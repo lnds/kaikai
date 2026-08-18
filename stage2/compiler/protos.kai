@@ -97,6 +97,7 @@ import compiler.modules
 import compiler.proto_scope
 import compiler.name_table
 import compiler.name_report
+import compiler.proto_rank
 import compiler.infer
 import compiler.layout_derive
 import compiler.layout_validate
@@ -433,6 +434,10 @@ fn arg_names_mangle(args: [String]) : String = match args {
 #[doc("kaikai name of the polymorphic dispatcher DFn for protocol op `op` (`__proto_<op>`).")]
 pub fn proto_dispatcher_name(op: String) : String = concat_all(["__proto_", op])
 
+#[doc("True when `name` is a synthesised protocol dispatcher (`__proto_<op>`).")]
+pub fn is_proto_dispatcher_name(name: String) : Bool =
+  strip_proto_dispatcher_prefix(name) != name
+
 # A decl's home canonicalised the way the registry stores it: the
 # root file's module name becomes `None`, matching the rest of the
 # root file's untagged decls.
@@ -526,6 +531,19 @@ fn proto_op_lookup_loop(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] 
 # receiver type.
 fn proto_ops_lookup_all(reg: ProtocolReg, name: String) : [ProtoOpReg] =
   proto_ops_lookup_all_loop(reg.ops, name)
+
+#[doc("The core module declaring a protocol with op `opname`, or `None`. The interpolation sugar binds `#{...}` to that `Show`, never to a user protocol that happens to declare `show`.")]
+pub fn proto_core_op_home(reg: ProtocolReg, opname: String,
+                          cores: [String]) : Option[String] =
+  pcoh_loop(proto_ops_lookup_all(reg, opname), cores)
+
+fn pcoh_loop(ops: [ProtoOpReg], cores: [String]) : Option[String] = match ops {
+  [] -> None
+  [POR(_, _, _, _, _, _, mo), ...rest] -> match mo {
+    Some(m) -> if list_has(cores, m) { mo } else { pcoh_loop(rest, cores) }
+    None    -> pcoh_loop(rest, cores)
+  }
+}
 
 fn proto_ops_lookup_all_loop(ops: [ProtoOpReg], target: String) : [ProtoOpReg] {
   match ops {
@@ -1212,7 +1230,7 @@ fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr],
         # distinct dispatcher names, so both survive; same-arity
         # collisions still collapse to one shared dispatcher.
         let disp = proto_dispatcher_name_at(arities, opname, list_length(params))
-        let already = dispatcher_named_in_acc(acc, disp)
+        let already = dispatcher_named_in_acc(acc, disp, mo)
         if already { generate_dispatchers_loop(rest, arities, acc) }
         else {
           let stub = make_dispatcher_fn(pname, opname, disp, params, ret, line, col, mo)
@@ -1223,13 +1241,17 @@ fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr],
   }
 }
 
-fn dispatcher_named_in_acc(ds: [Decl], want: String) : Bool {
+# One dispatcher per (name, home): two modules declaring the same op
+# each get their own, so a call narrows by receiver among distinct
+# signatures instead of meeting whichever module registered first.
+fn dispatcher_named_in_acc(ds: [Decl], want: String, mo: Option[String]) : Bool {
   match ds {
     [] -> false
     [d, ...rest] -> match d {
-      DFn(_, n, _, _, _, _, _, _, _, _) ->
-        if n == want { true } else { dispatcher_named_in_acc(rest, want) }
-      _ -> dispatcher_named_in_acc(rest, want)
+      DFn(_, n, _, _, _, _, _, _, _, dmo) ->
+        if n == want and mo_eq(dmo, mo) { true }
+        else { dispatcher_named_in_acc(rest, want, mo) }
+      _ -> dispatcher_named_in_acc(rest, want, mo)
     }
   }
 }
@@ -4725,8 +4747,8 @@ fn validate_proto_call_at(e: Expr, reg: ProtocolReg, cm: Option[String], file: S
 
 
   match e.kind {
-    ECall(callee, args_) -> match callee.kind {
-      EVar(name) -> {
+    ECall(callee, args_) -> match validate_dispatcher_callee(callee) {
+      Some(name) -> {
         let opname = strip_proto_dispatcher_prefix(name)
         # Only inspect calls that survived the rewrite as
         # `__proto_<op>(...)` (the prefix-strip yields a different
@@ -4745,7 +4767,7 @@ fn validate_proto_call_at(e: Expr, reg: ProtocolReg, cm: Option[String], file: S
                 # protocol, so `Ring.add` and `Add.add` are both valid
                 # targets for `add`).
                 Some(tname) -> match find_impl_any_proto(reg, opname, tname, cm) {
-                  Some(_) -> errs
+                  Some(_) -> validate_dispatch_unique(e, args_, reg, cm, opname, file, errs)
                   None -> {
                     let pname = first_proto_of_op(reg, opname)
                     diag_error(file, e.line, e.col,
@@ -4760,10 +4782,30 @@ fn validate_proto_call_at(e: Expr, reg: ProtocolReg, cm: Option[String], file: S
           }
         }
       }
-      _ -> errs
+      None -> errs
     }
     _ -> errs
   }
+}
+
+# A residual call with an impl in reach was left by the rewrite for one
+# reason: more than one protocol serves the receiver.
+fn validate_dispatch_unique(e: Expr, args_: [Expr], reg: ProtocolReg, cm: Option[String],
+                            opname: String, file: String, errs: Int) : Int / Console + File {
+  let ms = proto_matches_for(proto_cands_own_first(proto_ops_lookup_all(reg, opname), cm),
+                             args_, reg, cm, opname)
+  if proto_matches_ambiguous(ms) {
+    report_ambiguous_proto_call(file, e.line, e.col, opname, first_proto_of_op(reg, opname), ms)
+    errs + 1
+  } else { errs }
+}
+
+# A residual dispatcher call names its dispatcher bare or, when the
+# typer picked among same-named dispatchers, module-qualified.
+fn validate_dispatcher_callee(callee: Expr) : Option[String] = match callee.kind {
+  EVar(name)        -> Some(name)
+  EModCall(_, name) -> Some(name)
+  _                 -> None
 }
 
 # ====================================================================
@@ -5379,6 +5421,16 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
                                      callee, args_, reg, cm, opname)
       }
     }
+    # `m.__proto_op`: the interpolation sugar's `show`, homed at the core
+    # protocol. The qualifier selects the protocols declared by `m`.
+    EModCall(m, name) -> {
+      let opname = strip_proto_dispatcher_prefix(name)
+      if name == opname or not list_has(reg.op_names, opname) { None }
+      else {
+        try_rewrite_proto_candidates(pcof_matching(proto_ops_lookup_all(reg, opname), Some(m)),
+                                     callee, args_, reg, cm, opname)
+      }
+    }
     _ -> None
   }
 }
@@ -5393,56 +5445,52 @@ fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
 fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
                                  args_: [Expr], reg: ProtocolReg,
                                  cm: Option[String],
-                                 opname: String) : Option[ExprKind] {
-  match cands {
+                                 opname: String) : Option[ExprKind] = {
+  let ms = proto_matches_for(cands, args_, reg, cm, opname)
+  # Two homes serving the same receiver at the head tier: the call
+  # stays a dispatcher and `validate_proto_call_at` names them.
+  if proto_matches_ambiguous(ms) { None }
+  else { match ms {
     [] -> None
-    [po, ...rest] -> match po {
-      POR(pname, _, params, ret, _, _, pmo) -> {
-        # Arity guard: a name declared by two protocols at different
-        # arities (`P { f(x) }` + `Q { f(a, b) }`) yields one POR per
-        # protocol here. Only the candidate whose arity matches the
-        # call can be the target — skipping the rest is what stops a
-        # 1-arg call landing on the 2-arg impl.
-        if list_length(params) != list_length(args_) {
-          try_rewrite_proto_candidates(rest, callee, args_, reg, cm, opname)
-        }
-        # A protocol the calling module cannot see is not a dispatch
-        # candidate for its bare calls.
-        else if not proto_visible_from(reg.origins, pname, pmo, cm) {
-          try_rewrite_proto_candidates(rest, callee, args_, reg, cm, opname)
-        }
-        # When Self (or the protocol's `Shape` carrier) appears only in
-        # the op's return position (e.g. `from(x: a) : Self`), the args
-        # carry no dispatch information — defer to the caller-provided
-        # ret_ty (the `_with_ret` wrapper).
-        else if proto_op_self_only_in_return(params, ret,
-                  proto_shape_carriers_at(reg.tparams, pname, pmo)) {
-          try_rewrite_proto_candidates(rest, callee, args_, reg, cm, opname)
-        } else {
-          match find_proto_impl_for_args(reg, proto_key_of(reg.dkeys, pname, pmo),
-                                         pname, pmo, opname, args_) {
-            Some(impl_fn) -> {
-              let new_callee = mk_expr(EVar(impl_fn), callee.line, callee.col)
-              Some(ECall(new_callee, args_))
-            }
-            None -> try_rewrite_proto_candidates(rest, callee, args_, reg, cm, opname)
-          }
-        }
-      }
-    }
+    [PMatch(_, _, impl_fn), ..._] ->
+      Some(ECall(mk_expr(EVar(impl_fn), callee.line, callee.col), args_))
+  } }
+}
+
+# The protocols among `cands` whose impl table serves `args_`, ranked
+# (proto_rank). A candidate is skipped when its arity differs from the
+# call, when the calling module cannot see it, or when `Self` (or the
+# `Shape` carrier) informs dispatch from the return position alone —
+# the `_with_ret` wrapper owns that shape.
+fn proto_matches_for(cands: [ProtoOpReg], args_: [Expr], reg: ProtocolReg,
+                     cm: Option[String], opname: String) : [ProtoMatch] =
+  proto_ranked_matches(cands, cm, reg.cores, (po) => proto_serves(po, args_, reg, cm, opname))
+
+fn proto_serves(po: ProtoOpReg, args_: [Expr], reg: ProtocolReg,
+                cm: Option[String], opname: String) : Option[String] = match po {
+  POR(pname, _, params, ret, _, _, pmo) -> {
+    let skip = list_length(params) != list_length(args_) or
+               not proto_visible_from(reg.origins, pname, pmo, cm) or
+               proto_op_self_only_in_return(params, ret,
+                 proto_shape_carriers_at(reg.tparams, pname, pmo))
+    if skip { None }
+    else { find_proto_impl_for_args(reg, proto_key_of(reg.dkeys, pname, pmo),
+                                    pname, pmo, opname, args_) }
   }
 }
 
-# Issue #180: returns true when none of the op's parameter types
-# contains `Self` (nor the protocol's `Shape` carrier), i.e. dispatch
-# is informed only by the return type. Such ops can only be dispatched
-# via the surrounding expected type (typed-hole error otherwise).
+# True when the arguments carry no dispatch information: `Self` (or the
+# protocol's `Shape` carrier) appears in the return position alone, or
+# the op takes no arguments at all. Such ops resolve against the
+# surrounding expected type. An op with arguments that names `Self`
+# nowhere dispatches on them like any other.
 fn proto_op_self_only_in_return(params: [Param], ret: TypeExpr,
                                 carriers: [String]) : Bool {
-  not list_any(params, (p) => match p.ptype {
+  let in_params = list_any(params, (p) => match p.ptype {
     Some(te) -> te_mentions_self_or_carrier(te, carriers)
     None -> false
   })
+  not in_params and (te_mentions_self_or_carrier(ret, carriers) or list_length(params) == 0)
 }
 
 # The surface names of a protocol's `Shape`-kind tparams — the dispatch
