@@ -19,16 +19,14 @@ CORPUS="$ROOT/examples/namespace-collisions"
 # The `test-namespace-collisions*` targets take their fixture lists from
 # these labels (tests/namespace_matrix_axes.sh), so a label spelled wrong
 # or a golden missing means a fixture silently drops out of execution —
-# both are structural errors here. `modular` has no harness behind it
-# yet, so a row carrying only that label counts as unexecuted.
+# both are structural errors here.
 axis_golden() {
   case "$1" in
-    c|native|asan) echo main.out.expected ;;
-    neg|neg-native) echo main.err.expected ;;
+    c|native|asan|modular) echo main.out.expected ;;
+    neg|neg-native|neg-modular) echo main.err.expected ;;
     diag) echo DIAG.expected ;;
     testsym) echo main.test.expected ;;
     check) echo main.check.expected ;;
-    modular) echo "" ;;
     *) return 1 ;;
   esac
 }
