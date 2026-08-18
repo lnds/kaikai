@@ -27,6 +27,7 @@ axis_golden() {
     neg|neg-native) echo main.err.expected ;;
     diag) echo DIAG.expected ;;
     testsym) echo main.test.expected ;;
+    check) echo main.check.expected ;;
     modular) echo "" ;;
     *) return 1 ;;
   esac
