@@ -240,7 +240,8 @@ test-rboxed-prim-scope: kaic1 kaic2
 # own thousands of binders. The reverse check keeps future runtime helpers
 # out of the user namespaces, so no waived case can silently reopen.
 # String literals are stripped first: the compiler's own strings name the
-# kai_* symbols it emits, which would read as false leaks.
+# kai_* symbols it emits, which would read as false leaks. The same sweep
+# runs over a fixture whose user fn is spelled like a runtime helper.
 test-kai-namespace: kaic2
 	@set -e; \
 	tmp=$$(mktemp -d); trap "rm -rf $$tmp" EXIT; \
@@ -252,7 +253,15 @@ test-kai-namespace: kaic2
 	[ -z "$$leaks" ] || { echo "test-kai-namespace FAIL: user-derived identifiers emitted into the runtime kai_ namespace:"; echo "$$leaks"; exit 1; }; \
 	rev=$$(tr -c 'A-Za-z0-9_' '\n' < stage2/runtime.h | grep -E '^(kaiu_|kaiv_)' | sort -u); \
 	[ -z "$$rev" ] || { echo "test-kai-namespace FAIL: runtime.h names symbols inside the user namespaces:"; echo "$$rev"; exit 1; }; \
-	echo "test-kai-namespace OK — emitted kai_* stays inside runtime.h; runtime stays out of kaiu_/kaiv_"
+	fx=examples/namespace-collisions/adv_name_internal_prefix; \
+	( cd stage2 && ./kaic2 ../$$fx/main.kai ) > $$tmp/adv.c; \
+	perl -pe 's/"(?:[^"\\]|\\.)*"//g' $$tmp/adv.c \
+	  | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/adv-emitted.txt; \
+	leaks=$$(comm -23 $$tmp/adv-emitted.txt $$tmp/runtime.txt); \
+	[ -z "$$leaks" ] || { echo "test-kai-namespace FAIL: a user fn named after a runtime helper reached the kai_ namespace:"; echo "$$leaks"; exit 1; }; \
+	grep -q 'kaiu_ha__kai_internal_drop' $$tmp/adv.c \
+	  || { echo "test-kai-namespace FAIL: $$fx did not emit ha.kai_internal_drop as kaiu_ha__kai_internal_drop"; exit 1; }; \
+	echo "test-kai-namespace OK — emitted kai_* stays inside runtime.h; runtime stays out of kaiu_/kaiv_; user names shaped like runtime helpers stay in kaiu_"
 
 # A root file whose basename is not a C identifier still mints valid symbols.
 # Both backends, since the name reaches C emission and KIR lowering alike.
