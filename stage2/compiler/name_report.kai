@@ -9,6 +9,7 @@
 import compiler.util
 import compiler.ast
 import compiler.diag
+import compiler.diag_file
 import compiler.name_table
 import compiler.name_uses
 
@@ -42,27 +43,89 @@ fn nr_first(homes: [String]) : String = match homes {
   [h, ..._] -> h
 }
 
-#[doc("Warn once for every contested bare name the root file references. The single entry point: build the table, scan the uses, report each.")]
-pub fn nr_report_program(file: String, decls: [Decl],
-      target: String) : Unit / Console + File {
-  let t = nt_collect(decls, target)
-  nr_each(file, nu_scan(decls, t, target), t, target)
+#[doc("Warn once for every contested bare name the root file references, and once for every effect two non-core modules both export. The single entry point: build the table, scan the uses, report each. `early` carries uses scanned before a pass keyed them; `core` names the modules whose collisions are theirs to resolve.")]
+pub fn nr_report_program(df: DiagFiles, decls: [Decl], target: String,
+      reg: ProtocolReg, early: [NUse], core: [String]) : Unit / Console + File {
+  let t = list_append(nt_collect(decls, target), nt_protocols(reg, target))
+  let uses = nu_merge(nu_scan(decls, t, target, nu_dispatchers(reg)), early)
+  nr_each(df_root(df), uses, t, target)
+  nr_effects(df, decls, nt_collisions(t, NCEffect), t, target, core)
 }
 
 fn nr_each(file: String, uses: [NUse], t: [NEnt],
       target: String) : Unit / Console + File = match uses {
   [] -> ()
-  [NUse(cls, name, line, col), ...rest] -> {
+  [NUse(cls, name, line, col, op), ...rest] -> {
     nr_warn_ambiguous(file, line, col, cls, name,
-                      nt_contested(t, cls, name, target), nr_suffix(cls))
+                      nt_contested(t, cls, name, target), nr_suffix(cls, op))
     nr_each(file, rest, t, target)
   }
 }
 
 # A value class is qualified at a call; a classifier is qualified where
-# it is named.
-fn nr_suffix(c: NCls) : String = match c {
-  NCFn   -> "(...)"
-  NCCtor -> "(...)"
-  _      -> ""
+# it is named; a protocol reached through an operation, at that call.
+fn nr_suffix(c: NCls, op: String) : String = match c {
+  NCFn       -> "(...)"
+  NCCtor     -> "(...)"
+  NCProtocol -> if op == "" { "" } else { concat_all([".", op, "(...)"]) }
+  _          -> ""
+}
+
+# Effects are keyed by bare name in the runtime evidence table, so two
+# same-named effects loaded together collide even when the root names
+# neither. The collision itself is reported; core keeps its own names.
+fn nr_effects(df: DiagFiles, decls: [Decl], names: [String], t: [NEnt],
+      target: String, core: [String]) : Unit / Console + File = match names {
+  [] -> ()
+  [n, ...rest] -> {
+    let homes = nr_non_core(nt_homes(t, NCEffect, n), core)
+    if list_length(homes) > 1 { nr_effect_warn(df, decls, n, homes, target) } else { () }
+    nr_effects(df, decls, rest, t, target, core)
+  }
+}
+
+fn nr_non_core(homes: [String], core: [String]) : [String] = match homes {
+  [] -> []
+  [h, ...rest] ->
+    if list_has(core, h) { nr_non_core(rest, core) } else { [h, ...nr_non_core(rest, core)] }
+}
+
+# Anchored at the last colliding declaration, in its own file.
+fn nr_effect_warn(df: DiagFiles, decls: [Decl], name: String,
+      homes: [String], target: String) : Unit / Console + File = {
+  let msg = concat_all(["effect '", name, "' is exported by multiple modules: ",
+                        join_with(homes, ", ")])
+  match nr_effect_decl(decls, name, nr_last(homes), target) {
+    Some(d) -> match d {
+      DEffect(_, _, _, _, _, l, c, _) -> diag_warning(decl_diag_file(d, df), l, c, msg)
+      _ -> diag_warning(df_root(df), 0, 0, msg)
+    }
+    None -> diag_warning(df_root(df), 0, 0, msg)
+  }
+  diag_note(concat_all(["effect candidates: ", nr_candidates(name, homes)]))
+  diag_help("effects are keyed by name at run time, so these collide when both are live; keep one, or name them apart")
+}
+
+fn nr_effect_decl(decls: [Decl], name: String, home: String,
+      target: String) : Option[Decl] = match decls {
+  [] -> None
+  [d, ...rest] -> match d {
+    DEffect(_, n, _, _, _, _, _, mo) ->
+      if n == name and nr_home(mo, target) == home { Some(d) }
+      else { nr_effect_decl(rest, name, home, target) }
+    DDoc(_, _, inner, _, _) -> nr_effect_decl([inner, ...rest], name, home, target)
+    DAttr(_, inner, _, _)   -> nr_effect_decl([inner, ...rest], name, home, target)
+    _ -> nr_effect_decl(rest, name, home, target)
+  }
+}
+
+fn nr_home(mo: Option[String], target: String) : String = match mo {
+  Some(m) -> m
+  None    -> target
+}
+
+fn nr_last(xs: [String]) : String = match xs {
+  []           -> ""
+  [x]          -> x
+  [_, ...rest] -> nr_last(rest)
 }

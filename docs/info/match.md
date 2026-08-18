@@ -32,6 +32,9 @@ x: Int                                    # bind + union-variant narrow
 Some(x)   None                            # Option
 Ok(v)     Err(e)                          # Result
 Red       Green       Blue                # nullary variants
+MAX       m.MAX       Some(m.MAX)         # constants: equal to the
+                                          # value; a qualifier picks
+                                          # the module's constant
 
 []                                        # empty list
 [x]                                       # one element

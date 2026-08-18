@@ -1,0 +1,185 @@
+# compiler/const_pattern.kai — constants in pattern position.
+#
+# A constant named in a pattern parses as a nullary variant (`LIMIT`,
+# `m.LIMIT`) or, lowercase at the top of an arm, as a binder. When the
+# name is a declared constant the arm means "equal to that constant's
+# value": the pattern becomes a fresh binder and the arm gains an
+# equality guard. A qualifier selects the module's constant, so the
+# guard reads `m.LIMIT`; a bare spelling reads the bare constant.
+#
+# Value-position reads need no rewrite: a constant IS a value.
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+import compiler.desugar
+
+# A declared constant: its home module (`None` for the root file) and
+# its spelling.
+type CDecl = CD(Option[String], String)
+
+# One rewritten pattern plus the equality guards it accumulated.
+type CPRes = CPR(Pattern, [Expr])
+
+#[doc("Rewrite constant names used in match patterns, at any depth, into a fresh binder plus an equality guard against the constant.")]
+pub fn desugar_const_patterns_decls(decls: [Decl]) : [Decl] {
+  let cs = cpat_consts(decls, [])
+  match cs {
+    [] -> decls
+    _  -> map(decls, (d) => cpat_decl(d, cs))
+  }
+}
+
+fn cpat_consts(decls: [Decl], acc: [CDecl]) : [CDecl] = match decls {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DConst(_, name, _, _, mo, _, _) -> cpat_consts(rest, [CD(mo, name), ...acc])
+    _ -> cpat_consts(rest, acc)
+  }
+}
+
+fn cpat_decl(d: Decl, cs: [CDecl]) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(p, n, tps, ps, ret, row, cpat_expr(body, cs), l, c, mo)
+  DTest(n, body, l, c, mo) -> DTest(n, cpat_expr(body, cs), l, c, mo)
+  DBench(n, body, l, c, mo) -> DBench(n, cpat_expr(body, cs), l, c, mo)
+  DConst(p, n, ty, body, mo, l, c) -> DConst(p, n, ty, cpat_expr(body, cs), mo, l, c)
+  _ -> d
+}
+
+fn cpat_expr(e: Expr, cs: [CDecl]) : Expr = {
+  let k2 = match e.kind {
+    EMatch(scr, arms) -> EMatch(cpat_expr(scr, cs), map(arms, (a) => cpat_arm(a, cs)))
+    _ -> dsg_map_expr_kind(e.kind, (sub) => cpat_expr(sub, cs))
+  }
+  Expr { kind: k2, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+}
+
+# A pattern binder shadows a same-named constant inside the arm's body
+# and guard, so those walk with the shadowed constants removed. The
+# pattern itself is judged against the full set.
+fn cpat_arm(a: Arm, cs: [CDecl]) : Arm = match a {
+  Arm(pat, opt_g, body) -> {
+    let inner = cpat_unshadowed(cs, pat_binders(pat, []), [])
+    let body2 = cpat_expr(body, inner)
+    let g2 = match opt_g { Some(g) -> Some(cpat_expr(g, inner))  None -> None }
+    match cpat_top(pat, cs) {
+      CPR(pat2, guards) -> Arm(pat2, cpat_and_all(g2, guards), body2)
+    }
+  }
+}
+
+fn cpat_unshadowed(cs: [CDecl], binders: [String], acc: [CDecl]) : [CDecl] = match cs {
+  [] -> acc
+  [CD(mo, n), ...rest] ->
+    if list_has(binders, n) { cpat_unshadowed(rest, binders, acc) }
+    else { cpat_unshadowed(rest, binders, [CD(mo, n), ...acc]) }
+}
+
+# The user's guard, if any, is tested after every equality: a binder it
+# reads must already be known to hold the constant's value.
+fn cpat_and_all(user: Option[Expr], guards: [Expr]) : Option[Expr] = match guards {
+  [] -> user
+  [g, ...rest] -> match cpat_and_all(user, rest) {
+    None    -> Some(g)
+    Some(r) -> Some(mk_expr(EBinop("and", g, r), g.line, g.col))
+  }
+}
+
+# Only the top of an arm reads a lowercase binder as a constant; a
+# nested lowercase name is always a binder.
+fn cpat_top(pat: Pattern, cs: [CDecl]) : CPRes = match pat.pkind {
+  PBind(name) ->
+    if cpat_has_bare(cs, name) { cpat_eq(pat, name, mk_expr(EVar(name), pat.line, pat.col)) }
+    else { CPR(pat, []) }
+  _ -> cpat_pat(pat, cs)
+}
+
+fn cpat_pat(pat: Pattern, cs: [CDecl]) : CPRes = match pat.pkind {
+  PVariant(home, name, [])   -> cpat_nullary(pat, home, name, cs)
+  PVariant(home, name, subs) -> cpat_subs(pat, subs, cs, (s2) => PVariant(home, name, s2))
+  PList(subs, rest)          -> cpat_subs(pat, subs, cs, (s2) => PList(s2, rest))
+  PAs(name, inner)           -> cpat_subs(pat, [inner], cs, (s2) => cpat_as(name, s2, inner))
+  PVariantRecord(name, fs)   -> cpat_fields(pat, fs, cs, (f2) => PVariantRecord(name, f2))
+  PRecord(fs)                -> cpat_fields(pat, fs, cs, (f2) => PRecord(f2))
+  _ -> CPR(pat, [])
+}
+
+fn cpat_nullary(pat: Pattern, home: Option[String], name: String, cs: [CDecl]) : CPRes =
+  match cpat_const_ref(home, name, cs, pat.line, pat.col) {
+    Some(cref) -> cpat_eq(pat, name, cref)
+    None       -> CPR(pat, [])
+  }
+
+fn cpat_as(name: String, rebuilt: [Pattern], orig: Pattern) : PatKind = match rebuilt {
+  [inner2, ..._] -> PAs(name, inner2)
+  []             -> PAs(name, orig)
+}
+
+fn cpat_subs(pat: Pattern, subs: [Pattern], cs: [CDecl],
+             build: ([Pattern]) -> PatKind) : CPRes = match cpat_pats(subs, cs) {
+  CPRs(subs2, gs) -> CPR(mk_pat(build(subs2), pat.line, pat.col), gs)
+}
+
+fn cpat_fields(pat: Pattern, fs: [PField], cs: [CDecl],
+               build: ([PField]) -> PatKind) : CPRes = match cpat_pfields(fs, cs) {
+  CPFs(fs2, gs) -> CPR(mk_pat(build(fs2), pat.line, pat.col), gs)
+}
+
+# The expression a constant pattern compares against. A qualifier names
+# the module's own constant and nothing else; a bare spelling names
+# whichever constant carries it. Neither is a constant: `None`.
+fn cpat_const_ref(home: Option[String], name: String, cs: [CDecl],
+                line: Int, col: Int) : Option[Expr] = match home {
+  Some(h) ->
+    if cpat_has_homed(cs, h, name) { Some(mk_expr(EModCall(h, name), line, col)) }
+    else { None }
+  None ->
+    if cpat_has_bare(cs, name) { Some(mk_expr(EVar(name), line, col)) }
+    else { None }
+}
+
+fn cpat_has_bare(cs: [CDecl], name: String) : Bool = match cs {
+  [] -> false
+  [CD(_, n), ...rest] -> n == name or cpat_has_bare(rest, name)
+}
+
+fn cpat_has_homed(cs: [CDecl], home: String, name: String) : Bool = match cs {
+  [] -> false
+  [CD(mo, n), ...rest] -> match mo {
+    Some(m) -> (m == home and n == name) or cpat_has_homed(rest, home, name)
+    None    -> cpat_has_homed(rest, home, name)
+  }
+}
+
+# The binder is compiler-internal (`__` prefix) and unique per pattern
+# position, so two constants in one pattern never share a name.
+fn cpat_eq(pat: Pattern, name: String, const_ref: Expr) : CPRes = {
+  let cv = concat_all(["__cv_", name, "_", int_to_string(pat.line), "_",
+                       int_to_string(pat.col)])
+  let cv_var = mk_expr(EVar(cv), pat.line, pat.col)
+  CPR(mk_pat(PBind(cv), pat.line, pat.col),
+      [mk_expr(EBinop("==", cv_var, const_ref), pat.line, pat.col)])
+}
+
+type CPResList = CPRs([Pattern], [Expr])
+
+fn cpat_pats(ps: [Pattern], cs: [CDecl]) : CPResList = match ps {
+  [] -> CPRs([], [])
+  [p, ...rest] -> match cpat_pat(p, cs) {
+    CPR(p2, gs) -> match cpat_pats(rest, cs) {
+      CPRs(rest2, gs2) -> CPRs([p2, ...rest2], list_append(gs, gs2))
+    }
+  }
+}
+
+type CPFieldList = CPFs([PField], [Expr])
+
+fn cpat_pfields(fs: [PField], cs: [CDecl]) : CPFieldList = match fs {
+  [] -> CPFs([], [])
+  [PField(name, sub, short), ...rest] -> match cpat_pat(sub, cs) {
+    CPR(sub2, gs) -> match cpat_pfields(rest, cs) {
+      CPFs(rest2, gs2) -> CPFs([PField(name, sub2, short), ...rest2], list_append(gs, gs2))
+    }
+  }
+}
