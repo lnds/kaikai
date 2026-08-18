@@ -15,15 +15,33 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MATRIX="$ROOT/tests/namespace_matrix.tsv"
 CORPUS="$ROOT/examples/namespace-collisions"
 
+# Every axis label the matrix may carry, with the golden each one reads.
+# The `test-namespace-collisions*` targets take their fixture lists from
+# these labels (tests/namespace_matrix_axes.sh), so a label spelled wrong
+# or a golden missing means a fixture silently drops out of execution —
+# both are structural errors here. `modular` has no harness behind it
+# yet, so a row carrying only that label counts as unexecuted.
+axis_golden() {
+  case "$1" in
+    c|native|asan) echo main.out.expected ;;
+    neg|neg-native) echo main.err.expected ;;
+    diag) echo DIAG.expected ;;
+    testsym) echo main.test.expected ;;
+    modular) echo "" ;;
+    *) return 1 ;;
+  esac
+}
+
 rows=0
 todo=0
 missing=0
 na=0
 thin=0
 fixtures=0
+badaxis=0
 declare -a CLAIMED=()
 
-while IFS=$'\t' read -r class shape position polarity target; do
+while IFS=$'\t' read -r class shape position polarity target axes; do
   case "$class" in ''|'#'*) continue ;; esac
   rows=$((rows + 1))
 
@@ -44,6 +62,24 @@ while IFS=$'\t' read -r class shape position polarity target; do
       ;;
   esac
 
+  # The axes column decides where the row's fixtures run; a fixture-bearing
+  # row with no executing axis is counted coverage that never runs.
+  declare -a axis_list=()
+  executed=0
+  IFS=',' read -ra axis_list <<< "${axes:-}"
+  for a in "${axis_list[@]}"; do
+    if ! axis_golden "$a" > /dev/null; then
+      echo "  AXIS   $class / $shape / $position — unknown axis label '$a'"
+      badaxis=$((badaxis + 1))
+    elif [ -n "$(axis_golden "$a")" ]; then
+      executed=1
+    fi
+  done
+  if [ "$executed" -eq 0 ]; then
+    echo "  AXIS   $class / $shape / $position — no axis with a harness behind it (axes: '${axes:-}')"
+    badaxis=$((badaxis + 1))
+  fi
+
   # A cell may name several fixtures, comma-separated: one example per
   # cell proves the combination is represented, not that the
   # representative is enough. Cells whose defect is live carry more.
@@ -60,6 +96,12 @@ while IFS=$'\t' read -r class shape position polarity target; do
     CLAIMED+=("$t")
     n_here=$((n_here + 1))
     fixtures=$((fixtures + 1))
+    for a in "${axis_list[@]}"; do
+      golden="$(axis_golden "$a")"
+      [ -z "$golden" ] && continue
+      [ -f "$CORPUS/$t/$golden" ] \
+        || { echo "  AXIS   $class / $shape / $position — '$t' is on axis '$a' but has no $golden"; badaxis=$((badaxis + 1)); }
+    done
   done
 
   # Two fixtures per cell is the default, not an opt-in. One example says
@@ -112,14 +154,14 @@ for d in "$CORPUS"/*/; do
 done
 
 covered=$((rows - todo - na))
-echo "namespace_matrix: $rows rows, $covered covered ($fixtures fixtures), $na not applicable, $todo uncovered, $missing dangling, $unclaimed unclaimed, $thin thin"
+echo "namespace_matrix: $rows rows, $covered covered ($fixtures fixtures), $na not applicable, $todo uncovered, $missing dangling, $unclaimed unclaimed, $badaxis axis errors, $thin thin"
 
 # Structural errors are absolute: a row naming a fixture that is not there,
 # a fixture no row claims, a cell with neither fixture nor reason. None of
 # these is debt to pay down — they mean the matrix and the corpus disagree
 # right now.
-if [ "$todo" -gt 0 ] || [ "$missing" -gt 0 ] || [ "$unclaimed" -gt 0 ]; then
-  echo "namespace_matrix: the matrix and the corpus disagree — add the fixture, write the reason, or claim the orphan"
+if [ "$todo" -gt 0 ] || [ "$missing" -gt 0 ] || [ "$unclaimed" -gt 0 ] || [ "$badaxis" -gt 0 ]; then
+  echo "namespace_matrix: the matrix and the corpus disagree — add the fixture, write the reason, claim the orphan, or fix the axes column"
   exit 1
 fi
 

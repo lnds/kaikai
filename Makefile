@@ -641,8 +641,10 @@ test-fmt-property: kaic2
 
 # Coverage of the namespace collision corpus is a checked property, not
 # a judgement call: every cell of the matrix names a fixture that exists
-# or carries a written reason, and every fixture on disk is claimed by a
-# row. Needs no compiler, so it runs standalone.
+# or carries a written reason, every fixture on disk is claimed by a
+# row, and every row's `axes` column — the list the stage2 corpus
+# targets read their fixtures from — names a harness with its golden on
+# disk. Needs no compiler, so it runs standalone.
 test-namespace-matrix:
 	@./tests/namespace_matrix.sh
 
