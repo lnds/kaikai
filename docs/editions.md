@@ -158,6 +158,23 @@ assembled from one list rather than reconstructed from git.
   `kai fetch`. `kai migrate` does not cover it — the affected text is
   in shell scripts and workflow files, not in `.kai` source.
 
+- **Unused imports** (decided with #1845). An
+  `import` the file never refers to — neither its written name as a
+  qualifier nor any name the module exports (protocol operations
+  included) — is a **warning** in Hanga Roa (`warning: unused import
+  \`m\``, at the import) and becomes an **error** at the Orongo cut,
+  as in Go. A module that declares impls, or declares nothing (a
+  documentation stub such as `math.bits`), is used by being loaded and
+  is never reported. Migration is mechanical — delete the line — and
+  `kai migrate` will carry the rule once the error is switched on.
+  Open before the flip: a program that imports a module only for the
+  impls it brings into scope is exempt by that rule, but an import of
+  a module that *also* exports names and is still used only for its
+  impls would be silent under the exemption and an error without it;
+  the Orongo rule needs either a blank-import form or an "impl
+  actually used" exemption for that class (`examples/org-pkgs` is
+  full of them).
+
 ## Edition selection in user packages
 
 A `kai.toml` declares which edition its source compiles against:

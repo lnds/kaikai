@@ -117,6 +117,11 @@ import mathlib.{add, mul}         # selective: only `add` and `mul`
 Imports are RESOLVED through `kai.toml` — the name on the right of
 `import` must appear as a dep (or be a stdlib name).
 
+An import the file never refers to — neither as a qualifier (`m.f`)
+nor through any name it exports — is a warning (`unused import \`m\``);
+it becomes an error at the Orongo edition. An import that only brings
+impls into scope is not reported.
+
 ## Visibility
 
 ```kaikai
