@@ -1,0 +1,138 @@
+# compiler/effect_scope.kai — module scoping for effect names.
+#
+# Every declaration, row label, handler head, `use`, and `E.op` perform
+# of a contested effect name is respelled per its declaring module
+# (effect_scope_table). Runs on the parsed stream before the qualifier
+# passes: a handler head still carries its `m.E` and a perform its
+# `m.E.op`, so the qualifier picks the home here and the uncontested
+# forms are left for those passes to validate and strip.
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+import compiler.scope_walk
+import compiler.effect_scope_table
+import compiler.effect_scope_types
+
+#[doc("Respell the contested effect names of each import segment under its own module's viewpoint; the decls past the marks are the root file's.")]
+pub fn es_segmented(segs: [ImportSeg], decls: [Decl], coll: [ESEntry],
+      scopes: [ModScope], global: [ModuleEntry], target: String,
+      cores: [String]) : [Decl] =
+  if list_length(coll) == 0 { decls }
+  else { es_seg_loop(segs, decls, coll, scopes, global, target, cores, scope_imports(scopes, global)) }
+
+fn es_seg_loop(segs: [ImportSeg], decls: [Decl], coll: [ESEntry],
+      scopes: [ModScope], global: [ModuleEntry], target: String,
+      cores: [String], imps: [ModImports]) : [Decl] = match segs {
+  [] -> es_decls(decls, es_ctx(coll, target, target, cores, scopes, global, imps))
+  [ISeg(mod_name, n), ...rest] -> {
+    let home = if mod_name == "" { target } else { mod_name }
+    list_append(es_decls(seg_take(decls, n), es_ctx(coll, home, target, cores, scopes, global, imps)),
+                es_seg_loop(rest, seg_drop(decls, n), coll, scopes, global, target, cores, imps))
+  }
+}
+
+#[doc("One module's viewpoint: its home, the root's, the cores, its imports and its qualifier table.")]
+pub fn es_ctx(coll: [ESEntry], home: String, target: String, cores: [String],
+      scopes: [ModScope], global: [ModuleEntry], imps: [ModImports]) : ESCtx = {
+  let owner = if home == target { "" } else { home }
+  ESCtx { coll: coll, home: home, target: target, cores: cores,
+          imports: es_imports_of(imps, owner), mt: ms_table(scopes, owner, global) }
+}
+
+fn es_imports_of(imps: [ModImports], owner: String) : [String] = match imps {
+  [] -> []
+  [MImp(o, names), ...rest] -> if o == owner { names } else { es_imports_of(rest, owner) }
+}
+
+fn es_decls(ds: [Decl], cx: ESCtx) : [Decl] = match ds {
+  [] -> []
+  [d, ...rest] -> [es_decl(d, cx), ...es_decls(rest, cx)]
+}
+
+fn es_decl(d: Decl, cx: ESCtx) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(p, n, tps, es_params(ps, cx), es_ty_opt(ret, cx), es_row(row, cx),
+        es_expr(body, sw_params(ps, []), cx), l, c, mo)
+  DEffect(p, n, tps, ops, dblk, l, c, mo) ->
+    DEffect(p, es_spell(cx, n, cx.home), tps, map(ops, (o) => es_eop(o, cx)),
+            es_dblk(dblk, cx), l, c, mo)
+  DType(p, n, tps, body, l, c, mo, slots) -> DType(p, n, tps, es_tbody(body, cx), l, c, mo, slots)
+  DConst(p, n, ty, body, mo, l, c) -> DConst(p, n, es_ty(ty, cx), es_expr(body, [], cx), mo, l, c)
+  DTest(n, body, l, c, mo)  -> DTest(n, es_expr(body, [], cx), l, c, mo)
+  DBench(n, body, l, c, mo) -> DBench(n, es_expr(body, [], cx), l, c, mo)
+  DCheck(n, ps, body, l, c, mo) ->
+    DCheck(n, es_params(ps, cx), es_expr(body, sw_params(ps, []), cx), l, c, mo)
+  DProtocol(p, n, tps, ops, l, c, mo) -> DProtocol(p, n, tps, map(ops, (o) => es_pop(o, cx)), l, c, mo)
+  DImpl(pn, tas, fty, subs, l, c, ss) ->
+    DImpl(pn, map(tas, (t) => es_ty(t, cx)), es_ty(fty, cx), es_decls(subs, cx), l, c, ss)
+  DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
+    DAxiom(p, sm, n, cso, tps, es_params(ps, cx), es_ty(ret, cx), es_row(row, cx), l, c)
+  DUse(eff, l, c) -> DUse(es_resolve(cx, eff), l, c)
+  DDerive(ps, inner, l, c)        -> DDerive(ps, es_decl(inner, cx), l, c)
+  DUnstable(inner, l, c)          -> DUnstable(es_decl(inner, cx), l, c)
+  DProtoLaws(t, inner, l, c, mo)  -> DProtoLaws(t, es_decl(inner, cx), l, c, mo)
+  DImplAxiom(t, inner, l, c, mo)  -> DImplAxiom(t, es_decl(inner, cx), l, c, mo)
+  DConstructor(inner, l, c)       -> DConstructor(es_decl(inner, cx), l, c)
+  DDoc(r, t, inner, l, c)         -> DDoc(r, t, es_decl(inner, cx), l, c)
+  DAttr(r, inner, l, c)           -> DAttr(r, es_decl(inner, cx), l, c)
+  _ -> d
+}
+
+fn es_eop(o: EffectOp, cx: ESCtx) : EffectOp = match o {
+  EOp(n, tps, ps, ret, l, c) -> EOp(n, tps, es_params(ps, cx), es_ty(ret, cx), l, c)
+}
+
+fn es_pop(o: ProtoOp, cx: ESCtx) : ProtoOp = match o {
+  POp(n, tps, ps, ret, l, c) -> POp(n, tps, es_params(ps, cx), es_ty(ret, cx), l, c)
+}
+
+fn es_dblk(o: Option[DefaultBlock], cx: ESCtx) : Option[DefaultBlock] = match o {
+  None -> None
+  Some(DBlk(hcs, ret, l, c)) ->
+    Some(DBlk(sw_hclauses(hcs, [], (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (n) => es_head(n, cx)),
+              sw_hreturn_opt(ret, [], (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (n) => es_head(n, cx)),
+              l, c))
+}
+
+fn es_expr(e: Expr, sh: [String], cx: ESCtx) : Expr =
+  sw_expr(e, sh, (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (n) => es_head(n, cx))
+
+# A handler head: `m.E` picks the home, a bare `E` follows the ladder.
+fn es_head(n: String, cx: ESCtx) : String = match split_dotted_qualifier(n) {
+  None -> es_resolve(cx, n)
+  Some(q) -> match q { QSplit(m, bare) -> match es_resolve_qualified(cx, m, bare) {
+    Some(s) -> s
+    None -> n
+  } }
+}
+
+# A perform: `E.op` with `E` free, or `m.E.op` with `m` free.
+fn es_leaf(e: Expr, sh: [String], cx: ESCtx) : Option[Expr] = match e.kind {
+  EField(obj, op) -> match obj.kind {
+    EVar(n) -> if list_has(sh, n) { None } else { es_bare_perform(e, obj, n, op, cx) }
+    EField(inner, mid) -> es_qualified_perform(e, inner, mid, op, sh, cx)
+    _ -> None
+  }
+  _ -> None
+}
+
+fn es_bare_perform(e: Expr, obj: Expr, n: String, op: String, cx: ESCtx) : Option[Expr] = {
+  let spelled = es_resolve(cx, n)
+  if spelled == n { None }
+  else { Some(es_re(e, EField(es_re(obj, EVar(spelled)), op))) }
+}
+
+fn es_qualified_perform(e: Expr, inner: Expr, mid: String, op: String,
+      sh: [String], cx: ESCtx) : Option[Expr] = match inner.kind {
+  EVar(m) ->
+    if list_has(sh, m) { None }
+    else { match es_resolve_qualified(cx, m, mid) {
+      Some(s) -> Some(es_re(e, EField(es_re(inner, EVar(s)), op)))
+      None -> None
+    } }
+  _ -> None
+}
+
+fn es_re(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }

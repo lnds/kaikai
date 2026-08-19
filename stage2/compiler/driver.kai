@@ -17,6 +17,9 @@ import compiler.kinds
 import compiler.kind_theory
 import compiler.kind_validate
 import compiler.unit_scope
+import compiler.effect_scope_table
+import compiler.effect_scope
+import compiler.effect_scope_check
 import compiler.lex
 import compiler.ast
 import compiler.diag_file
@@ -4553,14 +4556,23 @@ fn core_emit_key(cc: CoreCacheOpt, edition: String, decls: [Decl],
 # core TU bodies are persisted for the next build. Only plain builds
 # participate: test/bench shapes skip the cache instead of folding the
 # shape into the key.
+fn mod_names_overlap(xs: [String], ys: [String]) : Bool = match xs {
+  [] -> false
+  [x, ...rest] -> if list_has(ys, x) { true } else { mod_names_overlap(rest, ys) }
+}
+
+# A user module named like a core shares the core's origin, so its TU
+# would be persisted as the core's; such a program stays out of the cache.
 fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl],
                              bmode: BuildMode, target_mod_name: String,
                              regions: [RegionMark], cc: CoreCacheOpt,
-                             core_mods: [ModuleEntry], edition: String)
+                             core_mods: [ModuleEntry], user_mods: [ModuleEntry],
+                             edition: String)
                              : String / Console + File = {
   let plain = match bmode { BMBuild -> true _ -> false }
   let cacheable = core_mod_names(core_mods, [])
-  let key = if plain { core_emit_key(cc, edition, decls, cacheable, target_mod_name) } else { "" }
+  let shadowed = mod_names_overlap(core_mod_names(user_mods, []), cacheable)
+  let key = if plain and not shadowed { core_emit_key(cc, edition, decls, cacheable, target_mod_name) } else { "" }
   if key == "" {
     let _s = if cc.stats { eprint("kaic2: core-emit-cache: off") } else { () }
     emit_program_modular(path, src, decls, bmode, Some(target_mod_name), regions)
@@ -4747,15 +4759,23 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let mod_scopes = match expanded { EP_Mod(_, _, _, _, _, sc) -> sc }
             let seg_marks = match expanded { EP_Mod(_, _, _, _, sg, _) -> sg }
             let core_decls_l = surface_lower_decls(core_decls)
+            # Two modules declaring the same effect name each get a
+            # home-spelled one; a qualified head or perform picks the
+            # home here, while the qualifier is still written.
+            let es_coll = es_collect(list_append(core_decls_l, expanded_decls), target_mod_name)
+            let scoped_decls = es_segmented(seg_marks, expanded_decls, es_coll,
+              mod_scopes, module_table, target_mod_name, core_mod_names(core_mods, []))
+            let eff_scope_errs = eschk_segmented(seg_marks, scoped_decls, es_coll,
+              mod_scopes, module_table, target_mod_name, core_mod_names(core_mods, []), diag_ctx)
             let qualtype_errs = qtchk_decls(core_decls_l, module_table) +
-                                qtchk_segmented(seg_marks, expanded_decls, mod_scopes, module_table, target_mod_name)
+                                qtchk_segmented(seg_marks, scoped_decls, mod_scopes, module_table, target_mod_name)
             let pat_qual_errs = pqchk_decls(core_decls_l, module_table) +
-                                pqchk_segmented(seg_marks, expanded_decls, mod_scopes, module_table, target_mod_name)
+                                pqchk_segmented(seg_marks, scoped_decls, mod_scopes, module_table, target_mod_name)
             let qh_errs = qhchk_decls(core_decls_l, module_table, diag_ctx) +
-                          qhchk_segmented(seg_marks, expanded_decls, mod_scopes, module_table, target_mod_name, diag_ctx)
+                          qhchk_segmented(seg_marks, scoped_decls, mod_scopes, module_table, target_mod_name, diag_ctx)
             let qt_core = qh_decls(qualtype_decls(core_decls_l, module_table, diag_ctx), module_table)
             let qt_expanded = qh_segmented(seg_marks,
-              qualtype_segmented(seg_marks, expanded_decls, mod_scopes, module_table, target_mod_name, diag_ctx),
+              qualtype_segmented(seg_marks, scoped_decls, mod_scopes, module_table, target_mod_name, diag_ctx),
               mod_scopes, module_table, target_mod_name)
             # Key each free read of a colliding const name to the
             # module that owns it (the per-module scoping ta_scope
@@ -4895,9 +4915,11 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let usites = unit_sites(
               map(pa_segs, (sg) => match sg { PSeg(m, ds) -> USeg(m, ds) }),
               kind_reg)
+            let hab_view = hab_view_of(scope_imports(mod_scopes, module_table),
+                                       core_mod_names(core_mods, []), target_mod_name)
             let merged_kr = resolve_kinds_decls(merged_pre_kinds, kind_reg,
-              usites, target_mod_name)
-            let kind_ctx = build_kind_ctx(merged_kr, kind_reg, usites)
+              usites, target_mod_name, hab_view)
+            let kind_ctx = build_kind_ctx(merged_kr, kind_reg, usites, hab_view)
             # Atomic (kind, theory) pairs, captured before the catalog
             # decls are stripped; the typer's unit formation and
             # unify_dim dispatch on the theory of each habitant's kind.
@@ -4999,7 +5021,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # Gated on the first validation being clean to avoid
             # duplicate diagnostics.
             let raw_decls_pre_pos = resolve_kinds_decls(raw_decls_pre_pos0,
-              kind_reg, usites, target_mod_name)
+              kind_reg, usites, target_mod_name, hab_view)
             let post_alias_unit_errs = if unit_ref_errs == 0 {
               validate_unit_refs_decls(raw_decls_pre_pos, unit_scope(kind_ctx), diag_ctx)
             } else { 0 }
@@ -5190,6 +5212,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let proto_reg = lowered.reg
             let proto_errs = lowered.errs
             if doc_errs > 0 { doc_errs }
+            else if eff_scope_errs > 0 { eff_scope_errs }
             else if interp_cell.errs > 0 { interp_cell.errs }
             else if import_resolve_errs > 0 { import_resolve_errs }
             else if alias_res.errs > 0 { alias_res.errs }
@@ -5425,9 +5448,10 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # The same warning for every other class of name. One
                   # table, one message: a contested type reads like a
                   # contested function.
-                  nr_report_program(diag_ctx, typed_prog.decls, target_mod_name,
-                                    lowered.reg, early_const_uses,
-                                    core_mod_names(core_mods, []))
+                  let name_errs =
+                    nr_report_program(diag_ctx, typed_prog.decls, target_mod_name,
+                                      lowered.reg, early_const_uses,
+                                      core_mod_names(core_mods, []))
                   # Warn on unused local `let` and pattern bindings in
                   # the root file's decls. Scoped to root
                   # decls (mo == None) by `report_unused_in_decl` so
@@ -5439,6 +5463,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   else if inv_errs != 0 { inv_errs }
                   else if region_yield_errs != 0 { region_yield_errs }
                   else if collision_errs != 0 { collision_errs }
+                  else if name_errs != 0 { name_errs }
                   else {
                     let hole_errs = if strict_holes { strict_holes_check(path, all_decls) } else { 0 }
                     if hole_errs != 0 { hole_errs }
@@ -5670,7 +5695,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                           emit_kir(perceus_decls, region_marks, kir_inline_on)
                         } else if use_modular {
                           # Per-module .c/.h stream; the wrapper splits + links.
-                          emit_modular_maybe_cached(path, src, perceus_decls, bmode, target_mod_name, region_marks, core_cache, core_mods, edition)
+                          emit_modular_maybe_cached(path, src, perceus_decls, bmode, target_mod_name, region_marks, core_cache, core_mods,
+                                                    match expanded { EP_Mod(_, mt, _, _, _, _) -> mt }, edition)
                         } else {
                           emit_program(path, src, perceus_decls, bmode, Some(target_mod_name), region_marks)
                         }
