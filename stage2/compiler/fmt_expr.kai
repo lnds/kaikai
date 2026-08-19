@@ -49,7 +49,7 @@ pub fn fmt_handle(body: Expr, eff_name: String, eff_tyargs: [TypeExpr], init_opt
   let s6 = fmt_indent_out(s5)
   let s7 = fmt_emit(s6, "} with ")
   let s8 = fmt_emit(s7, eff_name)
-  let s9 = fmt_type_arg_list(eff_tyargs, s8)
+  let s9 = fmt_type_arg_list(eff_tyargs, fmt_first_type_line(eff_tyargs), s8)
   # The handler state has two spellings that share this slot: `(init)`
   # and `initially { }`. Only the `(init)` form prints beside the
   # effect name; the clause form prints inside the block below.
@@ -97,13 +97,14 @@ fn fmt_handle_initially(init_clause: Option[Expr], s: FmtSt) : FmtSt = match ini
 }
 
 # `[T, U]` after an effect name or type name; nothing for an empty list.
-fn fmt_type_arg_list(ty_args: [TypeExpr], s: FmtSt) : FmtSt =
-  if list_is_empty(ty_args) { s }
-  else {
-    let a = fmt_emit(s, "[")
-    let b = fmt_type_args(ty_args, a)
-    fmt_emit(b, "]")
-  }
+fn fmt_type_arg_list(ty_args: [TypeExpr], line: Int, s: FmtSt) : FmtSt =
+  if list_is_empty(ty_args) { s } else { fmt_type_seq("[", "]", line, ty_args, s, (t) => t) }
+
+#[doc("A delimited list of types: flat when it fits and the author kept it so, one type per line otherwise; `line` is the opener's source line.")]
+pub fn fmt_type_seq(open: String, close: String, line: Int, tys: [TypeExpr], s: FmtSt, tail: (FmtSt) -> FmtSt) : FmtSt {
+  let style = SeqStyle { open: open, close: close, pad: false, fill: false, hug: false }
+  fmt_seq(s, style, line, map(tys, (t) => SeqItem(t.line, (u) => fmt_type(t, u))), tail)
+}
 
 pub fn fmt_hclauses(cs: [HClause], s: FmtSt) : FmtSt = match cs {
   []           -> s
@@ -121,16 +122,13 @@ pub fn fmt_hclauses(cs: [HClause], s: FmtSt) : FmtSt = match cs {
 # A lifecycle clause (`finally { ... }`, param-less) prints in its own
 # brace form: printing it as `finally() -> ...` would not reparse.
 pub fn fmt_hclause(c: HClause, s: FmtSt) : FmtSt = match c {
-  HC(op_name, params, body, _, _) ->
+  HC(op_name, params, body, line, _) ->
     if fmt_is_lifecycle_clause(op_name, params) {
       let s1 = fmt_emit(s, op_name)
       let s2 = fmt_emit(s1, " ")
       fmt_expr(body, s2)
     } else {
-      let s1 = fmt_emit(s, op_name)
-      let s2 = fmt_emit(s1, "(")
-      let s3 = fmt_params(params, s2)
-      fmt_arrow_body(body, fmt_emit(s3, ") ->"))
+      fmt_param_seq(params, line, fmt_emit(s, op_name), (t) => fmt_arrow_body(body, fmt_emit(t, " ->")))
     }
 }
 
@@ -236,7 +234,7 @@ pub fn fmt_row_labels(ls: [RowLabel], s: FmtSt) : FmtSt {
 
 pub fn fmt_row_label(rl: RowLabel, s: FmtSt) : FmtSt {
   match rl {
-    RL(name, ty_args) -> fmt_type_arg_list(ty_args, fmt_emit(s, name))
+    RL(name, ty_args) -> fmt_type_arg_list(ty_args, fmt_first_type_line(ty_args), fmt_emit(s, name))
   }
 }
 
@@ -244,19 +242,14 @@ pub fn fmt_row_label(rl: RowLabel, s: FmtSt) : FmtSt {
 
 pub fn fmt_type(t: TypeExpr, s: FmtSt) : FmtSt {
   match t.tkind {
-    TyName(name, ty_args) -> fmt_type_arg_list(ty_args, fmt_emit(s, name))
+    TyName(name, ty_args) -> fmt_type_arg_list(ty_args, t.line, fmt_emit(s, name))
     TyList(elem) -> {
       let s1 = fmt_emit(s, "[")
       let s2 = fmt_type(elem, s1)
       fmt_emit(s2, "]")
     }
-    TyFn(params, ret, row) -> {
-      let s1 = fmt_emit(s, "(")
-      let s2 = fmt_type_args(params, s1)
-      let s3 = fmt_emit(s2, ") -> ")
-      let s4 = fmt_type(ret, s3)
-      fmt_row(row, s4)
-    }
+    TyFn(params, ret, row) ->
+      fmt_type_seq("(", ")", t.line, params, s, (u) => fmt_row(row, fmt_type(ret, fmt_emit(u, " -> "))))
     # m12.5: `Real<m>`, `Int<kg*m/sec^2>` — dimensioned numerics.
     TyDim(base, u) -> {
       let s1 = fmt_type(base, s)
@@ -282,11 +275,7 @@ pub fn fmt_type(t: TypeExpr, s: FmtSt) : FmtSt {
     TyRow(row) -> fmt_row_bare(row, s)
     # Surface spellings print exactly what the author wrote.
     TySurface(ts) -> match ts {
-      TsTuple(tys) -> {
-        let s1 = fmt_emit(s, "(")
-        let s2 = fmt_type_args(tys, s1)
-        fmt_emit(s2, ")")
-      }
+      TsTuple(tys) -> fmt_type_seq("(", ")", t.line, tys, s, (u) => u)
       TsUnitSpan(raw, inner) -> match inner.tkind {
         TyDim(base, _) -> {
           let s1 = fmt_type(base, s)
@@ -314,18 +303,6 @@ fn fmt_row_bare(row: RowExpr, s: FmtSt) : FmtSt {
         let s2 = fmt_emit(s1, " + ")
         fmt_emit(s2, fmt_row_tail(tail))
       }
-  }
-}
-
-pub fn fmt_type_args(ts: [TypeExpr], s: FmtSt) : FmtSt {
-  match ts {
-    [] -> s
-    [t] -> fmt_type(t, s)
-    [t, ...rest] -> {
-      let s1 = fmt_type(t, s)
-      let s2 = fmt_emit(s1, ", ")
-      fmt_type_args(rest, s2)
-    }
   }
 }
 
@@ -730,20 +707,40 @@ fn fmt_operand(x: Expr, parent_op: String, is_right: Bool, s: FmtSt) : FmtSt = m
 
 fn fmt_paren(x: Expr, s: FmtSt) : FmtSt = fmt_emit(fmt_expr(x, fmt_emit(s, "(")), ")")
 
-pub fn fmt_if(c: Expr, then_e: Expr, else_opt: Option[Expr], s: FmtSt) : FmtSt {
-  let s1 = fmt_emit(s, "if ")
-  let s2 = fmt_stmt_head_expr(c, s1)
-  let s4 = fmt_brace_rest(then_e, s2)
+# `if c { a } else { b }` stays on one line when the author wrote every
+# branch on the `if`'s line and the whole fits; otherwise, and whenever
+# a branch holds more than one statement, the block form.
+pub fn fmt_if(c: Expr, then_e: Expr, else_opt: Option[Expr], s: FmtSt) : FmtSt =
+  if fmt_if_inline_written(fmt_leftmost(c).line, then_e, else_opt) {
+    match fmt_try_flat(s, (t) => fmt_if_form(c, then_e, else_opt, fmt_branch_flat, t)) {
+      Some(r) -> r
+      None -> fmt_if_form(c, then_e, else_opt, fmt_brace_rest, s)
+    }
+  } else { fmt_if_form(c, then_e, else_opt, fmt_brace_rest, s) }
+
+# `if c {` branch [` else {` branch | ` else ` if-chain]; `branch`
+# renders one branch after its opening brace.
+fn fmt_if_form(c: Expr, then_e: Expr, else_opt: Option[Expr], branch: (Expr, FmtSt) -> FmtSt, s: FmtSt) : FmtSt {
+  let s1 = branch(then_e, fmt_stmt_head_expr(c, fmt_emit(s, "if ")))
   match else_opt {
-    None -> s4
-    Some(e) -> {
-      let s5 = fmt_emit(s4, " else ")
-      match e.kind {
-        EIf(_, _, _) -> fmt_expr(e, s5)
-        _ -> fmt_brace_rest(e, fmt_emit(s5, "{"))
-      }
+    None -> s1
+    Some(e) -> match e.kind {
+      EIf(c2, t2, e2) ->
+        fmt_if_form(c2, t2, e2, branch, fmt_drain_before(fmt_emit(s1, " else "), fmt_leftmost(e).line))
+      _ -> branch(e, fmt_emit(s1, " else {"))
     }
   }
+}
+
+fn fmt_branch_flat(br: Expr, s: FmtSt) : FmtSt = match br.kind {
+  EBlock(stmts, tail) -> match stmts {
+    [st] -> fmt_emit(fmt_stmt(st, fmt_emit(s, " ")), " }")
+    _ -> match tail {
+      Some(t) -> fmt_emit(fmt_expr(t, fmt_emit(s, " ")), " }")
+      None -> fmt_emit(s, " }")
+    }
+  }
+  _ -> fmt_emit(fmt_expr(br, fmt_emit(s, " ")), " }")
 }
 
 # An if-condition / match-scrutinee, followed by its ` {`. One whose
@@ -764,15 +761,9 @@ fn fmt_head_expr(e: Expr, s: FmtSt, tail: (FmtSt) -> FmtSt) : FmtSt {
 
 # The rest of a `{ ... }` body after its opening brace has been
 # emitted: a block's statements below it, any other expression inline.
-pub fn fmt_brace_rest(e: Expr, s: FmtSt) : FmtSt {
-  match e.kind {
-    EBlock(stmts, tail) -> fmt_block_rest(stmts, tail, s)
-    _ -> {
-      let s1 = fmt_emit(s, " ")
-      let s2 = fmt_expr(e, s1)
-      fmt_emit(s2, " }")
-    }
-  }
+pub fn fmt_brace_rest(e: Expr, s: FmtSt) : FmtSt = match e.kind {
+  EBlock(stmts, tail) -> fmt_block_rest(stmts, tail, s)
+  _ -> fmt_branch_flat(e, s)
 }
 
 pub fn fmt_match(scrut: Expr, arms: [Arm], s: FmtSt) : FmtSt {
