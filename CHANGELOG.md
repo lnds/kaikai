@@ -84,6 +84,36 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.113.0 (2026-08-19)
+
+### Added
+
+- **fmt**: lay code out against a line width, keeping the author's breaks (#1812) (#1841)
+- **parse**: accept a module qualifier on handler heads, impls and effect ops (#1825)
+- **typer**: one table, one ambiguity warning, every class of name (#1821)
+- **typer**: key variant constructors by their declaring module (#1811)
+- **modules**: preserve the module qualifier of variant constructors through lowering (#1809)
+- **ast**: give every declaration form a module-origin slot (#1808)
+- **parse**: enforce lowercase-initial names for functions and effect operations (#1806)
+
+### Fixed
+
+- **fmt**: keep a one-line if, break op signatures and type bodies on width, attach trailing comments to their item (#1843) (#1844)
+- **typer**: dispatch bare protocol op calls by receiver across homonymous protocols (#1842)
+- **typer**: resolve #[derive] and impl protocol heads by the name ladder (#1840)
+- **resolve**: keep a constant pattern's qualifier, and route every name class through the one ambiguity report (#1839)
+- **ci**: raise the heaviest shard's ceiling to 45, matching the other long jobs
+- **emit**: resolve every constructor lookup through one ladder, and de-collide the compiler's own homonyms (#1832)
+- **kir**: repair the native self-host, and balance the CI that hid it (#1831)
+- **typer**: key the bare declaration registries by their declaring module (#1822)
+- **typer**: give TyCon its declaring module, and key variant tags by home (#1818)
+- **emit**: key handler, clause, finally and test symbols by their enclosing fn (#1820)
+- **perceus**: keep capability params out of the RC lattice (#1804)
+
+### Changed
+
+- **emit**: carry the declaring module through the variant table (#1814)
+
 ## v0.112.1 (2026-08-14)
 
 ### Fixed
