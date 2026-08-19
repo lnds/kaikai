@@ -15068,42 +15068,20 @@ fn synth_record_lit(st: InferState, nm: String, fis: [FieldInit], line: Int, col
   }
 }
 
-# lower a `4.0<USD>` / `42<sec>`-style numeric UoM literal
-# into an inline `Decimal { raw, scale }` record-literal when the
-# surrounding context expects `Decimal<u>`. The rewrite is narrow on
-# purpose:
-#
-#   • Expected type must canonicalise to `Decimal<u_field>`.
-#   • Source AST must be `ELitUnit(EInt | EReal, u_lit)`.
-#   • Units must match (`inf_unit_eq(u_lit, u_field)`); when they don't,
-#     we leave the original AST and let the regular unifier produce
-#     the unit-mismatch diagnostic at the call site.
-#
-# The lowering decodes the numeric value at compile time:
-#   • `n<u>`         → `Decimal { raw: n,  scale: 0 }`
-#   • `4.0<u>`       → `Decimal { raw: 4,  scale: 0 }` (the `%g`
-#     formatter strips trailing zeros, so the source-level scale-2
-#     intent is not preserved — see the `dec_lit` note in
-#     stdlib/decimal.kai for the same trade-off).
-#
-# Returns the rewritten Expr (typed as `Decimal<u_field>`) on a
-# match, the original expression untouched otherwise. The existing
-# unifier picks up from there: on success it sees equal types and
-# produces the empty substitution; on a unit mismatch (or any other
-# fall-through) it surfaces the same diagnostic it produced before
-# this lane landed.
+# Lower a `4.50<USD>` / `42<sec>`-style numeric UoM literal into an inline
+# `Decimal { raw, scale }` when the context expects `Decimal<u>`. The
+# literal is minted from its source digits, so the written scale survives
+# (`10.50<USD>` is scale 2); the scale of an arithmetic result is the
+# operation's to define. On a unit mismatch the AST is left alone and the
+# unifier reports it.
 fn try_lower_decimal_uom_lit(value: Expr, expected: Ty) : Expr {
   match expected {
     TyDimT(TyCon(None, "Decimal", _), u_field) -> match value.kind {
       ELitUnit(inner, u_lit) ->
         if inf_unit_eq(u_lit, u_field) {
           let target_ty = TyDimT(TyCon(None, "Decimal", []), unit_canon(u_field))
-          match inner.kind {
-            EInt(n, _) -> mk_decimal_record(n, 0, value.line, value.col, target_ty)
-            EReal(r, _) -> {
-              let parts = real_to_dec_parts(r)
-              mk_decimal_record(parts.raw, parts.scale, value.line, value.col, target_ty)
-            }
+          match mint_literal(inner, TyCon(None, "Decimal", [])) {
+            MintOk(e) -> with_ty(e, target_ty)
             _ -> value
           }
         } else { value }
@@ -15112,68 +15090,6 @@ fn try_lower_decimal_uom_lit(value: Expr, expected: Ty) : Expr {
     _ -> value
   }
 }
-
-# Build the `Decimal { raw, scale }` record-literal AST node and
-# stamp it with the unit-decorated type. Unit info is erased at the
-# carrier level — this is the same pattern existing UoM literals
-# follow (`Real<USD>` is a TyDimT decoration over a plain Real).
-# `raw` rides an `EFixed` typed `Int128` (the carrier's field type);
-# a bare `EInt` would emit a 64-bit Int and trap in boxed arithmetic.
-fn mk_decimal_record(raw: Int, scale: Int, line: Int, col: Int, ty: Ty) : Expr {
-  let raw_lit = with_ty(mk_expr(EFixed(int_to_string(raw), TyInt128), line, col), TyInt128)
-  let scale_lit = mk_expr(mk_int_synth(scale), line, col)
-  let fields = [FI("raw", raw_lit), FI("scale", scale_lit)]
-  with_ty(mk_expr(ERecordLit("Decimal", fields), line, col), ty)
-}
-
-# Decode an EReal value into the carrier's `(raw, scale)` parts via
-# the platform's `%g` formatter (re-using the same path the runtime
-# uses for `decimal.parse`). `%g` strips trailing zeros, so a source
-# literal `4.00<USD>` lowers as `{ raw: 4, scale: 0 }` rather than
-# `{ raw: 400, scale: 2 }` — mathematically equivalent under
-# `dec_align`/`decimal.eq`, lossy on stringification scale. A
-# scale-preserving variant is a follow-up that needs source-span
-# preservation on numeric literals.
-type DecParts = { raw: Int, scale: Int }
-
-fn real_to_dec_parts(r: Real) : DecParts {
-  let s = real_to_string(r)
-  let n = string_length(s)
-  let neg_check = match char_at(s, 0) { Some(c) -> c == '-' None -> false }
-  let body_start = if neg_check { 1 } else { 0 }
-  let dot = real_dec_find_dot(s, body_start, n)
-  if dot < 0 {
-    let mag = parse_decimal_or_zero(string_slice(s, body_start, n - body_start))
-    let signed = if neg_check { 0 - mag } else { mag }
-    DecParts { raw: signed, scale: 0 }
-  } else {
-    let int_str = string_slice(s, body_start, dot - body_start)
-    let frac_str = string_slice(s, dot + 1, n - dot - 1)
-    let frac_len = string_length(frac_str)
-    let int_mag = parse_decimal_or_zero(int_str)
-    let frac_v = parse_decimal_or_zero(frac_str)
-    let mag = int_mag * pow10_int(frac_len) + frac_v
-    let signed = if neg_check { 0 - mag } else { mag }
-    DecParts { raw: signed, scale: frac_len }
-  }
-}
-
-fn real_dec_find_dot(s: String, i: Int, n: Int) : Int {
-  if i >= n { 0 - 1 }
-  else { match char_at(s, i) {
-    None    -> 0 - 1
-    Some(c) -> if c == '.' { i } else { real_dec_find_dot(s, i + 1, n) }
-  } }
-}
-
-fn parse_decimal_or_zero(s: String) : Int =
-  match parse_decimal(s) { Some(v) -> v None -> 0 }
-
-fn pow10_int(n: Int) : Int =
-  if n <= 0 { 1 } else { pow10_int_loop(1, n) }
-
-fn pow10_int_loop(acc: Int, n: Int) : Int =
-  if n <= 0 { acc } else { pow10_int_loop(acc * 10, n - 1) }
 
 # Same rewrite, threading the resulting type back to the caller so
 # downstream unify sees equal types. Returned ty is the input
