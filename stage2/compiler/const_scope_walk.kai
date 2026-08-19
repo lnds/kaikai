@@ -1,151 +1,52 @@
-# compiler/const_scope_walk.kai — the scope-aware expression walk
-# behind const_scope. `sh` accumulates the lexically bound names; a
-# bound name is never rewritten.
+# compiler/const_scope_walk.kai — the const_scope leaf over the
+# shared scope walk: a free read of a colliding const name is keyed to
+# its owning module; a bound name is never rewritten.
 
 import compiler.util
 import compiler.ast
 import compiler.modules
+import compiler.scope_walk
 import compiler.const_scope_table
 
 #[doc("Names bound by a param list, prepended onto `acc`.")]
-pub fn cs_params(ps: [Param], acc: [String]) : [String] = match ps {
-  [] -> acc
-  [p, ...rest] -> cs_params(rest, [p.pname, ...acc])
-}
+pub fn cs_params(ps: [Param], acc: [String]) : [String] = sw_params(ps, acc)
 
 fn cs_re(e: Expr, k: ExprKind) : Expr =
   Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 #[doc("Rewrite the free reads of colliding const names in one expression; `sh` holds the names already bound in scope.")]
-pub fn cs_expr(e: Expr, sh: [String], cx: CSCtx) : Expr = match e.kind {
+pub fn cs_expr(e: Expr, sh: [String], cx: CSCtx) : Expr =
+  sw_expr(e, sh, (x, s) => cs_leaf(x, s, cx), (t) => t, (n) => n)
+
+# `mod.NAME` where NAME is a colliding pub const of `mod`: key it
+# here — rqc collapses an uppercase qualified export to a bare
+# `EVar` (the variant-ctor rule), which would lose the module. The
+# qualifier maps through `mt` first: an aliased import collides
+# under its tagged name, not the name the file wrote.
+# Private consts fall through so rqc / pub-access still diagnose.
+fn cs_leaf(e: Expr, sh: [String], cx: CSCtx) : Option[Expr] = match e.kind {
   EVar(nm) ->
-    if not cx.free or list_has(sh, nm) { e }
+    if not cx.free or list_has(sh, nm) { Some(e) }
     else { match cs_owner(cx, nm) {
-      Some(m) -> if m == cx.target { e } else { cs_re(e, EModCall(m, nm)) }
-      None    -> e
+      Some(m) -> if m == cx.target { Some(e) } else { Some(cs_re(e, EModCall(m, nm))) }
+      None    -> Some(e)
     } }
-  ECall(callee, args_) ->
-    cs_re(e, ECall(cs_expr(callee, sh, cx), cs_exprs(args_, sh, cx)))
-  # `mod.NAME` where NAME is a colliding pub const of `mod`: key it
-  # here — rqc collapses an uppercase qualified export to a bare
-  # `EVar` (the variant-ctor rule), which would lose the module. The
-  # qualifier maps through `mt` first: an aliased import collides
-  # under its tagged name, not the name the file wrote.
-  # Private consts fall through so rqc / pub-access still diagnose.
   EField(obj, f) -> match obj.kind {
     EVar(m) -> {
       let tm = mt_tagged_name(cx.mt, m)
       if not list_has(sh, m) and cs_is_pub_const(cx.coll, f, tm) {
-        cs_re(e, EModCall(tm, f))
-      } else { cs_re(e, EField(cs_expr(obj, sh, cx), f)) }
+        Some(cs_re(e, EModCall(tm, f)))
+      } else { None }
     }
-    _ -> cs_re(e, EField(cs_expr(obj, sh, cx), f))
+    _ -> None
   }
-  EIndex(a, b) -> cs_re(e, EIndex(cs_expr(a, sh, cx), cs_expr(b, sh, cx)))
-  EBinop(op, a, b) -> cs_re(e, EBinop(op, cs_expr(a, sh, cx), cs_expr(b, sh, cx)))
-  EUnop(op, x) -> cs_re(e, EUnop(op, cs_expr(x, sh, cx)))
-  EIf(c, t_, eo) ->
-    cs_re(e, EIf(cs_expr(c, sh, cx), cs_expr(t_, sh, cx), cs_expr_opt(eo, sh, cx)))
-  EMatch(scr, arms) ->
-    cs_re(e, EMatch(cs_expr(scr, sh, cx), cs_arms(arms, sh, cx)))
-  ELambda(ps, body) ->
-    cs_re(e, ELambda(ps, cs_expr(body, cs_params(ps, sh), cx)))
-  ERecordLit(n, fis) -> cs_re(e, ERecordLit(n, cs_fis(fis, sh, cx)))
-  EList(els) -> cs_re(e, EList(cs_elems(els, sh, cx)))
-  ERange(a, b, stp) ->
-    cs_re(e, ERange(cs_expr(a, sh, cx), cs_expr(b, sh, cx), cs_expr_opt(stp, sh, cx)))
-  EBlock(ss, tail) -> match cs_stmts(ss, sh, cx, []) {
-    CSS(ss1, sh1) -> cs_re(e, EBlock(ss1, cs_expr_opt(tail, sh1, cx)))
-  }
-  EPipe(a, b) -> cs_re(e, EPipe(cs_expr(a, sh, cx), cs_expr(b, sh, cx)))
-  EMapPipe(a, b) -> cs_re(e, EMapPipe(cs_expr(a, sh, cx), cs_expr(b, sh, cx)))
-  EFlatMapPipe(a, b) -> cs_re(e, EFlatMapPipe(cs_expr(a, sh, cx), cs_expr(b, sh, cx)))
-  EFilterPipe(a, b) -> cs_re(e, EFilterPipe(cs_expr(a, sh, cx), cs_expr(b, sh, cx)))
-  EBang(x) -> cs_re(e, EBang(cs_expr(x, sh, cx)))
-  EHandle(body, eff, tas, init, alias, hcs, ret) -> {
-    let shb = match alias { Some(a) -> [a, ...sh]  None -> sh }
-    cs_re(e, EHandle(cs_expr(body, shb, cx), eff, tas,
-                     cs_expr_opt(init, sh, cx), alias,
-                     cs_hclauses(hcs, sh, cx), cs_hreturn_opt(ret, sh, cx)))
-  }
-  EIntrinsic(n, args_) -> cs_re(e, EIntrinsic(n, cs_exprs(args_, sh, cx)))
-  _ -> e
-}
-
-fn cs_exprs(es: [Expr], sh: [String], cx: CSCtx) : [Expr] = match es {
-  [] -> []
-  [x, ...rest] -> [cs_expr(x, sh, cx), ...cs_exprs(rest, sh, cx)]
-}
-
-fn cs_expr_opt(o: Option[Expr], sh: [String], cx: CSCtx) : Option[Expr] = match o {
-  None -> None
-  Some(x) -> Some(cs_expr(x, sh, cx))
-}
-
-fn cs_fis(fis: [FieldInit], sh: [String], cx: CSCtx) : [FieldInit] = match fis {
-  [] -> []
-  [FI(f, x), ...rest] -> [FI(f, cs_expr(x, sh, cx)), ...cs_fis(rest, sh, cx)]
-}
-
-fn cs_elems(els: [ListElem], sh: [String], cx: CSCtx) : [ListElem] = match els {
-  [] -> []
-  [el, ...rest] -> {
-    let el1 = match el {
-      ElPlain(x)  -> ElPlain(cs_expr(x, sh, cx))
-      ElSpread(x) -> ElSpread(cs_expr(x, sh, cx))
-    }
-    [el1, ...cs_elems(rest, sh, cx)]
-  }
-}
-
-fn cs_arms(arms: [Arm], sh: [String], cx: CSCtx) : [Arm] = match arms {
-  [] -> []
-  [Arm(p, g, body), ...rest] -> {
-    let shb = pat_binders(p, sh)
-    [Arm(p, cs_expr_opt(g, shb, cx), cs_expr(body, shb, cx)),
-     ...cs_arms(rest, sh, cx)]
-  }
+  _ -> None
 }
 
 #[doc("Rewrite the bodies of a handler-clause list; each clause binds its op params and `resume`.")]
-pub fn cs_hclauses(hcs: [HClause], sh: [String], cx: CSCtx) : [HClause] = match hcs {
-  [] -> []
-  [HC(op, ps, body, l, c), ...rest] -> {
-    let shc = ["resume", ...cs_params(ps, sh)]
-    [HC(op, ps, cs_expr(body, shc, cx), l, c), ...cs_hclauses(rest, sh, cx)]
-  }
-}
+pub fn cs_hclauses(hcs: [HClause], sh: [String], cx: CSCtx) : [HClause] =
+  sw_hclauses(hcs, sh, (x, s) => cs_leaf(x, s, cx), (t) => t, (n) => n)
 
 #[doc("Rewrite a handler `return(x)` clause body; `x` is bound inside it.")]
 pub fn cs_hreturn_opt(o: Option[HReturn], sh: [String], cx: CSCtx) : Option[HReturn] =
-  match o {
-    None -> None
-    Some(HR(x, body, l, c)) -> Some(HR(x, cs_expr(body, [x, ...sh], cx), l, c))
-  }
-
-# A statement list threads its binders forward: a `let` / `var` name
-# scopes over the remaining statements and the block tail.
-type CSStmts = CSS([Stmt], [String])
-
-fn cs_stmts(ss: [Stmt], sh: [String], cx: CSCtx, acc: [Stmt]) : CSStmts = match ss {
-  [] -> CSS(list_reverse(acc), sh)
-  [s, ...rest] ->
-    cs_stmts(rest, cs_stmt_binders(s, sh), cx, [cs_stmt(s, sh, cx), ...acc])
-}
-
-fn cs_stmt(s: Stmt, sh: [String], cx: CSCtx) : Stmt = match s {
-  SLet(p, t, x) -> SLet(p, t, cs_expr(x, sh, cx))
-  SAssert(x, mo) -> SAssert(cs_expr(x, sh, cx), cs_expr_opt(mo, sh, cx))
-  SExprStmt(x) -> SExprStmt(cs_expr(x, sh, cx))
-  SIndexAssign(a, b, c, l, cc) ->
-    SIndexAssign(cs_expr(a, sh, cx), cs_expr(b, sh, cx), cs_expr(c, sh, cx), l, cc)
-  SAssign(a, b, l, c) -> SAssign(cs_expr(a, sh, cx), cs_expr(b, sh, cx), l, c)
-  SVar(n, t, x, l, c) -> SVar(n, t, cs_expr(x, sh, cx), l, c)
-  SUse(_, _, _) -> s
-}
-
-fn cs_stmt_binders(s: Stmt, sh: [String]) : [String] = match s {
-  SLet(p, _, _)       -> pat_binders(p, sh)
-  SVar(n, _, _, _, _) -> [n, ...sh]
-  _ -> sh
-}
+  sw_hreturn_opt(o, sh, (x, s) => cs_leaf(x, s, cx), (t) => t, (n) => n)

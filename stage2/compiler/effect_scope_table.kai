@@ -1,0 +1,128 @@
+# compiler/effect_scope_table.kai — which effect names are contested,
+# and what a name means from one module's viewpoint.
+#
+# Two modules may each declare `effect Emit`. Everything downstream —
+# the row typer, the handler typing, the evidence struct, the runtime
+# label the perform looks up — keys an effect on its spelling alone,
+# so a contested name is given a home-spelled one per declaring module
+# (`Emit__ea`) before any of that runs. Core and root declarations
+# keep the bare spelling: the core is the implicit prelude, the root
+# is the program.
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+
+#[doc("One effect declaration: `ESE(name, home, pub)`. Root declarations carry the target module as home.")]
+pub type ESEntry = ESE(String, String, Bool)
+
+#[doc("What one module sees: the contested declarations, its own home, the root's, the core homes, the tagged names of its imports, and its qualifier table.")]
+pub type ESCtx = { coll: [ESEntry], home: String, target: String, cores: [String],
+                   imports: [String], mt: [ModuleEntry] }
+
+#[doc("The effect declarations of `decls` whose name another home also declares, in stream order.")]
+pub fn es_collect(decls: [Decl], target: String) : [ESEntry] = {
+  let all = es_entries(decls, target, [])
+  es_keep_contested(all, all, [])
+}
+
+fn es_entries(ds: [Decl], target: String, acc: [ESEntry]) : [ESEntry] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> es_entries(rest, target, es_entry(d, target, acc))
+}
+
+fn es_entry(d: Decl, target: String, acc: [ESEntry]) : [ESEntry] = match d {
+  DEffect(p, n, _, _, _, _, _, mo) ->
+    [ESE(n, match mo { Some(m) -> m  None -> target }, p), ...acc]
+  DDoc(_, _, inner, _, _) -> es_entry(inner, target, acc)
+  DAttr(_, inner, _, _)   -> es_entry(inner, target, acc)
+  DUnstable(inner, _, _)  -> es_entry(inner, target, acc)
+  _ -> acc
+}
+
+fn es_keep_contested(all: [ESEntry], todo: [ESEntry], acc: [ESEntry]) : [ESEntry] = match todo {
+  [] -> list_reverse(acc)
+  [e, ...rest] -> match e {
+    ESE(n, home, _) ->
+      if es_other_home(all, n, home) { es_keep_contested(all, rest, [e, ...acc]) }
+      else { es_keep_contested(all, rest, acc) }
+  }
+}
+
+fn es_other_home(t: [ESEntry], name: String, home: String) : Bool = match t {
+  [] -> false
+  [ESE(n, h, _), ...rest] ->
+    if n == name and h != home { true } else { es_other_home(rest, name, home) }
+}
+
+#[doc("The spelling of effect `name` declared by `home`: home-spelled when contested and neither core nor root, else bare.")]
+pub fn es_spell(cx: ESCtx, name: String, home: String) : String =
+  if home == cx.target or list_has(cx.cores, home) or not es_declares(cx.coll, name, home) { name }
+  else { concat_all([name, "__", es_ident(home)]) }
+
+# A module path's dots are not identifier characters downstream.
+fn es_ident(home: String) : String = es_ident_loop(home, 0, string_length(home), "")
+
+fn es_ident_loop(s: String, i: Int, n: Int, acc: String) : String =
+  if i >= n { acc }
+  else { match char_at(s, i) {
+    Some(c) -> {
+      let piece = if c == '.' { "_" } else { int_to_byte_string(char_to_int(c)) }
+      es_ident_loop(s, i + 1, n, string_concat(acc, piece))
+    }
+    None    -> acc
+  } }
+
+#[doc("The name the user wrote for a declaration spelled by `es_spell`: the home suffix removed when the declaration carries that home.")]
+pub fn es_display(name: String, mo: Option[String]) : String = match mo {
+  None -> name
+  Some(m) -> {
+    let suffix = string_concat("__", es_ident(m))
+    let n = string_length(name)
+    let k = string_length(suffix)
+    if n > k and string_slice(name, n - k, k) == suffix { string_slice(name, 0, n - k) }
+    else { name }
+  }
+}
+
+fn es_declares(t: [ESEntry], name: String, home: String) : Bool = match t {
+  [] -> false
+  [ESE(n, h, _), ...rest] ->
+    if n == name and h == home { true } else { es_declares(rest, name, home) }
+}
+
+#[doc("The spelling a bare `name` denotes from the context's home, by the name ladder: the module's own declaration, else the one visible import that exports it, else the bare name (core, root, ambiguous or unknown).")]
+pub fn es_resolve(cx: ESCtx, name: String) : String =
+  if es_declares(cx.coll, name, cx.home) { es_spell(cx, name, cx.home) }
+  else { match es_imported(cx.coll, name, cx.imports, []) {
+    [h] -> es_spell(cx, name, h)
+    _   -> name
+  } }
+
+#[doc("The homes a bare `name` must choose between from the context's home, or `[]` when the ladder settles it.")]
+pub fn es_contested(cx: ESCtx, name: String) : [String] =
+  if es_declares(cx.coll, name, cx.home) { [] }
+  else { match es_imported(cx.coll, name, cx.imports, []) {
+    [_] -> []
+    homes -> list_reverse(homes)
+  } }
+
+fn es_imported(t: [ESEntry], name: String, imports: [String], acc: [String]) : [String] = match t {
+  [] -> acc
+  [ESE(n, h, p), ...rest] ->
+    if n == name and p and list_has(imports, h) and not list_has(acc, h) {
+      es_imported(rest, name, imports, [h, ...acc])
+    } else { es_imported(rest, name, imports, acc) }
+}
+
+#[doc("The spelling a qualified `mod.name` denotes, when `mod` is a visible module exporting a contested `name`; None leaves the qualifier for the qualifier passes.")]
+pub fn es_resolve_qualified(cx: ESCtx, mod: String, name: String) : Option[String] =
+  match mt_lookup(cx.mt, mod) {
+    None -> None
+    Some(me) -> {
+      let home = mt_tagged_name(cx.mt, mod)
+      if me_has_export(me, name) and es_declares(cx.coll, name, home) {
+        Some(es_spell(cx, name, home))
+      } else { None }
+    }
+  }

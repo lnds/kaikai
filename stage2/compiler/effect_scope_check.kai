@@ -1,0 +1,117 @@
+# compiler/effect_scope_check.kai — the root's ambiguous bare effect
+# names. A bare name the ladder cannot settle stays bare, and the
+# resolver would report it as unknown; it is named as an ambiguity
+# here instead, before that.
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+import compiler.diag_file
+import compiler.expr_positions
+import compiler.name_table
+import compiler.name_report
+import compiler.effect_scope_table
+import compiler.effect_scope
+#[doc("Report every bare effect name of the root file that the ladder leaves contested; returns the error count.")]
+pub fn eschk_segmented(segs: [ImportSeg], decls: [Decl], coll: [ESEntry],
+      scopes: [ModScope], global: [ModuleEntry], target: String,
+      cores: [String], df: DiagFiles) : Int / Console + File =
+  if list_length(coll) == 0 { 0 }
+  else {
+    let cx = es_ctx(coll, target, target, cores, scopes, global, scope_imports(scopes, global))
+    eschk_decls(seg_root(segs, decls), cx, df_root(df), 0)
+  }
+
+fn seg_root(segs: [ImportSeg], decls: [Decl]) : [Decl] = match segs {
+  [] -> decls
+  [ISeg(_, n), ...rest] -> seg_root(rest, seg_drop(decls, n))
+}
+
+fn eschk_decls(ds: [Decl], cx: ESCtx, file: String, errs: Int) : Int / Console + File = match ds {
+  [] -> errs
+  [d, ...rest] -> eschk_decls(rest, cx, file, errs + eschk_decl(d, cx, file))
+}
+
+fn eschk_decl(d: Decl, cx: ESCtx, file: String) : Int / Console + File = match d {
+  DFn(_, _, _, ps, ret, row, body, l, c, _) ->
+    eschk_row(row, cx, file, l, c) + eschk_tys(es_param_tys(ps, []), cx, file, l, c) +
+    eschk_ty_opt(ret, cx, file, l, c) + eschk_expr(body, cx, file)
+  DConst(_, _, ty, body, _, l, c) -> eschk_ty(ty, cx, file, l, c) + eschk_expr(body, cx, file)
+  DTest(_, body, _, _, _)  -> eschk_expr(body, cx, file)
+  DBench(_, body, _, _, _) -> eschk_expr(body, cx, file)
+  DCheck(_, _, body, _, _, _) -> eschk_expr(body, cx, file)
+  DUse(eff, l, c) -> eschk_name(eff, cx, file, l, c)
+  DDerive(_, inner, _, _)        -> eschk_decl(inner, cx, file)
+  DUnstable(inner, _, _)         -> eschk_decl(inner, cx, file)
+  DProtoLaws(_, inner, _, _, _)  -> eschk_decl(inner, cx, file)
+  DImplAxiom(_, inner, _, _, _)  -> eschk_decl(inner, cx, file)
+  DConstructor(inner, _, _)      -> eschk_decl(inner, cx, file)
+  DDoc(_, _, inner, _, _)        -> eschk_decl(inner, cx, file)
+  DAttr(_, inner, _, _)          -> eschk_decl(inner, cx, file)
+  _ -> 0
+}
+
+fn es_param_tys(ps: [Param], acc: [TypeExpr]) : [TypeExpr] = match ps {
+  [] -> acc
+  [p, ...rest] -> match p.ptype {
+    Some(t) -> es_param_tys(rest, [t, ...acc])
+    None -> es_param_tys(rest, acc)
+  }
+}
+
+fn eschk_tys(ts: [TypeExpr], cx: ESCtx, file: String, l: Int, c: Int) : Int / Console + File = match ts {
+  [] -> 0
+  [t, ...rest] -> eschk_ty(t, cx, file, l, c) + eschk_tys(rest, cx, file, l, c)
+}
+
+fn eschk_ty_opt(o: Option[TypeExpr], cx: ESCtx, file: String, l: Int, c: Int) : Int / Console + File = match o {
+  None -> 0
+  Some(t) -> eschk_ty(t, cx, file, l, c)
+}
+
+fn eschk_ty(t: TypeExpr, cx: ESCtx, file: String, l: Int, c: Int) : Int / Console + File = match t.tkind {
+  TyName(_, ts) -> eschk_tys(ts, cx, file, l, c)
+  TyList(x) -> eschk_ty(x, cx, file, l, c)
+  TyFn(ps, r, row) -> eschk_tys(ps, cx, file, l, c) + eschk_ty(r, cx, file, l, c) + eschk_row(row, cx, file, l, c)
+  TyDim(x, _) -> eschk_ty(x, cx, file, l, c)
+  TyRefine(x, _) -> eschk_ty(x, cx, file, l, c)
+  TyRow(row) -> eschk_row(row, cx, file, l, c)
+  _ -> 0
+}
+
+# A row label carries no position of its own; the declaration's stands in.
+fn eschk_row(r: RowExpr, cx: ESCtx, file: String, l: Int, c: Int) : Int / Console + File = match r {
+  REmpty -> 0
+  RClosed(ls) -> eschk_labels(ls, cx, file, l, c)
+  ROpen(_, ls) -> eschk_labels(ls, cx, file, l, c)
+}
+
+fn eschk_labels(ls: [RowLabel], cx: ESCtx, file: String, l: Int, c: Int) : Int / Console + File = match ls {
+  [] -> 0
+  [lab, ...rest] -> match lab {
+    RL(n, ts) -> eschk_name(n, cx, file, l, c) + eschk_tys(ts, cx, file, l, c) + eschk_labels(rest, cx, file, l, c)
+  }
+}
+
+fn eschk_expr(e: Expr, cx: ESCtx, file: String) : Int / Console + File = {
+  let here = match e.kind {
+    EHandle(_, eff, _, _, _, _, _) -> eschk_name(eff, cx, file, e.line, e.col)
+    EField(obj, _) -> match obj.kind {
+      EVar(n) -> eschk_name(n, cx, file, obj.line, obj.col)
+      _ -> 0
+    }
+    _ -> 0
+  }
+  here + eschk_children(xp_positions(e), cx, file)
+}
+
+fn eschk_children(ps: [XPos], cx: ESCtx, file: String) : Int / Console + File = match ps {
+  [] -> 0
+  [XP(_, child), ...rest] -> eschk_expr(child, cx, file) + eschk_children(rest, cx, file)
+}
+
+fn eschk_name(n: String, cx: ESCtx, file: String, l: Int, c: Int) : Int / Console + File =
+  match es_contested(cx, n) {
+    [] -> 0
+    homes -> { nr_error_ambiguous(file, l, c, NCEffect, n, homes, ""); 1 }
+  }

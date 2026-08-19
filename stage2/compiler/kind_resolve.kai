@@ -39,20 +39,35 @@ import compiler.unit_scope
 # (kind, theory) pairs the unit formation check dispatches on, the
 # value-domain (form-b) kinds as `KI(domain, kind)`, the closed-set
 # kinds, and the per-module habitant declaration sites.
-pub type KindCtx = KCtx([SymKinds], [HomedDecl], [String], [KindTheory], [KindIntro], [ClosedKind], [HabSlots], [UnitSite])
+pub type KindCtx = KCtx([SymKinds], [HomedDecl], [String], [KindTheory], [KindIntro], [ClosedKind], [HabSlots], [UnitSite], HabView)
+
+#[doc("What a module may see of foreign habitant declarations: each module's direct imports (tagged names, `\"\"` = root) and the core homes, seen by every module. Empty lists make every exported site visible.")]
+pub type HabView = { imports: [ModImports], cores: [String] }
+
+#[doc("The view that keeps every exported foreign site visible.")]
+pub fn hab_view_all() : HabView = HabView { imports: [], cores: [] }
+
+#[doc("A view over the per-file import table, whose root owner is `\"\"` where the habitant passes key the root by its module name.")]
+pub fn hab_view_of(imports: [ModImports], cores: [String], root: String) : HabView =
+  HabView { imports: map(imports, (i) => hab_view_rekey(i, root)), cores: cores }
+
+fn hab_view_rekey(i: ModImports, root: String) : ModImports = match i {
+  MImp(owner, names) -> if owner == "" { MImp(root, names) } else { i }
+}
 
 # The set of kinds a single habitant symbol inhabits.
 pub type SymKinds = SK(String, [String])
 #                      sym     kinds
 
-fn kc_syms(c: KindCtx) : [SymKinds] = match c { KCtx(s, _, _, _, _, _, _, _) -> s }
-fn kc_uses(c: KindCtx) : [HomedDecl] = match c { KCtx(_, u, _, _, _, _, _, _) -> u }
-fn kc_aliases(c: KindCtx) : [String] = match c { KCtx(_, _, a, _, _, _, _, _) -> a }
-fn kc_theories(c: KindCtx) : [KindTheory] = match c { KCtx(_, _, _, m, _, _, _, _) -> m }
-fn kc_doms(c: KindCtx) : [KindIntro] = match c { KCtx(_, _, _, _, ds, _, _, _) -> ds }
-fn kc_closed(c: KindCtx) : [ClosedKind] = match c { KCtx(_, _, _, _, _, cs, _, _) -> cs }
-fn kc_hab_slots(c: KindCtx) : [HabSlots] = match c { KCtx(_, _, _, _, _, _, hs, _) -> hs }
-fn kc_sites(c: KindCtx) : [UnitSite] = match c { KCtx(_, _, _, _, _, _, _, us) -> us }
+fn kc_syms(c: KindCtx) : [SymKinds] = match c { KCtx(s, _, _, _, _, _, _, _, _) -> s }
+fn kc_uses(c: KindCtx) : [HomedDecl] = match c { KCtx(_, u, _, _, _, _, _, _, _) -> u }
+fn kc_aliases(c: KindCtx) : [String] = match c { KCtx(_, _, a, _, _, _, _, _, _) -> a }
+fn kc_theories(c: KindCtx) : [KindTheory] = match c { KCtx(_, _, _, m, _, _, _, _, _) -> m }
+fn kc_doms(c: KindCtx) : [KindIntro] = match c { KCtx(_, _, _, _, ds, _, _, _, _) -> ds }
+fn kc_closed(c: KindCtx) : [ClosedKind] = match c { KCtx(_, _, _, _, _, cs, _, _, _) -> cs }
+fn kc_hab_slots(c: KindCtx) : [HabSlots] = match c { KCtx(_, _, _, _, _, _, hs, _, _) -> hs }
+fn kc_sites(c: KindCtx) : [UnitSite] = match c { KCtx(_, _, _, _, _, _, _, us, _) -> us }
+fn kc_view(c: KindCtx) : HabView = match c { KCtx(_, _, _, _, _, _, _, _, v) -> v }
 
 # The unit-symbol scope threaded through the unit-hygiene validator: the
 # file's kind context plus the locally-bound unit-kind tparams
@@ -102,11 +117,12 @@ atomic (Module + Composition) kinds the formation guard reads. The
 resolve without importing a habitant file. `sites` carries each
 habitant declaration's home module, for module-scoped resolution.
 """)]
-pub fn build_kind_ctx(decls: [Decl], reg: KindReg, sites: [UnitSite]) : KindCtx =
+pub fn build_kind_ctx(decls: [Decl], reg: KindReg, sites: [UnitSite],
+      view: HabView) : KindCtx =
   KCtx(bkc_syms(decls, reg, base_habitant_syms()), bkc_uses(decls, []),
        bkc_aliases(decls, []), atomic_kind_theories(decls),
        value_domain_kinds(decls), closed_kind_sets(decls),
-       habitant_slot_decls(decls), sites)
+       habitant_slot_decls(decls), sites, view)
 
 # The base habitant->kinds seed: the shipped `Layout` habitants,
 # taken straight from the Composition engine's atom set so the
@@ -333,7 +349,7 @@ fn rs_chosen_kind(c: KindCtx, home: String, kinds: [String]) : String = match ki
 # expands by bare name, so no spelling separates the candidates.
 fn rs_foreign(c: KindCtx, sym: String, sites: [UnitSite],
       home: String) : SymRes = {
-  let vis = unit_sites_pub_foreign(sites, home)
+  let vis = rs_visible_rung(c, unit_sites_pub_foreign(sites, home), home)
   let homes = unit_sites_homes(vis)
   match homes {
     [] -> SRok(sym)   # only non-exported foreign declarations: the privacy validator reports the reference
@@ -347,6 +363,23 @@ fn rs_foreign(c: KindCtx, sym: String, sites: [UnitSite],
         }
       }
   }
+}
+
+# The foreign sites `home` may see: those of the modules it imports and
+# of the cores, which every module sees without importing. No home (the
+# validator's view of a symbol the rewrite left bare) sees every exported
+# site, as does a view with neither imports nor cores.
+fn rs_visible_rung(c: KindCtx, vis: [UnitSite], home: String) : [UnitSite] =
+  if home == "" { vis }
+  else {
+    let v = kc_view(c)
+    let seen = unit_sites_in(vis, list_append(mod_imports_of(v.imports, home), v.cores))
+    if list_length(seen) > 0 { seen } else { vis }
+  }
+
+fn mod_imports_of(imps: [ModImports], home: String) : [String] = match imps {
+  [] -> []
+  [MImp(o, names), ...rest] -> if o == home { names } else { mod_imports_of(rest, home) }
 }
 
 fn rs_foreign_kind(c: KindCtx, sym: String, home: String, vis: [UnitSite],
@@ -418,8 +451,8 @@ rename queue for the declarations themselves); `target` names the root
 module for the streaming home attribution of use sites.
 """)]
 pub fn resolve_kinds_decls(decls: [Decl], reg: KindReg, sites: [UnitSite],
-      target: String) : [Decl] {
-  let ctx = build_kind_ctx(decls, reg, sites)
+      target: String, view: HabView) : [Decl] {
+  let ctx = build_kind_ctx(decls, reg, sites, view)
   resolve_kinds_loop(decls, ctx, target, target, sites, [])
 }
 
@@ -574,7 +607,7 @@ fn rk_impl_home(ms: [Decl], cur: String, target: String) : String = match ms {
 # for a symbol declared in no kind (undeclared).
 #[doc("The kinds a bare habitant symbol inhabits, for the ambiguity diagnostic.")]
 pub fn sym_candidate_kinds(reg: KindReg, decls: [Decl], sym: String) : [String] =
-  sym_kinds_lookup(build_kind_ctx(decls, reg, []), sym)
+  sym_kinds_lookup(build_kind_ctx(decls, reg, [], hab_view_all()), sym)
 
 #[doc("""
 Drop every `DKind` / `DUseKind` from the stream. Run after kind

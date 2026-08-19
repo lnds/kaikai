@@ -331,11 +331,13 @@ requires.
 
 **Effect evidence.** The `Ev` struct type is module-qualified while the
 runtime evidence label is bare, so push and lookup disagree and an op
-call reads a function pointer at the wrong offset. The current source
-documents this mismatch as an explanation rather than a defect. Both
-sides key on `<home>::<E>`. Fixed runtime labels (`Cancel`, `Link`,
-`Monitor`, `Spawn`, `Actor`) are core-homed, so their spelling is
-unchanged.
+call reads a function pointer at the wrong offset. Both sides now key
+on one spelling: a contested effect name is respelled per declaring
+module (`Emit__ea`) before resolution, in the declaration, every row
+label, handler head, `use`, and perform, so the typer, the evidence
+struct and the runtime label all see distinct effects. Core and root
+declarations keep the bare spelling, so the fixed runtime labels
+(`Cancel`, `Link`, `Monitor`, `Spawn`, `Actor`) are unchanged.
 
 **`extern "C"` is the deliberate exception.** The emitted symbol must
 match the foreign library, so it cannot be namespaced. Kaikai-side the
