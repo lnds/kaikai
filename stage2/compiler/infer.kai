@@ -11117,7 +11117,12 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
                 let ty = apply_ty(st2.sub, rv.ty)
                 # emit `EModCall(<mod>, nm)` so codegen
                 # mints `kai_<mod>__<nm>` directly.
-                let callee_node = with_ty(mk_expr(EModCall(pick.mod, nm), callee.line, callee.col), pick.inst_ty)
+                # A dispatcher stays bare: the protocol rewrite picks the
+                # impl by receiver, and a module-qualified dispatcher
+                # spelling is reserved for the interpolation sugar's `show`.
+                let callee_kind = if inf_string_starts_with_q(nm, "__proto_") { EVar(nm) }
+                                  else { EModCall(pick.mod, nm) }
+                let callee_node = with_ty(mk_expr(callee_kind, callee.line, callee.col), pick.inst_ty)
                 let root = with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty)
                 Some(mk_inferred(st2, ty, root))
               }
@@ -14475,6 +14480,9 @@ fn collect_escaped_names_kind(k: ExprKind, acc: [String]) : [String] {
       let callee_ty = match callee.ty { Some(t) -> t  None -> TyAny }
       let safe = match callee.kind {
         EVar(_) -> true
+        # A module-qualified dispatcher (`m.__proto_show`) is a named
+        # callee like any bare one.
+        EModCall(_, n) -> inf_string_starts_with_q(n, "__proto_") or ty_callee_has_mutable(callee_ty)
         _       -> ty_callee_has_mutable(callee_ty)
       }
       let a0 = collect_escaped_names(callee, acc)
@@ -20933,8 +20941,37 @@ pub fn prepend_reverse_decls(xs: [Decl], acc: [Decl]) : [Decl] {
 # (or vice versa). The legacy `rerank_recs_for` patch is no longer
 # load-bearing once every call site goes through this partition.
 #[doc("infer: partition a post-cascade flat decl stream into per-module sub-streams, attributing each decl to its declaring module.")]
-pub fn partition_decls_by_home(decls: [Decl], target_mod: String) : [ModuleDecls] = {
-  partition_by_homes_loop(decls, target_mod, [])
+pub fn partition_decls_by_home(decls: [Decl], target_mod: String) : [ModuleDecls] =
+  target_bucket_last(partition_by_homes_loop(decls, target_mod, []), target_mod)
+
+# The target is typed after every module it may import. First-appearance
+# order does not guarantee that: a module whose only declarations are
+# protocols and impls contributes nothing to the stream until the
+# lowered impl fns and dispatchers, which are appended after the
+# target's own decls.
+fn target_bucket_last(mods: [ModuleDecls], target_mod: String) : [ModuleDecls] =
+  match tbl_target(mods, target_mod) {
+    None    -> mods
+    Some(t) -> list_append(tbl_others(mods, target_mod, []), [t])
+  }
+
+fn tbl_is_target(m: ModuleDecls, target_mod: String) : Bool = match m.name {
+  Some(n) -> n == target_mod
+  None    -> false
+}
+
+fn tbl_target(mods: [ModuleDecls], target_mod: String) : Option[ModuleDecls] =
+  match mods {
+    [] -> None
+    [m, ...rest] -> if tbl_is_target(m, target_mod) { Some(m) }
+                    else { tbl_target(rest, target_mod) }
+  }
+
+fn tbl_others(mods: [ModuleDecls], target_mod: String,
+              acc: [ModuleDecls]) : [ModuleDecls] = match mods {
+  [] -> list_reverse(acc)
+  [m, ...rest] -> if tbl_is_target(m, target_mod) { tbl_others(rest, target_mod, acc) }
+                  else { tbl_others(rest, target_mod, [m, ...acc]) }
 }
 
 # Walk decls left-to-right, bucketing each decl under its home
