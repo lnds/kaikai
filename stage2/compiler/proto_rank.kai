@@ -1,0 +1,85 @@
+# compiler/proto_rank.kai — which protocol serves a bare op call.
+#
+# A bare `op(x, ...)` names no protocol; every protocol declaring `op`
+# whose impl table covers the receiver is a candidate. They rank by
+# how the caller reaches them — its own module, then an import (or the
+# root), then the prelude — and the head of the ranking is the only
+# legal target. Two candidates on the head's rung from different
+# homes leave nothing in the source to pick one: the call is
+# ambiguous and is reported, not guessed. Cores are exempt: the
+# prelude resolves among its own in registry order.
+
+import compiler.util
+import compiler.ast
+import compiler.diag
+import compiler.fnreg
+
+#[doc("One protocol able to serve a bare op call: `PMatch(home, tier, impl_fn)`. Tier 0 = the caller's own module, 1 = imported or root, 2 = core.")]
+pub type ProtoMatch = PMatch(Option[String], Int, String)
+
+#[doc("Rank `cands` (each an op declaration with its home) by tier, keeping only those `serves` maps to an impl fn. `cm` is the calling module, `cores` the prelude module names.")]
+pub fn proto_ranked_matches(cands: [ProtoOpReg], cm: Option[String], cores: [String],
+                            serves: (ProtoOpReg) -> Option[String]) : [ProtoMatch] = {
+  let ms = prm_collect(cands, cm, cores, serves, [])
+  list_append(prm_tier(ms, 0), list_append(prm_tier(ms, 1), prm_tier(ms, 2)))
+}
+
+#[doc("True when a ranked match list carries, at the head's tier, a second protocol from another home.")]
+pub fn proto_matches_ambiguous(ms: [ProtoMatch]) : Bool = match ms {
+  [] -> false
+  [PMatch(h, t, _), ...rest] -> t < 2 and prm_other_home(rest, h, t)
+}
+
+#[doc("Report an ambiguous bare op call: every home whose protocol serves the receiver, in declaration order.")]
+pub fn report_ambiguous_proto_call(file: String, line: Int, col: Int, opname: String,
+                                   pname: String, ms: [ProtoMatch]) : Unit / Console + File {
+  let homes = prm_homes(list_reverse(ms), [])
+  diag_error(file, line, col,
+    concat_all(["ambiguous call to `", opname, "`: protocol `", pname,
+                "` is exported by multiple modules: ", join_with(homes, ", ")]))
+  diag_note(concat_all(["each of ", join_with(map(homes, (h) => concat_all([h, ".", pname])), ", "),
+                        " implements `", opname, "` for this receiver"]))
+  diag_help("import only one of the declaring modules, or dispatch on a receiver only one of them implements")
+}
+
+fn prm_collect(cands: [ProtoOpReg], cm: Option[String], cores: [String],
+               serves: (ProtoOpReg) -> Option[String],
+               acc: [ProtoMatch]) : [ProtoMatch] = match cands {
+  [] -> list_reverse(acc)
+  [po, ...rest] -> match serves(po) {
+    None -> prm_collect(rest, cm, cores, serves, acc)
+    Some(impl_fn) -> match po {
+      POR(_, _, _, _, _, _, pmo) ->
+        prm_collect(rest, cm, cores, serves,
+                    [PMatch(pmo, prm_tier_of(pmo, cm, cores), impl_fn), ...acc])
+    }
+  }
+}
+
+fn prm_tier_of(pmo: Option[String], cm: Option[String], cores: [String]) : Int =
+  if mo_eq(pmo, cm) { 0 }
+  else { match pmo {
+    Some(m) -> if list_has(cores, m) { 2 } else { 1 }
+    None    -> 1
+  } }
+
+fn prm_tier(ms: [ProtoMatch], t: Int) : [ProtoMatch] = match ms {
+  [] -> []
+  [m, ...rest] -> match m {
+    PMatch(_, mt, _) -> if mt == t { [m, ...prm_tier(rest, t)] } else { prm_tier(rest, t) }
+  }
+}
+
+fn prm_other_home(ms: [ProtoMatch], h: Option[String], t: Int) : Bool = match ms {
+  [] -> false
+  [PMatch(m, mt, _), ...rest] ->
+    if mt == t and not mo_eq(m, h) { true } else { prm_other_home(rest, h, t) }
+}
+
+fn prm_homes(ms: [ProtoMatch], acc: [String]) : [String] = match ms {
+  [] -> list_reverse(acc)
+  [PMatch(mo, _, _), ...rest] -> {
+    let h = match mo { Some(m) -> m  None -> "<root>" }
+    if list_has(acc, h) { prm_homes(rest, acc) } else { prm_homes(rest, [h, ...acc]) }
+  }
+}

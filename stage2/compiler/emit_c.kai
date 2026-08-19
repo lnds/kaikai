@@ -519,8 +519,12 @@ fn find_ambig_loop(fns: [EFn], target_origin: Option[String], seen: [String], ac
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
       EFn(n, _, _, _) ->
-        if list_has(seen, n) { find_ambig_loop(rest, target_origin, seen, acc) }
-        else {
+        # Protocol dispatchers are one per (op, home) by construction;
+        # the receiver picks among them, so they are never a bare-name
+        # ambiguity.
+        if list_has(seen, n) or is_proto_dispatcher_name(n) {
+          find_ambig_loop(rest, target_origin, seen, acc)
+        } else {
           let cands = efn_collect_matching(fns, n, [])
           let count = list_length(cands)
           if count <= 1 { find_ambig_loop(rest, target_origin, [n, ...seen], acc) }
@@ -11024,21 +11028,23 @@ fn mk_proto_dispatch_body(pname: String, opname: String, line: Int, col: Int) : 
 # collision context is keyed by the decl's home. Growing the inherited
 # environment means growing this record, not another parameter thread.
 type InterpCtx = { op_names: [String], op_arities: [OpAr],
-                   file: String, cs: CSCtx }
+                   file: String, cs: CSCtx, show_home: Option[String] }
 
-#[doc("Emit-layer entry point desugar_interp_decls")]
+#[doc("Emit-layer entry point desugar_interp_decls. `show_home` is the core module whose `Show` every user-side `#{...}` binds to (`None` leaves the op bare); `cores` names the core modules, whose own interpolations stay bare — they are typed before that module's dispatchers exist.")]
 pub fn desugar_interp_decls(ds: [Decl], op_names: [String], op_arities: [OpAr],
       global_mt: [ModuleEntry], scopes: [ModScope], coll: [CSEntry],
-      target: String, file: String) : [Decl] / Console + File {
+      target: String, file: String, show_home: Option[String],
+      cores: [String]) : [Decl] / Console + File {
 
   if not list_has(op_names, "show") { ds }
   else { desugar_interp_decls_loop(ds, op_names, op_arities, global_mt, scopes,
-                                   coll, target, file, target, []) }
+                                   coll, target, file, show_home, cores, target, []) }
 }
 
 fn desugar_interp_decls_loop(ds: [Decl], op_names: [String], op_arities: [OpAr],
       global_mt: [ModuleEntry], scopes: [ModScope], coll: [CSEntry],
-      target: String, file: String, cur: String, acc: [Decl]) : [Decl] / Console + File {
+      target: String, file: String, show_home: Option[String], cores: [String],
+      cur: String, acc: [Decl]) : [Decl] / Console + File {
 
   match ds {
     [] -> list_reverse(acc)
@@ -11048,9 +11054,10 @@ fn desugar_interp_decls_loop(ds: [Decl], op_names: [String], op_arities: [OpAr],
       let cx = InterpCtx { op_names: op_names, op_arities: op_arities, file: file,
                            cs: CSCtx { coll: coll, home: home, target: target,
                                        free: false,
-                                       mt: ms_table(scopes, seg, global_mt) } }
+                                       mt: ms_table(scopes, seg, global_mt) },
+                           show_home: if list_has(cores, home) { None } else { show_home } }
       desugar_interp_decls_loop(rest, op_names, op_arities, global_mt, scopes,
-                                coll, target, file, home,
+                                coll, target, file, show_home, cores, home,
                                 [desugar_interp_decl(d, cx), ...acc])
     }
   }
@@ -11346,10 +11353,15 @@ fn interp_part_to_expr(p: IPart, pos: InterpPos, cx: InterpCtx,
       }
       # The post-rename dispatcher name (`__proto_show`) bypasses the
       # rename pass that already ran inside lower_protocols. The
-      # post-inference rewrite recognises this prefixed form.
-      mk_expr(ECall(mk_expr(EVar(proto_dispatcher_name("show")), line, col),
-                     [inner]),
-              line, col)
+      # post-inference rewrite recognises this prefixed form. Homed at
+      # the core `Show`: a user protocol with a `show` op must not
+      # capture the interpolation inside its own module.
+      let disp = proto_dispatcher_name("show")
+      let callee = match cx.show_home {
+        Some(h) -> EModCall(h, disp)
+        None    -> EVar(disp)
+      }
+      mk_expr(ECall(mk_expr(callee, line, col), [inner]), line, col)
     }
   }
 }
