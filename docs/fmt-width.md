@@ -56,7 +56,7 @@ writer breaks.
 
 **A body hanging off `=` / `->` / `:=`** — a function's `= expr`
 body, a `let` / `var` right-hand side, an assignment, a match arm, a
-handler clause. On the head line when it fits there; on its own line,
+handler clause, a `type` alias body. On the head line when it fits there; on its own line,
 one level in, when it fits there whole; on the head line breaking
 inside itself when it must break anyway and its first line fits; on
 its own line otherwise.
@@ -67,10 +67,14 @@ fn build(host: String, port: Int, retries: Int, verbose: Bool) : Cfg =
 ```
 
 **A delimited sequence** — call arguments, list and record literals,
-tuples, map and set literals, a signature's parameter list. Flat when
-it fits (a signature's return type, row and body opener count toward
-the fit); otherwise one item per line with the closer on its own line
-at the outer indent, no trailing comma. Two refinements:
+tuples, map and set literals, a signature's parameter list (a
+function's, an effect or protocol operation's, a handler clause's), a
+type's argument list and a tuple type. Flat when it fits (a
+signature's return type, row and body opener count toward the fit);
+otherwise one item per line with the closer on its own line at the
+outer indent, no trailing comma. A trailing comment stays with the
+item it follows, on whichever of a multi-line item's lines it sits.
+Two refinements:
 
 - a list whose elements are all literals or names packs into rows
   instead of one per line (`[2, 3, 5, 7, ...]`);
@@ -104,6 +108,16 @@ fn pipeline(xs: [Int]) : [Int] =
   xs
     | (x => x * 2)
     | (x => x + 1)
+```
+
+**A one-line `if`** — `if c { a } else { b }` (and an `else if`
+chain) that the author wrote on one line, each branch a lone
+expression or statement, stays on one line when it fits. Broken by
+the author, over budget, or holding a multi-statement branch, it takes
+the block form — which is a fixed point.
+
+```kaikai
+fn abs(x: Int) : Int = if x > 0 { x } else { 0 - x }
 ```
 
 ### The author's breaks
@@ -146,8 +160,9 @@ lands on its own line above the body.
 ### What does not move
 
 - Structural forms keep their structure: a `match`, a block body, a
-  handler, a sum type's variants are always multi-line and were before
-  the width model.
+  handler, a sum type's variants, an `if` whose branches the author
+  laid out as blocks are always multi-line and were before the width
+  model.
 - Redundant parentheses the author wrote for emphasis are not
   preserved; they are not in the AST. Necessary ones are.
 - A multi-line string literal or raw attribute is one atom: its inner
@@ -212,8 +227,8 @@ Measured at 100 columns over the formatter's own output:
 | corpus | files | soft | soft_max | hard |
 |---|---|---|---|---|
 | `examples/fmt/width` | 18 | 0 | 0 | 2 |
-| `stdlib` | 74 | 1 | 103 | 90 |
-| `stage2/compiler` | 168 | 22 | 155 | 676 |
+| `stdlib` | 74 | 0 | 0 | 90 |
+| `stage2/compiler` | 169 | 20 | 155 | 689 |
 
 (Before the width model: 14 / 263 / 4,996 soft lines respectively.)
 The soft lines that remain are lines whose code part is short and
