@@ -284,7 +284,7 @@ distinguishes it within that home.
 | user function | `kaiu_<home>__<name>` |
 | variant tag | hash of `(home, ctor)`, linear probe — see below |
 | variant table entry | keyed `(home, ctor)`, carrying arity + payload |
-| impl method | `__pimpl_<home_P>__<P>_<home_T>__<T>_<op>` |
+| impl method | `__pimpl_<home_P>__<P>_<T>__<home_T>_<op>` — each half home-spelled only when its name is contested |
 | protocol dispatcher | `__proto_<home_P>__<P>_<op>` |
 | handler / clause / finally | `_kaiu_<what>_<home>__<enc_fn>_<L>_<C>` |
 | test / bench / check | `__test__<home>__<L>_<C>` |
