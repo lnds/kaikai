@@ -1,0 +1,229 @@
+# compiler/import_uses.kai — the imports a file never refers to.
+#
+# An import is used when the file mentions its written name (a
+# qualifier) or any name the module exports — its protocol operations
+# included, since an op is called without its protocol's name — anywhere
+# outside the import lines themselves; a module that declares impls, or
+# nothing at all, is used by being loaded and is never reported. The scan is over the token stream, not the AST:
+# every position a name can occupy counts the same way, and a word inside
+# a string literal counts too, so an interpolation (`#{m.f(x)}`) keeps its
+# module alive. A name right after `m.` belongs to `m` alone; any other
+# identifier may be a bare or UFCS reference to whichever module exports
+# it. Over-approximating "used" is the safe direction — a missed use
+# would be a false report.
+
+import compiler.util
+import compiler.chars
+import compiler.lex
+import compiler.ast
+import compiler.resolve
+import compiler.modules
+
+#[doc("One import nothing in its file refers to: `UImp(written_name, line, col)`.")]
+pub type UnusedImport = UImp(String, Int, Int)
+
+#[doc("What a file can refer to a loaded module by: `MNames(origin, names, silent)` — the exports plus protocol operation names; `silent` when loading the module is its use (it declares impls, or nothing).")]
+pub type ModNames = MNames(String, [String], Bool)
+
+#[doc("The `ModNames` of a module loaded from `origin` with `exports`, read off its declarations.")]
+pub fn mod_names(origin: String, exports: [String], decls: [Decl]) : ModNames =
+  MNames(origin, mn_proto_ops(decls, exports), decls_declare_impls(decls) or list_length(decls) == 0)
+
+fn mn_proto_ops(ds: [Decl], acc: [String]) : [String] = match ds {
+  []           -> acc
+  [d, ...rest] -> mn_proto_ops(rest, mn_decl_ops(d, acc))
+}
+
+fn mn_decl_ops(d: Decl, acc: [String]) : [String] = match d {
+  DProtocol(true, _, _, ops, _, _, _) -> mn_ops(ops, acc)
+  DDoc(_, _, inner, _, _)             -> mn_decl_ops(inner, acc)
+  DAttr(_, inner, _, _)               -> mn_decl_ops(inner, acc)
+  DUnstable(inner, _, _)              -> mn_decl_ops(inner, acc)
+  DProtoLaws(_, inner, _, _, _)       -> mn_decl_ops(inner, acc)
+  _                                   -> acc
+}
+
+fn mn_ops(ops: [ProtoOp], acc: [String]) : [String] = match ops {
+  []                                  -> acc
+  [POp(n, _, _, _, _, _), ...rest]    -> mn_ops(rest, [n, ...acc])
+}
+
+fn mn_find(table: [ModNames], origin: String) : Option[ModNames] = match table {
+  []           -> None
+  [MNames(o, ns, sl), ...rest] -> if o == origin { Some(MNames(o, ns, sl)) } else { mn_find(rest, origin) }
+}
+
+# An import still waiting for its first reference.
+type Pending = Pend(String, [String], Int, Int)
+
+#[doc("The imports of one file that nothing in it refers to. `bindings` are the file's own import entries; `table` the names of every loaded module, keyed by origin.")]
+pub fn unused_imports(src: String, tokens: [Token], decls: [Decl],
+                      bindings: [ModuleEntry], table: [ModNames]) : [UnusedImport] = {
+  let cx = IuCx { src: src, import_lines: iu_import_lines(decls, []), mods: iu_module_names(bindings, []) }
+  let pending = iu_pending(decls, bindings, table, [])
+  iu_report(iu_scan(cx, tokens, 0, pending), [])
+}
+
+# The scan's fixed inputs: the source, the lines the imports sit on, and
+# every module name the file binds (a qualifier).
+type IuCx = { src: String, import_lines: [Int], mods: [String] }
+
+fn iu_module_names(mes: [ModuleEntry], acc: [String]) : [String] = match mes {
+  []                         -> acc
+  [ME(w, _, _, _), ...rest]  -> iu_module_names(rest, [w, ...acc])
+}
+
+fn iu_import_lines(ds: [Decl], acc: [Int]) : [Int] = match ds {
+  []                          -> acc
+  [DImport(_, l, _), ...rest] -> iu_import_lines(rest, [l, ...acc])
+  [_, ...rest]                -> iu_import_lines(rest, acc)
+}
+
+# An import whose module failed to load has no binding and was already
+# reported; it is not pending. A binding without names (not loaded this
+# run) falls back to its export list.
+fn iu_pending(ds: [Decl], bindings: [ModuleEntry], table: [ModNames],
+              acc: [Pending]) : [Pending] = match ds {
+  [] -> list_reverse(acc)
+  [DImport(ik, l, c), ...rest] -> match iu_written(ik) {
+    None -> iu_pending(rest, bindings, table, acc)
+    Some(w) -> match mt_lookup(bindings, w) {
+      Some(ME(_, exports, origin, _)) -> match mn_find(table, origin) {
+        Some(MNames(_, _, true))      -> iu_pending(rest, bindings, table, acc)
+        Some(MNames(_, names, false)) -> iu_pending(rest, bindings, table, [Pend(w, names, l, c), ...acc])
+        None                          -> iu_pending(rest, bindings, table, [Pend(w, exports, l, c), ...acc])
+      }
+      None -> iu_pending(rest, bindings, table, acc)
+    }
+  }
+  [_, ...rest] -> iu_pending(rest, bindings, table, acc)
+}
+
+fn iu_written(ik: ImportKind) : Option[String] = match ik {
+  IkPath(p)         -> Some(last_segment(p))
+  IkAlias(_, alias) -> Some(alias)
+  IkSelective(p, _) -> Some(last_segment(p))
+  IkHole(_)         -> None
+}
+
+fn iu_report(ps: [Pending], acc: [UnusedImport]) : [UnusedImport] = match ps {
+  []                          -> list_reverse(acc)
+  [Pend(w, _, l, c), ...rest] -> iu_report(rest, [UImp(w, l, c), ...acc])
+}
+
+# Walk the tokens until every pending import has been referenced. `st`
+# tracks a qualifier in progress: 1 after a module name, 2 after its dot,
+# so the identifier that follows is that module's and counts for no other.
+# Every comparison reads `cx.src` in place by offsets — materialising a
+# slice per candidate word would pin each one in the runtime's intern
+# table, a linear retention over the scan.
+fn iu_scan(cx: IuCx, toks: [Token], st: Int, pending: [Pending]) : [Pending] =
+  match pending {
+    [] -> []
+    _  -> match toks {
+      [] -> pending
+      [t, ...rest] ->
+        iu_scan(cx, rest, iu_next_st(cx, t, st), iu_next_pending(cx, t, st, pending))
+    }
+  }
+
+# The qualifier state after `t`: 1 on a module name, 2 on its dot, else 0.
+fn iu_next_st(cx: IuCx, t: Token, st: Int) : Int =
+  if iu_on_import_line(cx.import_lines, t.line) { 0 }
+  else { match t.kind {
+    TkIdent -> if iu_span_in(cx.src, t.start, t.length, cx.mods) { 1 } else { 0 }
+    TkDot   -> if st == 1 { 2 } else { 0 }
+    _       -> 0
+  } }
+
+fn iu_next_pending(cx: IuCx, t: Token, st: Int, pending: [Pending]) : [Pending] =
+  if iu_on_import_line(cx.import_lines, t.line) { pending }
+  else { match t.kind {
+    TkIdent  -> if st == 2 { pending } else { iu_mention(cx.src, t.start, t.length, pending) }
+    TkString -> iu_words(cx, t.start, t.start + t.length, pending)
+    _        -> pending
+  } }
+
+fn iu_on_import_line(ls: [Int], line: Int) : Bool = match ls {
+  []           -> false
+  [h, ...rest] -> h == line or iu_on_import_line(rest, line)
+}
+
+# Drop from `pending` every import the word at src[ws, ws+wl) refers to.
+# The no-hit case returns `pending` untouched: rebuilding the list per
+# word retains an allocation per token scanned, linear over the file.
+fn iu_mention(src: String, ws: Int, wl: Int, pending: [Pending]) : [Pending] =
+  if iu_any_hit(src, ws, wl, pending) { iu_drop_hits(src, ws, wl, pending) } else { pending }
+
+fn iu_any_hit(src: String, ws: Int, wl: Int, pending: [Pending]) : Bool = match pending {
+  [] -> false
+  [Pend(written, exports, _, _), ...rest] ->
+    iu_span_eq(src, ws, wl, written) or iu_span_in(src, ws, wl, exports) or iu_any_hit(src, ws, wl, rest)
+}
+
+fn iu_drop_hits(src: String, ws: Int, wl: Int, pending: [Pending]) : [Pending] = match pending {
+  [] -> []
+  [Pend(written, exports, l, c), ...rest] ->
+    if iu_span_eq(src, ws, wl, written) or iu_span_in(src, ws, wl, exports) { iu_drop_hits(src, ws, wl, rest) }
+    else { [Pend(written, exports, l, c), ...iu_drop_hits(src, ws, wl, rest)] }
+}
+
+fn iu_span_in(src: String, ws: Int, wl: Int, names: [String]) : Bool = match names {
+  []           -> false
+  [n, ...rest] -> iu_span_eq(src, ws, wl, n) or iu_span_in(src, ws, wl, rest)
+}
+
+fn iu_span_eq(src: String, ws: Int, wl: Int, name: String) : Bool =
+  wl == string_length(name) and iu_span_eq_loop(src, ws, name, 0, wl)
+
+fn iu_span_eq_loop(src: String, ws: Int, name: String, i: Int, n: Int) : Bool =
+  if i >= n { true }
+  else if char_at_or_zero(src, ws + i) == char_at_or_zero(name, i) { iu_span_eq_loop(src, ws, name, i + 1, n) }
+  else { false }
+
+# Every identifier-shaped run inside a string literal is a mention, with
+# the same qualifier rule: the word right after `m.` is `m`'s alone.
+fn iu_words(cx: IuCx, i: Int, n: Int, pending: [Pending]) : [Pending] =
+  iu_words_loop(cx, i, n, false, pending)
+
+fn iu_words_loop(cx: IuCx, i: Int, n: Int, qualified: Bool, pending: [Pending]) : [Pending] =
+  if i >= n { pending }
+  else { match pending {
+    [] -> []
+    _  -> match char_at(cx.src, i) {
+      None    -> pending
+      Some(c) ->
+        if ch_is_alpha(c) { iu_word(cx, i, iu_word_end(cx.src, i + 1, n), n, qualified, pending) }
+        else { iu_words_loop(cx, i + 1, n, qualified and c == '.', pending) }
+    }
+  } }
+
+fn iu_word(cx: IuCx, ws: Int, end: Int, n: Int, qualified: Bool, pending: [Pending]) : [Pending] = {
+  let next_qual = iu_span_in(cx.src, ws, end - ws, cx.mods) and char_at(cx.src, end) == Some('.')
+  let p2 = if qualified { pending } else { iu_mention(cx.src, ws, end - ws, pending) }
+  iu_words_loop(cx, end, n, next_qual, p2)
+}
+
+fn iu_word_end(s: String, i: Int, n: Int) : Int =
+  if i >= n { n }
+  else { match char_at(s, i) {
+    Some(c) -> if ch_is_alnum(c) { iu_word_end(s, i + 1, n) } else { i }
+    None    -> i
+  } }
+
+#[doc("True when `decls` declares an impl at top level, through any wrapper.")]
+pub fn decls_declare_impls(ds: [Decl]) : Bool = match ds {
+  []           -> false
+  [d, ...rest] -> decl_declares_impl(d) or decls_declare_impls(rest)
+}
+
+fn decl_declares_impl(d: Decl) : Bool = match d {
+  DImpl(_, _, _, _, _, _, _)    -> true
+  DImplAxiom(_, _, _, _, _)     -> true
+  DDerive(_, _, _, _)           -> true
+  DDoc(_, _, inner, _, _)       -> decl_declares_impl(inner)
+  DAttr(_, inner, _, _)         -> decl_declares_impl(inner)
+  DUnstable(inner, _, _)        -> decl_declares_impl(inner)
+  DProtoLaws(_, inner, _, _, _) -> decl_declares_impl(inner)
+  _                             -> false
+}
