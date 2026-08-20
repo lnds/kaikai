@@ -10892,7 +10892,8 @@ rc-detector:
 #
 # Positive axes diff stdout against `main.out.expected`; negative axes
 # must fail to compile with the first line of `main.err.expected` as a
-# stderr substring. The negative goldens pin the DIAGNOSTIC, not merely
+# stderr substring. A fixture's optional `main.flags` (e.g. an edition)
+# is passed to the bare-compiler axes; `bin/kai` axes carry their own. The negative goldens pin the DIAGNOSTIC, not merely
 # a non-zero exit: several fail for the wrong reason today (a type
 # mismatch where the real fault is an ambiguous name), and a bare
 # exit-code check would pass on that.
@@ -10914,7 +10915,8 @@ test-namespace-collisions: $(TARGET) build
 	for d in $(NSCOL_DIRS); do \
 	  src=../examples/namespace-collisions/$$d/main.kai; \
 	  exp=../examples/namespace-collisions/$$d/main.out.expected; \
-	  if ! ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/nscol-$$d.c 2> build/nscol-$$d.err; then \
+	  flags=$$(cat ../examples/namespace-collisions/$$d/main.flags 2>/dev/null); \
+	  if ! ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$flags $$src > build/nscol-$$d.c 2> build/nscol-$$d.err; then \
 	    echo "namespace-collisions FAIL $$d (kaic2)"; head -3 build/nscol-$$d.err; continue; fi; \
 	  if ! $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/nscol-$$d.c -o build/nscol-$$d-c $(LDLIBS_M); then \
 	    echo "namespace-collisions FAIL $$d (cc)"; continue; fi; \
