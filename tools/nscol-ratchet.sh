@@ -44,6 +44,16 @@ if [ "$ran" -eq 0 ]; then
   exit 1
 fi
 
+# A fixture the matrix declares but the log never reaches is invisible to a
+# failure count: it neither passes nor fails, it just stops being tested.
+declared="$("$ROOT/tests/namespace_matrix_axes.sh" "$axis" | sort -u | grep -c . || true)"
+if [ "$ran" -lt "$declared" ]; then
+  echo "$name FAIL — $ran of $declared declared fixtures reached the log; missing:"
+  comm -23 <("$ROOT/tests/namespace_matrix_axes.sh" "$axis" | sort -u) \
+           <(echo "$verdicts" | awk 'NF { print $3 }' | sort -u) | sed 's/^/  /'
+  exit 1
+fi
+
 if [ "$fail" -gt "$baseline" ]; then
   echo "$name FAIL — $fail of $ran fixtures failing, baseline $baseline; failing:"
   echo "$failing" | sed 's/^/  /'
