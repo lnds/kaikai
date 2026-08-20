@@ -1222,6 +1222,14 @@ fn uc_resolve_decls(cache_res: UcLookup, abs_path: String, src: String,
     }
   }
 
+# A user module named like a core is another module: its home must not
+# be the core's, or both mint the same symbols and share one cache row.
+fn user_module_home(import_name: String, cores: [ModuleEntry]) : String =
+  match mt_lookup(cores, import_name) {
+    Some(_) -> string_concat("local_", import_name)
+    None    -> import_name
+  }
+
 fn resolve_module(base_dir: String, mod_path: String, import_name: String, search_paths: [String], cores: [ModuleEntry], owner: String, cache_on: Bool, rs: ResolveState) : ResolveState / Console + File {
 
   let cf = find_module_file(base_dir, mod_path, search_paths)
@@ -1311,7 +1319,11 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
                   # segment in the flat stream is keyed by the name this
                   # importer bound it under, so the scope is keyed the
                   # same way for the per-segment lookup to match.
-                  let rs2 = process_imports(base_dir, decls, search_paths, cores, import_name, cache_on, rs_doc)
+                  # The module's home keys its decls, its segment and the
+                  # imports it owns; the importer's spelling is a per-file
+                  # binding onto it.
+                  let home = user_module_home(import_name, cores)
+                  let rs2 = process_imports(base_dir, decls, search_paths, cores, home, cache_on, rs_doc)
                   let kept = non_import_decls(decls)
                   # Validate same-module name collisions before the
                   # imported module's decls join the global stream.
@@ -1322,23 +1334,21 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
                   # symbols for the same kaikai name.
                   let mod_errs = validate_module_same_module_collisions(kept, abs_path)
                   let rs2b = if mod_errs > 0 { rs_bump_errs_by(rs2, mod_errs) } else { rs2 }
-                  # Tag every DFn coming from this module with
-                  # `module_origin = Some(import_name)` so the codegen
-                  # mints `kai_<import_name>__<name>`. Done before the
-                  # global concat so transitive imports carry their own
-                  # surface name through to emission. When the caller
-                  # passes `import_name == ""`, we still concat decls
-                  # but leave them with their parser-supplied None.
+                  # Tag every DFn coming from this module with its home so
+                  # the codegen mints `kai_<home>__<name>`. When the caller
+                  # passes `import_name == ""`, we still concat decls but
+                  # leave them with their parser-supplied None.
                   let tagged = if import_name == "" { kept }
-                               else { tag_decls_module_origin(kept, import_name) }
+                               else { tag_decls_module_origin(kept, home) }
                   let exports = collect_pub_exports(kept, [])
-                  let rs3 = rs_note_names(rs_append_decls(rs2b, import_name, tagged), abs_path, exports, kept)
-                  report_unused_imports(abs_path, src, tokens, decls, import_name, rs3)
+                  let rs3 = rs_note_names(rs_append_decls(rs2b, home, tagged), abs_path, exports, kept)
+                  report_unused_imports(abs_path, src, tokens, decls, home, rs3)
                   if import_name == "" { rs3 }
                   else {
                     let unstable_exports = collect_unstable_exports(kept, [])
-                    let entry = ME(import_name, exports, abs_path, unstable_exports)
-                    rs_bind_in(rs_add_module(rs3, entry), owner, entry)
+                    let entry = ME(home, exports, abs_path, unstable_exports)
+                    let bound = ME(import_name, exports, abs_path, unstable_exports)
+                    rs_bind_in(rs_add_module(rs3, entry), owner, bound)
                   }
                 } }
               }
@@ -4581,23 +4591,14 @@ fn core_emit_key(cc: CoreCacheOpt, edition: String, decls: [Decl],
 # core TU bodies are persisted for the next build. Only plain builds
 # participate: test/bench shapes skip the cache instead of folding the
 # shape into the key.
-fn mod_names_overlap(xs: [String], ys: [String]) : Bool = match xs {
-  [] -> false
-  [x, ...rest] -> if list_has(ys, x) { true } else { mod_names_overlap(rest, ys) }
-}
-
-# A user module named like a core shares the core's origin, so its TU
-# would be persisted as the core's; such a program stays out of the cache.
 fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl],
                              bmode: BuildMode, target_mod_name: String,
                              regions: [RegionMark], cc: CoreCacheOpt,
-                             core_mods: [ModuleEntry], user_mods: [ModuleEntry],
-                             edition: String)
+                             core_mods: [ModuleEntry], edition: String)
                              : String / Console + File = {
   let plain = match bmode { BMBuild -> true _ -> false }
   let cacheable = core_mod_names(core_mods, [])
-  let shadowed = mod_names_overlap(core_mod_names(user_mods, []), cacheable)
-  let key = if plain and not shadowed { core_emit_key(cc, edition, decls, cacheable, target_mod_name) } else { "" }
+  let key = if plain { core_emit_key(cc, edition, decls, cacheable, target_mod_name) } else { "" }
   if key == "" {
     let _s = if cc.stats { eprint("kaic2: core-emit-cache: off") } else { () }
     emit_program_modular(path, src, decls, bmode, Some(target_mod_name), regions)
@@ -5726,8 +5727,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                           emit_kir(perceus_decls, region_marks, kir_inline_on)
                         } else if use_modular {
                           # Per-module .c/.h stream; the wrapper splits + links.
-                          emit_modular_maybe_cached(path, src, perceus_decls, bmode, target_mod_name, region_marks, core_cache, core_mods,
-                                                    match expanded { EP_Mod(_, mt, _, _, _, _) -> mt }, edition)
+                          emit_modular_maybe_cached(path, src, perceus_decls, bmode, target_mod_name, region_marks, core_cache, core_mods, edition)
                         } else {
                           emit_program(path, src, perceus_decls, bmode, Some(target_mod_name), region_marks)
                         }
