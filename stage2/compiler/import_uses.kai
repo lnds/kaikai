@@ -114,67 +114,95 @@ fn iu_report(ps: [Pending], acc: [UnusedImport]) : [UnusedImport] = match ps {
 # Walk the tokens until every pending import has been referenced. `st`
 # tracks a qualifier in progress: 1 after a module name, 2 after its dot,
 # so the identifier that follows is that module's and counts for no other.
+# Every comparison reads `cx.src` in place by offsets — materialising a
+# slice per candidate word would pin each one in the runtime's intern
+# table, a linear retention over the scan.
 fn iu_scan(cx: IuCx, toks: [Token], st: Int, pending: [Pending]) : [Pending] =
   match pending {
     [] -> []
     _  -> match toks {
       [] -> pending
-      [t, ...rest] -> {
-        let s = iu_step(cx, t, st, pending)
-        iu_scan(cx, rest, s.st, s.pending)
-      }
+      [t, ...rest] ->
+        iu_scan(cx, rest, iu_next_st(cx, t, st), iu_next_pending(cx, t, st, pending))
     }
   }
 
-type Step = { st: Int, pending: [Pending] }
-
-fn iu_step(cx: IuCx, t: Token, st: Int, pending: [Pending]) : Step =
-  if iu_on_import_line(cx.import_lines, t.line) { Step { st: 0, pending: pending } }
+# The qualifier state after `t`: 1 on a module name, 2 on its dot, else 0.
+fn iu_next_st(cx: IuCx, t: Token, st: Int) : Int =
+  if iu_on_import_line(cx.import_lines, t.line) { 0 }
   else { match t.kind {
-    TkIdent  -> iu_ident(cx, string_slice(cx.src, t.start, t.length), st, pending)
-    TkDot    -> Step { st: if st == 1 { 2 } else { 0 }, pending: pending }
-    TkString -> Step { st: 0, pending: iu_words(cx, string_slice(cx.src, t.start, t.length), pending) }
-    _        -> Step { st: 0, pending: pending }
+    TkIdent -> if iu_span_in(cx.src, t.start, t.length, cx.mods) { 1 } else { 0 }
+    TkDot   -> if st == 1 { 2 } else { 0 }
+    _       -> 0
   } }
 
-fn iu_ident(cx: IuCx, w: String, st: Int, pending: [Pending]) : Step = {
-  let st2 = if list_has(cx.mods, w) { 1 } else { 0 }
-  Step { st: st2, pending: if st == 2 { pending } else { iu_mention(w, pending) } }
-}
+fn iu_next_pending(cx: IuCx, t: Token, st: Int, pending: [Pending]) : [Pending] =
+  if iu_on_import_line(cx.import_lines, t.line) { pending }
+  else { match t.kind {
+    TkIdent  -> if st == 2 { pending } else { iu_mention(cx.src, t.start, t.length, pending) }
+    TkString -> iu_words(cx, t.start, t.start + t.length, pending)
+    _        -> pending
+  } }
 
 fn iu_on_import_line(ls: [Int], line: Int) : Bool = match ls {
   []           -> false
   [h, ...rest] -> h == line or iu_on_import_line(rest, line)
 }
 
-fn iu_mention(w: String, pending: [Pending]) : [Pending] = match pending {
+# Drop from `pending` every import the word at src[ws, ws+wl) refers to.
+# The no-hit case returns `pending` untouched: rebuilding the list per
+# word retains an allocation per token scanned, linear over the file.
+fn iu_mention(src: String, ws: Int, wl: Int, pending: [Pending]) : [Pending] =
+  if iu_any_hit(src, ws, wl, pending) { iu_drop_hits(src, ws, wl, pending) } else { pending }
+
+fn iu_any_hit(src: String, ws: Int, wl: Int, pending: [Pending]) : Bool = match pending {
+  [] -> false
+  [Pend(written, exports, _, _), ...rest] ->
+    iu_span_eq(src, ws, wl, written) or iu_span_in(src, ws, wl, exports) or iu_any_hit(src, ws, wl, rest)
+}
+
+fn iu_drop_hits(src: String, ws: Int, wl: Int, pending: [Pending]) : [Pending] = match pending {
   [] -> []
   [Pend(written, exports, l, c), ...rest] ->
-    if w == written or list_has(exports, w) { iu_mention(w, rest) }
-    else { [Pend(written, exports, l, c), ...iu_mention(w, rest)] }
+    if iu_span_eq(src, ws, wl, written) or iu_span_in(src, ws, wl, exports) { iu_drop_hits(src, ws, wl, rest) }
+    else { [Pend(written, exports, l, c), ...iu_drop_hits(src, ws, wl, rest)] }
 }
+
+fn iu_span_in(src: String, ws: Int, wl: Int, names: [String]) : Bool = match names {
+  []           -> false
+  [n, ...rest] -> iu_span_eq(src, ws, wl, n) or iu_span_in(src, ws, wl, rest)
+}
+
+fn iu_span_eq(src: String, ws: Int, wl: Int, name: String) : Bool =
+  wl == string_length(name) and iu_span_eq_loop(src, ws, name, 0, wl)
+
+fn iu_span_eq_loop(src: String, ws: Int, name: String, i: Int, n: Int) : Bool =
+  if i >= n { true }
+  else if char_at_or_zero(src, ws + i) == char_at_or_zero(name, i) { iu_span_eq_loop(src, ws, name, i + 1, n) }
+  else { false }
 
 # Every identifier-shaped run inside a string literal is a mention, with
 # the same qualifier rule: the word right after `m.` is `m`'s alone.
-fn iu_words(cx: IuCx, s: String, pending: [Pending]) : [Pending] =
-  iu_words_loop(cx, s, 0, string_length(s), false, pending)
+fn iu_words(cx: IuCx, i: Int, n: Int, pending: [Pending]) : [Pending] =
+  iu_words_loop(cx, i, n, false, pending)
 
-fn iu_words_loop(cx: IuCx, s: String, i: Int, n: Int, qualified: Bool, pending: [Pending]) : [Pending] =
+fn iu_words_loop(cx: IuCx, i: Int, n: Int, qualified: Bool, pending: [Pending]) : [Pending] =
   if i >= n { pending }
   else { match pending {
     [] -> []
-    _  -> match char_at(s, i) {
+    _  -> match char_at(cx.src, i) {
       None    -> pending
       Some(c) ->
-        if ch_is_alpha(c) {
-          let end = iu_word_end(s, i + 1, n)
-          let w = string_slice(s, i, end - i)
-          let next_qual = list_has(cx.mods, w) and char_at(s, end) == Some('.')
-          let p2 = if qualified { pending } else { iu_mention(w, pending) }
-          iu_words_loop(cx, s, end, n, next_qual, p2)
-        } else { iu_words_loop(cx, s, i + 1, n, qualified and c == '.', pending) }
+        if ch_is_alpha(c) { iu_word(cx, i, iu_word_end(cx.src, i + 1, n), n, qualified, pending) }
+        else { iu_words_loop(cx, i + 1, n, qualified and c == '.', pending) }
     }
   } }
+
+fn iu_word(cx: IuCx, ws: Int, end: Int, n: Int, qualified: Bool, pending: [Pending]) : [Pending] = {
+  let next_qual = iu_span_in(cx.src, ws, end - ws, cx.mods) and char_at(cx.src, end) == Some('.')
+  let p2 = if qualified { pending } else { iu_mention(cx.src, ws, end - ws, pending) }
+  iu_words_loop(cx, end, n, next_qual, p2)
+}
 
 fn iu_word_end(s: String, i: Int, n: Int) : Int =
   if i >= n { n }
