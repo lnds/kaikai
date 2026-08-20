@@ -1,0 +1,108 @@
+# compiler/type_scope_table.kai — which nominal type names are contested,
+# and what a name means from one module's viewpoint.
+#
+# Two modules may each declare `type Item`. Everything downstream — the
+# record and variant tables, the impl table, the head tag, the
+# `__pimpl_` symbol — keys a nominal type on its spelling alone, so a
+# contested name is given a home-spelled one per declaring module
+# (`Item__da`) before any of that runs. Core and root declarations keep
+# the bare spelling; aliases stay out, `ta_scope` expands them per module.
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+import compiler.home_spell
+
+#[doc("One nominal type declaration: `TSE(name, home, pub)`. Root declarations carry the target module as home.")]
+pub type TSEntry = TSE(String, String, Bool)
+
+#[doc("What one module sees: the contested declarations, its own home, the root's, the core homes, the tagged names of its imports, and its qualifier table.")]
+pub type TSCtx = { coll: [TSEntry], home: String, target: String, cores: [String],
+                   imports: [String], mt: [ModuleEntry] }
+
+#[doc("The nominal type declarations of `decls` whose name another home also declares, in stream order.")]
+pub fn ts_collect(decls: [Decl], target: String) : [TSEntry] = {
+  let all = ts_entries(decls, target, [])
+  ts_keep_contested(all, all, [])
+}
+
+fn ts_entries(ds: [Decl], target: String, acc: [TSEntry]) : [TSEntry] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> ts_entries(rest, target, ts_entry(d, target, acc))
+}
+
+fn ts_entry(d: Decl, target: String, acc: [TSEntry]) : [TSEntry] = match decl_transparent_inner(d) {
+  Some(inner) -> ts_entry(inner, target, acc)
+  None -> match d {
+    DType(p, n, _, body, _, _, mo, _) ->
+      if ts_nominal(body) { [TSE(n, match mo { Some(m) -> m  None -> target }, p), ...acc] }
+      else { acc }
+    _ -> acc
+  }
+}
+
+fn ts_nominal(body: TypeBody) : Bool = match body {
+  TBRecord(_) -> true
+  TBSum(_)    -> true
+  _           -> false
+}
+
+fn ts_keep_contested(all: [TSEntry], todo: [TSEntry], acc: [TSEntry]) : [TSEntry] = match todo {
+  [] -> list_reverse(acc)
+  [e, ...rest] -> match e {
+    TSE(n, home, _) ->
+      if ts_other_home(all, n, home) { ts_keep_contested(all, rest, [e, ...acc]) }
+      else { ts_keep_contested(all, rest, acc) }
+  }
+}
+
+fn ts_other_home(t: [TSEntry], name: String, home: String) : Bool = match t {
+  [] -> false
+  [TSE(n, h, _), ...rest] ->
+    if n == name and h != home { true } else { ts_other_home(rest, name, home) }
+}
+
+#[doc("The spelling of type `name` declared by `home`: home-spelled when contested and neither core nor root, else bare.")]
+pub fn ts_spell(cx: TSCtx, name: String, home: String) : String =
+  if home == cx.target or list_has(cx.cores, home) or not ts_declares(cx.coll, name, home) { name }
+  else { hs_spell(name, home) }
+
+fn ts_declares(t: [TSEntry], name: String, home: String) : Bool = match t {
+  [] -> false
+  [TSE(n, h, _), ...rest] ->
+    if n == name and h == home { true } else { ts_declares(rest, name, home) }
+}
+
+#[doc("The spelling a bare `name` denotes from the context's home, by the name ladder: the module's own declaration, else the one visible import that exports it, else the bare name (core, root, ambiguous or unknown).")]
+pub fn ts_resolve(cx: TSCtx, name: String) : String =
+  if ts_declares(cx.coll, name, cx.home) { ts_spell(cx, name, cx.home) }
+  else { match ts_imported(cx.coll, name, cx.imports, []) {
+    [h] -> ts_spell(cx, name, h)
+    _   -> name
+  } }
+
+fn ts_imported(t: [TSEntry], name: String, imports: [String], acc: [String]) : [String] = match t {
+  [] -> acc
+  [TSE(n, h, p), ...rest] ->
+    if n == name and p and list_has(imports, h) and not list_has(acc, h) {
+      ts_imported(rest, name, imports, [h, ...acc])
+    } else { ts_imported(rest, name, imports, acc) }
+}
+
+#[doc("The spelling a qualified `mod.name` denotes, when `mod` is a visible module exporting a contested `name`; None leaves the qualifier for the qualifier passes.")]
+pub fn ts_resolve_qualified(cx: TSCtx, mod: String, name: String) : Option[String] =
+  match mt_lookup(cx.mt, mod) {
+    None -> None
+    Some(me) -> {
+      let home = mt_tagged_name(cx.mt, mod)
+      if me_has_export(me, name) and ts_declares(cx.coll, name, home) {
+        Some(ts_spell(cx, name, home))
+      } else { None }
+    }
+  }
+
+#[doc("True when `name` is bound as a module in the context's qualifier table; a module qualifier outranks any type of the same spelling.")]
+pub fn ts_is_module(cx: TSCtx, name: String) : Bool = match mt_lookup(cx.mt, name) {
+  Some(_) -> true
+  None    -> false
+}
