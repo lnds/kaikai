@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 test-doc tier1-asan tier1-backend-parity daily coverage-probe rc-budget stress-fixtures test-posix-shell
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily coverage-probe rc-budget stress-fixtures test-posix-shell
 
 all: kaic1 kaic2 bin/kai
 
@@ -980,21 +980,21 @@ test-packages: kaic2
 test-editions: kaic2
 	@tools/test-editions.sh
 
-# Tier 2.5 — daily memory-safety gate. Rebuilds the demos/ probe set
-# with `-fsanitize=address,undefined` and runs each binary; fails on
-# any sanitizer diagnostic or if the demos baseline regresses under
+# ASAN+UBSan memory-safety gate. Rebuilds the demos/ probe set with
+# `-fsanitize=address,undefined` and runs each binary; fails on any
+# sanitizer diagnostic or if the demos baseline regresses under
 # instrumentation. Apple clang lacks LSAN support, so leak detection
 # stays disabled (`detect_leaks=0`) for portability with the Linux
 # runner; if a leak ratchet ever becomes useful, gate it separately
 # on Linux.
 #
-# Why daily and not per-PR: ASAN doubles compile + run wall, and the
-# value is structural — catch new UAF / UB regressions of the R10 /
-# R11 shape (heap-use-after-free in handler dispatch / Perceus
-# scopes) within 24h of merge — not gating. CI: invoked from
-# `make daily` so `.github/workflows/daily.yml` picks it up
-# automatically.
-tier1-asan: kaic2 test-arena
+# CI runs the two shards as parallel jobs (tier1-asan.yml); each pays
+# the kaic2 bootstrap itself, so the split point balances the legs
+# around the shared demos block, not the bootstrap. Locally
+# `make tier1-asan` runs both shards in sequence.
+tier1-asan: tier1-asan-a tier1-asan-b
+
+tier1-asan-a: kaic2 test-arena
 	@ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	 $(MAKE) -C demos verify \
@@ -1042,6 +1042,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #350 fixtures pass under ASAN+UBSan (arm-binding multi-use drop gate)"
 	@$(MAKE) -C stage2 test-perceus-trmc-spread-asan
 	@echo "tier1-asan OK — TRMC shared pass-through arg fixture passes under ASAN+UBSan (dropmask / wrap-skip alignment gate)"
+
+tier1-asan-b: kaic2
 	@$(MAKE) -C stage2 test-perceus-issue703-asan
 	@echo "tier1-asan OK — issue #703 fixture passes under ASAN+UBSan (UFn-body let-bound variant double-match gate)"
 	@$(MAKE) -C stage2 test-issue-779-asan
@@ -1122,6 +1124,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #1635 fixture passes under ASAN+UBSan (goto move-set name collision, no stale-cell read)"
 	@$(MAKE) -C stage2 test-perceus-1801-capability-param-asan
 	@echo "tier1-asan OK — issue #1801 fixtures pass under ASAN+UBSan (capability params carry no RC traffic, evidence node never dropped)"
+	@$(MAKE) -C stage2 test-perceus-1803-op-arg-free-asan
+	@echo "tier1-asan OK — issue #1803 fixture passes under ASAN+UBSan (clause-body binder vs continuation register gate)"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,
