@@ -49,7 +49,14 @@ green `main` runs (no outliers; tier1 spread 25m40s–28m00s):
 | **tier1** | tier1.yml | **27m 26s** | **yes (the gate)** | **yes** |
 | tier1-native | tier1-native.yml | 20m 29s | no | no |
 | tier0 | tier1.yml | 12m 35s | no | no (parallel runner) |
-| tier1-asan | tier1-asan.yml | 9m 21s | no (path-gated) | no |
+| tier1-asan | tier1-asan.yml | 9m 21s¹ | no (path-gated) | no |
+
+¹ tier1-asan drifted hard after this snapshot: by 2026-08-21 the single
+serial job ran ~24.5m end-to-end (bootstrap ~7m + arena/demos ~4m +
+fixture legs ~13m), at the edge of its 1500s bounded step. The recipe is
+now split into two parallel matrix jobs (`tier1-asan-a` runs the
+arena/demos block plus the first fixture legs, `tier1-asan-b` the rest),
+each paying its own bootstrap; nominal ~16m per shard.
 
 The repo is **public**, so `ubuntu-latest` is the 4-vCPU / 16-GB standard
 runner. No OOM/swap-kill in the logs, but 4 cores cap the in-job `-j`
