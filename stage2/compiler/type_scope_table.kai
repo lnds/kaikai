@@ -1,31 +1,33 @@
-# compiler/type_scope_table.kai — which type names are contested,
-# and what a name means from one module's viewpoint.
+# compiler/type_scope_table.kai — which type names carry per-home
+# identity, and what a name means from one module's viewpoint.
 #
 # Two modules may each declare `type Item`. Everything downstream — the
 # record and variant tables, the impl table, the head tag, the
 # `__pimpl_` symbol — keys a nominal type on its spelling alone, so a
 # contested name is given a home-spelled one per declaring module
-# (`Item__da`) before any of that runs. Transparent aliases contest the
-# same namespace and respell the same way, so expansion keys on a name
-# that already carries its home. Core and root declarations keep the
-# bare spelling.
+# (`Item__da`) before any of that runs. Transparent aliases respell
+# unconditionally (they disappear at expansion; nothing downstream keys
+# them), so the alias table is globally name-unique and expansion needs
+# no per-module filter. Core and root declarations keep the bare
+# spelling.
 
 import compiler.util
 import compiler.ast
 import compiler.modules
 import compiler.home_spell
 
-#[doc("One nominal type declaration: `TSE(name, home, pub)`. Root declarations carry the target module as home.")]
-pub type TSEntry = TSE(String, String, Bool)
+#[doc("One scoped type declaration: `TSE(name, home, pub, arity, is_alias)`. Nominal entries exist only when contested; alias entries always. Root declarations carry the target module as home.")]
+pub type TSEntry = TSE(String, String, Bool, Int, Bool)
 
-#[doc("What one module sees: the contested declarations, its own home, the root's, the core homes, the tagged names of its imports, and its qualifier table.")]
+#[doc("What one module sees: the scoped declarations, its own home, the root's, the core homes, the tagged names of its imports, and its qualifier table.")]
 pub type TSCtx = { coll: [TSEntry], home: String, target: String, cores: [String],
                    imports: [String], mt: [ModuleEntry] }
 
-#[doc("The type declarations of `decls` whose name another home also declares, in stream order. Transparent aliases contest the namespace too; single-name bodies resolving to effects stay with the effect-alias machinery.")]
+#[doc("The type declarations of `decls` that carry per-home identity: contested nominals and aliases, plus every remaining transparent alias. Single-name bodies resolving to effects stay with the effect-alias machinery.")]
 pub fn ts_collect(decls: [Decl], target: String, effs: [String]) : [TSEntry] = {
   let all = ts_entries(decls, target, effs, [])
-  ts_keep_contested(all, all, [])
+  let kept = ts_keep_contested(all, all, [])
+  ts_add_uncontested_aliases(all, kept, kept)
 }
 
 fn ts_entries(ds: [Decl], target: String, effs: [String], acc: [TSEntry]) : [TSEntry] = match ds {
@@ -36,9 +38,11 @@ fn ts_entries(ds: [Decl], target: String, effs: [String], acc: [TSEntry]) : [TSE
 fn ts_entry(d: Decl, target: String, effs: [String], acc: [TSEntry]) : [TSEntry] = match decl_transparent_inner(d) {
   Some(inner) -> ts_entry(inner, target, effs, acc)
   None -> match d {
-    DType(p, n, _, body, _, _, mo, _) ->
-      if ts_scoped_body(body, effs) { [TSE(n, match mo { Some(m) -> m  None -> target }, p), ...acc] }
-      else { acc }
+    DType(p, n, tps, body, _, _, mo, _) ->
+      if ts_scoped_body(body, effs) {
+        [TSE(n, match mo { Some(m) -> m  None -> target }, p,
+             list_length(tps), ts_is_alias_body(body)), ...acc]
+      } else { acc }
     _ -> acc
   }
 }
@@ -50,6 +54,11 @@ fn ts_scoped_body(body: TypeBody, effs: [String]) : Bool = match body {
   TBEffectAlias(_) -> false
 }
 
+fn ts_is_alias_body(body: TypeBody) : Bool = match body {
+  TBAlias(_) -> true
+  _          -> false
+}
+
 fn ts_effect_named(t: TypeExpr, effs: [String]) : Bool = match t.tkind {
   TyName(n, []) -> list_has(effs, n)
   _ -> false
@@ -58,7 +67,7 @@ fn ts_effect_named(t: TypeExpr, effs: [String]) : Bool = match t.tkind {
 fn ts_keep_contested(all: [TSEntry], todo: [TSEntry], acc: [TSEntry]) : [TSEntry] = match todo {
   [] -> list_reverse(acc)
   [e, ...rest] -> match e {
-    TSE(n, home, _) ->
+    TSE(n, home, _, _, _) ->
       if ts_other_home(all, n, home) { ts_keep_contested(all, rest, [e, ...acc]) }
       else { ts_keep_contested(all, rest, acc) }
   }
@@ -66,46 +75,95 @@ fn ts_keep_contested(all: [TSEntry], todo: [TSEntry], acc: [TSEntry]) : [TSEntry
 
 fn ts_other_home(t: [TSEntry], name: String, home: String) : Bool = match t {
   [] -> false
-  [TSE(n, h, _), ...rest] ->
+  [TSE(n, h, _, _, _), ...rest] ->
     if n == name and h != home { true } else { ts_other_home(rest, name, home) }
 }
 
-#[doc("The spelling of type `name` declared by `home`: home-spelled when contested and neither core nor root, else bare.")]
+# An uncontested alias still spells always, so its name can never be
+# captured by an unrelated module at expansion time.
+fn ts_add_uncontested_aliases(all: [TSEntry], kept: [TSEntry], acc: [TSEntry]) : [TSEntry] =
+  match all {
+    [] -> acc
+    [e, ...rest] -> match e {
+      TSE(n, h, _, _, is_alias) ->
+        if is_alias and not ts_declares(kept, n, h) {
+          ts_add_uncontested_aliases(rest, kept, [e, ...acc])
+        } else { ts_add_uncontested_aliases(rest, kept, acc) }
+    }
+  }
+
+#[doc("The spelling of type `name` declared by `home`: home-spelled when the entry carries per-home identity and is neither core nor root, else bare.")]
 pub fn ts_spell(cx: TSCtx, name: String, home: String) : String =
-  if home == cx.target or list_has(cx.cores, home) or not ts_declares(cx.coll, name, home) { name }
-  else { hs_spell(name, home) }
+  if home == cx.target or list_has(cx.cores, home) { name }
+  else { match ts_entry_of(cx.coll, name, home) {
+    Some(_) -> hs_spell(name, home)
+    None    -> name
+  } }
+
+fn ts_entry_of(t: [TSEntry], name: String, home: String) : Option[TSEntry] =
+  match t {
+    [] -> None
+    [e, ...rest] -> match e {
+      TSE(n, h, _, _, _) ->
+        if n == name and h == home { Some(e) } else { ts_entry_of(rest, name, home) }
+    }
+  }
 
 fn ts_declares(t: [TSEntry], name: String, home: String) : Bool = match t {
   [] -> false
-  [TSE(n, h, _), ...rest] ->
+  [TSE(n, h, _, _, _), ...rest] ->
     if n == name and h == home { true } else { ts_declares(rest, name, home) }
 }
 
-#[doc("The spelling a bare `name` denotes from the context's home, by the name ladder: the module's own declaration, else the one visible import that exports it, else the bare name (core, root, ambiguous or unknown).")]
-pub fn ts_resolve(cx: TSCtx, name: String) : String =
-  if ts_declares(cx.coll, name, cx.home) { ts_spell(cx, name, cx.home) }
-  else { match ts_imported(cx.coll, name, cx.imports, []) {
-    [h] -> ts_spell(cx, name, h)
-    _   -> name
-  } }
-
-fn ts_imported(t: [TSEntry], name: String, imports: [String], acc: [String]) : [String] = match t {
-  [] -> acc
-  [TSE(n, h, p), ...rest] ->
-    if n == name and p and list_has(imports, h) and not list_has(acc, h) {
-      ts_imported(rest, name, imports, [h, ...acc])
-    } else { ts_imported(rest, name, imports, acc) }
+# Only an alias entry is arity-gated: a 0-argument alias must not answer
+# a generic use like `Option[Int]` (the generic core type wins those),
+# and a parameterised alias must not answer a bare use. Nominal entries
+# stay arity-agnostic, exactly as before.
+fn ts_arity_ok(e: TSEntry, nargs: Int) : Bool = match e {
+  TSE(_, _, _, arity, is_alias) -> not is_alias or arity == nargs
 }
 
-#[doc("The spelling a qualified `mod.name` denotes, when `mod` is a visible module exporting a contested `name`; None leaves the qualifier for the qualifier passes.")]
-pub fn ts_resolve_qualified(cx: TSCtx, mod: String, name: String) : Option[String] =
+#[doc("The spelling a bare `name` taking `nargs` type arguments denotes from the context's home, by the name ladder: the module's own declaration, else the one visible import that exports it, else the bare name (core, root, ambiguous or unknown).")]
+pub fn ts_resolve(cx: TSCtx, name: String, nargs: Int) : String =
+  match ts_entry_of(cx.coll, name, cx.home) {
+    Some(e) ->
+      if ts_arity_ok(e, nargs) { ts_spell(cx, name, cx.home) }
+      else { ts_resolve_imported(cx, name, nargs) }
+    None -> ts_resolve_imported(cx, name, nargs)
+  }
+
+fn ts_resolve_imported(cx: TSCtx, name: String, nargs: Int) : String =
+  match ts_imported(cx.coll, name, nargs, cx.imports, []) {
+    [h] -> ts_spell(cx, name, h)
+    _   -> name
+  }
+
+fn ts_imported(t: [TSEntry], name: String, nargs: Int, imports: [String],
+      acc: [String]) : [String] = match t {
+  [] -> acc
+  [e, ...rest] -> match e {
+    TSE(n, h, p, _, _) -> {
+      let cand = n == name and p and list_has(imports, h)
+      let ok = cand and ts_arity_ok(e, nargs) and not list_has(acc, h)
+      if ok { ts_imported(rest, name, nargs, imports, [h, ...acc]) }
+      else { ts_imported(rest, name, nargs, imports, acc) }
+    }
+  }
+}
+
+#[doc("The spelling a qualified `mod.name` taking `nargs` type arguments denotes, when `mod` is a visible module exporting a scoped `name`; None leaves the qualifier for the qualifier passes.")]
+pub fn ts_resolve_qualified(cx: TSCtx, mod: String, name: String, nargs: Int) : Option[String] =
   match mt_lookup(cx.mt, mod) {
     None -> None
     Some(me) -> {
       let home = mt_tagged_name(cx.mt, mod)
-      if me_has_export(me, name) and ts_declares(cx.coll, name, home) {
-        Some(ts_spell(cx, name, home))
-      } else { None }
+      match ts_entry_of(cx.coll, name, home) {
+        None -> None
+        Some(e) ->
+          if me_has_export(me, name) and ts_arity_ok(e, nargs) {
+            Some(ts_spell(cx, name, home))
+          } else { None }
+      }
     }
   }
 

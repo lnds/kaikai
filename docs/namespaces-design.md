@@ -624,11 +624,13 @@ Paying down structure while passing through is the only way these files
 improve at all, because nobody schedules a lane whose sole purpose is to
 split `infer.kai`.
 
-The corrective passes are the sharpest measure here. `ta_scope`,
-`unit_scope`, `proto_scope` and `const_scope` exist only because tables
-were keyed on the spelling and had to be filtered afterwards. Keying at
-construction makes each one dead code, so the count going from four to
-zero is the structural result this refactor is for — more than any
+The corrective passes are the sharpest measure here. `unit_scope`,
+`proto_scope` and `const_scope` exist only because tables were keyed on
+the spelling and had to be filtered afterwards; `ta_scope` was the
+first retired — transparent aliases now respell unconditionally at
+birth, so expansion keys a globally unique name with no filter. Keying
+at construction makes each one dead code, so the count going from four
+to zero is the structural result this refactor is for — more than any
 individual grade.
 
 **Cost at compile time.** Comparing a pair instead of a string, in tables
