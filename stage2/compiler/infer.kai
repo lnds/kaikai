@@ -1479,6 +1479,80 @@ fn inf_tycon_arg_to_string(t: Ty) : String = match inf_row_carrier_of(t) {
   None      -> inf_ty_to_string(t)
 }
 
+# As `inf_ty_to_string`, but a home-spelled contested head renders as
+# the qualified form the user can write (`db.Item`): the owner comes
+# from the env's head-owner table, which collects one entry per
+# home-spelled declaration.
+pub fn inf_ty_to_string_ow(owners: [HeadOwnerEntry], t: Ty) : String {
+  match t {
+    TyInt    -> "Int"
+    TyReal   -> "Real"
+    TyBool   -> "Bool"
+    TyString -> "String"
+    TyChar   -> "Char"
+    TyUnit   -> "Unit"
+    TyByte     -> "Byte"
+    TyInt32    -> "Int32"
+    TyUInt32   -> "UInt32"
+    TyUInt64   -> "UInt64"
+    TyInt128   -> "Int128"
+    TyHandle   -> "Handle"
+    TyListT(inner) -> cat3("[", inf_ty_to_string_ow(owners, inner), "]")
+    TyFnT(ps, ret, row) -> concat_all([
+      "(", inf_join_with(inf_ty_string_list_ow(owners, ps), ", "), ") -> ",
+      inf_ty_to_string_ow(owners, ret),
+      inf_row_to_string_suffix(row)
+    ])
+    TyCon(_, cname, tas) -> {
+      let shown = inf_tycon_display_ow(owners, cname)
+      match tas {
+        [] -> shown
+        _ -> concat_all([shown, "[", inf_join_with(map(tas, (a) => inf_tycon_arg_to_string_ow(owners, a)), ", "), "]"])
+      }
+    }
+    TyVarT(n) -> cat2("?t", int_to_string(n))
+    TyShapeApp(sv, arg) -> concat_all(["?s", int_to_string(sv), "[", inf_ty_to_string_ow(owners, arg), "]"])
+    TyAny -> "?"
+    TyDimT(base, u) -> concat_all([inf_ty_to_string_ow(owners, base), "<", inf_unit_canon_display(u), ">"])
+    TyRefineT(base, _) -> concat_all([inf_ty_to_string_ow(owners, base), " where <pred>"])
+    TyUnion(parts) -> inf_join_with(map(parts, (x) => inf_ty_to_string_ow(owners, x)), " | ")
+  }
+}
+
+fn inf_ty_string_list_ow(owners: [HeadOwnerEntry], ts: [Ty]) : [String] =
+  map(ts, (x) => inf_ty_to_string_ow(owners, x))
+
+fn inf_tycon_arg_to_string_ow(owners: [HeadOwnerEntry], t: Ty) : String =
+  match inf_row_carrier_of(t) {
+    Some(row) -> if labels_empty(row.labels) { "_" } else { inf_join_with(map(row.labels, label_to_string), " + ") }
+    None      -> inf_ty_to_string_ow(owners, t)
+  }
+
+fn inf_head_owner_of(owners: [HeadOwnerEntry], cname: String) : Option[String] =
+  match owners {
+    [] -> None
+    [HOE(n, mods), ...rest] ->
+      if n == cname { first_string(mods) }
+      else { inf_head_owner_of(rest, cname) }
+  }
+
+# The contested decl is registered under its spelled name, which is
+# also the suffix hs_display strips — the lookup answers the owner and
+# proves the suffix at once.
+fn inf_tycon_display_ow(owners: [HeadOwnerEntry], cname: String) : String =
+  match inf_head_owner_of(owners, cname) {
+    None -> cname
+    Some(own) -> {
+      let disp = hs_display(cname, Some(own))
+      if disp == cname { cname } else { concat_all([own, ".", disp]) }
+    }
+  }
+
+fn first_string(xs: [String]) : Option[String] = match xs {
+  [] -> None
+  [x, ..._] -> Some(x)
+}
+
 #[doc("Render a resolved Ty as its surface display string (with a non-empty effect row suffix). Shared by the typed-AST dumps and consumers like kai lint.")]
 pub fn inf_ty_to_string(t: Ty) : String {
   match t {
@@ -9030,13 +9104,13 @@ fn first_failing_arg_loop(env: TyEnv, sub: Subst, params: [Ty],
 # The signature note restates whatever the `expected:` note already
 # printed whenever the callee is the expected side, which is the common
 # case; it only earns its line when the two differ.
-fn call_sig_note_text(name_opt: Option[String], resolved: Ty,
+fn call_sig_note_text(owners: [HeadOwnerEntry], name_opt: Option[String], resolved: Ty,
                         expected_shown: String) : Option[String] {
   match name_opt {
     None -> None
     Some(nm) -> match resolved {
       TyFnT(_, _, _) -> {
-        let sig = inf_ty_to_string(resolved)
+        let sig = inf_ty_to_string_ow(owners, resolved)
         if sig == expected_shown { None } else { Some("`#{nm}` expects: #{sig}") }
       }
       _ -> None
@@ -9059,7 +9133,7 @@ fn emit_call_arg_notes(env: TyEnv, sub: Subst, callee: Expr,
     }
     None -> ()
   }
-  match call_sig_note_text(name_opt, resolved, expected_shown) {
+  match call_sig_note_text(env.head_owners, name_opt, resolved, expected_shown) {
     Some(txt) -> diag_note(txt)
     None      -> ()
   }
@@ -9083,7 +9157,7 @@ fn build_call_type_mismatch_diag(env: TyEnv, sub: Subst, callee: Expr,
     }
     None -> []
   }
-  let sig_notes = match call_sig_note_text(name_opt, resolved, expected_shown) {
+  let sig_notes = match call_sig_note_text(env.head_owners, name_opt, resolved, expected_shown) {
     Some(txt) -> [ri_note(file, line, col, txt)]
     None      -> []
   }
@@ -9120,7 +9194,7 @@ fn arity_mismatch_of(sub: Subst, callee_ty: Ty, arg_tys: [Ty]) : Option[Int] {
 # line so users see exactly which arity was declared. When the callee
 # is anonymous, the notes omit the name but still surface the param
 # count + signature.
-fn emit_wrong_arity(file: String, callee: Expr, callee_ty: Ty,
+fn emit_wrong_arity(owners: [HeadOwnerEntry], file: String, callee: Expr, callee_ty: Ty,
                       arg_tys: [Ty], line: Int, col: Int) : Unit / Console + File {
 
   let np = match callee_ty {
@@ -9139,7 +9213,7 @@ fn emit_wrong_arity(file: String, callee: Expr, callee_ty: Ty,
   }
   match name_opt {
     Some(nm) -> match callee_ty {
-      TyFnT(_, _, _) -> diag_note("`#{nm}` expects: #{inf_ty_to_string(callee_ty)}")
+      TyFnT(_, _, _) -> diag_note("`#{nm}` expects: #{inf_ty_to_string_ow(owners, callee_ty)}")
       _              -> ()
     }
     None -> ()
@@ -9154,7 +9228,7 @@ fn emit_wrong_arity(file: String, callee: Expr, callee_ty: Ty,
 # structured T4 Diagnostic builder. Mirrors the text emitted
 # by `emit_wrong_arity` exactly so an LSP client can rebuild the same
 # `error: / note: / help:` block from the collected value.
-fn build_wrong_arity_diag(file: String, callee: Expr, callee_ty: Ty,
+fn build_wrong_arity_diag(owners: [HeadOwnerEntry], file: String, callee: Expr, callee_ty: Ty,
                             arg_tys: [Ty], line: Int, col: Int) : Diagnostic {
   let np = match callee_ty {
     TyFnT(params, _, _) -> list_length(params)
@@ -9172,7 +9246,7 @@ fn build_wrong_arity_diag(file: String, callee: Expr, callee_ty: Ty,
   }
   let sig_notes = match name_opt {
     Some(nm) -> match callee_ty {
-      TyFnT(_, _, _) -> [ri_note(file, line, col, "`#{nm}` expects: #{inf_ty_to_string(callee_ty)}")]
+      TyFnT(_, _, _) -> [ri_note(file, line, col, "`#{nm}` expects: #{inf_ty_to_string_ow(owners, callee_ty)}")]
       _              -> []
     }
     None -> []
@@ -9207,9 +9281,9 @@ fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
   let resolved_callee = apply_ty(st.sub, callee_ty)
   match arity_mismatch_of(st.sub, callee_ty, arg_tys) {
     Some(_np) -> {
-      emit_wrong_arity(st.file, callee, resolved_callee, arg_tys, line, col)
+      emit_wrong_arity(st.env.head_owners, st.file, callee, resolved_callee, arg_tys, line, col)
       # T4 collected diagnostic.
-      let d = build_wrong_arity_diag(st.file, callee, resolved_callee, arg_tys, line, col)
+      let d = build_wrong_arity_diag(st.env.head_owners, st.file, callee, resolved_callee, arg_tys, line, col)
       st_bump_err(st_push_diag(st, d))
     }
     None -> {
@@ -9218,7 +9292,7 @@ fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
       if st1.errs > pre_errs {
         # Mirrors the `expected:` note `st_unify` just printed, so the
         # trailing signature note can drop itself when it would repeat it.
-        let expected_shown = inf_ty_to_string(apply_ty(st1.sub, callee_ty))
+        let expected_shown = inf_ty_to_string_ow(st1.env.head_owners, apply_ty(st1.sub, callee_ty))
         emit_call_arg_notes(st1.env, st1.sub, callee, callee_ty, arg_tys, expected_shown)
         # T1 collected diagnostic. The header text mirrors
         # the generic "type mismatch in function call" line emitted by
@@ -9238,8 +9312,8 @@ fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
 # found type's parent union, plus a concrete remediation hint. The
 # plain notes still fire when neither side is union-flavoured.
 fn emit_union_aware_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console {
-  diag_note("expected: #{inf_ty_to_string(expected)}")
-  diag_note("found:    #{inf_ty_to_string(found)}")
+  diag_note("expected: #{inf_ty_to_string_ow(env.head_owners, expected)}")
+  diag_note("found:    #{inf_ty_to_string_ow(env.head_owners, found)}")
   # Drill through matching wrappers (TyFn, TyCon-of-same-name with
   # mismatched args) to surface the first divergent TyCon pair. That
   # is where the union/component context is meaningful — at the
@@ -13463,7 +13537,10 @@ pub fn build_head_owner_map(decls: [Decl], modules: [ModuleEntry],
     # Tongariki: only the seeded built-in `List → list` participates.
     # User-defined `pub type T` is invisible to pipe dispatch and the
     # rejection diagnostic falls through to the standard HLNone path.
-    head_owner_seed()
+    # Spelled entries ride along regardless of edition: they feed
+    # diagnostics (un-spelling a contested name to `mod.T`), which need
+    # the owner even where old-edition dispatch ignores the cache.
+    list_append(head_owner_seed(), spelled_head_owners(decls, []))
   }
 }
 
