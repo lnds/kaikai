@@ -1122,6 +1122,8 @@ tier1-asan: kaic2 test-arena
 	@echo "tier1-asan OK — issue #1635 fixture passes under ASAN+UBSan (goto move-set name collision, no stale-cell read)"
 	@$(MAKE) -C stage2 test-perceus-1801-capability-param-asan
 	@echo "tier1-asan OK — issue #1801 fixtures pass under ASAN+UBSan (capability params carry no RC traffic, evidence node never dropped)"
+	@$(MAKE) -C stage2 test-perceus-1803-op-arg-free-asan
+	@echo "tier1-asan OK — issue #1803 fixtures pass under ASAN+UBSan (primitive-payload op arg matched in the handler clause, no free-while-live)"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,
