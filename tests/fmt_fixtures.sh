@@ -139,27 +139,73 @@ else
   fail=$((fail + 1))
 fi
 
-# The package-directory case must still resolve: `kai fmt .` and
-# `kai fmt ./<pkg>` route through resolve_package_spec to the manifest
-# entry point and format it in place (exit 0, entry rewritten).
+# The package-directory case formats the whole package: `kai fmt .`
+# and `kai fmt ./<pkg>` rewrite every .kai file the package owns, not
+# just the resolved entry point (a sibling left mangled while fmt
+# exits 0 is the #1849 regression).
 cp "$dsp/unformatted.kai" "$dsp/main.kai"
-if ( cd "$dsp"; "$KAI" fmt . ) 2>"$tmp/dot.err" && diff -u "$tmp/canonical.kai" "$dsp/main.kai" > "$tmp/diff"; then
-  echo "  OK   dot-package (fmt . resolves + formats the manifest entry)"
+if ( cd "$dsp"; "$KAI" fmt . ) 2>"$tmp/dot.err" \
+   && diff -u "$tmp/canonical.kai" "$dsp/main.kai" > "$tmp/diff" \
+   && diff -u "$tmp/canonical.kai" "$dsp/unformatted.kai" >> "$tmp/diff"; then
+  echo "  OK   dot-package (fmt . formats every package file)"
   pass=$((pass + 1))
 else
-  echo "  FAIL dot-package — fmt . did not resolve/format the entry:"
+  echo "  FAIL dot-package — fmt . left a package file unformatted:"
   sed 's/^/      /' "$tmp/dot.err"
   sed 's/^/      /' "$tmp/diff"
   fail=$((fail + 1))
 fi
 cp "$dsp/unformatted.kai" "$dsp/main.kai"
-if ( cd "$tmp"; "$KAI" fmt ./dotslash-pkg ) 2>"$tmp/subpkg.err" && diff -u "$tmp/canonical.kai" "$dsp/main.kai" > "$tmp/diff"; then
-  echo "  OK   subdir-package (fmt ./<pkg> resolves + formats the manifest entry)"
+cp "$dsp/unformatted.kai" "$dsp/sibling.kai"
+if ( cd "$tmp"; "$KAI" fmt ./dotslash-pkg ) 2>"$tmp/subpkg.err" \
+   && diff -u "$tmp/canonical.kai" "$dsp/main.kai" > "$tmp/diff" \
+   && diff -u "$tmp/canonical.kai" "$dsp/sibling.kai" >> "$tmp/diff"; then
+  echo "  OK   subdir-package (fmt ./<pkg> formats every package file)"
   pass=$((pass + 1))
 else
-  echo "  FAIL subdir-package — fmt ./<pkg> did not resolve/format the entry:"
+  echo "  FAIL subdir-package — fmt ./<pkg> left a package file unformatted:"
   sed 's/^/      /' "$tmp/subpkg.err"
   sed 's/^/      /' "$tmp/diff"
+  fail=$((fail + 1))
+fi
+
+# Package-mode --check: exit 1 listing the files that would change;
+# exit 0 (silent) when the whole package is canonical. Drives the
+# driver-level comparison too — a canonical file must check clean, the
+# trailing-newline comparison trap fixed alongside #1849.
+printf 'fn  main( ) =  ()\n' > "$dsp/sibling.kai"
+check_rc=0
+( cd "$dsp"; "$KAI" fmt --check . >"$tmp/check.out" 2>&1 ) || check_rc=$?
+if [ "$check_rc" -eq 1 ] && [ "$(cat "$tmp/check.out")" = "sibling.kai" ]; then
+  echo "  OK   package-check-dirty (lists only the unformatted file, exit 1)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL package-check-dirty — rc=$check_rc out=$(cat "$tmp/check.out")"
+  fail=$((fail + 1))
+fi
+"$KAI" fmt "$dsp/sibling.kai" 2>/dev/null
+check_rc=0
+( cd "$dsp"; "$KAI" fmt --check . >"$tmp/check.out" 2>&1 ) || check_rc=$?
+if [ "$check_rc" -eq 0 ] && [ ! -s "$tmp/check.out" ]; then
+  echo "  OK   package-check-clean (exit 0, silent, canonical package)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL package-check-clean — rc=$check_rc out=$(cat "$tmp/check.out")"
+  fail=$((fail + 1))
+fi
+
+# Single-file --check round-trip: a file just rewritten by `kai fmt`
+# checks clean (rc 0); a non-canonical one checks dirty (rc 1) and the
+# canonical text goes to stdout.
+printf 'fn  main( ) =  ()\n' > "$tmp/single.kai"
+"$KAI" fmt "$tmp/single.kai" 2>/dev/null
+check_rc=0
+"$KAI" fmt --check "$tmp/single.kai" >"$tmp/check.out" 2>&1 || check_rc=$?
+if [ "$check_rc" -eq 0 ]; then
+  echo "  OK   file-check-clean (fmt then --check exits 0)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL file-check-clean — rc=$check_rc out=$(cat "$tmp/check.out")"
   fail=$((fail + 1))
 fi
 
