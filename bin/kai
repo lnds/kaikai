@@ -1534,7 +1534,8 @@ EOF
 usage_fmt() {
   cat <<EOF
 usage: kai fmt [--width N] <file.kai>            # rewrite file in place
-       kai fmt [--width N] --check <file.kai>    # exit 0 if formatted, 1 if not
+       kai fmt [--width N] [. | ./<pkg>]         # rewrite the whole package
+       kai fmt [--width N] --check <target>      # exit 0 if formatted, 1 if not
        kai fmt [--width N] --stdin               # read stdin -> formatted to stdout
 
 Pretty-print kaikai source canonically. The formatter is gofmt-style:
@@ -1554,14 +1555,21 @@ Options:
                the package's kai.toml \`[fmt]\` table, else 100.
   --check      Do not modify the file. Exit 0 if already formatted; 1
                otherwise. Print the formatted output to stdout when
-               different.
+               different (single file), or the list of files that
+               would change (package form).
   --stdin      Read kaikai source from stdin; write formatted source
                to stdout. The file form (kai fmt <file>) rewrites the
                file in place; this form is for editor integrations.
   -h, --help   Show this help.
 
+A package form (\`.\`, \`./<pkg>\`, or no argument) formats every .kai
+file the package owns — sibling modules covered by the package root
+plus the tests/ sibling — not just the entry point.
+
 Examples:
   kai fmt stage2/compiler.kai
+  kai fmt              # every .kai file in the current package
+  kai fmt --check .    # list unformatted files; exit 1 if any
   kai fmt --check src/foo.kai && echo OK
   cat src/foo.kai | kai fmt --stdin > /tmp/foo-fmt.kai
 EOF
@@ -3207,17 +3215,25 @@ cmd_fmt() {
     return $?
   fi
 
-  if [ -z "$src" ]; then
-    src="$(resolve_package_spec "" "formatting")"
-  else
-    # A `./`-prefixed FILE is a file path, not a package spec: route only
-    # `.` and `./<dir>` through resolve_package_spec so `kai fmt
-    # ./main.kai` (and `find . -exec kai fmt {}`) works.
-    case "$src" in
-      .)     src="$(resolve_package_spec "$src" "formatting")" ;;
-      ./*)   [ -f "$src" ] || src="$(resolve_package_spec "$src" "formatting")" ;;
-    esac
-  fi
+  # A package form (no argument, `.`, `./<dir>`) formats every .kai
+  # file the package owns, not just the entry point: a library ships
+  # no entry point at all, and sibling modules matter as much as
+  # main.kai. A `./`-prefixed FILE stays a single-file run so
+  # `kai fmt ./main.kai` (and `find . -exec kai fmt {}`) keeps working.
+  case "$src" in
+    ""|.)
+      fmt_package "." "$width" "$mode_check"
+      return $?
+      ;;
+    ./*)
+      if [ ! -f "$src" ]; then
+        [ -d "$src" ] || die "$src is not a directory"
+        [ -f "${src%/}/kai.toml" ] || die "$src has no kai.toml — sub-packages must declare their own manifest"
+        fmt_package "${src%/}" "$width" "$mode_check"
+        return $?
+      fi
+      ;;
+  esac
   [ -n "$src" ] || die "missing input file (see 'kai fmt --help')"
   [ -f "$src" ] || die_file_not_found "$src" "fmt"
   width="$(fmt_width_for "$(dirname "$src")" "$width")"
@@ -3227,18 +3243,53 @@ cmd_fmt() {
     return $?
   fi
 
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT INT TERM
-  if "$KAIC2" --fmt-width "$width" --fmt "$src" > "$tmp/out.kai"; then
-    # Only write back when the formatted text differs (avoids touching
-    # the file mtime on a no-op).
-    if ! cmp -s "$src" "$tmp/out.kai"; then
-      cat "$tmp/out.kai" > "$src"
+  fmt_rewrite_file "$src" "$width"
+}
+
+# Format every .kai file package $1 owns (source files plus the
+# tests/ sibling), in place — or, with $3 set, check-only: list the
+# files that would change (gofmt -l spirit) and exit 1 when any do.
+fmt_package() {
+  fp_root="$(cd "$1" && pwd)"
+  fp_width="$(fmt_width_for "$fp_root" "$2")"
+  fp_check="$3"
+  fp_files="$(package_source_files "$fp_root")"
+  for fp_tf in "$fp_root"/tests/*.kai; do
+    [ -f "$fp_tf" ] && fp_files="$fp_files
+${fp_tf#"$fp_root"/}"
+  done
+  [ -n "$fp_files" ] || die "no .kai files found in $1 (see 'kai fmt --help')"
+  fp_status=0
+  # shellcheck disable=SC2086
+  for fp_rel in $fp_files; do
+    fp_f="$fp_root/$fp_rel"
+    if [ -n "$fp_check" ]; then
+      fp_out="$("$KAIC2" --fmt-width "$fp_width" --fmt-check "$fp_f")" || {
+        [ -n "$fp_out" ] && printf '%s\n' "$fp_rel"
+        fp_status=1
+      }
+    else
+      printf 'kai: fmt %s\n' "$fp_rel" >&2
+      fmt_rewrite_file "$fp_f" "$fp_width" || fp_status=1
     fi
-  else
-    cat "$tmp/out.kai" >&2 2>/dev/null || true
-    return 1
+  done
+  return "$fp_status"
+}
+
+# Rewrite $1 in place with the formatter's output at width $2. Only
+# writes back when the text differs, so a no-op run keeps the mtime.
+fmt_rewrite_file() {
+  fr_tmp="$(mktemp -d)"
+  if "$KAIC2" --fmt-width "$2" --fmt "$1" > "$fr_tmp/out.kai"; then
+    if ! cmp -s "$1" "$fr_tmp/out.kai"; then
+      cat "$fr_tmp/out.kai" > "$1"
+    fi
+    rm -rf "$fr_tmp"
+    return 0
   fi
+  cat "$fr_tmp/out.kai" >&2 2>/dev/null || true
+  rm -rf "$fr_tmp"
+  return 1
 }
 
 # kai migrate — rewrite source from one edition's surface to the next.

@@ -170,13 +170,18 @@ printf 'name = "w"\nversion = "0.1.0"\n\n[fmt]\nwidth = 60\n' > "$tmp/pkg/kai.to
 cp "$probe" "$tmp/pkg/src/a.kai"
 "$KAIC2" --fmt-width 60 --fmt "$probe" > "$tmp/want60.kai"
 "$KAIC2" --fmt-width 120 --fmt "$probe" > "$tmp/want120.kai"
-if ! "$ROOT/bin/kai" fmt --check "$tmp/pkg/src/a.kai" > "$tmp/got.kai" 2>/dev/null; then :; fi
-if ! cmp -s "$tmp/got.kai" "$tmp/want60.kai"; then
+# --check on a canonical file prints nothing (check-clean), so the
+# plumbing probes drive the in-place rewrite path instead: write-back
+# only fires when the width actually reached kaic2.
+cp "$probe" "$tmp/pkg/src/a.kai"
+"$ROOT/bin/kai" fmt "$tmp/pkg/src/a.kai" 2>/dev/null
+if ! cmp -s "$tmp/pkg/src/a.kai" "$tmp/want60.kai"; then
   echo "  FAIL plumbing — kai fmt did not take width = 60 from the package's kai.toml [fmt] table"
   fail=$((fail + 1))
 fi
-if ! "$ROOT/bin/kai" fmt --width 120 --check "$tmp/pkg/src/a.kai" > "$tmp/got.kai" 2>/dev/null; then :; fi
-if ! cmp -s "$tmp/got.kai" "$tmp/want120.kai"; then
+cp "$probe" "$tmp/pkg/src/a.kai"
+"$ROOT/bin/kai" fmt --width 120 "$tmp/pkg/src/a.kai" 2>/dev/null
+if ! cmp -s "$tmp/pkg/src/a.kai" "$tmp/want120.kai"; then
   echo "  FAIL plumbing — kai fmt --width 120 did not override the manifest"
   fail=$((fail + 1))
 fi
