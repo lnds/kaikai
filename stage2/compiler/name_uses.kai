@@ -12,6 +12,8 @@
 import compiler.util
 import compiler.ast
 import compiler.expr_positions
+import compiler.modules
+import compiler.scope_walk
 import compiler.name_table
 
 #[doc("One contested reference: `NUse(class, name, line, col, op)`. `op` is the operation a protocol was reached through, else empty.")]
@@ -192,4 +194,162 @@ fn nu_seen(acc: [NUse], cls: NCls, name: String) : Bool = match acc {
   [NUse(c, n, _, _, _), ...rest] ->
     if n == name and ncls_word(c) == ncls_word(cls) { true }
     else { nu_seen(rest, cls, name) }
+}
+
+# ==== const keying across modules ====
+#
+# A colliding const read keys to the module that owns it: the reader's
+# own first, else the first exported one of another home. The collision
+# table comes from `nt_collect` — boundary-stamped homes, not a
+# streaming scan — so a `DConst`'s identity is set where it is parsed,
+# like every other name class this module resolves.
+
+#[doc("One const-keying context: the collision table (NEnt NCConst entries), the reading decl's home, and the root module name. `free` off restricts the rewrite to qualified reads (the interp lift keys those; free reads wait for the scope-aware rerun). `mt` maps a written qualifier to its tagged module name — empty when the stream's qualifiers are already tagged.")]
+pub type CSCtx = { coll: [NEnt], home: String, target: String,
+                   free: Bool, mt: [ModuleEntry] }
+
+#[doc("The const collisions of `decls`: consts whose name another home also declares, in stream order (boundary-stamped homes).")]
+pub fn nu_const_coll(decls: [Decl], target: String) : [NEnt] =
+  nu_keep_collided(nt_collect(decls, target), nt_collect(decls, target), [])
+
+fn nu_keep_collided(all: [NEnt], todo: [NEnt], acc: [NEnt]) : [NEnt] = match todo {
+  [] -> list_reverse(acc)
+  [e, ...rest] -> match e {
+    NEnt(NCConst, n, h, _) ->
+      if nu_other_home(all, n, h) { nu_keep_collided(all, rest, [e, ...acc]) }
+      else { nu_keep_collided(all, rest, acc) }
+    _ -> nu_keep_collided(all, rest, acc)
+  }
+}
+
+fn nu_other_home(t: [NEnt], name: String, home: String) : Bool = match t {
+  [] -> false
+  [NEnt(c, n, h, _), ...rest] ->
+    if ncls_word(c) == "constant" and n == name and h != home { true }
+    else { nu_other_home(rest, name, home) }
+}
+
+#[doc("A decl's home for both reading and streaming: a DConst carries its own `module_origin` (None marks the root); everything else follows the streaming reset.")]
+pub fn nu_reader_home(d: Decl, cur: String, target: String) : String = match d {
+  DConst(_, _, _, _, mo, _, _) -> match mo { Some(m) -> m  None -> target }
+  DDoc(_, _, inner, _, _) -> nu_reader_home(inner, cur, target)
+  DAttr(_, inner, _, _)   -> nu_reader_home(inner, cur, target)
+  _ -> decl_home_hint_reset(d, cur, target)
+}
+
+#[doc("The module that owns a read of `name` from the context's home: the reader's own const if it declares one, else the first exported const of another module. The root's consts are never a foreign pick — the root is not importable.")]
+pub fn nu_const_owner(cx: CSCtx, name: String) : Option[String] =
+  if nu_const_declares(cx.coll, name, cx.home) { Some(cx.home) }
+  else { nu_const_foreign_pub(cx.coll, name, cx.home, cx.target) }
+
+fn nu_const_declares(t: [NEnt], name: String, home: String) : Bool = match t {
+  [] -> false
+  [NEnt(c, n, h, _), ...rest] ->
+    if ncls_word(c) == "constant" and n == name and h == home { true }
+    else { nu_const_declares(rest, name, home) }
+}
+
+fn nu_const_foreign_pub(t: [NEnt], name: String, home: String,
+      target: String) : Option[String] = match t {
+  [] -> None
+  [NEnt(c, n, h, p), ...rest] ->
+    if ncls_word(c) == "constant" and n == name and p and h != home and h != target { Some(h) }
+    else { nu_const_foreign_pub(rest, name, home, target) }
+}
+
+#[doc("True when `home` declares a pub const `name` in the collision table.")]
+pub fn nu_is_pub_const(t: [NEnt], name: String, home: String) : Bool = match t {
+  [] -> false
+  [NEnt(c, n, h, p), ...rest] ->
+    if ncls_word(c) == "constant" and n == name and h == home and p { true }
+    else { nu_is_pub_const(rest, name, home) }
+}
+
+fn nu_const_re(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn nu_scope_params(ps: [Param], acc: [String]) : [String] = sw_params(ps, acc)
+
+#[doc("Rewrite the free reads of colliding const names in one expression; `sh` holds the names already bound in scope.")]
+pub fn nu_const_expr(e: Expr, sh: [String], cx: CSCtx) : Expr =
+  sw_expr(e, sh, (x, s) => nu_const_leaf(x, s, cx), (t) => t, (n) => n)
+
+# `mod.NAME` where NAME is a colliding pub const of `mod`: key it
+# here — rqc collapses an uppercase qualified export to a bare
+# `EVar` (the variant-ctor rule), which would lose the module. The
+# qualifier maps through `mt` first: an aliased import collides
+# under its tagged name, not the name the file wrote.
+# Private consts fall through so rqc / pub-access still diagnose.
+fn nu_const_leaf(e: Expr, sh: [String], cx: CSCtx) : Option[Expr] = match e.kind {
+  EVar(nm) ->
+    if not cx.free or list_has(sh, nm) { Some(e) }
+    else { match nu_const_owner(cx, nm) {
+      Some(m) -> if m == cx.target { Some(e) } else { Some(nu_const_re(e, EModCall(m, nm))) }
+      None    -> Some(e)
+    } }
+  EField(obj, f) -> match obj.kind {
+    EVar(m) -> {
+      let tm = mt_tagged_name(cx.mt, m)
+      if not list_has(sh, m) and nu_is_pub_const(cx.coll, f, tm) {
+        Some(nu_const_re(e, EModCall(tm, f)))
+      } else { None }
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+fn nu_const_hclauses(hcs: [HClause], sh: [String], cx: CSCtx) : [HClause] =
+  sw_hclauses(hcs, sh, (x, s) => nu_const_leaf(x, s, cx), (t) => t, (n) => n)
+
+fn nu_const_hreturn_opt(o: Option[HReturn], sh: [String], cx: CSCtx) : Option[HReturn] =
+  sw_hreturn_opt(o, sh, (x, s) => nu_const_leaf(x, s, cx), (t) => t, (n) => n)
+
+#[doc("Rewrite free reads of colliding const names to `EModCall(home, name)`, resolving each against the reading decl's own module first. Runs before rqc: a qualified `mod.CONST` read is keyed here, before the uppercase collapse can drop its module. `scopes`/`global_mt` give each decl its segment module table, so a qualifier written as a per-file import alias keys under its tagged name; pass empty tables when the stream's qualifiers are already tagged.")]
+pub fn nu_scope_const_decls(decls: [Decl], coll: [NEnt], target: String,
+      scopes: [ModScope], global_mt: [ModuleEntry]) : [Decl] =
+  if list_length(coll) == 0 { decls }
+  else { nu_scope_const_loop(decls, coll, target, target, scopes, global_mt, []) }
+
+fn nu_scope_const_loop(ds: [Decl], coll: [NEnt], cur: String, target: String,
+      scopes: [ModScope], global_mt: [ModuleEntry], acc: [Decl]) : [Decl] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> {
+    let home = nu_reader_home(d, cur, target)
+    let seg = if home == target { "" } else { home }
+    let cx = CSCtx { coll: coll, home: home, target: target, free: true,
+                     mt: ms_table(scopes, seg, global_mt) }
+    nu_scope_const_loop(rest, coll, home, target, scopes, global_mt, [nu_const_decl(d, cx), ...acc])
+  }
+}
+
+fn nu_const_sub_decls(ds: [Decl], cx: CSCtx) : [Decl] = match ds {
+  [] -> []
+  [d, ...rest] -> [nu_const_decl(d, cx), ...nu_const_sub_decls(rest, cx)]
+}
+
+fn nu_const_decl(d: Decl, cx: CSCtx) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(p, n, tps, ps, ret, row, nu_const_expr(body, nu_scope_params(ps, []), cx), l, c, mo)
+  DConst(p, n, ty, body, mo, l, c) -> DConst(p, n, ty, nu_const_expr(body, [], cx), mo, l, c)
+  DTest(n, body, l, c, mo)  -> DTest(n, nu_const_expr(body, [], cx), l, c, mo)
+  DBench(n, body, l, c, mo) -> DBench(n, nu_const_expr(body, [], cx), l, c, mo)
+  DCheck(n, ps, body, l, c, mo) ->
+    DCheck(n, ps, nu_const_expr(body, nu_scope_params(ps, []), cx), l, c, mo)
+  DEffect(p, n, tps, ops, dblk, l, c, mo) -> match dblk {
+    Some(DBlk(hcs, ret, bl, bc)) ->
+      DEffect(p, n, tps, ops,
+              Some(DBlk(nu_const_hclauses(hcs, [], cx), nu_const_hreturn_opt(ret, [], cx), bl, bc)),
+              l, c, mo)
+    None -> d
+  }
+  DImpl(pn, tas, fty, subs, l, c, ss) -> DImpl(pn, tas, fty, nu_const_sub_decls(subs, cx), l, c, ss)
+  DDerive(ps, inner, l, c)    -> DDerive(ps, nu_const_decl(inner, cx), l, c)
+  DUnstable(inner, l, c)      -> DUnstable(nu_const_decl(inner, cx), l, c)
+  DProtoLaws(t, inner, l, c, mo)  -> DProtoLaws(t, nu_const_decl(inner, cx), l, c, mo)
+  DImplAxiom(t, inner, l, c, mo)  -> DImplAxiom(t, nu_const_decl(inner, cx), l, c, mo)
+  DConstructor(inner, l, c)   -> DConstructor(nu_const_decl(inner, cx), l, c)
+  DDoc(r, t, inner, l, c)     -> DDoc(r, t, nu_const_decl(inner, cx), l, c)
+  DAttr(r, inner, l, c)       -> DAttr(r, nu_const_decl(inner, cx), l, c)
+  _ -> d
 }
