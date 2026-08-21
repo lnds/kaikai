@@ -1,17 +1,12 @@
-# compiler/ta_scope.kai — module scoping for transparent type aliases.
+# compiler/ta_scope.kai — module-scoped expansion for transparent type aliases.
 #
-# `type Step = ...` is not a package-global name. The transparent-alias
-# table is collected over the flattened decl stream of every module, so
-# expanding a decl against the whole table lets whichever alias was
-# declared first rewrite `Step` everywhere — including inside a module
-# that declares its own `Step` and never imports the first one.
-#
-# Each decl expands against the aliases its own module may see: the ones
-# it declares itself, plus the `pub` ones of other modules. That is the
-# rule `pa_decide` (compiler.pub_access) already applies to references;
-# here it decides which alias a use site resolves to rather than whether
-# the use is legal. Records and sums already scope this way through the
-# typer's `module_origin` disambiguation — aliases had no equivalent.
+# `type Step = ...` is not a package-global name: a module's use sites
+# expand against the aliases that module may see — its own, the `pub`
+# ones of the modules it imports, and the ambient core set. Contested
+# alias names are already respelled per home by `type_scope`, so a
+# same-named alias from a module this one never imported can no longer
+# answer here — that is what `type_scope` gives nominal types through
+# the typer's `module_origin` disambiguation.
 
 import compiler.util
 import compiler.ast
@@ -31,6 +26,22 @@ fn tas_decl_home(d: Decl, cur: String, target: String) : String = match d {
   _ -> decl_home_hint_reset(d, cur, target)
 }
 
+# An untagged alias comes from the root file, which only the root may see.
+fn tas_home_eq(e_home: String, home: String, target: String) : Bool =
+  e_home == home or (e_home == "" and home == target)
+
+# The modules a home imports; the root file owns its imports under ""
+# in the resolver's scope list.
+fn tas_imports_of(imps: [ModImports], home: String, target: String) : [String] = {
+  let owner = if home == target { "" } else { home }
+  tas_imps_lookup(imps, owner)
+}
+
+fn tas_imps_lookup(imps: [ModImports], owner: String) : [String] = match imps {
+  [] -> []
+  [MImp(o, names), ...rest] -> if o == owner { names } else { tas_imps_lookup(rest, owner) }
+}
+
 # `ta_lookup` takes the first match, so a module's own aliases lead the
 # filtered table: a local `type T` shadows an imported `pub type T`
 # rather than losing to whichever module was flattened first. This is
@@ -41,24 +52,37 @@ fn tas_decl_home(d: Decl, cur: String, target: String) : String = match d {
 # aliases, so they never enter the table, but they own the name inside
 # their module all the same — an imported alias must not expand a use
 # that resolves to one of them.
-fn tas_filter(table: [TAEntry], home: String, nominal: [String]) : [TAEntry] =
-  list_append(tas_take(table, home, nominal, true, []),
-              tas_take(table, home, nominal, false, []))
+fn tas_filter(table: [TAEntry], home: String, nominal: [String],
+      imports: [String], cores: [String], target: String) : [TAEntry] =
+  list_append(tas_take_own(table, home, target, []),
+              tas_take_visible(table, home, nominal, imports, cores, target, []))
 
-fn tas_imported_ok(e: TAEntry, home: String, nominal: [String]) : Bool = {
-  let visible = ta_visible_from(e, home)
-  let foreign = not ta_home_matches(e, home)
-  let shadowed = list_has(nominal, ta_entry_name(e))
-  visible and foreign and not shadowed
-}
-
-fn tas_take(table: [TAEntry], home: String, nominal: [String], own: Bool,
+fn tas_take_own(table: [TAEntry], home: String, target: String,
       acc: [TAEntry]) : [TAEntry] = match table {
   [] -> list_reverse(acc)
-  [e, ...rest] -> {
-    let keep = if own { ta_home_matches(e, home) }
-               else { tas_imported_ok(e, home, nominal) }
-    tas_take(rest, home, nominal, own, if keep { [e, ...acc] } else { acc })
+  [e, ...rest] -> match e {
+    TAE(_, _, _, e_home, _) ->
+      tas_take_own(rest, home, target,
+        if tas_home_eq(e_home, home, target) { [e, ...acc] } else { acc })
+  }
+}
+
+fn tas_visible_ok(e_home: String, e_pub: Bool, home: String,
+      imports: [String], cores: [String], target: String) : Bool =
+  if not e_pub { false }
+  else if tas_home_eq(e_home, home, target) { false }
+  else { list_has(imports, e_home) or list_has(cores, e_home) }
+
+fn tas_take_visible(table: [TAEntry], home: String, nominal: [String],
+      imports: [String], cores: [String], target: String,
+      acc: [TAEntry]) : [TAEntry] = match table {
+  [] -> list_reverse(acc)
+  [e, ...rest] -> match e {
+    TAE(n, _, _, e_home, e_pub) -> {
+      let vis = tas_visible_ok(e_home, e_pub, home, imports, cores, target)
+      tas_take_visible(rest, home, nominal, imports, cores, target,
+        if vis and not list_has(nominal, n) { [e, ...acc] } else { acc })
+    }
   }
 }
 
@@ -108,11 +132,13 @@ fn tas_nominals_of_home(ns: [TasNominal], home: String,
 type TasCache = TC(String, [TAEntry], Bool)
 
 fn tas_table_for(table: [TAEntry], home: String, nominal: [TasNominal],
+      imps: [ModImports], cores: [String], target: String,
       cache: TasCache) : TasCache = match cache {
   TC(chome, _, valid) ->
     if valid and chome == home { cache }
     else {
-      TC(home, tas_filter(table, home, tas_nominals_of_home(nominal, home, [])), true)
+      TC(home, tas_filter(table, home, tas_nominals_of_home(nominal, home, []),
+                          tas_imports_of(imps, home, target), cores, target), true)
     }
 }
 
@@ -120,23 +146,25 @@ fn tas_cached_table(cache: TasCache) : [TAEntry] = match cache {
   TC(_, t, _) -> t
 }
 
-#[doc("Expand transparent type aliases in every decl, resolving each against the aliases its own module may see rather than the whole package. `target` is the root file's module name, the home of every decl the root declares.")]
+#[doc("Expand transparent type aliases in every decl, resolving each against the aliases its own module may see: its own, the `pub` ones of the modules `imps` says it imports, and the ambient core set `cores`. `target` is the root file's module name, the home of every decl the root declares.")]
 pub fn ta_scope_expand_decls(decls: [Decl], table: [TAEntry],
-      aliases: [AliasResult], fuel: Int, target: String) : [Decl] = {
+      aliases: [AliasResult], fuel: Int, imps: [ModImports],
+      target: String, cores: [String]) : [Decl] = {
   let nominal = tas_nominals(decls, target, target, [])
-  tas_loop(decls, table, aliases, fuel, target, target, nominal,
-           TC("", [], false), [])
+  tas_loop(decls, table, aliases, fuel, target, target, nominal, imps,
+           cores, TC("", [], false), [])
 }
 
 fn tas_loop(decls: [Decl], table: [TAEntry], aliases: [AliasResult],
       fuel: Int, cur: String, target: String, nominal: [TasNominal],
-      cache: TasCache, acc: [Decl]) : [Decl] = match decls {
+      imps: [ModImports], cores: [String], cache: TasCache,
+      acc: [Decl]) : [Decl] = match decls {
   [] -> list_reverse(acc)
   [d, ...rest] -> {
     let home = tas_decl_home(d, cur, target)
-    let cache1 = tas_table_for(table, home, nominal, cache)
+    let cache1 = tas_table_for(table, home, nominal, imps, cores, target, cache)
     let d1 = ta_expand_one(d, tas_cached_table(cache1), aliases, fuel)
-    tas_loop(rest, table, aliases, fuel, home, target, nominal, cache1,
-             [d1, ...acc])
+    tas_loop(rest, table, aliases, fuel, home, target, nominal, imps,
+             cores, cache1, [d1, ...acc])
   }
 }
