@@ -63,6 +63,10 @@ import compiler.infer
 import compiler.fnreg
 import compiler.modules
 import compiler.name_uses
+import compiler.type_scope_table
+import compiler.type_scope
+import compiler.effect_scope_table
+import compiler.effect_scope
 import compiler.native_prims
 import compiler.unbox
 import compiler.perceus
@@ -11026,21 +11030,26 @@ fn mk_proto_dispatch_body(pname: String, opname: String, line: Int, col: Int) : 
 # collision context is keyed by the decl's home. Growing the inherited
 # environment means growing this record, not another parameter thread.
 type InterpCtx = { op_names: [String], op_arities: [OpAr],
-                   file: String, cs: CSCtx, show_home: Option[String] }
+                   file: String, cs: CSCtx, show_home: Option[String],
+                   ts: Option[TSCtx], es: Option[ESCtx] }
 
-#[doc("Emit-layer entry point desugar_interp_decls. `show_home` is the core module whose `Show` every user-side `#{...}` binds to (`None` leaves the op bare); `cores` names the core modules, whose own interpolations stay bare — they are typed before that module's dispatchers exist.")]
+#[doc("Emit-layer entry point desugar_interp_decls. `show_home` is the core module whose `Show` every user-side `#{...}` binds to (`None` leaves the op bare); `cores` names the core modules, whose own interpolations stay bare — they are typed before that module's dispatchers exist. `ts_coll`/`es_coll` are the contested type/effect tables the freshly-parsed interp fragments respell against.")]
 pub fn desugar_interp_decls(ds: [Decl], op_names: [String], op_arities: [OpAr],
       global_mt: [ModuleEntry], scopes: [ModScope], coll: [NEnt],
+      ts_coll: [TSEntry], es_coll: [ESEntry],
       target: String, file: String, show_home: Option[String],
       cores: [String]) : [Decl] / Console + File {
 
   if not list_has(op_names, "show") { ds }
   else { desugar_interp_decls_loop(ds, op_names, op_arities, global_mt, scopes,
-                                   coll, target, file, show_home, cores, target, []) }
+                                    coll, ts_coll, es_coll,
+                                    scope_imports(scopes, global_mt),
+                                    target, file, show_home, cores, target, []) }
 }
 
 fn desugar_interp_decls_loop(ds: [Decl], op_names: [String], op_arities: [OpAr],
       global_mt: [ModuleEntry], scopes: [ModScope], coll: [NEnt],
+      ts_coll: [TSEntry], es_coll: [ESEntry], imps: [ModImports],
       target: String, file: String, show_home: Option[String], cores: [String],
       cur: String, acc: [Decl]) : [Decl] / Console + File {
 
@@ -11053,9 +11062,14 @@ fn desugar_interp_decls_loop(ds: [Decl], op_names: [String], op_arities: [OpAr],
                            cs: CSCtx { coll: coll, home: home, target: target,
                                        free: false,
                                        mt: ms_table(scopes, seg, global_mt) },
-                           show_home: if list_has(cores, home) { None } else { show_home } }
+                           show_home: if list_has(cores, home) { None } else { show_home },
+                           ts: if list_length(ts_coll) == 0 { None }
+                               else { Some(ts_ctx(ts_coll, home, target, cores, scopes, global_mt, imps)) },
+                           es: if list_length(es_coll) == 0 { None }
+                               else { Some(es_ctx(es_coll, home, target, cores, scopes, global_mt, imps)) } }
       desugar_interp_decls_loop(rest, op_names, op_arities, global_mt, scopes,
-                                coll, target, file, show_home, cores, home,
+                                coll, ts_coll, es_coll, imps,
+                                target, file, show_home, cores, home,
                                 [desugar_interp_decl(d, cx), ...acc])
     }
   }
@@ -11310,6 +11324,12 @@ fn interp_parts_to_exprs(parts: [IPart], pos: InterpPos, cx: InterpCtx,
   }
 }
 
+# Effect scoping runs before type scoping, mirroring the driver order.
+fn interp_scope_frag(e: Expr, cx: InterpCtx) : Expr = {
+  let e1 = match cx.es { Some(esc) -> es_expr_scoped(e, esc)  None -> e }
+  match cx.ts { Some(tsc) -> ts_expr_scoped(e1, tsc)  None -> e1 }
+}
+
 fn interp_part_to_expr(p: IPart, pos: InterpPos, cx: InterpCtx,
                         line: Int, col: Int) : Expr / Console + File {
 
@@ -11319,32 +11339,32 @@ fn interp_part_to_expr(p: IPart, pos: InterpPos, cx: InterpCtx,
       # The body starts past the `#{` that opens it.
       let body = InterpPos { line: pos.line, col: pos.col + 2 }
       let inner = match parse_interp_expr(expr_src) {
-        # Issue #217: run the qualified-call resolver on the
-        # freshly-parsed sub-expression before recursing into the
-        # interp desugar. Without this step `list.sum(xs)` and other
-        # `mod.fn(args)` shapes inside `#{...}` skip the rewrite the
-        # rest of the program goes through and surface to the typer
-        # as an unresolved EField on a module-name EVar. The table is
-        # the reading decl's segmented one, so a per-file import
-        # alias resolves here just as it does outside the span.
+        # The freshly-parsed sub-expression must go through the early
+        # whole-program rewrites it missed while locked in a string
+        # span; every one is idempotent on already-rewritten trees:
         #
-        # `cs_expr` keys a qualified read of a colliding pub const
-        # before rqc can collapse its uppercase form to a bare EVar
-        # (the variant-ctor rule). Free reads are left alone (`free`
-        # off): the driver re-runs the full const keying pass over the
-        # lifted stream, where lexical scope is tracked.
+        # - `interp_scope_frag` respells contested type/effect names,
+        #   so a qualified `m.T` picks its home (`T__m`) and matches
+        #   every other use site. Runs first, mirroring the driver's
+        #   pass order.
+        # - the const-keying pass keys a qualified read of a colliding
+        #   pub const before rqc collapses its uppercase form to a
+        #   bare EVar (the variant-ctor rule). Free reads are left
+        #   alone (`free` off): the driver re-runs the full pass over
+        #   the lifted stream, where lexical scope is tracked.
+        # - the qualified-call resolver keeps `list.sum(xs)` and other
+        #   `mod.fn(args)` shapes from surfacing to the typer as an
+        #   unresolved EField on a module-name EVar. The table is the
+        #   reading decl's segmented one, so a per-file import alias
+        #   resolves here just as it does outside the span.
         #
-        # Issue #443: the protocol-call rewriter that turns
-        # `EVar("eq")` into `EVar("__proto_eq")` runs inside
-        # `lower_protocols`, but the freshly-parsed sub-expression
-        # we surface here was still locked inside a string span at
-        # that point. The driver re-runs `rename_proto_calls_decls`
-        # on the post-interp-desugar decl stream so the surfaced
-        # references go through the same arity-aware, scope-aware
-        # rewrite the rest of the program got.
+        # The protocol-call rewriter in `lower_protocols` also ran
+        # before the lift; the driver re-runs `rename_proto_calls_decls`
+        # on the post-desugar decl stream so the surfaced references go
+        # through the same arity-aware, scope-aware rewrite.
         Some(e) -> desugar_interp_expr(
-                     rqc_expr(nu_const_expr(surface_lower_expr(prc_rebase_expr(e, body.line, body.col)),
-                                      [], cx.cs),
+                     rqc_expr(nu_const_expr(interp_scope_frag(surface_lower_expr(prc_rebase_expr(e, body.line, body.col)), cx),
+                                     [], cx.cs),
                               [], cx.cs.mt, cx.file),
                      cx)
         None    -> mk_expr(EStr("\"\"", false), line, col)
