@@ -205,6 +205,7 @@ The download is corrupt or tampered — aborting."
   [ -x "$BIN_DIR/kai" ] || err "install failed: $BIN_DIR/kai not executable"
 
   add_to_path
+  add_completion_path
   info "==> installed kaikai $tag to $PREFIX"
   "$BIN_DIR/kai" --version >&2 || true
 
@@ -249,6 +250,52 @@ add_to_path() {
     printf '%s\n' "$line"
   } >> "$profile"
   info "    added $BIN_DIR to PATH in $profile"
+}
+
+# ---- completion wiring -----------------------------------------------------
+# Point the user's shell at $PREFIX/share, where `kai install` drops the
+# completions a package declares. Wired once here so every later install
+# just works, with no per-package step and no root.
+#
+# zsh PREPENDS to fpath. Appended, a stock function of the same name still
+# wins — zsh's `_mh` claims `mark`, and returns non-zero rather than
+# declining, which suppresses even file completion.
+#
+# The interactive rc file, not the login profile: fpath must be set before
+# compinit runs, and fish reads only conf.d/.
+add_completion_path() {
+  marker="# added by kaikai install.sh (completions)"
+  shell_name="$(basename "${SHELL:-}")"
+
+  case "$shell_name" in
+    zsh)
+      rc="${ZDOTDIR:-$HOME}/.zshrc"
+      line="fpath=(\"$PREFIX/share/zsh/site-functions\" \$fpath)" ;;
+    bash)
+      rc="$HOME/.bashrc"
+      line="for f in \"$PREFIX/share/bash-completion/completions/\"*; do [ -r \"\$f\" ] && . \"\$f\"; done" ;;
+    fish)
+      rc="${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/kaikai.fish"
+      line="set -p fish_complete_path \"$PREFIX/share/fish/vendor_completions.d\"" ;;
+    *)
+      return 0 ;;
+  esac
+
+  if [ -f "$rc" ] && grep -Fq "$marker" "$rc" 2>/dev/null; then
+    info "    completions already configured in $rc"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$rc")" 2>/dev/null || :
+  {
+    printf '\n%s\n' "$marker"
+    printf '%s\n' "$line"
+  } >> "$rc" || {
+    info "Could not write $rc. Add this line manually:"
+    info "    $line"
+    return 0
+  }
+  info "    wired package completions in $rc"
 }
 
 main "$@"
