@@ -17,6 +17,7 @@ kai init <name>                   # create a kai.toml in cwd
 kai add <source>[@<ref>]          # add a dep
 kai fetch                         # resolve + lock
 kai install <spec> [--force]      # build a package, install its binary
+                                  #   + any [completions] it declares
 kai install --list                # what this prefix has installed
 kai update [<name>]               # refresh deps
 kai show                          # dump parsed manifest
@@ -30,7 +31,8 @@ The `<spec>` is `.` for the cwd's package or a git source with an
 optional `@<ref>`; the binary is named from the manifest's `name`,
 not the URL. Replacing an installed binary needs `--force`, names
 the toolchain ships are refused, and a library — having no entry
-point — is turned away rather than failing at link time.
+point — is turned away rather than failing at link time. A
+`[completions]` table gets its scripts installed too (below).
 
 `kai install` with no argument still resolves dependencies, the
 behaviour that is now `kai fetch`, and warns that it does. That
@@ -80,6 +82,34 @@ always work; `libs` name system libraries that must exist on the
 consumer's machine. Declarative only — no build scripts, no free-form
 flags. `CFLAGS` keeps precedence as the escape hatch;
 `KAI_NATIVE_DEPS=0` disables the channel.
+
+## Shell completions (`[completions]`)
+
+A package declares the completion scripts it ships; `kai install`
+places each one where its shell looks:
+
+```text
+[completions]
+zsh  = "completions/_foo"      # -> share/zsh/site-functions/_foo
+bash = "completions/foo.bash"  # -> share/bash-completion/completions/foo
+fish = "completions/foo.fish"  # -> share/fish/vendor_completions.d/foo.fish
+```
+
+Paths are relative to the package; destinations sit under
+`$KAIKAI_HOME/share`, named from the manifest's `name`. `install.sh`
+wires those three directories into the shell's search path once, so
+every later `kai install` works with no per-package step; `kai
+install` prints the line to add when that wiring is missing, and never
+edits a startup file itself.
+
+zsh gets the directory **prepended** to `fpath`: appended, a stock
+function of the same name still wins (zsh's `_mh` claims `mark` and
+suppresses even file completion when MH is absent).
+
+Declarative only, like `[native]`: three shells, a fixed destination
+each, no hooks. A path escaping the package or naming a missing file
+is skipped with a warning and the binary still installs. `kai upgrade`
+carries these directories across its `share/` wipe.
 
 ## Migrating across an edition
 

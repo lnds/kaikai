@@ -776,6 +776,115 @@ manifest_native_entries() {
   ' "$mne_dir/kai.toml"
 }
 
+# Parse the `[completions]` table of a package manifest: one
+# `<shell>\t<relative path>` line per declared file, for the shells the
+# installer knows where to place (zsh, bash, fish). Same naive-TOML awk
+# contract as the other manifest readers here; unknown keys are ignored
+# so a manifest naming a shell this release cannot place still installs.
+manifest_completion_entries() {
+  mce_dir="$1"
+  [ -n "$mce_dir" ] && [ -f "$mce_dir/kai.toml" ] || return 0
+  awk '
+    /^[[:space:]]*\[completions\][[:space:]]*$/ { insec = 1; next }
+    /^[[:space:]]*\[/                           { insec = 0 }
+    insec {
+      line = $0
+      sub(/[[:space:]]*#.*$/, "", line)
+      if (match(line, /^[[:space:]]*(zsh|bash|fish)[[:space:]]*=[[:space:]]*"[^"]+"/)) {
+        key = line
+        sub(/^[[:space:]]*/, "", key)
+        sub(/[[:space:]]*=.*$/, "", key)
+        val = line
+        sub(/^[^"]*"/, "", val)
+        sub(/".*$/, "", val)
+        print key "\t" val
+      }
+    }
+  ' "$mce_dir/kai.toml"
+}
+
+# Where a shell looks for a completion file under the toolchain prefix,
+# and what the file must be named there — the vendor conventions each
+# shell already searches. Emits `<dir>\t<basename>`.
+completion_dest() {
+  case "$1" in
+    zsh)  printf 'share/zsh/site-functions\t_%s' "$2" ;;
+    bash) printf 'share/bash-completion/completions\t%s' "$2" ;;
+    fish) printf 'share/fish/vendor_completions.d\t%s.fish' "$2" ;;
+  esac
+}
+
+# The line a user adds to their shell rc to pick the directory up, for
+# the case where install.sh never ran (a Homebrew or hand-built prefix).
+#
+# zsh PREPENDS: appended, a stock function of the same name still wins —
+# which is exactly the failure this whole channel exists to fix (zsh's
+# `_mh` claims `mark` and returns non-zero, suppressing file completion).
+completion_rc_line() {
+  case "$1" in
+    zsh)  printf 'fpath=("%s/share/zsh/site-functions" $fpath)   # before compinit' "$2" ;;
+    bash) printf 'for f in "%s/share/bash-completion/completions/"*; do [ -r "$f" ] && . "$f"; done' "$2" ;;
+    fish) printf 'set -p fish_complete_path "%s/share/fish/vendor_completions.d"' "$2" ;;
+  esac
+}
+
+# Copy every completion the package at $1 declares into the prefix, and
+# report where they went plus what the user's shell needs, once. Silent
+# for a package that declares none.
+install_completions() {
+  ic_dir="$1"; ic_name="$2"
+  ic_prefix="$(install_prefix)"
+  ic_entries="$(manifest_completion_entries "$ic_dir")"
+  [ -n "$ic_entries" ] || return 0
+
+  printf '%s\n' "$ic_entries" | while IFS="$(printf '\t')" read -r ic_shell ic_rel; do
+    [ -n "$ic_shell" ] && [ -n "$ic_rel" ] || continue
+    # A relative path under the package, like `[native]` sources. An
+    # absolute path or a `..` hop would read outside what was cloned.
+    case "$ic_rel" in
+      /*|*..*)
+        echo "kai: warning: completions.$ic_shell = '$ic_rel' is not a path inside the package — skipped" >&2
+        continue ;;
+    esac
+    if [ ! -f "$ic_dir/$ic_rel" ]; then
+      echo "kai: warning: completions.$ic_shell names '$ic_rel', which the package does not ship — skipped" >&2
+      continue
+    fi
+    ic_dest="$(completion_dest "$ic_shell" "$ic_name")"
+    ic_subdir="$(printf '%s' "$ic_dest" | cut -f1)"
+    ic_base="$(printf '%s' "$ic_dest" | cut -f2)"
+    mkdir -p "$ic_prefix/$ic_subdir"
+    cp -f "$ic_dir/$ic_rel" "$ic_prefix/$ic_subdir/$ic_base"
+    echo "kai: installed $ic_shell completion to $ic_prefix/$ic_subdir/$ic_base" >&2
+  done
+
+  # Never edit an rc file here: wiring the search path is install.sh's
+  # one-time job, done with consent.
+  ic_shell_name="$(basename "${SHELL:-sh}")"
+  printf '%s\n' "$ic_entries" | cut -f1 | grep -qx "$ic_shell_name" || return 0
+  ic_rc="$(completion_rc_file "$ic_shell_name")"
+  ic_dir_probe="$ic_prefix/$(completion_dest "$ic_shell_name" x | cut -f1)"
+  if [ -n "$ic_rc" ] && [ -f "$ic_rc" ] \
+     && grep -Fq "$ic_dir_probe" "$ic_rc" 2>/dev/null; then
+    echo "kai: start a new shell (or re-run compinit) to pick up '$ic_name' completion" >&2
+    return 0
+  fi
+  echo "kai: your $ic_shell_name does not search that directory yet — add this line to ${ic_rc:-your shell startup file}:" >&2
+  echo "    $(completion_rc_line "$ic_shell_name" "$ic_prefix")" >&2
+  echo "  then start a new shell." >&2
+}
+
+# The interactive startup file each shell reads, which is where the
+# search-path line has to go: zsh must set fpath before compinit, and
+# fish reads only conf.d/. install.sh writes the same files.
+completion_rc_file() {
+  case "$1" in
+    zsh)  printf '%s/.zshrc' "${ZDOTDIR:-$HOME}" ;;
+    bash) printf '%s/.bashrc' "$HOME" ;;
+    fish) printf '%s/fish/conf.d/kaikai.fish' "${XDG_CONFIG_HOME:-$HOME/.config}" ;;
+  esac
+}
+
 # Collect the native declarations of the root package plus every
 # resolved dep: `<pkg>\t<kind>\t<value>` lines. Each package root
 # emits a `dir` line first; src/inc values absolutise against the
@@ -3685,6 +3794,7 @@ install_from_dir() {
   mv -f "$ifd_tmp" "$ifd_dest"
   install_manifest_record "$ifd_name" "$ifd_source" "$ifd_ref"
   echo "kai: installed '$ifd_name' to $ifd_dest" >&2
+  install_completions "$ifd_dir" "$ifd_name"
 }
 
 cmd_install() {
@@ -3712,6 +3822,15 @@ so 'kai install github.com/owner/thing' yields 'thing'.
 Options:
   --force     replace an already-installed binary of the same name
   --list      print what this prefix has installed, then exit
+
+A package that declares a [completions] table in its kai.toml also
+gets its shell completions installed under \$KAIKAI_HOME/share, and
+the line your shell needs is printed if it is not wired up yet:
+
+  [completions]
+  zsh  = "completions/_foo"
+  bash = "completions/foo.bash"
+  fish = "completions/foo.fish"
 
 Names shipped by the kaikai toolchain are refused. To resolve a
 package's dependencies without installing anything, use 'kai fetch'.
@@ -4807,12 +4926,19 @@ EOF
   [ -x "$top/bin/kai" ] || die "tarball missing bin/kai"
 
   # Swap contents in place. Replace bin/libexec/share wholesale so a
-  # removed file from the old version does not linger — but bin/ is
-  # shared with `kai install`, so user binaries are carried across the
-  # wipe. The ledger, not the directory listing, is what says which
-  # ones are the user's.
+  # removed file from the old version does not linger — but bin/ and
+  # share/ are shared with `kai install`, so user binaries and the
+  # completions installed packages dropped are carried across the wipe.
+  # The ledger, not the directory listing, is what says which binaries
+  # are the user's; for completions it is the directory itself, since
+  # the toolchain ships none of the three.
   upgrade_stash="$tmp/stash-bin"
   mkdir -p "$upgrade_stash"
+  upgrade_comp_stash="$tmp/stash-share"
+  mkdir -p "$upgrade_comp_stash"
+  [ -d "$prefix/share" ] && ( cd "$prefix/share" \
+    && tar -cf - zsh bash-completion fish 2>/dev/null ) \
+    | ( cd "$upgrade_comp_stash" && tar -xf - 2>/dev/null ) || :
   upgrade_ledger="$prefix/.kai-installed"
   if [ -f "$upgrade_ledger" ]; then
     while IFS="$(printf '\t')" read -r stash_name _ _; do
@@ -4829,6 +4955,10 @@ EOF
       (cd "$top" && tar -cf - "$d") | (cd "$prefix" && tar -xf -)
     fi
   done
+
+  mkdir -p "$prefix/share"
+  ( cd "$upgrade_comp_stash" && tar -cf - . 2>/dev/null ) \
+    | ( cd "$prefix/share" && tar -xf - 2>/dev/null ) || :
 
   # Restore user binaries the new toolchain does not itself provide. A
   # name that has since become a toolchain binary is dropped rather than

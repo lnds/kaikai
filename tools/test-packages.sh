@@ -227,6 +227,10 @@ run_check_script "library_test_discovery" "library_test_discovery/check.sh"
 # toolchain's own names are refused and a library is turned away.
 run_check_script "install_binary"      "install_binary/check.sh"
 
+# A package's [completions] land where each shell searches, and survive
+# the upgrade wipe.
+run_check_script "install_completions" "install_completions/check.sh"
+
 # The shared bin/ means `kai upgrade` must carry user binaries across
 # its wholesale replacement of bin/libexec/share.
 run_check_script "upgrade_preserves_installed" "upgrade_preserves_installed/check.sh"
