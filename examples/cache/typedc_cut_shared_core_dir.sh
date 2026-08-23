@@ -41,7 +41,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 CC="$WORK/coredir"
 mkdir -p "$CC"
 # The real toolchain id bin/kai derives; any stable string works here.
-TID="fixture-$(cksum < "$KAIC2" $EDITION_FLAG | cut -d' ' -f1)"
+TID="fixture-$(cksum < "$KAIC2" | cut -d' ' -f1)"
 
 PROJ="$WORK/p1"
 mkdir -p "$PROJ"

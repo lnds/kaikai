@@ -19,7 +19,7 @@ KAIC2="$ROOT/stage2/kaic2"
 # edition, so this fixture must exercise the one the repo declares.
 EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 PROJ="$(mktemp -d)"
-restore_mtime() { [ -f "$PROJ/kaic2.mtime.ref" ] && touch -r "$PROJ/kaic2.mtime.ref" "$KAIC2" $EDITION_FLAG 2>/dev/null; rm -rf "$PROJ"; }
+restore_mtime() { [ -f "$PROJ/kaic2.mtime.ref" ] && touch -r "$PROJ/kaic2.mtime.ref" "$KAIC2" 2>/dev/null; rm -rf "$PROJ"; }
 trap 'restore_mtime' EXIT INT TERM
 
 # Native-modular only engages on a native-capable kaic2.
@@ -76,7 +76,7 @@ dirs2=$(find "$nmroot" -mindepth 1 -maxdepth 1 -type d -not -name runtime | wc -
 
 # Perturb the toolchain id: a new kaic2 mtime is a new build id. The ref
 # file preserves the original mtime for restore on exit.
-touch -r "$KAIC2" $EDITION_FLAG "$PROJ/kaic2.mtime.ref"
+touch -r "$KAIC2" "$PROJ/kaic2.mtime.ref"
 touch "$KAIC2"
 touch "$PROJ/stamp2"
 build bumped
