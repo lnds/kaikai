@@ -3555,8 +3555,8 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # module so a core helper (`complex::add`) shadows the bare op
   # only inside its own module, never in the user's file.
   let local_fns = collect_local_fn_arities_mo(stripped)
-  let user_renamed = rename_proto_calls_decls_mo(stripped, raw_op_arities, core_op_arities, local_fns, target_mod)
-  let impl_renamed = rename_proto_calls_decls_mo(lower_res.fns, raw_op_arities, core_op_arities, local_fns, target_mod)
+  let user_renamed = rename_proto_calls_decls_mo(stripped, raw_op_arities, core_op_arities, local_fns, target_mod, imports)
+  let impl_renamed = rename_proto_calls_decls_mo(lower_res.fns, raw_op_arities, core_op_arities, local_fns, target_mod, imports)
   let final_decls = list_append(user_renamed, list_append(impl_renamed, dispatchers))
   # Index the now-final impl table once; the post-inference rewrite's
   # per-spec scans consult it instead of walking `reg.impls` linearly.
@@ -3625,7 +3625,7 @@ pub type OpAr = OpAr(String, Int)
 # program-wide and the call would bind the concrete helper instead of
 # the polymorphic dispatcher.
 #[doc("A top-level fn's (name, arity, module) used by the per-module shadow guard.")]
-pub type LFnAr = LFnAr(String, Int, Option[String])
+pub type LFnAr = LFnAr(String, Int, Option[String], Bool)
 
 # Project the registry's POR list into `[OpAr]`. Done once at the
 # `lower_protocols` boundary; the rewriter then threads it.
@@ -3790,8 +3790,8 @@ pub fn collect_local_fn_arities_mo(ds: [Decl]) : [LFnAr] {
   match ds {
     [] -> []
     [d, ...rest] -> match d {
-      DFn(_, name, _, ps, _, _, _, _, _, mo) ->
-        [LFnAr(name, list_length(ps), mo), ...collect_local_fn_arities_mo(rest)]
+      DFn(is_pub, name, _, ps, _, _, _, _, _, mo) ->
+        [LFnAr(name, list_length(ps), mo, is_pub), ...collect_local_fn_arities_mo(rest)]
       _ -> collect_local_fn_arities_mo(rest)
     }
   }
@@ -3807,7 +3807,7 @@ pub fn local_arities_for_mo(fns: [LFnAr], mo: Option[String]) : [OpAr] {
   match fns {
     [] -> []
     [f, ...rest] -> match f {
-      LFnAr(name, ar, fmo) ->
+      LFnAr(name, ar, fmo, _) ->
         if opt_str_eq(fmo, mo) {
           [OpAr(name, ar), ...local_arities_for_mo(rest, mo)]
         } else {
@@ -3822,18 +3822,33 @@ pub fn local_arities_for_mo(fns: [LFnAr], mo: Option[String]) : [OpAr] {
 # `Some(target_mod)` lands in the same bucket as an untagged root call
 # site (`canon_mo` maps both to `None`).
 fn local_arities_for_mo_canon(fns: [LFnAr], mo: Option[String],
-                               target_mod: String) : [OpAr] {
+                               target_mod: String, imps: [String]) : [OpAr] {
   match fns {
     [] -> []
     [f, ...rest] -> match f {
-      LFnAr(name, ar, fmo) ->
-        if opt_str_eq(canon_mo(fmo, target_mod), mo) {
-          [OpAr(name, ar), ...local_arities_for_mo_canon(rest, mo, target_mod)]
+      LFnAr(name, ar, fmo, _) ->
+        if lfn_visible_at(f, mo, target_mod, imps) {
+          [OpAr(name, ar), ...local_arities_for_mo_canon(rest, mo, target_mod, imps)]
         } else {
-          local_arities_for_mo_canon(rest, mo, target_mod)
+          local_arities_for_mo_canon(rest, mo, target_mod, imps)
         }
     }
   }
+}
+
+# A fn shadows a protocol op at a call site in module `mo` when it is
+# declared there, or when it is a `pub fn` of a module `mo` imports:
+# an imported name is in scope bare, so the op cannot also claim it.
+fn lfn_visible_at(f: LFnAr, mo: Option[String], target_mod: String,
+                  imps: [String]) : Bool = match f {
+  LFnAr(_, _, fmo, is_pub) ->
+    if opt_str_eq(canon_mo(fmo, target_mod), mo) { true }
+    else { is_pub and lfn_home_imported(fmo, imps) }
+}
+
+fn lfn_home_imported(fmo: Option[String], imps: [String]) : Bool = match fmo {
+  None    -> false
+  Some(m) -> list_has(imps, m)
 }
 
 # Names of every top-level fn in module `mo` (any arity). Feeds the
@@ -3843,15 +3858,15 @@ fn local_arities_for_mo_canon(fns: [LFnAr], mo: Option[String],
 # is intentionally ignored here — a value reference carries no call
 # shape to disambiguate by, so any same-named local fn shadows.
 fn local_names_for_mo_canon(fns: [LFnAr], mo: Option[String],
-                             target_mod: String) : [String] {
+                             target_mod: String, imps: [String]) : [String] {
   match fns {
     [] -> []
     [f, ...rest] -> match f {
-      LFnAr(name, _, fmo) ->
-        if opt_str_eq(canon_mo(fmo, target_mod), mo) {
-          [name, ...local_names_for_mo_canon(rest, mo, target_mod)]
+      LFnAr(name, _, _, _) ->
+        if lfn_visible_at(f, mo, target_mod, imps) {
+          [name, ...local_names_for_mo_canon(rest, mo, target_mod, imps)]
         } else {
-          local_names_for_mo_canon(rest, mo, target_mod)
+          local_names_for_mo_canon(rest, mo, target_mod, imps)
         }
     }
   }
@@ -3903,8 +3918,9 @@ pub fn rename_proto_calls_decls(ds: [Decl], op_arities: [OpAr],
 #[doc("Per-module variant of `rename_proto_calls_decls`: shadows are module-scoped.")]
 pub fn rename_proto_calls_decls_mo(ds: [Decl], raw_ops: [OpAr],
                                     core_ops: [OpAr], local_fns: [LFnAr],
-                                    target_mod: String) : [Decl] =
-  rename_proto_calls_decls_mo_loop(ds, raw_ops, core_ops, local_fns, target_mod,
+                                    target_mod: String,
+                                    imports: [ModImports]) : [Decl] =
+  rename_proto_calls_decls_mo_loop(ds, raw_ops, core_ops, local_fns, target_mod, imports,
                                     ShadowByMod { entries: [], has_root: false,
                                                   root_ops: [], root_names: [] }, [])
 
@@ -3932,20 +3948,23 @@ fn sbm_lookup(entries: [ShadowEntry], k: String) : Option[ShadowEntry] = match e
 type ShadowResult = { cache: ShadowByMod, ops: [OpAr], names: [String] }
 
 fn shadow_for_mo(c: ShadowByMod, dmo: Option[String], raw_ops: [OpAr],
-                 core_ops: [OpAr], local_fns: [LFnAr], target_mod: String) : ShadowResult = match dmo {
+                 core_ops: [OpAr], local_fns: [LFnAr], target_mod: String,
+                 imports: [ModImports]) : ShadowResult = match dmo {
   None ->
     if c.has_root { ShadowResult { cache: c, ops: c.root_ops, names: c.root_names } }
     else {
-      let ops = filter_shadowed_ops(raw_ops, local_arities_for_mo_canon(local_fns, None, target_mod))
-      let names = local_names_for_mo_canon(local_fns, None, target_mod)
+      let imps = proto_imports_of(imports, "")
+      let ops = filter_shadowed_ops(raw_ops, local_arities_for_mo_canon(local_fns, None, target_mod, imps))
+      let names = local_names_for_mo_canon(local_fns, None, target_mod, imps)
       ShadowResult { cache: ShadowByMod { entries: c.entries, has_root: true, root_ops: ops, root_names: names },
                      ops: ops, names: names }
     }
   Some(m) -> match sbm_lookup(c.entries, m) {
     Some(e) -> ShadowResult { cache: c, ops: e.ops, names: e.names }
     None    -> {
-      let ops = filter_shadowed_ops(core_ops, local_arities_for_mo_canon(local_fns, dmo, target_mod))
-      let names = local_names_for_mo_canon(local_fns, dmo, target_mod)
+      let imps = proto_imports_of(imports, m)
+      let ops = filter_shadowed_ops(core_ops, local_arities_for_mo_canon(local_fns, dmo, target_mod, imps))
+      let names = local_names_for_mo_canon(local_fns, dmo, target_mod, imps)
       ShadowResult { cache: ShadowByMod { entries: [ShadowEntry { key: m, ops: ops, names: names }, ...c.entries],
                                           has_root: c.has_root, root_ops: c.root_ops, root_names: c.root_names },
                      ops: ops, names: names }
@@ -3953,15 +3972,22 @@ fn shadow_for_mo(c: ShadowByMod, dmo: Option[String], raw_ops: [OpAr],
   }
 }
 
+# The modules `owner` imports; the root file is keyed by the empty name.
+fn proto_imports_of(imps: [ModImports], owner: String) : [String] = match imps {
+  [] -> []
+  [MImp(o, names), ...rest] -> if o == owner { names } else { proto_imports_of(rest, owner) }
+}
+
 fn rename_proto_calls_decls_mo_loop(ds: [Decl], raw_ops: [OpAr], core_ops: [OpAr],
                                      local_fns: [LFnAr], target_mod: String,
+                                     imports: [ModImports],
                                      c: ShadowByMod, acc: [Decl]) : [Decl] = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> {
     let dmo = canon_mo(decl_module(d), target_mod)
-    let r = shadow_for_mo(c, dmo, raw_ops, core_ops, local_fns, target_mod)
+    let r = shadow_for_mo(c, dmo, raw_ops, core_ops, local_fns, target_mod, imports)
     let renamed = rename_proto_calls_decl(d, r.ops, r.names)
-    rename_proto_calls_decls_mo_loop(rest, raw_ops, core_ops, local_fns, target_mod, r.cache,
+    rename_proto_calls_decls_mo_loop(rest, raw_ops, core_ops, local_fns, target_mod, imports, r.cache,
                                      [renamed, ...acc])
   }
 }
