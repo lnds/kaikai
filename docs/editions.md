@@ -171,9 +171,26 @@ assembled from one list rather than reconstructed from git.
   impls it brings into scope is exempt by that rule, but an import of
   a module that *also* exports names and is still used only for its
   impls would be silent under the exemption and an error without it;
-  the Orongo rule needs either a blank-import form or an "impl
-  actually used" exemption for that class (`examples/org-pkgs` is
-  full of them).
+   the Orongo rule needs either a blank-import form or an "impl
+   actually used" exemption for that class (`examples/org-pkgs` is
+   full of them).
+
+- **Core helpers superseded by surface features** (audit in the
+  closed issue #1807; scheduled, not yet removed). Seven core helpers
+  remain callable although their replacement shipped:
+  `string_concat(a, b)` → `a ++ b`; `string_concat_all(xs)` →
+  `string_join(xs, "")`; `int_to_string` / `real_to_string` → string
+  interpolation (`"#{n}"`) or `Show`; `string_to_int` /
+  `string_to_real` → the parse path (replacement unverified in the
+  audit); `array_make(n, v)` → constructor under review (indexed
+  access and assignment already cover reads/writes). They keep
+  working through Hanga Roa — some are still called inside
+  `impl Show` bodies — and at the Orongo cut the ones with verified
+  replacements are removed, with `kai migrate` rewriting user call
+  sites (all mechanical except `array_make`). Open before the flip:
+  verify the parse-path replacement for the two `string_to_*`
+  helpers, and decide `array_make`'s fate (retain as the sole
+  constructor or replace with a literal form).
 
 ## Edition selection in user packages
 
