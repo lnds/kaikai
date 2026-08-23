@@ -64,9 +64,13 @@ EOF
 }
 
 # Run the script inside a sandbox. $2.. = env assignments.
+# Each case states its own request explicitly (`run "$dir" KAI_LLVM=1`), so
+# the ambient value must not leak in: a developer building the documented
+# mac way (`make KAI_LLVM=1 tier0`) would otherwise turn the "native not
+# requested" cases into "requested", and the gate reds on its own harness.
 run() {
   local dir="$1"; shift
-  ( cd "$dir" && env PATH="$dir/shim:$PATH" "$@" bash tools/parity-preserve-native.sh 2>&1 )
+  ( cd "$dir" && env -u KAI_LLVM PATH="$dir/shim:$PATH" "$@" bash tools/parity-preserve-native.sh 2>&1 )
 }
 
 echo "== test-parity-preserve-native =="
