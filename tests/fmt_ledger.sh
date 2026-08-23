@@ -28,6 +28,10 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; fmt reproduces the surface
+# of the edition the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 REPORT="$ROOT/tools/fmt-width-report.sh"
 WIDTH="${FMT_WIDTH:-$(sed -n 's/^budget *//p' tools/fmt-width-baseline.txt | head -1)}"
 
@@ -54,7 +58,7 @@ measure() {
   for f in "$@"; do
     [ -f "$f" ] || continue
     n=$((n + 1))
-    if ! "$KAIC2" --path "$ROOT/stdlib" --fmt "$f" > "$out/$n.kai" 2>/dev/null; then
+    if ! "$KAIC2" $EDITION_FLAG --path "$ROOT/stdlib" --fmt "$f" > "$out/$n.kai" 2>/dev/null; then
       refused=$((refused + 1))
       rm -f "$out/$n.kai"
     fi

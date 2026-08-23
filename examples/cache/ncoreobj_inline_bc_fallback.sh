@@ -12,6 +12,10 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the cache keys carry the
+# edition, so this fixture must exercise the one the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 BC="$ROOT/stage0/runtime_llvm.bc"
 INL="$ROOT/stage0/runtime_inline.bc"
 
@@ -24,7 +28,7 @@ PROJ="$(mktemp -d)"
 trap 'rm -rf "$PROJ"' EXIT INT TERM
 
 printf 'fn main() : Unit = ()\n' > "$PROJ/probe.kai"
-"$KAIC2" --emit=native --path "$ROOT/stdlib" --path "$PROJ" "$PROJ/probe.kai" \
+"$KAIC2" $EDITION_FLAG --emit=native --path "$ROOT/stdlib" --path "$PROJ" "$PROJ/probe.kai" \
   >/dev/null 2>"$PROJ/probe.err" || true
 if grep -q "not built into this compiler" "$PROJ/probe.err" 2>/dev/null; then
   echo "ncoreobj_inline_bc_fallback SKIP — kaic2 has no libLLVM native backend"
@@ -42,7 +46,7 @@ NOTE="native runtime inline bitcode unavailable"
 emit() {
   KAI_NATIVE_CORE_OBJ=1 KAI_NATIVE_OPT=2 \
   KAI_NATIVE_RUNTIME_BC="$BC" KAI_NATIVE_RUNTIME_INLINE_BC="$1" \
-    "$KAIC2" --emit=native --core-cache-dir "$ccdir" --toolchain-id nib-test \
+    "$KAIC2" $EDITION_FLAG --emit=native --core-cache-dir "$ccdir" --toolchain-id nib-test \
     --core-cache-stats --path "$ROOT/stdlib" --path "$PROJ" "$PROJ/main.kai"
 }
 

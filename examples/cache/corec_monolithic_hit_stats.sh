@@ -14,6 +14,10 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the cache keys carry the
+# edition, so this fixture must exercise the one the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 STDLIB="$ROOT/stdlib"
 PROJ="$(mktemp -d)"
 trap 'rm -rf "$PROJ"' EXIT INT TERM
@@ -29,16 +33,16 @@ CCDIR="$PROJ/core-cache"
 mkdir -p "$CCDIR"
 
 # Oracle: cache off — fresh core lex+parse.
-"$KAIC2" --emit=kir --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" \
+"$KAIC2" $EDITION_FLAG --emit=kir --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" \
   > "$PROJ/oracle.kir" 2>/dev/null
 
 # Cold: empty dir — every core module misses, blobs are written.
-"$KAIC2" --emit=kir --path "$STDLIB" --path "$PROJ" \
+"$KAIC2" $EDITION_FLAG --emit=kir --path "$STDLIB" --path "$PROJ" \
   --core-cache-dir "$CCDIR" --toolchain-id fixture --core-cache-stats \
   "$PROJ/main.kai" > "$PROJ/cold.kir" 2> "$PROJ/cold.err"
 
 # Warm: blobs present — every core module must hit (lex+parse skipped).
-"$KAIC2" --emit=kir --path "$STDLIB" --path "$PROJ" \
+"$KAIC2" $EDITION_FLAG --emit=kir --path "$STDLIB" --path "$PROJ" \
   --core-cache-dir "$CCDIR" --toolchain-id fixture --core-cache-stats \
   "$PROJ/main.kai" > "$PROJ/warm.kir" 2> "$PROJ/warm.err"
 

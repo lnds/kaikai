@@ -26,6 +26,10 @@ if ! command -v "$LLVM_CONFIG" >/dev/null 2>&1; then
 fi
 
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the repo's EDITION is what
+# this gate must exercise.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 [ -x "$KAIC2" ] || { echo "test-native-namespace FAIL — no kaic2 at $KAIC2"; exit 1; }
 
 work="$(mktemp -d)"
@@ -64,7 +68,7 @@ fn main() : Int / Stdout = {
 }
 PROBE
 
-KAI_NATIVE_CGLEVEL=0 "$KAIC2" --emit=native --path "$ROOT/stdlib" "$work/probe.kai" >/dev/null 2>"$work/emit.err" \
+KAI_NATIVE_CGLEVEL=0 "$KAIC2" $EDITION_FLAG --emit=native --path "$ROOT/stdlib" "$work/probe.kai" >/dev/null 2>"$work/emit.err" \
   || { echo "test-native-namespace FAIL — native emit failed:"; cat "$work/emit.err"; exit 1; }
 
 obj="$work/probe.o"

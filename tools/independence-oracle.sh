@@ -34,6 +34,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 KAIC2="${KAIC2:-$ROOT/stage2/kaic2}"
+
+# A flagless kaic2 runs the oldest edition; the repo's EDITION is what
+# this gate must exercise.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 STDLIB="${STDLIB:-$ROOT/stdlib}"
 ORACLE_DIR="${ORACLE_DIR:-$ROOT/examples/oracle}"
 WORK="${WORK:-$(mktemp -d)}"
@@ -50,7 +54,7 @@ fail=0
 # lane's probe library) follow the file argument.
 dump_core() {
   out="$1"; err="$2"; file="$3"; shift 3
-  "$KAIC2" "$@" --path "$STDLIB" --dump-typed-core "$file" > "$out" 2> "$err"
+  "$KAIC2" $EDITION_FLAG "$@" --path "$STDLIB" --dump-typed-core "$file" > "$out" 2> "$err"
   echo $?
 }
 

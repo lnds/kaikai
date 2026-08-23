@@ -132,7 +132,8 @@ fi
 # loop, so the binary shows no call to count — the KIR text is the observable:
 # a mask regression (ls_ctor_mask / the registration) prints `m0` here.
 KAIC2="$ROOT/stage2/kaic2"
-MASKED_CON="$("$KAIC2" --path "$ROOT/stdlib" --emit=kir "$SRC" 2>/dev/null \
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
+MASKED_CON="$("$KAIC2" $EDITION_FLAG --path "$ROOT/stdlib" --emit=kir "$SRC" 2>/dev/null \
   | grep -cE 'con RBNode #[0-9]+ m[1-9][0-9]*' || true)"
 echo "native-perf/inline-gate: masked RBNode ctors in KIR = $MASKED_CON (expect > 0)"
 if [ "$MASKED_CON" -eq 0 ]; then

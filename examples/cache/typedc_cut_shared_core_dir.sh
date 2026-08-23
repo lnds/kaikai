@@ -30,6 +30,10 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the cache keys carry the
+# edition, so this fixture must exercise the one the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 STDLIB="$ROOT/stdlib"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM
@@ -37,7 +41,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 CC="$WORK/coredir"
 mkdir -p "$CC"
 # The real toolchain id bin/kai derives; any stable string works here.
-TID="fixture-$(cksum < "$KAIC2" | cut -d' ' -f1)"
+TID="fixture-$(cksum < "$KAIC2" $EDITION_FLAG | cut -d' ' -f1)"
 
 PROJ="$WORK/p1"
 mkdir -p "$PROJ"
@@ -65,7 +69,7 @@ fail() {
 # $1: output file, $2: project dir, rest: extra flags
 build() {
   out="$1"; proj="$2"; shift 2
-  if ! "$KAIC2" "$@" --path "$STDLIB" --path "$proj" "$proj/main.kai" \
+  if ! "$KAIC2" $EDITION_FLAG "$@" --path "$STDLIB" --path "$proj" "$proj/main.kai" \
        > "$out" 2>"$WORK/err"; then
     cat "$WORK/err"
     fail "build exited non-zero ($*)"
@@ -89,7 +93,7 @@ same() {
 # $1: project dir, rest: extra flags — a typecheck-only run.
 check() {
   proj="$1"; shift
-  "$KAIC2" "$@" --check --path "$STDLIB" --path "$proj" "$proj/main.kai" \
+  "$KAIC2" $EDITION_FLAG "$@" --check --path "$STDLIB" --path "$proj" "$proj/main.kai" \
     >/dev/null 2>"$WORK/checkerr" || {
       cat "$WORK/checkerr"
       fail "--check exited non-zero ($*)"
@@ -197,7 +201,7 @@ fi
 # ---- 5: --check agrees, warm, and still reports a type error ---------
 
 # shellcheck disable=SC2046
-if ! "$KAIC2" $(shared) --check --path "$STDLIB" --path "$PROJ" \
+if ! "$KAIC2" $EDITION_FLAG $(shared) --check --path "$STDLIB" --path "$PROJ" \
      "$PROJ/main.kai" >/dev/null 2>"$WORK/err"; then
   cat "$WORK/err"
   fail "--check rejected a program a full build accepts"
@@ -207,7 +211,7 @@ cat > "$PROJ/bad.kai" <<'EOF'
 fn main() : Unit = { let x: Int = "not an int" () }
 EOF
 # shellcheck disable=SC2046
-if "$KAIC2" $(shared) --check --path "$STDLIB" --path "$PROJ" \
+if "$KAIC2" $EDITION_FLAG $(shared) --check --path "$STDLIB" --path "$PROJ" \
    "$PROJ/bad.kai" >/dev/null 2>"$WORK/baderr"; then
   fail "--check accepted a type-incorrect program with a warm cut"
 fi
@@ -235,7 +239,7 @@ fn main() : Int / Stdout = {
 }
 EOF
 # shellcheck disable=SC2046
-if "$KAIC2" $(shared) --check --path "$STDLIB" --path "$PROJ" \
+if "$KAIC2" $EDITION_FLAG $(shared) --check --path "$STDLIB" --path "$PROJ" \
    "$PROJ/overflow.kai" >/dev/null 2>"$WORK/ovferr"; then
   fail "--check accepted an out-of-range Int literal"
 fi
@@ -251,7 +255,7 @@ Module-position doc on the root file.
 fn main() : Unit / Stdout = Stdout.print("ok")
 EOF
 # shellcheck disable=SC2046
-if ! "$KAIC2" $(shared) --check --path "$STDLIB" --path "$PROJ" \
+if ! "$KAIC2" $EDITION_FLAG $(shared) --check --path "$STDLIB" --path "$PROJ" \
      "$PROJ/moddoc.kai" >/dev/null 2>"$WORK/docerr"; then
   cat "$WORK/docerr"
   fail "--check rejected a root file carrying a module doc"
