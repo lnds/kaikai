@@ -102,7 +102,7 @@ kaic1: kaic0    $(MAKE) -C stage1 kaic1        # kaic0 compiles stage1 → kaic1
 kaic2: kaic1    $(MAKE) -C stage2 kaic2        # kaic1 compiles stage2 → kaic2
 ```
 
-Each stage's compiler builds the next. `make kaic2` triggers the whole chain if earlier stages are stale. After editing `stage2/compiler/*.kai`, `make kaic2` is the one command to rebuild — it reassembles the bundle and compiles. `make KAI_LLVM=1 kaic2` does the same with the in-process libLLVM backend linked (needed for native parity; on mac either put the keg on PATH first — `export PATH=/opt/homebrew/opt/llvm@18/bin:$PATH` — or pass `LLVM_CONFIG=$(brew --prefix llvm@18)/bin/llvm-config`). If `KAI_LLVM=1` is forced and llvm-config does not resolve, make stops immediately with an error naming the fix; the Homebrew lib dir needed by llvm-config's `-lzstd` is added to the link line automatically.
+Each stage's compiler builds the next. `make kaic2` triggers the whole chain if earlier stages are stale. After editing `stage2/compiler/*.kai`, `make kaic2` is the one command to rebuild — it reassembles the bundle and compiles. `make KAI_LLVM=1 kaic2` does the same with the in-process libLLVM backend linked (needed for native parity; on mac either put the keg on PATH first — `export PATH=/opt/homebrew/opt/llvm@18/bin:$PATH` — or pass `LLVM_CONFIG=$(brew --prefix llvm@18)/bin/llvm-config`; any LLVM major works, and `tools/gen-runtime-bc.sh` writes the runtime bitcode with the clang matching whichever one resolves). If `KAI_LLVM=1` is forced and llvm-config does not resolve, make stops immediately with an error naming the fix; the Homebrew lib dir needed by llvm-config's `-lzstd` is added to the link line automatically.
 
 ## The bundle — why `main.kai` is a stub
 
