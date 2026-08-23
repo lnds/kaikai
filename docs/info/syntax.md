@@ -244,8 +244,8 @@ type Box = { n: Int }
 impl protocols.Show for Box { fn show(x: Box) : String = "boxed" }
 #    ^ protocol in an `impl` head
 
-fn emit() : Unit / Trace = trace.Trace.log("hi")
-#                            ^ effect operation
+fn emit() : Unit / trace.Trace = trace.Trace.log("hi")
+#               ^ effect in a row  ^ effect operation
 
 fn main() : Unit / Stdout =
   handle { emit() } with trace.Trace {
@@ -257,14 +257,15 @@ fn main() : Unit / Stdout =
 
 A qualifier is accepted on types, variant constructors (in expression
 and pattern position), functions, constants, protocols in an `impl`
-head and in `#[derive(...)]`, effects in a `handle … with` head, and
-effect operations. It is only a disambiguator: `trace.Trace.log` and
-`Trace.log` name the same operation whenever the bare name is
-unambiguous. A bare protocol in an `impl` head or a `#[derive]`, and a
-bare type, effect, or constant anywhere in the root file, that two
-imports export is an error naming both candidates. Each module keeps
-its own declaration either way: two imports may each declare `effect
-Emit`, and `with ea.Emit` / `ea.Emit.put(...)` reach only `ea`'s.
+head and in `#[derive(...)]`, effects in a `handle … with` head, in an
+effect row, and in effect operations. It is only a disambiguator:
+`trace.Trace.log` and `Trace.log` name the same operation whenever the
+bare name is unambiguous. A bare protocol in an `impl` head or a
+`#[derive]`, and a bare type, effect, or constant anywhere in the root
+file, that two imports export is an error naming both candidates. Each
+module keeps its own declaration either way: two imports may each
+declare `effect Emit`, and `with ea.Emit` / `ea.Emit.put(...)` reach
+only `ea`'s.
 
 ## Tests
 

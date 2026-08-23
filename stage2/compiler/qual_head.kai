@@ -121,15 +121,78 @@ fn qh_join(xs: [String]) : String = match xs {
 
 fn qh_decl(d: Decl, mt: [ModuleEntry]) : Decl = match d {
   DFn(is_pub, name, tps, ps, ret, row, body, l, c, mo) ->
-    DFn(is_pub, name, tps, ps, ret, row, qh_expr(body, mt), l, c, mo)
+    DFn(is_pub, name, tps, qh_params(ps, mt), qh_ty_opt(ret, mt), qh_row(row, mt), qh_expr(body, mt), l, c, mo)
   DImpl(pname, pargs, target, methods, l, c, itps) ->
-    DImpl(qh_proto_name(pname, mt), pargs, target, qh_sub_decls(methods, mt), l, c, itps)
+    DImpl(qh_proto_name(pname, mt), qh_tys(pargs, mt), qh_ty(target, mt), qh_sub_decls(methods, mt), l, c, itps)
   DTest(desc, body, l, c, mo) -> DTest(desc, qh_expr(body, mt), l, c, mo)
   DBench(desc, body, l, c, mo) -> DBench(desc, qh_expr(body, mt), l, c, mo)
-  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, qh_expr(body, mt), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, qh_params(ps, mt), qh_expr(body, mt), l, c, mo)
+  DConst(p, n, ty, body, mo, l, c) -> DConst(p, n, qh_ty(ty, mt), qh_expr(body, mt), mo, l, c)
+  DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
+    DAxiom(p, sm, n, cso, tps, qh_params(ps, mt), qh_ty(ret, mt), qh_row(row, mt), l, c)
+  DProtocol(p, n, tps, ops, l, c, mo) -> DProtocol(p, n, tps, qh_pops(ops, mt), l, c, mo)
+  DEffect(p, n, tps, ops, dblk, l, c, mo) -> DEffect(p, n, tps, qh_eops(ops, mt), dblk, l, c, mo)
+  DType(p, n, tps, body, l, c, mo, slots) -> DType(p, n, tps, qh_tbody(body, mt), l, c, mo, slots)
   DDerive(protos, inner, l, c) ->
     DDerive(map(protos, (n) => qh_proto_name(n, mt)), qh_decl(inner, mt), l, c)
   _ -> d
+}
+
+# Row labels resolve like heads: `m.E` strips to the exported `E`
+# (contested names were already home-spelled by the effect-scope pass).
+fn qh_row(r: RowExpr, mt: [ModuleEntry]) : RowExpr = match r {
+  REmpty -> REmpty
+  RClosed(ls) -> RClosed(map(ls, (l) => qh_label(l, mt)))
+  ROpen(v, ls) -> ROpen(v, map(ls, (l) => qh_label(l, mt)))
+}
+
+fn qh_label(l: RowLabel, mt: [ModuleEntry]) : RowLabel = match l {
+  RL(n, ts) -> RL(qh_name(n, mt), qh_tys(ts, mt))
+}
+
+fn qh_tys(ts: [TypeExpr], mt: [ModuleEntry]) : [TypeExpr] = map(ts, (t) => qh_ty(t, mt))
+
+fn qh_ty_opt(o: Option[TypeExpr], mt: [ModuleEntry]) : Option[TypeExpr] = match o {
+  None -> None
+  Some(t) -> Some(qh_ty(t, mt))
+}
+
+fn qh_ty(t: TypeExpr, mt: [ModuleEntry]) : TypeExpr = {
+  let k = match t.tkind {
+    TyName(n, ts) -> TyName(n, qh_tys(ts, mt))
+    TyList(x) -> TyList(qh_ty(x, mt))
+    TyFn(ps, r, row) -> TyFn(qh_tys(ps, mt), qh_ty(r, mt), qh_row(row, mt))
+    TyRow(row) -> TyRow(qh_row(row, mt))
+    TyDim(x, u) -> TyDim(qh_ty(x, mt), u)
+    TyRefine(x, pred) -> TyRefine(qh_ty(x, mt), pred)
+    _ -> t.tkind
+  }
+  TypeExpr { tkind: k, line: t.line, col: t.col }
+}
+
+fn qh_params(ps: [Param], mt: [ModuleEntry]) : [Param] =
+  map(ps, (p) => Param { pname: p.pname, ptype: qh_ty_opt(p.ptype, mt),
+                         pline: p.pline, pcol: p.pcol, pborrow: p.pborrow })
+
+fn qh_pops(ops: [ProtoOp], mt: [ModuleEntry]) : [ProtoOp] =
+  map(ops, (o) => match o {
+    POp(n, tps, ps, ret, l, c) -> POp(n, tps, qh_params(ps, mt), qh_ty(ret, mt), l, c)
+  })
+
+fn qh_eops(ops: [EffectOp], mt: [ModuleEntry]) : [EffectOp] =
+  map(ops, (o) => match o {
+    EOp(n, tps, ps, ret, l, c) -> EOp(n, tps, qh_params(ps, mt), qh_ty(ret, mt), l, c)
+  })
+
+fn qh_tbody(b: TypeBody, mt: [ModuleEntry]) : TypeBody = match b {
+  TBAlias(t) -> TBAlias(qh_ty(t, mt))
+  TBRecord(fs) -> TBRecord(map(fs, (f) => match f {
+    FD(p, n, t, attrs) -> FD(p, n, qh_ty(t, mt), attrs)
+  }))
+  TBSum(vs) -> TBSum(map(vs, (v) => match v {
+    Var(n, ts) -> Var(n, qh_tys(ts, mt))
+  }))
+  TBEffectAlias(ls) -> TBEffectAlias(map(ls, (n) => qh_name(n, mt)))
 }
 
 fn qh_sub_decls(ds: [Decl], mt: [ModuleEntry]) : [Decl] = match ds {
@@ -148,17 +211,101 @@ fn qh_expr(e: Expr, mt: [ModuleEntry]) : Expr = match e.kind {
 }
 
 fn qhchk_decl(d: Decl, mt: [ModuleEntry], file: String) : Int / Console + File = match d {
-  DFn(_, _, _, _, _, _, body, _, _, _) -> qhchk_expr(body, mt, file)
-  DImpl(pname, _, _, methods, l, c, _) -> {
-    let here = qh_report(pname, "protocol", mt, file, l, c)
-    here + qhchk_sub_decls(methods, mt, file)
-  }
+  DFn(_, _, _, ps, ret, row, body, l, c, _) ->
+    qhchk_params(ps, mt, file, l, c) + qhchk_ty_opt(ret, mt, file, l, c) +
+    qhchk_row(row, mt, file, l, c) + qhchk_expr(body, mt, file)
+  DImpl(pname, pargs, target, methods, l, c, _) ->
+    qh_report(pname, "protocol", mt, file, l, c) + qhchk_tys(pargs, mt, file, l, c) +
+    qhchk_ty(target, mt, file, l, c) + qhchk_sub_decls(methods, mt, file)
   DTest(_, body, _, _, _) -> qhchk_expr(body, mt, file)
   DBench(_, body, _, _, _) -> qhchk_expr(body, mt, file)
-  DCheck(_, _, body, _, _, _) -> qhchk_expr(body, mt, file)
+  DCheck(_, ps, body, l, c, _) ->
+    qhchk_params(ps, mt, file, l, c) + qhchk_expr(body, mt, file)
+  DConst(_, _, ty, body, _, l, c) ->
+    qhchk_ty(ty, mt, file, l, c) + qhchk_expr(body, mt, file)
+  DAxiom(_, _, _, _, _, ps, ret, row, l, c) ->
+    qhchk_params(ps, mt, file, l, c) + qhchk_ty(ret, mt, file, l, c) +
+    qhchk_row(row, mt, file, l, c)
+  DProtocol(_, _, _, ops, l, c, _) -> qhchk_pops(ops, mt, file, l, c)
+  DEffect(_, _, _, ops, _, l, c, _) -> qhchk_eops(ops, mt, file, l, c)
+  DType(_, _, _, body, l, c, _, _) -> qhchk_tbody(body, mt, file, l, c)
   DDerive(protos, inner, l, c) ->
     qhchk_names(protos, mt, file, l, c) + qhchk_decl(inner, mt, file)
   _ -> 0
+}
+
+# A row label carries no position of its own; the declaration's stands in.
+fn qhchk_row(r: RowExpr, mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match r {
+  REmpty -> 0
+  RClosed(ls) -> qhchk_labels(ls, mt, file, l, c)
+  ROpen(_, ls) -> qhchk_labels(ls, mt, file, l, c)
+}
+
+fn qhchk_labels(ls: [RowLabel], mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match ls {
+  [] -> 0
+  [RL(n, ts), ...rest] ->
+    qh_report(n, "effect", mt, file, l, c) + qhchk_tys(ts, mt, file, l, c) +
+    qhchk_labels(rest, mt, file, l, c)
+}
+
+fn qhchk_tys(ts: [TypeExpr], mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match ts {
+  [] -> 0
+  [t, ...rest] -> qhchk_ty(t, mt, file, l, c) + qhchk_tys(rest, mt, file, l, c)
+}
+
+fn qhchk_ty_opt(o: Option[TypeExpr], mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match o {
+  None -> 0
+  Some(t) -> qhchk_ty(t, mt, file, l, c)
+}
+
+fn qhchk_ty(t: TypeExpr, mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match t.tkind {
+  TyName(_, ts) -> qhchk_tys(ts, mt, file, l, c)
+  TyList(x) -> qhchk_ty(x, mt, file, l, c)
+  TyFn(ps, r, row) ->
+    qhchk_tys(ps, mt, file, l, c) + qhchk_ty(r, mt, file, l, c) + qhchk_row(row, mt, file, l, c)
+  TyRow(row) -> qhchk_row(row, mt, file, l, c)
+  TyDim(x, _) -> qhchk_ty(x, mt, file, l, c)
+  TyRefine(x, _) -> qhchk_ty(x, mt, file, l, c)
+  _ -> 0
+}
+
+fn qhchk_params(ps: [Param], mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match ps {
+  [] -> 0
+  [p, ...rest] -> qhchk_ty_opt(p.ptype, mt, file, l, c) + qhchk_params(rest, mt, file, l, c)
+}
+
+fn qhchk_pops(ops: [ProtoOp], mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match ops {
+  [] -> 0
+  [POp(_, _, ps, ret, _, _), ...rest] ->
+    qhchk_params(ps, mt, file, l, c) + qhchk_ty(ret, mt, file, l, c) + qhchk_pops(rest, mt, file, l, c)
+}
+
+fn qhchk_eops(ops: [EffectOp], mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match ops {
+  [] -> 0
+  [EOp(_, _, ps, ret, _, _), ...rest] ->
+    qhchk_params(ps, mt, file, l, c) + qhchk_ty(ret, mt, file, l, c) + qhchk_eops(rest, mt, file, l, c)
+}
+
+fn qhchk_tbody(b: TypeBody, mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match b {
+  TBAlias(t) -> qhchk_ty(t, mt, file, l, c)
+  TBRecord(fs) -> qhchk_fields(fs, mt, file, l, c)
+  TBSum(vs) -> qhchk_variants(vs, mt, file, l, c)
+  TBEffectAlias(ls) -> qhchk_eff_alias(ls, mt, file, l, c)
+}
+
+fn qhchk_fields(fs: [FieldDecl], mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match fs {
+  [] -> 0
+  [FD(_, _, t, _), ...rest] -> qhchk_ty(t, mt, file, l, c) + qhchk_fields(rest, mt, file, l, c)
+}
+
+fn qhchk_variants(vs: [Variant], mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match vs {
+  [] -> 0
+  [Var(_, ts), ...rest] -> qhchk_tys(ts, mt, file, l, c) + qhchk_variants(rest, mt, file, l, c)
+}
+
+fn qhchk_eff_alias(ls: [String], mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match ls {
+  [] -> 0
+  [n, ...rest] -> qh_report(n, "effect", mt, file, l, c) + qhchk_eff_alias(rest, mt, file, l, c)
 }
 
 fn qhchk_names(names: [String], mt: [ModuleEntry], file: String,
