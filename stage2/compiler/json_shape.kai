@@ -5,7 +5,9 @@ Classifies a field's declared type into the `JsonShape` the impl builder
 reads and encodes it as, and explains the classification's refusals so
 the pre-expansion validator can report an unbindable field at the derive
 rather than leaving it to surface as a missing `to_json` at the first
-call site.
+call site. It also counts the combinator lambdas a shape's encoder and
+decoder emit, which is what gives each synthesised lambda a column of
+its own.
 """)]
 
 import compiler.util
@@ -159,4 +161,68 @@ pub fn json_head_name(ftype: TypeExpr) : String = match ftype.tkind {
   TyName(n, _) -> n
   TyList(elem) -> concat_all(["[", json_head_name(elem), "]"])
   _            -> "?"
+}
+
+# ---- variant payloads ----------------------------------------------
+
+#[doc("The JSON shapes of one variant's payload types, or `None` when a payload has no JSON denotation, which drops the whole derive.")]
+pub fn jd_payload_shapes(vargs: [TypeExpr], acc: [JsonShape]) : Option[[JsonShape]] =
+  match vargs {
+    [] -> Some(list_reverse(acc))
+    [t, ...rest] -> match jd_shape_of(t) {
+      Some(s) -> jd_payload_shapes(rest, [s, ...acc])
+      None    -> None
+    }
+  }
+
+#[doc("The same payload shapes with an unbindable payload reduced to the empty list, for callers that already refused the derive.")]
+pub fn jd_shape_of_all(vargs: [TypeExpr]) : [JsonShape] = match jd_payload_shapes(vargs, []) {
+  Some(ss) -> ss
+  None     -> []
+}
+
+# ---- synthesised-lambda slots --------------------------------------
+#
+# The lambda lifter keys a lifted lambda's C symbol on
+# `(enclosing fn, line, col)`, and every node the impl builder makes
+# carries the derive attribute's single source position. Two combinator
+# lambdas in one derive would therefore mint the same symbol, so each
+# gets a distinct synthetic column: a slot number, unique across the
+# whole `to_json` / `of_json` body, offset past any real column on the
+# line. The counts below mirror the emission walk and must stay in step
+# with which shapes actually emit a lambda.
+
+#[doc("The synthetic column a lambda in `slot` takes, offset past any real column on the line.")]
+pub fn jd_slot_col(col: Int, slot: Int) : Int = col + 1000 + slot
+
+#[doc("How many lambdas encoding a shape emits: one per list/option combinator, plus whatever the element shape nests.")]
+pub fn jd_enc_lams(shape: JsonShape) : Int = match shape {
+  JSList(inner) -> 1 + jd_enc_lams(inner)
+  JSOpt(inner)  -> 1 + jd_enc_lams(inner)
+  _ -> 0
+}
+
+#[doc("How many lambdas decoding a shape emits. Mirrors the encoder except at `Option`: a leaf reads through its own optional reader and emits none, and an optional list hands its ELEMENT decoder straight to `json_bind_opt_list`, skipping the list combinator's own lambda.")]
+pub fn jd_dec_lams(shape: JsonShape) : Int = match shape {
+  JSList(inner) -> 1 + jd_dec_lams(inner)
+  JSOpt(inner)  -> match inner {
+    JSStr  -> 0
+    JSInt  -> 0
+    JSReal -> 0
+    JSBool -> 0
+    JSList(elem) -> 1 + jd_dec_lams(elem)
+    _ -> 1 + jd_dec_lams(inner)
+  }
+  _ -> 0
+}
+
+#[doc("How many lambdas one variant's payloads emit in the given direction.")]
+pub fn jd_variant_lams(v: Variant, enc: Bool) : Int = match v {
+  Var(_, vargs) -> jd_shapes_lams(jd_shape_of_all(vargs), enc, 0)
+}
+
+fn jd_shapes_lams(shapes: [JsonShape], enc: Bool, acc: Int) : Int = match shapes {
+  [] -> acc
+  [s, ...rest] ->
+    jd_shapes_lams(rest, enc, acc + if enc { jd_enc_lams(s) } else { jd_dec_lams(s) })
 }
