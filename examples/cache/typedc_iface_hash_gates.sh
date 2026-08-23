@@ -28,12 +28,16 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
 
+# A flagless kaic2 runs the oldest edition; the cache keys carry the
+# edition, so this fixture must exercise the one the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
+
 if [ ! -x "$KAIC2" ]; then
   echo "typedc_iface_hash_gates: FAIL (kaic2 not built at $KAIC2)"
   exit 1
 fi
 
-out="$("$KAIC2" --cache-typed-selftest 2>&1)" || {
+out="$("$KAIC2" $EDITION_FLAG --cache-typed-selftest 2>&1)" || {
   echo "typedc_iface_hash_gates: FAIL (selftest exited non-zero)"
   echo "$out"
   exit 1

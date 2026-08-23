@@ -52,6 +52,10 @@ ROOT="$(pwd)"
 KAIC2="$ROOT/stage2/kaic2"
 KAIC1="$ROOT/stage1/kaic1"
 
+# A flagless kaic2 runs the oldest edition, so these fixtures would pin
+# the previous surface. kaic1 has no --edition, hence only kaic2 gets it.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
+
 if [ ! -x "$KAIC2" ]; then
   echo "test-negative FAIL — stage2/kaic2 not built (run 'make kaic2' first)"
   exit 1
@@ -96,8 +100,11 @@ run_one() {
   fi
 
   extra_flags=""
+  if [ "$compiler" = "$KAIC2" ]; then
+    extra_flags="$EDITION_FLAG"
+  fi
   if [ -f "$dir/$stem.flags" ]; then
-    extra_flags=$(cat "$dir/$stem.flags")
+    extra_flags="$extra_flags $(cat "$dir/$stem.flags")"
   fi
 
   rel="${src#$ROOT/}"
@@ -166,7 +173,8 @@ run_one_runtime() {
   bin="$tmp/$key.bin"
   errfile="$tmp/$key.runerr"
 
-  if ! "$KAIC2" "$src" > "$cfile" 2> "$errfile.compile"; then
+  # shellcheck disable=SC2086 — EDITION_FLAG is intentionally word-split.
+  if ! "$KAIC2" $EDITION_FLAG "$src" > "$cfile" 2> "$errfile.compile"; then
     echo "FAIL $rel — kaic2 rejected at compile (this is a runtime-negative fixture)"
     return
   fi

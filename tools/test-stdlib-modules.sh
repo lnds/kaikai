@@ -28,6 +28,10 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 KAIC2="$ROOT/stage2/kaic2"
 
+# A flagless kaic2 runs the oldest edition; the repo's EDITION is what
+# this gate must exercise.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
+
 if [ ! -x "$KAIC2" ]; then
   echo "test-stdlib-modules FAIL — stage2/kaic2 not built" >&2
   exit 1
@@ -47,7 +51,7 @@ probe_one() {
   err="$tmpdir/probe_$key.err"
   printf 'import %s\n\nfn main() : Int = 0\n' "$mod_dotted" > "$probe"
 
-  if "$KAIC2" --path stdlib "$probe" > /dev/null 2> "$err"; then
+  if "$KAIC2" $EDITION_FLAG --path stdlib "$probe" > /dev/null 2> "$err"; then
     echo "OK $f"
   else
     echo "FAIL $f"

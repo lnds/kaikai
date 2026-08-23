@@ -14,6 +14,10 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAI="$ROOT/bin/kai"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the cache keys carry the
+# edition, so this fixture must exercise the one the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 PROJ="$(mktemp -d)"
 restore_mtime() { [ -f "$PROJ/kaic2.mtime.ref" ] && touch -r "$PROJ/kaic2.mtime.ref" "$KAIC2" 2>/dev/null; rm -rf "$PROJ"; }
 trap 'restore_mtime' EXIT INT TERM
@@ -22,7 +26,7 @@ trap 'restore_mtime' EXIT INT TERM
 native_capable=0
 if [ -x "$KAIC2" ]; then
   printf 'fn main() : Unit = ()\n' > "$PROJ/probe.kai"
-  "$KAIC2" --emit=native --path "$ROOT/stdlib" --path "$PROJ" "$PROJ/probe.kai" \
+  "$KAIC2" $EDITION_FLAG --emit=native --path "$ROOT/stdlib" --path "$PROJ" "$PROJ/probe.kai" \
     >/dev/null 2>"$PROJ/native-probe.err" || true
   grep -q "not built into this compiler" "$PROJ/native-probe.err" 2>/dev/null || native_capable=1
 fi

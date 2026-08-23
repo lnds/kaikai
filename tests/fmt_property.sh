@@ -94,6 +94,10 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
 
+# A flagless kaic2 runs the oldest edition; fmt reproduces the surface
+# of the edition the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
+
 # Most of the corpus imports stdlib (`import spawn`, `import actor`,
 # `collections.map`, …). Without this the parse fails with "cannot open
 # module" and the file is dropped as unparseable — which silently shrank
@@ -343,7 +347,7 @@ check_one() {
   #      aspirational code that does not compile yet.
   #   D  coverage debt — everything else. FAILS the run: either the
   #      harness learns to resolve the file or it gets classified.
-  if ! "$KAIC2" $KPATH $extra --ast "$abs" > "$b.ast0" 2> "$b.err"; then
+  if ! "$KAIC2" $EDITION_FLAG $KPATH $extra --ast "$abs" > "$b.ast0" 2> "$b.err"; then
     case "$rel" in
       *.err.kai)                printf 'N' >> "$results"; return 0 ;;
       examples/negative/*)      printf 'N' >> "$results"; return 0 ;;
@@ -363,7 +367,7 @@ check_one() {
   fi
 
   # (a) fmt must not refuse.
-  if ! "$KAIC2" $KPATH $extra --fmt "$abs" > "$p1" 2> "$b.err"; then
+  if ! "$KAIC2" $EDITION_FLAG $KPATH $extra --fmt "$abs" > "$p1" 2> "$b.err"; then
     # An explicit `kai fmt:` refusal is a documented out-of-scope
     # construct, not a failure.
     if grep -q "kai fmt:" "$b.err"; then
@@ -378,7 +382,7 @@ check_one() {
   fi
 
   # (b) the output must re-parse.
-  if "$KAIC2" $KPATH $extra --ast "$p1" > "$b.ast1" 2> "$b.err"; then
+  if "$KAIC2" $EDITION_FLAG $KPATH $extra --ast "$p1" > "$b.ast1" 2> "$b.err"; then
     reparsed=1
   else
     reparsed=0
@@ -424,7 +428,7 @@ check_one() {
   fi
 
   # (d) idempotency.
-  if ! "$KAIC2" $KPATH $extra --fmt "$p1" > "$p2" 2> "$b.err"; then
+  if ! "$KAIC2" $EDITION_FLAG $KPATH $extra --fmt "$p1" > "$p2" 2> "$b.err"; then
     { echo "  FAIL $rel — (d) fmt refused its own output:"
       sed 's/^/      /' "$b.err"; } >> "$failures"
     printf 'F' >> "$results"

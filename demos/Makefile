@@ -29,10 +29,10 @@ CORE_PRELUDES :=
 PRELUDES  :=
 STDLIB    := ../stdlib
 # kaic2 defaults to the oldest edition (tongariki) for flagless
-# invocations; pin the repo's current edition so demos see the same
+# invocations; pass the repo's declared edition so demos see the same
 # surface as the rest of the tree (e.g. convention pipe-dispatch over a
 # stdlib head, gated on >= hanga-roa).
-EDITION   := --edition hanga-roa
+EDITION   := --edition $(shell cat ../EDITION)
 # These demos are built by kaic2 (stage 2), whose emitted C uses the
 # stage-2 runtime (Koka tagged-Int, kai_intf, reuse-token, borrow).
 # Resolve `#include "runtime.h"` to stage2/runtime.h — `-I ../stage2`

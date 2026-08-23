@@ -21,6 +21,10 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; fmt reproduces the surface
+# of the edition the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 FIXTURE="$ROOT/examples/fmt/help_scope.input.kai"
 
 if [ ! -x "$KAIC2" ]; then
@@ -34,12 +38,12 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 fail=0
 
 # 1. Every construct the help claims to format actually formats.
-if ! "$KAIC2" --fmt "$FIXTURE" > "$tmp/p1" 2> "$tmp/err"; then
+if ! "$KAIC2" $EDITION_FLAG --fmt "$FIXTURE" > "$tmp/p1" 2> "$tmp/err"; then
   echo "  FAIL help_scope fixture — fmt refused a construct the help claims to format:"
   sed 's/^/      /' "$tmp/err"
   fail=$((fail + 1))
 else
-  if ! "$KAIC2" --fmt "$tmp/p1" > "$tmp/p2" 2> "$tmp/err"; then
+  if ! "$KAIC2" $EDITION_FLAG --fmt "$tmp/p1" > "$tmp/p2" 2> "$tmp/err"; then
     echo "  FAIL help_scope fixture — fmt refused on second pass:"
     sed 's/^/      /' "$tmp/err"
     fail=$((fail + 1))

@@ -24,10 +24,11 @@ kai_build_single_tu() {
   local src="$1" out="$2"
   local root="$KAI_SINGLE_TU_ROOT"
   local kaic2="$root/stage2/kaic2"
+  local edition_flag="--edition $(cat "$root/EDITION")"
   local stdlib="$root/stdlib"
 
   [ -x "$kaic2" ] || { echo "kai_build_single_tu: $kaic2 missing — run 'make kaic2'" >&2; return 1; }
-  "$kaic2" --path "$stdlib" "$src" > "$out.c" || return 1
+  "$kaic2" $edition_flag --path "$stdlib" "$src" > "$out.c" || return 1
   # shellcheck disable=SC2086
   ${CC:-cc} $KAI_SINGLE_TU_CFLAGS \
     -I "$root/stage2" -DKAI_STDLIB_PATH="\"$stdlib\"" -I "$root/stage0" \

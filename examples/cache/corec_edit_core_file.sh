@@ -16,6 +16,10 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the cache keys carry the
+# edition, so this fixture must exercise the one the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 TMPSTD="$(mktemp -d)"
 PROJ="$(mktemp -d)"
 trap 'rm -rf "$TMPSTD" "$PROJ"' EXIT INT TERM
@@ -29,7 +33,7 @@ EOF
 mkdir -p "$PROJ/.kai-cache"
 
 # Warm the cache against the pristine copy.
-KAIKAI_STDLIB_PATH="$TMPSTD" "$KAIC2" --user-cache --path "$TMPSTD" --path "$PROJ" \
+KAIKAI_STDLIB_PATH="$TMPSTD" "$KAIC2" $EDITION_FLAG --user-cache --path "$TMPSTD" --path "$PROJ" \
   "$PROJ/main.kai" > "$PROJ/warm_before.c" 2>/dev/null
 before="$(ls "$PROJ/.kai-cache/core-"*.kab 2>/dev/null | wc -l | tr -d ' ')"
 if [ "$before" = "0" ]; then
@@ -42,11 +46,11 @@ printf '\n# issue #825 invalidation probe\n' >> "$TMPSTD/core/list.kai"
 
 # Build again with the cache on. The edited list.kai must miss (new
 # hash, new blob name) and re-parse; everything else stays a hit.
-KAIKAI_STDLIB_PATH="$TMPSTD" "$KAIC2" --user-cache --path "$TMPSTD" --path "$PROJ" \
+KAIKAI_STDLIB_PATH="$TMPSTD" "$KAIC2" $EDITION_FLAG --user-cache --path "$TMPSTD" --path "$PROJ" \
   "$PROJ/main.kai" > "$PROJ/after.c" 2>/dev/null
 
 # Oracle: a fresh no-cache build of the EDITED stdlib.
-KAIKAI_STDLIB_PATH="$TMPSTD" "$KAIC2" --path "$TMPSTD" --path "$PROJ" \
+KAIKAI_STDLIB_PATH="$TMPSTD" "$KAIC2" $EDITION_FLAG --path "$TMPSTD" --path "$PROJ" \
   "$PROJ/main.kai" > "$PROJ/oracle_edited.c" 2>/dev/null
 
 if ! cmp -s "$PROJ/after.c" "$PROJ/oracle_edited.c"; then

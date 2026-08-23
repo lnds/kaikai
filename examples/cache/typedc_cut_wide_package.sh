@@ -21,6 +21,10 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the cache keys carry the
+# edition, so this fixture must exercise the one the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 PROJ="$(mktemp -d)"
 trap 'rm -rf "$PROJ"' EXIT INT TERM
 
@@ -49,7 +53,7 @@ mkdir -p "$PROJ/.kai-cache"
 
 build() {
   out="$1"; shift
-  if ! "$KAIC2" "$@" --path "$PROJ" "$PROJ/main.kai" > "$out" 2>"$PROJ/err"; then
+  if ! "$KAIC2" $EDITION_FLAG "$@" --path "$PROJ" "$PROJ/main.kai" > "$out" 2>"$PROJ/err"; then
     echo "typedc_cut_wide_package: FAIL — build exited non-zero ($*)"
     cat "$PROJ/err"
     exit 1
