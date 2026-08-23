@@ -1,0 +1,114 @@
+#[doc("""
+compiler.extern_fn_dup — one C symbol, one kaikai signature.
+
+Two modules may each declare `extern "C" fn cos(x: Real) : Real`: the
+symbol is the same libc entry and both spellings describe it the same
+way, so both are correct and both stay. What has no consistent reading
+is two declarations of ONE symbol with DIFFERENT signatures — a second
+arity, another parameter type, another return type. Nothing downstream
+can honour both: the emit writes two contradictory `extern` prototypes
+for the same name, and under separate compilation each translation unit
+sees only its own, so the mismatch reaches neither the compiler nor the
+linker and the call runs against the wrong ABI.
+
+The registry is therefore keyed by the C symbol, not by the kaikai
+spelling — an `extern "C"("sym")` override makes the two differ — and
+the duplicate is admitted only when the signatures agree.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.diag_file
+import compiler.home_dup
+
+# A declared extern fn: its rendered signature plus a homed declaration
+# whose name is the C SYMBOL, not the kaikai spelling. The symbol is
+# what the two modules share, so it is what the conflict is about and
+# what the diagnostic names.
+type ExternFn = EF(String, HomedDecl)
+
+#[doc("Reject two `extern \"C\" fn` declarations that bind one C symbol to different signatures. Agreeing redeclarations are the ordinary cross-module pattern and stay legal.")]
+pub fn validate_extern_fn_homes(decls: [Decl], df: DiagFiles) : Int / Console + File =
+  extern_fn_loop(decls, df, [], 0)
+
+fn extern_fn_loop(decls: [Decl], df: DiagFiles, seen: [ExternFn],
+                  errs: Int) : Int / Console + File = match decls {
+  [] -> errs
+  [d, ...rest] -> match decl_extern_fn(d) {
+    None -> extern_fn_loop(rest, df, seen, errs)
+    Some(e) -> match extern_fn_find(seen, ef_symbol(e)) {
+      None -> extern_fn_loop(rest, df, [e, ...seen], errs)
+      Some(prev) ->
+        if ef_sig(prev) == ef_sig(e) { extern_fn_loop(rest, df, seen, errs) }
+        else {
+          report_extern_fn_conflict(df, e, prev)
+          extern_fn_loop(rest, df, seen, errs + 1)
+        }
+    }
+  }
+}
+
+fn ef_sig(e: ExternFn) : String = match e { EF(g, _) -> g }
+fn ef_decl(e: ExternFn) : HomedDecl = match e { EF(_, h) -> h }
+fn ef_symbol(e: ExternFn) : String = hd_name(ef_decl(e))
+
+fn extern_fn_find(seen: [ExternFn], sym: String) : Option[ExternFn] = match seen {
+  [] -> None
+  [e, ...rest] -> if ef_symbol(e) == sym { Some(e) } else { extern_fn_find(rest, sym) }
+}
+
+# Both signatures are shown: the reader reconciles two declarations, and
+# which one is wrong is theirs to decide, so neither is called expected.
+fn report_extern_fn_conflict(df: DiagFiles, second: ExternFn,
+                             first: ExternFn) : Unit / Console + File =
+  report_conflict(df,
+    concat_all(["conflicting declarations of extern function `",
+                ef_symbol(second), "`"]),
+    concat_all(["one C symbol has one signature: ",
+                home_display(hd_home(ef_decl(first))), " declares `",
+                ef_sig(first), "`, ",
+                home_display(hd_home(ef_decl(second))), " declares `",
+                ef_sig(second),
+                "`; make them agree, or bind one to a different symbol"]),
+    ef_decl(second), ef_decl(first))
+
+# An extern fn reaches this pass as the DFn `lower_axiom_one` produced:
+# the marker body carries the C-symbol override, empty when the kaikai
+# identifier IS the symbol.
+fn decl_extern_fn(d: Decl) : Option[ExternFn] = match d {
+  DFn(_, name, _, params, ret, _, body, l, c, mo) -> match body.kind {
+    EExternBody(over) -> {
+      let sym = if string_length(over) > 0 { over } else { name }
+      Some(EF(extern_sig_display(params, ret), HD(mo, sym, l, c)))
+    }
+    _ -> None
+  }
+  DDoc(_, _, inner, _, _) -> decl_extern_fn(inner)
+  DAttr(_, inner, _, _)   -> decl_extern_fn(inner)
+  _                       -> None
+}
+
+# The rendering IS the comparison key: two signatures agree exactly when
+# they render alike, so an unannotated parameter (which no extern fn has)
+# cannot silently match an annotated one.
+fn extern_sig_display(params: [Param], ret: Option[TypeExpr]) : String =
+  concat_all(["(", join_with(map(params, param_ty_display), ", "), ") : ",
+              opt_ty_display(ret)])
+
+fn param_ty_display(p: Param) : String = opt_ty_display(p.ptype)
+
+fn opt_ty_display(t: Option[TypeExpr]) : String = match t {
+  None    -> "_"
+  Some(x) -> ffi_ty_display(x)
+}
+
+# The boundary admits scalars, fixed-width annotations, extern structs
+# and opaque handles — all `TyName`. Anything else is rejected further
+# down the pipeline; here it only has to render distinguishably.
+fn ffi_ty_display(t: TypeExpr) : String = match t.tkind {
+  TyName(name, [])   -> name
+  TyName(name, targs) ->
+    concat_all([name, "[", join_with(map(targs, ffi_ty_display), ", "), "]"])
+  TyList(inner)      -> concat_all(["[", ffi_ty_display(inner), "]"])
+  _                  -> "?"
+}
