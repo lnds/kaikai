@@ -1,0 +1,116 @@
+#[doc("""
+Fatal-error gate for interpolation bodies that do not parse.
+
+Every consumer of an interpolation re-parses its raw span
+(`parse_interp_expr`) long after the whole-program passes ran, and each
+one recovers from a parse failure by substituting the empty string — the
+only choice available to a pure rebuild walker. Without this pass the
+program builds and exits 0 with the fragment silently dropped.
+
+The scan runs once, before the lift, and reports each failing fragment
+against the file and position it really occupies: the parser's own error
+carries `<interp>` and a position inside the fragment, which names no
+file the user wrote.
+""")]
+
+import compiler.ast
+import compiler.diag
+import compiler.diag_file
+import compiler.expr_positions
+import compiler.fnreg
+import compiler.infer
+import compiler.parse
+import compiler.util
+
+#[doc("Report every interpolation body that fails to parse; returns the count so the driver folds it into the exit code.")]
+pub fn check_interp_parses(ds: [Decl], df: DiagFiles) : Int / Console + File =
+  ic_decls(ds, df, 0)
+
+fn ic_decls(ds: [Decl], df: DiagFiles, acc: Int) : Int / Console + File = match ds {
+  [] -> acc
+  [d, ...rest] -> ic_decls(rest, df, ic_decl(d, df, acc))
+}
+
+fn ic_decl(d: Decl, df: DiagFiles, acc: Int) : Int / Console + File = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> ic_expr(body, decl_diag_file(d, df), acc)
+  DTest(_, body, _, _, _)              -> ic_expr(body, decl_diag_file(d, df), acc)
+  DBench(_, body, _, _, _)             -> ic_expr(body, decl_diag_file(d, df), acc)
+  DCheck(_, _, body, _, _, _)          -> ic_expr(body, decl_diag_file(d, df), acc)
+  DImpl(_, _, _, subs, _, _, _)        -> ic_decls(subs, df, acc)
+  DDerive(_, inner, _, _)              -> ic_decl(inner, df, acc)
+  DUnstable(inner, _, _)               -> ic_decl(inner, df, acc)
+  DConstructor(inner, _, _)            -> ic_decl(inner, df, acc)
+  DProtoLaws(_, inner, _, _, _)        -> ic_decl(inner, df, acc)
+  DImplAxiom(_, inner, _, _, _)        -> ic_decl(inner, df, acc)
+  _ -> acc
+}
+
+fn ic_expr(e: Expr, file: String, acc: Int) : Int / Console + File = {
+  let a1 = match e.kind {
+    EStr(span, is_triple) -> ic_span(span, is_triple, file, e.line, e.col, acc)
+    _ -> acc
+  }
+  ic_positions(xp_positions(e), file, a1)
+}
+
+fn ic_positions(ps: [XPos], file: String, acc: Int) : Int / Console + File = match ps {
+  [] -> acc
+  [XP(_, child), ...rest] -> ic_positions(rest, file, ic_expr(child, file, acc))
+}
+
+fn ic_span(span: String, is_triple: Bool, file: String,
+           line: Int, col: Int, acc: Int) : Int / Console + File = {
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  if not has_interp(span, body_start, body_end) { acc }
+  else {
+    let parts = iscan_collect(span, body_end,
+                              IScan { parts: [], lit_start: body_start, i: body_start })
+    ic_parts(parts, IcPos { line: line, col: col + body_start }, file, acc)
+  }
+}
+
+# Where a part begins in the real source; mirrors the lift's own walk so
+# the caret lands on the fragment, not on the literal's opening quote.
+type IcPos = { line: Int, col: Int }
+
+fn ic_advance(p: IcPos, s: String, i: Int) : IcPos = {
+  if i >= string_length(s) { p }
+  else {
+    let nxt = match char_at(s, i) {
+      Some('\n') -> IcPos { line: p.line + 1, col: 1 }
+      _          -> IcPos { line: p.line, col: p.col + 1 }
+    }
+    ic_advance(nxt, s, i + 1)
+  }
+}
+
+fn ic_report(file: String, line: Int, col: Int, src: String, acc: Int) : Int / Console + File = {
+  let quoted = concat_all(["cannot parse the interpolated expression `", src, "`"])
+  diag_error(file, line, col, quoted)
+  diag_note("an interpolation body is parsed as a single expression")
+  acc + 1
+}
+
+fn ic_parts(parts: [IPart], pos: IcPos, file: String, acc: Int) : Int / Console + File =
+  match parts {
+    [] -> acc
+    [p, ...rest] -> {
+      let a1 = match p {
+        IpLit(_, _) -> acc
+        IpExp(src) -> match parse_interp_expr(src) {
+          Some(_) -> acc
+          None -> ic_report(file, pos.line, pos.col + 2, src, acc)
+        }
+      }
+      let next = match p {
+        IpLit(piece, _) -> ic_advance(pos, piece, 0)
+        IpExp(src) -> {
+          let after = ic_advance(IcPos { line: pos.line, col: pos.col + 2 }, src, 0)
+          IcPos { line: after.line, col: after.col + 1 }
+        }
+      }
+      ic_parts(rest, next, file, a1)
+    }
+  }
