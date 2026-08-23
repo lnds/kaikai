@@ -29,6 +29,11 @@ fn jd_var(n: String, line: Int, col: Int) : Expr = jd_expr(EVar(n), line, col)
 fn jd_call(callee: String, targs: [Expr], line: Int, col: Int) : Expr =
   jd_expr(ECall(jd_var(callee, line, col), targs), line, col)
 
+# `Err(e) -> Err(e)`: the arm every threaded read re-raises through.
+fn jd_err_arm(line: Int, col: Int) : Arm =
+  Arm(mk_pat(PVariant(None, "Err", [mk_pat(PBind("e"), line, col)]), line, col), None,
+      jd_call("Err", [jd_var("e", line, col)], line, col))
+
 # `EStr` carries the raw source span, quotes included.
 fn jd_str(s: String, line: Int, col: Int) : Expr =
   jd_expr(EStr(concat_all(["\"", s, "\""]), false), line, col)
@@ -118,39 +123,41 @@ fn jd_shim(tname: String, shown: String, line: Int, col: Int) : Decl {
 # name is what the type says, with no case conversion.
 
 fn jd_to_json_body(jfs: [JsonField], line: Int, col: Int) : Expr =
-  jd_call("JObj", [jd_expr(EList(jd_pairs(jfs, line, col)), line, col)], line, col)
+  jd_call("JObj", [jd_expr(EList(jd_pairs(jfs, 0, line, col)), line, col)], line, col)
 
-fn jd_pairs(jfs: [JsonField], line: Int, col: Int) : [ListElem] = match jfs {
+fn jd_pairs(jfs: [JsonField], slot: Int, line: Int, col: Int) : [ListElem] = match jfs {
   [] -> []
   [f, ...rest] -> match f {
     # A `#[json(skip)]` field is not written to the wire.
     JF(name, wire, shape, _, skip) ->
-      if skip { jd_pairs(rest, line, col) }
+      if skip { jd_pairs(rest, slot, line, col) }
       else {
         let read = jd_expr(EField(jd_var("self", line, col), name), line, col)
         let pair = jd_expr(ERecordLit("Pair",
                      [FI("fst", jd_str(wire, line, col)),
-                      FI("snd", jd_encode(shape, read, line, col))]), line, col)
-        [ElPlain(pair), ...jd_pairs(rest, line, col)]
+                      FI("snd", jd_encode(shape, read, slot, line, col))]), line, col)
+        [ElPlain(pair), ...jd_pairs(rest, slot + jd_enc_lams(shape), line, col)]
       }
   }
 }
 
-fn jd_encode(shape: JsonShape, v: Expr, line: Int, col: Int) : Expr = match shape {
+fn jd_encode(shape: JsonShape, v: Expr, slot: Int, line: Int, col: Int) : Expr = match shape {
   JSStr  -> jd_call("JStr", [v], line, col)
   JSInt  -> jd_call("JNum", [v], line, col)
   JSReal -> jd_call("JReal", [v], line, col)
   JSBool -> jd_call("JBool", [v], line, col)
   JSRecord(rt) -> jd_call(concat_all(["__pimpl_Json_", rt, "_to_json"]), [v], line, col)
-  JSList(inner) -> jd_call("json_of_list", [v, jd_encoder_fn(inner, line, col)], line, col)
-  JSOpt(inner)  -> jd_call("json_of_opt", [v, jd_encoder_fn(inner, line, col)], line, col)
+  JSList(inner) -> jd_call("json_of_list", [v, jd_encoder_fn(inner, slot, line, col)], line, col)
+  JSOpt(inner)  -> jd_call("json_of_opt", [v, jd_encoder_fn(inner, slot, line, col)], line, col)
 }
 
 # The element encoder a list / option hands to its combinator: `(x) =>
 # <encode(x)>`, so the same `jd_encode` covers nesting to any depth.
-fn jd_encoder_fn(shape: JsonShape, line: Int, col: Int) : Expr {
-  let p = Param { pname: "x", ptype: None, pline: line, pcol: col, pborrow: false }
-  jd_expr(ELambda([p], jd_encode(shape, jd_var("x", line, col), line, col)), line, col)
+fn jd_encoder_fn(shape: JsonShape, slot: Int, line: Int, col: Int) : Expr {
+  let lcol = jd_slot_col(col, slot)
+  let p = Param { pname: "x", ptype: None, pline: line, pcol: lcol, pborrow: false }
+  jd_expr(ELambda([p], jd_encode(shape, jd_var("x", line, col), slot + 1, line, col)),
+          line, lcol)
 }
 
 # ---- of_json -------------------------------------------------------
@@ -166,14 +173,12 @@ fn jd_of_json_body(tname: String, jfs: [JsonField], line: Int, col: Int) : Expr 
   let guard = jd_call("json_bind_object",
                 [jd_var("v", line, col), jd_var("path", line, col)], line, col)
   let ok_arm = Arm(mk_pat(PVariant(None, "Ok", [mk_pat(PWild, line, col)]), line, col),
-                   None, jd_tower(tname, jfs, [], line, col))
-  let err_arm = Arm(mk_pat(PVariant(None, "Err", [mk_pat(PBind("e"), line, col)]),
-                           line, col), None,
-                    jd_call("Err", [jd_var("e", line, col)], line, col))
+                   None, jd_tower(tname, jfs, [], 0, line, col))
+  let err_arm = jd_err_arm(line, col)
   jd_expr(EMatch(guard, [ok_arm, err_arm]), line, col)
 }
 
-fn jd_tower(tname: String, jfs: [JsonField], bound: [String],
+fn jd_tower(tname: String, jfs: [JsonField], bound: [String], slot: Int,
             line: Int, col: Int) : Expr = match jfs {
   [] -> jd_call("Ok", [jd_record(tname, list_reverse(bound), line, col)], line, col)
   [f, ...rest] -> match f {
@@ -182,8 +187,8 @@ fn jd_tower(tname: String, jfs: [JsonField], bound: [String],
         # No wire value: reconstruct from the default, or `None` for an
         # `Option`. `let name = <value>` then continue the tower.
         let value = jd_skip_value(shape, dflt, line, col)
-        jd_expr(EBlock([SLet(mk_pat(PBind(name), line, col), None, value)],
-                       Some(jd_tower(tname, rest, [name, ...bound], line, col))),
+        let tail = jd_tower(tname, rest, [name, ...bound], slot, line, col)
+        jd_expr(EBlock([SLet(mk_pat(PBind(name), line, col), None, value)], Some(tail)),
                 line, col)
       } else {
         let node = jd_call("json_bind_field",
@@ -194,15 +199,14 @@ fn jd_tower(tname: String, jfs: [JsonField], bound: [String],
         # is absent (`JNull`); an absent field with no default still errors
         # in the leaf reader, preserving #1280's required-field policy.
         let read = match dflt {
-          None    -> jd_decode(shape, node, sub, line, col)
-          Some(d) -> jd_default_read(shape, node, sub, d, line, col)
+          None    -> jd_decode(shape, node, sub, slot, line, col)
+          Some(d) -> jd_default_read(shape, node, sub, d, slot, line, col)
         }
-        let ok_arm = Arm(mk_pat(PVariant(None, "Ok", [mk_pat(PBind(name), line, col)]),
-                                line, col), None,
-                         jd_tower(tname, rest, [name, ...bound], line, col))
-        let err_arm = Arm(mk_pat(PVariant(None, "Err", [mk_pat(PBind("e"), line, col)]),
-                                 line, col), None,
-                          jd_call("Err", [jd_var("e", line, col)], line, col))
+        let next = slot + jd_dec_lams(shape)
+        let tail = jd_tower(tname, rest, [name, ...bound], next, line, col)
+        let bind = mk_pat(PVariant(None, "Ok", [mk_pat(PBind(name), line, col)]), line, col)
+        let ok_arm = Arm(bind, None, tail)
+        let err_arm = jd_err_arm(line, col)
         jd_expr(EMatch(read, [ok_arm, err_arm]), line, col)
       }
   }
@@ -221,15 +225,15 @@ fn jd_skip_value(shape: JsonShape, dflt: Option[Expr], line: Int, col: Int) : Ex
 # — the default stands in for an absent key, the leaf reader still handles
 # a present-but-wrong-shape value.
 fn jd_default_read(shape: JsonShape, node: Expr, sub: Expr, dflt: Expr,
-                   line: Int, col: Int) : Expr {
+                   slot: Int, line: Int, col: Int) : Expr {
   let null_arm = Arm(mk_pat(PVariant(None, "JNull", []), line, col), None,
                      jd_call("Ok", [dflt], line, col))
   let some_arm = Arm(mk_pat(PBind("__jn"), line, col), None,
-                     jd_decode(shape, jd_var("__jn", line, col), sub, line, col))
+                     jd_decode(shape, jd_var("__jn", line, col), sub, slot, line, col))
   jd_expr(EMatch(node, [null_arm, some_arm]), line, col)
 }
 
-fn jd_decode(shape: JsonShape, node: Expr, path: Expr,
+fn jd_decode(shape: JsonShape, node: Expr, path: Expr, slot: Int,
              line: Int, col: Int) : Expr = match shape {
   JSStr  -> jd_call("json_bind_string", [node, path], line, col)
   JSInt  -> jd_call("json_bind_int", [node, path], line, col)
@@ -238,31 +242,33 @@ fn jd_decode(shape: JsonShape, node: Expr, path: Expr,
   JSRecord(rt) ->
     jd_call(concat_all(["__pimpl_Json_", rt, "_of_json"]), [node, path], line, col)
   JSList(inner) ->
-    jd_call("json_bind_list", [node, path, jd_decoder_fn(inner, line, col)], line, col)
-  JSOpt(inner) -> jd_opt_decode(inner, node, path, line, col)
+    jd_call("json_bind_list", [node, path, jd_decoder_fn(inner, slot, line, col)], line, col)
+  JSOpt(inner) -> jd_opt_decode(inner, node, path, slot, line, col)
 }
 
 # The optional readers are per-leaf so `null` short-circuits before the
 # leaf's shape check; a nested record or list under `Option` has no
 # dedicated reader, so it goes through the generic combinator instead.
-fn jd_opt_decode(inner: JsonShape, node: Expr, path: Expr,
+fn jd_opt_decode(inner: JsonShape, node: Expr, path: Expr, slot: Int,
                  line: Int, col: Int) : Expr = match inner {
   JSStr  -> jd_call("json_bind_opt_string", [node, path], line, col)
   JSInt  -> jd_call("json_bind_opt_int", [node, path], line, col)
   JSReal -> jd_call("json_bind_opt_real", [node, path], line, col)
   JSBool -> jd_call("json_bind_opt_bool", [node, path], line, col)
   JSList(elem) ->
-    jd_call("json_bind_opt_list", [node, path, jd_decoder_fn(elem, line, col)], line, col)
-  _ -> jd_call("json_bind_opt", [node, path, jd_decoder_fn(inner, line, col)], line, col)
+    jd_call("json_bind_opt_list", [node, path, jd_decoder_fn(elem, slot, line, col)], line, col)
+  _ -> jd_call("json_bind_opt", [node, path, jd_decoder_fn(inner, slot, line, col)], line, col)
 }
 
 # The element decoder a list hands to its combinator: `(x, p) =>
 # <decode(x, p)>`, taking the per-element path the combinator built.
-fn jd_decoder_fn(shape: JsonShape, line: Int, col: Int) : Expr {
-  let px = Param { pname: "x", ptype: None, pline: line, pcol: col, pborrow: false }
-  let pp = Param { pname: "p", ptype: None, pline: line, pcol: col, pborrow: false }
-  let body = jd_decode(shape, jd_var("x", line, col), jd_var("p", line, col), line, col)
-  jd_expr(ELambda([px, pp], body), line, col)
+fn jd_decoder_fn(shape: JsonShape, slot: Int, line: Int, col: Int) : Expr {
+  let lcol = jd_slot_col(col, slot)
+  let px = Param { pname: "x", ptype: None, pline: line, pcol: lcol, pborrow: false }
+  let pp = Param { pname: "p", ptype: None, pline: line, pcol: lcol, pborrow: false }
+  let body = jd_decode(shape, jd_var("x", line, col), jd_var("p", line, col), slot + 1,
+                       line, col)
+  jd_expr(ELambda([px, pp], body), line, lcol)
 }
 
 fn jd_record(tname: String, names: [String], line: Int, col: Int) : Expr =
@@ -298,15 +304,6 @@ fn jd_variants_loop(variants: [Variant], acc: [[JsonShape]]) : Option[[[JsonShap
     }
   }
 
-fn jd_payload_shapes(vargs: [TypeExpr], acc: [JsonShape]) : Option[[JsonShape]] =
-  match vargs {
-    [] -> Some(list_reverse(acc))
-    [t, ...rest] -> match jd_shape_of(t) {
-      Some(s) -> jd_payload_shapes(rest, [s, ...acc])
-      None    -> None
-    }
-  }
-
 fn jd_sum_impl(tname: String, variants: [Variant], line: Int, col: Int) : Decl =
   jd_make_impl(tname, jd_sum_to_json_body(variants, line, col),
                jd_sum_of_json_body(tname, variants, line, col), line, col)
@@ -318,20 +315,23 @@ fn jd_sum_impl(tname: String, variants: [Variant], line: Int, col: Int) : Decl =
 
 fn jd_sum_to_json_body(variants: [Variant], line: Int, col: Int) : Expr =
   jd_expr(EMatch(jd_var("self", line, col),
-                 jd_sum_encode_arms(variants, line, col)), line, col)
+                 jd_sum_encode_arms(variants, 0, line, col)), line, col)
 
-fn jd_sum_encode_arms(variants: [Variant], line: Int, col: Int) : [Arm] =
+fn jd_sum_encode_arms(variants: [Variant], slot: Int, line: Int, col: Int) : [Arm] =
   match variants {
     [] -> []
-    [v, ...rest] -> [jd_sum_encode_arm(v, line, col),
-                     ...jd_sum_encode_arms(rest, line, col)]
+    [v, ...rest] -> {
+      let next = slot + jd_variant_lams(v, true)
+      [jd_sum_encode_arm(v, slot, line, col),
+       ...jd_sum_encode_arms(rest, next, line, col)]
+    }
   }
 
-fn jd_sum_encode_arm(v: Variant, line: Int, col: Int) : Arm = match v {
+fn jd_sum_encode_arm(v: Variant, slot: Int, line: Int, col: Int) : Arm = match v {
   Var(name, vargs) -> {
     let subs = jd_bind_pats(vargs, 0, line, col)
     let pat = mk_pat(PVariant(None, name, subs), line, col)
-    let value = jd_encode_payload(jd_shape_of_all(vargs), 0, line, col)
+    let value = jd_encode_payload(jd_shape_of_all(vargs), 0, slot, line, col)
     Arm(pat, None, jd_envelope(name, value, line, col))
   }
 }
@@ -349,20 +349,20 @@ fn jd_envelope(name: String, value: Expr, line: Int, col: Int) : Expr {
 
 # `null` for a nullary variant, the single encoding for one payload, a
 # `JArr` of encodings for several.
-fn jd_encode_payload(shapes: [JsonShape], i: Int, line: Int, col: Int) : Expr =
+fn jd_encode_payload(shapes: [JsonShape], i: Int, slot: Int, line: Int, col: Int) : Expr =
   match shapes {
     []  -> jd_var("JNull", line, col)
-    [s] -> jd_encode(s, jd_var(concat_all(["p", int_to_string(i)]), line, col), line, col)
-    _   -> jd_call("JArr", [jd_expr(EList(jd_encode_elems(shapes, i, line, col)), line, col)],
+    [s] -> jd_encode(s, jd_var(concat_all(["p", int_to_string(i)]), line, col), slot, line, col)
+    _   -> jd_call("JArr", [jd_expr(EList(jd_encode_elems(shapes, i, slot, line, col)), line, col)],
                    line, col)
   }
 
-fn jd_encode_elems(shapes: [JsonShape], i: Int, line: Int, col: Int) : [ListElem] =
+fn jd_encode_elems(shapes: [JsonShape], i: Int, slot: Int, line: Int, col: Int) : [ListElem] =
   match shapes {
     [] -> []
     [s, ...rest] -> {
-      let e = jd_encode(s, jd_var(concat_all(["p", int_to_string(i)]), line, col), line, col)
-      [ElPlain(e), ...jd_encode_elems(rest, i + 1, line, col)]
+      let e = jd_encode(s, jd_var(concat_all(["p", int_to_string(i)]), line, col), slot, line, col)
+      [ElPlain(e), ...jd_encode_elems(rest, i + 1, slot + jd_enc_lams(s), line, col)]
     }
   }
 
@@ -372,11 +372,6 @@ fn jd_bind_pats(vargs: [TypeExpr], i: Int, line: Int, col: Int) : [Pattern] =
     [_, ...rest] -> [mk_pat(PBind(concat_all(["p", int_to_string(i)])), line, col),
                      ...jd_bind_pats(rest, i + 1, line, col)]
   }
-
-fn jd_shape_of_all(vargs: [TypeExpr]) : [JsonShape] = match jd_payload_shapes(vargs, []) {
-  Some(ss) -> ss
-  None     -> []
-}
 
 # ---- sum of_json ---------------------------------------------------
 #
@@ -389,8 +384,7 @@ fn jd_sum_of_json_body(tname: String, variants: [Variant], line: Int, col: Int) 
                 [jd_var("v", line, col), jd_var("path", line, col)], line, col)
   let ok_arm = Arm(mk_pat(PVariant(None, "Ok", [mk_pat(PWild, line, col)]), line, col),
                    None, jd_sum_read_tag(tname, variants, line, col))
-  let err_arm = Arm(mk_pat(PVariant(None, "Err", [mk_pat(PBind("e"), line, col)]), line, col),
-                    None, jd_call("Err", [jd_var("e", line, col)], line, col))
+  let err_arm = jd_err_arm(line, col)
   jd_expr(EMatch(guard, [ok_arm, err_arm]), line, col)
 }
 
@@ -404,14 +398,13 @@ fn jd_sum_read_tag(tname: String, variants: [Variant], line: Int, col: Int) : Ex
   let read = jd_call("json_bind_string", [node, tag_path], line, col)
   let ok_arm = Arm(mk_pat(PVariant(None, "Ok", [mk_pat(PBind("__tag"), line, col)]), line, col),
                    None, jd_tag_tower(tname, variants, line, col))
-  let err_arm = Arm(mk_pat(PVariant(None, "Err", [mk_pat(PBind("e"), line, col)]), line, col),
-                    None, jd_call("Err", [jd_var("e", line, col)], line, col))
+  let err_arm = jd_err_arm(line, col)
   jd_expr(EMatch(read, [ok_arm, err_arm]), line, col)
 }
 
 # `match __tag { "V0" -> <decode V0> ; ... ; _ -> Err(unknown) }`.
 fn jd_tag_tower(tname: String, variants: [Variant], line: Int, col: Int) : Expr {
-  let arms = jd_tag_arms(variants, line, col)
+  let arms = jd_tag_arms(variants, 0, line, col)
   let names = jd_variant_names(variants)
   let unknown = jd_call("Err",
     [jd_call("json_bind_unknown_tag",
@@ -421,13 +414,14 @@ fn jd_tag_tower(tname: String, variants: [Variant], line: Int, col: Int) : Expr 
   jd_expr(EMatch(jd_var("__tag", line, col), list_append(arms, [dflt])), line, col)
 }
 
-fn jd_tag_arms(variants: [Variant], line: Int, col: Int) : [Arm] = match variants {
+fn jd_tag_arms(variants: [Variant], slot: Int, line: Int, col: Int) : [Arm] = match variants {
   [] -> []
   [v, ...rest] -> match v {
     Var(name, vargs) -> {
       let pat = mk_pat(PLit(jd_str(name, line, col)), line, col)
-      let body = jd_variant_decode(name, jd_shape_of_all(vargs), line, col)
-      [Arm(pat, None, body), ...jd_tag_arms(rest, line, col)]
+      let body = jd_variant_decode(name, jd_shape_of_all(vargs), slot, line, col)
+      let next = slot + jd_variant_lams(v, false)
+      [Arm(pat, None, body), ...jd_tag_arms(rest, next, line, col)]
     }
   }
 }
@@ -442,24 +436,23 @@ fn jd_value_path(line: Int, col: Int) : Expr =
 # Decode `value` for one variant against its payload shapes and build
 # the constructor. Nullary ignores `value`; one payload decodes it
 # directly; several read `value` as a JSON array element-by-element.
-fn jd_variant_decode(name: String, shapes: [JsonShape], line: Int, col: Int) : Expr =
+fn jd_variant_decode(name: String, shapes: [JsonShape], slot: Int, line: Int, col: Int) : Expr =
   match shapes {
     []  -> jd_call("Ok", [jd_var(name, line, col)], line, col)
     [s] -> {
-      let read = jd_decode(s, jd_value_node(line, col), jd_value_path(line, col), line, col)
+      let read = jd_decode(s, jd_value_node(line, col), jd_value_path(line, col), slot, line, col)
       let ok = Arm(mk_pat(PVariant(None, "Ok", [mk_pat(PBind("p0"), line, col)]), line, col), None,
                    jd_call("Ok", [jd_call(name, [jd_var("p0", line, col)], line, col)], line, col))
-      let err = Arm(mk_pat(PVariant(None, "Err", [mk_pat(PBind("e"), line, col)]), line, col), None,
-                    jd_call("Err", [jd_var("e", line, col)], line, col))
+      let err = jd_err_arm(line, col)
       jd_expr(EMatch(read, [ok, err]), line, col)
     }
-    _ -> jd_tuple_decode(name, shapes, jd_count_shapes(shapes, 0), 0, [], line, col)
+    _ -> jd_tuple_decode(name, shapes, jd_count_shapes(shapes, 0), 0, [], slot, line, col)
   }
 
 # Thread `json_bind_tuple_elem(value, i, arity, path.value)` for each
 # payload, then decode the element, ending in `Ok(Variant(p0, ..))`.
 fn jd_tuple_decode(name: String, shapes: [JsonShape], arity: Int, i: Int,
-                   bound: [String], line: Int, col: Int) : Expr = match shapes {
+                   bound: [String], slot: Int, line: Int, col: Int) : Expr = match shapes {
   [] -> {
     let args = jd_bound_args(list_reverse(bound), line, col)
     jd_call("Ok", [jd_call(name, args, line, col)], line, col)
@@ -471,22 +464,24 @@ fn jd_tuple_decode(name: String, shapes: [JsonShape], arity: Int, i: Int,
     let epath = jd_call("json_path_index",
                   [jd_value_path(line, col), jd_expr(mk_int_synth(i), line, col)], line, col)
     let pname = concat_all(["p", int_to_string(i)])
-    let elem_ok = Arm(mk_pat(PVariant(None, "Ok", [mk_pat(PBind("__ev"), line, col)]), line, col), None,
-                      jd_decode_elem(s, pname, rest, name, shapes, arity, i, bound, epath, line, col))
-    let elem_err = Arm(mk_pat(PVariant(None, "Err", [mk_pat(PBind("e"), line, col)]), line, col), None,
-                       jd_call("Err", [jd_var("e", line, col)], line, col))
+    let read = jd_decode_elem(s, pname, rest, name, shapes, arity, i,
+                              bound, epath, slot, line, col)
+    let ev_pat = mk_pat(PVariant(None, "Ok", [mk_pat(PBind("__ev"), line, col)]), line, col)
+    let elem_ok = Arm(ev_pat, None, read)
+    let elem_err = jd_err_arm(line, col)
     jd_expr(EMatch(elem, [elem_ok, elem_err]), line, col)
   }
 }
 
 fn jd_decode_elem(s: JsonShape, pname: String, rest: [JsonShape], name: String,
                   shapes: [JsonShape], arity: Int, i: Int, bound: [String],
-                  epath: Expr, line: Int, col: Int) : Expr {
-  let read = jd_decode(s, jd_var("__ev", line, col), epath, line, col)
+                  epath: Expr, slot: Int, line: Int, col: Int) : Expr {
+  let read = jd_decode(s, jd_var("__ev", line, col), epath, slot, line, col)
+  let next = slot + jd_dec_lams(s)
+  let bound1 = [pname, ...bound]
   let ok = Arm(mk_pat(PVariant(None, "Ok", [mk_pat(PBind(pname), line, col)]), line, col), None,
-               jd_tuple_decode(name, rest, arity, i + 1, [pname, ...bound], line, col))
-  let err = Arm(mk_pat(PVariant(None, "Err", [mk_pat(PBind("e"), line, col)]), line, col), None,
-                jd_call("Err", [jd_var("e", line, col)], line, col))
+               jd_tuple_decode(name, rest, arity, i + 1, bound1, next, line, col))
+  let err = jd_err_arm(line, col)
   jd_expr(EMatch(read, [ok, err]), line, col)
 }
 
