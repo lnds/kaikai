@@ -90,7 +90,11 @@ echo "build-modes check: --debug DWARF line table names panic_trace.kai OK"
 
 # Panic stack trace: the --debug binary's panic must print a kaikai-source
 # trace naming the .kai file (resolved via atos/addr2line over the DWARF).
-dbg_out="$("$WORK/dbg" 2>&1 || true)"
+dbg_rc=0
+dbg_out="$("$WORK/dbg" 2>&1)" || dbg_rc=$?
+# A panic exits 1. Anything else means the trace path itself died — a signal
+# status (128+n) is what a stack walk that runs off the fiber stack looks like.
+[ "$dbg_rc" -eq 1 ] || fail "--debug panic exited $dbg_rc, expected 1 (the backtrace path crashed)"
 echo "$dbg_out" | grep -q "panic: boom" || fail "--debug binary did not panic"
 echo "$dbg_out" | grep -q "stack trace (kaikai source)" || fail "--debug panic printed no stack-trace header"
 echo "$dbg_out" | grep -q "panic_trace.kai" || fail "--debug panic stack trace did not resolve to panic_trace.kai"

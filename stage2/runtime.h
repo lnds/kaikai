@@ -7589,9 +7589,40 @@ static int kai_shell_squote(const char *src, char *dst, size_t n) {
     return 1;
 }
 
+/* Return addresses of the live frames, newest first, into `out`.
+ *
+ * TRAP (macOS): `backtrace(3)` walks frame pointers but bounds the walk with
+ * the *pthread* stack extent, so a panic raised on a fiber's mmap'd stack
+ * faults inside libsystem's `__thread_stack_pcs` — the whole --debug panic
+ * path dies with SIGSEGV instead of printing a trace. Walk the chain here
+ * against the active fiber's own bounds; only the main fiber (stack_base
+ * NULL) rides the thread stack, where `backtrace` is safe. */
+static int kai_capture_frames(void **out, int max) {
+#if defined(__APPLE__)
+    KaiFiber *f = kai_current_fiber();
+    if (!f || !f->stack_base) return backtrace(out, max);
+    /* [guard page | usable stack]; frame pointers live in the usable half. */
+    char *lo = (char *) f->stack_base + kai_page_size();
+    char *hi = lo + f->stack_size;
+    void **fp = (void **) __builtin_frame_address(0);
+    int n = 0;
+    while (n < max && (char *) fp >= lo && (char *) fp + 2 * sizeof(void *) <= hi) {
+        void **next = (void **) fp[0];
+        void  *ret  = fp[1];
+        if (!ret) break;
+        out[n++] = ret;
+        if ((char *) next <= (char *) fp) break;   /* chain must climb */
+        fp = next;
+    }
+    return n;
+#else
+    return backtrace(out, max);
+#endif
+}
+
 static void kai_panic_backtrace(void) {
     void *frames[64];
-    int n = backtrace(frames, 64);
+    int n = kai_capture_frames(frames, 64);
     if (n <= 0) return;
     char exe[4096];
     if (!kai_self_exe_path(exe, sizeof exe)) return;
