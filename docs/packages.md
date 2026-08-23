@@ -39,7 +39,8 @@ Three forms are accepted for a dependency value:
    workspace-style development before publishing.
 
 Top-level keys recognised by the v1 parser:
-`name`, `version`, `[dependencies]`, `[native]`, `[fmt]`. Any other
+`name`, `version`, `[dependencies]`, `[native]`, `[completions]`,
+`[fmt]`. Any other
 top-level keys are ignored (forwards-compatible with future
 extensions).
 
@@ -122,6 +123,65 @@ Both backends receive the declarations: the shim objects and `-l`
 flags join every link line (C and native alike). The `[native]` table
 is an additive `kai.toml` schema change — per `docs/editions.md`,
 additions are non-breaking, so no edition bump is involved.
+
+## Shell completions (`[completions]`)
+
+A CLI is not usable from its binary alone. A package declares the
+completion scripts it ships and `kai install` places them, the same
+way `[native]` declares vendored C:
+
+```toml
+[completions]
+zsh  = "completions/_foo"
+bash = "completions/foo.bash"
+fish = "completions/foo.fish"
+```
+
+Paths are relative to the declaring package. Each file goes to the
+vendor directory its shell already searches, under the toolchain
+prefix — no root, no system directory to detect:
+
+```
+$KAIKAI_HOME/share/zsh/site-functions/_foo
+$KAIKAI_HOME/share/bash-completion/completions/foo
+$KAIKAI_HOME/share/fish/vendor_completions.d/foo.fish
+```
+
+The destination filename comes from the manifest's `name`, not from
+the source path, so the file lands under the name the shell looks for
+regardless of how the package spells it in its repository.
+
+**The directory is wired once, not per package.** `install.sh` adds
+the three directories to the shell's search path when it installs the
+toolchain, so every later `kai install` just works. `kai install`
+prints the line for the user's shell when that wiring is absent — a
+Homebrew prefix, a hand-built checkout — and never edits a startup
+file itself: that is the installer's job, done once with consent.
+
+**zsh prepends.** The directory goes at the *front* of `fpath`.
+Appended, a stock function of the same name still wins, and zsh ships
+functions that claim short names: `_mh` claims `mark`, and when MH is
+absent it returns non-zero rather than declining, which suppresses
+even the default file completion. A user of such a package sees
+`mark <TAB>` offer nothing at all. Prepending is what fixes it.
+
+**Scope: declarative only**, on the same grounds as `[native]`. Three
+known shells, a fixed destination each, no hooks — a post-install
+script is code running on the consumer's machine, which the manifest
+does not do. A key naming a shell this release cannot place is
+ignored, so a manifest is free to name a fourth one early. A path that
+escapes the package (absolute, or with a `..` hop) or names a file the
+package does not ship is skipped with a warning; the binary still
+installs, because a manifest typo is not a reason to withhold a
+working command.
+
+`kai upgrade` replaces `share/` wholesale so a file dropped by the old
+release does not linger, and carries these three directories across
+that wipe — the toolchain ships none of them, so everything there is
+what an installed package put there.
+
+`[completions]` is an additive `kai.toml` schema change: no edition
+bump, and a manifest without it installs exactly as before.
 
 ## Driver commands
 
@@ -221,6 +281,10 @@ toolchain, which is not true of `~/.cargo/bin`:
   the install ledger are carried across that wipe; a name the new
   toolchain has since claimed is not restored, and the conflict is
   reported.
+
+A package that declares `[completions]` also gets its completion
+scripts installed under `$KAIKAI_HOME/share`, with the line the user's
+shell needs printed when that directory is not searched yet.
 
 A library has no entry point, so there is nothing to install: the
 command says so directly rather than failing at link time.
