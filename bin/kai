@@ -270,6 +270,21 @@ emit_compiler_stderr() {
   cat "$1" >&2
 }
 
+# Rewrite the entry path kaic2 rendered ($2, the copy it was handed) to
+# the user's source ($3) in a captured stderr. Both are literal paths we
+# constructed, so the substitution is exact. A path may carry sed
+# metacharacters: escape the regex ones on the pattern side, `&` and `\`
+# on the replacement, `|` (the delimiter) on both. `sed -i` is not
+# portable — write to a sibling temp and move it back.
+diag_rewrite_entry_path() {
+  [ -s "$1" ] || return 0
+  _dre_from="$(printf '%s' "$2" | sed 's/[][\\.*^$|/]/\\&/g')"
+  _dre_to="$(printf '%s' "$3" | sed 's/[\\&|]/\\&/g')"
+  sed "s|$_dre_from|$_dre_to|g" "$1" > "$1.diagpath" 2>/dev/null \
+    && mv "$1.diagpath" "$1" 2>/dev/null || rm -f "$1.diagpath" 2>/dev/null
+  return 0
+}
+
 # Resolve the runtime shim the in-process libLLVM `native` backend links
 # against (stage0/runtime_llvm.c holds the `kaix_prelude_*` forwarders the
 # native object calls). Dev checkout lives next to the C runtime under
@@ -2006,6 +2021,7 @@ compile_to_binary() {
     # shellcheck disable=SC2086
     if (unset KAI_TRACE_RC; KAI_NATIVE_RUNTIME_INLINE_BC="$nm_inline_bc_env" "$KAIC2" --emit=native-modular --path "$src_dir" $pkg_path_flags --path "$STDLIB_ROOT" $unstable_flags $edition_flag $user_cache_flag $core_cache_flags "$@" "$nm_dir/$src_base") >"$tmp/native-modular.objs" 2>"$nmerr" \
        && [ -s "$tmp/native-modular.objs" ]; then
+      diag_rewrite_entry_path "$nmerr" "$nm_dir/$src_base" "$nm_abs"
       emit_compiler_stderr "$nmerr"
       nm_ldstack=""
       [ "$(uname -s)" = "Darwin" ] && nm_ldstack="-Wl,-stack_size,0x8000000"
@@ -2035,12 +2051,14 @@ compile_to_binary() {
       fi
       return 0
     fi
-    # native-modular did not produce objects. A kaic2 without libLLVM prints the
-    # known sentinel — fall through to the whole-program native path below, which
-    # degrades to C. Any other failure is a real error we surface there too, so
-    # the whole-program path re-runs the compile and reports it verbatim.
+    # native-modular produced no objects. Only a kaic2 without libLLVM
+    # (known sentinel) falls through to the whole-program path below, which
+    # degrades to C. Any other failure is the user's compile error: falling
+    # through would recompile it and print every diagnostic a second time.
     if ! grep -q "not built into this compiler" "$nmerr" 2>/dev/null; then
+      diag_rewrite_entry_path "$nmerr" "$nm_dir/$src_base" "$nm_abs"
       cat "$nmerr" >&2
+      exit 1
     fi
   fi
   if [ "$backend" = "native" ]; then
@@ -2141,9 +2159,11 @@ compile_to_binary() {
         cat "$nerr" >&2
         exit 2
       fi
+      diag_rewrite_entry_path "$nerr" "$tmp/$src_base" "$dbg_src"
       cat "$nerr" >&2
       exit 1
     fi
+    diag_rewrite_entry_path "$nerr" "$tmp/$src_base" "$dbg_src"
     emit_compiler_stderr "$nerr"
     if [ ! -f "$obj" ]; then
       die "native backend: no object produced (expected $obj)"
@@ -3527,7 +3547,10 @@ watch_run_once() {
   src="$1"; tmp="$2"; backend="$3"; backend_origin="$4"
   bin="$tmp/$(basename "$src" .kai)"
   ts="$(date '+%H:%M:%S')"
-  if compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$src" "$tmp" "$bin" "watch" 2>"$tmp/err"; then
+  # The native paths report a compile error by `exit`ing rather than
+  # returning, so the build runs in a subshell: otherwise the first broken
+  # save kills the watcher instead of reporting it.
+  if ( compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$src" "$tmp" "$bin" "watch" ) 2>"$tmp/err"; then
     emit_compiler_stderr "$tmp/err"
     printf '\n[%s] Build OK\n' "$ts"
     "$bin" || printf '\n[%s] Program exited with status %d\n' "$ts" "$?"
