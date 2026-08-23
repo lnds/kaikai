@@ -15,32 +15,36 @@
 # data layout — correct by construction. It is NOT committed (.gitignore'd);
 # `make` regenerates it whenever its inputs change.
 #
-# WHY clang 18, GATED. The in-process parser is libLLVM 18 (the version
-# kaic2 statically links). LLVM's bitcode rule is writer <= reader: a .bc
-# from a NEWER clang (Apple clang 21, Homebrew clang 22) fails to parse with
-# `Unknown attribute kind` / `expected type`. So this script REFUSES to
-# generate from any clang that is not major 18 — better no .bc (P2 opts out,
+# WHY THE WRITER MATCHES THE READER, GATED. The in-process parser is the
+# libLLVM kaic2 links, which the build resolves through `llvm-config` — not
+# a fixed version. LLVM's bitcode rule is writer <= reader: a .bc from a
+# NEWER clang fails to parse (`Unknown attribute kind` / `expected type`).
+# An OLDER writer parses but is not free either — the reader then warns once
+# per function about target features its version renamed or retired
+# (`'+zcm' is not a recognized feature`), and that lands on the user's
+# stderr on every native build. So this script generates only from a clang
+# whose major MATCHES the resolved llvm-config — better no .bc (P2 opts out,
 # the build falls back to linking runtime_llvm.c with cc: same behaviour,
-# just no inlining) than an unparseable one that breaks the native build.
+# just no inlining) than one that breaks or spams the native build.
 #
 # USAGE
 #   tools/gen-runtime-bc.sh                 # (re)generate if stale; no-op if fresh
 #   tools/gen-runtime-bc.sh --force         # always regenerate
 #   tools/gen-runtime-bc.sh --status        # machine state (see below); exit 0
 #   tools/gen-runtime-bc.sh --status-line   # same state as one human line + remedy
-#   tools/gen-runtime-bc.sh --clang         # the resolved clang 18; exit 1 if none
-#   CLANG18=/path/to/clang-18 tools/gen-runtime-bc.sh
+#   tools/gen-runtime-bc.sh --clang         # the resolved clang; exit 1 if none
+#   CLANG18=/path/to/clang tools/gen-runtime-bc.sh   # explicit override
 #
 # THREE STATES, NOT TWO. "optout" alone hides whether the host CAN run P2:
-# a host with clang 18 and no .bc is one `make` away from active, while a
-# host without clang 18 needs an install. --status prints
+# a host with a matching clang and no .bc is one `make` away from active,
+# while a host without one needs an install. --status prints
 #   active                 the .bc is fresh; the native link inlines the runtime
-#   optout needs-regen     clang 18 resolvable, .bc missing or stale
-#   optout no-clang18      no clang 18 on this host
+#   optout needs-regen     matching clang resolvable, .bc missing or stale
+#   optout no-clang18      no clang matching the reader on this host
 # The first word keeps the original active/optout vocabulary, so callers that
 # test it are unaffected by the added reason field.
 #
-# EXIT: 0 on success OR clean opt-out (no clang 18). Non-zero only on a real
+# EXIT: 0 on success OR clean opt-out (no matching clang). Non-zero only on a real
 # generation error (clang present but the compile failed). The build treats
 # a missing .bc as "P2 off", never as a hard failure — except the release /
 # CI job, which asserts P2 is active where it MUST be (see the release
@@ -78,22 +82,64 @@ else
   echo "gen-runtime-bc: neither sha256sum nor shasum found; cannot compute the staleness stamp." >&2
   exit 2
 fi
+# The writer's identity is part of the key: a host that changes clang (or
+# whose llvm-config moves to another major) must re-emit, or it keeps
+# linking a bitcode written for a different LLVM.
 input_hash() {
-  $SHA256 "$RUNTIME_C" "$RUNTIME_H" | $SHA256 | awk '{print $1}'
+  { $SHA256 "$RUNTIME_C" "$RUNTIME_H"
+    printf '%s\n' "$(resolve_clang 2>/dev/null || echo none)"
+    printf '%s\n' "$(clang_major "$(resolve_clang 2>/dev/null || echo false)" 2>/dev/null || echo 0)"
+  } | $SHA256 | awk '{print $1}'
 }
 
+clang_major() {
+  "$1" --version 2>/dev/null | sed -n '1s/.*version \([0-9]*\)\..*/\1/p'
+}
+
+# The major version of the libLLVM kaic2 links — the READER of this
+# bitcode. `llvm-config` is what stage2/Makefile probes to decide the
+# native backend, so it is the same LLVM the in-process parser will be.
+reader_major() {
+  _rm_cfg="${LLVM_CONFIG:-llvm-config}"
+  command -v "$_rm_cfg" >/dev/null 2>&1 || return 1
+  "$_rm_cfg" --version 2>/dev/null | sed -n '1s/^\([0-9]*\)\..*/\1/p'
+}
+
+# The writer must MATCH the reader, not a fixed version. LLVM's rule is
+# writer <= reader, but a writer OLDER than the reader still costs: the
+# reader warns once per function about target features that version
+# renamed or retired (`'+zcm' is not a recognized feature`), which lands
+# on the user's stderr for every native build. Same major on both sides
+# is the only combination that is both parseable and quiet.
+#
+# CLANG18 stays honoured as an explicit override (the historical name;
+# it pins whichever clang the caller names). Otherwise: the clang paired
+# with the resolved llvm-config first, then the version-suffixed and
+# generic candidates, accepting the first whose major matches the
+# reader's. Without a reader (no llvm-config → no native backend, so no
+# bitcode consumer) any clang is as good as none, so the search falls
+# back to the historical 18.
 resolve_clang() {
   if [ -n "${CLANG18:-}" ]; then echo "$CLANG18"; return 0; fi
+  _rc_want="$(reader_major || true)"
+  [ -n "$_rc_want" ] || _rc_want=18
+  _rc_paired=""
+  if command -v "${LLVM_CONFIG:-llvm-config}" >/dev/null 2>&1; then
+    _rc_paired="$("${LLVM_CONFIG:-llvm-config}" --bindir 2>/dev/null)/clang"
+  fi
   for c in \
-    /opt/homebrew/opt/llvm@18/bin/clang \
-    /usr/local/opt/llvm@18/bin/clang \
-    clang-18 \
-    /usr/lib/llvm-18/bin/clang \
+    "$_rc_paired" \
+    "clang-$_rc_want" \
+    "/opt/homebrew/opt/llvm@$_rc_want/bin/clang" \
+    "/usr/local/opt/llvm@$_rc_want/bin/clang" \
+    "/usr/lib/llvm-$_rc_want/bin/clang" \
+    clang \
     cc
   do
-    if command -v "$c" >/dev/null 2>&1; then
-      v="$("$c" --version 2>/dev/null | sed -n '1s/.*version \([0-9]*\)\..*/\1/p')"
-      if [ "$v" = "18" ]; then echo "$c"; return 0; fi
+    [ -n "$c" ] || continue
+    if command -v "$c" >/dev/null 2>&1 && [ "$(clang_major "$c")" = "$_rc_want" ]; then
+      echo "$c"
+      return 0
     fi
   done
   return 1
@@ -120,9 +166,9 @@ p2_status_line() {
     active)
       echo "ACTIVE (the native link inlines the runtime before O2)" ;;
     "optout needs-regen")
-      echo "OPTOUT: bitcode not generated, but clang 18 IS installed ($(resolve_clang || true)) — heap-bound native code runs several times slower than CI's until you run: make KAI_LLVM=1 kaic2" ;;
+      echo "OPTOUT: bitcode not generated, but a matching clang IS installed ($(resolve_clang || true)) — heap-bound native code runs several times slower than CI's until you run: make KAI_LLVM=1 kaic2" ;;
     *)
-      echo "OPTOUT: no clang 18 on this host — heap-bound native code runs several times slower than CI's; install one: brew install llvm@18 / apt-get install clang-18" ;;
+      echo "OPTOUT: no clang matching the libLLVM kaic2 links (major $(reader_major || echo 18)) on this host — heap-bound native code runs several times slower than CI's; install one: brew install llvm@$(reader_major || echo 18) / apt-get install clang-$(reader_major || echo 18)" ;;
   esac
 }
 
@@ -131,17 +177,18 @@ case "$mode" in
   --status-line) p2_status_line; exit 0 ;;
   # The resolved clang, for tools that must reach the matching llvm-* binaries
   # (bitcode readers are version-locked to their writer). Empty + exit 1 when
-  # there is none, so a caller can tell "no clang 18" from a resolution.
+  # there is none, so a caller can tell "no matching clang" from a resolution.
   --clang)       resolve_clang || exit 1; exit 0 ;;
 esac
 
 CLANG="$(resolve_clang || true)"
 if [ -z "$CLANG" ]; then
-  # No clang 18 — clean opt-out. Drop any stale .bc so the native link does
+  # No matching clang — clean opt-out. Drop any stale .bc so the native link does
   # not pick up a runtime that no longer matches the sources.
   rm -f "$BC_OUT" "$BC_INLINE" "$STAMP"
-  echo "gen-runtime-bc: no clang 18 found; native P2 bitcode disabled (build falls back to cc-links-runtime_llvm.c)." >&2
-  echo "gen-runtime-bc:   install one to enable P2 — brew install llvm@18  /  apt-get install clang-18" >&2
+  _need="$(reader_major || echo 18)"
+  echo "gen-runtime-bc: no clang $_need found (must match the libLLVM kaic2 links); native P2 bitcode disabled (build falls back to cc-links-runtime_llvm.c)." >&2
+  echo "gen-runtime-bc:   install one to enable P2 — brew install llvm@$_need  /  apt-get install clang-$_need" >&2
   exit 0
 fi
 

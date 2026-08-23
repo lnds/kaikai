@@ -282,7 +282,8 @@ operand is never `decref`'d, so a multi-use Int never double-frees. The
 > not an `available_externally` graft — so the object is self-contained and
 > the cc link line DROPS `runtime_llvm.c` (it does NOT stay identical; the
 > literal "identical" reading was the unsound double-source one). (2) The
-> bitcode is generated at BUILD TIME per-platform (clang-18, version-gated),
+> bitcode is generated at BUILD TIME per-platform (by a clang whose major
+> matches the libLLVM kaic2 links, version-gated),
 > NOT vendored — a single committed `.bc` mis-codegens across Mach-O/ELF
 > because it encodes the build host's data layout. Measured: `list_fold`
 > 1.21× and `rbtree` 1.05× faster than legacy native; `bl`-to-`kaix_*` per
@@ -326,9 +327,11 @@ bin/kai --version                       # `native p2:` field
 benchmarks/mn-throughput/run.sh         # `p2:` line in the environment banner
 ```
 
-`optout needs-regen` means clang 18 resolves but the `.bc` was never built —
-one `make KAI_LLVM=1 kaic2` away from active. `optout no-clang18` needs an
-install. Distinguishing the two is what keeps a recoverable state from being
+`optout needs-regen` means a matching clang resolves but the `.bc` was never
+built — one `make KAI_LLVM=1 kaic2` away from active. `optout no-clang18`
+needs an install. "Matching" is the writer/reader pairing: the bitcode must be
+written by the same LLVM major that reads it, or the reader warns once per
+function about target features its version retired, on every native build. Distinguishing the two is what keeps a recoverable state from being
 read as a native-codegen defect.
 
 ### P3 — alloca-everything → mem2reg · **do not pursue** (correctly not pursued)
