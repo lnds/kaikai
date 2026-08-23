@@ -16,7 +16,6 @@ file the user wrote.
 import compiler.ast
 import compiler.diag
 import compiler.diag_file
-import compiler.expr_positions
 import compiler.fnreg
 import compiler.infer
 import compiler.parse
@@ -45,17 +44,92 @@ fn ic_decl(d: Decl, df: DiagFiles, acc: Int) : Int / Console + File = match d {
   _ -> acc
 }
 
-fn ic_expr(e: Expr, file: String, acc: Int) : Int / Console + File = {
-  let a1 = match e.kind {
-    EStr(span, is_triple) -> ic_span(span, is_triple, file, e.line, e.col, acc)
-    _ -> acc
-  }
-  ic_positions(xp_positions(e), file, a1)
+fn ic_expr(e: Expr, file: String, acc: Int) : Int / Console + File = match e.kind {
+  EStr(span, is_triple) -> ic_span(span, is_triple, file, e.line, e.col, acc)
+  k -> ic_kids(k, file, acc)
 }
 
-fn ic_positions(ps: [XPos], file: String, acc: Int) : Int / Console + File = match ps {
+# The descent enumerates children directly rather than through
+# `xp_positions`: that table materialises a fresh `[XPos]` per node, and
+# a whole-program scan visits two orders of magnitude more nodes than it
+# finds interpolations, so the array is allocated and dropped unread.
+fn ic_kids(k: ExprKind, file: String, acc: Int) : Int / Console + File = match k {
+  ECall(f, xs)          -> ic_exprs(xs, file, ic_expr(f, file, acc))
+  EField(x, _)          -> ic_expr(x, file, acc)
+  EIndex(a, b)          -> ic_expr(b, file, ic_expr(a, file, acc))
+  EBinop(_, a, b)       -> ic_expr(b, file, ic_expr(a, file, acc))
+  EUnop(_, x)           -> ic_expr(x, file, acc)
+  EIf(c, t_, eo)        -> ic_expr_opt(eo, file, ic_expr(t_, file, ic_expr(c, file, acc)))
+  EMatch(scr, arms)     -> ic_arms(arms, file, ic_expr(scr, file, acc))
+  ELambda(_, b)         -> ic_expr(b, file, acc)
+  ERecordLit(_, fs)     -> ic_fields(fs, file, acc)
+  EList(els)            -> ic_elems(els, file, acc)
+  ERange(a, b, st)      -> ic_expr_opt(st, file, ic_expr(b, file, ic_expr(a, file, acc)))
+  EBlock(ss, tail)      -> ic_expr_opt(tail, file, ic_stmts(ss, file, acc))
+  EPipe(a, b)           -> ic_expr(b, file, ic_expr(a, file, acc))
+  EMapPipe(a, b)        -> ic_expr(b, file, ic_expr(a, file, acc))
+  EFlatMapPipe(a, b)    -> ic_expr(b, file, ic_expr(a, file, acc))
+  EFilterPipe(a, b)     -> ic_expr(b, file, ic_expr(a, file, acc))
+  EHandle(body, _, _, init, _, cs, ret) ->
+    ic_hreturn_opt(ret, file, ic_hclauses(cs, file, ic_expr_opt(init, file, ic_expr(body, file, acc))))
+  ELitUnit(inner, _)    -> ic_expr(inner, file, acc)
+  EBang(inner)          -> ic_expr(inner, file, acc)
+  EIntrinsic(_, xs)     -> ic_exprs(xs, file, acc)
+  ESurface(sf)          -> ic_exprs(surface_children(sf), file, acc)
+  _ -> acc
+}
+
+fn ic_exprs(es: [Expr], file: String, acc: Int) : Int / Console + File = match es {
   [] -> acc
-  [XP(_, child), ...rest] -> ic_positions(rest, file, ic_expr(child, file, acc))
+  [h, ...rest] -> ic_exprs(rest, file, ic_expr(h, file, acc))
+}
+
+fn ic_expr_opt(o: Option[Expr], file: String, acc: Int) : Int / Console + File = match o {
+  None    -> acc
+  Some(x) -> ic_expr(x, file, acc)
+}
+
+fn ic_arms(arms: [Arm], file: String, acc: Int) : Int / Console + File = match arms {
+  [] -> acc
+  [Arm(_, g, body), ...rest] -> ic_arms(rest, file, ic_expr(body, file, ic_expr_opt(g, file, acc)))
+}
+
+fn ic_fields(fs: [FieldInit], file: String, acc: Int) : Int / Console + File = match fs {
+  [] -> acc
+  [FI(_, e), ...rest] -> ic_fields(rest, file, ic_expr(e, file, acc))
+}
+
+fn ic_elems(els: [ListElem], file: String, acc: Int) : Int / Console + File = match els {
+  [] -> acc
+  [h, ...rest] -> ic_elems(rest, file, match h {
+    ElPlain(e)  -> ic_expr(e, file, acc)
+    ElSpread(e) -> ic_expr(e, file, acc)
+  })
+}
+
+fn ic_stmts(ss: [Stmt], file: String, acc: Int) : Int / Console + File = match ss {
+  [] -> acc
+  [h, ...rest] -> ic_stmts(rest, file, ic_stmt(h, file, acc))
+}
+
+fn ic_stmt(s: Stmt, file: String, acc: Int) : Int / Console + File = match s {
+  SLet(_, _, rhs)              -> ic_expr(rhs, file, acc)
+  SAssert(c, m)                -> ic_expr_opt(m, file, ic_expr(c, file, acc))
+  SExprStmt(e)                 -> ic_expr(e, file, acc)
+  SIndexAssign(a, i, v, _, _)  -> ic_expr(v, file, ic_expr(i, file, ic_expr(a, file, acc)))
+  SAssign(l, v, _, _)          -> ic_expr(v, file, ic_expr(l, file, acc))
+  SVar(_, _, init, _, _)       -> ic_expr(init, file, acc)
+  SUse(_, _, _)                -> acc
+}
+
+fn ic_hclauses(cs: [HClause], file: String, acc: Int) : Int / Console + File = match cs {
+  [] -> acc
+  [HC(_, _, body, _, _), ...rest] -> ic_hclauses(rest, file, ic_expr(body, file, acc))
+}
+
+fn ic_hreturn_opt(o: Option[HReturn], file: String, acc: Int) : Int / Console + File = match o {
+  None -> acc
+  Some(HR(_, body, _, _)) -> ic_expr(body, file, acc)
 }
 
 fn ic_span(span: String, is_triple: Bool, file: String,
