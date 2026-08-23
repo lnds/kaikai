@@ -19,6 +19,10 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the cache keys carry the
+# edition, so this fixture must exercise the one the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 PROJ="$(mktemp -d)"
 ENTRYDIR="$(mktemp -d)"
 trap 'rm -rf "$PROJ" "$ENTRYDIR"' EXIT INT TERM
@@ -52,7 +56,7 @@ blob_count() { find "$PROJ/.kai-cache" -maxdepth 1 -name 'tm-*.kab' 2>/dev/null 
 
 build() {
   out="$1"; shift
-  if ! "$KAIC2" "$@" --path "$PROJ" "$ENTRYDIR/main.kai" > "$out" 2>"$PROJ/err"; then
+  if ! "$KAIC2" $EDITION_FLAG "$@" --path "$PROJ" "$ENTRYDIR/main.kai" > "$out" 2>"$PROJ/err"; then
     echo "typedc_cut_native_entry_copy: FAIL — build exited non-zero ($*)"
     cat "$PROJ/err"
     exit 1

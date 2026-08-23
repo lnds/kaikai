@@ -17,6 +17,10 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the repo's EDITION is what
+# this gate must exercise.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 STDLIB="$ROOT/stdlib"
 FAIL=0
 
@@ -25,7 +29,7 @@ check() {
   fixture="$1"
   eff="$2"
   name=$(basename "$fixture" .kai)
-  c=$("$KAIC2" --path "$STDLIB" "$fixture" 2>/dev/null) || {
+  c=$("$KAIC2" $EDITION_FLAG --path "$STDLIB" "$fixture" 2>/dev/null) || {
     echo "GATE FAIL $name: kaic2 errored"; FAIL=1; return
   }
   walk=$(printf '%s' "$c" | grep -c "kai_evidence_lookup_node(\"$eff\")" || true)

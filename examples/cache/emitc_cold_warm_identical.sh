@@ -23,6 +23,10 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the cache keys carry the
+# edition, so this fixture must exercise the one the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 STDLIB="$ROOT/stdlib"
 PROJ="$(mktemp -d)"
 trap 'rm -rf "$PROJ"' EXIT INT TERM
@@ -65,11 +69,11 @@ CACHE="$PROJ/core-cache"
 mkdir -p "$CACHE"
 
 # Oracle: no cache flags — the core is emitted fresh.
-"$KAIC2" --emit=c-modular --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" \
+"$KAIC2" $EDITION_FLAG --emit=c-modular --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" \
   > "$PROJ/oracle.stream" 2>/dev/null
 
 # Cold: empty cache -> emit-cache miss, entry written.
-"$KAIC2" --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
+"$KAIC2" $EDITION_FLAG --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
   --core-cache-stats --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" \
   > "$PROJ/cold.stream" 2> "$PROJ/cold.err"
 grep -q "core-emit-cache: miss" "$PROJ/cold.err" || {
@@ -77,7 +81,7 @@ grep -q "core-emit-cache: miss" "$PROJ/cold.err" || {
   cat "$PROJ/cold.err"; exit 1; }
 
 # Warm: entry present -> hit, core TU bodies spliced.
-"$KAIC2" --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
+"$KAIC2" $EDITION_FLAG --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
   --core-cache-stats --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" \
   > "$PROJ/warm.stream" 2> "$PROJ/warm.err"
 grep -q "core-emit-cache: hit" "$PROJ/warm.err" || {
@@ -92,7 +96,7 @@ cmp -s "$PROJ/warm.stream" "$PROJ/oracle.stream" || {
   exit 1; }
 
 # A different toolchain id must miss: never splice another build's C.
-"$KAIC2" --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid2 \
+"$KAIC2" $EDITION_FLAG --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid2 \
   --core-cache-stats --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" \
   > /dev/null 2> "$PROJ/tid2.err"
 grep -q "core-emit-cache: miss" "$PROJ/tid2.err" || {
@@ -101,7 +105,7 @@ grep -q "core-emit-cache: miss" "$PROJ/tid2.err" || {
 
 # A body-only edit keeps the surface key: the hot rebuild loop hits.
 sed 's/"light"/"lighter"/' "$PROJ/main.kai" > "$PROJ/edited.kai"
-"$KAIC2" --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
+"$KAIC2" $EDITION_FLAG --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
   --core-cache-stats --path "$STDLIB" --path "$PROJ" "$PROJ/edited.kai" \
   > /dev/null 2> "$PROJ/edited.err"
 grep -q "core-emit-cache: hit" "$PROJ/edited.err" || {
@@ -121,7 +125,7 @@ impl Eq for Shade {
   }
 }
 EOF
-"$KAIC2" --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
+"$KAIC2" $EDITION_FLAG --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
   --core-cache-stats --path "$STDLIB" --path "$PROJ" "$PROJ/impl_added.kai" \
   > /dev/null 2> "$PROJ/impl.err"
 grep -q "core-emit-cache: miss" "$PROJ/impl.err" || {
@@ -129,7 +133,7 @@ grep -q "core-emit-cache: miss" "$PROJ/impl.err" || {
   cat "$PROJ/impl.err"; exit 1; }
 
 # A test-shaped build must not consult the emit cache (bmode gating).
-"$KAIC2" --emit=c-modular --test --core-cache-dir "$CACHE" --toolchain-id tid1 \
+"$KAIC2" $EDITION_FLAG --emit=c-modular --test --core-cache-dir "$CACHE" --toolchain-id tid1 \
   --core-cache-stats --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" \
   > /dev/null 2> "$PROJ/test.err" || true
 grep -q "core-emit-cache: off" "$PROJ/test.err" || {

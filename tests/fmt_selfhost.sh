@@ -31,6 +31,10 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
 
+# A flagless kaic2 runs the oldest edition; fmt reproduces the surface
+# of the edition the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
+
 # Known non-idempotent files, each tagged with its tracking issue.
 # Empty today (#785's trailing-comment edge was fixed in #788).
 SKIP=""
@@ -66,7 +70,7 @@ for abs in $corpus; do
   p2="$tmp/$n.p2"
   err="$tmp/$n.err"
 
-  if ! "$KAIC2" --fmt "$abs" > "$p1" 2> "$err"; then
+  if ! "$KAIC2" $EDITION_FLAG --fmt "$abs" > "$p1" 2> "$err"; then
     echo "  FAIL $rel — fmt refused:"
     sed 's/^/      /' "$err"
     fail=$((fail + 1))
@@ -79,7 +83,7 @@ for abs in $corpus; do
     continue
   fi
 
-  if ! "$KAIC2" --fmt "$p1" > "$p2" 2> "$err"; then
+  if ! "$KAIC2" $EDITION_FLAG --fmt "$p1" > "$p2" 2> "$err"; then
     echo "  FAIL $rel — fmt refused on second pass:"
     sed 's/^/      /' "$err"
     fail=$((fail + 1))

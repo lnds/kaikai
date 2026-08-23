@@ -1,5 +1,13 @@
 .PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-negative test-stage1-rejections test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily coverage-probe rc-budget stress-fixtures test-posix-shell
 
+# A bare kaic2 with no `--edition` runs the OLDEST edition (tongariki),
+# so a recipe driving the binary directly would test the previous
+# surface while `bin/kai` tests the current one. $(KAIC2) is the binary
+# already carrying the flag.
+KAI_EDITION  := $(shell cat EDITION)
+EDITION_FLAG := --edition $(KAI_EDITION)
+KAIC2        := ./stage2/kaic2 $(EDITION_FLAG)
+
 all: kaic1 kaic2 bin/kai
 
 kaic0:
@@ -224,7 +232,7 @@ test-rboxed-prim-scope: kaic1 kaic2
 	if grep -q 'kai_op_ne_v(kai_ntag,' $$tmp/s1.c; then \
 	  echo "rboxed-prim FAIL kaic1: raw (Perceus-exempt) llvm_backend_tag binder in a consuming slot"; exit 1; \
 	fi; \
-	./stage2/kaic2 --path stdlib --backend=c examples/perceus/rboxed_prim_shared_let_1648.kai > $$tmp/s2.c; \
+	$(KAIC2) --path stdlib --backend=c examples/perceus/rboxed_prim_shared_let_1648.kai > $$tmp/s2.c; \
 	grep -q 'kai_op_ne_v(kai_internal_dup(kaiv_ntag)' $$tmp/s2.c \
 	  || { echo "rboxed-prim FAIL kaic2: comparator read of the llvm_backend_tag binder lost its dup"; exit 1; }; \
 	if grep -q 'kai_op_ne_v(kaiv_ntag,' $$tmp/s2.c; then \
@@ -245,7 +253,7 @@ test-rboxed-prim-scope: kaic1 kaic2
 test-kai-namespace: kaic2
 	@set -e; \
 	tmp=$$(mktemp -d); trap "rm -rf $$tmp" EXIT; \
-	( cd stage2 && ./kaic2 main.kai ) > $$tmp/self.c; \
+	( cd stage2 && ./kaic2 $(EDITION_FLAG) main.kai ) > $$tmp/self.c; \
 	perl -pe 's/"(?:[^"\\]|\\.)*"//g' $$tmp/self.c \
 	  | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/emitted.txt; \
 	tr -c 'A-Za-z0-9_' '\n' < stage2/runtime.h | grep -E '^kai_' | sort -u > $$tmp/runtime.txt; \
@@ -254,7 +262,7 @@ test-kai-namespace: kaic2
 	rev=$$(tr -c 'A-Za-z0-9_' '\n' < stage2/runtime.h | grep -E '^(kaiu_|kaiv_)' | sort -u); \
 	[ -z "$$rev" ] || { echo "test-kai-namespace FAIL: runtime.h names symbols inside the user namespaces:"; echo "$$rev"; exit 1; }; \
 	fx=examples/namespace-collisions/adv_name_internal_prefix; \
-	( cd stage2 && ./kaic2 ../$$fx/main.kai ) > $$tmp/adv.c; \
+	( cd stage2 && ./kaic2 $(EDITION_FLAG) ../$$fx/main.kai ) > $$tmp/adv.c; \
 	perl -pe 's/"(?:[^"\\]|\\.)*"//g' $$tmp/adv.c \
 	  | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/adv-emitted.txt; \
 	leaks=$$(comm -23 $$tmp/adv-emitted.txt $$tmp/runtime.txt); \
@@ -861,7 +869,7 @@ test-library-mode: kaic2
 	  src="examples/library_mode/$$fx.kai"; \
 	  exp="examples/library_mode/$$fx.out.expected"; \
 	  out=$$(mktemp); \
-	  "$$root/stage2/kaic2" --library-mode "$$src" > "$$out" 2>/dev/null \
+	  "$$root/stage2/kaic2" $(EDITION_FLAG) --library-mode "$$src" > "$$out" 2>/dev/null \
 	    || { echo "library-mode $$fx FAIL (kaic2 exit)"; rm -f "$$out"; exit 1; }; \
 	  diff -q "$$exp" "$$out" > /dev/null \
 	    || { echo "library-mode $$fx DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
@@ -871,7 +879,7 @@ test-library-mode: kaic2
 	src="examples/library_mode/def_at_imports.kai"; \
 	exp="examples/library_mode/def_at_imports.out.expected"; \
 	out=$$(mktemp); \
-	"$$root/stage2/kaic2" --path examples/library_mode --library-mode "$$src" > "$$out" 2>/dev/null \
+	"$$root/stage2/kaic2" $(EDITION_FLAG) --path examples/library_mode --library-mode "$$src" > "$$out" 2>/dev/null \
 	  || { echo "library-mode def_at_imports FAIL (kaic2 exit)"; rm -f "$$out"; exit 1; }; \
 	diff -q "$$exp" "$$out" > /dev/null \
 	  || { echo "library-mode def_at_imports DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
@@ -914,7 +922,7 @@ test-diagnostics-collected: kaic2
 	  src="examples/library_mode/$$fx.kai"; \
 	  exp="examples/library_mode/$$fx.diags.expected"; \
 	  out=$$(mktemp); \
-	  "$$root/stage2/kaic2" --diags-json "$$src" > "$$out" 2>/dev/null \
+	  "$$root/stage2/kaic2" $(EDITION_FLAG) --diags-json "$$src" > "$$out" 2>/dev/null \
 	    || { echo "diags-collected $$fx FAIL (kaic2 exit)"; rm -f "$$out"; exit 1; }; \
 	  diff -q "$$exp" "$$out" > /dev/null \
 	    || { echo "diags-collected $$fx DIFF"; diff "$$exp" "$$out"; rm -f "$$out"; exit 1; }; \
@@ -1171,7 +1179,7 @@ stress-fixtures: kaic2
 	for f in examples/effects/interp_recursive_walk.kai \
 	         examples/effects/m4c_flow_through.kai; do \
 	  name=$$(basename $$f .kai); \
-	  stage2/kaic2 $$f > /tmp/stress-$$name.c 2> /tmp/stress-$$name.err \
+	  stage2/kaic2 $(EDITION_FLAG) $$f > /tmp/stress-$$name.c 2> /tmp/stress-$$name.err \
 	    || { echo "stress FAIL $$name (kaic2 errored)"; cat /tmp/stress-$$name.err; exit 1; }; \
 	  cc -std=c99 -I stage2 -I stage0 /tmp/stress-$$name.c -o /tmp/stress-$$name -lm 2>> /tmp/stress-$$name.err \
 	    || { echo "stress FAIL $$name (cc errored)"; cat /tmp/stress-$$name.err; exit 1; }; \
@@ -1190,7 +1198,7 @@ coverage-probe:
 # docs/perceus-honesty-targets.md. Today the threshold is "no
 # regression from 46.9 M leaked".
 rc-budget: kaic2
-	@KAI_TRACE_RC=1 KAI_THREADS=1 stage2/kaic2 stage2/compiler.kai > /dev/null 2> /tmp/rc.log; \
+	@KAI_TRACE_RC=1 KAI_THREADS=1 stage2/kaic2 $(EDITION_FLAG) stage2/compiler.kai > /dev/null 2> /tmp/rc.log; \
 	leaked=$$(grep -E "alloc_total" /tmp/rc.log | head -1 | sed 's/.*leaked=\([0-9]*\).*/\1/'); \
 	if [ -z "$$leaked" ]; then \
 	  echo "rc-budget SKIP — KAI_TRACE_RC trace empty (kaic2 not built with trace)"; \

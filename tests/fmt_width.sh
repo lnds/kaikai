@@ -44,6 +44,10 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; fmt reproduces the surface
+# of the edition the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 REPORT="$ROOT/tools/fmt-width-report.sh"
 BASELINE="$ROOT/tools/fmt-width-baseline.txt"
 CORPUS="$ROOT/examples/fmt/width"
@@ -72,7 +76,7 @@ fail=0
 # report table reads as the corpus does.
 for input in "$CORPUS"/*.input.kai; do
   name=$(basename "$input" .input.kai)
-  if ! "$KAIC2" --path "$ROOT/stdlib" --fmt "$input" > "$tmp/$name.kai" 2> "$tmp/err"; then
+  if ! "$KAIC2" $EDITION_FLAG --path "$ROOT/stdlib" --fmt "$input" > "$tmp/$name.kai" 2> "$tmp/err"; then
     echo "  FAIL $name — fmt refused a width fixture:"
     sed 's/^/      /' "$tmp/err"
     fail=$((fail + 1))
@@ -148,7 +152,7 @@ mkdir -p "$tmp/narrow"
 ncollapse=0
 for input in "$CORPUS"/*.input.kai; do
   name=$(basename "$input" .input.kai)
-  "$KAIC2" --path "$ROOT/stdlib" --fmt-width "$narrow" --fmt "$input" > "$tmp/narrow/$name.kai" 2>/dev/null || true
+  "$KAIC2" $EDITION_FLAG --path "$ROOT/stdlib" --fmt-width "$narrow" --fmt "$input" > "$tmp/narrow/$name.kai" 2>/dev/null || true
   in_lines=$(wc -l < "$input" | tr -d ' ')
   out_lines=$(wc -l < "$tmp/narrow/$name.kai" | tr -d ' ')
   lost=$((in_lines - out_lines))
@@ -168,8 +172,8 @@ probe="$CORPUS/call_args.input.kai"
 mkdir -p "$tmp/pkg/src"
 printf 'name = "w"\nversion = "0.1.0"\n\n[fmt]\nwidth = 60\n' > "$tmp/pkg/kai.toml"
 cp "$probe" "$tmp/pkg/src/a.kai"
-"$KAIC2" --fmt-width 60 --fmt "$probe" > "$tmp/want60.kai"
-"$KAIC2" --fmt-width 120 --fmt "$probe" > "$tmp/want120.kai"
+"$KAIC2" $EDITION_FLAG --fmt-width 60 --fmt "$probe" > "$tmp/want60.kai"
+"$KAIC2" $EDITION_FLAG --fmt-width 120 --fmt "$probe" > "$tmp/want120.kai"
 # --check on a canonical file prints nothing (check-clean), so the
 # plumbing probes drive the in-place rewrite path instead: write-back
 # only fires when the width actually reached kaic2.

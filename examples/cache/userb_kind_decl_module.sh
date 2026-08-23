@@ -14,6 +14,10 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the cache keys carry the
+# edition, so this fixture must exercise the one the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 PROJ="$(mktemp -d)"
 trap 'rm -rf "$PROJ"' EXIT INT TERM
 
@@ -37,14 +41,14 @@ EOF
 mkdir -p "$PROJ/.kai-cache"
 
 # Oracle: cache disabled.
-"$KAIC2" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/oracle.c" 2>/dev/null
+"$KAIC2" $EDITION_FLAG --path "$PROJ" "$PROJ/main.kai" > "$PROJ/oracle.c" 2>/dev/null
 
 # Cold: cache enabled, empty cache -> miss, module blob written.
 rm -f "$PROJ/.kai-cache/"*.kab 2>/dev/null || true
-"$KAIC2" --user-cache --path "$PROJ" "$PROJ/main.kai" > "$PROJ/cold.c" 2>/dev/null
+"$KAIC2" $EDITION_FLAG --user-cache --path "$PROJ" "$PROJ/main.kai" > "$PROJ/cold.c" 2>/dev/null
 
 # Warm: cache enabled, blob present -> hit, parse skipped.
-"$KAIC2" --user-cache --path "$PROJ" "$PROJ/main.kai" > "$PROJ/warm.c" 2>/dev/null
+"$KAIC2" $EDITION_FLAG --user-cache --path "$PROJ" "$PROJ/main.kai" > "$PROJ/warm.c" 2>/dev/null
 
 if ! cmp -s "$PROJ/cold.c" "$PROJ/oracle.c"; then
   echo "userb_kind_decl_module FAIL — cold-cache C differs from no-cache oracle"

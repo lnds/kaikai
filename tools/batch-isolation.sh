@@ -20,6 +20,10 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 KAIC2="${KAIC2:-$ROOT/stage2/kaic2}"
+
+# A flagless kaic2 runs the oldest edition; the repo's EDITION is what
+# this gate must exercise.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 STDLIB="${STDLIB:-$ROOT/stdlib}"
 A="$ROOT/examples/oracle/lane4/file_a.kai"
 B="$ROOT/examples/oracle/lane4/file_b.kai"
@@ -32,12 +36,12 @@ if [ ! -x "$KAIC2" ]; then
 fi
 
 # Standalone .c (the reference). kaic2 prints the .c to stdout.
-"$KAIC2" --path "$STDLIB" "$A" > "$WORK/a_alone.c" 2>/dev/null
-"$KAIC2" --path "$STDLIB" "$B" > "$WORK/b_alone.c" 2>/dev/null
+"$KAIC2" $EDITION_FLAG --path "$STDLIB" "$A" > "$WORK/a_alone.c" 2>/dev/null
+"$KAIC2" $EDITION_FLAG --path "$STDLIB" "$B" > "$WORK/b_alone.c" 2>/dev/null
 
 # Batch .c (both in one process).
 printf '%s\t%s\n%s\t%s\n' "$A" "$WORK/a_batch.c" "$B" "$WORK/b_batch.c" > "$WORK/iso.list"
-"$KAIC2" --path "$STDLIB" --batch-list "$WORK/iso.list" >/dev/null 2>&1
+"$KAIC2" $EDITION_FLAG --path "$STDLIB" --batch-list "$WORK/iso.list" >/dev/null 2>&1
 
 fail=0
 if cmp -s "$WORK/a_alone.c" "$WORK/a_batch.c"; then

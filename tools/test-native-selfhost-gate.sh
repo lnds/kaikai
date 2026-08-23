@@ -38,6 +38,10 @@ fi
 
 CC="${CC:-cc}"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the repo's EDITION is what
+# this gate must exercise.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 RUNTIME_LLVM_BC="$ROOT/stage0/runtime_llvm.bc"
 [ -f "$RUNTIME_LLVM_BC" ] || RUNTIME_LLVM_BC=""
 
@@ -77,7 +81,7 @@ echo "native-selfhost-gate: compiling stage2/main.kai with --emit=native …"
 rc=0
 ( cd "$ROOT/stage2" \
   && env KAI_NATIVE_RUNTIME_BC="$RUNTIME_LLVM_BC" \
-       "$KAIC2" --emit=native --path "$ROOT/stdlib" main.kai >/dev/null 2>"$ERR" ) || rc=$?
+       "$KAIC2" $EDITION_FLAG --emit=native --path "$ROOT/stdlib" main.kai >/dev/null 2>"$ERR" ) || rc=$?
 obj_produced=0
 [ -f "$ROOT/stage2/main.o" ] && obj_produced=1
 
@@ -158,7 +162,7 @@ elif [ "$count" -eq 0 ]; then
     echo "  not startup. Sample: $SAMPLE"
     rm -f "$BIN"; exit 1
   fi
-  oc="$("$KAIC2" --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)" || ocrc=$?
+  oc="$("$KAIC2" $EDITION_FLAG --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)" || ocrc=$?
   ocrc="${ocrc:-0}"
   # The trivial sample derives nothing, so the `#[derive(Layout)]` impl
   # builder never runs. Re-run the SAME native binary over a Layout-deriving
@@ -175,7 +179,7 @@ elif [ "$count" -eq 0 ]; then
       echo "::error::native-selfhost-gate FAIL — the native-built compiler died on signal $((lncrc - 128)) compiling $LAYOUT."
       rm -f "$BIN"; exit 1
     fi
-    loc="$("$KAIC2" --emit=c --path "$ROOT/stdlib" "$LAYOUT" 2>/dev/null)" || locrc=$?
+    loc="$("$KAIC2" $EDITION_FLAG --emit=c --path "$ROOT/stdlib" "$LAYOUT" 2>/dev/null)" || locrc=$?
     locrc="${locrc:-0}"
   fi
   rm -f "$BIN"

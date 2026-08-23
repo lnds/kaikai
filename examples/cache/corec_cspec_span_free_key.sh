@@ -21,6 +21,10 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the cache keys carry the
+# edition, so this fixture must exercise the one the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 STDLIB="$ROOT/stdlib"
 PROJ="$(mktemp -d)"
 trap 'rm -rf "$PROJ"' EXIT INT TERM
@@ -51,7 +55,7 @@ CACHE="$PROJ/core-cache"
 mkdir -p "$CACHE"
 
 # A: cold cache -> miss, entry written.
-"$KAIC2" --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
+"$KAIC2" $EDITION_FLAG --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
   --core-cache-stats --path "$STDLIB" --path "$PROJ" "$PROJ/a.kai" \
   > /dev/null 2> "$PROJ/a.err"
 grep -q "core-emit-cache: miss" "$PROJ/a.err" || {
@@ -60,7 +64,7 @@ grep -q "core-emit-cache: miss" "$PROJ/a.err" || {
 
 # B: adding a HOF-with-lambda must HIT — the cspec decl is span-free-keyed
 # out of the surface. This is the line that FAILS on the pre-fix compiler.
-"$KAIC2" --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
+"$KAIC2" $EDITION_FLAG --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
   --core-cache-stats --path "$STDLIB" --path "$PROJ" "$PROJ/b.kai" \
   > /dev/null 2> "$PROJ/b.err"
 grep -q "core-emit-cache: hit" "$PROJ/b.err" || {
@@ -69,7 +73,7 @@ grep -q "core-emit-cache: hit" "$PROJ/b.err" || {
 
 # C: a new top-level fn is a real surface change and must still MISS —
 # the fix drops cspec noise, it does not weaken invalidation.
-"$KAIC2" --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
+"$KAIC2" $EDITION_FLAG --emit=c-modular --core-cache-dir "$CACHE" --toolchain-id tid1 \
   --core-cache-stats --path "$STDLIB" --path "$PROJ" "$PROJ/c.kai" \
   > /dev/null 2> "$PROJ/c.err"
 grep -q "core-emit-cache: miss" "$PROJ/c.err" || {

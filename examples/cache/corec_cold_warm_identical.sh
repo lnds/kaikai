@@ -22,6 +22,10 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the cache keys carry the
+# edition, so this fixture must exercise the one the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 STDLIB="$ROOT/stdlib"
 PROJ="$(mktemp -d)"
 trap 'rm -rf "$PROJ"' EXIT INT TERM
@@ -43,14 +47,14 @@ EOF
 mkdir -p "$PROJ/.kai-cache"
 
 # Oracle: cache disabled — the core is lexed+parsed fresh.
-"$KAIC2" --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/oracle.c" 2>/dev/null
+"$KAIC2" $EDITION_FLAG --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/oracle.c" 2>/dev/null
 
 # Cold: cache enabled, empty cache -> all core misses, 12 blobs written.
 rm -f "$PROJ/.kai-cache/core-"*.kab 2>/dev/null || true
-"$KAIC2" --user-cache --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/cold.c" 2>/dev/null
+"$KAIC2" $EDITION_FLAG --user-cache --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/cold.c" 2>/dev/null
 
 # Warm: cache enabled, blobs present -> all core hits, lex+parse skipped.
-"$KAIC2" --user-cache --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/warm.c" 2>/dev/null
+"$KAIC2" $EDITION_FLAG --user-cache --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/warm.c" 2>/dev/null
 
 if ! cmp -s "$PROJ/cold.c" "$PROJ/oracle.c"; then
   echo "corec_cold_warm_identical FAIL — cold-cache C differs from no-cache oracle"

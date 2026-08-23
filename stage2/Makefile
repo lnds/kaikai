@@ -136,6 +136,15 @@ endif
 KAIC1   := ../stage1/kaic1
 TARGET  := kaic2
 
+# A bare kaic2 with no `--edition` runs the OLDEST edition (tongariki),
+# so a harness driving the binary directly tests the previous surface
+# while `bin/kai`, which derives the flag from kai.toml or this file,
+# tests the current one. $(KAIC2) is the binary already carrying the
+# flag; every invocation goes through it.
+KAI_EDITION  := $(shell cat ../EDITION)
+EDITION_FLAG := --edition $(KAI_EDITION)
+KAIC2        := ./$(TARGET) $(EDITION_FLAG)
+
 # Issue #677 — entry point of the `compiler` package. kaic2 reads
 # main.kai and resolves `import compiler.<mod>` against
 # compiler/<mod>.kai. kaic1 reads the concatenated build/bundle.kai
@@ -284,7 +293,7 @@ kaic2-fast: $(KAIC2_FAST_STAGING)
 	@set -e; \
 	./$(KAIC2_FAST_STAGING) --version | grep -q "self-hosted" \
 	  || { echo "kaic2-fast FAIL (--version) — keeping existing ./$(TARGET)"; exit 1; }; \
-	./$(KAIC2_FAST_STAGING) ../examples/portfolio/portfolio.kai > build/kaic2-fast-smoke.c \
+	./$(KAIC2_FAST_STAGING) $(EDITION_FLAG) ../examples/portfolio/portfolio.kai > build/kaic2-fast-smoke.c \
 	  || { echo "kaic2-fast FAIL (smoke compile) — keeping existing ./$(TARGET)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage0 build/kaic2-fast-smoke.c -o build/kaic2-fast-smoke $(LDLIBS_M); \
 	./build/kaic2-fast-smoke > build/kaic2-fast-smoke.out; \
@@ -302,13 +311,13 @@ kaic2-fast: $(KAIC2_FAST_STAGING)
 # Does not touch ./kaic2.
 kaic2-fast-verify: $(KAIC2_FAST_STAGING)
 	@set -e; \
-	./$(TARGET) $(SRC) > build/kaic2-fast-ref.c; \
-	./$(KAIC2_FAST_STAGING) $(SRC) > build/kaic2-fast-new.c; \
+	$(KAIC2) $(SRC) > build/kaic2-fast-ref.c; \
+	./$(KAIC2_FAST_STAGING) $(EDITION_FLAG) $(SRC) > build/kaic2-fast-new.c; \
 	diff -q build/kaic2-fast-ref.c build/kaic2-fast-new.c > /dev/null \
 	  && echo "kaic2-fast-verify: self-compile OK (emitted C byte-identical)" \
 	  || { echo "kaic2-fast-verify: self-compile DIFF — is ./$(TARGET) built from the current source?"; exit 1; }; \
-	./$(TARGET) ../examples/portfolio/portfolio.kai > build/kaic2-fast-ref-smoke.c; \
-	./$(KAIC2_FAST_STAGING) ../examples/portfolio/portfolio.kai > build/kaic2-fast-new-smoke.c; \
+	$(KAIC2) ../examples/portfolio/portfolio.kai > build/kaic2-fast-ref-smoke.c; \
+	./$(KAIC2_FAST_STAGING) $(EDITION_FLAG) ../examples/portfolio/portfolio.kai > build/kaic2-fast-new-smoke.c; \
 	diff -q build/kaic2-fast-ref-smoke.c build/kaic2-fast-new-smoke.c > /dev/null \
 	  && echo "kaic2-fast-verify OK (compiler + sample emitted C byte-identical)" \
 	  || { echo "kaic2-fast-verify: sample DIFF"; exit 1; }
@@ -320,7 +329,7 @@ test-tokens: $(TARGET) build
 	@$(STACK) set -e; \
 	for f in ../examples/minimal/*.kai ../stage1/compiler.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) --tokens $$f | awk '{$$1=$$1; print}' > build/s2-$$name.tok; \
+	  $(KAIC2) --tokens $$f | awk '{$$1=$$1; print}' > build/s2-$$name.tok; \
 	  ../stage1/kaic1 --tokens $$f | awk '{$$1=$$1; print}' > build/s1-$$name.tok; \
 	  diff -q build/s1-$$name.tok build/s2-$$name.tok > /dev/null \
 	    && echo "tokens OK $$name" \
@@ -332,7 +341,7 @@ test-ast: $(TARGET) build
 	@$(STACK) set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) --ast $$f > build/s2-$$name.ast && echo "ast OK $$name" \
+	  $(KAIC2) --ast $$f > build/s2-$$name.ast && echo "ast OK $$name" \
 	    || { echo "ast FAIL $$name"; exit 1; }; \
 	done
 
@@ -341,7 +350,7 @@ test-types: $(TARGET) build
 	@$(STACK) set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) --types $$f > build/s2-$$name.types && echo "types OK $$name" \
+	  $(KAIC2) --types $$f > build/s2-$$name.types && echo "types OK $$name" \
 	    || { echo "types FAIL $$name"; exit 1; }; \
 	done
 
@@ -350,7 +359,7 @@ test-env: $(TARGET) build
 	@$(STACK) set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) --env $$f > build/s2-$$name.env && echo "env OK $$name" \
+	  $(KAIC2) --env $$f > build/s2-$$name.env && echo "env OK $$name" \
 	    || { echo "env FAIL $$name"; exit 1; }; \
 	done
 
@@ -361,7 +370,7 @@ test-infer: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --infer $$f > build/s2-$$name.infer 2> build/s2-$$name.infer.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --infer $$f > build/s2-$$name.infer 2> build/s2-$$name.infer.err \
 	    && [ ! -s build/s2-$$name.infer.err ] \
 	    && echo "infer OK $$name" \
 	    || { echo "infer FAIL $$name"; cat build/s2-$$name.infer.err; exit 1; }; \
@@ -375,7 +384,7 @@ test-dump-mono: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --dump-mono $$f > build/s2-$$name.mono 2> build/s2-$$name.mono.err; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --dump-mono $$f > build/s2-$$name.mono 2> build/s2-$$name.mono.err; \
 	  : '#645 introduced phantom row vars on pure named fns, so call-sites'; \
 	  : 'into row-poly callbacks (filter, map, each, ...) legitimately'; \
 	  : 'leave the trailing row slot as `?tN` until m4c specialises.'; \
@@ -397,7 +406,7 @@ test-dump-typed: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --dump-typed $$f > build/s2-$$name.typed 2> build/s2-$$name.typed.err; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --dump-typed $$f > build/s2-$$name.typed 2> build/s2-$$name.typed.err; \
 	  if grep -q ' : ?$$' build/s2-$$name.typed; then \
 	    echo "dump-typed FAIL $$name (found un-annotated nodes)"; \
 	    grep ' : ?$$' build/s2-$$name.typed | head; \
@@ -421,7 +430,7 @@ test-rawsafe: $(TARGET) build
 	for spec in $(RAWSAFE_FIXTURES); do \
 	  name=$${spec%%:*}; fns=$${spec#*:}; \
 	  pat=$$(echo "$$fns" | sed 's/,/|/g'); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib --dump-rawsafe ../examples/perceus/$$name.kai 2> build/$$name.rawsafe.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --dump-rawsafe ../examples/perceus/$$name.kai 2> build/$$name.rawsafe.err \
 	    | grep -E "^($$pat) (load|store)" > build/$$name.rawsafe || true; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.rawsafe > /dev/null \
 	    && echo "rawsafe OK $$name (use-analysis marks match golden)" \
@@ -438,7 +447,7 @@ test-rawsafe: $(TARGET) build
 # runtime and no emitted text change on this path.
 test-purity: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib --dump-purity ../examples/perceus/purity_scalar.kai 2> build/purity_scalar.err \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --dump-purity ../examples/perceus/purity_scalar.kai 2> build/purity_scalar.err \
 	  > build/purity_scalar.out || true; \
 	diff -q ../examples/perceus/purity_scalar.out.expected build/purity_scalar.out > /dev/null \
 	  && echo "purity OK purity_scalar (confirmation marks match golden)" \
@@ -456,7 +465,7 @@ test-borrowsafe: $(TARGET) build
 	for spec in $(BORROWSAFE_FIXTURES); do \
 	  name=$${spec%%:*}; fns=$${spec#*:}; \
 	  pat=$$(echo "$$fns" | sed 's/,/|/g'); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib --dump-borrowsafe ../examples/perceus/$$name.kai 2> build/$$name.borrowsafe.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --dump-borrowsafe ../examples/perceus/$$name.kai 2> build/$$name.borrowsafe.err \
 	    | grep -E "^($$pat) borrow" > build/$$name.borrowsafe || true; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.borrowsafe > /dev/null \
 	    && echo "borrowsafe OK $$name (borrow classifier matches golden)" \
@@ -469,7 +478,7 @@ test-infer-check: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --check $$f > build/s2-$$name.check 2> build/s2-$$name.check.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --check $$f > build/s2-$$name.check 2> build/s2-$$name.check.err \
 	    && [ ! -s build/s2-$$name.check ] \
 	    && [ ! -s build/s2-$$name.check.err ] \
 	    && echo "check-types OK $$name" \
@@ -481,7 +490,7 @@ test-check: $(TARGET) build
 	@$(STACK) set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $$f > /dev/null \
+	  $(KAIC2) $$f > /dev/null \
 	    && echo "check OK $$name" \
 	    || { echo "check FAIL $$name"; exit 1; }; \
 	done
@@ -491,7 +500,7 @@ test-run: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/run-$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/run-$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/run-$$name.c -o build/run-$$name $(LDLIBS_M) ; \
 	  ./build/run-$$name > build/run-$$name.out; \
 	  ../stage1/kaic1 $$f > build/run-$$name-s1.c; \
@@ -507,7 +516,7 @@ test-blocks: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --test $$f > build/$$name-t.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --test $$f > build/$$name-t.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name-t.c -o build/$$name-t $(LDLIBS_M) ; \
 	  ./build/$$name-t 2> build/$$name-t.err || true; \
 	  ../stage1/kaic1 --test $$f > build/$$name-t-s1.c; \
@@ -526,7 +535,7 @@ test-blocks: $(TARGET) build
 # downstream passes (check + HM + emit) accept without change.
 test-modules: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/modules/main.kai > build/modules.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/modules/main.kai > build/modules.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/modules.c -o build/modules-c $(LDLIBS_M) ; \
 	./build/modules-c > build/modules-c.out; \
 	printf '42\n42\n12\n' > build/modules.expected; \
@@ -555,7 +564,7 @@ test-modules-qualified: $(TARGET) build
 	for d in $(QUALIFIED_DIRS); do \
 	  src=../examples/modules-qualified/$$d/main.kai; \
 	  exp=../examples/modules-qualified/$$d/main.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$src > build/mq-$$d.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$src > build/mq-$$d.c \
 	    || { echo "modules-qualified FAIL $$d (kaic2)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/mq-$$d.c -o build/mq-$$d-c $(LDLIBS_M) \
 	    || { echo "modules-qualified FAIL $$d (cc)"; exit 1; }; \
@@ -576,7 +585,7 @@ test-modules-qualified-neg: $(TARGET) build
 	for d in $(QUALIFIED_NEG_DIRS); do \
 	  src=../examples/modules-qualified/$$d/main.kai; \
 	  exp=../examples/modules-qualified/$$d/main.err.expected; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$src > /dev/null 2> build/mq-neg-$$d.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$src > /dev/null 2> build/mq-neg-$$d.err || rc=$$?; \
 	  if [ $$rc -eq 0 ]; then \
 	    echo "modules-qualified-neg FAIL $$d (expected error, got success)"; exit 1; \
 	  fi; \
@@ -599,7 +608,7 @@ test-modules-collision: $(TARGET) build
 	for d in $(COLLISION_DIRS); do \
 	  src=../examples/modules/$$d/main.kai; \
 	  exp=../examples/modules/$$d/main.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../examples/modules/$$d $$src > build/mc-$$d.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../examples/modules/$$d $$src > build/mc-$$d.c \
 	    || { echo "modules-collision FAIL $$d (kaic2)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/mc-$$d.c -o build/mc-$$d-c $(LDLIBS_M) \
 	    || { echo "modules-collision FAIL $$d (cc)"; exit 1; }; \
@@ -630,7 +639,7 @@ test-modules-derive-export: $(TARGET) build
 	for d in $(DERIVE_EXPORT_DIRS); do \
 	  src=../examples/modules/$$d/main.kai; \
 	  exp=../examples/modules/$$d/main.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../examples/modules/$$d --path ../stdlib $$src > build/mde-$$d.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../examples/modules/$$d --path ../stdlib $$src > build/mde-$$d.c \
 	    || { echo "modules-derive-export FAIL $$d (kaic2)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/mde-$$d.c -o build/mde-$$d-c $(LDLIBS_M) \
 	    || { echo "modules-derive-export FAIL $$d (cc)"; exit 1; }; \
@@ -652,7 +661,7 @@ test-modules-const-export: $(TARGET) build
 	d=pub_const_export; \
 	src=../examples/modules/$$d/main.kai; \
 	exp=../examples/modules/$$d/main.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../examples/modules/$$d --path ../stdlib $$src > build/mce-$$d.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../examples/modules/$$d --path ../stdlib $$src > build/mce-$$d.c \
 	  || { echo "modules-const-export FAIL $$d (kaic2)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/mce-$$d.c -o build/mce-$$d-c $(LDLIBS_M) \
 	  || { echo "modules-const-export FAIL $$d (cc)"; exit 1; }; \
@@ -665,7 +674,7 @@ test-modules-const-export: $(TARGET) build
 	d=priv_const_used_in_main; \
 	src=../examples/modules/$$d/main.kai; \
 	exp=../examples/modules/$$d/main.err.expected; \
-	rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../examples/modules/$$d --path ../stdlib $$src > /dev/null 2> build/mce-$$d.err || rc=$$?; \
+	rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../examples/modules/$$d --path ../stdlib $$src > /dev/null 2> build/mce-$$d.err || rc=$$?; \
 	if [ $$rc -eq 0 ]; then \
 	  echo "modules-const-export FAIL $$d (expected error, got success)"; exit 1; \
 	fi; \
@@ -689,7 +698,7 @@ test-modules-transitive-privacy: $(TARGET) build
 	d=transitive_import_privacy; \
 	src=../examples/modules/$$d/main.kai; \
 	exp=../examples/modules/$$d/main.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../examples/modules/$$d $$src > build/mtp-$$d.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../examples/modules/$$d $$src > build/mtp-$$d.c \
 	  || { echo "modules-transitive-privacy FAIL $$d (kaic2)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/mtp-$$d.c -o build/mtp-$$d-c $(LDLIBS_M) \
 	  || { echo "modules-transitive-privacy FAIL $$d (cc)"; exit 1; }; \
@@ -717,7 +726,7 @@ test-modules-uom-privacy: $(TARGET) build
 	for d in $(MUOMP_POS_DIRS); do \
 	  src=../examples/modules/$$d/main.kai; \
 	  exp=../examples/modules/$$d/main.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../examples/modules/$$d $$src > build/muomp-$$d.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../examples/modules/$$d $$src > build/muomp-$$d.c \
 	    || { echo "modules-uom-privacy FAIL $$d (kaic2)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/muomp-$$d.c -o build/muomp-$$d-c $(LDLIBS_M) \
 	    || { echo "modules-uom-privacy FAIL $$d (cc)"; exit 1; }; \
@@ -731,7 +740,7 @@ test-modules-uom-privacy: $(TARGET) build
 	for d in $(MUOMP_NEG_DIRS); do \
 	  src=../examples/modules/$$d/main.kai; \
 	  exp=../examples/modules/$$d/main.err.expected; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../examples/modules/$$d $$src > /dev/null 2> build/muomp-$$d.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../examples/modules/$$d $$src > /dev/null 2> build/muomp-$$d.err || rc=$$?; \
 	  if [ $$rc -eq 0 ]; then \
 	    echo "modules-uom-privacy FAIL $$d (expected error, got success)"; exit 1; \
 	  fi; \
@@ -759,7 +768,7 @@ test-modules-privacy-matrix: $(TARGET) build
 	for d in $(PRIVM_POS_DIRS); do \
 	  src=../examples/modules/$$d/main.kai; \
 	  exp=../examples/modules/$$d/main.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../examples/modules/$$d $$src > build/privm-$$d.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../examples/modules/$$d $$src > build/privm-$$d.c \
 	    || { echo "modules-privacy-matrix FAIL $$d (kaic2)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/privm-$$d.c -o build/privm-$$d-c $(LDLIBS_M) \
 	    || { echo "modules-privacy-matrix FAIL $$d (cc)"; exit 1; }; \
@@ -773,7 +782,7 @@ test-modules-privacy-matrix: $(TARGET) build
 	for d in $(PRIVM_NEG_DIRS); do \
 	  src=../examples/modules/$$d/main.kai; \
 	  exp=../examples/modules/$$d/main.err.expected; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../examples/modules/$$d $$src > /dev/null 2> build/privm-$$d.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../examples/modules/$$d $$src > /dev/null 2> build/privm-$$d.err || rc=$$?; \
 	  if [ $$rc -eq 0 ]; then \
 	    echo "modules-privacy-matrix FAIL $$d (expected error, got success)"; exit 1; \
 	  fi; \
@@ -795,7 +804,7 @@ test-modules-privacy-matrix: $(TARGET) build
 test-issue-1723-import-diag-file: $(TARGET) build
 	@set -e; \
 	fx=../examples/modules/issue-1723-import-diag-file; \
-	rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path $$fx $$fx/main.kai \
+	rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path $$fx $$fx/main.kai \
 	  > /dev/null 2> build/diagfile-1723.err || rc=$$?; \
 	if [ $$rc -eq 0 ]; then \
 	  echo "issue-1723-import-diag-file FAIL (expected error, got success)"; exit 1; \
@@ -852,13 +861,13 @@ test-modules-path: $(TARGET) build
 	@set -e; \
 	MAIN=../examples/modules-path/main.kai; \
 	LIB=../examples/modules-path-lib; \
-	rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$MAIN > /dev/null 2> build/modules-path.miss.err || rc=$$?; \
+	rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$MAIN > /dev/null 2> build/modules-path.miss.err || rc=$$?; \
 	if [ $$rc -eq 0 ]; then \
 	  echo "modules-path FAIL (expected error without --path)"; exit 1; \
 	fi; \
 	grep -q "cannot open module" build/modules-path.miss.err \
 	  || { echo "modules-path FAIL (wrong error message)"; cat build/modules-path.miss.err; exit 1; }; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path $$LIB $$MAIN > build/modules-path.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path $$LIB $$MAIN > build/modules-path.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/modules-path.c -o build/modules-path-c $(LDLIBS_M) ; \
 	./build/modules-path-c > build/modules-path-c.out; \
 	printf '42\nKAI!\n' > build/modules-path.expected; \
@@ -872,7 +881,7 @@ test-modules-path: $(TARGET) build
 # `--path ../stdlib` so the resolver finds the module.
 test-loop: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/loop/main.kai > build/loop.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/loop/main.kai > build/loop.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/loop.c -o build/loop-c $(LDLIBS_M) ; \
 	./build/loop-c > build/loop.out; \
 	diff -q ../examples/loop/main.out.expected build/loop.out > /dev/null \
@@ -884,7 +893,7 @@ test-loop: $(TARGET) build
 # the resolver finds the new module, run, diff against golden.
 test-reader: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/reader/main.kai > build/reader.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/reader/main.kai > build/reader.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/reader.c -o build/reader-c $(LDLIBS_M) ; \
 	./build/reader-c > build/reader.out; \
 	diff -q ../examples/reader/main.out.expected build/reader.out > /dev/null \
@@ -893,7 +902,7 @@ test-reader: $(TARGET) build
 
 test-writer: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/writer/main.kai > build/writer.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/writer/main.kai > build/writer.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/writer.c -o build/writer-c $(LDLIBS_M) ; \
 	./build/writer-c > build/writer.out; \
 	diff -q ../examples/writer/main.out.expected build/writer.out > /dev/null \
@@ -909,7 +918,7 @@ test-writer: $(TARGET) build
 # the same shape produces a deterministic stdout diff under tier1.
 test-foreign-prelude: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/foreign_prelude.kai > build/foreign_prelude.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/foreign_prelude.kai > build/foreign_prelude.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/foreign_prelude.c -o build/foreign_prelude-c $(LDLIBS_M) ; \
 	./build/foreign_prelude-c > build/foreign_prelude.out; \
 	diff -q ../examples/effects/foreign_prelude.out.expected build/foreign_prelude.out > /dev/null \
@@ -924,7 +933,7 @@ test-foreign-prelude: $(TARGET) build
 # Compile + run + diff so a regression of the same shape fails tier1.
 test-issue-672: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/cap_read_in_interp.kai > build/cap_read_in_interp.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/cap_read_in_interp.kai > build/cap_read_in_interp.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/cap_read_in_interp.c -o build/cap_read_in_interp-c $(LDLIBS_M) ; \
 	./build/cap_read_in_interp-c > build/cap_read_in_interp.out; \
 	diff -q ../examples/effects/cap_read_in_interp.out.expected build/cap_read_in_interp.out > /dev/null \
@@ -938,7 +947,7 @@ test-issue-672: $(TARGET) build
 test-issue-1194-reassigned-record-field-in-interp: $(TARGET) build
 	@set -e; \
 	f=issue_1194_reassigned_record_field_in_interp; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/$$f.kai > build/$$f.c \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/$$f.kai > build/$$f.c \
 	  || { echo "issue-1194 FAIL (kaic2)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M) \
 	  || { echo "issue-1194 FAIL (cc)"; exit 1; }; \
@@ -964,7 +973,7 @@ test-issue-1263-abandon-across-resumed-frame: $(TARGET) build
 	@set -e; \
 	. ../tools/lib/timeout.sh; \
 	f=issue_1263_abandon_across_resumed_frame; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/$$f.kai > build/s2-$$f.c \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/$$f.kai > build/s2-$$f.c \
 	  || { echo "issue-1263 FAIL (kaic2)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$f.c -o build/s2-$$f-c $(LDLIBS_M) \
 	  || { echo "issue-1263 FAIL (cc)"; exit 1; }; \
@@ -994,7 +1003,7 @@ test-issue-1263-abandon-across-resumed-frame-native: $(TARGET) build
 test-issue-1564-promoted-cell-across-handle: $(TARGET) build
 	@set -e; \
 	f=issue_1564_promoted_cell_across_discarding_handle; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/$$f.kai > build/s2-$$f.c \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/$$f.kai > build/s2-$$f.c \
 	  || { echo "issue-1564 FAIL (kaic2)"; exit 1; }; \
 	for O in -O0 -O2; do \
 	  $(CC) -std=c99 -Wno-unused-function -Wno-unused-variable $$O \
@@ -1026,7 +1035,7 @@ test-issue-1564-promoted-cell-across-handle-native: $(TARGET) build
 # fixture stays libc-only so it links without extra `cc` flags.
 test-ffi-extern-c: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/ffi_extern_c_basic.kai > build/ffi_extern_c_basic.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/ffi_extern_c_basic.kai > build/ffi_extern_c_basic.c; \
 	$(CC) $(CFLAGS) -Wno-absolute-value -I ../stage2 -I ../stage0 build/ffi_extern_c_basic.c -o build/ffi_extern_c_basic-c $(LDLIBS_M) ; \
 	./build/ffi_extern_c_basic-c > build/ffi_extern_c_basic.out; \
 	diff -q ../examples/effects/ffi_extern_c_basic.out.expected build/ffi_extern_c_basic.out > /dev/null \
@@ -1043,20 +1052,20 @@ test-ffi-extern-c: $(TARGET) build
 test-numeric-fixed-width: $(TARGET) build
 	@set -e; \
 	for f in int128_overflow fixed_width_protocols; do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) ../examples/numeric/$$f.kai > build/$$f.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) ../examples/numeric/$$f.kai > build/$$f.c; \
 	  $(CC) $(CFLAGS) -Wno-absolute-value -I ../stage2 -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M); \
 	  ./build/$$f-c > build/$$f.out; \
 	  diff -q ../examples/numeric/$$f.out.expected build/$$f.out > /dev/null \
 	    && echo "numeric $$f OK (C backend)" \
 	    || { echo "numeric $$f DIFF"; diff ../examples/numeric/$$f.out.expected build/$$f.out; exit 1; }; \
 	done; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/numeric/ffi_fixed_honest.kai > build/ffi_fixed_honest.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/numeric/ffi_fixed_honest.kai > build/ffi_fixed_honest.c; \
 	$(CC) $(CFLAGS) -Wno-absolute-value -I ../stage2 -I ../stage0 build/ffi_fixed_honest.c ../examples/numeric/ffi_fixed_shim.c -o build/ffi_fixed_honest-c $(LDLIBS_M); \
 	./build/ffi_fixed_honest-c > build/ffi_fixed_honest.out; \
 	diff -q ../examples/numeric/ffi_fixed_honest.out.expected build/ffi_fixed_honest.out > /dev/null \
 	  && echo "numeric ffi_fixed_honest OK (C backend)" \
 	  || { echo "numeric ffi_fixed_honest DIFF"; diff ../examples/numeric/ffi_fixed_honest.out.expected build/ffi_fixed_honest.out; exit 1; }; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/numeric/kind_mismatch.err.kai > build/kind_mismatch.out 2>&1 \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/numeric/kind_mismatch.err.kai > build/kind_mismatch.out 2>&1 \
 	  && { echo "kind_mismatch DID NOT FAIL — Int32 must not unify with Int"; exit 1; } \
 	  || true; \
 	grep -F "$$(head -1 ../examples/numeric/kind_mismatch.err.expected)" build/kind_mismatch.out > /dev/null \
@@ -1071,32 +1080,32 @@ test-numeric-fixed-width: $(TARGET) build
 test-numeric-bigint: $(TARGET) build
 	@set -e; \
 	for f in bigint_arith bigint_factorial bigint_border bigint_literal bigint_errors; do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$f.kai > build/$$f.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$f.kai > build/$$f.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M); \
 	  ./build/$$f-c > build/$$f.out; \
 	  diff -q ../examples/numeric/$$f.out.expected build/$$f.out > /dev/null \
 	    && echo "bigint $$f OK (C backend)" \
 	    || { echo "bigint $$f DIFF"; diff ../examples/numeric/$$f.out.expected build/$$f.out; exit 1; }; \
 	done; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/int_overflow.err.kai > build/int_overflow.out 2>&1 \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/int_overflow.err.kai > build/int_overflow.out 2>&1 \
 	  && { echo "int_overflow DID NOT FAIL — Int literal past i64 must diagnose"; exit 1; } \
 	  || true; \
 	grep -F "$$(head -1 ../examples/numeric/int_overflow.err.expected)" build/int_overflow.out > /dev/null \
 	  && echo "bigint int_overflow OK (out-of-range Int rejection)" \
 	  || { echo "bigint int_overflow DIFF — expected out-of-range diagnostic"; cat build/int_overflow.out; exit 1; }; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/hex_literal.kai > build/hex_literal.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/hex_literal.kai > build/hex_literal.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/hex_literal.c -o build/hex_literal-c $(LDLIBS_M); \
 	./build/hex_literal-c > build/hex_literal.out; \
 	diff -q ../examples/numeric/hex_literal.out.expected build/hex_literal.out > /dev/null \
 	  && echo "hex_literal OK (C backend)" \
 	  || { echo "hex_literal DIFF"; diff ../examples/numeric/hex_literal.out.expected build/hex_literal.out; exit 1; }; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/hex_bin_separators.kai > build/hex_bin_separators.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/hex_bin_separators.kai > build/hex_bin_separators.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/hex_bin_separators.c -o build/hex_bin_separators-c $(LDLIBS_M); \
 	./build/hex_bin_separators-c > build/hex_bin_separators.out; \
 	diff -q ../examples/numeric/hex_bin_separators.out.expected build/hex_bin_separators.out > /dev/null \
 	  && echo "hex_bin_separators OK (C backend)" \
 	  || { echo "hex_bin_separators DIFF"; diff ../examples/numeric/hex_bin_separators.out.expected build/hex_bin_separators.out; exit 1; }; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/hex_overflow.err.kai > build/hex_overflow.out 2>&1 \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/hex_overflow.err.kai > build/hex_overflow.out 2>&1 \
 	  && { echo "hex_overflow DID NOT FAIL — hex literal past 64 bits must diagnose"; exit 1; } \
 	  || true; \
 	grep -F "$$(head -1 ../examples/numeric/hex_overflow.err.expected)" build/hex_overflow.out > /dev/null \
@@ -1132,7 +1141,7 @@ test-numeric-bigint-native: $(TARGET) build
 test-numeric-decimal-rational: $(TARGET) build
 	@set -e; \
 	for f in decimal_big_demo rational_demo big_numeric_operators complex_div_operator decimal_operators import_alias_clash; do \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$f.kai > build/$$f.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$f.kai > build/$$f.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M); \
 	./build/$$f-c > build/$$f.out; \
 	diff -q ../examples/numeric/$$f.out.expected build/$$f.out > /dev/null \
@@ -1165,7 +1174,7 @@ test-numeric-div-by-zero-traps: $(TARGET) build
 	@set -e; \
 	for name in bigint_div_by_zero_traps rational_div_by_zero_traps \
 	            decimal_big_div_by_zero_traps decimal_div_by_zero_traps; do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	  rc=0; ./build/$$name > build/$$name.out 2> build/$$name.err || rc=$$?; \
 	  [ $$rc -ne 0 ] || { echo "div-trap FAIL $$name (exit 0 — did not trap)"; cat build/$$name.out; exit 1; }; \
@@ -1199,7 +1208,7 @@ test-numeric-div-by-zero-traps-native: $(TARGET) build
 test-issue-1637-div-overflow-trap: $(TARGET) build
 	@set -e; \
 	for name in int_div_min_overflow_traps int_mod_min_overflow_traps; do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	  rc=0; ./build/$$name > build/$$name.out 2> build/$$name.err || rc=$$?; \
 	  [ $$rc -ne 0 ] || { echo "div-overflow-trap FAIL $$name (exit 0 — did not trap)"; cat build/$$name.out; exit 1; }; \
@@ -1234,7 +1243,7 @@ test-issue-1637-div-overflow-trap-native: $(TARGET) build
 test-numeric-literal-mint: $(TARGET) build
 	@set -e; \
 	for f in literal_mint literal_suffix literal_principality byte_call_arg; do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$f.kai > build/$$f.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$f.kai > build/$$f.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M); \
 	  ./build/$$f-c > build/$$f.out; \
 	  diff -q ../examples/numeric/$$f.out.expected build/$$f.out > /dev/null \
@@ -1242,7 +1251,7 @@ test-numeric-literal-mint: $(TARGET) build
 	    || { echo "literal-mint $$f DIFF"; diff ../examples/numeric/$$f.out.expected build/$$f.out; exit 1; }; \
 	done; \
 	for f in mint_int_from_point mint_int_from_whole_point mint_byte_overflow mint_u8_suffix_overflow mint_decimal_overflow; do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$f.err.kai > build/$$f.out 2>&1 \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/numeric/$$f.err.kai > build/$$f.out 2>&1 \
 	    && { echo "literal-mint $$f DID NOT FAIL"; exit 1; } \
 	    || true; \
 	  grep -F "$$(head -1 ../examples/numeric/$$f.err.expected)" build/$$f.out > /dev/null \
@@ -1261,7 +1270,7 @@ test-numeric-literal-mint: $(TARGET) build
 # with an actionable `--backend=c` diagnostic (issue #923).
 test-ffi-v2-struct: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --backend=c ../examples/ffi/v2_struct_by_value.kai > build/v2_struct.stream; \
+	$(KAIC2) $(TEST_CORE_CACHE) --backend=c ../examples/ffi/v2_struct_by_value.kai > build/v2_struct.stream; \
 	rm -rf build/v2_struct.d; mkdir -p build/v2_struct.d; \
 	nonce=$$(sed -n '1s/^\/\/KAIDELIM://p' build/v2_struct.stream); \
 	awk -v dir=build/v2_struct.d -v pfx="//KAIFILE:$$nonce::" 'index($$0, pfx) == 1 { out = dir "/" substr($$0, length(pfx) + 1); next } out { print > out }' build/v2_struct.stream; \
@@ -1284,7 +1293,7 @@ test-ffi-v2-struct: $(TARGET) build
 # the native-vs-C parity ratchet.
 test-ffi-v2-opaque: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --backend=c ../examples/ffi/v2_opaque_handle.kai > build/v2_opaque.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --backend=c ../examples/ffi/v2_opaque_handle.kai > build/v2_opaque.c; \
 	$(CC) $(CFLAGS) -Wno-absolute-value -I ../stage2 -I ../stage0 build/v2_opaque.c ../examples/ffi/v2_shim.c -o build/v2_opaque-c $(LDLIBS_M); \
 	./build/v2_opaque-c > build/v2_opaque.out; \
 	diff -q ../examples/ffi/v2_opaque_handle.out.expected build/v2_opaque.out > /dev/null \
@@ -1335,7 +1344,7 @@ test-ffi-v2-native-struct: $(TARGET) build
 	for pair in "v2_struct_by_value v2_struct_native_shim.c" "v2_struct_adv v2_struct_adv_shim.c"; do \
 	  set -- $$pair; f=$$1; shim=$$2; \
 	  cp ../examples/ffi/$$f.kai build/$$f.kai; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --emit=native --path ../stdlib --path ../examples/ffi build/$$f.kai > build/$$f-nat.err 2>&1 \
+	  $(KAIC2) $(TEST_CORE_CACHE) --emit=native --path ../stdlib --path ../examples/ffi build/$$f.kai > build/$$f-nat.err 2>&1 \
 	    || { echo "ffi-v2-native-struct $$f EMIT FAIL"; cat build/$$f-nat.err; exit 1; }; \
 	  $(CC) -c ../examples/ffi/$$shim -o build/$$f-shim.o; \
 	  $(CC) $(CFLAGS) build/$$f.o build/$$f-shim.o ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o build/$$f-nat $(LDLIBS_M) -ldl; \
@@ -1465,9 +1474,9 @@ test-native-modular: $(TARGET) build
 	fx=../examples/multi-module/issue-989-native-modular; \
 	work=build/nmod; rm -rf $$work; mkdir -p $$work; cp $$fx/*.kai $$work/; \
 	cache=build/nmod-cache; rm -rf $$cache; mkdir -p $$cache; \
-	emit() { ./$(TARGET) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai 2>build/nmod.err; }; \
+	emit() { $(KAIC2) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai 2>build/nmod.err; }; \
 	link() { $(CC) $(CFLAGS) $(LDFLAGS_STACK) $$1 ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o $$2 $(LDLIBS_M) -ldl; }; \
-	./$(TARGET) --emit=native --path ../stdlib --path $$work $$work/main.kai >/dev/null 2>build/nmod-whole.err \
+	$(KAIC2) --emit=native --path ../stdlib --path $$work $$work/main.kai >/dev/null 2>build/nmod-whole.err \
 	  || { echo "native-modular: whole-program EMIT FAIL"; cat build/nmod-whole.err; exit 1; }; \
 	link "$$work/main.o" build/nmod-whole; ./build/nmod-whole > build/nmod-whole.out; \
 	emit | sort > build/nmod-objs1.txt \
@@ -1505,7 +1514,7 @@ test-issue-1706-runner-mode-key: $(TARGET) build
 	fx=../examples/multi-module/issue-1706-runner-mode-key; \
 	work=build/nmod-1706; rm -rf $$work; mkdir -p $$work; cp $$fx/*.kai $$work/; \
 	cache=build/nmod-1706-cache; rm -rf $$cache; mkdir -p $$cache; \
-	emit() { ./$(TARGET) --emit=native-modular $$1 --path ../stdlib --path $$work \
+	emit() { $(KAIC2) --emit=native-modular $$1 --path ../stdlib --path $$work \
 	  $$work/main.kai 2>build/nmod_1706.err; }; \
 	link() { $(CC) $(CFLAGS) $(LDFLAGS_STACK) $$(tr '\n' ' ' < $$1) \
 	  ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o $$2 $(LDLIBS_M) -ldl; }; \
@@ -1539,7 +1548,7 @@ test-issue-1426-cross-module-derive-show-native: $(TARGET) build
 	@set -e; \
 	fx=../examples/multi-module/issue-1426-cross-module-derive-show; \
 	work=build/nmod-1426; rm -rf $$work; mkdir -p $$work; cp $$fx/*.kai $$work/; \
-	./$(TARGET) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai \
+	$(KAIC2) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai \
 	  > build/nmod_1426_objs.txt 2>build/nmod_1426.err \
 	  || { echo "issue-1426-cross-module-derive-show-native: EMIT FAIL"; cat build/nmod_1426.err; exit 1; }; \
 	$(CC) $(CFLAGS) $(LDFLAGS_STACK) $$(tr '\n' ' ' < build/nmod_1426_objs.txt) \
@@ -1554,7 +1563,7 @@ test-issue-1852-cross-module-derive-json-native: $(TARGET) build
 	@set -e; \
 	fx=../examples/multi-module/issue-1852-cross-module-derive-json; \
 	work=build/nmod-1852; rm -rf $$work; mkdir -p $$work; cp $$fx/*.kai $$work/; \
-	./$(TARGET) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai \
+	$(KAIC2) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai \
 	  > build/nmod_1852_objs.txt 2>build/nmod_1852.err \
 	  || { echo "issue-1852-cross-module-derive-json-native: EMIT FAIL"; cat build/nmod_1852.err; exit 1; }; \
 	$(CC) $(CFLAGS) $(LDFLAGS_STACK) $$(tr '\n' ' ' < build/nmod_1852_objs.txt) \
@@ -1572,7 +1581,7 @@ test-modules-const-export-native: $(TARGET) build
 	@set -e; \
 	fx=../examples/modules/pub_const_export; \
 	work=build/nmod-const; rm -rf $$work; mkdir -p $$work; cp $$fx/*.kai $$work/; \
-	./$(TARGET) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai \
+	$(KAIC2) --emit=native-modular --path ../stdlib --path $$work $$work/main.kai \
 	  > build/nmod_const_objs.txt 2>build/nmod_const.err \
 	  || { echo "modules-const-export-native: EMIT FAIL"; cat build/nmod_const.err; exit 1; }; \
 	$(CC) $(CFLAGS) $(LDFLAGS_STACK) $$(tr '\n' ' ' < build/nmod_const_objs.txt) \
@@ -1612,11 +1621,11 @@ test-native-core-obj: $(TARGET) build
 	cache=build/ncoreobj-cache; rm -rf $$cache; mkdir -p $$cache; \
 	printf 'fn main() : Unit / Console = println("core-obj hello")\n' > $$work/hello.kai; \
 	link() { $(CC) $(CFLAGS) $(LDFLAGS_STACK) $$1 ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 -o $$2 $(LDLIBS_M) -ldl; }; \
-	KAI_NATIVE_CORE_OBJ=0 ./$(TARGET) --emit=native --core-cache-dir $$cache --toolchain-id nco-test --path ../stdlib --path $$work $$work/hello.kai > build/ncoreobj-whole.txt 2> build/ncoreobj-whole.err \
+	KAI_NATIVE_CORE_OBJ=0 $(KAIC2) --emit=native --core-cache-dir $$cache --toolchain-id nco-test --path ../stdlib --path $$work $$work/hello.kai > build/ncoreobj-whole.txt 2> build/ncoreobj-whole.err \
 	  || { echo "native-core-obj: whole-program EMIT FAIL"; cat build/ncoreobj-whole.err; exit 1; }; \
 	link "$$work/hello.o" build/ncoreobj-whole; ./build/ncoreobj-whole > build/ncoreobj-whole.out; \
 	rm -f $$work/hello.o; \
-	./$(TARGET) --emit=native --core-cache-dir $$cache --toolchain-id nco-test --core-cache-stats --path ../stdlib --path $$work $$work/hello.kai > build/ncoreobj-objs1.txt 2> build/ncoreobj1.err \
+	$(KAIC2) --emit=native --core-cache-dir $$cache --toolchain-id nco-test --core-cache-stats --path ../stdlib --path $$work $$work/hello.kai > build/ncoreobj-objs1.txt 2> build/ncoreobj1.err \
 	  || { echo "native-core-obj: cold split EMIT FAIL"; cat build/ncoreobj1.err; exit 1; }; \
 	grep -q "native-core-obj: miss" build/ncoreobj1.err \
 	  || { echo "native-core-obj: cold build did not report a miss"; cat build/ncoreobj1.err; exit 1; }; \
@@ -1629,7 +1638,7 @@ test-native-core-obj: $(TARGET) build
 	  && echo "native-core-obj OK: split output == whole-program output" \
 	  || { echo "native-core-obj: split != whole-program"; diff build/ncoreobj-whole.out build/ncoreobj-split.out; exit 1; }; \
 	rm -f $$work/hello.o; \
-	./$(TARGET) --emit=native --core-cache-dir $$cache --toolchain-id nco-test --core-cache-stats --path ../stdlib --path $$work $$work/hello.kai > build/ncoreobj-objs2.txt 2> build/ncoreobj2.err \
+	$(KAIC2) --emit=native --core-cache-dir $$cache --toolchain-id nco-test --core-cache-stats --path ../stdlib --path $$work $$work/hello.kai > build/ncoreobj-objs2.txt 2> build/ncoreobj2.err \
 	  || { echo "native-core-obj: warm split EMIT FAIL"; cat build/ncoreobj2.err; exit 1; }; \
 	grep -q "native-core-obj: hit" build/ncoreobj2.err \
 	  || { echo "native-core-obj: warm build did not report a hit"; cat build/ncoreobj2.err; exit 1; }; \
@@ -1639,7 +1648,7 @@ test-native-core-obj: $(TARGET) build
 	  && echo "native-core-obj OK: warm build reused the one cached core object" \
 	  || { echo "native-core-obj: warm build minted a second core object"; ls $$cache; exit 1; }; \
 	rm -f $$work/hello.o; \
-	KAI_NATIVE_CGLEVEL=0 ./$(TARGET) --emit=native --core-cache-dir $$cache --toolchain-id nco-test --core-cache-stats --path ../stdlib --path $$work $$work/hello.kai > build/ncoreobj-objs3.txt 2> build/ncoreobj3.err \
+	KAI_NATIVE_CGLEVEL=0 $(KAIC2) --emit=native --core-cache-dir $$cache --toolchain-id nco-test --core-cache-stats --path ../stdlib --path $$work $$work/hello.kai > build/ncoreobj-objs3.txt 2> build/ncoreobj3.err \
 	  || { echo "native-core-obj: tag-change EMIT FAIL"; cat build/ncoreobj3.err; exit 1; }; \
 	grep -q "native-core-obj: miss" build/ncoreobj3.err \
 	  || { echo "native-core-obj: backend-tag change did not change the core key (tag not folded into the key)"; cat build/ncoreobj3.err; exit 1; }; \
@@ -1718,7 +1727,7 @@ endif
 test-ffi-v2-negatives: $(TARGET) build
 	@set -e; \
 	for f in v2_struct_field_non_c v2_callback_param; do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --check ../examples/negative/ffi/$$f.kai > build/$$f.out 2>&1 \
+	  $(KAIC2) $(TEST_CORE_CACHE) --check ../examples/negative/ffi/$$f.kai > build/$$f.out 2>&1 \
 	    && { echo "$$f DID NOT FAIL — v2 must still reject it"; exit 1; } || true; \
 	  grep -F "$$(head -1 ../examples/negative/ffi/$$f.err.expected)" build/$$f.out > /dev/null \
 	    && echo "ffi-v2-negative $$f OK (rejected)" \
@@ -1732,7 +1741,7 @@ test-ffi-v2-negatives: $(TARGET) build
 # message pointing at `/`.
 test-issue-315-no-double-slash: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/aspirational/issue_315_no_double_slash.err.kai \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/aspirational/issue_315_no_double_slash.err.kai \
 	    > build/issue_315_no_double_slash.out 2>&1 \
 	  && { echo "issue_315 DID NOT FAIL — `//` should be rejected"; exit 1; } \
 	  || true; \
@@ -1753,14 +1762,14 @@ test-issue-260-261-extern-c-fn: $(TARGET) build
 	for f in extern_c_basic extern_c_name_override; do \
 	  src=../examples/ffi/$$f.kai; \
 	  exp=../examples/ffi/$$f.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$src > build/$$f.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$src > build/$$f.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M) ; \
 	  ./build/$$f-c > build/$$f.out; \
 	  diff -q $$exp build/$$f.out > /dev/null \
 	    && echo "$$f OK (C backend)" \
 	    || { echo "$$f DIFF (C backend)"; diff $$exp build/$$f.out; exit 1; }; \
 	done; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/ffi/extern_c_old_syntax.err.kai > build/extern_c_old_syntax.out 2>&1 \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/ffi/extern_c_old_syntax.err.kai > build/extern_c_old_syntax.out 2>&1 \
 	  && { echo "extern_c_old_syntax DID NOT FAIL — legacy syntax should be rejected"; exit 1; } \
 	  || true; \
 	grep -F "$$(head -1 ../examples/ffi/extern_c_old_syntax.err.expected)" build/extern_c_old_syntax.out > /dev/null \
@@ -1778,7 +1787,7 @@ test-issue-260-261-extern-c-fn: $(TARGET) build
 # next to `main.kai`.
 test-ffi-pub-axiom-cross-module: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../examples/effects/ffi_pub_axiom_cross_module \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../examples/effects/ffi_pub_axiom_cross_module \
 	  ../examples/effects/ffi_pub_axiom_cross_module/main.kai \
 	  > build/ffi_pub_axiom_cross_module.c; \
 	$(CC) $(CFLAGS) -Wno-absolute-value -I ../stage2 -I ../stage0 \
@@ -1808,7 +1817,7 @@ test-issue-248-loop-sugars: $(TARGET) build
 	         issue_802_stream_alias_var_state; do \
 	  src=../examples/sugars/loop/$$f.kai; \
 	  exp=../examples/sugars/loop/$$f.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/$$f.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/$$f.c \
 	    || { echo "$$f FAIL (kaic2)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M) \
 	    || { echo "$$f FAIL (cc)"; exit 1; }; \
@@ -1829,7 +1838,7 @@ test-issue-1179-var-slot-loop: $(TARGET) build
 	for f in issue_1179_var_slot_loops issue_1179_each_closure_state issue_1179_cell_register; do \
 	  src=../examples/sugars/loop/$$f.kai; \
 	  exp=../examples/sugars/loop/$$f.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/$$f.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/$$f.c \
 	    || { echo "$$f FAIL (kaic2)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M) \
 	    || { echo "$$f FAIL (cc)"; exit 1; }; \
@@ -1852,7 +1861,7 @@ test-issue-1179-var-slot-loop: $(TARGET) build
 	done; \
 	grep -q "kaiv_s_txt__slot = kai_core_array_make" build/issue_1179_cell_register.c \
 	  || { echo "issue_1179 FAIL (String var lost its array slot)"; exit 1; }; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir ../examples/sugars/loop/issue_1179_cell_register.kai > build/issue_1179_cell_register.kir \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir ../examples/sugars/loop/issue_1179_cell_register.kai > build/issue_1179_cell_register.kir \
 	  || { echo "issue_1179 FAIL (kir dump)"; exit 1; }; \
 	grep -q "acc_int__slot: i64" build/issue_1179_cell_register.kir \
 	  || { echo "issue_1179 FAIL (acc_int not a raw i64 register in KIR)"; exit 1; }; \
@@ -1869,7 +1878,7 @@ test-issue-1214-nonliteral-init: $(TARGET) build
 	f=issue_1214_nonliteral_init; \
 	src=../examples/sugars/loop/$$f.kai; \
 	exp=../examples/sugars/loop/$$f.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/$$f.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/$$f.c \
 	  || { echo "$$f FAIL (kaic2)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$f.c -o build/$$f-c $(LDLIBS_M) \
 	  || { echo "$$f FAIL (cc)"; exit 1; }; \
@@ -1877,7 +1886,7 @@ test-issue-1214-nonliteral-init: $(TARGET) build
 	  || { echo "$$f FAIL (run)"; exit 1; }; \
 	diff -q $$exp build/$$f.out > /dev/null \
 	  || { echo "$$f DIFF"; diff $$exp build/$$f.out; exit 1; }; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir $$src > build/$$f.kir \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir $$src > build/$$f.kir \
 	  || { echo "$$f FAIL (kir dump)"; exit 1; }; \
 	awk '/^fn collatz/,/^}/' build/$$f.kir | grep -q "m__slot: i64" \
 	  || { echo "$$f FAIL (collatz m := n not promoted to raw i64)"; exit 1; }; \
@@ -1896,7 +1905,7 @@ test-issue-1214-nonliteral-init: $(TARGET) build
 # at the exact site instead of corrupting heap state silently.
 test-ffi-extern-c-asan: $(TARGET) build
 	@set -e; \
-	./$(TARGET) ../examples/effects/ffi_extern_c_basic.kai > build/ffi_extern_c_basic-asan.c; \
+	$(KAIC2) ../examples/effects/ffi_extern_c_basic.kai > build/ffi_extern_c_basic-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -Wno-unused-function -Wno-unused-variable -Wno-absolute-value \
 	      -I ../stage2 -I ../stage0 build/ffi_extern_c_basic-asan.c -o build/ffi_extern_c_basic-c-asan; \
@@ -1927,7 +1936,7 @@ test-ffi-scalar-char: $(TARGET) build
 	for f in extern_c_user_symbol extern_c_char; do \
 	  src=../examples/ffi/$$f.kai; \
 	  exp=../examples/ffi/$$f.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$src > build/$$f.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$src > build/$$f.c; \
 	  $(CC) $(CFLAGS) -Werror=implicit-function-declaration -Wno-absolute-value \
 	    -I ../stage2 -I ../stage0 build/$$f.c ../examples/ffi/scalar_shim.c -o build/$$f-c $(LDLIBS_M); \
 	  ./build/$$f-c > build/$$f.out; \
@@ -1954,7 +1963,7 @@ test-ffi-scalar-char: $(TARGET) build
 # the helper file (resolved via `--path ../stdlib`).
 test-prelude-qualified-call: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
 	            ../examples/stdlib/qualified_call_in_prelude.kai \
 	            > build/qualified_call_in_prelude.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/qualified_call_in_prelude.c -o build/qualified_call_in_prelude $(LDLIBS_M) ; \
@@ -1973,7 +1982,7 @@ test-prelude-qualified-call: $(TARGET) build
 # (Int, Int) -> ?t`.
 test-issue-219-modcall: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
 	            ../examples/stdlib/issue_219_typer_modcall.kai \
 	            > build/issue_219_typer_modcall.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/issue_219_typer_modcall.c -o build/issue_219_typer_modcall $(LDLIBS_M) ; \
@@ -1991,7 +2000,7 @@ test-issue-219-modcall: $(TARGET) build
 # driver.kai.)
 test-issue-318: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
 	            --test ../examples/stdlib/issue_318_kai_test_prelude_scope.kai \
 	            > build/issue_318_kai_test_prelude_scope.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/issue_318_kai_test_prelude_scope.c -o build/issue_318_kai_test_prelude_scope $(LDLIBS_M) ; \
@@ -2009,7 +2018,7 @@ test-issue-318: $(TARGET) build
 # gate is that kaic2 emits C cleanly and the C compiles.
 test-issue-746: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
 	            --test ../examples/stdlib/issue_746_tuple_spread.kai \
 	            > build/issue_746.c 2> build/issue_746.err \
 	  || { echo "issue-746 FAIL (kaic2 errored — tuple-in-spread regressed)"; \
@@ -2033,7 +2042,7 @@ test-issue-668: $(TARGET) build
 	@set -e; \
 	f=../examples/effects/issue_668_map_large_in_fiber.kai; \
 	name=$$(basename $$f .kai); \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	  || { echo "issue-668 FAIL (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	  || { echo "issue-668 FAIL (C compile failed)"; exit 1; }; \
@@ -2061,7 +2070,7 @@ test-trmc-list-build: $(TARGET) build
 	@set -e; \
 	f=../examples/perceus/trmc_list_build_large.kai; \
 	name=$$(basename $$f .kai); \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	  || { echo "trmc-list-build FAIL (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	grep -q 'goto _kai_build_entry' build/s2-$$name.c \
 	  || { echo "trmc-list-build FAIL (cons TRMC did not fire for build — rewrite regressed?)"; exit 1; }; \
@@ -2087,7 +2096,7 @@ test-region-1123: $(TARGET) build
 	@set -e; \
 	for name in region_tree_1123 region_tree_escape_1123; do \
 	  f=../examples/perceus/$$name.kai; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "region-1123 FAIL ($$name: kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q 'kai_arena_variant(' build/s2-$$name.c \
 	    || { echo "region-1123 FAIL ($$name: Node did not route to the arena — cross-fn routing regressed?)"; exit 1; }; \
@@ -2111,7 +2120,7 @@ test-region-1193-native: $(TARGET) build
 	@set -e; \
 	for name in region_tree_1123 region_tree_escape_1123; do \
 	  f=../examples/perceus/$$name.kai; \
-	  ./$(TARGET) --emit=native --path ../stdlib $$f > /dev/null 2> build/s2-1193-$$name.err \
+	  $(KAIC2) --emit=native --path ../stdlib $$f > /dev/null 2> build/s2-1193-$$name.err \
 	    || { echo "region-1193-native FAIL ($$name: native emit errored)"; cat build/s2-1193-$$name.err; exit 1; }; \
 	  obj=../examples/perceus/$$name.o; \
 	  nm $$obj 2>/dev/null | grep -q 'kaix_arena_variant' \
@@ -2193,7 +2202,7 @@ TRACE_FIXTURES := trace_basic trace_prefix r9_clause_capture \
 test-trace: $(TARGET) build
 	@set -e; \
 	for name in $(TRACE_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/$$name.c -o build/$$name-c $(LDLIBS_M) ; \
 	  KAI_THREADS=1 ./build/$$name-c > build/$$name.out; \
 	  diff -q ../examples/effects/$$name.out.expected build/$$name.out > /dev/null \
@@ -2211,7 +2220,7 @@ test-trace: $(TARGET) build
 test-trace-asan: $(TARGET) build
 	@set -e; \
 	for name in $(TRACE_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -2243,7 +2252,7 @@ RUNTIME_SHADOW_FIXTURES := issue_78_runtime_name_shadow
 test-runtime-shadow: $(TARGET) build
 	@set -e; \
 	for name in $(RUNTIME_SHADOW_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/$$name.c -o build/$$name-c $(LDLIBS_M) ; \
 	  ./build/$$name-c > build/$$name.out; \
 	  diff -q ../examples/effects/$$name.out.expected build/$$name.out > /dev/null \
@@ -2258,7 +2267,7 @@ test-runtime-shadow: $(TARGET) build
 test-runtime-shadow-asan: $(TARGET) build
 	@set -e; \
 	for name in $(RUNTIME_SHADOW_FIXTURES); do \
-	  ./$(TARGET) ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -2286,7 +2295,7 @@ MN_SIGALTSTACK_THREADS := 1 2 8 16
 test-mn-sigaltstack-asan: $(TARGET) build
 	@set -e; \
 	name=mn_sigaltstack_teardown; \
-	./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	      -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c $(LDLIBS_M); \
@@ -2321,7 +2330,7 @@ ISSUE_501_FIXTURES := issue_501_handler_no_resume_nothing_op_int_let \
 test-issue-501: $(TARGET) build
 	@set -e; \
 	for name in $(ISSUE_501_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/$$name.kai > build/$$name.c; \
 	  $(CC) -std=c99 -Wno-unused-function -Wno-unused-variable -O2 \
 	        $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/$$name.c \
 	        -o build/$$name-c $(LDLIBS_M); \
@@ -2340,14 +2349,14 @@ test-issue-501: $(TARGET) build
 test-issue-743: $(TARGET) build
 	@set -e; \
 	pos=issue_743_generic_effect_payload_field; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/$$pos.kai > build/$$pos.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/$$pos.kai > build/$$pos.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$pos.c -o build/$$pos-c $(LDLIBS_M); \
 	./build/$$pos-c > build/$$pos.out; \
 	diff -q ../examples/effects/$$pos.out.expected build/$$pos.out > /dev/null \
 	  && echo "issue-743 OK $$pos (C)" \
 	  || { echo "issue-743 DIFF $$pos"; diff ../examples/effects/$$pos.out.expected build/$$pos.out; exit 1; }; \
 	neg=issue_743_generic_effect_payload_bad_field; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/$$neg.kai 2> build/$$neg.err > /dev/null && \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/$$neg.kai 2> build/$$neg.err > /dev/null && \
 	  { echo "issue-743 FAIL $$neg (Tier 1 escape: bad field accepted)"; exit 1; } \
 	  || true; \
 	grep -qF "$$(cat ../examples/effects/$$neg.err.expected)" build/$$neg.err \
@@ -2364,14 +2373,14 @@ test-issue-743: $(TARGET) build
 test-issue-842: $(TARGET) build
 	@set -e; \
 	pos=issue_842_multi_param_op_payload_field; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/$$pos.kai > build/$$pos.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/$$pos.kai > build/$$pos.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$pos.c -o build/$$pos-c $(LDLIBS_M); \
 	./build/$$pos-c > build/$$pos.out; \
 	diff -q ../examples/effects/$$pos.out.expected build/$$pos.out > /dev/null \
 	  && echo "issue-842 OK $$pos (C)" \
 	  || { echo "issue-842 DIFF $$pos"; diff ../examples/effects/$$pos.out.expected build/$$pos.out; exit 1; }; \
 	neg=issue_842_multi_param_op_payload_bad_field; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/$$neg.kai 2> build/$$neg.err > /dev/null && \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/$$neg.kai 2> build/$$neg.err > /dev/null && \
 	  { echo "issue-842 FAIL $$neg (Tier 1 escape: bad field accepted)"; exit 1; } \
 	  || true; \
 	grep -qF "$$(cat ../examples/effects/$$neg.err.expected)" build/$$neg.err \
@@ -2387,14 +2396,14 @@ test-issue-842: $(TARGET) build
 test-issue-1542: $(TARGET) build
 	@set -e; \
 	pos=issue_1542_row_kind_slot_rejected; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/$$pos.kai > build/$$pos.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/$$pos.kai > build/$$pos.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$pos.c -o build/$$pos-c $(LDLIBS_M); \
 	./build/$$pos-c > build/$$pos.out; \
 	diff -q ../examples/effects/$$pos.out.expected build/$$pos.out > /dev/null \
 	  && echo "issue-1542 OK $$pos (C)" \
 	  || { echo "issue-1542 DIFF $$pos"; diff ../examples/effects/$$pos.out.expected build/$$pos.out; exit 1; }; \
 	for neg in issue_1542_row_kind_slot_wrong_effect issue_1542_row_kind_slot_non_effect; do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/$$neg.kai 2> build/$$neg.err > /dev/null && \
+	  $(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/$$neg.kai 2> build/$$neg.err > /dev/null && \
 	    { echo "issue-1542 FAIL $$neg (Tier 1 escape: row-kind slot unchecked)"; exit 1; } \
 	    || true; \
 	  grep -qF "$$(cat ../examples/effects/$$neg.err.expected)" build/$$neg.err \
@@ -2415,7 +2424,7 @@ SIGNAL_TRAP_FIXTURES := issue_107_signal_trap signal_pending_before_await
 test-signal-trap-asan: $(TARGET) build
 	@set -e; \
 	for name in $(SIGNAL_TRAP_FIXTURES); do \
-	  ./$(TARGET) ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -2451,7 +2460,7 @@ LOG_DEFAULT_FIXTURES := issue_141_log_default
 test-log-asan: $(TARGET) build
 	@set -e; \
 	for name in $(LOG_DEFAULT_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -2487,7 +2496,7 @@ SECURERANDOM_FIXTURES := random_secure_basic
 test-securerandom-asan: $(TARGET) build
 	@set -e; \
 	for name in $(SECURERANDOM_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib \
+	  $(KAIC2) --path ../stdlib \
 	    ../examples/stdlib/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -2516,7 +2525,7 @@ TRAP_EXIT_CANCEL_FIXTURES := issue_103_trap_exit_cancel_handler
 test-trap-exit-cancel-asan: $(TARGET) build
 	@set -e; \
 	for name in $(TRAP_EXIT_CANCEL_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -2552,7 +2561,7 @@ PROCESS_BASIC_FIXTURES := process_basic process_piped_capture process_piped_page
 test-process-basic-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PROCESS_BASIC_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -2576,7 +2585,7 @@ test-process-basic-asan: $(TARGET) build
 # finds the module.
 test-time: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/time/main.kai > build/time.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/time/main.kai > build/time.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/time.c -o build/time-c $(LDLIBS_M) ; \
 	./build/time-c > build/time.out; \
 	diff -q ../examples/time/main.out.expected build/time.out > /dev/null \
@@ -2594,7 +2603,7 @@ test-intervals: $(TARGET) build
 	for f in ../examples/intervals/basic.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --dump-intervals $$f > build/iv-$$name.out 2>&1 \
+	  $(KAIC2) $(TEST_CORE_CACHE) --dump-intervals $$f > build/iv-$$name.out 2>&1 \
 	    || { echo "intervals FAIL $$name (kaic2 errored)"; cat build/iv-$$name.out; exit 1; }; \
 	  diff -q $$exp build/iv-$$name.out > /dev/null \
 	    && echo "intervals OK $$name" \
@@ -2617,7 +2626,7 @@ test-call-elision: $(TARGET) build
 	         ../examples/intervals/call_site_unproven.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --dump-call-elision $$f > build/ce-$$name.out 2>&1 \
+	  $(KAIC2) $(TEST_CORE_CACHE) --dump-call-elision $$f > build/ce-$$name.out 2>&1 \
 	    || { echo "call-elision FAIL $$name (kaic2 errored)"; cat build/ce-$$name.out; exit 1; }; \
 	  diff -q $$exp build/ce-$$name.out > /dev/null \
 	    && echo "call-elision OK $$name" \
@@ -2631,7 +2640,7 @@ test-call-elision: $(TARGET) build
 test-call-elision-neg: $(TARGET) build
 	@f=../examples/intervals/call_site_too_loose.kai; \
 	exp=$${f%.kai}.err.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --check $$f > build/ce-too-loose.out 2> build/ce-too-loose.err; \
+	$(KAIC2) $(TEST_CORE_CACHE) --check $$f > build/ce-too-loose.out 2> build/ce-too-loose.err; \
 	rc=$$?; \
 	if [ $$rc -eq 0 ]; then \
 	  echo "call-elision-neg FAIL too_loose (expected non-zero exit)"; exit 1; \
@@ -2652,7 +2661,7 @@ test-unused-bindings: $(TARGET) build
 	  [ -e $$f ] || continue; \
 	  name=$$(basename $$f .kai); \
 	  exp=../examples/typer/$$name.warn.expected; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/typer-$$name.c 2> build/typer-$$name.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > build/typer-$$name.c 2> build/typer-$$name.err || rc=$$?; \
 	  if [ $$rc -ne 0 ]; then \
 	    echo "unused-bindings FAIL $$name (kaic2 exit=$$rc)"; cat build/typer-$$name.err; exit 1; \
 	  fi; \
@@ -2688,7 +2697,7 @@ test-stdlib-survey: $(TARGET) build
 	  case "$$name" in bench_*|check_*|*_lib|qualified_call_in_prelude|issue_219_typer_modcall|issue_318_kai_test_prelude_scope) continue ;; esac; \
 	  exp_err=../examples/stdlib/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) --path ../stdlib $$f \
+	    rc=0; $(KAIC2) --path ../stdlib $$f \
 	      > /dev/null 2> build/stdlib-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "stdlib FAIL $$name (expected error, got success)"; fail=$$((fail+1)); continue; \
@@ -2704,7 +2713,7 @@ test-stdlib-survey: $(TARGET) build
 	    fi; \
 	    continue; \
 	  fi; \
-	  ./$(TARGET) --path ../stdlib $$f > build/stdlib-$$name.c 2> build/stdlib-$$name.kaic2err; \
+	  $(KAIC2) --path ../stdlib $$f > build/stdlib-$$name.c 2> build/stdlib-$$name.kaic2err; \
 	  rc=$$?; \
 	  if [ $$rc -ne 0 ]; then \
 	    echo "stdlib FAIL $$name (kaic2 errored)"; fail=$$((fail+1)); continue; \
@@ -2740,7 +2749,7 @@ test-stdlib: $(TARGET) build
 	  case "$$name" in bench_*|check_*|*_lib|qualified_call_in_prelude|issue_219_typer_modcall|issue_318_kai_test_prelude_scope) continue ;; esac; \
 	  exp_err=../examples/stdlib/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
 	      > /dev/null 2> build/stdlib-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "stdlib FAIL $$name (expected error, got success)"; exit 1; \
@@ -2753,7 +2762,7 @@ test-stdlib: $(TARGET) build
 	    echo "stdlib OK $$name (rejected as expected)"; \
 	    continue; \
 	  fi; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/stdlib-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/stdlib-$$name.c \
 	    || { echo "stdlib FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/stdlib-$$name.c -o build/stdlib-$$name $(LDLIBS_M) \
 	    || { echo "stdlib FAIL $$name (C compile failed)"; exit 1; }; \
@@ -2826,7 +2835,7 @@ test-units: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/units/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
 	      > /dev/null 2> build/units-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "units FAIL $$name (expected error, got success)"; exit 1; \
@@ -2839,7 +2848,7 @@ test-units: $(TARGET) build
 	    echo "units OK $$name (rejected as expected)"; \
 	    continue; \
 	  fi; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/units-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/units-$$name.err \
 	    || { echo "units FAIL $$name (kaic2 errored)"; cat build/units-$$name.err; exit 1; }; \
 	  echo "units OK $$name"; \
 	done
@@ -2855,7 +2864,7 @@ test-units: $(TARGET) build
 test-stdlib-crypto-asan: $(TARGET) build
 	@set -e; \
 	name=crypto_hash_basic; \
-	./$(TARGET) --path ../stdlib \
+	$(KAIC2) --path ../stdlib \
 	  ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
 	  || { echo "stdlib-crypto-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
@@ -2892,7 +2901,7 @@ test-stdlib-crypto-asan: $(TARGET) build
 test-stdlib-regex-predicate-asan: $(TARGET) build
 	@set -e; \
 	for name in regex_predicate_basic regex_subsume_basic regex_subsume_alpha; do \
-	  ./$(TARGET) --path ../stdlib \
+	  $(KAIC2) --path ../stdlib \
 	    ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
 	    || { echo "stdlib-regex-predicate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
@@ -2922,18 +2931,18 @@ test-holes: $(TARGET) build
 	@set -e; \
 	for f in ../examples/holes/*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --holes $$f > build/s2-$$name.holes; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --holes $$f > build/s2-$$name.holes; \
 	  if ! grep -q "type hole" build/s2-$$name.holes; then \
 	    echo "holes FAIL $$name (no report)"; cat build/s2-$$name.holes; exit 1; \
 	  fi; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --holes-json $$f > build/s2-$$name.holes.json; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --holes-json $$f > build/s2-$$name.holes.json; \
 	  python3 ../scripts/validate_holes_json.py build/s2-$$name.holes.json \
 	    || { echo "holes FAIL $$name (invalid JSON / schema)"; cat build/s2-$$name.holes.json; exit 1; }; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --strict-holes $$f > /dev/null 2> build/s2-$$name.strict.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --strict-holes $$f > /dev/null 2> build/s2-$$name.strict.err || rc=$$?; \
 	  if [ $$rc -eq 0 ]; then \
 	    echo "holes FAIL $$name (--strict-holes did not fail)"; cat build/s2-$$name.strict.err; exit 1; \
 	  fi; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/$$name-holes.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/$$name-holes.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name-holes.c -o build/$$name-holes-c $(LDLIBS_M) ; \
 	  crc=0; ./build/$$name-holes-c > build/$$name-holes-c.out 2>&1 || crc=$$?; \
 	  if [ $$crc -ne 0 ] && ! grep -q "unfilled hole:" build/$$name-holes-c.out; then \
@@ -3042,7 +3051,7 @@ test-effects: $(TARGET) build
 	@set -e; \
 	for f in ../examples/effects/parse_effect.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --ast $$f > build/s2-$$name.ast \
+	  $(KAIC2) $(TEST_CORE_CACHE) --ast $$f > build/s2-$$name.ast \
 	    && grep -q "effect \"Io\"" build/s2-$$name.ast \
 	    && grep -q "effect \"Fail\"" build/s2-$$name.ast \
 	    && grep -q "op \"print\"" build/s2-$$name.ast \
@@ -3051,7 +3060,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/parse_row_syntax.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --ast $$f > build/s2-$$name.ast \
+	  $(KAIC2) $(TEST_CORE_CACHE) --ast $$f > build/s2-$$name.ast \
 	    && grep -q "row Io" build/s2-$$name.ast \
 	    && grep -q "row Io + Fail" build/s2-$$name.ast \
 	    && echo "effects OK $$name" \
@@ -3059,44 +3068,44 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/row_match_higher_order.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (row match accepted)" \
 	    || { echo "effects FAIL $$name (matching rows rejected)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
 	for f in ../examples/effects/row_pure_to_effectful.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (pure-to-effectful elaboration accepted)" \
 	    || { echo "effects FAIL $$name (pure-to-effectful elaboration rejected)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
 	for f in ../examples/effects/op_call_basic.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (op call accepted)" \
 	    || { echo "effects FAIL $$name (op call rejected)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
 	for f in ../examples/effects/handle_basic.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --ast $$f > build/s2-$$name.ast 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --ast $$f > build/s2-$$name.ast 2> build/s2-$$name.err \
 	    && grep -q "handle Io" build/s2-$$name.ast \
 	    && echo "effects OK $$name (handle parsed)" \
 	    || { echo "effects FAIL $$name"; cat build/s2-$$name.err build/s2-$$name.ast; exit 1; }; \
 	done; \
 	for f in ../examples/effects/handle_alias.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (alias resolved)" \
 	    || { echo "effects FAIL $$name"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
 	for f in ../examples/effects/handle_removes_effect.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (handle removes effect)" \
 	    || { echo "effects FAIL $$name (handle did not remove effect)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m7a_6a_struct_emit.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "typedef struct EvCounter EvCounter;" build/s2-$$name.c \
 	    && grep -q "typedef struct EvGreeter EvGreeter;" build/s2-$$name.c \
@@ -3114,7 +3123,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7a_6b_handle_runs.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_evidence_push_with_jmp(&_node, \"Counter\"" build/s2-$$name.c \
 	    && grep -q "kai_evidence_pop()" build/s2-$$name.c \
@@ -3128,7 +3137,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7a_6c_op_dispatch.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "_ev.tick = &_kaiu_main__clause_" build/s2-$$name.c \
 	    && grep -q "_ev.get = &_kaiu_main__clause_" build/s2-$$name.c \
@@ -3144,7 +3153,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7a_6d_resume_check.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_cont_init_identity(&_k" build/s2-$$name.c \
 	    && grep -q "kai_cont_resume(k, " build/s2-$$name.c \
@@ -3157,7 +3166,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7a_6d_double_resume.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3170,7 +3179,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7a_6e_discard_resume.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_evidence_push_with_jmp" build/s2-$$name.c \
 	    && grep -q "if (setjmp(_jmp) == 0)" build/s2-$$name.c \
@@ -3184,7 +3193,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7a_6f_clause_typed.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3194,7 +3203,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7a_7_default_console.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_stdout_print" build/s2-$$name.c \
 	    && grep -q "kai_default_stderr_eprint" build/s2-$$name.c \
@@ -3215,7 +3224,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7a_7_default_env.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_env_args" build/s2-$$name.c \
 	    && grep -q "kai_default_env_var"  build/s2-$$name.c \
@@ -3231,7 +3240,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7a_7_default_file.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_file_read_file"  build/s2-$$name.c \
 	    && grep -q "kai_default_file_write_file" build/s2-$$name.c \
@@ -3246,7 +3255,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7a_7_default_stdin.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_stdin_read_line" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default-Stdin wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
@@ -3265,7 +3274,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7b_1_alias_io.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_stdout_print" build/s2-$$name.c \
 	    && grep -q "kai_default_stdin_read_line" build/s2-$$name.c \
@@ -3280,7 +3289,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7b_1_alias_single.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3295,7 +3304,7 @@ test-effects: $(TARGET) build
 	         ../examples/effects/m7b_12_row_var_compose.kai \
 	         ../examples/effects/m7b_12_row_var_concrete_plus_var.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3317,7 +3326,7 @@ test-effects: $(TARGET) build
 	         ../examples/effects/m7b_2b_mutable_intercept.kai \
 	         ../examples/effects/m7b_15_nested_alias.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3331,7 +3340,7 @@ test-effects: $(TARGET) build
 	         ../examples/effects/m8_2_yield_unhandled.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/effects/$$name.err.expected; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
 	  if [ $$rc -eq 0 ]; then \
 	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
 	  fi; \
@@ -3344,7 +3353,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_2_yield_noop.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_spawn_yield" build/s2-$$name.c \
 	    && grep -q "kai_evidence_init_default(&_kai_default_node_spawn" build/s2-$$name.c \
@@ -3360,7 +3369,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_3_spawn_await_value.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_spawn_spawn" build/s2-$$name.c \
 	    && grep -q "kai_default_spawn_await" build/s2-$$name.c \
@@ -3375,7 +3384,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_3_spawn_console.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3391,7 +3400,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/m8x_2_yield_interleave.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3404,7 +3413,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/m8x_3_cancel_at_yield.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3417,7 +3426,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/m8x_4_recv_blocking.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3430,7 +3439,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/m8x_4_request_reply.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3443,7 +3452,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/m8x_4_block_sender.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3457,7 +3466,7 @@ test-effects: $(TARGET) build
 	         ../examples/effects/issue_763_spawn_actor_policy_drop_oldest.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3470,7 +3479,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/issue_763_drop_oldest_invariant.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3483,7 +3492,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/m8_trap_exit.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3496,7 +3505,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/issue_103_trap_exit_cancel_handler.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3508,7 +3517,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_spawn_per_op_generics.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3523,7 +3532,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_spawn_per_op_row_generics.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3536,7 +3545,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_monitor.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3548,7 +3557,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_4_cancel_uncaught.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_cancel_raise" build/s2-$$name.c \
 	    && grep -q "kai_evidence_init_default(&_kai_default_node_cancel" build/s2-$$name.c \
@@ -3568,7 +3577,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_4_cancel_caught.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3585,7 +3594,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_5_nursery_join.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3597,7 +3606,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8x_9_nursery_autojoin.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3609,7 +3618,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8x_10_nursery_cancel_on_fail.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3623,7 +3632,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/nursery_cancel_on_fail_eager.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3637,7 +3646,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_6_fiber_inside_ok.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3650,7 +3659,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/m8_6_fiber_escapes.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/effects/$$name.err.expected; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
 	  if [ $$rc -eq 0 ]; then \
 	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
 	  fi; \
@@ -3664,7 +3673,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/m8x_6_fiber_in_result.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/effects/$$name.err.expected; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
 	  if [ $$rc -eq 0 ]; then \
 	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
 	  fi; \
@@ -3678,7 +3687,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/m8x_6_pid_escapes.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/effects/$$name.err.expected; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
 	  if [ $$rc -eq 0 ]; then \
 	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
 	  fi; \
@@ -3693,7 +3702,7 @@ test-effects: $(TARGET) build
 	         ../examples/effects/m8x_7_pid_in_sum.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/effects/$$name.err.expected; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
 	  if [ $$rc -eq 0 ]; then \
 	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
 	  fi; \
@@ -3706,7 +3715,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8x_7_recursive_sum_no_breach.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored on positive sum fixture)"; \
 	         cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
@@ -3719,7 +3728,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8x_8_nursery_cap.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored on cap-binding fixture)"; \
 	         cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
@@ -3732,7 +3741,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8x_8_brand_through_match.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored on positive same-nursery fixture)"; \
 	         cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
@@ -3745,7 +3754,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8x_8_brand_generic_roundtrip_ok.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored on positive generic round-trip)"; \
 	         cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
@@ -3758,7 +3767,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8x_8_brand_opaque_helper_warns.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored on opaque-helper warning fixture)"; \
 	         cat build/s2-$$name.err; exit 1; }; \
 	  grep -qF "escapes brand tracking through \`stash\`" build/s2-$$name.err \
@@ -3777,7 +3786,7 @@ test-effects: $(TARGET) build
 	         ../examples/effects/m8x_8_brand_through_generic.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/effects/$$name.err.expected; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
 	  if [ $$rc -eq 0 ]; then \
 	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
 	  fi; \
@@ -3791,7 +3800,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/m8x_8_brand_dump.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=../examples/effects/$$name.brands.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --dump-brands --path ../stdlib $$f > build/s2-$$name.brands 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --dump-brands --path ../stdlib $$f > build/s2-$$name.brands 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored on --dump-brands)"; \
 	         cat build/s2-$$name.err; exit 1; }; \
 	  diff -u $$exp build/s2-$$name.brands \
@@ -3800,7 +3809,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_7_actor_self_send.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3813,7 +3822,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_8_mailbox_drop_oldest.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3827,7 +3836,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_8_mailbox_drop_newest.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3841,7 +3850,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_9_supervision_pattern.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3854,7 +3863,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_12_self_delegating_handler.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  set_count=$$(grep -c "_disp_fib->in_dispatch_node = _node_op" build/s2-$$name.c || true); \
 	  rest_count=$$(grep -c "_disp_fib->in_dispatch_node = _saved_disp" build/s2-$$name.c || true); \
@@ -3872,7 +3881,7 @@ test-effects: $(TARGET) build
 	         ../examples/effects/m8_fiber_discard_yields.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/effects/$$name.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3885,7 +3894,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/mn_trampoline_tail_steal.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/effects/$$name.out.expected; \
-	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3907,7 +3916,7 @@ test-effects: $(TARGET) build
 	         ../examples/effects/mn_str_intern_race.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/effects/$$name.out.expected; \
-	  ./$(TARGET) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3923,7 +3932,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m8_fiber_stack_overflow.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3946,7 +3955,7 @@ test-effects: $(TARGET) build
 	  exp_out=../examples/effects/$$name.out.expected; \
 	  exp_err=../examples/effects/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "effects FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -3957,7 +3966,7 @@ test-effects: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "effects OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	      || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	      || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3975,7 +3984,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/issue_107_signal_trap.kai ../examples/effects/signal_pending_before_await.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -3994,7 +4003,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/m8x_signal_await_parks.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4013,7 +4022,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/process_basic.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_process_start" build/s2-$$name.c \
 	    && grep -q "kai_default_process_wait"  build/s2-$$name.c \
@@ -4033,7 +4042,7 @@ test-effects: $(TARGET) build
 	         ../examples/effects/process_piped_big.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_process_start_piped" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (default start_piped wiring missing)"; exit 1; }; \
@@ -4048,7 +4057,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/issue_141_log_default.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4073,7 +4082,7 @@ test-effects: $(TARGET) build
 	         ../examples/effects/array_record_local_masks_mutable.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4089,7 +4098,7 @@ test-effects: $(TARGET) build
 	         ../examples/effects/string_builder_masks_mutable.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4101,7 +4110,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/mutable_user_handler_over_default.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4114,7 +4123,7 @@ test-effects: $(TARGET) build
 	         ../examples/effects/array_record_forward_requires_mutable.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=$${f%.kai}.err.expected; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
 	  if [ $$rc -eq 0 ]; then \
 	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
 	  fi; \
@@ -4128,7 +4137,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/prelude_effect_via_scheme.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4142,7 +4151,7 @@ test-effects: $(TARGET) build
 	         ../examples/effects/issue_308_stdlib_log_unchanged.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4161,7 +4170,7 @@ test-effects: $(TARGET) build
 	         ../examples/actors/receive_timeout_race_deadline.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "actors FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "actors FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4174,7 +4183,7 @@ test-effects: $(TARGET) build
 	for f in ../examples/actors/dual_actor_missing_one.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/actors/$$name.err.expected; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
 	  if [ $$rc -eq 0 ]; then \
 	    echo "actors FAIL $$name (expected error, got success)"; exit 1; \
 	  fi; \
@@ -4187,7 +4196,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/file_stream_roundtrip.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_default_file_open_write" build/s2-$$name.c \
 	    && grep -q "kai_default_file_write_chunk" build/s2-$$name.c \
@@ -4205,7 +4214,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/file_stream_mock.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4217,7 +4226,7 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/file_stream_open_missing.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4242,7 +4251,7 @@ test-effects: $(TARGET) build
 	  "row_carrier_naming|^named ticks=2$$|#773 typer: concrete-row annotation Stream[Int, Tick] resolves the row slot"; do \
 	  name=$${spec%%|*}; rest=$${spec#*|}; pat=$${rest%%|*}; desc=$${rest#*|}; \
 	  f=../examples/effects/$$name.kai; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --edition hanga-roa --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4252,7 +4261,7 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name ($$desc)" \
 	    || { echo "effects FAIL $$name (output mismatch; want /$$pat/)"; cat build/s2-$$name.out; exit 1; }; \
 	done; \
-	./$(TARGET) $(TEST_CORE_CACHE) --edition hanga-roa --path ../stdlib ../demos/wc.kai > build/s2-wc.c 2> build/s2-wc.err \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../demos/wc.kai > build/s2-wc.c 2> build/s2-wc.err \
 	  || { echo "effects FAIL wc (kaic2 errored)"; cat build/s2-wc.err; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-wc.c -o build/s2-wc $(LDLIBS_M) \
 	  || { echo "effects FAIL wc (C compile failed)"; exit 1; }; \
@@ -4284,7 +4293,7 @@ test-sugars: $(TARGET) build
 	    *) extra_flags="" ;; \
 	  esac; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$extra_flags $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$extra_flags $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "sugars FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -4295,7 +4304,7 @@ test-sugars: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "sugars OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) $$extra_flags $$f > build/$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) $$extra_flags $$f > build/$$name.c \
 	      || { echo "sugars FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) \
 	      || { echo "sugars FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4322,7 +4331,7 @@ test-lint: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  exp_txt=../examples/lint/$$name.lint.expected; \
 	  exp_json=../examples/lint/$$name.lint-json.expected; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --lint --path ../stdlib $$f > build/s2-$$name.lint 2>&1 || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --lint --path ../stdlib $$f > build/s2-$$name.lint 2>&1 || rc=$$?; \
 	  if [ $$rc -ne 0 ]; then \
 	    echo "lint FAIL $$name (--lint exited $$rc; a lint must never block)"; \
 	    cat build/s2-$$name.lint; exit 1; \
@@ -4331,7 +4340,7 @@ test-lint: $(TARGET) build
 	    diff -q $$exp_txt build/s2-$$name.lint > /dev/null \
 	      || { echo "lint DIFF $$name (--lint)"; diff $$exp_txt build/s2-$$name.lint; exit 1; }; \
 	  fi; \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --lint-json --path ../stdlib $$f > build/s2-$$name.lint-json 2>&1 || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --lint-json --path ../stdlib $$f > build/s2-$$name.lint-json 2>&1 || rc=$$?; \
 	  if [ $$rc -ne 0 ]; then \
 	    echo "lint FAIL $$name (--lint-json exited $$rc)"; \
 	    cat build/s2-$$name.lint-json; exit 1; \
@@ -4357,7 +4366,7 @@ test-records: $(TARGET) build
 	  exp_out=../examples/records/$$name.out.expected; \
 	  exp_err=../examples/records/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/r-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/r-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "records FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -4368,7 +4377,7 @@ test-records: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "records OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/$$name.c \
 	      || { echo "records FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) \
 	      || { echo "records FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4397,7 +4406,7 @@ test-diagnostics: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/diagnostics/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/diag-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/diag-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "diagnostics FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -4408,7 +4417,7 @@ test-diagnostics: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "diagnostics OK $$name (m11 v1 template emitted)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/diag-$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/diag-$$name.c \
 	      || { echo "diagnostics FAIL $$name (kaic2 errored unexpectedly)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/diag-$$name.c -o build/diag-$$name $(LDLIBS_M) \
 	      || { echo "diagnostics FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4433,7 +4442,7 @@ test-match: $(TARGET) build
 	  exp_out=../examples/match/$$name.out.expected; \
 	  exp_err=../examples/match/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/m2-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/m2-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "match FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -4444,7 +4453,7 @@ test-match: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "match OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/m2-$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/m2-$$name.c \
 	      || { echo "match FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/m2-$$name.c -o build/m2-$$name $(LDLIBS_M) \
 	      || { echo "match FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4471,7 +4480,7 @@ test-literals: $(TARGET) build
 	  exp_out=../examples/literals/$$name.out.expected; \
 	  exp_err=../examples/literals/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/lit-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/lit-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "literals FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -4482,7 +4491,7 @@ test-literals: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "literals OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/lit-$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/lit-$$name.c \
 	      || { echo "literals FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/lit-$$name.c -o build/lit-$$name $(LDLIBS_M) \
 	      || { echo "literals FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4513,7 +4522,7 @@ test-string: $(TARGET) build
 	  exp_out=../examples/string/$$name.out.expected; \
 	  exp_err=../examples/string/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
 	      > /dev/null 2> build/str-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "string FAIL $$name (expected error, got success)"; exit 1; \
@@ -4525,7 +4534,7 @@ test-string: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "string OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f \
+	    $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
 	      > build/str-$$name.c \
 	      || { echo "string FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/str-$$name.c -o build/str-$$name $(LDLIBS_M) \
@@ -4555,7 +4564,7 @@ test-pipes: $(TARGET) build
 	  exp_out=../examples/pipes/$$name.out.expected; \
 	  exp_err=../examples/pipes/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/p2-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/p2-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "pipes FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -4566,7 +4575,7 @@ test-pipes: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "pipes OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/$$name.c \
 	      || { echo "pipes FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) \
 	      || { echo "pipes FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4586,15 +4595,15 @@ test-pipes: $(TARGET) build
 # dispatch (`|`, `||`, `|?`) on the opt-in stdlib collections (Set,
 # Stack, Queue, HashSet, HashMap, and a Map re-confirm). These import
 # `collections.*` (so they need `--path ../stdlib`) and rely on the
-# hanga-roa edition gate that enables non-List head dispatch (so they
-# pass `--edition hanga-roa`), which is why they live in their own
-# subdir rather than the flat `examples/pipes/*.kai` glob.
+# hanga-roa edition gate that enables non-List head dispatch, which is
+# why they live in their own subdir rather than the flat
+# `examples/pipes/*.kai` glob.
 test-pipes-collections: $(TARGET) build
 	@$(STACK) set -e; \
 	for f in ../examples/pipes/collections/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/pipes/collections/$$name.out.expected; \
-	  ./$(TARGET) --path ../stdlib --edition hanga-roa $$f > build/pc-$$name.c \
+	  $(KAIC2) --path ../stdlib $$f > build/pc-$$name.c \
 	    || { echo "pipes-collections FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/pc-$$name.c -o build/pc-$$name $(LDLIBS_M) \
 	    || { echo "pipes-collections FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4620,7 +4629,7 @@ test-protocols: $(TARGET) build
 	  exp_out=../examples/protocols/$$name.out.expected; \
 	  exp_err=../examples/protocols/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/p2-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/p2-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "protocols FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -4631,7 +4640,7 @@ test-protocols: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "protocols OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/p2-$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/p2-$$name.c \
 	      || { echo "protocols FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/p2-$$name.c -o build/p2-$$name $(LDLIBS_M) \
 	      || { echo "protocols FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4661,7 +4670,7 @@ test-proto-scalar-dispatch: $(TARGET) build
 	@set -e; \
 	src=../examples/protocols/poly_scalar_dispatch.kai; \
 	exp=../examples/protocols/poly_scalar_dispatch.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --test $$src > build/psd.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --test $$src > build/psd.c \
 	  || { echo "proto-scalar-dispatch FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/psd.c -o build/psd $(LDLIBS_M) \
 	  || { echo "proto-scalar-dispatch FAIL (C compile failed)"; exit 1; }; \
@@ -4683,7 +4692,7 @@ test-bare-narrow-assert: $(TARGET) build
 	@set -e; \
 	src=../examples/protocols/bare_narrow_in_assert.kai; \
 	exp=../examples/protocols/bare_narrow_in_assert.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --test $$src > build/bna.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --test $$src > build/bna.c \
 	  || { echo "bare-narrow-assert FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/bna.c -o build/bna $(LDLIBS_M) \
 	  || { echo "bare-narrow-assert FAIL (C compile failed)"; exit 1; }; \
@@ -4741,7 +4750,7 @@ test-m4c: $(TARGET) build
 	@$(STACK) set -e; \
 	for f in ../examples/effects/m4c_run_with.kai ../examples/effects/m4c_handler_in_body.kai ../examples/effects/m4c_flow_through.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "m4c FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "m4c FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4788,9 +4797,9 @@ bench-effects: build
 
 selfhost: $(TARGET) build
 	@$(STACK) set -e; \
-	./$(TARGET) $(SRC) > build/kaic2b.c; \
+	$(KAIC2) $(SRC) > build/kaic2b.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage0 build/kaic2b.c -o build/kaic2b $(LDLIBS_M) ; \
-	./build/kaic2b $(SRC) > build/kaic2c.c; \
+	./build/kaic2b $(EDITION_FLAG) $(SRC) > build/kaic2c.c; \
 	diff -q build/kaic2b.c build/kaic2c.c > /dev/null \
 	  && echo "selfhost determinism: OK (kaic2b.c == kaic2c.c)" \
 	  || { echo "selfhost determinism: DIFF (kaic2b.c != kaic2c.c)"; exit 1; }
@@ -4813,7 +4822,7 @@ test-demos-core: $(TARGET) build
 	  if [ ! -f $$src ]; then echo "demos-core FAIL $$name (missing $$src)"; exit 1; fi; \
 	  if [ ! -f $$exp ]; then echo "demos-core FAIL $$name (missing $$exp)"; exit 1; fi; \
 	  preludes=""; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$preludes $$src > build/demo-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$preludes $$src > build/demo-$$name.c \
 	    || { echo "demos-core FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/demo-$$name.c -o build/demo-$$name $(LDLIBS_M) \
 	    || { echo "demos-core FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4845,7 +4854,7 @@ test-aspirational: $(TARGET) build
 	  if [ ! -f $$src ]; then echo "aspirational FAIL $$name (missing $$src)"; exit 1; fi; \
 	  if [ ! -f $$exp ]; then echo "aspirational FAIL $$name (missing $$exp)"; exit 1; fi; \
 	  preludes=""; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$preludes $$src > build/asp-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$preludes $$src > build/asp-$$name.c \
 	    || { echo "aspirational FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/asp-$$name.c -o build/asp-$$name $(LDLIBS_M) \
 	    || { echo "aspirational FAIL $$name (C compile failed)"; exit 1; }; \
@@ -4867,7 +4876,7 @@ test-match-backtrack-unify: $(TARGET) build
 	@set -e; \
 	f=../examples/perceus/match_backtrack_unify.kai; \
 	name=$$(basename $$f .kai); \
-	./$(TARGET) $(TEST_CORE_CACHE) $$f > build/$$name.c \
+	$(KAIC2) $(TEST_CORE_CACHE) $$f > build/$$name.c \
 	  || { echo "match-backtrack FAIL $$name (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) \
 	  || { echo "match-backtrack FAIL $$name (cc errored)"; exit 1; }; \
@@ -4885,7 +4894,7 @@ test-unbox-phase2: $(TARGET) build
 	@set -e; \
 	for f in ../examples/perceus/unbox_phase2_*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/perceus-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/perceus-$$name.c \
 	    || { echo "unbox FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/perceus-$$name.c -o build/perceus-$$name $(LDLIBS_M) \
 	    || { echo "unbox FAIL $$name (cc errored)"; exit 1; }; \
@@ -5050,7 +5059,7 @@ test-unbox-phase2: $(TARGET) build
 	@# inside `n + 1` instead of routing through `kai_op_eq` /
 	@# `kai_op_add`. The boxed match path's per-arm `kai_op_eq` chain
 	@# and `kai_decref(_scr)` cleanup must not appear inside the body.
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/perceus/match_pbind_catchall_raw.kai > build/perceus-match_pbind_catchall_raw.c \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/perceus/match_pbind_catchall_raw.kai > build/perceus-match_pbind_catchall_raw.c \
 	  || { echo "unbox FAIL match_pbind_catchall_raw (kaic2 errored)"; exit 1; }
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/perceus-match_pbind_catchall_raw.c -o build/perceus-match_pbind_catchall_raw $(LDLIBS_M) \
 	  || { echo "unbox FAIL match_pbind_catchall_raw (cc errored)"; exit 1; }
@@ -5083,7 +5092,7 @@ test-unbox-phase3: $(TARGET) build
 	@set -e; \
 	for f in ../examples/perceus/phase3/unbox_*.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/phase3-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/phase3-$$name.c \
 	    || { echo "unbox-phase3 FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/phase3-$$name.c -o build/phase3-$$name $(LDLIBS_M) \
 	    || { echo "unbox-phase3 FAIL $$name (cc errored)"; exit 1; }; \
@@ -5105,7 +5114,7 @@ test-issue-892-mono-arg-unbox: $(TARGET) build
 	@set -e; \
 	f=../examples/perceus/mono_arg_unbox_892.kai; \
 	name=$$(basename $$f .kai); \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib --path ../examples/perceus $$f > build/perceus-$$name.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --path ../examples/perceus $$f > build/perceus-$$name.c \
 	  || { echo "892 FAIL $$name (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/perceus-$$name.c -o build/perceus-$$name $(LDLIBS_M) \
 	  || { echo "892 FAIL $$name (cc errored)"; exit 1; }; \
@@ -5129,7 +5138,7 @@ test-issue-892-mono-arg-unbox: $(TARGET) build
 # would deterministically blow the stack.
 test-tco: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/tco/main.kai > build/tco.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/main.kai > build/tco.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco.c -o build/tco $(LDLIBS_M) ; \
 	./build/tco > build/tco.out; \
 	diff -q ../examples/tco/main.out.expected build/tco.out > /dev/null \
@@ -5148,7 +5157,7 @@ test-tco: $(TARGET) build
 # to validate against — but it does NOT enforce rule 3 today.
 test-tco-regression: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/tco/list_nth_shape.kai > build/tco-nth.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/list_nth_shape.kai > build/tco-nth.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-nth.c -o build/tco-nth $(LDLIBS_M) ; \
 	./build/tco-nth > build/tco-nth.out; \
 	diff -q ../examples/tco/list_nth_shape.out.expected build/tco-nth.out > /dev/null \
@@ -5165,7 +5174,7 @@ test-tco-regression: $(TARGET) build
 # because TCO's per-call-site dropmask is a Perceus output.
 test-tco-zero-arg: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/perceus/r12_zero_arg_recursive.kai > build/tco-zero.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/perceus/r12_zero_arg_recursive.kai > build/tco-zero.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-zero.c -o build/tco-zero $(LDLIBS_M) ; \
 	./build/tco-zero > build/tco-zero.out; \
 	diff -q ../examples/perceus/r12_zero_arg_recursive.out.expected build/tco-zero.out > /dev/null \
@@ -5187,7 +5196,7 @@ test-tco-zero-arg: $(TARGET) build
 # count at exit is 0 (leak closed).
 test-tco-309: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/tco/issue_309_countdown.kai > build/tco-309.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/issue_309_countdown.kai > build/tco-309.c; \
 	grep -F -q '_kai_count_down_entry:;' build/tco-309.c \
 	  || { echo "tco-309 FAIL (no _kai_count_down_entry label in emitted C)"; exit 1; }; \
 	grep -F -q 'goto _kai_count_down_entry;' build/tco-309.c \
@@ -5223,7 +5232,7 @@ test-tco-309: $(TARGET) build
 # actually lands on `kai_bench_loop`.
 test-tco-perceus-wrap: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/perceus/unbox_bench.kai > build/tco-perceus.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/perceus/unbox_bench.kai > build/tco-perceus.c; \
 	grep -F -q '_kai_bench_loop_entry:;' build/tco-perceus.c \
 	  || { echo "tco-perceus-wrap FAIL (no _kai_bench_loop_entry label in emitted C)"; exit 1; }; \
 	grep -F -q 'goto _kai_bench_loop_entry;' build/tco-perceus.c \
@@ -5245,7 +5254,7 @@ test-tco-perceus-wrap: $(TARGET) build
 test-perceus-812-tracer: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/rc_counters_nonzero.kai; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-812tr.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-812tr.c \
 	  || { echo "perceus-812-tracer FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-812tr.c -o build/s2-812tr $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-812tr > /dev/null 2> build/s2-812tr.rc; \
@@ -5267,7 +5276,7 @@ test-perceus-1219-bootstrap-seed: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/bootstrap_no_builtin_nullary_seed_1219.kai; \
 	exp=../examples/perceus/bootstrap_no_builtin_nullary_seed_1219.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1219boot.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1219boot.c \
 	  || { echo "perceus-1219-bootstrap-seed FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1219boot.c -o build/s2-1219boot $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1219boot > build/s2-1219boot.out 2> build/s2-1219boot.rc; \
@@ -5291,7 +5300,7 @@ test-perceus-1219-bootstrap-seed: $(TARGET) build
 test-perceus-817-filter-leak: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/filter_heap_bounded_817.kai; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-817fl.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-817fl.c \
 	  || { echo "perceus-817-filter-leak FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-817fl.c -o build/s2-817fl $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-817fl > build/s2-817fl.out 2> build/s2-817fl.rc; \
@@ -5316,7 +5325,7 @@ test-perceus-1117-map-pipe-record-leak: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/map_pipe_record_leak_1117.kai; \
 	exp=../examples/perceus/map_pipe_record_leak_1117.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1117mprl.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1117mprl.c \
 	  || { echo "perceus-1117-map-pipe-record-leak FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1117mprl.c -o build/s2-1117mprl $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1117mprl > build/s2-1117mprl.out 2> build/s2-1117mprl.rc; \
@@ -5339,7 +5348,7 @@ test-perceus-1134-pipe-fusion: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/pipe_fusion_purity_1134.kai; \
 	exp=../examples/perceus/pipe_fusion_purity_1134.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1134pf.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1134pf.c \
 	  || { echo "perceus-1134-pipe-fusion FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1134pf.c -o build/s2-1134pf $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1134pf > build/s2-1134pf.out 2> build/s2-1134pf.rc; \
@@ -5361,7 +5370,7 @@ test-perceus-1134-pipe-fusion-ordering: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/pipe_fusion_ordering_1134.kai; \
 	exp=../examples/perceus/pipe_fusion_ordering_1134.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1134pfo.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1134pfo.c \
 	  || { echo "perceus-1134-pipe-fusion-ordering FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1134pfo.c -o build/s2-1134pfo $(LDLIBS_M); \
 	./build/s2-1134pfo > build/s2-1134pfo.out; \
@@ -5380,7 +5389,7 @@ test-perceus-1134-pipe-fusion-terminal: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/pipe_fusion_terminal_1134.kai; \
 	exp=../examples/perceus/pipe_fusion_terminal_1134.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1134pft.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1134pft.c \
 	  || { echo "perceus-1134-pipe-fusion-terminal FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1134pft.c -o build/s2-1134pft $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1134pft > build/s2-1134pft.out 2> build/s2-1134pft.rc; \
@@ -5401,7 +5410,7 @@ test-perceus-1143-pipe-fusion-lambda: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/pipe_fusion_lambda_1143.kai; \
 	exp=../examples/perceus/pipe_fusion_lambda_1143.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1143pfl.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1143pfl.c \
 	  || { echo "perceus-1143-pipe-fusion-lambda FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1143pfl.c -o build/s2-1143pfl $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1143pfl > build/s2-1143pfl.out 2> build/s2-1143pfl.rc; \
@@ -5422,7 +5431,7 @@ test-perceus-1143-pipe-fusion-ring: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/pipe_fusion_ring_1143.kai; \
 	exp=../examples/perceus/pipe_fusion_ring_1143.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1143pfr.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1143pfr.c \
 	  || { echo "perceus-1143-pipe-fusion-ring FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1143pfr.c -o build/s2-1143pfr $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1143pfr > build/s2-1143pfr.out 2> build/s2-1143pfr.rc; \
@@ -5447,7 +5456,7 @@ test-perceus-1186-map-pipe-terminal-field: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/pipe_fusion_terminal_field_1186.kai; \
 	exp=../examples/perceus/pipe_fusion_terminal_field_1186.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1186mptf.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1186mptf.c \
 	  || { echo "perceus-1186-map-pipe-terminal-field FAIL (kaic2 errored — annotation-needed regression)"; exit 1; }; \
 	grep -q map_sum build/s2-1186mptf.c \
 	  || { echo "perceus-1186-map-pipe-terminal-field FAIL (no map_sum — fusion regressed)"; exit 1; }; \
@@ -5484,7 +5493,7 @@ test-closure-spec-1205: $(TARGET) build
 	./build/s2-cs1205 > build/s2-cs1205.out; \
 	diff -q $$exp build/s2-cs1205.out > /dev/null \
 	  || { echo "closure-spec-1205 FAIL (output diff)"; diff $$exp build/s2-cs1205.out; exit 1; }; \
-	./$(TARGET) --emit=kir --path ../stdlib --edition hanga-roa $$src > build/s2-cs1205.kir 2>/dev/null; \
+	$(KAIC2) --emit=kir --path ../stdlib $$src > build/s2-cs1205.kir 2>/dev/null; \
 	awk '/^fn (vec__)?foldl_loop__cspec.*mono/,/^}/' build/s2-cs1205.kir > build/s2-cs1205-loop.kir; \
 	test -s build/s2-cs1205-loop.kir \
 	  || { echo "closure-spec-1205 FAIL (no specialised loop emitted — closure not specialised)"; exit 1; }; \
@@ -5509,7 +5518,7 @@ test-collect-ground-1208: $(TARGET) build
 	./build/s2-cg1208 > build/s2-cg1208.out; \
 	diff -q $$exp build/s2-cg1208.out > /dev/null \
 	  || { echo "collect-ground-1208 FAIL (output diff)"; diff $$exp build/s2-cg1208.out; exit 1; }; \
-	./$(TARGET) --emit=kir --path ../stdlib --edition hanga-roa $$src > build/s2-cg1208.kir 2>/dev/null; \
+	$(KAIC2) --emit=kir --path ../stdlib $$src > build/s2-cg1208.kir 2>/dev/null; \
 	awk '/^fn (protocols__)?rmcv_loop__cspec.*mono__Point/,/^}/' build/s2-cg1208.kir > build/s2-cg1208-loop.kir; \
 	test -s build/s2-cg1208-loop.kir \
 	  || { echo "collect-ground-1208 FAIL (no grounded collect loop emitted — return-only tparam not grounded)"; exit 1; }; \
@@ -5536,7 +5545,7 @@ test-collect-multiread-1208: $(TARGET) build
 	./build/s2-mr1208 > build/s2-mr1208.out; \
 	diff -q $$exp build/s2-mr1208.out > /dev/null \
 	  || { echo "collect-multiread-1208 FAIL (output diff — a boxed field was freed before its second read)"; diff $$exp build/s2-mr1208.out; exit 1; }; \
-	./$(TARGET) --path ../stdlib $$src 2>/dev/null | grep -F -q '__csb_' \
+	$(KAIC2) --path ../stdlib $$src 2>/dev/null | grep -F -q '__csb_' \
 	  || { echo "collect-multiread-1208 FAIL (no bind-once binder emitted — the multi-read guard did not fire)"; exit 1; }; \
 	echo "collect-multiread-1208 OK (every boxed field round-trips; bind-once binder present)"
 
@@ -5622,7 +5631,7 @@ test-perceus-1120-array-borrow: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/array_borrow_read_1120.kai; \
 	exp=../examples/perceus/array_borrow_read_1120.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1120ab.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1120ab.c \
 	  || { echo "perceus-1120-array-borrow FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1120ab.c -o build/s2-1120ab $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1120ab > build/s2-1120ab.out 2> build/s2-1120ab.rc; \
@@ -5671,7 +5680,7 @@ test-perceus-1135-vec-value: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_1135_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1135-vec FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
@@ -5686,7 +5695,7 @@ test-perceus-1135-vec-value: $(TARGET) build
 	       grep vec_ build/s2-vec_shared_cow_1135.rc || true; exit 1; }; \
 	src=../examples/effects/vec_pure_row_1135.kai; \
 	exp=../examples/effects/vec_pure_row_1135.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-vec_pure_row.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-vec_pure_row.c \
 	  || { echo "perceus-1135-vec FAIL (pure-row fixture rejected — a Vec op raised an effect demand)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-vec_pure_row.c -o build/s2-vec_pure_row $(LDLIBS_M); \
 	./build/s2-vec_pure_row > build/s2-vec_pure_row.out; \
@@ -5736,7 +5745,7 @@ test-perceus-1135-vec-raw: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_1135_RAW_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1135-vec-raw FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
@@ -5777,7 +5786,7 @@ test-perceus-1151-vec-push-growth: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_1151_GROWTH_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1151-vec-push-growth FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	  ./build/s2-$$name > build/s2-$$name.out; \
@@ -5801,7 +5810,7 @@ test-perceus-1151-vec-push-growth-native: $(TARGET) build
 test-perceus-1151-vec-push-growth-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_1151_GROWTH_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -5832,7 +5841,7 @@ test-perceus-1153-modcall-linear: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_1153_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1153-modcall-linear FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	  KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
@@ -5864,7 +5873,7 @@ test-perceus-1153-modcall-linear-native: $(TARGET) build
 test-perceus-1153-modcall-linear-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_1153_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -5889,7 +5898,7 @@ test-perceus-1338-ledger-mn: $(TARGET) build
 	@set -e; \
 	name=ledger_mn_sum_1338; \
 	src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	  || { echo "perceus-1338-ledger-mn FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	for t in 1 4; do \
@@ -5921,7 +5930,7 @@ test-perceus-1150-vec-surface: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_1150_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1150-vec-surface FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
@@ -5960,7 +5969,7 @@ test-perceus-1150-vec-surface-native: $(TARGET) build
 test-perceus-1150-vec-surface-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_1150_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -5992,7 +6001,7 @@ test-perceus-1126-read-loop-drop: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_1126_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
 	    || { echo "perceus-1126-read-loop-drop FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
@@ -6037,7 +6046,7 @@ test-perceus-1127-borrow-closure: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/borrow_closure_1127.kai; \
 	exp=../examples/perceus/borrow_closure_1127.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1127bc.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1127bc.c \
 	  || { echo "perceus-1127-borrow-closure FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1127bc.c -o build/s2-1127bc $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1127bc > build/s2-1127bc.out 2> build/s2-1127bc.rc; \
@@ -6078,7 +6087,7 @@ test-perceus-1512-fn-name-hoist: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/borrow_fn_name_hoisted_1512.kai; \
 	exp=../examples/perceus/borrow_fn_name_hoisted_1512.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1512fnh.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1512fnh.c \
 	  || { echo "perceus-1512-fn-name-hoist FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1512fnh.c -o build/s2-1512fnh $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1512fnh > build/s2-1512fnh.out 2> build/s2-1512fnh.rc; \
@@ -6093,7 +6102,7 @@ test-perceus-1127-borrow-hof: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/borrow_stdlib_hof_1127.kai; \
 	exp=../examples/perceus/borrow_stdlib_hof_1127.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1127hof.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1127hof.c \
 	  || { echo "perceus-1127-borrow-hof FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1127hof.c -o build/s2-1127hof $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1127hof > build/s2-1127hof.out 2> build/s2-1127hof.rc; \
@@ -6125,7 +6134,7 @@ test-perceus-1127-borrow-tco: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/borrow_tco_descent_1127.kai; \
 	exp=../examples/perceus/borrow_tco_descent_1127.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1127tco.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1127tco.c \
 	  || { echo "perceus-1127-borrow-tco FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1127tco.c -o build/s2-1127tco $(LDLIBS_M); \
 	./build/s2-1127tco > build/s2-1127tco.out \
@@ -6155,7 +6164,7 @@ test-perceus-1130-borrow-pipe: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/borrow_closure_pipe_1130.kai; \
 	exp=../examples/perceus/borrow_closure_pipe_1130.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1130bp.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1130bp.c \
 	  || { echo "perceus-1130-borrow-pipe FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1130bp.c -o build/s2-1130bp $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1130bp > build/s2-1130bp.out 2> build/s2-1130bp.rc; \
@@ -6188,7 +6197,7 @@ test-perceus-1130-hof-tail-drop: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/borrow_hof_tail_drop_1130.kai; \
 	exp=../examples/perceus/borrow_hof_tail_drop_1130.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1130htd.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1130htd.c \
 	  || { echo "perceus-1130-hof-tail-drop FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1130htd.c -o build/s2-1130htd $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1130htd > build/s2-1130htd.out 2> build/s2-1130htd.rc; \
@@ -6216,7 +6225,7 @@ test-perceus-1131-borrow-descent: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/borrow_descent_1127.kai; \
 	exp=../examples/perceus/borrow_descent_1127.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1131desc.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1131desc.c \
 	  || { echo "perceus-1131-borrow-descent FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1131desc.c -o build/s2-1131desc $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1131desc > build/s2-1131desc.out 2> build/s2-1131desc.rc; \
@@ -6247,7 +6256,7 @@ test-perceus-1131-modular-escape: $(TARGET) build
 	  || { echo "perceus-1131-modular-escape FAIL (modular compiler build/link)"; cat build/s2-1131modesc.log; exit 1; }; \
 	KAIKAI_STDLIB_PATH=$(STDLIB_ABS) $$out $$src > build/s2-1131modesc.c 2> build/s2-1131modesc.err \
 	  || { echo "perceus-1131-modular-escape FAIL (modular compiler UAF'd compiling the fixture)"; cat build/s2-1131modesc.err; exit 1; }; \
-	KAIKAI_STDLIB_PATH=$(STDLIB_ABS) ./$(TARGET) $(TEST_CORE_CACHE) $$src > build/s2-1131modesc-ref.c; \
+	KAIKAI_STDLIB_PATH=$(STDLIB_ABS) $(KAIC2) $(TEST_CORE_CACHE) $$src > build/s2-1131modesc-ref.c; \
 	diff -q build/s2-1131modesc-ref.c build/s2-1131modesc.c > /dev/null \
 	  && echo "perceus-1131-modular-escape OK (modular compiler compiles the escape shape byte-identically to single-TU)" \
 	  || { echo "perceus-1131-modular-escape FAIL (modular emit differs from single-TU)"; exit 1; }
@@ -6263,7 +6272,7 @@ test-perceus-1295-borrow-slot-nested-arg: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/borrow_slot_nested_arg_1295.kai; \
 	exp=../examples/perceus/borrow_slot_nested_arg_1295.out.expected; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1295bsna.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1295bsna.c \
 	  || { echo "perceus-1295-borrow-slot-nested-arg FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1295bsna.c -o build/s2-1295bsna $(LDLIBS_M); \
 	./build/s2-1295bsna > build/s2-1295bsna.out \
@@ -6279,7 +6288,7 @@ test-perceus-1295-borrow-slot-nested-arg: $(TARGET) build
 test-perceus-1295-borrow-slot-nested-arg-asan: $(TARGET) build
 	@set -e; \
 	name=borrow_slot_nested_arg_1295; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -6303,7 +6312,7 @@ test-perceus-1295-borrow-slot-nested-arg-asan: $(TARGET) build
 test-perceus-1303-single-use-branch-leak: $(TARGET) build
 	@set -e; \
 	name=single_use_param_branch_leak_1303; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1303subl.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1303subl.c \
 	  || { echo "perceus-1303-single-use-branch-leak FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1303subl.c -o build/s2-1303subl $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1303subl > build/s2-1303subl.out 2> build/s2-1303subl.rc \
@@ -6324,7 +6333,7 @@ test-perceus-1303-single-use-branch-leak: $(TARGET) build
 test-perceus-1303-single-use-branch-leak-asan: $(TARGET) build
 	@set -e; \
 	name=single_use_param_branch_leak_1303; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -6349,7 +6358,7 @@ test-perceus-1303-single-use-branch-leak-asan: $(TARGET) build
 test-perceus-1302-tcrec-goto-drops: $(TARGET) build
 	@set -e; \
 	name=tcrec_goto_owned_binder_1302; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1302tgd.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1302tgd.c \
 	  || { echo "perceus-1302-tcrec-goto-drops FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1302tgd.c -o build/s2-1302tgd $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1302tgd > build/s2-1302tgd.out 2> build/s2-1302tgd.rc \
@@ -6369,7 +6378,7 @@ test-perceus-1302-tcrec-goto-drops: $(TARGET) build
 test-perceus-1302-tcrec-goto-drops-asan: $(TARGET) build
 	@set -e; \
 	name=tcrec_goto_owned_binder_1302; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -6413,7 +6422,7 @@ test-perceus-1302-tcrec-goto-drops-native: $(TARGET) build
 test-perceus-1635-goto-move-collision: $(TARGET) build
 	@set -e; \
 	name=goto_move_name_collision_1635; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1635gmc.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1635gmc.c \
 	  || { echo "perceus-1635-goto-move-collision FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1635gmc.c -o build/s2-1635gmc $(LDLIBS_M); \
 	KAI_THREADS=1 ./build/s2-1635gmc > build/s2-1635gmc.out 2> build/s2-1635gmc.err \
@@ -6428,7 +6437,7 @@ test-perceus-1635-goto-move-collision: $(TARGET) build
 test-perceus-1635-goto-move-collision-asan: $(TARGET) build
 	@set -e; \
 	name=goto_move_name_collision_1635; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -6466,7 +6475,7 @@ test-perceus-1635-goto-move-collision-native: $(TARGET) build
 test-perceus-1758-cond-exit-drop: $(TARGET) build
 	@set -e; \
 	name=owned_param_bare_pass_selfrec_1758; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1758ced.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1758ced.c \
 	  || { echo "perceus-1758-cond-exit-drop FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1758ced.c -o build/s2-1758ced $(LDLIBS_M); \
 	KAI_THREADS=1 ./build/s2-1758ced > build/s2-1758ced.out 2> build/s2-1758ced.err \
@@ -6480,7 +6489,7 @@ test-perceus-1758-cond-exit-drop: $(TARGET) build
 test-perceus-1758-cond-exit-drop-asan: $(TARGET) build
 	@set -e; \
 	name=owned_param_bare_pass_selfrec_1758; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -6521,7 +6530,7 @@ MOVE_GATE_1768_FIXTURES := move_gate_assert_read_1768 move_gate_guard_lastuse_17
 test-perceus-1768-move-gate-positions: $(TARGET) build
 	@set -e; \
 	for name in $(MOVE_GATE_1768_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1768mgp.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1768mgp.c \
 	    || { echo "perceus-1768-move-gate-positions FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1768mgp.c -o build/s2-1768mgp $(LDLIBS_M); \
 	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1768mgp > build/s2-1768mgp.out 2> build/s2-1768mgp.rc \
@@ -6537,7 +6546,7 @@ test-perceus-1768-move-gate-positions: $(TARGET) build
 test-perceus-1768-move-gate-positions-asan: $(TARGET) build
 	@set -e; \
 	for name in $(MOVE_GATE_1768_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1768mgp-asan.c \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1768mgp-asan.c \
 	    || { echo "perceus-1768-move-gate-positions-asan FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -6573,7 +6582,7 @@ test-perceus-1768-move-gate-positions-native: $(TARGET) build
 test-perceus-1771-borrow-raw-scrutinee: $(TARGET) build
 	@set -e; \
 	name=borrow_raw_scrutinee_1771; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1771brs.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1771brs.c \
 	  || { echo "perceus-1771-borrow-raw-scrutinee FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1771brs.c -o build/s2-1771brs $(LDLIBS_M); \
 	KAI_THREADS=1 ./build/s2-1771brs > build/s2-1771brs.out 2> build/s2-1771brs.err \
@@ -6607,7 +6616,7 @@ LET_SC_1785_FIXTURES := let_shortcircuit_tail_1785 let_shortcircuit_stmt_1785
 test-perceus-1770-arm-birth-leak: $(TARGET) build
 	@set -e; \
 	for name in $(ARM_BIRTH_1770_FIXTURES) $(GUARD_FAIL_1774_FIXTURES) $(BIRTH_PAY_1777_FIXTURES) $(BRANCH_PAY_1780_FIXTURES) $(LET_SC_1785_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1770abl.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1770abl.c \
 	    || { echo "perceus-1770-arm-birth-leak FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1770abl.c -o build/s2-1770abl $(LDLIBS_M); \
 	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1770abl > build/s2-1770abl.out 2> build/s2-1770abl.rc \
@@ -6628,7 +6637,7 @@ test-perceus-1770-arm-birth-leak: $(TARGET) build
 test-perceus-1770-arm-birth-leak-asan: $(TARGET) build
 	@set -e; \
 	for name in $(ARM_BIRTH_1770_FIXTURES) $(GUARD_FAIL_1774_FIXTURES) $(BIRTH_PAY_1777_FIXTURES) $(BRANCH_PAY_1780_FIXTURES) $(LET_SC_1785_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1770abl-asan.c \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1770abl-asan.c \
 	    || { echo "perceus-1770-arm-birth-leak-asan FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -6670,7 +6679,7 @@ test-perceus-1770-arm-birth-leak-native: $(TARGET) build
 test-perceus-1783-interp-intern-leak: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/interp_intern_leak_1783.kai; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1783iil.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1783iil.c \
 	  || { echo "perceus-1783-interp-intern-leak FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1783iil.c -o build/s2-1783iil $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1783iil > build/s2-1783iil.out 2> build/s2-1783iil.rc \
@@ -6705,7 +6714,7 @@ VARIANT_REBUILD_1784_FIXTURES := variant_rebuild_diagonal_1784 variant_rebuild_w
 test-perceus-1784-variant-rebuild: $(TARGET) build
 	@set -e; \
 	for name in $(VARIANT_REBUILD_1784_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1784vr.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1784vr.c \
 	    || { echo "perceus-1784-variant-rebuild FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1784vr.c -o build/s2-1784vr $(LDLIBS_M); \
 	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1784vr > build/s2-1784vr.out 2> build/s2-1784vr.rc \
@@ -6724,7 +6733,7 @@ test-perceus-1784-variant-rebuild: $(TARGET) build
 test-perceus-1784-variant-rebuild-asan: $(TARGET) build
 	@set -e; \
 	for name in $(VARIANT_REBUILD_1784_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -6768,7 +6777,7 @@ RECORD_NESTED_REUSE_FLOOR_NATIVE := record_rebuild_samefield_1786
 test-perceus-1786-record-rebuild: $(TARGET) build
 	@set -e; \
 	for name in $(RECORD_NESTED_REBUILD_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1786rr.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1786rr.c \
 	    || { echo "perceus-1786-record-rebuild FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1786rr.c -o build/s2-1786rr $(LDLIBS_M); \
 	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1786rr > build/s2-1786rr.out 2> build/s2-1786rr.rc \
@@ -6787,7 +6796,7 @@ test-perceus-1786-record-rebuild: $(TARGET) build
 test-perceus-1786-record-rebuild-asan: $(TARGET) build
 	@set -e; \
 	for name in $(RECORD_NESTED_REBUILD_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1786rr-asan.c \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1786rr-asan.c \
 	    || { echo "perceus-1786-record-rebuild-asan FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -6834,7 +6843,7 @@ ARM_USE_SCOPE_1791_FIXTURES := arm_use_scope_collision_1791
 test-perceus-1791-arm-use-scope: $(TARGET) build
 	@set -e; \
 	for name in $(ARM_USE_SCOPE_1791_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1791aus.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1791aus.c \
 	    || { echo "perceus-1791-arm-use-scope FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1791aus.c -o build/s2-1791aus $(LDLIBS_M); \
 	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1791aus > build/s2-1791aus.out 2> build/s2-1791aus.rc \
@@ -6856,7 +6865,7 @@ test-perceus-1791-arm-use-scope: $(TARGET) build
 test-perceus-1791-arm-use-scope-asan: $(TARGET) build
 	@set -e; \
 	for name in $(ARM_USE_SCOPE_1791_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1791aus-asan.c \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1791aus-asan.c \
 	    || { echo "perceus-1791-arm-use-scope-asan FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -6899,7 +6908,7 @@ CAP_PARAM_1801_FIXTURES := capability_param_dispatch capability_param_multi_inst
 test-perceus-1801-capability-param: $(TARGET) build
 	@set -e; \
 	for name in $(CAP_PARAM_1801_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/s2-1801cap.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/s2-1801cap.c \
 	    || { echo "perceus-1801-capability-param FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1801cap.c -o build/s2-1801cap $(LDLIBS_M); \
 	  KAI_THREADS=1 ./build/s2-1801cap > build/s2-1801cap.out 2> build/s2-1801cap.err \
@@ -6912,7 +6921,7 @@ test-perceus-1801-capability-param: $(TARGET) build
 test-perceus-1801-capability-param-asan: $(TARGET) build
 	@set -e; \
 	for name in $(CAP_PARAM_1801_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/s2-1801cap-asan.c \
+	  $(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/s2-1801cap-asan.c \
 	    || { echo "perceus-1801-capability-param-asan FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -6951,7 +6960,7 @@ OP_ARG_1803_FIXTURES := op_arg_clause_match_1803
 test-perceus-1803-op-arg-free: $(TARGET) build
 	@set -e; \
 	for name in $(OP_ARG_1803_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1803oaf.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1803oaf.c \
 	    || { echo "perceus-1803-op-arg-free FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1803oaf.c -o build/s2-1803oaf $(LDLIBS_M); \
 	  KAI_THREADS=1 ./build/s2-1803oaf > build/s2-1803oaf.out 2> build/s2-1803oaf.err \
@@ -6977,7 +6986,7 @@ test-perceus-1803-op-arg-free-native: $(TARGET) build
 test-perceus-1803-op-arg-free-asan: $(TARGET) build
 	@set -e; \
 	for name in $(OP_ARG_1803_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1803oaf-asan.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1803oaf-asan.c \
 	    || { echo "perceus-1803-op-arg-free-asan FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	    -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -7004,7 +7013,7 @@ test-perceus-1803-op-arg-free-asan: $(TARGET) build
 test-perceus-1765-binop-base-tail: $(TARGET) build
 	@set -e; \
 	name=owned_param_binop_base_tail_1765; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1765bbt.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1765bbt.c \
 	  || { echo "perceus-1765-binop-base-tail FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1765bbt.c -o build/s2-1765bbt $(LDLIBS_M); \
 	KAI_THREADS=1 ./build/s2-1765bbt > build/s2-1765bbt.out 2> build/s2-1765bbt.err \
@@ -7018,7 +7027,7 @@ test-perceus-1765-binop-base-tail: $(TARGET) build
 test-perceus-1765-binop-base-tail-asan: $(TARGET) build
 	@set -e; \
 	name=owned_param_binop_base_tail_1765; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -7056,7 +7065,7 @@ test-perceus-1765-binop-base-tail-native: $(TARGET) build
 test-perceus-1324-char-binder-goto: $(TARGET) build
 	@set -e; \
 	name=tcrec_char_binder_goto_1324; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1324cbg.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1324cbg.c \
 	  || { echo "perceus-1324-char-binder-goto FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1324cbg.c -o build/s2-1324cbg $(LDLIBS_M); \
 	./build/s2-1324cbg > build/s2-1324cbg.out 2>&1 \
@@ -7072,7 +7081,7 @@ test-perceus-1324-char-binder-goto: $(TARGET) build
 test-perceus-1324-char-binder-goto-asan: $(TARGET) build
 	@set -e; \
 	name=tcrec_char_binder_goto_1324; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
 	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
@@ -7107,7 +7116,7 @@ test-perceus-1324-char-binder-goto-native: $(TARGET) build
 test-perceus-1395-char-param-raw: $(TARGET) build
 	@set -e; \
 	name=char_param_raw_1395; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1395cpr.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1395cpr.c \
 	  || { echo "perceus-1395-char-param-raw FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1395cpr.c -o build/s2-1395cpr $(LDLIBS_M); \
 	./build/s2-1395cpr > build/s2-1395cpr.out 2>&1 \
@@ -7121,7 +7130,7 @@ test-perceus-1395-char-param-raw: $(TARGET) build
 test-perceus-1395-char-param-raw-asan: $(TARGET) build
 	@set -e; \
 	name=char_param_raw_1395; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
 	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
@@ -7156,7 +7165,7 @@ test-perceus-1395-char-param-raw-native: $(TARGET) build
 test-perceus-1410-byte-raw-ops: $(TARGET) build
 	@set -e; \
 	name=byte_raw_ops_1410; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1410bro.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1410bro.c \
 	  || { echo "perceus-1410-byte-raw-ops FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1410bro.c -o build/s2-1410bro $(LDLIBS_M); \
 	./build/s2-1410bro > build/s2-1410bro.out 2>&1 \
@@ -7170,7 +7179,7 @@ test-perceus-1410-byte-raw-ops: $(TARGET) build
 test-perceus-1410-byte-raw-ops-asan: $(TARGET) build
 	@set -e; \
 	name=byte_raw_ops_1410; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
 	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
@@ -7206,7 +7215,7 @@ test-perceus-1410-byte-raw-ops-native: $(TARGET) build
 test-perceus-1457-fixed-raw-ops: $(TARGET) build
 	@set -e; \
 	name=fixed_raw_ops_1457; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1457fro.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1457fro.c \
 	  || { echo "perceus-1457-fixed-raw-ops FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1457fro.c -o build/s2-1457fro $(LDLIBS_M); \
 	./build/s2-1457fro > build/s2-1457fro.out 2>&1 \
@@ -7220,7 +7229,7 @@ test-perceus-1457-fixed-raw-ops: $(TARGET) build
 test-perceus-1457-fixed-raw-ops-asan: $(TARGET) build
 	@set -e; \
 	name=fixed_raw_ops_1457; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
 	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
@@ -7254,7 +7263,7 @@ test-perceus-1457-fixed-raw-ops-native: $(TARGET) build
 test-perceus-1464-fixed-raw-ops: $(TARGET) build
 	@set -e; \
 	name=fixed_raw_ops_1464; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1464fro.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1464fro.c \
 	  || { echo "perceus-1464-fixed-raw-ops FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1464fro.c -o build/s2-1464fro $(LDLIBS_M); \
 	./build/s2-1464fro > build/s2-1464fro.out 2>&1 \
@@ -7268,7 +7277,7 @@ test-perceus-1464-fixed-raw-ops: $(TARGET) build
 test-perceus-1464-fixed-raw-ops-asan: $(TARGET) build
 	@set -e; \
 	name=fixed_raw_ops_1464; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
 	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
@@ -7302,7 +7311,7 @@ test-perceus-1464-fixed-raw-ops-native: $(TARGET) build
 test-perceus-1637-int-wrap-ops: $(TARGET) build
 	@set -e; \
 	name=int_wrap_ops_1637; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1637iwo.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1637iwo.c \
 	  || { echo "perceus-1637-int-wrap-ops FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1637iwo.c -o build/s2-1637iwo $(LDLIBS_M); \
 	./build/s2-1637iwo > build/s2-1637iwo.out 2>&1 \
@@ -7316,7 +7325,7 @@ test-perceus-1637-int-wrap-ops: $(TARGET) build
 test-perceus-1637-int-wrap-ops-asan: $(TARGET) build
 	@set -e; \
 	name=int_wrap_ops_1637; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
 	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
@@ -7350,7 +7359,7 @@ test-perceus-1637-int-wrap-ops-native: $(TARGET) build
 test-issue-1454-fixed-vec: $(TARGET) build
 	@set -e; \
 	name=fixed_vec_inline_1454; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1454fv.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1454fv.c \
 	  || { echo "issue-1454-fixed-vec FAIL (kaic2 errored)"; exit 1; }; \
 	grep -q 'typedef struct { double a\[3\]; } KaiFixedVec_Real_3;' build/s2-1454fv.c \
 	  || { echo "issue-1454-fixed-vec FAIL (no fixed typedef emitted)"; exit 1; }; \
@@ -7399,7 +7408,7 @@ test-issue-1454-fixed-vec-native: $(TARGET) build
 test-issue-1481-fixed-vec-border: $(TARGET) build
 	@set -e; \
 	name=fixed_vec_border_1481; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1481fvb.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1481fvb.c \
 	  || { echo "issue-1481-fixed-vec-border FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1481fvb.c -o build/s2-1481fvb $(LDLIBS_M); \
 	./build/s2-1481fvb > build/s2-1481fvb.out 2>&1 \
@@ -7439,7 +7448,7 @@ FIXED_VEC_1480 := fixed_vec_dynamic_index_1480 fixed_vec_match_arms_1480 fixed_v
 test-issue-1480-fixed-vec-shapes: $(TARGET) build
 	@set -e; \
 	for name in $(FIXED_VEC_1480); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1480fv.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1480fv.c \
 	    || { echo "issue-1480-fixed-vec-shapes FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  grep -qE 'KaiFixedVec_(Int|Real)_[0-9]+' build/s2-1480fv.c \
 	    || { echo "issue-1480-fixed-vec-shapes FAIL ($$name: no fixed typedef — representation lost)"; exit 1; }; \
@@ -7456,7 +7465,7 @@ test-issue-1480-fixed-vec-shapes: $(TARGET) build
 	    || { echo "issue-1480-fixed-vec-shapes FAIL ($$name: output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1480fv.out; exit 1; }; \
 	done; \
 	grep -q 'kai_fixed_vec_idx' build/s2-1480fv.c || true; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/fixed_vec_dynamic_index_1480.kai 2>/dev/null \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/fixed_vec_dynamic_index_1480.kai 2>/dev/null \
 	  | grep -q 'kai_fixed_vec_idx' \
 	  || { echo "issue-1480-fixed-vec-shapes FAIL (dynamic index emitted no bounds check)"; exit 1; }; \
 	echo "issue-1480-fixed-vec-shapes OK (inline reads, bounds-checked dynamic index, no dynamic vec)"
@@ -7466,7 +7475,7 @@ test-issue-1480-fixed-vec-shapes: $(TARGET) build
 test-issue-1480-fixed-vec-collect-neg: $(TARGET) build
 	@set -e; \
 	name=fixed_vec_collect_unprovable_1480; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1480neg.c 2> build/s2-1480neg.err \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1480neg.c 2> build/s2-1480neg.err \
 	  && { echo "issue-1480-fixed-vec-collect-neg FAIL (accepted an unprovable collect)"; exit 1; } \
 	  || true; \
 	grep -qF "$$(cat ../examples/perceus/$$name.err.expected)" build/s2-1480neg.err \
@@ -7503,7 +7512,7 @@ test-issue-1480-fixed-vec-shapes-native: $(TARGET) build
 test-issue-1491-fixed-vec-param: $(TARGET) build
 	@set -e; \
 	name=fixed_vec_param_1491; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1491fvp.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1491fvp.c \
 	  || { echo "issue-1491-fixed-vec-param FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1491fvp.c -o build/s2-1491fvp $(LDLIBS_M); \
 	./build/s2-1491fvp > build/s2-1491fvp.out 2>&1 \
@@ -7539,7 +7548,7 @@ test-issue-1491-fixed-vec-param-native: $(TARGET) build
 test-issue-1518-fixed-vec-param-raw: $(TARGET) build
 	@set -e; \
 	name=fixed_vec_param_raw_1518; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1518fvr.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1518fvr.c \
 	  || { echo "issue-1518-fixed-vec-param-raw FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1518fvr.c -o build/s2-1518fvr $(LDLIBS_M); \
 	./build/s2-1518fvr > build/s2-1518fvr.out 2>&1 \
@@ -7575,7 +7584,7 @@ test-issue-1518-fixed-vec-param-raw-native: $(TARGET) build
 test-issue-1517-linalg-matrix-ops: $(TARGET) build
 	@set -e; \
 	name=linalg_matrix_ops; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1517lin.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1517lin.c \
 	  || { echo "issue-1517-linalg-matrix-ops FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1517lin.c -o build/s2-1517lin $(LDLIBS_M); \
 	./build/s2-1517lin > build/s2-1517lin.out 2>&1 \
@@ -7613,7 +7622,7 @@ test-issue-1517-linalg-matrix-ops-native: $(TARGET) build
 test-issue-1394-byte-box: $(TARGET) build
 	@set -e; \
 	name=byte_field_box_1394; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1394bb.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1394bb.c \
 	  || { echo "issue-1394-byte-box FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1394bb.c -o build/s2-1394bb $(LDLIBS_M); \
 	./build/s2-1394bb > build/s2-1394bb.out 2>&1 \
@@ -7627,7 +7636,7 @@ test-issue-1394-byte-box: $(TARGET) build
 test-issue-1394-byte-box-asan: $(TARGET) build
 	@set -e; \
 	name=byte_field_box_1394; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-absolute-value \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan $(LDLIBS_M); \
 	ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
@@ -7662,7 +7671,7 @@ test-issue-1394-byte-box-native: $(TARGET) build
 test-perceus-1315-borrowed-match-release: $(TARGET) build
 	@set -e; \
 	for name in borrowed_match_str_payload_1315 borrowed_match_list_payload_1315; do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
 	    || { echo "perceus-1315-borrowed-match-release FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc \
@@ -7683,7 +7692,7 @@ test-perceus-1315-borrowed-match-release: $(TARGET) build
 test-perceus-1315-borrowed-match-release-asan: $(TARGET) build
 	@set -e; \
 	for name in borrowed_match_str_payload_1315 borrowed_match_list_payload_1315; do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -7739,7 +7748,7 @@ test-perceus-1315-borrowed-match-release-native: $(TARGET) build
 test-perceus-1355-closure-temp-release: $(TARGET) build
 	@set -e; \
 	name=closure_temp_borrowed_hof_1355; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
 	  || { echo "perceus-1355-closure-temp-release FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc \
@@ -7759,7 +7768,7 @@ test-perceus-1355-closure-temp-release: $(TARGET) build
 test-perceus-1355-closure-temp-release-asan: $(TARGET) build
 	@set -e; \
 	name=closure_temp_borrowed_hof_1355; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -7800,7 +7809,7 @@ test-perceus-1355-closure-temp-release-native: $(TARGET) build
 test-perceus-1328-selftail-borrowed-local: $(TARGET) build
 	@set -e; \
 	for name in selftail_borrowed_local_1328 tail_read_borrowed_local_1328 selftail_consuming_multiuse_1328 selftail_arm_binder_move_1328 rethread_param_consuming_read_1328; do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
 	    || { echo "perceus-1328-selftail-borrowed-local FAIL ($$name: kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	  KAI_TRACE_RC=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc \
@@ -7821,7 +7830,7 @@ test-perceus-1328-selftail-borrowed-local: $(TARGET) build
 test-perceus-1328-selftail-borrowed-local-asan: $(TARGET) build
 	@set -e; \
 	for name in selftail_borrowed_local_1328 tail_read_borrowed_local_1328 selftail_consuming_multiuse_1328 selftail_arm_binder_move_1328 rethread_param_consuming_read_1328; do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -7867,7 +7876,7 @@ test-perceus-1328-selftail-borrowed-local-native: $(TARGET) build
 test-heap-limit: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/heap_limit_runaway_878.kai; \
-	./$(TARGET) --path ../stdlib $$src > build/s2-878hl.c \
+	$(KAIC2) --path ../stdlib $$src > build/s2-878hl.c \
 	  || { echo "heap-limit FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-878hl.c -o build/s2-878hl $(LDLIBS_M); \
 	lo=0; KAI_MAX_HEAP=64m $(TIMEOUT) 30 ./build/s2-878hl > build/s2-878hl.lo.out 2> build/s2-878hl.lo.err || lo=$$?; \
@@ -8079,7 +8088,7 @@ test-perceus-1053-nested-rotation-reuse: $(TARGET) build
 test-perceus-1104-balance-token-donation: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/balance_token_donation_1104.kai; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1104btd.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1104btd.c \
 	  || { echo "perceus-1104-balance-token-donation FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1104btd.c -o build/s2-1104btd $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1104btd > build/s2-1104btd.out 2> build/s2-1104btd.rc; \
@@ -8132,7 +8141,7 @@ test-perceus-1164-cross-call-donation: $(TARGET) build
 test-perceus-1104-sibling-param-move: $(TARGET) build
 	@set -e; \
 	src=../examples/perceus/balance_sibling_param_move_1104.kai; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1104spm.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1104spm.c \
 	  || { echo "perceus-1104-sibling-param-move FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1104spm.c -o build/s2-1104spm $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1104spm > build/s2-1104spm.out 2> build/s2-1104spm.rc; \
@@ -8160,7 +8169,7 @@ test-perceus-1136-sized-variant: $(TARGET) build
 	@set -e; \
 	for name in variant_static_match_1136 variant_raw_rebuild_1136 variant_poly_frontier_1136; do \
 	  src=../examples/perceus/$$name.kai; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1136-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1136-$$name.c \
 	    || { echo "perceus-1136-sized-variant FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1136-$$name.c -o build/s2-1136-$$name $(LDLIBS_M); \
 	  ./build/s2-1136-$$name > build/s2-1136-$$name.out; \
@@ -8190,13 +8199,13 @@ test-perceus-1136-sized-variant-native: $(TARGET) build
 test-perceus-1180-range-lazy: $(TARGET) build
 	@set -e; \
 	name=range_lazy_1180; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
 	  || { echo "perceus-1180-range-lazy FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
 	diff -q ../examples/perceus/$$name.out.expected build/s2-$$name.out > /dev/null \
 	  || { echo "perceus-1180-range-lazy FAIL (output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-$$name.out; exit 1; }; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/range_step_zero_1180.kai > build/s2-1180-step0.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/range_step_zero_1180.kai > build/s2-1180-step0.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1180-step0.c -o build/s2-1180-step0 $(LDLIBS_M); \
 	if ./build/s2-1180-step0 > /dev/null 2> build/s2-1180-step0.err; then \
 	  echo "perceus-1180-range-lazy FAIL (zero step did not trap)"; exit 1; \
@@ -8218,7 +8227,7 @@ test-perceus-1180-range-lazy-native: $(TARGET) build
 test-perceus-1180-range-lazy-asan: $(TARGET) build
 	@set -e; \
 	name=range_lazy_1180; \
-	./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	      -I ../stage2 -I ../stage0 build/s2-$$name-asan.c -o build/s2-$$name-asan; \
@@ -8236,7 +8245,7 @@ test-perceus-1180-range-lazy-asan: $(TARGET) build
 test-perceus-1180-range-sum: $(TARGET) build
 	@set -e; \
 	name=range_lazy_sum_1180; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
 	  || { echo "perceus-1180-range-sum FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
@@ -8270,7 +8279,7 @@ test-perceus-1180-range-sum-native: $(TARGET) build
 test-shape-fusion-1200: $(TARGET) build
 	@set -e; \
 	name=shape_fusion_1200; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
 	  || { echo "shape-fusion-1200 FAIL (kaic2 errored)"; exit 1; }; \
 	grep -q 'kai___pimpl_Sequence_Chain_foldl' build/s2-$$name.c \
 	  || { echo "shape-fusion-1200 FAIL (impl foldl not called — pipe did not dispatch)"; exit 1; }; \
@@ -8294,7 +8303,7 @@ test-shape-laws-1200: $(TARGET) build
 	@set -e; \
 	run() { \
 	  src=../examples/sugars/$$1.kai; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --prop-check --path ../stdlib $$src > build/s2-$$1.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) --prop-check --path ../stdlib $$src > build/s2-$$1.c \
 	    || { echo "shape-laws-1200 FAIL ($$1 kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$1.c -o build/s2-$$1 $(LDLIBS_M); \
 	  ./build/s2-$$1 > build/s2-$$1.out 2>&1 || true; \
@@ -8319,7 +8328,7 @@ test-perceus-1156-raw-widen: $(TARGET) build
 	@set -e; \
 	name=variant_raw_widen_1156; \
 	src=../examples/perceus/$$name.kai; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1156-$$name.c \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-1156-$$name.c \
 	  || { echo "perceus-1156-raw-widen FAIL ($$name kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1156-$$name.c -o build/s2-1156-$$name $(LDLIBS_M); \
 	./build/s2-1156-$$name > build/s2-1156-$$name.out; \
@@ -8348,7 +8357,7 @@ test-perceus-1157-full-mask: $(TARGET) build
 	@set -e; \
 	name=variant_full_mask_1157; \
 	src=../examples/perceus/$$name.kai; \
-	./$(TARGET) --path ../stdlib $$src > build/s2-1157-$$name.c \
+	$(KAIC2) --path ../stdlib $$src > build/s2-1157-$$name.c \
 	  || { echo "perceus-1157-full-mask FAIL ($$name kaic2 errored)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1157-$$name.c -o build/s2-1157-$$name $(LDLIBS_M); \
 	./build/s2-1157-$$name > build/s2-1157-$$name.out; \
@@ -8388,7 +8397,7 @@ test-perceus-1160-de-opaque: $(TARGET) build
 	@set -e; \
 	for name in $(DE_OPAQUE_1160_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; \
-	  ./$(TARGET) --path ../stdlib $$src > build/s2-1160-$$name.c \
+	  $(KAIC2) --path ../stdlib $$src > build/s2-1160-$$name.c \
 	    || { echo "perceus-1160-de-opaque FAIL ($$name kaic2 errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1160-$$name.c -o build/s2-1160-$$name $(LDLIBS_M); \
 	  ./build/s2-1160-$$name > build/s2-1160-$$name.out; \
@@ -8421,7 +8430,7 @@ test-kir-inline-trmc-1158: $(TARGET) build
 	  || { echo "kir-inline-trmc-1158 FAIL (run crashed/hung — TRMC spine broke under the paste)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_inline_trmc_tail_1158.out.expected build/s2-1158trmc.out > /dev/null \
 	  || { echo "kir-inline-trmc-1158 FAIL (output diff)"; diff ../examples/perceus/kir_inline_trmc_tail_1158.out.expected build/s2-1158trmc.out; exit 1; }; \
-	kir=$$(./$(TARGET) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn build/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn build/,/^}/'); \
 	echo "$$kir" | grep -q 'trmc-step' \
 	  || { echo "kir-inline-trmc-1158 FAIL (build lost its trmc-step terminator)"; exit 1; }; \
 	echo "$$kir" | grep -q 'classify' \
@@ -8440,7 +8449,7 @@ test-kir-while-slot-1158: $(TARGET) build
 	  || { echo "kir-while-slot-1158 FAIL (run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_while_slot_1158.out.expected build/s2-1158wslot.out > /dev/null \
 	  || { echo "kir-while-slot-1158 FAIL (output diff)"; diff ../examples/perceus/kir_while_slot_1158.out.expected build/s2-1158wslot.out; exit 1; }; \
-	kir=$$(./$(TARGET) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn main/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn main/,/^}/'); \
 	echo "$$kir" | grep -qE 'install State|perform State' \
 	  && { echo "kir-while-slot-1158 FAIL (State dispatch survived in main)"; exit 1; } \
 	  || true; \
@@ -8460,7 +8469,7 @@ test-kir-while-param-slot-1173: $(TARGET) build
 	  || { echo "kir-while-param-slot-1173 FAIL (run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_while_param_slot_1173.out.expected build/s2-1173wpslot.out > /dev/null \
 	  || { echo "kir-while-param-slot-1173 FAIL (output diff)"; diff ../examples/perceus/kir_while_param_slot_1173.out.expected build/s2-1173wpslot.out; exit 1; }; \
-	kir=$$(./$(TARGET) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn lcg/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn lcg/,/^}/'); \
 	echo "$$kir" | grep -qE 'install State|perform State' \
 	  && { echo "kir-while-param-slot-1173 FAIL (State dispatch survived in lcg)"; exit 1; } \
 	  || true; \
@@ -8480,7 +8489,7 @@ test-kir-var-escape-state-1173: $(TARGET) build
 	  || { echo "kir-var-escape-state-1173 FAIL (run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/var_escapes_stays_state_1173.out.expected build/s2-1173vesc.out > /dev/null \
 	  || { echo "kir-var-escape-state-1173 FAIL (output diff)"; diff ../examples/perceus/var_escapes_stays_state_1173.out.expected build/s2-1173vesc.out; exit 1; }; \
-	kir=$$(./$(TARGET) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn main/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn main/,/^}/'); \
 	echo "$$kir" | grep -q 'install State' \
 	  || { echo "kir-var-escape-state-1173 FAIL (State install gone from main — an escaping var was demoted to a slot)"; exit 1; }; \
 	echo "kir-var-escape-state-1173 OK (surviving closure keeps the cell a dispatched State handler)"
@@ -8504,7 +8513,7 @@ test-kir-while-raw-cond-1414: $(TARGET) build
 	  || { echo "kir-while-raw-cond-1414 FAIL (C run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_while_raw_cond_1414.out.expected build/s2-1414raw-c.out > /dev/null \
 	  || { echo "kir-while-raw-cond-1414 FAIL (C output diff)"; exit 1; }; \
-	kir=$$(./$(TARGET) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn spin/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn spin/,/^}/'); \
 	echo "$$kir" | grep -q 'bool.box' \
 	  && { echo "kir-while-raw-cond-1414 FAIL (bool.box survived in spin — pred boxed again)"; exit 1; } \
 	  || true; \
@@ -8530,7 +8539,7 @@ test-kir-while-boxed-cond-1414: $(TARGET) build
 	  || { echo "kir-while-boxed-cond-1414 FAIL (run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_while_boxed_cond_1414.out.expected build/s2-1414box.out > /dev/null \
 	  || { echo "kir-while-boxed-cond-1414 FAIL (output diff)"; diff ../examples/perceus/kir_while_boxed_cond_1414.out.expected build/s2-1414box.out; exit 1; }; \
-	kir=$$(./$(TARGET) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn spin/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn spin/,/^}/'); \
 	echo "$$kir" | grep -q ': box = prim !=' \
 	  || { echo "kir-while-boxed-cond-1414 FAIL (boxed != gone from spin — twin no longer negative)"; exit 1; }; \
 	echo "$$kir" | grep -q ': i1 = prim i!=' \
@@ -8616,7 +8625,7 @@ test-perceus-1069-projection-reuse: $(TARGET) build
 	  || { echo "perceus-1069-projection-reuse FAIL (native run errored — exit $$?)"; exit 1; }; \
 	diff -q $$exp build/s2-1069proj-n.out > /dev/null \
 	  || { echo "perceus-1069-projection-reuse FAIL (native output diff — original corrupted)"; diff $$exp build/s2-1069proj-n.out; exit 1; }; \
-	./$(TARGET) --path ../stdlib $$src > build/s2-1069proj.c; \
+	$(KAIC2) --path ../stdlib $$src > build/s2-1069proj.c; \
 	body=$$(awk '/\*kaiu_grow_kind\(KaiValue \*kaiv_e\) \{/{f=1} f{print} f&&/^}/{exit}' build/s2-1069proj.c); \
 	echo "$$body" | grep -q "kai_variant_u" \
 	  || { echo "perceus-1069-projection-reuse FAIL (grow_kind not found in emitted C)"; exit 1; }; \
@@ -8685,7 +8694,7 @@ test-native-1083-field-read: $(TARGET) build
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1083nfr > build/s2-1083nfr.out 2> build/s2-1083nfr.rc; \
 	diff -q $$exp build/s2-1083nfr.out > /dev/null \
 	  || { echo "native-1083-field-read FAIL (native output diff)"; diff $$exp build/s2-1083nfr.out; exit 1; }; \
-	./$(TARGET) --path ../stdlib $$src > build/s2-1083nfr-c.c 2> build/s2-1083nfr-c.err \
+	$(KAIC2) --path ../stdlib $$src > build/s2-1083nfr-c.c 2> build/s2-1083nfr-c.err \
 	  || { echo "native-1083-field-read FAIL (C build errored)"; cat build/s2-1083nfr-c.err; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1083nfr-c.c -o build/s2-1083nfr-c $(LDLIBS_M) ; \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-1083nfr-c > build/s2-1083nfr-c.out 2> build/s2-1083nfr-c.rc; \
@@ -8714,7 +8723,7 @@ test-native-static-slot-read: $(TARGET) build
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-nssr > build/s2-nssr.out 2> build/s2-nssr.rc; \
 	diff -q $$exp build/s2-nssr.out > /dev/null \
 	  || { echo "native-static-slot-read FAIL (native output diff)"; diff $$exp build/s2-nssr.out; exit 1; }; \
-	./$(TARGET) --path ../stdlib $$src > build/s2-nssr-c.c 2> build/s2-nssr-c.err \
+	$(KAIC2) --path ../stdlib $$src > build/s2-nssr-c.c 2> build/s2-nssr-c.err \
 	  || { echo "native-static-slot-read FAIL (C build errored)"; cat build/s2-nssr-c.err; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-nssr-c.c -o build/s2-nssr-c $(LDLIBS_M) ; \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-nssr-c > build/s2-nssr-c.out 2> build/s2-nssr-c.rc; \
@@ -8775,7 +8784,7 @@ test-native-1110-reuse-int-slot: $(TARGET) build
 	./build/s2-r1110 > build/s2-r1110.out; \
 	diff -q $$exp build/s2-r1110.out > /dev/null \
 	  || { echo "native-1110-reuse FAIL (native output diff)"; diff $$exp build/s2-r1110.out; exit 1; }; \
-	./$(TARGET) --path ../stdlib $$src > build/s2-r1110-c.c 2> build/s2-r1110-c.err \
+	$(KAIC2) --path ../stdlib $$src > build/s2-r1110-c.c 2> build/s2-r1110-c.err \
 	  || { echo "native-1110-reuse FAIL (C build errored)"; cat build/s2-r1110-c.err; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-r1110-c.c -o build/s2-r1110-c $(LDLIBS_M) ; \
 	./build/s2-r1110-c > build/s2-r1110-c.out; \
@@ -8798,7 +8807,7 @@ test-native-1229-arm-int-binder: $(TARGET) build
 	./build/s2-r1229 > build/s2-r1229.out; \
 	diff -q $$exp build/s2-r1229.out > /dev/null \
 	  || { echo "native-1229-arm-int-binder FAIL (native output diff)"; diff $$exp build/s2-r1229.out; exit 1; }; \
-	./$(TARGET) --path ../stdlib $$src > build/s2-r1229-c.c 2> build/s2-r1229-c.err \
+	$(KAIC2) --path ../stdlib $$src > build/s2-r1229-c.c 2> build/s2-r1229-c.err \
 	  || { echo "native-1229-arm-int-binder FAIL (C build errored)"; cat build/s2-r1229-c.err; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-r1229-c.c -o build/s2-r1229-c $(LDLIBS_M) ; \
 	./build/s2-r1229-c > build/s2-r1229-c.out; \
@@ -8822,7 +8831,7 @@ test-native-1229-writeside: $(TARGET) build
 	./build/s2-r1229w > build/s2-r1229w.out; \
 	diff -q $$exp build/s2-r1229w.out > /dev/null \
 	  || { echo "native-1229-writeside FAIL (native output diff)"; diff $$exp build/s2-r1229w.out; exit 1; }; \
-	./$(TARGET) --path ../stdlib $$src > build/s2-r1229w-c.c 2> build/s2-r1229w-c.err \
+	$(KAIC2) --path ../stdlib $$src > build/s2-r1229w-c.c 2> build/s2-r1229w-c.err \
 	  || { echo "native-1229-writeside FAIL (C build errored)"; cat build/s2-r1229w-c.err; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-r1229w-c.c -o build/s2-r1229w-c $(LDLIBS_M) ; \
 	./build/s2-r1229w-c > build/s2-r1229w-c.out; \
@@ -8880,7 +8889,7 @@ test-native-test-runner-950: $(TARGET) build
 # the program still completes with the expected sum.
 test-tco-rule3-basic: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/tco/rule3_basic.kai > build/tco-r3b.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/rule3_basic.kai > build/tco-r3b.c; \
 	grep -F -q 'goto _kai_walk_entry' build/tco-r3b.c \
 	  || { echo "tco-rule3-basic FAIL (no walk goto label)"; exit 1; }; \
 	if awk '/_kai_walk_entry/,/__pcs_ret/' build/tco-r3b.c | grep -F -q 'kai_internal_drop(kai_xs)'; then \
@@ -8901,7 +8910,7 @@ test-tco-rule3-basic: $(TARGET) build
 # to completion under glibc strict-malloc without abort.
 test-tco-rule3-no-misfire: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/tco/rule3_no_misfire.kai > build/tco-r3n.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/rule3_no_misfire.kai > build/tco-r3n.c; \
 	grep -F -q 'goto _kai_id_walk_entry' build/tco-r3n.c \
 	  || { echo "tco-rule3-no-misfire FAIL (no id_walk goto label)"; exit 1; }; \
 	if awk '/_kai_id_walk_entry/,/__pcs_ret/' build/tco-r3n.c | grep -F -q 'kai_internal_drop(kai_xs)'; then \
@@ -8929,7 +8938,7 @@ test-tco-rule3-no-misfire: $(TARGET) build
 # normally flush.
 test-issue-678-stdout-buffered: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/runtime/issue_678_stdout_line_buffered.kai > build/iss678.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/runtime/issue_678_stdout_line_buffered.kai > build/iss678.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss678.c -o build/iss678 $(LDLIBS_M); \
 	./build/iss678 > build/iss678.out; \
 	diff -q ../examples/runtime/issue_678_stdout_line_buffered.out.expected build/iss678.out > /dev/null \
@@ -9045,7 +9054,7 @@ endif
 # fix the sleeper would block for 60 seconds.
 test-issue-679-cancel-parked: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
 	  ../examples/effects/issue_679_cancel_reaches_parked.kai > build/iss679.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss679.c -o build/iss679 $(LDLIBS_M); \
 	./build/iss679 > build/iss679.out; \
@@ -9070,7 +9079,7 @@ test-issue-679-cancel-parked: $(TARGET) build
 # blocks for a minute, post-fix it prints 7 immediately.
 test-issue-1539-select-races: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
 	  ../examples/effects/issue_1539_select_races.kai > build/iss1539.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss1539.c -o build/iss1539 $(LDLIBS_M); \
 	./build/iss1539 > build/iss1539.out; \
@@ -9099,7 +9108,7 @@ test-issue-1539-select-races: $(TARGET) build
 # the test timed out.
 test-issue-682-cancel-sibling-handler: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
 	  ../examples/effects/issue_682_cancel_sibling_handler.kai > build/iss682.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss682.c -o build/iss682 $(LDLIBS_M); \
 	./build/iss682 > build/iss682.out; \
@@ -9123,7 +9132,7 @@ test-issue-682-cancel-sibling-handler: $(TARGET) build
 # keeps the corrected doc honest.
 test-issue-1533-remote-cancel-runs-handler: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
 	  ../examples/effects/issue_1533_remote_cancel_runs_handler.kai > build/iss1533.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss1533.c -o build/iss1533 $(LDLIBS_M); \
 	./build/iss1533 > build/iss1533.out; \
@@ -9137,7 +9146,7 @@ test-issue-1533-remote-cancel-runs-handler: $(TARGET) build
 # the longjmp to the fiber's pad skipped it entirely.
 test-issue-1537-finally-cancel-scope: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
 	  ../examples/effects/finally_cancel_scope.kai > build/iss1537c.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss1537c.c -o build/iss1537c $(LDLIBS_M); \
 	./build/iss1537c > build/iss1537c.out; \
@@ -9152,14 +9161,14 @@ test-issue-1537-finally-cancel-scope: $(TARGET) build
 # skip an alias whose name the surrounding scope already binds.
 test-issue-1565-handler-alias-shadow: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
 	  ../examples/effects/issue_1565_handler_alias_shadow.kai > build/iss1565.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss1565.c -o build/iss1565 $(LDLIBS_M); \
 	./build/iss1565 > build/iss1565.out; \
 	diff -q ../examples/effects/issue_1565_handler_alias_shadow.out.expected build/iss1565.out > /dev/null \
 	  && echo "issue-1565 OK (C: enclosing binding wins over the handler state alias)" \
 	  || { echo "issue-1565 DIFF (C)"; diff ../examples/effects/issue_1565_handler_alias_shadow.out.expected build/iss1565.out; exit 1; }; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
 	  ../examples/effects/issue_1565_handler_alias_shadow.kai 2>&1 >/dev/null \
 	  | grep -q 'is the enclosing binding, not the handler state' \
 	  || { echo "issue-1565 FAIL (no shadowing diagnostic)"; exit 1; }; \
@@ -9190,7 +9199,7 @@ endif
 # would be the regression, rc 1 the clean diagnostic.
 test-issue-978-spawn-parent-handled-effect: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
 	  ../examples/effects/issue_978_spawn_parent_handled_effect.kai > build/iss978.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss978.c -o build/iss978 $(LDLIBS_M); \
 	rc=0; ./build/iss978 > build/iss978.out 2> build/iss978.err || rc=$$?; \
@@ -9215,7 +9224,7 @@ test-issue-978-spawn-parent-handled-effect: $(TARGET) build
 test-issue-1051-spawn-parent-handled-builtin-default: $(TARGET) build
 	@set -e; \
 	name=issue_1051_spawn_parent_handled_builtin_default; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	rc=0; ./build/$$name > build/$$name.out 2> build/$$name.err || rc=$$?; \
 	[ $$rc -eq 0 ] || { echo "issue-1051 FAIL $$name (exit $$rc, want 0 — rc 139 = segfault regressed)"; cat build/$$name.out build/$$name.err; exit 1; }; \
@@ -9225,7 +9234,7 @@ test-issue-1051-spawn-parent-handled-builtin-default: $(TARGET) build
 	  || { echo "issue-1051 FAIL $$name (default INFO line missing/misrouted — op-field regressed)"; cat build/$$name.err; exit 1; }; \
 	echo "issue-1051 OK $$name (Log default runs in spawned fiber, op-field lands on info)"; \
 	name=issue_1051_spawn_parent_handled_env_default; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	rc=0; ./build/$$name > build/$$name.out 2>&1 || rc=$$?; \
 	[ $$rc -eq 0 ] || { echo "issue-1051 FAIL $$name (exit $$rc, want 0)"; cat build/$$name.out; exit 1; }; \
@@ -9251,7 +9260,7 @@ test-issue-1051-spawn-parent-handled-builtin-default: $(TARGET) build
 test-issue-1331-op-arg-release: $(TARGET) build
 	@set -e; \
 	name=issue_1331_op_arg_release; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	KAI_THREADS=1 KAI_TRACE_RC=1 ./build/$$name > build/$$name.out 2> build/$$name.rc \
 	  || { echo "issue-1331 FAIL $$name (crash)"; cat build/$$name.rc; exit 1; }; \
@@ -9271,7 +9280,7 @@ test-issue-1331-op-arg-release: $(TARGET) build
 test-issue-1331-borrowed-op-arg-asan: $(TARGET) build
 	@set -e; \
 	name=issue_1331_borrowed_op_arg; \
-	./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	      -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan; \
@@ -9289,7 +9298,7 @@ test-issue-1331-borrowed-op-arg-asan: $(TARGET) build
 test-issue-1331-op-arg-release-asan: $(TARGET) build
 	@set -e; \
 	name=issue_1331_op_arg_release; \
-	./$(TARGET) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
+	$(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/$$name-asan.c; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	      -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan; \
@@ -9306,7 +9315,7 @@ test-issue-1331-op-arg-release-asan: $(TARGET) build
 test-issue-1067-fiber-trap-isolation: $(TARGET) build
 	@set -e; \
 	name=issue_1067_trap_in_fiber_contained; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	rc=0; ./build/$$name > build/$$name.out 2>&1 || rc=$$?; \
 	[ $$rc -eq 0 ] || { echo "issue-1067 FAIL $$name (exit $$rc, want 0 — trap escaped the fiber)"; cat build/$$name.out; exit 1; }; \
@@ -9314,7 +9323,7 @@ test-issue-1067-fiber-trap-isolation: $(TARGET) build
 	  && echo "issue-1067 OK $$name (fiber trap contained, supervisor got Trapped reason, process survived)" \
 	  || { echo "issue-1067 DIFF $$name"; diff ../examples/effects/$$name.out.expected build/$$name.out; exit 1; }; \
 	name=issue_1067_trap_top_level_exits; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	rc=0; ./build/$$name > build/$$name.out 2> build/$$name.err || rc=$$?; \
 	[ $$rc -ne 0 ] || { echo "issue-1067 FAIL $$name (exit 0 — top-level trap did not terminate)"; cat build/$$name.out; exit 1; }; \
@@ -9336,7 +9345,7 @@ test-issue-1093-divzero-trap: $(TARGET) build
 	            "issue_1093_mod_by_zero_traps:mod by zero" \
 	            "issue_1093_div_overflow_traps:divide overflow"; do \
 	  name=$${pair%%:*}; msg=$${pair#*:}; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	  rc=0; ./build/$$name > build/$$name.out 2> build/$$name.err || rc=$$?; \
 	  [ $$rc -ne 0 ] || { echo "issue-1093 FAIL $$name (exit 0 — did not trap)"; cat build/$$name.out; exit 1; }; \
@@ -9347,7 +9356,7 @@ test-issue-1093-divzero-trap: $(TARGET) build
 	    || { echo "issue-1093 FAIL $$name (want 'trap: $$msg' on stderr)"; cat build/$$name.err; exit 1; }; \
 	done; \
 	name=issue_1093_div_normal_ok; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	rc=0; ./build/$$name > build/$$name.out 2>&1 || rc=$$?; \
 	[ $$rc -eq 0 ] || { echo "issue-1093 FAIL $$name (exit $$rc — normal div/mod or Real div regressed)"; cat build/$$name.out; exit 1; }; \
@@ -9367,13 +9376,13 @@ test-issue-997-spawn-cell-fiber-local: $(TARGET) build
 	@set -e; \
 	for name in issue_997_spawn_cell_read_rejected issue_997_spawn_cell_write_rejected \
 	            issue_997_spawn_cell_transitive_rejected; do \
-	  rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c 2> build/$$name.err || rc=$$?; \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c 2> build/$$name.err || rc=$$?; \
 	  [ $$rc -ne 0 ] || { echo "issue-997 FAIL $$name (compiled, want compile-time reject)"; exit 1; }; \
 	  grep -F "$$(cat ../examples/effects/$$name.err.expected)" build/$$name.err > /dev/null \
 	    && echo "issue-997 OK $$name (cell-across-spawn rejected at compile time)" \
 	    || { echo "issue-997 MISS $$name (rejected, wrong diagnostic)"; cat build/$$name.err; exit 1; }; \
 	done; \
-	./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/issue_997_spawn_cell_runtime_floor.kai > build/iss997rf.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/issue_997_spawn_cell_runtime_floor.kai > build/iss997rf.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss997rf.c -o build/iss997rf $(LDLIBS_M); \
 	rc=0; ./build/iss997rf > build/iss997rf.out 2> build/iss997rf.err || rc=$$?; \
 	[ $$rc -eq 1 ] || { echo "issue-997 FAIL runtime_floor (exit $$rc, want 1 — rc 139 = segfault regressed)"; cat build/iss997rf.out build/iss997rf.err; exit 1; }; \
@@ -9383,7 +9392,7 @@ test-issue-997-spawn-cell-fiber-local: $(TARGET) build
 	  && echo "issue-997 OK runtime_floor (unreachable cell reports clean diagnostic, not a segfault)" \
 	  || { echo "issue-997 FAIL runtime_floor (diagnostic missing on stderr)"; cat build/iss997rf.err; exit 1; }; \
 	for name in issue_997_spawn_inner_cell_ok issue_997_spawn_no_cell_ok issue_997_spawn_shadowed_cell_ok; do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	  ./build/$$name > build/$$name.out 2>&1 \
 	    || { echo "issue-997 FAIL $$name (valid program crashed)"; cat build/$$name.out; exit 1; }; \
@@ -9407,7 +9416,7 @@ test-issue-997-spawn-cell-fiber-local: $(TARGET) build
 # >=4 cases before completion.
 test-tco-issue-680: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/tco/issue_680_polymorphic_fold.kai > build/tco-680.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/issue_680_polymorphic_fold.kai > build/tco-680.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-680.c -o build/tco-680 $(LDLIBS_M) ; \
 	./build/tco-680 > build/tco-680.out; \
 	diff -q ../examples/tco/issue_680_polymorphic_fold.out.expected build/tco-680.out > /dev/null \
@@ -9424,7 +9433,7 @@ test-tco-issue-680: $(TARGET) build
 # param pointers.
 test-tco-param-shadow: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/tco/param_shadow_rebind.kai > build/tco-param-shadow.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/param_shadow_rebind.kai > build/tco-param-shadow.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-param-shadow.c -o build/tco-param-shadow $(LDLIBS_M) ; \
 	./build/tco-param-shadow > build/tco-param-shadow.out; \
 	diff -q ../examples/tco/param_shadow_rebind.out.expected build/tco-param-shadow.out > /dev/null \
@@ -9444,7 +9453,7 @@ PERCEUS_ISSUE82_FIXTURES := issue_82_leak_audit
 test-perceus-issue82: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ISSUE82_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) ; \
 	  ./build/$$name > build/$$name.out; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
@@ -9461,7 +9470,7 @@ test-perceus-issue82: $(TARGET) build
 test-perceus-issue82-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ISSUE82_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -9493,7 +9502,7 @@ PERCEUS_ISSUE703_FIXTURES := double_match_same_variant
 test-perceus-issue703: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ISSUE703_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) ; \
 	  ./build/$$name > build/$$name.out; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
@@ -9509,7 +9518,7 @@ test-perceus-issue703: $(TARGET) build
 test-perceus-issue703-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ISSUE703_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -9536,7 +9545,7 @@ PERCEUS_ISSUE779_FIXTURES := issue_779_block_raw_tail
 test-issue-779: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ISSUE779_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) ; \
 	  ./build/$$name > build/$$name.out; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
@@ -9550,7 +9559,7 @@ test-issue-779: $(TARGET) build
 test-issue-779-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ISSUE779_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -9578,7 +9587,7 @@ PERCEUS_ENUM_SLOT_FIXTURES := enum_slot_repr
 test-perceus-enum-slot: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ENUM_SLOT_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) ; \
 	  ./build/$$name > build/$$name.out; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
@@ -9593,7 +9602,7 @@ test-perceus-enum-slot: $(TARGET) build
 test-perceus-enum-slot-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ENUM_SLOT_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -9625,7 +9634,7 @@ PERCEUS_ISSUE298_FIXTURES := closure_lifecycle_298
 test-perceus-issue298: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ISSUE298_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) ; \
 	  ./build/$$name > build/$$name.out; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
@@ -9647,7 +9656,7 @@ PERCEUS_ISSUE350_FIXTURES := gap3_tail_rebuild_variant \
 test-perceus-issue350: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ISSUE350_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	  ./build/$$name > build/$$name.out; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
@@ -9663,7 +9672,7 @@ test-perceus-issue350: $(TARGET) build
 test-perceus-issue350-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ISSUE350_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -9690,7 +9699,7 @@ PERCEUS_TRMC_SPREAD_FIXTURES := trmc_spread_shared_arg
 test-perceus-trmc-spread: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_TRMC_SPREAD_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	  ./build/$$name > build/$$name.out; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
@@ -9701,7 +9710,7 @@ test-perceus-trmc-spread: $(TARGET) build
 test-perceus-trmc-spread-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_TRMC_SPREAD_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -DKAI_NO_CELL_POOL \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -9732,7 +9741,7 @@ PERCEUS_NESTED_REUSE_FIXTURES := nested_pattern_reuse_balance native_variant_reu
 test-perceus-nested-reuse: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_NESTED_REUSE_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
 	  ./build/$$name > build/$$name.out; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
@@ -9749,7 +9758,7 @@ test-perceus-nested-reuse: $(TARGET) build
 test-perceus-nested-reuse-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_NESTED_REUSE_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -DKAI_NO_CELL_POOL \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -9806,7 +9815,7 @@ PERCEUS_INT_CACHE_FIXTURES := int_cache_reuse_bump
 test-perceus-int-cache: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_INT_CACHE_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) ; \
 	  ./build/$$name > build/$$name.out; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
@@ -9821,7 +9830,7 @@ test-perceus-int-cache: $(TARGET) build
 test-perceus-int-cache-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_INT_CACHE_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -9851,7 +9860,7 @@ INT_FIELD_INLINE_FIXTURES := int_field_inline int_field_closure_capture
 test-int-field-inline: $(TARGET) build
 	@set -e; \
 	for name in $(INT_FIELD_INLINE_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) ; \
 	  ./build/$$name > build/$$name.out; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
@@ -9862,7 +9871,7 @@ test-int-field-inline: $(TARGET) build
 test-int-field-inline-asan: $(TARGET) build
 	@set -e; \
 	for name in $(INT_FIELD_INLINE_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -9885,7 +9894,7 @@ test-int-field-inline-asan: $(TARGET) build
 test-perceus-issue298-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ISSUE298_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -9947,7 +9956,7 @@ PERCEUS_ISSUE118_FIXTURES := reuse_cons_basic reuse_alias_aborts \
 test-perceus-issue118: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ISSUE118_FIXTURES); do \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) ; \
 	  ./build/$$name > build/$$name.out; \
 	  diff -q ../examples/perceus/$$name.out.expected build/$$name.out > /dev/null \
@@ -9962,7 +9971,7 @@ test-perceus-issue118: $(TARGET) build
 test-perceus-issue118-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_ISSUE118_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
 	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c; \
@@ -9987,7 +9996,7 @@ test-perceus-issue118-asan: $(TARGET) build
 # tries to chase a pointer through what is in fact an int64.
 test-match-pbind-catchall-asan: $(TARGET) build
 	@set -e; \
-	./$(TARGET) ../examples/perceus/match_pbind_catchall_raw.kai > build/match_pbind_catchall_raw-asan.c \
+	$(KAIC2) ../examples/perceus/match_pbind_catchall_raw.kai > build/match_pbind_catchall_raw-asan.c \
 	  || { echo "match-pbind-catchall-asan FAIL (kaic2 errored)"; exit 1; }; \
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	      -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -10020,7 +10029,7 @@ HTTP_CLIENT_FIXTURES := http_client_basic
 test-http-client-asan: $(TARGET) build
 	@set -e; \
 	for name in $(HTTP_CLIENT_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
+	  $(KAIC2) --path ../stdlib ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
 	    || { echo "http-client-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -10053,7 +10062,7 @@ ENV_MUTATE_FIXTURES := os_env_mutate
 test-env-mutate-asan: $(TARGET) build
 	@set -e; \
 	for name in $(ENV_MUTATE_FIXTURES); do \
-	  ./$(TARGET) --path ../stdlib ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
+	  $(KAIC2) --path ../stdlib ../examples/stdlib/$$name.kai > build/stdlib-$$name-asan.c \
 	    || { echo "env-mutate-asan FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -10094,7 +10103,7 @@ test-sequence: $(TARGET) build
 	  exp_out=../examples/sequence/$$name.out.expected; \
 	  exp_err=../examples/sequence/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/seq-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/seq-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "sequence FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -10105,7 +10114,7 @@ test-sequence: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "sequence OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/seq-$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/seq-$$name.c \
 	      || { echo "sequence FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/seq-$$name.c -o build/seq-$$name $(LDLIBS_M) \
 	      || { echo "sequence FAIL $$name (C compile failed)"; exit 1; }; \
@@ -10128,7 +10137,7 @@ test-ufcs: $(TARGET) build
 	  exp_out=../examples/ufcs/$$name.out.expected; \
 	  exp_err=../examples/ufcs/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
 	      > /dev/null 2> build/ufcs-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "ufcs FAIL $$name (expected error, got success)"; exit 1; \
@@ -10140,7 +10149,7 @@ test-ufcs: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "ufcs OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/ufcs-$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/ufcs-$$name.c \
 	      || { echo "ufcs FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/ufcs-$$name.c -o build/ufcs-$$name $(LDLIBS_M) \
 	      || { echo "ufcs FAIL $$name (C compile failed)"; exit 1; }; \
@@ -10163,7 +10172,7 @@ test-unions: $(TARGET) build
 	  exp_out=../examples/unions/$$name.out.expected; \
 	  exp_err=../examples/unions/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/u2-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/u2-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "unions FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -10174,7 +10183,7 @@ test-unions: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "unions OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/u2-$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/u2-$$name.c \
 	      || { echo "unions FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/u2-$$name.c -o build/u2-$$name $(LDLIBS_M) \
 	      || { echo "unions FAIL $$name (C compile failed)"; exit 1; }; \
@@ -10206,7 +10215,7 @@ test-aliases: $(TARGET) build
 	  exp_out=../examples/types/$$name.out.expected; \
 	  exp_err=../examples/types/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/ta-$$name.err || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/ta-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "aliases FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
@@ -10217,7 +10226,7 @@ test-aliases: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "aliases OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/ta-$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/ta-$$name.c \
 	      || { echo "aliases FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/ta-$$name.c -o build/ta-$$name $(LDLIBS_M) \
 	      || { echo "aliases FAIL $$name (C compile failed)"; exit 1; }; \
@@ -10241,7 +10250,7 @@ test-aliases: $(TARGET) build
 # the gate that catches regressions in the per-site instrumentation.
 test-rc-trace-callsite: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) ../examples/effects/rc_trace_callsite.kai > build/rc_trace_callsite.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/effects/rc_trace_callsite.kai > build/rc_trace_callsite.c; \
 	$(CC) $(CFLAGS) -DKAI_TRACE_RC=1 -I ../stage2 -I ../stage0 build/rc_trace_callsite.c -o build/rc_trace_callsite-c $(LDLIBS_M) ; \
 	KAI_THREADS=1 ./build/rc_trace_callsite-c > build/rc_trace_callsite.out 2> build/rc_trace_callsite.err; \
 	diff -q ../examples/effects/rc_trace_callsite.out.expected build/rc_trace_callsite.out > /dev/null \
@@ -10274,7 +10283,7 @@ test-violations: $(TARGET) build
 	  exp_out=../examples/refinements/$$name.out.expected; \
 	  exp_err=../examples/refinements/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/viol-$$name.cerr || rc=$$?; \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/viol-$$name.cerr || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "violations FAIL $$name (expected compile error, got success)"; exit 1; \
 	    fi; \
@@ -10286,7 +10295,7 @@ test-violations: $(TARGET) build
 	    echo "violations OK $$name (rejected at compile time)"; \
 	    continue; \
 	  fi; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) $$f > build/viol-$$name.c \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/viol-$$name.c \
 	    || { echo "violations FAIL $$name (kaic2 C errored)"; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/viol-$$name.c -o build/viol-$$name $(LDLIBS_M) \
 	    || { echo "violations FAIL $$name (C compile failed)"; exit 1; }; \
@@ -10323,7 +10332,7 @@ test-attributes: $(TARGET) build
 	  exp_out=../examples/attributes/$$name.out.expected; \
 	  exp_err=../examples/attributes/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$preludes $$f \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$preludes $$f \
 	      > /dev/null 2> build/attr-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "attributes FAIL $$name (expected error, got success)"; exit 1; \
@@ -10334,7 +10343,7 @@ test-attributes: $(TARGET) build
 	      || { echo "attributes FAIL $$name (missing diagnostic: $$needle)"; \
 	           cat build/attr-$$name.err; exit 1; }; \
 	  elif [ -f $$exp_out ]; then \
-	    ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$preludes $$f > build/attr-$$name.c \
+	    $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$preludes $$f > build/attr-$$name.c \
 	      || { echo "attributes FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/attr-$$name.c -o build/attr-$$name $(LDLIBS_M) \
 	      || { echo "attributes FAIL $$name (C compile failed)"; exit 1; }; \
@@ -10357,16 +10366,16 @@ test-attributes: $(TARGET) build
 # examples/negative/doc/ under tools/test-negative.sh.
 test-doc-attr: $(TARGET) build
 	@$(STACK) set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --doc-json ../examples/doc/doc_json_basic.kai > build/doc-json-basic.out; \
+	$(KAIC2) $(TEST_CORE_CACHE) --doc-json ../examples/doc/doc_json_basic.kai > build/doc-json-basic.out; \
 	diff ../examples/doc/doc_json_basic.doc.expected build/doc-json-basic.out > /dev/null \
 	  && echo "doc-attr OK doc-json golden" \
 	  || { echo "doc-attr DIFF doc-json golden"; \
 	       diff ../examples/doc/doc_json_basic.doc.expected build/doc-json-basic.out; exit 1; }; \
-	./$(TARGET) $(TEST_CORE_CACHE) --holes-json ../examples/doc/doc_holes.kai > build/doc-holes.json; \
+	$(KAIC2) $(TEST_CORE_CACHE) --holes-json ../examples/doc/doc_holes.kai > build/doc-holes.json; \
 	grep -qF '"doc": "Documented holder of the probe hole."' build/doc-holes.json \
 	  && echo "doc-attr OK holes-json doc field" \
 	  || { echo "doc-attr FAIL holes-json doc field"; cat build/doc-holes.json; exit 1; }; \
-	./$(TARGET) $(TEST_CORE_CACHE) --builtins-doc-json > build/builtins-doc.json; \
+	$(KAIC2) $(TEST_CORE_CACHE) --builtins-doc-json > build/builtins-doc.json; \
 	grep -qF '"module": "core/list"' build/builtins-doc.json \
 	  && echo "doc-attr OK builtins-doc-json" \
 	  || { echo "doc-attr FAIL builtins-doc-json"; exit 1; }
@@ -10388,7 +10397,7 @@ test-shadowing: $(TARGET) build
 	  exp_out=../examples/shadowing/$$name.out.expected; \
 	  exp_err=../examples/shadowing/$$name.err.expected; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f \
+	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
 	      > /dev/null 2> build/shadowing-$$name.err || rc=$$?; \
 	    if [ $$rc -eq 0 ]; then \
 	      echo "shadowing FAIL $$name (expected error, got success)"; exit 1; \
@@ -10400,7 +10409,7 @@ test-shadowing: $(TARGET) build
 	    done < $$exp_err; \
 	    echo "shadowing OK $$name (rejected as expected)"; \
 	  else \
-	    ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$f \
+	    $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
 	      > build/shadowing-$$name.c \
 	      || { echo "shadowing FAIL $$name (kaic2 errored)"; exit 1; }; \
 	    $(CC) $(CFLAGS) $(LDFLAGS_STACK) -I ../stage2 -I ../stage0 build/shadowing-$$name.c -o build/shadowing-$$name $(LDLIBS_M) \
@@ -10450,7 +10459,7 @@ test-modular-build: $(TARGET) build
 	  exp=$${f%.kai}.out.expected; \
 	  [ -f $$exp ] || exp=$$(dirname $$f)/main.out.expected; \
 	  mod=build/$$name.d; rm -rf $$mod; mkdir -p $$mod; \
-	  ./$(TARGET) --emit=c-modular --path ../stdlib --path "$$srcdir" $$f \
+	  $(KAIC2) --emit=c-modular --path ../stdlib --path "$$srcdir" $$f \
 	    > build/$$name.stream \
 	    || { echo "modular FAIL $$name (kaic2 errored)"; exit 1; }; \
 	  nonce=$$(sed -n '1s|^//KAIDELIM:||p' build/$$name.stream); \
@@ -10520,7 +10529,7 @@ test-modular-identity: test-modular-build
 test-issue-963-cross-module-mono: $(TARGET) build
 	@set -e; \
 	fx=../examples/multi-module/issue-963-cross-module-mono; \
-	./$(TARGET) --path ../stdlib --path $$fx $$fx/main.kai \
+	$(KAIC2) --path ../stdlib --path $$fx $$fx/main.kai \
 	            > build/issue_963_cross_module_mono.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/issue_963_cross_module_mono.c -o build/issue_963_cross_module_mono $(LDLIBS_M) ; \
 	./build/issue_963_cross_module_mono > build/issue_963_cross_module_mono.out; \
@@ -10531,7 +10540,7 @@ test-issue-963-cross-module-mono: $(TARGET) build
 test-issue-1426-cross-module-derive-show: $(TARGET) build
 	@set -e; \
 	fx=../examples/multi-module/issue-1426-cross-module-derive-show; \
-	./$(TARGET) --path ../stdlib --path $$fx $$fx/main.kai \
+	$(KAIC2) --path ../stdlib --path $$fx $$fx/main.kai \
 	            > build/issue_1426_derive_show.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/issue_1426_derive_show.c -o build/issue_1426_derive_show $(LDLIBS_M) ; \
 	./build/issue_1426_derive_show > build/issue_1426_derive_show.out; \
@@ -10542,7 +10551,7 @@ test-issue-1426-cross-module-derive-show: $(TARGET) build
 test-issue-1852-cross-module-derive-json: $(TARGET) build
 	@set -e; \
 	fx=../examples/multi-module/issue-1852-cross-module-derive-json; \
-	./$(TARGET) --path ../stdlib --path $$fx $$fx/main.kai \
+	$(KAIC2) --path ../stdlib --path $$fx $$fx/main.kai \
 	            > build/issue_1852_derive_json.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/issue_1852_derive_json.c -o build/issue_1852_derive_json $(LDLIBS_M) ; \
 	./build/issue_1852_derive_json > build/issue_1852_derive_json.out; \
@@ -10563,7 +10572,7 @@ test-home-tu-partition: $(TARGET) build
 	@set -e; \
 	fx=../examples/multi-module/home-tu-partition; \
 	KAI_MODULAR=1 KAI_MODULAR_NO_CACHE=1 KAIKAI_STDLIB_PATH=$(STDLIB_ABS) \
-	  ./$(TARGET) --emit=c-modular --path ../stdlib --path $$fx $$fx/main.kai \
+	  $(KAIC2) --emit=c-modular --path ../stdlib --path $$fx $$fx/main.kai \
 	  2>/dev/null > build/home_tu_partition.stream; \
 	tu_of() { awk -v sym="$$1" '/^\/\/KAIFILE:.*\.c$$/{t=$$0;sub(/.*::/,"",t)} $$0 ~ sym && /\{$$/ {print t; exit}' build/home_tu_partition.stream; }; \
 	assert_tu() { got=$$(tu_of "$$2"); [ "$$got" = "$$3" ] \
@@ -10575,7 +10584,7 @@ test-home-tu-partition: $(TARGET) build
 	assert_tu "root lambda"        "_kaiu_lam_main_19_14"         "__root__.c"; \
 	assert_tu "imported pub fn"    "kaiu_widget__label"           "widget.c"; \
 	assert_tu "cross-module spec"  "kaiu_widget__wrap__mono__Int" "__root__.c"; \
-	./$(TARGET) --path ../stdlib --path $$fx $$fx/main.kai > build/home_tu_partition.c; \
+	$(KAIC2) --path ../stdlib --path $$fx $$fx/main.kai > build/home_tu_partition.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/home_tu_partition.c -o build/home_tu_partition $(LDLIBS_M); \
 	./build/home_tu_partition > build/home_tu_partition.out; \
 	diff -q $$fx/main.out.expected build/home_tu_partition.out > /dev/null \
@@ -10663,7 +10672,7 @@ test-modular-hermetic: $(TARGET) build
 	d=build/modular-hermetic.d; rm -rf $$d; mkdir -p $$d; \
 	emit_split() { \
 	  out=$$d/$$1; rm -rf $$out; mkdir -p $$out; \
-	  ./$(TARGET) --emit=c-modular --path ../stdlib --path $$src --edition $$(cat ../EDITION) $$src/main.kai 2> /dev/null > $$d/$$1.stream \
+	  $(KAIC2) --emit=c-modular --path ../stdlib --path $$src $$src/main.kai 2> /dev/null > $$d/$$1.stream \
 	    || { echo "modular-hermetic FAIL $$1 (emit)"; exit 1; }; \
 	  nonce=$$(sed -n '1s/^\/\/KAIDELIM://p' $$d/$$1.stream); \
 	  awk -v dir="$$out" -v pfx="//KAIFILE:$$nonce::" \
@@ -10740,7 +10749,7 @@ test-modular-selfhost: $(TARGET) build
 	  || { echo "modular-selfhost FAIL (--version output)"; cat build/modular-selfhost.ver; exit 1; }; \
 	KAIKAI_STDLIB_PATH=$(STDLIB_ABS) $$out ../examples/portfolio/portfolio.kai > build/modular-selfhost-smoke.c \
 	  || { echo "modular-selfhost FAIL (modular binary crashed compiling)"; exit 1; }; \
-	KAIKAI_STDLIB_PATH=$(STDLIB_ABS) ./$(TARGET) ../examples/portfolio/portfolio.kai > build/modular-selfhost-smoke-ref.c; \
+	KAIKAI_STDLIB_PATH=$(STDLIB_ABS) $(KAIC2) ../examples/portfolio/portfolio.kai > build/modular-selfhost-smoke-ref.c; \
 	diff -q build/modular-selfhost-smoke-ref.c build/modular-selfhost-smoke.c > /dev/null \
 	  || { echo "modular-selfhost FAIL (emitted C differs from single-TU kaic2)"; exit 1; }; \
 	echo "modular-selfhost OK (linked modularly + --version + compiles byte-identically)"
@@ -10801,7 +10810,7 @@ endif
 core-cache-warm: $(TARGET) build
 	@if [ -n "$(TEST_CORE_CACHE)" ]; then \
 	  mkdir -p $(TEST_CORE_CACHE_DIR); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) ../demos/fizzbuzz/main.kai > build/core-cache-warm.c 2> build/core-cache-warm.err \
+	  $(KAIC2) $(TEST_CORE_CACHE) ../demos/fizzbuzz/main.kai > build/core-cache-warm.c 2> build/core-cache-warm.err \
 	    || { echo "core-cache-warm FAIL"; cat build/core-cache-warm.err; exit 1; }; \
 	  echo "core-cache-warm OK ($(TEST_CORE_CACHE_DIR))"; \
 	else echo "core-cache-warm off (KAI_CORE_CACHE=0)"; fi
@@ -10901,15 +10910,15 @@ test-kir: $(TARGET) build
 	for f in ../examples/kir/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  fns=$$(cat ../examples/kir/$$name.kir.fns); \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir-noinline $$f 2>/dev/null \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir-noinline $$f 2>/dev/null \
 	    | awk -v fns="$$fns" 'BEGIN{n=split(fns,a," ");for(i=1;i<=n;i++)w[a[i]]=1} /^fn |^lambda fn |^clause fn /{nm="";for(i=1;i<=NF;i++)if($$i ~ /\(/){nm=$$i;sub(/\(.*/,"",nm);break} cur=(nm in w)} cur{print} /^}/{if(cur){print "";cur=0}}' \
 	    > build/$$name.kir; \
 	  diff -q ../examples/kir/$$name.kir.expected build/$$name.kir > /dev/null \
 	    || { echo "kir DIFF $$name"; diff ../examples/kir/$$name.kir.expected build/$$name.kir; exit 1; }; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir $$f 2>/dev/null > build/$$name.kir.run2a; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir $$f 2>/dev/null > build/$$name.kir.run2b; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir-noinline $$f 2>/dev/null > build/$$name.kir.run2c; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir-noinline $$f 2>/dev/null > build/$$name.kir.run2d; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir $$f 2>/dev/null > build/$$name.kir.run2a; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir $$f 2>/dev/null > build/$$name.kir.run2b; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir-noinline $$f 2>/dev/null > build/$$name.kir.run2c; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir-noinline $$f 2>/dev/null > build/$$name.kir.run2d; \
 	  diff -q build/$$name.kir.run2a build/$$name.kir.run2b > /dev/null \
 	    || { echo "kir NON-DETERMINISTIC $$name"; exit 1; }; \
 	  diff -q build/$$name.kir.run2c build/$$name.kir.run2d > /dev/null \
@@ -10951,7 +10960,7 @@ test-native-namespace: $(TARGET)
 # clause / cleanup). Verifies BOTH backends still agree once the symbols move.
 test-issue-1682-user-symbol-namespace: $(TARGET) build
 	@set -e; \
-	./$(TARGET) $(TEST_CORE_CACHE) --backend=c --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --backend=c --path ../stdlib \
 	  ../examples/effects/issue_1682_user_symbol_namespace.kai > build/iss1682.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss1682.c -o build/iss1682 $(LDLIBS_M); \
 	./build/iss1682 > build/iss1682.out; \
@@ -11029,7 +11038,7 @@ test-namespace-collisions: $(TARGET) build
 	  src=../examples/namespace-collisions/$$d/main.kai; \
 	  exp=../examples/namespace-collisions/$$d/main.out.expected; \
 	  flags=$$(cat ../examples/namespace-collisions/$$d/main.flags 2>/dev/null); \
-	  if ! ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$flags $$src > build/nscol-$$d.c 2> build/nscol-$$d.err; then \
+	  if ! $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$flags $$src > build/nscol-$$d.c 2> build/nscol-$$d.err; then \
 	    echo "namespace-collisions FAIL $$d (kaic2)"; head -3 build/nscol-$$d.err; continue; fi; \
 	  if ! $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/nscol-$$d.c -o build/nscol-$$d-c $(LDLIBS_M); then \
 	    echo "namespace-collisions FAIL $$d (cc)"; continue; fi; \
@@ -11047,7 +11056,7 @@ test-namespace-collisions-neg: $(TARGET) build
 	  src=../examples/namespace-collisions/$$d/main.kai; \
 	  exp=../examples/namespace-collisions/$$d/main.err.expected; \
 	  flags=$$(cat ../examples/namespace-collisions/$$d/main.flags 2>/dev/null); \
-	  if ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$flags $$src > /dev/null 2> build/nscol-neg-$$d.err; then \
+	  if $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$flags $$src > /dev/null 2> build/nscol-neg-$$d.err; then \
 	    echo "namespace-collisions-neg FAIL $$d (expected error, got success)"; continue; fi; \
 	  needle=$$(head -1 $$exp); \
 	  if ! grep -qF "$$needle" build/nscol-neg-$$d.err; then \
@@ -11141,7 +11150,8 @@ test-namespace-collisions-asan: $(TARGET) build
 	@( \
 	for d in $(NSCOL_ASAN_DIRS); do \
 	  src=../examples/namespace-collisions/$$d/main.kai; \
-	  if ! ./$(TARGET) --path ../stdlib $$src > build/nscol-asan-$$d.c 2> build/nscol-asan-$$d.cerr; then \
+	  flags=$$(cat ../examples/namespace-collisions/$$d/main.flags 2>/dev/null); \
+	  if ! $(KAIC2) --path ../stdlib $$flags $$src > build/nscol-asan-$$d.c 2> build/nscol-asan-$$d.cerr; then \
 	    echo "namespace-collisions-asan FAIL $$d (kaic2)"; head -3 build/nscol-asan-$$d.cerr; continue; fi; \
 	  if ! $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
@@ -11203,7 +11213,8 @@ test-namespace-collisions-diag: $(TARGET) build
 	for d in $(NSCOL_DIAG_DIRS); do \
 	  src=../examples/namespace-collisions/$$d/main.kai; \
 	  exp=../examples/namespace-collisions/$$d/DIAG.expected; \
-	  ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > /dev/null 2> build/nscol-diag-$$d.err || true; \
+	  flags=$$(cat ../examples/namespace-collisions/$$d/main.flags 2>/dev/null); \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$flags $$src > /dev/null 2> build/nscol-diag-$$d.err || true; \
 	  missing=0; \
 	  while IFS= read -r needle; do \
 	    [ -z "$$needle" ] && continue; \

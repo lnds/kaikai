@@ -13,6 +13,7 @@
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 CACHE_DIR="$(mktemp -d)"
 SRC_DIR="$(mktemp -d)"
 trap 'rm -rf "$CACHE_DIR" "$SRC_DIR"' EXIT INT TERM
@@ -32,7 +33,7 @@ EOF
 
 # First compile — populates the cache under SHA1.
 out1="$(KAI_PRELUDE_CACHE=1 KAI_PRELUDE_CACHE_DIR="$CACHE_DIR" \
-        "$ROOT/stage2/kaic2" --emit-prelude-cache --cache-sha "$SHA1" \
+        "$ROOT/stage2/kaic2" $EDITION_FLAG --emit-prelude-cache --cache-sha "$SHA1" \
         "$SRC_DIR/lib.kai" > "$CACHE_DIR/${SHA1}.kab" && echo built || echo failed)"
 if [ "$out1" != "built" ]; then
   echo "source_content_change FAIL — initial cache emit failed"

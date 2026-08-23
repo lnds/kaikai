@@ -32,6 +32,10 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the repo's EDITION is what
+# this gate must exercise.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 SKIPS="$ROOT/tools/check-parity-skips.txt"
 
 if [ ! -x "$KAIC2" ]; then
@@ -69,10 +73,10 @@ run_one() {
 
   rc_build=0
   # shellcheck disable=SC2086 — extra_flags is intentionally word-split.
-  "$KAIC2" $extra_flags "$src" > /dev/null 2> "$tmp/$key.build.err" || rc_build=$?
+  "$KAIC2" $EDITION_FLAG $extra_flags "$src" > /dev/null 2> "$tmp/$key.build.err" || rc_build=$?
   rc_check=0
   # shellcheck disable=SC2086
-  "$KAIC2" $extra_flags --check "$src" > /dev/null 2> "$tmp/$key.check.err" || rc_check=$?
+  "$KAIC2" $EDITION_FLAG $extra_flags --check "$src" > /dev/null 2> "$tmp/$key.check.err" || rc_check=$?
 
   if reason=$(skip_reason "$rel"); then
     if [ "$rc_build" -ne 0 ] && [ "$rc_check" -eq 0 ]; then

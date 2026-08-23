@@ -44,6 +44,10 @@ fi
 CC="${CC:-cc}"
 FIXDIR="examples/native"
 KAIC2="$ROOT/stage2/kaic2"
+
+# A flagless kaic2 runs the oldest edition; the repo's EDITION is what
+# this gate must exercise.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 RUNTIME_LLVM_C="$ROOT/stage0/runtime_llvm.c"
 # P2 (docs/native-codegen-perf-plan.md §P2): when the runtime bitcode is
 # present (the stage2 KAI_LLVM build generated it via clang 18), exercise the
@@ -108,7 +112,7 @@ for fix in "$FIXDIR"/*.kai; do
   # --- native backend: emit object in-process, link, run ---
   obj="$WORK/$name.o"
   nbin="$WORK/$name-native"
-  if ! env KAI_NATIVE_RUNTIME_BC="$RUNTIME_LLVM_BC" "$KAIC2" --emit=native -o "$obj" "$fix" >/dev/null 2>"$WORK/$name.nemit.err"; then
+  if ! env KAI_NATIVE_RUNTIME_BC="$RUNTIME_LLVM_BC" "$KAIC2" $EDITION_FLAG --emit=native -o "$obj" "$fix" >/dev/null 2>"$WORK/$name.nemit.err"; then
     # --emit=native prints the object path; -o is ignored by the
     # current spine, so fall back to the source-derived path.
     :
@@ -144,7 +148,7 @@ for fix in "$FIXDIR"/*.kai; do
   # --- C-direct backend (the oracle): emit C, compile, run ---
   cfile="$WORK/$name.c"
   cbin="$WORK/$name-c"
-  if ! "$KAIC2" "$fix" >"$cfile" 2>"$WORK/$name.cemit.err"; then
+  if ! "$KAIC2" $EDITION_FLAG "$fix" >"$cfile" 2>"$WORK/$name.cemit.err"; then
     echo "FAIL $name — C-direct backend failed to emit"
     cat "$WORK/$name.cemit.err"
     fail=$((fail + 1))

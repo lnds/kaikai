@@ -17,6 +17,10 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KAIC2="$ROOT/stage2/kaic2"
 
+# A flagless kaic2 runs the oldest edition; fmt reproduces the surface
+# of the edition the repo declares.
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
+
 if [ ! -x "$KAIC2" ]; then
   echo "fmt_fixtures: $KAIC2 not built; run 'make kaic2' first" >&2
   exit 2
@@ -34,7 +38,7 @@ for input in "$ROOT"/examples/fmt/*.input.kai "$ROOT"/examples/fmt/width/*.input
     echo "  SKIP $name — missing $expected"
     continue
   fi
-  if ! "$KAIC2" --fmt "$input" > "$tmp/out.kai" 2> "$tmp/err"; then
+  if ! "$KAIC2" $EDITION_FLAG --fmt "$input" > "$tmp/out.kai" 2> "$tmp/err"; then
     echo "  FAIL $name — fmt rejected input:"
     sed 's/^/      /' "$tmp/err"
     fail=$((fail + 1))
@@ -46,7 +50,7 @@ for input in "$ROOT"/examples/fmt/*.input.kai "$ROOT"/examples/fmt/width/*.input
     fail=$((fail + 1))
     continue
   fi
-  if ! "$KAIC2" --fmt "$expected" > "$tmp/out2.kai" 2> "$tmp/err"; then
+  if ! "$KAIC2" $EDITION_FLAG --fmt "$expected" > "$tmp/out2.kai" 2> "$tmp/err"; then
     echo "  FAIL $name — fmt rejected expected (idempotency):"
     sed 's/^/      /' "$tmp/err"
     fail=$((fail + 1))
@@ -72,7 +76,7 @@ for f in "$ROOT"/examples/minimal/*.kai \
          "$ROOT"/examples/phase4/*.kai; do
   [ -f "$f" ] || continue
   name=$(basename "$f")
-  if ! "$KAIC2" --fmt "$f" > "$tmp/rt.kai" 2> "$tmp/err"; then
+  if ! "$KAIC2" $EDITION_FLAG --fmt "$f" > "$tmp/rt.kai" 2> "$tmp/err"; then
     # Unsupported constructs are reported via stderr + exit 1; that is
     # an explicit refusal, not a failure of the formatter.
     if grep -q "kai fmt:" "$tmp/err"; then
@@ -86,13 +90,13 @@ for f in "$ROOT"/examples/minimal/*.kai \
   fi
   # Re-parse: if the formatter's output cannot be parsed, that is
   # a fatal silent breakage of the round-trip invariant.
-  if ! "$KAIC2" --tokens "$tmp/rt.kai" > /dev/null 2> "$tmp/err"; then
+  if ! "$KAIC2" $EDITION_FLAG --tokens "$tmp/rt.kai" > /dev/null 2> "$tmp/err"; then
     echo "  FAIL $name — formatted output failed to re-parse:"
     sed 's/^/      /' "$tmp/err"
     fail=$((fail + 1))
     continue
   fi
-  if ! "$KAIC2" --fmt "$tmp/rt.kai" > "$tmp/rt2.kai" 2> "$tmp/err"; then
+  if ! "$KAIC2" $EDITION_FLAG --fmt "$tmp/rt.kai" > "$tmp/rt2.kai" 2> "$tmp/err"; then
     echo "  FAIL $name — fmt(fmt) errored:"
     sed 's/^/      /' "$tmp/err"
     fail=$((fail + 1))
@@ -121,7 +125,7 @@ cat > "$dsp/unformatted.kai" <<'EOF'
 fn   main( ) : Unit / Stdout   =   println( "hi" )
 EOF
 # The canonical formatting the driver should apply, independent of path.
-"$KAIC2" --fmt "$dsp/unformatted.kai" > "$tmp/canonical.kai"
+"$KAIC2" $EDITION_FLAG --fmt "$dsp/unformatted.kai" > "$tmp/canonical.kai"
 
 # In-place fmt over `./main.kai` must apply the same rewrite as the bare
 # filename does over `main.kai` — no "is not a directory" death.

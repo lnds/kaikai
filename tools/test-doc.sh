@@ -24,6 +24,7 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 KAI="$ROOT/bin/kai"
+EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 
 fail() {
   echo "test-doc: FAIL: $1" >&2
@@ -67,7 +68,7 @@ echo "$sym_out" | grep -q "non-overlapping" || fail "missing doc body text"
 
 # 5. --doc-json carries the `sig` field for a fn (issue #774 follow-up).
 if command -v python3 >/dev/null 2>&1; then
-  "$ROOT/stage2/kaic2" --doc-json "$ROOT/examples/doc/doc_json_basic.kai" 2>/dev/null \
+  "$ROOT/stage2/kaic2" $EDITION_FLAG --doc-json "$ROOT/examples/doc/doc_json_basic.kai" 2>/dev/null \
     | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
