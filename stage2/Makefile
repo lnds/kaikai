@@ -11015,7 +11015,8 @@ test-namespace-collisions-neg: $(TARGET) build
 	for d in $(NSCOL_NEG_DIRS); do \
 	  src=../examples/namespace-collisions/$$d/main.kai; \
 	  exp=../examples/namespace-collisions/$$d/main.err.expected; \
-	  if ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$src > /dev/null 2> build/nscol-neg-$$d.err; then \
+	  flags=$$(cat ../examples/namespace-collisions/$$d/main.flags 2>/dev/null); \
+	  if ./$(TARGET) $(TEST_CORE_CACHE) --path ../stdlib $$flags $$src > /dev/null 2> build/nscol-neg-$$d.err; then \
 	    echo "namespace-collisions-neg FAIL $$d (expected error, got success)"; continue; fi; \
 	  needle=$$(head -1 $$exp); \
 	  if ! grep -qF "$$needle" build/nscol-neg-$$d.err; then \
