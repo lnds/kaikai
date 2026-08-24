@@ -62,6 +62,7 @@ import compiler.refinements
 import compiler.infer
 import compiler.fnreg
 import compiler.modules
+import compiler.qual_head
 import compiler.name_uses
 import compiler.type_scope_table
 import compiler.type_scope
@@ -11030,9 +11031,13 @@ fn mk_proto_dispatch_body(pname: String, opname: String, line: Int, col: Int) : 
 # table (import aliases are per file) rides in `cs.mt`, the const
 # collision context is keyed by the decl's home. Growing the inherited
 # environment means growing this record, not another parameter thread.
+# `locals` holds the names lexically bound where the span sits. The
+# fragment is parsed with no surrounding scope, so without it the
+# qualified-call resolver reads `pa.Node` against the module table and
+# a local `pa` that shadows module `pa` loses its projection.
 type InterpCtx = { op_names: [String], op_arities: [OpAr],
                    file: String, cs: CSCtx, show_home: Option[String],
-                   ts: Option[TSCtx], es: Option[ESCtx] }
+                   ts: Option[TSCtx], es: Option[ESCtx], locals: [String] }
 
 #[doc("Emit-layer entry point desugar_interp_decls. `show_home` is the core module whose `Show` every user-side `#{...}` binds to (`None` leaves the op bare); `cores` names the core modules, whose own interpolations stay bare — they are typed before that module's dispatchers exist. `ts_coll`/`es_coll` are the contested type/effect tables the freshly-parsed interp fragments respell against.")]
 pub fn desugar_interp_decls(ds: [Decl], op_names: [String], op_arities: [OpAr],
@@ -11067,7 +11072,8 @@ fn desugar_interp_decls_loop(ds: [Decl], op_names: [String], op_arities: [OpAr],
                            ts: if list_length(ts_coll) == 0 { None }
                                else { Some(ts_ctx(ts_coll, home, target, cores, scopes, global_mt, imps, [])) },
                            es: if list_length(es_coll) == 0 { None }
-                               else { Some(es_ctx(es_coll, home, target, cores, scopes, global_mt, imps)) } }
+                               else { Some(es_ctx(es_coll, home, target, cores, scopes, global_mt, imps)) },
+                           locals: [] }
       desugar_interp_decls_loop(rest, op_names, op_arities, global_mt, scopes,
                                 coll, ts_coll, es_coll, imps,
                                 target, file, show_home, cores, home,
@@ -11076,17 +11082,25 @@ fn desugar_interp_decls_loop(ds: [Decl], op_names: [String], op_arities: [OpAr],
   }
 }
 
+# `cx` with `names` added to the lexical scope the spans below sit in.
+fn interp_bind(cx: InterpCtx, names: [String]) : InterpCtx =
+  InterpCtx { op_names: cx.op_names, op_arities: cx.op_arities, file: cx.file,
+              cs: cx.cs, show_home: cx.show_home, ts: cx.ts, es: cx.es,
+              locals: list_append(names, cx.locals) }
+
 fn desugar_interp_decl(d: Decl, cx: InterpCtx) : Decl / Console + File {
 
   match d {
     DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
-      DFn(p, n, tps, ps, ret, row, desugar_interp_expr(body, cx), l, c, mo)
+      DFn(p, n, tps, ps, ret, row,
+          desugar_interp_expr(body, interp_bind(cx, fn_param_names(ps))), l, c, mo)
     DTest(desc, body, l, c, mo) ->
       DTest(desc, desugar_interp_expr(body, cx), l, c, mo)
     DBench(desc, body, l, c, mo) ->
       DBench(desc, desugar_interp_expr(body, cx), l, c, mo)
     DCheck(desc, ps, body, l, c, mo) ->
-      DCheck(desc, ps, desugar_interp_expr(body, cx), l, c, mo)
+      DCheck(desc, ps,
+             desugar_interp_expr(body, interp_bind(cx, fn_param_names(ps))), l, c, mo)
     _ -> d
   }
 }
@@ -11167,14 +11181,15 @@ fn desugar_interp_kind(k: ExprKind, cx: InterpCtx,
                                   desugar_interp_expr_opt(eo, cx))
     EMatch(scr, arms)    -> EMatch(desugar_interp_expr(scr, cx),
                                      desugar_interp_arms(arms, cx))
-    ELambda(ps, b)       -> ELambda(ps, desugar_interp_expr(b, cx))
+    ELambda(ps, b)       -> ELambda(ps, desugar_interp_expr(b, interp_bind(cx, fn_param_names(ps))))
     ERecordLit(name, fs) -> ERecordLit(name, desugar_interp_fields_init(fs, cx))
     EList(els)           -> EList(desugar_interp_list_elems(els, cx))
     ERange(a, b, opt_step) -> ERange(desugar_interp_expr(a, cx),
                                        desugar_interp_expr(b, cx),
                                        desugar_interp_expr_opt(opt_step, cx))
-    EBlock(stmts, tail)  -> EBlock(desugar_interp_stmts(stmts, cx),
-                                     desugar_interp_expr_opt(tail, cx))
+    EBlock(stmts, tail)  -> match desugar_interp_block(stmts, cx, []) {
+      IBlk(ss, cx1) -> EBlock(ss, desugar_interp_expr_opt(tail, cx1))
+    }
     EPipe(a, b)          -> EPipe(desugar_interp_expr(a, cx),
                                     desugar_interp_expr(b, cx))
     EMapPipe(a, b)       -> EMapPipe(desugar_interp_expr(a, cx),
@@ -11207,10 +11222,12 @@ fn desugar_interp_arms(arms: [Arm], cx: InterpCtx) : [Arm] / Console + File = ma
 }
 
 fn desugar_interp_arm(a: Arm, cx: InterpCtx) : Arm / Console + File = match a {
-  Arm(pat, guard_opt, body) ->
+  Arm(pat, guard_opt, body) -> {
+    let cxa = interp_bind(cx, pat_binders(pat, []))
     Arm(pat,
-        desugar_interp_expr_opt(guard_opt, cx),
-        desugar_interp_expr(body, cx))
+        desugar_interp_expr_opt(guard_opt, cxa),
+        desugar_interp_expr(body, cxa))
+  }
 }
 
 fn desugar_interp_fields_init(fs: [FieldInit], cx: InterpCtx) : [FieldInit] / Console + File = match fs {
@@ -11234,9 +11251,20 @@ fn desugar_interp_list_elem(el: ListElem, cx: InterpCtx) : ListElem / Console + 
   ElSpread(e) -> ElSpread(desugar_interp_expr(e, cx))
 }
 
-fn desugar_interp_stmts(ss: [Stmt], cx: InterpCtx) : [Stmt] / Console + File = match ss {
-  []           -> []
-  [h, ...rest] -> [desugar_interp_stmt(h, cx), ...desugar_interp_stmts(rest, cx)]
+# A block's statements bind left to right: each `let` / `var` is in
+# scope for the spans that follow it, and for the block's tail.
+type IBlk = IBlk([Stmt], InterpCtx)
+
+fn desugar_interp_block(ss: [Stmt], cx: InterpCtx, acc: [Stmt]) : IBlk / Console + File = match ss {
+  []           -> IBlk(list_reverse(acc), cx)
+  [h, ...rest] -> desugar_interp_block(rest, interp_stmt_binds(h, cx),
+                                       [desugar_interp_stmt(h, cx), ...acc])
+}
+
+fn interp_stmt_binds(s: Stmt, cx: InterpCtx) : InterpCtx = match s {
+  SLet(p, _, _)       -> interp_bind(cx, pat_binders(p, []))
+  SVar(name, _, _, _, _) -> interp_bind(cx, [name])
+  _ -> cx
 }
 
 fn desugar_interp_stmt(s: Stmt, cx: InterpCtx) : Stmt / Console + File = match s {
@@ -11263,7 +11291,7 @@ fn desugar_interp_hclauses(cs: [HClause], cx: InterpCtx) : [HClause] / Console +
 
 fn desugar_interp_hclause(c: HClause, cx: InterpCtx) : HClause / Console + File = match c {
   HC(op_name, ps, body, ln, cl) ->
-    HC(op_name, ps, desugar_interp_expr(body, cx), ln, cl)
+    HC(op_name, ps, desugar_interp_expr(body, interp_bind(cx, fn_param_names(ps))), ln, cl)
 }
 
 fn desugar_interp_hreturn_opt(opt: Option[HReturn], cx: InterpCtx) : Option[HReturn] / Console + File = match opt {
@@ -11272,7 +11300,7 @@ fn desugar_interp_hreturn_opt(opt: Option[HReturn], cx: InterpCtx) : Option[HRet
 }
 
 fn desugar_interp_hreturn(r: HReturn, cx: InterpCtx) : HReturn / Console + File = match r {
-  HR(name, body, ln, cl) -> HR(name, desugar_interp_expr(body, cx), ln, cl)
+  HR(name, body, ln, cl) -> HR(name, desugar_interp_expr(body, interp_bind(cx, [name])), ln, cl)
 }
 
 fn lift_interp_string(span: String, body_start: Int, body_end: Int,
@@ -11328,7 +11356,11 @@ fn interp_parts_to_exprs(parts: [IPart], pos: InterpPos, cx: InterpCtx,
 # Effect scoping runs before type scoping, mirroring the driver order.
 fn interp_scope_frag(e: Expr, cx: InterpCtx) : Expr = {
   let e1 = match cx.es { Some(esc) -> es_expr_scoped(e, esc)  None -> e }
-  match cx.ts { Some(tsc) -> ts_expr_scoped(e1, tsc)  None -> e1 }
+  let e2 = match cx.ts { Some(tsc) -> ts_expr_scoped(e1, tsc)  None -> e1 }
+  # A qualified handler head (`with m.E`) reaches the typer bare, the
+  # same shape the whole-program pass produces for a head written
+  # outside a span.
+  qh_expr(e2, cx.cs.mt)
 }
 
 fn interp_part_to_expr(p: IPart, pos: InterpPos, cx: InterpCtx,
@@ -11365,8 +11397,8 @@ fn interp_part_to_expr(p: IPart, pos: InterpPos, cx: InterpCtx,
         # through the same arity-aware, scope-aware rewrite.
         Some(e) -> desugar_interp_expr(
                      rqc_expr(nu_const_expr(interp_scope_frag(surface_lower_expr(prc_rebase_expr(e, body.line, body.col)), cx),
-                                     [], cx.cs),
-                              [], cx.cs.mt, [], cx.file),
+                                     cx.locals, cx.cs),
+                              cx.locals, cx.cs.mt, [], cx.file),
                      cx)
         None    -> mk_expr(EStr("\"\"", false), line, col)
       }
