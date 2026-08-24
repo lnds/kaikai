@@ -59,6 +59,7 @@ import compiler.borrow_infer
 import compiler.perceus_op_arg
 import compiler.perceus_plant_drop
 import compiler.perceus_tail_drop
+import compiler.consume_index
 
 # ==================================================================
 # Downward glue mirrors (prc_ prefix) — copied verbatim from the
@@ -323,7 +324,7 @@ pub fn perceus_pass(decls: [Decl]) : [Decl] / Console {
   # Consume-map (Koka Borrowed dual): per-fn CONSUMED param positions. A caller
   # may MOVE a binder into a consuming slot; a non-consuming slot (field-read
   # callee like regexp nb_add_transition) must keep the caller's ref.
-  let cmap = pcs_build_consume_map(decls, [])
+  let cmap = pcs_build_consume_map(decls, cix_empty())
   # Names of `extern "C" fn` shims whose return type is an opaque handle.
   # A `let h = f(...)` with such an `f` binds a handle box that must move
   # at its last consuming use (the shim there decrefs the box); otherwise
@@ -632,7 +633,7 @@ fn pcs_borrow_lookup(bmap: [BorrowEntry], key: String) : [Int] = match bmap {
 
 # Back-compat: tests call the 2-arg form with no borrow map.
 fn perceus_decl(d: Decl, fns: [EFn]) : Decl / Console =
-  perceus_decl_b(d, fns, [], [], [], pcs_efn_names(fns), [], [])
+  perceus_decl_b(d, fns, [], cix_empty(), [], pcs_efn_names(fns), [], [])
 
 # A match scrutinee is borrowed when it is the bare read of a borrowed
 # param (`match p { ... }`, `p` in `borrowed`) or already wrapped in
@@ -1029,14 +1030,13 @@ pub fn pcs_borrow_params(pnames: [String], body: Expr) : [String] = match pnames
 # sound: move only into CONSUMING slots; a non-consuming slot must keep the
 # caller's ref (dup), else the value's life after the call reads freed memory
 # (the regexp UAF). Keyed per fn (qualified + bare, like the borrow map).
-pub type ConsumeEntry = CE(String, [Int])
 
-fn pcs_build_consume_map(decls: [Decl], acc: [ConsumeEntry]) : [ConsumeEntry] = match decls {
+fn pcs_build_consume_map(decls: [Decl], acc: ConsumeIndex) : ConsumeIndex = match decls {
   []           -> acc
   [d, ...rest] -> pcs_build_consume_map(rest, pcs_consume_entry_of(d, acc))
 }
 
-fn pcs_consume_entry_of(d: Decl, acc: [ConsumeEntry]) : [ConsumeEntry] = match d {
+fn pcs_consume_entry_of(d: Decl, acc: ConsumeIndex) : ConsumeIndex = match d {
   DFn(_, name, _, params, _, _, body, _, _, mo) -> {
     let pnames = map(params, (p) => p.pname)
     # An FFI shim's body is opaque to the consuming-use walk, so a normal
@@ -1045,10 +1045,10 @@ fn pcs_consume_entry_of(d: Decl, acc: [ConsumeEntry]) : [ConsumeEntry] = match d
     # a value passed to two shim calls is double-freed.
     let positions = if body_is_ffi_extern(body) { pcs_ffi_consumed_positions(params, 0) }
                     else { pcs_consumed_positions(pnames, body, 0) }
-    let qual = [CE(pcs_borrow_key(name, mo), positions), ...acc]
+    let qual = CE(pcs_borrow_key(name, mo), positions)
     match mo {
-      None    -> qual
-      Some(_) -> [CE(name, positions), ...qual]
+      None    -> cix_add(acc, qual)
+      Some(_) -> cix_add_newest_first(acc, [CE(name, positions), qual])
     }
   }
   _ -> acc
@@ -1146,16 +1146,11 @@ fn pcs_elems_bare_var(p: String, els: [ListElem]) : Bool = match els {
   }
 }
 
-fn pcs_consume_lookup(cmap: [ConsumeEntry], key: String) : [Int] = match cmap {
-  []           -> []
-  [e, ...rest] -> match e { CE(k, ps) -> if k == key { ps } else { pcs_consume_lookup(rest, key) } }
-}
-
 # True iff every arg-slot use of `nm` in `e` lands in a CONSUMING param slot
 # of the callee (per cmap). ctor slots / match scrutinees / returns consume by
 # construction. A user-fn call whose slot for nm is NOT in the callee's
 # consume set → false (the callee borrows nm; moving it is unsound).
-fn pcs_uses_only_consuming_slots(nm: String, e: Expr, cmap: [ConsumeEntry]) : Bool =
+fn pcs_uses_only_consuming_slots(nm: String, e: Expr, cmap: ConsumeIndex) : Bool =
   pcs_consuming_slots_kind(nm, e.kind, cmap)
 
 fn pcs_any_arg_is_lambda(xs: [Expr]) : Bool = match xs {
@@ -1170,7 +1165,7 @@ fn pcs_name_in_exprs(nm: String, xs: [Expr]) : Bool = match xs {
   [h, ...rest] -> pcs_name_in_expr(nm, h) or pcs_name_in_exprs(nm, rest)
 }
 
-fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: [ConsumeEntry]) : Bool = match k {
+fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: ConsumeIndex) : Bool = match k {
   ECall(f, xs) -> {
     # Higher-order conservatism: if ANY arg is a lambda, the call is a
     # higher-order combinator (map/filter/fold). The lambda may FIELD-READ
@@ -1184,7 +1179,7 @@ fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: [ConsumeEntry]) : Boo
       false
     } else {
       let key = pcs_callee_key(f)
-      let consumed = pcs_consume_lookup(cmap, key)
+      let consumed = cix_lookup(cmap, key)
       let is_ctor = match f.kind {
         EVar(c)        -> pcs_name_is_ctor(c)
         EModCall(_, c) -> pcs_name_is_ctor(c)
@@ -1213,7 +1208,7 @@ fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: [ConsumeEntry]) : Boo
   _ -> pcs_consuming_slots_ps(nm, xp_positions_kind(k), cmap)
 }
 
-fn pcs_consuming_slots_ps(nm: String, ps: [XPos], cmap: [ConsumeEntry]) : Bool = match ps {
+fn pcs_consuming_slots_ps(nm: String, ps: [XPos], cmap: ConsumeIndex) : Bool = match ps {
   []                  -> true
   [XP(r, c), ...rest] ->
     (match r {
@@ -1223,7 +1218,7 @@ fn pcs_consuming_slots_ps(nm: String, ps: [XPos], cmap: [ConsumeEntry]) : Bool =
     }) and pcs_consuming_slots_ps(nm, rest, cmap)
 }
 
-fn pcs_consuming_args(nm: String, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: [ConsumeEntry]) : Bool = match xs {
+fn pcs_consuming_args(nm: String, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: ConsumeIndex) : Bool = match xs {
   []           -> true
   [h, ...rest] -> {
     let here = match h.kind {
@@ -1234,7 +1229,7 @@ fn pcs_consuming_args(nm: String, xs: [Expr], consumed: [Int], is_ctor: Bool, i:
   }
 }
 
-fn pcs_consuming_arms(nm: String, arms: [Arm], cmap: [ConsumeEntry]) : Bool = match arms {
+fn pcs_consuming_arms(nm: String, arms: [Arm], cmap: ConsumeIndex) : Bool = match arms {
   []           -> true
   [a, ...rest] -> match a {
     Arm(_, opt_g, b) ->
@@ -1252,10 +1247,10 @@ fn pcs_consuming_arms(nm: String, arms: [Arm], cmap: [ConsumeEntry]) : Bool = ma
 # diverging at the `EVar` arg slot (the move point) where it gates on the
 # position match. Returns `true` iff the last read consumes (so moving it
 # is sound).
-fn pcs_last_use_consuming(nm: String, lu_line: Int, lu_col: Int, e: Expr, cmap: [ConsumeEntry]) : Bool =
+fn pcs_last_use_consuming(nm: String, lu_line: Int, lu_col: Int, e: Expr, cmap: ConsumeIndex) : Bool =
   pcs_lu_consuming_kind(nm, lu_line, lu_col, e.kind, cmap)
 
-fn pcs_lu_consuming_kind(nm: String, ll: Int, lc: Int, k: ExprKind, cmap: [ConsumeEntry]) : Bool = match k {
+fn pcs_lu_consuming_kind(nm: String, ll: Int, lc: Int, k: ExprKind, cmap: ConsumeIndex) : Bool = match k {
   ECall(f, xs) ->
     if pcs_any_arg_is_lambda(xs) and (pcs_name_in_exprs(nm, xs) or pcs_name_in_expr(nm, f)) {
       # The last use sits in / under a higher-order combinator's lambda
@@ -1263,7 +1258,7 @@ fn pcs_lu_consuming_kind(nm: String, ll: Int, lc: Int, k: ExprKind, cmap: [Consu
       false
     } else {
       let key = pcs_callee_key(f)
-      let consumed = pcs_consume_lookup(cmap, key)
+      let consumed = cix_lookup(cmap, key)
       let is_ctor = match f.kind {
         EVar(c)        -> pcs_name_is_ctor(c)
         EModCall(_, c) -> pcs_name_is_ctor(c)
@@ -1291,7 +1286,7 @@ fn pcs_lu_consuming_kind(nm: String, ll: Int, lc: Int, k: ExprKind, cmap: [Consu
   _ -> pcs_lu_consuming_ps(nm, ll, lc, xp_positions_kind(k), cmap)
 }
 
-fn pcs_lu_consuming_ps(nm: String, ll: Int, lc: Int, ps: [XPos], cmap: [ConsumeEntry]) : Bool = match ps {
+fn pcs_lu_consuming_ps(nm: String, ll: Int, lc: Int, ps: [XPos], cmap: ConsumeIndex) : Bool = match ps {
   []                  -> true
   [XP(r, c), ...rest] ->
     (match r {
@@ -1301,7 +1296,7 @@ fn pcs_lu_consuming_ps(nm: String, ll: Int, lc: Int, ps: [XPos], cmap: [ConsumeE
     }) and pcs_lu_consuming_ps(nm, ll, lc, rest, cmap)
 }
 
-fn pcs_lu_consuming_args(nm: String, ll: Int, lc: Int, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: [ConsumeEntry]) : Bool = match xs {
+fn pcs_lu_consuming_args(nm: String, ll: Int, lc: Int, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: ConsumeIndex) : Bool = match xs {
   []           -> true
   [h, ...rest] -> {
     let here = match h.kind {
@@ -1317,7 +1312,7 @@ fn pcs_lu_consuming_args(nm: String, ll: Int, lc: Int, xs: [Expr], consumed: [In
   }
 }
 
-fn pcs_lu_consuming_arms(nm: String, ll: Int, lc: Int, arms: [Arm], cmap: [ConsumeEntry]) : Bool = match arms {
+fn pcs_lu_consuming_arms(nm: String, ll: Int, lc: Int, arms: [Arm], cmap: ConsumeIndex) : Bool = match arms {
   []           -> true
   [a, ...rest] -> match a {
     # A guard can evaluate and its arm still not be chosen — the next arm
@@ -1344,7 +1339,7 @@ fn pcs_strs_minus(xs: [String], ys: [String]) : [String] = match xs {
   [h, ...rest] -> if list_has(ys, h) { pcs_strs_minus(rest, ys) } else { [h, ...pcs_strs_minus(rest, ys)] }
 }
 
-fn pcs_collect_move_last_set(binders: [String], body: Expr, uses: [Use], cmap: [ConsumeEntry], acc: [String]) : [String] = match binders {
+fn pcs_collect_move_last_set(binders: [String], body: Expr, uses: [Use], cmap: ConsumeIndex, acc: [String]) : [String] = match binders {
   []           -> list_reverse(acc)
   [nm, ...rest] -> {
     let acc1 = match last_use_for(nm, uses) {
@@ -1747,7 +1742,7 @@ fn pcs_inspected_elems(nm: String, els: [ListElem]) : Bool = match els {
   }
 }
 
-fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: [ConsumeEntry], opaque_ret_fns: [String],
+fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: ConsumeIndex, opaque_ret_fns: [String],
                   fn_names: [String], prim_bmap: [BorrowEntry], cap_tys: [String]) : Decl / Console {
 
   match d {
@@ -3312,7 +3307,7 @@ fn pcs_arm_tail_ctor_arms(arms: [Arm]) : Bool = match arms {
 
 #[doc("Arm-level pattern binders that pass the branch-aware safety check over the arm body (max-path<=1, consumed-on-every-path, all-consumers-linear). Pub: emit_c's arm-top reuse consults it so the shared-branch dup set matches exactly the binders perceus moves — the two must agree or RC double-counts.")]
 pub fn pcs_branch_aware_skip_locals(binders: [String], body: Expr) : [String] =
-  pcs_branch_aware_skip_locals_b(binders, body, [], [], [])
+  pcs_branch_aware_skip_locals_b(binders, body, [], cix_empty(), [])
 
 # Move-on-every-use is sound for a name only when NO execution path through
 # the whole body reads it more than once: the per-arm gates cannot see a
@@ -3329,7 +3324,7 @@ fn pcs_global_single_path(names: [String], body: Expr, bmap: [BorrowEntry]) : [S
 # what lets the rb-tree Black arm's l/r pass `mp <= 1` — without it, the
 # is_red(l) + insert_loop(l) uses sum to 2 on the descent path. `bmap` is
 # the global borrow map; pass [] for the borrow-unaware behaviour.
-pub fn pcs_branch_aware_skip_locals_b(binders: [String], body: Expr, bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] = match binders {
+pub fn pcs_branch_aware_skip_locals_b(binders: [String], body: Expr, bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] = match binders {
   []           -> []
   [h, ...rest] -> {
     let mp = pcs_max_paths_b_expr(h, body, bmap)
@@ -3561,10 +3556,10 @@ fn pcs_bhtsc_arms(self_name: String, arms: [Arm]) : Bool = match arms {
 # in a consuming slot. Separate from `pcs_collect_arm_skip_binders`'
 # `reuse_shape` set (which governs the orthogonal reuse-in-place model);
 # this set governs the free-the-cell-then-goto model. Same 4 gates.
-fn pcs_collect_goto_tail_moves(self_name: String, e: Expr, bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] / Console =
+fn pcs_collect_goto_tail_moves(self_name: String, e: Expr, bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] / Console =
   pcs_gtm_kind(self_name, e.kind, bmap, cmap, borrowed)
 
-fn pcs_gtm_kind(self_name: String, k: ExprKind, bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] / Console = match k {
+fn pcs_gtm_kind(self_name: String, k: ExprKind, bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] / Console = match k {
   EMatch(s, arms) ->
     # Same borrowed-scrutinee inhibition as the arm-skip cascade: a
     # borrowed scrutinee frees no cell, so its arm binders must not move.
@@ -3590,7 +3585,7 @@ fn pcs_gtm_kind(self_name: String, k: ExprKind, bmap: [BorrowEntry], cmap: [Cons
   _ -> []
 }
 
-fn pcs_gtm_arms(self_name: String, arms: [Arm], bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] / Console = match arms {
+fn pcs_gtm_arms(self_name: String, arms: [Arm], bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] / Console = match arms {
   []           -> []
   [a, ...rest] -> match a {
     Arm(pat, opt_g, body) -> {
@@ -3618,7 +3613,7 @@ fn pcs_gtm_arms(self_name: String, arms: [Arm], bmap: [BorrowEntry], cmap: [Cons
   }
 }
 
-fn pcs_gtm_stmts(self_name: String, stmts: [Stmt], bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] / Console = match stmts {
+fn pcs_gtm_stmts(self_name: String, stmts: [Stmt], bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] / Console = match stmts {
   []           -> []
   [s, ...rest] -> {
     let here = match s {
@@ -3710,10 +3705,10 @@ fn pcs_strs_union(xs: [String], ys: [String]) : [String] = match ys {
 # it passes the check in its own arm body (max-path<=1 borrow-aware,
 # consumed-on-every-path, all-consumers-linear); the three conditions ARE
 # Koka's per-branch ownership reconcile and are sound on their own.
-pub fn pcs_collect_arm_skip_binders(self_name: String, tl: Bool, e: Expr, bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] =
+pub fn pcs_collect_arm_skip_binders(self_name: String, tl: Bool, e: Expr, bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] =
   pcs_collect_arm_skip_kind(self_name, tl, e.kind, bmap, cmap, borrowed)
 
-fn pcs_collect_arm_skip_kind(self_name: String, tl: Bool, k: ExprKind, bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] = match k {
+fn pcs_collect_arm_skip_kind(self_name: String, tl: Bool, k: ExprKind, bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] = match k {
   EMatch(s, arms) ->
     # A borrowed scrutinee has NO reuse (rule 5): its cell belongs to the
     # caller, so the arm-top steal that arm-moves rely on never fires.
@@ -3732,14 +3727,14 @@ fn pcs_collect_arm_skip_kind(self_name: String, tl: Bool, k: ExprKind, bmap: [Bo
   _ -> pcs_collect_arm_skip_ps(self_name, tl, xp_positions_kind(k), bmap, cmap, borrowed)
 }
 
-fn pcs_collect_arm_skip_ps(self_name: String, tl: Bool, ps: [XPos], bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] = match ps {
+fn pcs_collect_arm_skip_ps(self_name: String, tl: Bool, ps: [XPos], bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] = match ps {
   []                  -> []
   [XP(_, c), ...rest] ->
     pcs_list_union(pcs_collect_arm_skip_binders(self_name, tl, c, bmap, cmap, borrowed),
                    pcs_collect_arm_skip_ps(self_name, tl, rest, bmap, cmap, borrowed))
 }
 
-fn pcs_collect_arm_skip_arms(self_name: String, tl: Bool, arms: [Arm], bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] = match arms {
+fn pcs_collect_arm_skip_arms(self_name: String, tl: Bool, arms: [Arm], bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] = match arms {
   []           -> []
   [a, ...rest] -> match a {
     Arm(pat, opt_g, body) -> {
@@ -4920,7 +4915,7 @@ fn pcs_make_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
 # under the `__pcs_ret` exit wrap) whose scrutinee does not mention p.
 # A missed selection is a missed optimisation, never a bug.
 fn pcs_owned_scope_move_params(pnames: [String], body: Expr, skip: [String],
-                                bmap: [BorrowEntry], cmap: [ConsumeEntry], borrowed: [String]) : [String] =
+                                bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] =
   match pnames {
     [] -> []
     [p, ...rest] -> {
