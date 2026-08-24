@@ -91,11 +91,36 @@ echo "native-selfhost-gate: native backend OK"
 ERR="$(mktemp)"
 trap 'rm -f "$ERR" "$ROOT/stage2/main.o" "$ROOT/stage2/kaic2-native" "$ROOT/stage2/native-selfhost-shim.o"; find "$ROOT/stage2/compiler" -name "*.o" -delete 2>/dev/null || true' EXIT
 
+# The self-compile is the heaviest process this repo runs: it holds the
+# whole program's AST and tables live for the duration. When the host runs
+# short of memory the kernel kills it, and the job then reports only a
+# shutdown signal with no compiler error — indistinguishable, from the log
+# alone, from a hang. Sample RSS while it runs so the log says which.
+if [ -r /proc/meminfo ]; then
+  echo "native-selfhost-gate: host memory at start:"
+  grep -E '^(MemTotal|MemAvailable|SwapTotal):' /proc/meminfo | sed 's/^/    /'
+fi
+
 echo "native-selfhost-gate: compiling stage2/main.kai with --emit=native …"
 rc=0
 ( cd "$ROOT/stage2" \
   && env KAI_NATIVE_RUNTIME_BC="$RUNTIME_LLVM_BC" \
-       "$KAIC2" $EDITION_FLAG --emit=native --path "$ROOT/stdlib" main.kai >/dev/null 2>"$ERR" ) || rc=$?
+       "$KAIC2" $EDITION_FLAG --emit=native --path "$ROOT/stdlib" main.kai >/dev/null 2>"$ERR" ) & 
+emit_pid=$!
+if [ -r /proc/meminfo ]; then
+  ( peak=0
+    while kill -0 "$emit_pid" 2>/dev/null; do
+      rss="$(ps -o rss= -p "$emit_pid" 2>/dev/null | tr -d ' ')"
+      case "$rss" in ''|*[!0-9]*) rss=0 ;; esac
+      [ "$rss" -gt "$peak" ] && peak="$rss"
+      avail="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"
+      echo "    [$(date -u +%H:%M:%S)] emit RSS ${rss} kB (peak ${peak} kB), host MemAvailable ${avail} kB"
+      sleep 120
+    done ) &
+  sampler_pid=$!
+fi
+wait "$emit_pid" || rc=$?
+[ -n "${sampler_pid:-}" ] && kill "$sampler_pid" 2>/dev/null
 obj_produced=0
 [ -f "$ROOT/stage2/main.o" ] && obj_produced=1
 
