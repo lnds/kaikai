@@ -110,8 +110,13 @@ emit_pid=$!
 if [ -r /proc/meminfo ]; then
   ( peak=0
     while kill -0 "$emit_pid" 2>/dev/null; do
-      rss="$(ps -o rss= -p "$emit_pid" 2>/dev/null | tr -d ' ')"
+      # $emit_pid is the subshell, not the compiler: charge the whole
+      # process group, so the number tracks kaic2 wherever it sits.
+      rss="$(ps -o rss= -g "$emit_pid" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
       case "$rss" in ''|*[!0-9]*) rss=0 ;; esac
+      if [ "$rss" -eq 0 ]; then
+        rss="$(ps -eo rss=,comm= 2>/dev/null | awk '$2 ~ /kaic2/ {s+=$1} END{print s+0}')"
+      fi
       [ "$rss" -gt "$peak" ] && peak="$rss"
       avail="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"
       line="    [$(date -u +%H:%M:%S)] emit RSS ${rss} kB (peak ${peak} kB), host MemAvailable ${avail} kB"
