@@ -1,0 +1,131 @@
+#[doc("""
+Symbol table: one opaque `SymId` per declaration, resolved to its
+`{class, name, home, scope}` row in O(1).
+
+Identity is the id, not the spelling. Two declarations of the same
+bare name in different homes are different ids, so a consumer that
+holds a `SymId` cannot re-derive a different candidate than the one
+resolve picked — the failure mode that string comparison keeps
+reproducing across passes.
+
+Storage is columnar `Array` rather than a list of rows: one buffer per
+field, indexed by id. A row costs no cons cell and no per-row header,
+and `sym_class` / `sym_home` never walk. `Vec` would be the value-typed
+choice, but the bootstrap compiler that builds this bundle has no `Vec`
+primitives, so `Array` is what the compiler can spell about itself.
+""")]
+
+import compiler.name_table
+
+#[doc("An opaque per-declaration identity. Distinct declarations get distinct ids regardless of spelling.")]
+pub type SymId = SymId(Int)
+
+#[doc("The scope a symbol was declared in: the whole program, or one home module.")]
+pub type SymScope = ScProgram | ScHome(String)
+
+#[doc("Columnar symbol table indexed by `SymId`: one buffer per field, plus a hash index from bare name to ids.")]
+pub type SymTab = { count: Int,
+                    names: Array[String],
+                    homes: Array[String],
+                    classes: Array[NCls],
+                    scopes: Array[SymScope],
+                    exported: Array[Bool],
+                    buckets: Array[[Int]],
+                    nbuckets: Int }
+
+#[doc("The integer behind a `SymId`. Only the table itself indexes with it.")]
+pub fn sym_raw(s: SymId) : Int = match s { SymId(i) -> i }
+
+#[doc("How many symbols the table holds. Valid ids are `0 .. count - 1`.")]
+pub fn st_count(t: SymTab) : Int = t.count
+
+#[doc("True when `s` indexes a row of `t`.")]
+pub fn st_valid(t: SymTab, s: SymId) : Bool {
+  let i = sym_raw(s)
+  i >= 0 and i < t.count
+}
+
+#[doc("The declared name of `s`, or the empty string when `s` is out of range.")]
+pub fn sym_name(t: SymTab, s: SymId) : String =
+  if st_valid(t, s) { array_get(t.names, sym_raw(s)) } else { "" }
+
+#[doc("The home module that declares `s`, or the empty string when `s` is out of range.")]
+pub fn sym_home(t: SymTab, s: SymId) : String =
+  if st_valid(t, s) { array_get(t.homes, sym_raw(s)) } else { "" }
+
+#[doc("The name class of `s`. An out-of-range id reports `NCFn`, which no caller reaches without first checking `st_valid`.")]
+pub fn sym_class(t: SymTab, s: SymId) : NCls =
+  if st_valid(t, s) { array_get(t.classes, sym_raw(s)) } else { NCFn }
+
+#[doc("The scope `s` was declared in.")]
+pub fn sym_scope(t: SymTab, s: SymId) : SymScope =
+  if st_valid(t, s) { array_get(t.scopes, sym_raw(s)) } else { ScProgram }
+
+#[doc("True when `s` is exported from its home.")]
+pub fn sym_exported(t: SymTab, s: SymId) : Bool =
+  if st_valid(t, s) { array_get(t.exported, sym_raw(s)) } else { false }
+
+#[doc("The home a scope names, or the empty string for program scope.")]
+pub fn scope_home(sc: SymScope) : String = match sc {
+  ScProgram  -> ""
+  ScHome(h)  -> h
+}
+
+#[doc("True when two scopes are the same.")]
+pub fn scope_eq(a: SymScope, b: SymScope) : Bool = match a {
+  ScProgram -> match b { ScProgram -> true  ScHome(_) -> false }
+  ScHome(h) -> match b { ScProgram -> false ScHome(k) -> h == k }
+}
+
+# Fixed power-of-two bucket count, comfortably above the ~20k symbols a
+# self-compile declares, so chains stay short.
+fn st_nbuckets() : Int = 32768
+
+#[doc("Bucket for `name`. `string_hash` may be negative; the result lands in `[0, n)` for any sign.")]
+pub fn st_slot(name: String, n: Int) : Int {
+  let h = string_hash(name)
+  ((h % n) + n) % n
+}
+
+#[doc("Every id declared under the bare name `name`, in declaration order. Empty when nothing declares it.")]
+pub fn st_by_name(t: SymTab, name: String) : [SymId] =
+  st_wrap(st_filter_name(t, array_get(t.buckets, st_slot(name, t.nbuckets)), name, []))
+
+# A bucket chain is built newest-first and may hold foreign names that
+# hashed alike, so the read re-applies exact equality and re-reverses.
+fn st_filter_name(t: SymTab, chain: [Int], name: String, acc: [Int]) : [Int] = match chain {
+  [] -> acc
+  [i, ...rest] ->
+    if array_get(t.names, i) == name { st_filter_name(t, rest, name, [i, ...acc]) }
+    else { st_filter_name(t, rest, name, acc) }
+}
+
+fn st_wrap(is: [Int]) : [SymId] = match is {
+  []           -> []
+  [i, ...rest] -> [SymId(i), ...st_wrap(rest)]
+}
+
+#[doc("The single id declaring `name` in class `cls` at `home`, or `None`. A name declared once per home resolves here without consulting candidates.")]
+pub fn st_lookup(t: SymTab, cls: NCls, name: String, home: String) : Option[SymId] =
+  st_pick(t, st_by_name(t, name), cls, home)
+
+fn st_pick(t: SymTab, cands: [SymId], cls: NCls, home: String) : Option[SymId] = match cands {
+  [] -> None
+  [s, ...rest] ->
+    if sym_home(t, s) == home and ncls_same(sym_class(t, s), cls) { Some(s) }
+    else { st_pick(t, rest, cls, home) }
+}
+
+#[doc("The ids declaring `name` in class `cls`, across every home. More than one means the bare use is contested.")]
+pub fn st_candidates(t: SymTab, cls: NCls, name: String) : [SymId] =
+  st_keep_class(t, st_by_name(t, name), cls)
+
+fn st_keep_class(t: SymTab, cands: [SymId], cls: NCls) : [SymId] = match cands {
+  [] -> []
+  [s, ...rest] ->
+    if ncls_same(sym_class(t, s), cls) { [s, ...st_keep_class(t, rest, cls)] }
+    else { st_keep_class(t, rest, cls) }
+}
+
+#[doc("True when two name classes are the same namespace.")]
+pub fn ncls_same(a: NCls, b: NCls) : Bool = ncls_word(a) == ncls_word(b)
