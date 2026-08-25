@@ -114,8 +114,12 @@ if [ -r /proc/meminfo ]; then
       case "$rss" in ''|*[!0-9]*) rss=0 ;; esac
       [ "$rss" -gt "$peak" ] && peak="$rss"
       avail="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"
-      echo "    [$(date -u +%H:%M:%S)] emit RSS ${rss} kB (peak ${peak} kB), host MemAvailable ${avail} kB"
-      sleep 120
+      line="    [$(date -u +%H:%M:%S)] emit RSS ${rss} kB (peak ${peak} kB), host MemAvailable ${avail} kB"
+      echo "$line"
+      # Also to a file: a job killed mid-run keeps no log, and this
+      # sample series is the only evidence of how it died.
+      echo "$line" >> "$ROOT/selfhost-memory-samples.txt"
+      sleep 60
     done ) &
   sampler_pid=$!
 fi
