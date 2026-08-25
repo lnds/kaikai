@@ -57,16 +57,30 @@ case "$baseline" in
     exit 1 ;;
 esac
 
-# The native backend needs a kaic2 linked against libLLVM. `make` keys
-# off timestamps, not flags, so a kaic2 built WITHOUT KAI_LLVM is "up to
-# date" w.r.t. build/stage2.c and `make KAI_LLVM=1 kaic2` would not
-# relink it. Force the relink by removing the binary first; this only
-# redoes the final link (seconds).
-echo "native-selfhost-gate: building kaic2 with KAI_LLVM=1 …"
-rm -f "$KAIC2"
-LLVM_CONFIG="$LLVM_CONFIG" make -C "$ROOT/stage2" KAI_LLVM=1 kaic2 >/dev/null 2>&1 \
-  || { echo "native-selfhost-gate FAIL — kaic2 (KAI_LLVM=1) build failed"; exit 1; }
+# The native backend needs a kaic2 linked against libLLVM. The build job
+# already produced exactly that binary and shipped it in the artifact, so
+# rebuilding it here re-ran a `cc -O2` over the whole ~100 MB translation
+# unit for a binary that was already correct. Assert the capability
+# instead: a kaic2 without the native backend cannot emit an object, so a
+# one-line probe distinguishes the two in well under a second.
 [ -x "$KAIC2" ] || { echo "native-selfhost-gate FAIL — kaic2 not found at $KAIC2"; exit 1; }
+
+echo "native-selfhost-gate: probing the native backend …"
+PROBE_DIR="$(mktemp -d)"
+printf 'fn main() : Unit / Console = println("probe")\n' > "$PROBE_DIR/probe.kai"
+probe_rc=0
+( cd "$PROBE_DIR" \
+  && env KAI_NATIVE_RUNTIME_BC="$RUNTIME_LLVM_BC" \
+       "$KAIC2" $EDITION_FLAG --emit=native --path "$ROOT/stdlib" probe.kai \
+       >/dev/null 2>"$PROBE_DIR/probe.err" ) || probe_rc=$?
+if [ "$probe_rc" -ne 0 ] || [ ! -f "$PROBE_DIR/probe.o" ]; then
+  echo "::error::native-selfhost-gate FAIL — this kaic2 cannot emit native objects (exit $probe_rc)."
+  echo "  The gate needs the KAI_LLVM=1 binary the build job publishes; this one was built C-only."
+  head -10 "$PROBE_DIR/probe.err" 2>/dev/null | sed 's/^/    /'
+  rm -rf "$PROBE_DIR"; exit 1
+fi
+rm -rf "$PROBE_DIR"
+echo "native-selfhost-gate: native backend OK"
 
 # Compile the compiler with itself, native backend. Run from stage2/ so
 # `import compiler.driver` in main.kai resolves against compiler/*.kai
@@ -77,11 +91,45 @@ LLVM_CONFIG="$LLVM_CONFIG" make -C "$ROOT/stage2" KAI_LLVM=1 kaic2 >/dev/null 2>
 ERR="$(mktemp)"
 trap 'rm -f "$ERR" "$ROOT/stage2/main.o" "$ROOT/stage2/kaic2-native" "$ROOT/stage2/native-selfhost-shim.o"; find "$ROOT/stage2/compiler" -name "*.o" -delete 2>/dev/null || true' EXIT
 
+# The self-compile is the heaviest process this repo runs: it holds the
+# whole program's AST and tables live for the duration. When the host runs
+# short of memory the kernel kills it, and the job then reports only a
+# shutdown signal with no compiler error — indistinguishable, from the log
+# alone, from a hang. Sample RSS while it runs so the log says which.
+if [ -r /proc/meminfo ]; then
+  echo "native-selfhost-gate: host memory at start:"
+  grep -E '^(MemTotal|MemAvailable|SwapTotal):' /proc/meminfo | sed 's/^/    /'
+fi
+
 echo "native-selfhost-gate: compiling stage2/main.kai with --emit=native …"
 rc=0
 ( cd "$ROOT/stage2" \
   && env KAI_NATIVE_RUNTIME_BC="$RUNTIME_LLVM_BC" \
-       "$KAIC2" $EDITION_FLAG --emit=native --path "$ROOT/stdlib" main.kai >/dev/null 2>"$ERR" ) || rc=$?
+       "$KAIC2" $EDITION_FLAG --emit=native --path "$ROOT/stdlib" main.kai >/dev/null 2>"$ERR" ) & 
+emit_pid=$!
+if [ -r /proc/meminfo ]; then
+  ( peak=0
+    while kill -0 "$emit_pid" 2>/dev/null; do
+      # $emit_pid is the subshell, not the compiler: charge the whole
+      # process group, so the number tracks kaic2 wherever it sits.
+      rss="$(ps -o rss= -g "$emit_pid" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+      case "$rss" in ''|*[!0-9]*) rss=0 ;; esac
+      if [ "$rss" -eq 0 ]; then
+        rss="$(ps -eo rss=,comm= 2>/dev/null | awk '$2 ~ /kaic2/ {s+=$1} END{print s+0}')"
+      fi
+      [ "$rss" -gt "$peak" ] && peak="$rss"
+      avail="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"
+      line="    [$(date -u +%H:%M:%S)] emit RSS ${rss} kB (peak ${peak} kB), host MemAvailable ${avail} kB"
+      echo "$line"
+      # Also to a file: a job killed mid-run keeps no log, and this
+      # sample series is the only evidence of how it died.
+      echo "$line" >> "$ROOT/selfhost-memory-samples.txt"
+      sleep 60
+    done ) &
+  sampler_pid=$!
+fi
+wait "$emit_pid" || rc=$?
+[ -n "${sampler_pid:-}" ] && kill "$sampler_pid" 2>/dev/null
 obj_produced=0
 [ -f "$ROOT/stage2/main.o" ] && obj_produced=1
 

@@ -194,15 +194,15 @@ warm-core: kaic2
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-diag-path-rewrite
-	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), emitted kai_* confined to the runtime namespace on both backends, a non-identifier basename still mints valid C symbols, demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures, RC-string prims keep their shared-let binders in Perceus scope, #!/bin/sh scripts parse under dash"
+tier0: selfhost test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-diag-path-rewrite test-selfhost-gate-no-rebuild
+	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), emitted kai_* confined to the runtime namespace on both backends, a non-identifier basename still mints valid C symbols, demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures, RC-string prims keep their shared-let binders in Perceus scope, #!/bin/sh scripts parse under dash, the native self-host gate consumes the published kaic2 instead of rebuilding it"
 
 # tier0 minus the selfhost. The selfhost is two whole compiler generations
 # and dominates tier0's wall clock; the remaining gates are seconds. CI runs
 # the two as separate jobs so a broken gate reports in a couple of minutes
 # instead of waiting behind the selfhost, and the two run concurrently
 # rather than in series. Locally `tier0` stays the single pre-commit gate.
-tier0-gates: test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-diag-path-rewrite
+tier0-gates: test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-diag-path-rewrite test-selfhost-gate-no-rebuild
 	@echo "tier0-gates OK — every tier0 gate except the selfhost"
 
 # The native half of the namespace gate lives in stage2 (it needs $(TARGET));
@@ -313,6 +313,12 @@ test-llvm-force-guard:
 # seconds, no kaic2 dependency.
 test-parity-preserve-native:
 	@bash tools/test-parity-preserve-native.sh
+
+# The native self-host gate must run the kaic2 build-native published, not
+# rebuild it: the extra `cc -O2` pass shared a runner with a multi-GB
+# self-compile. Hermetic, no kaic2 dependency, milliseconds.
+test-selfhost-gate-no-rebuild:
+	@bash tools/test-selfhost-gate-no-rebuild.sh
 
 # Exit-code contract of the bounded-run shim every M:N gate classifies hangs
 # with: deadline -> 124, child that survived SIGTERM -> 137. Seconds, no
