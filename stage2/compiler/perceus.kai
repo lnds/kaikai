@@ -1898,9 +1898,11 @@ fn perceus_decl_b(d: Decl, fns: [EFn], bmap: [BorrowEntry], cmap: ConsumeIndex, 
         let borrow_move_params = pcs_collect_borrow_move_last_params(
           name, pnames, body, uses, bmap, borrowed, skip_set)
         let move_last_set = pcs_strs_minus(
-          pcs_strs_inter(
-            pcs_collect_move_last_set(pcs_all_arm_binders(body, []), body, uses, cmap, []),
-            safe_arm_binders),
+          pcs_list_union(
+            pcs_strs_inter(
+              pcs_collect_move_last_set(pcs_all_arm_binders(body, []), body, uses, cmap, []),
+              safe_arm_binders),
+            pcs_collect_move_last_lets(body, uses, cmap, skip_set)),
           skip_set)
         # Let-bound opaque handles whose birth ref needs an end-of-scope
         # drop (each shim call consumes a dup; the birth ref is released
@@ -4717,6 +4719,76 @@ fn pcs_blb_qualifies(nm: String, pat: Pattern, rhs: Expr, rest: [Stmt],
       PRR(a, brc, blocked) ->
         if a != 0 or brc != 1 or blocked { false }
         else { pcs_blb_payer_ok(nm, ot, fn_name) }
+    }
+  }
+
+# Block-`let` binders whose single read transfers the birth ref. A `let`
+# owns what it binds (unlike an arm binder, which aliases the scrutinee
+# and needs the cons-cascade gate), so moving its lone read leaves no
+# orphan and needs no cascade analysis. Gates: exactly one plain read,
+# none in a lambda, the name bound once in the whole body, the read
+# unconditional (never behind a short-circuit or branch edge, whose skipped
+# path would leave the ref unpaid) and landing in a consuming slot.
+fn pcs_collect_move_last_lets(body: Expr, uses: [Use], cmap: ConsumeIndex,
+                              skip: [String]) : [String] =
+  pcs_mll_expr(body, body, uses, cmap, skip, [])
+
+fn pcs_mll_expr(e: Expr, body: Expr, uses: [Use], cmap: ConsumeIndex,
+                skip: [String], acc: [String]) : [String] = {
+  let acc1 = match e.kind {
+    EBlock(ss, _) -> pcs_mll_scan(ss, body, uses, cmap, skip, acc)
+    _             -> acc
+  }
+  pcs_mll_ps(xp_positions(e), body, uses, cmap, skip, acc1)
+}
+
+fn pcs_mll_ps(ps: [XPos], body: Expr, uses: [Use], cmap: ConsumeIndex,
+              skip: [String], acc: [String]) : [String] = match ps {
+  []                  -> acc
+  [XP(r, c), ...rest] -> {
+    let acc1 = if xrole_inline(r) { pcs_mll_expr(c, body, uses, cmap, skip, acc) }
+               else { acc }
+    pcs_mll_ps(rest, body, uses, cmap, skip, acc1)
+  }
+}
+
+fn pcs_mll_scan(ss: [Stmt], body: Expr, uses: [Use], cmap: ConsumeIndex,
+                skip: [String], acc: [String]) : [String] = match ss {
+  []           -> acc
+  [s, ...rest] -> {
+    let acc1 = match s {
+      SLet(pat, _, rhs) -> match rhs.mode {
+        MUnboxed -> acc
+        _        -> match pat.pkind {
+          PBind(nm) ->
+            if pcs_mll_qualifies(nm, pat, rhs, body, uses, cmap, skip) { [nm, ...acc] }
+            else { acc }
+          _ -> acc
+        }
+      }
+      _ -> acc
+    }
+    pcs_mll_scan(rest, body, uses, cmap, skip, acc1)
+  }
+}
+
+fn pcs_mll_qualifies(nm: String, pat: Pattern, rhs: Expr, body: Expr,
+                     uses: [Use], cmap: ConsumeIndex, skip: [String]) : Bool =
+  if name_is_unused_binder(nm) or list_has(skip, nm) { false }
+  else if not list_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm) { false }
+  else if pcs_count_non_lam_uses(nm, uses, 0) != 1 { false }
+  else if pcs_uses_have_in_lam(uses, nm) { false }
+  else if pcs_blb_bind_count(nm, body, 0) != 1 { false }
+  else {
+    match pcs_read_roles(nm, body, false) {
+      PRR(a, brc, blocked) ->
+        if a != 1 or brc != 0 or blocked { false }
+        else {
+          match last_use_for(nm, uses) {
+            LUAt(_, ll, lc) -> pcs_last_use_consuming(nm, ll, lc, body, cmap)
+            _               -> false
+          }
+        }
     }
   }
 
