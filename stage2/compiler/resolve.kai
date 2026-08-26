@@ -54,6 +54,11 @@ import compiler.ast
 import compiler.diag_file
 import compiler.refinements
 import compiler.native_prims
+import compiler.modules
+import compiler.symtab
+import compiler.usetab
+import compiler.resolve_state
+import compiler.resolve_use
 
 # ====================================================================
 # checker: name resolution
@@ -73,17 +78,20 @@ pub type Env = { scopes: [[String]], had_error: Bool, file: String,
               # (`cannot find <name> in this scope`). Mirrors
               # `InferState.diags` semantics (reverse order, flipped at
               # the entry point).
-              diags: [Diagnostic] }
+              diags: [Diagnostic],
+              # The resolution the walk produces. Inert unless the
+              # entry point turned it on.
+              rs: ResState }
 
 #[doc("Fresh resolver env for `file` with a single empty scope and no errors.")]
-pub fn env_new(file: String) : Env = Env { scopes: [[]], had_error: false, file: file, diags: [] }
+pub fn env_new(file: String) : Env = Env { scopes: [[]], had_error: false, file: file, diags: [], rs: rs_off() }
 
 fn env_push(e: Env) : Env =
-  Env { scopes: [[], ...e.scopes], had_error: e.had_error, file: e.file, diags: e.diags }
+  Env { scopes: [[], ...e.scopes], had_error: e.had_error, file: e.file, diags: e.diags, rs: e.rs }
 
 fn env_pop(e: Env) : Env {
   match e.scopes {
-    [_, ...rest] -> Env { scopes: rest, had_error: e.had_error, file: e.file, diags: e.diags }
+    [_, ...rest] -> Env { scopes: rest, had_error: e.had_error, file: e.file, diags: e.diags, rs: e.rs }
     _ -> e
   }
 }
@@ -91,7 +99,7 @@ fn env_pop(e: Env) : Env {
 fn env_add(e: Env, name: String) : Env {
   match e.scopes {
     [top, ...rest] ->
-      Env { scopes: [[name, ...top], ...rest], had_error: e.had_error, file: e.file, diags: e.diags }
+      Env { scopes: [[name, ...top], ...rest], had_error: e.had_error, file: e.file, diags: e.diags, rs: e.rs }
     _ -> e
   }
 }
@@ -115,13 +123,13 @@ fn concat_scopes(ss: [[String]], acc: [String]) : [String] {
 }
 
 fn env_mark_err(e: Env) : Env =
-  Env { scopes: e.scopes, had_error: true, file: e.file, diags: e.diags }
+  Env { scopes: e.scopes, had_error: true, file: e.file, diags: e.diags, rs: e.rs }
 
 # Push a Diagnostic onto the Env accumulator. Used by the T3 emit
 # site in parallel with its existing `diag_error` call.
 fn env_push_diag(e: Env, d: Diagnostic) : Env =
   Env { scopes: e.scopes, had_error: e.had_error, file: e.file,
-        diags: [d, ...e.diags] }
+        diags: [d, ...e.diags], rs: e.rs }
 
 fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env / Console + File {
 
@@ -301,6 +309,23 @@ fn bind_pfield(e: Env, pf: PField) : Env {
   }
 }
 
+# ---- resolution recording ----
+#
+# The resolver's decision per use site, appended to the use table in
+# walk order. `shadowed` says a binder in scope already covers the
+# name, which outranks any declaration.
+
+fn env_record(e: Env, name: String, shadowed: Bool, line: Int, col: Int) : Env =
+  if rs_recording(e.rs) {
+    env_with_rs(e, rs_record(e.rs, URow(name, ru_value(e.rs.tab, name, e.rs.home, shadowed),
+                                        line, col)))
+  } else { e }
+
+fn env_record_qualified(e: Env, modn: String, name: String, line: Int, col: Int) : Env =
+  if rs_recording(e.rs) {
+    env_with_rs(e, rs_record(e.rs, URow(name, ru_qualified(e.rs.tab, modn, name), line, col)))
+  } else { e }
+
 # ---- expression walker ----
 
 fn chk_expr(e: Env, x: Expr) : Env / Console + File {
@@ -319,7 +344,7 @@ fn chk_expr(e: Env, x: Expr) : Env / Console + File {
     EUnder     -> e
     EPlaceholder -> e
     EVar(name) -> {
-      if env_has(e, name) { e }
+      if env_has(e, name) { env_record(e, name, true, x.line, x.col) }
       else {
         # Canonical Rust/Elm-style diagnostic.
         # Error line stays terse; the did-you-mean suggestion moves
@@ -341,7 +366,7 @@ fn chk_expr(e: Env, x: Expr) : Env / Console + File {
           None    -> []
         }
         let e1 = env_push_diag(e, mk_diag(SevError, e.file, x.line, x.col, msg, related))
-        env_mark_err(e1)
+        env_mark_err(env_record(e1, name, false, x.line, x.col))
       }
     }
     ECall(f, xs) -> {
@@ -427,7 +452,7 @@ fn chk_expr(e: Env, x: Expr) : Env / Console + File {
     # qualified module call carries no sub-expressions and binds no
     # names — the resolver fills it in once everything is in scope, so
     # the checker has nothing to verify here.
-    EModCall(_, _) -> e
+    EModCall(modn, name) -> env_record_qualified(e, modn, name, x.line, x.col)
     # intrinsic args are ordinary sub-expressions (a loop intrinsic
     # carries its original callee plus the loop's lambdas); walk them so
     # name-binding issues surface exactly as in the pre-lowering call.
@@ -778,9 +803,19 @@ fn register_import(e: Env, ik: ImportKind) : Env {
 # ---- entry point ----
 
 #[doc("Resolve a program: seed core, pre-register decls, walk them, then fold in row-label, refinement, and unbound-tyvar checks. Each diagnostic names the file that declares the decl it is in. Returns 1 if any check failed.")]
-pub fn check_program(df: DiagFiles, decls: [Decl]) : Int / Console + File {
+pub fn check_program(df: DiagFiles, decls: [Decl]) : Int / Console + File =
+  resolve_program(df, decls).errs
+
+#[doc("Resolve a program and keep the resolution: the same checks `check_program` runs, with every use site recorded against `tab`.")]
+pub fn resolve_program_with(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : Resolution / Console + File =
+  resolve_run(df, decls, rs_on(tab, target))
+
+fn resolve_program(df: DiagFiles, decls: [Decl]) : Resolution / Console + File =
+  resolve_run(df, decls, rs_off())
+
+fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState) : Resolution / Console + File {
   let file = df_root(df)
-  let e0 = env_new(file)
+  let e0 = env_with_rs(env_new(file), rs0)
   let e1 = add_all(e0, core_names())
   let e2 = register_decls(e1, decls)
   let e3 = chk_decls_files(e2, decls, df)
@@ -789,19 +824,39 @@ pub fn check_program(df: DiagFiles, decls: [Decl]) : Int / Console + File {
   let row_errs = check_row_labels(decls, df, eff_names, arities)
   let strict_errs = check_call_site_refinements(file, decls)
   let tyvar_errs = check_unbound_tyvars(decls, df)
-  if e3.had_error or row_errs > 0 or strict_errs > 0 or tyvar_errs > 0 { 1 } else { 0 }
+  Resolution { errs: if e3.had_error or row_errs > 0 or strict_errs > 0 or tyvar_errs > 0 { 1 } else { 0 },
+               uses: rs_uses(e3.rs) }
 }
+
+#[doc("What a resolver run produced: the error count `check_program` reports, and the use table the walk filled.")]
+pub type Resolution = { errs: Int, uses: UseTab }
+
+fn env_with_rs(e: Env, rs: ResState) : Env =
+  Env { scopes: e.scopes, had_error: e.had_error, file: e.file, diags: e.diags, rs: rs }
+
 
 # The env's file follows the decl being walked, so an error inside an
 # imported module's body is anchored in that module's file.
 fn chk_decls_files(e: Env, ds: [Decl], df: DiagFiles) : Env / Console + File = match ds {
   [] -> e
-  [d, ...rest] ->
-    chk_decls_files(chk_decl(env_with_file(e, decl_diag_file(d, df)), d), rest, df)
+  [d, ...rest] -> {
+    let at = env_at_decl(e, d, decl_diag_file(d, df))
+    chk_decls_files(chk_decl(at, d), rest, df)
+  }
+}
+
+# The home follows the decl being walked, the same streaming reset the
+# name table uses, so a use site inside an imported module resolves
+# against that module's home rather than the root's.
+fn env_at_decl(e: Env, d: Decl, file: String) : Env {
+  let f = env_with_file(e, file)
+  if rs_recording(f.rs) {
+    env_with_rs(f, rs_at_home(f.rs, decl_home_hint_reset(d, f.rs.home, f.rs.home)))
+  } else { f }
 }
 
 fn env_with_file(e: Env, file: String) : Env =
-  Env { scopes: e.scopes, had_error: e.had_error, file: file, diags: e.diags }
+  Env { scopes: e.scopes, had_error: e.had_error, file: file, diags: e.diags, rs: e.rs }
 
 # Arity table built from every DEffect in the program. Effects are
 # declared in stdlib source and loaded before this runs, so every
