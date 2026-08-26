@@ -1160,6 +1160,8 @@ tier1-asan-b: kaic2
 	@echo "tier1-asan OK — issue #1801 fixtures pass under ASAN+UBSan (capability params carry no RC traffic, evidence node never dropped)"
 	@$(MAKE) -C stage2 test-perceus-1803-op-arg-free-asan
 	@echo "tier1-asan OK — issue #1803 fixture passes under ASAN+UBSan (clause-body binder vs continuation register gate)"
+	@$(MAKE) -C stage2 test-perceus-1902-block-let-move-asan
+	@echo "tier1-asan OK — block-let move-at-last-use fixture passes under ASAN+UBSan (no over-release when the lone read transfers the birth ref)"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,
