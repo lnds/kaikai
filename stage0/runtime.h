@@ -1034,6 +1034,23 @@ static void kai_set_scope_fn(const char *name) {
     kai_current_scope_fn = (name != NULL) ? name : "<root>";
 }
 
+/* The scope is restored on the way out: without it a leaf callee's name
+ * stays current and the caller's later allocations are billed to the
+ * leaf, which silently invents alloc sites and hides real ones. */
+typedef struct { const char *prev; } KaiScopeGuard;
+
+static KaiScopeGuard kai_scope_enter(const char *name) {
+    KaiScopeGuard g;
+    g.prev = kai_current_scope_fn;
+    kai_set_scope_fn(name);
+    return g;
+}
+
+static KaiValue *kai_scope_leave(KaiScopeGuard g, KaiValue *v) {
+    kai_current_scope_fn = g.prev;
+    return v;
+}
+
 #define KAI_LEAKSITE_BUCKETS 8192
 
 typedef struct {
@@ -1193,9 +1210,15 @@ static void kai_leaksite_register_once(void) {
     atexit(kai_leaksite_report);
 }
 
+#define KAI_SCOPE_LEAVE(v) kai_scope_leave(_kai_sg, (v))
+
 #endif /* KAI_TRACE_RC_LEAKSITE */
 
 #endif /* KAI_TRACE_RC */
+
+#ifndef KAI_SCOPE_LEAVE
+#define KAI_SCOPE_LEAVE(v) (v)
+#endif
 
 #ifndef KAI_TRACE_RC
 #define KAI_RC_NOINLINE
