@@ -6991,51 +6991,92 @@ fn utable_atom_violation(t: UTable, kts: [KindTheory]) : Option[String] =
 # Apply the substitution to a type. Recurses structurally; resolves
 # `TyVarT(n)` via subst_lookup, then recurses on the replacement so a
 # chained binding `?t0 -> ?t1 -> Int` collapses to `Int`.
-fn apply_ty(s: Subst, t: Ty) : Ty {
+fn apply_ty(s: Subst, t: Ty) : Ty = match apply_ty_opt(s, t) {
+  None      -> t
+  Some(t1)  -> t1
+}
+
+# `None` means the substitution left the subtree untouched, so callers
+# keep the input node instead of rebuilding an identical one. Nominal
+# types with no arguments (`Int`, `Decl`) dominate the annotation sites,
+# and rebuilding them allocates a fresh node per call for nothing.
+fn apply_ty_opt(s: Subst, t: Ty) : Option[Ty] {
   match t {
-    TyInt    -> t
-    TyReal   -> t
-    TyBool   -> t
-    TyString -> t
-    TyChar   -> t
-    TyUnit   -> t
-    TyByte     -> t
-    TyInt32    -> t
-    TyUInt32   -> t
-    TyUInt64   -> t
-    TyInt128   -> t
-    TyHandle   -> t
-    TyAny    -> t
+    TyInt    -> None
+    TyReal   -> None
+    TyBool   -> None
+    TyString -> None
+    TyChar   -> None
+    TyUnit   -> None
+    TyByte     -> None
+    TyInt32    -> None
+    TyUInt32   -> None
+    TyUInt64   -> None
+    TyInt128   -> None
+    TyHandle   -> None
+    TyAny    -> None
     TyVarT(n) -> match subst_lookup(s, n) {
-      Some(t2) -> apply_ty(s, t2)
-      None     -> t
+      Some(t2) -> Some(apply_ty(s, t2))
+      None     -> None
     }
-    TyListT(inner) -> TyListT(apply_ty(s, inner))
-    TyFnT(params, ret, row) -> TyFnT(apply_tys(s, params), apply_ty(s, ret), apply_row(s, row))
-    TyCon(mo_, name, atys) -> TyCon(mo_, name, apply_tys(s, atys))
+    TyListT(inner) -> match apply_ty_opt(s, inner) {
+      None      -> None
+      Some(i1)  -> Some(TyListT(i1))
+    }
+    TyFnT(params, ret, row) -> {
+      let ps = apply_tys_opt(s, params)
+      let rt = apply_ty_opt(s, ret)
+      let rw = apply_row_opt(s, row)
+      match ps {
+        None -> match rt {
+          None -> match rw {
+            None      -> None
+            Some(rw1) -> Some(TyFnT(params, ret, rw1))
+          }
+          Some(rt1) -> Some(TyFnT(params, rt1, opt_row_or(rw, row)))
+        }
+        Some(ps1) -> Some(TyFnT(ps1, opt_ty_or(rt, ret), opt_row_or(rw, row)))
+      }
+    }
+    TyCon(mo_, name, atys) -> match apply_tys_opt(s, atys) {
+      None      -> None
+      Some(as1) -> Some(TyCon(mo_, name, as1))
+    }
     # Once the shape var binds to a constructor witness, reconstruct the
     # concrete applied type (`s := List, A := Int` → `TyListT(Int)`), so
     # a resolved `TyShapeApp` never survives past substitution. Unbound,
     # only the argument is walked.
     TyShapeApp(sv, arg) -> match subst_lookup(s, sv) {
-      Some(wit) -> shape_reapply(apply_ty(s, wit), apply_ty(s, arg))
-      None      -> TyShapeApp(sv, apply_ty(s, arg))
+      Some(wit) -> Some(shape_reapply(apply_ty(s, wit), apply_ty(s, arg)))
+      None      -> match apply_ty_opt(s, arg) {
+        None      -> None
+        Some(a1)  -> Some(TyShapeApp(sv, a1))
+      }
     }
     # applying a substitution to a dimensioned type recurses into
     # both the base type and the unit expression. Unit-vars chase
     # through unit_slots; everything else passes through unchanged.
-    TyDimT(base, u) -> dim_collapse(apply_ty(s, base), apply_unit(s, u))
+    # `dim_collapse` normalises, so it runs even when nothing was
+    # substituted.
+    TyDimT(base, u) -> Some(dim_collapse(apply_ty(s, base), apply_unit(s, u)))
     # substitutions don't touch the predicate Expr (it
     # references value-level identifiers, not Ty vars); just recurse
     # through the base.
-    TyRefineT(base, p) -> TyRefineT(apply_ty(s, base), p)
+    TyRefineT(base, p) -> match apply_ty_opt(s, base) {
+      None      -> None
+      Some(b1)  -> Some(TyRefineT(b1, p))
+    }
     # substitute through each component then
     # re-normalise. A substitution can change a component's mangled
     # form (e.g. `?t0` → `Int`), which can re-order the canonical
     # list and uncover new duplicates that idempotence collapses.
-    TyUnion(parts) -> normalize_union(map(parts, (p) => apply_ty(s, p)))
+    TyUnion(parts) -> Some(normalize_union(map(parts, (p) => apply_ty(s, p))))
   }
 }
+
+fn opt_ty_or(o: Option[Ty], d: Ty) : Ty = match o { None -> d  Some(t) -> t }
+
+fn opt_row_or(o: Option[Row], d: Row) : Row = match o { None -> d  Some(r) -> r }
 
 
 # collapse `TyDimT(TyDimT(b, u1), u2)` to `TyDimT(b, u1*u2)` and
@@ -7069,10 +7110,23 @@ pub fn dim_collapse(base: Ty, u: UnitExprT) : Ty {
 
 fn unit_is_dims(u: UnitExprT) : Bool = match u { UDims(_) -> true  _ -> false }
 
-fn apply_tys(s: Subst, ts: [Ty]) : [Ty] {
+fn apply_tys(s: Subst, ts: [Ty]) : [Ty] = match apply_tys_opt(s, ts) {
+  None      -> ts
+  Some(ts1) -> ts1
+}
+
+# `None` keeps the caller's list. A spine is only rebuilt once an
+# element actually changed; the prefix before it is shared verbatim.
+fn apply_tys_opt(s: Subst, ts: [Ty]) : Option[[Ty]] {
   match ts {
-    [] -> []
-    [t, ...rest] -> [apply_ty(s, t), ...apply_tys(s, rest)]
+    [] -> None
+    [t, ...rest] -> match apply_ty_opt(s, t) {
+      Some(t1) -> Some([t1, ...apply_tys(s, rest)])
+      None     -> match apply_tys_opt(s, rest) {
+        None       -> None
+        Some(rest1) -> Some([t, ...rest1])
+      }
+    }
   }
 }
 
@@ -7231,35 +7285,69 @@ fn label_concat(a: [Label], b: [Label]) : [Label] {
   }
 }
 
-fn apply_label_args(s: Subst, l: Label) : Label =
-  Label { eff: l.eff, ty_args: apply_tys(s, l.ty_args) }
+fn apply_label_args_opt(s: Subst, l: Label) : Option[Label] =
+  match apply_tys_opt(s, l.ty_args) {
+    None      -> None
+    Some(as1) -> Some(Label { eff: l.eff, ty_args: as1 })
+  }
 
-fn apply_labels(s: Subst, ls: [Label]) : [Label] {
+fn apply_label_args(s: Subst, l: Label) : Label = match apply_label_args_opt(s, l) {
+  None     -> l
+  Some(l1) -> l1
+}
+
+fn apply_labels(s: Subst, ls: [Label]) : [Label] = match apply_labels_opt(s, ls) {
+  None      -> ls
+  Some(ls1) -> ls1
+}
+
+fn apply_labels_opt(s: Subst, ls: [Label]) : Option[[Label]] {
   match ls {
-    [] -> []
-    [h, ...rest] -> [apply_label_args(s, h), ...apply_labels(s, rest)]
+    [] -> None
+    [h, ...rest] -> match apply_label_args_opt(s, h) {
+      Some(h1) -> Some([h1, ...apply_labels(s, rest)])
+      None     -> match apply_labels_opt(s, rest) {
+        None        -> None
+        Some(rest1) -> Some([h, ...rest1])
+      }
+    }
   }
 }
 
 # Resolve a row under the current substitution: apply_ty to each
 # label payload, and chase the tail var if it's bound.
-fn apply_row(s: Subst, r: Row) : Row {
-  let labels1 = apply_labels(s, r.labels)
+fn apply_row(s: Subst, r: Row) : Row = match apply_row_opt(s, r) {
+  None     -> r
+  Some(r1) -> r1
+}
+
+# `None` means neither the labels nor the tail moved, so the row is
+# returned as-is rather than copied field by field.
+fn apply_row_opt(s: Subst, r: Row) : Option[Row] {
+  let labels1 = apply_labels_opt(s, r.labels)
   match r.tail {
-    None -> Row { labels: labels1, tail: None, display_alias: r.display_alias }
+    None -> match labels1 {
+      None     -> None
+      Some(ls) -> Some(Row { labels: ls, tail: None, display_alias: r.display_alias })
+    }
     Some(v) -> match subst_row_lookup(s, v) {
-      None -> Row { labels: labels1, tail: Some(v), display_alias: r.display_alias }
+      None -> match labels1 {
+        None     -> None
+        Some(ls) -> Some(Row { labels: ls, tail: Some(v), display_alias: r.display_alias })
+      }
       Some(r2) -> {
         let r2r = apply_row(s, r2)
-        Row {
-          labels: label_concat(labels1, r2r.labels),
+        Some(Row {
+          labels: label_concat(opt_labels_or(labels1, r.labels), r2r.labels),
           tail: r2r.tail,
           display_alias: r.display_alias
-        }
+        })
       }
     }
   }
 }
+
+fn opt_labels_or(o: Option[[Label]], d: [Label]) : [Label] = match o { None -> d  Some(ls) -> ls }
 
 # Does row variable `v` appear in row `r` after applying the current
 # substitution? Standard occurs check, restricted to the tail (row
