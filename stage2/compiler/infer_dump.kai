@@ -1,0 +1,452 @@
+#[doc("""Human-readable typed-AST dumps for the typer's debug flags.
+
+Backs `--infer`, `--dump-typed`, `--dump-typed-core`, `--dump-last-use`,
+`--dump-intervals` and `--holes`.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.intervals
+import compiler.infer
+import compiler.infer_scan_uses
+
+#[doc("infer: --infer dump of inferred top-level signatures.")]
+pub fn dump_infer(file: String, decls: [Decl]) : Int / Console + File {
+
+
+  let r = infer_program(file, decls, true)
+  r.errs
+}
+
+# ---- `--dump-typed`: typed AST pretty-printer ----
+#
+# Runs inference and walks the resulting annotated tree, printing a
+# compact `<kind> : <ty>` line per Expr node. The point of the flag
+# is diagnostic — every Expr node the walker returned is expected to
+# carry a `Some(ty)`, so a `?` in the output indicates a missed
+# rebuild path.
+
+fn ty_tag(e: Expr) : String {
+  match e.ty {
+    Some(t) -> string_concat(" : ", inf_ty_to_string(t))
+    None    -> " : ?"
+  }
+}
+
+fn tag_of_kind(k: ExprKind) : String {
+  match k {
+    EInt(n, _) -> concat_all(["int ", int_to_string(n)])
+    EFixed(span, _)   -> concat_all(["fixed ", span])
+    EReal(_, _)       -> "real"
+    EIntLit(_)        -> "real"
+    EDecimalLit(_)    -> "real"
+    EBool(b)       -> if b { "bool true" } else { "bool false" }
+    EChar(_)       -> "char"
+    EStr(_, _)     -> "string"
+    EUnit          -> "unit"
+    EVar(nm)       -> concat_all(["ident ", nm])
+    EUnder         -> "_"
+    EPlaceholder   -> "."
+    ECall(_, _)    -> "call"
+    EField(_, nm)  -> concat_all(["field .", nm])
+    EIndex(_, _)   -> "index"
+    EBinop(op, _, _) -> concat_all(["binop ", op])
+    EUnop(op, _)   -> concat_all(["unop ", op])
+    EIf(_, _, _)   -> "if"
+    EMatch(_, _)   -> "match"
+    ELambda(_, _)  -> "lambda"
+    ERecordLit(nm, _) -> concat_all(["record ", nm])
+    EList(_)       -> "list"
+    ERange(_, _, _) -> "range"
+    EBlock(_, _)   -> "block"
+    EPipe(_, _)    -> "pipe"
+    EMapPipe(_, _) -> "map_pipe"
+    EFlatMapPipe(_, _) -> "flat_map_pipe"
+    EFilterPipe(_, _) -> "filter_pipe"
+    EHole(nm_opt)  -> match nm_opt {
+      Some(nm) -> concat_all(["hole ?", nm])
+      None     -> "hole ?"
+    }
+    ETodo(msg)     -> concat_all(["todo \"", msg, "\""])
+    EExternBody(over) -> concat_all(["extern-body \"", over, "\""])
+    EBang(_)       -> "bang"
+    EHandle(_, eff_name, _, _, _, _, _) -> concat_all(["handle ", eff_name])
+    ELitUnit(_, u) -> concat_all(["lit-unit <", inf_unit_canon_display(u), ">"])
+    EVariantsOf(ty, _) -> concat_all(["variants-of ", inf_type_expr_display(ty)])
+    # qualified module call dump label.
+    EModCall(m, fname) -> concat_all(["modcall ", m, ".", fname])
+    EIntrinsic(name, _) -> concat_all(["intrinsic $", name])
+    ESurface(_) -> "surface"
+  }
+}
+
+fn dump_typed_expr(e: Expr, depth: Int) : Unit / Console {
+
+  inf_emit_line(depth, concat_all([tag_of_kind(e.kind), ty_tag(e)]))
+  dump_typed_subexprs(e.kind, depth + 1)
+}
+
+# Note: stage 1's capture analyser doesn't recognise pattern bindings
+# inside a lambda body as locals, which turns a seemingly-innocent
+# `each((a) => match a { Arm(_, g, body) -> ... })` into "capture
+# g, body from outer scope" and fails to compile. Every iteration in
+# this dumper therefore uses explicit recursive helpers with pattern
+# matching at top level rather than inline lambdas.
+
+fn dump_typed_exprs(xs: [Expr], depth: Int) : Unit / Console {
+
+  match xs {
+    [] -> ()
+    [x, ...rest] -> { dump_typed_expr(x, depth) dump_typed_exprs(rest, depth) }
+  }
+}
+
+fn dump_typed_arms(arms: [Arm], depth: Int) : Unit / Console {
+
+  match arms {
+    [] -> ()
+    [a, ...rest] -> {
+      match a {
+        Arm(_, g, body) -> {
+          match g {
+            Some(gx) -> dump_typed_expr(gx, depth)
+            None -> ()
+          }
+          dump_typed_expr(body, depth)
+        }
+      }
+      dump_typed_arms(rest, depth)
+    }
+  }
+}
+
+fn dump_typed_fis(fis: [FieldInit], depth: Int) : Unit / Console {
+
+  match fis {
+    [] -> ()
+    [fi, ...rest] -> {
+      match fi { FI(_, v) -> dump_typed_expr(v, depth) }
+      dump_typed_fis(rest, depth)
+    }
+  }
+}
+
+fn dump_typed_elems(els: [ListElem], depth: Int) : Unit / Console {
+
+  match els {
+    [] -> ()
+    [el, ...rest] -> {
+      match el {
+        ElPlain(x)  -> dump_typed_expr(x, depth)
+        ElSpread(x) -> dump_typed_expr(x, depth)
+      }
+      dump_typed_elems(rest, depth)
+    }
+  }
+}
+
+fn dump_typed_stmts(ss: [Stmt], depth: Int) : Unit / Console {
+
+  match ss {
+    [] -> ()
+    [s, ...rest] -> { dump_typed_stmt(s, depth) dump_typed_stmts(rest, depth) }
+  }
+}
+
+fn dump_typed_subexprs(k: ExprKind, depth: Int) : Unit / Console {
+
+  match k {
+    ECall(callee, xs) -> {
+      dump_typed_expr(callee, depth)
+      dump_typed_exprs(xs, depth)
+    }
+    EField(base, _)   -> dump_typed_expr(base, depth)
+    EIndex(a, b)      -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
+    EBinop(_, a, b)   -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
+    EUnop(_, x)       -> dump_typed_expr(x, depth)
+    EIf(c, a, eo)     -> {
+      dump_typed_expr(c, depth)
+      dump_typed_expr(a, depth)
+      match eo { Some(b) -> dump_typed_expr(b, depth) None -> () }
+    }
+    EMatch(scr, arms) -> {
+      dump_typed_expr(scr, depth)
+      dump_typed_arms(arms, depth)
+    }
+    ELambda(_, body)  -> dump_typed_expr(body, depth)
+    ERecordLit(_, fis) -> dump_typed_fis(fis, depth)
+    EList(els) -> dump_typed_elems(els, depth)
+    ERange(a, b, so) -> {
+      dump_typed_expr(a, depth)
+      dump_typed_expr(b, depth)
+      match so { Some(s) -> dump_typed_expr(s, depth) None -> () }
+    }
+    EBlock(ss, tail) -> {
+      dump_typed_stmts(ss, depth)
+      match tail { Some(t) -> dump_typed_expr(t, depth) None -> () }
+    }
+    EPipe(a, b) -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
+    EMapPipe(a, b) -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
+    EFlatMapPipe(a, b) -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
+    EFilterPipe(a, b) -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
+    EBang(inner) -> dump_typed_expr(inner, depth)
+    _ -> ()
+  }
+}
+
+fn dump_typed_stmt(s: Stmt, depth: Int) : Unit / Console {
+
+  match s {
+    SLet(_, _, rhs)  -> { inf_emit_line(depth, "let") dump_typed_expr(rhs, depth + 1) }
+    SAssert(c, mo)   -> {
+      inf_emit_line(depth, "assert")
+      dump_typed_expr(c, depth + 1)
+      match mo { Some(m) -> dump_typed_expr(m, depth + 1) None -> () }
+    }
+    SExprStmt(ex)    -> dump_typed_expr(ex, depth)
+    SIndexAssign(b, i, v, _, _) -> {
+      inf_emit_line(depth, "index-assign")
+      dump_typed_expr(b, depth + 1)
+      dump_typed_expr(i, depth + 1)
+      dump_typed_expr(v, depth + 1)
+    }
+    SAssign(b, v, _, _) -> {
+      inf_emit_line(depth, "assign")
+      dump_typed_expr(b, depth + 1)
+      dump_typed_expr(v, depth + 1)
+    }
+    SVar(n, _, rhs, _, _) -> {
+      inf_emit_line(depth, "var #{n}")
+      dump_typed_expr(rhs, depth + 1)
+    }
+    SUse(n, _, _) -> inf_emit_line(depth, "use #{n}")
+  }
+}
+
+fn dump_typed_decl(d: Decl) : Unit / Console {
+  match d {
+    # Hanga Roa: with core auto-loaded, `all_decls` carries both the
+    # root file and the entire core set. Only dump decls authored in
+    # the root file (module_origin = None); core / imported modules
+    # have `Some(mod)`. This keeps the --dump-typed output focused on
+    # what the user actually wrote — the same scope the legacy
+    # behaviour gave before core became implicit.
+    DFn(_, nm, _, _, _, _, body, line, col, mo) -> match mo {
+      None -> {
+        print("fn #{nm} @#{int_to_string(line)}:#{int_to_string(col)}")
+        dump_typed_expr(body, 1)
+      }
+      Some(_) -> ()
+    }
+    _ -> ()
+  }
+}
+
+#[doc("infer: --dump-typed dump of the fully typed AST.")]
+pub fn dump_typed(file: String, decls: [Decl]) : Int / Console + File {
+
+  let r = infer_program(file, decls, false)
+  dump_typed_loop(r.decls)
+  r.errs
+}
+
+fn dump_typed_loop(ds: [Decl]) : Unit / Console {
+  match ds {
+    [] -> ()
+    [d, ...rest] -> { dump_typed_decl(d) dump_typed_loop(rest) }
+  }
+}
+
+# The independence-oracle dump: same machinery as dump_typed, but the
+# predicate is inverted — only core / imported decls (module_origin =
+# Some) are printed, the root file (None) is hidden. Diffing this dump
+# across two runs that share the same core but differ only in the user
+# file proves whether the user contaminated core's typed AST.
+fn dump_typed_core_decl(d: Decl) : Unit / Console {
+  match d {
+    DFn(_, nm, _, _, _, _, body, line, col, mo) -> match mo {
+      Some(m) -> {
+        print("fn #{m}.#{nm} @#{int_to_string(line)}:#{int_to_string(col)}")
+        dump_typed_expr(body, 1)
+      }
+      None -> ()
+    }
+    _ -> ()
+  }
+}
+
+#[doc("infer: --dump-typed-core dump of the typed AST of core / imported modules only (the independence oracle's probe).")]
+pub fn dump_typed_core(file: String, decls: [Decl]) : Int / Console + File {
+
+  let r = infer_program(file, decls, false)
+  dump_typed_core_loop(r.decls)
+  r.errs
+}
+
+fn dump_typed_core_loop(ds: [Decl]) : Unit / Console {
+  match ds {
+    [] -> ()
+    [d, ...rest] -> { dump_typed_core_decl(d) dump_typed_core_loop(rest) }
+  }
+}
+
+
+# ====================================================================
+# L7 — typed-AST diagnostic dumps (main.kai 33266-34037; L6 TCO at
+# 32115-33265 stays in main with the emit_c lane)
+# ====================================================================
+
+fn dump_last_use_for_param(p: Param, uses: [Use]) : Unit / Console {
+  let lu = inf_last_use_for(p.pname, uses)
+  match lu {
+    LUAt(nm, ln, cl) -> print("  param #{nm}: last-use at #{int_to_string(ln)}:#{int_to_string(cl)}")
+    LUBlocked(nm)    -> print("  param #{nm}: blocked by closure capture")
+    LUUnused(nm)     -> print("  param #{nm}: never used")
+  }
+}
+
+fn dump_last_use_for_decl(d: Decl) : Unit / Console {
+  match d {
+    DFn(_, nm, _, params, _, _, body, ln, _, _) -> {
+      print("fn #{nm}@#{int_to_string(ln)}:")
+      let uses = inf_scan_uses_expr(body, false)
+      params |> each((p) => dump_last_use_for_param(p, uses))
+    }
+    _ -> {}
+  }
+}
+
+#[doc("infer: --dump-last-use Perceus last-use diagnostic over typed decls.")]
+pub fn dump_last_use(file: String, decls: [Decl]) : Int / Console + File {
+
+
+  let r = infer_program(file, decls, false)
+  r.decls |> each(dump_last_use_for_decl)
+  r.errs
+}
+
+# dump per-fn body intervals. Runs the typer to anchor
+# every Expr's `.ty`, then walks each user-defined DFn's body with
+# the interval propagator and prints the inferred range. Useful for
+# pinning the lattice's behaviour in fixtures before the unifier
+# reshape consumes it.
+#[doc("infer: --dump-intervals refinement-interval dump.")]
+pub fn dump_intervals(file: String, decls: [Decl]) : Int / Console + File {
+
+  let r = infer_program(file, decls, false)
+  # Hanga Roa: core auto-load surfaces every stdlib DFn alongside the
+  # target file's. The dump's pre-Hanga shape pinned one line per
+  # target-file fn; without the filter, the dump explodes to ~320
+  # lines mixing core helpers with the target. Keep only decls whose
+  # module-origin is `None` — the root file's own declarations.
+  r.decls |> each(dump_intervals_for_decl)
+  r.errs
+}
+
+fn dump_intervals_for_decl(d: Decl) : Unit / Console = match d {
+  DFn(_, name, _, _, _, _, _, _, _, mo) -> match mo {
+    None    -> {
+      let iv = ival_of_decl(d)
+      print("#{name}: #{ival_show(iv)}")
+    }
+    Some(_) -> ()
+  }
+  _ -> ()
+}
+
+# ---- `--holes`: typed-hole reports ----
+#
+# For each `?` / `?name` in the program, print the expected type
+# (recovered from the final substitution) and the bindings visible
+# at that point. Candidate synthesis — what the doc calls "a bounded
+# enumeration of fillable expressions" — lands in a later milestone;
+# this pass covers the "stop, record, keep going" half.
+#
+# Output mirrors the example in docs/typed-holes.md closely.
+
+fn dump_scope_entry(te: TyEntry) : Unit / Console =
+  print("    #{te.name} : #{scheme_to_string(te.scheme)}")
+
+fn dump_hole_candidate(c: String) : Unit / Console =
+  print("    #{c}")
+
+# The default report lists only the hole's LOCAL bindings (params +
+# lets); the surrounding top-level scope — hundreds of stdlib entries
+# — is summarised as a count and dumped only under `--holes-scope`.
+fn dump_hole_report(file: String, rh: ResolvedHole, core_len: Int,
+                    toplevel_len: Int, full: Bool) : Unit / Console {
+  match rh {
+    RH(kind, line, col, ty, scope, env_fresh) -> {
+      let label = hole_kind_label(kind)
+      let user_scope = drop_last_entries(scope, core_len)
+      let shown = if full { user_scope }
+                  else { drop_last_entries(scope, toplevel_len) }
+      let elided = list_length(user_scope) - list_length(shown)
+      let cands = synth_candidates(scope, ty, env_fresh)
+      print("#{file}:#{int_to_string(line)}:#{int_to_string(col)}: type hole #{label}")
+      print("")
+      print("  expected: #{inf_ty_to_string(ty)}")
+      print("")
+      let scope_label = if full { "  in scope:" } else { "  in scope (local):" }
+      match shown {
+        [] -> { print(if full { "  in scope: (empty)" } else { "  in scope (local): (empty)" }) print("") }
+        _  -> {
+          print(scope_label)
+          shown |> each(dump_scope_entry)
+          print("")
+        }
+      }
+      match cands {
+        [] -> ()
+        _  -> {
+          print("  candidates that fit:")
+          cands |> each(dump_hole_candidate)
+          print("")
+        }
+      }
+      match elided {
+        0 -> ()
+        _ -> {
+          print("  #{int_to_string(elided)} more bindings in scope (--holes-scope lists them)")
+          print("")
+        }
+      }
+    }
+  }
+}
+
+# Human-readable label for a hole site. `?`, `?name`, or
+# `todo!("msg")`. Used by `--holes` and `--strict-holes`.
+#[doc("infer: surface spelling of a hole kind (`?`, `?name`, `todo!`).")]
+pub fn hole_kind_label(k: HoleKind) : String {
+  match k {
+    HKHole(nm_opt) -> match nm_opt {
+      Some(nm) -> cat2("?", nm)
+      None     -> "?"
+    }
+    HKTodo(msg) -> concat_all(["todo!(\"", msg, "\")"])
+  }
+}
+
+fn dump_holes_loop(file: String, hs: [ResolvedHole], core_len: Int,
+                   toplevel_len: Int, full: Bool) : Unit / Console {
+
+  match hs {
+    [] -> ()
+    [h, ...rest] -> {
+      dump_hole_report(file, h, core_len, toplevel_len, full)
+      dump_holes_loop(file, rest, core_len, toplevel_len, full)
+    }
+  }
+}
+
+#[doc("infer: --holes human-readable typed-hole report over the build front-end's typed program. `full` lists every reachable binding instead of the hole's locals.")]
+pub fn dump_holes(file: String, tp: TypedProgram, full: Bool) : Int / Console + File {
+
+  match tp.holes {
+    [] -> { print("(no typed holes)") tp.errs }
+    _  -> { dump_holes_loop(file, tp.holes, tp.core_len, tp.toplevel_len, full) tp.errs }
+  }
+}
+
+

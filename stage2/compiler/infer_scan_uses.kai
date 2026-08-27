@@ -1,0 +1,227 @@
+#[doc("""Binder-use scan over the typed AST.
+
+Collects every read of a binder, with position, so the last-use dump and
+the interval passes can attribute them.
+""")]
+
+import compiler.ast
+import compiler.infer
+
+# Public entry: collect every `Use` in `e`, in source pre-order.
+#
+# The `_acc` workers below thread a reverse-order accumulator: each
+# `EVar` is consed to the front (O(1)), children are visited left to
+# right, and a single `list_reverse` at this entry point restores the
+# observable pre-order. This replaces the former
+# `list_append(left, list_append(...))` chaining, which copied the
+# left list at every node — O(n^2) in AST size. The consumer
+# `inf_last_use_for` is
+# order-independent (max line/col wins, any in-lam ref blocks), so
+# the reverse only preserves the diagnostic's stable output ordering.
+#[doc("infer: collect binder uses across an expression.")]
+pub fn inf_scan_uses_expr(e: Expr, in_lam: Bool) : [Use] / Console =
+
+  list_reverse(inf_scan_uses_expr_acc(e, in_lam, []))
+
+
+fn inf_scan_uses_expr_acc(e: Expr, in_lam: Bool, acc: [Use]) : [Use] / Console =
+
+  inf_scan_uses_kind(e.kind, e.line, e.col, in_lam, acc)
+
+
+fn inf_scan_uses_in_arms(arms: [Arm], in_lam: Bool, acc: [Use]) : [Use] / Console {
+
+  match arms {
+    [] -> acc
+    [h, ...rest] -> match h {
+      Arm(_, guard_opt, body) -> {
+        let a1 = match guard_opt {
+          None -> acc
+          Some(g) -> inf_scan_uses_expr_acc(g, in_lam, acc)
+        }
+        let a2 = inf_scan_uses_expr_acc(body, in_lam, a1)
+        inf_scan_uses_in_arms(rest, in_lam, a2)
+      }
+    }
+  }
+}
+
+
+fn inf_scan_uses_in_clauses(cs: [HClause], in_lam: Bool, acc: [Use]) : [Use] / Console {
+
+  match cs {
+    [] -> acc
+    [h, ...rest] -> match h {
+      HC(_, _, body, _, _) ->
+        inf_scan_uses_in_clauses(rest, in_lam,
+                                 inf_scan_uses_expr_acc(body, in_lam, acc))
+    }
+  }
+}
+
+# Re-parse an `EStr` span to surface `#{expr}` interpolations and
+# scan each parsed sub-expression for EVar refs. Mirrors `fv_interp`.
+
+fn inf_scan_uses_in_exprs(es: [Expr], in_lam: Bool, acc: [Use]) : [Use] / Console {
+
+  match es {
+    [] -> acc
+    [h, ...rest] ->
+      inf_scan_uses_in_exprs(rest, in_lam,
+                             inf_scan_uses_expr_acc(h, in_lam, acc))
+  }
+}
+
+
+fn inf_scan_uses_in_field_inits(fis: [FieldInit], in_lam: Bool, acc: [Use]) : [Use] / Console {
+
+  match fis {
+    [] -> acc
+    [h, ...rest] -> match h {
+      FI(_, e) ->
+        inf_scan_uses_in_field_inits(rest, in_lam,
+                                     inf_scan_uses_expr_acc(e, in_lam, acc))
+    }
+  }
+}
+
+
+fn inf_scan_uses_in_interp(span: String, is_triple: Bool, in_lam: Bool, acc: [Use]) : [Use] / Console {
+
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  let parts = inf_iscan_collect(span, body_end,
+                            IScan { parts: [], lit_start: body_start, i: body_start })
+  inf_scan_uses_interp_parts(parts, in_lam, acc)
+}
+
+
+fn inf_scan_uses_in_list_elems(es: [ListElem], in_lam: Bool, acc: [Use]) : [Use] / Console {
+
+  match es {
+    [] -> acc
+    [h, ...rest] -> {
+      let inner = match h {
+        ElPlain(e) -> e
+        ElSpread(e) -> e
+      }
+      inf_scan_uses_in_list_elems(rest, in_lam,
+                                  inf_scan_uses_expr_acc(inner, in_lam, acc))
+    }
+  }
+}
+
+
+fn inf_scan_uses_in_stmts(stmts: [Stmt], in_lam: Bool, acc: [Use]) : [Use] / Console {
+
+  match stmts {
+    [] -> acc
+    [h, ...rest] -> {
+      let a1 = match h {
+        SLet(_, _, rhs) -> inf_scan_uses_expr_acc(rhs, in_lam, acc)
+        SAssert(c, opt_msg) -> {
+          let a = inf_scan_uses_expr_acc(c, in_lam, acc)
+          match opt_msg {
+            None -> a
+            Some(e2) -> inf_scan_uses_expr_acc(e2, in_lam, a)
+          }
+        }
+        SExprStmt(e) -> inf_scan_uses_expr_acc(e, in_lam, acc)
+        SIndexAssign(arr, idx, val, _, _) -> {
+          let a = inf_scan_uses_expr_acc(arr, in_lam, acc)
+          let a2 = inf_scan_uses_expr_acc(idx, in_lam, a)
+          inf_scan_uses_expr_acc(val, in_lam, a2)
+        }
+        SAssign(lhs, val, _, _) ->
+          inf_scan_uses_expr_acc(val, in_lam, inf_scan_uses_expr_acc(lhs, in_lam, acc))
+        SVar(_, _, init, _, _) -> inf_scan_uses_expr_acc(init, in_lam, acc)
+        # SUse has no expression — no uses to scan.
+        SUse(_, _, _) -> acc
+      }
+      inf_scan_uses_in_stmts(rest, in_lam, a1)
+    }
+  }
+}
+
+
+fn inf_scan_uses_interp_parts(parts: [IPart], in_lam: Bool, acc: [Use]) : [Use] / Console {
+
+  match parts {
+    [] -> acc
+    [p, ...rest] -> match p {
+      IpLit(_, _) -> inf_scan_uses_interp_parts(rest, in_lam, acc)
+      IpExp(esrc) -> {
+        let a1 = match parse_interp_expr(esrc) {
+          Some(e) -> inf_scan_uses_expr_acc(e, in_lam, acc)
+          None -> acc
+        }
+        inf_scan_uses_interp_parts(rest, in_lam, a1)
+      }
+    }
+  }
+}
+
+# Find the last-use record for `nm` among `uses`. A single in-lambda
+# reference forces `LUBlocked`; otherwise the max (line, col) wins.
+
+fn inf_scan_uses_opt(opt: Option[Expr], in_lam: Bool, acc: [Use]) : [Use] / Console =
+  match opt {
+    None     -> acc
+    Some(e2) -> inf_scan_uses_expr_acc(e2, in_lam, acc)
+  }
+
+fn inf_scan_uses_kind(k: ExprKind, line: Int, col: Int, in_lam: Bool, acc: [Use]) : [Use] / Console {
+
+  match k {
+    EVar(nm) -> [U(nm, line, col, in_lam), ...acc]
+    # Interpolated strings hide EVar refs inside `#{...}` segments —
+    # the lexer keeps the raw source span and emit re-parses at code
+    # gen. Mirror `fv_interp` (5700-5725) so a binding read only via
+    # interpolation never gets mis-classified as `LUUnused`.
+    EStr(span, is_triple) -> inf_scan_uses_in_interp(span, is_triple, in_lam, acc)
+    ECall(f, xs) -> inf_scan_uses_in_exprs(xs, in_lam,
+                                           inf_scan_uses_expr_acc(f, in_lam, acc))
+    EField(x, _) -> inf_scan_uses_expr_acc(x, in_lam, acc)
+    EIndex(x, i) -> inf_scan_uses_expr_acc(i, in_lam,
+                                           inf_scan_uses_expr_acc(x, in_lam, acc))
+    EBinop(_, l, r) -> inf_scan_uses_expr_acc(r, in_lam,
+                                              inf_scan_uses_expr_acc(l, in_lam, acc))
+    EUnop(_, x) -> inf_scan_uses_expr_acc(x, in_lam, acc)
+    EIf(c, t, opt_e) ->
+      inf_scan_uses_opt(opt_e, in_lam,
+        inf_scan_uses_expr_acc(t, in_lam, inf_scan_uses_expr_acc(c, in_lam, acc)))
+    EMatch(s, arms) -> inf_scan_uses_in_arms(arms, in_lam,
+                                             inf_scan_uses_expr_acc(s, in_lam, acc))
+    ELambda(_, body) -> inf_scan_uses_expr_acc(body, true, acc)
+    ERecordLit(_, fis) -> inf_scan_uses_in_field_inits(fis, in_lam, acc)
+    EList(elems) -> inf_scan_uses_in_list_elems(elems, in_lam, acc)
+    ERange(lo, hi, opt_by) ->
+      inf_scan_uses_opt(opt_by, in_lam,
+        inf_scan_uses_expr_acc(hi, in_lam, inf_scan_uses_expr_acc(lo, in_lam, acc)))
+    EBlock(stmts, opt_tail) ->
+      inf_scan_uses_opt(opt_tail, in_lam, inf_scan_uses_in_stmts(stmts, in_lam, acc))
+    EPipe(l, r) -> inf_scan_uses_expr_acc(r, in_lam,
+                                          inf_scan_uses_expr_acc(l, in_lam, acc))
+    EMapPipe(l, r) -> inf_scan_uses_expr_acc(r, in_lam,
+                                             inf_scan_uses_expr_acc(l, in_lam, acc))
+    EFlatMapPipe(l, r) -> inf_scan_uses_expr_acc(r, in_lam,
+                                                 inf_scan_uses_expr_acc(l, in_lam, acc))
+    EFilterPipe(l, r) -> inf_scan_uses_expr_acc(r, in_lam,
+                                                inf_scan_uses_expr_acc(l, in_lam, acc))
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+      let a1 = inf_scan_uses_expr_acc(body, in_lam, acc)
+      let a2 = inf_scan_uses_opt(init_opt, in_lam, a1)
+      let a3 = inf_scan_uses_in_clauses(clauses, in_lam, a2)
+      match ret_opt {
+        None -> a3
+        Some(hr) -> match hr {
+          HR(_, body2, _, _) -> inf_scan_uses_expr_acc(body2, in_lam, a3)
+        }
+      }
+    }
+    _ -> acc
+  }
+}
+
+

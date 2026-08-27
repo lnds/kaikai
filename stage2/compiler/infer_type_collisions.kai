@@ -1,0 +1,173 @@
+#[doc("""Duplicate type and constructor declarations.
+
+Reports a type name declared twice or shadowing a builtin, and a
+constructor claimed by two different types.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.diag_file
+import compiler.infer
+
+type TypeNameClaim = TNC(String, Int, Int)
+
+#[doc("infer: `validate_type_name_collisions_decls` — typer entry point invoked by the driver.")]
+pub fn validate_type_name_collisions_decls(root_decls: [Decl], file: String) : Int / Console + File {
+
+  validate_type_name_collisions_loop(root_decls, file, [], 0)
+}
+
+fn validate_type_name_collisions_loop(remaining: [Decl], file: String,
+    claims: [TypeNameClaim],
+    errs: Int) : Int / Console + File {
+
+  match remaining {
+    [] -> errs
+    [d, ...rest] -> match d {
+      DType(_, name, _, _, line, col, _, _) ->
+        validate_one_type_decl(rest, file, claims, errs, name, line, col)
+      DDerive(_, inner, _, _) -> match inner {
+        DType(_, name, _, _, line, col, _, _) ->
+          validate_one_type_decl(rest, file, claims, errs, name, line, col)
+        _ -> validate_type_name_collisions_loop(rest, file, claims, errs)
+      }
+      DUnstable(inner, _, _) -> match inner {
+        DType(_, name, _, _, line, col, _, _) ->
+          validate_one_type_decl(rest, file, claims, errs, name, line, col)
+        _ -> validate_type_name_collisions_loop(rest, file, claims, errs)
+      }
+      DProtoLaws(_, inner, _, _, _) -> validate_type_name_collisions_loop(rest, file, claims, errs)
+      DImplAxiom(_, inner, _, _, _) -> validate_type_name_collisions_loop(rest, file, claims, errs)
+      DConstructor(inner, _, _) -> validate_type_name_collisions_loop(rest, file, claims, errs)
+      _ -> validate_type_name_collisions_loop(rest, file, claims, errs)
+    }
+  }
+}
+
+fn validate_one_type_decl(rest: [Decl], file: String,
+    claims: [TypeNameClaim], errs: Int,
+    name: String, line: Int, col: Int) : Int / Console + File {
+
+  if list_has(reserved_builtin_type_names(), name) {
+    diag_error(file, line, col,
+      concat_all(["type '", name,
+          "' is a reserved builtin type name and cannot be redeclared"]))
+    diag_help(concat_all(["rename the local type (e.g. '", name,
+        "2'); '", name, "' is reserved by the language"]))
+    validate_type_name_collisions_loop(rest, file,
+        [TNC(name, line, col), ...claims],
+        errs + 1)
+  } else {
+  match find_type_name_claim(claims, name) {
+    Some(prev) -> {
+      report_dup_type_decl(file, name, line, col, prev)
+      validate_type_name_collisions_loop(rest, file, claims, errs + 1)
+    }
+    # Hanga Roa: cross-module type-name "collision" with a core /
+    # core / imported module is NOT an error — it is shadowing,
+    # which every serious language with scoped identifiers permits.
+    # A user `type Pair = { fst: Int, snd: Int }` in their root file
+    # is welcome to coexist with `core.tuple.Pair[a, b]`: inside the
+    # user's archivo the local definition wins; the imported one
+    # stays reachable via qualified access (`tuple.Pair`). The cb4bd6b
+    # invariant ("one type name resolves to one definition") was an
+    # over-strict shortcut that traded language ergonomics for a
+    # simpler variant-table lookup — the correct fix lives in the
+    # typer's dispatch (key variants by (module, name) and resolve
+    # contextually by the scrutinee's type) and is tracked as a
+    # separate bug. Local duplicates inside the same file (the case
+    # `Some(prev)` above) remain an error — that ambiguity has no
+    # disambiguator.
+    None -> validate_type_name_collisions_loop(rest, file,
+        [TNC(name, line, col), ...claims],
+        errs)
+  }
+  }
+}
+
+# types that the language reserves for its own use; user
+# code cannot redeclare them via `type X = ...`. `Cont` is the
+# one-shot continuation type that appears in `extern "handler" fn`
+# signatures inside `default { }` blocks; the typer/codegen treat it
+# as an opaque builtin (TyCon(None, "Cont", [t])) and lower it to KaiCont*
+# at emit time.
+fn reserved_builtin_type_names() : [String] = ["Cont"]
+
+fn me_list_has_name(mes: [ModuleEntry], name: String) : Bool {
+  match mes {
+    [] -> false
+    [me, ...rest] -> match me {
+      ME(mn, _, _, _) -> if mn == name { true } else { me_list_has_name(rest, name) }
+    }
+  }
+}
+
+fn find_type_name_claim(claims: [TypeNameClaim], name: String) : Option[TypeNameClaim] {
+  match claims {
+    [] -> None
+    [c, ...rest] -> match c {
+      TNC(n, _, _) -> if n == name { Some(c) } else { find_type_name_claim(rest, name) }
+    }
+  }
+}
+
+
+fn report_dup_type_decl(file: String, name: String, line: Int, col: Int,
+    prev: TypeNameClaim) : Unit / Console + File {
+
+  match prev {
+    TNC(_, prev_line, prev_col) -> {
+      let msg = concat_all(["type '", name,
+          "' is already declared in this module (earlier at ",
+          file, ":", int_to_string(prev_line), ":",
+          int_to_string(prev_col), ")"])
+      diag_error(file, line, col, msg)
+      diag_help(concat_all(["remove or rename the second 'type ", name,
+          " = ...' declaration"]))
+    }
+  }
+}
+
+#[doc("infer: `validate_constructor_uniqueness_decls` — reject a second `#[constructor]` for the same type. The claim is keyed by the declaring module: two modules each with their own type and its own constructor are distinct claims, not a collision.")]
+pub fn validate_constructor_uniqueness_decls(decls: [Decl], df: DiagFiles) : Int / Console + File {
+
+  validate_constructor_uniqueness_loop(decls, df, [], 0)
+}
+
+fn validate_constructor_uniqueness_loop(remaining: [Decl], df: DiagFiles,
+    claims: [HomedDecl],
+    errs: Int) : Int / Console + File {
+  match remaining {
+    [] -> errs
+    [d, ...rest] -> match constructor_decl_type(d) {
+      Some(claim) -> match homed_find(claims, hd_home(claim), hd_name(claim)) {
+        Some(prev) -> {
+          report_dup_constructor(decl_diag_file(d, df), claim, prev)
+          validate_constructor_uniqueness_loop(rest, df, claims, errs + 1)
+        }
+        None -> validate_constructor_uniqueness_loop(rest, df, [claim, ...claims], errs)
+      }
+      None -> validate_constructor_uniqueness_loop(rest, df, claims, errs)
+    }
+  }
+}
+
+# The `(home, type)` claim of a `#[constructor]` wrapper whose inner fn
+# returns a named type; None for any other decl.
+fn constructor_decl_type(d: Decl) : Option[HomedDecl] = match d {
+  DConstructor(DFn(_, _, _, _, Some(ret_te), _, _, _, _, mo), l, c) ->
+    match constructor_type_name(ret_te) {
+      Some(tname) -> Some(HD(mo, tname, l, c))
+      None        -> None
+    }
+  _ -> None
+}
+
+fn report_dup_constructor(file: String, claim: HomedDecl,
+    prev: HomedDecl) : Unit / Console + File {
+  diag_error(file, hd_line(claim), hd_col(claim),
+    concat_all(["type '", hd_name(claim), "' already has a `#[constructor]` (earlier at ",
+                file, ":", int_to_string(hd_line(prev)), ":", int_to_string(hd_col(prev)), ")"]))
+  diag_help(concat_all(["a type has at most one `#[constructor]`; keep one and make the other a named `pub fn` (overloading is out — Tier 1 #3)"]))
+}
