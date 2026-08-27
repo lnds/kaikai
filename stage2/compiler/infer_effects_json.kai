@@ -1,0 +1,247 @@
+#[doc("""Effect-usage walker behind the typer's `--effects-json` report.
+
+Collects, per function, the effects its body invokes and the handlers it
+installs, as the entries `--effects-json` serialises.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.infer
+import compiler.infer_json_base
+import compiler.infer_effects_names
+
+#[doc("infer: per-function effect-usage record behind `--effects-json`.")]
+pub type EffEntry = { fn_name: String, line: Int, col: Int,
+                  effs: [String], handlers: [EffHandle] }
+
+#[doc("infer: collect per-function effect usage across a typed declaration list.")]
+pub fn effects_walk_decls(decls: [Decl], acc: [EffEntry]) : [EffEntry] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DFn(_, name, _, _, _, _, body, line, col, _) ->
+        if effects_skip_internal(name) {
+          effects_walk_decls(rest, acc)
+        } else {
+          let acc0 = EffUseAcc { effs: [], handlers: [] }
+          let used = effects_collect_expr(body, acc0)
+          let entry = EffEntry { fn_name: name, line: line, col: col,
+                                  effs: used.effs, handlers: used.handlers }
+          effects_walk_decls(rest, [entry, ...acc])
+        }
+      _ -> effects_walk_decls(rest, acc)
+    }
+  }
+}
+
+# Skip compiler-generated names (protocol dispatchers, impl bodies,
+# auto-derived ops). They all start with `__`; the user did not
+# write them and an LLM consuming the JSON does not care about
+# them.
+fn effects_collect_expr(e: Expr, acc: EffUseAcc) : EffUseAcc =
+  effects_collect_kind(e.kind, e.line, e.col, acc)
+
+fn effects_collect_kind(k: ExprKind, line: Int, col: Int,
+                         acc: EffUseAcc) : EffUseAcc {
+  match k {
+    EVar(name) -> {
+      # `Eff.op` qualified names — desugar_op_calls flattens
+      # EField(EVar(eff), op) into EVar("eff.op") before this point.
+      match effects_split_qualified(name) {
+        Some(eff) -> EffUseAcc {
+          effs: effects_add_unique(eff, acc.effs),
+          handlers: acc.handlers
+        }
+        None -> acc
+      }
+    }
+    EHandle(body, eff_name, _, init_opt, _, clauses, ret_opt) -> {
+      let h = EH(eff_name, line, col)
+      let acc1 = EffUseAcc { effs: acc.effs,
+                              handlers: [h, ...acc.handlers] }
+      let acc2 = effects_collect_expr(body, acc1)
+      let acc3 = match init_opt {
+        Some(e2) -> effects_collect_expr(e2, acc2)
+        None     -> acc2
+      }
+      let acc4 = effects_collect_clauses(clauses, acc3)
+      effects_collect_opt_return(ret_opt, acc4)
+    }
+    EBlock(stmts, tail) -> {
+      let a1 = effects_collect_stmts(stmts, acc)
+      match tail {
+        Some(t) -> effects_collect_expr(t, a1)
+        None    -> a1
+      }
+    }
+    EMatch(scr, arms) -> {
+      let a1 = effects_collect_expr(scr, acc)
+      effects_collect_arms(arms, a1)
+    }
+    ECall(callee, args_) -> {
+      let a1 = effects_collect_expr(callee, acc)
+      effects_collect_exprs(args_, a1)
+    }
+    EField(base, _) -> effects_collect_expr(base, acc)
+    EIndex(a, b) -> {
+      let a1 = effects_collect_expr(a, acc)
+      effects_collect_expr(b, a1)
+    }
+    EBinop(_, a, b) -> {
+      let a1 = effects_collect_expr(a, acc)
+      effects_collect_expr(b, a1)
+    }
+    EUnop(_, x) -> effects_collect_expr(x, acc)
+    EIf(c, t_, eo) -> {
+      let a1 = effects_collect_expr(c, acc)
+      let a2 = effects_collect_expr(t_, a1)
+      match eo {
+        Some(e2) -> effects_collect_expr(e2, a2)
+        None     -> a2
+      }
+    }
+    ELambda(_, b) -> effects_collect_expr(b, acc)
+    ERecordLit(_, fields) -> effects_collect_fields(fields, acc)
+    EList(elems) -> effects_collect_elems(elems, acc)
+    ERange(a, b, opt_step) -> {
+      let a1 = effects_collect_expr(a, acc)
+      let a2 = effects_collect_expr(b, a1)
+      match opt_step {
+        Some(s) -> effects_collect_expr(s, a2)
+        None    -> a2
+      }
+    }
+    EPipe(a, b) -> {
+      let a1 = effects_collect_expr(a, acc)
+      effects_collect_expr(b, a1)
+    }
+    EMapPipe(a, b) -> {
+      let a1 = effects_collect_expr(a, acc)
+      effects_collect_expr(b, a1)
+    }
+    EFlatMapPipe(a, b) -> {
+      let a1 = effects_collect_expr(a, acc)
+      effects_collect_expr(b, a1)
+    }
+    EFilterPipe(a, b) -> {
+      let a1 = effects_collect_expr(a, acc)
+      effects_collect_expr(b, a1)
+    }
+    ELitUnit(inner, _) -> effects_collect_expr(inner, acc)
+    EBang(inner) -> effects_collect_expr(inner, acc)
+    _ -> acc
+  }
+}
+
+fn effects_collect_exprs(es: [Expr], acc: EffUseAcc) : EffUseAcc {
+  match es {
+    [] -> acc
+    [h, ...rest] -> effects_collect_exprs(rest, effects_collect_expr(h, acc))
+  }
+}
+
+fn effects_collect_stmts(ss: [Stmt], acc: EffUseAcc) : EffUseAcc {
+  match ss {
+    [] -> acc
+    [s, ...rest] -> match s {
+      SLet(_, _, rhs) -> effects_collect_stmts(rest, effects_collect_expr(rhs, acc))
+      SAssert(c, m) -> {
+        let a1 = effects_collect_expr(c, acc)
+        let a2 = match m { Some(mx) -> effects_collect_expr(mx, a1) None -> a1 }
+        effects_collect_stmts(rest, a2)
+      }
+      SExprStmt(x) -> effects_collect_stmts(rest, effects_collect_expr(x, acc))
+      SIndexAssign(b, i, v, _, _) -> {
+        let a1 = effects_collect_expr(b, acc)
+        let a2 = effects_collect_expr(i, a1)
+        let a3 = effects_collect_expr(v, a2)
+        effects_collect_stmts(rest, a3)
+      }
+      SAssign(b, v, _, _) -> {
+        let a1 = effects_collect_expr(b, acc)
+        let a3 = effects_collect_expr(v, a1)
+        effects_collect_stmts(rest, a3)
+      }
+      SVar(_, _, rhs, _, _) -> effects_collect_stmts(rest, effects_collect_expr(rhs, acc))
+      SUse(_, _, _) -> effects_collect_stmts(rest, acc)
+    }
+  }
+}
+
+fn effects_collect_arms(arms: [Arm], acc: EffUseAcc) : EffUseAcc {
+  match arms {
+    [] -> acc
+    [a, ...rest] -> match a {
+      Arm(_, g, b) -> {
+        let a1 = match g { Some(gg) -> effects_collect_expr(gg, acc) None -> acc }
+        let a2 = effects_collect_expr(b, a1)
+        effects_collect_arms(rest, a2)
+      }
+    }
+  }
+}
+
+fn effects_collect_fields(fs: [FieldInit], acc: EffUseAcc) : EffUseAcc {
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      FI(_, v) -> effects_collect_fields(rest, effects_collect_expr(v, acc))
+    }
+  }
+}
+
+fn effects_collect_elems(els: [ListElem], acc: EffUseAcc) : EffUseAcc {
+  match els {
+    [] -> acc
+    [el, ...rest] -> match el {
+      ElPlain(x)  -> effects_collect_elems(rest, effects_collect_expr(x, acc))
+      ElSpread(x) -> effects_collect_elems(rest, effects_collect_expr(x, acc))
+    }
+  }
+}
+
+fn effects_collect_clauses(cs: [HClause], acc: EffUseAcc) : EffUseAcc {
+  match cs {
+    [] -> acc
+    [c, ...rest] -> match c {
+      HC(_, _, b, _, _) -> effects_collect_clauses(rest, effects_collect_expr(b, acc))
+    }
+  }
+}
+
+fn effects_collect_opt_return(opt: Option[HReturn], acc: EffUseAcc) : EffUseAcc {
+  match opt {
+    None -> acc
+    Some(r) -> match r {
+      HR(_, b, _, _) -> effects_collect_expr(b, acc)
+    }
+  }
+}
+
+# Split `"Eff.op"` into `Some("Eff")` if the name has the qualified
+# shape that desugar_op_calls produces. Reject names that start with
+# `__` (compiler-generated dispatchers, impl bodies, etc.) so
+# protocol dispatch traffic doesn't pollute the effect graph.
+pub fn effects_json_entry(e: EffEntry) : String =
+  concat_all([
+    "{",
+    "\"fn\": ", json_str(e.fn_name),
+    ", \"line\": ", int_to_string(e.line),
+    ", \"col\": ", int_to_string(e.col),
+    ", \"effects\": [",
+    inf_join_with(map(e.effs, json_str), ", "),
+    "], \"handlers_installed\": [",
+    inf_join_with(map(e.handlers, effects_json_handler), ", "),
+    "]}"
+  ])
+
+fn effects_json_handler(h: EffHandle) : String {
+  match h {
+    EH(eff, line, col) -> concat_all([
+      "{\"effect\": ", json_str(eff),
+      ", \"line\": ", int_to_string(line),
+      ", \"col\": ", int_to_string(col), "}"
+    ])
+  }
+}
+
