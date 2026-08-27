@@ -1,0 +1,225 @@
+#[doc("""Machine-readable typed-hole and effect reports for the typer driver.
+
+Emits the `--holes-json`, `--holes-json-scope`, `--effects-json` and
+`--effect-holes-json` payloads over an already-typed program, plus the
+`--strict-holes` gate. Schema is stable per `docs/typed-holes.md`.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.infer
+import compiler.infer_json_base
+import compiler.infer_effects_json
+
+# ---- `--holes-json`: machine-readable hole reports ----
+#
+# Emits a single JSON array, stable schema per docs/typed-holes.md.
+# Each element carries {file, line, col, name, expected_type, in_scope,
+# candidates, scope_elided}. By default `in_scope` lists the hole's
+# LOCAL bindings (params + lets) and `scope_elided` counts the
+# reachable bindings not listed; `--holes-json-scope` lists everything
+# (core included) with `scope_elided: 0`.
+
+
+fn json_scope_entry(te: TyEntry) : String =
+  concat_all([
+    "{\"name\": ", json_str(te.name),
+    ", \"type\": ", json_str(scheme_to_string(te.scheme)), "}"
+  ])
+
+fn json_scope_entries(es: [TyEntry]) : String =
+  concat_all(["[", inf_join_with(map(es, json_scope_entry), ", "), "]"])
+
+fn json_candidate(expr: String) : String =
+  concat_all(["{\"expr\": ", json_str(expr), ", \"kind\": \"synth\"}"])
+
+fn json_candidates(cs: [String]) : String =
+  concat_all(["[", inf_join_with(map(cs, json_candidate), ", "), "]"])
+
+fn json_hole_report(file: String, doc_items: [DocItem], rh: ResolvedHole,
+                    toplevel_len: Int, full: Bool) : String {
+  match rh {
+    RH(kind, line, col, ty, scope, env_fresh) -> {
+      let kj = hole_kind_json(kind)
+      let shown = if full { scope } else { drop_last_entries(scope, toplevel_len) }
+      let elided = list_length(scope) - list_length(shown)
+      let cands = synth_candidates(scope, ty, env_fresh)
+      # the surrounding declaration's `#[doc(...)]` text,
+      # resolved by source position against the root file's doc side
+      # table. null when the surrounding decl is undocumented.
+      let doc_field = match doc_for_line(doc_items, line) {
+        Some(s) -> json_str(s)
+        None    -> json_null()
+      }
+      concat_all([
+        "{",
+        "\"file\": ", json_str(file),
+        ", \"line\": ", int_to_string(line),
+        ", \"col\": ", int_to_string(col),
+        ", \"kind\": ", kj.kind,
+        ", \"name\": ", kj.name,
+        ", \"message\": ", kj.message,
+        ", \"expected_type\": ", json_str(inf_ty_to_string(ty)),
+        ", \"in_scope\": ", json_scope_entries(shown),
+        ", \"scope_elided\": ", int_to_string(elided),
+        ", \"candidates\": ", json_candidates(cands),
+        ", \"doc\": ", doc_field,
+        "}"
+      ])
+    }
+  }
+}
+
+# Triple of JSON fields derived from a HoleKind: the discriminator
+# string, the optional `name` payload (only `?name` populates it),
+# and the optional `message` payload (only `todo!(msg)` populates).
+type HoleKindJson = { kind: String, name: String, message: String }
+
+fn hole_kind_json(k: HoleKind) : HoleKindJson {
+  match k {
+    HKHole(nm_opt) -> {
+      let nm_field = match nm_opt {
+        Some(nm) -> json_str(nm)
+        None     -> json_null()
+      }
+      HoleKindJson { kind: json_str("hole"), name: nm_field, message: json_null() }
+    }
+    HKTodo(msg) ->
+      HoleKindJson { kind: json_str("todo"), name: json_null(), message: json_str(msg) }
+  }
+}
+
+#[doc("infer: --holes-json structured typed-hole report over the build front-end's typed program. doc_items is the root file's doc side table; `full` lists every reachable binding instead of the hole's locals.")]
+pub fn dump_holes_json(file: String, tp: TypedProgram, doc_items: [DocItem], full: Bool) : Int / Console + File {
+
+  let body = inf_join_with(map(tp.holes, (h) => json_hole_report(file, doc_items, h, tp.toplevel_len, full)), ", ")
+  print(concat_all(["[", body, "]"]))
+  tp.errs
+}
+
+# ---- `--effects-json`: per-fn effect graph as data ----
+#
+# For each user-declared `DFn` in the typed AST, emit a JSON object
+# capturing the effects performed by the body and the handlers
+# installed within it. Effect detection is post-inference: the typed
+# `EVar("Eff.op")` references inside the body name the effects;
+# `EHandle` nodes name the handlers. Returns the inference's error
+# count so a typer-rejected program still produces a non-zero exit.
+#
+# Schema (stable):
+#   [{"fn": String, "line": Int, "col": Int,
+#     "effects": [String],
+#     "handlers_installed": [{"effect": String, "line": Int, "col": Int}]}]
+#
+# `effects` lists each *distinct* effect performed by the body in
+# declaration order of first appearance (sorted lexicographically
+# would also be fine — the schema does not promise an order, but
+# stable across runs is the only invariant a consumer needs).
+# Compiler-internal aliases like `__proto_show` are filtered out.
+
+
+#[doc("infer: --effects-json structured effect-row report over the build front-end's typed program.")]
+pub fn dump_effects_json(file: String, tp: TypedProgram) : Int / Console + File {
+
+  let entries = effects_walk_decls(tp.decls, [])
+  let body = inf_join_with(map(entries, effects_json_entry), ", ")
+  print(concat_all(["[", body, "]"]))
+  tp.errs
+}
+
+# ---- `--effect-holes-json`: typed effect-hole resolutions as data ----
+#
+# For each `?` or `?name` that appeared in a row tail position, emit
+# what the inferencer resolved it to. Consumers (LLMs, IDEs, the
+# author themselves) read this to know which effect row goes where
+# the hole was written.
+#
+# Schema (stable):
+#   [{
+#     "file": String, "fn": String,
+#     "line": Int, "col": Int,
+#     "name": String | null,        # `?e` → "e"; bare `?` → null
+#     "labels": [String],           # resolved effect labels (sorted)
+#     "open": Bool,                 # true if the tail is still a free row var
+#     "tail_var": String | null     # "?eN" id when open, else null
+#   }]
+#[doc("infer: structured effect-hole report over the build front-end's typed program.")]
+pub fn dump_effect_holes_json(file: String, tp: TypedProgram) : Int / Console + File {
+
+  let body = inf_join_with(map(tp.row_holes, (rh) => json_row_hole_report(file, rh)), ", ")
+  print(concat_all(["[", body, "]"]))
+  tp.errs
+}
+
+fn json_row_hole_report(file: String, rrh: ResolvedRowHole) : String {
+  match rrh {
+    RRH(nm_opt, line, col, fn_name, row, body_labels) -> {
+      let name_field = match nm_opt {
+        Some(n) -> json_str(n)
+        None    -> json_null()
+      }
+      let label_strs = map(row.labels, (l) => json_str(l.eff))
+      let labels_field = concat_all(["[", inf_join_with(label_strs, ", "), "]"])
+      let body_strs = map(body_labels, json_str)
+      let body_field = concat_all(["[", inf_join_with(body_strs, ", "), "]"])
+      let open = match row.tail { Some(_) -> true None -> false }
+      let tail_field = match row.tail {
+        Some(v) -> json_str(concat_all(["?e", int_to_string(v)]))
+        None    -> json_null()
+      }
+      concat_all([
+        "{",
+        "\"file\": ", json_str(file),
+        ", \"fn\": ", json_str(fn_name),
+        ", \"line\": ", int_to_string(line),
+        ", \"col\": ", int_to_string(col),
+        ", \"name\": ", name_field,
+        ", \"labels\": ", labels_field,
+        ", \"open\": ", if open { "true" } else { "false" },
+        ", \"tail_var\": ", tail_field,
+        ", \"body_row\": ", body_field,
+        "}"
+      ])
+    }
+  }
+}
+
+
+# --strict-holes uses this on the normal compile path: emit a
+# one-line diagnostic per hole to stderr, and promote the hole count
+# to the return code so the driver skips emission. Users who want the
+# rich report should run --holes or --holes-json explicitly.
+fn strict_holes_report_loop(file: String, hs: [ResolvedHole]) : Unit / Console + File {
+
+
+  match hs {
+    [] -> ()
+    [h, ...rest] -> {
+      match h {
+        RH(kind, line, col, ty, _, _) -> {
+          let label = hole_kind_label(kind)
+          diag_error(file, line, col, "unfilled hole #{label} : #{inf_ty_to_string(ty)}")
+          diag_help("replace `#{label}` with an expression of type `#{inf_ty_to_string(ty)}`")
+          diag_note("--strict-holes blocks emission until every `?` / `?name` / `todo!` is filled")
+        }
+      }
+      strict_holes_report_loop(file, rest)
+    }
+  }
+}
+
+#[doc("infer: --strict-holes gate that fails the build on any unfilled hole.")]
+pub fn strict_holes_check(file: String, decls: [Decl]) : Int / Console + File {
+
+  let r = infer_program(file, decls, false)
+  let n = list_length(r.holes)
+  if n == 0 { r.errs }
+  else {
+    strict_holes_report_loop(file, r.holes)
+    eprint("#{file}: #{int_to_string(n)} unfilled hole(s) (--strict-holes)")
+    r.errs + n
+  }
+}
+
+

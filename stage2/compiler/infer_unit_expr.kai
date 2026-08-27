@@ -1,0 +1,145 @@
+#[doc("""Validation of a single unit expression against the units in scope.
+
+Every symbol a unit expression names must be a declared unit, a unit
+tparam, or a qualified habitant of a dimensioned type.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.kinds
+import compiler.infer
+
+# One unresolved habitant symbol: unknown, ambiguous across kinds, or
+# ambiguous across modules, each with the recipe that fixes it.
+fn unit_sym_unknown(s: String, file: String, line: Int, col: Int) : Int / Console + File = {
+  let dom = unit_sym_value_domain(s)
+  if dom == "" {
+    diag_error(file, line, col,
+      concat_all(["unknown unit `", s, "`; declare it with `unit ", s,
+                  "` (atomic) or `unit ", s, " = <expr>` (alias) before use"]))
+  } else {
+    diag_error(file, line, col,
+      concat_all(["no kind in scope declares `", dom, "` value habitants — `<",
+                  s, ">` needs a `kind K : ... with ", dom, "` declaration"]))
+  }
+  1
+}
+
+fn unit_sym_ambig_kind(s: String, kinds: [String],
+                       file: String, line: Int, col: Int) : Int / Console + File = {
+  let hint =
+    if unit_sym_value_domain(s) == "" {
+      concat_all(["qualify it (`<", ambig_first_kind(kinds), ".", s,
+                  ">`) or add `use kind ", ambig_first_kind(kinds), "`"])
+    } else {
+      concat_all(["add `use kind ", ambig_first_kind(kinds), "`"])
+    }
+  diag_error(file, line, col,
+    concat_all(["unit `", s, "` is ambiguous — it is declared in ",
+                join_with(kinds, " and "), "; ", hint]))
+  1
+}
+
+fn unit_sym_ambig_module(s: String, homes: [String],
+                         file: String, line: Int, col: Int) : Int / Console + File = {
+  diag_error(file, line, col,
+    concat_all(["unit `", s, "` is declared in more than one module (",
+                join_with(homes, ", "),
+                ") and none is this module's own — the bare name cannot",
+                " choose between them; declare a local `unit ", s,
+                "` (a module's own declaration wins) or rename one of",
+                " the colliding declarations"]))
+  1
+}
+
+fn validate_unit_sym(s: String, scope: UnitScope,
+                     file: String, line: Int, col: Int) : Int / Console + File =
+  if kind_sym_is_qualified(s) { validate_qualified_habitant(s, scope, file, line, col) }
+  else { match scope_resolve_sym(scope, s) {
+    SRok(_)           -> 0
+    SRunknown         -> unit_sym_unknown(s, file, line, col)
+    SRambig(kinds)    -> unit_sym_ambig_kind(s, kinds, file, line, col)
+    SRambigMod(homes) -> unit_sym_ambig_module(s, homes, file, line, col)
+  } }
+
+# Walk a UnitExprT and emit one diagnostic per unresolved habitant
+# symbol. After kind resolution a resolved symbol is qualified
+# (`Metric$m`); a still-bare `USym` either resolves to zero kinds
+# (undeclared) or several with no `use kind` (ambiguous). The scope
+# carries the kind context and the decl's local unit-kind tparams.
+#[doc("infer: check every symbol of a unit expression resolves in scope; returns the error count.")]
+pub fn validate_unit_expr(u: UnitExprT, scope: UnitScope,
+                         file: String, line: Int, col: Int) : Int / Console + File = match u {
+  UOne -> 0
+  UVar(_) -> 0
+  USym(s) -> validate_unit_sym(s, scope, file, line, col)
+  UMul(a, b) -> validate_unit_expr(a, scope, file, line, col) +
+                validate_unit_expr(b, scope, file, line, col)
+  UInv(a) -> validate_unit_expr(a, scope, file, line, col)
+  UPow(a, _) -> validate_unit_expr(a, scope, file, line, col)
+  UJoin(a, b) -> validate_unit_expr(a, scope, file, line, col) +
+                 validate_unit_expr(b, scope, file, line, col)
+  UDims(us) -> validate_unit_exprs(us, scope, file, line, col)
+}
+
+#[doc("infer: check a list of unit expressions; returns the summed error count.")]
+pub fn validate_unit_exprs(us: [UnitExprT], scope: UnitScope,
+                       file: String, line: Int, col: Int) : Int / Console + File = match us {
+  [] -> 0
+  [u, ...rest] -> validate_unit_expr(u, scope, file, line, col) +
+                  validate_unit_exprs(rest, scope, file, line, col)
+}
+
+# First candidate kind of an ambiguous symbol, for the "qualify as
+# <Kind.sym>" hint. The candidate list is never empty here (ambiguity
+# means >= 2), but a fallback keeps the walker total.
+fn ambig_first_kind(kinds: [String]) : String = match kinds {
+  [] -> "Kind"
+  [h, ..._] -> h
+}
+
+# A qualified habitant (`Kind$sym`) checked against its kind's own
+# habitant policy: a value-domain kind admits only values of its
+# domain; a closed-set kind admits only its fixed atoms. Every other
+# kind passes — the qualifier already pinned it.
+fn habitant_value_domain(bare: String, kind: String, dom: String,
+                         file: String, line: Int, col: Int) : Int / Console + File =
+  if unit_sym_value_domain(bare) == dom { 0 }
+  else {
+    diag_error(file, line, col,
+      concat_all(["`", bare, "` is not a habitant of `", kind, "` — its habitants",
+                  " are `", dom, "` values written directly in `<>`",
+                  if dom == "Int" { " (e.g. `<3>`)" } else { " (e.g. `<\"tag\">`)" }]))
+    1
+  }
+
+fn habitant_closed_kind(bare: String, kind: String, atoms: [String],
+                        file: String, line: Int, col: Int) : Int / Console + File =
+  if list_has(atoms, bare) { 0 }
+  else {
+    diag_error(file, line, col,
+      concat_all(["`", bare, "` is not a habitant of the closed kind `", kind,
+                  "` — its habitants are: ", join_with(atoms, ", ")]))
+    1
+  }
+
+fn validate_qualified_habitant(s: String, scope: UnitScope, file: String,
+                               line: Int, col: Int) : Int / Console + File {
+  let kind = kind_sym_kind(s)
+  let bare = kind_sym_bare(s)
+  let dom = scope_value_domain_of(scope, kind)
+  if not (dom == "") { habitant_value_domain(bare, kind, dom, file, line, col) }
+  else { match scope_closed_atoms_of(scope, kind) {
+    []    -> 0
+    atoms -> habitant_closed_kind(bare, kind, atoms, file, line, col)
+  } }
+}
+
+# Reserved unit symbols the compiler treats as built-in (currently
+# none — `Real<1>` parses as UOne, not USym("1")). This hook keeps
+# the validator forward-compatible with future built-in dimensions
+# (e.g. SI base units shipped as part of the language) without
+# editing the per-fixture declaration list.
+fn is_builtin_unit_symbol(_s: String) : Bool = false
+

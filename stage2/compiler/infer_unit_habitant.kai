@@ -1,0 +1,169 @@
+#[doc("""Habitant-slot and module-shape checks for dimensioned types.
+
+A dimensioned type's unit argument must fill its slots with the kinds the
+type declares; module and semilattice units carry their own shape rules.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.kinds
+import compiler.infer
+
+fn dim_base_head_name(base: TypeExpr) : String = match base.tkind {
+  TyName(n, _) -> n
+  TyRefine(inner, _) -> dim_base_head_name(inner)
+  _ -> ""
+}
+
+# The positional habitant components of a `<>` annotation: a `UDims`
+# splays into its list, any other unit expression is a single habitant.
+fn dim_habitant_components(u: UnitExprT) : [UnitExprT] = match u {
+  UDims(us) -> us
+  _ -> [u]
+}
+
+# The kind a single-habitant unit expression inhabits, for slot-kind
+# checking. A local unit-kind tparam (`[n: Dim]`) is a variable, not a
+# concrete habitant — its kind is fixed by its binder and unification,
+# so it is skipped (empty). A qualified symbol names its kind; a bare
+# symbol that resolves keeps the default `Measure` kind (its qualifier
+# is elided); an unresolved symbol yields empty (the unit-hygiene
+# validator already reports it). A compound expression is not a single
+# habitant and yields empty.
+fn dim_habitant_kind(u: UnitExprT, scope: UnitScope) : String = match u {
+  USym(s) ->
+    if scope_is_local(scope, s) { "" }
+    else if kind_sym_is_qualified(s) { kind_sym_kind(s) }
+    else { match scope_resolve_sym(scope, s) {
+      SRok(q) -> if kind_sym_is_qualified(q) { kind_sym_kind(q) } else { measure_kind_name() }
+      _ -> ""
+    } }
+  _ -> ""
+}
+
+# Validate a `<>` annotation against the head type's declared habitant
+# slots: arity (component count == slot count — a written annotation
+# names every slot) and per-slot kind (each component's kind == the
+# declared slot kind, positionally). A type absent from the slot table
+# declares no slots, so its annotation is a free brand and this check
+# is a no-op.
+#[doc("infer: check a dimensioned type's unit argument fills its slots with the declared kinds.")]
+pub fn validate_habitant_slots(base: TypeExpr, u: UnitExprT, scope: UnitScope,
+                           file: String, line: Int, col: Int) : Int / Console + File {
+  match scope_habitant_slots_of(scope, dim_base_head_name(base)) {
+    None -> 0
+    Some(slot_kinds) -> {
+      let comps = dim_habitant_components(u)
+      let nc = list_length(comps)
+      let ns = list_length(slot_kinds)
+      if not (nc == ns) {
+        diag_error(file, line, col,
+          concat_all(["`", dim_base_head_name(base), "` declares ", int_to_string(ns),
+                      if ns == 1 { " habitant slot" } else { " habitant slots" },
+                      ", but the annotation has ", int_to_string(nc)]))
+        1
+      } else {
+        validate_slot_kinds(dim_base_head_name(base), comps, slot_kinds, scope, file, line, col, 0)
+      }
+    }
+  }
+}
+
+fn validate_slot_kinds(tname: String, comps: [UnitExprT], slot_kinds: [String],
+                       scope: UnitScope, file: String, line: Int, col: Int,
+                       idx: Int) : Int / Console + File = match comps {
+  [] -> 0
+  [comp, ...rest] -> match slot_kinds {
+    [] -> 0
+    [want, ...rest_kinds] -> {
+      let got = dim_habitant_kind(comp, scope)
+      let e = if got == "" or got == want { 0 }
+        else {
+          diag_error(file, line, col,
+            concat_all(["habitant slot ", int_to_string(idx + 1), " of `", tname,
+                        "` expects a `", want, "` habitant, but got a `", got, "` one"]))
+          1
+        }
+      e + validate_slot_kinds(tname, rest, rest_kinds, scope, file, line, col, idx + 1)
+    }
+  }
+}
+
+# Atomic-kind shape check on a written unit (annotation or literal):
+# a Module or Composition habitant stands alone with exponent 1 or not
+# at all. Runs on the canonical table of the whole expression, so
+# `USD^1` collapses cleanly and `USD^2`, `USD*m`, `USD/EUR` are
+# rejected at the source position that wrote them.
+#[doc("infer: check a module unit is a bare symbol rather than a composite expression.")]
+pub fn validate_module_unit_shape(u: UnitExprT, scope: UnitScope, file: String,
+                              line: Int, col: Int) : Int / Console + File {
+  match u {
+    # Each position of a habitant list stands alone; the shape check
+    # runs per component, never on their merged table.
+    UDims(us) -> validate_module_unit_shapes(us, scope, file, line, col)
+    _ -> validate_module_unit_shape_one(u, scope, file, line, col)
+  }
+}
+
+fn validate_module_unit_shapes(us: [UnitExprT], scope: UnitScope, file: String,
+                               line: Int, col: Int) : Int / Console + File = match us {
+  [] -> 0
+  [u, ...rest] -> validate_module_unit_shape(u, scope, file, line, col) +
+                  validate_module_unit_shapes(rest, scope, file, line, col)
+}
+
+fn validate_module_unit_shape_one(u: UnitExprT, scope: UnitScope, file: String,
+                                  line: Int, col: Int) : Int / Console + File {
+  match scope_kind_theories(scope) {
+    [] -> 0
+    kts -> match utable_atom_violation(unit_to_table(u), kts) {
+      None -> 0
+      Some(sym) -> {
+        let kind = kind_sym_kind(sym)
+        diag_error(file, line, col,
+          concat_all(["unit `", inf_unit_expr_display(unit_canon(u)),
+                      "` does not exist: `", kind,
+                      "` habitants have no products or powers"]))
+        diag_note(concat_all(["`", kind,
+          "` habitants stand alone: a quantity is either scalar or carries exactly one habitant with exponent 1"]))
+        1
+      }
+    }
+  }
+}
+
+# Semilattice shape check on a written unit tree (annotation or
+# literal): habitants of a Semilattice kind compound only through `+`,
+# and a join admits only habitant symbols of one Semilattice kind.
+# Tree-based on purpose: the canonical table cannot tell `read*write`
+# from `read + write`.
+#[doc("infer: check a semilattice unit matches the shape its theory admits.")]
+pub fn validate_semilattice_unit_shape(u: UnitExprT, scope: UnitScope, file: String,
+                                   line: Int, col: Int) : Int / Console + File {
+  match scope_kind_theories(scope) {
+    [] -> 0
+    kts -> match sl_shape_violation(u, kts) {
+      None -> 0
+      Some(v) -> {
+        match v {
+          SlvProduct(sym) ->
+            diag_error(file, line, col,
+              concat_all(["`", kind_sym_bare(sym), "` is a `", kind_sym_kind(sym),
+                          "` habitant: it joins with `+` and admits no product,",
+                          " inverse, or power"]))
+          SlvJoinLeaf(what) ->
+            diag_error(file, line, col,
+              concat_all(["`+` joins habitants of a Semilattice kind, and `",
+                          what, "` is not one"]))
+          SlvJoinMix(k1, k2) ->
+            diag_error(file, line, col,
+              concat_all(["habitants of `", k1, "` and `", k2,
+                          "` belong to different kinds and cannot join"]))
+        }
+        1
+      }
+    }
+  }
+}
+

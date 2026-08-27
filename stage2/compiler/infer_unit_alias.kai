@@ -1,0 +1,73 @@
+#[doc("""Unit-alias table and alias expansion for units of measure.
+
+`unit` declarations may alias a unit expression; the typer resolves those
+aliases before any unit arithmetic. Expansion carries a `seen` list so a
+cyclic alias terminates instead of diverging.
+""")]
+
+import compiler.util
+import compiler.ast
+
+pub type UAliasEntry = UAE(String, UnitExprT)
+
+#[doc("infer: flat table of every `unit X = ...` alias body in a declaration list.")]
+pub fn collect_unit_alias_table(decls: [Decl]) : [UAliasEntry] =
+  collect_unit_alias_table_loop(decls, [])
+
+fn collect_unit_alias_table_loop(decls: [Decl], acc: [UAliasEntry]) : [UAliasEntry] {
+  match decls {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DUnit(_, name, UBAlias(body), _, _, _, _) -> collect_unit_alias_table_loop(rest, [UAE(name, body), ...acc])
+      _ -> collect_unit_alias_table_loop(rest, acc)
+    }
+  }
+}
+fn unit_alias_lookup(aliases: [UAliasEntry], name: String) : Option[UnitExprT] {
+  match aliases {
+    [] -> None
+    [a, ...rest] -> match a {
+      UAE(n, b) -> if n == name { Some(b) } else { unit_alias_lookup(rest, name) }
+    }
+  }
+}
+
+# Walk a UnitExprT and replace USym(name) with the alias body whenever
+# `name` is registered as an alias. Recursive — alias-of-alias chains
+# expand fully. The `seen` parameter guards against accidental cycles
+# (the spec rules them out, but a defensive guard keeps the
+# compiler from looping if a future refactor introduces one).
+fn expand_unit_aliases_in_unit(u: UnitExprT, aliases: [UAliasEntry], seen: [String]) : UnitExprT {
+  match u {
+    UOne -> u
+    UVar(_) -> u
+    USym(s) -> {
+      if list_has(seen, s) { u }
+      else {
+        match unit_alias_lookup(aliases, s) {
+          Some(body) -> expand_unit_aliases_in_unit(body, aliases, [s, ...seen])
+          None -> u
+        }
+      }
+    }
+    UMul(a, b) -> UMul(expand_unit_aliases_in_unit(a, aliases, seen),
+                      expand_unit_aliases_in_unit(b, aliases, seen))
+    UInv(a) -> UInv(expand_unit_aliases_in_unit(a, aliases, seen))
+    UPow(a, n) -> UPow(expand_unit_aliases_in_unit(a, aliases, seen), n)
+    UJoin(a, b) -> UJoin(expand_unit_aliases_in_unit(a, aliases, seen),
+                         expand_unit_aliases_in_unit(b, aliases, seen))
+    UDims(us) -> UDims(expand_unit_aliases_in_units(us, aliases, seen))
+  }
+}
+
+#[doc("infer: expand unit aliases across a list of unit expressions.")]
+pub fn expand_unit_aliases_in_units(us: [UnitExprT], aliases: [UAliasEntry], seen: [String]) : [UnitExprT] = match us {
+  [] -> []
+  [u, ...rest] -> [expand_unit_aliases_in_unit(u, aliases, seen),
+                   ...expand_unit_aliases_in_units(rest, aliases, seen)]
+}
+
+#[doc("infer: rewrite every unit alias symbol in a declaration list to its body.")]
+pub fn expand_unit_aliases_decls(ds: [Decl], aliases: [UAliasEntry]) : [Decl] =
+  map_units_decls(ds, (u) => expand_unit_aliases_in_unit(u, aliases, []))
+
