@@ -47,6 +47,7 @@ import compiler.infer
 import compiler.fnreg
 import compiler.native_prims
 import compiler.unbox_native_raw
+import compiler.fn_index
 
 #
 # Sits between monomorphisation and perceus_pass. Walks every
@@ -72,11 +73,11 @@ import compiler.unbox_native_raw
 # Subsequent milestones extend the analysis to comparisons, EIf
 # cond, and match scrutinees.
 pub fn unbox_pass(decls: [Decl], cis: [CtorIntSlots], nat: Bool) : [Decl] / Console = {
-  let fns = register_fn_decls(decls)
+  let fns = fnx_build(register_fn_decls(decls))
   map(decls, (d) => unbox_decl(d, fns, cis, nat))
 }
 
-fn unbox_decl(d: Decl, fns: [EFn], cis: [CtorIntSlots], nat: Bool) : Decl / Console {
+fn unbox_decl(d: Decl, fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : Decl / Console {
 
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
@@ -101,7 +102,7 @@ fn unbox_decl(d: Decl, fns: [EFn], cis: [CtorIntSlots], nat: Bool) : Decl / Cons
       # `undeclared identifier 'kai_a'`. Closes the
       # int/math/real_*_basic cc failures (stdlib/math/int.kai:min,
       # stdlib/math/real.kai:min, and the `max` companions).
-      let env0 = match lookup_ufn_sig(fns, name, mo) {
+      let env0 = match fnx_ufn_sig(fns, name, mo) {
         Some(US(_, _, mask)) -> ufn_param_env(params, mask, [])
         None    -> []
       }
@@ -162,7 +163,7 @@ fn ufn_param_env(params: [Param], mask: [Bool], acc: [LocBind]) : [LocBind] {
 #     ECall arm will call `emit_expr_raw` on each arg, which falls
 #     back to the boxed-then-unbox boundary tactic when the child
 #     is MBoxed (matches the existing M3 / M4 handling).
-fn ufn_promote_calls(e: Expr, fns: [EFn]) : Expr {
+fn ufn_promote_calls(e: Expr, fns: FnIndex) : Expr {
   let kind1 = ufn_promote_calls_kind(e.kind, fns)
   # Phase 3 — promote ECall to MUnboxed when callee resolves UFn
   # and result type is unboxable. Promote EIf to MUnboxed when
@@ -236,7 +237,7 @@ pub fn arm_body_diverges(e: Expr) : Bool = match e.kind {
   _ -> false
 }
 
-fn ufn_promote_calls_kind(k: ExprKind, fns: [EFn]) : ExprKind {
+fn ufn_promote_calls_kind(k: ExprKind, fns: FnIndex) : ExprKind {
   match k {
     ECall(callee, args_) -> ECall(ufn_promote_calls(callee, fns),
                                    map(args_, (a) => ufn_promote_calls(a, fns)))
@@ -270,33 +271,33 @@ fn ufn_promote_calls_kind(k: ExprKind, fns: [EFn]) : ExprKind {
   }
 }
 
-fn ufn_promote_calls_opt(opt: Option[Expr], fns: [EFn]) : Option[Expr] {
+fn ufn_promote_calls_opt(opt: Option[Expr], fns: FnIndex) : Option[Expr] {
   match opt {
     Some(e) -> Some(ufn_promote_calls(e, fns))
     None    -> None
   }
 }
 
-fn ufn_promote_calls_arm(a: Arm, fns: [EFn]) : Arm {
+fn ufn_promote_calls_arm(a: Arm, fns: FnIndex) : Arm {
   match a {
     Arm(p, g, b) -> Arm(p, ufn_promote_calls_opt(g, fns), ufn_promote_calls(b, fns))
   }
 }
 
-fn ufn_promote_calls_field(fi: FieldInit, fns: [EFn]) : FieldInit {
+fn ufn_promote_calls_field(fi: FieldInit, fns: FnIndex) : FieldInit {
   match fi {
     FI(n, v) -> FI(n, ufn_promote_calls(v, fns))
   }
 }
 
-fn ufn_promote_calls_elem(el: ListElem, fns: [EFn]) : ListElem {
+fn ufn_promote_calls_elem(el: ListElem, fns: FnIndex) : ListElem {
   match el {
     ElPlain(x)  -> ElPlain(ufn_promote_calls(x, fns))
     ElSpread(x) -> ElSpread(ufn_promote_calls(x, fns))
   }
 }
 
-fn ufn_promote_calls_stmt(s: Stmt, fns: [EFn]) : Stmt {
+fn ufn_promote_calls_stmt(s: Stmt, fns: FnIndex) : Stmt {
   match s {
     SLet(p, ann, rhs) -> SLet(p, ann, ufn_promote_calls(rhs, fns))
     SVar(n, ty, rhs, l, c) -> SVar(n, ty, ufn_promote_calls(rhs, fns), l, c)
@@ -311,13 +312,13 @@ fn ufn_promote_calls_stmt(s: Stmt, fns: [EFn]) : Stmt {
   }
 }
 
-fn ufn_promote_calls_clause(c: HClause, fns: [EFn]) : HClause {
+fn ufn_promote_calls_clause(c: HClause, fns: FnIndex) : HClause {
   match c {
     HC(n, ps, b, l, co) -> HC(n, ps, ufn_promote_calls(b, fns), l, co)
   }
 }
 
-fn ufn_promote_calls_opt_return(opt: Option[HReturn], fns: [EFn]) : Option[HReturn] {
+fn ufn_promote_calls_opt_return(opt: Option[HReturn], fns: FnIndex) : Option[HReturn] {
   match opt {
     Some(r) -> match r {
       HR(p, b, l, c) -> Some(HR(p, ufn_promote_calls(b, fns), l, c))
@@ -334,13 +335,13 @@ fn ufn_promote_calls_opt_return(opt: Option[HReturn], fns: [EFn]) : Option[HRetu
 # name as a UFn (e.g. `box_a.wrap` + `box_b.wrap`) are routed
 # correctly without round-tripping through `efn_resolve`'s
 # first-match fallback.
-fn call_resolves_to_ufn(callee: Expr, fns: [EFn]) : Bool {
+fn call_resolves_to_ufn(callee: Expr, fns: FnIndex) : Bool {
   match callee.kind {
-    EVar(name) -> match efn_resolve(fns, name) {
+    EVar(name) -> match efn_resolve(fnx_all(fns), name) {
       Some(EFn(_, _, _, Some(_))) -> true
       _ -> false
     }
-    EModCall(mod, fname) -> match lookup_ufn_sig(fns, fname, Some(mod)) {
+    EModCall(mod, fname) -> match fnx_ufn_sig(fns, fname, Some(mod)) {
       Some(_) -> true
       None    -> false
     }
@@ -483,18 +484,18 @@ pub fn raw_op_str(op: String) : String {
 # `EBlock` / SLet to record raw locals. Children inside slots that
 # only accept boxed (calls, records, lists, closures, return) are
 # free to be `MUnboxed`; the emitter wraps at the boundary.
-fn unbox_expr(e: Expr, env: [LocBind]) : Expr / Console = unbox_expr_aware(e, env, [], [], false)
+fn unbox_expr(e: Expr, env: [LocBind]) : Expr / Console = unbox_expr_aware(e, env, fnx_empty(), [], false)
 
-fn unbox_expr_aware(e: Expr, env: [LocBind], fns: [EFn], cis: [CtorIntSlots], nat: Bool) : Expr / Console {
+fn unbox_expr_aware(e: Expr, env: [LocBind], fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : Expr / Console {
 
   let kind1 = unbox_kind_aware(e.kind, env, fns, cis, nat)
   let mode1 = decide_mode_aware(kind1, e.ty, env, fns)
   Expr { kind: kind1, line: e.line, col: e.col, ty: e.ty, mode: mode1 }
 }
 
-fn unbox_kind(k: ExprKind, env: [LocBind]) : ExprKind / Console = unbox_kind_aware(k, env, [], [], false)
+fn unbox_kind(k: ExprKind, env: [LocBind]) : ExprKind / Console = unbox_kind_aware(k, env, fnx_empty(), [], false)
 
-fn unbox_kind_aware(k: ExprKind, env: [LocBind], fns: [EFn], cis: [CtorIntSlots], nat: Bool) : ExprKind / Console {
+fn unbox_kind_aware(k: ExprKind, env: [LocBind], fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : ExprKind / Console {
 
   match k {
     EInt(_, _)        -> k
@@ -570,9 +571,9 @@ fn unbox_kind_aware(k: ExprKind, env: [LocBind], fns: [EFn], cis: [CtorIntSlots]
   }
 }
 
-fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode = decide_mode_aware(k, opt_ty, env, [])
+fn decide_mode(k: ExprKind, opt_ty: Option[Ty], env: [LocBind]) : ValueMode = decide_mode_aware(k, opt_ty, env, fnx_empty())
 
-fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: [EFn]) : ValueMode {
+fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: FnIndex) : ValueMode {
   # A fixed-width `Vec[e]<n>` is a flat by-value C aggregate with no boxed
   # form, but ONLY at its origin — the `__fixed_vec_lit` literal — and at
   # an `EVar` read of a binder that already holds one (env mode). A
@@ -761,9 +762,9 @@ fn pow_exp_is_inlinable(e: Expr) : Bool {
   }
 }
 
-fn unbox_opt(opt: Option[Expr], env: [LocBind]) : Option[Expr] / Console = unbox_opt_aware(opt, env, [], [], false)
+fn unbox_opt(opt: Option[Expr], env: [LocBind]) : Option[Expr] / Console = unbox_opt_aware(opt, env, fnx_empty(), [], false)
 
-fn unbox_opt_aware(opt: Option[Expr], env: [LocBind], fns: [EFn], cis: [CtorIntSlots], nat: Bool) : Option[Expr] / Console {
+fn unbox_opt_aware(opt: Option[Expr], env: [LocBind], fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : Option[Expr] / Console {
 
   match opt {
     Some(e) -> Some(unbox_expr_aware(e, env, fns, cis, nat))
@@ -771,9 +772,9 @@ fn unbox_opt_aware(opt: Option[Expr], env: [LocBind], fns: [EFn], cis: [CtorIntS
   }
 }
 
-fn unbox_arm(a: Arm, env: [LocBind]) : Arm / Console = unbox_arm_aware(a, env, [], [], false)
+fn unbox_arm(a: Arm, env: [LocBind]) : Arm / Console = unbox_arm_aware(a, env, fnx_empty(), [], false)
 
-fn unbox_arm_aware(a: Arm, env: [LocBind], fns: [EFn], cis: [CtorIntSlots], nat: Bool) : Arm / Console {
+fn unbox_arm_aware(a: Arm, env: [LocBind], fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : Arm / Console {
 
   match a {
     Arm(p, g, b) -> Arm(p, unbox_opt_aware(g, env, fns, cis, nat), unbox_expr_aware(b, env, fns, cis, nat))
@@ -789,9 +790,9 @@ fn unbox_arm_aware(a: Arm, env: [LocBind], fns: [EFn], cis: [CtorIntSlots], nat:
 # reference inside a `#{...}` interp slot or inside a captured
 # ELambda body forces the binding to stay boxed, because those
 # read sites bypass this pass's alias map.
-fn unbox_arm_with_scr(a: Arm, env: [LocBind], raw_scr: Bool) : Arm / Console = unbox_arm_with_scr_aware(a, env, raw_scr, [], [], false)
+fn unbox_arm_with_scr(a: Arm, env: [LocBind], raw_scr: Bool) : Arm / Console = unbox_arm_with_scr_aware(a, env, raw_scr, fnx_empty(), [], false)
 
-fn unbox_arm_with_scr_aware(a: Arm, env: [LocBind], raw_scr: Bool, fns: [EFn], cis: [CtorIntSlots], nat: Bool) : Arm / Console {
+fn unbox_arm_with_scr_aware(a: Arm, env: [LocBind], raw_scr: Bool, fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : Arm / Console {
 
   match a {
     Arm(p, g, b) -> {
@@ -823,7 +824,7 @@ fn unbox_arm_with_scr_aware(a: Arm, env: [LocBind], raw_scr: Bool, fns: [EFn], c
 # use). Recurses into nested PVariant sub-patterns. Slot order matches
 # the ctor's payload order, so the i-th sub-pattern reads the i-th flag.
 fn seed_variant_int_binders(home: Option[String], ctor: String, subs: [Pattern], body: Expr,
-                            cis: [CtorIntSlots], nat: Bool, env: [LocBind], fns: [EFn]) : [LocBind] / Console {
+                            cis: [CtorIntSlots], nat: Bool, env: [LocBind], fns: FnIndex) : [LocBind] / Console {
   let flags = match ctor_int_slots_lookup_in(cis, home, ctor) {
     Some(fl) -> fl
     None     -> []
@@ -832,7 +833,7 @@ fn seed_variant_int_binders(home: Option[String], ctor: String, subs: [Pattern],
 }
 
 fn seed_variant_int_loop(subs: [Pattern], flags: [Bool], i: Int, body: Expr,
-                         cis: [CtorIntSlots], nat: Bool, env: [LocBind], fns: [EFn]) : [LocBind] / Console {
+                         cis: [CtorIntSlots], nat: Bool, env: [LocBind], fns: FnIndex) : [LocBind] / Console {
   match subs {
     [] -> env
     [sp, ...rest] -> {
@@ -851,7 +852,7 @@ fn seed_variant_int_loop(subs: [Pattern], flags: [Bool], i: Int, body: Expr,
           # can never diverge (#1110).
           {
             let boxed_free = slot_is_int and not expr_has_interp_use(body, nm) and not uses_have_in_lam(scan_uses_expr(body, false), nm)
-            let native_ok = not nat or native_arm_binder_raw_safe(nm, body, cis, fns)
+            let native_ok = not nat or native_arm_binder_raw_safe(nm, body, cis, fnx_all(fns))
             if boxed_free and native_ok { [LB(nm, MUnboxed), ...env] } else { env }
           }
         # Nested variant: its own sub-PBind binders may read kind-1 slots.
@@ -877,15 +878,15 @@ fn list_nth_bool(xs: [Bool], i: Int) : Option[Bool] {
 # KIR-lowering READ it instead of re-deriving rawness from the mutated body
 # (#1229). One producer, three readers, no phase can disagree. Runs only under
 # the native backend (the C oracle's total re-box border needs no such table).
-pub fn native_raw_arm_binders(decls: [Decl], cis: [CtorIntSlots], fns: [EFn]) : [RawArmBinder] / Console =
+pub fn native_raw_arm_binders(decls: [Decl], cis: [CtorIntSlots], fns: FnIndex) : [RawArmBinder] / Console =
   nrab_decls(decls, cis, fns, [])
 
-fn nrab_decls(ds: [Decl], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match ds {
+fn nrab_decls(ds: [Decl], cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match ds {
   []           -> acc
   [d, ...rest] -> nrab_decls(rest, cis, fns, nrab_decl(d, cis, fns, acc))
 }
 
-fn nrab_decl(d: Decl, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match d {
+fn nrab_decl(d: Decl, cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match d {
   DFn(_, _, _, _, _, _, body, _, _, _) -> nrab_expr(body, cis, fns, acc)
   DTest(_, body, _, _, _)                 -> nrab_expr(body, cis, fns, acc)
   DBench(_, body, _, _, _)                -> nrab_expr(body, cis, fns, acc)
@@ -896,7 +897,7 @@ fn nrab_decl(d: Decl, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [R
 # Every arm of every `match` in `e`; a `PVariant` arm seeds its Int sub-binders,
 # then the arm body is descended for nested matches. Mirror of the emit-side
 # walk (`nab_mentions`) so no arm-carrying form is skipped.
-fn nrab_expr(e: Expr, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match e.kind {
+fn nrab_expr(e: Expr, cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match e.kind {
   EMatch(s, arms)      -> nrab_arms(arms, cis, fns, nrab_expr(s, cis, fns, acc))
   ECall(f, xs)         -> nrab_exprs(xs, cis, fns, nrab_expr(f, cis, fns, acc))
   EIntrinsic(_, xs)    -> nrab_exprs(xs, cis, fns, acc)
@@ -921,24 +922,24 @@ fn nrab_expr(e: Expr, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [R
   _                    -> acc
 }
 
-fn nrab_exprs(es: [Expr], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match es {
+fn nrab_exprs(es: [Expr], cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match es {
   []           -> acc
   [e, ...rest] -> nrab_exprs(rest, cis, fns, nrab_expr(e, cis, fns, acc))
 }
-fn nrab_opt(oe: Option[Expr], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match oe { None -> acc Some(e) -> nrab_expr(e, cis, fns, acc) }
-fn nrab_fields(fis: [FieldInit], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match fis {
+fn nrab_opt(oe: Option[Expr], cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match oe { None -> acc Some(e) -> nrab_expr(e, cis, fns, acc) }
+fn nrab_fields(fis: [FieldInit], cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match fis {
   []           -> acc
   [f, ...rest] -> nrab_fields(rest, cis, fns, match f { FI(_, v) -> nrab_expr(v, cis, fns, acc) })
 }
-fn nrab_elems(els: [ListElem], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match els {
+fn nrab_elems(els: [ListElem], cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match els {
   []            -> acc
   [el, ...rest] -> nrab_elems(rest, cis, fns, match el { ElPlain(e) -> nrab_expr(e, cis, fns, acc) ElSpread(e) -> nrab_expr(e, cis, fns, acc) })
 }
-fn nrab_stmts(ss: [Stmt], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match ss {
+fn nrab_stmts(ss: [Stmt], cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match ss {
   []           -> acc
   [s, ...rest] -> nrab_stmts(rest, cis, fns, nrab_stmt(s, cis, fns, acc))
 }
-fn nrab_stmt(s: Stmt, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match s {
+fn nrab_stmt(s: Stmt, cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match s {
   SExprStmt(e)                -> nrab_expr(e, cis, fns, acc)
   SLet(_, _, rhs)             -> nrab_expr(rhs, cis, fns, acc)
   SVar(_, _, rhs, _, _)       -> nrab_expr(rhs, cis, fns, acc)
@@ -946,16 +947,16 @@ fn nrab_stmt(s: Stmt, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [R
   SIndexAssign(b, i, v, _, _) -> nrab_expr(v, cis, fns, nrab_expr(i, cis, fns, nrab_expr(b, cis, fns, acc)))
   _                           -> acc
 }
-fn nrab_clauses(cls: [HClause], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match cls {
+fn nrab_clauses(cls: [HClause], cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match cls {
   []           -> acc
   [c, ...rest] -> nrab_clauses(rest, cis, fns, match c { HC(_, _, b, _, _) -> nrab_expr(b, cis, fns, acc) })
 }
-fn nrab_ret(ro: Option[HReturn], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match ro {
+fn nrab_ret(ro: Option[HReturn], cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match ro {
   None     -> acc
   Some(hr) -> match hr { HR(_, b, _, _) -> nrab_expr(b, cis, fns, acc) }
 }
 
-fn nrab_arms(arms: [Arm], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match arms {
+fn nrab_arms(arms: [Arm], cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match arms {
   []           -> acc
   [a, ...rest] -> nrab_arms(rest, cis, fns, match a { Arm(p, _, b) -> nrab_expr(b, cis, fns, nrab_pat(p, b, cis, fns, acc)) })
 }
@@ -964,22 +965,22 @@ fn nrab_arms(arms: [Arm], cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) 
 # condition `seed_variant_int_loop` applies under `nat`: a kind-1 Int slot,
 # not read via interp / a captured lambda, and `native_arm_binder_raw_safe`.
 # Recurses into nested `PVariant` sub-patterns, exactly as the seed does.
-fn nrab_pat(p: Pattern, body: Expr, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match p.pkind {
+fn nrab_pat(p: Pattern, body: Expr, cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match p.pkind {
   PVariant(hm, ctor, subs) -> nrab_variant(hm, ctor, subs, body, cis, fns, acc)
   _                    -> acc
 }
-fn nrab_variant(home: Option[String], ctor: String, subs: [Pattern], body: Expr, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = {
+fn nrab_variant(home: Option[String], ctor: String, subs: [Pattern], body: Expr, cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = {
   let flags = match ctor_int_slots_lookup_in(cis, home, ctor) { Some(fl) -> fl None -> [] }
   nrab_slot_loop(subs, flags, 0, body, cis, fns, acc)
 }
-fn nrab_slot_loop(subs: [Pattern], flags: [Bool], i: Int, body: Expr, cis: [CtorIntSlots], fns: [EFn], acc: [RawArmBinder]) : [RawArmBinder] / Console = match subs {
+fn nrab_slot_loop(subs: [Pattern], flags: [Bool], i: Int, body: Expr, cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match subs {
   []           -> acc
   [sp, ...rest] -> {
     let slot_is_int = match list_nth_bool(flags, i) { Some(b) -> b None -> false }
     let acc1 = match sp.pkind {
       PBind(nm) -> {
         let boxed_free = slot_is_int and not expr_has_interp_use(body, nm) and not uses_have_in_lam(scan_uses_expr(body, false), nm)
-        if boxed_free and native_arm_binder_raw_safe(nm, body, cis, fns) { [RAB(nm, sp.line, sp.col), ...acc] } else { acc }
+        if boxed_free and native_arm_binder_raw_safe(nm, body, cis, fnx_all(fns)) { [RAB(nm, sp.line, sp.col), ...acc] } else { acc }
       }
       PVariant(inner_hm, inner_ctor, inner_subs) -> nrab_variant(inner_hm, inner_ctor, inner_subs, body, cis, fns, acc)
       _ -> acc
@@ -996,18 +997,18 @@ pub fn raw_arm_binder_at(tbl: [RawArmBinder], nm: String, line: Int, col: Int) :
   [RAB(n, l, c), ...rest] -> if n == nm and l == line and c == col { true } else { raw_arm_binder_at(rest, nm, line, col) }
 }
 
-fn unbox_field(fi: FieldInit, env: [LocBind]) : FieldInit / Console = unbox_field_aware(fi, env, [], [], false)
+fn unbox_field(fi: FieldInit, env: [LocBind]) : FieldInit / Console = unbox_field_aware(fi, env, fnx_empty(), [], false)
 
-fn unbox_field_aware(fi: FieldInit, env: [LocBind], fns: [EFn], cis: [CtorIntSlots], nat: Bool) : FieldInit / Console {
+fn unbox_field_aware(fi: FieldInit, env: [LocBind], fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : FieldInit / Console {
 
   match fi {
     FI(n, v) -> FI(n, unbox_expr_aware(v, env, fns, cis, nat))
   }
 }
 
-fn unbox_elem(el: ListElem, env: [LocBind]) : ListElem / Console = unbox_elem_aware(el, env, [], [], false)
+fn unbox_elem(el: ListElem, env: [LocBind]) : ListElem / Console = unbox_elem_aware(el, env, fnx_empty(), [], false)
 
-fn unbox_elem_aware(el: ListElem, env: [LocBind], fns: [EFn], cis: [CtorIntSlots], nat: Bool) : ListElem / Console {
+fn unbox_elem_aware(el: ListElem, env: [LocBind], fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : ListElem / Console {
 
   match el {
     ElPlain(x)  -> ElPlain(unbox_expr_aware(x, env, fns, cis, nat))
@@ -1015,27 +1016,27 @@ fn unbox_elem_aware(el: ListElem, env: [LocBind], fns: [EFn], cis: [CtorIntSlots
   }
 }
 
-fn unbox_clause(c: HClause, env: [LocBind]) : HClause / Console = unbox_clause_aware(c, env, [], [], false)
+fn unbox_clause(c: HClause, env: [LocBind]) : HClause / Console = unbox_clause_aware(c, env, fnx_empty(), [], false)
 
-fn unbox_clause_aware(c: HClause, env: [LocBind], fns: [EFn], cis: [CtorIntSlots], nat: Bool) : HClause / Console {
+fn unbox_clause_aware(c: HClause, env: [LocBind], fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : HClause / Console {
 
   match c {
     HC(n, ps, b, l, co) -> HC(n, ps, unbox_expr_aware(b, env, fns, cis, nat), l, co)
   }
 }
 
-fn unbox_opt_return(opt: Option[HReturn], env: [LocBind]) : Option[HReturn] / Console = unbox_opt_return_aware(opt, env, [], [], false)
+fn unbox_opt_return(opt: Option[HReturn], env: [LocBind]) : Option[HReturn] / Console = unbox_opt_return_aware(opt, env, fnx_empty(), [], false)
 
-fn unbox_opt_return_aware(opt: Option[HReturn], env: [LocBind], fns: [EFn], cis: [CtorIntSlots], nat: Bool) : Option[HReturn] / Console {
+fn unbox_opt_return_aware(opt: Option[HReturn], env: [LocBind], fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : Option[HReturn] / Console {
   match opt {
     Some(r) -> Some(unbox_return_aware(r, env, fns, cis, nat))
     None    -> None
   }
 }
 
-fn unbox_return(r: HReturn, env: [LocBind]) : HReturn / Console = unbox_return_aware(r, env, [], [], false)
+fn unbox_return(r: HReturn, env: [LocBind]) : HReturn / Console = unbox_return_aware(r, env, fnx_empty(), [], false)
 
-fn unbox_return_aware(r: HReturn, env: [LocBind], fns: [EFn], cis: [CtorIntSlots], nat: Bool) : HReturn / Console {
+fn unbox_return_aware(r: HReturn, env: [LocBind], fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : HReturn / Console {
 
   match r {
     HR(p, b, l, c) -> HR(p, unbox_expr_aware(b, env, fns, cis, nat), l, c)
@@ -1046,9 +1047,9 @@ type UbStmts = UbStmts([Stmt], [LocBind])
 
 fn unbox_stmts(stmts: [Stmt], tail: Option[Expr], env: [LocBind], acc: [Stmt]) : UbStmts / Console =
 
-  unbox_stmts_aware(stmts, tail, env, acc, [], [], false)
+  unbox_stmts_aware(stmts, tail, env, acc, fnx_empty(), [], false)
 
-fn unbox_stmts_aware(stmts: [Stmt], tail: Option[Expr], env: [LocBind], acc: [Stmt], fns: [EFn], cis: [CtorIntSlots], nat: Bool) : UbStmts / Console {
+fn unbox_stmts_aware(stmts: [Stmt], tail: Option[Expr], env: [LocBind], acc: [Stmt], fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : UbStmts / Console {
 
   match stmts {
     [] -> UbStmts(list_reverse(acc), env)
@@ -1065,9 +1066,9 @@ type UbStmt = UbStmt(Stmt, [LocBind])
 
 fn unbox_stmt(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind]) : UbStmt / Console =
 
-  unbox_stmt_aware(s, rest, tail, env, [], [], false)
+  unbox_stmt_aware(s, rest, tail, env, fnx_empty(), [], false)
 
-fn unbox_stmt_aware(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind], fns: [EFn], cis: [CtorIntSlots], nat: Bool) : UbStmt / Console {
+fn unbox_stmt_aware(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind], fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : UbStmt / Console {
 
   match s {
     SLet(pat, ann, rhs) -> {
