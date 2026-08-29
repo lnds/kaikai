@@ -122,7 +122,10 @@ through `import compiler.<mod>`.
 
 A NEW `stage2/compiler/*.kai` module needs only its own `import` lines and one
 `import` of it from a module already in the graph. There is no ordered source
-list to update.
+list to update. `make test-stage2-graph` (tier 0) asserts every module is
+reachable from `main.kai`, that no `import` dangles, and that the graph stays
+acyclic -- an unreachable module is silently absent from the compiler, not a
+build error.
 
 ## `make kaic2-fast` — dev rebuild via modular self-compile
 
