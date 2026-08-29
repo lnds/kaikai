@@ -794,7 +794,10 @@ type TyKind
   | TyFn([TypeExpr], TypeExpr)
 
 type Decl
-  = DFn(Bool, String, [Param], Option[TypeExpr], Expr, Int, Int)
+  # The last slot is the module the declaration was loaded from, `None`
+  # for the root file. Two modules may declare one bare name, so the
+  # emitted C symbol is keyed on the pair, not on the name alone.
+  = DFn(Bool, String, [Param], Option[TypeExpr], Expr, Int, Int, Option[String])
   | DType(Bool, String, [String], TypeBody, Int, Int)
   | DTest(String, Expr, Int, Int)
   | DImport(ImportKind, Int, Int)
@@ -2253,14 +2256,14 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
               let rb = parse_expr(p5)
               match rb.r {
                 None -> err_d(rb.p)
-                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, body, t.line, t.col))
+                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, body, t.line, t.col, None))
               }
             } else if p_at(p4, TkLbrace) {
               let tb = p_peek(p4)
               let rb = parse_block(p4, tb)
               match rb.r {
                 None -> err_d(rb.p)
-                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, body, t.line, t.col))
+                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, body, t.line, t.col, None))
               }
             } else {
               err_d(p_error_here(p4, "expected `=` or `{` to start function body"))
@@ -2838,7 +2841,7 @@ fn dump_type(ty: TypeExpr, depth: Int) : Unit {
 
 fn dump_decl(d: Decl, depth: Int) : Unit {
   match d {
-    DFn(is_pub, name, params, opt_ret, body, line, col) -> {
+    DFn(is_pub, name, params, opt_ret, body, line, col, _) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       emit_line(depth, "fn #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
       params |> each((pm) => dump_param(pm, depth + 1))
@@ -3254,7 +3257,7 @@ fn add_params(e: Env, ps: [Param]) : Env {
 
 fn chk_decl(e: Env, d: Decl) : Env {
   match d {
-    DFn(_, _, params, _, body, _, _) -> {
+    DFn(_, _, params, _, body, _, _, _) -> {
       let e1 = env_push(e)
       let e2 = add_params(e1, params)
       let e3 = chk_expr(e2, body)
@@ -3288,7 +3291,7 @@ fn register_decls(e: Env, ds: [Decl]) : Env {
 
 fn register_one(e: Env, d: Decl) : Env {
   match d {
-    DFn(_, name, _, _, _, _, _) -> env_add(e, name)
+    DFn(_, name, _, _, _, _, _, _) -> env_add(e, name)
     DType(_, name, _, body, _, _) -> {
       let e1 = env_add(e, name)
       match body {
@@ -3377,7 +3380,12 @@ fn join_with(xs: [String], sep: String) : String = string_join(xs, sep)
 # falling back to a local. Stage 1 does the same; both tables are
 # lists of sum-variant pairs.
 
-type EFn  = EFn(String, Int)
+# EFn(bare name, arity, C suffix, module). The suffix is what follows
+# `kai_` in the emitted symbol: the bare name, or the name keyed on its
+# module when two modules declare it. Resolution happens once, when the
+# registry is ordered for a module, so a call site emits what it is
+# handed instead of re-deciding by name.
+type EFn  = EFn(String, Int, String, Option[String])
 # EVar carries name, arity, and the atom-style global variant tag.
 # Tags 0..10 are reserved for builtins per docs/variant-tags.md; user
 # variants start at 11 (KAI_USER_VARIANT_TAG_BASE in stage 0) and
@@ -3392,7 +3400,19 @@ fn efn_find(fns: [EFn], target: String) : Option[Int] {
   match fns {
     [] -> None
     [h, ...rest] -> match h {
-      EFn(n, ar) -> if n == target { Some(ar) } else { efn_find(rest, target) }
+      EFn(n, ar, _, _) -> if n == target { Some(ar) } else { efn_find(rest, target) }
+    }
+  }
+}
+
+# The C suffix a call to `target` emits. Falls back to the bare name so
+# a callee outside the registry (a prelude name, an unresolved use) is
+# spelled the way it always was.
+fn efn_cname(fns: [EFn], target: String) : String {
+  match fns {
+    [] -> target
+    [h, ...rest] -> match h {
+      EFn(n, _, c, _) -> if n == target { c } else { efn_cname(rest, target) }
     }
   }
 }
@@ -3415,19 +3435,35 @@ fn evar_find_tag(vs: [EVar], target: String) : Int {
   }
 }
 
-fn fn_of_decl(d: Decl) : Option[EFn] {
+# The C symbol suffix for a function: the bare name, or the name keyed
+# on its module when more than one module declares it. Keying only a
+# contested name is what keeps an uncontested program emitting the
+# symbols it always did.
+fn fn_cname(name: String, mo: Option[String], contested: [String]) : String {
+  match mo {
+    None -> name
+    Some(m) -> if list_has(contested, name) { concat_all([name, "__", mod_ident(m)]) }
+               else { name }
+  }
+}
+
+# A module path as an identifier piece: dots become underscores.
+fn mod_ident(m: String) : String = join_with(string_split(m, "."), "_")
+
+fn fn_of_decl(d: Decl, contested: [String]) : Option[EFn] {
   match d {
-    DFn(_, name, params, _, _, _, _) -> Some(EFn(name, list_length(params)))
+    DFn(_, name, params, _, _, _, _, mo) ->
+      Some(EFn(name, list_length(params), fn_cname(name, mo, contested), mo))
     _ -> None
   }
 }
 
-fn register_fn_decls(decls: [Decl]) : [EFn] {
+fn register_fn_decls(decls: [Decl], contested: [String]) : [EFn] {
   match decls {
     [] -> []
-    [d, ...rest] -> match fn_of_decl(d) {
-      Some(fs) -> [fs, ...register_fn_decls(rest)]
-      None -> register_fn_decls(rest)
+    [d, ...rest] -> match fn_of_decl(d, contested) {
+      Some(fs) -> [fs, ...register_fn_decls(rest, contested)]
+      None -> register_fn_decls(rest, contested)
     }
   }
 }
@@ -3847,7 +3883,7 @@ fn emit_ident_value(name: String, fns: [EFn], variants: [EVar], locals: [String]
       }
       None -> match efn_find(fns, name) {
         Some(ar) ->
-          cat5("kai_closure(&_kai_", name, "_thunk, ", int_to_string(ar), ", 0, NULL)")
+          cat5("kai_closure(&_kai_", efn_cname(fns, name), "_thunk, ", int_to_string(ar), ", 0, NULL)")
         None -> cat2("kai_", name)
       }
     }
@@ -3942,7 +3978,7 @@ fn emit_named_call_lookup(src: String, callee: String, args_e: [Expr], call_args
         EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
       }
       None -> match efn_find(fns, callee) {
-        Some(_) -> cat5("kai_", callee, "(", call_args, ")")
+        Some(_) -> cat5("kai_", efn_cname(fns, callee), "(", call_args, ")")
         None -> concat_all([
           "kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e)),
           ", (KaiValue *[]){", call_args, "})"
@@ -3997,7 +4033,7 @@ fn emit_pipe_named_lookup(src: String, callee: String, arity: Int, lhs_c: String
         EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
       }
       None -> match efn_find(fns, callee) {
-        Some(_) -> cat5("kai_", callee, "(", args_all, ")")
+        Some(_) -> cat5("kai_", efn_cname(fns, callee), "(", args_all, ")")
         None -> concat_all([
           "kai_apply(kai_", callee, ", ", int_to_string(arity),
           ", (KaiValue *[]){", args_all, "})"
@@ -4586,13 +4622,15 @@ fn has_interp(span: String, i: Int, end: Int) : Bool {
 # expression is replaced with `kai_closure(&_kai_lam_<id>, arity,
 # n_caps, captures)`; the body is emitted as a separate function later.
 
-type LamInfo = LamInfo(Int, Int, Int, [Param], [String], Expr)
+# The last slot is the module the enclosing declaration belongs to: a
+# lambda resolves a bare call the way its own module does.
+type LamInfo = LamInfo(Int, Int, Int, [Param], [String], Expr, Option[String])
 
 fn find_lam(lams: [LamInfo], line: Int, col: Int) : Option[LamInfo] {
   match lams {
     [] -> None
     [l, ...rest] -> match l {
-      LamInfo(_, ln, cl, _, _, _) ->
+      LamInfo(_, ln, cl, _, _, _, _) ->
         if ln == line and cl == col { Some(l) }
         else { find_lam(rest, line, col) }
     }
@@ -4759,9 +4797,13 @@ fn fv_interp_parts(parts: [IPart], own: [String], globals: [String], acc: [Strin
 
 # ---- lambda collection pass ----
 
-type LamCollect = { next_id: Int, lams: [LamInfo], globals: [String] }
+type LamCollect = { next_id: Int, lams: [LamInfo], globals: [String], home: Option[String] }
 
-fn lc_new(globals: [String]) : LamCollect = LamCollect { next_id: 0, lams: [], globals: globals }
+fn lc_new(globals: [String]) : LamCollect =
+  LamCollect { next_id: 0, lams: [], globals: globals, home: None }
+
+fn lc_at_home(st: LamCollect, home: Option[String]) : LamCollect =
+  LamCollect { next_id: st.next_id, lams: st.lams, globals: st.globals, home: home }
 
 fn params_to_names(ps: [Param]) : [String] =
   map(ps, (pm) => pm.pname)
@@ -4791,8 +4833,9 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
       let id = st.next_id
       let own = params_to_names(params)
       let caps = fv_expr(body, own, st.globals, [])
-      let info = LamInfo(id, x.line, x.col, params, caps, body)
-      let st1 = LamCollect { next_id: id + 1, lams: [info, ...st.lams], globals: st.globals }
+      let info = LamInfo(id, x.line, x.col, params, caps, body, st.home)
+      let st1 = LamCollect { next_id: id + 1, lams: [info, ...st.lams],
+                             globals: st.globals, home: st.home }
       collect_expr(body, st1)
     }
     ERecordLit(_, fields) -> collect_field_inits(fields, st)
@@ -4891,7 +4934,7 @@ fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect {
 
 fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
   match d {
-    DFn(_, _, _, _, body, _, _) -> collect_expr(body, st)
+    DFn(_, _, _, _, body, _, _, mo) -> collect_expr(body, lc_at_home(st, mo))
     DType(_, _, _, _, _, _) -> st
     DTest(_, body, _, _) -> collect_expr(body, st)
     DImport(_, _, _) -> st
@@ -4907,7 +4950,7 @@ fn collect_decls(ds: [Decl], st: LamCollect) : LamCollect {
 
 # Globals: prelude names + user fn names + variant ctor names. Used as a
 # cheap "this ident does not need to be captured" test.
-fn efn_name(e: EFn) : String = match e { EFn(n, _) -> n }
+fn efn_name(e: EFn) : String = match e { EFn(n, _, _, _) -> n }
 fn evar_name(v: EVar) : String = match v { EV(n, _, _) -> n }
 
 fn build_globals(fns: [EFn], variants: [EVar]) : [String] {
@@ -4941,7 +4984,7 @@ fn emit_lam_cap_reads(caps: [String], i: Int) : String {
 
 fn emit_lam_helper(src: String, l: LamInfo, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   match l {
-    LamInfo(id, _, _, params, caps, body) -> {
+    LamInfo(id, _, _, params, caps, body, _) -> {
       let arg_reads = emit_lam_arg_reads(params, 0)
       let cap_reads = emit_lam_cap_reads(caps, 0)
       # Lambda body has its own scope: params + captured names. The
@@ -4961,11 +5004,13 @@ fn emit_lam_helper(src: String, l: LamInfo, fns: [EFn], variants: [EVar], lams: 
 }
 
 fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], variants: [EVar]) : String =
-  concat_all(map(lams, (l) => emit_lam_helper(src, l, fns, variants, lams)))
+  concat_all(map(lams, (l) => emit_lam_helper(src, l, home_first(fns, lam_home(l)), variants, lams)))
+
+fn lam_home(l: LamInfo) : Option[String] = match l { LamInfo(_, _, _, _, _, _, mo) -> mo }
 
 fn emit_one_lam_forward(l: LamInfo) : String =
   match l {
-    LamInfo(id, _, _, _, _, _) ->
+    LamInfo(id, _, _, _, _, _, _) ->
       concat_all(["static KaiValue *_kai_lam_", int_to_string(id), "(KaiValue *, KaiValue **, int);\n"])
   }
 
@@ -4979,7 +5024,7 @@ fn emit_lambda_ref(x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo], local
   match find_lam(lams, x.line, x.col) {
     None -> "kai_unit() /* lambda: missing info */"
     Some(l) -> match l {
-      LamInfo(id, _, _, params, caps, _) -> {
+      LamInfo(id, _, _, params, caps, _, _) -> {
         let arity = list_length(params)
         let n_caps = list_length(caps)
         if n_caps == 0 {
@@ -5223,25 +5268,28 @@ fn emit_param_list(params: [Param]) : String {
 fn emit_fn_signature(name: String, params: [Param]) : String =
   cat5("static KaiValue *kai_", name, "(", emit_param_list(params), ")")
 
-fn emit_fn_forward(d: Decl) : String {
+fn emit_fn_forward(d: Decl, contested: [String]) : String {
   match d {
-    DFn(_, name, params, _, _, _, _) -> cat2(emit_fn_signature(name, params), ";\n")
+    DFn(_, name, params, _, _, _, _, mo) ->
+      cat2(emit_fn_signature(fn_cname(name, mo, contested), params), ";\n")
     _ -> ""
   }
 }
 
-fn emit_thunk_forward(d: Decl) : String {
+fn emit_thunk_forward(d: Decl, contested: [String]) : String {
   match d {
-    DFn(_, name, _, _, _, _, _) ->
-      cat3("static KaiValue *_kai_", name, "_thunk(KaiValue *, KaiValue **, int);\n")
+    DFn(_, name, _, _, _, _, _, mo) ->
+      cat3("static KaiValue *_kai_", fn_cname(name, mo, contested), "_thunk(KaiValue *, KaiValue **, int);\n")
     _ -> ""
   }
 }
 
-fn emit_fn_body(src: String, d: Decl, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+fn emit_fn_body(src: String, d: Decl, fns: [EFn], variants: [EVar], lams: [LamInfo],
+                contested: [String]) : String {
   match d {
-    DFn(_, name, params, _, body, _, _) -> {
-      let sig = emit_fn_signature(name, params)
+    DFn(_, name, params, _, body, _, _, mo) -> {
+      let cname = fn_cname(name, mo, contested)
+      let sig = emit_fn_signature(cname, params)
       # m12.6 fix: locals starts with the fn's params so any
       # subsequent SLet binding that shadows a global fn name
       # (or the params themselves do) resolves to the local kai_<name>
@@ -5254,7 +5302,7 @@ fn emit_fn_body(src: String, d: Decl, fns: [EFn], variants: [EVar], lams: [LamIn
       # `return ({ ... });` so the goto inside the statement-
       # expression has a target.
       let label = if tcrec_body_has_sentinel(body) {
-        concat_all(["_kai_", name, "_entry:;\n    "])
+        concat_all(["_kai_", cname, "_entry:;\n    "])
       } else { "" }
       # Scope the body for leak attribution: chunks allocated here are
       # credited to this fn. The guard restores the caller's scope on
@@ -5286,16 +5334,17 @@ fn emit_param_reads(params: [Param], start: Int) : String {
   }
 }
 
-fn emit_fn_thunk(d: Decl) : String {
+fn emit_fn_thunk(d: Decl, contested: [String]) : String {
   match d {
-    DFn(_, name, params, _, _, _, _) -> {
+    DFn(_, name, params, _, _, _, _, mo) -> {
+      let cname = fn_cname(name, mo, contested)
       let param_reads = emit_param_reads(params, 0)
       let named_args = emit_param_args(params)
       let hdr = concat_all([
-        "static KaiValue *_kai_", name,
+        "static KaiValue *_kai_", cname,
         "_thunk(KaiValue *self, KaiValue **args, int n) {\n    (void) self; (void) n;\n"
       ])
-      let call = concat_all(["    return kai_", name, "(", named_args, ");\n}\n\n"])
+      let call = concat_all(["    return kai_", cname, "(", named_args, ");\n}\n\n"])
       concat_all([hdr, param_reads, call])
     }
     _ -> ""
@@ -5304,19 +5353,65 @@ fn emit_fn_thunk(d: Decl) : String {
 
 # ---- top-level passes ----
 
-fn fn_forward_decls(decls: [Decl]) : String =
-  concat_all(map(decls, emit_fn_forward))
+fn fn_forward_decls(decls: [Decl], contested: [String]) : String =
+  concat_all(map(decls, (d) => emit_fn_forward(d, contested)))
 
-fn thunk_forward_decls(decls: [Decl]) : String =
-  concat_all(map(decls, emit_thunk_forward))
+fn thunk_forward_decls(decls: [Decl], contested: [String]) : String =
+  concat_all(map(decls, (d) => emit_thunk_forward(d, contested)))
 
-fn fn_bodies(src: String, decls: [Decl], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String =
-  concat_all(map(decls, (d) => {
-    match d {
-      DFn(_, _, _, _, _, _, _) -> cat2(emit_fn_body(src, d, fns, variants, lams), emit_fn_thunk(d))
-      _ -> ""
+# Bodies are emitted module by module, against a registry whose own
+# module's entries come first. A bare call inside a module reaches that
+# module's declaration, so two modules declaring one name never resolve
+# to each other's.
+fn fn_bodies(src: String, decls: [Decl], fns: [EFn], variants: [EVar], lams: [LamInfo],
+             contested: [String]) : String =
+  fn_bodies_loop(src, decls, fns, fns, None, variants, lams, contested)
+
+fn fn_bodies_loop(src: String, ds: [Decl], all: [EFn], fns: [EFn], home: Option[String],
+                  variants: [EVar], lams: [LamInfo], contested: [String]) : String {
+  match ds {
+    [] -> ""
+    [d, ...rest] -> match d {
+      DFn(_, _, _, _, _, _, _, mo) -> {
+        let scoped = if mod_eq(mo, home) { fns } else { home_first(all, mo) }
+        let one = cat2(emit_fn_body(src, d, scoped, variants, lams, contested),
+                       emit_fn_thunk(d, contested))
+        cat2(one, fn_bodies_loop(src, rest, all, scoped, mo, variants, lams, contested))
+      }
+      _ -> fn_bodies_loop(src, rest, all, fns, home, variants, lams, contested)
     }
-  }))
+  }
+}
+
+fn mod_eq(a: Option[String], b: Option[String]) : Bool {
+  match a {
+    None -> match b { None -> true  Some(_) -> false }
+    Some(x) -> match b { None -> false  Some(y) -> x == y }
+  }
+}
+
+# The registry with `home`'s entries moved to the front. `efn_cname`
+# answers with the first match, so this is what makes the reader's own
+# module win over every other.
+fn home_first(fns: [EFn], home: Option[String]) : [EFn] =
+  match home {
+    None -> fns
+    Some(_) -> list_append(efn_of_home(fns, home, true), efn_of_home(fns, home, false))
+  }
+
+# The registry entries whose module is `home` when `want` is true, the
+# rest when it is false.
+fn efn_of_home(fns: [EFn], home: Option[String], want: Bool) : [EFn] {
+  match fns {
+    [] -> []
+    [h, ...rest] -> match h {
+      EFn(_, _, _, mo) -> {
+        let keep = if want { mod_eq(mo, home) } else { not mod_eq(mo, home) }
+        if keep { [h, ...efn_of_home(rest, home, want)] } else { efn_of_home(rest, home, want) }
+      }
+    }
+  }
+}
 
 # ---- test function emission (always emitted; only called from int main
 #      when test_mode is on) ----
@@ -5391,7 +5486,7 @@ fn has_main_decl(decls: [Decl]) : Bool {
   match decls {
     [] -> false
     [d, ...rest] -> match d {
-      DFn(_, n, _, _, _, _, _) -> if n == "main" { true } else { has_main_decl(rest) }
+      DFn(_, n, _, _, _, _, _, _) -> if n == "main" { true } else { has_main_decl(rest) }
       _ -> has_main_decl(rest)
     }
   }
@@ -5601,7 +5696,7 @@ fn pcs_name_in(xs: [String], t: String) : Bool = match xs {
 
 fn perceus_decl(d: Decl) : Decl {
   match d {
-    DFn(is_pub, name, params, opt_ret, body, ln, cl) -> {
+    DFn(is_pub, name, params, opt_ret, body, ln, cl, mo) -> {
       # KIR Lane 1.2: a `: Handle` param is a raw non-RC pointer, so keep
       # it out of the Perceus scope (never dup'd, never dropped). Handle
       # *lets* are excluded inside the walk at their `SLet` (see
@@ -5611,7 +5706,7 @@ fn perceus_decl(d: Decl) : Decl {
       let uses = pcs_collect_uses_expr(body, pnames, false, [])
       let new_body = pcs_rewrite_expr(body, pnames, uses, false)
       let body_with_drops = pcs_prepend_unused_drops(new_body, rc_params, uses)
-      DFn(is_pub, name, params, opt_ret, body_with_drops, ln, cl)
+      DFn(is_pub, name, params, opt_ret, body_with_drops, ln, cl, mo)
     }
     # Test bodies are emitted as their own thunk fns; without rewriting
     # them here, multi-use let-bindings inside test bodies (especially
@@ -6563,7 +6658,7 @@ fn tcrec_rewrite_decls(decls: [Decl]) : [Decl] = map(decls, tcrec_rewrite_decl)
 
 fn tcrec_rewrite_decl(d: Decl) : Decl {
   match d {
-    DFn(is_pub, name, params, opt_ret, body, ln, cl) -> {
+    DFn(is_pub, name, params, opt_ret, body, ln, cl, mo) -> {
       let arity = list_length(params)
       if not tcrec_has_tail_self_call(body, name, arity) { d }
       else {
@@ -6573,7 +6668,7 @@ fn tcrec_rewrite_decl(d: Decl) : Decl {
         else {
           let new_body = tcrec_rewrite_body(body, name, arity, name,
                                             params, pnames, uses, [])
-          DFn(is_pub, name, params, opt_ret, new_body, ln, cl)
+          DFn(is_pub, name, params, opt_ret, new_body, ln, cl, mo)
         }
       }
     }
@@ -6828,17 +6923,18 @@ fn tcrec_emit_rebinds(pnames: [String], i: Int) : String {
 }
 
 fn emit_program(file: String, src: String, decls: [Decl], test_mode: Bool) : String {
-  let fns = register_fn_decls(decls)
+  let contested = contested_fn_names(decls, [], [])
+  let fns = register_fn_decls(decls, contested)
   let variants = register_variants(decls)
   let globals = build_globals(fns, variants)
   let st0 = lc_new(globals)
   let st = collect_decls(decls, st0)
   let lams = st.lams
   let header = "/* generated by kaikai stage 1 */\n#include \"runtime.h\"\n\n"
-  let fwd = fn_forward_decls(decls)
-  let thunk_fwd = thunk_forward_decls(decls)
+  let fwd = fn_forward_decls(decls, contested)
+  let thunk_fwd = thunk_forward_decls(decls, contested)
   let lam_fwd = emit_lam_forward_decls(lams)
-  let bodies = fn_bodies(src, decls, fns, variants, lams)
+  let bodies = fn_bodies(src, decls, fns, variants, lams, contested)
   let lam_bodies = emit_lam_helpers(src, lams, fns, variants)
   let tests = emit_all_tests(src, decls, fns, variants, lams)
   let main_wr = emit_main_wrapper(decls, test_mode)
@@ -7045,6 +7141,56 @@ fn non_import_decls(ds: [Decl], acc: [Decl]) : [Decl] {
 
 # Walk a decl list, loading every module it imports. Post-order: each
 # module's own imports are resolved before its decls are appended.
+# Stamp every function a module declares with that module, so the
+# module a declaration belongs to is carried on the declaration rather
+# than reconstructed downstream.
+fn tag_module(ds: [Decl], mod: String) : [Decl] {
+  match ds {
+    [] -> []
+    [d, ...rest] -> {
+      let d1 = match d {
+        DFn(p, n, ps, r, b, l, c, _) -> DFn(p, n, ps, r, b, l, c, Some(mod))
+        _ -> d
+      }
+      [d1, ...tag_module(rest, mod)]
+    }
+  }
+}
+
+# The function names more than one module declares. `seen` holds one
+# `name@module` per declaration, so a name whose pair is new while the
+# name is not has reached a second module.
+fn contested_fn_names(ds: [Decl], seen: [String], acc: [String]) : [String] {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DFn(_, n, _, _, _, _, _, mo) -> {
+        let key = cat3(n, "@", match mo { None -> ""  Some(m) -> m })
+        if list_has(seen, key) { contested_fn_names(rest, seen, acc) }
+        else if fn_name_seen(seen, n) {
+          if list_has(acc, n) { contested_fn_names(rest, [key, ...seen], acc) }
+          else { contested_fn_names(rest, [key, ...seen], [n, ...acc]) }
+        } else { contested_fn_names(rest, [key, ...seen], acc) }
+      }
+      _ -> contested_fn_names(rest, seen, acc)
+    }
+  }
+}
+
+fn fn_name_seen(seen: [String], name: String) : Bool {
+  match seen {
+    [] -> false
+    [k, ...rest] -> if key_name(k) == name { true } else { fn_name_seen(rest, name) }
+  }
+}
+
+fn key_name(k: String) : String {
+  match string_split(k, "@") {
+    [n, ...__] -> n
+    [] -> k
+  }
+}
+
 fn expand_imports(base_dir: String, root: String, ds: [Decl], st: ImpState) : ImpState {
   match ds {
     [] -> st
@@ -7067,12 +7213,12 @@ fn load_import(base_dir: String, root: String, mod: String, line: Int, col: Int,
   } else {
     match read_file(file) {
       Err(msg) -> imp_error(st, "#{at}: error: cannot open module `#{mod}` (#{file}): #{msg}")
-      Ok(src) -> imp_mark(load_module_src(base_dir, file, src, st), file)
+      Ok(src) -> imp_mark(load_module_src(base_dir, file, mod, src, st), file)
     }
   }
 }
 
-fn load_module_src(base_dir: String, file: String, src: String, st: ImpState) : ImpState {
+fn load_module_src(base_dir: String, file: String, mod: String, src: String, st: ImpState) : ImpState {
   let line0 = st.next_line
   let advanced = imp_open(st, file, line0, count_lines(src) + 2)
   let tokens = tokenize_at(src, line0)
@@ -7084,7 +7230,8 @@ fn load_module_src(base_dir: String, file: String, src: String, st: ImpState) : 
       None -> imp_bump_errs(advanced, 1)
       Some(mds) -> {
         let inner = expand_imports(base_dir, file, mds, imp_push(advanced, file))
-        imp_add_decls(imp_pop(inner), non_import_decls(strip_prelude_tests(mds, []), []))
+        imp_add_decls(imp_pop(inner),
+                      tag_module(non_import_decls(strip_prelude_tests(mds, []), []), mod))
       }
     }
   }
