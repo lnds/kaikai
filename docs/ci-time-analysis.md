@@ -75,7 +75,7 @@ Reconstructed from the `tier1` step's per-line timestamps in a real run
 |---|---|---|
 | Setup + checkout + apt clang | ~25 s | |
 | stage0 + stage1 build (`-O0`) | ~20 s | kaic0 0.2 s, kaic1 ~seconds |
-| regen `build/stage2.c` (`kaic1` over the 4 MB bundle) | **~45 s** | 16 s locally; ubuntu ~2.8× slower |
+| regen `build/stage2.c` (`kaic1` over the 4 MB package) | **~45 s** | 16 s locally; ubuntu ~2.8× slower |
 | **`cc` kaic2 at `-O2`** | **~197 s (3.3 m)** | 55 s locally; ubuntu ~3.6× slower |
 | 5 "costly" self-compiles (`-j5`, ~4 GB each) | ~128 s (2.1 m) | `test-tokens/ast/types/env/check` over `main.kai` |
 | **~1100 "light" fixtures + caches** | **~900 s (15 m)** | the dominant pool |
@@ -258,13 +258,12 @@ the lighter shard brings each native shard under ~14 min.
 
 ## 8. The mtime trap (for the artifact handoff)
 
-`build/stage2.c` depends on `build/bundle.kai` + `kaic1`; `bundle.kai`
-depends on the `compiler/*.kai` sources. After downloading the artifact, a
-naïve `touch kaic2` is **not enough** — if any `compiler/*.kai` source is
-newer than `build/bundle.kai`, make regenerates the whole chain (the 45 s
-regen + 197 s `cc`). The fix that works (validated locally with a real
-`make` run, not dry-run): touch the build chain
-`kaic0 → kaic1 → bundle.kai → stage2.c → kaic2` with the **current time**,
+`build/stage2.c` depends on `main.kai` + the `compiler/*.kai` sources +
+`kaic1`. After downloading the artifact, a naïve `touch kaic2` is **not
+enough** — if any source is newer than `build/stage2.c`, make regenerates
+the whole chain (the 45 s regen + 197 s `cc`). The fix that works
+(validated locally with a real `make` run, not dry-run): touch the build
+chain `kaic0 → kaic1 → stage2.c → kaic2` with the **current time**,
 which is newer than every checked-out source, in dependency order. `make`
 then reports every target up-to-date and the test job pays **0 s** of
 rebuild instead of ~260 s.

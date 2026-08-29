@@ -12,7 +12,7 @@ Practical map of the build. Read this before running the compiler or touching a 
 | Verify a change | `make tier0` (fast) · `make tier1` (full, CI gate) |
 | One backend-parity fixture | `tools/test-backend-parity.sh` (env-driven; see §parity) |
 
-**Do NOT** call `kaic2` raw, pass `--path ../stdlib` by hand, or reconstruct a `cc … -I ../stage0` line from Makefile recipes. `bin/kai` does all of that. **Do NOT** compile `stage2/main.kai` as "the compiler" — it is a 33-line stub (see §bundle).
+**Do NOT** call `kaic2` raw, pass `--path ../stdlib` by hand, or reconstruct a `cc … -I ../stage0` line from Makefile recipes. `bin/kai` does all of that. **Do NOT** compile `stage2/main.kai` as "the compiler" — it is a 33-line stub (see §package).
 
 ## `bin/kai` — the entry point
 
@@ -102,23 +102,33 @@ kaic1: kaic0    $(MAKE) -C stage1 kaic1        # kaic0 compiles stage1 → kaic1
 kaic2: kaic1    $(MAKE) -C stage2 kaic2        # kaic1 compiles stage2 → kaic2
 ```
 
-Each stage's compiler builds the next. `make kaic2` triggers the whole chain if earlier stages are stale. After editing `stage2/compiler/*.kai`, `make kaic2` is the one command to rebuild — it reassembles the bundle and compiles. `make KAI_LLVM=1 kaic2` does the same with the in-process libLLVM backend linked (needed for native parity; on mac either put the keg on PATH first — `export PATH=/opt/homebrew/opt/llvm@18/bin:$PATH` — or pass `LLVM_CONFIG=$(brew --prefix llvm@18)/bin/llvm-config`; any LLVM major works, and `tools/gen-runtime-bc.sh` writes the runtime bitcode with the clang matching whichever one resolves). If `KAI_LLVM=1` is forced and llvm-config does not resolve, make stops immediately with an error naming the fix; the Homebrew lib dir needed by llvm-config's `-lzstd` is added to the link line automatically.
+Each stage's compiler builds the next. `make kaic2` triggers the whole chain if earlier stages are stale. After editing `stage2/compiler/*.kai`, `make kaic2` is the one command to rebuild. `make KAI_LLVM=1 kaic2` does the same with the in-process libLLVM backend linked (needed for native parity; on mac either put the keg on PATH first — `export PATH=/opt/homebrew/opt/llvm@18/bin:$PATH` — or pass `LLVM_CONFIG=$(brew --prefix llvm@18)/bin/llvm-config`; any LLVM major works, and `tools/gen-runtime-bc.sh` writes the runtime bitcode with the clang matching whichever one resolves). If `KAI_LLVM=1` is forced and llvm-config does not resolve, make stops immediately with an error naming the fix; the Homebrew lib dir needed by llvm-config's `-lzstd` is added to the link line automatically.
 
-## The bundle — why `main.kai` is a stub
+## The package — why `main.kai` is a stub
 
-stage1/kaic1 is kaikai-minimal: it does **not** resolve `import`. So the stage2 compiler, which is split across ~55 modules under `stage2/compiler/`, is fed to kaic1 as a single **concatenated bundle**, not via imports.
+The stage 2 compiler is a kaikai package rooted at `stage2/`: `main.kai` is the
+entry point and the ~200 modules under `stage2/compiler/` are reached from it
+through `import compiler.<mod>`.
 
-- `BUNDLE_SRCS` in `stage2/Makefile` is the explicit, **ordered** list of those ~55 files (`util.kai`, `chars.kai`, `lex.kai`, … `emit_c.kai`, `driver.kai`, `main.kai`). Order matters (helpers before users).
-- The `kaic2` recipe concatenates them into one bundle and compiles that. **You never concat `BUNDLE_SRCS` by hand — the Makefile does it.**
-- `stage2/main.kai` is a 33-line entry stub at the END of the bundle, not the compiler. Compiling `main.kai` alone does nothing useful.
+- **Both kaic1 and kaic2 resolve imports.** kaic1 loads a module's dependencies
+  before the module itself (post-order over the import graph), so compilation
+  order is derived, never hand-maintained.
+- Each module is lexed into a line range disjoint from every other. Lambda
+  identity and the `__list_rest_<line>_<col>__` sentinels are keyed on
+  (line, col); shared ranges make two lambdas at the same position in different
+  files collide.
+- `stage2/main.kai` is a 33-line entry stub, not the compiler. Compiling
+  `main.kai` is compiling the whole package.
 
-When you add a NEW `stage2/compiler/*.kai` module, it must be added to `BUNDLE_SRCS` in dependency order, or the bundle won't see it.
+A NEW `stage2/compiler/*.kai` module needs only its own `import` lines and one
+`import` of it from a module already in the graph. There is no ordered source
+list to update.
 
 ## `make kaic2-fast` — dev rebuild via modular self-compile
 
-`make kaic2` always re-bootstraps: re-concatenate the ~99k-line bundle, kaic1 re-monolithises it, `cc -O2` compiles one giant TU. That is the **trust chain** (a fresh machine needs it), but as a dev rebuild it is all-or-nothing. `make kaic2-fast` is the rebuild path when a working `kaic2` already exists:
+`make kaic2` always re-bootstraps: kaic1 reads the whole package and emits one ~212k-line C file, `cc -O2` compiles that giant TU. That is the **trust chain** (a fresh machine needs it), but as a dev rebuild it is all-or-nothing. `make kaic2-fast` is the rebuild path when a working `kaic2` already exists:
 
-1. The existing `kaic2` compiles `stage2/main.kai` **directly** — resolving imports, no bundle, no kaic1 — through `bin/kai`'s `KAI_MODULAR=1 --backend=c` path: ~86 per-module TUs compiled in parallel with the `.o` content-hash cache, so a one-module edit recompiles one TU.
+1. The existing `kaic2` compiles `stage2/main.kai` **directly** — no kaic1, no `cc -O2` of a whole-program TU — through `bin/kai`'s `KAI_MODULAR=1 --backend=c` path: ~86 per-module TUs compiled in parallel with the `.o` content-hash cache, so a one-module edit recompiles one TU.
 2. The result lands in a **staging binary** (`stage2/build/kaic2-fast.bin`) and is sanity-gated (`--version` + a golden demo compiled with no flags, exercising the baked stdlib path) before being swapped into `stage2/kaic2`. A broken build never clobbers the working compiler.
 
 Selection is **explicit, never automatic**: `make kaic2` stays pure bootstrap, `make kaic2-fast` is additive and opt-in. Auto-preferring the fast path was rejected — a stale `kaic2` silently building a wrong `kaic2` is the failure mode to avoid; typing `-fast` is the acknowledgment that you trust the binary currently in place.
@@ -152,7 +162,7 @@ TARGET_BACKEND=native ORACLE_BACKEND=c BACKEND_PARITY_JOBS=1 \
 
 ## Traps (verified, recurring)
 
-- **`stage2/main.kai` is a stub**, not the compiler. The compiler is the `BUNDLE_SRCS` bundle.
+- **`stage2/main.kai` is a stub**, not the compiler. The compiler is the ~200 modules it reaches through `import compiler.driver`.
 - **`kai fmt` is in-place destructive** — never run it on compiler/stdlib sources; redirect output to `/tmp`.
 - **`runtime.h` has TWO copies** (`stage0/runtime.h` + `stage2/runtime.h`). A runtime prim/handler added to one must be added to BOTH; they change together.
 - **Header prerequisites are hand-declared.** Stage 1 and stage 2 compile a *generated* `.c` whose `#include "runtime.h"` make cannot see, so each rule names the header it actually binds under its own `-I` order (`stage2` → `stage2/runtime.h`, `stage1` → `stage0/runtime.h`). Adding a rule that compiles either translation unit means adding that prerequisite too, and only that one — naming a header the TU never reaches turns unrelated edits into a ~70 s `-O2` rebuild. `make test-header-deps` (tier 0) asserts both directions.
