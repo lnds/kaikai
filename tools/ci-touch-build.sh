@@ -2,12 +2,12 @@
 # ci-touch-build.sh — make a downloaded build artifact look fresh to `make`.
 #
 # The build-once CI job (docs/ci-time-analysis.md §8) uploads the bootstrap
-# chain (kaic0, kaic1, kaic2 + the generated stage1.c / bundle.kai /
-# stage2.c). A consuming job downloads it, but artifact extraction does NOT
+# chain (kaic0, kaic1, kaic2 + the generated stage1.c / stage2.c). A
+# consuming job downloads it, but artifact extraction does NOT
 # preserve mtimes relative to the checked-out sources — every `compiler/*.kai`
 # source lands with the checkout mtime, which is typically NEWER than the
 # extracted binaries. `make` would then regenerate the whole chain (the
-# ~45 s bundle regen + the ~197 s kaic2 `cc`), defeating the artifact.
+# ~45 s stage2.c regen + the ~197 s kaic2 `cc`), defeating the artifact.
 #
 # Fix: touch the dependency chain bottom-up with the CURRENT time (newer than
 # every source), in topological order, so `make` finds every target
@@ -17,7 +17,7 @@
 # The chain order MUST match the Makefile dependency edges:
 #   stage0/kaic0
 #     -> stage1/build/stage1.c -> stage1/kaic1
-#       -> stage2/build/bundle.kai -> stage2/build/stage2.c -> stage2/kaic2
+#       -> stage2/build/stage2.c -> stage2/kaic2
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -34,7 +34,6 @@ chain=(
   stage0/kaic0
   stage1/build/stage1.c
   stage1/kaic1
-  stage2/build/bundle.kai
   stage2/build/stage2.c
   stage2/kaic2
 )

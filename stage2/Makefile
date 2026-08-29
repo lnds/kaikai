@@ -145,29 +145,20 @@ KAI_EDITION  := $(shell cat ../EDITION)
 EDITION_FLAG := --edition $(KAI_EDITION)
 KAIC2        := ./$(TARGET) $(EDITION_FLAG)
 
-# Issue #677 — entry point of the `compiler` package. kaic2 reads
-# main.kai and resolves `import compiler.<mod>` against
-# compiler/<mod>.kai. kaic1 reads the concatenated build/bundle.kai
-# produced by the BUNDLE_SRCS recipe below.
+# Entry point of the `compiler` package: both kaic1 and kaic2 read it
+# and resolve `import compiler.<mod>` against compiler/<mod>.kai.
 SRC     := main.kai
 
-# Issue #677 — modularisation. The stage 2 compiler is now a kaikai
-# package rooted at this directory. `kai.toml` names it `compiler`;
-# `main.kai` is the entry point; per-module source lives in
-# `compiler/<mod>.kai`. kaic2 reads the package modularly (resolving
-# `import compiler.<mod>` lines in main.kai). kaic1, which does not
-# resolve imports, still consumes a concatenated bundle that the
-# Makefile produces below.
+# Issue #677 — modularisation. The stage 2 compiler is a kaikai package
+# rooted at this directory. `kai.toml` names it `compiler`; `main.kai`
+# is the entry point; per-module source lives in `compiler/<mod>.kai`.
+# Both kaic1 and kaic2 read the package modularly, resolving
+# `import compiler.<mod>` against `compiler/<mod>.kai`. Compilation
+# order is the import graph's, not a hand-maintained list.
 #
-# BUNDLE_SRCS is the explicit, ordered list of source files the
-# concat target glues together for kaic1. The order matters: helpers
-# like ch_is_digit must precede the lexer body in main.kai that calls
-# them. No wildcards — a wildcard would silently misorder the day
-# someone adds a module whose alphabetical name lands before its
-# dependencies. kaic1 parses `import` lines (stage1/compiler.kai
-# `parse_import_decl`) and ignores them downstream, so the bundle
-# compiles clean without stripping the import statements.
-BUNDLE_SRCS := compiler/util.kai compiler/chars.kai compiler/escapes.kai compiler/diag.kai compiler/lex.kai compiler/ast.kai compiler/ast_map.kai compiler/expr_positions.kai compiler/diag_file.kai compiler/home_dup.kai compiler/extern_fn_dup.kai compiler/kinds.kai compiler/kind_theory.kai compiler/kind_semilattice.kai compiler/unit_walk.kai compiler/kind_resolve.kai compiler/kind_validate.kai compiler/layout_synth.kai compiler/home_tu.kai compiler/rows.kai compiler/doc_attr.kai compiler/native_prims.kai compiler/intervals.kai compiler/refine_help.kai compiler/refinements.kai compiler/parse.kai compiler/surface_lower.kai compiler/fmt_writer.kai compiler/fmt_anchor.kai compiler/fmt_names.kai compiler/fmt_refine.kai compiler/fmt_shape.kai compiler/fmt_chain.kai compiler/fmt_layout.kai compiler/fmt_expr.kai compiler/fmt_effect.kai compiler/fmt_decl.kai compiler/fmt.kai compiler/migrate_rules.kai compiler/migrate_types.kai compiler/migrate_walk.kai compiler/migrate_scan.kai compiler/migrate.kai compiler/cache.kai compiler/cache_ast.kai compiler/modules.kai compiler/home_spell.kai compiler/effect_scope_table.kai compiler/name_table.kai compiler/symtab.kai compiler/symtab_build.kai compiler/usetab.kai compiler/resolve_state.kai compiler/resolve_use.kai compiler/resolve.kai compiler/import_uses.kai compiler/symtab_test.kai compiler/name_uses.kai compiler/name_report.kai compiler/qual_head.kai compiler/scope_walk.kai compiler/type_scope_table.kai compiler/type_scope.kai compiler/effect_scope_types.kai compiler/effect_scope.kai compiler/effect_scope_check.kai compiler/user_cache.kai compiler/core_cache.kai compiler/emit_cache.kai compiler/loop_lower.kai compiler/infer_index.kai compiler/brand_transp.kai compiler/desugar.kai compiler/const_pattern.kai compiler/cell_scan.kai compiler/cell_promote.kai compiler/refine_enforce.kai compiler/region.kai compiler/region_yield.kai compiler/variant_index.kai compiler/pipe_fusion.kai compiler/lit_mint.kai compiler/vec_surface.kai compiler/fixed_vec_match.kai compiler/infer_unit_alias.kai compiler/infer.kai compiler/infer_unit_habitant.kai compiler/infer_unit_expr.kai compiler/infer_unit_validate.kai compiler/infer_shape_validate.kai compiler/infer_union_collisions.kai compiler/infer_type_collisions.kai compiler/infer_name_collisions.kai compiler/infer_scan_uses.kai compiler/infer_dump.kai compiler/infer_json_base.kai compiler/infer_effects_names.kai compiler/infer_effects_json.kai compiler/infer_holes_json.kai compiler/cache_delta.kai compiler/cache_iface_acc.kai compiler/cache_typed.kai compiler/cache_typedprog.kai compiler/cache_delta_io.kai compiler/cache_module.kai compiler/cache_module_test.kai compiler/typed_cut.kai compiler/cache_delta_test.kai compiler/evidence_scan.kai compiler/evidence.kai compiler/evidence_inject.kai compiler/evidence_frame.kai compiler/fnreg.kai compiler/interp_check.kai compiler/bare_pick.kai compiler/pub_access_refs.kai compiler/pub_access_decl.kai compiler/pub_access_table.kai compiler/pa_index.kai compiler/pub_access.kai compiler/fn_index.kai compiler/unbox_native_raw.kai compiler/unbox.kai compiler/rawsafe.kai compiler/borrow_escape.kai compiler/borrow_infer.kai compiler/perceus_op_arg.kai compiler/perceus_plant_drop.kai compiler/perceus_tail_drop.kai compiler/consume_index.kai compiler/perceus.kai compiler/purity.kai compiler/impl_index.kai compiler/layout_derive.kai compiler/layout_validate.kai compiler/json_shape.kai compiler/json_derive.kai compiler/proto_scope.kai compiler/proto_rank.kai compiler/protos.kai compiler/fwd_inline.kai compiler/inst_index.kai compiler/monomorph.kai compiler/emit_shared.kai compiler/tycon_home.kai compiler/emit_tcrec_live.kai compiler/vec_raw.kai compiler/ffi_v2.kai compiler/kir.kai compiler/kir_uses.kai compiler/kir_varslot.kai compiler/kir_inline_clone.kai compiler/kir_inline_beta.kai compiler/kir_inline.kai compiler/kir_lower.kai compiler/kir_pat_alias.kai compiler/kir_lower_reuse.kai compiler/kir_lower_raw.kai compiler/kir_lower_bind.kai compiler/kir_lower_variant.kai compiler/kir_lower_match.kai compiler/kir_lower_lit.kai compiler/kir_lower_rec.kai compiler/kir_lower_walk.kai compiler/kir_lower_fns.kai compiler/kir_dump.kai compiler/emit_native_di.kai compiler/emit_native_fn.kai compiler/emit_native_slot.kai compiler/emit_native_ops.kai compiler/emit_native_fixedvec.kai compiler/emit_native_abi.kai compiler/emit_native_struct.kai compiler/emit_native_ffi.kai compiler/emit_native_fx.kai compiler/emit_native_fx2.kai compiler/emit_native_trmc.kai compiler/emit_native_term.kai compiler/emit_native_def.kai compiler/emit_native_proto.kai compiler/emit_native_test.kai compiler/emit_native.kai compiler/emit_native_modkey.kai compiler/emit_native_core.kai compiler/emit_native_modular.kai compiler/emit_ffi_c.kai compiler/emit_reuse_donate.kai compiler/emit_slices.kai compiler/emit_c.kai compiler/modular_linkage.kai compiler/lint_idiom.kai compiler/lint_redundant.kai compiler/lint_combinator.kai compiler/lint_spread.kai compiler/lint_deadcode.kai compiler/lint_effects.kai compiler/lint.kai compiler/closure_spec_ast.kai compiler/closure_spec_emit.kai compiler/closure_spec.kai compiler/law_checks.kai compiler/driver.kai main.kai
+# PKG_SRCS exists only so make knows when to regenerate: a wildcard is
+# right here because the graph, not this variable, decides order.
+PKG_SRCS := main.kai $(wildcard compiler/*.kai)
 # Hanga Roa: compile-time absolute path to `stdlib/` so the core
 # loader inside kaic2 can find core/*.kai, protocols.kai,
 # effects.kai, array.kai without any --prelude flag at runtime.
@@ -212,25 +203,8 @@ $(KAIC1):
 build:
 	@mkdir -p build
 
-# Issue #677 Phase 1 — concat the per-module sources into a single
-# bundle that kaic1 consumes as one translation unit. `awk 1` ensures
-# every file ends with a newline before its successor starts, so a
-# missing final newline in module A cannot fuse a token across the
-# A→B boundary.
-#
-# No header preamble. Adding any line at the top would shift every
-# downstream line number and would cascade into kaikai's gensym names
-# (which encode `<line>_<col>`), producing a byte-shift in the
-# emitted C between the direct `kaic1 compiler.kai` path and the new
-# `kaic1 build/bundle.kai` path. Selfhost determinism still holds
-# (kaic2b.c == kaic2c.c) but the cross-path equivalence is worth
-# preserving so anyone comparing artifacts pre/post-modularisation
-# sees zero diff.
-build/bundle.kai: $(BUNDLE_SRCS) | build
-	@awk 1 $(BUNDLE_SRCS) > $@
-
-build/stage2.c: build/bundle.kai $(KAIC1) | build
-	$(STACK) $(KAIC1) build/bundle.kai > $@
+build/stage2.c: $(PKG_SRCS) $(KAIC1) | build
+	$(STACK) $(KAIC1) $(SRC) > $@
 
 # Announce which backend capability got compiled in, so a dev never has
 # to guess why `kai build` behaves differently across two checkouts (the
@@ -256,8 +230,8 @@ ifeq ($(KAI_LLVM),1)
 	@echo "building stage2: native P2 bitcode: $$(../tools/gen-runtime-bc.sh --status-line)"
 endif
 
-# --- Dev fast rebuild: whole-bundle at -O0 ----------------------------
-# Same trust path as kaic2 (kaic1 regenerates stage2.c from the bundle),
+# --- Dev fast rebuild: whole-program at -O0 ---------------------------
+# Same trust path as kaic2 (kaic1 regenerates stage2.c from main.kai),
 # but cc compiles the 17 MB TU at -O0 instead of -O2. The cc step drops
 # from ~70 s to ~5 s; the resulting binary self-compiles slower, so this
 # is for the edit-check loop only, never for CI or the selfhost oracle.

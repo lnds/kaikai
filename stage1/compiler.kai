@@ -79,7 +79,14 @@ fn tk_name(k: TokKind) : String {
 
 type Lexer = { src: String, pos: Int, line: Int, col: Int }
 
-fn lex_new(src: String) : Lexer = Lexer { src: src, pos: 0, line: 1, col: 1 }
+fn lex_new(src: String) : Lexer = lex_new_at(src, 1)
+
+# `line0` offsets a module's positions into a range disjoint from every
+# other module's. Lambda identity and the `__list_rest_<line>_<col>__`
+# sentinels are keyed on (line, col); without disjoint ranges two
+# lambdas at the same position in different files collide and the
+# first one's captures win.
+fn lex_new_at(src: String, line0: Int) : Lexer = Lexer { src: src, pos: 0, line: line0, col: 1 }
 
 fn lex_at_end(l: Lexer) : Bool = l.pos >= string_length(l.src)
 
@@ -614,6 +621,10 @@ fn tokenize(src: String) : [Token] {
   lex_loop(lex_new(src), [])
 }
 
+fn tokenize_at(src: String, line0: Int) : [Token] {
+  lex_loop(lex_new_at(src, line0), [])
+}
+
 # ====================================================================
 # token dump (for --tokens)
 # ====================================================================
@@ -642,27 +653,78 @@ fn dump_tokens(src: String, tokens: [Token]) : Unit {
 # error scanning
 # ====================================================================
 
-fn report_one_error(path: String, t: Token, msg: String) : Unit {
-  eprint("#{path}:#{tok_line_str(t)}:#{tok_col_str(t)}: error: #{msg}")
+fn report_one_error(path: String, base: Int, t: Token, msg: String) : Unit {
+  eprint("#{path}:#{int_to_string(t.line - base + 1)}:#{tok_col_str(t)}: error: #{msg}")
 }
 
-fn report_errors_loop(path: String, ts: [Token], count: Int) : Int {
+fn report_errors_loop(path: String, base: Int, ts: [Token], count: Int) : Int {
   match ts {
     [] -> count
     [t, ...rest] -> match t.kind {
       TkError(msg) -> {
-        report_one_error(path, t, msg)
-        report_errors_loop(path, rest, count + 1)
+        report_one_error(path, base, t, msg)
+        report_errors_loop(path, base, rest, count + 1)
       }
-      _ -> report_errors_loop(path, rest, count)
+      _ -> report_errors_loop(path, base, rest, count)
     }
   }
 }
 
 # Returns 0 on success, 1 if any TkError tokens appeared (all reported to stderr).
 fn report_errors(path: String, src: String, tokens: [Token]) : Int {
-  if report_errors_loop(path, tokens, 0) > 0 { 1 } else { 0 }
+  report_errors_at(path, 1, tokens)
 }
+
+fn report_errors_at(path: String, base: Int, tokens: [Token]) : Int {
+  if report_errors_loop(path, base, tokens, 0) > 0 { 1 } else { 0 }
+}
+
+# ====================================================================
+# source spans
+# ====================================================================
+#
+# Each module is lexed into a line range disjoint from every other, so a
+# lambda's (line, col) identity stays unique program-wide. The span table
+# maps a program-wide line back to its file and the line within it, so a
+# diagnostic still names the position the author wrote.
+
+type Span = Span(String, Int, Int)   # file, first program line, line count
+
+fn span_of(spans: [Span], line: Int) : Option[Span] {
+  match spans {
+    [] -> None
+    [s, ...rest] -> match s {
+      Span(_, base, n) ->
+        if line >= base and line < base + n { Some(s) } else { span_of(rest, line) }
+    }
+  }
+}
+
+# `(file, line)` as authored, given a program-wide line. Falls back to
+# the root file when no span covers it (single-file compiles, and every
+# position the root file itself owns).
+fn span_file(spans: [Span], root: String, line: Int) : String {
+  match span_of(spans, line) {
+    Some(Span(f, _, _)) -> f
+    None -> root
+  }
+}
+
+# First line past a span's range -- where the next one starts.
+fn span_end(s: Span) : Int {
+  match s { Span(_, base, n) -> base + n }
+}
+
+fn span_line(spans: [Span], line: Int) : Int {
+  match span_of(spans, line) {
+    Some(Span(_, base, _)) -> line - base + 1
+    None -> line
+  }
+}
+
+fn span_pos(spans: [Span], root: String, line: Int, col: Int) : String =
+  concat_all([span_file(spans, root, line), ":", int_to_string(span_line(spans, line)),
+              ":", int_to_string(col)])
 
 # ====================================================================
 # AST types
@@ -761,7 +823,7 @@ fn mk_ty(k: TyKind, line: Int, col: Int) : TypeExpr = TypeExpr { tkind: k, line:
 # p_advance is O(1) (takes tail). Peek-ahead uses list destructuring
 # up to depth 3, which covers every lookahead stage 0 does.
 
-type Parser = { file: String, src: String, rest: [Token], had_error: Bool }
+type Parser = { file: String, src: String, rest: [Token], had_error: Bool, line_base: Int }
 
 # A result = a new parser plus an optional payload. `None` means the
 # parser failed (had_error is set on `p`). This mirrors stage 0's
@@ -780,15 +842,15 @@ type PFD     = { p: Parser, r: Option[FieldDecl] }
 type PPF     = { p: Parser, r: Option[PField] }
 type PEL     = { p: Parser, r: Option[ListElem] }
 
-fn parser_new(file: String, src: String, toks: [Token]) : Parser =
-  Parser { file: file, src: src, rest: toks, had_error: false }
+fn parser_new(file: String, src: String, toks: [Token], line_base: Int) : Parser =
+  Parser { file: file, src: src, rest: toks, had_error: false, line_base: line_base }
 
 fn p_mark_err(p: Parser) : Parser =
-  Parser { file: p.file, src: p.src, rest: p.rest, had_error: true }
+  Parser { file: p.file, src: p.src, rest: p.rest, had_error: true, line_base: p.line_base }
 
 fn p_advance(p: Parser) : Parser {
   match p.rest {
-    [_, ...rest1] -> Parser { file: p.file, src: p.src, rest: rest1, had_error: p.had_error }
+    [_, ...rest1] -> Parser { file: p.file, src: p.src, rest: rest1, had_error: p.had_error, line_base: p.line_base }
     [] -> p
   }
 }
@@ -897,7 +959,7 @@ fn p_skip_newlines_and_semis(p: Parser) : Parser {
 fn p_error(p: Parser, t: Token, msg: String) : Parser {
   if p.had_error { p }
   else {
-    eprint("#{p.file}:#{int_to_string(t.line)}:#{int_to_string(t.col)}: error: #{msg}")
+    eprint("#{p.file}:#{int_to_string(t.line - p.line_base + 1)}:#{int_to_string(t.col)}: error: #{msg}")
     p_mark_err(p)
   }
 }
@@ -2496,7 +2558,6 @@ fn parse_test_decl(p: Parser, t: Token) : PDecl {
 }
 
 fn parse_import_decl(p: Parser, t: Token) : PDecl {
-  # For stage 1 MVP, imports are structurally parsed but not resolved.
   # Accept: `import a.b.c`, `import a.b.c as X`, `import a.b.c.{f, g}`.
   let first = p_peek(p)
   if not tk_is(first.kind, TkIdent) {
@@ -2570,7 +2631,11 @@ fn parse_program_loop(p: Parser, acc: [Decl]) : PParser {
 type PParser = { p: Parser, decls: Option[[Decl]] }
 
 fn parse_program(file: String, src: String, toks: [Token]) : PParser {
-  parse_program_loop(parser_new(file, src, toks), [])
+  parse_program_at(file, src, toks, 1)
+}
+
+fn parse_program_at(file: String, src: String, toks: [Token], line_base: Int) : PParser {
+  parse_program_loop(parser_new(file, src, toks, line_base), [])
 }
 
 # ====================================================================
@@ -2860,16 +2925,16 @@ fn dump_program(decls: [Decl]) : Unit {
 # enters and leaves. Errors accumulate into `had_error`; the driver
 # returns 1 when that flag is set.
 
-type Env = { scopes: [[String]], had_error: Bool, file: String }
+type Env = { scopes: [[String]], had_error: Bool, file: String, spans: [Span] }
 
-fn env_new(file: String) : Env = Env { scopes: [[]], had_error: false, file: file }
+fn env_new(file: String, spans: [Span]) : Env = Env { scopes: [[]], had_error: false, file: file, spans: spans }
 
 fn env_push(e: Env) : Env =
-  Env { scopes: [[], ...e.scopes], had_error: e.had_error, file: e.file }
+  Env { scopes: [[], ...e.scopes], had_error: e.had_error, file: e.file, spans: e.spans }
 
 fn env_pop(e: Env) : Env {
   match e.scopes {
-    [_, ...rest] -> Env { scopes: rest, had_error: e.had_error, file: e.file }
+    [_, ...rest] -> Env { scopes: rest, had_error: e.had_error, file: e.file, spans: e.spans }
     _ -> e
   }
 }
@@ -2877,7 +2942,7 @@ fn env_pop(e: Env) : Env {
 fn env_add(e: Env, name: String) : Env {
   match e.scopes {
     [top, ...rest] ->
-      Env { scopes: [[name, ...top], ...rest], had_error: e.had_error, file: e.file }
+      Env { scopes: [[name, ...top], ...rest], had_error: e.had_error, file: e.file, spans: e.spans }
     _ -> e
   }
 }
@@ -2899,10 +2964,10 @@ fn scopes_has(scopes: [[String]], target: String) : Bool {
 fn env_has(e: Env, name: String) : Bool = scopes_has(e.scopes, name)
 
 fn env_mark_err(e: Env) : Env =
-  Env { scopes: e.scopes, had_error: true, file: e.file }
+  Env { scopes: e.scopes, had_error: true, file: e.file, spans: e.spans }
 
 fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env {
-  eprint("#{e.file}:#{int_to_string(line)}:#{int_to_string(col)}: error: #{msg}")
+  eprint("#{span_pos(e.spans, e.file, line, col)}: error: #{msg}")
   env_mark_err(e)
 }
 
@@ -3245,9 +3310,9 @@ fn register_variants_env(e: Env, vs: [Variant]) : Env {
   }
 }
 
-# For imports we add just the surface name: the last segment of the
-# dotted path, the alias, or each selected name. Stage 0 does the
-# same; deeper module resolution is a stage 2 concern.
+# The surface name an import binds: the last segment of the dotted
+# path, the alias, or each selected name. The imported module's decls
+# are already in scope by then -- this only names the module itself.
 fn last_segment(path: String) : String {
   last_segment_loop(path, string_length(path) - 1, string_length(path))
 }
@@ -3273,8 +3338,8 @@ fn register_import(e: Env, ik: ImportKind) : Env {
 
 # ---- entry point ----
 
-fn check_program(file: String, decls: [Decl]) : Int {
-  let e0 = env_new(file)
+fn check_program(file: String, decls: [Decl], spans: [Span]) : Int {
+  let e0 = env_new(file, spans)
   let e1 = add_all(e0, prelude_names())
   let e2 = register_decls(e1, decls)
   let e3 = chk_decls(e2, decls)
@@ -4473,7 +4538,7 @@ fn emit_interp_part(src: String, p: IPart, fns: [EFn], variants: [EVar], lams: [
     IpLit(_, raw) -> cat3("kai_str(", raw, ")")
     IpExp(expr_src) -> {
       let toks = tokenize(expr_src)
-      let prs = parser_new("<interp>", expr_src, toks)
+      let prs = parser_new("<interp>", expr_src, toks, 1)
       let r = parse_expr(prs)
       match r.r {
         Some(e) -> cat3("kai_to_string(", emit_expr(src,e, fns, variants, lams, locals), ")")
@@ -4680,7 +4745,7 @@ fn fv_interp_parts(parts: [IPart], own: [String], globals: [String], acc: [Strin
       IpLit(_, _) -> fv_interp_parts(rest, own, globals, acc)
       IpExp(esrc) -> {
         let toks = tokenize(esrc)
-        let prs = parser_new("<interp>", esrc, toks)
+        let prs = parser_new("<interp>", esrc, toks, 1)
         let r = parse_expr(prs)
         let acc1 = match r.r {
           Some(e) -> fv_expr(e, own, globals, acc)
@@ -4815,7 +4880,7 @@ fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect {
       IpLit(_, _) -> collect_interp_parts(rest, st)
       IpExp(esrc) -> {
         let toks = tokenize(esrc)
-        let prs = parser_new("<interp>", esrc, toks)
+        let prs = parser_new("<interp>", esrc, toks, 1)
         let r = parse_expr(prs)
         let st1 = match r.r { Some(e) -> collect_expr(e, st) None -> st }
         collect_interp_parts(rest, st1)
@@ -5718,7 +5783,7 @@ fn pcs_collect_uses_interp_parts(parts: [IPart], scope: [String], in_lam: Bool,
       IpLit(_, _) -> pcs_collect_uses_interp_parts(rest, scope, in_lam, acc)
       IpExp(esrc) -> {
         let toks = tokenize(esrc)
-        let prs = parser_new("<interp>", esrc, toks)
+        let prs = parser_new("<interp>", esrc, toks, 1)
         let r = parse_expr(prs)
         let acc1 = match r.r {
           Some(e) -> pcs_collect_uses_expr(e, scope, in_lam, acc)
@@ -5986,7 +6051,7 @@ fn pcs_concat_iparts(parts: [IPart], acc: String) : String {
 fn pcs_rewrite_interp_src(esrc: String, scope: [String], uses: [Use],
                            in_lam: Bool) : String {
   let toks = tokenize(esrc)
-  let prs = parser_new("<interp>", esrc, toks)
+  let prs = parser_new("<interp>", esrc, toks, 1)
   let r = parse_expr(prs)
   match r.r {
     None -> esrc
@@ -6864,7 +6929,12 @@ fn usage() : Unit {
 # every `DTest` block from the prelude before returning it. This
 # matches stage 2's behaviour: `kai test <user.kai>` should run
 # only the user file's own tests, not the stdlib's.
-fn load_prelude(path: String, include_tests: Bool) : Option[[Decl]] {
+# A prelude occupies the program's first line range; the root file and
+# every imported module follow it. `Prelude` carries that range so the
+# caller can place them after it and diagnostics stay file-relative.
+type Prelude = Prelude([Decl], Span)
+
+fn load_prelude(path: String, include_tests: Bool) : Option[Prelude] {
   match read_file(path) {
     Err(msg) -> { eprint("kaic1: #{path}: #{msg}"); None }
     Ok(src) -> {
@@ -6873,9 +6943,11 @@ fn load_prelude(path: String, include_tests: Bool) : Option[[Decl]] {
       if errs != 0 { None }
       else {
         let parsed = parse_program(path, src, tokens)
+        let span = Span(path, 1, count_lines(src) + 2)
         match parsed.decls {
           None -> None
-          Some(ds) -> if include_tests { Some(ds) } else { Some(strip_prelude_tests(ds, [])) }
+          Some(ds) -> if include_tests { Some(Prelude(ds, span)) }
+                      else { Some(Prelude(strip_prelude_tests(ds, []), span)) }
         }
       }
     }
@@ -6892,9 +6964,155 @@ fn strip_prelude_tests(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
   }
 }
 
-fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) : Int {
-  let tokens = tokenize(src)
-  let lex_errs = report_errors(path, src, tokens)
+# ====================================================================
+# import resolution
+# ====================================================================
+#
+# A dotted module path maps to a file under the root file's directory:
+# `compiler.driver` -> `<root dir>/compiler/driver.kai`. Loading
+# is post-order over the import graph, so a module's dependencies are
+# always concatenated ahead of it -- kaic1's top-level scan does not
+# resolve a call whose target is defined in a later segment.
+
+# `next_line` is the first line number the next module loaded gets. Each
+# module is lexed into a range disjoint from every other, so positions
+# stay unique program-wide.
+type ImpState = { seen: [String], stack: [String], decls: [Decl], errs: Int, next_line: Int, spans: [Span] }
+
+fn imp_new_at(spans: [Span], line0: Int) : ImpState =
+  ImpState { seen: [], stack: [], decls: [], errs: 0, next_line: line0, spans: spans }
+
+fn imp_seen_q(st: ImpState, path: String) : Bool = list_has(st.seen, path)
+
+fn imp_mark(st: ImpState, path: String) : ImpState =
+  ImpState { seen: [path, ...st.seen], stack: st.stack, decls: st.decls, errs: st.errs, next_line: st.next_line, spans: st.spans }
+
+fn imp_push(st: ImpState, path: String) : ImpState =
+  ImpState { seen: st.seen, stack: [path, ...st.stack], decls: st.decls, errs: st.errs, next_line: st.next_line, spans: st.spans }
+
+fn imp_pop(st: ImpState) : ImpState {
+  match st.stack {
+    [_, ...rest] -> ImpState { seen: st.seen, stack: rest, decls: st.decls, errs: st.errs, next_line: st.next_line, spans: st.spans }
+    _ -> st
+  }
+}
+
+fn imp_add_decls(st: ImpState, ds: [Decl]) : ImpState =
+  ImpState { seen: st.seen, stack: st.stack, decls: list_append(st.decls, ds), errs: st.errs, next_line: st.next_line, spans: st.spans }
+
+fn imp_error(st: ImpState, msg: String) : ImpState {
+  eprint("kaic1: #{msg}")
+  ImpState { seen: st.seen, stack: st.stack, decls: st.decls, errs: st.errs + 1, next_line: st.next_line, spans: st.spans }
+}
+
+# Directory part of a file path, "." when the path has no separator.
+fn dir_of(path: String) : String = dir_of_loop(path, string_length(path) - 1)
+
+fn dir_of_loop(path: String, i: Int) : String {
+  if i < 0 { "." }
+  else {
+    match char_at(path, i) {
+      Some(c) -> if c == '/' { string_slice(path, 0, i) } else { dir_of_loop(path, i - 1) }
+      None -> "."
+    }
+  }
+}
+
+fn join_path(dir: String, rel: String) : String =
+  if dir == "" { rel } else { cat3(dir, "/", rel) }
+
+# `a.b.c` -> `a/b/c.kai`
+fn module_rel_path(mod: String) : String =
+  cat2(join_with(string_split(mod, "."), "/"), ".kai")
+
+fn import_path_of(ik: ImportKind) : String {
+  match ik {
+    IkPath(p) -> p
+    IkAlias(p, _) -> p
+    IkSelective(p, _) -> p
+  }
+}
+
+fn non_import_decls(ds: [Decl], acc: [Decl]) : [Decl] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DImport(_, _, _) -> non_import_decls(rest, acc)
+      _ -> non_import_decls(rest, [d, ...acc])
+    }
+  }
+}
+
+# Walk a decl list, loading every module it imports. Post-order: each
+# module's own imports are resolved before its decls are appended.
+fn expand_imports(base_dir: String, root: String, ds: [Decl], st: ImpState) : ImpState {
+  match ds {
+    [] -> st
+    [d, ...rest] -> {
+      let st1 = match d {
+        DImport(ik, line, col) -> load_import(base_dir, root, import_path_of(ik), line, col, st)
+        _ -> st
+      }
+      expand_imports(base_dir, root, rest, st1)
+    }
+  }
+}
+
+fn load_import(base_dir: String, root: String, mod: String, line: Int, col: Int, st: ImpState) : ImpState {
+  let file = join_path(base_dir, module_rel_path(mod))
+  let at = span_pos(st.spans, root, line, col)
+  if imp_seen_q(st, file) { st }
+  else if list_has(st.stack, file) {
+    imp_error(st, "#{at}: error: import cycle through `#{mod}`")
+  } else {
+    match read_file(file) {
+      Err(msg) -> imp_error(st, "#{at}: error: cannot open module `#{mod}` (#{file}): #{msg}")
+      Ok(src) -> imp_mark(load_module_src(base_dir, file, src, st), file)
+    }
+  }
+}
+
+fn load_module_src(base_dir: String, file: String, src: String, st: ImpState) : ImpState {
+  let line0 = st.next_line
+  let advanced = imp_open(st, file, line0, count_lines(src) + 2)
+  let tokens = tokenize_at(src, line0)
+  let lex_errs = report_errors_at(file, line0, tokens)
+  if lex_errs != 0 { imp_bump_errs(advanced, lex_errs) }
+  else {
+    let parsed = parse_program_at(file, src, tokens, line0)
+    match parsed.decls {
+      None -> imp_bump_errs(advanced, 1)
+      Some(mds) -> {
+        let inner = expand_imports(base_dir, file, mds, imp_push(advanced, file))
+        imp_add_decls(imp_pop(inner), non_import_decls(strip_prelude_tests(mds, []), []))
+      }
+    }
+  }
+}
+
+fn imp_open(st: ImpState, file: String, base: Int, n: Int) : ImpState =
+  ImpState { seen: st.seen, stack: st.stack, decls: st.decls, errs: st.errs,
+             next_line: base + n, spans: [Span(file, base, n), ...st.spans] }
+
+fn imp_bump_errs(st: ImpState, n: Int) : ImpState =
+  ImpState { seen: st.seen, stack: st.stack, decls: st.decls, errs: st.errs + n, next_line: st.next_line, spans: st.spans }
+
+fn count_lines(src: String) : Int = count_lines_loop(src, 0, string_length(src), 0)
+
+fn count_lines_loop(src: String, i: Int, n: Int, acc: Int) : Int {
+  if i >= n { acc }
+  else {
+    match char_at(src, i) {
+      Some(c) -> count_lines_loop(src, i + 1, n, if c == '\n' { acc + 1 } else { acc })
+      None -> acc
+    }
+  }
+}
+
+fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl], pspan: Span) : Int {
+  let line0 = span_end(pspan)
+  let tokens = tokenize_at(src, line0)
+  let lex_errs = report_errors_at(path, line0, tokens)
   match mode {
     MTokens -> {
       dump_tokens(src, tokens)
@@ -6904,15 +7122,19 @@ fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) 
     _ -> {
       if lex_errs != 0 { lex_errs }
       else {
-        let parsed = parse_program(path, src, tokens)
+        let parsed = parse_program_at(path, src, tokens, line0)
         match parsed.decls {
           None -> 1
           Some(own_decls) -> {
-            let all_decls = list_append(prelude_decls, own_decls)
+            let root_span = Span(path, line0, count_lines(src) + 2)
+            let imp = expand_imports(dir_of(path), path, own_decls,
+                                     imp_new_at([root_span, pspan], span_end(root_span)))
+            let all_decls = list_append(list_append(prelude_decls, imp.decls), own_decls)
+            if imp.errs != 0 { imp.errs } else {
             match mode {
               MAst -> { dump_program(all_decls); 0 }
               _ -> {
-                let chk = check_program(path, all_decls)
+                let chk = check_program(path, all_decls, imp.spans)
                 if chk != 0 { chk }
                 else {
                   let test_mode = match mode { MTest -> true _ -> false }
@@ -6934,6 +7156,7 @@ fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) 
                 }
               }
             }
+            }
           }
         }
       }
@@ -6947,15 +7170,15 @@ fn run(opts: CliOptions) : Int {
     _ -> match opts.path {
       None -> { usage(); 2 }
       Some(p) -> {
-        let prelude_decls =
+        let loaded =
           match opts.prelude {
-            None -> Some([])
+            None -> Some(Prelude([], Span("", 1, 0)))
             Some(pp) -> load_prelude(pp, opts.include_prelude_tests)
           }
-        match prelude_decls {
+        match loaded {
           None -> 1
-          Some(pds) -> match read_file(p) {
-            Ok(src) -> compile_source(p, opts.mode, src, pds)
+          Some(Prelude(pds, pspan)) -> match read_file(p) {
+            Ok(src) -> compile_source(p, opts.mode, src, pds, pspan)
             Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
           }
         }
