@@ -1,20 +1,22 @@
 #[doc("""
 Builds the symbol table from a declaration stream.
 
-Ids are assigned in stream order, so the table is a function of the
-decl list alone — the same program always yields the same ids, which is
-what lets a downstream artifact key on them.
+The module symbols come first, one per distinct home in the stream, so
+a declaration's owner is an id the table already holds by the time the
+declaration is filled. Ids are assigned deterministically — homes in
+first-mention order, then declarations in stream order — so the table
+is a function of the decl list alone, which is what lets a downstream
+artifact key on them.
 
-The stream itself comes from `nt_collect`, the walker that already
-knows every declaration form's home and every name class a form
-contributes (a `type` contributes the habitant AND its constructors).
-Reusing it keeps one walker authoritative: a new declaration form
-teaches `nt_collect` once and both consumers learn it.
+The entry stream itself comes from `nt_collect`, the walker that
+already knows every declaration form's home and every name class a
+form contributes (a `type` contributes the habitant AND its
+constructors). Reusing it keeps one walker authoritative: a new
+declaration form teaches `nt_collect` once and both consumers learn it.
 
-The buffers are sized before the fill, so the build is two passes over
-the entries and allocates each column exactly once. `Mutable` is masked
-at the entry point: the arrays are born inside it and nothing outside
-observes a write.
+The buffers are sized before the fill, so the build allocates each
+column exactly once. `Mutable` is masked at the entry point: the arrays
+are born inside it and nothing outside observes a write.
 """)]
 
 import compiler.name_table
@@ -24,39 +26,70 @@ import compiler.symtab
 pub fn st_build(decls: [Decl], target: String) : SymTab =
   st_of_entries(nt_collect(decls, target))
 
-#[doc("The symbol table for an already-collected entry stream.")]
+#[doc("The symbol table for an already-collected entry stream, one module symbol ahead of the declarations it owns.")]
 pub fn st_of_entries(es: [NEnt]) : SymTab {
-  let n = list_length(es)
+  let homes = stb_homes(es, [])
+  let nh = list_length(homes)
+  let n = nh + list_length(es)
   let nb = st_nbuckets_build()
-  st_fill(es, 0, SymTab { count: n,
-                          names: array_make(n, ""),
-                          homes: array_make(n, ""),
-                          classes: array_make(n, NCFn),
-                          scopes: array_make(n, ScProgram),
-                          exported: array_make(n, false),
-                          buckets: array_make(nb, []),
-                          nbuckets: nb })
+  let base = SymTab { count: n,
+                      names: array_make(n, ""),
+                      owners: array_make(n, 0 - 1),
+                      classes: array_make(n, NCFn),
+                      exported: array_make(n, false),
+                      buckets: array_make(nb, []),
+                      nbuckets: nb }
+  st_fill(es, homes, "", 0 - 1, nh, st_fill_modules(homes, 0, base))
 }
 
 # Must agree with symtab's own bucket count: a table filled against one
 # modulus and read against another loses every entry.
 fn st_nbuckets_build() : Int = 32768
 
-fn st_fill(es: [NEnt], i: Int, t: SymTab) : SymTab / Mutable = match es {
-  [] -> t
-  [e, ...rest] -> st_fill(rest, i + 1, st_put(t, i, e))
+# Distinct homes in first-mention order. The position of a home in this
+# list is the id of its module symbol. Testing the newest entry first
+# skips the membership scan for the run of entries that share a home,
+# which is how the stream arrives.
+fn stb_homes(es: [NEnt], acc: [String]) : [String] = match es {
+  [] -> list_reverse(acc)
+  [NEnt(_, _, h, _), ...rest] -> match acc {
+    [last, ..._] -> if h == last or list_has(acc, h) { stb_homes(rest, acc) }
+                    else { stb_homes(rest, [h, ...acc]) }
+    []           -> stb_homes(rest, [h])
+  }
 }
 
-fn st_put(t: SymTab, i: Int, e: NEnt) : SymTab / Mutable = match e {
-  NEnt(cls, name, home, exp) -> {
-    let s = st_slot(name, t.nbuckets)
-    SymTab { count: t.count,
-             names: array_set(t.names, i, name),
-             homes: array_set(t.homes, i, home),
-             classes: array_set(t.classes, i, cls),
-             scopes: array_set(t.scopes, i, ScHome(home)),
-             exported: array_set(t.exported, i, exp),
-             buckets: array_set(t.buckets, s, [i, ...array_get(t.buckets, s)]),
-             nbuckets: t.nbuckets }
+fn stb_index(homes: [String], h: String, i: Int) : Int = match homes {
+  [] -> 0 - 1
+  [x, ...rest] -> if x == h { i } else { stb_index(rest, h, i + 1) }
+}
+
+fn st_fill_modules(hs: [String], i: Int, t: SymTab) : SymTab / Mutable = match hs {
+  [] -> t
+  [h, ...rest] -> st_fill_modules(rest, i + 1, st_put_row(t, i, NCModule, h, 0 - 1, true))
+}
+
+# The stream arrives module by module, so the previous entry's home is
+# almost always this one's: memoising it turns the home scan from a
+# per-declaration cost into a per-module one.
+fn st_fill(es: [NEnt], homes: [String], last: String, last_id: Int, i: Int,
+      t: SymTab) : SymTab / Mutable = match es {
+  [] -> t
+  [NEnt(cls, name, home, exp), ...rest] -> {
+    let owner = if last_id >= 0 and home == last { last_id }
+                else { stb_index(homes, home, 0) }
+    st_fill(rest, homes, home, owner, i + 1, st_put_row(t, i, cls, name, owner, exp))
   }
+}
+
+fn st_put_row(t: SymTab, i: Int, cls: NCls, name: String, owner: Int,
+      exp: Bool) : SymTab / Mutable {
+  let s = st_slot(name, t.nbuckets)
+  SymTab { count: t.count,
+           names: array_set(t.names, i, name),
+           owners: array_set(t.owners, i, owner),
+           classes: array_set(t.classes, i, cls),
+           exported: array_set(t.exported, i, exp),
+           buckets: array_set(t.buckets, s, [i, ...array_get(t.buckets, s)]),
+           nbuckets: t.nbuckets }
 }
