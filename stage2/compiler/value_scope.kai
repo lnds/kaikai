@@ -1,0 +1,112 @@
+# compiler/value_scope.kai — module scoping for bare value names.
+#
+# A free read of a contested function or constructor name is rewritten
+# to `EModCall(home, name)`, the form that already carries a home
+# through the typer, monomorph and codegen. The home comes from the
+# reading module's own viewpoint, so a call reaches the declaration
+# that module declared or imported, never the one that happened to
+# register last.
+#
+# The walk is scope-aware: a lexical binder shadows every import, so a
+# `let` named like an export is left alone rather than rewritten. That
+# is what makes the viewpoint sound where a positional heuristic — only
+# rewriting names in call position — is not.
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+import compiler.scope_walk
+import compiler.value_scope_table
+
+#[doc("Rewrite each import segment's free reads of contested value names under its own module's viewpoint; the decls past the marks are the root file's.")]
+pub fn vs_segmented(segs: [ImportSeg], decls: [Decl], coll: [VSEntry],
+      scopes: [ModScope], global: [ModuleEntry], target: String,
+      cores: [String]) : [Decl] =
+  if list_length(coll) == 0 { decls }
+  else { vs_seg_loop(segs, decls,
+                     VSView { coll: coll, target: target, cores: cores,
+                              imps: scope_imports(scopes, global),
+                              scopes: scopes, global: global }) }
+
+# What every segment shares: the contested names and the three tables a
+# viewpoint is cut from. Only the home varies per segment.
+type VSView = { coll: [VSEntry], target: String, cores: [String],
+                imps: [ModImports], scopes: [ModScope], global: [ModuleEntry] }
+
+fn vs_view_ctx(v: VSView, home: String) : VSCtx =
+  vs_ctx(v.coll, home, v.target, v.cores, v.imps, v.scopes, v.global)
+
+fn vs_seg_loop(segs: [ImportSeg], decls: [Decl], v: VSView) : [Decl] = match segs {
+  [] -> vs_decls(decls, vs_view_ctx(v, v.target))
+  [ISeg(mod_name, n), ...rest] -> {
+    let home = if mod_name == "" { v.target } else { mod_name }
+    list_append(vs_decls(seg_take(decls, n), vs_view_ctx(v, home)),
+                vs_seg_loop(rest, seg_drop(decls, n), v))
+  }
+}
+
+# A name the reader's own home declares keeps its bare spelling: the
+# typer already registers that declaration, and rewriting it would push
+# every intra-module call through the qualified key for no gain.
+#
+# A module qualifier is not a value read: `map.from(...)` names the
+# module `map`, which a contested function `map` must never displace.
+# A name bound as a module therefore outranks every value of the same
+# spelling, exactly as it does on the type side.
+fn vs_leaf(e: Expr, sh: [String], cx: VSCtx) : Option[Expr] = match e.kind {
+  EVar(nm) ->
+    if list_has(sh, nm) or vs_is_module(cx, nm) { Some(e) }
+    else { match vs_resolve(cx, nm) {
+      Some(h) -> if h == cx.home or h == cx.target or list_has(cx.cores, h) { Some(e) }
+                 else { Some(vs_re(e, EModCall(h, nm))) }
+      None    -> Some(e)
+    } }
+  _ -> None
+}
+
+fn vs_re(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn vs_expr(e: Expr, sh: [String], cx: VSCtx) : Expr =
+  sw_expr(e, sh, (x, s) => vs_leaf(x, s, cx), (t) => t, (n) => n)
+
+fn vs_decls(ds: [Decl], cx: VSCtx) : [Decl] = match ds {
+  [] -> []
+  [d, ...rest] -> [vs_decl(d, cx), ...vs_decls(rest, cx)]
+}
+
+fn vs_sub_decls(ds: [Decl], cx: VSCtx) : [Decl] = match ds {
+  [] -> []
+  [d, ...rest] -> [vs_decl(d, cx), ...vs_sub_decls(rest, cx)]
+}
+
+fn vs_decl(d: Decl, cx: VSCtx) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(p, n, tps, ps, ret, row, vs_expr(body, sw_params(ps, []), cx), l, c, mo)
+  DConst(p, n, ty, body, mo, l, c) -> DConst(p, n, ty, vs_expr(body, [], cx), mo, l, c)
+  DTest(n, body, l, c, mo)  -> DTest(n, vs_expr(body, [], cx), l, c, mo)
+  DBench(n, body, l, c, mo) -> DBench(n, vs_expr(body, [], cx), l, c, mo)
+  DCheck(n, ps, body, l, c, mo) ->
+    DCheck(n, ps, vs_expr(body, sw_params(ps, []), cx), l, c, mo)
+  DEffect(p, n, tps, ops, dblk, l, c, mo) -> match dblk {
+    Some(DBlk(hcs, ret, bl, bc)) ->
+      DEffect(p, n, tps, ops,
+              Some(DBlk(vs_hclauses(hcs, cx), vs_hreturn_opt(ret, cx), bl, bc)), l, c, mo)
+    None -> d
+  }
+  DImpl(pn, tas, fty, subs, l, c, ss) -> DImpl(pn, tas, fty, vs_sub_decls(subs, cx), l, c, ss)
+  DDerive(ps, inner, l, c)       -> DDerive(ps, vs_decl(inner, cx), l, c)
+  DUnstable(inner, l, c)         -> DUnstable(vs_decl(inner, cx), l, c)
+  DProtoLaws(t, inner, l, c, mo) -> DProtoLaws(t, vs_decl(inner, cx), l, c, mo)
+  DImplAxiom(t, inner, l, c, mo) -> DImplAxiom(t, vs_decl(inner, cx), l, c, mo)
+  DConstructor(inner, l, c)      -> DConstructor(vs_decl(inner, cx), l, c)
+  DDoc(r, t, inner, l, c)        -> DDoc(r, t, vs_decl(inner, cx), l, c)
+  DAttr(r, inner, l, c)          -> DAttr(r, vs_decl(inner, cx), l, c)
+  _ -> d
+}
+
+fn vs_hclauses(hcs: [HClause], cx: VSCtx) : [HClause] =
+  sw_hclauses(hcs, [], (x, s) => vs_leaf(x, s, cx), (t) => t, (n) => n)
+
+fn vs_hreturn_opt(o: Option[HReturn], cx: VSCtx) : Option[HReturn] =
+  sw_hreturn_opt(o, [], (x, s) => vs_leaf(x, s, cx), (t) => t, (n) => n)
