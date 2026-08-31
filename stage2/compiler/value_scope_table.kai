@@ -1,0 +1,100 @@
+# compiler/value_scope_table.kai — which module a bare value name means
+# from one module's viewpoint.
+#
+# A function or constructor name is registered globally by its bare
+# spelling, so two modules exporting one name shadow each other and the
+# last registration wins. Import order alone then decides which one a
+# call reaches, and a module can reach a name it never imported.
+#
+# The viewpoint fixes that: a bare name resolves against the reader's
+# own declarations and the modules that reader actually imports, never
+# against the whole program. The ladder mirrors the type side — own
+# home first, then the single visible import that exports it — so both
+# name sides answer a bare use the same way.
+
+import compiler.util
+import compiler.ast
+import compiler.name_table
+
+#[doc("One value declaration that carries per-home identity: `VSE(name, home, pub)`. Entries exist only for names two homes both declare.")]
+pub type VSEntry = VSE(String, String, Bool)
+
+#[doc("What one module sees when it reads a bare value name: the contested declarations, its own home, the root's, the core homes, and the tagged names of its imports.")]
+pub type VSCtx = { coll: [VSEntry], home: String, target: String,
+                   cores: [String], imports: [String] }
+
+#[doc("The value declarations of `decls` whose bare name another home also declares, in stream order. An uncontested name needs no viewpoint.")]
+pub fn vs_collect(decls: [Decl], target: String) : [VSEntry] {
+  let all = vs_entries(nt_collect(decls, target), [])
+  vs_keep_contested(all, all, [])
+}
+
+# Functions and constructors share one namespace at a use site, so both
+# classes enter the table; a const is keyed by its own pass.
+fn vs_entries(es: [NEnt], acc: [VSEntry]) : [VSEntry] = match es {
+  [] -> list_reverse(acc)
+  [NEnt(c, n, h, p), ...rest] ->
+    if vs_is_value(c) { vs_entries(rest, [VSE(n, h, p), ...acc]) }
+    else { vs_entries(rest, acc) }
+}
+
+fn vs_is_value(c: NCls) : Bool = match c {
+  NCFn   -> true
+  NCCtor -> true
+  _      -> false
+}
+
+fn vs_keep_contested(all: [VSEntry], todo: [VSEntry], acc: [VSEntry]) : [VSEntry] =
+  match todo {
+    [] -> list_reverse(acc)
+    [e, ...rest] -> match e {
+      VSE(n, h, _) ->
+        if vs_other_home(all, n, h) { vs_keep_contested(all, rest, [e, ...acc]) }
+        else { vs_keep_contested(all, rest, acc) }
+    }
+  }
+
+fn vs_other_home(t: [VSEntry], name: String, home: String) : Bool = match t {
+  [] -> false
+  [VSE(n, h, _), ...rest] ->
+    if n == name and h != home { true } else { vs_other_home(rest, name, home) }
+}
+
+#[doc("True when `home` declares `name` in the contested table.")]
+pub fn vs_declares(t: [VSEntry], name: String, home: String) : Bool = match t {
+  [] -> false
+  [VSE(n, h, _), ...rest] ->
+    if n == name and h == home { true } else { vs_declares(rest, name, home) }
+}
+
+#[doc("The home a bare `name` denotes from the context's viewpoint, or `None` when no rule settles it: the reader's own declaration wins, else the single visible import that exports it. Several visible exporters leave the name contested for the report.")]
+pub fn vs_resolve(cx: VSCtx, name: String) : Option[String] =
+  if vs_declares(cx.coll, name, cx.home) { Some(cx.home) }
+  else { match vs_visible_homes(cx.coll, name, cx.imports, []) {
+    [h] -> Some(h)
+    _   -> None
+  } }
+
+#[doc("The homes that export `name` and are visible to the reader, deduplicated. More than one means the bare use cannot be settled by import alone.")]
+pub fn vs_visible_homes(t: [VSEntry], name: String, imports: [String],
+      acc: [String]) : [String] = match t {
+  [] -> list_reverse(acc)
+  [VSE(n, h, p), ...rest] ->
+    if n == name and p and list_has(imports, h) and not list_has(acc, h) {
+      vs_visible_homes(rest, name, imports, [h, ...acc])
+    } else { vs_visible_homes(rest, name, imports, acc) }
+}
+
+#[doc("The tagged names one module imports directly, from the per-file import view.")]
+pub fn vs_imports_of(imps: [ModImports], owner: String) : [String] = match imps {
+  [] -> []
+  [MImp(o, names), ...rest] -> if o == owner { names } else { vs_imports_of(rest, owner) }
+}
+
+#[doc("One module's viewpoint over the contested value names.")]
+pub fn vs_ctx(coll: [VSEntry], home: String, target: String, cores: [String],
+      imps: [ModImports]) : VSCtx {
+  let owner = if home == target { "" } else { home }
+  VSCtx { coll: coll, home: home, target: target, cores: cores,
+          imports: vs_imports_of(imps, owner) }
+}
