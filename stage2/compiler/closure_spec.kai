@@ -167,10 +167,21 @@ fn cs_collect_decls(ds: [Decl], all: [Decl], hofns: [Decl]) : [CSpecReq] =
   match ds {
     [] -> []
     [d, ...rest] -> {
-      let here = match cs_decl_mo(d) { None -> cs_collect_expr(decl_body(d), all, hofns)  Some(_) -> [] }
+      let here = if cs_specialisable_host(d) { cs_collect_expr(decl_body(d), all, hofns) } else { [] }
       list_append(here, cs_collect_decls(rest, all, hofns))
     }
   }
+
+# A spec is named for the `(line, col)` of its call site. A derived body
+# carries the position of the `type` it was derived from, so two nested
+# combinators inside one derive share a key and their specs collide —
+# the encoder that writes a payload gets the decoder's inlined stage.
+# Only a hand-written root-file body has positions that separate.
+fn cs_specialisable_host(d: Decl) : Bool =
+  match cs_decl_mo(d) { Some(_) -> false  None -> not cs_decl_is_derived(d) }
+
+fn cs_decl_is_derived(d: Decl) : Bool =
+  match d { DFn(_, n, _, _, _, _, _, _, _, _) -> string_contains(n, "__pimpl_")  _ -> false }
 
 # Bottom-up read walk: a request per specialisable `G(args)`. Children
 # first so nested folds are discovered too.
@@ -220,10 +231,10 @@ fn rewrite_all(ds: [Decl], all: [Decl], hofns: [Decl]) : [Decl] =
 # decl is left untouched: no spec was discovered for its internal calls.
 fn rewrite_decl(d: Decl, all: [Decl], hofns: [Decl]) : Decl =
   match d {
-    DFn(p, n, tp, ps, rt, row, body, l, c, mo) -> match mo {
-      None    -> DFn(p, n, tp, ps, rt, row, rewrite_expr(body, all, hofns), l, c, None)
-      Some(_) -> d
-    }
+    DFn(p, n, tp, ps, rt, row, body, l, c, mo) ->
+      if cs_specialisable_host(d) {
+        DFn(p, n, tp, ps, rt, row, rewrite_expr(body, all, hofns), l, c, mo)
+      } else { d }
     _ -> d
   }
 
@@ -409,19 +420,26 @@ fn is_tyvar_name(n: String) : Bool = not name_is_global(n)
 fn classify_closure(a: Expr, all: [Decl]) : Option[ClosureArg] =
   if not fn_ty_pure(a.ty) { None }
   else {
-    match sym_read_kind(a.kind) {
+    match a.kind {
       ELambda(ps, b) ->
         if captures_free(b, cs_param_names(ps)) { None } else { Some(CaLambda(ps, b)) }
       # A `__`-prefixed name is a compiler-synthesised symbol — a protocol
       # dispatcher (`__proto_cmp`) or impl (`__pimpl_*`) reified from a bare
       # op reference. Inlining one impl's body breaks dispatch for every
       # other type, so these are never specialised.
-      EVar(name) ->
-        if is_synthesised(name) { None }
-        else { match lookup_named_fn(all, name) { Some(d) -> Some(CaNamedFn(d))  None -> None } }
+      EVar(name)    -> cs_named(name, all)
+      ESym(_, name) -> cs_named(name, all)
       _ -> None
     }
   }
+
+# A `__`-prefixed name is a compiler-synthesised symbol — a protocol
+# dispatcher (`__proto_cmp`) or impl (`__pimpl_*`) reified from a bare op
+# reference. Inlining one impl's body breaks dispatch for every other
+# type, so these are never specialised.
+fn cs_named(name: String, all: [Decl]) : Option[ClosureArg] =
+  if is_synthesised(name) { None }
+  else { match lookup_named_fn(all, name) { Some(d) -> Some(CaNamedFn(d))  None -> None } }
 
 fn is_synthesised(n: String) : Bool =
   match char_at(n, 1) {
