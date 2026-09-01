@@ -56,6 +56,7 @@ import compiler.refinements
 import compiler.native_prims
 import compiler.modules
 import compiler.symtab
+import compiler.symtab_build
 import compiler.usetab
 import compiler.resolve_state
 import compiler.resolve_use
@@ -112,6 +113,21 @@ fn scopes_has(scopes: [[String]], target: String) : Bool {
 }
 
 fn env_has(e: Env, name: String) : Bool = scopes_has(e.scopes, name)
+
+# A binder shadows a declaration; a top-level name does not shadow
+# itself. Both live in `scopes`, so "is this a local?" is a question
+# about depth: the outermost scope is where `add_all` and
+# `register_decls` seed the core and the declarations, and every
+# binder scope sits above it. Without the depth test every use of a
+# top-level function reads as shadowed and no site ever resolves to a
+# symbol.
+fn env_is_binder(e: Env, name: String) : Bool = scopes_has(env_binder_scopes(e.scopes), name)
+
+fn env_binder_scopes(ss: [[String]]) : [[String]] = match ss {
+  []        -> []
+  [_]       -> []
+  [top, ...rest] -> [top, ...env_binder_scopes(rest)]
+}
 
 fn env_all_names(e: Env) : [String] = concat_scopes(e.scopes, [])
 
@@ -343,8 +359,12 @@ fn chk_expr(e: Env, x: Expr) : Env / Console + File {
     EUnit      -> e
     EUnder     -> e
     EPlaceholder -> e
+    # Already resolved: the walk stamped it on an earlier pass over this
+    # tree, and re-deciding it here is exactly what identity exists to
+    # prevent. Recorded again so the ordinals stay in step.
+    ESym(_, name) -> env_record(e, name, env_is_binder(e, name), x.line, x.col)
     EVar(name) -> {
-      if env_has(e, name) { env_record(e, name, true, x.line, x.col) }
+      if env_has(e, name) { env_record(e, name, env_is_binder(e, name), x.line, x.col) }
       else {
         # Canonical Rust/Elm-style diagnostic.
         # Error line stays terse; the did-you-mean suggestion moves
@@ -803,15 +823,16 @@ fn register_import(e: Env, ik: ImportKind) : Env {
 # ---- entry point ----
 
 #[doc("Resolve a program: seed core, pre-register decls, walk them, then fold in row-label, refinement, and unbound-tyvar checks. Each diagnostic names the file that declares the decl it is in. Returns 1 if any check failed.")]
-pub fn check_program(df: DiagFiles, decls: [Decl]) : Int / Console + File =
-  resolve_program(df, decls).errs
+pub fn check_program(df: DiagFiles, decls: [Decl], target: String) : Int / Console + File =
+  resolve_program(df, decls, target).errs
 
 #[doc("Resolve a program and keep the resolution: the same checks `check_program` runs, with every use site recorded against `tab`.")]
 pub fn resolve_program_with(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : Resolution / Console + File =
   resolve_run(df, decls, rs_on(tab, target))
 
-fn resolve_program(df: DiagFiles, decls: [Decl]) : Resolution / Console + File =
-  resolve_run(df, decls, rs_off())
+#[doc("Resolve a program against the symbol table its own declarations build.")]
+pub fn resolve_program(df: DiagFiles, decls: [Decl], target: String) : Resolution / Console + File =
+  resolve_program_with(df, decls, st_build(decls, target), target)
 
 fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState) : Resolution / Console + File {
   let file = df_root(df)

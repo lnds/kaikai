@@ -537,6 +537,7 @@ fn inf_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EStr(_, _)     -> k
     EUnit          -> k
     EVar(_)        -> k
+    ESym(_, _)        -> k
     EUnder         -> k
     EPlaceholder   -> k
     EHole(_)       -> k
@@ -1618,6 +1619,7 @@ fn collect_call_labels(e: Expr, acc: [Label]) : [Label] = match e.kind {
   EStr(_, _)          -> acc
   EUnit               -> acc
   EVar(_)             -> acc
+  ESym(_, _)             -> acc
   EUnder              -> acc
   EPlaceholder        -> acc
   EHole(_)            -> acc
@@ -2006,6 +2008,7 @@ fn walk_field_priv_children(file: String, home: Option[String],
   EStr(_, _)        -> acc
   EUnit             -> acc
   EVar(_)           -> acc
+  ESym(_, _)           -> acc
   EUnder            -> acc
   EPlaceholder      -> acc
   EHole(_)          -> acc
@@ -2310,6 +2313,7 @@ fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
     EStr(_, _)        -> acc
     EUnit             -> acc
     EVar(_)           -> acc
+    ESym(_, _)           -> acc
     EUnder            -> acc
     EPlaceholder      -> acc
     EHole(_)          -> acc
@@ -8955,6 +8959,27 @@ fn field_hint(fs: [FTy], target: String) : String {
 
 # ---- the walker ----
 
+# A bare value read, whether the resolver has stamped its identity or
+# not. The scheme still comes from the name: the type environment is
+# keyed by spelling, so an `ESym` types exactly as the `EVar` it
+# replaced, and the id it carries is what later passes read instead of
+# deciding the name again.
+fn synth_name_read(st: InferState, nm: String, e: Expr) : Inferred / Console + File + Mutable =
+  if nm == "resume" and st.in_clause {
+    diag_error(st.file, e.line, e.col,
+      "`resume` may only be called, not used as a value: it cannot escape its handler clause")
+    diag_help("call the continuation directly, e.g. `resume(v)`")
+    inferred_leaf(st_bump_err(st), TyAny, e)
+  } else { match ty_env_lookup(st.env, nm) {
+    Some(sc) -> {
+      let r = st_instantiate_report(st, sc)
+      let st2 = if r.fresh == [] and r.unit_fresh == [] { r.st }
+                else { st_push_inst(r.st, CS(nm, e.line, e.col, r.fresh, r.unit_fresh, None)) }
+      inferred_leaf(st2, r.ty, e)
+    }
+    None -> inferred_leaf(st, TyAny, e)
+  } }
+
 fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
 
 
@@ -8996,24 +9021,8 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     # escapes its clause as a first-class value — `let k = resume`,
     # `f(resume)`. The continuation has no value representation outside its
     # clause, so reject it cleanly (docs/effects.md).
-    EVar(nm) ->
-      if nm == "resume" and st.in_clause {
-        diag_error(st.file, e.line, e.col,
-          "`resume` may only be called, not used as a value: it cannot escape its handler clause")
-        diag_help("call the continuation directly, e.g. `resume(v)`")
-        inferred_leaf(st_bump_err(st), TyAny, e)
-      } else { match ty_env_lookup(st.env, nm) {
-        Some(sc) -> {
-          let r = st_instantiate_report(st, sc)
-          let st2 = if r.fresh == [] and r.unit_fresh == [] {
-            r.st
-          } else {
-            st_push_inst(r.st, CS(nm, e.line, e.col, r.fresh, r.unit_fresh, None))
-          }
-          inferred_leaf(st2, r.ty, e)
-        }
-        None     -> inferred_leaf(st, TyAny, e)
-      } }
+    ESym(_, nm) -> synth_name_read(st, nm, e)
+    EVar(nm) -> synth_name_read(st, nm, e)
     ECall(callee, args_)       -> synth_call(st, callee, args_, e.line, e.col)
     EField(obj, fnm)           -> synth_field(st, obj, fnm, e.line, e.col)
     EIndex(coll, ix)           -> synth_index(st, coll, ix, e.line, e.col)
@@ -10638,6 +10647,10 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
             }
         }
       }
+      # The base of an effect-op call names an effect, and effects are
+      # not in the value namespace the resolver stamps, so this shape is
+      # unreachable.
+      ESym(_, _) -> None
       _ -> None
     }
     _ -> None
@@ -13803,6 +13816,7 @@ fn collect_escaped_names_kind(k: ExprKind, acc: [String]) : [String] {
       let callee_ty = match callee.ty { Some(t) -> t  None -> TyAny }
       let safe = match callee.kind {
         EVar(_) -> true
+        ESym(_, _) -> true
         # A module-qualified dispatcher (`m.__proto_show`) is a named
         # callee like any bare one.
         EModCall(_, n) -> inf_string_starts_with_q(n, "__proto_") or ty_callee_has_mutable(callee_ty)
@@ -13903,6 +13917,7 @@ fn collect_escaped_in_exprs_safe(es: [Expr], acc: [String]) : [String] = match e
   []           -> acc
   [h, ...rest] -> match h.kind {
     EVar(_) -> collect_escaped_in_exprs_safe(rest, acc)
+    ESym(_, _) -> collect_escaped_in_exprs_safe(rest, acc)
     _       -> collect_escaped_in_exprs_safe(rest, collect_escaped_names(h, acc))
   }
 }
@@ -15657,16 +15672,20 @@ fn check_branch_for_ctor(st: InferState, br: Expr, expected: Ty) : Inferred / Co
   match br.kind {
     ECall(c, _) -> match c.kind {
       EVar(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
+      ESym(_, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
       _ -> synth(st, br)
     }
     EVar(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
+    ESym(_, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
     EBlock(_, tail) -> match tail {
       Some(te) -> match te.kind {
         ECall(c, _) -> match c.kind {
           EVar(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
+          ESym(_, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
           _ -> synth(st, br)
         }
         EVar(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
+        ESym(_, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
         _ -> synth(st, br)
       }
       None -> synth(st, br)
@@ -15733,6 +15752,7 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
     # `EVar(cname)` (e.g. `NotFound`) in annotation context whose
     # qualified `parent::cname` exists picks the qualified scheme.
     EVar(_) -> nullary_ctor_check_or_synth(st, e, expected)
+    ESym(_, _) -> nullary_ctor_check_or_synth(st, e, expected)
     # thread expected into block tails so a
     # `{ ...stmts...; ctor(args) }` body benefits from the same
     # annotation-driven disambiguation as a bare ctor expression.
@@ -16059,6 +16079,7 @@ fn unboxed_expr(e: Expr) : Expr =
 fn is_fixed_vec_lit(e: Expr) : Bool = match e.kind {
   ECall(callee, _) -> match callee.kind { EVar(nm) -> nm == "__fixed_vec_lit"  _ -> false }
   EVar(_) -> match e.ty { Some(t) -> ty_is_fixed_vec(t)  None -> false }
+  ESym(_, _) -> match e.ty { Some(t) -> ty_is_fixed_vec(t)  None -> false }
   _ -> false
 }
 
@@ -16358,6 +16379,7 @@ fn check_body_against_ret(st: InferState, body: Expr, expected: Ty,
     # avoid regressing existing inference paths.
     ECall(_, _) -> check_expr_against(st, body, expected, what, body.line, body.col)
     EVar(_) -> check_expr_against(st, body, expected, what, body.line, body.col)
+    ESym(_, _) -> check_expr_against(st, body, expected, what, body.line, body.col)
     _ -> synth(st, body)
   }
 }
