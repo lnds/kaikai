@@ -1,0 +1,214 @@
+#[doc("""
+Stamps identity onto the references the resolver decided.
+
+The checker walks the tree to report unbound names and returns an
+`Env`; it cannot replace a node. This pass walks the same tree and
+rewrites every `EVar` naming a declaration into `ESym`, so what
+survives resolve carries the id rather than the spelling a later pass
+would have to decide again.
+
+It resolves directly rather than replaying the checker's use ordinals.
+`ru_value` needs the table, the name, the reader's home and whether a
+binder shadows — all four are computable here, so the two walks share
+the decision function instead of an index that has to stay in step.
+
+The binder set is a plain list of names in scope, the same shape the
+checker carries: only the shadowing question is asked of it, and a
+name in it is a local whatever it spells. Every scope-introducing form
+extends it; everything else is structural recursion through
+`prc_map_expr_kind`, so a new `ExprKind` needs no arm here.
+
+A name nothing declares is left as `EVar`. The checker has already
+reported it, and inventing an id for a reference that resolves to
+nothing would put a row in the tree that the table cannot answer.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.modules
+import compiler.name_table
+import compiler.resolve_use
+import compiler.symtab
+import compiler.usetab
+import compiler.util
+
+#[doc("Rewrite every resolved value reference in `ds` into `ESym`, deciding each against `tab`.")]
+pub fn stamp_decls(ds: [Decl], tab: SymTab, target: String) : [Decl] =
+  stamp_loop(ds, tab, target, target, [])
+
+fn stamp_loop(ds: [Decl], tab: SymTab, cur: String, target: String,
+      acc: [Decl]) : [Decl] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> {
+    let home = decl_home_hint_reset(d, cur, target)
+    stamp_loop(rest, tab, home, target, [stamp_decl(d, tab, home), ...acc])
+  }
+}
+
+# The home is a module symbol's id, so two homonymous modules never
+# answer each other's uses however they are spelled.
+fn stamp_decl(d: Decl, tab: SymTab, home: String) : Decl = {
+  let h = match st_module(tab, home) { Some(m) -> m  None -> sym_none() }
+  stamp_decl_at(d, tab, h)
+}
+
+fn stamp_decl_at(d: Decl, t: SymTab, h: SymId) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(p, n, tps, ps, ret, row, stamp(body, t, h, fn_param_names(ps)), l, c, mo)
+  DTest(desc, body, l, c, mo)  -> DTest(desc, stamp(body, t, h, []), l, c, mo)
+  DBench(desc, body, l, c, mo) -> DBench(desc, stamp(body, t, h, []), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo) ->
+    DCheck(desc, ps, stamp(body, t, h, fn_param_names(ps)), l, c, mo)
+  DDoc(a, b, inner, l, c)      -> DDoc(a, b, stamp_decl_at(inner, t, h), l, c)
+  DAttr(a, inner, l, c)        -> DAttr(a, stamp_decl_at(inner, t, h), l, c)
+  DConstructor(inner, l, c)    -> DConstructor(stamp_decl_at(inner, t, h), l, c)
+  DUnstable(inner, l, c)       -> DUnstable(stamp_decl_at(inner, t, h), l, c)
+  _ -> d
+}
+
+fn stamp(e: Expr, t: SymTab, h: SymId, sc: [String]) : Expr =
+  re(e, stamp_kind(e.kind, t, h, sc))
+
+fn stamp_kind(k: ExprKind, t: SymTab, h: SymId, sc: [String]) : ExprKind = match k {
+  EVar(n) -> stamp_name(k, n, t, h, sc)
+  # A binder shadows, so its own body sees it; every form below extends
+  # the scope before descending rather than after.
+  ELambda(ps, b) -> ELambda(ps, stamp(b, t, h, list_append(fn_param_names(ps), sc)))
+  EBlock(ss, tail) -> stamp_block(ss, tail, t, h, sc, [])
+  EMatch(scr, arms) ->
+    EMatch(stamp(scr, t, h, sc), stamp_arms(arms, t, h, sc))
+  EHandle(body, eff, tys, init, alias, cs, ret) -> {
+    let inner = match alias { Some(a) -> [a, ...sc]  None -> sc }
+    EHandle(stamp(body, t, h, inner), eff, tys, stamp_opt(init, t, h, sc), alias,
+            stamp_clauses(cs, t, h, sc), stamp_ret(ret, t, h, sc))
+  }
+  _ -> prc_map_expr_kind(k, (x) => stamp(x, t, h, sc))
+}
+
+# `URSym` is the only decision that names a declaration: `URLocal` is a
+# binder, `URCands` stays contested for the typer to narrow, and
+# `URUnres` is the error the checker already reported.
+fn stamp_name(k: ExprKind, n: String, t: SymTab, h: SymId, sc: [String]) : ExprKind =
+  match ru_value(t, n, h, list_has(sc, n)) {
+    URSym(i)   -> ESym(SymId(i), n)
+    URLocal    -> k
+    URCands(_) -> k
+    URUnres    -> k
+  }
+
+# A `let` binds for the statements after it, not for its own right-hand
+# side, so the scope grows as the list is consumed.
+fn stamp_block(ss: [Stmt], tail: Option[Expr], t: SymTab, h: SymId,
+      sc: [String], acc: [Stmt]) : ExprKind = match ss {
+  [] -> EBlock(list_reverse(acc), stamp_opt(tail, t, h, sc))
+  [s, ...rest] -> {
+    let s1 = stamp_stmt(s, t, h, sc)
+    stamp_block(rest, tail, t, h, stmt_binders(s, sc), [s1, ...acc])
+  }
+}
+
+fn stmt_binders(s: Stmt, sc: [String]) : [String] = match s {
+  SLet(p, _, _) -> pat_names(p, sc)
+  _             -> sc
+}
+
+fn stamp_stmt(s: Stmt, t: SymTab, h: SymId, sc: [String]) : Stmt = match s {
+  SLet(p, ann, rhs) -> SLet(p, ann, stamp(rhs, t, h, sc))
+  SAssert(c, m)     -> SAssert(stamp(c, t, h, sc), stamp_opt(m, t, h, sc))
+  SExprStmt(x)      -> SExprStmt(stamp(x, t, h, sc))
+  _                 -> s
+}
+
+fn stamp_arms(arms: [Arm], t: SymTab, h: SymId, sc: [String]) : [Arm] = match arms {
+  [] -> []
+  [Arm(p, g, b), ...rest] -> {
+    let inner = pat_names(p, sc)
+    [Arm(p, stamp_opt(g, t, h, inner), stamp(b, t, h, inner)),
+     ...stamp_arms(rest, t, h, sc)]
+  }
+}
+
+fn stamp_clauses(cs: [HClause], t: SymTab, h: SymId, sc: [String]) : [HClause] =
+  match cs {
+    [] -> []
+    [HC(n, ps, b, l, c), ...rest] -> {
+      # A clause resumes, so `resume` is in scope for its body.
+      let inner = list_append(["resume", ...fn_param_names(ps)], sc)
+      [HC(n, ps, stamp(b, t, h, inner), l, c), ...stamp_clauses(rest, t, h, sc)]
+    }
+  }
+
+fn stamp_ret(r: Option[HReturn], t: SymTab, h: SymId, sc: [String]) : Option[HReturn] =
+  match r {
+    None -> None
+    Some(HR(n, b, l, c)) -> Some(HR(n, stamp(b, t, h, [n, ...sc]), l, c))
+  }
+
+fn stamp_opt(o: Option[Expr], t: SymTab, h: SymId, sc: [String]) : Option[Expr] =
+  match o { None -> None  Some(x) -> Some(stamp(x, t, h, sc)) }
+
+# Every name a pattern binds, prepended to the scope it opens.
+fn pat_names(p: Pattern, acc: [String]) : [String] = match p.pkind {
+  PBind(n)        -> [n, ...acc]
+  PAs(n, sub)     -> pat_names(sub, [n, ...acc])
+  PNarrow(n, _)   -> [n, ...acc]
+  PList(ps, rest) -> match rest {
+    Some(r) -> pat_names_loop(ps, [r, ...acc])
+    None    -> pat_names_loop(ps, acc)
+  }
+  PVariant(_, _, subs)        -> pat_names_loop(subs, acc)
+  PVariantRecord(_, _, fs)    -> pfield_names(fs, acc)
+  PRecord(fs)                 -> pfield_names(fs, acc)
+  PSurface(sp)                -> pat_names_loop(patsurface_children(sp), acc)
+  _                           -> acc
+}
+
+fn pat_names_loop(ps: [Pattern], acc: [String]) : [String] = match ps {
+  [] -> acc
+  [p, ...rest] -> pat_names_loop(rest, pat_names(p, acc))
+}
+
+fn pfield_names(fs: [PField], acc: [String]) : [String] = match fs {
+  [] -> acc
+  [PField(_, sub, _), ...rest] -> pfield_names(rest, pat_names(sub, acc))
+}
+
+fn re(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+#[doc("""
+Fold every `ESym` back to the name it carries.
+
+Identity is what resolve decided and the typer reads. The backend
+passes below the typer — unboxing, RC, lowering, emission — dispatch on
+the callee's *shape* in hundreds of places, and each of those spells
+its own fallthrough, so a node shape they were not written for changes
+their answers silently rather than loudly.
+
+Folding here keeps the two facts separate: the id is load-bearing above
+this line, and below it a reference is a name again, which is what the
+C symbol is spelled from anyway. The fold is total and shape-preserving
+— only the constructor changes — so nothing downstream can tell a
+resolved reference from the bare one it started as.
+""")]
+pub fn unstamp_decls(ds: [Decl]) : [Decl] = map(ds, unstamp_decl)
+
+fn unstamp_decl(d: Decl) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(p, n, tps, ps, ret, row, unstamp(body), l, c, mo)
+  DTest(desc, body, l, c, mo)  -> DTest(desc, unstamp(body), l, c, mo)
+  DBench(desc, body, l, c, mo) -> DBench(desc, unstamp(body), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, unstamp(body), l, c, mo)
+  DDoc(a, b, inner, l, c)      -> DDoc(a, b, unstamp_decl(inner), l, c)
+  DAttr(a, inner, l, c)        -> DAttr(a, unstamp_decl(inner), l, c)
+  DConstructor(inner, l, c)    -> DConstructor(unstamp_decl(inner), l, c)
+  DUnstable(inner, l, c)       -> DUnstable(unstamp_decl(inner), l, c)
+  _ -> d
+}
+
+fn unstamp(e: Expr) : Expr = re(e, unstamp_kind(e.kind))
+
+fn unstamp_kind(k: ExprKind) : ExprKind = match k {
+  ESym(_, n) -> EVar(n)
+  _          -> prc_map_expr_kind(k, unstamp)
+}
