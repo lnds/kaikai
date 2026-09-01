@@ -60,6 +60,7 @@ import compiler.symtab_build
 import compiler.usetab
 import compiler.resolve_state
 import compiler.resolve_use
+import compiler.scope_chain
 
 # ====================================================================
 # checker: name resolution
@@ -73,8 +74,8 @@ import compiler.resolve_use
 # enters and leaves. Errors accumulate into `had_error`; the driver
 # returns 1 when that flag is set.
 
-#[doc("Resolver scope environment: a stack of name scopes, an error flag, the source file, and the T3 diagnostic accumulator.")]
-pub type Env = { scopes: [[String]], had_error: Bool, file: String,
+#[doc("Resolver scope environment: the scope chain, an error flag, the source file, and the T3 diagnostic accumulator.")]
+pub type Env = { chain: Chain, had_error: Bool, file: String,
               # Structured diagnostic collection for T3
               # (`cannot find <name> in this scope`). Mirrors
               # `InferState.diags` semantics (reverse order, flipped at
@@ -85,66 +86,53 @@ pub type Env = { scopes: [[String]], had_error: Bool, file: String,
               rs: ResState }
 
 #[doc("Fresh resolver env for `file` with a single empty scope and no errors.")]
-pub fn env_new(file: String) : Env = Env { scopes: [[]], had_error: false, file: file, diags: [], rs: rs_off() }
+pub fn env_new(file: String) : Env =
+  Env { chain: ch_new(), had_error: false, file: file, diags: [], rs: rs_off() }
 
-fn env_push(e: Env) : Env =
-  Env { scopes: [[], ...e.scopes], had_error: e.had_error, file: e.file, diags: e.diags, rs: e.rs }
+fn env_with_chain(e: Env, c: Chain) : Env =
+  Env { chain: c, had_error: e.had_error, file: e.file, diags: e.diags, rs: e.rs }
 
-fn env_pop(e: Env) : Env {
-  match e.scopes {
-    [_, ...rest] -> Env { scopes: rest, had_error: e.had_error, file: e.file, diags: e.diags, rs: e.rs }
-    _ -> e
+fn env_push(e: Env) : Env = env_with_chain(e, ch_push(e.chain))
+
+fn env_pop(e: Env) : Env = env_with_chain(e, ch_pop(e.chain))
+
+# A top-level name is registered so forward references resolve, but its
+# identity is NOT fixed here: two homes may declare it, and which one a
+# use reaches depends on the home the walk is inside when the use is
+# read. Binding it to a symbol at registration time would freeze the
+# first home's answer for every reader.
+fn env_add(e: Env, name: String) : Env =
+  env_with_chain(e, ch_bind(e.chain, name, sym_none()))
+
+# A binder takes a fresh local id: `let map = ...` shadows the core
+# `map` and must never be stamped as it.
+fn env_bind_local(e: Env, name: String) : Env =
+  env_with_chain(e, ch_declare_local(e.chain, name))
+
+fn env_has(e: Env, name: String) : Bool = ch_has(e.chain, name)
+
+# What a name reaches: a binder answers with its own id, a declaration
+# with whatever the symbol table resolves for the home the walk is in.
+fn env_lookup(e: Env, name: String) : Option[SymId] =
+  match ch_lookup(e.chain, name) {
+    Some(s) -> if ch_is_local(s) { Some(s) } else { env_decl_sym(e, name) }
+    None    -> None
   }
-}
 
-fn env_add(e: Env, name: String) : Env {
-  match e.scopes {
-    [top, ...rest] ->
-      Env { scopes: [[name, ...top], ...rest], had_error: e.had_error, file: e.file, diags: e.diags, rs: e.rs }
-    _ -> e
-  }
-}
+fn env_decl_sym(e: Env, name: String) : Option[SymId] =
+  if rs_recording(e.rs) { rs_decl_sym(e.rs, name) } else { None }
 
-fn scopes_has(scopes: [[String]], target: String) : Bool {
-  match scopes {
-    [] -> false
-    [top, ...rest] -> if list_has(top, target) { true } else { scopes_has(rest, target) }
-  }
-}
+fn env_shadowed(e: Env, name: String) : Bool = ch_shadows(e.chain, name)
 
-fn env_has(e: Env, name: String) : Bool = scopes_has(e.scopes, name)
-
-# A binder shadows a declaration; a top-level name does not shadow
-# itself. Both live in `scopes`, so "is this a local?" is a question
-# about depth: the outermost scope is where `add_all` and
-# `register_decls` seed the core and the declarations, and every
-# binder scope sits above it. Without the depth test every use of a
-# top-level function reads as shadowed and no site ever resolves to a
-# symbol.
-fn env_is_binder(e: Env, name: String) : Bool = scopes_has(env_binder_scopes(e.scopes), name)
-
-fn env_binder_scopes(ss: [[String]]) : [[String]] = match ss {
-  []        -> []
-  [_]       -> []
-  [top, ...rest] -> [top, ...env_binder_scopes(rest)]
-}
-
-fn env_all_names(e: Env) : [String] = concat_scopes(e.scopes, [])
-
-fn concat_scopes(ss: [[String]], acc: [String]) : [String] {
-  match ss {
-    [] -> acc
-    [scope, ...rest] -> concat_scopes(rest, list_append(acc, scope))
-  }
-}
+fn env_all_names(e: Env) : [String] = ch_names(e.chain)
 
 fn env_mark_err(e: Env) : Env =
-  Env { scopes: e.scopes, had_error: true, file: e.file, diags: e.diags, rs: e.rs }
+  Env { chain: e.chain, had_error: true, file: e.file, diags: e.diags, rs: e.rs }
 
 # Push a Diagnostic onto the Env accumulator. Used by the T3 emit
 # site in parallel with its existing `diag_error` call.
 fn env_push_diag(e: Env, d: Diagnostic) : Env =
-  Env { scopes: e.scopes, had_error: e.had_error, file: e.file,
+  Env { chain: e.chain, had_error: e.had_error, file: e.file,
         diags: [d, ...e.diags], rs: e.rs }
 
 fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env / Console + File {
@@ -285,11 +273,11 @@ fn bind_pat(e: Env, pat: Pattern) : Env {
     PWild -> e
     PLit(_) -> e
     PRange(_, _) -> e
-    PBind(name) -> env_add(e, name)
+    PBind(name) -> env_bind_local(e, name)
     PList(pats, opt_rest) -> {
       let e1 = bind_pats_loop(e, pats)
       match opt_rest {
-        Some(rname) -> env_add(e1, rname)
+        Some(rname) -> env_bind_local(e1, rname)
         None -> e1
       }
     }
@@ -297,8 +285,8 @@ fn bind_pat(e: Env, pat: Pattern) : Env {
     PVariantRecord(_, _, fields) -> bind_pfields_loop(e, fields)
     PRecord(fields) -> bind_pfields_loop(e, fields)
     PHole(_) -> e
-    PAs(name, sub) -> bind_pat(env_add(e, name), sub)
-    PNarrow(name, _) -> env_add(e, name)
+    PAs(name, sub) -> bind_pat(env_bind_local(e, name), sub)
+    PNarrow(name, _) -> env_bind_local(e, name)
     PSurface(sp) -> bind_pats_loop(e, patsurface_children(sp))
   }
 }
@@ -343,141 +331,232 @@ fn env_record_qualified(e: Env, modn: String, name: String, line: Int, col: Int)
   } else { e }
 
 # ---- expression walker ----
+#
+# Every walker returns the env AND the tree it walked. Rewriting here
+# is what makes the resolver's decision survive: a use site the chain
+# resolved becomes an `ESym` carrying the id, so no later pass re-reads
+# the spelling to decide what the name meant.
 
-fn chk_expr(e: Env, x: Expr) : Env / Console + File {
+#[doc("A walked expression: the env after it, and the tree with its resolved names stamped.")]
+pub type RExpr = RExpr(Env, Expr)
 
+#[doc("A walked expression list: the env after it, and the rewritten elements.")]
+pub type RExprs = RExprs(Env, [Expr])
 
+fn rx_env(r: RExpr) : Env = match r { RExpr(e, _) -> e }
+
+fn chk_expr(e: Env, x: Expr) : RExpr / Console + File {
+  match chk_kind(e, x) {
+    RKind(e1, k) -> RExpr(e1, Expr { kind: k, line: x.line, col: x.col, ty: x.ty, mode: x.mode })
+  }
+}
+
+type RKind = RKind(Env, ExprKind)
+
+fn rk_same(e: Env, k: ExprKind) : RKind = RKind(e, k)
+
+fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
   match x.kind {
-    EInt(_, _)    -> e
-    EReal(_, _)   -> e
-    EIntLit(_)    -> e
-    EDecimalLit(_) -> e
-    EFixed(_, _)  -> e
-    EBool(_)   -> e
-    EChar(_)   -> e
-    EStr(_, _) -> e
-    EUnit      -> e
-    EUnder     -> e
-    EPlaceholder -> e
+    EInt(_, _)    -> rk_same(e, x.kind)
+    EReal(_, _)   -> rk_same(e, x.kind)
+    EIntLit(_)    -> rk_same(e, x.kind)
+    EDecimalLit(_) -> rk_same(e, x.kind)
+    EFixed(_, _)  -> rk_same(e, x.kind)
+    EBool(_)   -> rk_same(e, x.kind)
+    EChar(_)   -> rk_same(e, x.kind)
+    EStr(_, _) -> rk_same(e, x.kind)
+    EUnit      -> rk_same(e, x.kind)
+    EUnder     -> rk_same(e, x.kind)
+    EPlaceholder -> rk_same(e, x.kind)
     # Already resolved: the walk stamped it on an earlier pass over this
     # tree, and re-deciding it here is exactly what identity exists to
     # prevent. Recorded again so the ordinals stay in step.
-    ESym(_, name) -> env_record(e, name, env_is_binder(e, name), x.line, x.col)
-    EVar(name) -> {
-      if env_has(e, name) { env_record(e, name, env_is_binder(e, name), x.line, x.col) }
-      else {
-        # Canonical Rust/Elm-style diagnostic.
-        # Error line stays terse; the did-you-mean suggestion moves
-        # to a separate `help:` line and is suppressed when no name
-        # is within Levenshtein distance 3 (closest_name's threshold).
-        diag_error(e.file, x.line, x.col, "cannot find `#{name}` in this scope")
-        let msg = "cannot find `#{name}` in this scope"
-        let sug = closest_name(name, env_all_names(e))
-        match sug {
-          Some(s) -> diag_help("a similar name exists in scope: `#{s}` (did you mean this?)")
-          None    -> ()
-        }
-        # T3 collected diagnostic. Stderr above remains byte-identical;
-        # the structured Diagnostic carries the same message + optional
-        # did-you-mean help.
-        let related = match sug {
-          Some(s) -> [ri_help(e.file, x.line, x.col,
-                              "a similar name exists in scope: `#{s}` (did you mean this?)")]
-          None    -> []
-        }
-        let e1 = env_push_diag(e, mk_diag(SevError, e.file, x.line, x.col, msg, related))
-        env_mark_err(env_record(e1, name, false, x.line, x.col))
+    ESym(_, name) -> rk_same(env_record(e, name, env_shadowed(e, name), x.line, x.col), x.kind)
+    EVar(name) -> chk_var(e, name, x)
+    ECall(f, xs) -> match chk_expr(e, f) {
+      RExpr(e1, f1) -> match chk_exprs(e1, xs) {
+        RExprs(e2, xs1) -> RKind(e2, ECall(f1, xs1))
       }
     }
-    ECall(f, xs) -> {
-      let e1 = chk_expr(e, f)
-      chk_exprs(e1, xs)
+    EField(base, fname) -> match chk_expr(e, base) {
+      RExpr(e1, b1) -> RKind(e1, EField(b1, fname))
     }
-    EField(base, _) -> chk_expr(e, base)
-    EIndex(base, idx) -> chk_expr(chk_expr(e, base), idx)
-    EBinop(_, a, b) -> chk_expr(chk_expr(e, a), b)
-    EUnop(_, inner) -> chk_expr(e, inner)
-    EIf(c, a, opt_b) -> {
-      let e1 = chk_expr(chk_expr(e, c), a)
-      match opt_b {
-        Some(b) -> chk_expr(e1, b)
-        None -> e1
+    EIndex(base, idx) -> match chk_expr(e, base) {
+      RExpr(e1, b1) -> match chk_expr(e1, idx) {
+        RExpr(e2, i1) -> RKind(e2, EIndex(b1, i1))
       }
     }
-    EMatch(scrut, arms) -> {
-      let e1 = chk_expr(e, scrut)
-      chk_arms(e1, arms)
+    EBinop(op, a, b) -> match chk_expr(e, a) {
+      RExpr(e1, a1) -> match chk_expr(e1, b) {
+        RExpr(e2, b1) -> RKind(e2, EBinop(op, a1, b1))
+      }
+    }
+    EUnop(op, inner) -> match chk_expr(e, inner) {
+      RExpr(e1, i1) -> RKind(e1, EUnop(op, i1))
+    }
+    EIf(c, a, opt_b) -> match chk_expr(e, c) {
+      RExpr(e1, c1) -> match chk_expr(e1, a) {
+        RExpr(e2, a1) -> match opt_b {
+          Some(b) -> match chk_expr(e2, b) {
+            RExpr(e3, b1) -> RKind(e3, EIf(c1, a1, Some(b1)))
+          }
+          None -> RKind(e2, EIf(c1, a1, None))
+        }
+      }
+    }
+    EMatch(scrut, arms) -> match chk_expr(e, scrut) {
+      RExpr(e1, s1) -> match chk_arms(e1, arms) {
+        RArms(e2, as1) -> RKind(e2, EMatch(s1, as1))
+      }
     }
     ELambda(params, body) -> {
-      let e1 = env_push(e)
-      let e2 = add_params(e1, params)
-      let e3 = chk_expr(e2, body)
-      env_pop(e3)
+      let e1 = add_params(env_push(e), params)
+      match chk_expr(e1, body) {
+        RExpr(e2, b1) -> RKind(env_pop(e2), ELambda(params, b1))
+      }
     }
-    ERecordLit(_, fields) -> chk_field_inits(e, fields)
-    EList(elems) -> chk_list_elems(e, elems)
-    ERange(a, b, opt_step) -> {
-      let e1 = chk_expr(chk_expr(e, a), b)
-      match opt_step { Some(s) -> chk_expr(e1, s) None -> e1 }
+    ERecordLit(tn, fields) -> match chk_field_inits(e, fields) {
+      RFields(e1, fs1) -> RKind(e1, ERecordLit(tn, fs1))
+    }
+    EList(elems) -> match chk_list_elems(e, elems) {
+      RElems(e1, es1) -> RKind(e1, EList(es1))
+    }
+    ERange(a, b, opt_step) -> match chk_expr(e, a) {
+      RExpr(e1, a1) -> match chk_expr(e1, b) {
+        RExpr(e2, b1) -> match opt_step {
+          Some(st) -> match chk_expr(e2, st) {
+            RExpr(e3, s1) -> RKind(e3, ERange(a1, b1, Some(s1)))
+          }
+          None -> RKind(e2, ERange(a1, b1, None))
+        }
+      }
     }
     EBlock(stmts, opt_final) -> {
-      let e1 = env_push(e)
-      let e2 = chk_stmts(e1, stmts)
-      let e3 = match opt_final { Some(f) -> chk_expr(e2, f) None -> e2 }
-      env_pop(e3)
-    }
-    EPipe(a, b) -> chk_expr(chk_expr(e, a), b)
-    EMapPipe(a, b) -> chk_expr(chk_expr(e, a), b)
-    EFlatMapPipe(a, b) -> chk_expr(chk_expr(e, a), b)
-    EFilterPipe(a, b) -> chk_expr(chk_expr(e, a), b)
-    EHole(_) -> e          # holes bind no names; checker lets them pass silently
-    ETodo(_) -> e          # same posture as a hole
-    EExternBody(_) -> e          # same posture as a hole
-    EBang(inner) -> chk_expr(e, inner)   # scope-walk the operand
-    EHandle(body, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
-      # `Eff as log` makes `log` a binding that names the capability
-      # inside the body. We push a scope so the name disappears once
-      # the body is done.
-      # The init expression (`with State[T](init)`) lives in the outer
-      # scope — its free vars are the surrounding env.
-      let stateful = match init_opt { Some(_) -> true None -> false }
-      let after_init = match init_opt {
-        Some(ie) -> chk_expr(e, ie)
-        None     -> e
-      }
-      let body_env = match alias_opt {
-        Some(alias) -> env_add(env_push(after_init), alias)
-        None        -> after_init
-      }
-      let e1 = chk_expr(body_env, body)
-      let restored = match alias_opt {
-        Some(_) -> env_pop(e1)
-        None    -> e1
-      }
-      if stateful { warn_shadowed_aliases(restored, handler_state_aliases(), x.line, x.col) } else { () }
-      let e2 = chk_handler_clauses(restored, clauses, stateful)
-      match ret_opt {
-        Some(r) -> chk_handler_return(e2, r, stateful)
-        None    -> e2
+      match chk_stmts(env_push(e), stmts) {
+        RStmts(e1, ss1) -> match opt_final {
+          Some(f) -> match chk_expr(e1, f) {
+            RExpr(e2, f1) -> RKind(env_pop(e2), EBlock(ss1, Some(f1)))
+          }
+          None -> RKind(env_pop(e1), EBlock(ss1, None))
+        }
       }
     }
+    EPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EPipe(l, r))
+    EMapPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EMapPipe(l, r))
+    EFlatMapPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EFlatMapPipe(l, r))
+    EFilterPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EFilterPipe(l, r))
+    EHole(_) -> rk_same(e, x.kind)          # holes bind no names; checker lets them pass silently
+    ETodo(_) -> rk_same(e, x.kind)          # same posture as a hole
+    EExternBody(_) -> rk_same(e, x.kind)          # same posture as a hole
+    EBang(inner) -> match chk_expr(e, inner) {   # scope-walk the operand
+      RExpr(e1, i1) -> RKind(e1, EBang(i1))
+    }
+    EHandle(body, en, ta, init_opt, alias_opt, clauses, ret_opt) ->
+      chk_handle(e, x, body, en, ta, init_opt, alias_opt, clauses, ret_opt)
     # literal carrying a unit annotation. Recurse into the inner
     # numeric literal; the unit symbols themselves are validated at
     # type-resolution time, not here.
-    ELitUnit(inner, _) -> chk_expr(e, inner)
+    ELitUnit(inner, u) -> match chk_expr(e, inner) {
+      RExpr(e1, i1) -> RKind(e1, ELitUnit(i1, u))
+    }
     # `variants[T]()` carries no value-level sub-expressions.
     # The TypeExpr is validated by the resolver (sum + nullary-only)
     # in a later pass, not here.
-    EVariantsOf(_, _) -> e
+    EVariantsOf(_, _) -> rk_same(e, x.kind)
     # qualified module call carries no sub-expressions and binds no
     # names — the resolver fills it in once everything is in scope, so
     # the checker has nothing to verify here.
-    EModCall(modn, name) -> env_record_qualified(e, modn, name, x.line, x.col)
+    EModCall(modn, name) -> rk_same(env_record_qualified(e, modn, name, x.line, x.col), x.kind)
     # intrinsic args are ordinary sub-expressions (a loop intrinsic
     # carries its original callee plus the loop's lambdas); walk them so
     # name-binding issues surface exactly as in the pre-lowering call.
-    EIntrinsic(_, args_) -> chk_exprs(e, args_)
-    ESurface(sf) -> chk_exprs(e, surface_children(sf))
+    EIntrinsic(nm, args_) -> match chk_exprs(e, args_) {
+      RExprs(e1, as1) -> RKind(e1, EIntrinsic(nm, as1))
+    }
+    # A surface node's children are walked for their diagnostics; the
+    # node itself is rebuilt from the original, since the surface forms
+    # are lowered before any consumer of identity runs.
+    ESurface(sf) -> rk_same(rx_envs(chk_exprs(e, surface_children(sf))), x.kind)
+  }
+}
+
+# The one place a bare name becomes an identity. A binder in scope
+# stays an `EVar` — a local is not a declaration any consumer indexes —
+# and a name the chain resolves to a declaration becomes the `ESym`
+# that carries the decision forward. An unbound name is reported and
+# left as written, so the diagnostics downstream still read a spelling.
+fn chk_var(e: Env, name: String, x: Expr) : RKind / Console + File {
+  if env_has(e, name) {
+    let shadowed = env_shadowed(e, name)
+    let e1 = env_record(e, name, shadowed, x.line, x.col)
+    match env_lookup(e1, name) {
+      Some(s) -> if ch_is_local(s) { RKind(e1, x.kind) } else { RKind(e1, ESym(s, name)) }
+      None    -> RKind(e1, x.kind)
+    }
+  } else { RKind(chk_unbound(e, name, x), x.kind) }
+}
+
+# Canonical Rust/Elm-style diagnostic. The error line stays terse; the
+# did-you-mean suggestion moves to a separate `help:` line and is
+# suppressed when no name is within Levenshtein distance 3.
+fn chk_unbound(e: Env, name: String, x: Expr) : Env / Console + File {
+  diag_error(e.file, x.line, x.col, "cannot find `#{name}` in this scope")
+  let msg = "cannot find `#{name}` in this scope"
+  let sug = closest_name(name, env_all_names(e))
+  match sug {
+    Some(s) -> diag_help("a similar name exists in scope: `#{s}` (did you mean this?)")
+    None    -> ()
+  }
+  let related = match sug {
+    Some(s) -> [ri_help(e.file, x.line, x.col,
+                        "a similar name exists in scope: `#{s}` (did you mean this?)")]
+    None    -> []
+  }
+  let e1 = env_push_diag(e, mk_diag(SevError, e.file, x.line, x.col, msg, related))
+  env_mark_err(env_record(e1, name, false, x.line, x.col))
+}
+
+fn rx_envs(r: RExprs) : Env = match r { RExprs(e, _) -> e }
+
+fn chk_pipe(e: Env, a: Expr, b: Expr,
+      mk: (Expr, Expr) -> ExprKind) : RKind / Console + File =
+  match chk_expr(e, a) {
+    RExpr(e1, a1) -> match chk_expr(e1, b) {
+      RExpr(e2, b1) -> RKind(e2, mk(a1, b1))
+    }
+  }
+
+# `Eff as log` makes `log` a binding that names the capability inside
+# the body, so it is pushed in a scope of its own and disappears with
+# it. The init expression (`with State[T](init)`) lives in the outer
+# scope — its free vars are the surrounding env.
+fn chk_handle(e: Env, x: Expr, body: Expr, en: String, ta: [TypeExpr],
+      init_opt: Option[Expr], alias_opt: Option[String], clauses: [HClause],
+      ret_opt: Option[HReturn]) : RKind / Console + File {
+  let stateful = match init_opt { Some(_) -> true None -> false }
+  let after = match init_opt {
+    Some(ie) -> match chk_expr(e, ie) { RExpr(e1, i1) -> RExpr(e1, i1) }
+    None     -> RExpr(e, x)
+  }
+  let init1 = match init_opt { Some(_) -> match after { RExpr(_, i) -> Some(i) } None -> None }
+  let e0 = rx_env(after)
+  let body_env = match alias_opt {
+    Some(alias) -> env_bind_local(env_push(e0), alias)
+    None        -> e0
+  }
+  match chk_expr(body_env, body) {
+    RExpr(eb, body1) -> {
+      let restored = match alias_opt { Some(_) -> env_pop(eb) None -> eb }
+      if stateful { warn_shadowed_aliases(restored, handler_state_aliases(), x.line, x.col) } else { () }
+      match chk_handler_clauses(restored, clauses, stateful) {
+        RClauses(ec, cs1) -> match ret_opt {
+          Some(r) -> match chk_handler_return(ec, r, stateful) {
+            RRet(er, r1) -> RKind(er, EHandle(body1, en, ta, init1, alias_opt, cs1, Some(r1)))
+          }
+          None -> RKind(ec, EHandle(body1, en, ta, init1, alias_opt, cs1, None))
+        }
+      }
+    }
   }
 }
 
@@ -497,7 +576,7 @@ fn bind_state_aliases_loop(e: Env, outer: Env, names: [String]) : Env {
   match names {
     [] -> e
     [nm, ...rest] ->
-      bind_state_aliases_loop(if env_has(outer, nm) { e } else { env_add(e, nm) },
+      bind_state_aliases_loop(if env_has(outer, nm) { e } else { env_bind_local(e, nm) },
                               outer, rest)
   }
 }
@@ -520,177 +599,195 @@ fn warn_shadowed_aliases(e: Env, names: [String], line: Int, col: Int) : Unit / 
   }
 }
 
-fn chk_handler_clauses(e: Env, cs: [HClause], stateful: Bool) : Env / Console + File {
+type RClauses = RClauses(Env, [HClause])
 
+fn chk_handler_clauses(e: Env, cs: [HClause],
+      stateful: Bool) : RClauses / Console + File = chk_clauses_loop(e, cs, stateful, [])
 
-  match cs {
-    [] -> e
-    [c, ...rest] -> match c {
-      HC(_, params, body, _, _) -> {
-        let e1 = env_push(e)
-        let e1s = if stateful { bind_state_aliases(e1, e) } else { e1 }
-        let e2 = add_params(e1s, params)
-        let e3 = chk_expr(e2, body)
-        chk_handler_clauses(env_pop(e3), rest, stateful)
+fn chk_clauses_loop(e: Env, cs: [HClause], stateful: Bool,
+      acc: [HClause]) : RClauses / Console + File = match cs {
+  [] -> RClauses(e, list_reverse(acc))
+  [HC(nm, params, body, l, c), ...rest] -> {
+    let e1 = env_push(e)
+    let e1s = if stateful { bind_state_aliases(e1, e) } else { e1 }
+    match chk_expr(add_params(e1s, params), body) {
+      RExpr(e2, b1) -> chk_clauses_loop(env_pop(e2), rest, stateful, [HC(nm, params, b1, l, c), ...acc])
+    }
+  }
+}
+
+type RRet = RRet(Env, HReturn)
+
+fn chk_handler_return(e: Env, r: HReturn, stateful: Bool) : RRet / Console + File {
+  match r {
+    HR(name, body, l, c) -> {
+      let e2 = env_bind_local(env_push(e), name)
+      let e2s = if stateful { bind_state_aliases(e2, e) } else { e2 }
+      match chk_expr(e2s, body) {
+        RExpr(e3, b1) -> RRet(env_pop(e3), HR(name, b1, l, c))
       }
     }
   }
 }
 
-fn chk_handler_return(e: Env, r: HReturn, stateful: Bool) : Env / Console + File {
+fn chk_exprs(e: Env, xs: [Expr]) : RExprs / Console + File = chk_exprs_loop(e, xs, [])
 
-
-  match r {
-    HR(name, body, _, _) -> {
-      let e1 = env_push(e)
-      let e2 = env_add(e1, name)
-      let e2s = if stateful { bind_state_aliases(e2, e) } else { e2 }
-      let e3 = chk_expr(e2s, body)
-      env_pop(e3)
-    }
+fn chk_exprs_loop(e: Env, xs: [Expr], acc: [Expr]) : RExprs / Console + File = match xs {
+  [] -> RExprs(e, list_reverse(acc))
+  [h, ...rest] -> match chk_expr(e, h) {
+    RExpr(e1, h1) -> chk_exprs_loop(e1, rest, [h1, ...acc])
   }
 }
 
-fn chk_exprs(e: Env, xs: [Expr]) : Env / Console + File {
+type RFields = RFields(Env, [FieldInit])
 
+fn chk_field_inits(e: Env, fs: [FieldInit]) : RFields / Console + File =
+  chk_fields_loop(e, fs, [])
 
-  match xs {
-    [] -> e
-    [h, ...rest] -> chk_exprs(chk_expr(e, h), rest)
-  }
-}
-
-fn chk_field_inits(e: Env, fs: [FieldInit]) : Env / Console + File {
-
-
+fn chk_fields_loop(e: Env, fs: [FieldInit], acc: [FieldInit]) : RFields / Console + File =
   match fs {
-    [] -> e
-    [f, ...rest] -> match f {
-      FI(_, val) -> chk_field_inits(chk_expr(e, val), rest)
+    [] -> RFields(e, list_reverse(acc))
+    [FI(n, val), ...rest] -> match chk_expr(e, val) {
+      RExpr(e1, v1) -> chk_fields_loop(e1, rest, [FI(n, v1), ...acc])
     }
   }
-}
 
-fn chk_list_elems(e: Env, es: [ListElem]) : Env / Console + File {
+type RElems = RElems(Env, [ListElem])
 
+fn chk_list_elems(e: Env, es: [ListElem]) : RElems / Console + File =
+  chk_elems_loop(e, es, [])
 
+fn chk_elems_loop(e: Env, es: [ListElem], acc: [ListElem]) : RElems / Console + File =
   match es {
-    [] -> e
-    [el, ...rest] -> match el {
-      ElPlain(x)  -> chk_list_elems(chk_expr(e, x), rest)
-      ElSpread(x) -> chk_list_elems(chk_expr(e, x), rest)
+    [] -> RElems(e, list_reverse(acc))
+    [ElPlain(xp), ...rest] -> match chk_expr(e, xp) {
+      RExpr(e1, x1) -> chk_elems_loop(e1, rest, [ElPlain(x1), ...acc])
+    }
+    [ElSpread(xs), ...rest] -> match chk_expr(e, xs) {
+      RExpr(e1, x1) -> chk_elems_loop(e1, rest, [ElSpread(x1), ...acc])
+    }
+  }
+
+type RArms = RArms(Env, [Arm])
+
+fn chk_arms(e: Env, arms: [Arm]) : RArms / Console + File = chk_arms_loop(e, arms, [])
+
+fn chk_arms_loop(e: Env, arms: [Arm], acc: [Arm]) : RArms / Console + File = match arms {
+  [] -> RArms(e, list_reverse(acc))
+  [Arm(pat, guard, body), ...rest] -> {
+    let e2 = bind_pat(env_push(e), pat)
+    match chk_guard(e2, guard) {
+      RGuard(e3, g1) -> match chk_expr(e3, body) {
+        RExpr(e4, b1) -> chk_arms_loop(env_pop(e4), rest, [Arm(pat, g1, b1), ...acc])
+      }
     }
   }
 }
 
-fn chk_arms(e: Env, arms: [Arm]) : Env / Console + File {
+type RGuard = RGuard(Env, Option[Expr])
 
+fn chk_guard(e: Env, g: Option[Expr]) : RGuard / Console + File = match g {
+  Some(gx) -> match chk_expr(e, gx) { RExpr(e1, g1) -> RGuard(e1, Some(g1)) }
+  None     -> RGuard(e, None)
+}
 
-  match arms {
-    [] -> e
-    [a, ...rest] -> chk_arms(chk_arm(e, a), rest)
+type RStmts = RStmts(Env, [Stmt])
+
+fn chk_stmts(e: Env, ss: [Stmt]) : RStmts / Console + File = chk_stmts_loop(e, ss, [])
+
+fn chk_stmts_loop(e: Env, ss: [Stmt], acc: [Stmt]) : RStmts / Console + File = match ss {
+  [] -> RStmts(e, list_reverse(acc))
+  [s, ...rest] -> match chk_stmt(e, s) {
+    RStmt(e1, s1) -> chk_stmts_loop(e1, rest, [s1, ...acc])
   }
 }
 
-fn chk_arm(e: Env, a: Arm) : Env / Console + File {
+type RStmt = RStmt(Env, Stmt)
 
-
-  match a {
-    Arm(pat, guard, body) -> {
-      let e1 = env_push(e)
-      let e2 = bind_pat(e1, pat)
-      let e3 = match guard { Some(g) -> chk_expr(e2, g) None -> e2 }
-      let e4 = chk_expr(e3, body)
-      env_pop(e4)
-    }
-  }
-}
-
-fn chk_stmts(e: Env, ss: [Stmt]) : Env / Console + File {
-
-
-  match ss {
-    [] -> e
-    [s, ...rest] -> chk_stmts(chk_stmt(e, s), rest)
-  }
-}
-
-fn chk_stmt(e: Env, s: Stmt) : Env / Console + File {
-
-
+fn chk_stmt(e: Env, s: Stmt) : RStmt / Console + File {
   match s {
-    SLet(pat, _, rhs) -> {
-      let e1 = chk_expr(e, rhs)
-      bind_pat(e1, pat)
+    SLet(pat, ta, rhs) -> match chk_expr(e, rhs) {
+      RExpr(e1, r1) -> RStmt(bind_pat(e1, pat), SLet(pat, ta, r1))
     }
-    SAssert(cond, opt_msg) -> {
-      let e1 = chk_expr(e, cond)
-      match opt_msg { Some(m) -> chk_expr(e1, m) None -> e1 }
+    SAssert(cond, opt_msg) -> match chk_expr(e, cond) {
+      RExpr(e1, c1) -> match opt_msg {
+        Some(m) -> match chk_expr(e1, m) {
+          RExpr(e2, m1) -> RStmt(e2, SAssert(c1, Some(m1)))
+        }
+        None -> RStmt(e1, SAssert(c1, None))
+      }
     }
-    SExprStmt(x) -> chk_expr(e, x)
+    SExprStmt(x) -> match chk_expr(e, x) { RExpr(e1, x1) -> RStmt(e1, SExprStmt(x1)) }
     # index-assign sugar — desugared away before this pass runs,
     # but kept arm here so the match stays exhaustive if name resolution
     # is invoked on the raw AST (e.g. from a future debug dump).
-    SIndexAssign(base, idx, val, _, _) -> {
-      let e1 = chk_expr(e, base)
-      let e2 = chk_expr(e1, idx)
-      chk_expr(e2, val)
+    SIndexAssign(base, idx, val, l, c) -> match chk_expr(e, base) {
+      RExpr(e1, b1) -> match chk_expr(e1, idx) {
+        RExpr(e2, i1) -> match chk_expr(e2, val) {
+          RExpr(e3, v1) -> RStmt(e3, SIndexAssign(b1, i1, v1, l, c))
+        }
+      }
     }
-    SAssign(base, val, _, _) -> chk_expr(chk_expr(e, base), val)
+    SAssign(base, val, l, c) -> match chk_expr(e, base) {
+      RExpr(e1, b1) -> match chk_expr(e1, val) {
+        RExpr(e2, v1) -> RStmt(e2, SAssign(b1, v1, l, c))
+      }
+    }
     # `var name = init` is desugared away pre-resolve by
     # `desugar_var_decls`. This arm is dead code in normal compilation;
     # if a future debug mode skips the desugar, treat the binding like
     # `let` so the match stays exhaustive and follow-on resolution
     # still produces useful diagnostics.
-    SVar(name, _, rhs, _line, _col) -> {
-      let e1 = chk_expr(e, rhs)
-      env_add(e1, name)
+    SVar(name, ta, rhs, line, col) -> match chk_expr(e, rhs) {
+      RExpr(e1, r1) -> RStmt(env_bind_local(e1, name), SVar(name, ta, r1, line, col))
     }
     # `use Effect` stmt is stripped by desugar_use_decls before chk
     # runs. Arm kept so the match is exhaustive in case of a future
     # debug-only path that skips the desugar.
-    SUse(_, _, _) -> e
+    SUse(_, _, _) -> RStmt(e, s)
   }
 }
 
 fn add_params(e: Env, ps: [Param]) : Env {
   match ps {
     [] -> e
-    [p, ...rest] -> add_params(env_add(e, p.pname), rest)
+    [p, ...rest] -> add_params(env_bind_local(e, p.pname), rest)
   }
 }
 
 # ---- declaration walkers ----
 
-fn chk_decl(e: Env, d: Decl) : Env / Console + File {
+#[doc("A walked declaration: the env after it, and the tree with its resolved names stamped.")]
+pub type RDecl = RDecl(Env, Decl)
 
+#[doc("A walked declaration list: the env after it, and the rewritten declarations.")]
+pub type RDecls = RDecls(Env, [Decl])
 
+fn rd_env(r: RDecl) : Env = match r { RDecl(e, _) -> e }
+
+fn chk_decl(e: Env, d: Decl) : RDecl / Console + File {
   match d {
-    DFn(_, _, _, params, _, _, body, _, _, _) -> {
-      let e1 = env_push(e)
-      let e2 = add_params(e1, params)
-      let e3 = chk_expr(e2, body)
-      env_pop(e3)
+    DFn(p, n, tp, params, rt, row, body, l, c, mo) -> {
+      let e1 = add_params(env_push(e), params)
+      match chk_expr(e1, body) {
+        RExpr(e2, b1) -> RDecl(env_pop(e2), DFn(p, n, tp, params, rt, row, b1, l, c, mo))
+      }
     }
-    DType(_, _, _, _, _, _, _, _) -> e
-    DTest(_, body, _, _, _) -> {
-      let e1 = env_push(e)
-      let e2 = chk_expr(e1, body)
-      env_pop(e2)
+    DType(_, _, _, _, _, _, _, _) -> RDecl(e, d)
+    DTest(nm, body, l, c, mo) -> match chk_body_scope(e, body) {
+      RExpr(e1, b1) -> RDecl(e1, DTest(nm, b1, l, c, mo))
     }
-    DBench(_, body, _, _, _) -> {
-      let e1 = env_push(e)
-      let e2 = chk_expr(e1, body)
-      env_pop(e2)
+    DBench(nm, body, l, c, mo) -> match chk_body_scope(e, body) {
+      RExpr(e1, b1) -> RDecl(e1, DBench(nm, b1, l, c, mo))
     }
-    DCheck(_, params, body, _, _, _) -> {
-      let e1 = env_push(e)
-      let e2 = add_params(e1, params)
-      let e3 = chk_expr(e2, body)
-      env_pop(e3)
+    DCheck(nm, params, body, l, c, mo) -> {
+      let e1 = add_params(env_push(e), params)
+      match chk_expr(e1, body) {
+        RExpr(e2, b1) -> RDecl(env_pop(e2), DCheck(nm, params, b1, l, c, mo))
+      }
     }
-    DImport(_, _, _) -> e
-    DEffect(_, _, _, _, _, _, _, _) -> e
+    DImport(_, _, _) -> RDecl(e, d)
+    DEffect(_, _, _, _, _, _, _, _) -> RDecl(e, d)
     # protocol / impl / derive decls are stripped by `lower_protocols`
     # before `check_program` runs, so reaching one here means the
     # pipeline was driven directly into `chk_decl` (e.g. via `--check`
@@ -698,37 +795,51 @@ fn chk_decl(e: Env, d: Decl) : Env / Console + File {
     # to lower first). Treat as a no-op rather than a fatal error so
     # the selfhost path continues to validate the post-lowering decl
     # stream.
-    DProtocol(_, _, _, _, _, _, _) -> e
-    DImpl(_, _, _, _, _, _, _) -> e
-    DDerive(_, _, _, _) -> e
-    DUnstable(_, _, _) -> e
-    DProtoLaws(_, inner, _, _, _) -> chk_decl(e, inner)  # stripped pre-resolve; defensive
-    DImplAxiom(_, inner, _, _, _) -> chk_decl(e, inner)
-    DConstructor(inner, _, _) -> chk_decl(e, inner)   # check the marked fn body
-    DUnit(_, _, _, _, _, _, _) -> e            # unit declarations introduce no value bindings
-    DUse(_, _, _) -> e                       # stripped by desugar_use_decls before chk runs
-    DUseKind(_, _, _, _) -> e                # stripped by the kind-resolution pass before chk runs
-    DAxiom(_, _, _, _, _, _, _, _, _, _) -> e     # rewritten to DFn by lower_axioms before chk runs
-    DConst(_, name, _, body, _, _, _) -> {
-      let e1 = env_add(e, name)
-      chk_expr(e1, body)
+    DProtocol(_, _, _, _, _, _, _) -> RDecl(e, d)
+    DImpl(_, _, _, _, _, _, _) -> RDecl(e, d)
+    DDerive(_, _, _, _) -> RDecl(e, d)
+    DUnstable(_, _, _) -> RDecl(e, d)
+    DProtoLaws(th, inner, l, c, mo) -> match chk_decl(e, inner) {
+      RDecl(e1, i1) -> RDecl(e1, DProtoLaws(th, i1, l, c, mo))
     }
-    DExternType(_, _, _, _, _) -> e   # FFI v2: a foreign type binds no value; introduces no scope name
-    DDoc(_, _, inner, _, _) -> chk_decl(e, inner)    # check the documented decl
-    DAttr(_, inner, _, _) -> chk_decl(e, inner)
-    DModuleDoc(_, _, _, _) -> e                       # doc text only
-    DTheory(_, _, _, _, _) -> e                          # catalog decl: stripped pre-resolve, no value bindings
-    DKind(_, _, _, _, _, _, _, _) -> e                      # catalog decl: stripped pre-resolve, no value bindings
+    DImplAxiom(th, inner, l, c, mo) -> match chk_decl(e, inner) {
+      RDecl(e1, i1) -> RDecl(e1, DImplAxiom(th, i1, l, c, mo))
+    }
+    DConstructor(inner, l, c) -> match chk_decl(e, inner) {
+      RDecl(e1, i1) -> RDecl(e1, DConstructor(i1, l, c))
+    }
+    DUnit(_, _, _, _, _, _, _) -> RDecl(e, d)  # unit declarations introduce no value bindings
+    DUse(_, _, _) -> RDecl(e, d)               # stripped by desugar_use_decls before chk runs
+    DUseKind(_, _, _, _) -> RDecl(e, d)        # stripped by the kind-resolution pass before chk runs
+    DAxiom(_, _, _, _, _, _, _, _, _, _) -> RDecl(e, d)  # rewritten to DFn by lower_axioms before chk runs
+    DConst(p, name, ta, body, mo, l, c) -> match chk_expr(env_add(e, name), body) {
+      RExpr(e1, b1) -> RDecl(e1, DConst(p, name, ta, b1, mo, l, c))
+    }
+    DExternType(_, _, _, _, _) -> RDecl(e, d)  # FFI v2: a foreign type binds no value
+    DDoc(ds, dl, inner, l, c) -> match chk_decl(e, inner) {
+      RDecl(e1, i1) -> RDecl(e1, DDoc(ds, dl, i1, l, c))
+    }
+    DAttr(at, inner, l, c) -> match chk_decl(e, inner) {
+      RDecl(e1, i1) -> RDecl(e1, DAttr(at, i1, l, c))
+    }
+    DModuleDoc(_, _, _, _) -> RDecl(e, d)      # doc text only
+    DTheory(_, _, _, _, _) -> RDecl(e, d)      # catalog decl: stripped pre-resolve
+    DKind(_, _, _, _, _, _, _, _) -> RDecl(e, d)  # catalog decl: stripped pre-resolve
   }
 }
 
-#[doc("Walk a decl list with the resolver, threading the scope env left to right.")]
-pub fn chk_decls(e: Env, ds: [Decl]) : Env / Console + File {
+fn chk_body_scope(e: Env, body: Expr) : RExpr / Console + File =
+  match chk_expr(env_push(e), body) {
+    RExpr(e1, b1) -> RExpr(env_pop(e1), b1)
+  }
 
+#[doc("Walk a decl list with the resolver, threading the scope env left to right and stamping every resolved name.")]
+pub fn chk_decls(e: Env, ds: [Decl]) : RDecls / Console + File = chk_decls_loop(e, ds, [])
 
-  match ds {
-    [] -> e
-    [d, ...rest] -> chk_decls(chk_decl(e, d), rest)
+fn chk_decls_loop(e: Env, ds: [Decl], acc: [Decl]) : RDecls / Console + File = match ds {
+  [] -> RDecls(e, list_reverse(acc))
+  [d, ...rest] -> match chk_decl(e, d) {
+    RDecl(e1, d1) -> chk_decls_loop(e1, rest, [d1, ...acc])
   }
 }
 
@@ -826,6 +937,15 @@ fn register_import(e: Env, ik: ImportKind) : Env {
 pub fn check_program(df: DiagFiles, decls: [Decl], target: String) : Int / Console + File =
   resolve_program(df, decls, target).errs
 
+#[doc("Resolve `decls` and hand back the tree with every resolved name stamped, or the original stream when resolution failed.")]
+pub fn resolve_decls(df: DiagFiles, decls: [Decl], target: String) : ResolvedDecls / Console + File {
+  let r = resolve_program(df, decls, target)
+  ResolvedDecls { errs: r.errs, decls: if r.errs == 0 { r.decls } else { decls } }
+}
+
+#[doc("A resolved decl stream: the resolver's error count, and the declarations downstream passes consume.")]
+pub type ResolvedDecls = { errs: Int, decls: [Decl] }
+
 #[doc("Resolve a program and keep the resolution: the same checks `check_program` runs, with every use site recorded against `tab`.")]
 pub fn resolve_program_with(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : Resolution / Console + File =
   resolve_run(df, decls, rs_on(tab, target))
@@ -839,30 +959,43 @@ fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState) : Resolution / Conso
   let e0 = env_with_rs(env_new(file), rs0)
   let e1 = add_all(e0, core_names())
   let e2 = register_decls(e1, decls)
-  let e3 = chk_decls_files(e2, decls, df)
+  let walked = chk_decls_files(e2, decls, df)
+  let e3 = rds_env(walked)
+  let out = rds_decls(walked)
   let eff_names = collect_effect_names(decls)
   let arities = collect_effect_arities(decls)
   let row_errs = check_row_labels(decls, df, eff_names, arities)
   let strict_errs = check_call_site_refinements(file, decls)
   let tyvar_errs = check_unbound_tyvars(decls, df)
   Resolution { errs: if e3.had_error or row_errs > 0 or strict_errs > 0 or tyvar_errs > 0 { 1 } else { 0 },
-               uses: rs_uses(e3.rs) }
+               uses: rs_uses(e3.rs),
+               decls: out }
 }
 
-#[doc("What a resolver run produced: the error count `check_program` reports, and the use table the walk filled.")]
-pub type Resolution = { errs: Int, uses: UseTab }
+#[doc("What a resolver run produced: the error count `check_program` reports, the use table the walk filled, and the declarations with every resolved name stamped.")]
+pub type Resolution = { errs: Int, uses: UseTab, decls: [Decl] }
+
+fn rds_env(r: RDecls) : Env = match r { RDecls(e, _) -> e }
+
+fn rds_decls(r: RDecls) : [Decl] = match r { RDecls(_, ds) -> ds }
 
 fn env_with_rs(e: Env, rs: ResState) : Env =
-  Env { scopes: e.scopes, had_error: e.had_error, file: e.file, diags: e.diags, rs: rs }
+  Env { chain: e.chain, had_error: e.had_error, file: e.file, diags: e.diags, rs: rs }
 
 
 # The env's file follows the decl being walked, so an error inside an
 # imported module's body is anchored in that module's file.
-fn chk_decls_files(e: Env, ds: [Decl], df: DiagFiles) : Env / Console + File = match ds {
-  [] -> e
+fn chk_decls_files(e: Env, ds: [Decl], df: DiagFiles) : RDecls / Console + File =
+  chk_files_loop(e, ds, df, [])
+
+fn chk_files_loop(e: Env, ds: [Decl], df: DiagFiles,
+      acc: [Decl]) : RDecls / Console + File = match ds {
+  [] -> RDecls(e, list_reverse(acc))
   [d, ...rest] -> {
     let at = env_at_decl(e, d, decl_diag_file(d, df))
-    chk_decls_files(chk_decl(at, d), rest, df)
+    match chk_decl(at, d) {
+      RDecl(e1, d1) -> chk_files_loop(e1, rest, df, [d1, ...acc])
+    }
   }
 }
 
@@ -878,7 +1011,7 @@ fn env_at_decl_home(f: Env, d: Decl, home: String) : Env =
   env_with_rs(f, rs_at_home(f.rs, decl_home_hint_reset(d, home, home)))
 
 fn env_with_file(e: Env, file: String) : Env =
-  Env { scopes: e.scopes, had_error: e.had_error, file: file, diags: e.diags, rs: e.rs }
+  Env { chain: e.chain, had_error: e.had_error, file: file, diags: e.diags, rs: e.rs }
 
 # Arity table built from every DEffect in the program. Effects are
 # declared in stdlib source and loaded before this runs, so every
