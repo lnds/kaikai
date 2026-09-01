@@ -522,6 +522,7 @@ fn record_kept_pos(i: Int) : Int =
 # the donor's recycled old child, the shape the reuse alias guard protects.
 fn record_fi_is_binder_read(v: Expr) : Bool = match v.kind {
   EVar(_)         -> true
+  ESym(_, _)         -> true
   ECall(f, dargs) -> match f.kind {
     EVar(fname) ->
       if fname == "__perceus_dup" {
@@ -721,6 +722,7 @@ pub fn expr_kind_name(k: ExprKind) : String {
     EStr(_, _)     -> "EStr"
     EUnit          -> "EUnit"
     EVar(_)        -> "EVar"
+    ESym(_, _)        -> "EVar"
     EUnder         -> "EUnder"
     EPlaceholder   -> "EPlaceholder"
     ECall(_, _)    -> "ECall"
@@ -954,6 +956,49 @@ pub fn find_lam(lams: [LamInfo], enc_fn: String, line: Int, col: Int) : Option[L
 # program's globals. We skip descent into nested ELambdas (each gets its
 # own capture set), and re-parse string interpolations so identifiers
 # hidden inside #{...} get captured too.
+# A free-name read, whether or not the resolver stamped its identity:
+# the name is what closure capture records either way.
+fn fv_name(name: String, own: [String], globals: [String], acc: [String]) : [String] {
+  # m7b #15 closure-capture: a tagged op call like
+  # `Eff.op@<alias>` rewrites to `EVar("Eff.op@alias")`. The
+  # name is *not* a real identifier — emit_call_expr splits the
+  # `@` and dispatches via `kai_alias_<alias>_id`. For closure
+  # capture purposes we record the alias under the sentinel
+  # name `__alias_id__<alias>`; the lambda emit decodes it back
+  # to `KaiHandlerId kai_alias_<alias>_id` in the body prologue.
+  let at_pos = string_index_of_at(name)
+  if at_pos >= 0 {
+    let alias = string_slice(name, at_pos + 1, string_length(name))
+    let cap_name = string_concat("__alias_id__", alias)
+    if list_has(own, alias) { acc }
+    else if list_has(acc, cap_name) { acc }
+    else { [cap_name, ...acc] }
+  }
+  # Issue #669: `__pcs_scr` / `__pcs_ret` / `__pcs_arm_ret` are
+  # synthetic identifiers inserted by Perceus passes that
+  # materialise as match-scoped C locals (`_scr`, etc.) at emit
+  # time, not as kaikai-level bindings. When a Perceus pass leaves
+  # one of these inside a lambda body, fv_expr would treat it as
+  # a free variable and ask the lambda to capture it — but no
+  # outer binding exists to capture, producing C output that
+  # references an undeclared identifier. They are never genuine
+  # free vars; suppress them here.
+  else if name == "__pcs_scr"     { acc }
+  else if name == "__pcs_ret"     { acc }
+  else if name == "__pcs_arm_ret" { acc }
+  # `__perceus_*` names are Perceus sentinels the emit dispatches (dup,
+  # drop, borrow, apply_borrow, owned_borrow, reuse) — never genuine
+  # free vars. When one lands as a call CALLEE inside a lifted lambda
+  # (e.g. `xs |> list.map(_, ^f)` splices `__perceus_owned_borrow(f)`
+  # into the placeholder lambda), fv_expr would ask the lambda to
+  # capture it → an undeclared `kai___perceus_*` in the C. Suppress.
+  else if string_starts_with_q(name, "__perceus_") { acc }
+  else if list_has(own, name) { acc }
+  else if list_has(globals, name) { acc }
+  else if list_has(acc, name) { acc }
+  else { [name, ...acc] }
+}
+
 #[doc("Free variables of an expression, given the lambda's own params and the program's globals. We skip descent into nested ELambdas (each gets its own capture set), and re-parse…")]
 pub fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] / Console {
 
@@ -967,46 +1012,8 @@ pub fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [Stri
     EChar(_) -> acc
     EStr(span, is_triple) -> fv_interp(span, is_triple, own, globals, acc)
     EUnit -> acc
-    EVar(name) -> {
-      # m7b #15 closure-capture: a tagged op call like
-      # `Eff.op@<alias>` rewrites to `EVar("Eff.op@alias")`. The
-      # name is *not* a real identifier — emit_call_expr splits the
-      # `@` and dispatches via `kai_alias_<alias>_id`. For closure
-      # capture purposes we record the alias under the sentinel
-      # name `__alias_id__<alias>`; the lambda emit decodes it back
-      # to `KaiHandlerId kai_alias_<alias>_id` in the body prologue.
-      let at_pos = string_index_of_at(name)
-      if at_pos >= 0 {
-        let alias = string_slice(name, at_pos + 1, string_length(name))
-        let cap_name = string_concat("__alias_id__", alias)
-        if list_has(own, alias) { acc }
-        else if list_has(acc, cap_name) { acc }
-        else { [cap_name, ...acc] }
-      }
-      # Issue #669: `__pcs_scr` / `__pcs_ret` / `__pcs_arm_ret` are
-      # synthetic identifiers inserted by Perceus passes that
-      # materialise as match-scoped C locals (`_scr`, etc.) at emit
-      # time, not as kaikai-level bindings. When a Perceus pass leaves
-      # one of these inside a lambda body, fv_expr would treat it as
-      # a free variable and ask the lambda to capture it — but no
-      # outer binding exists to capture, producing C output that
-      # references an undeclared identifier. They are never genuine
-      # free vars; suppress them here.
-      else if name == "__pcs_scr"     { acc }
-      else if name == "__pcs_ret"     { acc }
-      else if name == "__pcs_arm_ret" { acc }
-      # `__perceus_*` names are Perceus sentinels the emit dispatches (dup,
-      # drop, borrow, apply_borrow, owned_borrow, reuse) — never genuine
-      # free vars. When one lands as a call CALLEE inside a lifted lambda
-      # (e.g. `xs |> list.map(_, ^f)` splices `__perceus_owned_borrow(f)`
-      # into the placeholder lambda), fv_expr would ask the lambda to
-      # capture it → an undeclared `kai___perceus_*` in the C. Suppress.
-      else if string_starts_with_q(name, "__perceus_") { acc }
-      else if list_has(own, name) { acc }
-      else if list_has(globals, name) { acc }
-      else if list_has(acc, name) { acc }
-      else { [name, ...acc] }
-    }
+    EVar(name) -> fv_name(name, own, globals, acc)
+    ESym(_, name) -> fv_name(name, own, globals, acc)
     EUnder -> acc
     EPlaceholder -> acc
     ECall(f, xs) -> fv_exprs(xs, own, globals, fv_expr(f, own, globals, acc))
@@ -1411,6 +1418,7 @@ pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
     EStr(span, is_triple) -> collect_interp(span, is_triple, st)
     EUnit -> st
     EVar(_) -> st
+    ESym(_, _) -> st
     EUnder -> st
     EPlaceholder -> st
     ECall(f, xs) -> collect_exprs(xs, collect_expr(f, st))
@@ -3321,6 +3329,7 @@ pub fn map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EStr(_, _)     -> k
     EUnit          -> k
     EVar(_)        -> k
+    ESym(_, _)        -> k
     EUnder         -> k
     EPlaceholder   -> k
     EHole(_)       -> k
