@@ -1,0 +1,171 @@
+#[doc("""
+Decide a contested bare call once, before the typer and the emitter each
+decide it for themselves.
+
+Two lookups answer the same question over the same declaration stream in
+opposite orders: the typer's environment is newest-first, the emitter's
+`EFn` table is stream-first. When a name is exported by more than one
+module and nothing shadows it, they pick different functions — the typer
+types one call and codegen emits the other.
+
+Rather than keep two tie-breaks in step, the ambiguity is settled here
+and the call is rewritten to the qualified form both already agree on.
+The rung that settles it is §4's: an import is an explicit declaration
+at the head of the file, so it outranks the core, which arrives
+implicitly. An ambiguity the core cannot settle is left alone for the
+existing warning to report.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.fnreg
+import compiler.infer
+import compiler.modules
+import compiler.util
+
+#[doc("Rewrite each root-file bare call whose arity only the import's candidate accepts into a qualified call on that import.")]
+pub fn bp_decls(ds: [Decl], fns: [EFn], cores: [String], target: String) : [Decl] = {
+  let picks = bp_picks(fns, fns, cores, [], [])
+  if list_length(picks) == 0 { ds } else { bp_map_decls(ds, picks, target) }
+}
+
+# One decision per contested name: `BP(name, winning module, its arity)`.
+# The arity is what makes the rewrite safe to apply: only a call the
+# core's candidate cannot accept is redirected, so a bare name that
+# resolves today keeps resolving to what it resolves to now.
+type BPick = BP(String, String, Int)
+
+fn bp_lookup(ps: [BPick], n: String, nargs: Int) : Option[String] = match ps {
+  [] -> None
+  [BP(name, home, ar), ...rest] ->
+    if name == n and ar == nargs { Some(home) } else { bp_lookup(rest, n, nargs) }
+}
+
+# Only a nullary declaration outside the core can ever win a name here,
+# and a program has very few of those. Narrowing the candidate set first
+# keeps the quadratic scan below off the whole table: a self-compile
+# carries thousands of declarations but a handful of nullary ones.
+fn bp_picks(all: [EFn], todo: [EFn], cores: [String], seen: [String],
+            acc: [BPick]) : [BPick] = match todo {
+  [] -> list_reverse(acc)
+  [f, ...rest] -> match f {
+    EFn(n, ar, mo, _, _) ->
+      if ar != 0 or bp_is_core(mo, cores) or list_has(seen, n) {
+        bp_picks(all, rest, cores, seen, acc)
+      } else {
+        bp_picks(all, rest, cores, [n, ...seen], bp_pick_one(all, n, cores, acc))
+      }
+  }
+}
+
+fn bp_is_core(mo: Option[String], cores: [String]) : Bool = match mo {
+  None    -> true
+  Some(m) -> list_has(cores, m)
+}
+
+fn bp_pick_one(all: [EFn], n: String, cores: [String], acc: [BPick]) : [BPick] = {
+  let cands = efn_collect_matching(all, n, [])
+  if list_length(cands) <= 1 { acc }
+  else { match efn_pick_root(cands) {
+    # A root-file declaration already wins for every consumer.
+    Some(_) -> acc
+    None -> match bp_non_core_homes(cands, cores, []) {
+      [home] -> bp_pick_arity(cands, n, home, acc)
+      _      -> acc
+    }
+  } }
+}
+
+# Only a nullary call is redirected. A nullary name carries no argument
+# shape for either resolver to discriminate on, which is exactly where
+# the two disagreed; at any other arity both readings stay live and the
+# bare call keeps resolving as it does today — `import collections.map`
+# beside a bare `map(xs, f)` still means the core's list `map`.
+fn bp_pick_arity(cands: [EFn], n: String, home: String, acc: [BPick]) : [BPick] =
+  if list_has_int(bp_home_arities(cands, home, []), 0) { [BP(n, home, 0), ...acc] }
+  else { acc }
+
+fn bp_home_arities(cands: [EFn], home: String, acc: [Int]) : [Int] = match cands {
+  [] -> acc
+  [EFn(_, ar, mo, _, _), ...rest] -> match mo {
+    Some(m) -> if m == home and not list_has_int(acc, ar) {
+                 bp_home_arities(rest, home, [ar, ...acc])
+               } else { bp_home_arities(rest, home, acc) }
+    None    -> bp_home_arities(rest, home, acc)
+  }
+}
+
+
+
+
+# The candidate homes that are not core modules. Exactly one means the
+# core is the only other claimant, and the import takes the name.
+fn bp_non_core_homes(cands: [EFn], cores: [String], acc: [String]) : [String] = match cands {
+  [] -> list_reverse(acc)
+  [EFn(_, _, mo, _, _), ...rest] -> match mo {
+    None -> bp_non_core_homes(rest, cores, acc)
+    Some(m) ->
+      if list_has(cores, m) or list_has(acc, m) { bp_non_core_homes(rest, cores, acc) }
+      else { bp_non_core_homes(rest, cores, [m, ...acc]) }
+  }
+}
+
+# Only root-file bodies are rewritten: a module body resolves its own
+# bare names against its own module first, which the emitter's table
+# rotation already reflects.
+fn bp_map_decls(ds: [Decl], ps: [BPick], target: String) : [Decl] = match ds {
+  [] -> []
+  [d, ...rest] -> [bp_decl(d, ps, target), ...bp_map_decls(rest, ps, target)]
+}
+
+fn bp_decl(d: Decl, ps: [BPick], target: String) : Decl = match d {
+  DFn(p, n, tps, params, ret, row, body, l, c, mo) ->
+    if bp_is_root(mo, target) {
+      DFn(p, n, tps, params, ret, row,
+          bp_expr(body, ps, fn_param_names(params)), l, c, mo)
+    } else { d }
+  DTest(desc, body, l, c, mo) ->
+    if bp_is_root(mo, target) { DTest(desc, bp_expr(body, ps, []), l, c, mo) } else { d }
+  DBench(desc, body, l, c, mo) ->
+    if bp_is_root(mo, target) { DBench(desc, bp_expr(body, ps, []), l, c, mo) } else { d }
+  DCheck(desc, params, body, l, c, mo) ->
+    if bp_is_root(mo, target) {
+      DCheck(desc, params, bp_expr(body, ps, fn_param_names(params)), l, c, mo)
+    } else { d }
+  _ -> d
+}
+
+fn bp_is_root(mo: Option[String], target: String) : Bool = match mo {
+  None    -> true
+  Some(m) -> m == target
+}
+
+fn bp_expr(e: Expr, ps: [BPick], sh: [String]) : Expr = match e.kind {
+  ECall(callee, args_) -> match callee.kind {
+    EVar(n) -> {
+      let args1 = bp_exprs(args_, ps, sh)
+      if list_has(sh, n) { bp_re(e, ECall(callee, args1)) }
+      else { match bp_lookup(ps, n, list_length(args_)) {
+        Some(home) -> bp_re(e, ECall(bp_re(callee, EModCall(home, n)), args1))
+        None       -> bp_re(e, ECall(callee, args1))
+      } }
+    }
+    _ -> bp_re(e, ECall(bp_expr(callee, ps, sh), bp_exprs(args_, ps, sh)))
+  }
+  # Binders are not tracked past the call's own scope: a shadowed name is
+  # left alone, which is the conservative direction — the rewrite only
+  # ever fires on a name nothing local claims.
+  ELambda(params, body) -> bp_re(e, ELambda(params, bp_expr(body, ps, list_append(fn_param_names(params), sh))))
+  _ -> bp_re(e, bp_positions_kind(e, ps, sh))
+}
+
+fn bp_re(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn bp_positions_kind(e: Expr, ps: [BPick], sh: [String]) : ExprKind =
+  prc_map_expr_kind(e.kind, (x) => bp_expr(x, ps, sh))
+
+fn bp_exprs(es: [Expr], ps: [BPick], sh: [String]) : [Expr] = match es {
+  [] -> []
+  [h, ...rest] -> [bp_expr(h, ps, sh), ...bp_exprs(rest, ps, sh)]
+}
