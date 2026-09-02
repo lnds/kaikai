@@ -1,37 +1,23 @@
 #[doc("""
-In-process gates for the resolver's use table, run behind
-`--resolve-sym-selftest`.
+Gates on what the resolver stamps into the tree.
 
-`symtab_test.kai` proves the table answers correctly when asked. These
-gates prove the resolver actually asks: they run the real walk over a
-real declaration stream and read what it recorded.
+The subject is the rewritten declaration stream, not a side table: a
+resolved reference is an `ESym` carrying the id, and that is what every
+pass downstream reads. Asserting against anything else would test a
+transport the compiler no longer has.
 
-That distinction is the whole point. The table, its builder and the
-recording entry point can all be correct and still be dead, because
-nothing in the pipeline calls them — which is what they were. A gate
-over the table alone cannot tell the two states apart; a gate over the
-walk can.
-
-The properties:
-
-1. **A call to a top-level declaration resolves to its symbol.** The
-   resolver seeds declarations and the core into its outermost scope,
-   so a naive "is this name in scope" test reads every such use as
-   shadowed and records `URLocal`. A use that reaches `URSym` is the
-   evidence the depth test is live.
-2. **A binder shadows the declaration it hides.** The same name, bound
-   as a parameter, records `URLocal` — so the two answers come from the
-   binding structure and not from the spelling.
-3. **A use resolves inside its own home.** Two homes declaring one name
-   each answer their own reader, decided by owner id.
+Four properties, each the negation of a defect the string-keyed resolver
+kept reproducing: a call reaches its declaration, a binder shadows one,
+a local is never stamped as a declaration, and two homes declaring one
+name reach two different ids.
 """)]
 
 import compiler.ast
 import compiler.diag_file
 import compiler.resolve
-import compiler.usetab
+import compiler.symtab
 
-# `fn <n>() = <body>`, homed in `mo`.
+# `pub fn <n>() = <body>`, homed in `mo`.
 fn rst_fn(n: String, mo: Option[String], body: Expr) : Decl =
   DFn(true, n, [], [], None, REmpty, body, 0, 0, mo)
 
@@ -44,86 +30,78 @@ fn rst_param(p: String) : Param =
 
 fn rst_var(n: String) : Expr = mk_expr(EVar(n), 0, 0)
 
-# The resolution of a decl stream whose untagged decls are homed in
-# `root`, with recording on.
-fn rst_resolve(ds: [Decl]) : UseTab / Console + File =
-  resolve_program(diag_files_flat("t.kai"), ds, "root").uses
+# The stamped stream for a decl list whose untagged decls are homed in `root`.
+fn rst_resolve(ds: [Decl]) : [Decl] / Console + File =
+  resolve_program(diag_files_flat("t.kai"), ds, "root").decls
 
-# What the walk recorded for the first use site naming `n`.
-fn rst_res_of(t: UseTab, n: String, i: Int) : Option[UseRes] =
-  if i >= ut_count(t) { None }
-  else if ut_name(t, i) == n { Some(ut_res(t, i)) }
-  else { rst_res_of(t, n, i + 1) }
-
-fn rst_is_sym(r: Option[UseRes]) : Bool = match r {
-  Some(URSym(_)) -> true
-  _              -> false
+# The body of the declaration named `n`.
+fn rst_body_of(ds: [Decl], n: String) : Option[Expr] = match ds {
+  [] -> None
+  [d, ...rest] -> match d {
+    DFn(_, dn, _, _, _, _, body, _, _, _) ->
+      if dn == n { Some(body) } else { rst_body_of(rest, n) }
+    _ -> rst_body_of(rest, n)
+  }
 }
 
-fn rst_is_local(r: Option[UseRes]) : Bool = match r {
-  Some(URLocal) -> true
-  _             -> false
+# The id a body's reference carries, or `None` when it stayed a spelling.
+fn rst_sym_in(ds: [Decl], caller: String) : Option[SymId] =
+  match rst_body_of(ds, caller) {
+    None    -> None
+    Some(b) -> match b.kind { ESym(s, _) -> Some(s)  _ -> None }
+  }
+
+fn rst_is_sym(o: Option[SymId]) : Bool = match o {
+  Some(_) -> true
+  None    -> false
 }
 
-fn rst_sym_id(r: Option[UseRes]) : Option[Int] = match r {
-  Some(URSym(i)) -> Some(i)
-  _              -> None
-}
-
-# A bare call to a declared function must reach that declaration, not
-# read as a local. This is the gate that fails when the resolver treats
-# its own pre-registered declarations as binders.
+# A call to a declaration carries its id.
 fn rst_call_reaches_decl() : Bool / Console + File {
-  let uses = rst_resolve([rst_fn("helper", None, mk_expr(EUnit, 0, 0)),
-                          rst_fn("caller", None, rst_var("helper"))])
-  rst_is_sym(rst_res_of(uses, "helper", 0))
+  let ds = rst_resolve([rst_fn("helper", None, mk_expr(EUnit, 0, 0)),
+                        rst_fn("caller", None, rst_var("helper"))])
+  rst_is_sym(rst_sym_in(ds, "caller"))
 }
 
-# The same name bound as a parameter is a local, so the declaration it
-# hides is not what the use names.
+# A parameter shadows a declaration of the same name, so the use stays a
+# spelling: a local is not a declaration any consumer indexes.
 fn rst_binder_shadows_decl() : Bool / Console + File {
-  let uses = rst_resolve([rst_fn("x", None, mk_expr(EUnit, 0, 0)),
-                          rst_fn1("caller", "x", rst_var("x"))])
-  rst_is_local(rst_res_of(uses, "x", 0))
+  let ds = rst_resolve([rst_fn("x", None, mk_expr(EUnit, 0, 0)),
+                        rst_fn1("caller", "x", rst_var("x"))])
+  rst_is_sym(rst_sym_in(ds, "caller")) == false
 }
 
-# Two homes each declaring `dup`, each calling it: every use resolves,
-# and a reader reaches the declaration its own home owns.
+# Two homes each declaring `dup`, each calling it: a reader reaches the
+# declaration its own home owns, and the two ids differ — which no
+# spelling can say.
 fn rst_home_decides() : Bool / Console + File {
-  let uses = rst_resolve([rst_fn("dup", Some("alpha"), mk_expr(EUnit, 0, 0)),
-                          rst_fn("ua", Some("alpha"), rst_var("dup")),
-                          rst_fn("dup", Some("beta"), mk_expr(EUnit, 0, 0)),
-                          rst_fn("ub", Some("beta"), rst_var("dup"))])
-  rst_two_homes_differ(uses)
+  let ds = rst_resolve([rst_fn("dup", Some("alpha"), mk_expr(EUnit, 0, 0)),
+                        rst_fn("ua", Some("alpha"), rst_var("dup")),
+                        rst_fn("dup", Some("beta"), mk_expr(EUnit, 0, 0)),
+                        rst_fn("ub", Some("beta"), rst_var("dup"))])
+  rst_ids_differ(rst_sym_in(ds, "ua"), rst_sym_in(ds, "ub"))
 }
 
-# Both uses spell `dup`; the ids must differ, which no spelling can say.
-fn rst_two_homes_differ(t: UseTab) : Bool = match rst_sym_ids(t, "dup", 0, []) {
-  [a, b] -> a != b
-  _      -> false
+fn rst_ids_differ(a: Option[SymId], b: Option[SymId]) : Bool = match a {
+  None    -> false
+  Some(x) -> match b {
+    None    -> false
+    Some(y) -> sym_raw(x) != sym_raw(y)
+  }
 }
 
-fn rst_sym_ids(t: UseTab, n: String, i: Int, acc: [Int]) : [Int] =
-  if i >= ut_count(t) { list_reverse(acc) }
-  else if ut_name(t, i) == n {
-    match rst_sym_id(Some(ut_res(t, i))) {
-      Some(s) -> rst_sym_ids(t, n, i + 1, [s, ...acc])
-      None    -> rst_sym_ids(t, n, i + 1, acc)
-    }
-  } else { rst_sym_ids(t, n, i + 1, acc) }
-
-# The walk must record something: an empty table means the resolution
-# never ran, the state the pipeline was in before it was wired.
-fn rst_walk_records() : Bool / Console + File {
-  let uses = rst_resolve([rst_fn("helper", None, mk_expr(EUnit, 0, 0)),
-                          rst_fn("caller", None, rst_var("helper"))])
-  ut_count(uses) > 0
+# The walk must stamp something: a stream whose every reference stayed a
+# spelling is the state the pipeline was in before it was wired.
+fn rst_walk_stamps() : Bool / Console + File {
+  let ds = rst_resolve([rst_fn("helper", None, mk_expr(EUnit, 0, 0)),
+                        rst_fn("caller", None, rst_var("helper"))])
+  rst_is_sym(rst_sym_in(ds, "caller"))
 }
 
-#[doc("Runs every resolver use-table gate. Returns a line starting `OK` on success, `FAIL:` otherwise.")]
+#[doc("Runs every resolver stamping gate. Returns a line starting `OK` on success, `FAIL:` otherwise.")]
 pub fn resolve_sym_selftest() : String / Console + File =
-  if rst_walk_records() == false { "FAIL: the resolver recorded no use sites" }
-  else if rst_call_reaches_decl() == false { "FAIL: a call to a declaration recorded as a local" }
+  if rst_walk_stamps() == false { "FAIL: the resolver stamped no reference" }
+  else if rst_call_reaches_decl() == false { "FAIL: a call to a declaration was not stamped" }
   else if rst_binder_shadows_decl() == false { "FAIL: a parameter did not shadow the declaration" }
   else if rst_home_decides() == false { "FAIL: two homes resolved one name to one symbol" }
   else { "OK resolve-sym (4 gates)" }

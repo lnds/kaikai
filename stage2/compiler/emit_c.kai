@@ -45,6 +45,7 @@
 # compiler.protos, and compiler.emit_shared (the backend-shared layer).
 
 import compiler.ast
+import compiler.sym_read
 import compiler.diag_file
 import compiler.kinds
 import compiler.home_tu
@@ -450,13 +451,13 @@ fn efn_find(fns: [EFn], target: String) : Option[EFn] {
   match fns {
     [] -> None
     [h, ...rest] -> match h {
-      EFn(n, _, _, _) -> if n == target { Some(h) } else { efn_find(rest, target) }
+      EFn(n, _, _, _, _) -> if n == target { Some(h) } else { efn_find(rest, target) }
     }
   }
 }
 
 fn efn_find_arity(fns: [EFn], target: String) : Option[Int] = match efn_resolve(fns, target) {
-  Some(EFn(_, ar, _, _)) -> Some(ar)
+  Some(EFn(_, ar, _, _, _)) -> Some(ar)
   None                   -> None
 }
 
@@ -521,7 +522,7 @@ fn find_ambig_loop(fns: [EFn], target_origin: Option[String], seen: [String], ac
   match fns {
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
-      EFn(n, _, _, _) ->
+      EFn(n, _, _, _, _) ->
         # Protocol dispatchers are one per (op, home) by construction;
         # the receiver picks among them, so they are never a bare-name
         # ambiguity.
@@ -563,8 +564,8 @@ fn ambig_mods_of(cands: [EFn], acc: [String]) : [String] {
   match cands {
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
-      EFn(_, _, None, _)    -> ambig_mods_of(rest, acc)
-      EFn(_, _, Some(m), _) ->
+      EFn(_, _, None, _, _)    -> ambig_mods_of(rest, acc)
+      EFn(_, _, Some(m), _, _) ->
         if list_has(acc, m) { ambig_mods_of(rest, acc) }
         else                { ambig_mods_of(rest, [m, ...acc]) }
     }
@@ -685,7 +686,7 @@ fn walk_reuse_ctors(e: Expr, acc: [String]) : [String] = {
   # We reuse the existing full ExprKind walker to descend; it already
   # visits every child, and the only node we care about adds a name.
   let acc1 = match e.kind {
-    ECall(callee, args_) -> match callee.kind {
+    ECall(callee, args_) -> match sym_read_kind(callee.kind) {
       EVar(nm) ->
         if nm == "__perceus_reuse_variant" {
           match args_ {
@@ -844,7 +845,7 @@ fn walk_bare_callees(e: Expr, acc: [String]) : [String] = match e.kind {
   EIntrinsic(_, args_) -> walk_bare_callees_list(args_, acc)
   ESurface(sf) -> walk_bare_callees_list(surface_children(sf), acc)
   ECall(callee, args_) -> {
-    let acc1 = match callee.kind {
+    let acc1 = match sym_read_kind(callee.kind) {
       EVar(name) -> if list_has(acc, name) { acc } else { [name, ...acc] }
       _          -> walk_bare_callees(callee, acc)
     }
@@ -1551,7 +1552,7 @@ fn emit_ident_value(name: String, lcs: [String], fns: [EFn], variants: [VariantE
           cat5("kai_closure(&_", cname, "_thunk, ", int_to_string(ar), ", 0, NULL)")
       }
       None -> match efn_resolve(fns, name) {
-        Some(EFn(_, ar, mo, _)) ->
+        Some(EFn(_, ar, mo, _, _)) ->
           cat5("kai_closure(&", c_user_thunk_sym(c_sym(name, mo)), ", ", int_to_string(ar), ", 0, NULL)")
         None -> c_local(name)
       }
@@ -1975,7 +1976,7 @@ pub fn mono_sum_decls(decls: [Decl], enums: [String]) : String = match decls {
 fn nullary_ctor_tag(e: Expr, cx: EmitCtx) : Option[Int] = match e.kind {
   EVar(nm) -> evar_find_tag_opt(cx.variants, nm)
   ECall(callee, args_) -> match args_ {
-    [] -> match callee.kind {
+    [] -> match sym_read_kind(callee.kind) {
       EVar(nm) -> evar_find_tag_opt(cx.variants, nm)
       _        -> None
     }
@@ -2237,7 +2238,7 @@ fn emit_args_have_owned_borrow(args_e: [Expr]) : Bool = match args_e {
 }
 
 fn emit_is_owned_borrow(a: Expr) : Bool = match a.kind {
-  ECall(callee, _) -> match callee.kind {
+  ECall(callee, _) -> match sym_read_kind(callee.kind) {
     EVar(nm) -> nm == "__perceus_owned_borrow"
     _        -> false
   }
@@ -2322,11 +2323,11 @@ fn emit_ob_drops(args_e: [Expr], i: Int) : String = match args_e {
 # original boxed-only dispatch.
 fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option[String] / Console {
 
-  match f.kind {
+  match sym_read_kind(f.kind) {
     EVar(callee) ->
       if list_has(cx.lcs, callee) { None }
-      else { match efn_resolve(cx.fns, callee) {
-        Some(EFn(_, _, mo, Some(US(_, rt, mask)))) -> {
+      else { match efn_resolve_sym(cx.fns, ec_callee_sym(f), callee) {
+        Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) -> {
           let raw_args = emit_call_args_masked(src, args_e, mask, cx)
           let raw_call = emit_user_call(c_sym(callee, mo), raw_args, cx)
           Some(ufn_call_result(rt, raw_call))
@@ -2345,13 +2346,14 @@ fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Opti
   }
 }
 
-# A resolved reference emits as the name it carries: identity picked the
-# declaration, and the C symbol is derived from it downstream. Every emit
-# path that spells an identifier reads through here, so neither shape
-# needs its own copy of the dispatch.
-fn ec_name_kind(k: ExprKind) : ExprKind = match k {
-  ESym(_, n) -> EVar(n)
-  _          -> k
+
+
+# The identity a callee carries, or none when the reference was never
+# stamped. Read before the kind is normalised to a spelling, so the
+# lookup can answer by declaration rather than by name.
+fn ec_callee_sym(f: Expr) : SymId = match f.kind {
+  ESym(s, _) -> s
+  _          -> sym_none()
 }
 
 fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
@@ -2360,7 +2362,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
   # The emitter spells a C identifier from the name, and a resolved
   # reference carries the same one, so the two shapes share this whole
   # dispatch rather than duplicating it.
-  match ec_name_kind(f.kind) {
+  match sym_read_kind(f.kind) {
     EVar(callee) -> {
       # m7a #6d: `resume(v)` lowers to a runtime call that performs
       # the one-shot status check, flips the status, and tail-calls
@@ -2857,9 +2859,9 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
         match evar_payload_tys_arity(cx.variants, None, callee, list_length(args_e)) {
           Some(tys) -> match emit_variant_call_typed(None, callee, args_e, tys, src, cx) {
             Some(s) -> s
-            None    -> emit_named_call_lookup(src, callee, args_e, call_args, cx)
+            None    -> emit_named_call_lookup(src, callee, ec_callee_sym(f), args_e, call_args, cx)
           }
-          None -> emit_named_call_lookup(src, callee, args_e, call_args, cx)
+          None -> emit_named_call_lookup(src, callee, ec_callee_sym(f), args_e, call_args, cx)
         }
       }
     }
@@ -2977,7 +2979,7 @@ fn emit_pipe_named_lookup(src: String, callee: String, arity: Int, lhs_c: String
         EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
       }
       None -> match efn_resolve(cx.fns, callee) {
-        Some(EFn(_, _, mo, _)) -> emit_user_call(c_sym(callee, mo), args_all, cx)
+        Some(EFn(_, _, mo, _, _)) -> emit_user_call(c_sym(callee, mo), args_all, cx)
         None -> {
           emit_guard_no_intrinsic_mint(callee)
           concat_all([
@@ -3000,7 +3002,7 @@ fn emit_pipe_named_lookup(src: String, callee: String, arity: Int, lhs_c: String
 # closure-thunk emission from the same lookup chain. `lcs` lets a
 # local closure shadow a same-named top-level fn (see
 # emit_pipe_named_lookup).
-fn emit_named_call_lookup(src: String, callee: String, args_e: [Expr], call_args: String, cx: EmitCtx) : String / Console =
+fn emit_named_call_lookup(src: String, callee: String, csym: SymId, args_e: [Expr], call_args: String, cx: EmitCtx) : String / Console =
   if list_has(cx.lcs, callee) {
     concat_all([
       "kai_apply(", c_local(callee), ", ", int_to_string(list_length(args_e)),
@@ -3028,8 +3030,8 @@ fn emit_named_call_lookup(src: String, callee: String, args_e: [Expr], call_args
       Some(ep) -> match ep {
         EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
       }
-      None -> match efn_resolve(cx.fns, callee) {
-        Some(EFn(_, _, mo, _)) -> emit_user_call(c_sym(callee, mo), call_args, cx)
+      None -> match efn_resolve_sym(cx.fns, csym, callee) {
+        Some(EFn(_, _, mo, _, _)) -> emit_user_call(c_sym(callee, mo), call_args, cx)
         None -> {
           emit_guard_no_intrinsic_mint(callee)
           concat_all([
@@ -3141,7 +3143,7 @@ fn evf_require_walk(eff: String) : String =
 fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Console {
 
   match rhs.kind {
-    ECall(f, args_e) -> match f.kind {
+    ECall(f, args_e) -> match sym_read_kind(f.kind) {
       # Phase 3 unboxing — pipe into a UFn callee. The piped LHS
       # becomes the first arg; both LHS and the trailing args are
       # emitted raw via `emit_expr_raw`. Without this branch the
@@ -3155,8 +3157,8 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Con
           let rest_args = emit_call_args(src, args_e, cx)
           let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
           emit_pipe_named_lookup(src, callee, list_length(args_e) + 1, lhs_c, args_e, args_all, cx)
-        } else { match efn_resolve(cx.fns, callee) {
-          Some(EFn(_, _, mo, Some(US(_, rt, mask)))) -> {
+        } else { match efn_resolve_sym(cx.fns, ec_callee_sym(rhs), callee) {
+          Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) -> {
             # Pipe: LHS is param 0, args_e are params 1+. Marshal each
             # per the mask (mixed-param lane, issue #440 follow-up).
             let lhs_raw = pipe_arg_masked(src, lhs, mask, 0, cx)
@@ -3207,8 +3209,8 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Con
       if list_has(cx.lcs, callee) {
         let lhs_c = emit_expr(src, lhs, cx)
         emit_pipe_named_lookup(src, callee, 1, lhs_c, [], lhs_c, cx)
-      } else { match efn_resolve(cx.fns, callee) {
-        Some(EFn(_, _, mo, Some(US(_, rt, mask)))) -> {
+      } else { match efn_resolve_sym(cx.fns, ec_callee_sym(rhs), callee) {
+        Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) -> {
           let lhs_raw = pipe_arg_masked(src, lhs, mask, 0, cx)
           let raw_call = emit_user_call(c_sym(callee, mo), lhs_raw, cx)
           ufn_call_result(rt, raw_call)
@@ -3272,7 +3274,7 @@ fn emit_range_expr(src: String, from: Expr, to: Expr, opt_step: Option[Expr],
 # the cell, blocking `kai_check_unique` on the recursive accumulator
 # spine and leaking +1 reference per iteration.
 fn is_perceus_dup_call(e: Expr) : Bool = match e.kind {
-  ECall(callee, _) -> match callee.kind {
+  ECall(callee, _) -> match sym_read_kind(callee.kind) {
     EVar(nm) -> nm == "__perceus_dup"
     _ -> false
   }
@@ -3342,7 +3344,7 @@ fn emit_field_init_name(fi: FieldInit) : String {
 # on (v, i) matches the vec_get variant it replaces; no record, no
 # base drop.
 fn emit_vec_get_field_fused(src: String, base: Expr, fname: String, cx: EmitCtx) : Option[String] / Console = match base.kind {
-  ECall(f, args_e) -> match f.kind {
+  ECall(f, args_e) -> match sym_read_kind(f.kind) {
     EVar(callee) ->
       if (callee == "vec_get" or callee == "vec_get_borrow") and not cx.in_region {
         match vec_rec_field_slot(cx.recs, base.ty, fname) {
@@ -3370,7 +3372,7 @@ fn emit_vec_get_field_fused(src: String, base: Expr, fname: String, cx: EmitCtx)
 # field values (compound literals, the __perceus_reuse_record idiom).
 # Field order is the desugar-canonicalised declaration order — the
 # same layout bet the constant-index record read makes.
-fn emit_vec_write_rec_fused(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option[String] / Console = match f.kind {
+fn emit_vec_write_rec_fused(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option[String] / Console = match sym_read_kind(f.kind) {
   EVar(callee) -> {
     if callee == "vec_push" and not cx.in_region {
       match args_e {
@@ -4071,7 +4073,7 @@ fn try_reuse_cons_arm(pat: Pattern, body: Expr) : Option[ReuseConsArm] {
     PList(pats, opt_rest) -> match opt_rest {
       Some(rest_name) -> match pats {
         [head_pat] -> match body.kind {
-          ECall(callee, call_args) -> match callee.kind {
+          ECall(callee, call_args) -> match sym_read_kind(callee.kind) {
             EVar(callee_name) ->
               if callee_name == "__perceus_reuse_cons" {
                 match call_args {
@@ -4284,7 +4286,7 @@ fn arm_tail_consumes_kind(k: ExprKind) : Bool = match k {
   # A tail ECall is acceptable ONLY if it is a TRMC step sentinel or a TRMC
   # apply of a constructor rebuild (the token is consumed building the node).
   # Any other call (balance_left, …) does NOT consume the token → reject.
-  ECall(f, xs) -> match f.kind {
+  ECall(f, xs) -> match sym_read_kind(f.kind) {
     EVar(callee) ->
       if trmc_is_step_sentinel(callee) { true }
       else if trmc_is_apply_sentinel(callee) { arm_apply_is_ctor(xs) }
@@ -4382,7 +4384,7 @@ fn arm_bare_use_kind(nm: String, k: ExprKind) : Bool = match k {
 
 # In a call, a bare `EVar(nm)` directly as an arg is a moved use UNLESS
 # the call is `__perceus_dup(nm)` (that arg is a dup, not a move).
-fn arm_call_bare_use(nm: String, f: Expr, xs: [Expr]) : Bool = match f.kind {
+fn arm_call_bare_use(nm: String, f: Expr, xs: [Expr]) : Bool = match sym_read_kind(f.kind) {
   EVar(callee) -> if callee == "__perceus_dup" { false }
                   else { arm_binder_has_bare_use(nm, f) or arm_bare_use_seq(nm, xs) }
   _ -> arm_binder_has_bare_use(nm, f) or arm_bare_use_seq(nm, xs)
@@ -5028,7 +5030,7 @@ fn rv_any_nested_ctor(cargs: [Expr]) : Bool = match cargs {
   []           -> false
   [e, ...rest] -> {
     let here = match e.kind {
-      ECall(f, xs) -> match f.kind {
+      ECall(f, xs) -> match sym_read_kind(f.kind) {
         EVar(c)        -> name_first_is_upper(c) and rv_nonempty(xs)
         EModCall(_, c) -> name_first_is_upper(c) and rv_nonempty(xs)
         _              -> false
@@ -5433,7 +5435,7 @@ fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : String 
 # exit (the owner up the call stack reclaims it). Returns the inner
 # scrutinee expr when the wrap is present.
 fn match_borrow_inner(scrut: Expr) : Option[Expr] = match scrut.kind {
-  ECall(callee, args_) -> match callee.kind {
+  ECall(callee, args_) -> match sym_read_kind(callee.kind) {
     EVar(nm) -> if nm == "__perceus_borrow" {
       match args_ { [inner] -> Some(inner) _ -> None }
     } else { None }
@@ -7031,7 +7033,7 @@ fn ty_te_is_int(te: TypeExpr) : Bool = match te.tkind {
 }
 
 fn unwrap_perceus_dup_for_borrow(x: Expr) : Expr = match x.kind {
-  ECall(callee, args_) -> match callee.kind {
+  ECall(callee, args_) -> match sym_read_kind(callee.kind) {
     EVar(nm) ->
       if nm == "__perceus_dup" {
         match args_ {
@@ -7377,15 +7379,15 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
 # unbox boundary form.
 fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option[String] / Console {
 
-  match f.kind {
+  match sym_read_kind(f.kind) {
     EVar(callee) ->
       if list_has(cx.lcs, callee) { None }
-      else { match efn_resolve(cx.fns, callee) {
+      else { match efn_resolve_sym(cx.fns, ec_callee_sym(f), callee) {
         # Mixed-param lane: only take the raw-call path when the callee
         # RETURNS raw (a raw context cannot consume a boxed result).
         # Args are still marshalled per the mask — boxed params pass
         # `KaiValue *`, raw params pass scalars.
-        Some(EFn(_, _, mo, Some(US(_, rt, mask)))) ->
+        Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) ->
           if ty_is_unboxable_t(rt) {
             Some(emit_ufn_raw_call_go(src, c_sym(callee, mo), args_e, mask, rt, cx))
           } else { None }
@@ -7433,10 +7435,10 @@ fn emit_expr(src: String, x: Expr, cx: EmitCtx) : String / Console {
 
 fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
 
-  # `ec_name_kind` has already folded `ESym` into `EVar`, so the arm
+  # `sym_read_kind` has already folded `ESym` into `EVar`, so the arm
   # below is unreachable; it exists because exhaustiveness is checked on
   # the constructor, not on what the normaliser can still produce.
-  match ec_name_kind(x.kind) {
+  match sym_read_kind(x.kind) {
     ESym(_, name) -> emit_ident_value(name, cx.lcs, cx.fns, cx.variants, cx.core)
     # Fix B (bidirectional list literals): when an Int literal is
     # checked against a Byte-context (e.g. inside `let bs: [Byte] = [65, 66]`),
@@ -7775,7 +7777,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
         None -> match const_body_of(cx.consts, fname) {
         Some(body) -> emit_expr(src, body, cx)
         None -> match efn_resolve(cx.fns, fname) {
-          Some(EFn(_, ar, _, _)) ->
+          Some(EFn(_, ar, _, _, _)) ->
             cat5("kai_closure(&", c_user_thunk_sym(c_sym(fname, Some(mod))), ", ", int_to_string(ar), ", 0, NULL)")
           None -> c_local(fname)
         }
@@ -8284,7 +8286,7 @@ fn emit_clause_assignments(eff_name: String, cs: [HClause],
 
 fn expr_is_perceus_drop_call(x: Expr) : Bool {
   match x.kind {
-    ECall(callee, _) -> match callee.kind {
+    ECall(callee, _) -> match sym_read_kind(callee.kind) {
       EVar(nm) -> nm == "__perceus_drop" or nm == "__perceus_guard_drop"
       _ -> false
     }
@@ -10933,7 +10935,7 @@ fn desugar_op_calls_expr(e: Expr, effs: [String]) : Expr =
 
 fn desugar_op_calls_callee(callee: Expr, effs: [String]) : Expr {
   match callee.kind {
-    EField(base, op_name) -> match base.kind {
+    EField(base, op_name) -> match sym_read_kind(base.kind) {
       EVar(name) ->
         if list_has(effs, name) {
           mk_expr(EVar(string_concat(name, string_concat(".", op_name))),
@@ -11152,7 +11154,7 @@ fn desugar_interp_kind(k: ExprKind, cx: InterpCtx,
         lift_interp_string(span, body_start, body_end, cx, line, col)
       } else { k }
     }
-    ECall(c, args_) -> match c.kind {
+    ECall(c, args_) -> match sym_read_kind(c.kind) {
       EField(receiver, op_name) ->
         if list_has(cx.op_names, op_name) {
           let new_callee = mk_expr(EVar(proto_dispatcher_name(op_name)),
@@ -14111,7 +14113,7 @@ fn tcrec_modcall_is_self(callmod: String, own_mod: Option[String]) : Bool =
 
 fn tcrec_is_direct_self_call(e: Expr, nm: String, arity: Int, own_mod: Option[String]) : Bool =
   match e.kind {
-    ECall(f, xs) -> match f.kind {
+    ECall(f, xs) -> match sym_read_kind(f.kind) {
       EVar(callee)              -> callee == nm and list_length(xs) == arity
       EModCall(callmod, callee) -> callee == nm and list_length(xs) == arity and tcrec_modcall_is_self(callmod, own_mod)
       _ -> false
@@ -14137,7 +14139,7 @@ fn tcrec_expr_has_self_call(e: Expr, nm: String, arity: Int, own_mod: Option[Str
     EUnit               -> false
     EUnder              -> false
     ECall(f, xs) -> {
-      let here = match f.kind {
+      let here = match sym_read_kind(f.kind) {
         EVar(callee)              -> callee == nm and list_length(xs) == arity
         EModCall(callmod, callee) -> callee == nm and list_length(xs) == arity and tcrec_modcall_is_self(callmod, own_mod)
         _ -> false
@@ -14183,7 +14185,7 @@ fn tcrec_arms_have_self_call(arms: [Arm], nm: String, arity: Int, own_mod: Optio
 
 fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, own_mod: Option[String], scope: [String], cons_ok: Bool) : Bool {
   match k {
-    ECall(f, xs) -> match f.kind {
+    ECall(f, xs) -> match sym_read_kind(f.kind) {
       EVar(callee) ->
         if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
           true

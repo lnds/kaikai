@@ -64,13 +64,14 @@ import compiler.evidence
 import compiler.evidence_inject
 import compiler.fnreg
 import compiler.interp_check
-import compiler.bare_pick
 import compiler.pub_access
 import compiler.cell_promote
 import compiler.unbox
 import compiler.fn_index
 import compiler.rawsafe
+import compiler.bare_pick
 import compiler.perceus
+import compiler.sym_erase
 import compiler.purity
 import compiler.protos
 import compiler.home_tu
@@ -3644,7 +3645,7 @@ fn var_better(a: Option[String], cl: Int, cc: Int, name: String, ql: Int, qc: In
 }
 
 fn find_var_at_expr(e: Expr, ql: Int, qc: Int, acc: Option[String]) : Option[String] {
-  let a0 = match e.kind {
+  let a0 = match sym_read_kind(e.kind) {
     EVar(name) -> var_better(acc, e.line, e.col, name, ql, qc)
     _          -> acc
   }
@@ -3935,7 +3936,7 @@ fn compile_to_module_with_diags(file: String, decls: [Decl]) : ModuleWithDiags /
   let e0 = env_new(file)
   let e1 = add_all(e0, core_names())
   let e2 = register_decls(e1, decls)
-  let e3 = chk_decls(e2, decls)
+  let e3 = rds_env(chk_decls(e2, decls))
   let t3_diags = finalize_diags(e3.diags)
   let r = infer_program(file, decls, false)
   ModuleWithDiags {
@@ -5293,8 +5294,10 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let nursery_rw = rewrite_nursery_caps_decls(interp_decls, diag_ctx)
             # Settle a bare call the core and one import both claim,
             # before the typer and the emitter each settle it their own
-            # way and disagree. §4: an import is explicit, the core is
-            # not, so the import takes the name.
+            # way and disagree. The rung is "an import is explicit, the
+            # core is not" — a precedence the scope chain does not model:
+            # `ru_pick` knows "declared in my own home" and "contested",
+            # with no rank between two foreign homes.
             let all_decls = bp_decls(nursery_rw.decls,
                                      register_fn_decls(nursery_rw.decls),
                                      core_mod_names(core_mods, []),
@@ -5350,39 +5353,57 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
               MEnv -> { dump_env(build_ty_env(all_decls).env); 0 }
               MInfer -> dump_infer(path, all_decls)
               MDumpTyped -> {
-                let chk = check_program(diag_ctx, all_decls, target_mod_name)
+                let rd = resolve_decls(diag_ctx, all_decls, target_mod_name)
+                let chk = rd.errs
+                let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_typed(path, all_decls) }
               }
               MDumpTypedCore -> {
-                let chk = check_program(diag_ctx, all_decls, target_mod_name)
+                let rd = resolve_decls(diag_ctx, all_decls, target_mod_name)
+                let chk = rd.errs
+                let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_typed_core(path, all_decls) }
               }
               MDumpMono -> {
-                let chk = check_program(diag_ctx, all_decls, target_mod_name)
+                let rd = resolve_decls(diag_ctx, all_decls, target_mod_name)
+                let chk = rd.errs
+                let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_mono(path, all_decls) }
               }
               MDumpMonoOut -> {
-                let chk = check_program(diag_ctx, all_decls, target_mod_name)
+                let rd = resolve_decls(diag_ctx, all_decls, target_mod_name)
+                let chk = rd.errs
+                let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_mono_out(path, all_decls) }
               }
               MDumpRawSafe -> {
-                let chk = check_program(diag_ctx, all_decls, target_mod_name)
+                let rd = resolve_decls(diag_ctx, all_decls, target_mod_name)
+                let chk = rd.errs
+                let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_rawsafe(path, all_decls) }
               }
               MDumpBorrowSafe -> {
-                let chk = check_program(diag_ctx, all_decls, target_mod_name)
+                let rd = resolve_decls(diag_ctx, all_decls, target_mod_name)
+                let chk = rd.errs
+                let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_borrowsafe(path, all_decls) }
               }
               MDumpLastUse -> {
-                let chk = check_program(diag_ctx, all_decls, target_mod_name)
+                let rd = resolve_decls(diag_ctx, all_decls, target_mod_name)
+                let chk = rd.errs
+                let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_last_use(path, all_decls) }
               }
               MDumpIntervals -> {
-                let chk = check_program(diag_ctx, all_decls, target_mod_name)
+                let rd = resolve_decls(diag_ctx, all_decls, target_mod_name)
+                let chk = rd.errs
+                let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_intervals(path, all_decls) }
               }
               MDumpCallElision -> {
-                let chk = check_program(diag_ctx, all_decls, target_mod_name)
+                let rd = resolve_decls(diag_ctx, all_decls, target_mod_name)
+                let chk = rd.errs
+                let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_call_elision(path, all_decls) }
               }
               MDumpBrands -> {
@@ -5422,7 +5443,9 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # answers position-keyed queries against the typed
                 # AST. Probes are read from `# @probe` comments in
                 # the source so a fixture is self-describing.
-                let chk = check_program(diag_ctx, all_decls, target_mod_name)
+                let rd = resolve_decls(diag_ctx, all_decls, target_mod_name)
+                let chk = rd.errs
+                let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_library_mode(path, src, all_decls) }
               }
               MDiagsJson -> {
@@ -5443,7 +5466,9 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # The head-owner cache is the same one a build computes:
                 # a lint that rejected a pipe the build accepts would be
                 # unusable on idiomatic code.
-                let chk = check_program(diag_ctx, all_decls, target_mod_name)
+                let rd = resolve_decls(diag_ctx, all_decls, target_mod_name)
+                let chk = rd.errs
+                let all_decls = rd.decls
                 if chk != 0 { chk } else {
                   run_lint(path, all_decls, post_use_decls,
                            build_head_owner_map(all_decls, module_table,
@@ -5451,7 +5476,9 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 }
               }
               MLintJson -> {
-                let chk = check_program(diag_ctx, all_decls, target_mod_name)
+                let rd = resolve_decls(diag_ctx, all_decls, target_mod_name)
+                let chk = rd.errs
+                let all_decls = rd.decls
                 if chk != 0 { chk } else {
                   run_lint_json(path, all_decls, post_use_decls,
                                 build_head_owner_map(all_decls, module_table,
@@ -5459,7 +5486,9 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 }
               }
               _ -> {
-                let chk = check_program(diag_ctx, all_decls, target_mod_name)
+                let rd = resolve_decls(diag_ctx, all_decls, target_mod_name)
+                let chk = rd.errs
+                let all_decls = rd.decls
                 if chk != 0 { chk }
                 else {
                   # Build the per-compile head-owner cache once from the
@@ -5638,7 +5667,13 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # slots (`array_make(1, lit)`) to raw local cells
                       # so the unbox pass below marks arithmetic over
                       # their reads raw on both backends.
-                      let cell_decls = promote_scalar_cells(mono_decls)
+                      # Identity has done its work by here: the resolver
+                      # decided it, and the typer, the protocol rewrite
+                      # and the monomorphiser each consumed it. Below this
+                      # line a name is a C symbol to spell, so the
+                      # references are erased once rather than every
+                      # spelling site carrying a second shape.
+                      let cell_decls = promote_scalar_cells(sym_erase_decls(mono_decls))
                       # Unbox analysis. Runs between monomorphisation
                       # and perceus so the perceus pass sees post-unbox
                       # modes (it only inserts dup/drop on `MBoxed`

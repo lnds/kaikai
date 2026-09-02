@@ -13,6 +13,7 @@
 # reached from a non-root call site, is left indirect.
 
 import compiler.ast
+import compiler.sym_read
 import compiler.util
 import compiler.pipe_fusion
 import compiler.closure_spec_ast
@@ -166,10 +167,21 @@ fn cs_collect_decls(ds: [Decl], all: [Decl], hofns: [Decl]) : [CSpecReq] =
   match ds {
     [] -> []
     [d, ...rest] -> {
-      let here = match cs_decl_mo(d) { None -> cs_collect_expr(decl_body(d), all, hofns)  Some(_) -> [] }
+      let here = if cs_specialisable_host(d) { cs_collect_expr(decl_body(d), all, hofns) } else { [] }
       list_append(here, cs_collect_decls(rest, all, hofns))
     }
   }
+
+# A spec is named for the `(line, col)` of its call site. A derived body
+# carries the position of the `type` it was derived from, so two nested
+# combinators inside one derive share a key and their specs collide —
+# the encoder that writes a payload gets the decoder's inlined stage.
+# Only a hand-written root-file body has positions that separate.
+fn cs_specialisable_host(d: Decl) : Bool =
+  match cs_decl_mo(d) { Some(_) -> false  None -> not cs_decl_is_derived(d) }
+
+fn cs_decl_is_derived(d: Decl) : Bool =
+  match d { DFn(_, n, _, _, _, _, _, _, _, _) -> string_contains(n, "__pimpl_")  _ -> false }
 
 # Bottom-up read walk: a request per specialisable `G(args)`. Children
 # first so nested folds are discovered too.
@@ -219,10 +231,10 @@ fn rewrite_all(ds: [Decl], all: [Decl], hofns: [Decl]) : [Decl] =
 # decl is left untouched: no spec was discovered for its internal calls.
 fn rewrite_decl(d: Decl, all: [Decl], hofns: [Decl]) : Decl =
   match d {
-    DFn(p, n, tp, ps, rt, row, body, l, c, mo) -> match mo {
-      None    -> DFn(p, n, tp, ps, rt, row, rewrite_expr(body, all, hofns), l, c, None)
-      Some(_) -> d
-    }
+    DFn(p, n, tp, ps, rt, row, body, l, c, mo) ->
+      if cs_specialisable_host(d) {
+        DFn(p, n, tp, ps, rt, row, rewrite_expr(body, all, hofns), l, c, mo)
+      } else { d }
     _ -> d
   }
 
@@ -312,7 +324,7 @@ fn kids_have_arity0_proto_op(es: [Expr]) : Bool =
   }
 
 fn callee_is_proto_op(callee: Expr) : Bool =
-  match callee.kind {
+  match sym_read_kind(callee.kind) {
     EVar(n)        -> string_starts_with_q(n, "__proto_")
     EModCall(_, n) -> string_starts_with_q(n, "__proto_")
     _              -> false
@@ -366,7 +378,7 @@ fn kids_passed(es: [Expr], fname: String, self_name: String) : Bool =
   }
 
 fn callee_is(callee: Expr, name: String) : Bool =
-  match callee.kind {
+  match sym_read_kind(callee.kind) {
     EVar(n)        -> n == name
     EModCall(_, n) -> n == name
     _              -> false
@@ -379,7 +391,7 @@ fn args_have_var(args_: [Expr], fname: String) : Bool =
   }
 
 fn arg_is_var(a: Expr, fname: String) : Bool =
-  match a.kind { EVar(n) -> n == fname  _ -> false }
+  match sym_read_kind(a.kind) { EVar(n) -> n == fname  _ -> false }
 
 # True when some lowercase type-variable name appears in the result type
 # but in no surviving parameter type — a return-only tparam.
@@ -415,12 +427,19 @@ fn classify_closure(a: Expr, all: [Decl]) : Option[ClosureArg] =
       # dispatcher (`__proto_cmp`) or impl (`__pimpl_*`) reified from a bare
       # op reference. Inlining one impl's body breaks dispatch for every
       # other type, so these are never specialised.
-      EVar(name) ->
-        if is_synthesised(name) { None }
-        else { match lookup_named_fn(all, name) { Some(d) -> Some(CaNamedFn(d))  None -> None } }
+      EVar(name)    -> cs_named(name, all)
+      ESym(_, name) -> cs_named(name, all)
       _ -> None
     }
   }
+
+# A `__`-prefixed name is a compiler-synthesised symbol — a protocol
+# dispatcher (`__proto_cmp`) or impl (`__pimpl_*`) reified from a bare op
+# reference. Inlining one impl's body breaks dispatch for every other
+# type, so these are never specialised.
+fn cs_named(name: String, all: [Decl]) : Option[ClosureArg] =
+  if is_synthesised(name) { None }
+  else { match lookup_named_fn(all, name) { Some(d) -> Some(CaNamedFn(d))  None -> None } }
 
 fn is_synthesised(n: String) : Bool =
   match char_at(n, 1) {
