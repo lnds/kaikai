@@ -2887,6 +2887,38 @@ fn ty_env_add_sym(env: TyEnv, s: SymId, name: String, sc: TyScheme) : TyEnv {
   }
 }
 
+# The key an effect op is registered and looked up under, derived from
+# the effect's identity. `<id>` is an integer the table minted, so two
+# homonymous effects key apart with nothing respelled; a use site the
+# resolver could not settle has no id and keys by the written name, the
+# shape every core and root effect keeps.
+# What a perform's base names: the id that keys the op lookup, and the
+# name that keys the row label and the collision report. Read together
+# so neither half has to be discarded to get the other — an `ESym`
+# carries both, a bare `EVar` only the name.
+type OpBase = OpBase(SymId, String)
+
+fn op_base_of(k: ExprKind) : Option[OpBase] = match k {
+  ESym(s, n) -> Some(OpBase(s, n))
+  EVar(n)    -> Some(OpBase(sym_none(), n))
+  _          -> None
+}
+
+# The op scheme under the identity key, else under the written-name
+# key. An effect the table never gave an id — a core one, or one from a
+# path with no whole-program build — registers only the second.
+fn op_lookup_either(env: TyEnv, k1: String, k2: String) : Option[TyScheme] =
+  match ty_env_lookup(env, k1) {
+    Some(sc) -> Some(sc)
+    None     -> if k1 == k2 { None } else { ty_env_lookup(env, k2) }
+  }
+
+fn ty_op_key_sym(s: SymId, op_name: String) : String =
+  concat_all(["#", int_to_string(sym_raw(s)), ".", op_name])
+
+fn ty_op_key_name(eff_name: String, op_name: String) : String =
+  string_concat(eff_name, string_concat(".", op_name))
+
 #[doc("infer: the scheme registered for the declaration `s`, or None when nothing registered one.")]
 pub fn ty_env_lookup_sym(env: TyEnv, s: SymId) : Option[TyScheme] =
   match idx_chain_sym(env.sindex, s) {
@@ -4976,8 +5008,9 @@ fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
           let env2 = add_variants_of_decl(env1, d, top_names, tab, target)
           EnvWithArities { env: env2, arities: ar_acc }
         }
-        DEffect(_, eff_name, tparams, ops, _, _, _, _) -> {
-          let r2 = add_effect_op_sigs(env, eff_name, tparams, ops)
+        DEffect(_, eff_name, tparams, ops, _, _, _, emo) -> {
+          let r2 = add_effect_op_sigs(env, eff_name, tparams, ops,
+                                      ty_decl_sym(tab, NCEffect, eff_name, emo, target))
           # merge per-effect arities into the running accumulator.
           EnvWithArities { env: r2.env, arities: append_op_arities(r2.arities, ar_acc) }
         }
@@ -5113,10 +5146,10 @@ fn append_op_arities(a: [OpEffArity], b: [OpEffArity]) : [OpEffArity] {
 type EnvWithArities = { env: TyEnv, arities: [OpEffArity] }
 
 fn add_effect_op_sigs(env: TyEnv, eff_name: String, tparams: [String],
-                       ops: [EffectOp]) : EnvWithArities {
+                       ops: [EffectOp], esym: SymId) : EnvWithArities {
   let binds = mk_tpbinds(tparams)
   let ids = tparam_ids(tparams)
-  add_effect_op_sigs_loop(env, eff_name, binds, ids, ops, [])
+  add_effect_op_sigs_loop(env, eff_name, binds, ids, ops, [], esym)
 }
 
 # register each op of `Eff[T1, T2]` under the
@@ -5137,7 +5170,7 @@ fn add_effect_op_sigs(env: TyEnv, eff_name: String, tparams: [String],
 # not (yet) a thing; the offset for `mk_rvbinds_from` stays 0.
 fn add_effect_op_sigs_loop(env: TyEnv, eff_name: String, binds: [TPBind],
                             ids: [Int], ops: [EffectOp],
-                            ar_acc: [OpEffArity]) : EnvWithArities {
+                            ar_acc: [OpEffArity], esym: SymId) : EnvWithArities {
   match ops {
     [] -> EnvWithArities { env: env, arities: ar_acc }
     [op, ...rest] -> match op {
@@ -5160,13 +5193,17 @@ fn add_effect_op_sigs_loop(env: TyEnv, eff_name: String, binds: [TPBind],
           }
           _ -> scheme_full(all_ids, op_rv_ids, body_ty)
         }
-        let key = string_concat(eff_name, string_concat(".", op_name))
-        let env1 = ty_env_add(env, key, sc)
+        let key = ty_op_key_name(eff_name, op_name)
+        # The same scheme under the effect's identity, so a settled use
+        # site reaches it without the name having been respelled first.
+        let env0 = ty_env_add(env, key, sc)
+        let env1 = if sym_raw(esym) >= 0 { ty_env_add(env0, ty_op_key_sym(esym, op_name), sc) }
+                   else { env0 }
         # Record only the effect-level arity per dotted key. The
         # synth_op_call_with_scheme caller uses this to take the
         # first N entries of `inst.fresh` as the row label's ty_args.
         let ar1 = [OEA(key, list_length(ids)), ...ar_acc]
-        add_effect_op_sigs_loop(env1, eff_name, binds, ids, rest, ar1)
+        add_effect_op_sigs_loop(env1, eff_name, binds, ids, rest, ar1, esym)
       }
     }
   }
@@ -10614,16 +10651,25 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
 
 
   match callee.kind {
-    # A base the resolver settled reads exactly like the `EVar` it
-    # replaced: the row/perform machinery below is keyed by the
-    # written name, not yet by identity, so the id rides along unread
-    # until that machinery is.
-    EField(base, op_name) -> match sym_read_kind(base.kind) {
-      EVar(name) -> {
-        # First try the literal name (`Io`, `Mutable`, ...).
-        let key = string_concat(name, string_concat(".", op_name))
-        match ty_env_lookup(st.env, key) {
-          Some(sc) -> Some(record_op_res(synth_op_call_with_scheme(st, sc, args_, key, line, col), key, None, false, line, col))
+    # A settled base and a bare one take the same path: the id decides
+    # the lookup key, the written name decides the row label. Reading
+    # them apart is what lets a homonymous effect reach its own op
+    # without the name having been respelled upstream.
+    EField(base, op_name) -> match op_base_of(base.kind) {
+      Some(OpBase(bsym, name)) -> {
+        # A base the resolver settled keys by the effect's identity, so
+        # two modules declaring one effect name reach their own op
+        # without either having been respelled. A base it could not
+        # settle — a core effect, an alias, a capability parameter —
+        # keys by the written name, which is the ladder below.
+        let key = if sym_raw(bsym) >= 0 { ty_op_key_sym(bsym, op_name) }
+                  else { ty_op_key_name(name, op_name) }
+        # The scheme is found by identity; the row label and the
+        # collision report stay keyed by the written name, which is what
+        # the runtime evidence stack and the diagnostics are keyed by.
+        let named_key = ty_op_key_name(name, op_name)
+        match op_lookup_either(st.env, key, named_key) {
+          Some(sc) -> Some(record_op_res(synth_op_call_with_scheme(st, sc, args_, named_key, line, col), named_key, None, false, line, col))
           None ->
             if is_effect_in_env(st.env, name) {
               Some(synth_op_call_unknown_op(st, name, op_name, line, col))
@@ -10717,11 +10763,7 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
             }
         }
       }
-      # The base of an effect-op call names an effect, and effects are
-      # not in the value namespace the resolver stamps, so this shape is
-      # unreachable.
-      ESym(_, _) -> None
-      _ -> None
+      None -> None
     }
     _ -> None
   }
