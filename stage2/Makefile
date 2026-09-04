@@ -5517,6 +5517,24 @@ test-closure-spec-1205: $(TARGET) build
 	fi; \
 	echo "closure-spec-1205 OK (sum matches; specialised loop has zero per-element call_ind, lambda inlined into tcrec)"
 
+# Closure-specialisation accumulator read in BOTH modes. The bound-once
+# accumulator is declared raw and consumed boxed (`if a > b` -> kai_op_gt);
+# a backend that declares one spelling and reads the other fails to compile.
+# Run on BOTH backends: the defect was a c/native parity break, so a
+# native-only gate would not have caught it.
+test-closure-spec-mixed-mode-acc: $(TARGET) build
+	@set -e; \
+	src=../examples/perceus/closure_spec_mixed_mode_acc.kai; \
+	exp=../examples/perceus/closure_spec_mixed_mode_acc.out.expected; \
+	for be in c native; do \
+	  KAI_BACKEND=$$be ../bin/kai build $$src -o build/s2-csmma 2> build/s2-csmma.err \
+	    || { echo "closure-spec-mixed-mode-acc FAIL ($$be build errored)"; cat build/s2-csmma.err; exit 1; }; \
+	  ./build/s2-csmma > build/s2-csmma.out; \
+	  diff -q $$exp build/s2-csmma.out > /dev/null \
+	    || { echo "closure-spec-mixed-mode-acc FAIL ($$be output diff)"; diff $$exp build/s2-csmma.out; exit 1; }; \
+	done; \
+	echo "closure-spec-mixed-mode-acc OK (raw-declared accumulator boxes on demand; c and native agree)"
+
 # Issue #1208 (native) — grounding a return-only tparam from the call
 # site. `let v: Vec[Point] = [a..b] | stage` collects into a Vec whose
 # element type is return-only; mono now grounds it from the annotated

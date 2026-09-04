@@ -5848,10 +5848,9 @@ fn emit_match_default_owned(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) 
 fn emit_block_raw(src: String, stmts: [Stmt], tail: Expr, cx: EmitCtx) : String / Console {
   let drops = block_unused_lets(stmts, Some(tail))
   let stmt_acc = emit_block_stmts(src, stmts, drops, cx)
-  let stmt_out = match stmt_acc { EBSA(_, t) -> t }
-  let block_lcs = match stmt_acc { EBSA(l, _) -> l }
+  let stmt_out = match stmt_acc { EBSA(_, t, _) -> t }
   let tail_c = emit_expr_raw(src, tail,
-                             emit_ctx_tcpend_after_stmts(emit_ctx_with_lcs(cx, block_lcs), stmts))
+                             emit_ctx_tcpend_after_stmts(emit_ctx_after_block_stmts(cx, stmt_acc), stmts))
   cat4("({ ", stmt_out, tail_c, "; })")
 }
 
@@ -7671,11 +7670,11 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
           # `EVar(name)` to the local read instead of a same-named
           # top-level fn.
           let stmt_acc = emit_block_stmts(src, stmts, drops, bcx)
-          let stmt_out = match stmt_acc { EBSA(_, t) -> t }
-          let block_lcs = match stmt_acc { EBSA(l, _) -> l }
+          let stmt_out = match stmt_acc { EBSA(_, t, _) -> t }
+          let block_cx = emit_ctx_after_block_stmts(cx, stmt_acc)
           if is_region {
             let final_in = match opt_final {
-              Some(fe) -> emit_expr(src, fe, emit_ctx_with_in_region(emit_ctx_with_lcs(cx, block_lcs), true))
+              Some(fe) -> emit_expr(src, fe, emit_ctx_with_in_region(block_cx, true))
               None -> "kai_unit()"
             }
             concat_all(["({ kai_arena_push(); ", stmt_out,
@@ -7684,7 +7683,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
           } else {
             let final_out = match opt_final {
               Some(fe) -> cat2(emit_expr(src, fe,
-                                         emit_ctx_tcpend_after_stmts(emit_ctx_with_lcs(cx, block_lcs), stmts)),
+                                         emit_ctx_tcpend_after_stmts(block_cx, stmts)),
                                "; ")
               None -> "kai_unit(); "
             }
@@ -7981,11 +7980,10 @@ fn emit_block_discard(src: String, stmts: [Stmt], opt_final: Option[Expr], cx: E
     _ -> {
       let drops = block_unused_lets(stmts, opt_final)
       let stmt_acc = emit_block_stmts(src, stmts, drops, cx)
-      let stmt_out = match stmt_acc { EBSA(_, t) -> t }
-      let block_lcs = match stmt_acc { EBSA(l, _) -> l }
+      let stmt_out = match stmt_acc { EBSA(_, t, _) -> t }
       let final_out = match opt_final {
         Some(fe) -> emit_stmt_discard_or_drop(src, fe,
-                      emit_ctx_tcpend_after_stmts(emit_ctx_with_lcs(cx, block_lcs), stmts))
+                      emit_ctx_tcpend_after_stmts(emit_ctx_after_block_stmts(cx, stmt_acc), stmts))
         None -> ""
       }
       Some(cat4("{ ", stmt_out, final_out, "} "))
@@ -8322,19 +8320,17 @@ fn emit_stmt(src: String, s: Stmt, cx: EmitCtx) : String / Console {
 # appended to `lcs` so subsequent stmts (and the trailing final
 # expression) see them as locals. Other stmt forms (`SAssert`,
 # `SExprStmt`, dead `SVar` / `SUse` / `SIndexAssign`) are scope-
-# neutral. The accumulated `lcs` is returned alongside the
-# concatenated C output so the caller can pass it to the final
-# expression.
+# neutral. The accumulated `lcs` and the raw-declared subset are returned
+# alongside the concatenated C output so the caller can scope the final
+# expression with both.
+type EmitBlockStmtsAcc = EBSA([String], String, [String])
 
-# m14 v1.x — fold over a block's stmts threading the local-name
-# scope. After each `SLet(pat, _, _)`, the pattern's binders are
-# appended to `lcs` so subsequent stmts (and the trailing final
-# expression) see them as locals. Other stmt forms (`SAssert`,
-# `SExprStmt`, dead `SVar` / `SUse` / `SIndexAssign`) are scope-
-# neutral. The accumulated `lcs` is returned alongside the
-# concatenated C output so the caller can pass it to the final
-# expression.
-type EmitBlockStmtsAcc = EBSA([String], String)
+# Re-scope `cx` to a finished block's statement scope: the locals it bound
+# AND the subset of them declared raw (`kair_`). The trailing expression of
+# a block reads both, so applying only `lcs` sends a raw binder's read to a
+# `kaiv_` that was never declared.
+fn emit_ctx_after_block_stmts(cx: EmitCtx, acc: EmitBlockStmtsAcc) : EmitCtx =
+  match acc { EBSA(l, _, k) -> emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, l), k) }
 
 fn emit_block_stmts(src: String, stmts: [Stmt], drops: [String],
                     cx: EmitCtx) : EmitBlockStmtsAcc / Console =
@@ -8344,16 +8340,43 @@ fn emit_block_stmts_loop(src: String, stmts: [Stmt], drops: [String],
                           cx: EmitCtx,
                           acc: String) : EmitBlockStmtsAcc / Console = match stmts {
 
-  [] -> EBSA(cx.lcs, acc)
+  [] -> EBSA(cx.lcs, acc, cx.kind1_raw)
   [s, ...rest] -> {
     let out = emit_stmt_with_drops(src, s, drops, cx)
     let lcs1 = match s {
       SLet(pat, _, _) -> list_append(cx.lcs, pat_binders(pat, []))
       _ -> cx.lcs
     }
-    emit_block_stmts_loop(src, rest, drops, emit_ctx_with_lcs(cx, lcs1),
+    let k1 = stmt_kind1_raw_after(s, cx.kind1_raw)
+    emit_block_stmts_loop(src, rest, drops,
+                          emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, lcs1), k1),
                           string_concat(acc, out))
   }
+}
+
+# A `let` binder that the unbox pass marked MUnboxed is declared as the raw
+# `int64_t kair_<nm>` and has no boxed `kaiv_<nm>` local, so later reads must
+# resolve through `kind1_raw` (raw directly, or `kai_int(kair_<nm>)` in a
+# boxed consumer) exactly as an arm binder does. A boxed rebind of the same
+# name drops it again: the shadowing declaration is a real `kaiv_<nm>`, and
+# leaving the name in the set would send its reads to a `kair_` that the
+# new binding never declared.
+fn stmt_kind1_raw_after(s: Stmt, ks: [String]) : [String] = match s {
+  SLet(pat, _, rhs) -> match pat.pkind {
+    PBind(nm) -> match rhs.mode {
+      MUnboxed -> if list_has(ks, nm) { ks } else { [nm, ...ks] }
+      _        -> list_drop_name(ks, nm)
+    }
+    _ -> ks
+  }
+  _ -> ks
+}
+
+fn list_drop_name(names: [String], target: String) : [String] = match names {
+  [] -> []
+  [n, ...rest] ->
+    if n == target { list_drop_name(rest, target) }
+    else { [n, ...list_drop_name(rest, target)] }
 }
 
 # m5 #3 — emit_stmt variant that consults the per-block drop set.
