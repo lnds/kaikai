@@ -1,0 +1,124 @@
+#[doc("""
+Protocol name resolution through the scope chain.
+
+A protocol name climbs the same rungs every other name class does. The
+registry keys a home by `Option[String]` — `None` for the root file —
+so this is where the chain's `SymId` answers become the shape the
+registry stores, and the only place that mapping is written.
+
+`PkPrivate` keeps the distinction the ladder this replaced could make:
+a protocol declared in a module the use site cannot reach reports as
+private, naming that module, not as an unknown name.
+""")]
+
+import compiler.ast
+import compiler.modules
+import compiler.symtab
+import compiler.scope_view
+import compiler.decl_names
+import compiler.proto_key
+import compiler.scope_file
+
+#[doc("What protocol resolution needs from the chain: the symbol table, every file's scope view, and the module untagged declarations are homed in.")]
+pub type PScope = PScope(SymTab, FileViews, String)
+
+#[doc("A scope resolving nothing: the table is empty, so every protocol name is unknown. The shape a caller with no whole-program build gets.")]
+pub fn ps_empty() : PScope = PScope(st_empty(), fv_empty(), "")
+
+#[doc("The scope view of the file homed at `home` (`None` = root file).")]
+pub fn ps_view(p: PScope, home: Option[String]) : ScopeView = match p {
+  PScope(t, vs, root) -> fv_of(t, vs, pk_home_name(home, root))
+}
+
+#[doc("The symbol table this scope resolves against.")]
+pub fn ps_tab(p: PScope) : SymTab = match p { PScope(t, _, _) -> t }
+
+#[doc("The module name untagged declarations are homed in.")]
+pub fn ps_root(p: PScope) : String = match p { PScope(_, _, r) -> r }
+
+#[doc("""
+The protocol `name` (bare, or `m.P`) reaches from the view `v`, as the
+home the registry keys by: `None` for the root file, `Some(m)` for a
+module.
+
+`PkPrivate` names a home declaring it that the view cannot reach, so a
+diagnostic can say "declared in `m`, not visible here" rather than
+"unknown protocol".
+""")]
+pub type PkRes = PkHome(Option[String]) | PkPrivate(String) | PkUnknown
+               | PkAmbiguous([Option[String]])
+
+#[doc("Resolve the protocol `name` from the view `v`, answering the home the registry keys by. `root` is the target module, whose declarations the registry homes at `None`.")]
+pub fn pk_resolve(t: SymTab, v: ScopeView, name: String, root: String) : PkRes =
+  match split_dotted_qualifier(name) {
+    Some(QSplit(m, bare)) -> pk_res(t, sv_qualified(t, NCProtocol, m, bare), root)
+    None -> pk_res(t, sv_resolve(t, v, NCProtocol, name), root)
+  }
+
+fn pk_res(t: SymTab, r: SvRes, root: String) : PkRes = match r {
+  SvSym(s)     -> PkHome(pk_home(t, s, root))
+  SvPrivate(s) -> PkPrivate(sym_name(t, sym_owner(t, s)))
+  SvAmbig(ss)  -> PkAmbiguous(pk_homes(t, ss, root))
+  SvNone       -> PkUnknown
+}
+
+# The registry homes a root-file declaration at `None`, so the target
+# module's own name maps back to it.
+fn pk_home(t: SymTab, s: SymId, root: String) : Option[String] {
+  let h = sym_name(t, sym_owner(t, s))
+  if h == root { None } else { Some(h) }
+}
+
+fn pk_homes(t: SymTab, ss: [SymId], root: String) : [Option[String]] = match ss {
+  [] -> []
+  [s, ...rest] -> [pk_home(t, s, root), ...pk_homes(t, rest, root)]
+}
+
+#[doc("The dispatch key of the protocol `name` homed at `home`, resolved through the table. The bare name when the table holds no such protocol.")]
+pub fn pk_key_at(t: SymTab, v: ScopeView, name: String,
+      home: Option[String], root: String) : String =
+  match st_module(t, pk_home_name(home, root)) {
+    None    -> name
+    Some(m) -> match st_lookup(t, NCProtocol, name, m) {
+      None    -> name
+      Some(s) -> pk_of(t, v, s)
+    }
+  }
+
+fn pk_home_name(home: Option[String], root: String) : String = match home {
+  None    -> root
+  Some(m) -> m
+}
+
+#[doc("True when the protocol `name` homed at `home` is a legal dispatch candidate for a call inside the module `cm` (`None` = root file).")]
+pub fn pk_visible_from(t: SymTab, name: String, home: Option[String],
+      cm: Option[String], root: String) : Bool = match cm {
+    None    -> true
+    Some(_) -> match home {
+      None    -> true
+      Some(_) -> pk_home_name(home, root) == pk_home_name(cm, root) or
+                 pk_exported(t, name, home, root)
+    }
+  }
+
+fn pk_exported(t: SymTab, name: String, home: Option[String],
+      root: String) : Bool = match st_module(t, pk_home_name(home, root)) {
+    None    -> false
+    Some(m) -> match st_lookup(t, NCProtocol, name, m) {
+      None    -> false
+      Some(s) -> sym_exported(t, s)
+    }
+  }
+
+#[doc("Resolve the protocol `name` as seen from the file homed at `from` (`None` = root file).")]
+pub fn ps_resolve(p: PScope, name: String, from: Option[String]) : PkRes =
+  pk_resolve(ps_tab(p), ps_view(p, from), name, ps_root(p))
+
+#[doc("The dispatch key of the protocol `name` homed at `home`.")]
+pub fn ps_key(p: PScope, name: String, home: Option[String]) : String =
+  pk_key_at(ps_tab(p), ps_view(p, home), name, home, ps_root(p))
+
+#[doc("True when the protocol `name` homed at `home` is a dispatch candidate for a call inside module `cm` (`None` = root file).")]
+pub fn ps_visible(p: PScope, name: String, home: Option[String],
+      cm: Option[String]) : Bool =
+  pk_visible_from(ps_tab(p), name, home, cm, ps_root(p))

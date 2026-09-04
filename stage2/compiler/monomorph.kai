@@ -74,7 +74,7 @@ import compiler.infer
 import compiler.infer_index
 import compiler.inst_index
 import compiler.protos
-import compiler.proto_scope
+import compiler.proto_resolve
 
 # ==================================================================
 # Leak-report value types (pub: main's `report_mono_leaks` reads them).
@@ -915,7 +915,8 @@ pub type MonoOutput = MonoOut([Decl], [MLeakRecord], [BoundViolation])
 
 #[doc("Specialise every generic decl against the concrete instantiations the typer resolved (tp.insts), emitting one mangled spec per (name, tys, units) tuple; returns the rewritten program, any Phase 3 leak records, and fn-bound violations at concrete instantiations.")]
 pub fn monomorphise(tp: TypedProgram, reg: ProtocolReg,
-                  local_arities: [OpAr], fn_bounds: [FnBoundsRec]) : MonoOutput {
+                  local_arities: [OpAr], fn_bounds: [FnBoundsRec],
+                  ps: PScope) : MonoOutput {
   let polys = collect_poly_fns(tp.decls)
   # `resolve_protocol_calls` renames `__proto_<op>(arg)` call sites
   # to `__pimpl_<P>_<T>_<op>(arg)` AFTER `infer_program` has populated
@@ -950,7 +951,7 @@ pub fn monomorphise(tp: TypedProgram, reg: ProtocolReg,
       # reaches here (it isn't concrete), so a generic caller forwarding
       # its own tparam defers to its own instantiation — no constraint
       # propagation.
-      let viols = check_fn_bounds(all_items, fn_bounds, insts_ix, polys, reg, [])
+      let viols = check_fn_bounds(all_items, fn_bounds, insts_ix, polys, reg, ps, [])
       MonoOut(list_append(rewritten, spec_sort(specs)), leaks, viols)
     }
   }
@@ -985,20 +986,20 @@ fn spec_sort_name(d: Decl) : String = match d {
 # error falls back to the callee decl's own line/col.
 fn check_fn_bounds(tuples: [MonoTuple], fn_bounds: [FnBoundsRec],
                    insts: InstIndex, polys: [PolyFn], reg: ProtocolReg,
-                   acc: [BoundViolation]) : [BoundViolation] {
+                   ps: PScope, acc: [BoundViolation]) : [BoundViolation] {
   match tuples {
     [] -> list_reverse(acc)
     [t, ...rest] -> match t {
       MT(mo, name, tys, _) -> match lookup_fn_bounds(fn_bounds, name, mo) {
-        None -> check_fn_bounds(rest, fn_bounds, insts, polys, reg, acc)
+        None -> check_fn_bounds(rest, fn_bounds, insts, polys, reg, ps, acc)
         Some(fbr) -> match fbr {
           FBR(_, fmo, ftbs) -> {
             let loc = match inst_loc_for(insts, name, tys) {
               MoLC(0, 0) -> decl_loc_of(polys, name)
               lc       -> lc
             }
-            let acc1 = check_tuple_bounds(ftbs, tys, name, fmo, reg, loc, acc)
-            check_fn_bounds(rest, fn_bounds, insts, polys, reg, acc1)
+            let acc1 = check_tuple_bounds(ftbs, tys, name, fmo, reg, loc, ps, acc)
+            check_fn_bounds(rest, fn_bounds, insts, polys, reg, ps, acc1)
           }
         }
       }
@@ -1057,7 +1058,7 @@ type LineCol = MoLC(Int, Int)
 fn check_tuple_bounds(ftbs: [FnTPBound], tys: [Ty], name: String,
                       fmo: Option[String],
                       reg: ProtocolReg, loc: LineCol,
-                      acc: [BoundViolation]) : [BoundViolation] {
+                      ps: PScope, acc: [BoundViolation]) : [BoundViolation] {
   match ftbs {
     [] -> acc
     [ftb, ...rest] -> match ftb {
@@ -1066,10 +1067,10 @@ fn check_tuple_bounds(ftbs: [FnTPBound], tys: [Ty], name: String,
           None -> acc
           Some(ty) -> match ty_head_name(ty) {
             None -> acc
-            Some(head) -> check_protos_for_head(protos, head, name, fmo, ty, reg, loc, acc)
+            Some(head) -> check_protos_for_head(protos, head, name, fmo, ty, reg, loc, ps, acc)
           }
         }
-        check_tuple_bounds(rest, tys, name, fmo, reg, loc, acc1)
+        check_tuple_bounds(rest, tys, name, fmo, reg, loc, ps, acc1)
       }
     }
   }
@@ -1078,18 +1079,18 @@ fn check_tuple_bounds(ftbs: [FnTPBound], tys: [Ty], name: String,
 fn check_protos_for_head(protos: [String], head: String, fname: String,
                          fmo: Option[String],
                          ty: Ty, reg: ProtocolReg, loc: LineCol,
-                         acc: [BoundViolation]) : [BoundViolation] {
+                         ps: PScope, acc: [BoundViolation]) : [BoundViolation] {
   match protos {
     [] -> acc
     [p, ...rest] -> {
-      let acc1 = if head_satisfies_proto(reg, p, fmo, head) { acc }
+      let acc1 = if head_satisfies_proto(reg, p, fmo, head, ps) { acc }
                  else {
                    let msg = concat_all(["type `", mono_ty_to_string(ty),
                      "` does not satisfy the bound `", p,
                      "` on a type parameter of `", fname, "`"])
                    match loc { MoLC(l, c) -> [BV(msg, l, c), ...acc] }
                  }
-      check_protos_for_head(rest, head, fname, fmo, ty, reg, loc, acc1)
+      check_protos_for_head(rest, head, fname, fmo, ty, reg, loc, ps, acc1)
     }
   }
 }
@@ -1101,9 +1102,10 @@ fn check_protos_for_head(protos: [String], head: String, fname: String,
 # The bound's name resolves from the declaring fn's module, so a
 # contested protocol name checks against its own impl table.
 fn head_satisfies_proto(reg: ProtocolReg, proto: String,
-                        fmo: Option[String], head: String) : Bool {
-  let pkey = match proto_scope_resolve(reg, proto, fmo) {
-    PRHome(ph) -> proto_key_of(reg.dkeys, proto, ph)
+                        fmo: Option[String], head: String,
+                        ps: PScope) : Bool {
+  let pkey = match ps_resolve(ps, proto, fmo) {
+    PkHome(ph) -> proto_key_of(reg.dkeys, proto, ph)
     _ -> proto
   }
   prc_reg_has_impl(reg, pkey, head) or derive_builtin_impl(proto, head)
