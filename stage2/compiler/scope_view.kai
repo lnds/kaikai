@@ -1,0 +1,152 @@
+#[doc("""
+What one module can see: the rungs a bare name climbs before it
+resolves.
+
+The scope chain binds a name to the symbol it declares, but a use site
+reaches further than its own scopes — it reaches the modules its file
+imports, and the prelude every file sees without importing. That
+structure is a link in the chain like any other: the ladder
+`own module -> selective picks -> plain imports -> cores -> any` is a
+walk outward through scopes that happen to be modules.
+
+Before this, three passes each rebuilt that ladder over their own entry
+type and each answered in a *string* — a name respelled with its home
+baked in. They disagreed about the rung order, so one name could reach
+two declarations depending on which pass asked. Here the rungs are one
+list, walked once, and the answer is a `SymId`.
+
+A rung answers only when exactly one symbol on it is visible. Two
+candidates on the same rung are an ambiguity the caller reports, never
+a first-declared pick — the failure mode the string ladders kept
+reproducing.
+""")]
+
+import compiler.ast
+import compiler.symtab
+
+#[doc("The modules one file can see: its own home, the names its selective imports pick, the modules it imports, and the prelude cores.")]
+pub type ScopeView = { home: SymId, picks: [SvPick], imports: [SymId], cores: [SymId] }
+
+#[doc("One name a selective import picks, bound to the module that exports it.")]
+pub type SvPick = SvPick(String, SymId)
+
+#[doc("A view that sees nothing but its own home. The root file before any import is resolved.")]
+pub fn sv_of_home(home: SymId) : ScopeView =
+  ScopeView { home: home, picks: [], imports: [], cores: [] }
+
+#[doc("The view of a file homed at `home`, picking `picks`, importing `imports`, over the prelude `cores`.")]
+pub fn sv_new(home: SymId, picks: [SvPick], imports: [SymId],
+      cores: [SymId]) : ScopeView =
+  ScopeView { home: home, picks: picks, imports: imports, cores: cores }
+
+#[doc("The same view seen from `home`, keeping the file's imports and picks. The walk enters a new module without rebuilding what its file sees.")]
+pub fn sv_at_home(v: ScopeView, home: SymId) : ScopeView =
+  ScopeView { home: home, picks: v.picks, imports: v.imports, cores: v.cores }
+
+#[doc("True when `m` is one of the prelude cores. A core's declarations keep the spelling the runtime is keyed by.")]
+pub fn sv_is_core(v: ScopeView, m: SymId) : Bool = sv_has(v.cores, m)
+
+fn sv_has(ms: [SymId], m: SymId) : Bool = match ms {
+  [] -> false
+  [x, ...rest] -> if sym_raw(x) == sym_raw(m) { true } else { sv_has(rest, m) }
+}
+
+# The modules a selective import names this name from. `import m.{T}`
+# says which `T` the file means, so it outranks the plain import list
+# even when a second import also exports one.
+fn sv_pick_homes(ps: [SvPick], name: String, acc: [SymId]) : [SymId] = match ps {
+  [] -> acc
+  [SvPick(n, m), ...rest] ->
+    if n == name and not sv_has(acc, m) { sv_pick_homes(rest, name, [m, ...acc]) }
+    else { sv_pick_homes(rest, name, acc) }
+}
+
+#[doc("The rungs a bare `name` climbs, outermost last. `SvAny` closes the ladder: a visible declaration in a module the file never imported still answers, so an unimportable name reports as private rather than unknown.")]
+pub type SvRung = SvOwn | SvPicks | SvImports | SvCores | SvAny
+
+#[doc("The ladder every name class climbs, in order.")]
+pub fn sv_rungs() : [SvRung] = [SvOwn, SvPicks, SvImports, SvCores, SvAny]
+
+#[doc("What resolving a name against a view decided.")]
+pub type SvRes = SvSym(SymId) | SvAmbig([SymId]) | SvNone
+
+#[doc("""
+The symbol `name` of class `cls` reaches from this view.
+
+Each rung is tried in turn and the first that holds a candidate
+answers. One candidate resolves; two or more are an ambiguity, because
+a rung that cannot tell them apart has no ground to prefer either.
+""")]
+pub fn sv_resolve(t: SymTab, v: ScopeView, cls: NCls, name: String) : SvRes =
+  sv_climb(t, v, sv_rungs(), st_candidates(t, cls, name))
+
+#[doc("""
+The symbol `name` reaches when several classes share one namespace at
+the use site — the three value classes, where a function, a constant
+and a constructor all answer to a bare name.
+
+The rungs are climbed once over the union, not once per class: a
+constant at home must beat a function two modules away, which resolving
+each class apart and choosing between the answers cannot express.
+""")]
+pub fn sv_resolve_any(t: SymTab, v: ScopeView, cs: [NCls], name: String) : SvRes =
+  sv_climb(t, v, sv_rungs(), sv_cands_of(t, cs, name))
+
+fn sv_cands_of(t: SymTab, cs: [NCls], name: String) : [SymId] = match cs {
+  [] -> []
+  [c, ...rest] -> list_append(st_candidates(t, c, name), sv_cands_of(t, rest, name))
+}
+
+fn sv_climb(t: SymTab, v: ScopeView, rungs: [SvRung], cands: [SymId]) : SvRes =
+  match rungs {
+    [] -> SvNone
+    [r, ...rest] -> match sv_on_rung(t, v, r, cands, []) {
+      []  -> sv_climb(t, v, rest, cands)
+      [s] -> SvSym(s)
+      ss  -> SvAmbig(list_reverse(ss))
+    }
+  }
+
+# A candidate is on a rung when its owner is a module that rung admits
+# and it is reachable from here: a foreign declaration must be
+# exported, one at home need not be.
+fn sv_on_rung(t: SymTab, v: ScopeView, r: SvRung, cands: [SymId],
+      acc: [SymId]) : [SymId] = match cands {
+  [] -> acc
+  [s, ...rest] -> {
+    let owner = sym_owner(t, s)
+    let at_home = sym_raw(owner) == sym_raw(v.home)
+    let ok = sv_admits(v, r, owner, sym_name(t, s)) and
+             (at_home or sym_exported(t, s)) and
+             not sv_owner_seen(t, acc, owner)
+    if ok { sv_on_rung(t, v, r, rest, [s, ...acc]) }
+    else { sv_on_rung(t, v, r, rest, acc) }
+  }
+}
+
+fn sv_admits(v: ScopeView, r: SvRung, owner: SymId, name: String) : Bool = match r {
+  SvOwn     -> sym_raw(owner) == sym_raw(v.home)
+  SvPicks   -> sv_has(sv_pick_homes(v.picks, name, []), owner)
+  SvImports -> sv_has(v.imports, owner)
+  SvCores   -> sv_has(v.cores, owner)
+  SvAny     -> true
+}
+
+# Two declarations from one module never compete on a rung: the module
+# is the unit a rung admits, so the first is the one it meant.
+fn sv_owner_seen(t: SymTab, acc: [SymId], owner: SymId) : Bool = match acc {
+  [] -> false
+  [s, ...rest] ->
+    if sym_raw(sym_owner(t, s)) == sym_raw(owner) { true }
+    else { sv_owner_seen(t, rest, owner) }
+}
+
+#[doc("The symbol the qualified `mod.name` of class `cls` reaches: the declaration `mod` homes, ignoring every other module. A qualifier names its module, so no rung applies.")]
+pub fn sv_qualified(t: SymTab, cls: NCls, modn: String, name: String) : SvRes =
+  match st_module(t, modn) {
+    None    -> SvNone
+    Some(m) -> match st_lookup(t, cls, name, m) {
+      Some(s) -> SvSym(s)
+      None    -> SvNone
+    }
+  }

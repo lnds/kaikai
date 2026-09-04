@@ -261,8 +261,8 @@ fn ufn_promote_calls_kind(k: ExprKind, fns: FnIndex) : ExprKind {
     EMapPipe(a, b)       -> EMapPipe(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
     EFlatMapPipe(a, b)   -> EFlatMapPipe(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
     EFilterPipe(a, b)    -> EFilterPipe(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
-    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(ufn_promote_calls(body, fns), eff_name, eff_tyargs,
+    EHandle(body, eff_name, _, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(ufn_promote_calls(body, fns), eff_name, sym_none(), eff_tyargs,
               ufn_promote_calls_opt(init_opt, fns), alias_opt,
               map(clauses, (c) => ufn_promote_calls_clause(c, fns)),
               ufn_promote_calls_opt_return(ret_opt, fns))
@@ -330,13 +330,27 @@ fn ufn_promote_calls_opt_return(opt: Option[HReturn], fns: FnIndex) : Option[HRe
 
 # Decide whether the callee Expr resolves to a UFn entry. v1 only
 # recognises EVar(name) and EModCall(mod, fname); anything else
-# (closure-typed local, lambda) keeps the boxed convention. The
-# EModCall arm picks the entry whose module-of-origin equals
-# `mod` exactly so two modules that both export the same bare
-# name as a UFn (e.g. `box_a.wrap` + `box_b.wrap`) are routed
-# correctly without round-tripping through `efn_resolve`'s
-# first-match fallback.
-fn call_resolves_to_ufn(callee: Expr, fns: FnIndex) : Bool {
+# (closure-typed local, lambda) keeps the boxed convention.
+#
+# A callee the resolver stamped answers from its id alone. The bare and
+# module-qualified arms below are what a name has to fall back on: the
+# first-match walk, and the module test that tells two exporters of one
+# bare name apart.
+fn call_resolves_to_ufn(callee: Expr, fns: FnIndex) : Bool =
+  match ub_callee_sym(callee.kind) {
+    Some(s) -> match fnx_ufn_sig_sym(fns, s) {
+      Some(_) -> true
+      None    -> false
+    }
+    None -> call_resolves_to_ufn_named(callee, fns)
+  }
+
+fn ub_callee_sym(k: ExprKind) : Option[SymId] = match k {
+  ESym(s, _) -> if sym_raw(s) >= 0 { Some(s) } else { None }
+  _          -> None
+}
+
+fn call_resolves_to_ufn_named(callee: Expr, fns: FnIndex) : Bool {
   match sym_read_kind(callee.kind) {
     EVar(name) -> match efn_resolve(fnx_all(fns), name) {
       Some(EFn(_, _, _, Some(_), _)) -> true
@@ -561,11 +575,11 @@ fn unbox_kind_aware(k: ExprKind, env: [LocBind], fns: FnIndex, cis: [CtorIntSlot
     EMapPipe(a, b)       -> EMapPipe(unbox_expr_aware(a, env, fns, cis, nat), unbox_expr_aware(b, env, fns, cis, nat))
     EFlatMapPipe(a, b)   -> EFlatMapPipe(unbox_expr_aware(a, env, fns, cis, nat), unbox_expr_aware(b, env, fns, cis, nat))
     EFilterPipe(a, b)    -> EFilterPipe(unbox_expr_aware(a, env, fns, cis, nat), unbox_expr_aware(b, env, fns, cis, nat))
-    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+    EHandle(body, eff_name, _, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
       # The handled body opens a fresh dynamic scope for the effect
       # capability. v1 walks it with the outer env (no bindings
       # leak into the handler's continuation captures).
-      EHandle(unbox_expr_aware(body, env, fns, cis, nat), eff_name, eff_tyargs,
+      EHandle(unbox_expr_aware(body, env, fns, cis, nat), eff_name, sym_none(), eff_tyargs,
               unbox_opt_aware(init_opt, env, fns, cis, nat), alias_opt,
               map(clauses, (c) => unbox_clause_aware(c, env, fns, cis, nat)),
               unbox_opt_return_aware(ret_opt, env, fns, cis, nat))
@@ -923,7 +937,7 @@ fn nrab_expr(e: Expr, cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : 
   EMapPipe(a, b)       -> nrab_expr(b, cis, fns, nrab_expr(a, cis, fns, acc))
   EFlatMapPipe(a, b)   -> nrab_expr(b, cis, fns, nrab_expr(a, cis, fns, acc))
   EFilterPipe(a, b)    -> nrab_expr(b, cis, fns, nrab_expr(a, cis, fns, acc))
-  EHandle(b, _, _, io, _, cls, ro) -> nrab_ret(ro, cis, fns, nrab_clauses(cls, cis, fns, nrab_opt(io, cis, fns, nrab_expr(b, cis, fns, acc))))
+  EHandle(b, _, _, _, io, _, cls, ro) -> nrab_ret(ro, cis, fns, nrab_clauses(cls, cis, fns, nrab_opt(io, cis, fns, nrab_expr(b, cis, fns, acc))))
   _                    -> acc
 }
 
@@ -1292,7 +1306,7 @@ fn kind_has_interp_use(k: ExprKind, nm: String) : Bool / Console {
     EMapPipe(l, r)   -> expr_has_interp_use(l, nm) or expr_has_interp_use(r, nm)
     EFlatMapPipe(l, r) -> expr_has_interp_use(l, nm) or expr_has_interp_use(r, nm)
     EFilterPipe(l, r) -> expr_has_interp_use(l, nm) or expr_has_interp_use(r, nm)
-    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
       if expr_has_interp_use(body, nm) { true }
       else if opt_expr_has_interp_use(init_opt, nm) { true }
       else if clauses_have_interp_use(clauses, nm) { true }
