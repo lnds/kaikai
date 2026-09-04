@@ -84,6 +84,59 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.114.0 (2026-09-04)
+
+### Added
+
+- **compiler**: the scope chain resolves every name class it can reach (#1897) (#1921)
+- **compiler**: a real symbol table — nested scopes with identity, consumed by the passes that used to re-derive it (#1897) (#1919)
+- **compiler**: the symbol table resolves the program, and ESym carries identity through the AST (#1897 part B) (#1917)
+- **compiler**: a module is a symbol and an owner is a SymId (#1897 Step 1) (#1914)
+- **stage1**: resolve imports in kaic1 and retire the source bundle (#1897 Step 0) (#1913)
+- **resolve**: keep the resolution instead of discarding it (#1903)
+- **compiler**: give the compiler a symbol table keyed by SymId (#1901)
+- **compiler**: give PVariantRecord a home slot so qualified record-variant patterns validate (#1892)
+- **pkg**: install the shell completions a package declares (#1886)
+
+### Fixed
+
+- **typer**: a bare value name resolves against what its module imports, not global registration order (#1897) (#1916)
+- **typer**: a bare name two modules both export is an error, not a pick by registration order (#1915)
+- **ci**: make the differential quality gate actually run, and grade correctly (#1911)
+- **runtime**: restore the caller scope so leak attribution stops billing leaves (#1906)
+- **perceus**: move block-let binders at their last use (#1905)
+- **ci**: stop the native self-host gate from rebuilding the compiler it was handed (#1899)
+- **resolve**: close the five namespace-collision breaks in the red-team report (#1800) (#1893)
+- **driver**: name the user's source in native diagnostics, not the cache copy (#1881) (#1894)
+- **derive,resolve**: give each synthesised Json lambda its own column, and let a selective import decide a contested type (#1890)
+- **resolve**: reject extern "C" fn declarations that bind one C symbol to conflicting signatures (#1800) (#1885)
+- **resolve**: small namespace surfaces — qualified effect rows, single ctor diagnostic, variant-record qualifier guardrail (#1880)
+- **driver,runtime**: surface diagnostics a successful build swallowed, and stop the --debug panic trace from crashing on macOS (#1882)
+- **resolve**: decide the qualifier's name table before resolving a qualified name (#1877)
+- **typer**: respell contested type/effect names inside string interpolations (#1871)
+- **perceus**: keep clause-body k binders from clobbering the native continuation register (#1865)
+- **typer,diag**: mismatch notes render contested types as mod.T (#1800) (#1863)
+- **fmt**: keep adjacent imports in one block and make package-form fmt cover the whole package (#1850, #1849) (#1862)
+- **resolve,modules**: module-scope transparent type aliases (#1858) (#1860)
+- **resolve,modules**: nominal type identity by home and module identity vs. the core (#1800 structural keys) (#1848)
+- **typer,evidence,resolve**: written decimal scale, live-effect fixtures + backed-sibling hedge, unused-import warning (#1800 decision package) (#1846)
+- **resolve**: effect identity by home, classifier ambiguity as error, habitants by visible module (#1800 modular parity pt.2) (#1845)
+
+### Changed
+
+- **lex**: retire the unreachable unit keyword token (#1920)
+- **compiler**: index the four hottest linear scans in the front end (#1912)
+- **typer**: split the dumps, collision checks and use-scan out of infer.kai (#1910)
+- **typer**: split the JSON reports and unit validation out of infer.kai (#1909)
+- **native**: stop two per-call rebuilds from allocating into the peak (#1908)
+- **typer**: index variant lookup by return tycon (#1907)
+- **compiler**: stop three quadratic accumulators from allocating 393M cons cells (#1904)
+- **typer**: stop apply_ty rebuilding types the substitution never touched (#1900)
+- **perceus**: index the consume map instead of scanning it (#1898)
+- **resolve**: retire unit_scope — unit collisions keyed by name_table (#1800) (#1874)
+- **resolve**: retire const_scope — const collisions keyed by name_table (#1800) (#1866)
+- **resolve**: retire ta_scope — aliases keyed at construction (#1800) (#1861)
+
 ## v0.113.0 (2026-08-19)
 
 ### Added
