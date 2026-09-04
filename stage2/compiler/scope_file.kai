@@ -1,0 +1,130 @@
+#[doc("""
+The scope view one file resolves under, built from what the loader
+already knows: the modules the file imports, the names its selective
+imports pick, and the prelude cores.
+
+`ScopeView` models the rungs; nothing built one with those rungs
+filled. The resolver reached a name through its own home alone, so
+`SvPicks`, `SvImports` and `SvCores` admitted nobody and the ladder
+collapsed to `own -> any` — a bare name either was declared at home or
+was answered by any visible declaration, with the three rungs between
+them silent.
+
+The loader's tables are the source: `[ModImports]` says which modules a
+file imports, `[SelImport]` which names it picks from which module, and
+the core list names the prelude. Each is a module *name*; the view
+holds ids, so every name is resolved against the table once here rather
+than compared as a string at each rung.
+
+A file that imports a module the table never saw contributes no rung
+entry: an unknown module declares nothing, so admitting it would widen
+no rung.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+import compiler.symtab
+import compiler.scope_view
+import compiler.type_scope_table
+
+#[doc("Every file's scope view, keyed by the module that owns it. The root file is keyed by the target module name.")]
+pub type FileViews = FileViews([FvEntry], ScopeView)
+
+#[doc("One file's view: `FvEntry(owning module, view)`.")]
+pub type FvEntry = FvEntry(String, ScopeView)
+
+#[doc("""
+The per-file views for a program: for each file the loader recorded,
+the modules it imports, the names it picks, and the cores every file
+sees without importing them.
+
+`root` is the target module's name — the home of every untagged
+declaration, and the owner an import table spells `""`.
+""")]
+pub fn fv_build(t: SymTab, imports: [ModImports], sels: [SelImport],
+      cores: [String], root: String) : FileViews {
+  let core_ids = fv_ids(t, cores, [])
+  FileViews(fv_entries(t, imports, sels, core_ids, root, []),
+            fv_bare(t, core_ids, root))
+}
+
+#[doc("No file views: every home resolves seeing only its own declarations, the shape a caller with no loader tables gets.")]
+pub fn fv_empty() : FileViews = FileViews([], sv_of_home(sym_none()))
+
+#[doc("The view of the file owned by the module named `home`; a view seeing only that home and the cores when no file was recorded for it.")]
+pub fn fv_of(t: SymTab, v: FileViews, home: String) : ScopeView = match v {
+  FileViews(es, fallback) -> match fv_find(es, home) {
+    Some(sv) -> sv
+    None     -> sv_at_home(fallback, fv_home_id(t, home))
+  }
+}
+
+fn fv_find(es: [FvEntry], home: String) : Option[ScopeView] = match es {
+  [] -> None
+  [FvEntry(o, sv), ...rest] -> if o == home { Some(sv) } else { fv_find(rest, home) }
+}
+
+# A file the loader spells `""` is the root file, whose declarations are
+# homed in the target module.
+fn fv_owner(owner: String, root: String) : String =
+  if owner == "" { root } else { owner }
+
+fn fv_entries(t: SymTab, imports: [ModImports], sels: [SelImport],
+      core_ids: [SymId], root: String, acc: [FvEntry]) : [FvEntry] =
+  match imports {
+    [] -> list_reverse(acc)
+    [MImp(owner, names), ...rest] -> {
+      let home = fv_owner(owner, root)
+      let e = FvEntry(home, fv_view(t, home, names, sels, core_ids, root))
+      fv_entries(t, rest, sels, core_ids, root, [e, ...acc])
+    }
+  }
+
+fn fv_view(t: SymTab, home: String, names: [String], sels: [SelImport],
+      core_ids: [SymId], root: String) : ScopeView =
+  sv_new(fv_home_id(t, home), fv_picks(t, sels, home, root, []),
+         fv_ids(t, names, []), core_ids)
+
+# A home the table does not know owns no declaration, so `SvOwn` admits
+# nothing and the outer rungs answer — the same shape a use site in an
+# unbuilt module already had.
+fn fv_home_id(t: SymTab, home: String) : SymId = match st_module(t, home) {
+  Some(m) -> m
+  None    -> sym_none()
+}
+
+fn fv_bare(t: SymTab, core_ids: [SymId], root: String) : ScopeView =
+  sv_new(fv_home_id(t, root), [], [], core_ids)
+
+# Only the picks the file itself wrote. A pick names one module, so it
+# outranks the plain import list even when a second import exports the
+# same name.
+fn fv_picks(t: SymTab, sels: [SelImport], home: String, root: String,
+      acc: [SvPick]) : [SvPick] = match sels {
+  [] -> list_reverse(acc)
+  [SelImport(owner, written, names), ...rest] ->
+    if fv_owner(owner, root) == home {
+      fv_picks(t, rest, home, root, fv_pick_names(t, written, names, acc))
+    } else { fv_picks(t, rest, home, root, acc) }
+}
+
+fn fv_pick_names(t: SymTab, written: String, names: [String],
+      acc: [SvPick]) : [SvPick] = match st_module(t, written) {
+  None    -> acc
+  Some(m) -> fv_pick_loop(names, m, acc)
+}
+
+fn fv_pick_loop(names: [String], m: SymId, acc: [SvPick]) : [SvPick] =
+  match names {
+    [] -> acc
+    [n, ...rest] -> fv_pick_loop(rest, m, [SvPick(n, m), ...acc])
+  }
+
+fn fv_ids(t: SymTab, names: [String], acc: [SymId]) : [SymId] = match names {
+  [] -> list_reverse(acc)
+  [n, ...rest] -> match st_module(t, n) {
+    Some(m) -> fv_ids(t, rest, [m, ...acc])
+    None    -> fv_ids(t, rest, acc)
+  }
+}
