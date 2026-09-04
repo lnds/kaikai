@@ -57,6 +57,7 @@ import compiler.native_prims
 import compiler.modules
 import compiler.symtab
 import compiler.symtab_build
+import compiler.scope_view
 import compiler.resolve_state
 import compiler.resolve_use
 import compiler.scope_chain
@@ -100,7 +101,23 @@ fn env_pop(e: Env) : Env = env_with_chain(e, ch_pop(e.chain))
 # use reaches depends on the home the walk is inside when the use is
 # read. Binding it to a symbol at registration time would freeze the
 # first home's answer for every reader.
-fn env_add(e: Env, name: String) : Env =
+# The chain binds `name` to the identity `rs` already knows: the id
+# `st_build` minted for the declaration this walk is registering, when
+# the class matches and the current home owns it. Not yet recording (a
+# lint, a test helper with no table) or a class the table cannot
+# distinguish this way binds `sym_none()`, same as before — the chain
+# still shadows correctly, it just carries no identity to stamp.
+fn env_add(e: Env, name: String, cls: NCls) : Env =
+  env_with_chain(e, ch_bind(e.chain, name, env_decl_owner_sym(e, cls, name)))
+
+fn env_decl_owner_sym(e: Env, cls: NCls, name: String) : SymId =
+  if rs_recording(e.rs) { rs_decl_owner_sym(e.rs, cls, name) } else { sym_none() }
+
+# A binding with no declared class of its own: the core names `add_all`
+# seeds the root scope with, and a selective import's picked names,
+# which are already declarations elsewhere and get their identity from
+# the ORIGIN's registration, not a second one here.
+fn env_add_untyped(e: Env, name: String) : Env =
   env_with_chain(e, ch_bind(e.chain, name, sym_none()))
 
 # A binder takes a fresh local id: `let map = ...` shadows the core
@@ -112,6 +129,14 @@ fn env_has(e: Env, name: String) : Bool = ch_has(e.chain, name)
 
 # What a name reaches: a binder answers with its own id, a declaration
 # with whatever the symbol table resolves for the home the walk is in.
+#
+# NOT the id the chain bound at registration, even though `env_add` now
+# mints one. A core name is bound once for the whole program, but which
+# declaration it reaches depends on the home the walk is inside when
+# the use is read — `map` is exported by `option`, `result` and `list`,
+# and answering with the registration's id turns every bare `map` into
+# a contested name. The chain's id says a name was declared; the table
+# says which declaration this reader reaches.
 fn env_lookup(e: Env, name: String) : Option[SymId] =
   match ch_lookup(e.chain, name) {
     Some(s) -> if ch_is_local(s) { Some(s) } else { env_decl_sym(e, name) }
@@ -263,7 +288,7 @@ pub fn core_names() : [String] {
 
 #[doc("Add every name in `names` to the current (top) scope of `e`.")]
 pub fn add_all(e: Env, names: [String]) : Env =
-  reduce(names, e, (acc, n) => env_add(acc, n))
+  reduce(names, e, (acc, n) => env_add_untyped(acc, n))
 
 # ---- pattern bindings: walk a pattern and add its bound names ----
 
@@ -433,7 +458,7 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
     EBang(inner) -> match chk_expr(e, inner) {   # scope-walk the operand
       RExpr(e1, i1) -> RKind(e1, EBang(i1))
     }
-    EHandle(body, en, ta, init_opt, alias_opt, clauses, ret_opt) ->
+    EHandle(body, en, _, ta, init_opt, alias_opt, clauses, ret_opt) ->
       chk_handle(e, x, body, en, ta, init_opt, alias_opt, clauses, ret_opt)
     # literal carrying a unit annotation. Recurse into the inner
     # numeric literal; the unit symbols themselves are validated at
@@ -509,10 +534,20 @@ fn chk_pipe(e: Env, a: Expr, b: Expr,
 # the body, so it is pushed in a scope of its own and disappears with
 # it. The init expression (`with State[T](init)`) lives in the outer
 # scope — its free vars are the surrounding env.
+# The effect a handler head names. A qualifier picks the module
+# outright; a bare name climbs the scope view like any other class.
+fn chk_handle_sym(e: Env, en: String) : SymId =
+  if rs_recording(e.rs) { rs_effect_sym(e.rs, en) } else { sym_none() }
+
 fn chk_handle(e: Env, x: Expr, body: Expr, en: String, ta: [TypeExpr],
       init_opt: Option[Expr], alias_opt: Option[String], clauses: [HClause],
       ret_opt: Option[HReturn]) : RKind / Console + File {
   let stateful = match init_opt { Some(_) -> true None -> false }
+  # The effect this head handles, settled once. `with m.E` names which
+  # `E` it is; a bare head resolves through the same chain every other
+  # class does. Downstream reads the id instead of deciding the name
+  # again — which is what the respelling exists to make possible.
+  let esym = chk_handle_sym(e, en)
   let after = match init_opt {
     Some(ie) -> match chk_expr(e, ie) { RExpr(e1, i1) -> RExpr(e1, i1) }
     None     -> RExpr(e, x)
@@ -530,9 +565,9 @@ fn chk_handle(e: Env, x: Expr, body: Expr, en: String, ta: [TypeExpr],
       match chk_handler_clauses(restored, clauses, stateful) {
         RClauses(ec, cs1) -> match ret_opt {
           Some(r) -> match chk_handler_return(ec, r, stateful) {
-            RRet(er, r1) -> RKind(er, EHandle(body1, en, ta, init1, alias_opt, cs1, Some(r1)))
+            RRet(er, r1) -> RKind(er, EHandle(body1, en, esym, ta, init1, alias_opt, cs1, Some(r1)))
           }
-          None -> RKind(ec, EHandle(body1, en, ta, init1, alias_opt, cs1, None))
+          None -> RKind(ec, EHandle(body1, en, esym, ta, init1, alias_opt, cs1, None))
         }
       }
     }
@@ -791,7 +826,7 @@ fn chk_decl(e: Env, d: Decl) : RDecl / Console + File {
     DUse(_, _, _) -> RDecl(e, d)               # stripped by desugar_use_decls before chk runs
     DUseKind(_, _, _, _) -> RDecl(e, d)        # stripped by the kind-resolution pass before chk runs
     DAxiom(_, _, _, _, _, _, _, _, _, _) -> RDecl(e, d)  # rewritten to DFn by lower_axioms before chk runs
-    DConst(p, name, ta, body, mo, l, c) -> match chk_expr(env_add(e, name), body) {
+    DConst(p, name, ta, body, mo, l, c) -> match chk_expr(env_add(e, name, NCConst), body) {
       RExpr(e1, b1) -> RDecl(e1, DConst(p, name, ta, b1, mo, l, c))
     }
     DExternType(_, _, _, _, _) -> RDecl(e, d)  # FFI v2: a foreign type binds no value
@@ -825,18 +860,29 @@ fn chk_decls_loop(e: Env, ds: [Decl], acc: [Decl]) : RDecls / Console + File = m
 # ---- top-level pre-registration ----
 
 #[doc("Pre-register every top-level decl's name into the env so forward references resolve.")]
-pub fn register_decls(e: Env, ds: [Decl]) : Env {
+pub fn register_decls(e: Env, ds: [Decl], target: String) : Env {
   match ds {
     [] -> e
-    [d, ...rest] -> register_decls(register_one(e, d), rest)
+    [d, ...rest] -> register_decls(register_one(env_at_decl_reg(e, d, target), d), rest, target)
   }
 }
 
+# The registration pass runs before the use-site walk, over the same
+# stream `env_at_decl` follows there: the home resets on the same decl
+# forms, by the same rule, so a declaration is registered under the
+# home the table gave it.
+fn env_at_decl_reg(e: Env, d: Decl, target: String) : Env =
+  if rs_recording(e.rs) {
+    env_with_rs(e, rs_at_home(e.rs, decl_home_hint_reset(d, rs_home_name(e.rs), target)))
+  } else { e }
+
 fn register_one(e: Env, d: Decl) : Env {
   match d {
-    DFn(_, name, _, _, _, _, _, _, _, _) -> env_add(e, name)
+    DFn(_, name, _, _, _, _, _, _, _, _) ->
+      if string_starts_with_q(name, "__proto_") { env_add_untyped(e, name) }
+      else { env_add(e, name, NCFn) }
     DType(_, name, _, body, _, _, _, _) -> {
-      let e1 = env_add(e, name)
+      let e1 = env_add(e, name, NCType)
       match body {
         TBSum(variants) -> register_variants_env(e1, variants)
         _ -> e1
@@ -846,7 +892,7 @@ fn register_one(e: Env, d: Decl) : Env {
     DBench(_, _, _, _, _) -> e
     DCheck(_, _, _, _, _, _) -> e
     DImport(ik, _, _) -> register_import(e, ik)
-    DEffect(_, name, _, _, _, _, _, _) -> env_add(e, name)
+    DEffect(_, name, _, _, _, _, _, _) -> env_add(e, name, NCEffect)
     # stripped pre-resolve; never reaches register_one in practice.
     # No-op for completeness so the match stays exhaustive.
     DProtocol(_, _, _, _, _, _, _) -> e
@@ -859,9 +905,9 @@ fn register_one(e: Env, d: Decl) : Env {
     DUnit(_, _, _, _, _, _, _) -> e            # unit names live in their own namespace, validated at type-resolve time
     DUse(_, _, _) -> e                       # stripped by desugar_use_decls before register_one runs
     DUseKind(_, _, _, _) -> e                # stripped by the kind-resolution pass before register_one runs
-    DAxiom(_, _, name, _, _, _, _, _, _, _) -> env_add(e, name)  # also rewritten to DFn by lower_axioms; case kept for completeness
-    DConst(_, name, _, _, _, _, _) -> env_add(e, name)
-    DExternType(name, _, _, _, _) -> env_add(e, name)   # FFI v2: register the foreign type name so its references resolve
+    DAxiom(_, _, name, _, _, _, _, _, _, _) -> env_add(e, name, NCFn)  # also rewritten to DFn by lower_axioms; case kept for completeness
+    DConst(_, name, _, _, _, _, _) -> env_add(e, name, NCConst)
+    DExternType(name, _, _, _, _) -> env_add(e, name, NCExternType)   # FFI v2: register the foreign type name so its references resolve
     DDoc(_, _, inner, _, _) -> register_one(e, inner)   # register the documented decl
     DAttr(_, inner, _, _) -> register_one(e, inner)
     DModuleDoc(_, _, _, _) -> e                          # doc text only, no names
@@ -874,7 +920,7 @@ fn register_variants_env(e: Env, vs: [Variant]) : Env {
   match vs {
     [] -> e
     [v, ...rest] -> match v {
-      Var(name, _) -> register_variants_env(env_add(e, name), rest)
+      Var(name, _) -> register_variants_env(env_add_untyped(e, name), rest)
     }
   }
 }
@@ -900,8 +946,8 @@ fn last_segment_loop(s: String, i: Int, end: Int) : String {
 
 fn register_import(e: Env, ik: ImportKind) : Env {
   match ik {
-    IkPath(path) -> env_add(e, last_segment(path))
-    IkAlias(_, alias) -> env_add(e, alias)
+    IkPath(path) -> env_add(e, last_segment(path), NCModule)
+    IkAlias(_, alias) -> env_add(e, alias, NCModule)
     IkSelective(_, names) -> add_all(e, names)
     # import holes don't bind anything in the value namespace — they
     # are diagnostic-only. Skip for env-binding purposes; the
@@ -919,25 +965,25 @@ pub fn check_program(df: DiagFiles, decls: [Decl], target: String) : Int / Conso
 #[doc("Resolve `decls` and hand back the tree with every resolved name stamped, or the original stream when resolution failed.")]
 pub fn resolve_decls(df: DiagFiles, decls: [Decl], target: String) : ResolvedDecls / Console + File {
   let r = resolve_program(df, decls, target)
-  ResolvedDecls { errs: r.errs, decls: if r.errs == 0 { r.decls } else { decls } }
+  ResolvedDecls { errs: r.errs, decls: if r.errs == 0 { r.decls } else { decls }, tab: r.tab }
 }
 
-#[doc("A resolved decl stream: the resolver's error count, and the declarations downstream passes consume.")]
-pub type ResolvedDecls = { errs: Int, decls: [Decl] }
+#[doc("A resolved decl stream: the resolver's error count, the declarations downstream passes consume, and the table their stamped ids index.")]
+pub type ResolvedDecls = { errs: Int, decls: [Decl], tab: SymTab }
 
 #[doc("Resolve a program and keep the resolution: the same checks `check_program` runs, with every use site recorded against `tab`.")]
 pub fn resolve_program_with(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : Resolution / Console + File =
-  resolve_run(df, decls, rs_on(tab, target))
+  resolve_run(df, decls, rs_on(tab, target), tab)
 
 #[doc("Resolve a program against the symbol table its own declarations build.")]
 pub fn resolve_program(df: DiagFiles, decls: [Decl], target: String) : Resolution / Console + File =
   resolve_program_with(df, decls, st_build(decls, target), target)
 
-fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState) : Resolution / Console + File {
+fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState, tab: SymTab) : Resolution / Console + File {
   let file = df_root(df)
   let e0 = env_with_rs(env_new(file), rs0)
   let e1 = add_all(e0, core_names())
-  let e2 = register_decls(e1, decls)
+  let e2 = register_decls(e1, decls, rs_home_name(rs0))
   let walked = chk_decls_files(e2, decls, df)
   let e3 = rds_env(walked)
   let out = rds_decls(walked)
@@ -947,11 +993,11 @@ fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState) : Resolution / Conso
   let strict_errs = check_call_site_refinements(file, decls)
   let tyvar_errs = check_unbound_tyvars(decls, df)
   Resolution { errs: if e3.had_error or row_errs > 0 or strict_errs > 0 or tyvar_errs > 0 { 1 } else { 0 },
-               decls: out }
+               decls: out, tab: tab }
 }
 
-#[doc("What a resolver run produced: the error count `check_program` reports, and the declarations with every resolved name stamped.")]
-pub type Resolution = { errs: Int, decls: [Decl] }
+#[doc("What a resolver run produced: the error count `check_program` reports, the declarations with every resolved name stamped, and the table those ids index. A consumer holding a stamped id resolves it here rather than deciding the name again.")]
+pub type Resolution = { errs: Int, decls: [Decl], tab: SymTab }
 
 #[doc("The env a decl walk ended in.")]
 pub fn rds_env(r: RDecls) : Env = match r { RDecls(e, _) -> e }

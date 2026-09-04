@@ -21,6 +21,8 @@ import compiler.kind_semilattice
 import compiler.kind_resolve
 import compiler.parse
 import compiler.resolve
+import compiler.decl_names
+import compiler.symtab
 import compiler.modules
 import compiler.loop_lower
 import compiler.doc_attr
@@ -572,8 +574,8 @@ fn inf_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EMapPipe(a, b)       -> EMapPipe(f(a), f(b))
     EFlatMapPipe(a, b)   -> EFlatMapPipe(f(a), f(b))
     EFilterPipe(a, b)    -> EFilterPipe(f(a), f(b))
-    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(f(body), eff_name, eff_tyargs,
+    EHandle(body, eff_name, _, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(f(body), eff_name, sym_none(), eff_tyargs,
               inf_map_opt_expr(init_opt, f), alias_opt,
               map(clauses, (c) => inf_map_clause_exprs(c, f)),
               inf_map_opt_return_exprs(ret_opt, f))
@@ -1665,7 +1667,7 @@ fn collect_call_labels(e: Expr, acc: [Label]) : [Label] = match e.kind {
   EFilterPipe(a, b)   -> collect_call_labels(b, collect_call_labels(a, acc))
   EBang(inner)        -> collect_call_labels(inner, acc)
   ELitUnit(inner, _)  -> collect_call_labels(inner, acc)
-  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+  EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
     let a1 = collect_call_labels(body, acc)
     let a2 = match init_opt { Some(i) -> collect_call_labels(i, a1) None -> a1 }
     let a3 = collect_call_labels_clauses(clauses, a2)
@@ -2080,7 +2082,7 @@ fn walk_field_priv_children(file: String, home: Option[String],
   }
   EBang(inner)       -> walk_field_priv_expr(file, home, all_decls, inner, acc)
   ELitUnit(inner, _) -> walk_field_priv_expr(file, home, all_decls, inner, acc)
-  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+  EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
     let a0 = match init_opt {
       Some(i) -> walk_field_priv_expr(file, home, all_decls, i, acc)
       None    -> acc
@@ -2396,7 +2398,7 @@ fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
     }
     EBang(inner)       -> walk_coverage_expr(file, decls, eff_map, fname, inner, stack, acc)
     ELitUnit(inner, _) -> walk_coverage_expr(file, decls, eff_map, fname, inner, stack, acc)
-    EHandle(body, eff_name, _, init_opt, _, clauses, ret_opt) -> {
+    EHandle(body, eff_name, _, _, init_opt, _, clauses, ret_opt) -> {
       let frame = HF(eff_name,
                      handle_clause_op_names(clauses),
                      effect_default_op_map_get(eff_map, eff_name),
@@ -2842,7 +2844,12 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
                # buckets by constructor name; this one buckets by the
                # type each entry constructs, which is what the
                # exhaustiveness walker queries.
-               vindex: VariantIndex[TyEntry] }
+               vindex: VariantIndex[TyEntry],
+               # the same entries keyed by the id of the declaration each
+               # came from. A name bucket holds every homonym and leaves
+               # the reader to tell them apart; an id bucket holds one
+               # declaration, so a settled use needs no tie-break.
+               sindex: NameIndex[TyEntry] }
 
 # head-owner cache entry. `head` is the bare type name
 # (`List`, `MyBox`, ...); `mods` is the list of modules whose
@@ -2853,7 +2860,7 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
 pub type HeadOwnerEntry = HOE(String, [String])
 
 #[doc("infer: the empty typing environment.")]
-pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty(), vindex: vix_empty() }
+pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }
 
 fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv {
   let k = ty_bucket_key(name)
@@ -2861,10 +2868,80 @@ fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv {
   TyEnv { entries: [e, ...env.entries],
           fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
           index: idx_prepend(env.index, k, e),
-          vindex: vix_prepend(env.vindex, ty_variant_key(e), e) }
+          vindex: vix_prepend(env.vindex, ty_variant_key(e), e), sindex: env.sindex }
 }
 
-# composite key for module-qualified scheme entries.
+# Register `sc` under the declaration `s` as well as under its name.
+# The name index still answers a bare use; this one answers a use the
+# resolver already settled, where the id names one declaration and no
+# homonym is left to tell apart.
+fn ty_env_add_sym(env: TyEnv, s: SymId, name: String, sc: TyScheme) : TyEnv {
+  let named = ty_env_add(env, name, sc)
+  if sym_raw(s) < 0 { named }
+  else {
+    TyEnv { entries: named.entries, fresh: named.fresh, unions: named.unions,
+            constructors: named.constructors, head_owners: named.head_owners,
+            root_fns: named.root_fns, row_kind: named.row_kind,
+            index: named.index, vindex: named.vindex,
+            sindex: idx_prepend_sym(named.sindex, s, TyEntry { name: name, scheme: sc }) }
+  }
+}
+
+# The key an effect op is registered and looked up under, derived from
+# the effect's identity. `<id>` is an integer the table minted, so two
+# homonymous effects key apart with nothing respelled; a use site the
+# resolver could not settle has no id and keys by the written name, the
+# shape every core and root effect keeps.
+# What a perform's base names: the id that keys the op lookup, and the
+# name that keys the row label and the collision report. Read together
+# so neither half has to be discarded to get the other — an `ESym`
+# carries both, a bare `EVar` only the name.
+type OpBase = OpBase(SymId, String)
+
+fn op_base_of(k: ExprKind) : Option[OpBase] = match k {
+  ESym(s, n) -> Some(OpBase(s, n))
+  EVar(n)    -> Some(OpBase(sym_none(), n))
+  _          -> None
+}
+
+# The op scheme under the identity key, else under the written-name
+# key. An effect the table never gave an id — a core one, or one from a
+# path with no whole-program build — registers only the second.
+fn op_lookup_either(env: TyEnv, k1: String, k2: String) : Option[TyScheme] =
+  match ty_env_lookup(env, k1) {
+    Some(sc) -> Some(sc)
+    None     -> if k1 == k2 { None } else { ty_env_lookup(env, k2) }
+  }
+
+fn ty_op_key_sym(s: SymId, op_name: String) : String =
+  concat_all(["#", int_to_string(sym_raw(s)), ".", op_name])
+
+fn ty_op_key_name(eff_name: String, op_name: String) : String =
+  string_concat(eff_name, string_concat(".", op_name))
+
+#[doc("infer: the scheme registered for the declaration `s`, or None when nothing registered one.")]
+pub fn ty_env_lookup_sym(env: TyEnv, s: SymId) : Option[TyScheme] =
+  match idx_chain_sym(env.sindex, s) {
+    []        -> None
+    [e, ..._] -> Some(e.scheme)
+  }
+
+# The id `tab` holds for the declaration `mo` homes under `name`. An
+# untagged decl belongs to the root file, which `st_build` records
+# under the target module's own symbol.
+fn ty_decl_sym(tab: SymTab, cls: NCls, name: String, mo: Option[String],
+      target: String) : SymId {
+  let home = match mo { Some(m) -> m  None -> target }
+  match st_module(tab, home) {
+    None    -> sym_none()
+    Some(h) -> match st_lookup(tab, cls, name, h) {
+      Some(s) -> s
+      None    -> sym_none()
+    }
+  }
+}
+
+# composite key for module-qualified scheme entries.# composite key for module-qualified scheme entries.
 # When the same bare `fname` is exported from two core modules
 # (e.g. `repeat` from `list.kai` and `string.kai`), the bare-name
 # entries shadow each other in `entries`. Modules also register
@@ -3438,7 +3515,7 @@ pub fn add_core_sigs(env: TyEnv) : TyEnv {
   match ty_env_prepend_batch(batch, env.entries, env.index, env.vindex) {
     TEP(all_entries, idx, vidx) ->
       TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
-              index: idx, vindex: vidx }
+              index: idx, vindex: vidx, sindex: env.sindex }
   }
 }
 
@@ -3482,7 +3559,7 @@ fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
   match ty_env_prepend_batch(es, env.entries, env.index, env.vindex) {
     TEP(all_entries, idx, vidx) ->
       TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
-              index: idx, vindex: vidx }
+              index: idx, vindex: vidx, sindex: env.sindex }
   }
 }
 
@@ -4076,14 +4153,15 @@ fn names_excluding(xs: [String], drop: [String]) : [String] {
   }
 }
 
-fn add_variants_of_decl(env: TyEnv, d: Decl, top_names: [String]) : TyEnv {
+fn add_variants_of_decl(env: TyEnv, d: Decl, top_names: [String],
+      tab: SymTab, target: String) : TyEnv {
   match d {
     DType(is_pub, tname, tparams, body, _, _, mo, _) -> match body {
       # A private type's constructors are unreachable from another
       # module, so they get no home key: they can neither be named
       # through a qualifier nor make a bare name ambiguous elsewhere.
       TBSum(vs) -> add_variants_loop(env, if is_pub { mo } else { None },
-                                        tname, tparams, vs, top_names)
+                                        tname, tparams, vs, top_names, tab, target)
       _ -> env
     }
     _ -> env
@@ -4105,7 +4183,8 @@ fn add_variants_of_decl(env: TyEnv, d: Decl, top_names: [String]) : TyEnv {
 # goes through the variant-as-callable path.
 fn add_variants_loop(env: TyEnv, home: Option[String],
                        tname: String, tparams: [String],
-                       vs: [Variant], top_names: [String]) : TyEnv {
+                       vs: [Variant], top_names: [String],
+                       tab: SymTab, target: String) : TyEnv {
   match vs {
     [] -> env
     [v, ...rest] -> match v {
@@ -4115,7 +4194,7 @@ fn add_variants_loop(env: TyEnv, home: Option[String],
           _  -> false
         }
         if shadows {
-          add_variants_loop(env, home, tname, tparams, rest, top_names)
+          add_variants_loop(env, home, tname, tparams, rest, top_names, tab, target)
         } else {
           let sc = scheme_of_variant(tname, tparams, v)
           # Ctor overloading at use sites: always
@@ -4140,9 +4219,9 @@ fn add_variants_loop(env: TyEnv, home: Option[String],
           let env2 = if bare_is_core_builtin_variant(env_h, cname) {
             env_h
           } else {
-            ty_env_add(env_h, cname, sc)
+            ty_env_add_sym(env_h, ty_decl_sym(tab, NCCtor, cname, home, target), cname, sc)
           }
-          add_variants_loop(env2, home, tname, tparams, rest, top_names)
+          add_variants_loop(env2, home, tname, tparams, rest, top_names, tab, target)
         }
       }
     }
@@ -4881,10 +4960,11 @@ fn is_implicit_tparam_candidate(name: String) : Bool {
 
 fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
                     top_names: [String]) : EnvWithArities =
-  add_decls_loop_rk(env, ar_acc, ds, top_names, compute_row_kind_slots(ds))
+  add_decls_loop_rk(env, ar_acc, ds, top_names, compute_row_kind_slots(ds), st_empty(), "")
 
 fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
-                    top_names: [String], rk_table: [RowKindEntry]) : EnvWithArities {
+                    top_names: [String], rk_table: [RowKindEntry],
+                    tab: SymTab, target: String) : EnvWithArities {
   match ds {
     [] -> EnvWithArities { env: env, arities: ar_acc }
     [d, ...rest] -> {
@@ -4901,7 +4981,7 @@ fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # schemes registered by `add_core_sigs`.
         DFn(_, fname, _, _, _, _, _, _, _, mo) -> match fn_scheme_of_decl_rk(d, rk_table) {
           Some(sc) -> {
-            let env1 = ty_env_add(env, fname, sc)
+            let env1 = ty_env_add_sym(env, ty_decl_sym(tab, NCFn, fname, mo, target), fname, sc)
             let env2 = match mo {
               Some(m) -> ty_env_add_qualified(env1, m, fname, sc)
               None    -> env1
@@ -4925,11 +5005,12 @@ fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # redeclaration of `type SplitN = ...`).
         DType(_, dt_name, dt_tparams, _, _, _, _, _) -> {
           let env1 = ty_env_add_decl_marker(env, dt_name, list_length(dt_tparams))
-          let env2 = add_variants_of_decl(env1, d, top_names)
+          let env2 = add_variants_of_decl(env1, d, top_names, tab, target)
           EnvWithArities { env: env2, arities: ar_acc }
         }
-        DEffect(_, eff_name, tparams, ops, _, _, _, _) -> {
-          let r2 = add_effect_op_sigs(env, eff_name, tparams, ops)
+        DEffect(_, eff_name, tparams, ops, _, _, _, emo) -> {
+          let r2 = add_effect_op_sigs(env, eff_name, tparams, ops,
+                                      ty_decl_sym(tab, NCEffect, eff_name, emo, target))
           # merge per-effect arities into the running accumulator.
           EnvWithArities { env: r2.env, arities: append_op_arities(r2.arities, ar_acc) }
         }
@@ -4941,7 +5022,7 @@ fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # reads (`real.real_pi`) resolve through the qualified env.
         DConst(_, cname, cte, _, mo, _, _) -> {
           let csc = mono(resolve_ty_with_binds(cte, [], []))
-          let env1 = ty_env_add(env, cname, csc)
+          let env1 = ty_env_add_sym(env, ty_decl_sym(tab, NCConst, cname, mo, target), cname, csc)
           let env2 = match mo {
             Some(m) -> ty_env_add_qualified(env1, m, cname, csc)
             None    -> env1
@@ -4952,20 +5033,20 @@ fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # as a bare `DFn` would be, then record its `type -> (home, fn)`
         # binding so `try_constructor_call` can desugar `Type(args)`.
         DProtoLaws(_, inner, cl, cc, _) -> {
-          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table)
+          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table, tab, target)
           EnvWithArities { env: register_constructor(r.env, inner, cl, cc), arities: r.arities }
         }
         DImplAxiom(_, inner, cl, cc, _) -> {
-          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table)
+          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table, tab, target)
           EnvWithArities { env: register_constructor(r.env, inner, cl, cc), arities: r.arities }
         }
         DConstructor(inner, cl, cc) -> {
-          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table)
+          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table, tab, target)
           EnvWithArities { env: register_constructor(r.env, inner, cl, cc), arities: r.arities }
         }
         _ -> EnvWithArities { env: env, arities: ar_acc }
       }
-      add_decls_loop_rk(r.env, r.arities, rest, top_names, rk_table)
+      add_decls_loop_rk(r.env, r.arities, rest, top_names, rk_table, tab, target)
     }
   }
 }
@@ -5018,7 +5099,7 @@ fn ctor_add(env: TyEnv, entry: CtorEntry, l: Int, c: Int) : TyEnv =
   TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions,
           constructors: [entry, ...env.constructors],
           head_owners: env.head_owners, root_fns: env.root_fns,
-          row_kind: env.row_kind, index: env.index, vindex: env.vindex }
+          row_kind: env.row_kind, index: env.index, vindex: env.vindex, sindex: env.sindex }
 
 # Collect every `#[constructor]` binding in a decl stream. Used to
 # seed a module's `ModuleEnvDelta` so downstream modules inherit the
@@ -5065,10 +5146,10 @@ fn append_op_arities(a: [OpEffArity], b: [OpEffArity]) : [OpEffArity] {
 type EnvWithArities = { env: TyEnv, arities: [OpEffArity] }
 
 fn add_effect_op_sigs(env: TyEnv, eff_name: String, tparams: [String],
-                       ops: [EffectOp]) : EnvWithArities {
+                       ops: [EffectOp], esym: SymId) : EnvWithArities {
   let binds = mk_tpbinds(tparams)
   let ids = tparam_ids(tparams)
-  add_effect_op_sigs_loop(env, eff_name, binds, ids, ops, [])
+  add_effect_op_sigs_loop(env, eff_name, binds, ids, ops, [], esym)
 }
 
 # register each op of `Eff[T1, T2]` under the
@@ -5089,7 +5170,7 @@ fn add_effect_op_sigs(env: TyEnv, eff_name: String, tparams: [String],
 # not (yet) a thing; the offset for `mk_rvbinds_from` stays 0.
 fn add_effect_op_sigs_loop(env: TyEnv, eff_name: String, binds: [TPBind],
                             ids: [Int], ops: [EffectOp],
-                            ar_acc: [OpEffArity]) : EnvWithArities {
+                            ar_acc: [OpEffArity], esym: SymId) : EnvWithArities {
   match ops {
     [] -> EnvWithArities { env: env, arities: ar_acc }
     [op, ...rest] -> match op {
@@ -5112,13 +5193,17 @@ fn add_effect_op_sigs_loop(env: TyEnv, eff_name: String, binds: [TPBind],
           }
           _ -> scheme_full(all_ids, op_rv_ids, body_ty)
         }
-        let key = string_concat(eff_name, string_concat(".", op_name))
-        let env1 = ty_env_add(env, key, sc)
+        let key = ty_op_key_name(eff_name, op_name)
+        # The same scheme under the effect's identity, so a settled use
+        # site reaches it without the name having been respelled first.
+        let env0 = ty_env_add(env, key, sc)
+        let env1 = if sym_raw(esym) >= 0 { ty_env_add(env0, ty_op_key_sym(esym, op_name), sc) }
+                   else { env0 }
         # Record only the effect-level arity per dotted key. The
         # synth_op_call_with_scheme caller uses this to take the
         # first N entries of `inst.fresh` as the row label's ty_args.
         let ar1 = [OEA(key, list_length(ids)), ...ar_acc]
-        add_effect_op_sigs_loop(env1, eff_name, binds, ids, rest, ar1)
+        add_effect_op_sigs_loop(env1, eff_name, binds, ids, rest, ar1, esym)
       }
     }
   }
@@ -5214,7 +5299,8 @@ fn build_ty_env_module(seed: BuiltEnv, decls: [Decl],
   let env_with_unions = TyEnv {
     entries: seed.env.entries, fresh: seed.env.fresh, unions: unions, constructors: seed.env.constructors,
     head_owners: seed.env.head_owners, root_fns: seed.env.root_fns,
-    row_kind: compute_row_kind_slots(decls), index: seed.env.index, vindex: seed.env.vindex
+    row_kind: compute_row_kind_slots(decls), index: seed.env.index, vindex: seed.env.vindex,
+    sindex: seed.env.sindex
   }
   let r = add_decls_loop(env_with_unions, seed.op_eff_arities, decls, top_names)
   BuiltEnv { env: r.env, core_len: seed.core_len,
@@ -5237,7 +5323,7 @@ fn build_ty_env_inherited(seed: BuiltEnv, inherited: ModuleEnvDelta,
                             decls: [Decl], unions: [UnionInfo],
                             top_names: [String]) : BuiltEnv =
   build_ty_env_inherited_rk(seed, inherited, decls, unions, top_names,
-                            compute_row_kind_slots(decls))
+                            compute_row_kind_slots(decls), st_empty(), "")
 
 # As `build_ty_env_inherited` but with an explicit row-kind table. The
 # per-module typer fold passes the table computed over the FULL program
@@ -5246,7 +5332,8 @@ fn build_ty_env_inherited(seed: BuiltEnv, inherited: ModuleEnvDelta,
 # against stdlib's `Stream`).
 fn build_ty_env_inherited_rk(seed: BuiltEnv, inherited: ModuleEnvDelta,
                             decls: [Decl], unions: [UnionInfo],
-                            top_names: [String], rk_table: [RowKindEntry]) : BuiltEnv {
+                            top_names: [String], rk_table: [RowKindEntry],
+                            tab: SymTab, target: String) : BuiltEnv {
   # `inherited.ty_entries` are newer than the seed (prepended at head).
   # Prepend them onto BOTH the seed entries and the seed index in one
   # pass, sharing each entry exactly as `ty_env_add` does -- never
@@ -5257,11 +5344,11 @@ fn build_ty_env_inherited_rk(seed: BuiltEnv, inherited: ModuleEnvDelta,
       entries: seeded_entries, fresh: seed.env.fresh, unions: unions,
       constructors: list_append(inherited.constructors, seed.env.constructors),
       head_owners: seed.env.head_owners, root_fns: seed.env.root_fns,
-      row_kind: rk_table, index: seeded_index, vindex: seeded_vindex
+      row_kind: rk_table, index: seeded_index, vindex: seeded_vindex, sindex: seed.env.sindex
     }
   }
   let ar_in = list_append(inherited.op_eff_arities, seed.op_eff_arities)
-  let r = add_decls_loop_rk(env_in, ar_in, decls, top_names, rk_table)
+  let r = add_decls_loop_rk(env_in, ar_in, decls, top_names, rk_table, tab, target)
   BuiltEnv { env: r.env, core_len: seed.core_len,
              op_eff_arities: r.arities }
 }
@@ -7164,7 +7251,7 @@ fn shape_bind(sv: Int, wit: Ty, arg: Ty, s: Subst) : Option[Subst] / Mutable =
 # id. The env's `fresh` counter advances by one per bound var.
 
 fn fresh_var(env: TyEnv) : TyEnv =
-  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index, vindex: env.vindex }
+  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index, vindex: env.vindex, sindex: env.sindex }
 
 fn advance_fresh(env: TyEnv, n: Int) : TyEnv =
   if n <= 0 { env } else { advance_fresh(fresh_var(env), n - 1) }
@@ -7201,7 +7288,7 @@ fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if env.fresh >= need { env.fresh } else { need }
-      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index, vindex: env.vindex }
+      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index, vindex: env.vindex, sindex: env.sindex }
       let sub = mk_fresh_subst(vars, start)
       Instantiated { env: env1, ty: apply_ty(sub, body) }
     }
@@ -8784,7 +8871,7 @@ fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes / Mutable {
 fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
   InferState {
     file: outer.file,
-    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions, constructors: outer.env.constructors, head_owners: outer.env.head_owners, root_fns: outer.env.root_fns, row_kind: outer.env.row_kind, index: outer.env.index, vindex: outer.env.vindex },
+    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions, constructors: outer.env.constructors, head_owners: outer.env.head_owners, root_fns: outer.env.root_fns, row_kind: outer.env.row_kind, index: outer.env.index, vindex: outer.env.vindex, sindex: outer.env.sindex },
     core_len: outer.core_len,
     sub: inner.sub,
     recs: inner.recs,
@@ -8965,6 +9052,22 @@ fn field_hint(fs: [FTy], target: String) : String {
 # keyed by spelling, so an `ESym` types exactly as the `EVar` it
 # replaced, and the id it carries is what later passes read instead of
 # deciding the name again.
+# A read the resolver settled. The id names one declaration, so the
+# scheme comes from it and the spelling is never consulted. A name the
+# env holds under no id — a core signature, a local binder — falls back
+# to the name index.
+fn synth_sym_read(st: InferState, sy: SymId, nm: String,
+      e: Expr) : Inferred / Console + File + Mutable =
+  match ty_env_lookup_sym(st.env, sy) {
+    Some(sc) -> {
+      let r = st_instantiate_report(st, sc)
+      let st2 = if r.fresh == [] and r.unit_fresh == [] { r.st }
+                else { st_push_inst(r.st, CS(nm, e.line, e.col, r.fresh, r.unit_fresh, None)) }
+      inferred_leaf(st2, r.ty, e)
+    }
+    None -> synth_name_read(st, nm, e)
+  }
+
 fn synth_name_read(st: InferState, nm: String, e: Expr) : Inferred / Console + File + Mutable =
   if nm == "resume" and st.in_clause {
     diag_error(st.file, e.line, e.col,
@@ -9022,7 +9125,7 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     # escapes its clause as a first-class value — `let k = resume`,
     # `f(resume)`. The continuation has no value representation outside its
     # clause, so reject it cleanly (docs/effects.md).
-    ESym(_, nm) -> synth_name_read(st, nm, e)
+    ESym(sy, nm) -> synth_sym_read(st, sy, nm, e)
     EVar(nm) -> synth_name_read(st, nm, e)
     ECall(callee, args_)       -> synth_call(st, callee, args_, e.line, e.col)
     EField(obj, fnm)           -> synth_field(st, obj, fnm, e.line, e.col)
@@ -9044,7 +9147,7 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     ETodo(msg)                 -> synth_todo(st, msg, e)
     EExternBody(_)             -> synth_extern_body(st, e)
     EBang(inner)               -> synth_bang(st, inner, e.line, e.col)
-    EHandle(_, _, _, _, _, _, _) -> synth_handle(st, e)
+    EHandle(_, _, _, _, _, _, _, _) -> synth_handle(st, e)
     # numeric literal with a unit annotation. The inner Expr is
     # always EInt or EReal; the literal's type is `TyDimT(base, u)`
     # where base is TyInt or TyReal and u is the canonical unit.
@@ -9220,7 +9323,7 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
 
 
   match e.kind {
-    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
+    EHandle(body, eff_name, _, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
       # type-check the init expression in the outer scope.
       # The init's inferred type IS the handler-state type — it is
       # propagated into the clauses so `state` / `log` and 2-arg
@@ -9312,7 +9415,7 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       let r_typed = check_return_clause_opt(cs_typed.st, ret_opt, rb.ty,
                                              stateful, init_typed_st.state_ty)
       let new_e = with_ty(
-        mk_expr(EHandle(rb.expr, eff_name, eff_tyargs, init_typed_st.init_opt,
+        mk_expr(EHandle(rb.expr, eff_name, sym_none(), eff_tyargs, init_typed_st.init_opt,
                          alias_opt, cs_typed.clauses, r_typed.ret_opt),
                 e.line, e.col),
         r_typed.ty)
@@ -10549,12 +10652,25 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
 
 
   match callee.kind {
-    EField(base, op_name) -> match base.kind {
-      EVar(name) -> {
-        # First try the literal name (`Io`, `Mutable`, ...).
-        let key = string_concat(name, string_concat(".", op_name))
-        match ty_env_lookup(st.env, key) {
-          Some(sc) -> Some(record_op_res(synth_op_call_with_scheme(st, sc, args_, key, line, col), key, None, false, line, col))
+    # A settled base and a bare one take the same path: the id decides
+    # the lookup key, the written name decides the row label. Reading
+    # them apart is what lets a homonymous effect reach its own op
+    # without the name having been respelled upstream.
+    EField(base, op_name) -> match op_base_of(base.kind) {
+      Some(OpBase(bsym, name)) -> {
+        # A base the resolver settled keys by the effect's identity, so
+        # two modules declaring one effect name reach their own op
+        # without either having been respelled. A base it could not
+        # settle — a core effect, an alias, a capability parameter —
+        # keys by the written name, which is the ladder below.
+        let key = if sym_raw(bsym) >= 0 { ty_op_key_sym(bsym, op_name) }
+                  else { ty_op_key_name(name, op_name) }
+        # The scheme is found by identity; the row label and the
+        # collision report stay keyed by the written name, which is what
+        # the runtime evidence stack and the diagnostics are keyed by.
+        let named_key = ty_op_key_name(name, op_name)
+        match op_lookup_either(st.env, key, named_key) {
+          Some(sc) -> Some(record_op_res(synth_op_call_with_scheme(st, sc, args_, named_key, line, col), named_key, None, false, line, col))
           None ->
             if is_effect_in_env(st.env, name) {
               Some(synth_op_call_unknown_op(st, name, op_name, line, col))
@@ -10648,11 +10764,7 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
             }
         }
       }
-      # The base of an effect-op call names an effect, and effects are
-      # not in the value namespace the resolver stamps, so this shape is
-      # unreachable.
-      ESym(_, _) -> None
-      _ -> None
+      None -> None
     }
     _ -> None
   }
@@ -12869,7 +12981,7 @@ fn modules_declaring_type(modules: [ModuleEntry], head: String,
 # right before the typer runs.
 fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
   TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors,
-          head_owners: hos, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index, vindex: env.vindex }
+          head_owners: hos, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index, vindex: env.vindex, sindex: env.sindex }
 
 # attach the set of root-file (user) function names to the
 # env. A root `fn foo` unconditionally shadows a stdlib `pub fn foo`;
@@ -12878,7 +12990,7 @@ fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
 # export exactly. Seeded once per compile.
 fn ty_env_with_root_fns(env: TyEnv, rfns: [String]) : TyEnv =
   TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors,
-          head_owners: env.head_owners, root_fns: rfns, row_kind: env.row_kind, index: env.index, vindex: env.vindex }
+          head_owners: env.head_owners, root_fns: rfns, row_kind: env.row_kind, index: env.index, vindex: env.vindex, sindex: env.sindex }
 
 # collect the bare names of root-file (`mo = None`)
 # functions from the full program decl stream. Imported / core decls
@@ -13538,7 +13650,7 @@ fn collect_local_arrays_kind(k: ExprKind, acc: [String], dmut: [String]) : [Stri
       let a1 = collect_local_arrays(b, collect_local_arrays(a, acc, dmut), dmut)
       match oc { Some(c) -> collect_local_arrays(c, a1, dmut) None -> a1 }
     }
-    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
       let a1 = collect_local_arrays(body, acc, dmut)
       let a2 = match init_opt { Some(i) -> collect_local_arrays(i, a1, dmut) None -> a1 }
       let a3 = collect_local_in_hclauses(clauses, a2, dmut)
@@ -13858,7 +13970,7 @@ fn collect_escaped_names_kind(k: ExprKind, acc: [String]) : [String] {
       let a1 = collect_escaped_names(b, collect_escaped_names(a, acc))
       match oc { Some(c) -> collect_escaped_names(c, a1) None -> a1 }
     }
-    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
       let a1 = collect_escaped_names(body, acc)
       let a2 = match init_opt { Some(i) -> collect_escaped_names(i, a1) None -> a1 }
       let a3 = collect_escaped_in_hclauses(clauses, a2)
@@ -14248,7 +14360,7 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
         None    -> true
       } }
     }
-    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
       if not all_demands_local(body, locals, escaped, params, dmut) { false }
       else if not (match init_opt {
         Some(i) -> all_demands_local(i, locals, escaped, params, dmut)
@@ -18939,7 +19051,8 @@ type ProgramData = {
 # the earlier baseline.
 fn collect_program_data_inherited(file: String, decls: [Decl],
                                     inherited: ModuleEnvDelta,
-                                    all_program_decls: [Decl])
+                                    all_program_decls: [Decl],
+                                    tab: SymTab)
                                     : ProgramData / Console + File {
   # expand `unit Newton = kg * m / sec^2` aliases at the AST
   # level before any pass that calls inf_resolve_ty. After this pass no
@@ -18966,7 +19079,8 @@ fn collect_program_data_inherited(file: String, decls: [Decl],
   } else { decls_a }
   let rk_table = compute_row_kind_slots(rk_src_decls)
   let built = build_ty_env_inherited_rk(seed, inherited, decls_a,
-                                       unions_all, top_names, rk_table)
+                                       unions_all, top_names, rk_table, tab,
+                                       module_name_of_path(file))
   let recs_here = collect_records(decls_a)
   let recs_all = list_append(recs_here, inherited.recs)
   # rebuild the type-alias resolution table here so
@@ -19028,11 +19142,12 @@ pub fn typecheck_module(file: String, mod: ModuleDecls,
                      proto_impls: [ProtoImplReg],
                      head_owners: [HeadOwnerEntry],
                      kind_theories: [KindTheory],
+                     tab: SymTab,
                      verbose: Bool) : TypecheckedModule / Console + File {
 
 
   let data0 = collect_program_data_inherited(file, mod.decls, inherited,
-                                                all_program_decls)
+                                                all_program_decls, tab)
   # attach the per-compile head-owner cache to the env
   # the typer walks. The cache is built once per `compile_source`
   # invocation from the post-`expand_imports` decl stream + module
@@ -19165,7 +19280,7 @@ fn typecheck_program(file: String, modules: [ModuleDecls],
                       proto_impls: [ProtoImplReg],
                       verbose: Bool) : TypedProgram / Console + File =
   typecheck_program_with_head_owners(file, modules, proto_impls,
-                                     head_owner_seed(), [], verbose)
+                                     head_owner_seed(), [], st_empty(), verbose)
 
 # variant accepting the per-compile head-owner cache. The
 # cache is built once by `compile_source` after `expand_imports`
@@ -19176,6 +19291,7 @@ fn typecheck_program_with_head_owners(file: String, modules: [ModuleDecls],
                                        proto_impls: [ProtoImplReg],
                                        head_owners: [HeadOwnerEntry],
                                        kind_theories: [KindTheory],
+                                       tab: SymTab,
                                        verbose: Bool) : TypedProgram / Console + File {
 
 
@@ -19186,7 +19302,7 @@ fn typecheck_program_with_head_owners(file: String, modules: [ModuleDecls],
   let all_program_decls = flatten_module_decls(modules, [])
   typecheck_program_loop(file, modules, module_env_delta_empty(),
                           all_program_decls,
-                          proto_impls, head_owners, kind_theories, verbose,
+                          proto_impls, head_owners, kind_theories, tab, verbose,
                           [], 0, [], [], [], [], [], 0, 0)
 }
 
@@ -19210,6 +19326,7 @@ fn typecheck_program_loop(file: String, modules: [ModuleDecls],
                             proto_impls: [ProtoImplReg],
                             head_owners: [HeadOwnerEntry],
                             kind_theories: [KindTheory],
+                            tab: SymTab,
                             verbose: Bool,
                             acc_decls: [Decl],
                             acc_errs: Int,
@@ -19237,14 +19354,14 @@ fn typecheck_program_loop(file: String, modules: [ModuleDecls],
     }
     [m, ...rest] -> {
       let r = typecheck_module(file, m, acc_delta, all_program_decls,
-                                  proto_impls, head_owners, kind_theories, verbose)
+                                  proto_impls, head_owners, kind_theories, tab, verbose)
       let next_delta = merge_env_deltas(acc_delta, r.delta)
       let next_core_len = match core_len_acc {
         0 -> r.typed.core_len
         _ -> core_len_acc
       }
       typecheck_program_loop(file, rest, next_delta, all_program_decls,
-                              proto_impls, head_owners, kind_theories, verbose,
+                              proto_impls, head_owners, kind_theories, tab, verbose,
                               prepend_reverse_decls(r.typed.decls, acc_decls),
                               acc_errs + r.typed.errs,
                               llvm_prepend_reverse(r.typed.insts, acc_insts),
@@ -19524,7 +19641,7 @@ fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
                                proto_impls: [ProtoImplReg]) : TypedProgram / Console + File =
   infer_program_with_protos_cached(file, decls, verbose, proto_impls,
                                    head_owner_seed(),
-                                   atomic_kind_theories(decls))
+                                   atomic_kind_theories(decls), st_empty())
 
 # variant accepting the per-compile head-owner cache. The
 # `compile_source` driver builds the cache from the post-`expand_imports`
@@ -19535,7 +19652,8 @@ fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
 pub fn infer_program_with_protos_cached(file: String, decls: [Decl], verbose: Bool,
                                        proto_impls: [ProtoImplReg],
                                        head_owners: [HeadOwnerEntry],
-                                       kind_theories: [KindTheory]) : TypedProgram / Console + File {
+                                       kind_theories: [KindTheory],
+                                       tab: SymTab) : TypedProgram / Console + File {
 
 
   # Hanga Roa modular typecheck: partition the post-cascade decl
@@ -19555,7 +19673,7 @@ pub fn infer_program_with_protos_cached(file: String, decls: [Decl], verbose: Bo
     [_]          -> [ModuleDecls { name: None, decls: decls }]
     _            -> mods0
   }
-  typecheck_program_with_head_owners(file, mods, proto_impls, head_owners, kind_theories, verbose)
+  typecheck_program_with_head_owners(file, mods, proto_impls, head_owners, kind_theories, tab, verbose)
 }
 
 
@@ -19619,7 +19737,7 @@ fn synth_find_arg(scope: [TyEntry], want: Ty, fresh: Int, avoid: [String], sub: 
       if list_has_string(avoid, te.name) or (not synth_return_structural(te.scheme)) {
         synth_find_arg(rest, want, fresh, avoid, sub)
       } else {
-        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty(), vindex: vix_empty() }, te.scheme)
+        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
         match unify(inst.ty, want, sub) {
           Some(sub1) -> Some(ArgMatch { name: te.name, sub: sub1, fresh: inst.env.fresh })
           None       -> synth_find_arg(rest, want, fresh, avoid, sub)
@@ -19648,7 +19766,7 @@ fn synth_find_args(scope: [TyEntry], params: [Ty], fresh: Int, avoid: [String],
 # Try entry `te` as a direct match or a 1-level application against
 # `expected`. Returns rendered candidate text or None.
 fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int) : Option[String] / Mutable {
-  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty(), vindex: vix_empty() }, te.scheme)
+  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
   match unify(inst.ty, expected, subst_empty()) {
     Some(_) -> Some(te.name)
     None    -> match inst.ty {

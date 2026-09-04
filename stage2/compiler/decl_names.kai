@@ -1,11 +1,22 @@
-# compiler/name_table.kai — the one table every name class is keyed in.
-#
-# A name's identity is `(home, class, name)`. Each declaration form
-# contributes its entries here once, at construction, so no class has
-# to grow its own collision scan and no two classes can disagree about
-# what a collision is. `NCls` separates the namespaces that genuinely
-# do not compete: a `type Log` and an `effect Log` are two habitants,
-# not a collision.
+#[doc("""
+Every name a declaration stream introduces, with the class it competes
+in and the module that declares it.
+
+One walker knows every declaration form and every name class a form
+contributes — a `type` contributes the habitant AND its constructors,
+a `kind` contributes the kind AND, through the habitants declared
+against it, their own class. Teaching a new form here teaches every
+consumer at once.
+
+Names enter as the user wrote them: a declaration's identity is the
+module that owns it, so two modules declaring `Item` contribute two
+entries under ONE name rather than one entry under two names — which is
+what lets a contested bare use be recognised as contested at all.
+
+While the type and effect scope passes still respell a contested
+declaration ahead of this walk, the written name has to be recovered
+from the spelling. That strip goes when the respelling does.
+""")]
 
 import compiler.util
 import compiler.ast
@@ -16,7 +27,7 @@ import compiler.home_spell
 pub type NCls = NCFn | NCType | NCEffect | NCConst | NCProtocol
               | NCCtor | NCKind | NCExternType | NCUnit | NCModule
 
-#[doc("One declared name: `NEnt(class, name, home, pub)`. Root-file declarations carry the target module as home.")]
+#[doc("One declared name: `NEnt(class, name, home, exported)`. Root-file declarations carry the target module as home.")]
 pub type NEnt = NEnt(NCls, String, String, Bool)
 
 #[doc("The English word for a class, as it appears in a diagnostic.")]
@@ -33,7 +44,8 @@ pub fn ncls_word(c: NCls) : String = match c {
   NCModule     -> "module"
 }
 
-fn ncls_eq(a: NCls, b: NCls) : Bool = ncls_word(a) == ncls_word(b)
+#[doc("True when two name classes are the same namespace.")]
+pub fn ncls_same(a: NCls, b: NCls) : Bool = ncls_word(a) == ncls_word(b)
 
 #[doc("Every name `decls` declares, in stream order. `target` is the root file's module name, the home of every untagged declaration.")]
 pub fn nt_collect(decls: [Decl], target: String) : [NEnt] =
@@ -70,13 +82,13 @@ fn nt_mo(mo: Option[String], target: String) : String = match mo {
 }
 
 fn nt_one(d: Decl, home: String, acc: [NEnt]) : [NEnt] = match d {
-  DFn(p, n, _, _, _, _, _, _, _, _)   -> [NEnt(NCFn, n, home, p), ...acc]
-  DConst(p, n, _, _, _, _, _)         -> [NEnt(NCConst, n, home, p), ...acc]
-  DEffect(p, n, _, _, _, _, _, mo)    -> [NEnt(NCEffect, hs_display(n, mo), home, p), ...acc]
-  DProtocol(p, n, _, _, _, _, _)      -> [NEnt(NCProtocol, n, home, p), ...acc]
-  DKind(p, n, _, _, _, _, _, _)       -> [NEnt(NCKind, n, home, p), ...acc]
-  DUnit(p, n, _, _, _, _, _)          -> [NEnt(NCUnit, n, home, p), ...acc]
-  DExternType(n, _, _, _, _)          -> [NEnt(NCExternType, n, home, true), ...acc]
+  DFn(p, n, _, _, _, _, _, _, _, _)    -> [NEnt(NCFn, n, home, p), ...acc]
+  DConst(p, n, _, _, _, _, _)          -> [NEnt(NCConst, n, home, p), ...acc]
+  DEffect(p, n, _, _, _, _, _, mo)     -> [NEnt(NCEffect, hs_display(n, mo), home, p), ...acc]
+  DProtocol(p, n, _, _, _, _, _)       -> [NEnt(NCProtocol, n, home, p), ...acc]
+  DKind(p, n, _, _, _, _, _, _)        -> [NEnt(NCKind, n, home, p), ...acc]
+  DUnit(p, n, _, _, _, _, _)           -> [NEnt(NCUnit, n, home, p), ...acc]
+  DExternType(n, _, _, _, _)           -> [NEnt(NCExternType, n, home, true), ...acc]
   DAxiom(p, _, n, _, _, _, _, _, _, _) -> [NEnt(NCFn, n, home, p), ...acc]
   # A `type` contributes the habitant AND every constructor it
   # introduces: one declaration form, two name classes.
@@ -114,63 +126,4 @@ fn nt_origins(os: [ProtoOriginReg], target: String, acc: [NEnt]) : [NEnt] = matc
   [] -> acc
   [PrOR(n, mo, p), ...rest] ->
     nt_origins(rest, target, [NEnt(NCProtocol, n, nt_mo(mo, target), p), ...acc])
-}
-
-#[doc("Only the entries of class `cls`.")]
-pub fn nt_only(t: [NEnt], cls: NCls) : [NEnt] = match t {
-  [] -> []
-  [NEnt(c, n, h, p), ...rest] ->
-    if ncls_eq(c, cls) { [NEnt(c, n, h, p), ...nt_only(rest, cls)] }
-    else { nt_only(rest, cls) }
-}
-
-#[doc("Every name declared by two or more homes in class `cls`, each once, in stream order.")]
-pub fn nt_collisions(t: [NEnt], cls: NCls) : [String] =
-  nt_coll_loop(nt_only(t, cls), [], [])
-
-fn nt_coll_loop(t: [NEnt], seen: [String], acc: [String]) : [String] = match t {
-  [] -> list_reverse(acc)
-  [NEnt(c, n, _, _), ...rest] ->
-    if list_has(seen, n) { nt_coll_loop(rest, seen, acc) }
-    else if list_length(nt_homes(t, c, n)) > 1 { nt_coll_loop(rest, [n, ...seen], [n, ...acc]) }
-    else { nt_coll_loop(rest, [n, ...seen], acc) }
-}
-
-#[doc("The homes that declare `name` in class `cls`, deduplicated, in stream order. Fewer than two means the name resolves without qualification.")]
-pub fn nt_homes(t: [NEnt], cls: NCls, name: String) : [String] =
-  nt_homes_loop(t, cls, name, [])
-
-fn nt_homes_loop(t: [NEnt], cls: NCls, name: String, acc: [String]) : [String] =
-  match t {
-    [] -> list_reverse(acc)
-    [NEnt(c, n, h, _), ...rest] ->
-      if n == name and ncls_eq(c, cls) and list_has(acc, h) == false {
-        nt_homes_loop(rest, cls, name, [h, ...acc])
-      } else { nt_homes_loop(rest, cls, name, acc) }
-  }
-
-#[doc("True when `home` itself declares `name` in class `cls`. The reader's own module wins over every import, so such a use is never ambiguous.")]
-pub fn nt_declares(t: [NEnt], cls: NCls, name: String, home: String) : Bool =
-  match t {
-    [] -> false
-    [NEnt(c, n, h, _), ...rest] ->
-      if n == name and h == home and ncls_eq(c, cls) { true }
-      else { nt_declares(rest, cls, name, home) }
-  }
-
-#[doc("The candidate homes a bare use of `name` must choose between, or `[]` when the ladder already resolves it: the reader's own declaration wins, the non-core homes outrank the cores, and a single candidate on the first rung needs no qualifier.")]
-pub fn nt_contested(t: [NEnt], cls: NCls, name: String, reader: String,
-      core: [String]) : [String] =
-  if nt_declares(t, cls, name, reader) { [] }
-  else {
-    let homes = nt_homes(t, cls, name)
-    let user = nt_drop_cores(homes, core)
-    let rung = if list_length(user) > 0 { user } else { homes }
-    if list_length(rung) <= 1 { [] } else { rung }
-  }
-
-fn nt_drop_cores(homes: [String], core: [String]) : [String] = match homes {
-  [] -> []
-  [h, ...rest] ->
-    if list_has(core, h) { nt_drop_cores(rest, core) } else { [h, ...nt_drop_cores(rest, core)] }
 }

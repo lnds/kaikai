@@ -2,16 +2,18 @@
 The decision a use site's name resolves to: local binder, one symbol,
 a contested candidate set, or nothing.
 
-This is the whole point of the phase. Today each consumer re-derives
+This is the whole point of the phase. Each consumer used to re-derive
 this decision downstream by comparing strings its own way, which is how
-two of them come to pick different declarations for one bare name. Here
+two of them came to pick different declarations for one bare name. Here
 the decision is made once, in the resolver, and recorded.
 
-The order is the language's: a binder in scope shadows a declaration,
-and a declaration in the use site's own home wins over one imported
-from elsewhere. Only when the bare name reaches more than one home does
-the site stay a candidate set for the typer to narrow — the protocol
-dispatch case, which already works that way de facto.
+The order is the language's, and it is one order for every name class:
+a binder in scope shadows a declaration, then the scope view's rungs
+carry the name outward — the use site's own module, the names its
+selective imports pick, the modules it imports, the prelude cores, and
+finally anything visible. Only when a rung holds more than one
+declaration does the site stay a candidate set for the typer to narrow
+— the protocol dispatch case, which already works that way de facto.
 
 "The use site's own home" is a module symbol's id, not its spelling.
 Two homonymous modules hold two ids, so a declaration in one never
@@ -19,7 +21,8 @@ answers a use in the other, however the two are written.
 """)]
 
 import compiler.symtab
-import compiler.name_table
+import compiler.scope_view
+import compiler.decl_names
 
 #[doc("What the resolver decided a use site names.")]
 pub type UseRes
@@ -28,61 +31,50 @@ pub type UseRes
   | URCands([Int])
   | URUnres
 
-#[doc("Resolve the value name `name`, used inside the module symbol `home`, given whether a binder in scope shadows it.")]
-pub fn ru_value(t: SymTab, name: String, home: SymId, shadowed: Bool) : UseRes =
-  if shadowed { URLocal } else { ru_decl(t, name, home) }
+#[doc("Resolve `name` in class `cls`, used under the scope view `v`, given whether a binder in scope shadows it.")]
+pub fn ru_class(t: SymTab, v: ScopeView, cls: NCls, name: String,
+      shadowed: Bool) : UseRes =
+  if shadowed { URLocal } else { ru_of(sv_resolve(t, v, cls, name)) }
+
+fn ru_of(r: SvRes) : UseRes = match r {
+  SvSym(s)    -> URSym(sym_raw(s))
+  SvAmbig(ss) -> URCands(ru_raw(ss))
+  SvNone      -> URUnres
+}
 
 # Value names live in three declaration classes: a function, a
 # constant, or a variant constructor. They share one namespace at a use
-# site, so the lookup is one pass over the name's ids rather than three
-# class-keyed probes.
-fn ru_decl(t: SymTab, name: String, home: SymId) : UseRes =
-  ru_pick(t, ru_value_ids(t, st_by_name(t, name)), home)
+# site, so a value lookup climbs the rungs once over all three rather
+# than resolving each class apart and picking between the answers.
+fn ru_value_classes() : [NCls] = [NCFn, NCConst, NCCtor]
 
-fn ru_value_ids(t: SymTab, ids: [SymId]) : [SymId] = match ids {
-  [] -> []
-  [s, ...rest] ->
-    if ru_is_value(sym_class(t, s)) { [s, ...ru_value_ids(t, rest)] }
-    else { ru_value_ids(t, rest) }
-}
+#[doc("Resolve the value name `name`, used under the scope view `v`, given whether a binder in scope shadows it.")]
+pub fn ru_value_in(t: SymTab, v: ScopeView, name: String, shadowed: Bool) : UseRes =
+  if shadowed { URLocal }
+  else { ru_of(sv_resolve_any(t, v, ru_value_classes(), name)) }
 
-fn ru_is_value(c: NCls) : Bool = match c {
-  NCFn    -> true
-  NCConst -> true
-  NCCtor  -> true
-  _       -> false
-}
-
-# A declaration at home beats every other, so a module that declares
-# its own `parse` never reaches somebody else's. Without that rule the
-# home's own declaration would sit in the candidate set beside the
-# imports and the narrowing would have to re-derive precedence.
-fn ru_pick(t: SymTab, ids: [SymId], home: SymId) : UseRes = match ids {
-  []  -> URUnres
-  [s] -> URSym(sym_raw(s))
-  _   -> match ru_at_home(t, ids, home) {
-    Some(s) -> URSym(sym_raw(s))
-    None    -> URCands(ru_raw(ids))
-  }
-}
-
-fn ru_at_home(t: SymTab, ids: [SymId], home: SymId) : Option[SymId] = match ids {
-  [] -> None
-  [s, ...rest] ->
-    if sym_owned_by(t, s, home) { Some(s) } else { ru_at_home(t, rest, home) }
-}
+#[doc("Resolve the value name `name`, used inside the module symbol `home`, given whether a binder in scope shadows it. The home alone is the view: a caller with no import structure sees only its own module.")]
+pub fn ru_value(t: SymTab, name: String, home: SymId, shadowed: Bool) : UseRes =
+  ru_value_in(t, sv_of_home(home), name, shadowed)
 
 fn ru_raw(ids: [SymId]) : [Int] = match ids {
   []           -> []
   [s, ...rest] -> [sym_raw(s), ...ru_raw(rest)]
 }
 
-#[doc("Resolve the qualified call `mod.name`: the declaration the module named `mod` homes, ignoring every other home.")]
+#[doc("Resolve the qualified use `mod.name` in class `cls`: the declaration the module named `mod` homes, ignoring every other home.")]
+pub fn ru_qualified_class(t: SymTab, cls: NCls, modn: String, name: String) : UseRes =
+  ru_of(sv_qualified(t, cls, modn, name))
+
+#[doc("Resolve the qualified call `mod.name`: the value the module named `mod` homes, ignoring every other home.")]
 pub fn ru_qualified(t: SymTab, modn: String, name: String) : UseRes =
-  match st_module(t, modn) {
-    None    -> URUnres
-    Some(m) -> match ru_at_home(t, ru_value_ids(t, st_by_name(t, name)), m) {
-      Some(s) -> URSym(sym_raw(s))
-      None    -> URUnres
+  ru_qualified_any(t, ru_value_classes(), modn, name)
+
+fn ru_qualified_any(t: SymTab, cs: [NCls], modn: String, name: String) : UseRes =
+  match cs {
+    [] -> URUnres
+    [c, ...rest] -> match ru_qualified_class(t, c, modn, name) {
+      URUnres -> ru_qualified_any(t, rest, modn, name)
+      r       -> r
     }
   }
