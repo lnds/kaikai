@@ -160,9 +160,16 @@ lands on its own line above the body.
 ### What does not move
 
 - Structural forms keep their structure: a `match`, a block body, a
-  handler, a sum type's variants, an `if` whose branches the author
-  laid out as blocks are always multi-line and were before the width
-  model.
+  handler, an `if` whose branches the author laid out as blocks are
+  always multi-line and were before the width model. A `type` body is
+  not one of them — a sum type's variants and a record's fields both
+  ask the width, and both stay on the declaration's line when they fit
+  and the author kept them there.
+- A blank line the author left between the statements of a block is
+  kept, as the blank lines between top-level declarations always were:
+  a run of them collapses to one, and a blank opening or closing the
+  block goes. It is authorial layout the AST does not carry and the
+  writer cannot reconstruct.
 - Redundant parentheses the author wrote for emphasis are not
   preserved; they are not in the AST. Necessary ones are.
 - A multi-line string literal or raw attribute is one atom: its inner
@@ -187,13 +194,13 @@ and the one the author-break policy answers.
 
 ## The corpus
 
-`examples/fmt/width/` holds 18 fixtures, each hand-wrapped the way the
+`examples/fmt/width/` holds 21 fixtures, each hand-wrapped the way the
 documentation teaches and built so that collapsing it overflows the
 budget. One construct family per fixture: `=` bodies, call arguments,
 pipe chains, signatures, list and record literals, match arms,
 `if`/`else`, nested calls, trailing lambdas, statement bodies,
 operator chains, declarations, imports, handler clauses, generic
-bounds. Two are controls, asserted absolutely: `already_narrow` (fits
+bounds, contract clauses, sum-type bodies, blank lines. Two are controls, asserted absolutely: `already_narrow` (fits
 with room to spare; `soft` and `collapse` must be 0 — the net against
 a writer that invents breaks) and `unbreakable_atoms` (every
 over-budget line is `hard`; `soft` must be 0 — the net against a
@@ -226,7 +233,7 @@ Measured at 100 columns over the formatter's own output:
 
 | corpus | files | soft | soft_max | hard |
 |---|---|---|---|---|
-| `examples/fmt/width` | 18 | 0 | 0 | 2 |
+| `examples/fmt/width` | 21 | 0 | 0 | 2 |
 | `stdlib` | 74 | 0 | 0 | 90 |
 | `stage2/compiler` | 169 | 20 | 155 | 689 |
 
