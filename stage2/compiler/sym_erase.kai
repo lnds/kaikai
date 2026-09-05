@@ -11,38 +11,95 @@ of those spelling sites carry a second shape for no decision it makes.
 So the boundary is explicit and lives in one place, rather than each
 downstream pass growing its own `ESym` arm that quietly means `EVar`.
 A pass that ever needs the identity again reads it above this line.
+
+A bare spelling only carries the decision where the name answers to one
+declaration. Where several modules declare it and none of them is the
+reader's own, the erasure spells the home the resolver chose — the
+qualified form the backend already resolves by (name, home) — so the
+settled question is not re-asked by name below.
 """)]
 
 import compiler.ast
 import compiler.ast_map
+import compiler.symtab
+import compiler.decl_names
+import compiler.home_tu
 
-#[doc("The same declarations with every resolved reference spelled back as a plain name.")]
-pub fn sym_erase_decls(ds: [Decl]) : [Decl] = match ds {
+#[doc("The erasure's view of the program: the symbol table the resolver stamped from, and the module whose file is being built.")]
+pub type SymErase = SymErase(SymTab, String)
+
+#[doc("The same declarations with every resolved reference spelled as the backend reads it.")]
+pub fn sym_erase_decls_in(se: SymErase, ds: [Decl]) : [Decl] = match ds {
   []           -> []
-  [d, ...rest] -> [sym_erase_decl(d), ...sym_erase_decls(rest)]
+  [d, ...rest] -> [sym_erase_decl_in(se, d), ...sym_erase_decls_in(se, rest)]
 }
 
-#[doc("The same declaration with every resolved reference in its body spelled back as a plain name.")]
-pub fn sym_erase_decl(d: Decl) : Decl = match d {
+# The home a declaration's body sits in: the module whose other entries a
+# bare name inside it reaches without qualification.
+fn se_decl_home(se: SymErase, d: Decl) : String = match se {
+  SymErase(_, target) -> match home_tu(d) {
+    Some(m) -> m
+    None    -> target
+  }
+}
+
+#[doc("The same declaration with every resolved reference in its body spelled as the backend reads it.")]
+pub fn sym_erase_decl_in(se: SymErase, d: Decl) : Decl = se_decl_body(se, se_decl_home(se, d), d)
+
+fn se_decl_body(se: SymErase, h: String, d: Decl) : Decl = match d {
   DFn(p, n, tp, ps, rt, row, body, l, c, mo) ->
-    DFn(p, n, tp, ps, rt, row, sym_erase_expr(body), l, c, mo)
-  DTest(desc, body, l, c, mo)      -> DTest(desc, sym_erase_expr(body), l, c, mo)
-  DBench(desc, body, l, c, mo)     -> DBench(desc, sym_erase_expr(body), l, c, mo)
-  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, sym_erase_expr(body), l, c, mo)
-  DConst(p, n, ta, body, mo, l, c) -> DConst(p, n, ta, sym_erase_expr(body), mo, l, c)
-  DConstructor(inner, l, c)        -> DConstructor(sym_erase_decl(inner), l, c)
-  DProtoLaws(th, inner, l, c, mo)  -> DProtoLaws(th, sym_erase_decl(inner), l, c, mo)
-  DImplAxiom(th, inner, l, c, mo)  -> DImplAxiom(th, sym_erase_decl(inner), l, c, mo)
-  DDoc(raw, txt, inner, l, c)      -> DDoc(raw, txt, sym_erase_decl(inner), l, c)
-  DAttr(raw, inner, l, c)          -> DAttr(raw, sym_erase_decl(inner), l, c)
+    DFn(p, n, tp, ps, rt, row, sym_erase_expr_at(se, h, body), l, c, mo)
+  DTest(desc, body, l, c, mo)      -> DTest(desc, sym_erase_expr_at(se, h, body), l, c, mo)
+  DBench(desc, body, l, c, mo)     -> DBench(desc, sym_erase_expr_at(se, h, body), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, sym_erase_expr_at(se, h, body), l, c, mo)
+  DConst(p, n, ta, body, mo, l, c) -> DConst(p, n, ta, sym_erase_expr_at(se, h, body), mo, l, c)
+  DConstructor(inner, l, c)        -> DConstructor(se_decl_body(se, h, inner), l, c)
+  DProtoLaws(th, inner, l, c, mo)  -> DProtoLaws(th, se_decl_body(se, h, inner), l, c, mo)
+  DImplAxiom(th, inner, l, c, mo)  -> DImplAxiom(th, se_decl_body(se, h, inner), l, c, mo)
+  DDoc(raw, txt, inner, l, c)      -> DDoc(raw, txt, se_decl_body(se, h, inner), l, c)
+  DAttr(raw, inner, l, c)          -> DAttr(raw, se_decl_body(se, h, inner), l, c)
   _ -> d
 }
 
-#[doc("The same expression with every resolved reference in it spelled back as a plain name.")]
-pub fn sym_erase_expr(e: Expr) : Expr =
-  Expr { kind: sym_erase_kind(e.kind), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+fn sym_erase_expr_at(se: SymErase, h: String, e: Expr) : Expr =
+  Expr { kind: sym_erase_kind_at(se, h, e.kind), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
-fn sym_erase_kind(k: ExprKind) : ExprKind = match k {
-  ESym(_, n) -> EVar(n)
-  _          -> prc_map_expr_kind(k, (sub) => sym_erase_expr(sub))
+fn sym_erase_kind_at(se: SymErase, h: String, k: ExprKind) : ExprKind = match k {
+  ESym(s, n) -> sym_erase_ref(se, h, s, n)
+  _          -> prc_map_expr_kind(k, (sub) => sym_erase_expr_at(se, h, sub))
+}
+
+# A reference spells its home only where the bare name would leave the
+# decision open: a function several modules declare, none of them the root
+# file, and none of them the body's own module. A name reached from inside
+# its own home is not contested there, and the passes that read a
+# self-recursive call by name — the tail-call rewrite among them — only
+# see one when it stays bare.
+fn sym_erase_ref(se: SymErase, h: String, s: SymId, n: String) : ExprKind = match se {
+  SymErase(tab, target) -> {
+    let home = sym_home(tab, s)
+    if home == "" { EVar(n) }
+    else { match sym_class(tab, s) {
+      NCFn -> if se_spellable(tab, target, h, n) { EModCall(home, n) } else { EVar(n) }
+      _    -> EVar(n)
+    } }
+  }
+}
+
+# Contested, with no candidate the bare name already answers: a root-file
+# entry wins every bare call in the registry, and the body's own module
+# answers one before any import does.
+fn se_spellable(tab: SymTab, target: String, h: String, n: String) : Bool = {
+  let cands = st_candidates(tab, NCFn, n)
+  se_many(cands) and not se_any_home(tab, cands, target) and not se_any_home(tab, cands, h)
+}
+
+fn se_many(cands: [SymId]) : Bool = match cands {
+  [_, _, ..._] -> true
+  _            -> false
+}
+
+fn se_any_home(tab: SymTab, cands: [SymId], home: String) : Bool = match cands {
+  []           -> false
+  [c, ...rest] -> if sym_home(tab, c) == home { true } else { se_any_home(tab, rest, home) }
 }
