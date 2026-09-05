@@ -9,6 +9,7 @@
 # back into `fmt_decl` for impl-body methods.
 
 import compiler.util
+import compiler.lex
 import compiler.ast
 import compiler.fmt_writer
 import compiler.fmt_names
@@ -245,25 +246,85 @@ fn fmt_fn_ret(ret: Option[TypeExpr], s: FmtSt) : FmtSt = match ret {
   Some(t) -> fmt_type(t, fmt_emit(s, " : "))
 }
 
-# Contract clauses in signature position. Before an `= expr` body they
-# stay inline on the signature line; before a block body each clause
-# gets its own indented line and the `{` opens below them — the
-# collapsed `requires p {` shape does not re-parse (the pred swallows
-# the brace).
+# Contract clauses in signature position: a group with one break point
+# before each clause. Before a block body the group is always broken —
+# the collapsed `requires p {` shape does not re-parse (the pred
+# swallows the brace). Before an `= expr` body it is flat when the
+# whole signature fits and the author kept it flat, one clause per
+# line otherwise, with the `=` opening at the margin below them so no
+# clause line ends on a dangling opener.
 fn fmt_fn_contracts(reqs: [Expr], enss: [Expr], inner: Expr, s: FmtSt) : FmtSt {
   match inner.kind {
-    EBlock(_, _) -> {
-      let s1 = fmt_indent_in(s)
-      let s2 = fmt_clause_lines("requires", reqs, s1)
-      let s3 = fmt_clause_lines("ensures", enss, s2)
-      let s4 = fmt_newline(fmt_indent_out(s3))
-      fmt_fn_body_at_margin(inner, s4)
-    }
-    _ -> {
-      let s1 = fmt_contract_clauses("requires", reqs, s)
-      let s2 = fmt_contract_clauses("ensures", enss, s1)
-      fmt_fn_body(inner, s2)
-    }
+    EBlock(_, _) -> fmt_clauses_broken(reqs, enss, (t) => fmt_fn_body_at_margin(inner, t), s)
+    _ ->
+      if clauses_author_broke(s, reqs, enss) { fmt_clauses_expr_broken(reqs, enss, inner, s) }
+      else {
+        match fmt_try_flat(s, (t) => fmt_clauses_flat(reqs, enss, t)) {
+          Some(r) -> fmt_fn_body(inner, r)
+          None -> fmt_clauses_expr_broken(reqs, enss, inner, s)
+        }
+      }
+  }
+}
+
+# The clause run flat on the signature line, up to the body's opener.
+# Measured as one group: a `requires` that fits only by pushing the
+# `=` past the budget has not fit.
+fn fmt_clauses_flat(reqs: [Expr], enss: [Expr], s: FmtSt) : FmtSt =
+  fmt_contract_clauses("ensures", enss, fmt_contract_clauses("requires", reqs, s))
+
+# One clause per line, indented under the signature; `open` then emits
+# the body at the margin the clauses left.
+fn fmt_clauses_broken(reqs: [Expr], enss: [Expr], open: (FmtSt) -> FmtSt, s: FmtSt) : FmtSt {
+  let s1 = fmt_indent_in(s)
+  let s2 = fmt_clause_lines("requires", reqs, s1)
+  let s3 = fmt_clause_lines("ensures", enss, s2)
+  open(fmt_newline(fmt_indent_out(s3)))
+}
+
+fn fmt_clauses_expr_broken(reqs: [Expr], enss: [Expr], inner: Expr, s: FmtSt) : FmtSt =
+  fmt_clauses_broken(reqs, enss, (t) => fmt_assign_body(inner, fmt_emit(t, "=")), s)
+
+# The author broke the run when some `requires` / `ensures` keyword
+# opens a source line. The keyword is the break point, so it is the
+# token to ask about — the predicate after it never starts the line.
+fn clauses_author_broke(s: FmtSt, reqs: [Expr], enss: [Expr]) : Bool =
+  clause_kw_opens_line(s.toks, s, clauses_span_from(reqs, enss), clauses_span_to(reqs, enss))
+
+fn clause_kw_opens_line(toks: [Token], s: FmtSt, from: Int, to: Int) : Bool = match toks {
+  [] -> false
+  [t, ...rest] ->
+    if clause_kw_in_span(t, s, from, to) { true }
+    else { clause_kw_opens_line(rest, s, from, to) }
+}
+
+fn clause_kw_in_span(t: Token, s: FmtSt, from: Int, to: Int) : Bool {
+  let in_span = (clause_tok_is_kw(t.kind) and (t.line >= from)) and (t.line <= to)
+  in_span and fmt_starts_line(s, t.line, t.col)
+}
+
+fn clause_tok_is_kw(k: TokKind) : Bool = match k {
+  TkRequires -> true
+  TkEnsures -> true
+  _ -> false
+}
+
+# The clause run spans the lines its predicates occupy: a keyword
+# outside that window belongs to another declaration's contract.
+fn clauses_span_from(reqs: [Expr], enss: [Expr]) : Int =
+  preds_line_bound(enss, preds_line_bound(reqs, 0, true), true)
+
+fn clauses_span_to(reqs: [Expr], enss: [Expr]) : Int =
+  preds_line_bound(enss, preds_line_bound(reqs, 0, false), false)
+
+fn preds_line_bound(preds: [Expr], acc: Int, lo: Bool) : Int = match preds {
+  [] -> acc
+  [p, ...rest] -> {
+    let line = fmt_leftmost(p).line
+    let next = if acc == 0 { line }
+               else if lo { if line < acc { line } else { acc } }
+               else { if line > acc { line } else { acc } }
+    preds_line_bound(rest, next, lo)
   }
 }
 
@@ -326,7 +387,7 @@ pub fn fmt_type_decl(is_pub: Bool, name: String, tparams: [String], body: TypeBo
   match body {
     TBAlias(t) -> fmt_hang(fmt_emit(s4, " ="), fmt_type_starts_line(s4, t), (a) => fmt_type(t, a))
     TBRecord(fields) -> fmt_record_body(fields, line, s4)
-    TBSum(variants) -> fmt_sum_variants(variants, scan_elem_lines(s4.toks, line), s4)
+    TBSum(variants) -> fmt_sum_body(variants, line, s4)
     TBEffectAlias(labels) -> {
       let a = fmt_emit(s4, " = ")
       fmt_emit(a, string_join(labels, " + "))
@@ -350,20 +411,15 @@ fn fmt_habitant_slots_inner(slots: [String], s: FmtSt) : FmtSt = match slots {
 fn fmt_one_slot(slot: String, s: FmtSt) : FmtSt =
   fmt_emit(fmt_emit(fmt_emit(s, habitant_slot_name_of(slot)), ": "), habitant_slot_kind_of(slot))
 
-# True when any of the record's fields carries a comment of its own —
-# a trailing on its line, or a leading block above it. Drives the
-# one-field-per-line layout: the single-line form has nowhere to put a
-# mid-record comment, so it would push every one of them past the
-# closing brace.
-fn elem_lines_commented(fs: [FieldDecl], el: ElemLines, cmts: [Cmt], i: Int) : Bool = match fs {
-  [] -> false
-  [_, ...rest] ->
-    if cmt_within_elem(cmts, elem_line_at(el, i)) {
-      true
-    } else {
-      elem_lines_commented(rest, el, cmts, i + 1)
-    }
-}
+# True when one of a type body's elements carries a comment of its own
+# — a trailing on its line, or a leading block above it. Drives the
+# one-per-line layout for both record fields and sum variants: the
+# single-line form has nowhere to put a mid-body comment, so it would
+# push every one of them past the closing delimiter.
+fn elem_lines_commented(count: Int, el: ElemLines, cmts: [Cmt], i: Int) : Bool =
+  if i >= count { false }
+  else if cmt_within_elem(cmts, elem_line_at(el, i)) { true }
+  else { elem_lines_commented(count, el, cmts, i + 1) }
 
 # Any pending comment at or above `line` belongs inside the record:
 # `fmt_drain_before` has already emitted everything preceding the decl,
@@ -378,7 +434,7 @@ fn cmt_within_elem(cmts: [Cmt], line: Int) : Bool = match cmts {
 # wrote it that way, or when the one-line form does not fit.
 fn fmt_record_body(fields: [FieldDecl], line: Int, s: FmtSt) : FmtSt {
   let el = scan_elem_lines(s.toks, line)
-  if elem_lines_commented(fields, el, s.cmts, 0) or elem_lines_broken(el, list_length(fields), line) {
+  if elem_lines_commented(list_length(fields), el, s.cmts, 0) or elem_lines_broken(el, list_length(fields), line) {
     fmt_record_expanded(fields, el, s)
   } else {
     match fmt_try_flat(s, (t) => fmt_record_flat(fields, t)) {
@@ -454,6 +510,31 @@ fn fmt_field_attr(a: FieldAttr, s: FmtSt) : FmtSt = match a {
     let s2 = fmt_expr(e, s1)
     fmt_emit(s2, ")] ")
   }
+}
+
+# A sum body breaks one variant per line when a variant carries a
+# comment (a comment swallows the rest of its line), when the author
+# wrote it that way, or when the one-line form does not fit — the same
+# three questions a record body asks.
+fn fmt_sum_body(vs: [Variant], line: Int, s: FmtSt) : FmtSt {
+  let el = scan_elem_lines(s.toks, line)
+  if elem_lines_commented(list_length(vs), el, s.cmts, 0) or elem_lines_broken(el, list_length(vs), line) {
+    fmt_sum_variants(vs, el, s)
+  } else {
+    match fmt_try_flat(s, (t) => fmt_sum_flat(vs, t)) {
+      Some(r) -> r
+      None -> fmt_sum_variants(vs, el, s)
+    }
+  }
+}
+
+# `= A | B | C` on the declaration's own line.
+fn fmt_sum_flat(vs: [Variant], s: FmtSt) : FmtSt = fmt_sum_flat_loop(vs, fmt_emit(s, " = "))
+
+fn fmt_sum_flat_loop(vs: [Variant], s: FmtSt) : FmtSt = match vs {
+  [] -> s
+  [v] -> fmt_variant(v, s)
+  [v, ...rest] -> fmt_sum_flat_loop(rest, fmt_emit(fmt_variant(v, s), " | "))
 }
 
 pub fn fmt_sum_variants(vs: [Variant], el: ElemLines, s: FmtSt) : FmtSt {
