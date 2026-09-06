@@ -1319,7 +1319,8 @@ fn inf_head_owner_of(owners: [HeadOwnerEntry], cname: String) : Option[String] =
 # The contested decl is registered under its spelled name, which is
 # also the suffix hs_display strips — the lookup answers the owner and
 # proves the suffix at once.
-fn inf_tycon_display_ow(owners: [HeadOwnerEntry], cname: String) : String =
+#[doc("A nominal head as the reader wrote it: `mod.T` when the name was keyed by a home, the name itself otherwise.")]
+pub fn inf_tycon_display_ow(owners: [HeadOwnerEntry], cname: String) : String =
   match inf_head_owner_of(owners, cname) {
     None -> cname
     Some(own) -> {
@@ -2650,13 +2651,16 @@ fn is_effect_declared(eff_name: String, decls: [Decl]) : Bool {
 # the op" from "enclosing handle exists, clauses omit the op, default
 # does not fill the gap" — the help lines differ.
 
-fn report_uncovered_op(file: String, fname: String, eff_name: String,
+fn report_uncovered_op(file: String, fname: String, eff_raw: String,
                         op_name: String, decls: [Decl],
                         line: Int, col: Int, at_main: Bool) : Unit / Console + File {
+  # The row and the handler tables key the effect by its spelled name;
+  # what the reader is told to write is the name their source spells.
+  let eff_name = inf_tycon_display_ow(spelled_head_owners(decls, []), eff_raw)
   let qualified = concat_all([eff_name, ".", op_name])
   let header = concat_all(["effect not handled: ", qualified])
   diag_error(file, line, col, header)
-  let default_status = describe_default_status(eff_name, op_name, decls)
+  let default_status = describe_default_status(eff_raw, op_name, decls)
   diag_note(default_status)
   if at_main {
     diag_help(concat_all(["wrap the call in `handle { ... } with ",
@@ -8708,19 +8712,23 @@ fn tycon_pair_or_none(expected: Ty, found: Ty) : Option[TyConPair] {
 fn emit_union_focus_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console {
   let exp_name = tycon_name_or_empty(expected)
   let fnd_name = tycon_name_or_empty(found)
+  # The head carries the home a contested declaration was keyed by;
+  # what the reader is shown is the name their source spells.
+  let exp_shown = inf_tycon_display_ow(env.head_owners, exp_name)
+  let fnd_shown = inf_tycon_display_ow(env.head_owners, fnd_name)
   let exp_comps = if exp_name == "" { [] } else { variants_of_type(env, exp_name) }
   let fnd_comps = if fnd_name == "" { [] } else { variants_of_type(env, fnd_name) }
   let fnd_parents = if fnd_name == "" { [] } else { union_parents_of(env.unions, fnd_name) }
   match exp_comps {
     [] -> ()
-    _  -> diag_note("union: `#{exp_name}` = #{inf_join_with(exp_comps, " | ")}")
+    _  -> diag_note("union: `#{exp_shown}` = #{inf_join_with(exp_comps, " | ")}")
   }
   match fnd_comps {
     [] -> match fnd_parents {
       [] -> ()
-      [p, ..._rest] -> diag_note("`#{fnd_name}` is a component of `#{p}`")
+      [p, ..._rest] -> diag_note("`#{fnd_shown}` is a component of `#{inf_tycon_display_ow(env.head_owners, p)}`")
     }
-    _ -> diag_note("union: `#{fnd_name}` = #{inf_join_with(fnd_comps, " | ")}")
+    _ -> diag_note("union: `#{fnd_shown}` = #{inf_join_with(fnd_comps, " | ")}")
   }
   match exp_comps {
     [] -> ()
@@ -8730,15 +8738,16 @@ fn emit_union_focus_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console 
           # The expected union already lists the found's parent — so
           # the failure is the no-chains rule (D3 does not transit
           # through intermediate unions). Tell the user how to bridge.
-          diag_help("the D3 upcast does not chain; lift through `#{p}` first (e.g. `let x: #{p} = ...`)")
+          let ps = inf_tycon_display_ow(env.head_owners, p)
+          diag_help("the D3 upcast does not chain; lift through `#{ps}` first (e.g. `let x: #{ps} = ...`)")
         } else {
-          diag_help("extend `#{exp_name}` to include `#{fnd_name}` (or its parent `#{p}`), or narrow via `match` before the call")
+          diag_help("extend `#{exp_shown}` to include `#{fnd_shown}` (or its parent `#{inf_tycon_display_ow(env.head_owners, p)}`), or narrow via `match` before the call")
         }
       }
       # Found is itself a union (or a free TyCon with no parent).
       # Suggest the structural fix: include the found type, or narrow
       # via pattern matching at the call site.
-      [] -> diag_help("extend `#{exp_name}` to include `#{fnd_name}`, or narrow via `match` before the call")
+      [] -> diag_help("extend `#{exp_shown}` to include `#{fnd_shown}`, or narrow via `match` before the call")
     }
   }
 }
@@ -12902,20 +12911,27 @@ pub fn build_head_owner_map(decls: [Decl], modules: [ModuleEntry],
   }
 }
 
-# A home-spelled type (`Source__mod_a`) is not in any export list — the
-# exports carry the written name — but its spelling carries its owner.
-fn spelled_head_owners(ds: [Decl], acc: [HeadOwnerEntry]) : [HeadOwnerEntry] = match ds {
+# A home-spelled declaration (`Source__mod_a`) is not in any export
+# list — the exports carry the written name — but its spelling carries
+# its owner. Effects join types here: the runtime keys a perform on the
+# spelled label, so only the diagnostic un-spells it.
+#[doc("The home each home-spelled declaration in `ds` was keyed by, as head-owner entries a diagnostic un-spells names with.")]
+pub fn spelled_head_owners(ds: [Decl], acc: [HeadOwnerEntry]) : [HeadOwnerEntry] = match ds {
   [] -> acc
   [d, ...rest] -> match decl_transparent_inner(d) {
     Some(inner) -> spelled_head_owners([inner, ...rest], acc)
     None -> match d {
       DType(true, name, _, _, _, _, Some(m), _) ->
-        if hs_display(name, Some(m)) == name { spelled_head_owners(rest, acc) }
-        else { spelled_head_owners(rest, [HOE(name, [m]), ...acc]) }
+        spelled_head_owners(rest, spelled_owner(name, m, acc))
+      DEffect(_, name, _, _, _, _, _, Some(m)) ->
+        spelled_head_owners(rest, spelled_owner(name, m, acc))
       _ -> spelled_head_owners(rest, acc)
     }
   }
 }
+
+fn spelled_owner(name: String, m: String, acc: [HeadOwnerEntry]) : [HeadOwnerEntry] =
+  if hs_display(name, Some(m)) == name { acc } else { [HOE(name, [m]), ...acc] }
 
 fn collect_pub_type_names(ds: [Decl], acc: [String]) : [String] {
   match ds {
@@ -18661,14 +18677,15 @@ fn check_main_row_handlable(st: InferState, body_row: [Label],
           EU(_, uline, ucol) -> {
             let ln = if uline >= 0 { uline } else { line }
             let cl = if ucol  >= 0 { ucol  } else { col  }
+            let shown = inf_tycon_display_ow(st.env.head_owners, h.eff)
             let header = string_concat("`main` declares effect `",
-              string_concat(h.eff,
+              string_concat(shown,
                 "` but no default handler is installed for it"))
             diag_error(st.file, ln, cl, header)
             diag_note("only the canonical stdlib effects (Stdout, Stderr, Stdin, Env, File, Clock, Random, SecureRandom, NetTcp, Signal, Process, Log, Mutable, Cancel, Link, Monitor, Spawn) receive a default handler from the `main` wrapper")
-            diag_note("`#{h.eff}` is either user-declared or a capability-only effect (e.g. `Ffi`); the runtime would have no evidence for it at the top level")
-            diag_help("wrap the body in `handle { ... } with #{h.eff} { ... }` so the effect is closed before reaching `main`'s scope")
-            diag_help("or remove `/ #{h.eff}` from `main`'s declared row if the call site is dead code")
+            diag_note("`#{shown}` is either user-declared or a capability-only effect (e.g. `Ffi`); the runtime would have no evidence for it at the top level")
+            diag_help("wrap the body in `handle { ... } with #{shown} { ... }` so the effect is closed before reaching `main`'s scope")
+            diag_help("or remove `/ #{shown}` from `main`'s declared row if the call site is dead code")
             st_bump_err(st)
           }
         }
@@ -18704,7 +18721,8 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
             EU(_, uline, ucol) -> {
               let line = if uline >= 0 { uline } else { fline }
               let col  = if ucol  >= 0 { ucol  } else { fcol  }
-              let lab_str = label_to_string(apply_label_args(st.sub, lab))
+              let lab_str = label_display(st.env.head_owners,
+                                          label_to_string(apply_label_args(st.sub, lab)))
               # Template 5 — missing effect. Header keeps the
               # legacy "effect not handled: <label>" wording so all
               # prior fixtures still match; the shape notes
@@ -18795,6 +18813,14 @@ fn unify_label_args_into(a: [Ty], b: [Ty], st: InferState) : InferState / Consol
 # as the eff name; parameterised labels render as `Eff[T1, T2]` with
 # each ty_arg passed through `inf_ty_to_string` so unbound TyVars show as
 # `?tN`.
+#[doc("An effect label as the reader wrote it: the head un-spelled to `mod.Eff` when it was keyed by a home, its type arguments untouched.")]
+pub fn label_display(owners: [HeadOwnerEntry], lab: String) : String = {
+  let i = string_index_of_char(lab, '[')
+  if i < 0 { inf_tycon_display_ow(owners, lab) }
+  else { string_concat(inf_tycon_display_ow(owners, string_slice(lab, 0, i)),
+                       string_slice(lab, i, string_length(lab) - i)) }
+}
+
 #[doc("infer: `label_to_string` — driver-facing type.")]
 pub fn label_to_string(l: Label) : String {
   # strip the internal `@<cell>` identity suffix so a
