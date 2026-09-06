@@ -84,6 +84,23 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.115.0 (2026-09-05)
+
+### Added
+
+- **compiler**: protocol scoping goes through the chain; proto_scope.kai deleted (#1897) (#1923)
+
+### Fixed
+
+- **cache**: a bare call's ESym decodes, so its module hits the typed cut (#1922) (#1933)
+- **fmt**: a type body and a contract run consult the width; block blanks survive (#1932)
+- **compiler**: a contested callee is spelled by its home, not by name (#1897) (#1931)
+- **emit**: a raw-declared let binder resolves raw in every later read (#1924) (#1926)
+
+### Changed
+
+- **compiler**: the resolver's chosen home spells a contested call, so bare_pick goes (#1897) (#1936)
+
 ## v0.114.0 (2026-09-04)
 
 ### Added
