@@ -1,0 +1,202 @@
+#[doc("""
+The root file's ambiguous bare type names, decided by the symbol table.
+
+A bare type two imports both export is an error naming both candidates,
+the same error a contested constant or effect already gets. The name
+ladder that respells a contested declaration answers such a use with
+the bare name — no home won — and the typer then meets a use site the
+declarations no longer spell, reporting an unreadable mismatch that
+leaks the home-spelled name into user-facing text.
+
+The decision is taken here instead, before any of that: the use site
+resolves against the file's scope view, and two candidates on one rung
+are reported as the ambiguity they are. Identity comes from the table,
+so the report names the homes the user must choose between rather than
+a spelling downstream minted.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+import compiler.diag_file
+import compiler.expr_positions
+import compiler.decl_names
+import compiler.name_report
+import compiler.symtab
+import compiler.symtab_build
+import compiler.scope_view
+import compiler.scope_file
+import compiler.type_scope_table
+
+# The scan's fixed inputs: the table every name resolves against, the
+# root file's view of it, and the type parameters the enclosing
+# signature binds — a bound parameter is not a declaration any module
+# contests.
+type TsChk = { tab: SymTab, view: ScopeView, file: String, tps: [String] }
+
+#[doc("Report every bare type name of the root file that the scope view leaves contested; returns the error count. `all` is every declaration the table is built from, `decls` the segmented stream `segs` marks the imported files of.")]
+pub fn tschk_segmented(segs: [ImportSeg], decls: [Decl], all: [Decl],
+      scopes: [ModScope], global: [ModuleEntry], target: String,
+      cores: [String], sels: [SelImport], df: DiagFiles) : Int / Console + File {
+  let tab = st_build(all, target)
+  let views = fv_build(tab, scope_imports(scopes, global), sels, cores, target)
+  let cx = TsChk { tab: tab, view: fv_of(tab, views, target),
+                   file: df_root(df), tps: [] }
+  tschk_decls(tschk_root(segs, decls), cx, 0)
+}
+
+fn tschk_root(segs: [ImportSeg], decls: [Decl]) : [Decl] = match segs {
+  [] -> decls
+  [ISeg(_, n), ...rest] -> tschk_root(rest, seg_drop(decls, n))
+}
+
+fn tschk_decls(ds: [Decl], cx: TsChk, errs: Int) : Int / Console + File = match ds {
+  [] -> errs
+  [d, ...rest] -> tschk_decls(rest, cx, errs + tschk_decl(d, cx))
+}
+
+fn tschk_decl(d: Decl, cx0: TsChk) : Int / Console + File = match d {
+  DFn(_, _, tps, ps, ret, _, body, _, _, _) -> {
+    let cx = tschk_bind(cx0, tps)
+    tschk_params(ps, cx) + tschk_ty_opt(ret, cx) + tschk_expr(body, cx)
+  }
+  DConst(_, _, ty, body, _, _, _) -> tschk_ty(ty, cx0) + tschk_expr(body, cx0)
+  DTest(_, body, _, _, _)      -> tschk_expr(body, cx0)
+  DBench(_, body, _, _, _)     -> tschk_expr(body, cx0)
+  DCheck(_, ps, body, _, _, _) -> tschk_params(ps, cx0) + tschk_expr(body, cx0)
+  DType(_, _, tps, body, _, _, _, _) -> tschk_tbody(body, tschk_bind(cx0, tps))
+  DAxiom(_, _, _, _, tps, ps, ret, _, _, _) -> {
+    let cx = tschk_bind(cx0, tps)
+    tschk_params(ps, cx) + tschk_ty(ret, cx)
+  }
+  DImpl(_, tas, fty, subs, _, _, _) ->
+    tschk_tys(tas, cx0) + tschk_ty(fty, cx0) + tschk_decls(subs, cx0, 0)
+  DDerive(_, inner, _, _)       -> tschk_decl(inner, cx0)
+  DUnstable(inner, _, _)        -> tschk_decl(inner, cx0)
+  DProtoLaws(_, inner, _, _, _) -> tschk_decl(inner, cx0)
+  DImplAxiom(_, inner, _, _, _) -> tschk_decl(inner, cx0)
+  DConstructor(inner, _, _)     -> tschk_decl(inner, cx0)
+  DDoc(_, _, inner, _, _)       -> tschk_decl(inner, cx0)
+  DAttr(_, inner, _, _)         -> tschk_decl(inner, cx0)
+  _ -> 0
+}
+
+fn tschk_bind(cx: TsChk, tps: [String]) : TsChk =
+  TsChk { tab: cx.tab, view: cx.view, file: cx.file,
+          tps: list_append(cx.tps, tps) }
+
+fn tschk_tbody(b: TypeBody, cx: TsChk) : Int / Console + File = match b {
+  TBAlias(t)   -> tschk_ty(t, cx)
+  TBRecord(fs) -> tschk_fields(fs, cx)
+  TBSum(vs)    -> tschk_variants(vs, cx)
+  _ -> 0
+}
+
+fn tschk_fields(fs: [FieldDecl], cx: TsChk) : Int / Console + File = match fs {
+  [] -> 0
+  [FD(_, _, t, _), ...rest] -> tschk_ty(t, cx) + tschk_fields(rest, cx)
+}
+
+fn tschk_variants(vs: [Variant], cx: TsChk) : Int / Console + File = match vs {
+  [] -> 0
+  [Var(_, ts), ...rest] -> tschk_tys(ts, cx) + tschk_variants(rest, cx)
+}
+
+fn tschk_params(ps: [Param], cx: TsChk) : Int / Console + File = match ps {
+  [] -> 0
+  [p, ...rest] -> tschk_ty_opt(p.ptype, cx) + tschk_params(rest, cx)
+}
+
+fn tschk_ty_opt(o: Option[TypeExpr], cx: TsChk) : Int / Console + File = match o {
+  None    -> 0
+  Some(t) -> tschk_ty(t, cx)
+}
+
+fn tschk_ty(t: TypeExpr, cx: TsChk) : Int / Console + File = match t.tkind {
+  TyName(n, ts)    -> tschk_name(n, t.line, t.col, cx) + tschk_tys(ts, cx)
+  TyList(x)        -> tschk_ty(x, cx)
+  TyFn(ps, r, _)   -> tschk_tys(ps, cx) + tschk_ty(r, cx)
+  TyDim(x, _)      -> tschk_ty(x, cx)
+  TyRefine(x, _)   -> tschk_ty(x, cx)
+  _ -> 0
+}
+
+fn tschk_tys(ts: [TypeExpr], cx: TsChk) : Int / Console + File = match ts {
+  [] -> 0
+  [t, ...rest] -> tschk_ty(t, cx) + tschk_tys(rest, cx)
+}
+
+# An annotation inside a body reaches the same report as one in a
+# signature. `xp_positions` carries the walk to every sub-expression;
+# the arms here name only the positions that hold a type.
+fn tschk_expr(e: Expr, cx: TsChk) : Int / Console + File =
+  tschk_here(e, cx) + tschk_children(xp_positions(e), cx)
+
+fn tschk_here(e: Expr, cx: TsChk) : Int / Console + File = match e.kind {
+  ELambda(ps, _)        -> tschk_params(ps, cx)
+  EVariantsOf(t, _)     -> tschk_ty(t, cx)
+  EBlock(ss, _)         -> tschk_stmts(ss, cx)
+  EMatch(_, arms)       -> tschk_arms(arms, cx)
+  EHandle(_, _, _, ts, _, _, _, _) -> tschk_tys(ts, cx)
+  _ -> 0
+}
+
+fn tschk_stmts(ss: [Stmt], cx: TsChk) : Int / Console + File = match ss {
+  [] -> 0
+  [SLet(p, t, _), ...rest] ->
+    tschk_pat(p, cx) + tschk_ty_opt(t, cx) + tschk_stmts(rest, cx)
+  [_, ...rest] -> tschk_stmts(rest, cx)
+}
+
+fn tschk_arms(arms: [Arm], cx: TsChk) : Int / Console + File = match arms {
+  [] -> 0
+  [Arm(p, _, _), ...rest] -> tschk_pat(p, cx) + tschk_arms(rest, cx)
+}
+
+# A narrowing pattern names a type; every other position only holds
+# sub-patterns.
+fn tschk_pat(p: Pattern, cx: TsChk) : Int / Console + File = match p.pkind {
+  PNarrow(_, t)              -> tschk_ty(t, cx)
+  PVariant(_, _, subs)       -> tschk_pats(subs, cx)
+  PVariantRecord(_, _, fs)   -> tschk_pfields(fs, cx)
+  PRecord(fs)                -> tschk_pfields(fs, cx)
+  PList(subs, _)             -> tschk_pats(subs, cx)
+  PAs(_, inner)              -> tschk_pat(inner, cx)
+  PSurface(ps)               -> tschk_pats(patsurface_children(ps), cx)
+  _ -> 0
+}
+
+fn tschk_pats(ps: [Pattern], cx: TsChk) : Int / Console + File = match ps {
+  [] -> 0
+  [p, ...rest] -> tschk_pat(p, cx) + tschk_pats(rest, cx)
+}
+
+fn tschk_pfields(fs: [PField], cx: TsChk) : Int / Console + File = match fs {
+  [] -> 0
+  [PField(_, sub, _), ...rest] -> tschk_pat(sub, cx) + tschk_pfields(rest, cx)
+}
+
+fn tschk_children(ps: [XPos], cx: TsChk) : Int / Console + File = match ps {
+  [] -> 0
+  [XP(_, child), ...rest] -> tschk_expr(child, cx) + tschk_children(rest, cx)
+}
+
+# A qualifier IS the choice, and a type parameter is bound by its own
+# signature rather than declared by a module: neither can be contested.
+fn tschk_name(n: String, l: Int, c: Int, cx: TsChk) : Int / Console + File =
+  if list_has(cx.tps, n) { 0 }
+  else { match split_dotted_qualifier(n) {
+    Some(_) -> 0
+    None -> match sv_resolve(cx.tab, cx.view, NCType, n) {
+      SvAmbig(ss) -> {
+        nr_error_ambiguous(cx.file, l, c, NCType, n, tschk_homes(cx.tab, ss, []), "")
+        1
+      }
+      _ -> 0
+    }
+  } }
+
+fn tschk_homes(t: SymTab, ss: [SymId], acc: [String]) : [String] = match ss {
+  [] -> list_reverse(acc)
+  [s, ...rest] -> tschk_homes(t, rest, [sym_home(t, s), ...acc])
+}
