@@ -14,7 +14,7 @@ BASELINE_FILE="$ROOT/tools/corrective-pass-baseline.txt"
 
 count=0
 alive=""
-for p in ta_scope unit_scope proto_scope const_scope; do
+for p in ta_scope unit_scope proto_scope const_scope bare_pick; do
   if [ -f "$ROOT/stage2/compiler/$p.kai" ]; then
     count=$((count + 1)); alive="$alive $p"
   fi
