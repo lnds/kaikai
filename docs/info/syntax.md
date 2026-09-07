@@ -86,6 +86,9 @@ type Shade = Light | Dark                      # another sum
 type ColorErr = Color | Shade                  # union of PRE-DECLARED sums
                                                #   (not new ctors; narrow
                                                #   with `n : T ->` arms)
+type Both = pa.Cfg | pb.Cfg                    # a member may be qualified,
+                                               #   which is how two homonymous
+                                               #   imported types are told apart
 type Web = Stdout + Mutable                    # effect alias (row)
 
 effect Logger {                                # effect declaration
