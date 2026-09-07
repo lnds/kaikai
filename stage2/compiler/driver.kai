@@ -40,6 +40,9 @@ import compiler.fmt
 import compiler.fmt_writer
 import compiler.migrate
 import compiler.migrate_scan
+import compiler.mutate
+import compiler.mutate_splice
+import compiler.mutate_report
 import compiler.cache
 import compiler.cache_delta_test
 import compiler.symtab_test
@@ -1607,6 +1610,16 @@ pub type Mode
   # emits nothing (exit 0).
   | MFmt(Int)
   | MFmtCheck(Int)
+  # `kai mutate` — mutation testing. MMutateList catalogues every
+  # mutation site the operators find in the parsed program, one
+  # tab-separated record per line (MMutateListJson the same as JSON);
+  # MMutateApply(i) writes the source with site `i` mutated to stdout.
+  # Both stop right after parse: a mutation is a surface rewrite, and
+  # running the semantic pipeline on the parent would only slow the
+  # enumeration down.
+  | MMutateList
+  | MMutateListJson
+  | MMutateApply(Int)
   # `--migrate` — edition source migration. Parse, rewrite every
   # edition-broken surface form the rule set knows, re-emit through
   # the fmt-writer. Prints the migrated source to stdout and a
@@ -1832,6 +1845,15 @@ fn cli_parse_width(w: String) : Int = match string_to_int(w) {
   None -> fmt_default_width()
 }
 
+# A site index is an offset into the catalogue `--mutate-list` prints.
+# A non-numeric or negative argument resolves to -1, which no site
+# carries, so the run reports the bad index rather than mutating
+# something the caller did not name.
+fn cli_parse_site(w: String) : Int = match string_to_int(w) {
+  Some(n) -> if n >= 0 { n } else { 0 - 1 }
+  None -> 0 - 1
+}
+
 # Set the consumer-package name parsed from kai.toml. The value flows
 # through to the qualified-call rewriter so self-imports from a
 # package's own modules never emit the unstable warning.
@@ -2015,6 +2037,15 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         }
       } else if a == "--migrate" {
         parse_cli_loop(more, cli_with_mode(opts, MMigrate))
+      } else if a == "--mutate-list" {
+        parse_cli_loop(more, cli_with_mode(opts, MMutateList))
+      } else if a == "--mutate-list-json" {
+        parse_cli_loop(more, cli_with_mode(opts, MMutateListJson))
+      } else if a == "--mutate-apply" {
+        match more {
+          [i, ...more2] -> parse_cli_loop(more2, cli_with_mode(opts, MMutateApply(cli_parse_site(i))))
+          [] -> { eprint("kaic2: --mutate-apply requires a site index"); cli_with_mode(opts, MHelp) }
+        }
       } else if a == "--library-mode" {
         parse_cli_loop(more, cli_with_mode(opts, MLibraryMode))
       } else if a == "--diags-json" {
@@ -2164,6 +2195,9 @@ fn usage() : Unit / Console {
   eprint("  --fmt              pretty-print canonical kaikai source to stdout (Tongariki)")
   eprint("  --fmt-check        write formatted source to stdout iff different from input; exit 1")
   eprint("  --fmt-width <n>    line width for --fmt / --fmt-check (default 100)")
+  eprint("  --mutate-list      list every mutation site: id, operator, line, col, description")
+  eprint("  --mutate-list-json same catalogue as JSON")
+  eprint("  --mutate-apply <i> write the source with mutation site <i> applied to stdout")
   eprint("  --library-mode     run lex/parse/resolve/infer; answer `# @probe <kind> L:C` queries as JSON (issue #454)")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
   eprint("  --package-name <n>   identifier of the consuming package (from kai.toml `name`); silences #unstable on self-imports (#602)")
@@ -4534,6 +4568,46 @@ fn run_migrate_ok(out: String, reps: [MigRep], flips: Int) : Int / Console = {
   0
 }
 
+# Write the source with one mutation site applied to stdout. A mutant
+# costs a full rebuild of whatever the oracle compiles, so a mutant that
+# does not parse is that cost spent for nothing: the rewritten source is
+# reparsed here and the run fails without printing rather than handing
+# the caller a guaranteed compile-fail. A parse failure is a defect in
+# an operator's span arithmetic, not a property of the corpus.
+fn run_mutate_apply(path: String, src: String, toks: [Token], decls: [Decl], i: Int) : Int / Console = {
+  let sites = mutate_sites(decls)
+  match mut_site_at(sites, i) {
+    None -> {
+      eprint("mutate: no site #{int_to_string(i)} (the file has #{int_to_string(list_length(sites))})")
+      1
+    }
+    Some(site) -> match mut_apply(site, toks, src) {
+      None -> { eprint("mutate: site #{int_to_string(i)} does not resolve to a source span"); 1 }
+      Some(out) -> run_mutate_checked(path, out, i)
+    }
+  }
+}
+
+fn run_mutate_checked(path: String, out: String, i: Int) : Int / Console =
+  match parse_program(path, out, tokenize(out)).decls {
+    None -> { eprint("mutate: site #{int_to_string(i)} produced source that does not parse"); 1 }
+    Some(_) -> { print(mut_strip_final_newline(out)); 0 }
+  }
+
+# `print` re-adds the newline the source already carries, so the mutant
+# would otherwise gain a blank last line its parent does not have.
+fn mut_strip_final_newline(out: String) : String = {
+  let n = string_length(out)
+  if n > 0 and string_slice(out, n - 1, 1) == "\n" { string_slice(out, 0, n - 1) } else { out }
+}
+
+fn mut_site_at(sites: [MutSite], i: Int) : Option[MutSite] {
+  match sites {
+    [] -> None
+    [s, ...rest] -> if i == 0 { Some(s) } else { mut_site_at(rest, i - 1) }
+  }
+}
+
 # `batch_out`, when `Some(p)`, redirects the C-backend `.c` emission
 # to `write_file(p, ...)` instead of stdout, so the batch driver can
 # write each fixture's output to its own file from one process. `None`
@@ -4708,6 +4782,20 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
               let cmts = collect_comments(src, tokens)
               run_migrate(path, src, own_decls, cmts, edition)
             }
+            # `kai mutate`. Same parse-then-stop shape as MFmt, but the
+            # output is the site catalogue rather than source. The
+            # mutant itself (MMutateApply) is the original source with
+            # one token span rewritten — never a re-print, so a mutant
+            # differs from its parent by the mutation and nothing else.
+            MMutateList -> {
+              print(mut_sites_text(path, mutate_sites(own_decls)))
+              0
+            }
+            MMutateListJson -> {
+              print(mut_sites_json(path, mutate_sites(own_decls)))
+              0
+            }
+            MMutateApply(i) -> run_mutate_apply(path, src, tokens, own_decls, i)
             _ -> {
             # Strip `#[doc(...)]` wrappers into the doc side table right
             # after parse — only `kai fmt` (above)

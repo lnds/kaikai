@@ -57,6 +57,8 @@ expect_reject "typecheck rejects unknown flag" "unknown flag" typecheck "$BOGUS"
 expect_reject "lint rejects unknown flag"      "unknown flag" lint "$BOGUS" x.kai
 expect_reject "fmt rejects unknown flag"       "unknown flag" fmt "$BOGUS" x.kai
 expect_reject "migrate rejects unknown flag"   "unknown flag" migrate "$BOGUS" x.kai
+expect_reject "mutate rejects unknown flag"    "unknown flag" mutate "$BOGUS"
+expect_reject "mutate rejects unknown operator" "unknown operator" mutate --operator nosuchop
 expect_reject "watch rejects unknown flag"     "unknown flag" watch "$BOGUS" x.kai
 expect_reject "init rejects unknown flag"      "unknown flag" init "$BOGUS"
 expect_reject "fetch rejects unknown flag"     "unknown flag" fetch "$BOGUS"

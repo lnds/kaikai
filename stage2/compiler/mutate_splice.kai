@@ -1,0 +1,189 @@
+# compiler/mutate_splice.kai — turning a mutation site into source.
+#
+# The AST says WHAT to break and WHERE; this module rewrites exactly
+# that span in the ORIGINAL source and leaves every other byte alone.
+#
+# The alternative — re-printing the mutated AST through the formatter —
+# was measured and rejected: `stage2/compiler/perceus.kai` is 5918
+# lines and formats to 7626, so a reprinted mutant would carry ~1700
+# lines of cosmetic reflow around the one line that matters. A diff
+# nobody can read is a diff nobody acts on, and an operator's effect
+# must be the only difference between a mutant and its parent.
+#
+# Spans come from the token stream, which carries absolute byte offsets
+# (`start` + `length`). A site's line/col locates its anchor token; the
+# operator decides how far the span reaches from there.
+
+import compiler.ast
+import compiler.lex
+import compiler.mutate
+import compiler.mutate_ops
+
+# --- token lookup -----------------------------------------------------
+
+# The first token at or after (line, col). Sites are anchored on a real
+# token, so the equal case is the hit; the "after" case only carries a
+# zero-width insertion whose anchor is the following token.
+fn tok_at(toks: [Token], line: Int, col: Int) : Option[Token] {
+  match toks {
+    [] -> None
+    [t, ...rest] ->
+      if t.line == line and t.col == col { Some(t) }
+      else { tok_at(rest, line, col) }
+  }
+}
+
+fn toks_from(toks: [Token], line: Int, col: Int) : [Token] {
+  match toks {
+    [] -> []
+    [t, ...rest] ->
+      if t.line == line and t.col == col { toks } else { toks_from(rest, line, col) }
+  }
+}
+
+fn tok_end(t: Token) : Int = t.start + t.length
+
+# --- span model -------------------------------------------------------
+
+#[doc("A byte range in the original source, half-open: `[from, to)`.")]
+pub type MutSpan = MSpan(Int, Int)
+
+#[doc("Start offset of a span.")]
+pub fn mspan_from(s: MutSpan) : Int = match s { MSpan(a, _) -> a }
+
+#[doc("End offset of a span, exclusive.")]
+pub fn mspan_to(s: MutSpan) : Int = match s { MSpan(_, b) -> b }
+
+# --- per-operator span resolution -------------------------------------
+
+#[doc("Resolve a mutation site to the byte span it rewrites, or None when the site's anchor token cannot be found.")]
+pub fn mut_span_of(site: MutSite, toks: [Token], src: String) : Option[MutSpan] {
+  let rest = toks_from(toks, ms_line(site), ms_col(site))
+  match rest {
+    [] -> None
+    [t, ..._] -> match ms_op(site) {
+      MOpArm -> mut_arm_span(site, toks, t)
+      MOpCall -> mut_call_span(rest, src, t)
+      # A negation is a zero-width insertion before the condition.
+      MOpNegate -> Some(MSpan(t.start, t.start))
+      # Comparison, connective and literal all rewrite one token, and
+      # the anchor IS that token: a binop node's line/col point at the
+      # operator, a literal's at the literal.
+      _ -> Some(MSpan(t.start, tok_end(t)))
+    }
+  }
+}
+
+# An arm runs from its own pattern's first token up to where the NEXT
+# arm's pattern begins, a boundary the site carries because a token scan
+# cannot find it: nothing in the token stream distinguishes an arm
+# boundary from a nested `match`, and two arms written on one line have
+# no newline between them at all.
+#
+# Ending the span at the next arm's first token consumes the whitespace
+# and newline between them, so the deletion leaves neither a blank line
+# nor a stray indent.
+fn mut_arm_span(site: MutSite, toks: [Token], first: Token) : Option[MutSpan] =
+  match mut_parse_pos(ms_end(site)) {
+    None -> None
+    Some(MPos2(l, c)) -> match tok_at(toks, l, c) {
+      None -> None
+      Some(nxt) -> Some(MSpan(first.start, nxt.start))
+    }
+  }
+
+# A `line:col` cue as the walk encodes it. None for a malformed or
+# empty key, which fails the site rather than mutating a guessed span.
+type MutPos2 = MPos2(Int, Int)
+
+fn mut_parse_pos(key: String) : Option[MutPos2] = {
+  let i = string_index_of_char(key, ':')
+  if i < 0 { None }
+  else {
+    let l = string_to_int(string_slice(key, 0, i))
+    let c = string_to_int(string_slice(key, i + 1, string_length(key) - i - 1))
+    match l {
+      None -> None
+      Some(lv) -> match c {
+        None -> None
+        Some(cv) -> Some(MPos2(lv, cv))
+      }
+    }
+  }
+}
+
+# `f(x)` -> `x`: one span covering the whole call, from the callee's
+# first token through the `)` that closes its argument list. The
+# replacement is the argument's own source, so the elision keeps the
+# argument exactly as the author wrote it.
+fn mut_call_span(rest: [Token], src: String, first: Token) : Option[MutSpan] =
+  match mut_call_close(rest, 0, false) {
+    0 -> None
+    close -> Some(MSpan(first.start, close))
+  }
+
+fn tok_depth_delta(t: Token) : Int = match t.kind {
+  TkLparen -> 1  TkLbracket -> 1  TkLbrace -> 1
+  TkRparen -> 0 - 1  TkRbracket -> 0 - 1  TkRbrace -> 0 - 1
+  _ -> 0
+}
+
+# Offset just past the `)` closing this call, or 0 when the token run
+# does not close. `opened` guards the callee tokens that precede the
+# argument list so the scan does not stop before it begins.
+fn mut_call_close(toks: [Token], depth: Int, opened: Bool) : Int {
+  match toks {
+    [] -> 0
+    [t, ...more] -> {
+      let d = depth + tok_depth_delta(t)
+      if opened and d == 0 { tok_end(t) }
+      else if d < 0 { 0 }
+      else { mut_call_close(more, d, opened or d > 0) }
+    }
+  }
+}
+
+# --- applying a mutation ----------------------------------------------
+
+#[doc("The mutated source for one site: the original with the site's span replaced. None when the site cannot be resolved against the token stream.")]
+pub fn mut_apply(site: MutSite, toks: [Token], src: String) : Option[String] =
+  match mut_span_of(site, toks, src) {
+    None -> None
+    Some(sp) -> Some(mut_splice(src, sp, mut_replacement(site, toks, src, sp)))
+  }
+
+fn mut_splice(src: String, sp: MutSpan, text: String) : String = {
+  let a = mspan_from(sp)
+  let b = mspan_to(sp)
+  concat_all([string_slice(src, 0, a), text,
+              string_slice(src, b, string_length(src) - b)])
+}
+
+# Call elision writes the argument back, which is the source between the
+# opening paren and the matching close. Every other operator's
+# replacement is fixed by the site itself.
+fn mut_replacement(site: MutSite, toks: [Token], src: String, sp: MutSpan) : String =
+  match ms_op(site) {
+    MOpCall -> mut_call_arg_text(toks_from(toks, ms_line(site), ms_col(site)), src, sp)
+    _ -> ms_to(site)
+  }
+
+fn mut_call_arg_text(rest: [Token], src: String, sp: MutSpan) : String =
+  match mut_call_open(rest, 0) {
+    0 -> ""
+    open -> {
+      let close = mspan_to(sp) - 1
+      if close > open { string_slice(src, open, close - open) } else { "" }
+    }
+  }
+
+# Offset just past the `(` that opens this call's argument list.
+fn mut_call_open(toks: [Token], depth: Int) : Int {
+  match toks {
+    [] -> 0
+    [t, ...more] -> match t.kind {
+      TkLparen -> tok_end(t)
+      _ -> mut_call_open(more, depth)
+    }
+  }
+}

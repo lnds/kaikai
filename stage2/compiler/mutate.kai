@@ -1,0 +1,280 @@
+# compiler/mutate.kai — `kai mutate` site collection.
+#
+# Mutation testing asks the test suite one question: if this line is
+# broken on purpose, does anything fail? A mutant that survives is a
+# hole with a file, a line and a diff.
+#
+# Sites come from the AST, never from a text scan: a `sed` mutant that
+# rewrites a string literal or a comment is noise, and the operators
+# below are shapes (`match` arms, gates, connectives) that only a parse
+# can see. The AST decides WHAT and WHERE; mutate_splice rewrites the
+# exact token span in the original source, so a mutant differs from its
+# parent by the mutation alone and by nothing else.
+#
+# The walk is the migrate_scan shape: one arm per decl form that owns an
+# expression, delegating to the shared expression walker.
+
+import compiler.ast
+import compiler.mutate_ops
+
+# --- the site model ---------------------------------------------------
+
+#[doc("One mutation site: where it lives, which operator applies, where its span ends, and the text that replaces it.")]
+pub type MutSite = MS(MutOp, Int, Int, String, String)
+
+# A source position. Local to the site walk: the splicer works in byte
+# offsets, and only the walk needs to talk about line/column pairs.
+type MutPos = MPos(Int, Int)
+
+#[doc("The operator that produced a mutation site.")]
+pub fn ms_op(s: MutSite) : MutOp = match s { MS(o, _, _, _, _) -> o }
+
+#[doc("Source line of a mutation site, 1-based.")]
+pub fn ms_line(s: MutSite) : Int = match s { MS(_, l, _, _, _) -> l }
+
+#[doc("Source column of a mutation site, 1-based.")]
+pub fn ms_col(s: MutSite) : Int = match s { MS(_, _, c, _, _) -> c }
+
+#[doc("Where the site's span ends, as `line:col`. Empty when the span is the anchor token itself, which is every operator but arm deletion.")]
+pub fn ms_end(s: MutSite) : String = match s { MS(_, _, _, f, _) -> f }
+
+#[doc("The text the mutation writes in place of the original span. Empty deletes the span.")]
+pub fn ms_to(s: MutSite) : String = match s { MS(_, _, _, _, t) -> t }
+
+# --- decl walk --------------------------------------------------------
+
+#[doc("Collect every mutation site in a parsed program, in source order.")]
+pub fn mutate_sites(decls: [Decl]) : [MutSite] =
+  reduce(map(decls, mut_decl_sites), [], cat_sites)
+
+fn cat_sites(a: [MutSite], b: [MutSite]) : [MutSite] = list_append(a, b)
+
+# Only decls that own an expression can host a mutation. `test` and
+# `check` bodies are deliberately excluded: mutating the oracle is not
+# a measurement of the oracle.
+fn mut_decl_sites(d: Decl) : [MutSite] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> mut_expr(body)
+  DConst(_, _, _, body, _, _, _) -> mut_expr(body)
+  DImpl(_, _, _, ds, _, _, _) -> mutate_sites(ds)
+  DDerive(_, inner, _, _) -> mut_decl_sites(inner)
+  DUnstable(inner, _, _) -> mut_decl_sites(inner)
+  DProtoLaws(_, inner, _, _, _) -> mut_decl_sites(inner)
+  DImplAxiom(_, inner, _, _, _) -> mut_decl_sites(inner)
+  DConstructor(inner, _, _) -> mut_decl_sites(inner)
+  DDoc(_, _, inner, _, _) -> mut_decl_sites(inner)
+  DAttr(_, inner, _, _) -> mut_decl_sites(inner)
+  _ -> []
+}
+
+# --- expression walk --------------------------------------------------
+
+# Child lists are traversed with the `map` + `reduce` prims rather than
+# a local list-match: an AST constructor's 2nd-field binder feeding a
+# bundle-local list-match is the shape kaic1 miscompiles into a runtime
+# non-exhaustive panic. Same discipline as migrate_scan.
+fn flatten_sites(xss: [[MutSite]]) : [MutSite] = reduce(xss, [], cat_sites)
+
+fn mut_expr(e: Expr) : [MutSite] =
+  list_append(mut_here(e), mut_children(e))
+
+# Sites the node itself contributes, before recursion.
+fn mut_here(e: Expr) : [MutSite] = match e.kind {
+  EBinop(op, _, _) -> mut_binop_site(op, e.line, e.col)
+  EIf(c, _, _) -> mut_cond_site(c)
+  EMatch(_, arms) -> mut_arm_sites(arms)
+  EInt(_, raw) -> [MS(MOpLiteral, e.line, e.col, "", mut_int_perturb(raw))]
+  EIntLit(raw) -> [MS(MOpLiteral, e.line, e.col, "", mut_int_perturb(raw))]
+  EBool(b) -> [MS(MOpLiteral, e.line, e.col, "", mut_bool_perturb(b))]
+  ECall(callee, cargs) -> mut_call_site(callee, cargs, e.line, e.col)
+  _ -> []
+}
+
+# A binop contributes a boundary shift or a connective swap, never
+# both: the two rules are disjoint on the operator token.
+fn mut_binop_site(op: String, line: Int, col: Int) : [MutSite] =
+  match mut_compare_swap(op) {
+    Some(to) -> [MS(MOpCompare, line, col, "", to)]
+    None -> match mut_connect_swap(op) {
+      Some(to) -> [MS(MOpConnect, line, col, "", to)]
+      None -> []
+    }
+  }
+
+# Negation wraps the condition rather than editing it, so the site is
+# anchored at the condition's own first token and the splice is a
+# prefix. A condition that already reads `not c` is skipped: inverting
+# it back is the identity, which is an equivalent mutant by
+# construction and would only inflate the survivor count.
+fn mut_cond_site(c: Expr) : [MutSite] = match c.kind {
+  EUnop(op, _) -> if op == "not" { [] } else { [mut_negate_at(c)] }
+  _ -> [mut_negate_at(c)]
+}
+
+fn mut_negate_at(c: Expr) : MutSite = match mut_leftmost(c) {
+  MPos(l, cc) -> MS(MOpNegate, l, cc, "", "not ")
+}
+
+# The leftmost source position an expression occupies. A node's own
+# line/col is the position of its DEFINING token, which for a call is
+# the opening paren and for a binop is the operator — both to the right
+# of where the expression actually starts. An operator that inserts or
+# deletes a prefix has to anchor on the real start or it splices into
+# the middle of the expression.
+fn mut_leftmost(e: Expr) : MutPos = match e.kind {
+  ECall(callee, _) -> mut_leftmost(callee)
+  EBinop(_, a, _) -> mut_leftmost(a)
+  EField(base, _) -> mut_leftmost(base)
+  EIndex(a, _) -> mut_leftmost(a)
+  EPipe(a, _) -> mut_leftmost(a)
+  EMapPipe(a, _) -> mut_leftmost(a)
+  EFlatMapPipe(a, _) -> mut_leftmost(a)
+  EFilterPipe(a, _) -> mut_leftmost(a)
+  ELitUnit(inner, _) -> mut_leftmost(inner)
+  _ -> MPos(e.line, e.col)
+}
+
+# Dropping an arm is the operator this tool exists for. The last arm is
+# never dropped: a `match` whose final arm is a catch-all becomes
+# non-exhaustive, which the typer rejects — a compile-fail that says
+# nothing about the corpus. Every earlier arm is a real candidate.
+#
+# An arm's extent runs to where the NEXT arm's pattern begins, and the
+# AST is the only authority on that: a token scan cannot tell an arm
+# boundary from a nested `match`, and two arms sharing one line have no
+# newline between them to find. The site therefore carries the next
+# arm's position in its `from` field, which the splicer reads back as
+# the span's end.
+#
+# The arm list is mapped to plain positions BEFORE the pairing, so the
+# walk never list-matches on the `EMatch` binder itself.
+fn mut_arm_sites(arms: [Arm]) : [MutSite] =
+  mut_arm_pairs(map(arms, mut_arm_pos), [])
+
+fn mut_arm_pos(a: Arm) : MutPos = match a { Arm(p, _, _) -> MPos(p.line, p.col) }
+
+# Pair each arm with its successor. The last arm has none, and dropping
+# it would leave a `match` the typer rejects as non-exhaustive — a
+# compile-fail that says nothing about the corpus — so it yields no site.
+fn mut_arm_pairs(ps: [MutPos], acc: [MutSite]) : [MutSite] {
+  match ps {
+    [] -> list_reverse(acc)
+    [_last] -> list_reverse(acc)
+    [p, ...rest] -> mut_arm_pairs(rest, list_append([mut_arm_site(p, rest)], acc))
+  }
+}
+
+fn mut_arm_site(p: MutPos, rest: [MutPos]) : MutSite = match p {
+  MPos(l, c) -> MS(MOpArm, l, c, mut_next_pos_key(rest), "")
+}
+
+# The successor's position, encoded as `line:col` — the splicer's cue
+# for where this arm's span ends.
+fn mut_next_pos_key(rest: [MutPos]) : String = match rest {
+  [] -> ""
+  [MPos(l, c), ..._] -> concat_all([int_to_string(l), ":", int_to_string(c)])
+}
+
+# Eliding a call keeps its first argument, which is only type-correct
+# when the call is a one-argument transform — the `f(x) -> x` shape of a
+# pass that silently does nothing. Zero-argument and multi-argument
+# calls are skipped rather than emitted as guaranteed compile-fails.
+fn mut_call_site(callee: Expr, cargs: [Expr], line: Int, col: Int) : [MutSite] =
+  if list_length(cargs) == 1 { [mut_call_at(callee)] } else { [] }
+
+fn mut_call_at(callee: Expr) : MutSite = match mut_leftmost(callee) {
+  MPos(l, c) -> MS(MOpCall, l, c, "", "")
+}
+
+# Sites from every direct sub-expression. Exhaustive over `ExprKind` by
+# design: a new variant is a compile error here rather than a subtree
+# the tool silently never mutates, which is the same failure mode the
+# tool exists to catch.
+fn mut_children(e: Expr) : [MutSite] = match e.kind {
+  EInt(_, _) -> []
+  EReal(_, _) -> []
+  EIntLit(_) -> []
+  EDecimalLit(_) -> []
+  EFixed(_, _) -> []
+  EBool(_) -> []
+  EChar(_) -> []
+  EStr(_, _) -> []
+  EUnit -> []
+  EVar(_) -> []
+  ESym(_, _) -> []
+  EUnder -> []
+  EPlaceholder -> []
+  EHole(_) -> []
+  ETodo(_) -> []
+  EExternBody(_) -> []
+  EVariantsOf(_, _) -> []
+  EModCall(_, _) -> []
+  EIntrinsic(_, iargs) -> flatten_sites(map(iargs, mut_expr))
+  ECall(callee, cargs) -> list_append(mut_expr(callee), flatten_sites(map(cargs, mut_expr)))
+  EField(base, _) -> mut_expr(base)
+  EIndex(a, b) -> list_append(mut_expr(a), mut_expr(b))
+  EBinop(_, a, b) -> list_append(mut_expr(a), mut_expr(b))
+  EUnop(_, x) -> mut_expr(x)
+  EIf(c, t, eo) -> list_append(mut_expr(c), list_append(mut_expr(t), mut_opt(eo)))
+  EMatch(scr, arms) -> list_append(mut_expr(scr), flatten_sites(map(arms, mut_arm_exprs)))
+  ELambda(_, b) -> mut_expr(b)
+  ERecordLit(_, fs) -> flatten_sites(map(fs, mut_field))
+  EList(els) -> flatten_sites(map(els, mut_elem))
+  ERange(a, b, st) -> list_append(mut_expr(a), list_append(mut_expr(b), mut_opt(st)))
+  EBlock(stmts, tail) -> list_append(flatten_sites(map(stmts, mut_stmt)), mut_opt(tail))
+  EPipe(a, b) -> list_append(mut_expr(a), mut_expr(b))
+  EMapPipe(a, b) -> list_append(mut_expr(a), mut_expr(b))
+  EFlatMapPipe(a, b) -> list_append(mut_expr(a), mut_expr(b))
+  EFilterPipe(a, b) -> list_append(mut_expr(a), mut_expr(b))
+  EHandle(body, _, _, _, init, _, clauses, ret) ->
+    list_append(mut_expr(body),
+                list_append(mut_opt(init),
+                            list_append(flatten_sites(map(clauses, mut_clause)),
+                                        mut_opt_return(ret))))
+  ELitUnit(inner, _) -> mut_expr(inner)
+  EBang(inner) -> mut_expr(inner)
+  # Surface forms are desugared before any pass the corpus exercises
+  # runs, so a mutation planted here would be rewritten out from under
+  # the report's own line and column.
+  ESurface(_) -> []
+}
+
+fn mut_opt(o: Option[Expr]) : [MutSite] = match o {
+  None -> []
+  Some(x) -> mut_expr(x)
+}
+
+fn mut_arm_exprs(a: Arm) : [MutSite] = match a {
+  Arm(_, g, b) -> list_append(mut_opt(g), mut_expr(b))
+}
+
+fn mut_field(fi: FieldInit) : [MutSite] = match fi {
+  FI(_, x) -> mut_expr(x)
+}
+
+fn mut_elem(el: ListElem) : [MutSite] = match el {
+  ElPlain(x) -> mut_expr(x)
+  ElSpread(x) -> mut_expr(x)
+}
+
+fn mut_clause(c: HClause) : [MutSite] = match c {
+  HC(_, _, b, _, _) -> mut_expr(b)
+}
+
+fn mut_opt_return(o: Option[HReturn]) : [MutSite] = match o {
+  None -> []
+  Some(r) -> mut_return(r)
+}
+
+fn mut_return(r: HReturn) : [MutSite] = match r {
+  HR(_, b, _, _) -> mut_expr(b)
+}
+
+fn mut_stmt(s: Stmt) : [MutSite] = match s {
+  SLet(_, _, x) -> mut_expr(x)
+  SAssert(x, mo) -> list_append(mut_expr(x), mut_opt(mo))
+  SExprStmt(x) -> mut_expr(x)
+  SIndexAssign(a, i, v, _, _) -> list_append(mut_expr(a), list_append(mut_expr(i), mut_expr(v)))
+  SAssign(l, r, _, _) -> list_append(mut_expr(l), mut_expr(r))
+  SVar(_, _, x, _, _) -> mut_expr(x)
+  SUse(_, _, _) -> []
+}

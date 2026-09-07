@@ -1241,6 +1241,10 @@ Commands:
                                 (--width N sets the line width).
   migrate [<file>] [--write]    Rewrite source across an edition bump
                                 (dry-run by default; --write applies).
+  mutate [<spec>] [--limit N]   Mutation testing: break one construct at
+                                a time and report what the suite did not
+                                notice. --oracle sets the command that
+                                judges a mutant (default 'kai test').
   watch [<spec>]                Recompile + run on every save (live demo).
   init  <name>                  Create a kai.toml manifest in the cwd.
   add   <source>[@<ref>]        Fetch a dep and append it to kai.toml.
@@ -5003,6 +5007,314 @@ EOF
   "$prefix/bin/kai" --version >&2 || true
 }
 
+usage_mutate() {
+  cat <<EOF
+usage: kai mutate [<spec>] [--oracle <cmd>] [--module <file>] [--operator <name>]
+                  [--limit <n>] [--list] [--json]
+
+Break the code on purpose and ask whether anything notices.
+
+kai mutate rewrites one construct at a time — a dropped \`match\` arm, a
+shifted comparison, a swapped connective — and runs an oracle against
+each mutant. A mutant the oracle rejects is KILLED: something noticed. A
+mutant that survives is a hole in the suite, reported with its file,
+line, operator and diff.
+
+Mutations come from the AST, never a text scan: a rewritten string
+literal or comment is noise. Each mutant is the original source with one
+token span replaced, so its diff against the parent is the mutation and
+nothing else.
+
+The oracle is any command that exits 0 when the code is healthy. The
+default is \`kai test\`, which suits a package with \`test\` blocks; a
+codebase whose real suite is a fixture corpus or a script points
+--oracle at that instead.
+
+Operators, in the order they are applied:
+  arm        drop a match arm — a case that stops being handled
+  compare    shift a comparison boundary (\`>=\` -> \`>\`)
+  connect    swap a boolean connective (\`and\` -> \`or\`)
+  negate     invert a condition (\`if c\` -> \`if not c\`)
+  literal    perturb a literal (\`0\` -> \`1\`)
+  call       elide a call, keeping its argument (\`f(x)\` -> \`x\`)
+
+Output:
+  SURVIVED   the oracle accepted the mutant — a hole worth a fixture
+  killed     the oracle rejected it, as it should
+  compile    the mutant did not build; a kill, but the least
+             interesting kind, so it is counted separately
+
+Reported as survivors, never as a percentage: a survivor is actionable,
+a score is a number nobody acts on.
+
+Equivalent mutants — ones that mean exactly what the original meant and
+so can never be killed — are suppressed via
+tools/mutate-known-equivalent.txt, keyed \`<file>:<line>:<operator>\` with
+a written reason after a \`#\`. An entry with no reason is an error, not a
+suppression.
+
+Options:
+  --oracle <cmd>     Command judged by exit code; 0 = healthy. Default \`kai test\`.
+  --module <file>    Mutate only this file. Default: every module the package owns.
+  --operator <name>  Apply only this operator. Repeatable.
+  --limit <n>        Stop after n mutants. Useful for a first look.
+  --list             List the mutation sites and exit; run nothing.
+  --json             Machine-readable output.
+  -h, --help         Show this help.
+
+Cost: every mutant re-runs the oracle. When the oracle rebuilds a
+compiler that is minutes per mutant, so start with --limit and a single
+--module — survivors are found long before a full run finishes.
+
+Examples:
+  kai mutate
+  kai mutate --limit 20 --operator arm
+  kai mutate --module src/parser.kai --oracle './run-tests.sh'
+EOF
+}
+
+# Mutation modes stop right after parse, so they need only the search
+# paths that let imports resolve — no manifest, no cache, no edition.
+mutate_kaic2() {
+  mk_src="$1"; shift
+  mk_dir="$(cd "$(dirname "$mk_src")" && pwd)"
+  (unset KAI_TRACE_RC; "$KAIC2" --path "$mk_dir" --path "$STDLIB_ROOT" "$@" "$mk_src")
+}
+
+# The suppression file, resolved against the package root. Absent is
+# fine: it only ever removes sites from a run.
+mutate_equiv_file() {
+  printf '%s/tools/mutate-known-equivalent.txt' "$1"
+}
+
+# Is (file, line, operator) recorded as a known equivalent? An entry
+# must carry a reason after `#`; one without is a hard error, on the
+# same discipline the coverage matrix applies to its `N/A:` rows —
+# a suppression nobody justified is indistinguishable from a hole
+# somebody hid.
+mutate_is_equivalent() {
+  me_file="$1"; me_line="$2"; me_op="$3"; me_db="$4"; me_root="$5"
+  [ -f "$me_db" ] || return 1
+  # An entry may name the module the way the report does or the way the
+  # package does — an absolute path and a root-relative one are the same
+  # file, and a reader should not have to know which form the tool chose.
+  me_rel="${me_file#"$me_root"/}"
+  me_hit="$(grep -n -e "^$me_file:$me_line:$me_op[[:space:]]*\(#\|$\)" \
+                    -e "^$me_rel:$me_line:$me_op[[:space:]]*\(#\|$\)" \
+                 "$me_db" 2>/dev/null | head -1)" || true
+  [ -n "$me_hit" ] || return 1
+  case "$me_hit" in
+    *'#'*)
+      me_reason="${me_hit#*#}"
+      me_reason="$(printf '%s' "$me_reason" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [ -n "$me_reason" ] && return 0
+      ;;
+  esac
+  die "tools/mutate-known-equivalent.txt: '$me_file:$me_line:$me_op' has no reason — an entry without one is not a suppression"
+}
+
+cmd_mutate() {
+  mu_spec=""; mu_oracle=""; mu_module=""; mu_ops=""; mu_limit=""
+  mu_list=""; mu_json=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_mutate; return 0 ;;
+      --oracle)   [ $# -ge 2 ] || die "--oracle requires a command"
+                  mu_oracle="$2"; shift 2 ;;
+      --oracle=*) mu_oracle="${1#--oracle=}"; shift ;;
+      --module)   [ $# -ge 2 ] || die "--module requires a file"
+                  mu_module="$2"; shift 2 ;;
+      --module=*) mu_module="${1#--module=}"; shift ;;
+      --operator)   [ $# -ge 2 ] || die "--operator requires a name"
+                    mu_ops="$mu_ops $2"; shift 2 ;;
+      --operator=*) mu_ops="$mu_ops ${1#--operator=}"; shift ;;
+      --limit)    [ $# -ge 2 ] || die "--limit requires a count"
+                  mu_limit="$2"; shift 2 ;;
+      --limit=*)  mu_limit="${1#--limit=}"; shift ;;
+      --list) mu_list=1; shift ;;
+      --json) mu_json=1; shift ;;
+      -*) die "unknown flag: $1 (see 'kai mutate --help')" ;;
+      *)  [ -z "$mu_spec" ] || die "only one package spec supported"
+          mu_spec="$1"; shift ;;
+    esac
+  done
+  case "$mu_limit" in
+    ""|*[!0-9]*) [ -z "$mu_limit" ] || die "--limit takes a positive integer, got '$mu_limit'" ;;
+  esac
+  for mu_o in $mu_ops; do
+    case "$mu_o" in
+      arm|compare|connect|negate|literal|call) ;;
+      *) die "unknown operator: $mu_o (see 'kai mutate --help')" ;;
+    esac
+  done
+  ensure_built
+
+  mu_root="${mu_spec:-.}"
+  [ -d "$mu_root" ] || mu_root="$(dirname "$mu_root")"
+  mu_root="$(cd "$mu_root" && pwd)"
+  [ -n "$mu_oracle" ] || mu_oracle="$SCRIPT_DIR/kai test"
+
+  if [ -n "$mu_module" ]; then
+    [ -f "$mu_module" ] || die_file_not_found "$mu_module" "mutate"
+    mu_files="$mu_module"
+  else
+    mu_files=""
+    for mu_rel in $(package_source_files "$mu_root"); do
+      mu_files="$mu_files
+$mu_root/$mu_rel"
+    done
+    [ -n "$mu_files" ] || die "no .kai files found in $mu_root (see 'kai mutate --help')"
+  fi
+
+  mu_db="$(mutate_equiv_file "$mu_root")"
+  mu_tmp="$(mktemp -d)"
+
+  # Generating a mutant uses the compiler, and an oracle is free to
+  # REBUILD that compiler — which is exactly what a self-hosted codebase
+  # does. A rebuilt-from-mutated-source compiler would then generate the
+  # next mutant, so a snapshot taken before the run owns every mutation
+  # from here on. Without this the tool corrupts its own input the first
+  # time it is pointed at the toolchain that builds it.
+  cp "$KAIC2" "$mu_tmp/kaic2-pinned"
+  mu_gen="$mu_tmp/kaic2-pinned"
+
+  # An interrupted run must not leave a mutant on disk: the source is
+  # mutated in place, so a Ctrl-C between "write mutant" and "restore"
+  # would otherwise commit the break. The trap restores before cleanup.
+  mu_live=""
+  trap 'mutate_restore "$mu_live" "$mu_tmp"; rm -rf "$mu_tmp"' EXIT INT TERM
+
+  mu_total=0; mu_killed=0; mu_compile=0; mu_survived=0; mu_equiv=0
+  mu_start="$(date +%s)"
+  : > "$mu_tmp/survivors"
+
+  for mu_f in $mu_files; do
+    [ -f "$mu_f" ] || continue
+    mutate_kaic2 "$mu_f" --mutate-list > "$mu_tmp/sites" 2>/dev/null || {
+      printf 'kai: mutate: %s does not parse; skipped\n' "$mu_f" >&2
+      continue
+    }
+    [ -s "$mu_tmp/sites" ] || continue
+
+    if [ -n "$mu_list" ]; then
+      while IFS="$(printf '\t')" read -r mu_id mu_op mu_line mu_col mu_desc; do
+        mutate_op_selected "$mu_op" "$mu_ops" || continue
+        printf '%s\t%s\t%s:%s\t%s\n' "$mu_op" "$mu_f" "$mu_line" "$mu_col" "$mu_desc"
+      done < "$mu_tmp/sites"
+      continue
+    fi
+
+    cp "$mu_f" "$mu_tmp/orig.kai"
+    while IFS="$(printf '\t')" read -r mu_id mu_op mu_line mu_col mu_desc; do
+      mutate_op_selected "$mu_op" "$mu_ops" || continue
+      [ -z "$mu_limit" ] || [ "$mu_total" -lt "$mu_limit" ] || break
+      if mutate_is_equivalent "$mu_f" "$mu_line" "$mu_op" "$mu_db" "$mu_root"; then
+        mu_equiv=$((mu_equiv + 1))
+        continue
+      fi
+      mu_total=$((mu_total + 1))
+      # `set -e` would abort the sweep on the first killed mutant, whose
+      # non-zero status is the normal, desired outcome — so the verdict
+      # is captured rather than left to propagate.
+      mu_rc=0
+      mu_live="$mu_f"
+      mutate_run_one "$mu_f" "$mu_id" "$mu_op" "$mu_line" "$mu_col" "$mu_oracle" "$mu_tmp" "$mu_gen" || mu_rc=$?
+      mu_live=""
+      case "$mu_rc" in
+        0) mu_survived=$((mu_survived + 1)) ;;
+        1) mu_killed=$((mu_killed + 1)) ;;
+        *) mu_compile=$((mu_compile + 1)) ;;
+      esac
+    done < "$mu_tmp/sites"
+    cp "$mu_tmp/orig.kai" "$mu_f"
+    [ -z "$mu_limit" ] || [ "$mu_total" -lt "$mu_limit" ] || break
+  done
+
+  [ -n "$mu_list" ] && return 0
+  mutate_report "$mu_total" "$mu_killed" "$mu_compile" "$mu_survived" "$mu_equiv" \
+                "$(($(date +%s) - mu_start))" "$mu_tmp/survivors" "$mu_json"
+}
+
+# Put back the module a run was mutating when it was interrupted. Safe
+# to call with no module in flight, which is the common case.
+mutate_restore() {
+  [ -n "$1" ] || return 0
+  [ -f "$2/orig.kai" ] || return 0
+  cp "$2/orig.kai" "$1" 2>/dev/null || true
+  printf 'kai: mutate: interrupted; restored %s\n' "$1" >&2
+}
+
+# Is this operator in the caller's selection? An empty selection means
+# every operator.
+mutate_op_selected() {
+  [ -n "$2" ] || return 0
+  for mo_o in $2; do
+    [ "$mo_o" = "$1" ] && return 0
+  done
+  return 1
+}
+
+# Run one mutant: write it over the source, ask the oracle, restore.
+# Exit 0 = survived, 1 = killed, 2 = did not compile.
+#
+# The source is mutated IN PLACE rather than in a copy because the
+# oracle compiles the package as it stands on disk — a mutant in a temp
+# directory would be a file nothing builds. The original is restored
+# before returning, and again after the loop, so an interrupted run
+# leaves the tree as it found it.
+mutate_run_one() {
+  mo_f="$1"; mo_id="$2"; mo_op="$3"; mo_line="$4"; mo_col="$5"
+  mo_oracle="$6"; mo_tmp="$7"; mo_gen="$8"
+
+  # The mutant is generated from the pristine copy by the PINNED
+  # compiler: the loop writes each mutant over the source in turn, and
+  # an oracle that rebuilds the toolchain would otherwise leave a
+  # mutated compiler to generate the next one. Search paths still
+  # resolve against the real module's directory.
+  if ! (unset KAI_TRACE_RC; "$mo_gen" --path "$(dirname "$mo_f")" --path "$STDLIB_ROOT" \
+        --mutate-apply "$mo_id" "$mo_tmp/orig.kai") > "$mo_tmp/mutant.kai" 2>/dev/null; then
+    return 2
+  fi
+  cp "$mo_tmp/mutant.kai" "$mo_f"
+  mo_rc=0
+  ( eval "$mo_oracle" ) >/dev/null 2>&1 || mo_rc=$?
+  cp "$mo_tmp/orig.kai" "$mo_f"
+
+  if [ "$mo_rc" -eq 0 ]; then
+    {
+      printf '%s\t%s\t%s\t%s\n' "$mo_f" "$mo_line" "$mo_col" "$mo_op"
+      diff "$mo_tmp/orig.kai" "$mo_tmp/mutant.kai" | sed 's/^/    /'
+    } >> "$mo_tmp/survivors"
+    printf 'SURVIVED  %s:%s  %s\n' "$mo_f" "$mo_line" "$mo_op" >&2
+    return 0
+  fi
+  printf 'killed    %s:%s  %s\n' "$mo_f" "$mo_line" "$mo_op" >&2
+  return 1
+}
+
+mutate_report() {
+  mr_total="$1"; mr_killed="$2"; mr_compile="$3"; mr_survived="$4"
+  mr_equiv="$5"; mr_secs="$6"; mr_survfile="$7"; mr_json="$8"
+
+  if [ -n "$mr_json" ]; then
+    printf '{"mutants": %s, "killed": %s, "compile_failed": %s, "survived": %s, "known_equivalent": %s, "seconds": %s}\n' \
+      "$mr_total" "$mr_killed" "$mr_compile" "$mr_survived" "$mr_equiv" "$mr_secs"
+    return 0
+  fi
+
+  printf '\n'
+  if [ "$mr_survived" -gt 0 ]; then
+    printf 'survivors — the suite did not notice these:\n\n'
+    cat "$mr_survfile"
+    printf '\n'
+  fi
+  printf '%s mutants in %ss: %s killed, %s did not compile, %s survived' \
+    "$mr_total" "$mr_secs" "$mr_killed" "$mr_compile" "$mr_survived"
+  [ "$mr_equiv" -gt 0 ] && printf ', %s known-equivalent skipped' "$mr_equiv"
+  printf '\n'
+  [ "$mr_survived" -eq 0 ]
+}
+
 case "${1:-}" in
   build)     shift; cmd_build "$@" ;;
   run)       shift; cmd_run   "$@" ;;
@@ -5013,6 +5325,7 @@ case "${1:-}" in
   lint)      shift; cmd_lint  "$@" ;;
   fmt)       shift; cmd_fmt   "$@" ;;
   migrate)   shift; cmd_migrate "$@" ;;
+  mutate)    shift; cmd_mutate  "$@" ;;
   watch)     shift; cmd_watch "$@" ;;
   init)      shift; cmd_init    "$@" ;;
   fetch)     shift; cmd_fetch   "$@" ;;
