@@ -86,9 +86,6 @@ type Shade = Light | Dark                      # another sum
 type ColorErr = Color | Shade                  # union of PRE-DECLARED sums
                                                #   (not new ctors; narrow
                                                #   with `n : T ->` arms)
-type Both = pa.Cfg | pb.Cfg                    # a member may be qualified,
-                                               #   which is how two homonymous
-                                               #   imported types are told apart
 type Web = Stdout + Mutable                    # effect alias (row)
 
 effect Logger {                                # effect declaration
@@ -142,6 +139,11 @@ extern "C" fn cos(x: Real) : Real / Ffi        # FFI — Ffi in row REQUIRED
 
 fn main() : Int = fib(10) + classify(0, 5) + MAX
 ```
+
+A union member may be qualified — `type Both = pa.Cfg | pb.Cfg` — which
+is how a union names two homonymous imported types, since a bare `Cfg`
+cannot mean either one. A qualified member always reads as a reference
+to a declared type, never as a constructor, so it takes no payload.
 
 FFI surface beyond `extern "C" fn` — extern structs (`extern "C"
 type Vec2 = { x: F32, y: F32 }`), opaque handles (`extern "C" opaque
