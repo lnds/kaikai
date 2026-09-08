@@ -84,6 +84,24 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.116.0 (2026-09-08)
+
+### Added
+
+- **mutate**: kai mutate — ask the corpus whether it would notice a deliberate break (#1939) (#1943)
+
+### Fixed
+
+- **typer**: reserve the primitive type names at the user's declaration (#1947)
+- **parse**: a union member may be a qualified type (#1946)
+- **compiler**: a signature's own type parameter outranks an imported name (#1945)
+- **typer**: a contested bare type is the error a contested constant is (#1897) (#1940)
+- **fmt**: a unit literal is atomic by its interior, not never (#1930) (#1937)
+
+### Changed
+
+- **compiler**: selective-import picks belong to the name report, not the type scope (#1897) (#1941)
+
 ## v0.115.0 (2026-09-05)
 
 ### Added
