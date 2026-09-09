@@ -378,7 +378,8 @@ fn pcs_is_ffi_opaque_record(fields: [FieldDecl]) : Bool = match fields {
   _ -> false
 }
 
-fn pcs_build_borrow_map(decls: [Decl], acc: [BorrowEntry]) : [BorrowEntry] = match decls {
+#[doc("Interprocedural borrow map keyed by callee name plus borrowed parameter positions. Pub: the tco pre-pass consults it.")]
+pub fn pcs_build_borrow_map(decls: [Decl], acc: [BorrowEntry]) : [BorrowEntry] = match decls {
   []           -> acc
   [d, ...rest] -> pcs_build_borrow_map(rest, pcs_borrow_entry_of(d, acc))
 }
@@ -626,7 +627,8 @@ fn pcs_borrow_positions(pnames: [String], bset: [String], i: Int) : [Int] = matc
     else { pcs_borrow_positions(rest, bset, i + 1) }
 }
 
-fn pcs_borrow_lookup(bmap: [BorrowEntry], key: String) : [Int] = match bmap {
+#[doc("Borrowed parameter positions registered for `key`, or the empty list.")]
+pub fn pcs_borrow_lookup(bmap: [BorrowEntry], key: String) : [Int] = match bmap {
   []           -> []
   [e, ...rest] -> match e {
     BwE(k, ps) -> if k == key { ps } else { pcs_borrow_lookup(rest, key) }
@@ -837,7 +839,8 @@ fn pcs_maybe_rename_borrow_prim(callee: Expr, key: String, positions: [Int]) : E
   } else { callee }
 
 # The call key for a callee expr — bare EVar or resolved EModCall.
-fn pcs_callee_key(callee: Expr) : String = match sym_read_kind(callee.kind) {
+#[doc("Call key for a callee expression: the bare name, or `mod.name` for a resolved module call.")]
+pub fn pcs_callee_key(callee: Expr) : String = match sym_read_kind(callee.kind) {
   EVar(nm)          -> nm
   EModCall(m, nm)   -> concat_all([m, ".", nm])
   _                 -> ""
@@ -973,7 +976,8 @@ fn pcs_wrap_dup(a: Expr) : Expr =
            [a]),
          line: a.line, col: a.col, ty: a.ty, mode: a.mode }
 
-fn pcs_has_int(xs: [Int], t: Int) : Bool = match xs {
+#[doc("True when the int list contains `t`.")]
+pub fn pcs_has_int(xs: [Int], t: Int) : Bool = match xs {
   []           -> false
   [x, ...rest] -> if x == t { true } else { pcs_has_int(rest, t) }
 }
@@ -3265,13 +3269,18 @@ fn pcs_max_paths_b_arms(nm: String, arms: [Arm], best: Int, bmap: [BorrowEntry])
 #      list-spread tails `[..., ...nm]`) internally incref their
 #      arg, and a raw transfer would leak or double-free.
 #[doc("Params whose transfer must be skipped because some branch reads them through an incref-ing op (capability ops, borrowed field access, spread tails). Pub: tco consults it.")]
-pub fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] = match pnames {
+pub fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] =
+  pcs_branch_aware_skip_params_b(pnames, body, [])
+
+#[doc("Borrow-aware `pcs_branch_aware_skip_params`: a read landing in a borrowed callee slot witnesses no consumption, so the param keeps its drop.")]
+pub fn pcs_branch_aware_skip_params_b(pnames: [String], body: Expr,
+                                      bmap: [BorrowEntry]) : [String] = match pnames {
   []           -> []
   [h, ...rest] -> {
-    let mp = pcs_max_paths_in_expr(h, body)
-    let cv = pcs_consumed_on_every_path(h, body)
+    let mp = pcs_max_paths_b_expr(h, body, bmap)
+    let cv = pcs_consumed_b_expr(h, body, bmap)
     let ln = pcs_all_consumers_linear(h, body)
-    let rest_skip = pcs_branch_aware_skip_params(rest, body)
+    let rest_skip = pcs_branch_aware_skip_params_b(rest, body, bmap)
     if mp <= 1 and cv and ln { [h, ...rest_skip] } else { rest_skip }
   }
 }
@@ -4160,39 +4169,64 @@ fn pcs_consumers_linear_elems(nm: String, els: [ListElem]) : Bool = match els {
 # bodies (`XLam`/`XCl`) run elsewhere. `EIf`/`EMatch` keep explicit
 # arms because their branch positions are alternatives of each other —
 # all must consume — which the flat position list cannot express.
-fn pcs_consumed_on_every_path(nm: String, e: Expr) : Bool = match e.kind {
+fn pcs_consumed_on_every_path(nm: String, e: Expr) : Bool =
+  pcs_consumed_b_expr(nm, e, [])
+
+# Borrow-aware witness. A read landing in a BORROWED parameter slot of the
+# callee does not take ownership, so it cannot witness consumption: the
+# caller still holds the ref the callee never released. Counting it as a
+# consumer is what leaves a self-tail-call's parameter undropped across the
+# `goto` — the slot is rebound over a value nobody freed.
+fn pcs_consumed_b_expr(nm: String, e: Expr, bmap: [BorrowEntry]) : Bool = match e.kind {
   EVar(uname)      -> uname == nm
   EIf(c, t, opt_e) -> {
-    if pcs_consumed_on_every_path(nm, c) { true }
+    if pcs_consumed_b_expr(nm, c, bmap) { true }
     else {
       match opt_e {
         None    -> false   # missing-else path leaves the binding alive
-        Some(e2) -> pcs_consumed_on_every_path(nm, t) and
-                    pcs_consumed_on_every_path(nm, e2)
+        Some(e2) -> pcs_consumed_b_expr(nm, t, bmap) and
+                    pcs_consumed_b_expr(nm, e2, bmap)
       }
     }
   }
   EMatch(s, arms)  -> {
-    if pcs_consumed_on_every_path(nm, s) { true }
-    else { pcs_consumed_all_arms(nm, arms) }
+    if pcs_consumed_b_expr(nm, s, bmap) { true }
+    else { pcs_consumed_b_arms(nm, arms, bmap) }
   }
-  _                -> pcs_consumed_ps(nm, xp_positions(e))
+  ECall(f, xs)     -> {
+    if pcs_consumed_b_expr(nm, f, bmap) { true }
+    else { pcs_consumed_b_args(nm, xs, pcs_borrow_lookup(bmap, pcs_callee_key(f)), 0, bmap) }
+  }
+  _                -> pcs_consumed_b_ps(nm, xp_positions(e), bmap)
 }
 
-fn pcs_consumed_ps(nm: String, ps: [XPos]) : Bool = match ps {
+# A bare `nm` in a borrowed slot is a borrow, not a consumer; any other
+# slot keeps the owned reading. Sub-expressions are scanned either way.
+fn pcs_consumed_b_args(nm: String, xs: [Expr], positions: [Int], i: Int,
+                       bmap: [BorrowEntry]) : Bool = match xs {
+  []           -> false
+  [a, ...rest] -> {
+    let here = if pcs_has_int(positions, i) {
+      match a.kind { EVar(u) -> false  _ -> pcs_consumed_b_expr(nm, a, bmap) }
+    } else { pcs_consumed_b_expr(nm, a, bmap) }
+    here or pcs_consumed_b_args(nm, rest, positions, i + 1, bmap)
+  }
+}
+
+fn pcs_consumed_b_ps(nm: String, ps: [XPos], bmap: [BorrowEntry]) : Bool = match ps {
   []                  -> false
   [XP(r, c), ...rest] ->
-    (match r { XAll -> pcs_consumed_on_every_path(nm, c) _ -> false }) or
-    pcs_consumed_ps(nm, rest)
+    (match r { XAll -> pcs_consumed_b_expr(nm, c, bmap) _ -> false }) or
+    pcs_consumed_b_ps(nm, rest, bmap)
 }
 
 
-fn pcs_consumed_all_arms(nm: String, arms: [Arm]) : Bool = match arms {
+fn pcs_consumed_b_arms(nm: String, arms: [Arm], bmap: [BorrowEntry]) : Bool = match arms {
   []           -> true   # no arms = no paths = vacuously consumed
                           # (but EMatch with zero arms is invalid anyway)
   [a, ...rest] -> match a {
     Arm(_, _, body) ->
-      pcs_consumed_on_every_path(nm, body) and pcs_consumed_all_arms(nm, rest)
+      pcs_consumed_b_expr(nm, body, bmap) and pcs_consumed_b_arms(nm, rest, bmap)
   }
 }
 
