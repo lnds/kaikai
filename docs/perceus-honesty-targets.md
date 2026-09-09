@@ -191,6 +191,22 @@ instruction counts locate it precisely:
   notes C and Koka pay the same random-descent cache miss, so chasing
   `reuse_freed` does not move the wall.
 
+## What the corpus measures
+
+`tools/rc-leak-gate.sh` runs every `examples/perceus` fixture under the
+runtime RC ledger (`KAI_TRACE_RC=1`) and pins its allocation count in
+`tools/rc-leak-baseline.txt`, one column per backend. Before it, the
+corpus asserted stdout only, so a leak was invisible: the program printed
+the right answer and took the memory with it.
+
+Reading the numbers: a program that still holds its structure when `main`
+returns exits without a final free walk, so whatever is live at exit
+counts as leaked. `leaked` at or below `live_peak` is that residue — a
+fixture that deliberately keeps a 200k-node spine reports ~200k. The
+defect signature is `leaked` well ABOVE `live_peak`: memory accumulated
+and was dropped on the floor. On the first full measurement, 97 of 240
+fixtures reported `leaked > 0` and none exceeded its `live_peak`.
+
 ## What does NOT work today (residual leak sources)
 
 These leak on `kaic2` self-compile but do **not** surface below the
