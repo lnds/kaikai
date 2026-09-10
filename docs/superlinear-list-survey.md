@@ -85,17 +85,58 @@ and a single fixture answers the wrong question:
 Ranked by cost on the real self-compile. "Bound" is the collection whose
 growth makes the site quadratic.
 
-| # | site | file | bound | exponent | self-compile cons | share of all allocs |
-|---:|---|---|---|---:|---:|---:|
-| 1 | `list_minus` / `list_minus_loop` | `emit_shared.kai:1394` | `st.globals` — every global in the program, walked per lambda | 1.05 / lambda | 7,539,728 | 1.14% |
-| 2 | `partition_decls_by_home` (= `bucket_append`) — since fixed | `infer.kai:19649` | decls per home module | 1.67 (decls) | 2,901,030 | 0.44% |
-| 3 | `flatten_module_decls` | `infer.kai` | modules × decls each | 1.27 (mods) | 2,393,716 | 0.36% |
-| 4 | `fns_prefer_module` | `emit_shared.kai` | the whole `EFn` table, per module | 1.35 (mods) | 2,254,504 | 0.34% |
-| 5 | `rs_append_decls` | `driver.kai:1047` | `rs.decls` — all decls resolved so far | 2.02 (mods) | 1,104,607 | 0.17% |
-| 6 | `scopes_bind` | `driver.kai` | bindings per owner module | 2.03 (mods) | 109,573 | 0.02% |
-| 7 | `rs_add_module` | `driver.kai` | `rs.modules` | 2.03 (mods) | 23,220 | 0.00% |
+| # | site | file | bound | exponent | self-compile cons | share of all allocs | state |
+|---:|---|---|---|---:|---:|---:|---|
+| 1 | `list_minus` / `list_minus_loop` | `emit_shared.kai:1394` | `st.globals` — every global in the program, walked per lambda | 1.05 / lambda | 7,539,728 | 1.14% | fixed |
+| 2 | `partition_decls_by_home` (= `bucket_append`) | `infer.kai:19649` | decls per home module | 1.67 (decls) | 2,901,030 | 0.44% | fixed in its own lane |
+| 3 | `flatten_module_decls` | `infer.kai` | modules × decls each | 1.27 (mods) | 2,393,716 | 0.36% | fixed |
+| 4 | `fns_prefer_module` | `emit_shared.kai` | the whole `EFn` table, per module | 1.35 (mods) | 2,254,504 | 0.34% | scan fixed, append kept |
+| 5 | `rs_append_decls` | `driver.kai:1047` | `rs.decls` — all decls resolved so far | 2.02 (mods) | 1,104,607 | 0.17% | fixed |
+| 6 | `scopes_bind` | `driver.kai` | bindings per owner module | 2.03 (mods) | 109,573 | 0.02% | kept, measured |
+| 7 | `rs_add_module` | `driver.kai` | `rs.modules` | 2.03 (mods) | 23,220 | 0.00% | fixed |
 
 Together ~2.5% of the self-compile's allocations.
+
+### What the fixes moved
+
+Measured the same way, both compilers run over the same input (the
+self-compile of the surveyed tree), C backend:
+
+| | before | after |
+|---|---:|---:|
+| `alloc_total` | 663,158,660 | 645,274,311 |
+| cons | 106,737,590 | 88,309,128 |
+
+`alloc_total` −2.7%, cons −17.3%. The five sites' own cells fall from
+13,687,622 to 2,832,751 including the index and reversal helpers that
+replaced them.
+
+Growth is linear afterwards, not merely smaller. On the modules axis
+with D = 11 decls each, doubling M doubles the cells exactly:
+
+| M | `rs_append_decls` before | after | `rs_add_module` before | after |
+|---:|---:|---:|---:|---:|
+| 20 | 2,320 | 260 | 210 | 20 |
+| 40 | 9,440 | 520 | 820 | 40 |
+| 80 | 38,080 | 1,040 | 3,240 | 80 |
+| 160 | 152,960 | 2,080 | 12,880 | 160 |
+
+The before columns track the closed forms above (`D·M(M−1)/2` and
+`M(M−1)/2`); the after columns are `D·M` and `M`.
+
+Two sites kept their append deliberately, each because the measurement
+said the rewrite costs more than it saves:
+
+- **`fns_prefer_module`.** The quadratic here is the `list_has` over the
+  shadowed-name list, which allocates nothing — indexing it removed
+  9,844 cells, and the site's remaining 2.24M are the `list_append` of
+  the module's own entries onto the rest of the table. Rebuilding that
+  as a reversal costs the whole table instead of the short half: measured
+  +4,449,788 cons on the self-compile, so it was reverted.
+- **`scopes_bind`.** Removing the per-owner append saved 7,448 cells,
+  while the two-level reversal its readers then owed cost 155,351. Its
+  remaining cost is the owner-list spine, which is bounded by file count
+  and is not an accumulation.
 
 ### Closed-form validation
 
@@ -122,15 +163,22 @@ module across M = 20…160).
 
 ### Why `list_minus` ranks first
 
-`emit_shared.kai:1446` computes
-`list_minus(st.globals, st.local_scope)` once per lambda, to shadow
-globals the local scope redefines. The existing comment reasons that
-"O(|globals| × |locals|) is acceptable: |locals| stays tiny" — true, and
-it addresses the wrong factor. `st.local_scope` is indeed tiny; the
-cost is `|lambdas| × |globals|`, and `st.globals` holds every global
-name in the program. Measured at 1.05 exponent per lambda with globals
-held fixed, and 7.5M cons on the self-compile: the largest single
-superlinear site in the compiler, 2.6× `bucket_append`.
+The lambda lifter computed `list_minus(st.globals, st.local_scope)`
+once per lambda, to shadow globals the local scope redefines. The
+comment over it reasoned that "O(|globals| × |locals|) is acceptable:
+|locals| stays tiny" — true, and it addresses the wrong factor.
+`st.local_scope` is indeed tiny; the cost is `|lambdas| × |globals|`,
+and `st.globals` holds every global name in the program. Measured at
+1.05 exponent per lambda with globals held fixed, and 7.5M cons on the
+self-compile: the largest single superlinear site in the compiler,
+2.6× `bucket_append`.
+
+A comment that argues its own safety from the variable that does not
+matter is the drift the repo's comment rule warns about, and it read as
+true for as long as nobody measured the other factor. The subtraction is
+now gone: the shadow set and the globals both stay indexed
+(`compiler/name_scope.kai`) and the difference is evaluated per lookup,
+so the whole materialisation it justified no longer happens.
 
 ## 4. Dismissed — and the bound that clears them
 
@@ -169,7 +217,7 @@ them.
 Confirmed, with a qualification worth keeping.
 
 The shape is systemic — seven instances, none found by reading the code
-for suspicious names, and the largest (`list_minus`) sits under a
+for suspicious names, and the largest (`list_minus`) sat under a
 comment asserting it is fine. `#1897`'s summary ("every win came from
 the same shape — a table scanned linearly because no index existed")
 describes the compiler accurately.
