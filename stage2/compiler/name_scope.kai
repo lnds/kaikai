@@ -1,0 +1,85 @@
+# compiler/name_scope.kai -- the global-name set free-variable analysis
+# tests against, with the shadowing subtraction applied at the read.
+#
+# `fv_name` asks one question of the program's globals -- "is this name
+# already bound at program level" -- and the answer must exclude names
+# the enclosing fn re-bound, since a shadowed global is a capture. The
+# subtraction used to be a materialised list difference recomputed once
+# per lambda, which is |lambdas| x |globals|: the shadow list is tiny
+# but the globals list holds every global in the program.
+#
+# Here both sides stay indexed and the difference is evaluated per
+# lookup, so adding a shadow costs O(log n) and never copies the
+# globals. The type is the invariant: a value of this type is already
+# shadow-corrected, so there is no un-subtracted variant a caller could
+# pass by mistake.
+
+import compiler.infer_index
+
+#[doc("The program-level names a free-variable walk resolves against, minus the enclosing scope's shadows.")]
+pub type NameScope = { globals: NameIndex[String], shadows: NameIndex[String] }
+
+#[doc("A scope binding no names at all.")]
+pub fn ns_empty() : NameScope =
+  NameScope { globals: idx_empty(), shadows: idx_empty() }
+
+#[doc("A scope over the given global names, with nothing shadowed yet.")]
+pub fn ns_of_globals(names: [String]) : NameScope =
+  NameScope { globals: ns_index_all(names, idx_empty()), shadows: idx_empty() }
+
+fn ns_index_all(names: [String], ix: NameIndex[String]) : NameIndex[String] = match names {
+  []           -> ix
+  [n, ...rest] -> ns_index_all(rest, idx_prepend(ix, n, n))
+}
+
+#[doc("The scope with one more global name in it.")]
+pub fn ns_add_global(s: NameScope, name: String) : NameScope =
+  NameScope { globals: idx_prepend(s.globals, name, name), shadows: s.shadows }
+
+#[doc("The scope with `names` shadowed: each is treated as locally bound, so a read of it is a capture rather than a global reference.")]
+pub fn ns_shadow(s: NameScope, names: [String]) : NameScope =
+  NameScope { globals: s.globals, shadows: ns_index_all(names, s.shadows) }
+
+#[doc("Whether `name` resolves to a program-level global here — true only when it is a global and no enclosing binding shadows it.")]
+pub fn ns_has(s: NameScope, name: String) : Bool =
+  if ns_chain_has(idx_chain(s.shadows, name), name) { false }
+  else { ns_chain_has(idx_chain(s.globals, name), name) }
+
+# Bucket chains hold every name hashing alike, so the exact test is
+# re-applied over the chain the index returns.
+fn ns_chain_has(chain: [String], name: String) : Bool = match chain {
+  []           -> false
+  [h, ...rest] -> if h == name { true } else { ns_chain_has(rest, name) }
+}
+
+# ==== the lambda lifter's enclosing scope ====
+#
+# Two views of the same bindings: the flat name list a handler-alias
+# filter still consumes, and the shadow-corrected global set the
+# free-variable walk resolves against. They are one field and one
+# constructor so a walker cannot extend one and forget the other.
+#
+# `base` keeps the unshadowed globals, so entering a fn body can reset
+# the local names to exactly that fn's parameters without replaying the
+# shadow index the outer scope built.
+
+#[doc("The names an enclosing fn has bound at the current walk position, paired with the global set they shadow.")]
+pub type LamScope = { names: [String], base: NameScope, resolves: NameScope }
+
+#[doc("A scope binding no local names, resolving against the given globals.")]
+pub fn lscope_new(globals: NameScope) : LamScope =
+  LamScope { names: [], base: globals, resolves: globals }
+
+#[doc("The scope with `added` bound on top: shadowing the globals and appended to the name list, in one step.")]
+pub fn lscope_bind(s: LamScope, added: [String]) : LamScope =
+  LamScope { names: list_append(s.names, added), base: s.base,
+             resolves: ns_shadow(s.resolves, added) }
+
+#[doc("The scope rebound to exactly `names`, discarding any outer local bindings while keeping the same globals.")]
+pub fn lscope_reset(s: LamScope, names: [String]) : LamScope =
+  LamScope { names: names, base: s.base, resolves: ns_shadow(s.base, names) }
+
+#[doc("The scope with one more global name visible, binding no locals.")]
+pub fn lscope_add_global(s: LamScope, name: String) : LamScope =
+  LamScope { names: s.names, base: ns_add_global(s.base, name),
+             resolves: ns_add_global(s.resolves, name) }

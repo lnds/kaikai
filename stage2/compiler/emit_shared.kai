@@ -58,6 +58,7 @@ import compiler.infer
 import compiler.parse
 import compiler.resolve
 import compiler.unbox
+import compiler.name_scope
 import compiler.evidence_scan
 
 # ====================================================================
@@ -101,8 +102,11 @@ pub type VariantEntry = EV(Option[String], String, Int, [TypeExpr], Int)
 pub fn fns_prefer_module(fns: [EFn], mo: Option[String]) : [EFn] = match mo {
   None    -> fns
   Some(m) -> {
+    # `same` holds one module's entries and `other` the rest of the
+    # table, so appending copies the short half — cheaper than reversing
+    # the concatenation of both.
     let same = fns_filter_same_module(fns, m, [])
-    let shadowed = efn_names_of(same, [])
+    let shadowed = ns_of_globals(efn_names_of(same, []))
     list_append(same,
                 fns_filter_other_module_pruned(fns, m, shadowed, []))
   }
@@ -136,9 +140,9 @@ pub fn fns_prefer_module_cached(c: FnsByMod, mo: Option[String]) : FnsByModResul
 
 pub type FnsByModResult = { cache: FnsByMod, table: [EFn] }
 
-#[doc("Collect the bare names present in an EFn list (used to prune colliding root shadows, #748).")]
+#[doc("Collect the bare names present in an EFn list. Order-free: the names feed a membership set.")]
 pub fn efn_names_of(fns: [EFn], acc: [String]) : [String] = match fns {
-  [] -> list_reverse(acc)
+  [] -> acc
   [h, ...rest] -> match h { EFn(n, _, _, _, _) -> efn_names_of(rest, [n, ...acc]) }
 }
 
@@ -168,8 +172,8 @@ pub fn fns_filter_other_module(fns: [EFn], m: String, acc: [EFn]) : [EFn] {
   }
 }
 
-#[doc("EFn-table filter/selector: like fns_filter_other_module, but drop root-file (mo=None) entries whose name is in `shadowed` — the same-module names that must not be shadowed by the user's root decls (#748).")]
-pub fn fns_filter_other_module_pruned(fns: [EFn], m: String, shadowed: [String], acc: [EFn]) : [EFn] {
+#[doc("Like fns_filter_other_module, but drops root-file (mo=None) entries whose name the body's own module redefines.")]
+pub fn fns_filter_other_module_pruned(fns: [EFn], m: String, shadowed: NameScope, acc: [EFn]) : [EFn] {
   match fns {
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
@@ -179,12 +183,12 @@ pub fn fns_filter_other_module_pruned(fns: [EFn], m: String, shadowed: [String],
         else       { fns_filter_other_module_pruned(rest, m, shadowed, [h, ...acc]) }
       # Root-file entry: drop it when the body's module redefines the
       # same bare name, so `efn_pick_root` cannot pick the user shadow
-      # for a bare self-call inside the module body (#748). A root entry
-      # whose name the module does NOT redefine stays — the module body
-      # might legitimately reference it (rare, but preserves old behaviour).
+      # for a bare self-call inside the module body. A root entry whose
+      # name the module does NOT redefine stays — the module body may
+      # legitimately reference it.
       EFn(n, _, None, _, _) ->
-        if list_has(shadowed, n) { fns_filter_other_module_pruned(rest, m, shadowed, acc) }
-        else                     { fns_filter_other_module_pruned(rest, m, shadowed, [h, ...acc]) }
+        if ns_has(shadowed, n) { fns_filter_other_module_pruned(rest, m, shadowed, acc) }
+        else                   { fns_filter_other_module_pruned(rest, m, shadowed, [h, ...acc]) }
     }
   }
 }
@@ -959,7 +963,7 @@ pub fn find_lam(lams: [LamInfo], enc_fn: String, line: Int, col: Int) : Option[L
 # hidden inside #{...} get captured too.
 # A free-name read, whether or not the resolver stamped its identity:
 # the name is what closure capture records either way.
-fn fv_name(name: String, own: [String], globals: [String], acc: [String]) : [String] {
+fn fv_name(name: String, own: [String], globals: NameScope, acc: [String]) : [String] {
   # m7b #15 closure-capture: a tagged op call like
   # `Eff.op@<alias>` rewrites to `EVar("Eff.op@alias")`. The
   # name is *not* a real identifier — emit_call_expr splits the
@@ -995,13 +999,13 @@ fn fv_name(name: String, own: [String], globals: [String], acc: [String]) : [Str
   # capture it → an undeclared `kai___perceus_*` in the C. Suppress.
   else if string_starts_with_q(name, "__perceus_") { acc }
   else if list_has(own, name) { acc }
-  else if list_has(globals, name) { acc }
+  else if ns_has(globals, name) { acc }
   else if list_has(acc, name) { acc }
   else { [name, ...acc] }
 }
 
 #[doc("Free variables of an expression, given the lambda's own params and the program's globals. We skip descent into nested ELambdas (each gets its own capture set), and re-parse…")]
-pub fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] / Console {
+pub fn fv_expr(x: Expr, own: [String], globals: NameScope, acc: [String]) : [String] / Console {
 
   match x.kind {
     EInt(_, _)  -> acc
@@ -1106,7 +1110,7 @@ pub fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [Stri
 }
 
 #[doc("Free-variable collector over hclauses.")]
-pub fn fv_hclauses(cs: [HClause], own: [String], globals: [String], acc: [String]) : [String] / Console {
+pub fn fv_hclauses(cs: [HClause], own: [String], globals: NameScope, acc: [String]) : [String] / Console {
 
   match cs {
     [] -> acc
@@ -1128,7 +1132,7 @@ pub fn fv_hclauses(cs: [HClause], own: [String], globals: [String], acc: [String
 }
 
 #[doc("Free-variable collector over hreturn.")]
-pub fn fv_hreturn(r: HReturn, own: [String], globals: [String], acc: [String]) : [String] / Console {
+pub fn fv_hreturn(r: HReturn, own: [String], globals: NameScope, acc: [String]) : [String] / Console {
 
   match r {
     # Same state aliases as in `fv_hclauses` — a stateful return clause
@@ -1147,7 +1151,7 @@ pub fn list_concat_strings(a: [String], b: [String]) : [String] {
 }
 
 #[doc("Free-variable collector over exprs.")]
-pub fn fv_exprs(xs: [Expr], own: [String], globals: [String], acc: [String]) : [String] / Console {
+pub fn fv_exprs(xs: [Expr], own: [String], globals: NameScope, acc: [String]) : [String] / Console {
 
   match xs {
     [] -> acc
@@ -1156,7 +1160,7 @@ pub fn fv_exprs(xs: [Expr], own: [String], globals: [String], acc: [String]) : [
 }
 
 #[doc("Free-variable collector over arms.")]
-pub fn fv_arms(arms: [Arm], own: [String], globals: [String], acc: [String]) : [String] / Console {
+pub fn fv_arms(arms: [Arm], own: [String], globals: NameScope, acc: [String]) : [String] / Console {
 
   match arms {
     [] -> acc
@@ -1232,7 +1236,7 @@ pub fn pfield_bindings_loop(fs: [PField], acc: [String]) : [String] {
 }
 
 #[doc("Free-variable collector over field inits.")]
-pub fn fv_field_inits(fs: [FieldInit], own: [String], globals: [String], acc: [String]) : [String] / Console {
+pub fn fv_field_inits(fs: [FieldInit], own: [String], globals: NameScope, acc: [String]) : [String] / Console {
 
   match fs {
     [] -> acc
@@ -1243,7 +1247,7 @@ pub fn fv_field_inits(fs: [FieldInit], own: [String], globals: [String], acc: [S
 }
 
 #[doc("Free-variable collector over list elems.")]
-pub fn fv_list_elems(es: [ListElem], own: [String], globals: [String], acc: [String]) : [String] / Console {
+pub fn fv_list_elems(es: [ListElem], own: [String], globals: NameScope, acc: [String]) : [String] / Console {
 
   match es {
     [] -> acc
@@ -1262,7 +1266,7 @@ pub fn fv_list_elems(es: [ListElem], own: [String], globals: [String], acc: [Str
 pub type FvScoped = { own: [String], acc: [String] }
 
 #[doc("Free-variable collector over stmts scoped.")]
-pub fn fv_stmts_scoped(ss: [Stmt], own: [String], globals: [String], acc: [String]) : FvScoped / Console {
+pub fn fv_stmts_scoped(ss: [Stmt], own: [String], globals: NameScope, acc: [String]) : FvScoped / Console {
 
   match ss {
     [] -> FvScoped { own: own, acc: acc }
@@ -1282,7 +1286,7 @@ pub fn fv_stmts_scoped(ss: [Stmt], own: [String], globals: [String], acc: [Strin
 }
 
 #[doc("Free-variable collector over stmt.")]
-pub fn fv_stmt(s: Stmt, own: [String], globals: [String], acc: [String]) : [String] / Console {
+pub fn fv_stmt(s: Stmt, own: [String], globals: NameScope, acc: [String]) : [String] / Console {
 
   match s {
     SLet(_, _, rhs) -> fv_expr(rhs, own, globals, acc)
@@ -1307,7 +1311,7 @@ pub fn fv_stmt(s: Stmt, own: [String], globals: [String], acc: [String]) : [Stri
 }
 
 #[doc("Free-variable collector over interp.")]
-pub fn fv_interp(span: String, is_triple: Bool, own: [String], globals: [String], acc: [String]) : [String] / Console {
+pub fn fv_interp(span: String, is_triple: Bool, own: [String], globals: NameScope, acc: [String]) : [String] / Console {
 
   let n = string_length(span)
   let body_start = if is_triple { 3 } else { 1 }
@@ -1317,7 +1321,7 @@ pub fn fv_interp(span: String, is_triple: Bool, own: [String], globals: [String]
 }
 
 #[doc("Free-variable collector over interp parts.")]
-pub fn fv_interp_parts(parts: [IPart], own: [String], globals: [String], acc: [String]) : [String] / Console {
+pub fn fv_interp_parts(parts: [IPart], own: [String], globals: NameScope, acc: [String]) : [String] / Console {
 
   match parts {
     [] -> acc
@@ -1349,20 +1353,15 @@ pub fn fv_interp_parts(parts: [IPart], own: [String], globals: [String], acc: [S
 # mint matching prefixed clause symbols.
 #[doc("c #4: `cur_enc_fn` carries the post-monomorph C symbol of the fn / lambda / test the walker is currently inside. Updated at scope boundaries (DFn / DTest entry, ELambda…")]
 pub type LamCollect = { next_id: Int, lams: [LamInfo], clauses: [ClauseInfo],
-                    globals: [String], cur_enc_fn: String,
-                    # issue #285: enclosing-fn parameter and let/var binding
-                    # names visible at the current walk position. Shadows
-                    # `globals` when computing a nested lambda's caps so a
-                    # captured `Ref[T]` parameter named after a stdlib fn
-                    # (e.g. `count`, colliding with `list.count`) is added
-                    # to the closure's capture array instead of being
-                    # silently re-resolved to the global function value.
-                    local_scope: [String] }
+                    # A name an enclosing fn bound shadows the global of the
+                    # same spelling, so a lambda reading it captures it rather
+                    # than re-resolving to the global function value.
+                    scope: LamScope, cur_enc_fn: String }
 
 #[doc("Lambda-collect state helper: new.")]
 pub fn lc_new(globals: [String]) : LamCollect =
-  LamCollect { next_id: 0, lams: [], clauses: [], globals: globals,
-                cur_enc_fn: "", local_scope: [] }
+  LamCollect { next_id: 0, lams: [], clauses: [],
+                scope: lscope_new(ns_of_globals(globals)), cur_enc_fn: "" }
 
 # issue #285: state-passing scope helpers. Snapshot at entry of a
 # scope-introducing form (DFn body, EBlock, ELambda body); restore
@@ -1373,24 +1372,18 @@ pub fn lc_new(globals: [String]) : LamCollect =
 # scope-introducing form (DFn body, EBlock, ELambda body); restore
 # on exit. Kept tiny so the walker stays a one-line state-tweak per
 # scope frame.
-#[doc("issue #285: state-passing scope helpers. Snapshot at entry of a scope-introducing form (DFn body, EBlock, ELambda body); restore on exit. Kept tiny so the walker stays a…")]
-pub fn lc_set_locals(st: LamCollect, locals: [String]) : LamCollect =
+#[doc("Replace the walker's enclosing scope, for restoring a snapshot taken at a scope boundary.")]
+pub fn lc_set_scope(st: LamCollect, sc: LamScope) : LamCollect =
   LamCollect { next_id: st.next_id, lams: st.lams,
-                clauses: st.clauses, globals: st.globals,
-                cur_enc_fn: st.cur_enc_fn, local_scope: locals }
+                clauses: st.clauses, scope: sc, cur_enc_fn: st.cur_enc_fn }
 
-#[doc("Lambda-collect state helper: extend locals.")]
+#[doc("Lambda-collect state helper: bind more names in the current scope.")]
 pub fn lc_extend_locals(st: LamCollect, names: [String]) : LamCollect =
-  lc_set_locals(st, list_append(st.local_scope, names))
+  lc_set_scope(st, lscope_bind(st.scope, names))
 
-# issue #285: filter names out of `globals` so `fv_expr` records them
-# as captures. O(|globals| × |locals|) is acceptable: |locals| stays
-# tiny (a handful per fn), and lambda lifting runs once per emit.
-
-# issue #285: filter names out of `globals` so `fv_expr` records them
-# as captures. O(|globals| × |locals|) is acceptable: |locals| stays
-# tiny (a handful per fn), and lambda lifting runs once per emit.
-#[doc("issue #285: filter names out of `globals` so `fv_expr` records them as captures. O(|globals| × |locals|) is acceptable: |locals| stays tiny (a handful per fn), and lambda…")]
+# Callers must keep both operands bounded: this copies the first list
+# and scans the second per element, so it is O(|xs| x |ys|) every call.
+#[doc("The elements of the first list absent from the second, in order.")]
 pub fn list_minus(xs: [String], ys: [String]) : [String] = list_minus_loop(xs, ys, [])
 
 #[doc("Tail accumulator for list_minus: elements of the first list absent from the second.")]
@@ -1437,14 +1430,7 @@ pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
     ELambda(params, body) -> {
       let id = st.next_id
       let own = params_to_names(params)
-      # issue #285: an enclosing fn parameter or let/var binding whose
-      # name happens to match a stdlib fn (e.g. a `count: Ref[Int]`
-      # parameter while `list.count` is in scope) must be captured by
-      # the lambda, not silently re-resolved to the global. Filter the
-      # globals fed to `fv_expr` so any name shadowed by the current
-      # `local_scope` is treated as a free variable and added to caps.
-      let effective_globals = list_minus(st.globals, st.local_scope)
-      let caps = fv_expr(body, own, effective_globals, [])
+      let caps = fv_expr(body, own, st.scope.resolves, [])
       let info = LamInfo(id, st.cur_enc_fn, x.line, x.col, params, caps, body)
       # m4c #4: the lambda body is its own enclosing scope for clause
       # symbols (lifted to `lam_symbol` at emit). Push the new
@@ -1452,20 +1438,18 @@ pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
       # out so a sibling expression keeps stamping against its own
       # enclosing fn.
       let outer_enc_fn = st.cur_enc_fn
-      let outer_locals = st.local_scope
+      let outer_scope = st.scope
       let lam_enc_fn = lam_symbol_at(outer_enc_fn, x.line, x.col)
-      # Inside the lambda body, the lambda's own params shadow outer
-      # globals too — extend `local_scope` so a nested lambda nested
-      # again inside this body sees the shadowing chain.
+      # The lambda's own params shadow outer globals inside its body too,
+      # so a lambda nested again in there sees the whole shadowing chain.
       let st1 = LamCollect { next_id: id + 1, lams: [info, ...st.lams],
-                              clauses: st.clauses, globals: st.globals,
-                              cur_enc_fn: lam_enc_fn,
-                              local_scope: list_append(outer_locals, own) }
+                              clauses: st.clauses,
+                              scope: lscope_bind(outer_scope, own),
+                              cur_enc_fn: lam_enc_fn }
       let st2 = collect_expr(body, st1)
       LamCollect { next_id: st2.next_id, lams: st2.lams,
-                    clauses: st2.clauses, globals: st2.globals,
-                    cur_enc_fn: outer_enc_fn,
-                    local_scope: outer_locals }
+                    clauses: st2.clauses, scope: outer_scope,
+                    cur_enc_fn: outer_enc_fn }
     }
     ERecordLit(_, fields) -> collect_field_inits(fields, st)
     EList(elems) -> collect_list_elems(elems, st)
@@ -1474,14 +1458,12 @@ pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
       match opt_step { Some(s) -> collect_expr(s, s1) None -> s1 }
     }
     EBlock(stmts, opt_final) -> {
-      # issue #285: SLet / SVar inside the block extend `local_scope`;
-      # restore the outer scope on exit so siblings (and the lambda
-      # lifter's caller) don't see the block's bindings as still in
-      # scope.
-      let outer_locals = st.local_scope
+      # Statements bind into the block's scope; siblings must not see
+      # those bindings, so the outer scope is restored on exit.
+      let outer_scope = st.scope
       let s1 = collect_stmts(stmts, st)
       let s2 = match opt_final { Some(f) -> collect_expr(f, s1) None -> s1 }
-      lc_set_locals(s2, outer_locals)
+      lc_set_scope(s2, outer_scope)
     }
     EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
     EMapPipe(a, b) -> collect_expr(b, collect_expr(a, st))
@@ -1512,21 +1494,13 @@ pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
       # `demos/spiral`. The alias is only in scope inside the body —
       # not in `init` (runs before the handler is installed) and not
       # in the clauses (which see `state` / `log` magic instead).
-      let outer_globals = s0.globals
+      let outer_scope = s0.scope
       let s_body_in = match alias_opt {
-        Some(a) -> LamCollect {
-          next_id: s0.next_id, lams: s0.lams,
-          clauses: s0.clauses, globals: [a, ...outer_globals],
-          cur_enc_fn: s0.cur_enc_fn, local_scope: s0.local_scope
-        }
-        None -> s0
+        Some(a) -> lc_set_scope(s0, lscope_add_global(outer_scope, a))
+        None    -> s0
       }
       let s1_ext = collect_expr(body, s_body_in)
-      let s1 = LamCollect {
-        next_id: s1_ext.next_id, lams: s1_ext.lams,
-        clauses: s1_ext.clauses, globals: outer_globals,
-        cur_enc_fn: s1_ext.cur_enc_fn, local_scope: s1_ext.local_scope
-      }
+      let s1 = lc_set_scope(s1_ext, outer_scope)
       let s2 = collect_hclauses(clauses, s1)
       match ret_opt { Some(r) -> collect_hreturn(r, s2) None -> s2 }
     }
@@ -1594,19 +1568,15 @@ pub fn lc_record_clauses(cs: [HClause], eff: String, stateful: Bool,
         # surrounding handle frame. Mirrors `fv_hclauses`. A stateless
         # handler binds no alias, and a name the enclosing scope already
         # binds rides the env channel like any other capture.
-        let live_aliases = live_state_aliases(stateful, st.local_scope)
+        let live_aliases = live_state_aliases(stateful, st.scope.names)
         let own_for_fv = list_concat_strings(map(params, (pm) => pm.pname), live_aliases)
-        # issue #285: filter globals shadowed by enclosing-fn / outer
-        # let-var bindings, so a clause body capturing e.g. `count`
-        # (parameter shadowing `list.count`) is added to env captures.
-        let effective_globals = list_minus(st.globals, st.local_scope)
-        let raw_caps = fv_expr(body, own_for_fv, effective_globals, [])
+        let raw_caps = fv_expr(body, own_for_fv, st.scope.resolves, [])
         let caps = filter_clause_captures(raw_caps)
         let info = CI(hline, hcol, eff, op_name, params, body, stateful, enc_fn, caps)
         let st1 = LamCollect {
           next_id: st.next_id, lams: st.lams,
-          clauses: [info, ...st.clauses], globals: st.globals,
-          cur_enc_fn: st.cur_enc_fn, local_scope: st.local_scope
+          clauses: [info, ...st.clauses], scope: st.scope,
+          cur_enc_fn: st.cur_enc_fn
         }
         lc_record_clauses(rest, eff, stateful, hline, hcol, enc_fn, st1)
       }
@@ -1732,11 +1702,10 @@ pub fn collect_stmt(s: Stmt, st: LamCollect) : LamCollect / Console {
 
   match s {
     SLet(pat, _, rhs) -> {
-      # issue #285: walk RHS in the *outer* scope, then extend
-      # `local_scope` with the pattern's bound names so subsequent
-      # stmts and a trailing tail expression treat them as captures.
+      # The RHS walks in the outer scope; the pattern's names bind only
+      # for the statements after it.
       let s1 = collect_expr(rhs, st)
-      lc_set_locals(s1, pat_bindings(pat, s1.local_scope))
+      lc_extend_locals(s1, pat_bindings(pat, []))
     }
     SAssert(c, opt_m) -> {
       let s1 = collect_expr(c, st)
@@ -1799,24 +1768,22 @@ pub fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect / Conso
 #[doc("c #4: enter / leave helpers for the cur_enc_fn field. Functional state-passing — the walker swaps the enclosing fn name on the way in and restores the parent's name on the way…")]
 pub fn enter_enc_fn(st: LamCollect, name: String) : LamCollect =
   LamCollect { next_id: st.next_id, lams: st.lams,
-                clauses: st.clauses, globals: st.globals,
-                cur_enc_fn: name, local_scope: st.local_scope }
+                clauses: st.clauses, scope: st.scope, cur_enc_fn: name }
 
 #[doc("Restore the enclosing-function name in clause-lookup state after a nested walk.")]
 pub fn restore_enc_fn(st: LamCollect, name: String) : LamCollect =
   LamCollect { next_id: st.next_id, lams: st.lams,
-                clauses: st.clauses, globals: st.globals,
-                cur_enc_fn: name, local_scope: st.local_scope }
+                clauses: st.clauses, scope: st.scope, cur_enc_fn: name }
 
 # Walk a test / bench / check body under its runner symbol, restoring the
 # surrounding enclosing fn and lexical scope on the way out.
 fn collect_runner_body(body: Expr, locals: [String], enc: String,
                        st: LamCollect) : LamCollect / Console {
   let outer = st.cur_enc_fn
-  let outer_locals = st.local_scope
-  let st1 = enter_enc_fn(lc_set_locals(st, locals), enc)
+  let outer_scope = st.scope
+  let st1 = enter_enc_fn(lc_set_scope(st, lscope_reset(outer_scope, locals)), enc)
   let st2 = collect_expr(body, st1)
-  lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
+  lc_set_scope(restore_enc_fn(st2, outer), outer_scope)
 }
 
 #[doc("AST collector walking decl.")]
@@ -1825,15 +1792,15 @@ pub fn collect_decl(d: Decl, st: LamCollect) : LamCollect / Console {
   match d {
     DFn(_, name, _, ps, _, _, body, _, _, mo) -> {
       let outer = st.cur_enc_fn
-      let outer_locals = st.local_scope
-      # issue #285: seed `local_scope` with the fn's parameter names so
-      # any nested ELambda's free-variable analysis treats a parameter
-      # whose name collides with a stdlib fn (e.g. `count` shadowing
-      # `list.count`) as a captured local instead of a global.
-      let st1 = enter_enc_fn(lc_set_locals(st, params_to_names(ps)),
-                              c_sym(name, mo))
+      let outer_scope = st.scope
+      # Seed the scope with the fn's parameter names so a nested lambda
+      # treats a parameter colliding with a stdlib fn (e.g. `count`
+      # against `list.count`) as a captured local, not a global.
+      let st1 = enter_enc_fn(
+        lc_set_scope(st, lscope_reset(outer_scope, params_to_names(ps))),
+        c_sym(name, mo))
       let st2 = collect_expr(body, st1)
-      lc_set_locals(restore_enc_fn(st2, outer), outer_locals)
+      lc_set_scope(restore_enc_fn(st2, outer), outer_scope)
     }
     DType(_, _, _, _, _, _, _, _) -> st
     # The runner symbol the backends will emit is also the enclosing-fn
