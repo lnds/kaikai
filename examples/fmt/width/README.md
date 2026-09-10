@@ -14,11 +14,13 @@ Each fixture is a pair:
 - `<name>.expected.kai` — what `kai fmt` produces for it, checked by
   `tests/fmt_fixtures.sh` for bytes and idempotency.
 
-Three fixtures cover the constructs whose layout must consult the
+Four fixtures cover the constructs whose layout must consult the
 width rather than break unconditionally — `contracts` (a
 `requires` / `ensures` run), `sum_type_width` (a `type` sum body) —
 and the authorial layout the writer must not discard: `blank_lines`
-(a blank line between the statements of a block).
+(a blank line between the statements of a block) and
+`trailing_comment` (a comment closing a block body, which belongs to
+that body and not to whatever follows the brace).
 
 Two fixtures are controls and must not move:
 
