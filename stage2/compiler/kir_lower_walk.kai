@@ -1090,7 +1090,44 @@ fn lower_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes /
   if block_is_region(st.regions, x.line, x.col) { lower_region_block(x, stmts, tail, st) }
   else { lower_plain_block(x, stmts, tail, st) }
 
-fn lower_plain_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console {
+fn lower_plain_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console =
+  lower_plain_block_at(x, stmts, tail, SBoxed, st)
+
+# Lower a fn body at its declared return slot. A boxed slot is the ordinary
+# lowering. A raw slot forwards through the slot-driven border: a natively
+# raw body yields its scalar register, a plain block forwards its tail to
+# that same border, and anything else lowers boxed and unbox-borrows at the
+# slot the signature declares (never one guessed from the body's type — the
+# type-driven border routes a Bool/Char body to `real.unbox`).
+#
+# `kir_node_is_raw` gates the raw FORMS rather than `.mode` alone: the unbox
+# pass marks forms `MUnboxed` that `lower_expr_raw_kind` has no raw prim for
+# — a Char comparison routes to the f-family there and feeds an i32 register
+# to `kaix_real_field`. A `MUnboxed` call is admitted on top of that: its
+# callee already returns the scalar raw.
+pub fn lower_fn_body_at(body: Expr, ret: KSlot, st: LowerSt) : LRes / Console = match ret {
+  SBoxed -> lower_expr(body, st)
+  _      -> match body.kind {
+    EBlock(stmts, tail) ->
+      if block_is_region(st.regions, body.line, body.col) { lower_expr(body, st) }
+      else { lower_plain_block_at(body, stmts, tail, ret, st) }
+    _ -> if fn_body_lowers_raw(body) { lower_expr_raw_at(body, ret, st) }
+         else { lower_expr(body, st) }
+  }
+}
+
+fn fn_body_lowers_raw(body: Expr) : Bool =
+  if kir_node_is_raw(body) { true }
+  else { match body.mode {
+    MUnboxed -> match body.kind { ECall(_, _) -> true _ -> false }
+    _        -> false
+  } }
+
+# A plain block lowered with a destination slot for its TAIL. The statements
+# and their scope-exit drops are identical either way — only the tail's
+# border differs, so a raw destination forwards it to `lower_expr_raw_at`
+# instead of boxing it for the caller to unbox straight back.
+fn lower_plain_block_at(x: Expr, stmts: [Stmt], tail: Option[Expr], dst: KSlot, st: LowerSt) : LRes / Console {
   let snap = st.renames
   let lsnap = st.locals
   let st1 = lower_stmts(stmts, st)
@@ -1100,9 +1137,14 @@ fn lower_plain_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : 
   # scalar carries no rc).
   let st2 = lower_block_exit_drops(stmts, tail, st1)
   match tail {
-    Some(e) -> match lower_expr(e, tcp_after_stmts(st2, stmts)) { LRes(v, st3) -> LRes(v, ls_set_locals(ls_set_renames(st3, snap), lsnap)) }
+    Some(e) -> match lower_tail_at(e, dst, tcp_after_stmts(st2, stmts)) { LRes(v, st3) -> LRes(v, ls_set_locals(ls_set_renames(st3, snap), lsnap)) }
     None    -> LRes(KUnitV, ls_set_locals(ls_set_renames(st2, snap), lsnap))
   }
+}
+
+fn lower_tail_at(e: Expr, dst: KSlot, st: LowerSt) : LRes / Console = match dst {
+  SBoxed -> lower_expr(e, st)
+  _      -> lower_fn_body_at(e, dst, st)
 }
 
 # A lexical `region { }` block: bump-allocate the body's ctors into a fresh
@@ -1360,6 +1402,12 @@ fn kir_assert_msg(opt_msg: Option[Expr]) : String = match opt_msg {
 # to destructure). Returns the raw slot (SReal for a Real result, SBool for
 # a comparison/logical result), or None to keep the boxed path. Mirror of
 # perceus's `prc_pat_bindings_skip_raw` gate (a raw binder skips RC).
+#
+# A CALL whose result the unbox pass marked `MUnboxed` binds raw too: the
+# callee already returns the scalar in a raw register, and perceus skipped
+# the binder's RC on the same `MUnboxed` verdict — binding it boxed mints a
+# box per evaluation that nothing owns and nothing frees. Its slot comes
+# from the scalar type; a type with no raw slot keeps the boxed path.
 fn raw_let_slot(pat: Pattern, rhs: Expr) : Option[KSlot] = match pat.pkind {
   PBind(_) ->
     if kir_node_is_raw(rhs) {
@@ -1369,7 +1417,24 @@ fn raw_let_slot(pat: Pattern, rhs: Expr) : Option[KSlot] = match pat.pkind {
       else if kir_ty_is_byte(rhs.ty) { Some(SByte) }
       else if kir_ty_is_fixed_raw(rhs.ty) { Some(kir_fixed_raw_slot(rhs.ty)) }
       else { Some(SBool) }
-    } else { None }
+    } else { raw_call_let_slot(rhs) }
+  _ -> None
+}
+
+# The raw slot of a `MUnboxed` call result, or None for anything else. The
+# `else`-to-`SBool` guess the raw-node path can afford is unsafe here: a
+# call's result type is only known to be unboxable, so an unmapped type
+# must fall back to boxed rather than be read as an i32 bool.
+fn raw_call_let_slot(rhs: Expr) : Option[KSlot] = match rhs.mode {
+  MUnboxed -> match rhs.kind {
+    ECall(_, _) ->
+      if kir_ty_is_real(rhs.ty) { Some(SReal) }
+      else if kir_ty_is_int(rhs.ty) { Some(SInt64) }
+      else if kir_ty_is_byte(rhs.ty) { Some(SByte) }
+      else if kir_ty_is_fixed_raw(rhs.ty) { Some(kir_fixed_raw_slot(rhs.ty)) }
+      else { None }
+    _ -> None
+  }
   _ -> None
 }
 

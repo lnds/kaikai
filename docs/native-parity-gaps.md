@@ -444,6 +444,16 @@ Soundness gates: parity vs C-direct byte-id on the 9 closed fixtures +
   at the raw↔boxed border (`kaix_real` box-on-read / `kaix_real_field`
   unbox-borrow). No RC on a raw value → no double-free. See
   `docs/lane-experience-np-real.md`.
+
+  That closure holds and did not regress: it settled correctness (the
+  double-free) over raw borders *within* an expression, and the fixtures it
+  named still pass. The allocation gap #1961 reports on the same fixture
+  arrived AFTER it, with the raw-return SIGNATURE (`ret_slot_of_sig`): a
+  raw-return fn declared `f64` yet lowered its body boxed, so every call
+  minted a box the `KRet` unboxed straight back off, and a `let` over a call
+  result bound boxed while perceus had already skipped its RC. Both borders
+  now lower at the declared slot, and `unbox_bench_real` is at parity on the
+  two backends (`alloc_total` 1,000,002, peak RSS ~57 MB).
 - **`^` on Real** (free_fall) — math_real_basic CLOSED 2026-06-13 by the same
   raw-Real lane (its raw base reached `kaix_pow_int` correctly once the
   operand was raw). `free_fall` (a package fixture) still listed.
