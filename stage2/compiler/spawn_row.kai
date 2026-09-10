@@ -1,0 +1,331 @@
+# Spawn-boundary effect check.
+#
+# A child fiber starts with an empty evidence stack, so a handler
+# installed around a spawn sits on a frame the child cannot reach.
+# Only two kinds of effect resolve inside a child: one whose
+# `default { }` bridges to a runtime supplier (installed per fiber),
+# and a fiber-local one (bound to the child's own disposition). Any
+# other effect on a spawned thunk would dispatch against a slot
+# nobody filled, so it is rejected here instead of aborting at run
+# time.
+#
+# The thunk's row is read from the typed AST: inference annotates a
+# lambda with `TyFnT(_, _, row)`, and the nursery cap rewrite has
+# already turned `n.spawn(f)` into `Spawn.spawn(f)`, so every spawn
+# surface reaches this one check.
+
+import compiler.ast
+import compiler.diag
+import compiler.util
+
+#[doc("Reject a spawned thunk carrying an effect the child fiber cannot resolve.")]
+pub fn check_spawn_rows(file: String, mod_decls: [Decl],
+                         all_decls: [Decl]) : Int / Console + File =
+  check_spawn_rows_loop(file, all_decls, mod_decls, 0)
+
+
+fn check_spawn_rows_loop(file: String, all_decls: [Decl],
+                          ds: [Decl],
+                          acc: Int) : Int / Console + File {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DFn(_, _, _, _, _, _, body, _, _, _) -> {
+        let n = walk_spawn_rows_expr(file, all_decls, body, 0)
+        check_spawn_rows_loop(file, all_decls, rest, acc + n)
+      }
+      _ -> check_spawn_rows_loop(file, all_decls, rest, acc)
+    }
+  }
+}
+
+
+fn walk_spawn_rows_expr(file: String, decls: [Decl], e: Expr,
+                         acc: Int) : Int / Console + File {
+  let here = match e.kind {
+    ECall(callee, args_) -> match callee.kind {
+      EVar(key)   -> spawn_call_errs(file, decls, key, args_)
+      # A resolved stdlib export reaches the call site as a symbol,
+      # not a bare name: the free `spawn` wrapper arrives here.
+      ESym(_, nm) -> spawn_call_errs(file, decls, nm, args_)
+      _           -> 0
+    }
+    _ -> 0
+  }
+  walk_spawn_rows_list(file, decls, spawn_expr_children(e), acc + here)
+}
+
+
+fn spawn_call_errs(file: String, decls: [Decl], key: String,
+                    args_: [Expr]) : Int / Console + File {
+  if is_spawn_boundary_callee(key) {
+    check_spawned_thunk_row(file, decls, args_)
+  } else { 0 }
+}
+
+
+fn walk_spawn_rows_list(file: String, decls: [Decl], es: [Expr],
+                         acc: Int) : Int / Console + File {
+  match es {
+    []           -> acc
+    [h, ...rest] -> {
+      let a1 = walk_spawn_rows_expr(file, decls, h, acc)
+      walk_spawn_rows_list(file, decls, rest, a1)
+    }
+  }
+}
+
+
+# Sub-expressions to descend into. A spawn call can hide anywhere a
+# value can, so this stays exhaustive over the value-carrying forms;
+# a leaf yields none.
+fn spawn_expr_children(e: Expr) : [Expr] {
+  match e.kind {
+    ECall(callee, args_) -> [callee, ...args_]
+    EField(base, _)      -> [base]
+    EIndex(a, b)         -> [a, b]
+    EBinop(_, a, b)      -> [a, b]
+    EUnop(_, x)          -> [x]
+    EBang(x)             -> [x]
+    ELitUnit(x, _)       -> [x]
+    ELambda(_, body)     -> [body]
+    EPipe(a, b)          -> [a, b]
+    EMapPipe(a, b)       -> [a, b]
+    EFlatMapPipe(a, b)   -> [a, b]
+    EFilterPipe(a, b)    -> [a, b]
+    EIntrinsic(_, args_) -> args_
+    ESurface(sf)         -> surface_children(sf)
+    EList(els)           -> list_elem_exprs(els)
+    ERecordLit(_, fs)    -> field_init_exprs(fs)
+    EIf(c, t, eo)        -> [c, t, ...opt_expr(eo)]
+    ERange(a, b, os)     -> [a, b, ...opt_expr(os)]
+    EMatch(scr, arms)    -> [scr, ...arm_exprs(arms)]
+    EBlock(stmts, tail)  -> cat_exprs(stmt_exprs(stmts), opt_expr(tail))
+    EHandle(body, _, _, _, io, _, cs, _) ->
+      [body, ...cat_exprs(opt_expr(io), clause_exprs(cs))]
+    _ -> []
+  }
+}
+
+
+fn cat_exprs(a: [Expr], b: [Expr]) : [Expr] = match a {
+  []           -> b
+  [h, ...rest] -> [h, ...cat_exprs(rest, b)]
+}
+
+
+fn opt_expr(o: Option[Expr]) : [Expr] = match o {
+  Some(x) -> [x]
+  None    -> []
+}
+
+
+fn list_elem_exprs(els: [ListElem]) : [Expr] = match els {
+  []            -> []
+  [el, ...rest] -> match el {
+    ElPlain(e)  -> [e, ...list_elem_exprs(rest)]
+    ElSpread(e) -> [e, ...list_elem_exprs(rest)]
+  }
+}
+
+
+fn field_init_exprs(fs: [FieldInit]) : [Expr] = match fs {
+  []           -> []
+  [f, ...rest] -> match f { FI(_, e) -> [e, ...field_init_exprs(rest)] }
+}
+
+
+fn arm_exprs(arms: [Arm]) : [Expr] = match arms {
+  []           -> []
+  [a, ...rest] -> match a {
+    Arm(_, og, body) ->
+      cat_exprs(opt_expr(og), [body, ...arm_exprs(rest)])
+  }
+}
+
+
+fn clause_exprs(cs: [HClause]) : [Expr] = match cs {
+  []           -> []
+  [c, ...rest] -> match c {
+    HC(_, _, body, _, _) -> [body, ...clause_exprs(rest)]
+  }
+}
+
+
+fn stmt_exprs(ss: [Stmt]) : [Expr] = match ss {
+  []           -> []
+  [s, ...rest] -> cat_exprs(stmt_own_exprs(s), stmt_exprs(rest))
+}
+
+
+fn stmt_own_exprs(s: Stmt) : [Expr] = match s {
+  SLet(_, _, e)       -> [e]
+  SVar(_, _, e, _, _) -> [e]
+  SExprStmt(e)        -> [e]
+  SAssert(e, og)      -> [e, ...opt_expr(og)]
+  _                   -> []
+}
+
+
+# Every callee that hands a thunk to a fresh fiber. `Spawn.spawn` is
+# the op both `n.spawn` (rewritten by the nursery cap pass) and the
+# free `spawn` wrapper reach; `spawn_actor_fiber` is the actor
+# surface's own runtime entry, which does not route through the op.
+fn is_spawn_boundary_callee(key: String) : Bool =
+  name_in(spawn_boundary_callees(), strip_dispatch_tag(key))
+
+
+fn spawn_boundary_callees() : [String] =
+  ["Spawn.spawn", "spawn_actor_fiber",
+   "spawn", "spawn.spawn",
+   "spawn_actor", "spawn.spawn_actor",
+   "spawn_actor_policy", "spawn.spawn_actor_policy",
+   "actor.spawn_actor", "actor.spawn_actor_policy"]
+
+
+fn name_in(xs: [String], s: String) : Bool {
+  match xs {
+    []           -> false
+    [h, ...rest] -> if h == s { true } else { name_in(rest, s) }
+  }
+}
+
+
+# `@alias` / `#cap` suffixes are codegen-only dispatch tags.
+fn strip_dispatch_tag(key: String) : String =
+  strip_dispatch_tag_loop(key, 0, string_length(key))
+
+
+fn strip_dispatch_tag_loop(key: String, i: Int, n: Int) : String {
+  if i >= n { key }
+  else {
+    match char_at(key, i) {
+      Some(c) -> if c == '@' or c == '#' { string_slice(key, 0, i) }
+                 else { strip_dispatch_tag_loop(key, i + 1, n) }
+      None    -> key
+    }
+  }
+}
+
+
+# The thunk is the last argument on every spawn surface.
+fn spawn_thunk_arg(args_: [Expr]) : Option[Expr] {
+  match args_ {
+    []           -> None
+    [a]          -> Some(a)
+    [_, ...rest] -> spawn_thunk_arg(rest)
+  }
+}
+
+
+fn check_spawned_thunk_row(file: String, decls: [Decl],                             args_: [Expr]) : Int / Console + File {
+  match spawn_thunk_arg(args_) {
+    None      -> 0
+    Some(thk) -> match thk.ty {
+      None     -> 0
+      Some(t)  -> match t {
+        TyFnT(_, _, row) ->
+          report_spawn_row_labels(file, decls, row.labels,
+                                   thk.line, thk.col, 0)
+        _ -> 0
+      }
+    }
+  }
+}
+
+
+# An effect crosses a spawn when the runtime installs it for the child:
+# an all-`$extern_handler` default supplies it per fiber, and a
+# fiber-local effect resolves against the child's own disposition. An
+# effect this program never declares is not ours to judge.
+fn effect_crosses_spawn(eff: String, decls: [Decl]) : Bool {
+  match find_effect_decl(eff, decls) {
+    None      -> true
+    Some(blk) ->
+      if spawn_effect_is_fiber_local(eff) { true }
+      else { default_block_is_extern(blk) }
+  }
+}
+
+
+fn find_effect_decl(eff: String, decls: [Decl]) : Option[Option[DefaultBlock]] {
+  match decls {
+    []           -> None
+    [d, ...rest] -> match d {
+      DEffect(_, n, _, _, defblk, _, _, _) ->
+        if n == eff { Some(defblk) } else { find_effect_decl(eff, rest) }
+      _ -> find_effect_decl(eff, rest)
+    }
+  }
+}
+
+
+# A `default { }` whose clauses all bridge to `$extern_handler` is
+# supplied by the runtime per fiber; a hand-written clause is not.
+fn default_block_is_extern(defblk: Option[DefaultBlock]) : Bool {
+  match defblk {
+    None      -> false
+    Some(blk) -> match blk {
+      DBlk(clauses, _, _, _) -> clauses_all_extern(clauses)
+    }
+  }
+}
+
+
+fn clauses_all_extern(cs: [HClause]) : Bool {
+  match cs {
+    []           -> false
+    [c, ...rest] -> match c {
+      HC(_, _, body, _, _) ->
+        if clause_is_extern(body) { rest_all_extern(rest) } else { false }
+    }
+  }
+}
+
+
+fn rest_all_extern(cs: [HClause]) : Bool {
+  match cs {
+    []           -> true
+    [c, ...rest] -> match c {
+      HC(_, _, body, _, _) ->
+        if clause_is_extern(body) { rest_all_extern(rest) } else { false }
+    }
+  }
+}
+
+
+fn clause_is_extern(body: Expr) : Bool {
+  match body.kind {
+    EIntrinsic(name, _) -> name == "extern_handler"
+    _                   -> false
+  }
+}
+
+
+fn spawn_effect_is_fiber_local(eff: String) : Bool =
+  name_in(["Cancel", "Link", "Monitor", "Spawn", "Actor", "Ffi"], eff)
+
+
+fn report_spawn_row_labels(file: String, decls: [Decl],                             labels: [Label], line: Int, col: Int,
+                            acc: Int) : Int / Console + File {
+  match labels {
+    []           -> acc
+    [l, ...rest] ->
+      if effect_crosses_spawn(l.eff, decls) {
+        report_spawn_row_labels(file, decls, rest, line, col, acc)
+      } else {
+        report_spawn_escape(file, l.eff, line, col)
+        report_spawn_row_labels(file, decls, rest, line, col, acc + 1)
+      }
+  }
+}
+
+
+fn report_spawn_escape(file: String, eff_name: String,
+                        line: Int, col: Int) : Unit / Console + File {
+  diag_error(file, line, col,
+             concat_all(["effect not handled in spawned fiber: ", eff_name]))
+  diag_note("a fiber does not inherit the parent's handlers")
+  diag_help(concat_all(["handle the effect inside the spawned body: `handle { ... } with ",
+                        eff_name, " { ... }`"]))
+}
