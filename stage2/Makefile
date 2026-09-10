@@ -6670,6 +6670,7 @@ test-perceus-1961-call-raw-border: $(TARGET) build
 	  || { echo "perceus-1961-call-raw-border FAIL (leaked=$$leaked, a boxed call border)"; exit 1; }; \
 	echo "perceus-1961-call-raw-border OK"
 
+ifeq ($(KAI_LLVM),1)
 test-perceus-1961-call-raw-border-native: $(TARGET) build
 	@set -e; \
 	name=call_raw_result_border_1961; \
@@ -6683,6 +6684,10 @@ test-perceus-1961-call-raw-border-native: $(TARGET) build
 	[ -n "$$leaked" ] && [ "$$leaked" -eq 0 ] \
 	  || { echo "perceus-1961-call-raw-border-native FAIL (leaked=$$leaked, a boxed call border)"; exit 1; }; \
 	echo "perceus-1961-call-raw-border-native OK"
+else
+test-perceus-1961-call-raw-border-native:
+	@echo "perceus-1961-call-raw-border-native SKIP (C-only build; native backend not compiled)"
+endif
 
 # Issue #1768 — positions the use collector sees but the move gates did
 # not reason about: assert conditions and messages, match guards,
