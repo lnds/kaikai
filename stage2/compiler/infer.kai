@@ -19497,8 +19497,8 @@ fn tbl_others(mods: [ModuleDecls], target_mod: String,
 # The phase flip happens at the first decl carrying an explicit
 # `module_origin` of its own.
 fn partition_by_homes_loop(decls: [Decl], target_mod: String,
-                              acc: [ModuleDecls]) : [ModuleDecls] =
-  partition_by_homes_walk(decls, target_mod, "__builtin__", acc)
+                              acc: [HomeBucket]) : [ModuleDecls] =
+  buckets_finish(partition_by_homes_walk(decls, target_mod, "__builtin__", acc), [])
 
 # Walk decls left-to-right, threading the running `current_anchor`
 # module (= the home of the most recently seen DFn / DType /
@@ -19511,7 +19511,7 @@ fn partition_by_homes_loop(decls: [Decl], target_mod: String,
 # `inject_builtin_effects` block) lands in `__builtin__`.
 fn partition_by_homes_walk(decls: [Decl], target_mod: String,
                               current_anchor: String,
-                              acc: [ModuleDecls]) : [ModuleDecls] = match decls {
+                              acc: [HomeBucket]) : [HomeBucket] = match decls {
   [] -> acc
   [d, ...rest_d] -> {
     let explicit = decl_explicit_module_origin(d)
@@ -19528,7 +19528,7 @@ fn partition_by_homes_walk(decls: [Decl], target_mod: String,
     # to the last core module. Core tests keep their module's
     # anchor; only the post-core target decls flip this.
     let next_anchor = if home == target_mod { target_mod } else { anchor1 }
-    let acc1 = bucket_append(acc, home, d, [])
+    let acc1 = bucket_push(acc, home, d, [])
     partition_by_homes_walk(rest_d, target_mod, next_anchor, acc1)
   }
 }
@@ -19641,26 +19641,48 @@ fn home_or_target(mo: Option[String], target_mod: String) : String = match mo {
   None    -> target_mod
 }
 
-# Append `d` to the bucket whose `name = Some(home)`. Creates the
-# bucket at the END of `acc` (preserves first-appearance order)
-# when no bucket for `home` exists yet. `done` accumulates the
-# already-walked head of `acc` so the in-progress buckets stay in
-# order without reversing twice.
-fn bucket_append(acc: [ModuleDecls], home: String, d: Decl,
-                    done: [ModuleDecls]) : [ModuleDecls] = match acc {
-  [] -> list_append(list_reverse(done),
-          [ModuleDecls { name: Some(home), decls: [d] }])
-  [m, ...rest] -> {
-    let mname = match m.name { None -> "" Some(s) -> s }
-    if mname == home {
-      let updated = ModuleDecls { name: m.name,
-                                    decls: list_append(m.decls, [d]) }
-      list_append(list_reverse(done), [updated, ...rest])
+# A bucket under construction. BOTH axes are held reversed —
+# newest bucket first, newest decl first — so a push is O(1) on the
+# common path instead of copying a spine. Decls arrive in runs that
+# share a home, so the run's bucket is the one just created and sits
+# at the head. `buckets_finish` is the only way back to
+# `ModuleDecls`; it undoes both reversals, so first-appearance order
+# of buckets and source order of decls are restored exactly once and
+# no caller can observe the working representation.
+type HomeBucket = { home: String, rev_decls: [Decl] }
+
+# Push `d` onto the bucket named `home`, creating it at the head when
+# absent. An existing bucket keeps its position; `done` carries the
+# scanned prefix reversed so the rebuild costs only the buckets the
+# scan actually passed.
+fn bucket_push(acc: [HomeBucket], home: String, d: Decl,
+                  done: [HomeBucket]) : [HomeBucket] = match acc {
+  [] -> [HomeBucket { home: home, rev_decls: [d] }, ...list_reverse(done)]
+  [m, ...rest] ->
+    if m.home == home {
+      prepend_reverse_buckets(done,
+        [HomeBucket { home: home, rev_decls: [d, ...m.rev_decls] }, ...rest])
     } else {
-      bucket_append(rest, home, d, [m, ...done])
+      bucket_push(rest, home, d, [m, ...done])
     }
-  }
 }
+
+fn prepend_reverse_buckets(xs: [HomeBucket], acc: [HomeBucket]) : [HomeBucket] =
+  match xs {
+    [] -> acc
+    [x, ...rest] -> prepend_reverse_buckets(rest, [x, ...acc])
+  }
+
+# Undo both reversals: bucket order and, inside each bucket, decl
+# order.
+fn buckets_finish(acc: [HomeBucket], out: [ModuleDecls]) : [ModuleDecls] =
+  match acc {
+    [] -> out
+    [m, ...rest] ->
+      buckets_finish(rest,
+        [ModuleDecls { name: Some(m.home), decls: list_reverse(m.rev_decls) },
+         ...out])
+  }
 
 # variant accepting a snapshot of the protocol impl table
 # from `lower_protocols`. `synth_binop` consults it to gate dispatch
