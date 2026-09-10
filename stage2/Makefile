@@ -9323,26 +9323,22 @@ test-issue-1565-handler-alias-shadow-native:
 	@echo "issue-1565 native: SKIP (KAI_LLVM != 1)"
 endif
 
-# Issue #978 — a fiber spawned inside a nursery performs an effect handled in
-# the PARENT fiber. Handler evidence is per-fiber and does not cross a spawn, so
-# the spawned thunk fills the callee's evidence slot from its own (empty) stack;
-# pre-fix that slot held a NULL (or a zeroed synth-default node) and the perform
-# dereferenced it -> segfault (rc 139) on a type-checked program. The fix guards
-# every frame-slot fill, so the unhandled effect reports `effect not handled in
-# fiber: Note` + exit 1 — NOT a segfault. The exact exit code matters: rc 139
-# would be the regression, rc 1 the clean diagnostic.
+# Issue #978 — a fiber spawned inside a nursery performs an effect whose handler
+# is installed in the PARENT fiber. A child starts with an empty evidence stack,
+# so the parent's handler is not reachable from inside it. The spawn boundary is
+# settled at COMPILE time: the program must be REJECTED by the typer, never
+# built and never run. Supersedes the earlier runtime-diagnostic contract, which
+# accepted the program and aborted with `effect not handled in fiber` at rc 1.
 test-issue-978-spawn-parent-handled-effect: $(TARGET) build
 	@set -e; \
+	neg=issue_978_spawn_parent_handled_effect; \
 	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
-	  ../examples/effects/issue_978_spawn_parent_handled_effect.kai > build/iss978.c; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss978.c -o build/iss978 $(LDLIBS_M); \
-	rc=0; ./build/iss978 > build/iss978.out 2> build/iss978.err || rc=$$?; \
-	[ $$rc -eq 1 ] || { echo "issue-978 FAIL (exit $$rc, want 1 — rc 139 = segfault regressed)"; cat build/iss978.out build/iss978.err; exit 1; }; \
-	diff -q ../examples/effects/issue_978_spawn_parent_handled_effect.out.expected build/iss978.out > /dev/null \
-	  || { echo "issue-978 DIFF (stdout)"; diff ../examples/effects/issue_978_spawn_parent_handled_effect.out.expected build/iss978.out; exit 1; }; \
-	grep -q "kai: effect not handled in fiber: Note" build/iss978.err \
-	  && echo "issue-978 OK (spawned fiber's parent-handled effect reports clean diagnostic, not a segfault)" \
-	  || { echo "issue-978 FAIL (diagnostic missing on stderr)"; cat build/iss978.err; exit 1; }
+	  ../examples/effects/$$neg.kai 2> build/$$neg.err > /dev/null && \
+	  { echo "issue-978 FAIL $$neg (spawned thunk's unhandled effect accepted)"; exit 1; } \
+	  || true; \
+	grep -qF "$$(cat ../examples/effects/$$neg.err.expected)" build/$$neg.err \
+	  && echo "issue-978 OK $$neg (unhandled effect on a spawned thunk rejected at compile time)" \
+	  || { echo "issue-978 FAIL $$neg (wrong diagnostic)"; cat build/$$neg.err; exit 1; }
 
 # Issue #1051 — a fiber spawned inside a nursery performs a BUILTIN effect with
 # a stdlib default block (`Log`, `Env`) whose handler is installed in the PARENT

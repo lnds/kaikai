@@ -28,6 +28,38 @@ effect whose evidence the scheduler installs per fiber, so it cannot
 travel in a frame slot and no user handler can own its ops. See
 `docs/effects-stdlib.md` §*Three classes of builtin effect*.
 
+## The spawn boundary
+
+A thunk handed to `spawn` must arrive with no unhandled user effect.
+A child fiber starts with an *empty* evidence stack — it does not
+inherit the parent's — because a parent handler's evidence lives on a
+stack frame the parent overwrites once it returns. A handler installed
+around the `nursery` is therefore not visible from inside the child.
+
+Two kinds of effect still cross, and they are the only two: one whose
+`default { }` block bridges to a runtime supplier (the scheduler
+installs it per fiber, so `Stdout`, `Clock`, `Log`, `Env` … resolve
+inside a child), and a fiber-local effect (`Cancel`, `Link`,
+`Monitor`, `Spawn`, `Actor`), which binds the child's own disposition
+by construction.
+
+Anything else is rejected at compile time:
+
+```
+error: effect not handled in spawned fiber: Fail
+  = note: a fiber does not inherit the parent's handlers
+  = help: handle the effect inside the spawned body
+```
+
+Put the handler inside the spawned body:
+
+```kai
+n.spawn(() => handle { work() } with Fail { fail(m, resume) -> () })
+```
+
+The rule covers every surface that reaches a fiber: `n.spawn`, the
+free `spawn`, `Spawn.spawn`, and `spawn_actor` / `spawn_actor_policy`.
+
 ## Syntax
 
 ```kai
@@ -212,8 +244,7 @@ pin the wider semantics.
 One exception applies in the actor model: when a fiber is linked
 to a peer with `trap_exit=true` (set via `fiber_set_trap_exit`),
 its `Cancel.raise()` bypasses any `with Cancel { raise(_) -> ... }`
-handler in the call chain — including handlers inherited from the
-parent fiber's evidence chain at spawn time — and unwinds straight
+handler in the call chain — and unwinds straight
 to the trampoline cancel pad so the link-propagation walk can push
 a `"Crashed"` string into the supervisor's mailbox. See
 docs/actors.md §*Trap-exit semantics* for the BEAM-faithful
