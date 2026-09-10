@@ -16865,11 +16865,10 @@ static int kai_fiber_has_trap_exit_link(KaiFiber *f) {
  * linked child's termination through its mailbox, not through a
  * Cancel handler in the call chain between the spawn point and
  * the receive point. Without this hook, the child's `Cancel.raise()`
- * walks the inherited evidence chain (cloned at spawn time per
- * issue #104) and lands in any outer `with Cancel { raise(_) -> ... }`
- * the parent installed before the spawn — short-circuiting the
- * trampoline-tail link propagation that would have pushed
- * `"Crashed"` into the supervisor's mailbox.
+ * walks its own fiber's evidence chain and lands in any
+ * `with Cancel { raise(_) -> ... }` installed inside the fiber —
+ * short-circuiting the trampoline-tail link propagation that would
+ * have pushed `"Crashed"` into the supervisor's mailbox.
  *
  * The check fires only when the cancel_pad is live (so we have
  * somewhere to longjmp) and the fiber actually has a trap-exit'd
