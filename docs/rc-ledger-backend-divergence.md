@@ -99,14 +99,16 @@ more, which is 20,000 × 48 B.
 So C is retaining one `Real` per rebuilt spine node. On the full fixture that
 is 199,972 cells and 9.6 MB of RSS (49.8 MB vs 40.2 MB).
 
-The C TRMC step decides what to release through a per-call-site `dropmask`
-whose own criterion is documented as conservative
-(`tcrec_compute_site_dropmask`, `emit_c.kai`): a param read exactly once at
-`LUAt` gets no drop, on the assumption the single read transfers the reference
-to the recursive call's matching argument. In a TRMC spine step the rebuilt
-node's scalar slot does not transfer that way, and the reference is dropped on
-the floor. This is the mechanism the evidence points to; the exact predicate at
-fault was not isolated, and fixing the C emitter is outside this lane.
+The mechanism is the TRMC step's single-store reuse, not the per-call-site
+`dropmask` this note first pointed at. When the step rebuilds into the arm-top
+reuse token, `emit_trmc_slot_stores` elides the store of any slot whose value
+is already in the donated shell (`trmc_slot_is_donor_identity`, `emit_c.kai`).
+A `Real` slot is the one kind whose arm binder owns a box — the bind reads it
+as `kai_real(slot.r)`, and the elided store (`kai_take_real`) was its only
+consumer. Pointer binders alias without an incref, Int binders bind raw, enum
+binders are immortal singletons; none owes a release. So the elision orphaned
+one `Real` per rebuilt spine node. The elision now releases that box, and C's
+column converges on native's.
 
 ## What this means for the instrument
 
