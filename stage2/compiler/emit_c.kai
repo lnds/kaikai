@@ -16404,6 +16404,10 @@ fn emit_trmc_slot_stores(src: String, node: String, cname: String, args_e: [Expr
   match args_e {
     [] -> ""
     [a, ...rest] -> {
+      let kind = match tys_opt {
+        Some(ts) -> match trmc_ty_nth(ts, i) { Some(t) -> variant_slot_kind(t, cx.enums) None -> 0 }
+        None     -> 0
+      }
       let head =
         if i == holeslot {
           concat_all(["kai_var_slots(", node, ")[", int_to_string(i), "].ptr = (KaiValue *)0; "])
@@ -16415,12 +16419,15 @@ fn emit_trmc_slot_stores(src: String, node: String, cname: String, args_e: [Expr
           # changed fields). Only the TRMC hole + permuted/transformed slots
           # are written. Guarded by trmc_slot_is_donor_identity (same ctor,
           # arg is the positional binder bound off `_scr[i]`).
-          ""
+          #
+          # A Real slot is the one kind whose binder owns a box: the arm bind
+          # reads it as `kai_real(slot.r)`, and the store this elides is what
+          # would have consumed it (`kai_take_real`). Pointer binders alias
+          # without an incref, Int binders bind raw, enum binders are
+          # immortal singletons — none owes a release. Eliding the store
+          # without this decref orphans one Real per rebuilt spine node.
+          if kind == 2 { trmc_elided_real_release(a) } else { "" }
         } else {
-          let kind = match tys_opt {
-            Some(ts) -> match trmc_ty_nth(ts, i) { Some(t) -> variant_slot_kind(t, cx.enums) None -> 0 }
-            None     -> 0
-          }
           let slotpfx = concat_all(["kai_var_slots(", node, ")[", int_to_string(i), "]"])
           if kind == 1 {
             concat_all([slotpfx, ".i64 = ", emit_trmc_int_slot(src, a, cx), "; "])
@@ -16444,6 +16451,16 @@ fn emit_trmc_slot_stores(src: String, node: String, cname: String, args_e: [Expr
     }
   }
 }
+
+# Release the boxed Real a donor-identity slot elision leaves unconsumed.
+# The arg reached `trmc_slot_is_donor_identity` as `EVar(nm)` (a Perceus dup
+# wrapper stripped), and `nm`'s arm bind allocated the box; the elided store
+# was its only consumer.
+fn trmc_elided_real_release(a: Expr) : String =
+  match (unwrap_perceus_dup_for_borrow(a)).kind {
+    EVar(nm) -> concat_all(["kai_decref(", c_local(nm), "); "])
+    _        -> ""
+  }
 
 # True when slot i of the rebuild can skip its store because the value is
 # already in the donated reuse cell. SOUND only when (1) we are inside an
