@@ -84,6 +84,30 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.117.0 (2026-09-11)
+
+### BREAKING CHANGE
+
+- a spawned thunk carrying an unhandled user effect no
+longer compiles; the handler moves inside the spawned body.
+
+### Added
+
+- **typer**: settle a spawned fiber's effects at compile time (#1960)
+
+### Fixed
+
+- **emit**: release the Real a TRMC reuse step's elided slot store owned (#1963)
+- **kir**: lower a raw-return call's result at its declared slot (#1962)
+- **fmt**: keep a comment that closes a block body inside the block (#1958)
+- **perceus**: a self-tail-call's borrowed arg takes the goto drop (#1902) (#1951)
+- **typer**: check a contested bare type in the file that wrote it (#1948)
+
+### Changed
+
+- **compiler**: index the shadow set and accumulate reversed at five superlinear sites (#1959)
+- **typer**: make the home-module partition linear in its decls (#1956)
+
 ## v0.116.0 (2026-09-08)
 
 ### Added
