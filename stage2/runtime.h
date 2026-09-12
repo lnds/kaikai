@@ -17969,22 +17969,22 @@ static void kai_llvm_bc_id(const char *env, char *out, size_t outsz) {
 
 /* Codegen level for the TargetMachine — instruction selection, scheduling
  * and register allocation, a budget separate from the IR pass pipeline.
- * `None` still emits correct code; it trades register allocation quality
- * for a ~4x faster emit, which dominates a default build's back-half.
  *
- * `--release` and `--debug` keep `Default`: release must not lose codegen
- * quality, and debug already pays O0's larger module. Only an unqualified
- * `kai build` — the edit loop — takes the fast level. `KAI_NATIVE_CGLEVEL`
- * overrides for measurement.
+ * `Default` for every build profile. `None` emits correct code ~4x faster
+ * but spends the register allocator's budget: on the rb-tree descent it
+ * quadruples the spill traffic in the hot loop (349 -> 1508 load/store)
+ * and doubles the program's retired instructions. Emitted-code speed
+ * outranks compile time here.
  *
- * The chosen level shapes the emitted object, so it rides the backend tag
- * that keys the shared core-object cache; otherwise a default build and a
- * release build would collide on one key. */
+ * `KAI_NATIVE_CGLEVEL=0` selects the fast level, opt-in and never by
+ * default. Note it reaches only the prebuilt core object, not the user's
+ * own module — so it was never a usable escape from the default this
+ * replaces, and `--release` was not one either. It rides the backend tag
+ * that keys the shared core-object cache, so a fast-emit object cannot be
+ * served to a build that did not ask for one. */
 static const char *kai_llvm_cgen_level_id(void) {
     const char *e = getenv("KAI_NATIVE_CGLEVEL");
     if (e && e[0]) return (strcmp(e, "0") == 0) ? "none" : "default";
-    const char *m = getenv("KAI_BUILD_MODE");
-    if (m && strcmp(m, "default") == 0) return "none";
     return "default";
 }
 
