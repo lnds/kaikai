@@ -854,7 +854,7 @@ pub fn pat_is_unboxable_lit_or_wild(p: Pattern) : Bool {
 # (e.g. emit_c.kai:1340:25 and monomorph.kai:1340:25 under the
 # multi-module emit), so `find_lam` keys on `(enc_fn, line, col)`.
 #[doc("Lifted lambda descriptor (id, enc_fn, line, col, params, caps, body) for closure emission.")]
-pub type LamInfo = LamInfo(Int, String, Int, Int, [Param], [String], Expr)
+pub type LamInfo = LamInfo(Int, String, Int, Int, [Param], [String], Expr, Option[String])
 
 # The lambda's C symbol derives from (enc_fn, line, col) — the same key
 # find_lam resolves — not from a program-global counter, so a lambda
@@ -865,7 +865,7 @@ pub fn lam_symbol_at(enc_fn: String, line: Int, col: Int) : String =
 
 #[doc("C symbol of a lifted lambda from its LamInfo.")]
 pub fn lam_symbol(l: LamInfo) : String = match l {
-  LamInfo(_, ef, ln, cl, _, _, _) -> lam_symbol_at(ef, ln, cl)
+  LamInfo(_, ef, ln, cl, _, _, _, _) -> lam_symbol_at(ef, ln, cl)
 }
 
 # m7a #6c: each handler op clause becomes a top-level C function.
@@ -934,18 +934,28 @@ pub fn lam_symbol(l: LamInfo) : String = match l {
 # any clause body that names an enclosing-fn parameter triggered the
 # `use of undeclared identifier 'kai_<param>'` C error tracked as R9.
 #[doc("a #6c: each handler op clause becomes a top-level C function. The id pair (handle_line, handle_col) plus op_name uniquely names the clause (HCs do not nest within the same…")]
-pub type ClauseInfo = CI(Int, Int, String, String, [Param], Expr, Bool, String, [String])
+pub type ClauseInfo = CI(Int, Int, String, String, [Param], Expr, Bool, String, [String], Option[String])
 
 #[doc("The handler-state aliases a stateful handler actually binds, given the enclosing local scope.")]
 pub fn live_state_aliases(stateful: Bool, local_scope: [String]) : [String] =
   if stateful { list_minus(handler_state_aliases(), local_scope) } else { [] }
+
+#[doc("The module a lifted lambda came from, for rotating the EFn table to it before its body resolves a bare call.")]
+pub fn lam_mo(l: LamInfo) : Option[String] = match l {
+  LamInfo(_, _, _, _, _, _, _, mo) -> mo
+}
+
+#[doc("The module a handler clause came from, for rotating the EFn table to it before its body resolves a bare call.")]
+pub fn clause_mo(c: ClauseInfo) : Option[String] = match c {
+  CI(_, _, _, _, _, _, _, _, _, mo) -> mo
+}
 
 #[doc("Look up a lifted lambda by enclosing fn + source position. The (enc_fn, line, col) triple is unique even when two modules share a lambda at the same line/col.")]
 pub fn find_lam(lams: [LamInfo], enc_fn: String, line: Int, col: Int) : Option[LamInfo] {
   match lams {
     [] -> None
     [l, ...rest] -> match l {
-      LamInfo(_, ef, ln, cl, _, _, _) ->
+      LamInfo(_, ef, ln, cl, _, _, _, _) ->
         if ef == enc_fn and ln == line and cl == col { Some(l) }
         else { find_lam(rest, enc_fn, line, col) }
     }
@@ -1356,12 +1366,17 @@ pub type LamCollect = { next_id: Int, lams: [LamInfo], clauses: [ClauseInfo],
                     # A name an enclosing fn bound shadows the global of the
                     # same spelling, so a lambda reading it captures it rather
                     # than re-resolving to the global function value.
-                    scope: LamScope, cur_enc_fn: String }
+                    # The module the walker is inside, carried raw rather than
+                    # recovered from `cur_enc_fn`: the lifted bodies are emitted
+                    # from side tables with no Decl to read `mo` off, and the
+                    # emitters must rotate the EFn table to this module before
+                    # resolving a bare call (see `fns_prefer_module`).
+                    scope: LamScope, cur_enc_fn: String, cur_mo: Option[String] }
 
 #[doc("Lambda-collect state helper: new.")]
 pub fn lc_new(globals: [String]) : LamCollect =
   LamCollect { next_id: 0, lams: [], clauses: [],
-                scope: lscope_new(ns_of_globals(globals)), cur_enc_fn: "" }
+                scope: lscope_new(ns_of_globals(globals)), cur_enc_fn: "", cur_mo: None }
 
 # issue #285: state-passing scope helpers. Snapshot at entry of a
 # scope-introducing form (DFn body, EBlock, ELambda body); restore
@@ -1375,7 +1390,7 @@ pub fn lc_new(globals: [String]) : LamCollect =
 #[doc("Replace the walker's enclosing scope, for restoring a snapshot taken at a scope boundary.")]
 pub fn lc_set_scope(st: LamCollect, sc: LamScope) : LamCollect =
   LamCollect { next_id: st.next_id, lams: st.lams,
-                clauses: st.clauses, scope: sc, cur_enc_fn: st.cur_enc_fn }
+                clauses: st.clauses, scope: sc, cur_enc_fn: st.cur_enc_fn, cur_mo: st.cur_mo }
 
 #[doc("Lambda-collect state helper: bind more names in the current scope.")]
 pub fn lc_extend_locals(st: LamCollect, names: [String]) : LamCollect =
@@ -1431,7 +1446,7 @@ pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
       let id = st.next_id
       let own = params_to_names(params)
       let caps = fv_expr(body, own, st.scope.resolves, [])
-      let info = LamInfo(id, st.cur_enc_fn, x.line, x.col, params, caps, body)
+      let info = LamInfo(id, st.cur_enc_fn, x.line, x.col, params, caps, body, st.cur_mo)
       # m4c #4: the lambda body is its own enclosing scope for clause
       # symbols (lifted to `lam_symbol` at emit). Push the new
       # enc_fn for the body walk; restore the outer enc_fn on the way
@@ -1445,11 +1460,11 @@ pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
       let st1 = LamCollect { next_id: id + 1, lams: [info, ...st.lams],
                               clauses: st.clauses,
                               scope: lscope_bind(outer_scope, own),
-                              cur_enc_fn: lam_enc_fn }
+                              cur_enc_fn: lam_enc_fn, cur_mo: st.cur_mo }
       let st2 = collect_expr(body, st1)
       LamCollect { next_id: st2.next_id, lams: st2.lams,
                     clauses: st2.clauses, scope: outer_scope,
-                    cur_enc_fn: outer_enc_fn }
+                    cur_enc_fn: outer_enc_fn, cur_mo: st.cur_mo }
     }
     ERecordLit(_, fields) -> collect_field_inits(fields, st)
     EList(elems) -> collect_list_elems(elems, st)
@@ -1572,11 +1587,11 @@ pub fn lc_record_clauses(cs: [HClause], eff: String, stateful: Bool,
         let own_for_fv = list_concat_strings(map(params, (pm) => pm.pname), live_aliases)
         let raw_caps = fv_expr(body, own_for_fv, st.scope.resolves, [])
         let caps = filter_clause_captures(raw_caps)
-        let info = CI(hline, hcol, eff, op_name, params, body, stateful, enc_fn, caps)
+        let info = CI(hline, hcol, eff, op_name, params, body, stateful, enc_fn, caps, st.cur_mo)
         let st1 = LamCollect {
           next_id: st.next_id, lams: st.lams,
           clauses: [info, ...st.clauses], scope: st.scope,
-          cur_enc_fn: st.cur_enc_fn
+          cur_enc_fn: st.cur_enc_fn, cur_mo: st.cur_mo
         }
         lc_record_clauses(rest, eff, stateful, hline, hcol, enc_fn, st1)
       }
@@ -1766,22 +1781,22 @@ pub fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect / Conso
 # in and restores the parent's name on the way out so siblings stamp
 # their own clauses against the right scope.
 #[doc("c #4: enter / leave helpers for the cur_enc_fn field. Functional state-passing — the walker swaps the enclosing fn name on the way in and restores the parent's name on the way…")]
-pub fn enter_enc_fn(st: LamCollect, name: String) : LamCollect =
+pub fn enter_enc_fn(st: LamCollect, name: String, mo: Option[String]) : LamCollect =
   LamCollect { next_id: st.next_id, lams: st.lams,
-                clauses: st.clauses, scope: st.scope, cur_enc_fn: name }
+                clauses: st.clauses, scope: st.scope, cur_enc_fn: name, cur_mo: mo }
 
 #[doc("Restore the enclosing-function name in clause-lookup state after a nested walk.")]
 pub fn restore_enc_fn(st: LamCollect, name: String) : LamCollect =
   LamCollect { next_id: st.next_id, lams: st.lams,
-                clauses: st.clauses, scope: st.scope, cur_enc_fn: name }
+                clauses: st.clauses, scope: st.scope, cur_enc_fn: name, cur_mo: st.cur_mo }
 
 # Walk a test / bench / check body under its runner symbol, restoring the
 # surrounding enclosing fn and lexical scope on the way out.
 fn collect_runner_body(body: Expr, locals: [String], enc: String,
-                       st: LamCollect) : LamCollect / Console {
+                       mo: Option[String], st: LamCollect) : LamCollect / Console {
   let outer = st.cur_enc_fn
   let outer_scope = st.scope
-  let st1 = enter_enc_fn(lc_set_scope(st, lscope_reset(outer_scope, locals)), enc)
+  let st1 = enter_enc_fn(lc_set_scope(st, lscope_reset(outer_scope, locals)), enc, mo)
   let st2 = collect_expr(body, st1)
   lc_set_scope(restore_enc_fn(st2, outer), outer_scope)
 }
@@ -1798,7 +1813,7 @@ pub fn collect_decl(d: Decl, st: LamCollect) : LamCollect / Console {
       # against `list.count`) as a captured local, not a global.
       let st1 = enter_enc_fn(
         lc_set_scope(st, lscope_reset(outer_scope, params_to_names(ps))),
-        c_sym(name, mo))
+        c_sym(name, mo), mo)
       let st2 = collect_expr(body, st1)
       lc_set_scope(restore_enc_fn(st2, outer), outer_scope)
     }
@@ -1807,11 +1822,11 @@ pub fn collect_decl(d: Decl, st: LamCollect) : LamCollect / Console {
     # key for everything lifted out of the block's body, so the collector
     # mints it from the same `runner_enc_fn` both backends call.
     DTest(_, body, line, col, mo) ->
-      collect_runner_body(body, [], runner_enc_fn("test", mo, line, col), st)
+      collect_runner_body(body, [], runner_enc_fn("test", mo, line, col), mo, st)
     DBench(_, body, line, col, mo) ->
-      collect_runner_body(body, [], runner_enc_fn("bench", mo, line, col), st)
+      collect_runner_body(body, [], runner_enc_fn("bench", mo, line, col), mo, st)
     DCheck(_, ps, body, line, col, mo) ->
-      collect_runner_body(body, params_to_names(ps), runner_enc_fn("check", mo, line, col), st)
+      collect_runner_body(body, params_to_names(ps), runner_enc_fn("check", mo, line, col), mo, st)
     DImport(_, _, _) -> st
     DEffect(_, _, _, _, _, _, _, _) -> st          # no expressions to walk
     # m12.8: stripped pre-resolve. No expressions to walk if one
