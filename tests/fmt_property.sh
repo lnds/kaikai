@@ -125,6 +125,11 @@ KNOWN_REPARSE="
 
 # (c) AST equality — output parses but denotes something else.
 KNOWN_AST="
+# #1977 — a pipe nested inside a lambda body is hoisted out and
+# re-associated, dropping the parens that delimited the outer lambda's
+# body; the result does not type-check. The corpus had no subject of
+# this shape before this fixture.
+examples/namespace-collisions/own_fn_call_forms_matrix_nested/pkg.kai
 "
 
 # (d) idempotency — no fixed point in one pass.
