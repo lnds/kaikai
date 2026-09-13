@@ -122,7 +122,20 @@ fn main() : Unit / Stdout = {
 
 Self-tail calls are MANDATORY-OPTIMISED (Tier 1 #2). A function
 whose final expression is a call to itself uses constant stack.
-Non-self tail calls do not generally get TCO.
+
+Mutual tail recursion gets the same guarantee: a cycle of functions
+calling each other in tail position — the `is_even`/`is_odd` pair, or
+any longer cycle — runs in constant stack on both backends. The group
+is fused into one self-recursive function, so the cycle becomes the
+same loop a self-tail call compiles to.
+
+The cycle's members have to share one signature for this: same
+parameter types, same return type, same effect row, and no type
+parameters. A cycle whose members disagree on any of those still
+consumes a frame per hop.
+
+A tail call that is not part of a cycle — `f` calling `g` where `g`
+never leads back to `f` — is an ordinary call and keeps its frame.
 
 ## Performance
 

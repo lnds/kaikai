@@ -1,0 +1,173 @@
+#[doc("""
+Parameter renaming for tail-call fusion.
+
+The members of a fused group each name their parameters their own way,
+while the fused body binds one set of names. This module rewrites a
+member's body to read those names instead.
+
+The fused entry's names are minted, not borrowed from any member, so
+the substitution cannot rename a read into a name one of that member's
+own locals already binds — which is why the walk needs no scope.
+
+The walk is a plain structural substitution, and a form it does not
+descend into would leave a parameter read spelled the old way.
+`tfsubst_walkable` is therefore the gate the fusion must consult first:
+a body it rejects stays unfused rather than half-renamed.
+""")]
+
+import compiler.ast
+import compiler.util
+
+#[doc("Rewrite `body` so that reads of the parameters in `from` name the correspondingly positioned parameters in `to`. Positions that already agree are left alone, so a member whose parameter names match the lead's is returned untouched.")]
+pub fn tfsubst_rename_params(body: Expr, from: [Param], to: [Param]) : Expr =
+  tf_subst_vars(body, tf_rename_pairs(from, to))
+
+#[doc("True when every expression form in `body` is one the substitution walks. A form it does not descend into would keep a parameter read spelled the old way, so a body this rejects must not be fused.")]
+pub fn tfsubst_walkable(body: Expr) : Bool = tfsubst_kind_walkable(body.kind)
+
+fn tfsubst_kind_walkable(k: ExprKind) : Bool = match k {
+  EInt(_, _)    -> true
+  EReal(_, _)   -> true
+  EBool(_)      -> true
+  EChar(_)      -> true
+  EStr(s, _)    -> not tfsubst_has_interp(s)
+  EUnit         -> true
+  EVar(_)       -> true
+  ESym(_, _)    -> true
+  EModCall(_, _) -> true
+  ECall(f, xs)  -> tfsubst_walkable(f) and tfsubst_all(xs)
+  EBinop(_, a, b) -> tfsubst_walkable(a) and tfsubst_walkable(b)
+  EUnop(_, a)   -> tfsubst_walkable(a)
+  EField(a, _)  -> tfsubst_walkable(a)
+  EIndex(a, b)  -> tfsubst_walkable(a) and tfsubst_walkable(b)
+  EIf(c, t, e)  -> tfsubst_walkable(c) and tfsubst_walkable(t) and tfsubst_opt_walkable(e)
+  EMatch(s, arms) -> tfsubst_walkable(s) and tfsubst_arms_walkable(arms)
+  EBlock(stmts, tail) -> tfsubst_stmts_walkable(stmts) and tfsubst_opt_walkable(tail)
+  _             -> false
+}
+
+# An interpolated string hides expression syntax inside its span, which
+# the substitution never reaches.
+fn tfsubst_has_interp(span: String) : Bool = has_interp(span, 0, string_length(span))
+
+fn tfsubst_opt_walkable(o: Option[Expr]) : Bool = match o {
+  None    -> true
+  Some(e) -> tfsubst_walkable(e)
+}
+
+fn tfsubst_all(xs: [Expr]) : Bool = match xs {
+  [] -> true
+  [x, ...rest] -> if tfsubst_walkable(x) { tfsubst_all(rest) } else { false }
+  _ -> true
+}
+
+fn tfsubst_arms_walkable(arms: [Arm]) : Bool = match arms {
+  [] -> true
+  [Arm(_, guard, body), ...rest] ->
+    if tfsubst_opt_walkable(guard) and tfsubst_walkable(body) { tfsubst_arms_walkable(rest) }
+    else { false }
+  _ -> true
+}
+
+fn tfsubst_stmts_walkable(stmts: [Stmt]) : Bool = match stmts {
+  [] -> true
+  [s, ...rest] -> if tfsubst_stmt_walkable(s) { tfsubst_stmts_walkable(rest) } else { false }
+  _ -> true
+}
+
+fn tfsubst_stmt_walkable(s: Stmt) : Bool = match s {
+  SLet(_, _, rhs) -> tfsubst_walkable(rhs)
+  SExprStmt(e)    -> tfsubst_walkable(e)
+  _               -> false
+}
+
+fn tf_rename_pairs(from: [Param], to: [Param]) : [[String]] {
+  match from {
+    [] -> []
+    [f, ...frest] -> match to {
+      [] -> []
+      [t, ...trest] ->
+        if f.pname == t.pname { tf_rename_pairs(frest, trest) }
+        else { [[f.pname, t.pname], ...tf_rename_pairs(frest, trest)] }
+      _ -> []
+    }
+    _ -> []
+  }
+}
+
+# ---- variable substitution -----------------------------------------
+
+fn tf_subst_vars(e: Expr, pairs: [[String]]) : Expr =
+  if list_is_empty(pairs) { e }
+  else { mk_expr(tf_subst_kind(e.kind, pairs), e.line, e.col) }
+
+fn tf_subst_kind(k: ExprKind, pairs: [[String]]) : ExprKind {
+  match k {
+    EVar(n) -> EVar(tf_subst_name(n, pairs))
+    ECall(f, xs) -> ECall(tf_subst_vars(f, pairs), tf_subst_list(xs, pairs))
+    EBinop(op, a, b) -> EBinop(op, tf_subst_vars(a, pairs), tf_subst_vars(b, pairs))
+    EUnop(op, a) -> EUnop(op, tf_subst_vars(a, pairs))
+    EIf(c, t, opt_e) ->
+      EIf(tf_subst_vars(c, pairs), tf_subst_vars(t, pairs), tf_subst_opt(opt_e, pairs))
+    EMatch(s, arms) -> EMatch(tf_subst_vars(s, pairs), tf_subst_arms(arms, pairs))
+    EBlock(stmts, opt_tail) -> EBlock(tf_subst_stmts(stmts, pairs), tf_subst_opt(opt_tail, pairs))
+    EField(a, fld) -> EField(tf_subst_vars(a, pairs), fld)
+    EIndex(a, b) -> EIndex(tf_subst_vars(a, pairs), tf_subst_vars(b, pairs))
+    _ -> k
+  }
+}
+
+fn tf_subst_opt(opt_e: Option[Expr], pairs: [[String]]) : Option[Expr] = match opt_e {
+  None    -> None
+  Some(e) -> Some(tf_subst_vars(e, pairs))
+}
+
+fn tf_subst_list(xs: [Expr], pairs: [[String]]) : [Expr] = match xs {
+  [] -> []
+  [x, ...rest] -> [tf_subst_vars(x, pairs), ...tf_subst_list(rest, pairs)]
+  _ -> []
+}
+
+fn tf_subst_arms(arms: [Arm], pairs: [[String]]) : [Arm] = match arms {
+  [] -> []
+  [Arm(p, guard, body), ...rest] ->
+    [Arm(p, tf_subst_opt(guard, pairs), tf_subst_vars(body, pairs)),
+     ...tf_subst_arms(rest, pairs)]
+  _ -> []
+}
+
+fn tf_subst_stmts(stmts: [Stmt], pairs: [[String]]) : [Stmt] = match stmts {
+  [] -> []
+  [s, ...rest] -> [tf_subst_stmt(s, pairs), ...tf_subst_stmts(rest, pairs)]
+  _ -> []
+}
+
+fn tf_subst_stmt(s: Stmt, pairs: [[String]]) : Stmt = match s {
+  SLet(p, t, rhs)   -> SLet(p, t, tf_subst_vars(rhs, pairs))
+  SExprStmt(e)      -> SExprStmt(tf_subst_vars(e, pairs))
+  _                 -> s
+}
+
+fn tf_subst_name(n: String, pairs: [[String]]) : String = match pairs {
+  [] -> n
+  [pair, ...rest] -> match pair {
+    [from, to] -> if n == from { to } else { tf_subst_name(n, rest) }
+    _          -> tf_subst_name(n, rest)
+  }
+  _ -> n
+}
+
+# A body carrying a form the parameter substitution does not descend
+# into would keep a read spelled the old way once the fused entry
+# renames the parameters, so such a group stays unfused.
+#[doc("True when every declaration in `ds` has a body the substitution walks in full. A group containing one it does not must stay unfused.")]
+pub fn tfsubst_bodies_walkable(ds: [Decl]) : Bool = match ds {
+  [] -> true
+  [d, ...rest] -> if tfsubst_body_walkable(d) { tfsubst_bodies_walkable(rest) } else { false }
+  _ -> true
+}
+
+fn tfsubst_body_walkable(d: Decl) : Bool = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> tfsubst_walkable(body)
+  _ -> false
+}
