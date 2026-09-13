@@ -1,0 +1,316 @@
+#[doc("""
+Tail-call graph over a program's `[Decl]`, and its mutually recursive
+groups.
+
+The self-tail rewrite keys on a function's own name, so it sees a cycle
+of length one and nothing longer. This pass supplies the missing shape:
+an edge `f -> g` for every call to `g` sitting in TAIL position in `f`'s
+body, and the strongly connected components of that graph. A component
+of two or more members is a mutual tail recursion — the
+`is_even`/`is_odd` shape — which the fusion rewrite turns into a single
+self-recursive function the existing goto-loop already optimises.
+
+Tail position is the same notion the self-tail gate walks: the branches
+of an `if`, the bodies of `match` arms, and a block's trailing
+expression. A block tail that merely reads back a `let` bound earlier
+in the same block is peeled, so the call the binding hid is seen as the
+tail position it is.
+
+Edges are keyed by `(name, mo)` — the emitted symbol identity — so a
+call qualified by the monomorphiser as `EModCall(host, name)` joins the
+same node as the bare call it came from. A name rebound by an inner
+`let` or a lambda parameter shadows the top-level function, so the walk
+carries the shadowing scope and drops an edge whose callee is shadowed.
+
+The pass is a PURE analysis producing a side table (the `purity.kai`
+pattern): it does not mutate the AST.
+""")]
+
+import compiler.ast
+import compiler.util
+
+#[doc("One node of the tail-call graph: a top-level function's name, its module origin, and its arity. Arity is carried because a call whose argument count differs from the declaration is not a tail call the rewrite can fuse.")]
+pub type TgNode = TgN(String, Option[String], Int)
+
+#[doc("A tail-call edge from the node at index `from` to the node at index `to`, both indices into the node list `tailgraph_nodes` returned.")]
+pub type TgEdge = TgE(Int, Int)
+
+#[doc("The tail-call graph of a program: its nodes in declaration order and the tail-call edges between them.")]
+pub type TailGraph = TG([TgNode], [TgEdge])
+
+#[doc("A mutually recursive tail-call group: the indices, into the graph's node list, of the members of one strongly connected component of size two or more.")]
+pub type TgGroup = TgGrp([Int])
+
+#[doc("The declared name of a tail-call graph node.")]
+pub fn tgnode_name(n: TgNode) : String = match n { TgN(nm, _, _) -> nm }
+#[doc("The module a tail-call graph node belongs to; `None` for the root file.")]
+pub fn tgnode_mo(n: TgNode) : Option[String] = match n { TgN(_, mo, _) -> mo }
+fn tgnode_arity(n: TgNode) : Int = match n { TgN(_, _, a) -> a }
+#[doc("The node indices making up a mutually recursive group, in ascending order.")]
+pub fn tggroup_members(g: TgGroup) : [Int] = match g { TgGrp(xs) -> xs }
+#[doc("The nodes of a tail-call graph, in declaration order.")]
+pub fn tailgraph_nodes(g: TailGraph) : [TgNode] = match g { TG(ns, _) -> ns }
+fn tailgraph_edges(g: TailGraph) : [TgEdge] = match g { TG(_, es) -> es }
+
+# ---- entry points --------------------------------------------------
+
+#[doc("Build the tail-call graph of `decls`: one node per top-level function, one edge per call in tail position whose callee is another top-level function of matching arity.")]
+pub fn tailgraph_build(decls: [Decl]) : TailGraph {
+  let nodes = tg_collect_nodes(decls)
+  TG(nodes, tg_collect_edges(decls, nodes))
+}
+
+#[doc("The mutually recursive tail-call groups of `g`: every strongly connected component with two or more members, each as node indices in ascending order. Self-loops are excluded — a component of one member is the self-tail case the existing rewrite already handles.")]
+pub fn tailgraph_groups(g: TailGraph) : [TgGroup] =
+  tg_groups_from(g, tg_index_range(list_length(tailgraph_nodes(g)), 0), [])
+
+
+# ---- nodes ---------------------------------------------------------
+
+fn tg_collect_nodes(decls: [Decl]) : [TgNode] = match decls {
+  [] -> []
+  [d, ...rest] -> match tg_node_of_decl(d) {
+    Some(n) -> [n, ...tg_collect_nodes(rest)]
+    None    -> tg_collect_nodes(rest)
+  }
+  _ -> []
+}
+
+fn tg_node_of_decl(d: Decl) : Option[TgNode] = match d {
+  DFn(_, name, _, params, _, _, _, _, _, mo) -> Some(TgN(name, mo, list_length(params)))
+  _ -> None
+}
+
+fn tg_find_node(ns: [TgNode], name: String, mo: Option[String], i: Int) : Int = match ns {
+  [] -> 0 - 1
+  [n, ...rest] ->
+    if tgnode_name(n) == name and mo_eq(tgnode_mo(n), mo) { i }
+    else { tg_find_node(rest, name, mo, i + 1) }
+  _ -> 0 - 1
+}
+
+fn tg_node_at(ns: [TgNode], i: Int) : Option[TgNode] = match ns {
+  [] -> None
+  [n, ...rest] -> if i <= 0 { Some(n) } else { tg_node_at(rest, i - 1) }
+  _ -> None
+}
+
+# ---- edges ---------------------------------------------------------
+
+fn tg_collect_edges(decls: [Decl], nodes: [TgNode]) : [TgEdge] =
+  tg_edges_loop(decls, nodes, 0, [])
+
+fn tg_edges_loop(decls: [Decl], nodes: [TgNode], i: Int, acc: [TgEdge]) : [TgEdge] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DFn(_, _, _, _, _, _, body, _, _, mo) ->
+        tg_edges_loop(rest, nodes, i + 1,
+          tg_add_targets(tg_tail_targets(body, mo, nodes, []), nodes, i, acc))
+      _ -> tg_edges_loop(rest, nodes, i, acc)
+    }
+    _ -> list_reverse(acc)
+  }
+}
+
+fn tg_add_targets(targets: [Int], nodes: [TgNode], from: Int, acc: [TgEdge]) : [TgEdge] {
+  match targets {
+    [] -> acc
+    [t, ...rest] ->
+      if tg_has_edge(acc, from, t) { tg_add_targets(rest, nodes, from, acc) }
+      else { tg_add_targets(rest, nodes, from, [TgE(from, t), ...acc]) }
+    _ -> acc
+  }
+}
+
+fn tg_has_edge(es: [TgEdge], from: Int, to: Int) : Bool = match es {
+  [] -> false
+  [TgE(a, b), ...rest] -> if a == from and b == to { true } else { tg_has_edge(rest, from, to) }
+  _ -> false
+}
+
+fn tg_tail_targets(body: Expr, mo: Option[String], nodes: [TgNode], scope: [String]) : [Int] =
+  tg_walk_tail(body.kind, mo, nodes, scope)
+
+fn tg_walk_tail(k: ExprKind, mo: Option[String], nodes: [TgNode], scope: [String]) : [Int] {
+  match k {
+    ECall(f, xs) -> tg_call_target(f.kind, list_length(xs), mo, nodes, scope)
+    EIf(_, t, opt_e) ->
+      list_append(tg_walk_tail(t.kind, mo, nodes, scope), tg_walk_opt(opt_e, mo, nodes, scope))
+    EMatch(_, arms) -> tg_walk_arms(arms, mo, nodes, scope)
+    EBlock(stmts, opt_tail) ->
+      tg_walk_block(stmts, opt_tail, mo, nodes, tg_block_scope(stmts, scope))
+    _ -> []
+  }
+}
+
+fn tg_walk_opt(opt_e: Option[Expr], mo: Option[String], nodes: [TgNode], scope: [String]) : [Int] =
+  match opt_e {
+    None    -> []
+    Some(e) -> tg_walk_tail(e.kind, mo, nodes, scope)
+  }
+
+fn tg_walk_arms(arms: [Arm], mo: Option[String], nodes: [TgNode], scope: [String]) : [Int] {
+  match arms {
+    [] -> []
+    [Arm(pat, _, abody), ...rest] ->
+      list_append(tg_walk_tail(abody.kind, mo, nodes, pat_bindings(pat, scope)),
+                  tg_walk_arms(rest, mo, nodes, scope))
+    _ -> []
+  }
+}
+
+# A tail that only reads back a `let` from the same block hides the
+# call in that binding; the call is the real tail position.
+fn tg_walk_block(stmts: [Stmt], opt_tail: Option[Expr], mo: Option[String],
+                 nodes: [TgNode], scope: [String]) : [Int] {
+  match opt_tail {
+    None    -> []
+    Some(e) -> tg_walk_block_tail(e, stmts, mo, nodes, scope)
+  }
+}
+
+fn tg_walk_block_tail(e: Expr, stmts: [Stmt], mo: Option[String],
+                      nodes: [TgNode], scope: [String]) : [Int] {
+  match e.kind {
+    EVar(tn) -> if tg_is_ret_wrap(tn) { tg_walk_ret_wrap(stmts, tn, mo, nodes, scope) } else { [] }
+    _        -> tg_walk_tail(e.kind, mo, nodes, scope)
+  }
+}
+
+fn tg_walk_ret_wrap(stmts: [Stmt], tn: String, mo: Option[String],
+                    nodes: [TgNode], scope: [String]) : [Int] {
+  match tg_find_let_rhs(stmts, tn) {
+    Some(inner) -> tg_walk_tail(inner.kind, mo, nodes, scope)
+    None        -> []
+  }
+}
+
+fn tg_is_ret_wrap(n: String) : Bool = n == "__pcs_arm_ret" or n == "__pcs_block_ret"
+
+fn tg_find_let_rhs(stmts: [Stmt], target: String) : Option[Expr] = match stmts {
+  [] -> None
+  [s, ...rest] -> match s {
+    SLet(p, _, rhs) -> if tg_pattern_binds(p, target) { Some(rhs) } else { tg_find_let_rhs(rest, target) }
+    _ -> tg_find_let_rhs(rest, target)
+  }
+  _ -> None
+}
+
+fn tg_pattern_binds(p: Pattern, target: String) : Bool = match p.pkind {
+  PBind(n) -> n == target
+  _        -> false
+}
+
+fn tg_call_target(fk: ExprKind, argc: Int, mo: Option[String],
+                  nodes: [TgNode], scope: [String]) : [Int] {
+  match sym_read_kind(fk) {
+    EVar(callee) -> tg_resolve_in(callee, mo, argc, nodes, scope)
+    EModCall(callmod, callee) ->
+      if tg_modcall_is_own(callmod, mo) { tg_resolve_in(callee, mo, argc, nodes, scope) }
+      else { tg_resolve_in(callee, Some(callmod), argc, nodes, scope) }
+    _ -> []
+  }
+}
+
+
+fn tg_resolve_in(callee: String, mo: Option[String], argc: Int,
+                 nodes: [TgNode], scope: [String]) : [Int] {
+  if list_has(scope, callee) { [] }
+  else {
+    let i = tg_find_node(nodes, callee, mo, 0)
+    if i < 0 { [] } else { tg_arity_ok(nodes, i, argc) }
+  }
+}
+
+fn tg_arity_ok(nodes: [TgNode], i: Int, argc: Int) : [Int] = match tg_node_at(nodes, i) {
+  Some(n) -> if tgnode_arity(n) == argc { [i] } else { [] }
+  None    -> []
+}
+
+fn tg_modcall_is_own(callmod: String, mo: Option[String]) : Bool = match mo {
+  None    -> false
+  Some(m) -> m == callmod
+}
+
+# ---- shadowing -----------------------------------------------------
+
+fn tg_block_scope(stmts: [Stmt], scope: [String]) : [String] {
+  match stmts {
+    [] -> scope
+    [s, ...rest] -> {
+      let scope1 = match s {
+        SLet(pat, _, _)        -> pat_bindings(pat, scope)
+        SVar(name, _, _, _, _) -> [name, ...scope]
+        _                      -> scope
+      }
+      tg_block_scope(rest, scope1)
+    }
+    _ -> scope
+  }
+}
+
+# ---- strongly connected components ---------------------------------
+#
+# Reachability closure rather than Tarjan: the graph has one node per
+# top-level function and the closure is computed once per component, so
+# the simpler formulation stays well inside the pass budget and needs no
+# explicit stack.
+
+fn tg_groups_from(g: TailGraph, idxs: [Int], seen: [Int]) : [TgGroup] {
+  match idxs {
+    [] -> []
+    [i, ...rest] ->
+      if tg_has_int(seen, i) { tg_groups_from(g, rest, seen) }
+      else { tg_group_at(g, i, rest, seen) }
+    _ -> []
+  }
+}
+
+fn tg_group_at(g: TailGraph, i: Int, rest: [Int], seen: [Int]) : [TgGroup] {
+  let comp = tg_component_of(g, i)
+  if list_length(comp) >= 2 {
+    [TgGrp(comp), ...tg_groups_from(g, rest, list_append(seen, comp))]
+  } else { tg_groups_from(g, rest, [i, ...seen]) }
+}
+
+# The component of `i` is every node reachable from `i` that also
+# reaches `i` back.
+fn tg_component_of(g: TailGraph, i: Int) : [Int] {
+  let fwd = tg_reach_forward(g, [i], [])
+  tg_keep_mutual(g, fwd, i, [])
+}
+
+fn tg_keep_mutual(g: TailGraph, cands: [Int], i: Int, acc: [Int]) : [Int] {
+  match cands {
+    [] -> list_reverse(acc)
+    [c, ...rest] ->
+      if tg_has_int(tg_reach_forward(g, [c], []), i) { tg_keep_mutual(g, rest, i, [c, ...acc]) }
+      else { tg_keep_mutual(g, rest, i, acc) }
+    _ -> list_reverse(acc)
+  }
+}
+
+fn tg_reach_forward(g: TailGraph, frontier: [Int], seen: [Int]) : [Int] {
+  match frontier {
+    [] -> seen
+    [n, ...rest] ->
+      if tg_has_int(seen, n) { tg_reach_forward(g, rest, seen) }
+      else { tg_reach_forward(g, list_append(rest, tg_succs(tailgraph_edges(g), n)), [n, ...seen]) }
+    _ -> seen
+  }
+}
+
+fn tg_succs(es: [TgEdge], from: Int) : [Int] = match es {
+  [] -> []
+  [TgE(a, b), ...rest] -> if a == from { [b, ...tg_succs(rest, from)] } else { tg_succs(rest, from) }
+  _ -> []
+}
+
+fn tg_has_int(xs: [Int], t: Int) : Bool = match xs {
+  [] -> false
+  [x, ...rest] -> if x == t { true } else { tg_has_int(rest, t) }
+  _ -> false
+}
+
+fn tg_index_range(n: Int, i: Int) : [Int] = if i >= n { [] } else { [i, ...tg_index_range(n, i + 1)] }
