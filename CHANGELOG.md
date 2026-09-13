@@ -84,6 +84,27 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.118.0 (2026-09-12)
+
+### BREAKING CHANGE
+
+- `string.bytes(s)` returns `[Byte]` instead of
+`[Char]`. Callers that consumed the elements as `Char` convert with
+`byte_to_int` (or `int_to_char(byte_to_int(b))` where a `Char` is
+genuinely wanted); callers that fed the result to `string.from_chars`
+were double-encoding and want `string.from_bytes`.
+
+### Added
+
+- **stdlib**: give string.bytes the Byte element type (#1978) (#1979)
+
+### Fixed
+
+- **compiler**: rotate the EFn table for lambda and clause bodies (#1974)
+- **native**: restore the Default codegen level on every build profile (#1967)
+- **typecheck**: match kai build's exit code and file naming (#1972) (#1976)
+- **mutate**: count an uncompilable mutant as compile-fail, not a kill (#1975)
+
 ## v0.117.0 (2026-09-11)
 
 ### BREAKING CHANGE
