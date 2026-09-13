@@ -95,6 +95,30 @@ nursery { n ->
   cancelled on request (`n.cancel`) is an expected outcome and does
   not propagate. (`panic` is a process-terminating escape, not a
   scope-recoverable failure.)
+- The re-raise is a `Cancel.raise()` like any other: it walks the
+  handler stack of the fiber running the nursery body, so a
+  `with Cancel { raise(_) -> ... }` enclosing the nursery — at any
+  nesting level, in the root fiber or a spawned one — runs its
+  clause and execution continues past the handle. That is the
+  supervisor-at-the-boundary shape: catch the failure where the
+  scope closes, clean up, and choose what happens next.
+
+  ```kaikai
+  handle {
+    nursery { n ->
+      let r = n.spawn(() => risky())
+      n.await(r)
+    }
+  } with Cancel {
+    raise(resume) -> println("a child failed; cleaning up")
+  }
+  ```
+
+  With no `with Cancel` in scope the re-raise is terminal, as
+  before: it unwinds a spawned fiber to its cancel pad (marking it
+  CANCELLED, which its own parent scope then sees as a failure), and
+  at the program root, where no pad exists, it prints
+  `kai: nursery child cancelled; no survivors` and exits non-zero.
 
 `spawn`, `await`, and `select` carry `Cancel` because each is a
 yield point: a fiber blocked in any of them can be cancelled by

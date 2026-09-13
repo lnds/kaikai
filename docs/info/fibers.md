@@ -52,6 +52,22 @@ fn main() : Int / Spawn + Stdout = {
   cancelled and the failure re-raises out of the scope. A child
   cancelled on request (`n.cancel`) is an expected outcome and does
   not propagate.
+- That re-raise walks the handler stack like any `Cancel.raise()`, so
+  a `with Cancel` around the nursery catches it and execution
+  continues past the handle. With no handler in scope it is terminal:
+  the fiber unwinds cancelled, and at the program root the runtime
+  prints `no survivors` and exits non-zero.
+
+```kai
+handle {
+  nursery { n ->
+    let r = n.spawn(() => risky())
+    n.await(r)
+  }
+} with Cancel {
+  raise(resume) -> println("a child failed; cleaning up")
+}
+```
 
 ## Actors
 

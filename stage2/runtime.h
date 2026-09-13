@@ -3866,6 +3866,10 @@ static void kai_sched_unpark(KaiFiber *target);
  * observe a sibling-triggered cancel before retrying their syscall.
  * Body lives near the op-call lookup prologue at line 8868+. */
 static void kai_check_cancel_yield_point(void);
+/* Dispatch a pending cancellation through the innermost user `with
+ * Cancel` handler on this fiber. Does not return when one is in scope;
+ * returns 0 when there is none. Body sits beside the yield-point hook. */
+static int kai_cancel_dispatch_user_handler(void);
 /* Splice a fiber off whatever reactor waiter list holds it; defined with
  * the reactor below, needed above by the select loser-cancel walk. */
 static int kai_reactor_detach_fiber(KaiFiber *target);
@@ -16686,14 +16690,19 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
     free(scope);
 
     if (failed) {
+        /* The re-raise is a `Cancel.raise()` like any other: it walks
+         * this fiber's handler stack first, so a `with Cancel`
+         * enclosing the nursery runs its clause. Only with no user
+         * handler in scope does it take a terminal path — the
+         * trampoline's cancel pad, or, at the program root where no
+         * pad exists, banner + exit. */
+        f->cancel_delivered = 1;
+        (void) kai_cancel_dispatch_user_handler();
         if (f->cancel_pad_set) {
-            f->cancel_delivered = 1;
+            kai_evidence_unwind_all();
             longjmp(f->cancel_pad, 1);
             /* Unreachable. */
         }
-        /* The root fiber (main) has no cancel_pad — a child crash at
-         * the program root is a terminal failure. Match the unhandled
-         * Cancel.raise() root behaviour: banner + exit. */
         fputs("kai: nursery child cancelled; no survivors\n", stderr);
         exit(1);
     }
@@ -17161,47 +17170,20 @@ struct KaiRtEvCancel {
     KaiValue   *(*raise)(KaiRtEvCancel *self, KaiCont *k);
 };
 
-/* Phase 3 — Cancel delivery at yield points. Every effect-op call
- * goes through one of the kai_evidence_lookup* functions; we use
- * that as the natural yield-point check.
+/* Walk the current fiber's evidence stack and, if a user `with Cancel`
+ * handler is in scope, dispatch its `raise` clause and longjmp to the
+ * handle's landing pad — the call does not return. Returns 0 when no
+ * user handler is in scope, leaving the caller to pick its own
+ * fallback (cancel pad, banner, exit).
  *
- * Two paths after the flag is observed:
- *
- *   1. User-installed `handle { ... } with Cancel { raise(_) -> ... }`
- *      is in scope on the current fiber's evidence stack. Dispatch
- *      through the user clause exactly as a direct `Cancel.raise()`
- *      call site would (issue #682 — sibling-initiated cancels must
- *      run the same handler the synchronous path runs, otherwise the
- *      cleanup contract documented in `kai info fibers` is silently
- *      broken). The clause discards `resume` (forced — `raise()`
- *      returns `Nothing`), so we then long-jump to the handle's
- *      landing pad with the discarded value installed in its slot.
- *
- *   2. No user handler in scope. Fall back to the cancel_pad path —
- *      the trampoline's second-return marks the fiber CANCELLED and
- *      continues with the awaiter walk. If the pad is not set
- *      (main_fiber, or outside trampoline scope), the check falls
- *      through and dispatch proceeds normally; a subsequent
- *      user-level `Cancel.raise()` will still hit
- *      kai_default_cancel_raise which exits the program.
- *
- * The user-handler walk explicitly skips `in_dispatch_node` so a
- * Cancel handler that is itself mid-dispatch (a `Cancel.raise()`
- * re-issued from inside its own clause) resolves to an outer Cancel
- * frame instead of recursing into itself — same per-fiber rule
- * `kai_evidence_lookup_node` enforces for user-driven dispatch
- * (m8 bug #12). */
-static void kai_check_cancel_yield_point(void) {
-    KaiFiber *f = kai_current_fiber();
-    if (!(f->cancel_requested && !f->cancel_delivered && f->cancel_pad_set)) {
-        return;
-    }
-
-    /* Search the evidence stack for the innermost user Cancel handler
-     * (one with a live `handle_jmp` — default Cancel handlers do not
-     * allocate a jmp_buf because they never longjmp out of their
-     * clause). Skip the in-dispatch node (same rule as the by-name
-     * lookup) to preserve the recursion-into-outer-frame contract. */
+ * A user handler is one with a live `handle_jmp`; default Cancel
+ * handlers allocate no jmp_buf because they never longjmp out of their
+ * clause. The walk skips `in_dispatch_node` so a Cancel handler that is
+ * itself mid-dispatch resolves to an outer Cancel frame instead of
+ * recursing into itself — the same per-fiber rule
+ * `kai_evidence_lookup_node` enforces for user-driven dispatch. */
+static int kai_cancel_dispatch_user_handler(void) {
+    KaiFiber    *f    = kai_current_fiber();
     KaiEvidence *node = f->evidence_top;
     KaiEvidence *user_node = NULL;
     while (node) {
@@ -17214,28 +17196,13 @@ static void kai_check_cancel_yield_point(void) {
         }
         node = node->parent;
     }
+    if (user_node == NULL) return 0;
 
-    /* Delivered marker is flipped *before* invoking the clause. The
-     * clause body may call into ops that re-enter
-     * kai_check_cancel_yield_point — without the early flip those
-     * re-entries would see the flag still set and try to dispatch
-     * again. */
-    f->cancel_delivered = 1;
-
-    if (user_node == NULL) {
-        kai_evidence_unwind_all();
-        longjmp(f->cancel_pad, 1);
-        /* Unreachable. */
-    }
-
-    /* Dispatch the user clause. Mirrors the op-call shape emitted by
-     * `emit_named_call` (stage2/main.kai §"op call `Eff.op(args)`")
-     * for `Cancel.raise()` — bind identity continuation, mark the
-     * node as in-dispatch across the call, invoke the clause, and if
-     * `resume` was discarded (status stays UNRESUMED — the only
-     * legal outcome for raise() because it returns `Nothing`), store
-     * the discarded value, pop evidence, and longjmp to the handle's
-     * landing pad. */
+    /* Mirrors the op-call shape emitted for `Cancel.raise()`: bind an
+     * identity continuation, mark the node in-dispatch across the call,
+     * invoke the clause, and — `resume` discarded, the only legal
+     * outcome because raise() returns `Nothing` — store the discarded
+     * value, pop evidence, and longjmp to the handle's landing pad. */
     KaiRtEvCancel *ev = (KaiRtEvCancel *) user_node->handler;
     KaiCont k;
     kai_cont_init_identity(&k, ev->handler_id);
@@ -17252,10 +17219,36 @@ static void kai_check_cancel_yield_point(void) {
         /* Unreachable. */
     }
 
-    /* Defensive: a Cancel clause that calls `resume(_)` is a
-     * compiler bug (raise() returns Nothing — there is no Nothing
-     * value to feed back). If it ever happens, fall back to the
-     * pad so the fiber still terminates cleanly. */
+    /* Defensive: a Cancel clause that calls `resume(_)` is a compiler
+     * bug — raise() returns Nothing, so there is no value to feed back.
+     * Report no handler so the caller takes its terminal path. */
+    return 0;
+}
+
+/* Deliver a requested cancellation at a yield point. Every effect-op
+ * call goes through a kai_evidence_lookup* function, which makes those
+ * the natural delivery points. With the pad unset (the root fiber, or
+ * outside trampoline scope) the check falls through and dispatch
+ * proceeds normally; a later `Cancel.raise()` still reaches the default
+ * handler. */
+static void kai_check_cancel_yield_point(void) {
+    KaiFiber *f = kai_current_fiber();
+    if (!(f->cancel_requested && !f->cancel_delivered && f->cancel_pad_set)) {
+        return;
+    }
+
+    /* Delivered marker is flipped *before* invoking the clause. The
+     * clause body may call into ops that re-enter
+     * kai_check_cancel_yield_point — without the early flip those
+     * re-entries would see the flag still set and try to dispatch
+     * again. */
+    f->cancel_delivered = 1;
+
+    (void) kai_cancel_dispatch_user_handler();
+
+    /* No user handler in scope (or a clause that illegally resumed):
+     * fall back to the pad — the trampoline's second return marks the
+     * fiber CANCELLED and continues with the awaiter walk. */
     kai_evidence_unwind_all();
     longjmp(f->cancel_pad, 1);
     /* Unreachable. */
