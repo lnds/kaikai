@@ -26,11 +26,11 @@ have different tags. Two constructors with the same name are forbidden
 (kaikai does not allow constructor-name shadowing across sum types
 inside the same module).
 
-## Reserved range — builtins (tags 0..10)
+## Reserved range — builtins (tags 0..11)
 
 The reserved range is fixed and must agree across stage0/stage1/stage2
 and `stage0/runtime.h`. User variants start at `KAI_USER_VARIANT_TAG_BASE
-= 11` and increment in declaration order during resolve.
+= 12` and increment in declaration order during resolve.
 
 | Tag | Constructor  | Sum type             | Arity |
 | --- | ------------ | -------------------- | ----- |
@@ -45,8 +45,9 @@ and `stage0/runtime.h`. User variants start at `KAI_USER_VARIANT_TAG_BASE
 | 8   | `SigUsr2`    | `Signal`             | 0     |
 | 9   | `Exited`     | `ProcessExit`        | 1     |
 | 10  | `Signaled`   | `ProcessExit`        | 1     |
+| 11  | `SigWinch`   | `Signal`             | 0     |
 
-`KAI_USER_VARIANT_TAG_BASE = 11`.
+`KAI_USER_VARIANT_TAG_BASE = 12`.
 
 The reserved range is intentionally small and ordered by builtin sum
 type, with each sum type's constructors contiguous. This keeps the
@@ -59,7 +60,7 @@ not variants in kaikai; they are primitive `Bool`).
 When the compiler resolves a `type Foo = A | B(Int) | C` declaration,
 it adds `A`, `B`, `C` to the global variants table. In **stage 2** each
 user constructor's tag is **name-keyed**: `tag = KAI_USER_VARIANT_TAG_BASE
-+ (FNV-1a(name) mod 65525)`, linear probe on collision, names inserted
++ (FNV-1a(name) mod 65524)`, linear probe on collision, names inserted
 in sorted order. A constructor's tag is therefore a function of the
 program's *set* of constructor names — sparse in the uint16 space, not
 dense — and stays stable when unrelated declarations are added, moved,
@@ -109,7 +110,7 @@ assume a fixed value for any user constructor.
 3. **Builtin tag values are stable across kaikai versions within an
    edition.** A change to the table is a breaking change for compiled
    artefacts; treat it as an edition-bump decision.
-4. **`KAI_USER_VARIANT_TAG_BASE` is `11`.** If the reserved range is
+4. **`KAI_USER_VARIANT_TAG_BASE` is `12`.** If the reserved range is
    extended (e.g. a new builtin), bump this constant and document it
    here.
 
@@ -169,7 +170,7 @@ and all three stages agree byte-for-byte:
 | --- | ------------- | --------------------- |
 | 16  | `Option`      | `Some`, `None`        |
 | 17  | `Result`      | `Ok`, `Err`           |
-| 18  | `Signal`      | `SigInt`…`SigUsr2`    |
+| 18  | `Signal`      | `SigInt`…`SigWinch`   |
 | 19  | `ProcessExit` | `Exited`, `Signaled`  |
 
 `KAI_USER_HEAD_TAG_BASE = 20`. User-declared sum types and records

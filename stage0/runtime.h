@@ -242,10 +242,10 @@ typedef enum {
 
 /* Variant-tag -> head-type-tag map. Set once at startup by codegen-
  * emitted main via kai_register_variant_heads(table, len). Until set,
- * the bootstrap table covers the 11 reserved builtin variants
+ * the bootstrap table covers the 12 reserved builtin variants
  * (Some/None -> Option, Ok/Err -> Result, Sig* -> Signal,
  * Exited/Signaled -> ProcessExit). */
-static const int32_t kai_variant_to_head_bootstrap[11] = {
+static const int32_t kai_variant_to_head_bootstrap[12] = {
     /* 0  */ KAI_HEAD_OPTION,        /* Some  */
     /* 1  */ KAI_HEAD_OPTION,        /* None  */
     /* 2  */ KAI_HEAD_RESULT,        /* Ok    */
@@ -257,10 +257,11 @@ static const int32_t kai_variant_to_head_bootstrap[11] = {
     /* 8  */ KAI_HEAD_SIGNAL,        /* SigUsr2 */
     /* 9  */ KAI_HEAD_PROCESS_EXIT,  /* Exited   */
     /* 10 */ KAI_HEAD_PROCESS_EXIT,  /* Signaled */
+    /* 11 */ KAI_HEAD_SIGNAL,        /* SigWinch */
 };
 
 static const int32_t *kai_variant_to_head     = kai_variant_to_head_bootstrap;
-static int32_t        kai_variant_to_head_len = 11;
+static int32_t        kai_variant_to_head_len = 12;
 
 static inline void kai_register_variant_heads(const int32_t *tbl, int32_t len) {
     kai_variant_to_head     = tbl;

@@ -52,7 +52,7 @@ retirement note below.)
 
 `emit_shared.kai` (~160 fns) shares **analysis**, not **lowering**: symbol
 resolution (`c_sym`, `efn_resolve`, `fns_filter_*`), variant tags
-(`evar_find_tag`, `register_variants`, `user_variant_tag_base()=11`), closure
+(`evar_find_tag`, `register_variants`, `user_variant_tag_base()=12`), closure
 free-variables (`fv_expr`/`fv_arms`/`fv_stmts_scoped`/`fv_interp`), pattern
 bindings (`pat_bindings`), lambda collection (`find_lam`, `lc_*`). The frontier
 where the duplication lives — the actual AST→target lowering — is **not** shared.

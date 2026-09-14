@@ -28,13 +28,13 @@
 /* ---------- tables ---------- */
 
 /* Atom-style global variant tag base — first user-variant tag.
- * Tags 0..10 are reserved for builtin constructors per the convention
+ * Tags 0..11 are reserved for builtin constructors per the convention
  * pinned in docs/variant-tags.md. Stage 0 only knows about the four
  * builtins it can emit (Some, None, Ok, Err); the Signal and ProcessExit
  * constructors are runtime-only and never built by stage-0-emitted code,
- * so they do not appear in the table here but they still consume tags
- * 4 through 10 in the global numbering. */
-#define KAI_USER_VARIANT_TAG_BASE 11
+ * so they do not appear in the table here but they still consume the
+ * remaining reserved tags in the global numbering. */
+#define KAI_USER_VARIANT_TAG_BASE 12
 
 typedef struct { const char *name; size_t len; int arity; int tag; } SymEntry;
 
@@ -1960,6 +1960,7 @@ static void register_builtin_variants(E *e) {
         { "SigUsr2",  0, 8 },
         { "Exited",   1, 9 },
         { "Signaled", 1, 10 },
+        { "SigWinch", 0, 11 },
     };
     for (size_t i = 0; i < sizeof(B) / sizeof(B[0]); ++i) {
         reg_entry(&e->variants, &e->n_variants, &e->cap_variants,
