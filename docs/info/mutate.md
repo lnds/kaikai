@@ -66,7 +66,7 @@ reparsed first and the site is reported as unresolvable instead.
 | `arm` | drop a `match` arm | a case stopped being handled and nothing noticed |
 | `compare` | `>=` → `>` | the boundary of a gate is untested |
 | `connect` | `and` → `or` | a gate that never fires, or always does |
-| `negate` | `if c` → `if not c` | an inverted guard changes no observed output |
+| `negate` | `if c` → `if not (c)` | an inverted guard changes no observed output |
 | `literal` | `0` → `1` | a seed or base case is unexercised |
 | `call` | `f(x)` → `x` | a step could do nothing and no test would care |
 
