@@ -5,6 +5,14 @@ Fixtures for `kai mutate`.
 `operators.kai` carries one construct per mutation operator;
 `operators.sites.expected` is the site catalogue it must produce.
 
+`negate_shapes.kai` carries one `if` per condition shape — atom,
+comparison, connective, call. A site catalogue proves an operator
+finds its construct, not that the mutant it writes compiles, and
+`negate` is the operator where the two come apart: `not` binds tighter
+than every binary operator, so a bare prefix is well-formed only on an
+atom. `make -C stage2 test-mutate-negate-shapes` pins the catalogue and
+`--check`s every `negate` mutant.
+
 Regenerate the golden after an intentional operator change:
 
 ```sh
