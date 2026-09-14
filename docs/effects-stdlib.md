@@ -1216,7 +1216,7 @@ clean exit, control flows past the `with` clause and the
 ### Declaration
 
 ```kai
-type Sig = SigInt | SigTerm | SigHup | SigUsr1 | SigUsr2
+type Sig = SigInt | SigTerm | SigHup | SigUsr1 | SigUsr2 | SigWinch
 
 effect Signal {
   on(sig: Sig)  : Unit
@@ -1240,6 +1240,11 @@ effect Signal {
   keep making progress while this fiber is parked. An empty
   subscription set is treated as `{SigInt}` so a programmer who
   forgot `on()` still wakes on Ctrl-C.
+- `SigWinch` is the terminal-resize notification. Its default
+  disposition is to ignore, so subscribing changes nothing for a
+  program that does not `on(SigWinch)`; a full-screen program
+  parks a fiber on `await()` and re-queries the terminal size
+  when it returns `SigWinch`.
 
 ### Default handler
 
@@ -1280,9 +1285,11 @@ signal API used here.
 
 Windows and WASM map to a smaller subset of `Sig`:
 - Windows can deliver Ctrl-C via `SetConsoleCtrlHandler` →
-  surface as `SigInt`. `SigTerm` / `SigHup` / `SigUsr*` have no
-  Windows equivalent and would map to `Result[Sig, String]` in a
-  v2 shape, or be silently absent.
+  surface as `SigInt`. `SigTerm` / `SigHup` / `SigUsr*` /
+  `SigWinch` have no Windows equivalent and would map to
+  `Result[Sig, String]` in a v2 shape, or be silently absent.
+  A Windows console resize arrives as a console event, not a
+  signal.
 - WASI does not expose signals. The `Signal` effect would not
   install on WASI builds; programs that need it would not link.
 

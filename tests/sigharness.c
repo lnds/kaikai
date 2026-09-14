@@ -28,7 +28,7 @@
  * still surfaces rather than hanging the harness.
  *
  * Default signal is SIGTERM, override with `--sig INT|TERM|HUP|
- * USR1|USR2`. SIGTERM is the default so a regression that makes
+ * USR1|USR2|WINCH`. SIGTERM is the default so a regression that makes
  * `Signal.await()` return without parking can't accidentally
  * pass — the fixture program prints the variant name back, and
  * a stub return value would mismatch.
@@ -36,6 +36,10 @@
 
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
+/* SIGWINCH is a BSD extension, hidden by strict _POSIX_C_SOURCE. */
+#if defined(__APPLE__)
+#  define _DARWIN_C_SOURCE 1
+#endif
 
 #include <errno.h>
 #include <signal.h>
@@ -102,6 +106,7 @@ static int signal_for_name(const char *name) {
     if (!strcmp(name, "HUP"))  return SIGHUP;
     if (!strcmp(name, "USR1")) return SIGUSR1;
     if (!strcmp(name, "USR2")) return SIGUSR2;
+    if (!strcmp(name, "WINCH")) return SIGWINCH;
     return -1;
 }
 
@@ -128,7 +133,7 @@ int main(int argc, char **argv) {
         argi += 2;
     }
     if (argi >= argc) {
-        fprintf(stderr, "usage: %s [--sig INT|TERM|HUP|USR1|USR2] <prog> [args...]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--sig INT|TERM|HUP|USR1|USR2|WINCH] <prog> [args...]\n", argv[0]);
         return 2;
     }
 
