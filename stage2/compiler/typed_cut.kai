@@ -37,6 +37,7 @@ import compiler.cache_iface_acc
 import compiler.cache_module
 import compiler.user_cache
 import compiler.modules
+import compiler.diag_file
 
 #[doc("Per-module cut context: the cache directory (empty disables the cut) and the cross-module context hash folded into every module key.")]
 pub type TypedCutCtx = TCC(String, String)
@@ -186,7 +187,7 @@ fn tcf_finish(acc: TCFold, all_program_decls: [Decl]) : TypedProgram = match acc
 }
 
 #[doc("Fold the per-module typechecker across a partitioned decl stream, restoring each module from its typed blob when the cut's key matches and inferring it otherwise. With the cut disabled every module is inferred, which is byte-identical to the uncut fold.")]
-pub fn tcut_typecheck_program(file: String, modules: [ModuleDecls],
+pub fn tcut_typecheck_program(file: String, df: DiagFiles, modules: [ModuleDecls],
                                ctx: TypedCutCtx,
                                proto_impls: [ProtoImplReg],
                                head_owners: [HeadOwnerEntry],
@@ -194,7 +195,7 @@ pub fn tcut_typecheck_program(file: String, modules: [ModuleDecls],
                                tab: SymTab,
                                verbose: Bool) : TypedProgram / Console + File = {
   let all_program_decls = flatten_module_decls(modules, [])
-  let acc = tcut_loop(file, modules, module_env_delta_empty(), iface_acc_empty(),
+  let acc = tcut_loop(file, df, modules, module_env_delta_empty(), iface_acc_empty(),
                        all_program_decls, ctx, proto_impls, head_owners,
                        kind_theories, tab, verbose, tcf_empty())
   tcf_finish(acc, all_program_decls)
@@ -205,16 +206,16 @@ pub fn tcut_typecheck_program(file: String, modules: [ModuleDecls],
 # reduced to canonical pairs for the key. Deriving the key from the
 # merged delta instead would re-canonicalise the whole accumulation once
 # per module.
-fn tcut_loop(file: String, modules: [ModuleDecls], inherited: ModuleEnvDelta,
+fn tcut_loop(file: String, df: DiagFiles, modules: [ModuleDecls], inherited: ModuleEnvDelta,
               iface: IfaceAcc, all_program_decls: [Decl], ctx: TypedCutCtx,
               proto_impls: [ProtoImplReg], head_owners: [HeadOwnerEntry],
               kind_theories: [KindTheory], tab: SymTab, verbose: Bool,
               acc: TCFold) : TCFold / Console + File = match modules {
   [] -> acc
   [m, ...rest] -> {
-    let tm = tcut_module(file, m, inherited, iface, all_program_decls, ctx,
+    let tm = tcut_module(file, df, m, inherited, iface, all_program_decls, ctx,
                           proto_impls, head_owners, kind_theories, tab, verbose)
-    tcut_loop(file, rest, merge_env_deltas(inherited, tm.delta),
+    tcut_loop(file, df, rest, merge_env_deltas(inherited, tm.delta),
                iface_acc_extend(iface, tm.delta), all_program_decls, ctx,
                proto_impls, head_owners, kind_theories, tab, verbose,
                tcf_step(acc, tm))
@@ -224,30 +225,30 @@ fn tcut_loop(file: String, modules: [ModuleDecls], inherited: ModuleEnvDelta,
 # One module: restore it when its key hits, infer and publish otherwise.
 # The key is computed once and reused for the publish, so a hit and the
 # miss that would have replaced it name the same blob.
-fn tcut_module(file: String, m: ModuleDecls, inherited: ModuleEnvDelta,
+fn tcut_module(file: String, df: DiagFiles, m: ModuleDecls, inherited: ModuleEnvDelta,
                 iface: IfaceAcc, all_program_decls: [Decl], ctx: TypedCutCtx,
                 proto_impls: [ProtoImplReg], head_owners: [HeadOwnerEntry],
                 kind_theories: [KindTheory], tab: SymTab,
                 verbose: Bool) : TypecheckedModule / Console + File = {
   if not tcut_on(ctx) {
-    typecheck_module(file, m, inherited, all_program_decls, proto_impls,
+    typecheck_module(file, df, m, inherited, all_program_decls, proto_impls,
                       head_owners, kind_theories, tab, verbose)
   } else {
     let key = tcut_key(ctx, m.decls, iface)
     match tcut_lookup(ctx, key) {
       Some(hit) -> hit
-      None -> tcut_infer_publish(file, m, inherited, all_program_decls, ctx, key,
+      None -> tcut_infer_publish(file, df, m, inherited, all_program_decls, ctx, key,
                                   proto_impls, head_owners, kind_theories, tab, verbose)
     }
   }
 }
 
-fn tcut_infer_publish(file: String, m: ModuleDecls, inherited: ModuleEnvDelta,
+fn tcut_infer_publish(file: String, df: DiagFiles, m: ModuleDecls, inherited: ModuleEnvDelta,
                        all_program_decls: [Decl], ctx: TypedCutCtx, key: String,
                        proto_impls: [ProtoImplReg], head_owners: [HeadOwnerEntry],
                        kind_theories: [KindTheory], tab: SymTab,
                        verbose: Bool) : TypecheckedModule / Console + File = {
-  let tm = typecheck_module(file, m, inherited, all_program_decls, proto_impls,
+  let tm = typecheck_module(file, df, m, inherited, all_program_decls, proto_impls,
                              head_owners, kind_theories, tab, verbose)
   # A module that produced errors is not published: its typed artifact is
   # a partial result the next build must reproduce, diagnostics and all.
@@ -256,7 +257,7 @@ fn tcut_infer_publish(file: String, m: ModuleDecls, inherited: ModuleEnvDelta,
 }
 
 #[doc("The cut-aware counterpart of `infer_program_with_protos_cached`: partition the post-cascade decl stream by home module, then fold the per-module typechecker across it under the cut. An empty cache directory disables the cut and reproduces the uncut path exactly.")]
-pub fn tcut_infer_program(file: String, decls: [Decl], cache_dir: String,
+pub fn tcut_infer_program(file: String, df: DiagFiles, decls: [Decl], cache_dir: String,
                            proto_impls: [ProtoImplReg],
                            head_owners: [HeadOwnerEntry],
                            kind_theories: [KindTheory],
@@ -266,14 +267,14 @@ pub fn tcut_infer_program(file: String, decls: [Decl], cache_dir: String,
   # One bucket (or none) means there is nothing to cut: the fold would
   # re-infer the whole program on any edit anyway, so run it uncut.
   match mods0 {
-    []  -> infer_program_with_protos_cached(file, decls, verbose, proto_impls,
+    []  -> infer_program_with_protos_cached(file, df, decls, verbose, proto_impls,
                                              head_owners, kind_theories, tab)
-    [_] -> infer_program_with_protos_cached(file, decls, verbose, proto_impls,
+    [_] -> infer_program_with_protos_cached(file, df, decls, verbose, proto_impls,
                                              head_owners, kind_theories, tab)
     _   -> {
       let ctx = tcut_ctx(cache_dir, flatten_module_decls(mods0, []), proto_impls,
                           head_owners, kind_theories)
-      tcut_typecheck_program(file, mods0, ctx, proto_impls, head_owners,
+      tcut_typecheck_program(file, df, mods0, ctx, proto_impls, head_owners,
                               kind_theories, tab, verbose)
     }
   }
