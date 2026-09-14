@@ -84,6 +84,29 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.119.0 (2026-09-14)
+
+### BREAKING CHANGE
+
+- `string.slice` takes codepoint indices instead of byte
+offsets. ASCII call sites are unaffected (one codepoint is one byte).
+A caller that fed `string.index_of` into `string.slice` moves to
+`string.byte_slice` (keeping byte offsets) or `string.char_index_of`
+(moving to codepoints).
+
+### Added
+
+- **stdlib**: trap SIGWINCH through the Signal effect (#1989)
+- **stdlib**: index string.slice by codepoint, add byte_slice and the boundary primitives (#1985)
+
+### Fixed
+
+- **cli**: typecheck and lint a package that has no entry point (#1990)
+- **typer**: attribute a typer diagnostic to the file declaring the decl (#1988)
+- **mutate**: parenthesise the condition the negate operator inverts (#1986)
+- **tco**: give mutual tail calls constant stack on both backends (#1984)
+- **runtime**: let a nursery's re-raise reach a user Cancel handler (#1980)
+
 ## v0.118.0 (2026-09-12)
 
 ### BREAKING CHANGE
