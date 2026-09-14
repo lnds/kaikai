@@ -1,7 +1,10 @@
 #[doc("""
-core.string — byte-indexed string helpers over the runtime string
-builtins. Lengths and offsets are byte counts unless a name says
-otherwise (`char_count`, `chars`, `char_indices` are codepoint-aware).
+core.string — helpers over the runtime string builtins. Two index
+units, distinguished by name: `slice` / `char_index_of` / `char_count`
+address Unicode codepoints; the `byte_`-prefixed names and `length` /
+`index_of` / `char_at` address bytes. A byte offset that lands inside a
+multibyte sequence never yields a broken string — `byte_slice` returns
+`None` and `floor_char_boundary` / `ceil_char_boundary` snap it out.
 """)]
 
 #[doc("""
@@ -12,13 +15,11 @@ read clearer than `.fst`/`.snd` at call sites.
 pub type CharIndex = { off: Int, cp: Char }
 
 #[doc("""
-Byte count of `s` (O(1)), matching the byte-indexed `slice`/`char_at`
+Byte count of `s` (O(1)), matching the byte-indexed `char_at`/`index_of`
 family. For the Unicode codepoint count use `char_count`; `byte_length`
 is an explicit synonym when the unit needs to be unambiguous.
 """)]
 pub fn length(s: String) : Int = string_length(s)
-#[doc("Returns the substring of `len` bytes starting at byte offset `from`.")]
-pub fn slice(s: String, from: Int, len: Int) : String = string_slice(s, from, len)
 #[doc("Parses `s` as a base-10 integer, returning `None` on malformed input.")]
 pub fn to_int(s: String) : Option[Int] = string_to_int(s)
 #[doc("Concatenates two strings.")]
@@ -258,6 +259,97 @@ pub fn char_count(s: String) : Int = string_char_count_loop(s, 0, string_length(
 #[doc("Explicit byte count of `s` — a synonym of `length`, spelled to make the unit unambiguous next to `char_count`.")]
 pub fn byte_length(s: String) : Int = string_length(s)
 
+# A UTF-8 continuation byte is 0b10xxxxxx (0x80..0xBF); every other byte
+# starts a sequence. `string_cp_len` cannot answer this — it reports
+# width 1 for a continuation byte, classifying it as a malformed lead.
+fn string_is_continuation(s: String, off: Int) : Bool {
+  let b = string_byte_at_int(s, off)
+  b >= 128 and b < 192
+}
+
+#[doc("""
+True when `byte_off` sits on a codepoint boundary — either end of `s`,
+or the first byte of a UTF-8 sequence. Offsets outside `0..byte_length`
+are not boundaries.
+""")]
+pub fn is_char_boundary(s: String, byte_off: Int) : Bool {
+  if byte_off < 0 or byte_off > string_length(s) { false }
+  else if byte_off == string_length(s) { true }
+  else { not string_is_continuation(s, byte_off) }
+}
+
+fn string_floor_loop(s: String, off: Int) : Int =
+  if off <= 0 { 0 }
+  else if string_is_continuation(s, off) { string_floor_loop(s, off - 1) }
+  else { off }
+
+fn string_ceil_loop(s: String, off: Int, n: Int) : Int =
+  if off >= n { n }
+  else if string_is_continuation(s, off) { string_ceil_loop(s, off + 1, n) }
+  else { off }
+
+#[doc("""
+The largest codepoint boundary `<= byte_off` — the offset to truncate at
+to keep at most `byte_off` bytes without splitting a codepoint. Clamps to
+`0..byte_length`.
+""")]
+pub fn floor_char_boundary(s: String, byte_off: Int) : Int {
+  let n = string_length(s)
+  if byte_off <= 0 { 0 }
+  else if byte_off >= n { n }
+  else { string_floor_loop(s, byte_off) }
+}
+
+#[doc("""
+The smallest codepoint boundary `>= byte_off`. Clamps to `0..byte_length`.
+""")]
+pub fn ceil_char_boundary(s: String, byte_off: Int) : Int {
+  let n = string_length(s)
+  if byte_off <= 0 { 0 }
+  else if byte_off >= n { n }
+  else { string_ceil_loop(s, byte_off, n) }
+}
+
+#[doc("""
+The substring of `len` bytes at byte offset `from`, or `None` when either
+end falls inside a multibyte sequence or outside `0..byte_length`. Use
+`slice` to index by codepoint, `floor_char_boundary` to snap an arbitrary
+offset onto a boundary first.
+""")]
+pub fn byte_slice(s: String, from: Int, len: Int) : Option[String] {
+  if len < 0 { None }
+  else if not is_char_boundary(s, from) { None }
+  else if not is_char_boundary(s, from + len) { None }
+  else { Some(string_slice(s, from, len)) }
+}
+
+# Advance `count` codepoints from byte offset `off`, stopping at the end
+# of the buffer so an over-long request clamps instead of running off.
+fn string_advance_cps(s: String, off: Int, n: Int, count: Int) : Int {
+  if count <= 0 or off >= n { off }
+  else {
+    let w = string_cp_len(s, off)
+    let step = if w <= 0 { 1 } else { w }
+    string_advance_cps(s, off + step, n, count - 1)
+  }
+}
+
+#[doc("""
+The substring of `len` Unicode codepoints starting at codepoint index
+`from`, never splitting a codepoint. Out-of-range indices clamp, so the
+result may be shorter than `len` and a `from` past the end yields `""`.
+For byte offsets use `byte_slice`.
+""")]
+pub fn slice(s: String, from: Int, len: Int) : String {
+  if len <= 0 { "" }
+  else {
+    let n = string_length(s)
+    let lo = string_advance_cps(s, 0, n, if from < 0 { 0 } else { from })
+    let hi = string_advance_cps(s, lo, n, len)
+    string_slice(s, lo, hi - lo)
+  }
+}
+
 # Each name below also exists as a bare core export (`list.is_empty`,
 # `char.to_upper`, …); first-arg-type narrowing routes the `String`
 # receiver here.
@@ -294,10 +386,22 @@ fn string_map_chars(cs: [Char], f: (Char) -> Char, acc: [String]) : [String] = m
 
 #[doc("""
 Byte offset of the first occurrence of `needle`, or `None`.
-`index_of(s, "")` is `Some(0)`. Byte index, consistent with `slice`.
+`index_of(s, "")` is `Some(0)`. Byte index — pairs with `byte_slice`;
+for an offset to pass to `slice`, use `char_index_of`.
 """)]
 pub fn index_of(s: String, needle: String) : Option[Int] =
   string_index_of_loop(s, needle, 0, string_length(s) - string_length(needle), string_length(needle))
+
+#[doc("""
+Codepoint index of the first occurrence of `needle`, or `None`.
+`char_index_of(s, "")` is `Some(0)`. Pairs with `slice`; for a byte
+offset use `index_of`.
+""")]
+pub fn char_index_of(s: String, needle: String) : Option[Int] =
+  match index_of(s, needle) {
+    None    -> None
+    Some(b) -> Some(string_char_count_loop(s, 0, b, 0))
+  }
 
 # Compare `needle`'s bytes against `s` at offset `at` in place — no
 # per-position slice, so the search is O(n·m) time and O(1) space.
@@ -556,6 +660,43 @@ test "to_upper / to_lower — multibyte passes through as valid UTF-8" {
   assert u == "Aá€ Z"
   assert l == "aá€ z"
   assert byte_length(u) == byte_length("aá€ z")
+}
+
+test "slice — codepoint indexed, multibyte never split, out of range clamps" {
+  assert string.slice("café", 2, 2) == "fé"
+  assert string.slice("aá€中😀z", 2, 3) == "€中😀"
+  assert string.slice("café", 3, 9) == "é"
+  assert string.slice("café", 9, 2) == ""
+  assert string.slice("café", 1, 0) == ""
+  assert string.slice("café", -3, 2) == "ca"
+}
+
+test "byte_slice — Some on a boundary cut, None inside a codepoint" {
+  # "é" spans bytes 3..5, so 4 is the only interior offset.
+  assert string.byte_slice("café", 3, 2) == Some("é")
+  assert string.byte_slice("café", 0, 4) == None
+  assert string.byte_slice("café", 4, 1) == None
+  assert string.byte_slice("café", 0, -1) == None
+  assert string.byte_slice("café", 0, 9) == None
+}
+
+test "char boundaries — classify, snap down, snap up, clamp the ends" {
+  # "a😀z": 'a' at 0, the 4-byte 😀 at 1..5, 'z' at 5.
+  assert string.is_char_boundary("a😀z", 1) == true
+  assert string.is_char_boundary("a😀z", 3) == false
+  assert string.is_char_boundary("a😀z", -1) == false
+  assert string.floor_char_boundary("a😀z", 3) == 1
+  assert string.ceil_char_boundary("a😀z", 3) == 5
+  assert string.floor_char_boundary("a😀z", 99) == 6
+  assert string.ceil_char_boundary("a😀z", -4) == 0
+}
+
+test "char_index_of — codepoint index where index_of gives a byte offset" {
+  let ci = string.char_index_of("aá€中z", "中")
+  let bi = string.index_of("aá€中z", "中")
+  assert ci == Some(3)
+  assert bi == Some(6)
+  assert string.char_index_of("aá€中z", "q") == None
 }
 
 test "index_of — hit, miss, empty needle, at start, at end" {
