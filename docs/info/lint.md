@@ -19,7 +19,9 @@ kai lint --json [<spec>]           # findings as a JSON array
 ```
 
 `<spec>` is a `.kai` file or a package (`.` / `./<sub>`), the same as
-`kai build` / `kai test`.
+`kai build` / `kai test`. A package with an entry point is linted once
+from that entry; a package without one — a library — is linted module
+by module, so its whole surface is covered either way.
 
 ## Rules
 

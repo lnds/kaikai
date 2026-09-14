@@ -223,6 +223,10 @@ run_check_script "orphan_check_bench_discovery" "orphan_check_bench_discovery/ch
 # not need an entry, so a library is not locked out of package mode.
 run_check_script "library_test_discovery" "library_test_discovery/check.sh"
 
+# The report-mode verbs reach the same package: a library is checked and
+# linted module by module instead of dying on the entry it does not have.
+run_check_script "library_report_modes" "library_report_modes/check.sh"
+
 # `kai install <spec>` builds a package and installs its binary; the
 # toolchain's own names are refused and a library is turned away.
 run_check_script "install_binary"      "install_binary/check.sh"
