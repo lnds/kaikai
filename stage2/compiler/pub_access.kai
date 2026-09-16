@@ -27,10 +27,10 @@ type PaMeta = { name: String, kind: String, is_pub: Bool }
 
 #[doc("Validate module privacy over the per-module decl segments; returns the number of violations reported. `root_bounds` carries the root file's fn tparam bounds (the parser strips them from the stored tparams into a side table).")]
 pub fn validate_pub_access(segs: [CoreSegment], root_bounds: [FnBoundsRec],
-      target_mod: String,
+      target_mod: String, cores: [String],
       df: DiagFiles) : Int / Console + File {
   let table = pai_build(pa_table(segs))
-  let e1 = pa_check_segs(segs, table, df, 0)
+  let e1 = pa_check_segs(segs, table, target_mod, cores, df, 0)
   # The bound check runs only over the root segment, whose file is the
   # root path.
   pa_check_bound_segs(segs, root_bounds, target_mod, table, df_root(df), e1)
@@ -62,6 +62,27 @@ pub fn pa_import_segs(marks: [ImportSeg], flat: [Decl],
 # same-home or `pub` (locals-shadow-imports and root-shadows-core rely
 # on this); it is private when every carrier is foreign and non-`pub`;
 # it is unknown when no entry exists (the typer reports unbound names).
+# A core module's own reference cannot mean a declaration in the root
+# file: the root shadows the core name for the user's code, not for the
+# core module that declared it. Without this, a `type Option` written in
+# the root file makes every `Option` annotation inside `core/option.kai`
+# read as a private access to the user's module.
+fn pa_decide_at(table: PaIndex, name: String, home: String,
+      target_mod: String, cores: [String], types_only: Bool) : PaVerdict =
+  if pa_is_core_home(home, cores) {
+    pa_decide_loop(pa_drop_home(pai_entries(table, name), target_mod),
+                   name, home, types_only, None)
+  } else { pa_decide(table, name, home, types_only) }
+
+fn pa_is_core_home(home: String, cores: [String]) : Bool = list_has(cores, home)
+
+fn pa_drop_home(entries: [PaEntry], drop: String) : [PaEntry] = match entries {
+  [] -> []
+  [e, ...rest] ->
+    if e.home == drop { pa_drop_home(rest, drop) }
+    else { [e, ...pa_drop_home(rest, drop)] }
+}
+
 fn pa_decide(table: PaIndex, name: String, home: String,
       types_only: Bool) : PaVerdict =
   pa_decide_loop(pai_entries(table, name), name, home, types_only, None)
@@ -101,22 +122,24 @@ fn pa_leak_loop(entries: [PaEntry], name: String,
 
 # Each segment carries its own module, so the diagnostics for its
 # decls name that module's file rather than the root path.
-fn pa_check_segs(segs: [CoreSegment], table: PaIndex, df: DiagFiles,
+fn pa_check_segs(segs: [CoreSegment], table: PaIndex, target_mod: String,
+      cores: [String], df: DiagFiles,
       errs: Int) : Int / Console + File = match segs {
   [] -> errs
   [PSeg(mod_name, ds), ...rest] ->
-    pa_check_segs(rest, table, df,
-      pa_check_decls(ds, mod_name, table,
+    pa_check_segs(rest, table, target_mod, cores, df,
+      pa_check_decls(ds, mod_name, target_mod, cores, table,
         module_file_or(mod_name, df_mods(df), df_root(df)), errs))
 }
 
-fn pa_check_decls(ds: [Decl], home: String, table: PaIndex, file: String,
+fn pa_check_decls(ds: [Decl], home: String, target_mod: String,
+      cores: [String], table: PaIndex, file: String,
       errs: Int) : Int / Console + File = match ds {
   [] -> errs
   [d, ...rest] ->
-    pa_check_decls(rest, home, table, file,
+    pa_check_decls(rest, home, target_mod, cores, table, file,
       errs + pa_check_refs(pa_decl_refs(d), pa_decl_meta(d),
-      home, table, file, 0))
+      home, target_mod, cores, table, file, 0))
 }
 
 fn pa_meta(name: String, kind: String, is_pub: Bool) : PaMeta =
@@ -142,17 +165,19 @@ fn pa_decl_meta(d: Decl) : PaMeta = match d {
 }
 
 fn pa_check_refs(refs: [PaRef], meta: PaMeta, home: String,
+      target_mod: String, cores: [String],
       table: PaIndex, file: String,
       errs: Int) : Int / Console + File = match refs {
   [] -> errs
   [r, ...rest] ->
-    pa_check_refs(rest, meta, home, table, file,
-      errs + pa_check_ref(r, meta, home, table, file))
+    pa_check_refs(rest, meta, home, target_mod, cores, table, file,
+      errs + pa_check_ref(r, meta, home, target_mod, cores, table, file))
 }
 
-fn pa_check_ref(r: PaRef, meta: PaMeta, home: String, table: PaIndex,
+fn pa_check_ref(r: PaRef, meta: PaMeta, home: String, target_mod: String,
+      cores: [String], table: PaIndex,
       file: String) : Int / Console + File =
-  match pa_decide(table, r.name, home, r.is_ty) {
+  match pa_decide_at(table, r.name, home, target_mod, cores, r.is_ty) {
     PaPrivateTo(m) -> pa_diag_private(file, r, m)
     PaUnknown -> 0
     PaVisible ->
@@ -212,7 +237,7 @@ fn pa_check_bound_decls(ds: [Decl], bounds: [FnBoundsRec], home: String,
     DFn(is_pub, name, _, _, _, _, _, line, col, _) ->
       pa_check_bound_decls(rest, bounds, home, table, file,
         pa_check_refs(pa_bound_table_refs(bounds, name, line, col),
-      pa_meta(name, "fn", is_pub), home, table, file, errs))
+      pa_meta(name, "fn", is_pub), home, home, [], table, file, errs))
     _ -> pa_check_bound_decls(rest, bounds, home, table, file, errs)
   }
 }
