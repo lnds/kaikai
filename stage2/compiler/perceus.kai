@@ -310,9 +310,13 @@ fn prc_raw_names_zip(params: [Param], mask: [Bool]) : [String] = match params {
 
 
 #[doc("Entry point: scope-aware Perceus RC pass over the post-mono [Decl] (dup at non-last uses, drop unused params at entry). Pipeline position monomorphise -> unbox -> perceus_pass -> tco -> emit.")]
-pub fn perceus_pass(decls: [Decl]) : [Decl] / Console {
+pub fn perceus_pass(decls: [Decl]) : [Decl] / Console =
+  perceus_pass_in(decls, st_build(decls, ""))
 
-  let fns = fnx_build(register_fn_decls(decls))
+#[doc("`tab` is the program's symbol table, so registry identities match the ones the resolver stamped on call sites.")]
+pub fn perceus_pass_in(decls: [Decl], tab: SymTab) : [Decl] / Console {
+
+  let fns = fnx_build(register_fn_decls_in(decls, tab))
   # Borrow inference pre-pass (Koka pre-Parc): per-fn borrowed param
   # positions, consumed by BOTH sides of the flip (callee wraps the
   # borrowed scrutinee in __perceus_borrow so emit_match skips its exit
@@ -345,7 +349,7 @@ pub fn perceus_pass(decls: [Decl]) : [Decl] / Console {
 fn pcs_collect_opaque_ret_fns(decls: [Decl], opaque_names: [String], acc: [String]) : [String] = match decls {
   []           -> acc
   [d, ...rest] -> match d {
-    DFn(_, name, _, _, opt_ret, _, body, _, _, mo) ->
+    DFn(_, name, _, _, opt_ret, _, body, _, _, mo, fsym) ->
       if body_is_ffi_extern(body) and pcs_ret_is_opaque(opt_ret, opaque_names) {
         pcs_collect_opaque_ret_fns(rest, opaque_names, [pcs_borrow_key(name, mo), name, ...acc])
       } else { pcs_collect_opaque_ret_fns(rest, opaque_names, acc) }
@@ -366,7 +370,7 @@ pub type BorrowEntry = BwE(String, [Int])
 fn pcs_collect_opaque_names(decls: [Decl], acc: [String]) : [String] = match decls {
   []           -> acc
   [d, ...rest] -> match d {
-    DType(_, name, _, TBRecord(fields), _, _, _, _) ->
+    DType(_, name, _, TBRecord(fields), _, _, _, _, _) ->
       if pcs_is_ffi_opaque_record(fields) { pcs_collect_opaque_names(rest, [name, ...acc]) }
       else { pcs_collect_opaque_names(rest, acc) }
     _ -> pcs_collect_opaque_names(rest, acc)
@@ -423,7 +427,7 @@ fn pcs_seed_prim(prims: [String], user_fns: [String], acc: [BorrowEntry]) : [Bor
 fn pcs_user_fn_names(decls: [Decl], acc: [String]) : [String] = match decls {
   []           -> acc
   [d, ...rest] -> match d {
-    DFn(_, name, _, _, _, _, _, _, _, _) -> pcs_user_fn_names(rest, [name, ...acc])
+    DFn(_, name, _, _, _, _, _, _, _, _, fsym) -> pcs_user_fn_names(rest, [name, ...acc])
     _                                    -> pcs_user_fn_names(rest, acc)
   }
 }
@@ -440,7 +444,7 @@ fn pcs_cap_type_names(decls: [Decl]) : [String] =
 fn pcs_effect_decl_names(decls: [Decl], acc: [String]) : [String] = match decls {
   []           -> acc
   [d, ...rest] -> match d {
-    DEffect(_, name, _, _, _, _, _, _) -> pcs_effect_decl_names(rest, [name, ...acc])
+    DEffect(_, name, _, _, _, _, _, _, _) -> pcs_effect_decl_names(rest, [name, ...acc])
     _                                  -> pcs_effect_decl_names(rest, acc)
   }
 }
@@ -448,7 +452,7 @@ fn pcs_effect_decl_names(decls: [Decl], acc: [String]) : [String] = match decls 
 fn pcs_type_decl_names(decls: [Decl], acc: [String]) : [String] = match decls {
   []           -> acc
   [d, ...rest] -> match d {
-    DType(_, name, _, _, _, _, _, _) -> pcs_type_decl_names(rest, [name, ...acc])
+    DType(_, name, _, _, _, _, _, _, _) -> pcs_type_decl_names(rest, [name, ...acc])
     _                                -> pcs_type_decl_names(rest, acc)
   }
 }
@@ -545,7 +549,7 @@ fn pcs_prim_only_bmap(bmap: [BorrowEntry]) : [BorrowEntry] = match bmap {
 }
 
 fn pcs_borrow_entry_of(d: Decl, acc: [BorrowEntry]) : [BorrowEntry] = match d {
-  DFn(is_pub, name, _, params, _, _, body, _, _, mo) -> {
+  DFn(is_pub, name, _, params, _, _, body, _, _, mo, fsym) -> {
     # An FFI shim's body is a tag the inspection walk reads as "param
     # never referenced" — which it would mis-classify as borrowed,
     # making the caller strip the dup. The shim CONSUMES each input, so
@@ -1045,7 +1049,7 @@ fn pcs_build_consume_map(decls: [Decl], acc: ConsumeIndex) : ConsumeIndex = matc
 }
 
 fn pcs_consume_entry_of(d: Decl, acc: ConsumeIndex) : ConsumeIndex = match d {
-  DFn(_, name, _, params, _, _, body, _, _, mo) -> {
+  DFn(_, name, _, params, _, _, body, _, _, mo, fsym) -> {
     let pnames = map(params, (p) => p.pname)
     # An FFI shim's body is opaque to the consuming-use walk, so a normal
     # scan finds nothing consumed. The shim decrefs every boxed input, so
@@ -1754,7 +1758,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
                   fn_names: [String], prim_bmap: [BorrowEntry], cap_tys: [String]) : Decl / Console {
 
   match d {
-    DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
+    DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo, fsym) -> {
       # An `extern "C" fn` body is the magic ETodo tag that signals the
       # C / LLVM emitters to inline an FFI shim. Skip Perceus rewriting
       # — the shim handles its own arg-decref discipline (it
@@ -1806,7 +1810,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         let scx = StripCx { bmap: bmap, borrow_last: borrow_last, bclosures: [],
                             fn_names: fn_names, no_wrap: [], uses: uses }
         let body_borrow = pcs_strip_borrow_args_d(reused_body, scx)
-        DFn(is_pub, name, tparams, params, opt_ret, row, body_borrow, ln, cl, mo)
+        DFn(is_pub, name, tparams, params, opt_ret, row, body_borrow, ln, cl, mo, sym_none())
       }
       else {
         # Boxed and MIXED-signature fns share this path. A mixed-sig fn
@@ -1994,7 +1998,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # Last: an op argument reaches its handler owned, and a borrowed
         # binder is the one read that arrives without a reference of its own.
         let body_op_args = poa_own_op_args(body_borrow, borrowed)
-        DFn(is_pub, name, tparams, params, opt_ret, row, body_op_args, ln, cl, mo)
+        DFn(is_pub, name, tparams, params, opt_ret, row, body_op_args, ln, cl, mo, sym_none())
       }
     }
     # Test bodies are emitted as their own thunk fns; without rewriting
@@ -2762,7 +2766,7 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     }
     EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
                               pcs_rewrite_arms(arms, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
-    EHandle(body, eff, _, eff_tas, init_opt, alias, clauses, ret_opt) -> {
+    EHandle(body, eff, hsym, eff_tas, init_opt, alias, clauses, ret_opt) -> {
       let body1 = pcs_rewrite_expr(body, scope, uses, in_lam, skip_set, force_set, bmap, [])
       let init1 = match init_opt {
         None -> None
@@ -2778,7 +2782,7 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
                     hl, hc))
         }
       }
-      EHandle(body1, eff, sym_none(), eff_tas, init1, alias, cls1, ret1)
+      EHandle(body1, eff, hsym, eff_tas, init1, alias, cls1, ret1)
     }
     # Remaining kinds inlined for issue #528 (stage 1 has no row
     # polymorphism on function-param types, so the HOF `map_expr_kind`
@@ -5208,7 +5212,7 @@ fn pcs_arm_drop_kind(k: ExprKind, line: Int, col: Int, fn_name: String,
       let pn = map(ps, (p) => p.pname)
       ELambda(ps, pcs_arm_drop_pass(body, fn_name, list_append(outer_scope, pn), uses))
     }
-    EHandle(body, eff, _, eff_tas, init_opt, alias, clauses, ret_opt) -> {
+    EHandle(body, eff, hsym, eff_tas, init_opt, alias, clauses, ret_opt) -> {
       let body1 = pcs_arm_drop_pass(body, fn_name, outer_scope, uses)
       let init1 = match init_opt {
         None -> None
@@ -5224,7 +5228,7 @@ fn pcs_arm_drop_kind(k: ExprKind, line: Int, col: Int, fn_name: String,
                     hl, hc))
         }
       }
-      EHandle(body1, eff, sym_none(), eff_tas, init1, alias, cls1, ret1)
+      EHandle(body1, eff, hsym, eff_tas, init1, alias, cls1, ret1)
     }
     # Issue #528: inlined from `map_expr_kind` (stage 1 lacks row
     # polymorphism on function-param types).
