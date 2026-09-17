@@ -1042,6 +1042,12 @@ test-core-text:
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/char_test.kai
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/char_unicode_test.kai
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/string_test.kai
+	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/string_boundaries_test.kai
+	# Rename the inline-test entry to avoid colliding with auto-loaded core.string.
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	cp stdlib/core/string.kai "$$tmp/string_subject.kai" && \
+	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) "$$tmp/string_subject.kai"
+	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" check --backend=c tests/stdlib/core_text_properties_test.kai
 
 # Differential independence oracle (#962): proves core's typecheck is
 # byte-identical with and without an adversarial user file — the
