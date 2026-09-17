@@ -73,15 +73,19 @@ import compiler.fn_index
 #
 # Subsequent milestones extend the analysis to comparisons, EIf
 # cond, and match scrutinees.
-pub fn unbox_pass(decls: [Decl], cis: [CtorIntSlots], nat: Bool) : [Decl] / Console = {
-  let fns = fnx_build(register_fn_decls(decls))
+#[doc("`tab` is the program's symbol table: `call_resolves_to_ufn` looks a call site's `ESym` up in this index, so both must be numbered by the same table.")]
+pub fn unbox_pass_in(decls: [Decl], cis: [CtorIntSlots], nat: Bool, tab: SymTab) : [Decl] / Console = {
+  let fns = fnx_build(register_fn_decls_in(decls, tab))
   map(decls, (d) => unbox_decl(d, fns, cis, nat))
 }
+
+pub fn unbox_pass(decls: [Decl], cis: [CtorIntSlots], nat: Bool) : [Decl] / Console =
+  unbox_pass_in(decls, cis, nat, st_build(decls, ""))
 
 fn unbox_decl(d: Decl, fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : Decl / Console {
 
   match d {
-    DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
+    DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo, fsym) -> {
       # Phase 3 unboxing: when this DFn is itself a UFn, seed the
       # local-binding env with each parameter marked MUnboxed so
       # EVar reads of `pname` in the body resolve to the raw alias
@@ -108,13 +112,13 @@ fn unbox_decl(d: Decl, fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : Decl / Co
         None    -> []
       }
       let body1 = unbox_expr_aware(body, env0, fns, cis, nat)
-      DFn(is_pub, name, tparams, params, opt_ret, row, body1, ln, cl, mo)
+      DFn(is_pub, name, tparams, params, opt_ret, row, body1, ln, cl, mo, sym_none())
     }
     DTest(desc, body, ln, cl, mo) -> DTest(desc, unbox_expr_aware(body, [], fns, cis, nat), ln, cl, mo)
     DBench(desc, body, ln, cl, mo) -> DBench(desc, unbox_expr_aware(body, [], fns, cis, nat), ln, cl, mo)
     DCheck(desc, ps, body, ln, cl, mo) -> DCheck(desc, ps, unbox_expr_aware(body, [], fns, cis, nat), ln, cl, mo)
-    DImpl(name, proto_args, ty, sub_decls, l, c, tps) ->
-      DImpl(name, proto_args, ty, map(sub_decls, (sd) => unbox_decl(sd, fns, cis, nat)), l, c, tps)
+    DImpl(name, proto_args, ty, sub_decls, l, c, tps, isym) ->
+      DImpl(name, proto_args, ty, map(sub_decls, (sd) => unbox_decl(sd, fns, cis, nat)), l, c, tps, isym)
     DDerive(ps, inner, l, c) -> DDerive(ps, unbox_decl(inner, fns, cis, nat), l, c)
     DUnstable(inner, l, c) -> DUnstable(unbox_decl(inner, fns, cis, nat), l, c)
     DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, unbox_decl(inner, fns, cis, nat), l, c, mo)
@@ -261,8 +265,8 @@ fn ufn_promote_calls_kind(k: ExprKind, fns: FnIndex) : ExprKind {
     EMapPipe(a, b)       -> EMapPipe(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
     EFlatMapPipe(a, b)   -> EFlatMapPipe(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
     EFilterPipe(a, b)    -> EFilterPipe(ufn_promote_calls(a, fns), ufn_promote_calls(b, fns))
-    EHandle(body, eff_name, _, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(ufn_promote_calls(body, fns), eff_name, sym_none(), eff_tyargs,
+    EHandle(body, eff_name, hsym, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(ufn_promote_calls(body, fns), eff_name, hsym, eff_tyargs,
               ufn_promote_calls_opt(init_opt, fns), alias_opt,
               map(clauses, (c) => ufn_promote_calls_clause(c, fns)),
               ufn_promote_calls_opt_return(ret_opt, fns))
@@ -575,11 +579,11 @@ fn unbox_kind_aware(k: ExprKind, env: [LocBind], fns: FnIndex, cis: [CtorIntSlot
     EMapPipe(a, b)       -> EMapPipe(unbox_expr_aware(a, env, fns, cis, nat), unbox_expr_aware(b, env, fns, cis, nat))
     EFlatMapPipe(a, b)   -> EFlatMapPipe(unbox_expr_aware(a, env, fns, cis, nat), unbox_expr_aware(b, env, fns, cis, nat))
     EFilterPipe(a, b)    -> EFilterPipe(unbox_expr_aware(a, env, fns, cis, nat), unbox_expr_aware(b, env, fns, cis, nat))
-    EHandle(body, eff_name, _, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+    EHandle(body, eff_name, hsym, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
       # The handled body opens a fresh dynamic scope for the effect
       # capability. v1 walks it with the outer env (no bindings
       # leak into the handler's continuation captures).
-      EHandle(unbox_expr_aware(body, env, fns, cis, nat), eff_name, sym_none(), eff_tyargs,
+      EHandle(unbox_expr_aware(body, env, fns, cis, nat), eff_name, hsym, eff_tyargs,
               unbox_opt_aware(init_opt, env, fns, cis, nat), alias_opt,
               map(clauses, (c) => unbox_clause_aware(c, env, fns, cis, nat)),
               unbox_opt_return_aware(ret_opt, env, fns, cis, nat))
@@ -906,7 +910,7 @@ fn nrab_decls(ds: [Decl], cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]
 }
 
 fn nrab_decl(d: Decl, cis: [CtorIntSlots], fns: FnIndex, acc: [RawArmBinder]) : [RawArmBinder] / Console = match d {
-  DFn(_, _, _, _, _, _, body, _, _, _) -> nrab_expr(body, cis, fns, acc)
+  DFn(_, _, _, _, _, _, body, _, _, _, fsym) -> nrab_expr(body, cis, fns, acc)
   DTest(_, body, _, _, _)                 -> nrab_expr(body, cis, fns, acc)
   DBench(_, body, _, _, _)                -> nrab_expr(body, cis, fns, acc)
   DCheck(_, _, body, _, _, _)             -> nrab_expr(body, cis, fns, acc)
