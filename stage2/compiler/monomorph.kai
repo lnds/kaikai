@@ -67,6 +67,8 @@
 # not blocking here.
 
 import compiler.ast
+import compiler.modules
+import compiler.scope_walk
 import compiler.sym_read
 import compiler.kinds
 import compiler.util
@@ -1991,12 +1993,12 @@ fn emit_spec(d: Decl, mt: MonoTuple, insts: InstIndex, polys: PolyIx,
     # main → spec(1 iter) → poly(TCO loop). Post-#599 the RC
     # convention across that boundary mismatches and a `step(s, ev)`
     # closure call double-decrefs `s` on the third iteration.
-    # The walker is sound here because, after `subst_decl`, every
-    # `EVar(orig_name)` in the spec body refers to the spec being
-    # emitted — the formals are monomorphic and there is no other
-    # instance the original name could mean. Function-as-value
-    # uses (bare `EVar(orig_name)` outside an `ECall`) are left
-    # alone, preserving the polymorphic dispatch surface.
+    # A free `EVar(orig_name)` in the spec body means the spec being
+    # emitted, so the walker tracks binders: a local that shadows the
+    # name is a different value and its calls are left alone.
+    # Function-as-value uses (bare `EVar(orig_name)` outside an
+    # `ECall`) are left alone too, preserving the polymorphic
+    # dispatch surface.
     let orig_name = match d { DFn(_, n, _, _, _, _, _, _, _, _, fsym) -> n  _ -> "" }
     let mangled = mono_mangle_name(orig_name, tys, units)
     let spec3 = retarget_self_calls_decl(spec2, orig_name, mangled)
@@ -2030,18 +2032,19 @@ fn retarget_self_calls_decl(d: Decl, orig_name: String, mangled: String) : Decl 
     match d {
       DFn(p, n, tp, ps, rt, row, body, ln, cl, mo, fsym) ->
         DFn(p, n, tp, ps, rt, row,
-            retarget_self_calls_expr(body, orig_name, mangled),
+            retarget_self_calls_expr(body, sw_params(ps, []), orig_name, mangled),
             ln, cl, mo, fsym)
       _ -> d
     }
   }
 }
 
-fn retarget_self_calls_expr(e: Expr, orig_name: String, mangled: String) : Expr =
-  Expr { kind: retarget_self_calls_kind(e.kind, orig_name, mangled),
+fn retarget_self_calls_expr(e: Expr, sh: [String], orig_name: String, mangled: String) : Expr =
+  Expr { kind: retarget_self_calls_kind(e.kind, sh, orig_name, mangled),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
-fn retarget_self_calls_kind(k: ExprKind, orig_name: String, mangled: String) : ExprKind {
+fn retarget_self_calls_kind(k: ExprKind, sh: [String], orig_name: String,
+      mangled: String) : ExprKind {
   match k {
     ECall(callee, args_) -> match sym_read_kind(callee.kind) {
       # The single rewrite the walker performs: `f(args)` where f is
@@ -2049,21 +2052,67 @@ fn retarget_self_calls_kind(k: ExprKind, orig_name: String, mangled: String) : E
       # recurse so nested self-calls inside arg expressions also get
       # retargeted.
       EVar(name) ->
-        if name == orig_name {
+        if name == orig_name and not list_has(sh, name) {
           let new_callee = Expr { kind: EVar(mangled),
                                    line: callee.line, col: callee.col,
                                    ty: callee.ty, mode: callee.mode }
-          let new_args = map(args_, (a) => retarget_self_calls_expr(a, orig_name, mangled))
+          let new_args = map(args_, (a) => retarget_self_calls_expr(a, sh, orig_name, mangled))
           ECall(new_callee, new_args)
         } else {
           ECall(callee,
-                map(args_, (a) => retarget_self_calls_expr(a, orig_name, mangled)))
+                map(args_, (a) => retarget_self_calls_expr(a, sh, orig_name, mangled)))
         }
-      _ -> ECall(retarget_self_calls_expr(callee, orig_name, mangled),
-                  map(args_, (a) => retarget_self_calls_expr(a, orig_name, mangled)))
+      _ -> ECall(retarget_self_calls_expr(callee, sh, orig_name, mangled),
+                  map(args_, (a) => retarget_self_calls_expr(a, sh, orig_name, mangled)))
     }
-    _ -> mono_map_expr_kind(k, (sub) => retarget_self_calls_expr(sub, orig_name, mangled))
+    # Binding forms extend the shadow set for their body; the generic
+    # mapper cannot, so they are spelled out here.
+    ELambda(ps, b) -> ELambda(ps, retarget_self_calls_expr(b, sw_params(ps, sh), orig_name, mangled))
+    EMatch(scr, arms) ->
+      EMatch(retarget_self_calls_expr(scr, sh, orig_name, mangled),
+             map(arms, (a) => retarget_arm(a, sh, orig_name, mangled)))
+    EBlock(stmts, tail) -> match retarget_stmts(stmts, sh, orig_name, mangled, []) {
+      RSS(ss1, sh1) ->
+        EBlock(ss1, match tail {
+          Some(t) -> Some(retarget_self_calls_expr(t, sh1, orig_name, mangled))
+          None    -> None
+        })
+    }
+    _ -> mono_map_expr_kind(k, (sub) => retarget_self_calls_expr(sub, sh, orig_name, mangled))
   }
+}
+
+fn retarget_arm(a: Arm, sh: [String], orig_name: String, mangled: String) : Arm = match a {
+  Arm(p, guard, body) -> {
+    let sh1 = pat_binders(p, sh)
+    Arm(p, match guard {
+          Some(g) -> Some(retarget_self_calls_expr(g, sh1, orig_name, mangled))
+          None    -> None
+        },
+        retarget_self_calls_expr(body, sh1, orig_name, mangled))
+  }
+}
+
+# A statement list threads its binders forward: each statement is
+# rewritten under the scope its predecessors left, and the tail sees
+# the whole block's binders.
+type RetStmts = RSS([Stmt], [String])
+
+fn retarget_stmts(ss: [Stmt], sh: [String], orig_name: String, mangled: String,
+      acc: [Stmt]) : RetStmts = match ss {
+  [] -> RSS(list_reverse(acc), sh)
+  [s, ...rest] ->
+    retarget_stmts(rest, retarget_stmt_binders(s, sh), orig_name, mangled,
+                   [retarget_stmt(s, sh, orig_name, mangled), ...acc])
+}
+
+fn retarget_stmt(s: Stmt, sh: [String], orig_name: String, mangled: String) : Stmt =
+  mono_map_stmt_exprs(s, (x) => retarget_self_calls_expr(x, sh, orig_name, mangled))
+
+fn retarget_stmt_binders(s: Stmt, sh: [String]) : [String] = match s {
+  SLet(p, _, _)       -> pat_binders(p, sh)
+  SVar(n, _, _, _, _) -> [n, ...sh]
+  _ -> sh
 }
 
 # Walk a decl's body collecting concrete poly tuples introduced by
