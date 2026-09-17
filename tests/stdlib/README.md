@@ -3,9 +3,23 @@
 `char_test.kai`, `char_unicode_test.kai`, and `string_test.kai` call the
 public core modules through qualified names. They exercise all 50 public
 functions across the three modules; this is API coverage, not a measured
-line or branch coverage percentage. Existing inline stdlib tests remain
-in place. These standalone suites avoid depending on implicit prelude
-test discovery.
+line or branch coverage percentage. `string_boundaries_test.kai` adds
+boundary grids and runtime sentinel checks. The target also explicitly
+runs the inline string tests, including the private codepoint advance
+contract, through a temporary entry with a different module name.
+
+`core_text_properties_test.kai` contains 12 generated `check` properties:
+ASCII classification and case normalization, Unicode normalization and
+reference case-pair sequences, UTF-8 round-trips, reversal, slicing
+against a list model, byte boundaries, trimming, concatenation, and
+character-to-string casing consistency. Checks return `Bool` so the
+built-in property harness can report and shrink counterexamples.
+
+The installed 0.119 generators produce printable ASCII `Char`/`String`
+values. Generated integer lists are therefore also mapped through an
+explicit palette spanning all UTF-8 widths, Unicode case exceptions,
+whitespace and scalar boundaries. This samples sequences from that
+palette; it is not exhaustive coverage of Unicode.
 
 The character suite checks all 128 ASCII codepoints and non-ASCII
 negative cases. The Unicode suite uses explicit case pairs for every
@@ -25,6 +39,14 @@ make test-core-text KAI_TEST_DRIVER="$(command -v kai)" KAI_TEST_BACKEND=c
 
 CI runs `make test-core-text` with the repository driver in tier 1,
 shard 3. Mutation remains an opt-in diagnostic, using `kai mutate`.
+The target also invokes `kai check --backend=c`: the property runner in
+0.119 supports C only, independently of the backend selected for `test`.
+Each property runs 100 generated cases with the runtime's reproducible
+seed. Run just the properties with:
+
+```sh
+KAI_STDLIB="$PWD/stdlib" kai check --backend=c tests/stdlib/core_text_properties_test.kai
+```
 
 ## Native mutation testing
 
@@ -55,24 +77,80 @@ while an observable difference needs a new failing test. Compilation
 failures are reported separately by `kai mutate` and do not establish
 that an assertion detected the mutation.
 
-### Equivalent string boundary mutations
+### String mutation oracle and equivalent sites
 
-Some boundary mutations leave the public result unchanged. Keep these
-visible in the native report and check their reasoning when the code
-changes:
+For `string`, include the assertion suites and generated properties in
+the oracle, and map the
+repository's native equivalence file to the temporary entry name:
+
+```sh
+mkdir -p "$work/tools"
+sed 's|stdlib/core/string.kai:|string_subject.kai:|' \
+  tools/mutate-known-equivalent.txt > "$work/tools/mutate-known-equivalent.txt"
+oracle="kai test --backend=native '$repo/tests/stdlib/string_test.kai' &&
+  kai test --backend=native '$repo/tests/stdlib/string_boundaries_test.kai' &&
+  kai test --backend=native '$work/string_subject.kai' &&
+  kai check --backend=c '$repo/tests/stdlib/core_text_properties_test.kai'"
+eval "$oracle"
+kai mutate "$work" --module "$work/string_subject.kai" \
+  --oracle "{ $oracle; } >> '$work/oracle.log' 2>&1"
+```
+
+Use a fresh copy with `module=string` from the setup above. Run the oracle
+successfully before mutating. All six native operators are in scope.
+An optional `ulimit -t 15` in the oracle bounds CPU use when a mutation
+prevents a loop from terminating; inspect the oracle's failure output
+before treating such a rejection as evidence.
+
+Known equivalents are recorded in `tools/mutate-known-equivalent.txt`,
+with a reason for each site. They are **skipped**, not killed by tests.
+The boundary fixture exercises the identities and runtime invariants
+behind these explanations; passing examples alone do not prove an
+arbitrary mutant equivalent. Review each entry when its source changes.
 
 | Guard | Why the alternate boundary returns the same value |
 |---|---|
 | Left/right trim loop at the buffer edge | `char_at` returns `None` outside the buffer; its arm returns the same offset. |
 | `trim` with `hi == lo` | Slicing zero bytes produces the same empty string. |
 | Padding with `length == width` | Repeating the fill zero times and concatenating it preserves the input. |
+| Singleton arm in trailing-line removal | The general list arm also produces `[x]` when its tail is empty; the earlier empty-string arm still handles `[""]`. |
 | `w <= 0` in chars/count/advance/indices | The enclosing guard admits only in-range offsets, where `string_cp_len` returns 1–4. |
+| Literal changes in the same width fallback | Threshold `1` still yields step `1` when width is `1`; changing the fallback value is unreachable. |
 | Floor at zero or buffer end; ceil at buffer end | The helper either repeats the same clamp or reads the out-of-range byte sentinel `-1`, which is not a continuation byte. |
-| Codepoint advance at `off == n` | One extra step can produce `n + 1`; the final byte slice clamps it to the same end of the buffer. |
-| Slice with zero length or zero start | The alternate branches still produce an empty slice or a start of zero, respectively. |
+| Slice with zero length | The alternate branch still produces an empty slice. |
 | Blank check at the buffer end | The extra `char_at` returns `None`, whose arm is also `true`. |
+| Blank check's `None` result | With the original end guard, only in-range offsets reach `char_at`, which always returns `Some` there, including malformed bytes. |
 
-Do not suppress all comparisons on a line indiscriminately: the
-`count <= 0 or off >= n` line has both a killable count boundary and an
-equivalent end boundary, while the native suppression key does not
-include the column.
+The codepoint advance end guard is not excluded: its inline test checks
+the private helper's bounded offset directly, so a mutant returning
+`n + 1` is rejected even when the public slice would hide that error.
+`slice` delegates negative-start clamping to this helper, avoiding a
+second conditional with an identical zero-start result.
+The native suppression key has no column; never exclude a line/operator
+pair that also contains an observable mutation.
+
+## Validation with kai 0.119.0
+
+All 59 assertion tests pass on C and native. All 12 properties pass with
+100 cases each on the C property runner. Restoring the pre-fix Unicode
+module makes the reference-pair property fail; its shrunk seed `[-44]`
+selects the `Ź`/`ź` pair. The corrected module passes the same check.
+
+All six mutation operators were swept against the assertion suites:
+
+| Module | Killed by the oracle | Did not compile | Equivalent, skipped | Survived |
+|---|---:|---:|---:|---:|
+| `char` | 17 | 10 | 0 | 0 |
+| `char_unicode` | 116 | 23 | 0 | 0 |
+| `string` | 169 | 87 | 26 | 0 |
+
+The string sweep used three isolated copies, grouped by operators:
+`arm/call/compare/connect` (130 tested, 17 skipped), `negate` (46 tested),
+and `literal` (80 tested, 9 skipped). The groups cover every generated
+site once. The 26 equivalents are excluded explicitly, not counted as
+tests detecting a fault.
+
+A further 20-mutant smoke run puts `kai check` first in the oracle:
+9 killed, 11 compile failures, zero survivors. The generated
+concatenation property reports and shrinks counterexamples for those
+prefix/suffix mutations.
