@@ -44,12 +44,15 @@ SPELL_ALLOW='effect_scope_table|type_scope_table'
 #   protos            — what a derived `show` prints.
 DISPLAY_ALLOW='decl_names|pub_access_table|name_report|infer|protos'
 
+# Comments and `#[doc]` bodies name these functions when they explain
+# the mechanism, so strip a line's comment before matching: prose about
+# the respelling is not a use of it.
 scan() {
   pat="$1"
   for f in "$SRC"/*.kai; do
     b=$(basename "$f" .kai)
     [ "$b" = "home_spell" ] && continue
-    n=$(grep -cE "(^|[^a-z_])$pat\(" "$f" || true)
+    n=$(sed 's/#.*$//' "$f" | grep -cE "(^|[^a-z_])$pat\(" || true)
     [ "$n" -gt 0 ] && printf '%s %s\n' "$b" "$n"
   done
   return 0
