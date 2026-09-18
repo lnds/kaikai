@@ -339,6 +339,23 @@ struct and the runtime label all see distinct effects. Core and root
 declarations keep the bare spelling, so the fixed runtime labels
 (`Cancel`, `Link`, `Monitor`, `Spawn`, `Actor`) are unchanged.
 
+**Type respelling is compile-time only, and outlives its purpose.** The
+effect spelling above reaches the runtime; the type one does not. No
+`Cfg__ta` appears in an emitted binary — the type respelling exists
+solely to keep the typer from unifying two homonyms, because a nominal
+type is `TyCon(Option[String], String, [Ty])` and identity there is
+`module_slot_compat(am, bm) and an == bn`. That module slot is
+permissive by construction (a `None` matches anything) and is `None` at
+every construction site outside a test, so the name string is carrying
+the disambiguation the slot was meant to carry.
+
+The type half therefore retires when `TyCon` carries a `SymId`, and not
+before: with the respelling removed and `TyCon` unchanged, the
+namespace-collision corpus goes from 7 failures to 50 on the C axis
+alone. `tools/respelling-confined-gate.sh` holds the surface meanwhile —
+the files that may mint or read a home spelling are listed there, so the
+mechanism cannot spread while it waits to be deleted.
+
 **`extern "C"` is the deliberate exception.** The emitted symbol must
 match the foreign library, so it cannot be namespaced. Kaikai-side the
 name is still `(home, name)` and resolves by §1; only the C symbol is
