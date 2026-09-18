@@ -84,6 +84,16 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.119.1 (2026-09-18)
+
+### Fixed
+
+- **monomorph**: a local shadowing a generic no longer steals its self-call retarget (#2000)
+- **compiler**: one symbol table, and identities that survive the passes (#1993)
+- **typer**: reject `_` as an expression (#1998)
+- **stdlib**: cover core text contracts and correct Unicode casing (#1997)
+- **monomorph**: resolve a root generic homonymous with a core generic (#1992)
+
 ## v0.119.0 (2026-09-14)
 
 ### BREAKING CHANGE
