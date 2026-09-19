@@ -37,6 +37,7 @@ import compiler.vec_surface
 import compiler.fixed_vec_match
 import compiler.home_spell
 import compiler.infer_unit_alias
+import compiler.tycon_scheme_home
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule, `inf_` prefix)
@@ -861,7 +862,12 @@ pub fn fixed_width_ty_of_name(name: String) : Ty =
 fn ffi_fixed_ty_of_name(name: String) : Ty =
   if name == "F32" { TyReal } else { TyInt }
 
-fn inf_resolve_ty(t: TypeExpr) : Ty {
+fn inf_resolve_ty(t: TypeExpr) : Ty = inf_resolve_ty_hv(t, tsh_view_empty())
+
+# As `inf_resolve_ty` but stamping each nominal head's module slot, so
+# an annotation resolved through this path agrees with the constructor
+# scheme and the record table on which declaration a name denotes.
+fn inf_resolve_ty_hv(t: TypeExpr, hv: TyHomeView) : Ty {
   match t.tkind {
     TyName(name, targs) -> {
       if name == "Int" { TyInt }
@@ -890,18 +896,18 @@ fn inf_resolve_ty(t: TypeExpr) : Ty {
       # any expected type, which is sound only because the default
       # handler aborts before any consumer of that "value" runs.
       else if name == "Nothing" { TyAny }
-      else { TyCon(None, name, inf_resolve_ty_list(targs)) }
+      else { tsh_tycon(hv, name, inf_resolve_ty_list_hv(targs, hv)) }
     }
-    TyList(inner) -> TyListT(inf_resolve_ty(inner))
-    TyFn(fps, fret, rexpr) -> TyFnT(inf_resolve_ty_list(fps), inf_resolve_ty(fret), inf_row_of_expr(rexpr))
+    TyList(inner) -> TyListT(inf_resolve_ty_hv(inner, hv))
+    TyFn(fps, fret, rexpr) -> TyFnT(inf_resolve_ty_list_hv(fps, hv), inf_resolve_ty_hv(fret, hv), inf_row_of_expr(rexpr))
     # dimensioned base type. The unit goes through unit_canon
     # (with empty alias and tparam contexts here) so two textually
     # different but algebraically equal forms compare equal under unify.
-    TyDim(base, u) -> TyDimT(inf_resolve_ty(base), unit_canon(u))
+    TyDim(base, u) -> TyDimT(inf_resolve_ty_hv(base, hv), unit_canon(u))
     # preserve the refinement on the semantic side.
     # `TyRefineT(b, p)` ⊑ `b` in the unifier (upcast); narrowing
     # requires explicit `ensure(...)` or a match-arm `: RefinedT`.
-    TyRefine(base, p) -> TyRefineT(inf_resolve_ty(base), p)
+    TyRefine(base, p) -> TyRefineT(inf_resolve_ty_hv(base, hv), p)
     # a compound row reaching *type* position (not dissolved
     # by alias substitution) — resolve to an undeclared name so the
     # natural "unknown type" cascade reports it.
@@ -925,6 +931,9 @@ fn inf_resolve_ty(t: TypeExpr) : Ty {
 # `mk_rvbinds`. Diagnostics-only paths are fine with the placeholder.
 
 fn inf_resolve_ty_list(ts: [TypeExpr]) : [Ty] = map(ts, inf_resolve_ty)
+
+fn inf_resolve_ty_list_hv(ts: [TypeExpr], hv: TyHomeView) : [Ty] =
+  map(ts, (t) => inf_resolve_ty_hv(t, hv))
 
 # Annotation resolution that honours the per-type row-kind table: a
 # `T[..., e]` slot the type declares row-kind resolves to a row carrier
@@ -2850,6 +2859,11 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
                # `let s : Stream[String, File + ReadFault]` annotation
                # unifies with the inferred carrier.
                row_kind: [RowKindEntry],
+               # the whole-program type-home table (`tsh_collect`). Lets
+               # any resolver reached from the env stamp a nominal type's
+               # module slot, so the annotation side of a type agrees with
+               # the constructor scheme and the record table.
+               ty_homes: [TyHomeEntry],
                # name index over `entries`, keyed by each entry's bucket
                # key (last `::`-segment). Mirrors `entries` exactly: every
                # prepend to `entries` prepends to this index too, so
@@ -2876,13 +2890,13 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
 pub type HeadOwnerEntry = HOE(String, [String])
 
 #[doc("infer: the empty typing environment.")]
-pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }
+pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], ty_homes: [], index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }
 
 fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv {
   let k = ty_bucket_key(name)
   let e = TyEntry { name: name, scheme: sc }
   TyEnv { entries: [e, ...env.entries],
-          fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
+          fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, ty_homes: env.ty_homes,
           index: idx_prepend(env.index, k, e),
           vindex: vix_prepend(env.vindex, ty_variant_key(e), e), sindex: env.sindex }
 }
@@ -2897,7 +2911,7 @@ fn ty_env_add_sym(env: TyEnv, s: SymId, name: String, sc: TyScheme) : TyEnv {
   else {
     TyEnv { entries: named.entries, fresh: named.fresh, unions: named.unions,
             constructors: named.constructors, head_owners: named.head_owners,
-            root_fns: named.root_fns, row_kind: named.row_kind,
+            root_fns: named.root_fns, row_kind: named.row_kind, ty_homes: named.ty_homes,
             index: named.index, vindex: named.vindex,
             sindex: idx_prepend_sym(named.sindex, s, TyEntry { name: name, scheme: sc }) }
   }
@@ -3530,7 +3544,7 @@ pub fn add_core_sigs(env: TyEnv) : TyEnv {
   let batch = list_append(es, native_es)
   match ty_env_prepend_batch(batch, env.entries, env.index, env.vindex) {
     TEP(all_entries, idx, vidx) ->
-      TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
+      TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, ty_homes: env.ty_homes,
               index: idx, vindex: vidx, sindex: env.sindex }
   }
 }
@@ -3574,7 +3588,7 @@ fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
   ]
   match ty_env_prepend_batch(es, env.entries, env.index, env.vindex) {
     TEP(all_entries, idx, vidx) ->
-      TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind,
+      TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, ty_homes: env.ty_homes,
               index: idx, vindex: vidx, sindex: env.sindex }
   }
 }
@@ -4104,7 +4118,15 @@ fn validate_nominal_row_vars_decl(d: Decl, file: String) : Int / Console + File 
   }
 }
 
-fn scheme_of_variant(type_name: String, tparams: [String], v: Variant) : TyScheme {
+fn scheme_of_variant(type_name: String, tparams: [String], v: Variant) : TyScheme =
+  scheme_of_variant_hv(type_name, tparams, v, tsh_view_empty())
+
+# As `scheme_of_variant` but stamping the constructed type's module
+# slot from `hv`. The annotation side of the same type is stamped from
+# the same table, and a stamped head only meets an unstamped one by the
+# permissive rule — so both sides have to be built from one view.
+fn scheme_of_variant_hv(type_name: String, tparams: [String], v: Variant,
+                        hv: TyHomeView) : TyScheme {
   match v {
     Var(_ctor_name, vargs) -> {
       # A tparam that appears in *row* position inside a ctor field
@@ -4139,7 +4161,7 @@ fn scheme_of_variant(type_name: String, tparams: [String], v: Variant) : TySchem
       let ids = tparam_ids(tparams)
       let tvar_ids = map(tvar_names, (n) => tpbind_id_of(binds, n))
       let rvar_ids = map(rvar_names, (n) => tpbind_id_of(binds, n))
-      let result = TyCon(None, type_name, map(ids, (i) => head_slot_for(i, rvar_ids)))
+      let result = TyCon(tsh_slot(hv, type_name), type_name, map(ids, (i) => head_slot_for(i, rvar_ids)))
       match vargs {
         [] -> scheme(ids, result)
         _  -> scheme_full(tvar_ids, rvar_ids, fn_ty(arg_tys, result))
@@ -4170,14 +4192,14 @@ fn names_excluding(xs: [String], drop: [String]) : [String] {
 }
 
 fn add_variants_of_decl(env: TyEnv, d: Decl, top_names: [String],
-      tab: SymTab, target: String) : TyEnv {
+      tab: SymTab, target: String, hv: TyHomeView) : TyEnv {
   match d {
     DType(is_pub, tname, tparams, body, _, _, mo, _, _) -> match body {
       # A private type's constructors are unreachable from another
       # module, so they get no home key: they can neither be named
       # through a qualifier nor make a bare name ambiguous elsewhere.
       TBSum(vs) -> add_variants_loop(env, if is_pub { mo } else { None },
-                                        tname, tparams, vs, top_names, tab, target)
+                                        tname, tparams, vs, top_names, tab, target, hv)
       _ -> env
     }
     _ -> env
@@ -4200,7 +4222,7 @@ fn add_variants_of_decl(env: TyEnv, d: Decl, top_names: [String],
 fn add_variants_loop(env: TyEnv, home: Option[String],
                        tname: String, tparams: [String],
                        vs: [Variant], top_names: [String],
-                       tab: SymTab, target: String) : TyEnv {
+                       tab: SymTab, target: String, hv: TyHomeView) : TyEnv {
   match vs {
     [] -> env
     [v, ...rest] -> match v {
@@ -4210,9 +4232,9 @@ fn add_variants_loop(env: TyEnv, home: Option[String],
           _  -> false
         }
         if shadows {
-          add_variants_loop(env, home, tname, tparams, rest, top_names, tab, target)
+          add_variants_loop(env, home, tname, tparams, rest, top_names, tab, target, hv)
         } else {
-          let sc = scheme_of_variant(tname, tparams, v)
+          let sc = scheme_of_variant_hv(tname, tparams, v, hv)
           # Ctor overloading at use sites: always
           # register the qualified `<tname>::<cname>` key so disambiguation
           # at match / annotated construction sites can pick this variant
@@ -4237,7 +4259,7 @@ fn add_variants_loop(env: TyEnv, home: Option[String],
           } else {
             ty_env_add_sym(env_h, ty_decl_sym(tab, NCCtor, cname, home, target), cname, sc)
           }
-          add_variants_loop(env2, home, tname, tparams, rest, top_names, tab, target)
+          add_variants_loop(env2, home, tname, tparams, rest, top_names, tab, target, hv)
         }
       }
     }
@@ -4281,22 +4303,31 @@ fn bare_is_core_builtin_variant(env: TyEnv, cname: String) : Bool {
 # `UnionInfo` is declared near `TyEnv`. The helpers below populate and
 # consume it.
 
-fn collect_unions(ds: [Decl]) : [UnionInfo] = collect_unions_loop(ds, [])
+fn collect_unions(ds: [Decl]) : [UnionInfo] =
+  collect_unions_hv(ds, tsh_view_empty())
 
-fn collect_unions_loop(ds: [Decl], acc: [UnionInfo]) : [UnionInfo] {
+# As `collect_unions` but stamping each component's module slot from
+# the same table the constructor schemes are stamped from. A component
+# names a type whose constructor scheme carries a home; built without
+# one here, the two sides of the same type would meet only by the
+# permissive slot rule.
+fn collect_unions_hv(ds: [Decl], hv: TyHomeView) : [UnionInfo] =
+  collect_unions_loop_hv(ds, [], hv)
+
+fn collect_unions_loop_hv(ds: [Decl], acc: [UnionInfo], hv: TyHomeView) : [UnionInfo] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match decl_transparent_inner(d) {
-      Some(inner) -> collect_unions_loop([inner, ...rest], acc)
+      Some(inner) -> collect_unions_loop_hv([inner, ...rest], acc, hv)
       None -> match d {
         DType(_, name, _, body, line, col, _, _, _) -> match body {
           TBSum(vs) -> {
-            let comps = variants_to_component_tys(vs)
-            collect_unions_loop(rest, [UI(name, comps, line, col), ...acc])
+            let comps = variants_to_component_tys(vs, hv)
+            collect_unions_loop_hv(rest, [UI(name, comps, line, col), ...acc], hv)
           }
-          _ -> collect_unions_loop(rest, acc)
+          _ -> collect_unions_loop_hv(rest, acc, hv)
         }
-        _ -> collect_unions_loop(rest, acc)
+        _ -> collect_unions_loop_hv(rest, acc, hv)
       }
     }
   }
@@ -4307,11 +4338,12 @@ fn collect_unions_loop(ds: [Decl], acc: [UnionInfo]) : [UnionInfo] {
 # the type level: the parent's TyCon-result is what makes
 # payload-bearing variants type-check. Singleton unions collapse to the
 # bare component (per `normalize_union`).
-fn variants_to_component_tys(vs: [Variant]) : [Ty] {
+fn variants_to_component_tys(vs: [Variant], hv: TyHomeView) : [Ty] {
   match vs {
     [] -> []
     [v, ...rest] -> match v {
-      Var(cname, _) -> [TyCon(None, cname, []), ...variants_to_component_tys(rest)]
+      Var(cname, _) -> [tsh_tycon(hv, cname, []),
+                        ...variants_to_component_tys(rest, hv)]
     }
   }
 }
@@ -4570,7 +4602,13 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind]) : Ty 
 # row equally. Callers with no table pass `[]`: then only ctor-field row
 # vars (in `rbinds`) and literal compound rows resolve to carriers; a
 # single concrete effect stays a type.
-fn resolve_ty_with_binds_rk(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry]) : Ty {
+fn resolve_ty_with_binds_rk(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry]) : Ty =
+  resolve_ty_with_binds_hv(t, tpbinds, rbinds, rk, tsh_view_empty())
+
+# As `resolve_ty_with_binds_rk` but stamping each nominal type's module
+# slot from `hv`, so a signature's `TyCon` carries the same home the
+# record table gives a literal of that type.
+fn resolve_ty_with_binds_hv(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry], hv: TyHomeView) : Ty {
   match t.tkind {
     TyName(name, tas) -> {
       match shape_tparam_lookup(tpbinds, name) {
@@ -4578,7 +4616,7 @@ fn resolve_ty_with_binds_rk(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk
         # A bare `s` (no args) is the unapplied shape variable. More than
         # one arg is an arity violation caught by the formation validator.
         Some(sid) -> match tas {
-          [arg] -> TyShapeApp(sid, resolve_ty_with_binds_rk(arg, tpbinds, rbinds, rk))
+          [arg] -> TyShapeApp(sid, resolve_ty_with_binds_hv(arg, tpbinds, rbinds, rk, hv))
           _ -> tv(sid)
         }
         None -> match tpbind_lookup(tpbinds, name) {
@@ -4595,29 +4633,28 @@ fn resolve_ty_with_binds_rk(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk
           else if is_ffi_fixed_name(name) { ffi_fixed_ty_of_name(name) }
           else if name == "Handle"   { TyHandle }
           else if name == "Nothing" { TyAny }
-          # The module_origin slot stays `None` here: this runs at
-          # scheme-build time, when the record / sum tables that name
-          # a type's home are not yet in scope. `tag_tycon_modules`
-          # stamps it post-typing, which keeps the populate logic in
-          # one place instead of at this function's call sites.
-          else { TyCon(None, name, resolve_tycon_args(tas, row_kind_slots_of(rk, name), 0, tpbinds, rbinds, rk)) }
+          # The slot is stamped from the caller's view of the decl
+          # stream. A caller with no view leaves it empty, and
+          # `tag_tycon_modules` stamps what is still bare post-typing.
+          else { TyCon(tsh_slot(hv, name), name,
+                       resolve_tycon_args(tas, row_kind_slots_of(rk, name), 0, tpbinds, rbinds, rk, hv)) }
         }
       }
       }
     }
-    TyList(inner) -> TyListT(resolve_ty_with_binds_rk(inner, tpbinds, rbinds, rk))
+    TyList(inner) -> TyListT(resolve_ty_with_binds_hv(inner, tpbinds, rbinds, rk, hv))
     TyFn(fps, fret, rexpr) ->
-      TyFnT(map(fps, (p) => resolve_ty_with_binds_rk(p, tpbinds, rbinds, rk)),
-            resolve_ty_with_binds_rk(fret, tpbinds, rbinds, rk),
+      TyFnT(map(fps, (p) => resolve_ty_with_binds_hv(p, tpbinds, rbinds, rk, hv)),
+            resolve_ty_with_binds_hv(fret, tpbinds, rbinds, rk, hv),
             row_of_expr_with_binds(rexpr, tpbinds, rbinds))
     # dimensioned base — resolve the inner Ty against tpbinds,
     # then walk the unit and rewrite any symbol that names a unit
     # tparam (`[u: Measure]` → name "u#Unit") to UVar(id).
     TyDim(base, u) ->
-      dim_collapse(resolve_ty_with_binds_rk(base, tpbinds, rbinds, rk),
+      dim_collapse(resolve_ty_with_binds_hv(base, tpbinds, rbinds, rk, hv),
                    unit_canon(unit_resolve_tparams(u, tpbinds)))
     # preserve refinement on the semantic side.
-    TyRefine(base, p) -> TyRefineT(resolve_ty_with_binds_rk(base, tpbinds, rbinds, rk), p)
+    TyRefine(base, p) -> TyRefineT(resolve_ty_with_binds_hv(base, tpbinds, rbinds, rk, hv), p)
     # a compound row reaching *type* position (not dissolved
     # by alias substitution). Resolve to an undeclared name so the
     # natural "unknown type" cascade reports it.
@@ -4630,12 +4667,12 @@ fn resolve_ty_with_binds_rk(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk
 # row-kind slot indices: a slot whose index is in `idxs` resolves to a
 # row carrier.
 fn resolve_tycon_args(tas: [TypeExpr], idxs: [Int], i: Int,
-                      tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry]) : [Ty] {
+                      tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry], hv: TyHomeView) : [Ty] {
   match tas {
     [] -> []
     [a, ...rest] -> {
-      let resolved = resolve_tycon_arg(a, list_has_int(idxs, i), tpbinds, rbinds, rk)
-      [resolved, ...resolve_tycon_args(rest, idxs, i + 1, tpbinds, rbinds, rk)]
+      let resolved = resolve_tycon_arg(a, list_has_int(idxs, i), tpbinds, rbinds, rk, hv)
+      [resolved, ...resolve_tycon_args(rest, idxs, i + 1, tpbinds, rbinds, rk, hv)]
     }
   }
 }
@@ -4647,19 +4684,19 @@ fn resolve_tycon_args(tas: [TypeExpr], idxs: [Int], i: Int,
 # `rbinds`, table-independent. The carrier shares its row-var id with
 # the ctor field's `/ e`, so the head slot and the function row are the
 # same generalised row var.
-fn resolve_tycon_arg(t: TypeExpr, is_row: Bool, tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry]) : Ty {
+fn resolve_tycon_arg(t: TypeExpr, is_row: Bool, tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry], hv: TyHomeView) : Ty {
   match t.tkind {
     TyName(name, tas) ->
       match tas {
         [] -> match inf_rvbind_lookup(rbinds, name) {
           Some(id) -> row_arg_carrier(row_with_tail(id))
           None     -> if is_row { inf_resolve_row_arg(t) }
-                      else { resolve_ty_with_binds_rk(t, tpbinds, rbinds, rk) }
+                      else { resolve_ty_with_binds_hv(t, tpbinds, rbinds, rk, hv) }
         }
-        _ -> resolve_ty_with_binds_rk(t, tpbinds, rbinds, rk)
+        _ -> resolve_ty_with_binds_hv(t, tpbinds, rbinds, rk, hv)
       }
     TyRow(rexpr) -> row_arg_carrier(row_of_expr_with_binds(rexpr, tpbinds, rbinds))
-    _ -> resolve_ty_with_binds_rk(t, tpbinds, rbinds, rk)
+    _ -> resolve_ty_with_binds_hv(t, tpbinds, rbinds, rk, hv)
   }
 }
 
@@ -4745,9 +4782,13 @@ fn resolve_ty_with_rvbinds(t: TypeExpr, rbinds: [RVBind]) : Ty =
 fn param_ty_with_binds(pm: Param, tpbinds: [TPBind], rbinds: [RVBind]) : Ty =
   param_ty_with_binds_rk(pm, tpbinds, rbinds, [])
 
-fn param_ty_with_binds_rk(pm: Param, tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry]) : Ty {
+fn param_ty_with_binds_rk(pm: Param, tpbinds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry]) : Ty =
+  param_ty_with_binds_hv(pm, tpbinds, rbinds, rk, tsh_view_empty())
+
+fn param_ty_with_binds_hv(pm: Param, tpbinds: [TPBind], rbinds: [RVBind],
+                          rk: [RowKindEntry], hv: TyHomeView) : Ty {
   match pm.ptype {
-    Some(te) -> resolve_ty_with_binds_rk(te, tpbinds, rbinds, rk)
+    Some(te) -> resolve_ty_with_binds_hv(te, tpbinds, rbinds, rk, hv)
     None     -> TyAny
   }
 }
@@ -4795,9 +4836,16 @@ pub fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] = fn_scheme_of_decl_rk(d, [
 # As `fn_scheme_of_decl` but with the per-type row-kind-slot table so a
 # row var sourced only in a `T[..., e, ...]` return position (e.g.
 # `from_list(...) : Stream[t, e]`) is bound + generalised as a row var.
-pub fn fn_scheme_of_decl_rk(d: Decl, row_kind_table: [RowKindEntry]) : Option[TyScheme] {
+pub fn fn_scheme_of_decl_rk(d: Decl, row_kind_table: [RowKindEntry]) : Option[TyScheme] =
+  fn_scheme_of_decl_hv(d, row_kind_table, [])
+
+# As `fn_scheme_of_decl_rk` but stamping each nominal type in the
+# signature with its declaring module, viewed from the decl's own home.
+pub fn fn_scheme_of_decl_hv(d: Decl, row_kind_table: [RowKindEntry],
+                            homes: [TyHomeEntry]) : Option[TyScheme] {
   match d {
-    DFn(_, fname, tparams, params, opt_ret, rexpr, _, _, _, _, fsym) -> {
+    DFn(_, fname, tparams, params, opt_ret, rexpr, _, _, _, dmo, fsym) -> {
+      let hv = tsh_view(homes, dmo)
       # collect row-variable names per decl, allocate small
       # bound ids (0, 1, ...) in order of appearance, build the body
       # type with those ids in tail positions. The scheme generalises
@@ -4819,9 +4867,9 @@ pub fn fn_scheme_of_decl_rk(d: Decl, row_kind_table: [RowKindEntry]) : Option[Ty
       let implicit = collect_implicit_tparams_in_decl(d, tparams)
       let effective_tparams = list_append(tparams, implicit)
       let tpbinds = mk_tpbinds(effective_tparams)
-      let pts = map(params, (p) => param_ty_with_binds_rk(p, tpbinds, rbinds, row_kind_table))
+      let pts = map(params, (p) => param_ty_with_binds_hv(p, tpbinds, rbinds, row_kind_table, hv))
       let ret = match opt_ret {
-        Some(rty) -> resolve_ty_with_binds_rk(rty, tpbinds, rbinds, row_kind_table)
+        Some(rty) -> resolve_ty_with_binds_hv(rty, tpbinds, rbinds, row_kind_table, hv)
         None      -> TyUnit
       }
       # elaboration for pure named callbacks. When a fn
@@ -4980,7 +5028,15 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
 
 fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
                     top_names: [String], rk_table: [RowKindEntry],
-                    tab: SymTab, target: String) : EnvWithArities {
+                    tab: SymTab, target: String) : EnvWithArities =
+  add_decls_loop_hv(env, ar_acc, ds, top_names, rk_table, tab, target, [])
+
+# As `add_decls_loop_rk` but carrying the type-home table, so each
+# signature's nominal types are stamped with their declaring module as
+# the scheme is built rather than after the typer has already unified.
+fn add_decls_loop_hv(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
+                    top_names: [String], rk_table: [RowKindEntry],
+                    tab: SymTab, target: String, homes: [TyHomeEntry]) : EnvWithArities {
   match ds {
     [] -> EnvWithArities { env: env, arities: ar_acc }
     [d, ...rest] -> {
@@ -4995,7 +5051,7 @@ fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # unaffected — the EModCall branch consults the qualified
         # key first and falls back to bare only for core-only
         # schemes registered by `add_core_sigs`.
-        DFn(_, fname, _, _, _, _, _, _, _, mo, fsym) -> match fn_scheme_of_decl_rk(d, rk_table) {
+        DFn(_, fname, _, _, _, _, _, _, _, mo, fsym) -> match fn_scheme_of_decl_hv(d, rk_table, homes) {
           Some(sc) -> {
             let env1 = ty_env_add_sym(env, ty_decl_sym(tab, NCFn, fname, mo, target), fname, sc)
             let env2 = match mo {
@@ -5021,7 +5077,7 @@ fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # redeclaration of `type SplitN = ...`).
         DType(_, dt_name, dt_tparams, _, _, _, _, _, _) -> {
           let env1 = ty_env_add_decl_marker(env, dt_name, list_length(dt_tparams))
-          let env2 = add_variants_of_decl(env1, d, top_names, tab, target)
+          let env2 = add_variants_of_decl(env1, d, top_names, tab, target, tsh_view(homes, None))
           EnvWithArities { env: env2, arities: ar_acc }
         }
         DEffect(_, eff_name, tparams, ops, _, _, _, emo, _) -> {
@@ -5049,20 +5105,20 @@ fn add_decls_loop_rk(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # as a bare `DFn` would be, then record its `type -> (home, fn)`
         # binding so `try_constructor_call` can desugar `Type(args)`.
         DProtoLaws(_, inner, cl, cc, _) -> {
-          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table, tab, target)
+          let r = add_decls_loop_hv(env, ar_acc, [inner], top_names, rk_table, tab, target, homes)
           EnvWithArities { env: register_constructor(r.env, inner, cl, cc), arities: r.arities }
         }
         DImplAxiom(_, inner, cl, cc, _) -> {
-          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table, tab, target)
+          let r = add_decls_loop_hv(env, ar_acc, [inner], top_names, rk_table, tab, target, homes)
           EnvWithArities { env: register_constructor(r.env, inner, cl, cc), arities: r.arities }
         }
         DConstructor(inner, cl, cc) -> {
-          let r = add_decls_loop_rk(env, ar_acc, [inner], top_names, rk_table, tab, target)
+          let r = add_decls_loop_hv(env, ar_acc, [inner], top_names, rk_table, tab, target, homes)
           EnvWithArities { env: register_constructor(r.env, inner, cl, cc), arities: r.arities }
         }
         _ -> EnvWithArities { env: env, arities: ar_acc }
       }
-      add_decls_loop_rk(r.env, r.arities, rest, top_names, rk_table, tab, target)
+      add_decls_loop_hv(r.env, r.arities, rest, top_names, rk_table, tab, target, homes)
     }
   }
 }
@@ -5115,7 +5171,7 @@ fn ctor_add(env: TyEnv, entry: CtorEntry, l: Int, c: Int) : TyEnv =
   TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions,
           constructors: [entry, ...env.constructors],
           head_owners: env.head_owners, root_fns: env.root_fns,
-          row_kind: env.row_kind, index: env.index, vindex: env.vindex, sindex: env.sindex }
+          row_kind: env.row_kind, ty_homes: env.ty_homes, index: env.index, vindex: env.vindex, sindex: env.sindex }
 
 # Collect every `#[constructor]` binding in a decl stream. Used to
 # seed a module's `ModuleEnvDelta` so downstream modules inherit the
@@ -5315,7 +5371,8 @@ fn build_ty_env_module(seed: BuiltEnv, decls: [Decl],
   let env_with_unions = TyEnv {
     entries: seed.env.entries, fresh: seed.env.fresh, unions: unions, constructors: seed.env.constructors,
     head_owners: seed.env.head_owners, root_fns: seed.env.root_fns,
-    row_kind: compute_row_kind_slots(decls), index: seed.env.index, vindex: seed.env.vindex,
+    row_kind: compute_row_kind_slots(decls), ty_homes: tsh_collect(decls),
+    index: seed.env.index, vindex: seed.env.vindex,
     sindex: seed.env.sindex
   }
   let r = add_decls_loop(env_with_unions, seed.op_eff_arities, decls, top_names)
@@ -5349,7 +5406,17 @@ fn build_ty_env_inherited(seed: BuiltEnv, inherited: ModuleEnvDelta,
 fn build_ty_env_inherited_rk(seed: BuiltEnv, inherited: ModuleEnvDelta,
                             decls: [Decl], unions: [UnionInfo],
                             top_names: [String], rk_table: [RowKindEntry],
-                            tab: SymTab, target: String) : BuiltEnv {
+                            tab: SymTab, target: String) : BuiltEnv =
+  build_ty_env_inherited_hv(seed, inherited, decls, unions, top_names,
+                            rk_table, tab, target, tsh_collect(decls))
+
+# As `build_ty_env_inherited_rk` but with the type-home table supplied
+# by the caller, which alone knows the whole-program decl stream.
+fn build_ty_env_inherited_hv(seed: BuiltEnv, inherited: ModuleEnvDelta,
+                            decls: [Decl], unions: [UnionInfo],
+                            top_names: [String], rk_table: [RowKindEntry],
+                            tab: SymTab, target: String,
+                            homes: [TyHomeEntry]) : BuiltEnv {
   # `inherited.ty_entries` are newer than the seed (prepended at head).
   # Prepend them onto BOTH the seed entries and the seed index in one
   # pass, sharing each entry exactly as `ty_env_add` does -- never
@@ -5360,11 +5427,15 @@ fn build_ty_env_inherited_rk(seed: BuiltEnv, inherited: ModuleEnvDelta,
       entries: seeded_entries, fresh: seed.env.fresh, unions: unions,
       constructors: list_append(inherited.constructors, seed.env.constructors),
       head_owners: seed.env.head_owners, root_fns: seed.env.root_fns,
-      row_kind: rk_table, index: seeded_index, vindex: seeded_vindex, sindex: seed.env.sindex
+      row_kind: rk_table, ty_homes: homes,
+      index: seeded_index, vindex: seeded_vindex, sindex: seed.env.sindex
     }
   }
   let ar_in = list_append(inherited.op_eff_arities, seed.op_eff_arities)
-  let r = add_decls_loop_rk(env_in, ar_in, decls, top_names, rk_table, tab, target)
+  # The table spans the decls this env is built from, so a signature in
+  # one module resolves a type declared in another exactly as the record
+  # table does for a literal.
+  let r = add_decls_loop_hv(env_in, ar_in, decls, top_names, rk_table, tab, target, homes)
   BuiltEnv { env: r.env, core_len: seed.core_len,
              op_eff_arities: r.arities }
 }
@@ -7137,9 +7208,12 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
         # lists ensure we are looking at bare nominal types, not
         # generic instances. No chains: only the immediate parent
         # accepts.
-        # Union upcast: module must match too (a union accepts variants
-        # declared in the same module, not same-name types from elsewhere).
-        else if option_str_eq(am, bm) and list_length(aa) == 0 and list_length(ba) == 0 and list_has(variants_of_type(env, an), bn) { Some(s) }
+        # The two homes are deliberately not compared: `type Both =
+        # ua.Cfg | ub.Cfg` lists components another module declares, so
+        # the union's home and its component's are unrelated. Membership
+        # in the parent's component list is what authorises the lift,
+        # and that list already names one declaration each.
+        else if list_length(aa) == 0 and list_length(ba) == 0 and list_has(variants_of_type(env, an), bn) { Some(s) }
         else { None }
       }
       # a bare named record on the LHS unifies with the
@@ -7267,7 +7341,7 @@ fn shape_bind(sv: Int, wit: Ty, arg: Ty, s: Subst) : Option[Subst] / Mutable =
 # id. The env's `fresh` counter advances by one per bound var.
 
 fn fresh_var(env: TyEnv) : TyEnv =
-  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index, vindex: env.vindex, sindex: env.sindex }
+  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, ty_homes: env.ty_homes, index: env.index, vindex: env.vindex, sindex: env.sindex }
 
 fn advance_fresh(env: TyEnv, n: Int) : TyEnv =
   if n <= 0 { env } else { advance_fresh(fresh_var(env), n - 1) }
@@ -7304,7 +7378,7 @@ fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if env.fresh >= need { env.fresh } else { need }
-      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index, vindex: env.vindex, sindex: env.sindex }
+      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, root_fns: env.root_fns, row_kind: env.row_kind, ty_homes: env.ty_homes, index: env.index, vindex: env.vindex, sindex: env.sindex }
       let sub = mk_fresh_subst(vars, start)
       Instantiated { env: env1, ty: apply_ty(sub, body) }
     }
@@ -8778,15 +8852,21 @@ fn tycon_name_or_empty(t: Ty) : String {
 # zero-arg variants of `U`, so a value of type `A` lifts to `U`.
 fn union_upcast_ok(env: TyEnv, expected: Ty, found: Ty) : Bool {
   match expected {
-    TyCon(em, u_name, u_args) -> match found {
-      TyCon(fm, t_name, t_args) -> {
+    TyCon(_, u_name, u_args) -> match found {
+      TyCon(_, t_name, t_args) -> {
         # An upcast lifts a component into a DIFFERENT parent, between
         # bare nominal heads only. Without the self-name guard, a sum
         # type whose variant repeats the type's name upcasts to itself
         # and swallows an argument mismatch (`Box[String]` vs `Box[Int]`).
+        #
+        # The two homes are deliberately not compared: a union lists
+        # components another module declares (`type Both = ua.Cfg |
+        # ub.Cfg`), so the parent's home and the component's are
+        # unrelated. Membership in the parent's component list is what
+        # authorises the lift, and that list already names one
+        # declaration each.
         if t_name == u_name { false }
         else if list_length(u_args) > 0 or list_length(t_args) > 0 { false }
-        else if not option_str_eq(em, fm) { false }
         else { list_has(variants_of_type(env, u_name), t_name) }
       }
       _ -> false
@@ -8892,7 +8972,7 @@ fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes / Mutable {
 fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
   InferState {
     file: outer.file,
-    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions, constructors: outer.env.constructors, head_owners: outer.env.head_owners, root_fns: outer.env.root_fns, row_kind: outer.env.row_kind, index: outer.env.index, vindex: outer.env.vindex, sindex: outer.env.sindex },
+    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions, constructors: outer.env.constructors, head_owners: outer.env.head_owners, root_fns: outer.env.root_fns, row_kind: outer.env.row_kind, ty_homes: outer.env.ty_homes, index: outer.env.index, vindex: outer.env.vindex, sindex: outer.env.sindex },
     core_len: outer.core_len,
     sub: inner.sub,
     recs: inner.recs,
@@ -8920,7 +9000,7 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
 
 fn param_ty_or_fresh(st: InferState, pm: Param) : TyRes {
   match pm.ptype {
-    Some(te) -> ty_res(st, inf_resolve_ty(te))
+    Some(te) -> ty_res(st, inf_resolve_ty_hv(te, tsh_view(st.env.ty_homes, None)))
     None     -> st_fresh_ty(st)
   }
 }
@@ -13017,7 +13097,7 @@ fn modules_declaring_type(modules: [ModuleEntry], head: String,
 # right before the typer runs.
 fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
   TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors,
-          head_owners: hos, root_fns: env.root_fns, row_kind: env.row_kind, index: env.index, vindex: env.vindex, sindex: env.sindex }
+          head_owners: hos, root_fns: env.root_fns, row_kind: env.row_kind, ty_homes: env.ty_homes, index: env.index, vindex: env.vindex, sindex: env.sindex }
 
 # attach the set of root-file (user) function names to the
 # env. A root `fn foo` unconditionally shadows a stdlib `pub fn foo`;
@@ -13026,7 +13106,7 @@ fn ty_env_with_head_owners(env: TyEnv, hos: [HeadOwnerEntry]) : TyEnv =
 # export exactly. Seeded once per compile.
 fn ty_env_with_root_fns(env: TyEnv, rfns: [String]) : TyEnv =
   TyEnv { entries: env.entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors,
-          head_owners: env.head_owners, root_fns: rfns, row_kind: env.row_kind, index: env.index, vindex: env.vindex, sindex: env.sindex }
+          head_owners: env.head_owners, root_fns: rfns, row_kind: env.row_kind, ty_homes: env.ty_homes, index: env.index, vindex: env.vindex, sindex: env.sindex }
 
 # collect the bare names of root-file (`mo = None`)
 # functions from the full program decl stream. Imported / core decls
@@ -19172,7 +19252,10 @@ type ProgramData = {
   recs:       [RecInfo],
   alias_res:  AliasResolution,
   op_to_eff:  [OpToEff],
-  sums:       [SumInfo]
+  sums:       [SumInfo],
+  # the whole-program type-home table this module's tables were
+  # stamped from; the delta below stamps its own from the same one.
+  homes:      [TyHomeEntry]
 }
 
 # variant that seeds the working tables from an
@@ -19215,9 +19298,6 @@ fn collect_program_data_inherited(file: String, df: DiagFiles, decls: [Decl],
   # top of the built-in seed; collect unions across the inherited
   # set + this module so cross-module variant lookups still resolve.
   let seed = build_ty_env_seed()
-  let unions_here = collect_unions(decls_a)
-  let unions_all = list_append(unions_here, inherited.unions)
-  let top_names = collect_top_type_names(decls_a)
   # row-kind table over the FULL program decl stream so a
   # `T[..., e]` annotation in one module resolves the row slot of a
   # type declared in another (a root `fn : Stream[t, e]` against
@@ -19226,9 +19306,19 @@ fn collect_program_data_inherited(file: String, df: DiagFiles, decls: [Decl],
     all_program_decls
   } else { decls_a }
   let rk_table = compute_row_kind_slots(rk_src_decls)
-  let built = build_ty_env_inherited_rk(seed, inherited, decls_a,
+  # The type-home table spans the same whole-program stream: a name this
+  # module declares once may be declared again elsewhere, and only the
+  # full stream shows that. Every structure carrying a nominal head is
+  # stamped from this one view, so the annotation side, the constructor
+  # schemes and the union components agree on a type's home.
+  let homes = tsh_collect(rk_src_decls)
+  let hview = tsh_view(homes, None)
+  let unions_here = collect_unions_hv(decls_a, hview)
+  let unions_all = list_append(unions_here, inherited.unions)
+  let top_names = collect_top_type_names(decls_a)
+  let built = build_ty_env_inherited_hv(seed, inherited, decls_a,
                                        unions_all, top_names, rk_table, tab,
-                                       module_name_of_path(file))
+                                       module_name_of_path(file), homes)
   let recs_here = collect_records(decls_a)
   let recs_all = list_append(recs_here, inherited.recs)
   # rebuild the type-alias resolution table here so
@@ -19257,7 +19347,8 @@ fn collect_program_data_inherited(file: String, df: DiagFiles, decls: [Decl],
   let sums_all = list_append(sums_here, inherited.sums)
   ProgramData {
     decls_a: decls_a, built: built, recs: recs_all,
-    alias_res: alias_res, op_to_eff: op_to_eff_all, sums: sums_all
+    alias_res: alias_res, op_to_eff: op_to_eff_all, sums: sums_all,
+    homes: homes
   }
 }
 
@@ -19326,7 +19417,8 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
                           op_eff_arities: data0.built.op_eff_arities }
   let data = ProgramData { decls_a: data0.decls_a, built: built1,
                             recs: data0.recs, alias_res: data0.alias_res,
-                            op_to_eff: data0.op_to_eff, sums: data0.sums }
+                            op_to_eff: data0.op_to_eff, sums: data0.sums,
+                            homes: data0.homes }
   # Hanga Roa modular typecheck: `infer_all_loop` keeps a per-decl
   # `all_decls` pointer so `check_main_row_handlable` /
   # `check_body_row` can look up `DEffect default { ... }` blocks
@@ -19392,7 +19484,7 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
   let delta = ModuleEnvDelta {
     name:           mod.name,
     ty_entries:     new_entries,
-    unions:         collect_unions(data.decls_a),
+    unions:         collect_unions_hv(data.decls_a, tsh_view(data.homes, None)),
     op_eff_arities: new_arities,
     recs:           collect_records(data.decls_a),
     sums:           collect_sums(data.decls_a),
@@ -19919,7 +20011,7 @@ fn synth_find_arg(scope: [TyEntry], want: Ty, fresh: Int, avoid: [String], sub: 
       if list_has_string(avoid, te.name) or (not synth_return_structural(te.scheme)) {
         synth_find_arg(rest, want, fresh, avoid, sub)
       } else {
-        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
+        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], ty_homes: [], index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
         match unify(inst.ty, want, sub) {
           Some(sub1) -> Some(ArgMatch { name: te.name, sub: sub1, fresh: inst.env.fresh })
           None       -> synth_find_arg(rest, want, fresh, avoid, sub)
@@ -19948,7 +20040,7 @@ fn synth_find_args(scope: [TyEntry], params: [Ty], fresh: Int, avoid: [String],
 # Try entry `te` as a direct match or a 1-level application against
 # `expected`. Returns rendered candidate text or None.
 fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int) : Option[String] / Mutable {
-  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
+  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], ty_homes: [], index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
   match unify(inst.ty, expected, subst_empty()) {
     Some(_) -> Some(te.name)
     None    -> match inst.ty {
