@@ -41,12 +41,17 @@ pub type TfPlan = TfP([String], Option[String])
 # The group identity every retarget site tests against: member names in
 # discriminant order, the fused entry's lead name, the shared arity, and
 # the module the group lives in.
-type TfCtx = TfCtx([String], String, Int, Option[String])
+# The group's member names, the fused entry's name, its arity, the
+# module the group lives in, and the ids of the member declarations —
+# a resolved call names one of them outright, so the (name, module)
+# walk is only what an unresolved call falls back to.
+type TfCtx = TfCtx([String], String, Int, Option[String], [SymId])
 
-fn tfctx_names(c: TfCtx) : [String] = match c { TfCtx(ns, _, _, _) -> ns }
-fn tfctx_lead(c: TfCtx) : String = match c { TfCtx(_, l, _, _) -> l }
-fn tfctx_arity(c: TfCtx) : Int = match c { TfCtx(_, _, a, _) -> a }
-fn tfctx_mo(c: TfCtx) : Option[String] = match c { TfCtx(_, _, _, m) -> m }
+fn tfctx_names(c: TfCtx) : [String] = match c { TfCtx(ns, _, _, _, _) -> ns }
+fn tfctx_lead(c: TfCtx) : String = match c { TfCtx(_, l, _, _, _) -> l }
+fn tfctx_arity(c: TfCtx) : Int = match c { TfCtx(_, _, a, _, _) -> a }
+fn tfctx_mo(c: TfCtx) : Option[String] = match c { TfCtx(_, _, _, m, _) -> m }
+fn tfctx_syms(c: TfCtx) : [SymId] = match c { TfCtx(_, _, _, _, ss) -> ss }
 
 #[doc("The name of the fused function minted for the group whose lowest-indexed member is `lead`. The name is derived from the member's own name so a group in a module lands beside it, and carries a prefix no source identifier can spell.")]
 pub fn tailfuse_name(lead: String) : String = cat2("__kai_fused_", lead)
@@ -225,16 +230,29 @@ fn tf_int_ty(ln: Int, cl: Int) : TypeExpr =
 fn tf_dispatch_body(members: [Decl], names: [String], lname: String,
                     params: [Param], mo: Option[String], ln: Int, cl: Int) : Expr =
   mk_expr(EMatch(mk_ref(tailfuse_tag_param(), ln, cl),
-                 tf_dispatch_arms(members, names, lname, params, mo, 0)), ln, cl)
+                 tf_dispatch_arms(members, names, lname, params, mo,
+                                  tf_member_syms(members), 0)), ln, cl)
+
+# The id of each member declaration, positionally aligned with `names`.
+fn tf_member_syms(ms: [Decl]) : [SymId] = match ms {
+  [] -> []
+  [d, ...rest] -> [tf_decl_sym(d), ...tf_member_syms(rest)]
+  _ -> []
+}
+
+fn tf_decl_sym(d: Decl) : SymId = match d {
+  DFn(_, _, _, _, _, _, _, _, _, _, fsym) -> fsym
+  _ -> sym_none()
+}
 
 fn tf_dispatch_arms(members: [Decl], names: [String], lname: String,
-                    params: [Param], mo: Option[String], i: Int) : [Arm] {
+                    params: [Param], mo: Option[String], syms: [SymId], i: Int) : [Arm] {
   match members {
     [] -> []
     [d, ...rest] -> {
       let last = list_is_empty(rest)
-      [tf_arm_for(d, names, lname, params, mo, i, last),
-       ...tf_dispatch_arms(rest, names, lname, params, mo, i + 1)]
+      [tf_arm_for(d, names, lname, params, mo, syms, i, last),
+       ...tf_dispatch_arms(rest, names, lname, params, mo, syms, i + 1)]
     }
     _ -> []
   }
@@ -243,11 +261,11 @@ fn tf_dispatch_arms(members: [Decl], names: [String], lname: String,
 # The final arm is the catch-all so the match is total without relying
 # on the discriminant's range being known to the checker.
 fn tf_arm_for(d: Decl, names: [String], lname: String, params: [Param],
-              mo: Option[String], i: Int, last: Bool) : Arm {
+              mo: Option[String], syms: [SymId], i: Int, last: Bool) : Arm {
   match d {
     DFn(_, _, _, mparams, _, _, body, ln, cl, _, _) ->
       Arm(tf_arm_pattern(i, last, ln, cl), None,
-          tf_retarget(tfsubst_rename_params(body, mparams, params), names, lname, params, mo))
+          tf_retarget(tfsubst_rename_params(body, mparams, params), names, lname, params, mo, syms))
     _ -> Arm(tf_arm_pattern(i, last, 0, 0), None, mk_expr(EUnit, 0, 0))
   }
 }
@@ -322,8 +340,8 @@ fn tf_param_args(params: [Param], ln: Int, cl: Int) : [Expr] = match params {
 # with the member's discriminant prepended; that is the call the
 # self-tail rewrite later turns into a jump.
 fn tf_retarget(body: Expr, names: [String], lead: String,
-               params: [Param], mo: Option[String]) : Expr =
-  tf_retarget_in(body, TfCtx(names, lead, list_length(params), mo), [])
+               params: [Param], mo: Option[String], syms: [SymId]) : Expr =
+  tf_retarget_in(body, TfCtx(names, lead, list_length(params), mo, syms), [])
 
 # `scope` carries the names an enclosing binder rebound: a local
 # shadowing a member's name is not that member, so a call through it
@@ -389,7 +407,14 @@ fn tf_retarget_call(k: ExprKind, f: Expr, xs: [Expr], ctx: TfCtx,
 
 fn tf_member_index(fk: ExprKind, argc: Int, ctx: TfCtx, scope: [String]) : Option[Int] {
   if argc != tfctx_arity(ctx) { None }
-  else { match sym_read_kind(fk) {
+  else { match fk {
+    # A resolved call names one declaration: the member is found by id,
+    # with no (name, module) pair to agree on. A local shadowing a
+    # member stays an `EVar`, so an id here is never a local.
+    ESym(s, n)      -> match tf_sym_index(tfctx_syms(ctx), s, 0) {
+                         Some(i) -> Some(i)
+                         None    -> tf_lookup_member(n, ctx, scope)
+                       }
     EVar(n)         -> tf_lookup_member(n, ctx, scope)
     EModCall(cm, n) ->
       if tf_mod_is_own(cm, tfctx_mo(ctx)) { tf_lookup_member(n, ctx, scope) } else { None }
@@ -399,6 +424,16 @@ fn tf_member_index(fk: ExprKind, argc: Int, ctx: TfCtx, scope: [String]) : Optio
 
 fn tf_lookup_member(n: String, ctx: TfCtx, scope: [String]) : Option[Int] =
   if list_has(scope, n) { None } else { tf_name_index(tfctx_names(ctx), n, 0) }
+
+# The group member a resolved call reaches. Members the resolver never
+# stamped carry no id and never match.
+fn tf_sym_index(syms: [SymId], s: SymId, i: Int) : Option[Int] = match syms {
+  [] -> None
+  [h, ...rest] ->
+    if sym_raw(h) >= 0 and sym_raw(h) == sym_raw(s) { Some(i) }
+    else { tf_sym_index(rest, s, i + 1) }
+  _ -> None
+}
 
 fn tf_name_index(names: [String], n: String, i: Int) : Option[Int] = match names {
   [] -> None
