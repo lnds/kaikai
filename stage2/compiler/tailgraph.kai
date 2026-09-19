@@ -29,8 +29,8 @@ pattern): it does not mutate the AST.
 import compiler.ast
 import compiler.util
 
-#[doc("One node of the tail-call graph: a top-level function's name, its module origin, and its arity. Arity is carried because a call whose argument count differs from the declaration is not a tail call the rewrite can fuse.")]
-pub type TgNode = TgN(String, Option[String], Int)
+#[doc("One node of the tail-call graph: a top-level function's name, its module origin, its arity, and the id of the declaration it stands for. Arity is carried because a call whose argument count differs from the declaration is not a tail call the rewrite can fuse; the id is what a resolved call matches on, so two same-named functions are two nodes whatever they spell.")]
+pub type TgNode = TgN(String, Option[String], Int, SymId)
 
 #[doc("A tail-call edge from the node at index `from` to the node at index `to`, both indices into the node list `tailgraph_nodes` returned.")]
 pub type TgEdge = TgE(Int, Int)
@@ -42,10 +42,12 @@ pub type TailGraph = TG([TgNode], [TgEdge])
 pub type TgGroup = TgGrp([Int])
 
 #[doc("The declared name of a tail-call graph node.")]
-pub fn tgnode_name(n: TgNode) : String = match n { TgN(nm, _, _) -> nm }
+pub fn tgnode_name(n: TgNode) : String = match n { TgN(nm, _, _, _) -> nm }
 #[doc("The module a tail-call graph node belongs to; `None` for the root file.")]
-pub fn tgnode_mo(n: TgNode) : Option[String] = match n { TgN(_, mo, _) -> mo }
-fn tgnode_arity(n: TgNode) : Int = match n { TgN(_, _, a) -> a }
+pub fn tgnode_mo(n: TgNode) : Option[String] = match n { TgN(_, mo, _, _) -> mo }
+fn tgnode_arity(n: TgNode) : Int = match n { TgN(_, _, a, _) -> a }
+
+fn tgnode_sym(n: TgNode) : SymId = match n { TgN(_, _, _, s) -> s }
 #[doc("The node indices making up a mutually recursive group, in ascending order.")]
 pub fn tggroup_members(g: TgGroup) : [Int] = match g { TgGrp(xs) -> xs }
 #[doc("The nodes of a tail-call graph, in declaration order.")]
@@ -77,7 +79,7 @@ fn tg_collect_nodes(decls: [Decl]) : [TgNode] = match decls {
 }
 
 fn tg_node_of_decl(d: Decl) : Option[TgNode] = match d {
-  DFn(_, name, _, params, _, _, _, _, _, mo, _) -> Some(TgN(name, mo, list_length(params)))
+  DFn(_, name, _, params, _, _, _, _, _, mo, fsym) -> Some(TgN(name, mo, list_length(params), fsym))
   _ -> None
 }
 
@@ -204,7 +206,12 @@ fn tg_pattern_binds(p: Pattern, target: String) : Bool = match p.pkind {
 
 fn tg_call_target(fk: ExprKind, argc: Int, mo: Option[String],
                   nodes: [TgNode], scope: [String]) : [Int] {
-  match sym_read_kind(fk) {
+  match fk {
+    # A resolved callee names one declaration, so the node is found by
+    # id and no (name, module) pair has to agree. A local binder still
+    # shadows: the resolver leaves a local as an `EVar`, so an id here
+    # is never one.
+    ESym(s, callee) -> tg_resolve_sym(s, callee, mo, argc, nodes, scope)
     EVar(callee) -> tg_resolve_in(callee, mo, argc, nodes, scope)
     EModCall(callmod, callee) ->
       if tg_modcall_is_own(callmod, mo) { tg_resolve_in(callee, mo, argc, nodes, scope) }
@@ -213,6 +220,26 @@ fn tg_call_target(fk: ExprKind, argc: Int, mo: Option[String],
   }
 }
 
+
+fn tg_resolve_sym(s: SymId, callee: String, mo: Option[String], argc: Int,
+                  nodes: [TgNode], scope: [String]) : [Int] {
+  if list_has(scope, callee) { [] }
+  else {
+    let i = tg_find_sym(nodes, s, 0)
+    if i < 0 { tg_resolve_in(callee, mo, argc, nodes, scope) }
+    else { tg_arity_ok(nodes, i, argc) }
+  }
+}
+
+# A node whose declaration is the one the call resolved to. Nodes built
+# from decls the resolver never stamped carry no id and never match.
+fn tg_find_sym(ns: [TgNode], s: SymId, i: Int) : Int = match ns {
+  [] -> 0 - 1
+  [n, ...rest] ->
+    if sym_raw(tgnode_sym(n)) >= 0 and sym_raw(tgnode_sym(n)) == sym_raw(s) { i }
+    else { tg_find_sym(rest, s, i + 1) }
+  _ -> 0 - 1
+}
 
 fn tg_resolve_in(callee: String, mo: Option[String], argc: Int,
                  nodes: [TgNode], scope: [String]) : [Int] {
