@@ -1,0 +1,101 @@
+#[doc("""
+The module declaring each nominal type name, as a scheme-build-time
+table.
+
+`resolve_ty_with_binds` turns a signature's `TypeExpr` into a `Ty`
+before the record and sum tables exist, so it leaves every `TyCon`'s
+module slot empty. A literal built in the same module goes through
+`rec_instantiate`, which does know the home and stamps it. The two
+sides of one type then disagree — `fn swap(p: Pair[a, b])` carries an
+empty slot while the `Pair { ... }` in its body carries `tuple` — and
+unification has to treat an empty slot as compatible with every home
+to let them meet. That permissiveness is what stops the slot from
+separating two same-named types.
+
+This table closes the gap at the annotation side: it maps a type name
+to the module declaring it, built from the same decl stream the record
+table is, so the slot is populated where the `TyCon` is first built
+rather than patched afterwards.
+
+A name the whole stream declares more than once resolves to nothing:
+the table cannot say which declaration a bare use meant, so the slot
+stays empty and the permissive rule still carries it. Contested names
+reach the typer home-spelled (`Cfg__ua`) and so are unique here, each
+resolving to its own declaration.
+""")]
+
+import compiler.util
+import compiler.ast
+
+#[doc("One nominal type declaration: the name it spells and the module declaring it.")]
+pub type TyHomeEntry = THE(String, Option[String])
+
+#[doc("The declaring module of every nominal type in `ds`. Aliases are absent: they are expanded before a slot could be read.")]
+pub fn tsh_collect(ds: [Decl]) : [TyHomeEntry] = tsh_loop(ds, [])
+
+fn tsh_loop(ds: [Decl], acc: [TyHomeEntry]) : [TyHomeEntry] = match ds {
+  [] -> acc
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> tsh_loop([inner, ...rest], acc)
+    None -> match d {
+      DType(_, nm, _, body, _, _, mo, _, _) -> match body {
+        TBAlias(_)       -> tsh_loop(rest, acc)
+        TBEffectAlias(_) -> tsh_loop(rest, acc)
+        _                -> tsh_loop(rest, tsh_record(acc, nm, mo))
+      }
+      _ -> tsh_loop(rest, acc)
+    }
+  }
+}
+
+# A core segment is re-injected alongside its own declaration, so the
+# same pair arrives twice; recording it once keeps the uniqueness test
+# in `tsh_home_of` meaningful.
+fn tsh_record(acc: [TyHomeEntry], nm: String, mo: Option[String]) : [TyHomeEntry] =
+  if tsh_has(acc, nm, mo) { acc } else { [THE(nm, mo), ...acc] }
+
+fn tsh_has(hs: [TyHomeEntry], nm: String, mo: Option[String]) : Bool = match hs {
+  [] -> false
+  [THE(n, m), ...rest] ->
+    if n == nm and tsh_same(m, mo) { true } else { tsh_has(rest, nm, mo) }
+}
+
+fn tsh_same(a: Option[String], b: Option[String]) : Bool = match a {
+  None    -> match b { None -> true   Some(_) -> false }
+  Some(x) -> match b { None -> false  Some(y) -> x == y }
+}
+
+#[doc("The table paired with the module whose signature is being resolved: what a bare type name in that module denotes.")]
+pub type TyHomeView = THV([TyHomeEntry], Option[String])
+
+#[doc("The view that stamps nothing, for callers resolving a type outside any module's signature.")]
+pub fn tsh_view_empty() : TyHomeView = THV([], None)
+
+#[doc("The view of `hs` from the module `cur`.")]
+pub fn tsh_view(hs: [TyHomeEntry], cur: Option[String]) : TyHomeView = THV(hs, cur)
+
+#[doc("The module slot a bare `nm` carries under `v`, empty when the view cannot name one declaration.")]
+pub fn tsh_slot(v: TyHomeView, nm: String) : Option[String] =
+  match v { THV(hs, _) -> tsh_home_of(hs, nm) }
+
+#[doc("A nominal type from a name the source wrote, with its module slot decided by `v`. The one place a `TyCon` whose name is not a core literal is built.")]
+pub fn tsh_tycon(v: TyHomeView, nm: String, args: [Ty]) : Ty =
+  TyCon(tsh_slot(v, nm), nm, args)
+
+#[doc("The module declaring `nm`, or nothing when the decl stream does not settle it on the name alone.")]
+pub fn tsh_home_of(hs: [TyHomeEntry], nm: String) : Option[String] =
+  tsh_scan(hs, nm, None, 0)
+
+# Only a name the whole stream declares exactly once is stamped: a name
+# with two declarations leaves the reader nothing to pick between, and
+# a wrong home is worse than none. One declaration is one home whichever
+# module is looking, so the reading module never overrides.
+fn tsh_scan(hs: [TyHomeEntry], nm: String,
+            found: Option[String], n: Int) : Option[String] =
+  match hs {
+    [] -> if n == 1 { found } else { None }
+    [THE(hn, hm), ...rest] ->
+      if hn != nm { tsh_scan(rest, nm, found, n) }
+      else if n >= 1 { None }
+      else { tsh_scan(rest, nm, hm, n + 1) }
+  }

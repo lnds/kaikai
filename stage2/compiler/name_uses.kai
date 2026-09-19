@@ -17,6 +17,7 @@ import compiler.modules
 import compiler.scope_walk
 import compiler.kinds
 import compiler.decl_names
+import compiler.symtab
 import compiler.name_contest
 
 #[doc("One contested reference: `NUse(class, name, line, col, op)`. `op` is the operation a protocol was reached through, else empty.")]
@@ -32,8 +33,14 @@ pub fn nu_scan(decls: [Decl], t: [NEnt], target: String, ds: [NDisp],
 #[doc("`nu_scan` under the selective imports the root file wrote; a picked name is settled and never reported.")]
 pub fn nu_scan_picks(decls: [Decl], t: [NEnt], target: String, ds: [NDisp],
       core: [String], picks: [NPick]) : [NUse] =
+  nu_scan_tab(decls, t, target, ds, core, picks, st_empty())
+
+#[doc("`nu_scan_picks` against the resolver's table, so a reference that carries an id is read from its declaration rather than re-derived from its spelling. An empty table reports every reference by name, as the scans that run before resolve must.")]
+pub fn nu_scan_tab(decls: [Decl], t: [NEnt], target: String, ds: [NDisp],
+      core: [String], picks: [NPick], tab: SymTab) : [NUse] =
   list_reverse(nu_decls(decls,
-    NuCx { t: t, target: target, ds: ds, core: core, picks: picks, tps: [] }, []))
+    NuCx { t: t, target: target, ds: ds, core: core, picks: picks, tps: [],
+           tab: tab }, []))
 
 #[doc("The contested constant references of the root file, under the selective imports it wrote. Scanned before module scoping keys them: a keyed read no longer shows its bare spelling.")]
 pub fn nu_scan_consts(decls: [Decl], target: String, picks: [NPick]) : [NUse] =
@@ -60,7 +67,11 @@ pub fn nu_merge(a: [NUse], b: [NUse]) : [NUse] = match b {
 # and the type parameters the enclosing signature binds — a bound
 # parameter is not a declaration any module contests.
 type NuCx = { t: [NEnt], target: String, ds: [NDisp], core: [String],
-              picks: [NPick], tps: [String] }
+              picks: [NPick], tps: [String],
+              # the resolver's table, for references that carry an id:
+              # the class is read from the declaration the resolver
+              # settled instead of guessed back from the spelling.
+              tab: SymTab }
 
 fn nu_decls(ds: [Decl], cx: NuCx, acc: [NUse]) : [NUse] =
   match ds {
@@ -95,7 +106,7 @@ fn nu_decl(d: Decl, cx: NuCx, acc: [NUse]) : [NUse] = match d {
 
 fn nu_bind(cx: NuCx, tps: [String]) : NuCx =
   NuCx { t: cx.t, target: cx.target, ds: cx.ds, core: cx.core,
-         picks: cx.picks, tps: list_append(cx.tps, tps) }
+         picks: cx.picks, tps: list_append(cx.tps, tps), tab: cx.tab }
 
 fn nu_params(ps: [Param], cx: NuCx, acc: [NUse]) : [NUse] =
   match ps {
@@ -156,16 +167,33 @@ fn nu_row_hit(n: String, targs: [TypeExpr], cx: NuCx, acc: [NUse]) : [NUse] = ma
 # protocol. A name in none of these is a function, already covered by
 # its own reporter.
 fn nu_expr(e: Expr, cx: NuCx, acc: [NUse]) : [NUse] = {
-  let here = match sym_read_kind(e.kind) {
+  let here = match e.kind {
     EVar(n)     -> nu_name_hit(n, e.line, e.col, false, cx, acc)
-    ECall(c, _) -> match sym_read_kind(c.kind) {
-      EVar(n) -> nu_name_hit(n, c.line, c.col, true, cx, acc)
-      _       -> acc
+    ESym(s, n)  -> nu_sym_hit(s, n, e.line, e.col, false, cx, acc)
+    ECall(c, _) -> match c.kind {
+      EVar(n)    -> nu_name_hit(n, c.line, c.col, true, cx, acc)
+      ESym(s, n) -> nu_sym_hit(s, n, c.line, c.col, true, cx, acc)
+      _          -> acc
     }
     _ -> acc
   }
   nu_positions(xp_positions(e), cx, here)
 }
+
+# A reference that carries an id still reports: the resolver stamps one
+# even where the bare name is ambiguous, so the id says which
+# declaration was picked, not that the pick was unambiguous. What the
+# id does settle is the CLASS — the name is reported as the kind of
+# declaration it actually reaches, instead of the spelling being tried
+# against constructor, then function, then constant in that order.
+fn nu_sym_hit(s: SymId, name: String, line: Int, col: Int, called: Bool,
+      cx: NuCx, acc: [NUse]) : [NUse] =
+  if st_valid(cx.tab, s) {
+    match nu_disp_find(cx.ds, name) {
+      Some(NDisp(_, op, proto)) -> nu_hit_op(NCProtocol, proto, line, col, op, cx, acc)
+      None -> nu_hit_call(sym_class(cx.tab, s), name, line, col, called, cx, acc)
+    }
+  } else { nu_name_hit(name, line, col, called, cx, acc) }
 
 fn nu_positions(ps: [XPos], cx: NuCx, acc: [NUse]) : [NUse] =
   match ps {
