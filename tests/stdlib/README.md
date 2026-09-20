@@ -154,3 +154,19 @@ A further 20-mutant smoke run puts `kai check` first in the oracle:
 9 killed, 11 compile failures, zero survivors. The generated
 concatenation property reports and shrinks counterexamples for those
 prefix/suffix mutations.
+
+## HTTP redirect credentials
+
+`make test-http-redirects` builds `http_redirect_client.kai` and observes
+its requests with two Python loopback HTTP servers. The wire assertions
+cover same-origin preservation, host case, different hosts and ports,
+network-path references, duplicate/mixed-case credential headers, Host
+regeneration, 307/308 body preservation, POST-to-GET rewriting and a chain
+returning to the original origin without restoring stripped credentials.
+The target also runs the inline origin comparison test in `net/http.kai`,
+including omitted versus explicit default ports and unparseable URLs.
+
+The test runs in tier 1 shard 3 on C and tier1-native shard 2 on native.
+Select another toolchain/backend with `KAI_TEST_DRIVER` and
+`KAI_TEST_BACKEND`. `KAI_STDLIB` can select a disposable pre-fix copy for
+red/green validation of the wire test; its default is this checkout.

@@ -637,12 +637,6 @@ fn http_request_ready(acc_rev: [Int], _have: Int) : Option[Request] = {
 }
 
 # ---- redirect following -------------------------------------------
-#
-# `follow` (and the `http_*_follow` wrappers) sit on top of `request`.
-# The single-call surface (`request`, `get`, `post`, …) is unchanged;
-# `follow` adds browser-like auto-follow with method-rewrite rules and
-# a bounded loop. It forwards `req.headers` verbatim across hops —
-# callers strip cross-origin Authorization / Cookie themselves.
 
 #[doc("""
 Knobs for `follow`'s redirect handling:
@@ -673,34 +667,15 @@ pub fn default_redirect_policy() : RedirectPolicy = RedirectPolicy {
   preserve_method_307_308: true,
 }
 
-# Local helpers — `string_starts_with` / `list_contains` are not in
-# the auto-loaded core set, so keep private copies here.
-
-fn http_string_starts_with(s: String, prefix: String) : Bool = {
-  let pn = string_length(prefix)
-  let sn = string_length(s)
-  if pn == 0 { true }
-  else if pn > sn { false }
-  else { string_slice(s, 0, pn) == prefix }
-}
-
-fn http_status_in(codes: [Int], status: Int) : Bool = match codes {
-  [] -> false
-  [c, ...rest] -> if c == status { true } else { http_status_in(rest, status) }
-}
-
-# `Location` resolution, three shapes:
-#   - Absolute URL (`http://…`, `https://…`): used verbatim
-#     (downstream `request` rejects `https://` with a clear Err).
-#   - Path-absolute (`/foo`): keep scheme + host + port from the
-#     previous request, swap the path. `:port` is always emitted
-#     because `parse_url` round-trips it explicitly.
-#   - Anything else (relative, protocol-relative `//host/…`):
-#     returned verbatim, so the follow fails with a parse error.
 fn http_resolve_redirect_url(orig_url: String, loc: String) : String = {
-  if http_string_starts_with(loc, "http://") or http_string_starts_with(loc, "https://") {
+  if string.starts_with(loc, "http://") or string.starts_with(loc, "https://") {
     loc
-  } else if http_string_starts_with(loc, "/") {
+  } else if string.starts_with(loc, "//") {
+    match parse_url(orig_url) {
+      Err(_) -> loc
+      Ok(u) -> string_concat_all([u.scheme, ":", loc])
+    }
+  } else if string.starts_with(loc, "/") {
     match parse_url(orig_url) {
       Err(_) -> loc
       Ok(u)  -> string_concat_all([u.scheme, "://", u.host, ":", int_to_string(u.port), loc])
@@ -710,9 +685,26 @@ fn http_resolve_redirect_url(orig_url: String, loc: String) : String = {
   }
 }
 
-# Build the follow-up `Request` from the original, response status,
-# `Location`, and policy. The method-rewrite branches are mutually
-# exclusive — no real status matches more than one.
+fn http_same_origin(from: String, to: String) : Bool =
+  match parse_url(from) {
+    Err(_) -> false
+    Ok(a) -> match parse_url(to) {
+      Err(_) -> false
+      Ok(b) -> a.scheme == b.scheme and a.port == b.port
+        and string.to_lower(a.host) == string.to_lower(b.host)
+    }
+  }
+
+fn http_redirect_header(h: HttpHeader, same_origin: Bool) : Bool = {
+  let name = string.to_lower(h.name)
+  let credential = name == "authorization" or name == "proxy-authorization"
+    or name == "cookie" or name == "cookie2"
+  name != "host" and (same_origin or not credential)
+}
+
+fn http_redirect_headers(hs: [HttpHeader], same_origin: Bool) : [HttpHeader] =
+  list.filter(hs, (h) => http_redirect_header(h, same_origin))
+
 fn http_build_next_request(orig: Request, status: Int, loc: String,
                            policy: RedirectPolicy) : Request = {
   let new_method =
@@ -727,7 +719,8 @@ fn http_build_next_request(orig: Request, status: Int, loc: String,
     }
   let new_body = if new_method == "GET" { "" } else { orig.body }
   let new_url  = http_resolve_redirect_url(orig.url, loc)
-  Request { method: new_method, url: new_url, headers: orig.headers, body: new_body }
+  let headers = http_redirect_headers(orig.headers, http_same_origin(orig.url, new_url))
+  Request { method: new_method, url: new_url, headers: headers, body: new_body }
 }
 
 # Inner loop — one hop per recursive call. `n_redirects` is the hop
@@ -742,7 +735,7 @@ fn http_follow_loop(req: Request, policy: RedirectPolicy, n_redirects: Int)
     ]))
   } else {
     let resp = request(req)
-    if http_status_in(policy.follow_3xx, resp.status) {
+    if list.contains(policy.follow_3xx, resp.status) {
       match header_lookup(resp.headers, "Location") {
         None -> Err(string_concat_all([
           "redirect missing Location header at status ",
@@ -765,6 +758,16 @@ until either a non-3xx status is reached, the `Location` header
 is missing, or `policy.max_redirects` is exceeded. The bare
 `request` keeps its single-call semantics so existing call
 sites are unaffected.
+
+Redirects preserve Authorization, Proxy-Authorization, Cookie and
+Cookie2 only within the same origin (scheme, ASCII-case-insensitive
+host, effective port). All occurrences are removed on an origin change,
+including mixed-case header names; later hops never restore them.
+Host overrides are removed on every redirect so the next request uses
+its destination authority. Other headers are preserved. This is not a
+cookie jar or a policy for application-specific secret headers.
+Absolute HTTP URLs, absolute paths and network-path references are
+supported; other relative references retain the existing error behavior.
 """)]
 pub fn follow(req: Request, policy: RedirectPolicy)
     : Result[Response, String] / NetTcp + Cancel =
@@ -797,3 +800,10 @@ pub fn put_follow(url: String, body: String)
 pub fn delete_follow(url: String) : Result[Response, String] / NetTcp + Cancel =
   follow(Request { method: "DELETE", url: url, headers: [], body: "" },
               default_redirect_policy())
+test "redirect origin uses host case and effective port" {
+  assert(http_same_origin("http://EXAMPLE.test/a", "http://example.test:80/b"))
+  assert(not http_same_origin("http://example.test/a", "http://example.test:81/a"))
+  assert(not http_same_origin("http://example.test/a", "http://sub.example.test/a"))
+  assert(not http_same_origin("http://example.test/a", "https://example.test/a"))
+  assert(not http_same_origin("http://example.test/a", "invalid"))
+}

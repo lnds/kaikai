@@ -487,7 +487,7 @@ bench-mn-throughput: kaic2
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test rc-leak-gate test-partition-linearity demos-no-regression test-fmt test-fmt-width test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-core-text test-independence-oracle test-packages test-editions test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-release-platforms test-cli-flags
+tier1: test rc-leak-gate test-partition-linearity demos-no-regression test-fmt test-fmt-width test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-core-text test-http-redirects test-independence-oracle test-packages test-editions test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-release-platforms test-cli-flags
 	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + independence oracle (#962 soundness gate) + package-mode harness (issue #569) + whole-compiler c-modular link (issue #1012) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + M:N determinism (N=1==N=4) + kai info smoke + kai doc smoke + Perceus RC leak ledger (240 fixtures pinned)"
 
 # CI sharding (docs/ci-time-analysis.md §7). tier1's ~15-min light-fixture
@@ -555,7 +555,7 @@ tier1-shard-2: kaic2
 tier1-shard-3: kaic2
 	$(MAKE) -C stage2 test-light-shard SHARD=2 SHARDS=4
 	$(MAKE) -C stage2 rc-leak-gate
-	$(MAKE) test-partition-linearity test-core-text
+	$(MAKE) test-partition-linearity test-core-text test-http-redirects
 	@echo "tier1-shard-3 OK — light slice 2/4 + Perceus RC leak ledger + partition linearity + core text contracts"
 
 # The two modular self-hosts sit in separate shards: each rebuilds the whole
@@ -1058,9 +1058,13 @@ test-negative: kaic2
 test-stdlib-modules: kaic2
 	@./tools/test-stdlib-modules.sh
 
-.PHONY: test-core-text
+.PHONY: test-core-text test-http-redirects
 KAI_TEST_DRIVER ?= $(CURDIR)/bin/kai
 KAI_TEST_BACKEND ?= c
+
+test-http-redirects:
+	KAI_TEST_DRIVER="$(KAI_TEST_DRIVER)" KAI_TEST_BACKEND="$(KAI_TEST_BACKEND)" python3 tests/http_redirects.py
+	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) stdlib/net/http.kai
 
 test-core-text:
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/char_test.kai
