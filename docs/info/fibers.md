@@ -164,11 +164,81 @@ KAI_THREADS=1 ./my_program
   driven straight from `main` at any N — see `kai info ffi`. Spawned
   fibers migrate freely; only the entry fiber carries the pin.
 
+## Mutable state and fibers
+
+Each fiber owns a private heap. A value a spawned thunk captures is
+copied into the child, so a mutation the child performs lands on the
+copy: the parent never observes it, and neither does any sibling.
+Where the boundary falls:
+
+- **Inside one fiber**, `Mutable` is the ordinary way to hold state.
+  `Ref` and `Array` behave exactly as they read — no races are
+  possible, because nothing else reaches that heap.
+- **Between fibers**, message passing, and only message passing. One
+  fiber owns the state; the others ask it to act. See
+  `kai info actors`.
+- **`nursery` is control flow, not sharing.** It runs independent work
+  in parallel and joins it. Results come back through `await`; they do
+  not come back through a cell both sides hold.
+
+A thunk that captures a value carrying mutation — a `Ref`, an `Array`,
+or a record holding either, at any depth — is rejected where it is
+spawned, because the copy would make the program quietly wrong rather
+than loudly broken:
+
+```kaikai-neg
+import spawn
+
+fn bump(r: Ref[Int]) : Unit / Mutable =
+  Mutable.ref_set(r, Mutable.ref_get(r) + 1)
+
+fn main() : Int / Spawn + Mutable = {
+  let counter = Mutable.ref_make(0)
+  nursery { n ->                        # error: a spawned fiber cannot
+    let f = n.spawn(() => bump(counter)) #   capture `Ref[Int]`
+    n.await(f)
+  }
+  0
+}
+```
+
+Two shapes that look similar and are fine: a carrier CONSTRUCTED
+inside the thunk belongs to the child and is never shared, and a value
+READ before the spawn is captured as the value, not the cell.
+
+```kaikai
+import spawn
+
+fn fill(buf: Array[Int]) : Int / Mutable = {
+  let _ = array_set(buf, 0, 1)
+  array_get(buf, 0)
+}
+
+fn compute(x: Int) : Int = x * 2
+
+fn main() : Int / Spawn + Stdout + Mutable = {
+  let counter = Mutable.ref_make(21)
+  let snapshot = Mutable.ref_get(counter)   # an Int, not the cell
+  nursery { n ->
+    let a = n.spawn(() => { let buf = array_make(8, 0)  fill(buf) })
+    let b = n.spawn(() => compute(snapshot))
+    Stdout.print("#{n.await(a)} #{n.await(b)}")
+  }
+  0
+}
+```
+
+This is the same rule the row check applies to effects, read on the
+value side: a child fiber starts with an empty evidence stack AND a
+heap of its own, so neither a handler nor a cell reaches it from the
+parent.
+
 ## NOT IN KAIKAI
 
 - `async` / `await` keywords. Concurrency is an effect, not syntax.
 - Goroutines / unstructured spawn. Every spawn lives in a nursery.
-- Channels as a primitive. Use Actors or nursery + shared State[T].
+- Channels as a primitive. Use Actors.
+- Shared mutable state between fibers. See Mutable state and fibers.
 - OS-thread parking under blocking syscalls. Reactor parks fibers.
 - Multi-shot resume (which would mean a fiber's continuation
   runs twice). One-shot only.

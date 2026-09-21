@@ -1,77 +1,93 @@
-# Spawn-boundary effect check.
+# Spawn-boundary check.
 #
-# A child fiber starts with an empty evidence stack, so a handler
-# installed around a spawn sits on a frame the child cannot reach.
-# Only two kinds of effect resolve inside a child: one whose
-# `default { }` bridges to a runtime supplier (installed per fiber),
-# and a fiber-local one (bound to the child's own disposition). Any
-# other effect on a spawned thunk would dispatch against a slot
-# nobody filled, so it is rejected here instead of aborting at run
-# time.
+# A child fiber starts empty: an empty evidence stack, and a heap of
+# its own. Both halves of that are rejected here.
 #
-# The thunk's row is read from the typed AST: inference annotates a
-# lambda with `TyFnT(_, _, row)`, and the nursery cap rewrite has
+# The row half: a handler installed around a spawn sits on a frame the
+# child cannot reach. Only two kinds of effect resolve inside a child:
+# one whose `default { }` bridges to a runtime supplier (installed per
+# fiber), and a fiber-local one (bound to the child's own disposition).
+# Any other effect would dispatch against a slot nobody filled.
+#
+# The value half (`spawn_capture`): a captured value is copied into the
+# child, so a mutation the child performs never reaches the parent.
+#
+# Both read the typed AST: inference annotates a lambda with
+# `TyFnT(_, _, row)` and types its body, and the nursery cap rewrite has
 # already turned `n.spawn(f)` into `Spawn.spawn(f)`, so every spawn
 # surface reaches this one check.
 
 import compiler.ast
 import compiler.diag
 import compiler.diag_file
+import compiler.spawn_capture
 import compiler.util
 
-#[doc("Reject a spawned thunk carrying an effect the child fiber cannot resolve. Each diagnostic names the file declaring the decl it fires on.")]
-pub fn check_spawn_rows(df: DiagFiles, mod_decls: [Decl],
+#[doc("Reject a spawned thunk the child fiber cannot honour: an effect it cannot resolve, or a captured value it would mutate as a copy. Each diagnostic names the file declaring the decl it fires on.")]
+pub fn check_spawn_rows(df: DiagFiles, recs: [RecInfo], mod_decls: [Decl],
                          all_decls: [Decl]) : Int / Console + File =
-  check_spawn_rows_loop(df, all_decls, mod_decls, 0)
+  check_spawn_rows_loop(df, recs, all_decls, mod_decls, 0)
 
 
-fn check_spawn_rows_loop(df: DiagFiles, all_decls: [Decl],
+fn check_spawn_rows_loop(df: DiagFiles, recs: [RecInfo], all_decls: [Decl],
                           ds: [Decl],
                           acc: Int) : Int / Console + File {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
       DFn(_, _, _, _, _, _, body, _, _, _, _) -> {
-        let n = walk_spawn_rows_expr(decl_diag_file(d, df), all_decls, body, 0)
-        check_spawn_rows_loop(df, all_decls, rest, acc + n)
+        let n = walk_spawn_rows_expr(decl_diag_file(d, df), recs, all_decls, body, 0)
+        check_spawn_rows_loop(df, recs, all_decls, rest, acc + n)
       }
-      _ -> check_spawn_rows_loop(df, all_decls, rest, acc)
+      _ -> check_spawn_rows_loop(df, recs, all_decls, rest, acc)
     }
   }
 }
 
 
-fn walk_spawn_rows_expr(file: String, decls: [Decl], e: Expr,
+fn walk_spawn_rows_expr(file: String, recs: [RecInfo], decls: [Decl], e: Expr,
                          acc: Int) : Int / Console + File {
   let here = match e.kind {
     ECall(callee, args_) -> match callee.kind {
-      EVar(key)   -> spawn_call_errs(file, decls, key, args_)
+      EVar(key)   -> spawn_call_errs(file, recs, decls, key, args_)
       # A resolved stdlib export reaches the call site as a symbol,
       # not a bare name: the free `spawn` wrapper arrives here.
-      ESym(_, nm) -> spawn_call_errs(file, decls, nm, args_)
+      ESym(_, nm) -> spawn_call_errs(file, recs, decls, nm, args_)
       _           -> 0
     }
     _ -> 0
   }
-  walk_spawn_rows_list(file, decls, spawn_expr_children(e), acc + here)
+  walk_spawn_rows_list(file, recs, decls, spawn_expr_children(e), acc + here)
 }
 
 
-fn spawn_call_errs(file: String, decls: [Decl], key: String,
+fn spawn_call_errs(file: String, recs: [RecInfo], decls: [Decl], key: String,
                     args_: [Expr]) : Int / Console + File {
   if is_spawn_boundary_callee(key) {
-    check_spawned_thunk_row(file, decls, args_)
+    check_spawned_thunk(file, recs, decls, args_)
   } else { 0 }
 }
 
 
-fn walk_spawn_rows_list(file: String, decls: [Decl], es: [Expr],
+# The two halves of the boundary: the row the child cannot resolve, and
+# the values it would mutate as a copy.
+fn check_spawned_thunk(file: String, recs: [RecInfo], decls: [Decl],
+                        args_: [Expr]) : Int / Console + File {
+  let row_errs = check_spawned_thunk_row(file, decls, args_)
+  match spawn_thunk_arg(args_) {
+    None      -> row_errs
+    Some(thk) -> row_errs + check_thunk_captures(file, recs, thk)
+  }
+}
+
+
+fn walk_spawn_rows_list(file: String, recs: [RecInfo], decls: [Decl], es: [Expr],
                          acc: Int) : Int / Console + File {
   match es {
     []           -> acc
     [h, ...rest] -> {
-      let a1 = walk_spawn_rows_expr(file, decls, h, acc)
-      walk_spawn_rows_list(file, decls, rest, a1)
+      let a1 = walk_spawn_rows_expr(file, recs, decls, h, acc)
+      walk_spawn_rows_list(file, recs, decls, rest, a1)
     }
   }
 }
@@ -165,47 +181,6 @@ fn stmt_own_exprs(s: Stmt) : [Expr] = match s {
   SExprStmt(e)        -> [e]
   SAssert(e, og)      -> [e, ...opt_expr(og)]
   _                   -> []
-}
-
-
-# Every callee that hands a thunk to a fresh fiber. `Spawn.spawn` is
-# the op both `n.spawn` (rewritten by the nursery cap pass) and the
-# free `spawn` wrapper reach; `spawn_actor_fiber` is the actor
-# surface's own runtime entry, which does not route through the op.
-fn is_spawn_boundary_callee(key: String) : Bool =
-  name_in(spawn_boundary_callees(), strip_dispatch_tag(key))
-
-
-fn spawn_boundary_callees() : [String] =
-  ["Spawn.spawn", "spawn_actor_fiber",
-   "spawn", "spawn.spawn",
-   "spawn_actor", "spawn.spawn_actor",
-   "spawn_actor_policy", "spawn.spawn_actor_policy",
-   "actor.spawn_actor", "actor.spawn_actor_policy"]
-
-
-fn name_in(xs: [String], s: String) : Bool {
-  match xs {
-    []           -> false
-    [h, ...rest] -> if h == s { true } else { name_in(rest, s) }
-  }
-}
-
-
-# `@alias` / `#cap` suffixes are codegen-only dispatch tags.
-fn strip_dispatch_tag(key: String) : String =
-  strip_dispatch_tag_loop(key, 0, string_length(key))
-
-
-fn strip_dispatch_tag_loop(key: String, i: Int, n: Int) : String {
-  if i >= n { key }
-  else {
-    match char_at(key, i) {
-      Some(c) -> if c == '@' or c == '#' { string_slice(key, 0, i) }
-                 else { strip_dispatch_tag_loop(key, i + 1, n) }
-      None    -> key
-    }
-  }
 }
 
 
@@ -304,7 +279,15 @@ fn clause_is_extern(body: Expr) : Bool {
 
 
 fn spawn_effect_is_fiber_local(eff: String) : Bool =
-  name_in(["Cancel", "Link", "Monitor", "Spawn", "Actor", "Ffi"], eff)
+  eff_is_one_of(["Cancel", "Link", "Monitor", "Spawn", "Actor", "Ffi"], eff)
+
+
+fn eff_is_one_of(xs: [String], s: String) : Bool {
+  match xs {
+    []           -> false
+    [h, ...rest] -> if h == s { true } else { eff_is_one_of(rest, s) }
+  }
+}
 
 
 fn report_spawn_row_labels(file: String, decls: [Decl],                             labels: [Label], line: Int, col: Int,

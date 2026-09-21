@@ -1,0 +1,319 @@
+#[doc("""
+Spawn-boundary capture check.
+
+Fibers have private heaps: a value a thunk captures is copied into the
+child, so a mutation the child performs lands on the copy and the
+parent never sees it. Where the row check rejects an effect the child
+cannot resolve, this rejects a VALUE whose mutation the child cannot
+share — the same boundary, read on the other side.
+
+What counts as a carrier is `mutation_carriers`, not a list spelled
+here: any record reaching an `Array`/`Ref` through its fields is
+classified without touching this module.
+
+Only a FREE name is a capture. A carrier built inside the thunk, and a
+plain value read before the spawn, both stay legal — they are what
+keeps the check from rejecting correct code.
+""")]
+
+import compiler.ast
+import compiler.closure_spec_ast
+import compiler.diag
+import compiler.mutation_carriers
+import compiler.util
+
+#[doc("True iff `key` names a callee that hands a thunk to a fresh fiber.")]
+pub fn is_spawn_boundary_callee(key: String) : Bool =
+  name_in(spawn_boundary_callees(), strip_dispatch_tag(key))
+
+
+# `Spawn.spawn` is the op both `n.spawn` (rewritten by the nursery cap
+# pass) and the free `spawn` wrapper reach; `spawn_actor_fiber` is the
+# actor surface's own runtime entry, which does not route through the op.
+fn spawn_boundary_callees() : [String] =
+  ["Spawn.spawn", "spawn_actor_fiber",
+   "spawn", "spawn.spawn",
+   "spawn_actor", "spawn.spawn_actor",
+   "spawn_actor_policy", "spawn.spawn_actor_policy",
+   "actor.spawn_actor", "actor.spawn_actor_policy"]
+
+
+fn name_in(xs: [String], s: String) : Bool {
+  match xs {
+    []           -> false
+    [h, ...rest] -> if h == s { true } else { name_in(rest, s) }
+  }
+}
+
+
+# `@alias` / `#cap` suffixes are codegen-only dispatch tags.
+fn strip_dispatch_tag(key: String) : String =
+  strip_dispatch_tag_loop(key, 0, string_length(key))
+
+
+fn strip_dispatch_tag_loop(key: String, i: Int, n: Int) : String {
+  if i >= n { key }
+  else {
+    match char_at(key, i) {
+      Some(c) -> if c == '@' or c == '#' { string_slice(key, 0, i) }
+                 else { strip_dispatch_tag_loop(key, i + 1, n) }
+      None    -> key
+    }
+  }
+}
+
+
+#[doc("Reject a spawned thunk capturing a mutation carrier from the enclosing fiber. Returns the diagnostic count.")]
+pub fn check_thunk_captures(file: String, recs: [RecInfo],
+                            thunk: Expr) : Int / Console + File {
+  match thunk.kind {
+    ELambda(ps, body) -> {
+      let dmut = mutating_record_type_names(recs)
+      let bound = param_names(ps, [])
+      report_captures(file, free_carriers(body, bound, dmut, []), 0)
+    }
+    _ -> 0
+  }
+}
+
+
+fn param_names(ps: [Param], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> param_names(rest, [p.pname, ...acc])
+}
+
+
+# A capture: name, its type as written for the diagnostic, and where it
+# is read. The first read of a name is the one reported.
+type Capture = Cap(String, String, Int, Int)
+
+
+fn report_captures(file: String, cs: [Capture],
+                   acc: Int) : Int / Console + File {
+  match cs {
+    []           -> acc
+    [c, ...rest] -> match c {
+      Cap(name, tyname, line, col) -> {
+        report_capture(file, name, tyname, line, col)
+        report_captures(file, rest, acc + 1)
+      }
+    }
+  }
+}
+
+
+# The row check's help ("handle it inside") is wrong here: when the
+# point IS to share, moving the state inside gives each child its own
+# copy. Actors are the supported route.
+fn report_capture(file: String, name: String, tyname: String,
+                  line: Int, col: Int) : Unit / Console + File {
+  diag_error(file, line, col,
+             concat_all(["a spawned fiber cannot capture `", tyname, "`"]))
+  diag_note(concat_all(["`", name, "` is owned by the parent fiber"]))
+  diag_note("fibers have private heaps; the child would mutate a copy")
+  diag_help("let one fiber own the state and message it (`kai info actors`)")
+}
+
+
+# Free names of carrier type, in source order, one entry per name.
+fn free_carriers(e: Expr, bound: [String], dmut: [String],
+                 acc: [Capture]) : [Capture] {
+  match e.kind {
+    EVar(n)    -> add_carrier(e, n, bound, dmut, acc)
+    ESym(_, n) -> add_carrier(e, n, bound, dmut, acc)
+    ELambda(ps, body) ->
+      free_carriers(body, param_names(ps, bound), dmut, acc)
+    EBlock(stmts, tail) -> {
+      let st = free_in_stmts(stmts, bound, dmut, acc)
+      match st {
+        SC(bound1, acc1) -> match tail {
+          Some(t) -> free_carriers(t, bound1, dmut, acc1)
+          None    -> acc1
+        }
+      }
+    }
+    EMatch(scr, arms) -> {
+      let a1 = free_carriers(scr, bound, dmut, acc)
+      free_in_arms(arms, bound, dmut, a1)
+    }
+    # A nested spawn runs its own capture check, and its thunk's frame
+    # of reference is that inner child, not this one. Descending would
+    # report the same name once per enclosing spawn.
+    ECall(callee, args_) ->
+      if callee_is_spawn(callee) { acc }
+      else { free_in_list([callee, ...args_], bound, dmut, acc) }
+    _ -> free_in_list(capture_kids(e), bound, dmut, acc)
+  }
+}
+
+
+fn callee_is_spawn(callee: Expr) : Bool = match callee.kind {
+  EVar(key)   -> is_spawn_boundary_callee(key)
+  ESym(_, nm) -> is_spawn_boundary_callee(nm)
+  _           -> false
+}
+
+
+fn add_carrier(e: Expr, n: String, bound: [String], dmut: [String],
+               acc: [Capture]) : [Capture] {
+  if list_has(bound, n) { acc }
+  else if has_capture(acc, n) { acc }
+  else { match e.ty {
+    Some(t) -> if ty_carries_mutation(t, dmut) {
+                 [Cap(n, carrier_display(t), e.line, e.col), ...acc]
+               } else { acc }
+    None    -> acc
+  } }
+}
+
+
+fn has_capture(cs: [Capture], n: String) : Bool = match cs {
+  []           -> false
+  [c, ...rest] -> match c {
+    Cap(name, _, _, _) -> if name == n { true } else { has_capture(rest, n) }
+  }
+}
+
+
+# Carrier types only, so the head plus its arguments is the whole
+# rendering; anything else is not reported and never reaches here.
+fn carrier_display(t: Ty) : String = match t {
+  TyCon(_, name, targs) -> match targs {
+    [] -> name
+    _  -> concat_all([name, "[", join_with(display_args(targs), ", "), "]"])
+  }
+  _ -> "a mutable value"
+}
+
+
+fn display_args(ts: [Ty]) : [String] = match ts {
+  []           -> []
+  [t, ...rest] -> [carrier_display_arg(t), ...display_args(rest)]
+}
+
+
+fn carrier_display_arg(t: Ty) : String = match t {
+  TyInt    -> "Int"
+  TyReal   -> "Real"
+  TyBool   -> "Bool"
+  TyString -> "String"
+  TyChar   -> "Char"
+  TyUnit   -> "Unit"
+  TyListT(inner) -> concat_all(["[", carrier_display_arg(inner), "]"])
+  TyCon(_, name, targs) -> match targs {
+    [] -> name
+    _  -> concat_all([name, "[", join_with(display_args(targs), ", "), "]"])
+  }
+  _ -> "_"
+}
+
+
+# A block binds as it goes: a name bound by an earlier `let` is not
+# free in the statements that follow it.
+type ScanState = SC([String], [Capture])
+
+
+fn free_in_stmts(ss: [Stmt], bound: [String], dmut: [String],
+                 acc: [Capture]) : ScanState {
+  match ss {
+    []           -> SC(bound, acc)
+    [s, ...rest] -> match stmt_scan(s, bound, dmut, acc) {
+      SC(bound1, acc1) -> free_in_stmts(rest, bound1, dmut, acc1)
+    }
+  }
+}
+
+
+fn stmt_scan(s: Stmt, bound: [String], dmut: [String],
+             acc: [Capture]) : ScanState {
+  match s {
+    SLet(pat, _, rhs) ->
+      SC(cs_pat_binders(pat, bound), free_carriers(rhs, bound, dmut, acc))
+    SVar(n, _, rhs, _, _) ->
+      SC([n, ...bound], free_carriers(rhs, bound, dmut, acc))
+    SExprStmt(e) -> SC(bound, free_carriers(e, bound, dmut, acc))
+    SAssert(e, og) -> {
+      let a1 = free_carriers(e, bound, dmut, acc)
+      SC(bound, free_in_opt(og, bound, dmut, a1))
+    }
+    _ -> SC(bound, acc)
+  }
+}
+
+
+fn free_in_arms(arms: [Arm], bound: [String], dmut: [String],
+                acc: [Capture]) : [Capture] {
+  match arms {
+    []           -> acc
+    [a, ...rest] -> match a {
+      Arm(pat, og, body) -> {
+        let bound1 = cs_pat_binders(pat, bound)
+        let a1 = free_in_opt(og, bound1, dmut, acc)
+        free_in_arms(rest, bound, dmut,
+                     free_carriers(body, bound1, dmut, a1))
+      }
+    }
+  }
+}
+
+
+fn free_in_opt(o: Option[Expr], bound: [String], dmut: [String],
+               acc: [Capture]) : [Capture] = match o {
+  Some(e) -> free_carriers(e, bound, dmut, acc)
+  None    -> acc
+}
+
+
+fn free_in_list(es: [Expr], bound: [String], dmut: [String],
+                acc: [Capture]) : [Capture] {
+  match es {
+    []           -> acc
+    [h, ...rest] ->
+      free_in_list(rest, bound, dmut, free_carriers(h, bound, dmut, acc))
+  }
+}
+
+
+# Sub-expressions of the forms that bind nothing; the binding forms
+# (block, match, lambda) are handled by `free_carriers` directly.
+fn capture_kids(e: Expr) : [Expr] {
+  match e.kind {
+    EField(base, _)      -> [base]
+    EIndex(a, b)         -> [a, b]
+    EBinop(_, a, b)      -> [a, b]
+    EUnop(_, x)          -> [x]
+    EBang(x)             -> [x]
+    ELitUnit(x, _)       -> [x]
+    EPipe(a, b)          -> [a, b]
+    EMapPipe(a, b)       -> [a, b]
+    EFlatMapPipe(a, b)   -> [a, b]
+    EFilterPipe(a, b)    -> [a, b]
+    EIntrinsic(_, args_) -> args_
+    EList(els)           -> capture_list_elems(els)
+    ERecordLit(_, fs)    -> capture_field_inits(fs)
+    EIf(c, t, eo)        -> [c, t, ...capture_opt(eo)]
+    ERange(a, b, os)     -> [a, b, ...capture_opt(os)]
+    _ -> []
+  }
+}
+
+
+fn capture_opt(o: Option[Expr]) : [Expr] = match o {
+  Some(x) -> [x]
+  None    -> []
+}
+
+
+fn capture_list_elems(els: [ListElem]) : [Expr] = match els {
+  []            -> []
+  [el, ...rest] -> match el {
+    ElPlain(e)  -> [e, ...capture_list_elems(rest)]
+    ElSpread(e) -> [e, ...capture_list_elems(rest)]
+  }
+}
+
+
+fn capture_field_inits(fs: [FieldInit]) : [Expr] = match fs {
+  []           -> []
+  [f, ...rest] -> match f { FI(_, e) -> [e, ...capture_field_inits(rest)] }
+}
