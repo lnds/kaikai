@@ -18,7 +18,8 @@ name: tier1-native
 # and the native self-host gate runs as a fourth parallel consumer of the same
 # artifact — nothing downstream depends on its output, so keeping it inside
 # build-native would only delay the artifact upload (~13 min off the critical
-# path). native is the DEFAULT backend and deserves equal-or-better coverage
+# path). The M:N corpus gate and the RC detector consume the same artifact
+# (see their jobs below). native is the DEFAULT backend and deserves equal-or-better coverage
 # than the C oracle — sharding cuts wall-clock without dropping a fixture.
 on:
   pull_request:
@@ -55,6 +56,7 @@ jobs:
     outputs:
       doc-only: ${{ steps.doc-only.outputs.skip }}
       nscol: ${{ steps.nscol.outputs.run }}
+      rcdet: ${{ steps.rcdet.outputs.run }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -100,6 +102,24 @@ jobs:
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "Diff does not reach name resolution; skipping the namespace-collision corpus."
+          fi
+
+      # The RC detector runs only on PRs that can introduce an RC regression;
+      # its daily cron lives in rc-detector.yml.
+      - name: Does this diff reach the RC surface?
+        id: rcdet
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          CHANGED=$(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}")
+          if echo "$CHANGED" | grep -qE '^(stage0/runtime\.h|stage0/runtime_llvm\.c|stage2/compiler/perceus\.kai|stage2/compiler/emit_c\.kai|stage2/compiler/kir_lower_[^/]*\.kai|stage2/compiler/emit_native[^/]*\.kai|examples/perceus/.*|tools/rc-selfhost-detector\.sh|tools/rc-detector-corpus\.txt|tools/kaic2-native-capable\.sh|\.github/workflows/(rc-detector|tier1-native)\.yml)$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Diff does not reach the RC surface; skipping the RC detector."
           fi
 
   # Build the libLLVM-capable kaic2 + P2 runtime bitcode once, assert P2 is
@@ -561,6 +581,47 @@ jobs:
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error::working tree dirty after native-shard-2"; git status; exit 1
           fi
+
+  # M:N corpus determinism on the shared native build. The shards live in
+  # tier1-mn-corpus.yml, which also carries the nightly deep sweep; the
+  # REQUIRED `tier1-mn-corpus` check is the aggregator below, because a
+  # called workflow's jobs report under a `caller / job` name.
+  mn-corpus:
+    needs: [changes, build-native]
+    if: needs.changes.outputs.doc-only != 'true'
+    uses: ./.github/workflows/tier1-mn-corpus.yml
+    with:
+      artifact: kaic2-native
+
+  # Aggregator. Green iff the coverage plan held and every shard passed; a
+  # doc-only PR reports SUCCESS without running them.
+  tier1-mn-corpus:
+    needs: [changes, mn-corpus]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Gate on the plan and all shards
+        run: |
+          if [ "${{ needs.changes.outputs.doc-only }}" = "true" ]; then
+            echo "tier1-mn-corpus OK — doc-only PR, shards skipped"; exit 0
+          fi
+          r='${{ needs.mn-corpus.result }}'
+          echo "mn-corpus: $r"
+          if [ "$r" = "success" ]; then
+            echo "tier1-mn-corpus OK — the corpus reproduces its N=1 behaviour at N=4 on both backends"
+          else
+            echo "::error::tier1-mn-corpus FAIL — the coverage plan or a shard did not succeed"; exit 1
+          fi
+
+  # RC self-host detector on the shared native build, path-gated. Not a
+  # required check; its daily cron lives in rc-detector.yml.
+  rc-detector:
+    needs: [changes, build-native]
+    if: needs.changes.outputs.doc-only != 'true' && needs.changes.outputs.rcdet == 'true'
+    uses: ./.github/workflows/rc-detector.yml
+    with:
+      artifact: kaic2-native
 
   # Aggregator (mirrors tier1's). This is the Required check branch
   # protection gates on: one tidy `tier1-native` status, green iff all

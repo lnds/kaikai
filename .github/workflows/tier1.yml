@@ -37,10 +37,11 @@ permissions:
 # pool is CPU-bound + independent, so it is sharded across SEPARATE
 # runners (each with its own memory bus — in-job `-j` is bandwidth-capped).
 # A single `build` job bootstraps the C-only kaic2 ONCE and publishes it as
-# an artifact; tier0 + the tier1 shards consume it (download + a
-# dependency-ordered mtime touch so `make` rebuilds nothing). The `tier1`
-# aggregator job gates on every shard, so the REQUIRED check is still
-# named `tier1` and branch protection needs no change.
+# an artifact; tier0, the tier1 shards, tier1-asan and tier1-tsan consume it
+# (download + a dependency-ordered mtime touch so `make` rebuilds nothing).
+# Artifacts do not cross workflows, which is why the sanitizer gates live
+# here. The `tier1` aggregator job gates on every shard; `tier1-tsan` is a
+# separate REQUIRED check reported by its own job.
 jobs:
   # Shared doc-only detection for PRs. Pure-doc PRs short-circuit every
   # downstream job with SUCCESS so the required `tier1` check is satisfied
@@ -54,6 +55,8 @@ jobs:
     outputs:
       doc-only: ${{ steps.doc-only.outputs.skip }}
       compiler-touch: ${{ steps.compiler-touch.outputs.touch }}
+      asan: ${{ steps.asan.outputs.run }}
+      tsan: ${{ steps.tsan.outputs.run }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -98,6 +101,44 @@ jobs:
             echo "No compiler-source changes; shard-4 skips the self-hosts."
           else
             echo "touch=true" >> "$GITHUB_OUTPUT"
+          fi
+      # Scope of the tier1-asan shards: the code that can produce a
+      # memory-shape regression. Non-PR events always run.
+      - name: Does this diff reach the ASAN surface?
+        id: asan
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          CHANGED=$(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}")
+          if echo "$CHANGED" | grep -qE '^(stage0/|stage1/compiler\.kai$|stage2/compiler/|stage2/runtime\.h$|stage2/Makefile$|stdlib/|examples/effects/|examples/perceus/|\.github/workflows/tier1\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Diff does not reach the ASAN surface; tier1-asan skipped."
+          fi
+      # Scope of the tier1-tsan gate: the code that can produce a data race
+      # under the M:N scheduler. Non-PR events always run.
+      - name: Does this diff reach the M:N surface?
+        id: tsan
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          CHANGED=$(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}")
+          MATCHED=$(echo "$CHANGED" | grep -E \
+            '^(stage0/runtime\.h|stage0/runtime_llvm\.c|stage2/runtime.*\.h|stage2/Makefile|stdlib/(actor|spawn)\.kai|examples/effects/mn_.*|examples/llvm/cancel_raise_in_fiber_under_mailbox\.kai|demos/parallel_actors/.*|tools/(run-mn-tsan|run-mn-reactor-bench|run-mn-deadlock-banner|ci-bounded-step|ci-touch-build)\.sh|tools/lib/timeout\.sh|\.github/workflows/tier1\.yml)$' \
+            || true)
+          if [ -z "$MATCHED" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Diff touches no M:N surface; tier1-tsan reports without running."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "M:N surface touched:"; echo "$MATCHED"
           fi
 
   # Build the C-only kaic2 once and publish the bootstrap chain. Every
@@ -497,6 +538,108 @@ jobs:
         run: |
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error::working tree dirty after tier1-shard-7"
+            git status; exit 1
+          fi
+
+  # Demos and the -asan fixture legs under ASAN+UBSan, sharded in two so a
+  # new leg does not push one serial job past its deadline. The sanitizers
+  # instrument the fixture binaries, not kaic2, so the shared build serves.
+  # Path-gated and not a required check: it reports only where it runs.
+  tier1-asan:
+    needs: [changes, build]
+    if: needs.changes.outputs.doc-only != 'true' && needs.changes.outputs.asan == 'true'
+    strategy:
+      # A red shard keeps its sibling running: the other half's legs are
+      # diagnostic signal, not redundant work.
+      fail-fast: false
+      matrix:
+        shard: [a, b]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          command -v clang >/dev/null 2>&1 || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends clang
+          }
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-c
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      # Bounded under `timeout-minutes` so a demo that wedges under ASAN
+      # fails here, named, instead of reporting `cancelled` — the conclusion
+      # a routine supersede also produces.
+      - name: tier1-asan-${{ matrix.shard }} (demos + fixture legs under ASAN+UBSan)
+        run: ./tools/ci-bounded-step.sh 1200 "tier1-asan-${{ matrix.shard }} (ASAN+UBSan)" make CC=clang tier1-asan-${{ matrix.shard }}
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after tier1-asan-${{ matrix.shard }}; build artifacts leaked into tracked paths"
+            git status; exit 1
+          fi
+
+  # M:N ThreadSanitizer, reactor no-starvation and deadlock-banner gates.
+  # A REQUIRED check, so it must report on every PR: it runs whenever the
+  # workflow is not cancelled and self-skips with SUCCESS when the diff
+  # misses the M:N surface. A job-level path `if` would leave it `skipped`
+  # behind a skipped build on doc-only PRs.
+  tier1-tsan:
+    needs: [changes, build]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Scope gate to the M:N surface
+        run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "::error::tier1-tsan FAIL — the changes job did not succeed"; exit 1
+          fi
+          if [ "${{ needs.changes.outputs.tsan }}" != "true" ]; then
+            echo "tier1-tsan OK — PR touches no M:N surface; the race gate is not exercised."; exit 0
+          fi
+          if [ "${{ needs.build.result }}" != "success" ]; then
+            echo "::error::tier1-tsan FAIL — the shared kaic2 build did not succeed"; exit 1
+          fi
+      - uses: actions/checkout@v4
+        if: needs.changes.outputs.tsan == 'true'
+      - name: Install toolchain
+        if: needs.changes.outputs.tsan == 'true'
+        run: |
+          command -v clang >/dev/null 2>&1 || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends clang
+          }
+      - uses: actions/download-artifact@v4
+        if: needs.changes.outputs.tsan == 'true'
+        with:
+          name: kaic2-c
+      - name: Restore artifact mtimes (no rebuild)
+        if: needs.changes.outputs.tsan == 'true'
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      # Each gate is bounded well under `timeout-minutes`: the gate exists to
+      # catch a scheduler that wedges, and an unbounded wedge reports the job
+      # as `cancelled`, like a routine supersede. Nominal is ~10 s per gate.
+      - name: M:N ThreadSanitizer + determinism gate
+        if: needs.changes.outputs.tsan == 'true'
+        run: ./tools/ci-bounded-step.sh 600 "tier1-tsan M:N ThreadSanitizer gate" make CC=clang test-mn-tsan
+      - name: F2 reactor no-starvation gate
+        if: needs.changes.outputs.tsan == 'true'
+        run: ./tools/ci-bounded-step.sh 300 "tier1-tsan F2 reactor no-starvation gate" make CC=clang test-mn-reactor-bench
+      - name: Deadlock-banner determinism gate
+        if: needs.changes.outputs.tsan == 'true'
+        run: ./tools/ci-bounded-step.sh 600 "tier1-tsan deadlock-banner determinism gate" make CC=clang test-mn-deadlock-banner
+      - name: Working tree clean check
+        if: needs.changes.outputs.tsan == 'true'
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after tier1-tsan"
             git status; exit 1
           fi
 

@@ -11360,12 +11360,17 @@ rc-leak-gate-native:
 # oracle shares. The native half needs a KAI_LLVM=1 kaic2 and instruments
 # the runtime via the legacy link path; the script SKIPs native where
 # libLLVM is absent. Heavy (build x2 x corpus) — cron / RC-path-gated, not a
-# per-PR gate. Relinks kaic2 with KAI_LLVM=1 first when libLLVM is present.
+# per-PR gate. When libLLVM is present, relinks kaic2 with KAI_LLVM=1 unless
+# the existing binary is already up to date AND native-capable.
 rc-detector:
 	@if command -v "$(LLVM_CONFIG)" >/dev/null 2>&1; then \
-	  rm -f $(TARGET); \
-	  LLVM_CONFIG="$(LLVM_CONFIG)" $(MAKE) KAI_LLVM=1 kaic2 >/dev/null 2>&1 \
-	    || { echo "rc-detector FAIL — kaic2 (KAI_LLVM=1) build failed"; exit 1; }; \
+	  if $(MAKE) -q $(TARGET) 2>/dev/null && ../tools/kaic2-native-capable.sh $(TARGET); then \
+	    echo "rc-detector: $(TARGET) is up to date and native-capable; not rebuilding"; \
+	  else \
+	    rm -f $(TARGET); \
+	    LLVM_CONFIG="$(LLVM_CONFIG)" $(MAKE) KAI_LLVM=1 kaic2 >/dev/null 2>&1 \
+	      || { echo "rc-detector FAIL — kaic2 (KAI_LLVM=1) build failed"; exit 1; }; \
+	  fi; \
 	fi
 	@CC="$(CC)" LLVM_CONFIG="$(LLVM_CONFIG)" bash ../tools/rc-selfhost-detector.sh
 

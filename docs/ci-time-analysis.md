@@ -31,6 +31,22 @@
 > methodology reference; per-phase numbers no longer reflect the current
 > layout.
 
+> **Addendum (2026-09-21).** Artifacts do not cross workflows, so every
+> gate that ran in its own workflow bootstrapped its own `kaic2`: up to 7
+> compiler builds per PR (the two shared builds plus tier1-asan x2,
+> tier1-tsan, tier1-mn-corpus's native build, and rc-detector's forced
+> native relink). The exact-key bootstrap cache never helped, because the
+> workflows start in parallel and all miss together. Fixed: each gate moved
+> into the workflow that owns its compiler variant, behind `needs:` on the
+> shared build — tier1-asan and tier1-tsan into `tier1.yml` (artifact
+> `kaic2-c`), the mn-corpus shards and rc-detector into `tier1-native.yml`
+> (artifact `kaic2-native`, via `workflow_call` so the nightly crons keep
+> one definition). `make rc-detector` skips its relink when `kaic2` is
+> already up to date and native-capable (`tools/kaic2-native-capable.sh`).
+> A PR now builds the compiler twice. The required check names are
+> unchanged: `tier1-tsan` is a job in `tier1.yml` that always reports, and
+> `tier1-mn-corpus` is an aggregator job in `tier1-native.yml`.
+
 All numbers below are **measured**, never dry-run. CI durations come from the
 GitHub Actions REST API for real `main` runs on `ubuntu-latest`; local splits
 come from `/usr/bin/time -p` on a 14-core / 24 GB macOS host with no
@@ -55,8 +71,8 @@ green `main` runs (no outliers; tier1 spread 25m40s–28m00s):
 serial job ran ~24.5m end-to-end (bootstrap ~7m + arena/demos ~4m +
 fixture legs ~13m), at the edge of its 1500s bounded step. The recipe is
 now split into two parallel matrix jobs (`tier1-asan-a` runs the
-arena/demos block plus the first fixture legs, `tier1-asan-b` the rest),
-each paying its own bootstrap; nominal ~16m per shard.
+arena/demos block plus the first fixture legs, `tier1-asan-b` the rest).
+Both shards now consume the shared tier1 build instead of bootstrapping.
 
 The repo is **public**, so `ubuntu-latest` is the 4-vCPU / 16-GB standard
 runner. No OOM/swap-kill in the logs, but 4 cores cap the in-job `-j`

@@ -446,7 +446,7 @@ test-perceus-1131-modular-escape: kaic2
 # Issue #1207 F1 — M:N scheduler ThreadSanitizer + determinism gate. Builds
 # the cross-thread concurrency fixture with -fsanitize=thread and runs it at
 # KAI_THREADS=4: zero data races AND N=1==N=4 output. TSAN is slow, so this
-# rides a dedicated CI tier (tier1-tsan.yml), never TEST_LIGHT.
+# rides a dedicated CI job (tier1-tsan in tier1.yml), never TEST_LIGHT.
 test-mn-tsan: kaic2
 	@bash tools/run-mn-tsan.sh
 
@@ -464,8 +464,8 @@ test-mn-deadlock-banner: kaic2
 
 # M:N corpus determinism: the whole fixture corpus at N=1 vs N>1, both
 # backends. Deliberately NOT in `tier1` — it is the heaviest gate in the
-# repo and owns its own workflow (.github/workflows/tier1-mn-corpus.yml),
-# where it shards across runners. This target is the local entry point;
+# repo and owns its own CI jobs (.github/workflows/tier1-mn-corpus.yml,
+# called from tier1-native.yml), where it shards across runners. This target is the local entry point;
 # scope it with MN_CORPUS_DIRS while iterating. A C-only kaic2 drops the
 # native arm with a loud line rather than silently halving the coverage.
 test-mn-corpus: kaic2
@@ -475,7 +475,7 @@ test-mn-corpus: kaic2
 # wakes on time while CPU hogs occupy the other scheduler threads. Fails on
 # the F1 inline reactor (the poll is pinned to thread 0), passes once the
 # reactor runs on its own thread. Timing-based, so it rides the dedicated
-# concurrency tier (tier1-tsan.yml), not the fast tier1 path.
+# concurrency job (tier1-tsan in tier1.yml), not the fast tier1 path.
 test-mn-reactor-bench: kaic2
 	@bash tools/run-mn-reactor-bench.sh
 
@@ -1124,9 +1124,9 @@ test-editions: kaic2
 # runner; if a leak ratchet ever becomes useful, gate it separately
 # on Linux.
 #
-# CI runs the two shards as parallel jobs (tier1-asan.yml); each pays
-# the kaic2 bootstrap itself, so the split point balances the legs
-# around the shared demos block, not the bootstrap. Locally
+# CI runs the two shards as parallel jobs (the tier1-asan job in
+# tier1.yml) on the shared kaic2 build, so the split point balances the
+# legs around the demos block. Locally
 # `make tier1-asan` runs both shards in sequence.
 tier1-asan: tier1-asan-a tier1-asan-b
 

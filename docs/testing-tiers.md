@@ -314,7 +314,9 @@ arithmetic: if it did not reach every fixture on every arm it fails
 outright, because a truncated walk otherwise produces a tidy and
 entirely false "no findings".
 
-**Where it runs.** `.github/workflows/tier1-mn-corpus.yml`, always-on
+**Where it runs.** `.github/workflows/tier1-mn-corpus.yml`, called from
+`tier1-native.yml` on the shared native build and aggregated there as the
+required `tier1-mn-corpus` check; always-on
 (a path filter would encode the false assumption that the blast radius
 is local), sharded per `tools/mn-corpus-shards.txt`. The shard split is
 asserted to partition the corpus before any fixture runs — a shard list
