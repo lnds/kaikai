@@ -258,8 +258,10 @@ fn main() : Int = 0
 A capability is **second-class**: it may appear only as a call
 argument or an op receiver. It cannot be returned from its `handle`,
 stored in a value, or captured by a closure that outlives the block —
-a value that must outlive its scope is a `Ref[T]` under `Mutable`, a
-dynamic population of stateful entities is actors/`Spawn`. Instances
+a value that must outlive its scope is a `Ref[T]` under `Mutable`
+(within one fiber — a `Ref` does not cross a spawn, see
+`kai info fibers`), a dynamic population of stateful entities is
+actors/`Spawn`. Instances
 are monomorphic (`f(c: State[Int])`, not `f(c: State[T])`); `mask` is
 not provided — name the outer instance instead.
 
