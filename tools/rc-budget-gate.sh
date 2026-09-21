@@ -22,7 +22,14 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KAI="$ROOT/bin/kai"
 SRC="$ROOT/tools/rc-budget"
-BASELINE="$ROOT/tools/rc-budget-baseline.txt"
+BACKEND="${RC_BUDGET_BACKEND:-c}"
+# One baseline per backend. Both numbers are honest: native folds a drop the
+# C path pays, so the same shape costs differently on each.
+if [ "$BACKEND" = "c" ]; then
+  BASELINE="$ROOT/tools/rc-budget-baseline.txt"
+else
+  BASELINE="$ROOT/tools/rc-budget-baseline-$BACKEND.txt"
+fi
 WORK="${TMPDIR:-/tmp}/rc-budget.$$"
 UPDATE="${RC_BUDGET_UPDATE:-0}"
 
@@ -30,7 +37,7 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK"
 
 measure() {
-  KAI_BACKEND="${RC_BUDGET_BACKEND:-c}" "$KAI" build "$SRC/$1.kai" -o "$WORK/$1" >/dev/null 2>&1 \
+  KAI_BACKEND="$BACKEND" "$KAI" build "$SRC/$1.kai" -o "$WORK/$1" >/dev/null 2>&1 \
     || { echo "rc-budget: $1 failed to build" >&2; return 1; }
   KAI_TRACE_RC=1 KAI_THREADS=1 "$WORK/$1" 2>&1 >/dev/null \
     | sed -n 's/.*incref_total=\([0-9]*\) decref_total=\([0-9]*\).*/\1 \2/p' \
@@ -52,7 +59,7 @@ if [ "$UPDATE" = "1" ]; then
 fi
 
 [ -f "$BASELINE" ] || {
-  echo "rc-budget: no baseline; run RC_BUDGET_UPDATE=1 $0" >&2
+  echo "rc-budget: no baseline; run RC_BUDGET_UPDATE=1 [RC_BUDGET_BACKEND=<b>] $0" >&2
   exit 1
 }
 
