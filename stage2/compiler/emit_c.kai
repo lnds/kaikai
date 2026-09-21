@@ -2242,6 +2242,14 @@ fn emit_mark_call(src: String, m: Mark, args_e: [Expr], cx: EmitCtx) : String / 
       ])
       _ -> "kai_unit() /* apply borrow: expected closure + args */"
     }
+    # A non-modulo-cons tail leaf: plug the leaf value into the open cctx
+    # hole and return the spine root.
+    MkTrmcApply -> match args_e {
+      [leaf] -> concat_all([
+        "kai_cctx_apply_linear(_kai_acc, ", emit_expr(src, leaf, cx), ")"
+      ])
+      _ -> "kai_unit() /* trmc apply: arity mismatch */"
+    }
     _ -> concat_all(["kai_unit() /* no lowering for mark ", mark_name(m), " */"])
   }
 
@@ -2433,15 +2441,6 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
             emit_trmc_step(src, sym, holeslot, cname, dropmask, pnames, args_e, cx)
           }
           _ -> "kai_unit() /* trmc: malformed step sentinel */"
-        }
-      } else if trmc_is_apply_sentinel(callee) {
-        # TRMC non-modulo-cons tail leaf: plug the leaf value into the
-        # open cctx hole and return the spine root.
-        match args_e {
-          [leaf] -> concat_all([
-            "kai_cctx_apply_linear(_kai_acc, ", emit_expr(src, leaf, cx), ")"
-          ])
-          _ -> "kai_unit() /* trmc: malformed apply sentinel */"
         }
       } else if tcrec_is_sentinel(callee) {
         # Issue #37: self-tail-call site, planted by `tcrec_rewrite_decl`.
@@ -4311,10 +4310,8 @@ fn arm_tail_consumes_kind(k: ExprKind) : Bool = match k {
   # apply of a constructor rebuild (the token is consumed building the node).
   # Any other call (balance_left, …) does NOT consume the token → reject.
   ECall(f, xs) -> match sym_read_kind(f.kind) {
-    EVar(callee) ->
-      if trmc_is_step_sentinel(callee) { true }
-      else if trmc_is_apply_sentinel(callee) { arm_apply_is_ctor(xs) }
-      else { false }
+    EVar(callee) -> trmc_is_step_sentinel(callee)
+    EMark(MkTrmcApply) -> arm_apply_is_ctor(xs)
     _ -> false
   }
   _ -> false
@@ -15722,9 +15719,8 @@ fn tcrec_make_sentinel(sym: String, dropmask: Int, pnames: [String]) : String =
 # from the self-call's args (with <dropmask> reconciling Perceus's
 # exit-drops, exactly like tcrec_emit_goto), and `goto`s the entry label.
 #
-# A non-modulo-cons tail leaf is wrapped as
-#   ECall(EVar("__kai_trmc_apply"), [leaf_expr])
-# which the emitter lowers to `kai_cctx_apply_linear(_kai_acc, <leaf>)`.
+# A non-modulo-cons tail leaf is wrapped in the `MkTrmcApply` mark, which
+# the emitter lowers to `kai_cctx_apply_linear(_kai_acc, <leaf>)`.
 #
 # The ctor tag/mask/payload-types are resolved at emit time from
 # `cname` against `cx.variants` (the rewrite pass has no EmitCtx), so
@@ -15740,8 +15736,6 @@ fn trmc_make_step_sentinel(sym: String, holeslot: Int, cname: String,
   }
 
 fn trmc_is_step_sentinel(callee: String) : Bool = string_starts_with_q(callee, "__kai_trmc|")
-
-fn trmc_is_apply_sentinel(callee: String) : Bool = callee == "__kai_trmc_apply"
 
 # Issue #706: the sentinel wire-format helpers now live in
 # `emit_shared.kai` (`es_tcrec_*`) so both the C and LLVM emitters
@@ -15935,7 +15929,7 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int, o
 }
 
 fn trmc_wrap_apply(leaf: Expr) : ExprKind =
-  ECall(Expr { kind: EVar("__kai_trmc_apply"), line: leaf.line, col: leaf.col, ty: leaf.ty, mode: leaf.mode },
+  ECall(Expr { kind: EMark(MkTrmcApply), line: leaf.line, col: leaf.col, ty: leaf.ty, mode: leaf.mode },
         [leaf])
 
 fn trmc_rewrite_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], c_sym_str: String,
