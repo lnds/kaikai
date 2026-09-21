@@ -2223,13 +2223,47 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / 
 # beats emitting a call to a symbol that does not exist.
 fn emit_mark_call(src: String, m: Mark, args_e: [Expr], cx: EmitCtx) : String / Console =
   match m {
+    # Both drop marks lower to the runtime decref, which returns unit so
+    # the call site still type-checks as a value.
     MkGuardDrop -> match args_e {
       [a] -> concat_all(["kai_internal_drop(", emit_expr(src, a, cx), ")"])
       _   -> "kai_unit() /* guard drop: arity mismatch */"
     }
+    MkDrop -> match args_e {
+      [a] -> concat_all(["kai_internal_drop(", emit_expr(src, a, cx), ")"])
+      _   -> "kai_unit() /* drop: arity mismatch */"
+    }
     MkBorrow -> match args_e {
       [a] -> emit_expr(src, a, cx)
       _   -> "kai_unit() /* borrow: arity mismatch */"
+    }
+    # A borrowing indirect call: slot 0 is invoked without being consumed
+    # (no closure decref), so the caller keeps the ref and drops after its
+    # last use. The remaining args keep the owned convention.
+    MkApplyBorrow -> match args_e {
+      [fv, ...rest] -> concat_all([
+        "kai_apply_borrow(", emit_expr(src, fv, cx), ", ",
+        int_to_string(list_length(rest)),
+        ", (KaiValue *[]){", emit_call_args(src, rest, cx), "})"
+      ])
+      _ -> "kai_unit() /* apply borrow: expected closure + args */"
+    }
+    # A non-modulo-cons tail leaf: plug the leaf value into the open cctx
+    # hole and return the spine root.
+    MkTrmcApply -> match args_e {
+      [leaf] -> concat_all([
+        "kai_cctx_apply_linear(_kai_acc, ", emit_expr(src, leaf, cx), ")"
+      ])
+      _ -> "kai_unit() /* trmc apply: arity mismatch */"
+    }
+    # Normally the enclosing call emits the closure plus the drop-after,
+    # having seen this mark on one of its args. Reaching here means a
+    # rarer path (a pipe splice) did not capture it as such an arg, so
+    # emit the inner value and skip the drop — a bounded leak, never a
+    # miscompile.
+    MkOwnedBorrow -> match args_e {
+      [g] -> emit_expr(src, g, cx)
+      _   -> "kai_unit() /* owned borrow: arity mismatch */"
     }
     _ -> concat_all(["kai_unit() /* no lowering for mark ", mark_name(m), " */"])
   }
@@ -2277,9 +2311,9 @@ fn emit_args_have_owned_borrow(args_e: [Expr]) : Bool = match args_e {
 }
 
 fn emit_is_owned_borrow(a: Expr) : Bool = match a.kind {
-  ECall(callee, _) -> match sym_read_kind(callee.kind) {
-    EVar(nm) -> nm == "__perceus_owned_borrow"
-    _        -> false
+  ECall(callee, _) -> match callee.kind {
+    EMark(MkOwnedBorrow) -> true
+    _                    -> false
   }
   _ -> false
 }
@@ -2423,15 +2457,6 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           }
           _ -> "kai_unit() /* trmc: malformed step sentinel */"
         }
-      } else if trmc_is_apply_sentinel(callee) {
-        # TRMC non-modulo-cons tail leaf: plug the leaf value into the
-        # open cctx hole and return the spine root.
-        match args_e {
-          [leaf] -> concat_all([
-            "kai_cctx_apply_linear(_kai_acc, ", emit_expr(src, leaf, cx), ")"
-          ])
-          _ -> "kai_unit() /* trmc: malformed apply sentinel */"
-        }
       } else if tcrec_is_sentinel(callee) {
         # Issue #37: self-tail-call site, planted by `tcrec_rewrite_decl`.
         # The callee carries `__kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...`;
@@ -2508,15 +2533,6 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
             concat_all(["kai_str(\"", nm, "\")"])
           }
           _ -> "kai_unit() /* unit_name: expected 1 arg */"
-        }
-      } else if callee == "__perceus_drop" {
-        # m5 #4 — AST-level drop, lowered to runtime `kai_decref`
-        # (returns Unit so the call site type-checks as KaiValue *).
-        match args_e {
-          [a] -> concat_all([
-            "kai_internal_drop(", emit_expr(src, a, cx), ")"
-          ])
-          _   -> "kai_unit() /* __perceus_drop: arity mismatch */"
         }
       } else if callee == "__perceus_reuse_cons" {
         # issue #118 — reuse-in-place for cons cells. The recogniser
@@ -2730,36 +2746,6 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
             "kai_decref(_a); kai_decref(_b); _r; })"
           ])
           _ -> "kai_unit() /* bit_toggle: expected 2 args */"
-        }
-      } else if callee == "__perceus_apply_borrow" {
-        # issue #1130 — borrowing indirect call. perceus rewrites a
-        # `f(args)` through a `^`-borrowed function-typed param into
-        # `__perceus_apply_borrow(f, args...)`. `f` is invoked WITHOUT
-        # being consumed (`kai_apply_borrow`, no closure decref); the
-        # caller keeps the ref and drops after last use. Args keep the
-        # owned convention. The first arg is the closure value; the rest
-        # are the call arguments.
-        match args_e {
-          [fv, ...rest] -> {
-            let rest_args = emit_call_args(src, rest, cx)
-            concat_all([
-              "kai_apply_borrow(", emit_expr(src, fv, cx), ", ",
-              int_to_string(list_length(rest)),
-              ", (KaiValue *[]){", rest_args, "})"
-            ])
-          }
-          _ -> "kai_unit() /* __perceus_apply_borrow: expected closure + args */"
-        }
-      } else if callee == "__perceus_owned_borrow" {
-        # issue #1130 rule 1 — normally `emit_call_expr` intercepts a call
-        # whose ARG is `__perceus_owned_borrow(g)` and emits the closure +
-        # drop-after. Reaching here means this marker was NOT captured as
-        # such an arg (a rarer emit path, e.g. a pipe splice). Degrade
-        # transparently: emit the inner `g` (materialise the closure). The
-        # drop-after is skipped — a bounded leak, never a miscompile.
-        match args_e {
-          [g] -> emit_expr(src, g, cx)
-          _   -> "kai_unit() /* __perceus_owned_borrow: expected 1 arg */"
         }
       } else if string_contains_dot(callee) {
         # m7a #6c/#6d/#6e: op call `Eff.op(args)`. Look up the
@@ -4319,10 +4305,8 @@ fn arm_tail_consumes_kind(k: ExprKind) : Bool = match k {
   # apply of a constructor rebuild (the token is consumed building the node).
   # Any other call (balance_left, …) does NOT consume the token → reject.
   ECall(f, xs) -> match sym_read_kind(f.kind) {
-    EVar(callee) ->
-      if trmc_is_step_sentinel(callee) { true }
-      else if trmc_is_apply_sentinel(callee) { arm_apply_is_ctor(xs) }
-      else { false }
+    EVar(callee) -> trmc_is_step_sentinel(callee)
+    EMark(MkTrmcApply) -> arm_apply_is_ctor(xs)
     _ -> false
   }
   _ -> false
@@ -8320,7 +8304,6 @@ fn emit_clause_assignments(eff_name: String, cs: [HClause],
 fn expr_is_perceus_drop_call(x: Expr) : Bool {
   match x.kind {
     ECall(callee, _) -> match sym_read_kind(callee.kind) {
-      EVar(nm) -> nm == "__perceus_drop"
       EMark(m) -> mark_is_drop(m)
       _ -> false
     }
@@ -15730,9 +15713,8 @@ fn tcrec_make_sentinel(sym: String, dropmask: Int, pnames: [String]) : String =
 # from the self-call's args (with <dropmask> reconciling Perceus's
 # exit-drops, exactly like tcrec_emit_goto), and `goto`s the entry label.
 #
-# A non-modulo-cons tail leaf is wrapped as
-#   ECall(EVar("__kai_trmc_apply"), [leaf_expr])
-# which the emitter lowers to `kai_cctx_apply_linear(_kai_acc, <leaf>)`.
+# A non-modulo-cons tail leaf is wrapped in the `MkTrmcApply` mark, which
+# the emitter lowers to `kai_cctx_apply_linear(_kai_acc, <leaf>)`.
 #
 # The ctor tag/mask/payload-types are resolved at emit time from
 # `cname` against `cx.variants` (the rewrite pass has no EmitCtx), so
@@ -15748,8 +15730,6 @@ fn trmc_make_step_sentinel(sym: String, holeslot: Int, cname: String,
   }
 
 fn trmc_is_step_sentinel(callee: String) : Bool = string_starts_with_q(callee, "__kai_trmc|")
-
-fn trmc_is_apply_sentinel(callee: String) : Bool = callee == "__kai_trmc_apply"
 
 # Issue #706: the sentinel wire-format helpers now live in
 # `emit_shared.kai` (`es_tcrec_*`) so both the C and LLVM emitters
@@ -15943,7 +15923,7 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int, o
 }
 
 fn trmc_wrap_apply(leaf: Expr) : ExprKind =
-  ECall(Expr { kind: EVar("__kai_trmc_apply"), line: leaf.line, col: leaf.col, ty: leaf.ty, mode: leaf.mode },
+  ECall(Expr { kind: EMark(MkTrmcApply), line: leaf.line, col: leaf.col, ty: leaf.ty, mode: leaf.mode },
         [leaf])
 
 fn trmc_rewrite_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], c_sym_str: String,

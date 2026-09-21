@@ -691,9 +691,8 @@ fn pcs_wrap_borrow_arms(arms: [Arm], borrowed: [String]) : [Arm] = match arms {
   }
 }
 
-# Callee side, closure (issue #1130). A direct call `f(args)` where `f` is
-# a borrowed function-typed param routes to the borrowing indirect call:
-# `__perceus_apply_borrow(f, args...)`. The closure ref stays with the
+# Callee side, closure. A direct call `f(args)` where `f` is a borrowed
+# function-typed param routes to the borrowing indirect call. The closure ref stays with the
 # caller (it is in the skip-set, never dup'd; its exit drop frees it once),
 # so the per-call incref/decref pair collapses. `bc` is the borrowed set
 # restricted to function-typed params — a value-typed borrowed param is
@@ -731,10 +730,10 @@ fn pcs_wrap_borrow_call_kind(k: ExprKind, bc: [String]) : ExprKind = match k {
   _ -> prc_map_expr_kind(k, (sub) => pcs_wrap_borrow_calls(sub, bc))
 }
 
-# Build `__perceus_apply_borrow(clo, args…)` from a closure callee expr and
-# its already-walked call args.
+# Build the borrowing indirect call from a closure callee expr and its
+# already-walked call args.
 fn pcs_apply_borrow_call(clo: Expr, args2: [Expr]) : ExprKind =
-  ECall(Expr { kind: EVar("__perceus_apply_borrow"), line: clo.line,
+  ECall(Expr { kind: EMark(MkApplyBorrow), line: clo.line,
                col: clo.col, ty: None, mode: MUnknown },
         [clo, ...args2])
 
@@ -790,11 +789,10 @@ fn pcs_strip_borrow_args_d(e: Expr, scx: StripCx) : Expr =
 fn pcs_strip_borrow_kind(k: ExprKind, scx: StripCx) : ExprKind = match k {
   ECall(callee, args_) -> {
     let key = pcs_callee_key(callee)
-    # `__perceus_apply_borrow(f, args…)` — arg0 is the borrowed closure
-    # itself (invoked, not consumed): position 0 is a borrow slot, so it
-    # must not take the dup-on-consume. Its remaining args keep the owned
-    # convention. Treat position 0 as borrowed for this call.
-    if key == "__perceus_apply_borrow" {
+    # The borrowing indirect call holds the closure it invokes in slot 0
+    # without consuming it, so that slot must not take the dup-on-consume
+    # while the rest keep the owned convention.
+    if pcs_callee_borrows_slot0(callee) {
       let args2 = pcs_strip_args_at_d(args_, [0], 0, scx)
       ECall(pcs_strip_borrow_args_d(callee, scx), args2)
     } else {
@@ -842,6 +840,12 @@ fn pcs_maybe_rename_borrow_prim(callee: Expr, key: String, positions: [Int]) : E
       None    -> callee
     }
   } else { callee }
+
+# A mark whose slot 0 holds a value it invokes rather than consumes.
+fn pcs_callee_borrows_slot0(callee: Expr) : Bool = match callee.kind {
+  EMark(MkApplyBorrow) -> true
+  _                    -> false
+}
 
 # The call key for a callee expr — bare EVar or resolved EModCall.
 #[doc("Call key for a callee expression: the bare name, or `mod.name` for a resolved module call.")]
@@ -943,8 +947,8 @@ fn pcs_arg_is_owned_rvalue(a: Expr) : Bool = match a.kind {
 
 # A bare `EVar(f)` argument (no dup wrap — it was suppressed by the skip-
 # set) whose name is a borrowed closure param of the current fn. Flowing to
-# an owned slot, it needs the dup-on-consume. A `__perceus_apply_borrow(f,…)`
-# arg is a CALL of `f`, not a value-flow, so it is not matched here.
+# an owned slot, it needs the dup-on-consume. A borrowing-indirect-call arg
+# is a CALL of `f`, not a value-flow, so it is not matched here.
 fn pcs_arg_is_bare_borrowed_closure(a: Expr, bclosures: [String]) : Bool = match a.kind {
   EVar(nm) -> list_has(bclosures, nm)
   _        -> false
@@ -960,7 +964,7 @@ fn pcs_arg_is_fn_name(a: Expr, fn_names: [String]) : Bool = match a.kind {
 
 fn pcs_wrap_owned_borrow(a: Expr) : Expr =
   Expr { kind: ECall(
-           Expr { kind: EVar("__perceus_owned_borrow"), line: a.line, col: a.col,
+           Expr { kind: EMark(MkOwnedBorrow), line: a.line, col: a.col,
                   ty: None, mode: MUnknown },
            [a]),
          line: a.line, col: a.col, ty: a.ty, mode: a.mode }
@@ -5005,7 +5009,7 @@ fn pcs_uses_has_name(uses: [Use], nm: String) : Bool {
 fn pcs_make_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
   SExprStmt(Expr {
     kind: ECall(
-      Expr { kind: EVar("__perceus_drop"), line: ln, col: cl,
+      Expr { kind: EMark(MkDrop), line: ln, col: cl,
              ty: None, mode: MUnknown },
       [Expr { kind: EVar(nm), line: ln, col: cl,
               ty: None, mode: MUnknown }]
@@ -5822,13 +5826,12 @@ fn pcs_drops_dead_in(drops: [Stmt], leaf: Expr) : [Stmt] / Console = match drops
   }
 }
 
-# The binder of a `pcs_make_drop_stmt` (`SExprStmt(ECall(EVar("__perceus_drop"), [EVar(nm)]))`).
+# The binder of a `pcs_make_drop_stmt`.
 fn pcs_drop_stmt_name(d: Stmt) : Option[String] = match d {
   SExprStmt(e) -> match e.kind {
     ECall(callee, args_) -> match sym_read_kind(callee.kind) {
-      EVar(cn) -> if cn == "__perceus_drop" {
+      EMark(MkDrop) ->
         match args_ { [a] -> match a.kind { EVar(nm) -> Some(nm) _ -> None } _ -> None }
-      } else { None }
       _ -> None
     }
     _ -> None

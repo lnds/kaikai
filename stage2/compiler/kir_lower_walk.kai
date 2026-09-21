@@ -2846,19 +2846,21 @@ fn ctor_home_of_expr_ty(x: Expr) : Option[String] = match x.ty {
 fn lower_mark_call(x: Expr, m: Mark, cargs: [Expr], st: LowerSt) : LRes / Console =
   if mark_is_drop(m) { lower_rc_unary(cargs, KDropMk, st) }
   else if mark_is_transparent(m) { lower_borrow_through(cargs, st) }
-  else {
-    eprint(concat_all(["kir: mark ", mark_name(m), " has no lowering"]))
-    LRes(KUnitV, st)
-  }
+  else { match m {
+    MkApplyBorrow -> lower_apply_borrow(x, cargs, st)
+    MkTrmcApply   -> lower_trmc_apply(x, cargs, st)
+    _ -> {
+      eprint(concat_all(["kir: mark ", mark_name(m), " has no lowering"]))
+      LRes(KUnitV, st)
+    }
+  } }
 
 # Dispatch a non-effect-op bare call by its `CalleeKind`.
 fn lower_named_call_kind(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console =
   match classify_callee(callee) {
     CkDup       -> lower_rc_unary(cargs, KDupMk, st)
-    CkDrop      -> lower_rc_unary(cargs, KDropMk, st)
     CkReuse     -> lower_reuse(x, callee, cargs, st)
     CkTrmcStep  -> lower_trmc_step(x, callee, cargs, st)
-    CkTrmcApply -> lower_trmc_apply(x, cargs, st)
     CkTcrec     -> lower_tcrec(x, callee, cargs, st)
     CkResume    -> lower_resume(x, cargs, st)
     # `__strip_unit(e)` is a compile-time unit erasure — identity at
@@ -2872,18 +2874,6 @@ fn lower_named_call_kind(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : 
     # — a shim that has no unit to read → empty string, so `#{t}` over a
     # `Real<s>` dropped its ` s` suffix (the Show-for-Real<u> display).
     CkUnitName  -> lower_unit_name(cargs, st)
-    # `__perceus_apply_borrow(f, args...)` (#1130) — a borrowing indirect
-    # call: `f` is invoked WITHOUT being consumed. perceus rewrites a
-    # `f(args)` through a `^`-borrowed function-typed param into this
-    # sentinel; the closure ref stays with the caller (dropped after last
-    # use), so no per-call KDup/KDrop of the closure. Lower `f` as the
-    # closure value and the rest as owned call args → `KCallIndirectBorrow`.
-    CkApplyBorrow -> lower_apply_borrow(x, cargs, st)
-    # `__perceus_owned_borrow(g)` — an owned value in a borrowed slot whose
-    # birth ref the caller drops after the call. The mark itself lowers
-    # transparently to the inner value; the enclosing call site emits the
-    # post-call KDrop (`ob_drop_after`).
-    CkOwnedBorrow -> lower_borrow_through(cargs, st)
     CkCtor      -> lower_ctor_call(x, ctor_home_of_expr_ty(x), callee, cargs, st)
     # A bare callee that resolves to a top-level fn is a direct call; one
     # that does not is a LOCAL binder holding a function value (a param /
@@ -2920,10 +2910,8 @@ fn lower_borrow_through(cargs: [Expr], st: LowerSt) : LRes / Console = match car
   _   -> LRes(KUnitV, st)
 }
 
-# `__perceus_apply_borrow(f, args...)` (#1130) — borrowing indirect call.
-# The first arg is the closure value, invoked WITHOUT being consumed; the
-# rest are the owned call arguments. Emits `KCallIndirectBorrow` (routed to
-# `kaix_apply_borrow` on native / `kai_apply_borrow` on the C oracle).
+# A borrowing indirect call. The first arg is the closure value, invoked
+# WITHOUT being consumed; the rest are the owned call arguments.
 fn lower_apply_borrow(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
   [fe, ...rest] ->
     match lower_expr(fe, st) { LRes(fv, st1) ->
@@ -3522,14 +3510,14 @@ fn lower_direct_call(x: Expr, sym: String, cargs: [Expr], st: LowerSt) : LRes / 
                   cargs, avs, kpos_of(x)) }
 }
 
-# A `__perceus_owned_borrow`-marked arg lowered to its inner value: the
-# callee borrows it and no binder holds it, so the caller releases the
-# birth ref right after the call (the C oracle's statement-expression
-# decref). The drop must follow the call op — before it is a UAF.
+# An owned value in a borrowed slot: the callee borrows it and no binder
+# holds it, so the caller releases the birth ref right after the call. The
+# mark lowers to its inner value and the call site emits the drop, which
+# must follow the call op — before it is a UAF.
 fn ob_is_marked(a: Expr) : Bool = match a.kind {
   ECall(callee, _) -> match callee.kind {
-    EVar(nm) -> nm == "__perceus_owned_borrow"
-    _        -> false
+    EMark(MkOwnedBorrow) -> true
+    _                    -> false
   }
   _ -> false
 }
@@ -3684,7 +3672,7 @@ fn trmc_self_args(xs: [Expr], hole: Int) : [Expr] = match xs {
     else         { trmc_self_args(rest, hole - 1) }
 }
 
-# `__kai_trmc_apply(leaf)` → KTrmcApply (plug leaf into the open hole).
+# The trmc apply mark → KTrmcApply (plug leaf into the open hole).
 #
 # A `KTrmcApply` is a terminal RET — it does NOT flow to the match's L0
 # continuation where `match_finish` plants the owned-scrutinee exit drop. When
