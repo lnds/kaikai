@@ -9510,19 +9510,19 @@ endif
 # A `test` body performs builtin effects directly and through a helper
 # whose row names them. The runner entry must install their defaults:
 # none may crash or report the effect unhandled, on either backend.
-ISSUE_2022_FIXTURE := issue_2022_test_body_builtin_effects
+ISSUE_2022_FIXTURE := ../examples/test-runner/builtin_effects
 
 define issue_2022_run
 	@set -e; \
-	f=$(ISSUE_2022_FIXTURE); out=build/$$f-$(1); \
+	f=$(ISSUE_2022_FIXTURE); out=build/issue-2022-$(1); \
 	rm -f issue_2022_test_body.tmp; \
-	../bin/kai test --backend=$(1) ../examples/effects/$$f.kai > $$out.stdout 2> $$out.raw \
+	../bin/kai test --backend=$(1) $$f.kai > $$out.stdout 2> $$out.raw \
 	  || { echo "issue-2022 FAIL ($(1): kai test exited non-zero)"; cat $$out.stdout $$out.raw; rm -f issue_2022_test_body.tmp; exit 1; }; \
 	rm -f issue_2022_test_body.tmp; \
 	grep -v '^kai: note' $$out.raw > $$out.stderr || true; \
 	cat $$out.stdout $$out.stderr > $$out.out; \
-	diff -q ../examples/effects/$$f.out.expected $$out.out > /dev/null \
-	  || { echo "issue-2022 DIFF ($(1))"; diff ../examples/effects/$$f.out.expected $$out.out; exit 1; }; \
+	diff -q $$f.test.expected $$out.out > /dev/null \
+	  || { echo "issue-2022 DIFF ($(1))"; diff $$f.test.expected $$out.out; exit 1; }; \
 	echo "issue-2022 OK ($(1): test bodies perform builtin effects)"
 endef
 
