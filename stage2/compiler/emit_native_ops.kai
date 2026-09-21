@@ -497,6 +497,7 @@ fn nprim_is_raw(nm: String) : Bool =
   nprim_raw_fbinop_op(nm) >= 0 or nprim_raw_fcmp_pred(nm) >= 0 or
   nprim_raw_ibinop_op(nm) >= 0 or nprim_raw_icmp_pred(nm) >= 0 or
   nprim_raw_u8binop_op(nm) >= 0 or nprim_raw_u8cmp_pred(nm) >= 0 or
+  nprim_is_i32cmp(nm) or
   nprim_fixed_prefix(nm) != ""
 
 # The box/unbox border prims for the raw fixed widths.
@@ -558,6 +559,22 @@ fn nprim_raw_u8cmp_pred(nm: String) : Int =
   else if nm == "u8>=" { 3 } else if nm == "u8==" { 4 } else if nm == "u8!=" { 5 }
   else { -1 }
 
+# The i32-domain comparison families (`b1` Bool, `ch` Char): both hold a
+# non-negative value in an i32 register — the Bool 0/1 form, a Char codepoint
+# — so one signed `icmp` serves them and only the load slot differs.
+fn nprim_is_i32cmp(nm: String) : Bool =
+  (string_starts_with_q(nm, "b1") or string_starts_with_q(nm, "ch")) and
+  nprim_i32cmp_pred(nm) >= 0
+
+fn nprim_i32cmp_slot(nm: String) : KSlot =
+  if string_starts_with_q(nm, "b1") { SBool } else { SChar }
+
+# The `icmp` predicate of an i32-domain comparison prim, or -1. The prefix is
+# two chars in both families.
+fn nprim_i32cmp_pred(nm: String) : Int =
+  if string_length(nm) < 3 { -1 }
+  else { nprim_fixed_cmp_pred(string_slice(nm, 2, string_length(nm) - 2)) }
+
 # The op suffix of a fixed-width prim (`i32+` → `+`, `i128*` → `*`). The
 # prefix width varies (`i32`/`u32`/`u64` are 3 chars, `i128` is 4), so the
 # slice starts after the actual prefix, not a hard-coded offset.
@@ -608,27 +625,26 @@ fn nemit_raw_prim(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console =
   else if nm == "band" { nemit_raw_logical(ctx, 1, cargs) }
   else if nm == "bor" { nemit_raw_logical(ctx, 0, cargs) }
   else if nprim_fixed_prefix(nm) != "" { nemit_raw_fixed_prim(ctx, nm, cargs) }
-  else {
-    let fop = nprim_raw_fbinop_op(nm)
-    if fop >= 0 { nemit_raw_fbinop(ctx, fop, cargs) }
-    else {
-      let iop = nprim_raw_ibinop_op(nm)
-      if iop >= 0 { nemit_raw_ibinop(ctx, iop, cargs) }
-      else {
-        let uop = nprim_raw_u8binop_op(nm)
-        if uop >= 0 { nemit_raw_u8binop(ctx, uop, cargs) }
-        else {
-          let up = nprim_raw_u8cmp_pred(nm)
-          if up >= 0 { nemit_raw_u8cmp(ctx, up, cargs) }
-          else {
-            let fp = nprim_raw_fcmp_pred(nm)
-            if fp >= 0 { nemit_raw_fcmp(ctx, fp, cargs) }
-            else { nemit_raw_icmp(ctx, nprim_raw_icmp_pred(nm), cargs) }
-          }
-        }
-      }
-    }
-  }
+  else { nemit_raw_binfamily(ctx, nm, cargs) }
+
+# The raw binary families, each keyed by its own prim prefix: Real `f`, Int
+# `i`, Byte `u8`, and the i32-domain comparisons (`b1` Bool, `ch` Char). The
+# i-family is last because its predicate reader is the fallback — every name
+# reaching here is one of these.
+fn nemit_raw_binfamily(ctx: Handle, nm: String, cargs: [KVal]) : Handle / Console = {
+  let fop = nprim_raw_fbinop_op(nm)
+  let iop = nprim_raw_ibinop_op(nm)
+  let uop = nprim_raw_u8binop_op(nm)
+  let up = nprim_raw_u8cmp_pred(nm)
+  let fp = nprim_raw_fcmp_pred(nm)
+  if fop >= 0 { nemit_raw_fbinop(ctx, fop, cargs) }
+  else if iop >= 0 { nemit_raw_ibinop(ctx, iop, cargs) }
+  else if uop >= 0 { nemit_raw_u8binop(ctx, uop, cargs) }
+  else if up >= 0 { nemit_raw_u8cmp(ctx, up, cargs) }
+  else if nprim_is_i32cmp(nm) { nemit_raw_i32cmp(ctx, nprim_i32cmp_pred(nm), nprim_i32cmp_slot(nm), cargs) }
+  else if fp >= 0 { nemit_raw_fcmp(ctx, fp, cargs) }
+  else { nemit_raw_icmp(ctx, nprim_raw_icmp_pred(nm), cargs) }
+}
 
 # `<op>(a, b)` raw `f64` arithmetic → one `fbinop` instruction. Both atoms
 # load raw (the registers are `f64`). No buffer, no call, no RC.
@@ -708,6 +724,18 @@ fn nemit_raw_u8cmp(ctx: Handle, pred: Int, cargs: [KVal]) : Handle / Console = m
     llvm_build_zext_i1_i32(native_ctx_b(ctx), i1v, native_ctx_i32t(ctx))
   }
   _ -> { nemit_unsupported(ctx, "raw u8 cmp arity"); nemit_null(ctx) }
+}
+
+# `<cmp>(a, b)` over two operands already in an i32 register (Bool 0/1, Char
+# codepoint) → `icmp` widened to the i32 `SBool` register. The slot is the
+# OPERAND's, not the result's — loading these at `SReal` is what routes a
+# Bool through `kaix_real_field`.
+fn nemit_raw_i32cmp(ctx: Handle, pred: Int, slot: KSlot, cargs: [KVal]) : Handle / Console = match cargs {
+  [a, b] -> {
+    let i1v = llvm_build_icmp(native_ctx_b(ctx), pred, nemit_atom_raw(ctx, a, slot), nemit_atom_raw(ctx, b, slot))
+    llvm_build_zext_i1_i32(native_ctx_b(ctx), i1v, native_ctx_i32t(ctx))
+  }
+  _ -> { nemit_unsupported(ctx, "raw i32 cmp arity"); nemit_null(ctx) }
 }
 
 # --- raw fixed-width (Int32/UInt32/UInt64/Int128) op family ---
