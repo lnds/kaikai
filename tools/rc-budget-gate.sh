@@ -13,6 +13,10 @@
 #
 # Each shape below exercises a different owner: a tree that shares nothing,
 # a pipe chain over a list, and strings through interpolation.
+#
+# The backend is pinned: the two emit different counts for the same shape
+# (native folds a drop the C path pays), so a floating default would read a
+# tree built with KAI_LLVM=1 against numbers taken from the other backend.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,7 +30,7 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK"
 
 measure() {
-  "$KAI" build "$SRC/$1.kai" -o "$WORK/$1" >/dev/null 2>&1 \
+  KAI_BACKEND="${RC_BUDGET_BACKEND:-c}" "$KAI" build "$SRC/$1.kai" -o "$WORK/$1" >/dev/null 2>&1 \
     || { echo "rc-budget: $1 failed to build" >&2; return 1; }
   KAI_TRACE_RC=1 KAI_THREADS=1 "$WORK/$1" 2>&1 >/dev/null \
     | sed -n 's/.*incref_total=\([0-9]*\) decref_total=\([0-9]*\).*/\1 \2/p' \
