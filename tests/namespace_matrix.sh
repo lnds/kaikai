@@ -22,7 +22,7 @@ CORPUS="$ROOT/examples/namespace-collisions"
 # both are structural errors here.
 axis_golden() {
   case "$1" in
-    c|native|asan|modular) echo main.out.expected ;;
+    c|native|native-modular|asan|modular) echo main.out.expected ;;
     neg|neg-native|neg-modular) echo main.err.expected ;;
     diag) echo DIAG.expected ;;
     testsym) echo main.test.expected ;;
