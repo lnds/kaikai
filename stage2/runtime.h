@@ -9836,8 +9836,11 @@ static KaiValue *kai_core_string_to_int(KaiValue *s) {
         memcpy(buf, s->as.s.bytes, s->as.s.len);
         buf[s->as.s.len] = '\0';
         char *end = NULL;
+        /* strtoll saturates to LLONG_MIN/MAX on overflow and reports it
+         * only through errno, which it never clears on success. */
+        errno = 0;
         long long v = strtoll(buf, &end, 10);
-        if (end && *end == '\0' && end != buf) {
+        if (end && *end == '\0' && end != buf && errno != ERANGE) {
             value = (int64_t) v;
             ok = 1;
         }
@@ -9858,8 +9861,14 @@ static KaiValue *kai_core_string_to_real(KaiValue *s) {
         memcpy(buf, s->as.s.bytes, s->as.s.len);
         buf[s->as.s.len] = '\0';
         char *end = NULL;
+        /* strtod saturates to ±HUGE_VAL on overflow and reports it only
+         * through errno. ERANGE also covers underflow, where the result
+         * is a subnormal or zero — that is ordinary precision loss, not
+         * a parse failure, so only the infinite case is rejected. */
+        errno = 0;
         double v = strtod(buf, &end);
-        if (end && *end == '\0' && end != buf) {
+        if (end && *end == '\0' && end != buf
+            && !(errno == ERANGE && (v >= HUGE_VAL || v <= -HUGE_VAL))) {
             value = v;
             ok = 1;
         }
