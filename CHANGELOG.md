@@ -84,6 +84,26 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.119.2 (2026-09-21)
+
+### Fixed
+
+- **fmt**: stop a dropped last file from failing the package run (#2017)
+- **runtime**: reject numeric parses that overflow instead of saturating (#2015)
+- **rc-budget**: give each backend its own baseline
+- **kir**: lower a mark read in value position (#2009)
+- **stdlib**: strip credentials on cross-origin HTTP redirects (#2005)
+- **fmt**: parenthesise a pipe an arrow lambda's body heads (#2006)
+- **compiler**: carry a declaration's identity through the passes that rewrite its body (#2001)
+
+### Changed
+
+- **compiler**: give four more synthetic markers their own constructor (#2010)
+- **compiler**: give each of EVar's three uses its own constructor (#2008)
+- **compiler**: specialise by identity, and pin where a bare reference may still be minted (#2004)
+- **compiler**: give a nominal type and a synthesised reference one place to be built (#2003)
+- **compiler**: confine the respelling and measure what blocks its retirement (#1994) (#2002)
+
 ## v0.119.1 (2026-09-18)
 
 ### Fixed
