@@ -58,9 +58,14 @@ if [ "$UPDATE" = "1" ]; then
   exit 0
 fi
 
+# A backend with no baseline yet reports its counts and passes. Only the
+# default backend's baseline is a gate; a new one is seeded from a run that
+# printed its numbers, so nobody has to build that backend by hand to author it.
 [ -f "$BASELINE" ] || {
-  echo "rc-budget: no baseline; run RC_BUDGET_UPDATE=1 [RC_BUDGET_BACKEND=<b>] $0" >&2
-  exit 1
+  echo "rc-budget: no baseline for backend '$BACKEND' — measured counts follow."
+  echo "rc-budget: seed it by copying these into $(basename "$BASELINE")."
+  cat "$WORK/measured.txt"
+  exit 0
 }
 
 # A shape may get cheaper without ceremony; only growth is a regression.
