@@ -10,6 +10,8 @@ import compiler.ast
 import compiler.util
 import compiler.mutate
 import compiler.mutate_ops
+import compiler.mutate_splice
+import compiler.lex
 
 #[doc("Render one mutation site as a tab-separated record: index, operator, line, column, description.")]
 pub fn mut_site_line(idx: Int, file: String, site: MutSite) : String =
@@ -28,25 +30,93 @@ fn mut_numbered(sites: [MutSite], i: Int, acc: [String]) : [String] {
   }
 }
 
-#[doc("Render the site catalogue as a JSON array, matching the `--lint-json` discipline.")]
-pub fn mut_sites_json(file: String, sites: [MutSite]) : String =
-  concat_all(["[", join_with(mut_json_items(file, sites, 0, []), ", "), "]"])
+# --- JSON catalogue ---------------------------------------------------
+#
+# Beyond the anchor, each site carries what an external driver needs to
+# diff, cache and suppress it without re-reading the source: the exact
+# span, its text before and after, and a semantic key — enclosing
+# declaration, operator, original text, ordinal — that survives edits
+# elsewhere in the file.
 
-fn mut_json_items(file: String, sites: [MutSite], i: Int, acc: [String]) : [String] {
+# A site with its resolved edit. An unresolvable site has no edit and
+# an empty original.
+type MutRow = MRow(Int, MutSite, Option[MutEdit], String)
+
+#[doc("Render the site catalogue as a JSON array, matching the `--lint-json` discipline. `module` qualifies each site's enclosing declaration.")]
+pub fn mut_sites_json(file: String, module: String, sites: [MutSite], toks: [Token], src: String) : String = {
+  let rows = mut_rows(sites, toks, src, 0, [])
+  let items = map(rows, (r) => mut_row_json(file, module, r, mut_ordinal(r, rows)))
+  concat_all(["[", join_with(items, ",\n "), "]"])
+}
+
+fn mut_rows(sites: [MutSite], toks: [Token], src: String, i: Int, acc: [MutRow]) : [MutRow] {
   match sites {
     [] -> list_reverse(acc)
-    [s, ...rest] ->
-      mut_json_items(file, rest, i + 1, list_append([mut_site_json(file, i, s)], acc))
+    [s, ...rest] -> mut_rows(rest, toks, src, i + 1, list_append([mut_row(i, s, toks, src)], acc))
   }
 }
 
-fn mut_site_json(file: String, i: Int, s: MutSite) : String =
-  concat_all([
+fn mut_row(i: Int, s: MutSite, toks: [Token], src: String) : MutRow =
+  match mut_edit_of(s, toks, src) {
+    None -> MRow(i, s, None, "")
+    Some(ed) -> MRow(i, s, Some(ed),
+                     mut_span_text(src, mpoint_byte(medit_start(ed)), mpoint_byte(medit_end(ed))))
+  }
+
+fn mrow_start(r: MutRow) : Int = match r {
+  MRow(_, _, Some(ed), _) -> mpoint_byte(medit_start(ed))
+  MRow(_, _, None, _) -> 0 - 1
+}
+
+# 1-based rank of a row among the rows sharing its enclosing
+# declaration, operator and original text, in source order. Ties on the
+# start byte (a call and the literal it wraps can both begin there) fall
+# back to catalogue order.
+fn mut_ordinal(r: MutRow, rows: [MutRow]) : Int =
+  1 + list_length(filter(rows, (o) => mut_same_key(o, r) and mut_precedes(o, r)))
+
+fn mut_same_key(a: MutRow, b: MutRow) : Bool = match a {
+  MRow(_, sa, _, oa) -> match b {
+    MRow(_, sb, _, ob) ->
+      ms_scope(sa) == ms_scope(sb) and mut_op_name(ms_op(sa)) == mut_op_name(ms_op(sb)) and oa == ob
+  }
+}
+
+fn mut_precedes(a: MutRow, b: MutRow) : Bool = match a {
+  MRow(ia, _, _, _) -> match b {
+    MRow(ib, _, _, _) ->
+      mrow_start(a) < mrow_start(b) or (mrow_start(a) == mrow_start(b) and ia < ib)
+  }
+}
+
+fn mut_row_json(file: String, module: String, r: MutRow, ordinal: Int) : String = match r {
+  MRow(i, s, ed, orig) -> concat_all([
     "{\"id\": ", int_to_string(i),
     ", \"file\": ", json_quote(file),
     ", \"line\": ", int_to_string(ms_line(s)),
     ", \"col\": ", int_to_string(ms_col(s)),
     ", \"operator\": ", json_quote(mut_op_name(ms_op(s))),
+    mut_edit_json(ed, orig),
+    ", \"enclosing\": ", json_quote(concat_all([module, ".", ms_scope(s)])),
+    ", \"ordinal\": ", int_to_string(ordinal),
     ", \"description\": ", json_quote(mut_op_blurb(ms_op(s))),
     "}"
   ])
+}
+
+# An unresolvable site keeps the new keys, as `null`, so every record
+# has the same shape.
+fn mut_edit_json(ed: Option[MutEdit], orig: String) : String = match ed {
+  None -> ", \"start\": null, \"end\": null, \"original\": null, \"replacement\": null"
+  Some(e) -> concat_all([
+    ", \"start\": ", mut_point_json(medit_start(e)),
+    ", \"end\": ", mut_point_json(medit_end(e)),
+    ", \"original\": ", json_quote(orig),
+    ", \"replacement\": ", json_quote(medit_text(e))
+  ])
+}
+
+fn mut_point_json(p: MutPoint) : String =
+  concat_all(["{\"line\": ", int_to_string(mpoint_line(p)),
+              ", \"col\": ", int_to_string(mpoint_col(p)),
+              ", \"byte\": ", int_to_string(mpoint_byte(p)), "}"])
