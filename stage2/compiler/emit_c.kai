@@ -45,6 +45,7 @@
 # compiler.protos, and compiler.emit_shared (the backend-shared layer).
 
 import compiler.ast
+import compiler.marks
 import compiler.sym_read
 import compiler.diag_file
 import compiler.kinds
@@ -845,6 +846,7 @@ fn walk_bare_callees(e: Expr, acc: [String]) : [String] = match e.kind {
   EStr(_, _)          -> acc
   EUnit               -> acc
   EVar(_)             -> acc
+  EMark(_)             -> acc
   ESym(_, _)             -> acc
   EUnder              -> acc
   EPlaceholder        -> acc
@@ -1113,6 +1115,7 @@ fn report_unused_in_expr(file: String, e: Expr) : Unit / Console + File {
     EStr(_, _) -> ()
     EUnit -> ()
     EVar(_) -> ()
+    EMark(_) -> ()
     ESym(_, _) -> ()
     EUnder -> ()
     EPlaceholder -> ()
@@ -2206,7 +2209,32 @@ fn emit_reuse_variant_body(src: String, cname: String, cargs: [Expr],
   }
 }
 
-fn emit_call_expr(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
+fn emit_call_expr(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console =
+  match f.kind {
+    # A mark in callee position names no C symbol: it asks for a
+    # lowering the mark itself decides, so it never enters the
+    # spelling-keyed dispatch below.
+    EMark(m) -> emit_mark_call(src, m, args_e, cx)
+    _        -> emit_call_expr_named(src, f, args_e, cx)
+  }
+
+# The C a mark lowers to. A mark the C backend does not lower reaches
+# here only if a pass planted one this emitter never learned; naming it
+# beats emitting a call to a symbol that does not exist.
+fn emit_mark_call(src: String, m: Mark, args_e: [Expr], cx: EmitCtx) : String / Console =
+  match m {
+    MkGuardDrop -> match args_e {
+      [a] -> concat_all(["kai_internal_drop(", emit_expr(src, a, cx), ")"])
+      _   -> "kai_unit() /* guard drop: arity mismatch */"
+    }
+    MkBorrow -> match args_e {
+      [a] -> emit_expr(src, a, cx)
+      _   -> "kai_unit() /* borrow: arity mismatch */"
+    }
+    _ -> concat_all(["kai_unit() /* no lowering for mark ", mark_name(m), " */"])
+  }
+
+fn emit_call_expr_named(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
 
   # issue #1130 rule 1 — drop-after-call for a freshly materialised closure
   # in a borrowed slot. perceus marks such an arg `__perceus_owned_borrow(g)`;
@@ -2481,7 +2509,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           }
           _ -> "kai_unit() /* unit_name: expected 1 arg */"
         }
-      } else if callee == "__perceus_drop" or callee == "__perceus_guard_drop" {
+      } else if callee == "__perceus_drop" {
         # m5 #4 — AST-level drop, lowered to runtime `kai_decref`
         # (returns Unit so the call site type-checks as KaiValue *).
         match args_e {
@@ -2721,13 +2749,6 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
             ])
           }
           _ -> "kai_unit() /* __perceus_apply_borrow: expected closure + args */"
-        }
-      } else if callee == "__perceus_borrow" {
-        # RC-transparent marker, never a runtime function: emit the inner
-        # value instead of minting an undeclared C identifier.
-        match args_e {
-          [a] -> emit_expr(src, a, cx)
-          _   -> "kai_unit() /* __perceus_borrow: expected 1 arg */"
         }
       } else if callee == "__perceus_owned_borrow" {
         # issue #1130 rule 1 — normally `emit_call_expr` intercepts a call
@@ -5446,11 +5467,9 @@ fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : String 
 # exit (the owner up the call stack reclaims it). Returns the inner
 # scrutinee expr when the wrap is present.
 fn match_borrow_inner(scrut: Expr) : Option[Expr] = match scrut.kind {
-  ECall(callee, args_) -> match sym_read_kind(callee.kind) {
-    EVar(nm) -> if nm == "__perceus_borrow" {
-      match args_ { [inner] -> Some(inner) _ -> None }
-    } else { None }
-    _ -> None
+  ECall(callee, args_) -> match callee.kind {
+    EMark(MkBorrow) -> match args_ { [inner] -> Some(inner)  _ -> None }
+    _               -> None
   }
   _ -> None
 }
@@ -7454,6 +7473,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
   # compile error rather than dead-code cleanup.
   match sym_read_kind(x.kind) {
     ESym(_, name) -> emit_ident_value(name, cx.lcs, cx.fns, cx.variants, cx.core)
+    EMark(m) -> emit_ident_value(mark_name(m), cx.lcs, cx.fns, cx.variants, cx.core)
     # Fix B (bidirectional list literals): when an Int literal is
     # checked against a Byte-context (e.g. inside `let bs: [Byte] = [65, 66]`),
     # the typer rewrites the node's ty to TyByte. Emit a Byte
@@ -8300,7 +8320,8 @@ fn emit_clause_assignments(eff_name: String, cs: [HClause],
 fn expr_is_perceus_drop_call(x: Expr) : Bool {
   match x.kind {
     ECall(callee, _) -> match sym_read_kind(callee.kind) {
-      EVar(nm) -> nm == "__perceus_drop" or nm == "__perceus_guard_drop"
+      EVar(nm) -> nm == "__perceus_drop"
+      EMark(m) -> mark_is_drop(m)
       _ -> false
     }
     _ -> false
@@ -11218,6 +11239,7 @@ fn desugar_interp_kind(k: ExprKind, cx: InterpCtx,
     EChar(_)       -> k
     EUnit          -> k
     EVar(_)        -> k
+    EMark(_)        -> k
     ESym(_, _)        -> k
     EUnder         -> k
     EPlaceholder   -> k
