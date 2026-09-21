@@ -13,6 +13,18 @@ than every binary operator, so a bare prefix is well-formed only on an
 atom. `make -C stage2 test-mutate-negate-shapes` pins the catalogue and
 `--check`s every `negate` mutant.
 
+`site_data.kai` pins the `--mutate-list-json` catalogue in
+`site_data.sites.json.expected`: every operator, an arm inside an impl
+method, a const, and a repeated `(operator, original)` pair.
+`make -C stage2 test-mutate-site-data` diffs it and checks that each
+`--mutate-apply` mutant is the source with the reported span replaced.
+Regenerate it from `stage2/` so the `file` field matches:
+
+```sh
+cd stage2 && ./kaic2 --mutate-list-json ../examples/mutate/site_data.kai --path ../stdlib \
+  > ../examples/mutate/site_data.sites.json.expected
+```
+
 Regenerate the golden after an intentional operator change:
 
 ```sh

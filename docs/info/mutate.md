@@ -119,6 +119,40 @@ Three things keep it usable:
 - **A compile-failure costs no oracle run at all.** It is detected by
   the build the oracle starts with.
 
+## External drivers
+
+The compiler splits the work the same way for any driver: `kaic2
+--mutate-list-json <file>` catalogues the sites, `kaic2 --mutate-apply
+<i> <file>` prints the source with site `i` applied. Each JSON site
+carries enough to diff, cache and suppress it without re-reading the
+source:
+
+```json
+{"id": 4, "file": "src/planner.kai", "line": 42, "col": 7,
+ "operator": "compare",
+ "start": {"line": 42, "col": 7, "byte": 1180},
+ "end":   {"line": 42, "col": 9, "byte": 1182},
+ "original": ">=", "replacement": ">",
+ "enclosing": "planner.order_sites/2", "ordinal": 1,
+ "description": "shift a comparison boundary"}
+```
+
+- `start` / `end` — the half-open span the mutation rewrites; line and
+  column 1-based, byte offset 0-based. The mutant is exactly the source
+  with `[start.byte, end.byte)` replaced by `replacement`.
+- `original` — the span's source text; `replacement` — what replaces
+  it, `""` for a deletion (an `arm` site's span is the whole arm).
+- `enclosing` — the declaration the site lives in: `module.fn/arity`,
+  `module.CONST`, or `module.(Show for Color).show/1` for an impl
+  method.
+- `ordinal` — 1-based rank among the sites sharing `enclosing`,
+  `operator` and `original`, in source order.
+
+`enclosing` + `operator` + `original` + `ordinal` identify a site
+across edits elsewhere in the file, which `<file>:<line>:<operator>`
+does not. A site whose span cannot be resolved reports these keys as
+`null`.
+
 ## Equivalent mutants
 
 Some mutants mean exactly what the original meant. They can never be
