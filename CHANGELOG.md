@@ -84,6 +84,24 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.121.0 (2026-09-22)
+
+### Added
+
+- **parse**: a leading bar declares a single-member sum (#2049)
+- **test**: machine-readable results and test selection for kai test (#2043)
+
+### Fixed
+
+- **emit**: a lambda captures a match-arm binder that shadows a global (#2048)
+- **perceus**: count a binder read through the operand of `!` as a use (#2039)
+- **stage1**: a lambda captures a local that shadows a global name (#2047)
+- **protos**: accept a derived field typed by the type's own parameter (#2045)
+- **emit**: dup the register a shadowed match binder actually bound (#2044)
+- **emit**: negate a raw Bool logically, not bitwise (#2042)
+- **protos**: give a derived impl over a generic type its type parameters (#2041)
+- **emit**: a root pub fn shadows a same-name core fn under its own name, not stdlib's (#2033)
+
 ## v0.120.0 (2026-09-21)
 
 ### Added
