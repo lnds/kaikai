@@ -84,6 +84,19 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.120.0 (2026-09-21)
+
+### Added
+
+- **mutate**: emit full site data in --mutate-list-json (#2025)
+
+### Fixed
+
+- **typer**: resolve a record field's constructor from the field's type (#2030)
+- **emit**: install default handlers in test, bench and check entries (#2026)
+- **emit**: compare raw Bool and Char operands with icmp, not the Real family (#2029)
+- **typer**: reject a spawned thunk that captures mutable state (#2024)
+
 ## v0.119.2 (2026-09-21)
 
 ### Fixed
