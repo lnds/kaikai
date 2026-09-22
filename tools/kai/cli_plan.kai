@@ -1,0 +1,133 @@
+#[doc("A resolved build: the pieces every backend path shares — kaic2 invocation, diagnostics, runtime owner object, link.")]
+
+import cli_caches
+import cli_err
+import cli_fs
+import cli_hash
+import cli_nativedeps
+import cli_proc
+import cli_sys
+import cli_toolchain
+
+#[doc("The codegen backend, and whether a flag or `KAI_BACKEND` chose it (an implicit native degrades on a C-only kaic2).")]
+pub type Backend = { name: String, explicit: Bool }
+
+#[doc("One build request: entry file, scratch dir, output binary, the verb naming it in messages, extra kaic2 flags.")]
+pub type Job = { src: String, tmp: String, out: String, verb: String, extra: [String] }
+
+#[doc("A build once the package around the entry file is resolved: the kaic2 flags before the entry, and the native dependencies.")]
+pub type Plan = {
+  t: Toolchain,
+  job: Job,
+  src_dir: String,
+  flags: [String],
+  native: [Native],
+  native_objs: [String],
+  libs: [String]
+}
+
+#[doc("Optimisation level for the runtime owner object: only -O0 keeps the thread pointer from being cached across a fiber's context switch.")]
+pub const OWNER_OPT : String = "-O0"
+
+#[doc("The kaic2 argv for `entry`: the emit flags, the plan's flags, the job's extra flags, then the entry.")]
+pub fn kaic2(p: Plan, emit: [String], entry: String) : [String] =
+  [p.t.layout.kaic2, ...emit] ++ p.flags ++ p.job.extra ++ [entry]
+
+#[doc("How kaic2 runs: `KAI_TRACE_RC` removed (the trace belongs to the user's program), `set` added, output to the named files.")]
+pub fn kaic2_spawn(set: [(String, String)], out: String, err: String) : Spawn =
+  cli_proc.Spawn { dir: "", out, err, set, unset: ["KAI_TRACE_RC"] }
+
+#[doc("The C compiler as a command: `$CC` split into words.")]
+pub fn cc(t: Toolchain) : [String] = cli_proc.words(t.cc)
+
+#[doc("Replace the path kaic2 was handed with the user's own in a captured diagnostics file.")]
+pub fn rewrite_paths(file: String, from: String, to: String) : Unit / File =
+  match read_file(file) {
+    Ok(s) if s != "" -> {
+      let _ = write_file(file, string.replace(s, from, to))
+    }
+    _ -> ()
+  }
+
+#[doc("Replay a captured stderr file, when it holds anything.")]
+pub fn replay(file: String) : Unit / Ffi =
+  if cli_sys.size(file) > 0 { cli_sys.copy_to_stderr(file) }
+
+#[doc("True when a captured file names the sentinel a kaic2 without libLLVM prints for a native emit.")]
+pub fn c_only(err_file: String) : Bool / File =
+  string_contains(cli_fs.read_or_empty(err_file), "not built into this compiler")
+
+#[doc("Run a link line; on failure name the `[native]` causes and fail with `<what> link failed`.")]
+pub fn link(p: Plan, argv: [String], what: String) : Result[Unit, Int] / Stderr + Env + File + Ffi =
+  if cli_proc.run(argv, cli_proc.inherit()) == 0 {
+    Ok(())
+  } else {
+    cli_nativedeps.link_hint(p.native)
+    cli_err.die("#{what} link failed")
+  }
+
+#[doc("""
+The runtime owner object for `src` compiled with `defs`, cached under the
+native-modular cache by content; empty when the cache or the compile fails
+(the caller then compiles the runtime into its link line).
+""")]
+pub fn runtime_obj(t: Toolchain, src: String, defs: [String]) : String / Env + File + Ffi {
+  let dir = "#{cli_caches.root("KAI_NATIVE_MODULAR_CACHE_DIR", "nmodular", t.os)}/runtime"
+  let hdr_c = "#{t.inc_c}/runtime.h"
+  let hdr = "#{t.inc}/runtime.h"
+  let headers = (if cli_sys.is_file(hdr_c) { [cli_hash.Bytes(hdr_c)] } else { [] })
+    ++ (if cli_sys.is_file(hdr) and hdr != hdr_c { [cli_hash.Bytes(hdr)] } else { [] })
+  let head = cli_hash.lines([
+    t.cc,
+    string.join(t.cflags_compile, " "),
+    OWNER_OPT,
+    string.join(defs, " "),
+    cli_toolchain.host(t)
+  ])
+  let obj = "#{dir}/#{cli_hash.digest([head, cli_hash.Bytes(src), ...headers])}.o"
+  let part = "#{obj}.#{cli_sys.getpid()}"
+  let argv = cc(t)
+    ++ t.cflags_compile
+    ++ [OWNER_OPT, ...defs]
+    ++ ["-I", t.inc_c, "-I", t.inc, "-c", src, "-o", part]
+  if not cli_fs.mkdir_p(dir) {
+    ""
+  } else if cli_sys.is_file(obj) {
+    obj
+  } else if cli_proc.run(argv, cli_proc.Spawn { ...cli_proc.inherit(), err: "/dev/null" }) == 0
+    and file_rename(part, obj).is_ok() {
+    obj
+  } else {
+    let _ = file_delete(part)
+    ""
+  }
+}
+
+#[doc("The lines of a file as words — the object list kaic2 prints, one path per line.")]
+pub fn listed(file: String) : [String] / File = cli_proc.words(cli_fs.read_or_empty(file))
+
+#[doc("The nonce of a marker stream (`//KAIDELIM:<nonce>` on line 1), or empty for plain output.")]
+pub fn nonce(text: String) : String {
+  let first = list.head(string.split(text, "\n")).unwrap_or("")
+  string.drop_prefix(first, "//KAIDELIM:").unwrap_or("")
+}
+
+# One `//KAIFILE:<nonce>::<name>` section: its lines, each newline-terminated; none, no file.
+fn write_section(dir: String, piece: String, last: Bool) : Unit / File =
+  match string.index_of(piece, "\n") {
+    None -> ()
+    Some(i) -> {
+      let body = string_slice(piece, i + 1, string_length(piece) - i - 1)
+      let text = if last and string.ends_with(body, "\n") { body } else { body ++ "\n" }
+      if body != "" or (not last) {
+        let _ = write_file("#{dir}/#{string_slice(piece, 0, i)}", text)
+      }
+    }
+  }
+
+#[doc("Carve a marker stream into its files under `dir`: each `//KAIFILE:<nonce>::<name>` line opens the next file.")]
+pub fn split_stream(text: String, n: String, dir: String) : Unit / File {
+  let pieces = list.drop(string.split(text, "\n//KAIFILE:#{n}::"), 1)
+  let last = list.length(pieces) - 1
+  list.enumerate(pieces) |> foreach(p => write_section(dir, p.snd, p.fst == last))
+}

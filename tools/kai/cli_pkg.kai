@@ -1,0 +1,174 @@
+#[doc("Package dependencies at build time, through the kai-pkg helper: auto-install and the dependency roots.")]
+
+import path
+import cli_caches
+import cli_err
+import cli_fs
+import cli_manifest
+import cli_proc
+import cli_sys
+import cli_toolchain
+
+fn newer(a: String, b: String) : Bool / Ffi = cli_sys.mtime(a) > cli_sys.mtime(b)
+
+fn stale(src: String, bin: String) : Bool / Ffi = (not cli_sys.is_exec(bin)) or newer(src, bin)
+
+# Wait for another invocation's build lock; true once `bin` is current.
+fn await_lock(lock: String, src: String, bin: String, waited: Int) : Bool / File + Ffi =
+  match dir_create_dir(lock) {
+    Ok(_) -> false
+    Err(_) -> if waited >= 120 {
+      cli_sys.remove_tree(lock)
+      await_lock(lock, src, bin, waited)
+    } else {
+      cli_sys.sleep(1)
+      if stale(src, bin) { await_lock(lock, src, bin, waited + 1) } else { true }
+    }
+  }
+
+fn build_now(
+  t: Toolchain,
+  label: String,
+  src: String,
+  bin: String
+) : Result[Unit, Int] / Stderr + File + Ffi {
+  Stderr.eprint("kai: building #{label} ...")
+  let tmp_bin = "#{bin}.tmp.#{cli_sys.getpid()}"
+  let argv = ["#{t.layout.root}/bin/kai", "build", src, "-o", tmp_bin]
+  let built = cli_proc.run(argv, cli_proc.Spawn { ...cli_proc.inherit(), out: "&2" }) == 0
+  if built and file_rename(tmp_bin, bin).is_ok() {
+    Ok(())
+  } else {
+    let _ = file_delete(tmp_bin)
+    cli_err.die("failed to build #{label} from #{src}")
+  }
+}
+
+# Build a helper tool through `bin/kai build`, atomically and under a lock,
+# so concurrent invocations sharing a checkout never run a half-linked binary.
+fn build_helper(
+  t: Toolchain,
+  label: String,
+  src: String,
+  bin: String
+) : Result[Unit, Int] / Stderr + File + Ffi {
+  let lock = "#{bin}.lock"
+  if (not stale(src, bin)) or await_lock(lock, src, bin, 0) {
+    Ok(())
+  } else {
+    let r = if stale(src, bin) { build_now(t, label, src, bin) } else { Ok(()) }
+    cli_sys.remove_tree(lock)
+    r
+  }
+}
+
+#[doc("The kai-pkg helper: shipped in an installed prefix, built on first use in a checkout.")]
+pub fn ensure_kaipkg(t: Toolchain) : Result[String, Int] / Stderr + File + Ffi {
+  let root = t.layout.root
+  if not t.layout.dev {
+    let bin = "#{root}/libexec/kaikai/kai-pkg"
+    if cli_sys.is_exec(bin) {
+      Ok(bin)
+    } else {
+      cli_err.die("kai-pkg binary missing at #{bin} — installation is corrupt")
+    }
+  } else {
+    let bin = "#{root}/tools/kai-pkg/kai-pkg"
+    build_helper(t, "tools/kai-pkg", "#{root}/tools/kai-pkg/main.kai", bin).map(u => bin)
+  }
+}
+
+#[doc("Where kai-pkg keeps fetched packages.")]
+pub fn cache_root(t: Toolchain) : String / Env = cli_caches.root("KAIKAI_CACHE", "pkg", t.os)
+
+fn assigns_after(line: String, key: String) : Bool =
+  list.drop(string.split(line, key), 1)
+    |> list.any(after => string.starts_with(string.trim_left(after), "="))
+
+# `grep -qE '(source|git)[[:space:]]*='` on one line.
+fn names_git_source(line: String) : Bool =
+  assigns_after(line, "source") or assigns_after(line, "git")
+
+# `grep -qE '"[^"]*@[^"]*"'`: a quoted span holding `@` (the inline `src@ref` form).
+fn names_inline_ref(line: String) : Bool {
+  let parts = string.split(line, "\"")
+  list.drop(list.take(parts, list.length(parts) - 1), 1) |> list.any(p => string_contains(p, "@"))
+}
+
+#[doc("True when the manifest names a git dependency whose lock is missing or points at a vanished cache checkout.")]
+pub fn needs_auto_install(dir: String, root: String) : Bool / File + Ffi {
+  let ls = string.split(cli_fs.read_or_empty("#{dir}/kai.toml"), "\n")
+  if not (ls |> list.any(l => names_git_source(l) or names_inline_ref(l))) {
+    false
+  } else if not cli_sys.is_file("#{dir}/kai.lock") {
+    true
+  } else {
+    cli_manifest.lock_dirs(dir, root) |> list.any(d => not cli_sys.is_dir("#{d}/.git"))
+  }
+}
+
+# `$(cd dir && cd p && pwd)` for a relative dependency path; empty when missing.
+fn dep_abs(dir: String, p: String) : String / Ffi =
+  if path.is_absolute(p) {
+    p
+  } else {
+    let a = cli_fs.absolute("#{dir}/#{p}")
+    if cli_sys.is_dir(a) { a } else { "" }
+  }
+
+fn parse_paths(dir: String, text: String) : [(String, String)] / Ffi =
+  string.split(text, "\n")
+    |> list.map(line => string.split(line, "\t"))
+    |> list.filter(fs => list.length(fs) >= 2)
+    |> list.map(
+      fs => (
+        string.trim(list.head(fs).unwrap_or("")),
+        dep_abs(dir, string.trim(string.join(list.drop(fs, 1), "\t")))
+      )
+    )
+    |> list.filter(e => e.snd != "")
+
+#[doc("`kai-pkg paths` in `dir`: each resolved dependency's name and absolute root; `quiet` drops its stderr.")]
+pub fn dep_roots(t: Toolchain, kaipkg: String, dir: String, quiet: Bool, scratch: String) : [(
+  String,
+  String
+)] / Env + File + Ffi {
+  let sp = cli_proc.Spawn {
+    ...cli_proc.inherit(),
+    dir: dir,
+    err: if quiet { "/dev/null" } else { "" },
+    set: [("KAIKAI_CACHE_ROOT", cache_root(t))]
+  }
+  let out = cli_proc.capture([kaipkg, "paths"], sp, "#{scratch}/kaipkg-paths.#{cli_sys.getpid()}")
+  parse_paths(dir, out.snd)
+}
+
+#[doc("The `--path` roots of a package build: the package, its parent, and each resolved dependency, auto-installing first when the lock is stale.")]
+pub fn path_flags(
+  t: Toolchain,
+  dir: String,
+  scratch: String
+) : Result[[String], Int] / Stderr + Env + File + Ffi {
+  let parent = cli_fs.dirname(dir)
+  let up =
+    if parent != "" and parent != dir and cli_sys.is_dir(parent) { ["--path", parent] } else { [] }
+  let kaipkg = ensure_kaipkg(t)!
+  let root = cache_root(t)
+  let _ = cli_fs.mkdir_p(root)
+  let sp = cli_proc.Spawn {
+    ...cli_proc.inherit(),
+    dir: dir,
+    out: "&2",
+    set: [("KAIKAI_CACHE_ROOT", root)]
+  }
+  let rc = if needs_auto_install(dir, root) { cli_proc.run([kaipkg, "install"], sp) } else { 0 }
+  if rc != 0 {
+    Err(rc)
+  } else {
+    Ok(
+      ["--path", dir]
+        ++ up
+        ++ (dep_roots(t, kaipkg, dir, false, scratch) || (e => ["--path", e.snd]))
+    )
+  }
+}

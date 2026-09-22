@@ -1,13 +1,17 @@
 #[doc("The `kai` command: core verbs run here; any other verb runs `kai-<verb>` from PATH.")]
 
+import os.env
+import cli_build
 import cli_env
 import cli_layout
 import cli_plugin
+import cli_sys
+import cli_toolchain
 import cli_usage
 
 # Core verbs the bin/kai wrapper still serves itself. A plugin never shadows one.
 const WRAPPER_VERBS : [String] = [
-  "build", "run", "test", "bench", "check", "typecheck", "lint", "fmt", "migrate",
+  "test", "bench", "check", "typecheck", "lint", "fmt", "migrate",
   "mutate", "watch", "init", "fetch", "install", "add", "update", "upgrade", "show",
   "lsp", "info", "doc", "--version", "-V"
 ]
@@ -21,6 +25,27 @@ fn unknown(l: Layout, verb: String) : Int / Stderr + File {
   2
 }
 
+# The verbs that compile: the deep-recursing compiler needs a 32 MiB stack, and
+# every child resolves the stdlib this kai does.
+fn core(
+  l: Layout,
+  args: [String],
+  verb: (Toolchain, [String]) -> Result[Int, Int] / e
+) : Int / Env + File + Ffi + e {
+  cli_sys.raise_stack(33554432)
+  let _ = env.set("KAIKAI_STDLIB_PATH", l.stdlib)
+  match verb(cli_toolchain.resolve(l), args) {
+    Ok(code) -> code
+    Err(code) -> code
+  }
+}
+
+# The runtime prints these reports at exit; they belong to the user's program, not to kai.
+fn quiet_exit_reports() : Unit / Env {
+  let _ = env.unset("KAI_TRACE_RC")
+  let _ = env.unset("KAI_PROFILE_RC")
+}
+
 fn dispatch(l: Layout, argv: [String]) : Int / Stdout + Stderr + Env + File + Ffi =
   match argv {
     [] -> {
@@ -32,6 +57,8 @@ fn dispatch(l: Layout, argv: [String]) : Int / Stdout + Stderr + Env + File + Ff
       0
     }
     ["env", ...rest] -> cli_env.run(l, rest)
+    ["build", ...rest] -> core(l, rest, cli_build.build)
+    ["run", ...rest] -> core(l, rest, cli_build.run)
     [v, ...rest] -> match plugin_for(v) {
       Some(prog) -> cli_plugin.launch(l, prog, rest)
       None -> unknown(l, v)
@@ -40,7 +67,11 @@ fn dispatch(l: Layout, argv: [String]) : Int / Stdout + Stderr + Env + File + Ff
 
 fn main() : Int / Stdout + Stderr + Env + File + Ffi =
   match cli_layout.resolve(program_name()) {
-    Ok(l) -> dispatch(l, Env.args())
+    Ok(l) -> {
+      let code = dispatch(l, Env.args())
+      quiet_exit_reports()
+      code
+    }
     Err(root) -> {
       Stderr.eprint("kai: error: cannot find kaikai installation under #{root}")
       Stderr.eprint(

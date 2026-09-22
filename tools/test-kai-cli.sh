@@ -1,7 +1,7 @@
 #!/bin/sh
-# Gate for the kai binary (tools/kai): `kai env`, the plugin contract, and
-# the dispatch of an unknown verb to `kai-<verb>` on PATH — in a dev
-# checkout and in an installed prefix.
+# Gate for the kai binary (tools/kai): `kai env`, the plugin contract, the
+# dispatch of an unknown verb to `kai-<verb>` on PATH, and build/run — in a
+# dev checkout and in an installed prefix.
 
 set -eu
 
@@ -89,6 +89,34 @@ expect_line "a flag is never a plugin" 2 "kai: error: unknown command: --hello" 
   env PATH="$TMP/plugins:$PATH" "$KAI" --hello
 expect_line "help" 0 " _      _ _      _" "$KAI" help
 expect_line "no command: usage, exit 2" 2 " _      _ _      _" "$KAI"
+
+# build/run through the binary.
+mkdir -p "$TMP/prog"
+cat > "$TMP/prog/args.kai" <<'KAI'
+import os.args
+fn main() : Int / Stdout + Env = {
+  args.argv() |> foreach(a => Stdout.print("[#{a}]"))
+  7
+}
+KAI
+printf 'fn main() : Unit / Stdout = Stdout.print("hi")\n' > "$TMP/prog/hello.kai"
+expect "run (c): args verbatim, exit status passed through" 7 "[a b]
+[--x]" "$KAI" run --backend=c "$TMP/prog/args.kai" "a b" --x
+# The default backend: native, or C with a note on a kaic2 without libLLVM.
+status=0
+got="$("$KAI" run "$TMP/prog/args.kai" "a b" --x 2>/dev/null)" || status=$?
+if [ "$status" -eq 7 ] && [ "$got" = "[a b]
+[--x]" ]; then ok "run (default backend): args, exit status"; else fail "run (default backend): exit $status, got '$got'"; fi
+# Parallel compiles into a cold cache: every status must reach kai even though
+# the runtime reaps children whenever a fiber parks on file I/O.
+stats="$(cd "$TMP/prog" && KAI_MODULAR=1 KAI_MODULAR_STATS=1 KAI_MODULAR_JOBS=8 \
+  KAI_MODULAR_CACHE_DIR="$TMP/mc" "$KAI" build --backend=c hello.kai -o hello 2>&1 && ./hello)" || true
+case "$stats" in
+  *"cache hits=0 compiled="*"hi") ok "build: parallel c-modular compiles into a cold cache" ;;
+  *) fail "build: parallel c-modular compiles into a cold cache"; printf '%s\n' "$stats" | sed 's/^/        /' ;;
+esac
+traces="$(KAI_TRACE_RC=1 "$KAI" run "$TMP/prog/hello.kai" 2>&1 | grep -c 'KAI_TRACE_RC\] alloc_total=' || true)"
+if [ "$traces" = "1" ]; then ok "run: the RC trace is the program's alone"; else fail "run: $traces RC trace lines, want 1"; fi
 
 # An installed prefix: the binary resolves the prefix it sits in, never
 # the checkout it was built in, and ignores a KAIKAI_HOME naming another.

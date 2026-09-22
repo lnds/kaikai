@@ -1,0 +1,255 @@
+#[doc("The `[native]` contract: vendored C sources, include dirs and system libraries a package graph declares.")]
+
+import path
+import cli_caches
+import cli_err
+import cli_fs
+import cli_hash
+import cli_manifest
+import cli_pkg
+import cli_proc
+import cli_sys
+import cli_toolchain
+
+#[doc("One declaration of a package: its root (`dir`), or a `src`/`inc`/`lib` entry of its `[native]` table.")]
+pub type Native = { pkg: String, kind: String, value: String }
+
+# The `[native]` table's lines joined into one blob; whole-line comments blank out.
+fn native_blob(ls: [String], insec: Bool, acc: String) : String =
+  match ls {
+    [] -> acc
+    [line, ...rest] -> {
+      let t = string.trim_left(line)
+      if string.trim_right(t) == "[native]" {
+        native_blob(rest, true, acc)
+      } else if string.starts_with(t, "[") {
+        native_blob(rest, false, acc)
+      } else if insec {
+        native_blob(rest, true, acc ++ " " ++ (if string.starts_with(t, "#") { "" } else { line }))
+      } else {
+        native_blob(rest, false, acc)
+      }
+    }
+  }
+
+# The body of the first `key = [ … ]` in the blob, up to the first `]`.
+fn array_body(blob: String, key: String) : Option[String] {
+  let pieces = string.split(blob, key)
+  let hit = list.drop(pieces, 1)
+    |> list.enumerate
+    |> list.find_map(p => {
+      let after_eq = string.drop_prefix(string.trim_left(p.snd), "=")
+      match after_eq {
+        Some(a) -> string.drop_prefix(string.trim_left(a), "[").map(b => (p.fst, b))
+        None -> None
+      }
+    })
+  match hit {
+    None -> None
+    Some(h) -> {
+      let rest = string.join([h.snd, ...list.drop(pieces, h.fst + 2)], key)
+      let closed = string.split(rest, "]")
+      if list.length(closed) < 2 { None } else { list.head(closed) }
+    }
+  }
+}
+
+# Every `"…"` in order.
+fn quoted_strings(s: String) : [String] {
+  let parts = string.split(s, "\"")
+  list.enumerate(parts)
+    |? (p => p.fst % 2 == 1 and p.fst < list.length(parts) - 1)
+    | (p => p.snd)
+}
+
+fn entries(dir: String) : [(String, String)] / File {
+  let blob = native_blob(string.split(cli_fs.read_or_empty("#{dir}/kai.toml"), "\n"), false, "")
+  [("sources", "src"), ("include", "inc"), ("libs", "lib")]
+    || (k => match array_body(blob, k.fst) {
+      Some(body) -> quoted_strings(body) | (v => (k.snd, v))
+      None -> []
+    })
+}
+
+fn package(name: String, dir: String) : [Native] / File {
+  let own = entries(dir)
+    | (e => {
+      let v = if e.fst == "lib" or path.is_absolute(e.snd) { e.snd } else { "#{dir}/#{e.snd}" }
+      Native { pkg: name, kind: e.fst, value: v }
+    })
+  [Native { pkg: name, kind: "dir", value: dir }, ...own]
+}
+
+fn dedupe(xs: [Native], seen: [String]) : [Native] =
+  match xs {
+    [] -> []
+    [x, ...rest] -> {
+      let k = "#{x.kind}\t#{x.value}"
+      if seen.contains(k) { dedupe(rest, seen) } else { [x, ...dedupe(rest, [k, ...seen])] }
+    }
+  }
+
+#[doc("Every package's native declarations — the root package first, then each resolved dependency — deduplicated.")]
+pub fn collect(
+  t: Toolchain,
+  dir: String,
+  scratch: String
+) : Result[[Native], Int] / Stderr + Env + File + Ffi {
+  let root = package(cli_manifest.package_name(dir).unwrap_or("."), dir)
+  let deps = if cli_manifest.has_dependencies(dir) {
+    let kaipkg = cli_pkg.ensure_kaipkg(t)!
+    cli_pkg.dep_roots(t, kaipkg, dir, true, scratch) || (d => package(d.fst, d.snd))
+  } else {
+    []
+  }
+  Ok(dedupe(root ++ deps, []))
+}
+
+fn sources(info: [Native]) : [Native] = info |? (n => n.kind == "src")
+
+fn of_kind(info: [Native], pkg: String, kind: String) : [String] =
+  info |? (n => n.pkg == pkg and n.kind == kind) | (n => n.value)
+
+fn unique(xs: [String]) : [String] =
+  list.reverse(xs |> list.foldl([], (acc, x) => if acc.contains(x) { acc } else { [x, ...acc] }))
+
+#[doc("The packages that ship native C sources, once each, in order.")]
+pub fn source_packages(info: [Native]) : [String] = unique(sources(info) | (n => n.pkg))
+
+#[doc("Declared sources that do not exist, as the error lines naming them.")]
+pub fn missing_sources(info: [Native]) : [String] / Ffi =
+  sources(info)
+    |? (n => not cli_sys.is_file(n.value))
+    | (n => "kai: error: package '#{n.pkg}' declares native source #{n.value}, but it does not exist")
+
+fn headers_below(dir: String) : [String] / File + Ffi =
+  if not cli_sys.is_dir(dir) {
+    []
+  } else {
+    let depth = list.length(string.split(dir, "/"))
+    dir_walk(dir)
+      |? (f => string.ends_with(f, ".h") and list.length(string.split(f, "/")) - depth <= 3)
+      |> list.sort
+  }
+
+fn object_key(t: Toolchain, info: [Native], n: Native) : String / File + Ffi {
+  let head = cli_hash.lines([t.cc, string.join(t.cflags_compile, " "), cli_toolchain.host(t)])
+  let headers = of_kind(info, n.pkg, "inc") || headers_below | (h => cli_hash.Bytes(h))
+  cli_hash.digest([head, cli_hash.Bytes(n.value), ...headers])
+}
+
+fn compile_one(t: Toolchain, info: [Native], n: Native, obj: String) : Bool / Ffi {
+  let incs = of_kind(info, n.pkg, "inc") || (d => ["-I", d])
+  let argv = cli_proc.words(t.cc) ++ t.cflags_compile ++ incs ++ ["-c", n.value, "-o", obj]
+  cli_proc.run(argv, cli_proc.inherit()) == 0
+}
+
+fn compile_failed(n: Native) : Result[String, Int] / Stderr =
+  cli_err.fail("failed to compile native source #{n.value} (package '#{n.pkg}')", 1)
+
+fn cached_object(
+  t: Toolchain,
+  info: [Native],
+  n: Native,
+  cache: String
+) : Result[String, Int] / Stderr + File + Ffi {
+  let obj = "#{cache}/#{object_key(t, info, n)}.o"
+  let part = "#{obj}.#{cli_sys.getpid()}"
+  if cli_sys.is_file(obj) {
+    Ok(obj)
+  } else if compile_one(t, info, n, part) and file_rename(part, obj).is_ok() {
+    Ok(obj)
+  } else {
+    let _ = file_delete(part)
+    compile_failed(n)
+  }
+}
+
+# Without a usable cache the objects land in the build's scratch dir, numbered.
+fn build_objects(
+  t: Toolchain,
+  info: [Native],
+  srcs: [Pair[Int, Native]],
+  cache: String,
+  tmp: String
+) : Result[[String], Int] / Stderr + File + Ffi =
+  match srcs {
+    [] -> Ok([])
+    [p, ...rest] -> {
+      let obj = "#{tmp}/nativedep-#{p.fst + 1}.o"
+      let o = if cache != "" {
+        cached_object(t, info, p.snd, cache)!
+      } else if compile_one(t, info, p.snd, obj) {
+        obj
+      } else {
+        compile_failed(p.snd)!
+      }
+      let os = build_objects(t, info, rest, cache, tmp)!
+      Ok([o, ...os])
+    }
+  }
+
+#[doc("Compile every declared native source to an object — cached by content across projects — and return the object paths.")]
+pub fn objects(
+  t: Toolchain,
+  info: [Native],
+  tmp: String
+) : Result[[String], Int] / Stderr + Env + File + Ffi {
+  let dir = cli_caches.root("KAI_NATIVE_DEP_CACHE_DIR", "nativedep", t.os)
+  let cache = if cli_fs.mkdir_p(dir) { dir } else { "" }
+  build_objects(t, info, list.enumerate(sources(info)), cache, tmp)
+}
+
+#[doc("`-l<lib>` for every declared system library, once each.")]
+pub fn lib_flags(info: [Native]) : [String] =
+  unique(info |? (n => n.kind == "lib") | (n => n.value)) | (l => "-l#{l}")
+
+fn stray_sources_note(info: [Native], d: Native) : [String] / File + Ffi {
+  let declares = sources(info) |> list.any(n => n.pkg == d.pkg)
+  let stray = if declares or (not cli_sys.is_dir(d.value)) {
+    []
+  } else {
+    dir_walk(d.value)
+      |? (f => string.ends_with(f, ".c")
+        and list.length(string.split(f, "/")) - list.length(string.split(d.value, "/")) <= 3)
+  }
+  match list.head(stray) {
+    None -> []
+    Some(c) -> {
+      let rel = string.drop_prefix(c, "#{d.value}/").unwrap_or(c)
+      [
+        "kai: note: dependency '#{d.pkg}' ships C sources (e.g. #{rel}) not declared in its kai.toml [native] table — undefined symbols at link usually mean that contract is missing. See docs/packages.md."
+      ]
+    }
+  }
+}
+
+#[doc("After a failed link: the notes naming `[native]` causes the user can act on.")]
+pub fn link_hint(info: [Native]) : Unit / Stderr + Env + File + Ffi =
+  if list.is_empty(info) {
+    ()
+  } else if cli_caches.env_or("KAI_NATIVE_DEPS", "1") == "0" {
+    if not list.is_empty(sources(info)) {
+      Stderr.eprint(
+        "kai: note: KAI_NATIVE_DEPS=0 disabled the [native] sources this package's dependency graph declares — undefined symbols at link are expected unless CFLAGS supplies them."
+      )
+    }
+  } else {
+    let libs = info
+      |? (n => n.kind == "lib")
+      |> list.foldl(
+        [],
+        (acc, n) => if acc |> list.any(a => a.value == n.value) { acc } else { [n, ...acc] }
+      )
+      |> list.reverse
+    libs
+      |> foreach(
+        n => Stderr.eprint(
+          "kai: note: package '#{n.pkg}' requires system library '#{n.value}' (-l#{n.value}); if the linker could not find it, install it on this machine."
+        )
+      )
+    info
+      |? (n => n.kind == "dir")
+      || (d => stray_sources_note(info, d))
+      |> foreach(m => Stderr.eprint(m))
+  }

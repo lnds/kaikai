@@ -1,0 +1,231 @@
+#[doc("`kai build` and `kai run`: flags, the output name, the scratch dir, and the report modes that stop after the typer.")]
+
+import os.env
+import cli_build_help
+import cli_compile
+import cli_err
+import cli_fs
+import cli_manifest
+import cli_plan
+import cli_proc
+import cli_spec
+import cli_sys
+import cli_toolchain
+
+const REPORT_FLAGS : [String] = [
+  "--holes", "--holes-json", "--holes-scope", "--holes-json-scope", "--diags-json",
+  "--effects-json",
+  "--effect-holes-json", "--library-mode"
+]
+
+type Opts = {
+  spec: String,
+  out: String,
+  report: String,
+  backend: String,
+  opt: String,
+  mode: String,
+  help: Bool
+}
+
+fn no_opts() : Opts =
+  Opts { spec: "", out: "", report: "", backend: "", opt: "", mode: "", help: false }
+
+fn backend_value(v: String) : Result[String, Int] / Stderr =
+  if v == "c" or v == "native" {
+    Ok(v)
+  } else {
+    cli_err.die("--backend must be 'c' or 'native' (got: #{v})")
+  }
+
+# Flags `build` and `run` share; `None` when `a` is not one of them.
+fn common_flag(
+  a: String,
+  rest: [String],
+  o: Opts
+) : Option[Result[(Opts, [String]), Int]] / Stderr =
+  if string.starts_with(a, "--backend=") {
+    Some(
+      backend_value(string.drop_prefix(a, "--backend=").unwrap_or("")).map(
+        b => (Opts { ...o, backend: b }, rest)
+      )
+    )
+  } else if a == "--backend" {
+    match rest {
+      [] -> Some(cli_err.die("--backend needs an argument (c|native)"))
+      [v, ...more] -> Some(backend_value(v).map(b => (Opts { ...o, backend: b }, more)))
+    }
+  } else if a == "--debug" {
+    Some(Ok((Opts { ...o, opt: "0", mode: "debug" }, rest)))
+  } else if a == "--release" {
+    Some(Ok((Opts { ...o, opt: "2", mode: "release" }, rest)))
+  } else {
+    None
+  }
+
+fn build_flag(a: String, rest: [String], o: Opts) : Result[(Opts, [String]), Int] / Stderr =
+  if a == "-o" {
+    match rest {
+      [] -> cli_err.die("-o needs an argument")
+      [v, ...more] -> Ok((Opts { ...o, out: v }, more))
+    }
+  } else if REPORT_FLAGS.contains(a) {
+    if o.report != "" {
+      cli_err.die("report-mode flags are mutually exclusive")
+    } else {
+      Ok((Opts { ...o, report: a }, rest))
+    }
+  } else if string.starts_with(a, "-") {
+    common_flag(a, rest, o).unwrap_or_else(
+      () => cli_err.die("unknown flag: #{a} (see 'kai build --help')")
+    )
+  } else if o.spec != "" {
+    cli_err.die("only one input supported")
+  } else {
+    Ok((Opts { ...o, spec: a }, rest))
+  }
+
+fn parse_build(args: [String], o: Opts) : Result[Opts, Int] / Stderr =
+  match args {
+    [] -> Ok(o)
+    [a, ..._] if a == "-h" or a == "--help" -> Ok(Opts { ...o, help: true })
+    [a, ...rest] -> {
+      let next = build_flag(a, rest, o)!
+      parse_build(next.snd, next.fst)
+    }
+  }
+
+# `run` stops at `--` or at its first non-flag, the spec; the rest goes to the program.
+fn parse_run(args: [String], o: Opts) : Result[(Opts, [String]), Int] / Stderr =
+  match args {
+    [] -> Ok((o, []))
+    [a, ..._] if a == "-h" or a == "--help" -> Ok((Opts { ...o, help: true }, []))
+    ["--", ...rest] -> Ok((o, rest))
+    [a, ...rest] if string.starts_with(a, "-") -> {
+      let next = common_flag(a, rest, o).unwrap_or_else(
+        () => cli_err.die("unknown flag: #{a} (see 'kai run --help')")
+      )!
+      parse_run(next.snd, next.fst)
+    }
+    _ -> Ok((o, args))
+  }
+
+fn export_profile(o: Opts) : Unit / Env {
+  let _ = env.set("KAI_NATIVE_OPT", if o.opt == "" { "2" } else { o.opt })
+  let _ = env.set("KAI_BUILD_MODE", if o.mode == "" { "default" } else { o.mode })
+}
+
+# Named after the package (Go-style), placed in a sub-package's own dir.
+fn default_out(src: String) : String / File + Ffi {
+  let manifest = cli_fs.dir_of(src).and_then(d => cli_manifest.find_dir(d)).unwrap_or("")
+  let base = cli_fs.basename(src)
+  let stem = if base == ".kai" { base } else { string.drop_suffix(base, ".kai").unwrap_or(base) }
+  let name = cli_manifest.package_name(manifest).unwrap_or(stem)
+  if manifest != "" and manifest != cli_sys.cwd() { "#{manifest}/#{name}" } else { name }
+}
+
+# Run `body` with a fresh scratch dir, removed afterwards whatever happened.
+fn with_scratch(
+  body: (String) -> Result[Int, Int] / e
+) : Result[Int, Int] / Stderr + Env + Ffi + e {
+  let tmp = cli_fs.scratch_dir()
+  if tmp == "" {
+    cli_err.fail("cannot create a scratch directory", 1)
+  } else {
+    cli_sys.defer_signals()
+    let r = body(tmp)
+    cli_sys.remove_tree(tmp)
+    r
+  }
+}
+
+fn entry(spec: String, verb: String) : Result[String, Int] / Stderr + File + Ffi {
+  let src = cli_spec.resolve(spec, "building", false)!
+  if src == "" { cli_err.die("missing input file (see 'kai #{verb} --help')") } else { Ok(src) }
+}
+
+fn report(t: Toolchain, src: String, o: Opts) : Result[Int, Int] / Stderr + Env + File + Ffi =
+  if o.out != "" {
+    cli_err.die("#{o.report} does not produce a binary; drop -o <out>")
+  } else if o.backend != "" {
+    cli_err.die("#{o.report} is independent of --backend; drop the flag")
+  } else {
+    with_scratch(tmp => cli_compile.report(t, src, o.report, tmp))
+  }
+
+fn build_binary(t: Toolchain, src: String, o: Opts) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let b = cli_compile.resolve_backend(o.backend)!
+  export_profile(o)
+  let out = if o.out == "" { default_out(src) } else { o.out }
+  with_scratch(
+    tmp => build_in(t, b, cli_plan.Job { src, tmp, out, verb: "build", extra: [] }, o.mode)
+  )
+}
+
+# `--release` strips the linked binary; a missing `strip` only leaves it larger.
+fn build_in(
+  t: Toolchain,
+  b: Backend,
+  job: Job,
+  mode: String
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  cli_compile.compile(t, b, job)!
+  if mode == "release" and cli_sys.is_file(job.out) {
+    let _ =
+      cli_proc.run(["strip", job.out], cli_proc.Spawn { ...cli_proc.inherit(), err: "/dev/null" })
+  }
+  Ok(0)
+}
+
+#[doc("`kai build [<spec>] [-o <out>] [flags]`: the exit status.")]
+pub fn build(t: Toolchain, args: [String]) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let o = parse_build(args, no_opts())!
+  if o.help {
+    Stdout.print(cli_build_help.build())
+    Ok(0)
+  } else {
+    let src = entry(o.spec, "build")!
+    if o.report != "" {
+      let _ = cli_compile.resolve_backend(o.backend)!
+      export_profile(o)
+      report(t, src, o)
+    } else {
+      build_binary(t, src, o)
+    }
+  }
+}
+
+fn run_spec(args: [String]) : Result[(String, [String]), Int] / Stderr + File + Ffi =
+  match args {
+    [] -> entry("", "run").map(s => (s, []))
+    [a, ...rest] if a == "." or string.starts_with(a, "./") -> entry(a, "run").map(s => (s, rest))
+    [a, ...rest] -> Ok((a, rest))
+  }
+
+fn run_in(
+  t: Toolchain,
+  b: Backend,
+  src: String,
+  args: [String],
+  tmp: String
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let base = cli_fs.basename(src)
+  let bin = "#{tmp}/#{string.drop_suffix(base, ".kai").unwrap_or(base)}"
+  cli_compile.compile(t, b, cli_plan.Job { src, tmp, out: bin, verb: "run", extra: [] })!
+  Ok(cli_proc.run([bin, ...args], cli_proc.inherit()))
+}
+
+#[doc("`kai run [flags] [<spec>] [args...]`: build to a scratch binary, run it with the args, and return its status.")]
+pub fn run(t: Toolchain, args: [String]) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let parsed = parse_run(args, no_opts())!
+  let o = parsed.fst
+  if o.help {
+    Stdout.print(cli_build_help.run())
+    Ok(0)
+  } else {
+    let spec = run_spec(parsed.snd)!
+    let b = cli_compile.resolve_backend(o.backend)!
+    export_profile(o)
+    with_scratch(tmp => run_in(t, b, spec.fst, spec.snd, tmp))
+  }
+}
