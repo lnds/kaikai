@@ -1928,6 +1928,7 @@ extern void kai_main_teardown_defaults(void);
  * status matches the C-direct `int main`'s `return kai_*_summary()`
  * without the shim's `int main` needing to know the build mode. */
 void kaix_test_run_one(const char *desc, KaiValue *(*body)(void)) { kai_test_run_one(desc, body); }
+void kaix_test_line(int line) { kai_test_line(line); }
 void kaix_bench_run_one(const char *desc, KaiValue *(*body)(void)) { kai_bench_run_one(desc, body); }
 void kaix_test_summary_exit(void)  { exit(kai_test_summary()); }
 void kaix_bench_summary_exit(void) { exit(kai_bench_summary()); }

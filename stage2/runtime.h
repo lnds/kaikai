@@ -10316,34 +10316,192 @@ static KaiValue *_kai_core_mailbox_recv_thunk(KaiValue *s, KaiValue **a, int n) 
 static KaiValue *_kai_core_mailbox_recv_timeout_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_mailbox_recv_timeout(a[0], a[1]); }
 static KaiValue *_kai_core_mailbox_free_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_mailbox_free(a[0]); }
 
-/* ---------- test harness hooks (used by --test runs) ---------- */
+/* ---------- test harness hooks (used by --test runs) ----------
+ *
+ * Two report formats share one set of counters. The human format is the
+ * default and is byte-for-byte what it has always been; NDJSON is opt-in
+ * through KAI_TEST_JSON.
+ *
+ * Records go to fd 3 when the caller opens it, and only otherwise to
+ * stdout: a test body's own `Stdout.print` shares stdout with the report,
+ * and interleaved prose makes the stream unparseable. The driver opens
+ * fd 3 for `--json`, so the records always arrive on a clean channel.
+ *
+ * Selection (KAI_TEST_ONLY) filters by the same id the JSON emits,
+ * `<file>:<desc>`. A deselected block is not begun, so it is absent from
+ * both the records and the counters.
+ */
 
 static KAI_TLS int         kai_test_count_total  = 0;
 static KAI_TLS int         kai_test_count_passed = 0;
 static KAI_TLS const char *kai_test_current      = NULL;
+static KAI_TLS const char *kai_test_current_file = NULL;
+static KAI_TLS int         kai_test_current_line = 0;
+static KAI_TLS long long   kai_test_started_ns   = 0;
+static KAI_TLS long long   kai_test_suite_ns     = 0;
+static KAI_TLS int         kai_test_reported     = 0;
 static KAI_TLS jmp_buf     kai_test_jmp;
 static KAI_TLS int         kai_test_in_progress  = 0;
+
+static long long kai_test_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + (long long)ts.tv_nsec;
+}
+
+static int kai_test_json_mode(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *raw = getenv("KAI_TEST_JSON");
+        cached = (raw && *raw && strcmp(raw, "0") != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Where records land. fd 3 when the caller opened it, else stdout. */
+static FILE *kai_test_json_out(void) {
+    static FILE *cached = NULL;
+    if (!cached) {
+        if (fcntl(3, F_GETFD) != -1) cached = fdopen(3, "w");
+        if (!cached) cached = stdout;
+    }
+    return cached;
+}
+
+/* The file the running blocks were declared in. One test binary is built
+   per source file, so this is per-process, not per-block. The driver
+   supplies the user-facing path: the native paths compile a COPY of the
+   entry, so the path baked in at compile time would name a scratch file
+   the user cannot click. */
+static const char *kai_test_file(void) {
+    if (!kai_test_current_file) {
+        const char *env = getenv("KAI_TEST_FILE");
+        kai_test_current_file = (env && *env) ? env : "";
+    }
+    return kai_test_current_file;
+}
+
+static void kai_test_json_bytes(FILE *o, const char *s) {
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        switch (*p) {
+            case '"':  fputs("\\\"", o); break;
+            case '\\': fputs("\\\\", o); break;
+            case '\n': fputs("\\n", o);  break;
+            case '\r': fputs("\\r", o);  break;
+            case '\t': fputs("\\t", o);  break;
+            default:
+                if (*p < 0x20) fprintf(o, "\\u%04x", *p);
+                else           fputc((char)*p, o);
+        }
+    }
+}
+
+static void kai_test_json_str(FILE *o, const char *s) {
+    fputc('"', o);
+    kai_test_json_bytes(o, s);
+    fputc('"', o);
+}
+
+/* `<file>:<desc>` — stable across runs for an unchanged block, and the
+   exact spelling KAI_TEST_ONLY matches against. */
+static void kai_test_json_id(FILE *o) {
+    fputc('"', o);
+    kai_test_json_bytes(o, kai_test_file());
+    fputc(':', o);
+    kai_test_json_bytes(o, kai_test_current ? kai_test_current : "");
+    fputc('"', o);
+}
+
+static void kai_test_json_record(const char *status, const char *msg) {
+    long long ms = (kai_test_now_ns() - kai_test_started_ns) / 1000000LL;
+    FILE *o = kai_test_json_out();
+    fputs("{\"type\":\"test\",\"id\":", o);
+    kai_test_json_id(o);
+    fputs(",\"file\":", o);
+    kai_test_json_str(o, kai_test_file());
+    fprintf(o, ",\"line\":%d,\"status\":", kai_test_current_line);
+    kai_test_json_str(o, status);
+    fprintf(o, ",\"duration_ms\":%lld", ms < 0 ? 0 : ms);
+    if (msg) {
+        fputs(",\"message\":", o);
+        kai_test_json_str(o, msg);
+    }
+    fputs("}\n", o);
+    fflush(o);
+}
+
+/* Whether a block runs at all. KAI_TEST_ONLY is a newline-separated list
+   of ids; unset means every block runs. The needle is matched whole, so
+   one id is never a prefix of another's match. */
+static int kai_test_selected(const char *file, const char *desc) {
+    const char *only = getenv("KAI_TEST_ONLY");
+    if (!only || !*only) return 1;
+    size_t flen = strlen(file ? file : "");
+    size_t dlen = strlen(desc ? desc : "");
+    for (const char *p = only; *p; ) {
+        const char *nl = strchr(p, '\n');
+        size_t seg = nl ? (size_t)(nl - p) : strlen(p);
+        if (seg == flen + 1 + dlen &&
+            strncmp(p, file ? file : "", flen) == 0 &&
+            p[flen] == ':' &&
+            strncmp(p + flen + 1, desc ? desc : "", dlen) == 0) {
+            return 1;
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return 0;
+}
 
 static void kai_test_begin(const char *desc) {
     kai_test_count_total++;
     kai_test_current = desc;
+    kai_test_reported = 0;
+    kai_test_started_ns = kai_test_now_ns();
+}
+
+/* The declaration line of the block about to run, stamped by both
+   emitters right before the block's begin/run_one. */
+static void kai_test_line(int line) { kai_test_current_line = line; }
+
+/* A longjmp out of a test body that reported nothing came from a failure
+   path carrying no message of its own; the record must still exist. */
+static void kai_test_unreported_fail(void) {
+    if (kai_test_json_mode() && !kai_test_reported) {
+        kai_test_json_record("fail", "assertion failed");
+        kai_test_reported = 1;
+    }
 }
 
 static void kai_test_pass(void) {
     kai_test_count_passed++;
+    if (kai_test_json_mode()) { kai_test_json_record("pass", NULL); kai_test_reported = 1; return; }
     fprintf(stderr, "  ok   %s\n", kai_test_current ? kai_test_current : "");
 }
 
 static void kai_test_fail(const char *desc, const char *msg) {
+    if (kai_test_json_mode()) {
+        kai_test_json_record("fail", msg ? msg : "assertion failed");
+        kai_test_reported = 1;
+        return;
+    }
     fprintf(stderr, "  FAIL %s : %s\n",
             desc ? desc : "",
             msg  ? msg  : "assertion failed");
 }
 
 static int kai_test_summary(void) {
-    fprintf(stderr, "\n%d/%d tests passed\n",
-            kai_test_count_passed, kai_test_count_total);
-    return (kai_test_count_passed == kai_test_count_total) ? 0 : 1;
+    int failed = kai_test_count_total - kai_test_count_passed;
+    if (kai_test_json_mode()) {
+        FILE *o = kai_test_json_out();
+        fprintf(o, "{\"type\":\"summary\",\"passed\":%d,\"failed\":%d,\"duration_ms\":%lld}\n",
+                kai_test_count_passed, failed, kai_test_suite_ns / 1000000LL);
+        fflush(o);
+    } else {
+        fprintf(stderr, "\n%d/%d tests passed\n",
+                kai_test_count_passed, kai_test_count_total);
+    }
+    return failed == 0 ? 0 : 1;
 }
 
 /* Run one test body through the begin/setjmp/pass landing pad. The
@@ -10357,6 +10515,8 @@ static int kai_test_summary(void) {
    final value (a boxed `KaiValue *`), decref'd here exactly as the
    C-direct runner's `kai_decref(_body)`. */
 static void kai_test_run_one(const char *desc, KaiValue *(*body)(void)) {
+    if (!kai_test_selected(kai_test_file(), desc)) return;
+    long long t0 = kai_test_now_ns();
     kai_test_begin(desc);
     if (setjmp(kai_test_jmp) == 0) {
         kai_test_in_progress = 1;
@@ -10366,7 +10526,9 @@ static void kai_test_run_one(const char *desc, KaiValue *(*body)(void)) {
         kai_test_pass();
     } else {
         kai_test_in_progress = 0;
+        kai_test_unreported_fail();
     }
+    kai_test_suite_ns += kai_test_now_ns() - t0;
 }
 
 /* ---------- bench harness hooks (used by --bench runs) ----------
