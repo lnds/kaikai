@@ -1,0 +1,209 @@
+#[doc("Compile an entry file to a binary: resolve the package around it, then build through the chosen backend.")]
+
+import cli_caches
+import cli_cmodular
+import cli_csingle
+import cli_err
+import cli_fs
+import cli_layout
+import cli_manifest
+import cli_native
+import cli_nativedeps
+import cli_pkg
+import cli_plan
+import cli_proc
+import cli_sys
+import cli_toolchain
+
+const KNOWN_EDITIONS : [String] = ["tongariki", "hanga-roa", "orongo"]
+
+#[doc("The backend: the `--backend` flag, else `KAI_BACKEND`, else an implicit `native`.")]
+pub fn resolve_backend(flag: String) : Result[Backend, Int] / Stderr + Env =
+  if flag != "" {
+    Ok(cli_plan.Backend { name: flag, explicit: true })
+  } else {
+    match cli_caches.env_or("KAI_BACKEND", "") {
+      "" -> Ok(cli_plan.Backend { name: "native", explicit: false })
+      b if b == "c" or b == "native" -> Ok(cli_plan.Backend { name: b, explicit: true })
+      b -> cli_err.die("KAI_BACKEND must be 'c' or 'native' (got: #{b})")
+    }
+  }
+
+#[doc("`--edition <name>`: the manifest's field when valid, else the toolchain's own edition.")]
+pub fn edition_flag(l: Layout, manifest: String) : Result[[String], Int] / Stderr + File + Ffi =
+  match cli_manifest.edition_field(manifest) {
+    Some(ed) if ed != "" -> if KNOWN_EDITIONS.contains(ed) {
+      Ok(["--edition", ed])
+    } else {
+      Stderr.eprint("kai: error: unknown edition \"#{ed}\" in #{manifest}/kai.toml")
+      Stderr.eprint("  known editions: #{string.join(KNOWN_EDITIONS, " ")}")
+      Stderr.eprint(
+        "  hint: check the spelling, or update kaikai if you expect this edition to exist."
+      )
+      Err(1)
+    }
+    _ -> Ok(["--edition", cli_layout.meta(l, "EDITION")])
+  }
+
+#[doc("""
+The per-project incremental cache: on inside a package (or with
+`KAI_CACHE=1`), under `<package>/.kai-cache`, which also serves as the
+core cache when the shared one is off.
+""")]
+pub fn user_cache_flags(
+  t: Toolchain,
+  manifest: String,
+  src_dir: String
+) : [String] / Env + File + Ffi {
+  let mode = cli_caches.env_or("KAI_CACHE", "auto")
+  if mode == "1" or mode == "auto" and manifest != "" {
+    let dir = "#{if manifest == "" { src_dir } else { manifest }}/.kai-cache"
+    let _ = cli_fs.mkdir_p(dir)
+    let core = if list.is_empty(t.core_cache) { ["--core-cache-dir", dir] } else { [] }
+    ["--user-cache", "--user-cache-dir", dir] ++ core
+  } else {
+    []
+  }
+}
+
+#[doc("The `file '<src>' not found` error, pointing at `kai <verb> --help`.")]
+pub fn not_found[a](src: String, verb: String) : Result[a, Int] / Stderr {
+  Stderr.eprint("kai: error: file '#{src}' not found.")
+  Stderr.eprint("Try 'kai #{verb} --help' for usage.")
+  Err(2)
+}
+
+# Every backend links through $CC: say so before any compile, naming the packages that need one.
+fn check_cc(t: Toolchain, native: [Native]) : Result[Unit, Int] / Stderr + Env + Ffi =
+  if cli_proc.which(t.cc).is_some() {
+    Ok(())
+  } else {
+    Stderr.eprint(
+      "kai: error: no C compiler found ('#{t.cc}' is not on PATH); kai needs one to link binaries."
+    )
+    cli_nativedeps.source_packages(native)
+      |> foreach(
+        pkg => Stderr.eprint(
+          "kai: error: package '#{pkg}' ships native C sources that must be compiled with it."
+        )
+      )
+    Stderr.eprint(
+      "kai: hint: install one (macOS: xcode-select --install; Debian/Ubuntu: apt install build-essential), then retry."
+    )
+    Err(2)
+  }
+
+fn native_link_inputs(t: Toolchain, native: [Native], tmp: String) : Result[
+  ([String], [String]),
+  Int
+] / Stderr + Env + File + Ffi =
+  if list.is_empty(native) or cli_caches.env_or("KAI_NATIVE_DEPS", "1") == "0" {
+    Ok(([], []))
+  } else {
+    let missing = cli_nativedeps.missing_sources(native)
+    if not list.is_empty(missing) {
+      missing |> foreach(m => Stderr.eprint(m))
+      Err(1)
+    } else {
+      let objs = cli_nativedeps.objects(t, native, tmp)!
+      Ok((objs, cli_nativedeps.lib_flags(native)))
+    }
+  }
+
+# The kaic2 flags ahead of the entry: the project's dirs lead `--path` and the
+# stdlib trails, so a local module outranks a stdlib one of the same name.
+fn search_flags(
+  t: Toolchain,
+  src_dir: String,
+  manifest: String,
+  pkg: [String],
+  edition: [String]
+) : [String] / Env + File + Ffi =
+  ["--path", src_dir]
+    ++ pkg
+    ++ ["--path", t.layout.stdlib]
+    ++ cli_manifest.unstable_flags(manifest)
+    ++ edition
+    ++ user_cache_flags(t, manifest, src_dir)
+    ++ t.core_cache
+
+#[doc("Resolve the package around `job.src`: search paths, edition, `[unstable]` opt-ins, caches, native dependencies.")]
+pub fn plan(t: Toolchain, job: Job) : Result[Plan, Int] / Stderr + Env + File + Ffi =
+  if not cli_sys.is_file(job.src) {
+    not_found(job.src, job.verb)
+  } else {
+    cli_toolchain.ensure_built(t)!
+    let src_dir = cli_fs.dir_of(job.src).unwrap_or(".")
+    let manifest = cli_manifest.find_dir(src_dir).unwrap_or("")
+    let edition = edition_flag(t.layout, manifest)!
+    let pkg = if manifest == "" { [] } else { cli_pkg.path_flags(t, manifest, job.tmp)! }
+    let native = if manifest == "" { [] } else { cli_nativedeps.collect(t, manifest, job.tmp)! }
+    check_cc(t, native)!
+    let inputs = native_link_inputs(t, native, job.tmp)!
+    let flags = search_flags(t, src_dir, manifest, pkg, edition)
+    Ok(cli_plan.Plan { t, job, src_dir, flags, native, native_objs: inputs.fst, libs: inputs.snd })
+  }
+
+fn whole_program(p: Plan, b: Backend) : Result[Unit, Int] / Stderr + Env + File + Ffi =
+  match cli_native.build_whole(p)! {
+    Linked -> Ok(())
+    NoLlvm(err) -> if b.explicit {
+      Stderr.eprint("kai: error: the native backend is not built into this kaic2.")
+      Stderr.eprint(
+        "kai: error: rebuild with 'make -C stage2 KAI_LLVM=1 kaic2', or pass --backend=c."
+      )
+      cli_sys.copy_to_stderr(err)
+      Err(2)
+    } else {
+      Stderr.eprint(
+        "kai: note: native backend unavailable in this kaic2 (built without libLLVM); using the C backend."
+      )
+      Stderr.eprint(
+        "kai: note: rebuild with 'make -C stage2 KAI_LLVM=1 kaic2' for the native default, or pass --backend=c to silence this note."
+      )
+      dispatch(p, cli_plan.Backend { name: "c", explicit: true })
+    }
+  }
+
+fn dispatch(p: Plan, b: Backend) : Result[Unit, Int] / Stderr + Env + File + Ffi =
+  if b.name == "native" {
+    if cli_native.modular(p) {
+      match cli_native.build_modular(p)! {
+        Linked -> Ok(())
+        NoLlvm(_) -> whole_program(p, b)
+      }
+    } else {
+      whole_program(p, b)
+    }
+  } else if cli_cmodular.wanted(p.t) {
+    cli_cmodular.build(p)
+  } else {
+    cli_csingle.build(p)
+  }
+
+#[doc("Build `job.src` into `job.out` through backend `b`.")]
+pub fn compile(t: Toolchain, b: Backend, job: Job) : Result[Unit, Int] / Stderr + Env + File + Ffi {
+  let p = plan(t, job)!
+  dispatch(p, b)
+}
+
+#[doc("Run kaic2 in a report mode (`--holes-json`, `--diags-json`, …) over `src`: the report is the whole output; any failure is status 1.")]
+pub fn report(
+  t: Toolchain,
+  src: String,
+  flag: String,
+  tmp: String
+) : Result[Int, Int] / Stderr + Env + File + Ffi =
+  if not cli_sys.is_file(src) {
+    not_found(src, "build")
+  } else {
+    cli_toolchain.ensure_built(t)!
+    let src_dir = cli_fs.dir_of(src).unwrap_or(".")
+    let manifest = cli_manifest.find_dir(src_dir).unwrap_or("")
+    let edition = edition_flag(t.layout, manifest)!
+    let pkg = if manifest == "" { [] } else { cli_pkg.path_flags(t, manifest, tmp)! }
+    let flags = search_flags(t, src_dir, manifest, pkg, edition)
+    let argv = [t.layout.kaic2, ...flags] ++ [flag, "#{src_dir}/#{cli_fs.basename(src)}"]
+    let rc = cli_proc.run(argv, cli_plan.kaic2_spawn([], "", ""))
+    Ok(if rc == 0 { 0 } else { 1 })
+  }

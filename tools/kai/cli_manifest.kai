@@ -1,0 +1,205 @@
+#[doc("""
+Line-level readers for `kai.toml` and `kai.lock`.
+
+They reproduce the driver's historic readers field for field, quirks
+included (a `name` in the first 30 lines counts wherever it sits, an
+unquoted `edition` yields the whole line), so a manifest resolves the
+same way it always has.
+""")]
+
+import cli_fs
+import cli_proc
+import cli_sys
+
+fn lines_of(file: String) : [String] / File = string.split(cli_fs.read_or_empty(file), "\n")
+
+#[doc("The nearest directory at or above the absolute `dir` holding a `kai.toml`; `/` itself is never searched.")]
+pub fn find_dir(dir: String) : Option[String] / Ffi =
+  if dir == "" or dir == "/" {
+    None
+  } else if cli_sys.is_file("#{dir}/kai.toml") {
+    Some(dir)
+  } else {
+    find_dir(cli_fs.dirname(dir))
+  }
+
+# `^\s*KEY\s*=\s*"VALUE"\s*$` with VALUE non-empty and free of quotes.
+fn quoted_value(line: String, key: String) : Option[String] =
+  match assignment_rhs(line, key) {
+    None -> None
+    Some(rhs) -> {
+      let t = string.trim(rhs)
+      let n = string_length(t)
+      let inner = string_slice(t, 1, n - 2)
+      let quoted = n >= 3 and string.starts_with(t, "\"") and string.ends_with(t, "\"")
+      if quoted and (not string_contains(inner, "\"")) { Some(inner) } else { None }
+    }
+  }
+
+# The text after `=` when the line reads `^\s*KEY\s*=`.
+fn assignment_rhs(line: String, key: String) : Option[String] =
+  match string.drop_prefix(string.trim_left(line), key) {
+    Some(rest) -> string.drop_prefix(string.trim_left(rest), "=")
+    None -> None
+  }
+
+fn opens_table(line: String) : Bool = string.starts_with(string.trim_left(line), "[")
+
+# `name`/`entry` reader: the root table, a `[package]` table, or any of the first 30 lines.
+fn scan_package(ls: [String], key: String, nr: Int, in_root: Bool) : Option[String] =
+  match ls {
+    [] -> None
+    [line, ...rest] -> {
+      let root = in_root and (not opens_table(line))
+      if string.starts_with(string.trim_left(line), "[package]") {
+        scan_package(rest, key, nr + 1, true)
+      } else {
+        let eligible = nr == 1 or root or line != "" and (not string.starts_with(line, "["))
+        let hit = if eligible and (root or nr <= 30) { quoted_value(line, key) } else { None }
+        match hit {
+          Some(v) -> Some(v)
+          None -> scan_package(rest, key, nr + 1, root)
+        }
+      }
+    }
+  }
+
+#[doc("The manifest's `name`, if it declares one.")]
+pub fn package_name(dir: String) : Option[String] / File + Ffi =
+  if dir == "" or (not cli_sys.is_file("#{dir}/kai.toml")) {
+    None
+  } else {
+    scan_package(lines_of("#{dir}/kai.toml"), "name", 1, false)
+  }
+
+#[doc("The manifest's `entry`, default `main.kai`.")]
+pub fn entry(dir: String) : String / File + Ffi =
+  if dir == "" or (not cli_sys.is_file("#{dir}/kai.toml")) {
+    "main.kai"
+  } else {
+    scan_package(lines_of("#{dir}/kai.toml"), "entry", 1, false).unwrap_or("main.kai")
+  }
+
+# `sub(/^[^=]*=[[:space:]]*"/, ""); sub(/".*/, "")`: the quoted value, or the whole line when unquoted.
+fn loose_value(line: String) : String {
+  let parts = string.split(line, "=")
+  let after = string.trim_left(string.join(list.drop(parts, 1), "="))
+  let n = if list.length(parts) > 1 and string.starts_with(after, "\"") {
+    string_slice(after, 1, string_length(after) - 1)
+  } else {
+    line
+  }
+  list.head(string.split(n, "\"")).unwrap_or("")
+}
+
+# The root table: lines before the first line that opens a table at column 0.
+fn root_value(ls: [String], key: String, nr: Int, in_root: Bool) : Option[String] =
+  match ls {
+    [] -> None
+    [line, ...rest] -> if string.starts_with(line, "[") {
+      root_value(rest, key, nr + 1, false)
+    } else {
+      let r = in_root or nr == 1
+      if r and assignment_rhs(line, key).is_some() {
+        Some(loose_value(line))
+      } else {
+        root_value(rest, key, nr + 1, r)
+      }
+    }
+  }
+
+#[doc("The `edition` field of the root table, if present.")]
+pub fn edition_field(dir: String) : Option[String] / File + Ffi =
+  if dir == "" or (not cli_sys.is_file("#{dir}/kai.toml")) {
+    None
+  } else {
+    root_value(lines_of("#{dir}/kai.toml"), "edition", 1, false)
+  }
+
+fn ident_len(cs: [Char], n: Int) : Int =
+  match cs {
+    [c, ...rest] if char.is_alnum(c) or c == '-' and n > 0 -> ident_len(rest, n + 1)
+    _ -> n
+  }
+
+# `^\s*[A-Za-z_][A-Za-z0-9_-]*\s*=\s*true`: the identifier.
+fn unstable_key(line: String) : Option[String] {
+  let t = string.trim_left(line)
+  let n = if string.starts_with(t, "-") or char.is_digit(string.chars(t).head().unwrap_or('0')) {
+    0
+  } else {
+    ident_len(string.chars(t), 0)
+  }
+  let k = string_slice(t, 0, n)
+  let rhs = assignment_rhs(t, k).unwrap_or("")
+  if n > 0 and string.starts_with(string.trim_left(rhs), "true") { Some(k) } else { None }
+}
+
+fn scan_unstable(ls: [String], insec: Bool) : [String] =
+  match ls {
+    [] -> []
+    [line, ...rest] -> if string.trim_right(line) == "[unstable]"
+      and string.starts_with(line, "[") {
+      scan_unstable(rest, true)
+    } else if string.starts_with(line, "[") {
+      scan_unstable(rest, false)
+    } else {
+      let k = if insec { unstable_key(line) } else { None }
+      match k {
+        Some(key) -> ["--unstable-optin", key, ...scan_unstable(rest, insec)]
+        None -> scan_unstable(rest, insec)
+      }
+    }
+  }
+
+#[doc("`--package-name <name>` from the root table and `--unstable-optin <pkg>` per `[unstable]` entry set to true.")]
+pub fn unstable_flags(dir: String) : [String] / File + Ffi =
+  if dir == "" or (not cli_sys.is_file("#{dir}/kai.toml")) {
+    []
+  } else {
+    let ls = lines_of("#{dir}/kai.toml")
+    let name = match root_value(ls, "name", 1, false) {
+      Some(n) -> ["--package-name", ...cli_proc.words(n)]
+      None -> []
+    }
+    name ++ scan_unstable(ls, false)
+  }
+
+#[doc("True when the manifest has a line starting `[dependencies]`.")]
+pub fn has_dependencies(dir: String) : Bool / File =
+  lines_of("#{dir}/kai.toml") |> list.any(l => string.starts_with(l, "[dependencies]"))
+
+fn third_word(line: String) : String =
+  string.replace(list.nth(cli_proc.words(line), 2).unwrap_or(""), "\"", "")
+
+fn sanitize(s: String, keep_slash: Bool) : String =
+  string.chars(s)
+    |> list.map(
+      c => if char.is_alnum(c) or c == '-' or c == '.' or keep_slash and c == '/' { c } else { '_' }
+    )
+    |> string.from_chars
+
+fn drop_any(s: String, prefixes: [String]) : String =
+  prefixes.find_map(p => string.drop_prefix(s, p)).unwrap_or(s)
+
+# The cache slug of a git source: scheme and one leading `/` dropped, odd characters to `_`.
+fn slug(source: String) : String {
+  let s1 = drop_any(source, ["http://", "https://"])
+  let s2 = string.drop_prefix(s1, "ssh://").unwrap_or(s1)
+  let s3 = string.drop_prefix(s2, "file://").unwrap_or(s2)
+  sanitize(string.drop_prefix(s3, "/").unwrap_or(s3), true)
+}
+
+#[doc("The cache directories `kai.lock` pins, `<root>/<source slug>/<sha>`, in lock order.")]
+pub fn lock_dirs(dir: String, root: String) : [String] / File =
+  lines_of("#{dir}/kai.lock")
+    |> list.foldl(("", []), (st, line) => {
+      if string.starts_with(line, "source =") {
+        (third_word(line), st.snd)
+      } else if string.starts_with(line, "sha =") {
+        ("", ["#{root}/#{slug(st.fst)}/#{sanitize(third_word(line), false)}", ...st.snd])
+      } else {
+        st
+      }
+    })
+    |> (st => list.reverse(st.snd))

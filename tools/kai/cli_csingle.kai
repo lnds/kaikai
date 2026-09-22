@@ -1,0 +1,108 @@
+#[doc("""
+The single-TU C path: one emitted `.c` compiled at -O2 as the program
+object, linked with a -O0 runtime owner that holds every fiber suspend
+point.
+""")]
+
+import cli_err
+import cli_fs
+import cli_plan
+import cli_proc
+
+const OWNER_DEFS : [String] =
+  ["-DKAI_SEPARATE_COMPILATION=1", "-DKAI_RUNTIME_OWNER=1", "-DKAI_PROGRAM_PROVIDES_MAIN=1"]
+
+# A scheduler op compiled into the -O2 object would cache the thread pointer across a context switch.
+fn leaked_scheduler(p: Plan, obj: String) : Bool / File + Env + Ffi =
+  cli_proc.which("nm").is_some()
+    and string_contains(
+      cli_proc.capture(
+        ["nm", obj],
+        cli_proc.Spawn { ...cli_proc.inherit(), err: "/dev/null" },
+        "#{p.job.tmp}/nm.out"
+      ).snd,
+      "swapcontext"
+    )
+
+fn link_split(
+  p: Plan,
+  cfile: String,
+  incl: String
+) : Result[Unit, Int] / Stderr + Env + File + Ffi {
+  let t = p.t
+  let obj = "#{p.job.tmp}/out.o"
+  let compile = cli_plan.cc(t)
+    ++ t.cflags_compile
+    ++ [
+      "-DKAI_SEPARATE_COMPILATION=1",
+      "-I",
+      incl,
+      "-I",
+      t.inc_c,
+      "-I",
+      t.inc,
+      "-c",
+      cfile,
+      "-o",
+      obj
+    ]
+  if cli_proc.run(compile, cli_proc.inherit()) != 0 {
+    cli_err.die("C backend compile failed")
+  } else if leaked_scheduler(p, obj) {
+    cli_err.die(
+      "C backend: swapcontext leaked into the -O2 program object (a parking op is missing its KAI_SCHED_FN gate — #1238)"
+    )
+  } else {
+    let rt = cli_plan.runtime_obj(t, t.owner_c, OWNER_DEFS)
+    let argv = if rt != "" {
+      cli_plan.cc(t)
+        ++ t.cflags
+        ++ ["-I", incl, obj]
+        ++ p.native_objs
+        ++ [rt, "-o", p.job.out, "-lm", ...p.libs]
+    } else {
+      cli_plan.cc(t)
+        ++ t.cflags
+        ++ [cli_plan.OWNER_OPT, ...OWNER_DEFS]
+        ++ ["-I", incl, "-I", t.inc_c, "-I", t.inc, obj]
+        ++ p.native_objs
+        ++ [t.owner_c, "-o", p.job.out, "-lm", ...p.libs]
+    }
+    cli_plan.link(p, argv, "C backend")
+  }
+}
+
+#[doc("""
+Build through the plain C emit. A struct-by-value FFI program emits a
+marker stream carrying `kai_ffi.h` beside `out.c`; it splits into a
+subdir a hand-written shim can include from.
+""")]
+pub fn build(p: Plan) : Result[Unit, Int] / Stderr + Env + File + Ffi {
+  let t = p.t
+  let out_c = "#{p.job.tmp}/out.c"
+  let rc = cli_proc.run(cli_plan.kaic2(p, [], p.job.src), cli_plan.kaic2_spawn([], out_c, ""))
+  if rc != 0 {
+    Err(rc)
+  } else {
+    let text = cli_fs.read_or_empty(out_c)
+    let n = cli_plan.nonce(text)
+    let ffi = "#{p.job.tmp}/ffi"
+    let split = n != ""
+    if split {
+      let _ = cli_fs.mkdir_p(ffi)
+      cli_plan.split_stream(text, n, ffi)
+    }
+    let cfile = if split { "#{ffi}/out.c" } else { out_c }
+    let incl = if split { ffi } else { t.inc_c }
+    if t.owner_c == "" {
+      let argv = cli_plan.cc(t)
+        ++ t.cflags
+        ++ ["-I", incl, "-I", t.inc_c, "-I", t.inc, cfile]
+        ++ p.native_objs
+        ++ ["-o", p.job.out, "-lm", ...p.libs]
+      cli_plan.link(p, argv, "C backend")
+    } else {
+      link_split(p, cfile, incl)
+    }
+  }
+}

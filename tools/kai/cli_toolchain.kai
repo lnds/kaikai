@@ -1,0 +1,160 @@
+#[doc("The C toolchain and runtime files a build links against, resolved once per invocation.")]
+
+import os.env
+import cli_caches
+import cli_fs
+import cli_layout
+import cli_proc
+import cli_sys
+
+#[doc("`$CC`, `$CFLAGS` (and its compile-line form without `.c` shims), the runtime include dirs and objects, and the core-cache flags.")]
+pub type Toolchain = {
+  layout: Layout,
+  cc: String,
+  cflags: [String],
+  cflags_compile: [String],
+  cflags_from_env: Bool,
+  inc: String,
+  inc_c: String,
+  llvm_c: String,
+  owner_c: String,
+  llvm_bc: String,
+  inline_bc: String,
+  core_cache: [String],
+  os: String,
+  arch: String
+}
+
+const DEFAULT_CFLAGS : String = "-std=c99 -Wno-unused-function -Wno-unused-variable -O2"
+
+# Flags whose value is the next word: a `.c` after one is an argument, not a source.
+const SEPARATED_ARG_FLAGS : [String] = [
+  "-include", "-imacros", "-x", "-Xclang", "-Xlinker", "-Xpreprocessor", "-MT", "-MQ", "-MF", "-I",
+  "-L", "-D", "-U", "-isystem", "-iquote", "-idirafter", "-o", "-z", "-T"
+]
+
+fn is_shim_source(prev: String, w: String) : Bool =
+  (not string.starts_with(w, "-"))
+    and string.ends_with(w, ".c")
+    and (not SEPARATED_ARG_FLAGS.contains(prev))
+
+# `.c` shims ride the link lines only: a source is illegal on a `-c … -o` line.
+fn compile_flags(ws: [String]) : [String] =
+  ws
+    |> list.foldl(("", []), (st, w) => {
+      let kept = if is_shim_source(st.fst, w) { st.snd } else { [w, ...st.snd] }
+      (w, kept)
+    })
+    |> (st => list.reverse(st.snd))
+
+fn first_file(candidates: [String]) : String / Ffi =
+  candidates.find(p => cli_sys.is_file(p)).unwrap_or("")
+
+fn core_cache_flags(l: Layout, os: String) : [String] / Env + File + Ffi {
+  let tid = cli_layout.toolchain_id(l)
+  let off = cli_caches.env_or("KAI_CORE_CACHE", "1") == "0"
+  let dir = "#{cli_caches.root("KAI_CORE_CACHE_DIR", "core", os)}/#{tid}"
+  if off or tid == "" or (not cli_fs.mkdir_p(dir)) {
+    []
+  } else {
+    let stats = if cli_caches.env_or("KAI_CORE_CACHE_STATS", "0") == "1" {
+      ["--core-cache-stats"]
+    } else {
+      []
+    }
+    ["--core-cache-dir", dir, "--toolchain-id", tid] ++ stats
+  }
+}
+
+#[doc("Resolve the toolchain for layout `l`; `KAI_INCLUDE` overrides both runtime include dirs.")]
+pub fn resolve(l: Layout) : Toolchain / Env + File + Ffi {
+  let os = cli_sys.uname_s()
+  let inc_default = if l.dev { "#{l.root}/stage0" } else { "#{l.root}/share/kaikai/include" }
+  let inc_c_default = if l.dev { "#{l.root}/stage2" } else { "#{l.root}/share/kaikai/include" }
+  let inc = cli_caches.env_or("KAI_INCLUDE", inc_default)
+  let inc_c = cli_caches.env_or("KAI_INCLUDE", inc_c_default)
+  let llvm_bc = first_file(["#{inc}/runtime_llvm.bc", "#{l.root}/stage0/runtime_llvm.bc"])
+  let inline_bc = if llvm_bc == "" {
+    ""
+  } else {
+    first_file(["#{inc}/runtime_inline.bc", "#{l.root}/stage0/runtime_inline.bc"])
+  }
+  let cflags = cli_proc.words(cli_caches.env_or("CFLAGS", DEFAULT_CFLAGS))
+  Toolchain {
+    layout: l,
+    cc: cli_caches.env_or("CC", "cc"),
+    cflags,
+    cflags_compile: compile_flags(cflags),
+    cflags_from_env: env.get("CFLAGS").is_some(),
+    inc,
+    inc_c,
+    llvm_c: first_file(["#{inc}/runtime_llvm.c", "#{l.root}/stage0/runtime_llvm.c"]),
+    owner_c: first_file(["#{inc_c}/runtime_owner_c.c", "#{l.root}/stage2/runtime_owner_c.c"]),
+    llvm_bc,
+    inline_bc,
+    core_cache: core_cache_flags(l, os),
+    os,
+    arch: cli_sys.uname_m()
+  }
+}
+
+#[doc("`uname -sm`: the host key folded into every object-cache digest.")]
+pub fn host(t: Toolchain) : String = "#{t.os} #{t.arch}"
+
+#[doc("Linker flags that drop unreferenced functions; none in a debug build or when `KAI_NATIVE_DEAD_STRIP=0`.")]
+pub fn dead_strip(t: Toolchain) : [String] / Env =
+  if cli_caches.env_or("KAI_NATIVE_DEAD_STRIP", "1") == "0"
+    or cli_caches.env_or("KAI_BUILD_MODE", "default") == "debug" {
+    []
+  } else if t.os == "Darwin" {
+    ["-Wl,-dead_strip"]
+  } else {
+    ["-Wl,--gc-sections"]
+  }
+
+#[doc("The main-thread stack size a deeply recursive program needs on macOS, fixed at link time.")]
+pub fn stack_ldflags(t: Toolchain) : [String] =
+  if t.os == "Darwin" { ["-Wl,-stack_size,0x8000000"] } else { [] }
+
+# A user CFLAGS must not compile a shim source into the compiler: the stage
+# Makefiles get the flags-only form, or their own defaults when that is empty.
+fn bootstrap(t: Toolchain, stage: String, target: String) : Int / Ffi {
+  let base = cli_proc.Spawn { ...cli_proc.inherit(), dir: "#{t.layout.root}/#{stage}", out: "&2" }
+  let sp = if not t.cflags_from_env {
+    base
+  } else if list.is_empty(t.cflags_compile) {
+    cli_proc.Spawn { ...base, unset: ["CFLAGS"] }
+  } else {
+    cli_proc.Spawn { ...base, set: [("CFLAGS", string.join(t.cflags_compile, " "))] }
+  }
+  cli_proc.run(["make", target], sp)
+}
+
+#[doc("The compiler, bootstrapped stage by stage in a checkout when missing; an installed prefix must ship it.")]
+pub fn ensure_built(t: Toolchain) : Result[Unit, Int] / Stderr + Ffi {
+  let root = t.layout.root
+  if not t.layout.dev {
+    if cli_sys.is_exec(t.layout.kaic2) {
+      Ok(())
+    } else {
+      Stderr.eprint(
+        "kai: error: kaic2 binary missing at #{t.layout.kaic2} — installation is corrupt"
+      )
+      Err(2)
+    }
+  } else {
+    [("stage0", "kaic0"), ("stage1", "kaic1"), ("stage2", "kaic2")]
+      |> list.foldl(
+        Ok(()),
+        (acc, s) => match acc {
+          Ok(_) -> if cli_sys.is_exec("#{root}/#{s.fst}/#{s.snd}") {
+            Ok(())
+          } else {
+            let rc = bootstrap(t, s.fst, s.snd)
+            if rc == 0 { Ok(()) } else { Err(rc) }
+          }
+          e -> e
+        }
+      )
+  }
+}

@@ -1,0 +1,200 @@
+#[doc("""
+C separate compilation: kaic2 emits one `.c` per module plus per-TU
+header slices; each compiles in parallel to an object cached by the
+hash of what it can see, and the objects link with the runtime owner.
+""")]
+
+import cli_caches
+import cli_err
+import cli_fs
+import cli_hash
+import cli_plan
+import cli_proc
+import cli_sys
+import cli_toolchain
+
+const SEPARATE : String = "-DKAI_SEPARATE_COMPILATION=1"
+
+# One translation unit: its source, its object, the defines it compiles with, and its cache key.
+type Tu = { c: String, o: String, defs: [String], key: String }
+
+#[doc("Whether the C backend compiles per module: `KAI_MODULAR` forces it, else it follows the shared core cache.")]
+pub fn wanted(t: Toolchain) : Bool / Env =
+  match cli_caches.env_or("KAI_MODULAR", "auto") {
+    "1" -> true
+    "0" -> false
+    _ -> not list.is_empty(t.core_cache)
+  }
+
+fn sources(dir: String) : [String] / File =
+  list.sort(dir_list_dir(dir) |? (f => string.ends_with(f, ".c")))
+
+fn stem(f: String) : String = string.drop_suffix(f, ".c").unwrap_or(f)
+
+# The program TU that owns the runtime when there is no separate owner object.
+fn owner_module(t: Toolchain, dir: String, cs: [String]) : String / Ffi =
+  if t.owner_c != "" {
+    ""
+  } else if cli_sys.is_file("#{dir}/__root__.c") {
+    "__root__.c"
+  } else {
+    list.head(cs).unwrap_or("")
+  }
+
+fn tu(dir: String, owner: String, common: String, f: String) : Tu / Ffi {
+  let defs = if f == owner { [SEPARATE, "-DKAI_RUNTIME_OWNER=1"] } else { [SEPARATE] }
+  let th = "#{dir}/kai_types_#{stem(f)}.h"
+  let dh = "#{dir}/kai_decls_#{stem(f)}.h"
+  let keyed = common != "" and cli_sys.is_file(th) and cli_sys.is_file(dh)
+  let key = if keyed {
+    cli_hash.digest([
+      cli_hash.lines([common, string.join(defs, " ")]),
+      cli_hash.Bytes(th),
+      cli_hash.Bytes(dh),
+      cli_hash.Bytes("#{dir}/#{f}")
+    ])
+  } else {
+    ""
+  }
+  Tu { c: "#{dir}/#{f}", o: "#{dir}/#{stem(f)}.o", defs, key }
+}
+
+fn compile_argv(t: Toolchain, dir: String, u: Tu) : [String] =
+  cli_plan.cc(t)
+    ++ t.cflags_compile
+    ++ ["-I", dir, "-I", t.inc_c, "-I", t.inc]
+    ++ u.defs
+    ++ ["-c", u.c, "-o", u.o]
+
+fn store(cache: String, u: Tu) : Unit / File + Ffi =
+  if u.key != "" {
+    let part = "#{cache}/#{u.key}.o.#{cli_sys.getpid()}"
+    if cli_fs.copy(u.o, part) {
+      let _ = file_rename(part, "#{cache}/#{u.key}.o")
+    }
+  }
+
+# Wait for the oldest running compile; true when it succeeded.
+fn finish(cache: String, job: (Int, Tu)) : Bool / Stderr + File + Ffi =
+  if cli_sys.wait(job.fst) == 0 {
+    store(cache, job.snd)
+    true
+  } else {
+    Stderr.eprint("kai: error: modular compile failed for #{cli_fs.basename(job.snd.c)}")
+    false
+  }
+
+# At most `jobs` compiles in flight; the oldest is reaped first. Returns the failure count.
+fn pool(
+  t: Toolchain,
+  dir: String,
+  cache: String,
+  jobs: Int,
+  todo: [Tu],
+  running: [(Int, Tu)],
+  failed: Int
+) : Int / Stderr + File + Ffi =
+  match todo, running {
+    [], _ -> running |> list.foldl(failed, (n, j) => if finish(cache, j) { n } else { n + 1 })
+    _, [oldest, ...others] if list.length(running) >= jobs -> {
+      let n = if finish(cache, oldest) { failed } else { failed + 1 }
+      pool(t, dir, cache, jobs, todo, others, n)
+    }
+    [u, ...rest], _ -> {
+      let pid = cli_proc.start(compile_argv(t, dir, u), cli_proc.inherit())
+      pool(t, dir, cache, jobs, rest, running ++ [(pid, u)], failed)
+    }
+  }
+
+fn cache_hit(cache: String, u: Tu) : Bool / File + Ffi =
+  u.key != "" and cli_sys.is_file("#{cache}/#{u.key}.o") and cli_fs.copy("#{cache}/#{u.key}.o", u.o)
+
+fn jobs_setting(t: Toolchain) : Int / Env + Ffi =
+  match string.to_int(cli_caches.env_or("KAI_MODULAR_JOBS", "")) {
+    Some(n) if n > 0 -> n
+    _ -> cli_sys.ncpu()
+  }
+
+fn cache_dir(t: Toolchain) : String / Env + File + Ffi {
+  let dir = cli_caches.root("KAI_MODULAR_CACHE_DIR", "cmodular", t.os)
+  if cli_caches.env_or("KAI_MODULAR_NO_CACHE", "0") != "1" and cli_fs.mkdir_p(dir) {
+    dir
+  } else {
+    ""
+  }
+}
+
+# Every TU to an object: cache hits copy, the rest compile in parallel. Fails when any compile does.
+fn compile_all(t: Toolchain, dir: String) : Result[Unit, Int] / Stderr + Env + File + Ffi {
+  let cs = sources(dir)
+  let cache = cache_dir(t)
+  let common = if cache == "" {
+    ""
+  } else {
+    cli_hash.digest([
+      cli_hash.lines([t.cc, string.join(t.cflags_compile, " "), SEPARATE, cli_toolchain.host(t)]),
+      cli_hash.Bytes("#{dir}/runtime.h")
+    ])
+  }
+  let owner = owner_module(t, dir, cs)
+  let jobs = jobs_setting(t)
+  let misses = cs | (f => tu(dir, owner, common, f)) |? (u => not cache_hit(cache, u))
+  let failed = pool(t, dir, cache, jobs, misses, [], 0)
+  if cli_caches.env_or("KAI_MODULAR_STATS", "0") == "1" {
+    let ntu = list.length(cs)
+    let nmiss = list.length(misses)
+    let location = if cache == "" { "" } else { " (#{cache})" }
+    Stderr.eprint(
+      "kai: c-modular: #{ntu} TUs, jobs=#{jobs}, cache hits=#{ntu - nmiss} compiled=#{nmiss}#{location}"
+    )
+  }
+  if failed > 0 { cli_err.die("modular compile failed") } else { Ok(()) }
+}
+
+fn link_all(p: Plan, dir: String) : Result[Unit, Int] / Stderr + Env + File + Ffi {
+  let t = p.t
+  let objs = sources(dir) | (f => "#{dir}/#{stem(f)}.o")
+  let lead = cli_plan.cc(t) ++ t.cflags
+  let tail = p.native_objs ++ ["-o", p.job.out, "-lm", ...p.libs]
+  let ldstack = cli_toolchain.stack_ldflags(t)
+  let defs = [SEPARATE, "-DKAI_RUNTIME_OWNER=1", "-DKAI_PROGRAM_PROVIDES_MAIN=1"]
+  let rt = if t.owner_c == "" { "" } else { cli_plan.runtime_obj(t, t.owner_c, defs) }
+  let argv = if t.owner_c == "" {
+    lead ++ ldstack ++ objs ++ tail
+  } else if rt != "" {
+    lead ++ ldstack ++ objs ++ p.native_objs ++ [rt, "-o", p.job.out, "-lm", ...p.libs]
+  } else {
+    lead
+      ++ [cli_plan.OWNER_OPT, ...defs]
+      ++ ldstack
+      ++ ["-I", t.inc_c, "-I", t.inc]
+      ++ objs
+      ++ p.native_objs
+      ++ [t.owner_c, "-o", p.job.out, "-lm", ...p.libs]
+  }
+  cli_plan.link(p, argv, "modular")
+}
+
+#[doc("Build through `--emit=c-modular`: split the stream, compile each TU (cached, in parallel), link. A kaic2 failure passes its status through.")]
+pub fn build(p: Plan) : Result[Unit, Int] / Stderr + Env + File + Ffi {
+  let t = p.t
+  let stream = "#{p.job.tmp}/modular.stream"
+  let dir = "#{p.job.tmp}/mod"
+  let rc = cli_proc.run(
+    cli_plan.kaic2(p, ["--emit=c-modular"], p.job.src),
+    cli_plan.kaic2_spawn([], stream, "")
+  )
+  let text = cli_fs.read_or_empty(stream)
+  let n = cli_plan.nonce(text)
+  if rc != 0 {
+    Err(rc)
+  } else if n == "" {
+    cli_err.die("internal: --emit=c-modular produced no //KAIDELIM marker")
+  } else {
+    let _ = cli_fs.mkdir_p(dir)
+    cli_plan.split_stream(text, n, dir)
+    let _ = cli_fs.copy("#{t.inc_c}/runtime.h", "#{dir}/runtime.h")
+    compile_all(t, dir)!
+    link_all(p, dir)
+  }
+}
