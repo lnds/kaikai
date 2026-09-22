@@ -60,6 +60,27 @@ On a Homebrew install, `kai upgrade` does not touch the Cellar — it
 prints a pointer to `brew upgrade kaikai` and exits. This is distinct
 from `kai update`, which refreshes package dependencies in `kai.toml`.
 
+## `kai env` and plugins
+
+`kai env` prints the installation `kai` resolves — the one place the
+install prefix, the stdlib, and the compiler identity are worked out:
+
+```sh
+$ kai env
+KAIKAI_HOME=/Users/x/.kaikai
+KAI_STDLIB=/Users/x/.kaikai/share/kaikai/stdlib
+KAI_TOOLCHAIN_ID=1790102223-92641704
+$ kai env KAI_STDLIB             # just the value, one per name
+/Users/x/.kaikai/share/kaikai/stdlib
+```
+
+A command `kai` does not know runs as a plugin, the git/cargo model:
+`kai foo a b` executes the first executable `kai-foo` on `PATH` with
+`a b`, the three variables above already exported, and exits with its
+status. A plugin run directly recovers the same values with `kai env`.
+A plugin never shadows a built-in command; with no `kai-foo` on `PATH`,
+`kai foo` reports the unknown command.
+
 ## Build profiles
 
 `kai build` takes a profile flag that trades compile speed, binary size,
