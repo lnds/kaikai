@@ -1,4 +1,4 @@
-.PHONY: test-diag-path-rewrite bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-decl-symid-survives test-evar-above-erase test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily coverage-probe rc-budget stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-rc-budget
+.PHONY: test-diag-path-rewrite bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-decl-symid-survives test-evar-above-erase test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 test-light-partition test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily coverage-probe rc-budget stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-rc-budget
 
 # A bare kaic2 with no `--edition` runs the OLDEST edition (tongariki),
 # so a recipe driving the binary directly would test the previous
@@ -209,7 +209,7 @@ warm-core: kaic2
 
 # Tier 0: pre-commit gate. ~30-60s. Every agent / human runs this
 # before every commit. If it fails, no commit happens.
-tier0: selfhost test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-diag-path-rewrite test-selfhost-gate-no-rebuild test-stage1-imports test-stage1-homonyms test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-decl-symid-survives test-evar-above-erase test-respelling-confined test-compile-alloc test-rc-budget
+tier0: selfhost test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-diag-path-rewrite test-selfhost-gate-no-rebuild test-stage1-imports test-stage1-homonyms test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-decl-symid-survives test-evar-above-erase test-respelling-confined test-compile-alloc test-light-partition test-rc-budget
 	@echo "tier0 OK — selfhost deterministic (kaic2b.c == kaic2c.c), emitted kai_* confined to the runtime namespace on both backends, a non-identifier basename still mints valid C symbols, demos baseline holds, arena gate passes, heap ceiling contains, evidence-frame gate holds, runtime globals classified, no thread-local escapes into an inlinable hot-bitcode function, timeout shim honours its exit-code contract, P2 status distinguishes its three states, header prerequisites declared, forced KAI_LLVM=1 without llvm-config stops loud, the parity gate cannot silently downgrade a native tree, kaic1 rejects its negative fixtures, kaic1 resolves imports across a multi-module package, two modules declaring one function name mint two C symbols, a symbol's owner is a module symbol's id, every stage2 module is reachable from main.kai, RC-string prims keep their shared-let binders in Perceus scope, #!/bin/sh scripts parse under dash, the native self-host gate consumes the published kaic2 instead of rebuilding it, the compiler allocates within its ceiling compiling a fixed program"
 
 # tier0 minus the selfhost. The selfhost is two whole compiler generations
@@ -217,7 +217,7 @@ tier0: selfhost test-kai-namespace test-native-namespace test-module-name-ident 
 # the two as separate jobs so a broken gate reports in a couple of minutes
 # instead of waiting behind the selfhost, and the two run concurrently
 # rather than in series. Locally `tier0` stays the single pre-commit gate.
-tier0-gates: test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-diag-path-rewrite test-selfhost-gate-no-rebuild test-stage1-imports test-stage1-homonyms test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-decl-symid-survives test-evar-above-erase test-respelling-confined test-compile-alloc
+tier0-gates: test-kai-namespace test-native-namespace test-module-name-ident demos-no-regression test-arena test-heap-limit test-evidence-frame test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-stage1-rejections test-rboxed-prim-scope test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-diag-path-rewrite test-selfhost-gate-no-rebuild test-stage1-imports test-stage1-homonyms test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-decl-symid-survives test-evar-above-erase test-respelling-confined test-compile-alloc test-light-partition
 	@echo "tier0-gates OK — every tier0 gate except the selfhost"
 
 # A ceiling on the cells the compiler allocates compiling a fixed
@@ -493,99 +493,109 @@ bench-mn-throughput: kaic2
 tier1: test rc-leak-gate test-partition-linearity demos-no-regression test-fmt test-fmt-package test-fmt-width test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-core-text test-http-redirects test-independence-oracle test-packages test-editions test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-release-platforms test-cli-flags
 	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + independence oracle (#962 soundness gate) + package-mode harness (issue #569) + whole-compiler c-modular link (issue #1012) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + M:N determinism (N=1==N=4) + kai info smoke + kai doc smoke + Perceus RC leak ledger (240 fixtures pinned)"
 
-# CI sharding (docs/ci-time-analysis.md §7). tier1's ~15-min light-fixture
-# grout dominates the PR critical path; it is CPU-bound + independent, so we
-# split it across SEPARATE runners (each with its own memory bus — in-job
-# `-j` is bandwidth-capped). These shards PARTITION the `tier1` work:
-# every phase of `tier1` above appears in exactly one shard, so the union is
-# the full gate with identical coverage. The CI workflow runs them in
-# parallel on a shared pre-built kaic2 and an aggregator job (`tier1`)
-# gates on all of them — the Required check name is unchanged.
+# CI sharding (docs/ci-time-analysis.md §7). The tier1 work is split across
+# SEPARATE runners (each with its own memory bus — in-job `-j` is
+# bandwidth-capped). These shards PARTITION the `tier1` work: every phase of
+# `tier1` above appears in exactly one shard, so the union is the full gate
+# with identical coverage. The CI workflow runs them in parallel on a shared
+# pre-built kaic2 and an aggregator job (`tier1`) gates on all of them — the
+# Required check name is unchanged.
 #
-#  shard 1 — the 4 GB self-compiles + stateful caches (memory-bound), then,
-#            after they free their RSS, demos + every non-light phase. These
-#            are CPU-light, so the runner that finishes the costly compiles
-#            fastest absorbs the tail instead of sitting idle.
-#  shard 2 — light slice 1/4 + the namespace-collision corpus (C axes).
-#  shard 3 — light slice 2/4.
-#  shard 4 — the whole-compiler modular self-host. It is a full compiler
-#            self-compile (the slowest single phase in the gate); isolating
-#            it keeps every shard's wall-clock near the light slices instead
-#            of one shard dominating the critical path.
-#  shard 5 — light slice 3/4.
-#  shard 6 — the modular-escape gate + light slice 4/4.
-#  shard 7 — fmt meaning-preservation over the whole corpus.
-# Why the non-light tail lives on shard 1, NOT on a light shard: an earlier
-# 3-way light split measured worse, but the culprit was the tail + demos
-# piled onto a light slice, not the round-robin itself. Round-robin splits
-# by target COUNT, not cost, and the families differ ~50x (stdlib 158
-# fixtures vs 1-fixture targets) — if the slices measure unbalanced, weight
-# the split by measured cost instead of raising SHARDS further.
+# Every shard but 7 carries one light slice. The slices are planned by
+# measured cost (tools/tier1-light-plan.sh), and each shard's fixed work
+# below is its `base` in tools/tier1-light-costs.txt, so the planner packs
+# the light pool around it. Moving a phase between shards means updating
+# those bases.
+#
+#  shard 1 — the 4 GB self-compiles + stateful caches (memory-bound), demos,
+#            then the CPU-light CLI/tooling tail.
+#  shard 2 — the namespace-collision corpus (C axes).
+#  shard 3 — the Perceus RC leak ledger + partition linearity + core text.
+#  shard 4 — the whole-compiler modular self-host.
+#  shard 5 — fmt fixtures + fmt self-hosting, packages, editions, kai info.
+#  shard 6 — the modular-escape gate.
+#  shard 7 — fmt meaning-preservation over the whole corpus, alone: ~18 min
+#            of its own leaves no room beside another gate.
+#
+# The two modular self-hosts (shards 4 and 6) only detect regressions in the
+# sources they compile, so CI passes TIER1_SELFHOSTS=0 on PRs that touch no
+# compiler source. The light slices on those shards run either way.
 #
 # Coverage invariant (do not break): the set
 #   { test-costly-parallel, test-heap-limit, test-user-cache,
 #     test-core-cache, test-modular-selfhost, test-perceus-1131-modular-escape,
-#     light(1/4), light(2/4), light(3/4), light(4/4), test-fmt-property,
-#     demos-no-regression, test-fmt, test-fmt-package, test-fmt-width,
-#     test-fmt-selfhost,
-#     test-fmt-help-scope, test-bench,
-#     test-check, test-library-mode, test-lsp, test-diagnostics-collected,
-#     test-native-diag-path, test-watch-survives-error, test-negative,
-#     test-stdlib-modules, test-packages,
+#     light(1/6) .. light(6/6), test-fmt-property, demos-no-regression,
+#     test-fmt, test-fmt-package, test-fmt-width, test-fmt-selfhost,
+#     test-fmt-help-scope, test-bench, test-check, test-typecheck,
+#     test-check-parity, test-library-mode, test-lsp,
+#     test-diagnostics-collected, test-native-diag-path,
+#     test-watch-survives-error, test-negative, test-stdlib-modules,
+#     test-independence-oracle, test-packages, test-editions,
 #     test-private-type-shadow-audit, test-private-record-shadow-audit,
-#     test-canonical-aliases, test-info, test-doc,
-#     test-upgrade-resolver, test-release-platforms, test-cli-flags }
-# equals exactly the prerequisites of `tier1` (the four light slices union
-# to TEST_LIGHT_TARGETS, proven by the round-robin partition in
-# stage2/Makefile). Adding a phase to `tier1` means adding it to a shard.
+#     test-canonical-aliases, test-info, test-doc, test-upgrade-resolver,
+#     test-release-platforms, test-cli-flags, rc-leak-gate,
+#     test-partition-linearity, test-core-text, test-http-redirects }
+# covers the prerequisites of `tier1` (the light slices union to
+# TEST_LIGHT_TARGETS, asserted by `test-light-partition` in tier0). Adding a
+# phase to `tier1` means adding it to a shard.
+TIER1_LIGHT_SLICES := 6
+TIER1_SELFHOSTS ?= 1
+tier1-light-slice = $(MAKE) -C stage2 test-light-shard SHARD=$(1) SHARDS=$(TIER1_LIGHT_SLICES)
+
+test-light-partition:
+	$(MAKE) -C stage2 test-light-partition SHARDS=$(TIER1_LIGHT_SLICES)
+
 tier1-shard-1: kaic2
 	$(MAKE) -C stage2 test-costly-parallel
 	$(MAKE) -C stage2 test-heap-limit
 	$(MAKE) -C stage2 test-user-cache
 	$(MAKE) -C stage2 test-core-cache
 	$(MAKE) demos-no-regression
-	$(MAKE) test-fmt test-fmt-package test-fmt-width test-fmt-selfhost test-fmt-help-scope test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-independence-oracle test-packages test-editions test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-info test-doc test-upgrade-resolver test-release-platforms test-cli-flags
-	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + non-light tail (fmt/bench/check/lsp/negative/stdlib-modules/audits/info/doc/upgrade-resolver/release-platforms)"
+	$(MAKE) test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-doc test-upgrade-resolver test-release-platforms test-cli-flags
+	$(call tier1-light-slice,1)
+	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + CLI/tooling tail + light slice 1/$(TIER1_LIGHT_SLICES)"
 
-# The C-only axes of the namespace-collision corpus ride the lightest
-# slice, and the matrix gate runs again right after so it reads their
-# ratchet status (tests/namespace_matrix.sh refuses green over a red axis).
+# The matrix gate runs right after the C-only namespace-collision axes so it
+# reads their ratchet status (tests/namespace_matrix.sh refuses green over a
+# red axis).
 tier1-shard-2: kaic2
-	$(MAKE) -C stage2 test-light-shard SHARD=1 SHARDS=4
+	$(call tier1-light-slice,2)
 	$(MAKE) -C stage2 test-namespace-collisions-c-axes
 	$(MAKE) test-namespace-matrix
-	@echo "tier1-shard-2 OK — light slice 1/4 + namespace-collision corpus (C axes) under ratchet"
+	@echo "tier1-shard-2 OK — light slice 2/$(TIER1_LIGHT_SLICES) + namespace-collision corpus (C axes) under ratchet"
 
 tier1-shard-3: kaic2
-	$(MAKE) -C stage2 test-light-shard SHARD=2 SHARDS=4
+	$(call tier1-light-slice,3)
 	$(MAKE) -C stage2 rc-leak-gate
 	$(MAKE) test-partition-linearity test-core-text test-http-redirects
-	@echo "tier1-shard-3 OK — light slice 2/4 + Perceus RC leak ledger + partition linearity + core text contracts"
+	@echo "tier1-shard-3 OK — light slice 3/$(TIER1_LIGHT_SLICES) + Perceus RC leak ledger + partition linearity + core text contracts"
 
 # The two modular self-hosts sit in separate shards: each rebuilds the whole
 # compiler, and a PR touching stage2/compiler/** misses the warm cache by
-# construction, so the pair no longer fits one job's budget.
+# construction, so the pair does not fit one job's budget.
 tier1-shard-4: kaic2
+ifneq ($(TIER1_SELFHOSTS),0)
 	$(MAKE) -C stage2 test-modular-selfhost
-	@echo "tier1-shard-4 OK — whole-compiler c-modular link"
+endif
+	$(call tier1-light-slice,4)
+	@echo "tier1-shard-4 OK — whole-compiler c-modular link (TIER1_SELFHOSTS=$(TIER1_SELFHOSTS)) + light slice 4/$(TIER1_LIGHT_SLICES)"
 
 tier1-shard-5: kaic2
-	$(MAKE) -C stage2 test-light-shard SHARD=3 SHARDS=4
-	@echo "tier1-shard-5 OK — light slice 3/4"
+	$(MAKE) test-fmt test-fmt-package test-fmt-width test-fmt-selfhost test-fmt-help-scope test-independence-oracle test-packages test-editions test-info
+	$(call tier1-light-slice,5)
+	@echo "tier1-shard-5 OK — fmt fixtures + fmt self-hosting + packages + editions + kai info + light slice 5/$(TIER1_LIGHT_SLICES)"
 
-# Split out of shard-4 so CI can gate and time it on its own; it shares
-# shard-4's object cache but is a separate job. Carries the fourth light
-# slice too: the pair stays well inside the budget the whole-compiler
-# shards set.
 tier1-shard-6: kaic2
+ifneq ($(TIER1_SELFHOSTS),0)
 	$(MAKE) -C stage2 test-perceus-1131-modular-escape
-	$(MAKE) -C stage2 test-light-shard SHARD=4 SHARDS=4
-	@echo "tier1-shard-6 OK — #1131 modular-escape gate + light slice 4/4"
+endif
+	$(call tier1-light-slice,6)
+	@echo "tier1-shard-6 OK — modular-escape gate (TIER1_SELFHOSTS=$(TIER1_SELFHOSTS)) + light slice 6/$(TIER1_LIGHT_SLICES)"
 
 # fmt-property gets its own shard because it must run UNCONDITIONALLY: the
 # corpus it formats can regress from a stdlib or fixture change, so it may
-# not ride a shard whose steps are gated on a compiler-source touch, and its
-# ~20 min leaves no headroom on a shard that carries anything else.
+# not be gated on a compiler-source touch, and its ~18 min leaves no
+# headroom on a shard that carries anything else.
 tier1-shard-7: kaic2
 	$(MAKE) test-fmt-property
 	@echo "tier1-shard-7 OK — fmt meaning-preservation over the whole corpus"

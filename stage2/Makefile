@@ -11226,25 +11226,26 @@ TEST_LIGHT_TARGETS := test-infer test-infer-check test-lint test-dump-typed test
 test-light-parallel: $(TARGET) build core-cache-warm
 	@$(MAKE) -j$(TEST_JOBS) $(TEST_LIGHT_TARGETS)
 
-# CI sharding (docs/ci-time-analysis.md §7). The ~100 light targets are the
-# dominant tier1 cost (~15 min on ubuntu-latest) and are CPU-bound +
-# independent, so they scale near-linearly across SEPARATE runners (in-job
-# `-j` is memory-bandwidth-capped at 1.24×; separate runners each get their
-# own memory bus — the tier1-perf retro measured this). `test-light-shard`
-# runs the round-robin slice `SHARD` of `SHARDS` of TEST_LIGHT_TARGETS:
-# target i (1-based) belongs to shard ((i-1) % SHARDS) + 1. Round-robin (not
-# contiguous wordlist) balances the heavy families (stdlib/sugars/effects)
-# across slices instead of piling them into one. The slices are a partition
-# of the single canonical list — their union is exactly TEST_LIGHT_TARGETS,
-# with no overlap, by construction. SHARDS=1 (default) reproduces the full
-# list, so a non-sharded `test` is unchanged.
+# CI sharding (docs/ci-time-analysis.md §7). The light targets are the
+# dominant tier1 cost and are CPU-bound + independent, so they scale across
+# SEPARATE runners (in-job `-j` is memory-bandwidth-capped; separate runners
+# each get their own memory bus). `test-light-shard` runs slice `SHARD` of
+# `SHARDS`, planned by tools/tier1-light-plan.sh from the measured costs in
+# tools/tier1-light-costs.txt: the families differ ~50x in cost, so a split
+# by target count leaves one slice with the long poles. A target missing
+# from the cost table gets the default cost, so adding one never breaks the
+# split. The slices partition TEST_LIGHT_TARGETS — `test-light-partition`
+# asserts it. SHARDS=1 (default) reproduces the full list.
 SHARD  ?= 1
 SHARDS ?= 1
+TIER1_LIGHT_PLAN = ../tools/tier1-light-plan.sh
 test-light-shard: $(TARGET) build core-cache-warm
-	@slice=$$(echo $(TEST_LIGHT_TARGETS) | tr ' ' '\n' \
-	  | awk 'NR % $(SHARDS) == ($(SHARD) - 1) % $(SHARDS)' | tr '\n' ' '); \
+	@slice=$$(sh $(TIER1_LIGHT_PLAN) $(SHARD) $(SHARDS) $(TEST_LIGHT_TARGETS)) || exit 1; \
 	echo "test-light-shard $(SHARD)/$(SHARDS): $$(echo $$slice | wc -w | tr -d ' ') targets"; \
 	$(MAKE) -j$(TEST_JOBS) $$slice
+
+test-light-partition:
+	@sh $(TIER1_LIGHT_PLAN) --check $(SHARDS) $(TEST_LIGHT_TARGETS)
 
 test: $(TARGET) build
 	@$(MAKE) test-costly-parallel
