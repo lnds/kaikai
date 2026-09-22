@@ -79,6 +79,9 @@ statements on one line (`{ f(h); each_of(t, f) }`). A single-quoted
 
 ```kaikai
 type Color = Red | Green | Blue                # sum type
+type Evidence = | SameBytecode                 # sum with ONE member —
+                                               #   the leading `|` is
+                                               #   required (see below)
 type Point = { x: Int, y: Int }                # record type
 type Wallet = { owner: String,                 # `priv` hides a field
                 priv pin: Int }                #   outside the module
@@ -139,6 +142,23 @@ extern "C" fn cos(x: Real) : Real / Ffi        # FFI — Ffi in row REQUIRED
 
 fn main() : Int = fib(10) + classify(0, 5) + MAX
 ```
+
+A sum with a single member takes a leading `|`:
+
+```kaikai
+type Evidence = | SameBytecode    # one member — sum, ctor exists
+type Color = Red | Green          # two or more — no leading bar
+type Meters = Int                 # no bar, one name — type ALIAS
+
+fn main() : Int = match SameBytecode { SameBytecode -> 0 }
+```
+
+The bar is what separates the two readings: without it, `type E = X` is
+an alias to a type named `X` and no constructor `X` is created. The bar
+is only needed when the lone member takes no payload — `type E = X(Int)`
+already reads as a sum on its parentheses, and `kai fmt` drops a bar
+written there. A variant with no payload never takes empty parentheses:
+write `X`, not `X()`.
 
 A union member may be qualified — `type Both = pa.Cfg | pb.Cfg` — which
 is how a union names two homonymous imported types, since a bare `Cfg`
@@ -1310,6 +1330,12 @@ fn classify(n: Int) : String {
   case n if n < 0 -> "neg"                      # clause-block guard is
   case _          -> "pos"                      #   `when`, not `if`
 }
+```
+
+```kaikai-neg
+type Evidence = SameBytecode()                 # no empty payload parens
+                                               # (one-member sum is
+                                               #  `= | SameBytecode`)
 ```
 
 ```kaikai-neg
