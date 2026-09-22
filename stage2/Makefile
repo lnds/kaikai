@@ -9624,6 +9624,16 @@ define test_json_run
 	[ "$$rc" -ne 0 ] || { echo "test-json FAIL ($(1): --only matching nothing exited 0)"; exit 1; }; \
 	grep -q 'no test matched --only' $$out.miss.err \
 	  || { echo "test-json FAIL ($(1): --only matching nothing did not say so)"; cat $$out.miss.err; exit 1; }; \
+	rc=0; ./bin/kai test --backend=$(1) --only "$$f.kai:no such block" $$f.kai \
+	  > $$out.miss2.raw 2> $$out.miss2.err || rc=$$?; \
+	[ "$$rc" -ne 0 ] || { echo "test-json FAIL ($(1): --only matching nothing exited 0 without --json)"; exit 1; }; \
+	grep -q 'no test matched --only' $$out.miss2.err \
+	  || { echo "test-json FAIL ($(1): --only matching nothing did not say so without --json)"; cat $$out.miss2.err; exit 1; }; \
+	rc=0; ./bin/kai test --backend=$(1) --only "$$f.kai:triples" $$f.kai \
+	  > $$out.hit.raw 2> $$out.hit.err || rc=$$?; \
+	[ "$$rc" -eq 0 ] || { echo "test-json FAIL ($(1): --only on a passing block exited $$rc)"; cat $$out.hit.err; exit 1; }; \
+	grep -q 'ok   triples' $$out.hit.err \
+	  || { echo "test-json FAIL ($(1): --only without --json lost the human report)"; cat $$out.hit.err; exit 1; }; \
 	echo "test-json OK ($(1): --json records + --only selection)"
 endef
 
