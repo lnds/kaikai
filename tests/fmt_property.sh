@@ -296,7 +296,8 @@ pkg_paths() {
 
 # Jobs: parallel workers. Four kaic2 invocations per file over ~1800
 # files is ~18 minutes serial, which does not fit a Tier 1 shard; the
-# work is per-file independent, so it fans out. Defaults to the host's
+# work is per-file independent, so it fans out (and FMT_PROPERTY_SHARD
+# below splits it across runners). Defaults to the host's
 # logical CPU count, same convention as tools/test-backend-parity.sh.
 if [ -n "${FMT_PROPERTY_JOBS:-}" ]; then
   JOBS="$FMT_PROPERTY_JOBS"
@@ -506,6 +507,35 @@ check_one() {
   rm -f "$p1" "$p2"
 }
 
+# Narrow the sorted corpus in $2 to part I of N ($1 = "I/N"; empty keeps
+# the whole corpus) so the sweep can run on N runners. Part I takes every
+# line whose number is congruent to I mod N: the parts are disjoint and
+# cover the corpus by construction, and interleaving spreads the costly
+# directories across parts. The kept count is asserted against that rule
+# so a selector bug cannot silently drop files.
+select_shard() {
+  [ -n "$1" ] || return 0
+  i=0; n=0
+  if printf '%s\n' "$1" | grep -Eq '^[1-9][0-9]*/[1-9][0-9]*$'; then
+    i="${1%/*}"; n="${1#*/}"
+  fi
+  if [ "$i" -lt 1 ] || [ "$i" -gt "$n" ]; then
+    echo "fmt_property: FMT_PROPERTY_SHARD='$1' is not I/N with 1 <= I <= N" >&2
+    exit 2
+  fi
+  total=$(wc -l < "$2" | tr -d ' ')
+  awk -v i="$i" -v n="$n" 'NR % n == i % n' "$2" > "$2.part"
+  mv "$2.part" "$2"
+  kept=$(wc -l < "$2" | tr -d ' ')
+  want=0
+  if [ "$total" -ge "$i" ]; then want=$(( (total - i) / n + 1 )); fi
+  if [ "$kept" -ne "$want" ]; then
+    echo "fmt_property: shard $1 kept $kept of $total files, expected $want" >&2
+    exit 2
+  fi
+  echo "fmt_property: shard $1 — $kept of $total corpus files"
+}
+
 # xargs re-enters this script with --worker so the function is available
 # in the child shell; $0 is the script itself.
 if [ "${1:-}" = "--worker" ]; then
@@ -520,6 +550,7 @@ fi
 # stage2/compiler/ never use, which is exactly why the selfhost
 # ratchet could not see these bugs.
 find "$ROOT/examples" -name '*.kai' -type f | sort > "$tmp/corpus"
+select_shard "${FMT_PROPERTY_SHARD:-}" "$tmp/corpus"
 
 FMT_PROPERTY_TMP="$tmp"
 export FMT_PROPERTY_TMP
