@@ -1,0 +1,71 @@
+# compiler/derive_generic.kai — a derived impl over a generic type.
+#
+# The derive generators build their impl for the bare head `T`. For
+# `type T[a, b]` that head has no type arguments, so the typer cannot
+# match a method parameter typed `T` to the record, and a derived field
+# access falls through to whatever else carries the field's name.
+#
+# This pass rewrites the impl the way it would be written by hand:
+# `impl[a: P, b: P] P for T[a, b]`, every `T` in a method signature
+# read as `T[a, b]`. Surface lowering, which copies an impl's type
+# parameters onto its methods, has already run by the time derives
+# expand, so the methods receive them here directly.
+
+import compiler.ast
+
+#[doc("Rewrite a derived impl of protocol `pname` for type `tname` with type parameters `tps` into its generic form. A non-generic type or a non-impl decl comes back unchanged.")]
+pub fn derive_generalize(d: Decl, pname: String, tname: String, tps: [String]) : Decl =
+  if list_length(tps) == 0 { d } else {
+    match d {
+      DImpl(p, pargs, target, ms, l, c, _, isym) -> {
+        let applied = mk_ty(TyName(tname, dg_args(tps, l, c)), target.line, target.col)
+        let methods = map(ms, (m) => dg_method(m, tps, tname))
+        DImpl(p, pargs, applied, methods, l, c, map(tps, (tp) => dg_bounded(tp, pname)), isym)
+      }
+      _ -> d
+    }
+  }
+
+# A fresh argument list per use: the rewritten signatures never share one.
+fn dg_args(tps: [String], l: Int, c: Int) : [TypeExpr] =
+  map(tps, (tp) => mk_ty(TyName(dg_tp_name(tp), []), l, c))
+
+# A type parameter's stored form is its name, optionally followed by a
+# `#`-introduced kind or bound suffix.
+fn dg_tp_name(tp: String) : String = {
+  let i = string_index_of_char(tp, '#')
+  if i < 0 { tp } else { string_slice(tp, 0, i) }
+}
+
+# Only a plain type parameter takes the protocol bound: a kinded one (a
+# measure, a shape) is not a value the protocol ranges over.
+fn dg_bounded(tp: String, pname: String) : String =
+  if string_index_of_char(tp, '#') < 0 { concat_all([tp, "#b:", pname]) } else { tp }
+
+fn dg_method(m: Decl, tps: [String], tname: String) : Decl = match m {
+  DFn(is_pub, n, mtps, ps, ret, row, body, l, c, mo, fsym) ->
+    DFn(is_pub, n, list_append(tps, mtps), map(ps, (p) => dg_param(p, tname, tps)),
+        dg_ty_opt(ret, tname, tps), row, body, l, c, mo, fsym)
+  _ -> m
+}
+
+fn dg_param(p: Param, tname: String, tps: [String]) : Param =
+  Param { pname: p.pname, ptype: dg_ty_opt(p.ptype, tname, tps),
+          pline: p.pline, pcol: p.pcol, pborrow: p.pborrow }
+
+fn dg_ty_opt(t: Option[TypeExpr], tname: String, tps: [String]) : Option[TypeExpr] =
+  match t {
+    None -> None
+    Some(x) -> Some(dg_ty(x, tname, tps))
+  }
+
+# Apply the type's arguments to every bare occurrence of its head.
+fn dg_ty(t: TypeExpr, tname: String, tps: [String]) : TypeExpr = match t.tkind {
+  TyName(n, targs) ->
+    if n == tname and list_length(targs) == 0 { mk_ty(TyName(n, dg_args(tps, t.line, t.col)), t.line, t.col) }
+    else { mk_ty(TyName(n, map(targs, (x) => dg_ty(x, tname, tps))), t.line, t.col) }
+  TyList(inner) -> mk_ty(TyList(dg_ty(inner, tname, tps)), t.line, t.col)
+  TyFn(ps, ret, row) ->
+    mk_ty(TyFn(map(ps, (x) => dg_ty(x, tname, tps)), dg_ty(ret, tname, tps), row), t.line, t.col)
+  _ -> t
+}
