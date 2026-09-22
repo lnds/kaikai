@@ -514,8 +514,9 @@ tier1: test rc-leak-gate test-partition-linearity demos-no-regression test-fmt t
 #  shard 4 — the whole-compiler modular self-host.
 #  shard 5 — fmt fixtures + fmt self-hosting, packages, editions, kai info.
 #  shard 6 — the modular-escape gate.
-#  shard 7 — fmt meaning-preservation over the whole corpus, alone: ~18 min
-#            of its own leaves no room beside another gate.
+#  shard 7 — fmt meaning-preservation over the whole corpus, alone, split
+#            across runners: FMT_PROPERTY_SHARD=I/N selects part I (unset
+#            runs the whole corpus).
 #
 # The two modular self-hosts (shards 4 and 6) only detect regressions in the
 # sources they compile, so CI passes TIER1_SELFHOSTS=0 on PRs that touch no
@@ -594,11 +595,12 @@ endif
 
 # fmt-property gets its own shard because it must run UNCONDITIONALLY: the
 # corpus it formats can regress from a stdlib or fixture change, so it may
-# not be gated on a compiler-source touch, and its ~18 min leaves no
-# headroom on a shard that carries anything else.
+# not be gated on a compiler-source touch, and it leaves no headroom on a
+# shard that carries anything else. CI runs it as parallel parts via
+# FMT_PROPERTY_SHARD=I/N on the make command line (exported to the script).
 tier1-shard-7: kaic2
 	$(MAKE) test-fmt-property
-	@echo "tier1-shard-7 OK — fmt meaning-preservation over the whole corpus"
+	@echo "tier1-shard-7 OK — fmt meaning-preservation, corpus part $(or $(FMT_PROPERTY_SHARD),1/1)"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info

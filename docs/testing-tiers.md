@@ -389,7 +389,13 @@ would leave a formatter gate silently inert exactly when nobody touched
 the formatter — and the corpus it checks can still regress from a stdlib
 or fixture change. Nor does it fit beside another gate on an
 unconditional shard: ~20 minutes leaves no headroom under the job
-ceiling. Hence its own shard, unconditional. Note the harness passes
+ceiling. Hence its own shard, unconditional. The sweep is one CPU-bound `xargs`
+fan-out with no serial section, and on a 4-vCPU runner it took 16–26
+minutes for the same corpus depending on the host, so `tier1-shard-7` is a
+two-leg matrix: `FMT_PROPERTY_SHARD=I/N` keeps the sorted corpus lines
+whose number is congruent to I mod N — disjoint and total by construction,
+with the kept count asserted — and the aggregator is green only when every
+leg is. Unset, the script sweeps the whole corpus. Note the harness passes
 `--path stdlib`: without it most of the corpus fails to resolve its
 imports and is silently dropped as unparseable, which costs about a
 quarter of the coverage.
