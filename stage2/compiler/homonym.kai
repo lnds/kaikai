@@ -1,0 +1,165 @@
+#[doc("""
+Choosing between the modules that declare one bare name, from the
+argument's type rather than from load order.
+
+Several modules in scope may declare the same function name — two core
+modules, two of a package's own modules, a module and a core one. A call
+that writes the name bare names a candidate set, not a declaration, and
+only the first argument's type says which member is meant. The typer
+walks a body before every type in it is settled, so at the call site the
+answer may not exist yet; committing there is a guess, and the guess
+surfaces as a mismatch against a type the author never wrote.
+
+So the choice is deferred: the call records what it needs, and the
+decision is made once the body has settled. This module owns the parts of
+that decision that are pure — which candidate sets an argument's type can
+decide at all, which candidate a settled type names, and the retarget of
+the calls that were resolved. The worklist itself rides the inference
+state, next to the deferred field accesses it mirrors.
+
+A set nothing decided is left alone rather than reported here: a bare name
+several modules export is what the contested-name report already speaks to,
+and the retarget is what keeps it quiet about every call the argument's
+type does resolve.
+
+The rule is single-dispatch on the first argument's head type over a
+closed set: one comparison per candidate, no search and no backtracking.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.ast_map
+
+#[doc("One candidate for a contested bare name: the module that declares it, and the function type it declares.")]
+pub type HomCand = HCand(String, Ty)
+
+#[doc("A bare call whose candidates the argument's type had not settled yet: the name, the call's expected function type, and the call site.")]
+pub type DeferredHom = DHom(String, Ty, Int, Int)
+
+#[doc("The module a drained call resolved to, keyed by the callee's source position.")]
+pub type HomPick = HPick(Int, Int, String)
+
+#[doc("The head constructor of `t` as a comparable name, or `None` while `t` is still a variable — the one case an argument cannot decide by.")]
+pub fn hom_head(t: Ty) : Option[String] = match t {
+  TyInt          -> Some("Int")
+  TyReal         -> Some("Real")
+  TyBool         -> Some("Bool")
+  TyString       -> Some("String")
+  TyChar         -> Some("Char")
+  TyUnit         -> Some("Unit")
+  TyByte         -> Some("Byte")
+  TyInt32        -> Some("Int32")
+  TyUInt32       -> Some("UInt32")
+  TyUInt64       -> Some("UInt64")
+  TyInt128       -> Some("Int128")
+  TyListT(_)     -> Some("[]")
+  TyFnT(_, _, _) -> Some("fn")
+  TyCon(_, n, _) -> Some(n)
+  TyRefineT(b, _) -> hom_head(b)
+  _              -> None
+}
+
+#[doc("The declared first parameter of a candidate's function type, or `None` when it takes no arguments.")]
+pub fn hom_first_param(t: Ty) : Option[Ty] = match t {
+  TyFnT(ps, _, _) -> match ps {
+    []          -> None
+    [p, ..._]   -> Some(p)
+  }
+  _ -> None
+}
+
+#[doc("The distinct heads the candidates' first parameters carry, or `[]` when any candidate is effectful, argument-less, or headed by a variable — none of which an argument's type can decide between.")]
+pub fn hom_heads(cs: [HomCand]) : [String] = hom_heads_loop(cs, [])
+
+#[doc("True when the argument's type decides the set: two or more distinct first-parameter heads, every candidate pure. Such a call is resolved by the type, never by which module registered last.")]
+pub fn hom_decidable(cs: [HomCand]) : Bool = list_length(hom_heads(cs)) >= 2
+
+#[doc("The one candidate module whose first parameter has `arg`'s head, or `None` when `arg` is still a variable or no single candidate matches.")]
+pub fn hom_choose(cs: [HomCand], arg: Ty) : Option[String] = match hom_head(arg) {
+  None    -> None
+  Some(h) -> hom_unique(cs, h, None)
+}
+
+#[doc("Retarget the calls the drain resolved: a callee at a recorded position becomes a call to its module, so codegen and the contested-name report both see one declaration.")]
+pub fn hom_retarget(e: Expr, picks: [HomPick]) : Expr = match picks {
+  []  -> e
+  _   -> hom_retarget_walk(e, picks)
+}
+
+# ---- first-parameter heads ----
+
+# `[]` is the "cannot decide" answer, so a candidate that rules the set
+# out short-circuits rather than contributing nothing.
+fn hom_heads_loop(cs: [HomCand], acc: [String]) : [String] = match cs {
+  [] -> list_reverse(acc)
+  [HCand(_, t), ...rest] ->
+    if hom_pure(t) { hom_heads_add(hom_cand_head(t), rest, acc) } else { [] }
+}
+
+fn hom_heads_add(h: Option[String], rest: [HomCand], acc: [String]) : [String] =
+  match h {
+    None    -> []
+    Some(x) -> if list_has(acc, x) { hom_heads_loop(rest, acc) }
+               else { hom_heads_loop(rest, [x, ...acc]) }
+  }
+
+fn hom_cand_head(t: Ty) : Option[String] = match hom_first_param(t) {
+  None    -> None
+  Some(p) -> hom_head(p)
+}
+
+# A candidate that performs an effect cannot be deferred: its label has to
+# reach the caller's row while the body is still being walked, and the
+# drain runs after the row is checked.
+fn hom_pure(t: Ty) : Bool = match t {
+  TyFnT(_, _, r) -> match r.labels {
+    [] -> true
+    _  -> false
+  }
+  _ -> false
+}
+
+fn hom_unique(cs: [HomCand], head: String, found: Option[String]) : Option[String] =
+  match cs {
+    [] -> found
+    [HCand(m, t), ...rest] -> match hom_cand_head(t) {
+      Some(h) -> if h == head { hom_unique_first(rest, head, found, m) }
+                 else { hom_unique(rest, head, found) }
+      None    -> hom_unique(rest, head, found)
+    }
+  }
+
+# A second candidate with the same head is a tie no rule breaks.
+fn hom_unique_first(rest: [HomCand], head: String, found: Option[String],
+      m: String) : Option[String] = match found {
+  None    -> hom_unique(rest, head, Some(m))
+  Some(_) -> None
+}
+
+# ---- retarget ----
+
+fn hom_retarget_walk(e: Expr, picks: [HomPick]) : Expr {
+  let mapped = hom_with_kind(e, prc_map_expr_kind(e.kind, (s) => hom_retarget_walk(s, picks)))
+  match mapped.kind {
+    ECall(c, call_args) -> hom_retarget_call(mapped, c, call_args, picks)
+    _ -> mapped
+  }
+}
+
+fn hom_retarget_call(e: Expr, c: Expr, call_args: [Expr], picks: [HomPick]) : Expr =
+  match c.kind {
+    EVar(nm) -> match hom_pick_at(picks, c.line, c.col) {
+      None    -> e
+      Some(m) -> hom_with_kind(e, ECall(hom_with_kind(c, EModCall(m, nm)), call_args))
+    }
+    _ -> e
+  }
+
+fn hom_pick_at(picks: [HomPick], line: Int, col: Int) : Option[String] = match picks {
+  [] -> None
+  [HPick(l, c, m), ...rest] ->
+    if l == line and c == col { Some(m) } else { hom_pick_at(rest, line, col) }
+}
+
+fn hom_with_kind(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
