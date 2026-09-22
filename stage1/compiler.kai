@@ -4798,13 +4798,21 @@ fn fv_interp_parts(parts: [IPart], own: [String], globals: [String], acc: [Strin
 
 # ---- lambda collection pass ----
 
-type LamCollect = { next_id: Int, lams: [LamInfo], globals: [String], home: Option[String] }
+# `scope` holds the locals bound at the current point of the walk. A
+# local that shadows a global name is still a capture.
+type LamCollect = { next_id: Int, lams: [LamInfo], globals: [String], home: Option[String], scope: [String] }
 
 fn lc_new(globals: [String]) : LamCollect =
-  LamCollect { next_id: 0, lams: [], globals: globals, home: None }
+  LamCollect { next_id: 0, lams: [], globals: globals, home: None, scope: [] }
 
 fn lc_at_home(st: LamCollect, home: Option[String]) : LamCollect =
-  LamCollect { next_id: st.next_id, lams: st.lams, globals: st.globals, home: home }
+  LamCollect { next_id: st.next_id, lams: st.lams, globals: st.globals, home: home, scope: st.scope }
+
+fn lc_in_scope(st: LamCollect, scope: [String]) : LamCollect =
+  LamCollect { next_id: st.next_id, lams: st.lams, globals: st.globals, home: st.home, scope: scope }
+
+fn lam_captures(body: Expr, own: [String], st: LamCollect) : [String] =
+  filter(fv_expr(body, own, [], []), (n) => list_has(st.scope, n) or not list_has(st.globals, n))
 
 fn params_to_names(ps: [Param]) : [String] =
   map(ps, (pm) => pm.pname)
@@ -4833,11 +4841,12 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
     ELambda(params, body) -> {
       let id = st.next_id
       let own = params_to_names(params)
-      let caps = fv_expr(body, own, st.globals, [])
+      let caps = lam_captures(body, own, st)
       let info = LamInfo(id, x.line, x.col, params, caps, body, st.home)
       let st1 = LamCollect { next_id: id + 1, lams: [info, ...st.lams],
-                             globals: st.globals, home: st.home }
-      collect_expr(body, st1)
+                             globals: st.globals, home: st.home,
+                             scope: list_append(own, st.scope) }
+      lc_in_scope(collect_expr(body, st1), st.scope)
     }
     ERecordLit(_, fields) -> collect_field_inits(fields, st)
     EList(elems) -> collect_list_elems(elems, st)
@@ -4847,7 +4856,8 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
     }
     EBlock(stmts, opt_final) -> {
       let s1 = collect_stmts(stmts, st)
-      match opt_final { Some(f) -> collect_expr(f, s1) None -> s1 }
+      let s2 = match opt_final { Some(f) -> collect_expr(f, s1) None -> s1 }
+      lc_in_scope(s2, st.scope)
     }
     EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
   }
@@ -4864,9 +4874,10 @@ fn collect_arms(arms: [Arm], st: LamCollect) : LamCollect {
   match arms {
     [] -> st
     [a, ...rest] -> match a {
-      Arm(_, opt_g, body) -> {
-        let s1 = match opt_g { Some(g) -> collect_expr(g, st) None -> st }
-        collect_arms(rest, collect_expr(body, s1))
+      Arm(pat, opt_g, body) -> {
+        let s0 = lc_in_scope(st, pat_bindings(pat, st.scope))
+        let s1 = match opt_g { Some(g) -> collect_expr(g, s0) None -> s0 }
+        collect_arms(rest, lc_in_scope(collect_expr(body, s1), st.scope))
       }
     }
   }
@@ -4900,7 +4911,7 @@ fn collect_stmts(ss: [Stmt], st: LamCollect) : LamCollect {
 
 fn collect_stmt(s: Stmt, st: LamCollect) : LamCollect {
   match s {
-    SLet(_, _, rhs) -> collect_expr(rhs, st)
+    SLet(pat, _, rhs) -> lc_in_scope(collect_expr(rhs, st), pat_bindings(pat, st.scope))
     SAssert(c, opt_m) -> {
       let s1 = collect_expr(c, st)
       match opt_m { Some(m) -> collect_expr(m, s1) None -> s1 }
@@ -4935,9 +4946,9 @@ fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect {
 
 fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
   match d {
-    DFn(_, _, _, _, body, _, _, mo) -> collect_expr(body, lc_at_home(st, mo))
+    DFn(_, _, ps, _, body, _, _, mo) -> collect_expr(body, lc_in_scope(lc_at_home(st, mo), params_to_names(ps)))
     DType(_, _, _, _, _, _) -> st
-    DTest(_, body, _, _) -> collect_expr(body, st)
+    DTest(_, body, _, _) -> collect_expr(body, lc_in_scope(st, []))
     DImport(_, _, _) -> st
   }
 }
