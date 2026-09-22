@@ -1,0 +1,117 @@
+# compiler/kir_reach.kai — the KIR fns a program can reach from its roots.
+#
+# LLVM keeps every external-linkage definition it is handed, so an imported
+# module the program never calls still pays its full optimise + codegen and is
+# only discarded by the linker. This pass drops those fns before emission.
+#
+# A symbol reaches a fn through a direct or tail call, a closure (a lifted
+# lambda's own symbol, or `c_user_thunk_sym` of a named fn), a handler install
+# (the site's clause and return thunks), a `finally` thunk, or a prim spelled
+# like a fn. A dropped fn is neither defined nor declared, so a reference this
+# walk missed fails the build instead of running.
+
+import compiler.util
+import compiler.kir
+import compiler.infer_index
+import compiler.emit_shared
+
+#[doc("The program restricted to the fns reachable from `main`, the `pinned` symbols, and every fn `is_root` accepts. Fn order is preserved.")]
+pub fn kir_reachable(kp: KProgram, is_root: (KFn) -> Bool, pinned: [String]) : KProgram = {
+  let by_name = kreach_index(kp.fns, idx_empty())
+  let seeds = list_append(filter(kp.fns, is_root), kreach_resolve_all(by_name, ["main", ...pinned], []))
+  let live = kreach_walk(seeds, by_name, kp.handlers, idx_empty())
+  KProgram { types: kp.types, fns: filter(kp.fns, (f) => kreach_has(live, f.sym)),
+             handlers: kp.handlers, install_order: kp.install_order,
+             defaults: kp.defaults, runner_defaults: kp.runner_defaults,
+             synth_defaults: kp.synth_defaults, regions: kp.regions, runners: kp.runners }
+}
+
+# ---- symbol → fn ------------------------------------------------------
+
+# Each fn is indexed under its own symbol and its closure-thunk symbol.
+fn kreach_index(fns: [KFn], ix: NameIndex[KFn]) : NameIndex[KFn] = match fns {
+  [] -> ix
+  [f, ...rest] -> kreach_index(rest, idx_prepend(idx_prepend(ix, f.sym, f), c_user_thunk_sym(f.sym), f))
+}
+
+fn kreach_lookup(ix: NameIndex[KFn], name: String) : Option[KFn] =
+  kreach_pick(idx_chain(ix, name), name)
+
+fn kreach_pick(chain: [KFn], name: String) : Option[KFn] = match chain {
+  [] -> None
+  [f, ...rest] ->
+    if f.sym == name or c_user_thunk_sym(f.sym) == name { Some(f) } else { kreach_pick(rest, name) }
+}
+
+fn kreach_resolve_all(ix: NameIndex[KFn], names: [String], acc: [KFn]) : [KFn] = match names {
+  [] -> acc
+  [n, ...rest] -> match kreach_lookup(ix, n) {
+    Some(f) -> kreach_resolve_all(ix, rest, [f, ...acc])
+    None    -> kreach_resolve_all(ix, rest, acc)
+  }
+}
+
+# ---- live set ---------------------------------------------------------
+
+fn kreach_has(live: NameIndex[String], sym: String) : Bool = list_has(idx_chain(live, sym), sym)
+
+fn kreach_walk(work: [KFn], ix: NameIndex[KFn], hs: [KHandlerDecl], live: NameIndex[String]) : NameIndex[String] = match work {
+  [] -> live
+  [f, ...rest] ->
+    if kreach_has(live, f.sym) { kreach_walk(rest, ix, hs, live) }
+    else {
+      let next = kreach_resolve_all(ix, kreach_refs_blocks(f.blocks, hs, []), rest)
+      kreach_walk(next, ix, hs, idx_prepend(live, f.sym, f.sym))
+    }
+}
+
+# ---- references -------------------------------------------------------
+
+fn kreach_refs_blocks(bs: [KBlock], hs: [KHandlerDecl], acc: [String]) : [String] = match bs {
+  [] -> acc
+  [b, ...rest] -> kreach_refs_blocks(rest, hs, kreach_refs_term(b.term, kreach_refs_stmts(b.stmts, hs, acc)))
+}
+
+fn kreach_refs_stmts(ss: [KStmt], hs: [KHandlerDecl], acc: [String]) : [String] = match ss {
+  [] -> acc
+  [s, ...rest] -> kreach_refs_stmts(rest, hs, kreach_refs_stmt(s, hs, acc))
+}
+
+fn kreach_refs_stmt(s: KStmt, hs: [KHandlerDecl], acc: [String]) : [String] = match s {
+  KLet(_, _, op, _)            -> kreach_refs_op(op, hs, acc)
+  KDo(op, _)                   -> kreach_refs_op(op, hs, acc)
+  KInstall(_, site, _, _, _)   -> kreach_site_thunks(hs, site, acc)
+  KSetCleanup(_, _, thunk, _)  -> [thunk, ...acc]
+  _                            -> acc
+}
+
+fn kreach_refs_op(op: KOp, hs: [KHandlerDecl], acc: [String]) : [String] = match op {
+  KCall(sym, _)       -> [sym, ...acc]
+  KClosure(sym, _, _) -> [sym, ...acc]
+  KPrim(nm, _)        -> [nm, ...acc]
+  KSetjmp(_, site)    -> kreach_site_thunks(hs, site, acc)
+  _                   -> acc
+}
+
+fn kreach_refs_term(t: KTerm, acc: [String]) : [String] = match t {
+  KTailCall(sym, _, _) -> [sym, ...acc]
+  _                    -> acc
+}
+
+# The clause and return thunks of the handler installed at `site`.
+fn kreach_site_thunks(hs: [KHandlerDecl], site: String, acc: [String]) : [String] = match hs {
+  [] -> acc
+  [h, ...rest] ->
+    if h.sym == site { kreach_op_thunks(h.op_thunks, kreach_ret_thunk(h.ret_thunk, acc)) }
+    else { kreach_site_thunks(rest, site, acc) }
+}
+
+fn kreach_ret_thunk(rt: Option[String], acc: [String]) : [String] = match rt {
+  Some(sym) -> [sym, ...acc]
+  None      -> acc
+}
+
+fn kreach_op_thunks(ts: [KOpThunk], acc: [String]) : [String] = match ts {
+  [] -> acc
+  [KOT(_, sym), ...rest] -> kreach_op_thunks(rest, [sym, ...acc])
+}
