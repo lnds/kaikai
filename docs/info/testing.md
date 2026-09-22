@@ -18,6 +18,8 @@ matcher DSL — `assert x == 42` is enough. `assert` belongs inside
 
 ```text
 kai test [<spec>|./...]            # run tests
+kai test --json [<spec>]           # machine-readable results
+kai test --only <id> [<spec>]      # run named blocks (repeatable)
 kai bench [<spec>] [--iters N]     # run benchmarks
 kai check [<spec>]                 # run property blocks
 ```
@@ -143,11 +145,35 @@ file: at least one `test "..." { ... }` block plus an
 `main` with the test runner). Non-`*.kai` files (fixtures, golden
 files) under `tests/` are ignored by the runner.
 
+## Machine-readable results
+
+`kai test --json` writes NDJSON to stdout — one record per block,
+then a summary — instead of the human report. A block's own output
+moves to stderr, so the stream stays parseable.
+
+```text
+{"type":"test","id":"tests/planner_test.kai:orders sites","file":"tests/planner_test.kai","line":18,"status":"pass","duration_ms":3}
+{"type":"test","id":"tests/planner_test.kai:drops sites","file":"tests/planner_test.kai","line":31,"status":"fail","duration_ms":2,"message":"assertion failed"}
+{"type":"summary","passed":41,"failed":1,"duration_ms":812}
+```
+
+An `id` is `<file>:<test name>` — the path as given to `kai test` —
+and is stable across runs while the block's name and file hold.
+
+`--only <id>` runs just the named blocks, spelled as `--json` emits
+them, and repeats to name several. The exit code covers the selected
+set; an `--only` that matches nothing is an error, not an empty pass.
+
+```sh
+kai test --json .
+kai test --only 'tests/planner_test.kai:orders sites' .
+```
+
 ## Exit codes
 
 ```text
 0   all tests passed (or no tests defined)
-1   one or more failures
+1   one or more failures, or --only matched no block
 2   compile error before tests could run
 ```
 

@@ -1468,6 +1468,13 @@ at load time (issue #318) so the count reflects only the user's tests.
 
 Options:
   -h, --help                Show this help.
+  --json                    Report results as NDJSON on stdout: one
+                            {"type":"test",...} record per block, then a
+                            {"type":"summary",...}. Everything else the
+                            run writes goes to stderr.
+  --only <id>               Run only the named block. Repeatable. <id> is
+                            '<file>:<test name>', exactly as --json emits
+                            it. The exit code covers the selected set.
   --include-prelude-tests   Also run test blocks defined inside the
                             auto-loaded core stdlib modules (legacy).
 
@@ -1476,6 +1483,8 @@ Examples:
   kai test ./...                             # every package under cwd
   kai test stage2/tests/test_lex.kai
   kai test demos/poker/poker.kai
+  kai test --json .
+  kai test --only 'tests/planner_test.kai:orders cheap sites first'
   kai test --include-prelude-tests demos/poker/poker.kai
 EOF
 }
@@ -2997,6 +3006,23 @@ package_test_files() {
 # side already found blocks; the rest is forwarded to the compiler.
 # The status comes back as the exit code, not on stdout — the runner
 # binaries own stdout.
+
+# Run one compiled test binary. $1 is the path the ids name, $2 the
+# binary. Outside JSON mode this is just the binary with KAI_TEST_FILE
+# set; in JSON mode fd 3 (the records) is appended to $KAI_TEST_JSON_LOG
+# so the driver can relay and count them once every binary has run.
+run_test_binary() {
+  _rtb_file="$1"; _rtb_bin="$2"
+  if [ -n "${KAI_TEST_JSON_LOG:-}" ]; then
+    # The block's own stdout joins stderr: the report is the only thing
+    # the caller's stdout carries, so `kai test --json | parser` works
+    # even for a suite that prints.
+    KAI_TEST_FILE="$_rtb_file" "$_rtb_bin" 3>>"$KAI_TEST_JSON_LOG" 1>&2
+  else
+    KAI_TEST_FILE="$_rtb_file" "$_rtb_bin"
+  fi
+}
+
 run_package_blocks() {
   pkg_root="$1"; src="$2"; kind="$3"; kind_flag="$4"
   backend="$5"; backend_origin="$6"; agg_status="$7"; found="$8"
@@ -3020,12 +3046,12 @@ run_package_blocks() {
     [ -n "$has_blocks" ] || continue
     case "$rel" in
       *_test.kai)
-        printf '== kai %s %s\n' "$kind" "$rel" >&2
+        [ -n "${KAI_TEST_JSON:-}" ] || printf '== kai %s %s\n' "$kind" "$rel" >&2
         obin="$tmp/$(printf '%s' "${rel%.kai}" | tr '/' '_')-r"
         # shellcheck disable=SC2086
         compile_to_binary --backend "$backend" --backend-origin "$backend_origin" \
           "$pkg_root_abs/$rel" "$tmp" "$obin" "$kind" "$kind_flag" "$@"
-        "$obin" || agg_status=$?
+        run_test_binary "$rel" "$obin" || agg_status=$?
         ;;
       *)
         printf 'kai: warning: %s declares %s blocks but is not reachable from the entry point; rename it to *_test.kai (or move it under tests/) so package %s runs include it\n' "$rel" "$kind" "$kind" >&2
@@ -3080,11 +3106,26 @@ cmd_test() {
   # `--backend` is consumed here (NOT forwarded) so `kai test` resolves
   # the backend through resolve_backend() — native by default, the same
   # as `kai build`/`run`, now that the native backend runs test blocks.
+  # `--json` and `--only` govern how the test BINARY reports and which
+  # blocks it runs, not how it is compiled: both ride env vars into the
+  # run, so the binary and its cache entry are identical either way.
   extra_flags=""
   backend_cli=""
+  test_json=""
+  test_only=""
+  KAI_NL="$(printf '\nx')"; KAI_NL="${KAI_NL%x}"
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help) usage_test; return 0 ;;
+      --json) test_json=1; shift ;;
+      --only)
+        shift; [ $# -gt 0 ] || die "--only needs an argument (see 'kai test --help')"
+        if [ -z "$test_only" ]; then test_only="$1"; else test_only="$test_only$KAI_NL$1"; fi
+        shift ;;
+      --only=*)
+        _only_arg="${1#--only=}"
+        if [ -z "$test_only" ]; then test_only="$_only_arg"; else test_only="$test_only$KAI_NL$_only_arg"; fi
+        shift ;;
       --include-prelude-tests) extra_flags="$extra_flags --include-prelude-tests"; shift ;;
       --backend)
         shift; [ $# -gt 0 ] || die "--backend needs an argument (c|native)"
@@ -3095,6 +3136,17 @@ cmd_test() {
       *) break ;;
     esac
   done
+  KAI_TEST_ONLY="$test_only"; export KAI_TEST_ONLY
+  [ -n "$test_json" ] && { KAI_TEST_JSON=1; export KAI_TEST_JSON; }
+  # Records ride fd 3 so a test body's own stdout cannot interleave itself
+  # into the stream. They are collected rather than relayed live: only the
+  # driver sees every binary, so only it can tell a selection that matched
+  # nothing from one matched in a sibling file.
+  test_json_log=""
+  if [ -n "$test_json" ]; then
+    test_json_log="$(mktemp)"
+    KAI_TEST_JSON_LOG="$test_json_log"; export KAI_TEST_JSON_LOG
+  fi
   # Resolve the backend (native by default). An explicit choice is
   # propagated to the recursive `kai test` invocations so the whole walk
   # honours it; the implicit native default is re-resolved per package.
@@ -3132,7 +3184,7 @@ cmd_test() {
     # shellcheck disable=SC2086
     compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$src" "$tmp" "$bin" "test" --test $extra_flags
     entry_dir="$(dirname "$src")"
-    "$bin" || agg_status=$?
+    run_test_binary "$src" "$bin" || agg_status=$?
   else
     entry_dir="$pkg_root"
   fi
@@ -3150,10 +3202,10 @@ cmd_test() {
       [ -f "$tf" ] || continue
       pkg_has_tests=1
       tbin="$tmp/$(basename "$tf" .kai)-t"
-      printf '== kai test %s\n' "$tf" >&2
+      [ -n "$test_json" ] || printf '== kai test %s\n' "$tf" >&2
       # shellcheck disable=SC2086
       compile_to_binary --backend "$backend" --backend-origin "$backend_origin" "$tf" "$tmp" "$tbin" "test" --test $extra_flags
-      "$tbin" || agg_status=$?
+      run_test_binary "$tf" "$tbin" || agg_status=$?
     done
   fi
 
@@ -3162,6 +3214,18 @@ cmd_test() {
     run_package_blocks "$pkg_root" "$src" "test" "--test" \
       "$backend" "$backend_origin" "$agg_status" "$pkg_has_tests" $extra_flags ||
       agg_status=$?
+  fi
+  if [ -n "$test_json_log" ]; then
+    cat "$test_json_log"
+    # An `--only` that named nothing anywhere is a caller error, not an
+    # empty pass: a driver reading exit 0 would take a typo'd id for a
+    # surviving mutant.
+    if [ -n "$test_only" ] &&
+       ! grep -q '^{"type":"test"' "$test_json_log"; then
+      printf 'kai: no test matched --only\n' >&2
+      agg_status=1
+    fi
+    rm -f "$test_json_log"
   fi
   return "$agg_status"
 }

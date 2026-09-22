@@ -82,6 +82,7 @@ expect_reject "check --backend without value"  "needs an argument" check --backe
 expect_reject "test --backend without value"   "needs an argument" test --backend
 expect_reject "bench --backend without value"  "needs an argument" bench --backend
 expect_reject "watch --backend without value"  "needs an argument" watch --backend
+expect_reject "test --only without value"      "needs an argument" test --only
 
 # Reversion proof for the original repro: an explicit --backend=c runs
 # the check runner exactly like the flagless form — no basename noise,
