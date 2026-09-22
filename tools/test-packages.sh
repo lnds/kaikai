@@ -248,6 +248,10 @@ run_positive "build_sub_package"      "build_sub_package"      "build_sub_packag
 run_positive "build_sub_package-sub"  "build_sub_package/sub"  "build_sub_package/sub/main.out.expected"
 run_positive "build_module_qualified" "build_module_qualified" "build_module_qualified/main.out.expected"
 
+# A module's private helper spelled like a core builtin: the call reaches
+# the module's own fn, on both backends.
+run_positive "builtin_shadow"         "builtin_shadow"         "builtin_shadow/main.out.expected"
+
 # git-source dep chains (rendered manifests): direct dep and a
 # transitive chain. SKIP when the manifest was not rendered, matching
 # the git-fixture fail-open policy above. A silent warm-up build runs
@@ -313,6 +317,7 @@ run_parity  "parity-git_tag_alias"      "git_tag_alias"
 run_parity  "parity-native_shim"        "native_shim/app"
 run_parity  "parity-simple_dep"         "simple_dep"
 run_parity  "parity-transitive"         "transitive"
+run_parity  "parity-builtin_shadow"     "builtin_shadow"
 
 printf '== summary: %d ok, %d fail, %d skip ==\n' "$PASS" "$FAIL" "$SKIP"
 if [ "$FAIL" -gt 0 ]; then

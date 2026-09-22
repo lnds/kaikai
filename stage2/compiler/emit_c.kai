@@ -1566,14 +1566,18 @@ fn emit_ident_value(name: String, lcs: [String], fns: [EFn], variants: [VariantE
       "kai_nullary_fast(", int_to_string(evar_find_tag(variants, name)),
       ", \"", name, "\")"
     ])
-    None -> match core_find(core, name) {
-      Some(ep) -> match ep {
-        EP(_, cname, ar) ->
-          cat5("kai_closure(&_", cname, "_thunk, ", int_to_string(ar), ", 0, NULL)")
-      }
-      None -> match efn_resolve(fns, name, root_mod) {
-        Some(EFn(_, ar, mo, _, _)) ->
-          cat5("kai_closure(&", c_user_thunk_sym(c_sym(name, mo)), ", ", int_to_string(ar), ", 0, NULL)")
+    # A top-level `fn` the program declares under this name answers
+    # before the core table: a declaration shadows the builtin it is
+    # spelled like, which is what the typer and the native lowering
+    # (`c_sym_of_callee`) already read off this same registry.
+    None -> match efn_resolve(fns, name, root_mod) {
+      Some(EFn(_, ar, mo, _, _)) ->
+        cat5("kai_closure(&", c_user_thunk_sym(c_sym(name, mo)), ", ", int_to_string(ar), ", 0, NULL)")
+      None -> match core_find(core, name) {
+        Some(ep) -> match ep {
+          EP(_, cname, ar) ->
+            cat5("kai_closure(&_", cname, "_thunk, ", int_to_string(ar), ", 0, NULL)")
+        }
         None -> c_local(name)
       }
     }
@@ -2985,7 +2989,7 @@ fn emit_guard_no_intrinsic_mint(callee: String) : Unit =
 # here as a defensive identity-on-raw boundary because the pipe
 # path may inline through emit_pipe_expr's match without first
 # going through `emit_expr`.
-fn emit_pipe_named_lookup(src: String, callee: String, arity: Int, lhs_c: String, args_e: [Expr], args_all: String, cx: EmitCtx) : String / Console =
+fn emit_pipe_named_lookup(src: String, callee: String, csym: SymId, arity: Int, lhs_c: String, args_e: [Expr], args_all: String, cx: EmitCtx) : String / Console =
   if list_has(cx.lcs, callee) {
     concat_all([
       "kai_apply(", c_local(callee), ", ", int_to_string(arity),
@@ -2998,12 +3002,16 @@ fn emit_pipe_named_lookup(src: String, callee: String, arity: Int, lhs_c: String
       let slots_all = if list_length(args_e) == 0 { lhs_slot } else { cat3(lhs_slot, ", ", rest_slots) }
       emit_variant_call(None, callee, arity, slots_all, cx)
     }
-    None -> match core_find(cx.core, callee) {
-      Some(ep) -> match ep {
-        EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
-      }
-      None -> match efn_resolve(cx.fns, callee, cx.root_mod) {
-        Some(EFn(_, _, mo, _, _)) -> emit_user_call(c_sym(callee, mo), args_all, cx)
+    # A top-level `fn` the program declares under this name answers
+    # before the core table: a declaration shadows the builtin it is
+    # spelled like, which is what the typer and the native lowering
+    # (`c_sym_of_callee`) already read off this same registry.
+    None -> match efn_resolve_sym(cx.fns, csym, callee, cx.root_mod) {
+      Some(EFn(_, _, mo, _, _)) -> emit_user_call(c_sym(callee, mo), args_all, cx)
+      None -> match core_find(cx.core, callee) {
+        Some(ep) -> match ep {
+          EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
+        }
         None -> {
           emit_guard_no_intrinsic_mint(callee)
           concat_all([
@@ -3050,21 +3058,25 @@ fn emit_named_call_lookup(src: String, callee: String, csym: SymId, args_e: [Exp
     # context. This is the vehicle that carries a handle unboxed.
     None -> match rcore_find(cx.rcore, callee) {
       Some(RP(_, cname, ptys, _)) -> emit_rcore_call(src, cname, ptys, args_e, cx)
-      None -> match core_find(cx.core, callee) {
-      Some(ep) -> match ep {
-        EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
-      }
+      # A top-level `fn` the program declares under this name answers
+      # before the core table: a declaration shadows the builtin it is
+      # spelled like, which is what the typer and the native lowering
+      # (`c_sym_of_callee`) already read off this same registry.
       None -> match efn_resolve_sym(cx.fns, csym, callee, cx.root_mod) {
         Some(EFn(_, _, mo, _, _)) -> emit_user_call(c_sym(callee, mo), call_args, cx)
-        None -> {
-          emit_guard_no_intrinsic_mint(callee)
-          concat_all([
-            "kai_apply(", c_local(callee), ", ", int_to_string(list_length(args_e)),
-            ", (KaiValue *[]){", call_args, "})"
-          ])
+        None -> match core_find(cx.core, callee) {
+          Some(ep) -> match ep {
+            EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
+          }
+          None -> {
+            emit_guard_no_intrinsic_mint(callee)
+            concat_all([
+              "kai_apply(", c_local(callee), ", ", int_to_string(list_length(args_e)),
+              ", (KaiValue *[]){", call_args, "})"
+            ])
+          }
         }
       }
-    }
     }
   } }
 
@@ -3180,8 +3192,8 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Con
           let lhs_c = emit_expr(src, lhs, cx)
           let rest_args = emit_call_args(src, args_e, cx)
           let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
-          emit_pipe_named_lookup(src, callee, list_length(args_e) + 1, lhs_c, args_e, args_all, cx)
-        } else { match efn_resolve_sym(cx.fns, ec_callee_sym(rhs), callee, cx.root_mod) {
+          emit_pipe_named_lookup(src, callee, ec_callee_sym(f), list_length(args_e) + 1, lhs_c, args_e, args_all, cx)
+        } else { match efn_resolve_sym(cx.fns, ec_callee_sym(f), callee, cx.root_mod) {
           Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) -> {
             # Pipe: LHS is param 0, args_e are params 1+. Marshal each
             # per the mask (mixed-param lane, issue #440 follow-up).
@@ -3195,7 +3207,7 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Con
             let lhs_c = emit_expr(src, lhs, cx)
             let rest_args = emit_call_args(src, args_e, cx)
             let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
-            emit_pipe_named_lookup(src, callee, list_length(args_e) + 1, lhs_c, args_e, args_all, cx)
+            emit_pipe_named_lookup(src, callee, ec_callee_sym(f), list_length(args_e) + 1, lhs_c, args_e, args_all, cx)
           }
         } }
       }
@@ -3232,7 +3244,7 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Con
     EVar(callee) -> {
       if list_has(cx.lcs, callee) {
         let lhs_c = emit_expr(src, lhs, cx)
-        emit_pipe_named_lookup(src, callee, 1, lhs_c, [], lhs_c, cx)
+        emit_pipe_named_lookup(src, callee, ec_callee_sym(rhs), 1, lhs_c, [], lhs_c, cx)
       } else { match efn_resolve_sym(cx.fns, ec_callee_sym(rhs), callee, cx.root_mod) {
         Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) -> {
           let lhs_raw = pipe_arg_masked(src, lhs, mask, 0, cx)
@@ -3241,7 +3253,7 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Con
         }
         _ -> {
           let lhs_c = emit_expr(src, lhs, cx)
-          emit_pipe_named_lookup(src, callee, 1, lhs_c, [], lhs_c, cx)
+          emit_pipe_named_lookup(src, callee, ec_callee_sym(rhs), 1, lhs_c, [], lhs_c, cx)
         }
       } }
     }
