@@ -10316,6 +10316,63 @@ static KaiValue *_kai_core_mailbox_recv_thunk(KaiValue *s, KaiValue **a, int n) 
 static KaiValue *_kai_core_mailbox_recv_timeout_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_mailbox_recv_timeout(a[0], a[1]); }
 static KaiValue *_kai_core_mailbox_free_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_mailbox_free(a[0]); }
 
+/* The rest of the registry, by arity. Every `core_table()` entry
+ * (compiler/core_prims.kai) needs a thunk here: a builtin named as a
+ * value becomes a closure over it, and a missing one is a compile error
+ * in the generated C. */
+#define KAI_CORE_THUNK0(nm) \
+    static KaiValue *_kai_core_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) a; (void) n; return kai_core_##nm(); }
+#define KAI_CORE_THUNK1(nm) \
+    static KaiValue *_kai_core_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) n; return kai_core_##nm(a[0]); }
+#define KAI_CORE_THUNK2(nm) \
+    static KaiValue *_kai_core_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) n; return kai_core_##nm(a[0], a[1]); }
+#define KAI_CORE_THUNK3(nm) \
+    static KaiValue *_kai_core_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) n; return kai_core_##nm(a[0], a[1], a[2]); }
+
+KAI_CORE_THUNK1(int_to_le4)
+KAI_CORE_THUNK1(int_to_le8)
+KAI_CORE_THUNK1(int_to_byte)
+KAI_CORE_THUNK1(byte_to_int)
+KAI_CORE_THUNK2(byte_add)
+KAI_CORE_THUNK2(byte_sub)
+KAI_CORE_THUNK2(byte_eq)
+KAI_CORE_THUNK2(byte_lt)
+KAI_CORE_THUNK1(byte_to_string)
+KAI_CORE_THUNK1(int32_to_string)
+KAI_CORE_THUNK1(uint32_to_string)
+KAI_CORE_THUNK1(uint64_to_string)
+KAI_CORE_THUNK1(int128_to_string)
+KAI_CORE_THUNK1(int_to_int32)
+KAI_CORE_THUNK1(int_to_uint32)
+KAI_CORE_THUNK1(int_to_uint64)
+KAI_CORE_THUNK1(int_to_int128)
+KAI_CORE_THUNK1(int32_to_int)
+KAI_CORE_THUNK1(uint32_to_int)
+KAI_CORE_THUNK1(uint64_to_int)
+KAI_CORE_THUNK1(int128_to_int)
+KAI_CORE_THUNK1(array_length_borrow)
+KAI_CORE_THUNK2(array_get_borrow)
+KAI_CORE_THUNK2(vec_make)
+KAI_CORE_THUNK0(vec_empty)
+KAI_CORE_THUNK1(vec_length)
+KAI_CORE_THUNK2(vec_get)
+KAI_CORE_THUNK3(vec_set)
+KAI_CORE_THUNK2(vec_push)
+KAI_CORE_THUNK1(vec_length_borrow)
+KAI_CORE_THUNK2(vec_get_borrow)
+KAI_CORE_THUNK3(vec_slice)
+KAI_CORE_THUNK2(vec_tail_from)
+KAI_CORE_THUNK1(vec_reserve)
+KAI_CORE_THUNK1(vec_from_list)
+KAI_CORE_THUNK0(mailbox_alloc_unowned)
+KAI_CORE_THUNK2(mailbox_alloc_bounded_unowned)
+KAI_CORE_THUNK2(mailbox_assign_owner)
+KAI_CORE_THUNK2(spawn_actor_fiber)
+
 /* ---------- test harness hooks (used by --test runs) ----------
  *
  * Two report formats share one set of counters. The human format is the
