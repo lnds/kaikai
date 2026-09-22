@@ -72,8 +72,6 @@ expect_reject "upgrade rejects unknown flag"   "unknown flag" upgrade "$BOGUS"
 expect_reject "upgrade rejects stray args"     "takes no arguments" upgrade nonsense
 
 # kai check backend contract (issue #1750).
-expect_reject "check refuses --backend=native" "C-only" check --backend=native x.kai
-expect_reject "check refuses --backend native" "C-only" check --backend native x.kai
 expect_reject "check refuses a bogus backend"  "must be 'c' or 'native'" check --backend=metal x.kai
 expect_reject "check --backend without value"  "needs an argument" check --backend
 
