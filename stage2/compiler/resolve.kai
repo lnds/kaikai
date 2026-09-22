@@ -77,6 +77,11 @@ import compiler.scope_chain
 
 #[doc("Resolver scope environment: the scope chain, an error flag, the source file, and the T3 diagnostic accumulator.")]
 pub type Env = { chain: ScopeChain, had_error: Bool, file: String,
+              # Right-hand sides of bare `type E = X` declarations. `X`
+              # names no constructor — the declaration is an alias — so
+              # a use of `X` as a value is the one-member-sum mistake
+              # and earns a targeted help line.
+              alias_heads: [String],
               # Structured diagnostic collection for T3
               # (`cannot find <name> in this scope`). Mirrors
               # `InferState.diags` semantics (reverse order, flipped at
@@ -88,10 +93,10 @@ pub type Env = { chain: ScopeChain, had_error: Bool, file: String,
 
 #[doc("Fresh resolver env for `file` with a single empty scope and no errors.")]
 pub fn env_new(file: String) : Env =
-  Env { chain: ch_new(), had_error: false, file: file, diags: [], rs: rs_off() }
+  Env { chain: ch_new(), had_error: false, file: file, alias_heads: [], diags: [], rs: rs_off() }
 
 fn env_with_chain(e: Env, c: ScopeChain) : Env =
-  Env { chain: c, had_error: e.had_error, file: e.file, diags: e.diags, rs: e.rs }
+  Env { chain: c, had_error: e.had_error, file: e.file, alias_heads: e.alias_heads, diags: e.diags, rs: e.rs }
 
 fn env_push(e: Env) : Env = env_with_chain(e, ch_push(e.chain))
 
@@ -151,14 +156,18 @@ fn env_shadowed(e: Env, name: String) : Bool = ch_shadows(e.chain, name)
 
 fn env_all_names(e: Env) : [String] = ch_names(e.chain)
 
+fn env_note_alias_head(e: Env, head: String) : Env =
+  Env { chain: e.chain, had_error: e.had_error, file: e.file,
+        alias_heads: [head, ...e.alias_heads], diags: e.diags, rs: e.rs }
+
 fn env_mark_err(e: Env) : Env =
-  Env { chain: e.chain, had_error: true, file: e.file, diags: e.diags, rs: e.rs }
+  Env { chain: e.chain, had_error: true, file: e.file, alias_heads: e.alias_heads, diags: e.diags, rs: e.rs }
 
 # Push a Diagnostic onto the Env accumulator. Used by the T3 emit
 # site in parallel with its existing `diag_error` call.
 fn env_push_diag(e: Env, d: Diagnostic) : Env =
   Env { chain: e.chain, had_error: e.had_error, file: e.file,
-        diags: [d, ...e.diags], rs: e.rs }
+        alias_heads: e.alias_heads, diags: [d, ...e.diags], rs: e.rs }
 
 fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env / Console + File {
 
@@ -508,18 +517,31 @@ fn chk_var(e: Env, name: String, x: Expr) : RKind / Console + File {
 fn chk_unbound(e: Env, name: String, x: Expr) : Env / Console + File {
   diag_error(e.file, x.line, x.col, "cannot find `#{name}` in this scope")
   let msg = "cannot find `#{name}` in this scope"
-  let sug = closest_name(name, env_all_names(e))
-  match sug {
-    Some(s) -> diag_help("a similar name exists in scope: `#{s}` (did you mean this?)")
+  let hint = unbound_hint(e, name)
+  match hint {
+    Some(h) -> diag_help(h)
     None    -> ()
   }
-  let related = match sug {
-    Some(s) -> [ri_help(e.file, x.line, x.col,
-                        "a similar name exists in scope: `#{s}` (did you mean this?)")]
+  let related = match hint {
+    Some(h) -> [ri_help(e.file, x.line, x.col, h)]
     None    -> []
   }
   env_mark_err(env_push_diag(e, mk_diag(SevError, e.file, x.line, x.col, msg, related)))
 }
+
+# A name that appears as a bare alias right-hand side has no
+# constructor precisely because the declaration is an alias; the
+# leading bar is what would have made it a sum. Anything else falls
+# back to the did-you-mean, which stays silent past distance 3.
+fn unbound_hint(e: Env, name: String) : Option[String] =
+  if list_has(e.alias_heads, name) {
+    Some("`type ... = #{name}` declares an alias, so `#{name}` is not a constructor — write `type ... = | #{name}` for a one-member sum")
+  } else {
+    match closest_name(name, env_all_names(e)) {
+      Some(s) -> Some("a similar name exists in scope: `#{s}` (did you mean this?)")
+      None    -> None
+    }
+  }
 
 fn rx_envs(r: RExprs) : Env = match r { RExprs(e, _) -> e }
 
@@ -898,6 +920,10 @@ fn register_one(e: Env, d: Decl) : Env {
       let e1 = env_add(e, name, NCType)
       match body {
         TBSum(variants) -> register_variants_env(e1, variants)
+        TBAlias(t) -> match t.tkind {
+          TyName(head, []) -> env_note_alias_head(e1, head)
+          _ -> e1
+        }
         _ -> e1
       }
     }
@@ -1030,7 +1056,7 @@ pub fn rds_env(r: RDecls) : Env = match r { RDecls(e, _) -> e }
 fn rds_decls(r: RDecls) : [Decl] = match r { RDecls(_, ds) -> ds }
 
 fn env_with_rs(e: Env, rs: ResState) : Env =
-  Env { chain: e.chain, had_error: e.had_error, file: e.file, diags: e.diags, rs: rs }
+  Env { chain: e.chain, had_error: e.had_error, file: e.file, alias_heads: e.alias_heads, diags: e.diags, rs: rs }
 
 
 # The env's file follows the decl being walked, so an error inside an
@@ -1061,7 +1087,7 @@ fn env_at_decl_home(f: Env, d: Decl, home: String) : Env =
   env_with_rs(f, rs_at_home(f.rs, decl_home_hint_reset(d, home, home)))
 
 fn env_with_file(e: Env, file: String) : Env =
-  Env { chain: e.chain, had_error: e.had_error, file: file, diags: e.diags, rs: e.rs }
+  Env { chain: e.chain, had_error: e.had_error, file: file, alias_heads: e.alias_heads, diags: e.diags, rs: e.rs }
 
 # Arity table built from every DEffect in the program. Effects are
 # declared in stdlib source and loaded before this runs, so every
