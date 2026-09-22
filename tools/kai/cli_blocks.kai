@@ -1,0 +1,284 @@
+#[doc("""
+Package-wide block discovery for `kai test`, `kai check` and `kai bench`.
+
+The entry build reaches only its import graph, and files holding blocks
+are leaves nothing imports, so every unreachable `*_test.kai` a package
+owns compiles and runs as its own runner binary.
+""")]
+
+import os.env
+import cli_caches
+import cli_compile
+import cli_err
+import cli_fs
+import cli_plan
+import cli_proc
+import cli_spec
+import cli_sys
+
+fn is_hidden(rel: String) : Bool =
+  string.starts_with(rel, ".") and string_contains(rel, "/") or string_contains(rel, "/.")
+
+# A nested package (its own kai.toml) or a `tests/` dir owns what sits below it.
+fn owned(root: String, d: String) : Bool / Ffi =
+  if d == "." {
+    true
+  } else if cli_sys.is_file("#{root}/#{d}/kai.toml") or cli_fs.basename(d) == "tests" {
+    false
+  } else {
+    owned(root, cli_fs.dirname(d))
+  }
+
+#[doc("Every `.kai` file package `root` owns, root-relative and sorted; nested packages, `tests/` and hidden dirs excluded.")]
+pub fn source_files(root: String) : [String] / File + Ffi =
+  dir_walk(root)
+    |? (p => string.ends_with(p, ".kai"))
+    | (p => string.drop_prefix(p, "#{root}/").unwrap_or(p))
+    |> list.sort
+    |? (rel => (not is_hidden(rel)) and owned(root, cli_fs.dirname(rel)))
+
+fn tests_dir_files(dir: String) : [String] / File + Ffi =
+  if cli_sys.is_dir(dir) {
+    list.sort(dir_list_dir(dir) |? (f => string.ends_with(f, ".kai")))
+      | (f => "#{dir}/#{f}")
+      |? (p => cli_sys.is_file(p))
+  } else {
+    []
+  }
+
+#[doc("The `*_test.kai` files package `root` owns plus its `tests/*.kai`: what an entry-less run compiles.")]
+pub fn test_files(root: String) : [String] / File + Ffi =
+  (source_files(root) |? (rel => string.ends_with(rel, "_test.kai")))
+    ++ tests_dir_files("#{root}/tests")
+
+#[doc("`kai test`'s `tests/` sibling of the entry: its `.kai` files, sorted.")]
+pub fn tests_of(entry_dir: String) : [String] / File + Ffi = tests_dir_files("#{entry_dir}/tests")
+
+#[doc("True when some line of `file` opens a `kind` block: `^\\s*<kind>\\s+\"`.")]
+pub fn declares(file: String, kind: String) : Bool / File =
+  string.split(cli_fs.read_or_empty(file), "\n")
+    |> list.any(
+      l => match string.drop_prefix(string.trim_left(l), kind) {
+        Some(rest) -> (string.starts_with(rest, " ") or string.starts_with(rest, "\t"))
+          and string.starts_with(string.trim_left(rest), "\"")
+        None -> false
+      }
+    )
+
+fn ident_prefix(cs: [Char]) : [Char] =
+  match cs {
+    [c, ...rest] if char.is_alnum(c) or c == '.' -> [c, ...ident_prefix(rest)]
+    _ -> []
+  }
+
+# The module an `import` line names, when its file sits under `root`.
+fn import_target(root: String, l: String) : [String] / Ffi {
+  let rest = string.drop_prefix(string.trim_left(l), "import").unwrap_or("")
+  let spaced = string.starts_with(rest, " ") or string.starts_with(rest, "\t")
+  let cs = string.chars(string.trim_left(rest))
+  let starts = match cs {
+    [c, ..._] -> char.is_alpha(c)
+    [] -> false
+  }
+  let m = string.from_chars(ident_prefix(cs))
+  let rel = "#{string.replace(string.drop_suffix(m, ".").unwrap_or(m), ".", "/")}.kai"
+  if spaced and starts and cli_sys.is_file("#{root}/#{rel}") { [rel] } else { [] }
+}
+
+# `import <mod>` lines naming a module file under `root`, as root-relative paths.
+fn local_imports(root: String, file: String) : [String] / File + Ffi =
+  string.split(cli_fs.read_or_empty("#{root}/#{file}"), "\n") || (l => import_target(root, l))
+
+fn closure(root: String, frontier: [String], seen: [String]) : [String] / File + Ffi =
+  match frontier {
+    [] -> seen
+    _ -> {
+      let next = frontier
+        || (f => local_imports(root, f))
+        |> list.foldl(
+          [],
+          (acc, r) => if seen.contains(r) or acc.contains(r) { acc } else { acc ++ [r] }
+        )
+      closure(root, next, seen ++ next)
+    }
+  }
+
+#[doc("The package root a spec names when a manifest governs it (arming package-wide discovery), else empty.")]
+pub fn package_root(spec: String) : String / Ffi =
+  if spec == "" or spec == "." {
+    if cli_sys.is_file("kai.toml") { "." } else { "" }
+  } else if string.starts_with(spec, "./") {
+    let rel = string.drop_prefix(spec, "./").unwrap_or(spec)
+    let sub = string.drop_suffix(rel, "/").unwrap_or(rel)
+    if cli_sys.is_file("#{sub}/kai.toml") { sub } else { "" }
+  } else {
+    ""
+  }
+
+fn append_file(from: String, to: String) : Unit / File {
+  let _ = write_file(to, cli_fs.read_or_empty(to) ++ cli_fs.read_or_empty(from))
+}
+
+#[doc("""
+Run one runner binary with `KAI_TEST_FILE` naming `id`. Under
+`KAI_TEST_JSON_LOG` its record stream (fd 3) appends to that log and its
+stdout joins stderr; under `KAI_TEST_RAN_LOG` its stderr is also kept there.
+""")]
+pub fn run_binary(id: String, bin: String, tmp: String) : Int / Env + File + Ffi {
+  let base = cli_proc.Spawn { ...cli_proc.inherit(), set: [("KAI_TEST_FILE", id)] }
+  let json = cli_caches.env_or("KAI_TEST_JSON_LOG", "")
+  let ran = cli_caches.env_or("KAI_TEST_RAN_LOG", "")
+  if json != "" {
+    cli_proc.run([bin], cli_proc.Spawn { ...base, out: "&2", fd3: json })
+  } else if ran != "" {
+    let err = "#{tmp}/runner.err"
+    let rc = cli_proc.run([bin], cli_proc.Spawn { ...base, err: err })
+    cli_sys.copy_to_stderr(err)
+    append_file(err, ran)
+    rc
+  } else {
+    cli_proc.run([bin], base)
+  }
+}
+
+#[doc("One discovery pass: what kind of block, the flag that compiles it, and the kaic2 flags forwarded after it.")]
+pub type Pass = { kind: String, flag: String, extra: [String] }
+
+fn runner(t: Toolchain, b: Backend, root: String, rel: String, pass: Pass, tmp: String) : Result[
+  Int,
+  Int
+] / Stderr + Env + File + Ffi {
+  if cli_caches.env_or("KAI_TEST_JSON", "") == "" { Stderr.eprint("== kai #{pass.kind} #{rel}") }
+  let stem = string.drop_suffix(rel, ".kai").unwrap_or(rel)
+  let bin = "#{tmp}/#{string.replace(stem, "/", "_")}-r"
+  let job = cli_plan.Job {
+    src: "#{root}/#{rel}",
+    tmp,
+    out: bin,
+    verb: pass.kind,
+    extra: [pass.flag, ...pass.extra]
+  }
+  cli_compile.compile(t, b, job)!
+  Ok(run_binary(rel, bin, tmp))
+}
+
+#[doc("Fold `step` over `files` from `status`, stopping early once an interrupt is pending.")]
+pub fn fold_files[e](
+  files: [String],
+  status: Int,
+  step: (String, Int) -> Result[Int, Int] / e
+) : Result[Int, Int] / Ffi + e =
+  match files {
+    [] -> Ok(status)
+    _ if cli_sys.pending_signal() != 0 -> Ok(status)
+    [f, ...rest] -> {
+      let next = step(f, status)!
+      fold_files(rest, next, step)
+    }
+  }
+
+fn discovered(
+  t: Toolchain,
+  b: Backend,
+  root: String,
+  reach: [String],
+  pass: Pass,
+  tmp: String,
+  rel: String,
+  status: Int
+) : Result[Int, Int] / Stderr + Env + File + Ffi =
+  if reach.contains(rel) or (not declares("#{root}/#{rel}", pass.kind)) {
+    Ok(status)
+  } else if string.ends_with(rel, "_test.kai") {
+    let rc = runner(t, b, root, rel, pass, tmp)!
+    Ok(if rc != 0 { rc } else { status })
+  } else {
+    Stderr.eprint(
+      "kai: warning: #{rel} declares #{pass.kind} blocks but is not reachable from the entry point; rename it to *_test.kai (or move it under tests/) so package #{pass.kind} runs include it"
+    )
+    Ok(status)
+  }
+
+#[doc("""
+Run every unreachable `*_test.kai` of package `root` holding `pass.kind`
+blocks; `src` is the entry (empty for a library). Warns when no file of
+the package declares such blocks (`found` covers the entry side). Returns
+the last failing status, else `status`.
+""")]
+pub fn run_package(
+  t: Toolchain,
+  b: Backend,
+  root: String,
+  src: String,
+  pass: Pass,
+  status: Int,
+  found: Bool
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let root_abs = cli_fs.absolute(root)
+  let reach = if src == "" {
+    []
+  } else {
+    let entry = string.drop_prefix(cli_fs.absolute(src), "#{root_abs}/").unwrap_or(src)
+    closure(root_abs, [entry], [entry])
+  }
+  let files = source_files(root_abs)
+  let any = found or (files |> list.any(rel => declares("#{root_abs}/#{rel}", pass.kind)))
+  let tmp = cli_fs.scratch_dir()
+  let r = fold_files(files, status, (rel, st) => discovered(t, b, root_abs, reach, pass, tmp, rel, st))
+  cli_sys.remove_tree(tmp)
+  if not any { Stderr.eprint("kai: warning: no #{pass.kind} blocks found in this package") }
+  r
+}
+
+fn entry_of(spec: String, verb: String) : Result[(String, String), Int] / Stderr + File + Ffi {
+  let src = cli_spec.resolve(spec, "building", true)!
+  let root = package_root(spec)
+  if src == "" and root == "" {
+    cli_err.die("missing input file (see 'kai #{verb} --help')")
+  } else {
+    Ok((src, root))
+  }
+}
+
+#[doc("The runners' target: `(entry, package root)`, either empty — a package spec resolves both, any other spec is the entry as given.")]
+pub fn target(rest: [String], verb: String) : Result[(String, String), Int] / Stderr + File + Ffi {
+  let spec = match rest {
+    [s, ..._] -> s
+    [] -> ""
+  }
+  if spec == "" or spec == "." or string.starts_with(spec, "./") {
+    entry_of(spec, verb)
+  } else {
+    Ok((spec, ""))
+  }
+}
+
+#[doc("Build the entry, if any, with `pass.flag` into `<tmp>/<stem>-<tag>` and run it as is, then the package's runners: the aggregate status.")]
+pub fn run_entry(
+  t: Toolchain,
+  b: Backend,
+  target: (String, String),
+  pass: Pass,
+  tag: String,
+  tmp: String
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let src = target.fst
+  let entry = if src == "" {
+    (0, false)
+  } else {
+    let bin = "#{tmp}/#{cli_fs.stem(src)}-#{tag}"
+    cli_compile.compile(t, b, cli_plan.Job {
+      src,
+      tmp,
+      out: bin,
+      verb: pass.kind,
+      extra: [pass.flag, ...pass.extra]
+    })!
+    (cli_proc.run([bin], cli_proc.inherit()), declares(src, pass.kind))
+  }
+  if target.snd == "" {
+    Ok(entry.fst)
+  } else {
+    run_package(t, b, target.snd, src, pass, entry.fst, entry.snd)
+  }
+}

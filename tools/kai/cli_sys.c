@@ -46,6 +46,7 @@ int kaicli_is_exec(const char *path) {
 typedef struct { char **items; int len; } StrList;
 
 static StrList exec_argv, child_set, child_unset;
+static char *child_fd3;
 
 static void list_push(StrList *l, const char *s) {
     char **grown = realloc(l->items, (size_t) (l->len + 2) * sizeof(char *));
@@ -70,6 +71,12 @@ void kaicli_child_setenv(const char *name, const char *value) {
 }
 
 void kaicli_child_unsetenv(const char *name) { list_push(&child_unset, name); }
+
+/* Open `path` for appending as the next child's fd 3 (the test-record stream). */
+void kaicli_child_fd3(const char *path) {
+    free(child_fd3);
+    child_fd3 = strdup(path);
+}
 
 static void reset_signals(void) {
     sigset_t empty;
@@ -114,6 +121,10 @@ static void run_child(const char *dir, const char *out, const char *err) {
     for (int i = 0; i + 1 < child_set.len; i += 2) setenv(child_set.items[i], child_set.items[i + 1], 1);
     for (int i = 0; i < child_unset.len; i++) unsetenv(child_unset.items[i]);
     if ((dir && *dir && chdir(dir) != 0) || redirect(out, 1) != 0 || redirect(err, 2) != 0) _exit(126);
+    if (child_fd3) {
+        int f = open(child_fd3, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (f < 0 || (f != 3 && (dup2(f, 3) < 0 || close(f) != 0))) _exit(126);
+    }
     execvp(exec_argv.items[0], exec_argv.items);
     dprintf(2, "kai: %s: %s\n", exec_argv.items[0], strerror(errno));
     _exit(127);
@@ -169,6 +180,8 @@ int64_t kaicli_spawn(const char *dir, const char *out, const char *err) {
     list_clear(&exec_argv);
     list_clear(&child_set);
     list_clear(&child_unset);
+    free(child_fd3);
+    child_fd3 = NULL;
     return handle;
 }
 
@@ -238,6 +251,25 @@ void kaicli_copy_to_stderr(const char *path) {
     fflush(stdout);
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) fwrite(buf, 1, n, stderr);
     fflush(stderr);
+    fclose(f);
+}
+
+/* Set once kaic2 proves it lacks libLLVM: later builds of this run skip the native attempt. */
+static int no_llvm;
+
+void kaicli_mark_no_llvm(void) { no_llvm = 1; }
+
+int kaicli_no_llvm(void) { return no_llvm; }
+
+/* `cat path`: the file's exact bytes on stdout. */
+void kaicli_copy_to_stdout(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    char buf[65536];
+    size_t n;
+    fflush(stdout);
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) fwrite(buf, 1, n, stdout);
+    fflush(stdout);
     fclose(f);
 }
 

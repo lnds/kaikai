@@ -1,0 +1,200 @@
+#[doc("`kai test`: compile the entry and every test file with `--test`, run them, aggregate the status; `./...` walks every package below.")]
+
+import os.env
+import cli_blocks
+import cli_compile
+import cli_err
+import cli_fs
+import cli_manifest
+import cli_plan
+import cli_proc
+import cli_sys
+import cli_test_help
+
+# `--json` and `--only` shape how the runners report and what they run, not how they compile.
+type TestOpts = { json: Bool, only: [String], backend: String, extra: [String], help: Bool }
+
+fn add_only(o: TestOpts, v: String) : TestOpts = TestOpts { ...o, only: o.only ++ [v] }
+
+fn parse(args: [String], o: TestOpts) : Result[(TestOpts, [String]), Int] / Stderr =
+  match args {
+    [] -> Ok((o, []))
+    [a, ..._] if a == "-h" or a == "--help" -> Ok((TestOpts { ...o, help: true }, []))
+    ["--json", ...rest] -> parse(rest, TestOpts { ...o, json: true })
+    ["--only"] -> cli_err.die("--only needs an argument (see 'kai test --help')")
+    ["--only", v, ...rest] -> parse(rest, add_only(o, v))
+    ["--backend"] -> cli_err.die("--backend needs an argument (c|native)")
+    ["--backend", v, ...rest] -> parse(rest, TestOpts { ...o, backend: v })
+    ["--", ...rest] -> Ok((o, rest))
+    [a, ...rest] if string.starts_with(a, "--only=") ->
+      parse(rest, add_only(o, string.drop_prefix(a, "--only=").unwrap_or("")))
+    [a, ...rest] if string.starts_with(a, "--backend=") ->
+      parse(rest, TestOpts { ...o, backend: string.drop_prefix(a, "--backend=").unwrap_or("") })
+    [a, ...rest] if string.starts_with(a, "-") ->
+      parse(rest, TestOpts { ...o, extra: o.extra ++ [a] })
+    _ -> Ok((o, args))
+  }
+
+fn label_of(dir: String) : String / File + Ffi =
+  match cli_manifest.package_name(dir) {
+    Some(n) -> "#{n} (#{dir})"
+    None -> dir
+  }
+
+# Visit one package: `(ran, failed)` so far, updated.
+fn visit(
+  t: Toolchain,
+  flags: [String],
+  acc: (Int, Bool),
+  dir: String
+) : (Int, Bool) / Stderr + File + Ffi {
+  let label = label_of(dir)
+  let rel = cli_manifest.entry(dir)
+  if cli_sys.pending_signal() != 0 {
+    acc
+  } else if (not cli_sys.is_file("#{dir}/#{rel}")) and list.is_empty(cli_blocks.test_files(dir)) {
+    Stderr.eprint("== kai test SKIP #{label} (no #{rel}, no *_test.kai)")
+    acc
+  } else {
+    Stderr.eprint("== kai test #{label}")
+    let rc = cli_proc.run(["#{t.layout.root}/bin/kai", "test", ...flags], cli_proc.Spawn {
+      ...cli_proc.inherit(),
+      dir: dir
+    })
+    if rc != 0 { Stderr.eprint("== FAIL #{label}") }
+    let next = (acc.fst + 1, acc.snd or rc != 0)
+    next
+  }
+}
+
+# `kai test ./...`: every directory below the cwd carrying a kai.toml, each in its own `kai test`.
+fn recursive(t: Toolchain, flags: [String]) : Int / Stderr + File + Ffi {
+  let here = cli_sys.cwd()
+  let dirs = dir_walk(".")
+    |? (p => cli_fs.basename(p) == "kai.toml")
+    |> list.sort
+    | (p => cli_fs.dirname(p))
+  if list.is_empty(dirs) {
+    Stderr.eprint("kai: no kai.toml found under #{here}")
+    1
+  } else {
+    let r = dirs |> list.foldl((0, false), (acc, d) => visit(t, flags, acc, d))
+    if r.fst == 0 {
+      Stderr.eprint("kai: no buildable packages found under #{here}")
+      1
+    } else if r.snd {
+      1
+    } else {
+      Stderr.eprint("kai: all package tests passed (#{r.fst} package(s))")
+      0
+    }
+  }
+}
+
+fn log_file(tmp: String, name: String) : String / File {
+  let f = "#{tmp}/#{name}"
+  let _ = write_file(f, "")
+  f
+}
+
+# The entry, then its `tests/` sibling, then the package's unreachable test files.
+fn run_all(t: Toolchain, b: Backend, o: TestOpts, src: String, root: String, tmp: String) : Result[
+  Int,
+  Int
+] / Stderr + Env + File + Ffi {
+  let extra = ["--test", ...o.extra]
+  let entry_status = if src == "" {
+    0
+  } else {
+    let bin = "#{tmp}/#{cli_fs.stem(src)}-t"
+    cli_compile.compile(t, b, cli_plan.Job { src, tmp, out: bin, verb: "test", extra })!
+    cli_blocks.run_binary(src, bin, tmp)
+  }
+  let tests = cli_blocks.tests_of(if src == "" { root } else { cli_fs.dirname(src) })
+  let status = cli_blocks.fold_files(tests, entry_status, (tf, st) => test_file(t, b, o, tmp, tf, st))!
+  if root == "" {
+    Ok(status)
+  } else {
+    let pass = cli_blocks.Pass { kind: "test", flag: "--test", extra: o.extra }
+    cli_blocks.run_package(t, b, root, src, pass, status, not list.is_empty(tests))
+  }
+}
+
+fn test_file(t: Toolchain, b: Backend, o: TestOpts, tmp: String, tf: String, status: Int) : Result[Int, Int] / Stderr + Env + File + Ffi = {
+  let bin = "#{tmp}/#{cli_fs.stem(tf)}-t"
+  if not o.json { Stderr.eprint("== kai test #{tf}") }
+  cli_compile.compile(t, b, cli_plan.Job { src: tf, tmp, out: bin, verb: "test", extra: ["--test", ...o.extra] })!
+  let rc = cli_blocks.run_binary(tf, bin, tmp)
+  Ok(if rc != 0 { rc } else { status })
+}
+
+# A selection that matched nothing is a caller error, whatever the output format.
+fn verdict(o: TestOpts, logs: (String, String), status: Int) : Int / Stderr + File + Ffi {
+  let only = string.join(o.only, "\n") != ""
+  if logs.fst != "" and o.json { cli_sys.copy_to_stdout(logs.fst) }
+  let json_miss = logs.fst != ""
+    and only
+    and (not (string.split(cli_fs.read_or_empty(logs.fst), "\n")
+      |> list.any(l => string.starts_with(l, "{\"type\":\"test\""))))
+  let ran_miss = logs.snd != ""
+    and (not (string.split(cli_fs.read_or_empty(logs.snd), "\n") |> list.any(l => ran_line(l))))
+  if json_miss or ran_miss {
+    Stderr.eprint("kai: no test matched --only")
+    1
+  } else {
+    status
+  }
+}
+
+# `^ +(ok|FAIL) `: a per-block line of the runner.
+fn ran_line(l: String) : Bool {
+  let t = string.from_chars(string.chars(l) |> list.drop_while(c => c == ' '))
+  string.starts_with(l, " ") and (string.starts_with(t, "ok ") or string.starts_with(t, "FAIL "))
+}
+
+# The record log under `--json`, the ran log under a text `--only`; both exported so every runner — nested `kai test` runs included — reports into them.
+fn open_logs(o: TestOpts, tmp: String) : (String, String) / Env + File {
+  let json_log = if o.json { log_file(tmp, "json.log") } else { "" }
+  let ran_log =
+    if string.join(o.only, "\n") != "" and (not o.json) { log_file(tmp, "ran.log") } else { "" }
+  if json_log != "" { let _ = env.set("KAI_TEST_JSON_LOG", json_log) }
+  if ran_log != "" { let _ = env.set("KAI_TEST_RAN_LOG", ran_log) }
+  let logs = (json_log, ran_log)
+  logs
+}
+
+fn run_suite(
+  t: Toolchain,
+  o: TestOpts,
+  rest: [String],
+  tmp: String
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let logs = open_logs(o, tmp)
+  let b = cli_compile.resolve_backend(o.backend)!
+  let rec = if o.backend == "" { [] } else { ["--backend", o.backend] }
+  match rest {
+    [s, ..._] if s == "./..." or s == "..." -> Ok(recursive(t, rec ++ o.extra))
+    _ -> {
+      let target = cli_blocks.target(rest, "test")!
+      let status = run_all(t, b, o, target.fst, target.snd, tmp)!
+      Ok(verdict(o, logs, status))
+    }
+  }
+}
+
+#[doc("`kai test [options] [<spec>|./...]`: the aggregate exit status.")]
+pub fn test_verb(
+  t: Toolchain,
+  args: [String]
+) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let parsed = parse(args, TestOpts { json: false, only: [], backend: "", extra: [], help: false })!
+  let o = parsed.fst
+  if o.help {
+    Stdout.print(cli_test_help.test_text())
+    Ok(0)
+  } else {
+    let _ = env.set("KAI_TEST_ONLY", string.join(o.only, "\n"))
+    if o.json { let _ = env.set("KAI_TEST_JSON", "1") }
+    cli_fs.with_scratch(tmp => run_suite(t, o, parsed.snd, tmp))
+  }
+}

@@ -1,0 +1,204 @@
+#[doc("`kai bench`, `kai check` and `kai typecheck`: the block runners beside `kai test`, and the front end alone.")]
+
+import os.env
+import cli_blocks
+import cli_compile
+import cli_err
+import cli_fs
+import cli_spec
+import cli_test_help
+
+const REPORT_FLAGS : [String] = [
+  "--holes", "--holes-json", "--holes-scope", "--holes-json-scope", "--diags-json",
+  "--effects-json", "--effect-holes-json"
+]
+
+type RunnerOpts = { iters: String, backend: String, help: Bool }
+
+const NO_OPTS : RunnerOpts = RunnerOpts { iters: "", backend: "", help: false }
+
+fn backend_flag(
+  args: [String],
+  o: RunnerOpts
+) : Option[Result[(RunnerOpts, [String]), Int]] / Stderr =
+  match args {
+    ["--backend"] -> Some(cli_err.die("--backend needs an argument (c|native)"))
+    ["--backend", v, ...rest] -> Some(Ok((RunnerOpts { ...o, backend: v }, rest)))
+    [a, ...rest] if string.starts_with(a, "--backend=") ->
+      Some(
+        Ok((RunnerOpts { ...o, backend: string.drop_prefix(a, "--backend=").unwrap_or("") }, rest))
+      )
+    _ -> None
+  }
+
+fn parse_bench(args: [String], o: RunnerOpts) : Result[(RunnerOpts, [String]), Int] / Stderr =
+  match args {
+    [] -> Ok((o, []))
+    [a, ..._] if a == "-h" or a == "--help" -> Ok((RunnerOpts { ...o, help: true }, []))
+    ["--iters"] -> cli_err.die("--iters requires a value (see 'kai bench --help')")
+    ["--iters", v, ...rest] -> parse_bench(rest, RunnerOpts { ...o, iters: v })
+    [a, ...rest] if string.starts_with(a, "--iters=") ->
+      parse_bench(rest, RunnerOpts { ...o, iters: string.drop_prefix(a, "--iters=").unwrap_or("") })
+    ["--", ...rest] -> Ok((o, rest))
+    [a, ..._] if string.starts_with(a, "-") -> match backend_flag(args, o) {
+      Some(r) -> {
+        let next = r!
+        parse_bench(next.snd, next.fst)
+      }
+      None -> cli_err.die("unknown option: #{a} (see 'kai bench --help')")
+    }
+    _ -> Ok((o, args))
+  }
+
+fn parse_check(args: [String], o: RunnerOpts) : Result[(RunnerOpts, [String]), Int] / Stderr =
+  match args {
+    [] -> Ok((o, []))
+    [a, ..._] if a == "-h" or a == "--help" -> Ok((RunnerOpts { ...o, help: true }, []))
+    ["--", ...rest] -> Ok((o, rest))
+    [a, ..._] if string.starts_with(a, "-") -> match backend_flag(args, o) {
+      Some(r) -> {
+        let next = r!
+        parse_check(next.snd, next.fst)
+      }
+      None -> cli_err.die("unknown flag: #{a} (see 'kai check --help')")
+    }
+    _ -> Ok((o, args))
+  }
+
+# `[1-9]` somewhere among nothing but digits: `test "$n" -gt 0` on a digit string.
+fn positive(n: String) : Bool {
+  let cs = string.chars(n)
+  (not list.is_empty(cs)) and list.all(cs, c => char.is_digit(c)) and list.any(cs, c => c != '0')
+}
+
+fn bench_suite(t: Toolchain, o: RunnerOpts, target: (String, String), tmp: String) : Result[
+  Int,
+  Int
+] / Stderr + Env + File + Ffi {
+  let b = cli_compile.resolve_backend(o.backend)!
+  if o.iters != "" { let _ = env.set("KAI_BENCH_ITERS", o.iters) }
+  cli_blocks.run_entry(
+    t,
+    b,
+    target,
+    cli_blocks.Pass { kind: "bench", flag: "--bench", extra: [] },
+    "b",
+    tmp
+  )
+}
+
+#[doc("`kai bench [--iters N] [--backend c|native] [<spec>]`: the aggregate exit status.")]
+pub fn bench_verb(
+  t: Toolchain,
+  args: [String]
+) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let parsed = parse_bench(args, NO_OPTS)!
+  let o = parsed.fst
+  if o.help {
+    Stdout.print(cli_test_help.bench_text())
+    Ok(0)
+  } else {
+    let target = cli_blocks.target(parsed.snd, "bench")!
+    if o.iters != "" and (not positive(o.iters)) {
+      cli_err.die("--iters value must be a positive integer (got: #{o.iters})")
+    } else {
+      cli_fs.with_scratch(tmp => bench_suite(t, o, target, tmp))
+    }
+  }
+}
+
+#[doc("`kai check [--backend c|native] [<spec>]`: the aggregate exit status.")]
+pub fn check_verb(
+  t: Toolchain,
+  args: [String]
+) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let parsed = parse_check(args, NO_OPTS)!
+  let o = parsed.fst
+  if o.help {
+    Stdout.print(cli_test_help.check_text())
+    Ok(0)
+  } else if not (o.backend == "" or o.backend == "c" or o.backend == "native") {
+    cli_err.die("--backend must be 'c' or 'native' (got: #{o.backend})")
+  } else {
+    let b = cli_compile.resolve_backend(o.backend)!
+    let target = cli_blocks.target(parsed.snd, "check")!
+    let pass = cli_blocks.Pass { kind: "check", flag: "--prop-check", extra: [] }
+    cli_fs.with_scratch(tmp => cli_blocks.run_entry(t, b, target, pass, "c", tmp))
+  }
+}
+
+type TypecheckOpts = { spec: String, mode: String, help: Bool }
+
+fn parse_typecheck(args: [String], o: TypecheckOpts) : Result[TypecheckOpts, Int] / Stderr =
+  match args {
+    [] -> Ok(o)
+    [a, ..._] if a == "-h" or a == "--help" -> Ok(TypecheckOpts { ...o, help: true })
+    [a, ...rest] if REPORT_FLAGS.contains(a) ->
+      if o.mode != "" {
+        cli_err.die("report-mode flags are mutually exclusive")
+      } else {
+        parse_typecheck(rest, TypecheckOpts { ...o, mode: a })
+      }
+    [a, ..._] if string.starts_with(a, "-") ->
+      cli_err.die("unknown flag: #{a} (see 'kai typecheck --help')")
+    [a, ...rest] ->
+      if o.spec != "" {
+        cli_err.die("only one input supported")
+      } else {
+        parse_typecheck(rest, TypecheckOpts { ...o, spec: a })
+      }
+  }
+
+fn report_one(t: Toolchain, root: String, flag: String, tmp: String, rel: String, status: Int) : Result[Int, Int] / Stderr + Env + File + Ffi = {
+  Stderr.eprint("kai: #{rel}")
+  let rc = cli_compile.report(t, "#{root}/#{rel}", flag, tmp)!
+  Ok(if rc != 0 { 1 } else { status })
+}
+
+# Every module the package owns, each its own compilation root: with no entry there is no import graph to walk.
+fn report_package(
+  t: Toolchain,
+  pkg: String,
+  flag: String,
+  tmp: String
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let root = cli_fs.absolute(pkg)
+  let tests = cli_blocks.tests_of(root) | (p => string.drop_prefix(p, "#{root}/").unwrap_or(p))
+  let files = cli_blocks.source_files(root) ++ tests
+  if list.is_empty(files) {
+    cli_err.die("no .kai files found in #{pkg}")
+  } else {
+    cli_blocks.fold_files(files, 0, (rel, st) => report_one(t, root, flag, tmp, rel, st))
+  }
+}
+
+fn typecheck_in(
+  t: Toolchain,
+  o: TypecheckOpts,
+  tmp: String
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let src = cli_spec.resolve(o.spec, "checking", true)!
+  let root = cli_blocks.package_root(o.spec)
+  let flag = if o.mode == "" { "--check" } else { o.mode }
+  if src != "" {
+    cli_compile.report(t, src, flag, tmp)
+  } else if root == "" {
+    cli_err.die("missing input file (see 'kai typecheck --help')")
+  } else {
+    report_package(t, root, flag, tmp)
+  }
+}
+
+#[doc("`kai typecheck [<report flag>] [<spec>]`: the front end alone, exit 1 on any diagnostic error.")]
+pub fn typecheck_verb(
+  t: Toolchain,
+  args: [String]
+) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let o = parse_typecheck(args, TypecheckOpts { spec: "", mode: "", help: false })!
+  if o.help {
+    Stdout.print(cli_test_help.typecheck_text())
+    Ok(0)
+  } else {
+    cli_fs.with_scratch(tmp => typecheck_in(t, o, tmp))
+  }
+}

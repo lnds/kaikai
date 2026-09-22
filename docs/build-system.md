@@ -35,8 +35,9 @@ A C-only `kaic2` prints `note: native backend unavailable … using the C backen
 
 The commands are moving out of the shell wrapper into a binary written in
 kaikai, `tools/kai/`. `bin/kai` hands it every verb it no longer serves —
-today `build`, `run`, `env`, `help`, and any unknown verb, which the binary
-runs as a `kai-<verb>` plugin from `PATH` (`kai info install`). In a checkout,
+today `build`, `run`, `test`, `bench`, `check`, `typecheck`, `env`, `help`,
+and any unknown verb, which the binary runs as a `kai-<verb>` plugin from
+`PATH` (`kai info install`). In a checkout,
 `bin/kai` builds it on first use through `tools/kai/Makefile`, which drives
 `kaic2` directly; a release ships it as `libexec/kaikai/kai`. The bootstrap
 never goes through it: the Makefiles keep invoking `kaic2` with their own
