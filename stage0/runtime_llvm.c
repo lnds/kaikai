@@ -1932,6 +1932,124 @@ void kaix_test_line(int line) { kai_test_line(line); }
 void kaix_bench_run_one(const char *desc, KaiValue *(*body)(void)) { kai_bench_run_one(desc, body); }
 void kaix_test_summary_exit(void)  { exit(kai_test_summary()); }
 void kaix_bench_summary_exit(void) { exit(kai_bench_summary()); }
+void kaix_check_summary_exit(void) { exit(kai_check_summary()); }
+
+/* Check runner. Must stay step-for-step with the C-direct `_kai_check_<id>`
+ * (emit_c's `emit_check_fn`): the PRNG draws happen in the same order, so a
+ * counterexample reports the same iteration and value on both backends.
+ * The body borrows `args`; this loop owns and drops them. */
+typedef KaiValue *(*KaixShrink)(KaiValue *);
+typedef struct { const char *name; const char *type; } KaixCheckParam;
+
+static KaiValue *kaix_check_arbitrary(const char *ty) {
+    if (strcmp(ty, "Int") == 0)      return kai_arbitrary_int();
+    if (strcmp(ty, "Bool") == 0)     return kai_arbitrary_bool();
+    if (strcmp(ty, "Char") == 0)     return kai_arbitrary_char();
+    if (strcmp(ty, "String") == 0)   return kai_arbitrary_string();
+    if (strcmp(ty, "[Int]") == 0)    return kai_arbitrary_list_int();
+    if (strcmp(ty, "[Bool]") == 0)   return kai_arbitrary_list_bool();
+    if (strcmp(ty, "[Char]") == 0)   return kai_arbitrary_list_char();
+    if (strcmp(ty, "[String]") == 0) return kai_arbitrary_list_string();
+    const char *pre = "check v1: no generator for type ";
+    const char *post = " — supported types are Int, Bool, Char, String, and lists of those";
+    size_t n = strlen(pre) + strlen(ty) + strlen(post) + 1;
+    char *msg = malloc(n);
+    snprintf(msg, n, "%s%s%s", pre, ty, post);
+    return kai_core_panic(kai_str(msg));
+}
+
+/* The shrink strategies for a param type, in the order the C oracle tries them. */
+static int kaix_check_shrinkers(const char *ty, KaixShrink out[2]) {
+    if (strcmp(ty, "Int") == 0)    { out[0] = kai_shrink_int;    return 1; }
+    if (strcmp(ty, "Bool") == 0)   { out[0] = kai_shrink_bool;   return 1; }
+    if (strcmp(ty, "Char") == 0)   { out[0] = kai_shrink_char;   return 1; }
+    if (strcmp(ty, "String") == 0) { out[0] = kai_shrink_string; return 1; }
+    if (strcmp(ty, "[Int]") == 0)    { out[0] = kai_shrink_list_int;    out[1] = kai_shrink_list_int_head;    return 2; }
+    if (strcmp(ty, "[Bool]") == 0)   { out[0] = kai_shrink_list_bool;   out[1] = kai_shrink_list_bool_head;   return 2; }
+    if (strcmp(ty, "[Char]") == 0)   { out[0] = kai_shrink_list_char;   out[1] = kai_shrink_list_char_head;   return 2; }
+    if (strcmp(ty, "[String]") == 0) { out[0] = kai_shrink_list_string; out[1] = kai_shrink_list_string_head; return 2; }
+    return 0;
+}
+
+static int kaix_check_holds(KaiFn body, KaiValue **args, int n) {
+    KaiValue *r = body(NULL, args, n);
+    int ok = kai_op_truthy(r);
+    kai_decref(r);
+    return ok;
+}
+
+/* One greedy shrink round: the first candidate that still fails replaces its
+ * param. Returns whether any candidate stuck. */
+static int kaix_check_shrink_round(KaiFn body, const KaixCheckParam *ps, KaiValue **args, int n) {
+    for (int j = 0; j < n; j++) {
+        KaixShrink sh[2];
+        int ns = kaix_check_shrinkers(ps[j].type, sh);
+        for (int k = 0; k < ns; k++) {
+            KaiValue *cand = sh[k](args[j]);
+            if (cand == NULL) continue;
+            KaiValue *save = args[j];
+            args[j] = cand;
+            if (!kaix_check_holds(body, args, n)) { kai_decref(save); return 1; }
+            args[j] = save;
+            kai_decref(cand);
+        }
+    }
+    return 0;
+}
+
+/* Split `spec` (`name:Type;name:Type`) in place into `ps`; returns the count. */
+static int kaix_check_parse_spec(char *spec, KaixCheckParam *ps) {
+    int n = 0;
+    char *p = spec;
+    while (*p) {
+        char *end = strchr(p, ';');
+        if (end) *end = '\0';
+        char *colon = strchr(p, ':');
+        *colon = '\0';
+        ps[n].name = p;
+        ps[n].type = colon + 1;
+        n++;
+        if (!end) break;
+        p = end + 1;
+    }
+    return n;
+}
+
+void kaix_check_run_one(const char *desc, const char *spec, KaiFn body) {
+    int cap = 1;
+    for (const char *s = spec; *s; s++) if (*s == ';') cap++;
+    char *buf = strdup(spec);
+    KaixCheckParam *ps = calloc((size_t) cap, sizeof *ps);
+    KaiValue **args = calloc((size_t) cap, sizeof *args);
+    int n = kaix_check_parse_spec(buf, ps);
+    kai_check_begin(desc);
+    int failed_at = -1;
+    for (int i = 0; i < KAI_CHECK_ITERS; i++) {
+        kai_check_cx_reset();
+        for (int j = 0; j < n; j++) {
+            args[j] = kaix_check_arbitrary(ps[j].type);
+            kai_check_record_param(ps[j].name, args[j]);
+        }
+        if (!kaix_check_holds(body, args, n)) { failed_at = i; break; }
+        for (int j = 0; j < n; j++) kai_decref(args[j]);
+    }
+    if (failed_at >= 0) {
+        kai_check_cx_save_orig();
+        int budget = kai_check_shrink_iters_limit();
+        for (int s = 0; s < budget; s++) {
+            if (!kaix_check_shrink_round(body, ps, args, n)) break;
+        }
+        kai_check_cx_reset();
+        for (int j = 0; j < n; j++) kai_check_record_param(ps[j].name, args[j]);
+        kai_check_fail_shrunk(failed_at);
+        for (int j = 0; j < n; j++) kai_decref(args[j]);
+    } else {
+        kai_check_pass(KAI_CHECK_ITERS);
+    }
+    free(args);
+    free(ps);
+    free(buf);
+}
 
 /* Option C — protocol dispatch tables. The LLVM emitter generates the
  * body of `_kai_proto_init_llvm` per program: it calls

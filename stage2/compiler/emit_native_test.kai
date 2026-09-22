@@ -1,6 +1,6 @@
 # compiler/emit_native_test.kai — the synthetic `kai_main` driver the
-# native backend emits in test / bench mode (`--emit=native --test` /
-# `--bench`).
+# native backend emits in test / bench / check mode (`--emit=native --test` /
+# `--bench` / `--prop-check`).
 #
 # The C-direct backend builds a fresh `int main` per build mode
 # (emit_c's `emit_main_wrapper`): in test mode it calls each
@@ -18,15 +18,13 @@ import compiler.kir
 import compiler.emit_shared
 import compiler.emit_native_ops
 import compiler.emit_native_fn
+import compiler.emit_native_term
 
-# True when the build mode runs a synthetic test/bench driver instead of
-# the user's `fn main`. `BMCheck` stays on the C oracle (the native check
-# runner is a later burn-down — see `lower_runner_decls`), so it is NOT
-# driver-mode here.
+# True when the build mode runs a synthetic runner driver instead of the
+# user's `fn main`.
 pub fn nemit_is_runner_mode(bmode: BuildMode) : Bool = match bmode {
-  BMTest  -> true
-  BMBench -> true
-  _       -> false
+  BMBuild -> false
+  _       -> true
 }
 
 # The user's `fn main` (KFn sym `main` → `kai_main`) must NOT be emitted
@@ -63,30 +61,50 @@ fn ndriver_open_kai_main(ctx: Handle) : Unit = {
 # The `*_summary_exit` forwarder for this mode.
 fn ndriver_exit_sym(bmode: BuildMode) : String = match bmode {
   BMBench -> "kaix_bench_summary_exit"
+  BMCheck -> "kaix_check_summary_exit"
   _       -> "kaix_test_summary_exit"
 }
 
-# The `*_run_one` forwarder for a runner kind.
+# The `*_run_one` forwarder for a test or bench runner.
 fn nrunner_call_sym(kind: KRunnerKind) : String = match kind {
   KRBench -> "kaix_bench_run_one"
   _       -> "kaix_test_run_one"
 }
 
-# Does this runner belong to the active driver mode? `kai test` runs the
-# test blocks; `kai bench` the bench blocks. A bench block in a test run
-# (and vice-versa) is skipped — the C oracle drives the same split by
-# emitting a per-mode call list.
+# Does this runner belong to the active driver mode? Each mode runs only
+# its own kind of block — the C oracle drives the same split by emitting a
+# per-mode call list.
 fn nrunner_in_mode(kind: KRunnerKind, bmode: BuildMode) : Bool = match bmode {
   BMBench -> match kind { KRBench -> true _ -> false }
+  BMCheck -> match kind { KRCheck(_) -> true _ -> false }
   _       -> match kind { KRTest  -> true _ -> false }
 }
 
 fn nemit_runner_calls(ctx: Handle, runners: [KRunner], bmode: BuildMode) : Unit / Console = match runners {
   [] -> ()
   [r, ...rest] -> {
-    if nrunner_in_mode(r.kind, bmode) { nemit_one_runner_call(ctx, r) } else { () }
+    if nrunner_in_mode(r.kind, bmode) { nemit_runner_call(ctx, r) } else { () }
     nemit_runner_calls(ctx, rest, bmode)
   }
+}
+
+fn nemit_runner_call(ctx: Handle, r: KRunner) : Unit / Console = match r.kind {
+  KRCheck(specs) -> nemit_check_runner_call(ctx, r, specs)
+  _              -> nemit_one_runner_call(ctx, r)
+}
+
+# `kaix_check_run_one(i8* desc, i8* spec, ptr thunk) -> void`. The body is
+# reached through its thunk-ABI forwarder, so the runtime passes the
+# generated params as `args[]` whatever the body's own signature is; `spec`
+# is the `;`-joined `name:Type` list the runtime generates and shrinks from.
+fn nemit_check_runner_call(ctx: Handle, r: KRunner, specs: [String]) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let b = native_ctx_b(ctx)
+  let desc = llvm_build_string_span(b, nemit_decode_span(r.desc))
+  let spec = llvm_build_string_span(b, string_join(specs, ";"))
+  let thunk = nemit_declare_thunk(ctx, c_user_thunk_sym(r.sym))
+  let _c = ncall_sig3(ctx, "kaix_check_run_one", native_ctx_voidt(ctx), p, p, p, desc, spec, thunk)
+  ()
 }
 
 # `kaix_<kind>_run_one(i8* desc, ptr body) -> void`. `desc` is the

@@ -9252,6 +9252,30 @@ test-native-test-runner-950: $(TARGET) build
 	  echo "native-test-runner-950 OK (native == C: summary 2/3, exit 1; no RC trace line — KAI_TRACE_RC inert)"; \
 	fi
 
+# The native backend runs `check` blocks. `kai check` on the fixture must
+# print the same per-block lines, summary, and exit code on native as on the
+# C oracle — a pass, a failure at a nonzero iteration, String params read by
+# decref-aware consumers, and multi-param shrinking — and native's
+# KAI_TRACE_RC report must match C's leak count.
+test-native-check-runner: $(TARGET) build
+	@set -e; \
+	src=../examples/native/check_runner_parity.kai; \
+	gold=../examples/native/check_runner_parity.out.expected; \
+	run() { \
+	  rc=0; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 KAI_MAX_HEAP=4g $(TIMEOUT) 60 ../bin/kai check --backend=$$1 $$src > build/s2-ckr-$$1.raw 2>&1 || rc=$$?; \
+	  grep -vE '^\[KAI_TRACE_RC\]' build/s2-ckr-$$1.raw > build/s2-ckr-$$1.out || true; \
+	  diff -q $$gold build/s2-ckr-$$1.out > /dev/null \
+	    || { echo "native-check-runner FAIL ($$1 output diff)"; diff $$gold build/s2-ckr-$$1.out; exit 1; }; \
+	  [ "$$rc" -eq 1 ] || { echo "native-check-runner FAIL ($$1 exit $$rc != 1)"; exit 1; }; \
+	}; \
+	run c; run native; \
+	cl=$$(grep -oE 'leaked=[0-9]+' build/s2-ckr-c.raw | head -1); \
+	nl=$$(grep -oE 'leaked=[0-9]+' build/s2-ckr-native.raw | head -1); \
+	[ "$$cl" = "$$nl" ] \
+	  || { echo "native-check-runner FAIL (RC native $$nl vs C $$cl)"; grep KAI_TRACE_RC build/s2-ckr-native.raw; exit 1; }; \
+	echo "native-check-runner OK (native == C: summary 2/5, exit 1, RC $${nl:-inert})"
+
 # Issue #92 — rule 3 fires. The `walk` fn matches on `xs` (single
 # scrutinee read, count==1) and recurses with `(t, acc + h)`. `xs`
 # does not appear anywhere in the recursive call's args, so rule 3
