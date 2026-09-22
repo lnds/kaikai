@@ -31,6 +31,17 @@ A C-only `kaic2` prints `note: native backend unavailable … using the C backen
 
 `./bin/kai typecheck <file.kai>` is the fast edit-loop answer to "does this compile?": it runs the full front-end (resolve + infer + protocol/kind/effect checks) and stops — no monomorph, no codegen, no `cc`, no link, so it behaves identically on a C-only and a native `kaic2`. Front-end diagnostics and exit code are identical to a build's (gate: `make test-check-parity`); errors that only surface at monomorphisation or in a backend subset gap are out of its scope by design. The JSON report flags ride it (`kai typecheck f.kai --diags-json`).
 
+### The kai binary (`tools/kai`)
+
+The commands are moving out of the shell wrapper into a binary written in
+kaikai, `tools/kai/`. `bin/kai` hands it every verb it no longer serves —
+today `env`, `help`, and any unknown verb, which the binary runs as a
+`kai-<verb>` plugin from `PATH` (`kai info install`). In a checkout,
+`bin/kai` builds it on first use through `tools/kai/Makefile`, which drives
+`kaic2` directly; a release ships it as `libexec/kaikai/kai`. The bootstrap
+never goes through it: the Makefiles keep invoking `kaic2` with their own
+flags. Gate: `make test-kai-cli`.
+
 ### The shared core cache
 
 Every `bin/kai` build passes `--core-cache-dir` + `--toolchain-id` to

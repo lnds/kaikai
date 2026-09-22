@@ -136,6 +136,10 @@ KAI_BACKEND=c ./bin/kai build tools/kai-pkg/main.kai -o tools/kai-pkg/kai-pkg >&
 echo "==> building kai-lsp"
 KAI_BACKEND=c ./bin/kai build tools/kai-lsp/main.kai -o tools/kai-lsp/kai-lsp >&2
 
+# Build the kai binary with its own Makefile, which drives kaic2 directly.
+echo "==> building kai"
+make -C tools/kai kai >&2
+
 # Copy artifacts.
 echo "==> assembling installed layout at $STAGE"
 cp bin/kai             "$STAGE/bin/kai"
@@ -146,6 +150,8 @@ cp tools/kai-pkg/kai-pkg "$STAGE/libexec/kaikai/kai-pkg"
 chmod +x               "$STAGE/libexec/kaikai/kai-pkg"
 cp tools/kai-lsp/kai-lsp "$STAGE/libexec/kaikai/kai-lsp"
 chmod +x               "$STAGE/libexec/kaikai/kai-lsp"
+cp tools/kai/kai       "$STAGE/libexec/kaikai/kai"
+chmod +x               "$STAGE/libexec/kaikai/kai"
 
 # Stdlib: copy the whole tree preserving structure.
 (cd stdlib && tar -cf - .) | (cd "$STAGE/share/kaikai/stdlib" && tar -xf -)
@@ -296,6 +302,17 @@ if grep -q 'hola manifest mode' "$SMOKE_DIR/out.proj"; then
   echo "    manifest project OK"
 else
   echo "build-release.sh: smoke test failed (kai.toml project) — issue #512?" >&2
+  smoke_failed=1
+fi
+
+# Smoke test #3 — the kai binary resolves the staged prefix, not the
+# checkout it was built in.
+echo "==> smoke test: kai env"
+env_home="$(PATH="$STAGE/bin:/usr/bin:/bin" "$STAGE/bin/kai" env KAIKAI_HOME 2>&1 || true)"
+if [ "$env_home" = "$STAGE" ]; then
+  echo "    kai env OK"
+else
+  echo "build-release.sh: smoke test failed (kai env printed '$env_home', expected '$STAGE')" >&2
   smoke_failed=1
 fi
 
