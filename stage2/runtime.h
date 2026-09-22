@@ -18271,9 +18271,16 @@ static void *kai_llvm_build_logical(void *b, int64_t op, void *a, void *c) {
     return op ? (void *) LLVMBuildAnd(bld, la, lc, "")
               : (void *) LLVMBuildOr(bld, la, lc, "");
 }
-/* Logical NOT of a raw `i1` (`!x`). */
+/* Logical NOT of a raw bool (`!x`), width-independent. The raw-Bool
+ * register is `i32` 0/1, not `i1`: a bitwise complement there yields
+ * `~1 == -2` — still truthy for every consumer. Compare against zero and
+ * re-widen so the result is the 0/1 a raw-Bool slot must hold. */
 static void *kai_llvm_build_lnot(void *b, void *a) {
-    return (void *) LLVMBuildNot((LLVMBuilderRef) b, (LLVMValueRef) a, "");
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a;
+    LLVMTypeRef ty = LLVMTypeOf(la);
+    LLVMValueRef z = LLVMBuildICmp(bld, LLVMIntEQ, la, LLVMConstNull(ty), "");
+    return (void *) LLVMBuildZExt(bld, z, ty, "");
 }
 /* Widen an `i1` (an `fcmp`/`icmp` result) to the `i32` a `kaix_bool` box
  * takes (its param is `i32` 0/1). Mirror of how the C-direct oracle's raw
