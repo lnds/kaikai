@@ -10841,7 +10841,9 @@ MODULAR_FIXTURES = ../examples/multi-module/main.kai \
                    ../examples/modules-qualified/two_modules/main.kai \
                    ../examples/shadowing/user_shadows_stdlib_list_fns.kai \
                    ../examples/shadowing/user_show_shadows_protocol_op.kai \
-                   ../examples/shadowing/user_shadows_and_qualified_coexist.kai
+                   ../examples/shadowing/user_shadows_and_qualified_coexist.kai \
+                   ../examples/shadowing/user_pub_fn_arity_diff_vs_core.kai \
+                   ../examples/shadowing/user_pub_fn_same_arity_shadows_core.kai
 test-modular-build: $(TARGET) build
 	@$(STACK) set -e; \
 	i=0; \
