@@ -56,7 +56,7 @@ TSAN_CFLAGS="-std=c11 -Wno-unused-function -Wno-unused-variable -g -O1 -fsanitiz
 # gets wrong when it cannot see a ucontext switch — TSAN's included, which is
 # why the runtime annotates every fiber switch for it.
 #
-# The last three cover the cross-thread memory invariant itself — the rule
+# The next three cover the cross-thread memory invariant itself — the rule
 # that makes non-atomic RC sound. Each targets one way a value used to stay
 # reachable from two threads: a message's scalar leaves (only the spine was
 # rebuilt), a terminated fiber's result handed to several awaiters at once,
@@ -64,12 +64,17 @@ TSAN_CFLAGS="-std=c11 -Wno-unused-function -Wno-unused-variable -g -O1 -fsanitiz
 # buckets, which a stdout diff cannot see unless the lost update happens to
 # land — TSAN reports them either way, which is why these live here and not
 # only in the effects tier.
+#
+# The last covers a mailbox's lifetime: senders on other threads read its Pid
+# while the owner closes it, and a send that slipped between the check and the
+# enqueue would write into freed memory.
 FIXTURES=(
   "examples/effects/mn_cross_thread_copy_stress.kai"
   "examples/effects/mn_deep_stack_migration.kai"
   "examples/effects/mn_cross_thread_scalar_share.kai"
   "examples/effects/mn_await_result_share.kai"
   "examples/effects/mn_str_intern_race.kai"
+  "examples/effects/mn_send_to_ended_mailbox_race.kai"
 )
 
 fail=0
