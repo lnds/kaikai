@@ -16,8 +16,10 @@ kaic0:
 kaic1: kaic0
 	$(MAKE) -C stage1 kaic1
 
+# The kai binary is built with kaic2 so no gate pays for it inside its own timeout.
 kaic2: kaic1
 	$(MAKE) -C stage2 kaic2
+	$(MAKE) -s -C tools/kai kai
 
 # Dev fast rebuild — an EXISTING kaic2 recompiles itself modularly
 # (no kaic1, no bundle). Deliberately not wired into the bootstrap
