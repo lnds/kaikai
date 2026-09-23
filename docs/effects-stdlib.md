@@ -1086,8 +1086,10 @@ effect Process {
   piped child is pclose-shaped: it closes surviving pipe ends
   before reaping. The `os.process` surface adds `pipe_to` (stdin
   only — the pager shape), `pipe_from` (stdout only — the capture
-  shape), and `read_all` (drain to EOF). All pipe IO blocks the OS
-  thread, not the fiber.
+  shape), and `read_all` (drain to EOF). `read_stdout` on an empty
+  pipe parks the fiber on read-readiness, so other fibers and their
+  timers keep running while a child stays silent. `write_stdin`
+  still blocks the OS thread while the pipe is full.
 - `wait` blocks until the child exits and returns its exit
   status. The fiber suspends via the scheduler's reactor
   (`pidfd_open` on Linux; SIGCHLD-driven on macOS / *BSD).

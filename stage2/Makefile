@@ -2633,8 +2633,9 @@ test-trap-exit-cancel-asan: $(TARGET) build
 # the other ASAN gates. The process_piped_* fixtures extend the
 # sweep over the stdio-pipe plumbing: pipe()/dup2 fd wiring, the
 # pid-keyed pipe table (malloc'd entries freed at wait), the
-# chunked read buffer, and the EPIPE dead-reader write path.
-PROCESS_BASIC_FIXTURES := process_basic process_piped_capture process_piped_pager process_piped_epipe process_piped_big
+# chunked read buffer, the EPIPE dead-reader write path, and the
+# read-readiness park of a reader whose child stays silent.
+PROCESS_BASIC_FIXTURES := process_basic process_piped_capture process_piped_pager process_piped_epipe process_piped_big process_read_stdout_timers
 
 test-process-basic-asan: $(TARGET) build
 	@set -e; \
