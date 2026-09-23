@@ -63,6 +63,7 @@ import compiler.perceus_plant_drop
 import compiler.perceus_tail_drop
 import compiler.consume_index
 import compiler.fn_index
+import compiler.borrow_view
 
 # ==================================================================
 # Downward glue mirrors (prc_ prefix) — copied verbatim from the
@@ -312,22 +313,24 @@ fn prc_raw_names_zip(params: [Param], mask: [Bool]) : [String] = match params {
 
 #[doc("Entry point: scope-aware Perceus RC pass over the post-mono [Decl] (dup at non-last uses, drop unused params at entry). Pipeline position monomorphise -> unbox -> perceus_pass -> tco -> emit.")]
 pub fn perceus_pass(decls: [Decl]) : [Decl] / Console =
-  perceus_pass_in(decls, st_build(decls, ""))
+  perceus_pass_in(decls, st_build(decls, ""), "")
 
-#[doc("`tab` is the program's symbol table, so registry identities match the ones the resolver stamped on call sites.")]
-pub fn perceus_pass_in(decls: [Decl], tab: SymTab) : [Decl] / Console {
+#[doc("`tab` is the program's symbol table, so registry identities match the ones the resolver stamped on call sites; `root` names the root file's module.")]
+pub fn perceus_pass_in(decls: [Decl], tab: SymTab, root: String) : [Decl] / Console {
 
   let fns = fnx_build(register_fn_decls_in(decls, tab))
   # Borrow inference pre-pass (Koka pre-Parc): per-fn borrowed param
   # positions, consumed by BOTH sides of the flip (callee wraps the
   # borrowed scrutinee in __perceus_borrow so emit_match skips its exit
   # decref; caller strips the __perceus_dup on args in borrowed slots).
-  let bmap0 = pcs_build_borrow_map(decls, [])
+  # Each body reads the view of its own module, where a bare callee name
+  # means the declaration the emitter links it to.
   # Read-only prims (array_get/array_length) join the borrow map so the
   # caller strips the container dup and the path counter charges 0 —
   # reusing the whole borrow pipeline. Seeded only where no user fn
   # shadows the name; the same entry gates the callee rename.
-  let bmap = pcs_seed_prim_borrows(pcs_user_fn_names(decls, []), bmap0)
+  let prim_bmap = pcs_seed_prim_borrows(pcs_user_fn_names(decls, []), [])
+  let views = pcs_build_borrow_views(decls, root, prim_bmap)
   # Consume-map (Koka Borrowed dual): per-fn CONSUMED param positions. A caller
   # may MOVE a binder into a consuming slot; a non-consuming slot (field-read
   # callee like regexp nb_add_transition) must keep the caller's ref.
@@ -338,12 +341,11 @@ pub fn perceus_pass_in(decls: [Decl], tab: SymTab) : [Decl] / Console {
   # it is dup'd at every use and the birth ref never reaches zero.
   let opaque_names = pcs_collect_opaque_names(decls, [])
   let opaque_ret_fns = pcs_collect_opaque_ret_fns(decls, opaque_names, [])
-  # `fn_names` and `prim_bmap` derive only from `fns` / `bmap`, both fixed for
-  # the whole pass: rebuilding them per decl is quadratic in the fn count.
+  # `fn_names` derives only from `fns`, fixed for the whole pass:
+  # rebuilding it per decl is quadratic in the fn count.
   let fn_names = pcs_efn_names(fns)
-  let prim_bmap = pcs_prim_only_bmap(bmap)
   let cap_tys = pcs_cap_type_names(decls)
-  map(decls, (d) => perceus_decl_b(d, fns, bmap, cmap, opaque_ret_fns, fn_names, prim_bmap, cap_tys))
+  map(decls, (d) => perceus_decl_b(d, fns, bv_for_decl(views, d), cmap, opaque_ret_fns, fn_names, prim_bmap, cap_tys))
 }
 
 # `extern "C" fn` names whose return type is an opaque handle.
@@ -363,8 +365,6 @@ fn pcs_ret_is_opaque(opt_ret: Option[TypeExpr], opaque_names: [String]) : Bool =
   None    -> false
 }
 
-pub type BorrowEntry = BwE(String, [Int])
-
 # Names of types declared `extern "C" opaque`, recovered from the
 # one-`__ffi_handle`-field records they lower to. Every boxed FFI input
 # is consumed (the shim decrefs each after the extern returns).
@@ -383,10 +383,17 @@ fn pcs_is_ffi_opaque_record(fields: [FieldDecl]) : Bool = match fields {
   _ -> false
 }
 
-#[doc("Interprocedural borrow map keyed by callee name plus borrowed parameter positions. Pub: the tco pre-pass consults it.")]
-pub fn pcs_build_borrow_map(decls: [Decl], acc: [BorrowEntry]) : [BorrowEntry] = match decls {
-  []           -> acc
-  [d, ...rest] -> pcs_build_borrow_map(rest, pcs_borrow_entry_of(d, acc))
+#[doc("Interprocedural borrow map, one view per calling module. Pub: the tco pre-pass consults it.")]
+pub fn pcs_build_borrow_views(decls: [Decl], root: String, seed: [BorrowEntry]) : BorrowViews =
+  bv_build(pcs_borrow_decls(decls, []), root, seed)
+
+fn pcs_borrow_decls(decls: [Decl], acc: [BorrowDecl]) : [BorrowDecl] = match decls {
+  []           -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DFn(is_pub, name, _, params, _, _, body, _, _, mo, _) ->
+      pcs_borrow_decls(rest, [BD(name, mo, pcs_borrowed_positions(is_pub, name, mo, params, body)), ...acc])
+    _ -> pcs_borrow_decls(rest, acc)
+  }
 }
 
 # Read-only runtime primitives that borrow their container. A closed
@@ -537,46 +544,15 @@ fn pcs_lbn_arms(arms: [Arm], acc: [String]) : [String] = match arms {
   }
 }
 
-# The borrow map restricted to the seeded read-only prims, for the
-# borrow-last detection (a user-fn borrow param must not be swept in).
-fn pcs_prim_only_bmap(bmap: [BorrowEntry]) : [BorrowEntry] = match bmap {
-  []           -> []
-  [e, ...rest] -> match e {
-    BwE(k, ps) ->
-      if (match pcs_prim_borrow_variant(k) { Some(_) -> true None -> false })
-      { [BwE(k, ps), ...pcs_prim_only_bmap(rest)] }
-      else { pcs_prim_only_bmap(rest) }
+# An FFI shim's body is a tag the inspection walk reads as "param never
+# referenced", which would mis-classify every param as borrowed and make
+# the caller strip the dup. The shim CONSUMES each input: it borrows none.
+fn pcs_borrowed_positions(is_pub: Bool, name: String, mo: Option[String], params: [Param], body: Expr) : [Int] =
+  if body_is_ffi_extern(body) { [] }
+  else {
+    let pnames = map(params, (p) => p.pname)
+    pcs_borrow_positions(pnames, pcs_borrow_params_hybrid(is_pub, pcs_borrow_key(name, mo), params, pnames, body), 0)
   }
-}
-
-fn pcs_borrow_entry_of(d: Decl, acc: [BorrowEntry]) : [BorrowEntry] = match d {
-  DFn(is_pub, name, _, params, _, _, body, _, _, mo, fsym) -> {
-    # An FFI shim's body is a tag the inspection walk reads as "param
-    # never referenced" — which it would mis-classify as borrowed,
-    # making the caller strip the dup. The shim CONSUMES each input, so
-    # it owns none: register no borrowed positions.
-    if body_is_ffi_extern(body) { acc }
-    else {
-      let pnames = map(params, (p) => p.pname)
-      let bset = pcs_borrow_params_hybrid(is_pub, pcs_borrow_key(name, mo), params, pnames, body)
-      match bset {
-        [] -> acc
-        _  -> {
-          let positions = pcs_borrow_positions(pnames, bset, 0)
-          # Register under BOTH the qualified key and the bare name, so
-          # a caller referencing the fn either way (EModCall(mod,name)
-          # or a bare EVar(name)) finds it.
-          let qual = [BwE(pcs_borrow_key(name, mo), positions), ...acc]
-          match mo {
-            None    -> qual
-            Some(_) -> [BwE(name, positions), ...qual]
-          }
-        }
-      }
-    }
-  }
-  _ -> acc
-}
 
 pub fn pcs_borrow_key(name: String, mo: Option[String]) : String = match mo {
   None    -> name
@@ -3156,8 +3132,8 @@ pub fn pcs_max_paths_in_expr(nm: String, e: Expr) : Int =
 # which inspects `l` without taking ownership. Without this, `l`'s use in
 # `is_red(l)` plus its use in `insert_loop(l)` sum to 2 on the same path →
 # the binder fails the `mp <= 1` skip check → a spurious dup keeps the
-# descent tree shared → the rb-tree spine leaks. `bmap` is the borrow map
-# built by pcs_build_borrow_map. The arg-position filter mirrors
+# descent tree shared → the rb-tree spine leaks. `bmap` is the calling
+# module's view of the borrow map. The arg-position filter mirrors
 # pcs_strip_borrow_args exactly.)
 fn pcs_max_paths_b_expr(nm: String, e: Expr, bmap: [BorrowEntry]) : Int =
   pcs_max_paths_b_kind(nm, e.kind, bmap)

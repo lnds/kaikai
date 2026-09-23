@@ -31,8 +31,12 @@ reuse lever.
 ## Prior art already in-tree
 
 Perceus already carries an interprocedural borrow map keyed by callee name +
-parameter position: `pcs_build_borrow_map` / `pcs_strip_borrow_args` /
-`BorrowEntry` in `stage2/compiler/perceus.kai`. Two producers feed it today:
+parameter position: `pcs_build_borrow_views` / `pcs_strip_borrow_args` in
+`stage2/compiler/perceus.kai`, with `BorrowEntry` and the per-module views in
+`stage2/compiler/borrow_view.kai`. Each body reads the view of its own module,
+so a bare callee name several modules declare resolves to the declaration the
+emitter links (own module, then the root file, then the first in program
+order). Two producers feed it today:
 
 - **Inference, ultra-conservative:** a parameter is borrowed only when the
   function's match arms bind *nothing* that is later read (the `is_red`
@@ -142,8 +146,9 @@ matter, not part of this surface.
 ## References
 
 - `docs/perceus-honesty-targets.md` — RC discipline tiers this extends.
-- `stage2/compiler/perceus.kai` — `BorrowEntry`, `pcs_build_borrow_map`,
+- `stage2/compiler/perceus.kai` — `pcs_build_borrow_views`,
   `pcs_strip_borrow_args`, the conservative `pcs_borrow_params` rule.
+- `stage2/compiler/borrow_view.kai` — `BorrowEntry` and the per-module views.
 - Koka source: `src/Core/Borrowed.hs`, `src/Backend/C/Parc.hs`
   (`parcBorrowApp`), `lib/std/core/vector.kk` / `list.kk` (`^` usage).
 - Issue #1120 — prim-level borrow (shipped); the measurement method
