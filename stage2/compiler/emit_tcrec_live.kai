@@ -14,10 +14,11 @@ released at the goto unless the goto path already consumed it.
 
 Consumption is judged syntactically over the post-perceus AST: a bare
 `EVar(name)` read transfers the binding's ref (Perceus discipline), a
-`__perceus_dup(name)` wrap does not. The scan is conservative — any
-mention that MIGHT consume (lambda capture, interpolation span, either
-branch of an already-evaluated conditional) counts as consumed, so a
-stale entry can only under-release (a bounded leak), never
+`__perceus_dup(name)` wrap does not, and neither does a lambda capture —
+building the closure increfs each capture. The scan is otherwise
+conservative — any mention that MIGHT consume (interpolation span,
+either branch of an already-evaluated conditional) counts as consumed,
+so a stale entry can only under-release (a bounded leak), never
 over-release (a double-free).
 """)]
 
@@ -115,51 +116,37 @@ fn tcl_args_consume(args: [Expr], nm: String) : Bool = match args {
 
 #[doc("""
 True when evaluating `e` consumes (or might consume) binder `nm`'s ref:
-a bare `EVar(nm)` read anywhere in `e`, any mention under a lambda or
-in an interpolation span. A `__perceus_dup(nm)` wrap alone does not
-consume. Shadowing inside `e` is ignored — that only biases toward
-"consumed", the safe direction.
+a bare `EVar(nm)` read anywhere in `e` outside a lambda body, or a
+mention in an interpolation span. A `__perceus_dup(nm)` wrap or a
+closure capture alone does not consume. Shadowing inside `e` is
+ignored — that only biases toward "consumed", the safe direction.
 """)]
-pub fn tcl_consumes(e: Expr, nm: String) : Bool = tcl_scan(e, nm, false)
-
-# `every_read` false = Perceus consume scan (dup wraps are transparent
-# reads, interp spans only count when they interpolate). true = capture
-# scan under a lambda: any appearance keeps the entry conservatively.
-# The descend rides `xp_positions`; a lambda body flips to the capture
-# scan at its `XLam` role.
-fn tcl_scan(e: Expr, nm: String, every_read: Bool) : Bool = match e.kind {
+pub fn tcl_consumes(e: Expr, nm: String) : Bool = match e.kind {
   EVar(n)       -> n == nm
-  ECall(f, xs)  -> tcl_scan_call(f, xs, nm, every_read)
-  EStr(span, _) -> tcl_scan_span(span, nm, every_read)
-  _             -> tcl_scan_ps(xp_positions(e), nm, every_read)
+  ECall(f, xs)  -> tcl_consumes_call(f, xs, nm)
+  EStr(span, _) -> has_interp(span, 0, string_length(span)) and tcl_span_mentions(span, nm)
+  _             -> tcl_consumes_ps(xp_positions(e), nm)
 }
 
-fn tcl_scan_ps(ps: [XPos], nm: String, ev: Bool) : Bool = match ps {
+fn tcl_consumes_ps(ps: [XPos], nm: String) : Bool = match ps {
   [] -> false
   [XP(r, c), ...rest] ->
-    tcl_scan(c, nm, match r { XLam -> true _ -> ev }) or tcl_scan_ps(rest, nm, ev)
+    (match r { XLam -> false _ -> tcl_consumes(c, nm) }) or tcl_consumes_ps(rest, nm)
 }
 
-# A dup wrap is a transparent read on the consume scan; a bare callee
-# read of the binder (a closure held in a local) consumes like any EVar.
-# A guard-fail drop is also transparent: it runs only on a guard's falsy
-# edge, which never shares a path with the body's goto — filtering its
-# binder here would starve the success-path goto release.
-fn tcl_scan_call(f: Expr, xs: [Expr], nm: String, ev: Bool) : Bool = match f.kind {
-  EVar(cn) ->
-    if cn == "__perceus_dup" and not ev { false }
-    else { cn == nm or tcl_scan_list(xs, nm, ev) }
-  EMark(MkGuardDrop) -> if ev { tcl_scan_list(xs, nm, ev) } else { false }
-  _ -> tcl_scan(f, nm, ev) or tcl_scan_list(xs, nm, ev)
+# A bare callee read of the binder (a closure held in a local) consumes
+# like any EVar. A guard-fail drop runs only on a guard's falsy edge,
+# which never shares a path with the body's goto — filtering its binder
+# here would starve the success-path goto release.
+fn tcl_consumes_call(f: Expr, xs: [Expr], nm: String) : Bool = match f.kind {
+  EVar(cn) -> if cn == "__perceus_dup" { false } else { cn == nm or tcl_consumes_list(xs, nm) }
+  EMark(MkGuardDrop) -> false
+  _ -> tcl_consumes(f, nm) or tcl_consumes_list(xs, nm)
 }
 
-fn tcl_scan_span(span: String, nm: String, ev: Bool) : Bool =
-  if ev or has_interp(span, 0, string_length(span)) { tcl_span_mentions(span, nm) }
-  else { false }
-
-fn tcl_scan_list(xs: [Expr], nm: String, ev: Bool) : Bool = match xs {
+fn tcl_consumes_list(xs: [Expr], nm: String) : Bool = match xs {
   [] -> false
-  [x, ...rest] -> tcl_scan(x, nm, ev) or tcl_scan_list(rest, nm, ev)
+  [x, ...rest] -> tcl_consumes(x, nm) or tcl_consumes_list(rest, nm)
 }
 
 # An interpolation span is raw source; a substring hit is the

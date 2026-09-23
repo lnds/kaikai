@@ -1287,6 +1287,8 @@ tier1-asan-b: kaic2
 	@echo "tier1-asan OK — a pattern binder captured by a lambda in a self tail call's arguments stays live on the C backend"
 	@$(MAKE) -C stage2 test-perceus-borrow-homonym-asan
 	@echo "tier1-asan OK — a bare callee homonymous across modules reads the calling module's borrow convention (no use-after-free)"
+	@$(MAKE) -C stage2 test-perceus-closure-capture-selftail-asan
+	@echo "tier1-asan OK — a closure-captured arm binder on a self-tail path is released after the args, not before"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,
