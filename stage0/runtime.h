@@ -5911,15 +5911,13 @@ static KaiValue *kai_core_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue 
 }
 
 static KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg) {
-    if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
+    if (!pid || pid->tag != KAI_PID) {
         fprintf(stderr, "kai: mailbox_send: argument is not a Pid\n");
         exit(1);
     }
-    /* m5.x flip Phase 3 closeout (issue #82): transfer the caller's
-     * `msg` ref directly into the mailbox (kai_mailbox_push takes
-     * ownership) and consume the `pid` ref. Pre-fix the helper did
-     * `kai_incref(msg)` then dropped the caller's ref on the floor. */
-    kai_mailbox_push(pid->as.mb, msg);
+    /* A send to an ended mailbox succeeds and the message is dropped. */
+    if (pid->as.mb) kai_mailbox_push(pid->as.mb, msg);
+    else            kai_decref(msg);
     kai_decref(pid);
     return kai_unit();
 }

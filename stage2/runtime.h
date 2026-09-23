@@ -124,7 +124,8 @@
  * them, so DCE drops the whole suspend-point closure they anchor (kai_sched_park,
  * the reactor, the trampoline), leaving nothing for the optimiser to mishoist.
  * The set is exactly the ops reachable from emitted code that transitively hit
- * swapcontext; a leaf op that slips in is caught by a build-time `nm` assert.
+ * swapcontext or the scheduler's thread-locals; a leaf op that slips in is
+ * caught by a build-time `nm` assert.
  * The axis is KAI_SEPARATE_COMPILATION (linkage), orthogonal to KAI_HOT_ONLY
  * (which governs the native bitcode's shim elision). */
 #if defined(KAI_SEPARATE_COMPILATION)
@@ -3110,7 +3111,7 @@ struct KaiFiber {
     int             trap_exit;
     /* Tier 2 — most-recently-allocated mailbox owned by this fiber.
      * Set by kai_mailbox_alloc[_bounded] and cleared by
-     * kai_mailbox_free. Read by kai_link_propagate_terminate when
+     * kai_mailbox_close. Read by kai_link_propagate_terminate when
      * trap_exit=1 to find a delivery target for the Exit string.
      * v1 simplification: nested with_mailbox is not tracked — the
      * inner allocation overwrites and the inner free clears the
@@ -3823,6 +3824,13 @@ struct KaiMailbox {
      * node under this lock and wakes the owner's scheduler thread. */
     pthread_mutex_t mu;
     int             mu_inited;
+    /* Set under `mu` when the owning scope ends; a push that sees it
+     * drops its message instead of enqueueing. */
+    int             closed;
+    /* The owning scope holds one pin and every in-flight send holds
+     * one, so a sender never touches a freed struct: the last unpin
+     * frees it. */
+    _Atomic int     pins;
 };
 
 /* Phase 5 — intrusive linked-peer chain on KaiFiber. A bidirectional
@@ -3954,70 +3962,39 @@ static void kai_mailbox_init_mu(KaiMailbox *mb) {
 static inline void kai_mbox_lock(KaiMailbox *mb)   { if (mb->mu_inited) pthread_mutex_lock(&mb->mu); }
 static inline void kai_mbox_unlock(KaiMailbox *mb) { if (mb->mu_inited) pthread_mutex_unlock(&mb->mu); }
 
-static KaiMailbox *kai_mailbox_alloc(void) {
+/* An owned mailbox is stamped onto the allocating fiber (with_mailbox:
+ * that fiber IS the actor) so link/monitor/trap-exit find it without a
+ * registry. An unowned one leaves the caller's `mailbox` slot untouched —
+ * spawn_actor wires it to the spawned fiber instead, and stamping the
+ * parent would corrupt its own lookups whenever it already owns one. */
+static KaiMailbox *kai_mailbox_new(int cap, int overflow, int owned) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
     if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     kai_mailbox_init_mu(mb);
-    /* default policy: unbounded — matches m8 #7 behaviour. */
-    mb->cap          = 0;
-    mb->overflow     = KAI_OVERFLOW_UNBOUNDED;
-    /* Phase 5: associate the mailbox with the allocating fiber. v1
-     * actor surface (with_mailbox) is the only path to mailbox_alloc,
-     * and the allocating fiber IS the actor; spawn_actor uses
-     * kai_mailbox_alloc_unowned + kai_mailbox_assign_owner to point
-     * at the spawned fiber instead of the parent. */
-    mb->owner_fiber  = kai_current_fiber();
-    /* Tier 2 trap-exit: stamp the mailbox onto its owner fiber so
-     * kai_link_propagate_terminate can locate it without a global
-     * registry. Nested allocs overwrite; kai_mailbox_free clears. */
-    if (mb->owner_fiber) mb->owner_fiber->mailbox = mb;
+    mb->cap      = cap;
+    mb->overflow = overflow;
+    atomic_init(&mb->pins, 1);
+    if (owned) {
+        mb->owner_fiber = kai_current_fiber();
+        if (mb->owner_fiber) mb->owner_fiber->mailbox = mb;
+    }
     return mb;
 }
 
-/* Tier 2 spawn_actor — variant of kai_mailbox_alloc that does NOT
- * stamp owner_fiber. Used by stdlib's `spawn_actor` so the
- * mailbox's owner can be reassigned to the spawned fiber via
- * kai_mailbox_assign_owner before the spawned body runs. The
- * `mailbox` slot on the parent fiber is left untouched too —
- * spawn_actor's mailbox does not belong to the parent. */
+static KaiMailbox *kai_mailbox_alloc(void) {
+    return kai_mailbox_new(0, KAI_OVERFLOW_UNBOUNDED, 1);
+}
+
 static KaiMailbox *kai_mailbox_alloc_unowned(void) {
-    KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
-    if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
-    kai_mailbox_init_mu(mb);
-    mb->cap         = 0;
-    mb->overflow    = KAI_OVERFLOW_UNBOUNDED;
-    mb->owner_fiber = NULL;  /* set later by kai_mailbox_assign_owner */
-    return mb;
+    return kai_mailbox_new(0, KAI_OVERFLOW_UNBOUNDED, 0);
 }
 
 static KaiMailbox *kai_mailbox_alloc_bounded(int cap, int overflow) {
-    KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
-    if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
-    kai_mailbox_init_mu(mb);
-    /* Phase 4: BlockSender now supported via the per-mailbox sender
-     * waiter queue + cooperative parking on full push. */
-    mb->cap          = cap;
-    mb->overflow     = overflow;
-    mb->owner_fiber  = kai_current_fiber();
-    if (mb->owner_fiber) mb->owner_fiber->mailbox = mb;
-    return mb;
+    return kai_mailbox_new(cap, overflow, 1);
 }
 
-/* Issue #763 spawn_actor_policy — bounded counterpart of
- * kai_mailbox_alloc_unowned. No owner stamp and the parent fiber's
- * `mailbox` slot stays untouched; ownership is wired to the spawned
- * fiber afterwards via kai_mailbox_assign_owner. Routing through
- * kai_mailbox_alloc_bounded instead would overwrite the parent's
- * `mailbox` slot, corrupting its monitor / link / trap-exit lookups
- * whenever the parent already owns a mailbox. */
 static KaiMailbox *kai_mailbox_alloc_bounded_unowned(int cap, int overflow) {
-    KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
-    if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
-    kai_mailbox_init_mu(mb);
-    mb->cap         = cap;
-    mb->overflow    = overflow;
-    mb->owner_fiber = NULL;  /* set later by kai_mailbox_assign_owner */
-    return mb;
+    return kai_mailbox_new(cap, overflow, 0);
 }
 
 /* Phase 4 helper: link a fiber into a waiter chain at the tail. */
@@ -4118,10 +4095,11 @@ static int kai_mailbox_waiter_remove(KaiFiber **head, KaiFiber **tail, KaiFiber 
  * lost. The loop re-checks because another sender can take the slot between
  * our wake and our resume.
  *
- * Caller must NOT hold the mailbox lock. Returns holding it, with room in the
- * mailbox — the caller enqueues under that same acquisition, so two senders
- * racing on the last slot cannot both pass the check and overshoot `cap`. */
-static void kai_mailbox_await_slot(KaiMailbox *mb) {
+ * Caller must NOT hold the mailbox lock. Returns holding it: 1 with room in
+ * the mailbox — the caller enqueues under that same acquisition, so two
+ * senders racing on the last slot cannot both pass the check and overshoot
+ * `cap` — or 0 once the mailbox is closed. */
+static int kai_mailbox_await_slot(KaiMailbox *mb) {
     for (;;) {
         KaiFiber *me = kai_current_fiber();
         kai_mbox_lock(mb);
@@ -4129,7 +4107,8 @@ static void kai_mailbox_await_slot(KaiMailbox *mb) {
          * re-enqueue below never double-links the chain. */
         kai_mailbox_waiter_remove(&mb->send_waiter_head,
                                   &mb->send_waiter_tail, me);
-        if (mb->len < mb->cap) return;   /* lock stays held */
+        if (mb->closed) return 0;
+        if (mb->len < mb->cap) return 1;
         kai_mailbox_waiter_enqueue(&mb->send_waiter_head,
                                    &mb->send_waiter_tail, me);
         kai_mbox_unlock(mb);
@@ -4137,32 +4116,39 @@ static void kai_mailbox_await_slot(KaiMailbox *mb) {
     }
 }
 
-/* Enforce the overflow policy on a full mailbox and return holding the lock,
- * or 0 if the message was dropped by policy (lock released, msg consumed).
- * Shared by both push paths so a policy cannot mean two different things
- * depending on which thread the receiver landed on. */
-static int kai_mailbox_reserve_slot(KaiMailbox *mb, KaiValue *msg) {
-    if (mb->cap > 0 && mb->overflow == KAI_OVERFLOW_BLOCK_SENDER) {
-        kai_mailbox_await_slot(mb);
-        return 1;
-    }
-    kai_mbox_lock(mb);
-    if (mb->cap > 0 && mb->len >= mb->cap) {
-        if (mb->overflow == KAI_OVERFLOW_DROP_NEWEST) {
-            kai_mbox_unlock(mb);
-            kai_decref(msg);
-            return 0;
-        }
-        if (mb->overflow == KAI_OVERFLOW_DROP_OLDEST) {
-            KaiMboxNode *old = mb->head;
-            mb->head = old->next;
-            if (!mb->head) { mb->tail = NULL; }
-            kai_decref(old->msg);
-            free(old);
-            mb->len--;
-        }
+/* Apply a drop policy to a full mailbox, under its lock. Returns 0 when the
+ * incoming message is the one to drop. */
+static int kai_mailbox_make_room(KaiMailbox *mb) {
+    if (mb->cap == 0 || mb->len < mb->cap) return 1;
+    if (mb->overflow == KAI_OVERFLOW_DROP_NEWEST) return 0;
+    if (mb->overflow == KAI_OVERFLOW_DROP_OLDEST) {
+        KaiMboxNode *old = mb->head;
+        mb->head = old->next;
+        if (!mb->head) mb->tail = NULL;
+        kai_decref(old->msg);
+        free(old);
+        mb->len--;
     }
     return 1;
+}
+
+/* Enforce the overflow policy and return holding the lock, or 0 if the
+ * message was dropped — by policy or because the mailbox is closed (lock
+ * released, msg consumed). Shared by both push paths so a policy cannot mean
+ * two different things depending on which thread the receiver landed on. */
+static int kai_mailbox_reserve_slot(KaiMailbox *mb, KaiValue *msg) {
+    int room;
+    if (mb->cap > 0 && mb->overflow == KAI_OVERFLOW_BLOCK_SENDER) {
+        room = kai_mailbox_await_slot(mb);
+    } else {
+        kai_mbox_lock(mb);
+        room = !mb->closed && kai_mailbox_make_room(mb);
+    }
+    if (!room) {
+        kai_mbox_unlock(mb);
+        kai_decref(msg);
+    }
+    return room;
 }
 
 static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
@@ -4329,24 +4315,78 @@ static KaiValue *kai_mailbox_pop_timeout(KaiMailbox *mb, uint64_t timeout_nanos)
     }
 }
 
-static void kai_mailbox_free(KaiMailbox *mb) {
-    if (!mb) return;
-    /* Tier 2 trap-exit: drop the back-pointer if the owner fiber
-     * still has us as its current mailbox. Nested with_mailbox: the
-     * inner free clears the slot even though the outer mailbox is
-     * still alive — accepted v1 limitation. */
+static void kai_mailbox_unpin(KaiMailbox *mb) {
+    if (atomic_fetch_sub_explicit(&mb->pins, 1, memory_order_acq_rel) != 1) return;
+    if (mb->mu_inited) pthread_mutex_destroy(&mb->mu);
+    free(mb);
+}
+
+/* End the owning scope: queued messages are released on the owner's thread,
+ * later pushes drop theirs, and senders parked on a full BlockSender mailbox
+ * are woken to observe the close instead of waiting forever. */
+static void kai_mailbox_close(KaiMailbox *mb) {
+    /* Nested with_mailbox: the inner close clears the slot even though the
+     * outer mailbox is still alive. */
     if (mb->owner_fiber && mb->owner_fiber->mailbox == mb) {
         mb->owner_fiber->mailbox = NULL;
     }
+    kai_mbox_lock(mb);
+    mb->closed = 1;
     KaiMboxNode *node = mb->head;
+    mb->head = mb->tail = NULL;
+    mb->len = 0;
+    kai_mbox_unlock(mb);
     while (node) {
         KaiMboxNode *next = node->next;
         kai_decref(node->msg);
         free(node);
         node = next;
     }
-    if (mb->mu_inited) pthread_mutex_destroy(&mb->mu);
-    free(mb);
+    for (;;) {
+        kai_mbox_lock(mb);
+        KaiFiber *sw = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
+                                                  &mb->send_waiter_tail);
+        kai_mbox_unlock(mb);
+        if (!sw) break;
+        kai_sched_unpark(sw);
+    }
+    kai_mailbox_unpin(mb);
+}
+
+/* A mailbox has exactly one Pid box, immortal and shared by every handle
+ * (copies across threads incref it), and closing nulls its `as.mb`. So a
+ * NULL there means "ended" and no handle can point at a freed mailbox. Under
+ * M:N the stripe lock orders a sender's read-and-pin against the owner's
+ * null, closing the window where the mailbox could be released between the
+ * two. */
+#define KAI_PID_STRIPES 64
+#if defined(KAI_SEPARATE_COMPILATION)
+extern _Atomic int kai_pid_stripe[KAI_PID_STRIPES];
+#  if defined(KAI_RUNTIME_OWNER)
+_Atomic int kai_pid_stripe[KAI_PID_STRIPES];
+#  endif
+#else
+static _Atomic int kai_pid_stripe[KAI_PID_STRIPES];
+#endif
+
+static _Atomic int *kai_pid_stripe_lock(KaiValue *pid) {
+    if (kai_nthreads <= 1) return NULL;
+    _Atomic int *s = &kai_pid_stripe[((uintptr_t) pid >> 4) % KAI_PID_STRIPES];
+    while (atomic_exchange_explicit(s, 1, memory_order_acquire)) { }
+    return s;
+}
+
+static void kai_pid_stripe_unlock(_Atomic int *s) {
+    if (s) atomic_store_explicit(s, 0, memory_order_release);
+}
+
+/* Returns the Pid's mailbox pinned for one send, or NULL once it has ended. */
+static KaiMailbox *kai_mailbox_pin(KaiValue *pid) {
+    _Atomic int *s = kai_pid_stripe_lock(pid);
+    KaiMailbox *mb = pid->as.mb;
+    if (mb) atomic_fetch_add_explicit(&mb->pins, 1, memory_order_relaxed);
+    kai_pid_stripe_unlock(s);
+    return mb;
 }
 
 /* m8 #7: wrap a borrowed mailbox pointer as a KAI_PID value. The
@@ -8980,43 +9020,28 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg)
 ;
 #else
 {
-    if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
+    if (!pid || pid->tag != KAI_PID) {
         fprintf(stderr, "kai: mailbox_send: argument is not a Pid\n");
         exit(1);
     }
-    KaiMailbox *mb = pid->as.mb;
-    /* M:N — a message must not leave this fiber's non-atomic-RC heap
-     * reachable from a second scheduler thread. Deep-copy it into a
-     * single-owner tree (rc=1) and enqueue the copy under the mailbox
-     * lock; the receiver adopts it and later frees it on its own thread.
-     *
-     * The copy is unconditional at N>1 rather than gated on "is the
-     * receiver on another thread right now?", because no point-in-time
-     * answer to that question is sound:
-     *   - the receiver's `home_thread` can change the instant after it is
-     *     read — a thief retargets it under the VICTIM's slot lock
-     *     (kai_sched_steal_from), which a sender holding no lock at all
-     *     does not exclude; and
-     *   - even a decision that is right when it is made does not stay
-     *     right. Whenever Perceus dup'd the value across the send, the
-     *     sender keeps its own reference, so a same-thread pointer
-     *     transfer leaves one object owned by two fibers. Stealing then
-     *     moves one of them to another thread and the rc is shared across
-     *     threads after the fact.
-     * So the fast path cannot be rescued by locking the read; only by not
-     * taking it. This matches the unconditional thunk copy on the spawn
-     * path and the BEAM's copy-on-send. At N=1 no worker thread exists and
-     * the pointer transfer (issue #82 callee-consumes) is unchanged. */
-    if (kai_nthreads > 1) {
+    /* A send to an ended mailbox succeeds and the message is dropped: the
+     * sender cannot know whether the receiver is still alive. */
+    KaiMailbox *mb = kai_mailbox_pin(pid);
+    if (!mb) {
+        kai_decref(msg);
+    } else if (kai_nthreads > 1) {
+        /* Copy unconditionally: no point-in-time "same thread?" answer is
+         * sound, since a thief can retarget the receiver's home thread
+         * under a lock the sender does not hold, and a Perceus dup across
+         * the send leaves the sender its own reference to a value stealing
+         * would later share across threads. */
         KaiValue *copy = kai_deep_copy_cross(msg);
         kai_decref(msg);
         kai_mailbox_push_cross_thread(mb, copy);
     } else {
-        /* m5.x flip Phase 3 closeout (issue #82): transfer the caller's
-         * `msg` ref directly into the mailbox (kai_mailbox_push takes
-         * ownership) and consume the `pid` ref. */
         kai_mailbox_push(mb, msg);
     }
+    if (mb) kai_mailbox_unpin(mb);
     kai_decref(pid);
     return kai_unit();
 }
@@ -9065,17 +9090,25 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_recv_timeout(KaiValue *pid, KaiValue *ti
 }
 #endif
 
-/* Free the mailbox attached to a Pid. Called by `with_mailbox` when
- * the scope exits; the Pid value itself is RC-managed independently. */
-static KaiValue *kai_core_mailbox_free(KaiValue *pid) {
-    if (pid && pid->tag == KAI_PID && pid->as.mb) {
-        kai_mailbox_free(pid->as.mb);
+/* Close the mailbox attached to a Pid when its `with_mailbox` /
+ * `spawn_actor` scope exits; the Pid value itself is RC-managed
+ * independently and reads as ended from then on. */
+KAI_SCHED_FN KaiValue *kai_core_mailbox_free(KaiValue *pid)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    if (pid && pid->tag == KAI_PID) {
+        _Atomic int *s = kai_pid_stripe_lock(pid);
+        KaiMailbox *mb = pid->as.mb;
         pid->as.mb = NULL;
+        kai_pid_stripe_unlock(s);
+        if (mb) kai_mailbox_close(mb);
     }
-    /* m5.x flip Phase 3 closeout (issue #82): consume input ref. */
     if (pid) kai_decref(pid);
     return kai_unit();
 }
+#endif
 
 /* ---------- core: file io ---------- */
 

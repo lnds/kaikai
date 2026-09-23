@@ -62,7 +62,12 @@ effect Actor[Msg] {
   the receiving mailbox's overflow policy (see §*Mailbox
   policies* below). The blocking case (`BlockSender`) is a
   yield point for the sender, so a blocked sender can itself
-  receive `Cancel.raise()`.
+  receive `Cancel.raise()`. A send to an actor that has ended
+  succeeds and the message is dropped, as on the BEAM: the
+  sender cannot observe the receiver's liveness through `send`
+  (use `Monitor` for that). A sender parked on a full
+  `BlockSender` mailbox resumes when the receiver ends, and its
+  message is dropped.
 - `receive()` — remove and return the next message from the
   current actor's mailbox. Blocks the fiber until a message
   arrives. Carries `Cancel` in its row because a blocked
@@ -99,7 +104,7 @@ type ServerMsg =
 ```kai
 # Pid is opaque, compiler-synthesised.
 # Construction: returned by `spawn_actor` / `self`.
-# Elimination: `Spawn.send(pid, msg)` and supervision ops.
+# Elimination: `Actor.send(pid, msg)` and supervision ops.
 ```
 
 `Pid[Msg]` is a region-branded handle (same mechanism as
@@ -107,6 +112,14 @@ type ServerMsg =
 system*). It cannot escape the nursery that created the actor
 — the region check prevents storing a `Pid[Msg]` in a data
 structure that outlives the nursery.
+
+> **v1 status (2026-09-23):** no region check confines a
+> `Pid[Msg]` today. A pid can outlive its mailbox's scope — for
+> instance captured by a `spawn_actor` child that outlives the
+> parent's `with_mailbox` — and a send through it is the no-op
+> described under `send` above. The runtime keeps one handle per
+> mailbox and clears it when the scope ends, so a stale pid reads
+> as ended and never reaches a freed or reused mailbox.
 
 Two pids are equal if and only if they refer to the same
 actor instance. Equality is intentional: supervision,

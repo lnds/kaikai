@@ -19,6 +19,9 @@ can be set per actor — `BlockSender` parks the sender on a full
 mailbox (backpressure). `receive()` is selective: future
 `receive_match { }` selects on pattern (deferred to Orongo).
 
+A `send` to an actor that has ended succeeds and the message is
+dropped, as on the BEAM; use `Monitor` to learn that a peer is gone.
+
 ## Example
 
 ```kaikai
