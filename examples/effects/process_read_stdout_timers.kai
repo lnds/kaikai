@@ -1,0 +1,67 @@
+# A fiber waiting in `read_stdout` on a silent child must not stall the
+# scheduler: the parent's 300 ms receive_timeout fires long before the
+# child's 10 s sleep ends. Killing the child then EOFs the reader.
+import actor
+import time
+import os.process as proc
+
+type Msg = Chunk(String) | Eof
+
+fn reader(child: Child, parent: Pid[Msg]) : Unit / Process + Actor[Msg] =
+  match proc.read_stdout(child) {
+    Ok(s) ->
+      if string_length(s) == 0 { Actor.send(parent, Eof) } else { Actor.send(parent, Chunk(s)) }
+    Err(_) -> Actor.send(parent, Eof)
+  }
+
+fn reap(child: Child) : Unit / Process {
+  let _k = proc.kill(child, 9)
+  let _w = proc.wait(child)
+  ()
+}
+
+fn after_timeout(child: Child, ms: Int) : Int / Process + Actor[Msg] + Stdout {
+  let _k = proc.kill(child, 9)
+  let tail = Actor.receive()
+  let _w = proc.wait(child)
+  if ms >= 3000 {
+    Stdout.print("timeout late: #{ms}ms")
+    1
+  } else {
+    match tail {
+      Eof -> {
+        Stdout.print("timeout fired while the reader waited")
+        Stdout.print("reader saw EOF after kill")
+        0
+      }
+      Chunk(s) -> {
+        Stdout.print("unexpected output: #{s}")
+        1
+      }
+    }
+  }
+}
+
+fn main() : Int / Process + Spawn + Clock + Stdout = with_mailbox {
+  match proc.pipe_from("/bin/sleep", ["10"]) {
+    Err(e) -> {
+      Stdout.print("start FAIL: #{e}")
+      1
+    }
+    Ok(child) -> {
+      let me = Actor.self()
+      let t0 = monotonic()
+      let _r = spawn_actor(() => reader(child, me))
+      let got = receive_timeout(millis(300))
+      let ms = duration_to_nanos(elapsed_since(t0, monotonic())) / 1_000_000
+      match got {
+        None -> after_timeout(child, ms)
+        Some(_) -> {
+          reap(child)
+          Stdout.print("read returned first after #{ms}ms")
+          1
+        }
+      }
+    }
+  }
+}

@@ -13391,6 +13391,7 @@ static KaiValue *kai_default_process_start_piped(void *self, KaiValue *cmd, KaiV
         close(out_p[1]);
         rd = out_p[0];
         fcntl(rd, F_SETFD, FD_CLOEXEC);
+        fcntl(rd, F_SETFL, fcntl(rd, F_GETFL) | O_NONBLOCK);
     }
     _kai_proc_pipe_add((int) pid, wr, rd);
     return _kai_process_ok(k, _kai_process_make_child((int) pid));
@@ -13427,25 +13428,41 @@ static KaiValue *kai_default_process_close_stdin(void *self, KaiValue *child, Ka
     return _kai_process_ok(k, kai_unit());
 }
 
-/* read_stdout(c) -> Result[String, String]. One blocking read of up
- * to 64 KiB; Ok("") is EOF. Reading chunk-by-chunk (rather than one
- * read-to-end op) is what lets a caller drain output larger than the
- * OS pipe capacity without deadlocking the child. Blocks the OS
- * thread, not the fiber. */
-static KaiValue *kai_default_process_read_stdout(void *self, KaiValue *child, KaiCont *k) {
+/* read_stdout(c) -> Result[String, String]. One read of up to 64 KiB;
+ * Ok("") is EOF. Reading chunk-by-chunk (rather than one read-to-end
+ * op) is what lets a caller drain output larger than the OS pipe
+ * capacity without deadlocking the child. The read end is O_NONBLOCK:
+ * an empty pipe parks the fiber on read-readiness, never the thread.
+ * The fd is looked up again after each park: a concurrent `wait` may
+ * have closed it, and its number reused by an unrelated file. */
+KAI_SCHED_FN KaiValue *kai_default_process_read_stdout(void *self, KaiValue *child, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     int pid = _kai_process_record_pid(child);
     int fd  = pid > 0 ? _kai_proc_pipe_fd(pid, 1) : -1;
     if (fd < 0) {
         return _kai_process_err_msg(k, "read_stdout: stdout is not piped");
     }
+    kai_reactor_init();
     enum { KAI_PROC_READ_CHUNK = 65536 };
     char *buf = (char *) malloc(KAI_PROC_READ_CHUNK);
     if (!buf) { fputs("kai: out of memory\n", stderr); exit(1); }
     ssize_t n;
-    do {
+    for (;;) {
         n = read(fd, buf, KAI_PROC_READ_CHUNK);
-    } while (n < 0 && errno == EINTR);
+        if (n >= 0) break;
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+        kai_reactor_park_socket_read(kai_current_fiber(), fd);
+        fd = _kai_proc_pipe_fd(pid, 1);
+        if (fd < 0) {
+            free(buf);
+            return _kai_process_err_msg(k, "read_stdout: stdout was closed");
+        }
+    }
     if (n < 0) {
         int e = errno;
         free(buf);
@@ -13455,6 +13472,7 @@ static KaiValue *kai_default_process_read_stdout(void *self, KaiValue *child, Ka
     free(buf);
     return _kai_process_ok(k, s);
 }
+#endif
 
 /* =================================================================
  * Log effect — issue #141. Tier S2 #7 of `docs/stdlib-roadmap.md`.
