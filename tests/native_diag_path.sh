@@ -1,7 +1,7 @@
 #!/bin/sh
 # Diagnostics on the native build paths, end to end.
 #
-# `bin/kai` compiles a COPY of the entry file on both native paths (the
+# `kai` compiles a COPY of the entry file on both native paths (the
 # whole-program copy under $tmp, the native-modular copy under the
 # content-addressed cache dir), because kaic2 derives the object path and
 # the cache keys from the path it is handed. Left uncorrected, every
@@ -10,7 +10,8 @@
 # C path never copies and has always named the real file.
 #
 # Two things are pinned:
-#   1. the rendered path is the user's file, on both native paths;
+#   1. the rendered path is the user's file, on both native paths, from a
+#      project directory whose name carries `.`, `*`, `[`, `&` and `\`;
 #   2. a compile error on the native-modular path is reported ONCE — the
 #      fallback to whole-program used to recompile the same source and
 #      print every diagnostic a second time.
@@ -19,9 +20,8 @@
 # tests/watch_survives_error.sh.
 #
 # This needs a kaic2 with libLLVM. Where the native backend is absent
-# `bin/kai` degrades to C, which was never affected, so the run reports
-# SKIP rather than a hollow pass. The substitution itself is gated
-# backend-independently by tests/diag_path_rewrite.sh.
+# `kai` degrades to C, which was never affected, so the run reports SKIP
+# rather than a hollow pass.
 
 set -eu
 
@@ -30,7 +30,7 @@ KAI="$ROOT/bin/kai"
 FX="$ROOT/examples/modules/issue-1881-native-diag-path"
 
 work="$(mktemp -d)"
-proj="$work/proj"
+proj="$work/p.d*[x]&a\\b"
 trap 'rm -rf "$work"' EXIT INT TERM
 
 fail=0
