@@ -9,8 +9,9 @@
 #      graceful message, never a raw curl 403;
 #   3. report a network failure and a no-tag response distinctly.
 #
-# It drives the live `upgrade_latest_tag` extracted from bin/kai with a
-# curl stub serving local fixtures — no network, no GitHub Release.
+# It drives the live `upgrade_latest_tag` extracted from the kai-upgrade
+# plugin with a curl stub serving local fixtures — no network, no GitHub
+# Release.
 
 set -eu
 
@@ -22,11 +23,11 @@ fail() { echo "test-upgrade-resolver: FAIL: $1" >&2; exit 1; }
 work="$(mktemp -d "${TMPDIR:-/tmp}/kai-upgrade-test.XXXXXX")"
 trap 'rm -rf "$work"' EXIT INT TERM
 
-# Extract the live resolver from bin/kai so we test the shipped code.
+# Extract the live resolver from the plugin so we test the shipped code.
 awk '/^upgrade_latest_tag\(\) \{/{f=1} f{print} f&&/^\}/{exit}' \
-  "$ROOT/bin/kai" > "$work/resolver.sh"
+  "$ROOT/tools/kai/plugins/kai-upgrade" > "$work/resolver.sh"
 grep -q 'upgrade_latest_tag' "$work/resolver.sh" \
-  || fail "could not extract upgrade_latest_tag from bin/kai"
+  || fail "could not extract upgrade_latest_tag from tools/kai/plugins/kai-upgrade"
 
 # curl stub: writes $FIXTURE_HDR to the -D file and $FIXTURE_BODY to
 # stdout, and exits $FIXTURE_RC. Mimics the flags the resolver passes.
@@ -101,11 +102,11 @@ run_case "no v-tag in response → notag" "" "notag"
 # standing in for the site so the whole thing runs offline.
 
 awk '/^upgrade_manifest_entry\(\) \{/{f=1} f{print} f&&/^\}/{exit}' \
-  "$ROOT/bin/kai" > "$work/manifest.sh"
+  "$ROOT/tools/kai/plugins/kai-upgrade" > "$work/manifest.sh"
 grep -q 'upgrade_manifest_entry' "$work/manifest.sh" \
-  || fail "could not extract upgrade_manifest_entry from bin/kai"
+  || fail "could not extract upgrade_manifest_entry from tools/kai/plugins/kai-upgrade"
 awk '/^upgrade_dist_base\(\) \{/{f=1} f{print} f&&/^\}/{exit}' \
-  "$ROOT/bin/kai" >> "$work/manifest.sh"
+  "$ROOT/tools/kai/plugins/kai-upgrade" >> "$work/manifest.sh"
 # shellcheck disable=SC1090
 . "$work/manifest.sh"
 
@@ -167,7 +168,7 @@ echo "test-upgrade-resolver: ok — generator rejects a malformed tag"
 # ---- #1569: a failed resolve must not exit 0 ---------------------------
 # `tag="$(fn)"` under `set -e` terminates the shell at the assignment, so
 # the error branches below it are dead code and the user sees silence.
-grep -q 'tag="$(upgrade_latest_tag)" || true' "$ROOT/bin/kai" \
+grep -q 'tag="$(upgrade_latest_tag)" || true' "$ROOT/tools/kai/plugins/kai-upgrade" \
   || fail "bin/kai must split the tag assignment from its failure test (#1569)"
 echo "test-upgrade-resolver: ok — bin/kai survives a failing resolve"
 

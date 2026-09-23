@@ -75,11 +75,13 @@ $ kai env KAI_STDLIB             # just the value, one per name
 ```
 
 A command `kai` does not know runs as a plugin, the git/cargo model:
-`kai foo a b` executes the first executable `kai-foo` on `PATH` with
-`a b`, the three variables above already exported, and exits with its
-status. A plugin run directly recovers the same values with `kai env`.
-A plugin never shadows a built-in command; with no `kai-foo` on `PATH`,
-`kai foo` reports the unknown command.
+`kai foo a b` executes `kai-foo` with `a b`, the three variables above
+already exported, and exits with its status. The plugins the toolchain
+ships (`libexec/kaikai/plugins/`, `kai upgrade` among them) come first,
+then the first executable `kai-foo` on `PATH`. A plugin run directly
+recovers the same values with `kai env`. A plugin never shadows a
+built-in command; with no `kai-foo` found, `kai foo` reports the unknown
+command.
 
 ## Build profiles
 

@@ -65,7 +65,7 @@ echo "==> building kaikai $VERSION for $OS-$ARCH"
 # Wipe any prior staging tree (clean slate per run).
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" \
-         "$STAGE/libexec/kaikai" \
+         "$STAGE/libexec/kaikai/plugins" \
          "$STAGE/share/kaikai/stdlib" \
          "$STAGE/share/kaikai/include" \
          "$STAGE/share/kaikai/demos" \
@@ -152,6 +152,8 @@ cp tools/kai-lsp/kai-lsp "$STAGE/libexec/kaikai/kai-lsp"
 chmod +x               "$STAGE/libexec/kaikai/kai-lsp"
 cp tools/kai/kai       "$STAGE/libexec/kaikai/kai"
 chmod +x               "$STAGE/libexec/kaikai/kai"
+cp tools/kai/plugins/kai-upgrade "$STAGE/libexec/kaikai/plugins/kai-upgrade"
+chmod +x               "$STAGE/libexec/kaikai/plugins/kai-upgrade"
 
 # Stdlib: copy the whole tree preserving structure.
 (cd stdlib && tar -cf - .) | (cd "$STAGE/share/kaikai/stdlib" && tar -xf -)
