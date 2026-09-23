@@ -1048,11 +1048,12 @@ effect Process {
   wait(c: Child)                      : Result[Exit, String]
   kill(c: Child, sig: Signal)         : Result[Unit, String]
   exit(code: Int)                     : Nothing
-  start_piped(cmd: String, args: [String],
-              pipe_stdin: Bool, pipe_stdout: Bool) : Result[Child, String]
+  start_piped(cmd: String, args: [String], pipe_stdin: Bool,
+              pipe_stdout: Bool, pipe_stderr: Bool) : Result[Child, String]
   write_stdin(c: Child, data: String) : Result[Unit, String]
   close_stdin(c: Child)               : Result[Unit, String]
   read_stdout(c: Child)               : Result[String, String]
+  read_stderr(c: Child)               : Result[String, String]
 }
 ```
 
@@ -1074,7 +1075,7 @@ effect Process {
   effect (kaikai fibers); see §*Why `Process` and not `Spawn`*.
   Standard fds (stdin/stdout/stderr) inherit from the parent
   unless the child is started via `start_piped`, which attaches a
-  pipe to the child's stdin and/or stdout (stderr always inherits).
+  pipe to any of the child's stdin, stdout and stderr.
 - `start_piped` is the popen-shaped redirection family.
   `write_stdin` writes every byte or reports the OS error — a
   reader that already died surfaces as `Err("Broken pipe")`, never
@@ -1086,9 +1087,13 @@ effect Process {
   piped child is pclose-shaped: it closes surviving pipe ends
   before reaping. The `os.process` surface adds `pipe_to` (stdin
   only — the pager shape), `pipe_from` (stdout only — the capture
-  shape), and `read_all` (drain to EOF). `read_stdout` on an empty
-  pipe parks the fiber on read-readiness, so other fibers and their
-  timers keep running while a child stays silent. `write_stdin`
+  shape), `pipe_errs` (stdout and stderr — the supervisor shape, read
+  with `read_stdout` and `read_stderr`), and `read_all` (drain stdout
+  to EOF); the other starters leave stderr inherited. `read_stdout`
+  and `read_stderr` on an empty pipe park the fiber on read-readiness,
+  so other fibers and their timers keep running while a child stays
+  silent. Draining one pipe to EOF while the child fills the other
+  deadlocks; drain each from its own fiber when output is large. `write_stdin`
   still blocks the OS thread while the pipe is full.
 - `wait` blocks until the child exits and returns its exit
   status. The fiber suspends via the scheduler's reactor
