@@ -66,7 +66,7 @@ objs=$(find "$nmroot" -name '*.o' -not -path '*/runtime/*' 2>/dev/null | wc -l |
 [ "$objs" -ge 2 ] || {
   echo "nmodular_subdir_import_routing FAIL — cached $objs partition objects (want >= 2);"
   echo "  a dotted import into a subdirectory did not route onto the native-modular path,"
-  echo "  so the per-partition object cache never engaged (see nm_local_imports in bin/kai)."
+  echo "  so the per-partition object cache never engaged (see imports_local in tools/kai/cli_native.kai)."
   exit 1
 }
 

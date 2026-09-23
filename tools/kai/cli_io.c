@@ -1,4 +1,4 @@
-/* Byte-exact file plumbing and the wall clock for the kai CLI. */
+/* Byte-exact file plumbing, symlinks, the running executable and the wall clock for the kai CLI. */
 #define _XOPEN_SOURCE 700
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
@@ -6,9 +6,13 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 static int pump(int from, int to) {
     char buf[65536];
@@ -87,4 +91,28 @@ const char *kaicli_local_hms(void) {
     struct tm tm;
     if (!localtime_r(&now, &tm) || strftime(buf, sizeof(buf), "%H:%M:%S", &tm) == 0) return "";
     return buf;
+}
+
+/* The target a symlink names, as written; empty when `path` is not a symlink. */
+const char *kaicli_readlink(const char *path) {
+    static char buf[4096];
+    ssize_t n = readlink(path, buf, sizeof(buf) - 1);
+    if (n < 0) return "";
+    buf[n] = '\0';
+    return buf;
+}
+
+/* The path the kernel ran this process from; empty when the OS cannot say. */
+const char *kaicli_self_exe(void) {
+    static char buf[4096];
+#ifdef __APPLE__
+    uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) != 0) return "";
+    return buf;
+#else
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n < 0) return "";
+    buf[n] = '\0';
+    return buf;
+#endif
 }

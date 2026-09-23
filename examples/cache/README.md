@@ -44,7 +44,7 @@ project user cache (`<project>/.kai-cache/<content>-<dep>.kab`, written
 by `stage2/compiler/user_cache.kai`). Unlike the Phase A fixtures, the
 Phase B cache is wired end-to-end: each fixture builds a throwaway
 multi-module project under `/tmp` with `KAI_CACHE=1` (the opt-in the
-`bin/kai` wrapper reads to create the cache dir and pass
+`kai` reads to create the cache dir and pass
 `--user-cache`).
 
 Five are negative — they edit something and assert the build does NOT

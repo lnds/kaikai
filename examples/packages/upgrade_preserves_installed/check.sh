@@ -93,14 +93,12 @@ done
 # one prefix and the upgrade wipes another.
 inst="$TMP/installed"
 mkdir -p "$inst/bin" "$inst/libexec/kaikai" "$inst/share/kaikai/stdlib"
-"$ROOT/bin/kai" env >/dev/null
 cp "$ROOT/bin/kai" "$inst/bin/kai"
-cp "$ROOT/tools/kai/kai" "$inst/libexec/kaikai/kai"
 printf '#!/bin/sh\n' > "$inst/libexec/kaikai/kaic2"
-chmod +x "$inst/bin/kai" "$inst/libexec/kaikai/kaic2"
+chmod +x "$inst/libexec/kaikai/kaic2"
 got="$(KAIKAI_HOME="$TMP/somewhere-else" "$inst/bin/kai" env KAIKAI_HOME)"
 [ "$got" = "$inst" ] \
-  || note "installed prefix resolved to '$got', not the wrapper's own root"
+  || note "installed prefix resolved to '$got', not the binary's own root"
 
 # --- a name the new toolchain claims does not shadow it ---------------
 prefix2="$TMP/prefix2"

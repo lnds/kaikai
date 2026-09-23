@@ -135,7 +135,7 @@ machinery below is needed to *use* the language; it is the toolchain for
 Everything builds from the repo root with `make`:
 
 ```sh
-make all       # stage 0 (C), stage 1 (kaikai-minimal), bin/kai
+make all       # stage 0 (C), stage 1 (kaikai-minimal), stage 2, bin/kai
 make test      # runs stage 0, stage 1, and phase 4 demo suites
 make selfhost  # proves kaic1 compiled by kaic1 is a fixed point
 ```
@@ -149,6 +149,7 @@ On a fresh checkout, only a C compiler is required to start:
 cc stage0/*.c -o stage0/kaic0
 ./stage0/kaic0 stage1/compiler.kai > /tmp/stage1.c
 cc /tmp/stage1.c -I stage0 -o stage1/kaic1
+make kaic2     # kaic1 builds kaic2; kaic2 builds the kai binary, bin/kai
 bin/kai run examples/phase4/hello.kai
 ```
 
@@ -157,7 +158,7 @@ itself byte-for-byte — the defining property of a self-hosted compiler.
 
 ## Usage
 
-The `bin/kai` driver wraps `kaic1` + `cc`. Run a program:
+The `kai` binary (`bin/kai`) drives `kaic2` + `cc`. Run a program:
 
 ```sh
 kai run examples/phase4/collatz.kai

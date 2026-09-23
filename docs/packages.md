@@ -511,11 +511,11 @@ The package manager is split across three components:
    auto-builds it on first use (dev layout) or relies on a
    pre-built binary at `libexec/kaikai/kai-pkg` (installed
    layout).
-3. **`bin/kai`** — POSIX shell driver. `find_manifest_dir` walks
-   up looking for `kai.toml`; `manifest_path_flags` consumes
+3. **`kai`** (`tools/kai/`) — the driver. `cli_manifest.find_dir`
+   walks up looking for `kai.toml`; `cli_pkg.path_flags` consumes
    `kai-pkg paths` and emits absolute `--path` flags for kaic2.
-   `cmd_init` / `cmd_install` / `cmd_show_pkg` are thin
-   shell-outs to the kai-pkg binary.
+   `kai init` / `kai install` / `kai show` drive the kai-pkg
+   binary.
 
 This split keeps the parser reusable as a stdlib component, gives
 the package manager a real type system to work with (instead of
