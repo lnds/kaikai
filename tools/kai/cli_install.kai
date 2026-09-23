@@ -1,0 +1,201 @@
+#[doc("`kai install`: build a package, local or cloned from git, and install its binary under the prefix's `bin/`.")]
+
+import cli_caches
+import cli_completions
+import cli_err
+import cli_fs
+import cli_layout
+import cli_ledger
+import cli_manifest
+import cli_pkg_help
+import cli_pkgcmd
+import cli_proc
+import cli_sys
+
+type InstallOpts = { spec: String, force: Bool, listing: Bool, help: Bool }
+
+fn parse(args: [String], o: InstallOpts) : Result[InstallOpts, Int] / Stderr =
+  match args {
+    [] -> Ok(o)
+    [a, ..._] if a == "-h" or a == "--help" -> Ok(InstallOpts { ...o, help: true })
+    ["--list", ..._] -> Ok(InstallOpts { ...o, listing: true })
+    [a, ...rest] if a == "--force" or a == "-f" -> parse(rest, InstallOpts { ...o, force: true })
+    [a, ..._] if string.starts_with(a, "-") -> cli_err.die("unknown flag for 'kai install': #{a}")
+    [a, ...rest] ->
+      if o.spec != "" {
+        cli_err.die("only one spec supported (see 'kai install --help')")
+      } else {
+        parse(rest, InstallOpts { ...o, spec: a })
+      }
+  }
+
+# The two-line refusals exit 1, unlike `die`.
+fn refuse[a](first: String, second: String) : Result[a, Int] / Stderr {
+  Stderr.eprint("kai: error: #{first}")
+  Stderr.eprint("  #{second}")
+  Err(1)
+}
+
+fn lower(c: Char) : Bool = c >= 'a' and c <= 'z'
+
+fn name_char(c: Char) : Bool = lower(c) or char.is_digit(c) or c == '_' or c == '-'
+
+# The name becomes a file under the prefix's bin/, so it must be a bare filename.
+fn check_name(name: String) : Result[Unit, Int] / Stderr =
+  match string.chars(name) {
+    cs if list.is_empty(cs) or (not list.all(cs, c => name_char(c))) ->
+      cli_err.die("package name '#{name}' is not installable — expected [a-z][a-z0-9_-]*")
+    [c, ..._] if not lower(c) ->
+      cli_err.die(
+        "package name '#{name}' is not installable — must start with a lowercase letter"
+      )
+    _ -> Ok(())
+  }
+
+fn package_name(dir: String) : Result[String, Int] / Stderr + File + Ffi =
+  if not cli_sys.is_file("#{dir}/kai.toml") {
+    cli_err.die("#{dir} has no kai.toml — not a kaikai package")
+  } else {
+    match cli_manifest.package_name(dir) {
+      Some(n) if n != "" -> {
+        check_name(n)!
+        Ok(n)
+      }
+      _ -> cli_err.die("#{dir}/kai.toml has no 'name' — cannot derive a binary name")
+    }
+  }
+
+fn check_target(
+  l: Layout,
+  dir: String,
+  name: String,
+  force: Bool
+) : Result[String, Int] / Stderr + Env + File + Ffi {
+  let entry = cli_manifest.entry(dir)
+  let dest = "#{cli_layout.home(l)}/bin/#{name}"
+  if not cli_sys.is_file("#{dir}/#{entry}") {
+    refuse(
+      "package '#{name}' has no entry point (#{entry} not found)",
+      "a library has no binary to install; only packages with an entry point can be installed"
+    )
+  } else if cli_ledger.reserved(l).contains(name) {
+    refuse(
+      "refusing to install '#{name}': the name is reserved by the kaikai toolchain",
+      "installing it would overwrite part of the toolchain in #{cli_layout.home(l)}/bin"
+    )
+  } else if cli_sys.exists(dest) and (not force) {
+    refuse("binary '#{name}' already exists at #{dest}", "pass --force to replace it")
+  } else {
+    Ok(dest)
+  }
+}
+
+# Build into a temp name, then rename: a PATH lookup never sees a half-written binary, a failed build keeps the old one.
+fn from_dir(
+  l: Layout,
+  dir: String,
+  source: String,
+  ref: String,
+  force: Bool
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let name = package_name(dir)!
+  let dest = check_target(l, dir, name, force)!
+  let _ = cli_fs.mkdir_p(cli_fs.dirname(dest))
+  let part = "#{dest}.tmp.#{cli_sys.getpid()}"
+  Stderr.eprint("kai: installing '#{name}' from #{dir}")
+  let rc = cli_proc.run(["#{l.root}/bin/kai", "build", ".", "-o", part], cli_proc.Spawn {
+    ...cli_proc.inherit(),
+    dir: dir,
+    out: "&2"
+  })
+  if rc != 0 {
+    let _ = file_delete(part)
+    cli_err.die("failed to build package '#{name}'")
+  } else {
+    let _ = file_rename(part, dest)
+    cli_ledger.record(l, name, source, ref)
+    Stderr.eprint("kai: installed '#{name}' to #{dest}")
+    cli_completions.install(dir, name, cli_layout.home(l))
+    Ok(0)
+  }
+}
+
+# Bare host/owner/repo gets https://; a URL or an absolute path passes through, as kai-pkg's own does.
+fn git_url(source: String) : String =
+  if ["/", "git@", "ssh://", "https://", "http://", "file://"]
+    |> list.any(p => string.starts_with(source, p)) {
+    source
+  } else {
+    "https://#{source}"
+  }
+
+fn from_git(
+  l: Layout,
+  source: String,
+  ref: String,
+  force: Bool
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let clone = cli_sys.mkdtemp("#{cli_caches.env_or("TMPDIR", "/tmp")}/kaikai-install.XXXXXX")
+  if clone == "" {
+    cli_err.die("cannot create a temporary directory")
+  } else {
+    cli_sys.defer_signals()
+    Stderr.eprint("kai: fetching #{source}@#{ref}")
+    let argv = ["git", "clone", "--depth", "1", "--branch", ref, git_url(source), "#{clone}/src"]
+    let quiet = cli_proc.Spawn { ...cli_proc.inherit(), out: "/dev/null", err: "/dev/null" }
+    let r = if cli_proc.run(argv, quiet) != 0 {
+      cli_err.die("failed to clone #{source} at ref '#{ref}'")
+    } else {
+      from_dir(l, "#{clone}/src", source, ref, force)
+    }
+    cli_sys.remove_tree(clone)
+    let sig = cli_sys.pending_signal()
+    if sig != 0 { Err(128 + sig) } else { r }
+  }
+}
+
+# `@<ref>` splits off first: a path may itself contain '@', and a ref means a clone.
+fn split_spec(spec: String) : (String, String) =
+  match string.split(spec, "@") {
+    [only] -> (only, "")
+    parts -> (string.join(list.init(parts).unwrap_or([]), "@"), list.last(parts).unwrap_or(""))
+  }
+
+fn install_spec(l: Layout, o: InstallOpts) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let s = split_spec(o.spec)
+  let local = s.snd == "" and cli_sys.is_dir(s.fst)
+  let pathy = o.spec == "." or string.starts_with(o.spec, "./") or string.starts_with(o.spec, "../")
+  if local {
+    let dir = cli_fs.absolute(s.fst)
+    from_dir(l, dir, dir, "local", o.force)
+  } else if pathy {
+    cli_err.die("#{o.spec} is not a directory")
+  } else {
+    from_git(l, s.fst, if s.snd == "" { "main" } else { s.snd }, o.force)
+  }
+}
+
+#[doc("`kai install [<spec>] [--force]` / `kai install --list`: the exit status.")]
+pub fn install_verb(
+  t: Toolchain,
+  args: [String]
+) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let o = parse(args, InstallOpts { spec: "", force: false, listing: false, help: false })!
+  if o.help {
+    Stdout.print(cli_pkg_help.install_text())
+    Ok(0)
+  } else if o.listing {
+    cli_ledger.listing(t.layout)
+    Ok(0)
+  } else if o.spec == "" {
+    Stderr.eprint(
+      "kai: warning: 'kai install' with no argument resolves dependencies; that is now 'kai fetch'."
+    )
+    Stderr.eprint(
+      "  'kai install <spec>' installs a package's binary. The no-argument form changes at the next edition."
+    )
+    cli_pkgcmd.fetch_verb(t, [])
+  } else {
+    install_spec(t.layout, o)
+  }
+}

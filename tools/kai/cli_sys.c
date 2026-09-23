@@ -26,6 +26,11 @@ int64_t kaicli_size(const char *path) {
     return stat(path, &st) == 0 ? (int64_t) st.st_size : -1;
 }
 
+int kaicli_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
 int kaicli_is_dir(const char *path) {
     struct stat st;
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
