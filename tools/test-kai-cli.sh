@@ -1,7 +1,7 @@
 #!/bin/sh
 # Gate for the kai binary (tools/kai): `kai env`, the plugin contract, the
-# dispatch of an unknown verb to `kai-<verb>` on PATH, and build/run — in a
-# dev checkout and in an installed prefix.
+# dispatch of an unknown verb to `kai-<verb>` on PATH, build/run and the
+# dev-loop verbs — in a dev checkout and in an installed prefix.
 
 set -eu
 
@@ -117,6 +117,38 @@ case "$stats" in
 esac
 traces="$(KAI_TRACE_RC=1 "$KAI" run "$TMP/prog/hello.kai" 2>&1 | grep -c 'KAI_TRACE_RC\] alloc_total=' || true)"
 if [ "$traces" = "1" ]; then ok "run: the RC trace is the program's alone"; else fail "run: $traces RC trace lines, want 1"; fi
+
+# The dev-loop verbs over a package: entry, tests/ sibling, discovered *_test.kai.
+Q="$TMP/ws/pkg"
+mkdir -p "$Q/tests" "$TMP/ws/lib/tests"
+printf 'name = "tp"\n' > "$Q/kai.toml"
+printf 'pub fn one() : Int = 1\n' > "$Q/util.kai"
+printf 'import util\nfn main() : Int = util.one() - 1\ntest "entry" {\n  assert util.one() == 1\n}\n' > "$Q/main.kai"
+printf 'import util\ntest "extra" {\n  assert util.one() == 1\n}\n' > "$Q/extra_test.kai"
+printf 'test "sibling" {\n  assert true\n}\nfn main() : Int = 0\n' > "$Q/tests/a.kai"
+printf 'name = "tl"\n' > "$TMP/ws/lib/kai.toml"
+printf 'pub fn one() : Int = 1\n' > "$TMP/ws/lib/lib.kai"
+printf 'import lib\ntest "lib" {\n  assert lib.one() == 1\n}\n' > "$TMP/ws/lib/lib_test.kai"
+printf 'fn main() : Int = 0\n' > "$TMP/ws/lib/tests/t.kai"
+got="$(cd "$Q" && "$KAI" test --backend=c 2>&1)" && status=0 || status=$?
+case "$status:$got" in
+  *"not reachable"*) fail "test: the entry is never reported unreachable"; printf '%s\n' "$got" | sed 's/^/        /' ;;
+  0:*"/tests/a.kai"*"== kai test extra_test.kai"*) ok "test: entry, tests/ sibling, discovered *_test.kai" ;;
+  *) fail "test: package run (exit $status)"; printf '%s\n' "$got" | sed 's/^/        /' ;;
+esac
+expect_line "test --json --only: no match is exit 1" 1 "kai: no test matched --only" \
+  sh -c 'cd "$1" && { "$2" test --backend=c --json --only nomatch 2>err >/dev/null; rc=$?; tail -1 err; exit $rc; }' _ "$Q" "$KAI"
+expect_line "test --only: no match is exit 1" 1 "kai: no test matched --only" \
+  sh -c 'cd "$1" && { "$2" test --backend=c --only nomatch >err 2>&1; rc=$?; tail -1 err; exit $rc; }' _ "$Q" "$KAI"
+expect_line "test ./...: every package" 0 "kai: all package tests passed (2 package(s))" \
+  sh -c 'cd "$1" && { "$2" test --backend=c ./... >"$3" 2>&1; rc=$?; tail -1 "$3"; exit $rc; }' _ "$TMP/ws" "$KAI" "$TMP/rec.log"
+expect "typecheck: a library checks every module it owns" 0 "kai: lib.kai
+kai: lib_test.kai
+kai: tests/t.kai" sh -c 'cd "$1" && "$2" typecheck' _ "$TMP/ws/lib" "$KAI"
+expect "bench: --iters must be positive" 2 \
+  "kai: error: --iters value must be a positive integer (got: 0)" "$KAI" bench --iters 0 x.kai
+expect "check: --backend is validated" 2 \
+  "kai: error: --backend must be 'c' or 'native' (got: llvm)" "$KAI" check --backend llvm x.kai
 
 # An installed prefix: the binary resolves the prefix it sits in, never
 # the checkout it was built in, and ignores a KAIKAI_HOME naming another.
