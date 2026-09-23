@@ -1181,6 +1181,9 @@ KaiValue *kaix_core_bit_toggle(KaiValue *a, KaiValue *b) { KaiValue *r = kai_int
    calls directly when compiled through the LLVM backend. */
 KaiValue *kaix_core_args(void)                           { return kai_core_args(); }
 KaiValue *kaix_core_program_name(void)                   { return kai_core_program_name(); }
+/* Second spelling of the same entry point: a stdlib wrapper named like the
+   builtin it forwards to cannot reach it under its own name. */
+KaiValue *kaix_core_core_program_name(void)              { return kai_core_program_name(); }
 KaiValue *kaix_core_stdlib_path(void)                    { return kai_core_stdlib_path(); }
 KaiValue *kaix_core_abspath(KaiValue *p)                 { return kai_core_abspath(p); }
 KaiValue *kaix_core_exit(KaiValue *v)                    { return kai_core_exit(v); }
