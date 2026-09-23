@@ -19,8 +19,11 @@ import compiler.ast
 import compiler.resolve
 import compiler.modules
 
-#[doc("One import nothing in its file refers to: `UImp(written_name, line, col)`.")]
-pub type UnusedImport = UImp(String, Int, Int)
+#[doc("One import nothing in its file refers to: `UImp(written_name, origin, line, col)`, `origin` being the path of the module it loads.")]
+pub type UnusedImport = UImp(String, String, Int, Int)
+
+#[doc("One loaded file as the unit-wide import check sees it: its origin and diagnostic path, what a rescan of it needs (`src`, `import_lines`, the module names it binds), the modules its used imports load, and its unused imports.")]
+pub type FileImports = { origin: String, path: String, src: String, import_lines: [Int], mods: [String], edges: [String], unused: [UnusedImport] }
 
 #[doc("What a file can refer to a loaded module by: `MNames(origin, names, silent)` — the exports plus protocol operation names; `silent` when loading the module is its use (it declares impls, or nothing).")]
 pub type ModNames = MNames(String, [String], Bool)
@@ -48,20 +51,34 @@ fn mn_ops(ops: [ProtoOp], acc: [String]) : [String] = match ops {
   [POp(n, _, _, _, _, _), ...rest]    -> mn_ops(rest, [n, ...acc])
 }
 
-fn mn_find(table: [ModNames], origin: String) : Option[ModNames] = match table {
+#[doc("The `ModNames` recorded in `table` for the module loaded from `origin`.")]
+pub fn mod_names_find(table: [ModNames], origin: String) : Option[ModNames] = match table {
   []           -> None
-  [MNames(o, ns, sl), ...rest] -> if o == origin { Some(MNames(o, ns, sl)) } else { mn_find(rest, origin) }
+  [MNames(o, ns, sl), ...rest] -> if o == origin { Some(MNames(o, ns, sl)) } else { mod_names_find(rest, origin) }
 }
 
-# An import still waiting for its first reference.
-type Pending = Pend(String, [String], Int, Int)
+# Something still waiting for its first mention: its key, and every name
+# that counts as one.
+type Pending = Pend(String, [String])
 
-#[doc("The imports of one file that nothing in it refers to. `bindings` are the file's own import entries; `table` the names of every loaded module, keyed by origin.")]
-pub fn unused_imports(src: String, tokens: [Token], decls: [Decl],
-                      bindings: [ModuleEntry], table: [ModNames]) : [UnusedImport] = {
+# An import that may turn out unused, with the names that mark it used.
+type ImportCand = ICand(UnusedImport, [String])
+
+#[doc("Scan one file's imports. `bindings` are the file's own import entries; `table` the names of every loaded module, keyed by origin.")]
+pub fn file_imports(origin: String, path: String, src: String, tokens: [Token], decls: [Decl],
+                    bindings: [ModuleEntry], table: [ModNames]) : FileImports = {
   let cx = IuCx { src: src, import_lines: iu_import_lines(decls, []), mods: iu_module_names(bindings, []) }
-  let pending = iu_pending(decls, bindings, table, [])
-  iu_report(iu_scan(cx, tokens, 0, pending), [])
+  let cands = iu_cands(decls, bindings, table, [])
+  let unused = iu_unused(cands, iu_scan(cx, tokens, 0, iu_cand_pending(cands, [])), [])
+  FileImports { origin: origin, path: path, src: src, import_lines: cx.import_lines, mods: cx.mods,
+                edges: iu_edges(bindings, unused, []), unused: unused }
+}
+
+#[doc("The origins among `mods` that `f` mentions by one of their names, a name qualified by another module aside.")]
+pub fn file_mentions(f: FileImports, mods: [ModNames]) : [String] = {
+  let pending = iu_mod_pending(mods, [])
+  let cx = IuCx { src: f.src, import_lines: f.import_lines, mods: f.mods }
+  iu_mentioned(pending, iu_scan(cx, tokenize(f.src), 0, pending), [])
 }
 
 # The scan's fixed inputs: the source, the lines the imports sit on, and
@@ -80,23 +97,22 @@ fn iu_import_lines(ds: [Decl], acc: [Int]) : [Int] = match ds {
 }
 
 # An import whose module failed to load has no binding and was already
-# reported; it is not pending. A binding without names (not loaded this
+# reported; it is no candidate. A binding without names (not loaded this
 # run) falls back to its export list.
-fn iu_pending(ds: [Decl], bindings: [ModuleEntry], table: [ModNames],
-              acc: [Pending]) : [Pending] = match ds {
+fn iu_cands(ds: [Decl], bindings: [ModuleEntry], table: [ModNames], acc: [ImportCand]) : [ImportCand] = match ds {
   [] -> list_reverse(acc)
   [DImport(ik, l, c), ...rest] -> match iu_written(ik) {
-    None -> iu_pending(rest, bindings, table, acc)
+    None -> iu_cands(rest, bindings, table, acc)
     Some(w) -> match mt_lookup(bindings, w) {
-      Some(ME(_, exports, origin, _)) -> match mn_find(table, origin) {
-        Some(MNames(_, _, true))      -> iu_pending(rest, bindings, table, acc)
-        Some(MNames(_, names, false)) -> iu_pending(rest, bindings, table, [Pend(w, names, l, c), ...acc])
-        None                          -> iu_pending(rest, bindings, table, [Pend(w, exports, l, c), ...acc])
+      Some(ME(_, exports, origin, _)) -> match mod_names_find(table, origin) {
+        Some(MNames(_, _, true))      -> iu_cands(rest, bindings, table, acc)
+        Some(MNames(_, names, false)) -> iu_cands(rest, bindings, table, [ICand(UImp(w, origin, l, c), names), ...acc])
+        None                          -> iu_cands(rest, bindings, table, [ICand(UImp(w, origin, l, c), exports), ...acc])
       }
-      None -> iu_pending(rest, bindings, table, acc)
+      None -> iu_cands(rest, bindings, table, acc)
     }
   }
-  [_, ...rest] -> iu_pending(rest, bindings, table, acc)
+  [_, ...rest] -> iu_cands(rest, bindings, table, acc)
 }
 
 fn iu_written(ik: ImportKind) : Option[String] = match ik {
@@ -106,12 +122,47 @@ fn iu_written(ik: ImportKind) : Option[String] = match ik {
   IkHole(_)         -> None
 }
 
-fn iu_report(ps: [Pending], acc: [UnusedImport]) : [UnusedImport] = match ps {
-  []                          -> list_reverse(acc)
-  [Pend(w, _, l, c), ...rest] -> iu_report(rest, [UImp(w, l, c), ...acc])
+# A candidate is keyed by its written name, which is also a mention of it.
+fn iu_cand_pending(cs: [ImportCand], acc: [Pending]) : [Pending] = match cs {
+  []                                     -> list_reverse(acc)
+  [ICand(UImp(w, _, _, _), ns), ...rest] -> iu_cand_pending(rest, [Pend(w, [w, ...ns]), ...acc])
 }
 
-# Walk the tokens until every pending import has been referenced. `st`
+fn iu_unused(cs: [ImportCand], left: [Pending], acc: [UnusedImport]) : [UnusedImport] = match cs {
+  [] -> list_reverse(acc)
+  [ICand(UImp(w, o, l, c), _), ...rest] ->
+    if iu_pending_has(left, w) { iu_unused(rest, left, [UImp(w, o, l, c), ...acc]) }
+    else { iu_unused(rest, left, acc) }
+}
+
+fn iu_edges(bindings: [ModuleEntry], unused: [UnusedImport], acc: [String]) : [String] = match bindings {
+  [] -> list_reverse(acc)
+  [ME(w, _, origin, _), ...rest] ->
+    if iu_unused_has(unused, w) { iu_edges(rest, unused, acc) } else { iu_edges(rest, unused, [origin, ...acc]) }
+}
+
+fn iu_unused_has(us: [UnusedImport], w: String) : Bool = match us {
+  []                          -> false
+  [UImp(u, _, _, _), ...rest] -> u == w or iu_unused_has(rest, w)
+}
+
+fn iu_mod_pending(ms: [ModNames], acc: [Pending]) : [Pending] = match ms {
+  []                           -> acc
+  [MNames(o, ns, _), ...rest]  -> iu_mod_pending(rest, [Pend(o, ns), ...acc])
+}
+
+fn iu_mentioned(all: [Pending], left: [Pending], acc: [String]) : [String] = match all {
+  [] -> acc
+  [Pend(k, _), ...rest] ->
+    if iu_pending_has(left, k) { iu_mentioned(rest, left, acc) } else { iu_mentioned(rest, left, [k, ...acc]) }
+}
+
+fn iu_pending_has(ps: [Pending], k: String) : Bool = match ps {
+  []                    -> false
+  [Pend(p, _), ...rest] -> p == k or iu_pending_has(rest, k)
+}
+
+# Walk the tokens until every pending entry has been mentioned. `st`
 # tracks a qualifier in progress: 1 after a module name, 2 after its dot,
 # so the identifier that follows is that module's and counts for no other.
 # Every comparison reads `cx.src` in place by offsets — materialising a
@@ -149,23 +200,22 @@ fn iu_on_import_line(ls: [Int], line: Int) : Bool = match ls {
   [h, ...rest] -> h == line or iu_on_import_line(rest, line)
 }
 
-# Drop from `pending` every import the word at src[ws, ws+wl) refers to.
+# Drop from `pending` every entry the word at src[ws, ws+wl) mentions.
 # The no-hit case returns `pending` untouched: rebuilding the list per
 # word retains an allocation per token scanned, linear over the file.
 fn iu_mention(src: String, ws: Int, wl: Int, pending: [Pending]) : [Pending] =
   if iu_any_hit(src, ws, wl, pending) { iu_drop_hits(src, ws, wl, pending) } else { pending }
 
 fn iu_any_hit(src: String, ws: Int, wl: Int, pending: [Pending]) : Bool = match pending {
-  [] -> false
-  [Pend(written, exports, _, _), ...rest] ->
-    iu_span_eq(src, ws, wl, written) or iu_span_in(src, ws, wl, exports) or iu_any_hit(src, ws, wl, rest)
+  []                        -> false
+  [Pend(_, names), ...rest] -> iu_span_in(src, ws, wl, names) or iu_any_hit(src, ws, wl, rest)
 }
 
 fn iu_drop_hits(src: String, ws: Int, wl: Int, pending: [Pending]) : [Pending] = match pending {
   [] -> []
-  [Pend(written, exports, l, c), ...rest] ->
-    if iu_span_eq(src, ws, wl, written) or iu_span_in(src, ws, wl, exports) { iu_drop_hits(src, ws, wl, rest) }
-    else { [Pend(written, exports, l, c), ...iu_drop_hits(src, ws, wl, rest)] }
+  [Pend(k, names), ...rest] ->
+    if iu_span_in(src, ws, wl, names) { iu_drop_hits(src, ws, wl, rest) }
+    else { [Pend(k, names), ...iu_drop_hits(src, ws, wl, rest)] }
 }
 
 fn iu_span_in(src: String, ws: Int, wl: Int, names: [String]) : Bool = match names {

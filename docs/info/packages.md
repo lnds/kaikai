@@ -152,6 +152,14 @@ nor through any name it exports — is a warning (`unused import \`m\``);
 it becomes an error at the Orongo edition. An import that only brings
 impls into scope is not reported.
 
+Files merge into one unit, so an import also makes its module's names
+visible to the other files. When another file uses a module that enters
+the unit only through an import its own file never uses, that import is
+not reported as unused: the warning names the file that needs the
+module (`import \`m\` is not used in this file, but \`other.kai\` needs
+it loaded`), and the import belongs there. Removing every import
+reported as unused, all at once, keeps the program building.
+
 ## Visibility
 
 ```kaikai
