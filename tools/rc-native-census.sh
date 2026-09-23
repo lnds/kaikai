@@ -23,9 +23,13 @@
 #   BUILD-FAIL  did not build under the census CFLAGS
 #   OK          clean (parity-exempt nondeterministic fixtures skip the diff)
 #
+# A fixture with a <name>.driver sidecar runs under that driver, as in
+# tools/test-effects-goldens.sh: `sigharness [--sig NAME]` waits for the
+# "ready" line and delivers the signal the program parks on.
+#
 # tools/rc-native-census-skips.txt excludes fixtures the census cannot
-# execute standalone (compiler-dump goldens, external-signal harness
-# shapes) and parks open findings under their issue number.
+# execute standalone (compiler-dump goldens) and parks open findings
+# under their issue number.
 #
 # Fixtures build and run in parallel ($RC_CENSUS_JOBS workers, default the
 # core count); the summary aggregates per-fixture verdict files afterwards.
@@ -95,6 +99,30 @@ run_bounded() {
   if [ -n "$TIMEOUT_CMD" ]; then "$TIMEOUT_CMD" "$RUN_TIMEOUT" "$@"; else "$@"; fi
 }
 
+# The external driver a fixture's .driver sidecar names, as a command
+# prefix; empty when the fixture runs bare.
+driver_cmd() {
+  local sidecar="$ROOT/examples/$1/$2.driver" driver
+  [ -f "$sidecar" ] || return 0
+  driver="$(head -1 "$sidecar")"
+  echo "$SIGHARNESS_BIN ${driver#sigharness}"
+}
+
+# Fails fast on a sidecar naming a driver the census cannot run, instead
+# of letting that fixture park until the timeout.
+check_drivers() {
+  local sidecar driver bad=0
+  for sidecar in "$ROOT"/examples/perceus/*.driver "$ROOT"/examples/effects/*.driver; do
+    [ -f "$sidecar" ] || continue
+    driver="$(head -1 "$sidecar")"
+    case "$driver" in
+      sigharness|sigharness\ *) ;;
+      *) echo "rc-native-census: unknown driver '$driver' in ${sidecar#$ROOT/} (knows: sigharness)" >&2; bad=1 ;;
+    esac
+  done
+  return "$bad"
+}
+
 # stdout+stderr with sanitizer WARNING chatter dropped: ASan warns freely
 # on fiber stacks and swapcontext (platform-dependent wording) without any
 # error having occurred; errors say ERROR and sanitizer_hit sees them.
@@ -121,7 +149,8 @@ classify_one() {
   if ! CFLAGS="$ASAN_CFLAGS" "$KAI" build --backend=native "$src" -o "$bin" 2>"$bin.build"; then
     verdict=BUILD-FAIL
   else
-    run_bounded env KAI_THREADS=1 "$bin" >"$bin.out" 2>"$bin.err" </dev/null
+    # $(driver_cmd) word-splits on purpose: it carries the driver's args.
+    run_bounded env KAI_THREADS=1 $(driver_cmd "$dir" "$name") "$bin" >"$bin.out" 2>"$bin.err" </dev/null
     local rc=$?
     if sanitizer_hit "$bin.err"; then
       verdict=SANITIZER
@@ -134,7 +163,7 @@ classify_one() {
   echo "$verdict" > "$bin.verdict"
   echo "  $verdict $dir/$name"
 }
-export -f classify_one nondet_exempt sanitizer_hit run_bounded golden_matches filtered_streams
+export -f classify_one nondet_exempt sanitizer_hit run_bounded driver_cmd golden_matches filtered_streams
 
 collect_fixtures() {
   for dir in perceus effects; do
@@ -166,6 +195,16 @@ collect_results() {
 }
 
 count_verdict() { grep -c ":$1\$" "$results"; }
+
+check_drivers || exit 2
+export SIGHARNESS_BIN="$WORK/sigharness"
+if ! ${CC:-cc} -O1 "$ROOT/tests/sigharness.c" -o "$SIGHARNESS_BIN"; then
+  echo "rc-native-census: could not build tests/sigharness.c" >&2
+  exit 2
+fi
+# The driver's own deadline tracks the census's, so RC_CENSUS_TIMEOUT
+# governs driven fixtures too.
+export KAI_SIGHARNESS_TIMEOUT_S="$RUN_TIMEOUT"
 
 fixtures="$WORK/fixtures.txt"
 collect_fixtures > "$fixtures"
