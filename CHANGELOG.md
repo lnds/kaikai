@@ -84,6 +84,25 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.124.0 (2026-09-23)
+
+### Added
+
+- **stdlib**: capture a child's stderr in os/process (#2090)
+
+### Fixed
+
+- **runtime**: a send to an ended mailbox is a no-op, not an abort (#2097)
+- **perceus**: release a closure-captured arm binder after the self-tail args (#2098)
+- **perceus**: resolve a bare callee's borrow convention per calling module (#2099)
+- **perceus**: release a never-read block-let bound to an alias (#2091)
+- **resolve**: take the unused-import verdict over the whole unit (#2088)
+
+### Changed
+
+- **perceus**: one source for the birth-ref payer decision (#2100)
+- **typer**: stamp TyCon home from the caller's view at every construction site (#2094)
+
 ## v0.123.0 (2026-09-23)
 
 ### Added
