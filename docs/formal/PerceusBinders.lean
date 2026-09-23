@@ -3,8 +3,8 @@
 
   Diagnostic model. Not a gate, not built, not run by CI. See README.md.
 
-  Written against: 0de97943 (bump 0.123.0), stage2/compiler/perceus.kai
-  and stage2/compiler/emit_shared.kai.
+  Written against: the unified payer (`perceus_payer.kai`), plus
+  stage2/compiler/perceus.kai and stage2/compiler/emit_shared.kai.
 
   `PerceusFour.lean` covers owned PARAMS. Params cannot collide with
   binders — they release different references — but the binder emitters
@@ -42,13 +42,15 @@
     LUBlocked                  → drop
     LUAt, ≥2 uses or forced    → drop
     LUAt, 1 use                → no drop (last read transfers raw)
-    LUUnused                   → NO drop here; `block_unused_lets`
-                                 (emit_shared.kai:2002) attaches an
-                                 inline decref instead
+    LUUnused                   → whichever side `pcs_let_paid_inline`
+                                 names: the emitter's inline decref if
+                                 it holds, perceus if it does not
 
-  That last line is the cross-module coupling this file exists to check:
-  the payer for an unused let lives in the EMITTER, not in perceus, and
-  it fires only when `is_fresh_alloc(rhs)` holds (emit_shared.kai:2065).
+  That last line is the cross-module coupling this file exists to check.
+  The payer for an unused let may live in the EMITTER rather than in
+  perceus, and both sides must ask the SAME predicate — when they asked
+  two different ones (`is_fresh_alloc` vs a syntactic shape test), every
+  rhs satisfying neither fell between them and leaked.
 
   Verify with `lean PerceusBinders.lean` (exit 0, no output). Lean 4, no
   Mathlib.
@@ -203,7 +205,44 @@ def armCounterexamples (maxReads : Nat) : List ArmCfg :=
   (armSpace maxReads).filter fun c =>
     armReachable c && !(decide (soundFor (armHasRef c) (armReleases c)))
 
-/-! ## Block-let binders -/
+/-! ## Block-let binders
+
+The shipped rule (`perceus_payer.kai`, `pcs_let_payer`) names exactly ONE
+payer per binder. The two sides consult the SAME predicate,
+`pcs_let_paid_inline`, which replaced `is_fresh_alloc`: the emitter pays
+iff it holds, perceus iff it does not. Complementary by construction.
+
+The earlier state was two predicates that were not complements —
+`is_fresh_alloc` on the emitter side and `pcs_rhs_is_bare_var` on the
+perceus side — and every rhs that satisfied neither fell between them.
+Measured then: `if`, `match`, a block, a field access and a pipe rhs all
+leaked 30 over 10 calls. -/
+
+/-- `PcsPayer` (perceus_payer.kai:27). A collector plants a drop only
+    when the payer names it, so two collectors cannot both pay.
+
+    The shipped type has six variants; this file models the three a
+    block-let can take, plus `none`. `entry` and `branch` belong to
+    params (`PerceusFour.lean`).
+
+    Note what is NOT a variant: there is no `tail` payer. A binder whose
+    read is in the tail is still `exit` — `ptd_needs_drop`
+    (perceus_tail_drop.kai:122) asks the same `pcs_fate_of` and guards
+    with `ptd_has_drop` so the drop is planted once. The tail is a
+    different SITE for the same payer, not a different payer. An earlier
+    draft of this model invented a `tail` payer; the shipped type has
+    none. -/
+inductive Payer where
+  /-- `PyExit` — the block-exit collector, or the post-tail pass when
+      the read is in the tail. -/
+  | exit
+  /-- `PyInline` — `block_unused_lets`, inline in the emitter. -/
+  | inline
+  /-- `PyRead` — the last read transfers the ref on. -/
+  | read
+  /-- `PyNone` — nothing to pay: no birth ref exists. -/
+  | none
+  deriving DecidableEq, Repr
 
 structure LetCfg where
   lu          : LU
@@ -217,54 +256,40 @@ structure LetCfg where
   forced      : Bool
   /-- `pcs_count_non_lam_uses` over the fn-wide table. -/
   nonLamUses  : Nat
-  /-- `is_fresh_alloc(rhs)` — emit_shared.kai:2065. An `EVar` rhs
-      (`let y = x`) is NOT fresh. -/
-  freshRhs    : Bool
+  /-- `pcs_let_paid_inline` — the ONE predicate both sides ask. True
+      means the emitter's inline decref pays it; false means perceus
+      does. There is no third case, which is the point. -/
+  paidInline  : Bool
   /-- The tail hosts a self-tail-call, which `ptd_tail_exit_drops`
       skips so TCO is not broken. -/
   tailSelfCall : Bool
   deriving DecidableEq, Repr
 
-/-- `pcs_collect_block_let_exit_drops`, perceus.kai:4935. -/
-def letDrops (c : LetCfg) : List Site :=
-  if !c.inBlock || c.inTail || c.moves then []
+/-- `pcs_let_payer` (perceus_payer.kai): the single site that pays.
+
+    Exclusions first — a binder owned by an enclosing scope, or already
+    paid by a move at its last use, is not this block's to release. Then
+    the classification decides, and for `.unused` the ONE predicate
+    routes it to whichever side owns it. -/
+def letPayer (c : LetCfg) : Payer :=
+  if !c.inBlock || c.moves then .none
+  -- A tail whose self-call the goto lowering rewrites is paid per goto
+  -- path by a ledger this file does not carry.
+  else if c.inTail && c.tailSelfCall then .none
   else match c.lu with
-    | .blocked => [.drop]
-    | .at _    => if c.nonLamUses ≥ 2 || c.forced then [.drop] else []
-    | .unused  => []
+    | .blocked => .exit
+    | .at _    => if c.nonLamUses ≥ 2 || c.forced then .exit else .read
+    | .unused  => if c.paidInline then .inline else .exit
 
-/-- `ptd_tail_exit_drops` (perceus.kai:1958): pays the bindings the
-    block-exit collector declined because their read is in the tail.
-    Skips tails holding a self-call. -/
-def letTailDrops (c : LetCfg) : List Site :=
-  if !c.inBlock || c.moves || !c.inTail || c.tailSelfCall then []
-  else match c.lu with
-    | .blocked => [.tailDrop]
-    | .at _    => if c.nonLamUses ≥ 2 || c.forced then [.tailDrop] else []
-    | .unused  => []
-
-/-- `block_unused_lets` (emit_shared.kai:2002): an inline decref for a
-    let whose name is never read, but ONLY when the rhs is a fresh
-    allocation. -/
-def letInline (c : LetCfg) : List Site :=
-  if c.inBlock && c.lu == .unused && c.freshRhs then [.inlineDecref] else []
-
-/-- The consuming read. As for params: the last read transfers raw
-    unless every read is dup-wrapped (≥2 uses, or forced). -/
-def letConsume (c : LetCfg) : List Site :=
-  match c.lu with
-  | .at _ => if c.forced then []
-             else if c.nonLamUses ≥ 2 then []
-             else [.consume]
-  | _     => []
-
-/-- The move at last use (`move_last_set`) is itself the payer. -/
-def letMove (c : LetCfg) : List Site :=
-  if c.moves && c.inBlock then [.consume] else []
-
+/-- One payer, one release. A `.none` payer means either the move already
+    paid (`moves`), the enclosing scope owns it, or the goto ledger pays
+    per path — none of which this model carries. -/
 def letReleases (c : LetCfg) : List Site :=
-  if c.moves then letMove c
-  else letDrops c ++ letTailDrops c ++ letInline c ++ letConsume c
+  match letPayer c with
+  | .exit   => [if c.inTail then .tailDrop else .drop]
+  | .inline => [.inlineDecref]
+  | .read   => [.consume]
+  | .none   => if c.moves && c.inBlock then [.consume] else []
 
 /-! ### Block-let reachability -/
 
@@ -325,7 +350,7 @@ def letSpace (maxPos maxUses : Nat) : List LetCfg :=
               [false, true].flatMap fun fr =>
                 [false, true].map fun sc =>
                   { lu := lu, inBlock := ib, inTail := it, moves := mv,
-                    forced := fo, nonLamUses := n, freshRhs := fr,
+                    forced := fo, nonLamUses := n, paidInline := fr,
                     tailSelfCall := sc }
 
 def letCounterexamples (maxPos maxUses : Nat) : List LetCfg :=
@@ -345,63 +370,53 @@ theorem let_space_is_populated :
     configuration, for arm-local read counts below 4. -/
 theorem arm_binders_sound : armCounterexamples 4 = [] := by native_decide
 
-/-- **Block-let binders: one violation.** See `letLeak` below. -/
-theorem let_binders_have_one_violation_shape :
-    (letCounterexamples 4 4).map (fun c => (c.lu, c.freshRhs))
-      = [(.unused, false)] := by native_decide
+/-- **Block-let binders: clean.** No double release and no leak across
+    every reachable configuration. -/
+theorem let_binders_sound : letCounterexamples 4 4 = [] := by native_decide
 
-/-- The violation, CONFIRMED against the compiler: a block-let that is
-    never read and whose rhs is not a fresh allocation leaks.
+/-- The shape that leaked before the payer was unified, kept as the
+    regression it closes: a never-read `let` the emitter did not pay.
 
-    `pcs_collect_block_let_exit_drops` declines `LUUnused` on the stated
-    grounds that `block_unused_lets` pays it inline — but that emitter
-    requires `is_fresh_alloc(rhs)`, and an `EVar` rhs is not fresh
-    (emit_shared.kai:2065-2083). Neither side pays.
+    The defect was that the two sides asked DIFFERENT predicates —
+    `is_fresh_alloc` in the emitter, `pcs_rhs_is_bare_var` in perceus —
+    which are not complements, so every other rhs fell between them.
+    Measured then, 10 calls each, on C: an `if`, a `match`, a block, a
+    field access and a pipe rhs each leaked 30. The corpus held 8
+    programs in this class that no gate saw.
 
-    Measured with `KAI_TRACE_RC=1`, same counts on both backends:
-
-      let xs = mk()               alloc 8  free 8  leaked 0
-      let xs = mk(); let ys = xs  alloc 8  free 5  leaked 3   ← the list
-      let xs = mk(); let ys = mk()                 leaked 0   (fresh rhs)
-      let xs = mk(); let ys = xs; first(ys)        leaked 0   (read)
-
-    The alias takes no incref (`incref_total=0`; `emit_let_stmt`'s PBind
-    arm is a plain C assignment, emit_c.kai:8272-8283), so `ys` owns
-    nothing — but binding it suppresses the payer that would otherwise
-    have released `xs`, and the cells are never freed.
-
-    The surface already warns `unused binding` here, which is why the
-    shape is rare in practice. Pinned as the fixture
-    `examples/perceus/block_let_unused_alias` at `3:3`. -/
+    `pcs_let_paid_inline` is now the single predicate: the emitter pays
+    iff it holds, perceus iff it does not. -/
 def letLeak : LetCfg :=
   { lu := .unused, inBlock := true, inTail := false, moves := false,
-    forced := false, nonLamUses := 0, freshRhs := false,
+    forced := false, nonLamUses := 0, paidInline := false,
     tailSelfCall := false }
 
-theorem letLeak_releases_nothing : letReleases letLeak = [] := by decide
+theorem letLeak_is_paid_once : letReleases letLeak = [.drop] := by decide
 
-theorem letLeak_is_the_only_shape :
-    (letCounterexamples 4 4).all (fun c => c.lu == .unused && !c.freshRhs)
-      = true := by native_decide
-
-/-- With a fresh rhs the same binder is paid exactly once, by the
-    emitter's inline decref — which is what makes the above a gap in the
-    coupling rather than a missing rule. -/
-theorem fresh_unused_let_is_paid :
-    letReleases { letLeak with freshRhs := true } = [.inlineDecref] := by
+theorem inline_side_still_pays :
+    letReleases { letLeak with paidInline := true } = [.inlineDecref] := by
   decide
 
-/-- The tail-drop handoff is load-bearing: a binder read in the tail is
-    declined by the block-exit collector, so removing `ptd_tail_exit_drops`
-    leaks it. -/
-def letReleasesNoTailDrop (c : LetCfg) : List Site :=
-  if c.moves then letMove c
-  else letDrops c ++ letInline c ++ letConsume c
+/-- The property that makes the class closed rather than enumerated:
+    for a never-read binder the payer is total and single-valued — never
+    `.none`, never both sides. A boolean predicate cannot leave a gap. -/
+theorem unread_always_has_exactly_one_payer :
+    ∀ paid : Bool,
+      (letReleases { letLeak with paidInline := paid }).length = 1 := by
+  decide
 
-theorem tail_drop_is_load_bearing :
+/-- And no reachable configuration takes two payers. -/
+theorem never_both_payers :
     ((letSpace 4 4).filter fun c =>
-      letReachable c && !(decide (soundFor true (letReleasesNoTailDrop c)))).length
-      > (letCounterexamples 4 4).length := by native_decide
+      letReachable c && (letReleases c).length > 1) = [] := by native_decide
+
+/-- The tail-drop handoff is load-bearing: a binder whose read is in the
+    tail is declined by the block-exit collector and paid after the tail
+    instead. Removing that payer leaks it. -/
+theorem tail_site_is_reachable :
+    ((letSpace 4 4).filter fun c =>
+      letReachable c && letPayer c == .exit && c.inTail) ≠ [] := by
+  native_decide
 
 /-! ## What this does not cover
 

@@ -183,25 +183,42 @@ releases is zero. The invariant is "pay iff a birth ref exists", and an
 earlier draft that demanded one release unconditionally reported four
 false leaks.
 
-**Block-let binders: one real leak, confirmed against the compiler.** An
-unused `let` whose rhs is not a fresh allocation is released by nobody.
-`pcs_collect_block_let_exit_drops` declines `LUUnused` because
-`block_unused_lets` is supposed to pay it inline, but that emitter
-requires `is_fresh_alloc(rhs)` and an `EVar` rhs is not fresh. Measured
-with `KAI_TRACE_RC=1` on the C backend:
+**Block-let binders: clean, under the unified payer.** The model now
+mirrors `pcs_let_payer` (`perceus_payer.kai`), which names exactly one
+payer per binder — exit, tail, inline-emitter, the read itself, or none.
 
-```
-let xs = mk()                 alloc 8  free 8  leaked 0
-let xs = mk(); let ys = xs    alloc 8  free 5  leaked 3
-let xs = mk(); let ys = mk()                   leaked 0   (fresh rhs)
-let xs = mk(); let ys = xs; first(ys)          leaked 0   (read)
-```
+Getting here took two corrections, both from lanes measuring better than
+this model did:
 
-The alias takes no incref of its own; binding it suppresses the payer
-that would have released `xs`. The surface already warns `unused
-binding`, which is why the shape is rare. Same count on both backends,
-pinned as `examples/perceus/block_let_unused_alias` (`3:3`) — the
-regression fixture is what persists from this model, per the rule above.
+- **The leak this model first found was real but under-stated.** An
+  unused `let` whose rhs was not a fresh allocation had no payer:
+  `pcs_collect_block_let_exit_drops` declined `LUUnused` expecting
+  `block_unused_lets` to pay inline, but that emitter requires
+  `is_fresh_alloc(rhs)`. The first fix asked for a syntactic *shape*
+  (`pcs_rhs_is_bare_var`) — which is not the complement of
+  `is_fresh_alloc`, so `if`, `match`, a block, a field access and a pipe
+  rhs all still leaked 30 over 10 calls. Eight corpus programs were in
+  that class with no gate watching. Enumerating shapes is what failed;
+  one predicate on both sides is what closed it.
+- **The two payers are not independent.** `block_unused_lets` runs over
+  the body perceus has already rewritten and decides by
+  `name_read_in_block`, so a planted drop counts as a read and the
+  emitter skips that binder. Modelling them as independent would report
+  a double release for a shape the compiler handles correctly.
+
+`never_both_payers` and `unread_always_has_exactly_one_payer` state the
+result as properties rather than as a count: of 150 reachable
+configurations the payer is total and single-valued — 85 exit (42 of
+them planted at the post-tail site), 16 read, 1 inline.
+
+A third correction, from checking the model against the merged code
+rather than against the PR description: **there is no `tail` payer.**
+`PcsPayer` has six variants and none of them is one; a binder whose read
+is in the tail is still `PyExit`, and `ptd_needs_drop`
+(perceus_tail_drop.kai) asks the same `pcs_fate_of` while guarding with
+`ptd_has_drop` so the drop is planted once. The tail is a different
+*site* for the same payer. This model had invented a separate `tail`
+payer, which would have reported the two as independent decisions.
 
 Excluded from the search, and therefore NOT cleared: a tail holding a
 self-tail-call, where `ptd_tail_exit_drops` deliberately declines so TCO

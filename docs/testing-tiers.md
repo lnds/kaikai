@@ -226,6 +226,47 @@ into this gate. New fixtures that fail on one backend but not the
 other should not merge until the divergence is resolved or
 explicitly skipped with a tracking issue.
 
+## A clean exit is not a pass (RC verification)
+
+Three signals that look like evidence and are not, each of which
+produced a wrong "this works" verdict on a program that was corrupt:
+
+- **An exit code of 0.** With the cell pool active, a use-after-free
+  routinely completes: the freed cell is recycled and the program runs
+  to the end. One repro printed `eq=true` and `4`, exit 0. The bytes
+  were `e q = t r u e \n 4 \0 \0 \0 \n` — the `len=` prefix
+  overwritten with NULs. Whether such a program aborts or prints
+  garbage is decided by heap layout, not by whether the bug is there.
+
+- **A balanced RC ledger.** `KAI_TRACE_RC=1` reporting
+  `alloc_total == free_total, leaked=0` does not mean each reference
+  was released once. An over-release recycles the cell and the counts
+  still match. A binder that over-released a borrowed param reported
+  `6/6/0` while the list it aliased was already truncated — visible
+  only in the value (`list_length` returned 1 on a 3-element list, and
+  2 on the other backend).
+
+- **Reading output by eye.** Both cases above were reported as passing
+  because the output "looked right" in a terminal.
+
+What to use instead:
+
+- Compare the **value** against the expected bytes — `diff` against a
+  golden, or `od -c` when the difference may be non-printing. A fixture
+  whose `.out.expected` is diffed by the harness gets this for free;
+  an ad-hoc check at a terminal does not.
+- Use **ASAN with `KAI_NO_CELL_POOL`** as the detector. The pool is
+  what hides the failure; turning it off is what makes a UAF abort at
+  the point of the bug rather than somewhere unrelated later.
+- Treat `tools/rc-leak-baseline.txt` as a **ratchet, not a proof**. It
+  catches a count that moves, which is its job; it cannot catch a count
+  that was always wrong in a self-cancelling way.
+
+The backend-parity harness above is the strongest detector for this
+class precisely because it diffs stdout: a corrupted value that still
+exits 0 diverges from the other backend, and the diff fails even
+though both exit codes are 0.
+
 ## M:N corpus-determinism discipline (issue #1207)
 
 Backend parity asks whether two backends agree. This gate asks a
