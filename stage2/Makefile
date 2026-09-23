@@ -2658,10 +2658,10 @@ test-trap-exit-cancel-asan: $(TARGET) build
 # the lane. Wired into the top-level `tier1-asan` rule alongside
 # the other ASAN gates. The process_piped_* fixtures extend the
 # sweep over the stdio-pipe plumbing: pipe()/dup2 fd wiring, the
-# pid-keyed pipe table (malloc'd entries freed at wait), the
-# chunked read buffer, the EPIPE dead-reader write path, and the
-# read-readiness park of a reader whose child stays silent.
-PROCESS_BASIC_FIXTURES := process_basic process_piped_capture process_piped_pager process_piped_epipe process_piped_big process_read_stdout_timers
+# pid-keyed pipe table (malloc'd entries freed at wait), the separate
+# stderr pipe, the chunked read buffer, the EPIPE dead-reader write
+# path, and the read-readiness park of a reader whose child stays silent.
+PROCESS_BASIC_FIXTURES := process_basic process_piped_capture process_piped_pager process_piped_epipe process_piped_big process_read_stdout_timers process_piped_stderr
 
 test-process-basic-asan: $(TARGET) build
 	@set -e; \
@@ -4214,7 +4214,8 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/process_piped_capture.kai \
 	         ../examples/effects/process_piped_pager.kai \
 	         ../examples/effects/process_piped_epipe.kai \
-	         ../examples/effects/process_piped_big.kai; do \
+	         ../examples/effects/process_piped_big.kai \
+	         ../examples/effects/process_piped_stderr.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \

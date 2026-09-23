@@ -12935,9 +12935,9 @@ KAI_SCHED_FN KaiValue *kai_default_signal_await(void *self, KaiCont *k)
  *     child terminates. Tier 2 follow-up tracked in
  *     docs/fibers-honesty-targets.md §Reactor.
  *   - Stdio plumbing is popen-shaped: `start_piped` attaches pipes
- *     to the child's stdin/stdout; `write_stdin` / `read_stdout` /
- *     `close_stdin` drive them; `wait` closes whatever is still open
- *     before reaping (pclose semantics). stderr always inherits.
+ *     to any of the child's stdin/stdout/stderr; `write_stdin` /
+ *     `read_stdout` / `read_stderr` / `close_stdin` drive them; `wait`
+ *     closes whatever is still open before reaping (pclose semantics).
  *   - SIGCHLD handling is implicit through blocking waitpid; the
  *     Signal effect intentionally omits SIGCHLD per its catalog
  *     comment so the two effects don't fight over the disposition.
@@ -13076,6 +13076,7 @@ typedef struct KaiProcPipe {
     int pid;
     int in_fd;   /* parent writes the child's stdin; -1 = not piped / closed */
     int out_fd;  /* parent reads the child's stdout; -1 = not piped */
+    int err_fd;  /* parent reads the child's stderr; -1 = not piped */
     struct KaiProcPipe *next;
 } KaiProcPipe;
 
@@ -13091,24 +13092,27 @@ static KaiProcPipe    *kai_proc_pipes = NULL;
 static pthread_mutex_t kai_proc_pipes_mu = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
-static void _kai_proc_pipe_add(int pid, int in_fd, int out_fd) {
+static void _kai_proc_pipe_add(int pid, int in_fd, int out_fd, int err_fd) {
     KaiProcPipe *e = (KaiProcPipe *) malloc(sizeof(KaiProcPipe));
     if (!e) { fputs("kai: out of memory\n", stderr); exit(1); }
-    e->pid = pid; e->in_fd = in_fd; e->out_fd = out_fd;
+    e->pid = pid; e->in_fd = in_fd; e->out_fd = out_fd; e->err_fd = err_fd;
     pthread_mutex_lock(&kai_proc_pipes_mu);
     e->next = kai_proc_pipes;
     kai_proc_pipes = e;
     pthread_mutex_unlock(&kai_proc_pipes_mu);
 }
 
-/* Fetch one end (0 = in_fd, 1 = out_fd) under the lock. The blocking
- * IO itself runs unlocked so a parked write cannot stall unrelated
- * process ops. */
+/* Fetch one end (0 = in_fd, 1 = out_fd, 2 = err_fd) under the lock.
+ * The blocking IO itself runs unlocked so a parked write cannot stall
+ * unrelated process ops. */
 static int _kai_proc_pipe_fd(int pid, int which) {
     int fd = -1;
     pthread_mutex_lock(&kai_proc_pipes_mu);
     for (KaiProcPipe *e = kai_proc_pipes; e; e = e->next) {
-        if (e->pid == pid) { fd = which ? e->out_fd : e->in_fd; break; }
+        if (e->pid == pid) {
+            fd = which == 0 ? e->in_fd : which == 1 ? e->out_fd : e->err_fd;
+            break;
+        }
     }
     pthread_mutex_unlock(&kai_proc_pipes_mu);
     return fd;
@@ -13135,6 +13139,7 @@ static void _kai_proc_pipe_drop(int pid) {
     if (e) {
         if (e->in_fd  >= 0) close(e->in_fd);
         if (e->out_fd >= 0) close(e->out_fd);
+        if (e->err_fd >= 0) close(e->err_fd);
         free(e);
     }
 }
@@ -13246,8 +13251,8 @@ KAI_SCHED_FN KaiValue *kai_default_process_wait(void *self, KaiValue *child, Kai
     if (pid <= 0) {
         return _kai_process_err_msg(k, "wait: invalid Child");
     }
-    /* pclose semantics: EOF the child's stdin and release both parent
-     * ends before reaping — a still-open write end would deadlock a
+    /* pclose semantics: EOF the child's stdin and release every parent
+     * end before reaping — a still-open write end would deadlock a
      * child that reads stdin to exhaustion. Drain stdout BEFORE wait;
      * closing the read end here means an undrained child still writing
      * takes EPIPE instead of blocking forever. */
@@ -13319,29 +13324,61 @@ static KaiValue *kai_default_process_exit(void *self, KaiValue *code, KaiCont *k
     return NULL;
 }
 
-/* start_piped(cmd, args, pipe_stdin, pipe_stdout) -> Result[Child, String].
- * popen-shaped: attach a pipe to the child's stdin and/or stdout;
- * stderr always inherits. Unlike `start`, primitive failure surfaces
+/* start_piped(cmd, args, pipe_stdin, pipe_stdout, pipe_stderr)
+ *   -> Result[Child, String].
+ * popen-shaped: attach a pipe to any of the child's stdin, stdout and
+ * stderr; the rest inherit. Unlike `start`, primitive failure surfaces
  * as Err — a missing binary is an ordinary outcome when shelling out.
  * Parent ends are FD_CLOEXEC so a later fork cannot hold a stray
  * write end open and starve a sibling reader of EOF. */
+static int _kai_proc_pipe_open(int want, int p[2]) {
+    if (!want || pipe(p) == 0) return 0;
+    int e = errno;
+    p[0] = p[1] = -1;
+    return e;
+}
+
+static void _kai_proc_pipe_close_pair(int p[2]) {
+    if (p[0] >= 0) close(p[0]);
+    if (p[1] >= 0) close(p[1]);
+}
+
+/* Child side, between fork and exec: async-signal-safe calls only. */
+static void _kai_proc_pipe_child_dup(int p[2], int child_end, int target) {
+    if (p[child_end] < 0) return;
+    if (p[child_end] != target) { dup2(p[child_end], target); close(p[child_end]); }
+    close(p[1 - child_end]);
+}
+
+static int _kai_proc_pipe_parent_read_end(int p[2]) {
+    if (p[0] < 0) return -1;
+    close(p[1]);
+    fcntl(p[0], F_SETFD, FD_CLOEXEC);
+    fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_NONBLOCK);
+    return p[0];
+}
+
+static int _kai_proc_want(KaiValue *flag) {
+    return flag && flag->tag == KAI_BOOL && flag->as.b;
+}
+
 static KaiValue *kai_default_process_start_piped(void *self, KaiValue *cmd, KaiValue *args,
                                                  KaiValue *pipe_in_v, KaiValue *pipe_out_v,
-                                                 KaiCont *k) {
+                                                 KaiValue *pipe_err_v, KaiCont *k) {
     (void) self;
     if (!cmd || cmd->tag != KAI_STR) {
         return _kai_process_err_msg(k, "start_piped: cmd must be a String");
     }
-    int want_in  = pipe_in_v  && pipe_in_v->tag  == KAI_BOOL && pipe_in_v->as.b;
-    int want_out = pipe_out_v && pipe_out_v->tag == KAI_BOOL && pipe_out_v->as.b;
     int in_p[2]  = { -1, -1 };
     int out_p[2] = { -1, -1 };
-    if (want_in && pipe(in_p) < 0) {
-        return _kai_process_err(k, errno);
-    }
-    if (want_out && pipe(out_p) < 0) {
-        int e = errno;
-        if (want_in) { close(in_p[0]); close(in_p[1]); }
+    int err_p[2] = { -1, -1 };
+    int e = _kai_proc_pipe_open(_kai_proc_want(pipe_in_v), in_p);
+    if (!e) e = _kai_proc_pipe_open(_kai_proc_want(pipe_out_v), out_p);
+    if (!e) e = _kai_proc_pipe_open(_kai_proc_want(pipe_err_v), err_p);
+    if (e) {
+        _kai_proc_pipe_close_pair(in_p);
+        _kai_proc_pipe_close_pair(out_p);
+        _kai_proc_pipe_close_pair(err_p);
         return _kai_process_err(k, e);
     }
     const char *cmd_cstr = cmd->as.s.bytes ? cmd->as.s.bytes : "";
@@ -13351,22 +13388,18 @@ static KaiValue *kai_default_process_start_piped(void *self, KaiValue *cmd, KaiV
     kai_reactor_init();
     pid_t pid = fork();
     if (pid < 0) {
-        int e = errno;
+        e = errno;
         _kai_process_free_argv(argv, argc);
-        if (want_in)  { close(in_p[0]);  close(in_p[1]); }
-        if (want_out) { close(out_p[0]); close(out_p[1]); }
+        _kai_proc_pipe_close_pair(in_p);
+        _kai_proc_pipe_close_pair(out_p);
+        _kai_proc_pipe_close_pair(err_p);
         return _kai_process_err(k, e);
     }
     if (pid == 0) {
         _kai_process_child_reset_signals();
-        if (want_in) {
-            if (in_p[0] != 0) { dup2(in_p[0], 0); close(in_p[0]); }
-            close(in_p[1]);
-        }
-        if (want_out) {
-            if (out_p[1] != 1) { dup2(out_p[1], 1); close(out_p[1]); }
-            close(out_p[0]);
-        }
+        _kai_proc_pipe_child_dup(in_p, 0, 0);
+        _kai_proc_pipe_child_dup(out_p, 1, 1);
+        _kai_proc_pipe_child_dup(err_p, 1, 2);
         execvp(cmd_cstr, argv);
         /* Async-signal-safe writers only. 127 = command not found. */
         const char *prefix = "kai: Process.start_piped: execvp: ";
@@ -13378,8 +13411,8 @@ static KaiValue *kai_default_process_start_piped(void *self, KaiValue *cmd, KaiV
         _exit(127);
     }
     _kai_process_free_argv(argv, argc);
-    int wr = -1, rd = -1;
-    if (want_in) {
+    int wr = -1;
+    if (in_p[1] >= 0) {
         close(in_p[0]);
         wr = in_p[1];
         fcntl(wr, F_SETFD, FD_CLOEXEC);
@@ -13387,13 +13420,8 @@ static KaiValue *kai_default_process_start_piped(void *self, KaiValue *cmd, KaiV
         fcntl(wr, F_SETNOSIGPIPE, 1);
 #endif
     }
-    if (want_out) {
-        close(out_p[1]);
-        rd = out_p[0];
-        fcntl(rd, F_SETFD, FD_CLOEXEC);
-        fcntl(rd, F_SETFL, fcntl(rd, F_GETFL) | O_NONBLOCK);
-    }
-    _kai_proc_pipe_add((int) pid, wr, rd);
+    _kai_proc_pipe_add((int) pid, wr, _kai_proc_pipe_parent_read_end(out_p),
+                       _kai_proc_pipe_parent_read_end(err_p));
     return _kai_process_ok(k, _kai_process_make_child((int) pid));
 }
 
@@ -13428,23 +13456,22 @@ static KaiValue *kai_default_process_close_stdin(void *self, KaiValue *child, Ka
     return _kai_process_ok(k, kai_unit());
 }
 
-/* read_stdout(c) -> Result[String, String]. One read of up to 64 KiB;
- * Ok("") is EOF. Reading chunk-by-chunk (rather than one read-to-end
- * op) is what lets a caller drain output larger than the OS pipe
- * capacity without deadlocking the child. The read end is O_NONBLOCK:
- * an empty pipe parks the fiber on read-readiness, never the thread.
- * The fd is looked up again after each park: a concurrent `wait` may
- * have closed it, and its number reused by an unrelated file. */
-KAI_SCHED_FN KaiValue *kai_default_process_read_stdout(void *self, KaiValue *child, KaiCont *k)
-#if KAI_SCHED_DECL_ONLY
-;
-#else
-{
-    (void) self;
+/* One read of up to 64 KiB from a piped child stream (1 = stdout,
+ * 2 = stderr); Ok("") is EOF. Reading chunk-by-chunk (rather than one
+ * read-to-end op) is what lets a caller drain output larger than the
+ * OS pipe capacity without deadlocking the child. The read end is
+ * O_NONBLOCK: an empty pipe parks the fiber on read-readiness, never
+ * the thread. The fd is looked up again after each park: a concurrent
+ * `wait` may have closed it, and its number reused by an unrelated file. */
+#if !KAI_SCHED_DECL_ONLY
+static KaiValue *_kai_proc_read_chunk(KaiValue *child, int which, KaiCont *k) {
+    const char *name = which == 1 ? "stdout" : "stderr";
+    char msg[64];
     int pid = _kai_process_record_pid(child);
-    int fd  = pid > 0 ? _kai_proc_pipe_fd(pid, 1) : -1;
+    int fd  = pid > 0 ? _kai_proc_pipe_fd(pid, which) : -1;
     if (fd < 0) {
-        return _kai_process_err_msg(k, "read_stdout: stdout is not piped");
+        snprintf(msg, sizeof msg, "read_%s: %s is not piped", name, name);
+        return _kai_process_err_msg(k, msg);
     }
     kai_reactor_init();
     enum { KAI_PROC_READ_CHUNK = 65536 };
@@ -13457,10 +13484,11 @@ KAI_SCHED_FN KaiValue *kai_default_process_read_stdout(void *self, KaiValue *chi
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) break;
         kai_reactor_park_socket_read(kai_current_fiber(), fd);
-        fd = _kai_proc_pipe_fd(pid, 1);
+        fd = _kai_proc_pipe_fd(pid, which);
         if (fd < 0) {
             free(buf);
-            return _kai_process_err_msg(k, "read_stdout: stdout was closed");
+            snprintf(msg, sizeof msg, "read_%s: %s was closed", name, name);
+            return _kai_process_err_msg(k, msg);
         }
     }
     if (n < 0) {
@@ -13471,6 +13499,26 @@ KAI_SCHED_FN KaiValue *kai_default_process_read_stdout(void *self, KaiValue *chi
     KaiValue *s = kai_str_from_bytes(buf, (size_t) n);
     free(buf);
     return _kai_process_ok(k, s);
+}
+#endif
+
+KAI_SCHED_FN KaiValue *kai_default_process_read_stdout(void *self, KaiValue *child, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    return _kai_proc_read_chunk(child, 1, k);
+}
+#endif
+
+KAI_SCHED_FN KaiValue *kai_default_process_read_stderr(void *self, KaiValue *child, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    return _kai_proc_read_chunk(child, 2, k);
 }
 #endif
 
