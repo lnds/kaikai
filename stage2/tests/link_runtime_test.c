@@ -93,8 +93,8 @@ int main(void) {
         KaiMailbox *mb = kai_mailbox_alloc();
         check("mailbox owner is current fiber", mb->owner_fiber == &owner);
         check("alloc stamps owner.mailbox",     owner.mailbox == mb);
-        kai_mailbox_free(mb);
-        check("free clears owner.mailbox",      owner.mailbox == NULL);
+        kai_mailbox_close(mb);
+        check("close clears owner.mailbox",     owner.mailbox == NULL);
         kai_active_fiber = &kai_main_fiber;  /* restore */
     }
 
@@ -150,7 +150,7 @@ int main(void) {
                       && memcmp(msg->as.s.bytes, "Crashed", 7) == 0);
         }
 
-        kai_mailbox_free(wmb);
+        kai_mailbox_close(wmb);
         kai_active_fiber = &kai_main_fiber;
     }
 
