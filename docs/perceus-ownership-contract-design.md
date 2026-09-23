@@ -12,7 +12,7 @@ historical RC issues to it.
 
 ## Evidence
 
-The exit-drop rule exists in seven places:
+The exit-drop rule used to exist in seven places:
 
 | where | note |
 |---|---|
@@ -24,6 +24,18 @@ The exit-drop rule exists in seven places:
 
 The second copy lives inside `perceus.kai` itself. Physical proximity did
 not prevent it, so file organisation is not the mechanism that would.
+
+It is now stated once, in `perceus_payer.kai`: `pcs_fate` decides whether
+a binder's last read hands its birth ref on, and `pcs_param_payer` /
+`pcs_let_payer` / `pcs_arm_payer` name the single site that pays. The
+dup decision (`pcs_is_non_last`), the param and block-let collectors, the
+post-tail pass, the arm-drop collector, the goto dropmask
+(`tcrec_compute_site_dropmask`, `tcrec_rule3_mask_b`) and the emitter's
+inline decref for a never-read `let` (`block_unused_lets`, through
+`pcs_let_paid_inline`) all ask it; `nemit_drop_assigns_masked` transcribes
+the dropmask the sentinel carries. The goto path still recomputes its
+*inputs* (its own skip set over the rewritten body) rather than reading a
+contract value, which is Stage 2's subject below.
 
 The contract is the decorated AST: consumers recover decisions by pattern
 matching on `__perceus_*` sentinels rather than reading a value. So

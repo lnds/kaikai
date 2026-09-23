@@ -6962,12 +6962,14 @@ test-perceus-owned-scope-unused-param-native:
 	@echo "perceus-owned-scope-unused-param-native SKIP (C-only build; native backend not compiled)"
 endif
 
-# A never-read block `let` bound to a bare name: the emitter's inline decref
-# only covers a fresh rhs, so perceus plants the exit drop. The `_shapes`
-# fixture also holds aliases whose source stays live, where that drop would
-# double-free; the ASAN companion (pool off) is the detector for those, and
-# rc-leak-gate pins the leak count on both backends.
-BLOCK_LET_UNUSED_ALIAS_FIXTURES := block_let_unused_alias block_let_unused_alias_shapes
+# A block `let`'s birth ref has exactly one payer: a never-read `let` is
+# released inline by the emitter when its rhs is fresh and by a perceus exit
+# drop otherwise, and a `let` of a borrowed param dups so it owns what it
+# binds. The fixtures hold guards where a second payer would double-free;
+# the ASAN companion (pool off) is the detector for those, and rc-leak-gate
+# pins the leak count on both backends.
+BLOCK_LET_UNUSED_ALIAS_FIXTURES := block_let_unused_alias block_let_unused_alias_shapes \
+  block_let_unused_value borrowed_let_alias
 
 test-perceus-block-let-unused-alias: $(TARGET) build
 	@set -e; \

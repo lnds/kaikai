@@ -347,9 +347,9 @@ infrastructure but stop short of flipping the runtime:
     position != `last_use_for(name).LUAt(line, col)` OR enclosed
     in a lambda body (closure capture conservatively blocks
     last).
-  - `pcs_prepend_unused_drops` — wraps the body in `EBlock` to
-    insert `SExprStmt(__perceus_drop(p))` for every `LUUnused`
-    parameter.
+  - `pcs_wrap_param_drops` (`perceus_payer.kai`) — wraps the body
+    in `EBlock` to insert `SExprStmt(__perceus_drop(p))` for every
+    parameter whose payer is the entry or the exit drop.
 
 - **Step 3/4 (runtime uniformisation) — attempted, reverted:**
   modifying `kai_lt` / `gt` / `le` / `ge` / `eq_v` / `ne_v` /
