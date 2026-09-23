@@ -84,6 +84,20 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.123.0 (2026-09-23)
+
+### Added
+
+- **cli**: kai is a binary; delete the bin/kai shell script (#2082)
+- **cli**: move the source-tool verbs and --version into the kai binary (#2080)
+- **cli**: move the package verbs into the kai binary (#2079)
+- **cli**: ship kai upgrade as the kai-upgrade plugin (#2078)
+
+### Fixed
+
+- **runtime**: park read_stdout on pipe readiness instead of blocking the thread (#2085)
+- **perceus**: release a never-read owned param once, not again per arm (#2084)
+
 ## v0.122.0 (2026-09-22)
 
 ### Added
