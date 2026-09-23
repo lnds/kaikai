@@ -166,7 +166,10 @@ assembled from one list rather than reconstructed from git.
   as in Go. A module that declares impls, or declares nothing (a
   documentation stub such as `math.bits`), is used by being loaded and
   is never reported. Migration is mechanical — delete the line — and
-  `kai migrate` will carry the rule once the error is switched on.
+  `kai migrate` will carry the rule once the error is switched on. An
+  import its file never uses but that is the only way a module another
+  file uses enters the unit is not "unused": its warning names that
+  file, and the import moves there instead of going away.
   Open before the flip: a program that imports a module only for the
   impls it brings into scope is exempt by that rule, but an import of
   a module that *also* exports names and is still used only for its
