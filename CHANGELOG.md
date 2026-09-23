@@ -84,6 +84,29 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.122.0 (2026-09-22)
+
+### Added
+
+- **cli**: move kai test, bench, check and typecheck into the kai binary (#2076)
+- **cli**: move kai build and kai run into the kai binary (#2075)
+- **cli**: add kai env and dispatch unknown verbs to kai-<verb> plugins (#2073)
+- **stdlib**: decode TOML floats and locate a failed decode (#2068)
+- **native**: run check blocks on the native backend (#2064)
+
+### Fixed
+
+- **stdlib**: give args.program_name a spelling that reaches the builtin (#2074)
+- **kir**: a core builtin named as a pipe's function lowers on both backends (#2071)
+- **typer**: resolve a contested bare call once the argument's type is known (#2072)
+- **emit**: a user fn beats the core builtin it is spelled like (#2069)
+- **test**: an --only that matched no block exits 1 without --json too (#2063)
+- **kir**: scope a match-arm binder's shadow rename to its arm (#2057)
+
+### Changed
+
+- **emit**: drop native fns nothing reaches before LLVM sees them (#2065)
+
 ## v0.121.0 (2026-09-22)
 
 ### Added
