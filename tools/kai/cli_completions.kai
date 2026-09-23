@@ -1,0 +1,127 @@
+#[doc("""
+Shell completions a package declares in its `[completions]` table, copied
+under the install prefix where each shell's vendor search path looks. An
+rc file is never edited: wiring the search path is install.sh's job.
+""")]
+
+import os.env
+import cli_caches
+import cli_fs
+import cli_sys
+
+const SHELLS : [String] = ["zsh", "bash", "fish"]
+
+# The line with any `#` comment and the whitespace before it removed.
+fn uncommented(line: String) : String =
+  match string.split(line, "#") {
+    [code, _, ..._] -> string.trim_right(code)
+    _ -> line
+  }
+
+fn is_header(line: String) : Bool = string.starts_with(string.trim_left(line), "[")
+
+fn is_section(line: String) : Bool = string.trim(line) == "[completions]"
+
+# `<shell> = "<path>"` for a shell the installer can place.
+fn entry(line: String) : [(String, String)] {
+  let code = string.trim_left(uncommented(line))
+  let key = string.from_chars(string.chars(code) |> list.take_while(c => char.is_alpha(c)))
+  let rest = string.trim_left(string.drop_prefix(code, key).unwrap_or(""))
+  let value = string.trim_left(string.drop_prefix(rest, "=").unwrap_or(""))
+  match string.split(value, "\"") {
+    ["", v, _, ..._] if SHELLS.contains(key) and string.starts_with(rest, "=") and v != "" ->
+      [(key, v)]
+    _ -> []
+  }
+}
+
+fn scan(lines: [String], inside: Bool) : [(String, String)] =
+  match lines {
+    [] -> []
+    [l, ...rest] if is_section(l) -> scan(rest, true)
+    [l, ...rest] if is_header(l) -> scan(rest, false)
+    [l, ...rest] -> (if inside { entry(l) } else { [] }) ++ scan(rest, inside)
+  }
+
+#[doc("The `(shell, path)` pairs the `[completions]` table of `<dir>/kai.toml` declares.")]
+pub fn declared(dir: String) : [(String, String)] / File =
+  scan(string.split(cli_fs.read_or_empty("#{dir}/kai.toml"), "\n"), false)
+
+# Where a shell looks for a completion file under the prefix, and the name it must have there.
+fn dest(shell: String, name: String) : (String, String) =
+  match shell {
+    "zsh" -> ("share/zsh/site-functions", "_#{name}")
+    "bash" -> ("share/bash-completion/completions", name)
+    _ -> ("share/fish/vendor_completions.d", "#{name}.fish")
+  }
+
+# The line a user adds to their shell rc when install.sh never wired the directory.
+fn rc_line(shell: String, prefix: String) : String =
+  match shell {
+    "zsh" -> "fpath=(\"#{prefix}/share/zsh/site-functions\" $fpath)   # before compinit"
+    "bash" ->
+      "for f in \"#{prefix}/share/bash-completion/completions/\"*; do [ -r \"$f\" ] && . \"$f\"; done"
+    _ -> "set -p fish_complete_path \"#{prefix}/share/fish/vendor_completions.d\""
+  }
+
+# The startup file the search-path line belongs in; install.sh writes the same ones.
+fn rc_file(shell: String) : String / Env {
+  let home = cli_caches.env_or("HOME", "")
+  match shell {
+    "zsh" -> "#{cli_caches.env_or("ZDOTDIR", home)}/.zshrc"
+    "bash" -> "#{home}/.bashrc"
+    _ -> "#{cli_caches.env_or("XDG_CONFIG_HOME", "#{home}/.config")}/fish/conf.d/kaikai.fish"
+  }
+}
+
+fn place(
+  dir: String,
+  name: String,
+  prefix: String,
+  e: (String, String)
+) : Unit / Stderr + File + Ffi {
+  let shell = e.fst
+  let rel = e.snd
+  if string.starts_with(rel, "/") or string_contains(rel, "..") {
+    Stderr.eprint(
+      "kai: warning: completions.#{shell} = '#{rel}' is not a path inside the package — skipped"
+    )
+  } else if not cli_sys.is_file("#{dir}/#{rel}") {
+    Stderr.eprint(
+      "kai: warning: completions.#{shell} names '#{rel}', which the package does not ship — skipped"
+    )
+  } else {
+    let d = dest(shell, name)
+    let target = "#{prefix}/#{d.fst}/#{d.snd}"
+    let _ = cli_fs.mkdir_p("#{prefix}/#{d.fst}")
+    let _ = cli_fs.copy("#{dir}/#{rel}", target)
+    Stderr.eprint("kai: installed #{shell} completion to #{target}")
+  }
+}
+
+fn advise(name: String, prefix: String, shell: String) : Unit / Stderr + Env + File + Ffi {
+  let rc = rc_file(shell)
+  let probe = "#{prefix}/#{dest(shell, "x").fst}"
+  if cli_sys.is_file(rc) and string_contains(cli_fs.read_or_empty(rc), probe) {
+    Stderr.eprint("kai: start a new shell (or re-run compinit) to pick up '#{name}' completion")
+  } else {
+    Stderr.eprint(
+      "kai: your #{shell} does not search that directory yet — add this line to #{rc}:"
+    )
+    Stderr.eprint("    #{rc_line(shell, prefix)}")
+    Stderr.eprint("  then start a new shell.")
+  }
+}
+
+#[doc("""
+Copy every completion the package at `dir` declares under `prefix`, then,
+when the user's shell is among them, say whether that shell already
+searches there or which line its rc needs. Silent for a package that
+declares none.
+""")]
+pub fn install(dir: String, name: String, prefix: String) : Unit / Stderr + Env + File + Ffi {
+  let es = declared(dir)
+  es |> foreach(e => place(dir, name, prefix, e))
+  let shell = cli_fs.basename(cli_caches.env_or("SHELL", "sh"))
+  if es |> list.any(e => e.fst == shell) { advise(name, prefix, shell) }
+}

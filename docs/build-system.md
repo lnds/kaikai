@@ -35,7 +35,8 @@ A C-only `kaic2` prints `note: native backend unavailable … using the C backen
 
 The commands are moving out of the shell wrapper into a binary written in
 kaikai, `tools/kai/`. `bin/kai` hands it every verb it no longer serves —
-today `build`, `run`, `test`, `bench`, `check`, `typecheck`, `env`, `help`,
+today `build`, `run`, `test`, `bench`, `check`, `typecheck`, the package
+verbs (`init`, `fetch`, `add`, `update`, `show`, `install`), `env`, `help`,
 and any unknown verb, which the binary runs as a `kai-<verb>` plugin from
 its own `plugins/` dir (`tools/kai/plugins/`, shipped as
 `libexec/kaikai/plugins/`; `upgrade` lives there) or from `PATH` (`kai info

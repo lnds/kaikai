@@ -1,0 +1,85 @@
+#[doc("""
+The install prefix `kai install` writes binaries to and its ledger,
+`<prefix>/.kai-installed`: one `<name>\\t<source>\\t<ref>` line per binary
+the user installed, which `kai upgrade` carries across a toolchain swap.
+""")]
+
+import cli_fs
+import cli_layout
+import cli_sys
+
+#[doc("The ledger of the prefix `kai install` targets.")]
+pub fn path(l: Layout) : String / Env + Ffi = "#{cli_layout.home(l)}/.kai-installed"
+
+# The ledger's lines; a final newline ends the last one rather than opening another.
+fn lines(l: Layout) : [String] / Env + File + Ffi {
+  let content = cli_fs.read_or_empty(path(l))
+  let parts = string.split(content, "\n")
+  if content == "" {
+    []
+  } else if string.ends_with(content, "\n") {
+    list.init(parts).unwrap_or([])
+  } else {
+    parts
+  }
+}
+
+fn owns(line: String, name: String) : Bool = string.starts_with(line, "#{name}\t")
+
+#[doc("Record `name` as installed from `source` at `ref`, replacing any earlier entry; the ledger stays byte-sorted.")]
+pub fn record(l: Layout, name: String, source: String, ref: String) : Unit / Env + File + Ffi {
+  let file = path(l)
+  let _ = cli_fs.mkdir_p(cli_fs.dirname(file))
+  let kept = lines(l) |? (x => not owns(x, name))
+  let sorted = list.sort(kept ++ ["#{name}\t#{source}\t#{ref}"])
+  let part = "#{file}.tmp.#{cli_sys.getpid()}"
+  let _ = write_file(part, string.join(sorted | (x => "#{x}\n"), ""))
+  let _ = file_rename(part, file)
+}
+
+fn listed(line: String) : [String] =
+  match string.split(line, "\t") |? (f => f != "") {
+    [n, src, ...ref] -> ["#{n}\t#{src}@#{string.join(ref, "\t")}"]
+    [n] -> ["#{n}\t@"]
+    [] -> []
+  }
+
+#[doc("`kai install --list`: each installed binary as `<name>\\t<source>@<ref>`.")]
+pub fn listing(l: Layout) : Unit / Stdout + Stderr + Env + File + Ffi {
+  if cli_fs.read_or_empty(path(l)) == "" {
+    Stderr.eprint("kai: no packages installed")
+  } else {
+    lines(l) || listed |> foreach(x => Stdout.print(x))
+  }
+}
+
+fn entries(dir: String) : [String] / File + Ffi =
+  if cli_sys.is_dir(dir) { dir_list_dir(dir) } else { [] }
+
+# `"$STAGE/bin/<name>"` or `"$STAGE/libexec/kaikai/<name>"`: what the release tarball ships.
+fn staged(line: String) : [String] =
+  ["\"$STAGE/bin/", "\"$STAGE/libexec/kaikai/"]
+    || (tag => match string.split(line, tag) {
+      [_, ...rest] if not list.is_empty(rest) -> [list.last(rest).unwrap_or("")]
+      _ -> []
+    })
+    || (tail => match string.split(tail, "\"") {
+      [n, _, ..._] if n != "" and name_chars(n) -> [n]
+      _ -> []
+    })
+
+fn name_chars(n: String) : Bool =
+  string.chars(n) |> list.all(c => char.is_alnum(c) or c == '.' or c == '_' or c == '-')
+
+#[doc("""
+Names a user package may not claim: the toolchain's own binaries, from
+the prefix's `bin/` and `libexec/kaikai/` and, in a checkout, from what
+the release script stages. A name already in the ledger is the user's.
+""")]
+pub fn reserved(l: Layout) : [String] / Env + File + Ffi {
+  let prefix = cli_layout.home(l)
+  let script = string.split(cli_fs.read_or_empty("#{l.root}/scripts/build-release.sh"), "\n")
+  let ledger = lines(l)
+  (entries("#{prefix}/bin") ++ entries("#{prefix}/libexec/kaikai") ++ (script || staged))
+    |? (n => not (ledger |> list.any(x => owns(x, n))))
+}
