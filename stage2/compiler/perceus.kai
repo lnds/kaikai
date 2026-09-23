@@ -17,20 +17,14 @@
 #
 #   - `perceus_pass` — the entry point: build the `[EFn]` registry via
 #     compiler.fnreg, then rewrite every decl (`perceus_decl` /
-#     `pcs_collect_uses_expr` / `pcs_rewrite_expr` /
-#     `pcs_prepend_unused_drops`) so each binding transfers at its last
-#     use, earlier reads bump the refcount via `__perceus_dup`, and
-#     unused params drop at body entry.
-#   - The use-collection + last-use machinery (`pcs_collect_uses_expr`,
-#     `last_use_for`, `pcs_count_non_lam_uses`,
+#     `pcs_collect_uses_expr` / `pcs_rewrite_expr`) so each binding
+#     transfers at its last use and earlier reads bump the refcount via
+#     `__perceus_dup`. Who releases what no read transfers is decided in
+#     compiler.perceus_payer.
+#   - The use-collection machinery (`pcs_collect_uses_expr`,
 #     `pcs_branch_aware_skip_params`) is `pub` because the tco pre-pass
-#     (`tcrec_*`, still resident in main pending the emit_c lane)
-#     consults it directly to align its goto-loop drops with the wrap's
-#     exit drops — the same emit-adjacent-consumer shape unbox (N3) hit.
-#
-# Public surface (5 fns, 0 pub types): perceus_pass + the 4 tco-shared
-# use/last-use helpers above. The internal types `PcsBlockState` /
-# `PcsRwBlock` / `PcsRwStmt` / `DupMark` stay private (no external sig).
+#     (`tcrec_*`) consults it to align its goto-loop drops with the wrap's
+#     exit drops.
 #
 # Bundle order: ... infer, fnreg, unbox, perceus, main. Imports
 # compiler.ast for the AST nodes, compiler.diag for diagnostics,
@@ -59,6 +53,8 @@ import compiler.ast_map
 import compiler.expr_positions
 import compiler.borrow_infer
 import compiler.perceus_op_arg
+import compiler.perceus_let_own
+import compiler.perceus_payer
 import compiler.perceus_plant_drop
 import compiler.perceus_tail_drop
 import compiler.consume_index
@@ -285,30 +281,10 @@ fn prc_raw_names_zip(params: [Param], mask: [Bool]) : [String] = match params {
 # Reads the source AST as the IR. The emitter consumes whatever this
 # function returns; selfhost convergence remains the gate.
 
-# m5 #4 step 2/4 — scope-aware Perceus pass.
-#
-# For each `DFn`, walks the body twice:
-#   1. `pcs_collect_uses_expr` — accumulates `[Use]` for every EVar
-#      whose name is currently in scope (params + lets + match
-#      pattern bindings + handler-clause params + lambda params).
-#      Mirrors `fv_expr` (5478) modulo polarity: we want IN-scope
-#      reads, fv wants free vars.
-#   2. `pcs_rewrite_expr` — reconstructs the body, wrapping every
-#      non-last in-scope EVar in `ECall(EVar("__perceus_dup"), [...])`.
-#      Last-use-per-name is computed via `pcs_last_use_for` (same as
-#      m5 #2 but consumed for rewriting, not just reporting).
-#
-# Then `pcs_prepend_unused_drops` wraps the body in `EBlock` to drop
-# every parameter whose `pcs_last_use_for` is `LUUnused`. Drops emit
-# at body START — safe because the param was never read after entry.
-#
-# Together with the runtime primitive consumption (step 3/4 —
-# blocked on stage 1 needing its own perceus pass; see
-# `docs/perceus-basic.md` §"What unblocks step 3+"), this
-# would produce a coherent linear discipline: every binding
-# transferred at exactly one position (last use); earlier reads
-# bump the refcount via dup; unused params dropped at entry.
-# Inert until step 3 lands.
+# For each `DFn` the pass collects the in-scope reads (`pcs_collect_uses_expr`),
+# then rewrites the body so every read that does not hand its binder's birth
+# ref on is wrapped in `__perceus_dup`. The drops that release what no read
+# hands on are planted where `compiler.perceus_payer` names the payer.
 
 
 #[doc("Entry point: scope-aware Perceus RC pass over the post-mono [Decl] (dup at non-last uses, drop unused params at entry). Pipeline position monomorphise -> unbox -> perceus_pass -> tco -> emit.")]
@@ -868,13 +844,8 @@ fn pcs_strip_args_at_d(args_: [Expr], positions: [Int], i: Int, scx: StripCx) : 
 # fn-name mark against a LOCAL that shadows a top-level fn's name —
 # its stripped-dup read is a borrow, and dropping it would over-free.
 fn pcs_arg_is_untracked(a: Expr, uses: [Use]) : Bool = match a.kind {
-  EVar(nm) -> pcs_never_read(nm, uses)
+  EVar(nm) -> pcs_unread(nm, uses)
   _ -> false
-}
-
-fn pcs_never_read(nm: String, uses: [Use]) : Bool = match last_use_for(nm, uses) {
-  LUUnused(_) -> true
-  _           -> false
 }
 
 # A bare `EVar` argument (no dup wrap) naming a SINGLE-use value: the
@@ -887,14 +858,10 @@ fn pcs_never_read(nm: String, uses: [Use]) : Bool = match last_use_for(nm, uses)
 fn pcs_arg_is_owned_move(a: Expr, scx: StripCx) : Bool = match a.kind {
   EVar(nm) ->
     if list_has(scx.no_wrap, nm) { false }
-    else if pcs_count_non_lam_uses(nm, scx.uses, 0) != 1 { false }
-    else { match last_use_for(nm, scx.uses) {
-      LUAt(_, _, _) -> match a.ty {
-        Some(t) -> not (ty_is_unboxable_t(t) or ty_is_fixed_vec(t))
-        None    -> false
-      }
-      LUBlocked(_) -> false
-      LUUnused(_)  -> false
+    else if not pcs_fate_transfers(pcs_fate_of(nm, scx.uses, false, false)) { false }
+    else { match a.ty {
+      Some(t) -> not (ty_is_unboxable_t(t) or ty_is_fixed_vec(t))
+      None    -> false
     } }
   _ -> false
 }
@@ -1766,8 +1733,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
       # with an EMPTY param scope (mirroring DTest below): in-body
       # SLet bindings enter the scope during the walk and get their
       # dups + exit drops, while the raw params stay untouched and
-      # `pcs_prepend_unused_drops` is skipped (no boxed params to
-      # reclaim).
+      # take no param drops (no boxed params to reclaim).
       else if prc_is_all_raw_ufn_decl(fns, name, mo) {
         # ALL-raw UFn: every param is a raw C scalar with no rc, so the
         # body rewrite runs with an EMPTY param scope (issue #703) — no
@@ -1857,7 +1823,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # Koka Parc `ownedInScope`: owned sibling params read once-per-path in
         # a top-level match, moved at their single use with the exit drop
         # replaced by a branch-local drop in the arms that never read them.
-        let owned_moves = pcs_owned_scope_move_params(pnames, body, uses, skip_set0, bmap, cmap, borrowed)
+        let owned_moves = pcs_owned_scope_move_params(pnames, body, skip_set0, bmap, cmap, borrowed)
         let skip_set = pcs_list_union(skip_set0, owned_moves)
         # Issue #817 — arm-binders whose LAST use lands in a consuming slot
         # but which are NOT in `skip_set` (so the conservative dup orphans
@@ -1924,6 +1890,9 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         let branchy_lets = pcs_branchy_let_binders(body, name, uses,
                                                    pcs_list_union(rewrite_skip_set, pnames))
         let force_all = pcs_list_union(pcs_list_union(branchy_single, branchy_arms), branchy_lets)
+        # The exit drop keeps the #1126 borrow-move params: only their
+        # re-thread moves, and the base path still owns the container.
+        let psets = PcsParamSets { moved: skip_set, forced: force_all, branch: owned_moves }
         let new_body0 = pcs_rewrite_expr(body, pnames, uses, false, rewrite_skip_set, force_all, bmap, move_last_set)
         let new_body1 = pcs_force_opaque_exit_drops(new_body0, opaque_lets, uses)
         # The block-exit collector below declines a binding whose last read
@@ -1935,9 +1904,10 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
                                            branchy_lets,
                                            pcs_borrow_lookup(bmap, pcs_borrow_key(name, mo)))
         let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
-        # Plant the branch-local drop for each `owned_moves` param in the arms
-        # that never read it (their exit drop was skipped via `skip_set`).
-        let param_dropped = pcs_inject_param_branch_drops(arm_dropped, owned_moves, name)
+        # The branch-local drop, in the arms that never read it, for each
+        # param the payer assigns there.
+        let param_dropped = pcs_inject_param_branch_drops(arm_dropped,
+          pcs_names_paid_by(owned_moves, uses, psets, PyBranch), name)
         let reused_body = pcs_recognise_reuse_expr_b(param_dropped, borrowed)
         # Borrowed params carry no exit obligation — exclude from the
         # unused-param drop. Raw params (mixed-sig) likewise carry no rc,
@@ -1955,7 +1925,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # reads ARE rewritten to the borrow variant.
         let bl_names = pcs_list_union(pnames, pcs_let_binder_names(body, []))
         let borrow_last = pcs_collect_borrow_last_set(bl_names, body, prim_bmap)
-        let body_with_drops = pcs_prepend_unused_drops(reused_body, drop_params, uses, skip_set, force_all)
+        let body_with_drops = pcs_wrap_param_drops(reused_body, drop_params, uses, psets)
         # Callee flip: wrap borrowed scrutinees so emit_match skips the
         # decref. Caller flip: strip __perceus_dup on borrowed-slot args,
         # keeping the last-use of a borrow-only container consuming.
@@ -1978,10 +1948,11 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         let scx = StripCx { bmap: bmap, borrow_last: borrow_last, bclosures: borrowed_closures,
                             fn_names: fn_names, no_wrap: no_wrap, uses: uses }
         let body_borrow = pcs_strip_borrow_args_d(body_borrow_call, scx)
-        # Last: an op argument reaches its handler owned, and a borrowed
+        # Last: an op argument and a `let` value are owned, and a borrowed
         # binder is the one read that arrives without a reference of its own.
         let body_op_args = poa_own_op_args(body_borrow, borrowed)
-        DFn(is_pub, name, tparams, params, opt_ret, row, body_op_args, ln, cl, mo, fsym)
+        let body_lets = plo_own_let_values(body_op_args, borrowed)
+        DFn(is_pub, name, tparams, params, opt_ret, row, body_lets, ln, cl, mo, fsym)
       }
     }
     # Test bodies are emitted as their own thunk fns; without rewriting
@@ -2706,7 +2677,7 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
       let pn = map(ps, (p) => p.pname)
       # Issue #817 — the lambda's own params still leak (dup'd-and-never-
       # dropped, the `(w) => not is_empty(w)` residual slice). The fix is
-      # to give them the `pcs_prepend_unused_drops` discipline a top-level
+      # to give them the param-drop discipline (`pcs_wrap_param_drops`) a top-level
       # `fn` gets — but that produces the `EBlock([SLet(__pcs_ret, body),
       # drop], __pcs_ret)` wrap, which the native/KIR backend cannot lower
       # in a CLOSURE body (it lowers it fine for `fn` bodies): it adds
@@ -2725,26 +2696,6 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
         None -> None
         Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
       }
-      # Issue #297 (partial) — block-scope exit drops for SLet PBind
-      # bindings that took a `__perceus_dup` per non-last read above.
-      # Symmetric with `pcs_collect_exit_drops` for fn params: an
-      # SLet whose binder has ≥ 2 non-lam uses (or LUBlocked) carries
-      # an unbalanced original ref at block exit; without an explicit
-      # `__perceus_drop` the chunk leaks.
-      #
-      # Scope: only emit a drop when the binding does NOT appear in the
-      # block's tail expression. A tail-position read forces the drop AFTER
-      # the tail, and doing that here would hide a self-tail-call from
-      # `tcrec_rewrite_decls` and break TCO — the demo-side regression was a
-      # stack overflow on `search`. `ptd_tail_exit_drops` picks those
-      # bindings up instead, skipping the tails that hold a self-call.
-      #
-      # LUAt-with-count==1 stays raw (lexically-last consumer
-      # transfers the ref). LUUnused is handled by `block_unused_lets`
-      # via inline decref.
-      # A binder that moves at its last use already pays the birth ref
-      # there; an exit-drop on top of the move would double-free, so the
-      # move-last set is excluded.
       let exit_drops = pcs_collect_block_let_exit_drops(stmts, scope, uses,
                                                          opt_tail, move_last_set, force_set, [])
       EBlock(pcs_append_drops(r.stmts, exit_drops), new_tail)
@@ -2990,112 +2941,20 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
   }
 }
 
-# Dup predicate (m5.x-flip Phase 1, "dup all ≥2 uses" variant). A name
-# is wrapped in `__perceus_dup` whenever:
-#   (a) it appears inside a closure body (`in_lam_here == true`); the
-#       lambda may outlive the construction site, so every capture-side
-#       read pays a dup and the closure's incref-on-construction holds
-#       the original;
-#   (b) it has any in-lam use elsewhere (LUBlocked) — the closure owns
-#       the original, so non-lam reads must dup;
-#   (c) it has ≥ 2 non-lam uses (LUAt with count ≥ 2) — every read pays
-#       a dup. Under the loose runtime the original ref leaks (no exit
-#       drop yet); the exit-drop pass that reclaims it landed together
-#       with the runtime flip (m5.x atomic A+B+C+D, 2026-04-28).
-# The previous "lexically-last → raw transfer" rule was unsafe because
-# C does not specify the evaluation order of function-call arguments;
-# the lexically-last raw read could fire before earlier dup-wrapped
-# reads, freeing the local before the dups executed (lane experience
-# 2026-04-26). The all-dup variant is order-independent: every read
-# bumps rc before the primitive consumes it. The single-use case stays
-# raw — no dup, no drop, transferring the binding's existing reference.
-# LUUnused names cannot reach this predicate (they have no uses).
-#
-# Carve-out for the magic clause-body names `state` and `log`
-# (`pcs_rewrite_clauses` injects them into the local scope so this
-# predicate fires for them): both are *aliases* of `self->state` /
-# `self->log`, not bindings the clause owns. The clause prologue
-# (`clause_state_prologue`, `emit_clause_body`) emits
-# `KaiValue *kai_state = self->state;` — a raw aliased pointer
-# whose storage's lifetime is the *handler's*, not the clause's.
-# Treating either name as "last use" and emitting a raw transfer
-# hands the EvE slot's only outstanding ref to a downstream
-# decref-aware sink (`kai_core_string_concat`,
-# `kai_core_string_length`, `kai_core_string_join`); the sink
-# decrefs it, the storage is freed, and the next op call into the
-# same parameterised handler reads the freed slot. The fix forces
-# every read of `state` / `log` to emit `__perceus_dup`, balancing
-# the consumer's burn-off with one extra `kai_internal_dup` per
-# read. Cost: one `kai_incref` per state/log read (well within the
-# loose runtime's tolerance); this is the smallest correct change
-# until the Perceus exit-pass closes the broader RC story (see
-# `docs/lane-diagnostic-r10-r11.md` for the full analysis;
-# broader Perceus follow-ups tracked under the `perceus` label
-# (issues #77–#82). Closed R10 and R11 (issue #61).
-
+# Dup predicate: wrap this read in `__perceus_dup` unless it hands the
+# birth ref on, per `pcs_fate`. A read inside a lambda is a capture and
+# always dups. `force_set` names are owned elsewhere (a check loop's params)
+# and dup on every read, as do the clause-body aliases `state` / `log`,
+# which point into the handler's slot. `skip_set` names move on every read;
+# a `move_last_set` name moves only at its last read.
 fn pcs_is_non_last(nm: String, line: Int, col: Int, uses: [Use],
                    in_lam_here: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : Bool {
-  # Issue #697 — `force_set` carries the names that must dup on EVERY
-  # read, last-use included, because the body does not own them: it
-  # borrows them. The sole populator is the `DCheck` branch, whose
-  # `with`-clause params are owned by the generated check loop (it
-  # drops them in iter_drops/tail_drops) and re-read by the shrinker
-  # across iterations. Treating a check-param as last-use → raw
-  # transfer hands the loop's only ref to a decref-aware consumer
-  # (`kai_core_string_length`, `kai_op_ne_v`, …), which frees it;
-  # the loop's own drop then double-frees. Same alias-not-owned shape
-  # as `state`/`log` below — forced to always-dup for the same reason.
   if nm == "state" or nm == "log" or list_has(force_set, nm) { true }
   else if in_lam_here { true }
   else {
-    match last_use_for(nm, uses) {
-      LUAt(_, lu_line, lu_col) -> {
-        # Issue #599 — branch-aware dup elimination. If the binding
-        # appears in `skip_set` (built once from the body via
-        # `pcs_max_paths_*`, populated only for top-level fn params
-        # whose max non-lam reads across any execution path is <= 1),
-        # skip the dup wrap entirely: the single read on the executed
-        # path can transfer ownership raw.
-        if list_has(skip_set, nm) { false }
-        # Issue #817 — move-at-last-use. `move_last_set` holds the
-        # arm-binders whose LAST use lands in a consuming slot (computed
-        # in `perceus_decl_b` with the body + cmap in scope). When the
-        # CURRENT read is that last use, transfer ownership raw (no dup):
-        # the consuming slot takes the binder's birth ref, leaving no
-        # orphan. Earlier reads (e.g. a predicate `p(h)` whose closure
-        # could retain `h`) keep their conservative dup, since `(line,col)`
-        # does not match the last-use position. This is what stops
-        # `list.filter`/`map`/`flat_map` over heap elements leaking the
-        # extracted head: the cons in `[h, ...acc]` moves `h` instead of
-        # dup'ing-and-orphaning it. NOT a skip-set entry (which would move
-        # the predicate read too → UAF if `p` retains `h`).
-        else if list_has(move_last_set, nm) and line == lu_line and col == lu_col { false }
-        else { pcs_count_non_lam_uses(nm, uses, 0) >= 2 }
-      }
-      LUBlocked(_) -> true
-      LUUnused(_) -> false
-    }
-  }
-}
-
-# Count the non-in-lambda uses of `nm` in `uses`. Lambda uses are
-# excluded because they are accounted for by the LUBlocked branch and
-# the closure-capture incref; non-lam reads at the fn body's own scope
-# are what determine whether the binding is multi-use under the Phase 1
-# rule.
-#[doc("Count non-lambda reads of a name in a [Use] list (closure-capture increfs excluded). Pub: the tco pre-pass uses the multi-use predicate to decide goto-loop drop placement.")]
-pub fn pcs_count_non_lam_uses(nm: String, uses: [Use], acc: Int) : Int {
-  match uses {
-    [] -> acc
-    [h, ...rest] -> match h {
-      U(uname, _, _, in_lam) -> {
-        if uname == nm and not in_lam {
-          pcs_count_non_lam_uses(nm, rest, acc + 1)
-        } else {
-          pcs_count_non_lam_uses(nm, rest, acc)
-        }
-      }
-    }
+    let lu = last_use_for(nm, uses)
+    let moved = list_has(skip_set, nm) or (list_has(move_last_set, nm) and pcs_lu_at(lu, line, col))
+    pcs_fate_residual(pcs_fate(lu, nm, uses, moved, false))
   }
 }
 
@@ -4381,109 +4240,11 @@ fn pcs_render_with_marks(esrc: String, toks: [Token], marks: [DupMark],
   }
 }
 
-# ---- per-param drops: entry for unused, exit for multi-use / blocked ----
-#
-# Categorisation by `last_use_for`:
-#   - LUUnused(p)         → drop at body entry (param never read; release
-#                           immediately).
-#   - LUBlocked(p)         → drop at body exit (a closure may keep the
-#                           param alive past the fn body via capture; the
-#                           closure-capture incref balances; the original
-#                           param ref is released when the fn returns).
-#   - LUAt + count >= 2    → drop at body exit (every read is dup-wrapped
-#                           per Phase 1, so the original ref is unconsumed
-#                           and must be released).
-#   - LUAt + count == 1    → no drop (the single read transfers the
-#                           original ref to its consumer).
-#
-# Wrap shape when both entry and exit drops are needed:
-#   EBlock([entry_drops..., SLet(__pcs_ret, body), exit_drops...],
-#          Some(EVar("__pcs_ret")))
-# `__pcs_ret` is reserved (no kaikai user-source name starts with `__`).
-# When neither set has drops, the body is returned unchanged so the
-# fixed-point selfhost sees no extra wrap on inert fns.
-#
-# This pass is sound only because `emit_pat_binds` increfs every alias
-# extraction (variant args, cons head/tail) — the shared-storage producer
-# (caller's `e.kind` / list cell) keeps its own ref independent of the
-# binding. The previous attempt's UAF in `synth_call` (and why
-# incref-on-extract / Step A here is the prerequisite for this pass)
-# is recoverable from `git log` on the m5.x runtime flip commits
-# (atomic A+B+C+D, 2026-04-28).
-fn pcs_prepend_unused_drops(body: Expr, params: [Param], uses: [Use], skip_set: [String], forced_exit: [String]) : Expr {
-  let entry = pcs_collect_entry_drops(params, uses, [])
-  let exit_ = pcs_collect_exit_drops(params, uses, skip_set, forced_exit, [])
-  match entry {
-    [] -> match exit_ {
-      [] -> body
-      [_, ...__] -> pcs_wrap_with_exit(body, [], exit_)
-    }
-    [_, ...__] -> pcs_wrap_with_exit(body, entry, exit_)
-  }
-}
-
-fn pcs_wrap_with_exit(body: Expr, entry: [Stmt], exit_: [Stmt]) : Expr {
-  match exit_ {
-    [] -> Expr { kind: EBlock(entry, Some(body)), line: body.line, col: body.col,
-                 ty: body.ty, mode: body.mode }
-    [_, ...__] -> {
-      let ret_let = SLet(
-        Pattern { pkind: PBind("__pcs_ret"), line: body.line, col: body.col },
-        None,
-        body
-      )
-      let stmts = list_append(entry, [ret_let, ...exit_])
-      let tail = Expr { kind: EVar("__pcs_ret"), line: body.line, col: body.col,
-                        ty: body.ty, mode: body.mode }
-      Expr { kind: EBlock(stmts, Some(tail)), line: body.line, col: body.col,
-             ty: body.ty, mode: body.mode }
-    }
-  }
-}
-
-fn pcs_collect_entry_drops(params: [Param], uses: [Use], acc: [Stmt]) : [Stmt] {
-  match params {
-    [] -> list_reverse(acc)
-    [p, ...rest] -> {
-      let acc1 = match last_use_for(p.pname, uses) {
-        LUUnused(_) -> [pcs_make_drop_stmt(p.pname, p.pline, p.pcol), ...acc]
-        _ -> acc
-      }
-      pcs_collect_entry_drops(rest, uses, acc1)
-    }
-  }
-}
-
-fn pcs_collect_exit_drops(params: [Param], uses: [Use], skip_set: [String], forced_exit: [String], acc: [Stmt]) : [Stmt] {
-  match params {
-    [] -> list_reverse(acc)
-    [p, ...rest] -> {
-      let acc1 = match last_use_for(p.pname, uses) {
-        LUBlocked(_) -> [pcs_make_drop_stmt(p.pname, p.pline, p.pcol), ...acc]
-        LUAt(_, _, _) -> {
-          # Issue #599 — branch-aware: if the param is in `skip_set`,
-          # the rewriter did NOT wrap reads in `__perceus_dup`, so
-          # the single read on the executed path transfers the ref
-          # raw and the consumer must be linear. Emitting an exit
-          # drop here would double-free.
-          if list_has(skip_set, p.pname) { acc }
-          else if list_has(forced_exit, p.pname) or
-                  pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 {
-            [pcs_make_drop_stmt(p.pname, p.pline, p.pcol), ...acc]
-          } else { acc }
-        }
-        _ -> acc
-      }
-      pcs_collect_exit_drops(rest, uses, skip_set, forced_exit, acc1)
-    }
-  }
-}
-
 # A single-use owned param whose only read sits on some-but-not-all
 # execution paths would transfer raw at the read with no exit drop —
 # every path that skips the read leaks the birth ref. Select such
-# params so the rewriter dups their read (via force_set) and
-# `pcs_collect_exit_drops` releases the original unconditionally.
+# params so the rewriter dups their read (via force_set) and the exit
+# drop releases the original unconditionally.
 # Self-recursive fns are excluded: the goto/TRMC rewrites bypass the
 # exit wrap per iteration and their site dropmask mirrors the flat
 # use-count criterion, so forcing a dup there would unbalance the
@@ -4889,28 +4650,12 @@ fn pcs_blb_bc_name(nm: String, bound: [String], acc: Int) : Int = match bound {
   [b, ...rest] -> pcs_blb_bc_name(nm, rest, if b == nm { acc + 1 } else { acc })
 }
 
-# Block-scope let-binding exit drops.
-#
-# For each `SLet(PBind(name), _, rhs)` introduced by this block,
-# decide whether the binding needs a `__perceus_drop` at block exit.
-# The rule mirrors `pcs_collect_exit_drops` for fn params:
-#   - `LUBlocked` (closure capture) → drop.
-#   - `LUAt` with ≥ 2 non-lam uses → drop.
-#   - `LUAt` with exactly 1 non-lam use → no drop (the lexically-last
-#     read transfers the ref raw to its consumer).
-#   - `LUUnused` with a fresh-allocation rhs → no drop: the emitter's
-#     `block_unused_lets` decrefs it inline, and only for a fresh rhs.
-#   - `LUUnused` with a bare-name rhs → drop: a moved alias stays a bare
-#     name the emitter never pays. The planted drop is a read, so
-#     `block_unused_lets` then skips the binder: never both.
-#
-# Names already visible in `outer` (the scope at block entry) are
-# skipped — those are owned by an enclosing scope's drop discipline.
-#
-# Destructuring SLet (PRecord, PVariant, PTuple, ...) is handled by
-# `emit_let_stmt`'s destructuring arm (decrefs the composite temp),
-# so we ignore non-PBind patterns here. `pat_bindings_skip_raw`
-# excludes Tier 2.5 raw locals (`int64_t`, etc.) which have no rc.
+# Block-exit drops for the `let`s this block binds whose payer is the exit
+# (`pcs_let_payer`). A binding read in the tail is left to
+# `ptd_tail_exit_drops`, which releases after the tail value exists; a name
+# visible in `outer` belongs to an enclosing scope. Destructuring lets are
+# paid by `emit_let_stmt`, which decrefs the composite temp, and raw locals
+# carry no rc.
 fn pcs_collect_block_let_exit_drops(stmts: [Stmt], outer: [String],
                                      uses: [Use], opt_tail: Option[Expr],
                                      move_last_set: [String],
@@ -4923,26 +4668,10 @@ fn pcs_collect_block_let_exit_drops(stmts: [Stmt], outer: [String],
       let acc1 = match s {
         SLet(pat, _, rhs) -> match pat.pkind {
           PBind(nm) -> {
-            let names_in = prc_pat_bindings_skip_raw(pat, rhs, [])
-            let in_block = list_has(names_in, nm) and not list_has(outer, nm)
-            let in_tail = pcs_name_in_tail(nm, opt_tail)
-            # A move-at-last binder already releases the birth ref at its
-            # last use; an exit-drop here would double-free it.
-            let moves = list_has(move_last_set, nm)
-            if in_block and not in_tail and not moves {
-              match last_use_for(nm, uses) {
-                LUBlocked(_) -> [pcs_make_drop_stmt(nm, pat.line, pat.col), ...acc]
-                LUAt(_, _, _) ->
-                  # A force-set name dups on every read, single reads
-                  # included, so the birth ref always needs the drop.
-                  if pcs_count_non_lam_uses(nm, uses, 0) >= 2 or list_has(force_set, nm) {
-                    [pcs_make_drop_stmt(nm, pat.line, pat.col), ...acc]
-                  } else { acc }
-                LUUnused(_) ->
-                  if pcs_rhs_is_bare_var(rhs) {
-                    [pcs_make_drop_stmt(nm, pat.line, pat.col), ...acc]
-                  } else { acc }
-              }
+            let in_block = list_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm) and not list_has(outer, nm)
+            let payer = pcs_let_payer(nm, rhs, uses, list_has(move_last_set, nm), list_has(force_set, nm))
+            if in_block and pcs_pays(payer, PyExit) and not pcs_name_in_tail(nm, opt_tail) {
+              [pcs_make_drop_stmt(nm, pat.line, pat.col), ...acc]
             } else { acc }
           }
           _ -> acc
@@ -4989,22 +4718,6 @@ fn pcs_uses_has_name(uses: [Use], nm: String) : Bool {
   }
 }
 
-fn pcs_rhs_is_bare_var(rhs: Expr) : Bool = match rhs.kind {
-  EVar(_) -> true
-  _       -> false
-}
-
-fn pcs_make_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
-  SExprStmt(Expr {
-    kind: ECall(
-      Expr { kind: EMark(MkDrop), line: ln, col: cl,
-             ty: None, mode: MUnknown },
-      [Expr { kind: EVar(nm), line: ln, col: cl,
-              ty: None, mode: MUnknown }]
-    ),
-    line: ln, col: cl, ty: None, mode: MUnknown
-  })
-
 # ---- Koka Parc `ownedInScope`: owned sibling-param move + branch-drop ----
 #
 # An owned param read exactly once per path (e.g. `r` in
@@ -5028,18 +4741,18 @@ fn pcs_make_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
 #      consuming, no arm reads twice.
 #   5. no arm guard mentions p — a guard can fall through, so a guard
 #      read can neither consume nor host the branch drop soundly.
-#   6. p is read somewhere — a never-read param already takes the entry
-#      drop; branch drops on top of it would release it twice.
+# A never-read param may be selected: its payer is still the entry drop
+# (`pcs_param_payer`), so no branch drop is planted for it.
 # Narrow shape only: the fn body is a single top-level EMatch (possibly
 # under the `__pcs_ret` exit wrap) whose scrutinee does not mention p.
 # A missed selection is a missed optimisation, never a bug.
-fn pcs_owned_scope_move_params(pnames: [String], body: Expr, uses: [Use], skip: [String],
+fn pcs_owned_scope_move_params(pnames: [String], body: Expr, skip: [String],
                                 bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] =
   match pnames {
     [] -> []
     [p, ...rest] -> {
-      let rest_sel = pcs_owned_scope_move_params(rest, body, uses, skip, bmap, cmap, borrowed)
-      if list_has(skip, p) or pcs_never_read(p, uses) { rest_sel }
+      let rest_sel = pcs_owned_scope_move_params(rest, body, skip, bmap, cmap, borrowed)
+      if list_has(skip, p) { rest_sel }
       else {
         let mp = pcs_max_paths_b_expr(p, body, bmap)
         let linear = pcs_all_consumers_linear(p, body)
@@ -5513,26 +5226,12 @@ fn pcs_collect_arm_drops(bound: [String], ln: Int, cl: Int, body: Expr,
         else if pre_tail and pcs_name_in_body_tail(nm, body) { acc }
         else if pcs_guard_has_bare_read(nm, opt_g) { acc }
         else {
-          # Re-scan the arm body for `nm` to get arm-local uses.
-          # The fn-wide `uses` table can over-count `nm` when sibling
-          # arms or unrelated scopes also bind a name `nm`; mirroring
-          # the rule against the global table would emit a drop on a
-          # single-use binding (the lexically-last raw read transfers
-          # the ref, so a drop here would over-decref). The local
-          # rescan is bounded by the arm body's size and runs only
-          # for arms that introduce bindings.
+          # Arm-local reads: the fn-wide table over-counts a name that
+          # sibling arms also bind. A forced binder's dup'd read is paid by
+          # the guard-fail and goto planters, not here. The tcrec goto
+          # ledger reads a planted drop as a consume and does not pay again.
           let arm_uses = pcs_collect_uses_expr(body, [nm], false, [])
-          let arm_count = pcs_count_non_lam_uses(nm, arm_uses, 0)
-          let in_lam = pcs_uses_have_in_lam(arm_uses, nm)
-          if in_lam {
-            [pcs_make_drop_stmt(nm, ln, cl), ...acc]
-          } else if arm_count >= 2 {
-            [pcs_make_drop_stmt(nm, ln, cl), ...acc]
-          } else if arm_count == 0 and not name_is_unused_binder(nm) {
-            # A zero-use binder still took its bind-incref (only `_`-named
-            # binders are elided by the emitters), and with no read to
-            # transfer the ref this drop is its only payer — the tcrec goto
-            # ledger sees the drop as a consume and will not pay it again.
+          if pcs_pays(pcs_arm_payer(nm, arm_uses), PyExit) {
             [pcs_make_drop_stmt(nm, ln, cl), ...acc]
           } else { acc }
         }
@@ -5678,17 +5377,6 @@ fn pcs_make_guard_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
     ),
     line: ln, col: cl, ty: None, mode: MUnknown
   })
-
-fn pcs_uses_have_in_lam(uses: [Use], nm: String) : Bool {
-  match uses {
-    [] -> false
-    [h, ...rest] -> match h {
-      U(uname, _, _, in_lam) ->
-        if uname == nm and in_lam { true }
-        else { pcs_uses_have_in_lam(rest, nm) }
-    }
-  }
-}
 
 fn pcs_body_is_block_with_tail(body: Expr) : Bool {
   match body.kind {
@@ -5897,56 +5585,6 @@ fn pcs_name_in_body_tail(nm: String, body: Expr) : Bool / Console {
     _ -> {
       let us = pcs_collect_uses_expr(body, [nm], false, [])
       pcs_uses_has_name(us, nm)
-    }
-  }
-}
-
-# ---- m5 #2 — last-use analysis (fn-param scope) ----
-#
-# For each `pub fn` parameter, find the lexical position of its last
-# direct read in the body. Reads inside an `ELambda` body are
-# conservatively treated as closure captures and BLOCK "last": the
-# lambda may survive past its own evaluation point, so the captured
-# binding is alive until the closure dies. m5 #2 stays at fn-param
-# scope; let-bindings, match-pattern bindings, and closure-aware
-# data-flow refinement land in m5 #2b / m5 #3.
-#
-# Output is diagnostic only — `--dump-last-use` prints one line per
-# parameter:
-#   fn add@10:
-#     param x: last-use at 10:32
-#     param y: last-use at 10:36
-#     param z: blocked by closure capture
-#     param u: never used
-# m5 #3 will consume the same `last_use_for` result to drive drop
-# emission.
-
-#[doc("Last-use classification (LUUnused / LUBlocked / LUAt) for a name over a [Use] list. Pub because the tco pre-pass in main consults it to align goto-loop drops.")]
-pub fn last_use_for(nm: String, uses: [Use]) : LU =
-  last_use_for_loop(nm, uses, false, -1, -1)
-
-fn last_use_for_loop(nm: String, uses: [Use], blocked: Bool,
-                     mx_line: Int, mx_col: Int) : LU {
-  match uses {
-    [] -> {
-      if blocked { LUBlocked(nm) }
-      else if mx_line < 0 { LUUnused(nm) }
-      else { LUAt(nm, mx_line, mx_col) }
-    }
-    [h, ...rest] -> match h {
-      U(uname, ln, cl, in_lam) -> {
-        if uname == nm {
-          if in_lam {
-            last_use_for_loop(nm, rest, true, mx_line, mx_col)
-          } else if ln > mx_line or (ln == mx_line and cl > mx_col) {
-            last_use_for_loop(nm, rest, blocked, ln, cl)
-          } else {
-            last_use_for_loop(nm, rest, blocked, mx_line, mx_col)
-          }
-        } else {
-          last_use_for_loop(nm, rest, blocked, mx_line, mx_col)
-        }
-      }
     }
   }
 }

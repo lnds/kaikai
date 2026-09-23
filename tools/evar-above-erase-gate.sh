@@ -52,6 +52,7 @@ ALLOW="$ALLOW|emit_tcrec_live|cache_delta_test|resolve_sym_test"
 # Passes at or below the erasure. `EVar` is their correct form: the name
 # is a C symbol there, and `sym_erase` is what put it back.
 BELOW='sym_erase|perceus|perceus_plant_drop|perceus_tail_drop|perceus_op_arg'
+BELOW="$BELOW|perceus_payer|perceus_let_own"
 BELOW="$BELOW|emit_c|emit_shared|unbox|unbox_native_raw|kir_lower|kir_lower_walk"
 BELOW="$BELOW|cell_promote|region|driver"
 

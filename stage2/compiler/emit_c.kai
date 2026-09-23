@@ -76,6 +76,7 @@ import compiler.native_prims
 import compiler.unbox
 import compiler.perceus
 import compiler.borrow_view
+import compiler.perceus_payer
 import compiler.protos
 import compiler.emit_shared
 import compiler.emit_cache
@@ -14111,72 +14112,18 @@ fn tcrec_block_scope(stmts: [Stmt], scope: [String]) : [String] {
   }
 }
 
-# ---- m37 / TCO — self-tail-call rewrite (M2) ----------------------
+# ---- m37 / TCO: self-tail-call rewrite ------------------------------
 #
-# Runs after `perceus_pass`. For every fn whose body contains at least
-# one self-tail-call (per M1), the callee `EVar(name)` of each such
-# tail call is replaced with `EVar(sentinel)` where `sentinel` is a
-# pipe-encoded string carrying everything `emit_call_expr` needs:
+# Runs after `perceus_pass`. Each self-tail-call's callee is replaced with
+# a pipe-encoded sentinel carrying what `emit_call_expr` needs:
 #
 #     __kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...
 #
-# - `c_sym`     — the linker symbol of the enclosing fn (used to mint
-#                 the goto label `_kai_<c_sym>_entry`).
-# - `dropmask`  — bit `i` set iff parameter `i` should be dropped
-#                 before the rebind in the goto block. The criterion
-#                 mirrors `pcs_collect_exit_drops`: a param gets a
-#                 drop in the goto block iff `last_use_for` is
-#                 `LUBlocked` or `LUAt` with multi-use. This makes
-#                 the goto-path's drops byte-for-byte equivalent to
-#                 the wrap's exit drops, which the goto skips by
-#                 jumping out of the enclosing statement-expression.
-# - `p0..pN`    — parameter names, in declaration order, used to
-#                 emit `kai_<pname> = _t<i>;` in the goto block.
-#
-# `emit_fn_body` walks the rewritten body once and plants the goto
-# label `_kai_<c_sym>_entry:;` before `return ({ ... });` whenever a
-# sentinel call is present.
-#
-# Pipe was chosen as the separator because it cannot appear in kaikai
-# identifiers and so cannot collide with parameter names.
-#
-# M2 lands the rewrite + sentinel scanner only; no caller wires
-# `tcrec_rewrite_decls` into the pipeline yet, so selfhost stays
-# byte-identical until M3 connects the pieces.
-
-# ---- m37 / TCO — self-tail-call rewrite (M2) ----------------------
-#
-# Runs after `perceus_pass`. For every fn whose body contains at least
-# one self-tail-call (per M1), the callee `EVar(name)` of each such
-# tail call is replaced with `EVar(sentinel)` where `sentinel` is a
-# pipe-encoded string carrying everything `emit_call_expr` needs:
-#
-#     __kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...
-#
-# - `c_sym`     — the linker symbol of the enclosing fn (used to mint
-#                 the goto label `_kai_<c_sym>_entry`).
-# - `dropmask`  — bit `i` set iff parameter `i` should be dropped
-#                 before the rebind in the goto block. The criterion
-#                 mirrors `pcs_collect_exit_drops`: a param gets a
-#                 drop in the goto block iff `last_use_for` is
-#                 `LUBlocked` or `LUAt` with multi-use. This makes
-#                 the goto-path's drops byte-for-byte equivalent to
-#                 the wrap's exit drops, which the goto skips by
-#                 jumping out of the enclosing statement-expression.
-# - `p0..pN`    — parameter names, in declaration order, used to
-#                 emit `kai_<pname> = _t<i>;` in the goto block.
-#
-# `emit_fn_body` walks the rewritten body once and plants the goto
-# label `_kai_<c_sym>_entry:;` before `return ({ ... });` whenever a
-# sentinel call is present.
-#
-# Pipe was chosen as the separator because it cannot appear in kaikai
-# identifiers and so cannot collide with parameter names.
-#
-# M2 lands the rewrite + sentinel scanner only; no caller wires
-# `tcrec_rewrite_decls` into the pipeline yet, so selfhost stays
-# byte-identical until M3 connects the pieces.
-#[doc("---- m37 / TCO — self-tail-call rewrite (M2) ---------------------- Runs after `perceus_pass`. For every fn whose body contains at least one self-tail-call (per M1), the callee…")]
+# `c_sym` mints the goto label `_kai_<c_sym>_entry`; bit `i` of `dropmask`
+# drops param `i` before the rebind, standing in for the exit drop the goto
+# jumps past (`tcrec_compute_site_dropmask`); `p0..pN` are the params in
+# declaration order. Pipe cannot appear in a kaikai identifier.
+#[doc("Rewrite every self-tail-call into the goto sentinel the C and native emitters lower to a loop.")]
 pub fn tcrec_rewrite_decls(decls: [Decl], allow_trmc: Bool, cons_ok: Bool, root: String) : [Decl] / Console = {
   # The goto rebinds a parameter slot in place, so a read that hands the
   # value to a BORROWED callee slot leaves the old value unreleased: the
@@ -14186,31 +14133,10 @@ pub fn tcrec_rewrite_decls(decls: [Decl], allow_trmc: Bool, cons_ok: Bool, root:
   map(decls, (d) => tcrec_rewrite_decl(d, allow_trmc, cons_ok, bv_for_decl(views, d)))
 }
 
-# Pipeline reorder (Eric review 2026-05-06):
-# tcrec runs AFTER perceus_pass, so the body it receives may be
-# wrapped in `EBlock([...entry_drops, SLet(__pcs_ret, INNER),
-# ...exit_drops], Some(EVar(__pcs_ret)))` (`pcs_wrap_with_exit`).
-# `tcrec_is_pcs_ret_wrap` recognises the shape; when present,
-# `tcrec_rewrite_pcs_ret_wrap` rebuilds the wrap around a rewritten
-# inner body. Self-tail-calls in the wrap-less case (no exit drops,
-# body unchanged or `EBlock(entry, Some(body))` with entry-only
-# drops) work without any unwrap because the structural walker
-# already descends through `EBlock(_, Some(tail))`. Only the exit-
-# drops shape needs special handling because its tail is
-# `EVar(__pcs_ret)` instead of the original body.
-
-# Pipeline reorder (Eric review 2026-05-06):
-# tcrec runs AFTER perceus_pass, so the body it receives may be
-# wrapped in `EBlock([...entry_drops, SLet(__pcs_ret, INNER),
-# ...exit_drops], Some(EVar(__pcs_ret)))` (`pcs_wrap_with_exit`).
-# `tcrec_is_pcs_ret_wrap` recognises the shape; when present,
-# `tcrec_rewrite_pcs_ret_wrap` rebuilds the wrap around a rewritten
-# inner body. Self-tail-calls in the wrap-less case (no exit drops,
-# body unchanged or `EBlock(entry, Some(body))` with entry-only
-# drops) work without any unwrap because the structural walker
-# already descends through `EBlock(_, Some(tail))`. Only the exit-
-# drops shape needs special handling because its tail is
-# `EVar(__pcs_ret)` instead of the original body.
+# The body may arrive wrapped by perceus as `EBlock([entry..., SLet(__pcs_ret,
+# INNER), exit...], Some(EVar(__pcs_ret)))`; `tcrec_rewrite_pcs_ret_wrap`
+# rewrites INNER and rebuilds the wrap. The wrap-less and entry-only shapes
+# need no unwrap: the walker descends through `EBlock(_, Some(tail))`.
 fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: [BorrowEntry]) : Decl / Console {
 
   match d {
@@ -14494,98 +14420,21 @@ fn tcrec_rebuild_pcs_ret_wrap(orig: Expr, before: [Stmt], new_inner: Expr,
 fn tcrec_any_unused(params: [Param], uses: [Use]) : Bool {
   match params {
     [] -> false
-    [p, ...rest] -> match last_use_for(p.pname, uses) {
-      LUUnused(_) -> true
-      _ -> tcrec_any_unused(rest, uses)
-    }
+    [p, ...rest] -> pcs_unread(p.pname, uses) or tcrec_any_unused(rest, uses)
   }
 }
 
-# Conservative per-call-site dropmask. The criterion for each
-# parameter p mirrors `pcs_collect_exit_drops` exactly:
-#
-#   - LUBlocked              → drop.
-#   - LUAt + count(p) >= 2   → drop (every read is `__perceus_dup`-
-#                               wrapped, so the original ref is
-#                               unconsumed at the wrap's exit, which
-#                               the goto skips).
-#   - LUAt + count(p) == 1   → no drop. The single read transfers
-#                               ownership to its consumer; if the
-#                               consumer happens to live inside the
-#                               args, evaluating them already
-#                               releases p (so a goto-block drop
-#                               would double-free). If the consumer
-#                               lives *outside* the args (e.g. p
-#                               was the scrutinee of an enclosing
-#                               match — `nth`'s
-#                               `match xs { … nth(t, i-1) … }`),
-#                               the goto skips that match's exit
-#                               `kai_decref(_scr)` and we leak the
-#                               cons cell once per iteration. The
-#                               leak is bounded and tracked as
-#                               issue #43 / issue #92 (R6, re-land
-#                               blocked — three
-#                               structurally different attempts
-#                               in PR #41 + PR #48 all tripped a
-#                               glibc tcache-integrity abort during
-#                               stage 2's selfhost on Linux). The
-#                               canonical leak shape is the fixture
-#                               `examples/tco/list_nth_shape.kai`.
-#   - LUUnused               → unreachable (`tcrec_any_unused` made
-#                               us bail out before getting here).
-
-# Conservative per-call-site dropmask. The criterion for each
-# parameter p mirrors `pcs_collect_exit_drops` exactly:
-#
-#   - LUBlocked              → drop.
-#   - LUAt + count(p) >= 2   → drop (every read is `__perceus_dup`-
-#                               wrapped, so the original ref is
-#                               unconsumed at the wrap's exit, which
-#                               the goto skips).
-#   - LUAt + count(p) == 1   → no drop. The single read transfers
-#                               ownership to its consumer; if the
-#                               consumer happens to live inside the
-#                               args, evaluating them already
-#                               releases p (so a goto-block drop
-#                               would double-free). If the consumer
-#                               lives *outside* the args (e.g. p
-#                               was the scrutinee of an enclosing
-#                               match — `nth`'s
-#                               `match xs { … nth(t, i-1) … }`),
-#                               the goto skips that match's exit
-#                               `kai_decref(_scr)` and we leak the
-#                               cons cell once per iteration. The
-#                               leak is bounded and tracked as
-#                               issue #43 / issue #92 (R6, re-land
-#                               blocked — three
-#                               structurally different attempts
-#                               in PR #41 + PR #48 all tripped a
-#                               glibc tcache-integrity abort during
-#                               stage 2's selfhost on Linux). The
-#                               canonical leak shape is the fixture
-#                               `examples/tco/list_nth_shape.kai`.
-#   - LUUnused               → unreachable (`tcrec_any_unused` made
-#                               us bail out before getting here).
+# Per-call-site dropmask: bit `i` is set iff param `i`'s payer is the exit
+# drop, which the goto jumps past. A single-use param whose read sits
+# outside the call's args is rule 3's case (`tcrec_rule3_mask_b`); a
+# never-read param never gets here (`tcrec_any_unused` bails first).
 fn tcrec_compute_site_dropmask(params: [Param], uses: [Use], skip_set: [String],
                                 i: Int, acc: Int) : Int {
   match params {
     [] -> acc
     [p, ...rest] -> {
-      let drop = match last_use_for(p.pname, uses) {
-        LUBlocked(_) -> true
-        LUAt(_, _, _) -> {
-          # Issue #599 — branch-aware alignment: if the param is in
-          # `skip_set`, the pcs_rewrite pass did NOT wrap reads and
-          # `pcs_collect_exit_drops` suppressed the exit drop. The
-          # TCO setup must NOT plant a drop either; the single read
-          # transfers the ref raw to the recursive call's matching
-          # arg, balanced.
-          if list_has(skip_set, p.pname) { false }
-          else { pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 }
-        }
-        LUUnused(_) -> false
-      }
-      let acc1 = if drop { acc + tcrec_pow2(i) } else { acc }
+      let sets = PcsParamSets { moved: skip_set, forced: [], branch: [] }
+      let acc1 = if pcs_pays(pcs_param_payer(p.pname, uses, sets), PyExit) { acc + tcrec_pow2(i) } else { acc }
       tcrec_compute_site_dropmask(rest, uses, skip_set, i + 1, acc1)
     }
   }
@@ -14795,14 +14644,9 @@ fn tcrec_rule3_mask_b(params: [Param], uses: [Use], args: [Expr],
   match params {
     [] -> acc
     [p, ...rest] -> {
-      let fire = match last_use_for(p.pname, uses) {
-        LUAt(_, _, _) ->
-          if pcs_count_non_lam_uses(p.pname, uses, 0) == 1 {
-            if tcrec_args_have_evar(args, p.pname) { false }
-            else { tcrec_nth_bool(borrow_flags, i, false) }
-          } else { false }
-        _ -> false
-      }
+      let fire = pcs_fate_transfers(pcs_fate_of(p.pname, uses, false, false)) and
+                 not tcrec_args_have_evar(args, p.pname) and
+                 tcrec_nth_bool(borrow_flags, i, false)
       # The value handed to a BORROWED callee slot in these very args is
       # never released by the callee, and the goto is about to rebind the
       # slot over it. Nothing else on this path consumes it, so the goto

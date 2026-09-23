@@ -1,0 +1,104 @@
+# A `let` binds an owned reference.
+#
+# Every rhs shape already yields one: a temporary is fresh, a multi-read
+# local dups, a single-read local moves its birth ref in. The one shape that
+# does not is a BORROWED binder read bare where the rhs yields its value:
+# the function never owned it, so the binding would hold a reference nobody
+# gave it. Its payer would then release the caller's reference, or its last
+# read would move that reference into a consumer, and the caller's next
+# read of the borrowed value is a use-after-free.
+#
+# This pass dups those reads, and only those. The rhs yields its value from
+# itself and, through `if`, `match` and block tails, from every leaf those
+# may return. A binder that shadows a borrowed name owns its own value.
+
+import compiler.ast
+import compiler.ast_map
+import compiler.fnreg
+import compiler.modules
+import compiler.util
+
+#[doc("Dup every bare read of a `borrowed` binder that a `let` rhs yields as its value.")]
+pub fn plo_own_let_values(e: Expr, borrowed: [String]) : Expr = match borrowed {
+  []         -> e
+  [_, ...__] -> plo_expr(e, borrowed)
+}
+
+fn plo_expr(e: Expr, borrowed: [String]) : Expr =
+  Expr { kind: plo_kind(e.kind, borrowed), line: e.line, col: e.col,
+         ty: e.ty, mode: e.mode }
+
+fn plo_kind(k: ExprKind, borrowed: [String]) : ExprKind = match k {
+  EBlock(stmts, tail) -> plo_block(stmts, tail, borrowed)
+  EMatch(scr, arms)   -> EMatch(plo_expr(scr, borrowed), map(arms, (a) => plo_arm(a, borrowed)))
+  ELambda(ps, b)      -> ELambda(ps, plo_expr(b, plo_unbind(borrowed, map(ps, (p) => p.pname))))
+  _                   -> prc_map_expr_kind(k, (x) => plo_expr(x, borrowed))
+}
+
+fn plo_arm(a: Arm, borrowed: [String]) : Arm = match a {
+  Arm(pat, g, b) -> {
+    let live = plo_unbind(borrowed, pat_binders(pat, []))
+    Arm(pat, prc_map_opt_expr(g, (x) => plo_expr(x, live)), plo_expr(b, live))
+  }
+}
+
+fn plo_block(stmts: [Stmt], tail: Option[Expr], borrowed: [String]) : ExprKind =
+  EBlock(plo_stmts(stmts, borrowed),
+         prc_map_opt_expr(tail, (t) => plo_expr(t, plo_live_after(stmts, borrowed))))
+
+fn plo_stmts(stmts: [Stmt], borrowed: [String]) : [Stmt] = match stmts {
+  []           -> []
+  [s, ...rest] -> [plo_stmt(s, borrowed), ...plo_stmts(rest, plo_live_after([s], borrowed))]
+}
+
+# A `__`-named `let` is perceus's own wrap of a tail value: it passes the
+# value through and owns nothing of its own.
+fn plo_stmt(s: Stmt, borrowed: [String]) : Stmt = match s {
+  SLet(pat, ann, rhs) ->
+    if plo_is_wrap(pat) { SLet(pat, ann, plo_expr(rhs, borrowed)) }
+    else { SLet(pat, ann, plo_value(plo_expr(rhs, borrowed), borrowed)) }
+  _ -> prc_map_stmt_exprs(s, (x) => plo_expr(x, borrowed))
+}
+
+fn plo_is_wrap(pat: Pattern) : Bool = match pat.pkind {
+  PBind(nm) -> string_starts_with_q(nm, "__")
+  _         -> false
+}
+
+fn plo_value(e: Expr, borrowed: [String]) : Expr = match e.kind {
+  EVar(nm) -> if list_has(borrowed, nm) { plo_dup(e) } else { e }
+  _        -> Expr { kind: plo_value_kind(e.kind, borrowed), line: e.line, col: e.col,
+                     ty: e.ty, mode: e.mode }
+}
+
+fn plo_value_kind(k: ExprKind, borrowed: [String]) : ExprKind = match k {
+  EIf(c, t, oe)       -> EIf(c, plo_value(t, borrowed), prc_map_opt_expr(oe, (x) => plo_value(x, borrowed)))
+  EMatch(scr, arms)   -> EMatch(scr, map(arms, (a) => plo_value_arm(a, borrowed)))
+  EBlock(stmts, tail) ->
+    EBlock(stmts, prc_map_opt_expr(tail, (t) => plo_value(t, plo_live_after(stmts, borrowed))))
+  _                   -> k
+}
+
+fn plo_value_arm(a: Arm, borrowed: [String]) : Arm = match a {
+  Arm(pat, g, b) -> Arm(pat, g, plo_value(b, plo_unbind(borrowed, pat_binders(pat, []))))
+}
+
+fn plo_live_after(stmts: [Stmt], borrowed: [String]) : [String] = match stmts {
+  []           -> borrowed
+  [s, ...rest] -> plo_live_after(rest, plo_unbind(borrowed, plo_stmt_binders(s)))
+}
+
+fn plo_stmt_binders(s: Stmt) : [String] = match s {
+  SLet(pat, _, _)      -> pat_binders(pat, [])
+  SVar(nm, _, _, _, _) -> [nm]
+  _                    -> []
+}
+
+fn plo_unbind(borrowed: [String], bound: [String]) : [String] = match bound {
+  [] -> borrowed
+  _  -> filter(borrowed, (b) => not list_has(bound, b))
+}
+
+fn plo_dup(a: Expr) : Expr =
+  Expr { kind: ECall(mk_ref("__perceus_dup", a.line, a.col), [a]),
+         line: a.line, col: a.col, ty: a.ty, mode: a.mode }
