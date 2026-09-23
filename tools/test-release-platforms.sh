@@ -79,11 +79,11 @@ stub_uname='uname() {
   esac
 }'
 
-# `kai upgrade`'s token, via the live upgrade_platform extracted from bin/kai.
+# `kai upgrade`'s token, via the live upgrade_platform of the kai-upgrade plugin.
 awk '/^upgrade_platform\(\) \{/{f=1} f{print} f&&/^\}/{exit}' \
-  "$ROOT/bin/kai" > "$work/upgrade_platform.sh"
+  "$ROOT/tools/kai/plugins/kai-upgrade" > "$work/upgrade_platform.sh"
 grep -q 'upgrade_platform' "$work/upgrade_platform.sh" \
-  || fail "could not extract upgrade_platform from bin/kai"
+  || fail "could not extract upgrade_platform from tools/kai/plugins/kai-upgrade"
 
 wrapper_token() {
   STUB_OS="$1" STUB_ARCH="$2" sh -c "

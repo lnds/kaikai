@@ -145,9 +145,9 @@ printf 'new\n' > "$top/share/kaikai/VERSION"
 
 swap="$TMP/swap.sh"
 awk '/^  # Swap contents in place\./{f=1} f{print} /^  done$/{if(f&&++d==2)exit}' \
-  "$ROOT/bin/kai" > "$swap.body"
+  "$ROOT/tools/kai/plugins/kai-upgrade" > "$swap.body"
 if [ ! -s "$swap.body" ]; then
-  note "could not extract the swap block from bin/kai — markers moved"
+  note "could not extract the swap block from tools/kai/plugins/kai-upgrade — markers moved"
   exit 1
 fi
 {

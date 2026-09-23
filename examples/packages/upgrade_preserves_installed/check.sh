@@ -44,14 +44,14 @@ chmod +x "$top/bin/kai"
 printf 'new\n' > "$top/libexec/kaikai/kaic2"
 printf 'new\n' > "$top/share/kaikai/VERSION"
 
-# --- run the swap block verbatim from bin/kai -------------------------
+# --- run the swap block verbatim from the kai-upgrade plugin ----------
 # Extracted by markers so the fixture cannot drift from the shipped code:
 # if the block is edited, this runs the edited version.
 swap="$TMP/swap.sh"
 awk '/^  # Swap contents in place\./{f=1} f{print} /^  done$/{if(f&&++d==2)exit}' \
-  "$ROOT/bin/kai" > "$swap.body"
+  "$ROOT/tools/kai/plugins/kai-upgrade" > "$swap.body"
 if [ ! -s "$swap.body" ]; then
-  note "could not extract the swap block from bin/kai — markers moved"
+  note "could not extract the swap block from tools/kai/plugins/kai-upgrade — markers moved"
   exit 1
 fi
 {
@@ -87,10 +87,10 @@ done
 
 # --- install and upgrade must agree on the prefix ---------------------
 # The ledger only protects binaries if both commands read the same
-# directory. `kai upgrade` uses $ROOT (the wrapper's grandparent), so an
-# installed layout must resolve there even when $KAIKAI_HOME points
-# elsewhere — otherwise the ledger sits in one prefix and the upgrade
-# wipes another.
+# directory. `kai upgrade` upgrades the KAIKAI_HOME kai exports, which in
+# an installed layout is kai's own root, so install must resolve there too
+# even when $KAIKAI_HOME points elsewhere — otherwise the ledger sits in
+# one prefix and the upgrade wipes another.
 probe="$TMP/prefix-probe.sh"
 sed -n '/^install_prefix() {/,/^}/p' "$ROOT/bin/kai" > "$probe"
 if [ ! -s "$probe" ]; then

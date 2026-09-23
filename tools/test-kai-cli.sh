@@ -1,7 +1,8 @@
 #!/bin/sh
 # Gate for the kai binary (tools/kai): `kai env`, the plugin contract, the
-# dispatch of an unknown verb to `kai-<verb>` on PATH, build/run and the
-# dev-loop verbs — in a dev checkout and in an installed prefix.
+# dispatch of an unknown verb to `kai-<verb>` on PATH (`kai upgrade` among
+# them), build/run and the dev-loop verbs — in a dev checkout and in an
+# installed prefix.
 
 set -eu
 
@@ -170,6 +171,22 @@ expect "env: through a symlinked bin/kai" 0 "$P" "$TMP/kai-link" env KAIKAI_HOME
 rm "$P/libexec/kaikai/kai"
 expect_line "installed prefix without the binary" 2 \
   "kai: error: kai binary missing at $P/libexec/kaikai/kai — installation is corrupt" "$P/bin/kai" env
+
+# `kai upgrade` is a plugin the toolchain ships: found before PATH, it
+# upgrades the prefix kai exports.
+C="$TMP/Cellar/kaikai/0.0.1"
+mkdir -p "$C/bin" "$C/libexec/kaikai/plugins" "$C/share/kaikai/stdlib"
+cp "$ROOT/bin/kai" "$C/bin/kai"
+cp "$ROOT/tools/kai/kai" "$C/libexec/kaikai/kai"
+cp "$ROOT/tools/kai/plugins/kai-upgrade" "$C/libexec/kaikai/plugins/kai-upgrade"
+printf '#!/bin/sh\n' > "$C/libexec/kaikai/kaic2"
+chmod +x "$C/bin/kai" "$C/libexec/kaikai/kaic2"
+expect "upgrade: the plugin acts on the prefix kai exports" 0 "kai is installed via Homebrew ($C/bin/kai).
+Run 'brew upgrade kaikai' to update it." "$C/bin/kai" upgrade
+printf '#!/bin/sh\necho hijacked\n' > "$TMP/plugins/kai-upgrade"
+chmod +x "$TMP/plugins/kai-upgrade"
+expect_line "plugin: the toolchain's own comes before PATH" 0 "usage: kai upgrade" \
+  env PATH="$TMP/plugins:$PATH" "$KAI" upgrade --help
 
 printf 'test-kai-cli: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -21,7 +21,7 @@ trap 'rm -f "$err"' EXIT INT TERM
 
 fail=0
 pass=0
-for f in "$ROOT"/bin/kai "$ROOT"/tests/*.sh; do
+for f in "$ROOT"/bin/kai "$ROOT"/tools/kai/plugins/* "$ROOT"/tests/*.sh; do
   [ -f "$f" ] || continue
   head -1 "$f" | grep -q '^#!/bin/sh' || continue
   name="${f#"$ROOT"/}"
