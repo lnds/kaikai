@@ -115,8 +115,13 @@ echo "==> verifying selfhost byte-identical"
 make -C stage1 selfhost >&2
 make -C stage2 selfhost >&2
 
-# Build kai-pkg (the package-manifest helper). bin/kai dev-mode auto-builds
-# it on first use, but installed mode expects it pre-shipped at
+# The kai binary, built into bin/kai by its own Makefile, which drives kaic2
+# directly. Every step below that runs ./bin/kai needs it.
+echo "==> building kai"
+make -C tools/kai kai >&2
+
+# Build kai-pkg (the package-manifest helper). A checkout builds it on first
+# use, but an installed prefix expects it pre-shipped at
 # libexec/kaikai/kai-pkg — without it, any project with a kai.toml fails
 # with "installation is corrupt" (issue #512). Use the freshly-built kaic2
 # via bin/kai to compile its sources. Force the C backend explicitly:
@@ -136,10 +141,6 @@ KAI_BACKEND=c ./bin/kai build tools/kai-pkg/main.kai -o tools/kai-pkg/kai-pkg >&
 echo "==> building kai-lsp"
 KAI_BACKEND=c ./bin/kai build tools/kai-lsp/main.kai -o tools/kai-lsp/kai-lsp >&2
 
-# Build the kai binary with its own Makefile, which drives kaic2 directly.
-echo "==> building kai"
-make -C tools/kai kai >&2
-
 # Copy artifacts.
 echo "==> assembling installed layout at $STAGE"
 cp bin/kai             "$STAGE/bin/kai"
@@ -150,8 +151,6 @@ cp tools/kai-pkg/kai-pkg "$STAGE/libexec/kaikai/kai-pkg"
 chmod +x               "$STAGE/libexec/kaikai/kai-pkg"
 cp tools/kai-lsp/kai-lsp "$STAGE/libexec/kaikai/kai-lsp"
 chmod +x               "$STAGE/libexec/kaikai/kai-lsp"
-cp tools/kai/kai       "$STAGE/libexec/kaikai/kai"
-chmod +x               "$STAGE/libexec/kaikai/kai"
 cp tools/kai/plugins/kai-upgrade "$STAGE/libexec/kaikai/plugins/kai-upgrade"
 chmod +x               "$STAGE/libexec/kaikai/plugins/kai-upgrade"
 
@@ -161,8 +160,8 @@ chmod +x               "$STAGE/libexec/kaikai/plugins/kai-upgrade"
 # Runtime header + LLVM-path runtime shim (L1+ LLVM-direct).
 # The shipped compiler is stage2/kaic2, whose emitted C calls kai_intf,
 # kai_is_int and the reuse-token helpers that ONLY live in
-# stage2/runtime.h (the tagged-Int Koka runtime). bin/kai documents the
-# installed layout as carrying "a single runtime.h (the stage 2 one)".
+# stage2/runtime.h (the tagged-Int Koka runtime). The installed layout
+# carries a single runtime.h (the stage 2 one).
 # Shipping stage0/runtime.h here was a latent bug from the script's first
 # commit: the C smoke test passes whenever the smoke source never touches
 # the tagged-Int path, and fails (undeclared kai_intf) the moment a
@@ -171,13 +170,11 @@ chmod +x               "$STAGE/libexec/kaikai/plugins/kai-upgrade"
 #
 # The llvm-c-parity lane unified the LLVM shim (runtime_llvm.c) onto the
 # same stage2 runtime.h, so this one header now serves BOTH backends when
-# installed: bin/kai points RUNTIME_INC (LLVM) and RUNTIME_INC_C (C) at
-# share/kaikai/include, and the shim's `#include <runtime.h>` binds here.
+# installed: kai points both runtime include dirs at share/kaikai/include, and the shim's `#include <runtime.h>` binds here.
 cp stage2/runtime.h        "$STAGE/share/kaikai/include/runtime.h"
 cp stage0/runtime_llvm.c   "$STAGE/share/kaikai/include/runtime_llvm.c"
 # The minimal C-backend runtime owner (issue #1238): the C split's -O0 owner
-# object, next to runtime.h so bin/kai's RUNTIME_OWNER_C resolves it here in the
-# installed layout. NOT runtime_llvm.c (the native owner) — see the file's note.
+# object, next to runtime.h so kai resolves it here in the installed layout. NOT runtime_llvm.c (the native owner) — see the file's note.
 cp stage2/runtime_owner_c.c "$STAGE/share/kaikai/include/runtime_owner_c.c"
 
 # P2 (docs/native-codegen-perf-plan.md §P2): ship the native-runtime bitcode
@@ -187,7 +184,7 @@ cp stage2/runtime_owner_c.c "$STAGE/share/kaikai/include/runtime_owner_c.c"
 # clang 18). The bitcode encodes THIS build host's data layout, so it is
 # correct only for a tarball of the SAME platform — which is exactly what a
 # release runner produces (the macOS-arm64 runner builds the macOS-arm64
-# tarball). bin/kai resolves it next to runtime_llvm.c under
+# tarball). kai resolves it next to runtime_llvm.c under
 # share/kaikai/include in the installed layout. ASSERT it is present and
 # active: a release that silently fell back to the legacy cc-link path would
 # ship the slow native default. (build-release runs on a clang-18 runner;
@@ -214,8 +211,8 @@ if [ -f demos/baseline.txt ]; then
 fi
 
 # `kai info` reference pages. Source lives at docs/info/*.md; the
-# installed layout puts them under share/kaikai/info/ where bin/kai
-# looks for them (see `cmd_info` in bin/kai). Distributing through the
+# installed layout puts them under share/kaikai/info/ where `kai info`
+# looks for them. Distributing through the
 # tarball means brew tap users get them automatically — the formula
 # only bumps version+url+sha and never touches contents.
 if [ -d docs/info ]; then
@@ -249,7 +246,7 @@ echo "    staged kaic2: native backend present"
 
 # Smoke test: assert the staged tree resolves itself correctly without
 # falling back to the dev checkout.
-echo "==> smoke test: hello.kai through staged bin/kai"
+echo "==> smoke test: hello.kai through the staged kai"
 SMOKE_DIR="$(mktemp -d)"
 trap 'rm -rf "$SMOKE_DIR"' EXIT
 cat > "$SMOKE_DIR/hello.kai" <<'HEREDOC'

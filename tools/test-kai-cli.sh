@@ -159,9 +159,8 @@ expect "check: --backend is validated" 2 \
 P="$TMP/prefix"
 mkdir -p "$P/bin" "$P/libexec/kaikai" "$P/share/kaikai/stdlib"
 cp "$ROOT/bin/kai" "$P/bin/kai"
-cp "$ROOT/tools/kai/kai" "$P/libexec/kaikai/kai"
 printf '#!/bin/sh\n' > "$P/libexec/kaikai/kaic2"
-chmod +x "$P/bin/kai" "$P/libexec/kaikai/kaic2"
+chmod +x "$P/libexec/kaikai/kaic2"
 case "$(uname -s)" in
   Darwin) ptid="$(stat -f '%m-%z' "$P/libexec/kaikai/kaic2")" ;;
   *)      ptid="$(stat -c '%Y-%s' "$P/libexec/kaikai/kaic2")" ;;
@@ -171,19 +170,23 @@ KAI_STDLIB=$P/share/kaikai/stdlib
 KAI_TOOLCHAIN_ID=$ptid" env KAIKAI_HOME="$TMP/home" "$P/bin/kai" env
 ln -s "$P/bin/kai" "$TMP/kai-link"
 expect "env: through a symlinked bin/kai" 0 "$P" "$TMP/kai-link" env KAIKAI_HOME
-rm "$P/libexec/kaikai/kai"
-expect_line "installed prefix without the binary" 2 \
-  "kai: error: kai binary missing at $P/libexec/kaikai/kai — installation is corrupt" "$P/bin/kai" env
+mkdir -p "$TMP/brew/bin"
+ln -s ../../prefix/bin/kai "$TMP/brew/bin/kai"
+expect "env: through a relative symlink" 0 "$P" "$TMP/brew/bin/kai" env KAIKAI_HOME
+expect "env: found on PATH by name" 0 "$P" sh -c 'cd / && PATH="$1:$PATH" kai env KAIKAI_HOME' _ "$TMP/brew/bin"
+mkdir -p "$TMP/loose/bin"
+cp "$ROOT/bin/kai" "$TMP/loose/bin/kai"
+expect_line "not an installation" 2 "kai: error: cannot find kaikai installation under $TMP/loose" \
+  "$TMP/loose/bin/kai" env
 
 # `kai upgrade` is a plugin the toolchain ships: found before PATH, it
 # upgrades the prefix kai exports.
 C="$TMP/Cellar/kaikai/0.0.1"
 mkdir -p "$C/bin" "$C/libexec/kaikai/plugins" "$C/share/kaikai/stdlib"
 cp "$ROOT/bin/kai" "$C/bin/kai"
-cp "$ROOT/tools/kai/kai" "$C/libexec/kaikai/kai"
 cp "$ROOT/tools/kai/plugins/kai-upgrade" "$C/libexec/kaikai/plugins/kai-upgrade"
 printf '#!/bin/sh\n' > "$C/libexec/kaikai/kaic2"
-chmod +x "$C/bin/kai" "$C/libexec/kaikai/kaic2"
+chmod +x "$C/libexec/kaikai/kaic2"
 expect "upgrade: the plugin acts on the prefix kai exports" 0 "kai is installed via Homebrew ($C/bin/kai).
 Run 'brew upgrade kaikai' to update it." "$C/bin/kai" upgrade
 printf '#!/bin/sh\necho hijacked\n' > "$TMP/plugins/kai-upgrade"

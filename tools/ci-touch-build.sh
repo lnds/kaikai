@@ -70,8 +70,9 @@ for s in "stage0 kaic0" "stage1 kaic1" "stage2 kaic2"; do
     rebuild=1
   fi
 done
-if [ "$rebuild" -eq 0 ]; then
-  echo "ci-touch-build OK — kaic0/kaic1/kaic2 up-to-date, no rebuild needed"
-else
-  exit 1
-fi
+[ "$rebuild" -eq 0 ] || exit 1
+
+# The kai binary is not in the artifact: every gate runs it as bin/kai, so
+# build it here from the restored kaic2 (seconds).
+make -s -C tools/kai kai
+echo "ci-touch-build OK — kaic0/kaic1/kaic2 up-to-date, no rebuild needed; bin/kai built"

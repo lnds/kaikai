@@ -393,7 +393,7 @@ These should NOT invalidate the cache:
 - **Changes to `stage0/runtime.h`**: the cache stores typed AST, not
   C output. Runtime changes affect the final binary (cc compiles
   fresh every time) but not the typed AST.
-- **Changes to `bin/kai` driver shell**: doesn't touch typed AST.
+- **Changes to `kai` (`tools/kai/`)**: doesn't touch typed AST.
 - **Changes to `stage0/parser.c` / `stage0/main.c`**: only affects
   the bootstrap chain. User caches are unaffected unless the
   bootstrap rebuild changes the kaikai_version_hash (which it does
@@ -515,7 +515,7 @@ The user-file analogue of A.0: a per-project, content-addressable cache
 of post-parse `[Decl]` for user modules, with correct transitive
 invalidation. New module `stage2/compiler/user_cache.kai`; the driver's
 import resolver consults it before lexing each imported module. The
-`bin/kai` wrapper creates `<project>/.kai-cache/` and passes
+`kai` driver creates `<project>/.kai-cache/` and passes
 `--user-cache` automatically when the entry sits under a `kai.toml`;
 `KAI_CACHE=0` disables it and `KAI_CACHE=1` forces it on for a loose
 file. The package gate is what makes the typed rebuild cut below pay:

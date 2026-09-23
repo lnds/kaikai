@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-decl-symid-survives test-evar-above-erase test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags test-kai-cli clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 test-light-partition test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily coverage-probe rc-budget stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-rc-budget
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-decl-symid-survives test-evar-above-erase test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags test-kai-cli clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 test-light-partition test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily coverage-probe rc-budget stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-rc-budget bin/kai
 
 # A bare kaic2 with no `--edition` runs the OLDEST edition (tongariki),
 # so a recipe driving the binary directly would test the previous
@@ -30,11 +30,9 @@ kaic2-fast:
 kaic2-fast-verify:
 	$(MAKE) -C stage2 kaic2-fast-verify
 
-# bin/kai is already a checked-in shell script; this target just confirms it
-# is executable and visible.
+# The kai binary; tools/kai/Makefile decides staleness.
 bin/kai:
-	@chmod +x bin/kai
-	@echo "kai driver: $$(realpath bin/kai 2>/dev/null || pwd)/bin/kai"
+	$(MAKE) -s -C tools/kai kai
 
 test: test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record
 
@@ -48,7 +46,7 @@ test-stage2:
 	$(MAKE) -C stage2 test
 
 # Build + run + test every phase 4 demo via bin/kai.
-test-demos: kaic1
+test-demos: kaic2
 	@set -e; \
 	for f in examples/phase4/*.kai; do \
 	  name=$$(basename $$f .kai); \
@@ -89,13 +87,10 @@ test-multi-module: kaic2
 	  echo "$$case OK (abs+rel)"; \
 	done
 
-# Issue #279 regression — exercises bin/kai's `--path "$$STDLIB_ROOT"`
-# resolution end-to-end. The bug fixed in this lane was that line 469
-# of bin/kai hardcoded `--path "$$ROOT/stdlib"` instead of using the
-# already-resolved `$$STDLIB_ROOT`, breaking `import loop` (and any
-# non-prelude stdlib import) in the brew-installed layout where
-# `$$ROOT/stdlib` does not exist. We invoke `bin/kai run` (not kaic2
-# directly) so the wrapper's argument construction is exercised.
+# Issue #279 regression — `kai run` must pass the resolved stdlib root as
+# `--path`, not `$$ROOT/stdlib`, which does not exist in an installed
+# layout; `import loop` (any non-prelude stdlib import) breaks otherwise.
+# Driven through `bin/kai run`, not kaic2, so kai's argv is exercised.
 test-import-stdlib: kaic2
 	@set -e; \
 	root=$$(pwd); \
@@ -194,6 +189,7 @@ clean:
 	$(MAKE) -C stage0 clean
 	$(MAKE) -C stage1 clean
 	$(MAKE) -C stage2 clean
+	$(MAKE) -C tools/kai clean
 
 # ---- testing tiers (see docs/testing-tiers.md) ----------------------
 #
@@ -428,7 +424,7 @@ test-heap-limit: kaic2
 	@$(MAKE) -C stage2 test-heap-limit
 
 # Issue #1012 — the whole compiler links under --emit=c-modular (shared RC
-# free-list pools). Builds stage2/main.kai through bin/kai's KAI_MODULAR
+# free-list pools). Builds stage2/main.kai through kai's KAI_MODULAR
 # path and smokes --version; a regression of the shared-pool guard trips it
 # at link time (multi-GB .bss). Costly (a full modular self-compile), so it
 # rides tier1-shard-1 with the other self-compiles, not the light pool.
@@ -618,7 +614,7 @@ test-info: kaic2
 # `kai doc` smoke (pure shell + awk + python3 for JSON validation).
 # Guards the human reader over the stdlib #[doc(...)] attributes and
 # the `kai --help` heredoc against the #807 unescaped-backtick
-# regression. Needs kaic2 (the extractor) and bin/kai (the wrapper).
+# regression. Needs kaic2 (the extractor) and bin/kai.
 test-doc: kaic2
 	@tools/test-doc.sh
 
@@ -805,7 +801,7 @@ test-namespace-matrix:
 # closes a class should move this number, and a step that breaks a
 # passing cell shows up here. `VERBOSE=1` lists the failing cells;
 # `native` measures the other backend.
-test-namespace-matrix-status:
+test-namespace-matrix-status: bin/kai
 	@./tests/namespace_matrix_status.sh
 
 # Structural debt: km score on the compiler and on the files the name
@@ -1090,11 +1086,11 @@ test-stdlib-modules: kaic2
 KAI_TEST_DRIVER ?= $(CURDIR)/bin/kai
 KAI_TEST_BACKEND ?= c
 
-test-http-redirects:
+test-http-redirects: bin/kai
 	KAI_TEST_DRIVER="$(KAI_TEST_DRIVER)" KAI_TEST_BACKEND="$(KAI_TEST_BACKEND)" python3 tests/http_redirects.py
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) stdlib/net/http.kai
 
-test-core-text:
+test-core-text: bin/kai
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/char_test.kai
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/char_unicode_test.kai
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/string_test.kai
@@ -1299,7 +1295,7 @@ tier1-asan-b: kaic2
 # C-only, and the harness then SKIPs (exit 0) on the very capability the
 # rebuild just removed. Probing first keeps the C-only SKIP intact while
 # making a silent downgrade impossible.
-tier1-backend-parity:
+tier1-backend-parity: bin/kai
 	@bash tools/parity-preserve-native.sh
 	@TARGET_BACKEND=native ORACLE_BACKEND=c NATIVE_PARITY_RATCHET=1 tools/test-backend-parity.sh
 

@@ -57,8 +57,8 @@ LDLIBS_M := -lm
 # `kai build` destination since Lane 1.5 (the flip). Whether a given
 # kaic2 carries the native backend is a BUILD-CAPABILITY decision made
 # here; whether `kai build` *invokes* it is a runtime decision made in
-# `bin/kai resolve_backend()`. The two are deliberately separate: the
-# Makefile decides what is compiled in, the wrapper decides what runs.
+# kai (`cli_compile.resolve_backend`). The two are deliberately separate:
+# the Makefile decides what is compiled in, kai decides what runs.
 #
 # Capability auto-detection (Lane 1.5):
 #   - `make kaic2` with NO KAI_LLVM override probes `llvm-config`. Found
@@ -1399,7 +1399,7 @@ endif
 # A `.c` shim supplied via CFLAGS (the documented FFI-shim pattern) must ride
 # the LINK line: as an extra input next to `-c … -o` clang rejects it
 # ("cannot specify -o when generating multiple output files"). Exercises the
-# bin/kai wrapper end-to-end, not raw kaic2 — the routing lives in the wrapper.
+# kai end-to-end, not raw kaic2 — the routing lives in kai.
 test-ffi-cflags-shim: $(TARGET) build
 	@set -e; \
 	CFLAGS="../examples/ffi/cflags_shim.c" ../bin/kai build --backend=c ../examples/ffi/cflags_shim_link.kai -o build/cflags-shim-c 2> build/cflags-shim-c.err \
@@ -1778,7 +1778,7 @@ endif
 # adapters) or closure/handler thunks — the reachability a strip must not
 # break. Assertions: (1) the default (stripped) build's output is identical
 # to KAI_NATIVE_DEAD_STRIP=0; (2) the stripped binary is smaller — the strip
-# actually fired. End-to-end through bin/kai: the flags live in the wrapper.
+# actually fired. End-to-end through bin/kai: the flags live in kai.
 ifeq ($(KAI_LLVM),1)
 test-native-dead-strip: $(TARGET) build
 	@set -e; \
@@ -11044,7 +11044,7 @@ endif
 # against the single-TU golden. Proves a USER program with its own
 # modules (math.kai, shapes.kai, ...) plus stdlib core modules each
 # land in a distinct translation unit / object and link cleanly — the
-# GHC/Koka model. Mirrors the `bin/kai` wrapper's modular path so CI
+# GHC/Koka model. Mirrors kai's modular path so CI
 # exercises the same split + link discipline the driver ships.
 MODULAR_FIXTURES = ../examples/multi-module/main.kai \
                    ../examples/multi-module/issue-237/main.kai \
@@ -11215,7 +11215,7 @@ test-home-tu-partition: $(TARGET) build
 	  || { echo "home-tu DIFF"; diff $$fx/main.out.expected build/home_tu_partition.out; exit 1; }
 
 # Backend incremental lever — parallel cc + .o content-hash cache.
-# Drives bin/kai's KAI_MODULAR path (the parallel + cache wrapper, not the
+# Drives kai's KAI_MODULAR path (the parallel + cache driver, not the
 # Makefile's own split loop above) and pins the three cache states from
 # the KAI_MODULAR_STATS summary: cold (empty cache -> every TU compiled),
 # warm (no change -> every TU a hit, zero recompiled — the cache win), and
@@ -11346,7 +11346,7 @@ CMODULAR_SELFHOST_CACHE := $(CURDIR)/build/cmodular-selfhost-cache
 # build; the ~86-TU modular split would replicate them into every TU and
 # overflow the small-code-model link reach. The shared-pool guard
 # (KAI_SEPARATE_COMPILATION / KAI_RUNTIME_OWNER) emits one copy, so the
-# split links. Drives bin/kai's KAI_MODULAR path on the compiler itself,
+# split links. Drives kai's KAI_MODULAR path on the compiler itself,
 # smokes `--version`, and then makes the modular-built binary COMPILE a
 # program, byte-compared against $(TARGET)'s output — linking and
 # answering --version is not evidence the binary works (per-TU runtime

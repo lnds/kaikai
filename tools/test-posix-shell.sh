@@ -3,8 +3,8 @@
 # parse under a strict POSIX shell. macOS /bin/sh is bash 3.2 in POSIX
 # mode and accepts constructs dash (the Linux sh running these scripts
 # in CI) rejects at parse time — e.g. an unescaped backquote command
-# substitution inside a heredoc, which made every bin/kai invocation
-# die with "Syntax error: end of file unexpected".
+# substitution inside a heredoc dies with "Syntax error: end of file
+# unexpected".
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -21,7 +21,7 @@ trap 'rm -f "$err"' EXIT INT TERM
 
 fail=0
 pass=0
-for f in "$ROOT"/bin/kai "$ROOT"/tools/kai/plugins/* "$ROOT"/tests/*.sh; do
+for f in "$ROOT"/tools/kai/plugins/* "$ROOT"/tests/*.sh; do
   [ -f "$f" ] || continue
   head -1 "$f" | grep -q '^#!/bin/sh' || continue
   name="${f#"$ROOT"/}"
