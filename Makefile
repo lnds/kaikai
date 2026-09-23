@@ -1283,6 +1283,8 @@ tier1-asan-b: kaic2
 	@echo "tier1-asan OK — a never-read owned param is released once (entry drop only, no branch drops on top)"
 	@$(MAKE) -C stage2 test-perceus-block-let-unused-alias-asan
 	@echo "tier1-asan OK — a never-read block let bound to an alias is released once (exit drop, no double free when the source stays live)"
+	@$(MAKE) -C stage2 test-perceus-closure-capture-tail-asan
+	@echo "tier1-asan OK — a pattern binder captured by a lambda in a self tail call's arguments stays live on the C backend"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,
