@@ -1285,6 +1285,8 @@ tier1-asan-b: kaic2
 	@echo "tier1-asan OK — a never-read block let bound to an alias is released once (exit drop, no double free when the source stays live)"
 	@$(MAKE) -C stage2 test-perceus-closure-capture-tail-asan
 	@echo "tier1-asan OK — a pattern binder captured by a lambda in a self tail call's arguments stays live on the C backend"
+	@$(MAKE) -C stage2 test-perceus-borrow-homonym-asan
+	@echo "tier1-asan OK — a bare callee homonymous across modules reads the calling module's borrow convention (no use-after-free)"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,

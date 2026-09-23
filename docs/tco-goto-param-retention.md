@@ -29,7 +29,7 @@ static KaiValue *kaiu_env_prepend(KaiValue *kaiv_e, KaiValue *kaiv_p) {
 `ConsumeIndex` classifies both as non-consuming, so the consume map cannot
 separate them. The **borrow map** can, and already did: a borrowed parameter
 slot is exactly the slot whose callee takes no ownership. The mechanism was
-built and reachable — `pcs_build_borrow_map` registers `fresh` at position 0,
+built and reachable — `pcs_build_borrow_views` registers `fresh` at position 0,
 and a non-TCO caller already skips the dup and keeps its own drop — but the
 TCO pre-pass never consulted it.
 
