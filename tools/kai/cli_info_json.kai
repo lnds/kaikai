@@ -1,0 +1,132 @@
+#[doc("`kai info <topic> --json`: an info page as `{topic, title, tagline, sections}`, H2 headers keying the sections.")]
+
+#[doc("The lines of `text` as awk reads them: a final newline ends the last record, it does not open an empty one.")]
+pub fn records(text: String) : [String] {
+  let ls = string.split(text, "\n")
+  if string.ends_with(text, "\n") { list.take(ls, list.length(ls) - 1) } else { ls }
+}
+
+#[doc("True when the line holds something besides blanks: awk's `NF > 0`.")]
+pub fn has_field(line: String) : Bool = string.chars(line) |> list.any(c => c != ' ' and c != '\t')
+
+fn hex4(n: Int) : String {
+  let digits = "0123456789abcdef"
+  [12, 8, 4, 0]
+    | (shift => string_slice(digits, n / pow2(shift) % 16, n / pow2(shift) % 16 + 1))
+    |> string.join("")
+}
+
+fn pow2(n: Int) : Int = if n == 0 { 1 } else { 2 * pow2(n - 1) }
+
+fn escape_char(c: Char) : String =
+  if c == '\\' {
+    "\\\\"
+  } else if c == '"' {
+    "\\\""
+  } else if c == '\t' {
+    "\\t"
+  } else if c == '\n' {
+    "\\n"
+  } else if c == '\r' {
+    "\\r"
+  } else if char_to_int(c) < 32 {
+    "\\u#{hex4(char_to_int(c))}"
+  } else {
+    "#{c}"
+  }
+
+fn escape(s: String) : String = string.chars(s) | escape_char |> string.join("")
+
+fn drop_newlines(cs: [Char]) : [Char] = list.drop_while(cs, c => c == '\n')
+
+# `sub(/^\n+/, ""); sub(/\n+$/, "")`.
+fn trim_newlines(s: String) : String =
+  string.chars(s) |> drop_newlines |> list.reverse |> drop_newlines |> list.reverse |> string.from_chars
+
+type Page = {
+  title: String,
+  tagline: String,
+  sec: String,
+  buf: [String],
+  preamble: Bool,
+  out: String,
+  emitted: Bool,
+  avail: String,
+  hits: [Bool]
+}
+
+# The first selector naming `sec`, case-insensitively; with none, every section is wanted.
+fn wanted_at(wanted: [String], sec: String) : Option[Int] =
+  if list.is_empty(wanted) {
+    Some(-1)
+  } else {
+    list.index_of(wanted, w => string.to_lower(w) == string.to_lower(sec))
+  }
+
+fn save(p: Page, wanted: [String]) : Page =
+  if p.sec == "" {
+    p
+  } else {
+    let avail = if p.avail == "" { p.sec } else { "#{p.avail}, #{p.sec}" }
+    match wanted_at(wanted, p.sec) {
+      None -> Page { ...p, avail: avail }
+      Some(i) -> {
+        let body = trim_newlines(string.join(list.reverse(p.buf), "\n"))
+        let entry = "\n    \"#{escape(p.sec)}\": \"#{escape(body)}\""
+        Page {
+          ...p,
+          avail: avail,
+          out: "#{p.out}#{if p.emitted { "," } else { "" }}#{entry}",
+          emitted: true,
+          hits: list.map_indexed(p.hits, (j, h) => h or j == i)
+        }
+      }
+    }
+  }
+
+fn step(p: Page, wanted: [String], line: String) : Page =
+  if string.starts_with(line, "# ") {
+    Page { ...p, title: string.drop_prefix(line, "# ").unwrap_or(""), preamble: true }
+  } else if string.starts_with(line, "## ") {
+    Page {
+      ...save(p, wanted),
+      sec: string.drop_prefix(line, "## ").unwrap_or(""),
+      buf: [],
+      preamble: false
+    }
+  } else if p.preamble {
+    if p.tagline == "" and has_field(line) { Page { ...p, tagline: line } } else { p }
+  } else if p.sec != "" {
+    Page { ...p, buf: [line, ...p.buf] }
+  } else {
+    p
+  }
+
+#[doc("Print page `text` of `topic` as JSON; `want` holds `\\037`-joined section names to keep (empty keeps all). 1 when one names no section.")]
+pub fn render(topic: String, text: String, want: String) : Result[Int, Int] / Stdout + Stderr {
+  let wanted = if want == "" { [] } else { string.split(want, "\u{1f}") }
+  let start = Page {
+    title: "",
+    tagline: "",
+    sec: "",
+    buf: [],
+    preamble: false,
+    out: "",
+    emitted: false,
+    avail: "",
+    hits: wanted | (w => false)
+  }
+  let p = save(records(text) |> list.foldl(start, (acc, l) => step(acc, wanted, l)), wanted)
+  let missing = list.zip(wanted, p.hits) |? (wh => not wh.snd) | (wh => wh.fst)
+  if not list.is_empty(missing) {
+    missing
+      |> foreach(w => Stderr.eprint("kai: error: no section \"#{w}\" in topic \"#{topic}\""))
+    Stderr.eprint("  sections: #{p.avail}")
+    Err(1)
+  } else {
+    Stdout.print(
+      "{\n  \"topic\": \"#{topic}\",\n  \"title\": \"#{escape(p.title)}\",\n  \"tagline\": \"#{escape(p.tagline)}\",\n  \"sections\": {#{p.out}\n  }\n}"
+    )
+    Ok(0)
+  }
+}

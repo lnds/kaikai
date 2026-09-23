@@ -1,0 +1,110 @@
+#[doc("`kai watch`: rebuild and rerun a source on every save; a failed build keeps the loop alive.")]
+
+import cli_compile
+import cli_err
+import cli_fs
+import cli_io
+import cli_plan
+import cli_proc
+import cli_spec
+import cli_sys
+import cli_tool_help
+
+type WatchOpts = { backend: String, help: Bool }
+
+fn parse(args: [String], o: WatchOpts) : Result[(WatchOpts, [String]), Int] / Stderr =
+  match args {
+    [a, ..._] if a == "-h" or a == "--help" -> Ok((WatchOpts { ...o, help: true }, []))
+    ["--backend"] -> cli_err.die("--backend needs an argument (c|native)")
+    ["--backend", v, ...rest] -> parse(rest, WatchOpts { ...o, backend: v })
+    [a, ...rest] if string.starts_with(a, "--backend=") ->
+      parse(rest, WatchOpts { ...o, backend: string.drop_prefix(a, "--backend=").unwrap_or("") })
+    [a, ..._] if string.starts_with(a, "-") ->
+      cli_err.die("unknown flag: #{a} (see 'kai watch --help')")
+    _ -> Ok((o, args))
+  }
+
+fn source(args: [String]) : Result[String, Int] / Stderr + File + Ffi {
+  let src = match args {
+    [] -> cli_spec.resolve("", "building", false)!
+    [a, ..._] if a == "." or string.starts_with(a, "./") -> cli_spec.resolve(a, "building", false)!
+    [a, ..._] -> a
+  }
+  if src == "" {
+    cli_err.die("missing input file (see 'kai watch --help')")
+  } else if not cli_sys.is_file(src) {
+    cli_compile.not_found(src, "watch")
+  } else {
+    Ok("#{cli_fs.dir_of(src).unwrap_or(".")}/#{cli_fs.basename(src)}")
+  }
+}
+
+# One cycle: the build's stderr is held back, shown after `Build OK` is known, or with `Build FAILED`.
+fn cycle(t: Toolchain, b: Backend, src: String, tmp: String) : Unit / Stdout + Stderr + Env + File + Ffi {
+  let bin = "#{tmp}/#{cli_fs.stem(src)}"
+  let ts = cli_io.local_hms()
+  let err = "#{tmp}/watch.err"
+  let saved = cli_io.stderr_to(err)
+  cli_sys.clear_no_llvm()
+  let built = cli_compile.compile(t, b, cli_plan.Job { src, tmp, out: bin, verb: "watch", extra: [] })
+  cli_io.stderr_restore(saved)
+  match built {
+    Ok(_) -> {
+      cli_sys.copy_to_stderr(err)
+      Stdout.print("\n[#{ts}] Build OK")
+      let rc = cli_proc.run([bin], cli_proc.inherit())
+      if rc != 0 { Stdout.print("\n[#{ts}] Program exited with status #{rc}") }
+    }
+    Err(_) -> {
+      Stdout.print("\n[#{ts}] Build FAILED")
+      cli_sys.copy_to_stderr(err)
+    }
+  }
+}
+
+fn on_events(t: Toolchain, b: Backend, src: String, tmp: String, fd: Int) : Unit / Stdout + Stderr + Env + File + Ffi =
+  if cli_sys.read_line(fd) and cli_sys.pending_signal() == 0 {
+    cycle(t, b, src, tmp)
+    on_events(t, b, src, tmp, fd)
+  }
+
+fn poll(t: Toolchain, b: Backend, src: String, tmp: String, last: Int) : Unit / Stdout + Stderr + Env + File + Ffi {
+  cli_io.msleep(500)
+  if cli_sys.pending_signal() == 0 {
+    let now = cli_sys.mtime(src)
+    if now != last { cycle(t, b, src, tmp) }
+    poll(t, b, src, tmp, now)
+  }
+}
+
+fn watch(t: Toolchain, flag: String, src: String, tmp: String) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let b = cli_compile.resolve_backend(flag)!
+  let fswatch = cli_proc.which("fswatch").is_some()
+  Stdout.print("kaikai watch — recompiling on every save")
+  Stdout.print("Watching: #{src}")
+  if fswatch {
+    Stdout.print("(backend: fswatch)")
+  } else {
+    Stdout.print("(backend: mtime poll @ 500ms — install fswatch for lower latency)")
+  }
+  cycle(t, b, src, tmp)
+  if fswatch {
+    ["fswatch", "-o", src] |> foreach(a => cli_sys.argv_push(a))
+    on_events(t, b, src, tmp, cli_sys.spawn_reader())
+  } else {
+    poll(t, b, src, tmp, cli_sys.mtime(src))
+  }
+  Ok(0)
+}
+
+#[doc("`kai watch [--backend c|native] [<spec>]`: runs until interrupted.")]
+pub fn watch_verb(t: Toolchain, args: [String]) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let parsed = parse(args, WatchOpts { backend: "", help: false })!
+  if parsed.fst.help {
+    Stdout.print(cli_tool_help.watch_text())
+    Ok(0)
+  } else {
+    let src = source(parsed.snd)!
+    cli_fs.with_scratch(tmp => watch(t, parsed.fst.backend, src, tmp))
+  }
+}

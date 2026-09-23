@@ -1,0 +1,163 @@
+#[doc("""
+Field readers over `kaic2 --doc-json` output and the text shaping `kai doc` prints.
+
+The stream is scanned, not parsed: items split on the literal
+`{"kind": ` and each field is found by its `"key": ` prefix, so a
+dump reads the same way it always has.
+""")]
+
+import cli_info_json
+
+const ITEM : String = "{\"kind\": "
+
+# The text after the first `needle` in `s`.
+fn after(s: String, needle: String) : Option[String] =
+  match string.split(s, needle) {
+    [_, first, ...rest] -> Some(string.join([first, ...rest], needle))
+    _ -> None
+  }
+
+fn scan(cs: [Char], acc: [Char]) : String =
+  match cs {
+    [] -> string.from_chars(list.reverse(acc))
+    [c, ...rest] if c == '\\' -> match rest {
+      [d, ...more] -> scan(more, [d, c, ...acc])
+      [] -> scan([], [c, ...acc])
+    }
+    [c, ..._] if c == '"' -> string.from_chars(list.reverse(acc))
+    [c, ...rest] -> scan(rest, [c, ...acc])
+  }
+
+# A JSON string body up to its closing quote, escapes left raw.
+fn raw_string(s: String) : String = scan(string.chars(s), [])
+
+# The string value opening `rest`, past its quote.
+fn quoted(rest: String) : String = scan(list.drop(string.chars(rest), 1), [])
+
+fn unescape_chars(cs: [Char], acc: [Char]) : [Char] =
+  match cs {
+    [] -> list.reverse(acc)
+    [c, d, ...rest] if c == '\\' -> {
+      let e = if d == 'n' { '\n' } else if d == 't' { '\t' } else if d == 'r' { '\r' } else { d }
+      unescape_chars(rest, [e, ...acc])
+    }
+    [c, ...rest] -> unescape_chars(rest, [c, ...acc])
+  }
+
+#[doc("Resolve `\\n`, `\\t`, `\\r`; any other `\\X` is `X`.")]
+pub fn unescape(s: String) : String = string.from_chars(unescape_chars(string.chars(s), []))
+
+#[doc("The items of a doc dump, one text slice each, starting just after `{\"kind\": `.")]
+pub fn items(json: String) : [String] =
+  cli_info_json.records(json) || (line => list.drop(string.split(line, ITEM), 1))
+
+#[doc("A string field of an item, escapes left raw; empty when absent or null.")]
+pub fn field(item: String, key: String) : String =
+  match after(item, "\"#{key}\": ") {
+    Some(rest) if not string.starts_with(rest, "null") -> quoted(rest)
+    _ -> ""
+  }
+
+#[doc("True when the item's `pub` field is `true`.")]
+pub fn is_pub(item: String) : Bool =
+  match after(item, "\"pub\": ") {
+    Some(rest) -> string.starts_with(rest, "true")
+    None -> false
+  }
+
+#[doc("The item's kind: the quoted word the slice opens with.")]
+pub fn kind(item: String) : String =
+  match string.split(item, ", \"name\":") {
+    [before, _, ..._] -> {
+      let cs = string.chars(before)
+      string.from_chars(list.take(list.drop(cs, 1), list.length(cs) - 2))
+    }
+    _ -> ""
+  }
+
+#[doc("The item's name, read from its `\"name\": \"` prefix; none when it has no such field.")]
+pub fn name(item: String) : Option[String] =
+  after(item, "\"name\": \"").map(rest => raw_string(rest))
+
+#[doc("The unescaped `module_doc` of a dump's first line; empty when absent or null.")]
+pub fn module_doc(json: String) : String =
+  match list.head(cli_info_json.records(json)) {
+    Some(line) -> match after(line, "\"module_doc\": ") {
+      Some(rest) if not string.starts_with(rest, "null") -> unescape(quoted(rest))
+      _ -> ""
+    }
+    None -> ""
+  }
+
+# The first sentence: cut at the first `. `, keeping the period.
+fn sentence(para: String) : String =
+  match string.split(para, ". ") {
+    [first, _, ..._] -> "#{first}."
+    _ -> para
+  }
+
+fn paragraph(lines: [String], blank: (String) -> Bool) : String =
+  lines
+    |> list.foldl(("", false), (st, l) => {
+      if st.snd {
+        st
+      } else if blank(l) {
+        (st.fst, st.fst != "")
+      } else {
+        (if st.fst == "" { l } else { "#{st.fst} #{l}" }, false)
+      }
+    })
+    |> (st => st.fst)
+
+#[doc("The synopsis of a doc text: its first paragraph joined on spaces, cut after the first sentence.")]
+pub fn synopsis(text: String) : String =
+  sentence(paragraph(cli_info_json.records(text), l => not cli_info_json.has_field(l)))
+
+#[doc("The synopsis of an item's raw `doc` field, where only `\\n` escapes are resolved and only an empty line ends the paragraph.")]
+pub fn item_synopsis(raw: String) : String =
+  sentence(paragraph(string.split(string.replace(raw, "\\n", "\n"), "\n"), l => l == ""))
+
+fn is_ws(c: Char) : Bool = c == ' ' or c == '\t' or c == '\r' or c == '\n' or c == '\x0B' or c == '\x0C'
+
+fn trim_ws(cs: [Char]) : [Char] = list.drop_while(cs, is_ws)
+
+fn heading(cs: [Char]) : Option[String] {
+  let body = list.drop_while(cs, c => c == '#')
+  let hashes = list.length(cs) - list.length(body)
+  match body {
+    [c, ..._] if hashes > 0 and is_ws(c) -> Some(string.from_chars(trim_ws(body)))
+    _ -> None
+  }
+}
+
+fn bullet(cs: [Char]) : Option[String] =
+  match trim_ws(cs) {
+    [m, c, ...rest] if (m == '-' or m == '*') and is_ws(c) -> Some(string.from_chars(rest))
+    _ -> None
+  }
+
+fn render_line(fence: Bool, line: String) : (Bool, [String]) {
+  let cs = string.chars(line)
+  if string.starts_with(string.from_chars(trim_ws(cs)), "```") {
+    (not fence, [""])
+  } else if fence {
+    (fence, ["      #{line}"])
+  } else {
+    match heading(cs) {
+      Some(h) -> (fence, ["", "  #{h}"])
+      None -> match bullet(cs) {
+        Some(b) -> (fence, ["    - #{b}"])
+        None -> (fence, ["  #{line}"])
+      }
+    }
+  }
+}
+
+#[doc("A CommonMark doc body reflowed for a terminal: fences indented, headings and bullets normalised.")]
+pub fn render_body(body: String) : [String] =
+  cli_info_json.records("#{body}\n")
+    |> list.foldl((false, []), (st, line) => {
+      let r = render_line(st.fst, line)
+      (r.fst, list.reverse(r.snd) ++ st.snd)
+    })
+    |> (st => list.reverse(st.snd))

@@ -1,0 +1,187 @@
+#[doc("`kai fmt`: the canonical formatter over a file, a whole package, or stdin.")]
+
+import cli_blocks
+import cli_compile
+import cli_err
+import cli_fs
+import cli_io
+import cli_manifest
+import cli_proc
+import cli_sys
+import cli_toolchain
+import cli_tool_help
+
+type FmtOpts = { spec: String, check_only: Bool, stdin: Bool, width: String, help: Bool }
+
+fn parse(args: [String], o: FmtOpts) : Result[FmtOpts, Int] / Stderr =
+  match args {
+    [] -> Ok(o)
+    [a, ..._] if a == "-h" or a == "--help" -> Ok(FmtOpts { ...o, help: true })
+    ["--check", ...rest] -> parse(rest, FmtOpts { ...o, check_only: true })
+    ["--stdin", ...rest] -> parse(rest, FmtOpts { ...o, stdin: true })
+    ["--width"] -> cli_err.die("--width requires a column count")
+    ["--width", w, ...rest] -> parse(rest, FmtOpts { ...o, width: w })
+    [a, ...rest] if string.starts_with(a, "--width=") ->
+      parse(rest, FmtOpts { ...o, width: string.drop_prefix(a, "--width=").unwrap_or("") })
+    [a, ..._] if string.starts_with(a, "-") ->
+      cli_err.die("unknown flag: #{a} (see 'kai fmt --help')")
+    [a, ...rest] ->
+      if o.spec != "" {
+        cli_err.die("only one input file supported")
+      } else {
+        parse(rest, FmtOpts { ...o, spec: a })
+      }
+  }
+
+# The width a file under `dir` is laid out against: the flag, else its package's `[fmt]` width, else 100.
+fn width_for(dir: String, flag: String) : String / File + Ffi =
+  if flag != "" {
+    flag
+  } else {
+    match cli_manifest.find_dir(dir) {
+      Some(m) -> cli_manifest.fmt_width(m).unwrap_or("100")
+      None -> "100"
+    }
+  }
+
+fn kaic2(t: Toolchain, width: String, mode: String, file: String) : [String] =
+  [t.layout.kaic2, "--fmt-width", width, mode, file]
+
+# `$(…)` drops trailing newlines: output made only of them reads as empty.
+fn printed(s: String) : Bool = string.replace(s, "\n", "") != ""
+
+# Rewrite `file` with its formatted text, touching it only when the text changes.
+fn rewrite(t: Toolchain, file: String, width: String, tmp: String) : Bool / File + Ffi {
+  let out = "#{tmp}/out.kai"
+  let sp = cli_proc.Spawn { ...cli_proc.inherit(), out: out }
+  if cli_proc.run(kaic2(t, width, "--fmt", file), sp) != 0 {
+    cli_sys.copy_to_stderr(out)
+    false
+  } else {
+    let formatted = cli_fs.read_or_empty(out)
+    let same = match read_file(file) {
+      Ok(s) -> s == formatted
+      Err(_) -> false
+    }
+    if not same { let _ = write_file(file, formatted) }
+    true
+  }
+}
+
+# Check mode, gofmt -l style: the name of a file that would change, never its reformatted text.
+fn unformatted(t: Toolchain, file: String, width: String, tmp: String) : Option[Bool] / File + Ffi {
+  let sp = cli_proc.inherit()
+  let r = cli_proc.capture(kaic2(t, width, "--fmt-check", file), sp, "#{tmp}/check.out")
+  if r.fst == 0 { None } else { Some(printed(r.snd)) }
+}
+
+fn package_file(
+  t: Toolchain,
+  root: String,
+  width: String,
+  listing: Bool,
+  tmp: String,
+  rel: String,
+  status: Int
+) : Result[Int, Int] / Stdout + Stderr + File + Ffi {
+  let file = "#{root}/#{rel}"
+  if listing {
+    match unformatted(t, file, width, tmp) {
+      None -> Ok(status)
+      Some(named) -> {
+        if named { Stdout.print(rel) }
+        Ok(1)
+      }
+    }
+  } else {
+    Stderr.eprint("kai: fmt #{rel}")
+    Ok(if rewrite(t, file, width, tmp) { status } else { 1 })
+  }
+}
+
+# Every file the package owns plus its `tests/` sibling: a library has no entry point to start from.
+fn package(
+  t: Toolchain,
+  dir: String,
+  o: FmtOpts,
+  tmp: String
+) : Result[Int, Int] / Stdout + Stderr + File + Ffi {
+  let root = cli_fs.absolute(dir)
+  let width = width_for(root, o.width)
+  let tests = cli_blocks.tests_of(root) | (p => string.drop_prefix(p, "#{root}/").unwrap_or(p))
+  let files = cli_blocks.source_files(root) ++ tests
+  if list.is_empty(files) {
+    cli_err.die("no .kai files found in #{dir} (see 'kai fmt --help')")
+  } else {
+    cli_blocks.fold_files(files, 0, (rel, st) => package_file(t, root, width, o.check_only, tmp, rel, st))
+  }
+}
+
+fn sub_package(t: Toolchain, o: FmtOpts, tmp: String) : Result[Int, Int] / Stdout + Stderr + File + Ffi {
+  let dir = string.drop_suffix(o.spec, "/").unwrap_or(o.spec)
+  if not cli_sys.is_dir(o.spec) {
+    cli_err.die("#{o.spec} is not a directory")
+  } else if not cli_sys.is_file("#{dir}/kai.toml") {
+    cli_err.die("#{o.spec} has no kai.toml — sub-packages must declare their own manifest")
+  } else {
+    package(t, dir, o, tmp)
+  }
+}
+
+fn one_file(t: Toolchain, o: FmtOpts, tmp: String) : Result[Int, Int] / Stdout + Stderr + File + Ffi =
+  if not cli_sys.is_file(o.spec) {
+    cli_compile.not_found(o.spec, "fmt")
+  } else {
+    let width = width_for(cli_fs.dir_of(o.spec).unwrap_or(""), o.width)
+    if not o.check_only {
+      Ok(if rewrite(t, o.spec, width, tmp) { 0 } else { 1 })
+    } else {
+      match unformatted(t, o.spec, width, tmp) {
+        None -> Ok(0)
+        Some(named) -> {
+          if named { Stdout.print(o.spec) }
+          Ok(1)
+        }
+      }
+    }
+  }
+
+fn from_stdin(t: Toolchain, o: FmtOpts, tmp: String) : Result[Int, Int] / Stderr + File + Ffi =
+  if o.spec != "" {
+    cli_err.die("--stdin takes no file argument")
+  } else {
+    let src = "#{tmp}/in.kai"
+    let _ = cli_io.stdin_to(src)
+    let width = width_for(cli_sys.cwd(), o.width)
+    Ok(cli_proc.run(kaic2(t, width, "--fmt", src), cli_proc.inherit()))
+  }
+
+fn format(t: Toolchain, o: FmtOpts, tmp: String) : Result[Int, Int] / Stdout + Stderr + File + Ffi =
+  if o.stdin {
+    from_stdin(t, o, tmp)
+  } else if o.spec == "" or o.spec == "." {
+    package(t, ".", o, tmp)
+  } else if string.starts_with(o.spec, "./") and (not cli_sys.is_file(o.spec)) {
+    sub_package(t, o, tmp)
+  } else {
+    one_file(t, o, tmp)
+  }
+
+fn digits(s: String) : Bool = string.chars(s) |> list.all(c => char.is_digit(c))
+
+#[doc("`kai fmt [--width N] [--check | --stdin] [<spec>]`: 1 when a checked file is unformatted or a rewrite fails.")]
+pub fn fmt_verb(
+  t: Toolchain,
+  args: [String]
+) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let o = parse(args, FmtOpts { spec: "", check_only: false, stdin: false, width: "", help: false })!
+  if o.help {
+    Stdout.print(cli_tool_help.fmt_text())
+    Ok(0)
+  } else if not digits(o.width) {
+    cli_err.die("--width takes a positive integer, got '#{o.width}'")
+  } else {
+    cli_toolchain.ensure_built(t)!
+    cli_fs.with_scratch(tmp => format(t, o, tmp))
+  }
+}
