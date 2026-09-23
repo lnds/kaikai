@@ -7,13 +7,13 @@ git checkout:
 ```sh
 git clone https://github.com/lnds/kaikai
 cd kaikai
-make tier0       # builds stage 0, stage 1, stage 2; runs fast tests
+make             # builds stage 0, stage 1, stage 2 and bin/kai
 ./bin/kai run examples/minimal/hello.kai
 ```
 
-The first `bin/kai` invocation auto-builds any missing stage binary;
-subsequent calls reuse them. Stages 0 and 1 only need a C99 `cc`; the
-user-facing path is stage 2.
+`bin/kai` is the `kai` binary, built from `tools/kai/` by `make` (and by
+`make kaic2`); after editing `tools/kai/`, `make bin/kai` rebuilds it.
+Stages 0 and 1 only need a C99 `cc`; the user-facing path is stage 2.
 
 ## Backends
 

@@ -16,7 +16,7 @@ Practical map of the build. Read this before running the compiler or touching a 
 
 ## `bin/kai` — the entry point
 
-`bin/kai` is a checked-in POSIX shell wrapper. It is the ONLY thing you should use to run/build kaikai code. It resolves, automatically:
+`bin/kai` is the `kai` binary, written in kaikai under `tools/kai/` and built by `make` (`make kaic2` and `make bin/kai` build it too; it is not checked in). It is the ONLY thing you should use to run/build kaikai code. It resolves, automatically:
 - the stdlib path (`--path`),
 - the backend (native by default since the Lane 1.5 flip; force with `--backend=c` or `KAI_BACKEND=c`),
 - the `cc`/link step.
@@ -33,16 +33,18 @@ A C-only `kaic2` prints `note: native backend unavailable … using the C backen
 
 ### The kai binary (`tools/kai`)
 
-Every command lives in a binary written in kaikai, `tools/kai/`; `bin/kai`
-only builds it (and the stage 0/1/2 compilers) on first use and hands it
-argv. An unknown verb runs as a `kai-<verb>` plugin from the binary's own
-`plugins/` dir (`tools/kai/plugins/`, shipped as `libexec/kaikai/plugins/`;
-`upgrade` lives there) or from `PATH` (`kai info install`). In a checkout,
-`make kaic2` builds it through `tools/kai/Makefile`, which drives `kaic2`
-directly, and `bin/kai` rebuilds it on first use when stale; a release ships
-it as `libexec/kaikai/kai`. The bootstrap never goes through it: the
-Makefiles keep invoking `kaic2` with their own flags. Gate: `make
-test-kai-cli`.
+Every command lives in the binary. It finds its installation from its own
+path — `argv[0]`, searched on `PATH` when bare, symlinks followed — as
+`<root>/bin/kai`: a checkout when `<root>` holds `stage0/` and `stdlib/`,
+an installed prefix when it holds `libexec/kaikai/kaic2` and
+`share/kaikai/stdlib/`. An unknown verb runs as a `kai-<verb>` plugin
+from `tools/kai/plugins/` (installed: `libexec/kaikai/plugins/`; `upgrade`
+lives there) or from `PATH` (`kai info install`). `tools/kai/Makefile`
+builds it by driving `kaic2` directly; a checkout rebuilds it with `make
+bin/kai` after editing `tools/kai/`, a release ships it as `bin/kai`. The
+bootstrap never goes through it: the Makefiles keep invoking `kaic2` with
+their own flags, and CI builds it from the restored `kaic2` in
+`tools/ci-touch-build.sh`. Gate: `make test-kai-cli`.
 
 ### The shared core cache
 

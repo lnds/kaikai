@@ -10,7 +10,7 @@
 # With no args, runs every benches/*.kai.
 #
 # Env:
-#   KAI      path to the kai wrapper       (default ./bin/kai)
+#   KAI      path to the kai binary        (default ./bin/kai)
 #   RUNS     timing runs per binary        (default 3, reports best)
 #   ROUTES   space-separated route list    (default "c native")
 set -eu
