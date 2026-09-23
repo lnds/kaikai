@@ -1279,6 +1279,8 @@ tier1-asan-b: kaic2
 	@echo "tier1-asan OK — block-let move-at-last-use fixture passes under ASAN+UBSan (no over-release when the lone read transfers the birth ref)"
 	@$(MAKE) -C stage2 test-perceus-2032-bang-operand-use-asan
 	@echo "tier1-asan OK — a binder read only through a propagation operand keeps its ref (use scan sees the node, no use-after-free)"
+	@$(MAKE) -C stage2 test-perceus-owned-scope-unused-param-asan
+	@echo "tier1-asan OK — a never-read owned param is released once (entry drop only, no branch drops on top)"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,
