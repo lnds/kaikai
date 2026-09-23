@@ -1,0 +1,337 @@
+#[doc("""
+`kai mutate`: break the code one AST construct at a time and ask an oracle whether anything notices.
+
+Each mutant is written over the module in place, because the oracle builds
+the package as it stands on disk; the original is back before the next one.
+""")]
+
+import cli_blocks
+import cli_compile
+import cli_err
+import cli_fs
+import cli_info_json
+import cli_io
+import cli_proc
+import cli_sys
+import cli_toolchain
+import cli_tool_help
+
+const OPERATORS : [String] = ["arm", "compare", "connect", "negate", "literal", "call"]
+
+type MutateOpts = {
+  spec: String,
+  oracle: String,
+  module: String,
+  ops: [String],
+  limit: String,
+  list_only: Bool,
+  json: Bool,
+  help: Bool
+}
+
+# The flags that take a value, and what the value is.
+const VALUED : [(String, String)] = [
+  ("--oracle", "a command"), ("--module", "a file"), ("--operator", "a name"), ("--limit", "a count")
+]
+
+type Valued = { flag: String, value: String, rest: [String] }
+
+# `--flag v` or `--flag=v` for one of the valued flags.
+fn valued(args: [String]) : Option[Valued] =
+  match args {
+    [a, v, ...rest] if VALUED.any(fv => fv.fst == a) -> Some(Valued { flag: a, value: v, rest })
+    [a, ...rest] -> VALUED.find_map(
+      fv => string.drop_prefix(a, "#{fv.fst}=").map(v => Valued { flag: fv.fst, value: v, rest })
+    )
+    [] -> None
+  }
+
+fn set(o: MutateOpts, v: Valued) : MutateOpts =
+  if v.flag == "--oracle" {
+    MutateOpts { ...o, oracle: v.value }
+  } else if v.flag == "--module" {
+    MutateOpts { ...o, module: v.value }
+  } else if v.flag == "--operator" {
+    MutateOpts { ...o, ops: o.ops ++ cli_proc.words(v.value) }
+  } else {
+    MutateOpts { ...o, limit: v.value }
+  }
+
+fn parse(args: [String], o: MutateOpts) : Result[MutateOpts, Int] / Stderr =
+  match args {
+    [] -> Ok(o)
+    [a, ..._] if a == "-h" or a == "--help" -> Ok(MutateOpts { ...o, help: true })
+    ["--list", ...rest] -> parse(rest, MutateOpts { ...o, list_only: true })
+    ["--json", ...rest] -> parse(rest, MutateOpts { ...o, json: true })
+    [a] if VALUED.any(fv => fv.fst == a) ->
+      cli_err.die("#{a} requires #{VALUED.find_map(fv => if fv.fst == a { Some(fv.snd) } else { None }).unwrap_or("")}")
+    [a, ...rest] -> match valued(args) {
+      Some(v) -> parse(v.rest, set(o, v))
+      None -> if string.starts_with(a, "-") {
+        cli_err.die("unknown flag: #{a} (see 'kai mutate --help')")
+      } else if o.spec != "" {
+        cli_err.die("only one package spec supported")
+      } else {
+        parse(rest, MutateOpts { ...o, spec: a })
+      }
+    }
+  }
+
+fn validate(o: MutateOpts) : Result[Unit, Int] / Stderr =
+  if not (string.chars(o.limit) |> list.all(c => char.is_digit(c))) {
+    cli_err.die("--limit takes a positive integer, got '#{o.limit}'")
+  } else {
+    match o.ops |> list.find(op => not OPERATORS.contains(op)) {
+      Some(op) -> cli_err.die("unknown operator: #{op} (see 'kai mutate --help')")
+      None -> Ok(())
+    }
+  }
+
+#[doc("One mutation site as `kaic2 --mutate-list` prints it.")]
+type Site = { id: String, op: String, line: String, col: String, desc: String }
+
+# `while IFS=<tab> read -r …`: an unterminated last line is never read.
+fn sites(text: String) : [Site] =
+  list.take(string.split(text, "\n"), list.length(string.split(text, "\n")) - 1)
+    | (l => match cli_proc.read_fields(l, '\t', 5) {
+      [id, op, line, col, desc] -> Site { id, op, line, col, desc }
+      _ -> Site { id: "", op: "", line: "", col: "", desc: "" }
+    })
+
+type Run = {
+  t: Toolchain,
+  o: MutateOpts,
+  root: String,
+  oracle: String,
+  gen: String,
+  tmp: String,
+  db: [String]
+}
+
+type Tally = {
+  total: Int,
+  killed: Int,
+  compile: Int,
+  survived: Int,
+  equiv: Int,
+  survivors: [String],
+  stop: Bool
+}
+
+fn selected(r: Run, op: String) : Bool = list.is_empty(r.o.ops) or r.o.ops.contains(op)
+
+fn full(r: Run, n: Tally) : Bool = r.o.limit != "" and n.total >= string.to_int(r.o.limit).unwrap_or(0)
+
+# An entry `<file>:<line>:<op>`, then blanks, then a `#` reason or nothing.
+fn entry_for(key: String, e: String) : Bool =
+  match string.drop_prefix(e, key) {
+    Some(rest) -> {
+      let r = string.trim_left(rest)
+      r == "" or string.starts_with(r, "#")
+    }
+    None -> false
+  }
+
+# A suppression nobody justified is indistinguishable from a hidden hole: an entry without a reason is an error.
+fn equivalent(r: Run, f: String, s: Site) : Result[Bool, Int] / Stderr {
+  let rel = string.drop_prefix(f, "#{r.root}/").unwrap_or(f)
+  let tail = ":#{s.line}:#{s.op}"
+  match r.db |> list.find(e => entry_for("#{f}#{tail}", e) or entry_for("#{rel}#{tail}", e)) {
+    None -> Ok(false)
+    Some(e) -> match string.split(e, "#") {
+      [_, first, ...rest] if string.trim(string.join([first, ...rest], "#")) != "" -> Ok(true)
+      _ -> cli_err.die(
+        "tools/mutate-known-equivalent.txt: '#{f}#{tail}' has no reason — an entry without one is not a suppression"
+      )
+    }
+  }
+}
+
+fn gen_spawn(out: String) : Spawn =
+  cli_proc.Spawn { ...cli_proc.inherit(), out: out, err: "/dev/null", unset: ["KAI_TRACE_RC"] }
+
+fn quiet() : Spawn = cli_proc.Spawn { ...cli_proc.inherit(), out: "/dev/null", err: "/dev/null" }
+
+fn survivor(r: Run, f: String, s: Site) : [String] / File + Ffi {
+  let d = "#{r.tmp}/diff.out"
+  let _ = cli_proc.run(["diff", "#{r.tmp}/orig.kai", "#{r.tmp}/mutant.kai"], cli_proc.Spawn { ...cli_proc.inherit(), out: d })
+  ["#{f}\t#{s.line}\t#{s.col}\t#{s.op}", ...(cli_info_json.records(cli_fs.read_or_empty(d)) | (l => "    #{l}"))]
+}
+
+type Verdict = Survived([String]) | Killed | Uncompiled
+
+# The mutant is generated from the pristine copy by the pinned compiler: an oracle may rebuild the live one.
+fn judge(r: Run, f: String, s: Site) : Verdict / Stderr + File + Ffi {
+  let orig = "#{r.tmp}/orig.kai"
+  let paths = ["--path", cli_fs.dirname(f), "--path", r.t.layout.stdlib]
+  let apply = [r.gen, ...paths] ++ ["--mutate-apply", s.id, orig]
+  if cli_proc.run(apply, gen_spawn("#{r.tmp}/mutant.kai")) != 0 {
+    Uncompiled
+  } else {
+    let _ = cli_fs.copy("#{r.tmp}/mutant.kai", f)
+    let checks = cli_proc.run([r.gen, ...paths] ++ ["--check", f], quiet()) == 0
+    let rc = if checks { cli_proc.run(["sh", "-c", r.oracle], quiet()) } else { 1 }
+    let _ = cli_fs.copy(orig, f)
+    if not checks {
+      Uncompiled
+    } else if rc == 0 {
+      Stderr.eprint("SURVIVED  #{f}:#{s.line}  #{s.op}")
+      Survived(survivor(r, f, s))
+    } else {
+      Stderr.eprint("killed    #{f}:#{s.line}  #{s.op}")
+      Killed
+    }
+  }
+}
+
+fn tally(n: Tally, v: Verdict) : Tally {
+  let counted = Tally { ...n, total: n.total + 1 }
+  match v {
+    Survived(lines) ->
+      Tally { ...counted, survived: n.survived + 1, survivors: n.survivors ++ lines }
+    Killed -> Tally { ...counted, killed: n.killed + 1 }
+    Uncompiled -> Tally { ...counted, compile: n.compile + 1 }
+  }
+}
+
+fn interrupted(f: String, n: Tally) : Tally / Stderr + Ffi =
+  if cli_sys.pending_signal() != 0 {
+    Stderr.eprint("kai: mutate: interrupted; restored #{f}")
+    Tally { ...n, stop: true }
+  } else {
+    n
+  }
+
+fn site(r: Run, f: String, n: Tally, s: Site) : Result[Tally, Int] / Stderr + File + Ffi =
+  if n.stop or (not selected(r, s.op)) {
+    Ok(n)
+  } else if full(r, n) {
+    Ok(Tally { ...n, stop: true })
+  } else if equivalent(r, f, s)! {
+    Ok(Tally { ...n, equiv: n.equiv + 1 })
+  } else {
+    Ok(interrupted(f, tally(n, judge(r, f, s))))
+  }
+
+fn fold_sites(r: Run, f: String, ss: [Site], n: Tally) : Result[Tally, Int] / Stderr + File + Ffi =
+  match ss {
+    [] -> Ok(n)
+    [s, ...rest] -> {
+      let next = site(r, f, n, s)!
+      fold_sites(r, f, rest, next)
+    }
+  }
+
+fn list_sites(r: Run, f: String, ss: [Site]) : Unit / Stdout =
+  ss |? (s => selected(r, s.op)) |> foreach(s => Stdout.print("#{s.op}\t#{f}\t#{s.line}:#{s.col}\t#{s.desc}"))
+
+fn module(r: Run, n: Tally, f: String) : Result[Tally, Int] / Stdout + Stderr + File + Ffi =
+  if n.stop or (not cli_sys.is_file(f)) {
+    Ok(n)
+  } else {
+    let dir = cli_fs.dir_of(f).unwrap_or(".")
+    let argv = [r.t.layout.kaic2, "--path", dir, "--path", r.t.layout.stdlib, "--mutate-list", f]
+    let listed = cli_proc.run(argv, gen_spawn("#{r.tmp}/sites"))
+    let ss = sites(cli_fs.read_or_empty("#{r.tmp}/sites"))
+    if listed != 0 {
+      Stderr.eprint("kai: mutate: #{f} does not parse; skipped")
+      Ok(n)
+    } else if r.o.list_only {
+      list_sites(r, f, ss)
+      Ok(n)
+    } else if cli_fs.read_or_empty("#{r.tmp}/sites") == "" {
+      Ok(n)
+    } else {
+      let _ = cli_fs.copy(f, "#{r.tmp}/orig.kai")
+      let after = fold_sites(r, f, ss, n)!
+      let _ = cli_fs.copy("#{r.tmp}/orig.kai", f)
+      Ok(if full(r, after) { Tally { ...after, stop: true } } else { after })
+    }
+  }
+
+fn fold_modules(r: Run, fs: [String], n: Tally) : Result[Tally, Int] / Stdout + Stderr + File + Ffi =
+  match fs {
+    [] -> Ok(n)
+    [f, ...rest] -> {
+      let next = module(r, n, f)!
+      fold_modules(r, rest, next)
+    }
+  }
+
+fn report(n: Tally, secs: Int, json: Bool) : Int / Stdout =
+  if json {
+    Stdout.print(
+      "{\"mutants\": #{n.total}, \"killed\": #{n.killed}, \"compile_failed\": #{n.compile}, \"survived\": #{n.survived}, \"known_equivalent\": #{n.equiv}, \"seconds\": #{secs}}"
+    )
+    0
+  } else {
+    Stdout.print("")
+    if n.survived > 0 {
+      Stdout.print("survivors — the suite did not notice these:")
+      Stdout.print("")
+      n.survivors |> foreach(l => Stdout.print(l))
+      Stdout.print("")
+    }
+    let equiv = if n.equiv > 0 { ", #{n.equiv} known-equivalent skipped" } else { "" }
+    Stdout.print(
+      "#{n.total} mutants in #{secs}s: #{n.killed} killed, #{n.compile} did not compile, #{n.survived} survived#{equiv}"
+    )
+    if n.survived == 0 { 0 } else { 1 }
+  }
+
+fn modules(o: MutateOpts, root: String) : Result[[String], Int] / Stderr + File + Ffi =
+  if o.module != "" {
+    if cli_sys.is_file(o.module) { Ok([o.module]) } else { cli_compile.not_found(o.module, "mutate") }
+  } else {
+    match cli_blocks.source_files(root) {
+      [] -> cli_err.die("no .kai files found in #{root} (see 'kai mutate --help')")
+      rels -> Ok(rels | (rel => "#{root}/#{rel}"))
+    }
+  }
+
+fn sweep(t: Toolchain, o: MutateOpts, root: String, tmp: String) : Result[Int, Int] / Stdout + Stderr + File + Ffi {
+  let files = modules(o, root)!
+  let gen = "#{tmp}/kaic2-pinned"
+  let _ = cli_io.copy_exec(t.layout.kaic2, gen)
+  let oracle = if o.oracle == "" { "#{t.layout.root}/bin/kai test" } else { o.oracle }
+  let db = string.split(cli_fs.read_or_empty("#{root}/tools/mutate-known-equivalent.txt"), "\n")
+  let r = Run { t, o, root, oracle, gen, tmp, db }
+  let start = cli_io.epoch()
+  let none = Tally { total: 0, killed: 0, compile: 0, survived: 0, equiv: 0, survivors: [], stop: false }
+  let n = fold_modules(r, files, none)!
+  if o.list_only or cli_sys.pending_signal() != 0 {
+    Ok(0)
+  } else {
+    Ok(report(n, cli_io.epoch() - start, o.json))
+  }
+}
+
+fn package_root(spec: String) : Result[String, Int] / Stderr + Ffi {
+  let given = if spec == "" { "." } else { spec }
+  let dir = cli_fs.absolute(if cli_sys.is_dir(given) { given } else { cli_fs.dirname(given) })
+  if cli_sys.is_dir(dir) { Ok(dir) } else { cli_err.die("cannot open #{given}") }
+}
+
+#[doc("`kai mutate [<spec>] [--oracle <cmd>] [--module <file>] [--operator <name>] [--limit <n>] [--list] [--json]`: 1 when a mutant survives.")]
+pub fn mutate_verb(t: Toolchain, args: [String]) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let none = MutateOpts {
+    spec: "",
+    oracle: "",
+    module: "",
+    ops: [],
+    limit: "",
+    list_only: false,
+    json: false,
+    help: false
+  }
+  let o = parse(args, none)!
+  if o.help {
+    Stdout.print(cli_tool_help.mutate_text())
+    Ok(0)
+  } else {
+    validate(o)!
+    cli_toolchain.ensure_built(t)!
+    let root = package_root(o.spec)!
+    cli_fs.with_scratch(tmp => sweep(t, o, root, tmp))
+  }
+}

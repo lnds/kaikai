@@ -1,0 +1,202 @@
+#[doc("`kai doc`: the `#[doc]` attributes of stdlib and package modules, read in the terminal.")]
+
+import cli_docjson
+import cli_err
+import cli_fs
+import cli_io
+import cli_manifest
+import cli_pkg
+import cli_proc
+import cli_sys
+import cli_toolchain
+import cli_tool_help
+
+# `kaic2 --doc-json`, its stderr dropped: its status and the dump.
+fn doc_json(t: Toolchain, flags: [String], file: String, tmp: String) : (Int, String) / File + Ffi {
+  let sp = cli_proc.Spawn { ...cli_proc.inherit(), err: "/dev/null" }
+  cli_proc.capture([t.layout.kaic2, ...flags] ++ ["--doc-json", file], sp, "#{tmp}/doc.json")
+}
+
+fn stdlib_modules(root: String) : [String] / File =
+  dir_walk(root)
+    |? (p => string.ends_with(p, ".kai"))
+    | (p => string.drop_prefix(p, "#{root}/").unwrap_or(p))
+    |> list.sort
+
+fn module_list(t: Toolchain, tmp: String) : Unit / Stdout + File + Ffi {
+  let root = t.layout.stdlib
+  Stdout.print("kai doc — stdlib reference, by module.")
+  Stdout.print("")
+  Stdout.print("Modules:")
+  stdlib_modules(root)
+    |> foreach(rel => {
+      let syn = cli_docjson.synopsis(cli_docjson.module_doc(doc_json(t, [], "#{root}/#{rel}", tmp).snd))
+      let m = string.drop_suffix(rel, ".kai").unwrap_or(rel)
+      Stdout.print("  #{string.pad_right(m, 20, ' ')} #{syn}")
+    })
+  Stdout.print("")
+  Stdout.print("Usage:")
+  Stdout.print("  kai doc <module>            List a module's items")
+  Stdout.print("  kai doc <module>.<symbol>   Show one symbol's doc")
+}
+
+# A stdlib module by relative path, else by basename: top level first, then the first nested match.
+fn stdlib_module(root: String, name: String) : Option[String] / File + Ffi =
+  if cli_sys.is_file("#{root}/#{name}") {
+    Some("#{string.drop_suffix(name, ".kai").unwrap_or(name)}.kai")
+  } else if cli_sys.is_file("#{root}/#{name}.kai") {
+    Some("#{name}.kai")
+  } else {
+    stdlib_modules(root) |> list.find(rel => cli_fs.basename(rel) == "#{name}.kai")
+  }
+
+# The package's search roots, as run/build would inject them; quiet, as an auto-install may run.
+fn package_roots(t: Toolchain, tmp: String) : [String] / Stderr + Env + File + Ffi =
+  match cli_manifest.find_dir(cli_sys.cwd()) {
+    None -> []
+    Some(dir) -> {
+      let saved = cli_io.stderr_to("/dev/null")
+      let flags = cli_pkg.path_flags(t, dir, tmp)
+      cli_io.stderr_restore(saved)
+      match flags {
+        Ok(fs) -> fs |? (f => f != "--path")
+        Err(_) -> []
+      }
+    }
+  }
+
+# A dotted module name (`a.b` is `a/b.kai`) under the package roots, as `import` resolves it.
+fn package_module(roots: [String], name: String) : Option[String] / Ffi {
+  let rel = string.replace(name, ".", "/")
+  roots
+    || (r => ["#{r}/#{rel}.kai", "#{r}/#{name}.kai"])
+    |> list.find(c => cli_sys.is_file(c))
+}
+
+fn item_row(item: String) : [String] =
+  if cli_docjson.is_pub(item) {
+    let syn = cli_docjson.item_synopsis(cli_docjson.field(item, "doc"))
+    ["#{cli_docjson.field(item, "name")}\t#{cli_docjson.kind(item)}\t#{syn}"]
+  } else {
+    []
+  }
+
+# `IFS=<tab> read -r name kind syn`.
+fn row_line(row: String) : String =
+  match cli_proc.read_fields(row, '\t', 3) {
+    [name, _, syn] -> "  #{string.pad_right(name, 22, ' ')} #{syn}"
+    _ -> ""
+  }
+
+fn module_view(m: String, rel: String, json: String) : Unit / Stdout {
+  Stdout.print("# #{m}   (#{rel})")
+  let mdoc = cli_docjson.synopsis(cli_docjson.module_doc(json))
+  if mdoc != "" {
+    Stdout.print("")
+    Stdout.print("  #{mdoc}")
+  }
+  Stdout.print("")
+  cli_docjson.items(json)
+    || item_row
+    |> list.sort
+    |> foreach(r => Stdout.print(row_line(r)))
+  Stdout.print("")
+  Stdout.print("Run 'kai doc #{m}.<symbol>' for a symbol's signature and full doc.")
+}
+
+fn chomp(s: String) : String = if string.ends_with(s, "\n") { chomp(string.drop_suffix(s, "\n").unwrap_or(s)) } else { s }
+
+fn missing_symbol(m: String, sym: String, names: [String]) : Result[Int, Int] / Stderr {
+  Stderr.eprint("kai: error: no symbol '#{sym}' in module '#{m}'")
+  let near = list.take(names |? (n => string_contains(string.to_lower(n), string.to_lower(sym))), 3)
+  if not list.is_empty(near) { Stderr.eprint("  did you mean: #{string.join(near, " ")}") }
+  Stderr.eprint("  run 'kai doc #{m}' to list the module's items.")
+  Err(1)
+}
+
+fn symbol_view(m: String, sym: String, rel: String, json: String) : Result[Int, Int] / Stdout + Stderr {
+  let items = cli_docjson.items(json)
+  let names = items || (i => cli_docjson.name(i).map(n => [n]).unwrap_or([]))
+  match items |> list.find(i => cli_docjson.name(i).map(n => n == sym).unwrap_or(false)) {
+    None -> missing_symbol(m, sym, names)
+    Some(item) -> {
+      let sig = chomp(cli_docjson.unescape(cli_docjson.field(item, "sig")))
+      let body = chomp(cli_docjson.unescape(cli_docjson.field(item, "doc")))
+      Stdout.print("# #{m}.#{sym}   (#{rel})")
+      if sig != "" {
+        Stdout.print("")
+        if cli_docjson.kind(item) == "impl" {
+          string.split(string.replace(sig, ";", "\n"), "\n")
+            |> foreach(s => Stdout.print("  #{string.drop_prefix(s, " ").unwrap_or(s)}"))
+        } else {
+          Stdout.print("  #{sym}#{sig}")
+        }
+      }
+      if body != "" {
+        Stdout.print("")
+        cli_docjson.render_body(body) |> foreach(l => Stdout.print(l))
+      }
+      Ok(0)
+    }
+  }
+}
+
+fn not_a_module(m: String) : Result[Int, Int] / Stderr {
+  Stderr.eprint("kai: error: no module '#{m}' in the stdlib or the current package")
+  Stderr.eprint("  run 'kai doc' to list stdlib modules; for a package module,")
+  Stderr.eprint("  check it is declared in kai.toml and the name matches an import.")
+  Err(1)
+}
+
+# A resolved module: how it is shown, the file read, the extra search paths it needs.
+type Module = { rel: String, file: String, flags: [String] }
+
+# `<module>.<symbol>` splits on the last dot; a bare name lists the module.
+fn document(t: Toolchain, arg: String, tmp: String) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let parts = string.split(arg, ".")
+  let dotted = list.length(parts) > 1
+  let m = if dotted { string.join(list.take(parts, list.length(parts) - 1), ".") } else { arg }
+  let sym = if dotted { list.last(parts).unwrap_or("") } else { "" }
+  let std = t.layout.stdlib
+  let found = match stdlib_module(std, m) {
+    Some(rel) -> Some(Module { rel, file: "#{std}/#{rel}", flags: [] })
+    None -> {
+      let roots = package_roots(t, tmp)
+      package_module(roots, m).map(f => Module { rel: f, file: f, flags: roots || (r => ["--path", r]) })
+    }
+  }
+  match found {
+    None -> not_a_module(m)
+    Some(hit) -> {
+      let dump = doc_json(t, ["--path", std, ...hit.flags], hit.file, tmp)
+      if dump.fst != 0 {
+        Ok(dump.fst)
+      } else if sym == "" {
+        module_view(m, hit.rel, dump.snd)
+        Ok(0)
+      } else {
+        symbol_view(m, sym, hit.rel, dump.snd)
+      }
+    }
+  }
+}
+
+#[doc("`kai doc [<module>[.<symbol>]]`: the module list, a module's items, or one symbol's signature and doc.")]
+pub fn doc_verb(t: Toolchain, args: [String]) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi =
+  match args {
+    [a, ..._] if a == "-h" or a == "--help" -> {
+      Stdout.print(cli_tool_help.doc_text())
+      Ok(0)
+    }
+    [a, ..._] if string.starts_with(a, "-") -> cli_err.die("unknown flag: #{a} (see 'kai doc --help')")
+    _ -> {
+      cli_toolchain.ensure_built(t)!
+      match args {
+        [a, ..._] if a != "" -> cli_fs.with_scratch(tmp => document(t, a, tmp))
+        _ -> cli_fs.with_scratch(tmp => {
+          module_list(t, tmp)
+          Ok(0)
+        })
+      }
+    }
+  }

@@ -1,8 +1,8 @@
 #!/bin/sh
 # Gate for the kai binary (tools/kai): `kai env`, the plugin contract, the
 # dispatch of an unknown verb to `kai-<verb>` on PATH (`kai upgrade` among
-# them), build/run and the dev-loop verbs — in a dev checkout and in an
-# installed prefix.
+# them), build/run, the dev-loop and source-tool verbs — in a dev checkout
+# and in an installed prefix.
 
 set -eu
 
@@ -89,6 +89,9 @@ expect_line "unknown command" 2 "kai: error: unknown command: frobnicate" "$KAI"
 expect_line "a flag is never a plugin" 2 "kai: error: unknown command: --hello" \
   env PATH="$TMP/plugins:$PATH" "$KAI" --hello
 expect_line "help" 0 " _      _ _      _" "$KAI" help
+expect_line "--version" 0 "kaikai $(cat "$ROOT/VERSION") - $(cat "$ROOT/EDITION") (stage 2, self-hosted)" "$KAI" --version
+expect_line "info --list" 0 "$(ls "$ROOT/docs/info" | sed -n 's/\.md$//p' | LC_ALL=C sort | sed -n 1p)" "$KAI" info --list
+expect "fmt --stdin" 0 "fn main() : Int = 0" sh -c 'printf "fn main()   :  Int = 0\n" | "$1" fmt --stdin' _ "$KAI"
 expect_line "no command: usage, exit 2" 2 " _      _ _      _" "$KAI"
 
 # build/run through the binary.

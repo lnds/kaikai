@@ -33,18 +33,16 @@ A C-only `kaic2` prints `note: native backend unavailable … using the C backen
 
 ### The kai binary (`tools/kai`)
 
-The commands are moving out of the shell wrapper into a binary written in
-kaikai, `tools/kai/`. `bin/kai` hands it every verb it no longer serves —
-today `build`, `run`, `test`, `bench`, `check`, `typecheck`, the package
-verbs (`init`, `fetch`, `add`, `update`, `show`, `install`), `env`, `help`,
-and any unknown verb, which the binary runs as a `kai-<verb>` plugin from
-its own `plugins/` dir (`tools/kai/plugins/`, shipped as
-`libexec/kaikai/plugins/`; `upgrade` lives there) or from `PATH` (`kai info
-install`). In a checkout, `make kaic2` builds it through
-`tools/kai/Makefile`, which drives `kaic2` directly, and `bin/kai` rebuilds
-it on first use when stale; a release ships it as `libexec/kaikai/kai`. The
-bootstrap never goes through it: the Makefiles keep invoking `kaic2` with
-their own flags. Gate: `make test-kai-cli`.
+Every command lives in a binary written in kaikai, `tools/kai/`; `bin/kai`
+only builds it (and the stage 0/1/2 compilers) on first use and hands it
+argv. An unknown verb runs as a `kai-<verb>` plugin from the binary's own
+`plugins/` dir (`tools/kai/plugins/`, shipped as `libexec/kaikai/plugins/`;
+`upgrade` lives there) or from `PATH` (`kai info install`). In a checkout,
+`make kaic2` builds it through `tools/kai/Makefile`, which drives `kaic2`
+directly, and `bin/kai` rebuilds it on first use when stale; a release ships
+it as `libexec/kaikai/kai`. The bootstrap never goes through it: the
+Makefiles keep invoking `kaic2` with their own flags. Gate: `make
+test-kai-cli`.
 
 ### The shared core cache
 
@@ -184,6 +182,6 @@ TARGET_BACKEND=native ORACLE_BACKEND=c BACKEND_PARITY_JOBS=1 \
 - **`kai fmt` is in-place destructive** — never run it on compiler/stdlib sources; redirect output to `/tmp`.
 - **`runtime.h` has TWO copies** (`stage0/runtime.h` + `stage2/runtime.h`). A runtime prim/handler added to one must be added to BOTH; they change together.
 - **Header prerequisites are hand-declared.** Stage 1 and stage 2 compile a *generated* `.c` whose `#include "runtime.h"` make cannot see, so each rule names the header it actually binds under its own `-I` order (`stage2` → `stage2/runtime.h`, `stage1` → `stage0/runtime.h`). Adding a rule that compiles either translation unit means adding that prerequisite too, and only that one — naming a header the TU never reaches turns unrelated edits into a ~70 s `-O2` rebuild. `make test-header-deps` (tier 0) asserts both directions.
-- **The native paths compile a COPY of the entry file**, not the file the user named — the whole-program path under the run's `$tmp`, the native-modular path under the content-addressed cache dir — because `kaic2` derives the object path and the cache keys from the path it is handed. Anything that renders that path back to the user (diagnostics, DWARF) must map it to the real source: `bin/kai` corrects the captured stderr with `diag_rewrite_entry_path`, and `KAI_DEBUG_SRC` does the same for the DIFile. The C path never copies. Gates: `make test-diag-path-rewrite` (tier 0), `make test-native-diag-path` (tier 1).
+- **The native paths compile a COPY of the entry file**, not the file the user named — the whole-program path under the run's `$tmp`, the native-modular path under the content-addressed cache dir — because `kaic2` derives the object path and the cache keys from the path it is handed. Anything that renders that path back to the user (diagnostics, DWARF) must map it to the real source: `kai` corrects the captured stderr (`cli_plan.rewrite_paths`), and `KAI_DEBUG_SRC` does the same for the DIFile. The C path never copies. Gates: `make test-diag-path-rewrite` (tier 0), `make test-native-diag-path` (tier 1).
 - **mtime trap**: make decides rebuilds by timestamps, which don't survive a checkout or artifact download. After such, the binary chain may look stale; `make` rebuilds what it thinks is needed.
 - **Doc-only changes** (diff confined to `docs/`, root `*.md`, `LICENSE`) skip every tier locally and in CI (`paths-ignore`). Code paths always trigger tiers.

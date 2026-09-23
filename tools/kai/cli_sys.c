@@ -203,6 +203,45 @@ int64_t kaicli_wait(int64_t handle) {
     return code;
 }
 
+/* Start the pushed argv with its stdout on a pipe: the read end, or -1.
+   Nothing waits for this child; it ends when its output does. */
+int64_t kaicli_spawn_reader(void) {
+    int p[2];
+    int64_t fd = -1;
+    fflush(NULL);
+    if (pipe(p) == 0) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(p[0]);
+            if (dup2(p[1], 1) < 0) _exit(126);
+            close(p[1]);
+            run_child("", "", "");
+        }
+        close(p[1]);
+        if (pid > 0) {
+            fcntl(p[0], F_SETFD, FD_CLOEXEC);
+            fd = p[0];
+        } else {
+            close(p[0]);
+        }
+    }
+    list_clear(&exec_argv);
+    list_clear(&child_set);
+    list_clear(&child_unset);
+    return fd;
+}
+
+/* Block until one more line arrives on `fd`; false once it is closed. */
+int kaicli_read_line(int64_t fd) {
+    char c;
+    for (;;) {
+        ssize_t n = read((int) fd, &c, 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return 0;
+        if (c == '\n') return 1;
+    }
+}
+
 /* ---- interrupts: a Ctrl-C lands in the foreground child; kai outlives it
    to clean up, then exits 128 + the signal ---- */
 
@@ -263,6 +302,8 @@ void kaicli_copy_to_stderr(const char *path) {
 static int no_llvm;
 
 void kaicli_mark_no_llvm(void) { no_llvm = 1; }
+
+void kaicli_clear_no_llvm(void) { no_llvm = 0; }
 
 int kaicli_no_llvm(void) { return no_llvm; }
 

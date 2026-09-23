@@ -1,0 +1,213 @@
+#[doc("`kai info`: the language reference pages, as text or structured JSON.")]
+
+import cli_caches
+import cli_err
+import cli_fs
+import cli_info_json
+import cli_proc
+import cli_sys
+import cli_toolchain
+import cli_tool_help
+
+fn info_dir(l: Layout) : String / Env {
+  let own = if l.dev { "#{l.root}/docs/info" } else { "#{l.root}/share/kaikai/info" }
+  cli_caches.env_or("KAIKAI_INFO_PATH", own)
+}
+
+# `ls <dir> | sed -n 's/\.md$//p' | sort`.
+fn topics(dir: String) : [String] / File =
+  list.sort(
+    dir_list_dir(dir)
+      |? (f => (not string.starts_with(f, ".")) and string.ends_with(f, ".md"))
+      | (f => string.drop_suffix(f, ".md").unwrap_or(f))
+  )
+
+fn tagline_of(lines: [String], h1: Bool) : String =
+  match lines {
+    [] -> ""
+    [l, ...rest] if string.starts_with(l, "# ") -> tagline_of(rest, true)
+    [l, ..._] if h1 and cli_info_json.has_field(l) and (not string.starts_with(l, "#")) -> l
+    [_, ...rest] -> tagline_of(rest, h1)
+  }
+
+# The tagline: the first non-blank line after the `# title` that is not itself a heading.
+fn name_line(page: String) : String / File =
+  tagline_of(cli_info_json.records(cli_fs.read_or_empty(page)), false)
+
+fn row(topic: String, tagline: String) : String = "#{string.pad_right(topic, 12, ' ')} #{tagline}"
+
+fn listing(dir: String) : Unit / Stdout + File {
+  Stdout.print("kai info — language reference, organized by topic.")
+  Stdout.print("")
+  Stdout.print("Topics:")
+  topics(dir) |> foreach(t => Stdout.print("  #{row(t, name_line("#{dir}/#{t}.md"))}"))
+  [
+    "",
+    "Usage:",
+    "  kai info <topic>          Show topic page",
+    "  kai info <topic> --json [--section <name>]   Structured JSON",
+    "  kai info --list           Topic names only",
+    "  kai info -k <keyword>     Search",
+    "",
+    "For a single API, 'kai doc <module>.<symbol>' is cheaper than",
+    "any topic page."
+  ]
+    |> foreach(s => Stdout.print(s))
+}
+
+fn has_ci(hay: String, kw: String) : Bool = string_contains(string.to_lower(hay), string.to_lower(kw))
+
+# A body-only hit: the matching lines, each under its `## section`.
+fn body_hits(lines: [String], kw: String, sec: String) : Unit / Stdout =
+  match lines {
+    [] -> ()
+    [line, ...rest] -> {
+      let now = string.drop_prefix(line, "## ").unwrap_or(sec)
+      if has_ci(line, kw) { Stdout.print("  #{if now == "" { "" } else { "#{now}: " }}#{line}") }
+      body_hits(rest, kw, now)
+    }
+  }
+
+fn search_page(dir: String, kw: String, topic: String) : Bool / Stdout + File {
+  let page = "#{dir}/#{topic}.md"
+  let tag = name_line(page)
+  let text = cli_fs.read_or_empty(page)
+  if has_ci("#{topic} #{tag}", kw) {
+    Stdout.print(row(topic, tag))
+    true
+  } else if has_ci(text, kw) {
+    Stdout.print(row(topic, tag))
+    body_hits(cli_info_json.records(text), kw, "")
+    true
+  } else {
+    false
+  }
+}
+
+fn search(dir: String, kw: String) : Result[Int, Int] / Stdout + Stderr + File + Ffi =
+  if kw == "" {
+    Stderr.eprint("kai: error: -k requires a keyword")
+    Err(2)
+  } else {
+    let pages = topics(dir) |? (t => cli_sys.is_file("#{dir}/#{t}.md"))
+    let found = pages |> list.foldl(false, (acc, t) => search_page(dir, kw, t) or acc)
+    if found {
+      Ok(0)
+    } else {
+      Stderr.eprint("no topics matched '#{kw}'")
+      Err(1)
+    }
+  }
+
+fn count(hay: String, needle: String) : Int = list.length(string.split(hay, needle)) - 1
+
+# One synopsis row per module slice of the `--builtins-doc-json` dump.
+fn builtin_rows(json: String) : [String] =
+  cli_info_json.records(json)
+    || (line => list.drop(string.split(line, "\"module\": \""), 1))
+    | (part => {
+      let m = list.head(string.split(part, "\"")).unwrap_or("")
+      let items = string.pad_left("#{count(part, "\"kind\": ")}", 3, ' ')
+      let docs = string.pad_left("#{count(part, "\"doc\": \"")}", 3, ' ')
+      "  #{string.pad_right(m, 16, ' ')} #{items} items, #{docs} documented"
+    })
+
+fn builtins(t: Toolchain, flags: [String]) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  cli_toolchain.ensure_built(t)!
+  let argv = [t.layout.kaic2, "--builtins-doc-json"]
+  match flags {
+    ["--json", extra, ..._] if extra != "" -> {
+      Stderr.eprint("kai: error: 'kai info builtins --json' takes no further flags")
+      Err(2)
+    }
+    ["--json", ..._] -> Ok(cli_proc.run(argv, cli_proc.inherit()))
+    _ -> cli_fs.with_scratch(tmp => {
+      [
+        "# builtins",
+        "",
+        "Doc attributes of the auto-loaded core module set",
+        "(core/* + math/numeric + math/complex + effects + protocols + array).",
+        ""
+      ]
+        |> foreach(s => Stdout.print(s))
+      let out = cli_proc.capture(argv, cli_proc.inherit(), "#{tmp}/builtins.json")
+      builtin_rows(out.snd) |> foreach(s => Stdout.print(s))
+      Stdout.print("")
+      Stdout.print("Full doc text: kai info builtins --json")
+      Ok(0)
+    })
+  }
+}
+
+# Flags after the topic: `--json`, narrowed by `--section <name>` selectors kept `\037`-joined.
+fn page_flags(topic: String, args: [String], json: Bool, want: String) : Result[
+  (Bool, String),
+  Int
+] / Stderr =
+  match args {
+    [] -> Ok((json, want))
+    ["--json", ...rest] -> page_flags(topic, rest, true, want)
+    ["--section", name, ...rest] if name != "" -> page_flags(topic, rest, json, join_want(want, name))
+    ["--section", ..._] -> {
+      Stderr.eprint("kai: error: --section requires a section name")
+      Err(2)
+    }
+    [a, ...rest] if string.starts_with(a, "--section=") ->
+      page_flags(topic, rest, json, join_want(want, string.drop_prefix(a, "--section=").unwrap_or("")))
+    [a, ..._] -> {
+      Stderr.eprint("kai: error: unknown flag for 'kai info #{topic}': #{a}")
+      Stderr.eprint("  try '--json', '--json --section <name>', or no flag.")
+      Err(2)
+    }
+  }
+
+fn join_want(want: String, name: String) : String = if want == "" { name } else { "#{want}\u{1f}#{name}" }
+
+fn show(dir: String, topic: String, args: [String]) : Result[Int, Int] / Stdout + Stderr + File + Ffi {
+  let page = "#{dir}/#{topic}.md"
+  if not cli_sys.is_file(page) {
+    Stderr.eprint("kai: error: no info page for '#{topic}'")
+    Stderr.eprint("  run 'kai info' to list available topics.")
+    Err(1)
+  } else {
+    let f = page_flags(topic, args, false, "")!
+    if f.snd != "" and (not f.fst) {
+      Stderr.eprint("kai: error: --section requires --json")
+      Err(2)
+    } else if not f.fst {
+      cli_sys.copy_to_stdout(page)
+      Ok(0)
+    } else {
+      cli_info_json.render(topic, cli_fs.read_or_empty(page), f.snd)
+    }
+  }
+}
+
+#[doc("`kai info [<topic> [--json [--section <name>]...] | --list | -k <keyword>]`: the exit status.")]
+pub fn info_verb(t: Toolchain, args: [String]) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let dir = info_dir(t.layout)
+  if not cli_sys.is_dir(dir) {
+    Stderr.eprint("kai: error: info pages not found at #{dir}")
+    Stderr.eprint("  set KAIKAI_INFO_PATH to override the lookup path.")
+    Err(2)
+  } else {
+    match args {
+      [a, ..._] if a == "-h" or a == "--help" -> {
+        Stdout.print(cli_tool_help.info_text(dir))
+        Ok(0)
+      }
+      ["--list", ..._] -> {
+        topics(dir) |> foreach(s => Stdout.print(s))
+        Ok(0)
+      }
+      ["-k", ...rest] -> search(dir, list.head(rest).unwrap_or(""))
+      [a, ..._] if string.starts_with(a, "-") -> cli_err.die("unknown flag: #{a} (see 'kai info --help')")
+      [] -> {
+        listing(dir)
+        Ok(0)
+      }
+      ["builtins", ...rest] -> builtins(t, rest)
+      [topic, ...rest] -> show(dir, topic, rest)
+    }
+  }
+}
