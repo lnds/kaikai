@@ -49,6 +49,11 @@ concurrency:
 permissions:
   contents: read
 
+# The boot of stage2.c (docs/build-system.md §KAIC_BOOT). Workflow-wide: a
+# job whose mode disagrees with the artifact's stage2.c.id rebuilds stage2.c.
+env:
+  KAIC_BOOT: release
+
 jobs:
   changes:
     runs-on: ubuntu-latest
@@ -131,7 +136,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.doc-only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # A release boot compiles the whole compiler twice; keep equal to
+    # tier1-mn-corpus's scheduled build-native.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -153,6 +160,12 @@ jobs:
       - name: Fingerprint toolchain for cache key
         id: cc-fp
         run: echo "id=$( (clang --version | head -1; "$LLVM_CONFIG" --version) | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
+      # The boot is part of the chain's identity: the key names the release it resolves to.
+      - name: Resolve the release boot
+        id: boot
+        run: |
+          id="$(tools/kaic-boot.sh release-id)"
+          echo "id=$(printf '%s' "$id" | tr -c 'A-Za-z0-9.' '-')" >> "$GITHUB_OUTPUT"
       - name: Cache native bootstrap chain (exact source match only)
         id: bootstrap-cache
         uses: actions/cache@v4
@@ -164,15 +177,23 @@ jobs:
             stage1/build/stage1.c
             stage2/kaic2
             stage2/build/stage2.c
+            stage2/build/stage2.c.id
+            stage2/build/kaic2.id
             stage0/runtime_llvm.bc
             stage0/runtime_llvm.bc.stamp
             stage0/runtime_inline.bc
-          key: kaic2-native-${{ steps.cc-fp.outputs.id }}-${{ hashFiles('Makefile', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/assert-runtime-bc.sh') }}
-      - name: Build native kaic2
+          key: kaic2-native-${{ steps.cc-fp.outputs.id }}-${{ steps.boot.outputs.id }}-${{ hashFiles('Makefile', 'EDITION', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/kaic-boot.sh', 'tools/assert-runtime-bc.sh') }}
+      # kaic1 is not the boot; it ships because the consumers' chain carries it.
+      - name: Build kaic1 and the release-booted native kaic2
         if: steps.bootstrap-cache.outputs.cache-hit != 'true'
+        # Temporary: a kaic2-built compiler is several times slower under M:N; drop this once it is not.
+        env:
+          KAI_THREADS: "1"
         run: |
           rm -f stage2/kaic2
-          make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" kaic2 >/dev/null 2>&1
+          make kaic1
+          make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" kaic2 > "$RUNNER_TEMP/kaic2.log" 2>&1 \
+            || { tail -n 40 "$RUNNER_TEMP/kaic2.log"; exit 1; }
       - name: Mark cached chain fresh (no rebuild)
         if: steps.bootstrap-cache.outputs.cache-hit == 'true'
         run: |
@@ -191,6 +212,8 @@ jobs:
             stage1/build/stage1.c
             stage2/kaic2
             stage2/build/stage2.c
+            stage2/build/stage2.c.id
+            stage2/build/kaic2.id
             stage0/runtime_llvm.bc
             stage0/runtime_llvm.bc.stamp
             stage0/runtime_inline.bc

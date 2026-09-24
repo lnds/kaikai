@@ -330,8 +330,8 @@ kaic2-fast-verify: $(KAIC2_FAST_STAGING)
 	  && echo "kaic2-fast-verify OK (compiler + sample emitted C byte-identical)" \
 	  || { echo "kaic2-fast-verify: sample DIFF"; exit 1; }
 
-# Convergence gate for KAIC_BOOT: a kaic2 booted from the release named by
-# ../VERSION and one booted from the kaic1 chain must emit byte-identical C
+# Convergence gate for KAIC_BOOT: a kaic2 booted from the release boot
+# and one booted from the kaic1 chain must emit byte-identical C
 # for the compiler itself and for a sample program — the kaic2-fast-verify
 # contract across boots — and the release boot's kaic2-a must emit the C its
 # kaic2 emits. Each boot's stage2.c is reused only on an exact identity

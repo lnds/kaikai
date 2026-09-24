@@ -11,6 +11,8 @@
 #
 # The ceiling has headroom for ordinary drift and is not a baseline to
 # re-pin on every improvement; lower it when a lane wins real ground.
+# The count depends on the boot: a kaic1-booted kaic2 allocates about half
+# the cells of the release-booted one CI gates, so it passes with slack.
 
 set -eu
 cd "$(dirname "$0")/.."
@@ -18,7 +20,7 @@ ROOT="$(pwd)"
 KAIC2="$ROOT/stage2/kaic2"
 WORK="$ROOT/stage2/build/compile-alloc"
 MODS=40
-CEILING="${KAI_COMPILE_ALLOC_CEILING:-9000000}"
+CEILING="${KAI_COMPILE_ALLOC_CEILING:-16800000}"
 
 [ -x "$KAIC2" ] || { echo "compile-alloc: SKIP — no stage2/kaic2"; exit 0; }
 
