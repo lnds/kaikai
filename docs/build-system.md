@@ -170,7 +170,6 @@ unset KAIKAI_STDLIB_PATH; cd .. && make bin/kai
 - **Two hops.** `stage2-a.c` is the seed's codegen, so it compiles against the seed's runtime; only `stage2-b.c` is the tree's codegen, bound to the tree's `stage2/runtime.h`. When the tree is the seed's parent, both hops reproduce the seed byte for byte.
 - **The seed bakes no stdlib path.** `KAIKAI_STDLIB_PATH` points it at the tree's `stdlib/`; the final `kaic2` bakes the path the way `make kaic2` does.
 - **The leap is guaranteed only for the seed's parent.** A later tree compiles only while its compiler sources and core stay inside the seed's language; past that, rescue each intervening release in turn, or refresh the seed.
-- **`bin/kai` in a checkout builds `kaic0` and `kaic1` on first use** when they are missing, even with `stage2/kaic2` in place.
 
 Refreshing the seed after release `vX.Y.0`:
 
