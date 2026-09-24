@@ -69,24 +69,20 @@ if [ "$KAI_TIMEOUT_KIND" = none ]; then
   echo "::warning::run-mn-corpus-determinism runs UNBOUNDED (no timeout/gtimeout/perl); a wedge will block instead of counting as a hang"
 fi
 
-# A backend that cannot build a trivial program is dropped from the arm list
-# with a loud line — never silently degraded into a pass.
-usable_backends() {
-  local backend usable=""
-  printf 'fn main() : Int = 0\n' > "$TMP/probe.kai"
-  for backend in $BACKENDS; do
-    if KAI_BACKEND="$backend" "$KAI" build "$TMP/probe.kai" -o "$TMP/probe.bin" >/dev/null 2>&1; then
-      usable="$usable $backend"
-    else
-      echo "run-mn-corpus-determinism: backend '$backend' unavailable in this checkout — arm dropped" >&2
-    fi
-  done
-  echo "${usable# }"
-}
-BACKENDS="$(usable_backends)"
-if [ -z "$BACKENDS" ]; then
-  echo "run-mn-corpus-determinism: SKIP (no usable backend; rebuild kaic2, e.g. make KAI_LLVM=1 kaic2)"
-  exit 0
+# Every requested backend must build a trivial program. Dropping one would
+# report its arm green without running it; a C-only checkout asks for
+# MN_CORPUS_BACKENDS=c instead.
+unusable=""
+printf 'fn main() : Int = 0\n' > "$TMP/probe.kai"
+for backend in $BACKENDS; do
+  if ! KAI_BACKEND="$backend" "$KAI" build "$TMP/probe.kai" -o "$TMP/probe.bin" > "$TMP/probe.err" 2>&1; then
+    unusable="$unusable $backend"
+    sed 's/^/    /' "$TMP/probe.err" | head -10
+  fi
+done
+if [ -n "$unusable" ]; then
+  echo "run-mn-corpus-determinism FAIL — backend(s)${unusable} cannot build a trivial program (set MN_CORPUS_BACKENDS to the backends this checkout has)"
+  exit 1
 fi
 
 kai_corpus_entry_points > "$TMP/entry-points"
