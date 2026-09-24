@@ -239,6 +239,13 @@ endif
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(LDFLAGS_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M) $(LLVM_LDFLAGS)
 	@if [ -f $(STAGE2_ID) ]; then $(BOOT_SH) seal $< $@; else rm -f build/$@.id; fi
 ifeq ($(KAI_LLVM),1)
+	@# Linking libLLVM does not prove native works: a kaic2 compiled by kaic2
+	@# can link it and still crash emitting native, the default backend.
+ifeq ($(KAI_NATIVE_PROBE),0)
+	@echo "building stage2: native probe SKIPPED (KAI_NATIVE_PROBE=0)"
+else
+	@../tools/native-probe.sh $@ || { rm -f $@ build/$@.id; echo "building stage2: native backend BROKEN, $@ removed (KAI_NATIVE_PROBE=0 keeps it)"; exit 1; }
+endif
 	@# P2 (docs/native-codegen-perf-plan.md §P2): generate the native-runtime
 	@# bitcode the in-process backend links before O2. Build-time + gated to
 	@# clang 18 (writer <= the libLLVM-18 reader); a clang-18-less host opts

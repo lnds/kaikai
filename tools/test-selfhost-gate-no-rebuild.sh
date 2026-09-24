@@ -30,7 +30,7 @@ fi
 
 # …and it must still prove the binary can emit native objects before it
 # spends twenty minutes assuming so.
-if ! grep -q 'probe.kai' "$GATE"; then
+if ! grep -q 'native-probe.sh' "$GATE"; then
   echo "selfhost-gate-no-rebuild FAIL — the gate no longer probes the native backend."
   fail=1
 fi
