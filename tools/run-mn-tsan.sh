@@ -65,9 +65,12 @@ TSAN_CFLAGS="-std=c11 -Wno-unused-function -Wno-unused-variable -g -O1 -fsanitiz
 # land — TSAN reports them either way, which is why these live here and not
 # only in the effects tier.
 #
-# The last covers a mailbox's lifetime: senders on other threads read its Pid
+# The next covers a mailbox's lifetime: senders on other threads read its Pid
 # while the owner closes it, and a send that slipped between the check and the
 # enqueue would write into freed memory.
+#
+# The rally makes nearly every message a cross-thread wake, so it drives the
+# idle path hard: spinning workers, parks, and the permit handoff between them.
 FIXTURES=(
   "examples/effects/mn_cross_thread_copy_stress.kai"
   "examples/effects/mn_deep_stack_migration.kai"
@@ -75,6 +78,7 @@ FIXTURES=(
   "examples/effects/mn_await_result_share.kai"
   "examples/effects/mn_str_intern_race.kai"
   "examples/effects/mn_send_to_ended_mailbox_race.kai"
+  "examples/effects/mn_pingpong_no_false_deadlock.kai"
 )
 
 fail=0

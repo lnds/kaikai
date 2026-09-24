@@ -3513,6 +3513,12 @@ typedef struct KaiSchedSlot {
     KaiFiber       *steal_head;   /* fibers available to steal (FIFO) */
     KaiFiber       *steal_tail;
     _Atomic int     live;         /* slot participates in stealing */
+    /* Idle park: the owner blocks on park_cv until a waker hands it a
+     * permit or shutdown begins (kai_worker_park). */
+    pthread_mutex_t park_mu;
+    pthread_cond_t  park_cv;
+    _Atomic int     parked;       /* owner is announced asleep */
+    _Atomic int     permit;       /* a wake is pending; consumed by exchange */
 } KaiSchedSlot;
 
 #define KAI_MAX_THREADS 256
@@ -3525,18 +3531,24 @@ KaiSchedSlot kai_sched_slots[KAI_MAX_THREADS];
 static KaiSchedSlot kai_sched_slots[KAI_MAX_THREADS];
 #endif
 
-/* Count of threads currently idle (blocked on their cv). A cross-thread
- * producer reads it to decide whether a wakeup signal is worth sending;
- * The workers poll `kai_sched_shutting_down` at the top of their loop, so
- * it is atomic (a single writer at shutdown, many lock-free readers) and
- * needs no lock — the scheduler has no other cross-thread global state
- * beyond the per-slot deques. */
+/* `kai_sched_sleepers` counts workers announced asleep in kai_worker_park;
+ * a producer that reads 0 after its push skips the wake scan entirely.
+ * `kai_sched_spinning` counts workers searching in kai_worker_spin; while
+ * one is, a producer leaves its fiber to that search instead of waking a
+ * parked worker. `kai_sched_shutting_down` is written once at shutdown and
+ * read lock-free by every worker and the reactor. */
 #if defined(KAI_SEPARATE_COMPILATION)
+extern _Atomic int kai_sched_sleepers;
+extern _Atomic int kai_sched_spinning;
 extern _Atomic int kai_sched_shutting_down;   /* main returned → workers exit */
 #  if defined(KAI_RUNTIME_OWNER)
+_Atomic int kai_sched_sleepers = 0;
+_Atomic int kai_sched_spinning = 0;
 _Atomic int kai_sched_shutting_down = 0;
 #  endif
 #else
+static _Atomic int kai_sched_sleepers = 0;
+static _Atomic int kai_sched_spinning = 0;
 static _Atomic int kai_sched_shutting_down = 0;
 #endif
 
@@ -3547,12 +3559,16 @@ static _Atomic int kai_sched_shutting_down = 0;
  * wedged before it does. A deadlock is a stable state, so the check keys on
  * quiescence, never elapsed time — a long-running program is never killed.
  *
- *   kai_sched_idle_count    — workers parked in the idle nap. == kai_nthreads
+ *   kai_sched_idle_count    — workers blocked in the idle park. == kai_nthreads
  *                             means no fiber is RUNNING, so no fiber body can
  *                             produce new runnable work.
  *   kai_blocked_fiber_count — fibers currently in KAI_FIBER_PARKED (mailbox
  *                             recv / await / send-block AND reactor waiters);
  *                             the count the deadlock banner reports.
+ *   kai_sched_idle_epoch    — bumped each time a worker leaves the idle pool.
+ *                             The check reads its inputs one after another,
+ *                             so an unchanged epoch is what makes them one
+ *                             snapshot: no worker took a fiber in between.
  *   kai_deadlock_reported   — claimed by CAS so exactly one worker prints the
  *                             banner. Quiescence is observable by every idle
  *                             worker at once, so without it the banner count
@@ -3560,18 +3576,21 @@ static _Atomic int kai_sched_shutting_down = 0;
  * The reactor's own idle state is kai_reactor_idle, beside the reactor
  * globals below. Untouched at N=1 (that path keeps the TLS kai_parked_count). */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern _Atomic int kai_sched_idle_count;
-extern _Atomic int kai_blocked_fiber_count;
-extern _Atomic int kai_deadlock_reported;
+extern _Atomic int      kai_sched_idle_count;
+extern _Atomic unsigned kai_sched_idle_epoch;
+extern _Atomic int      kai_blocked_fiber_count;
+extern _Atomic int      kai_deadlock_reported;
 #  if defined(KAI_RUNTIME_OWNER)
-_Atomic int kai_sched_idle_count = 0;
-_Atomic int kai_blocked_fiber_count = 0;
-_Atomic int kai_deadlock_reported = 0;
+_Atomic int      kai_sched_idle_count = 0;
+_Atomic unsigned kai_sched_idle_epoch = 0;
+_Atomic int      kai_blocked_fiber_count = 0;
+_Atomic int      kai_deadlock_reported = 0;
 #  endif
 #else
-static _Atomic int kai_sched_idle_count = 0;
-static _Atomic int kai_blocked_fiber_count = 0;
-static _Atomic int kai_deadlock_reported = 0;
+static _Atomic int      kai_sched_idle_count = 0;
+static _Atomic unsigned kai_sched_idle_epoch = 0;
+static _Atomic int      kai_blocked_fiber_count = 0;
+static _Atomic int      kai_deadlock_reported = 0;
 #endif
 
 /* Park/wake trace for the deadlock banner. `kai_blocked_fiber_count` has a
@@ -3675,7 +3694,9 @@ static void kai_reactor_wake(void);
  * cross-thread mailbox send path (which runs on the sender's thread but
  * must resume a receiver parked on the owner's thread). */
 static void kai_sched_remote_unpark(KaiFiber *target);
-static void kai_sched_wake_thread(int tid);
+static int  kai_sched_wake_thread(int tid);
+static void kai_sched_notify_work(int slot);
+static void kai_sched_check_deadlock(void);
 /* Single-slot pending-free for fiber structs whose wrappers went to RC=0
  * while the fiber itself was still the current fiber (the trampoline tail's
  * kai_decref(self->value) is the producer). Drained at every entry point
@@ -15250,6 +15271,9 @@ static void kai_reactor_wait(void) {
     if (kai_nthreads > 1)
         atomic_store(&kai_reactor_idle, kai_reactor_parked_count == 0 ? 1 : 0);
     kai_reactor_unlock();
+    /* Parked workers never retry the deadlock check, so a reactor going
+     * quiescent after the last worker parked must run it itself. */
+    if (kai_nthreads > 1) kai_sched_check_deadlock();
     int rc = poll(pfds, (nfds_t) nfds, timeout_ms);
     if (kai_nthreads > 1) atomic_store(&kai_reactor_idle, 0);
     if (rc < 0 && errno != EINTR) {
@@ -15491,10 +15515,16 @@ static void kai_sched_enqueue(KaiFiber *f) {
          * would lock a slot the fiber is not queued on. */
         f->home_thread = owner;
         f->sched_next = NULL;
+        int was_empty = s->steal_tail == NULL;
         if (s->steal_tail) s->steal_tail->sched_next = f;
         else               s->steal_head = f;
         s->steal_tail = f;
         pthread_mutex_unlock(&s->mu);
+        /* An owner at its root searches next and takes a lone fiber itself;
+         * waking a peer to race it for that fiber is a wasted futex trip. */
+        if (!(was_empty && owner == kai_thread_id
+              && kai_active_fiber == &kai_main_fiber))
+            kai_sched_notify_work(owner);
         return;
     }
     f->sched_next = NULL;
@@ -15648,13 +15678,6 @@ static void kai_fiber_init_ctx(KaiFiber *f) {
  * docs/mn-scheduler-design.md §2, §4. Off at N=1.
  * ================================================================== */
 
-/* Reactor ownership is fixed on thread 0 for F1 (F0 left the reactor
- * single-owner; F2 shards it). Any thread may register a reactor waiter,
- * but only thread 0 runs `kai_reactor_wait` — a scheduler thread that
- * finds its own local queue empty and is NOT the owner steals or parks
- * on its condvar; it never touches the poll set. */
-#define KAI_REACTOR_OWNER_THREAD 0
-
 /* Find one runnable fiber for this thread: its own queue first (LIFO
  * locality preserved by the FIFO order the owner maintains), then a
  * round-robin steal sweep over the other live threads. Returns NULL when
@@ -15670,19 +15693,47 @@ static KaiFiber *kai_worker_find_work(void) {
     return NULL;
 }
 
-/* F2 — no-op. Every scheduler thread now polls its own deque on a short
- * nanosleep, so a fiber pushed by a cross-thread remote_unpark is picked up
- * on the next retry with no explicit signal. The reactor is a dedicated
- * thread woken through its own self-pipe (kai_reactor_wake), not through a
- * scheduler thread — so there is no thread here that blocks in poll() and
- * needs poking. (F1 poked thread 0's filepool pipe because that thread ran
- * the inline reactor; F2 moved the poll off the scheduler threads.) */
-static void kai_sched_wake_thread(int tid) {
-    (void) tid;
+/* Hand worker `tid` a permit if it is parked. Returns 1 only when this call
+ * delivered a fresh permit; 0 means `tid` is awake or already holds one, and
+ * either way it searches the deques again before it can sleep. */
+static int kai_sched_wake_thread(int tid) {
+    KaiSchedSlot *s = &kai_sched_slots[tid];
+    if (!atomic_load(&s->parked)) return 0;
+    if (atomic_exchange(&s->permit, 1)) return 0;
+    pthread_mutex_lock(&s->park_mu);
+    pthread_cond_signal(&s->park_cv);
+    pthread_mutex_unlock(&s->park_mu);
+    return 1;
+}
+
+/* A fiber just landed on `slot`'s deque (the push's slot lock is already
+ * released): wake the slot's owner if it is parked — only the owner can run
+ * a main-pinned fiber — else leave it to a spinning worker, else wake one
+ * parked peer to steal it; a busy owner would otherwise leave it queued
+ * behind its current fiber. Nobody parked costs one load. */
+static void kai_sched_notify_work(int slot) {
+    if (atomic_load(&kai_sched_sleepers) == 0) return;
+    if (slot != kai_thread_id && kai_sched_wake_thread(slot)) return;
+    if (atomic_load(&kai_sched_spinning) > 0) return;
+    for (int i = 1; i <= kai_nthreads; i++) {
+        int t = (kai_thread_id + i) % kai_nthreads;
+        if (t == kai_thread_id || t == slot) continue;
+        if (kai_sched_wake_thread(t)) return;
+    }
+}
+
+/* Shutdown: every parked worker re-reads the flag under its park lock. */
+static void kai_sched_wake_all(void) {
+    for (int i = 0; i < kai_nthreads; i++) {
+        KaiSchedSlot *s = &kai_sched_slots[i];
+        pthread_mutex_lock(&s->park_mu);
+        pthread_cond_signal(&s->park_cv);
+        pthread_mutex_unlock(&s->park_mu);
+    }
 }
 
 /* Promote a fiber owned by another thread from PARKED to READY and make
- * it runnable on its home thread, then wake that thread. Called from a
+ * it runnable on its home thread, then wake a worker for it. Called from a
  * cross-thread mailbox send (the sender runs here, the receiver's home
  * is elsewhere). The state flip is serialized on the target's slot lock
  * so it composes with the target's own park path (which sets PARKED
@@ -15706,6 +15757,7 @@ static void kai_sched_remote_unpark(KaiFiber *target) {
         kai_fiber_slot_unlock_at(home);
         atomic_fetch_sub(&kai_blocked_fiber_count, 1);
         kai_park_trace(target, "unpark-parked");
+        kai_sched_notify_work(home);
     } else if (target->state == KAI_FIBER_DONE ||
                target->state == KAI_FIBER_CANCELLED) {
         /* Terminal: nothing to wake, and the struct may be about to be
@@ -15720,13 +15772,12 @@ static void kai_sched_remote_unpark(KaiFiber *target) {
         kai_fiber_slot_unlock_at(home);
         kai_park_trace(target, "unpark-permit");
     }
-    kai_sched_wake_thread(home);
 }
 
 /* Every deque empty? Read each slot's ready head under its own lock so a
  * fiber a reactor flush is mid-enqueue is seen rather than raced past.
- * Called with kai_reactor_mu held, so the lock order (reactor_mu → slot)
- * is respected. */
+ * Takes one slot lock at a time, so it respects the reactor_mu → slot
+ * order whether or not the caller holds kai_reactor_mu. */
 static int kai_all_deques_empty(void) {
     for (int i = 0; i < kai_nthreads; i++) {
         KaiSchedSlot *s = &kai_sched_slots[i];
@@ -15739,10 +15790,11 @@ static int kai_all_deques_empty(void) {
 }
 
 /* Global-quiescence deadlock check — the M:N analogue of the single-thread
- * dispatch loop's "run queue empty with fibers parked". An idle worker runs
- * it; it fires only when the whole machine is wedged: every worker idle, the
- * reactor asleep with nothing armed, every deque empty, and at least one
- * fiber PARKED. That state is terminal — no fiber or reactor event can leave
+ * dispatch loop's "run queue empty with fibers parked". A worker runs it as
+ * it parks and the reactor as it goes quiescent, so whichever of them
+ * completes the wedge sees it. It fires only when the whole machine is
+ * wedged: every worker idle, the reactor asleep with nothing armed, every
+ * deque empty, and at least one fiber PARKED. That state is terminal — no fiber or reactor event can leave
  * it — so it is a true deadlock, not a transient lull, and the report needs
  * no timeout.
  *
@@ -15756,6 +15808,10 @@ static int kai_all_deques_empty(void) {
  * the reactor branch of commit_park) and scans the deques under their slot
  * locks, so a fiber a flush is mid-handback is counted, never missed. */
 static void kai_sched_check_deadlock(void) {
+    /* Read before the idle count: a worker leaves the pool by dropping the
+     * count and THEN bumping the epoch, so a worker this check still counts
+     * idle cannot have bumped it yet. */
+    unsigned epoch = atomic_load(&kai_sched_idle_epoch);
     /* Cheap lock-free gate so the reactor_mu acquisition below stays rare —
      * only an already-terminal-looking observation pays for the confirm. */
     if (atomic_load(&kai_sched_idle_count) != kai_nthreads) return;
@@ -15769,7 +15825,11 @@ static void kai_sched_check_deadlock(void) {
               && kai_reactor_parked_count == 0
               && atomic_load(&kai_blocked_fiber_count) > 0
               && !kai_sched_shutting_down
-              && kai_all_deques_empty();
+              && kai_all_deques_empty()
+              /* All idle does not stop a woken worker from leaving the pool
+               * and dequeuing between the reads above, which would make a
+               * queued fiber look like an empty deque. */
+              && atomic_load(&kai_sched_idle_epoch) == epoch;
     pthread_mutex_unlock(&kai_reactor_mu);
     if (!wedged) return;
 
@@ -15793,59 +15853,98 @@ static void kai_sched_check_deadlock(void) {
     exit(1);
 }
 
+/* Park this worker until a waker hands it a permit or shutdown begins.
+ * Returns a fiber the final recheck found, else NULL once woken.
+ *
+ * No lost wakeup: `parked` and the sleeper count are raised BEFORE the
+ * recheck locks each slot, and every producer reads them AFTER pushing under
+ * a slot lock. That lock orders each push against the recheck, so a push is
+ * either seen by the recheck or its producer sees this worker parked and
+ * delivers a permit. A permit is consumed by exchange, which acquires the
+ * push of every waker that found it already pending. */
+static KaiFiber *kai_worker_park(void) {
+    KaiSchedSlot *s = kai_sched_slot();
+    atomic_store(&s->parked, 1);
+    atomic_fetch_add(&kai_sched_sleepers, 1);
+    KaiFiber *f = kai_worker_find_work();
+    if (!f) {
+        /* Idle only once the recheck came up empty: a worker holding an
+         * undispatched fiber must never count as idle to the deadlock check. */
+        atomic_fetch_add(&kai_sched_idle_count, 1);
+        kai_sched_check_deadlock();
+        pthread_mutex_lock(&s->park_mu);
+        while (!atomic_load(&s->permit) && !kai_sched_shutting_down)
+            pthread_cond_wait(&s->park_cv, &s->park_mu);
+        pthread_mutex_unlock(&s->park_mu);
+        atomic_fetch_sub(&kai_sched_idle_count, 1);
+        atomic_fetch_add(&kai_sched_idle_epoch, 1);
+    }
+    int woken = atomic_exchange(&s->permit, 0);
+    atomic_fetch_sub(&kai_sched_sleepers, 1);
+    atomic_store(&s->parked, 0);
+    /* The recheck already found work, so a permit that raced it was meant
+     * for a fiber still queued: pass it on rather than leave that fiber
+     * waiting behind this one. */
+    if (f && woken) kai_sched_notify_work(kai_thread_id);
+    return f;
+}
+
+/* Search rounds a worker spends before parking. A worker that just ran out
+ * of work often gets the next fiber within microseconds (a reply, a wake),
+ * and catching it here spares the producer a futex wake and this worker a
+ * sleep/wake round trip. Bounded, so an idle program still parks at once. */
+#define KAI_SPIN_ROUNDS 32
+
+/* Search for work for a bounded spell, yielding the CPU between rounds so an
+ * oversubscribed host still runs the thread that would produce the work.
+ * Producers skip their wake while anyone spins (kai_sched_notify_work), so
+ * the last spinner out owes them: leaving empty-handed, it parks and its
+ * recheck sees any skipped push; leaving with a fiber, it wakes a parked
+ * peer if work is still queued. A push the scan below misses landed after
+ * this spinner left the count, so its producer did not count on it. */
+static KaiFiber *kai_worker_spin(void) {
+    atomic_fetch_add(&kai_sched_spinning, 1);
+    KaiFiber *f = NULL;
+    for (int i = 0; i < KAI_SPIN_ROUNDS && !f && !kai_sched_shutting_down; i++) {
+        sched_yield();
+        f = kai_worker_find_work();
+    }
+    int last = atomic_fetch_sub(&kai_sched_spinning, 1) == 1;
+    if (f && last && !kai_all_deques_empty()) kai_sched_notify_work(kai_thread_id);
+    return f;
+}
+
 /* The per-thread scheduler loop, run ON this thread's kai_main_fiber
  * (the OS-thread context). A worker thread enters here after startup; the
  * main thread enters it only implicitly (its main_fiber IS the program's
  * initial context, and park/trampoline swap back here when the local
  * queue drains). The loop: run everything runnable locally or stolen; when
- * nothing is runnable anywhere, count into kai_sched_idle_count, run the
- * global-quiescence deadlock check, and nap. Exits when the program has
- * terminated (shutdown flag set) — only the workers exit here; the main
- * thread's loop returns control to `main` via the root fiber finishing. */
+ * nothing is runnable anywhere, spin briefly, then block in kai_worker_park
+ * until a producer or shutdown wakes it. Exits when the program has terminated (shutdown
+ * flag set) — only the workers exit here; the main thread's loop returns
+ * control to `main` via the root fiber finishing. */
 static void kai_worker_loop(void) {
     KaiFiber *self_root = &kai_main_fiber;
     KAI_TSAN_BIND_ROOT();
-    int idle = 0;   /* this worker is currently counted in kai_sched_idle_count */
-    for (;;) {
-        if (kai_sched_shutting_down) {
-            if (idle) atomic_fetch_sub(&kai_sched_idle_count, 1);
-            return;
-        }
-        /* Leave the idle pool BEFORE searching. A worker holding a fiber it
-         * has not yet dispatched is invisible to the quiescence check (the
-         * fiber is off every deque and not RUNNING); counting that worker
-         * idle lets the check observe "all idle, deques empty, one blocked"
-         * mid-dispatch and kill a healthy process. Non-idle from before the
-         * search until the dispatch completes closes that window. */
-        if (idle) { atomic_fetch_sub(&kai_sched_idle_count, 1); idle = 0; }
+    while (!kai_sched_shutting_down) {
         KaiFiber *next = kai_worker_find_work();
-        if (next) {
-            next->state = KAI_FIBER_RUNNING;
-            kai_active_fiber = next;
-            KAI_TSAN_SWITCH_TO(next);
-            swapcontext(&self_root->ctx, &next->ctx);
-            kai_active_fiber = self_root;
-            kai_drain_pending_free();
-            /* F2 — from the root context (kai_main_fiber), after the exit
-             * swap above saved the fiber's ctx: link any fiber that
-             * reactor-parked into the wheel/waiter list, and requeue any
-             * fiber that yielded onto the steal list. Both are unsafe to do
-             * on the fiber's own stack (a thief/reactor could resume a
-             * half-saved ctx), so they are deferred to here. */
-            kai_drain_commit_stack();
-            kai_drain_requeue_stack();
-            continue;
-        }
-        /* Idle: no runnable work anywhere. Publish it, then test for a
-         * global deadlock before napping. A short nanosleep (not a condvar
-         * wait) is the portable choice: a cross-thread push is observed on
-         * the next retry within the sleep bound, and shutdown is observed at
-         * the top of the loop — neither depends on a wakeup that could be
-         * lost. 200µs bounds both wake latency and idle CPU. */
-        if (!idle) { atomic_fetch_add(&kai_sched_idle_count, 1); idle = 1; }
-        kai_sched_check_deadlock();
-        struct timespec nap = { 0, 200 * 1000 };   /* 200µs */
-        nanosleep(&nap, NULL);
+        if (!next) next = kai_worker_spin();
+        if (!next) next = kai_worker_park();
+        if (!next) continue;
+        next->state = KAI_FIBER_RUNNING;
+        kai_active_fiber = next;
+        KAI_TSAN_SWITCH_TO(next);
+        swapcontext(&self_root->ctx, &next->ctx);
+        kai_active_fiber = self_root;
+        kai_drain_pending_free();
+        /* F2 — from the root context (kai_main_fiber), after the exit
+         * swap above saved the fiber's ctx: link any fiber that
+         * reactor-parked into the wheel/waiter list, and requeue any
+         * fiber that yielded onto the steal list. Both are unsafe to do
+         * on the fiber's own stack (a thief/reactor could resume a
+         * half-saved ctx), so they are deferred to here. */
+        kai_drain_commit_stack();
+        kai_drain_requeue_stack();
     }
 }
 
@@ -16295,20 +16394,17 @@ static KaiValue  *kai_user_main_result = NULL;
 #endif
 /* Root-fiber trampoline for the user's main under M:N. Runs kai_main on
  * a spawned fiber's stack (so main can park/steal like any actor),
- * publishes the result, flips the shutdown flag, wakes every worker, and
- * returns to thread 0's scheduler loop. */
+ * publishes the result, flips the shutdown flag, and returns to thread 0's
+ * scheduler loop. */
 static void kai_bootstrap_trampoline(void) {
     KaiFiber *self = kai_active_fiber;
     kai_drain_pending_free();
     self->state = KAI_FIBER_RUNNING;
     kai_user_main_result = kai_user_main_fn();
     self->state = KAI_FIBER_DONE;
-    /* Program is over: flip the shutdown flag. Every worker polls it at
-     * the top of its loop within one nanosleep tick and returns, so no
-     * explicit wake is needed; the owner is woken from a possible poll()
-     * via its self-pipe. */
+    /* Program is over: flip the shutdown flag. kai_sched_bootstrap wakes
+     * the parked workers and the reactor once thread 0's loop sees it. */
     kai_sched_shutting_down = 1;
-    kai_sched_wake_thread(KAI_REACTOR_OWNER_THREAD);
     /* Hand back to this thread's scheduler loop, which sees the shutdown
      * flag and returns to kai_sched_bootstrap. Out of line: this frame spans
      * the whole user main, so an inline store would reuse the slot address
@@ -16436,6 +16532,10 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
         kai_sched_slots[i].steal_head = NULL;
         kai_sched_slots[i].steal_tail = NULL;
         kai_sched_slots[i].live = 0;
+        pthread_mutex_init(&kai_sched_slots[i].park_mu, NULL);
+        pthread_cond_init(&kai_sched_slots[i].park_cv, NULL);
+        kai_sched_slots[i].parked = 0;
+        kai_sched_slots[i].permit = 0;
     }
     /* F2 — the reactor mutex guards the wheel + waiter lists + parked_count,
      * and the reactor thread must have its self-pipes open before it polls
@@ -16494,8 +16594,10 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
      * context) until the bootstrap trampoline flips the shutdown flag. */
     kai_worker_loop();
 
-    /* Shutdown: the bootstrap trampoline set kai_sched_shutting_down; poke
-     * the reactor out of poll() so it observes the flag and exits. */
+    /* Shutdown: the bootstrap trampoline set kai_sched_shutting_down; wake
+     * the parked workers and poke the reactor out of poll() so every thread
+     * observes the flag and exits. */
+    kai_sched_wake_all();
     kai_reactor_wake();
     for (int i = 1; i < kai_nthreads; i++) pthread_join(kai_worker_threads[i], NULL);
     pthread_join(kai_reactor_thread, NULL);
