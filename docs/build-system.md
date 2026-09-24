@@ -7,7 +7,7 @@ Practical map of the build. Read this before running the compiler or touching a 
 | You want to… | Command (from repo root) |
 |---|---|
 | Run / build a `.kai` program | `./bin/kai run <file.kai>` · `./bin/kai build <file.kai> -o <out>` |
-| Rebuild the compiler after editing `stage2/compiler/*.kai` | `make kaic2-fast` (dev, needs an existing kaic2) · `make kaic2` (bootstrap, C) · `make KAI_LLVM=1 kaic2` (native) |
+| Rebuild the compiler after editing `stage2/compiler/*.kai` | `make kaic2-fast` (dev, needs an existing kaic2) · `make kaic2` (bootstrap, C) · `make KAI_LLVM=1 kaic2` (native) · `make kaic2 KAIC_BOOT=auto` (no kaic1; see §KAIC_BOOT) |
 | Full bootstrap from scratch | `make all` (→ `kaic0` → `kaic1` → `kaic2` → `bin/kai`) |
 | Verify a change | `make tier0` (fast) · `make tier1` (full, CI gate) |
 | One backend-parity fixture | `tools/test-backend-parity.sh` (env-driven; see §parity) |
@@ -117,7 +117,33 @@ kaic1: kaic0    $(MAKE) -C stage1 kaic1        # kaic0 compiles stage1 → kaic1
 kaic2: kaic1    $(MAKE) -C stage2 kaic2        # kaic1 compiles stage2 → kaic2
 ```
 
+(`kaic2` depends on `kaic1` only while the boot is kaic1 — the default; see §KAIC_BOOT.)
+
 Each stage's compiler builds the next. `make kaic2` triggers the whole chain if earlier stages are stale. After editing `stage2/compiler/*.kai`, `make kaic2` is the one command to rebuild. `make KAI_LLVM=1 kaic2` does the same with the in-process libLLVM backend linked (needed for native parity; on mac either put the keg on PATH first — `export PATH=/opt/homebrew/opt/llvm@18/bin:$PATH` — or pass `LLVM_CONFIG=$(brew --prefix llvm@18)/bin/llvm-config`; any LLVM major works, and `tools/gen-runtime-bc.sh` writes the runtime bitcode with the clang matching whichever one resolves). If `KAI_LLVM=1` is forced and llvm-config does not resolve, make stops immediately with an error naming the fix; the Homebrew lib dir needed by llvm-config's `-lzstd` is added to the link line automatically.
+
+### `KAIC_BOOT` — the compiler that emits `stage2.c`
+
+`stage2/build/stage2.c` is the whole compiler as one C file, emitted by a *boot* compiler (Go's `GOROOT_BOOTSTRAP`, Rust's stage0). `KAIC_BOOT` selects it; `tools/kaic-boot.sh` implements every mode but the default.
+
+| `KAIC_BOOT` | Boot | An existing `stage2.c` is reused when |
+|---|---|---|
+| unset | `kaic1` (the chain above) | make's mtime rule says so, as always |
+| `kaic1` | `kaic1` | its identity record matches exactly |
+| `release` | the `kaic2` of the release named by `VERSION`, fetched once into `stage2/build/boot/` and verified against the release's published sha256 | its identity record matches exactly |
+| `auto` | `stage2/kaic2` if this tree sealed it, else `release`, else `kaic1` | its inputs are unchanged (any boot) |
+| `<path>` | that binary; kaic1- or kaic2-class by its `--version` | its identity record matches exactly |
+
+**Identity, never mtime.** Every emit writes `stage2.c.id`: the boot (kind + sha256 of the binary; for `release` the version and tarball sha256), its class, the content hash of every input the boot read, and the sha256 of the C itself. A kaic2-class boot also reads the stdlib core modules — their builtin-effect declarations land in the C — so its inputs include those files and the edition. A switched boot, an edited input, or an edited `stage2.c` regenerates; a tarball's archived mtimes cannot make an old C look fresh. Linking `kaic2` seals it (`build/kaic2.id` adds the binary's sha256): `auto` boots from the current `kaic2` only while the seal matches, so a binary copied from another checkout — which bakes that checkout's stdlib path — is never a boot. A tree built before records existed, or a CI artifact restored by exact cache key, has no record: the unset and `auto` modes then defer to mtime, an explicit boot regenerates.
+
+Traps:
+
+- **A kaic2-class boot reads this tree's stdlib, never the tarball's.** The C is compiled against this tree's `runtime.h`, which pairs with this stdlib; a release's own stdlib declares that release's builtin effects, and a changed effect-op signature makes its C a hard `cc` error against the current runtime.
+- **Unavailable falls through, failing does not.** `auto` moves to the next boot only when one is absent (no sealed `kaic2`, no tarball for the platform, no network). A boot that fails to compile the source stops the build with its own error, and a checksum mismatch is fatal in every mode.
+- **A non-kaic1 boot yields a different binary.** Another compiler generated the C, so the `kaic2` differs byte-for-byte from the kaic1 build. What must agree is the C each resulting `kaic2` emits — `make kaic-boot-verify`.
+
+### `make kaic-boot-verify` — convergence gate
+
+Builds one `kaic2` from the `kaic1` boot and one from the `release` boot under `stage2/build/boot-verify/`, and requires byte-identical emitted C from both for the compiler itself and for a sample program — the `kaic2-fast-verify` contract across boots. Each boot's `stage2.c` is reused on an exact identity match. Does not touch `stage2/kaic2`; fetches the release on first use.
 
 ## The package — why `main.kai` is a stub
 
