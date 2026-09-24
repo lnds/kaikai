@@ -171,6 +171,47 @@ reachable from `main.kai`, that no `import` dangles, and that the graph stays
 acyclic -- an unreachable module is silently absent from the compiler, not a
 build error.
 
+## Bootstrap seed — rescue from a bare `cc`
+
+The seed is the C a released `kaic2` emits for its own source, frozen under a `bootstrap-seed-vX.Y` tag. It turns a machine with `cc` into a working `kaic2`: `cc` → seed `kaic2` → `kaic2-a` → the tree's `kaic2` → fixed point. Stage 0 and stage 1 are not on this path.
+
+- **Where it lives.** The tag points at a commit off `main` whose parent is the release that emitted it (`bootstrap-seed-v0.124` → `v0.124.0`). That commit adds `bootstrap/stage2.c` (the seed) and `bootstrap/runtime.h` (the parent's `stage2/runtime.h`, the only project header the seed includes). `main` never carries the seed; the tag's hash pins its content and its parent pins the source it reproduces. A clone fetches it with the other tags; a `--no-tags` clone needs `git fetch origin tag <seed>`.
+- **Edition.** Emitted under the parent's `EDITION`, the edition `make selfhost` compiles the compiler under, so the seed is byte-identical to that commit's `stage2/build/kaic2b.c`. A bare `kaic2` runs the oldest edition; always pass `--edition`.
+
+Rescue, from the root of the checkout to build:
+
+```sh
+SEED=bootstrap-seed-v0.124 ROOT=$PWD ED=$(cat EDITION)
+mkdir -p stage2/build/seed
+git archive $SEED bootstrap | tar -x -C stage2/build/seed
+cc -std=c99 -O2 stage2/build/seed/bootstrap/stage2.c -o stage2/build/seed/kaic2 -lm
+cd stage2
+export KAIKAI_STDLIB_PATH=$ROOT/stdlib
+build/seed/kaic2 --edition $ED main.kai > build/stage2-a.c
+cc -std=c99 -O2 -I build/seed/bootstrap build/stage2-a.c -o build/kaic2-a -lm   # seed runtime; -I stage0 breaks it
+build/kaic2-a --edition $ED main.kai > build/stage2-b.c
+cc -std=c99 -O2 -I . -DKAI_STDLIB_PATH="\"$ROOT/stdlib\"" build/stage2-b.c -o kaic2 -lm
+./kaic2 --edition $ED main.kai | cmp - build/stage2-b.c && echo "fixed point"
+unset KAIKAI_STDLIB_PATH; cd .. && make bin/kai
+```
+
+- **The seed compiles against its own `runtime.h`.** `-I stage0` binds `#include "runtime.h"` to the stage 0 runtime and the seed does not compile.
+- **Two hops.** `stage2-a.c` is the seed's codegen, so it compiles against the seed's runtime; only `stage2-b.c` is the tree's codegen, bound to the tree's `stage2/runtime.h`. When the tree is the seed's parent, both hops reproduce the seed byte for byte.
+- **The seed bakes no stdlib path.** `KAIKAI_STDLIB_PATH` points it at the tree's `stdlib/`; the final `kaic2` bakes the path the way `make kaic2` does.
+- **The leap is guaranteed only for the seed's parent.** A later tree compiles only while its compiler sources and core stay inside the seed's language; past that, rescue each intervening release in turn, or refresh the seed.
+
+Refreshing the seed after release `vX.Y.0`:
+
+```sh
+git worktree add --detach ../seed vX.Y.0 && cd ../seed && make kaic2
+mkdir bootstrap && cp stage2/runtime.h bootstrap/
+(cd stage2 && ./kaic2 --edition $(cat ../EDITION) main.kai) > bootstrap/stage2.c
+git add bootstrap && git commit -m "build(bootstrap): freeze the stage2.c rescue seed for vX.Y.0"
+git tag -a bootstrap-seed-vX.Y -m "Bootstrap rescue seed emitted by vX.Y.0"
+```
+
+Run the rescue against the new tag in a clean clone of `vX.Y.0`, then `git push origin bootstrap-seed-vX.Y`.
+
 ## `make kaic2-fast` — dev rebuild via modular self-compile
 
 `make kaic2` always re-bootstraps: kaic1 reads the whole package and emits one ~212k-line C file, `cc -O2` compiles that giant TU. That is the **trust chain** (a fresh machine needs it), but as a dev rebuild it is all-or-nothing. `make kaic2-fast` is the rebuild path when a working `kaic2` already exists:
