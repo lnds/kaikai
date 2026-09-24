@@ -176,44 +176,44 @@ build error.
 
 ## Bootstrap seed — rescue from a bare `cc`
 
-The seed is the C a released `kaic2` emits for its own source, frozen under a `bootstrap-seed-vX.Y` tag. It turns a machine with `cc` into a working `kaic2`: `cc` → seed `kaic2` → `kaic2-a` → the tree's `kaic2` → fixed point. Stage 0 and stage 1 are not on this path.
+The seed is the C a released `kaic2` emits for its own source, frozen under a `bootstrap-seed-v<release>` tag. With `cc` alone it yields a C-backend `kaic2`: `cc` → seed `kaic2` → `kaic2-a` → the tree's `kaic2` → fixed point. Stage 0 and stage 1 are not on this path. A native-capable `kaic2` also needs libLLVM for the last hop (`KAI_LLVM=1`, see the bootstrap chain above).
 
-- **Where it lives.** The tag points at a commit off `main` whose parent is the release that emitted it (`bootstrap-seed-v0.124` → `v0.124.0`). That commit adds `bootstrap/stage2.c` (the seed) and `bootstrap/runtime.h` (the parent's `stage2/runtime.h`, the only project header the seed includes). `main` never carries the seed; the tag's hash pins its content and its parent pins the source it reproduces. A clone fetches it with the other tags; a `--no-tags` clone needs `git fetch origin tag <seed>`.
-- **Edition.** Emitted under the parent's `EDITION`, the edition `make selfhost` compiles the compiler under, so the seed is byte-identical to that commit's `stage2/build/kaic2b.c`. A bare `kaic2` runs the oldest edition; always pass `--edition`.
+- **Where it lives.** The tag points at a commit off `main` whose parent is the release that emitted it (`bootstrap-seed-v0.124.1` → `v0.124.1`). That commit adds `bootstrap/stage2.c` (the seed) and `bootstrap/runtime.h` (the parent's `stage2/runtime.h`, the only project header the seed includes). `main` never carries the seed; the tag's hash pins its content and its parent pins the source it reproduces. A clone fetches it with the other tags; a `--no-tags` clone needs `git fetch origin tag <seed>`.
+- **Edition.** Emitted under the parent's `EDITION`, the edition `make selfhost` compiles the compiler under, so the seed is byte-identical to that commit's `stage2/build/kaic2b.c` and to what the published release's `kaic2` emits. A bare `kaic2` runs the oldest edition; always pass `--edition`.
 
 Rescue, from the root of the checkout to build:
 
 ```sh
-SEED=bootstrap-seed-v0.124 ROOT=$PWD ED=$(cat EDITION)
+SEED=bootstrap-seed-v0.124.1 ROOT=$PWD ED=$(cat EDITION)
 mkdir -p stage2/build/seed
 git archive $SEED bootstrap | tar -x -C stage2/build/seed
 cc -std=c99 -O2 stage2/build/seed/bootstrap/stage2.c -o stage2/build/seed/kaic2 -lm
-cd stage2
-export KAIKAI_STDLIB_PATH=$ROOT/stdlib
-build/seed/kaic2 --edition $ED main.kai > build/stage2-a.c
-cc -std=c99 -O2 -I build/seed/bootstrap build/stage2-a.c -o build/kaic2-a -lm   # seed runtime; -I stage0 breaks it
-build/kaic2-a --edition $ED main.kai > build/stage2-b.c
-cc -std=c99 -O2 -I . -DKAI_STDLIB_PATH="\"$ROOT/stdlib\"" build/stage2-b.c -o kaic2 -lm
-./kaic2 --edition $ED main.kai | cmp - build/stage2-b.c && echo "fixed point"
-unset KAIKAI_STDLIB_PATH; cd .. && make bin/kai
+(cd stage2 && KAIKAI_STDLIB_PATH=$ROOT/stdlib build/seed/kaic2 --edition $ED main.kai > build/stage2-a.c)
+cc -std=c99 -O2 -I stage2/build/seed/bootstrap stage2/build/stage2-a.c -o stage2/build/kaic2-a -lm   # seed runtime; -I stage0 breaks it
+make kaic2 KAI_LLVM=1 KAIC_BOOT=$ROOT/stage2/build/kaic2-a   # without libLLVM, drop KAI_LLVM=1: C backend only
+(cd stage2 && ./kaic2 --edition $ED main.kai | cmp - build/stage2.c) && echo "fixed point"
+./bin/kai build --backend=native examples/portfolio/portfolio.kai -o stage2/build/portfolio
+stage2/build/portfolio | diff examples/portfolio/portfolio.out.expected - && echo "native OK"
 ```
 
 - **The seed compiles against its own `runtime.h`.** `-I stage0` binds `#include "runtime.h"` to the stage 0 runtime and the seed does not compile.
-- **Two hops.** `stage2-a.c` is the seed's codegen, so it compiles against the seed's runtime; only `stage2-b.c` is the tree's codegen, bound to the tree's `stage2/runtime.h`. When the tree is the seed's parent, both hops reproduce the seed byte for byte.
-- **The seed bakes no stdlib path.** `KAIKAI_STDLIB_PATH` points it at the tree's `stdlib/`; the final `kaic2` bakes the path the way `make kaic2` does.
+- **Two hops.** `stage2-a.c` is the seed's codegen, so it compiles against the seed's runtime. The `make` hop has `kaic2-a` emit `stage2/build/stage2.c` with the tree's codegen and compiles it against the tree's `runtime.h`, so the final `kaic2` carries no seed codegen defect. That holds only while `kaic2-a`, compiled by the seed's codegen, still emits correct C: a defect that breaks C emission survives any number of hops, and the way out is kaic1 or a sound release.
+- **`KAIC_BOOT` takes the path, not `auto`.** `auto` only boots from a `stage2/kaic2` this tree sealed, so it would skip `kaic2-a` and fall through to the release or kaic1.
+- **The seed bakes no stdlib path.** `KAIKAI_STDLIB_PATH` points it at the tree's `stdlib/`; the `make` hop does the same for `kaic2-a` and the final `kaic2` bakes the path.
+- **Native is checked twice.** The `KAI_LLVM=1` link refuses a `kaic2` that cannot emit a native object (see Traps); the portfolio build checks a real program against its golden.
 - **The leap is guaranteed only for the seed's parent.** A later tree compiles only while its compiler sources and core stay inside the seed's language; past that, rescue each intervening release in turn, or refresh the seed.
 
-Refreshing the seed after release `vX.Y.0`:
+Refreshing the seed after release `vX.Y.Z`:
 
 ```sh
-git worktree add --detach ../seed vX.Y.0 && cd ../seed && make kaic2
+git worktree add --detach ../seed vX.Y.Z && cd ../seed && make kaic2
 mkdir bootstrap && cp stage2/runtime.h bootstrap/
 (cd stage2 && ./kaic2 --edition $(cat ../EDITION) main.kai) > bootstrap/stage2.c
-git add bootstrap && git commit -m "build(bootstrap): freeze the stage2.c rescue seed for vX.Y.0"
-git tag -a bootstrap-seed-vX.Y -m "Bootstrap rescue seed emitted by vX.Y.0"
+git add bootstrap && git commit -m "build(bootstrap): freeze the stage2.c rescue seed for vX.Y.Z"
+git tag -a bootstrap-seed-vX.Y.Z -m "Bootstrap rescue seed emitted by vX.Y.Z"
 ```
 
-Run the rescue against the new tag in a clean clone of `vX.Y.0`, then `git push origin bootstrap-seed-vX.Y`.
+Before `git push origin bootstrap-seed-vX.Y.Z`, run the rescue against the new tag in a clean clone of `vX.Y.Z` with libLLVM available: the fixed point and the native portfolio golden must both pass.
 
 ## `make kaic2-fast` — dev rebuild via modular self-compile
 
