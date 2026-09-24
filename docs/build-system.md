@@ -131,9 +131,11 @@ Each stage's compiler builds the next. `make kaic2` triggers the whole chain if 
 |---|---|---|
 | unset | `kaic1` (the chain above) | make's mtime rule says so, as always |
 | `kaic1` | `kaic1` | its identity record matches exactly |
-| `release` | the `kaic2` of the release named by `VERSION`, fetched once into `stage2/build/boot/` and verified against the release's published sha256 | its identity record matches exactly |
+| `release` | the `kaic2` of the newest published release up to `VERSION` (`VERSION`'s own once published), fetched once into `stage2/build/boot/` and verified against the release's published sha256 | its inputs match and its record names a release up to `VERSION` |
 | `auto` | `stage2/kaic2` if this tree sealed it, else `release`, else `kaic1` | its inputs are unchanged (any boot) |
 | `<path>` | that binary; kaic1- or kaic2-class by its `--version` | its identity record matches exactly |
+
+**A release boot is a release that exists.** `VERSION` names the release in progress between a version bump and its publication, so an unpublished `VERSION` resolves to the newest published release (read from its `latest.json` manifest) when that precedes `VERSION`, and to nothing otherwise. Freshness never reaches the network, so it accepts any recorded release up to `VERSION`; `tools/kaic-boot.sh release-id` prints the resolved release (name and tarball sha256) without downloading it.
 
 **Identity, never mtime.** Every emit writes `stage2.c.id`: the boot (kind + sha256 of the binary; for `release` the version and tarball sha256), its class, the content hash of every input the boot read, and the sha256 of the C itself. A kaic2-class boot also reads the stdlib core modules — their builtin-effect declarations land in the C — so its inputs include those files and the edition. A switched boot, an edited input, or an edited `stage2.c` regenerates; a tarball's archived mtimes cannot make an old C look fresh. Linking `kaic2` seals it (`build/kaic2.id` adds the binary's sha256): `auto` boots from the current `kaic2` only while the seal matches, so a binary copied from another checkout — which bakes that checkout's stdlib path — is never a boot. A tree built before records existed, or a CI artifact restored by exact cache key, has no record: the unset and `auto` modes then defer to mtime, an explicit boot regenerates.
 
@@ -147,6 +149,12 @@ Traps:
 ### `make kaic-boot-verify` — convergence gate
 
 Builds one `kaic2` from the `kaic1` boot and one from the `release` boot under `stage2/build/boot-verify/`, and requires byte-identical emitted C from both for the compiler itself and for a sample program — the `kaic2-fast-verify` contract across boots. Each boot's `stage2.c` is reused on an exact identity match. Does not touch `stage2/kaic2`; fetches the release on first use.
+
+### Which boot CI uses
+
+Every CI workflow that builds or consumes a `kaic2` sets `KAIC_BOOT=release` workflow-wide. The consumers need the mode too: the artifact ships `stage2.c.id`, and a job whose mode disagrees with it rebuilds `stage2.c`. The build jobs still build `kaic1`, because tier1 tests stage 1 itself and the artifact carries it; the bootstrap caches fold the resolved release (`release-id`), `EDITION` and `tools/kaic-boot.sh` into their key.
+
+The from-scratch chain runs in two places. The daily `bootstrap-from-scratch` job runs `make kaic-boot-verify` on a clean runner with its own `cc`. The release build (`scripts/build-release.sh`) unsets `KAIC_BOOT`, so every shipped `kaic2` is booted by stage 1.
 
 ## The package — why `main.kai` is a stub
 

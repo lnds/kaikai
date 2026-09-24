@@ -102,6 +102,8 @@ echo "    using $LLVM_CONFIG ($("$LLVM_CONFIG" --version))"
 # libLLVM). Only kaic2 is built KAI_LLVM=1 — FORCE native-capable so a
 # missing/broken vendored libLLVM breaks the release loudly instead of
 # silently shipping a C-only binary that cannot honour the native default.
+# A release anchors the chain of trust in cc: stage 1 always boots stage 2.
+unset KAIC_BOOT
 echo "==> bootstrapping kaic0 → kaic1 → kaic2 (kaic2: KAI_LLVM=1, static libLLVM)"
 make -C stage0 kaic0 >&2
 make -C stage1 kaic1 >&2

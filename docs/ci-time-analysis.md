@@ -274,8 +274,10 @@ the lighter shard brings each native shard under ~14 min.
 
 ## 8. The mtime trap (for the artifact handoff)
 
-`build/stage2.c` depends on `main.kai` + the `compiler/*.kai` sources +
-`kaic1`. After downloading the artifact, a naïve `touch kaic2` is **not
+`build/stage2.c` depends on `main.kai` + the `compiler/*.kai` sources
+(+ `kaic1` under the kaic1 boot; CI boots from the release and freshness
+also requires the shipped `stage2.c.id`, see `docs/build-system.md`
+§KAIC_BOOT). After downloading the artifact, a naïve `touch kaic2` is **not
 enough** — if any source is newer than `build/stage2.c`, make regenerates
 the whole chain (the 45 s regen + 197 s `cc`). The fix that works
 (validated locally with a real `make` run, not dry-run): touch the build
