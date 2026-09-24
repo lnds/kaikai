@@ -13,8 +13,13 @@
 #   auto              a kaic2 this tree sealed, else release, else kaic1
 #   <path>            any kaic1- or kaic2-class binary
 #
-# <out.c>.id records the boot and the content hash of every input the boot
-# read. A C file is reused only on an exact match — mtimes decide nothing.
+# A kaic2-class boot takes two hops: the boot emits <dir>/stage2-a.c, linked
+# into <dir>/kaic2-a, and kaic2-a emits <out.c>, so the C that is linked is
+# this tree's codegen. A kaic1-class boot takes one.
+#
+# <out.c>.id records the boot, the hop count and the content hash of every
+# input the boot read. A C file is reused only on an exact match — mtimes
+# decide nothing. The hop-a files are scratch, never recorded or reused.
 
 set -eu
 
@@ -199,6 +204,25 @@ run_boot() {
   fi
 }
 
+hops() { if [ "$1" = kaic2 ]; then echo 2; else echo 1; fi; }
+
+# emit_to <out.c>: run BOOT_BIN, replacing <out.c> only on success.
+emit_to() {
+  run_boot > "$1.tmp" || { rm -f "$1.tmp"; exit 1; }
+  mv "$1.tmp" "$1"
+}
+
+# Sound only while kaic2-a, built by the boot's codegen, still emits correct C.
+hop_a() {
+  dir="$(cd "$(dirname "$1")" && pwd)"
+  say "boot $BOOT_ID -> $dir/stage2-a.c"
+  emit_to "$dir/stage2-a.c"
+  say "cc $dir/stage2-a.c -> $dir/kaic2-a"
+  "${MAKE:-make}" -s -C "$STAGE2" boot-hop HOP_C="$dir/stage2-a.c" HOP_BIN="$dir/kaic2-a" >&2
+  BOOT_BIN="$dir/kaic2-a"
+  say "kaic2-a -> $1"
+}
+
 # The input key is taken before the boot runs: an edit landing mid-compile
 # must leave the record describing what the boot actually read, or stale.
 cmd_emit() {
@@ -207,18 +231,20 @@ cmd_emit() {
   mkdir -p "$(dirname "$out")"
   rm -f "$out.id"
   key="$(src_key "$BOOT_CLASS")"
-  say "boot $BOOT_ID -> $out"
-  run_boot > "$out.tmp" || { rm -f "$out.tmp"; exit 1; }
-  mv "$out.tmp" "$out"
-  printf 'boot=%s\nclass=%s\nsrc=%s\nout=%s\n' \
-    "$BOOT_ID" "$BOOT_CLASS" "$key" "$(sha_of "$out")" > "$out.id.tmp"
+  if [ "$BOOT_CLASS" = kaic2 ]; then hop_a "$out"; else say "boot $BOOT_ID -> $out"; fi
+  emit_to "$out"
+  printf 'boot=%s\nclass=%s\nhops=%s\nsrc=%s\nout=%s\n' \
+    "$BOOT_ID" "$BOOT_CLASS" "$(hops "$BOOT_CLASS")" "$key" "$(sha_of "$out")" > "$out.id.tmp"
   mv "$out.id.tmp" "$out.id"
 }
 
-# The record's C and inputs are byte-for-byte what is on disk now.
+# The record's C and inputs are byte-for-byte what is on disk now, and the
+# C took the hops its boot class takes.
 inputs_match() {
   [ -f "$1" ] && [ "$(field out "$2")" = "$(sha_of "$1")" ] || return 1
-  key="$(src_key "$(field class "$2")")"
+  class="$(field class "$2")"
+  [ "$(field hops "$2")" = "$(hops "$class")" ] || return 1
+  key="$(src_key "$class")"
   [ "$(field src "$2")" = "$key" ]
 }
 

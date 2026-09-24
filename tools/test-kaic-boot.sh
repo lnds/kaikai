@@ -1,12 +1,13 @@
 #!/bin/sh
 # tools/test-kaic-boot.sh — hermetic test of tools/kaic-boot.sh.
 #
-# Drives the live script against a fake tree whose boots are shell stubs
-# and whose release tarball is served over file://, so every resolution
-# path and every identity check runs in seconds with no network and no
-# compiler. The contract under test: a stage2.c is reused only on an exact
-# match of boot and input content, and each KAIC_BOOT mode picks the boot
-# it documents.
+# Drives the live script against a fake tree whose boots and cc are shell
+# stubs and whose release tarball is served over file://, so every
+# resolution path and every identity check runs in seconds with no network
+# and no compiler. The contract under test: a stage2.c is reused only on an
+# exact match of boot, hop count and input content, each KAIC_BOOT mode
+# picks the boot it documents, and a kaic2-class boot's C is emitted by the
+# kaic2-a linked from the boot's own C.
 
 set -eu
 
@@ -53,6 +54,20 @@ EOF
 }
 chmod +x "$root/stage1/kaic1"
 
+# A stub cc for the boot-hop target: the "binary" of a C file is a
+# kaic2-class stub that prints a hop-a header, then that C.
+cat > "$work/hop-cc" <<'EOF'
+#!/bin/sh
+{ echo '#!/bin/sh'
+  echo '[ "$1" = --version ] && { echo "kaic2 stage 2 (self-hosted)"; exit 0; }'
+  echo 'echo "/* hop-a stdlib=$KAIKAI_STDLIB_PATH args=$* */"'
+  echo "cat '$1'"
+} > "$2"
+chmod +x "$2"
+EOF
+chmod +x "$work/hop-cc"
+printf 'boot-hop:\n\t@%s $(HOP_C) $(HOP_BIN)\n' "$work/hop-cc" > "$root/stage2/Makefile"
+
 # Release tarballs for every platform the script knows, so the test runs
 # on any published host.
 for plat in darwin-arm64 linux-x86_64; do
@@ -89,11 +104,14 @@ fresh()   { boot "$1" fresh "$out" 2>/dev/null; }
 is_fresh()  { fresh "$1" || fail "$2: expected fresh under KAIC_BOOT=${1:-<unset>}"; }
 is_stale()  { if fresh "$1"; then fail "$2: expected stale under KAIC_BOOT=${1:-<unset>}"; fi; }
 boot_of() { sed -n 's/^boot=//p' "$out.id"; }
+hop_a="$root/stage2/build/stage2-a.c"
 
 # ---- kaic1: record, content checks, strict vs lenient -------------------
 boot "" emit "$out" 2>/dev/null
 grep -q '^/\* kaic1 \*/' "$out" || fail "unset mode did not run kaic1"
 case "$(boot_of)" in "kaic1 "*) ;; *) fail "kaic1 record names boot [$(boot_of)]" ;; esac
+grep -q '^hops=1$' "$out.id" || fail "kaic1 record does not state one hop"
+[ ! -f "$hop_a" ] || fail "a kaic1-class boot took a second hop"
 is_fresh "" "kaic1 record"; is_fresh kaic1 "kaic1 record"; is_fresh auto "kaic1 record"
 is_stale release "kaic1 record under release"
 ok "kaic1 emit records its boot; only a matching mode reuses it"
@@ -114,12 +132,24 @@ ok "without a record only unset/auto defer to make; an explicit boot rebuilds"
 
 # ---- release: download, verify, cache, stdlib, identity -----------------
 boot release emit "$out" 2>/dev/null || fail "release emit failed"
-grep -q "release stdlib=$root/stdlib args=--edition hanga-roa main.kai" "$out" \
-  || fail "release boot did not run with this tree's stdlib and edition: $(head -1 "$out")"
+[ "$(head -n 1 "$hop_a")" = "/* release stdlib=$root/stdlib args=--edition hanga-roa main.kai */" ] \
+  || fail "release boot did not run with this tree's stdlib and edition: $(head -n 1 "$hop_a")"
+[ "$(head -n 1 "$out")" = "/* hop-a stdlib=$root/stdlib args=--edition hanga-roa main.kai */" ] \
+  || fail "stage2.c was not emitted by kaic2-a with this tree's stdlib and edition: $(head -n 1 "$out")"
+sed 1d "$out" | cmp -s - "$hop_a" || fail "kaic2-a was not linked from the boot's stage2-a.c"
 case "$(boot_of)" in "release kaikai-v9.9.9-"*) ;; *) fail "release record names boot [$(boot_of)]" ;; esac
 grep -q '^class=kaic2$' "$out.id" || fail "release record is not kaic2-class"
+grep -q '^hops=2$' "$out.id" || fail "release record does not state two hops"
 is_fresh release "release record"; is_stale kaic1 "release record under kaic1"; is_stale "" "release record, unset"
-ok "release boot fetched, verified, run against this tree's stdlib"
+ok "release boot fetched, verified, run against this tree's stdlib; its kaic2-a emits stage2.c"
+
+cp "$out.id" "$work/rec"
+sed '/^hops=/d' "$work/rec" > "$out.id"
+is_stale release "kaic2-class record without a hop count"
+sed 's/^hops=2$/hops=1/' "$work/rec" > "$out.id"
+is_stale release "kaic2-class record of one hop"
+cp "$work/rec" "$out.id"
+ok "a kaic2-class C that did not take two hops is never reused"
 
 echo 'fn o() = 2' > "$root/stdlib/other.kai"
 is_fresh release "non-core stdlib edit"
@@ -201,7 +231,8 @@ ok "a kaic2 linked from an unrecorded stage2.c loses its seal"
 # ---- path -------------------------------------------------------------
 make_kaic2 "$work/mykaic2" path
 boot "$work/mykaic2" emit "$out" 2>/dev/null
-grep -q "^/\* path stdlib=$root/stdlib args=--edition" "$out" || fail "path boot not run as kaic2-class"
+grep -q "^/\* path stdlib=$root/stdlib args=--edition" "$hop_a" || fail "path boot not run as kaic2-class"
+grep -q '^hops=2$' "$out.id" || fail "a kaic2-class path boot did not take two hops"
 is_fresh "$work/mykaic2" "path record"
 echo '# other build' >> "$work/mykaic2"
 is_stale "$work/mykaic2" "path boot content changed"
