@@ -66,20 +66,11 @@ esac
 [ -x "$KAIC2" ] || { echo "native-selfhost-gate FAIL — kaic2 not found at $KAIC2"; exit 1; }
 
 echo "native-selfhost-gate: probing the native backend …"
-PROBE_DIR="$(mktemp -d)"
-printf 'fn main() : Unit / Console = println("probe")\n' > "$PROBE_DIR/probe.kai"
-probe_rc=0
-( cd "$PROBE_DIR" \
-  && env KAI_NATIVE_RUNTIME_BC="$RUNTIME_LLVM_BC" \
-       "$KAIC2" $EDITION_FLAG --emit=native --path "$ROOT/stdlib" probe.kai \
-       >/dev/null 2>"$PROBE_DIR/probe.err" ) || probe_rc=$?
-if [ "$probe_rc" -ne 0 ] || [ ! -f "$PROBE_DIR/probe.o" ]; then
-  echo "::error::native-selfhost-gate FAIL — this kaic2 cannot emit native objects (exit $probe_rc)."
-  echo "  The gate needs the KAI_LLVM=1 binary the build job publishes; this one was built C-only."
-  head -10 "$PROBE_DIR/probe.err" 2>/dev/null | sed 's/^/    /'
-  rm -rf "$PROBE_DIR"; exit 1
+if ! "$ROOT/tools/native-probe.sh" "$KAIC2"; then
+  echo "::error::native-selfhost-gate FAIL — this kaic2 cannot emit native objects."
+  echo "  The gate needs the KAI_LLVM=1 binary the build job publishes, with a working native backend."
+  exit 1
 fi
-rm -rf "$PROBE_DIR"
 echo "native-selfhost-gate: native backend OK"
 
 # Compile the compiler with itself, native backend. Run from stage2/ so
