@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-decl-symid-survives test-evar-above-erase test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-cli-flags test-kai-cli clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 test-light-partition test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily coverage-probe rc-budget stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-rc-budget bin/kai
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify kaic-boot-verify test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-decl-symid-survives test-evar-above-erase test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-upgrade-resolver test-release-platforms test-kaic-boot test-cli-flags test-kai-cli clean warm-core tier0 test-header-deps test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 test-light-partition test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily coverage-probe rc-budget stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-rc-budget bin/kai
 
 # A bare kaic2 with no `--edition` runs the OLDEST edition (tongariki),
 # so a recipe driving the binary directly would test the previous
@@ -17,7 +17,8 @@ kaic1: kaic0
 	$(MAKE) -C stage1 kaic1
 
 # The kai binary is built with kaic2 so no gate pays for it inside its own timeout.
-kaic2: kaic1
+# Only the kaic1 boot needs the stage0 -> stage1 chain (see KAIC_BOOT in stage2/Makefile).
+kaic2: $(if $(filter-out kaic1,$(KAIC_BOOT)),,kaic1)
 	$(MAKE) -C stage2 kaic2
 	$(MAKE) -s -C tools/kai kai
 
@@ -29,6 +30,10 @@ kaic2-fast:
 
 kaic2-fast-verify:
 	$(MAKE) -C stage2 kaic2-fast-verify
+
+# A release-booted and a kaic1-booted kaic2 emit the same C. See docs/build-system.md.
+kaic-boot-verify:
+	$(MAKE) -C stage2 kaic-boot-verify
 
 # The kai binary; tools/kai/Makefile decides staleness.
 bin/kai:
@@ -486,7 +491,7 @@ bench-mn-throughput: kaic2
 # Tier 1: pre-PR gate. ~2-4 min. Run before opening / merging a PR.
 # PR description should include the trailing line of this output (or
 # a CI link) — without it, the merge does not happen.
-tier1: test rc-leak-gate test-partition-linearity demos-no-regression test-fmt test-fmt-package test-fmt-width test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-core-text test-http-redirects test-independence-oracle test-packages test-editions test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-release-platforms test-cli-flags test-kai-cli
+tier1: test rc-leak-gate test-partition-linearity demos-no-regression test-fmt test-fmt-package test-fmt-width test-fmt-selfhost test-fmt-help-scope test-fmt-property test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-core-text test-http-redirects test-independence-oracle test-packages test-editions test-modular-selfhost test-perceus-1131-modular-escape test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-runtime-global-audit test-mn-determinism test-info test-doc test-upgrade-resolver test-release-platforms test-kaic-boot test-cli-flags test-kai-cli
 	@echo "tier1 OK — full make test + demos baseline + fmt fixtures + fmt self-hosting ratchet (issue #786) + bench smoke + check smoke + library-mode probes + diagnostics-collected fixtures + negative-space fixtures + stdlib modules compile clean + independence oracle (#962 soundness gate) + package-mode harness (issue #569) + whole-compiler c-modular link (issue #1012) + private-type shadow audit + private-record shadow audit + canonical-only alias audit + M:N determinism (N=1==N=4) + kai info smoke + kai doc smoke + Perceus RC leak ledger (240 fixtures pinned)"
 
 # CI sharding (docs/ci-time-analysis.md §7). The tier1 work is split across
@@ -530,8 +535,9 @@ tier1: test rc-leak-gate test-partition-linearity demos-no-regression test-fmt t
 #     test-independence-oracle, test-packages, test-editions,
 #     test-private-type-shadow-audit, test-private-record-shadow-audit,
 #     test-canonical-aliases, test-info, test-doc, test-upgrade-resolver,
-#     test-release-platforms, test-cli-flags, test-kai-cli, rc-leak-gate,
-#     test-partition-linearity, test-core-text, test-http-redirects }
+#     test-release-platforms, test-kaic-boot, test-cli-flags, test-kai-cli,
+#     rc-leak-gate, test-partition-linearity, test-core-text,
+#     test-http-redirects }
 # covers the prerequisites of `tier1` (the light slices union to
 # TEST_LIGHT_TARGETS, asserted by `test-light-partition` in tier0). Adding a
 # phase to `tier1` means adding it to a shard.
@@ -548,7 +554,7 @@ tier1-shard-1: kaic2
 	$(MAKE) -C stage2 test-user-cache
 	$(MAKE) -C stage2 test-core-cache
 	$(MAKE) demos-no-regression
-	$(MAKE) test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-doc test-upgrade-resolver test-release-platforms test-cli-flags test-kai-cli
+	$(MAKE) test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-doc test-upgrade-resolver test-release-platforms test-kaic-boot test-cli-flags test-kai-cli
 	$(call tier1-light-slice,1)
 	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + CLI/tooling tail + light slice 1/$(TIER1_LIGHT_SLICES)"
 
@@ -642,6 +648,15 @@ test-kai-cli: kaic2
 # every download 404s, so the correspondence is asserted, not assumed.
 test-release-platforms:
 	@tools/test-release-platforms.sh
+
+# KAIC_BOOT resolution and the stage2.c identity record (pure shell, no
+# compiler, no network: stub boots and a file:// release). The boot must run
+# only when make builds: a recipe line naming $$(MAKE) runs even under -n/-q.
+test-kaic-boot:
+	@tools/test-kaic-boot.sh
+	@out=$$($(MAKE) -n -C stage2 kaic2 KAIC_BOOT=/nonexistent/kaic2 2>&1); \
+	case "$$out" in *"kaic-boot: "*) echo "test-kaic-boot: FAIL: make -n ran the boot:"; echo "$$out"; exit 1 ;; esac; \
+	echo "test-kaic-boot: ok — make -n prints the boot, never runs it"
 
 # Issue #643 — institutional regression gate for the private-type
 # leak fix. `tools/audit-prelude-private-types.sh` walks every

@@ -109,6 +109,20 @@ installer_token() {
   " 2>/dev/null
 }
 
+# The KAIC_BOOT release fetch, via the live boot_platform of tools/kaic-boot.sh.
+awk '/^boot_platform\(\) \{/{f=1} f{print} f&&/^\}/{exit}' \
+  "$ROOT/tools/kaic-boot.sh" > "$work/boot_platform.sh"
+grep -q 'boot_platform' "$work/boot_platform.sh" \
+  || fail "could not extract boot_platform from tools/kaic-boot.sh"
+
+boot_token() {
+  STUB_OS="$1" STUB_ARCH="$2" sh -c "
+    $stub_uname
+    . '$work/boot_platform.sh'
+    boot_platform
+  " 2>/dev/null
+}
+
 # ---- 1 + 2. every published platform round-trips ---------------------
 for p in $platforms; do
   pair="$(uname_for "$p")" \
@@ -123,12 +137,16 @@ for p in $platforms; do
   [ "$got" = "$p" ] \
     || fail "install.sh on '$os $arch' derives [$got], matrix names the tarball [$p]"
 
+  got="$(boot_token "$os" "$arch" || true)"
+  [ "$got" = "$p" ] \
+    || fail "kaic-boot.sh on '$os $arch' derives [$got], matrix names the tarball [$p]"
+
   # build-release.sh's own guard must accept the platform it will be
   # asked to build. It derives OS/ARCH the same way, so grep its case arm.
   grep -q "$p" "$ROOT/scripts/build-release.sh" \
     || fail "build-release.sh does not accept platform '$p'"
 
-  echo "test-release-platforms: ok — $p agrees across matrix, install.sh, kai upgrade, build-release.sh"
+  echo "test-release-platforms: ok — $p agrees across matrix, install.sh, kai upgrade, kaic-boot.sh, build-release.sh"
 done
 
 # ---- 3. an unpublished platform is refused, not 404'd ----------------
@@ -144,7 +162,10 @@ case "$platforms" in
     if installer_token Linux aarch64 >/dev/null 2>&1; then
       fail "install.sh accepts linux-aarch64, which the matrix does not publish"
     fi
-    echo "test-release-platforms: ok — unpublished linux-aarch64 refused by both consumers"
+    if boot_token Linux aarch64 >/dev/null 2>&1; then
+      fail "kaic-boot.sh accepts linux-aarch64, which the matrix does not publish"
+    fi
+    echo "test-release-platforms: ok — unpublished linux-aarch64 refused by every consumer"
     ;;
 esac
 
@@ -154,6 +175,9 @@ fi
 if installer_token OpenBSD amd64 >/dev/null 2>&1; then
   fail "install.sh accepts an unsupported OS"
 fi
-echo "test-release-platforms: ok — unsupported OS refused by both consumers"
+if boot_token OpenBSD amd64 >/dev/null 2>&1; then
+  fail "kaic-boot.sh accepts an unsupported OS"
+fi
+echo "test-release-platforms: ok — unsupported OS refused by every consumer"
 
 echo "test-release-platforms: all cases passed"

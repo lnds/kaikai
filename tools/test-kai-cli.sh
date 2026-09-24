@@ -154,6 +154,16 @@ expect "bench: --iters must be positive" 2 \
 expect "check: --backend is validated" 2 \
   "kai: error: --backend must be 'c' or 'native' (got: llvm)" "$KAI" check --backend llvm x.kai
 
+# A dev checkout whose kaic2 exists needs nothing from stages 0-1: its
+# stage0/ holds no Makefile, so any attempt to rebuild kaic0 fails.
+D="$TMP/dev"
+mkdir -p "$D/bin" "$D/stage0" "$D/stage2"
+cp "$ROOT/bin/kai" "$D/bin/kai"
+ln -s "$ROOT/stdlib" "$D/stdlib"
+ln -s "$ROOT/stage2/kaic2" "$D/stage2/kaic2"
+expect "dev checkout: an existing kaic2 skips stages 0-1" 0 "fn main() = 0" \
+  sh -c 'printf "fn main()=0\n" | "$1" fmt --stdin' _ "$D/bin/kai"
+
 # An installed prefix: the binary resolves the prefix it sits in, never
 # the checkout it was built in, and ignores a KAIKAI_HOME naming another.
 P="$TMP/prefix"
