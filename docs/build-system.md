@@ -140,6 +140,7 @@ Each stage's compiler builds the next. `make kaic2` triggers the whole chain if 
 Traps:
 
 - **A kaic2-class boot reads this tree's stdlib, never the tarball's.** The C is compiled against this tree's `runtime.h`, which pairs with this stdlib; a release's own stdlib declares that release's builtin effects, and a changed effect-op signature makes its C a hard `cc` error against the current runtime.
+- **The boot's codegen meets this tree's runtime.** A kaic2 boot emits the runtime calls its own codegen knows, and that C is compiled against this tree's `runtime.h`. A runtime change that drops or re-signs a function an older codegen still emits breaks the release boot until the next release; an additive runtime keeps every recent release a valid boot.
 - **Unavailable falls through, failing does not.** `auto` moves to the next boot only when one is absent (no sealed `kaic2`, no tarball for the platform, no network). A boot that fails to compile the source stops the build with its own error, and a checksum mismatch is fatal in every mode.
 - **A non-kaic1 boot yields a different binary.** Another compiler generated the C, so the `kaic2` differs byte-for-byte from the kaic1 build. What must agree is the C each resulting `kaic2` emits — `make kaic-boot-verify`.
 
