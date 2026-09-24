@@ -44,7 +44,9 @@ builds it by driving `kaic2` directly; a checkout rebuilds it with `make
 bin/kai` after editing `tools/kai/`, a release ships it as `bin/kai`. The
 bootstrap never goes through it: the Makefiles keep invoking `kaic2` with
 their own flags, and CI builds it from the restored `kaic2` in
-`tools/ci-touch-build.sh`. Gate: `make test-kai-cli`.
+`tools/ci-touch-build.sh`. In a checkout with no `kaic2` it runs `make -C
+stage2 kaic2`, which builds kaic0/kaic1 only if the boot needs them
+(§KAIC_BOOT); an existing `kaic2` is used as is. Gate: `make test-kai-cli`.
 
 ### The shared core cache
 
