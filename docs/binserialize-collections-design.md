@@ -99,27 +99,35 @@ List` is declared, so the dispatcher's two-impl conflict never arises.
 
 ### Derive integration
 
-`derive_binser_record_to_bytes_chain` walks the field list and emits
-a `to_bytes(self.field)` call per field. The extension inspects
+The encoder is a per-type **writer**, `__binser_put_T(buf: BinBuf, self: T)
+: BinBuf / Mutable`, that appends `self` to a growable `BinBuf`;
+`to_bytes(self)` runs it over a fresh buffer and returns the bytes. A
+nested derived value is written into the same buffer, so encoding a
+recursive value is linear in its size. (Concatenating per-field arrays
+re-copies each subtree once per level above it: quadratic in depth.)
+
+The writer threads the buffer through the fields, choosing per
 `field.ftype.tkind`:
 
-| `tkind` | encode emits | decode emits |
+| `tkind` | writer emits | decode emits |
 |---|---|---|
-| `TyName(X, _)` X ∈ {Int, Bool, String, Real, Char} | `to_bytes(self.f)` / `bin_char_to_bytes(self.f)` | `__pimpl_BinSerialize_X_from_bytes(buf, pos)` / `bin_char_from_bytes(...)` |
-| `TyName(X, _)` X user-defined (derived) | `to_bytes(self.f)` | `__pimpl_BinSerialize_X_from_bytes(buf, pos)` |
-| `TyList(t)` | `bin_list_to_bytes(self.f, { x -> <encode_expr(t)> })` | `bin_list_from_bytes(buf, pos, { b, p -> <decode_call(t)>(b, p) })` |
-| `TyName("Option", [t])` | `bin_option_to_bytes(self.f, { x -> <encode_expr(t)> })` | `bin_option_from_bytes(buf, pos, { b, p -> <decode_call(t)>(b, p) })` |
-| `TyName("Char", _)` | `bin_char_to_bytes(self.f)` | `bin_char_from_bytes(buf, pos)` |
+| `TyName(X, _)` X derives BinSerialize | `__binser_put_X(acc, self.f)` | `__pimpl_BinSerialize_X_from_bytes(buf, pos)` |
+| `TyName(X, _)` X with a hand-written impl (Int, Bool, String, Real, ...) | `bin_buf_put(acc, __pimpl_BinSerialize_X_to_bytes(self.f))` | `__pimpl_BinSerialize_X_from_bytes(buf, pos)` |
+| `TyList(t)` | `bin_buf_put_list(acc, self.f, (b, x) => <put(t)>)` | `bin_list_from_bytes(buf, pos, { b, p -> <decode_call(t)>(b, p) })` |
+| `TyName("Option", [t])` | `bin_buf_put_option(acc, self.f, (b, x) => <put(t)>)` | `bin_option_from_bytes(buf, pos, { b, p -> <decode_call(t)>(b, p) })` |
+| `TyName("Char", _)` | `bin_buf_put(acc, bin_char_to_bytes(self.f))` | `bin_char_from_bytes(buf, pos)` |
 
-`encode_expr(t)` and `decode_call(t)` are recursive over `t`:
-nested `TyList(TyList(Int))` produces
+`put(t)` and `decode_call(t)` are recursive over `t`: nested
+`TyList(TyList(Int))` produces
 
 ```kai
-bin_list_to_bytes(self.f, { x -> bin_list_to_bytes(x, { y -> to_bytes(y) }) })
+bin_buf_put_list(acc, self.f, (b, x) => bin_buf_put_list(b, x, (b2, y) => bin_buf_put(b2, to_bytes(y))))
 ```
 
-The same shape applies inside sum variant payloads — the
-`derive_binser_sum_*` functions get the equivalent treatment.
+Sum variants write their declaration index with `bin_buf_byte` and then
+the payload the same way. The `bin_buf_*` writers produce the same bytes
+as `bin_list_to_bytes` / `bin_option_to_bytes`, which remain for direct
+use.
 
 ### Validator
 
