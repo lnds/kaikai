@@ -144,7 +144,7 @@ build error.
 
 ## Bootstrap seed — rescue from a bare `cc`
 
-The seed is the C a released `kaic2` emits for its own source, frozen under a `bootstrap-seed-vX.Y` tag. It turns a machine with `cc` into a working `kaic2` without kaic0 or kaic1.
+The seed is the C a released `kaic2` emits for its own source, frozen under a `bootstrap-seed-vX.Y` tag. It turns a machine with `cc` into a working `kaic2`: `cc` → seed `kaic2` → `kaic2-a` → the tree's `kaic2` → fixed point. Stage 0 and stage 1 are not on this path.
 
 - **Where it lives.** The tag points at a commit off `main` whose parent is the release that emitted it (`bootstrap-seed-v0.124` → `v0.124.0`). That commit adds `bootstrap/stage2.c` (the seed) and `bootstrap/runtime.h` (the parent's `stage2/runtime.h`, the only project header the seed includes). `main` never carries the seed; the tag's hash pins its content and its parent pins the source it reproduces. A clone fetches it with the other tags; a `--no-tags` clone needs `git fetch origin tag <seed>`.
 - **Edition.** Emitted under the parent's `EDITION`, the edition `make selfhost` compiles the compiler under, so the seed is byte-identical to that commit's `stage2/build/kaic2b.c`. A bare `kaic2` runs the oldest edition; always pass `--edition`.
@@ -159,7 +159,7 @@ cc -std=c99 -O2 stage2/build/seed/bootstrap/stage2.c -o stage2/build/seed/kaic2 
 cd stage2
 export KAIKAI_STDLIB_PATH=$ROOT/stdlib
 build/seed/kaic2 --edition $ED main.kai > build/stage2-a.c
-cc -std=c99 -O2 -I build/seed/bootstrap build/stage2-a.c -o build/kaic2-a -lm
+cc -std=c99 -O2 -I build/seed/bootstrap build/stage2-a.c -o build/kaic2-a -lm   # seed runtime; -I stage0 breaks it
 build/kaic2-a --edition $ED main.kai > build/stage2-b.c
 cc -std=c99 -O2 -I . -DKAI_STDLIB_PATH="\"$ROOT/stdlib\"" build/stage2-b.c -o kaic2 -lm
 ./kaic2 --edition $ED main.kai | cmp - build/stage2-b.c && echo "fixed point"
