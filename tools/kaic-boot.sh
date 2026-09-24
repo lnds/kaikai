@@ -5,10 +5,11 @@
 #   kaic-boot.sh emit  <out.c>         compile stage2/main.kai into <out.c>
 #   kaic-boot.sh fresh <out.c>         exit 0 iff <out.c> may be reused
 #   kaic-boot.sh seal  <out.c> <bin>   record the kaic2 linked from <out.c>
+#   kaic-boot.sh release-id            print the release boot's name and sha256
 #
 # The boot comes from $KAIC_BOOT (docs/build-system.md §KAIC_BOOT):
 #   kaic1 (or unset)  the stage0 -> stage1 chain
-#   release           the kaic2 of the release named by VERSION
+#   release           the kaic2 of the newest published release up to VERSION
 #   auto              a kaic2 this tree sealed, else release, else kaic1
 #   <path>            any kaic1- or kaic2-class binary
 #
@@ -21,6 +22,7 @@ ROOT="${KAIC_BOOT_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 STAGE2="$ROOT/stage2"
 BOOT_DIR="$STAGE2/build/boot"
 RELEASE_URL="${KAIC_BOOT_URL:-https://github.com/kaikailang-org/kaikai/releases/download}"
+LATEST_URL="${KAIC_BOOT_LATEST_URL:-https://github.com/kaikailang-org/kaikai/releases/latest/download/latest.json}"
 MODE="${KAIC_BOOT:-kaic1}"
 LC_ALL=C
 export LC_ALL
@@ -35,6 +37,11 @@ sha_of() { sha256 "$1" | awk '{print $1}'; }
 
 # Field $1 of record file $2, empty when absent.
 field() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -n 1; }
+
+# version_le <a> <b>: dotted version a is at most b.
+version_le() {
+  [ "$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1)" = "$1" ]
+}
 
 # Must match the tarball names scripts/build-release.sh publishes
 # (asserted by tools/test-release-platforms.sh).
@@ -121,12 +128,39 @@ release_fetch() {
   rm -rf "$tmp"
 }
 
+# release_sha <version> <platform>: the published tarball sha256, empty when unpublished.
+release_sha() {
+  command -v curl >/dev/null 2>&1 || return 0
+  curl -fsSL --retry 2 "$RELEASE_URL/v$1/kaikai-v$1-$2.tar.gz.sha256" 2>/dev/null | awk 'NR==1{print $1}'
+}
+
+latest_version() {
+  command -v curl >/dev/null 2>&1 || return 0
+  curl -fsSL --retry 2 "$LATEST_URL" 2>/dev/null \
+    | tr -d ' \n\r\t' | sed -n 's/.*"version":"\([0-9][0-9.]*\)".*/\1/p'
+}
+
+# The boot is a published release; VERSION names one only once it is published.
+release_version() {
+  want="$(cat "$ROOT/VERSION")"
+  if release_cached "$BOOT_DIR/kaikai-v$want-$1" || [ -n "$(release_sha "$want" "$1")" ]; then
+    echo "$want"; return
+  fi
+  latest="$(latest_version)"
+  [ -n "$latest" ] || { say "v$want is unpublished and no release manifest is reachable"; return 1; }
+  version_le "$latest" "$want" \
+    || { say "v$want is unpublished and the newest release, v$latest, follows it"; return 1; }
+  say "v$want is unpublished; the newest published release is v$latest"
+  echo "$latest"
+}
+
 boot_release() {
   plat="$(boot_platform)" || { say "no release tarball for $(uname -s)-$(uname -m)"; return 1; }
-  name="kaikai-v$(cat "$ROOT/VERSION")-$plat"
+  ver="$(release_version "$plat")" || return 1
+  name="kaikai-v$ver-$plat"
   dir="$BOOT_DIR/$name"
   release_cached "$dir" \
-    || release_fetch "$name" "$RELEASE_URL/v$(cat "$ROOT/VERSION")/$name.tar.gz" "$dir" \
+    || release_fetch "$name" "$RELEASE_URL/v$ver/$name.tar.gz" "$dir" \
     || return 1
   BOOT_BIN="$dir/libexec/kaikai/kaic2"
   BOOT_CLASS=kaic2
@@ -188,7 +222,8 @@ inputs_match() {
   [ "$(field src "$2")" = "$key" ]
 }
 
-# The recorded boot is the one $MODE selects; auto accepts any.
+# The recorded boot is the one $MODE selects; auto accepts any. Freshness
+# never reaches the network, so release accepts any release up to VERSION.
 boot_matches() {
   case "$MODE" in
     auto)    return 0 ;;
@@ -196,7 +231,9 @@ boot_matches() {
              [ -x "$kaic1" ] && want="kaic1 $(sha_of "$kaic1")" || want="kaic1 "
              case "$1" in "$want"*) return 0 ;; esac ;;
     release) plat="$(boot_platform)" || return 1
-             case "$1" in "release kaikai-v$(cat "$ROOT/VERSION")-$plat "*) return 0 ;; esac ;;
+             ver="${1#release kaikai-v}"; ver="${ver%%-*}"
+             case "$1" in "release kaikai-v$ver-$plat "*)
+               version_le "$ver" "$(cat "$ROOT/VERSION")" && return 0 ;; esac ;;
     *)       [ -x "$MODE" ] && [ "$1" = "path $(sha_of "$MODE")" ] && return 0 ;;
   esac
   return 1
@@ -224,9 +261,24 @@ cmd_seal() {
   fi
 }
 
+# Identifies the release boot without downloading it, for a cache key.
+cmd_release_id() {
+  plat="$(boot_platform)" || die "no release tarball for $(uname -s)-$(uname -m)"
+  ver="$(release_version "$plat")" || die "no release boot available"
+  name="kaikai-v$ver-$plat"
+  if release_cached "$BOOT_DIR/$name"; then
+    sha="$(field tarball "$BOOT_DIR/$name/boot.id")"
+  else
+    sha="$(release_sha "$ver" "$plat")"
+  fi
+  [ -n "$sha" ] || die "$name has no published sha256"
+  echo "$name $sha"
+}
+
 case "${1:-}" in
   emit)  [ $# -eq 2 ] || die "usage: kaic-boot.sh emit <out.c>";        cmd_emit "$2" ;;
   fresh) [ $# -eq 2 ] || die "usage: kaic-boot.sh fresh <out.c>";       cmd_fresh "$2" ;;
   seal)  [ $# -eq 3 ] || die "usage: kaic-boot.sh seal <out.c> <bin>";  cmd_seal "$2" "$3" ;;
-  *)     die "usage: kaic-boot.sh emit|fresh|seal ..." ;;
+  release-id) [ $# -eq 1 ] || die "usage: kaic-boot.sh release-id";     cmd_release_id ;;
+  *)     die "usage: kaic-boot.sh emit|fresh|seal|release-id ..." ;;
 esac

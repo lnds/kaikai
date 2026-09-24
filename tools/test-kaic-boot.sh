@@ -63,22 +63,28 @@ for plat in darwin-arm64 linux-x86_64; do
   (cd "$work/pkg" && tar -czf "$dist/v9.9.9/$name.tar.gz" "$name")
   (cd "$dist/v9.9.9" && { sha256sum "$name.tar.gz" 2>/dev/null || shasum -a 256 "$name.tar.gz"; } > "$name.tar.gz.sha256")
 done
+printf '{\n  "schema": 1,\n  "version": "9.9.9",\n  "tag": "v9.9.9"\n}\n' > "$dist/latest.json"
 
 out="$root/stage2/build/stage2.c"
 GOOD_URL="file://$dist"
 BAD_URL="file://$work/nowhere"
+GOOD_LATEST="file://$dist/latest.json"
+BAD_LATEST="file://$work/nowhere/latest.json"
 
 # boot <mode> <cmd> [args] — run the script under KAIC_BOOT=<mode> ("" = unset).
 boot() {
   mode="$1"; shift
   if [ -n "$mode" ]; then
-    KAIC_BOOT_ROOT="$root" KAIC_BOOT_URL="${URL:-$GOOD_URL}" KAIC_BOOT="$mode" "$BOOT_SH" "$@"
+    KAIC_BOOT_ROOT="$root" KAIC_BOOT_URL="${URL:-$GOOD_URL}" KAIC_BOOT_LATEST_URL="${LATEST:-$GOOD_LATEST}" \
+      KAIC_BOOT="$mode" "$BOOT_SH" "$@"
   else
-    (unset KAIC_BOOT; KAIC_BOOT_ROOT="$root" KAIC_BOOT_URL="${URL:-$GOOD_URL}" "$BOOT_SH" "$@")
+    (unset KAIC_BOOT; KAIC_BOOT_ROOT="$root" KAIC_BOOT_URL="${URL:-$GOOD_URL}" \
+      KAIC_BOOT_LATEST_URL="${LATEST:-$GOOD_LATEST}" "$BOOT_SH" "$@")
   fi
 }
 # A prefix assignment to a function call persists in POSIX sh; scope it.
-offline() { (URL="$BAD_URL"; boot "$@"); }
+offline() { (URL="$BAD_URL"; LATEST="$BAD_LATEST"; boot "$@"); }
+no_manifest() { (LATEST="$BAD_LATEST"; boot "$@"); }
 fresh()   { boot "$1" fresh "$out" 2>/dev/null; }
 is_fresh()  { fresh "$1" || fail "$2: expected fresh under KAIC_BOOT=${1:-<unset>}"; }
 is_stale()  { if fresh "$1"; then fail "$2: expected stale under KAIC_BOOT=${1:-<unset>}"; fi; }
@@ -130,9 +136,29 @@ boot release emit "$out" 2>/dev/null || fail "tampered cache was not re-fetched"
 ok "a cached boot that no longer hashes to its verified kaic2 is re-fetched, never reused"
 
 echo 9.9.10 > "$root/VERSION"
-is_stale release "VERSION names another release"
+is_fresh release "a published release preceding VERSION"
+echo 9.9.8 > "$root/VERSION"
+is_stale release "a release following VERSION"
 echo 9.9.9 > "$root/VERSION"
-ok "a boot of another release is never reused"
+ok "a boot of a release up to VERSION is reused, of a later release never"
+
+# ---- release: VERSION not published yet ---------------------------------
+echo 9.9.10 > "$root/VERSION"
+echo 'fn a() = 3' > "$root/stage2/compiler/a.kai"
+boot release emit "$out" 2>/dev/null || fail "an unpublished VERSION found no release boot"
+case "$(boot_of)" in "release kaikai-v9.9.9-"*) ;; *) fail "an unpublished VERSION booted [$(boot_of)]" ;; esac
+is_fresh release "boot of the newest published release"
+id="$(boot release release-id 2>/dev/null)" || fail "release-id failed for an unpublished VERSION"
+name="${id% *}"
+case "$name" in kaikai-v9.9.9-*) ;; *) fail "release-id names [$id]" ;; esac
+[ "${id#* }" = "$(awk '{print $1}' "$dist/v9.9.9/$name.tar.gz.sha256")" ] \
+  || fail "release-id [$id] disagrees with the published sha256"
+rm -rf "$root/stage2/build/boot"
+if no_manifest release emit "$out" 2>/dev/null; then fail "an unpublished VERSION booted without the release manifest"; fi
+echo 9.9.8 > "$root/VERSION"
+if boot release emit "$out" 2>/dev/null; then fail "a release following an unpublished VERSION was booted"; fi
+echo 9.9.9 > "$root/VERSION"
+ok "an unpublished VERSION boots the newest published release when it precedes VERSION, else nothing"
 
 rm -rf "$root/stage2/build/boot"
 for f in "$dist"/v9.9.9/*.sha256; do
