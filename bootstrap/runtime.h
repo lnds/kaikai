@@ -1,0 +1,19597 @@
+/*
+ * kaikai-minimal runtime for stage 0.
+ *
+ * Header-only. Generated C files #include this and compile together in
+ * one translation unit, so static storage and linkage are fine.
+ *
+ * All values are heap-allocated KaiValues with a reference-count header
+ * and a discriminating tag. Uniform boxing per docs/stage0-design.md;
+ * primitives (Int, Real, Bool, Char, Unit) are wrapped in the same
+ * struct so the generated code does not branch on shape.
+ *
+ * Calling convention for functions emitted by stage 0:
+ *   static KaiValue *kai_<name>(KaiValue *arg0, KaiValue *arg1, ...);
+ * Arguments are handed to the callee as owned references (callee must
+ * decref them or keep them alive as part of the returned value). The
+ * return value is owned by the caller.
+ *
+ * Closures and higher-order core helpers (map/filter/reduce/each)
+ * go through a dynamic dispatch path `kai_apply(closure, argc, argv)`
+ * to keep the generated code uniform.
+ */
+
+/* m8.x cooperative scheduler substrate: ucontext.
+ *
+ * The _XOPEN_SOURCE feature-test macro must be defined BEFORE ANY
+ * system header is included, otherwise sys/types.h (transitively
+ * pulled in by stdio.h, time.h, etc.) freezes the legacy POSIX
+ * ucontext_t layout (~56 bytes) instead of the full XSI shape
+ * (~880 bytes on darwin arm64). swapcontext then writes 880 bytes
+ * into a 56-byte buffer, silently corrupting whatever sits next to
+ * the embedded ucontext_t — exactly what bit Phase 2 once
+ * (kai_main_fiber.evidence_top got clobbered to a saved register
+ * value because the static evidence nodes were laid out adjacent).
+ * Spec: docs/fibers-impl.md §*macOS deprecation handling*. */
+#define _XOPEN_SOURCE 600
+/* mmap(MAP_ANON) is a BSD extension hidden by strict _XOPEN_SOURCE.
+ * Re-expose it: _DARWIN_C_SOURCE on macOS, _DEFAULT_SOURCE on glibc.
+ * The fiber stack allocator (m8.x guard pages) needs anonymous mmap. */
+#if defined(__APPLE__)
+#  define _DARWIN_C_SOURCE 1
+#endif
+#if defined(__linux__)
+#  define _DEFAULT_SOURCE 1
+/* glibc hides `dladdr` + `Dl_info` (a GNU extension, not C99) behind
+ * _GNU_SOURCE; the --debug panic backtrace (#500) needs them to de-slide
+ * PIE frames. Must be defined BEFORE any include, like the macros above —
+ * a strict `-std=c99` C-only bootstrap rejects the implicit declaration
+ * otherwise (macOS libSystem exposes them regardless, which is why a mac
+ * build did not catch it). _GNU_SOURCE implies _DEFAULT_SOURCE. */
+#  define _GNU_SOURCE 1
+#endif
+
+#ifndef KAI_RUNTIME_H
+#define KAI_RUNTIME_H
+
+#include <dirent.h>
+#include <math.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sched.h>      /* sched_getaffinity() — CPU count for the KAI_THREADS default */
+#include <sys/mman.h>
+#include <sys/resource.h>  /* getrlimit(RLIMIT_STACK) — stack budget for the kai_main fiber */
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include <execinfo.h>   /* backtrace() for the --debug panic stack trace (#500) */
+#include <dlfcn.h>      /* dladdr() — main-image load address to de-slide PIE frames */
+
+/* Purity attribute for a confirmed memory-clean fn (issue #1139): the C
+ * emitter prefixes `KAI_CONST` on the signature of a fn whose lowered
+ * body performs no memory access, so `cc -O2` can CSE / hoist / fold
+ * calls to it. `((const))` promises the result depends only on the
+ * arguments and the fn reads no memory through them — the C mirror of
+ * LLVM `memory(none)`. Only GCC/Clang honour it; elsewhere it vanishes.
+ * Defined unconditionally (NOT inside KAI_TRACE_RC), since every C build
+ * the emitter targets references it. */
+#if defined(__GNUC__) || defined(__clang__)
+#define KAI_CONST __attribute__((const))
+#else
+#define KAI_CONST
+#endif
+
+/* M:N scheduler — Class A per-scheduler-thread state (docs/mn-scheduler-
+ * design.md §1). Each OS scheduler thread owns its own copy; a fiber runs on
+ * exactly one thread at a time and only ever touches that thread's copy, so
+ * the allocator pools, region arena stack, scheduler core, and RC/trace
+ * ledgers need no lock on the hot path. Under a single thread `_Thread_local`
+ * is semantically identical to a plain global, so N=1 stays byte-identical.
+ * Every global carrying KAI_TLS is classified `tls` in the audit gate
+ * (tools/runtime-globals.allow).
+ *
+ * Under separate compilation (the -O0 owner split, #1238) these become `extern`
+ * across objects, which defaults to the general-dynamic TLS model (resolved via
+ * __tls_get_addr). Pin initial-exec: it resolves the address off the thread
+ * pointer directly (like the single-TU `static` local-exec), which TSAN models
+ * as thread-private — general-dynamic's opaque __tls_get_addr otherwise trips
+ * TSAN into a false cross-thread race on per-thread state. Sound because the
+ * owner links statically (initial-exec forbids dlopen, not static link), and
+ * orthogonal to the #1234 hoist (that cached the thread-pointer BASE across
+ * swapcontext; this pins the resolution MODE, not the base — the -O0 owner
+ * still closes the hoist). */
+#if defined(KAI_SEPARATE_COMPILATION) && (defined(__GNUC__) || defined(__clang__))
+#define KAI_TLS _Thread_local __attribute__((tls_model("initial-exec")))
+#else
+#define KAI_TLS _Thread_local
+#endif
+
+/* Linkage of the fiber suspend-point ops the C backend calls by name — the
+ * mailbox recv/send surface, spawn_actor, kai_sched_bootstrap, and every
+ * default effect handler that parks a fiber (Spawn, the reactor-backed NetTcp /
+ * Stdin / Clock / Process / Signal). Default `static` keeps the single-TU C
+ * path auto-contained and byte-identical (sound under gcc). Under separate
+ * compilation these move to the owner object: the owner defines them with
+ * external linkage, the program TU sees a prototype. Load-bearing for soundness
+ * — the owner is pinned to -O0 (KAI_RUNTIME_OWNER_OPT), because clang -O1+
+ * caches the thread pointer across swapcontext, and a fiber work-stolen onto
+ * another OS thread would then read the creator thread's scheduler TLS. A
+ * program TU compiled -O2 no longer holds these definitions — it references
+ * them, so DCE drops the whole suspend-point closure they anchor (kai_sched_park,
+ * the reactor, the trampoline), leaving nothing for the optimiser to mishoist.
+ * The set is exactly the ops reachable from emitted code that transitively hit
+ * swapcontext or the scheduler's thread-locals; a leaf op that slips in is
+ * caught by a build-time `nm` assert.
+ * The axis is KAI_SEPARATE_COMPILATION (linkage), orthogonal to KAI_HOT_ONLY
+ * (which governs the native bitcode's shim elision). */
+#if defined(KAI_SEPARATE_COMPILATION)
+#  if defined(KAI_RUNTIME_OWNER)
+#    define KAI_SCHED_FN
+#  else
+#    define KAI_SCHED_FN extern
+#  endif
+#else
+#  define KAI_SCHED_FN static
+#endif
+/* Its body is present in the owner and single-TU builds, elided to a bare
+ * prototype in a non-owner separate-compilation TU:
+ *   KAI_SCHED_FN <ret> name(args)
+ *   #if KAI_SCHED_DECL_ONLY
+ *   ;
+ *   #else
+ *   { ...body... }
+ *   #endif
+ * The body is never wrapped in a macro — compiler errors and byte-id stay honest. */
+#if defined(KAI_SEPARATE_COMPILATION) && !defined(KAI_RUNTIME_OWNER)
+#  define KAI_SCHED_DECL_ONLY 1
+#else
+#  define KAI_SCHED_DECL_ONLY 0
+#endif
+
+/* Number of OS scheduler threads (M:N). Read once from KAI_THREADS at
+ * startup (kai_sched_bootstrap), immutable after — published before any
+ * worker spawns, so no lock. Class B. Declared here, ahead of the
+ * allocator, because the slab/pool hot paths branch on it (N==1 keeps
+ * the pre-M:N single-thread behaviour byte-identical). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_nthreads;
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_nthreads = 1;
+#  endif
+#else
+static int kai_nthreads = 1;
+#endif
+
+/* net-tcp-v1 — sockets API for the NetTcp default handler.
+ * POSIX everywhere we ship: macOS, Linux, *BSD. The handler is
+ * blocking-only: the m8.x cooperative scheduler (landed v0.4.0)
+ * suspends fibers on mailbox / await / yield, but we have no
+ * readiness reactor yet, so socket reads/writes park the OS thread
+ * rather than the fiber. kqueue / epoll integration is a Tier 2
+ * follow-up tracked in docs/fibers-honesty-targets.md §Reactor. */
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+/* Issue #611 — Phase R1 reactor support. `poll()` is the wait
+ * primitive (POSIX everywhere we ship), `pthread` powers the file
+ * I/O worker pool, and `fcntl` toggles O_NONBLOCK on the self-pipes
+ * so the SIGCHLD handler and worker threads never block on write.
+ * Sockets stay on the blocking path until R2. */
+#include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
+
+/* Stack buffer size for filesystem path operations (realpath, dirname,
+ * join, etc.). Replaces the bare 4096 literal that was copy-pasted across
+ * ~14 path sites. Floors at 4096 to preserve the historical buffer size
+ * on every platform: darwin defines PATH_MAX as 1024 and Linux as 4096,
+ * so a plain `PATH_MAX` would have *shrunk* the macOS buffer and started
+ * truncating paths in [1024, 4096). The max() keeps the old behaviour
+ * everywhere and only grows on systems with a larger PATH_MAX. POSIX lets
+ * PATH_MAX be undefined when the max is unbounded (GNU/Hurd); the floor
+ * covers that case too. */
+#if defined(PATH_MAX) && PATH_MAX > 4096
+#  define KAI_PATH_BUF PATH_MAX
+#else
+#  define KAI_PATH_BUF 4096
+#endif
+
+/* Stack buffer for environment-variable *names* (get_var/set_var/unset_var).
+ * 1024 was copy-pasted across the three env entry points; named here so the
+ * three stay in lock-step. POSIX does not bound env name length, but 1024 is
+ * far past any real variable name; over-long names are truncated, matching
+ * the prior behaviour. */
+#define KAI_ENV_NAME_BUF 1024
+
+/* Stack buffer for network host strings passed to getaddrinfo (connect and
+ * listen sites). NI_MAXHOST is 1025 on most platforms; 256 is the historical
+ * pragmatic bound shared by both call sites — kept as-is, just named. */
+#define KAI_NET_HOST_BUF 256
+
+/* Initial heap capacity for the grow-by-doubling stdin read buffers
+ * (read_line and the stdin event loop). The buffer doubles via realloc, so
+ * this is only the starting point, not a ceiling; 128 covers a typical line
+ * without a first reallocation. */
+#define KAI_READ_BUF_INIT 128
+
+/* listen(2) backlog for server sockets. Linux caps the effective value at
+ * net.core.somaxconn regardless; 128 is the conservative v1 bound shared by
+ * every listen site. */
+#define KAI_LISTEN_BACKLOG 128
+
+/* Default permission bits for directories created by dir_create (rwxr-xr-x,
+ * umask-masked by the kernel). Named to document intent; value unchanged. */
+#define KAI_DIR_MODE 0755
+
+/* Apple deprecated ucontext in macOS 10.6 (POSIX-2008 obsoletion).
+ * The functions still work; the deprecation attribute on the
+ * prototypes triggers -Wdeprecated-declarations, which the local
+ * pragma silences. Same trick libco / libtask / Boost.Context use.
+ * The same envelope wraps every swap/get/makecontext call site. */
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+#include <ucontext.h>
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic pop
+#endif
+
+/* Not every program uses every core function; silence the
+   unused-function warnings that would otherwise pile up in `cc` output
+   when stage 0 links only the parts a given program needs. */
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wunused-function"
+#endif
+
+/* ---------- types ---------- */
+
+typedef enum {
+    KAI_UNIT,
+    KAI_BOOL,
+    KAI_INT,
+    KAI_REAL,
+    KAI_CHAR,
+    KAI_STR,
+    KAI_NIL,
+    KAI_CONS,
+    KAI_RECORD,
+    KAI_VARIANT,
+    KAI_CLOSURE,
+    KAI_ARRAY,
+    KAI_REF,        /* Ref[T]: single-cell mutable reference (Mutable effect).
+                     * Distinct from KAI_ARRAY — a Ref is exactly one slot, with
+                     * no length / capacity / indexing. The earlier hack backed
+                     * Ref with a length-1 KAI_ARRAY (issue #257); this is the
+                     * "clean fix" the #257 retro flagged. ML/OCaml `ref`,
+                     * Haskell `IORef` lineage. */
+    /* Cross-thread-handle rule: KAI_FIBER and KAI_PID are runtime-owned
+     * handles to a unit of execution or a channel reachable from more than
+     * one scheduler thread, so their rc is atomic (fiber) or the box
+     * immortal (pid) by construction. Everything the user's program builds
+     * as data stays non-atomic and crosses threads only by copy-on-send. */
+    KAI_FIBER,      /* m8 #3: Spawn / Fiber[T] handle (opaque) */
+    KAI_PID,        /* m8 #7: Actor[Msg] / Pid[Msg] handle (opaque) */
+    KAI_BYTE,         /* Lane 4 (#473): unsigned 8-bit integer, nominal */
+    KAI_INT32,        /* numeric lane A: signed 32-bit, nominal */
+    KAI_UINT32,       /* numeric lane A: unsigned 32-bit, nominal */
+    KAI_UINT64,       /* numeric lane A: unsigned 64-bit, nominal */
+    KAI_INT128,       /* numeric lane A: signed 128-bit, nominal */
+    KAI_FOREIGN,      /* FFI v2 (#417): opaque C handle (extern "C" opaque T).
+                       * Parks a raw `void *` the kaikai side threads through
+                       * but never inspects. RC manages the box; the parked
+                       * pointer is NEVER freed (no Drop integration — the
+                       * driver owns that lifetime). Identity-compared. */
+    KAI_VEC,          /* Vec[T]: pure value vector over one flat growable
+                       * buffer. One RC header for the whole vector; elements
+                       * stored unboxed (raw scalars / inline records) when
+                       * the element shape allows, boxed otherwise. Writes
+                       * mutate in place when the buffer is uniquely owned
+                       * (rc == 1) and copy-on-write when shared. */
+    KAI_RANGE         /* [a..b] / [a..b..s]: an Int cons-list stored as its
+                       * generator {from, to, step} — a REPRESENTATION of
+                       * `[Int]`, not a distinct type (same trick as KAI_VEC
+                       * under the sequence type). Consumers either iterate
+                       * the generator directly or normalise one cell at a
+                       * time via kai_seq_norm; a KAI_RANGE must never reach
+                       * an `as.cons` access un-normalised. No interior
+                       * pointers: dup/drop are plain. */
+} KaiTag;
+
+/* Head-type tags — single-dispatch protocol dispatch key.
+ * See docs/variant-tags.md "Head-type tags — protocol dispatch key".
+ *
+ * Tags 0..15 are reserved for primitives + structural; stdlib sums
+ * pin 16..19; user-declared nominal types start at 20. */
+#define KAI_HEAD_ANON         0
+#define KAI_HEAD_UNIT         1
+#define KAI_HEAD_BOOL         2
+#define KAI_HEAD_INT          3
+#define KAI_HEAD_REAL         4
+#define KAI_HEAD_CHAR         5
+#define KAI_HEAD_STRING       6
+#define KAI_HEAD_LIST         7
+#define KAI_HEAD_ARRAY        8
+#define KAI_HEAD_BYTE         9
+#define KAI_HEAD_CLOSURE     10
+#define KAI_HEAD_FIBER       11
+#define KAI_HEAD_PID         12
+#define KAI_HEAD_BYTES       13
+#define KAI_HEAD_VEC         14
+#define KAI_HEAD_OPTION      16
+#define KAI_HEAD_RESULT      17
+#define KAI_HEAD_SIGNAL      18
+#define KAI_HEAD_PROCESS_EXIT 19
+#define KAI_USER_HEAD_TAG_BASE 20
+
+/* Protocol IDs — first 12 reserved for stdlib protocols in
+ * stdlib/protocols.kai declaration order. User protocols start at 12.
+ * See docs/variant-tags.md "Protocol IDs". */
+#define KAI_PROTO_SHOW          0
+#define KAI_PROTO_EQ            1
+#define KAI_PROTO_ORD           2
+#define KAI_PROTO_HASH          3
+#define KAI_PROTO_SERIALIZE     4
+#define KAI_PROTO_BIN_SERIALIZE 5
+#define KAI_PROTO_DEFAULT       6
+#define KAI_PROTO_ADD           7
+#define KAI_PROTO_SUB           8
+#define KAI_PROTO_MUL           9
+#define KAI_PROTO_DIV          10
+#define KAI_PROTO_REM          11
+#define KAI_PROTO_NUMERIC      12
+#define KAI_PROTO_LAYOUT       13
+#define KAI_PROTO_JSON         14
+#define KAI_USER_PROTO_ID_BASE 15
+
+/* Operation index within a protocol (declaration order in
+ * stdlib/protocols.kai). The impl table keys on (proto_id, op_id, head_tag):
+ * a multi-op protocol (Ord, Numeric) registers one impl per op for the same
+ * (proto_id, head_tag), so the op_id disambiguates which impl a dispatcher
+ * or a bare-op-as-value lookup resolves. Single-op protocols use op 0. */
+#define KAI_OP_ORD_CMP          0
+#define KAI_OP_ORD_MIN          1
+#define KAI_OP_ORD_MAX          2
+#define KAI_OP_EQ_EQ            0
+
+/* Variant-tag -> head-type-tag map. Set once at startup by codegen-
+ * emitted main via kai_register_variant_heads(table, len). Until set,
+ * the bootstrap table covers the 12 reserved builtin variants
+ * (Some/None -> Option, Ok/Err -> Result, Sig* -> Signal,
+ * Exited/Signaled -> ProcessExit). */
+static const int32_t kai_variant_to_head_bootstrap[12] = {
+    /* 0  */ KAI_HEAD_OPTION,        /* Some  */
+    /* 1  */ KAI_HEAD_OPTION,        /* None  */
+    /* 2  */ KAI_HEAD_RESULT,        /* Ok    */
+    /* 3  */ KAI_HEAD_RESULT,        /* Err   */
+    /* 4  */ KAI_HEAD_SIGNAL,        /* SigInt  */
+    /* 5  */ KAI_HEAD_SIGNAL,        /* SigTerm */
+    /* 6  */ KAI_HEAD_SIGNAL,        /* SigHup  */
+    /* 7  */ KAI_HEAD_SIGNAL,        /* SigUsr1 */
+    /* 8  */ KAI_HEAD_SIGNAL,        /* SigUsr2 */
+    /* 9  */ KAI_HEAD_PROCESS_EXIT,  /* Exited   */
+    /* 10 */ KAI_HEAD_PROCESS_EXIT,  /* Signaled */
+    /* 11 */ KAI_HEAD_SIGNAL,        /* SigWinch */
+};
+
+/* Tag-keyed runtime metadata (variant->head map, impl table, name/mask
+ * tables, caches below) is process-global by design: a variant built in
+ * one translation unit is walked, freed, and dispatched in another.
+ * Under KAI_SEPARATE_COMPILATION each table therefore gets one shared
+ * copy (extern everywhere, defined by the KAI_RUNTIME_OWNER TU), like
+ * the RC free-list pools. A per-TU copy is not just waste: the reader
+ * TU would see an empty table and free through the wrong slot mask. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern const int32_t *kai_variant_to_head;
+extern int32_t        kai_variant_to_head_len;
+#  if defined(KAI_RUNTIME_OWNER)
+const int32_t *kai_variant_to_head     = kai_variant_to_head_bootstrap;
+int32_t        kai_variant_to_head_len = 12;
+#  endif
+#else
+static const int32_t *kai_variant_to_head     = kai_variant_to_head_bootstrap;
+static int32_t        kai_variant_to_head_len = 12;
+#endif
+
+static inline void kai_register_variant_heads(const int32_t *tbl, int32_t len) {
+    kai_variant_to_head     = tbl;
+    kai_variant_to_head_len = len;
+}
+
+/* Sparse registration: `pairs` is (variant_tag, head_tag) flattened, n
+ * total ints. Tags are name-keyed (sparse), so codegen cannot emit a
+ * dense table; build it here sized to the max tag present. Unclaimed
+ * slots stay 0 (KAI_HEAD_ANON). Called once at startup; the table is
+ * intentionally immortal. */
+static void kai_register_variant_head_pairs(const int32_t *pairs, int32_t n) {
+    int32_t max_tag = 10;
+    int32_t i;
+    int32_t *tbl;
+    for (i = 0; i + 1 < n; i += 2) if (pairs[i] > max_tag) max_tag = pairs[i];
+    tbl = (int32_t *) calloc((size_t) max_tag + 1, sizeof(int32_t));
+    if (!tbl) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    for (i = 0; i + 1 < n; i += 2) tbl[pairs[i]] = pairs[i + 1];
+    kai_register_variant_heads(tbl, max_tag + 1);
+}
+
+/* Impl-table entry — emitted by codegen as a static const array, then
+ * loaded into the runtime hashmap at startup by kai_register_impls. */
+typedef struct {
+    int32_t proto_id;
+    int32_t op_id;
+    int32_t head_tag;
+    void   *fn;
+} KaiImplEntry;
+
+/* Open-addressing hashmap, linear probing. Capacity is a power of 2.
+ * Empty slot marked by fn == NULL (no impl ever has NULL function).
+ * Key is (proto_id, op_id, head_tag): a multi-op protocol registers one
+ * impl per op for the same (proto_id, head_tag), so op_id disambiguates. */
+typedef struct {
+    int32_t proto_id;
+    int32_t op_id;
+    int32_t head_tag;
+    void   *fn;
+} KaiImplSlot;
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiImplSlot *kai_impl_table;
+extern int32_t      kai_impl_cap;
+extern int32_t      kai_impl_count;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiImplSlot *kai_impl_table  = NULL;
+int32_t      kai_impl_cap    = 0;
+int32_t      kai_impl_count  = 0;
+#  endif
+#else
+static KaiImplSlot *kai_impl_table  = NULL;
+static int32_t      kai_impl_cap    = 0;
+static int32_t      kai_impl_count  = 0;
+#endif
+
+static inline uint32_t kai_impl_hash(int32_t proto_id, int32_t op_id, int32_t head_tag) {
+    /* FNV-1a-ish mix; keys are small ints so any cheap mix is fine. */
+    uint32_t h = (uint32_t) proto_id * 2654435761u;
+    h ^= (uint32_t) op_id * 2246822519u;
+    h ^= (uint32_t) head_tag * 40503u;
+    h ^= h >> 13;
+    return h;
+}
+
+/* Lookup. Returns NULL when no impl is registered for the key.
+ * The dispatcher panics on NULL with a meaningful message. */
+static inline void *kai_lookup_impl(int32_t proto_id, int32_t op_id, int32_t head_tag) {
+    if (kai_impl_cap == 0) return NULL;
+    uint32_t mask = (uint32_t) (kai_impl_cap - 1);
+    uint32_t i    = kai_impl_hash(proto_id, op_id, head_tag) & mask;
+    while (kai_impl_table[i].fn != NULL) {
+        if (kai_impl_table[i].proto_id == proto_id &&
+            kai_impl_table[i].op_id == op_id &&
+            kai_impl_table[i].head_tag == head_tag) {
+            return kai_impl_table[i].fn;
+        }
+        i = (i + 1u) & mask;
+    }
+    return NULL;
+}
+
+static inline void kai_impl_insert(int32_t proto_id, int32_t op_id, int32_t head_tag, void *fn) {
+    uint32_t mask = (uint32_t) (kai_impl_cap - 1);
+    uint32_t i    = kai_impl_hash(proto_id, op_id, head_tag) & mask;
+    while (kai_impl_table[i].fn != NULL) {
+        /* Duplicate registration of the same key is a codegen bug —
+         * overwrite silently rather than crash. */
+        if (kai_impl_table[i].proto_id == proto_id &&
+            kai_impl_table[i].op_id == op_id &&
+            kai_impl_table[i].head_tag == head_tag) {
+            kai_impl_table[i].fn = fn;
+            return;
+        }
+        i = (i + 1u) & mask;
+    }
+    kai_impl_table[i].proto_id = proto_id;
+    kai_impl_table[i].op_id    = op_id;
+    kai_impl_table[i].head_tag = head_tag;
+    kai_impl_table[i].fn       = fn;
+    kai_impl_count++;
+}
+
+/* Called once at program start by codegen-emitted main (before user
+ * code runs). Sizes capacity at 2x for ~50% max load factor.
+ * Idempotent: calling twice replaces the table (last writer wins),
+ * which is correct for the single-compilation single-link model. */
+static void kai_register_impls(const KaiImplEntry *entries, int32_t n) {
+    int32_t cap = 16;
+    while (cap < n * 2) cap *= 2;
+    if (kai_impl_table != NULL) free(kai_impl_table);
+    kai_impl_table  = (KaiImplSlot *) calloc((size_t) cap, sizeof(KaiImplSlot));
+    kai_impl_cap    = cap;
+    kai_impl_count  = 0;
+    for (int32_t k = 0; k < n; ++k) {
+        kai_impl_insert(entries[k].proto_id, entries[k].op_id, entries[k].head_tag, entries[k].fn);
+    }
+}
+
+typedef struct KaiValue KaiValue;
+
+/* Dynamic-dispatch signature used for closures and higher-order calls. */
+typedef KaiValue *(*KaiFn)(KaiValue *self, KaiValue **args, int n_args);
+
+/* Issue #440 — variant payload slot. One machine word. Mask bits in
+ * `slot_mask` discriminate per-slot kind; see the `var`
+ * substructure below for the encoding. Binary-compatible with
+ * `KaiValue *` so legacy pointer-only callers (stage 0/1 emit,
+ * immortal-variant cache hash/match, reuse-in-place memcmp) keep
+ * working unchanged when mask=0. */
+typedef union {
+    KaiValue *ptr;
+    int64_t   i64;
+    double    r;
+    uint32_t  c;
+    int8_t    b;
+} KaiVarSlot;
+
+/* Issue #440 Phase 2 — slot kind decoder. 2 bits per slot in
+ * `slot_mask`; bit pair at position (2*i) encodes slot i's kind:
+ *   0 = pointer (KaiValue *) — legacy
+ *   1 = Int (int64_t, .i64)
+ *   2 = Real (double, .r)
+ *   3 = Enum (int64_t variant_tag, .i64) — a nullary ctor of an
+ *       all-nullary sum type stored as its immediate tag instead of a
+ *       pointer to its interned singleton. Distinct from INT so the
+ *       read-back path knows the i64 is a variant tag to re-intern
+ *       (kai_enum_slot_box), not a raw integer to box (kai_int).
+ * Variants with >16 slots fall back to mask=0 (all pointer) since the
+ * encoding exhausts the 32-bit mask. */
+#define KAI_VAR_SLOT_PTR  0u
+#define KAI_VAR_SLOT_INT  1u
+#define KAI_VAR_SLOT_REAL 2u
+#define KAI_VAR_SLOT_ENUM 3u
+
+static inline uint32_t kai_var_slot_kind(uint32_t mask, int i) {
+    return (mask >> (2 * (uint32_t) i)) & 3u;
+}
+
+struct KaiValue {
+    /* Koka-packed header (kk_header_t shape): 8 bytes, not the old 24.
+     * Koka stores `{ uint8 scan_fsize; uint8 _idx; uint16 tag; refcount }`
+     * in one word — kaikai mirrors it:
+     *   rc          (4) — reference count
+     *   tag         (1) — the KaiTag (KAI_VARIANT/INT/CONS/...); < 256 tags
+     *   var_n_args  (1) — slot count for a variant (Koka's scan_fsize); a
+     *                     node has ≤ 255 slots, so one byte suffices and
+     *                     the per-node int32 is gone
+     *   variant_tag (2) — constructor discriminant (Koka's uint16 tag)
+     * `slot_mask` (the per-slot kind bits) moved OUT of the per-node header
+     * into a tag→mask table (kai_slot_mask_of) — with Int now tagged, most
+     * slots are kind 0 and the mask is needed only by the generic drop /
+     * copy walkers, which can look it up per type instead of per node.
+     * This is the 80 B → 48 B shrink: 8 B header + 5×8 slots = 48, Koka's
+     * exact node size. `variant_name` likewise lives in a tag→name table. */
+    int32_t  rc;
+    uint8_t  tag;
+    uint8_t  var_n_args;
+    uint16_t variant_tag;
+#ifdef KAI_TRACE_RC
+    /* issue #296 — call-site attribution. Captured at kai_alloc as
+     * __builtin_return_address(0); decremented from the per-site
+     * histogram at kai_free_value. Only present under -DKAI_TRACE_RC=1
+     * (vanilla builds keep the original two-word header — runtime
+     * layout is otherwise unchanged). */
+    void   *alloc_site;
+#endif
+#ifdef KAI_TRACE_RC_LEAKSITE
+    /* Lane DIAG (#293) — kaikai-source attribution. Captured at
+     * kai_alloc as the value of `kai_current_scope_fn`, set by the
+     * stage-1 emitter at the top of every generated kaikai function
+     * via `kai_set_scope_fn(<name>)`. Pairs with `alloc_site`
+     * (return-address) to map every leaked chunk to the kaikai fn
+     * whose body emitted (or should have emitted) the matching
+     * decref. Only present under -DKAI_TRACE_RC_LEAKSITE=1. */
+    const char *scope_fn;
+#endif
+    union {
+        int      b;                                 /* KAI_BOOL */
+        int64_t  i;                                 /* KAI_INT */
+        double   r;                                 /* KAI_REAL */
+        uint32_t c;                                 /* KAI_CHAR */
+        uint8_t  byte_val;                                /* KAI_BYTE — Lane 4 (#473) */
+        int32_t  i32;                               /* KAI_INT32 */
+        uint32_t u32;                               /* KAI_UINT32 */
+        uint64_t u64;                               /* KAI_UINT64 */
+        /* KAI_INT128. Stored as two 8-byte halves, NOT a bare `__int128`:
+         * `__int128` carries a 16-byte alignment requirement that would
+         * raise KaiValue's alignment to 16, but the allocator/arena align
+         * to 8 — a misaligned `->as.i128` access is UB that segfaults on
+         * Linux/-O2 (and UBSan flags it). Access via kai_i128_load /
+         * kai_i128_store (memcpy, alignment-agnostic). */
+        uint64_t i128_halves[2];                    /* KAI_INT128 (lo, hi) */
+        struct { size_t len; char *bytes; } s;      /* KAI_STR (heap, not NUL-terminated but we always allocate +1 byte for safety) */
+        struct { KaiValue *head; KaiValue *tail; } cons;
+        /* KAI_RANGE: unmaterialised Int list. Inclusive bounds; step is
+         * never 0. Empty when step > 0 && from > to (or the mirror for
+         * step < 0). */
+        struct { int64_t from; int64_t to; int64_t step; } range;
+        struct {
+            int          n_fields;
+            KaiValue   **fields;
+            const char **names;                     /* static strings, not freed */
+            int32_t      head_type_tag;             /* docs/variant-tags.md "Head-type tags" */
+        } rec;
+        /* Monomorphic-node packing: a variant's slots live INLINE here,
+         * overlapping the union (a variant uses none of the other union
+         * members). `variant_tag` / `slot_mask` moved to the header above,
+         * so slot 0 no longer collides with the discriminant. This is the
+         * 80 B → 48 B shrink: slots start at the union offset (8) instead
+         * of after a 32 B `var` metadata substruct. Read via the
+         * `kai_var_slots(v)` macro (below) — `((KaiVarSlot *)&v->as)`. The
+         * slots are NOT a union member: a flexible array member in a union,
+         * or in an otherwise-empty wrapper struct, is rejected by C99
+         * (Linux clang errors; Apple clang silently accepts the GNU
+         * extension). `n_args` is recovered from the size class / the
+         * compiler-known ctor arity, not stored per node. */
+        struct {
+            KaiFn       fn;
+            int32_t     arity;
+            int32_t     n_captures;
+            KaiValue  **captures;
+        } clo;
+        /* Opaque mutable array. Used by the stage 2 inferencer to keep
+           the HM substitution indexed by TyVar id, so apply_ty lookups
+           are O(1) instead of O(k) over an association list. Set
+           mutates in place and returns the same value (Perceus unaware
+           — callers must not alias an array across logical versions). */
+        struct {
+            int64_t     len;
+            int64_t     cap;
+            KaiValue  **items;
+        } arr;
+        /* KAI_VEC: pure value vector. `data` is ONE heap block laid out
+         * as [KaiVecMeta][cap * stride bytes of elements]. The meta
+         * records how elements are stored (boxed pointers, raw scalars,
+         * or inline all-scalar records); len/cap live here so reads
+         * never touch the block for bounds. Writes go through the
+         * rc==1 uniqueness check: in place when unique, copy-on-write
+         * when shared — aliasing is never observable.
+         *
+         * A SLICE is a KAI_VEC whose `view_of` points at the owning
+         * vec node (never at another view — chains flatten on
+         * creation). For a view, `data` points at the view's FIRST
+         * ELEMENT inside the owner's block (not at the block start),
+         * `cap == len`, and the node holds one strong ref on the
+         * owner: a live slice pins the whole buffer, and the owner's
+         * rc > 1 disables its in-place writes until the slice dies.
+         * A view never owns element refs — the owner's free path
+         * releases them. Every write through a view copies first
+         * (kai_vec_ensure_unique treats any view as shared). */
+        struct {
+            int64_t     len;
+            int64_t     cap;
+            void       *data;
+            KaiValue   *view_of;
+        } vec;
+        /* KAI_REF: a single mutable cell. Owns one strong reference to
+         * `cell`. ref_set drops the old cell and steals the new value;
+         * ref_get hands back an incref'd copy; ref_make steals its init.
+         * No length, no indexing — the invariant "a Ref is one slot" is
+         * in the representation, not just the surface type. */
+        struct {
+            KaiValue   *cell;
+        } ref;
+        /* m8 #3: opaque handle to a KaiFiber. The KaiFiber struct
+         * itself is heap-allocated by Spawn.spawn and owned by this
+         * value: when the value's RC drops to zero, kai_free_value
+         * frees the KaiFiber and decrefs its result + thunk. */
+        struct KaiFiber *fib;
+        /* m8 #7: opaque handle to a KaiMailbox. Pid values share the
+         * mailbox's lifetime through borrowed pointers — the mailbox
+         * is owned by the with_mailbox / spawn_actor helper that
+         * allocated it, not by the Pid value. RC on the Pid value
+         * is just a handle count; freeing a Pid does not free the
+         * mailbox (that happens when the with_mailbox / spawn_actor
+         * scope exits). */
+        struct KaiMailbox *mb;
+        /* FFI v2 (#417): opaque C handle. The parked pointer is borrowed
+         * external memory — the box's RC frees only the KaiValue, never
+         * `foreign_ptr` (the driver calls the C destructor itself). */
+        void *foreign_ptr;
+    } as;
+    /* Variant slots overlap the union `as` (a variant uses none of the
+     * union's named members), so a node is `8 B header + n*8 slots` = 48 B
+     * for 5 slots, down from 80 B. `kai_alloc_var(n)` allocates
+     * `offsetof(KaiValue, as) + n*sizeof(KaiVarSlot)` and writes slots via
+     * the `kai_var_slots(v)` macro below. The slots are NOT a union member:
+     * a flexible array member in a union — or in an otherwise-empty wrapper
+     * struct — is a GNU extension Linux clang rejects under -std=c99. */
+};
+
+/* Variant slots for a KAI_VARIANT node. `&v->as` cast to `KaiVarSlot *`
+ * IS the slot array (the slots overlap the union at offset 0). Replaces
+ * the old `v->as.var.var_slots[i]` FAM; address and layout are
+ * byte-for-byte identical, only the spelling changes. */
+#define kai_var_slots(v) ((KaiVarSlot *) (&(v)->as))
+
+/* ---------- Vec[T] element-storage metadata ---------- */
+
+/* How a KAI_VEC stores its elements. Decided once, from the first
+ * element the vector ever holds; a vector's element type is static so
+ * every later element has the same shape. */
+#define KAI_VEC_EK_PENDING 0   /* empty vector, no element seen yet */
+#define KAI_VEC_EK_BOXED   1   /* KaiValue* per element, each slot RC'd */
+#define KAI_VEC_EK_RAW     2   /* one 8-byte scalar payload per element */
+#define KAI_VEC_EK_REC     3   /* all-scalar record stored inline */
+
+/* Inline-record field cap: a record with more fields (or any non-scalar
+ * field) falls back to boxed storage, which is always sound. */
+#define KAI_VEC_REC_MAX 8
+
+/* Prefix of the single heap block behind a KAI_VEC: the block is
+ * [KaiVecMeta][cap * stride bytes]. Field names are the static string
+ * literals record constructors carry; the meta stores copies of the
+ * pointers, never owns the strings. */
+typedef struct {
+    int32_t     ekind;
+    int32_t     elem_tag;                     /* RAW: KaiTag reboxed on read */
+    int64_t     stride;                       /* bytes per element */
+    int32_t     n_fields;                     /* REC */
+    int32_t     head_tag;                     /* REC: nominal head-type tag */
+    uint8_t     field_tags[KAI_VEC_REC_MAX];  /* REC: per-field scalar KaiTag */
+    const char *names[KAI_VEC_REC_MAX];       /* REC: field names (static) */
+} KaiVecMeta;
+
+/* Owner: `data` is the block start ([meta][elems]). View: `data` is
+ * the view's first element; the meta lives at the owner's block. Both
+ * accessors are the ONLY sanctioned way to reach a vec's meta/elements
+ * — direct `as.vec.data` arithmetic breaks on views. */
+static inline KaiVecMeta *kai_vec_meta(KaiValue *v) {
+    return (KaiVecMeta *) (v->as.vec.view_of ? v->as.vec.view_of->as.vec.data
+                                             : v->as.vec.data);
+}
+static inline char *kai_vec_elems(KaiValue *v) {
+    return v->as.vec.view_of ? (char *) v->as.vec.data
+                             : (char *) v->as.vec.data + sizeof(KaiVecMeta);
+}
+
+/* ---------- Koka-style tagged-value Int representation ----------
+ *
+ * Ported from Koka's kklib (box.h / integer.h / kklib.h, Daan Leijen).
+ * The structure kaikai never had: a value is ONE machine word. Koka,
+ * box.h:26-29 — on 64-bit, using `z` for the least-significant byte:
+ *
+ *   xxxx xxxz   z = bbbbbbb0  : a heap pointer p (always >= 2-byte aligned)
+ *   xxxx xxxz   z = bbbbbbb1  : a 63-bit value n, encoded as n*2+1
+ *
+ * Pointers from malloc/calloc are >= 8-byte aligned, so the bottom bit
+ * is free. A small Int is therefore an immediate — no heap block, no RC
+ * header. dup/drop on it are no-ops: Koka's kk_integer_dup/drop
+ * (integer.h:271-278) are literally "if (is_bigint) block_dup/drop;
+ * return i". This is what removes the rb-tree's 68.75M `kai_int` heap
+ * allocations (75% of all allocs) and the ~800M RC ops riding on them —
+ * the "kaikai-vs-Koka crux" of docs/benchmarks/rb_tree_2026-05-28.md.
+ *
+ * v1 uses extra_shift=0 (n*2+1, KK_TAG_BITS=1): the win is immediacy,
+ * not the fused-overflow add. Out-of-range Ints (|n| > 2^62) fall back
+ * to a heap KAI_INT — Koka's bigint path, identical shape. Every Int
+ * accessor below understands both forms, so the boxed↔unboxed frontier
+ * disappears: no re-box on a call boundary, comparison, or field read. */
+
+#define KAI_INT_TAG_BIT  ((intptr_t) 1)
+
+/* Bottom-bit discriminator — Koka kk_is_value / kk_is_ptr (kklib.h). */
+static inline int kai_is_value(KaiValue *v) {
+    return (((intptr_t) v) & KAI_INT_TAG_BIT) != 0;
+}
+static inline int kai_is_ptr(KaiValue *v) {
+    return v != NULL && (((intptr_t) v) & KAI_INT_TAG_BIT) == 0;
+}
+
+/* A `Handle` (an aligned LLVM C-API object pointer, owned by its LLVM
+ * context, never by RC) rides a boxed slot as an immediate: dup/drop on
+ * it are no-ops, and unboxing clears the bit. */
+static inline KaiValue *kai_handle_box(void *h) {
+    return (KaiValue *) ((uintptr_t) h | (uintptr_t) KAI_INT_TAG_BIT);
+}
+static inline void *kai_handle_unbox(KaiValue *v) {
+    return (void *) ((uintptr_t) v & ~(uintptr_t) KAI_INT_TAG_BIT);
+}
+
+/* Encode/decode a 63-bit immediate Int — Koka kk_integer_from_small /
+ * kk_smallint_from_integer (integer.h:206-215). Arithmetic >> keeps
+ * the sign. */
+static inline KaiValue *kai_tagged_int(int64_t n) {
+    /* Shift through uintptr_t: a signed left shift of a negative value
+     * is C UB (-fsanitize=undefined trips on it). The bit pattern is
+     * identical to the two's-complement signed shift, and kai_untag_int
+     * uses an arithmetic `>>` to restore the sign. */
+    return (KaiValue *) ((((uintptr_t) n) << 1) | (uintptr_t) KAI_INT_TAG_BIT);
+}
+static inline int64_t kai_untag_int(KaiValue *v) {
+    return ((intptr_t) v) >> 1;
+}
+
+/* The immediate range (63-bit on a 64-bit host). */
+#define KAI_SMALLINT_MAX ((int64_t) (INTPTR_MAX >> 1))
+#define KAI_SMALLINT_MIN ((int64_t) (INTPTR_MIN >> 1))
+static inline int kai_int_fits_immediate(int64_t n) {
+    return n >= KAI_SMALLINT_MIN && n <= KAI_SMALLINT_MAX;
+}
+
+/* ---------- head-type tag derivation ---------- */
+
+/* kai_head_tag — single-dispatch protocol dispatch key for any value.
+ * See docs/variant-tags.md "Head-type tags". O(1), cache-warm hot path. */
+static inline int32_t kai_head_tag(KaiValue *v) {
+    if (kai_is_value(v)) return KAI_HEAD_INT;   /* immediate small Int */
+    if (v == NULL) return KAI_HEAD_ANON;
+    switch ((KaiTag) v->tag) {
+        case KAI_UNIT:    return KAI_HEAD_UNIT;
+        case KAI_BOOL:    return KAI_HEAD_BOOL;
+        case KAI_INT:     return KAI_HEAD_INT;
+        case KAI_REAL:    return KAI_HEAD_REAL;
+        case KAI_CHAR:    return KAI_HEAD_CHAR;
+        case KAI_STR:     return KAI_HEAD_STRING;
+        case KAI_NIL:     return KAI_HEAD_LIST;
+        case KAI_CONS:    return KAI_HEAD_LIST;
+        case KAI_RANGE:   return KAI_HEAD_LIST;
+        case KAI_RECORD:  return v->as.rec.head_type_tag;
+        case KAI_VARIANT: {
+            int32_t vt = v->variant_tag;
+            if (vt >= 0 && vt < kai_variant_to_head_len) {
+                return kai_variant_to_head[vt];
+            }
+            return KAI_HEAD_ANON;
+        }
+        case KAI_CLOSURE: return KAI_HEAD_CLOSURE;
+        case KAI_ARRAY:   return KAI_HEAD_ARRAY;
+        case KAI_VEC:     return KAI_HEAD_VEC;
+        case KAI_REF:     return KAI_HEAD_ANON;  /* Ref is not protocol-dispatchable */
+        case KAI_FIBER:   return KAI_HEAD_FIBER;
+        case KAI_PID:     return KAI_HEAD_PID;
+        case KAI_FOREIGN: return KAI_HEAD_ANON;  /* opaque handle is not protocol-dispatchable (#417) */
+        case KAI_BYTE:    return KAI_HEAD_BYTE;
+        /* Fixed-width integers dispatch protocols at compile time (the
+         * typer resolves Show/Eq/Ord against the static type), so the
+         * runtime head tag is only consulted for a dynamically-typed
+         * box — there they ride the Int head, which is sound because no
+         * primitive carries a conflicting custom impl. */
+        case KAI_INT32:
+        case KAI_UINT32:
+        case KAI_UINT64:
+        case KAI_INT128:  return KAI_HEAD_INT;
+    }
+    return KAI_HEAD_ANON;
+}
+
+/* ---------- allocation and refcounting ---------- */
+
+/* Forward declarations used across sections. */
+static int       kai_op_truthy(KaiValue *v);
+
+/* Runtime tracing counters are written unconditionally (only the exit report
+ * is env-gated), and are READ across functions (the report, live-peak
+ * tracking). Under separate compilation the native-modular merge would inline
+ * counter-touching helpers into partitions, giving each its own copy —
+ * fragmenting the telemetry KAI_TRACE_RC prints. So they are ONE shared
+ * instance (external, owner-defined) under sep-comp, exactly like the runtime's
+ * other cross-function state. `KAI_RT_COUNTER(decl, init)` expands to the right
+ * linkage: extern everywhere + defined by the owner TU under sep-comp, else the
+ * self-contained `static ... = init`. */
+/* The counters are Class A (per-thread ledgers, summed at exit), so every
+ * form carries KAI_TLS — a _Thread_local extern resolves per thread to the
+ * owner's per-thread instance. Under one thread this is byte-identical. */
+#if defined(KAI_SEPARATE_COMPILATION)
+#  if defined(KAI_RUNTIME_OWNER)
+#    define KAI_RT_COUNTER(decl, init) extern KAI_TLS decl; KAI_TLS decl = init
+#  else
+#    define KAI_RT_COUNTER(decl, init) extern KAI_TLS decl
+#  endif
+#else
+#  define KAI_RT_COUNTER(decl, init) static KAI_TLS decl = init
+#endif
+
+#if defined(KAI_SEPARATE_COMPILATION)
+#  if defined(KAI_RUNTIME_OWNER)
+#    define KAI_RT_ATOMIC_COUNTER(n) extern _Atomic int64_t n; _Atomic int64_t n = 0
+#  else
+#    define KAI_RT_ATOMIC_COUNTER(n) extern _Atomic int64_t n
+#  endif
+#else
+#  define KAI_RT_ATOMIC_COUNTER(n) static _Atomic int64_t n = 0
+#endif
+#define KAI_CTR_INC(v) atomic_fetch_add_explicit(&(v), 1, memory_order_relaxed)
+
+/* Refcount tracing (m5 #0): always-compiled counters; the per-process
+   report at exit is gated on the env var KAI_TRACE_RC. The counters
+   add 4 increments per kai_alloc and 2 per kai_free_value — cheap
+   enough that the always-on path costs ~ns per allocation, but small
+   enough that we keep them on rather than ifdef'ing them in/out
+   (otherwise a measurement run would need a runtime rebuild). */
+KAI_RT_COUNTER(int64_t kai_rc_alloc_total, 0);
+KAI_RT_COUNTER(int64_t kai_rc_free_total, 0);
+KAI_RT_COUNTER(int64_t kai_rc_live_now, 0);
+KAI_RT_COUNTER(int64_t kai_rc_live_peak, 0);
+KAI_RT_COUNTER(int64_t kai_rc_alloc_by_tag[16], {0});
+/* issue #120 — opt-in Perceus regions. Dedicated arena counters,
+ * distinct from kai_rc_alloc_total / kai_rc_free_total so a region's
+ * bulk lifecycle is visible without polluting the per-value RC ledger.
+ * kai_arena_alloc_total counts KaiValue headers stamped by
+ * kai_arena_alloc; kai_arena_free_total counts the same headers
+ * reclaimed in bulk by kai_arena_free. The two must converge at exit
+ * exactly as alloc/free does — divergence flags a wrong-codegen silent
+ * leak (a non-region value mistakenly arena-allocated, invisible to
+ * ASAN because nothing is freed). Defined here, beside the RC ledger,
+ * so kai_rc_report() / kai_rc_strict_report() (below) can read them
+ * without a forward declaration; the arena machinery itself lives
+ * after the singletons. */
+KAI_RT_COUNTER(int64_t kai_arena_alloc_total, 0);
+KAI_RT_COUNTER(int64_t kai_arena_free_total, 0);
+/* issue #118 — Perceus reuse-in-place counter. Bumped by every
+ * successful in-place rewrite in kai_reuse_or_alloc_* (further down). */
+KAI_RT_COUNTER(int64_t kai_rc_reuse_total, 0);
+
+/* Vec uniqueness counters: writes that mutated a unique (rc == 1)
+ * buffer in place vs. writes that had to copy a shared one. */
+KAI_RT_COUNTER(int64_t kai_vec_inplace_total, 0);
+KAI_RT_COUNTER(int64_t kai_vec_cow_total, 0);
+
+/* The RC/vec trace ledgers are per-thread and summed at exit. A stale slot
+ * mis-attributes counts between threads — wrong telemetry, not corruption —
+ * but the address resolves exactly as the allocator slots do, so the
+ * bookkeeping is routed through noinline accessors on the same discipline: the
+ * slot is materialised and updated inside one activation, never spilled across
+ * a park. Grouped per event (one call per alloc/free) so the hot path pays one
+ * out-of-line hop, not one per counter. */
+__attribute__((noinline))
+static void kai_rc_count_alloc(int tag) {
+    kai_rc_alloc_total++;
+    kai_rc_live_now++;
+    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
+    if (tag >= 0 && tag < 16) kai_rc_alloc_by_tag[tag]++;
+}
+__attribute__((noinline))
+static void kai_rc_count_free(void) {
+    kai_rc_free_total++;
+    kai_rc_live_now--;
+}
+__attribute__((noinline))
+static void kai_rc_count_live_inc(void) {
+    kai_rc_live_now++;
+    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
+}
+__attribute__((noinline))
+static void kai_rc_count_live_sub(int64_t n) { kai_rc_live_now -= n; }
+__attribute__((noinline))
+static void kai_rc_count_reuse(void) { kai_rc_reuse_total++; }
+__attribute__((noinline))
+static void kai_vec_count_inplace(void) { kai_vec_inplace_total++; }
+__attribute__((noinline))
+static void kai_vec_count_cow(void) { kai_vec_cow_total++; }
+/* #2 parity probe — reuse-token DISPOSAL counter. Bumped by every
+ * kai_reuse_free, i.e. every arm-top token captured (UNIQUE scrutinee
+ * shell stolen) that the arm body could NOT donate to an in-frame
+ * kai_variant_at and therefore had to free. In the rb-tree this is the
+ * Black balance arm: `balance_left(insert_loop(l,...), ..., r)` allocates
+ * its rebuilt node inside balance_left's own frame, so the stolen Black
+ * cell crosses a function boundary the token cannot. This counter is the
+ * exact upper bound on what an interprocedural token-pass would recover —
+ * if it is small relative to alloc_total, #2 is not worth the ABI cost. */
+static KAI_TLS int64_t kai_rc_reuse_free_total = 0;
+/* #2 parity probe — kai_drop_reuse_token outcome split. unique = shell
+ * handed back (donatable); null_shared = rc>1 so cannot steal; null_mismatch
+ * = wrong tag/arity (e.g. RBLeaf scrutinee). Tells whether the wasted fresh
+ * allocs are a sharing problem (would need a different fix) or genuinely the
+ * inter-frame balance case (token-pass). */
+static KAI_TLS int64_t kai_rc_tok_unique = 0;
+static KAI_TLS int64_t kai_rc_tok_null_shared = 0;
+static KAI_TLS int64_t kai_rc_tok_null_mismatch = 0;
+/* Phase 1.B.1 — incref/decref call counters (the ones that actually
+ * touch `rc`; pinned/INT32_MAX short-circuits are NOT counted). Lets a
+ * borrow optimisation that elides incref/decref pairs show its effect
+ * directly (alloc_total is unchanged by a borrow — the head is never
+ * allocated, only refcounted). #812 — the increments are ALWAYS compiled
+ * (parallel to kai_rc_alloc_total), gated only by the KAI_TRACE_RC env var
+ * at report time; previously they sat behind -DKAI_TRACE_RC, so any binary
+ * built without that define (every `kai build` output) reported 0. */
+KAI_RT_ATOMIC_COUNTER(kai_rc_incref_total);
+KAI_RT_ATOMIC_COUNTER(kai_rc_decref_total);
+
+#ifdef KAI_TRACE_RC
+KAI_RT_COUNTER(int64_t kai_rc_free_by_tag[16], {0});
+#endif
+
+/* ---------- cross-thread ledger reduction ----------
+ *
+ * The counters above are Class A: per-thread TLS ledgers, so any one
+ * thread's copy is a partial total. Each scheduler thread registers a
+ * block of pointers to its TLS ledger on start; a thread that exits
+ * before the report folds its values into the process-wide accumulator
+ * (its TLS storage dies with it) and leaves the walk; the exit report
+ * reduces the fold plus every still-registered block. The hot
+ * incref/decref path never synchronizes. A block whose owner is still
+ * running is read without synchronization — tolerable in a diagnostic
+ * report, never in program state. */
+typedef struct {
+    int64_t alloc_total, free_total, live_peak;
+    int64_t alloc_by_tag[16];
+    int64_t arena_alloc_total, arena_free_total;
+    int64_t reuse_total, vec_inplace_total, vec_cow_total;
+    int64_t reuse_free_total, tok_unique, tok_null_shared, tok_null_mismatch;
+#ifdef KAI_TRACE_RC
+    int64_t free_by_tag[16];
+#endif
+} KaiRcLedgerSum;
+
+typedef struct KaiRcLedgerBlock {
+    const int64_t *alloc_total, *free_total, *live_peak;
+    const int64_t *alloc_by_tag;
+    const int64_t *arena_alloc_total, *arena_free_total;
+    const int64_t *reuse_total, *vec_inplace_total, *vec_cow_total;
+    const int64_t *reuse_free_total, *tok_unique, *tok_null_shared, *tok_null_mismatch;
+#ifdef KAI_TRACE_RC
+    const int64_t *free_by_tag;
+#endif
+    struct KaiRcLedgerBlock *next;
+} KaiRcLedgerBlock;
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiRcLedgerBlock *kai_rc_ledger_blocks;
+extern KaiRcLedgerSum kai_rc_ledger_folded;
+extern pthread_mutex_t kai_rc_ledger_mu;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiRcLedgerBlock *kai_rc_ledger_blocks = NULL;
+KaiRcLedgerSum kai_rc_ledger_folded;
+pthread_mutex_t kai_rc_ledger_mu = PTHREAD_MUTEX_INITIALIZER;
+#  endif
+#else
+static KaiRcLedgerBlock *kai_rc_ledger_blocks = NULL;
+static KaiRcLedgerSum kai_rc_ledger_folded;
+static pthread_mutex_t kai_rc_ledger_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+KAI_RT_COUNTER(KaiRcLedgerBlock *kai_rc_ledger_block, NULL);
+KAI_RT_COUNTER(int kai_rc_ledger_done, 0);
+
+/* Pointers are captured on the owning thread — that is what binds each
+ * field to THIS thread's TLS instance. */
+static void kai_rc_ledger_fill(KaiRcLedgerBlock *b) {
+    b->alloc_total       = &kai_rc_alloc_total;
+    b->free_total        = &kai_rc_free_total;
+    b->live_peak         = &kai_rc_live_peak;
+    b->alloc_by_tag      = kai_rc_alloc_by_tag;
+    b->arena_alloc_total = &kai_arena_alloc_total;
+    b->arena_free_total  = &kai_arena_free_total;
+    b->reuse_total       = &kai_rc_reuse_total;
+    b->vec_inplace_total = &kai_vec_inplace_total;
+    b->vec_cow_total     = &kai_vec_cow_total;
+    b->reuse_free_total  = &kai_rc_reuse_free_total;
+    b->tok_unique        = &kai_rc_tok_unique;
+    b->tok_null_shared   = &kai_rc_tok_null_shared;
+    b->tok_null_mismatch = &kai_rc_tok_null_mismatch;
+#ifdef KAI_TRACE_RC
+    b->free_by_tag       = kai_rc_free_by_tag;
+#endif
+}
+
+static void kai_rc_ledger_add(KaiRcLedgerSum *s, const KaiRcLedgerBlock *b) {
+    s->alloc_total       += *b->alloc_total;
+    s->free_total        += *b->free_total;
+    s->live_peak         += *b->live_peak;
+    for (int i = 0; i < 16; i++) s->alloc_by_tag[i] += b->alloc_by_tag[i];
+    s->arena_alloc_total += *b->arena_alloc_total;
+    s->arena_free_total  += *b->arena_free_total;
+    s->reuse_total       += *b->reuse_total;
+    s->vec_inplace_total += *b->vec_inplace_total;
+    s->vec_cow_total     += *b->vec_cow_total;
+    s->reuse_free_total  += *b->reuse_free_total;
+    s->tok_unique        += *b->tok_unique;
+    s->tok_null_shared   += *b->tok_null_shared;
+    s->tok_null_mismatch += *b->tok_null_mismatch;
+#ifdef KAI_TRACE_RC
+    for (int i = 0; i < 16; i++) s->free_by_tag[i] += b->free_by_tag[i];
+#endif
+}
+
+static __attribute__((noinline)) void kai_rc_ledger_register(void) {
+    if (kai_rc_ledger_block || kai_rc_ledger_done) return;
+    KaiRcLedgerBlock *b = (KaiRcLedgerBlock *) calloc(1, sizeof *b);
+    if (!b) return;
+    kai_rc_ledger_fill(b);
+    pthread_mutex_lock(&kai_rc_ledger_mu);
+    b->next = kai_rc_ledger_blocks;
+    kai_rc_ledger_blocks = b;
+    pthread_mutex_unlock(&kai_rc_ledger_mu);
+    kai_rc_ledger_block = b;
+}
+
+/* Thread teardown: the ledger folds into the accumulator and the block
+ * leaves the walk, so an exited thread's counts survive it. */
+static __attribute__((noinline)) void kai_rc_ledger_fold(void) {
+    if (kai_rc_ledger_done) return;
+    kai_rc_ledger_done = 1;
+    KaiRcLedgerBlock own;
+    kai_rc_ledger_fill(&own);
+    KaiRcLedgerBlock *b = kai_rc_ledger_block;
+    pthread_mutex_lock(&kai_rc_ledger_mu);
+    kai_rc_ledger_add(&kai_rc_ledger_folded, &own);
+    if (b) {
+        KaiRcLedgerBlock **p = &kai_rc_ledger_blocks;
+        while (*p && *p != b) p = &(*p)->next;
+        if (*p) *p = b->next;
+    }
+    pthread_mutex_unlock(&kai_rc_ledger_mu);
+    free(b);
+    kai_rc_ledger_block = NULL;
+}
+
+static __attribute__((noinline)) void kai_rc_ledger_sum(KaiRcLedgerSum *s) {
+    kai_rc_ledger_register();
+    pthread_mutex_lock(&kai_rc_ledger_mu);
+    *s = kai_rc_ledger_folded;
+    for (KaiRcLedgerBlock *b = kai_rc_ledger_blocks; b; b = b->next) {
+        kai_rc_ledger_add(s, b);
+    }
+    pthread_mutex_unlock(&kai_rc_ledger_mu);
+}
+
+static const char *kai_rc_tag_name(int t) {
+    switch (t) {
+        case KAI_UNIT:    return "unit";
+        case KAI_BOOL:    return "bool";
+        case KAI_INT:     return "int";
+        case KAI_REAL:    return "real";
+        case KAI_CHAR:    return "char";
+        case KAI_STR:     return "str";
+        case KAI_NIL:     return "nil";
+        case KAI_CONS:    return "cons";
+        case KAI_RECORD:  return "record";
+        case KAI_VARIANT: return "variant";
+        case KAI_CLOSURE: return "closure";
+        case KAI_ARRAY:   return "array";
+        case KAI_VEC:     return "vec";
+        case KAI_REF:     return "ref";
+        case KAI_BYTE:      return "Byte";
+        case KAI_INT32:     return "Int32";
+        case KAI_UINT32:    return "UInt32";
+        case KAI_UINT64:    return "UInt64";
+        case KAI_INT128:    return "Int128";
+        case KAI_RANGE:     return "range";
+        default:          return "?";
+    }
+}
+
+static void kai_rc_report(void) {
+    if (!getenv("KAI_TRACE_RC")) return;
+    KaiRcLedgerSum s;
+    kai_rc_ledger_sum(&s);
+    int64_t leaked = s.alloc_total - s.free_total;
+    fprintf(stderr,
+        "[KAI_TRACE_RC] alloc_total=%lld free_total=%lld leaked=%lld live_peak=%lld\n",
+        (long long) s.alloc_total,
+        (long long) s.free_total,
+        (long long) leaked,
+        (long long) s.live_peak);
+    for (int i = 0; i < 16; i++) {
+        if (s.alloc_by_tag[i] > 0) {
+            fprintf(stderr, "[KAI_TRACE_RC]   tag %-7s allocs=%lld\n",
+                    kai_rc_tag_name(i),
+                    (long long) s.alloc_by_tag[i]);
+        }
+    }
+    /* issue #118 — Perceus reuse-in-place counter. */
+    if (s.reuse_total > 0) {
+        fprintf(stderr, "[KAI_TRACE_RC]   reuse_in_place=%lld\n",
+                (long long) s.reuse_total);
+    }
+    if (s.vec_inplace_total > 0 || s.vec_cow_total > 0) {
+        fprintf(stderr, "[KAI_TRACE_RC]   vec_inplace=%lld vec_cow=%lld\n",
+                (long long) s.vec_inplace_total,
+                (long long) s.vec_cow_total);
+    }
+    /* #2 parity probe — tokens captured but freed (could not donate in
+     * frame). Upper bound on interprocedural-token-pass recovery. */
+    if (s.reuse_free_total > 0) {
+        fprintf(stderr, "[KAI_TRACE_RC]   reuse_freed=%lld\n",
+                (long long) s.reuse_free_total);
+    }
+    /* #2 parity probe — token-drop outcome split. */
+    if (s.tok_unique > 0 || s.tok_null_shared > 0 ||
+        s.tok_null_mismatch > 0) {
+        fprintf(stderr,
+            "[KAI_TRACE_RC]   tok_unique=%lld tok_null_shared=%lld tok_null_mismatch=%lld\n",
+            (long long) s.tok_unique,
+            (long long) s.tok_null_shared,
+            (long long) s.tok_null_mismatch);
+    }
+    /* Phase 1.B.1 — RC traffic (rc-touching incref/decref calls). */
+    fprintf(stderr, "[KAI_TRACE_RC]   incref_total=%lld decref_total=%lld\n",
+            (long long) kai_rc_incref_total,
+            (long long) kai_rc_decref_total);
+    /* issue #120 — region arena lifecycle. arena_live != 0 at exit
+     * flags a wrong-codegen silent leak (a non-region value mistakenly
+     * arena-allocated, which never frees and which ASAN cannot see). */
+    if (s.arena_alloc_total > 0 || s.arena_free_total > 0) {
+        fprintf(stderr,
+            "[KAI_TRACE_RC]   arena_alloc=%lld arena_free=%lld arena_live=%lld\n",
+            (long long) s.arena_alloc_total,
+            (long long) s.arena_free_total,
+            (long long) (s.arena_alloc_total - s.arena_free_total));
+    }
+}
+
+KAI_RT_COUNTER(int kai_rc_registered, 0);
+static void kai_rc_register_once(void) {
+    if (kai_rc_registered) return;
+    kai_rc_registered = 1;
+    atexit(kai_rc_report);
+}
+
+/* Strict alloc tracing — Track #2 of issue #291.
+ *
+ * Build with `-DKAI_TRACE_RC=1` to enable diagnostics that surface RC
+ * imbalances on macOS the same way glibc's tcache strict check does on
+ * Linux (`malloc(): unaligned tcache chunk detected`). Without the
+ * flag, the runtime keeps the cheap always-on counters above and adds
+ * zero overhead.
+ *
+ * Three facilities, layered:
+ *
+ * 1. Per-tag free counters (kai_rc_free_by_tag). Pairs with
+ *    kai_rc_alloc_by_tag so the report can show allocs/frees/live
+ *    per tag at exit. live != 0 → leak. frees > allocs → double-free.
+ *
+ * 2. Sentinel-on-free. Just before free(v) in kai_free_value the
+ *    chunk's bytes are stamped with 0xDEADBEEFDEADBEEF. macOS's
+ *    malloc happily reuses the chunk, but any read through a stale
+ *    pointer that was already decref'd surfaces the recognizable
+ *    poison pattern (e.g. `tag = 0xEFBE...`, `rc = 0xDEADBEEF`)
+ *    instead of stale-but-plausible content.
+ *
+ * 3. Optional per-chunk history (KAI_RC_HISTORY=1 env var). Records
+ *    a small ring buffer of (chunk, op, tag) tuples covering alloc /
+ *    incref / decref / free. Heavy — opt-in only — but lets a post
+ *    mortem trace which tag's RC drifted.
+ *
+ * Reporting:
+ * - Without -DKAI_TRACE_RC=1: existing env-gated KAI_TRACE_RC=1
+ *   report (allocs only).
+ * - With -DKAI_TRACE_RC=1: report fires unconditionally at exit
+ *   unless KAI_TRACE_RC_QUIET=1 is set; per-tag allocs, frees, and
+ *   live are all printed.
+ */
+#ifdef KAI_TRACE_RC
+
+#define KAI_RC_SENTINEL_U64 ((uint64_t) 0xDEADBEEFDEADBEEFULL)
+
+/* Optional per-chunk history. Ring buffer; KAI_RC_HISTORY=1 enables
+ * recording. Capacity is generous enough for the kaic2 self-compile
+ * working set without ballooning memory. Indexed by (counter %
+ * KAI_RC_HISTORY_CAP) so older entries get overwritten. */
+#define KAI_RC_HISTORY_CAP 65536
+typedef struct {
+    void   *chunk;
+    int32_t op;     /* 0=alloc, 1=incref, 2=decref, 3=free */
+    int32_t tag;
+} KaiRcHistoryEntry;
+static KAI_TLS KaiRcHistoryEntry kai_rc_history[KAI_RC_HISTORY_CAP];
+static KAI_TLS uint64_t kai_rc_history_count = 0;
+static int      kai_rc_history_enabled_cached = -1; /* lazy: -1 unread, 0 off, 1 on */
+
+static int kai_rc_history_enabled(void) {
+    if (kai_rc_history_enabled_cached < 0) {
+        const char *e = getenv("KAI_RC_HISTORY");
+        kai_rc_history_enabled_cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return kai_rc_history_enabled_cached;
+}
+
+static void kai_rc_history_log(void *chunk, int32_t op, int32_t tag) {
+    if (!kai_rc_history_enabled()) return;
+    uint64_t i = kai_rc_history_count++ % KAI_RC_HISTORY_CAP;
+    kai_rc_history[i].chunk = chunk;
+    kai_rc_history[i].op    = op;
+    kai_rc_history[i].tag   = tag;
+}
+
+static const char *kai_rc_op_name(int32_t op) {
+    switch (op) {
+        case 0: return "alloc";
+        case 1: return "incref";
+        case 2: return "decref";
+        case 3: return "free";
+        default: return "?";
+    }
+}
+
+static void kai_rc_strict_report(void) {
+    if (getenv("KAI_TRACE_RC_QUIET")) return;
+    KaiRcLedgerSum s;
+    kai_rc_ledger_sum(&s);
+    int64_t leaked = s.alloc_total - s.free_total;
+    fprintf(stderr,
+        "[KAI_TRACE_RC] STRICT alloc_total=%lld free_total=%lld leaked=%lld live_peak=%lld\n",
+        (long long) s.alloc_total,
+        (long long) s.free_total,
+        (long long) leaked,
+        (long long) s.live_peak);
+    for (int i = 0; i < 16; i++) {
+        int64_t a = s.alloc_by_tag[i];
+        int64_t f = s.free_by_tag[i];
+        if (a == 0 && f == 0) continue;
+        int64_t live = a - f;
+        const char *flag =
+            (live != 0)              ? " LEAK"     :
+            (f > a)                  ? " DOUBLE"   : "";
+        fprintf(stderr,
+            "[KAI_TRACE_RC] tag=%-7s allocs=%lld frees=%lld live=%lld%s\n",
+            kai_rc_tag_name(i),
+            (long long) a, (long long) f, (long long) live, flag);
+    }
+    /* issue #120 — region arena lifecycle under strict tracing. A
+     * non-zero arena_live is the ONLY visible signal of a wrong-codegen
+     * silent leak: arena memory is reclaimed in bulk without a free
+     * walk, so ASAN sees no use-after-free and the per-tag table above
+     * never moves for arena values. */
+    if (s.arena_alloc_total > 0 || s.arena_free_total > 0) {
+        int64_t arena_live = s.arena_alloc_total - s.arena_free_total;
+        const char *aflag = (arena_live != 0) ? " LEAK"
+                          : (s.arena_free_total > s.arena_alloc_total) ? " DOUBLE"
+                          : "";
+        fprintf(stderr,
+            "[KAI_TRACE_RC] arena   allocs=%lld frees=%lld live=%lld%s\n",
+            (long long) s.arena_alloc_total,
+            (long long) s.arena_free_total,
+            (long long) arena_live, aflag);
+    }
+    if (kai_rc_history_enabled() && kai_rc_history_count > 0) {
+        uint64_t total = kai_rc_history_count;
+        uint64_t shown = total < KAI_RC_HISTORY_CAP ? total : KAI_RC_HISTORY_CAP;
+        fprintf(stderr,
+            "[KAI_TRACE_RC] history total=%llu showing last=%llu\n",
+            (unsigned long long) total, (unsigned long long) shown);
+        uint64_t start = total > KAI_RC_HISTORY_CAP ? total - KAI_RC_HISTORY_CAP : 0;
+        for (uint64_t k = start; k < total; k++) {
+            KaiRcHistoryEntry *e = &kai_rc_history[k % KAI_RC_HISTORY_CAP];
+            fprintf(stderr, "[KAI_TRACE_RC] hist %s chunk=%p tag=%s\n",
+                kai_rc_op_name(e->op), e->chunk,
+                kai_rc_tag_name(e->tag));
+        }
+    }
+}
+
+static KAI_TLS int kai_rc_strict_registered = 0;
+static void kai_rc_strict_register_once(void) {
+    if (kai_rc_strict_registered) return;
+    kai_rc_strict_registered = 1;
+    atexit(kai_rc_strict_report);
+}
+
+/* ---------- issue #296: per-call-site leak attribution ----------
+ *
+ * Open-addressing hash table from caller return-address to per-site
+ * (alloc, free) counters. Keyed by `void *` (the return address of
+ * the kai_alloc invocation, captured via __builtin_return_address(0)
+ * inside each wrapper that calls kai_alloc — wrappers are marked
+ * KAI_RC_NOINLINE so the address is the real emit site, not an
+ * inlined parent).
+ *
+ * Sized at 16 K buckets — empirically the kaic2 selfhost emits
+ * fewer than ~3 K distinct alloc sites, so load factor stays under
+ * 20 %. Linear probing; the table is never resized. Saturates if
+ * full (drops the site silently — the histogram becomes lossy
+ * rather than corrupt).
+ *
+ * Per-chunk attribution: the alloc site is stored in the chunk's
+ * `alloc_site` field (added under #ifdef KAI_TRACE_RC at the top
+ * of struct KaiValue). On free, kai_free_value reads it back to
+ * decrement the matching site's free counter. Cost: one extra word
+ * per chunk under KAI_TRACE_RC (vanilla builds keep the original
+ * two-word header). */
+
+#define KAI_RC_SITE_BUCKETS 16384
+
+typedef struct {
+    void   *site;     /* return address; NULL = empty bucket */
+    int32_t tag;      /* dominant tag observed at this site */
+    int64_t allocs;
+    int64_t frees;
+} KaiRcSite;
+
+static KAI_TLS KaiRcSite kai_rc_sites[KAI_RC_SITE_BUCKETS];
+static KAI_TLS int       kai_rc_sites_count = 0;
+static KAI_TLS int       kai_rc_sites_full  = 0;  /* sticky: a probe overflowed */
+
+/* Hash a pointer using a fast mix (Knuth-style). The high bits of
+ * a return address carry the most variance, so we shift before
+ * masking. */
+static uint32_t kai_rc_site_hash(void *p) {
+    uintptr_t x = (uintptr_t) p;
+    x ^= x >> 33;
+    x *= (uintptr_t) 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return (uint32_t) (x & (KAI_RC_SITE_BUCKETS - 1));
+}
+
+/* Find or insert. Returns NULL on overflow (table saturated).
+ * Otherwise returns a pointer to the bucket (caller may mutate). */
+static KaiRcSite *kai_rc_site_lookup(void *site, int32_t tag, int insert) {
+    if (site == NULL) return NULL;
+    uint32_t mask = KAI_RC_SITE_BUCKETS - 1;
+    uint32_t h = kai_rc_site_hash(site);
+    for (uint32_t i = 0; i < KAI_RC_SITE_BUCKETS; i++) {
+        uint32_t k = (h + i) & mask;
+        KaiRcSite *b = &kai_rc_sites[k];
+        if (b->site == site) return b;
+        if (b->site == NULL) {
+            if (!insert) return NULL;
+            b->site = site;
+            b->tag  = tag;
+            kai_rc_sites_count++;
+            return b;
+        }
+    }
+    kai_rc_sites_full = 1;
+    return NULL;
+}
+
+static void kai_rc_site_record_alloc(void *site, int32_t tag) {
+    KaiRcSite *b = kai_rc_site_lookup(site, tag, 1);
+    if (b) b->allocs++;
+}
+
+static void kai_rc_site_record_free(void *site) {
+    KaiRcSite *b = kai_rc_site_lookup(site, 0, 0);
+    if (b) b->frees++;
+}
+
+/* qsort comparator: descending by leak count (allocs - frees). */
+static int kai_rc_site_cmp_leak(const void *a, const void *b) {
+    const KaiRcSite *x = (const KaiRcSite *) a;
+    const KaiRcSite *y = (const KaiRcSite *) b;
+    int64_t lx = x->allocs - x->frees;
+    int64_t ly = y->allocs - y->frees;
+    if (ly > lx) return 1;
+    if (ly < lx) return -1;
+    return 0;
+}
+
+/* On macOS, addresses captured via __builtin_return_address(0) are
+ * post-ASLR. Print the dyld slide so post-mortem symbolization with
+ * `atos -l <load>` can recover symbol names. On other platforms the
+ * slide is treated as 0. */
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+static intptr_t kai_rc_aslr_slide(void) {
+    return _dyld_get_image_vmaddr_slide(0);
+}
+#else
+static intptr_t kai_rc_aslr_slide(void) { return 0; }
+#endif
+
+static void kai_rc_site_report(void) {
+    if (getenv("KAI_TRACE_RC_QUIET")) return;
+    if (kai_rc_sites_count == 0) return;
+
+    /* Default top 20; KAI_TRACE_RC_TOP=N overrides. */
+    int top_n = 20;
+    const char *e = getenv("KAI_TRACE_RC_TOP");
+    if (e && e[0]) {
+        int n = atoi(e);
+        if (n > 0) top_n = n;
+    }
+
+    /* Compact non-empty buckets into a contiguous array for sort. */
+    KaiRcSite *flat = (KaiRcSite *) malloc(
+        (size_t) kai_rc_sites_count * sizeof(KaiRcSite));
+    if (!flat) return;
+    int n = 0;
+    int64_t total_leak = 0;
+    for (int i = 0; i < KAI_RC_SITE_BUCKETS; i++) {
+        if (kai_rc_sites[i].site != NULL) {
+            flat[n++] = kai_rc_sites[i];
+            int64_t live = kai_rc_sites[i].allocs - kai_rc_sites[i].frees;
+            if (live > 0) total_leak += live;
+        }
+    }
+    qsort(flat, (size_t) n, sizeof(KaiRcSite), kai_rc_site_cmp_leak);
+
+    fprintf(stderr,
+        "[KAI_TRACE_RC] top sites by leak (showing %d of %d distinct sites; total_leak=%lld%s)\n",
+        top_n < n ? top_n : n, n, (long long) total_leak,
+        kai_rc_sites_full ? "; TABLE SATURATED" : "");
+    fprintf(stderr,
+        "[KAI_TRACE_RC] aslr_slide=%p (subtract from site addresses for static symbolization)\n",
+        (void *) kai_rc_aslr_slide());
+    int limit = top_n < n ? top_n : n;
+    for (int i = 0; i < limit; i++) {
+        KaiRcSite *s = &flat[i];
+        int64_t live = s->allocs - s->frees;
+        double pct = s->allocs > 0
+            ? (100.0 * (double) live / (double) s->allocs) : 0.0;
+        double share = total_leak > 0
+            ? (100.0 * (double) live / (double) total_leak) : 0.0;
+        fprintf(stderr,
+            "[KAI_TRACE_RC] site %2d %p tag=%-7s allocs=%lld frees=%lld leak=%lld leak%%=%.1f share%%=%.1f\n",
+            i + 1, s->site, kai_rc_tag_name(s->tag),
+            (long long) s->allocs, (long long) s->frees, (long long) live,
+            pct, share);
+    }
+    free(flat);
+}
+
+static KAI_TLS int kai_rc_site_registered = 0;
+static void kai_rc_site_register_once(void) {
+    if (kai_rc_site_registered) return;
+    kai_rc_site_registered = 1;
+    atexit(kai_rc_site_report);
+}
+
+/* Wrappers that ultimately call kai_alloc must NOT be inlined when
+ * tracing is enabled — otherwise __builtin_return_address(0) inside
+ * the wrapper points at the wrapper's parent's parent, not the
+ * real emit site. Vanilla builds drop the attribute (zero overhead). */
+#define KAI_RC_NOINLINE __attribute__((noinline))
+
+/* ---------- Lane DIAG (#293): per-leak-site attribution ----------
+ *
+ * Aim: map every leaked chunk back to the kaikai source function that
+ * allocated it, so the fix lane (Lane FIX) can rank scope_fns by leak
+ * volume and patch the missing decrefs in their emit shapes.
+ *
+ * Two pieces of state at alloc time:
+ *  - `kai_current_scope_fn`: the kaikai fn currently executing,
+ *    set by the emitter via `kai_set_scope_fn(<name>)` at the top
+ *    of every generated body. Static (the kaic2 self-compile is
+ *    single-threaded). Inherits from the caller for fns that don't
+ *    yet carry the hook (dispatch from core / FFI), so the
+ *    attribution remains stable across mixed call paths.
+ *  - allocator tag (KAI_VARIANT, KAI_RECORD, …): captured from
+ *    `kai_alloc_traced`'s `tag` parameter.
+ *
+ * Aggregation is keyed on `(scope_fn, tag)`. Per-chunk metadata stays
+ * to one extra pointer (`scope_fn` field on KaiValue under
+ * KAI_TRACE_RC_LEAKSITE); the agg table is a fixed open-addressed
+ * hash sized at 8 K buckets — empirically the kaic2 self-compile
+ * has ≤ ~600 unique kaikai fn names, so worst-case load factor is
+ * ~8 % across (fn × 13 tags). */
+#ifdef KAI_TRACE_RC_LEAKSITE
+
+static KAI_TLS const char *kai_current_scope_fn = "<root>";
+
+static void kai_set_scope_fn(const char *name) {
+    kai_current_scope_fn = (name != NULL) ? name : "<root>";
+}
+
+/* The scope is restored on the way out: without it a leaf callee's name
+ * stays current and the caller's later allocations are billed to the
+ * leaf, which silently invents alloc sites and hides real ones. */
+typedef struct { const char *prev; } KaiScopeGuard;
+
+static KaiScopeGuard kai_scope_enter(const char *name) {
+    KaiScopeGuard g;
+    g.prev = kai_current_scope_fn;
+    kai_set_scope_fn(name);
+    return g;
+}
+
+static KaiValue *kai_scope_leave(KaiScopeGuard g, KaiValue *v) {
+    kai_current_scope_fn = g.prev;
+    return v;
+}
+
+#define KAI_LEAKSITE_BUCKETS 8192
+
+typedef struct {
+    const char *scope_fn;   /* NULL = empty bucket */
+    int32_t     tag;
+    int64_t     allocs;
+    int64_t     frees;
+} KaiLeakSite;
+
+static KAI_TLS KaiLeakSite kai_leaksites[KAI_LEAKSITE_BUCKETS];
+static KAI_TLS int         kai_leaksites_count = 0;
+static KAI_TLS int         kai_leaksites_full  = 0;
+
+static uint32_t kai_leaksite_hash(const char *scope, int32_t tag) {
+    uintptr_t x = (uintptr_t) scope;
+    x ^= (uintptr_t) ((uint32_t) tag * 0x9E3779B1u);
+    x ^= x >> 33;
+    x *= (uintptr_t) 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return (uint32_t) (x & (KAI_LEAKSITE_BUCKETS - 1));
+}
+
+static KaiLeakSite *kai_leaksite_lookup(const char *scope, int32_t tag, int insert) {
+    if (scope == NULL) scope = "<unknown>";
+    uint32_t mask = KAI_LEAKSITE_BUCKETS - 1;
+    uint32_t h = kai_leaksite_hash(scope, tag);
+    for (uint32_t i = 0; i < KAI_LEAKSITE_BUCKETS; i++) {
+        uint32_t k = (h + i) & mask;
+        KaiLeakSite *b = &kai_leaksites[k];
+        if (b->scope_fn == scope && b->tag == tag) return b;
+        if (b->scope_fn == NULL) {
+            if (!insert) return NULL;
+            b->scope_fn = scope;
+            b->tag      = tag;
+            kai_leaksites_count++;
+            return b;
+        }
+    }
+    kai_leaksites_full = 1;
+    return NULL;
+}
+
+static void kai_leaksite_record_alloc(const char *scope, int32_t tag) {
+    KaiLeakSite *b = kai_leaksite_lookup(scope, tag, 1);
+    if (b) b->allocs++;
+}
+
+static void kai_leaksite_record_free(const char *scope, int32_t tag) {
+    KaiLeakSite *b = kai_leaksite_lookup(scope, tag, 0);
+    if (b) b->frees++;
+}
+
+static const char *kai_leaksite_alloc_fn(int32_t tag) {
+    switch (tag) {
+        case KAI_VARIANT: return "kai_variant";
+        case KAI_RECORD:  return "kai_record";
+        case KAI_CONS:    return "kai_cons";
+        case KAI_STR:     return "kai_str";
+        case KAI_INT:     return "kai_int";
+        case KAI_REAL:    return "kai_real";
+        case KAI_CHAR:    return "kai_char";
+        case KAI_CLOSURE: return "kai_closure";
+        case KAI_ARRAY:   return "kai_array";
+        case KAI_VEC:     return "kai_vec";
+        case KAI_BOOL:    return "kai_bool";
+        case KAI_UNIT:    return "kai_unit";
+        case KAI_NIL:     return "kai_nil";
+        case KAI_FIBER:   return "kai_fiber";
+        case KAI_PID:     return "kai_pid";
+        case KAI_BYTE:      return "kai_byte";
+        case KAI_INT32:     return "kai_int32";
+        case KAI_UINT32:    return "kai_uint32";
+        case KAI_UINT64:    return "kai_uint64";
+        case KAI_INT128:    return "kai_int128";
+        default:          return "kai_alloc";
+    }
+}
+
+static int kai_leaksite_cmp_leak(const void *a, const void *b) {
+    const KaiLeakSite *x = (const KaiLeakSite *) a;
+    const KaiLeakSite *y = (const KaiLeakSite *) b;
+    int64_t lx = x->allocs - x->frees;
+    int64_t ly = y->allocs - y->frees;
+    if (ly > lx) return 1;
+    if (ly < lx) return -1;
+    return 0;
+}
+
+static void kai_leaksite_report(void) {
+    if (getenv("KAI_TRACE_RC_QUIET")) return;
+    if (kai_leaksites_count == 0) return;
+
+    int top_n = 20;
+    const char *e = getenv("KAI_TRACE_RC_LEAKSITE_TOP");
+    if (e && e[0]) {
+        int n = atoi(e);
+        if (n > 0) top_n = n;
+    }
+
+    KaiLeakSite *flat = (KaiLeakSite *) malloc(
+        (size_t) kai_leaksites_count * sizeof(KaiLeakSite));
+    if (!flat) return;
+    int n = 0;
+    int64_t total_leak = 0;
+    int64_t per_tag_leak[16] = {0};
+    for (int i = 0; i < KAI_LEAKSITE_BUCKETS; i++) {
+        if (kai_leaksites[i].scope_fn != NULL) {
+            flat[n++] = kai_leaksites[i];
+            int64_t live = kai_leaksites[i].allocs - kai_leaksites[i].frees;
+            if (live > 0) {
+                total_leak += live;
+                int t = kai_leaksites[i].tag;
+                if (t >= 0 && t < 16) per_tag_leak[t] += live;
+            }
+        }
+    }
+    qsort(flat, (size_t) n, sizeof(KaiLeakSite), kai_leaksite_cmp_leak);
+
+    int limit = top_n < n ? top_n : n;
+    fprintf(stderr,
+        "[KAI_TRACE_RC_LEAKSITE] top sites by leak (showing %d of %d distinct (scope_fn,tag); total_leak=%lld%s)\n",
+        limit, n, (long long) total_leak,
+        kai_leaksites_full ? "; TABLE SATURATED" : "");
+    fprintf(stderr,
+        "[KAI_TRACE_RC_LEAKSITE] columns: rank | alloc_fn | scope_fn | allocs | frees | leak | leak%% | share%%\n");
+    for (int i = 0; i < limit; i++) {
+        KaiLeakSite *s = &flat[i];
+        int64_t live = s->allocs - s->frees;
+        double pct = s->allocs > 0
+            ? (100.0 * (double) live / (double) s->allocs) : 0.0;
+        double share = total_leak > 0
+            ? (100.0 * (double) live / (double) total_leak) : 0.0;
+        fprintf(stderr,
+            "[KAI_TRACE_RC_LEAKSITE] %2d | %-11s | %-40s | %10lld | %10lld | %10lld | %5.1f | %5.1f\n",
+            i + 1,
+            kai_leaksite_alloc_fn(s->tag),
+            s->scope_fn,
+            (long long) s->allocs,
+            (long long) s->frees,
+            (long long) live,
+            pct, share);
+    }
+    /* Per-tag totals so checkpoint 2 (sum-by-alloc_fn vs per-tag totals)
+     * can be verified at a glance from the same dump. */
+    fprintf(stderr,
+        "[KAI_TRACE_RC_LEAKSITE] per-tag leak totals (sum across all scope_fns):\n");
+    for (int t = 0; t < 16; t++) {
+        if (per_tag_leak[t] != 0) {
+            fprintf(stderr,
+                "[KAI_TRACE_RC_LEAKSITE]   tag=%-7s leak=%lld\n",
+                kai_rc_tag_name(t), (long long) per_tag_leak[t]);
+        }
+    }
+    free(flat);
+}
+
+static KAI_TLS int kai_leaksite_registered = 0;
+static void kai_leaksite_register_once(void) {
+    if (kai_leaksite_registered) return;
+    kai_leaksite_registered = 1;
+    atexit(kai_leaksite_report);
+}
+
+#define KAI_SCOPE_LEAVE(v) kai_scope_leave(_kai_sg, (v))
+
+#endif /* KAI_TRACE_RC_LEAKSITE */
+
+#endif /* KAI_TRACE_RC */
+
+#ifndef KAI_SCOPE_LEAVE
+#define KAI_SCOPE_LEAVE(v) (v)
+#endif
+
+#ifndef KAI_TRACE_RC
+#define KAI_RC_NOINLINE
+#endif
+
+/* ---------- KAI_PROFILE_RC — per-category wall breakdown (lane #426)
+ *
+ * Independent of KAI_TRACE_RC. Times the four hot RC functions with
+ * `clock_gettime(CLOCK_MONOTONIC)` and prints a per-category summary
+ * at exit. Used to attribute the 16× C wall on the RB-tree benchmark
+ * (docs/benchmarks/rb_tree_2026-05-09.md) to alloc / free / non-free
+ * RC traffic, so the team can scope Phase 4 (variant-field unboxing)
+ * vs drop-specialisation correctly.
+ *
+ * Build with `-DKAI_PROFILE_RC=1` to compile the wrappers in. Output
+ * gates on env var KAI_PROFILE_RC=1 at run time so a single binary
+ * can be timed with and without the report. Vanilla builds compile
+ * to empty hooks and add zero overhead.
+ *
+ * Categories:
+ *   - alloc    — time inside `kai_alloc` (the leaf calloc + bookkeep).
+ *   - free     — time inside `kai_free_value` (the actual free + the
+ *                cascading decrefs on contained children).
+ *   - decref   — time inside `kai_decref` for every call that reaches
+ *                the rc-- path (skips NULL and singleton early exits).
+ *                Includes time spent calling `kai_free_value`; subtract
+ *                the free total to get pure non-free RC traffic.
+ *   - incref   — time inside `kai_incref` for every call that reaches
+ *                the rc++ path (skips NULL and singleton early exits).
+ *
+ * clock_gettime(CLOCK_MONOTONIC) costs ~30 ns per call on macOS — at
+ * ~25 M decrefs the instrumentation inflates the wall by ~1.5 s on
+ * the RB-tree benchmark. Per-category PROPORTIONS remain robust;
+ * absolute milliseconds under -DKAI_PROFILE_RC are not directly
+ * comparable to the un-instrumented wall. The exit report prints the
+ * instrumented wall alongside the categories so the gap is visible.
+ *
+ * Match dispatch is NOT a separate category — pattern test and
+ * field-extract are emitted inline by the codegen (see
+ * `_scr->variant_tag` reads in compiler-emitted C), so there
+ * is no central function to wrap. It folds into the un-attributed
+ * "other" bucket alongside everything else (calls, arithmetic,
+ * stack management).
+ */
+#ifdef KAI_PROFILE_RC
+#include <time.h>
+
+static KAI_TLS int64_t kai_prof_alloc_ns   = 0;
+static KAI_TLS int64_t kai_prof_free_ns    = 0;
+static KAI_TLS int64_t kai_prof_incref_ns  = 0;
+static KAI_TLS int64_t kai_prof_decref_ns  = 0;
+static KAI_TLS int64_t kai_prof_alloc_n    = 0;
+static KAI_TLS int64_t kai_prof_free_n     = 0;
+static KAI_TLS int64_t kai_prof_incref_n   = 0;
+static KAI_TLS int64_t kai_prof_decref_n   = 0;
+static KAI_TLS int64_t kai_prof_decref_to_zero_n = 0;
+static KAI_TLS struct timespec kai_prof_t0;
+static int kai_prof_init_done = 0;
+static int kai_prof_enabled = 0;
+
+/* Exclusive-time stack. The four hot RC functions call each other
+ * (kai_decref → kai_free_value → kai_decref → ...). Naive timing
+ * double-counts nested time. To get exclusive (self-only) time per
+ * category, every active call records its start_ns and accumulates
+ * the gross duration of any child instrumented call into a `child_ns`
+ * slot; on exit, exclusive = (now - start) - child_ns is added to the
+ * category counter, and gross time is bubbled to the parent's slot.
+ *
+ * Stack depth 32 is overkill — the deepest realistic chain is decref
+ * → free_value → decref → free_value → ... bounded by tree depth (~30
+ * for 1M nodes). Static fixed array; saturates on overflow (very
+ * defensively — if it ever fires we silently mis-attribute, no crash). */
+#define KAI_PROF_STACK_CAP 64
+typedef struct {
+    int64_t start_ns;
+    int64_t child_ns;
+} KaiProfFrame;
+static KAI_TLS KaiProfFrame kai_prof_stack[KAI_PROF_STACK_CAP];
+static KAI_TLS int kai_prof_sp = 0;
+
+static inline int64_t kai_prof_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec * 1000000000LL + (int64_t) ts.tv_nsec;
+}
+
+static inline int kai_prof_push(void) {
+    if (kai_prof_sp >= KAI_PROF_STACK_CAP) return -1;  /* saturate */
+    int idx = kai_prof_sp++;
+    kai_prof_stack[idx].start_ns = kai_prof_now_ns();
+    kai_prof_stack[idx].child_ns = 0;
+    return idx;
+}
+
+static inline int64_t kai_prof_pop_exclusive(int idx) {
+    if (idx < 0) return 0;
+    int64_t end = kai_prof_now_ns();
+    int64_t gross = end - kai_prof_stack[idx].start_ns;
+    int64_t self  = gross - kai_prof_stack[idx].child_ns;
+    if (self < 0) self = 0;  /* clock noise can produce tiny negatives */
+    kai_prof_sp = idx;  /* unwind any deeper saturated frames defensively */
+    /* Bubble gross time to parent so its exclusive subtraction works. */
+    if (idx > 0) kai_prof_stack[idx - 1].child_ns += gross;
+    return self;
+}
+
+static void kai_prof_report(void) {
+    if (!getenv("KAI_PROFILE_RC")) return;
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    int64_t wall_ns =
+        ((int64_t) t1.tv_sec - (int64_t) kai_prof_t0.tv_sec) * 1000000000LL
+      + ((int64_t) t1.tv_nsec - (int64_t) kai_prof_t0.tv_nsec);
+    int64_t alloc_ns  = kai_prof_alloc_ns;
+    int64_t free_ns   = kai_prof_free_ns;
+    int64_t incref_ns = kai_prof_incref_ns;
+    int64_t decref_ns = kai_prof_decref_ns;
+    /* Categories are exclusive (self-only) — no overlap. */
+    int64_t rc_traffic_ns = incref_ns + decref_ns;
+    int64_t accounted_ns  = alloc_ns + free_ns + rc_traffic_ns;
+    int64_t other_ns      = wall_ns - accounted_ns;
+    fprintf(stderr,
+        "[KAI_PROFILE_RC] wall_ms=%lld alloc_ms=%lld free_ms=%lld "
+        "rc_traffic_ms=%lld other_ms=%lld\n",
+        (long long) (wall_ns / 1000000),
+        (long long) (alloc_ns / 1000000),
+        (long long) (free_ns  / 1000000),
+        (long long) (rc_traffic_ns / 1000000),
+        (long long) (other_ns / 1000000));
+    fprintf(stderr,
+        "[KAI_PROFILE_RC] decref_ms=%lld (self) incref_ms=%lld (self)\n",
+        (long long) (decref_ns / 1000000),
+        (long long) (incref_ns / 1000000));
+    fprintf(stderr,
+        "[KAI_PROFILE_RC] calls alloc=%lld free=%lld incref=%lld "
+        "decref=%lld decref_to_zero=%lld\n",
+        (long long) kai_prof_alloc_n,
+        (long long) kai_prof_free_n,
+        (long long) kai_prof_incref_n,
+        (long long) kai_prof_decref_n,
+        (long long) kai_prof_decref_to_zero_n);
+    if (wall_ns > 0) {
+        fprintf(stderr,
+            "[KAI_PROFILE_RC] share alloc=%.1f%% free=%.1f%% "
+            "rc_traffic=%.1f%% other=%.1f%%\n",
+            100.0 * alloc_ns / wall_ns,
+            100.0 * free_ns / wall_ns,
+            100.0 * rc_traffic_ns / wall_ns,
+            100.0 * other_ns / wall_ns);
+    }
+}
+
+static void kai_prof_init(void) {
+    if (kai_prof_init_done) return;
+    kai_prof_init_done = 1;
+    const char *e = getenv("KAI_PROFILE_RC");
+    kai_prof_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    if (!kai_prof_enabled) return;
+    clock_gettime(CLOCK_MONOTONIC, &kai_prof_t0);
+    atexit(kai_prof_report);
+}
+
+#define KAI_PROF_ENTER()           \
+    int _kai_prof_idx = -1;        \
+    do {                           \
+        if (!kai_prof_init_done) kai_prof_init(); \
+        if (kai_prof_enabled) _kai_prof_idx = kai_prof_push(); \
+    } while (0)
+
+#define KAI_PROF_EXIT(category)                                              \
+    do {                                                                     \
+        if (kai_prof_enabled) {                                              \
+            kai_prof_##category##_ns += kai_prof_pop_exclusive(_kai_prof_idx); \
+            kai_prof_##category##_n++;                                       \
+        }                                                                    \
+    } while (0)
+
+#else /* !KAI_PROFILE_RC */
+
+#define KAI_PROF_ENTER()        ((void) 0)
+#define KAI_PROF_EXIT(category) ((void) 0)
+
+#endif /* KAI_PROFILE_RC */
+
+/* ---------- variant_name histogram (issue #300, lane #297/#298 validation)
+ *
+ * Independent of KAI_TRACE_RC. Counts variant alloc/free traffic keyed on
+ * the `variant_name` string-literal pointer (stable across runs, immune to
+ * the tail-call ABI bug that contaminates address-keyed attribution).
+ *
+ * Opt-in: build with `-DKAI_TRACE_VAR_NAMES=1`. Vanilla builds compile to
+ * empty hooks; emitted IR (and selfhost byte-identity) is unchanged.
+ *
+ * Output: at exit a destructor dumps `[VAR_NAME] <name> allocs=A frees=F
+ * leak=A-F` lines sorted by leak desc to stderr. Suppressed by
+ * KAI_TRACE_RC_QUIET=1 (shared with the address-keyed tracer).
+ */
+#ifdef KAI_TRACE_VAR_NAMES
+
+#define KAI_VAR_NAME_BUCKETS 4096
+
+typedef struct {
+    const char *name;
+    int64_t allocs;       /* invocation count: every kai_variant_u(_, name, ...) call */
+    int64_t real_allocs;  /* physical allocs: invocations that miss singleton/immortal cache */
+    int64_t frees;
+} KaiVarNameBucket;
+
+static KAI_TLS KaiVarNameBucket kai_var_names[KAI_VAR_NAME_BUCKETS];
+static KAI_TLS int kai_var_names_count;
+
+static KaiVarNameBucket *kai_var_name_lookup(const char *name) {
+    if (name == NULL) return NULL;
+    uintptr_t k = (uintptr_t) name;
+    uint32_t h = (uint32_t) ((k ^ (k >> 16)) * 0x9e3779b1u);
+    for (int probe = 0; probe < KAI_VAR_NAME_BUCKETS; ++probe) {
+        int i = (int) ((h + probe) & (KAI_VAR_NAME_BUCKETS - 1));
+        if (kai_var_names[i].name == NULL) {
+            kai_var_names[i].name = name;
+            kai_var_names_count++;
+            return &kai_var_names[i];
+        }
+        if (kai_var_names[i].name == name) return &kai_var_names[i];
+    }
+    return NULL; /* table full — silently drop */
+}
+
+static void kai_var_name_record_alloc(const char *name) {
+    KaiVarNameBucket *b = kai_var_name_lookup(name);
+    if (b) b->allocs++;
+}
+
+static void kai_var_name_record_real_alloc(const char *name) {
+    KaiVarNameBucket *b = kai_var_name_lookup(name);
+    if (b) b->real_allocs++;
+}
+
+static void kai_var_name_record_free(const char *name) {
+    KaiVarNameBucket *b = kai_var_name_lookup(name);
+    if (b) b->frees++;
+}
+
+static int kai_var_name_cmp_leak_desc(const void *a, const void *b) {
+    const KaiVarNameBucket *x = (const KaiVarNameBucket *) a;
+    const KaiVarNameBucket *y = (const KaiVarNameBucket *) b;
+    int64_t lx = x->real_allocs - x->frees;
+    int64_t ly = y->real_allocs - y->frees;
+    if (ly != lx) return (ly > lx) - (ly < lx);
+    return (y->real_allocs > x->real_allocs) - (y->real_allocs < x->real_allocs);
+}
+
+__attribute__((destructor))
+static void kai_var_name_report_at_exit(void) {
+    if (getenv("KAI_TRACE_RC_QUIET")) return;
+    KaiVarNameBucket snapshot[KAI_VAR_NAME_BUCKETS];
+    int n = 0;
+    for (int i = 0; i < KAI_VAR_NAME_BUCKETS; ++i) {
+        if (kai_var_names[i].name != NULL) snapshot[n++] = kai_var_names[i];
+    }
+    if (n == 0) return;
+    qsort(snapshot, (size_t) n, sizeof(snapshot[0]), kai_var_name_cmp_leak_desc);
+    int64_t total_invs = 0, total_real = 0, total_frees = 0;
+    for (int i = 0; i < n; ++i) {
+        total_invs += snapshot[i].allocs;
+        total_real += snapshot[i].real_allocs;
+        total_frees += snapshot[i].frees;
+    }
+    fprintf(stderr,
+        "[VAR_NAME] total distinct=%d invocations=%lld real_allocs=%lld frees=%lld leak=%lld\n",
+        n, (long long) total_invs, (long long) total_real,
+        (long long) total_frees, (long long) (total_real - total_frees));
+    fprintf(stderr,
+        "[VAR_NAME] columns: name | invocations | real_allocs | frees | leak\n");
+    for (int i = 0; i < n; ++i) {
+        int64_t leak = snapshot[i].real_allocs - snapshot[i].frees;
+        fprintf(stderr,
+            "[VAR_NAME] %-24s inv=%-12lld real=%-10lld frees=%-10lld leak=%lld\n",
+            snapshot[i].name,
+            (long long) snapshot[i].allocs,
+            (long long) snapshot[i].real_allocs,
+            (long long) snapshot[i].frees,
+            (long long) leak);
+    }
+}
+
+#define KAI_VAR_NAME_ALLOC(name)      kai_var_name_record_alloc(name)
+#define KAI_VAR_NAME_REAL_ALLOC(name) kai_var_name_record_real_alloc(name)
+#define KAI_VAR_NAME_FREE(name)       kai_var_name_record_free(name)
+
+#else /* !KAI_TRACE_VAR_NAMES */
+
+#define KAI_VAR_NAME_ALLOC(name)      ((void) 0)
+#define KAI_VAR_NAME_REAL_ALLOC(name) ((void) 0)
+#define KAI_VAR_NAME_FREE(name)       ((void) 0)
+
+#endif /* KAI_TRACE_VAR_NAMES */
+
+/* Monomorphic-node packing: the variant name is no longer stored per
+ * node (it was 8 B/node of metadata the hot path never reads). Instead a
+ * process-global tag→name table is populated the first time each tag is
+ * constructed (the ctor still passes `name`), and the rare readers
+ * (to_string, deep_copy, protocol dispatch) recover it via
+ * `kai_variant_name_of(tag)`. Tags are dense small ints; a flat array
+ * with a lazy grow covers them. Names are static string literals, never
+ * freed. */
+#define KAI_VARNAME_TABLE_INIT 256
+#if defined(KAI_SEPARATE_COMPILATION)
+extern const char **kai_varname_table;
+extern int kai_varname_table_cap;
+#  if defined(KAI_RUNTIME_OWNER)
+const char **kai_varname_table = NULL;
+int kai_varname_table_cap = 0;
+#  endif
+#else
+static const char **kai_varname_table = NULL;
+static int kai_varname_table_cap = 0;
+#endif
+
+static void kai_varname_register(int32_t tag, const char *name) {
+    if (tag < 0 || name == NULL) return;
+    if (tag >= kai_varname_table_cap) {
+        int newcap = kai_varname_table_cap == 0 ? KAI_VARNAME_TABLE_INIT : kai_varname_table_cap;
+        while (tag >= newcap) newcap *= 2;
+        kai_varname_table = (const char **) realloc(kai_varname_table, (size_t) newcap * sizeof(char *));
+        for (int i = kai_varname_table_cap; i < newcap; ++i) kai_varname_table[i] = NULL;
+        kai_varname_table_cap = newcap;
+    }
+    if (kai_varname_table[tag] == NULL) kai_varname_table[tag] = name;
+}
+
+static const char *kai_variant_name_of(int32_t tag) {
+    if (tag >= 0 && tag < kai_varname_table_cap && kai_varname_table[tag] != NULL) {
+        return kai_varname_table[tag];
+    }
+    return "";
+}
+
+/* Koka-packed header: the per-slot kind bits (`slot_mask`) no longer live
+ * per node — they are a property of the constructor, so a tag→mask table
+ * holds them (populated at first construction, like the name table). The
+ * generic drop / copy / reuse walkers read `kai_slot_mask_of(tag)`. A tag
+ * never seen returns 0 (all-pointer), the conservative default. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern uint32_t *kai_slotmask_table;
+extern int kai_slotmask_table_cap;
+extern uint8_t *kai_slotmask_seen;
+#  if defined(KAI_RUNTIME_OWNER)
+uint32_t *kai_slotmask_table = NULL;
+int kai_slotmask_table_cap = 0;
+uint8_t *kai_slotmask_seen = NULL;   /* 1 once a tag's mask is recorded */
+#  endif
+#else
+static uint32_t *kai_slotmask_table = NULL;
+static int kai_slotmask_table_cap = 0;
+static uint8_t *kai_slotmask_seen = NULL;   /* 1 once a tag's mask is recorded */
+#endif
+
+static void kai_slotmask_register(int32_t tag, uint32_t mask) {
+    if (tag < 0) return;
+    if (tag >= kai_slotmask_table_cap) {
+        int newcap = kai_slotmask_table_cap == 0 ? KAI_VARNAME_TABLE_INIT : kai_slotmask_table_cap;
+        while (tag >= newcap) newcap *= 2;
+        kai_slotmask_table = (uint32_t *) realloc(kai_slotmask_table, (size_t) newcap * sizeof(uint32_t));
+        kai_slotmask_seen  = (uint8_t *)  realloc(kai_slotmask_seen,  (size_t) newcap * sizeof(uint8_t));
+        for (int i = kai_slotmask_table_cap; i < newcap; ++i) { kai_slotmask_table[i] = 0; kai_slotmask_seen[i] = 0; }
+        kai_slotmask_table_cap = newcap;
+    }
+    if (!kai_slotmask_seen[tag]) { kai_slotmask_table[tag] = mask; kai_slotmask_seen[tag] = 1; }
+}
+
+static uint32_t kai_slot_mask_of(int32_t tag) {
+    if (tag >= 0 && tag < kai_slotmask_table_cap) return kai_slotmask_table[tag];
+    return 0;
+}
+
+/* ---------- KAI_MAX_HEAP: process heap ceiling (host containment) ----------
+ *
+ * Caps total committed heap so a runaway aborts clean instead of dragging
+ * the host into an OOM hang (on macOS the RAM compressor masks exhaustion;
+ * RLIMIT_AS / `ulimit -v` are no-ops, so there is no OS ceiling at all).
+ * Set `KAI_MAX_HEAP` to a byte count or a k/m/g-suffixed size (e.g. `4g`).
+ * Unset/empty/unparseable -> no cap, one predicted branch per grow point.
+ *
+ * The counter is monotonic high-water (commit, not live): the value heap
+ * never returns slabs to the OS, so the running total is the process's
+ * committed footprint, which is the metric containment cares about. It is
+ * charged at every OS-commit grow point — slab grow, oversized slab, cell
+ * calloc, variant-block fallback, arena chunk, and string/array payloads —
+ * so no allocation path can grow past the ceiling uncounted. Single OS
+ * thread (fibers share it), so a plain global needs no synchronisation. */
+/* Committed footprint is a whole-process total, so KAI_MAX_HEAP caps the
+ * program, not each TU: one shared accumulator (owner defines, others
+ * extern). A per-TU copy would let every TU spend the full ceiling. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern size_t kai_heap_limit_cached;
+extern int    kai_heap_inited;
+extern KAI_TLS size_t kai_heap_committed;
+#  if defined(KAI_RUNTIME_OWNER)
+size_t kai_heap_limit_cached = 0;   /* 0 = no cap */
+int    kai_heap_inited       = 0;
+KAI_TLS size_t kai_heap_committed    = 0;
+#  endif
+#else
+static size_t kai_heap_limit_cached = 0;   /* 0 = no cap */
+static int    kai_heap_inited       = 0;
+static KAI_TLS size_t kai_heap_committed    = 0;
+#endif
+
+static size_t kai_heap_limit(void) {
+    if (!kai_heap_inited) {
+        kai_heap_inited = 1;
+        const char *raw = getenv("KAI_MAX_HEAP");
+        if (raw && *raw) {
+            char *end = NULL;
+            unsigned long long n = strtoull(raw, &end, 10);
+            unsigned long long mul = 1;
+            if (end && *end) {
+                switch (*end) {
+                    case 'k': case 'K': mul = 1024ULL; break;
+                    case 'm': case 'M': mul = 1024ULL * 1024ULL; break;
+                    case 'g': case 'G': mul = 1024ULL * 1024ULL * 1024ULL; break;
+                    default: mul = 0; break;   /* junk suffix -> no cap */
+                }
+                if (mul && end[1]) mul = 0;    /* trailing junk after suffix -> no cap */
+            }
+            if (mul && n > 0 && n <= (unsigned long long) ((size_t) -1) / mul) {
+                kai_heap_limit_cached = (size_t) (n * mul);
+            }
+        }
+    }
+    return kai_heap_limit_cached;
+}
+
+/* noinline: kai_heap_committed is a per-thread accumulator; keeping the slot
+ * address inside this activation stops the optimiser from carrying it across a
+ * park into a work-stolen frame, which would charge the wrong thread's ledger. */
+__attribute__((noinline))
+static void kai_heap_charge(size_t sz) {
+    size_t limit = kai_heap_limit();
+    if (limit && kai_heap_committed + sz > limit) {
+        fprintf(stderr,
+            "kai: heap limit exceeded (KAI_MAX_HEAP=%s, used %zu bytes)\n",
+            getenv("KAI_MAX_HEAP"), kai_heap_committed);
+        exit(1);
+    }
+    kai_heap_committed += sz;
+}
+
+/* malloc/realloc that charge the payload against the ceiling and fold in
+ * the OOM check shared by every value-heap allocation. */
+static void *kai_heap_malloc(size_t sz) {
+    kai_heap_charge(sz);
+    void *p = malloc(sz);
+    if (!p) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    return p;
+}
+
+static void *kai_heap_realloc(void *ptr, size_t old_sz, size_t new_sz) {
+    if (new_sz > old_sz) kai_heap_charge(new_sz - old_sz);
+    void *p = realloc(ptr, new_sz);
+    if (!p) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    return p;
+}
+
+#ifdef KAI_TRACE_RC
+/* Under trace/profile the cell + slot free-lists are disabled (they
+ * would perturb leak attribution and poisoning). Provide malloc-only
+ * slot helpers here so the variant constructors below link in this
+ * mode too — the pooled versions live in the #else branch. */
+static KaiVarSlot *kai_slots_alloc(int n) {
+    return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+}
+static void kai_slots_free(KaiVarSlot *slots, int n) { (void) n; free(slots); }
+static KaiValue *kai_alloc_traced(KaiTag tag, void *site) {
+#else
+/* Issue #118 follow-up #3 — fixed-size cell free-list (Koka/mimalloc
+ * model). Every KaiValue is the same size, so a freed cell can host the
+ * next allocation without a malloc/free round-trip. This is the
+ * size-keyed reuse Koka gets implicitly from its heap: the functional
+ * rebuild's discarded spine cells are recycled by the very next
+ * constructor of the same size, WITHOUT any compiler-level token
+ * threading. Bounded so a transient spike does not pin memory forever.
+ *
+ * Disabled under KAI_TRACE_RC / KAI_PROFILE_RC: those modes poison freed
+ * cells and rely on exact malloc/free pairing for leak attribution, so
+ * recycling would corrupt their bookkeeping. The free-list is a pure
+ * production-path allocator optimisation — RC semantics and emitted code
+ * are byte-identical; only the malloc/free traffic changes. */
+#if !defined(KAI_TRACE_RC) && !defined(KAI_PROFILE_RC) && !defined(KAI_NO_CELL_POOL)
+#define KAI_CELL_POOL_ACTIVE 1
+/* Cap sized for the functional-rebuild working set. The rb-tree churns
+ * a ~1M-cell live set with a deep free/realloc cycle; a cap below the
+ * peak free-list depth spills to libc and the wall destabilises around
+ * the 10× target (measured: 262Ki oscillates 9.9–10.3× by run, 1Mi
+ * holds a stable 9.8–9.9×). 1Mi entries (8 MB of pointers, lazy .bss)
+ * keep the recycle hit-rate high; beyond it we fall through to
+ * malloc/free. */
+#define KAI_CELL_POOL_CAP 1048576
+/* The free-list pools are multi-MB per thread. As a `_Thread_local` ARRAY
+ * the whole table joins the TLS image, which the thread runtime
+ * zero-materialises (faulting in every page) at thread creation — so the
+ * full 8/72/72 MiB became resident per thread even for a program that
+ * never allocates (issue #1212/#1213: hello-world 2 MiB → 162 MiB). A
+ * `_Thread_local` POINTER instead is 8 bytes of TLS; the backing store is
+ * a single `calloc` on first push (kai_cell_pool_ensure), which the OS
+ * backs with lazy zero pages — RSS grows only with entries actually
+ * written, restoring the pre-M:N footprint. Separate-compilation sharing
+ * is unchanged: every TU sees the `extern` pointer; the owner TU defines
+ * it; the index counter moves with the pointer. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiValue **kai_cell_pool;
+extern KAI_TLS int kai_cell_pool_n;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiValue **kai_cell_pool = NULL;
+KAI_TLS int kai_cell_pool_n = 0;
+#  endif
+#else
+static KAI_TLS KaiValue **kai_cell_pool = NULL;
+static KAI_TLS int kai_cell_pool_n = 0;
+#endif
+
+/* Companion free-list for the variant `slots[]` arrays, keyed by arity
+ * (the dominant per-node malloc alongside the cell header). Arity 1..8
+ * covers every variant the functional rebuild churns; larger arities
+ * fall through to malloc/free. Sized to match the cell pool's working
+ * set so slot reuse does not become the spill bottleneck. */
+#define KAI_SLOT_POOL_MAXN 8
+#define KAI_SLOT_POOL_CAP  1048576
+/* Per-arity free-list. TLS holds only (MAXN+1) pointers; each arity's
+ * CAP-entry backing store is calloc'd lazily on first push of that arity
+ * (kai_slot_pool_ensure). Restores the lazy footprint the huge
+ * `_Thread_local` 2D array destroyed — see the cell-pool note above. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiVarSlot **kai_slot_pool[KAI_SLOT_POOL_MAXN + 1];
+extern KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiVarSlot **kai_slot_pool[KAI_SLOT_POOL_MAXN + 1];
+KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
+#  endif
+#else
+static KAI_TLS KaiVarSlot **kai_slot_pool[KAI_SLOT_POOL_MAXN + 1];
+static KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
+#endif
+
+/* FAM lane: free-list for whole variant BLOCKS (header + n inline slots
+ * in one allocation), keyed by arity. Replaces the cell_pool + slot_pool
+ * pair for variants — one push/pop instead of two, one cache line per
+ * node instead of a header here and a slots[] array somewhere else.
+ * Arity 0..8 covers every variant the functional rebuild churns; larger
+ * arities fall through to malloc/free. A pooled block already has the
+ * right byte size for its arity, so reuse is size-matched by
+ * construction (the reuse recognisers only ever rewrite same-arity). */
+#define KAI_VAR_BLOCK_POOL_MAXN 8
+#define KAI_VAR_BLOCK_POOL_CAP  1048576
+/* Per-arity free-list of whole variant blocks. TLS holds (MAXN+1)
+ * pointers; each arity's backing store is calloc'd lazily on first push
+ * (kai_var_block_pool_ensure). Restores the lazy footprint — see the
+ * cell-pool note above. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiValue **kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1];
+extern KAI_TLS int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiValue **kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1];
+KAI_TLS int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
+#  endif
+#else
+static KAI_TLS KaiValue **kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1];
+static KAI_TLS int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
+#endif
+
+/* Lazy backing-store materialisation for the free-list pools. Each pool's
+ * table (CAP pointers) is calloc'd on first push into it, not at thread
+ * startup — the OS backs the calloc with zero pages that only become
+ * resident as entries are written, so a program that allocates little
+ * pays little (issue #1212/#1213). calloc failure degrades to "no pool"
+ * (the caller falls through to libc malloc/free), never a crash. */
+static inline int kai_cell_pool_ensure(void) {
+    if (!kai_cell_pool) {
+        kai_cell_pool = (KaiValue **) calloc(KAI_CELL_POOL_CAP, sizeof(KaiValue *));
+    }
+    return kai_cell_pool != NULL;
+}
+static inline int kai_slot_pool_ensure(int n) {
+    if (!kai_slot_pool[n]) {
+        kai_slot_pool[n] = (KaiVarSlot **) calloc(KAI_SLOT_POOL_CAP, sizeof(KaiVarSlot *));
+    }
+    return kai_slot_pool[n] != NULL;
+}
+static inline int kai_var_block_pool_ensure(int n) {
+    if (!kai_var_block_pool[n]) {
+        kai_var_block_pool[n] = (KaiValue **) calloc(KAI_VAR_BLOCK_POOL_CAP, sizeof(KaiValue *));
+    }
+    return kai_var_block_pool[n] != NULL;
+}
+
+/* Free-list pool ops routed through noinline accessors: the pool base and
+ * index are thread-local, so their addresses must be materialised and consumed
+ * inside one activation. Inlined into an emitted kaikai frame that spans a
+ * park, the optimiser could hoist the slot address across the swap and let a
+ * work-stolen fiber push a freed cell onto — or pop from — the parking
+ * thread's free list, corrupting the heap. Out of line the slot is re-resolved
+ * on whatever thread now runs. Each returns/takes only the value, never a slot
+ * address, so nothing escapes the frame. */
+__attribute__((noinline))
+static KaiValue *kai_cell_pool_pop(void) {
+    if (kai_cell_pool_n > 0) return kai_cell_pool[--kai_cell_pool_n];
+    return NULL;
+}
+__attribute__((noinline))
+static int kai_cell_pool_push(KaiValue *v) {
+    if (kai_cell_pool_n < KAI_CELL_POOL_CAP && kai_cell_pool_ensure()) {
+        kai_cell_pool[kai_cell_pool_n++] = v;
+        return 1;
+    }
+    return 0;
+}
+__attribute__((noinline))
+static KaiValue *kai_var_block_pool_pop(int n) {
+    if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN && kai_var_block_pool_n[n] > 0) {
+        return kai_var_block_pool[n][--kai_var_block_pool_n[n]];
+    }
+    return NULL;
+}
+__attribute__((noinline))
+static int kai_var_block_pool_push(KaiValue *v, int n) {
+    if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN
+        && kai_var_block_pool_n[n] < KAI_VAR_BLOCK_POOL_CAP
+        && kai_var_block_pool_ensure(n)) {
+        kai_var_block_pool[n][kai_var_block_pool_n[n]++] = v;
+        return 1;
+    }
+    return 0;
+}
+
+/* ---------- variant-block slab allocator (issue: malloc 6.2% of bench) ----------
+ *
+ * A fresh variant block used to be `malloc(kai_var_block_size(n))` — one
+ * libc allocation per node, 6.96M of them on the rb-tree bench (the tree
+ * grows monotonically, so the block pool stays empty during the insert
+ * phase and every new node is a real malloc). Idea adapted from Koka's
+ * mimalloc segments — amortise the allocator, never hand individual cells
+ * back to libc — but WITHOUT a dependency: a plain bump allocator over
+ * malloc'd slabs.
+ *
+ * Design (slab-only, per asu): EVERY variant block comes from a slab.
+ * `kai_slab_alloc(sz)` bump-allocates `sz` bytes (8-aligned) from the
+ * current slab, growing a new slab when the bump pointer would overrun.
+ * The free path (kai_var_block_free) NEVER calls libc free on an
+ * individual block — a slab-interior pointer is not a malloc'd address,
+ * so free() on it is UB/corruption. Instead a freed block goes to the
+ * arity-keyed block pool (the free-list that already exists); a pool-full
+ * or over-arity spill is simply DROPPED (the cell stays in its slab,
+ * reclaimed when the whole slab is freed at exit — not an observable
+ * leak). The slabs themselves are tracked and freed in kai_slab_teardown
+ * (registered via atexit) so ASAN sees still-reachable == 0.
+ *
+ * Soundness net: if any free() ever reaches a slab-interior pointer, ASAN
+ * fires "free on non-malloc'd address" immediately. The self-compile gate
+ * (kaic2b.c == kaic2c.c) proves no AST node — of any arity — was
+ * corrupted by the size-classing. */
+#define KAI_SLAB_SIZE (256u * 1024u)   /* 256 KiB per slab */
+/* One shared slab allocator across a separate-compilation build: the native-
+ * modular merge inlines slab-touching helpers into partitions, so the slab
+ * state must be ONE instance (external, owner-defined) — a per-partition copy
+ * would bump-allocate into disjoint slabs. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS char  *kai_slab_cur;
+extern KAI_TLS size_t kai_slab_off;
+extern KAI_TLS char **kai_slab_list;
+extern KAI_TLS int    kai_slab_count;
+extern KAI_TLS int    kai_slab_cap;
+extern KAI_TLS int    kai_slab_atexit;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS char  *kai_slab_cur    = NULL;
+KAI_TLS size_t kai_slab_off    = 0;
+KAI_TLS char **kai_slab_list   = NULL;
+KAI_TLS int    kai_slab_count  = 0;
+KAI_TLS int    kai_slab_cap    = 0;
+KAI_TLS int    kai_slab_atexit = 0;
+#  endif
+#else
+static KAI_TLS char  *kai_slab_cur    = NULL;  /* current slab base */
+static KAI_TLS size_t kai_slab_off    = 0;     /* bump offset into current slab */
+static KAI_TLS char **kai_slab_list   = NULL;  /* all slabs, for teardown */
+static KAI_TLS int    kai_slab_count  = 0;
+static KAI_TLS int    kai_slab_cap    = 0;
+static KAI_TLS int    kai_slab_atexit = 0;
+#endif
+
+/* noinline: the slab bump state (cur/off/list/count/cap) is thread-local, so
+ * both functions must keep the slot address inside one activation — inlined
+ * into a park-spanning frame the optimiser could carry it across the swap and
+ * bump-allocate into, or free, the parking thread's slabs after a work-steal. */
+__attribute__((noinline))
+static void kai_slab_teardown(void) {
+    for (int i = 0; i < kai_slab_count; ++i) free(kai_slab_list[i]);
+    free(kai_slab_list);
+    kai_slab_list = NULL; kai_slab_count = 0; kai_slab_cap = 0;
+    kai_slab_cur = NULL; kai_slab_off = 0;
+}
+
+__attribute__((noinline))
+static void *kai_slab_alloc(size_t sz) {
+    sz = (sz + 7u) & ~(size_t) 7u;            /* 8-byte align */
+    if (sz > KAI_SLAB_SIZE) return kai_heap_malloc(sz); /* oversized: standalone (never freed individually either) */
+    if (!kai_slab_cur || kai_slab_off + sz > KAI_SLAB_SIZE) {
+        kai_heap_charge(KAI_SLAB_SIZE);
+        char *slab = (char *) malloc(KAI_SLAB_SIZE);
+        if (!slab) { fprintf(stderr, "kai: out of memory (slab)\n"); exit(1); }
+        if (kai_slab_count == kai_slab_cap) {
+            int ncap = kai_slab_cap == 0 ? 64 : kai_slab_cap * 2;
+            kai_slab_list = (char **) realloc(kai_slab_list, (size_t) ncap * sizeof(char *));
+            kai_slab_cap = ncap;
+        }
+        kai_slab_list[kai_slab_count++] = slab;
+        kai_slab_cur = slab;
+        kai_slab_off = 0;
+        /* At N>1 a variant block allocated on this thread's slab can
+         * migrate (with a cross-thread message copy) into another
+         * thread's block pool and be reused there, so a per-thread slab
+         * free at exit would pull the ground out from under a live block
+         * on another thread. Under M:N the OS reclaims all slabs at
+         * process exit instead; the teardown (whose only purpose is a
+         * clean ASAN "0 still-reachable" at N=1) is not registered. */
+        if (!kai_slab_atexit && kai_nthreads <= 1) {
+            atexit(kai_slab_teardown); kai_slab_atexit = 1;
+        }
+    }
+    void *p = kai_slab_cur + kai_slab_off;
+    kai_slab_off += sz;
+    return p;
+}
+
+static KaiVarSlot *kai_slots_alloc(int n) {
+#ifndef KAI_NO_SLOT_POOL
+    if (n >= 1 && n <= KAI_SLOT_POOL_MAXN && kai_slot_pool_n[n] > 0) {
+        return kai_slot_pool[n][--kai_slot_pool_n[n]];
+    }
+#endif
+    return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+}
+
+static void kai_slots_free(KaiVarSlot *slots, int n) {
+    if (slots == NULL) return;
+#ifndef KAI_NO_SLOT_POOL
+    if (n >= 1 && n <= KAI_SLOT_POOL_MAXN && kai_slot_pool_n[n] < KAI_SLOT_POOL_CAP
+        && kai_slot_pool_ensure(n)) {
+        kai_slot_pool[n][kai_slot_pool_n[n]++] = slots;
+        return;
+    }
+#endif
+    free(slots);
+}
+#else
+static KaiVarSlot *kai_slots_alloc(int n) {
+    return (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+}
+static void kai_slots_free(KaiVarSlot *slots, int n) { (void) n; free(slots); }
+#endif
+
+static KaiValue *kai_alloc(KaiTag tag) {
+#endif
+    KAI_PROF_ENTER();
+#ifdef KAI_CELL_POOL_ACTIVE
+    KaiValue *v = kai_cell_pool_pop();
+    if (v) {
+        /* Zero the struct so callers see calloc-equivalent state (the
+         * union, slots ptr, etc. must start clean). */
+        memset(v, 0, sizeof(KaiValue));
+    } else {
+        kai_heap_charge(sizeof(KaiValue));
+        v = (KaiValue *) calloc(1, sizeof(KaiValue));
+    }
+#else
+    kai_heap_charge(sizeof(KaiValue));
+    KaiValue *v = (KaiValue *) calloc(1, sizeof(KaiValue));
+#endif
+    if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    v->rc = 1;
+    v->tag = (uint8_t) tag;
+    /* trace */
+    kai_rc_count_alloc((int) tag);
+#ifdef KAI_TRACE_RC
+    v->alloc_site = site;
+    kai_rc_site_record_alloc(site, (int32_t) tag);
+    kai_rc_site_register_once();
+    kai_rc_history_log(v, /* op=alloc */ 0, (int32_t) tag);
+#endif
+#ifdef KAI_TRACE_RC_LEAKSITE
+    v->scope_fn = kai_current_scope_fn;
+    kai_leaksite_record_alloc(kai_current_scope_fn, (int32_t) tag);
+    kai_leaksite_register_once();
+#endif
+    KAI_PROF_EXIT(alloc);
+    return v;
+}
+
+#ifdef KAI_TRACE_RC
+/* Macro shim: every call to kai_alloc(tag) inside a wrapper captures
+ * the wrapper's caller (the real emit site) via
+ * __builtin_return_address(0). Wrappers must be marked
+ * KAI_RC_NOINLINE for this to point at the right frame. */
+#define kai_alloc(tag) kai_alloc_traced((tag), __builtin_return_address(0))
+#endif
+
+/* Byte size of a variant block holding `n` inline slots. */
+static inline size_t kai_var_block_size(int n) {
+    /* Slots overlap the union at `offsetof(KaiValue, as)`, so the block is
+     * the header up to `as` plus n slots — NOT sizeof(KaiValue) (which
+     * counts the whole union) + n slots. A 5-slot node is offsetof(as)=8 +
+     * 40 = 48 vs the old 80. Guard: at least sizeof(KaiValue) so a node
+     * with few slots still has a valid base for the generic header reads.
+     * `offsetof(KaiValue, as)` is the UB-free spelling — the old
+     * `(char *)&((KaiValue *)1)->...var_slots[0] - (char *)1` trick formed a
+     * member access on a misaligned bogus pointer that -fsanitize=undefined
+     * flags on every variant alloc under the ASAN tier. */
+    size_t base = offsetof(KaiValue, as);
+    size_t sz = base + (size_t) n * sizeof(KaiVarSlot);
+#ifndef KAI_CELL_POOL_ACTIVE
+    /* Diagnostic builds (trace/profile/no-pool) malloc each block
+     * individually and generic paths touch the cell through KaiValue*;
+     * honour the documented floor so those accesses stay in bounds. */
+    if (sz < sizeof(KaiValue)) sz = sizeof(KaiValue);
+#endif
+    return sz;
+}
+
+/* FAM lane: allocate a KAI_VARIANT block with `n` payload slots stored
+ * inline (one contiguous allocation). Mirrors kai_alloc's bookkeeping
+ * but draws from / returns to the per-arity block pool instead of the
+ * size-uniform cell pool, and never touches the separate slot pool.
+ * The trace epilogue is shared with kai_alloc via the same counters. */
+#ifdef KAI_TRACE_RC
+static KaiValue *kai_alloc_var_traced(int n, void *site) {
+#else
+static KaiValue *kai_alloc_var(int n) {
+#endif
+    KAI_PROF_ENTER();
+    KaiValue *v;
+    size_t bsz = kai_var_block_size(n);
+#ifdef KAI_CELL_POOL_ACTIVE
+    v = kai_var_block_pool_pop(n);
+    if (v) {
+        memset(v, 0, bsz);
+    } else {
+        v = (KaiValue *) kai_slab_alloc(bsz);
+        memset(v, 0, bsz);                 /* slab is uninit; this is the calloc-equivalent */
+    }
+#else
+    /* No cell pool (KAI_TRACE_RC / KAI_PROFILE_RC / KAI_NO_CELL_POOL):
+     * the slab allocator lives inside the cell-pool block, so fall back
+     * to a plain libc allocation. kai_var_block_free's matching #else
+     * calls free() on it. */
+    kai_heap_charge(bsz);
+    v = (KaiValue *) calloc(1, bsz);
+#endif
+    if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    v->rc = 1;
+    v->tag = (uint8_t) KAI_VARIANT;
+    kai_rc_count_alloc((int) KAI_VARIANT);
+#ifdef KAI_TRACE_RC
+    v->alloc_site = site;
+    kai_rc_site_record_alloc(site, (int32_t) KAI_VARIANT);
+    kai_rc_site_register_once();
+    kai_rc_history_log(v, /* op=alloc */ 0, (int32_t) KAI_VARIANT);
+#endif
+#ifdef KAI_TRACE_RC_LEAKSITE
+    v->scope_fn = kai_current_scope_fn;
+    kai_leaksite_record_alloc(kai_current_scope_fn, (int32_t) KAI_VARIANT);
+    kai_leaksite_register_once();
+#endif
+    KAI_PROF_EXIT(alloc);
+    return v;
+}
+#ifdef KAI_TRACE_RC
+#define kai_alloc_var(n) kai_alloc_var_traced((n), __builtin_return_address(0))
+#endif
+
+/* No-zero variant block allocator. Identical to kai_alloc_var except it
+ * skips the calloc/memset zero-init: the caller (kai_variant_u_fast)
+ * writes all n payload slots immediately after, so zeroing them is dead
+ * work — measured 22M instructions (6%) of the rb-tree bench sat in
+ * _int_malloc+calloc, the zero pass over 6.96M × 48 B nodes. malloc
+ * leaves the slots indeterminate, which is sound ONLY because every slot
+ * is overwritten before any read; the drop walker never sees an
+ * unwritten slot. This is Koka's kk_alloc (raw malloc, no zero) — the
+ * cell is fully initialised by the constructor, not by the allocator.
+ *
+ * The header fields the generic runtime reads (rc, tag, var_n_args,
+ * variant_tag) are all written here or by the caller, so none rely on
+ * the zero. Under tracing the alloc_site / scope_fn fields are written
+ * explicitly too. */
+#ifdef KAI_TRACE_RC
+static KaiValue *kai_alloc_var_nz_traced(int n, void *site) {
+#else
+static KaiValue *kai_alloc_var_nz(int n) {
+#endif
+    KAI_PROF_ENTER();
+    KaiValue *v;
+#ifdef KAI_CELL_POOL_ACTIVE
+    v = kai_var_block_pool_pop(n);
+    if (!v) {
+        /* pool miss: fresh slab block, no memset — caller overwrites every slot */
+        v = (KaiValue *) kai_slab_alloc(kai_var_block_size(n));
+    }
+#else
+    /* No cell pool: plain libc malloc (no-zero — caller fills slots);
+     * kai_var_block_free's #else frees it. */
+    v = (KaiValue *) kai_heap_malloc(kai_var_block_size(n));
+#endif
+    if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    v->rc = 1;
+    v->tag = (uint8_t) KAI_VARIANT;
+    kai_rc_count_alloc((int) KAI_VARIANT);
+#ifdef KAI_TRACE_RC
+    v->alloc_site = site;
+    kai_rc_site_record_alloc(site, (int32_t) KAI_VARIANT);
+    kai_rc_site_register_once();
+    kai_rc_history_log(v, /* op=alloc */ 0, (int32_t) KAI_VARIANT);
+#endif
+#ifdef KAI_TRACE_RC_LEAKSITE
+    v->scope_fn = kai_current_scope_fn;
+    kai_leaksite_record_alloc(kai_current_scope_fn, (int32_t) KAI_VARIANT);
+    kai_leaksite_register_once();
+#endif
+    KAI_PROF_EXIT(alloc);
+    return v;
+}
+#ifdef KAI_TRACE_RC
+#define kai_alloc_var_nz(n) kai_alloc_var_nz_traced((n), __builtin_return_address(0))
+#endif
+
+/* FAM lane: return a variant block (header + inline slots) to its
+ * per-arity free-list pool. Used by kai_free_value's VARIANT case in
+ * place of (kai_slots_free + cell-pool return).
+ *
+ * Slab-only invariant: every block lives inside a malloc'd slab
+ * (kai_slab_alloc), so it is NOT a standalone malloc'd address — calling
+ * libc free() on it is UB/corruption. So there is NO free(v) here. A
+ * block that cannot rejoin the pool (pool full, or arity > MAXN) is
+ * simply DROPPED: it stays in its slab and is reclaimed wholesale by
+ * kai_slab_teardown at exit. Not an observable leak (ASAN: reachable via
+ * the slab list until teardown). If a free() ever reaches here on a slab
+ * pointer, ASAN fires "free on non-malloc'd address" at once. */
+static void kai_var_block_free(KaiValue *v, int n) {
+    (void) v;
+#ifdef KAI_CELL_POOL_ACTIVE
+    if (kai_var_block_pool_push(v, n)) return;
+    /* spill: drop into the slab; teardown reclaims it at exit. */
+#else
+    /* No cell pool: blocks come from plain malloc/calloc (kai_alloc_var
+     * #else), so free them individually — no slab to reclaim them, and
+     * dropping here would leak (visible under the KAI_TRACE_RC tier). */
+    (void) n;
+    free(v);
+#endif
+}
+
+/* m5 #7: constant pool for nullary primitives.
+ *
+ * `kai_unit()`, `kai_bool(true)`, `kai_bool(false)`, `kai_nil()` are
+ * the four nullary constructors that dominated the per-tag alloc
+ * breakdown on kaic2 self-compile (~78% combined). Returning shared
+ * static singletons collapses every call to those factories into a
+ * pointer to .data, eliminating the calloc and the four
+ * `kai_rc_alloc_total` / `kai_rc_alloc_by_tag[]` increments per call.
+ *
+ * Singletons carry `rc = INT32_MAX` as a saturation sentinel.
+ * `kai_incref` / `kai_decref` short-circuit when they see the
+ * sentinel, so RC bookkeeping skips the singletons entirely:
+ *   - incref leaves rc as-is (no overflow toward zero).
+ *   - decref never triggers `kai_free_value` on a static, which
+ *     would otherwise call `free()` on .data and crash.
+ * The sentinel costs one extra `int` compare in the hot RC path;
+ * the saved alloc/free traffic dominates by orders of magnitude.
+ *
+ * Selfhost stays byte-identical because the emitted text is
+ * unchanged — only the runtime semantics shift.
+ */
+/* Singletons are returned by address (kai_unit() = &kai_singleton_unit),
+ * so their identity is observable: any pointer-equality fast path breaks if
+ * two TUs each hold a private copy. One shared instance (owner defines,
+ * others extern) keeps unit/true/false/nil pointer-identical across TUs. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiValue kai_singleton_unit;
+extern KaiValue kai_singleton_true;
+extern KaiValue kai_singleton_false;
+extern KaiValue kai_singleton_nil;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiValue kai_singleton_unit  = { .rc = INT32_MAX, .tag = KAI_UNIT, .as = { .b = 0 } };
+KaiValue kai_singleton_true  = { .rc = INT32_MAX, .tag = KAI_BOOL, .as = { .b = 1 } };
+KaiValue kai_singleton_false = { .rc = INT32_MAX, .tag = KAI_BOOL, .as = { .b = 0 } };
+KaiValue kai_singleton_nil   = { .rc = INT32_MAX, .tag = KAI_NIL,  .as = { .b = 0 } };
+#  endif
+#else
+static KaiValue kai_singleton_unit  = { .rc = INT32_MAX, .tag = KAI_UNIT, .as = { .b = 0 } };
+static KaiValue kai_singleton_true  = { .rc = INT32_MAX, .tag = KAI_BOOL, .as = { .b = 1 } };
+static KaiValue kai_singleton_false = { .rc = INT32_MAX, .tag = KAI_BOOL, .as = { .b = 0 } };
+static KaiValue kai_singleton_nil   = { .rc = INT32_MAX, .tag = KAI_NIL,  .as = { .b = 0 } };
+#endif
+
+/* issue #120 — opt-in Perceus regions: bump-arena primitive (P0).
+ *
+ * A `region { ... }` block bump-allocates every value constructed
+ * inside it into an arena and frees the whole arena in one shot when
+ * the brace closes — no per-value RC traffic, no per-value free walk.
+ * This pays where allocation is tight LIFO scratch (lexer / parser /
+ * formatter buffers): issue #120.
+ *
+ * KEY TRICK (asu + linus, docs/issue-120-regions-design.md): an arena
+ * value carries `rc = INT32_MAX`, the EXISTING saturation sentinel the
+ * runtime already short-circuits in kai_incref / kai_decref /
+ * kai_check_unique. So to the RC machinery an arena value is
+ * indistinguishable from a singleton:
+ *   - decref is a no-op (kai_decref returns early on INT32_MAX) — FREE.
+ *   - reuse-in-place auto-disables (kai_check_unique returns 0 for
+ *     INT32_MAX) — FREE, no Perceus pass change.
+ * No new tag, no new branch in the hot RC path, no struct growth.
+ *
+ * BOOKKEEPING LANDMINE: because kai_arena_free reclaims in bulk
+ * WITHOUT walking values, kai_rc_live_now is never decremented per
+ * value. Left alone, KAI_TRACE_RC leaked-vs-iterations gates would
+ * report false leaks. Fix: a SEPARATE per-arena live count
+ * (`n_live`) is subtracted from kai_rc_live_now on free, and the
+ * dedicated kai_arena_alloc_total / kai_arena_free_total counters are
+ * surfaced in kai_rc_report() so a wrong-codegen silent leak (a
+ * non-region value mistakenly arena-allocated — invisible to ASAN
+ * because nothing is freed) shows up as alloc/free divergence.
+ *
+ * PORTABILITY: malloc-backed chunks, NOT mmap — stage0 must build on
+ * any ANSI cc with zero deps (CLAUDE.md "no deps in stage0"). The
+ * arena stack is a plain global, not __thread: kaikai fibers each run
+ * to a suspension point on the OS thread that dispatched them, so a
+ * region never spans a fiber switch in v1. A per-fiber arena stack is
+ * the natural follow-up once regions are allowed to straddle await
+ * (see docs/lane-experience-issue-120.md). */
+
+#define KAI_ARENA_CHUNK_BYTES (64 * 1024)
+#define KAI_ARENA_ALIGN       16
+
+typedef struct KaiArenaChunk {
+    struct KaiArenaChunk *next;   /* grow-only singly-linked list */
+    size_t                used;   /* bytes consumed in `data` */
+    size_t                cap;    /* usable bytes in `data` */
+    unsigned char        *data;   /* malloc-backed payload */
+} KaiArenaChunk;
+
+typedef struct KaiArena {
+    KaiArenaChunk *head;          /* current (most-recently-grown) chunk */
+    int64_t        n_live;        /* KaiValue headers stamped into this arena */
+} KaiArena;
+
+static size_t kai_arena_align_up(size_t n) {
+    return (n + (KAI_ARENA_ALIGN - 1)) & ~((size_t) (KAI_ARENA_ALIGN - 1));
+}
+
+static KaiArenaChunk *kai_arena_chunk_new(size_t need) {
+    size_t cap = KAI_ARENA_CHUNK_BYTES;
+    if (need > cap) cap = need;               /* oversized single object */
+    kai_heap_charge(sizeof(KaiArenaChunk) + cap);
+    KaiArenaChunk *c = (KaiArenaChunk *) malloc(sizeof(KaiArenaChunk));
+    if (!c) { fprintf(stderr, "kai: out of memory (arena chunk)\n"); exit(1); }
+    c->data = (unsigned char *) malloc(cap);
+    if (!c->data) { fprintf(stderr, "kai: out of memory (arena data)\n"); exit(1); }
+    c->next = NULL;
+    c->used = 0;
+    c->cap  = cap;
+    return c;
+}
+
+static void kai_arena_init(KaiArena *a) {
+    a->head   = NULL;
+    a->n_live = 0;
+}
+
+/* Raw aligned bump for interior storage (record `fields`, variant
+ * `slots`, array `items`, KAI_STR `bytes`) so an aggregate built in a
+ * region keeps ALL of its memory inside the arena — otherwise the
+ * interior arrays would dangle on bulk free. Returns uninitialised
+ * memory; the caller writes it. Not refcounted, not a KaiValue. */
+static void *kai_arena_raw(KaiArena *a, size_t nbytes) {
+    size_t need = kai_arena_align_up(nbytes ? nbytes : 1);
+    if (!a->head || a->head->used + need > a->head->cap) {
+        KaiArenaChunk *c = kai_arena_chunk_new(need);
+        c->next = a->head;
+        a->head = c;
+    }
+    void *p = a->head->data + a->head->used;
+    a->head->used += need;
+    return p;
+}
+
+/* Bump a KaiValue header into the arena, stamped with the immortal
+ * sentinel so RC skips it. Mirrors kai_alloc's header init (rc, tag,
+ * zeroed union) but never calls calloc/free and never touches the
+ * per-value RC counters — only the dedicated arena counters. Live-now
+ * is bumped so live_peak stays honest mid-region; kai_arena_free
+ * subtracts the whole batch back. */
+static KaiValue *kai_arena_alloc(KaiArena *a, KaiTag tag) {
+    KaiValue *v = (KaiValue *) kai_arena_raw(a, sizeof(KaiValue));
+    memset(v, 0, sizeof(KaiValue));
+    v->rc  = INT32_MAX;                 /* immortal sentinel: decref no-op */
+    v->tag = (uint8_t) tag;
+    a->n_live++;
+    kai_arena_alloc_total++;
+    kai_rc_count_live_inc();
+    return v;
+}
+
+/* Bulk reclaim: free every chunk WITHOUT walking values (the whole
+ * point — no per-value free, no per-value decref). Balance the trace
+ * ledger by subtracting this arena's live count from kai_rc_live_now
+ * and crediting kai_arena_free_total, then reset so the arena can be
+ * reused. */
+static void kai_arena_free(KaiArena *a) {
+    KaiArenaChunk *c = a->head;
+    while (c) {
+        KaiArenaChunk *next = c->next;
+        free(c->data);
+        free(c);
+        c = next;
+    }
+    kai_arena_free_total += a->n_live;
+    kai_rc_count_live_sub(a->n_live);
+    a->head   = NULL;
+    a->n_live = 0;
+}
+
+/* Lexical region stack. `region { ... }` pushes a fresh arena on
+ * entry and pops+frees it on exit; constructors inside the block call
+ * kai_arena_alloc on the current top. Nesting is bounded by lexical
+ * block depth — 64 is far beyond any realistic region nesting and
+ * keeps the stack a flat global with no allocation of its own. */
+#define KAI_ARENA_STACK_MAX 64
+/* One region stack per process: a `region { }` pushing in one TU and the
+ * matching pop in another must land on the same stack, so it is shared
+ * (owner defines, others extern) — a per-TU copy would push and pop two
+ * disjoint stacks and desync the region depth. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiArena kai_arena_stack[KAI_ARENA_STACK_MAX];
+extern KAI_TLS int      kai_arena_sp;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiArena kai_arena_stack[KAI_ARENA_STACK_MAX];
+KAI_TLS int      kai_arena_sp = 0;
+#  endif
+#else
+static KAI_TLS KaiArena kai_arena_stack[KAI_ARENA_STACK_MAX];
+static KAI_TLS int      kai_arena_sp = 0;
+#endif
+
+static KaiArena *kai_arena_push(void) {
+    if (kai_arena_sp >= KAI_ARENA_STACK_MAX) {
+        fprintf(stderr, "kai: region nesting exceeds %d\n", KAI_ARENA_STACK_MAX);
+        exit(1);
+    }
+    KaiArena *a = &kai_arena_stack[kai_arena_sp++];
+    kai_arena_init(a);
+    return a;
+}
+
+static KaiArena *kai_arena_current(void) {
+    if (kai_arena_sp == 0) return NULL;     /* not inside a region */
+    return &kai_arena_stack[kai_arena_sp - 1];
+}
+
+static void kai_arena_pop(void) {
+    if (kai_arena_sp == 0) return;
+    kai_arena_free(&kai_arena_stack[--kai_arena_sp]);
+}
+
+/* Immortal-sentinel test on the shared `rc` field. A Fiber[T] handle's rc
+ * is written atomically from two threads (kai_incref/kai_decref FIBER arm);
+ * the sentinel check runs before the tag is known, so on the same field it
+ * must use the same atomicity or TSAN reports a race (plain read vs atomic
+ * write). A relaxed load compiles to the same mov/ldr as a plain read on
+ * x86/arm — no branch on kai_nthreads, no barrier — so N=1 stays byte-for-
+ * byte the same hot path while TSAN still sees a synchronized access at N>1. */
+static inline int kai_rc_is_immortal(const KaiValue *v) {
+    return atomic_load_explicit((const _Atomic int32_t *) &v->rc,
+                                memory_order_relaxed) == INT32_MAX;
+}
+
+/* Increment a reference. Pure fast path — no free, no out-of-line case
+ * — so the whole body is inlined into the caller. Previously a non-inline
+ * `static KaiValue *` (a real call at every dup, the symmetric cost to
+ * the old non-inline kai_decref). KAI_PROF_ENTER/EXIT dropped: they
+ * bracketed a single increment and blocked the inline. Under tracing the
+ * counters still fire. Koka's kk_block_dup is likewise inline. */
+static inline KaiValue *kai_incref(KaiValue *v) {
+    if (kai_is_value(v) || !v || kai_rc_is_immortal(v)) {
+#ifdef KAI_TRACE_RC
+        if (v && !kai_is_value(v)) kai_rc_history_log(v, /* op=incref */ 1, v->tag);
+#endif
+        return v;
+    }
+    /* Fiber[T] wrappers carry atomic rc — cross-thread scheduler handles
+     * (the rule at KaiValue). At N=1 no worker thread exists, so the plain
+     * increment below stays byte-identical. */
+    if (kai_nthreads > 1 && v->tag == KAI_FIBER) {
+        atomic_fetch_add_explicit((_Atomic int32_t *) &v->rc, 1,
+                                  memory_order_relaxed);
+        KAI_CTR_INC(kai_rc_incref_total);
+#ifdef KAI_TRACE_RC
+        kai_rc_history_log(v, /* op=incref */ 1, v->tag);
+#endif
+        return v;
+    }
+    v->rc++;
+    /* #812 — counter ALWAYS compiled (parallels kai_rc_alloc_total),
+     * reported only under the KAI_TRACE_RC env var. Behind `#ifdef
+     * KAI_TRACE_RC` it stayed 0 in every `kai build` binary (the wrapper
+     * does not pass -DKAI_TRACE_RC), so each "RC balanced" gate that read
+     * incref_total passed vacuously on 0 == 0. */
+    KAI_CTR_INC(kai_rc_incref_total);
+#ifdef KAI_TRACE_RC
+    kai_rc_history_log(v, /* op=incref */ 1, v->tag);
+#endif
+    return v;
+}
+static void       kai_decref(KaiValue *v);
+
+/* m8 #1/#3: KaiFiber definitions sit here (before kai_free_value)
+ * because KAI_FIBER values own their KaiFiber struct and the free
+ * path needs the full layout. The handler-stack runtime
+ * (KaiEvidence + push/pop/lookup) lives further down; KaiFiber only
+ * holds a `KaiEvidence *`, so a forward declaration is enough. The
+ * Spawn default handlers (kai_default_spawn_*) come later in the
+ * file too — they reach the struct through this declaration and use
+ * kai_apply (defined further down) to invoke spawned thunks. */
+typedef struct KaiEvidence KaiEvidence;
+
+/* m8 #3 + m8.x: fiber lifecycle states. The pre-v0.4.0 runtime ran
+ * `spawn` synchronously and only ever needed NEW/DONE; the m8.x
+ * cooperative scheduler (landed v0.4.0) adds READY (enqueued in the
+ * run queue), RUNNING (currently dispatched), and PARKED (blocked
+ * on await / receive / send). Spec: docs/fibers-impl.md §*Fiber
+ * state machine*. The numeric values are not stable across versions
+ * — no ABI commitment yet (CLAUDE.md "Backward compatibility — not
+ * promised until post-MVP"). */
+typedef enum {
+    KAI_FIBER_NEW       = 0,
+    KAI_FIBER_READY     = 1,  /* m8.x */
+    KAI_FIBER_RUNNING   = 2,  /* m8.x */
+    KAI_FIBER_PARKED    = 3,  /* m8.x */
+    KAI_FIBER_DONE      = 4,
+    KAI_FIBER_CANCELLED = 5
+} KaiFiberState;
+
+typedef struct KaiFiber   KaiFiber;
+typedef struct KaiNursery KaiNursery;     /* issue #959 — defined below */
+
+/* One selector's membership in one candidate's select chain. A fiber in
+ * Spawn.select allocates an array of these on its own stack and links one
+ * into every candidate, so N candidates can each reach the selector. */
+typedef struct KaiSelectWaiter KaiSelectWaiter;
+struct KaiSelectWaiter {
+    KaiFiber        *waiter;   /* the fiber parked in select      */
+    KaiSelectWaiter *next;     /* next node in the candidate chain */
+};
+typedef struct KaiLinkNode KaiLinkNode;  /* Phase 5 — defined below */
+typedef struct KaiMonitorNode KaiMonitorNode;  /* Tier 2 Monitor — defined below */
+
+struct KaiFiber {
+    KaiEvidence    *evidence_top;
+    /* M:N — the ONE per-fiber field that goes atomic. A cross-thread
+     * Spawn.cancel writes it (relaxed) while the target reads it at its
+     * own yield points (acquire); making it _Atomic keeps that the sole
+     * synchronized field and leaves the object-RC hot path atomic-free.
+     * At N=1 an _Atomic int on this platform is a plain aligned int. */
+    _Atomic int     cancel_requested;  /* Spawn.cancel(target) sets this (#4) */
+    int             cancel_delivered;  /* Cancel.raise() injected once (#4)   */
+    KaiFiber       *sched_next;        /* intrusive ready-queue link          */
+    KaiFiber       *parent;            /* spawning fiber, NULL for the root   */
+    /* M:N — the fiber's lifecycle state transitions under several different
+     * locks depending on the path (the parker's slot in kai_sched_park, the
+     * target's slot in remote_unpark, kai_reactor_mu in commit_park, the
+     * child's slot in the await/terminate handshake) and is read locklessly
+     * by peers, so it is _Atomic: that is the single field with no one
+     * covering lock, and making it atomic keeps every transition race-free
+     * without forcing one global scheduler lock. A plain aligned int at N=1. */
+    _Atomic KaiFiberState   state;
+    KaiValue       *thunk;             /* held alive while the fiber runs     */
+    KaiValue       *result;            /* set on DONE; what await returns     */
+    /* m8.x cooperative scheduler additions. Spec: docs/fibers-impl.md
+     * §*Scheduler*. main_fiber leaves ctx zero-initialised (filled in
+     * by getcontext on first dispatch); spawned fibers fill ctx via
+     * makecontext + a heap-allocated stack. */
+    ucontext_t      ctx;               /* swapcontext target              */
+    void           *stack_base;        /* heap-allocated; freed on RC=0   */
+    size_t          stack_size;        /* set per fiber (env-configurable) */
+    KaiFiber       *awaiters_head;     /* per-fiber awaiter chain head    */
+    KaiFiber       *awaiters_next;     /* link into another fiber's chain */
+    /* Spawn.select waiters. Separate from the awaiter chain because
+     * `awaiters_next` is a single link: a selector waits on every
+     * candidate at once, so its membership cannot be one pointer in
+     * its own struct. Each node is owned by the selector's stack frame
+     * and lives only while it is parked. Guarded by the candidate's
+     * slot lock, exactly like `awaiters_head`. */
+    KaiSelectWaiter *select_waiters_head;
+    /* m8.x Phase 3 — Cancel delivery at yield points. The trampoline
+     * sets up cancel_pad with setjmp before running the body; the
+     * yield-point hook in kai_evidence_lookup* longjmps here when the
+     * fiber's cancel_requested flag fires, unwinding the body to the
+     * trampoline's cancel branch (state=CANCELLED). cancel_pad_set
+     * gates the longjmp so it's only attempted while the pad is live
+     * — main_fiber never runs through the trampoline, so its
+     * cancel_pad stays unset and Cancel.raise() in main falls back to
+     * exit(0) (the m8 v1 behaviour for unhandled root cancellation). */
+    jmp_buf         cancel_pad;
+    int             cancel_pad_set;
+    /* Fiber-level trap isolation. A recoverable trap (index out of
+     * range, divide by zero, non-exhaustive match) unwinds to
+     * cancel_pad like Cancel does, but sets `trapped` so the
+     * trampoline reports KAI_EXIT_TRAPPED instead of CRASHED — a
+     * program bug, distinguishable from cooperative cancellation.
+     * trap_msg is a static C string (never freed). With no pad
+     * installed (main_fiber) a trap terminates the process. */
+    int             trapped;
+    const char     *trap_msg;
+    /* Phase 5 — intrusive list of linked peer fibers. Walked at
+     * trampoline termination (DONE or CANCELLED branches) to set
+     * cancel_requested on each peer. Owned by the fiber; nodes are
+     * freed during the propagation walk and as a safety net in
+     * kai_free_value's KAI_FIBER branch. */
+    KaiLinkNode    *linked_head;
+    /* Per-fiber dispatch state. Points at the evidence node whose clause
+     * body is currently on this fiber's stack, or NULL otherwise.
+     * `kai_evidence_lookup_node` skips it so a `Eff.op(...)` invoked from
+     * inside the clause resolves to the outer handler instead of recursing.
+     * The op-call site saves the previous value, sets this to its own node,
+     * runs the clause, then restores.
+     *
+     * Trap: the skip rule makes a stale value here MASK a live handler —
+     * the walk then reports the effect as unhandled even though the node is
+     * on the chain with a valid handler. A non-local exit out of a clause
+     * (a longjmp past the restore) leaves exactly that state. */
+    KaiEvidence    *in_dispatch_node;
+    /* R4 fix — back-pointer to the KaiValue wrapper that owns this
+     * fiber struct. Set in kai_fiber_value when the wrapper is
+     * allocated; the scheduler holds an incref on the wrapper from
+     * spawn-enqueue until the trampoline's DONE/CANCELLED tail, which
+     * `kai_decref`s `value`. Pairing the scheduler-side ref with the
+     * caller-side ref makes `let _ = fiber_spawn(…)` (discarding the
+     * Fiber value) safe: the wrapper stays alive while the struct is
+     * still referenced from the run queue. NULL on `kai_main_fiber`,
+     * which has no wrapper (it represents the OS thread). */
+    KaiValue       *value;
+    /* Tier 2 — trap-exit semantics. When 0 (default), a linked peer's
+     * termination sets cancel_requested on this fiber (the v1 uniform
+     * propagation). When 1, the propagation walk pushes a String into
+     * this fiber's mailbox instead — "Normal" if the peer terminated
+     * via DONE, "Crashed" if via CANCELLED — and leaves
+     * cancel_requested untouched. Toggled by Spawn.set_trap_exit;
+     * spec: docs/actors.md §*Supervision: links and monitors* /
+     * *Trap-exit semantics*. The flag is per-fiber, not per-link, so
+     * it must be set before the link that should respect it; later
+     * toggles affect future propagations only. */
+    int             trap_exit;
+    /* Tier 2 — most-recently-allocated mailbox owned by this fiber.
+     * Set by kai_mailbox_alloc[_bounded] and cleared by
+     * kai_mailbox_close. Read by kai_link_propagate_terminate when
+     * trap_exit=1 to find a delivery target for the Exit string.
+     * v1 simplification: nested with_mailbox is not tracked — the
+     * inner allocation overwrites and the inner free clears the
+     * slot, leaving the outer mailbox unreachable to the trap-exit
+     * walker until the inner scope exits. Demos do not nest.
+     * Forward-declared as struct KaiMailbox * because the full
+     * KaiMailbox typedef sits below KaiFiber in this header. */
+    struct KaiMailbox *mailbox;
+    /* Tier 2 — intrusive list of fibers monitoring this one. Each
+     * Monitor.monitor(target_pid) call from an observer fiber
+     * appends a node here on the *target* fiber. At trampoline
+     * termination (DONE or CANCELLED) the walker pops every entry
+     * and pushes the original target_pid value into the observer's
+     * mailbox, leaving the observer's cancel_requested untouched
+     * (monitors do not propagate faults — `docs/actors.md` §*Fault
+     * propagation*). Owned by the target fiber; nodes are freed in
+     * the propagation walk and as a safety net in
+     * kai_free_value's KAI_FIBER branch. */
+    KaiMonitorNode *monitor_head;
+    /* Issue #611 — Phase R1 reactor metadata. A parked fiber lives
+     * on exactly one reactor list at a time (timer wheel, pid waiter
+     * map, or file-pool waiter list), so a single intrusive link slot
+     * is sufficient. The companion data members carry the wakeup
+     * payload that the parking op needs to read on resume:
+     *   reactor_deadline_ns — monotonic deadline for timer-wheel parks.
+     *   reactor_wait_pid    — pid the fiber is waiting on (Process.wait).
+     *   reactor_wait_status — waitpid status filled by the SIGCHLD drain.
+     *   reactor_data        — generic pointer slot used by the file
+     *                         thread-pool offload to publish the
+     *                         completed `KaiValue *` result before
+     *                         waking the parked fiber.
+     * The slots are read once on resume; nothing else in the runtime
+     * touches them. Zero is a valid "not parked here" sentinel for
+     * all four. */
+    KaiFiber       *reactor_next;
+    uint64_t        reactor_deadline_ns;
+    int             reactor_wait_pid;
+    int             reactor_wait_status;
+    void           *reactor_data;
+    /* Issue #959 — structured-concurrency scope. `nursery_top` is the
+     * innermost open nursery on THIS fiber (a per-fiber stack so a
+     * spawned child opening its own nursery does not collide with the
+     * parent's; nesting composes Trio-style). `Spawn.spawn` registers
+     * the new child on `kai_active_fiber->nursery_top`'s children list
+     * via `scope_sibling_next`. `nursery_exit` joins every child on
+     * that list before returning, cancelling the rest and re-raising
+     * on the first child that terminated CANCELLED. NULL when no
+     * nursery is open (bare spawns then have no scope to join). */
+    struct KaiNursery *nursery_top;
+    KaiFiber          *scope_sibling_next;
+    /* The nursery this fiber was spawned into (NULL for bare spawns).
+     * Read by the trampoline's cancel branch to cancel siblings
+     * eagerly; valid there because the owner cannot free the scope
+     * until it has joined this fiber, which requires the terminal
+     * state store that follows the walk. */
+    struct KaiNursery *scope_nursery;
+    /* M:N scheduler — the OS scheduler thread that owns this fiber's
+     * heap and runs it. A fiber runs on exactly one thread at a time;
+     * `home_thread` is where it was spawned and where it parks. A
+     * cross-thread `Actor.send` reads it (lock-free) to decide copy vs
+     * pointer transfer, and a thief writes it (lock-free) when it steals
+     * the fiber — so it is atomic: the store publishes the new owner and
+     * every reader acquire-loads it, matching the `live`-slot discipline.
+     * Under N=1 every fiber's home_thread is 0, the copy branch is never
+     * taken, and an _Atomic int is a plain aligned int on our targets. */
+    _Atomic int home_thread;
+    /* M:N — when set, this fiber may only ever run on thread 0, the OS
+     * thread `main` entered on. Thread-affine C libraries (AppKit, and
+     * through it GLFW/SDL/GTK) trap if initialised or pumped off the
+     * process main thread, so the entry fiber carries the pin and every
+     * other fiber keeps migrating freely. Read by the thief (skip) and by
+     * enqueue (route to thread 0 instead of the caller's slot); never
+     * written after spawn. */
+    int pinned_main;
+    /* M:N — a cross-thread wake that arrives while this fiber is still
+     * RUNNING (it enqueued its recv-waiter but has not yet reached the
+     * park swap) is recorded here instead of lost. The park path checks
+     * it after marking PARKED and re-readies itself if non-zero, closing
+     * the enqueue-waiter / park lost-wakeup window. Touched only under
+     * the owner slot lock. */
+    int wake_pending;
+    /* F2 — dedicated reactor thread. A reactor park (sleep, socket, pid,
+     * stdin, signal, file-pool) stamps the reason here on the fiber's own
+     * stack, then yields to the scheduler root WITHOUT touching any shared
+     * reactor structure. The root, running on kai_main_fiber (never the
+     * parked fiber's stack), links the fiber into the wheel/waiter list
+     * from `kai_sched_commit_park` — so no thief or reactor drain can
+     * observe the fiber on a reactor list until its exit swap has finished
+     * writing its ctx. Zero (KAI_PARK_NONE, calloc-cleared) means "not a
+     * reactor park"; the mailbox/await park path leaves it zero and takes
+     * the wake_pending discipline instead. Reactor-only; unused at N=1. */
+    int pending_park;
+    /* Set (under kai_reactor_mu) by whichever reactor drain or detach
+     * actually spliced this fiber out of a reactor structure; cleared by
+     * kai_sched_park before every park. On resume it distinguishes a wake
+     * the reactor delivered from a spurious one (a stale unpark aimed at an
+     * earlier park, or a consumed wake_pending permit): a reactor park site
+     * must re-park when it resumes with this still 0 and its own predicate
+     * unmet, never conclude its deadline or event fired. */
+    int reactor_fired;
+    /* F2 — per-thread pending-commit stack link. `kai_sched_park` pushes a
+     * reactor-parking fiber here before swapping to the root; the root
+     * drains the stack post-swap and commits each. A stack (not a single
+     * slot) because two parks can interpose before the root drains. */
+    KaiFiber *commit_next;
+    /* ThreadSanitizer's per-fiber bookkeeping handle, or NULL outside a TSAN
+     * build. TSAN tracks a shadow stack and a sync clock per OS thread and
+     * cannot see a ucontext switch, so without this every fiber's function
+     * entries and exits land on whichever thread happens to run it; a fiber
+     * that migrates pushes on one thread and pops on another, and the
+     * imbalance eventually walks a shadow stack off its fixed-size mapping.
+     * See KAI_TSAN_SWITCH_TO. */
+    void *tsan_fiber;
+};
+
+/* Issue #959 — one open structured-concurrency scope. Children spawned
+ * while this scope is the active fiber's `nursery_top` are pushed on
+ * `children_head` (intrusive via the child's `scope_sibling_next`).
+ * `parent` chains to the enclosing nursery so a nested `nursery { }`
+ * restores it on exit. The scope holds one extra ref on each child's
+ * wrapper (taken at registration, released at join) so a discarded
+ * `Fiber[T]` handle cannot free the struct before the scope joins it.
+ *
+ * `children_head` is atomic because a failing child walks the list
+ * from its own thread (eager cancel-on-fail) while the owner may
+ * still be pushing spawns; the owner's store publishes the new
+ * node's `scope_sibling_next` to that walker.
+ *
+ * `failed_child` latches the first child that terminated CANCELLED
+ * without a requested cancellation. The latch elects a single eager
+ * walker when two children fail at once, and it is what `scope_exit`
+ * trusts for failure: the eager walk sets `cancel_requested` on
+ * peers, so a concurrently-failing peer can terminate flagged and
+ * would otherwise read as an expected cancellation, swallowing the
+ * failure. */
+struct KaiNursery {
+    _Atomic(KaiFiber *) children_head;
+    KaiNursery         *parent;
+    _Atomic(KaiFiber *) failed_child;
+};
+
+/* kai_main_fiber starts as the OS-thread context, representing the
+ * dispatch loop. Its ctx is filled lazily on first yield (getcontext at
+ * the moment we suspend the dispatch loop into a fiber). The active-fiber
+ * pointer (kai_active_fiber) tracks whoever is currently executing;
+ * kai_current_fiber returns it.
+ *
+ * Scheduler state is process-global: a fiber spawned by one TU is parked,
+ * resumed, and freed by another, so under separate compilation there is
+ * one shared scheduler (extern everywhere, owner defines) — a per-TU copy
+ * would split the ready queue and the active-fiber pointer in two. The
+ * active-fiber initializer takes kai_main_fiber's address, so both live in
+ * the owner TU together; other TUs see the same address via extern.
+ * Spec: docs/fibers-impl.md §*Dispatch loop*. */
+#define KAI_MAIN_FIBER_INIT {                                            \
+    NULL,                /* evidence_top */                              \
+    0, 0,                /* cancel_requested, cancel_delivered */        \
+    NULL, NULL,          /* sched_next, parent */                        \
+    KAI_FIBER_RUNNING,   /* state — main starts running on the OS thread */ \
+    NULL, NULL,          /* thunk, result */                            \
+    {0},                 /* ctx — getcontext fills it on first swap */   \
+    NULL, 0,             /* stack_base, stack_size — main uses OS stack */ \
+    NULL, NULL,          /* awaiters_head, awaiters_next */              \
+    NULL,                /* select_waiters_head */                       \
+    {0}, 0,              /* cancel_pad, cancel_pad_set — main has no pad */ \
+    0, NULL,             /* trapped, trap_msg — main starts untrapped */  \
+    NULL,                /* linked_head */                               \
+    NULL,                /* in_dispatch_node */                          \
+    NULL,                /* value — main has no wrapper */               \
+    0,                   /* trap_exit — main starts opted out */         \
+    NULL,                /* mailbox — set by with_mailbox if main uses one */ \
+    NULL,                /* monitor_head — Monitor.monitor(...) appends here */ \
+    NULL, 0, 0, 0, NULL, /* reactor_next, _deadline_ns, _wait_pid, _wait_status, _data */ \
+    NULL, NULL, NULL,    /* nursery_top, scope_sibling_next, scope_nursery */ \
+    0,                   /* home_thread — thread 0 is the main scheduler */ \
+    0,                   /* pinned_main — a scheduler root never migrates */ \
+    0,                   /* wake_pending */                              \
+    0,                   /* pending_park — not a reactor park */          \
+    0,                   /* reactor_fired */                              \
+    NULL,                /* commit_next */                               \
+    NULL                 /* tsan_fiber — bound on this thread's first switch */ \
+}
+/* `kai_active_fiber` cannot be statically initialised to `&kai_main_fiber`
+ * now that both are `_Thread_local`: the address of a thread-local is not a
+ * compile-time constant. It is anchored to each thread's own `kai_main_fiber`
+ * on that thread's first entry (kai_active_fiber_anchor, run from
+ * kai_set_args and lazily from kai_current_fiber for the pre-main path). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiFiber  kai_main_fiber;
+extern KAI_TLS KaiFiber *kai_active_fiber;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiFiber  kai_main_fiber   = KAI_MAIN_FIBER_INIT;
+KAI_TLS KaiFiber *kai_active_fiber = NULL;
+#  endif
+#else
+static KAI_TLS KaiFiber  kai_main_fiber   = KAI_MAIN_FIBER_INIT;
+static KAI_TLS KaiFiber *kai_active_fiber = NULL;
+#endif
+
+/* ---------- ThreadSanitizer fiber annotations ----------
+ *
+ * TSAN keys its shadow stack and sync clocks to the OS thread. A ucontext
+ * switch is invisible to it, so an unannotated fiber runtime feeds one
+ * thread's bookkeeping with another fiber's entries: under work stealing a
+ * fiber pushes frames on the thread that started it and pops them on the
+ * thread that resumed it, and the drift eventually walks a shadow stack off
+ * its mapping — a store fault inside the sanitizer, which the process then
+ * spins on rather than dying. The annotations below give
+ * each fiber (and each thread's scheduler root) its own TSAN state, which is
+ * what makes race reports meaningful under M:N at all.
+ *
+ * Every swapcontext/setcontext in the scheduler is immediately preceded by
+ * KAI_TSAN_SWITCH_TO / KAI_TSAN_SWITCH_TO_ROOT. Outside a TSAN build all of
+ * this compiles away.
+ *
+ * The switch itself is a macro, not a function, and that is load-bearing.
+ * TSAN pushes a frame record on entry to every instrumented function and pops
+ * one on return; a helper that changed fiber identity in its middle would push
+ * onto the outgoing fiber's shadow stack and pop from the incoming one,
+ * leaking a record per switch until a shadow stack ran off the end of its
+ * mapping — the very failure these annotations exist to prevent. Expanded at
+ * the call site, the identity change happens inside a frame that enters and
+ * leaves on one fiber, so the bookkeeping stays balanced. The two out-of-line
+ * accessors below run entirely on the outgoing fiber, before the switch. */
+#if defined(__SANITIZE_THREAD__)
+#  define KAI_TSAN_FIBERS 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define KAI_TSAN_FIBERS 1
+#  endif
+#endif
+
+#if defined(KAI_TSAN_FIBERS)
+void *__tsan_get_current_fiber(void);
+void *__tsan_create_fiber(unsigned flags);
+void  __tsan_destroy_fiber(void *fiber);
+void  __tsan_switch_to_fiber(void *fiber, unsigned flags);
+
+/* This thread's scheduler root adopts the thread's own TSAN state rather than
+ * a fresh one, so a root never looks like a fiber. It must be captured while
+ * the thread is still running AS the root — `__tsan_get_current_fiber()` from
+ * inside a fiber would alias the root's handle onto that fiber's state, and
+ * every later "switch back to root" would then land on a fiber. Hence the
+ * eager bind at the top of each scheduler loop rather than a lazy one at the
+ * first switch. noinline for the same reason kai_current_fiber is: the
+ * thread-local slot must be re-resolved on whatever thread runs this, never
+ * spilled across a swap by a caller whose frame spans one (the trampoline's
+ * does). */
+__attribute__((noinline))
+static void kai_tsan_bind_root(void) {
+    if (!kai_main_fiber.tsan_fiber) {
+        kai_main_fiber.tsan_fiber = __tsan_get_current_fiber();
+    }
+}
+
+__attribute__((noinline))
+static void *kai_tsan_root_fiber(void) {
+    return kai_main_fiber.tsan_fiber;
+}
+
+/* A fiber's own state, created on first dispatch. */
+__attribute__((noinline))
+static void *kai_tsan_fiber_of(KaiFiber *f) {
+    if (!f->tsan_fiber) f->tsan_fiber = __tsan_create_fiber(0);
+    return f->tsan_fiber;
+}
+
+#define KAI_TSAN_BIND_ROOT()      kai_tsan_bind_root()
+#define KAI_TSAN_SWITCH_TO(f)     __tsan_switch_to_fiber(kai_tsan_fiber_of(f), 0)
+#define KAI_TSAN_SWITCH_TO_ROOT() __tsan_switch_to_fiber(kai_tsan_root_fiber(), 0)
+
+/* Release a finished fiber's TSAN state. Called from the deferred-free drain,
+ * which runs on another context, so the state being dropped is never current. */
+static void kai_tsan_fiber_free(KaiFiber *f) {
+    if (f->tsan_fiber) {
+        __tsan_destroy_fiber(f->tsan_fiber);
+        f->tsan_fiber = NULL;
+    }
+}
+#else
+#define KAI_TSAN_BIND_ROOT()      ((void) 0)
+#define KAI_TSAN_SWITCH_TO(f)     ((void) 0)
+#define KAI_TSAN_SWITCH_TO_ROOT() ((void) 0)
+static inline void kai_tsan_fiber_free(KaiFiber *f) { (void) f; }
+#endif
+
+/* noinline is load-bearing: inlined into a fiber body, clang materialises
+ * TP+offset and spills it across the park swapcontext, so a work-stolen
+ * fiber would resume reading the creator thread's TLS. Out of line the
+ * thread pointer is re-read on every call, on whatever thread now runs. */
+__attribute__((noinline))
+static void kai_active_fiber_anchor(void) {
+    if (kai_active_fiber == NULL) kai_active_fiber = &kai_main_fiber;
+}
+
+/* Every read of the active fiber goes through here, never through a bare
+ * `kai_active_fiber`. A bare read inlined into a frame that spans a park lets
+ * the compiler resolve the TLS slot address once and spill it across the swap;
+ * a work-stolen fiber then resumes reading the parking thread's slot and gets
+ * some other thread's active fiber. Out of line the slot is re-resolved on
+ * whatever thread now runs. */
+__attribute__((noinline))
+static KaiFiber *kai_current_fiber(void) {
+    kai_active_fiber_anchor();
+    return kai_active_fiber;
+}
+
+/* Assign kai_active_fiber from OUT OF LINE. Load-bearing across a
+ * swapcontext resume: an inline `kai_active_fiber = f` resolves the TLS slot
+ * address once (a tlv_get_addr call on darwin) and, even at -O0, spills that
+ * address to the stack across the swap. A fiber that parks on one thread and
+ * resumes on another (work-stealing) would then store through the parking
+ * thread's slot, rotating every thread's active pointer. Out of line the slot
+ * is re-resolved on whatever thread now runs. Mirrors kai_active_fiber_anchor. */
+__attribute__((noinline))
+static void kai_set_active_fiber(KaiFiber *f) {
+    kai_active_fiber = f;
+}
+
+static void kai_evidence_unwind_all(void);
+
+/* A recoverable runtime trap (index out of range, divide by zero,
+ * non-exhaustive match). With a fiber pad installed, unwind to it
+ * like Cancel — the trampoline reports the fiber TRAPPED and a
+ * supervisor contains the fault. With no pad (main_fiber, or before
+ * runtime init) terminate the process, preserving the pre-existing
+ * top-level behaviour. `msg` must be a static string. */
+static void kai_trap_abort(const char *msg) {
+    KaiFiber *f = kai_current_fiber();
+    if (f && f->cancel_pad_set) {
+        f->trapped  = 1;
+        f->trap_msg = msg;
+        kai_evidence_unwind_all();
+        longjmp(f->cancel_pad, 1);
+        /* Unreachable. */
+    }
+    fprintf(stderr, "kai: trap: %s\n", msg ? msg : "runtime trap");
+    exit(1);
+}
+
+/* Ready queue (intrusive singly-linked, head/tail). Fibers go on the queue
+ * when spawned (NEW→READY) or unparked (PARKED→READY); off the queue when
+ * dispatched (READY→RUNNING). The dispatch loop drains it; deadlock
+ * detection panics when the queue is empty *and* parked fibers exist with
+ * no wakeup path. Shared like the rest of the scheduler. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiFiber *kai_ready_head;
+extern KAI_TLS KaiFiber *kai_ready_tail;
+extern KAI_TLS int       kai_parked_count;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiFiber *kai_ready_head = NULL;
+KAI_TLS KaiFiber *kai_ready_tail = NULL;
+KAI_TLS int       kai_parked_count = 0;
+#  endif
+#else
+static KAI_TLS KaiFiber *kai_ready_head = NULL;
+static KAI_TLS KaiFiber *kai_ready_tail = NULL;
+static KAI_TLS int       kai_parked_count = 0;  /* deadlock detection */
+#endif
+
+/* ==================================================================
+ * M:N work-stealing scheduler — cross-thread infrastructure.
+ * docs/mn-scheduler-design.md §2. Off entirely at N=1 (the default):
+ * kai_nthreads==1 makes every cross-thread branch below inert, so the
+ * single-thread scheduler runs byte-identically to the pre-M:N runtime.
+ * ================================================================== */
+
+/* This scheduler thread's id: 0 is the main thread, 1..N-1 the workers.
+ * Class A (per-thread). A freshly spawned fiber inherits its spawner's
+ * id as home_thread. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS int kai_thread_id;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS int kai_thread_id = 0;
+#  endif
+#else
+static KAI_TLS int kai_thread_id = 0;
+#endif
+
+/* Per-thread scheduler slot: this thread's ready deque, the single
+ * source of truth at N>1. The owner pushes/pops both ends and a thief
+ * pulls the head, all under `mu` — the mutex is touched only on
+ * enqueue/dequeue/steal/remote-unpark, never on the per-op RC path.
+ * `live` marks the slot as a steal target once its thread is running; a
+ * thief reads it outside `mu` (before deciding to lock), so it is atomic:
+ * a worker publishes `live=1` at startup and every thief acquire-loads it. */
+typedef struct KaiSchedSlot {
+    pthread_mutex_t mu;
+    KaiFiber       *steal_head;   /* fibers available to steal (FIFO) */
+    KaiFiber       *steal_tail;
+    _Atomic int     live;         /* slot participates in stealing */
+} KaiSchedSlot;
+
+#define KAI_MAX_THREADS 256
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiSchedSlot kai_sched_slots[KAI_MAX_THREADS];
+#  if defined(KAI_RUNTIME_OWNER)
+KaiSchedSlot kai_sched_slots[KAI_MAX_THREADS];
+#  endif
+#else
+static KaiSchedSlot kai_sched_slots[KAI_MAX_THREADS];
+#endif
+
+/* Count of threads currently idle (blocked on their cv). A cross-thread
+ * producer reads it to decide whether a wakeup signal is worth sending;
+ * The workers poll `kai_sched_shutting_down` at the top of their loop, so
+ * it is atomic (a single writer at shutdown, many lock-free readers) and
+ * needs no lock — the scheduler has no other cross-thread global state
+ * beyond the per-slot deques. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern _Atomic int kai_sched_shutting_down;   /* main returned → workers exit */
+#  if defined(KAI_RUNTIME_OWNER)
+_Atomic int kai_sched_shutting_down = 0;
+#  endif
+#else
+static _Atomic int kai_sched_shutting_down = 0;
+#endif
+
+/* M:N global-quiescence deadlock detection. The single-thread dispatch loop
+ * declares deadlock when its run queue drains with fibers still PARKED; no
+ * single worker can make that call under M:N (a peer might hold runnable
+ * work), so these globals let an idle worker confirm the WHOLE machine is
+ * wedged before it does. A deadlock is a stable state, so the check keys on
+ * quiescence, never elapsed time — a long-running program is never killed.
+ *
+ *   kai_sched_idle_count    — workers parked in the idle nap. == kai_nthreads
+ *                             means no fiber is RUNNING, so no fiber body can
+ *                             produce new runnable work.
+ *   kai_blocked_fiber_count — fibers currently in KAI_FIBER_PARKED (mailbox
+ *                             recv / await / send-block AND reactor waiters);
+ *                             the count the deadlock banner reports.
+ *   kai_deadlock_reported   — claimed by CAS so exactly one worker prints the
+ *                             banner. Quiescence is observable by every idle
+ *                             worker at once, so without it the banner count
+ *                             is a scheduling race.
+ * The reactor's own idle state is kai_reactor_idle, beside the reactor
+ * globals below. Untouched at N=1 (that path keeps the TLS kai_parked_count). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern _Atomic int kai_sched_idle_count;
+extern _Atomic int kai_blocked_fiber_count;
+extern _Atomic int kai_deadlock_reported;
+#  if defined(KAI_RUNTIME_OWNER)
+_Atomic int kai_sched_idle_count = 0;
+_Atomic int kai_blocked_fiber_count = 0;
+_Atomic int kai_deadlock_reported = 0;
+#  endif
+#else
+static _Atomic int kai_sched_idle_count = 0;
+static _Atomic int kai_blocked_fiber_count = 0;
+static _Atomic int kai_deadlock_reported = 0;
+#endif
+
+/* Park/wake trace for the deadlock banner. `kai_blocked_fiber_count` has a
+ * single decrement site (the PARKED branch of kai_sched_remote_unpark) while
+ * kai_reactor_parked_count has eight, so a fiber promoted off a reactor
+ * structure but flipped READY before the handback reaches it leaves the pair
+ * skewed — parked_count 0 with blocked_fiber_count > 0, which is exactly what
+ * the banner reports. The ring records the transitions the banner cannot
+ * reconstruct: enabled only when KAI_TRACE_PARK is set, so a normal run pays
+ * one predictable load per event and no formatting. */
+#define KAI_PARK_TRACE_CAP 64
+
+typedef struct {
+    const KaiFiber *fiber;
+    const char     *event;
+    int             thread;
+    int             state;
+    int             wake_pending;
+    int             reactor_fired;
+    int             blocked_count;
+    int             parked_count;
+} KaiParkTraceEntry;
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern _Atomic int       kai_park_trace_on;
+extern KaiParkTraceEntry kai_park_trace_ring[KAI_PARK_TRACE_CAP];
+extern _Atomic unsigned  kai_park_trace_seq;
+#  if defined(KAI_RUNTIME_OWNER)
+_Atomic int       kai_park_trace_on = -1;
+KaiParkTraceEntry kai_park_trace_ring[KAI_PARK_TRACE_CAP];
+_Atomic unsigned  kai_park_trace_seq = 0;
+#  endif
+#else
+static _Atomic int       kai_park_trace_on = -1;
+static KaiParkTraceEntry kai_park_trace_ring[KAI_PARK_TRACE_CAP];
+static _Atomic unsigned  kai_park_trace_seq = 0;
+#endif
+
+/* F2 — reactor park reasons stamped into KaiFiber.pending_park. Zero is
+ * "not a reactor park" (calloc-cleared), so a spawned or mailbox-parked
+ * fiber never looks pending. `kai_sched_commit_park` dispatches on these
+ * to link the fiber into the matching reactor waiter structure. */
+#define KAI_PARK_NONE          0
+#define KAI_PARK_TIMER         1
+#define KAI_PARK_PID           2
+#define KAI_PARK_SOCKET_READ   3
+#define KAI_PARK_SOCKET_WRITE  4
+#define KAI_PARK_STDIN         5
+#define KAI_PARK_SIGNAL        6
+#define KAI_PARK_FILEPOOL      7
+/* Non-reactor park (mailbox recv, await, send-block). Committed under the
+ * fiber's slot lock — not reactor_mu — by kai_sched_commit_park. Deferred
+ * like the reactor reasons so PARKED is set only after the exit swap saved
+ * the fiber's ctx, closing the steal-a-half-saved-context race at N>1. */
+#define KAI_PARK_SLOT          8
+
+/* F2 — per-thread head of the pending-commit stack (fibers that stamped a
+ * reactor park and yielded, waiting for the root to link them). Drained by
+ * `kai_drain_commit_stack` at the scheduler root after every dispatch swap.
+ * Class A (per-thread): each scheduler thread commits only its own parks. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiFiber *kai_commit_stack_head;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiFiber *kai_commit_stack_head = NULL;
+#  endif
+#else
+static KAI_TLS KaiFiber *kai_commit_stack_head = NULL;
+#endif
+
+/* F2 — per-thread head of the pending-requeue stack: fibers that yielded
+ * and must be put back on the steal list, but only AFTER their exit swap
+ * saved their ctx (publishing a fiber to the steal list before its ctx is
+ * written lets a thief resume a half-saved context — a race invisible to
+ * TSAN because swapcontext/ucontext_t is opaque). Like the commit stack it
+ * is drained on the root post-swap; the two never hold the same fiber (a
+ * yield and a reactor park are mutually exclusive), so both reuse the
+ * fiber's `commit_next` link. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiFiber *kai_requeue_stack_head;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiFiber *kai_requeue_stack_head = NULL;
+#  endif
+#else
+static KAI_TLS KaiFiber *kai_requeue_stack_head = NULL;
+#endif
+
+/* F2 forward decls — the dedicated-reactor-thread machinery. Bodies live
+ * alongside the reactor implementation (commit_park, mark_ready) and the
+ * scheduler primitives (drain_commit_stack). */
+static void kai_sched_commit_park(KaiFiber *f);
+static void kai_drain_commit_stack(void);
+static inline int  kai_fiber_slot_lock(KaiFiber *f);
+static inline void kai_fiber_slot_unlock_at(int home);
+static void kai_drain_requeue_stack(void);
+static void kai_reactor_mark_ready(KaiFiber *f);
+static void kai_reactor_wake(void);
+
+/* M:N forward decls — bodies live alongside the scheduler primitives.
+ * `kai_sched_remote_unpark` promotes a fiber owned by another thread:
+ * it enqueues onto that thread's steal deque and wakes it. Used by the
+ * cross-thread mailbox send path (which runs on the sender's thread but
+ * must resume a receiver parked on the owner's thread). */
+static void kai_sched_remote_unpark(KaiFiber *target);
+static void kai_sched_wake_thread(int tid);
+/* Single-slot pending-free for fiber structs whose wrappers went to RC=0
+ * while the fiber itself was still the current fiber (the trampoline tail's
+ * kai_decref(self->value) is the producer). Drained at every entry point
+ * that follows a context switch (top of trampoline, post-swapcontext in
+ * yield/park) so the freed stack is never the one we are running on. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiFiber *kai_pending_free;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiFiber *kai_pending_free = NULL;
+#  endif
+#else
+static KAI_TLS KaiFiber *kai_pending_free = NULL;
+#endif
+
+/* Single-slot deferred drop of the trampoline tail's own scheduler ref
+ * (`self->value`) at N>1. The tail keeps running on its private stack after
+ * dropping that ref (dequeue + setcontext below), so dropping it inline would
+ * let a peer thread holding the last other ref (a discarded Fiber[T] handle)
+ * take RC to 0 and munmap the stack out from under the still-running tail.
+ * Stashing the ref keeps RC >= 1 across the tail; the next context drops it
+ * once the setcontext has left the doomed stack. Same drain sites and
+ * single-slot discipline as kai_pending_free (every consumer drains before the
+ * next produce). N=1 has no peer thread and decrefs inline (byte-identical). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiValue *kai_pending_sched_drop;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiValue *kai_pending_sched_drop = NULL;
+#  endif
+#else
+static KAI_TLS KaiValue *kai_pending_sched_drop = NULL;
+#endif
+
+/* The pending-free slots are thread-local. Routed through noinline accessors
+ * so the slot address is materialised and consumed inside one activation:
+ * inlined into an emitted frame that spans a park, the store could land in the
+ * parking thread's slot after a work-steal, and a peer's drain would then
+ * munmap a stack this thread still owns. Take/set exchange only the value. */
+__attribute__((noinline))
+static void kai_pending_free_set(KaiFiber *f) { kai_pending_free = f; }
+__attribute__((noinline))
+static KaiFiber *kai_pending_free_take(void) {
+    KaiFiber *f = kai_pending_free;
+    if (f) kai_pending_free = NULL;
+    return f;
+}
+__attribute__((noinline))
+static void kai_pending_sched_drop_set(KaiValue *v) { kai_pending_sched_drop = v; }
+__attribute__((noinline))
+static KaiValue *kai_pending_sched_drop_take(void) {
+    KaiValue *v = kai_pending_sched_drop;
+    if (v) kai_pending_sched_drop = NULL;
+    return v;
+}
+
+/* Forward decl — defined alongside the m8.x fiber stack allocator
+ * later in the file, but used here by the free path (munmap needs the
+ * stack_size + page_size total). */
+static size_t kai_page_size(void);
+
+/* Linux's <sys/mman.h> exposes MAP_ANONYMOUS; older BSD-style headers
+ * (and the legacy macOS spelling) use MAP_ANON. Define whichever the
+ * platform omits in terms of the other so the fiber stack mmap call
+ * compiles on both. */
+#if !defined(MAP_ANON) && defined(MAP_ANONYMOUS)
+#  define MAP_ANON MAP_ANONYMOUS
+#endif
+
+static void kai_drain_pending_free(void) {
+    /* Drop a trampoline tail's deferred scheduler ref first: we are now on
+     * the next context's stack, so the doomed tail's stack is abandoned and
+     * this decref (which may take RC to 0 and munmap that stack) is safe. */
+    KaiValue *sv = kai_pending_sched_drop_take();
+    if (sv) kai_decref(sv);
+    KaiFiber *f = kai_pending_free_take();
+    if (!f) return;
+    /* thunk / result / linked_head were handled at wrapper-free time;
+     * only stack + struct remain. The stack is an mmap region of
+     * size stack_size + one guard page; pair the call with munmap
+     * (free would corrupt the heap). */
+    if (f->stack_base) {
+        munmap(f->stack_base, f->stack_size + kai_page_size());
+    }
+    kai_tsan_fiber_free(f);
+    free(f);
+}
+
+/* m8 #3: wrap a heap-allocated KaiFiber in an opaque KAI_FIBER
+ * value. The KaiFiber struct's lifetime is tied to the value's RC
+ * (kai_free_value frees both together). The struct's `value`
+ * back-pointer lets the scheduler retain its own incref on the
+ * wrapper from spawn-enqueue until the trampoline tail (R4 fix). */
+static KAI_RC_NOINLINE KaiValue *kai_fiber_value(KaiFiber *f) {
+    KaiValue *v = kai_alloc(KAI_FIBER);
+    v->as.fib = f;
+    f->value  = v;
+    return v;
+}
+
+/* m8 #7 + m8.x: mailbox runtime. A KaiMailbox is a singly-linked
+ * list of heap-allocated KaiValue messages (head = next-to-pop,
+ * tail = next-to-enqueue). Send pushes at the tail; receive pops
+ * the head. Receive on an empty mailbox parks the caller on
+ * recv_waiter (`kai_mailbox_pop`) and yields to the cooperative
+ * scheduler; the next push wakes the head waiter (FIFO). All four
+ * overflow policies (Unbounded / DropOldest / DropNewest /
+ * BlockSender) reach the runtime: DropOldest / DropNewest mutate
+ * the buffer in place; BlockSender parks the sender on
+ * send_waiter when full and resumes when a receiver pops a slot. */
+typedef struct KaiMboxNode KaiMboxNode;
+struct KaiMboxNode {
+    KaiValue    *msg;
+    KaiMboxNode *next;
+};
+
+/* m8 #8 + m8.x: mailbox overflow policy codes (matched in
+ * stdlib/actor.kai by the MailboxPolicy enum). 0 = Unbounded,
+ * 1 = Bounded+DropOldest, 2 = Bounded+DropNewest,
+ * 3 = Bounded+BlockSender. All four policies are implemented:
+ * `kai_mailbox_alloc_bounded` accepts every code; `kai_mailbox_push`
+ * dispatches on the policy and parks the sender on `send_waiter`
+ * for BlockSender via the cooperative scheduler. */
+#define KAI_OVERFLOW_UNBOUNDED    0
+#define KAI_OVERFLOW_DROP_OLDEST  1
+#define KAI_OVERFLOW_DROP_NEWEST  2
+#define KAI_OVERFLOW_BLOCK_SENDER 3
+
+typedef struct KaiMailbox KaiMailbox;
+struct KaiMailbox {
+    KaiMboxNode *head;
+    KaiMboxNode *tail;
+    int          len;
+    int          cap;       /* m8 #8: 0 = unbounded; >0 = bounded */
+    int          overflow;  /* m8 #8: KAI_OVERFLOW_* code */
+    /* Phase 4 — blocking primitives. Waiter queues for fibers
+     * parked on empty receive (head==NULL) or on full BlockSender
+     * push (len>=cap). Linked through each fiber's awaiters_next
+     * field — a fiber is in exactly one waiter chain at a time
+     * (await chain, receiver chain, or sender chain), so the
+     * single field is sufficient. */
+    KaiFiber    *recv_waiter_head;
+    KaiFiber    *recv_waiter_tail;
+    KaiFiber    *send_waiter_head;
+    KaiFiber    *send_waiter_tail;
+    /* Phase 5 — owner fiber for the Link/Monitor runtime.
+     * Set to kai_current_fiber() at allocation. Link.link(pid)
+     * resolves pid->mb->owner_fiber to find the target fiber to
+     * link to. v1 maps each mailbox to exactly one owning fiber
+     * (the one that called mailbox_alloc); spawn_actor (when it
+     * lands in m8.x #6) will set owner_fiber to the spawned
+     * fiber instead. */
+    KaiFiber    *owner_fiber;
+    /* M:N — guards the node list against a cross-thread `Actor.send`.
+     * A same-thread send (owner on the sender's thread, the only case
+     * at N=1) takes the fast path and never locks. A cross-thread send
+     * deep-copies the message into the sender's heap, then appends the
+     * node under this lock and wakes the owner's scheduler thread. */
+    pthread_mutex_t mu;
+    int             mu_inited;
+    /* Set under `mu` when the owning scope ends; a push that sees it
+     * drops its message instead of enqueueing. */
+    int             closed;
+    /* The owning scope holds one pin and every in-flight send holds
+     * one, so a sender never touches a freed struct: the last unpin
+     * frees it. */
+    _Atomic int     pins;
+};
+
+/* Phase 5 — intrusive linked-peer chain on KaiFiber. A bidirectional
+ * link between two fibers consists of one KaiLinkNode in each
+ * fiber's linked_head chain pointing at the other peer. On fiber
+ * termination (DONE or CANCELLED in the trampoline), the chain is
+ * walked and each peer's cancel_requested flag is set. The doc
+ * spec distinguishes Normal vs Crashed termination for link
+ * propagation; v1 propagates on both DONE and CANCELLED (BEAM
+ * trap-exit semantics is queued for post-MVP).
+ *
+ * The forward typedef is at the KaiFiber declaration above so
+ * KaiFiber can hold a `KaiLinkNode *linked_head`. */
+struct KaiLinkNode {
+    KaiFiber    *peer;
+    KaiLinkNode *next;
+};
+
+/* Tier 2 Monitor — intrusive node sitting on the *target* fiber's
+ * monitor_head chain. observer = the fiber that called
+ * Monitor.monitor(target_pid); target_pid = the same KaiValue *
+ * the user passed to monitor(...) (the runtime owns one ref via
+ * kai_incref so the value survives until the target terminates).
+ * On termination, the propagate walker pushes target_pid into
+ * observer->mailbox and frees the node.
+ *
+ * The forward typedef is at the KaiFiber declaration above so
+ * KaiFiber can hold a `KaiMonitorNode *monitor_head`. */
+struct KaiMonitorNode {
+    KaiFiber       *observer;
+    KaiValue       *target_pid;
+    KaiMonitorNode *next;
+};
+
+/* Phase 4 forward decls: mailbox push/pop park/wake the calling
+ * fiber via the scheduler primitives, which are defined further
+ * down (after the handler-stack runtime). The decls here let the
+ * mailbox ops compile in their natural file location. */
+static void kai_sched_park(void);
+static void kai_sched_unpark(KaiFiber *target);
+/* Issue #679: park sites in the reactor call this after wake to
+ * observe a sibling-triggered cancel before retrying their syscall.
+ * Body lives near the op-call lookup prologue at line 8868+. */
+static void kai_check_cancel_yield_point(void);
+/* Dispatch a pending cancellation through the innermost user `with
+ * Cancel` handler on this fiber. Does not return when one is in scope;
+ * returns 0 when there is none. Body sits beside the yield-point hook. */
+static int kai_cancel_dispatch_user_handler(void);
+/* Splice a fiber off whatever reactor waiter list holds it; defined with
+ * the reactor below, needed above by the select loser-cancel walk. */
+static int kai_reactor_detach_fiber(KaiFiber *target);
+
+/* Issue #611 — Phase R1 reactor forward decls. The default Clock /
+ * File / Process handlers live above the reactor implementation
+ * but call into it through the small API below to park their
+ * fibers. Bodies sit alongside the scheduler primitives a few
+ * thousand lines further down. */
+typedef struct KaiFilepoolItem KaiFilepoolItem;
+static void     kai_reactor_init(void);
+static void     kai_reactor_park_timer(KaiFiber *f, uint64_t deadline_ns);
+static void     kai_reactor_park_pid(KaiFiber *f, int pid);
+static int      kai_reactor_take_child_exit(int pid, int *status);
+static KaiValue *kai_reactor_run_in_pool(KaiValue *(*work)(void *), void *arg);
+static uint64_t kai_reactor_now_ns(void);
+/* Timeout-receive dual-park: arm a deadline alongside the mailbox park
+ * and disarm it if a message wins. Bodies sit with the timer wheel. */
+static void     kai_reactor_timer_insert(KaiFiber *f);
+static int      kai_reactor_timer_remove(KaiFiber *f);
+static int      kai_reactor_detach_fiber(KaiFiber *target);
+/* Every writer of the wheel takes these, the disarm above included. */
+static inline void kai_reactor_lock(void);
+static inline void kai_reactor_unlock(void);
+
+/* Issue #620 — Phase R3 reactor forward decls. The default Stdin
+ * handlers live ~1700 lines above the reactor implementation. They
+ * call into the small park-stdin helper which encapsulates the
+ * single-fiber slot, the parked-count bump, and the kai_sched_park
+ * yield. The nonblock-once helper is also forward-declared. */
+static int       kai_reactor_park_stdin(KaiFiber *f);
+static void      kai_reactor_stdin_set_nonblocking(void);
+
+/* Issue #630 — Phase R2 reactor forward decls. The six NetTcp
+ * default handlers live ~1000 lines above the reactor; they call
+ * these helpers to park on read/write readiness of a socket fd.
+ * A fiber sits on at most one socket-direction list at a time
+ * (a single op is either reading or writing, never both), so the
+ * existing `reactor_next` intrusive slot is sufficient. The fd is
+ * stashed in `reactor_wait_pid` (the slot is otherwise unused while
+ * a fiber is parked on a socket — pids and sockets are mutually
+ * exclusive park reasons). */
+static void      kai_reactor_park_socket_read(KaiFiber *f, int fd);
+static void      kai_reactor_park_socket_write(KaiFiber *f, int fd);
+/* Read-readiness park with a deadline: parks on the read-waiter list
+ * carrying `deadline_ns` in the fiber's own slot (single-list dual-park,
+ * no second intrusive link). Returns 1 if readiness woke us, 0 if the
+ * deadline fired first. */
+static int       kai_reactor_park_socket_read_timeout(KaiFiber *f, int fd, uint64_t deadline_ns);
+static void      kai_socket_set_nonblock(int fd);
+
+/* Issue #671 — Phase R4: park `f` on the singleton signal waiter
+ * slot and yield. Returns 0 on success, -1 if a second fiber is
+ * already parked (concurrent `Signal.await()` is undefined — v1
+ * panics at the call site with a clear diagnostic, mirroring the
+ * R3 stdin-multiplex contract). The signo arrives on resume via
+ * `f->reactor_wait_status`. */
+static int       kai_reactor_park_signal(KaiFiber *f);
+
+/* Issue #671 — Phase R4: async-signal-safe handler installed for
+ * every subscribed signal. Forward-declared because it is used by
+ * `kai_default_signal_on` (~line 6300) but its body lives down in
+ * the reactor block (~line 7030, alongside kai_reactor_sigchld_handler). */
+static void      kai_reactor_signal_handler(int sig);
+
+/* M:N — arm the per-mailbox cross-thread lock. The mailbox is created
+ * on one thread (its allocating fiber), so this init never races. At
+ * N=1 the lock is armed but never taken (every send is same-thread). */
+static void kai_mailbox_init_mu(KaiMailbox *mb) {
+    if (kai_nthreads > 1 && !mb->mu_inited) {
+        pthread_mutex_init(&mb->mu, NULL);
+        mb->mu_inited = 1;
+    }
+}
+
+/* Serialize a mailbox op against cross-thread senders. A no-op unless
+ * the lock was armed (N>1), so the single-thread pop/push paths stay
+ * lock-free and byte-identical. The owner's pop and same-thread pushes
+ * run on one thread cooperatively — they need the lock only to exclude
+ * a concurrent cross-thread send, never each other. */
+static inline void kai_mbox_lock(KaiMailbox *mb)   { if (mb->mu_inited) pthread_mutex_lock(&mb->mu); }
+static inline void kai_mbox_unlock(KaiMailbox *mb) { if (mb->mu_inited) pthread_mutex_unlock(&mb->mu); }
+
+/* An owned mailbox is stamped onto the allocating fiber (with_mailbox:
+ * that fiber IS the actor) so link/monitor/trap-exit find it without a
+ * registry. An unowned one leaves the caller's `mailbox` slot untouched —
+ * spawn_actor wires it to the spawned fiber instead, and stamping the
+ * parent would corrupt its own lookups whenever it already owns one. */
+static KaiMailbox *kai_mailbox_new(int cap, int overflow, int owned) {
+    KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
+    if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    kai_mailbox_init_mu(mb);
+    mb->cap      = cap;
+    mb->overflow = overflow;
+    atomic_init(&mb->pins, 1);
+    if (owned) {
+        mb->owner_fiber = kai_current_fiber();
+        if (mb->owner_fiber) mb->owner_fiber->mailbox = mb;
+    }
+    return mb;
+}
+
+static KaiMailbox *kai_mailbox_alloc(void) {
+    return kai_mailbox_new(0, KAI_OVERFLOW_UNBOUNDED, 1);
+}
+
+static KaiMailbox *kai_mailbox_alloc_unowned(void) {
+    return kai_mailbox_new(0, KAI_OVERFLOW_UNBOUNDED, 0);
+}
+
+static KaiMailbox *kai_mailbox_alloc_bounded(int cap, int overflow) {
+    return kai_mailbox_new(cap, overflow, 1);
+}
+
+static KaiMailbox *kai_mailbox_alloc_bounded_unowned(int cap, int overflow) {
+    return kai_mailbox_new(cap, overflow, 0);
+}
+
+/* Phase 4 helper: link a fiber into a waiter chain at the tail. */
+static void kai_mailbox_waiter_enqueue(KaiFiber **head, KaiFiber **tail, KaiFiber *f) {
+    f->awaiters_next = NULL;
+    if (*tail) {
+        (*tail)->awaiters_next = f;
+    } else {
+        *head = f;
+    }
+    *tail = f;
+}
+
+/* Phase 4 helper: pop the head waiter from a chain (FIFO wakeup). */
+static KaiFiber *kai_mailbox_waiter_dequeue(KaiFiber **head, KaiFiber **tail) {
+    KaiFiber *f = *head;
+    if (!f) return NULL;
+    *head = f->awaiters_next;
+    if (!*head) *tail = NULL;
+    f->awaiters_next = NULL;
+    return f;
+}
+
+/* Awaiter-chain hygiene under the owner's slot lock. A spurious resume can
+ * leave the waiter linked, so a re-wait must not double-link and a terminal
+ * observation must not walk away leaving a stale link (the waiter's
+ * awaiters_next is re-used by its next wait). */
+static void kai_awaiter_link_if_absent(KaiFiber *owner, KaiFiber *me) {
+    for (KaiFiber *c = owner->awaiters_head; c; c = c->awaiters_next) {
+        if (c == me) return;
+    }
+    me->awaiters_next = owner->awaiters_head;
+    owner->awaiters_head = me;
+}
+static void kai_awaiter_unlink(KaiFiber *owner, KaiFiber *me) {
+    KaiFiber **link = &owner->awaiters_head;
+    while (*link) {
+        if (*link == me) {
+            *link = me->awaiters_next;
+            me->awaiters_next = NULL;
+            return;
+        }
+        link = &(*link)->awaiters_next;
+    }
+}
+
+/* Select-chain membership. Both sides run under `owner`'s slot lock, so a
+ * candidate's terminate walk cannot snapshot the chain between a selector's
+ * state read and its link. `node` belongs to the selector's stack frame and
+ * must be unlinked from every candidate before that frame returns. */
+static void kai_select_link(KaiFiber *owner, KaiSelectWaiter *node) {
+    node->next = owner->select_waiters_head;
+    owner->select_waiters_head = node;
+}
+static void kai_select_unlink(KaiFiber *owner, KaiSelectWaiter *node) {
+    KaiSelectWaiter **link = &owner->select_waiters_head;
+    while (*link) {
+        if (*link == node) {
+            *link = node->next;
+            node->next = NULL;
+            return;
+        }
+        link = &(*link)->next;
+    }
+}
+
+/* Splice `f` out of a waiter chain regardless of position. Returns 1
+ * if found. The timeout-receive uses this to drop itself from the
+ * recv-waiter chain when its deadline fires first, so a later send
+ * does not unpark a fiber that already returned `None`. */
+static int kai_mailbox_waiter_remove(KaiFiber **head, KaiFiber **tail, KaiFiber *f) {
+    KaiFiber **link = head;
+    KaiFiber  *prev = NULL;
+    while (*link) {
+        if (*link == f) {
+            *link = f->awaiters_next;
+            if (!*link) *tail = prev;
+            f->awaiters_next = NULL;
+            return 1;
+        }
+        prev = *link;
+        link = &(*link)->awaiters_next;
+    }
+    return 0;
+}
+
+/* BlockSender back-pressure: park the calling fiber until a receiver frees a
+ * slot. Shared by both push paths, because which one a send takes depends
+ * only on where the receiver happens to be scheduled — a policy that applied
+ * on one and not the other would make delivery a function of placement.
+ *
+ * The full-check and the waiter-enqueue happen together under the mailbox
+ * lock, mirroring kai_mailbox_pop's recv side: a pop that frees a slot either
+ * runs before our check (we see room) or after our enqueue (it dequeues and
+ * wakes us). Dropping the lock before the park is what keeps that safe —
+ * kai_sched_park leaves the fiber RUNNING until the scheduler root commits it,
+ * and a wake landing in that window is recorded as wake_pending rather than
+ * lost. The loop re-checks because another sender can take the slot between
+ * our wake and our resume.
+ *
+ * Caller must NOT hold the mailbox lock. Returns holding it: 1 with room in
+ * the mailbox — the caller enqueues under that same acquisition, so two
+ * senders racing on the last slot cannot both pass the check and overshoot
+ * `cap` — or 0 once the mailbox is closed. */
+static int kai_mailbox_await_slot(KaiMailbox *mb) {
+    for (;;) {
+        KaiFiber *me = kai_current_fiber();
+        kai_mbox_lock(mb);
+        /* A spurious resume leaves us linked; unlink before deciding, so a
+         * re-enqueue below never double-links the chain. */
+        kai_mailbox_waiter_remove(&mb->send_waiter_head,
+                                  &mb->send_waiter_tail, me);
+        if (mb->closed) return 0;
+        if (mb->len < mb->cap) return 1;
+        kai_mailbox_waiter_enqueue(&mb->send_waiter_head,
+                                   &mb->send_waiter_tail, me);
+        kai_mbox_unlock(mb);
+        kai_sched_park();
+    }
+}
+
+/* Apply a drop policy to a full mailbox, under its lock. Returns 0 when the
+ * incoming message is the one to drop. */
+static int kai_mailbox_make_room(KaiMailbox *mb) {
+    if (mb->cap == 0 || mb->len < mb->cap) return 1;
+    if (mb->overflow == KAI_OVERFLOW_DROP_NEWEST) return 0;
+    if (mb->overflow == KAI_OVERFLOW_DROP_OLDEST) {
+        KaiMboxNode *old = mb->head;
+        mb->head = old->next;
+        if (!mb->head) mb->tail = NULL;
+        kai_decref(old->msg);
+        free(old);
+        mb->len--;
+    }
+    return 1;
+}
+
+/* Enforce the overflow policy and return holding the lock, or 0 if the
+ * message was dropped — by policy or because the mailbox is closed (lock
+ * released, msg consumed). Shared by both push paths so a policy cannot mean
+ * two different things depending on which thread the receiver landed on. */
+static int kai_mailbox_reserve_slot(KaiMailbox *mb, KaiValue *msg) {
+    int room;
+    if (mb->cap > 0 && mb->overflow == KAI_OVERFLOW_BLOCK_SENDER) {
+        room = kai_mailbox_await_slot(mb);
+    } else {
+        kai_mbox_lock(mb);
+        room = !mb->closed && kai_mailbox_make_room(mb);
+    }
+    if (!room) {
+        kai_mbox_unlock(mb);
+        kai_decref(msg);
+    }
+    return room;
+}
+
+static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
+    /* m8 #8 + Phase 4: enforce policy on full. */
+    if (!kai_mailbox_reserve_slot(mb, msg)) return;
+    KaiMboxNode *node = (KaiMboxNode *) calloc(1, sizeof(KaiMboxNode));
+    if (!node) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    node->msg  = msg;
+    node->next = NULL;
+    if (mb->tail) { mb->tail->next = node; }
+    else          { mb->head       = node; }
+    mb->tail = node;
+    mb->len++;
+    /* Phase 4: wake one parked receiver if any. */
+    KaiFiber *waiter = kai_mailbox_waiter_dequeue(&mb->recv_waiter_head,
+                                                    &mb->recv_waiter_tail);
+    kai_mbox_unlock(mb);
+    if (waiter) kai_sched_unpark(waiter);
+}
+
+/* M:N cross-thread send. `msg` has already been deep-copied into the
+ * SENDER's heap by the caller — the copied tree is single-owner (rc=1)
+ * and migrates to the receiver like a fiber does (freed on the
+ * receiver's thread, into its own TLS pools). We take the mailbox lock,
+ * append the node, and — if the owner is parked waiting to receive —
+ * promote it on ITS scheduler thread and wake that thread.
+ *
+ * Bounded policies mean the same thing here as on the same-thread path: a
+ * BlockSender mailbox parks the sender, it does not discard. The wake crosses
+ * threads on its own — kai_mailbox_pop already routes send-waiter wakes
+ * through kai_sched_unpark, which promotes on the target's home thread. */
+static void kai_mailbox_push_cross_thread(KaiMailbox *mb, KaiValue *msg) {
+    if (!kai_mailbox_reserve_slot(mb, msg)) return;
+    KaiMboxNode *node = (KaiMboxNode *) calloc(1, sizeof(KaiMboxNode));
+    if (!node) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    node->msg  = msg;
+    node->next = NULL;
+    if (mb->tail) mb->tail->next = node;
+    else          mb->head       = node;
+    mb->tail = node;
+    mb->len++;
+    KaiFiber *waiter = kai_mailbox_waiter_dequeue(&mb->recv_waiter_head,
+                                                  &mb->recv_waiter_tail);
+    kai_mbox_unlock(mb);
+    if (waiter) kai_sched_remote_unpark(waiter);
+}
+
+static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
+    /* Phase 4: park the calling fiber until a sender enqueues. The
+     * loop handles the case where another receiver took the slot
+     * between our unpark and resume (rare but possible if multiple
+     * fibers race on the same mailbox). Under M:N the empty-check and
+     * the waiter-enqueue happen under the lock so a concurrent
+     * cross-thread send cannot slip a message in and signal a wake
+     * between our check and our park (lost-wakeup); the lock is
+     * released before the park itself. */
+    for (;;) {
+        KaiFiber *me = kai_current_fiber();
+        kai_mbox_lock(mb);
+        /* A spurious resume leaves us linked; unlink before deciding, so the
+         * re-enqueue below never double-links the chain. */
+        kai_mailbox_waiter_remove(&mb->recv_waiter_head,
+                                  &mb->recv_waiter_tail, me);
+        if (mb->head) {
+            KaiMboxNode *node = mb->head;
+            mb->head = node->next;
+            if (!mb->head) { mb->tail = NULL; }
+            KaiValue *msg = node->msg;
+            free(node);
+            mb->len--;
+            KaiFiber *waiter = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
+                                                          &mb->send_waiter_tail);
+            kai_mbox_unlock(mb);
+            if (waiter) kai_sched_unpark(waiter);
+            return msg;
+        }
+        kai_mailbox_waiter_enqueue(&mb->recv_waiter_head,
+                                    &mb->recv_waiter_tail, me);
+        kai_mbox_unlock(mb);
+        kai_sched_park();
+    }
+}
+
+/* Receive with a deadline: park the caller on BOTH the recv-waiter
+ * chain and the timer wheel, woken by whichever fires first. Returns
+ * the popped message, or NULL if `timeout_nanos` elapsed first.
+ *
+ * The discriminant on wake is recv-waiter membership: a send unparks
+ * us by dequeuing us from the recv-waiter chain (we stay on the timer
+ * wheel), while the timer drain unparks us off the wheel (we stay on
+ * the recv-waiter chain). Whichever wakeup ran, we splice ourselves
+ * out of the OTHER structure so a later event cannot touch a fiber
+ * that already returned — the use-after-free trap this guards.
+ *
+ * A spurious message-wake (another receiver drained the slot first)
+ * re-parks for the remaining time; an elapsed deadline returns NULL. */
+static KaiValue *kai_mailbox_pop_timeout(KaiMailbox *mb, uint64_t timeout_nanos) {
+    kai_mbox_lock(mb);
+    if (mb->head) {
+        KaiMboxNode *node = mb->head;
+        mb->head = node->next;
+        if (!mb->head) { mb->tail = NULL; }
+        KaiValue *msg = node->msg;
+        free(node);
+        mb->len--;
+        KaiFiber *sw = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
+                                                   &mb->send_waiter_tail);
+        kai_mbox_unlock(mb);
+        if (sw) kai_sched_unpark(sw);
+        return msg;
+    }
+    kai_mbox_unlock(mb);
+    uint64_t deadline = kai_reactor_now_ns() + timeout_nanos;
+    for (;;) {
+        if (kai_reactor_now_ns() >= deadline) return NULL;
+        KaiFiber *me = kai_current_fiber();
+        kai_mbox_lock(mb);
+        kai_mailbox_waiter_enqueue(&mb->recv_waiter_head,
+                                   &mb->recv_waiter_tail, me);
+        kai_mbox_unlock(mb);
+        kai_reactor_park_timer(me, deadline);
+
+        /* park_timer's drain already spliced us off the wheel on a
+         * deadline wake. Disarm it on a message wake; in both cases
+         * remove ourselves from the chain we are still linked into. */
+        kai_mbox_lock(mb);
+        int still_waiting = kai_mailbox_waiter_remove(&mb->recv_waiter_head,
+                                                      &mb->recv_waiter_tail, me);
+        kai_mbox_unlock(mb);
+        if (still_waiting) {
+            /* Never dequeued by a send. Only the reactor's own splice
+             * (reactor_fired) means the deadline really fired; a resume
+             * without it is spurious — loop, which re-checks the clock
+             * and re-parks for whatever time remains. */
+            if (me->reactor_fired) return NULL;
+            continue;
+        }
+        /* A send dequeued us; disarm the still-armed deadline timer. The
+         * wheel belongs to the reactor, so splice under its lock — and hold
+         * that lock alone: the mailbox lock is released above so the two
+         * never nest, keeping the runtime's one-lock-at-a-time discipline.
+         * Re-acquiring the mailbox below can find the slot already drained
+         * by another receiver, which is the spurious case the loop handles. */
+        kai_reactor_lock();
+        kai_reactor_timer_remove(me);
+        kai_reactor_unlock();
+        kai_mbox_lock(mb);
+        if (mb->head) {
+            KaiMboxNode *node = mb->head;
+            mb->head = node->next;
+            if (!mb->head) { mb->tail = NULL; }
+            KaiValue *msg = node->msg;
+            free(node);
+            mb->len--;
+            KaiFiber *sw = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
+                                                      &mb->send_waiter_tail);
+            kai_mbox_unlock(mb);
+            if (sw) kai_sched_unpark(sw);
+            return msg;
+        }
+        kai_mbox_unlock(mb);
+        /* Spurious: another receiver took the slot. Loop re-checks the
+         * deadline and re-parks for whatever time remains. */
+    }
+}
+
+static void kai_mailbox_unpin(KaiMailbox *mb) {
+    if (atomic_fetch_sub_explicit(&mb->pins, 1, memory_order_acq_rel) != 1) return;
+    if (mb->mu_inited) pthread_mutex_destroy(&mb->mu);
+    free(mb);
+}
+
+/* End the owning scope: queued messages are released on the owner's thread,
+ * later pushes drop theirs, and senders parked on a full BlockSender mailbox
+ * are woken to observe the close instead of waiting forever. */
+static void kai_mailbox_close(KaiMailbox *mb) {
+    /* Nested with_mailbox: the inner close clears the slot even though the
+     * outer mailbox is still alive. */
+    if (mb->owner_fiber && mb->owner_fiber->mailbox == mb) {
+        mb->owner_fiber->mailbox = NULL;
+    }
+    kai_mbox_lock(mb);
+    mb->closed = 1;
+    KaiMboxNode *node = mb->head;
+    mb->head = mb->tail = NULL;
+    mb->len = 0;
+    kai_mbox_unlock(mb);
+    while (node) {
+        KaiMboxNode *next = node->next;
+        kai_decref(node->msg);
+        free(node);
+        node = next;
+    }
+    for (;;) {
+        kai_mbox_lock(mb);
+        KaiFiber *sw = kai_mailbox_waiter_dequeue(&mb->send_waiter_head,
+                                                  &mb->send_waiter_tail);
+        kai_mbox_unlock(mb);
+        if (!sw) break;
+        kai_sched_unpark(sw);
+    }
+    kai_mailbox_unpin(mb);
+}
+
+/* A mailbox has exactly one Pid box, immortal and shared by every handle
+ * (copies across threads incref it), and closing nulls its `as.mb`. So a
+ * NULL there means "ended" and no handle can point at a freed mailbox. Under
+ * M:N the stripe lock orders a sender's read-and-pin against the owner's
+ * null, closing the window where the mailbox could be released between the
+ * two. */
+#define KAI_PID_STRIPES 64
+#if defined(KAI_SEPARATE_COMPILATION)
+extern _Atomic int kai_pid_stripe[KAI_PID_STRIPES];
+#  if defined(KAI_RUNTIME_OWNER)
+_Atomic int kai_pid_stripe[KAI_PID_STRIPES];
+#  endif
+#else
+static _Atomic int kai_pid_stripe[KAI_PID_STRIPES];
+#endif
+
+static _Atomic int *kai_pid_stripe_lock(KaiValue *pid) {
+    if (kai_nthreads <= 1) return NULL;
+    _Atomic int *s = &kai_pid_stripe[((uintptr_t) pid >> 4) % KAI_PID_STRIPES];
+    while (atomic_exchange_explicit(s, 1, memory_order_acquire)) { }
+    return s;
+}
+
+static void kai_pid_stripe_unlock(_Atomic int *s) {
+    if (s) atomic_store_explicit(s, 0, memory_order_release);
+}
+
+/* Returns the Pid's mailbox pinned for one send, or NULL once it has ended. */
+static KaiMailbox *kai_mailbox_pin(KaiValue *pid) {
+    _Atomic int *s = kai_pid_stripe_lock(pid);
+    KaiMailbox *mb = pid->as.mb;
+    if (mb) atomic_fetch_add_explicit(&mb->pins, 1, memory_order_relaxed);
+    kai_pid_stripe_unlock(s);
+    return mb;
+}
+
+/* m8 #7: wrap a borrowed mailbox pointer as a KAI_PID value. The
+ * mailbox itself is owned by the with_mailbox / spawn_actor scope
+ * that allocated it; Pid values are non-owning handles that just
+ * carry the address. */
+static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
+    KaiValue *v = kai_alloc(KAI_PID);
+    v->as.mb = mb;
+    /* A Pid is a shared, non-owning identity: the mailbox outlives every
+     * handle to it and is freed by its allocating scope, never by rc. One
+     * mailbox is shared across the scheduler threads that send to it (that
+     * is the point of an actor), so its handle boxes are duplicated and
+     * dropped on many threads at once. Marking the box immortal keeps those
+     * touches off the non-atomic rc field — no cross-thread rc race, and the
+     * decref-to-free path was already a no-op here. */
+    v->rc = INT32_MAX;
+    return v;
+}
+
+/* Issue #817 — the recycle-this-cell tail shared by kai_free_value's
+ * non-cons cases and kai_free_cons_spine's per-cell reclaim. Runs the
+ * trace/poison bookkeeping (#812 counters, #296 alloc-site credit,
+ * history log, poison stamp) and returns the chunk to the pool (or
+ * libc), then bumps the free counters. Must run exactly once per
+ * reclaimed cell — double invocation is a double-free + double counter.
+ * Reads `_kc->tag` / `_kc->var_n_args` BEFORE the poison stamp clobbers
+ * them, so callers must not have poisoned the cell. */
+#define KAI_RECYCLE_CELL(cell) do {                                          \
+    KaiValue *_kc = (cell);                                                  \
+    KAI_RC_RECYCLE_TRACE(_kc);                                               \
+    KAI_RC_RECYCLE_POOL(_kc);                                                \
+    kai_rc_count_free();                                                     \
+} while (0)
+
+#ifdef KAI_TRACE_RC
+#define KAI_RC_RECYCLE_TRACE(_kc) do {                                       \
+    int32_t freed_tag = (_kc)->tag;                                          \
+    if (freed_tag >= 0 && freed_tag < 16) kai_rc_free_by_tag[freed_tag]++;   \
+    kai_rc_site_record_free((_kc)->alloc_site);                              \
+    kai_rc_history_log((_kc), /* op=free */ 3, freed_tag);                   \
+    KAI_RC_RECYCLE_LEAKSITE(_kc, freed_tag);                                 \
+    { uint64_t *p64 = (uint64_t *) (_kc);                                    \
+      size_t _psz = (freed_tag == (int32_t) KAI_VARIANT)                     \
+          ? kai_var_block_size((_kc)->var_n_args) : sizeof(KaiValue);        \
+      size_t nq = _psz / sizeof(uint64_t);                                   \
+      for (size_t i = 0; i < nq; i++) p64[i] = KAI_RC_SENTINEL_U64; }        \
+} while (0)
+#ifdef KAI_TRACE_RC_LEAKSITE
+#define KAI_RC_RECYCLE_LEAKSITE(_kc, ft) kai_leaksite_record_free((_kc)->scope_fn, (ft))
+#else
+#define KAI_RC_RECYCLE_LEAKSITE(_kc, ft) ((void) 0)
+#endif
+#else
+#define KAI_RC_RECYCLE_TRACE(_kc) ((void) 0)
+#endif
+
+#ifdef KAI_CELL_POOL_ACTIVE
+#define KAI_RC_RECYCLE_POOL(_kc) do {                                        \
+    if ((_kc)->tag == (int32_t) KAI_VARIANT) {                              \
+        kai_var_block_free((_kc), (_kc)->var_n_args);                        \
+    } else if (!kai_cell_pool_push(_kc)) {                                    \
+        free(_kc);                                                           \
+    }                                                                        \
+} while (0)
+#else
+#define KAI_RC_RECYCLE_POOL(_kc) free(_kc)
+#endif
+
+/* Issue #817 — free a cons cell's payload and walk a UNIQUE tail spine
+ * iteratively, so a 40K-element list frees in O(1) stack instead of O(n)
+ * recursion (the recursive `kai_decref(tail)` overflowed a 64 KiB fiber
+ * stack once filter/map stopped leaking the spine). Precondition: `v` is
+ * a KAI_CONS cell whose rc just hit 0 (we own its free). Each head — and
+ * any shared (rc>1) or non-cons tail — goes through the ordinary
+ * `kai_decref` so its counters, guards and cascade stay intact; only the
+ * unique cons spine is consumed by the loop. Each cell is reclaimed via
+ * KAI_RECYCLE_CELL, the same path the post-switch tail uses. */
+static void kai_free_cons_spine(KaiValue *v) {
+    for (;;) {
+        KaiValue *head = v->as.cons.head;
+        KaiValue *tail = v->as.cons.tail;   /* capture BEFORE recycle poisons v */
+        kai_decref(head);                   /* O(1) cascade for str/record; counters intact */
+        KAI_RECYCLE_CELL(v);                /* trace+poison+recycle+free_total++/live_now-- */
+        /* Continue only for a real, unique cons cell. A nil/singleton
+         * (kai_is_value or rc==INT32_MAX), a non-cons, or a shared
+         * (rc!=1) tail hands off to kai_decref for its own free path. */
+        if (kai_is_value(tail) || !tail ||
+            tail->rc == INT32_MAX ||
+            tail->tag != (int32_t) KAI_CONS ||
+            tail->rc != 1) {
+            kai_decref(tail);               /* counters + cascade for the boundary case */
+            return;
+        }
+        /* We are the unique owner of `tail`; consume it as `kai_decref`
+         * would (counter + trace history) but without the recursive call.
+         * (The FIRST cell's decref counter was charged by the `kai_decref`
+         * that called us; the loop charges the counter for each tail cell
+         * it consumes here, so the total stays byte-identical to the
+         * recursive version.) */
+        KAI_CTR_INC(kai_rc_decref_total);
+#ifdef KAI_TRACE_RC
+        kai_rc_history_log(tail, /* op=decref */ 2, tail->tag);
+#endif
+        tail->rc = 0;
+        v = tail;                           /* loop, no stack growth */
+    }
+}
+
+/* Iterative unique-variant tree free — the tree analogue of
+ * kai_free_cons_spine. Entered from kai_free_value's KAI_VARIANT case
+ * only once a unique (rc==1) variant child (`first`) is found: `v` has
+ * rc 0 and its slots below `next_slot` already released. A unique
+ * variant child transfers ownership to the walk (rc set to 0, no
+ * decref — that per-node decrement is the traffic this path deletes)
+ * through a worklist bounded by tree depth; immediate, shared,
+ * saturated, primitive, and non-variant slots cascade through
+ * kai_decref, and a full worklist falls back to kai_decref's recursive
+ * path. Out of line on purpose: the worklist frame (and its stack
+ * guard) must not tax the common shared-children free. Each block
+ * frees whole via KAI_RECYCLE_CELL, exactly once per cell. */
+#define KAI_VARIANT_SPINE_CAP 128
+static KAI_RC_NOINLINE void kai_free_variant_spine(KaiValue *v, int next_slot,
+                                                   KaiValue *first) {
+    KaiValue *pending[KAI_VARIANT_SPINE_CAP];
+    int n_pending = 0;
+    first->rc = 0;
+    pending[n_pending++] = first;
+    for (;;) {
+        uint32_t mask = kai_slot_mask_of(v->variant_tag);
+        int n_args = v->var_n_args;
+        for (int i = next_slot; i < n_args; ++i) {
+            if (mask != 0 && kai_var_slot_kind(mask, i) != KAI_VAR_SLOT_PTR) continue;
+            KaiValue *c = kai_var_slots(v)[i].ptr;
+            if (!kai_is_ptr(c)) continue;         /* immediate / null: no RC */
+            int32_t rc = c->rc;
+            if (rc == INT32_MAX) continue;        /* saturated singleton */
+            if (rc == 1) {
+                if (c->tag == (int32_t) KAI_VARIANT &&
+                    n_pending < KAI_VARIANT_SPINE_CAP) {
+                    c->rc = 0;
+                    pending[n_pending++] = c;
+                    continue;
+                }
+                kai_decref(c);                    /* unique non-variant: own free path */
+                continue;
+            }
+            /* Shared: kai_decref's rc>1 arm unfolded — one rc load, no
+             * re-checks. Must stay behaviourally identical to kai_decref. */
+            KAI_CTR_INC(kai_rc_decref_total);
+#ifdef KAI_TRACE_RC
+            kai_rc_history_log(c, /* op=decref */ 2, c->tag);
+#endif
+            c->rc = rc - 1;
+        }
+        KAI_RECYCLE_CELL(v);
+        if (n_pending == 0) return;
+        v = pending[--n_pending];
+        next_slot = 0;
+    }
+}
+
+static void kai_free_value(KaiValue *v) {
+    KAI_PROF_ENTER();
+    switch ((KaiTag) v->tag) {
+        case KAI_STR:
+            free(v->as.s.bytes);
+            break;
+        case KAI_CONS:
+            /* Issue #817 — iterative spine free; reclaims v and the whole
+             * unique tail spine, then returns (it already ran the recycle
+             * + counters for v, so we must NOT fall to the post-switch
+             * tail — that would double-free v). */
+            kai_free_cons_spine(v);
+            KAI_PROF_EXIT(free);
+            return;
+        case KAI_RECORD:
+            for (int i = 0; i < v->as.rec.n_fields; ++i) kai_decref(v->as.rec.fields[i]);
+            free(v->as.rec.fields);
+            free((void *) v->as.rec.names);
+            break;
+        case KAI_VARIANT: {
+            /* Only pointer slots carry RC (mask kind PTR; mask==0 means
+             * all-PTR; the mask lookup is hoisted — the tag is fixed
+             * across the loop). A unique variant child hands the whole
+             * subtree to the iterative walk, which recycles v and
+             * returns — must NOT fall to the post-switch tail (that
+             * would double-free v). Shared children take kai_decref's
+             * rc>1 arm unfolded: one rc load, no re-checks. FAM payload
+             * slots are inline in this block — the whole block returns
+             * to the per-arity variant pool at the recycle step. */
+            uint32_t fmask = kai_slot_mask_of(v->variant_tag);
+            int fn_args = v->var_n_args;
+            for (int i = 0; i < fn_args; ++i) {
+                if (fmask != 0 && kai_var_slot_kind(fmask, i) != KAI_VAR_SLOT_PTR) continue;
+                KaiValue *c = kai_var_slots(v)[i].ptr;
+                if (!kai_is_ptr(c)) continue;
+                int32_t crc = c->rc;
+                if (crc == INT32_MAX) continue;
+                if (crc == 1) {
+                    if (c->tag == (int32_t) KAI_VARIANT) {
+                        kai_free_variant_spine(v, i + 1, c);
+                        KAI_PROF_EXIT(free);
+                        return;
+                    }
+                    kai_decref(c);
+                    continue;
+                }
+                KAI_CTR_INC(kai_rc_decref_total);
+#ifdef KAI_TRACE_RC
+                kai_rc_history_log(c, /* op=decref */ 2, c->tag);
+#endif
+                c->rc = crc - 1;
+            }
+        }
+            break;
+        case KAI_CLOSURE:
+            for (int i = 0; i < v->as.clo.n_captures; ++i) kai_decref(v->as.clo.captures[i]);
+            free(v->as.clo.captures);
+            break;
+        case KAI_ARRAY:
+            for (int64_t i = 0; i < v->as.arr.len; ++i) kai_decref(v->as.arr.items[i]);
+            free(v->as.arr.items);
+            break;
+        case KAI_VEC: {
+            /* A view owns nothing but its ref on the owner: release it
+             * and stop — elements and block belong to the owner. */
+            if (v->as.vec.view_of) {
+                kai_decref(v->as.vec.view_of);
+                break;
+            }
+            /* Only boxed elements carry RC; raw / inline-record elements
+             * are plain bytes freed with the block. The meta prefix and
+             * the elements are ONE allocation (see kai_vec_meta). */
+            if (kai_vec_meta(v)->ekind == KAI_VEC_EK_BOXED) {
+                KaiValue **items = (KaiValue **) kai_vec_elems(v);
+                for (int64_t i = 0; i < v->as.vec.len; ++i) kai_decref(items[i]);
+            }
+            free(v->as.vec.data);
+            break;
+        }
+        case KAI_REF:
+            /* A Ref owns one strong reference to its cell. */
+            kai_decref(v->as.ref.cell);
+            break;
+        case KAI_FIBER:
+            if (v->as.fib) {
+                kai_decref(v->as.fib->thunk);
+                kai_decref(v->as.fib->result);
+                /* Phase 5: free any remaining link nodes. Normally
+                 * the trampoline's kai_link_propagate_terminate
+                 * empties this chain; the safety net here covers
+                 * fibers that died without going through the
+                 * trampoline (or through this path before the
+                 * trampoline ran). */
+                {
+                    KaiLinkNode *ln = v->as.fib->linked_head;
+                    while (ln) {
+                        KaiLinkNode *next = ln->next;
+                        free(ln);
+                        ln = next;
+                    }
+                    v->as.fib->linked_head = NULL;
+                }
+                /* Tier 2 Monitor — same safety net as the link chain.
+                 * Each entry holds an owning ref on its target_pid via
+                 * kai_monitor_add; we release that ref before freeing
+                 * the node so values referenced only by the monitor
+                 * chain can be reclaimed. */
+                {
+                    KaiMonitorNode *mn = v->as.fib->monitor_head;
+                    while (mn) {
+                        KaiMonitorNode *next = mn->next;
+                        if (mn->target_pid) kai_decref(mn->target_pid);
+                        free(mn);
+                        mn = next;
+                    }
+                    v->as.fib->monitor_head = NULL;
+                }
+                /* R4 fix — when the trampoline drops the scheduler's
+                 * ref on its own wrapper at DONE/CANCELLED, the wrapper
+                 * may go to RC=0 here while we are still running on
+                 * the fiber's private stack. Freeing the stack now
+                 * would yank the ground out from under the trampoline
+                 * tail. Defer the struct + stack free to the next
+                 * fiber's drain hook (top of trampoline / post-swap
+                 * in yield/park). The single-slot pending pointer is
+                 * sufficient because the only producer is the
+                 * trampoline tail, and every consumer drains before
+                 * any other produce can run. */
+                if (v->as.fib == kai_current_fiber()) {
+                    v->as.fib->value = NULL;
+                    kai_pending_free_set(v->as.fib);
+                } else {
+                    /* m8.x: release the private stack. Main fiber has
+                     * stack_base == NULL (uses the OS thread stack)
+                     * and is statically allocated; spawned fibers own
+                     * an mmap region of stack_size + guard page bytes
+                     * and must release it via munmap. */
+                    if (v->as.fib->stack_base) {
+                        munmap(v->as.fib->stack_base,
+                               v->as.fib->stack_size + kai_page_size());
+                    }
+                    free(v->as.fib);
+                }
+            }
+            break;
+        case KAI_PID:
+            /* The mailbox is owned by the with_mailbox / spawn_actor
+             * scope, NOT by the Pid value. Dropping a Pid handle
+             * does not free the mailbox. */
+            break;
+        case KAI_BYTE:
+            /* Lane 4 (#473): Byte is a 1-byte scalar embedded directly
+             * in the KaiValue. No heap payload. The base free(v)
+             * below reclaims the whole value. */
+            break;
+        case KAI_RANGE:
+            /* Three inline ints, no interior pointers — plain recycle. */
+            break;
+        default: break;
+    }
+    /* Issue #817 — recycle this cell (trace+poison+pool+counters). The
+     * same path kai_free_cons_spine uses per spine cell. */
+    KAI_RECYCLE_CELL(v);
+    KAI_PROF_EXIT(free);
+}
+
+/* Out-of-line drop-to-zero path: the cell reached rc==0, reclaim it.
+ * Split out of kai_decref so the common case (decrement, still live)
+ * stays a small inlinable body and only the rare free crosses a call.
+ * Idea adapted from Koka's kk_block_decref / kk_block_drop split: the
+ * drop fast path is inline at the call site, the free is a cold helper.
+ * kaikai keeps its own counters + kai_free_value walker, not kklib's
+ * free-list shape — the split is the idea, the body stays ours. */
+static void kai_decref_free(KaiValue *v) {
+#ifdef KAI_PROFILE_RC
+    kai_prof_decref_to_zero_n++;
+#endif
+    kai_free_value(v);
+}
+
+/* Decrement a reference. The fast path — immediate Int / null /
+ * saturated singleton / still-shared after decrement — is branch-only
+ * and inlines into the caller; only a cell hitting rc==0 calls out to
+ * kai_decref_free. Previously kai_decref was a non-inline `static void`
+ * (callgrind: 48M instructions on the rb-tree bench, a real call at
+ * every drop). Under tracing the counters still fire for full fidelity.
+ * KAI_PROF_ENTER/EXIT dropped from the hot path: they bracket a cold
+ * helper now, and the inline body must stay small to be inlined. */
+static inline void kai_decref(KaiValue *v) {
+    if (kai_is_value(v) || !v || kai_rc_is_immortal(v)) return;
+    /* #812 — always-compiled counter (see kai_incref). */
+    KAI_CTR_INC(kai_rc_decref_total);
+#ifdef KAI_TRACE_RC
+    kai_rc_history_log(v, /* op=decref */ 2, v->tag);
+#endif
+    /* A Fiber[T] wrapper is a scheduler-owned handle to a unit of
+     * execution running on another thread: the spawner drops the caller
+     * ref while the trampoline drops the scheduler ref, on two threads at
+     * once. Its rc is atomic — handle metadata, not the jewel (the user
+     * data inside the fiber's private heap stays non-atomic). See the
+     * cross-thread-handle rule at KaiValue. */
+    if (kai_nthreads > 1 && v->tag == KAI_FIBER) {
+        if (atomic_fetch_sub_explicit((_Atomic int32_t *) &v->rc, 1,
+                                      memory_order_acq_rel) == 1)
+            kai_decref_free(v);
+        return;
+    }
+    if (--v->rc == 0) kai_decref_free(v);
+}
+
+/* m5 #4 — Perceus dup/drop wrappers callable as KaiValue-returning fns.
+ *
+ * `__perceus_dup` and `__perceus_drop` are AST-level magic names the
+ * `perceus_pass` rewrites onto non-last EVar reads (dup) and unused-
+ * binding scope ends (drop). The emitter lowers them to these
+ * wrappers so the pass operates entirely through the core path
+ * without bespoke C generation.
+ *
+ * `kai_internal_dup` is `kai_incref` with a typed return; the AST
+ * rewrite wraps `EVar(x)` as `ECall(EVar("__perceus_dup"), [EVar(x)])`
+ * and the emitter sees a normal call.
+ *
+ * `kai_internal_drop` decrefs and returns `unit`. Drops emit as
+ * `SExprStmt(ECall(EVar("__perceus_drop"), [EVar(x)]))` so the unit
+ * return goes into the discarded `KaiValue *_` slot of the existing
+ * `SExprStmt` lowering. */
+static KaiValue *kai_internal_dup(KaiValue *v) { return kai_incref(v); }
+static KaiValue *kai_internal_drop(KaiValue *v) { kai_decref(v); return &kai_singleton_unit; }
+
+/* ---------- constructors ---------- */
+
+static KaiValue *kai_unit(void) { return &kai_singleton_unit; }
+
+static KaiValue *kai_bool(int b) {
+    return b ? &kai_singleton_true : &kai_singleton_false;
+}
+
+/* Char cache (Char is not yet a value-immediate). Every cached entry
+ * carries `rc = INT32_MAX` so `kai_incref` / `kai_decref` skip them.
+ *
+ * The Int cache that used to live here is GONE: with the Koka
+ * tagged-value Int (see the section near struct KaiValue) a small Int
+ * is an immediate with no heap footprint, so there is nothing to
+ * cache. The old [-65536..65535] x 48 B .bss table and its lazy-warm
+ * branch were the m5.x patch that approximated value-immediates; its
+ * own comment named "tagged pointers + raw-slot extract" as the real
+ * follow-up, which is exactly this port. */
+#define KAI_CHAR_CACHE_HI  ((uint32_t) 127)
+#define KAI_CHAR_CACHE_SIZE 128
+
+/* Cached char values are returned by address (&kai_char_cache[c]), so like
+ * the singletons they must be one shared instance across TUs — a per-TU
+ * copy would hand out non-identical pointers for the same char and warm the
+ * cache once per TU. Owner defines, others extern. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiValue kai_char_cache[KAI_CHAR_CACHE_SIZE];
+extern int      kai_char_cache_init;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiValue kai_char_cache[KAI_CHAR_CACHE_SIZE];
+int      kai_char_cache_init = 0;
+#  endif
+#else
+static KaiValue kai_char_cache[KAI_CHAR_CACHE_SIZE];
+static int kai_char_cache_init = 0;
+#endif
+
+/* Per-entry lazy warm for the Int cache (Phase 1.A, 2026-05-29).
+ *
+ * The widened range (131072 entries x 48 B = 6 MB) makes a one-shot
+ * O(size) warm a 6 MB RSS hit on the FIRST in-range int — paid even
+ * by a program that only ever mints `0` and `1`. Measured: a hello
+ * world jumped 1.5 MB -> 6.8 MB under the eager warm.
+ *
+ * Instead we initialize each cache slot the first time its exact value
+ * is requested. A never-warmed slot is all-zero (.bss), i.e.
+ * rc == 0 != INT32_MAX, so the `rc != INT32_MAX` test detects it. This
+ * touches only the OS pages (4 KB) backing the int values actually
+ * used, so RSS scales with the program's working set of small ints,
+ * not with the cache range. The pinned `rc = INT32_MAX` still makes
+ * `kai_incref` / `kai_decref` short-circuit, and the returned pointer
+ * is stable for the process lifetime (slots are never re-warmed once
+ * pinned). One extra branch per in-range `kai_int`, predictably taken
+ * after the slot is hot. (CPython's small-int cache warms eagerly; we
+ * warm lazily because our range — and entry size — is far larger.) */
+static void kai_char_cache_warm(void) {
+    for (int k = 0; k < KAI_CHAR_CACHE_SIZE; k++) {
+        kai_char_cache[k].rc = INT32_MAX;
+        kai_char_cache[k].tag = KAI_CHAR;
+        kai_char_cache[k].as.c = (uint32_t) k;
+    }
+    kai_char_cache_init = 1;
+}
+
+/* Koka kk_integer_from_small (integer.h:211-215): a small Int is an
+ * immediate value — no heap, no RC. Only out-of-range Ints (Koka's
+ * bigint path) heap-allocate a KAI_INT fallback. The 5 MB int cache is
+ * gone; immediacy makes it pointless.
+ *
+ * `kai_int` is the inline fast path: a 63-bit-fitting value (the
+ * overwhelming common case — every loop counter, key, index) becomes a
+ * tagged immediate with one shift and no call. Only the out-of-range
+ * bignum tail detours to the NOINLINE heap-alloc helper. Before this
+ * split `kai_int` was wholly NOINLINE, so reading an Int back from a
+ * KAI_VAR_SLOT_INT slot (`kai_int(slot.i64)`) was a real call at every
+ * field touch — the round-trip that made the raw-i64 slot kind look
+ * slower than the tagged-ptr slot. With the fast path inlined the slot
+ * read is a shift, the slot stays KAI_VAR_SLOT_INT (so the generic drop
+ * walker skips it — no decref on keys), and both wins compose. */
+static KAI_RC_NOINLINE KaiValue *kai_int_big(int64_t i) {
+    KaiValue *v = kai_alloc(KAI_INT);
+    v->as.i = i;
+    return v;
+}
+static inline KaiValue *kai_int(int64_t i) {
+    if (kai_int_fits_immediate(i)) return kai_tagged_int(i);
+    return kai_int_big(i);
+}
+
+/* Uniform Int accessors — understand BOTH the immediate and the heap
+ * fallback forms, so every hot op (kai_op_*) and every emitter unbox
+ * site reads an Int the same way and the boxed↔unboxed frontier (the
+ * re-box-on-every-boundary that the rb-tree bench measured) is gone.
+ * Mirror of Koka's kk_integer accessors (integer.h). */
+static inline int kai_is_int(KaiValue *v) {
+    return kai_is_value(v) || (v != NULL && v->tag == KAI_INT);
+}
+static inline int64_t kai_intf(KaiValue *v) {
+    /* The immediate (tagged) form is the overwhelming common case — every
+     * loop counter, key, index. Only the 63-bit-overflow bignum tail
+     * (|n| > 2^62) detours to the heap `v->as.i` load, which cannot be
+     * speculated (immediate `v` is not a valid address). We keep the branch
+     * (soundness: heap bignums are real) but hint it so the predictor and
+     * layout favour the immediate path. The heap load stays off the hot
+     * path. */
+    intptr_t iv = (intptr_t) v;
+    if (__builtin_expect((iv & KAI_INT_TAG_BIT) != 0, 1)) return iv >> 1;
+    return v->as.i;
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_real(double r) {
+    KaiValue *v = kai_alloc(KAI_REAL);
+    v->as.r = r;
+    return v;
+}
+
+/* Lane 4 (#473): Byte nominal scalar. No interning cache for v1 — every
+ * `kai_byte(n)` allocates a fresh KaiValue. Cache (analogous to
+ * kai_int_cache for 0..127) is a natural Lane-4b/perf optimisation. */
+static KAI_RC_NOINLINE KaiValue *kai_byte(uint8_t n) {
+    KaiValue *v = kai_alloc(KAI_BYTE);
+    v->as.byte_val = n;
+    return v;
+}
+
+/* Fixed-width integer boxes (numeric lane A). Used only when a raw iN
+ * value must cross into a boxed slot (Show, polymorphic container);
+ * arithmetic stays raw and never allocates. */
+static KAI_RC_NOINLINE KaiValue *kai_int32(int32_t n) {
+    KaiValue *v = kai_alloc(KAI_INT32);
+    v->as.i32 = n;
+    return v;
+}
+static KAI_RC_NOINLINE KaiValue *kai_uint32(uint32_t n) {
+    KaiValue *v = kai_alloc(KAI_UINT32);
+    v->as.u32 = n;
+    return v;
+}
+static KAI_RC_NOINLINE KaiValue *kai_uint64(uint64_t n) {
+    KaiValue *v = kai_alloc(KAI_UINT64);
+    v->as.u64 = n;
+    return v;
+}
+/* Load / store an Int128 box's value through its two 8-byte halves.
+ * `memcpy` is alignment-agnostic, so this never triggers the misaligned
+ * `__int128` access UB that a bare `v->as.i128` would on an 8-byte-aligned
+ * KaiValue (the cause of the Linux/-O2 selfhost segfault). */
+static inline __int128 kai_i128_load(const KaiValue *v) {
+    __int128 n;
+    memcpy(&n, v->as.i128_halves, sizeof(n));
+    return n;
+}
+static inline void kai_i128_store(KaiValue *v, __int128 n) {
+    memcpy(v->as.i128_halves, &n, sizeof(n));
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_int128(__int128 n) {
+    KaiValue *v = kai_alloc(KAI_INT128);
+    kai_i128_store(v, n);
+    return v;
+}
+
+/* Parse a decimal / `0x` hex / `0b` binary integer literal (digits
+ * only, optional leading `-`, `_` separators allowed) into __int128.
+ * The compiler emits this for Int128 literals whose value may exceed
+ * 64 bits — no C integer constant can hold them, so we build the value
+ * at runtime. Overflow past 128 bits wraps (two's complement). */
+static __int128 kai_i128_parse(const char *s) {
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    unsigned __int128 acc = 0;
+    unsigned base = 10;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; }
+    else if (s[0] == '0' && (s[1] == 'b' || s[1] == 'B')) { base = 2; s += 2; }
+    for (; *s; s++) {
+        char c = *s;
+        if (c == '_') continue;
+        unsigned d;
+        if (c >= '0' && c <= '9') d = (unsigned) (c - '0');
+        else if (c >= 'a' && c <= 'f') d = (unsigned) (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (unsigned) (c - 'A' + 10);
+        else break;
+        acc = acc * base + d;
+    }
+    return neg ? -(__int128) acc : (__int128) acc;
+}
+
+/* Render a signed 128-bit value to decimal (handles INT128_MIN). The
+ * C library has no %lld for __int128, so we build the digits manually
+ * into `buf` (max 40 chars: sign + 39 digits) and return the start. */
+static char *kai_i128_to_decimal(__int128 v, char *buf, size_t buflen) {
+    char *p = buf + buflen - 1;
+    *p = '\0';
+    unsigned __int128 mag = (v < 0) ? (unsigned __int128)(-(v + 1)) + 1u
+                                    : (unsigned __int128) v;
+    do { *--p = (char) ('0' + (int) (mag % 10)); mag /= 10; } while (mag != 0);
+    if (v < 0) *--p = '-';
+    return p;
+}
+
+/* FFI v2 (#417): box an opaque C handle. `p` is borrowed external
+ * memory — RC frees only this box, never `p` (see kai_free_value's
+ * default arm: no payload free for KAI_FOREIGN). */
+static KAI_RC_NOINLINE KaiValue *kai_foreign(void *p) {
+    KaiValue *v = kai_alloc(KAI_FOREIGN);
+    v->as.foreign_ptr = p;
+    return v;
+}
+
+/* Unwrap an opaque handle back to its raw `void *` (a borrow — the box
+ * keeps owning the cell; the pointer stays valid until the C resource
+ * is destroyed by the driver). */
+static inline void *kai_foreign_ptr(KaiValue *v) {
+    return (v && v->tag == KAI_FOREIGN) ? v->as.foreign_ptr : NULL;
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_char(uint32_t c) {
+    if (c <= KAI_CHAR_CACHE_HI) {
+        if (!kai_char_cache_init) kai_char_cache_warm();
+        return &kai_char_cache[c];
+    }
+    KaiValue *v = kai_alloc(KAI_CHAR);
+    v->as.c = c;
+    return v;
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_str_from_bytes(const char *bytes, size_t len) {
+    KaiValue *v = kai_alloc(KAI_STR);
+    v->as.s.len = len;
+    v->as.s.bytes = (char *) kai_heap_malloc(len + 1);
+    if (len > 0) memcpy(v->as.s.bytes, bytes, len);
+    v->as.s.bytes[len] = '\0';
+    return v;
+}
+
+/* Lane FIX (top-3 leak sites): short-string interning.
+ *
+ * `core_table()` (DIAG rank #1) reallocates ~50 strings per call —
+ * every call to `core_find` rebuilds the same `.rodata`-pointed
+ * literals. The strings are content-deduped by the C compiler, so
+ * repeat `kai_str("print")` calls receive the *same* `cstr` pointer.
+ * Interning by pointer-then-content gives an immortal singleton per
+ * literal, eliminating the per-call alloc/leak the same way
+ * #300 / #304 did for nullary and immortal-payload variants.
+ *
+ * Two-stage lookup (open-addressed, 1024 buckets):
+ *   1. Pointer match — hits 100% of compiler-emitted literal calls
+ *      because identical literals share a single .rodata entry.
+ *   2. Content match (≤ 64 bytes) — backstop for a repeated literal
+ *      whose .rodata pointer differs across translation units.
+ *
+ * Misses (long strings, full table) fall through to
+ * `kai_str_from_bytes` unchanged. Data-derived content must NOT come
+ * through here — every distinct string inserted is pinned immortal, so
+ * unbounded content grows the table without bound (use `kai_str_dyn`).
+ *
+ * Cached values carry `rc = INT32_MAX` so `kai_incref` / `kai_decref`
+ * short-circuit; `kai_free_value` is never reached. */
+#define KAI_STR_INTERN_BUCKETS 1024
+#define KAI_STR_INTERN_MAXLEN  64
+/* `cstr` is the bucket's publication flag as well as its key, so it is the
+ * one field that must be atomic: an inserter fills `len` and `value` first
+ * and RELEASES `cstr` last, a reader ACQUIRES `cstr` and only then reads the
+ * other two. Without that order a reader can match a bucket whose `value` is
+ * still NULL and hand a NULL string back to the program — on the path of
+ * every string literal. */
+typedef struct {
+    _Atomic(const char *) cstr;  /* NULL ⇒ empty bucket. Owned via strdup. */
+    size_t                len;
+    KaiValue             *value;
+} KaiStrInternBucket;
+/* The intern table's whole purpose is pointer-identity: equal strings map to
+ * one immortal value. A per-TU table would give each TU its own dedup set,
+ * so the same literal interned in two TUs would yield distinct pointers and
+ * defeat the interning. One shared table (owner defines, others extern).
+ *
+ * Shared and mutable, so the mutex is real: it serializes inserts (probe,
+ * allocate, publish) against each other. Lookups stay lock-free — entries are
+ * never removed or rewritten, so a probe that acquires a published `cstr`
+ * sees a bucket that is already final. The mutex takes no other lock, so it
+ * enters no ordering relation with the reactor / slot / mailbox locks. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiStrInternBucket kai_str_intern_table[KAI_STR_INTERN_BUCKETS];
+extern pthread_mutex_t    kai_str_intern_mu;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiStrInternBucket kai_str_intern_table[KAI_STR_INTERN_BUCKETS];
+pthread_mutex_t    kai_str_intern_mu = PTHREAD_MUTEX_INITIALIZER;
+#  endif
+#else
+static KaiStrInternBucket kai_str_intern_table[KAI_STR_INTERN_BUCKETS];
+static pthread_mutex_t    kai_str_intern_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+static inline size_t kai_str_intern_hash(const char *cstr, size_t len) {
+    /* FNV-1a, len-bounded. */
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t) (uint8_t) cstr[i];
+        h *= 1099511628211ull;
+    }
+    return (size_t) (h & (KAI_STR_INTERN_BUCKETS - 1));
+}
+
+/* Slow path: this probe found an empty bucket, so the string is (probably)
+ * not interned yet. Re-probe under the mutex — a peer may have inserted the
+ * same string, or filled the bucket we picked — then publish. */
+static KaiValue *kai_str_intern_insert(const char *cstr, size_t len) {
+    if (kai_nthreads > 1) pthread_mutex_lock(&kai_str_intern_mu);
+    KaiValue *result = NULL;
+    size_t i = kai_str_intern_hash(cstr, len);
+    for (size_t probe = 0; probe < KAI_STR_INTERN_BUCKETS; probe++) {
+        KaiStrInternBucket *b = &kai_str_intern_table[i];
+        const char *bc = atomic_load_explicit(&b->cstr, memory_order_relaxed);
+        if (bc == NULL) {
+            KaiValue *v = kai_str_from_bytes(cstr, len);
+            v->rc = INT32_MAX;
+            char *owned = (char *) malloc(len + 1);
+            if (owned) {
+                memcpy(owned, cstr, len);
+                owned[len] = '\0';
+                b->len   = len;
+                b->value = v;
+                /* Publish last, with release: a reader that acquires this
+                 * pointer is guaranteed to see the `len` / `value` above. */
+                atomic_store_explicit(&b->cstr, (const char *) owned,
+                                      memory_order_release);
+            }
+            /* Even if the copy failed, the value is still valid (just not
+             * cacheable). Subsequent calls re-alloc but stay correct. */
+            result = v;
+            break;
+        }
+        if (b->len == len && (bc == cstr || memcmp(bc, cstr, len) == 0)) {
+            result = b->value;   /* a peer interned it first */
+            break;
+        }
+        i = (i + 1) & (KAI_STR_INTERN_BUCKETS - 1);
+    }
+    if (kai_nthreads > 1) pthread_mutex_unlock(&kai_str_intern_mu);
+    /* Table full — fall back to non-cached. */
+    return result ? result : kai_str_from_bytes(cstr, len);
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_str(const char *cstr) {
+    size_t len = strlen(cstr);
+    if (len > KAI_STR_INTERN_MAXLEN) return kai_str_from_bytes(cstr, len);
+    size_t i = kai_str_intern_hash(cstr, len);
+    for (size_t probe = 0; probe < KAI_STR_INTERN_BUCKETS; probe++) {
+        KaiStrInternBucket *b = &kai_str_intern_table[i];
+        /* Acquire pairs with the release store in the insert path; entries are
+         * never removed or rewritten, so a published bucket is already final
+         * and the lock-free read needs nothing more. */
+        const char *bc = atomic_load_explicit(&b->cstr, memory_order_acquire);
+        if (bc == NULL) return kai_str_intern_insert(cstr, len);
+        if (b->len == len && (bc == cstr || memcmp(bc, cstr, len) == 0)) {
+            return b->value;
+        }
+        i = (i + 1) & (KAI_STR_INTERN_BUCKETS - 1);
+    }
+    /* Table full — fall back to non-cached. */
+    return kai_str_from_bytes(cstr, len);
+}
+
+/* For data-derived C strings (number renders, paths, dir entries).
+ * `kai_str` interns and pins its result immortal, which is only sound
+ * for program-bounded literals — unbounded content would grow the
+ * intern table one immortal cell per distinct value. */
+static KaiValue *kai_str_dyn(const char *cstr) {
+    return kai_str_from_bytes(cstr, strlen(cstr));
+}
+
+static KaiValue *kai_nil(void) { return &kai_singleton_nil; }
+
+static KAI_RC_NOINLINE KaiValue *kai_cons(KaiValue *head, KaiValue *tail) {
+    KaiValue *v = kai_alloc(KAI_CONS);
+    v->as.cons.head = head;
+    v->as.cons.tail = tail;
+    return v;
+}
+
+/* ---------- lazy ranges ---------- */
+
+/* A KAI_RANGE is `[Int]` stored as its generator — same list, other
+ * representation (like KAI_VEC under the sequence type). Constructing
+ * one is O(1); consumers iterate the generator without materialising.
+ * `step` is never 0 (kai_range_step traps on it). */
+
+static KaiValue *kai_range_new(int64_t from, int64_t to, int64_t step) {
+    KaiValue *v = kai_alloc(KAI_RANGE);
+    v->as.range.from = from;
+    v->as.range.to   = to;
+    v->as.range.step = step;
+    return v;
+}
+
+static inline int kai_range_is_empty(KaiValue *v) {
+    return v->as.range.step > 0 ? v->as.range.from > v->as.range.to
+                                : v->as.range.from < v->as.range.to;
+}
+
+/* Element count of a non-empty range, overflow-safe at the int64
+ * extremes (unsigned span arithmetic; INT64_MIN step negates cleanly
+ * as unsigned). */
+static inline int64_t kai_range_len(KaiValue *v) {
+    uint64_t span, ustep;
+    if (v->as.range.step > 0) {
+        span  = (uint64_t) v->as.range.to - (uint64_t) v->as.range.from;
+        ustep = (uint64_t) v->as.range.step;
+    } else {
+        span  = (uint64_t) v->as.range.from - (uint64_t) v->as.range.to;
+        ustep = 0 - (uint64_t) v->as.range.step;
+    }
+    return (int64_t) (span / ustep) + 1;
+}
+
+/* Last element actually generated by a non-empty range (`to` itself is
+ * only hit when the span divides the step). */
+static inline int64_t kai_range_last(KaiValue *v) {
+    return (int64_t) ((uint64_t) v->as.range.from +
+                      (uint64_t) v->as.range.step *
+                          (uint64_t) (kai_range_len(v) - 1));
+}
+
+/* Wrap-safe generator advance (bounds near INT64_MAX must not UB). */
+static inline int64_t kai_range_next(int64_t i, int64_t step) {
+    return (int64_t) ((uint64_t) i + (uint64_t) step);
+}
+
+/* Normalise ONE cell: rewrite a KAI_RANGE node in place into the list
+ * it denotes — KAI_NIL when empty, else a KAI_CONS whose tail is a
+ * fresh range node for the rest. The rewrite changes representation,
+ * never value, so it is sound under sharing (every alias sees the same
+ * list); rc and node identity are untouched. Anything else (cons, nil,
+ * NULL, immediates) passes through. Every `as.cons` access whose value
+ * may be a range must run behind this. */
+static KaiValue *kai_seq_norm(KaiValue *v) {
+    if (!kai_is_ptr(v) || v->tag != KAI_RANGE) return v;
+    if (kai_range_is_empty(v)) {
+        v->tag = (uint8_t) KAI_NIL;
+        return v;
+    }
+    int64_t from = v->as.range.from;
+    int64_t to   = v->as.range.to;
+    int64_t step = v->as.range.step;
+    int64_t next = kai_range_next(from, step);
+    KaiValue *tail = (step > 0 ? next > to : next < to)
+                         ? kai_nil()
+                         : kai_range_new(next, to, step);
+    v->as.cons.head = kai_int(from);
+    v->as.cons.tail = tail;
+    v->tag = (uint8_t) KAI_CONS;
+    return v;
+}
+
+/* Sequence cursor for generic list walkers (eq, show, conversions):
+ * yields the elements of a cons/range list without mutating or
+ * materialising it. Walks cons cells first; once a range node is hit,
+ * generates arithmetically to the end (a range's tail is never a
+ * cons). `kai_seq_it_next` yields an OWNED value (incref'd cons head /
+ * minted Int) — the caller releases it. */
+typedef struct {
+    KaiValue *node;              /* current cons position; NULL in range phase */
+    int64_t   from, to, step;    /* live once in range phase */
+    int       in_range;
+} KaiSeqIt;
+
+static void kai_seq_it_init(KaiSeqIt *it, KaiValue *v) {
+    it->node = v;
+    it->in_range = 0;
+}
+
+static KaiValue *kai_seq_it_next(KaiSeqIt *it) {
+    if (!it->in_range) {
+        KaiValue *n = it->node;
+        if (!kai_is_ptr(n)) return NULL;
+        if (n->tag == KAI_CONS) {
+            it->node = n->as.cons.tail;
+            return kai_incref(n->as.cons.head);
+        }
+        if (n->tag != KAI_RANGE) return NULL;
+        it->in_range = 1;
+        it->from = n->as.range.from;
+        it->to   = n->as.range.to;
+        it->step = n->as.range.step;
+    }
+    if (it->step > 0 ? it->from > it->to : it->from < it->to) return NULL;
+    KaiValue *r = kai_int(it->from);
+    it->from = kai_range_next(it->from, it->step);
+    return r;
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_record(int n, KaiValue **fields, const char **names) {
+    KaiValue *v = kai_alloc(KAI_RECORD);
+    v->as.rec.n_fields = n;
+    v->as.rec.fields = (KaiValue **) malloc(n * sizeof(KaiValue *));
+    v->as.rec.names  = (const char **) malloc(n * sizeof(const char *));
+    v->as.rec.head_type_tag = 0;  /* anonymous; kai_record_h sets it nominally */
+    for (int i = 0; i < n; ++i) {
+        v->as.rec.fields[i] = fields[i];
+        v->as.rec.names[i]  = names[i];
+    }
+    return v;
+}
+
+/* Nominal-record constructor — same as kai_record but stamps the
+ * head-type tag for protocol dispatch. See docs/variant-tags.md
+ * "Head-type tags". */
+static KAI_RC_NOINLINE KaiValue *kai_record_h(int n, KaiValue **fields, const char **names, int32_t head_tag) {
+    KaiValue *v = kai_record(n, fields, names);
+    v->as.rec.head_type_tag = head_tag;
+    return v;
+}
+
+/* Issue #300 — nullary variant singletons.
+ *
+ * `None` alone accounts for 50.7M allocations / 50.0M leaked in
+ * the kaic2 self-compile (63.8% of total live count). Every
+ * `kai_variant_u(_, "None", 0, 0, NULL)` call freshly allocs a chunk
+ * structurally identical to every other `None` chunk: same tag,
+ * same name pointer (string literal in .rodata), no payload. They
+ * differ only in identity, which kaikai source code never observes
+ * (variants don't have referential equality).
+ *
+ * The fix is the same trick already used for unit/bool/nil/cached
+ * ints/chars: keep one immortal chunk per `(tag, name_ptr)` pair,
+ * mark it `rc = INT32_MAX`, and return that pointer on every call.
+ * `kai_incref` / `kai_decref` already short-circuit on INT32_MAX
+ * so the singleton survives every RC operation unchanged and
+ * `kai_free_value` is never reached with a singleton.
+ *
+ * Storage — open-addressed table keyed on (tag, name_ptr). The
+ * name pointer is the address of a string literal in the binary's
+ * .rodata segment, so it's stable across calls and unique per
+ * distinct constructor. kaikai has on the order of 20-30 distinct
+ * nullary variants; 64 buckets gives ample headroom.
+ */
+#define KAI_NULLARY_SINGLETON_BUCKETS 64
+typedef struct {
+    int32_t       tag;
+    const char   *name;     /* NULL ⇒ empty bucket */
+    KaiValue     *value;
+} KaiNullarySingletonBucket;
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiNullarySingletonBucket
+    kai_nullary_singletons[KAI_NULLARY_SINGLETON_BUCKETS];
+#  if defined(KAI_RUNTIME_OWNER)
+KaiNullarySingletonBucket
+    kai_nullary_singletons[KAI_NULLARY_SINGLETON_BUCKETS];
+#  endif
+#else
+static KaiNullarySingletonBucket
+    kai_nullary_singletons[KAI_NULLARY_SINGLETON_BUCKETS];
+#endif
+
+static inline size_t kai_nullary_hash(int32_t tag, const char *name) {
+    uintptr_t p = (uintptr_t) name;
+    return (size_t) (((p >> 4) ^ (p >> 12) ^ (uintptr_t) tag)
+                     & (KAI_NULLARY_SINGLETON_BUCKETS - 1));
+}
+
+static KaiValue *kai_nullary_lookup(int32_t tag, const char *name) {
+    size_t i = kai_nullary_hash(tag, name);
+    for (size_t probe = 0; probe < KAI_NULLARY_SINGLETON_BUCKETS; probe++) {
+        KaiNullarySingletonBucket *b = &kai_nullary_singletons[i];
+        if (b->name == NULL) return NULL;
+        if (b->tag == tag && b->name == name) return b->value;
+        i = (i + 1) & (KAI_NULLARY_SINGLETON_BUCKETS - 1);
+    }
+    return NULL;
+}
+
+/* Enum-slot fast path (KAI_VAR_SLOT_ENUM): a tag->singleton map so a
+ * variant slot holding only the immediate `variant_tag` of an
+ * all-nullary sum type can be re-boxed back into its interned
+ * KaiValue* without knowing the ctor name at the read site. Tags are
+ * name-keyed sparse ints spanning the full uint16 space; a flat array
+ * indexed by tag is still the cheapest lookup (512 KiB of .bss).
+ * Populated lazily by kai_nullary_install as each nullary ctor is
+ * first constructed. Singletons are immortal (rc == INT32_MAX), so
+ * the stored pointer never dangles. */
+#define KAI_ENUM_TAG_MAX 65536
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiValue *kai_enum_by_tag[KAI_ENUM_TAG_MAX];
+#  if defined(KAI_RUNTIME_OWNER)
+KaiValue *kai_enum_by_tag[KAI_ENUM_TAG_MAX] = {0};
+#  endif
+#else
+static KaiValue *kai_enum_by_tag[KAI_ENUM_TAG_MAX] = {0};
+#endif
+
+/* Fast nullary-ctor construction: read the interned singleton straight
+ * from kai_enum_by_tag[tag] — an array load — instead of kai_variant_u's
+ * NOINLINE call + nullary-cache hash+probe. Every nullary is seeded into
+ * kai_enum_by_tag at startup (emit_nullary_enum_seed in
+ * _kai_register_proto_tables, before main's body), so the load always
+ * hits in steady state; the fallback covers a nullary built before the
+ * seed (it self-installs, so later loads hit). On the rb-tree bench the
+ * RBLeaf leaves were 13M instructions via the kai_variant_u path — every
+ * insert-into-leaf mints two RBLeaf singletons through the hash probe
+ * just to read back a pointer the seed already cached. Koka shape: a
+ * nullary is kk_datatype_from_tag, an immediate, never a table lookup. */
+static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
+                                               int n, uint32_t mask,
+                                               KaiVarSlot *slots);
+static inline KaiValue *kai_nullary_fast(int32_t tag, const char *name) {
+    if (tag >= 0 && tag < KAI_ENUM_TAG_MAX) {
+        KaiValue *v = kai_enum_by_tag[tag];
+        if (v) return v;
+    }
+    return kai_variant_u(tag, name, 0, 0, NULL);
+}
+
+static void kai_nullary_install(int32_t tag, const char *name, KaiValue *v) {
+    if (tag >= 0 && tag < KAI_ENUM_TAG_MAX) kai_enum_by_tag[tag] = v;
+    size_t i = kai_nullary_hash(tag, name);
+    for (size_t probe = 0; probe < KAI_NULLARY_SINGLETON_BUCKETS; probe++) {
+        KaiNullarySingletonBucket *b = &kai_nullary_singletons[i];
+        if (b->name == NULL) {
+            b->tag = tag;
+            b->name = name;
+            b->value = v;
+            return;
+        }
+        i = (i + 1) & (KAI_NULLARY_SINGLETON_BUCKETS - 1);
+    }
+    /* Table full — fall back to non-singleton behaviour. With 64
+     * buckets and a known cap of ~30 distinct nullary variants
+     * this branch is unreachable in practice. */
+}
+
+/* Re-box an enum-slot's immediate tag into its interned singleton
+ * KaiValue*. The singleton is created the first time the ctor is
+ * constructed anywhere in the program (kai_variant_u nullary path,
+ * which calls kai_nullary_install). For the slot to have been written
+ * with this tag, that construction already happened, so the lookup
+ * hits; the fallback (defensive) returns unit rather than dangle. */
+static inline KaiValue *kai_enum_slot_box(int64_t tag) {
+    if (tag >= 0 && tag < KAI_ENUM_TAG_MAX) {
+        KaiValue *v = kai_enum_by_tag[(int) tag];
+        if (v) return v;
+    }
+    return kai_unit();
+}
+
+/* Issue #293 next-tier — variants whose every arg is itself an
+ * immortal singleton (rc==INT32_MAX) are themselves morally
+ * immortal: they can never be mutated and have no observable
+ * identity. Cache them just like nullary variants. The dominant
+ * win is `Some(<immortal>)` and `Ok(<immortal>)`, which the
+ * compiler builds by the millions when threading typer/parser
+ * results that are themselves nullary variants or cached scalars.
+ *
+ * Storage — open-addressed table keyed on (tag, name, n, args[0..n]).
+ * Capped at n <= 4 to bound the key size. Once the table fills,
+ * subsequent lookups walk every bucket without finding the empty
+ * sentinel, so installs silently fail and every later invocation
+ * falls back to a fresh alloc. The 16384-bucket sizing originally
+ * landed for #293 turned out to be ~16x too small for kaic2's
+ * self-compile: the typer's `core_table` rebuilds 47 EP variants
+ * per call × ~13K calls (issue #297 EP wave, 2026-05-07), and
+ * Some/Ok/TyCon-shaped immortal-payload combinations push the
+ * working set past 16K well before the core entries land. The
+ * larger 262144-bucket sizing absorbs the EP table outright (642K
+ * leaks → 45 cached chunks, 99.99% drop) and adds ~16 MB of static
+ * .bss to the binary. Collisions still degrade to a fresh non-cached
+ * alloc — same behaviour as a full nullary table.
+ */
+#define KAI_IMMORTAL_VAR_BUCKETS 262144
+#define KAI_IMMORTAL_VAR_MAXN 4
+typedef struct {
+    int32_t       tag;
+    int           n;
+    const char   *name;     /* NULL ⇒ empty bucket */
+    KaiValue     *args[KAI_IMMORTAL_VAR_MAXN];
+    KaiValue     *value;
+} KaiImmortalVarBucket;
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiImmortalVarBucket
+    kai_immortal_vars[KAI_IMMORTAL_VAR_BUCKETS];
+#  if defined(KAI_RUNTIME_OWNER)
+KaiImmortalVarBucket
+    kai_immortal_vars[KAI_IMMORTAL_VAR_BUCKETS];
+#  endif
+#else
+static KaiImmortalVarBucket
+    kai_immortal_vars[KAI_IMMORTAL_VAR_BUCKETS];
+#endif
+
+/* Reusable-tag registry (issue #118 layer 3) — the immortal-args
+ * cache above immortalises any variant whose slots are all immortal,
+ * on the #293 premise that such a cell "can never be mutated and has
+ * no observable identity". That premise is FALSE for any tag the
+ * program rewrites in place via a Perceus reuse-arm: `mirror`/`rotate`
+ * over a `Tree` whose leaves are immortal `TLeaf` + interned strings
+ * would immortalise every node (rc=INT32_MAX), and `kai_check_unique`
+ * then rejects them — reuse-in-place never fires and the structure
+ * leaks wholesale.
+ *
+ * The compiler's Perceus recogniser already knows exactly which tags
+ * are reuse targets (it emits `kai_reuse_or_alloc_variant` for them).
+ * It stamps that set here at startup via `kai_register_reusable_tags`.
+ * `kai_variant_u` consults the set and skips immortalisation for a
+ * reusable tag, leaving its cells with a real refcount so reuse can
+ * fire. Some/Ok/AST-`Expr` (no reuse-arm) keep the #293 win intact;
+ * only the tags the program actually mutates leave the cache.
+ *
+ * Storage — a bitset indexed by tag. Tags are dense small ints
+ * assigned by the emitter; 1<<16 covers every realistic program with
+ * a single 8 KiB static array. Out-of-range tags (defensive) are
+ * treated as non-reusable, i.e. cacheable as before. */
+#define KAI_REUSABLE_TAG_MAX 65536
+#if defined(KAI_SEPARATE_COMPILATION)
+extern unsigned char kai_reusable_tag_bits[KAI_REUSABLE_TAG_MAX / 8];
+#  if defined(KAI_RUNTIME_OWNER)
+unsigned char kai_reusable_tag_bits[KAI_REUSABLE_TAG_MAX / 8];
+#  endif
+#else
+static unsigned char kai_reusable_tag_bits[KAI_REUSABLE_TAG_MAX / 8];
+#endif
+
+static void kai_register_reusable_tags(const int32_t *tags, int n) {
+    for (int i = 0; i < n; i++) {
+        int32_t t = tags[i];
+        if (t >= 0 && t < KAI_REUSABLE_TAG_MAX) {
+            kai_reusable_tag_bits[t >> 3] |= (unsigned char) (1u << (t & 7));
+        }
+    }
+}
+
+static inline int kai_tag_is_reusable(int32_t tag) {
+    if (tag < 0 || tag >= KAI_REUSABLE_TAG_MAX) return 0;
+    return (kai_reusable_tag_bits[tag >> 3] >> (tag & 7)) & 1;
+}
+
+/* Issue #688 — single variant constructor.
+ *
+ * `kai_variant_u` is the only entry point for KAI_VARIANT construction.
+ * Replaces the older `kai_variant` / `kai_variant_u` pair that diverged
+ * during Phase 2 #440: the typed path took the slot-mask shape but
+ * skipped the nullary / immortal caches, while the legacy boxed path
+ * kept the caches but assumed mask==0. Now a single function carries
+ * both: the cache fast paths fire when `mask == 0` (all slots are
+ * boxed `.ptr` values), and the typed path falls through when any
+ * primitive slot is present.
+ *
+ * Slot semantics: `slots[i].ptr` transfers ownership for pointer slots
+ * exactly like the legacy `KaiValue **args` shape; `slots[i].i64` /
+ * `slots[i].r` carry the raw unboxed payload for typed slots and have
+ * no ref-count discipline. The mask bit `1 << i` selects pointer (bit
+ * clear) vs primitive (bit set); convention matches stage 2's
+ * `variant_slot_mask` emitter. */
+
+static int kai_slots_all_immortal_ptr(int n, KaiVarSlot *slots) {
+    if (n <= 0 || n > KAI_IMMORTAL_VAR_MAXN) return 0;
+    for (int i = 0; i < n; i++) {
+        /* An immediate value (tagged Int) has no header and is never
+         * freed — it counts as immortal. A heap value is immortal only
+         * when its rc is saturated. */
+        /* A tagged-Int immediate slot DISQUALIFIES the variant from the
+         * immortal cache. The cache is for variants of BOUNDED cardinality
+         * (nullary ctors, all-immortal-pointer cells like `TLeaf` or
+         * interned-string payloads): caching them wins because a small fixed
+         * set is reused. A tagged Int has no header so it never frees — but a
+         * variant CONTAINING a *variable* tagged Int (`Lit(i)` for arbitrary
+         * `i`) has UNBOUNDED distinct identities. Immortalising it interns one
+         * cache entry per distinct `i`, saturating the fixed open-addressing
+         * table and degrading its linear probe to O(n) — the `variant_match`
+         * super-linear collapse (issue #855). The C backend never hits this:
+         * it builds such cells via `kai_variant_u_fast` with a TYPED `.i64`
+         * slot, bypassing the mask==0 cache path entirely. Excluding tagged-Int
+         * slots here brings the native (all-boxed) path to parity. */
+        if (kai_is_value(slots[i].ptr)) return 0;
+        if (slots[i].ptr == NULL || slots[i].ptr->rc != INT32_MAX) return 0;
+    }
+    return 1;
+}
+
+static inline size_t kai_immortal_slot_hash(int32_t tag, const char *name,
+                                            int n, KaiVarSlot *slots) {
+    uintptr_t h = (uintptr_t) name;
+    h = (h * 1315423911u) ^ ((uintptr_t) tag);
+    h = (h * 1315423911u) ^ (uintptr_t) n;
+    for (int i = 0; i < n; i++) {
+        h = (h * 1315423911u) ^ (uintptr_t) slots[i].ptr;
+    }
+    h ^= h >> 13;
+    return (size_t) (h & (KAI_IMMORTAL_VAR_BUCKETS - 1));
+}
+
+static int kai_immortal_slot_match(KaiImmortalVarBucket *b, int32_t tag,
+                                   const char *name, int n, KaiVarSlot *slots) {
+    if (b->name != name || b->tag != tag || b->n != n) return 0;
+    for (int i = 0; i < n; i++) {
+        if (b->args[i] != slots[i].ptr) return 0;
+    }
+    return 1;
+}
+
+static KaiValue *kai_immortal_slot_lookup(int32_t tag, const char *name,
+                                          int n, KaiVarSlot *slots) {
+    size_t i = kai_immortal_slot_hash(tag, name, n, slots);
+    for (size_t probe = 0; probe < KAI_IMMORTAL_VAR_BUCKETS; probe++) {
+        KaiImmortalVarBucket *b = &kai_immortal_vars[i];
+        if (b->name == NULL) return NULL;
+        if (kai_immortal_slot_match(b, tag, name, n, slots)) return b->value;
+        i = (i + 1) & (KAI_IMMORTAL_VAR_BUCKETS - 1);
+    }
+    return NULL;
+}
+
+static void kai_immortal_slot_install(int32_t tag, const char *name, int n,
+                                      KaiVarSlot *slots, KaiValue *v) {
+    size_t i = kai_immortal_slot_hash(tag, name, n, slots);
+    for (size_t probe = 0; probe < KAI_IMMORTAL_VAR_BUCKETS; probe++) {
+        KaiImmortalVarBucket *b = &kai_immortal_vars[i];
+        if (b->name == NULL) {
+            b->tag = tag;
+            b->name = name;
+            b->n = n;
+            for (int j = 0; j < n; j++) b->args[j] = slots[j].ptr;
+            b->value = v;
+            return;
+        }
+        i = (i + 1) & (KAI_IMMORTAL_VAR_BUCKETS - 1);
+    }
+    /* Table full — fall back to non-cached behaviour. */
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
+                                               int n, uint32_t mask,
+                                               KaiVarSlot *slots) {
+    KAI_VAR_NAME_ALLOC(name);
+    /* Record tag→name and tag→slot_mask: neither is stored per node now
+     * (Koka-packed header). Rare readers recover them via the tables. */
+    kai_varname_register(tag, name);
+    kai_slotmask_register(tag, mask);
+
+    /* Nullary fast path — shares the singleton cache with all other
+     * `Name`-tag nullaries. Mask is irrelevant when n == 0. */
+    if (n == 0 && name != NULL) {
+        KaiValue *cached = kai_nullary_lookup(tag, name);
+        if (cached) return cached;
+        KAI_VAR_NAME_REAL_ALLOC(name);
+        KaiValue *v = kai_alloc(KAI_VARIANT);
+        v->variant_tag = tag;
+        v->var_n_args = 0;
+        kai_slotmask_register(v->variant_tag, 0);
+        v->rc = INT32_MAX;
+        kai_nullary_install(tag, name, v);
+        return v;
+    }
+
+    /* Immortal-args fast path — only when every slot is a boxed pointer
+     * (mask == 0) and every pointer is itself immortal. Cells with
+     * primitive slots are not cached: their identity is the bit
+     * pattern, which the existing cache shape does not key on.
+     *
+     * Issue #118 layer 3 — a tag the program rewrites in place (reuse
+     * target) is excluded: immortalising it would saturate its rc and
+     * permanently block `kai_check_unique`, killing reuse-in-place on
+     * every cell of that type. The reusable-tag bitset is stamped at
+     * startup by the compiler's Perceus recogniser. */
+    if (mask == 0 && name != NULL && !kai_tag_is_reusable(tag) &&
+        kai_slots_all_immortal_ptr(n, slots)) {
+        KaiValue *cached = kai_immortal_slot_lookup(tag, name, n, slots);
+        if (cached) return cached;
+        KAI_VAR_NAME_REAL_ALLOC(name);
+        KaiValue *v = kai_alloc_var(n);
+        v->variant_tag = tag;
+        v->var_n_args = n;
+        kai_slotmask_register(v->variant_tag, 0);
+        for (int i = 0; i < n; ++i) kai_var_slots(v)[i] = slots[i];
+        v->rc = INT32_MAX;
+        kai_immortal_slot_install(tag, name, n, slots, v);
+        return v;
+    }
+
+    /* Cold path — fresh alloc, no caching. FAM: header + n inline slots
+     * in one block; `slots` aliases the trailing inline_slots so the
+     * emitted codegen reads payload identically. */
+    KAI_VAR_NAME_REAL_ALLOC(name);
+    KaiValue *v = kai_alloc_var(n);
+    v->variant_tag = tag;
+    v->var_n_args = n;
+    kai_slotmask_register(v->variant_tag, mask);
+    if (n > 0) {
+        for (int i = 0; i < n; ++i) kai_var_slots(v)[i] = slots[i];
+    } else {
+    }
+    return v;
+}
+
+/* Fast typed constructor for a payload-carrying variant with at least
+ * one PRIMITIVE slot (the only case the emitter routes here).
+ *
+ * `kai_variant_u` runs a per-call preamble before the actual
+ * alloc+stores: KAI_VAR_NAME_ALLOC, kai_varname_register,
+ * kai_slotmask_register, then a nullary-singleton probe and an
+ * immortal-args cache probe (262144-bucket hash + linear scan). It is
+ * also KAI_RC_NOINLINE — a real call with argument spill at every one of
+ * millions of construction sites (perfil: kai_variant_u = 43 samples,
+ * second only to the loop body itself).
+ *
+ * For a cell with a primitive slot NONE of that preamble can help: the
+ * nullary cache needs n == 0, and the immortal-args cache explicitly
+ * skips cells with primitive slots ("their identity is the bit pattern,
+ * which the cache shape does not key on"). So the only preamble work
+ * that matters is registering tag→name and tag→mask — and both
+ * registers are already idempotent (`kai_slotmask_seen[tag]` /
+ * `kai_varname_table[tag]` guard the first write). This fast path keeps
+ * exactly those two idempotent registers (so the generic drop walker
+ * reads the correct mask) and drops everything else, inlined so the C
+ * compiler folds the alloc + the fixed-bound store loop into the caller
+ * — Koka's `kk_alloc(sizeof) + field stores` shape.
+ *
+ * Mask MUST be registered here (not assumed pre-stamped): the walker in
+ * kai_free_value reads kai_slot_mask_of(tag) to decide which slots are
+ * pointers. A missing mask would make it treat a raw i64 key as a
+ * pointer and decref garbage. The `_seen` guard makes the steady-state
+ * cost a single predictable branch. */
+static inline KaiValue *kai_variant_u_fast(int32_t tag, int n,
+                                           KaiVarSlot *slots) {
+    /* No tag→name/mask register here: every payload ctor's name+mask is
+     * stamped ONCE at startup by kai_register_payload_ctors (emitted in
+     * _kai_register_proto_tables). Keeping the registers in the body made
+     * the fn too large for the inliner — at -O3 it stayed a separate
+     * 31.8M-instruction function (callgrind). Reduced to alloc+stores it
+     * inlines into the call site, the Koka kk_alloc + field-stores shape.
+     * No-zero alloc: the loop writes all n slots, so the allocator's
+     * zero-init is dead work. */
+    KaiValue *v = kai_alloc_var_nz(n);
+    v->variant_tag = tag;
+    v->var_n_args = (uint8_t) n;
+    for (int i = 0; i < n; ++i) kai_var_slots(v)[i] = slots[i];
+    return v;
+}
+
+/* Stamp the tag→name and tag→mask tables for every payload-carrying
+ * constructor at startup, so kai_variant_u_fast needs no per-call
+ * register (and stays small enough to inline). The emitter generates the
+ * (tag, name, mask) triples table and one call to this in
+ * _kai_register_proto_tables, beside kai_register_reusable_tags. */
+typedef struct { int32_t tag; const char *name; uint32_t mask; } KaiPayloadCtor;
+static void kai_register_payload_ctors(const KaiPayloadCtor *ctors, int n) {
+    for (int i = 0; i < n; ++i) {
+        kai_varname_register(ctors[i].tag, ctors[i].name);
+        kai_slotmask_register(ctors[i].tag, ctors[i].mask);
+    }
+}
+
+/* issue #120 — opt-in Perceus regions (Phase P1): arena-backed
+ * constructors. Mirror kai_cons / kai_record / kai_variant_u but
+ * bump-allocate the header (and interior arrays) into the current
+ * region arena instead of the RC heap. The emitter routes every
+ * constructor lexically inside a `region { }` block through these when
+ * `cx.in_region` is set; the resulting nodes carry rc = INT32_MAX (the
+ * arena sentinel) so RC skips them and the whole arena frees in one
+ * shot at block exit. No active region (defensive — codegen bug) →
+ * fall back to the RC constructor (correct, just unpooled). The arena
+ * variant ctor does NOT intern nullaries (unlike kai_variant_u): an
+ * arena nullary must die with its arena, not join the process-lifetime
+ * singleton cache. */
+static KaiValue *kai_arena_cons(KaiValue *head, KaiValue *tail) {
+    KaiArena *ar = kai_arena_current();
+    if (!ar) return kai_cons(head, tail);
+    KaiValue *v = kai_arena_alloc(ar, KAI_CONS);
+    v->as.cons.head = head;
+    v->as.cons.tail = tail;
+    return v;
+}
+
+static KaiValue *kai_arena_record(int n, KaiValue **fields, const char **names) {
+    KaiArena *ar = kai_arena_current();
+    if (!ar) return kai_record(n, fields, names);
+    KaiValue *v = kai_arena_alloc(ar, KAI_RECORD);
+    KaiValue **af = (KaiValue **) kai_arena_raw(ar, (size_t) (n > 0 ? n : 1) * sizeof(KaiValue *));
+    const char **an = (const char **) kai_arena_raw(ar, (size_t) (n > 0 ? n : 1) * sizeof(const char *));
+    for (int i = 0; i < n; ++i) { af[i] = fields[i]; an[i] = names[i]; }
+    v->as.rec.n_fields = n;
+    v->as.rec.fields = af;
+    v->as.rec.names = an;
+    v->as.rec.head_type_tag = 0;
+    return v;
+}
+
+static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
+                                   uint32_t mask, KaiVarSlot *slots) {
+    KaiArena *ar = kai_arena_current();
+    if (!ar) return kai_variant_u(tag, name, n, mask, slots);
+    /* Slots live INLINE at `&v->as` (kai_var_slots), so the cell must
+     * reserve `kai_var_block_size(n)` bytes — NOT just sizeof(KaiValue).
+     * kai_arena_alloc only sizes a bare header; a variant with n>0 read
+     * back through kai_var_slots would land past the allocation. Bump the
+     * full block, stamp the immortal sentinel, and write the slots where
+     * the reader expects them. */
+    KaiValue *v = (KaiValue *) kai_arena_raw(ar, kai_var_block_size(n));
+    memset(v, 0, kai_var_block_size(n));
+    v->rc  = INT32_MAX;
+    v->tag = (uint8_t) KAI_VARIANT;
+    v->variant_tag = tag;
+    v->var_n_args = (uint8_t) n;
+    ar->n_live++;
+    kai_arena_alloc_total++;
+    kai_rc_count_live_inc();
+    kai_slotmask_register(tag, mask);
+    for (int i = 0; i < n; ++i) kai_var_slots(v)[i] = slots[i];
+    return v;
+}
+
+/* Which border a deep copy is crossing. The structural walk is the same
+ * for both; the leaves are not, so the mode rides the recursion.
+ *
+ * KAI_COPY_REGION — the region border (issue #120). A value built inside
+ * a `region { }` is cloned OUT of the arena onto the ordinary RC heap
+ * with rc = 1 before the arena is bulk-freed. Gate on TAG (not on
+ * rc == INT32_MAX, which singletons share with arena values): structural
+ * nodes are reallocated fresh with recursively-copied children, while
+ * scalar / handle / opaque leaves are shared — `kai_alloc` never
+ * allocates out of the arena, so a leaf is already on the RC heap and
+ * survives the bulk free. A `Ref` MUST be shared here: `region { r }`
+ * has to hand back the very cell the block wrote through.
+ *
+ * KAI_COPY_CROSS — the thread border (Actor.send, spawn, await). This is
+ * what makes non-atomic RC sound: no heap object may be reachable from
+ * two scheduler threads, because two threads incrementing the same `rc`
+ * lose updates and then double-free. So nothing whose `rc` a second
+ * thread could touch may be shared — every leaf is rebuilt too. The only
+ * values that may cross by pointer are those RC does not apply to
+ * (immortal singletons) or whose rc is atomic by construction (the
+ * Fiber[T] handle, the immortal Pid box) — the cross-thread-handle rule
+ * at KaiTag.
+ *
+ * The switch is exhaustive over KaiTag on purpose and has NO `default:`.
+ * A sharing `default:` is how Real, Char, Ref, Foreign and the
+ * fixed-width Int boxes ended up crossing threads by pointer; without
+ * one, adding a tag is a compile error until it is classified here. */
+typedef enum { KAI_COPY_REGION = 0, KAI_COPY_CROSS = 1 } KaiCopyMode;
+static KAI_RC_NOINLINE KaiValue *kai_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures);
+static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
+    if (!v) return v;
+    /* Koka tagged-Int: an immediate small Int has no heap header, so
+     * `v->tag` would dereference a fake pointer. It is shared-nothing
+     * by construction — it carries no rc for a second thread to touch,
+     * so both modes return it verbatim. */
+    if (kai_is_value(v)) return v;
+    switch ((KaiTag) v->tag) {
+        /* Iterative down the tail. A list's length is unbounded, so one
+         * recursive frame per cell overflows the 64 KiB fiber stack long
+         * before the heap notices — and the margin is thin enough that
+         * frame size alone decides it. Heads still recurse: their depth is
+         * the value's nesting, not its length. `kai_cons` steals both refs,
+         * so each node is built with a placeholder tail and patched. */
+        case KAI_CONS: {
+            KaiValue *out  = kai_cons(kai_deep_copy(v->as.cons.head, mode), NULL);
+            KaiValue *last = out;
+            KaiValue *src  = v->as.cons.tail;
+            while (kai_is_ptr(src) && src->tag == KAI_CONS) {
+                KaiValue *node = kai_cons(kai_deep_copy(src->as.cons.head, mode), NULL);
+                last->as.cons.tail = node;
+                last = node;
+                src  = src->as.cons.tail;
+            }
+            last->as.cons.tail = kai_deep_copy(src, mode);
+            return out;
+        }
+        /* Sharing would be unsound here: kai_seq_norm rewrites a range
+         * node in place, and that mutation must not cross the copy-out
+         * boundary (fiber heaps, region exits). */
+        case KAI_RANGE:
+            return kai_range_new(v->as.range.from, v->as.range.to, v->as.range.step);
+        case KAI_RECORD: {
+            int n = v->as.rec.n_fields;
+            KaiValue **fields = (KaiValue **) malloc((size_t) (n > 0 ? n : 1) * sizeof(KaiValue *));
+            if (!fields) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); exit(1); }
+            for (int i = 0; i < n; ++i) fields[i] = kai_deep_copy(v->as.rec.fields[i], mode);
+            KaiValue *c = kai_record(n, fields, v->as.rec.names);
+            c->as.rec.head_type_tag = v->as.rec.head_type_tag;
+            free(fields);
+            return c;
+        }
+        case KAI_VARIANT: {
+            int n = v->var_n_args;
+            if (n <= 0) return kai_variant_u(v->variant_tag, kai_variant_name_of(v->variant_tag), 0, 0, NULL);
+            uint32_t mask = kai_slot_mask_of(v->variant_tag);
+            KaiVarSlot *slots = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+            if (!slots) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); exit(1); }
+            /* Respect the per-slot kind: a primitive slot (Int/Real/Enum)
+             * holds a raw scalar, NOT a pointer — deep-copying it as a
+             * pointer dereferences the integer as an address (UAF/segfault).
+             * Only pointer slots recurse. */
+            for (int i = 0; i < n; ++i) {
+                if (kai_var_slot_kind(mask, i) == KAI_VAR_SLOT_PTR)
+                    slots[i].ptr = kai_deep_copy(kai_var_slots(v)[i].ptr, mode);
+                else
+                    slots[i] = kai_var_slots(v)[i];
+            }
+            KaiValue *c = kai_variant_u(v->variant_tag, kai_variant_name_of(v->variant_tag), n,
+                                        mask, slots);
+            free(slots);
+            return c;
+        }
+        case KAI_ARRAY: {
+            int64_t len = v->as.arr.len;
+            KaiValue *c = kai_alloc(KAI_ARRAY);
+            c->as.arr.len = len;
+            c->as.arr.cap = len > 0 ? len : 1;
+            c->as.arr.items = (KaiValue **) kai_heap_malloc((size_t) c->as.arr.cap * sizeof(KaiValue *));
+            for (int64_t i = 0; i < len; ++i)
+                c->as.arr.items[i] = kai_deep_copy(v->as.arr.items[i], mode);
+            return c;
+        }
+        case KAI_STR: {
+            size_t len = v->as.s.len;
+            KaiValue *c = kai_alloc(KAI_STR);
+            c->as.s.len = len;
+            c->as.s.bytes = (char *) kai_heap_malloc(len + 1);
+            if (len > 0) memcpy(c->as.s.bytes, v->as.s.bytes, len);
+            c->as.s.bytes[len] = '\0';
+            return c;
+        }
+        case KAI_VEC: {
+            KaiVecMeta *m = kai_vec_meta(v);
+            int64_t len = v->as.vec.len;
+            size_t stride = (size_t) (m->stride > 0 ? m->stride : 0);
+            KaiValue *c = kai_alloc(KAI_VEC);
+            c->as.vec.len = len;
+            c->as.vec.cap = len;
+            c->as.vec.view_of = NULL;
+            c->as.vec.data = kai_heap_malloc(sizeof(KaiVecMeta) + (size_t) len * stride);
+            *kai_vec_meta(c) = *m;
+            memcpy(kai_vec_elems(c), kai_vec_elems(v), (size_t) len * stride);
+            if (m->ekind == KAI_VEC_EK_BOXED) {
+                KaiValue **src = (KaiValue **) kai_vec_elems(v);
+                KaiValue **dst = (KaiValue **) kai_vec_elems(c);
+                for (int64_t i = 0; i < len; ++i) dst[i] = kai_deep_copy(src[i], mode);
+            }
+            return c;
+        }
+        case KAI_CLOSURE: {
+            /* A spawned fiber's thunk is a closure that crosses to the
+             * fiber's scheduler thread; sharing it would let two threads
+             * touch its (non-atomic) rc and the rc of its captures. Copy
+             * the closure — the fn pointer is code (immortal, no rc) and
+             * each capture is deep-copied so the migrated closure is a
+             * single-owner tree, like a copied message. */
+            int nc = v->as.clo.n_captures;
+            KaiValue **caps = NULL;
+            if (nc > 0) {
+                caps = (KaiValue **) malloc((size_t) nc * sizeof(KaiValue *));
+                if (!caps) { fprintf(stderr, "kai: out of memory (closure copy-out)\n"); exit(1); }
+                for (int i = 0; i < nc; ++i) caps[i] = kai_deep_copy(v->as.clo.captures[i], mode);
+            }
+            /* kai_closure increfs each capture; we already own a fresh
+             * rc=1 copy, so drop our transient ref after it takes its own. */
+            KaiValue *c = kai_closure(v->as.clo.fn, v->as.clo.arity, nc, caps);
+            for (int i = 0; i < nc; ++i) kai_decref(caps[i]);
+            free(caps);
+            return c;
+        }
+
+        /* RC does not apply to these: rc is INT32_MAX, so incref/decref are
+         * no-ops and two threads touching them is not a race. */
+        case KAI_UNIT:
+        case KAI_BOOL:
+        case KAI_NIL:
+            return kai_incref(v);
+
+        /* Handles to a unit of execution / a channel, not data. A Fiber[T]
+         * wrapper carries an atomic rc and a Pid box is immortal, so both are
+         * already sound to reach from two threads — and copying them would
+         * destroy the identity they exist to carry. */
+        case KAI_FIBER:
+        case KAI_PID:
+            return kai_incref(v);
+
+        /* Scalar leaves. Sharing at the region border is sound and cheaper
+         * (they live on the RC heap, not in the arena). At the thread border
+         * each must be rebuilt: the rc is non-atomic and the sender keeps its
+         * own reference whenever Perceus dup'd the value across the send.
+         * The constructors reuse the immortal Char/Int caches where they
+         * apply, so a cached leaf still crosses without allocating. */
+        case KAI_INT:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_int(v->as.i);
+        case KAI_REAL:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_real(v->as.r);
+        case KAI_CHAR:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_char(v->as.c);
+        case KAI_BYTE:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_byte(v->as.byte_val);
+        case KAI_INT32:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_int32(v->as.i32);
+        case KAI_UINT32:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_uint32(v->as.u32);
+        case KAI_UINT64:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_uint64(v->as.u64);
+        case KAI_INT128:
+            return mode == KAI_COPY_REGION ? kai_incref(v) : kai_int128(kai_i128_load(v));
+
+        /* The box has an ordinary non-atomic rc, so the thread border needs a
+         * fresh one. The parked `void *` is borrowed external memory the FFI
+         * driver owns and RC never frees, so both boxes may name it. */
+        case KAI_FOREIGN:
+            return mode == KAI_COPY_REGION ? kai_incref(v)
+                                           : kai_foreign(v->as.foreign_ptr);
+
+        /* A Ref is one mutable cell. The region border shares it — the block
+         * must hand back the cell it wrote through. The thread border copies
+         * it: shape isolation gives the receiver its own cell, and sharing one
+         * would put both a non-atomic rc and a mutable cell under two threads. */
+        case KAI_REF: {
+            if (mode == KAI_COPY_REGION) return kai_incref(v);
+            KaiValue *c = kai_alloc(KAI_REF);
+            c->as.ref.cell = kai_deep_copy(v->as.ref.cell, mode);
+            return c;
+        }
+    }
+    /* No `default:` above, so -Wswitch makes a new tag a compile error here
+     * rather than letting it inherit a sharing fallback. */
+    kai_trap_abort("deep-copy: unclassified value tag");
+    return v;
+}
+
+/* The region border (issue #120): scalar and handle leaves are shared. */
+static inline KaiValue *kai_deep_copy_out(KaiValue *v) {
+    return kai_deep_copy(v, KAI_COPY_REGION);
+}
+
+/* The thread border: nothing with a non-atomic rc crosses by pointer. */
+static inline KaiValue *kai_deep_copy_cross(KaiValue *v) {
+    return kai_deep_copy(v, KAI_COPY_CROSS);
+}
+
+/* Issue #440 Phase 2 — borrow a slot as a boxed `KaiValue *`. Used by
+ * match-arm extraction, by the generic walkers (eq, to_string) and by
+ * any other code path that needs the boxed view. For pointer slots
+ * this returns the boxed child directly (still owned by the cell).
+ * For primitive slots this allocates a fresh boxed temporary that the
+ * caller owns and must release. Hot path: pointer slots are the
+ * majority by far in legacy code; the branch predictor sees one
+ * direction. */
+static inline KaiValue *kai_variant_slot_box(KaiValue *v, int i) {
+    uint32_t k = kai_var_slot_kind(kai_slot_mask_of(v->variant_tag), i);
+    if (k == KAI_VAR_SLOT_PTR)  return kai_var_slots(v)[i].ptr;
+    if (k == KAI_VAR_SLOT_INT)  return kai_int(kai_var_slots(v)[i].i64);
+    if (k == KAI_VAR_SLOT_REAL) return kai_real(kai_var_slots(v)[i].r);
+    if (k == KAI_VAR_SLOT_ENUM) return kai_enum_slot_box(kai_var_slots(v)[i].i64);
+    return kai_var_slots(v)[i].ptr;
+}
+
+/* Issue #440 Phase 2 — consume a boxed Int / Real, return the raw
+ * scalar and release the boxed temporary. Used by the stage 2
+ * emitter when packing a primitive payload into a typed variant
+ * slot: the call expression yields a boxed `KaiValue *` (already
+ * possibly cached as a singleton), and we want the raw payload to
+ * write into `slot.i64` / `slot.r`. Singleton Ints (rc == INT32_MAX)
+ * survive the decref unchanged. */
+static inline int64_t kai_take_int(KaiValue *v) {
+    if (kai_is_value(v)) return kai_untag_int(v);   /* immediate: no header to decref */
+    int64_t x = v->as.i;
+    kai_decref(v);
+    return x;
+}
+static inline double kai_take_real(KaiValue *v) {
+    double x = v->as.r;
+    kai_decref(v);
+    return x;
+}
+/* Enum-slot pack: read the variant_tag of a (nullary, interned) sum
+ * value and release the box. The box is an immortal singleton
+ * (rc == INT32_MAX), so the decref is a no-op; we keep it for symmetry
+ * with kai_take_int and to stay correct if a non-interned enum value
+ * ever reaches here. Defensive on non-variant input (returns 0). */
+static inline int64_t kai_take_enum(KaiValue *v) {
+    int64_t tag = (v && kai_is_ptr(v) && v->tag == KAI_VARIANT)
+                      ? (int64_t) v->variant_tag : 0;
+    kai_decref(v);
+    return tag;
+}
+
+/* ---------- Perceus reuse-in-place (issue #118 / Anga Roa wave) ----------
+ *
+ * Koka-style reuse-in-place: when a constructor consumes a value the
+ * Perceus pass can prove uniquely owned (RC == 1), reuse the consumed
+ * cell as the storage for the new value instead of paired free + alloc.
+ *
+ * Calling convention — these helpers are invoked from inside a
+ * `match` arm body. The match emitter (`emit_match_default`) wraps
+ * the scrutinee as `_scr` and *always* `kai_decref(_scr)`s on exit.
+ * To avoid a double-free / use-after-free on a reused cell, these
+ * helpers `kai_incref` the cell on the unique branch — the extra
+ * ref balances the post-arm `kai_decref(_scr)`, leaving the caller
+ * with a unique (RC=1) cell. The fallback branch leaves `_scr`
+ * untouched; the match exit reclaims it normally.
+ *
+ * Discipline summary (per branch):
+ *   - Unique: rewrite children in place, `kai_incref(_scr)`, return
+ *     `_scr`. Net RC after match exit: 1.
+ *   - Not unique / wrong shape: leave `_scr` alone, allocate fresh
+ *     via the existing `kai_<shape>` constructor. Net RC after match
+ *     exit: original_rc - 1.
+ *
+ * `head` / `tail` / `fields` / `args` are owning refs on entry — the
+ * allocator branch hands them straight to `kai_<shape>` (which does
+ * not incref); the reuse branch decref's the outgoing children
+ * before storing the incoming ones, exactly as `kai_free_value`
+ * would have during a paired free + alloc.
+ *
+ * The trace counter `kai_rc_reuse_total` increments on every
+ * successful in-place rewrite (see top of file).
+ */
+static inline int kai_check_unique(KaiValue *v) {
+    /* `rc == 1` already implies `rc != INT32_MAX` (a singleton's rc is
+     * saturated at INT32_MAX, never 1), so the explicit singleton guard
+     * the old code carried was a dead check executed on every call —
+     * and check_unique runs at every descent level + twice per nested
+     * balance arm. One `rc == 1` test suffices; an immediate (kai_is_
+     * value) has no header so it is excluded first. Koka's
+     * kk_datatype_ptr_is_unique is likewise a single refcount test.
+     * Also marked inline (was a plain `static int` — a real call on the
+     * hot path). */
+    return v != NULL && !kai_is_value(v) && v->rc == 1;
+}
+
+/* Conditional incref for a variant reuse arm whose donor is SHARED. When the
+ * donor reuses in place (unique), its kept children MOVE into the rebuild — no
+ * incref. When it is shared, the rebuild fresh-allocs and keeps a borrowed
+ * reference to each kept child, but the donor still owns those children and the
+ * match-exit `kai_decref(donor)` will cascade-free them; so each kept child the
+ * rebuild embeds needs its own ref. The emitter calls this once per embedded
+ * borrowed child (multiset: a child used twice is incref'd twice). Idempotent
+ * vs the reuse op's own uniqueness test — nothing mutates the donor between. */
+static inline void kai_incref_if_shared(KaiValue *donor, KaiValue *child) {
+    if (!kai_check_unique(donor)) kai_incref(child);
+}
+
+static KaiValue *kai_reuse_or_alloc_cons(KaiValue *_scr,
+                                         KaiValue *head, KaiValue *tail) {
+    if (_scr != NULL && _scr->tag == KAI_CONS && kai_check_unique(_scr)) {
+        /* Aliasing guard (see kai_reuse_or_alloc_variant): the incoming
+         * head/tail may alias the outgoing ones when `f` reused the
+         * child cell in place. Store first, decref the old only if it
+         * differs — decref-then-store would free a cell the new slot
+         * still points at. Latent under libc malloc, exposed by the
+         * cell free-list's immediate recycle. */
+        KaiValue *old_h = _scr->as.cons.head;
+        KaiValue *old_t = _scr->as.cons.tail;
+        _scr->as.cons.head = head;
+        _scr->as.cons.tail = tail;
+        if (old_h != head) kai_decref(old_h);
+        if (old_t != tail) kai_decref(old_t);
+        kai_rc_count_reuse();
+        return kai_incref(_scr);   /* survive enclosing match-exit decref */
+    }
+    return kai_cons(head, tail);
+}
+
+static KaiValue *kai_reuse_or_alloc_record(KaiValue *_scr,
+                                           int n, KaiValue **fields,
+                                           const char **names,
+                                           uint64_t kept_mask) {
+    if (_scr != NULL && _scr->tag == KAI_RECORD &&
+        _scr->as.rec.n_fields == n && kai_check_unique(_scr)) {
+        /* Decref the existing field values then overwrite. The
+         * fields[] / names[] pointer arrays are reused — both have
+         * the same length n, so no realloc is needed. names[]
+         * usually points at the same static-string literals across
+         * rebuilds (parsers thread the same record shape), so
+         * overwriting is idempotent in the common case. */
+        for (int i = 0; i < n; ++i) {
+            /* Aliasing guard (see kai_reuse_or_alloc_variant): skip
+             * the old-slot decref when old == new, EXCEPT where
+             * kept_mask marks the incoming value as a plain binder
+             * read (a kept child re-embedded in place). A binder read
+             * carries its own reference, so the donor's claim on the
+             * old child is still owed — the skip would leak it once
+             * per reuse. The mask never marks call results, the shape
+             * whose consumed-and-recycled pointer the guard protects. */
+            KaiValue *old_f = _scr->as.rec.fields[i];
+            _scr->as.rec.fields[i] = fields[i];
+            _scr->as.rec.names[i]  = names[i];
+            if (old_f != fields[i] ||
+                (i < 64 && (kept_mask & ((uint64_t)1 << i)))) {
+                kai_decref(old_f);
+            }
+        }
+        kai_rc_count_reuse();
+        return kai_incref(_scr);
+    }
+    return kai_record(n, fields, names);
+}
+
+/* Same as kai_reuse_or_alloc_record but stamps head_type_tag — used by
+ * codegen when the record's nominal head is known at compile time. */
+static KaiValue *kai_reuse_or_alloc_record_h(KaiValue *_scr,
+                                             int n, KaiValue **fields,
+                                             const char **names,
+                                             uint64_t kept_mask,
+                                             int32_t head_tag) {
+    KaiValue *v = kai_reuse_or_alloc_record(_scr, n, fields, names, kept_mask);
+    v->as.rec.head_type_tag = head_tag;
+    return v;
+}
+
+static KaiValue *kai_reuse_or_alloc_variant(KaiValue *_scr,
+                                            int32_t tag, const char *name,
+                                            int n, uint32_t mask,
+                                            KaiVarSlot *slots) {
+    if (_scr != NULL && _scr->tag == KAI_VARIANT &&
+        _scr->var_n_args == n && kai_slot_mask_of(_scr->variant_tag) == mask &&
+        kai_check_unique(_scr)) {
+        /* Phase 2: reuse fires when scrutinee and replacement agree on
+         * the slot-mask layout. For mask==0 the scrutinee's slots are
+         * all pointers and we must decref each one before overwriting.
+         * For mask!=0 the matching slots are primitive payloads with
+         * no RC discipline; the call sites that emit
+         * `kai_reuse_or_alloc_variant` for typed payloads are
+         * synthesised by stage 2's Perceus recogniser only when the
+         * mask matches, so this branch stays sound.
+         *
+         * ALIASING GUARD (issue #118 #3 latent UAF, surfaced by the cell
+         * free-list): the incoming `slots[i]` may ALIAS the outgoing
+         * `_scr->slots[i]` — the common desugar shape
+         * `Some(e) -> Some(f(e))` increfs `e`, computes `f(e)` (which
+         * may reuse e's own cell in place, so the result pointer ==
+         * the old slot pointer), then reuses `_scr`. Decref-then-store
+         * would free the very cell the new slot points at. We decref the
+         * OLD pointer only when it differs from the incoming one; an
+         * aliased slot keeps the cell live (the incref/decref pair from
+         * the bind + f's consumption already balanced it). With libc
+         * malloc this latent double-free was masked (the freed cell
+         * survived untouched until a far-off reuse); the immediate
+         * free-list recycle exposed it. */
+        for (int i = 0; i < n; ++i) {
+            uint32_t bit = (uint32_t) 1 << i;
+            KaiValue *old_ptr = kai_var_slots(_scr)[i].ptr;
+            kai_var_slots(_scr)[i] = slots[i];
+            if ((mask & bit) == 0 && old_ptr != slots[i].ptr) {
+                kai_decref(old_ptr);
+            }
+        }
+        _scr->variant_tag  = tag;
+        kai_rc_count_reuse();
+        return kai_incref(_scr);
+    }
+    return kai_variant_u(tag, name, n, mask, slots);
+}
+
+/* ---------- TRMC constructor-context (port of Koka types-cctx.h) ----------
+ *
+ * Tail-Recursion-Modulo-Cons. Direct port of Koka's
+ * `lib/std/core/inline/types-cctx.h` (Leijen & Lorenzen, "Tail Recursion
+ * Modulo Context", POPL'22). A recursive spine-rebuild whose tail
+ * expression is `Ctor(.., recur(child), ..)` is rewritten into a
+ * `goto`-loop carrying a *constructor context* (`KaiCctx`): the partially
+ * built result `res` plus a pointer `holeptr` to the open field where the
+ * next node attaches. Each loop iteration builds one node with a HOLE in
+ * the recursive slot, extends the cctx to point at that hole, and rebinds
+ * the loop variable to the child — O(1) stack, perfect spine reuse when
+ * the consumed cell is unique.
+ *
+ * kaikai difference from Koka: kaikai's holeptr points into the SEPARATE
+ * `slots[]` array (`&kai_var_slots(node)[i].ptr`), not an inline field of
+ * the block. The array stays alive and stable for the node's lifetime
+ * (kai_variant_at overwrites in place; the fresh-alloc branch allocates a
+ * fresh stable array), so the hole address never dangles. Koka's
+ * unique-check is rc==0; kaikai's is rc==1 (see kai_check_unique).
+ *
+ * The `_linear` variants are what the compiler emits for affine effect
+ * rows (the rb-tree's effect is total/affine). They assume `acc.res` is
+ * unique — which TRMC guarantees because every node on the spine was just
+ * built (or reused) by this loop and is held only by the cctx. Non-affine
+ * (multi-resume) fns are NOT recognised by the TRMC pass; they fall back
+ * to ordinary recursion, so the non-linear cctx path is not needed yet.
+ */
+typedef KaiValue **KaiFieldAddr;                  /* &kai_var_slots(node)[i].ptr */
+typedef struct { KaiValue *res; KaiFieldAddr holeptr; } KaiCctx;
+
+static inline KaiFieldAddr kai_field_addr_create(KaiValue **p) { return p; }
+
+static inline KaiCctx kai_cctx_empty(void) { KaiCctx c = { NULL, NULL }; return c; }
+
+/* apply_linear: plug `child` into the open hole, return the spine root.
+ * Empty cctx (first level) → the child IS the root. Mirrors Koka
+ * kk_cctx_apply_linear (types-cctx.h:66). */
+static inline KaiValue *kai_cctx_apply_linear(KaiCctx acc, KaiValue *child) {
+    if (acc.holeptr != NULL) { *acc.holeptr = child; return acc.res; }
+    return child;
+}
+
+/* extend_linear: plug `child` into the old hole, return a new cctx whose
+ * open hole is `field` (a slot inside `child`). Mirrors Koka
+ * kk_cctx_extend_linear (types-cctx.h:91). */
+static inline KaiCctx kai_cctx_extend_linear(KaiCctx acc, KaiValue *child,
+                                             KaiFieldAddr field) {
+    KaiCctx c;
+    c.res = kai_cctx_apply_linear(acc, child);
+    c.holeptr = field;
+    return c;
+}
+
+/* Reuse token (Koka kk_datatype_ptr_reuse). The caller has already proven
+ * `v` unique with kai_check_unique. Unlike kai_reuse_or_alloc_variant,
+ * this does NOT decref the donor's children: the emitter MOVES them into
+ * the new node (the unique branch) or dups+decrefs explicitly (the shared
+ * branch), exactly as rbtree__koka.c:268-285. Returning the raw cell lets
+ * kai_variant_at overwrite it in place. */
+typedef KaiValue *KaiReuse;
+#define kai_reuse_null NULL
+static inline KaiReuse kai_ptr_reuse(KaiValue *v) { return v; }
+
+/* arm-top drop-reuse, BORROW model (Koka kk_block_drop_reuse, kklib.h:818).
+ * Runs at the TOP of a match arm whose binds are BORROW (children read from
+ * `v`'s slots WITHOUT an incref), exactly like Koka's insert_loop:
+ *
+ *     tree l = con->left; ... r = con->right;      // borrow binds, no dup
+ *     reuse_t _ru = kk_reuse_null;
+ *     if (is_unique(t)) { _ru = reuse(t); }         // UNIQUE: take shell, children MOVE
+ *     else { dup(l); dup(r); ...; decref(t); }      // SHARED: dup kept children, drop t
+ *
+ *   - UNIQUE (kaikai rc==1): return the bare cell as a token. Do NOT touch
+ *     the children — they MOVE from this shell into the rebuilt node (the
+ *     borrow binds become the owners; net RC 0). The emit does NOT dup them
+ *     in the unique branch; kai_variant_at overwrites the slots next.
+ *   - SHARED (rc>1): NON-recursive `rc--` only. The cell stays live for its
+ *     other owners; its children stay referenced by it. The emit has dup'd
+ *     the children it keeps in the shared branch. Return null → fresh alloc.
+ *
+ * `n` is the rebuild arity; n_args != n cannot host the rebuild. With borrow
+ * binds the children are not owned here, so on mismatch we must NOT cascade:
+ * refcount-only decrement, no token. (A mismatch is a recogniser bug.)
+ *
+ * CRITICAL vs kai_decref: the shared branch is a NON-recursive `rc--`. A
+ * recursive decref would cascade into the borrow-bound children the emit is
+ * about to use — the 14x-tree leak/UAF from the misplaced first attempt.
+ * Koka's kk_block_drop_reuse is likewise refcount-only; child drops happen
+ * via explicit emit-side dup/decref, never inside the reuse primitive. */
+static inline KaiReuse kai_drop_reuse_token(KaiValue *v, int n) {
+    if (v == NULL || kai_is_value(v) || v->tag != KAI_VARIANT ||
+        v->var_n_args != n) {
+        if (v != NULL && !kai_is_value(v) && v->tag == KAI_VARIANT &&
+            v->rc != INT32_MAX) {
+            v->rc -= 1;   /* non-recursive: children are borrow-bound, not ours */
+        }
+#ifdef KAI_TRACE_RC
+        kai_rc_tok_null_mismatch++;
+#endif
+        return kai_reuse_null;
+    }
+    if (kai_check_unique(v)) {
+        /* sole owner: hand back the shell. Children MOVE into the rebuild
+         * (borrow binds become the owners). kai_variant_at overwrites next. */
+#ifdef KAI_TRACE_RC
+        kai_rc_tok_unique++;
+#endif
+        return v;
+    }
+    /* shared: non-recursive refcount decrement. */
+    if (v->rc != INT32_MAX) v->rc -= 1;
+#ifdef KAI_TRACE_RC
+    kai_rc_tok_null_shared++;
+#endif
+    return kai_reuse_null;
+}
+
+/* alloc-at: write a variant Ctor into a donated cell IN PLACE (no malloc),
+ * else fall back to a fresh alloc. Move semantics — does NOT decref the
+ * donor's old slots (they were extracted into locals and either moved into
+ * `slots[]` or dup'd by the emitter before donation). This is the correct
+ * embryo; kai_reuse_or_alloc_variant's eager-1:1-decref is NOT (it
+ * double-frees on non-bijective rebuilds — see lane memory). The donated
+ * cell already has the right slots[] array length (n_args >= n checked);
+ * we overwrite the slot words, retag, and reset rc=1. */
+static inline KaiValue *kai_variant_at(KaiReuse at, int32_t tag,
+                                       const char *name, int n, uint32_t mask,
+                                       KaiVarSlot *slots) {
+    if (at != NULL && at->tag == KAI_VARIANT && at->var_n_args == n) {
+        for (int i = 0; i < n; ++i) kai_var_slots(at)[i] = slots[i];
+        at->variant_tag = tag;
+        /* The tag→mask register is NOT repeated here: a reuse target is,
+         * by construction, a cell the program already built fresh (via
+         * kai_variant_u / kai_variant_u_fast), so its mask is registered.
+         * The slotmask table read by the drop walker is keyed on tag, not
+         * on this cell, so the steady-state register was pure redundant
+         * work (kai_slotmask_register's _seen guard already no-op'd it).
+         * Dropping it removes a call from every in-place rebuild — the
+         * rb-tree reuse arm fires ~20M times. The reuse counter only
+         * exists under tracing; gate it so the steady path is store-only. */
+        at->rc = 1;
+#ifdef KAI_TRACE_RC
+        kai_rc_count_reuse();
+#endif
+        (void) mask; (void) name;
+        return at;
+    }
+    return kai_variant_u(tag, name, n, mask, slots);
+}
+
+/* Free a reuse-TOKEN whose children have already MOVED out (Koka
+ * kk_block_drop / ParcReuse's drop of an unconsumed `Available` cell).
+ * A reuse-token is captured at the arm top (kai_drop_reuse_token UNIQUE
+ * branch) WITHOUT touching its children — the borrow binds become the
+ * owners. When the arm body reaches a tail that does NOT host a
+ * kai_variant_at rebuild (e.g. `balance_left(insert_loop(l,...), ..., r)`
+ * — the call allocates its own node inside its own frame), the token is
+ * never consumed. ParcReuse treats the reuse-token as LINEAR: consumed by
+ * a Con@reuse, else dropped on the non-consuming path. This is that drop.
+ *
+ * CRITICAL: it must free ONLY the cell, never cascade into the children —
+ * those were stolen (no incref) into owned binders the body is still using
+ * (the rb-tree balance arm passes them to balance_left). We zero n_args so
+ * the KAI_VARIANT case of kai_free_value skips the slot decref loop, then
+ * route through the normal free path (poison / cell-pool / counters stay
+ * correct). A null token is a no-op (the shared branch returned null). */
+static inline void kai_reuse_free(KaiReuse at) {
+    if (at == NULL) return;
+    if (kai_is_value(at) || at->tag != KAI_VARIANT) return;
+    /* Children already MOVED out — must NOT cascade-decref them. With the
+     * packed header, `slot_mask` is now a tag→mask TABLE, not a per-node
+     * field, so the old trick of stamping this node's mask "all-INT" would
+     * corrupt the shared mask of EVERY node of this tag (the double-free /
+     * non-exhaustive crash). Instead recycle the block DIRECTLY at its real
+     * arity, skipping kai_free_value's child-decref loop entirely — exactly
+     * the "no cascade" intent, done per-node. The trace/RC counters that
+     * kai_free_value would bump are handled here too. */
+    KAI_VAR_NAME_FREE(kai_variant_name_of(at->variant_tag));
+    kai_var_block_free(at, at->var_n_args);
+    kai_rc_count_free();
+#ifdef KAI_TRACE_RC
+    kai_rc_reuse_free_total++;
+    /* Per-tag free accounting (issue #296 table). `kai_var_block_free`
+     * recycles the block directly, bypassing `kai_free_value`, so the
+     * per-tag `frees` counter would otherwise stay flat while `allocs`
+     * climbed — inflating the reported `live=allocs-frees` by exactly the
+     * reuse_free count even though the cells are genuinely reclaimed (RSS
+     * flat). Mirror kai_free_value's bump so `live` reflects real liveness
+     * under arm-top reuse (this surfaced as a false LEAK in the #747 trace
+     * once the LLVM backend began freeing unconsumed reuse tokens). */
+    kai_rc_free_by_tag[(int) KAI_VARIANT]++;
+#endif
+}
+
+/* TRMC reuse-in-place (Koka kk_block_drop_reuse + kk_block_alloc_at,
+ * fused for the TRMC modulo-cons site). `_scr` is the variant cell the
+ * enclosing `match` arm just consumed. When it is UNIQUE and has the
+ * target arity, donate it as the storage for the rebuilt node:
+ * overwrite the slot words (MOVE semantics — the arm already extracted
+ * the donor's children into locals without incref, so we must NOT
+ * decref them), retag, and `incref` the cell so it survives the
+ * `kai_decref(_scr)` the match emits at arm exit (net rc after exit:
+ * 1, a unique freshly-built node — exactly the kai_reuse_or_alloc_cons
+ * discipline). When `_scr` is shared or wrong-arity, allocate a fresh
+ * node and leave `_scr` for the match exit to reclaim normally.
+ *
+ * This is what collapses the rb-tree's RBNode rebuild churn: each
+ * insert reuses the cells it walked instead of paired free+alloc,
+ * approaching Koka's in-place cost. Koka's unique gate is rc==0;
+ * kaikai's is rc==1 (kai_check_unique). */
+__attribute__((always_inline)) static inline KaiValue *kai_variant_reuse_at(KaiValue *_scr, int32_t tag,
+                                                                            const char *name, int n,
+                                                                            uint32_t mask, KaiVarSlot *slots) {
+    if (_scr != NULL && !kai_is_value(_scr) && _scr->tag == KAI_VARIANT &&
+        _scr->var_n_args == n && kai_check_unique(_scr)) {
+        /* A donor pointer slot the rebuild does not re-embed still holds
+         * the cell's claim on the old child; pay it here or it leaks
+         * (the wildcard-slot rebuild `MErr(_, _) -> MVal(99, [1])`). An
+         * aliased slot is a kept child moved in place — its bookkeeping
+         * already balanced, same guard as kai_reuse_or_alloc_variant.
+         * Slot-kind decode mirrors kai_free_variant_spine: mask 0 means
+         * all-pointer, else 2 bits per slot. */
+        uint32_t donor_mask = kai_slot_mask_of(_scr->variant_tag);
+        for (int i = 0; i < n; ++i) {
+            KaiValue *old_ptr = NULL;
+            if (donor_mask == 0 || kai_var_slot_kind(donor_mask, i) == KAI_VAR_SLOT_PTR) {
+                old_ptr = kai_var_slots(_scr)[i].ptr;
+                if (!kai_is_ptr(old_ptr)) old_ptr = NULL;
+            }
+            kai_var_slots(_scr)[i] = slots[i];
+            if (old_ptr != NULL && old_ptr != slots[i].ptr) kai_decref(old_ptr);
+        }
+        _scr->variant_tag = tag;
+        kai_slotmask_register(_scr->variant_tag, mask);
+        kai_rc_count_reuse();
+        return kai_incref(_scr);   /* survive the match-exit kai_decref(_scr) */
+    }
+    return kai_variant_u(tag, name, n, mask, slots);
+}
+
+/* Allocate an array of `len` slots, each initialised to `init`
+   (incref'd once per slot). Caller owns the returned array. */
+static KAI_RC_NOINLINE KaiValue *kai_array_make(int64_t len, KaiValue *init) {
+    if (len < 0) { fprintf(stderr, "kai: array_make: negative length\n"); exit(1); }
+    KaiValue *v = kai_alloc(KAI_ARRAY);
+    v->as.arr.len = len;
+    v->as.arr.cap = len > 0 ? len : 1;
+    v->as.arr.items = (KaiValue **) kai_heap_malloc((size_t) v->as.arr.cap * sizeof(KaiValue *));
+    for (int64_t i = 0; i < len; ++i) v->as.arr.items[i] = kai_incref(init);
+    return v;
+}
+
+/* Grow `a` to length `new_len`, initialising new slots with `init`.
+   Mutates in place, returns the same value (incref'd for the caller
+   so the result can be bound just like kai_array_make). If new_len
+   <= current len this is a no-op beyond the incref. */
+static KaiValue *kai_array_grow_impl(KaiValue *a, int64_t new_len, KaiValue *init) {
+    if (!a || a->tag != KAI_ARRAY) {
+        fprintf(stderr, "kai: array_grow: not an array\n"); exit(1);
+    }
+    if (new_len > a->as.arr.cap) {
+        int64_t nc = a->as.arr.cap * 2;
+        if (nc < new_len) nc = new_len;
+        a->as.arr.items = (KaiValue **) kai_heap_realloc(a->as.arr.items,
+            (size_t) a->as.arr.cap * sizeof(KaiValue *), (size_t) nc * sizeof(KaiValue *));
+        a->as.arr.cap = nc;
+    }
+    for (int64_t i = a->as.arr.len; i < new_len; ++i) a->as.arr.items[i] = kai_incref(init);
+    if (new_len > a->as.arr.len) a->as.arr.len = new_len;
+    return kai_incref(a);
+}
+
+/* O(1) read. Callers own the returned reference. */
+static KaiValue *kai_array_get_impl(KaiValue *a, int64_t i) {
+    if (!a || a->tag != KAI_ARRAY) {
+        fprintf(stderr, "kai: array_get: not an array\n"); exit(1);
+    }
+    if (i < 0 || i >= a->as.arr.len) {
+        static char buf[96];
+        snprintf(buf, sizeof(buf), "index %lld out of range (len=%lld)",
+                 (long long) i, (long long) a->as.arr.len);
+        kai_trap_abort(buf);
+    }
+    return kai_incref(a->as.arr.items[i]);
+}
+
+/* O(1) write. Takes ownership of `v`, decref's the previous slot.
+   Returns the same array (incref'd) so callers can thread it. */
+static KaiValue *kai_array_set_impl(KaiValue *a, int64_t i, KaiValue *v) {
+    if (!a || a->tag != KAI_ARRAY) {
+        fprintf(stderr, "kai: array_set: not an array\n"); exit(1);
+    }
+    if (i < 0 || i >= a->as.arr.len) {
+        static char buf[96];
+        snprintf(buf, sizeof(buf), "index %lld out of range (len=%lld)",
+                 (long long) i, (long long) a->as.arr.len);
+        kai_trap_abort(buf);
+    }
+    kai_decref(a->as.arr.items[i]);
+    a->as.arr.items[i] = v;
+    return kai_incref(a);
+}
+
+/* ---------- Vec[T] — pure value vector (flat buffer, CoW) ----------
+ *
+ * One contiguous growable buffer with a single RC header (the KaiValue
+ * node). The pure API never exposes mutation: writes go through the
+ * same rc == 1 uniqueness check as Perceus reuse-in-place — a unique
+ * buffer is rewritten in place (no witness can observe it), a shared
+ * one is copied first. Element storage is unboxed whenever the element
+ * shape allows: raw 8-byte scalars, or all-scalar records inlined at
+ * n_fields * 8 bytes per element with no per-element header. */
+
+/* The scalar KaiTag of a value that can live unboxed in a vec slot,
+ * or -1 when it must stay boxed. A tagged-immediate Int (no header)
+ * classifies as KAI_INT before any header read. */
+static int kai_vec_scalar_tag(KaiValue *x) {
+    if (!x) return -1;
+    if (kai_is_value(x)) return KAI_INT;
+    switch ((KaiTag) x->tag) {
+        case KAI_INT: case KAI_REAL: case KAI_BOOL:
+        case KAI_CHAR: case KAI_BYTE:
+            return (int) x->tag;
+        default:
+            return -1;
+    }
+}
+
+static int64_t kai_vec_scalar_bits(KaiValue *x, uint8_t tag) {
+    switch ((KaiTag) tag) {
+        case KAI_INT:  return kai_intf(x);   /* immediate or heap box */
+        case KAI_REAL: { int64_t b; memcpy(&b, &x->as.r, 8); return b; }
+        case KAI_BOOL: return (int64_t) x->as.b;
+        case KAI_CHAR: return (int64_t) x->as.c;
+        default:       return (int64_t) x->as.byte_val;  /* KAI_BYTE */
+    }
+}
+
+static KaiValue *kai_vec_scalar_box(uint8_t tag, int64_t bits) {
+    switch ((KaiTag) tag) {
+        case KAI_INT:  return kai_int(bits);
+        case KAI_REAL: { double r; memcpy(&r, &bits, 8); return kai_real(r); }
+        case KAI_BOOL: return kai_bool((int) bits);
+        case KAI_CHAR: return kai_char((uint32_t) bits);
+        default:       return kai_byte((uint8_t) bits);  /* KAI_BYTE */
+    }
+}
+
+/* Decide the storage kind from the first element the vec holds. The
+ * element type is static, so one classification covers every element
+ * the vector will ever store. */
+static void kai_vec_classify(KaiVecMeta *m, KaiValue *x) {
+    int st = kai_vec_scalar_tag(x);
+    if (st >= 0) {
+        m->ekind = KAI_VEC_EK_RAW;
+        m->elem_tag = st;
+        m->stride = 8;
+        return;
+    }
+    if (x && kai_is_ptr(x) && x->tag == KAI_RECORD &&
+        x->as.rec.n_fields > 0 && x->as.rec.n_fields <= KAI_VEC_REC_MAX) {
+        int n = x->as.rec.n_fields;
+        int all_scalar = 1;
+        for (int i = 0; i < n; ++i) {
+            int ft = kai_vec_scalar_tag(x->as.rec.fields[i]);
+            if (ft < 0) { all_scalar = 0; break; }
+            m->field_tags[i] = (uint8_t) ft;
+            m->names[i] = x->as.rec.names[i];
+        }
+        if (all_scalar) {
+            m->ekind = KAI_VEC_EK_REC;
+            m->n_fields = n;
+            m->head_tag = x->as.rec.head_type_tag;
+            m->stride = (int64_t) n * 8;
+            return;
+        }
+    }
+    m->ekind = KAI_VEC_EK_BOXED;
+    m->stride = (int64_t) sizeof(KaiValue *);
+}
+
+/* Fresh node + block. The block always carries a meta prefix, even at
+ * cap 0 (PENDING keeps stride 0; the alloc floor keeps malloc happy). */
+static KaiValue *kai_vec_alloc(int64_t len, int64_t cap, const KaiVecMeta *src) {
+    KaiValue *v = kai_alloc(KAI_VEC);
+    int64_t stride = (src && src->stride > 0) ? src->stride : 0;
+    size_t bytes = sizeof(KaiVecMeta) + (size_t) cap * (size_t) stride;
+    v->as.vec.len = len;
+    v->as.vec.cap = cap;
+    v->as.vec.view_of = NULL;
+    v->as.vec.data = kai_heap_malloc(bytes);
+    if (src) *kai_vec_meta(v) = *src;
+    else     memset(kai_vec_meta(v), 0, sizeof(KaiVecMeta));
+    return v;
+}
+
+/* Write one element into a slot whose old contents are GARBAGE (fresh
+ * or already released). Consumes `x`. The shape checks trap loudly on
+ * a meta mismatch — unreachable under a sound typer. */
+static void kai_vec_write_elem(KaiVecMeta *m, char *slot, KaiValue *x) {
+    switch (m->ekind) {
+        case KAI_VEC_EK_RAW: {
+            if (kai_vec_scalar_tag(x) != m->elem_tag)
+                kai_trap_abort("vec: element shape mismatch");
+            int64_t bits = kai_vec_scalar_bits(x, (uint8_t) m->elem_tag);
+            memcpy(slot, &bits, 8);
+            kai_decref(x);
+            return;
+        }
+        case KAI_VEC_EK_REC: {
+            if (!x || !kai_is_ptr(x) || x->tag != KAI_RECORD ||
+                x->as.rec.n_fields != m->n_fields)
+                kai_trap_abort("vec: record shape mismatch");
+            for (int i = 0; i < m->n_fields; ++i) {
+                /* Constructors normally emit fields in one canonical
+                 * order; resolve by name so a permuted literal still
+                 * lands each payload in its column. */
+                int j = -1;
+                if (x->as.rec.names[i] == m->names[i]) j = i;
+                else {
+                    for (int k = 0; k < m->n_fields; ++k) {
+                        if (x->as.rec.names[k] == m->names[i] ||
+                            strcmp(x->as.rec.names[k], m->names[i]) == 0) { j = k; break; }
+                    }
+                }
+                if (j < 0 || kai_vec_scalar_tag(x->as.rec.fields[j]) != m->field_tags[i])
+                    kai_trap_abort("vec: record shape mismatch");
+                int64_t bits = kai_vec_scalar_bits(x->as.rec.fields[j], m->field_tags[i]);
+                memcpy(slot + (size_t) i * 8, &bits, 8);
+            }
+            kai_decref(x);
+            return;
+        }
+        default:  /* BOXED — the slot steals x's incoming ref */
+            memcpy(slot, &x, sizeof(KaiValue *));
+            return;
+    }
+}
+
+/* Read one element as an owned boxed value. */
+static KaiValue *kai_vec_read_elem(KaiVecMeta *m, const char *slot) {
+    switch (m->ekind) {
+        case KAI_VEC_EK_RAW: {
+            int64_t bits;
+            memcpy(&bits, slot, 8);
+            return kai_vec_scalar_box((uint8_t) m->elem_tag, bits);
+        }
+        case KAI_VEC_EK_REC: {
+            KaiValue *fields[KAI_VEC_REC_MAX];
+            for (int i = 0; i < m->n_fields; ++i) {
+                int64_t bits;
+                memcpy(&bits, slot + (size_t) i * 8, 8);
+                fields[i] = kai_vec_scalar_box(m->field_tags[i], bits);
+            }
+            KaiValue *r = kai_record(m->n_fields, fields, m->names);
+            r->as.rec.head_type_tag = m->head_tag;
+            return r;
+        }
+        default: {  /* BOXED */
+            KaiValue *p;
+            memcpy(&p, slot, sizeof(KaiValue *));
+            return kai_incref(p);
+        }
+    }
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_vec_make(int64_t len, KaiValue *init) {
+    if (len < 0) { fprintf(stderr, "kai: vec_make: negative length\n"); exit(1); }
+    KaiVecMeta m;
+    memset(&m, 0, sizeof(m));
+    if (len > 0) kai_vec_classify(&m, init);
+    KaiValue *v = kai_vec_alloc(len, len, &m);
+    KaiVecMeta *vm = kai_vec_meta(v);
+    char *base = kai_vec_elems(v);
+    if (len == 0) return v;
+    if (vm->ekind == KAI_VEC_EK_BOXED) {
+        KaiValue **items = (KaiValue **) base;
+        for (int64_t i = 0; i < len; ++i) items[i] = kai_incref(init);
+    } else {
+        /* Extract the payload once, then replicate the stride image. */
+        kai_vec_write_elem(vm, base, kai_incref(init));
+        for (int64_t i = 1; i < len; ++i)
+            memcpy(base + (size_t) i * (size_t) vm->stride, base, (size_t) vm->stride);
+    }
+    return v;
+}
+
+static KaiValue *kai_vec_empty(void) {
+    return kai_vec_alloc(0, 0, NULL);
+}
+
+/* Copy for the shared-write path. Boxed children are shared (incref),
+ * raw bytes are memcpy'd; the copy is unique (rc = 1) by construction. */
+static KAI_RC_NOINLINE KaiValue *kai_vec_clone(KaiValue *v, int64_t cap) {
+    KaiVecMeta *m = kai_vec_meta(v);
+    int64_t len = v->as.vec.len;
+    if (cap < len) cap = len;
+    KaiValue *c = kai_vec_alloc(len, cap, m);
+    char *dst = kai_vec_elems(c);
+    memcpy(dst, kai_vec_elems(v), (size_t) len * (size_t) (m->stride > 0 ? m->stride : 0));
+    if (m->ekind == KAI_VEC_EK_BOXED) {
+        KaiValue **items = (KaiValue **) dst;
+        for (int64_t i = 0; i < len; ++i) kai_incref(items[i]);
+    }
+    return c;
+}
+
+static void kai_vec_bounds(KaiValue *v, int64_t i, const char *op) {
+    if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
+        fprintf(stderr, "kai: %s: not a vec\n", op); exit(1);
+    }
+    if (i < 0 || i >= v->as.vec.len) {
+        static char buf[96];
+        snprintf(buf, sizeof(buf), "index %lld out of range (len=%lld)",
+                 (long long) i, (long long) v->as.vec.len);
+        kai_trap_abort(buf);
+    }
+}
+
+/* Bounds gate for a dynamic index into a fixed-width `Vec[t]<n>`: the
+ * length is a compile-time constant, so only the index needs checking.
+ * Returns the index so the caller can use it inline as the subscript. */
+static int64_t kai_fixed_vec_idx(int64_t i, int64_t n) {
+    if (i < 0 || i >= n) {
+        static char buf[96];
+        snprintf(buf, sizeof(buf), "index %lld out of range (len=%lld)",
+                 (long long) i, (long long) n);
+        kai_trap_abort(buf);
+    }
+    return i;
+}
+
+/* O(1) read; the element leaves the vec owned by the caller. */
+static KaiValue *kai_vec_get_impl(KaiValue *v, int64_t i) {
+    kai_vec_bounds(v, i, "vec_get");
+    KaiVecMeta *m = kai_vec_meta(v);
+    return kai_vec_read_elem(m, kai_vec_elems(v) + (size_t) i * (size_t) m->stride);
+}
+
+/* The raw 8-byte payload of a scalar element, no box, no RC on either
+ * side. The dynamic twin of a fixed vec's `(v).a[i]` inline load: the
+ * read a `Vec[t]<n>` value takes once it has crossed the boxed border
+ * and is a heap vec, where the caller still wants a bare scalar. Only
+ * valid on a RAW-kind vec (flat scalar elements). */
+static const void *kai_vec_raw_slot(KaiValue *v, int64_t i) {
+    kai_vec_bounds(v, i, "vec_get");
+    KaiVecMeta *m = kai_vec_meta(v);
+    return kai_vec_elems(v) + (size_t) i * (size_t) m->stride;
+}
+
+/* The one unique-or-copy decision every Vec write rides: unique (rc==1)
+ * mutates in place, shared clones with `need_cap` capacity. Every write
+ * path — boxed or raw — MUST pass through here before touching bytes; a
+ * raw store on a shared buffer would silently corrupt a value another
+ * reference is observing. */
+static KaiValue *kai_vec_ensure_unique(KaiValue *v, int64_t need_cap) {
+    /* A view is shared by construction: its bytes belong to the owner,
+     * so every write through it copies — even at node rc == 1. */
+    if (v->as.vec.view_of || !kai_check_unique(v)) {
+        KaiValue *c = kai_vec_clone(v, need_cap);
+        kai_decref(v);
+        kai_vec_count_cow();
+        return c;
+    }
+    kai_vec_count_inplace();
+    return v;
+}
+
+/* Grow the (unique) block to `ncap` elements; returns the moved meta. */
+static KaiVecMeta *kai_vec_grow_cap(KaiValue *v, int64_t ncap) {
+    KaiVecMeta *m = kai_vec_meta(v);
+    v->as.vec.data = kai_heap_realloc(v->as.vec.data,
+        sizeof(KaiVecMeta) + (size_t) v->as.vec.cap * (size_t) (m->stride > 0 ? m->stride : 0),
+        sizeof(KaiVecMeta) + (size_t) ncap * (size_t) m->stride);
+    v->as.vec.cap = ncap;
+    return kai_vec_meta(v);
+}
+
+/* Pure write. Consumes `v` and `x`; returns the result vec (in place
+ * when `v` was unique, a copy when shared). */
+static KaiValue *kai_vec_set_impl(KaiValue *v, int64_t i, KaiValue *x) {
+    kai_vec_bounds(v, i, "vec_set");
+    v = kai_vec_ensure_unique(v, v->as.vec.cap);
+    KaiVecMeta *m = kai_vec_meta(v);
+    char *slot = kai_vec_elems(v) + (size_t) i * (size_t) m->stride;
+    if (m->ekind == KAI_VEC_EK_BOXED) {
+        KaiValue *old;
+        memcpy(&old, slot, sizeof(KaiValue *));
+        kai_vec_write_elem(m, slot, x);
+        kai_decref(old);
+    } else {
+        kai_vec_write_elem(m, slot, x);
+    }
+    return v;
+}
+
+/* Pure append. Consumes `v` and `x`. Unique with spare capacity is a
+ * plain in-place append; unique at capacity grows the block (doubling);
+ * shared copies first. An empty PENDING vec classifies from `x`. */
+static KaiValue *kai_vec_push_impl(KaiValue *v, KaiValue *x) {
+    if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
+        fprintf(stderr, "kai: vec_push: not a vec\n"); exit(1);
+    }
+    int64_t len = v->as.vec.len;
+    {
+        /* Grow only at capacity: an unconditional cap*2 here would double
+         * the clone's capacity on EVERY shared push (2^n blow-up). */
+        int64_t ncap = v->as.vec.cap;
+        if (len >= ncap) {
+            ncap = ncap * 2;
+            if (ncap < len + 1) ncap = len + 1;
+            if (ncap < 4) ncap = 4;
+        }
+        v = kai_vec_ensure_unique(v, ncap);
+    }
+    KaiVecMeta *m = kai_vec_meta(v);
+    if (m->ekind == KAI_VEC_EK_PENDING) {
+        kai_vec_classify(m, x);
+        int64_t ncap = v->as.vec.cap;
+        if (ncap < 4) ncap = 4;
+        m = kai_vec_grow_cap(v, ncap);
+    } else if (len == v->as.vec.cap) {
+        int64_t ncap = v->as.vec.cap * 2;
+        if (ncap < 4) ncap = 4;
+        m = kai_vec_grow_cap(v, ncap);
+    }
+    kai_vec_write_elem(m, kai_vec_elems(v) + (size_t) len * (size_t) m->stride, x);
+    v->as.vec.len = len + 1;
+    return v;
+}
+
+/* ---------- Vec raw element paths (compiler-fused) ----------
+ *
+ * The compiler fuses `vec_get(v, i).f` and `vec_push(v, Rec{..})` on
+ * inline-record carriers into these entry points so no boxed record is
+ * built per access. Only the element MOVE is raw: every write still
+ * rides kai_vec_ensure_unique — the ownership decision is never
+ * skipped. Field index trusts the declaration-order column layout,
+ * the same bet the constant-index record read (kai_op_field_at)
+ * already makes; ekind/arity/tag are checked and trap on mismatch. */
+
+static KaiValue *kai_vec_get_field_impl(KaiValue *v, KaiValue *i, int32_t fidx) {
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    kai_vec_bounds(v, idx, "vec_get");
+    KaiVecMeta *m = kai_vec_meta(v);
+    if (m->ekind != KAI_VEC_EK_REC || fidx < 0 || fidx >= m->n_fields)
+        kai_trap_abort("vec: fused field read on a non-inline-record vec");
+    int64_t bits;
+    memcpy(&bits, kai_vec_elems(v) + (size_t) idx * (size_t) m->stride
+                  + (size_t) fidx * 8, 8);
+    return kai_vec_scalar_box(m->field_tags[fidx], bits);
+}
+
+/* Consuming / borrowing pair, mirroring kai_core_array_get(_borrow). */
+static KaiValue *kai_vec_get_field(KaiValue *v, KaiValue *i, int32_t fidx) {
+    KaiValue *r = kai_vec_get_field_impl(v, i, fidx);
+    if (v) kai_decref(v);
+    if (i) kai_decref(i);
+    return r;
+}
+static KaiValue *kai_vec_get_field_borrow(KaiValue *v, KaiValue *i, int32_t fidx) {
+    return kai_vec_get_field_impl(v, i, fidx);
+}
+
+/* Store `n` unpacked scalar fields into one REC slot; consumes each x. */
+static void kai_vec_store_rec_fields(KaiVecMeta *m, char *slot, int64_t n,
+                                     KaiValue **xs) {
+    if (m->ekind != KAI_VEC_EK_REC || (int64_t) m->n_fields != n)
+        kai_trap_abort("vec: record shape mismatch");
+    for (int64_t k = 0; k < n; ++k) {
+        if (kai_vec_scalar_tag(xs[k]) != m->field_tags[k])
+            kai_trap_abort("vec: record shape mismatch");
+        int64_t bits = kai_vec_scalar_bits(xs[k], m->field_tags[k]);
+        memcpy(slot + (size_t) k * 8, &bits, 8);
+        kai_decref(xs[k]);
+    }
+}
+
+/* Fused `vec_push(v, Rec{f0: x0, ...})`: consumes v and every x; the
+ * record is never allocated. A PENDING vec classifies REC directly
+ * from the unpacked fields (`names` must be static literals); the
+ * head tag is 0, mirroring kai_record's anonymous-literal stamp. */
+static KaiValue *kai_vec_push_rec_raw(KaiValue *v, int64_t n,
+                                      KaiValue **xs, const char **names) {
+    if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
+        fprintf(stderr, "kai: vec_push: not a vec\n"); exit(1);
+    }
+    int64_t len = v->as.vec.len;
+    {
+        /* Grow only at capacity — see kai_vec_push_impl. */
+        int64_t ncap = v->as.vec.cap;
+        if (len >= ncap) {
+            ncap = ncap * 2;
+            if (ncap < len + 1) ncap = len + 1;
+            if (ncap < 4) ncap = 4;
+        }
+        v = kai_vec_ensure_unique(v, ncap);
+    }
+    KaiVecMeta *m = kai_vec_meta(v);
+    if (m->ekind == KAI_VEC_EK_PENDING) {
+        if (n < 1 || n > KAI_VEC_REC_MAX)
+            kai_trap_abort("vec: record shape mismatch");
+        m->ekind = KAI_VEC_EK_REC;
+        m->n_fields = (int32_t) n;
+        m->head_tag = 0;
+        m->stride = n * 8;
+        for (int64_t k = 0; k < n; ++k) {
+            int ft = kai_vec_scalar_tag(xs[k]);
+            if (ft < 0) kai_trap_abort("vec: record shape mismatch");
+            m->field_tags[k] = (uint8_t) ft;
+            m->names[k] = names[k];
+        }
+        int64_t ncap = v->as.vec.cap;
+        if (ncap < 4) ncap = 4;
+        m = kai_vec_grow_cap(v, ncap);
+    } else if (len == v->as.vec.cap) {
+        int64_t ncap = v->as.vec.cap * 2;
+        if (ncap < 4) ncap = 4;
+        m = kai_vec_grow_cap(v, ncap);
+    }
+    kai_vec_store_rec_fields(m, kai_vec_elems(v) + (size_t) len * (size_t) m->stride,
+                             n, xs);
+    v->as.vec.len = len + 1;
+    return v;
+}
+
+/* Fused `vec_set(v, i, Rec{...})`: consumes v, i, and every x. */
+static KaiValue *kai_vec_set_rec_raw(KaiValue *v, KaiValue *i, int64_t n,
+                                     KaiValue **xs) {
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    if (i) kai_decref(i);
+    kai_vec_bounds(v, idx, "vec_set");
+    v = kai_vec_ensure_unique(v, v->as.vec.cap);
+    KaiVecMeta *m = kai_vec_meta(v);
+    kai_vec_store_rec_fields(m, kai_vec_elems(v) + (size_t) idx * (size_t) m->stride,
+                             n, xs);
+    return v;
+}
+
+/* ---------- Vec slices: O(1) views over the shared buffer ----------
+ *
+ * A slice never copies elements: it is a fresh KAI_VEC node whose
+ * `view_of` holds one strong ref on the owner and whose `data` points
+ * at the first sliced element inside the owner's block. Consuming a
+ * UNIQUE view retargets it in place (no allocation) — a `[h, ...t]`
+ * descent re-slices the same node per level. An empty slice releases
+ * the source entirely, so a descent's pin dies exactly at `[]`. */
+
+static KaiValue *kai_vec_slice_impl(KaiValue *v, int64_t start, int64_t slen) {
+    if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
+        fprintf(stderr, "kai: vec_slice: not a vec\n"); exit(1);
+    }
+    int64_t len = v->as.vec.len;
+    if (start < 0 || slen < 0 || start > len || slen > len - start) {
+        static char buf[96];
+        snprintf(buf, sizeof(buf), "slice [%lld, +%lld] out of range (len=%lld)",
+                 (long long) start, (long long) slen, (long long) len);
+        kai_trap_abort(buf);
+    }
+    if (slen == 0) { kai_decref(v); return kai_vec_empty(); }
+    KaiVecMeta *m = kai_vec_meta(v);
+    if (v->as.vec.view_of && kai_check_unique(v)) {
+        v->as.vec.data = (char *) v->as.vec.data + (size_t) start * (size_t) m->stride;
+        v->as.vec.len = slen;
+        v->as.vec.cap = slen;
+        kai_vec_count_inplace();
+        return v;
+    }
+    KaiValue *owner = v->as.vec.view_of ? v->as.vec.view_of : v;
+    KaiValue *s = kai_alloc(KAI_VEC);
+    s->as.vec.len = slen;
+    s->as.vec.cap = slen;
+    s->as.vec.data = kai_vec_elems(v) + (size_t) start * (size_t) m->stride;
+    s->as.vec.view_of = owner;
+    /* A view source hands its owner-ref over via incref+release; an
+     * owner source transfers the consumed ref directly. */
+    if (v->as.vec.view_of) { kai_incref(owner); kai_decref(v); }
+    return s;
+}
+
+/* `[h, ...t]`'s tail: everything from `start` on. */
+static KaiValue *kai_vec_tail_from_impl(KaiValue *v, int64_t start) {
+    if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
+        fprintf(stderr, "kai: vec_slice: not a vec\n"); exit(1);
+    }
+    return kai_vec_slice_impl(v, start, v->as.vec.len - start);
+}
+
+/* Empty vec with `n` elements of capacity. Classification is still
+ * PENDING (stride 0), so the block holds only the meta; the first push
+ * classifies and grows the block to the reserved capacity in one
+ * realloc. */
+static KaiValue *kai_vec_reserve_impl(int64_t n) {
+    return kai_vec_alloc(0, n < 0 ? 0 : n, NULL);
+}
+
+/* List -> vec, pre-sized to the list's length. Consumes `xs`. The
+ * cursor covers a range (or a range tail) without materialising it. */
+static KaiValue *kai_vec_from_list_impl(KaiValue *xs) {
+    int64_t n = 0;
+    KaiValue *p = xs;
+    while (p && kai_is_ptr(p) && p->tag == KAI_CONS) { n++; p = p->as.cons.tail; }
+    if (p && kai_is_ptr(p) && p->tag == KAI_RANGE && !kai_range_is_empty(p))
+        n += kai_range_len(p);
+    KaiValue *v = kai_vec_alloc(0, n, NULL);
+    KaiSeqIt it;
+    kai_seq_it_init(&it, xs);
+    for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it))
+        v = kai_vec_push_impl(v, x);
+    kai_decref(xs);
+    return v;
+}
+
+/* Structural equality — Vec is a value, unlike identity-compared
+ * Array. Raw scalars compare by payload (Reals via `==`, preserving
+ * NaN/-0.0 semantics); boxed elements recurse through kai_op_eq. */
+static int kai_op_eq(KaiValue *a, KaiValue *b);
+static int kai_vec_eq(KaiValue *a, KaiValue *b) {
+    int64_t len = a->as.vec.len;
+    if (len != b->as.vec.len) return 0;
+    if (len == 0) return 1;
+    KaiVecMeta *ma = kai_vec_meta(a);
+    KaiVecMeta *mb = kai_vec_meta(b);
+    if (ma->ekind != mb->ekind) return 0;   /* unreachable for one static type */
+    const char *pa = kai_vec_elems(a);
+    const char *pb = kai_vec_elems(b);
+    if (ma->ekind == KAI_VEC_EK_BOXED) {
+        for (int64_t i = 0; i < len; ++i) {
+            KaiValue *xa, *xb;
+            memcpy(&xa, pa + (size_t) i * sizeof(KaiValue *), sizeof(KaiValue *));
+            memcpy(&xb, pb + (size_t) i * sizeof(KaiValue *), sizeof(KaiValue *));
+            if (!kai_op_eq(xa, xb)) return 0;
+        }
+        return 1;
+    }
+    /* RAW / REC: word-compare, except Real columns via double ==. */
+    int64_t words = (ma->stride / 8) * len;
+    int has_real = (ma->ekind == KAI_VEC_EK_RAW && ma->elem_tag == KAI_REAL);
+    if (ma->ekind == KAI_VEC_EK_REC) {
+        for (int i = 0; i < ma->n_fields; ++i)
+            if (ma->field_tags[i] == KAI_REAL) has_real = 1;
+    }
+    if (!has_real) return memcmp(pa, pb, (size_t) words * 8) == 0;
+    for (int64_t w = 0; w < words; ++w) {
+        int fld = (int) (w % (ma->stride / 8));
+        uint8_t t = (ma->ekind == KAI_VEC_EK_RAW) ? (uint8_t) ma->elem_tag
+                                                  : ma->field_tags[fld];
+        if (t == KAI_REAL) {
+            double ra, rb;
+            memcpy(&ra, pa + (size_t) w * 8, 8);
+            memcpy(&rb, pb + (size_t) w * 8, 8);
+            if (!(ra == rb)) return 0;
+        } else {
+            if (memcmp(pa + (size_t) w * 8, pb + (size_t) w * 8, 8) != 0) return 0;
+        }
+    }
+    return 1;
+}
+
+/* m5.x #2: incref each captured value so the closure owns its own
+ * reference. Symmetric with `kai_free_value` (KAI_CLOSURE branch),
+ * which decrefs every capture on chain-free. Without this incref the
+ * closure stores raw aliases of caller-owned bindings; the alias goes
+ * dangling as soon as the caller's scope decrefs them — latent under
+ * the loose runtime, a use-after-free under linear consumption. */
+static KAI_RC_NOINLINE KaiValue *kai_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures) {
+    KaiValue *v = kai_alloc(KAI_CLOSURE);
+    v->as.clo.fn = fn;
+    v->as.clo.arity = arity;
+    v->as.clo.n_captures = n_captures;
+    if (n_captures > 0) {
+        v->as.clo.captures = (KaiValue **) malloc(n_captures * sizeof(KaiValue *));
+        for (int i = 0; i < n_captures; ++i) v->as.clo.captures[i] = kai_incref(captures[i]);
+    } else {
+        v->as.clo.captures = NULL;
+    }
+    return v;
+}
+
+/* Invoke a closure dynamically.
+ *
+ * Issue #298 — kai_apply consumes its closure argument. Pre-fix the
+ * helper borrowed `clo`; emitters at every callsite (stage0 emit.c,
+ * stage1/stage2 compiler.kai, LLVM kaix_apply) handed it the binding
+ * raw and assumed the surrounding scope owned the ref. For let-bound
+ * closures invoked exactly once (e.g. `let f = make_adder(n); f(10)`),
+ * Perceus picked the `LUAt + count == 1 -> raw transfer` branch and
+ * never inserted a drop — so the closure leaked one ref per call. The
+ * 27.97% closure leak in kaic2 self-compile was driven by this shape.
+ *
+ * Post-fix the contract is symmetric with the rest of m5.x: every
+ * KaiValue * passed to kai_apply is OWNED by the call. The dispatched
+ * fn body cannot read `self` after its own return (it cannot — that
+ * pointer is freed before the result hits the caller), and runtime
+ * helpers (kai_core_map / _filter / _flat_map / _reduce / _each,
+ * kai_fiber_trampoline) now incref the closure ahead of every loop
+ * iteration so each kai_apply gets its own ref to consume; their
+ * post-loop decref releases the original ref the helper was handed. */
+static KaiValue *kai_apply(KaiValue *clo, int argc, KaiValue **argv) {
+    if (!clo || clo->tag != KAI_CLOSURE) {
+        fprintf(stderr, "kai: attempted to call a non-callable value\n");
+        exit(1);
+    }
+    KaiValue *r = clo->as.clo.fn(clo, argv, argc);
+    kai_decref(clo);
+    return r;
+}
+
+/* Borrowing indirect call (issue #1130). Invokes the closure WITHOUT
+ * consuming it: the caller retains the ref and drops it after its last
+ * use. This is the call variant a `^`-borrowed function-typed parameter
+ * routes to — the closure threaded through a tail loop pays no per-call
+ * incref/decref pair, only the entry dup and one exit drop. Args keep the
+ * owned convention (the body consumes them exactly as under kai_apply);
+ * only the closure is borrowed. */
+static KaiValue *kai_apply_borrow(KaiValue *clo, int argc, KaiValue **argv) {
+    if (!clo || clo->tag != KAI_CLOSURE) {
+        fprintf(stderr, "kai: attempted to call a non-callable value\n");
+        exit(1);
+    }
+    return clo->as.clo.fn(clo, argv, argc);
+}
+
+/* ---------- field access helpers ---------- */
+
+static KaiValue *kai_op_field(KaiValue *rec, const char *name) {
+    if (!rec || rec->tag != KAI_RECORD) {
+        fprintf(stderr, "kai: field access on non-record\n"); exit(1);
+    }
+    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
+        if (strcmp(rec->as.rec.names[i], name) == 0) {
+            return kai_incref(rec->as.rec.fields[i]);
+        }
+    }
+    fprintf(stderr, "kai: no such field `%s`\n", name); exit(1);
+}
+
+/* Constant-index field read. Same RC contract as kai_op_field (increfs the
+   read field) but skips the strcmp: the emitter computes the slot from the
+   static record type when known, relying on the desugar-canonicalised
+   declaration-order layout. */
+static KaiValue *kai_op_field_at(KaiValue *rec, int i) {
+    if (!rec || rec->tag != KAI_RECORD) {
+        fprintf(stderr, "kai: field access on non-record\n"); exit(1);
+    }
+    return kai_incref(rec->as.rec.fields[i]);
+}
+
+/* m5.x §4b sibling: borrow the field without incref. Used in pat_test
+   paths where the caller only reads the field's tag / value to decide
+   the arm match — no downstream consumer that would need an owned ref.
+   Pre-fix every pat_test of a record-shaped pattern leaked one ref per
+   field tested (kai_op_field always increfed; the test result was
+   discarded). emit_pat_binds keeps using the incref-ing kai_op_field so
+   bindings still own their own refs. */
+static KaiValue *kai_op_field_borrow(KaiValue *rec, const char *name) {
+    if (!rec || rec->tag != KAI_RECORD) {
+        fprintf(stderr, "kai: field access on non-record\n"); exit(1);
+    }
+    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
+        if (strcmp(rec->as.rec.names[i], name) == 0) {
+            return rec->as.rec.fields[i];
+        }
+    }
+    fprintf(stderr, "kai: no such field `%s`\n", name); exit(1);
+}
+
+/* ---------- equality ---------- */
+
+static int kai_op_eq(KaiValue *a, KaiValue *b) {
+    if (a == b) return 1;   /* identical word — covers two equal immediates (Koka kk_box_eq) */
+    /* Immediate Int: equal iff both are Ints with the same value. An
+     * immediate vs a heap value of any other type is unequal. Done
+     * before any header deref, since an immediate has no header. */
+    if (kai_is_value(a) || kai_is_value(b)) {
+        return kai_is_int(a) && kai_is_int(b) && kai_intf(a) == kai_intf(b);
+    }
+    if (!a || !b) return 0;
+    /* A range is a list in another representation — list equality must
+     * compare elements across representations, never tags. The cursor
+     * walk allocates nothing and leaves both sides untouched. */
+    if (a->tag == KAI_RANGE || b->tag == KAI_RANGE) {
+        int a_seq = a->tag == KAI_RANGE || a->tag == KAI_CONS || a->tag == KAI_NIL;
+        int b_seq = b->tag == KAI_RANGE || b->tag == KAI_CONS || b->tag == KAI_NIL;
+        if (!a_seq || !b_seq) return 0;
+        KaiSeqIt ia, ib;
+        kai_seq_it_init(&ia, a);
+        kai_seq_it_init(&ib, b);
+        for (;;) {
+            KaiValue *xa = kai_seq_it_next(&ia);
+            KaiValue *xb = kai_seq_it_next(&ib);
+            if (!xa || !xb) {
+                kai_decref(xa);
+                kai_decref(xb);
+                return xa == xb;
+            }
+            int eq = kai_op_eq(xa, xb);
+            kai_decref(xa);
+            kai_decref(xb);
+            if (!eq) return 0;
+        }
+    }
+    if (a->tag != b->tag) return 0;
+    switch ((KaiTag) a->tag) {
+        case KAI_UNIT: return 1;
+        case KAI_BOOL: return a->as.b == b->as.b;
+        case KAI_INT:  return a->as.i == kai_intf(b);
+        case KAI_REAL: return a->as.r == b->as.r;
+        case KAI_CHAR: return a->as.c == b->as.c;
+        case KAI_STR:  return a->as.s.len == b->as.s.len &&
+                              memcmp(a->as.s.bytes, b->as.s.bytes, a->as.s.len) == 0;
+        case KAI_NIL:  return 1;
+        case KAI_CONS:
+            return kai_op_eq(a->as.cons.head, b->as.cons.head) &&
+                   kai_op_eq(a->as.cons.tail, b->as.cons.tail);
+        case KAI_RANGE: return 1;   /* unreachable: the cursor walk above owns ranges */
+        case KAI_VARIANT: {
+            /* Eq dispatch: if a's head type has a custom impl Eq, route to it
+             * before structural fallback. Covers root AND nested cases (this
+             * fires on every recursive descent into a field of this kind).
+             * kai_op_eq is NON-consuming, so we incref a/b for the impl (which
+             * consumes them) and do NOT decref here. */
+            int32_t _eq_head = kai_head_tag(a);
+            void *_eq_fn = kai_lookup_impl(KAI_PROTO_EQ, KAI_OP_EQ_EQ, _eq_head);
+            if (_eq_fn) {
+                kai_incref(a); kai_incref(b);
+                KaiValue *_eq_r = ((KaiValue *(*)(KaiValue *, KaiValue *)) _eq_fn)(a, b);
+                int _eq_res = kai_op_truthy(_eq_r);
+                kai_decref(_eq_r);
+                return _eq_res;
+            }
+            if (a->variant_tag != b->variant_tag) return 0;
+            if (a->var_n_args != b->var_n_args) return 0;
+            /* Phase 2: if either cell carries primitive slots, the
+             * masks must agree slot-by-slot (a variant of the same
+             * tag/name must have the same layout). Then compare each
+             * slot by its kind: pointer slots recurse via kai_op_eq,
+             * primitive slots compare raw scalars. The mask==0 hot
+             * path stays on the original pointer-by-pointer walk. */
+            if (kai_slot_mask_of(a->variant_tag) == 0 && kai_slot_mask_of(b->variant_tag) == 0) {
+                for (int i = 0; i < a->var_n_args; ++i) {
+                    if (!kai_op_eq(kai_var_slots(a)[i].ptr, kai_var_slots(b)[i].ptr)) return 0;
+                }
+            } else {
+                if (kai_slot_mask_of(a->variant_tag) != kai_slot_mask_of(b->variant_tag)) return 0;
+                for (int i = 0; i < a->var_n_args; ++i) {
+                    uint32_t k = kai_var_slot_kind(kai_slot_mask_of(a->variant_tag), i);
+                    if (k == KAI_VAR_SLOT_PTR) {
+                        if (!kai_op_eq(kai_var_slots(a)[i].ptr, kai_var_slots(b)[i].ptr)) return 0;
+                    } else if (k == KAI_VAR_SLOT_INT || k == KAI_VAR_SLOT_ENUM) {
+                        /* ENUM compares its immediate variant_tag like a raw
+                         * Int; two enum slots are equal iff same tag. */
+                        if (kai_var_slots(a)[i].i64 != kai_var_slots(b)[i].i64) return 0;
+                    } else if (k == KAI_VAR_SLOT_REAL) {
+                        if (kai_var_slots(a)[i].r != kai_var_slots(b)[i].r) return 0;
+                    }
+                }
+            }
+            return 1;
+        }
+        case KAI_RECORD: {
+            /* Eq dispatch for records carrying a custom impl Eq. Records only
+             * get a dispatchable head_type_tag when stamped at construction
+             * (see LIMITATION in the handoff: nested record fields do not get
+             * a tag today). Root records reached via the resolver still work;
+             * this hook fires only when as.rec.head_type_tag is a real impl. */
+            int32_t _eq_head = kai_head_tag(a);
+            void *_eq_fn = kai_lookup_impl(KAI_PROTO_EQ, KAI_OP_EQ_EQ, _eq_head);
+            if (_eq_fn) {
+                kai_incref(a); kai_incref(b);
+                KaiValue *_eq_r = ((KaiValue *(*)(KaiValue *, KaiValue *)) _eq_fn)(a, b);
+                int _eq_res = kai_op_truthy(_eq_r);
+                kai_decref(_eq_r);
+                return _eq_res;
+            }
+            if (a->as.rec.n_fields != b->as.rec.n_fields) return 0;
+            for (int i = 0; i < a->as.rec.n_fields; ++i) {
+                if (!kai_op_eq(a->as.rec.fields[i], b->as.rec.fields[i])) return 0;
+            }
+            return 1;
+        }
+        case KAI_CLOSURE: return 0;      /* closures are not equatable */
+        case KAI_ARRAY:   return 0;      /* arrays are opaque, identity-compared */
+        case KAI_VEC:     return kai_vec_eq(a, b);  /* value: structural */
+        case KAI_REF:     return 0;      /* refs are identity-compared; a==b handled above */
+        case KAI_FIBER:   return a->as.fib == b->as.fib;  /* identity */
+        case KAI_PID:     return a->as.mb  == b->as.mb;   /* identity */
+        case KAI_FOREIGN: return a->as.foreign_ptr == b->as.foreign_ptr; /* identity (#417) */
+        case KAI_BYTE:      return a->as.byte_val == b->as.byte_val;    /* Lane 4 (#473) */
+        case KAI_INT32:     return a->as.i32 == b->as.i32;
+        case KAI_UINT32:    return a->as.u32 == b->as.u32;
+        case KAI_UINT64:    return a->as.u64 == b->as.u64;
+        case KAI_INT128:    return kai_i128_load(a) == kai_i128_load(b);
+    }
+    return 0;
+}
+
+/* ---------- to-string ---------- */
+
+static KAI_RC_NOINLINE KaiValue *kai_string_concat(KaiValue *a, KaiValue *b);
+
+static KaiValue *kai_to_string(KaiValue *v);
+
+/* Encode scalar value `cp` into `out` (>= 4 bytes), the exact inverse of
+ * the `string_cp_at` decode. Returns the byte width 1..4. A `Char` is
+ * always a valid scalar value (enforced at `int_to_char`); the surrogate
+ * / out-of-range clamp to U+FFFD only guards a raw uint32 reaching here. */
+static int kai_utf8_encode(uint32_t cp, unsigned char *out) {
+    if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+    if (cp < 0x80) {
+        out[0] = (unsigned char) cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = (unsigned char) (0xC0 | (cp >> 6));
+        out[1] = (unsigned char) (0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (unsigned char) (0xE0 | (cp >> 12));
+        out[1] = (unsigned char) (0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (unsigned char) (0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (unsigned char) (0xF0 | (cp >> 18));
+    out[1] = (unsigned char) (0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (unsigned char) (0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (unsigned char) (0x80 | (cp & 0x3F));
+    return 4;
+}
+
+static KaiValue *kai_list_to_string(KaiValue *v) {
+    KaiValue *acc = kai_str("[");
+    int first = 1;
+    KaiSeqIt it;
+    kai_seq_it_init(&it, v);
+    for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it)) {
+        if (!first) {
+            KaiValue *c = kai_string_concat(acc, kai_str(", "));
+            kai_decref(acc); acc = c;
+        }
+        first = 0;
+        KaiValue *s = kai_to_string(x);
+        KaiValue *c = kai_string_concat(acc, s);
+        kai_decref(acc); kai_decref(s); acc = c;
+        kai_decref(x);
+    }
+    KaiValue *c = kai_string_concat(acc, kai_str("]"));
+    kai_decref(acc); return c;
+}
+
+static KaiValue *kai_to_string(KaiValue *v) {
+    if (!v) return kai_str("<null>");
+    char buf[64];
+    /* Koka tagged-Int: a small Int is an immediate, not a heap value —
+     * `v->tag` would dereference the fake pointer and crash. Render it
+     * as the decoded integer before touching the header. */
+    if (kai_is_value(v)) {
+        snprintf(buf, sizeof(buf), "%lld", (long long) kai_intf(v));
+        return kai_str_dyn(buf);
+    }
+    switch ((KaiTag) v->tag) {
+        case KAI_UNIT: return kai_str("()");
+        case KAI_BOOL: return kai_str(v->as.b ? "true" : "false");
+        case KAI_INT:
+            snprintf(buf, sizeof(buf), "%lld", (long long) kai_intf(v));
+            return kai_str_dyn(buf);
+        case KAI_REAL:
+            snprintf(buf, sizeof(buf), "%g", v->as.r);
+            return kai_str_dyn(buf);
+        case KAI_CHAR:
+            snprintf(buf, sizeof(buf), "%c", (char) v->as.c);
+            return kai_str_dyn(buf);
+        case KAI_STR:    return kai_incref(v);
+        case KAI_NIL:    return kai_str("[]");
+        case KAI_CONS:   return kai_list_to_string(v);
+        case KAI_RANGE:  return kai_list_to_string(v);
+        case KAI_VARIANT: {
+            KaiValue *acc = kai_str(kai_variant_name_of(v->variant_tag));
+            if (v->var_n_args > 0) {
+                KaiValue *lp = kai_string_concat(acc, kai_str("(")); kai_decref(acc); acc = lp;
+                /* Phase 2: primitive slots are boxed on-the-fly via
+                 * kai_variant_slot_box; for the mask==0 hot path it
+                 * just returns the stored pointer. */
+                for (int i = 0; i < v->var_n_args; ++i) {
+                    if (i) { KaiValue *sep = kai_string_concat(acc, kai_str(", ")); kai_decref(acc); acc = sep; }
+                    uint32_t k = kai_var_slot_kind(kai_slot_mask_of(v->variant_tag), i);
+                    KaiValue *s;
+                    if (k == KAI_VAR_SLOT_PTR) {
+                        s = kai_to_string(kai_var_slots(v)[i].ptr);
+                    } else {
+                        KaiValue *tmp = kai_variant_slot_box(v, i);
+                        s = kai_to_string(tmp);
+                        kai_decref(tmp);
+                    }
+                    KaiValue *c = kai_string_concat(acc, s); kai_decref(acc); kai_decref(s); acc = c;
+                }
+                KaiValue *rp = kai_string_concat(acc, kai_str(")")); kai_decref(acc); acc = rp;
+            }
+            return acc;
+        }
+        case KAI_RECORD: {
+            KaiValue *acc = kai_str("{");
+            for (int i = 0; i < v->as.rec.n_fields; ++i) {
+                if (i) { KaiValue *sep = kai_string_concat(acc, kai_str(", ")); kai_decref(acc); acc = sep; }
+                KaiValue *nm = kai_str(v->as.rec.names[i]);
+                KaiValue *a1 = kai_string_concat(acc, nm); kai_decref(acc); kai_decref(nm); acc = a1;
+                KaiValue *a2 = kai_string_concat(acc, kai_str(": ")); kai_decref(acc); acc = a2;
+                KaiValue *fs = kai_to_string(v->as.rec.fields[i]);
+                KaiValue *a3 = kai_string_concat(acc, fs); kai_decref(acc); kai_decref(fs); acc = a3;
+            }
+            KaiValue *cl = kai_string_concat(acc, kai_str("}")); kai_decref(acc);
+            return cl;
+        }
+        case KAI_CLOSURE: return kai_str("<closure>");
+        case KAI_ARRAY:   return kai_str("<array>");
+        case KAI_VEC:     return kai_str("<vec>");
+        case KAI_REF: {
+            /* Honest render `Ref(<inner>)` — closes the follow-up the
+             * #257 retro left open (length-1 array printed as <array>). */
+            KaiValue *inner = kai_to_string(v->as.ref.cell);
+            KaiValue *open  = kai_string_concat(kai_str("Ref("), inner);
+            KaiValue *full  = kai_string_concat(open, kai_str(")"));
+            kai_decref(inner); kai_decref(open);
+            return full;
+        }
+        case KAI_FIBER:   return kai_str("<fiber>");
+        case KAI_PID:     return kai_str("<pid>");
+        case KAI_FOREIGN: return kai_str("<foreign>");
+        case KAI_BYTE:                                       /* Lane 4 (#473) */
+            snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.byte_val);
+            return kai_str_dyn(buf);
+        case KAI_INT32:
+            snprintf(buf, sizeof(buf), "%d", (int) v->as.i32);
+            return kai_str_dyn(buf);
+        case KAI_UINT32:
+            snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.u32);
+            return kai_str_dyn(buf);
+        case KAI_UINT64:
+            snprintf(buf, sizeof(buf), "%llu", (unsigned long long) v->as.u64);
+            return kai_str_dyn(buf);
+        case KAI_INT128: {
+            char i128buf[44];
+            return kai_str_dyn(kai_i128_to_decimal(kai_i128_load(v), i128buf, sizeof(i128buf)));
+        }
+    }
+    return kai_str("?");
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_string_concat(KaiValue *a, KaiValue *b) {
+    size_t la = (a && kai_is_ptr(a) && a->tag == KAI_STR) ? a->as.s.len : 0;
+    size_t lb = (b && kai_is_ptr(b) && b->tag == KAI_STR) ? b->as.s.len : 0;
+    KaiValue *v = kai_alloc(KAI_STR);
+    v->as.s.len = la + lb;
+    v->as.s.bytes = (char *) kai_heap_malloc(la + lb + 1);
+    if (la) memcpy(v->as.s.bytes, a->as.s.bytes, la);
+    if (lb) memcpy(v->as.s.bytes + la, b->as.s.bytes, lb);
+    v->as.s.bytes[la + lb] = '\0';
+    return v;
+}
+
+/* Two-pass concat of every KAI_STR in the cons list: measure total
+   length, allocate once, memcpy each piece in. Avoids the O(n²)
+   accumulation that a naive fold of kai_string_concat produces, which
+   dominates emit-heavy workloads like the self-hosting compiler. */
+static KAI_RC_NOINLINE KaiValue *kai_string_concat_all_impl(KaiValue *xs) {
+    size_t total = 0;
+    for (KaiValue *p = xs; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+        KaiValue *s = p->as.cons.head;
+        if (kai_is_ptr(s) && s->tag == KAI_STR) total += s->as.s.len;
+    }
+    KaiValue *v = kai_alloc(KAI_STR);
+    v->as.s.len = total;
+    v->as.s.bytes = (char *) kai_heap_malloc(total + 1);
+    size_t off = 0;
+    for (KaiValue *p = xs; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+        KaiValue *s = p->as.cons.head;
+        if (s && s->tag == KAI_STR && s->as.s.len > 0) {
+            memcpy(v->as.s.bytes + off, s->as.s.bytes, s->as.s.len);
+            off += s->as.s.len;
+        }
+    }
+    v->as.s.bytes[total] = '\0';
+    return v;
+}
+
+/* Two-pass join: like concat_all but interleaves `sep` between pieces. */
+static KAI_RC_NOINLINE KaiValue *kai_string_join_impl(KaiValue *xs, KaiValue *sep) {
+    size_t slen = (kai_is_ptr(sep) && sep->tag == KAI_STR) ? sep->as.s.len : 0;
+    size_t total = 0;
+    int count = 0;
+    for (KaiValue *p = xs; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+        KaiValue *s = p->as.cons.head;
+        if (kai_is_ptr(s) && s->tag == KAI_STR) total += s->as.s.len;
+        count++;
+    }
+    if (count > 1) total += slen * (size_t)(count - 1);
+    KaiValue *v = kai_alloc(KAI_STR);
+    v->as.s.len = total;
+    v->as.s.bytes = (char *) kai_heap_malloc(total + 1);
+    size_t off = 0;
+    int first = 1;
+    for (KaiValue *p = xs; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+        if (!first && slen > 0) {
+            memcpy(v->as.s.bytes + off, sep->as.s.bytes, slen);
+            off += slen;
+        }
+        first = 0;
+        KaiValue *s = p->as.cons.head;
+        if (s && s->tag == KAI_STR && s->as.s.len > 0) {
+            memcpy(v->as.s.bytes + off, s->as.s.bytes, s->as.s.len);
+            off += s->as.s.len;
+        }
+    }
+    v->as.s.bytes[total] = '\0';
+    return v;
+}
+
+/* ---------- core: IO ---------- */
+
+/*
+ * Calling convention for the core: borrow semantics. Arguments are
+ * borrowed from the caller (no incref / no decref on them). Return
+ * values are owned by the caller.
+ */
+
+/* Payload and trailing '\n' are separate stdio calls; each locks the
+ * stream individually but the pair does not. flockfile around the pair
+ * keeps a line atomic across scheduler threads. */
+static KaiValue *kai_core_print(KaiValue *arg) {
+    if (!arg) { fputc('\n', stdout); return kai_unit(); }
+    KaiValue *s = (arg->tag == KAI_STR) ? NULL : kai_to_string(arg);
+    KaiValue *src = s ? s : arg;
+    flockfile(stdout);
+    fwrite(src->as.s.bytes, 1, src->as.s.len, stdout);
+    fputc('\n', stdout);
+    funlockfile(stdout);
+    if (s) kai_decref(s);
+    kai_decref(arg);
+    return kai_unit();
+}
+
+static KaiValue *kai_core_eprint(KaiValue *arg) {
+    if (!arg) { fputc('\n', stderr); return kai_unit(); }
+    KaiValue *s = (arg->tag == KAI_STR) ? NULL : kai_to_string(arg);
+    KaiValue *src = s ? s : arg;
+    flockfile(stderr);
+    fwrite(src->as.s.bytes, 1, src->as.s.len, stderr);
+    fputc('\n', stderr);
+    funlockfile(stderr);
+    if (s) kai_decref(s);
+    kai_decref(arg);
+    return kai_unit();
+}
+
+/*
+ * Issue #447 (LSP framing): write a String to stdout verbatim with
+ * no trailing newline, then flush. LSP JSON-RPC framing requires the
+ * body to be exactly `Content-Length` bytes; `print` would inject an
+ * extra '\n' that breaks strict clients. Non-String args fall through
+ * `kai_to_string` for safety.
+ */
+static KaiValue *kai_core_write_stdout(KaiValue *arg) {
+    if (!arg) { fflush(stdout); return kai_unit(); }
+    if (arg->tag == KAI_STR) {
+        fwrite(arg->as.s.bytes, 1, arg->as.s.len, stdout);
+    } else {
+        KaiValue *s = kai_to_string(arg);
+        fwrite(s->as.s.bytes, 1, s->as.s.len, stdout);
+        kai_decref(s);
+    }
+    fflush(stdout);
+    kai_decref(arg);
+    return kai_unit();
+}
+
+/* --debug stack trace (#500). `__kai_build_debug` is 0 in a default/release
+ * binary and set to 1 by the native backend's debug marker global (emitted
+ * only when DWARF is on). A weak definition here means a binary that never
+ * defines the strong one still links. When it is 1, a panic resolves its
+ * return-address backtrace to `<file>.kai:<line>` via the platform symboliser
+ * (`atos` on macOS, `addr2line` on ELF) reading the DWARF this build emitted.
+ * In a non-debug binary the flag is 0, so the panic stays the one-line form
+ * and pays no symboliser cost. */
+__attribute__((weak)) int __kai_build_debug = 0;
+
+/* Best-effort absolute path of the running executable, into `buf`. Returns 1
+ * on success. The symboliser needs it to read the binary's (or its .dSYM's)
+ * DWARF. */
+static int kai_self_exe_path(char *buf, size_t n) {
+#if defined(__APPLE__)
+    uint32_t sz = (uint32_t) n;
+    extern int _NSGetExecutablePath(char *, uint32_t *);
+    return _NSGetExecutablePath(buf, &sz) == 0;
+#else
+    ssize_t r = readlink("/proc/self/exe", buf, n - 1);
+    if (r <= 0) return 0;
+    buf[r] = '\0';
+    return 1;
+#endif
+}
+
+/* Resolve and print the panic backtrace as kaikai source positions. Captures
+ * the native return addresses, then shells out to the platform symboliser
+ * once with all addresses (the DWARF line table maps each back to .kai:line).
+ * Silent + harmless when the symboliser is absent or resolves nothing — the
+ * caller already printed `panic: <msg>`. */
+/* Single-quote-wrap `src` into `dst` for safe inclusion in a /bin/sh command
+ * line, escaping any embedded `'` as `'\''` (close-quote, literal-quote,
+ * re-open-quote). Without this a path containing a single quote would break
+ * out of the quoting and the rest would be run by the shell — `exe` comes
+ * from the executable's own path, but it is still attacker-influenceable
+ * (a binary placed at a crafted path), so quote it properly. Truncates
+ * safely if `dst` fills; returns 1 on success, 0 if it could not fit. */
+static int kai_shell_squote(const char *src, char *dst, size_t n) {
+    size_t j = 0;
+    if (n < 3) return 0;
+    dst[j++] = '\'';
+    for (; *src; src++) {
+        if (*src == '\'') {
+            if (j + 4 >= n) return 0;
+            dst[j++] = '\''; dst[j++] = '\\'; dst[j++] = '\''; dst[j++] = '\'';
+        } else {
+            if (j + 1 >= n) return 0;
+            dst[j++] = *src;
+        }
+    }
+    if (j + 2 > n) return 0;
+    dst[j++] = '\''; dst[j] = '\0';
+    return 1;
+}
+
+/* Return addresses of the live frames, newest first, into `out`.
+ *
+ * TRAP (macOS): `backtrace(3)` walks frame pointers but bounds the walk with
+ * the *pthread* stack extent, so a panic raised on a fiber's mmap'd stack
+ * faults inside libsystem's `__thread_stack_pcs` — the whole --debug panic
+ * path dies with SIGSEGV instead of printing a trace. Walk the chain here
+ * against the active fiber's own bounds; only the main fiber (stack_base
+ * NULL) rides the thread stack, where `backtrace` is safe. */
+static int kai_capture_frames(void **out, int max) {
+#if defined(__APPLE__)
+    KaiFiber *f = kai_current_fiber();
+    if (!f || !f->stack_base) return backtrace(out, max);
+    /* [guard page | usable stack]; frame pointers live in the usable half. */
+    char *lo = (char *) f->stack_base + kai_page_size();
+    char *hi = lo + f->stack_size;
+    void **fp = (void **) __builtin_frame_address(0);
+    int n = 0;
+    while (n < max && (char *) fp >= lo && (char *) fp + 2 * sizeof(void *) <= hi) {
+        void **next = (void **) fp[0];
+        void  *ret  = fp[1];
+        if (!ret) break;
+        out[n++] = ret;
+        if ((char *) next <= (char *) fp) break;   /* chain must climb */
+        fp = next;
+    }
+    return n;
+#else
+    return backtrace(out, max);
+#endif
+}
+
+static void kai_panic_backtrace(void) {
+    void *frames[64];
+    int n = kai_capture_frames(frames, 64);
+    if (n <= 0) return;
+    char exe[4096];
+    if (!kai_self_exe_path(exe, sizeof exe)) return;
+    char qexe[4112];   /* exe single-quoted for the shell (worst case grows it) */
+    if (!kai_shell_squote(exe, qexe, sizeof qexe)) return;
+
+    /* The frames are RUNTIME addresses (PIE/ASLR-slid). The symboliser reads
+     * the binary at its STATIC link addresses, so the slide must be removed.
+     * `dladdr` on this fn's own address yields `dli_fbase` — the load address
+     * of the main image — which is exactly that slide. `atos -l <fbase>`
+     * tells atos the load address (it subtracts internally); for `addr2line`
+     * we subtract per-address and pass static offsets. */
+    Dl_info info;
+    uintptr_t base = 0;
+    if (dladdr((void *) kai_panic_backtrace, &info) && info.dli_fbase)
+        base = (uintptr_t) info.dli_fbase;
+
+    char cmd[8192];
+#if defined(__APPLE__)
+    int off = snprintf(cmd, sizeof cmd, "atos -o %s -fullPath -l %p", qexe, (void *) base);
+#else
+    int off = snprintf(cmd, sizeof cmd, "addr2line -f -p -e %s", qexe);
+#endif
+    if (off <= 0 || off >= (int) sizeof cmd) return;
+    /* Skip frame 0 (this fn) and frame 1 (kai_core_panic): start at the
+     * panic's caller. atos gets the runtime address (it applies -l itself);
+     * addr2line gets the static offset (runtime - base). */
+    for (int i = 2; i < n && off < (int) sizeof cmd - 32; i++) {
+#if defined(__APPLE__)
+        off += snprintf(cmd + off, sizeof cmd - off, " %p", frames[i]);
+#else
+        off += snprintf(cmd + off, sizeof cmd - off, " %p",
+                        (void *) ((uintptr_t) frames[i] - base));
+#endif
+    }
+
+    fflush(stderr);
+    FILE *p = popen(cmd, "r");
+    if (!p) return;
+    /* Print only the frames the symboliser resolved to a `.kai` source — the
+     * runtime/libc frames (no `.kai`) are noise. Header is emitted lazily so
+     * a build whose symboliser resolves nothing prints no empty header. */
+    char line[1024];
+    int printed = 0;
+    while (fgets(line, sizeof line, p)) {
+        if (!strstr(line, ".kai")) continue;
+        if (!printed) { fprintf(stderr, "stack trace (kaikai source):\n"); printed = 1; }
+        fprintf(stderr, "  %s", line);
+    }
+    pclose(p);
+}
+
+static KaiValue *kai_core_panic(KaiValue *msg) {
+    KaiFiber *f = kai_current_fiber();
+    if (f && f->cancel_pad_set) {
+        static char buf[256];
+        int n = 0;
+        if (kai_is_ptr(msg) && msg->tag == KAI_STR) {
+            n = (int) msg->as.s.len;
+            if (n > (int) sizeof(buf) - 1) n = (int) sizeof(buf) - 1;
+            memcpy(buf, msg->as.s.bytes, (size_t) n);
+        }
+        buf[n] = '\0';
+        kai_trap_abort(buf);
+    }
+    flockfile(stderr);
+    fprintf(stderr, "panic: ");
+    if (kai_is_ptr(msg) && msg->tag == KAI_STR) {
+        fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
+    }
+    fputc('\n', stderr);
+    funlockfile(stderr);
+    if (__kai_build_debug) kai_panic_backtrace();
+    exit(1);
+    return kai_unit();
+}
+
+static KaiValue *kai_core_exit(KaiValue *code) {
+    int c = (kai_is_int(code)) ? (int) kai_intf(code) : 0;
+    exit(c);
+    return kai_unit();
+}
+
+/* ---------- core: conversions ---------- */
+
+static KaiValue *kai_core_int_to_string(KaiValue *v) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", (long long) kai_intf(v));
+    KaiValue *r = kai_str_dyn(buf);
+    kai_decref(v);
+    return r;
+}
+
+static KaiValue *kai_core_real_to_string(KaiValue *v) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%g", v->as.r);
+    KaiValue *r = kai_str_dyn(buf);
+    kai_decref(v);
+    return r;
+}
+
+static KaiValue *kai_core_int_to_real(KaiValue *v) {
+    int64_t n = (kai_is_int(v)) ? kai_intf(v) : 0;
+    KaiValue *r = kai_real((double) n);
+    kai_decref(v);
+    return r;
+}
+
+/* Truncating cast toward zero. Out-of-range, NaN and Inf collapse to
+ * 0 — kaikai has no IEEE 754 surface for the user yet, so the safer
+ * default beats a UB conversion. Revisit when the math/real lane
+ * adds NaN-aware predicates. */
+static KaiValue *kai_core_real_to_int(KaiValue *v) {
+    if (!v || v->tag != KAI_REAL) { if (v) kai_decref(v); return kai_int(0); }
+    double r = v->as.r;
+    KaiValue *out;
+    if (r != r) out = kai_int(0);                       /* NaN */
+    else if (r >  9.2233720368547748e18) out = kai_int(0); /* > INT64_MAX */
+    else if (r < -9.2233720368547758e18) out = kai_int(0); /* < INT64_MIN */
+    else out = kai_int((int64_t) r);
+    kai_decref(v);
+    return out;
+}
+
+/* ---------- Lane 4 (#473): Byte nominal scalar conversions + ops ----- */
+
+/* `int_to_byte(n)` returns `Result[Byte, String]` — Err if n is outside
+ * 0..255, Ok otherwise. The Result is encoded as a KAI_VARIANT (Ok /
+ * Err) with one payload. */
+static KaiValue *kai_core_int_to_byte(KaiValue *v) {
+    if (!kai_is_int(v)) {
+        if (v) kai_decref(v);
+        KaiValue *err = kai_str("int_to_byte: not an Int");
+        return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = err}});
+    }
+    int64_t n = kai_intf(v);
+    kai_decref(v);
+    if (n < 0 || n > 255) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "int_to_byte: %lld is out of 0..255", (long long) n);
+        KaiValue *err = kai_str_dyn(buf);
+        return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = err}});
+    }
+    KaiValue *ok_payload = kai_byte((uint8_t) n);
+    return kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = ok_payload}});
+}
+
+static KaiValue *kai_core_byte_to_int(KaiValue *v) {
+    if (!v || v->tag != KAI_BYTE) { if (v) kai_decref(v); return kai_int(0); }
+    int64_t n = (int64_t) v->as.byte_val;
+    kai_decref(v);
+    return kai_int(n);
+}
+
+/* Wrapping arithmetic per uint8_t C semantics. Overflow is defined. */
+static KaiValue *kai_core_byte_add(KaiValue *a, KaiValue *b) {
+    uint8_t av = (kai_is_ptr(a) && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
+    uint8_t bv = (kai_is_ptr(b) && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
+    if (a) kai_decref(a);
+    if (b) kai_decref(b);
+    return kai_byte((uint8_t) (av + bv));
+}
+
+static KaiValue *kai_core_byte_sub(KaiValue *a, KaiValue *b) {
+    uint8_t av = (kai_is_ptr(a) && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
+    uint8_t bv = (kai_is_ptr(b) && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
+    if (a) kai_decref(a);
+    if (b) kai_decref(b);
+    return kai_byte((uint8_t) (av - bv));
+}
+
+static KaiValue *kai_core_byte_eq(KaiValue *a, KaiValue *b) {
+    uint8_t av = (kai_is_ptr(a) && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
+    uint8_t bv = (kai_is_ptr(b) && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
+    if (a) kai_decref(a);
+    if (b) kai_decref(b);
+    return kai_bool(av == bv);
+}
+
+static KaiValue *kai_core_byte_lt(KaiValue *a, KaiValue *b) {
+    uint8_t av = (kai_is_ptr(a) && a->tag == KAI_BYTE) ? a->as.byte_val : 0;
+    uint8_t bv = (kai_is_ptr(b) && b->tag == KAI_BYTE) ? b->as.byte_val : 0;
+    if (a) kai_decref(a);
+    if (b) kai_decref(b);
+    return kai_bool(av < bv);
+}
+
+static KaiValue *kai_core_byte_to_string(KaiValue *v) {
+    if (!v || v->tag != KAI_BYTE) { if (v) kai_decref(v); return kai_str("0"); }
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.byte_val);
+    kai_decref(v);
+    return kai_str_dyn(buf);
+}
+
+/* Fixed-width integer Show prims (numeric lane A). Each consumes its
+ * boxed argument (per the core consume discipline) and renders the
+ * raw value via the same width-correct formatting as `kai_to_string`. */
+static KaiValue *kai_core_int32_to_string(KaiValue *v) {
+    int32_t n = (v && kai_is_ptr(v) && v->tag == KAI_INT32) ? v->as.i32 : 0;
+    if (v) kai_decref(v);
+    char buf[16]; snprintf(buf, sizeof(buf), "%d", (int) n);
+    return kai_str_dyn(buf);
+}
+static KaiValue *kai_core_uint32_to_string(KaiValue *v) {
+    uint32_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT32) ? v->as.u32 : 0;
+    if (v) kai_decref(v);
+    char buf[16]; snprintf(buf, sizeof(buf), "%u", (unsigned) n);
+    return kai_str_dyn(buf);
+}
+static KaiValue *kai_core_uint64_to_string(KaiValue *v) {
+    uint64_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT64) ? v->as.u64 : 0;
+    if (v) kai_decref(v);
+    char buf[24]; snprintf(buf, sizeof(buf), "%llu", (unsigned long long) n);
+    return kai_str_dyn(buf);
+}
+static KaiValue *kai_core_int128_to_string(KaiValue *v) {
+    __int128 n = (v && kai_is_ptr(v) && v->tag == KAI_INT128) ? kai_i128_load(v) : 0;
+    if (v) kai_decref(v);
+    char buf[44];
+    return kai_str_dyn(kai_i128_to_decimal(n, buf, sizeof(buf)));
+}
+
+/* Fixed-width conversions. `int_to_*` truncates the 64-bit Int into the
+ * width (C cast semantics, no range check); `*_to_int` widens back —
+ * lossless for Int32/UInt32, a reinterpret for UInt64/Int128 values
+ * beyond Int's range (documented; callers needing exact 128-bit values
+ * keep them as Int128). */
+static KaiValue *kai_core_int_to_int32(KaiValue *v)  { int64_t n = kai_intf(v); kai_decref(v); return kai_int32((int32_t) n); }
+static KaiValue *kai_core_int_to_uint32(KaiValue *v) { int64_t n = kai_intf(v); kai_decref(v); return kai_uint32((uint32_t) n); }
+static KaiValue *kai_core_int_to_uint64(KaiValue *v) { int64_t n = kai_intf(v); kai_decref(v); return kai_uint64((uint64_t) n); }
+static KaiValue *kai_core_int_to_int128(KaiValue *v) { int64_t n = kai_intf(v); kai_decref(v); return kai_int128((__int128) n); }
+static KaiValue *kai_core_int32_to_int(KaiValue *v)  { int32_t n  = (v && kai_is_ptr(v) && v->tag == KAI_INT32)  ? v->as.i32  : 0; kai_decref(v); return kai_int((int64_t) n); }
+static KaiValue *kai_core_uint32_to_int(KaiValue *v) { uint32_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT32) ? v->as.u32  : 0; kai_decref(v); return kai_int((int64_t) n); }
+static KaiValue *kai_core_uint64_to_int(KaiValue *v) { uint64_t n = (v && kai_is_ptr(v) && v->tag == KAI_UINT64) ? v->as.u64  : 0; kai_decref(v); return kai_int((int64_t) n); }
+static KaiValue *kai_core_int128_to_int(KaiValue *v) { __int128 n = (v && kai_is_ptr(v) && v->tag == KAI_INT128) ? kai_i128_load(v) : 0; kai_decref(v); return kai_int((int64_t) n); }
+
+/* ---------- core: math/real libm bindings (issue #343) ----------
+ * IEEE-754 pass-through: NaN / Inf propagate per C99 <math.h>.
+ * Inspect with kai_core_real_is_nan / kai_core_real_is_inf. */
+
+#define KAI_LIBM_REAL1(name, fn)                                         \
+    static KaiValue *kai_core_real_##name(KaiValue *x) {              \
+        double r = (kai_is_ptr(x) && x->tag == KAI_REAL) ? fn(x->as.r) : 0.0;        \
+        KaiValue *out = kai_real(r);                                     \
+        if (x) kai_decref(x);                                            \
+        return out;                                                      \
+    }
+
+#define KAI_LIBM_REAL2(name, fn)                                         \
+    static KaiValue *kai_core_real_##name(KaiValue *a, KaiValue *b) { \
+        double av = (a && kai_is_ptr(a) && a->tag == KAI_REAL) ? a->as.r : 0.0;           \
+        double bv = (b && kai_is_ptr(b) && b->tag == KAI_REAL) ? b->as.r : 0.0;           \
+        KaiValue *out = kai_real(fn(av, bv));                            \
+        if (a) kai_decref(a);                                            \
+        if (b) kai_decref(b);                                            \
+        return out;                                                      \
+    }
+
+KAI_LIBM_REAL1(sqrt,  sqrt)
+KAI_LIBM_REAL1(cbrt,  cbrt)
+KAI_LIBM_REAL1(exp,   exp)
+KAI_LIBM_REAL1(log,   log)
+KAI_LIBM_REAL1(log2,  log2)
+KAI_LIBM_REAL1(log10, log10)
+KAI_LIBM_REAL1(sin,   sin)
+KAI_LIBM_REAL1(cos,   cos)
+KAI_LIBM_REAL1(tan,   tan)
+KAI_LIBM_REAL1(asin,  asin)
+KAI_LIBM_REAL1(acos,  acos)
+KAI_LIBM_REAL1(atan,  atan)
+KAI_LIBM_REAL1(sinh,  sinh)
+KAI_LIBM_REAL1(cosh,  cosh)
+KAI_LIBM_REAL1(tanh,  tanh)
+
+KAI_LIBM_REAL2(pow,   pow)
+KAI_LIBM_REAL2(atan2, atan2)
+KAI_LIBM_REAL2(rem,   fmod)
+
+#undef KAI_LIBM_REAL1
+#undef KAI_LIBM_REAL2
+
+/* signum: -1.0 / 0.0 / +1.0; NaN passes through as NaN. */
+static KaiValue *kai_core_real_signum(KaiValue *x) {
+    double r = (kai_is_ptr(x) && x->tag == KAI_REAL) ? x->as.r : 0.0;
+    double s;
+    if (r != r)        s = r;          /* NaN */
+    else if (r > 0.0)  s = 1.0;
+    else if (r < 0.0)  s = -1.0;
+    else               s = 0.0;
+    KaiValue *out = kai_real(s);
+    if (x) kai_decref(x);
+    return out;
+}
+
+static KaiValue *kai_core_real_is_nan(KaiValue *x) {
+    int yes = 0;
+    if (kai_is_ptr(x) && x->tag == KAI_REAL) { double r = x->as.r; yes = (r != r); }
+    KaiValue *out = kai_bool(yes);
+    if (x) kai_decref(x);
+    return out;
+}
+
+static KaiValue *kai_core_real_is_inf(KaiValue *x) {
+    int yes = 0;
+    if (kai_is_ptr(x) && x->tag == KAI_REAL) {
+        double r = x->as.r;
+        yes = (r > 1.7976931348623157e308) || (r < -1.7976931348623157e308);
+    }
+    KaiValue *out = kai_bool(yes);
+    if (x) kai_decref(x);
+    return out;
+}
+
+/* ---------- core: strings ---------- */
+
+static KaiValue *kai_core_string_length(KaiValue *s) {
+    int64_t n = (kai_is_ptr(s) && s->tag == KAI_STR) ? (int64_t) s->as.s.len : 0;
+    KaiValue *r = kai_int(n);
+    if (s) kai_decref(s);
+    return r;
+}
+
+static KaiValue *kai_core_string_concat(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_string_concat(a, b);
+    if (a) kai_decref(a);
+    if (b) kai_decref(b);
+    return r;
+}
+
+static KaiValue *kai_core_string_concat_all(KaiValue *xs) {
+    KaiValue *r = kai_string_concat_all_impl(xs);
+    if (xs) kai_decref(xs);
+    return r;
+}
+
+static KaiValue *kai_core_string_join(KaiValue *xs, KaiValue *sep) {
+    KaiValue *r = kai_string_join_impl(xs, sep);
+    if (xs) kai_decref(xs);
+    if (sep) kai_decref(sep);
+    return r;
+}
+
+/* ---------- core: arrays ---------- */
+
+static KaiValue *kai_core_array_make(KaiValue *n, KaiValue *init) {
+    int64_t len = (kai_is_int(n)) ? kai_intf(n) : 0;
+    /* impl increfs `init` once per slot; consume our own input
+     * refs (n and init) at the boundary. */
+    KaiValue *r = kai_array_make(len, init);
+    if (n) kai_decref(n);
+    if (init) kai_decref(init);
+    return r;
+}
+
+/* Length-0 array of any element type. `kai_array_make(0, NULL)` is
+   sound only because the fill loop never runs at len 0 — NULL is
+   never dereferenced. */
+static KaiValue *kai_core_array_empty(void) {
+    return kai_array_make(0, NULL);
+}
+
+static KaiValue *kai_core_array_length(KaiValue *a) {
+    int64_t len = (kai_is_ptr(a) && a->tag == KAI_ARRAY) ? a->as.arr.len : 0;
+    KaiValue *r = kai_int(len);
+    if (a) kai_decref(a);
+    return r;
+}
+
+/* Borrow variant (issue #1120): read the length without consuming `a`. */
+static KaiValue *kai_core_array_length_borrow(KaiValue *a) {
+    int64_t len = (kai_is_ptr(a) && a->tag == KAI_ARRAY) ? a->as.arr.len : 0;
+    return kai_int(len);
+}
+
+static KaiValue *kai_core_array_get(KaiValue *a, KaiValue *i) {
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    KaiValue *r = kai_array_get_impl(a, idx);
+    if (a) kai_decref(a);
+    if (i) kai_decref(i);
+    return r;
+}
+
+/* Borrow variant (issue #1120): the container is BORROWED, not consumed —
+   the caller kept its ref (Perceus stripped the dup), so we must NOT decref
+   `a`. The element still leaves the array with +1 (it escapes to the
+   caller). `i` is a tagged Int and is not rc-touched. */
+static KaiValue *kai_core_array_get_borrow(KaiValue *a, KaiValue *i) {
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    return kai_array_get_impl(a, idx);
+}
+
+static KaiValue *kai_core_array_set(KaiValue *a, KaiValue *i, KaiValue *v) {
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    /* impl returns kai_incref(a) — a fresh ref the caller owns.
+     * Our input `a` ref is therefore redundant under the callee-
+     * consumes convention; decref it so the array's refcount only
+     * reflects (1) the slot self-ref + (2) the caller's returned
+     * ref, never the borrowed entry. */
+    KaiValue *r = kai_array_set_impl(a, idx, kai_incref(v));
+    if (a) kai_decref(a);
+    if (i) kai_decref(i);
+    if (v) kai_decref(v);
+    return r;
+}
+
+static KaiValue *kai_core_array_grow(KaiValue *a, KaiValue *n, KaiValue *init) {
+    int64_t new_len = (kai_is_int(n)) ? kai_intf(n) : 0;
+    /* impl returns kai_incref(a) — caller owns the new ref. The
+     * input `a` ref is consumed under the callee-consumes
+     * convention. */
+    KaiValue *r = kai_array_grow_impl(a, new_len, init);
+    if (a) kai_decref(a);
+    if (n) kai_decref(n);
+    if (init) kai_decref(init);
+    return r;
+}
+
+/* ---------- core: Vec (pure value vector) ----------
+ *
+ * Callee-consumes at the boundary, like every core fn. The impls
+ * for set/push take the vec ref itself as the ownership transfer:
+ * a last-use caller arrives with rc == 1 (in-place is unobservable),
+ * a caller that kept the vec arrives with rc > 1 (copy-on-write). */
+
+static KaiValue *kai_core_vec_make(KaiValue *n, KaiValue *init) {
+    int64_t len = (kai_is_int(n)) ? kai_intf(n) : 0;
+    KaiValue *r = kai_vec_make(len, init);
+    if (n) kai_decref(n);
+    if (init) kai_decref(init);
+    return r;
+}
+
+static KaiValue *kai_core_vec_empty(void) {
+    return kai_vec_empty();
+}
+
+static KaiValue *kai_core_vec_length(KaiValue *v) {
+    int64_t len = (v && kai_is_ptr(v) && v->tag == KAI_VEC) ? v->as.vec.len : 0;
+    KaiValue *r = kai_int(len);
+    if (v) kai_decref(v);
+    return r;
+}
+
+static KaiValue *kai_core_vec_get(KaiValue *v, KaiValue *i) {
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    KaiValue *r = kai_vec_get_impl(v, idx);
+    if (v) kai_decref(v);
+    if (i) kai_decref(i);
+    return r;
+}
+
+static KaiValue *kai_core_vec_set(KaiValue *v, KaiValue *i, KaiValue *x) {
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    if (i) kai_decref(i);
+    return kai_vec_set_impl(v, idx, x);   /* consumes v and x */
+}
+
+static KaiValue *kai_core_vec_push(KaiValue *v, KaiValue *x) {
+    return kai_vec_push_impl(v, x);       /* consumes v and x */
+}
+
+/* Borrow variants (the array_get_borrow move): the container is
+ * BORROWED — the caller kept its ref (Perceus stripped the dup), so
+ * no decref here. `i` is a tagged Int and is not rc-touched. */
+static KaiValue *kai_core_vec_length_borrow(KaiValue *v) {
+    int64_t len = (v && kai_is_ptr(v) && v->tag == KAI_VEC) ? v->as.vec.len : 0;
+    return kai_int(len);
+}
+
+static KaiValue *kai_core_vec_get_borrow(KaiValue *v, KaiValue *i) {
+    int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    return kai_vec_get_impl(v, idx);
+}
+
+static KaiValue *kai_core_vec_slice(KaiValue *v, KaiValue *start, KaiValue *n) {
+    int64_t s = (kai_is_int(start)) ? kai_intf(start) : 0;
+    int64_t sl = (kai_is_int(n)) ? kai_intf(n) : 0;
+    if (start) kai_decref(start);
+    if (n) kai_decref(n);
+    return kai_vec_slice_impl(v, s, sl);      /* consumes v */
+}
+
+static KaiValue *kai_core_vec_tail_from(KaiValue *v, KaiValue *start) {
+    int64_t s = (kai_is_int(start)) ? kai_intf(start) : 0;
+    if (start) kai_decref(start);
+    return kai_vec_tail_from_impl(v, s);      /* consumes v */
+}
+
+static KaiValue *kai_core_vec_reserve(KaiValue *n) {
+    int64_t cap = (kai_is_int(n)) ? kai_intf(n) : 0;
+    if (n) kai_decref(n);
+    return kai_vec_reserve_impl(cap);
+}
+
+static KaiValue *kai_core_vec_from_list(KaiValue *xs) {
+    return kai_vec_from_list_impl(xs);        /* consumes xs */
+}
+
+/* ---------- core: refs (issue #257) ----------
+ *
+ * `Ref[T]` is a single-cell mutable reference in the `Mutable`
+ * effect (docs/effects-stdlib.md §Mutable). Surface ops:
+ *   ref_make[T](init: T)        : Ref[T]
+ *   ref_get[T](r: Ref[T])       : T
+ *   ref_set[T](r: Ref[T], v: T) : Unit
+ *
+ * Runtime layout: a Ref is a KAI_REF — a single mutable cell with its
+ * own tag (one `KaiValue *cell` field). Distinct from KAI_ARRAY: no
+ * length, no capacity, no indexing — the "a Ref is exactly one slot"
+ * invariant lives in the representation, not just the surface type.
+ * (The earlier length-1 KAI_ARRAY hack from #257 is replaced here.)
+ * RC: a Ref owns one strong reference to its cell. All three ops obey
+ * the callee-consumes convention. */
+static KaiValue *kai_core_ref_make(KaiValue *init) {
+    /* Steal `init` straight into the cell — no incref/decref dance
+     * (the array-backed version did one of each; this is strictly less
+     * RC work, which matters on the hot path of Front A). */
+    KaiValue *r = kai_alloc(KAI_REF);
+    r->as.ref.cell = init;
+    return r;
+}
+
+static KaiValue *kai_core_ref_get(KaiValue *r) {
+    /* Hand back a fresh strong reference to the cell; consume `r`. */
+    KaiValue *v = r ? kai_incref(r->as.ref.cell) : NULL;
+    if (r) kai_decref(r);
+    return v;
+}
+
+static KaiValue *kai_core_ref_set(KaiValue *r, KaiValue *v) {
+    /* Drop the old contents, steal `v` into the cell; consume `r`.
+     * Surface contract is Unit-typed. No bounds check, no index. */
+    if (r) {
+        kai_decref(r->as.ref.cell);
+        r->as.ref.cell = v;       /* steals v */
+        kai_decref(r);
+    } else if (v) {
+        kai_decref(v);
+    }
+    return kai_unit();
+}
+
+/* ---------- core: lists ---------- */
+
+static KaiValue *kai_core_list_length(KaiValue *xs) {
+    int64_t n = 0;
+    KaiValue *p = xs;
+    while (kai_is_ptr(p) && p->tag == KAI_CONS) { n++; p = p->as.cons.tail; }
+    if (kai_is_ptr(p) && p->tag == KAI_RANGE && !kai_range_is_empty(p))
+        n += kai_range_len(p);
+    KaiValue *r = kai_int(n);
+    if (xs) kai_decref(xs);
+    return r;
+}
+
+/* Borrows `xs` (does NOT decref it); the public wrapper decrefs
+ * `xs`/`ys` after the chain is built. Iterative forward build through
+ * a tail slot: one pass, one cell per element, no recursion (a deep
+ * spine must not consume C stack) — and the cursor makes a range
+ * prefix work without materialising `xs` itself. */
+static KaiValue *kai_list_append_borrow(KaiValue *xs, KaiValue *ys) {
+    KaiValue *head = NULL;
+    KaiValue **slot = &head;
+    KaiSeqIt it;
+    kai_seq_it_init(&it, xs);
+    for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it)) {
+        KaiValue *cell = kai_cons(x, NULL);
+        *slot = cell;
+        slot = &cell->as.cons.tail;
+    }
+    *slot = kai_incref(ys);
+    return head;
+}
+
+static KaiValue *kai_core_list_append(KaiValue *xs, KaiValue *ys) {
+    KaiValue *r = kai_list_append_borrow(xs, ys);
+    if (xs) kai_decref(xs);
+    if (ys) kai_decref(ys);
+    return r;
+}
+
+static KaiValue *kai_core_list_reverse(KaiValue *xs) {
+    /* A pure range reverses in O(1): same elements walked from the
+     * last actually-generated one back to `from` with the step
+     * negated. */
+    if (kai_is_ptr(xs) && xs->tag == KAI_RANGE) {
+        KaiValue *r = kai_range_is_empty(xs)
+            ? kai_nil()
+            : kai_range_new(kai_range_last(xs), xs->as.range.from,
+                            (int64_t) (0 - (uint64_t) xs->as.range.step));
+        kai_decref(xs);
+        return r;
+    }
+    KaiValue *acc = kai_nil();
+    KaiSeqIt it;
+    kai_seq_it_init(&it, xs);
+    for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it))
+        acc = kai_cons(x, acc);
+    if (xs) kai_decref(xs);
+    return acc;
+}
+
+/* ---------- core: higher order ---------- */
+/*
+ * Iterative refactor (Perceus Tier 2 part 3, 2026-04-29). Pre-flip
+ * these were recursive over `xs->as.cons.tail`, which forced the
+ * helpers to *borrow* `xs` (the recursion holds aliased pointers
+ * to every cell while the closure runs). Now they walk iteratively
+ * with `KaiValue *p = xs; p = p->as.cons.tail;` so the entire
+ * cons-chain stays alive under `xs`'s single reference until the
+ * helper exits, and we can decref `xs` once at the end.
+ *
+ * kai_apply contract under m5.x flip: every arg slot holds an OWNED
+ * reference that the callee consumes (the closure body is perceus-
+ * compiled and decrefs each arg through normal use). The helpers
+ * `kai_incref(p->as.cons.head)` to give the closure its own
+ * ownership of each element while the cons cell stays alive under
+ * `xs`. `kai_apply` itself does NOT consume `f` — the helper does
+ * that once, post-loop.
+ *
+ * `_map` / `_filter` build their result reversed (each iteration
+ * cons-prepends) and call `kai_core_list_reverse` once to
+ * restore order. `list_reverse` consumes its arg, so the
+ * intermediate reversed list is freed in the same step that
+ * produces the final list — no extra retention.
+ */
+
+static KaiValue *kai_core_map(KaiValue *xs, KaiValue *f) {
+    KaiValue *acc = kai_nil();
+    KaiSeqIt it;
+    kai_seq_it_init(&it, xs);
+    for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it)) {
+        /* kai_apply consumes (#298): x is owned, f incref'd per iter. */
+        KaiValue *head = kai_apply(kai_incref(f), 1, &x);
+        acc = kai_cons(head, acc);
+    }
+    KaiValue *result = kai_core_list_reverse(acc);  /* consumes acc */
+    if (xs) kai_decref(xs);
+    if (f)  kai_decref(f);
+    return result;
+}
+
+/* issue #201: runtime backing for the flat-map-pipe operator (`||`).
+ * Mirrors `kai_core_map` but each `f(elem)` produces a list that
+ * gets cons-prepended onto the reversed accumulator; the per-element
+ * piece is decref'd in the same step. The final reverse + decref loop
+ * matches `_map`'s ownership story so RC stays balanced regardless of
+ * the input shape. Empty pieces are a no-op for the inner loop.
+ */
+static KaiValue *kai_core_flat_map(KaiValue *xs, KaiValue *f) {
+    KaiValue *acc = kai_nil();
+    KaiSeqIt it;
+    kai_seq_it_init(&it, xs);
+    for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it)) {
+        /* kai_apply consumes (#298): x is owned, f incref'd per iter. */
+        KaiValue *piece = kai_apply(kai_incref(f), 1, &x);
+        /* Reverse `piece` into `acc` (which is in reverse order); the
+         * final single reverse restores element order. `piece` may
+         * itself be a range — the cursor covers it. */
+        KaiSeqIt qi;
+        kai_seq_it_init(&qi, piece);
+        for (KaiValue *q = kai_seq_it_next(&qi); q; q = kai_seq_it_next(&qi))
+            acc = kai_cons(q, acc);
+        if (piece) kai_decref(piece);
+    }
+    KaiValue *result = kai_core_list_reverse(acc);  /* consumes acc */
+    if (xs) kai_decref(xs);
+    if (f)  kai_decref(f);
+    return result;
+}
+
+static KaiValue *kai_core_filter(KaiValue *xs, KaiValue *pred) {
+    KaiValue *acc = kai_nil();
+    KaiSeqIt it;
+    kai_seq_it_init(&it, xs);
+    for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it)) {
+        /* kai_apply consumes (#298): the predicate gets its own ref of
+         * x; the kept element reuses the cursor's owned ref. */
+        KaiValue *arg0 = kai_incref(x);
+        KaiValue *keep = kai_apply(kai_incref(pred), 1, &arg0);
+        int yes = kai_op_truthy(keep);
+        kai_decref(keep);
+        if (yes) acc = kai_cons(x, acc);
+        else     kai_decref(x);
+    }
+    KaiValue *result = kai_core_list_reverse(acc);  /* consumes acc */
+    if (xs)   kai_decref(xs);
+    if (pred) kai_decref(pred);
+    return result;
+}
+
+static KaiValue *kai_core_reduce(KaiValue *xs, KaiValue *init, KaiValue *f) {
+    /* acc starts as the caller's `init` ref (transferred). Each
+     * iteration hands acc to the closure (which consumes it) and
+     * receives a freshly-owned `next` back. If `xs` is empty we
+     * return init unchanged — its single ref flows out to the
+     * caller. A range input runs entirely through the cursor: no cons
+     * cell is ever built. */
+    KaiValue *acc = init;
+    KaiSeqIt it;
+    kai_seq_it_init(&it, xs);
+    for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it)) {
+        KaiValue *args[2];
+        args[0] = acc;                              /* transfer to closure */
+        args[1] = x;                                /* closure consumes */
+        /* kai_apply consumes (#298): incref f for each iter. */
+        acc = kai_apply(kai_incref(f), 2, args);    /* closure produces fresh acc */
+    }
+    if (xs) kai_decref(xs);
+    if (f)  kai_decref(f);
+    return acc;
+}
+
+static KaiValue *kai_core_each(KaiValue *xs, KaiValue *f) {
+    KaiSeqIt it;
+    kai_seq_it_init(&it, xs);
+    for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it)) {
+        /* kai_apply consumes (#298): x is owned, f incref'd per iter. */
+        KaiValue *r = kai_apply(kai_incref(f), 1, &x);
+        kai_decref(r);
+    }
+    if (xs) kai_decref(xs);
+    if (f)  kai_decref(f);
+    return kai_unit();
+}
+
+/* ---------- binary and unary operators ---------- */
+/*
+ * Linear-consumption primitives (m5.x-flip Phase 3, 2026-04-28):
+ * each op reads ALL relevant fields of its arguments BEFORE decref'ing,
+ * then returns a freshly-allocated result. Aliasing-safe: `kai_op_eq_v(x, x)`
+ * decrefs `a` and `b` separately, but the read-then-decref ordering means
+ * both reads complete on a still-alive value. This pairs with the dup
+ * pass + exit drops + producer-side incref-on-extract (Steps A + B) so
+ * every value is released exactly once. NOT flipped: `kai_op_field` (already
+ * increfs its return; introspection rather than consumer), `kai_op_eq` (C-int
+ * returning, used inside non-consuming match tests), `kai_apply` (closure
+ * invocation; lifecycle managed at the call lowering).
+ */
+
+/* Int add, sub, and mul compute in uint64_t and cast back. kaikai's Int is a
+ * wrapping two's-complement int64_t by design (CLAUDE.md Tier 1 + the
+ * Int contract in docs); the polynomial/FNV hash mixing in
+ * stdlib/protocols.kai relies on the wrap. Signed overflow is UB in
+ * C99 (6.5) even when the hardware wraps, so doing the math directly
+ * on int64_t trips `-fsanitize=undefined` (tier1-asan) the moment a
+ * value overflows — which `impl Hash for Real` makes trivial (a
+ * Real's bit-cast is a large Int, and `acc * 31` overflows). The
+ * unsigned compute is well-defined modular arithmetic (6.3.1.3) and,
+ * on every target kaikai supports (two's-complement clang/gcc),
+ * produces the byte-identical result the signed form did — so this
+ * silences the UB without changing any emitted output. Division and
+ * comparison stay signed (their overflow is not part of the contract).
+ */
+/* Fixed-width boxed arithmetic (numeric lane A). `+`/`-`/`*` over two
+ * same-tag fixed-width boxes land here on both backends. Each computes in
+ * the unsigned of the width (defined two's-complement wrap) and re-boxes.
+ * Returns NULL when the pair is not a matching fixed-width pair, so the
+ * caller falls through to its Int/Real path. Byte also has a raw path;
+ * this arm is its boxed border (a boxed operand keeps the binop boxed). */
+static KaiValue *kai_fixed_arith(KaiValue *a, KaiValue *b, char op) {
+    if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return NULL;
+    switch ((KaiTag) a->tag) {
+        case KAI_BYTE: { uint8_t x = a->as.byte_val, y = b->as.byte_val;
+            uint8_t r = op == '+' ? (uint8_t)(x + y) : op == '-' ? (uint8_t)(x - y) : (uint8_t)(x * y); return kai_byte(r); }
+        case KAI_INT32: { uint32_t x = (uint32_t) a->as.i32, y = (uint32_t) b->as.i32;
+            uint32_t r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_int32((int32_t) r); }
+        case KAI_UINT32: { uint32_t x = a->as.u32, y = b->as.u32;
+            uint32_t r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_uint32(r); }
+        case KAI_UINT64: { uint64_t x = a->as.u64, y = b->as.u64;
+            uint64_t r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_uint64(r); }
+        case KAI_INT128: { unsigned __int128 x = (unsigned __int128) kai_i128_load(a), y = (unsigned __int128) kai_i128_load(b);
+            unsigned __int128 r = op == '+' ? x + y : op == '-' ? x - y : x * y; return kai_int128((__int128) r); }
+        default: return NULL;
+    }
+}
+
+/* Division for two same-tag fixed-width boxes. Unlike the wrapping
+ * add/sub/mul, the result depends on signedness, so each width divides
+ * in its own signed/unsigned domain (truncated toward zero, C
+ * semantics). A zero divisor aborts. NULL on a non-fixed-width pair. */
+static KaiValue *kai_fixed_div(KaiValue *a, KaiValue *b) {
+    if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return NULL;
+    switch ((KaiTag) a->tag) {
+        case KAI_BYTE:   { uint8_t  y = b->as.byte_val; if (y == 0) { kai_trap_abort("divide by zero"); } return kai_byte((uint8_t)(a->as.byte_val / y)); }
+        /* i64 domain so INT32_MIN / -1 wraps back to INT32_MIN on the
+         * truncating narrow, matching the raw widen-divide-narrow path. */
+        case KAI_INT32:  { int32_t  y = b->as.i32;  if (y == 0) { kai_trap_abort("divide by zero"); } return kai_int32((int32_t)((int64_t) a->as.i32 / (int64_t) y)); }
+        case KAI_UINT32: { uint32_t y = b->as.u32;  if (y == 0) { kai_trap_abort("divide by zero"); } return kai_uint32(a->as.u32 / y); }
+        case KAI_UINT64: { uint64_t y = b->as.u64;  if (y == 0) { kai_trap_abort("divide by zero"); } return kai_uint64(a->as.u64 / y); }
+        /* `/ -1` negates in the unsigned domain: I128_MIN / -1 is UB direct. */
+        case KAI_INT128: { __int128 y = kai_i128_load(b); if (y == 0) { kai_trap_abort("divide by zero"); } return kai_int128(y == -1 ? (__int128)(0 - (unsigned __int128) kai_i128_load(a)) : kai_i128_load(a) / y); }
+        default: return NULL;
+    }
+}
+
+static KaiValue *kai_op_add(KaiValue *a, KaiValue *b) {
+    KaiValue *r;
+    if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) + (uint64_t) kai_intf(b)));
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r + b->as.r);
+    else if ((r = kai_fixed_arith(a, b, '+')) != NULL) { /* boxed fixed-width */ }
+    else { fprintf(stderr, "kai: type mismatch in +\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
+static KaiValue *kai_op_sub(KaiValue *a, KaiValue *b) {
+    KaiValue *r;
+    if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) - (uint64_t) kai_intf(b)));
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r - b->as.r);
+    else if ((r = kai_fixed_arith(a, b, '-')) != NULL) { /* boxed fixed-width */ }
+    else { fprintf(stderr, "kai: type mismatch in -\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
+static KaiValue *kai_op_mul(KaiValue *a, KaiValue *b) {
+    KaiValue *r;
+    if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) * (uint64_t) kai_intf(b)));
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r * b->as.r);
+    else if ((r = kai_fixed_arith(a, b, '*')) != NULL) { /* boxed fixed-width */ }
+    else { fprintf(stderr, "kai: type mismatch in *\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
+static KaiValue *kai_op_div(KaiValue *a, KaiValue *b) {
+    KaiValue *r;
+    if (kai_is_int(a) && kai_is_int(b)) {
+        /* Same trap discipline as the raw kai_idiv_chk: a boxed and a
+         * raw `/` on the same operands must agree. */
+        if (kai_intf(b) == 0) { kai_trap_abort("divide by zero"); }
+        if (kai_intf(a) == INT64_MIN && kai_intf(b) == -1) { kai_trap_abort("divide overflow"); }
+        r = kai_int(kai_intf(a) / kai_intf(b));
+    } else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) {
+        r = kai_real(a->as.r / b->as.r);
+    } else if ((r = kai_fixed_div(a, b)) != NULL) { /* boxed fixed-width */ }
+    else { fprintf(stderr, "kai: type mismatch in /\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
+static KaiValue *kai_op_idiv(KaiValue *a, KaiValue *b) {
+    int64_t av = 0, bv = 0;
+    if      (kai_is_int(a))  av = kai_intf(a);
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL) av = (int64_t) a->as.r;
+    else { fprintf(stderr, "kai: type mismatch in //\n"); exit(1); }
+    if      (kai_is_int(b))  bv = kai_intf(b);
+    else if (kai_is_ptr(b) && b->tag == KAI_REAL) bv = (int64_t) b->as.r;
+    else { fprintf(stderr, "kai: type mismatch in //\n"); exit(1); }
+    if (bv == 0) { kai_trap_abort("divide by zero"); }
+    KaiValue *r = kai_int(av / bv);
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
+static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
+    KaiValue *r;
+    if (kai_is_int(a) && kai_is_int(b)) {
+        if (kai_intf(b) == 0) { kai_trap_abort("mod by zero"); }
+        if (kai_intf(a) == INT64_MIN && kai_intf(b) == -1) { kai_trap_abort("divide overflow"); }
+        r = kai_int(kai_intf(a) % kai_intf(b));
+    } else if (kai_is_ptr(a) && a->tag == KAI_BYTE && kai_is_ptr(b) && b->tag == KAI_BYTE) {
+        if (b->as.byte_val == 0) { kai_trap_abort("mod by zero"); }
+        r = kai_byte((uint8_t)(a->as.byte_val % b->as.byte_val));
+    } else if (kai_is_ptr(a) && a->tag == KAI_INT32 && kai_is_ptr(b) && b->tag == KAI_INT32) {
+        if (b->as.i32 == 0) { kai_trap_abort("mod by zero"); }
+        /* i64 domain so INT32_MIN % -1 is 0, matching the raw widen path. */
+        r = kai_int32((int32_t)((int64_t) a->as.i32 % (int64_t) b->as.i32));
+    } else if (kai_is_ptr(a) && a->tag == KAI_UINT32 && kai_is_ptr(b) && b->tag == KAI_UINT32) {
+        if (b->as.u32 == 0) { kai_trap_abort("mod by zero"); }
+        r = kai_uint32(a->as.u32 % b->as.u32);
+    } else if (kai_is_ptr(a) && a->tag == KAI_UINT64 && kai_is_ptr(b) && b->tag == KAI_UINT64) {
+        if (b->as.u64 == 0) { kai_trap_abort("mod by zero"); }
+        r = kai_uint64(a->as.u64 % b->as.u64);
+    } else if (kai_is_ptr(a) && a->tag == KAI_INT128 && kai_is_ptr(b) && b->tag == KAI_INT128) {
+        __int128 y = kai_i128_load(b); if (y == 0) { kai_trap_abort("mod by zero"); }
+        /* `x % -1` is 0 by definition; the direct op is UB at I128_MIN. */
+        r = kai_int128(y == -1 ? (__int128) 0 : kai_i128_load(a) % y);
+    } else { fprintf(stderr, "kai: type mismatch in %%\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
+/* Raw (unboxed) i64 `/` and `%` with the same trap discipline as the boxed
+ * path and array indexing: a zero divisor, or the one signed overflow
+ * `INT64_MIN / -1` (whose two's-complement result is unrepresentable), is a
+ * clean `kai_trap_abort`, not the hardware UB `sdiv`/`srem` would invoke.
+ * Both backends route raw Int div/mod here so the fault is deterministic
+ * across them. */
+static int64_t kai_idiv_chk(int64_t a, int64_t b) {
+    if (b == 0) { kai_trap_abort("divide by zero"); }
+    if (a == INT64_MIN && b == -1) { kai_trap_abort("divide overflow"); }
+    return a / b;
+}
+static int64_t kai_imod_chk(int64_t a, int64_t b) {
+    if (b == 0) { kai_trap_abort("mod by zero"); }
+    if (a == INT64_MIN && b == -1) { kai_trap_abort("divide overflow"); }
+    return a % b;
+}
+
+/* Unsigned `/` and `%` with the zero-divisor trap. UInt32/UInt64 widen
+ * their operands into u64 and divide unsigned; there is no INT_MIN/-1
+ * overflow in the unsigned domain, so only the zero divisor traps. */
+static uint64_t kai_udiv_chk(uint64_t a, uint64_t b) {
+    if (b == 0) { kai_trap_abort("divide by zero"); }
+    return a / b;
+}
+static uint64_t kai_umod_chk(uint64_t a, uint64_t b) {
+    if (b == 0) { kai_trap_abort("mod by zero"); }
+    return a % b;
+}
+
+/* Less-than for two same-tag fixed-width boxes; signedness per the
+ * width. Sets `*out` and returns 1 on a match, 0 otherwise. */
+static int kai_fixed_lt(KaiValue *a, KaiValue *b, int *out) {
+    if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return 0;
+    switch ((KaiTag) a->tag) {
+        case KAI_BYTE:   *out = a->as.byte_val < b->as.byte_val; return 1;
+        case KAI_INT32:  *out = a->as.i32  < b->as.i32;  return 1;
+        case KAI_UINT32: *out = a->as.u32  < b->as.u32;  return 1;
+        case KAI_UINT64: *out = a->as.u64  < b->as.u64;  return 1;
+        case KAI_INT128: *out = kai_i128_load(a) < kai_i128_load(b); return 1;
+        default: return 0;
+    }
+}
+
+/* Greater-than for two same-tag fixed-width boxes; signedness per the
+ * width. Mirror of `kai_fixed_lt`. */
+static int kai_fixed_gt(KaiValue *a, KaiValue *b, int *out) {
+    if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return 0;
+    switch ((KaiTag) a->tag) {
+        case KAI_BYTE:   *out = a->as.byte_val > b->as.byte_val; return 1;
+        case KAI_INT32:  *out = a->as.i32  > b->as.i32;  return 1;
+        case KAI_UINT32: *out = a->as.u32  > b->as.u32;  return 1;
+        case KAI_UINT64: *out = a->as.u64  > b->as.u64;  return 1;
+        case KAI_INT128: *out = kai_i128_load(a) > kai_i128_load(b); return 1;
+        default: return 0;
+    }
+}
+
+static KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
+    KaiValue *r;
+    int _flt;
+    if (kai_is_int(a)  && kai_is_int(b))       r = kai_bool(kai_intf(a) < kai_intf(b));
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_bool(a->as.r < b->as.r);
+    else if (kai_is_ptr(a) && a->tag == KAI_CHAR && kai_is_ptr(b) && b->tag == KAI_CHAR) r = kai_bool(a->as.c < b->as.c);
+    else if (kai_fixed_lt(a, b, &_flt)) r = kai_bool(_flt);
+    else if (kai_is_ptr(a) && a->tag == KAI_STR  && kai_is_ptr(b) && b->tag == KAI_STR) {
+        size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
+        int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
+        if (c != 0) r = kai_bool(c < 0);
+        else        r = kai_bool(a->as.s.len < b->as.s.len);
+    } else {
+        /* Ord dispatch: route to custom impl Ord.cmp when present (root and
+         * nested). kai_op_lt CONSUMES a/b, so incref for the impl (which also
+         * consumes) AND decref a/b at the end. cmp result < 0 means a < b. */
+        int32_t _o_head = kai_head_tag(a);
+        void *_o_fn = kai_lookup_impl(KAI_PROTO_ORD, KAI_OP_ORD_CMP, _o_head);
+        if (_o_fn) {
+            kai_incref(a); kai_incref(b);
+            KaiValue *_o_c = ((KaiValue *(*)(KaiValue *, KaiValue *)) _o_fn)(a, b);
+            int _o_r = kai_intf(_o_c) < 0;
+            kai_decref(_o_c);
+            kai_decref(a); kai_decref(b);
+            return kai_bool(_o_r);
+        }
+        fprintf(stderr, "kai: type mismatch in <\n"); exit(1);
+    }
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
+static KaiValue *kai_op_gt(KaiValue *a, KaiValue *b) {
+    KaiValue *r;
+    int _fgt;
+    if (kai_is_int(a)  && kai_is_int(b))       r = kai_bool(kai_intf(a) > kai_intf(b));
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_bool(a->as.r > b->as.r);
+    else if (kai_is_ptr(a) && a->tag == KAI_CHAR && kai_is_ptr(b) && b->tag == KAI_CHAR) r = kai_bool(a->as.c > b->as.c);
+    else if (kai_fixed_gt(a, b, &_fgt)) r = kai_bool(_fgt);
+    else if (kai_is_ptr(a) && a->tag == KAI_STR  && kai_is_ptr(b) && b->tag == KAI_STR) {
+        size_t n = a->as.s.len < b->as.s.len ? a->as.s.len : b->as.s.len;
+        int c = memcmp(a->as.s.bytes, b->as.s.bytes, n);
+        if (c != 0) r = kai_bool(c > 0);
+        else        r = kai_bool(a->as.s.len > b->as.s.len);
+    } else {
+        /* Ord dispatch (mirror of kai_op_lt). cmp result > 0 means a > b. */
+        int32_t _o_head = kai_head_tag(a);
+        void *_o_fn = kai_lookup_impl(KAI_PROTO_ORD, KAI_OP_ORD_CMP, _o_head);
+        if (_o_fn) {
+            kai_incref(a); kai_incref(b);
+            KaiValue *_o_c = ((KaiValue *(*)(KaiValue *, KaiValue *)) _o_fn)(a, b);
+            int _o_r = kai_intf(_o_c) > 0;
+            kai_decref(_o_c);
+            kai_decref(a); kai_decref(b);
+            return kai_bool(_o_r);
+        }
+        fprintf(stderr, "kai: type mismatch in >\n"); exit(1);
+    }
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
+/* `kai_op_le` and `kai_op_ge` are now layered over the consuming `kai_op_gt` /
+ * `kai_op_lt`. The inner call consumes `a` and `b` already; we must not
+ * decref them again here. The intermediate bool result is consumed
+ * locally to read the inverted truth value. */
+static KaiValue *kai_op_le(KaiValue *a, KaiValue *b) {
+    KaiValue *g = kai_op_gt(a, b);
+    KaiValue *r = kai_bool(!g->as.b);
+    kai_decref(g);
+    return r;
+}
+
+static KaiValue *kai_op_ge(KaiValue *a, KaiValue *b) {
+    KaiValue *l = kai_op_lt(a, b);
+    KaiValue *r = kai_bool(!l->as.b);
+    kai_decref(l);
+    return r;
+}
+
+/* `kai_op_eq` does NOT consume — it is the C-int returning equality used by
+ * pattern tests and other non-consuming sites. `kai_op_eq_v` / `kai_op_ne_v`
+ * are the value-level wrappers used for `==` / `!=` expressions; those
+ * DO consume per the m5.x flip. Self-aliasing (`kai_op_eq_v(x, x)`) is safe
+ * because `kai_op_eq` reads both pointers before either decref runs.  */
+static KaiValue *kai_op_eq_v(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_bool(kai_op_eq(a, b));
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
+static KaiValue *kai_op_ne_v(KaiValue *a, KaiValue *b) {
+    KaiValue *r = kai_bool(!kai_op_eq(a, b));
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
+/* `kai_op_pow_int(a, b)` — integer-exponent power for the `^` operator.
+ * Lives in runtime so the operator works without requiring the
+ * Numeric protocol in scope. The unit of a dimensioned operand is
+ * metadata on the type only; the runtime value carries no unit, so
+ * the same code path serves `Real` and `Real<u>` alike.
+ *
+ * For Int: negative exponents truncate to 0 (no integer reciprocal).
+ * For Real: negative exponents compute `1.0 / base^|e|` so unit
+ * lifting at the type level (`r : Real<m>`, `r ^ -1 : Real<m^-1>`)
+ * matches a meaningful runtime result. This is intentionally more
+ * lenient than the `Numeric.pow_int` stdlib impl, which clamps
+ * negatives to 0; the discrepancy is acceptable because `^`
+ * dispatches through this helper, never through the protocol. */
+static KaiValue *kai_op_pow_int(KaiValue *a, KaiValue *b) {
+    if (!kai_is_int(b)) {
+        fprintf(stderr, "kai: type mismatch in ^ (exponent must be Int)\n"); exit(1);
+    }
+    int64_t e = kai_intf(b);
+    KaiValue *r;
+    if (kai_is_int(a)) {
+        if (e < 0) { r = kai_int(0); }
+        else {
+            /* Unsigned accumulate: an overflowing power wraps like `*`. */
+            uint64_t base = (uint64_t) kai_intf(a);
+            uint64_t acc = 1;
+            for (int64_t i = 0; i < e; i++) { acc *= base; }
+            r = kai_int((int64_t) acc);
+        }
+    } else if (kai_is_ptr(a) && a->tag == KAI_REAL) {
+        double base = a->as.r;
+        int64_t k = e < 0 ? -e : e;
+        double acc = 1.0;
+        for (int64_t i = 0; i < k; i++) { acc *= base; }
+        if (e < 0) { acc = 1.0 / acc; }
+        r = kai_real(acc);
+    } else { fprintf(stderr, "kai: type mismatch in ^\n"); exit(1); }
+    kai_decref(a); kai_decref(b);
+    return r;
+}
+
+static KaiValue *kai_op_neg(KaiValue *a) {
+    KaiValue *r;
+    if (kai_is_int(a))       r = kai_int((int64_t)(0 - (uint64_t) kai_intf(a)));
+    else if (kai_is_ptr(a) && a->tag == KAI_REAL) r = kai_real(-a->as.r);
+    else if (kai_is_ptr(a) && a->tag == KAI_INT32)  r = kai_int32((int32_t)(-(uint32_t) a->as.i32));
+    else if (kai_is_ptr(a) && a->tag == KAI_UINT32) r = kai_uint32((uint32_t)(-a->as.u32));
+    else if (kai_is_ptr(a) && a->tag == KAI_UINT64) r = kai_uint64((uint64_t)(-a->as.u64));
+    else if (kai_is_ptr(a) && a->tag == KAI_INT128) r = kai_int128((__int128)(-(unsigned __int128) kai_i128_load(a)));
+    else { fprintf(stderr, "kai: type mismatch in unary -\n"); exit(1); }
+    kai_decref(a);
+    return r;
+}
+
+static KaiValue *kai_op_boolnot(KaiValue *a) {
+    KaiValue *r;
+    if (a->tag == KAI_BOOL) r = kai_bool(!a->as.b);
+    else { fprintf(stderr, "kai: type mismatch in `not`\n"); exit(1); }
+    kai_decref(a);
+    return r;
+}
+
+/* `kai_op_truthy` is a non-consuming C-int predicate used inside
+ * `if (kai_op_truthy(...))`, ternary lowerings of `if`/`and`/`or`, and
+ * `kai_assert_check`. It is intentionally NOT flipped under the
+ * m5.x runtime flip: the LLVM short-circuit lowering's phi node
+ * returns `lhs` itself in the early-exit branch, so consuming `lhs`
+ * inside the truthiness probe would alias-free a value still
+ * referenced downstream. The emitted-C path leaks the temporary
+ * argument; tracked in issue #82 as future cleanup (predicate
+ * consumes + emit-side incref before short-circuit). */
+static int kai_op_truthy(KaiValue *v) {
+    return v && v->tag == KAI_BOOL && v->as.b;
+}
+
+/* ---------- range construction ---------- */
+
+/* O(1): the list is represented by its generator (KAI_RANGE), never
+ * built. Consumers iterate it; match borders normalise one cell at a
+ * time (kai_seq_norm). */
+static KaiValue *kai_range(KaiValue *from, KaiValue *to) {
+    return kai_range_new(kai_intf(from), kai_intf(to), 1);
+}
+
+static KaiValue *kai_range_step(KaiValue *from, KaiValue *to, KaiValue *step) {
+    int64_t s = kai_intf(step);
+    if (s == 0) { fprintf(stderr, "kai: zero step in range\n"); exit(1); }
+    return kai_range_new(kai_intf(from), kai_intf(to), s);
+}
+
+/* ---------- core: args (set by generated `int main`) ---------- */
+
+/* Argv snapshot is written once by the generated main (the owner TU) and
+ * read by os_args()/exe_name() anywhere, so it is shared — a per-TU copy
+ * would leave every non-owner TU reading a NULL argv. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int    kai_g_argc;
+extern char **kai_g_argv;
+#  if defined(KAI_RUNTIME_OWNER)
+int    kai_g_argc = 0;
+char **kai_g_argv = NULL;
+#  endif
+#else
+static int          kai_g_argc = 0;
+static char       **kai_g_argv = NULL;
+#endif
+
+static void kai_set_args(int argc, char **argv) {
+    /* Anchor this thread's active fiber to its own root fiber before any
+     * fiber runs (the static initializer cannot, both being _Thread_local). */
+    kai_active_fiber_anchor();
+    kai_g_argc = argc;
+    kai_g_argv = argv;
+    /* Issue #678: libc defaults stdout to fully-buffered when the fd
+     * is a pipe or regular file. Combined with the runtime's reliance
+     * on atexit-driven flush (which signal-driven termination skips),
+     * that loses every Stdout.print issued before the buffer fills or
+     * before a clean exit. Match Go / Rust / Python -u semantics by
+     * forcing line-buffering at process entry. One syscall at startup;
+     * TTY stdout is already line-buffered so this is a no-op there.
+     * stderr is unbuffered by default — no change needed. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    /* Lazy registration: kai_set_args runs once at program start from
+       the emitted main wrapper. atexit fires only when the env var
+       gates a report, so the side effect is harmless when tracing is
+       off. Keeps the emitter unchanged — no new emit site needed. */
+    kai_rc_register_once();
+    kai_rc_ledger_register();
+#ifdef KAI_TRACE_RC
+    kai_rc_strict_register_once();
+#endif
+}
+
+/* `main`'s value as the process exit status. An Int return is the status
+ * (POSIX keeps the low 8 bits); any other return type — Unit, String — is 0.
+ * `main` is excluded from unboxing (classify_unbox_sig), so the result is
+ * always a KaiValue* here. Both backends' entry points share this rule.
+ * Returning the code lets libc run the full exit path; unlike
+ * `os.process.exit`'s _exit(2), buffered stdio is still flushed. */
+static int kai_main_exit_status(KaiValue *result) {
+    return kai_is_int(result) ? (int) (kai_intf(result) & 0xff) : 0;
+}
+
+static KaiValue *kai_core_args(void) {
+    KaiValue *acc = kai_nil();
+    for (int i = kai_g_argc - 1; i >= 1; --i) {
+        acc = kai_cons(kai_str(kai_g_argv[i]), acc);
+    }
+    return acc;
+}
+
+/* Issue #127: argv[0] as a kaikai String. Mirrors `kai_core_args`
+ * in routing through the `kai_g_argv` snapshot installed by
+ * `kai_set_args` at process entry. Returns the empty string when
+ * argv was never captured (unit tests linking the runtime without
+ * a generated `int main` wrapper) — leaves the surface total. */
+static KaiValue *kai_core_program_name(void) {
+    if (kai_g_argv == NULL || kai_g_argv[0] == NULL) return kai_str("");
+    return kai_str(kai_g_argv[0]);
+}
+
+/* Hanga Roa core loader: the path where `core/` lives on this
+ * system, hard-coded at compile time via -DKAI_STDLIB_PATH=... in
+ * stage1/stage2 Makefiles. Defaults to "stdlib" (relative to the
+ * caller's cwd) when the macro is unset, which keeps in-tree
+ * unit harnesses happy without the macro. Surface to kaikai code
+ * via the `kai_stdlib_path` builtin. */
+#ifndef KAI_STDLIB_PATH
+#define KAI_STDLIB_PATH "stdlib"
+#endif
+/* The compile-time `KAI_STDLIB_PATH` macro is set by stage{1,2}/Makefile
+ * to `$(abspath ../stdlib)` — an absolute path to the checkout's stdlib
+ * directory. After install (brew, tarball, etc.) that path no longer
+ * exists, so the env-var override `KAIKAI_STDLIB_PATH` takes precedence
+ * when set. `bin/kai` exports this var pointing at the installed
+ * `share/kaikai/stdlib` so users get a working compiler without
+ * rebuilding from source. Direct `kaic2` invocations from a source
+ * checkout leave the env unset and fall back to the macro.
+ */
+static KaiValue *kai_core_stdlib_path(void) {
+    const char *env = getenv("KAIKAI_STDLIB_PATH");
+    if (env && *env) {
+        return kai_str(env);
+    }
+    return kai_str(KAI_STDLIB_PATH);
+}
+
+/* Canonicalise a filesystem path via realpath(3). Returns the input
+ * unchanged when the path does not yet exist (caller's "first_try"
+ * candidate path before stat), so the dedup logic at the load site
+ * stays correct: only paths that resolve to real files get folded
+ * to their canonical form. Backed by POSIX realpath; falls back to
+ * the input string when realpath fails (errno != 0). */
+static KaiValue *kai_core_abspath(KaiValue *path) {
+    if (!path || path->tag != KAI_STR) {
+        return path;
+    }
+    char pbuf[KAI_PATH_BUF];
+    size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+    memcpy(pbuf, path->as.s.bytes, plen);
+    pbuf[plen] = '\0';
+    char resolved[KAI_PATH_BUF];
+    if (realpath(pbuf, resolved) == NULL) {
+        return path;
+    }
+    return kai_str_dyn(resolved);
+}
+
+/* ---------- core: mailbox runtime (m8 #7) ---------- */
+
+/* User code reaches the mailbox runtime through these core
+ * functions. They are wrapped in stdlib/actor.kai's `with_mailbox`
+ * helper, which also installs the user-facing Actor[Msg] handler.
+ * The polymorphic surface uses Nothing → TyAny so a single set of
+ * runtime entries serves every Msg type. */
+
+static KaiValue *kai_core_mailbox_alloc(void) {
+    return kai_pid_value(kai_mailbox_alloc());
+}
+
+/* Tier 2 spawn_actor — allocate a mailbox without stamping any
+ * owner. Pair with kai_core_mailbox_assign_owner to wire the
+ * mailbox onto the spawned fiber before its body runs. */
+static KaiValue *kai_core_mailbox_alloc_unowned(void) {
+    return kai_pid_value(kai_mailbox_alloc_unowned());
+}
+
+/* Tier 2 spawn_actor — set `pid->as.mb->owner_fiber = fiber->as.fib`
+ * AND `fiber->as.fib->mailbox = pid->as.mb`. Retained for callers that
+ * already hold a spawned Fiber; spawn_actor itself uses
+ * kai_core_spawn_actor_fiber, which stamps the owner before the fiber is
+ * enqueued so Monitor/Link resolve it synchronously with no race. */
+static KaiValue *kai_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
+    if (pid && pid->tag == KAI_PID && pid->as.mb &&
+        fiber && fiber->tag == KAI_FIBER && fiber->as.fib) {
+        pid->as.mb->owner_fiber = fiber->as.fib;
+        fiber->as.fib->mailbox  = pid->as.mb;
+    }
+    /* m5.x flip Phase 3 closeout (issue #82): consume input refs. */
+    if (pid)   kai_decref(pid);
+    if (fiber) kai_decref(fiber);
+    return kai_unit();
+}
+
+/* Spawn a fiber for `thunk` and stamp `pid`'s mailbox onto it — owner
+ * wiring and enqueue happen together, before the fiber can be stolen, so
+ * there is no window where the child runs with an unwired mailbox and no
+ * cross-thread write to owner_fiber. Because the stamp completes before
+ * this returns, Monitor/Link in the spawning fiber resolve owner_fiber
+ * synchronously. Consumes `pid` (the caller keeps its own Pid handle). */
+static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMailbox *stamp_mb);
+KAI_SCHED_FN KaiValue *kai_core_spawn_actor_fiber(KaiValue *pid, KaiValue *thunk)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    KaiMailbox *mb = (pid && pid->tag == KAI_PID) ? pid->as.mb : NULL;
+    KaiValue *f = kai_spawn_fiber_stamped(thunk, mb);
+    if (pid) kai_decref(pid);
+    return f;
+}
+#endif
+
+static KaiValue *kai_core_mailbox_alloc_bounded(KaiValue *cap, KaiValue *overflow) {
+    int c = (kai_is_int(cap)) ? (int) kai_intf(cap) : 0;
+    int o = (kai_is_int(overflow)) ? (int) kai_intf(overflow) : 0;
+    KaiValue *r = kai_pid_value(kai_mailbox_alloc_bounded(c, o));
+    /* m5.x flip Phase 3 closeout (issue #82): consume input refs. */
+    if (cap)      kai_decref(cap);
+    if (overflow) kai_decref(overflow);
+    return r;
+}
+
+/* Issue #763 spawn_actor_policy — bounded alloc without stamping an
+ * owner. Pair with kai_core_mailbox_assign_owner, same protocol
+ * as kai_core_mailbox_alloc_unowned. */
+static KaiValue *kai_core_mailbox_alloc_bounded_unowned(KaiValue *cap, KaiValue *overflow) {
+    int c = (kai_is_int(cap)) ? (int) kai_intf(cap) : 0;
+    int o = (kai_is_int(overflow)) ? (int) kai_intf(overflow) : 0;
+    KaiValue *r = kai_pid_value(kai_mailbox_alloc_bounded_unowned(c, o));
+    /* Consume input refs — callee-consumes discipline (issue #82). */
+    if (cap)      kai_decref(cap);
+    if (overflow) kai_decref(overflow);
+    return r;
+}
+
+KAI_SCHED_FN KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    if (!pid || pid->tag != KAI_PID) {
+        fprintf(stderr, "kai: mailbox_send: argument is not a Pid\n");
+        exit(1);
+    }
+    /* A send to an ended mailbox succeeds and the message is dropped: the
+     * sender cannot know whether the receiver is still alive. */
+    KaiMailbox *mb = kai_mailbox_pin(pid);
+    if (!mb) {
+        kai_decref(msg);
+    } else if (kai_nthreads > 1) {
+        /* Copy unconditionally: no point-in-time "same thread?" answer is
+         * sound, since a thief can retarget the receiver's home thread
+         * under a lock the sender does not hold, and a Perceus dup across
+         * the send leaves the sender its own reference to a value stealing
+         * would later share across threads. */
+        KaiValue *copy = kai_deep_copy_cross(msg);
+        kai_decref(msg);
+        kai_mailbox_push_cross_thread(mb, copy);
+    } else {
+        kai_mailbox_push(mb, msg);
+    }
+    if (mb) kai_mailbox_unpin(mb);
+    kai_decref(pid);
+    return kai_unit();
+}
+#endif
+
+KAI_SCHED_FN KaiValue *kai_core_mailbox_recv(KaiValue *pid)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
+        fprintf(stderr, "kai: mailbox_recv: argument is not a Pid\n");
+        exit(1);
+    }
+    /* kai_mailbox_pop returns the stored ref (mailbox transferred its
+     * ownership to the caller). Consume the input `pid` ref so the
+     * helper is callee-consumes-clean. */
+    KaiValue *msg = kai_mailbox_pop(pid->as.mb);
+    kai_decref(pid);
+    return msg;
+}
+#endif
+
+/* Receive within a deadline. `timeout_nanos` is a relative nanosecond
+ * budget; returns `Some(msg)` if a message arrives in time, `None` if
+ * the deadline elapses first. Mirrors `kai_core_mailbox_recv`'s
+ * callee-consumes-clean discipline for the input `pid` ref. */
+KAI_SCHED_FN KaiValue *kai_core_mailbox_recv_timeout(KaiValue *pid, KaiValue *timeout_nanos)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
+        fprintf(stderr, "kai: mailbox_recv_timeout: argument is not a Pid\n");
+        exit(1);
+    }
+    int64_t ns = kai_intf(timeout_nanos);
+    kai_decref(timeout_nanos);
+    KaiValue *msg = kai_mailbox_pop_timeout(pid->as.mb,
+                                            ns < 0 ? 0 : (uint64_t) ns);
+    kai_decref(pid);
+    if (msg) {
+        return kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    }
+    return kai_variant_u(1, "None", 0, 0, NULL);
+}
+#endif
+
+/* Close the mailbox attached to a Pid when its `with_mailbox` /
+ * `spawn_actor` scope exits; the Pid value itself is RC-managed
+ * independently and reads as ended from then on. */
+KAI_SCHED_FN KaiValue *kai_core_mailbox_free(KaiValue *pid)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    if (pid && pid->tag == KAI_PID) {
+        _Atomic int *s = kai_pid_stripe_lock(pid);
+        KaiMailbox *mb = pid->as.mb;
+        pid->as.mb = NULL;
+        kai_pid_stripe_unlock(s);
+        if (mb) kai_mailbox_close(mb);
+    }
+    if (pid) kai_decref(pid);
+    return kai_unit();
+}
+#endif
+
+/* ---------- core: file io ---------- */
+
+static KAI_RC_NOINLINE KaiValue *kai_core_read_file(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("read_file: argument is not a String");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        FILE *fp = fopen(pbuf, "rb");
+        struct stat st;
+        if (!fp) {
+            KaiValue *msg = kai_str("read_file: cannot open file");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        } else if (fstat(fileno(fp), &st) == 0 && S_ISDIR(st.st_mode)) {
+            /* fopen accepts directories; on Linux ext4 ftell(SEEK_END) then
+             * reports the htree EOF sentinel (~2^63), so reject before
+             * sizing the buffer. */
+            fclose(fp);
+            KaiValue *msg = kai_str("read_file: is a directory");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        } else if (fseek(fp, 0, SEEK_END) != 0) {
+            fclose(fp);
+            KaiValue *msg = kai_str("read_file: seek failed");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        } else {
+            long n = ftell(fp);
+            if (n < 0) {
+                fclose(fp);
+                KaiValue *msg = kai_str("read_file: tell failed");
+                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            } else if (fseek(fp, 0, SEEK_SET) != 0) {
+                fclose(fp);
+                KaiValue *msg = kai_str("read_file: rewind failed");
+                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            } else {
+                KaiValue *v = kai_alloc(KAI_STR);
+                v->as.s.len = (size_t) n;
+                kai_heap_charge((size_t) n + 1);
+                v->as.s.bytes = (char *) malloc((size_t) n + 1);
+                if (!v->as.s.bytes) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                size_t got = fread(v->as.s.bytes, 1, (size_t) n, fp);
+                fclose(fp);
+                v->as.s.bytes[got] = '\0';
+                v->as.s.len = got;
+                r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = v}});
+            }
+        }
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+static KaiValue *kai_core_write_file(KaiValue *path, KaiValue *content) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("write_file: path is not a String");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else if (!content || content->tag != KAI_STR) {
+        KaiValue *msg = kai_str("write_file: content is not a String");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        FILE *fp = fopen(pbuf, "wb");
+        if (!fp) {
+            KaiValue *msg = kai_str("write_file: cannot open file");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        } else {
+            size_t wrote = fwrite(content->as.s.bytes, 1, content->as.s.len, fp);
+            fclose(fp);
+            if (wrote != content->as.s.len) {
+                KaiValue *msg = kai_str("write_file: short write");
+                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            } else {
+                KaiValue *u = kai_unit();
+                r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
+            }
+        }
+    }
+    if (path)    kai_decref(path);
+    if (content) kai_decref(content);
+    return r;
+}
+
+/* ---------- core: chunked / streaming file io (issue #771) ----------
+ *
+ * Five primitives behind the new `File` ops `open_read` / `read_chunk` /
+ * `open_write` / `write_chunk` / `close_file`. Unlike the bulk
+ * `read_file` / `write_file` pair these keep an OS file descriptor open
+ * across calls, so the carrier (line surface, #801) can pull a large
+ * file chunk-by-chunk without materialising it. The handle is an opaque
+ * `FileHandle` record `{ fd: Int }` — same shape as the net `Conn`.
+ *
+ * Error register is `Result[_, String]` (Ok first), mirroring
+ * `read_file`. `read_chunk` returns `Ok("")` at EOF (the spec'd
+ * sentinel), never an error. Each primitive consumes its KaiValue *
+ * args linearly, decref'ing before building the result.
+ *
+ * Stage2 boxes small Ints tagged, so the `fd` slot inside a FileHandle
+ * record is read with kai_is_int / kai_intf — NEVER `->tag` / `->as.i`,
+ * which segfault on a tagged 0x1. String args stay `->tag == KAI_STR`:
+ * a String is always a heap pointer, never a tagged Int. */
+
+/* Build a FileHandle record `{ fd }`. Field-name string matches the
+ * kaikai-side `type FileHandle = { fd: Int }` decl
+ * (builtin_filehandle_decl) — kai_op_field reads by strcmp. */
+static KaiValue *_kai_file_make_handle(int fd) {
+    KaiValue *fd_kv = kai_int((int64_t) fd);
+    KaiValue *fields[1] = { fd_kv };
+    static const char *names[1] = { "fd" };
+    return kai_record(1, fields, names);
+}
+
+/* Pull the `fd` slot out of a FileHandle record. Returns -1 when the
+ * value is the wrong shape (caller returns an Err). The slot is an Int,
+ * which stage2 boxes tagged — read it with kai_is_int / kai_intf. */
+static int _kai_file_handle_fd(KaiValue *v) {
+    if (!kai_is_ptr(v) || v->tag != KAI_RECORD) return -1;
+    for (int i = 0; i < v->as.rec.n_fields; ++i) {
+        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "fd") == 0) {
+            KaiValue *f = v->as.rec.fields[i];
+            if (!kai_is_int(f)) return -1;
+            return (int) kai_intf(f);
+        }
+    }
+    return -1;
+}
+
+static KaiValue *_kai_file_err(const char *msg) {
+    KaiValue *m = kai_str(msg);
+    return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
+}
+
+static KaiValue *_kai_file_ok(KaiValue *payload) {
+    return kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = payload}});
+}
+
+/* open_read(path) -> Result[FileHandle, String]. Opens `path` read-only
+ * and hands back an owning FileHandle. */
+static KaiValue *kai_core_file_open_read(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        r = _kai_file_err("open_read: argument is not a String");
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        int fd = open(pbuf, O_RDONLY);
+        if (fd < 0) r = _kai_file_err("open_read: cannot open file");
+        else        r = _kai_file_ok(_kai_file_make_handle(fd));
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+/* read_chunk(h, max) -> Result[String, String]. Reads up to `max` bytes
+ * from the handle's fd into a fresh String. `Ok("")` signals EOF. A
+ * short read (fewer than `max` bytes, but more than zero) is normal and
+ * returned as-is; the caller loops until it sees the empty string. */
+static KaiValue *kai_core_file_read_chunk(KaiValue *h, KaiValue *max) {
+    KaiValue *r = NULL;
+    int fd = _kai_file_handle_fd(h);
+    int64_t cap = kai_is_int(max) ? kai_intf(max) : -1;
+    if (fd < 0) {
+        r = _kai_file_err("read_chunk: bad handle");
+    } else if (cap < 0) {
+        r = _kai_file_err("read_chunk: max is not a non-negative Int");
+    } else if (cap == 0) {
+        r = _kai_file_ok(kai_str(""));
+    } else {
+        char *buf = (char *) malloc((size_t) cap);
+        if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        ssize_t got;
+        do { got = read(fd, buf, (size_t) cap); } while (got < 0 && errno == EINTR);
+        if (got < 0) {
+            free(buf);
+            r = _kai_file_err("read_chunk: read failed");
+        } else {
+            KaiValue *v = kai_alloc(KAI_STR);
+            v->as.s.len = (size_t) got;
+            kai_heap_charge((size_t) got + 1);
+            v->as.s.bytes = (char *) malloc((size_t) got + 1);
+            if (!v->as.s.bytes) { free(buf); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+            memcpy(v->as.s.bytes, buf, (size_t) got);
+            v->as.s.bytes[got] = '\0';
+            free(buf);
+            r = _kai_file_ok(v);
+        }
+    }
+    if (kai_is_ptr(h))   kai_decref(h);
+    if (kai_is_ptr(max)) kai_decref(max);
+    return r;
+}
+
+/* open_write(path) -> Result[FileHandle, String]. Opens `path` for
+ * writing, creating it (mode 0644) and truncating any existing
+ * contents, then hands back an owning FileHandle. */
+static KaiValue *kai_core_file_open_write(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        r = _kai_file_err("open_write: argument is not a String");
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        /* O_RDWR, not O_WRONLY: the handle's typed capability is
+         * read + write, so reads through it must be valid. */
+        int fd = open(pbuf, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) r = _kai_file_err("open_write: cannot open file");
+        else        r = _kai_file_ok(_kai_file_make_handle(fd));
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+/* write_chunk(h, data) -> Result[Unit, String]. Writes every byte of
+ * `data` to the handle's fd, looping over partial writes. */
+static KaiValue *kai_core_file_write_chunk(KaiValue *h, KaiValue *data) {
+    KaiValue *r = NULL;
+    int fd = _kai_file_handle_fd(h);
+    if (fd < 0) {
+        r = _kai_file_err("write_chunk: bad handle");
+    } else if (!data || data->tag != KAI_STR) {
+        r = _kai_file_err("write_chunk: data is not a String");
+    } else {
+        size_t total = data->as.s.len;
+        size_t off = 0;
+        int failed = 0;
+        while (off < total) {
+            ssize_t w = write(fd, data->as.s.bytes + off, total - off);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                failed = 1;
+                break;
+            }
+            off += (size_t) w;
+        }
+        if (failed) r = _kai_file_err("write_chunk: write failed");
+        else        r = _kai_file_ok(kai_unit());
+    }
+    if (kai_is_ptr(h))    kai_decref(h);
+    if (kai_is_ptr(data)) kai_decref(data);
+    return r;
+}
+
+/* close_file(h) -> Unit. Closes the underlying fd; a bad handle or a
+ * close error is swallowed (there is no Result register on close — the
+ * fd is gone either way). */
+static KaiValue *kai_core_file_close(KaiValue *h) {
+    int fd = _kai_file_handle_fd(h);
+    if (fd >= 0) close(fd);
+    if (kai_is_ptr(h)) kai_decref(h);
+    return kai_unit();
+}
+
+/* Issue #345: file_exists / file_delete / file_rename. Each consumes
+ * its String args linearly (kai_decref before allocating the result),
+ * matching the core convention used by read_file/write_file above. */
+
+static KaiValue *kai_core_file_exists(KaiValue *path) {
+    int present = 0;
+    if (kai_is_ptr(path) && path->tag == KAI_STR) {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        present = (access(pbuf, F_OK) == 0) ? 1 : 0;
+    }
+    if (path) kai_decref(path);
+    return kai_bool(present);
+}
+
+static KaiValue *kai_core_file_delete(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("file_delete: path is not a String");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        if (unlink(pbuf) == 0) {
+            KaiValue *u = kai_unit();
+            r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
+        } else {
+            KaiValue *msg = kai_str("file_delete: unlink failed");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        }
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+static KaiValue *kai_core_file_rename(KaiValue *from, KaiValue *to) {
+    KaiValue *r = NULL;
+    if (!from || from->tag != KAI_STR) {
+        KaiValue *msg = kai_str("file_rename: from is not a String");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else if (!to || to->tag != KAI_STR) {
+        KaiValue *msg = kai_str("file_rename: to is not a String");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else {
+        char fbuf[KAI_PATH_BUF];
+        char tbuf[KAI_PATH_BUF];
+        size_t flen = from->as.s.len < sizeof(fbuf) - 1 ? from->as.s.len : sizeof(fbuf) - 1;
+        size_t tlen = to->as.s.len   < sizeof(tbuf) - 1 ? to->as.s.len   : sizeof(tbuf) - 1;
+        memcpy(fbuf, from->as.s.bytes, flen); fbuf[flen] = '\0';
+        memcpy(tbuf, to->as.s.bytes,   tlen); tbuf[tlen] = '\0';
+        if (rename(fbuf, tbuf) == 0) {
+            KaiValue *u = kai_unit();
+            r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
+        } else {
+            KaiValue *msg = kai_str("file_rename: rename failed");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        }
+    }
+    if (from) kai_decref(from);
+    if (to)   kai_decref(to);
+    return r;
+}
+
+/* Issue #482 (follow-up to #345) + Array[Byte] refactor (prereq for
+ * #452): binary file IO. Operates on `Array[Byte]` so the buffer
+ * lines up with BinSerialize post-#488 (O(1) reads, contiguous
+ * storage). Both primitives consume their args linearly (kai_decref
+ * before allocating the result), matching the convention used by the
+ * text variants. */
+
+static KaiValue *kai_core_file_read_bytes(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("file_read_bytes: argument is not a String");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        FILE *fp = fopen(pbuf, "rb");
+        struct stat st;
+        if (!fp) {
+            KaiValue *msg = kai_str("file_read_bytes: cannot open file");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        } else if (fstat(fileno(fp), &st) == 0 && S_ISDIR(st.st_mode)) {
+            /* fopen accepts directories; on Linux ext4 ftell(SEEK_END) then
+             * reports the htree EOF sentinel (~2^63), so reject before
+             * sizing the buffer. */
+            fclose(fp);
+            KaiValue *msg = kai_str("file_read_bytes: is a directory");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        } else if (fseek(fp, 0, SEEK_END) != 0) {
+            fclose(fp);
+            KaiValue *msg = kai_str("file_read_bytes: seek failed");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        } else {
+            long n = ftell(fp);
+            if (n < 0) {
+                fclose(fp);
+                KaiValue *msg = kai_str("file_read_bytes: tell failed");
+                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            } else if (fseek(fp, 0, SEEK_SET) != 0) {
+                fclose(fp);
+                KaiValue *msg = kai_str("file_read_bytes: rewind failed");
+                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            } else {
+                /* Read into a flat C buffer, then publish into a
+                 * fresh KAI_ARRAY one KAI_BYTE allocation per slot.
+                 * Allocating the kai_array directly (instead of
+                 * kai_array_make + array_set in a loop) avoids the
+                 * redundant default-incref/decref pair on every
+                 * position. */
+                unsigned char *buf = (unsigned char *) malloc((size_t) n + 1);
+                if (!buf) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                size_t got = fread(buf, 1, (size_t) n, fp);
+                fclose(fp);
+                KaiValue *arr = kai_alloc(KAI_ARRAY);
+                arr->as.arr.len = (int64_t) got;
+                arr->as.arr.cap = got > 0 ? (int64_t) got : 1;
+                kai_heap_charge((size_t) arr->as.arr.cap * sizeof(KaiValue *));
+                arr->as.arr.items = (KaiValue **) malloc((size_t) arr->as.arr.cap * sizeof(KaiValue *));
+                if (!arr->as.arr.items) { free(buf); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                for (size_t i = 0; i < got; ++i) arr->as.arr.items[i] = kai_byte(buf[i]);
+                free(buf);
+                r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = arr}});
+            }
+        }
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+static KaiValue *kai_core_file_write_bytes(KaiValue *path, KaiValue *bytes) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("file_write_bytes: path is not a String");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else if (!bytes || bytes->tag != KAI_ARRAY) {
+        KaiValue *msg = kai_str("file_write_bytes: buffer is not an Array");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        FILE *fp = fopen(pbuf, "wb");
+        if (!fp) {
+            KaiValue *msg = kai_str("file_write_bytes: cannot open file");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        } else {
+            /* Pack the kai_array into a contiguous C buffer, then
+             * issue a single fwrite. Cheaper than per-slot fwrite
+             * even with stdio buffering, and lets us fail fast on
+             * a non-Byte slot before any IO. */
+            int64_t n = bytes->as.arr.len;
+            int ok = 1;
+            unsigned char *out = NULL;
+            if (n > 0) {
+                out = (unsigned char *) malloc((size_t) n);
+                if (!out) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                for (int64_t i = 0; i < n; ++i) {
+                    KaiValue *e = bytes->as.arr.items[i];
+                    if (!e || e->tag != KAI_BYTE) { ok = 0; break; }
+                    out[i] = e->as.byte_val;
+                }
+            }
+            if (ok && n > 0) {
+                if (fwrite(out, 1, (size_t) n, fp) != (size_t) n) ok = 0;
+            }
+            if (out) free(out);
+            fclose(fp);
+            if (!ok) {
+                KaiValue *msg = kai_str("file_write_bytes: write failed");
+                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            } else {
+                KaiValue *u = kai_unit();
+                r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
+            }
+        }
+    }
+    if (path)  kai_decref(path);
+    if (bytes) kai_decref(bytes);
+    return r;
+}
+
+/* Issue #344: directory ops on top of the `File` effect. Each consumes
+ * its String args linearly (kai_decref before allocating the result),
+ * mirroring the file_exists/_delete/_rename convention. POSIX only
+ * (macOS + Linux). Return shapes:
+ *
+ *   dir_list_dir(path)    : [String]              — entries (no . / ..)
+ *   dir_create_dir(path)  : Result[Unit, String]  — Ok first
+ *   dir_remove_dir(path)  : Result[Unit, String]
+ *   dir_walk(path)        : [String]              — files (not dirs),
+ *                                                   depth-first; symlinks
+ *                                                   are NOT followed in v1
+ *
+ * dir_list_dir returns the empty list on read errors (matching how
+ * args() can be empty); use dir_create_dir / dir_remove_dir when an
+ * explicit Result is wanted. */
+
+static KaiValue *kai_core_dir_list_dir(KaiValue *path) {
+    KaiValue *acc = kai_nil();
+    if (kai_is_ptr(path) && path->tag == KAI_STR) {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        DIR *d = opendir(pbuf);
+        if (d) {
+            /* Buffer entries then prepend in reverse so the caller sees
+             * them in readdir order. readdir order is filesystem-defined
+             * but stable for a given mount, which keeps test output
+             * deterministic enough for fixtures. */
+            size_t cap = 16, n = 0;
+            char **names = (char **) malloc(cap * sizeof(char *));
+            if (!names) { closedir(d); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                const char *nm = e->d_name;
+                if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0'))) continue;
+                if (n + 1 > cap) {
+                    cap *= 2;
+                    names = (char **) realloc(names, cap * sizeof(char *));
+                    if (!names) { closedir(d); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                }
+                size_t len = strlen(nm);
+                char *copy = (char *) malloc(len + 1);
+                if (!copy) { closedir(d); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                memcpy(copy, nm, len + 1);
+                names[n++] = copy;
+            }
+            closedir(d);
+            for (size_t i = n; i > 0;) {
+                --i;
+                acc = kai_cons(kai_str_dyn(names[i]), acc);
+                free(names[i]);
+            }
+            free(names);
+        }
+    }
+    if (path) kai_decref(path);
+    return acc;
+}
+
+static KaiValue *kai_core_dir_create_dir(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("dir_create_dir: path is not a String");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        if (mkdir(pbuf, KAI_DIR_MODE) == 0) {
+            KaiValue *u = kai_unit();
+            r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
+        } else {
+            KaiValue *msg = kai_str("dir_create_dir: mkdir failed");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        }
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+static KaiValue *kai_core_dir_remove_dir(KaiValue *path) {
+    KaiValue *r = NULL;
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("dir_remove_dir: path is not a String");
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        if (rmdir(pbuf) == 0) {
+            KaiValue *u = kai_unit();
+            r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
+        } else {
+            KaiValue *msg = kai_str("dir_remove_dir: rmdir failed");
+            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        }
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+/* Iterative depth-first walk. Push subdirectories onto an explicit stack
+ * so a deep tree doesn't blow the C stack. Symlinks are NOT followed
+ * (v1 contract): use lstat + S_ISLNK skip so a symlink loop can't
+ * trap the walker. Only regular files are emitted; directories are
+ * traversed but not reported. */
+static KaiValue *kai_core_dir_walk(KaiValue *root) {
+    KaiValue *acc = kai_nil();
+    if (!root || root->tag != KAI_STR) {
+        if (root) kai_decref(root);
+        return acc;
+    }
+
+    size_t cap = 16, top = 0;
+    char **stack = (char **) malloc(cap * sizeof(char *));
+    if (!stack) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+
+    char rbuf[KAI_PATH_BUF];
+    size_t rlen = root->as.s.len < sizeof(rbuf) - 1 ? root->as.s.len : sizeof(rbuf) - 1;
+    memcpy(rbuf, root->as.s.bytes, rlen);
+    rbuf[rlen] = '\0';
+    {
+        char *copy = (char *) malloc(rlen + 1);
+        if (!copy) { free(stack); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        memcpy(copy, rbuf, rlen + 1);
+        stack[top++] = copy;
+    }
+
+    /* Collect files first, then prepend in reverse so the cons list
+     * reads in walk order. */
+    size_t fcap = 32, fn = 0;
+    char **files = (char **) malloc(fcap * sizeof(char *));
+    if (!files) { free(stack[0]); free(stack); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+
+    while (top > 0) {
+        char *dir_path = stack[--top];
+        DIR *d = opendir(dir_path);
+        if (!d) { free(dir_path); continue; }
+        /* Buffer child entries so we can push subdirs in reverse for
+         * deterministic depth-first order. */
+        size_t ccap = 16, cn = 0;
+        char **child_paths = (char **) malloc(ccap * sizeof(char *));
+        if (!child_paths) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        char *child_kinds = (char *) malloc(ccap); /* 'f' / 'd' / 's' (skip) */
+        if (!child_kinds) { free(child_paths); closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            const char *nm = e->d_name;
+            if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0'))) continue;
+            size_t dlen = strlen(dir_path);
+            size_t nlen = strlen(nm);
+            char *full = (char *) malloc(dlen + 1 + nlen + 1);
+            if (!full) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+            memcpy(full, dir_path, dlen);
+            int needs_sep = (dlen > 0 && dir_path[dlen - 1] != '/');
+            size_t off = dlen;
+            if (needs_sep) { full[off++] = '/'; }
+            memcpy(full + off, nm, nlen + 1);
+            struct stat st;
+            char kind = 's';
+            if (lstat(full, &st) == 0) {
+                if (S_ISLNK(st.st_mode))      kind = 's'; /* skip symlinks */
+                else if (S_ISDIR(st.st_mode)) kind = 'd';
+                else if (S_ISREG(st.st_mode)) kind = 'f';
+                else                          kind = 's'; /* sockets, fifos, etc. */
+            }
+            if (cn + 1 > ccap) {
+                ccap *= 2;
+                child_paths = (char **) realloc(child_paths, ccap * sizeof(char *));
+                child_kinds = (char *)  realloc(child_kinds, ccap);
+                if (!child_paths || !child_kinds) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+            }
+            child_paths[cn] = full;
+            child_kinds[cn] = kind;
+            cn++;
+        }
+        closedir(d);
+        free(dir_path);
+        /* Emit files in encountered order. */
+        for (size_t i = 0; i < cn; ++i) {
+            char k = child_kinds[i];
+            if (k == 'f') {
+                if (fn + 1 > fcap) {
+                    fcap *= 2;
+                    files = (char **) realloc(files, fcap * sizeof(char *));
+                    if (!files) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                }
+                files[fn++] = child_paths[i];
+            }
+        }
+        /* Push subdirs in reverse onto the stack so they pop in natural order. */
+        for (size_t i = cn; i > 0;) {
+            --i;
+            char k = child_kinds[i];
+            if (k == 'd') {
+                if (top + 1 > cap) {
+                    cap *= 2;
+                    stack = (char **) realloc(stack, cap * sizeof(char *));
+                    if (!stack) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                }
+                stack[top++] = child_paths[i];
+            } else if (k != 'f') {
+                /* skipped — free the path string */
+                free(child_paths[i]);
+            }
+        }
+        free(child_paths);
+        free(child_kinds);
+    }
+    free(stack);
+
+    /* Build the cons list in reverse so consumers see files in walk order. */
+    for (size_t i = fn; i > 0;) {
+        --i;
+        acc = kai_cons(kai_str(files[i]), acc);
+        free(files[i]);
+    }
+    free(files);
+
+    kai_decref(root);
+    return acc;
+}
+
+static KaiValue *kai_core_read_line(void) {
+    size_t cap = KAI_READ_BUF_INIT, n = 0;
+    char *buf = (char *) malloc(cap);
+    if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    int ch;
+    while ((ch = fgetc(stdin)) != EOF && ch != '\n') {
+        if (n + 1 >= cap) { cap *= 2; buf = (char *) realloc(buf, cap); }
+        buf[n++] = (char) ch;
+    }
+    if (ch == EOF && n == 0) {
+        free(buf);
+        KaiValue *msg = kai_str("read_line: end of input");
+        return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+    }
+    KaiValue *s = kai_str_from_bytes(buf, n);
+    free(buf);
+    return kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = s}});
+}
+
+/* Issue #453 + #620: byte-oriented stdin read. Reads up to `n` raw
+ * bytes from stdin (including '\n') and returns them as a String.
+ * On EOF the returned String is shorter than `n` — possibly empty.
+ * Used by LSP-style framed protocols where the body length is known
+ * up front and may contain newlines.
+ *
+ * R3 unification: this core entry and the `Stdin.read_bytes`
+ * default handler both go through `read(STDIN_FILENO, …)` so that a
+ * program mixing the two forms (flat `read_bytes(n)` and qualified
+ * `Stdin.read_bytes(n)`) consumes the input stream byte-for-byte
+ * without libc's stdio buffer in the middle. The flat core path
+ * stays blocking (it predates the reactor and is reachable from
+ * stage 0 binaries that have no fibers); the qualified handler
+ * parks the fiber on EAGAIN. */
+static KaiValue *kai_core_read_bytes(KaiValue *n) {
+    int64_t want = 0;
+    if (n && kai_is_int(n) && kai_intf(n) > 0) want = kai_intf(n);
+    if (n) kai_decref(n);
+    if (want <= 0) return kai_str_from_bytes("", 0);
+    char *buf = (char *) malloc((size_t) want);
+    if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    size_t got = 0;
+    while (got < (size_t) want) {
+        ssize_t r = read(STDIN_FILENO, buf + got, (size_t) want - got);
+        if (r > 0) {
+            got += (size_t) r;
+        } else if (r == 0) {
+            break;  /* EOF */
+        } else if (errno == EINTR) {
+            continue;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* fd 0 is O_NONBLOCK because the R3 reactor handler
+             * flipped it earlier in this process. The flat core
+             * has no fiber to park; emulate blocking semantics by
+             * polling until the fd is readable, then retry. */
+            struct pollfd p = { STDIN_FILENO, POLLIN, 0 };
+            int prc = poll(&p, 1, -1);
+            if (prc < 0 && errno != EINTR) break;
+            continue;
+        } else {
+            break;  /* I/O error — surface as short read */
+        }
+    }
+    KaiValue *s = kai_str_from_bytes(buf, got);
+    free(buf);
+    return s;
+}
+
+/* ---------- core: parsing and string helpers ---------- */
+
+/* m5.x flip Phase 3 closeout (Perceus Tier 2 audit, 2026-04-29):
+ * the next 8 helpers consume their args linearly. Result computed
+ * first, args decref'd before the constructor allocates. */
+static KaiValue *kai_core_string_to_int(KaiValue *s) {
+    int ok = 0;
+    int64_t value = 0;
+    if (s && s->tag == KAI_STR && s->as.s.len > 0 && s->as.s.len < 64) {
+        char buf[64];
+        memcpy(buf, s->as.s.bytes, s->as.s.len);
+        buf[s->as.s.len] = '\0';
+        char *end = NULL;
+        /* strtoll saturates to LLONG_MIN/MAX on overflow and reports it
+         * only through errno, which it never clears on success. */
+        errno = 0;
+        long long v = strtoll(buf, &end, 10);
+        if (end && *end == '\0' && end != buf && errno != ERANGE) {
+            value = (int64_t) v;
+            ok = 1;
+        }
+    }
+    if (s) kai_decref(s);
+    if (ok) {
+        KaiValue *iv = kai_int(value);
+        return kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = iv}});
+    }
+    return kai_variant_u(1, "None", 0, 0, NULL);
+}
+
+static KaiValue *kai_core_string_to_real(KaiValue *s) {
+    int ok = 0;
+    double value = 0.0;
+    if (s && s->tag == KAI_STR && s->as.s.len > 0 && s->as.s.len < 64) {
+        char buf[64];
+        memcpy(buf, s->as.s.bytes, s->as.s.len);
+        buf[s->as.s.len] = '\0';
+        char *end = NULL;
+        /* strtod saturates to ±HUGE_VAL on overflow and reports it only
+         * through errno. ERANGE also covers underflow, where the result
+         * is a subnormal or zero — that is ordinary precision loss, not
+         * a parse failure, so only the infinite case is rejected. */
+        errno = 0;
+        double v = strtod(buf, &end);
+        if (end && *end == '\0' && end != buf
+            && !(errno == ERANGE && (v >= HUGE_VAL || v <= -HUGE_VAL))) {
+            value = v;
+            ok = 1;
+        }
+    }
+    if (s) kai_decref(s);
+    if (ok) {
+        KaiValue *rv = kai_real(value);
+        return kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = rv}});
+    }
+    return kai_variant_u(1, "None", 0, 0, NULL);
+}
+
+static KaiValue *kai_core_char_at(KaiValue *s, KaiValue *i) {
+    int ok = 0;
+    uint32_t value = 0;
+    if (s && s->tag == KAI_STR && i && kai_is_int(i)) {
+        int64_t idx = kai_intf(i);
+        if (idx >= 0 && (size_t) idx < s->as.s.len) {
+            /* Byte-at semantics for now; multi-byte UTF-8 can return
+             * surrogate-like codepoints once we need them. Stage 0
+             * keeps it simple. */
+            value = (uint32_t)(unsigned char) s->as.s.bytes[idx];
+            ok = 1;
+        }
+    }
+    if (s) kai_decref(s);
+    if (i) kai_decref(i);
+    if (ok) {
+        KaiValue *cv = kai_char(value);
+        return kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = cv}});
+    }
+    return kai_variant_u(1, "None", 0, 0, NULL);
+}
+
+/* UTF-8 codepoint decode primitives (issue #744). `string.chars()`,
+ * `char_count`, `char_indices` are written in kaikai over these two:
+ * walk the byte buffer advancing `off += string_cp_len(s, off)` and
+ * read the codepoint with `string_cp_at(s, off)`. Keeping the decode
+ * in C (one lead-byte classification per call) avoids a kaikai byte
+ * loop that would box an Int per byte. Lenient at the value level: a
+ * malformed lead byte decodes to its raw byte value so a corrupt
+ * buffer never traps here (the scalar-value invariant is enforced at
+ * `int_to_char` / char-literal lexing, not on every decode). */
+static int kai_utf8_seq_len(unsigned char b0) {
+    if (b0 < 0x80)            return 1;
+    if ((b0 & 0xE0) == 0xC0)  return 2;
+    if ((b0 & 0xF0) == 0xE0)  return 3;
+    if ((b0 & 0xF8) == 0xF0)  return 4;
+    return 1;  /* malformed lead byte: consume one byte */
+}
+
+/* Byte-width (1..4) of the UTF-8 sequence starting at byte index `off`.
+ * Returns 0 on out-of-range / wrong type so a kaikai walk terminates. */
+static KaiValue *kai_core_string_cp_len(KaiValue *s, KaiValue *off) {
+    int64_t w = 0;
+    if (s && s->tag == KAI_STR && off && kai_is_int(off)) {
+        int64_t i = kai_intf(off);
+        if (i >= 0 && (size_t) i < s->as.s.len) {
+            int seq = kai_utf8_seq_len((unsigned char) s->as.s.bytes[i]);
+            size_t avail = s->as.s.len - (size_t) i;
+            w = ((size_t) seq > avail) ? (int64_t) avail : (int64_t) seq;
+        }
+    }
+    if (s)   kai_decref(s);
+    if (off) kai_decref(off);
+    return kai_int(w);
+}
+
+/* Decode the codepoint of the UTF-8 sequence starting at byte index
+ * `off`. Returns -1 on out-of-range / wrong type. Continuation bytes
+ * beyond the buffer are skipped (lenient, matches the clamp above). */
+static KaiValue *kai_core_string_cp_at(KaiValue *s, KaiValue *off) {
+    int64_t cp = -1;
+    if (s && s->tag == KAI_STR && off && kai_is_int(off)) {
+        int64_t i = kai_intf(off);
+        if (i >= 0 && (size_t) i < s->as.s.len) {
+            const unsigned char *b = (const unsigned char *) s->as.s.bytes;
+            size_t len = s->as.s.len;
+            unsigned char b0 = b[i];
+            if (b0 < 0x80) {
+                cp = b0;
+            } else {
+                uint32_t v;
+                int extra;
+                if      ((b0 & 0xE0) == 0xC0) { v = b0 & 0x1F; extra = 1; }
+                else if ((b0 & 0xF0) == 0xE0) { v = b0 & 0x0F; extra = 2; }
+                else if ((b0 & 0xF8) == 0xF0) { v = b0 & 0x07; extra = 3; }
+                else                          { v = b0; extra = 0; }
+                size_t j = (size_t) i + 1;
+                while (extra-- > 0 && j < len) {
+                    v = (v << 6) | (b[j] & 0x3F);
+                    j++;
+                }
+                /* Malformed input can decode above U+10FFFF or into the
+                 * surrogate range; map such non-scalar values to U+FFFD
+                 * (replacement char) so a `chars()` walk never feeds a
+                 * non-codepoint to `int_to_char` (which would panic).
+                 * Well-formed UTF-8 never hits this. */
+                if (v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) v = 0xFFFD;
+                cp = (int64_t) v;
+            }
+        }
+    }
+    if (s)   kai_decref(s);
+    if (off) kai_decref(off);
+    return kai_int(cp);
+}
+
+/* Reverse `s` by Unicode codepoint in one pass and one allocation: walk
+ * the source forward by UTF-8 sequence width and copy each FULL sequence,
+ * byte order intact, into the destination filled from the tail. Byte order
+ * within a codepoint is preserved; codepoint order is reversed. O(n), no
+ * intermediate `[Char]`, no per-char re-encode. A truncated trailing
+ * sequence (malformed input) is copied as-is via the clamped width. */
+static KaiValue *kai_core_string_reverse(KaiValue *s) {
+    if (!s || s->tag != KAI_STR) {
+        if (s) kai_decref(s);
+        return kai_str("");
+    }
+    size_t len = s->as.s.len;
+    const unsigned char *src = (const unsigned char *) s->as.s.bytes;
+    KaiValue *out = kai_alloc(KAI_STR);
+    out->as.s.len = len;
+    out->as.s.bytes = (char *) kai_heap_malloc(len + 1);
+    out->as.s.bytes[len] = '\0';
+    unsigned char *dst = (unsigned char *) out->as.s.bytes;
+    size_t i = 0;
+    size_t w = len;
+    while (i < len) {
+        int seq = kai_utf8_seq_len(src[i]);
+        size_t avail = len - i;
+        size_t step = ((size_t) seq > avail) ? avail : (size_t) seq;
+        w -= step;
+        memcpy(dst + w, src + i, step);
+        i += step;
+    }
+    kai_decref(s);
+    return out;
+}
+
+static KaiValue *kai_core_string_split(KaiValue *s, KaiValue *sep) {
+    KaiValue *acc;
+    if (!s || s->tag != KAI_STR) {
+        acc = kai_nil();
+    } else if (!sep || sep->tag != KAI_STR || sep->as.s.len == 0) {
+        /* No separator → singleton list with own copy of `s`. */
+        acc = kai_cons(kai_str_from_bytes(s->as.s.bytes, s->as.s.len), kai_nil());
+    } else {
+        const char *p = s->as.s.bytes;
+        size_t slen = s->as.s.len;
+        const char *sp = sep->as.s.bytes;
+        size_t seplen = sep->as.s.len;
+        /* Collect pieces into a temp array then fold right into a cons list. */
+        size_t cap = 8, n = 0;
+        struct { const char *b; size_t l; } *pieces = malloc(cap * sizeof(*pieces));
+        size_t i = 0;
+        size_t last = 0;
+        while (i + seplen <= slen) {
+            if (memcmp(p + i, sp, seplen) == 0) {
+                if (n == cap) { cap *= 2; pieces = realloc(pieces, cap * sizeof(*pieces)); }
+                pieces[n].b = p + last;
+                pieces[n].l = i - last;
+                n++;
+                i += seplen;
+                last = i;
+            } else {
+                i++;
+            }
+        }
+        if (n == cap) { cap *= 2; pieces = realloc(pieces, cap * sizeof(*pieces)); }
+        pieces[n].b = p + last;
+        pieces[n].l = slen - last;
+        n++;
+        acc = kai_nil();
+        for (size_t k = n; k > 0;) {
+            --k;
+            acc = kai_cons(kai_str_from_bytes(pieces[k].b, pieces[k].l), acc);
+        }
+        free(pieces);
+    }
+    if (s) kai_decref(s);
+    if (sep) kai_decref(sep);
+    return acc;
+}
+
+static KaiValue *kai_core_string_slice(KaiValue *s, KaiValue *from, KaiValue *len) {
+    KaiValue *r;
+    if (!s || s->tag != KAI_STR) {
+        r = kai_str("");
+    } else {
+        int64_t f = (kai_is_int(from)) ? kai_intf(from) : 0;
+        int64_t l = (kai_is_int(len)) ? kai_intf(len)  : 0;
+        if (f < 0) f = 0;
+        if (l < 0) l = 0;
+        if ((size_t) f > s->as.s.len) f = (int64_t) s->as.s.len;
+        size_t avail = s->as.s.len - (size_t) f;
+        size_t take  = ((size_t) l > avail) ? avail : (size_t) l;
+        r = kai_str_from_bytes(s->as.s.bytes + f, take);
+    }
+    if (s)    kai_decref(s);
+    if (from) kai_decref(from);
+    if (len)  kai_decref(len);
+    return r;
+}
+
+static KaiValue *kai_core_char_to_int(KaiValue *c) {
+    int64_t value = (kai_is_ptr(c) && c->tag == KAI_CHAR) ? (int64_t) c->as.c : 0;
+    if (c) kai_decref(c);
+    return kai_int(value);
+}
+
+/* Issue #744: `int_to_char` carries the `Char` scalar-value invariant.
+ * An argument outside the Unicode scalar-value range — negative, above
+ * U+10FFFF, or in the surrogate range U+D800..U+DFFF — is not a
+ * codepoint; constructing a `Char` from it is a programming error, so
+ * we panic (an audited runtime escape per Tier 1 #1, the same class as
+ * array out-of-bounds) rather than silently producing garbage. This
+ * keeps every `Char` in a running program a valid scalar value while
+ * leaving `int_to_char` total in its type. Byte values 0..255 (the
+ * common "build a byte" idiom) are all valid scalar values and pass
+ * unchanged. */
+static KaiValue *kai_core_int_to_char(KaiValue *n) {
+    int64_t cp = (kai_is_int(n)) ? kai_intf(n) : 0;
+    if (n) kai_decref(n);
+    if (cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+        char msg[96];
+        snprintf(msg, sizeof msg,
+                 "int_to_char: %lld is not a Unicode scalar value "
+                 "(0..0x10FFFF excluding surrogates)", (long long) cp);
+        kai_core_panic(kai_str(msg));
+    }
+    return kai_char((uint32_t) cp);
+}
+
+/* Build a 1-byte String holding the low 8 bits of `n`. Unlike
+ * `"#{int_to_char(n)}"` interpolation, which routes through
+ * `kai_to_string(KAI_CHAR)` + `Show for Char` and escape-renders any
+ * byte outside ASCII [32,126] (and truncates NUL via `strlen`), this
+ * builtin constructs the string via `kai_str_from_bytes` so every
+ * value 0..255 round-trips byte-exact. Cache layer (issue #592) uses
+ * it for the KAB2 binary on-disk format. Documented limitation
+ * sidebar in `stdlib/protocols.kai` (BinSerialize String/Real ASCII-
+ * only) closes once Phase A/B serdes routes through this. */
+static KaiValue *kai_core_int_to_byte_string(KaiValue *n) {
+    int64_t v = (kai_is_int(n)) ? kai_intf(n) : 0;
+    if (n) kai_decref(n);
+    unsigned char b = (unsigned char) (v & 0xff);
+    return kai_str_from_bytes((const char *) &b, 1);
+}
+
+/* Encode an Int as its 4- / 8-byte little-endian block in one alloc.
+ * The kaikai spellings emitted the same bytes one at a time and joined
+ * them through a cons list, paying 5 and 10 allocations for a block
+ * that fits in a register. Mirrors what the decoder side already does
+ * with `string_byte_at_int`. */
+static KaiValue *kai_core_int_to_le4(KaiValue *n) {
+    int64_t v = (kai_is_int(n)) ? kai_intf(n) : 0;
+    unsigned char b[4];
+    int i;
+    if (n) kai_decref(n);
+    for (i = 0; i < 4; i++) b[i] = (unsigned char) ((uint64_t) v >> (i * 8));
+    return kai_str_from_bytes((const char *) b, 4);
+}
+
+static KaiValue *kai_core_int_to_le8(KaiValue *n) {
+    int64_t v = (kai_is_int(n)) ? kai_intf(n) : 0;
+    unsigned char b[8];
+    int i;
+    if (n) kai_decref(n);
+    for (i = 0; i < 8; i++) b[i] = (unsigned char) ((uint64_t) v >> (i * 8));
+    return kai_str_from_bytes((const char *) b, 8);
+}
+
+/* Read one byte at index `i` of String `s`, returning it as an Int
+ * 0..255. Returns -1 on out-of-bounds or wrong type. Faster than
+ * `match char_at(s, i) { Some(c) -> char_to_int(c); None -> -1 }`
+ * because it avoids the Option allocation + Char alloc + decref
+ * chain (KAI_CHAR is cached for value < 128 but still hits a load
+ * + tag check). The KAB2 cache decoder (#592) calls this ~1M times
+ * per warm load; replacing Option-wrapped char_at cuts decoder wall
+ * from ~0.26s to under 0.04s. */
+static KaiValue *kai_core_string_byte_at_int(KaiValue *s, KaiValue *i) {
+    int64_t v = -1;
+    if (s && s->tag == KAI_STR && i && kai_is_int(i)) {
+        int64_t idx = kai_intf(i);
+        if (idx >= 0 && (size_t) idx < s->as.s.len) {
+            v = (int64_t)(unsigned char) s->as.s.bytes[idx];
+        }
+    }
+    if (s) kai_decref(s);
+    if (i) kai_decref(i);
+    return kai_int(v);
+}
+
+/* `string_hash(s)` — full-width 64-bit FNV-1a over the raw bytes, the
+ * Hash protocol's String backend (issue #373). Distinct from the
+ * interning hash `kai_str_intern_hash` above, which bucket-truncates
+ * with `& (BUCKETS-1)`; here we return the *whole* 64-bit digest cast
+ * to int64_t. That cast can wrap negative — that is correct and
+ * intended. The future HashMap (#374) normalises to a bucket via
+ * `((h % n) + n) % n` (or `h & (n-1)` for power-of-two n); negativity
+ * is HashMap's contract to absorb, not Hash's to mask. Done in C, not
+ * a kaikai byte loop, because the kaikai loop would box an Int per
+ * byte (one alloc + decref per character) — catastrophic for the hot
+ * path a HashMap exercises. */
+static KaiValue *kai_core_string_hash(KaiValue *s) {
+    uint64_t h = 1469598103934665603ull;
+    if (kai_is_ptr(s) && s->tag == KAI_STR) {
+        const char *bytes = s->as.s.bytes;
+        size_t len = s->as.s.len;
+        for (size_t i = 0; i < len; i++) {
+            h ^= (uint64_t) (uint8_t) bytes[i];
+            h *= 1099511628211ull;
+        }
+    }
+    if (s) kai_decref(s);
+    return kai_int((int64_t) h);
+}
+
+/* `real_bits(r)` — reinterpret a double's IEEE-754 bit pattern as an
+ * Int, the Hash protocol's Real backend (issue #373). A bit-cast
+ * rather than `int_of_real` truncation because truncation collapses
+ * the fraction (1.5 and 1.9 would hash identically); the bit pattern
+ * separates every distinct double. Note +0.0 and -0.0 have different
+ * bit patterns (and NaN payloads vary) — acceptable for a hash, since
+ * Hash↔Eq consistency on Real is the caller's concern, not ours. */
+static KaiValue *kai_core_real_bits(KaiValue *v) {
+    uint64_t bits = 0;
+    if (kai_is_ptr(v) && v->tag == KAI_REAL) {
+        double r = v->as.r;
+        memcpy(&bits, &r, sizeof(bits));
+    }
+    if (v) kai_decref(v);
+    return kai_int((int64_t) bits);
+}
+
+static KaiValue *kai_core_string_contains(KaiValue *s, KaiValue *sub) {
+    int yes = 0;
+    if (s && s->tag == KAI_STR && sub && sub->tag == KAI_STR) {
+        if (sub->as.s.len == 0) {
+            yes = 1;
+        } else if (sub->as.s.len <= s->as.s.len) {
+            for (size_t i = 0; i + sub->as.s.len <= s->as.s.len; ++i) {
+                if (memcmp(s->as.s.bytes + i, sub->as.s.bytes, sub->as.s.len) == 0) {
+                    yes = 1;
+                    break;
+                }
+            }
+        }
+    }
+    if (s)   kai_decref(s);
+    if (sub) kai_decref(sub);
+    return kai_bool(yes);
+}
+
+/* ---------- core thunks for first-class function refs ---------- */
+
+static KaiValue *_kai_core_print_thunk(KaiValue *s, KaiValue **a, int n)          { (void) s; (void) n; return kai_core_print(a[0]); }
+static KaiValue *_kai_core_eprint_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_core_eprint(a[0]); }
+static KaiValue *_kai_core_write_stdout_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_write_stdout(a[0]); }
+static KaiValue *_kai_core_panic_thunk(KaiValue *s, KaiValue **a, int n)          { (void) s; (void) n; return kai_core_panic(a[0]); }
+static KaiValue *_kai_core_exit_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_core_exit(a[0]); }
+static KaiValue *_kai_core_int_to_string_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_int_to_string(a[0]); }
+static KaiValue *_kai_core_real_to_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_real_to_string(a[0]); }
+static KaiValue *_kai_core_int_to_real_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_int_to_real(a[0]); }
+static KaiValue *_kai_core_real_to_int_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_real_to_int(a[0]); }
+static KaiValue *_kai_core_real_sqrt_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_sqrt(a[0]); }
+static KaiValue *_kai_core_real_cbrt_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_cbrt(a[0]); }
+static KaiValue *_kai_core_real_exp_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_exp(a[0]); }
+static KaiValue *_kai_core_real_log_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_log(a[0]); }
+static KaiValue *_kai_core_real_log2_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_log2(a[0]); }
+static KaiValue *_kai_core_real_log10_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_real_log10(a[0]); }
+static KaiValue *_kai_core_real_sin_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_sin(a[0]); }
+static KaiValue *_kai_core_real_cos_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_cos(a[0]); }
+static KaiValue *_kai_core_real_tan_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_tan(a[0]); }
+static KaiValue *_kai_core_real_asin_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_asin(a[0]); }
+static KaiValue *_kai_core_real_acos_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_acos(a[0]); }
+static KaiValue *_kai_core_real_atan_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_atan(a[0]); }
+static KaiValue *_kai_core_real_sinh_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_sinh(a[0]); }
+static KaiValue *_kai_core_real_cosh_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_cosh(a[0]); }
+static KaiValue *_kai_core_real_tanh_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_real_tanh(a[0]); }
+static KaiValue *_kai_core_real_signum_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_real_signum(a[0]); }
+static KaiValue *_kai_core_real_is_nan_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_real_is_nan(a[0]); }
+static KaiValue *_kai_core_real_is_inf_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_real_is_inf(a[0]); }
+static KaiValue *_kai_core_real_pow_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_pow(a[0], a[1]); }
+static KaiValue *_kai_core_real_atan2_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_real_atan2(a[0], a[1]); }
+static KaiValue *_kai_core_real_rem_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_real_rem(a[0], a[1]); }
+static KaiValue *_kai_core_string_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_string_length(a[0]); }
+static KaiValue *_kai_core_string_concat_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_string_concat(a[0], a[1]); }
+static KaiValue *_kai_core_string_concat_all_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_concat_all(a[0]); }
+static KaiValue *_kai_core_string_join_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_string_join(a[0], a[1]); }
+static KaiValue *_kai_core_array_make_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_array_make(a[0], a[1]); }
+static KaiValue *_kai_core_array_empty_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_core_array_empty(); }
+static KaiValue *_kai_core_array_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_array_length(a[0]); }
+static KaiValue *_kai_core_array_get_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_array_get(a[0], a[1]); }
+static KaiValue *_kai_core_array_set_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_array_set(a[0], a[1], a[2]); }
+static KaiValue *_kai_core_array_grow_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_array_grow(a[0], a[1], a[2]); }
+static KaiValue *_kai_core_ref_make_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_ref_make(a[0]); }
+static KaiValue *_kai_core_ref_get_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_ref_get(a[0]); }
+static KaiValue *_kai_core_ref_set_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_ref_set(a[0], a[1]); }
+static KaiValue *_kai_core_list_length_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_list_length(a[0]); }
+static KaiValue *_kai_core_list_append_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_list_append(a[0], a[1]); }
+static KaiValue *_kai_core_list_reverse_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_list_reverse(a[0]); }
+static KaiValue *_kai_core_map_thunk(KaiValue *s, KaiValue **a, int n)            { (void) s; (void) n; return kai_core_map(a[0], a[1]); }
+static KaiValue *_kai_core_flat_map_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_flat_map(a[0], a[1]); }
+static KaiValue *_kai_core_filter_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_core_filter(a[0], a[1]); }
+static KaiValue *_kai_core_reduce_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_core_reduce(a[0], a[1], a[2]); }
+static KaiValue *_kai_core_each_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_core_each(a[0], a[1]); }
+static KaiValue *_kai_core_args_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) a; (void) n; return kai_core_args(); }
+static KaiValue *_kai_core_program_name_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_core_program_name(); }
+static KaiValue *_kai_core_stdlib_path_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) a; (void) n; return kai_core_stdlib_path(); }
+static KaiValue *_kai_core_abspath_thunk(KaiValue *s, KaiValue **a, int n)        { (void) s; (void) n; return kai_core_abspath(a[0]); }
+static KaiValue *_kai_core_read_file_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_read_file(a[0]); }
+static KaiValue *_kai_core_write_file_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_write_file(a[0], a[1]); }
+static KaiValue *_kai_core_file_exists_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_file_exists(a[0]); }
+static KaiValue *_kai_core_file_delete_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_file_delete(a[0]); }
+static KaiValue *_kai_core_file_rename_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_file_rename(a[0], a[1]); }
+static KaiValue *_kai_core_file_read_bytes_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_file_read_bytes(a[0]); }
+static KaiValue *_kai_core_file_write_bytes_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_file_write_bytes(a[0], a[1]); }
+static KaiValue *_kai_core_dir_list_dir_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_dir_list_dir(a[0]); }
+static KaiValue *_kai_core_dir_create_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_dir_create_dir(a[0]); }
+static KaiValue *_kai_core_dir_remove_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_dir_remove_dir(a[0]); }
+static KaiValue *_kai_core_dir_walk_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_dir_walk(a[0]); }
+static KaiValue *_kai_core_read_line_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) a; (void) n; return kai_core_read_line(); }
+static KaiValue *_kai_core_read_bytes_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_read_bytes(a[0]); }
+static KaiValue *_kai_core_string_to_int_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_string_to_int(a[0]); }
+static KaiValue *_kai_core_string_to_real_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_to_real(a[0]); }
+static KaiValue *_kai_core_char_at_thunk(KaiValue *s, KaiValue **a, int n)        { (void) s; (void) n; return kai_core_char_at(a[0], a[1]); }
+static KaiValue *_kai_core_string_split_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_string_split(a[0], a[1]); }
+static KaiValue *_kai_core_string_contains_thunk(KaiValue *s, KaiValue **a, int n){ (void) s; (void) n; return kai_core_string_contains(a[0], a[1]); }
+static KaiValue *_kai_core_string_slice_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_string_slice(a[0], a[1], a[2]); }
+static KaiValue *_kai_core_char_to_int_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_char_to_int(a[0]); }
+static KaiValue *_kai_core_int_to_char_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_int_to_char(a[0]); }
+static KaiValue *_kai_core_int_to_byte_string_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_int_to_byte_string(a[0]); }
+static KaiValue *_kai_core_string_byte_at_int_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_byte_at_int(a[0], a[1]); }
+static KaiValue *_kai_core_string_cp_at_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_string_cp_at(a[0], a[1]); }
+static KaiValue *_kai_core_string_cp_len_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_cp_len(a[0], a[1]); }
+static KaiValue *_kai_core_string_reverse_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_reverse(a[0]); }
+static KaiValue *_kai_core_string_hash_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_string_hash(a[0]); }
+static KaiValue *_kai_core_real_bits_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_real_bits(a[0]); }
+static KaiValue *_kai_core_mailbox_alloc_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) a; (void) n; return kai_core_mailbox_alloc(); }
+static KaiValue *_kai_core_mailbox_alloc_bounded_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_mailbox_alloc_bounded(a[0], a[1]); }
+static KaiValue *_kai_core_mailbox_send_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_mailbox_send(a[0], a[1]); }
+static KaiValue *_kai_core_mailbox_recv_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_mailbox_recv(a[0]); }
+static KaiValue *_kai_core_mailbox_recv_timeout_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_mailbox_recv_timeout(a[0], a[1]); }
+static KaiValue *_kai_core_mailbox_free_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_mailbox_free(a[0]); }
+
+/* The rest of the registry, by arity. Every `core_table()` entry
+ * (compiler/core_prims.kai) needs a thunk here: a builtin named as a
+ * value becomes a closure over it, and a missing one is a compile error
+ * in the generated C. */
+#define KAI_CORE_THUNK0(nm) \
+    static KaiValue *_kai_core_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) a; (void) n; return kai_core_##nm(); }
+#define KAI_CORE_THUNK1(nm) \
+    static KaiValue *_kai_core_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) n; return kai_core_##nm(a[0]); }
+#define KAI_CORE_THUNK2(nm) \
+    static KaiValue *_kai_core_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) n; return kai_core_##nm(a[0], a[1]); }
+#define KAI_CORE_THUNK3(nm) \
+    static KaiValue *_kai_core_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) n; return kai_core_##nm(a[0], a[1], a[2]); }
+
+KAI_CORE_THUNK1(int_to_le4)
+KAI_CORE_THUNK1(int_to_le8)
+KAI_CORE_THUNK1(int_to_byte)
+KAI_CORE_THUNK1(byte_to_int)
+KAI_CORE_THUNK2(byte_add)
+KAI_CORE_THUNK2(byte_sub)
+KAI_CORE_THUNK2(byte_eq)
+KAI_CORE_THUNK2(byte_lt)
+KAI_CORE_THUNK1(byte_to_string)
+KAI_CORE_THUNK1(int32_to_string)
+KAI_CORE_THUNK1(uint32_to_string)
+KAI_CORE_THUNK1(uint64_to_string)
+KAI_CORE_THUNK1(int128_to_string)
+KAI_CORE_THUNK1(int_to_int32)
+KAI_CORE_THUNK1(int_to_uint32)
+KAI_CORE_THUNK1(int_to_uint64)
+KAI_CORE_THUNK1(int_to_int128)
+KAI_CORE_THUNK1(int32_to_int)
+KAI_CORE_THUNK1(uint32_to_int)
+KAI_CORE_THUNK1(uint64_to_int)
+KAI_CORE_THUNK1(int128_to_int)
+KAI_CORE_THUNK1(array_length_borrow)
+KAI_CORE_THUNK2(array_get_borrow)
+KAI_CORE_THUNK2(vec_make)
+KAI_CORE_THUNK0(vec_empty)
+KAI_CORE_THUNK1(vec_length)
+KAI_CORE_THUNK2(vec_get)
+KAI_CORE_THUNK3(vec_set)
+KAI_CORE_THUNK2(vec_push)
+KAI_CORE_THUNK1(vec_length_borrow)
+KAI_CORE_THUNK2(vec_get_borrow)
+KAI_CORE_THUNK3(vec_slice)
+KAI_CORE_THUNK2(vec_tail_from)
+KAI_CORE_THUNK1(vec_reserve)
+KAI_CORE_THUNK1(vec_from_list)
+KAI_CORE_THUNK0(mailbox_alloc_unowned)
+KAI_CORE_THUNK2(mailbox_alloc_bounded_unowned)
+KAI_CORE_THUNK2(mailbox_assign_owner)
+KAI_CORE_THUNK2(spawn_actor_fiber)
+
+/* ---------- test harness hooks (used by --test runs) ----------
+ *
+ * Two report formats share one set of counters. The human format is the
+ * default and is byte-for-byte what it has always been; NDJSON is opt-in
+ * through KAI_TEST_JSON.
+ *
+ * Records go to fd 3 when the caller opens it, and only otherwise to
+ * stdout: a test body's own `Stdout.print` shares stdout with the report,
+ * and interleaved prose makes the stream unparseable. The driver opens
+ * fd 3 for `--json`, so the records always arrive on a clean channel.
+ *
+ * Selection (KAI_TEST_ONLY) filters by the same id the JSON emits,
+ * `<file>:<desc>`. A deselected block is not begun, so it is absent from
+ * both the records and the counters.
+ */
+
+static KAI_TLS int         kai_test_count_total  = 0;
+static KAI_TLS int         kai_test_count_passed = 0;
+static KAI_TLS const char *kai_test_current      = NULL;
+static KAI_TLS const char *kai_test_current_file = NULL;
+static KAI_TLS int         kai_test_current_line = 0;
+static KAI_TLS long long   kai_test_started_ns   = 0;
+static KAI_TLS long long   kai_test_suite_ns     = 0;
+static KAI_TLS int         kai_test_reported     = 0;
+static KAI_TLS jmp_buf     kai_test_jmp;
+static KAI_TLS int         kai_test_in_progress  = 0;
+
+static long long kai_test_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + (long long)ts.tv_nsec;
+}
+
+static int kai_test_json_mode(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *raw = getenv("KAI_TEST_JSON");
+        cached = (raw && *raw && strcmp(raw, "0") != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Where records land. fd 3 when the caller opened it, else stdout. */
+static FILE *kai_test_json_out(void) {
+    static FILE *cached = NULL;
+    if (!cached) {
+        if (fcntl(3, F_GETFD) != -1) cached = fdopen(3, "w");
+        if (!cached) cached = stdout;
+    }
+    return cached;
+}
+
+/* The file the running blocks were declared in. One test binary is built
+   per source file, so this is per-process, not per-block. The driver
+   supplies the user-facing path: the native paths compile a COPY of the
+   entry, so the path baked in at compile time would name a scratch file
+   the user cannot click. */
+static const char *kai_test_file(void) {
+    if (!kai_test_current_file) {
+        const char *env = getenv("KAI_TEST_FILE");
+        kai_test_current_file = (env && *env) ? env : "";
+    }
+    return kai_test_current_file;
+}
+
+static void kai_test_json_bytes(FILE *o, const char *s) {
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        switch (*p) {
+            case '"':  fputs("\\\"", o); break;
+            case '\\': fputs("\\\\", o); break;
+            case '\n': fputs("\\n", o);  break;
+            case '\r': fputs("\\r", o);  break;
+            case '\t': fputs("\\t", o);  break;
+            default:
+                if (*p < 0x20) fprintf(o, "\\u%04x", *p);
+                else           fputc((char)*p, o);
+        }
+    }
+}
+
+static void kai_test_json_str(FILE *o, const char *s) {
+    fputc('"', o);
+    kai_test_json_bytes(o, s);
+    fputc('"', o);
+}
+
+/* `<file>:<desc>` — stable across runs for an unchanged block, and the
+   exact spelling KAI_TEST_ONLY matches against. */
+static void kai_test_json_id(FILE *o) {
+    fputc('"', o);
+    kai_test_json_bytes(o, kai_test_file());
+    fputc(':', o);
+    kai_test_json_bytes(o, kai_test_current ? kai_test_current : "");
+    fputc('"', o);
+}
+
+static void kai_test_json_record(const char *status, const char *msg) {
+    long long ms = (kai_test_now_ns() - kai_test_started_ns) / 1000000LL;
+    FILE *o = kai_test_json_out();
+    fputs("{\"type\":\"test\",\"id\":", o);
+    kai_test_json_id(o);
+    fputs(",\"file\":", o);
+    kai_test_json_str(o, kai_test_file());
+    fprintf(o, ",\"line\":%d,\"status\":", kai_test_current_line);
+    kai_test_json_str(o, status);
+    fprintf(o, ",\"duration_ms\":%lld", ms < 0 ? 0 : ms);
+    if (msg) {
+        fputs(",\"message\":", o);
+        kai_test_json_str(o, msg);
+    }
+    fputs("}\n", o);
+    fflush(o);
+}
+
+/* Whether a block runs at all. KAI_TEST_ONLY is a newline-separated list
+   of ids; unset means every block runs. The needle is matched whole, so
+   one id is never a prefix of another's match. */
+static int kai_test_selected(const char *file, const char *desc) {
+    const char *only = getenv("KAI_TEST_ONLY");
+    if (!only || !*only) return 1;
+    size_t flen = strlen(file ? file : "");
+    size_t dlen = strlen(desc ? desc : "");
+    for (const char *p = only; *p; ) {
+        const char *nl = strchr(p, '\n');
+        size_t seg = nl ? (size_t)(nl - p) : strlen(p);
+        if (seg == flen + 1 + dlen &&
+            strncmp(p, file ? file : "", flen) == 0 &&
+            p[flen] == ':' &&
+            strncmp(p + flen + 1, desc ? desc : "", dlen) == 0) {
+            return 1;
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return 0;
+}
+
+static void kai_test_begin(const char *desc) {
+    kai_test_count_total++;
+    kai_test_current = desc;
+    kai_test_reported = 0;
+    kai_test_started_ns = kai_test_now_ns();
+}
+
+/* The declaration line of the block about to run, stamped by both
+   emitters right before the block's begin/run_one. */
+static void kai_test_line(int line) { kai_test_current_line = line; }
+
+/* A longjmp out of a test body that reported nothing came from a failure
+   path carrying no message of its own; the record must still exist. */
+static void kai_test_unreported_fail(void) {
+    if (kai_test_json_mode() && !kai_test_reported) {
+        kai_test_json_record("fail", "assertion failed");
+        kai_test_reported = 1;
+    }
+}
+
+static void kai_test_pass(void) {
+    kai_test_count_passed++;
+    if (kai_test_json_mode()) { kai_test_json_record("pass", NULL); kai_test_reported = 1; return; }
+    fprintf(stderr, "  ok   %s\n", kai_test_current ? kai_test_current : "");
+}
+
+static void kai_test_fail(const char *desc, const char *msg) {
+    if (kai_test_json_mode()) {
+        kai_test_json_record("fail", msg ? msg : "assertion failed");
+        kai_test_reported = 1;
+        return;
+    }
+    fprintf(stderr, "  FAIL %s : %s\n",
+            desc ? desc : "",
+            msg  ? msg  : "assertion failed");
+}
+
+static int kai_test_summary(void) {
+    int failed = kai_test_count_total - kai_test_count_passed;
+    if (kai_test_json_mode()) {
+        FILE *o = kai_test_json_out();
+        fprintf(o, "{\"type\":\"summary\",\"passed\":%d,\"failed\":%d,\"duration_ms\":%lld}\n",
+                kai_test_count_passed, failed, kai_test_suite_ns / 1000000LL);
+        fflush(o);
+    } else {
+        fprintf(stderr, "\n%d/%d tests passed\n",
+                kai_test_count_passed, kai_test_count_total);
+    }
+    return failed == 0 ? 0 : 1;
+}
+
+/* Run one test body through the begin/setjmp/pass landing pad. The
+   C-direct backend weaves this same shape inline into each emitted
+   `_kai_test_<id>`; the native backend cannot emit a generated `int
+   main`, so it emits each test body as a plain fn and drives them
+   through this helper. The setjmp landing lives HERE, not in `body` —
+   so `kai_assert_check`'s longjmp on a failed assertion unwinds into a
+   frame still on the stack, and the body fn itself stays
+   mem2reg-promotable (no setjmp in its IR). `body` returns the block's
+   final value (a boxed `KaiValue *`), decref'd here exactly as the
+   C-direct runner's `kai_decref(_body)`. */
+static void kai_test_run_one(const char *desc, KaiValue *(*body)(void)) {
+    if (!kai_test_selected(kai_test_file(), desc)) return;
+    long long t0 = kai_test_now_ns();
+    kai_test_begin(desc);
+    if (setjmp(kai_test_jmp) == 0) {
+        kai_test_in_progress = 1;
+        KaiValue *r = body();
+        kai_decref(r);
+        kai_test_in_progress = 0;
+        kai_test_pass();
+    } else {
+        kai_test_in_progress = 0;
+        kai_test_unreported_fail();
+    }
+    kai_test_suite_ns += kai_test_now_ns() - t0;
+}
+
+/* ---------- bench harness hooks (used by --bench runs) ----------
+ * bench v1.x (issue #437): per-iteration timings collected into a
+ * sample buffer; on finalize we sort and report median + MAD + mean
+ * + range. The emitted bench wrapper runs KAI_BENCH_WARMUP untimed
+ * iterations first to take JIT/cache effects out of the timed
+ * window, then KAI_BENCH_ITERS timed iterations. Both knobs read
+ * from getenv() at startup so the user can override without
+ * recompiling. KAI_BENCH_ITERS_DEFAULT is the compile-time fallback.
+ *
+ * Selfhost-bench (the compiler measuring itself) deferred to v1.y;
+ * see issue #40 for the split plan.
+ */
+
+#define KAI_BENCH_ITERS_DEFAULT  1000
+#define KAI_BENCH_WARMUP_DEFAULT 50
+
+static KAI_TLS int kai_bench_count_total = 0;
+
+static int kai_bench_iters_cached = -1;
+static int kai_bench_warmup_cached = -1;
+
+static int kai_bench_parse_int_env(const char *name, int fallback) {
+    const char *raw = getenv(name);
+    if (!raw || !*raw) return fallback;
+    long v = 0;
+    const char *p = raw;
+    int sign = 1;
+    if (*p == '-') { sign = -1; p++; }
+    if (!*p) return fallback;
+    while (*p) {
+        if (*p < '0' || *p > '9') return fallback;
+        v = v * 10 + (*p - '0');
+        if (v > 100000000L) return fallback;
+        p++;
+    }
+    v *= sign;
+    if (v < 0) return fallback;
+    return (int)v;
+}
+
+static int kai_bench_iters(void) {
+    if (kai_bench_iters_cached < 0) {
+        int v = kai_bench_parse_int_env("KAI_BENCH_ITERS", KAI_BENCH_ITERS_DEFAULT);
+        if (v < 1) v = 1;
+        kai_bench_iters_cached = v;
+    }
+    return kai_bench_iters_cached;
+}
+
+static int kai_bench_warmup(void) {
+    if (kai_bench_warmup_cached < 0) {
+        int v = kai_bench_parse_int_env("KAI_BENCH_WARMUP", KAI_BENCH_WARMUP_DEFAULT);
+        if (v < 0) v = 0;
+        kai_bench_warmup_cached = v;
+    }
+    return kai_bench_warmup_cached;
+}
+
+static long long kai_bench_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + (long long)ts.tv_nsec;
+}
+
+/* Per-bench sample buffer. One bench at a time runs to completion
+   before the next one starts (the emitted main calls them in
+   sequence), so a single shared buffer is enough — we just realloc
+   it lazily to the high-water mark. */
+static KAI_TLS long long *kai_bench_samples = NULL;
+static KAI_TLS int kai_bench_samples_cap = 0;
+
+static void kai_bench_ensure_capacity(int n) {
+    if (n <= kai_bench_samples_cap) return;
+    long long *r = (long long *)realloc(kai_bench_samples, (size_t)n * sizeof(long long));
+    if (!r) {
+        fprintf(stderr, "kai_bench: out of memory reserving %d samples\n", n);
+        exit(1);
+    }
+    kai_bench_samples = r;
+    kai_bench_samples_cap = n;
+}
+
+static void kai_bench_record(int idx, long long sample_ns) {
+    /* Caller has already ensured capacity. Out-of-range index
+       silently drops — defensive against emitter bugs that miscount
+       iterations. */
+    if (idx < 0 || idx >= kai_bench_samples_cap) return;
+    kai_bench_samples[idx] = sample_ns;
+}
+
+static int kai_bench_ll_cmp(const void *a, const void *b) {
+    long long la = *(const long long *)a;
+    long long lb = *(const long long *)b;
+    if (la < lb) return -1;
+    if (la > lb) return 1;
+    return 0;
+}
+
+static long long kai_bench_median_sorted(const long long *xs, int n) {
+    if (n <= 0) return 0;
+    return xs[n / 2];
+}
+
+static void kai_bench_finalize(const char *desc, int iters) {
+    /* Samples already populated by kai_bench_record(0..iters-1). */
+    if (iters <= 0) {
+        fprintf(stderr, "  %s: 0 iter / median 0 ns / MAD 0 ns / mean 0 ns / range [0, 0]\n",
+                desc ? desc : "(unnamed)");
+        kai_bench_count_total++;
+        return;
+    }
+    long long *xs = kai_bench_samples;
+    long long total = 0;
+    long long mn = xs[0];
+    long long mx = xs[0];
+    for (int i = 0; i < iters; i++) {
+        long long s = xs[i];
+        total += s;
+        if (s < mn) mn = s;
+        if (s > mx) mx = s;
+    }
+    long long mean = total / (long long)iters;
+    qsort(xs, (size_t)iters, sizeof(long long), kai_bench_ll_cmp);
+    long long median = kai_bench_median_sorted(xs, iters);
+    /* MAD: median(|x_i - median|). Reuse the sample buffer for the
+       deviations — we're done with the sorted samples. */
+    for (int i = 0; i < iters; i++) {
+        long long d = xs[i] - median;
+        if (d < 0) d = -d;
+        xs[i] = d;
+    }
+    qsort(xs, (size_t)iters, sizeof(long long), kai_bench_ll_cmp);
+    long long mad = kai_bench_median_sorted(xs, iters);
+    fprintf(stderr,
+            "  %s: %d iter / median %lld ns / MAD %lld ns / mean %lld ns / range [%lld, %lld]\n",
+            desc ? desc : "(unnamed)", iters, median, mad, mean, mn, mx);
+    kai_bench_count_total++;
+}
+
+static int kai_bench_summary(void) {
+    fprintf(stderr, "\n%d benches\n", kai_bench_count_total);
+    if (kai_bench_samples) {
+        free(kai_bench_samples);
+        kai_bench_samples = NULL;
+        kai_bench_samples_cap = 0;
+    }
+    return 0;
+}
+
+/* Run one bench body through warmup + timed iterations. The C-direct
+   backend weaves this loop inline into each `_kai_bench_<id>`; the
+   native backend emits each body as a fn returning the block's final
+   boxed value and drives them here, decref'ing each result like the
+   C-direct runner. No setjmp pad — an assertion inside a bench should
+   panic, since timing aborted code is meaningless (`kai_assert_check`
+   with `kai_test_in_progress == 0` panics, which is the wanted
+   behaviour). */
+static void kai_bench_run_one(const char *desc, KaiValue *(*body)(void)) {
+    int iters  = kai_bench_iters();
+    int warmup = kai_bench_warmup();
+    int i;
+    kai_bench_ensure_capacity(iters);
+    for (i = 0; i < warmup; i++) kai_decref(body());
+    for (i = 0; i < iters; i++) {
+        long long a = kai_bench_now_ns();
+        KaiValue *r = body();
+        long long b = kai_bench_now_ns();
+        kai_decref(r);
+        kai_bench_record(i, b - a);
+    }
+    kai_bench_finalize(desc, iters);
+}
+
+/* ---------- check harness hooks (used by --check runs) ----------
+ * check v1 (issue #44): property-based testing. Each `check "..."
+ * [with p: T, ...] { body }` block is executed KAI_CHECK_ITERS
+ * times. Each iteration generates random values for the with-clause
+ * params via kai_arbitrary_<T>() and runs the body. The body must
+ * produce a Bool — true means the property held for that input,
+ * false records a counterexample and exits early.
+ *
+ * v1 reports the FIRST counterexample only (no shrinking). Shrinking
+ * + median-based outlier-counterexample selection deferred to v1.x;
+ * protocol-based generators (impl Arbitrary for T) deferred to v2
+ * post-protocols maturity (see issue #44 split plan).
+ */
+
+#define KAI_CHECK_ITERS 100
+
+static KAI_TLS int kai_check_count_total = 0;
+static KAI_TLS int kai_check_count_passed = 0;
+static KAI_TLS const char *kai_check_current_desc = NULL;
+
+#define KAI_CHECK_CX_BUF 1024
+static KAI_TLS char kai_check_cx_buf[KAI_CHECK_CX_BUF];
+static KAI_TLS size_t kai_check_cx_len = 0;
+
+/* xorshift64* PRNG. Seeded once per process with a constant so
+   counterexample reports are reproducible run-to-run; reseed via
+   KAI_CHECK_SEED env var lands in v1.x. */
+static KAI_TLS uint64_t kai_check_seed = 0xC0DECAFE12345678ULL;
+
+static uint64_t kai_check_rand_u64(void) {
+    kai_check_seed ^= kai_check_seed >> 12;
+    kai_check_seed ^= kai_check_seed << 25;
+    kai_check_seed ^= kai_check_seed >> 27;
+    return kai_check_seed * 0x2545F4914F6CDD1DULL;
+}
+
+static void kai_check_cx_reset(void) {
+    kai_check_cx_buf[0] = '\0';
+    kai_check_cx_len = 0;
+}
+
+static void kai_check_cx_append_raw(const char *s, size_t n) {
+    if (!s || n == 0) return;
+    if (kai_check_cx_len + n + 1 >= KAI_CHECK_CX_BUF) {
+        n = KAI_CHECK_CX_BUF - 1 - kai_check_cx_len;
+        if (n == 0) return;
+    }
+    memcpy(kai_check_cx_buf + kai_check_cx_len, s, n);
+    kai_check_cx_len += n;
+    kai_check_cx_buf[kai_check_cx_len] = '\0';
+}
+
+static void kai_check_cx_append(const char *s) {
+    if (!s) return;
+    kai_check_cx_append_raw(s, strlen(s));
+}
+
+/* Records "name=<repr>" in the counterexample buffer. Called by the
+   emitted check fn after each kai_arbitrary_<T> generator inside the
+   per-iter loop, before evaluating the body, so that on failure the
+   buffer already holds every input the predicate saw. v repr uses
+   kai_to_string (borrow). */
+static void kai_check_record_param(const char *name, KaiValue *v) {
+    if (kai_check_cx_len > 0) kai_check_cx_append(", ");
+    kai_check_cx_append(name);
+    kai_check_cx_append("=");
+    KaiValue *s = kai_to_string(v);
+    if (kai_is_ptr(s) && s->tag == KAI_STR) {
+        kai_check_cx_append_raw(s->as.s.bytes, s->as.s.len);
+    }
+    kai_decref(s);
+}
+
+static void kai_check_begin(const char *desc) {
+    kai_check_count_total++;
+    kai_check_current_desc = desc;
+}
+
+static void kai_check_pass(int iters) {
+    kai_check_count_passed++;
+    fprintf(stderr, "  %s: %d iter, OK\n",
+            kai_check_current_desc ? kai_check_current_desc : "(unnamed)",
+            iters);
+}
+
+static void kai_check_fail(int iter_at) {
+    fprintf(stderr, "  %s: counterexample at iter %d: %s\n",
+            kai_check_current_desc ? kai_check_current_desc : "(unnamed)",
+            iter_at, kai_check_cx_buf);
+}
+
+static int kai_check_summary(void) {
+    fprintf(stderr, "\n%d/%d checks passed\n",
+            kai_check_count_passed, kai_check_count_total);
+    return (kai_check_count_passed == kai_check_count_total) ? 0 : 1;
+}
+
+/* Intrinsic generators (issue #44 path b). Each returns a fresh
+   KaiValue * with rc=1 ready for the body to consume or drop. The
+   ranges are kept small so counterexamples are human-readable
+   (Int in [-50, 50], String len in [0, 10], list len in [0, 7]). */
+
+static KaiValue *kai_arbitrary_int(void) {
+    int64_t r = (int64_t)(kai_check_rand_u64() % 101) - 50;
+    return kai_int(r);
+}
+
+static KaiValue *kai_arbitrary_bool(void) {
+    return kai_bool((int)(kai_check_rand_u64() & 1));
+}
+
+static KaiValue *kai_arbitrary_char(void) {
+    /* printable ASCII ('!' .. '~') */
+    uint32_t c = (uint32_t)(0x21 + (kai_check_rand_u64() % 0x5E));
+    return kai_char(c);
+}
+
+static KaiValue *kai_arbitrary_string(void) {
+    int len = (int)(kai_check_rand_u64() % 11);
+    char buf[16];
+    for (int i = 0; i < len; i++) {
+        buf[i] = (char)(0x21 + (kai_check_rand_u64() % 0x5E));
+    }
+    return kai_str_from_bytes(buf, (size_t) len);
+}
+
+/* List generators by element kind. v1 supports primitive elements
+   only. Structural sum/record/list-of-non-primitive lands in v1.x
+   together with the typer-side derivation. */
+#define KAI_DEFINE_ARBITRARY_LIST(NAME, ELEM)                          \
+    static KaiValue *NAME(void) {                                      \
+        int len = (int)(kai_check_rand_u64() % 8);                     \
+        KaiValue *acc = kai_nil();                                     \
+        for (int i = 0; i < len; i++) acc = kai_cons(ELEM(), acc);     \
+        return acc;                                                    \
+    }
+KAI_DEFINE_ARBITRARY_LIST(kai_arbitrary_list_int,    kai_arbitrary_int)
+KAI_DEFINE_ARBITRARY_LIST(kai_arbitrary_list_bool,   kai_arbitrary_bool)
+KAI_DEFINE_ARBITRARY_LIST(kai_arbitrary_list_char,   kai_arbitrary_char)
+KAI_DEFINE_ARBITRARY_LIST(kai_arbitrary_list_string, kai_arbitrary_string)
+#undef KAI_DEFINE_ARBITRARY_LIST
+
+/* ---------- shrinkers (issue #438) ---------------------------------
+ * Each kai_shrink_<T>(v) returns a NEW KaiValue* (rc=1) that is one
+ * greedy step closer to the canonical minimum, or NULL when no smaller
+ * candidate exists. Callers own both the input (untouched, still must
+ * be decref'd by the caller as before) and the returned value.
+ *
+ * Strategy is greedy and per-type:
+ *   Int    : halve toward 0 (sign-preserving).
+ *   Bool   : true → false; false → NULL.
+ *   Char   : bisect toward 'a'; if c == 'a' then NULL.
+ *   String : delete first byte; else if non-empty, shrink first non-'a'
+ *            byte toward 'a'; else NULL.
+ *   List   : delete head element; else shrink first element via the
+ *            per-T element shrinker; else NULL.
+ *
+ * Greedy means each step produces ONE candidate; the runner accepts it
+ * only if the predicate still fails. If accepted the runner shrinks
+ * again from the new candidate; if rejected the runner asks for the
+ * NEXT alternative — encoded by re-calling the shrinker on the same
+ * input, which is fine because each shrinker is deterministic and the
+ * runner falls through to a different param after one rejection (the
+ * only branch we care about for v1.x; integrated multi-strategy
+ * backtracking is post-1.0 per #438 out-of-scope). */
+
+static KaiValue *kai_shrink_int(KaiValue *v) {
+    if (!kai_is_int(v)) return NULL;
+    /* `v` may be a Koka-style tagged immediate (small Int) OR a heap
+       KAI_INT, so read through kai_intf — a raw `v->as.i` deref would
+       segv on the immediate (which has no header). */
+    int64_t x = kai_intf(v);
+    if (x == 0) return NULL;
+    /* Halve toward zero. Integer division on negatives in C is
+       truncation toward zero (C99 §6.5.5/6), so x/2 already does the
+       right thing for both signs (e.g. -8/2 = -4, -1/2 = 0). */
+    return kai_int(x / 2);
+}
+
+static KaiValue *kai_shrink_bool(KaiValue *v) {
+    if (!v || v->tag != KAI_BOOL) return NULL;
+    if (v->as.b == 0) return NULL;
+    return kai_bool(0);
+}
+
+static KaiValue *kai_shrink_char(KaiValue *v) {
+    if (!v || v->tag != KAI_CHAR) return NULL;
+    uint32_t c = v->as.c;
+    if (c == (uint32_t) 'a') return NULL;
+    /* Bisect toward 'a'. Converges in O(log) steps. */
+    uint32_t a = (uint32_t) 'a';
+    uint32_t next = (c > a) ? (a + (c - a) / 2) : (c + (a - c) / 2);
+    if (next == c) next = a;  /* defensive: ensure progress */
+    return kai_char(next);
+}
+
+static KaiValue *kai_shrink_string(KaiValue *v) {
+    if (!v || v->tag != KAI_STR) return NULL;
+    size_t len = v->as.s.len;
+    if (len > 0) {
+        /* Delete first byte. */
+        return kai_str_from_bytes(v->as.s.bytes + 1, len - 1);
+    }
+    return NULL;
+}
+
+/* List shrinker factory. Two strategies:
+   A) drop head — biggest single reduction, collapses toward nil.
+   B) elem shrink — walks the spine looking for the FIRST element
+      that still has a smaller form via ELEM_SHRINK and rebuilds the
+      list with that one element replaced. Returns NULL if every
+      element is at its own minimum.
+   The walk-and-replace pattern gives strategy B a deterministic
+   linear sweep across the full list, not just the head, so e.g.
+   [0, -30] still has a productive shrink (rebuild to [0, -15]). */
+#define KAI_DEFINE_SHRINK_LIST(NAME, ELEM_SHRINK)                          \
+    static KaiValue *NAME(KaiValue *v) {                                   \
+        if (!v) return NULL;                                               \
+        if (v->tag == KAI_NIL) return NULL;                                \
+        if (v->tag != KAI_CONS) return NULL;                               \
+        KaiValue *tail = v->as.cons.tail;                                  \
+        kai_incref(tail);                                                  \
+        return tail;                                                       \
+    }                                                                      \
+    /* Rebuild prefix (in reverse) onto a new tail. Helper for strategy B. \
+       Each element in `rev_prefix` is a borrowed pointer and is incref'd  \
+       as it lands in the new spine; the new spine takes ownership of the  \
+       passed-in `tail` (no extra incref). */                              \
+    static KaiValue *NAME##_rebuild(KaiValue **rev_prefix, int n,          \
+                                    KaiValue *tail) {                      \
+        KaiValue *acc = tail;                                              \
+        for (int i = 0; i < n; i++) {                                      \
+            KaiValue *h = rev_prefix[i];                                   \
+            kai_incref(h);                                                 \
+            acc = kai_cons(h, acc);                                        \
+        }                                                                  \
+        return acc;                                                        \
+    }                                                                      \
+    static KaiValue *NAME##_head(KaiValue *v) {                            \
+        if (!v || v->tag != KAI_CONS) return NULL;                         \
+        /* First pass: walk to find the first shrinkable element. */       \
+        KaiValue *prefix[64];                                              \
+        int prefix_n = 0;                                                  \
+        KaiValue *cur = v;                                                 \
+        while (cur != NULL && cur->tag == KAI_CONS) {                      \
+            KaiValue *h = cur->as.cons.head;                               \
+            KaiValue *h2 = ELEM_SHRINK(h);                                 \
+            if (h2 != NULL) {                                              \
+                /* Build new list: h2 :: cur->tail (incref'd) prepended    \
+                   by the walked prefix in reverse. */                     \
+                KaiValue *new_tail = cur->as.cons.tail;                    \
+                kai_incref(new_tail);                                      \
+                KaiValue *acc = kai_cons(h2, new_tail);                    \
+                acc = NAME##_rebuild(prefix, prefix_n, acc);               \
+                return acc;                                                \
+            }                                                              \
+            if (prefix_n >= 64) return NULL; /* bound spine walk */         \
+            prefix[prefix_n++] = h;                                        \
+            cur = cur->as.cons.tail;                                       \
+        }                                                                  \
+        return NULL;                                                       \
+    }
+KAI_DEFINE_SHRINK_LIST(kai_shrink_list_int,    kai_shrink_int)
+KAI_DEFINE_SHRINK_LIST(kai_shrink_list_bool,   kai_shrink_bool)
+KAI_DEFINE_SHRINK_LIST(kai_shrink_list_char,   kai_shrink_char)
+KAI_DEFINE_SHRINK_LIST(kai_shrink_list_string, kai_shrink_string)
+#undef KAI_DEFINE_SHRINK_LIST
+
+/* Per-process shrink-iteration cap. KAI_CHECK_SHRINK_ITERS in the env
+   overrides; default 200 per #438. Read once and memoised so we don't
+   pay getenv cost per shrink step. */
+#define KAI_CHECK_SHRINK_ITERS_DEFAULT 200
+static int kai_check_shrink_iters_cached = -1;
+static int kai_check_shrink_iters_limit(void) {
+    if (kai_check_shrink_iters_cached >= 0) return kai_check_shrink_iters_cached;
+    const char *env = getenv("KAI_CHECK_SHRINK_ITERS");
+    int n = KAI_CHECK_SHRINK_ITERS_DEFAULT;
+    if (env && *env) {
+        int parsed = atoi(env);
+        if (parsed >= 0) n = parsed;
+    }
+    kai_check_shrink_iters_cached = n;
+    return n;
+}
+
+/* Counterexample-buffer side channel for shrinking. When a failure
+   triggers shrinking, the runner first snapshots the original cx
+   buffer here so the final report can show "<orig> shrunk to <min>".
+   Bounded by the same KAI_CHECK_CX_BUF cap as the live buffer. */
+static KAI_TLS char kai_check_orig_cx_buf[KAI_CHECK_CX_BUF];
+static KAI_TLS int  kai_check_has_orig_cx = 0;
+
+static void kai_check_cx_save_orig(void) {
+    size_t n = kai_check_cx_len;
+    if (n >= KAI_CHECK_CX_BUF) n = KAI_CHECK_CX_BUF - 1;
+    memcpy(kai_check_orig_cx_buf, kai_check_cx_buf, n);
+    kai_check_orig_cx_buf[n] = '\0';
+    kai_check_has_orig_cx = 1;
+}
+
+/* Reports a shrunk counterexample. If the shrink loop produced a
+   strictly smaller value, prints both forms; otherwise (no progress)
+   degrades to the v1 single-form output so noise stays low. */
+static void kai_check_fail_shrunk(int iter_at) {
+    if (kai_check_has_orig_cx
+        && strcmp(kai_check_orig_cx_buf, kai_check_cx_buf) != 0) {
+        fprintf(stderr,
+                "  %s: counterexample at iter %d: %s, shrunk to %s\n",
+                kai_check_current_desc ? kai_check_current_desc : "(unnamed)",
+                iter_at, kai_check_orig_cx_buf, kai_check_cx_buf);
+    } else {
+        fprintf(stderr, "  %s: counterexample at iter %d: %s\n",
+                kai_check_current_desc ? kai_check_current_desc : "(unnamed)",
+                iter_at, kai_check_cx_buf);
+    }
+    kai_check_has_orig_cx = 0;
+}
+
+/* Runtime-aware assert: called from every emitted `assert`. Inside an
+   active test (kai_test_in_progress) it prints a failure and longjmps
+   back to the test harness so the next test can run. Otherwise it
+   aborts the process via kai_core_panic, matching stage 0's
+   non-test-mode behaviour. */
+static void kai_assert_check(KaiValue *cond, const char *msg) {
+    int ok = kai_op_truthy(cond);
+    kai_decref(cond);
+    if (ok) return;
+    if (kai_test_in_progress) {
+        kai_test_fail(kai_test_current, msg ? msg : "assertion failed");
+        longjmp(kai_test_jmp, 1);
+    } else {
+        kai_core_panic(kai_str(msg ? msg : "assertion failed"));
+    }
+}
+
+/* Issue #86 (piece 2): contract-violation assert that appends the
+   runtime value of the offending binding to the panic message. Used
+   by the refinement-desugar path when the predicate has the simple
+   shape `<ident> <binop> <literal>` and the emitter could statically
+   resolve the single ident's local. `base_msg` is the predicate-aware
+   piece-1 context ("requires violated in `<fn>`\nrequired: ..."); the
+   appended line is "\nargument <ident_name> was: <value>".
+
+   Ownership: `cond` and `val` are both CONSUMED (decref'd on every
+   path). The call site passes a fresh owned ref for `val` — a boxed
+   local is forwarded via `kai_incref`, a raw-unboxed scalar via a
+   fresh `kai_real`/`kai_int` box. `kai_to_string` is a borrow on its
+   argument, so we decref `val` ourselves once the string is built.
+   Every owned temp (`vs`, `full`, `val`) is released before the
+   longjmp so a failure inside an active test block does not leak
+   (KAI_TRACE_RC / ASAN gate the lane on this). */
+static void kai_assert_check_with_value(KaiValue *cond, const char *base_msg,
+                                        const char *ident_name, KaiValue *val) {
+    int ok = kai_op_truthy(cond);
+    kai_decref(cond);
+    if (ok) { kai_decref(val); return; }
+    KaiValue *vs   = kai_to_string(val);
+    kai_decref(val);
+    KaiValue *m0   = kai_str(base_msg ? base_msg : "assertion failed");
+    KaiValue *m1   = kai_string_concat(m0, kai_str("\nargument "));
+    KaiValue *m2   = kai_string_concat(m1, kai_str(ident_name ? ident_name : "?"));
+    KaiValue *m3   = kai_string_concat(m2, kai_str(" was: "));
+    KaiValue *full = kai_string_concat(m3, vs);
+    kai_decref(m0); kai_decref(m1); kai_decref(m2); kai_decref(m3); kai_decref(vs);
+    if (kai_test_in_progress) {
+        kai_test_fail(kai_test_current, full->as.s.bytes);
+        kai_decref(full);
+        longjmp(kai_test_jmp, 1);
+    } else {
+        kai_core_panic(full);
+    }
+}
+
+/* =================================================================
+ * Effects: handler-stack runtime (m7a #5)
+ * =================================================================
+ *
+ * Per docs/effects-impl.md §*Handler-stack runtime*. Each fiber
+ * owns a stack of Evidence nodes; m7a operates with a single
+ * implicit fiber (kai_main_fiber), but the layout is per-fiber so
+ * m8's real scheduler can introduce fibers without refactoring
+ * this part of the runtime (Doc C OQ #3, decided).
+ *
+ * The Evidence node itself is intentionally untyped on the
+ * `handler` slot: each effect's compiled `Ev<Eff>` struct lives
+ * elsewhere; the call site casts back to *Ev<Eff> at the point
+ * where the effect name is statically known.
+ *
+ * m7a #6 will wire `handle { ... } with Eff { ... }` lowering to
+ * call kai_evidence_push / kai_evidence_pop, and `Eff.op(args)` to
+ * call kai_evidence_lookup.
+ */
+
+/* m7a #6a: handler-id stamped onto each EvE struct at handle entry,
+ * and copied into the continuation closure for one-shot diagnostics
+ * (Doc C §*resume representation*). The id is cosmetic — the
+ * status byte in the continuation is the real one-shot check.
+ * Monotonic + unique-per-process is enough for v1; m8 may revisit
+ * if cross-fiber id collisions become a debugging concern. */
+typedef unsigned long long KaiHandlerId;
+
+/* Handler ids must be unique per process: a handler installed in one TU and
+ * one in another would draw colliding ids from a per-TU counter (both start
+ * at 1). One shared counter (owner defines, others extern). Under M:N every
+ * scheduler thread installs handlers, so the bump is atomic — colliding ids
+ * across threads would alias distinct handler frames in effect dispatch. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern _Atomic KaiHandlerId kai_next_handler_id;
+#  if defined(KAI_RUNTIME_OWNER)
+_Atomic KaiHandlerId kai_next_handler_id = 1;
+#  endif
+#else
+static _Atomic KaiHandlerId kai_next_handler_id = 1;
+#endif
+
+static KaiHandlerId kai_fresh_handler_id(void) {
+    return atomic_fetch_add(&kai_next_handler_id, 1);
+}
+
+/* m7a #6d: continuation closure, stack-allocated at every op call
+ * site (Doc C §*resume representation* one-shot path). `status` is
+ * the one-shot check: the first call to `resume` flips it from
+ * UNRESUMED to RESUMED, the second call aborts with a runtime
+ * diagnostic. `fn` + `env` together name the rest of the
+ * computation; m7a #6d ships only the identity continuation
+ * (kai_cont_identity), so resume is effectively a tail return of
+ * its argument. The full CPS reification (the rest of the caller's
+ * body as a separately emitted function) is a later milestone. */
+typedef enum {
+    KAI_CONT_UNRESUMED = 0,
+    KAI_CONT_RESUMED   = 1
+} KaiContStatus;
+
+typedef struct KaiCont KaiCont;
+struct KaiCont {
+    KaiContStatus  status;
+    void          *env;
+    KaiValue     *(*fn)(void *env, KaiValue *v);
+    KaiHandlerId   handler_id;
+};
+
+/* Identity continuation: returns its argument unchanged. Until the
+ * CPS transform reifies the rest of the caller's body, every op
+ * call site uses this as the resume target — so the one-shot check
+ * is observable but the continuation is functionally a no-op. */
+static KaiValue *kai_cont_identity(void *env, KaiValue *v) {
+    (void) env;
+    return v;
+}
+
+static void kai_cont_init_identity(KaiCont *k, KaiHandlerId hid) {
+    k->status     = KAI_CONT_UNRESUMED;
+    k->env        = NULL;
+    k->fn         = &kai_cont_identity;
+    k->handler_id = hid;
+}
+
+/* Surface `resume(v)` lowers to this. The check + flip + tail call
+ * all happen here; the clause body sees a single function call. */
+static KaiValue *kai_cont_resume(KaiCont *k, KaiValue *v) {
+    if (k->status != KAI_CONT_UNRESUMED) {
+        fprintf(stderr,
+            "kai: continuation resumed twice (handler #%llu)\n",
+            (unsigned long long) k->handler_id);
+        exit(1);
+    }
+    k->status = KAI_CONT_RESUMED;
+    return k->fn(k->env, v);
+}
+
+/* m12.8 Phase 4b: split Console into atomic Stdout (print) and
+ * Stderr (eprint) default handlers. Both write the string + a
+ * trailing '\n' and resume with `()`. *Self is opaque to the
+ * runtime because `EvStdout` / `EvStderr` are compiler-emitted
+ * types — the cast happens at the assignment in the main wrapper.
+ *
+ * EPIPE absorption (Doc B §`Console`/Default handler) is later
+ * polish — for now any write fault propagates through fputs's
+ * default behaviour. The minimal-but-useful path lands first. */
+static KaiValue *kai_default_stdout_print(void *self, KaiValue *s, KaiCont *k) {
+    (void) self;
+    flockfile(stdout);
+    if (kai_is_ptr(s) && s->tag == KAI_STR) {
+        fwrite(s->as.s.bytes, 1, s->as.s.len, stdout);
+    }
+    fputc('\n', stdout);
+    funlockfile(stdout);
+    return kai_cont_resume(k, kai_unit());
+}
+
+static KaiValue *kai_default_stderr_eprint(void *self, KaiValue *s, KaiCont *k) {
+    (void) self;
+    flockfile(stderr);
+    if (kai_is_ptr(s) && s->tag == KAI_STR) {
+        fwrite(s->as.s.bytes, 1, s->as.s.len, stderr);
+    }
+    fputc('\n', stderr);
+    funlockfile(stderr);
+    return kai_cont_resume(k, kai_unit());
+}
+
+static KaiValue *kai_default_stdout_is_tty(void *self, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_bool(isatty(STDOUT_FILENO) != 0));
+}
+
+static KaiValue *kai_default_stderr_is_tty(void *self, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_bool(isatty(STDERR_FILENO) != 0));
+}
+
+static KaiValue *kai_default_stdin_is_tty(void *self, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_bool(isatty(STDIN_FILENO) != 0));
+}
+
+/* m7a #7 + Issue #620 — Phase R3 reactor: default Stdin handler.
+ * Doc B §`Stdin` declares `read_line() : Option[String] / Fail`;
+ * m7a simplifies to `: Option[String]`. EOF maps to None; any byte
+ * read returns Some(line) with the trailing '\n' stripped if
+ * present.
+ *
+ * R3 wiring: fd 0 is flipped to O_NONBLOCK once per process, then
+ * read() loops accumulating bytes. On EAGAIN the fiber parks on
+ * `kai_reactor_stdin_waiter` and the scheduler's poll() loop wakes
+ * it when POLLIN / POLLHUP arrives on STDIN_FILENO. Multiple
+ * concurrent readers are a logic bug (the bytes shred between
+ * fibers); the second reader panics with a clear diagnostic. */
+KAI_SCHED_FN KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    kai_reactor_init();
+    kai_reactor_stdin_set_nonblocking();
+
+    size_t cap = KAI_READ_BUF_INIT, n = 0;
+    char *buf = (char *) malloc(cap);
+    if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+
+    for (;;) {
+        if (n + 1 >= cap) { cap *= 2; buf = (char *) realloc(buf, cap); }
+        ssize_t r = read(STDIN_FILENO, buf + n, 1);
+        if (r > 0) {
+            if (buf[n] == '\n') {
+                /* Strip the trailing newline. */
+                KaiValue *s = kai_str_from_bytes(buf, n);
+                free(buf);
+                KaiValue *some = kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = s}});
+                return kai_cont_resume(k, some);
+            }
+            n++;
+        } else if (r == 0) {
+            /* EOF — peer closed. Partial line returned as Some;
+             * empty buffer becomes None. */
+            if (n == 0) {
+                free(buf);
+                return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));
+            }
+            KaiValue *s = kai_str_from_bytes(buf, n);
+            free(buf);
+            KaiValue *some = kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = s}});
+            return kai_cont_resume(k, some);
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* No bytes available — park the fiber on the reactor
+             * until POLLIN fires on stdin. */
+            if (kai_reactor_park_stdin(kai_current_fiber()) != 0) {
+                fprintf(stderr,
+                    "kai: stdin: multiple fibers reading concurrently "
+                    "is undefined; serialize via an actor\n");
+                exit(1);
+            }
+            /* Resumed: drain helper cleared the waiter slot. Loop
+             * to retry the read. */
+        } else if (errno == EINTR) {
+            /* Signal interrupted the read — retry immediately. */
+            continue;
+        } else {
+            /* Real I/O error. The op's surface type is
+             * `Option[String]`; propagate as None and let the
+             * caller see end-of-stream. Keeps parity with the
+             * pre-R3 fgetc path which silently treated errors as
+             * EOF. */
+            free(buf);
+            return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));
+        }
+    }
+}
+#endif
+
+/* Issue #453 + #620 — Phase R3: default Stdin.read_bytes handler.
+ * Returns a String of at most `n` raw bytes; on EOF the returned
+ * String is shorter than `n` — possibly empty. No Result wrapper —
+ * the LSP framing use case treats a short read as end-of-stream.
+ *
+ * R3 wiring: same shape as read_line — non-blocking read() loop
+ * with reactor parking on EAGAIN. The buffer is sized once up
+ * front so partial reads accumulate without realloc. */
+KAI_SCHED_FN KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    int64_t want = 0;
+    if (n && kai_is_int(n) && kai_intf(n) > 0) want = kai_intf(n);
+    if (want <= 0) {
+        return kai_cont_resume(k, kai_str_from_bytes("", 0));
+    }
+
+    kai_reactor_init();
+    kai_reactor_stdin_set_nonblocking();
+
+    char *buf = (char *) malloc((size_t) want);
+    if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    size_t got = 0;
+
+    while (got < (size_t) want) {
+        ssize_t r = read(STDIN_FILENO, buf + got, (size_t) want - got);
+        if (r > 0) {
+            got += (size_t) r;
+        } else if (r == 0) {
+            /* EOF — return what we have. */
+            break;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (kai_reactor_park_stdin(kai_current_fiber()) != 0) {
+                fprintf(stderr,
+                    "kai: stdin: multiple fibers reading concurrently "
+                    "is undefined; serialize via an actor\n");
+                exit(1);
+            }
+        } else if (errno == EINTR) {
+            continue;
+        } else {
+            /* Real I/O error — surface as short read (matches
+             * fread's silent behaviour on the pre-R3 path). */
+            break;
+        }
+    }
+
+    KaiValue *s = kai_str_from_bytes(buf, got);
+    free(buf);
+    return kai_cont_resume(k, s);
+}
+#endif
+
+/* m7a #7: default Env handlers. `args()` reuses kai_core_args
+ * (returns a [String] of argv[1..]); `var(name)` wraps getenv:
+ * present → Some(value), absent → None. */
+static KaiValue *kai_default_env_args(void *self, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_core_args());
+}
+
+static KaiValue *kai_default_env_get(void *self, KaiValue *name, KaiCont *k) {
+    (void) self;
+    if (!name || name->tag != KAI_STR) {
+        return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));
+    }
+    char nbuf[KAI_ENV_NAME_BUF];
+    size_t nlen = name->as.s.len < sizeof(nbuf) - 1 ? name->as.s.len : sizeof(nbuf) - 1;
+    memcpy(nbuf, name->as.s.bytes, nlen);
+    nbuf[nlen] = '\0';
+    const char *got = getenv(nbuf);
+    if (!got) return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));
+    KaiValue *s = kai_str(got);
+    KaiValue *some = kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = s}});
+    return kai_cont_resume(k, some);
+}
+
+/* Issue #127: Env write side + full block enumeration. POSIX
+ * `setenv(name, value, 1)` copies its arguments into libc-owned
+ * storage on both glibc and Apple libc, so the local stack buffers
+ * here are safe to release on return — no buffer-ownership leak
+ * across the FFI boundary. Errors lift `strerror(errno)` into a
+ * fresh `Err(String)`. `vars()` walks the POSIX `environ` array,
+ * splitting each `KEY=VALUE` entry into a `Pair { fst, snd }` so
+ * the surface type lines up with `[(String, String)]`. */
+extern char **environ;
+
+static KaiValue *kai_default_env_set_var(void *self, KaiValue *name,
+                                          KaiValue *value, KaiCont *k) {
+    (void) self;
+    if (!name || name->tag != KAI_STR || !value || value->tag != KAI_STR) {
+        KaiValue *m = kai_str("set_var: name and value must be Strings");
+        KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
+        return kai_cont_resume(k, err);
+    }
+    char nbuf[KAI_ENV_NAME_BUF];
+    size_t nlen = name->as.s.len < sizeof(nbuf) - 1 ? name->as.s.len : sizeof(nbuf) - 1;
+    memcpy(nbuf, name->as.s.bytes, nlen);
+    nbuf[nlen] = '\0';
+    /* setenv copies value too; an arbitrarily-long content string can
+     * outgrow the stack buffer, so heap-dup once and free after the
+     * call returns. */
+    char *vbuf = (char *) malloc(value->as.s.len + 1);
+    if (!vbuf) {
+        KaiValue *m = kai_str("set_var: out of memory");
+        KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
+        return kai_cont_resume(k, err);
+    }
+    if (value->as.s.len > 0) memcpy(vbuf, value->as.s.bytes, value->as.s.len);
+    vbuf[value->as.s.len] = '\0';
+    int rc = setenv(nbuf, vbuf, 1);
+    int saved_errno = errno;
+    free(vbuf);
+    if (rc != 0) {
+        const char *msg = strerror(saved_errno);
+        if (!msg) msg = "set_var failed";
+        KaiValue *m = kai_str(msg);
+        KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
+        return kai_cont_resume(k, err);
+    }
+    KaiValue *u = kai_unit();
+    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
+    return kai_cont_resume(k, ok);
+}
+
+static KaiValue *kai_default_env_unset_var(void *self, KaiValue *name, KaiCont *k) {
+    (void) self;
+    if (!name || name->tag != KAI_STR) {
+        KaiValue *m = kai_str("unset_var: name must be a String");
+        KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
+        return kai_cont_resume(k, err);
+    }
+    char nbuf[KAI_ENV_NAME_BUF];
+    size_t nlen = name->as.s.len < sizeof(nbuf) - 1 ? name->as.s.len : sizeof(nbuf) - 1;
+    memcpy(nbuf, name->as.s.bytes, nlen);
+    nbuf[nlen] = '\0';
+    if (unsetenv(nbuf) != 0) {
+        const char *msg = strerror(errno);
+        if (!msg) msg = "unset_var failed";
+        KaiValue *m = kai_str(msg);
+        KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
+        return kai_cont_resume(k, err);
+    }
+    KaiValue *u = kai_unit();
+    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
+    return kai_cont_resume(k, ok);
+}
+
+static KaiValue *kai_default_env_vars(void *self, KaiCont *k) {
+    (void) self;
+    /* Build the list head-down via list_append so the surface order
+     * matches the libc enumeration order (first entry of `environ`
+     * appears as head). cons-then-reverse would also work; this
+     * shape mirrors how `kai_core_args` walks argv. */
+    KaiValue *acc = kai_nil();
+    int count = 0;
+    for (char **ep = environ; ep && *ep; ++ep) ++count;
+    for (int i = count - 1; i >= 0; --i) {
+        const char *entry = environ[i];
+        if (!entry) continue;
+        const char *eq = strchr(entry, '=');
+        size_t name_len  = eq ? (size_t) (eq - entry) : strlen(entry);
+        const char *vstart = eq ? eq + 1 : "";
+        size_t value_len = eq ? strlen(vstart) : 0;
+        KaiValue *name_kv  = kai_str_from_bytes(entry, name_len);
+        KaiValue *value_kv = kai_str_from_bytes(vstart, value_len);
+        KaiValue *fields[2] = { name_kv, value_kv };
+        static const char *names[2] = { "fst", "snd" };
+        KaiValue *pair = kai_record(2, fields, names);
+        acc = kai_cons(pair, acc);
+    }
+    return kai_cont_resume(k, acc);
+}
+
+/* m7a #7: default File handlers. Each reuses the core helper —
+ * which already produces `Result[T, String]` shapes per Doc B
+ * §`File` error model — but routes the call through the Phase R1
+ * reactor's file-pool worker (issue #611) so the blocking `fopen`
+ * / `fread` / `fwrite` syscall runs off the scheduler thread.
+ * Other fibers therefore make forward progress while one is mid
+ * file op.
+ *
+ * Each `_arg` struct lives on the calling fiber's stack for the
+ * lifetime of the work; the `_thunk` runs on a pool worker thread
+ * and returns the KaiValue * the core produced. */
+typedef struct {
+    KaiValue *path;
+} KaiFileReadFileArg;
+static KaiValue *_kai_file_read_file_thunk(void *arg) {
+    KaiFileReadFileArg *a = (KaiFileReadFileArg *) arg;
+    return kai_core_read_file(a->path);
+}
+KAI_SCHED_FN KaiValue *kai_default_file_read_file(void *self, KaiValue *path, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    kai_reactor_init();
+    KaiFileReadFileArg a = { kai_incref(path) };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_read_file_thunk, &a);
+    return kai_cont_resume(k, r);
+}
+#endif
+
+typedef struct {
+    KaiValue *path;
+    KaiValue *contents;
+} KaiFileWriteFileArg;
+static KaiValue *_kai_file_write_file_thunk(void *arg) {
+    KaiFileWriteFileArg *a = (KaiFileWriteFileArg *) arg;
+    return kai_core_write_file(a->path, a->contents);
+}
+KAI_SCHED_FN KaiValue *kai_default_file_write_file(void *self, KaiValue *path,
+                                              KaiValue *contents, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    kai_reactor_init();
+    KaiFileWriteFileArg a = { kai_incref(path), kai_incref(contents) };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_write_file_thunk, &a);
+    return kai_cont_resume(k, r);
+}
+#endif
+
+/* The `_thunk`s below reach `kai_core_*` helpers that consume their
+ * arguments, so each op arg is increfed into the `_arg` struct: the ref
+ * the call site handed over is the one the extern-handler bridge
+ * releases (see the op-argument ABI note at `kai_default_spawn_yield`).
+ *
+ * Issue #771 Phase 1: default handlers for the five chunked `File`
+ * ops. Each offloads its blocking syscall to the R1 pool worker and
+ * parks the fiber, identical to read_file/write_file above — regular
+ * files are not epoll-pollable, so the pool is the readiness path. The
+ * `_arg` struct lives on the fiber stack for the duration of the work;
+ * the `_thunk` runs on a pool thread and returns the core's value. */
+typedef struct { KaiValue *path; } KaiFileOpenArg;
+static KaiValue *_kai_file_open_read_thunk(void *arg) {
+    return kai_core_file_open_read(((KaiFileOpenArg *) arg)->path);
+}
+KAI_SCHED_FN KaiValue *kai_default_file_open_read(void *self, KaiValue *path, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    kai_reactor_init();
+    KaiFileOpenArg a = { kai_incref(path) };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_open_read_thunk, &a);
+    return kai_cont_resume(k, r);
+}
+#endif
+
+typedef struct { KaiValue *h; KaiValue *max; } KaiFileReadChunkArg;
+static KaiValue *_kai_file_read_chunk_thunk(void *arg) {
+    KaiFileReadChunkArg *a = (KaiFileReadChunkArg *) arg;
+    return kai_core_file_read_chunk(a->h, a->max);
+}
+KAI_SCHED_FN KaiValue *kai_default_file_read_chunk(void *self, KaiValue *h, KaiValue *max, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    kai_reactor_init();
+    KaiFileReadChunkArg a = { kai_incref(h), kai_incref(max) };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_read_chunk_thunk, &a);
+    return kai_cont_resume(k, r);
+}
+#endif
+
+static KaiValue *_kai_file_open_write_thunk(void *arg) {
+    return kai_core_file_open_write(((KaiFileOpenArg *) arg)->path);
+}
+KAI_SCHED_FN KaiValue *kai_default_file_open_write(void *self, KaiValue *path, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    kai_reactor_init();
+    KaiFileOpenArg a = { kai_incref(path) };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_open_write_thunk, &a);
+    return kai_cont_resume(k, r);
+}
+#endif
+
+typedef struct { KaiValue *h; KaiValue *data; } KaiFileWriteChunkArg;
+static KaiValue *_kai_file_write_chunk_thunk(void *arg) {
+    KaiFileWriteChunkArg *a = (KaiFileWriteChunkArg *) arg;
+    return kai_core_file_write_chunk(a->h, a->data);
+}
+KAI_SCHED_FN KaiValue *kai_default_file_write_chunk(void *self, KaiValue *h, KaiValue *data, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    kai_reactor_init();
+    KaiFileWriteChunkArg a = { kai_incref(h), kai_incref(data) };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_write_chunk_thunk, &a);
+    return kai_cont_resume(k, r);
+}
+#endif
+
+typedef struct { KaiValue *h; } KaiFileCloseArg;
+static KaiValue *_kai_file_close_thunk(void *arg) {
+    return kai_core_file_close(((KaiFileCloseArg *) arg)->h);
+}
+KAI_SCHED_FN KaiValue *kai_default_file_close_file(void *self, KaiValue *h, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    kai_reactor_init();
+    KaiFileCloseArg a = { kai_incref(h) };
+    KaiValue *r = kai_reactor_run_in_pool(_kai_file_close_thunk, &a);
+    return kai_cont_resume(k, r);
+}
+#endif
+
+/* m7b #2b: default Mutable handler — wraps the core `array_*`
+ * helpers and resumes with the result. Doc B §`Mutable` *Default
+ * handler* says the trivial wrapping default is installed for any
+ * main row that mentions Mutable. The op signatures here mirror
+ * the core's Array[T] return shape (see compiler.kai
+ * builtin_mutable_decl for the divergence note from Doc B).
+ *
+ * The `kai_core_*` helpers consume their arguments, so each op arg is
+ * increfed into the call: the ref the call site handed over is the one
+ * the extern-handler bridge releases (see the op-argument ABI note at
+ * `kai_default_spawn_yield`). */
+static KaiValue *kai_default_mutable_array_make(void *self, KaiValue *n,
+                                                 KaiValue *init, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_core_array_make(kai_incref(n), kai_incref(init)));
+}
+
+static KaiValue *kai_default_mutable_array_length(void *self, KaiValue *a, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_core_array_length(kai_incref(a)));
+}
+
+static KaiValue *kai_default_mutable_array_get(void *self, KaiValue *a,
+                                                KaiValue *i, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_core_array_get(kai_incref(a), kai_incref(i)));
+}
+
+static KaiValue *kai_default_mutable_array_set(void *self, KaiValue *a,
+                                                KaiValue *i, KaiValue *v, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_core_array_set(kai_incref(a), kai_incref(i), kai_incref(v)));
+}
+
+static KaiValue *kai_default_mutable_array_grow(void *self, KaiValue *a,
+                                                 KaiValue *n, KaiValue *init, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_core_array_grow(kai_incref(a), kai_incref(n), kai_incref(init)));
+}
+
+/* Issue #257: Ref[T] ops in the default Mutable handler. Each
+ * trampolines to its core helper and resumes with the result,
+ * mirroring the array_* clauses above. */
+static KaiValue *kai_default_mutable_ref_make(void *self, KaiValue *init, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_core_ref_make(kai_incref(init)));
+}
+
+static KaiValue *kai_default_mutable_ref_get(void *self, KaiValue *r, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_core_ref_get(kai_incref(r)));
+}
+
+static KaiValue *kai_default_mutable_ref_set(void *self, KaiValue *r,
+                                              KaiValue *v, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_core_ref_set(kai_incref(r), kai_incref(v)));
+}
+
+/* Default Random handler — PCG32 (M.E.O'Neill 2014). Per-process
+ * shared state, seeded once on first use from time(NULL). Doc B
+ * §`Random` specifies seeding from SecureRandom; that is deferred
+ * until SecureRandom lands. Non-cryptographic by design — for
+ * games, simulations, sampling, fixtures. */
+/* Per-process RNG stream: one shared state so a seed in one TU is observed
+ * by random() in another (owner defines, others extern). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS uint64_t _kai_pcg_state;
+extern KAI_TLS uint64_t _kai_pcg_inc;
+extern KAI_TLS int      _kai_pcg_seeded;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS uint64_t _kai_pcg_state  = 0x853c49e6748fea9bULL;
+KAI_TLS uint64_t _kai_pcg_inc    = 0xda3e39cb94b95bdbULL;
+KAI_TLS int      _kai_pcg_seeded = 0;
+#  endif
+#else
+static KAI_TLS uint64_t _kai_pcg_state  = 0x853c49e6748fea9bULL;
+static KAI_TLS uint64_t _kai_pcg_inc    = 0xda3e39cb94b95bdbULL;
+static KAI_TLS int      _kai_pcg_seeded = 0;
+#endif
+
+static uint32_t _kai_pcg32_next(void) {
+    uint64_t old = _kai_pcg_state;
+    _kai_pcg_state = old * 6364136223846793005ULL + (_kai_pcg_inc | 1ULL);
+    uint32_t xorshifted = (uint32_t)(((old >> 18u) ^ old) >> 27u);
+    uint32_t rot = (uint32_t)(old >> 59u);
+    return (xorshifted >> rot) | (xorshifted << (((uint32_t)(-(int32_t)rot)) & 31u));
+}
+
+static void _kai_pcg32_seed(uint64_t initstate, uint64_t initseq) {
+    _kai_pcg_state = 0u;
+    _kai_pcg_inc   = (initseq << 1u) | 1u;
+    (void) _kai_pcg32_next();
+    _kai_pcg_state += initstate;
+    (void) _kai_pcg32_next();
+}
+
+static void _kai_pcg32_ensure_seeded(void) {
+    if (!_kai_pcg_seeded) {
+        uint64_t t = (uint64_t) time(NULL);
+        _kai_pcg32_seed(t ^ 0xa5a5a5a5a5a5a5a5ULL, t * 6364136223846793005ULL);
+        _kai_pcg_seeded = 1;
+    }
+}
+
+/* Doc B §`Random`: int_range(lo, hi) returns a value in [lo, hi).
+ * lo >= hi is a panic — there is no meaningful value. The PRNG draw
+ * uses the `% delta` shortcut; for delta well under 2^32 (e.g. 52
+ * for a card deck) the modulo bias is negligible. Rejection sampling
+ * is a future polish. */
+static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue *hi, KaiCont *k) {
+    (void) self;
+    int64_t lo_v = (kai_is_int(lo)) ? kai_intf(lo) : 0;
+    int64_t hi_v = (kai_is_int(hi)) ? kai_intf(hi) : 0;
+    if (lo_v >= hi_v) {
+        fprintf(stderr, "kai: Random.int_range: lo (%lld) >= hi (%lld)\n",
+                (long long) lo_v, (long long) hi_v);
+        exit(1);
+    }
+    _kai_pcg32_ensure_seeded();
+    uint64_t delta = (uint64_t) (hi_v - lo_v);
+    uint64_t draw;
+    if (delta <= 0xFFFFFFFFULL) {
+        draw = (uint64_t) _kai_pcg32_next() % delta;
+    } else {
+        uint64_t hi32 = (uint64_t) _kai_pcg32_next();
+        uint64_t lo32 = (uint64_t) _kai_pcg32_next();
+        draw = ((hi32 << 32) | lo32) % delta;
+    }
+    return kai_cont_resume(k, kai_int(lo_v + (int64_t) draw));
+}
+
+/* =================================================================
+ * Clock default handler
+ * =================================================================
+ *
+ * Spec: docs/effects-stdlib.md §`Clock`. Three ops:
+ *   wall_now()       -> WallTime { secs, nanos } via CLOCK_REALTIME
+ *   monotonic_now()  -> Instant  { secs, nanos } via CLOCK_MONOTONIC
+ *   sleep_ns(ns)     -> Unit     via the Phase R1 reactor timer wheel
+ *
+ * Issue #611 — Phase R1: sleep_ns parks the calling fiber on the
+ * reactor's timer wheel (sorted by CLOCK_MONOTONIC deadline) and
+ * yields. The scheduler's poll() loop blocks until the next
+ * deadline fires (or another wake source arrives) and promotes
+ * the sleeper back to READY. A previous EINTR-based busy loop
+ * around nanosleep(2) blocked the OS thread; the new path leaves
+ * the rest of the scheduler free to run other fibers while one is
+ * asleep.
+ *
+ * Field names ("secs", "nanos") are load-bearing: kai_op_field reads
+ * the slot by strcmp on the name pointer's contents, so the static
+ * cstrings here must match the kaikai-side `WallTime` / `Instant`
+ * declarations in stdlib/time.kai exactly. */
+static KaiValue *_kai_clock_make_record(int64_t secs, int64_t nanos) {
+    KaiValue *secs_kv  = kai_int(secs);
+    KaiValue *nanos_kv = kai_int(nanos);
+    KaiValue *fields[2] = { secs_kv, nanos_kv };
+    static const char *names[2] = { "secs", "nanos" };
+    return kai_record(2, fields, names);
+}
+
+static KaiValue *kai_default_clock_wall_now(void *self, KaiCont *k) {
+    (void) self;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        fprintf(stderr, "kai: Clock.wall_now: clock_gettime failed: %s\n",
+                strerror(errno));
+        exit(1);
+    }
+    return kai_cont_resume(k, _kai_clock_make_record(
+        (int64_t) ts.tv_sec, (int64_t) ts.tv_nsec));
+}
+
+static KaiValue *kai_default_clock_monotonic_now(void *self, KaiCont *k) {
+    (void) self;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        fprintf(stderr, "kai: Clock.monotonic_now: clock_gettime failed: %s\n",
+                strerror(errno));
+        exit(1);
+    }
+    return kai_cont_resume(k, _kai_clock_make_record(
+        (int64_t) ts.tv_sec, (int64_t) ts.tv_nsec));
+}
+
+KAI_SCHED_FN KaiValue *kai_default_clock_sleep_ns(void *self, KaiValue *ns, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    int64_t ns_v = (kai_is_int(ns)) ? kai_intf(ns) : 0;
+    if (ns_v > 0) {
+        kai_reactor_init();
+        uint64_t deadline = kai_reactor_now_ns() + (uint64_t) ns_v;
+        /* Re-park on a spurious resume: only a reactor splice or an
+         * elapsed clock ends the sleep. Cancel delivered while the fiber
+         * is parked still arrives at the next yield-point hook. */
+        while (kai_reactor_now_ns() < deadline) {
+            kai_reactor_park_timer(kai_current_fiber(), deadline);
+            if (kai_current_fiber()->reactor_fired) break;
+        }
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+#endif
+
+/* =================================================================
+ * NetTcp default handler (net-tcp-v1)
+ * =================================================================
+ *
+ * Spec: docs/effects-stdlib.md §`NetTcp`. Six ops, all blocking in
+ * v1. Maps directly to POSIX sockets via libc — same FFI-to-libc
+ * pattern as the File / Random defaults above. Errors return
+ * `Err(strerror(errno))`; success wraps the handle in a record
+ * matching the surface types declared by the compiler:
+ *
+ *   Conn      = { fd: Int }
+ *   Listener  = { fd: Int, port: Int }
+ *
+ * The `port` slot on Listener carries the kernel-assigned port back
+ * to the caller (the `bind(port=0)` use case). It is populated by
+ * the listen op via getsockname; ordinary `bind(port=N)` callers
+ * see the same N echoed back.
+ *
+ * v1 keeps to AF_INET (IPv4). AF_INET6 fallback waits on a separate
+ * lane — calling out IPv4-only as a v1 limitation in the spec note.
+ */
+
+static KaiValue *_kai_net_err(KaiCont *k, int saved_errno) {
+    const char *msg = strerror(saved_errno);
+    if (!msg) msg = "unknown error";
+    KaiValue *m = kai_str(msg);
+    KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
+    return kai_cont_resume(k, err);
+}
+
+static KaiValue *_kai_net_err_msg(KaiCont *k, const char *msg) {
+    KaiValue *m = kai_str(msg);
+    KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
+    return kai_cont_resume(k, err);
+}
+
+/* Build a Conn record `{ fd }`. Static field-name strings match
+ * what the kaikai-side `type Conn = { fd: Int }` declaration
+ * produces from emit_record_constructor — kai_op_field reads by
+ * strcmp on the name pointer's contents, so any pointer to a
+ * matching cstring works. */
+static KaiValue *_kai_net_make_conn(int fd) {
+    KaiValue *fd_kv = kai_int((int64_t) fd);
+    KaiValue *fields[1] = { fd_kv };
+    static const char *names[1] = { "fd" };
+    return kai_record(1, fields, names);
+}
+
+static KaiValue *_kai_net_make_listener(int fd, int port) {
+    KaiValue *fd_kv   = kai_int((int64_t) fd);
+    KaiValue *port_kv = kai_int((int64_t) port);
+    KaiValue *fields[2] = { fd_kv, port_kv };
+    static const char *names[2] = { "fd", "port" };
+    return kai_record(2, fields, names);
+}
+
+/* Pull the `fd` slot out of a Conn / Listener record. Returns -1 if
+ * the value is the wrong shape (caller falls through to an error
+ * return); v1 trusts the typer to keep this honest. */
+static int _kai_net_record_fd(KaiValue *v) {
+    if (!v || v->tag != KAI_RECORD) return -1;
+    for (int i = 0; i < v->as.rec.n_fields; ++i) {
+        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "fd") == 0) {
+            KaiValue *f = v->as.rec.fields[i];
+            if (!kai_is_int(f)) return -1;
+            return (int) kai_intf(f);
+        }
+    }
+    return -1;
+}
+
+/* connect(host, port) -> Result[Conn, String]. host is a hostname
+ * or IPv4 dotted-quad; getaddrinfo handles both. Restricted to
+ * AF_INET in v1.
+ *
+ * Issue #630 — Phase R2: non-blocking connect. The fd is flipped to
+ * O_NONBLOCK before connect(), which returns either 0 (instant
+ * success — common for loopback) or -1 with errno == EINPROGRESS.
+ * On EINPROGRESS the fiber parks on write-readiness; when the
+ * handshake completes (or fails) the kernel marks the fd writable.
+ * We read SO_ERROR to distinguish success from failure since
+ * connect() itself does not run a second time. EAGAIN/EWOULDBLOCK
+ * is not a documented connect() outcome and is treated identically
+ * to EINPROGRESS for safety. */
+KAI_SCHED_FN KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, KaiValue *port, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    if (!host || host->tag != KAI_STR || !kai_is_int(port)) {
+        return _kai_net_err_msg(k, "connect: bad arguments");
+    }
+    char host_buf[KAI_NET_HOST_BUF];
+    size_t hlen = host->as.s.len < sizeof(host_buf) - 1 ? host->as.s.len : sizeof(host_buf) - 1;
+    memcpy(host_buf, host->as.s.bytes, hlen);
+    host_buf[hlen] = '\0';
+    char port_buf[16];
+    snprintf(port_buf, sizeof(port_buf), "%lld", (long long) kai_intf(port));
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    struct addrinfo *res = NULL;
+    int gai = getaddrinfo(host_buf, port_buf, &hints, &res);
+    if (gai != 0) {
+        const char *msg = gai_strerror(gai);
+        return _kai_net_err_msg(k, msg ? msg : "getaddrinfo failed");
+    }
+    kai_reactor_init();
+    int fd = -1;
+    int saved_errno = 0;
+    for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
+        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0) { saved_errno = errno; continue; }
+        kai_socket_set_nonblock(fd);
+        int crc = connect(fd, p->ai_addr, p->ai_addrlen);
+        if (crc == 0) {
+            saved_errno = 0;
+            break;  /* instant success — loopback path */
+        }
+        if (errno == EINPROGRESS || errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* Park until the kernel marks the fd writable. POLLHUP /
+             * POLLERR also wake us — drain treats them as ready and
+             * the SO_ERROR check below surfaces the real reason. */
+            kai_reactor_park_socket_write(kai_current_fiber(), fd);
+            int so_err = 0;
+            socklen_t slen = sizeof(so_err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &slen) < 0) {
+                saved_errno = errno;
+                close(fd);
+                fd = -1;
+                continue;
+            }
+            if (so_err == 0) {
+                saved_errno = 0;
+                break;  /* handshake succeeded */
+            }
+            saved_errno = so_err;
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        saved_errno = errno;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) {
+        return _kai_net_err(k, saved_errno ? saved_errno : ECONNREFUSED);
+    }
+    KaiValue *conn = _kai_net_make_conn(fd);
+    KaiValue *ok   = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = conn}});
+    return kai_cont_resume(k, ok);
+}
+#endif
+
+/* listen(host, port) -> Result[Listener, String]. host = "" or
+ * "0.0.0.0" binds INADDR_ANY; specific IPv4 string also works.
+ * port = 0 asks the kernel for an ephemeral port; we read it back
+ * via getsockname so callers don't need a separate effect op. */
+static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
+    (void) self;
+    if (!host || host->tag != KAI_STR || !kai_is_int(port)) {
+        return _kai_net_err_msg(k, "listen: bad arguments");
+    }
+    char host_buf[KAI_NET_HOST_BUF];
+    size_t hlen = host->as.s.len < sizeof(host_buf) - 1 ? host->as.s.len : sizeof(host_buf) - 1;
+    memcpy(host_buf, host->as.s.bytes, hlen);
+    host_buf[hlen] = '\0';
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return _kai_net_err(k, errno);
+
+    /* SO_REUSEADDR mirrors the convention every server example sets
+     * — without it a listener that crashed seconds ago can't rebind
+     * because the kernel still holds the port in TIME_WAIT. The
+     * fixture's `bind(0)` path ignores the assigned port across
+     * runs anyway, but explicit servers benefit. */
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t) kai_intf(port));
+    if (host_buf[0] == '\0') {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, host_buf, &addr.sin_addr) != 1) {
+        /* Fall back to getaddrinfo for hostnames. */
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo *res = NULL;
+        int gai = getaddrinfo(host_buf, NULL, &hints, &res);
+        if (gai != 0) {
+            close(fd);
+            const char *msg = gai_strerror(gai);
+            return _kai_net_err_msg(k, msg ? msg : "getaddrinfo failed");
+        }
+        struct sockaddr_in *sin = (struct sockaddr_in *) res->ai_addr;
+        addr.sin_addr = sin->sin_addr;
+        freeaddrinfo(res);
+    }
+
+    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        int e = errno; close(fd); return _kai_net_err(k, e);
+    }
+    if (listen(fd, KAI_LISTEN_BACKLOG) < 0) {
+        int e = errno; close(fd); return _kai_net_err(k, e);
+    }
+    /* Issue #630 — Phase R2: the listener fd must be non-blocking so
+     * the parking accept() path below sees EAGAIN/EWOULDBLOCK when
+     * no connection is queued. Without this the accept() syscall
+     * would block the OS thread and starve every other fiber. */
+    kai_socket_set_nonblock(fd);
+
+    /* Read back the assigned port (kernel may have picked one when
+     * the caller passed 0). */
+    struct sockaddr_in bound;
+    socklen_t blen = sizeof(bound);
+    int actual_port = (int) kai_intf(port);
+    if (getsockname(fd, (struct sockaddr *) &bound, &blen) == 0) {
+        actual_port = (int) ntohs(bound.sin_port);
+    }
+
+    KaiValue *l  = _kai_net_make_listener(fd, actual_port);
+    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = l}});
+    return kai_cont_resume(k, ok);
+}
+
+/* accept(l) -> Result[Conn, String].
+ *
+ * Issue #630 — Phase R2: non-blocking accept. The listener fd was
+ * flipped to O_NONBLOCK in listen(); accept() now returns -1 +
+ * EAGAIN/EWOULDBLOCK when no peer is queued. The fiber parks on
+ * read-readiness of the listener fd and retries on wake. The
+ * connection fd inherits non-blocking on Linux when SOCK_NONBLOCK
+ * is passed to accept4(); for portability (macOS lacks accept4)
+ * we set it explicitly via kai_socket_set_nonblock on the returned
+ * fd so subsequent send/recv on the Conn also park rather than
+ * blocking. */
+KAI_SCHED_FN KaiValue *kai_default_nettcp_accept(void *self, KaiValue *l, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    int lfd = _kai_net_record_fd(l);
+    if (lfd < 0) return _kai_net_err_msg(k, "accept: invalid listener");
+    kai_reactor_init();
+    /* Defensive: listener fd should already be non-blocking from
+     * listen(), but a future Listener constructed via FFI would not
+     * be. Idempotent. */
+    kai_socket_set_nonblock(lfd);
+    for (;;) {
+        struct sockaddr_in peer;
+        socklen_t plen = sizeof(peer);
+        int cfd = accept(lfd, (struct sockaddr *) &peer, &plen);
+        if (cfd >= 0) {
+            kai_socket_set_nonblock(cfd);
+            KaiValue *conn = _kai_net_make_conn(cfd);
+            KaiValue *ok   = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = conn}});
+            return kai_cont_resume(k, ok);
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            kai_reactor_park_socket_read(kai_current_fiber(), lfd);
+            /* On resume, kai_sched_park runs the cancel-yield check
+             * for us (issue #679 fix) — a sibling-triggered cancel
+             * longjmps to cancel_pad before the retry below. */
+            continue;  /* Resume → retry accept() */
+        }
+        if (errno == EINTR) continue;
+        return _kai_net_err(k, errno);
+    }
+}
+#endif
+
+/* send(c, data) -> Result[Int, String]. data is a [Byte] = [Int]
+ * cons list; each element is taken mod 256. v1 walks the list once
+ * to assemble a contiguous buffer, then writes it.
+ *
+ * Issue #630 — Phase R2: non-blocking send with a partial-writes
+ * loop. The conn fd is already O_NONBLOCK (set by accept or
+ * connect). send() may return fewer bytes than requested when the
+ * kernel buffer is partially full, or -1 with EAGAIN when it is
+ * completely full. The loop parks on write-readiness on EAGAIN and
+ * advances on partial writes. The returned count is the total
+ * bytes written — equal to the input length on success. The
+ * pre-R2 contract that "callers may have to loop" is honoured
+ * internally so user code never sees a short write. */
+KAI_SCHED_FN KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue *data, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    int fd = _kai_net_record_fd(c);
+    if (fd < 0) return _kai_net_err_msg(k, "send: invalid conn");
+    if (!data) return _kai_net_err_msg(k, "send: null data");
+
+    /* Count the cons cells; a [Byte] of millions of bytes is out of
+     * scope for v1 — chunked send via streaming is a follow-up. */
+    size_t n = 0;
+    for (KaiValue *p = data; p && p->tag == KAI_CONS; p = p->as.cons.tail) ++n;
+    unsigned char *buf = NULL;
+    if (n > 0) {
+        buf = (unsigned char *) malloc(n);
+        if (!buf) return _kai_net_err_msg(k, "send: out of memory");
+        size_t i = 0;
+        for (KaiValue *p = data; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+            KaiValue *h = p->as.cons.head;
+            int64_t b = (kai_is_int(h)) ? kai_intf(h) : 0;
+            buf[i++] = (unsigned char) (b & 0xff);
+        }
+    }
+
+    kai_reactor_init();
+    /* Defensive: send may be called on a Conn that was never funnelled
+     * through the local accept/connect path (e.g. constructed via FFI
+     * in a future user lane). Idempotent on already-nonblock fds. */
+    kai_socket_set_nonblock(fd);
+
+    size_t total = 0;
+    int saved_errno = 0;
+    while (total < n) {
+        /* MSG_NOSIGNAL stops a SIGPIPE from killing the process when
+         * the peer has closed its read side; we surface EPIPE through
+         * the Result-shaped return instead. macOS does not have
+         * MSG_NOSIGNAL but exposes SO_NOSIGPIPE on the socket; we
+         * conservatively pass the flag where it exists and rely on
+         * the default SIGPIPE handler being SIG_IGN-equivalent on
+         * the install side for v1. */
+#ifdef MSG_NOSIGNAL
+        ssize_t w = send(fd, buf + total, n - total, MSG_NOSIGNAL);
+#else
+        ssize_t w = send(fd, buf + total, n - total, 0);
+#endif
+        if (w > 0) {
+            total += (size_t) w;
+            continue;
+        }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            kai_reactor_park_socket_write(kai_current_fiber(), fd);
+            continue;  /* Resume → retry send() */
+        }
+        if (w < 0 && errno == EINTR) continue;
+        saved_errno = errno;
+        break;
+    }
+    free(buf);
+    if (saved_errno != 0 && total == 0) {
+        return _kai_net_err(k, saved_errno);
+    }
+
+    KaiValue *cnt = kai_int((int64_t) total);
+    KaiValue *ok  = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = cnt}});
+    return kai_cont_resume(k, ok);
+}
+#endif
+
+/* recv(c, max) -> Result[[Byte], String]. max = 0 panics per spec
+ * (no useful "read zero bytes"); negative max is treated the same.
+ * Peer clean-close (recv == 0) returns Ok([]) so callers can
+ * distinguish from "not yet" via the empty list.
+ *
+ * Issue #630 — Phase R2: non-blocking recv. The fd is O_NONBLOCK
+ * (set by accept or connect). recv() returns >0 (bytes available),
+ * 0 (peer clean-close — surfaces as Ok([])), or -1 with EAGAIN
+ * when the kernel buffer is empty. On EAGAIN the fiber parks on
+ * read-readiness and retries. A single recv call returns whatever
+ * the kernel has buffered; callers loop at the user level if they
+ * need an exact byte count (matches POSIX recv semantics). */
+KAI_SCHED_FN KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue *max, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    int fd = _kai_net_record_fd(c);
+    if (fd < 0) return _kai_net_err_msg(k, "recv: invalid conn");
+    int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
+    if (cap <= 0) {
+        fputs("kai: NetTcp.recv: max must be > 0\n", stderr);
+        exit(1);
+    }
+    if (cap > (1 << 20)) cap = 1 << 20;  /* 1 MiB ceiling for v1 */
+    unsigned char *buf = (unsigned char *) malloc((size_t) cap);
+    if (!buf) return _kai_net_err_msg(k, "recv: out of memory");
+
+    kai_reactor_init();
+    /* Defensive idempotent flip — Conn fds from accept/connect are
+     * already non-blocking, but a future FFI-constructed Conn would
+     * not be. */
+    kai_socket_set_nonblock(fd);
+
+    ssize_t got;
+    for (;;) {
+        got = recv(fd, buf, (size_t) cap, 0);
+        if (got >= 0) break;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            kai_reactor_park_socket_read(kai_current_fiber(), fd);
+            continue;  /* Resume → retry recv() */
+        }
+        if (errno == EINTR) continue;
+        int saved_errno = errno;
+        free(buf);
+        return _kai_net_err(k, saved_errno);
+    }
+    KaiValue *acc = kai_nil();
+    for (ssize_t i = got; i > 0;) { --i; acc = kai_cons(kai_int((int64_t) buf[i]), acc); }
+    free(buf);
+    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = acc}});
+    return kai_cont_resume(k, ok);
+}
+#endif
+
+/* recv_timeout(c, max, nanos) -> Option[Result[[Int], String]]. The
+ * socket-side dual of Actor.receive_timeout: park on read-readiness and
+ * a `nanos` deadline, resume on whichever fires first (reactor single-
+ * list dual-park). `None` = deadline elapsed before any byte; `Some(Ok
+ * (bytes))` = data (or `Ok([])` on a clean EOF); `Some(Err(msg))` = a
+ * transport error. Three-way distinguishable, as the DoS fix requires. */
+KAI_SCHED_FN KaiValue *kai_default_nettcp_recv_timeout(void *self, KaiValue *c,
+                                                 KaiValue *max, KaiValue *ns,
+                                                 KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    int fd = _kai_net_record_fd(c);
+    if (fd < 0) return _kai_net_err_msg(k, "recv_timeout: invalid conn");
+    int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
+    if (cap <= 0) {
+        fputs("kai: NetTcp.recv_timeout: max must be > 0\n", stderr);
+        exit(1);
+    }
+    if (cap > (1 << 20)) cap = 1 << 20;  /* 1 MiB ceiling for v1 */
+    int64_t budget = (kai_is_int(ns)) ? kai_intf(ns) : 0;
+    if (budget < 0) budget = 0;
+
+    unsigned char *buf = (unsigned char *) malloc((size_t) cap);
+    if (!buf) return _kai_net_err_msg(k, "recv_timeout: out of memory");
+
+    kai_reactor_init();
+    kai_socket_set_nonblock(fd);
+
+    uint64_t deadline = kai_reactor_now_ns() + (uint64_t) budget;
+    ssize_t got;
+    for (;;) {
+        got = recv(fd, buf, (size_t) cap, 0);
+        if (got >= 0) break;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (!kai_reactor_park_socket_read_timeout(kai_current_fiber(),
+                                                      fd, deadline)) {
+                free(buf);
+                return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));
+            }
+            continue;  /* Readiness → retry recv() */
+        }
+        if (errno == EINTR) continue;
+        int saved_errno = errno;
+        free(buf);
+        const char *m = strerror(saved_errno);
+        if (!m) m = "unknown error";
+        KaiValue *err = kai_variant_u(3, "Err", 1, 0,
+                                      (KaiVarSlot[]){{.ptr = kai_str(m)}});
+        KaiValue *some = kai_variant_u(0, "Some", 1, 0,
+                                       (KaiVarSlot[]){{.ptr = err}});
+        return kai_cont_resume(k, some);
+    }
+    KaiValue *acc = kai_nil();
+    for (ssize_t i = got; i > 0;) { --i; acc = kai_cons(kai_int((int64_t) buf[i]), acc); }
+    free(buf);
+    KaiValue *ok   = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = acc}});
+    KaiValue *some = kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = ok}});
+    return kai_cont_resume(k, some);
+}
+#endif
+
+/* close(c) -> Unit. Spec says errors from close(2) are logged and
+ * swallowed — the user can do nothing useful with the value, and
+ * shutdown() is the right tool for "did everything flush?" anyway.
+ * Returns kai_unit(). */
+static KaiValue *kai_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
+    (void) self;
+    int fd = _kai_net_record_fd(c);
+    if (fd >= 0) {
+        if (close(fd) < 0) {
+            /* Stderr only — the surface op returns Unit. */
+            fprintf(stderr, "kai: NetTcp.close: %s\n", strerror(errno));
+        }
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* =================================================================
+ * NetDns effect — issue #352. getaddrinfo(3) exposed as a standalone
+ * capability so a component can resolve names without earning the
+ * right to open sockets (NetTcp). The syscall shape is identical to
+ * the one embedded in `kai_default_nettcp_connect`; the duplication
+ * is small and intentional (sharing a helper is the out-of-scope
+ * follow-up the issue names). AF_INET / SOCK_STREAM hints match the
+ * TCP path so the address set resolve returns is the same set connect
+ * would have walked — IPv4-only in v1, same limitation as NetTcp.
+ * ================================================================= */
+
+/* Build an IpAddr record `{ addr }` from an addrinfo node. The field
+ * name "addr" is the runtime contract with the kaikai-side builtin
+ * `type IpAddr = { addr: String }` (driver.kai builtin_ipaddr_decl);
+ * kai_op_field reads it by strcmp, so the static cstring is enough. */
+static KaiValue *_kai_net_make_ipaddr(struct addrinfo *p) {
+    char ip_buf[INET_ADDRSTRLEN];
+    struct sockaddr_in *sin = (struct sockaddr_in *) p->ai_addr;
+    const char *txt = inet_ntop(AF_INET, &sin->sin_addr, ip_buf, sizeof(ip_buf));
+    KaiValue *addr_kv = kai_str(txt ? txt : "");
+    KaiValue *fields[1] = { addr_kv };
+    static const char *names[1] = { "addr" };
+    return kai_record(1, fields, names);
+}
+
+/* Build a `[IpAddr]` from the getaddrinfo result list, preserving the
+ * order getaddrinfo returned (recursing tail-first keeps the cons
+ * chain in source order without a reverse pass). Non-AF_INET nodes
+ * are skipped — v1 is IPv4-only and the hints already filter, but
+ * the guard keeps the inet_ntop above honest. */
+static KaiValue *_kai_net_ipaddr_list(struct addrinfo *p) {
+    if (!p) return kai_nil();
+    KaiValue *tail = _kai_net_ipaddr_list(p->ai_next);
+    if (p->ai_family != AF_INET || !p->ai_addr) return tail;
+    return kai_cons(_kai_net_make_ipaddr(p), tail);
+}
+
+/* resolve(host) -> Result[[IpAddr], String] (Ok-first). host is a
+ * hostname or IPv4 dotted-quad; getaddrinfo handles both. An empty
+ * result list (no AF_INET addresses) still resolves to `Ok([])` —
+ * the stdlib `resolve_first` turns that into its own Err so the
+ * runtime stays a thin getaddrinfo shim. */
+static KaiValue *kai_default_netdns_resolve(void *self, KaiValue *host, KaiCont *k) {
+    (void) self;
+    if (!host || host->tag != KAI_STR) {
+        return _kai_net_err_msg(k, "resolve: bad arguments");
+    }
+    char host_buf[KAI_NET_HOST_BUF];
+    size_t hlen = host->as.s.len < sizeof(host_buf) - 1 ? host->as.s.len : sizeof(host_buf) - 1;
+    memcpy(host_buf, host->as.s.bytes, hlen);
+    host_buf[hlen] = '\0';
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    struct addrinfo *res = NULL;
+    int gai = getaddrinfo(host_buf, NULL, &hints, &res);
+    if (gai != 0) {
+        const char *msg = gai_strerror(gai);
+        return _kai_net_err_msg(k, msg ? msg : "getaddrinfo failed");
+    }
+    KaiValue *list = _kai_net_ipaddr_list(res);
+    freeaddrinfo(res);
+    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = list}});
+    return kai_cont_resume(k, ok);
+}
+
+/* =================================================================
+ * NetUdp default handler (issue #354)
+ * =================================================================
+ *
+ * Mirror of the NetUdp block in stage0/runtime.h. Stage 2 keeps its
+ * own copy of the runtime (Koka-style Perceus RC), so the datagram
+ * UDP handlers live here verbatim alongside the NetTcp family.
+ *
+ * Spec: docs/effects-stdlib.md §`NetUdp`. Four ops, all blocking in
+ * v1 (no reactor parking yet — the m8.x reactor lifts NetTcp and
+ * NetUdp together). socket(AF_INET, SOCK_DGRAM, 0) + bind / sendto /
+ * recvfrom / close. Surface records:
+ *
+ *   UdpSocket  = { fd: Int, port: Int }
+ *   SocketAddr = { host: String, port: Int }
+ *
+ * `[Byte]` lands as `[Int]`; SocketAddr.host is a textual IPv4
+ * dotted-quad (inet_pton on send, inet_ntop on recv). IPv4 only.
+ */
+
+static KaiValue *_kai_net_make_udpsocket(int fd, int port) {
+    KaiValue *fd_kv   = kai_int((int64_t) fd);
+    KaiValue *port_kv = kai_int((int64_t) port);
+    KaiValue *fields[2] = { fd_kv, port_kv };
+    static const char *names[2] = { "fd", "port" };
+    return kai_record(2, fields, names);
+}
+
+static KaiValue *_kai_net_make_sockaddr(const char *host, int port) {
+    KaiValue *host_kv = kai_str(host);
+    KaiValue *port_kv = kai_int((int64_t) port);
+    KaiValue *fields[2] = { host_kv, port_kv };
+    static const char *names[2] = { "host", "port" };
+    return kai_record(2, fields, names);
+}
+
+static int _kai_net_sockaddr_host(KaiValue *v, char *out, size_t cap) {
+    if (!v || v->tag != KAI_RECORD || cap == 0) return -1;
+    for (int i = 0; i < v->as.rec.n_fields; ++i) {
+        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "host") == 0) {
+            KaiValue *f = v->as.rec.fields[i];
+            if (!f || f->tag != KAI_STR) return -1;
+            size_t n = f->as.s.len < cap - 1 ? f->as.s.len : cap - 1;
+            memcpy(out, f->as.s.bytes, n);
+            out[n] = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int _kai_net_record_port(KaiValue *v) {
+    if (!v || v->tag != KAI_RECORD) return -1;
+    for (int i = 0; i < v->as.rec.n_fields; ++i) {
+        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "port") == 0) {
+            KaiValue *f = v->as.rec.fields[i];
+            if (!kai_is_int(f)) return -1;
+            return (int) kai_intf(f);
+        }
+    }
+    return -1;
+}
+
+static KaiValue *kai_default_netudp_bind(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {
+    (void) self;
+    if (!host || host->tag != KAI_STR || !kai_is_int(port)) {
+        return _kai_net_err_msg(k, "bind: bad arguments");
+    }
+    char host_buf[KAI_NET_HOST_BUF];
+    size_t hlen = host->as.s.len < sizeof(host_buf) - 1 ? host->as.s.len : sizeof(host_buf) - 1;
+    memcpy(host_buf, host->as.s.bytes, hlen);
+    host_buf[hlen] = '\0';
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return _kai_net_err(k, errno);
+
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    int64_t port_i = kai_intf(port);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t) port_i);
+    if (host_buf[0] == '\0') {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, host_buf, &addr.sin_addr) != 1) {
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        struct addrinfo *res = NULL;
+        int gai = getaddrinfo(host_buf, NULL, &hints, &res);
+        if (gai != 0) {
+            close(fd);
+            const char *msg = gai_strerror(gai);
+            return _kai_net_err_msg(k, msg ? msg : "getaddrinfo failed");
+        }
+        struct sockaddr_in *sin = (struct sockaddr_in *) res->ai_addr;
+        addr.sin_addr = sin->sin_addr;
+        freeaddrinfo(res);
+    }
+
+    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        int e = errno; close(fd); return _kai_net_err(k, e);
+    }
+
+    struct sockaddr_in bound;
+    socklen_t blen = sizeof(bound);
+    int actual_port = (int) port_i;
+    if (getsockname(fd, (struct sockaddr *) &bound, &blen) == 0) {
+        actual_port = (int) ntohs(bound.sin_port);
+    }
+
+    KaiValue *s  = _kai_net_make_udpsocket(fd, actual_port);
+    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = s}});
+    return kai_cont_resume(k, ok);
+}
+
+static KaiValue *kai_default_netudp_send(void *self, KaiValue *sock, KaiValue *dst, KaiValue *data, KaiCont *k) {
+    (void) self;
+    int fd = _kai_net_record_fd(sock);
+    if (fd < 0) return _kai_net_err_msg(k, "send: invalid socket");
+    if (!data) return _kai_net_err_msg(k, "send: null data");
+
+    char dst_host[KAI_NET_HOST_BUF];
+    if (_kai_net_sockaddr_host(dst, dst_host, sizeof(dst_host)) != 0) {
+        return _kai_net_err_msg(k, "send: invalid destination address");
+    }
+    int dst_port = _kai_net_record_port(dst);
+    if (dst_port < 0) return _kai_net_err_msg(k, "send: invalid destination port");
+
+    struct sockaddr_in dst_addr;
+    memset(&dst_addr, 0, sizeof(dst_addr));
+    dst_addr.sin_family = AF_INET;
+    dst_addr.sin_port   = htons((uint16_t) dst_port);
+    if (inet_pton(AF_INET, dst_host, &dst_addr.sin_addr) != 1) {
+        return _kai_net_err_msg(k, "send: destination host is not an IPv4 address");
+    }
+
+    size_t n = 0;
+    for (KaiValue *p = data; p && p->tag == KAI_CONS; p = p->as.cons.tail) ++n;
+    unsigned char *buf = NULL;
+    if (n > 0) {
+        buf = (unsigned char *) malloc(n);
+        if (!buf) return _kai_net_err_msg(k, "send: out of memory");
+        size_t i = 0;
+        for (KaiValue *p = data; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+            KaiValue *h = p->as.cons.head;
+            int64_t b = (kai_is_int(h)) ? kai_intf(h) : 0;
+            buf[i++] = (unsigned char) (b & 0xff);
+        }
+    }
+
+    ssize_t w;
+    for (;;) {
+#ifdef MSG_NOSIGNAL
+        w = sendto(fd, buf, n, MSG_NOSIGNAL, (struct sockaddr *) &dst_addr, sizeof(dst_addr));
+#else
+        w = sendto(fd, buf, n, 0, (struct sockaddr *) &dst_addr, sizeof(dst_addr));
+#endif
+        if (w < 0 && errno == EINTR) continue;
+        break;
+    }
+    int saved_errno = (w < 0) ? errno : 0;
+    free(buf);
+    if (w < 0) return _kai_net_err(k, saved_errno);
+
+    KaiValue *cnt = kai_int((int64_t) w);
+    KaiValue *ok  = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = cnt}});
+    return kai_cont_resume(k, ok);
+}
+
+static KaiValue *kai_default_netudp_recv(void *self, KaiValue *sock, KaiValue *max, KaiCont *k) {
+    (void) self;
+    int fd = _kai_net_record_fd(sock);
+    if (fd < 0) return _kai_net_err_msg(k, "recv: invalid socket");
+    int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
+    if (cap <= 0) {
+        fputs("kai: NetUdp.recv: max must be > 0\n", stderr);
+        exit(1);
+    }
+    if (cap > (1 << 16)) cap = 1 << 16;  /* IPv4 datagram ceiling */
+    unsigned char *buf = (unsigned char *) malloc((size_t) cap);
+    if (!buf) return _kai_net_err_msg(k, "recv: out of memory");
+
+    struct sockaddr_in src;
+    socklen_t srclen = sizeof(src);
+    ssize_t got;
+    for (;;) {
+        memset(&src, 0, sizeof(src));
+        srclen = sizeof(src);
+        got = recvfrom(fd, buf, (size_t) cap, 0, (struct sockaddr *) &src, &srclen);
+        if (got >= 0) break;
+        if (errno == EINTR) continue;
+        int saved_errno = errno;
+        free(buf);
+        return _kai_net_err(k, saved_errno);
+    }
+
+    char src_host[INET_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET, &src.sin_addr, src_host, sizeof(src_host))) {
+        src_host[0] = '\0';
+    }
+    int src_port = (int) ntohs(src.sin_port);
+    KaiValue *addr = _kai_net_make_sockaddr(src_host, src_port);
+
+    KaiValue *bytes = kai_nil();
+    for (ssize_t i = got; i > 0;) { --i; bytes = kai_cons(kai_int((int64_t) buf[i]), bytes); }
+    free(buf);
+
+    KaiValue *pfields[2] = { addr, bytes };
+    static const char *pnames[2] = { "fst", "snd" };
+    KaiValue *pair = kai_record(2, pfields, pnames);
+    KaiValue *ok   = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = pair}});
+    return kai_cont_resume(k, ok);
+}
+
+static KaiValue *kai_default_netudp_close(void *self, KaiValue *sock, KaiCont *k) {
+    (void) self;
+    int fd = _kai_net_record_fd(sock);
+    if (fd >= 0) {
+        if (close(fd) < 0) {
+            fprintf(stderr, "kai: NetUdp.close: %s\n", strerror(errno));
+        }
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+
+/* =================================================================
+ * Signal effect — issue #107. POSIX SIGINT/SIGTERM/SIGHUP/SIGUSR1/
+ * SIGUSR2 trap for graceful shutdown.
+ *
+ * Shape (v1, on/off/await):
+ *   on(sig)  : Unit  -- block sig at the process level, mark subscribed
+ *   off(sig) : Unit  -- unblock sig, drop from subscribed set
+ *   await()  : Sig   -- sigwait on the subscribed set, return arrived
+ *
+ * Why sigwait and not an async sa_handler:
+ *   The async path is restricted to async-signal-safe calls; building a
+ *   KaiValue variant inside the handler is not. The handler would have
+ *   to set a pending bit and let the next yield-point drain it — that
+ *   matches the BEAM-faithful `on_cancel(sig)` shape sketched in the
+ *   issue, which v1 cannot honour cleanly: `kai_default_cancel_raise`
+ *   exits the program when main_fiber has no cancel_pad, so a runtime-
+ *   triggered Cancel never runs the user's `with Cancel { raise(_) ->
+ *   cleanup }`. The on/off/await shape sidesteps the async problem
+ *   entirely: signals are blocked via sigprocmask, queued by the
+ *   kernel, and synchronously dequeued by sigwait inside `await()`
+ *   where the full runtime is available.
+ *
+ * v1 limitations (mirrored in docs/effects-stdlib.md §Signal):
+ *   - Posix only. Windows / WASM are out of scope.
+ *   - `await()` blocks the OS thread. Other fibers cannot run while
+ *     it is parked. Acceptable for the v1 use case (main parks on
+ *     Signal after spawning workers).
+ *   - SIGCHLD intentionally absent — Process.wait reaps children.
+ *   - Real-time signals (SIGRTMIN+n) and siginfo_t are out of scope.
+ */
+
+typedef struct {
+    int         signo;
+    const char *name;
+    int32_t     tag;       /* atom-style variant tag, docs/variant-tags.md */
+} KaiSignalEntry;
+
+static const KaiSignalEntry kai_signal_entries[] = {
+    { SIGINT,  "SigInt",  4 },
+    { SIGTERM, "SigTerm", 5 },
+    { SIGHUP,  "SigHup",  6 },
+    { SIGUSR1, "SigUsr1", 7 },
+    { SIGUSR2, "SigUsr2", 8 },
+    { SIGWINCH, "SigWinch", 11 },
+    { 0,       NULL,      0 }
+};
+
+static int _kai_signal_from_variant(KaiValue *sig_v) {
+    if (!sig_v || sig_v->tag != KAI_VARIANT) return 0;
+    const char *n = kai_variant_name_of(sig_v->variant_tag);
+    if (!n) return 0;
+    for (const KaiSignalEntry *e = kai_signal_entries; e->name; ++e) {
+        if (strcmp(e->name, n) == 0) return e->signo;
+    }
+    return 0;
+}
+
+static KaiValue *_kai_signal_to_variant(int signo) {
+    for (const KaiSignalEntry *e = kai_signal_entries; e->name; ++e) {
+        if (e->signo == signo) {
+            return kai_variant_u(e->tag, e->name, 0, 0, NULL);
+        }
+    }
+    return NULL;
+}
+
+/* Subscribed-signal set for the Signal effect: one module subscribes, a
+ * handler in another tests membership, so it is shared process state (owner
+ * defines, others extern) — a per-TU set would split the subscription. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern sigset_t kai_signal_subscribed;
+extern int      kai_signal_subscribed_init;
+#  if defined(KAI_RUNTIME_OWNER)
+sigset_t kai_signal_subscribed;
+int      kai_signal_subscribed_init = 0;
+#  endif
+#else
+static sigset_t kai_signal_subscribed;
+static int      kai_signal_subscribed_init = 0;
+#endif
+
+static void _kai_signal_init_subscribed(void) {
+    if (!kai_signal_subscribed_init) {
+        sigemptyset(&kai_signal_subscribed);
+        kai_signal_subscribed_init = 1;
+    }
+}
+
+/* Issue #671 — Phase R4: install an async-signal-safe sa_handler
+ * for `signo` that writes the signo byte into the reactor's self-
+ * pipe. Replaces v1's sigprocmask-only block, which relied on
+ * sigwait() inside `signal_await` to dequeue. Under R4 the kernel
+ * delivers the signal asynchronously to our handler (write(2) is
+ * async-signal-safe), and the scheduler's poll() loop reads the
+ * byte and wakes the parked fiber. */
+static void _kai_signal_install_handler(int signo) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = kai_reactor_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    /* SA_RESTART so a signal arriving during a syscall in another
+     * thread does not abort that syscall — only the scheduler
+     * thread's poll() needs to wake, and poll() returns -1/EINTR
+     * cleanly on its own. The reactor already runs without
+     * SA_RESTART on SIGCHLD because the wake byte is its own
+     * notification; here SA_RESTART is fine because the wake byte
+     * IS the signal payload. */
+    sa.sa_flags = SA_RESTART;
+    sigaction(signo, &sa, NULL);
+}
+
+static void _kai_signal_uninstall_handler(int signo) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sigaction(signo, &sa, NULL);
+}
+
+static KaiValue *kai_default_signal_on(void *self, KaiValue *sig_v, KaiCont *k) {
+    (void) self;
+    _kai_signal_init_subscribed();
+    int signo = _kai_signal_from_variant(sig_v);
+    if (signo > 0) {
+        sigaddset(&kai_signal_subscribed, signo);
+        /* Make sure the signal is NOT blocked at the process level —
+         * R4 wants the handler to fire, not for the kernel to queue
+         * the signal until sigwait() pulls it. Idempotent. */
+        sigset_t one;
+        sigemptyset(&one);
+        sigaddset(&one, signo);
+        sigprocmask(SIG_UNBLOCK, &one, NULL);
+        _kai_signal_install_handler(signo);
+        /* Ensure the reactor self-pipe exists before any handler can
+         * fire — kai_reactor_init is idempotent so paying the call
+         * here costs nothing if the reactor is already up. */
+        kai_reactor_init();
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* off(sig): restore the default disposition. A signal that arrives
+ * after `off` but before the SIG_DFL takes effect is best-effort —
+ * sigaction is atomic w.r.t. the calling thread but not w.r.t.
+ * concurrent signal delivery, the kernel may have already queued
+ * one byte to the self-pipe that the next `signal_await` (if any)
+ * will consume. Documented as a sharp edge in
+ * docs/effects-stdlib.md §Signal. */
+static KaiValue *kai_default_signal_off(void *self, KaiValue *sig_v, KaiCont *k) {
+    (void) self;
+    _kai_signal_init_subscribed();
+    int signo = _kai_signal_from_variant(sig_v);
+    if (signo > 0) {
+        sigdelset(&kai_signal_subscribed, signo);
+        _kai_signal_uninstall_handler(signo);
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* await(): empty subscribed set adds SIGINT defensively so Ctrl-C
+ * still wakes the caller. R4 path: park on the singleton signal
+ * waiter slot, yield to the scheduler, and resume when the reactor
+ * drains the self-pipe. The signo arrives in reactor_wait_status. */
+KAI_SCHED_FN KaiValue *kai_default_signal_await(void *self, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    _kai_signal_init_subscribed();
+    /* Defensive SIGINT subscription if nothing has been on()'d —
+     * mirrors the v1 behaviour so existing code that does
+     * `Signal.await()` directly without `Signal.on(SigInt)` still
+     * traps Ctrl-C. */
+    int any = 0;
+    for (const KaiSignalEntry *e = kai_signal_entries; e->name; ++e) {
+        if (sigismember(&kai_signal_subscribed, e->signo)) { any = 1; break; }
+    }
+    if (!any) {
+        sigaddset(&kai_signal_subscribed, SIGINT);
+        sigset_t one;
+        sigemptyset(&one);
+        sigaddset(&one, SIGINT);
+        sigprocmask(SIG_UNBLOCK, &one, NULL);
+        _kai_signal_install_handler(SIGINT);
+        kai_reactor_init();
+    }
+    for (;;) {
+        KaiFiber *me = kai_current_fiber();
+        if (kai_reactor_park_signal(me) != 0) {
+            /* v1 contract: only one fiber may sit in Signal.await()
+             * at a time. The byte in the self-pipe carries no
+             * identity, so two concurrent waiters would race over
+             * who picks it up. Mirrors the R3 stdin-multiplex
+             * panic. */
+            kai_core_panic(kai_str(
+                "signal_await: a fiber is already awaiting a signal — "
+                "concurrent Signal.await() is undefined; "
+                "serialize via an actor or supervisor"));
+        }
+        /* Drain set f->reactor_wait_status before unparking. A
+         * spurious wake (signo == 0) loops back and re-parks. */
+        int signo = me->reactor_wait_status;
+        me->reactor_wait_status = 0;
+        if (signo > 0) {
+            KaiValue *v = _kai_signal_to_variant(signo);
+            if (v) return kai_cont_resume(k, v);
+        }
+    }
+}
+#endif
+
+/* =================================================================
+ * Process effect — issue #126. POSIX subprocess primitives.
+ *
+ * Shape (v1):
+ *   start(cmd, args)  : Child                       -- fork + execvp
+ *   wait(c)           : Result[Exit, String]        -- waitpid blocking
+ *   kill(c, sig: Int) : Result[Unit, String]        -- kill(2)
+ *   exit(code)        : Nothing                     -- _exit(2)
+ *
+ * `Child = { pid: Int }` and `Exit = Exited(Int) | Signaled(Int)`
+ * are declared by the compiler's `builtin_child_decl` /
+ * `builtin_exit_decl` (stage2/compiler.kai) and minted here by
+ * name, same convention as Conn / Listener for NetTcp.
+ *
+ * Divergences from docs/effects-stdlib.md §Process pinned in the
+ * compiler's `builtin_process_decl` comment:
+ *   1. start returns Child, not Result[Child, String]. fork/exec
+ *      failure surfaces through `kai_panic`, matching the
+ *      "primitive failure" convention used elsewhere in the runtime.
+ *   2. kill takes a raw signo Int rather than the issue #107 Sig
+ *      sum type — kill needs the full POSIX signal set including
+ *      SIGKILL, which Sig deliberately excludes.
+ *
+ * v1 limitations (mirrored in docs/effects-stdlib.md §Process
+ * *What's not in v1*):
+ *   - POSIX only. Windows / WASM out of scope.
+ *   - All ops are blocking: `Process.wait` parks the OS thread
+ *     inside `waitpid` rather than the calling fiber. The m8.x
+ *     cooperative scheduler (landed v0.4.0) provides the suspend /
+ *     resume primitives, but reactor-driven cancellation-aware
+ *     waiting (`wait_or_kill`) still needs a SIGCHLD-aware reactor
+ *     plug that registers the pid and wakes the fiber when the
+ *     child terminates. Tier 2 follow-up tracked in
+ *     docs/fibers-honesty-targets.md §Reactor.
+ *   - Stdio plumbing is popen-shaped: `start_piped` attaches pipes
+ *     to any of the child's stdin/stdout/stderr; `write_stdin` /
+ *     `read_stdout` / `read_stderr` / `close_stdin` drive them; `wait`
+ *     closes whatever is still open before reaping (pclose semantics).
+ *   - SIGCHLD handling is implicit through blocking waitpid; the
+ *     Signal effect intentionally omits SIGCHLD per its catalog
+ *     comment so the two effects don't fight over the disposition.
+ */
+
+/* Build a Child record `{ pid: Int }`. The "pid" field name is
+ * load-bearing — `_kai_process_record_pid` reads the slot by
+ * strcmp on the name pointer's contents, in lockstep with
+ * `builtin_child_decl` in stage2/compiler.kai. */
+static KaiValue *_kai_process_make_child(int pid) {
+    KaiValue *pid_kv = kai_int((int64_t) pid);
+    KaiValue *fields[1] = { pid_kv };
+    static const char *names[1] = { "pid" };
+    return kai_record(1, fields, names);
+}
+
+/* Pull the `pid` slot out of a Child record. Returns -1 on shape
+ * mismatch — the caller surfaces that as an error path; v1 trusts
+ * the typer to keep this honest in normal flows. */
+static int _kai_process_record_pid(KaiValue *v) {
+    if (!v || v->tag != KAI_RECORD) return -1;
+    for (int i = 0; i < v->as.rec.n_fields; ++i) {
+        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "pid") == 0) {
+            KaiValue *f = v->as.rec.fields[i];
+            if (!kai_is_int(f)) return -1;
+            return (int) kai_intf(f);
+        }
+    }
+    return -1;
+}
+
+/* Mint Exited(code) / Signaled(signo) — variant *names* are the
+ * runtime contract with `builtin_exit_decl`. The typer-declared
+ * shape is `Exited(Int)` / `Signaled(Int)`. The emitter's slot
+ * representation for a variant Int field has flipped twice; this
+ * runtime constructor must track whichever convention the emitter
+ * reads, because the cell it mints is matched by emitter-generated
+ * code:
+ *   - #440 Phase 2: raw scalar in `.i64`, slot kind KAI_VAR_SLOT_INT.
+ *   - #741: re-boxed to a tagged pointer (`{.ptr = kai_int(n)}`,
+ *     slot_mask 0) when `variant_slot_kind` reported Int as a pointer
+ *     kind and the emitter bound every slot via `.ptr`.
+ *   - i64-inline Lane B (commit 1f4f66f): back to raw int64 in `.i64`
+ *     with slot kind KAI_VAR_SLOT_INT. `variant_slot_kind(Int) == 1`,
+ *     so the emitter constructs `Exited` as
+ *     `kai_variant_u_fast(9, 1, {{.i64 = code}})` (mask 1) and the
+ *     match reads `kai_var_slots(_scr)[0].i64` raw. With the old boxed
+ *     mask-0 cell the match read the pointer bits as the exit code, so
+ *     every `Exited(0)` looked non-zero (process_basic #741 went red).
+ * Mirror the emitter exactly: raw `.i64`, mask KAI_VAR_SLOT_INT. The
+ * mask also keeps the generic drop walker from decref-ing a raw int
+ * as if it were a pointer. */
+static KaiValue *_kai_process_make_exit_exited(int code) {
+    KaiVarSlot s; s.i64 = (int64_t) code;
+    return kai_variant_u(9, "Exited", 1, KAI_VAR_SLOT_INT, &s);
+}
+
+static KaiValue *_kai_process_make_exit_signaled(int signo) {
+    KaiVarSlot s; s.i64 = (int64_t) signo;
+    return kai_variant_u(10, "Signaled", 1, KAI_VAR_SLOT_INT, &s);
+}
+
+static KaiValue *_kai_process_err_msg(KaiCont *k, const char *msg) {
+    KaiValue *m = kai_str(msg);
+    KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
+    return kai_cont_resume(k, err);
+}
+
+static KaiValue *_kai_process_err(KaiCont *k, int saved_errno) {
+    const char *msg = strerror(saved_errno);
+    return _kai_process_err_msg(k, msg ? msg : "unknown error");
+}
+
+static KaiValue *_kai_process_ok(KaiCont *k, KaiValue *payload) {
+    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = payload}});
+    return kai_cont_resume(k, ok);
+}
+
+/* Walk a [String] cons list once to count entries, then again to
+ * copy the C strings into a NULL-terminated argv vector. The
+ * vector and its element copies are owned by the caller and freed
+ * after execvp returns / does not return. argv[0] is `cmd`; the
+ * supplied `args` list fills argv[1..n]. */
+static char **_kai_process_build_argv(const char *cmd, KaiValue *args, int *out_n) {
+    int n = 1;  /* slot 0 is cmd */
+    for (KaiValue *p = args; p && p->tag == KAI_CONS; p = p->as.cons.tail) ++n;
+    char **argv = (char **) malloc(((size_t) n + 1) * sizeof(char *));
+    if (!argv) return NULL;
+    argv[0] = strdup(cmd ? cmd : "");
+    int i = 1;
+    for (KaiValue *p = args; p && p->tag == KAI_CONS; p = p->as.cons.tail) {
+        KaiValue *h = p->as.cons.head;
+        if (kai_is_ptr(h) && h->tag == KAI_STR) {
+            argv[i] = strdup(h->as.s.bytes ? h->as.s.bytes : "");
+        } else {
+            argv[i] = strdup("");
+        }
+        ++i;
+    }
+    argv[n] = NULL;
+    *out_n = n;
+    return argv;
+}
+
+static void _kai_process_free_argv(char **argv, int n) {
+    if (!argv) return;
+    for (int i = 0; i < n; ++i) free(argv[i]);
+    free(argv);
+}
+
+/* Child-side, between fork and exec: reset the signal mask and the
+ * SIGPIPE disposition. Both survive execvp, and the runtime's own
+ * mask manipulation must not leak into the exec'd image — a child
+ * pipeline whose SIGPIPE is blocked reports EPIPE noise on stderr
+ * instead of dying silently when its reader closes (GNU `yes`
+ * observably differs between Linux CI and macOS without this).
+ * Async-signal-safe callees only. */
+static void _kai_process_child_reset_signals(void) {
+    sigset_t empty;
+    sigemptyset(&empty);
+    sigprocmask(SIG_SETMASK, &empty, NULL);
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(SIGPIPE, &dfl, NULL);
+}
+
+/* Parent-side pipe ends of a piped child, keyed by pid. `start_piped`
+ * registers, the stdio ops look up, and `wait` closes whatever is
+ * still open before reaping (pclose semantics) — an unclosed parent
+ * end would keep the child from ever seeing EOF. Shared process
+ * state for the same reason as kai_signal_subscribed: the ops may
+ * run from different TUs under separate compilation. */
+typedef struct KaiProcPipe {
+    int pid;
+    int in_fd;   /* parent writes the child's stdin; -1 = not piped / closed */
+    int out_fd;  /* parent reads the child's stdout; -1 = not piped */
+    int err_fd;  /* parent reads the child's stderr; -1 = not piped */
+    struct KaiProcPipe *next;
+} KaiProcPipe;
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiProcPipe    *kai_proc_pipes;
+extern pthread_mutex_t kai_proc_pipes_mu;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiProcPipe    *kai_proc_pipes = NULL;
+pthread_mutex_t kai_proc_pipes_mu = PTHREAD_MUTEX_INITIALIZER;
+#  endif
+#else
+static KaiProcPipe    *kai_proc_pipes = NULL;
+static pthread_mutex_t kai_proc_pipes_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+static void _kai_proc_pipe_add(int pid, int in_fd, int out_fd, int err_fd) {
+    KaiProcPipe *e = (KaiProcPipe *) malloc(sizeof(KaiProcPipe));
+    if (!e) { fputs("kai: out of memory\n", stderr); exit(1); }
+    e->pid = pid; e->in_fd = in_fd; e->out_fd = out_fd; e->err_fd = err_fd;
+    pthread_mutex_lock(&kai_proc_pipes_mu);
+    e->next = kai_proc_pipes;
+    kai_proc_pipes = e;
+    pthread_mutex_unlock(&kai_proc_pipes_mu);
+}
+
+/* Fetch one end (0 = in_fd, 1 = out_fd, 2 = err_fd) under the lock.
+ * The blocking IO itself runs unlocked so a parked write cannot stall
+ * unrelated process ops. */
+static int _kai_proc_pipe_fd(int pid, int which) {
+    int fd = -1;
+    pthread_mutex_lock(&kai_proc_pipes_mu);
+    for (KaiProcPipe *e = kai_proc_pipes; e; e = e->next) {
+        if (e->pid == pid) {
+            fd = which == 0 ? e->in_fd : which == 1 ? e->out_fd : e->err_fd;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&kai_proc_pipes_mu);
+    return fd;
+}
+
+static void _kai_proc_pipe_close_stdin(int pid) {
+    pthread_mutex_lock(&kai_proc_pipes_mu);
+    for (KaiProcPipe *e = kai_proc_pipes; e; e = e->next) {
+        if (e->pid == pid) {
+            if (e->in_fd >= 0) { close(e->in_fd); e->in_fd = -1; }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&kai_proc_pipes_mu);
+}
+
+static void _kai_proc_pipe_drop(int pid) {
+    pthread_mutex_lock(&kai_proc_pipes_mu);
+    KaiProcPipe **p = &kai_proc_pipes;
+    while (*p && (*p)->pid != pid) p = &(*p)->next;
+    KaiProcPipe *e = *p;
+    if (e) *p = e->next;
+    pthread_mutex_unlock(&kai_proc_pipes_mu);
+    if (e) {
+        if (e->in_fd  >= 0) close(e->in_fd);
+        if (e->out_fd >= 0) close(e->out_fd);
+        if (e->err_fd >= 0) close(e->err_fd);
+        free(e);
+    }
+}
+
+/* Write all of buf; returns 0 or the failing errno. A dead reader
+ * must surface as EPIPE, not kill the process: where the OS has a
+ * per-fd opt-out (F_SETNOSIGPIPE) start_piped already set it; else
+ * block SIGPIPE for this thread around the write and drain the
+ * pending signal so the default disposition never fires. */
+static int _kai_proc_write_all(int fd, const char *buf, size_t len) {
+#if !defined(F_SETNOSIGPIPE)
+    sigset_t pipe_set, prev_set;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &pipe_set, &prev_set);
+#endif
+    int err = 0;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            err = errno;
+            break;
+        }
+        off += (size_t) w;
+    }
+#if !defined(F_SETNOSIGPIPE)
+    if (err == EPIPE) {
+        struct timespec zero = { 0, 0 };
+        while (sigtimedwait(&pipe_set, NULL, &zero) >= 0) {}
+    }
+    pthread_sigmask(SIG_SETMASK, &prev_set, NULL);
+#endif
+    return err;
+}
+
+/* start(cmd, args) -> Child. fork + execvp; on failure of either
+ * primitive, panic with strerror — start has no Result wrapper in
+ * v1 (see the divergence note in builtin_process_decl).
+ *
+ * Issue #611 — install the SIGCHLD handler before fork() so that
+ * a fast-exiting child cannot deliver SIGCHLD to the kernel's
+ * default disposition (zombie reaper only) before the reactor is
+ * armed. Idempotent. */
+static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *args, KaiCont *k) {
+    (void) self;
+    if (!cmd || cmd->tag != KAI_STR) {
+        fputs("kai: Process.start: cmd must be a String\n", stderr);
+        exit(1);
+    }
+    kai_reactor_init();
+    /* cmd is heap-allocated by kai_str_from_bytes with a trailing
+     * NUL, so passing bytes directly to execvp is safe. */
+    const char *cmd_cstr = cmd->as.s.bytes ? cmd->as.s.bytes : "";
+    int argc = 0;
+    char **argv = _kai_process_build_argv(cmd_cstr, args, &argc);
+    if (!argv) {
+        fputs("kai: Process.start: out of memory building argv\n", stderr);
+        exit(1);
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        int e = errno;
+        _kai_process_free_argv(argv, argc);
+        fprintf(stderr, "kai: Process.start: fork: %s\n", strerror(e));
+        exit(1);
+    }
+    if (pid == 0) {
+        /* Child: replace image. execvp searches PATH for relative
+         * names; absolute paths bypass the search. On any failure
+         * exit 127, the shell convention for "command not found". */
+        _kai_process_child_reset_signals();
+        execvp(cmd_cstr, argv);
+        /* execvp only returns on failure. Async-signal-safe writers
+         * only — keep the message minimal. */
+        const char *prefix = "kai: Process.start: execvp: ";
+        const char *msg    = strerror(errno);
+        ssize_t w;
+        w = write(2, prefix, strlen(prefix)); (void) w;
+        if (msg) { w = write(2, msg, strlen(msg)); (void) w; }
+        w = write(2, "\n", 1); (void) w;
+        _exit(127);
+    }
+    /* Parent: clean up argv copies and resume with the Child
+     * handle. The Child borrows nothing from argv — it carries
+     * just the pid. */
+    _kai_process_free_argv(argv, argc);
+    KaiValue *child = _kai_process_make_child((int) pid);
+    return kai_cont_resume(k, child);
+}
+
+/* wait(c) -> Result[Exit, String]. Issue #611 Phase R1: the wait
+ * parks the calling fiber on the reactor's pid waiter map and the
+ * SIGCHLD self-pipe drives the wake. WIFEXITED → Exited(status);
+ * WIFSIGNALED → Signaled(signo). The reactor's waitpid drain uses
+ * `-1` to harvest any pending child, so a SIGCHLD that fires while
+ * the parking fiber is mid-park is handled by the drain helper at
+ * the next reactor wait (or immediately if the byte was already
+ * pending in the self-pipe). */
+KAI_SCHED_FN KaiValue *kai_default_process_wait(void *self, KaiValue *child, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    int pid = _kai_process_record_pid(child);
+    if (pid <= 0) {
+        return _kai_process_err_msg(k, "wait: invalid Child");
+    }
+    /* pclose semantics: EOF the child's stdin and release every parent
+     * end before reaping — a still-open write end would deadlock a
+     * child that reads stdin to exhaustion. Drain stdout BEFORE wait;
+     * closing the read end here means an undrained child still writing
+     * takes EPIPE instead of blocking forever. */
+    _kai_proc_pipe_drop(pid);
+    kai_reactor_init();
+    /* Race: the child may have terminated before we registered the
+     * waiter — reaped either by us here (non-blocking waitpid) or by
+     * the reactor drain's waitpid(-1), in which case the status sits
+     * in the pending-exits buffer. Check the buffer on both sides of
+     * our own waitpid: the drain can win between the two calls. */
+    int status = 0;
+    if (!kai_reactor_take_child_exit(pid, &status)) {
+        pid_t rc = waitpid((pid_t) pid, &status, WNOHANG);
+        if (rc == 0) {
+            /* Child still running; park on the pid map and let the
+             * SIGCHLD drain wake us with the status. Re-park on a spurious
+             * resume — only the drain's own splice carries a real status. */
+            KaiFiber *me = kai_current_fiber();
+            do {
+                kai_reactor_park_pid(me, pid);
+            } while (!me->reactor_fired);
+            status = me->reactor_wait_status;
+            me->reactor_wait_pid    = 0;
+            me->reactor_wait_status = 0;
+        } else if (rc < 0) {
+            int e = errno;
+            if (!kai_reactor_take_child_exit(pid, &status)) {
+                return _kai_process_err(k, e);
+            }
+        }
+    }
+    KaiValue *exit_v;
+    if (WIFEXITED(status)) {
+        exit_v = _kai_process_make_exit_exited(WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        exit_v = _kai_process_make_exit_signaled(WTERMSIG(status));
+    } else {
+        exit_v = _kai_process_make_exit_exited(-1);
+    }
+    return _kai_process_ok(k, exit_v);
+}
+#endif
+
+/* kill(c, sig) -> Result[Unit, String]. Maps directly to kill(2);
+ * sig is taken as a raw signo Int (full POSIX set including
+ * SIGKILL — see the builtin_process_decl divergence note). */
+static KaiValue *kai_default_process_kill(void *self, KaiValue *child, KaiValue *sig, KaiCont *k) {
+    (void) self;
+    int pid = _kai_process_record_pid(child);
+    if (pid <= 0) {
+        return _kai_process_err_msg(k, "kill: invalid Child");
+    }
+    int signo = (kai_is_int(sig)) ? (int) kai_intf(sig) : 0;
+    if (kill((pid_t) pid, signo) < 0) {
+        return _kai_process_err(k, errno);
+    }
+    return _kai_process_ok(k, kai_unit());
+}
+
+/* exit(code) -> Nothing. _exit(2) — skip libc atexit / stdio flush
+ * to match the doc spec contract. The `: Nothing` return type is
+ * load-bearing: we never resume k. */
+static KaiValue *kai_default_process_exit(void *self, KaiValue *code, KaiCont *k) {
+    (void) self;
+    (void) k;
+    int c = (kai_is_int(code)) ? (int) kai_intf(code) : 0;
+    _exit(c);
+    /* unreachable */
+    return NULL;
+}
+
+/* start_piped(cmd, args, pipe_stdin, pipe_stdout, pipe_stderr)
+ *   -> Result[Child, String].
+ * popen-shaped: attach a pipe to any of the child's stdin, stdout and
+ * stderr; the rest inherit. Unlike `start`, primitive failure surfaces
+ * as Err — a missing binary is an ordinary outcome when shelling out.
+ * Parent ends are FD_CLOEXEC so a later fork cannot hold a stray
+ * write end open and starve a sibling reader of EOF. */
+static int _kai_proc_pipe_open(int want, int p[2]) {
+    if (!want || pipe(p) == 0) return 0;
+    int e = errno;
+    p[0] = p[1] = -1;
+    return e;
+}
+
+static void _kai_proc_pipe_close_pair(int p[2]) {
+    if (p[0] >= 0) close(p[0]);
+    if (p[1] >= 0) close(p[1]);
+}
+
+/* Child side, between fork and exec: async-signal-safe calls only. */
+static void _kai_proc_pipe_child_dup(int p[2], int child_end, int target) {
+    if (p[child_end] < 0) return;
+    if (p[child_end] != target) { dup2(p[child_end], target); close(p[child_end]); }
+    close(p[1 - child_end]);
+}
+
+static int _kai_proc_pipe_parent_read_end(int p[2]) {
+    if (p[0] < 0) return -1;
+    close(p[1]);
+    fcntl(p[0], F_SETFD, FD_CLOEXEC);
+    fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_NONBLOCK);
+    return p[0];
+}
+
+static int _kai_proc_want(KaiValue *flag) {
+    return flag && flag->tag == KAI_BOOL && flag->as.b;
+}
+
+static KaiValue *kai_default_process_start_piped(void *self, KaiValue *cmd, KaiValue *args,
+                                                 KaiValue *pipe_in_v, KaiValue *pipe_out_v,
+                                                 KaiValue *pipe_err_v, KaiCont *k) {
+    (void) self;
+    if (!cmd || cmd->tag != KAI_STR) {
+        return _kai_process_err_msg(k, "start_piped: cmd must be a String");
+    }
+    int in_p[2]  = { -1, -1 };
+    int out_p[2] = { -1, -1 };
+    int err_p[2] = { -1, -1 };
+    int e = _kai_proc_pipe_open(_kai_proc_want(pipe_in_v), in_p);
+    if (!e) e = _kai_proc_pipe_open(_kai_proc_want(pipe_out_v), out_p);
+    if (!e) e = _kai_proc_pipe_open(_kai_proc_want(pipe_err_v), err_p);
+    if (e) {
+        _kai_proc_pipe_close_pair(in_p);
+        _kai_proc_pipe_close_pair(out_p);
+        _kai_proc_pipe_close_pair(err_p);
+        return _kai_process_err(k, e);
+    }
+    const char *cmd_cstr = cmd->as.s.bytes ? cmd->as.s.bytes : "";
+    int argc = 0;
+    char **argv = _kai_process_build_argv(cmd_cstr, args, &argc);
+    if (!argv) { fputs("kai: out of memory\n", stderr); exit(1); }
+    kai_reactor_init();
+    pid_t pid = fork();
+    if (pid < 0) {
+        e = errno;
+        _kai_process_free_argv(argv, argc);
+        _kai_proc_pipe_close_pair(in_p);
+        _kai_proc_pipe_close_pair(out_p);
+        _kai_proc_pipe_close_pair(err_p);
+        return _kai_process_err(k, e);
+    }
+    if (pid == 0) {
+        _kai_process_child_reset_signals();
+        _kai_proc_pipe_child_dup(in_p, 0, 0);
+        _kai_proc_pipe_child_dup(out_p, 1, 1);
+        _kai_proc_pipe_child_dup(err_p, 1, 2);
+        execvp(cmd_cstr, argv);
+        /* Async-signal-safe writers only. 127 = command not found. */
+        const char *prefix = "kai: Process.start_piped: execvp: ";
+        const char *msg    = strerror(errno);
+        ssize_t w;
+        w = write(2, prefix, strlen(prefix)); (void) w;
+        if (msg) { w = write(2, msg, strlen(msg)); (void) w; }
+        w = write(2, "\n", 1); (void) w;
+        _exit(127);
+    }
+    _kai_process_free_argv(argv, argc);
+    int wr = -1;
+    if (in_p[1] >= 0) {
+        close(in_p[0]);
+        wr = in_p[1];
+        fcntl(wr, F_SETFD, FD_CLOEXEC);
+#if defined(F_SETNOSIGPIPE)
+        fcntl(wr, F_SETNOSIGPIPE, 1);
+#endif
+    }
+    _kai_proc_pipe_add((int) pid, wr, _kai_proc_pipe_parent_read_end(out_p),
+                       _kai_proc_pipe_parent_read_end(err_p));
+    return _kai_process_ok(k, _kai_process_make_child((int) pid));
+}
+
+/* write_stdin(c, data) -> Result[Unit, String]. Writes every byte or
+ * reports the failing errno; a reader that died early is Err("Broken
+ * pipe"), never a fatal SIGPIPE. Blocks the OS thread while the pipe
+ * is full — a child that never reads its stdin deadlocks the writer. */
+static KaiValue *kai_default_process_write_stdin(void *self, KaiValue *child, KaiValue *data, KaiCont *k) {
+    (void) self;
+    int pid = _kai_process_record_pid(child);
+    int fd  = pid > 0 ? _kai_proc_pipe_fd(pid, 0) : -1;
+    if (fd < 0) {
+        return _kai_process_err_msg(k, "write_stdin: stdin is not piped");
+    }
+    if (data && data->tag == KAI_STR && data->as.s.bytes && data->as.s.len > 0) {
+        int err = _kai_proc_write_all(fd, data->as.s.bytes, data->as.s.len);
+        if (err) return _kai_process_err(k, err);
+    }
+    return _kai_process_ok(k, kai_unit());
+}
+
+/* close_stdin(c) -> Result[Unit, String]. EOFs the child's stdin.
+ * Idempotent — closing an already-closed end is Ok, matching pclose's
+ * tolerance; only a malformed Child is an error. */
+static KaiValue *kai_default_process_close_stdin(void *self, KaiValue *child, KaiCont *k) {
+    (void) self;
+    int pid = _kai_process_record_pid(child);
+    if (pid <= 0) {
+        return _kai_process_err_msg(k, "close_stdin: invalid Child");
+    }
+    _kai_proc_pipe_close_stdin(pid);
+    return _kai_process_ok(k, kai_unit());
+}
+
+/* One read of up to 64 KiB from a piped child stream (1 = stdout,
+ * 2 = stderr); Ok("") is EOF. Reading chunk-by-chunk (rather than one
+ * read-to-end op) is what lets a caller drain output larger than the
+ * OS pipe capacity without deadlocking the child. The read end is
+ * O_NONBLOCK: an empty pipe parks the fiber on read-readiness, never
+ * the thread. The fd is looked up again after each park: a concurrent
+ * `wait` may have closed it, and its number reused by an unrelated file. */
+#if !KAI_SCHED_DECL_ONLY
+static KaiValue *_kai_proc_read_chunk(KaiValue *child, int which, KaiCont *k) {
+    const char *name = which == 1 ? "stdout" : "stderr";
+    char msg[64];
+    int pid = _kai_process_record_pid(child);
+    int fd  = pid > 0 ? _kai_proc_pipe_fd(pid, which) : -1;
+    if (fd < 0) {
+        snprintf(msg, sizeof msg, "read_%s: %s is not piped", name, name);
+        return _kai_process_err_msg(k, msg);
+    }
+    kai_reactor_init();
+    enum { KAI_PROC_READ_CHUNK = 65536 };
+    char *buf = (char *) malloc(KAI_PROC_READ_CHUNK);
+    if (!buf) { fputs("kai: out of memory\n", stderr); exit(1); }
+    ssize_t n;
+    for (;;) {
+        n = read(fd, buf, KAI_PROC_READ_CHUNK);
+        if (n >= 0) break;
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+        kai_reactor_park_socket_read(kai_current_fiber(), fd);
+        fd = _kai_proc_pipe_fd(pid, which);
+        if (fd < 0) {
+            free(buf);
+            snprintf(msg, sizeof msg, "read_%s: %s was closed", name, name);
+            return _kai_process_err_msg(k, msg);
+        }
+    }
+    if (n < 0) {
+        int e = errno;
+        free(buf);
+        return _kai_process_err(k, e);
+    }
+    KaiValue *s = kai_str_from_bytes(buf, (size_t) n);
+    free(buf);
+    return _kai_process_ok(k, s);
+}
+#endif
+
+KAI_SCHED_FN KaiValue *kai_default_process_read_stdout(void *self, KaiValue *child, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    return _kai_proc_read_chunk(child, 1, k);
+}
+#endif
+
+KAI_SCHED_FN KaiValue *kai_default_process_read_stderr(void *self, KaiValue *child, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    return _kai_proc_read_chunk(child, 2, k);
+}
+#endif
+
+/* =================================================================
+ * Log effect — issue #141. Tier S2 #7 of `docs/stdlib-roadmap.md`.
+ *
+ * Four leveled ops (debug / info / warn / error) routed through the
+ * Log effect. The default handler installed by `kai_main_install_
+ * defaults` writes to stderr in
+ *
+ *     [YYYY-MM-DDTHH:MM:SSZ] LEVEL message\n
+ *
+ * form. The level field is left-padded to 5 chars so the column
+ * after it is aligned across all four ops:
+ *     "DEBUG", "INFO ", "WARN ", "ERROR".
+ *
+ * Timestamp source: `clock_gettime(CLOCK_REALTIME)` + `gmtime_r`
+ * + `strftime`. Calling `clock_gettime` directly here (rather than
+ * routing through the kaikai-side `Clock` effect) keeps the `Log`
+ * row free of `Clock` — a program can declare `: Unit / Log` and
+ * have its main install the Log default without also pulling
+ * `Clock`'s default handler into the row.
+ *
+ * The runtime flushes stderr after each write so test harnesses
+ * see the output deterministically (no buffer hold-back if a
+ * later abort kills the process before exit-time flushing fires).
+ *
+ * v1 limitations (mirrored in stdlib/log.kai):
+ *   - No level filtering. All four levels write unconditionally.
+ *   - No structured fields, redaction, rotation, color, async
+ *     batching, or trace-context propagation. All of those are
+ *     ahu.log territory (a higher layer that wraps Log). */
+
+static void _kai_log_emit(const char *level_padded, KaiValue *msg) {
+    /* Format the timestamp into a stack buffer. clock_gettime /
+     * gmtime_r failure is rare; fall back to a sentinel rather
+     * than swallow the message — the user should still see what
+     * level + body was intended. */
+    char ts[32];
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) == 0) {
+        struct tm tm;
+        if (gmtime_r(&now.tv_sec, &tm) != NULL &&
+            strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm) > 0) {
+            /* ok */
+        } else {
+            memcpy(ts, "?????", 6);
+        }
+    } else {
+        memcpy(ts, "?????", 6);
+    }
+
+    /* Header `[<ts>] <LEVEL> ` then the message bytes then newline.
+     * fputs on the prefix, fwrite on the message body so embedded
+     * NULs in user strings don't truncate the line. */
+    flockfile(stderr);
+    fputc('[', stderr);
+    fputs(ts, stderr);
+    fputs("] ", stderr);
+    fputs(level_padded, stderr);
+    fputc(' ', stderr);
+    if (msg && msg->tag == KAI_STR && msg->as.s.bytes && msg->as.s.len > 0) {
+        fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
+    }
+    fputc('\n', stderr);
+    funlockfile(stderr);
+    fflush(stderr);
+}
+
+static KaiValue *kai_default_log_debug(void *self, KaiValue *msg, KaiCont *k) {
+    (void) self;
+    _kai_log_emit("DEBUG", msg);
+    return kai_cont_resume(k, kai_unit());
+}
+
+static KaiValue *kai_default_log_info(void *self, KaiValue *msg, KaiCont *k) {
+    (void) self;
+    _kai_log_emit("INFO ", msg);
+    return kai_cont_resume(k, kai_unit());
+}
+
+static KaiValue *kai_default_log_warn(void *self, KaiValue *msg, KaiCont *k) {
+    (void) self;
+    _kai_log_emit("WARN ", msg);
+    return kai_cont_resume(k, kai_unit());
+}
+
+static KaiValue *kai_default_log_error(void *self, KaiValue *msg, KaiCont *k) {
+    (void) self;
+    _kai_log_emit("ERROR", msg);
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* =================================================================
+ * SecureRandom effect — issue #140. Cryptographically-secure RNG
+ * deliberately separated from Random so test handlers stubbing the
+ * latter cannot weaken security-sensitive paths.
+ *
+ * Default handler uses the platform CSPRNG, never a userspace PRNG:
+ *   - Linux: getrandom(2) syscall (works pre-prng-init; we loop on
+ *     EINTR but otherwise treat any failure as fatal — the kernel
+ *     pool being unavailable is catastrophic and there is no
+ *     meaningful Result for callers who already opted into crypto-
+ *     grade randomness).
+ *   - macOS / *BSD: arc4random_buf(3) — returns void; the libc
+ *     implementation reseeds itself from /dev/urandom and panics
+ *     internally on failure, matching the same "infallible from
+ *     callers' perspective" contract.
+ *
+ * v1 limitations (mirrored in docs/effects-stdlib.md §SecureRandom):
+ *   - POSIX only. Windows BCryptGenRandom is post-MVP.
+ *   - No /dev/urandom fallback. getrandom is the entire Linux story.
+ *   - No userspace ChaCha20 CSPRNG layer. Each draw hits the kernel.
+ *   - Uniform `int(min, max)` uses `% delta` reduction. The modulo
+ *     bias is acceptable for v1 (security-grade rejection sampling
+ *     is a follow-up); cryptographic-protocol callers that need a
+ *     strictly-uniform integer should draw `bytes` and reduce
+ *     themselves.
+ */
+
+#if defined(__linux__)
+#  include <sys/random.h>
+#elif defined(__APPLE__) || defined(__MACH__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+   /* arc4random_buf is in <stdlib.h> on macOS/BSD, already included
+    * above. No extra header needed. */
+#else
+#  error "kai SecureRandom: platform unsupported (POSIX getrandom / arc4random_buf required)"
+#endif
+
+static void _kai_securerandom_fill(unsigned char *buf, size_t n) {
+#if defined(__linux__)
+    size_t off = 0;
+    while (off < n) {
+        ssize_t got = getrandom(buf + off, n - off, 0);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "kai: SecureRandom: getrandom failed: %s\n", strerror(errno));
+            exit(1);
+        }
+        off += (size_t) got;
+    }
+#else
+    arc4random_buf(buf, n);
+#endif
+}
+
+/* int_range(min, max) -> Int in [min, max] (inclusive). Pulls 8
+ * bytes from the platform CSPRNG, interprets them as a uint64,
+ * reduces modulo (max - min + 1), and adds min. min > max is a
+ * panic: there is no meaningful uniform draw over an empty range.
+ * Op named `int_range` (not the doc's `int()`) because `int` is a
+ * C keyword and the C backend emits each effect op as a struct
+ * field by name. */
+static KaiValue *kai_default_securerandom_int_range(void *self, KaiValue *min_v, KaiValue *max_v, KaiCont *k) {
+    (void) self;
+    int64_t lo = (kai_is_int(min_v)) ? kai_intf(min_v) : 0;
+    int64_t hi = (kai_is_int(max_v)) ? kai_intf(max_v) : 0;
+    if (lo > hi) {
+        fprintf(stderr, "kai: SecureRandom.int: min (%lld) > max (%lld)\n",
+                (long long) lo, (long long) hi);
+        exit(1);
+    }
+    unsigned char buf[8];
+    _kai_securerandom_fill(buf, sizeof(buf));
+    uint64_t draw = 0;
+    for (int i = 0; i < 8; ++i) draw = (draw << 8) | (uint64_t) buf[i];
+    uint64_t span = (uint64_t) (hi - lo) + 1ULL;
+    uint64_t pick = (span == 0) ? draw : (draw % span);
+    return kai_cont_resume(k, kai_int(lo + (int64_t) pick));
+}
+
+/* bytes(n) -> [Int] (each in [0, 256), surface-typed [Byte] but
+ * stage 2 has no first-class Byte yet — same divergence the NetTcp
+ * decl documents). n <= 0 returns the empty list; n > 1 MiB is
+ * capped (matches NetTcp.recv's v1 ceiling — multi-megabyte single
+ * draws are out of scope and almost always wrong for crypto use,
+ * which is happier with smaller, repeated draws). */
+static KaiValue *kai_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCont *k) {
+    (void) self;
+    int64_t n = (kai_is_int(n_v)) ? kai_intf(n_v) : 0;
+    if (n <= 0) {
+        return kai_cont_resume(k, kai_nil());
+    }
+    if (n > (1 << 20)) n = 1 << 20;
+    unsigned char *buf = (unsigned char *) malloc((size_t) n);
+    if (!buf) {
+        fputs("kai: SecureRandom.bytes: out of memory\n", stderr);
+        exit(1);
+    }
+    _kai_securerandom_fill(buf, (size_t) n);
+    KaiValue *acc = kai_nil();
+    for (int64_t i = n; i > 0;) { --i; acc = kai_cons(kai_int((int64_t) buf[i]), acc); }
+    free(buf);
+    return kai_cont_resume(k, acc);
+}
+
+/* =================================================================
+ * m8.x cooperative scheduler primitives
+ * =================================================================
+ *
+ * Spec: docs/fibers-impl.md §*Scheduler* and §*Yield primitives*.
+ *
+ * Single-threaded cooperative scheduler. The OS thread starts in
+ * kai_main_fiber (state=RUNNING); spawned fibers each get a private
+ * heap-allocated stack and a ucontext_t. Yield/park use swapcontext
+ * to hand control between fibers. The dispatcher is implicit — there
+ * is no separate scheduler context, just whoever was running before
+ * the current fiber gets resumed when the queue empties.
+ *
+ * v1 ships Phase 2 (scheduler core); Phase 3 adds Cancel delivery at
+ * yield points; Phase 4 adds blocking primitives (BlockSender mailbox
+ * + Actor.receive parking); Phase 5 adds Link/Monitor runtime.
+ */
+
+/* Page size, queried once via sysconf and cached. macOS arm64 pages
+ * are 16 KiB, x86_64 / Linux are 4 KiB; the guard arithmetic must use
+ * the runtime value or mprotect rejects the call. */
+static size_t kai_page_size(void) {
+    static size_t cached = 0;
+    if (cached == 0) {
+        long ps = sysconf(_SC_PAGESIZE);
+        cached = (ps > 0) ? (size_t) ps : 4096;
+    }
+    return cached;
+}
+
+/* Read KAI_FIBER_STACK_SIZE once and cache. Out-of-range values
+ * fall back to the default and log a warning. The result is rounded
+ * up to a page-size multiple — mmap + mprotect both require it, and
+ * 16 KiB pages on macOS arm64 silently break sub-page values
+ * otherwise. */
+static size_t kai_fiber_stack_size(void) {
+    static size_t cached = 0;
+    if (cached != 0) return cached;
+    const char *env = getenv("KAI_FIBER_STACK_SIZE");
+    size_t sz = 64 * 1024;  /* default 64 KiB */
+    if (env && *env) {
+        char *end = NULL;
+        long long parsed = strtoll(env, &end, 10);
+        if (end != env && *end == '\0' && parsed >= 4096 && parsed <= (long long)(64 * 1024 * 1024)) {
+            sz = (size_t) parsed;
+        } else {
+            fprintf(stderr,
+                "kai: KAI_FIBER_STACK_SIZE=%s out of range [4096, 64M]; using default 64K\n",
+                env);
+        }
+    }
+    size_t ps = kai_page_size();
+    if (sz % ps != 0) sz = ((sz / ps) + 1) * ps;
+    cached = sz;
+    return cached;
+}
+
+/* Stack budget for the fiber that runs kai_main. It is not an ordinary
+ * fiber: at one thread main runs directly on the OS thread stack, and at
+ * N>1 it runs as a fiber — so handing it the 64 KiB fiber default would
+ * make the thread count decide whether a deeply recursive program
+ * survives. Track the main thread instead (RLIMIT_STACK, floored at the
+ * conventional 8 MiB), and let a larger explicit KAI_FIBER_STACK_SIZE
+ * still win. */
+static size_t kai_main_fiber_stack_size(void) {
+    size_t sz = 8 * 1024 * 1024;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) == 0
+        && rl.rlim_cur != RLIM_INFINITY
+        && (size_t) rl.rlim_cur > sz) {
+        sz = (size_t) rl.rlim_cur;
+    }
+    if (sz > 64 * 1024 * 1024) sz = 64 * 1024 * 1024;
+    size_t fiber = kai_fiber_stack_size();
+    return fiber > sz ? fiber : sz;
+}
+
+/* SIGSEGV / SIGBUS handler for fiber stack overflow. The fault lands
+ * on the active fiber's guard page (PROT_NONE); we print a diagnostic
+ * and re-raise with the default disposition. Faults outside any guard
+ * (e.g. NULL deref in user code) fall through to default — we only
+ * decorate the stack-overflow case. The handler runs on a sigaltstack
+ * so the overflowed stack is never used to format the message. Spec:
+ * `docs/fibers-honesty-targets.md` Tier 1. */
+/* Two different scopes live here, and conflating them loses the diagnostic:
+ * the SIGSEGV/SIGBUS disposition is process-wide (installed once, guarded by
+ * kai_sigsegv_installed), while sigaltstack is PER-THREAD. A thread without
+ * an alternate stack gives SA_ONSTACK nothing to switch to, so the handler
+ * would run on the stack that just overflowed, fault again, and the process
+ * dies with no message. Every thread that can run a fiber installs its own. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS void *kai_sigalt_stack;
+extern KAI_TLS int   kai_sigalt_ready;
+extern int   kai_sigsegv_installed;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS void *kai_sigalt_stack = NULL;
+KAI_TLS int   kai_sigalt_ready = 0;
+int   kai_sigsegv_installed = 0;
+#  endif
+#else
+static KAI_TLS void *kai_sigalt_stack = NULL;
+static KAI_TLS int   kai_sigalt_ready = 0;
+static int   kai_sigsegv_installed = 0;
+#endif
+
+static void kai_fiber_sigsegv_handler(int sig, siginfo_t *info, void *ucp) {
+    (void) ucp;
+    KaiFiber *f = kai_active_fiber;
+    if (f && f->stack_base && info && info->si_addr) {
+        char *guard_lo = (char *) f->stack_base;
+        char *guard_hi = guard_lo + kai_page_size();
+        char *addr     = (char *) info->si_addr;
+        if (addr >= guard_lo && addr < guard_hi) {
+            char buf[96];
+            int n = snprintf(buf, sizeof(buf),
+                             "kai: fiber stack overflow at %p\n", (void *) f);
+            if (n > 0) {
+                ssize_t w = write(2, buf, (size_t) n);
+                (void) w;
+            }
+        }
+    }
+    /* Re-raise with default disposition so the process terminates with
+     * the original signal — preserving the standard SIGSEGV exit
+     * status for callers (shell `$?` = 139) without swallowing
+     * unrelated faults. */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* Give the calling thread an alternate signal stack, adopting one that is
+ * already installed rather than displacing it.
+ *
+ * TRAP: a sanitizer runtime (and any embedding host that follows the same
+ * pattern) installs its own alternate stack per thread and, at thread exit,
+ * munmaps whatever `sigaltstack` hands back. Displacing it therefore makes
+ * that owner unmap OUR allocation — a malloc'd, unaligned pointer — which
+ * fails with EINVAL and is fatal under ASAN. Adopting costs nothing:
+ * SA_ONSTACK only needs a stack that is not the one that overflowed.
+ *
+ * Idempotent; an allocation we make stays owned by the thread-local pointer
+ * for the thread's life. */
+static void kai_install_thread_sigaltstack(void) {
+    if (kai_sigalt_ready) return;
+
+    stack_t cur;
+    if (sigaltstack(NULL, &cur) == 0 && cur.ss_sp && !(cur.ss_flags & SS_DISABLE)) {
+        kai_sigalt_ready = 1;
+        return;
+    }
+
+    size_t altsize = (size_t) SIGSTKSZ;
+    if (altsize < 32 * 1024) altsize = 32 * 1024;
+    void *sp = malloc(altsize);
+    if (!sp) return;
+    kai_sigalt_stack = sp;
+    kai_sigalt_ready = 1;
+
+    stack_t ss;
+    ss.ss_sp    = sp;
+    ss.ss_size  = altsize;
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+}
+
+static void kai_install_fiber_sigsegv_handler(void) {
+    kai_install_thread_sigaltstack();
+    if (kai_sigsegv_installed) return;
+    kai_sigsegv_installed = 1;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = kai_fiber_sigsegv_handler;
+    sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+}
+
+/* =================================================================
+ * Phase R1 reactor — issue #611
+ * =================================================================
+ *
+ * Single-threaded readiness reactor wired into the cooperative
+ * scheduler. Three surfaces park the calling fiber instead of the
+ * OS thread:
+ *   - Spawn.sleep(ns)        — timer wheel keyed on CLOCK_MONOTONIC.
+ *   - File defaults          — thread-pool offload (4 workers).
+ *   - Process.wait(child)    — SIGCHLD self-pipe + pid waiter map.
+ *
+ * OWNERSHIP INVARIANT (M:N §4, F2-ready boundary): all reactor state
+ * below — timer wheel, waiter lists, self-pipes, parked count, the file
+ * pool — is single-owner: it is read and mutated ONLY from inside
+ * `kai_reactor_wait` and its drain helpers (kai_reactor_*_drain), which
+ * are in turn called ONLY from `kai_reactor_wait`. No other code path
+ * touches it, and every ready-fiber handback goes through `kai_sched_unpark`
+ * from a drain. That single-owner discipline is what makes the F2 lift of
+ * `poll()` onto its own thread mechanical: only the handback (unpark →
+ * route to home_thread) changes; the state does not move.
+ *
+ * Wait primitive is `poll()` on two self-pipes (one for SIGCHLD,
+ * one for file-pool completions) plus a deadline-derived timeout.
+ * The kqueue/epoll path the parent issue (#474) sketched is queued
+ * for R2 when TCP sockets need readiness notifications; R1's three
+ * surfaces never wait directly on regular FDs, so the simpler
+ * `poll()` shape covers them portably without per-platform
+ * branching.
+ *
+ * Sockets (`NetTcp`) intentionally stay on the blocking syscall
+ * path until R2 ships in Orongo together with the Cancel redesign.
+ * The `NetTcp` runtime note in this file is left untouched and the
+ * `docs/effects-stdlib.md` sidebar for the surface continues to
+ * advertise the blocking shape.
+ */
+
+/* `kai_sched_unpark` is forward-declared earlier (right after the
+ * KaiFiber typedef) so the reactor drain helpers below can wake
+ * promoted fibers without needing a second prototype. */
+
+/* Self-pipe halves. The SIGCHLD handler writes one byte to
+ * kai_reactor_sigchld_pipe[1] from signal context (write(2) is
+ * async-signal-safe per POSIX). The reactor poll watches the read
+ * half. The file-pool worker threads write one byte to
+ * kai_reactor_filepool_pipe[1] on completion to wake the main
+ * thread from poll(). Both pipes are O_NONBLOCK so neither writer
+ * ever blocks; the reactor drains them with read() in a loop. */
+/* The reactor is one process-global structure: a fiber parks on a waiter
+ * list in one TU and kai_reactor_wait (compiled in a single TU) polls the
+ * self-pipes and drains those same lists. All reactor state — pipes, timer
+ * wheel, waiter lists, parked count, and the file-pool below — is therefore
+ * shared (owner defines, others extern); split ownership would let one TU
+ * enqueue a waiter the polling TU never sees, or poll a pipe another TU
+ * never opened. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_reactor_sigchld_pipe[2];
+extern int kai_reactor_filepool_pipe[2];
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_reactor_sigchld_pipe[2]  = { -1, -1 };
+int kai_reactor_filepool_pipe[2] = { -1, -1 };
+#  endif
+#else
+static int kai_reactor_sigchld_pipe[2]  = { -1, -1 };
+static int kai_reactor_filepool_pipe[2] = { -1, -1 };
+#endif
+
+/* Issue #671 — Phase R4 reactor: Signal effect self-pipe. The
+ * sa_handler installed by `signal_on` writes the signo to
+ * kai_reactor_signal_pipe[1] from signal context (one byte per
+ * delivery; write(2) is async-signal-safe per POSIX). The reactor
+ * poll watches the read half and drains it on wake, mapping signo
+ * → variant and waking the parked waiter. Replaces the v1
+ * sigwait body of `kai_default_signal_await` which blocked the
+ * entire OS thread. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_reactor_signal_pipe[2];
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_reactor_signal_pipe[2]   = { -1, -1 };
+#  endif
+#else
+static int kai_reactor_signal_pipe[2]   = { -1, -1 };
+#endif
+
+/* Sorted timer-wheel head (intrusive list of parked fibers chained
+ * through f->reactor_next, ordered by ascending deadline). Insertion
+ * is O(n); for v1 with handfuls of concurrent sleepers this stays
+ * well under the noise floor of poll() itself. A heap is queued for
+ * Orongo if the wheel ever shows up on a profile. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber *kai_reactor_timer_head;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber *kai_reactor_timer_head = NULL;
+#  endif
+#else
+static KaiFiber *kai_reactor_timer_head = NULL;
+#endif
+
+/* Process-wait map and file-pool waiter list. Both are intrusive
+ * single-linked through f->reactor_next, so a fiber can sit on at
+ * most one reactor structure at a time (asserted by the parking
+ * call sites — a fiber awaiting a pid cannot simultaneously sleep
+ * or sit on a file-pool completion). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber *kai_reactor_pid_waiters;
+extern KaiFiber *kai_reactor_filepool_waiters;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber *kai_reactor_pid_waiters     = NULL;
+KaiFiber *kai_reactor_filepool_waiters = NULL;
+#  endif
+#else
+static KaiFiber *kai_reactor_pid_waiters     = NULL;
+static KaiFiber *kai_reactor_filepool_waiters = NULL;
+#endif
+
+/* Exit statuses reaped by the SIGCHLD drain before any fiber parked
+ * on the pid. A child can die inside the window between the wait
+ * op's non-blocking waitpid and its park (or before wait is called
+ * at all — start → work → wait is the normal piped-child shape);
+ * the drain's waitpid(-1) wins that race and the status would be
+ * lost. Buffered nodes are consumed by `kai_reactor_take_child_exit`
+ * or by the drain's reconcile pass once the fiber does park. */
+typedef struct KaiPendingExit {
+    int pid;
+    int status;
+    struct KaiPendingExit *next;
+} KaiPendingExit;
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiPendingExit *kai_reactor_pending_exits;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiPendingExit *kai_reactor_pending_exits = NULL;
+#  endif
+#else
+static KaiPendingExit *kai_reactor_pending_exits = NULL;
+#endif
+
+/* Issue #620 — Phase R3 reactor: stdin slot. Singleton because
+ * STDIN_FILENO is process-shared; multiple fibers reading the same
+ * pipe concurrently is a logic bug (the bytes would shred). The
+ * parking op rejects with a clear panic if a second fiber tries.
+ * Wake source is POLLIN on fd 0, drained alongside the SIGCHLD /
+ * file-pool self-pipes by `kai_reactor_wait`. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber *kai_reactor_stdin_waiter;
+extern int       kai_reactor_stdin_orig_flags;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber *kai_reactor_stdin_waiter = NULL;
+int       kai_reactor_stdin_orig_flags = -1;
+#  endif
+#else
+static KaiFiber *kai_reactor_stdin_waiter = NULL;
+static int       kai_reactor_stdin_orig_flags = -1;
+#endif
+
+/* Issue #630 — Phase R2 reactor: per-direction socket waiter lists.
+ * One fiber-per-(fd, direction); the same fd may simultaneously have
+ * a reader and a writer parked (rare in v1 — typical HTTP server
+ * fibers serialise send/recv on a Conn — but it is the correct
+ * semantics for full-duplex sockets and costs nothing to support).
+ * Each list is intrusive through `f->reactor_next`; the fd lives in
+ * `f->reactor_wait_pid` (the slot doubles as "what are we waiting
+ * for"; pid waiters and socket waiters are mutually exclusive). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber *kai_reactor_socket_read_waiters;
+extern KaiFiber *kai_reactor_socket_write_waiters;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber *kai_reactor_socket_read_waiters  = NULL;
+KaiFiber *kai_reactor_socket_write_waiters = NULL;
+#  endif
+#else
+static KaiFiber *kai_reactor_socket_read_waiters  = NULL;
+static KaiFiber *kai_reactor_socket_write_waiters = NULL;
+#endif
+
+/* Issue #671 — Phase R4 reactor: Signal waiter slot. Singleton
+ * because only one fiber can sit on `Signal.await()` at a time —
+ * the signo arrives in the self-pipe regardless of which fiber
+ * is waiting, so multiple waiters would race over the byte. A
+ * second concurrent `signal_await` panics with a clear message
+ * (mirrors the stdin-multiplex panic from R3). Wake source is
+ * POLLIN on `kai_reactor_signal_pipe[0]`, drained alongside the
+ * SIGCHLD / file-pool / stdin pipes by `kai_reactor_wait`. The
+ * delivered signo is parked in `f->reactor_data` (a void * slot)
+ * so the await handler can rebuild the variant on resume. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber *kai_reactor_signal_waiter;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber *kai_reactor_signal_waiter = NULL;
+#  endif
+#else
+static KaiFiber *kai_reactor_signal_waiter = NULL;
+#endif
+
+/* Signo delivered while no fiber was parked on the Signal waiter
+ * slot. Sticky: the drain stashes it here instead of discarding, and
+ * the next `Signal.await()` consumes it without parking. Without this
+ * slot a signal landing between a subscriber announcing readiness and
+ * its park commit is lost and the waiter sleeps forever — the old
+ * sigwait body never had that window because the kernel queued
+ * blocked signals. Guarded by kai_reactor_mu at N>1. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_reactor_signal_pending;
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_reactor_signal_pending = 0;
+#  endif
+#else
+static int kai_reactor_signal_pending = 0;
+#endif
+
+/* Aggregate count of fibers parked on any reactor structure.
+ * kai_sched_park reads this to decide between "no one can wake us
+ * up — deadlock" (count == 0) and "block on the reactor until a
+ * timer/SIGCHLD/file-pool event arrives" (count > 0). */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_reactor_parked_count;
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_reactor_parked_count = 0;
+#  endif
+#else
+static int kai_reactor_parked_count = 0;
+#endif
+
+/* Set while the reactor thread is blocked in poll() with nothing armed —
+ * kai_reactor_parked_count was 0 when it built the poll set, so poll waits
+ * forever on the self-pipes and can promote no one until a commit pokes it.
+ * The global-quiescence deadlock check reads this to tell a genuinely idle
+ * reactor from one mid-drain: the flag is 0 from poll-return all the way
+ * through kai_reactor_flush_ready, so the check can never fire on a fiber
+ * the reactor is handing back to a deque. Written only under kai_reactor_mu
+ * (the set-idle store) and right after poll() (the clear); N>1 only. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern _Atomic int kai_reactor_idle;
+#  if defined(KAI_RUNTIME_OWNER)
+_Atomic int kai_reactor_idle = 0;
+#  endif
+#else
+static _Atomic int kai_reactor_idle = 0;
+#endif
+
+/* ==================================================================
+ * F2 — dedicated reactor thread. At N>1 the reactor no longer runs
+ * inline on a scheduler thread (F1 drained it on thread 0 only when
+ * that thread went idle, so CPU-bound fibers starved a concurrent
+ * sleeper). Instead a dedicated thread owns the poll() loop and every
+ * shared reactor structure — the timer wheel, the socket/pid/stdin/
+ * signal/file-pool waiter lists, and `kai_reactor_parked_count` — under
+ * `kai_reactor_mu`. Scheduler threads never touch those directly: they
+ * stamp a park reason and hand the fiber to the root, which commits it
+ * under the lock (`kai_sched_commit_park`) and pokes the reactor's
+ * self-pipe so a poll() already asleep with a stale timeout re-arms.
+ *
+ * Lock order: `kai_reactor_mu` (wheel + waiter lists + parked_count), a slot
+ * lock (state + steal list + home_thread + wake_pending) and a mailbox lock
+ * are disjoint — every site takes exactly one, never two nested, so there is
+ * no order to get wrong. Timeout-receive is the one fiber on two structures
+ * at once (recv-waiter chain plus timer wheel): it disarms the wheel after
+ * releasing the mailbox lock, never under it. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern pthread_mutex_t kai_reactor_mu;
+extern pthread_t       kai_reactor_thread;
+#  if defined(KAI_RUNTIME_OWNER)
+pthread_mutex_t kai_reactor_mu;
+pthread_t       kai_reactor_thread;
+#  endif
+#else
+static pthread_mutex_t kai_reactor_mu;
+static pthread_t       kai_reactor_thread;
+#endif
+
+/* No-op at N=1 (byte-identical) — the whole F2 machinery is gated on
+ * nthreads>1 and the inline single-thread reactor keeps its lock-free
+ * path. At N>1 these serialize every shared-reactor access. */
+static inline void kai_reactor_lock(void)   { if (kai_nthreads > 1) pthread_mutex_lock(&kai_reactor_mu); }
+static inline void kai_reactor_unlock(void) { if (kai_nthreads > 1) pthread_mutex_unlock(&kai_reactor_mu); }
+
+/* Wake the reactor out of poll() so it recomputes its timeout against a
+ * freshly linked waiter. A byte on the file-pool self-pipe (which the
+ * reactor always polls) breaks the wait; the drain reads it harmlessly.
+ * The pipe buffers the byte, so a wake that races the reactor between
+ * "unlock" and "poll" is not lost — the next poll returns at once. */
+static void kai_reactor_wake(void) {
+    if (kai_reactor_filepool_pipe[1] >= 0) {
+        unsigned char b = 1;
+        ssize_t w = write(kai_reactor_filepool_pipe[1], &b, 1);
+        (void) w;
+    }
+}
+
+/* The reactor thread collects every fiber a drain readied into this batch
+ * under `kai_reactor_mu`, then unparks them after releasing the lock — so
+ * a slot lock (taken by remote_unpark) is never nested under reactor_mu.
+ * Single-owner (only the reactor thread touches it), so no lock of its
+ * own. At N=1 the batch is unused: `kai_reactor_mark_ready` unparks inline,
+ * exactly as the F1 drains did. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiFiber **kai_reactor_ready_batch;
+extern int        kai_reactor_ready_n;
+extern int        kai_reactor_ready_cap;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiFiber **kai_reactor_ready_batch = NULL;
+int        kai_reactor_ready_n = 0;
+int        kai_reactor_ready_cap = 0;
+#  endif
+#else
+static KaiFiber **kai_reactor_ready_batch = NULL;
+static int        kai_reactor_ready_n = 0;
+static int        kai_reactor_ready_cap = 0;
+#endif
+
+/* Record one park/wake transition. `event` must be a string literal — the ring
+ * stores the pointer, not a copy. Entries are claimed with an atomic counter
+ * and written unsynchronised: a torn entry costs one garbled trace line, which
+ * is the right trade against perturbing the very timing under investigation. */
+static void kai_park_trace(const KaiFiber *f, const char *event) {
+    int on = atomic_load(&kai_park_trace_on);
+    if (on < 0) {
+        on = getenv("KAI_TRACE_PARK") ? 1 : 0;
+        atomic_store(&kai_park_trace_on, on);
+    }
+    if (!on) return;
+    unsigned slot = atomic_fetch_add(&kai_park_trace_seq, 1) % KAI_PARK_TRACE_CAP;
+    KaiParkTraceEntry *e = &kai_park_trace_ring[slot];
+    e->fiber         = f;
+    e->event         = event;
+    e->thread        = kai_thread_id;
+    e->state         = f ? f->state : -1;
+    e->wake_pending  = f ? f->wake_pending : -1;
+    e->reactor_fired = f ? f->reactor_fired : -1;
+    e->blocked_count = atomic_load(&kai_blocked_fiber_count);
+    e->parked_count  = kai_reactor_parked_count;
+}
+
+static const char *kai_fiber_state_name(int state) {
+    switch (state) {
+        case KAI_FIBER_READY:     return "READY";
+        case KAI_FIBER_RUNNING:   return "RUNNING";
+        case KAI_FIBER_PARKED:    return "PARKED";
+        case KAI_FIBER_DONE:      return "DONE";
+        case KAI_FIBER_CANCELLED: return "CANCELLED";
+        default:                  return "?";
+    }
+}
+
+/* Dump the park/wake ring oldest-first, for the deadlock banner. Silent when
+ * the trace is off, so the banner is unchanged on a normal run. */
+static void kai_park_trace_dump(void) {
+    if (atomic_load(&kai_park_trace_on) <= 0) return;
+    unsigned total = atomic_load(&kai_park_trace_seq);
+    unsigned shown = total < KAI_PARK_TRACE_CAP ? total : KAI_PARK_TRACE_CAP;
+    fprintf(stderr, "kai: park trace (%u events, last %u):\n", total, shown);
+    for (unsigned i = 0; i < shown; i++) {
+        const KaiParkTraceEntry *e =
+            &kai_park_trace_ring[(total - shown + i) % KAI_PARK_TRACE_CAP];
+        fprintf(stderr,
+                "  fiber=%p %-19s tid=%d state=%s wake_pending=%d "
+                "reactor_fired=%d blocked=%d parked=%d\n",
+                (const void *) e->fiber, e->event ? e->event : "?", e->thread,
+                kai_fiber_state_name(e->state), e->wake_pending,
+                e->reactor_fired, e->blocked_count, e->parked_count);
+    }
+}
+
+/* A drain readied `f`. At N=1 unpark inline (F1 behaviour, byte-identical
+ * scheduling order). At N>1 defer into the batch — the reactor holds
+ * `kai_reactor_mu` here and must not take a slot lock until it releases it. */
+static void kai_reactor_mark_ready(KaiFiber *f) {
+    /* The caller just spliced `f` off a reactor structure: stamp the wake
+     * as reactor-delivered so the park site can tell it from a spurious
+     * resume. Written under kai_reactor_mu (N>1) or on the only thread
+     * (N=1); the fiber reads it only after the wake's happens-before. */
+    f->reactor_fired = 1;
+    if (kai_nthreads <= 1) { kai_sched_unpark(f); return; }
+    if (kai_reactor_ready_n == kai_reactor_ready_cap) {
+        int ncap = kai_reactor_ready_cap ? kai_reactor_ready_cap * 2 : 16;
+        KaiFiber **nb = (KaiFiber **) realloc(kai_reactor_ready_batch,
+                                              (size_t) ncap * sizeof(KaiFiber *));
+        if (!nb) { fprintf(stderr, "kai: reactor ready-batch realloc failed\n"); exit(1); }
+        kai_reactor_ready_batch = nb;
+        kai_reactor_ready_cap   = ncap;
+    }
+    kai_reactor_ready_batch[kai_reactor_ready_n++] = f;
+}
+
+/* Unpark everything the drains batched this round, after `kai_reactor_mu`
+ * is released. Each remote_unpark flips PARKED→READY on the fiber's home
+ * slot and enqueues it there; the home thread picks it up on its next
+ * scheduler pass. No-op at N=1 (batch empty). */
+static void kai_reactor_flush_ready(void) {
+    for (int i = 0; i < kai_reactor_ready_n; i++) {
+        kai_sched_unpark(kai_reactor_ready_batch[i]);
+    }
+    kai_reactor_ready_n = 0;
+}
+
+/* File-pool work item. Each fiber-side park allocates one of these
+ * on the calling fiber's stack (lifetime = until wake) and pushes
+ * onto kai_filepool_queue. A worker thread pops, invokes `work` on
+ * `arg`, stores the return value in `result`, and writes one byte
+ * to the completion pipe so the scheduler can pick the waiter up.
+ *
+ * `arg` is owned by the calling fiber for the duration of the work
+ * (the worker only reads it); `result` is published by the worker
+ * for the calling fiber to consume on resume. The typedef alias
+ * sits up next to the reactor forward decls; only the struct
+ * definition lives here. */
+struct KaiFilepoolItem {
+    KaiValue *(*work)(void *arg);
+    void            *arg;
+    KaiValue        *result;
+    KaiFiber        *waiter;
+    KaiFilepoolItem *queue_next;
+};
+
+#define KAI_FILEPOOL_WORKERS 4
+/* One file-pool per process: a file op parked in one TU enqueues here and a
+ * worker thread drains it, so the queue, its lock, and the started/threads
+ * state are shared (owner defines, others extern). Two per-TU pools would
+ * spawn two thread sets and split the work queue. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern pthread_mutex_t  kai_filepool_mu;
+extern pthread_cond_t   kai_filepool_cv;
+extern KaiFilepoolItem *kai_filepool_q_head;
+extern KaiFilepoolItem *kai_filepool_q_tail;
+extern int              kai_filepool_started;
+extern pthread_t        kai_filepool_threads[KAI_FILEPOOL_WORKERS];
+#  if defined(KAI_RUNTIME_OWNER)
+pthread_mutex_t  kai_filepool_mu    = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t   kai_filepool_cv    = PTHREAD_COND_INITIALIZER;
+KaiFilepoolItem *kai_filepool_q_head = NULL;
+KaiFilepoolItem *kai_filepool_q_tail = NULL;
+int              kai_filepool_started = 0;
+pthread_t        kai_filepool_threads[KAI_FILEPOOL_WORKERS];
+#  endif
+#else
+static pthread_mutex_t  kai_filepool_mu    = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t   kai_filepool_cv    = PTHREAD_COND_INITIALIZER;
+static KaiFilepoolItem *kai_filepool_q_head = NULL;
+static KaiFilepoolItem *kai_filepool_q_tail = NULL;
+static int              kai_filepool_started = 0;
+static pthread_t        kai_filepool_threads[KAI_FILEPOOL_WORKERS];
+#endif
+
+/* SIGCHLD delivery slot. The handler does the minimum allowed
+ * inside signal context: write a single byte to the pipe. The
+ * scheduler's reactor drain reaps every child that has terminated
+ * via waitpid(-1, ..., WNOHANG) and wakes the matching fiber from
+ * kai_reactor_pid_waiters. */
+static void kai_reactor_sigchld_handler(int sig) {
+    (void) sig;
+    /* write(2) is the only stdio call the SIGCHLD handler issues —
+     * it is on POSIX's async-signal-safe list and the destination
+     * pipe is O_NONBLOCK, so EAGAIN simply means "byte already
+     * pending, the reactor will drain on next wake". */
+    unsigned char b = 1;
+    int saved = errno;
+    if (kai_reactor_sigchld_pipe[1] >= 0) {
+        ssize_t w = write(kai_reactor_sigchld_pipe[1], &b, 1);
+        (void) w;
+    }
+    errno = saved;
+}
+
+/* Issue #671 — Phase R4: Signal-effect handler. Writes the signo
+ * to the signal self-pipe so the reactor can promote the parked
+ * `Signal.await()` fiber on the next poll wake. The signo fits in
+ * the bottom byte (kai_signal_entries only ever contains values
+ * ≤ SIGUSR2 == 31 on every POSIX system we target). write(2) and
+ * the cast to unsigned char are async-signal-safe. */
+static void kai_reactor_signal_handler(int sig) {
+    int saved = errno;
+    if (kai_reactor_signal_pipe[1] >= 0 && sig > 0 && sig <= 255) {
+        unsigned char b = (unsigned char) sig;
+        ssize_t w = write(kai_reactor_signal_pipe[1], &b, 1);
+        (void) w;
+    }
+    errno = saved;
+}
+
+/* Monotonic clock helper. Used by the timer wheel for sleep
+ * deadlines so wall-clock skew (NTP step, RTC adjust) does not
+ * leak into Spawn.sleep semantics. */
+static uint64_t kai_reactor_now_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        /* clock_gettime on CLOCK_MONOTONIC is guaranteed by POSIX;
+         * any failure is a kernel bug. Fall back to zero so a sleep
+         * still terminates rather than spinning. */
+        return 0;
+    }
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+/* Sorted-insert into the timer wheel. O(n) over concurrent
+ * sleepers; expected n is small in v1. */
+static void kai_reactor_timer_insert(KaiFiber *f) {
+    f->reactor_next = NULL;
+    if (!kai_reactor_timer_head ||
+        f->reactor_deadline_ns < kai_reactor_timer_head->reactor_deadline_ns) {
+        f->reactor_next = kai_reactor_timer_head;
+        kai_reactor_timer_head = f;
+        return;
+    }
+    KaiFiber *c = kai_reactor_timer_head;
+    while (c->reactor_next &&
+           c->reactor_next->reactor_deadline_ns <= f->reactor_deadline_ns) {
+        c = c->reactor_next;
+    }
+    f->reactor_next = c->reactor_next;
+    c->reactor_next = f;
+}
+
+/* Pop every fiber whose deadline is <= `now` from the head and
+ * promote it to READY. Returns the number woken. */
+static int kai_reactor_timer_drain(uint64_t now) {
+    int woken = 0;
+    while (kai_reactor_timer_head &&
+           kai_reactor_timer_head->reactor_deadline_ns <= now) {
+        KaiFiber *f = kai_reactor_timer_head;
+        kai_reactor_timer_head = f->reactor_next;
+        f->reactor_next = NULL;
+        f->reactor_deadline_ns = 0;
+        kai_reactor_parked_count--;
+        kai_reactor_mark_ready(f);
+        woken++;
+    }
+    return woken;
+}
+
+/* Splice `f` out of the timer wheel if present. Returns 1 if it was
+ * found (and unparks accounting reconciled), 0 if absent. The dual-park
+ * receive uses this to disarm its deadline timer once a message wakes
+ * it first, so a later drain cannot wake a fiber that already returned. */
+static int kai_reactor_timer_remove(KaiFiber *f) {
+    KaiFiber **link = &kai_reactor_timer_head;
+    while (*link) {
+        if (*link == f) {
+            *link = f->reactor_next;
+            f->reactor_next = NULL;
+            f->reactor_deadline_ns = 0;
+            kai_reactor_parked_count--;
+            return 1;
+        }
+        link = &(*link)->reactor_next;
+    }
+    return 0;
+}
+
+/* Splice the fiber parked on `pid` (if any) off the waiter list and
+ * wake it with `status`. Caller holds the reactor lock. */
+static int kai_reactor_wake_pid_waiter(int pid, int status) {
+    KaiFiber **link = &kai_reactor_pid_waiters;
+    while (*link) {
+        if ((*link)->reactor_wait_pid == pid) {
+            KaiFiber *f = *link;
+            *link = f->reactor_next;
+            f->reactor_next = NULL;
+            f->reactor_wait_status = status;
+            /* Leave reactor_wait_pid intact so the wait op
+             * can confirm it matches on resume; clear elsewhere. */
+            kai_reactor_parked_count--;
+            kai_reactor_mark_ready(f);
+            return 1;
+        }
+        link = &(*link)->reactor_next;
+    }
+    return 0;
+}
+
+/* Drain SIGCHLD self-pipe and waitpid(-1, ..., WNOHANG) until no
+ * more children have terminated, waking the fiber parked on each
+ * pid. Idempotent — safe to call when no children are pending. */
+static int kai_reactor_sigchld_drain(void) {
+    if (kai_reactor_sigchld_pipe[0] < 0) return 0;
+    /* Drain the pipe (its content is just a wake notification —
+     * the real state is in the kernel's child table). */
+    for (;;) {
+        unsigned char buf[64];
+        ssize_t n = read(kai_reactor_sigchld_pipe[0], buf, sizeof(buf));
+        if (n <= 0) break;
+    }
+    int woken = 0;
+    for (;;) {
+        int status = 0;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid <= 0) break;  /* 0 = none ready, -1 = ECHILD/EINTR */
+        if (kai_reactor_wake_pid_waiter((int) pid, status)) {
+            woken++;
+            continue;
+        }
+        /* No fiber parked on this pid yet — the exit raced the wait
+         * op's own WNOHANG/park window, or wait has not been called.
+         * Buffer the status; `kai_reactor_take_child_exit` or the
+         * reconcile below hands it over. */
+        KaiPendingExit *pe = (KaiPendingExit *) malloc(sizeof(KaiPendingExit));
+        if (!pe) continue;  /* status lost only under OOM */
+        pe->pid    = (int) pid;
+        pe->status = status;
+        pe->next   = kai_reactor_pending_exits;
+        kai_reactor_pending_exits = pe;
+    }
+    /* Reconcile: wake any waiter whose status was buffered before it
+     * finished parking. Runs on every reactor pass with live pid
+     * waiters, so a fiber that lost the race is woken one pass later. */
+    KaiPendingExit **pp = &kai_reactor_pending_exits;
+    while (*pp) {
+        if (kai_reactor_wake_pid_waiter((*pp)->pid, (*pp)->status)) {
+            KaiPendingExit *dead = *pp;
+            *pp = dead->next;
+            free(dead);
+            woken++;
+        } else {
+            pp = &(*pp)->next;
+        }
+    }
+    return woken;
+}
+
+/* Consume a buffered exit for `pid`. Called by the wait op before
+ * and after its own non-blocking waitpid, outside the reactor lock. */
+static int kai_reactor_take_child_exit(int pid, int *status) {
+    int found = 0;
+    kai_reactor_lock();
+    KaiPendingExit **pp = &kai_reactor_pending_exits;
+    while (*pp) {
+        if ((*pp)->pid == pid) {
+            KaiPendingExit *e = *pp;
+            *pp = e->next;
+            *status = e->status;
+            free(e);
+            found = 1;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    kai_reactor_unlock();
+    return found;
+}
+
+/* Drain the file-pool completion pipe and promote every fiber whose
+ * work item just completed. */
+static int kai_reactor_filepool_drain(void) {
+    if (kai_reactor_filepool_pipe[0] < 0) return 0;
+    /* Empty the pipe; the real signal is in each item's `result`
+     * slot being non-NULL (workers store the result before writing
+     * the byte). Items waiting for promotion are still in
+     * kai_reactor_filepool_waiters. */
+    for (;;) {
+        unsigned char buf[64];
+        ssize_t n = read(kai_reactor_filepool_pipe[0], buf, sizeof(buf));
+        if (n <= 0) break;
+    }
+    int woken = 0;
+    KaiFiber **link = &kai_reactor_filepool_waiters;
+    while (*link) {
+        KaiFiber *f = *link;
+        KaiFilepoolItem *item = (KaiFilepoolItem *) f->reactor_data;
+        if (item && item->result != (KaiValue *) NULL) {
+            *link = f->reactor_next;
+            f->reactor_next = NULL;
+            kai_reactor_parked_count--;
+            kai_reactor_mark_ready(f);
+            woken++;
+        } else {
+            link = &(*link)->reactor_next;
+        }
+    }
+    return woken;
+}
+
+/* Wake the parked Signal waiter if a signo is pending. Caller holds
+ * the reactor lock at N>1. Returns 1 if a fiber was promoted. */
+static int kai_reactor_signal_try_wake(void) {
+    if (kai_reactor_signal_pending == 0) return 0;
+    if (!kai_reactor_signal_waiter)      return 0;
+    KaiFiber *f = kai_reactor_signal_waiter;
+    kai_reactor_signal_waiter = NULL;
+    /* Stash the signo in reactor_wait_status so the await handler
+     * can recover it on resume. Re-use of the slot is safe: the
+     * fiber is parked on a singleton waiter, never simultaneously
+     * on a pid / socket waiter. */
+    f->reactor_wait_status = kai_reactor_signal_pending;
+    kai_reactor_signal_pending = 0;
+    kai_reactor_parked_count--;
+    kai_park_trace(f, "signal-try-wake");
+    kai_reactor_mark_ready(f);
+    return 1;
+}
+
+/* Drain the Signal self-pipe and promote the parked `Signal.await()`
+ * waiter. Concurrent deliveries collapse to the most recent signo
+ * under v1's "single waiter, single fire" contract. A signo arriving
+ * while no fiber is parked is NOT discarded: it stays in
+ * kai_reactor_signal_pending until the next await consumes it. The
+ * drain can run on a reactor thread between a waiter's "ready"
+ * handshake and its park commit — discarding here strands that
+ * waiter forever. */
+static int kai_reactor_signal_drain(void) {
+    if (kai_reactor_signal_pipe[0] < 0) return 0;
+    int signo = 0;
+    unsigned char buf[64];
+    for (;;) {
+        ssize_t n = read(kai_reactor_signal_pipe[0], buf, sizeof(buf));
+        if (n <= 0) break;
+        if (n > 0) signo = (int) buf[n - 1];
+    }
+    if (signo != 0) kai_reactor_signal_pending = signo;
+    return kai_reactor_signal_try_wake();
+}
+
+/* File-pool worker loop. Pops items off the FIFO queue, runs the
+ * work function on the worker thread (so the blocking syscall stays
+ * off the scheduler thread), publishes the result, and writes one
+ * byte to the completion pipe to wake the scheduler. */
+static void *kai_filepool_worker(void *arg) {
+    (void) arg;
+    for (;;) {
+        pthread_mutex_lock(&kai_filepool_mu);
+        while (!kai_filepool_q_head) {
+            pthread_cond_wait(&kai_filepool_cv, &kai_filepool_mu);
+        }
+        KaiFilepoolItem *item = kai_filepool_q_head;
+        kai_filepool_q_head = item->queue_next;
+        if (!kai_filepool_q_head) kai_filepool_q_tail = NULL;
+        pthread_mutex_unlock(&kai_filepool_mu);
+
+        /* Sentinel item with NULL `work` signals shutdown — not
+         * exercised in v1 (the runtime never tears down) but kept
+         * symmetric with the queue protocol. */
+        if (!item->work) return NULL;
+
+        KaiValue *r = item->work(item->arg);
+
+        /* Publish the result, then notify. The order matters: the
+         * scheduler reads `result` after the byte arrives, so the
+         * store must be visible first. v1 single-CPU x86/arm64
+         * provides release ordering on aligned word stores, but a
+         * pthread_mutex round-trip gives us the same guarantee
+         * portably. */
+        pthread_mutex_lock(&kai_filepool_mu);
+        item->result = r ? r : kai_unit();
+        pthread_mutex_unlock(&kai_filepool_mu);
+
+        unsigned char b = 1;
+        if (kai_reactor_filepool_pipe[1] >= 0) {
+            ssize_t w = write(kai_reactor_filepool_pipe[1], &b, 1);
+            (void) w;
+        }
+    }
+}
+
+/* Issue #620 — restore stdin's original flags on process exit. The
+ * runtime flips fd 0 to O_NONBLOCK once the first stdin op runs;
+ * leaving the shell's stdin in non-blocking mode after exit is a
+ * subtle, hard-to-diagnose footgun (tools downstream of the kaikai
+ * program would see EAGAIN on every read). atexit guarantees this
+ * runs on normal termination and on `exit()` calls. */
+static void kai_reactor_stdin_restore(void) {
+    if (kai_reactor_stdin_orig_flags >= 0) {
+        fcntl(STDIN_FILENO, F_SETFL, kai_reactor_stdin_orig_flags);
+        kai_reactor_stdin_orig_flags = -1;
+    }
+}
+
+/* Issue #620 — set fd 0 to O_NONBLOCK once per process. Saves the
+ * original flags into kai_reactor_stdin_orig_flags so atexit can
+ * restore them. No-op on subsequent calls. If F_GETFL fails (eg. fd
+ * 0 closed by the parent program), the function is a no-op and the
+ * stdin parking path will surface the failure as a Fail/error. */
+static void kai_reactor_stdin_set_nonblocking(void) {
+    if (kai_reactor_stdin_orig_flags >= 0) return;
+    int fl = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (fl < 0) return;
+    kai_reactor_stdin_orig_flags = fl;
+    fcntl(STDIN_FILENO, F_SETFL, fl | O_NONBLOCK);
+    atexit(kai_reactor_stdin_restore);
+}
+
+/* Lazy initialisation of the reactor on first use. Idempotent;
+ * safe to call from every parking site. Installs SIGCHLD additively
+ * (only if no existing handler is registered) so the stack-guard
+ * SIGSEGV path and any future signal users continue to operate.
+ *
+ * The file-pool workers (4 OS threads) are deferred to the first
+ * actual file op via kai_reactor_init_filepool — sleep-only and
+ * process-only workloads should not pay the pthread_create cost. */
+static void kai_reactor_init_filepool(void);
+/* Idempotency is process-global, not per-TU: kai_reactor_init is called from
+ * many sites that land in different modular TUs, and it opens the shared
+ * self-pipes. A per-TU flag would let each TU re-run init and reopen the
+ * pipes over the shared fds. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_reactor_inited;
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_reactor_inited = 0;
+#  endif
+#else
+static int kai_reactor_inited = 0;
+#endif
+static void kai_reactor_init(void) {
+    if (kai_reactor_inited) return;
+    kai_reactor_inited = 1;
+
+    /* Self-pipes for the three wake sources (SIGCHLD, file-pool,
+     * Signal R4). O_NONBLOCK so handlers and worker threads never
+     * block; O_CLOEXEC so a forked child does not inherit them. */
+    if (pipe(kai_reactor_sigchld_pipe)  != 0 ||
+        pipe(kai_reactor_filepool_pipe) != 0 ||
+        pipe(kai_reactor_signal_pipe)   != 0) {
+        fprintf(stderr, "kai: reactor pipe() failed: %s\n", strerror(errno));
+        exit(1);
+    }
+    for (int i = 0; i < 3; i++) {
+        int fds[3][2] = {
+            { kai_reactor_sigchld_pipe[0],  kai_reactor_sigchld_pipe[1]  },
+            { kai_reactor_filepool_pipe[0], kai_reactor_filepool_pipe[1] },
+            { kai_reactor_signal_pipe[0],   kai_reactor_signal_pipe[1]   },
+        };
+        for (int p = 0; p < 2; p++) {
+            int fd = fds[i][p];
+            int fl = fcntl(fd, F_GETFL, 0);
+            if (fl != -1) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+            int cl = fcntl(fd, F_GETFD, 0);
+            if (cl != -1) fcntl(fd, F_SETFD, cl | FD_CLOEXEC);
+        }
+    }
+
+    /* Install SIGCHLD additively. The stack-guard handler grabs
+     * SIGSEGV/SIGBUS; we are explicit about touching only SIGCHLD
+     * to avoid stomping on it. Refuse to install if SIGCHLD is
+     * already taken by user code; the runtime exits with a clear
+     * diagnostic rather than silently overriding. */
+    struct sigaction old;
+    if (sigaction(SIGCHLD, NULL, &old) == 0) {
+        if (old.sa_handler != SIG_DFL && old.sa_handler != SIG_IGN) {
+            fprintf(stderr,
+                "kai: reactor cannot install SIGCHLD — slot already taken\n");
+            exit(1);
+        }
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = kai_reactor_sigchld_handler;
+    sigemptyset(&sa.sa_mask);
+    /* SA_NOCLDSTOP so we are not woken for stop/continue traffic —
+     * only terminal child exits matter. SA_RESTART is intentionally
+     * NOT set: the scheduler's poll() must return early on EINTR so
+     * the wake path is observed even when the self-pipe write loses
+     * the race with the kernel's signal delivery. The worker
+     * threads block SIGCHLD via their thread mask (see below), so
+     * the absence of SA_RESTART does not affect their blocking
+     * reads/writes. */
+    sa.sa_flags = SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa, NULL);
+}
+
+/* Spin up the 4-worker file pool on the first file op. SIGCHLD is
+ * blocked in every worker thread's mask so the signal always lands
+ * on the scheduler (main) thread, which is the one draining the
+ * self-pipe in kai_reactor_wait. The pool runs detached for the
+ * lifetime of the process; the OS reclaims the threads on exit. */
+static void kai_reactor_init_filepool(void) {
+    if (kai_filepool_started) return;
+    kai_filepool_started = 1;
+    sigset_t block_set, prev_set;
+    sigemptyset(&block_set);
+    sigaddset(&block_set, SIGCHLD);
+    pthread_sigmask(SIG_BLOCK, &block_set, &prev_set);
+    for (int i = 0; i < KAI_FILEPOOL_WORKERS; i++) {
+        if (pthread_create(&kai_filepool_threads[i], NULL,
+                           kai_filepool_worker, NULL) != 0) {
+            fprintf(stderr, "kai: reactor pthread_create failed: %s\n",
+                    strerror(errno));
+            exit(1);
+        }
+        pthread_detach(kai_filepool_threads[i]);
+    }
+    pthread_sigmask(SIG_SETMASK, &prev_set, NULL);
+}
+
+/* Submit a unit of work to the file-pool. The caller (a parking
+ * file op handler) supplies `work` + `arg`, then parks itself on
+ * kai_reactor_filepool_waiters and yields. The worker invokes
+ * `work(arg)`, stores the KaiValue * result in `item->result`,
+ * and wakes the scheduler. The item itself lives on the caller's
+ * fiber stack — no heap allocation. */
+static void kai_filepool_submit(KaiFilepoolItem *item) {
+    pthread_mutex_lock(&kai_filepool_mu);
+    item->queue_next = NULL;
+    if (kai_filepool_q_tail) {
+        kai_filepool_q_tail->queue_next = item;
+    } else {
+        kai_filepool_q_head = item;
+    }
+    kai_filepool_q_tail = item;
+    pthread_cond_signal(&kai_filepool_cv);
+    pthread_mutex_unlock(&kai_filepool_mu);
+}
+
+/* Public entry points used by the Clock / Process / File default
+ * handlers. Each is a thin wrapper that links the calling fiber
+ * into the appropriate reactor structure, bumps the parked-count,
+ * and yields via kai_sched_park (which falls into kai_reactor_wait
+ * once the run queue empties). On resume the reactor drain has
+ * already cleared the fiber's reactor_* slots and unparked it. */
+static void kai_reactor_park_timer(KaiFiber *f, uint64_t deadline_ns) {
+    f->reactor_deadline_ns = deadline_ns;
+    if (kai_nthreads > 1) {
+        /* F2: the root links us into the wheel post-swap (commit_park). */
+        f->pending_park = KAI_PARK_TIMER;
+        kai_sched_park();
+        return;
+    }
+    kai_reactor_timer_insert(f);
+    kai_reactor_parked_count++;
+    kai_sched_park();
+}
+
+static void kai_reactor_park_pid(KaiFiber *f, int pid) {
+    f->reactor_wait_pid    = pid;
+    f->reactor_wait_status = 0;
+    if (kai_nthreads > 1) {
+        f->pending_park = KAI_PARK_PID;
+        kai_sched_park();
+        return;
+    }
+    /* Push onto the head; pid lookup walks the list so order is
+     * irrelevant. The drain helper splices the matching node out. */
+    f->reactor_next = kai_reactor_pid_waiters;
+    kai_reactor_pid_waiters = f;
+    kai_reactor_parked_count++;
+    kai_sched_park();
+}
+
+/* Issue #620 — Phase R3: park `f` on the singleton stdin slot.
+ * Returns 0 on success and -1 if another fiber already holds the
+ * slot (the caller should treat that as "concurrent stdin readers
+ * — undefined" and panic). The slot is cleared by `kai_reactor_wait`
+ * when POLLIN / POLLHUP / POLLERR fires on STDIN_FILENO; on resume
+ * the parking site simply retries its read(). */
+static int kai_reactor_park_stdin(KaiFiber *f) {
+    if (kai_nthreads > 1) {
+        /* Reserve the singleton slot check under the lock; the reactor
+         * clears it on readiness. Concurrent stdin readers are undefined
+         * (the caller panics on -1), so the check→commit gap is benign. */
+        kai_reactor_lock();
+        int busy = (kai_reactor_stdin_waiter != NULL);
+        kai_reactor_unlock();
+        if (busy) return -1;
+        f->pending_park = KAI_PARK_STDIN;
+        kai_sched_park();
+        return 0;
+    }
+    if (kai_reactor_stdin_waiter != NULL) return -1;
+    kai_reactor_stdin_waiter = f;
+    kai_reactor_parked_count++;
+    kai_sched_park();
+    return 0;
+}
+
+/* Issue #671 — Phase R4: park `f` on the singleton Signal waiter
+ * slot. Returns 0 on success, -1 if another fiber is already
+ * parked (the caller panics with a clear diagnostic, same shape
+ * as the R3 stdin contract). On resume the delivered signo lives
+ * in `f->reactor_wait_status`; the await handler maps it back to
+ * the matching variant. */
+static int kai_reactor_park_signal(KaiFiber *f) {
+    f->reactor_wait_status = 0;
+    if (kai_nthreads > 1) {
+        kai_reactor_lock();
+        int busy = (kai_reactor_signal_waiter != NULL);
+        int pend = busy ? 0 : kai_reactor_signal_pending;
+        if (pend != 0) kai_reactor_signal_pending = 0;
+        kai_reactor_unlock();
+        if (busy) return -1;
+        if (pend != 0) { f->reactor_wait_status = pend; return 0; }
+        f->pending_park = KAI_PARK_SIGNAL;
+        kai_sched_park();
+        return 0;
+    }
+    if (kai_reactor_signal_waiter != NULL) return -1;
+    if (kai_reactor_signal_pending != 0) {
+        f->reactor_wait_status = kai_reactor_signal_pending;
+        kai_reactor_signal_pending = 0;
+        return 0;
+    }
+    kai_reactor_signal_waiter = f;
+    kai_reactor_parked_count++;
+    kai_sched_park();
+    return 0;
+}
+
+/* Issue #630 — Phase R2: set O_NONBLOCK on a socket fd. Idempotent;
+ * safe to call once per fd creation site. We do NOT save/restore the
+ * original flags (unlike stdin) because the fd was just opened by us
+ * — no caller cares about its pre-flag state. */
+static void kai_socket_set_nonblock(int fd) {
+    if (fd < 0) return;
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return;
+    if (!(fl & O_NONBLOCK)) {
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    }
+}
+
+/* Issue #630 — Phase R2: park `f` waiting for read-readiness on
+ * `fd` (accept on a listener, recv on a connection). Pushes the
+ * fiber onto the socket_read_waiters list, stashes the fd in
+ * reactor_wait_pid (slot is repurposed; pid waiters and socket
+ * waiters are mutually exclusive), bumps the parked-count, and
+ * yields. On resume the drain helper has spliced the fiber out;
+ * the caller retries its non-blocking read(). */
+static void kai_reactor_park_socket_read(KaiFiber *f, int fd) {
+    f->reactor_wait_pid    = fd;
+    f->reactor_wait_status = 0;
+    if (kai_nthreads > 1) {
+        f->pending_park = KAI_PARK_SOCKET_READ;
+        kai_sched_park();
+        return;
+    }
+    f->reactor_next = kai_reactor_socket_read_waiters;
+    kai_reactor_socket_read_waiters = f;
+    kai_reactor_parked_count++;
+    kai_sched_park();
+}
+
+/* Issue #630 — Phase R2: park `f` waiting for write-readiness on
+ * `fd` (connect handshake completion, send when the kernel buffer is
+ * full). Symmetric with kai_reactor_park_socket_read on the
+ * socket_write_waiters list. */
+static void kai_reactor_park_socket_write(KaiFiber *f, int fd) {
+    f->reactor_wait_pid    = fd;
+    f->reactor_wait_status = 0;
+    if (kai_nthreads > 1) {
+        f->pending_park = KAI_PARK_SOCKET_WRITE;
+        kai_sched_park();
+        return;
+    }
+    f->reactor_next = kai_reactor_socket_write_waiters;
+    kai_reactor_socket_write_waiters = f;
+    kai_reactor_parked_count++;
+    kai_sched_park();
+}
+
+/* Dual-park read-readiness + deadline on a single intrusive slot. The
+ * fiber lives only on the read-waiter list; its `reactor_deadline_ns`
+ * arms the poll timeout and the deadline-drain pass in kai_reactor_wait.
+ * Whichever wins, the drain that unparks us has already spliced us out
+ * of the one list — no second structure to disarm, so no UAF window.
+ * The deadline-drain stamps `reactor_wait_status = 1` before waking;
+ * readiness leaves it 0. Returns 1 (readiness) or 0 (deadline). */
+static int kai_reactor_park_socket_read_timeout(KaiFiber *f, int fd, uint64_t deadline_ns) {
+    f->reactor_wait_pid    = fd;
+    f->reactor_wait_status = 0;
+    f->reactor_deadline_ns = deadline_ns;
+    if (kai_nthreads > 1) {
+        f->pending_park = KAI_PARK_SOCKET_READ;
+        kai_sched_park();
+    } else {
+        f->reactor_next = kai_reactor_socket_read_waiters;
+        kai_reactor_socket_read_waiters = f;
+        kai_reactor_parked_count++;
+        kai_sched_park();
+    }
+    int timed_out = (f->reactor_wait_status == 1);
+    f->reactor_wait_status = 0;
+    f->reactor_deadline_ns = 0;
+    return timed_out ? 0 : 1;
+}
+
+/* Submit `work(arg)` to the file-pool worker queue and park the
+ * caller until completion. Returns the worker's KaiValue *result.
+ * The KaiFilepoolItem lives on the caller's fiber stack — safe
+ * because the parked fiber's stack is preserved until resume. */
+static KaiValue *kai_reactor_run_in_pool(KaiValue *(*work)(void *), void *arg) {
+    kai_reactor_init_filepool();
+    KaiFilepoolItem item;
+    item.work       = work;
+    item.arg        = arg;
+    item.result     = NULL;
+    item.waiter     = kai_current_fiber();
+    item.queue_next = NULL;
+
+    KaiFiber *me = kai_current_fiber();
+    me->reactor_data = &item;
+    if (kai_nthreads > 1) {
+        /* F2: the root links us into the waiter list post-swap. Submit
+         * first so a worker can start; a completion that races the commit
+         * is not lost — the drain readies on `item->result`, and commit's
+         * self-pipe poke forces a re-drain that observes it. */
+        me->pending_park = KAI_PARK_FILEPOOL;
+        kai_filepool_submit(&item);
+        kai_sched_park();
+        /* Re-park on a spurious resume: `item` lives on THIS stack, so
+         * returning before the worker publishes `result` would hand the
+         * pool a dangling frame. */
+        while (!item.result) {
+            me->pending_park = KAI_PARK_FILEPOOL;
+            kai_sched_park();
+        }
+    } else {
+        /* Queue order is irrelevant for the waiter list; insert at head. */
+        me->reactor_next = kai_reactor_filepool_waiters;
+        kai_reactor_filepool_waiters = me;
+        kai_reactor_parked_count++;
+        kai_filepool_submit(&item);
+        kai_sched_park();
+    }
+
+    /* On resume the drain helper has spliced us out of
+     * kai_reactor_filepool_waiters. The result slot is set by the
+     * worker prior to the pipe write. */
+    KaiValue *r = item.result;
+    me->reactor_data = NULL;
+    return r ? r : kai_unit();
+}
+
+/* Issue #630 — Phase R2: count the live socket-waiter fds in each
+ * direction. Two fibers parked on the same fd in the same direction
+ * is impossible in v1 (every Conn / Listener belongs to a single
+ * fiber under the per-fiber-arena model). Counting unique fds is
+ * therefore equivalent to counting waiters. */
+static int kai_reactor_count_socket_waiters(KaiFiber *head) {
+    int n = 0;
+    for (KaiFiber *f = head; f; f = f->reactor_next) n++;
+    return n;
+}
+
+/* Issue #630 — Phase R2: drain one socket-direction waiter list.
+ * For every fiber whose fd shows up in `pfds[i].revents` with
+ * POLLIN/POLLOUT/POLLHUP/POLLERR set, splice it out and unpark.
+ * The handler at the park site will retry its non-blocking syscall
+ * and either succeed, EOF, or re-park if the kernel buffer drained
+ * between wake and retry (spurious wake — POSIX permits it). */
+static int kai_reactor_socket_drain(KaiFiber **head_ptr, struct pollfd *pfds,
+                                    int nfds, short ready_mask) {
+    int woken = 0;
+    KaiFiber **link = head_ptr;
+    while (*link) {
+        int fd = (*link)->reactor_wait_pid;
+        /* OR every pfds entry's revents for this fd. The same fd can
+         * appear in the poll set multiple times (full-duplex sockets
+         * with both read and write waiters, or two readers on a
+         * shared listener — accept() distributes connections across
+         * them). Aggregating revents avoids missing a wake when the
+         * ready entry is not the first match. */
+        short revents = 0;
+        for (int i = 0; i < nfds; i++) {
+            if (pfds[i].fd == fd) revents |= pfds[i].revents;
+        }
+        if (revents & (ready_mask | POLLHUP | POLLERR | POLLNVAL)) {
+            KaiFiber *f = *link;
+            *link = f->reactor_next;
+            f->reactor_next = NULL;
+            f->reactor_wait_pid = 0;
+            kai_reactor_parked_count--;
+            kai_reactor_mark_ready(f);
+            woken++;
+        } else {
+            link = &(*link)->reactor_next;
+        }
+    }
+    return woken;
+}
+
+/* Wake every deadline-armed socket-read waiter whose deadline has
+ * passed, stamping reactor_wait_status = 1 so the park site returns
+ * timeout. Runs AFTER the readiness drain: a socket that turned ready
+ * in the same poll is already off the list, so data-just-in-time wins
+ * over a coincident deadline. */
+static int kai_reactor_socket_read_deadline_drain(uint64_t now) {
+    int woken = 0;
+    KaiFiber **link = &kai_reactor_socket_read_waiters;
+    while (*link) {
+        KaiFiber *f = *link;
+        if (f->reactor_deadline_ns && f->reactor_deadline_ns <= now) {
+            *link = f->reactor_next;
+            f->reactor_next = NULL;
+            f->reactor_wait_pid = 0;
+            f->reactor_wait_status = 1;
+            kai_reactor_parked_count--;
+            kai_reactor_mark_ready(f);
+            woken++;
+        } else {
+            link = &(*link)->reactor_next;
+        }
+    }
+    return woken;
+}
+
+/* Block in poll() until either the SIGCHLD pipe or the file-pool
+ * completion pipe fires, a socket fd becomes ready, or the next
+ * timer deadline arrives. Promotes every newly-ready fiber to the
+ * run queue. Called by kai_sched_park when the ready queue is empty
+ * but reactor waiters exist — the dispatch loop's substitute for a
+ * dedicated event loop thread. */
+static void kai_reactor_wait(void) {
+    /* F2: read the shared wheel + waiter lists to compute the timeout and
+     * build the poll set under `kai_reactor_mu` (no-op at N=1), then drop
+     * the lock before poll() — poll blocks the reactor thread and must not
+     * hold the mutex a committing scheduler needs. A waiter linked between
+     * this unlock and poll() is not missed: its commit poked the self-pipe,
+     * so poll() (which always watches that pipe) returns at once. */
+    kai_reactor_lock();
+    /* Compute the timeout in ms (poll's resolution). A negative
+     * timeout is "wait forever"; a zero timeout polls. The wake
+     * deadline is the earliest of the timer wheel head and any
+     * deadline-armed socket-read waiter (recv_timeout), so a socket
+     * deadline that precedes every timer still bounds the sleep. */
+    uint64_t wake_dl = 0;
+    if (kai_reactor_timer_head) {
+        wake_dl = kai_reactor_timer_head->reactor_deadline_ns;
+    }
+    for (KaiFiber *f = kai_reactor_socket_read_waiters; f; f = f->reactor_next) {
+        if (f->reactor_deadline_ns &&
+            (wake_dl == 0 || f->reactor_deadline_ns < wake_dl)) {
+            wake_dl = f->reactor_deadline_ns;
+        }
+    }
+    int timeout_ms = -1;
+    if (wake_dl) {
+        uint64_t now = kai_reactor_now_ns();
+        if (wake_dl <= now) {
+            timeout_ms = 0;
+        } else {
+            uint64_t diff_ns = wake_dl - now;
+            uint64_t ms = (diff_ns + 999999ULL) / 1000000ULL;  /* ceil */
+            if (ms > (uint64_t) INT_MAX) ms = (uint64_t) INT_MAX;
+            timeout_ms = (int) ms;
+        }
+    }
+
+    /* Size the pfds array: 2 self-pipes + optional stdin + N
+     * socket-read + M socket-write. Use a small stack buffer for the
+     * common case (no sockets) and fall back to a heap alloc when
+     * more than ~16 fds are live. */
+    int nread  = kai_reactor_count_socket_waiters(kai_reactor_socket_read_waiters);
+    int nwrite = kai_reactor_count_socket_waiters(kai_reactor_socket_write_waiters);
+    /* 3 self-pipes (sigchld + filepool + signal) + optional stdin
+     * (R3) + optional signal-waiter pipe (R4 — same fd as the
+     * self-pipe, but kept in the count for clarity). socket waiters
+     * grow the set per (fd, direction). */
+    int max_fds = 3 + 1 + nread + nwrite;
+    struct pollfd  stack_pfds[16];
+    struct pollfd *pfds = stack_pfds;
+    int heap_alloced = 0;
+    if (max_fds > (int) (sizeof(stack_pfds) / sizeof(stack_pfds[0]))) {
+        pfds = (struct pollfd *) malloc((size_t) max_fds * sizeof(*pfds));
+        if (!pfds) {
+            fprintf(stderr, "kai: reactor pfds malloc failed\n");
+            exit(1);
+        }
+        heap_alloced = 1;
+    }
+
+    int nfds = 0;
+    if (kai_reactor_sigchld_pipe[0] >= 0) {
+        pfds[nfds].fd = kai_reactor_sigchld_pipe[0];
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    if (kai_reactor_filepool_pipe[0] >= 0) {
+        pfds[nfds].fd = kai_reactor_filepool_pipe[0];
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    /* Issue #671 — Phase R4: signal self-pipe stays in the poll
+     * set for the lifetime of the process. A signal that arrives
+     * with no parked waiter is dropped by the drain — that races
+     * the v1 sigwait body exactly the same way (an unblocked signal
+     * arriving before sigwait() was lost too); the new path adds
+     * no new strand-against-handler hazard. */
+    if (kai_reactor_signal_pipe[0] >= 0) {
+        pfds[nfds].fd = kai_reactor_signal_pipe[0];
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    /* Issue #620 — Phase R3: only register stdin in the poll set
+     * while a fiber is parked on it. Otherwise we would wake on
+     * every keystroke even when no one is reading, burn CPU, and
+     * have no waiter to promote. */
+    if (kai_reactor_stdin_waiter != NULL) {
+        pfds[nfds].fd = STDIN_FILENO;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    /* Issue #630 — Phase R2: register every socket waiter's fd. If
+     * the same fd shows up in both directions (a fiber reading on a
+     * fd while another writes to it — rare in v1 but legal), the fd
+     * appears twice in the poll set with disjoint event masks; POSIX
+     * permits this and reports revents per-entry. */
+    for (KaiFiber *f = kai_reactor_socket_read_waiters; f; f = f->reactor_next) {
+        pfds[nfds].fd = f->reactor_wait_pid;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    for (KaiFiber *f = kai_reactor_socket_write_waiters; f; f = f->reactor_next) {
+        pfds[nfds].fd = f->reactor_wait_pid;
+        pfds[nfds].events = POLLOUT;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    /* Publish "reactor asleep with nothing armed" under the lock, so the
+     * deadlock check (which reads it under kai_reactor_mu) sees a coherent
+     * value. Cleared the instant poll() returns, before any drain/flush,
+     * so a promotion in flight is never mistaken for a quiescent reactor. */
+    if (kai_nthreads > 1)
+        atomic_store(&kai_reactor_idle, kai_reactor_parked_count == 0 ? 1 : 0);
+    kai_reactor_unlock();
+    int rc = poll(pfds, (nfds_t) nfds, timeout_ms);
+    if (kai_nthreads > 1) atomic_store(&kai_reactor_idle, 0);
+    if (rc < 0 && errno != EINTR) {
+        fprintf(stderr, "kai: reactor poll() failed: %s\n", strerror(errno));
+        exit(1);
+    }
+
+    /* Drain in a fixed order under the lock again — the drains unlink
+     * from the shared lists and decrement parked_count, and batch the
+     * readied fibers (kai_reactor_mark_ready). Even on EINTR (rc < 0) the
+     * timer wheel must be drained because a stray signal could have
+     * coincided with a deadline expiry. */
+    kai_reactor_lock();
+    uint64_t now = kai_reactor_now_ns();
+    kai_reactor_timer_drain(now);
+    if (rc > 0) {
+        /* Self-pipe and stdin paths first (these compare against the
+         * fixed fds we know up front). */
+        for (int i = 0; i < nfds; i++) {
+            if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            if (pfds[i].fd == kai_reactor_sigchld_pipe[0]) {
+                kai_reactor_sigchld_drain();
+            } else if (pfds[i].fd == kai_reactor_filepool_pipe[0]) {
+                kai_reactor_filepool_drain();
+            } else if (pfds[i].fd == kai_reactor_signal_pipe[0]) {
+                kai_reactor_signal_drain();
+            } else if (pfds[i].fd == STDIN_FILENO &&
+                       kai_reactor_stdin_waiter != NULL) {
+                /* Issue #620 — readiness event on stdin: promote
+                 * the parked fiber. POLLHUP / POLLERR also count
+                 * as wakeups so a closed pipe (EOF) does not
+                 * strand the waiter forever. */
+                KaiFiber *f = kai_reactor_stdin_waiter;
+                kai_reactor_stdin_waiter = NULL;
+                kai_reactor_parked_count--;
+                kai_reactor_mark_ready(f);
+            }
+        }
+        /* Socket waiters: separate drain pass because the same fd
+         * may appear in both directions (and the read/write masks
+         * are disjoint). Each drain handles only the matching list. */
+        kai_reactor_socket_drain(&kai_reactor_socket_read_waiters,  pfds, nfds, POLLIN);
+        kai_reactor_socket_drain(&kai_reactor_socket_write_waiters, pfds, nfds, POLLOUT);
+    }
+    /* Timeout-armed recv waiters whose deadline elapsed. Unconditional
+     * (like the timer drain): a bare poll timeout with no revents still
+     * has to expire them. Runs after the readiness drain above. */
+    kai_reactor_socket_read_deadline_drain(now);
+    /* A SIGCHLD delivered before we entered poll() may not appear
+     * in revents (the signal handler ran but the byte arrived
+     * after the kernel snapshot). Always attempt a non-blocking
+     * waitpid drain too so children that exited during the
+     * micro-window before poll() do not strand their fibers. */
+    if (kai_reactor_pid_waiters) {
+        kai_reactor_sigchld_drain();
+    }
+    kai_reactor_unlock();
+
+    if (heap_alloced) free(pfds);
+
+    /* Unpark the batch outside `kai_reactor_mu` (each remote_unpark takes a
+     * slot lock — never nested under reactor_mu). No-op at N=1: the drains
+     * unparked inline and the batch is empty. */
+    kai_reactor_flush_ready();
+}
+
+/* F2 — link a reactor-parking fiber into the waiter structure its park site
+ * stamped, and mark it PARKED, both under `kai_reactor_mu`. Runs on the
+ * scheduler root (kai_main_fiber) via `kai_drain_commit_stack` AFTER the
+ * fiber's exit swap finished writing its ctx — never on the fiber's own
+ * stack — so the reactor drain can never resume a half-saved context. The
+ * self-pipe poke re-arms a reactor already asleep in poll() with a stale
+ * timeout (the residual-deadlock fix: a timer linked while poll slept was
+ * never drained). Only reached at N>1 (the N=1 park sites link inline). */
+static void kai_sched_commit_park(KaiFiber *f) {
+    /* Non-reactor park: commit under f's slot lock, not reactor_mu. Its ctx
+     * is now saved (the exit swap completed), so publishing it PARKED is
+     * safe. Re-check wake_pending: a send that raced the pre-commit window
+     * saw us RUNNING and bumped it instead of enqueuing — honour that here
+     * by going straight to READY on the steal deque rather than parking. */
+    if (f->pending_park == KAI_PARK_SLOT) {
+        int home = kai_fiber_slot_lock(f);
+        KaiSchedSlot *s = &kai_sched_slots[home];
+        /* Clear pending_park before the unlock publishes the new state: a
+         * woken fiber can re-park and stamp a fresh reason the instant the
+         * state is visible, and a clear landing after that stomps it — the
+         * next commit would then park the fiber on no structure at all. */
+        f->pending_park = KAI_PARK_NONE;
+        if (f->wake_pending > 0) {
+            f->wake_pending--;
+            f->state = KAI_FIBER_READY;
+            f->sched_next = NULL;
+            if (s->steal_tail) s->steal_tail->sched_next = f;
+            else               s->steal_head = f;
+            s->steal_tail = f;
+        } else {
+            f->state = KAI_FIBER_PARKED;
+            atomic_fetch_add(&kai_blocked_fiber_count, 1);
+            kai_park_trace(f, "park-slot");
+        }
+        kai_fiber_slot_unlock_at(home);
+        return;
+    }
+    kai_reactor_lock();
+    int reason = f->pending_park;
+    int home = kai_fiber_slot_lock(f);
+    f->pending_park = KAI_PARK_NONE;
+    /* Cancel-vs-park race: the canceller sets cancel_requested and then
+     * detaches+unparks under kai_reactor_mu. A cancel that lands in the
+     * pre-commit window finds no waiter to detach, so committing this park
+     * would sleep through the flag until the reactor event fires. Re-check
+     * here and abort the park; the resume path runs the cancel yield-point
+     * check. The gate mirrors kai_check_cancel_yield_point so a fiber whose
+     * cancel cannot be delivered (already delivered, no pad) still parks. */
+    int cancel_abort = (f->cancel_requested && !f->cancel_delivered && f->cancel_pad_set);
+    if (f->wake_pending > 0 || cancel_abort) {
+        /* A wake raced the pre-commit window (or a stale permit survived
+         * an earlier park), or a pending cancel must not be slept through:
+         * go READY instead of parking on the reactor. The site observes
+         * reactor_fired == 0 and re-parks, or unwinds via the cancel pad. */
+        if (f->wake_pending > 0) f->wake_pending--;
+        f->state = KAI_FIBER_READY;
+        f->sched_next = NULL;
+        KaiSchedSlot *s = &kai_sched_slots[home];
+        if (s->steal_tail) s->steal_tail->sched_next = f;
+        else               s->steal_head = f;
+        s->steal_tail = f;
+        kai_park_trace(f, cancel_abort ? "commit-abort-cancel" : "commit-abort-wake");
+        kai_fiber_slot_unlock_at(home);
+        kai_reactor_unlock();
+        return;
+    }
+    f->state = KAI_FIBER_PARKED;
+    atomic_fetch_add(&kai_blocked_fiber_count, 1);
+    kai_park_trace(f, "park-reactor");
+    /* Publish PARKED under the slot lock so wakers (which classify state
+     * under that lock) never read a torn transition; the reactor insert
+     * below still happens under kai_reactor_mu, and a wake that flips us
+     * READY right after the unlock serializes behind it for the disarm. */
+    kai_fiber_slot_unlock_at(home);
+    switch (reason) {
+        case KAI_PARK_TIMER:
+            kai_reactor_timer_insert(f);
+            break;
+        case KAI_PARK_PID:
+            f->reactor_next = kai_reactor_pid_waiters;
+            kai_reactor_pid_waiters = f;
+            break;
+        case KAI_PARK_SOCKET_READ:
+            f->reactor_next = kai_reactor_socket_read_waiters;
+            kai_reactor_socket_read_waiters = f;
+            break;
+        case KAI_PARK_SOCKET_WRITE:
+            f->reactor_next = kai_reactor_socket_write_waiters;
+            kai_reactor_socket_write_waiters = f;
+            break;
+        case KAI_PARK_STDIN:
+            kai_reactor_stdin_waiter = f;
+            break;
+        case KAI_PARK_SIGNAL:
+            kai_reactor_signal_waiter = f;
+            break;
+        case KAI_PARK_FILEPOOL:
+            f->reactor_next = kai_reactor_filepool_waiters;
+            kai_reactor_filepool_waiters = f;
+            break;
+        default:
+            /* KAI_PARK_NONE should never reach the commit stack. */
+            break;
+    }
+    kai_reactor_parked_count++;
+    /* A signo delivered (and drained to `pending`) between the park
+     * request and this commit must wake the waiter now — the byte is
+     * gone from the self-pipe, so no future poll will re-deliver it. */
+    if (reason == KAI_PARK_SIGNAL) kai_reactor_signal_try_wake();
+    kai_reactor_unlock();
+    kai_reactor_wake();
+}
+
+/* Drain this thread's pending-commit stack on the scheduler root. Called
+ * right after each dispatch swap returns to kai_main_fiber, so every fiber
+ * that reactor-parked this pass is linked before the loop looks for more
+ * work. LIFO order is irrelevant — each fiber lands on its own waiter. */
+static void kai_drain_commit_stack(void) {
+    while (kai_commit_stack_head) {
+        KaiFiber *f = kai_commit_stack_head;
+        kai_commit_stack_head = f->commit_next;
+        f->commit_next = NULL;
+        kai_sched_commit_park(f);
+    }
+}
+
+/* This thread's scheduler slot. */
+static inline KaiSchedSlot *kai_sched_slot(void) {
+    return &kai_sched_slots[kai_thread_id];
+}
+
+/* Lock the slot that owns fiber `f` and return that slot's index. This
+ * guards `f`'s `state` + `awaiters_head` against a concurrent terminate:
+ * both the awaiter (check state, link onto the chain) and the target's own
+ * trampoline (set state, snapshot the chain) take THIS lock, closing the
+ * check-then-link lost-wakeup — an awaiter either observes DONE and skips
+ * parking, or is on the chain the terminate walk unparks.
+ *
+ * `f->home_thread` can change under a work-stealer, so we cannot just lock
+ * `slots[f->home_thread]` and trust it: re-read after acquiring and retry
+ * if it moved. Once we hold the lock of `f`'s current home, `f` cannot
+ * migrate — a thief must take that same slot lock to steal it — so the
+ * index stays valid until we release. The trampoline runs on `f`'s own
+ * (RUNNING, non-stealable) thread, so it locks the same slot. N=1 has one
+ * thread; callers gate these on nthreads>1 (single-thread path unchanged). */
+static inline int kai_fiber_slot_lock(KaiFiber *f) {
+    for (;;) {
+        int home = f->home_thread;
+        pthread_mutex_lock(&kai_sched_slots[home].mu);
+        if (f->home_thread == home) return home;
+        pthread_mutex_unlock(&kai_sched_slots[home].mu);
+    }
+}
+static inline void kai_fiber_slot_unlock_at(int home) {
+    pthread_mutex_unlock(&kai_sched_slots[home].mu);
+}
+
+/* At N>1 the ready queue lives in the slot (`steal_head`/`steal_tail`),
+ * one source of truth shared between the owner (both ends) and thieves
+ * (head only), serialized by the slot lock. At N=1 it is the plain TLS
+ * FIFO the pre-M:N runtime used — lock-free and byte-identical. */
+static void kai_sched_enqueue(KaiFiber *f) {
+    if (kai_nthreads > 1) {
+        /* A main-pinned fiber goes on thread 0's deque wherever the enqueue
+         * runs from — routing it to the caller's slot would hand it to that
+         * thread, which is exactly the migration the pin forbids. */
+        int owner = f->pinned_main ? 0 : kai_thread_id;
+        KaiSchedSlot *s = &kai_sched_slots[owner];
+        pthread_mutex_lock(&s->mu);
+        /* Publish ownership under the same lock that publishes the fiber
+         * onto this slot's steal list: a reader that finds `f` here must
+         * see home_thread pointing at this slot, or a cross-thread unpark
+         * would lock a slot the fiber is not queued on. */
+        f->home_thread = owner;
+        f->sched_next = NULL;
+        if (s->steal_tail) s->steal_tail->sched_next = f;
+        else               s->steal_head = f;
+        s->steal_tail = f;
+        pthread_mutex_unlock(&s->mu);
+        return;
+    }
+    f->sched_next = NULL;
+    if (kai_ready_tail) {
+        kai_ready_tail->sched_next = f;
+    } else {
+        kai_ready_head = f;
+    }
+    kai_ready_tail = f;
+}
+
+static KaiFiber *kai_sched_dequeue(void) {
+    if (kai_nthreads > 1) {
+        KaiSchedSlot *s = kai_sched_slot();
+        pthread_mutex_lock(&s->mu);
+        KaiFiber *f = s->steal_head;
+        if (f) {
+            s->steal_head = f->sched_next;
+            if (!s->steal_head) s->steal_tail = NULL;
+            f->sched_next = NULL;
+        }
+        pthread_mutex_unlock(&s->mu);
+        return f;
+    }
+    KaiFiber *f = kai_ready_head;
+    if (!f) return NULL;
+    kai_ready_head = f->sched_next;
+    if (!kai_ready_head) kai_ready_tail = NULL;
+    f->sched_next = NULL;
+    return f;
+}
+
+/* Steal one fiber from the head of thread `victim`'s ready queue,
+ * serialized against that thread's owner by the slot lock. Steal
+ * granularity is one fiber (a pointer move). The stolen fiber's
+ * home_thread is retargeted to the thief: it now runs, parks, and frees
+ * on the thief's thread, so its non-atomic-RC heap stays single-threaded.
+ * A fiber only migrates while READY — never mid-run — so nothing on its
+ * suspended stack references the victim thread's TLS. */
+static KaiFiber *kai_sched_steal_from(int victim) {
+    KaiSchedSlot *s = &kai_sched_slots[victim];
+    if (!s->live) return NULL;
+    pthread_mutex_lock(&s->mu);
+    KaiFiber *f = s->steal_head;
+    /* A main-pinned fiber is not stealable: taking it would run it here.
+     * Only the head is a steal candidate, so a pinned head just makes this
+     * victim unstealable for now — thread 0 dequeues it next. Thread 0
+     * never reaches this (it is never its own victim), so no thread-id
+     * test is needed: `pinned_main` implies victim 0. */
+    if (f && f->pinned_main) f = NULL;
+    if (f) {
+        s->steal_head = f->sched_next;
+        if (!s->steal_head) s->steal_tail = NULL;
+        f->sched_next = NULL;
+        /* Stamp the new owner under the victim's slot lock so a concurrent
+         * remote_unpark that reads home_thread sees a coherent value. */
+        f->home_thread = kai_thread_id;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return f;
+}
+
+/* Forward decl: the trampoline drives a fiber's body and walks its
+ * awaiter chain on completion. Defined below so it can call the
+ * scheduler primitives + kai_apply. */
+static void kai_fiber_trampoline(void);
+
+/* Fall-off-the-end landing for a fiber context. `uc_link` cannot name a
+ * scheduler root directly: `kai_main_fiber` is thread-local, so the address
+ * baked at spawn belongs to the spawning thread and a stolen fiber would
+ * resume a root another thread is running on. Resolve the executing
+ * thread's root here instead. */
+static void kai_fiber_uc_link_landing(void);
+static ucontext_t *kai_uc_link_target(void);
+
+/* Phase 5 forward decl: link propagation runs in the trampoline's
+ * termination tail; the helper itself is defined alongside the
+ * Link default handler further down. The reason argument distinguishes
+ * Normal (DONE) from Crashed (CANCELLED) and Trapped (a runtime trap)
+ * for trap-exit delivery. */
+typedef enum {
+    KAI_EXIT_NORMAL  = 0,
+    KAI_EXIT_CRASHED = 1,
+    KAI_EXIT_TRAPPED = 2
+} KaiExitReason;
+
+static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason);
+/* Tier 2 Monitor — observers learn about target's termination via a
+ * single push of `target_pid` into observer->mailbox. Defined
+ * alongside the Monitor default handler further down. */
+static void kai_monitor_propagate_terminate(KaiFiber *self);
+/* Eager nursery cancel-on-fail — defined alongside the nursery ops
+ * further down. */
+static void kai_nursery_propagate_failure(KaiFiber *self);
+
+/* Initialise a freshly-allocated KaiFiber's ucontext + private stack.
+ * Sets f->ctx so it can be a swapcontext target; fills uc_link as a
+ * fallback (the trampoline always exits via setcontext, so uc_link
+ * is reachable only on a runtime bug). The thunk slot must already
+ * be filled by the caller before the fiber runs. */
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+static void kai_fiber_init_ctx_sized(KaiFiber *f, size_t stack_size) {
+    kai_install_fiber_sigsegv_handler();
+    if (getcontext(&f->ctx) != 0) {
+        fprintf(stderr, "kai: getcontext failed for new fiber\n");
+        exit(1);
+    }
+    {
+        size_t ps = kai_page_size();
+        if (stack_size % ps != 0) stack_size = ((stack_size / ps) + 1) * ps;
+    }
+    f->stack_size = stack_size;
+    /* Allocate stack + one guard page below it. Stack grows down on
+     * x86_64 / arm64, so the lowest address is the overflow target.
+     * stack_base points at the guard; the usable region starts one
+     * page above. Layout (low → high):
+     *   [ guard page (PROT_NONE) | stack_size bytes (RW) ]
+     * We store stack_base as the mmap base so munmap covers both;
+     * stack_size remains the usable size, and total = stack_size +
+     * page_size whenever we need to release the region. */
+    size_t page = kai_page_size();
+    size_t total = f->stack_size + page;
+    void *region = mmap(NULL, total, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (region == MAP_FAILED) {
+        fprintf(stderr, "kai: mmap failed allocating fiber stack (%zu bytes)\n",
+                total);
+        exit(1);
+    }
+    if (mprotect(region, page, PROT_NONE) != 0) {
+        fprintf(stderr, "kai: mprotect guard page failed for fiber stack\n");
+        munmap(region, total);
+        exit(1);
+    }
+    f->stack_base = region;
+    f->ctx.uc_stack.ss_sp   = (char *) region + page;
+    f->ctx.uc_stack.ss_size = f->stack_size;
+    f->ctx.uc_link          = kai_uc_link_target();
+    makecontext(&f->ctx, kai_fiber_trampoline, 0);
+}
+
+static void kai_fiber_init_ctx(KaiFiber *f) {
+    kai_fiber_init_ctx_sized(f, kai_fiber_stack_size());
+}
+
+/* ==================================================================
+ * M:N work-stealing core — the per-thread scheduler loop.
+ * docs/mn-scheduler-design.md §2, §4. Off at N=1.
+ * ================================================================== */
+
+/* Reactor ownership is fixed on thread 0 for F1 (F0 left the reactor
+ * single-owner; F2 shards it). Any thread may register a reactor waiter,
+ * but only thread 0 runs `kai_reactor_wait` — a scheduler thread that
+ * finds its own local queue empty and is NOT the owner steals or parks
+ * on its condvar; it never touches the poll set. */
+#define KAI_REACTOR_OWNER_THREAD 0
+
+/* Find one runnable fiber for this thread: its own queue first (LIFO
+ * locality preserved by the FIFO order the owner maintains), then a
+ * round-robin steal sweep over the other live threads. Returns NULL when
+ * nothing is runnable anywhere this instant. */
+static KaiFiber *kai_worker_find_work(void) {
+    KaiFiber *f = kai_sched_dequeue();
+    if (f) return f;
+    for (int i = 1; i < kai_nthreads; i++) {
+        int victim = (kai_thread_id + i) % kai_nthreads;
+        f = kai_sched_steal_from(victim);
+        if (f) return f;
+    }
+    return NULL;
+}
+
+/* F2 — no-op. Every scheduler thread now polls its own deque on a short
+ * nanosleep, so a fiber pushed by a cross-thread remote_unpark is picked up
+ * on the next retry with no explicit signal. The reactor is a dedicated
+ * thread woken through its own self-pipe (kai_reactor_wake), not through a
+ * scheduler thread — so there is no thread here that blocks in poll() and
+ * needs poking. (F1 poked thread 0's filepool pipe because that thread ran
+ * the inline reactor; F2 moved the poll off the scheduler threads.) */
+static void kai_sched_wake_thread(int tid) {
+    (void) tid;
+}
+
+/* Promote a fiber owned by another thread from PARKED to READY and make
+ * it runnable on its home thread, then wake that thread. Called from a
+ * cross-thread mailbox send (the sender runs here, the receiver's home
+ * is elsewhere). The state flip is serialized on the target's slot lock
+ * so it composes with the target's own park path (which sets PARKED
+ * under the same lock via kai_sched_park_remote_safe below). */
+static void kai_sched_remote_unpark(KaiFiber *target) {
+    if (!target) return;
+    /* Lock the target's CURRENT home slot (retry loop — home_thread can
+     * move under a work-stealer between a bare read and the acquisition).
+     * Locking a stale slot would race the park commit's state/wake_pending
+     * transitions, which run under the current slot's lock: the classic
+     * outcome is a wake recorded where the commit never looks — a lost
+     * wakeup that strands the fiber. */
+    int home = kai_fiber_slot_lock(target);
+    KaiSchedSlot *s = &kai_sched_slots[home];
+    if (target->state == KAI_FIBER_PARKED) {
+        target->state = KAI_FIBER_READY;
+        target->sched_next = NULL;
+        if (s->steal_tail) s->steal_tail->sched_next = target;
+        else               s->steal_head = target;
+        s->steal_tail = target;
+        kai_fiber_slot_unlock_at(home);
+        atomic_fetch_sub(&kai_blocked_fiber_count, 1);
+        kai_park_trace(target, "unpark-parked");
+    } else if (target->state == KAI_FIBER_DONE ||
+               target->state == KAI_FIBER_CANCELLED) {
+        /* Terminal: nothing to wake, and the struct may be about to be
+         * reclaimed — do not write a permit into it. */
+        kai_fiber_slot_unlock_at(home);
+        kai_park_trace(target, "unpark-terminal");
+    } else {
+        /* RUNNING (pre-commit window) or READY (already waking): record a
+         * permit. The next park commit consumes it and the site re-checks
+         * its predicate, so a stale permit costs one spurious resume. */
+        target->wake_pending++;
+        kai_fiber_slot_unlock_at(home);
+        kai_park_trace(target, "unpark-permit");
+    }
+    kai_sched_wake_thread(home);
+}
+
+/* Every deque empty? Read each slot's ready head under its own lock so a
+ * fiber a reactor flush is mid-enqueue is seen rather than raced past.
+ * Called with kai_reactor_mu held, so the lock order (reactor_mu → slot)
+ * is respected. */
+static int kai_all_deques_empty(void) {
+    for (int i = 0; i < kai_nthreads; i++) {
+        KaiSchedSlot *s = &kai_sched_slots[i];
+        pthread_mutex_lock(&s->mu);
+        KaiFiber *head = s->steal_head;
+        pthread_mutex_unlock(&s->mu);
+        if (head) return 0;
+    }
+    return 1;
+}
+
+/* Global-quiescence deadlock check — the M:N analogue of the single-thread
+ * dispatch loop's "run queue empty with fibers parked". An idle worker runs
+ * it; it fires only when the whole machine is wedged: every worker idle, the
+ * reactor asleep with nothing armed, every deque empty, and at least one
+ * fiber PARKED. That state is terminal — no fiber or reactor event can leave
+ * it — so it is a true deadlock, not a transient lull, and the report needs
+ * no timeout.
+ *
+ * The race the check must survive — "I saw everyone idle; a peer just made a
+ * fiber runnable" — is closed by construction. The only producers of new
+ * runnable work are a RUNNING fiber (spawn / unpark / awaiter wake) and a
+ * reactor promotion. All workers idle ⇒ no fiber is RUNNING; kai_reactor_idle
+ * ⇒ the reactor is blocked in poll() with nothing to fire. With both true no
+ * producer can act, so the observed quiescence cannot dissolve under us. The
+ * confirmation runs under kai_reactor_mu (which serializes reactor drains and
+ * the reactor branch of commit_park) and scans the deques under their slot
+ * locks, so a fiber a flush is mid-handback is counted, never missed. */
+static void kai_sched_check_deadlock(void) {
+    /* Cheap lock-free gate so the reactor_mu acquisition below stays rare —
+     * only an already-terminal-looking observation pays for the confirm. */
+    if (atomic_load(&kai_sched_idle_count) != kai_nthreads) return;
+    if (!atomic_load(&kai_reactor_idle)) return;
+    if (atomic_load(&kai_blocked_fiber_count) <= 0) return;
+    if (kai_sched_shutting_down) return;
+
+    pthread_mutex_lock(&kai_reactor_mu);
+    int wedged = atomic_load(&kai_sched_idle_count) == kai_nthreads
+              && atomic_load(&kai_reactor_idle)
+              && kai_reactor_parked_count == 0
+              && atomic_load(&kai_blocked_fiber_count) > 0
+              && !kai_sched_shutting_down
+              && kai_all_deques_empty();
+    pthread_mutex_unlock(&kai_reactor_mu);
+    if (!wedged) return;
+
+    /* Wedged is a whole-scheduler state, so every idle worker observes it at
+     * once. Claim the report with a CAS: the winner prints and exits, the
+     * losers nap until that exit() lands. No mutex — the reporter must not be
+     * able to block on a peer in the very state it is reporting, and a loser
+     * spinning here holds nothing a peer could need. */
+    int unreported = 0;
+    if (!atomic_compare_exchange_strong(&kai_deadlock_reported, &unreported, 1)) {
+        for (;;) {
+            struct timespec nap = { 0, 200 * 1000 };
+            nanosleep(&nap, NULL);
+        }
+    }
+
+    fprintf(stderr,
+        "kai: all workers idle with fibers parked (%d parked) — deadlock\n",
+        atomic_load(&kai_blocked_fiber_count));
+    kai_park_trace_dump();
+    exit(1);
+}
+
+/* The per-thread scheduler loop, run ON this thread's kai_main_fiber
+ * (the OS-thread context). A worker thread enters here after startup; the
+ * main thread enters it only implicitly (its main_fiber IS the program's
+ * initial context, and park/trampoline swap back here when the local
+ * queue drains). The loop: run everything runnable locally or stolen; when
+ * nothing is runnable anywhere, count into kai_sched_idle_count, run the
+ * global-quiescence deadlock check, and nap. Exits when the program has
+ * terminated (shutdown flag set) — only the workers exit here; the main
+ * thread's loop returns control to `main` via the root fiber finishing. */
+static void kai_worker_loop(void) {
+    KaiFiber *self_root = &kai_main_fiber;
+    KAI_TSAN_BIND_ROOT();
+    int idle = 0;   /* this worker is currently counted in kai_sched_idle_count */
+    for (;;) {
+        if (kai_sched_shutting_down) {
+            if (idle) atomic_fetch_sub(&kai_sched_idle_count, 1);
+            return;
+        }
+        /* Leave the idle pool BEFORE searching. A worker holding a fiber it
+         * has not yet dispatched is invisible to the quiescence check (the
+         * fiber is off every deque and not RUNNING); counting that worker
+         * idle lets the check observe "all idle, deques empty, one blocked"
+         * mid-dispatch and kill a healthy process. Non-idle from before the
+         * search until the dispatch completes closes that window. */
+        if (idle) { atomic_fetch_sub(&kai_sched_idle_count, 1); idle = 0; }
+        KaiFiber *next = kai_worker_find_work();
+        if (next) {
+            next->state = KAI_FIBER_RUNNING;
+            kai_active_fiber = next;
+            KAI_TSAN_SWITCH_TO(next);
+            swapcontext(&self_root->ctx, &next->ctx);
+            kai_active_fiber = self_root;
+            kai_drain_pending_free();
+            /* F2 — from the root context (kai_main_fiber), after the exit
+             * swap above saved the fiber's ctx: link any fiber that
+             * reactor-parked into the wheel/waiter list, and requeue any
+             * fiber that yielded onto the steal list. Both are unsafe to do
+             * on the fiber's own stack (a thief/reactor could resume a
+             * half-saved ctx), so they are deferred to here. */
+            kai_drain_commit_stack();
+            kai_drain_requeue_stack();
+            continue;
+        }
+        /* Idle: no runnable work anywhere. Publish it, then test for a
+         * global deadlock before napping. A short nanosleep (not a condvar
+         * wait) is the portable choice: a cross-thread push is observed on
+         * the next retry within the sleep bound, and shutdown is observed at
+         * the top of the loop — neither depends on a wakeup that could be
+         * lost. 200µs bounds both wake latency and idle CPU. */
+        if (!idle) { atomic_fetch_add(&kai_sched_idle_count, 1); idle = 1; }
+        kai_sched_check_deadlock();
+        struct timespec nap = { 0, 200 * 1000 };   /* 200µs */
+        nanosleep(&nap, NULL);
+    }
+}
+
+/* Yield: caller stays READY and goes back on the run queue; control
+ * swaps to the head of the queue. No-op if the queue is empty (caller
+ * is the only ready fiber, nothing to switch to). */
+static void kai_sched_yield(void) {
+    KaiFiber *current = kai_current_fiber();
+
+    /* M:N: never enqueue `current` on the steal list before its ctx is
+     * saved — a thief could resume a half-written context. Defer the
+     * requeue to the root (post-swap) via the requeue stack, and hand
+     * control to this thread's scheduler loop, which drains the stack and
+     * dispatches the next runnable fiber. No fiber→fiber shortcut: the
+     * publish-after-swap invariant is worth the root trip. If nothing else
+     * is runnable this instant, the loop simply redispatches `current`. */
+    if (kai_nthreads > 1) {
+        current->state = KAI_FIBER_READY;
+        current->commit_next  = kai_requeue_stack_head;
+        kai_requeue_stack_head = current;
+        kai_active_fiber = &kai_main_fiber;
+        KAI_TSAN_SWITCH_TO_ROOT();
+        swapcontext(&current->ctx, &kai_main_fiber.ctx);
+        kai_set_active_fiber(current);
+        kai_drain_pending_free();
+        return;
+    }
+
+    KaiFiber *next = kai_sched_dequeue();
+    if (!next) return;  /* alone — nothing to yield to */
+    current->state = KAI_FIBER_READY;
+    kai_sched_enqueue(current);
+    next->state = KAI_FIBER_RUNNING;
+    kai_active_fiber = next;
+    KAI_TSAN_SWITCH_TO(next);
+    swapcontext(&current->ctx, &next->ctx);
+    /* Resumed: another fiber yielded/parked back to us; the swap
+     * source (current->ctx) holds the state that was just restored.
+     * R4 fix — if the fiber that swapped to us was the trampoline
+     * tail of a now-discarded fiber, `kai_pending_free` carries its
+     * deferred struct + stack. Reap before continuing. */
+    kai_drain_pending_free();
+}
+
+/* Drain this thread's pending-requeue stack on the scheduler root: each
+ * yielded fiber's exit swap has completed, so it is now safe to publish it
+ * to the steal list. */
+static void kai_drain_requeue_stack(void) {
+    while (kai_requeue_stack_head) {
+        KaiFiber *f = kai_requeue_stack_head;
+        kai_requeue_stack_head = f->commit_next;
+        f->commit_next = NULL;
+        kai_sched_enqueue(f);
+    }
+}
+
+/* Park: caller goes PARKED, control swaps to the head of the run
+ * queue. The caller must have already linked itself into a wakeup
+ * list (awaiter chain, mailbox waiter list, or a reactor structure)
+ * before calling park — otherwise no fiber can ever unpark it.
+ *
+ * Issue #611 — Phase R1 reactor integration: when the ready queue
+ * is empty but at least one fiber is parked on the reactor (timer
+ * wheel, pid waiter, file-pool waiter), block in `kai_reactor_wait`
+ * until an event promotes someone, then redequeue. Deadlock is now
+ * `ready queue empty AND reactor empty` — only that combination
+ * means no path to forward progress. */
+static void kai_sched_park(void) {
+    KaiFiber *current = kai_current_fiber();
+    /* Any prior park's fired stamp is history; the sites read it only for
+     * THIS park's resume. Safe here: the fiber is not linked into any
+     * reactor structure a drain could fire from (N>1 links at commit;
+     * N=1 links inline but is single-threaded). */
+    current->reactor_fired = 0;
+
+    /* M:N path: a parking fiber returns to this thread's scheduler loop
+     * (kai_main_fiber) — never runs poll() or a condvar wait on its own
+     * stack (asu invariant: nothing that blocks the OS thread runs on a
+     * user fiber's stack).
+     *
+     * Both reactor parks (pending_park already stamped by the site) and
+     * non-reactor parks (mailbox recv, await, send-block) yield
+     * UNCONDITIONALLY to the root and let it mark PARKED — from the root's
+     * stack, after this swap has finished saving our ctx. Setting PARKED
+     * inline, before the save, would let a cross-thread remote_unpark flip
+     * us READY onto the steal deque while our ctx is still being written,
+     * and a thief could then resume a half-saved context (garbage RIP).
+     * State stays RUNNING across the swap; a wake that races the commit
+     * takes remote_unpark's wake_pending path, which kai_sched_commit_park
+     * re-checks (reactor reasons under reactor_mu, KAI_PARK_SLOT under the
+     * slot lock) before it commits. */
+    if (kai_nthreads > 1) {
+        int was_reactor = (current->pending_park != KAI_PARK_NONE &&
+                           current->pending_park != KAI_PARK_SLOT);
+        if (!current->pending_park) current->pending_park = KAI_PARK_SLOT;
+        current->commit_next   = kai_commit_stack_head;
+        kai_commit_stack_head  = current;
+        kai_active_fiber = &kai_main_fiber;
+        KAI_TSAN_SWITCH_TO_ROOT();
+        swapcontext(&current->ctx, &kai_main_fiber.ctx);
+        kai_set_active_fiber(current);
+        kai_drain_pending_free();
+        /* A reactor park that resumes without the reactor's own splice
+         * (a message wake off the recv chain, a consumed permit, or a
+         * stale unpark) may still be linked into the wheel or a waiter
+         * list. Splice it out now, so a re-park or a return can never
+         * leave a dangling reactor link behind — the double-insert that
+         * corrupts the wheel's list structure. */
+        if (was_reactor && !current->reactor_fired) {
+            if (kai_reactor_detach_fiber(current))
+                kai_park_trace(current, "self-detach");
+        }
+        kai_check_cancel_yield_point();
+        return;
+    }
+
+    /* Mark the caller PARKED up front so the reactor drain helpers
+     * (which may run inside kai_reactor_wait below) can promote us
+     * back to READY via kai_sched_unpark. The unpark path bails out
+     * when state != PARKED, so a fiber whose state is still RUNNING
+     * when its deadline fires would be lost. */
+    current->state = KAI_FIBER_PARKED;
+    kai_parked_count++;
+
+    KaiFiber *next = kai_sched_dequeue();
+    while (!next) {
+        if (kai_reactor_parked_count > 0) {
+            kai_reactor_wait();
+            next = kai_sched_dequeue();
+            continue;
+        }
+        fprintf(stderr,
+            "kai: deadlock — fiber parked with empty run queue (%d parked total)\n",
+            kai_parked_count);
+        exit(1);
+    }
+    if (next == current) {
+        /* The reactor wake promoted us before we picked anyone else.
+         * Skip the swapcontext (we are still on our own stack) and
+         * unwind the parked accounting we just bumped. */
+        current->state = KAI_FIBER_RUNNING;
+        kai_parked_count--;
+        /* Issue #679: also observe a sibling-triggered cancel here.
+         * The unpark path from `kai_default_spawn_cancel`'s reactor
+         * detach lands here when the canceller is on the same OS
+         * thread frame as the reactor wake. */
+        kai_check_cancel_yield_point();
+        return;
+    }
+    next->state = KAI_FIBER_RUNNING;
+    kai_active_fiber = next;
+    KAI_TSAN_SWITCH_TO(next);
+    swapcontext(&current->ctx, &next->ctx);
+    /* R4 fix — see kai_sched_yield: drain pending free on resume. */
+    kai_drain_pending_free();
+    /* Issue #679: every reactor-driven park resumes here. If a
+     * sibling fiber called Spawn.cancel(self) while we were parked,
+     * the reactor detach + unpark wakes us and we must observe the
+     * cancel before retrying the syscall the park site wrapped.
+     * The yield-point check longjmps to `cancel_pad` if the flag is
+     * set; otherwise the park site's syscall retry loop continues
+     * normally. */
+    kai_check_cancel_yield_point();
+}
+
+/* Unpark: target PARKED → READY, enqueue at run queue tail. Caller
+ * stays RUNNING (does not yield); the unparked fiber runs whenever
+ * the scheduler reaches it. No-op if target is not currently
+ * PARKED (defensive against double-unpark).
+ *
+ * Under M:N the target may be owned by another thread (it was stolen, or
+ * this is a same-thread wake of a fiber whose home is elsewhere): route
+ * through the slot-locked remote path, which flips its state on its own
+ * slot and wakes its home thread. A target on this very thread takes the
+ * remote path too — same slot, same lock — so there is one unpark path
+ * at N>1 and the lost-wakeup guard (wake_pending) applies uniformly. */
+static void kai_sched_unpark(KaiFiber *target) {
+    if (!target) return;
+    if (kai_nthreads > 1) { kai_sched_remote_unpark(target); return; }
+    if (target->state != KAI_FIBER_PARKED) return;
+    target->state = KAI_FIBER_READY;
+    kai_parked_count--;
+    kai_sched_enqueue(target);
+}
+
+/* Trampoline: the entry point makecontext installs on every spawned
+ * fiber's stack. Reads kai_active_fiber to find itself (set by the
+ * dispatcher who swapped in), runs the thunk, walks awaiters, and
+ * hands control to the next ready fiber via setcontext.
+ *
+ * Phase 3 — Cancel landing: setjmp(cancel_pad) before the body runs.
+ * The yield-point hook in kai_evidence_lookup* longjmps here when
+ * cancel_requested fires; the second-return path skips the body and
+ * marks the fiber CANCELLED instead of DONE. cancel_pad_set is the
+ * gate the hook reads before attempting the longjmp.
+ *
+ * RC contract: f->thunk is owned by f for f's entire lifetime;
+ * kai_apply consumes (#298), so the trampoline incref's the thunk
+ * before each invocation to keep f->thunk's lifetime independent of
+ * the call. kai_free_value's KAI_FIBER branch decrefs both thunk and
+ * result when f's RC drops. */
+static void kai_fiber_uc_link_landing(void) {
+    kai_active_fiber = &kai_main_fiber;
+    KAI_TSAN_SWITCH_TO_ROOT();
+    setcontext(&kai_main_fiber.ctx);
+    fprintf(stderr, "kai: fiber uc_link landing failed to reach the scheduler root\n");
+    exit(1);
+}
+
+/* Per-thread context whose entry point is the landing above. Every fiber
+ * spawned on this thread links here, so a fall-off-the-end resolves the
+ * root of whichever thread is executing rather than the spawner's.
+ *
+ * The stack size is a literal, not SIGSTKSZ: glibc defines that as a
+ * sysconf() call, which makes a file-scope array a VLA and fails to
+ * compile. The landing only runs setcontext, so this is generous. */
+#define KAI_UC_LINK_STACK_SIZE 65536
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS ucontext_t kai_uc_link_ctx;
+extern KAI_TLS char kai_uc_link_stack[KAI_UC_LINK_STACK_SIZE];
+extern KAI_TLS int kai_uc_link_ready;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS ucontext_t kai_uc_link_ctx;
+KAI_TLS char kai_uc_link_stack[KAI_UC_LINK_STACK_SIZE];
+KAI_TLS int kai_uc_link_ready = 0;
+#  endif
+#else
+static KAI_TLS ucontext_t kai_uc_link_ctx;
+static KAI_TLS char kai_uc_link_stack[KAI_UC_LINK_STACK_SIZE];
+static KAI_TLS int kai_uc_link_ready = 0;
+#endif
+
+static ucontext_t *kai_uc_link_target(void) {
+    if (!kai_uc_link_ready) {
+        if (getcontext(&kai_uc_link_ctx) != 0) return &kai_main_fiber.ctx;
+        kai_uc_link_ctx.uc_stack.ss_sp   = kai_uc_link_stack;
+        kai_uc_link_ctx.uc_stack.ss_size = sizeof(kai_uc_link_stack);
+        kai_uc_link_ctx.uc_link          = NULL;
+        makecontext(&kai_uc_link_ctx, kai_fiber_uc_link_landing, 0);
+        kai_uc_link_ready = 1;
+    }
+    return &kai_uc_link_ctx;
+}
+
+static void kai_fiber_trampoline(void) {
+    KaiFiber *self = kai_active_fiber;
+    /* First entry follows a setcontext from another fiber's
+     * trampoline tail or a swap from yield/park. Drain any pending
+     * struct free left behind by the previous fiber's
+     * `kai_decref(self->value)` before we touch our own state. */
+    kai_drain_pending_free();
+    if (setjmp(self->cancel_pad) == 0) {
+        self->cancel_pad_set = 1;
+        /* kai_apply consumes (#298): give it its own ref, keep f->thunk. */
+        self->result = kai_apply(kai_incref(self->thunk), 0, NULL);
+        self->cancel_pad_set = 0;
+        self->state  = KAI_FIBER_DONE;
+    } else {
+        /* Cancel or trap landing: the yield-point hook, the default
+         * Cancel handler, or kai_trap_abort longjmped here. The body
+         * did not finish; result stays NULL. `trapped` distinguishes
+         * a runtime trap (a bug) from cooperative cancellation.
+         * Sibling cancellation must precede the terminal state store:
+         * the store is what lets the nursery owner join this fiber,
+         * finish its drain, and free the scope. */
+        self->cancel_pad_set = 0;
+        kai_nursery_propagate_failure(self);
+        self->state = KAI_FIBER_CANCELLED;
+    }
+
+    /* Phase 5 — Link propagation. Walk the linked chain. For each
+     * peer, behaviour depends on the peer's trap_exit flag (Tier 2):
+     *   - trap_exit=0 (default): set cancel_requested (current
+     *     behaviour, delivered at the peer's next yield-point hook).
+     *   - trap_exit=1: push a "Normal"/"Crashed"/"Trapped" string
+     *     into the peer's mailbox so the peer can react in user code
+     *     instead of being cancelled.
+     * The exit reason: DONE → Normal, trapped → Trapped, otherwise
+     * CANCELLED → Crashed. */
+    kai_link_propagate_terminate(self,
+        self->state == KAI_FIBER_DONE ? KAI_EXIT_NORMAL
+        : self->trapped ? KAI_EXIT_TRAPPED : KAI_EXIT_CRASHED);
+
+    /* Tier 2 Monitor — push our pid into each observer's mailbox.
+     * Observers do not get cancel_requested set; monitors are
+     * unidirectional and fault-isolated. */
+    kai_monitor_propagate_terminate(self);
+
+    /* Wake awaiters. Each was parked in Spawn.await / Spawn.select /
+     * nursery_join. Snapshot the chain under this fiber's slot lock so it
+     * is atomic against a concurrent awaiter's check-then-link (both sides
+     * take this lock): `state` was set DONE/CANCELLED above, so an awaiter
+     * that acquires the lock after this snapshot sees the terminal state
+     * and never parks, while one that linked before the snapshot is on the
+     * chain we walk here. Clear each awaiter's next-link before unparking
+     * so a re-park does not see stale links. */
+    KaiFiber  *wake_stack[8];
+    KaiFiber **wake = wake_stack;
+    int        wake_n = 0;
+    int self_hl = 0;
+    if (kai_nthreads > 1) self_hl = kai_fiber_slot_lock(self);
+    /* Snapshot AND clear every awaiter's next-link under the lock: an
+     * awaiter that observes our terminal state and returns re-uses its
+     * awaiters_next for its next wait, so the link must not be read or
+     * written outside this critical section. */
+    {
+        int n = 0;
+        for (KaiFiber *c = self->awaiters_head; c; c = c->awaiters_next) n++;
+        if (n > 8) {
+            wake = (KaiFiber **) malloc((size_t) n * sizeof(KaiFiber *));
+            if (!wake) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        }
+        KaiFiber *a = self->awaiters_head;
+        while (a) {
+            KaiFiber *nx = a->awaiters_next;
+            a->awaiters_next = NULL;
+            wake[wake_n++] = a;
+            a = nx;
+        }
+        self->awaiters_head = NULL;
+    }
+    /* Selectors parked on us. Each node lives on its selector's stack
+     * frame, so the chain must be walked to fibers HERE, under the lock:
+     * once a selector is unparked it can win, return, and reclaim its
+     * frame, and a `sel->next` read after that is a use-after-free.
+     * Collecting the fibers first means the unpark loop below touches no
+     * node memory. Each selector re-scans every candidate on resume, so
+     * detaching the chain is all we owe it. */
+    KaiFiber  *swake_stack[8];
+    KaiFiber **swake = swake_stack;
+    int        swake_n = 0;
+    {
+        int n = 0;
+        for (KaiSelectWaiter *c = self->select_waiters_head; c; c = c->next) n++;
+        if (n > 8) {
+            swake = (KaiFiber **) malloc((size_t) n * sizeof(KaiFiber *));
+            if (!swake) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        }
+        KaiSelectWaiter *s = self->select_waiters_head;
+        while (s) {
+            KaiSelectWaiter *nx = s->next;
+            s->next = NULL;
+            swake[swake_n++] = s->waiter;
+            s = nx;
+        }
+        self->select_waiters_head = NULL;
+    }
+    if (kai_nthreads > 1) kai_fiber_slot_unlock_at(self_hl);
+    for (int i = 0; i < swake_n; i++) kai_sched_unpark(swake[i]);
+    if (swake != swake_stack) free(swake);
+    for (int i = 0; i < wake_n; i++) kai_sched_unpark(wake[i]);
+    if (wake != wake_stack) free(wake);
+
+    /* R4 fix — drop the scheduler-side incref on our wrapper, taken
+     * by `kai_default_spawn_spawn` before enqueue. Pairs `enqueue`
+     * with this single decref.
+     *
+     * At N>1 we must NOT drop it inline: the tail keeps running on this
+     * fiber's private stack below (dequeue + setcontext), and a peer thread
+     * holding the last other ref (a discarded Fiber[T] handle) could take RC
+     * to 0 and munmap this stack the instant we drop ours. Stash the ref so
+     * RC stays >= 1 across the tail; the next context drops it once the
+     * setcontext has left this stack (folded into the pending-free drain).
+     * At N=1 there is no peer thread, so decref inline — if RC hits 0,
+     * kai_free_value defers the struct/stack free into kai_pending_free (we
+     * are still on this stack) and the next drain reaps it; byte-identical to
+     * the pre-M:N path. */
+    if (self->value) {
+        if (kai_nthreads > 1) kai_pending_sched_drop_set(self->value);
+        else                  kai_decref(self->value);
+    }
+
+    /* Hand control to the next ready fiber. Awaiters we just woke
+     * are now in the queue; the FIFO discipline picks the oldest
+     * ready (which may be one of them, or main, or a sibling).
+     *
+     * Issue #611 — if the queue is empty here but reactor waiters
+     * remain (timer wheel, pid map, file-pool list), block in
+     * kai_reactor_wait until a wake event promotes someone before
+     * declaring deadlock. */
+    /* M:N — a finished fiber with no local successor returns to this
+     * thread's scheduler loop (kai_main_fiber), which steals or idles.
+     * We setcontext explicitly so the loop resumes at its swap point
+     * rather than falling off the end into the uc_link landing.
+     *
+     * Both handoffs write kai_active_fiber out of line. This frame spans the
+     * fiber's whole body, so an inline store reuses the slot address resolved
+     * in the prologue — on the thread that first dispatched the fiber, not the
+     * one the tail runs on after a steal. */
+    if (kai_nthreads > 1) {
+        KaiFiber *next = kai_sched_dequeue();
+        if (next) {
+            next->state = KAI_FIBER_RUNNING;
+            kai_set_active_fiber(next);
+            KAI_TSAN_SWITCH_TO(next);
+            setcontext(&next->ctx);
+        }
+        kai_set_active_fiber(&kai_main_fiber);
+        KAI_TSAN_SWITCH_TO_ROOT();
+        setcontext(&kai_main_fiber.ctx);
+        /* setcontext does not return. */
+    }
+
+    KaiFiber *next = kai_sched_dequeue();
+    while (!next) {
+        if (kai_reactor_parked_count > 0) {
+            kai_reactor_wait();
+            next = kai_sched_dequeue();
+            continue;
+        }
+        fprintf(stderr,
+            "kai: fiber finished with empty run queue (%d parked) — deadlock\n",
+            kai_parked_count);
+        exit(1);
+    }
+    next->state = KAI_FIBER_RUNNING;
+    kai_active_fiber = next;
+    KAI_TSAN_SWITCH_TO(next);
+    setcontext(&next->ctx);
+    /* setcontext does not return. */
+}
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic pop
+#endif
+
+/* ==================================================================
+ * M:N bootstrap — start the worker pool and run `kai_main` as a fiber.
+ * ================================================================== */
+
+/* The user's `kai_main` (void→KaiValue*), captured by kai_sched_bootstrap
+ * so the root fiber's trampoline can invoke it. Immutable after startup. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiValue *(*kai_user_main_fn)(void);
+extern KaiValue  *kai_user_main_result;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiValue *(*kai_user_main_fn)(void) = NULL;
+KaiValue  *kai_user_main_result = NULL;
+#  endif
+#else
+static KaiValue *(*kai_user_main_fn)(void) = NULL;
+static KaiValue  *kai_user_main_result = NULL;
+#endif
+
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+/* Root-fiber trampoline for the user's main under M:N. Runs kai_main on
+ * a spawned fiber's stack (so main can park/steal like any actor),
+ * publishes the result, flips the shutdown flag, wakes every worker, and
+ * returns to thread 0's scheduler loop. */
+static void kai_bootstrap_trampoline(void) {
+    KaiFiber *self = kai_active_fiber;
+    kai_drain_pending_free();
+    self->state = KAI_FIBER_RUNNING;
+    kai_user_main_result = kai_user_main_fn();
+    self->state = KAI_FIBER_DONE;
+    /* Program is over: flip the shutdown flag. Every worker polls it at
+     * the top of its loop within one nanosleep tick and returns, so no
+     * explicit wake is needed; the owner is woken from a possible poll()
+     * via its self-pipe. */
+    kai_sched_shutting_down = 1;
+    kai_sched_wake_thread(KAI_REACTOR_OWNER_THREAD);
+    /* Hand back to this thread's scheduler loop, which sees the shutdown
+     * flag and returns to kai_sched_bootstrap. Out of line: this frame spans
+     * the whole user main, so an inline store would reuse the slot address
+     * resolved before main ever parked. */
+    kai_set_active_fiber(&kai_main_fiber);
+    KAI_TSAN_SWITCH_TO_ROOT();
+    setcontext(&kai_main_fiber.ctx);
+}
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic pop
+#endif
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern pthread_t kai_worker_threads[KAI_MAX_THREADS];
+#  if defined(KAI_RUNTIME_OWNER)
+pthread_t kai_worker_threads[KAI_MAX_THREADS];
+#  endif
+#else
+static pthread_t kai_worker_threads[KAI_MAX_THREADS];
+#endif
+
+/* Worker thread entry: adopt an id, anchor this thread's root fiber,
+ * mark the slot live, and run the scheduler loop until shutdown. */
+static void *kai_worker_thread_main(void *arg) {
+    kai_thread_id = (int) (intptr_t) arg;
+    /* Per-thread: without it a fiber overflowing here dies undiagnosed. */
+    kai_install_thread_sigaltstack();
+    kai_active_fiber_anchor();
+    kai_main_fiber.home_thread = kai_thread_id;
+    kai_sched_slots[kai_thread_id].live = 1;
+    kai_rc_ledger_register();
+    kai_worker_loop();
+    kai_rc_ledger_fold();
+    return NULL;
+}
+
+/* F2 — the dedicated reactor thread. Owns the poll() loop and every shared
+ * reactor structure (under kai_reactor_mu). It never dispatches fibers; it
+ * only drains ready ones and hands them back to their home scheduler thread
+ * via remote_unpark. `kai_reactor_wait` blocks in poll() on the self-pipes
+ * even with no timers armed, so this loop does not spin; a commit or the
+ * shutdown poke breaks the wait. Its thread id is kai_nthreads — a valid,
+ * never-live slot index it never dispatches from. */
+static void *kai_reactor_thread_main(void *arg) {
+    (void) arg;
+    kai_thread_id = kai_nthreads;
+    /* Never dispatches fibers, but keeps the scheduler threads uniform: a
+     * fault here reaches the handler instead of compounding on this stack. */
+    kai_install_thread_sigaltstack();
+    kai_rc_ledger_register();
+    for (;;) {
+        if (kai_sched_shutting_down) break;
+        kai_reactor_wait();
+    }
+    kai_rc_ledger_fold();
+    return NULL;
+}
+
+/* CPUs this process may actually run on. sysconf reports the whole
+ * machine, which over-subscribes a process pinned by an affinity mask
+ * (containers, CI runners), so the mask wins where it exists. */
+static int kai_host_ncpu(void) {
+#if defined(__linux__)
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof set, &set) == 0) {
+        int n = CPU_COUNT(&set);
+        if (n > 0) return n;
+    }
+#endif
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int) n : 1;
+}
+
+/* Ceiling on the *implicit* default only. Past this the per-process cost
+ * of spawning workers outgrows the scaling they buy, and a short-lived
+ * program on a many-core host pays it for nothing. An explicit
+ * KAI_THREADS is honoured up to KAI_MAX_THREADS-1. */
+#define KAI_DEFAULT_MAX_THREADS 32
+
+/* Parse KAI_THREADS. Unset → the host CPU count (capped); an explicit
+ * value wins, with "0"/"1"/garbage → 1, the single-thread escape hatch.
+ * Any count is clamped to [1, KAI_MAX_THREADS-1] so the reactor thread's
+ * id (kai_nthreads) stays a valid slot index. */
+static int kai_read_nthreads(void) {
+    const char *e = getenv("KAI_THREADS");
+    if (!e || !*e) {
+        int n = kai_host_ncpu();
+        if (n > KAI_DEFAULT_MAX_THREADS) n = KAI_DEFAULT_MAX_THREADS;
+        if (n > KAI_MAX_THREADS - 1) n = KAI_MAX_THREADS - 1;
+        return n < 1 ? 1 : n;
+    }
+    long n = strtol(e, NULL, 10);
+    if (n <= 1) return 1;
+    if (n > KAI_MAX_THREADS - 1) n = KAI_MAX_THREADS - 1;
+    return (int) n;
+}
+
+
+/* Run the program. At N=1 this is exactly `kai_main()` — no threads, no
+ * fibers spawned for main, byte-identical. At N>1 it starts the worker
+ * pool, runs kai_main as a fiber on thread 0, drives thread 0's
+ * scheduler loop until the program quiesces, then joins the workers. */
+KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    kai_nthreads = kai_read_nthreads();
+    if (kai_nthreads <= 1) {
+        kai_nthreads = 1;
+        KAI_TSAN_BIND_ROOT();
+        return user_main();
+    }
+
+    kai_user_main_fn = user_main;
+    /* The Char cache is classified immortal — shared by every thread, never
+     * mutated after init. Lazy warming breaks the second half of that: the
+     * first `kai_char(c)` on a worker writes 128 cells while other workers
+     * are already reading them. Warm it here instead, before any worker
+     * exists, so pthread_create publishes it and it really is read-only for
+     * the rest of the process. At N=1 the lazy path still applies. */
+    kai_char_cache_warm();
+    for (int i = 0; i < kai_nthreads; i++) {
+        pthread_mutex_init(&kai_sched_slots[i].mu, NULL);
+        kai_sched_slots[i].steal_head = NULL;
+        kai_sched_slots[i].steal_tail = NULL;
+        kai_sched_slots[i].live = 0;
+    }
+    /* F2 — the reactor mutex guards the wheel + waiter lists + parked_count,
+     * and the reactor thread must have its self-pipes open before it polls
+     * (kai_reactor_init is otherwise lazy, triggered by the first park). */
+    pthread_mutex_init(&kai_reactor_mu, NULL);
+    kai_reactor_init();
+    kai_thread_id = 0;
+    kai_active_fiber_anchor();
+    kai_main_fiber.home_thread = 0;
+    kai_sched_slots[0].live = 1;
+
+    /* Spawn kai_main as a fiber on thread 0's deque. It gets a main-thread
+     * stack, not a fiber one: raising the thread count must not shrink the
+     * stack budget a working program already had. */
+    KaiFiber *root = (KaiFiber *) calloc(1, sizeof(KaiFiber));
+    if (!root) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    root->home_thread = 0;
+    /* Thread 0 IS the OS thread the process entered `main` on, so pinning
+     * the entry fiber here is what makes `main` observably main-thread —
+     * the guarantee a thread-affine C library (AppKit/GLFW/SDL/GTK) needs
+     * from its caller. Every fiber `main` spawns stays freely stealable. */
+    root->pinned_main = 1;
+    root->evidence_top = NULL;
+    kai_fiber_init_ctx_sized(root, kai_main_fiber_stack_size());
+    /* Re-point its makecontext entry from the generic trampoline to the
+     * bootstrap trampoline (kai_fiber_init_ctx installed the former). */
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    makecontext(&root->ctx, kai_bootstrap_trampoline, 0);
+#if defined(__APPLE__) || defined(__clang__)
+#  pragma clang diagnostic pop
+#endif
+    root->state = KAI_FIBER_READY;
+    kai_sched_enqueue(root);
+
+    /* Start workers 1..N-1. */
+    for (int i = 1; i < kai_nthreads; i++) {
+        if (pthread_create(&kai_worker_threads[i], NULL,
+                           kai_worker_thread_main, (void *) (intptr_t) i) != 0) {
+            fprintf(stderr, "kai: scheduler pthread_create failed: %s\n",
+                    strerror(errno));
+            exit(1);
+        }
+    }
+
+    /* F2 — start the dedicated reactor thread. */
+    if (pthread_create(&kai_reactor_thread, NULL, kai_reactor_thread_main, NULL) != 0) {
+        fprintf(stderr, "kai: reactor pthread_create failed: %s\n", strerror(errno));
+        exit(1);
+    }
+
+
+    /* Thread 0 runs the scheduler loop (its kai_main_fiber is the loop
+     * context) until the bootstrap trampoline flips the shutdown flag. */
+    kai_worker_loop();
+
+    /* Shutdown: the bootstrap trampoline set kai_sched_shutting_down; poke
+     * the reactor out of poll() so it observes the flag and exits. */
+    kai_reactor_wake();
+    for (int i = 1; i < kai_nthreads; i++) pthread_join(kai_worker_threads[i], NULL);
+    pthread_join(kai_reactor_thread, NULL);
+    free(root);
+    return kai_user_main_result;
+}
+#endif
+
+/* m8.x: default Spawn handlers backed by the cooperative scheduler.
+ * spawn(thunk)        — alloc fiber + enqueue; thunk runs later.
+ * await(fiber)        — park on the fiber's awaiter chain until DONE.
+ * yield()             — rotate run queue (no-op if alone).
+ * select([fiber])     — race: park on every candidate, return the first
+ *                       to terminate, request cancel on the losers.
+ * cancel(fiber)       — set cancel_requested; delivery is Phase 3.
+ *
+ * Op-argument ABI (all effects, not just Spawn): a call site hands each
+ * op argument over as an OWNED reference, and the handler entry point
+ * consumes it. For a compiler-emitted user clause that is the ordinary
+ * function-parameter discipline; for a `$extern_handler` bridge the
+ * release lives in the generated shim (`_kai_default_<eff>_<op>_shim`
+ * in the C backend, `kaix_default_<eff>_<op>` in the native one). The
+ * bodies below therefore BORROW their args and `kai_incref` whatever
+ * they retain — same pattern `kai_core_map` documents. A body that
+ * forwards to a consuming `kai_core_*` helper increfs into that call,
+ * since the shim still owes one release.
+ *
+ * Spec: docs/fibers-impl.md §*Yield-point list* and §*Trampoline*. */
+KAI_SCHED_FN KaiValue *kai_default_spawn_yield(void *self, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    kai_sched_yield();
+    return kai_cont_resume(k, kai_unit());
+}
+#endif
+
+/* Shared spawn body for Spawn.spawn and spawn_actor. Builds the fiber,
+ * optionally stamps `stamp_mb` as its mailbox BEFORE enqueue (so the
+ * owner is wired before the child can be stolen and before this returns),
+ * and returns the RC=2 Fiber[T] wrapper. */
+static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMailbox *stamp_mb) {
+    if (!thunk || thunk->tag != KAI_CLOSURE) {
+        fprintf(stderr, "kai: Spawn.spawn called with non-closure value\n");
+        exit(1);
+    }
+    KaiFiber *f = (KaiFiber *) calloc(1, sizeof(KaiFiber));
+    if (!f) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    f->parent       = kai_current_fiber();
+    /* The fiber owns its thunk for its whole lifetime. At N=1 an incref
+     * suffices (one thread). At N>1 the fiber may run on another
+     * scheduler thread, so sharing the closure would race its non-atomic
+     * rc (and its captures') between the spawner and the fiber body —
+     * exactly the cross-thread-share the message copy path forbids. Copy
+     * the thunk into a single-owner tree that migrates with the fiber. */
+    if (kai_nthreads > 1) {
+        f->thunk = kai_deep_copy_cross(thunk);
+    } else {
+        /* incref to retain a ref the fiber owns; the caller-side ref is
+         * still the caller's to manage (Perceus decrefs at call-site exit). */
+        f->thunk = kai_incref(thunk);
+    }
+    /* Capabilities do not cross a spawn: a value-transportable effect
+     * rides the child thunk's own evidence frame, and a fiber-local
+     * effect resolves against this fiber's own disposition (cancel pad,
+     * link set, mailbox, nursery), never the parent's. The child starts
+     * with an empty evidence stack rather than inheriting the parent's —
+     * inheriting it would carry a parent handler whose *Ev struct lives
+     * on a stack frame the parent overwrites once it returns. */
+    f->evidence_top          = NULL;
+    kai_fiber_init_ctx(f);
+    /* Stamp the actor mailbox onto the fiber before it becomes runnable:
+     * owner_fiber must be set here, not after enqueue, or a Monitor/Link
+     * in the spawner would resolve a NULL owner and a stolen child could
+     * run (and free the mailbox) before the write landed. */
+    if (stamp_mb) {
+        stamp_mb->owner_fiber = f;
+        f->mailbox            = stamp_mb;
+    }
+    /* R4 fix — allocate the wrapper before enqueue so the scheduler
+     * can hold its own incref on the value. Without this second ref a
+     * `let _ = fiber_spawn(…)` discard would drop the wrapper to
+     * RC=0 while the struct is still in the ready queue, and the
+     * trampoline would later run on freed memory. The wrapper RC
+     * therefore starts at 2: one for the caller (the user-visible
+     * Fiber[T] handle) and one for the scheduler (released in the
+     * trampoline's DONE/CANCELLED tail via `kai_decref(self->value)`). */
+    KaiValue *v = kai_fiber_value(f);  /* RC=1, sets f->value */
+    kai_incref(v);                     /* RC=2, scheduler's own ref */
+    /* Issue #959 — register on the spawning fiber's innermost open
+     * nursery. The scope takes its own ref (RC=3 here) so a discarded
+     * `Fiber[T]` handle cannot free the wrapper before `nursery_exit`
+     * joins this child; the scope releases it during the join walk. */
+    KaiNursery *scope = kai_current_fiber()->nursery_top;
+    if (scope) {
+        kai_incref(v);
+        f->scope_nursery      = scope;
+        f->scope_sibling_next = scope->children_head;
+        scope->children_head  = f;
+    }
+    f->state = KAI_FIBER_READY;
+    kai_sched_enqueue(f);
+    return v;
+}
+
+KAI_SCHED_FN KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    KaiValue *v = kai_spawn_fiber_stamped(thunk, NULL);
+    return kai_cont_resume(k, v);
+}
+#endif
+
+/* Hand a terminated fiber's result to an awaiter.
+ *
+ * `f->result` is produced on `f`'s own thread and the Fiber[T] wrapper goes
+ * on owning it, so an awaiter that just increfs puts one non-atomic rc under
+ * two threads — and two awaiters woken on different threads race each other
+ * outright, since the terminate walk unparks the whole chain. The result is a
+ * value crossing a thread boundary exactly like a message, so it gets the
+ * same treatment: at N>1 the awaiter takes a private copy and the producer's
+ * reference is left alone. The wrapper is kept alive by the awaiter's own
+ * Fiber[T] handle, so reading it here is safe.
+ *
+ * A CANCELLED target may have unwound before assigning, leaving `result`
+ * NULL; the caller's continuation still needs a well-typed value, so that
+ * yields unit. At N=1 the incref is unchanged. */
+static KaiValue *kai_fiber_result_for_awaiter(KaiFiber *f) {
+    if (!f->result) return kai_unit();
+    if (kai_nthreads > 1) return kai_deep_copy_cross(f->result);
+    return kai_incref(f->result);
+}
+
+KAI_SCHED_FN KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    if (!fib_v || fib_v->tag != KAI_FIBER || !fib_v->as.fib) {
+        fprintf(stderr, "kai: Spawn.await called on non-fiber value\n");
+        exit(1);
+    }
+    KaiFiber *f = fib_v->as.fib;
+    /* Issue #679: a fiber cancelled mid-flight (e.g. cancelled
+     * while parked in NetTcp.accept) terminates in state
+     * CANCELLED, not DONE. Treat both as "terminated" for the
+     * purposes of awaiting. The fiber's `result` is set to
+     * kai_unit() on cancel-driven unwind (see the cancel pad
+     * setup). */
+    /* Check-and-link under f's slot lock so the terminate walk cannot
+     * snapshot the chain between our state read and our link (the lost
+     * wakeup). Loop: a resume is a hint, not a proof — re-check the
+     * terminal state and re-park on a spurious wake. */
+    for (;;) {
+        int f_hl = 0;
+        if (kai_nthreads > 1) f_hl = kai_fiber_slot_lock(f);
+        int terminal = (f->state == KAI_FIBER_DONE || f->state == KAI_FIBER_CANCELLED);
+        KaiFiber *me = kai_current_fiber();
+        if (terminal) kai_awaiter_unlink(f, me);
+        else          kai_awaiter_link_if_absent(f, me);
+        if (kai_nthreads > 1) kai_fiber_slot_unlock_at(f_hl);
+        if (terminal) break;
+        kai_sched_park();
+    }
+    return kai_cont_resume(k, kai_fiber_result_for_awaiter(f));
+}
+#endif
+
+KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    if (!fibs_v || (fibs_v->tag != KAI_CONS && fibs_v->tag != KAI_NIL)) {
+        fprintf(stderr, "kai: Spawn.select called on non-list value\n");
+        exit(1);
+    }
+    if (fibs_v->tag == KAI_NIL) {
+        fprintf(stderr, "kai: Spawn.select called on empty list\n");
+        exit(1);
+    }
+    /* Collect the candidates once: the list is walked repeatedly below and
+     * a cons cell read is not cheaper than an array index. */
+    int n = 0;
+    for (KaiValue *c = fibs_v; kai_is_ptr(c) && c->tag == KAI_CONS; c = c->as.cons.tail) n++;
+    KaiFiber  *fibs_stack[8];
+    KaiFiber **fibs = fibs_stack;
+    if (n > 8) {
+        fibs = (KaiFiber **) malloc((size_t) n * sizeof(KaiFiber *));
+        if (!fibs) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    }
+    {
+        int i = 0;
+        for (KaiValue *c = fibs_v; kai_is_ptr(c) && c->tag == KAI_CONS; c = c->as.cons.tail) {
+            KaiValue *elem = c->as.cons.head;
+            if (!elem || elem->tag != KAI_FIBER || !elem->as.fib) {
+                fprintf(stderr, "kai: Spawn.select: list element is not a fiber\n");
+                exit(1);
+            }
+            fibs[i++] = elem->as.fib;
+        }
+    }
+
+    /* Race. The selector links a node into EVERY candidate's select chain,
+     * so whichever terminates first wakes it; on resume it re-scans and
+     * takes the first candidate found terminated. Order within one wake is
+     * list order, which only decides ties — two fibers that finished before
+     * the selector ran are both winners by any honest reading.
+     *
+     * Link-then-recheck is the same lost-wakeup discipline await uses, one
+     * candidate at a time: a fiber that terminates while we are still
+     * linking later candidates has already put us on its chain (so the
+     * unpark is recorded, not lost) or set its terminal state before we
+     * read it (so the rescan sees it and we never park). */
+    KaiSelectWaiter  nodes_stack[8];
+    KaiSelectWaiter *nodes = nodes_stack;
+    if (n > 8) {
+        nodes = (KaiSelectWaiter *) malloc((size_t) n * sizeof(KaiSelectWaiter));
+        if (!nodes) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    }
+    KaiFiber *me     = kai_current_fiber();
+    KaiFiber *winner = NULL;
+    for (int i = 0; i < n; i++) { nodes[i].waiter = me; nodes[i].next = NULL; }
+
+    for (;;) {
+        int linked_upto = 0;
+        for (int i = 0; i < n && !winner; i++) {
+            KaiFiber *f = fibs[i];
+            int hl = 0;
+            if (kai_nthreads > 1) hl = kai_fiber_slot_lock(f);
+            if (f->state == KAI_FIBER_DONE || f->state == KAI_FIBER_CANCELLED) {
+                winner = f;
+            } else {
+                kai_select_link(f, &nodes[i]);
+                linked_upto = i + 1;
+            }
+            if (kai_nthreads > 1) kai_fiber_slot_unlock_at(hl);
+        }
+        /* Park only while still linked: a candidate that terminates now
+         * finds us on its chain and the unpark is recorded rather than
+         * lost. Unlinking before the park would leave nobody able to wake
+         * us — the whole race would hang on the first sleeper. */
+        if (!winner) kai_sched_park();
+        /* Unlink every node we linked this round, whether we won, lost the
+         * tie, or woke spuriously: the nodes live in this frame, so no
+         * candidate may hold a pointer into it past the return, and the
+         * next round must be able to re-link the same node cleanly. */
+        for (int i = 0; i < linked_upto; i++) {
+            KaiFiber *f = fibs[i];
+            int hl = 0;
+            if (kai_nthreads > 1) hl = kai_fiber_slot_lock(f);
+            kai_select_unlink(f, &nodes[i]);
+            if (kai_nthreads > 1) kai_fiber_slot_unlock_at(hl);
+        }
+        if (winner) break;
+    }
+
+    /* Cancel the losers. `select` returns one result and the nursery joins
+     * every child at scope exit, so a loser left running would stall the
+     * scope on work whose result nobody can observe. Delivery is the
+     * ordinary cooperative path: the flag lands and the fiber unwinds at
+     * its next yield point; a loser parked on the reactor gets detached and
+     * unparked so it reaches that point instead of sleeping until an
+     * external event it no longer needs. */
+    for (int i = 0; i < n; i++) {
+        KaiFiber *f = fibs[i];
+        if (f == winner) continue;
+        if (f->state == KAI_FIBER_DONE || f->state == KAI_FIBER_CANCELLED) continue;
+        f->cancel_requested = 1;
+        if (kai_reactor_detach_fiber(f)) kai_sched_unpark(f);
+    }
+
+    KaiValue *res = kai_fiber_result_for_awaiter(winner);
+    if (nodes != nodes_stack) free(nodes);
+    if (fibs  != fibs_stack)  free(fibs);
+    return kai_cont_resume(k, res);
+}
+#endif
+
+/* Issue #679: detach `target` from whatever reactor waiter list it
+ * sits on (if any). Returns 1 if the fiber was found and removed
+ * from some list, 0 if it was already runnable / DONE / not parked
+ * on the reactor. The caller is responsible for calling
+ * `kai_sched_unpark(target)` afterwards so the scheduler reschedules
+ * it; we keep detach and unpark separate so other call sites
+ * (timer expiry, socket-ready drain) that already manage their own
+ * resume sequencing can reuse the detach without double-unparking.
+ *
+ * The walk is O(N) per list; the lists are short in practice
+ * (per-fiber-arena means typically one waiter per fd). All seven
+ * lists are checked because a fiber lives on exactly one — the
+ * waiter discipline never enqueues the same fiber twice. */
+static int kai_reactor_detach_fiber(KaiFiber *target) {
+    if (!target) return 0;
+    /* F2: walk + unlink under kai_reactor_mu — the reactor thread and other
+     * schedulers touch these same lists. A target that stamped a park but
+     * has not been committed yet is not on any list here (returns 0); the
+     * commit path re-checks the cancel flag under this same lock and aborts
+     * the park, so the flag set before this walk is never slept through.
+     * reactor_mu is released before the caller's unpark takes a slot lock,
+     * so the two locks are never nested. */
+    kai_reactor_lock();
+    KaiFiber **heads[] = {
+        &kai_reactor_socket_read_waiters,
+        &kai_reactor_socket_write_waiters,
+        &kai_reactor_pid_waiters,
+        &kai_reactor_filepool_waiters,
+        &kai_reactor_timer_head,
+        &kai_reactor_stdin_waiter,
+        &kai_reactor_signal_waiter,
+    };
+    const int n_heads = (int) (sizeof(heads) / sizeof(heads[0]));
+    int found = 0;
+    for (int h = 0; h < n_heads && !found; ++h) {
+        KaiFiber **link = heads[h];
+        while (*link) {
+            if (*link == target) {
+                *link = target->reactor_next;
+                target->reactor_next = NULL;
+                target->reactor_wait_pid = 0;
+                target->reactor_fired = 1;
+                kai_reactor_parked_count--;
+                found = 1;
+                break;
+            }
+            link = &(*link)->reactor_next;
+        }
+    }
+    kai_reactor_unlock();
+    return found;
+}
+
+KAI_SCHED_FN KaiValue *kai_default_spawn_cancel(void *self, KaiValue *fib_v, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    if (fib_v && fib_v->tag == KAI_FIBER && fib_v->as.fib) {
+        KaiFiber *target = fib_v->as.fib;
+        target->cancel_requested = 1;
+        /* Issue #679: if the target is parked on a reactor waiter
+         * list (e.g. NetTcp.accept blocked on the listener fd, recv
+         * blocked on read-ready, timer waiting for a deadline), the
+         * flag alone is not enough — the reactor would never wake
+         * the fiber until external activity arrived, and the cancel
+         * delivery point is the next op-call boundary, which the
+         * parked fiber never reaches. Detach the target from its
+         * waiter list and unpark it. On resume the syscall retry
+         * loop at the park site (or the next op-call lookup
+         * prologue) observes `cancel_requested` and unwinds via
+         * the Cancel discipline.
+         *
+         * Detach is a no-op when the target is already runnable /
+         * DONE / parked outside the reactor — the cancel flag still
+         * lands and is observed at the next op boundary the
+         * existing pre-#679 path. */
+        if (kai_reactor_detach_fiber(target)) {
+            kai_sched_unpark(target);
+        }
+        /* Delivery (inject Cancel.raise() at the target's next
+         * op-call boundary) lands in Phase 3 via the lookup-prologue
+         * hook in kai_evidence_lookup_node. The flag-only behaviour
+         * is the contract Spawn.cancel commits to; only the *visible
+         * effect* changes when Phase 3 lands. */
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+#endif
+
+/* Tier 2 trap-exit: set the current fiber's trap_exit flag from a
+ * Bool argument. With trap_exit=1, a linked peer's termination
+ * delivers a "Normal"/"Crashed" string to the fiber's mailbox
+ * instead of setting cancel_requested. The fiber must already
+ * have a mailbox (typically via with_mailbox) for the delivery to
+ * land; without one, the propagation falls back to cancel_requested.
+ * Spec: docs/actors.md §*Trap-exit semantics*. */
+KAI_SCHED_FN KaiValue *kai_default_spawn_set_trap_exit(void *self, KaiValue *on, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    KaiFiber *f = kai_current_fiber();
+    int v = (on && on->tag == KAI_BOOL && on->as.b) ? 1 : 0;
+    f->trap_exit = v;
+    return kai_cont_resume(k, kai_unit());
+}
+#endif
+
+/* Issue #959 — open a structured-concurrency scope on the current
+ * fiber. Subsequent `Spawn.spawn` calls register their child on this
+ * scope's children list; `nursery_exit` joins them all. Scopes nest:
+ * the new scope's `parent` is the fiber's previous `nursery_top`. */
+KAI_SCHED_FN KaiValue *kai_default_spawn_scope_enter(void *self, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    KaiFiber *f = kai_current_fiber();
+    KaiNursery *n = (KaiNursery *) calloc(1, sizeof(KaiNursery));
+    if (!n) { fprintf(stderr, "kai: out of memory (nursery scope)\n"); exit(1); }
+    n->children_head = NULL;
+    n->parent        = f->nursery_top;
+    f->nursery_top   = n;
+    return kai_cont_resume(k, kai_unit());
+}
+#endif
+
+/* Park the current fiber on `child`'s awaiter chain until it reaches
+ * DONE or CANCELLED. Mirrors the await park; no result is read — the
+ * scope joins for completion, not for the value. */
+static void kai_nursery_join_child(KaiFiber *child) {
+    /* Check-and-link under child's slot lock so its terminate walk cannot
+     * snapshot the chain between our state read and our link (the lost
+     * wakeup that stranded a nursery join at N>1). Loop: only the child's
+     * terminal state ends the join; a spurious resume re-parks. */
+    for (;;) {
+        int child_hl = 0;
+        if (kai_nthreads > 1) child_hl = kai_fiber_slot_lock(child);
+        int terminal = (child->state == KAI_FIBER_DONE || child->state == KAI_FIBER_CANCELLED);
+        KaiFiber *me = kai_current_fiber();
+        if (terminal) kai_awaiter_unlink(child, me);
+        else          kai_awaiter_link_if_absent(child, me);
+        if (kai_nthreads > 1) kai_fiber_slot_unlock_at(child_hl);
+        if (terminal) return;
+        kai_sched_park();
+    }
+}
+
+/* Cancel every not-yet-terminated child still on the scope list: set
+ * the flag, and if the child is parked on the reactor, detach + unpark
+ * so the cancel is delivered at its next op boundary. Idempotent, so
+ * the eager walk and the scope_exit walk may both visit a sibling.
+ * `skip` excludes the failing child itself, which is mid-trampoline
+ * and must not be flagged as a requested cancellation. */
+static void kai_nursery_cancel_siblings(KaiFiber *head, KaiFiber *skip) {
+    for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
+        if (c == skip
+            || c->state == KAI_FIBER_DONE || c->state == KAI_FIBER_CANCELLED) {
+            continue;
+        }
+        c->cancel_requested = 1;
+        if (kai_reactor_detach_fiber(c)) {
+            kai_sched_unpark(c);
+        }
+    }
+}
+
+/* Eager cancel-on-fail: a child terminating CANCELLED without a
+ * requested cancellation cancels its siblings here, at its own
+ * termination, instead of when the owner's join loop reaches it.
+ * Runs before the terminal state store — see `scope_nursery` for why
+ * that keeps the scope pointer alive across threads. The latch makes
+ * one failing child the sole walker; a loser's failure is already
+ * recorded, so its skipped walk changes nothing. */
+static void kai_nursery_propagate_failure(KaiFiber *self) {
+    KaiNursery *scope = self->scope_nursery;
+    if (!scope || self->cancel_requested) return;
+    KaiFiber *expected = NULL;
+    if (!atomic_compare_exchange_strong(&scope->failed_child, &expected, self)) {
+        return;
+    }
+    kai_nursery_cancel_siblings(scope->children_head, self);
+}
+
+/* Issue #959 — close the innermost scope: join every child, then on
+ * the first child that terminated CANCELLED cancel the remaining
+ * siblings, finish the drain (waiting their unwind), release the
+ * scope's refs, and re-raise via the current fiber's cancel_pad so
+ * the failure propagates out of the nursery body. On a clean drain
+ * just release the refs and return unit. */
+KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    KaiFiber   *f     = kai_current_fiber();
+    KaiNursery *scope = f->nursery_top;
+    if (!scope) {
+        /* No open scope — `nursery_exit` without a matching enter is a
+         * runtime invariant violation, but degrade to a no-op rather
+         * than crash. */
+        return kai_cont_resume(k, kai_unit());
+    }
+    /* Pop the scope first so children joined below (which run on the
+     * scheduler) see the enclosing scope, not this closing one. */
+    f->nursery_top = scope->parent;
+
+    KaiFiber *head   = scope->children_head;
+    int       failed = 0;
+    for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
+        kai_nursery_join_child(c);
+        /* A child counts as a *failure* only if it terminated
+         * CANCELLED without anyone requesting its cancellation — i.e.
+         * it raised `Cancel` on its own or hit a runtime trap. A child
+         * cancelled on request (`Spawn.cancel` from a sibling, or the
+         * cancel_siblings walk below) terminates CANCELLED with
+         * `cancel_requested` set and is an expected, non-propagating
+         * outcome. */
+        if (!failed && c->state == KAI_FIBER_CANCELLED && !c->cancel_requested) {
+            failed = 1;
+            kai_nursery_cancel_siblings(head, NULL);
+        }
+    }
+    /* A failure the loop's flag test cannot see: a child that failed
+     * concurrently with a peer's cancel walk terminates flagged, and
+     * only the latch records it. All children are joined by now, so
+     * no further cancel walk is needed. */
+    if (!failed && scope->failed_child != NULL) failed = 1;
+    /* Release the scope's refs and clear the intrusive links. The
+     * children are all terminated now; their wrappers may still be
+     * held by the user's `Fiber[T]` handles, so decref (not free). */
+    KaiFiber *c = head;
+    while (c) {
+        KaiFiber *nx = c->scope_sibling_next;
+        c->scope_sibling_next = NULL;
+        c->scope_nursery      = NULL;
+        if (c->value) kai_decref(c->value);
+        c = nx;
+    }
+    free(scope);
+
+    if (failed) {
+        /* The re-raise is a `Cancel.raise()` like any other: it walks
+         * this fiber's handler stack first, so a `with Cancel`
+         * enclosing the nursery runs its clause. Only with no user
+         * handler in scope does it take a terminal path — the
+         * trampoline's cancel pad, or, at the program root where no
+         * pad exists, banner + exit. */
+        f->cancel_delivered = 1;
+        (void) kai_cancel_dispatch_user_handler();
+        if (f->cancel_pad_set) {
+            kai_evidence_unwind_all();
+            longjmp(f->cancel_pad, 1);
+            /* Unreachable. */
+        }
+        fputs("kai: nursery child cancelled; no survivors\n", stderr);
+        exit(1);
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+#endif
+
+/* m8 #4 + Phase 3: default Cancel.raise handler. Doc B §`Cancel`/
+ * Default handler: an unhandled Cancel.raise() unwinds the fiber
+ * cleanly (the runtime delivers "no silent survivors"). For a
+ * spawned fiber whose trampoline cancel_pad is live, longjmp to it
+ * — same path as the yield-point hook, marks state CANCELLED and
+ * resumes the scheduler. For main_fiber (no pad — main never runs
+ * through the trampoline), fall back to the m8 v1 behaviour: banner
+ * + exit(0). Exit code 0 because cancellation at the program root
+ * is an expected termination, not a programmer error. */
+static KaiValue *kai_default_cancel_raise(void *self, KaiCont *k) {
+    (void) self;
+    (void) k;
+    KaiFiber *f = kai_current_fiber();
+    if (f->cancel_pad_set) {
+        f->cancel_delivered = 1;
+        longjmp(f->cancel_pad, 1);
+        /* Unreachable. */
+    }
+    fputs("kai: Cancel.raise: unhandled (fiber cancelled)\n", stderr);
+    exit(0);
+}
+
+/* Phase 5 — Link runtime registry.
+ *
+ * `Link.link(peer)` registers a bidirectional link between the
+ * current fiber and the fiber that owns `peer`'s mailbox. On
+ * either fiber's termination, the trampoline walks the linked
+ * chain and sets cancel_requested on each peer (delivered at
+ * that peer's next yield-point hook).
+ *
+ * v1 simplifications:
+ *  - `Pid[Nothing]` is the type-erased existential pid the typer
+ *    uses for link/monitor ops; we resolve via `peer->as.mb->owner_fiber`.
+ *  - Self-links (a == b) are dropped.
+ *  - If the peer mailbox has no owner_fiber (mailbox alloc'd
+ *    outside any fiber context, e.g. before runtime init), the
+ *    link is silently dropped — caller cannot observe failure
+ *    because the op is `Unit`.
+ *  - Duplicate links between the same pair are not de-dup'd; the
+ *    propagation walk sets cancel_requested idempotently, so the
+ *    duplicates are harmless beyond the wasted KaiLinkNode.
+ *  - Spec specifies "crash → propagate cancel"; v1 propagates on
+ *    both DONE and CANCELLED termination (BEAM-style trap-exit
+ *    semantics queued for post-MVP). */
+static void kai_link_add_bidirectional(KaiFiber *a, KaiFiber *b) {
+    if (!a || !b || a == b) return;
+    KaiLinkNode *na = (KaiLinkNode *) calloc(1, sizeof(KaiLinkNode));
+    KaiLinkNode *nb = (KaiLinkNode *) calloc(1, sizeof(KaiLinkNode));
+    if (!na || !nb) {
+        fprintf(stderr, "kai: out of memory (link)\n");
+        exit(1);
+    }
+    na->peer = b; na->next = a->linked_head; a->linked_head = na;
+    nb->peer = a; nb->next = b->linked_head; b->linked_head = nb;
+}
+
+/* Walk a fiber's linked chain at termination. For each peer:
+ *   - if peer has trap_exit=1 AND a current mailbox, push a
+ *     "Normal" or "Crashed" KAI_STR (per `reason`) into the
+ *     mailbox. The peer learns of the termination in user code
+ *     and is NOT cancelled.
+ *   - otherwise, set cancel_requested (the v1 default — delivered
+ *     at the peer's next yield-point hook).
+ * In either branch, remove our back-link from the peer's chain so
+ * the peer's own future termination doesn't re-enter our (now-
+ * freed) chain. Each KaiLinkNode is freed as the walk passes it. */
+/* Deliver a system message (link trap-exit reason, monitor pid) into a
+ * mailbox owned by an arbitrary fiber, consuming `msg`. Same copy rule as
+ * kai_core_mailbox_send: at N=1 a plain push (byte-identical), at N>1 an
+ * unconditional deep copy, because the peer's `home_thread` is not stable
+ * across the send and the peer's heap must stay single-threaded. */
+static void kai_deliver_to_mailbox(KaiMailbox *mb, KaiValue *msg) {
+    if (kai_nthreads > 1) {
+        KaiValue *copy = kai_deep_copy_cross(msg);
+        kai_decref(msg);
+        kai_mailbox_push_cross_thread(mb, copy);
+    } else {
+        kai_mailbox_push(mb, msg);
+    }
+}
+
+static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason) {
+    KaiLinkNode *ln = self->linked_head;
+    self->linked_head = NULL;
+    while (ln) {
+        KaiLinkNode *next = ln->next;
+        KaiFiber *peer = ln->peer;
+        if (peer) {
+            if (peer->trap_exit && peer->mailbox) {
+                /* Trap-exit delivery: push the reason string into the
+                 * peer's mailbox. The mailbox holds an owning ref on
+                 * each msg (kai_mailbox_push convention via
+                 * mailbox_send's incref). Wake any parked receiver
+                 * — that's exactly what kai_mailbox_push already does
+                 * via its recv_waiter handoff. */
+                if (reason == KAI_EXIT_TRAPPED) {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "Trapped: %s",
+                             self->trap_msg ? self->trap_msg : "runtime trap");
+                    kai_deliver_to_mailbox(peer->mailbox, kai_str_dyn(buf));
+                } else {
+                    const char *txt = (reason == KAI_EXIT_NORMAL) ? "Normal" : "Crashed";
+                    kai_deliver_to_mailbox(peer->mailbox, kai_str(txt));
+                }
+            } else {
+                peer->cancel_requested = 1;
+            }
+            /* Remove our back-link from peer's chain (linear scan;
+             * v1 chains are short — typically 1-2 entries). At N>1 a
+             * link straddling two threads mutates the peer's chain from
+             * this thread; cross-thread link teardown as a peer-owned
+             * system message (design §5) is deferred — the propagation
+             * signal itself is safe (cancel_requested is atomic, mailbox
+             * delivery copies), only the far chain edit is unsynchronized.
+             * Same-thread links (the N=1 case) are unaffected. */
+            KaiLinkNode **slot = &peer->linked_head;
+            while (*slot) {
+                if ((*slot)->peer == self) {
+                    KaiLinkNode *rm = *slot;
+                    *slot = rm->next;
+                    free(rm);
+                    break;
+                }
+                slot = &(*slot)->next;
+            }
+        }
+        free(ln);
+        ln = next;
+    }
+}
+
+static KaiValue *kai_default_link_link(void *self, KaiValue *peer, KaiCont *k) {
+    (void) self;
+    if (peer && peer->tag == KAI_PID && peer->as.mb && peer->as.mb->owner_fiber) {
+        kai_link_add_bidirectional(kai_current_fiber(), peer->as.mb->owner_fiber);
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* Issue #103 — return 1 if `f` is bidirectionally linked to any
+ * peer with `trap_exit=true`. Used by the Cancel-lookup hook below
+ * to decide whether `Cancel.raise()` must bypass user handlers and
+ * unwind the fiber directly so the trampoline tail can convert
+ * termination into a `"Crashed"` mailbox push on the trap-exit'd
+ * peer. The walk is short (link chains are typically 1-2 entries
+ * per the v1 simplifications above) so the per-op overhead of this
+ * check is negligible. */
+static int kai_fiber_has_trap_exit_link(KaiFiber *f) {
+    if (!f) return 0;
+    KaiLinkNode *ln = f->linked_head;
+    while (ln) {
+        if (ln->peer && ln->peer->trap_exit) return 1;
+        ln = ln->next;
+    }
+    return 0;
+}
+
+/* Issue #103 — bypass user-installed Cancel handlers when the
+ * current fiber is linked to a trap-exit'd peer. The contract
+ * documented in docs/actors.md §*Trap-exit semantics* requires
+ * that a supervisor with `fiber_set_trap_exit(true)` observes a
+ * linked child's termination through its mailbox, not through a
+ * Cancel handler in the call chain between the spawn point and
+ * the receive point. Without this hook, the child's `Cancel.raise()`
+ * walks its own fiber's evidence chain and lands in any
+ * `with Cancel { raise(_) -> ... }` installed inside the fiber —
+ * short-circuiting the trampoline-tail link propagation that would
+ * have pushed `"Crashed"` into the supervisor's mailbox.
+ *
+ * The check fires only when the cancel_pad is live (so we have
+ * somewhere to longjmp) and the fiber actually has a trap-exit'd
+ * link (so this is the linkage-relevant case the issue scopes the
+ * fix to). Plain Cancel.raise() inside a fiber that holds no
+ * trap-exit'd link still dispatches through user handlers as before,
+ * preserving the cleanup-on-cancel idiom for non-supervised work. */
+static void kai_check_trap_exit_cancel_bypass(void) {
+    KaiFiber *f = kai_current_fiber();
+    if (!f || !f->cancel_pad_set) return;
+    if (!kai_fiber_has_trap_exit_link(f)) return;
+    f->cancel_delivered = 1;
+    longjmp(f->cancel_pad, 1);
+    /* Unreachable. */
+}
+
+/* Tier 2 Monitor — append (observer, target_pid) onto target's
+ * monitor_head chain. The runtime takes one ref on target_pid via
+ * kai_incref so the value can be pushed into the observer's mailbox
+ * at termination time even if the user dropped their last
+ * reference. v1 does not deduplicate: monitoring the same pid twice
+ * produces two MonitorDown deliveries, matching the BEAM spec. */
+static void kai_monitor_add(KaiFiber *target, KaiFiber *observer, KaiValue *target_pid) {
+    KaiMonitorNode *n = (KaiMonitorNode *) malloc(sizeof(KaiMonitorNode));
+    if (!n) {
+        fprintf(stderr, "kai: out of memory (monitor)\n");
+        exit(1);
+    }
+    n->observer   = observer;
+    n->target_pid = target_pid;
+    if (target_pid) kai_incref(target_pid);
+    n->next       = target->monitor_head;
+    target->monitor_head = n;
+}
+
+/* Tier 2 Monitor — remove the *first* entry on target's chain that
+ * matches (observer, target_pid). Demonitor v1 takes the same pid
+ * value the user originally passed to monitor(...); equality is
+ * by KAI_PID mailbox-pointer identity (kai_op_eq_v's KAI_PID branch).
+ * Returns 1 on removal, 0 if no match. */
+static int kai_monitor_remove(KaiFiber *target, KaiFiber *observer, KaiValue *target_pid) {
+    KaiMonitorNode **slot = &target->monitor_head;
+    while (*slot) {
+        KaiMonitorNode *cur = *slot;
+        int pid_match = 1;
+        if (target_pid && cur->target_pid) {
+            /* both present — match on mailbox pointer. */
+            pid_match =
+                cur->target_pid->tag == KAI_PID &&
+                target_pid->tag == KAI_PID &&
+                cur->target_pid->as.mb == target_pid->as.mb;
+        }
+        if (cur->observer == observer && pid_match) {
+            *slot = cur->next;
+            if (cur->target_pid) kai_decref(cur->target_pid);
+            free(cur);
+            return 1;
+        }
+        slot = &cur->next;
+    }
+    return 0;
+}
+
+/* Tier 2 Monitor — walk the target fiber's monitor chain at
+ * termination. For each (observer, target_pid) entry, push
+ * target_pid into observer->mailbox and free the node.
+ * Observers without a current mailbox silently drop the
+ * delivery (matching trap-exit's "no-mailbox falls back" shape;
+ * monitors do not propagate faults so there is no cancel-side
+ * fallback to take). The cause distinction (Normal / Crashed) is
+ * not encoded in the v1 message — observers that need it can pair
+ * Monitor with Link+trap_exit, which delivers the
+ * "Normal"/"Crashed" string into the same mailbox. */
+static void kai_monitor_propagate_terminate(KaiFiber *self) {
+    KaiMonitorNode *mn = self->monitor_head;
+    self->monitor_head = NULL;
+    while (mn) {
+        KaiMonitorNode *next = mn->next;
+        KaiFiber *observer = mn->observer;
+        if (observer && observer->mailbox && mn->target_pid) {
+            /* The mailbox takes ownership of the incref we stamped at
+             * kai_monitor_add time; kai_deliver_to_mailbox consumes it
+             * (copying across a thread boundary when needed). */
+            kai_deliver_to_mailbox(observer->mailbox, mn->target_pid);
+        } else if (mn->target_pid) {
+            /* No mailbox to deliver into — drop our owning ref so
+             * the pid value can be reclaimed. */
+            kai_decref(mn->target_pid);
+        }
+        free(mn);
+        mn = next;
+    }
+}
+
+static KaiValue *kai_default_monitor_monitor(void *self, KaiValue *target, KaiCont *k) {
+    (void) self;
+    if (target && target->tag == KAI_PID && target->as.mb && target->as.mb->owner_fiber) {
+        kai_monitor_add(target->as.mb->owner_fiber, kai_current_fiber(), target);
+    }
+    /* v1 simplification — return the same Pid as the ref. The
+     * spec's `MonitorRef` is opaque; identifying the monitored
+     * fiber by its own pid is sufficient for demonitor and for the
+     * fixture-level "which fiber died" pattern. The user-facing
+     * type alias `MonitorRef = Pid[Nothing]` is pinned in
+     * docs/actors.md §*Monitors — unidirectional* (v1 simplification).
+     */
+    return kai_cont_resume(k, target);
+}
+
+static KaiValue *kai_default_monitor_demonitor(void *self, KaiValue *ref, KaiCont *k) {
+    (void) self;
+    if (ref && ref->tag == KAI_PID && ref->as.mb && ref->as.mb->owner_fiber) {
+        kai_monitor_remove(ref->as.mb->owner_fiber, kai_current_fiber(), ref);
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* (typedef forward-declared above, before KaiFiber.) */
+struct KaiEvidence {
+    KaiEvidence *parent;
+    const char  *eff_label;     /* canonical effect name (literal or interned). */
+    void        *handler;       /* *Ev<Eff> struct; opaque to the runtime. */
+    /* m7a #6e: handle's setjmp target + slot to deposit the discarded
+     * clause's return value. Set by kai_evidence_push_with_jmp; the
+     * op-call site reads them via kai_evidence_lookup_node when
+     * status stays UNRESUMED after the clause returns, then longjmps
+     * with the clause's value as the handle's body result. NULL when
+     * the handle didn't allocate a jmp_buf (the m7a #7 default
+     * handlers always resume, so they never longjmp). */
+    jmp_buf     *handle_jmp;
+    KaiValue   **discard_slot;
+    /* `finally { }`: run when the scope exits, however it exits. The
+     * thunk runs with `evidence_top` restored to this node's parent, so
+     * it sees the handlers that were live when the handler was
+     * installed — not those at the jump site, which are already dead.
+     * NULL on every handler that declares no `finally`, which is what
+     * keeps the unwind walk free for them. Returns the block's value,
+     * which the caller drops — the clause is run for its effect. */
+    KaiValue  *(*cleanup)(void *);
+    void        *cleanup_env;
+    /* Guards against running the same cleanup twice when a normal exit
+     * races an unwind through the same node. */
+    int          cleanup_done;
+};
+
+/* Run one node's `finally` in its installation-time evidence context.
+ * Restoring `evidence_top` to `node->parent` is load-bearing: a cleanup
+ * that performs an effect must dispatch against the handlers live when
+ * the node was pushed, otherwise it walks a chain of dead frames. */
+static void kai_evidence_run_cleanup(KaiEvidence *node) {
+    if (node == NULL || node->cleanup == NULL || node->cleanup_done) return;
+    node->cleanup_done = 1;
+    KaiFiber *f = kai_current_fiber();
+    KaiEvidence *saved = f->evidence_top;
+    f->evidence_top = node->parent;
+    KaiValue *r = node->cleanup(node->cleanup_env);
+    f->evidence_top = saved;
+    if (r != NULL) kai_decref(r);
+}
+
+/* Push an Evidence node onto the current fiber's stack. The caller
+ * owns the node's storage — typically `alloca`'d inside a compiled
+ * `handle` prologue. This primitive only fills its fields and
+ * links it as the new top. */
+static void kai_evidence_push(KaiEvidence *node, const char *eff_label, void *handler) {
+    KaiFiber *f = kai_current_fiber();
+    node->parent       = f->evidence_top;
+    node->eff_label    = eff_label;
+    node->handler      = handler;
+    node->handle_jmp   = NULL;
+    node->discard_slot = NULL;
+    node->cleanup      = NULL;
+    node->cleanup_env  = NULL;
+    node->cleanup_done = 0;
+    f->evidence_top    = node;
+}
+/* Connect a frame-supplied default node to its Ev WITHOUT pushing it on the
+ * evidence stack: the call site addresses this node directly through the frame,
+ * so it needs `handler` / `eff_label` set and the discard fields NULL, but no
+ * `parent` / `evidence_top` linkage (a default never discards, never unwinds). */
+static void kai_evidence_init_default(KaiEvidence *node, const char *eff_label, void *handler) {
+    node->parent       = NULL;
+    node->eff_label    = eff_label;
+    node->handler      = handler;
+    node->handle_jmp   = NULL;
+    node->discard_slot = NULL;
+    node->cleanup      = NULL;
+    node->cleanup_env  = NULL;
+    node->cleanup_done = 0;
+}
+
+/* m7a #6e: like kai_evidence_push but also stamps the handle's
+ * setjmp/longjmp landing pad. The op-call site uses the node's
+ * `handle_jmp` to abandon the body when the clause discards
+ * `resume`. Default handlers (m7a #7) always resume, so they call
+ * the simpler push variant. */
+static void kai_evidence_push_with_jmp(KaiEvidence *node, const char *eff_label,
+                                        void *handler, jmp_buf *jmp,
+                                        KaiValue **discard_slot) {
+    KaiFiber *f = kai_current_fiber();
+    node->parent       = f->evidence_top;
+    node->eff_label    = eff_label;
+    node->handler      = handler;
+    node->handle_jmp   = jmp;
+    node->discard_slot = discard_slot;
+    node->cleanup      = NULL;
+    node->cleanup_env  = NULL;
+    node->cleanup_done = 0;
+    f->evidence_top    = node;
+}
+
+/* Arm a pushed node's `finally`. Separate from the push so the common
+ * handler — no `finally` — keeps the existing two-call prologue and the
+ * cleanup fields stay NULL. */
+static void kai_evidence_set_cleanup(KaiEvidence *node, KaiValue *(*fn)(void *), void *env) {
+    node->cleanup      = fn;
+    node->cleanup_env  = env;
+    node->cleanup_done = 0;
+}
+
+/* Pop the topmost Evidence node. The compiled `handle` epilogue
+ * always pairs with a matching push (Doc C §*Per-fiber isolation*
+ * balance invariant). Pop on an empty stack is a compiler bug; it
+ * silently no-ops here so a malformed prologue/epilogue cannot
+ * corrupt unrelated memory. */
+static void kai_evidence_pop(void) {
+    KaiFiber *f = kai_current_fiber();
+    if (f->evidence_top != NULL) {
+        f->evidence_top = f->evidence_top->parent;
+    }
+}
+
+/* Unwind the evidence stack past `node` — the abandon path, where a
+ * clause discarded `resume` and the op site longjmps to `node`'s handle.
+ * That jump destroys every frame the handle body pushed, `node` included,
+ * so popping a single entry is only correct when `node` is already the
+ * top. With a resumed handler frame still between the op site and its
+ * handle, a lone pop leaves the dead node linked as top: the next handle
+ * to reuse that stack storage links itself as its own parent, and every
+ * later lookup walks the resulting cycle forever. */
+static void kai_evidence_unwind_to(KaiEvidence *node) {
+    if (node == NULL) return;
+    /* Run every `finally` between the jump site and the target, innermost
+     * first, before the chain is truncated. `node` itself is included:
+     * the jump lands past its handler, so its scope is exiting too.
+     * Bounded by the same chain the truncation already walked implicitly;
+     * a handler with no `finally` costs one NULL check. */
+    KaiFiber *f = kai_current_fiber();
+    KaiEvidence *stop = node->parent;
+    for (KaiEvidence *n = f->evidence_top; n != NULL && n != stop; n = n->parent) {
+        kai_evidence_run_cleanup(n);
+    }
+    f->evidence_top = stop;
+}
+
+/* Cancellation longjmps straight to the fiber's `cancel_pad` without a
+ * target node, so it needs the whole remaining chain drained. */
+static void kai_evidence_unwind_all(void) {
+    KaiFiber *f = kai_current_fiber();
+    for (KaiEvidence *n = f->evidence_top; n != NULL; n = n->parent) {
+        kai_evidence_run_cleanup(n);
+    }
+    f->evidence_top = NULL;
+}
+
+/* Walk the current fiber's stack and return the innermost handler
+ * for `eff_label`. Returns NULL if no matching handler is in
+ * scope — which would indicate a compiler bug, since the type
+ * checker rejects unhandled effects. The fast path is pointer
+ * equality (most labels are literal strings shared at the call
+ * site); strcmp is the fallback for edge cases like dynamically-
+ * generated label strings. */
+
+/* Issue #682 — mirror of the compiler-emitted `struct EvCancel` so
+ * the runtime can dispatch `Cancel.raise()` synthetically when a
+ * sibling-initiated cancel lands at a yield point with a user
+ * `with Cancel { raise(_) -> ... }` handler in scope. The compiler
+ * emits the same layout in every translation unit that imports the
+ * Cancel effect (see the EvCancel struct in the generated C); the
+ * prefix (`handler_id`, `env`, `state`, then op fn pointers) is
+ * fixed by the Ev-struct convention documented in
+ * `docs/effects-impl.md` §*Evidence layout*. Since Cancel has a
+ * single op (`raise`), the runtime mirror is two pointers wide and
+ * stable across compiler versions within an edition. */
+typedef struct KaiRtEvCancel KaiRtEvCancel;
+struct KaiRtEvCancel {
+    KaiHandlerId handler_id;
+    void        *env;
+    KaiValue    *state;
+    KaiValue   *(*raise)(KaiRtEvCancel *self, KaiCont *k);
+};
+
+/* Walk the current fiber's evidence stack and, if a user `with Cancel`
+ * handler is in scope, dispatch its `raise` clause and longjmp to the
+ * handle's landing pad — the call does not return. Returns 0 when no
+ * user handler is in scope, leaving the caller to pick its own
+ * fallback (cancel pad, banner, exit).
+ *
+ * A user handler is one with a live `handle_jmp`; default Cancel
+ * handlers allocate no jmp_buf because they never longjmp out of their
+ * clause. The walk skips `in_dispatch_node` so a Cancel handler that is
+ * itself mid-dispatch resolves to an outer Cancel frame instead of
+ * recursing into itself — the same per-fiber rule
+ * `kai_evidence_lookup_node` enforces for user-driven dispatch. */
+static int kai_cancel_dispatch_user_handler(void) {
+    KaiFiber    *f    = kai_current_fiber();
+    KaiEvidence *node = f->evidence_top;
+    KaiEvidence *user_node = NULL;
+    while (node) {
+        if (node != f->in_dispatch_node
+            && node->handle_jmp != NULL
+            && node->eff_label
+            && strcmp(node->eff_label, "Cancel") == 0) {
+            user_node = node;
+            break;
+        }
+        node = node->parent;
+    }
+    if (user_node == NULL) return 0;
+
+    /* Mirrors the op-call shape emitted for `Cancel.raise()`: bind an
+     * identity continuation, mark the node in-dispatch across the call,
+     * invoke the clause, and — `resume` discarded, the only legal
+     * outcome because raise() returns `Nothing` — store the discarded
+     * value, pop evidence, and longjmp to the handle's landing pad. */
+    KaiRtEvCancel *ev = (KaiRtEvCancel *) user_node->handler;
+    KaiCont k;
+    kai_cont_init_identity(&k, ev->handler_id);
+
+    KaiEvidence *saved_disp = f->in_dispatch_node;
+    f->in_dispatch_node = user_node;
+    KaiValue *op_r = ev->raise(ev, &k);
+    f->in_dispatch_node = saved_disp;
+
+    if (k.status == KAI_CONT_UNRESUMED && user_node->handle_jmp != NULL) {
+        *user_node->discard_slot = op_r;
+        kai_evidence_unwind_to(user_node);
+        longjmp(*user_node->handle_jmp, 1);
+        /* Unreachable. */
+    }
+
+    /* Defensive: a Cancel clause that calls `resume(_)` is a compiler
+     * bug — raise() returns Nothing, so there is no value to feed back.
+     * Report no handler so the caller takes its terminal path. */
+    return 0;
+}
+
+/* Deliver a requested cancellation at a yield point. Every effect-op
+ * call goes through a kai_evidence_lookup* function, which makes those
+ * the natural delivery points. With the pad unset (the root fiber, or
+ * outside trampoline scope) the check falls through and dispatch
+ * proceeds normally; a later `Cancel.raise()` still reaches the default
+ * handler. */
+static void kai_check_cancel_yield_point(void) {
+    KaiFiber *f = kai_current_fiber();
+    if (!(f->cancel_requested && !f->cancel_delivered && f->cancel_pad_set)) {
+        return;
+    }
+
+    /* Delivered marker is flipped *before* invoking the clause. The
+     * clause body may call into ops that re-enter
+     * kai_check_cancel_yield_point — without the early flip those
+     * re-entries would see the flag still set and try to dispatch
+     * again. */
+    f->cancel_delivered = 1;
+
+    (void) kai_cancel_dispatch_user_handler();
+
+    /* No user handler in scope (or a clause that illegally resumed):
+     * fall back to the pad — the trampoline's second return marks the
+     * fiber CANCELLED and continues with the awaiter walk. */
+    kai_evidence_unwind_all();
+    longjmp(f->cancel_pad, 1);
+    /* Unreachable. */
+}
+
+static void *kai_evidence_lookup(const char *eff_label) {
+    kai_check_cancel_yield_point();
+    /* Issue #103 — Cancel-on-linked-trap-exit'd-peer must bypass
+     * user handlers (see kai_check_trap_exit_cancel_bypass). */
+    if (eff_label && strcmp(eff_label, "Cancel") == 0) {
+        kai_check_trap_exit_cancel_bypass();
+    }
+    KaiFiber *f = kai_current_fiber();
+    KaiEvidence *node = f->evidence_top;
+    while (node != NULL) {
+        if (node->eff_label == eff_label
+            || strcmp(node->eff_label, eff_label) == 0) {
+            return node->handler;
+        }
+        node = node->parent;
+    }
+    return NULL;
+}
+
+/* m7a #6e: same lookup but returns the whole node so the op-call
+ * site can reach the handle's jmp_buf if a discard happens. */
+static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
+    kai_check_cancel_yield_point();
+    /* Issue #103 — bypass user Cancel handlers when the current
+     * fiber is linked to a trap-exit'd peer (see
+     * kai_check_trap_exit_cancel_bypass for rationale). */
+    if (eff_label && strcmp(eff_label, "Cancel") == 0) {
+        kai_check_trap_exit_cancel_bypass();
+    }
+    KaiFiber *f = kai_current_fiber();
+    KaiEvidence *node = f->evidence_top;
+    while (node != NULL) {
+        /* m8 bug #12: skip a node whose clause body is currently being
+         * dispatched on *this* fiber, so a recursive op resolves to the
+         * outer handler. Per-fiber state, not a flag on the node. */
+        if (node != f->in_dispatch_node
+            && (node->eff_label == eff_label
+                || strcmp(node->eff_label, eff_label) == 0)) {
+            return node;
+        }
+        node = node->parent;
+    }
+    return NULL;
+}
+
+/* Resolve a default-bearing effect performed with no caller frame slot: a
+ * lexical handler on the stack wins (the walk finds it), else the frame-supplied
+ * default node (no longer pushed). The bridge for a direct perform in a fn that
+ * carries no frame (e.g. `main`), where the walk alone would miss the default. */
+static KaiEvidence *kai_evidence_lookup_or_default(const char *eff_label, KaiEvidence *def) {
+    KaiEvidence *node = kai_evidence_lookup_node(eff_label);
+    return node != NULL ? node : def;
+}
+
+/* A fiber-local effect resolved to no handler — the perform site walked an
+ * empty evidence stack. A capability does not cross a spawn, so a fiber-local
+ * op (Actor/Cancel/Link/Monitor/Spawn) performed in a fiber whose own body
+ * installed no handler for it has no disposition to bind. Report it instead of
+ * dereferencing the NULL node. */
+/* KAI_DEBUG_EVIDENCE=1 dumps the fiber and scheduler state behind an
+ * unhandled fiber-local effect. Under M:N the one message covers causes that
+ * need opposite fixes — the executing thread resolved the wrong fiber, the
+ * right fiber with an empty chain, or a live handler masked by a stale
+ * in_dispatch_node — and they are indistinguishable from the message alone.
+ * noinline so the thread pointer is re-read here rather than hoisted from
+ * the caller. Failure path only; no cost on the lookup. */
+__attribute__((noinline))
+static void kai_evidence_diag(KaiEvidence *node, const char *eff_label) {
+    KaiFiber *f = kai_current_fiber();
+    struct KaiMailbox *mb = f ? f->mailbox : NULL;
+    fprintf(stderr,
+        "kai: evidence-diag eff=%s node=%p handler=%p\n"
+        "  fiber=%p is_main=%d state=%d home_thread=%d thread_id=%d nthreads=%d\n"
+        "  evidence_top=%p in_dispatch=%p parent=%p\n"
+        "  mailbox=%p mb_owner=%p mb_owner_is_self=%d\n",
+        eff_label, (void *)node, node ? (void *)node->handler : NULL,
+        (void *)f, f == &kai_main_fiber, f ? (int)f->state : -1,
+        f ? (int)f->home_thread : -1, kai_thread_id, kai_nthreads,
+        f ? (void *)f->evidence_top : NULL, f ? (void *)f->in_dispatch_node : NULL,
+        f ? (void *)f->parent : NULL,
+        (void *)mb, mb ? (void *)mb->owner_fiber : NULL,
+        mb ? (mb->owner_fiber == f) : 0);
+    int depth = 0;
+    for (KaiEvidence *n = f ? f->evidence_top : NULL; n && depth < 16; n = n->parent) {
+        fprintf(stderr, "  [%d] node=%p eff=%s handler=%p%s\n", depth, (void *)n,
+                n->eff_label ? n->eff_label : "(null)", (void *)n->handler,
+                n == f->in_dispatch_node ? "  <-- masked by in_dispatch" : "");
+        depth++;
+    }
+}
+
+static KaiEvidence *kai_evidence_require(KaiEvidence *node, const char *eff_label) {
+    /* A NULL node (empty evidence stack) or a node whose handler slot was never
+     * filled (a default global minted for a fiber-local effect that has no real
+     * default) both mean "no disposition to bind here". Report either, instead
+     * of letting a later `node->handler` deref segfault. */
+    if (node == NULL || node->handler == NULL) {
+        if (getenv("KAI_DEBUG_EVIDENCE")) kai_evidence_diag(node, eff_label);
+        fprintf(stderr, "kai: effect not handled in fiber: %s\n", eff_label);
+        exit(1);
+    }
+    return node;
+}
+
+/* A by-id capability (a `var`/State/Reader cell or a `with Eff as a` alias)
+ * resolved to no node — the alias's evidence is on the fiber where it was
+ * installed and does not cross a spawn. A NULL here means the op ran on a
+ * child fiber that does not carry the cell; report it instead of dereferencing
+ * the NULL node. The compile-time escape check catches the common shapes; this
+ * is the runtime floor for the ones it cannot see statically. */
+static KaiEvidence *kai_evidence_require_reachable(KaiEvidence *node, const char *cap_name) {
+    if (node == NULL || node->handler == NULL) {
+        fprintf(stderr, "kai: capability not reachable in this fiber: %s\n", cap_name);
+        exit(1);
+    }
+    return node;
+}
+
+/* m7b #15: per-instance dispatch — find the evidence node whose
+ * handler_id matches `id`, no name match required. The codegen
+ * uses this when the op call comes from a `with Eff as alias`
+ * binding, so an outer alias's op stays reachable even after an
+ * inner `with Eff as other` shadows the effect name. */
+static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
+    kai_check_cancel_yield_point();
+    KaiFiber *f = kai_current_fiber();
+    KaiEvidence *node = f->evidence_top;
+    while (node != NULL) {
+        /* m8 bug #12: same per-fiber skip rule as the by-name lookup. */
+        if (node == f->in_dispatch_node) { node = node->parent; continue; }
+        KaiHandlerId nid = ((KaiHandlerId *) node->handler)[0];
+        if (nid == id) {
+            /* Issue #103 — same Cancel bypass as the by-name path:
+             * an aliased `with Cancel as e` op call on a fiber linked
+             * to a trap-exit'd peer must unwind directly. */
+            if (node->eff_label
+                && strcmp(node->eff_label, "Cancel") == 0) {
+                kai_check_trap_exit_cancel_bypass();
+            }
+            return node;
+        }
+        node = node->parent;
+    }
+    return NULL;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic pop
+#endif
+
+/* ===================================================================
+ * KIR Lane 1 — in-process libLLVM C-API forwarders (docs/kir-design.md
+ * §7.2). OPT-IN ONLY: compiled only under `-DKAI_LLVM` (set by
+ * `make KAI_LLVM=1`). The default build and the whole bootstrap chain
+ * never see these — no libLLVM header, no libLLVM link.
+ *
+ * ABI: a forwarder is a plain C function whose handle params/returns
+ * are raw `void *` (an LLVM C-API object pointer). On the kaikai side
+ * these are typed `TyHandle` (raw, MUnboxed, non-RC); the C path emits
+ * a raw UFn call with `void *` args and a `void *` result, so a handle
+ * NEVER passes through `kai_int` / the tagged-Int boxing (which would
+ * corrupt the pointer). This is the spike that confirms UFn-raw is the
+ * right vehicle over the extern-C/FFI shim (which always reboxes the
+ * result to `KaiValue *`).
+ * =================================================================== */
+#ifdef KAI_LLVM
+#include <llvm-c/Core.h>
+#include <llvm-c/Target.h>
+#include <llvm-c/TargetMachine.h>
+#include <llvm-c/Analysis.h>
+#include <llvm-c/Error.h>
+#include <llvm-c/Transforms/PassBuilder.h>
+#include <llvm-c/Linker.h>
+#include <llvm-c/IRReader.h>
+#include <llvm-c/DebugInfo.h>
+#include <stdlib.h>
+
+/* The native backend keeps one context + builder per compilation unit.
+ * `kai_llvm_module_new` creates them; the module owns the context for
+ * the backend's lifetime (disposed by the process exit, like the
+ * out-of-process backends). A handle crosses to kaikai as a raw
+ * `void *` (`TyHandle`, never boxed, never RC). */
+static LLVMContextRef kai_llvm_ctx = NULL;
+
+/* Create a fresh context + module named `name`. Returns the module
+ * handle. `name` is a kaikai `String` (a boxed `KaiValue *`); read its
+ * bytes with `->as.s.bytes` (the canonical String payload accessor). */
+static void *kai_llvm_module_new(KaiValue *name) {
+    kai_llvm_ctx = LLVMContextCreate();
+    LLVMModuleRef m = LLVMModuleCreateWithNameInContext(name->as.s.bytes, kai_llvm_ctx);
+    if (name) kai_decref(name);
+    return (void *) m;
+}
+
+/* === Parte B — the native backend context (handles live OUTSIDE the RC
+ * regime). ===========================================================
+ *
+ * The walk threads a lot of LLVM handles (module, builder, the cached
+ * types, the current function, and per-function register / basic-block
+ * tables). A handle is a raw LLVM pointer, NOT a `KaiValue *`: it carries
+ * no refcount. The production kaic2 is compiled by the type-BLIND kaic1,
+ * whose `kai_record` / list constructors `kai_incref` every field — which
+ * on a handle dereferences an LLVM pointer's non-existent `->rc` and
+ * corrupts it (the asu-reviewed "risk #1"). The defence is
+ * representational: NO handle ever enters a kaikai record or list. ALL
+ * backend state lives in THIS C struct, reached through one opaque
+ * `:Handle` the kaikai walk passes around (excluded from Perceus as a
+ * `:Handle` param). The register / block tables — `String -> handle` —
+ * therefore live here in C (the same off-RC vehicle as the arg buffer),
+ * with names `strdup`'d (never a borrowed kaikai pointer kept past the
+ * statement) and reset per function (arena-style). The tables store + return
+ * handles (stable LLVM pointers), never pointers into the table itself. */
+typedef struct { char *name; void *alloca; int slot; } KaiNReg;
+typedef struct { char *label; void *bb; } KaiNBlk;
+/* Evidence-frame ABI table: per fn symbol, the ordered user-effect slot
+ * labels its row demands. Off-RC, strdup'd; resolved by symbol from the
+ * signature, call site, and perform. */
+typedef struct { char *sym; char **slots; int nslots; } KaiNFrame;
+typedef struct {
+    void *m, *b, *ptrt, *i64t, *i32t, *i128t, *voidt, *f64t, *fnval;
+    KaiNReg *regs; int nregs, regcap;
+    KaiNBlk *blks; int nblks, blkcap;
+    KaiNFrame *frames; int nframes, framecap;
+    int ok;
+    int in_fn;   /* begin_fn/end_fn nesting guard (fail loud, not corrupt) */
+    /* DWARF debug info (#500), populated only in --debug. `dib` is the
+     * module DIBuilder, `difile` the source DIFile, `dicu` the compile
+     * unit, `disub` the CURRENT function's DISubprogram (the scope every
+     * `set_loc` attaches to). All NULL in release/default (calloc-zeroed)
+     * — `native_di_enabled` gates the emit so a non-debug build is
+     * byte-identical to before this lane. */
+    void *dib, *difile, *dicu, *disub;
+} KaiNativeCtx;
+
+static void *kai_native_ctx_new(void *m) {
+    KaiNativeCtx *c = (KaiNativeCtx *) calloc(1, sizeof(KaiNativeCtx));
+    c->m = m;
+    c->b = LLVMCreateBuilderInContext(LLVMGetModuleContext((LLVMModuleRef) m));
+    LLVMContextRef ctx = LLVMGetModuleContext((LLVMModuleRef) m);
+    c->ptrt = LLVMPointerTypeInContext(ctx, 0);
+    c->i64t = LLVMInt64TypeInContext(ctx);
+    c->i32t = LLVMInt32TypeInContext(ctx);
+    c->i128t = LLVMInt128TypeInContext(ctx);
+    c->voidt = LLVMVoidTypeInContext(ctx);
+    c->f64t = LLVMDoubleTypeInContext(ctx);
+    c->fnval = NULL;
+    c->regs = NULL; c->nregs = 0; c->regcap = 0;
+    c->blks = NULL; c->nblks = 0; c->blkcap = 0;
+    c->frames = NULL; c->nframes = 0; c->framecap = 0;
+    c->ok = 1; c->in_fn = 0;
+    return (void *) c;
+}
+/* Append `eff` to fn `sym`'s frame slot list, in canonical order. Returns
+ * kai_unit() — the prim ABI never returns C void. */
+static KaiValue *kai_native_ctx_add_frame_slot(void *cv, KaiValue *symv, KaiValue *effv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    const char *sym = symv->as.s.bytes;
+    const char *eff = effv->as.s.bytes;
+    KaiNFrame *fr = NULL;
+    for (int i = 0; i < c->nframes; i++)
+        if (strcmp(c->frames[i].sym, sym) == 0) { fr = &c->frames[i]; break; }
+    if (!fr) {
+        if (c->nframes == c->framecap) {
+            c->framecap = c->framecap ? c->framecap * 2 : 16;
+            c->frames = (KaiNFrame *) realloc(c->frames, (size_t) c->framecap * sizeof(KaiNFrame));
+        }
+        fr = &c->frames[c->nframes++];
+        fr->sym = strdup(sym); fr->slots = NULL; fr->nslots = 0;
+    }
+    fr->slots = (char **) realloc(fr->slots, (size_t) (fr->nslots + 1) * sizeof(char *));
+    fr->slots[fr->nslots++] = strdup(eff);
+    if (symv) kai_decref(symv);
+    if (effv) kai_decref(effv);
+    return kai_unit();
+}
+static int64_t kai_native_ctx_frame_slot_count(void *cv, KaiValue *symv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    const char *sym = symv->as.s.bytes;
+    int64_t r = 0;
+    for (int i = 0; i < c->nframes; i++)
+        if (strcmp(c->frames[i].sym, sym) == 0) { r = (int64_t) c->frames[i].nslots; break; }
+    if (symv) kai_decref(symv);
+    return r;
+}
+static KaiValue *kai_native_ctx_frame_slot_eff(void *cv, KaiValue *symv, int64_t j) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    const char *sym = symv->as.s.bytes;
+    const char *r = "";
+    for (int i = 0; i < c->nframes; i++)
+        if (strcmp(c->frames[i].sym, sym) == 0) {
+            if (j >= 0 && j < c->frames[i].nslots) r = c->frames[i].slots[j];
+            break;
+        }
+    if (symv) kai_decref(symv);
+    return kai_str(r);
+}
+static int64_t kai_native_ctx_frame_slot_index(void *cv, KaiValue *symv, KaiValue *effv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    const char *sym = symv->as.s.bytes;
+    const char *eff = effv->as.s.bytes;
+    int64_t r = -1;
+    for (int i = 0; i < c->nframes; i++)
+        if (strcmp(c->frames[i].sym, sym) == 0) {
+            for (int j = 0; j < c->frames[i].nslots; j++)
+                if (strcmp(c->frames[i].slots[j], eff) == 0) { r = (int64_t) j; break; }
+            break;
+        }
+    if (symv) kai_decref(symv);
+    if (effv) kai_decref(effv);
+    return r;
+}
+static void *kai_native_ctx_b(void *c)     { return ((KaiNativeCtx *) c)->b; }
+static void *kai_native_ctx_m(void *c)     { return ((KaiNativeCtx *) c)->m; }
+static void *kai_native_ctx_ptrt(void *c)  { return ((KaiNativeCtx *) c)->ptrt; }
+static void *kai_native_ctx_i64t(void *c)  { return ((KaiNativeCtx *) c)->i64t; }
+static void *kai_native_ctx_i32t(void *c)  { return ((KaiNativeCtx *) c)->i32t; }
+static void *kai_native_ctx_i128t(void *c) { return ((KaiNativeCtx *) c)->i128t; }
+static void *kai_native_ctx_voidt(void *c) { return ((KaiNativeCtx *) c)->voidt; }
+static void *kai_native_ctx_f64t(void *c) { return ((KaiNativeCtx *) c)->f64t; }
+/* An f64 constant from a raw `double` (the caller unboxes the `KRealV`
+ * payload — `->as.r` — so the prim takes the scalar directly, matching the
+ * unbox-pass / stage-1 `AReal` marshalling. Avoids a boxed-Real param that
+ * the C-direct unbox pass would `->as.r` anyway, mismatching the type). */
+static void *kai_llvm_const_real(void *f64ty, double d) {
+    return (void *) LLVMConstReal((LLVMTypeRef) f64ty, d);
+}
+static void *kai_native_ctx_fnval(void *c) { return ((KaiNativeCtx *) c)->fnval; }
+static KaiValue *kai_native_ctx_set_fnval(void *c, void *fn) { ((KaiNativeCtx *) c)->fnval = fn; return kai_unit(); }
+static int64_t kai_native_ctx_ok(void *c)  { return ((KaiNativeCtx *) c)->ok ? 1 : 0; }
+static KaiValue *kai_native_ctx_fail(void *c) { ((KaiNativeCtx *) c)->ok = 0; return kai_unit(); }
+
+/* Reset the per-function register + block tables (arena: free the strdup'd
+ * names, keep the buffers for reuse). `in_fn` guards against compiling a
+ * function inside another (would clobber `fnval`/tables) — fail loud. */
+static KaiValue *kai_native_ctx_begin_fn(void *cv, void *fnval) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (c->in_fn) { fprintf(stderr, "kai: native begin_fn nested (compiler bug)\n"); c->ok = 0; return kai_unit(); }
+    for (int i = 0; i < c->nregs; i++) free(c->regs[i].name);
+    for (int i = 0; i < c->nblks; i++) free(c->blks[i].label);
+    c->nregs = 0; c->nblks = 0; c->fnval = fnval; c->in_fn = 1;
+    /* DWARF (#500): start each fn with NO subprogram + no current location.
+     * Only a fn that calls `native_di_subprogram` (the user-fn walk) gets a
+     * scope; a synthetic fn (thunk / runtime hook / runner driver) keeps
+     * `disub == NULL`, so its instructions carry no `!dbg` — which avoids a
+     * location whose scope is the PREVIOUS fn's subprogram (the verifier's
+     * "wrong subprogram" rejection). The builder's stale location is
+     * cleared too so no instruction inherits one across the fn boundary. */
+    c->disub = NULL;
+    if (c->b) LLVMSetCurrentDebugLocation2((LLVMBuilderRef) c->b, NULL);
+    return kai_unit();
+}
+static KaiValue *kai_native_ctx_end_fn(void *cv) { ((KaiNativeCtx *) cv)->in_fn = 0; return kai_unit(); }
+
+static KaiValue *kai_native_ctx_add_reg(void *cv, KaiValue *name, void *alloca, int64_t slot) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (c->nregs == c->regcap) {
+        c->regcap = c->regcap ? c->regcap * 2 : 16;
+        c->regs = (KaiNReg *) realloc(c->regs, (size_t) c->regcap * sizeof(KaiNReg));
+    }
+    c->regs[c->nregs].name = strdup(name->as.s.bytes);
+    c->regs[c->nregs].alloca = alloca;
+    c->regs[c->nregs].slot = (int) slot;
+    c->nregs++;
+    if (name) kai_decref(name);
+    return kai_unit();
+}
+/* Returns the alloca handle, or NULL if absent. The slot is read
+ * separately (`reg_slot`) so the two stay one source. */
+static void *kai_native_ctx_find_reg(void *cv, KaiValue *name) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    void *r = NULL;
+    for (int i = 0; i < c->nregs; i++)
+        if (strcmp(c->regs[i].name, name->as.s.bytes) == 0) { r = c->regs[i].alloca; break; }
+    if (name) kai_decref(name);
+    return r;
+}
+static int64_t kai_native_ctx_reg_slot(void *cv, KaiValue *name) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    int64_t s = -1;
+    for (int i = 0; i < c->nregs; i++)
+        if (strcmp(c->regs[i].name, name->as.s.bytes) == 0) { s = c->regs[i].slot; break; }
+    if (name) kai_decref(name);
+    return s;
+}
+/* The alloca of the i-th register (params are collected first, in order,
+ * so `pN` of a tcrec reloop selects the N-th register). NULL if out of
+ * range. */
+static void *kai_native_ctx_reg_at(void *cv, int64_t i) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    return (i >= 0 && i < c->nregs) ? c->regs[i].alloca : NULL;
+}
+/* The slot TAG of the i-th register (params collected first, in order),
+ * so a `KTcrecGoto` reloop can re-materialise the `pN` value at the param's
+ * declared slot — RAW (`i64`/`f64`/`i1`) for a P3 raw param, so the back-
+ * edge store matches the alloca type (a boxed store into an `i64` alloca
+ * would mis-type, and re-boxing each iteration is the regression P3 fixes).
+ * -1 if out of range (a lowering bug). */
+static int64_t kai_native_ctx_reg_slot_at(void *cv, int64_t i) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    return (i >= 0 && i < c->nregs) ? c->regs[i].slot : -1;
+}
+static KaiValue *kai_native_ctx_add_block(void *cv, KaiValue *label, void *bb) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (c->nblks == c->blkcap) {
+        c->blkcap = c->blkcap ? c->blkcap * 2 : 16;
+        c->blks = (KaiNBlk *) realloc(c->blks, (size_t) c->blkcap * sizeof(KaiNBlk));
+    }
+    c->blks[c->nblks].label = strdup(label->as.s.bytes);
+    c->blks[c->nblks].bb = bb;
+    c->nblks++;
+    if (label) kai_decref(label);
+    return kai_unit();
+}
+static void *kai_native_ctx_find_block(void *cv, KaiValue *label) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    void *r = NULL;
+    for (int i = 0; i < c->nblks; i++)
+        if (strcmp(c->blks[i].label, label->as.s.bytes) == 0) { r = c->blks[i].bb; break; }
+    if (label) kai_decref(label);
+    return r;
+}
+/* The first block (the loop header a tcrec back-edge branches to). */
+static void *kai_native_ctx_first_block(void *cv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    return c->nblks > 0 ? c->blks[0].bb : NULL;
+}
+
+/* --- types (in the module's context) --- */
+static void *kai_llvm_int64_type(void *m) {
+    return (void *) LLVMInt64TypeInContext(LLVMGetModuleContext((LLVMModuleRef) m));
+}
+static void *kai_llvm_int32_type(void *m) {
+    return (void *) LLVMInt32TypeInContext(LLVMGetModuleContext((LLVMModuleRef) m));
+}
+static void *kai_llvm_ptr_type(void *m) {
+    /* Opaque pointer (LLVM ≥ 15): one `ptr` type, address space 0.
+     * Models `%KaiValue*` without a pointee — exactly the opaque-ptr
+     * world stage2/runtime_llvm.c already relies on. */
+    return (void *) LLVMPointerTypeInContext(LLVMGetModuleContext((LLVMModuleRef) m), 0);
+}
+static void *kai_llvm_void_type(void *m) {
+    return (void *) LLVMVoidTypeInContext(LLVMGetModuleContext((LLVMModuleRef) m));
+}
+/* Float (32-bit) type — the C `float` width an `F32` FFI arg crosses as. */
+static void *kai_llvm_float_type(void *m) {
+    return (void *) LLVMFloatTypeInContext(LLVMGetModuleContext((LLVMModuleRef) m));
+}
+/* An integer type of an arbitrary bit width (8/16/32/64) — the exact C
+ * width a fixed-width FFI scalar crosses as. */
+static void *kai_llvm_int_type(void *m, int64_t bits) {
+    return (void *) LLVMIntTypeInContext(LLVMGetModuleContext((LLVMModuleRef) m), (unsigned) bits);
+}
+static void *kai_llvm_fn_type_0(void *ret) {
+    return (void *) LLVMFunctionType((LLVMTypeRef) ret, NULL, 0, 0);
+}
+static void *kai_llvm_fn_type_1(void *ret, void *p0) {
+    LLVMTypeRef params[1]; params[0] = (LLVMTypeRef) p0;
+    return (void *) LLVMFunctionType((LLVMTypeRef) ret, params, 1, 0);
+}
+
+/* --- functions / blocks / builder --- */
+static void *kai_llvm_add_function(void *m, KaiValue *name, void *fnty) {
+    LLVMValueRef fn = LLVMAddFunction((LLVMModuleRef) m, name->as.s.bytes, (LLVMTypeRef) fnty);
+    if (name) kai_decref(name);
+    return (void *) fn;
+}
+static void *kai_llvm_append_block(void *m, void *fn, KaiValue *name) {
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(
+        LLVMGetModuleContext((LLVMModuleRef) m), (LLVMValueRef) fn, name->as.s.bytes);
+    if (name) kai_decref(name);
+    return (void *) bb;
+}
+static void *kai_llvm_builder_new(void *m) {
+    return (void *) LLVMCreateBuilderInContext(LLVMGetModuleContext((LLVMModuleRef) m));
+}
+static KaiValue *kai_llvm_position_at_end(void *b, void *bb) {
+    LLVMPositionBuilderAtEnd((LLVMBuilderRef) b, (LLVMBasicBlockRef) bb);
+    return kai_unit();
+}
+
+/* --- values / instructions --- */
+static void *kai_llvm_const_int(void *i64ty, int64_t v) {
+    return (void *) LLVMConstInt((LLVMTypeRef) i64ty, (unsigned long long) v, 1);
+}
+/* A raw i128 constant from its decimal text. Int128 literals may exceed the
+ * compiler's 64-bit `decode_int`, so the register const is materialised from
+ * the textual span (base 10, optional leading `-`) — the 128-bit value LLVM
+ * cannot take through the i64 `const_int`. */
+/* The span is the literal verbatim, so it may carry a `0x`/`0b` base
+ * prefix and `_` separators. LLVM parses neither: strip both and pass
+ * the matching radix, else the digits are read as decimal and silently
+ * yield a wrong constant. */
+static void *kai_llvm_const_i128_str(void *i128ty, KaiValue *s) {
+    const char *txt = s->as.s.bytes;
+    size_t len = s->as.s.len;
+    char buf[64];
+    size_t i = 0, n = 0;
+    unsigned radix = 10;
+    if (i < len && (txt[i] == '-' || txt[i] == '+')) {
+        if (txt[i] == '-' && n < sizeof buf - 1) buf[n++] = '-';
+        i++;
+    }
+    if (i + 1 < len && txt[i] == '0') {
+        char b = txt[i + 1];
+        if (b == 'x' || b == 'X') { radix = 16; i += 2; }
+        else if (b == 'b' || b == 'B') { radix = 2; i += 2; }
+    }
+    for (; i < len && n < sizeof buf - 1; i++) {
+        if (txt[i] != '_') buf[n++] = txt[i];
+    }
+    void *r = (void *) LLVMConstIntOfStringAndSize((LLVMTypeRef) i128ty, buf, (unsigned) n, radix);
+    kai_decref(s);
+    return r;
+}
+static void *kai_llvm_build_call_0(void *b, void *fn, void *fnty) {
+    return (void *) LLVMBuildCall2((LLVMBuilderRef) b, (LLVMTypeRef) fnty,
+                                   (LLVMValueRef) fn, NULL, 0, "");
+}
+static void *kai_llvm_build_call_1(void *b, void *fn, void *fnty, void *a0) {
+    LLVMValueRef args[1]; args[0] = (LLVMValueRef) a0;
+    return (void *) LLVMBuildCall2((LLVMBuilderRef) b, (LLVMTypeRef) fnty,
+                                   (LLVMValueRef) fn, args, 1, "");
+}
+static KaiValue *kai_llvm_build_ret(void *b, void *v) {
+    LLVMBuildRet((LLVMBuilderRef) b, (LLVMValueRef) v);
+    return kai_unit();
+}
+static KaiValue *kai_llvm_build_ret_void(void *b) {
+    LLVMBuildRetVoid((LLVMBuilderRef) b);
+    return kai_unit();
+}
+
+/* === Parte B: the generic KIR walk's C-API surface ===================
+ * The spine (above) builds `main -> 42`. The generic walk needs the rest
+ * of the IRBuilder surface: N-ary fn types + calls, the alloca/load/store
+ * model (every named KIR register is an entry-block alloca, mem2reg
+ * promotes it — asu review), the control terminators (br/condbr/switch),
+ * constants, globals, and a few raw readers. Handles stay raw `void *`,
+ * never boxed, never RC. */
+
+/* --- N-ary function types ---
+ * An arg buffer is a heap `void *[]` of LLVM handles the kaikai side
+ * fills push-by-push (a `[Handle]` list cannot carry non-RC handles —
+ * the list would dup/drop them — so the buffer lives in C, off the RC
+ * regime). `cap` grows geometrically; `n` is the live count. */
+typedef struct { void **xs; int64_t n; int64_t cap; } KaiLlvmBuf;
+static void *kai_llvm_buf_new(void) {
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) malloc(sizeof(KaiLlvmBuf));
+    bf->cap = 8; bf->n = 0;
+    bf->xs = (void **) malloc((size_t) bf->cap * sizeof(void *));
+    return (void *) bf;
+}
+static KaiValue *kai_llvm_buf_push(void *buf, void *h) {
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) buf;
+    if (bf->n == bf->cap) {
+        bf->cap *= 2;
+        bf->xs = (void **) realloc(bf->xs, (size_t) bf->cap * sizeof(void *));
+    }
+    bf->xs[bf->n++] = h;
+    return kai_unit();
+}
+static KaiValue *kai_llvm_buf_free(void *buf) {
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) buf;
+    free(bf->xs); free(bf);
+    return kai_unit();
+}
+/* The live count + the i-th handle of a buffer (the off-RC replacement
+ * for `list_length` / indexing on a `[Handle]` list). */
+static int64_t kai_llvm_buf_len(void *buf) { return ((KaiLlvmBuf *) buf)->n; }
+static void *kai_llvm_buf_get(void *buf, int64_t i) { return ((KaiLlvmBuf *) buf)->xs[i]; }
+/* A function type `ret (params...)` whose param-type handles are in `buf`. */
+static void *kai_llvm_fn_type_n(void *ret, void *buf) {
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) buf;
+    return (void *) LLVMFunctionType((LLVMTypeRef) ret,
+                                     (LLVMTypeRef *) bf->xs, (unsigned) bf->n, 0);
+}
+/* A struct type over a buffer of element types (non-packed: natural C
+ * padding), for an `extern "C" type` passed by value. */
+static void *kai_llvm_struct_type(void *m, void *buf) {
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) buf;
+    return (void *) LLVMStructTypeInContext(LLVMGetModuleContext((LLVMModuleRef) m),
+                                            (LLVMTypeRef *) bf->xs, (unsigned) bf->n, 0);
+}
+/* GEP to the i-th field of a struct held in memory. The struct is passed
+ * to / returned from a C extern by value via a `byval`/`sret` pointer;
+ * the shim stores/loads each field through this. */
+static void *kai_llvm_build_struct_gep(void *b, void *sty, void *ptr, int64_t i) {
+    return (void *) LLVMBuildStructGEP2((LLVMBuilderRef) b, (LLVMTypeRef) sty,
+                                        (LLVMValueRef) ptr, (unsigned) i, "");
+}
+/* `byval(<struct>)` on a parameter — the directive that makes LLVM apply
+ * the target C-ABI for struct-by-value (registers vs indirect per
+ * SysV/AAPCS), so a clang-compiled callee receives the struct correctly.
+ * Applied to BOTH the extern declaration's param and the call site, at the
+ * same 1-based param index (index 0 is the return). */
+static void kai_llvm_byval_attr_at(LLVMModuleRef m, LLVMValueRef fn_or_call,
+                                   int is_call, int64_t param_ix, LLVMTypeRef sty) {
+    LLVMContextRef ctx = LLVMGetModuleContext(m);
+    unsigned kind = LLVMGetEnumAttributeKindForName("byval", 5);
+    LLVMAttributeRef a = LLVMCreateTypeAttribute(ctx, kind, sty);
+    LLVMAttributeIndex ix = (LLVMAttributeIndex) (param_ix + 1);
+    if (is_call) LLVMAddCallSiteAttribute(fn_or_call, ix, a);
+    else LLVMAddAttributeAtIndex(fn_or_call, ix, a);
+}
+static KaiValue *kai_llvm_add_byval_decl(void *m, void *fn, int64_t param_ix, void *sty) {
+    kai_llvm_byval_attr_at((LLVMModuleRef) m, (LLVMValueRef) fn, 0, param_ix, (LLVMTypeRef) sty);
+    return kai_unit();
+}
+static KaiValue *kai_llvm_add_byval_call(void *m, void *call, int64_t param_ix, void *sty) {
+    kai_llvm_byval_attr_at((LLVMModuleRef) m, (LLVMValueRef) call, 1, param_ix, (LLVMTypeRef) sty);
+    return kai_unit();
+}
+/* `sret(<struct>)` on the hidden first parameter of a struct-returning
+ * extern — the ABI directive that makes a MEMORY-class return write
+ * through a caller-supplied pointer. Applied to the declaration's param 0
+ * and the matching call-site arg 0. */
+static void kai_llvm_sret_attr_at(LLVMModuleRef m, LLVMValueRef fn_or_call,
+                                  int is_call, LLVMTypeRef sty) {
+    LLVMContextRef ctx = LLVMGetModuleContext(m);
+    unsigned kind = LLVMGetEnumAttributeKindForName("sret", 4);
+    LLVMAttributeRef a = LLVMCreateTypeAttribute(ctx, kind, sty);
+    if (is_call) LLVMAddCallSiteAttribute(fn_or_call, 1u, a);
+    else LLVMAddAttributeAtIndex(fn_or_call, 1u, a);
+}
+static KaiValue *kai_llvm_add_sret_decl(void *m, void *fn, void *sty) {
+    kai_llvm_sret_attr_at((LLVMModuleRef) m, (LLVMValueRef) fn, 0, (LLVMTypeRef) sty);
+    return kai_unit();
+}
+static KaiValue *kai_llvm_add_sret_call(void *m, void *call, void *sty) {
+    kai_llvm_sret_attr_at((LLVMModuleRef) m, (LLVMValueRef) call, 1, (LLVMTypeRef) sty);
+    return kai_unit();
+}
+/* Purity/aliasing function attributes (issue #1139). Attached at
+ * `LLVMAttributeFunctionIndex` on the declaration, so every call site the
+ * optimizer sees carries the promise. `nounwind` is broad: kaikai has no
+ * exception unwinding (a trap longjmps past nounwind frames, which is
+ * orthogonal to the attribute — it names EH-personality unwinding only).
+ * `memory(none)` is stamped ONLY on a confirmed-pure scalar fn (no alloc,
+ * no RC, no pointer read); it takes the MemoryEffects bitmask, and
+ * `none()` is 0. willreturn is NEVER stamped — kaikai does not model
+ * termination, and a memory(none) fn that traps must not be DCE'd. */
+static void kai_llvm_add_enum_fn_attr(LLVMValueRef fn, const char *name,
+                                      unsigned name_len, uint64_t val) {
+    LLVMContextRef ctx = LLVMGetTypeContext(LLVMTypeOf(fn));
+    unsigned kind = LLVMGetEnumAttributeKindForName(name, name_len);
+    LLVMAttributeRef a = LLVMCreateEnumAttribute(ctx, kind, val);
+    LLVMAddAttributeAtIndex((LLVMValueRef) fn, LLVMAttributeFunctionIndex, a);
+}
+static KaiValue *kai_llvm_add_nounwind(void *fn) {
+    kai_llvm_add_enum_fn_attr((LLVMValueRef) fn, "nounwind", 8, 0);
+    return kai_unit();
+}
+static KaiValue *kai_llvm_add_memory_none(void *fn) {
+    kai_llvm_add_enum_fn_attr((LLVMValueRef) fn, "memory", 6, 0);
+    return kai_unit();
+}
+/* Demote a DEFINED function to internal linkage. The modular/split root
+ * partitions emit user fns raw (external) so cross-TU stdlib calls link; a
+ * root-private user fn keeps a bare source name, which then overrides a libc
+ * or runtime symbol the C owner TU calls (issue #1380: a user `fn read`
+ * shadowed POSIX `read`). The emitter calls this on those fns so their name
+ * stops participating in link-wide resolution. */
+static KaiValue *kai_llvm_set_internal_linkage(void *fn) {
+    LLVMSetLinkage((LLVMValueRef) fn, LLVMInternalLinkage);
+    return kai_unit();
+}
+/* The target C-ABI class of the native backend's default triple: 1 =
+ * AArch64 (AAPCS64), 2 = x86-64 SysV, 0 = anything else (the emitter keeps
+ * the honest struct-by-value reject there). Read once at module build; the
+ * object emission below pins the SAME `LLVMGetDefaultTargetTriple()`. */
+static int64_t kai_native_target_abi(void) {
+    char *triple = LLVMGetDefaultTargetTriple();
+    int64_t plat = 0;
+    if (triple) {
+        if (strncmp(triple, "arm64", 5) == 0 || strncmp(triple, "aarch64", 7) == 0) plat = 1;
+        else if (strncmp(triple, "x86_64", 6) == 0) {
+            /* SysV only — a `x86_64-pc-windows` triple uses a different
+             * struct ABI the classifier does not model. */
+            if (strstr(triple, "windows") == NULL) plat = 2;
+        }
+        LLVMDisposeMessage(triple);
+    }
+    return plat;
+}
+/* Identity of everything OUTSIDE the KIR that shapes an emitted native
+ * object: the target triple, the opt level, and the runtime bitcodes the
+ * emit step merges. Folded into the cached core object's content key so a
+ * toolchain-, target- or bitcode-level change can never resurrect a stale
+ * object whose KIR text happens to match. Empty string when the split
+ * cache must not engage: an explicit KAI_NATIVE_CORE_OBJ=0, a
+ * non-default opt level (`--debug` keeps the single-object path and its
+ * dSYM flow), or the whole-program runtime bitcode present without its
+ * inline twin — a split partition would then leave every `kaix_*` op an
+ * out-of-line call (an order of magnitude on hot loops), while the
+ * whole-program merge still inlines them. Bitcode identity is mtime-size
+ * (the kaic2 toolchain-id discipline), not a content hash: a regenerated
+ * identical bitcode costs one spurious miss, never a stale hit. */
+static void kai_llvm_bc_id(const char *env, char *out, size_t outsz) {
+    const char *p = getenv(env);
+    struct stat st;
+    if (p && p[0] && stat(p, &st) == 0)
+        snprintf(out, outsz, "%lld-%lld", (long long) st.st_mtime, (long long) st.st_size);
+    else
+        snprintf(out, outsz, "none");
+}
+
+/* Codegen level for the TargetMachine — instruction selection, scheduling
+ * and register allocation, a budget separate from the IR pass pipeline.
+ *
+ * `Default` for every build profile. `None` emits correct code ~4x faster
+ * but spends the register allocator's budget: on the rb-tree descent it
+ * quadruples the spill traffic in the hot loop (349 -> 1508 load/store)
+ * and doubles the program's retired instructions. Emitted-code speed
+ * outranks compile time here.
+ *
+ * `KAI_NATIVE_CGLEVEL=0` selects the fast level, opt-in and never by
+ * default. Note it reaches only the prebuilt core object, not the user's
+ * own module — so it was never a usable escape from the default this
+ * replaces, and `--release` was not one either. It rides the backend tag
+ * that keys the shared core-object cache, so a fast-emit object cannot be
+ * served to a build that did not ask for one. */
+static const char *kai_llvm_cgen_level_id(void) {
+    const char *e = getenv("KAI_NATIVE_CGLEVEL");
+    if (e && e[0]) return (strcmp(e, "0") == 0) ? "none" : "default";
+    return "default";
+}
+
+static LLVMCodeGenOptLevel kai_llvm_cgen_level(void) {
+    return (strcmp(kai_llvm_cgen_level_id(), "none") == 0)
+        ? LLVMCodeGenLevelNone : LLVMCodeGenLevelDefault;
+}
+static KaiValue *kai_llvm_backend_tag(void) {
+    const char *off = getenv("KAI_NATIVE_CORE_OBJ");
+    if (off && strcmp(off, "0") == 0) return kai_str("");
+    const char *lvl = getenv("KAI_NATIVE_OPT");
+    if (lvl && lvl[0] && strcmp(lvl, "2") != 0) return kai_str("");
+    char bc[64], inlbc[64], tag[512];
+    kai_llvm_bc_id("KAI_NATIVE_RUNTIME_BC", bc, sizeof bc);
+    kai_llvm_bc_id("KAI_NATIVE_RUNTIME_INLINE_BC", inlbc, sizeof inlbc);
+    if (strcmp(bc, "none") != 0 && strcmp(inlbc, "none") == 0) {
+        static int noted = 0;
+        if (!noted) {
+            noted = 1;
+            fprintf(stderr, "kai: native runtime inline bitcode unavailable — "
+                    "skipping the core-object split, using the whole-program "
+                    "runtime merge (slower build, runtime ops stay inlined)\n");
+        }
+        return kai_str("");
+    }
+    char *triple = LLVMGetDefaultTargetTriple();
+    snprintf(tag, sizeof tag, "%s|O2|cg:%s|bc:%s|inlbc:%s",
+             triple ? triple : "?", kai_llvm_cgen_level_id(), bc, inlbc);
+    if (triple) LLVMDisposeMessage(triple);
+    return kai_str(tag);
+}
+/* `n` copies of one pointer type, for the all-boxed fn signatures the
+ * KIR lowers (every param/return is `ptr`). */
+static void *kai_llvm_fn_type_boxed(void *ptr_t, int64_t n) {
+    LLVMTypeRef stack[16];
+    LLVMTypeRef *ps = stack;
+    LLVMTypeRef *heap = NULL;
+    if (n > 16) { heap = (LLVMTypeRef *) malloc((size_t) n * sizeof(LLVMTypeRef)); ps = heap; }
+    for (int64_t i = 0; i < n; i++) ps[i] = (LLVMTypeRef) ptr_t;
+    LLVMTypeRef t = LLVMFunctionType((LLVMTypeRef) ptr_t, ps, (unsigned) n, 0);
+    if (heap) free(heap);
+    return (void *) t;
+}
+/* An N-ary call to a known function value (the args are in `buf`). */
+static void *kai_llvm_build_call_n(void *b, void *fn, void *fnty, void *buf) {
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) buf;
+    return (void *) LLVMBuildCall2((LLVMBuilderRef) b, (LLVMTypeRef) fnty,
+                                   (LLVMValueRef) fn, (LLVMValueRef *) bf->xs,
+                                   (unsigned) bf->n, "");
+}
+
+/* --- function lookup / declaration ---
+ * Resolve a function by name; declare it (no body) if absent. The walk
+ * uses this for runtime externs (`kaix_*`) and forward references to
+ * user fns the module defines later. `LLVMGetNamedFunction` returns NULL
+ * when absent, so a miss adds the declaration with the given type. */
+static void *kai_llvm_get_or_declare_fn(void *m, KaiValue *name, void *fnty) {
+    LLVMValueRef fn = LLVMGetNamedFunction((LLVMModuleRef) m, name->as.s.bytes);
+    /* LLVMGetNamedFunction consults the module's ValueSymbolTable, which on
+     * LLVM 22 does NOT reliably index functions created earlier in this same
+     * walk (it returned NULL for a function the GetFirst/GetNext iterator
+     * still found in the module — the VST lazily de-syncs after many adds).
+     * Fall back to a linear scan (the iterator IS authoritative) so a
+     * forward-declared fn is reused, not re-added under a `.N` suffix. */
+    if (fn == NULL) {
+        for (LLVMValueRef g = LLVMGetFirstFunction((LLVMModuleRef) m); g; g = LLVMGetNextFunction(g)) {
+            if (strcmp(LLVMGetValueName(g), name->as.s.bytes) == 0) { fn = g; break; }
+        }
+    }
+    if (fn == NULL) fn = LLVMAddFunction((LLVMModuleRef) m, name->as.s.bytes, (LLVMTypeRef) fnty);
+    if (name) kai_decref(name);
+    return (void *) fn;
+}
+/* The i-th parameter value of a function (PDirect param reads). */
+static void *kai_llvm_get_param(void *fn, int64_t i) {
+    return (void *) LLVMGetParam((LLVMValueRef) fn, (unsigned) i);
+}
+/* An `[n x elem]` array type — the stack buffer a runtime ctor reads
+ * `args[i]` from (a `KaiValue*[]`, so `elem` is `ptr`). */
+static void *kai_llvm_array_type(void *elem, int64_t n) {
+    return (void *) LLVMArrayType((LLVMTypeRef) elem, (unsigned) n);
+}
+/* `getelementptr [n x elem], ptr arr, i32 0, i32 idx` — the address of
+ * the idx-th element of an alloca'd array. Two indices: the leading 0
+ * steps through the array pointer, `idx` selects the element. */
+static void *kai_llvm_build_array_gep(void *b, void *arrty, void *arr, void *idx) {
+    LLVMValueRef ixs[2];
+    /* The leading 0 index must be an i32 in the SAME context as the
+     * module — `LLVMInt32Type()` is the global context, which on a
+     * private-context module yields a cross-context Value* the verifier
+     * crashes on. Derive the context from the array type. */
+    LLVMContextRef ctx = LLVMGetTypeContext((LLVMTypeRef) arrty);
+    ixs[0] = LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0);
+    ixs[1] = (LLVMValueRef) idx;
+    return (void *) LLVMBuildGEP2((LLVMBuilderRef) b, (LLVMTypeRef) arrty,
+                                  (LLVMValueRef) arr, ixs, 2, "");
+}
+/* `args[i]` of a thunk's `KaiValue** args` param: `getelementptr ptr,
+ * ptr args, i64 i` then `load ptr`. One index (a plain pointer, not an
+ * array alloca), so a single-index GEP over the element type `ptrt`. */
+static void *kai_llvm_build_load_arg(void *b, void *args, void *ptrt, int64_t i) {
+    LLVMContextRef ctx = LLVMGetTypeContext((LLVMTypeRef) ptrt);
+    LLVMValueRef idx = LLVMConstInt(LLVMInt64TypeInContext(ctx), (unsigned long long) i, 0);
+    LLVMValueRef slot = LLVMBuildGEP2((LLVMBuilderRef) b, (LLVMTypeRef) ptrt,
+                                      (LLVMValueRef) args, &idx, 1, "");
+    return (void *) LLVMBuildLoad2((LLVMBuilderRef) b, (LLVMTypeRef) ptrt, slot, "");
+}
+
+/* --- the alloca / load / store model (asu review: every named register
+ * is an entry-block alloca; mem2reg promotes it to SSA+phi). --- */
+static void *kai_llvm_build_alloca(void *b, void *ty, KaiValue *name) {
+    LLVMValueRef a = LLVMBuildAlloca((LLVMBuilderRef) b, (LLVMTypeRef) ty, name->as.s.bytes);
+    if (name) kai_decref(name);
+    return (void *) a;
+}
+/* Build a fixed-size alloca in the CURRENT function's entry block, then
+ * restore the builder to where it was. A call-site arg buffer (`kaix_apply`
+ * / `kaix_variant` / `kaix_record`) must NOT alloca in a loop body: a
+ * `tcrec`/TRMC goto-loop re-executes that block per iteration, so an alloca
+ * there grows the stack each iteration (fixed size, but N times) and a fiber
+ * (64 KiB stack) overflows after ~8 K iterations — issue #668's `list.map`
+ * inside a fiber. The C-direct oracle uses a frame-scoped `KaiValue *args[n]`
+ * (allocated once); this hoists the equivalent alloca to the entry block so
+ * the goto-loop reuses one slot, exactly the "every alloca is an entry-block
+ * alloca" invariant the named registers already follow. Inserts before the
+ * entry block's terminator (the `br` to the loop header is already built when
+ * a body block emits a call), so the module stays well-formed. */
+static void *kai_llvm_build_alloca_entry(void *cv, void *ty, KaiValue *name) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    LLVMBuilderRef b = (LLVMBuilderRef) c->b;
+    LLVMBasicBlockRef cur = LLVMGetInsertBlock(b);
+    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock((LLVMValueRef) c->fnval);
+    LLVMValueRef first = LLVMGetFirstInstruction(entry);
+    if (first) LLVMPositionBuilderBefore(b, first);
+    else LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef a = LLVMBuildAlloca(b, (LLVMTypeRef) ty, name->as.s.bytes);
+    LLVMPositionBuilderAtEnd(b, cur);
+    if (name) kai_decref(name);
+    return (void *) a;
+}
+/* `alloca elem, count` — a runtime-sized stack buffer (the handle frame's
+ * `jmp_buf`, whose `sizeof` is a runtime value via `kai_jmpbuf_size` rather
+ * than a platform-specific N baked into the IR). `count` is an i64 Value. */
+static void *kai_llvm_build_array_alloca(void *b, void *elemty, void *count, KaiValue *name) {
+    LLVMValueRef a = LLVMBuildArrayAlloca((LLVMBuilderRef) b, (LLVMTypeRef) elemty,
+                                          (LLVMValueRef) count, name->as.s.bytes);
+    if (name) kai_decref(name);
+    return (void *) a;
+}
+static KaiValue *kai_llvm_build_store(void *b, void *val, void *ptr) {
+    LLVMValueRef s = LLVMBuildStore((LLVMBuilderRef) b, (LLVMValueRef) val, (LLVMValueRef) ptr);
+    /* Stamp the natural alignment from the value's type. Without a module
+     * DataLayout at emit time LLVM infers the ABI-generic (preferred) alignment,
+     * which is 4 for i64 — a store i64 align 4 the x86-64 -O2 backend lowers to a
+     * misaligned access that SIGSEGVs (arm64/-O0 tolerates it, hiding the bug).
+     * An `[n x i64]` slot is 8-aligned; stamp it so the store agrees. */
+    LLVMTypeRef vt = LLVMTypeOf((LLVMValueRef) val);
+    LLVMTypeKind k = LLVMGetTypeKind(vt);
+    if (k == LLVMIntegerTypeKind) {
+        unsigned bits = LLVMGetIntTypeWidth(vt);
+        LLVMSetAlignment(s, bits <= 8 ? 1 : bits <= 16 ? 2 : bits <= 32 ? 4 : 8);
+    } else if (k == LLVMPointerTypeKind || k == LLVMDoubleTypeKind) {
+        LLVMSetAlignment(s, 8);
+    } else if (k == LLVMFloatTypeKind) {
+        LLVMSetAlignment(s, 4);
+    }
+    return kai_unit();
+}
+static void *kai_llvm_build_load(void *b, void *ty, void *ptr) {
+    LLVMValueRef l = LLVMBuildLoad2((LLVMBuilderRef) b, (LLVMTypeRef) ty, (LLVMValueRef) ptr, "");
+    /* Same natural-alignment stamp as `kai_llvm_build_store`: without a module
+     * DataLayout at emit time a `load i64` gets ABI-generic align 4, which the
+     * x86-64 -O2 backend lowers to a misaligned load that SIGSEGVs. */
+    LLVMTypeKind k = LLVMGetTypeKind((LLVMTypeRef) ty);
+    if (k == LLVMIntegerTypeKind) {
+        unsigned bits = LLVMGetIntTypeWidth((LLVMTypeRef) ty);
+        LLVMSetAlignment(l, bits <= 8 ? 1 : bits <= 16 ? 2 : bits <= 32 ? 4 : 8);
+    } else if (k == LLVMPointerTypeKind || k == LLVMDoubleTypeKind) {
+        LLVMSetAlignment(l, 8);
+    } else if (k == LLVMFloatTypeKind) {
+        LLVMSetAlignment(l, 4);
+    }
+    return (void *) l;
+}
+/* The module global named `name` (its address as a Value*), or NULL when no
+ * such global exists. The call site addresses a default node minted in
+ * `kai_main_install_defaults` by this name. */
+static void *kai_llvm_get_named_global(void *m, KaiValue *name) {
+    LLVMValueRef g = LLVMGetNamedGlobal((LLVMModuleRef) m, name->as.s.bytes);
+    if (name) kai_decref(name);
+    return (void *) g;
+}
+/* True when a handle (an LLVM Value pointer) is the null pointer: the
+ * discriminant for `get_named_global` returning "no such global". */
+static int32_t kai_llvm_handle_is_null(void *h) { return h == NULL ? 1 : 0; }
+/* Position the builder at the START of a block (allocas must precede the
+ * block's other instructions to stay promotable + static). */
+static KaiValue *kai_llvm_position_at_start(void *b, void *bb) {
+    LLVMValueRef first = LLVMGetFirstInstruction((LLVMBasicBlockRef) bb);
+    if (first) LLVMPositionBuilderBefore((LLVMBuilderRef) b, first);
+    else LLVMPositionBuilderAtEnd((LLVMBuilderRef) b, (LLVMBasicBlockRef) bb);
+    return kai_unit();
+}
+
+/* --- control terminators --- */
+static KaiValue *kai_llvm_build_br(void *b, void *bb) {
+    LLVMBuildBr((LLVMBuilderRef) b, (LLVMBasicBlockRef) bb);
+    return kai_unit();
+}
+static KaiValue *kai_llvm_build_cond_br(void *b, void *cond, void *then_bb, void *else_bb) {
+    LLVMBuildCondBr((LLVMBuilderRef) b, (LLVMValueRef) cond,
+                    (LLVMBasicBlockRef) then_bb, (LLVMBasicBlockRef) else_bb);
+    return kai_unit();
+}
+static void *kai_llvm_build_switch(void *b, void *val, void *default_bb, int64_t ncases) {
+    return (void *) LLVMBuildSwitch((LLVMBuilderRef) b, (LLVMValueRef) val,
+                                    (LLVMBasicBlockRef) default_bb, (unsigned) ncases);
+}
+static KaiValue *kai_llvm_add_case(void *sw, void *onval, void *bb) {
+    LLVMAddCase((LLVMValueRef) sw, (LLVMValueRef) onval, (LLVMBasicBlockRef) bb);
+    return kai_unit();
+}
+static KaiValue *kai_llvm_build_unreachable(void *b) {
+    LLVMBuildUnreachable((LLVMBuilderRef) b);
+    return kai_unit();
+}
+/* `icmp ne i32 %v, 0` → i1 — turn a `kaix_truthy` i32 result (0/1) into
+ * the i1 a `condbr` needs. */
+static void *kai_llvm_build_icmp_ne_zero(void *b, void *v, void *i32ty) {
+    LLVMValueRef zero = LLVMConstInt((LLVMTypeRef) i32ty, 0, 0);
+    return (void *) LLVMBuildICmp((LLVMBuilderRef) b, LLVMIntNE, (LLVMValueRef) v, zero, "");
+}
+/* Raw `double` arithmetic for the unboxed-Real path (KIR mode-slave to the
+ * unbox pass). `op` selects the operator: 0=`fadd`, 1=`fsub`, 2=`fmul`,
+ * 3=`fdiv` — matching the C-direct oracle's `kair_a + kair_b` on a raw
+ * `double`. Operands + result are `f64` LLVM values, NOT boxed Reals: no
+ * RC, no `kaix_mul` consume, so the use-after-free the boxed path hit on a
+ * multi-use raw operand cannot arise. */
+static void *kai_llvm_build_fbinop(void *b, int64_t op, void *a, void *c) {
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
+    switch (op) {
+        case 0:  return (void *) LLVMBuildFAdd(bld, la, lc, "");
+        case 1:  return (void *) LLVMBuildFSub(bld, la, lc, "");
+        case 2:  return (void *) LLVMBuildFMul(bld, la, lc, "");
+        default: return (void *) LLVMBuildFDiv(bld, la, lc, "");
+    }
+}
+/* Raw `double` ordered comparison → an `i1`. `pred` selects the predicate:
+ * 0=`<`, 1=`>`, 2=`<=`, 3=`>=`, 4=`==`, 5=`!=` — the ordered (`O*`) family,
+ * matching the C `<`/`==` on a raw `double` (NaN compares false, as C does).
+ * The result is the `i1` a `condbr` consumes directly, or the caller boxes
+ * via `kaix_bool` at a raw→boxed border. */
+static void *kai_llvm_build_fcmp(void *b, int64_t pred, void *a, void *c) {
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
+    LLVMRealPredicate p;
+    switch (pred) {
+        case 0:  p = LLVMRealOLT; break;
+        case 1:  p = LLVMRealOGT; break;
+        case 2:  p = LLVMRealOLE; break;
+        case 3:  p = LLVMRealOGE; break;
+        case 4:  p = LLVMRealOEQ; break;
+        default: p = LLVMRealONE; break;
+    }
+    return (void *) LLVMBuildFCmp(bld, p, la, lc, "");
+}
+/* Negate a raw `double` (`-x`) — the unary-minus raw form (`(-kair_x)`). */
+static void *kai_llvm_build_fneg(void *b, void *a) {
+    return (void *) LLVMBuildFNeg((LLVMBuilderRef) b, (LLVMValueRef) a, "");
+}
+/* Raw `i1` short-circuit boolean (`a && c` / `a || c`) for the unboxed-Bool
+ * path. `op`: 1=and, 0=or. Both operands are already evaluated (the unbox
+ * pass only marks the node raw when both children are raw), so a STRICT
+ * bitwise `and`/`or` on two `i1` values reproduces the C `&&`/`||` result —
+ * the oracle's raw `int` logical. */
+static void *kai_llvm_build_logical(void *b, int64_t op, void *a, void *c) {
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
+    return op ? (void *) LLVMBuildAnd(bld, la, lc, "")
+              : (void *) LLVMBuildOr(bld, la, lc, "");
+}
+/* Logical NOT of a raw bool (`!x`), width-independent. The raw-Bool
+ * register is `i32` 0/1, not `i1`: a bitwise complement there yields
+ * `~1 == -2` — still truthy for every consumer. Compare against zero and
+ * re-widen so the result is the 0/1 a raw-Bool slot must hold. */
+static void *kai_llvm_build_lnot(void *b, void *a) {
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a;
+    LLVMTypeRef ty = LLVMTypeOf(la);
+    LLVMValueRef z = LLVMBuildICmp(bld, LLVMIntEQ, la, LLVMConstNull(ty), "");
+    return (void *) LLVMBuildZExt(bld, z, ty, "");
+}
+/* Widen an `i1` (an `fcmp`/`icmp` result) to the `i32` a `kaix_bool` box
+ * takes (its param is `i32` 0/1). Mirror of how the C-direct oracle's raw
+ * bool (`0`/`1`) feeds `kai_bool`. */
+static void *kai_llvm_build_zext_i1_i32(void *b, void *v, void *i32ty) {
+    return (void *) LLVMBuildZExt((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) i32ty, "");
+}
+/* Integer narrow/widen for fixed-width FFI marshalling. `trunc` narrows
+ * i64→iN at the call (C-cast, no range-check); `sext`/`zext` widen iN→i64
+ * on return — `sext` for a signed `I*`, `zext` for an unsigned `U*`
+ * (picking the wrong one turns `uint8_t 255` into Int -1). */
+static void *kai_llvm_build_trunc(void *b, void *v, void *ty) {
+    return (void *) LLVMBuildTrunc((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) ty, "");
+}
+static void *kai_llvm_build_sext(void *b, void *v, void *ty) {
+    return (void *) LLVMBuildSExt((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) ty, "");
+}
+static void *kai_llvm_build_zext(void *b, void *v, void *ty) {
+    return (void *) LLVMBuildZExt((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) ty, "");
+}
+/* Pointer↔integer round-trip for the i64-inline variant slot buffer: a boxed
+ * `KaiValue *` slot enters an `[n x i64]` payload word via `ptrtoint`, and
+ * a raw word is read back as a pointer via `inttoptr`. `KaiVarSlot` is a
+ * one-word union, so the bits survive the round-trip unchanged. */
+static void *kai_llvm_build_ptrtoint(void *b, void *v, void *ty) {
+    return (void *) LLVMBuildPtrToInt((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) ty, "");
+}
+static void *kai_llvm_build_inttoptr(void *b, void *v, void *ty) {
+    return (void *) LLVMBuildIntToPtr((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) ty, "");
+}
+/* Float narrow/widen: `double`→`float` at an F32 call, `float`→`double`
+ * on return. One `fpcast` covers both directions. */
+static void *kai_llvm_build_fpcast(void *b, void *v, void *ty) {
+    return (void *) LLVMBuildFPCast((LLVMBuilderRef) b, (LLVMValueRef) v, (LLVMTypeRef) ty, "");
+}
+/* Struct-value construction in SSA (no memory): start from `undef` of the
+ * struct type, `insertvalue` each field at its index, pass the aggregate
+ * by value (the call-site ABI classifies it from the struct type). On
+ * return, `extractvalue` each field out. */
+static void *kai_llvm_get_undef(void *ty) {
+    return (void *) LLVMGetUndef((LLVMTypeRef) ty);
+}
+static void *kai_llvm_build_insertvalue(void *b, void *agg, void *elt, int64_t idx) {
+    return (void *) LLVMBuildInsertValue((LLVMBuilderRef) b, (LLVMValueRef) agg,
+                                         (LLVMValueRef) elt, (unsigned) idx, "");
+}
+static void *kai_llvm_build_extractvalue(void *b, void *agg, int64_t idx) {
+    return (void *) LLVMBuildExtractValue((LLVMBuilderRef) b, (LLVMValueRef) agg,
+                                          (unsigned) idx, "");
+}
+/* Raw `i64` arithmetic for the unboxed-Int path (KIR mode-slave to the
+ * unbox pass). `op`: 0=`add`, 1=`sub`, 2=`mul` — matching the C-direct
+ * oracle's `kair_a + kair_b` on a raw `int64_t`. NO `nsw`/`nuw` flags:
+ * kaikai Int arithmetic WRAPS (the C emitter casts through `uint64_t`), so
+ * signed overflow must be defined two's-complement wrap, not UB the
+ * optimiser could exploit. The plain `LLVMBuildAdd`/`Sub`/`Mul` emit
+ * wrapping ops (no-wrap flags unset). Cases 3/4 (`sdiv`/`srem`) remain for
+ * completeness but the raw div/mod path no longer routes through them — it
+ * calls the checked helper `kai_idiv_chk`/`kai_imod_chk` so div-by-zero and
+ * INT64_MIN/-1 trap. Operands + result are `i64`, NOT boxed Ints: no RC, so
+ * the use-after-free the boxed path hit on a multi-use raw operand cannot
+ * arise. */
+static void *kai_llvm_build_ibinop(void *b, int64_t op, void *a, void *c) {
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
+    switch (op) {
+        case 0:  return (void *) LLVMBuildAdd(bld, la, lc, "");
+        case 1:  return (void *) LLVMBuildSub(bld, la, lc, "");
+        case 2:  return (void *) LLVMBuildMul(bld, la, lc, "");
+        case 3:  return (void *) LLVMBuildSDiv(bld, la, lc, "");
+        default: return (void *) LLVMBuildSRem(bld, la, lc, "");
+    }
+}
+/* Raw `i64` SIGNED comparison → an `i1`. `pred`: 0=`<`, 1=`>`, 2=`<=`,
+ * 3=`>=`, 4=`==`, 5=`!=` — the signed (`S*`) family, matching the C
+ * `<`/`==` on a raw `int64_t`. The result is the `i1` a `condbr` consumes
+ * directly, or the caller boxes via `kaix_bool` at a raw→boxed border. */
+static void *kai_llvm_build_icmp(void *b, int64_t pred, void *a, void *c) {
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
+    LLVMIntPredicate p;
+    switch (pred) {
+        case 0:  p = LLVMIntSLT; break;
+        case 1:  p = LLVMIntSGT; break;
+        case 2:  p = LLVMIntSLE; break;
+        case 3:  p = LLVMIntSGE; break;
+        case 4:  p = LLVMIntEQ;  break;
+        default: p = LLVMIntNE;  break;
+    }
+    return (void *) LLVMBuildICmp(bld, p, la, lc, "");
+}
+/* Raw UNSIGNED comparison → an `i1`, for the UInt32/UInt64 raw path.
+ * `pred`: 0=`<`, 1=`>`, 2=`<=`, 3=`>=`, 4=`==`, 5=`!=` — the unsigned
+ * (`U*`) family (`==`/`!=` are signedness-agnostic). */
+static void *kai_llvm_build_ucmp(void *b, int64_t pred, void *a, void *c) {
+    LLVMBuilderRef bld = (LLVMBuilderRef) b;
+    LLVMValueRef la = (LLVMValueRef) a, lc = (LLVMValueRef) c;
+    LLVMIntPredicate p;
+    switch (pred) {
+        case 0:  p = LLVMIntULT; break;
+        case 1:  p = LLVMIntUGT; break;
+        case 2:  p = LLVMIntULE; break;
+        case 3:  p = LLVMIntUGE; break;
+        case 4:  p = LLVMIntEQ;  break;
+        default: p = LLVMIntNE;  break;
+    }
+    return (void *) LLVMBuildICmp(bld, p, la, lc, "");
+}
+
+/* --- constants + globals --- */
+static void *kai_llvm_const_i32(void *i32ty, int64_t v) {
+    return (void *) LLVMConstInt((LLVMTypeRef) i32ty, (unsigned long long) v, 1);
+}
+/* A null `ptr` — the boxed unit/placeholder a join slot starts at before
+ * a branch stores into it (it is always overwritten before a read). */
+static void *kai_llvm_const_null(void *ptr_t) {
+    return (void *) LLVMConstNull((LLVMTypeRef) ptr_t);
+}
+/* An `i8*` to a private global string constant. Both entry points store
+ * their bytes verbatim: the caller decodes. `kai_llvm_build_global_string`
+ * takes a NUL-terminated name; `kai_llvm_build_string_span` honours the
+ * KaiValue's length, so a literal carrying an embedded NUL survives.
+ * The builder must be positioned in a block; the global is module-level
+ * + private. */
+static void *kai_llvm_build_global_string(void *b, KaiValue *s) {
+    /* A module-level private `[N x i8] c"..."` constant, NOT a builder
+     * instruction. `LLVMBuildGlobalStringPtr` inserts a GEP into the
+     * current block and, on LLVM 22 with opaque pointers + a private
+     * context, produced an unserialisable value (the module crashed in
+     * the printer/verifier). Mirror the mature LLVM-text emitter: add the
+     * global directly to the module and hand back its pointer — the i8
+     * array type comes from the builder's context so nothing is
+     * cross-context. The runtime ctor reads the bytes as `const char *`. */
+    LLVMBasicBlockRef bb = LLVMGetInsertBlock((LLVMBuilderRef) b);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(bb);
+    LLVMModuleRef m = LLVMGetGlobalParent(fn);
+    LLVMContextRef ctx = LLVMGetModuleContext(m);
+    const char *bytes = s->as.s.bytes;
+    unsigned len = (unsigned) strlen(bytes);
+    LLVMValueRef init = LLVMConstStringInContext(ctx, bytes, len, 0); /* NUL-terminated */
+    LLVMValueRef g = LLVMAddGlobal(m, LLVMTypeOf(init), "str");
+    LLVMSetInitializer(g, init);
+    LLVMSetGlobalConstant(g, 1);
+    LLVMSetLinkage(g, LLVMPrivateLinkage);
+    LLVMSetUnnamedAddr(g, 1);
+    if (s) kai_decref(s);
+    return (void *) g;
+}
+static void *kai_llvm_build_string_span(void *b, KaiValue *s) {
+    /* The literal arrives ALREADY DECODED from the compiler's shared
+     * escape table (compiler/escapes.kai), carrying its own length, so
+     * an embedded NUL survives. This used to re-decode C99 escapes here
+     * to match what `cc` did for the C backend's verbatim
+     * `kai_str("...")` — two tables that drifted apart. */
+    const char *buf = s->as.s.bytes;
+    size_t w = s->as.s.len;
+    /* Module-level private constant (NOT a builder instruction) — same
+     * fix as `kai_llvm_build_global_string`: `LLVMBuildGlobalStringPtr`
+     * yields an unserialisable value on LLVM 22 opaque-ptr + private
+     * context. `w` is the de-escaped length (an embedded `\0` is kept). */
+    LLVMBasicBlockRef bb = LLVMGetInsertBlock((LLVMBuilderRef) b);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(bb);
+    LLVMModuleRef m = LLVMGetGlobalParent(fn);
+    LLVMContextRef ctx = LLVMGetModuleContext(m);
+    LLVMValueRef init = LLVMConstStringInContext(ctx, buf, (unsigned) w, 0);
+    LLVMValueRef g = LLVMAddGlobal(m, LLVMTypeOf(init), "str");
+    LLVMSetInitializer(g, init);
+    LLVMSetGlobalConstant(g, 1);
+    LLVMSetLinkage(g, LLVMPrivateLinkage);
+    LLVMSetUnnamedAddr(g, 1);
+    if (s) kai_decref(s);
+    return (void *) g;
+}
+
+/* A module-level zero-initialised internal global of type `ty`, returning
+ * its address. The native default-handler install needs the `EvX` blob and
+ * the `KaiEvidence` node to OUTLIVE `kai_main_install_defaults`'s frame (the
+ * evidence stays pushed for the whole program), so they are module globals,
+ * not entry-block allocas — the C-direct oracle emits `static EvStdout
+ * _kai_default_ev_stdout;` for exactly this reason. Internal linkage + a
+ * zero initialiser match the C `static` (file-scope, zero-init). The type
+ * comes from the module's context so nothing is cross-context. */
+static void *kai_llvm_add_global_zeroed(void *m, void *ty, KaiValue *name) {
+    LLVMValueRef g = LLVMAddGlobal((LLVMModuleRef) m, (LLVMTypeRef) ty, name->as.s.bytes);
+    LLVMSetInitializer(g, LLVMConstNull((LLVMTypeRef) ty));
+    LLVMSetLinkage(g, LLVMInternalLinkage);
+    if (name) kai_decref(name);
+    return (void *) g;
+}
+
+/* Modular backend: the default-evidence globals cross object boundaries, so
+ * the owner TU defines them EXTERNAL (zero-init, cross-TU visible) and every
+ * other TU declares them EXTERNAL with no initializer. Same shape as
+ * `add_global_zeroed` but external linkage — the single-TU path keeps
+ * internal linkage so its byte-id is untouched. */
+static void *kai_llvm_add_global_extern_def(void *m, void *ty, KaiValue *name) {
+    LLVMValueRef g = LLVMAddGlobal((LLVMModuleRef) m, (LLVMTypeRef) ty, name->as.s.bytes);
+    LLVMSetInitializer(g, LLVMConstNull((LLVMTypeRef) ty));
+    LLVMSetLinkage(g, LLVMExternalLinkage);
+    if (name) kai_decref(name);
+    return (void *) g;
+}
+
+/* A leaf TU's external DECLARATION of an owner-defined global: no initializer
+ * (LLVM reads that as an external declaration) so the definition stays unique
+ * to the owner and the link resolves the reference across objects. */
+static void *kai_llvm_add_global_extern_decl(void *m, void *ty, KaiValue *name) {
+    LLVMValueRef g = LLVMAddGlobal((LLVMModuleRef) m, (LLVMTypeRef) ty, name->as.s.bytes);
+    LLVMSetLinkage(g, LLVMExternalLinkage);
+    if (name) kai_decref(name);
+    return (void *) g;
+}
+
+/* (The `i32 variant_tag` reader the emitted object calls for a `KTagOf`
+ * — `kaix_variant_tag_of` — is a RUNTIME symbol in stage0/runtime_llvm.c
+ * next to `kaix_is_variant_tag`, not a C-API builder prim: the native
+ * object links it, the compiler does not call it.) */
+
+/* --- DWARF debug info (#500) ---------------------------------------------
+ * The native backend emits DWARF line tables in --debug so `lldb`/`gdb`
+ * break on kaikai source lines and a panic resolves to `<file>.kai:<line>`
+ * via `atos`/`addr2line`. The metadata lives in the off-RC `KaiNativeCtx`
+ * (same vehicle as every other LLVM handle — a `DIBuilderRef` must never
+ * ride a kaikai record/list). The kaikai walk calls six high-level prims;
+ * the per-DI-node LLVM sequence stays in C so the emit_native code reads as
+ * "enable / open subprogram / set line / finalize", not raw DIBuilder.
+ *
+ * Scope: one DIFile + DICompileUnit per module, one DISubprogram per fn (a
+ * void() subroutine type — enough for line tables; we do not describe
+ * parameter/local types, which is out of scope per #500). A `set_loc`
+ * attaches the current subprogram as the location scope. Every prim is a
+ * NO-OP when DI was never enabled (`c->dib == NULL`), so a release/default
+ * build that never calls `native_di_enable` is byte-identical. */
+
+/* Enable DWARF for module `m`'s ctx: build the DIBuilder, the DIFile from
+ * (filename, directory), and the compile unit, and set the module's DWARF
+ * version + debug-info-version flags (without them the backend drops the
+ * metadata silently). Idempotent — a second call is a no-op.
+ *
+ * Gated on KAI_BUILD_MODE=debug, read HERE in C — the same place the opt
+ * level is gated (`kai_llvm_pass_pipeline` reads KAI_NATIVE_OPT). The
+ * kaikai walk calls this unconditionally; a non-debug build leaves `c->dib`
+ * NULL, so every later DI prim is a no-op and the module is byte-identical
+ * to before this lane. Keeping the gate in C means the emit_native walk
+ * needs no env-var prim. */
+static KaiValue *kai_native_di_enable(void *cv, KaiValue *fnamev, KaiValue *dirv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    const char *mode = getenv("KAI_BUILD_MODE");
+    if (!mode || strcmp(mode, "debug") != 0) { kai_decref(fnamev); kai_decref(dirv); return kai_unit(); }
+    if (c->dib) { kai_decref(fnamev); kai_decref(dirv); return kai_unit(); }
+    LLVMModuleRef m = (LLVMModuleRef) c->m;
+    LLVMContextRef ctx = LLVMGetModuleContext(m);
+    /* DWARF needs these module flags; emit them once. Values match what
+     * clang sets for `-g` on the LLVM 18 line. */
+    LLVMMetadataRef dwarf_ver = LLVMValueAsMetadata(
+        LLVMConstInt(LLVMInt32TypeInContext(ctx), 4, 0));
+    LLVMAddModuleFlag(m, LLVMModuleFlagBehaviorWarning, "Dwarf Version", 13, dwarf_ver);
+    LLVMMetadataRef di_ver = LLVMValueAsMetadata(
+        LLVMConstInt(LLVMInt32TypeInContext(ctx), (unsigned) LLVMDebugMetadataVersion(), 0));
+    LLVMAddModuleFlag(m, LLVMModuleFlagBehaviorWarning, "Debug Info Version", 18, di_ver);
+
+    c->dib = LLVMCreateDIBuilder(m);
+    /* The kaikai-side path is the entry file kaic2 saw — which `bin/kai`
+     * copied to $tmp, so it is ephemeral. KAI_DEBUG_SRC carries the user's
+     * ORIGINAL absolute path; prefer it so the DIFile + comp_dir point at the
+     * real source `lldb`/`gdb` can open. Split it into (dir, base) here. */
+    const char *fname = fnamev->as.s.bytes;
+    const char *dir = dirv->as.s.bytes;
+    char dirbuf[4096];
+    const char *real = getenv("KAI_DEBUG_SRC");
+    if (real && real[0]) {
+        const char *slash = strrchr(real, '/');
+        if (slash) {
+            size_t dl = (size_t) (slash - real);
+            if (dl >= sizeof dirbuf) dl = sizeof dirbuf - 1;
+            memcpy(dirbuf, real, dl); dirbuf[dl] = '\0';
+            dir = dirbuf; fname = slash + 1;
+        } else {
+            fname = real;
+        }
+    }
+    c->difile = LLVMDIBuilderCreateFile((LLVMDIBuilderRef) c->dib,
+        fname, strlen(fname), dir, strlen(dir));
+    c->dicu = LLVMDIBuilderCreateCompileUnit((LLVMDIBuilderRef) c->dib,
+        LLVMDWARFSourceLanguageC, (LLVMMetadataRef) c->difile,
+        "kaikai", 6, /*isOptimized=*/0, "", 0, /*RuntimeVer=*/0,
+        "", 0, LLVMDWARFEmissionFull, /*DWOId=*/0,
+        /*SplitDebugInlining=*/0, /*DebugInfoForProfiling=*/0, "", 0, "", 0);
+    kai_decref(fnamev); kai_decref(dirv);
+    return kai_unit();
+}
+
+/* 1 when DWARF is enabled on this ctx (the --debug walk gates every DI
+ * call on it), 0 otherwise — so the kaikai walk reads `if di_enabled`. */
+static int64_t kai_native_di_enabled(void *cv) {
+    return ((KaiNativeCtx *) cv)->dib ? 1 : 0;
+}
+
+/* Open a DISubprogram for the current fn `fnval` named `name` at source
+ * `line`, attach it (LLVMSetSubprogram), and record it as the current
+ * location scope. No-op when DI is off. */
+static KaiValue *kai_native_di_subprogram(void *cv, void *fnval, KaiValue *namev, int64_t line) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (!c->dib) { kai_decref(namev); return kai_unit(); }
+    /* A `void ()` subroutine type — line tables need a type but not the
+     * parameter shapes (out of scope per #500). */
+    LLVMMetadataRef subty = LLVMDIBuilderCreateSubroutineType(
+        (LLVMDIBuilderRef) c->dib, (LLVMMetadataRef) c->difile, NULL, 0, LLVMDIFlagZero);
+    const char *name = namev->as.s.bytes;
+    unsigned ln = (line > 0) ? (unsigned) line : 1u;
+    LLVMMetadataRef sp = LLVMDIBuilderCreateFunction(
+        (LLVMDIBuilderRef) c->dib, (LLVMMetadataRef) c->dicu,
+        name, strlen(name), name, strlen(name),
+        (LLVMMetadataRef) c->difile, ln, subty,
+        /*IsLocalToUnit=*/0, /*IsDefinition=*/1, /*ScopeLine=*/ln,
+        LLVMDIFlagZero, /*IsOptimized=*/0);
+    LLVMSetSubprogram((LLVMValueRef) fnval, sp);
+    c->disub = sp;
+    /* Seed the builder's current location to this fn's line UNDER THE NEW
+     * subprogram, so the prologue (allocas / param store / entry br, all
+     * emitted before the first statement's `set_loc`) carries a `!dbg`
+     * scoped to THIS fn — not the previous fn's lingering location, which
+     * the shared builder would otherwise keep and which the verifier
+     * rejects as "wrong subprogram". The builder is still positioned in the
+     * previous fn here; this only sets the location state, which persists
+     * across the `position_at_end` the caller does next. */
+    LLVMContextRef lctx = LLVMGetModuleContext((LLVMModuleRef) c->m);
+    LLVMMetadataRef ploc = LLVMDIBuilderCreateDebugLocation(lctx, ln, 0, sp, NULL);
+    LLVMSetCurrentDebugLocation2((LLVMBuilderRef) c->b, ploc);
+    kai_decref(namev);
+    return kai_unit();
+}
+
+/* Set the builder's current debug location to (line, col) under the
+ * current subprogram scope. No-op when DI is off or no subprogram is open
+ * (a synthetic fn with no source). The walk calls this before each
+ * source-bearing instruction; `set_loc(0,0)` style positions never reach
+ * here (the walk only calls on a real KAt). */
+static KaiValue *kai_native_di_set_loc(void *cv, int64_t line, int64_t col) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (!c->dib || !c->disub) return kai_unit();
+    LLVMContextRef ctx = LLVMGetModuleContext((LLVMModuleRef) c->m);
+    LLVMMetadataRef loc = LLVMDIBuilderCreateDebugLocation(
+        ctx, (unsigned) line, (unsigned) col, (LLVMMetadataRef) c->disub, NULL);
+    LLVMSetCurrentDebugLocation2((LLVMBuilderRef) c->b, loc);
+    return kai_unit();
+}
+
+/* Clear the builder's current debug location (the prologue / synthetic
+ * instructions carry none). No-op when DI is off. */
+static KaiValue *kai_native_di_clear_loc(void *cv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (!c->dib) return kai_unit();
+    LLVMSetCurrentDebugLocation2((LLVMBuilderRef) c->b, NULL);
+    return kai_unit();
+}
+
+/* Resolve every temporary DI node — MUST run after the whole module is
+ * built and BEFORE verify (an unfinalized DIBuilder leaves forward-ref
+ * placeholders the verifier rejects). No-op when DI is off. */
+static KaiValue *kai_native_di_finalize(void *cv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (c->dib) LLVMDIBuilderFinalize((LLVMDIBuilderRef) c->dib);
+    return kai_unit();
+}
+
+/* Emit the strong `__kai_build_debug = 1` global that flips the runtime's
+ * weak default (0), so a panic in THIS (debug) binary resolves its backtrace
+ * to .kai:line. No-op when DI is off, so a release/default binary keeps the
+ * weak 0 and the one-line panic. */
+static KaiValue *kai_native_di_debug_marker(void *cv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    if (!c->dib) return kai_unit();
+    LLVMModuleRef m = (LLVMModuleRef) c->m;
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(LLVMGetModuleContext(m));
+    LLVMValueRef g = LLVMAddGlobal(m, i32, "__kai_build_debug");
+    LLVMSetInitializer(g, LLVMConstInt(i32, 1, 0));
+    LLVMSetGlobalConstant(g, 1);
+    return kai_unit();
+}
+
+/* --- optimisation pass pipeline (L4, issue #498) ---
+ * Run the LLVM New-PM pipeline in-process on the module before codegen,
+ * matching the `-O2` the out-of-process C/LLVM-text paths get from
+ * `clang -O2`. Two profiles selected by `KAI_NATIVE_OPT`:
+ *   release (default / "2") — `default<O2>`: the per-module pipeline
+ *     `clang -O2` builds (inlining, vectorisation, unrolling); same
+ *     pass set, so native matches the C path's runtime perf.
+ *   debug ("0") — `default<O0>`: minimum legalisation, no inlining,
+ *     fast compile, symbols kept. Selected by `bin/kai --debug`.
+ * Levels "1"/"3"/"s"/"z" map straight to `default<O1|O3|Os|Oz>`; any
+ * other value falls back to O2. The pipeline string format is the same
+ * as `opt -passes=` and stable across the LLVM 18.x series.
+ *
+ * Runs AFTER verify (a pass set assumes verified IR; verify catches a
+ * codegen bug with a clear message before a pass turns it into an opaque
+ * LLVM crash) and reuses the SAME TargetMachine the emit step builds, so
+ * the pipeline's TargetTransformInfo cost model matches the emission
+ * target exactly (asu review). Returns 0 on success, non-zero on a pass
+ * error (surfaced like a verify failure). */
+static const char *kai_llvm_pass_pipeline(void) {
+    const char *lvl = getenv("KAI_NATIVE_OPT");
+    if (!lvl || !lvl[0]) return "default<O2>";   /* default: release */
+    if (strcmp(lvl, "0") == 0) return "default<O0>";
+    if (strcmp(lvl, "1") == 0) return "default<O1>";
+    if (strcmp(lvl, "3") == 0) return "default<O3>";
+    if (strcmp(lvl, "s") == 0) return "default<Os>";
+    if (strcmp(lvl, "z") == 0) return "default<Oz>";
+    return "default<O2>";                         /* "2" and unknowns */
+}
+
+static int64_t kai_llvm_run_passes(LLVMModuleRef m, LLVMTargetMachineRef tm) {
+    const char *pipeline = kai_llvm_pass_pipeline();
+    LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
+    LLVMErrorRef e = LLVMRunPasses(m, pipeline, tm, opts);
+    LLVMDisposePassBuilderOptions(opts);
+    if (e) {
+        char *msg = LLVMGetErrorMessage(e);   /* consumes e + allocates msg */
+        fprintf(stderr, "kai: native opt pass pipeline (%s) failed: %s\n",
+                pipeline, msg ? msg : "?");
+        LLVMDisposeErrorMessage(msg);         /* frees msg; do NOT ConsumeError(e) */
+        return 1;
+    }
+    return 0;
+}
+
+/* --- runtime bitcode link (P2, docs/native-codegen-perf-plan.md §P2) ---
+ *
+ * The native walk emits the runtime ops (`kaix_cons`, `kaix_variant_arg`,
+ * the list spine, the arithmetic helpers) as external `declare`s; their
+ * bodies live in `runtime_llvm.c`, compiled and linked by `cc` AFTER the
+ * in-process `default<O2>` pass. With no LTO, O2 sees opaque call barriers
+ * it cannot inline through — so a heap-bound loop (`list_fold`, the
+ * rb-tree) pays a real call per `kaix_cons` even at O2.
+ *
+ * This step closes that gap WITHOUT an LTO toolchain dependency or a second
+ * source of the runtime: `runtime_llvm.c` is compiled to LLVM bitcode at
+ * build time (`tools/gen-runtime-bc.sh`, clang 18, the same `-I stage2 -I
+ * stage0` resolution the cc link uses, so its `<runtime.h>` binds to the
+ * Koka runtime exactly as the C path does), and that bitcode is
+ * `LLVMLinkModules2`'d into the in-process module BEFORE the opt pipeline
+ * runs. O2 then sees the runtime BODIES and inlines/specialises them into
+ * the hot loop.
+ *
+ * Symbol model (asu-reviewed): a full link (Model X), NOT an
+ * `available_externally` graft (Model Y, the two-convergent-runtimes
+ * anti-pattern that killed the text-LLVM backend). After the link the
+ * runtime defs are merged physically into this module; we `internalize`
+ * every definition except `main` (the OS entry point the linker resolves)
+ * so the inliner can DCE the merged bodies it folds away. Because the
+ * bitcode supplies `main` + all `kaix_*` + the kaikai entry hooks, the
+ * resulting object is SELF-CONTAINED: the driver drops `runtime_llvm.c`
+ * from the final `cc` link (re-linking it would be a duplicate symbol).
+ *
+ * The bitcode path comes from `KAI_NATIVE_RUNTIME_BC` (the `bin/kai`
+ * wrapper resolves it next to `runtime_llvm.c`, mirroring how it resolves
+ * `RUNTIME_LLVM_C`; the stage2 Makefile builds it). When the env var is
+ * unset or the file is absent (a build without clang 18, so no bitcode was
+ * produced), this is a NO-OP and the driver falls back to the legacy
+ * `cc`-links-runtime_llvm.c path — correct, just unoptimised. The opt level
+ * is unchanged.
+ *
+ * MUST run after the module's target triple + data layout are set (this
+ * function copies them onto the bitcode source before linking, so the merge
+ * is clean and layout-correct) and BEFORE the opt pipeline. Returns 0 on
+ * success OR no-op; non-zero only on a real parse/link failure (a corrupt or
+ * incompatible bitcode), which the caller surfaces like a verify failure
+ * rather than emitting a half-linked module. */
+/* The program-emitted entry points the runtime OWNER object (cc-compiled
+ * runtime_llvm.c) calls into this whole-program object: its `main` invokes
+ * these across the object boundary, so they MUST stay external through the
+ * internaliser or the final cc link cannot resolve them. Before the hot/owner
+ * split `main` lived in the merged bitcode and called `kai_main` intra-module,
+ * so internalising all-but-`main` was enough; now `main` is owner-only. */
+static int kai_llvm_is_owner_entry_point(const char *nm) {
+    if (!nm) return 0;
+    return strcmp(nm, "main") == 0                       /* OS entry (owner-defined now) */
+        || strcmp(nm, "kai_main") == 0                   /* program body the owner's main runs */
+        || strcmp(nm, "_kai_proto_init_llvm") == 0       /* proto table init */
+        || strcmp(nm, "kai_main_install_defaults") == 0  /* default-handler install */
+        || strcmp(nm, "kai_main_teardown_defaults") == 0;/* default-handler teardown */
+}
+
+static void kai_llvm_internalize_except_main(LLVMModuleRef m) {
+    for (LLVMValueRef f = LLVMGetFirstFunction(m); f; f = LLVMGetNextFunction(f)) {
+        if (LLVMIsDeclaration(f)) continue;            /* nothing to internalise */
+        if (kai_llvm_is_owner_entry_point(LLVMGetValueName(f))) continue;
+        LLVMSetLinkage(f, LLVMInternalLinkage);
+    }
+    /* Globals defined by the runtime (string/variant-head tables, the
+     * default-evidence blobs) are referenced only from inside this now-merged
+     * module; internalise them too so globalDCE under O2 can drop the unused
+     * ones. A global the emitted code still references survives (it has a
+     * user); one the inliner folded away does not. */
+    for (LLVMValueRef g = LLVMGetFirstGlobal(m); g; g = LLVMGetNextGlobal(g)) {
+        if (LLVMIsDeclaration(g)) continue;
+        LLVMSetLinkage(g, LLVMInternalLinkage);
+    }
+}
+
+static int64_t kai_llvm_link_runtime_bc(void *m) {
+    const char *bc_path = getenv("KAI_NATIVE_RUNTIME_BC");
+    if (!bc_path || !bc_path[0]) return 0;             /* opt-out: legacy cc-links path */
+
+    LLVMMemoryBufferRef buf = NULL;
+    char *err = NULL;
+    if (LLVMCreateMemoryBufferWithContentsOfFile(bc_path, &buf, &err)) {
+        /* File named but unreadable — not a no-op situation (the driver set
+         * the var, so it expected a bitcode). Fail loudly. */
+        fprintf(stderr, "kai: native runtime bitcode unreadable (%s): %s\n",
+                bc_path, err ? err : "?");
+        if (err) LLVMDisposeMessage(err);
+        return 1;
+    }
+
+    /* Parse INTO the destination module's context — LLVMLinkModules2 rejects
+     * a cross-context source. LLVMParseIRInContext takes ownership of `buf`. */
+    LLVMContextRef ctx = LLVMGetModuleContext((LLVMModuleRef) m);
+    LLVMModuleRef src = NULL;
+    err = NULL;
+    if (LLVMParseIRInContext(ctx, buf, &src, &err)) {
+        fprintf(stderr, "kai: native runtime bitcode parse failed (%s): %s\n",
+                bc_path, err ? err : "?");
+        if (err) LLVMDisposeMessage(err);
+        return 1;
+    }
+
+    /* Reconcile the source's triple + data layout to the destination's BEFORE
+     * the link. The bitcode was produced by `clang -O2` with its own SDK
+     * triple (e.g. `arm64-apple-macosx16.0.0`), while the in-process module
+     * carries `LLVMGetDefaultTargetTriple()` (e.g. `...-darwin25.5.0`). The
+     * two are ABI-identical (same arch, same host LLVM), but a literal string
+     * mismatch makes LLVMLinkModules2 emit a noisy "different target triples"
+     * warning and would, on a real cross-target difference, keep the
+     * destination's silently. We set them equal so the link is clean and the
+     * match is guaranteed on every platform regardless of how the bitcode was
+     * generated. The destination's triple/layout were set by the caller from
+     * the emit TargetMachine just above this call. */
+    {
+        const char *dst_triple = LLVMGetTarget((LLVMModuleRef) m);
+        if (dst_triple) LLVMSetTarget(src, dst_triple);
+        LLVMSetModuleDataLayout(src, LLVMGetModuleDataLayout((LLVMModuleRef) m));
+    }
+
+    /* LLVMLinkModules2 consumes (and disposes) `src`. Returns 1 on error. */
+    if (LLVMLinkModules2((LLVMModuleRef) m, src)) {
+        fprintf(stderr, "kai: native runtime bitcode link failed (%s)\n", bc_path);
+        return 1;
+    }
+
+    kai_llvm_internalize_except_main((LLVMModuleRef) m);
+    return 0;
+}
+
+/* Modular runtime-bc merge: link the SEPARATE-COMPILATION runtime bitcode (its
+ * state globals are `external`, owned by the one runtime TU at link) into a
+ * partition so O2 inlines the `kaix_*` hot ops, WITHOUT duplicating runtime
+ * STATE across the N partition objects.
+ *
+ * The whole-program path internalises everything-but-main, which would strip
+ * the external linkage a cross-partition user call depends on. This path
+ * instead internalises only the RUNTIME functions the merge brought in — a
+ * function is "from the runtime" iff it was NOT defined in the partition
+ * before the merge. Those runtime bodies go `internal` so O2 inlines + DCEs
+ * them per partition; the user's own fns keep their linkage (external for the
+ * cross-TU calls), and the runtime's state globals stay `external` references
+ * resolved by the runtime owner. The result: the `kaix_*` ops inline into the
+ * hot path, one runtime-state instance survives (identity across partitions is
+ * preserved), and cross-partition symbols still link. Returns 0 on success or
+ * no-op (bc path unset), non-zero only on a real parse/link failure. */
+static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
+    const char *bc_path = getenv("KAI_NATIVE_RUNTIME_INLINE_BC");
+    if (!bc_path || !bc_path[0]) return 0;             /* opt-out: runtime stays an owner-TU call */
+
+    LLVMModuleRef mod = (LLVMModuleRef) m;
+
+    /* Snapshot the partition's OWN function names before the merge, so the
+     * post-merge internaliser can tell a runtime body (to fold away) from a
+     * user body (to keep external for cross-TU linkage). A partition has a
+     * bounded fn count; a flat name set keeps the check simple and allocation
+     * a single grow-on-demand array. */
+    size_t pre_cap = 64, pre_n = 0;
+    char **pre = (char **) malloc(pre_cap * sizeof(char *));
+    if (!pre) { fprintf(stderr, "kai: native modular merge OOM\n"); return 1; }
+    for (LLVMValueRef f = LLVMGetFirstFunction(mod); f; f = LLVMGetNextFunction(f)) {
+        if (LLVMIsDeclaration(f)) continue;
+        const char *nm = LLVMGetValueName(f);
+        if (!nm) continue;
+        if (pre_n == pre_cap) {
+            pre_cap *= 2;
+            char **np = (char **) realloc(pre, pre_cap * sizeof(char *));
+            if (!np) { free(pre); fprintf(stderr, "kai: native modular merge OOM\n"); return 1; }
+            pre = np;
+        }
+        pre[pre_n++] = strdup(nm);
+    }
+
+    LLVMMemoryBufferRef buf = NULL;
+    char *err = NULL;
+    if (LLVMCreateMemoryBufferWithContentsOfFile(bc_path, &buf, &err)) {
+        fprintf(stderr, "kai: native runtime inline bitcode unreadable (%s): %s\n",
+                bc_path, err ? err : "?");
+        if (err) LLVMDisposeMessage(err);
+        for (size_t i = 0; i < pre_n; i++) free(pre[i]);
+        free(pre);
+        return 1;
+    }
+    LLVMContextRef ctx = LLVMGetModuleContext(mod);
+    LLVMModuleRef src = NULL;
+    err = NULL;
+    if (LLVMParseIRInContext(ctx, buf, &src, &err)) {
+        fprintf(stderr, "kai: native runtime inline bitcode parse failed (%s): %s\n",
+                bc_path, err ? err : "?");
+        if (err) LLVMDisposeMessage(err);
+        for (size_t i = 0; i < pre_n; i++) free(pre[i]);
+        free(pre);
+        return 1;
+    }
+    {
+        const char *dst_triple = LLVMGetTarget(mod);
+        if (dst_triple) LLVMSetTarget(src, dst_triple);
+        LLVMSetModuleDataLayout(src, LLVMGetModuleDataLayout(mod));
+    }
+    if (LLVMLinkModules2(mod, src)) {
+        fprintf(stderr, "kai: native runtime inline bitcode link failed (%s)\n", bc_path);
+        for (size_t i = 0; i < pre_n; i++) free(pre[i]);
+        free(pre);
+        return 1;
+    }
+
+    /* Internalise every DEFINED function that was not in the pre-merge set —
+     * i.e. the runtime bodies just merged in, INCLUDING `main`. O2 then inlines
+     * the always_inline `kaix_*` ops and globalDCE drops the rest (a partition
+     * never calls the runtime's `main`, so it is dropped). Unlike the
+     * whole-program path, `main` is NOT kept external here: the ONE OS entry
+     * point comes from the runtime owner TU, so a partition exporting its own
+     * merged copy would collide with the owner's at link. User fns (in the pre
+     * set) and the runtime's external state globals are untouched. */
+    for (LLVMValueRef f = LLVMGetFirstFunction(mod); f; f = LLVMGetNextFunction(f)) {
+        if (LLVMIsDeclaration(f)) continue;
+        const char *nm = LLVMGetValueName(f);
+        if (!nm) continue;
+        int was_user = 0;
+        for (size_t i = 0; i < pre_n; i++) {
+            if (strcmp(pre[i], nm) == 0) { was_user = 1; break; }
+        }
+        if (!was_user) LLVMSetLinkage(f, LLVMInternalLinkage);
+    }
+
+    for (size_t i = 0; i < pre_n; i++) free(pre[i]);
+    free(pre);
+    return 0;
+}
+
+/* Copy one function attribute (by name) from `src` onto `dst` if `dst` lacks it. */
+static void kai_llvm_copy_fn_str_attr(LLVMValueRef dst, LLVMValueRef src,
+                                      const char *name, unsigned nlen) {
+    if (LLVMGetStringAttributeAtIndex(dst, LLVMAttributeFunctionIndex, name, nlen)) return;
+    LLVMAttributeRef a = LLVMGetStringAttributeAtIndex(src, LLVMAttributeFunctionIndex, name, nlen);
+    if (a) LLVMAddAttributeAtIndex(dst, LLVMAttributeFunctionIndex, a);
+}
+
+/* Give every emitted program function the SAME `target-cpu`/`target-features`
+ * the linked runtime bitcode carries, so the inliner sees caller ⊇ callee and
+ * folds the `kaix_*` ops into the hot path — without this the featureless
+ * program function is not a superset of the featured runtime callee and
+ * `areInlineCompatible` refuses every runtime-op inline. The attributes are
+ * copied from a runtime function already in the module (clang baked host
+ * features into the bc), which guarantees an exact match regardless of what
+ * `LLVMGetHostCPUFeatures` reports on this libLLVM build. MUST run after the bc
+ * is linked (so a donor is present) and before the opt pipeline. No-op when no
+ * runtime function carries the attributes (the legacy cc-links path). */
+static void kai_llvm_stamp_host_features(LLVMModuleRef m) {
+    LLVMValueRef donor = NULL;
+    for (LLVMValueRef f = LLVMGetFirstFunction(m); f; f = LLVMGetNextFunction(f)) {
+        if (LLVMIsDeclaration(f)) continue;
+        if (LLVMGetStringAttributeAtIndex(f, LLVMAttributeFunctionIndex, "target-features", 15)) {
+            donor = f; break;
+        }
+    }
+    if (!donor) return;
+    for (LLVMValueRef f = LLVMGetFirstFunction(m); f; f = LLVMGetNextFunction(f)) {
+        if (LLVMIsDeclaration(f)) continue;
+        kai_llvm_copy_fn_str_attr(f, donor, "target-cpu", 10);
+        kai_llvm_copy_fn_str_attr(f, donor, "target-features", 15);
+    }
+}
+
+/* --- object emission --- */
+/* Verify the module, then emit it as a native object file at `path`
+ * using the host target machine. Returns 0 on success, non-zero on a
+ * verify or codegen failure (the driver surfaces the error and aborts).
+ * One process: no `.ll` text, no `clang` subprocess. */
+static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runtime) {
+    const char *out = path->as.s.bytes;
+    int64_t rc = 0;
+    char *err = NULL;
+
+    /* Debug hook (KIR native walk): dump the in-memory module IR to the
+     * path in KAI_NATIVE_DUMP_IR before verify, so a malformed module can
+     * be inspected. Off by default; never affects the emitted object. */
+    {
+        const char *ir_path = getenv("KAI_NATIVE_DUMP_IR");
+        if (ir_path && ir_path[0]) {
+            char *ir_err = NULL;
+            LLVMPrintModuleToFile((LLVMModuleRef) m, ir_path, &ir_err);
+            if (ir_err) LLVMDisposeMessage(ir_err);
+        }
+    }
+
+    if (LLVMVerifyModule((LLVMModuleRef) m, LLVMReturnStatusAction, &err)) {
+        fprintf(stderr, "kai: native module verify failed: %s\n", err ? err : "?");
+        if (err) LLVMDisposeMessage(err);
+        if (path) kai_decref(path);
+        return 1;
+    }
+    if (err) { LLVMDisposeMessage(err); err = NULL; }
+
+    LLVMInitializeNativeTarget();
+    LLVMInitializeNativeAsmPrinter();
+
+    char *triple = LLVMGetDefaultTargetTriple();
+    LLVMTargetRef target = NULL;
+    if (LLVMGetTargetFromTriple(triple, &target, &err)) {
+        fprintf(stderr, "kai: native target lookup failed: %s\n", err ? err : "?");
+        if (err) LLVMDisposeMessage(err);
+        LLVMDisposeMessage(triple);
+        if (path) kai_decref(path);
+        return 1;
+    }
+    char *cpu = LLVMGetHostCPUName();
+    char *features = LLVMGetHostCPUFeatures();
+    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
+        target, triple, cpu ? cpu : "", features ? features : "",
+        kai_llvm_cgen_level(), LLVMRelocPIC, LLVMCodeModelDefault);
+    if (cpu) LLVMDisposeMessage(cpu);
+    if (features) LLVMDisposeMessage(features);
+    LLVMSetTarget((LLVMModuleRef) m, triple);
+    LLVMSetModuleDataLayout((LLVMModuleRef) m, LLVMCreateTargetDataLayout(tm));
+
+    /* P2: link the runtime as bitcode BEFORE opt, so default<O2> sees the
+     * `kaix_*` bodies and inlines them (no-op when KAI_NATIVE_RUNTIME_BC is
+     * unset — the legacy cc-links-runtime_llvm.c path). Runs after the
+     * triple/datalayout are set (they must match the bitcode's) and before
+     * the pipeline. A real link failure aborts before EmitToFile.
+     *
+     * `link_runtime`: 1 = whole-program (merge the full runtime bc, internalise
+     * all-but-main); 2 = modular partition (merge the SEPARATE-COMPILATION
+     * runtime bc whose state globals are external-owned, internalise only the
+     * merged runtime FUNCTIONS so O2 inlines the `kaix_*` ops without
+     * duplicating runtime state or stripping cross-TU user linkage); 0 = no
+     * merge (the runtime is one owner TU linked by cc). */
+    int merge_rc = 0;
+    if (link_runtime == 1)      merge_rc = kai_llvm_link_runtime_bc(m);
+    else if (link_runtime == 2) merge_rc = kai_llvm_link_runtime_bc_modular(m);
+    if (merge_rc) {
+        LLVMDisposeTargetMachine(tm);
+        LLVMDisposeMessage(triple);
+        if (path) kai_decref(path);
+        return 1;
+    }
+
+    /* Propagate the runtime bc's host target-cpu/features onto the emitted
+     * program functions so the opt pipeline can inline the runtime ops. Runs
+     * on the linked module (donor present) and before the passes. */
+    kai_llvm_stamp_host_features((LLVMModuleRef) m);
+
+    /* L4 (issue #498): optimise the module in-process before codegen.
+     * Default `default<O2>` for parity with the clang `-O2` the C/LLVM-
+     * text paths get; `KAI_NATIVE_OPT=0` (bin/kai --debug) drops to O0.
+     * A pass error aborts before EmitToFile (no half-optimised object). */
+    if (kai_llvm_run_passes((LLVMModuleRef) m, tm)) {
+        LLVMDisposeTargetMachine(tm);
+        LLVMDisposeMessage(triple);
+        if (path) kai_decref(path);
+        return 1;
+    }
+
+    /* ELF garbage-collects at section granularity, and the C API has no
+     * FunctionSections toggle, so stamp every defined function into its own
+     * .text.<name> section; the executable link then passes --gc-sections.
+     * Mach-O needs nothing here: LLVM emits subsections-via-symbols and the
+     * link dead-strips per atom. Unconditional so a content-addressed object
+     * never depends on the linker flag being on. */
+#if !defined(__APPLE__) && !defined(_WIN32)
+    for (LLVMValueRef fsec = LLVMGetFirstFunction((LLVMModuleRef) m); fsec;
+         fsec = LLVMGetNextFunction(fsec)) {
+        if (LLVMIsDeclaration(fsec)) continue;
+        const char *cursec = LLVMGetSection(fsec);
+        if (cursec && cursec[0]) continue;
+        size_t fnlen = 0;
+        const char *fname = LLVMGetValueName2(fsec, &fnlen);
+        if (!fname || fnlen == 0) continue;
+        char *secname = (char *) malloc(fnlen + 7);
+        if (!secname) continue;
+        memcpy(secname, ".text.", 6);
+        memcpy(secname + 6, fname, fnlen);
+        secname[fnlen + 6] = '\0';
+        LLVMSetSection(fsec, secname);
+        free(secname);
+    }
+#endif
+
+    /* Atomic publish: emit to a pid-suffixed sibling, then rename() onto the
+     * final path. A content-addressed object (the shared core cache) can be
+     * read by a concurrent build the moment it exists, so it must never be
+     * observable half-written; rename within one directory is atomic. */
+    {
+        char tmp_out[4096];
+        snprintf(tmp_out, sizeof tmp_out, "%s.tmp%ld", out, (long) getpid());
+        if (LLVMTargetMachineEmitToFile(tm, (LLVMModuleRef) m, tmp_out, LLVMObjectFile, &err)) {
+            fprintf(stderr, "kai: native object emit failed: %s\n", err ? err : "?");
+            if (err) LLVMDisposeMessage(err);
+            unlink(tmp_out);
+            rc = 1;
+        } else if (rename(tmp_out, out) != 0) {
+            fprintf(stderr, "kai: native object publish failed: %s -> %s\n", tmp_out, out);
+            unlink(tmp_out);
+            rc = 1;
+        }
+    }
+
+    LLVMDisposeTargetMachine(tm);
+    LLVMDisposeMessage(triple);
+    if (path) kai_decref(path);
+    return rc;
+}
+
+/* Whole-program object: merge the runtime bitcode + internalise so O2 inlines
+ * the `kaix_*` bodies. The default single-TU native path. */
+static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
+    return kai_llvm_emit_object_impl(m, path, 1);
+}
+
+/* One partition of a modular build. With KAI_NATIVE_RUNTIME_INLINE_BC set,
+ * merges the separate-compilation runtime bc so O2 inlines the `kaix_*` hot
+ * ops into this partition (runtime state stays external, owned by the runtime
+ * TU — no per-partition duplication). Unset → no merge, the runtime is one
+ * owner TU linked by cc (the legacy path). Cross-TU user symbols keep external
+ * linkage either way. */
+static int64_t kai_llvm_emit_object_raw(void *m, KaiValue *path) {
+    return kai_llvm_emit_object_impl(m, path, 2);
+}
+#else /* !KAI_LLVM */
+/* Default / bootstrap build: libLLVM is not linked, so the C-API
+ * forwarders are stubs. They exist only so the emitted compiler (which
+ * always contains the `emit_native` code path) LINKS; calling
+ * `--emit=native` on a kaic2 built without `KAI_LLVM=1` aborts here with
+ * a clear message instead of a link error. The default backend never
+ * reaches these (it dispatches to the C-text emitter). */
+static void *kai_llvm_native_unavailable(void) {
+    fprintf(stderr,
+        "kai: the native (in-process libLLVM) backend is not built into this "
+        "compiler.\n     Rebuild stage2 with `make KAI_LLVM=1` to enable "
+        "`--emit=native`.\n");
+    exit(1);
+    return NULL;
+}
+static void *kai_llvm_module_new(KaiValue *name) { (void) name; return kai_llvm_native_unavailable(); }
+/* Parte B native-context stubs. */
+static void *kai_native_ctx_new(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_b(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_m(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_ptrt(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_i64t(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_i32t(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_i128t(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_voidt(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_f64t(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_const_real(void *t, double d) { (void) t; (void) d; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_fbinop(void *b, int64_t op, void *a, void *c) { (void) b; (void) op; (void) a; (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_fcmp(void *b, int64_t p, void *a, void *c) { (void) b; (void) p; (void) a; (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_fneg(void *b, void *a) { (void) b; (void) a; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_logical(void *b, int64_t op, void *a, void *c) { (void) b; (void) op; (void) a; (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_lnot(void *b, void *a) { (void) b; (void) a; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_zext_i1_i32(void *b, void *v, void *t) { (void) b; (void) v; (void) t; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_ibinop(void *b, int64_t op, void *a, void *c) { (void) b; (void) op; (void) a; (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_icmp(void *b, int64_t p, void *a, void *c) { (void) b; (void) p; (void) a; (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_ucmp(void *b, int64_t p, void *a, void *c) { (void) b; (void) p; (void) a; (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_fnval(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_native_ctx_set_fnval(void *c, void *fn) { (void) c; (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_native_ctx_ok(void *c) { (void) c; kai_llvm_native_unavailable(); return 0; }
+static KaiValue *kai_native_ctx_fail(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_ctx_begin_fn(void *c, void *fn) { (void) c; (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_ctx_end_fn(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_ctx_add_frame_slot(void *c, KaiValue *s, KaiValue *e) { (void) c; (void) s; (void) e; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_native_ctx_frame_slot_count(void *c, KaiValue *s) { (void) c; (void) s; kai_llvm_native_unavailable(); return 0; }
+static KaiValue *kai_native_ctx_frame_slot_eff(void *c, KaiValue *s, int64_t j) { (void) c; (void) s; (void) j; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_native_ctx_frame_slot_index(void *c, KaiValue *s, KaiValue *e) { (void) c; (void) s; (void) e; kai_llvm_native_unavailable(); return -1; }
+static KaiValue *kai_native_ctx_add_reg(void *c, KaiValue *n, void *a, int64_t s) { (void) c; (void) n; (void) a; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_native_ctx_find_reg(void *c, KaiValue *n) { (void) c; (void) n; return kai_llvm_native_unavailable(); }
+static int64_t kai_native_ctx_reg_slot(void *c, KaiValue *n) { (void) c; (void) n; kai_llvm_native_unavailable(); return -1; }
+static void *kai_native_ctx_reg_at(void *c, int64_t i) { (void) c; (void) i; return kai_llvm_native_unavailable(); }
+static int64_t kai_native_ctx_reg_slot_at(void *c, int64_t i) { (void) c; (void) i; kai_llvm_native_unavailable(); return -1; }
+static KaiValue *kai_native_ctx_add_block(void *c, KaiValue *l, void *bb) { (void) c; (void) l; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_native_ctx_find_block(void *c, KaiValue *l) { (void) c; (void) l; return kai_llvm_native_unavailable(); }
+static void *kai_native_ctx_first_block(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_int64_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_int32_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_ptr_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_void_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_float_type(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_int_type(void *m, int64_t bits) { (void) m; (void) bits; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_struct_type(void *m, void *buf) { (void) m; (void) buf; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_struct_gep(void *b, void *s, void *p, int64_t i) { (void) b; (void) s; (void) p; (void) i; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_add_byval_decl(void *m, void *fn, int64_t ix, void *s) { (void) m; (void) fn; (void) ix; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_add_byval_call(void *m, void *c, int64_t ix, void *s) { (void) m; (void) c; (void) ix; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_add_sret_decl(void *m, void *fn, void *s) { (void) m; (void) fn; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_add_sret_call(void *m, void *c, void *s) { (void) m; (void) c; (void) s; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_add_nounwind(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_add_memory_none(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_set_internal_linkage(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_native_target_abi(void) { kai_llvm_native_unavailable(); return 0; }
+/* Silent (no abort): the driver probes this to decide whether the split
+ * core-object cache can engage; "" means it cannot on a C-only kaic2. */
+static KaiValue *kai_llvm_backend_tag(void) { return kai_str(""); }
+static void *kai_llvm_build_trunc(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_sext(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_zext(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_ptrtoint(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_inttoptr(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_fpcast(void *b, void *v, void *ty) { (void) b; (void) v; (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_get_undef(void *ty) { (void) ty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_insertvalue(void *b, void *agg, void *elt, int64_t idx) { (void) b; (void) agg; (void) elt; (void) idx; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_extractvalue(void *b, void *agg, int64_t idx) { (void) b; (void) agg; (void) idx; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_fn_type_0(void *ret) { (void) ret; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_fn_type_1(void *ret, void *p0) { (void) ret; (void) p0; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_add_function(void *m, KaiValue *name, void *fnty) { (void) m; (void) name; (void) fnty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_append_block(void *m, void *fn, KaiValue *name) { (void) m; (void) fn; (void) name; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_builder_new(void *m) { (void) m; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_position_at_end(void *b, void *bb) { (void) b; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_llvm_const_int(void *i64ty, int64_t v) { (void) i64ty; (void) v; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_const_i128_str(void *i128ty, KaiValue *s) { (void) i128ty; (void) s; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_call_0(void *b, void *fn, void *fnty) { (void) b; (void) fn; (void) fnty; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_call_1(void *b, void *fn, void *fnty, void *a0) { (void) b; (void) fn; (void) fnty; (void) a0; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_build_ret(void *b, void *v) { (void) b; (void) v; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_build_ret_void(void *b) { (void) b; kai_llvm_native_unavailable(); return kai_unit(); }
+/* Parte B generic-walk stubs (same contract: link, then abort on use). */
+static void *kai_llvm_fn_type_boxed(void *p, int64_t n) { (void) p; (void) n; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_fn_type_n(void *r, void *buf) { (void) r; (void) buf; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_call_n(void *b, void *fn, void *t, void *buf) { (void) b; (void) fn; (void) t; (void) buf; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_position_at_start(void *b, void *bb) { (void) b; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_llvm_get_or_declare_fn(void *m, KaiValue *nm, void *t) { (void) m; (void) nm; (void) t; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_get_param(void *fn, int64_t i) { (void) fn; (void) i; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_array_type(void *el, int64_t n) { (void) el; (void) n; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_array_gep(void *b, void *t, void *a, void *i) { (void) b; (void) t; (void) a; (void) i; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_load_arg(void *b, void *a, void *t, int64_t i) { (void) b; (void) a; (void) t; (void) i; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_buf_new(void) { return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_buf_push(void *buf, void *h) { (void) buf; (void) h; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_buf_free(void *buf) { (void) buf; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_llvm_buf_len(void *buf) { (void) buf; kai_llvm_native_unavailable(); return 0; }
+static void *kai_llvm_buf_get(void *buf, int64_t i) { (void) buf; (void) i; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_const_i32(void *t, int64_t v) { (void) t; (void) v; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_const_null(void *t) { (void) t; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_global_string(void *b, KaiValue *s) { (void) b; (void) s; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_string_span(void *b, KaiValue *s) { (void) b; (void) s; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_add_global_zeroed(void *m, void *t, KaiValue *nm) { (void) m; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_add_global_extern_def(void *m, void *t, KaiValue *nm) { (void) m; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_add_global_extern_decl(void *m, void *t, KaiValue *nm) { (void) m; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_alloca(void *b, void *t, KaiValue *nm) { (void) b; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_alloca_entry(void *c, void *t, KaiValue *nm) { (void) c; (void) t; (void) nm; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_array_alloca(void *b, void *et, void *c, KaiValue *nm) { (void) b; (void) et; (void) c; (void) nm; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_build_store(void *b, void *v, void *p) { (void) b; (void) v; (void) p; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_llvm_build_load(void *b, void *t, void *p) { (void) b; (void) t; (void) p; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_get_named_global(void *m, KaiValue *nm) { (void) m; (void) nm; return kai_llvm_native_unavailable(); }
+static int32_t kai_llvm_handle_is_null(void *h) { (void) h; return 1; }
+static KaiValue *kai_llvm_build_br(void *b, void *bb) { (void) b; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_build_cond_br(void *b, void *c, void *t, void *e) { (void) b; (void) c; (void) t; (void) e; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_llvm_build_switch(void *b, void *v, void *d, int64_t n) { (void) b; (void) v; (void) d; (void) n; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_add_case(void *sw, void *on, void *bb) { (void) sw; (void) on; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_build_unreachable(void *b) { (void) b; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_llvm_build_icmp_ne_zero(void *b, void *v, void *t) { (void) b; (void) v; (void) t; return kai_llvm_native_unavailable(); }
+static int64_t kai_llvm_emit_object(void *m, KaiValue *path) { (void) m; (void) path; kai_llvm_native_unavailable(); return 1; }
+static int64_t kai_llvm_emit_object_raw(void *m, KaiValue *path) { (void) m; (void) path; kai_llvm_native_unavailable(); return 1; }
+/* DWARF DI stubs (#500): unreachable on the C-only path (the native walk
+ * that calls them never runs), so they just satisfy the link. */
+static KaiValue *kai_native_di_enable(void *c, KaiValue *f, KaiValue *d) { (void) c; (void) f; (void) d; kai_llvm_native_unavailable(); return kai_unit(); }
+static int64_t kai_native_di_enabled(void *c) { (void) c; kai_llvm_native_unavailable(); return 0; }
+static KaiValue *kai_native_di_subprogram(void *c, void *fn, KaiValue *n, int64_t l) { (void) c; (void) fn; (void) n; (void) l; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_di_set_loc(void *c, int64_t l, int64_t col) { (void) c; (void) l; (void) col; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_di_clear_loc(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_di_finalize(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_native_di_debug_marker(void *c) { (void) c; kai_llvm_native_unavailable(); return kai_unit(); }
+#endif /* KAI_LLVM */
+
+#endif /* KAI_RUNTIME_H */
