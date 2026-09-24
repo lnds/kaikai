@@ -797,6 +797,16 @@ static inline int kai_is_ptr(KaiValue *v) {
     return v != NULL && (((intptr_t) v) & KAI_INT_TAG_BIT) == 0;
 }
 
+/* A `Handle` (an aligned LLVM C-API object pointer, owned by its LLVM
+ * context, never by RC) rides a boxed slot as an immediate: dup/drop on
+ * it are no-ops, and unboxing clears the bit. */
+static inline KaiValue *kai_handle_box(void *h) {
+    return (KaiValue *) ((uintptr_t) h | (uintptr_t) KAI_INT_TAG_BIT);
+}
+static inline void *kai_handle_unbox(KaiValue *v) {
+    return (void *) ((uintptr_t) v & ~(uintptr_t) KAI_INT_TAG_BIT);
+}
+
 /* Encode/decode a 63-bit immediate Int — Koka kk_integer_from_small /
  * kk_smallint_from_integer (integer.h:206-215). Arithmetic >> keeps
  * the sign. */
