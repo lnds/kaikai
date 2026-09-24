@@ -91,4 +91,35 @@ for arm in "${ARMS[@]}"; do
   done
 done
 
+# The other half: a healthy program must never be reported. The rally keeps
+# workers going idle and waking — the window in which a check reading its
+# inputs one by one mistook a fiber mid-dequeue for an empty deque.
+HEALTHY="examples/effects/mn_pingpong_no_false_deadlock.kai"
+for arm in "${ARMS[@]}"; do
+  bin="$TMP/healthy.$arm"
+  build_arm "$arm" "$HEALTHY" "$bin" >/dev/null 2>"$TMP/b.log" \
+    || { echo "BUILD FAILED [$arm] $HEALTHY"; cat "$TMP/b.log"; exit 1; }
+
+  for n in 2 4 8 default; do
+    if [ "$n" = default ]; then run_env=(env -u KAI_THREADS); else run_env=(env KAI_THREADS="$n"); fi
+    ok=0; witness=""
+    for _ in $(seq 1 "$REPEATS"); do
+      ec=0
+      kai_timeout "$RUN_TIMEOUT" "${run_env[@]}" "$bin" \
+        >"$TMP/run.out" 2>"$TMP/run.err" || ec=$?
+      if [ "$ec" = 0 ] && diff -q "${HEALTHY%.kai}.out.expected" "$TMP/run.out" >/dev/null; then
+        ok=$((ok+1))
+      elif [ -z "$witness" ]; then
+        witness="exit $ec: $(head -c 120 "$TMP/run.err")"
+      fi
+    done
+    if [ "$ok" = "$REPEATS" ]; then
+      echo "OK   no-false-deadlock [$arm] N=$n ($ok/$REPEATS clean)"
+    else
+      echo "FAIL no-false-deadlock [$arm] N=$n: ok=$ok of $REPEATS${witness:+ — $witness}"
+      fail=1
+    fi
+  done
+done
+
 [ "$fail" = "0" ] && echo "run-mn-deadlock-banner: OK" || { echo "run-mn-deadlock-banner: FAIL"; exit 1; }
