@@ -4731,9 +4731,7 @@ static void kai_free_value(KaiValue *v) {
              * does not free the mailbox. */
             break;
         case KAI_BYTE:
-            /* Lane 4 (#473): Byte is a 1-byte scalar embedded directly
-             * in the KaiValue. No heap payload. The base free(v)
-             * below reclaims the whole value. */
+            /* Unreachable: every Byte is an immortal kai_byte_cache cell. */
             break;
         case KAI_RANGE:
             /* Three inline ints, no interior pointers — plain recycle. */
@@ -4925,14 +4923,29 @@ static KAI_RC_NOINLINE KaiValue *kai_real(double r) {
     return v;
 }
 
-/* Lane 4 (#473): Byte nominal scalar. No interning cache for v1 — every
- * `kai_byte(n)` allocates a fresh KaiValue. Cache (analogous to
- * kai_int_cache for 0..127) is a natural Lane-4b/perf optimisation. */
-static KAI_RC_NOINLINE KaiValue *kai_byte(uint8_t n) {
-    KaiValue *v = kai_alloc(KAI_BYTE);
-    v->as.byte_val = n;
-    return v;
-}
+/* All 256 Bytes are immortal cells built at compile time: `kai_byte` never
+ * allocates, and the table is read-only from process start, so threads share
+ * it with no warm-up. Returned by address, so one instance across TUs (owner
+ * defines, others extern). */
+#define KAI_BYTE_CELL(n)    { .rc = INT32_MAX, .tag = KAI_BYTE, .as = { .byte_val = (uint8_t) (n) } }
+#define KAI_BYTE_CELLS4(n)  KAI_BYTE_CELL(n), KAI_BYTE_CELL((n) + 1), \
+                            KAI_BYTE_CELL((n) + 2), KAI_BYTE_CELL((n) + 3)
+#define KAI_BYTE_CELLS16(n) KAI_BYTE_CELLS4(n), KAI_BYTE_CELLS4((n) + 4), \
+                            KAI_BYTE_CELLS4((n) + 8), KAI_BYTE_CELLS4((n) + 12)
+#define KAI_BYTE_CELLS64(n) KAI_BYTE_CELLS16(n), KAI_BYTE_CELLS16((n) + 16), \
+                            KAI_BYTE_CELLS16((n) + 32), KAI_BYTE_CELLS16((n) + 48)
+#define KAI_BYTE_CELLS_ALL  KAI_BYTE_CELLS64(0), KAI_BYTE_CELLS64(64), \
+                            KAI_BYTE_CELLS64(128), KAI_BYTE_CELLS64(192)
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiValue kai_byte_cache[256];
+#  if defined(KAI_RUNTIME_OWNER)
+KaiValue kai_byte_cache[256] = { KAI_BYTE_CELLS_ALL };
+#  endif
+#else
+static KaiValue kai_byte_cache[256] = { KAI_BYTE_CELLS_ALL };
+#endif
+
+static inline KaiValue *kai_byte(uint8_t n) { return &kai_byte_cache[n]; }
 
 /* Fixed-width integer boxes (numeric lane A). Used only when a raw iN
  * value must cross into a boxed slot (Show, polymorphic container);
@@ -5582,6 +5595,9 @@ static int kai_slots_all_immortal_ptr(int n, KaiVarSlot *slots) {
          * slots here brings the native (all-boxed) path to parity. */
         if (kai_is_value(slots[i].ptr)) return 0;
         if (slots[i].ptr == NULL || slots[i].ptr->rc != INT32_MAX) return 0;
+        /* Same for Byte: every Byte is immortal, but `Px(r, g, b, a)` over
+         * data bytes has 256^n identities. */
+        if (slots[i].ptr->tag == KAI_BYTE) return 0;
     }
     return 1;
 }
@@ -9515,9 +9531,7 @@ static KaiValue *kai_core_file_read_bytes(KaiValue *path) {
                 KaiValue *msg = kai_str("file_read_bytes: rewind failed");
                 r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
             } else {
-                /* Read into a flat C buffer, then publish into a
-                 * fresh KAI_ARRAY one KAI_BYTE allocation per slot.
-                 * Allocating the kai_array directly (instead of
+                /* Allocating the kai_array directly (instead of
                  * kai_array_make + array_set in a loop) avoids the
                  * redundant default-incref/decref pair on every
                  * position. */

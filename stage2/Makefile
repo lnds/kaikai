@@ -11569,7 +11569,7 @@ test-modular-build: $(TARGET) build
 # regressed to per-TU state. Runs on the cross-module fiber binary from
 # test-modular-build, which links the widest set of runtime modules.
 MODULAR_SHARED_SYMS = kai_singleton_unit kai_singleton_nil kai_str_intern_table \
-                      kai_char_cache kai_active_fiber kai_ready_head kai_arena_sp \
+                      kai_char_cache kai_byte_cache kai_active_fiber kai_ready_head kai_arena_sp \
                       kai_heap_committed kai_next_handler_id
 test-modular-identity: test-modular-build
 	@set -e; \
