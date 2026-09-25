@@ -84,6 +84,19 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.125.0 (2026-09-25)
+
+### Added
+
+- **runtime**: add Array[Byte] block builtins (#2126)
+
+### Changed
+
+- **runtime**: serve every Byte from a static immortal cell table (#2124)
+- **runtime**: park idle M:N workers instead of polling (#2115)
+- **derive**: encode recursive BinSerialize values in linear time (#2113)
+- **stdlib**: encode derived BinSerialize lists in linear time (#2111)
+
 ## v0.124.1 (2026-09-24)
 
 ### Fixed
