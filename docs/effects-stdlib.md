@@ -1680,6 +1680,14 @@ two precise rules:
    the caller's POV; the same is true for `array_make` (a
    constructor, not a write).
 
+3. **The core `Array[Byte]` writers — `bytes_blit`,
+   `bytes_put_le`, `bytes_put_string` — mutate only their first
+   argument.** Their demand is local iff that destination is
+   local. `bytes_blit`'s source Array is read, not written, and
+   Bytes are copied by value, so a parameter source does not make
+   the demand external. The readers `bytes_get_le` and
+   `bytes_get_string` never require `Mutable`.
+
 The typer enforces this by collecting Mutable demand at every
 `array_set` / `array_grow` call site, then walking the typed
 function body once to classify each demand as local (the target

@@ -400,6 +400,12 @@ KaiValue *kaix_int_to_string_thunk(KaiValue *s, KaiValue **a, int n)    { (void)
 #define KAIX_CORE_THUNK3(nm) \
     KaiValue *kaix_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
     { (void) s; (void) n; return kai_core_##nm(a[0], a[1], a[2]); }
+#define KAIX_CORE_THUNK4(nm) \
+    KaiValue *kaix_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) n; return kai_core_##nm(a[0], a[1], a[2], a[3]); }
+#define KAIX_CORE_THUNK5(nm) \
+    KaiValue *kaix_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) n; return kai_core_##nm(a[0], a[1], a[2], a[3], a[4]); }
 
 KAIX_CORE_THUNK1(panic)
 KAIX_CORE_THUNK1(exit)
@@ -472,6 +478,11 @@ KAIX_CORE_THUNK1(string_reverse)
 KAIX_CORE_THUNK1(string_hash)
 KAIX_CORE_THUNK1(int_to_le4)
 KAIX_CORE_THUNK1(int_to_le8)
+KAIX_CORE_THUNK5(bytes_blit)
+KAIX_CORE_THUNK4(bytes_put_le)
+KAIX_CORE_THUNK3(bytes_get_le)
+KAIX_CORE_THUNK3(bytes_put_string)
+KAIX_CORE_THUNK3(bytes_get_string)
 KAIX_CORE_THUNK1(real_bits)
 KAIX_CORE_THUNK1(int_to_byte)
 KAIX_CORE_THUNK1(byte_to_int)
@@ -1227,6 +1238,11 @@ KaiValue *kaix_core_string_reverse(KaiValue *s)            { return kai_core_str
 KaiValue *kaix_core_string_hash(KaiValue *s)                { return kai_core_string_hash(s); }
 KaiValue *kaix_core_int_to_le4(KaiValue *n)                 { return kai_core_int_to_le4(n); }
 KaiValue *kaix_core_int_to_le8(KaiValue *n)                 { return kai_core_int_to_le8(n); }
+KaiValue *kaix_core_bytes_blit(KaiValue *d, KaiValue *o, KaiValue *s, KaiValue *so, KaiValue *n) { return kai_core_bytes_blit(d, o, s, so, n); }
+KaiValue *kaix_core_bytes_put_le(KaiValue *d, KaiValue *o, KaiValue *v, KaiValue *w) { return kai_core_bytes_put_le(d, o, v, w); }
+KaiValue *kaix_core_bytes_get_le(KaiValue *s, KaiValue *o, KaiValue *w)       { return kai_core_bytes_get_le(s, o, w); }
+KaiValue *kaix_core_bytes_put_string(KaiValue *d, KaiValue *o, KaiValue *s)   { return kai_core_bytes_put_string(d, o, s); }
+KaiValue *kaix_core_bytes_get_string(KaiValue *s, KaiValue *o, KaiValue *n)   { return kai_core_bytes_get_string(s, o, n); }
 KaiValue *kaix_core_real_bits(KaiValue *v)                  { return kai_core_real_bits(v); }
 KaiValue *kaix_core_array_make(KaiValue *n, KaiValue *init)           { return kai_core_array_make(n, init); }
 KaiValue *kaix_core_array_empty(void)                                 { return kai_core_array_empty(); }
