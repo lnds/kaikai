@@ -26,7 +26,7 @@ SRC="$ROOT/stage2/compiler"
 # Files allowed to construct a declaration carrying no identity.
 #   parse            — runs before the resolver; nothing to carry yet.
 #   desugar          — synthesised wrappers with no source declaration.
-#   cache_ast        — serialisation; ids are rebuilt on load, not stored.
+#   cache_ast        — a blob outlives the symbol table that stamped the ids.
 #   protos           — lowers impls into fresh fns the resolver never saw.
 #   json_derive      — same, for derived codecs.
 #   layout_derive    — same, for derived layouts.
