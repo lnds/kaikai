@@ -1,718 +1,86 @@
-# compiler/cache.kai — KAB2 core cache codec + AST serde.
-#
-# Extracted from main.kai under issue #677 Phase 1k (re-scope). The
-# original Phase 1k brief targeted compiler/driver.kai, but the
-# cross-section analysis in docs/lane-driver-cross-section-analysis.md
-# (PR #687) found the driver is the pipeline apex and cannot extract
-# before the stages beneath it. That analysis identified the cache
-# codec as the one clean cut inside the cli+driver block: it sits
-# *beside* the pipeline (a pure AST<->bytes function with no upward
-# calls into the typer/emitter/desugars), so it cuts cleanly today.
-#
-# What this module owns
-#
-# The KAB2 binary cache format and the full AST serialiser/deserialiser
-# behind it. `cache_serialize_module` walks a `[Decl]` and emits a
-# packed binary blob (header + payload); `cache_deserialize_module`
-# parses a blob back into `[Decl]` via the `CacheDeserialized` result.
-# The codec covers every Expr / Decl / Ty / Pattern / Stmt node the
-# compiler builds, so any change to the AST variant set in
-# compiler/ast.kai must be mirrored here or the cache silently misses.
-#
-# Wire format (KAB2, raw packed binary — NOT hex despite the legacy
-# `_to_hex` / `hex_to_` helper names kept from the KAB1 era):
-#   Header (76 bytes, fixed):
-#     magic           4 bytes  "KAB2"
-#     format_version  4 bytes  u32 LE
-#     kaikai_version  4 bytes  u32 LE
-#     source_sha256  64 bytes  ASCII lowercase hex of source content
-#   Body: payload as packed binary; per-type encodings documented inline.
-#
-# Public surface (4 symbols):
-#   - cache_serialize_module     — [Decl] + sha -> blob String
-#   - cache_deserialize_module   — blob -> Option[CacheDeserialized]
-#   - CacheDeserialized          — deserialise result (decls + echoed sha)
-#   - cache_roundtrip_self_test  — in-memory serialise/deserialise smoke test
-#
-# The four core-glue bridges (`load_core_cached`,
-# `emit_core_cache_for`, and the `run` dispatch arms) stay in
-# main.kai and call the public entry points above — they mix serde
-# with core helpers (module_name_of_path / strip_core_tests /
-# tag_decls_module_origin) that live up in the driver layer.
+#[doc("""
+KAB2 blob framing shared by every cache layer: a fixed 76-byte header
+in front of a payload the `BinSerialize` derive encodes.
+
+Header layout:
+
+    magic           4 bytes  "KAB2"
+    format_version  4 bytes  u32 LE — bump on any payload layout change
+    kaikai_version  4 bytes  u32 LE
+    key sha        64 bytes  ASCII
+
+A blob whose header drifts on any field is a miss, never a misread: the
+payload of an older layout is not decoded at all.
+""")]
 
 import compiler.util
-import compiler.diag
-import compiler.ast
 
-# ============================================================
-# Phase A cache (issue #592) — serialise [Decl] post-parse to a
-# binary `.kab` blob that kaic2 deserialises faster than re-parsing
-# the core source. KAB2 replaces the earlier KAB1 hex ASCII
-# format (issue #452) which doubled wire bytes and paid more in
-# string allocation than it saved in lex+parse. The codec uses raw
-# packed binary throughout, with the `int_to_byte_string` runtime
-# primitive (added for this lane) to construct exact 1-byte
-# Strings from Int byte values; `"#{int_to_char(b)}"` interpolation
-# would route through `Show for Char` and either escape-render or
-# truncate at NUL.
-#
-# Header (76 bytes, fixed, no newlines):
-#   magic           4 bytes  "KAB2"
-#   format_version  4 bytes  u32 LE — bump on any payload schema change
-#   kaikai_version  4 bytes  u32 LE — bump on kaikai release
-#   source_sha256  64 bytes  ASCII lowercase hex of source content
-#
-# Body:
-#   <payload as packed binary; per-type encodings documented inline>
-#
-# Function names are unchanged from KAB1 (cache_*_to_hex /
-# cache_hex_to_*) to keep the diff small — every helper is now a
-# binary encoder/decoder despite the legacy hex-suffix names. A
-# future rename pass can clean this up.
-
-fn cache_format_version() : Int = 11
+fn cache_format_version() : Int = 12
 
 fn cache_magic() : String = "KAB2"
 
-# Build a 1-byte String holding the low 8 bits of `b`. The runtime
-# primitive `int_to_byte_string` was added for the KAB2 codec
-# specifically so this path bypasses `Show for Char`'s `\xNN` escape
-# rendering (which would silently corrupt any byte outside ASCII
-# [32,126], including NUL).
-#[doc("KAB2 codec primitive: `cache_byte_to_hex`.")]
-pub fn cache_byte_to_hex(b: Int) : String {
-  let m = if b < 0 { 0 } else if b > 255 { 255 } else { b }
-  int_to_byte_string(m)
-}
-
-# Read one byte at position `pos` in `buf`. Returns Some byte value
-# on success, None on truncation. Uses `string_byte_at_int` (runtime
-# primitive added for #592) which returns -1 on OOB; this avoids the
-# Option[Char] + Char allocations that `char_at` pays per byte. The
-# warm-load decoder calls this ~10^6 times per build; the bypass
-# cuts cache deserialize wall by ~80%.
-#[doc("KAB2 codec primitive: `cache_hex_byte_at`.")]
-pub fn cache_hex_byte_at(buf: String, pos: Int) : Option[Int] {
-  let b = string_byte_at_int(buf, pos)
-  if b < 0 { None } else { Some(b) }
-}
-
-# Encode a 32-bit unsigned int as 4 raw bytes LE.
-#[doc("KAB2 codec primitive: `cache_u32_to_hex`.")]
-pub fn cache_u32_to_hex(n: Int) : String = int_to_le4(n)
-
-# Decode 4 LE bytes at position `pos` into an Int. Option-free hot
-# path using the `string_byte_at_int` primitive — see commentary on
-# `cache_hex_to_int` above.
-#[doc("KAB2 codec primitive: `cache_hex_to_u32`.")]
-pub fn cache_hex_to_u32(buf: String, pos: Int) : Option[CacheIntPos] {
-  let b0 = string_byte_at_int(buf, pos)
-  if b0 < 0 { None }
-  else {
-    let b1 = string_byte_at_int(buf, pos + 1)
-    if b1 < 0 { None }
-    else {
-      let b2 = string_byte_at_int(buf, pos + 2)
-      if b2 < 0 { None }
-      else {
-        let b3 = string_byte_at_int(buf, pos + 3)
-        if b3 < 0 { None }
-        else { Some(CIP(b0 + b1 * 256 + b2 * 65536 + b3 * 16777216, pos + 4)) }
-      }
-    }
-  }
-}
-
-pub type CacheIntPos = CIP(Int, Int)
-pub type CacheStrPos = CSP(String, Int)
-pub type CacheBoolPos = CBP(Bool, Int)
-
-# Encode a signed 64-bit Int as 8 raw bytes LE. Two's-complement, so
-# negative values round-trip exactly.
-#[doc("KAB2 codec primitive: `cache_int_to_hex`.")]
-pub fn cache_int_to_hex(n: Int) : String = int_to_le8(n)
-
-# Decode 8 LE bytes at position `pos` into a signed Int. Unrolled
-# and Option-free on the hot path: each byte read goes through
-# `string_byte_at_int` which returns Int directly (-1 on OOB),
-# avoiding per-byte Option allocations. ~30% of cache_load wall
-# went into this function pre-unroll.
-#[doc("KAB2 codec primitive: `cache_hex_to_int`.")]
-pub fn cache_hex_to_int(buf: String, pos: Int) : Option[CacheIntPos] {
-  let b0 = string_byte_at_int(buf, pos)
-  if b0 < 0 { None }
-  else {
-    let b1 = string_byte_at_int(buf, pos + 1)
-    if b1 < 0 { None }
-    else {
-      let b2 = string_byte_at_int(buf, pos + 2)
-      if b2 < 0 { None }
-      else {
-        let b3 = string_byte_at_int(buf, pos + 3)
-        if b3 < 0 { None }
-        else {
-          let b4 = string_byte_at_int(buf, pos + 4)
-          if b4 < 0 { None }
-          else {
-            let b5 = string_byte_at_int(buf, pos + 5)
-            if b5 < 0 { None }
-            else {
-              let b6 = string_byte_at_int(buf, pos + 6)
-              if b6 < 0 { None }
-              else {
-                let b7 = string_byte_at_int(buf, pos + 7)
-                if b7 < 0 { None }
-                else {
-                  let lo = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
-                  let hi_base = b4 + b5 * 256 + b6 * 65536
-                  let hi_top = if b7 >= 128 { b7 - 256 } else { b7 }
-                  let hi = hi_base + hi_top * 16777216
-                  Some(CIP(lo + hi * 4294967296, pos + 8))
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-# Encode a Bool as one raw byte (0x00 / 0x01).
-#[doc("KAB2 codec primitive: `cache_bool_to_hex`.")]
-pub fn cache_bool_to_hex(b: Bool) : String =
-  if b { cache_byte_to_hex(1) } else { cache_byte_to_hex(0) }
-
-#[doc("KAB2 codec primitive: `cache_hex_to_bool`.")]
-pub fn cache_hex_to_bool(buf: String, pos: Int) : Option[CacheBoolPos] {
-  match cache_hex_byte_at(buf, pos) {
-    None -> None
-    Some(0) -> Some(CBP(false, pos + 1))
-    Some(1) -> Some(CBP(true, pos + 1))
-    Some(_) -> None
-  }
-}
-
-# Encode a String as u32 LE length + raw bytes. The source bytes
-# are appended verbatim — `string_concat` is memcpy-based on the
-# runtime and preserves every byte 0..255 including NUL.
-#[doc("KAB2 codec primitive: `cache_string_to_hex`.")]
-pub fn cache_string_to_hex(s: String) : String {
-  let n = string_length(s)
-  concat_all([cache_u32_to_hex(n), s])
-}
-
-# Decode a length4-prefixed raw String payload. `string_slice` is
-# byte-wise on the runtime so the decoded String round-trips byte-
-# exact even for non-ASCII content.
-#[doc("KAB2 codec primitive: `cache_hex_to_string`.")]
-pub fn cache_hex_to_string(buf: String, pos: Int) : Option[CacheStrPos] {
-  match cache_hex_to_u32(buf, pos) {
-    None -> None
-    Some(cip) -> match cip {
-      CIP(n, pos2) ->
-        if pos2 + n > string_length(buf) { None }
-        else { Some(CSP(string_slice(buf, pos2, n), pos2 + n)) }
-    }
-  }
-}
-
-
-# Encode an Option[String] as 1 tag byte + (if Some) the encoded
-# String.
-#[doc("KAB2 codec primitive: `cache_opt_string_to_hex`.")]
-pub fn cache_opt_string_to_hex(o: Option[String]) : String = match o {
-  None -> cache_byte_to_hex(0)
-  Some(s) -> string_concat(cache_byte_to_hex(1), cache_string_to_hex(s))
-}
-
-#[doc("KAB2 codec primitive: `cache_hex_to_opt_string`.")]
-pub fn cache_hex_to_opt_string(buf: String, pos: Int) : Option[CacheOptStrPos] {
-  match cache_hex_byte_at(buf, pos) {
-    None -> None
-    Some(0) -> Some(COSP(None, pos + 1))
-    Some(1) -> match cache_hex_to_string(buf, pos + 1) {
-      None -> None
-      Some(csp) -> match csp { CSP(s, p2) -> Some(COSP(Some(s), p2)) }
-    }
-    Some(_) -> None
-  }
-}
-
-pub type CacheOptStrPos = COSP(Option[String], Int)
-
-# Encode an Option[Int] as 1 tag byte + (if Some) 8 raw bytes.
-#[doc("KAB2 codec primitive: `cache_opt_int_to_hex`.")]
-pub fn cache_opt_int_to_hex(o: Option[Int]) : String = match o {
-  None -> cache_byte_to_hex(0)
-  Some(n) -> string_concat(cache_byte_to_hex(1), cache_int_to_hex(n))
-}
-
-#[doc("KAB2 codec primitive: `cache_hex_to_opt_int`.")]
-pub fn cache_hex_to_opt_int(buf: String, pos: Int) : Option[CacheOptIntPos] {
-  match cache_hex_byte_at(buf, pos) {
-    None -> None
-    Some(0) -> Some(COIP(None, pos + 1))
-    Some(1) -> match cache_hex_to_int(buf, pos + 1) {
-      None -> None
-      Some(cip) -> match cip { CIP(n, p2) -> Some(COIP(Some(n), p2)) }
-    }
-    Some(_) -> None
-  }
-}
-
-pub type CacheOptIntPos = COIP(Option[Int], Int)
-
-# Encode a [String] as length4 + each encoded String.
-#[doc("KAB2 codec primitive: `cache_string_list_to_hex`.")]
-pub fn cache_string_list_to_hex(xs: [String]) : String =
-  concat_all([cache_u32_to_hex(list_length(xs)),
-              concat_all(list_reverse(cache_string_list_loop(xs, [])))])
-
-fn cache_string_list_loop(xs: [String], acc: [String]) : [String] = match xs {
-  [] -> acc
-  [h, ...t] -> cache_string_list_loop(t, [cache_string_to_hex(h), ...acc])
-}
-
-#[doc("KAB2 codec primitive: `cache_hex_to_string_list`.")]
-pub fn cache_hex_to_string_list(buf: String, pos: Int) : Option[CacheStrListPos] {
-  match cache_hex_to_u32(buf, pos) {
-    None -> None
-    Some(cip) -> match cip {
-      CIP(n, pos2) -> cache_hex_collect_string_list(buf, pos2, n, [])
-    }
-  }
-}
-
-fn cache_hex_collect_string_list(buf: String, pos: Int, remaining: Int,
-                                    acc: [String]) : Option[CacheStrListPos] {
-  if remaining <= 0 { Some(CSLP(list_reverse(acc), pos)) }
-  else {
-    match cache_hex_to_string(buf, pos) {
-      None -> None
-      Some(csp) -> match csp {
-        CSP(s, p2) -> cache_hex_collect_string_list(buf, p2, remaining - 1,
-                                                      [s, ...acc])
-      }
-    }
-  }
-}
-
-pub type CacheStrListPos = CSLP([String], Int)
-
-# Char codec: 4 bytes LE for the codepoint Int. Stage 1 chars are
-# codepoints, not UTF-8 byte sequences, so the wire encoding matches
-# `char_to_int` directly.
-#[doc("KAB2 codec primitive: `cache_char_to_hex`.")]
-pub fn cache_char_to_hex(c: Char) : String =
-  cache_u32_to_hex(char_to_int(c))
-
-pub type CacheCharPos = CCP(Char, Int)
-
-#[doc("KAB2 codec primitive: `cache_hex_to_char`.")]
-pub fn cache_hex_to_char(buf: String, pos: Int) : Option[CacheCharPos] {
-  match cache_hex_to_u32(buf, pos) {
-    None -> None
-    Some(cip) -> match cip { CIP(n, p2) -> Some(CCP(int_to_char(n), p2)) }
-  }
-}
-
-# Real codec: store as `length4 + ASCII decimal payload` produced by
-# `real_to_string`. The compiler-internal Real surface is what
-# decode_real already uses (real_to_string round-trip), so re-using
-# the runtime's stringification keeps Real cache values byte-stable
-# across builds.
-#[doc("KAB2 codec primitive: `cache_real_to_hex`.")]
-pub fn cache_real_to_hex(r: Real) : String =
-  cache_string_to_hex(real_to_string(r))
-
-pub type CacheRealPos = CRP(Real, Int)
-
-#[doc("KAB2 codec primitive: `cache_hex_to_real`.")]
-pub fn cache_hex_to_real(buf: String, pos: Int) : Option[CacheRealPos] {
-  match cache_hex_to_string(buf, pos) {
-    None -> None
-    Some(csp) -> match csp { CSP(s, p2) ->
-      match string_to_real(s) {
-        None -> None
-        Some(r) -> Some(CRP(r, p2))
-      }
-    }
-  }
-}
-
-# Generic [T] codec primitives. Stage 1 has first-class fn values but
-# the cache layer avoids them so the wire encoding stays inspectable:
-# every list-of-T serialiser below opens with the length, then walks
-# the list and concats the per-element chunks. The acc-then-reverse
-# shape keeps the inner loop O(1) per element; the final concat_all
-# is O(n) over the chunk list.
-#
-# Each cache_list_<T>_to_hex_chunks below returns the reversed chunk
-# accumulator. The top-level cache_list_<T>_to_hex wraps it with the
-# length prefix and the reverse+concat finaliser.
-
-# `cache_hex_to_u32` returns a CacheIntPos; conventionally the cache
-# layer treats CIP's first slot as "the decoded length" and the
-# second slot as "the cursor after the length". This is reused below.
-
-# `cache_file_header(source_sha)` produces the 76-byte fixed-size
-# header. KAB2 layout: 4-byte magic + 4-byte format_version LE +
-# 4-byte kaikai_version_hash LE + 64-byte ASCII source sha. The
-# caller appends the binary payload after this header.
-#[doc("Build the KAB2 blob header for a payload: magic, format version, compiler-version hash, and the 64-char key sha.")]
-pub fn cache_file_header(source_sha: String) : String =
-  concat_all([cache_magic(),
-              cache_u32_to_hex(cache_format_version()),
-              cache_u32_to_hex(cache_kaikai_version_hash()),
-              source_sha])
-
-# Bumped on every kaikai release. Currently hard-coded; the build
-# system can override via a future code-gen step.
-#
-# Cross-edition safety lives in each edition-sensitive layer's key
-# (core_emit_key and ncore_key fold the edition); this header field
-# is defense-in-depth against blobs copied between caches.
+# Cross-edition safety lives in each edition-sensitive layer's key; this
+# field is defense-in-depth against blobs copied between caches.
 fn cache_kaikai_version_hash() : Int = 2
 
-# Parse the cache file header from `buf`. Returns the source SHA
-# the file claims to hash, plus the offset where the payload begins
-# (76). Returns `None` if any of magic / format version / kaikai
-# version / sha length are malformed or mismatch the current
-# compiler's expectations.
-#[doc("Validate a KAB2 blob header, returning the echoed sha plus the payload offset; `None` on magic, format, version, or length drift.")]
-pub fn cache_read_header(buf: String) : Option[CacheHdr] {
-  if string_length(buf) < 76 { None }
-  else {
-    let magic = string_slice(buf, 0, 4)
-    if magic != cache_magic() { None }
-    else { match cache_hex_to_u32(buf, 4) {
-      None -> None
-      Some(cip) -> match cip { CIP(fv, _) ->
-        if fv != cache_format_version() { None }
-        else { match cache_hex_to_u32(buf, 8) {
-          None -> None
-          Some(cip2) -> match cip2 { CIP(kv, _) ->
-            if kv != cache_kaikai_version_hash() { None }
-            else {
-              let sha = string_slice(buf, 12, 64)
-              if string_length(sha) != 64 { None }
-              else { Some(CHdr(sha, 76)) }
-            }
-          }
-        } }
-      }
-    } }
-  }
-}
+fn cache_header_len() : Int = 76
 
+#[doc("A validated blob header: the echoed key sha and the payload offset.")]
 pub type CacheHdr = CHdr(String, Int)
 
-# ========================================================================
-# AST serde — Phase A.0 step 2 (refs #452)
-# ========================================================================
-#
-# Wire format conventions for every AST type below:
-#   - Sum types open with a 1-byte tag (2 hex chars). Tag values are
-#     local to each type (0x01.., never 0x00 so a stray zero byte is
-#     visibly wrong). Decoders reject unknown tags with `None`.
-#   - Records emit fields in source declaration order.
-#   - Lists emit `cache_u32_to_hex(length) + each element`.
-#   - Spans are (line: Int, col: Int) inline. The source file path is
-#     out-of-band — the module loader supplies it from the cache key,
-#     not from per-node payload, which keeps every Expr/Pattern/TypeExpr
-#     ~16 bytes lighter than carrying file inline.
-#
-# Every encoder returns a `String` (the hex payload chunk) and pushes
-# nothing onto the global state. Every decoder returns
-# `Option[Cache<T>Pos]` where the second slot is the cursor advanced
-# past the consumed bytes. The pos-types are defined alongside the
-# decoders so the wire format stays grep-able from one place.
+#[doc("Frame `payload` as a KAB2 blob under the 64-char key `sha`.")]
+pub fn cache_blob(sha: String, payload: Array[Byte]) : Array[Byte] =
+  array_concat_bytes(cache_header(sha), payload)
 
-# ---- Pos accumulator types -------------------------------------------------
-
-pub type CacheTyPos     = CTyP(TypeExpr, Int)
-pub type CacheRowPos    = CRowP(RowExpr, Int)
-pub type CacheRLPos     = CRLP(RowLabel, Int)
-pub type CacheUnitPos   = CUP(UnitExprT, Int)
-pub type CacheOptTyPos  = COTyP(Option[TypeExpr], Int)
-pub type CacheTyListPos = CTyLP([TypeExpr], Int)
-pub type CacheRLListPos = CRLLP([RowLabel], Int)
-pub type CacheExprPos   = CEP(Expr, Int)
-pub type CachePatPos    = CPaP(Pattern, Int)
-pub type CacheStmtPos   = CSMP(Stmt, Int)
-pub type CacheArmPos    = CArmP(Arm, Int)
-pub type CacheLEPos     = CLEP(ListElem, Int)
-pub type CacheFIPos     = CFIP(FieldInit, Int)
-pub type CachePFPos     = CPFP(PField, Int)
-pub type CacheParamPos  = CPmP(Param, Int)
-pub type CacheHCPos     = CHCP(HClause, Int)
-pub type CacheHRPos     = CHRP(HReturn, Int)
-pub type CacheDBPos     = CDBP(DefaultBlock, Int)
-pub type CacheOptExpPos = COExpP(Option[Expr], Int)
-type CacheOptStrPos2 = COSP2(Option[String], Int) # unused alias placeholder
-pub type CacheOptDBPos  = CODBP(Option[DefaultBlock], Int)
-pub type CacheOptHRPos  = COHRP(Option[HReturn], Int)
-pub type CacheExprLPos  = CExpLP([Expr], Int)
-pub type CacheStmtLPos  = CSMLP([Stmt], Int)
-pub type CachePatLPos   = CPaLP([Pattern], Int)
-pub type CacheArmLPos   = CArmLP([Arm], Int)
-pub type CacheLELPos    = CLELP([ListElem], Int)
-pub type CacheFILPos    = CFILP([FieldInit], Int)
-pub type CachePFLPos    = CPFLP([PField], Int)
-pub type CacheParamLPos = CPmLP([Param], Int)
-pub type CacheHCLPos    = CHCLP([HClause], Int)
-pub type CacheDeclPos   = CDP(Decl, Int)
-pub type CacheDeclLPos  = CDLP([Decl], Int)
-pub type CacheFDPos     = CFDP(FieldDecl, Int)
-pub type CacheVarPos    = CVarP(Variant, Int)
-pub type CacheFDLPos    = CFDLP([FieldDecl], Int)
-pub type CacheVarLPos   = CVarLP([Variant], Int)
-pub type CacheTBPos     = CTBP(TypeBody, Int)
-pub type CacheIKPos     = CIKP(ImportKind, Int)
-pub type CachePOPos     = CPOP(ProtoOp, Int)
-pub type CacheEOPos     = CEOP(EffectOp, Int)
-pub type CachePOLPos    = CPOLP([ProtoOp], Int)
-pub type CacheEOLPos    = CEOLP([EffectOp], Int)
-type CacheSevPos    = CSevP(Severity, Int)
-type CacheDiagPos   = CDgP(Diagnostic, Int)
-type CacheRIPos     = CRIP(RelatedInfo, Int)
-type CacheRILPos    = CRILP([RelatedInfo], Int)
-pub type CacheDiagLPos  = CDgLP([Diagnostic], Int)
-pub type CacheVMPos     = CVMP(ValueMode, Int)
-type CacheKindPos   = CKnP(Kind, Int)
-type CacheStrListPos2 = CSLP2([String], Int) # unused alias placeholder
-
-# ---- UnitExprT ------------------------------------------------------------
-
-#[doc("KAB2 codec primitive: `cache_unit_to_hex`.")]
-pub fn cache_unit_to_hex(u: UnitExprT) : String = match u {
-  UOne          -> cache_byte_to_hex(1)
-  USym(s)       -> concat_all([cache_byte_to_hex(2), cache_string_to_hex(s)])
-  UMul(a, b)    -> concat_all([cache_byte_to_hex(3), cache_unit_to_hex(a), cache_unit_to_hex(b)])
-  UInv(a)       -> concat_all([cache_byte_to_hex(4), cache_unit_to_hex(a)])
-  UPow(a, n)    -> concat_all([cache_byte_to_hex(5), cache_unit_to_hex(a), cache_int_to_hex(n)])
-  UVar(n)       -> concat_all([cache_byte_to_hex(6), cache_int_to_hex(n)])
-  UJoin(a, b)   -> concat_all([cache_byte_to_hex(7), cache_unit_to_hex(a), cache_unit_to_hex(b)])
-  UDims(us)     -> concat_all([cache_byte_to_hex(8), cache_int_to_hex(list_length(us)),
-                               cache_units_to_hex(us)])
+fn cache_header(sha: String) : Array[Byte] = {
+  let buf = array_make(cache_header_len(), bin_byte(0))
+  let _ = cache_put_text(buf, 0, cache_magic(), 0)
+  let _ = bin_write_len4(buf, 4, cache_format_version())
+  let _ = bin_write_len4(buf, 8, cache_kaikai_version_hash())
+  cache_put_text(buf, 12, sha, 0)
 }
 
-fn cache_units_to_hex(us: [UnitExprT]) : String = match us {
-  [] -> ""
-  [u, ...rest] -> concat_all([cache_unit_to_hex(u), cache_units_to_hex(rest)])
-}
-
-#[doc("KAB2 codec primitive: `cache_hex_to_unit`.")]
-pub fn cache_hex_to_unit(buf: String, pos: Int) : Option[CacheUnitPos] {
-  match cache_hex_byte_at(buf, pos) {
-    None -> None
-    Some(1) -> Some(CUP(UOne, pos + 1))
-    Some(2) -> match cache_hex_to_string(buf, pos + 1) {
-      None -> None
-      Some(csp) -> match csp { CSP(s, p2) -> Some(CUP(USym(s), p2)) }
-    }
-    Some(3) -> match cache_hex_to_unit(buf, pos + 1) {
-      None -> None
-      Some(cu1) -> match cu1 { CUP(a, p2) -> match cache_hex_to_unit(buf, p2) {
-        None -> None
-        Some(cu2) -> match cu2 { CUP(b, p3) -> Some(CUP(UMul(a, b), p3)) }
-      } }
-    }
-    Some(4) -> match cache_hex_to_unit(buf, pos + 1) {
-      None -> None
-      Some(cu1) -> match cu1 { CUP(a, p2) -> Some(CUP(UInv(a), p2)) }
-    }
-    Some(5) -> match cache_hex_to_unit(buf, pos + 1) {
-      None -> None
-      Some(cu1) -> match cu1 { CUP(a, p2) -> match cache_hex_to_int(buf, p2) {
-        None -> None
-        Some(cip) -> match cip { CIP(n, p3) -> Some(CUP(UPow(a, n), p3)) }
-      } }
-    }
-    Some(6) -> match cache_hex_to_int(buf, pos + 1) {
-      None -> None
-      Some(cip) -> match cip { CIP(n, p2) -> Some(CUP(UVar(n), p2)) }
-    }
-    Some(7) -> match cache_hex_to_unit(buf, pos + 1) {
-      None -> None
-      Some(cu1) -> match cu1 { CUP(a, p2) -> match cache_hex_to_unit(buf, p2) {
-        None -> None
-        Some(cu2) -> match cu2 { CUP(b, p3) -> Some(CUP(UJoin(a, b), p3)) }
-      } }
-    }
-    Some(8) -> match cache_hex_to_int(buf, pos + 1) {
-      None -> None
-      Some(cip) -> match cip { CIP(n, p2) -> cache_hex_to_units(buf, p2, n, []) }
-    }
-    Some(_) -> None
-  }
-}
-
-fn cache_hex_to_units(buf: String, pos: Int, n: Int, acc: [UnitExprT]) : Option[CacheUnitPos] {
-  if n == 0 { Some(CUP(UDims(list_reverse(acc)), pos)) }
+# Writes at most the 64 header bytes the sha slot has.
+fn cache_put_text(buf: Array[Byte], off: Int, s: String, i: Int) : Array[Byte] / Mutable =
+  if i >= string_length(s) or off + i >= cache_header_len() { buf }
   else {
-    match cache_hex_to_unit(buf, pos) {
-      None -> None
-      Some(cu) -> match cu { CUP(u, p2) -> cache_hex_to_units(buf, p2, n - 1, [u, ...acc]) }
-    }
+    buf[off + i] := bin_byte(string_byte_at_int(s, i))
+    cache_put_text(buf, off, s, i + 1)
   }
+
+#[doc("Validate a KAB2 blob header, returning the echoed sha plus the payload offset; `None` on magic, format, version, or length drift.")]
+pub fn cache_read_header(buf: Array[Byte]) : Option[CacheHdr] =
+  if array_length(buf) < cache_header_len() { None }
+  else if cache_bytes_text(buf, 0, 4) != cache_magic() { None }
+  else if not cache_u32_is(buf, 4, cache_format_version()) { None }
+  else if not cache_u32_is(buf, 8, cache_kaikai_version_hash()) { None }
+  else { Some(CHdr(cache_bytes_text(buf, 12, 64), cache_header_len())) }
+
+fn cache_u32_is(buf: Array[Byte], pos: Int, want: Int) : Bool = match bin_get_uint_le(buf, pos, 4) {
+  Some(n) -> n == want
+  None    -> false
 }
 
-# ---- Severity / RelatedInfo / Diagnostic ---------------------------------
+#[doc("The `n` bytes of `buf` at `off` as a byte-exact String.")]
+pub fn cache_bytes_text(buf: Array[Byte], off: Int, n: Int) : String =
+  concat_all(cache_text_loop(buf, off + n - 1, off, []))
 
-fn cache_sev_to_hex(s: Severity) : String = match s {
-  SevError   -> cache_byte_to_hex(1)
-  SevWarning -> cache_byte_to_hex(2)
-  SevHint    -> cache_byte_to_hex(3)
-  SevInfo    -> cache_byte_to_hex(4)
-}
+fn cache_text_loop(buf: Array[Byte], i: Int, lo: Int, acc: [String]) : [String] =
+  if i < lo { acc }
+  else { cache_text_loop(buf, i - 1, lo, [int_to_byte_string(byte_to_int(buf[i])), ...acc]) }
 
-fn cache_hex_to_sev(buf: String, pos: Int) : Option[CacheSevPos] {
-  match cache_hex_byte_at(buf, pos) {
-    None -> None
-    Some(1) -> Some(CSevP(SevError, pos + 1))
-    Some(2) -> Some(CSevP(SevWarning, pos + 1))
-    Some(3) -> Some(CSevP(SevHint, pos + 1))
-    Some(4) -> Some(CSevP(SevInfo, pos + 1))
-    Some(_) -> None
-  }
-}
+#[doc("Whether two byte buffers hold the same bytes.")]
+pub fn cache_bytes_eq(a: Array[Byte], b: Array[Byte]) : Bool =
+  array_length(a) == array_length(b) and cache_eq_from(a, b, 0)
 
-fn cache_ri_to_hex(r: RelatedInfo) : String = match r {
-  DR(file, line, col, msg) -> concat_all([cache_string_to_hex(file),
-                                            cache_int_to_hex(line),
-                                            cache_int_to_hex(col),
-                                            cache_string_to_hex(msg)])
-}
+fn cache_eq_from(a: Array[Byte], b: Array[Byte], i: Int) : Bool =
+  if i >= array_length(a) { true }
+  else if byte_to_int(a[i]) != byte_to_int(b[i]) { false }
+  else { cache_eq_from(a, b, i + 1) }
 
-fn cache_hex_to_ri(buf: String, pos: Int) : Option[CacheRIPos] {
-  match cache_hex_to_string(buf, pos) {
-    None -> None
-    Some(csp1) -> match csp1 { CSP(file, p1) ->
-      match cache_hex_to_int(buf, p1) {
-        None -> None
-        Some(cl) -> match cl { CIP(line, p2) ->
-          match cache_hex_to_int(buf, p2) {
-            None -> None
-            Some(cc) -> match cc { CIP(col, p3) ->
-              match cache_hex_to_string(buf, p3) {
-                None -> None
-                Some(csp2) -> match csp2 { CSP(msg, p4) ->
-                  Some(CRIP(DR(file, line, col, msg), p4))
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
+#[doc("Extend an FNV-1a state over `bs`. `string_hash` returns the bare state, so `cache_fnv_bytes(string_hash(p), bs)` hashes `p` followed by `bs`.")]
+pub fn cache_fnv_bytes(h: Int, bs: Array[Byte]) : Int = cache_fnv_loop(h, bs, 0, array_length(bs))
 
-fn cache_ri_list_to_hex(xs: [RelatedInfo]) : String =
-  concat_all([cache_u32_to_hex(list_length(xs)),
-              concat_all(list_reverse(cache_ri_list_loop(xs, [])))])
-
-fn cache_ri_list_loop(xs: [RelatedInfo], acc: [String]) : [String] = match xs {
-  [] -> acc
-  [h, ...t] -> cache_ri_list_loop(t, [cache_ri_to_hex(h), ...acc])
-}
-
-fn cache_hex_to_ri_list(buf: String, pos: Int) : Option[CacheRILPos] {
-  match cache_hex_to_u32(buf, pos) {
-    None -> None
-    Some(cip) -> match cip { CIP(n, p2) ->
-      cache_hex_collect_ri_list(buf, p2, n, [])
-    }
-  }
-}
-
-fn cache_hex_collect_ri_list(buf: String, pos: Int, remaining: Int,
-                               acc: [RelatedInfo]) : Option[CacheRILPos] {
-  if remaining <= 0 { Some(CRILP(list_reverse(acc), pos)) }
-  else {
-    match cache_hex_to_ri(buf, pos) {
-      None -> None
-      Some(cri) -> match cri { CRIP(ri, p2) ->
-        cache_hex_collect_ri_list(buf, p2, remaining - 1, [ri, ...acc])
-      }
-    }
-  }
-}
-
-fn cache_diag_to_hex(d: Diagnostic) : String = match d {
-  D(sev, file, line, col, msg, rel) -> concat_all([cache_sev_to_hex(sev),
-                                                       cache_string_to_hex(file),
-                                                       cache_int_to_hex(line),
-                                                       cache_int_to_hex(col),
-                                                       cache_string_to_hex(msg),
-                                                       cache_ri_list_to_hex(rel)])
-}
-
-fn cache_hex_to_diag(buf: String, pos: Int) : Option[CacheDiagPos] {
-  match cache_hex_to_sev(buf, pos) {
-    None -> None
-    Some(cs) -> match cs { CSevP(sev, p1) ->
-      match cache_hex_to_string(buf, p1) {
-        None -> None
-        Some(csp1) -> match csp1 { CSP(file, p2) ->
-          match cache_hex_to_int(buf, p2) {
-            None -> None
-            Some(cl) -> match cl { CIP(line, p3) ->
-              match cache_hex_to_int(buf, p3) {
-                None -> None
-                Some(cc) -> match cc { CIP(col, p4) ->
-                  match cache_hex_to_string(buf, p4) {
-                    None -> None
-                    Some(csp2) -> match csp2 { CSP(msg, p5) ->
-                      match cache_hex_to_ri_list(buf, p5) {
-                        None -> None
-                        Some(cril) -> match cril { CRILP(rel, p6) ->
-                          Some(CDgP(D(sev, file, line, col, msg, rel), p6))
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-#[doc("Serialise a `[Diagnostic]` to its KAB2 payload chunk: `u32` length followed by each diagnostic's encoding.")]
-pub fn cache_diag_list_to_hex(xs: [Diagnostic]) : String =
-  concat_all([cache_u32_to_hex(list_length(xs)),
-              concat_all(list_reverse(cache_diag_list_loop(xs, [])))])
-
-fn cache_diag_list_loop(xs: [Diagnostic], acc: [String]) : [String] = match xs {
-  [] -> acc
-  [h, ...t] -> cache_diag_list_loop(t, [cache_diag_to_hex(h), ...acc])
-}
-
-#[doc("Decode a `[Diagnostic]` payload chunk at `pos`; the result's second slot is the cursor past the consumed bytes.")]
-pub fn cache_hex_to_diag_list(buf: String, pos: Int) : Option[CacheDiagLPos] {
-  match cache_hex_to_u32(buf, pos) {
-    None -> None
-    Some(cip) -> match cip { CIP(n, p2) ->
-      cache_hex_collect_diag_list(buf, p2, n, [])
-    }
-  }
-}
-
-fn cache_hex_collect_diag_list(buf: String, pos: Int, remaining: Int,
-                                 acc: [Diagnostic]) : Option[CacheDiagLPos] {
-  if remaining <= 0 { Some(CDgLP(list_reverse(acc), pos)) }
-  else {
-    match cache_hex_to_diag(buf, pos) {
-      None -> None
-      Some(cd) -> match cd { CDgP(d, p2) ->
-        cache_hex_collect_diag_list(buf, p2, remaining - 1, [d, ...acc])
-      }
-    }
-  }
-}
+fn cache_fnv_loop(h: Int, bs: Array[Byte], i: Int, n: Int) : Int =
+  if i >= n { h }
+  else { cache_fnv_loop(bit_xor(h, byte_to_int(bs[i])) * 1099511628211, bs, i + 1, n) }

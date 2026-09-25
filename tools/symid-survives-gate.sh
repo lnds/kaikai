@@ -25,9 +25,8 @@ SRC="$ROOT/stage2/compiler"
 #   qual_head      — mints a fresh node under a rewritten effect name.
 #   scope_walk     — rewrites the effect name itself, so a carried id
 #                    would point at the declaration the rename left.
-#   cache_ast      — serialisation; ids are rebuilt on load, not stored.
 #   loop_lower     — threads the node through a helper.
-ALLOW='parse|desugar|qual_head|scope_walk|cache_ast|loop_lower'
+ALLOW='parse|desugar|qual_head|scope_walk|loop_lower'
 
 # An EHandle construction spans several lines, so the id sits on the
 # same line as the constructor only some of the time. Join each file

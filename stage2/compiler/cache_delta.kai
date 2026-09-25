@@ -1,16 +1,15 @@
 #[doc("""
-`ModuleEnvDelta` serde + canonical interface hash for incremental
+Canonical interface hash of a `ModuleEnvDelta` for incremental
 rebuilds.
 
 A module's typed *interface* is its `ModuleEnvDelta` (infer.kai): a
 `name` plus 8 tables an importer can resolve against. This module
-serializes that delta over the KAB2 primitive + `Ty`/`TyScheme` layers,
-and derives the **interface hash**: two modules whose deltas are
-logically equal hash equal, regardless of inference order, so a source
-edit that leaves a module's interface unchanged does not invalidate its
-importers. The per-module cut folds the same entry canonicalisation
-incrementally across the module partition — see
-`compiler.cache_iface_acc`.
+derives the **interface hash** over the entries' derived encodings: two
+modules whose deltas are logically equal hash equal, regardless of
+inference order, so a source edit that leaves a module's interface
+unchanged does not invalidate its importers. The per-module cut folds
+the same entry canonicalisation incrementally across the module
+partition — see `compiler.cache_iface_acc`.
 
 Canonicalization (the soundness contract):
 - **Var renumbering.** `TyVarT` / row-tail / `TyShapeApp` ids are
@@ -32,7 +31,6 @@ never a stale hit), which is the sound side.
 import compiler.ast
 import compiler.util
 import compiler.cache
-import compiler.cache_ast
 import compiler.infer
 import compiler.user_cache
 
@@ -189,96 +187,10 @@ fn canon_int_list(xs: [Int], vr: VarRemap) : CanonIntL = match xs {
   }
 }
 
-# ---- 8-table codec ----------------------------------------------------
-# Each table is `u32 length + per-element`. Elements reuse the KAB2
-# primitives + the Ty/Scheme codec. TyEntry / UnionInfo / OpEffArity /
-# RecInfo / SumInfo / OpToEff / UAliasEntry / CtorEntry.
-#
-# A list slot read from a variant (`UI`'s `tys`, `SI`'s `vars`, ...) is
-# consumed with `map` inside the arm that destructured it, then length-
-# prefixed and concatenated. Passing such a slot positionally to a
-# helper that `match`es it corrupts the list under the stage1 bootstrap
-# compiler (law_checks.kai `lc_shape_of_variant` is the canonical idiom).
-
-fn len_prefixed(chunks: [String]) : String =
-  concat_all([cache_u32_to_hex(list_length(chunks)), concat_all(chunks)])
-
-#[doc("Serialise one `TyEntry` (an exported binding's inferred scheme).")]
-pub fn cache_tyentry_to_hex(e: TyEntry) : String =
-  concat_all([cache_string_to_hex(e.name), cache_scheme_to_hex(e.scheme)])
-
-#[doc("Serialise one `UnionInfo`.")]
-pub fn cache_unioninfo_to_hex(u: UnionInfo) : String = match u {
-  UI(nm, tys, l, c) -> {
-    let tychunks = map(tys, (ty) => cache_tyr_to_hex(ty))
-    concat_all([cache_string_to_hex(nm), len_prefixed(tychunks),
-                cache_int_to_hex(l), cache_int_to_hex(c)])
-  }
-}
-
-#[doc("Serialise one `OpEffArity`.")]
-pub fn cache_opeffarity_to_hex(a: OpEffArity) : String = match a {
-  OEA(nm, n) -> concat_all([cache_string_to_hex(nm), cache_int_to_hex(n)])
-}
-
-#[doc("Serialise one `FieldDecl`.")]
-pub fn cache_fielddecl_to_hex(f: FieldDecl) : String = match f {
-  FD(is_pub, nm, ty, attrs) -> concat_all([cache_bool_to_hex(is_pub),
-                                     cache_string_to_hex(nm),
-                                     cache_typeexpr_to_hex(ty),
-                                     cache_fattrs_to_hex(attrs)])
-}
-
-#[doc("Serialise one `RecInfo`.")]
-pub fn cache_recinfo_to_hex(r: RecInfo) : String = match r {
-  RI(nm, tps, fields, mo) -> {
-    let tpchunks = map(tps, (s) => cache_string_to_hex(s))
-    let fchunks = map(fields, (fd) => cache_fielddecl_to_hex(fd))
-    concat_all([cache_string_to_hex(nm), len_prefixed(tpchunks),
-                len_prefixed(fchunks), cache_opt_string_to_hex(mo)])
-  }
-}
-
-#[doc("Serialise one `Variant`.")]
-pub fn cache_variant_to_hex(v: Variant) : String = match v {
-  Var(nm, tys) -> {
-    let tychunks = map(tys, (te) => cache_typeexpr_to_hex(te))
-    concat_all([cache_string_to_hex(nm), len_prefixed(tychunks)])
-  }
-}
-
-#[doc("Serialise one `SumInfo`.")]
-pub fn cache_suminfo_to_hex(s: SumInfo) : String = match s {
-  SI(nm, tps, vars, mo) -> {
-    let tpchunks = map(tps, (s2) => cache_string_to_hex(s2))
-    let vchunks = map(vars, (v) => cache_variant_to_hex(v))
-    concat_all([cache_string_to_hex(nm), len_prefixed(tpchunks),
-                len_prefixed(vchunks), cache_opt_string_to_hex(mo)])
-  }
-}
-
-#[doc("Serialise one `OpToEff` mapping.")]
-pub fn cache_optoeff_to_hex(o: OpToEff) : String = match o {
-  OEFP(op, eff) -> concat_all([cache_string_to_hex(op), cache_string_to_hex(eff)])
-}
-
-#[doc("Serialise one `UAliasEntry`.")]
-pub fn cache_ualias_to_hex(u: UAliasEntry) : String = match u {
-  UAE(nm, unit) -> concat_all([cache_string_to_hex(nm), cache_unit_to_hex(unit)])
-}
-
-#[doc("Serialise one `CtorEntry`.")]
-pub fn cache_ctorentry_to_hex(c: CtorEntry) : String = match c {
-  CtorE(ty, home, fn_) -> concat_all([cache_string_to_hex(ty),
-                                       cache_string_to_hex(home),
-                                       cache_string_to_hex(fn_)])
-}
-
 # ---- interface hash ---------------------------------------------------
-# Tables are rendered sorted-by-name via `kv_sort` below.
 # The hash covers a canonical rendering of the delta: each table's
-# elements sorted by name, var ids renumbered, concatenated in a fixed
-# table order, hashed with the same FNV-1a digest the user cache uses.
+# elements sorted by name, var ids renumbered, their encodings folded in
+# a fixed table order through the FNV-1a digest the user cache uses.
 
 fn tyentry_key(e: TyEntry) : String = e.name
 fn unioninfo_key(u: UnionInfo) : String = match u { UI(nm, _, _, _) -> nm }
@@ -293,11 +205,8 @@ fn optoeff_key(o: OpToEff) : String = match o { OEFP(op, eff) -> joined_key(op, 
 fn ualias_key(u: UAliasEntry) : String = match u { UAE(nm, _) -> nm }
 fn ctorentry_key(c: CtorEntry) : String = match c { CtorE(ty, _, fn_) -> joined_key(ty, fn_) }
 
-# Render one table to its canonical hex chunk: sort the (key, chunk)
-# pairs by key, then concat the chunks in that order. `render_table`
-# takes the table already turned into (key, canonical-chunk) pairs.
-#[doc("One table entry reduced to its sort key and its canonical chunk.")]
-pub type KV = KV(String, String)
+#[doc("One table entry reduced to its sort key and its canonical encoding.")]
+pub type KV = KV(String, Array[Byte])
 
 # A large core delta carries hundreds of entries per table (~900 for
 # `ty_entries` in a full-stdlib build). Every list walk below is
@@ -308,12 +217,12 @@ pub type KV = KV(String, String)
 # reversed; `kv_sort` is stable over exactly that order, so the tie
 # order it produces is part of the canonical bytes.
 
-fn render_table(pairs: [KV]) : String =
-  concat_all(kv_chunks(kv_sort(pairs), []))
+# Fold one table's chunks into the running hash, sorted by key.
+fn hash_table(h: Int, pairs: [KV]) : Int = kv_fold(h, kv_sort(pairs))
 
-fn kv_chunks(pairs: [KV], acc: [String]) : [String] = match pairs {
-  [] -> list_reverse(acc)
-  [KV(_, chunk), ...t] -> kv_chunks(t, [chunk, ...acc])
+fn kv_fold(h: Int, pairs: [KV]) : Int = match pairs {
+  [] -> h
+  [KV(_, chunk), ...t] -> kv_fold(cache_fnv_bytes(h, chunk), t)
 }
 
 # Bottom-up merge sort — a table runs to hundreds of entries on a
@@ -365,14 +274,14 @@ fn kv_merge(a: [KV], b: [KV], acc: [KV]) : [KV] = match a {
 pub fn tyentry_pairs(xs: [TyEntry], acc: [KV]) : [KV] = match xs {
   [] -> acc
   [e, ...t] -> tyentry_pairs(t, [KV(tyentry_key(e),
-                   cache_tyentry_to_hex(TyEntry { name: e.name, scheme: canon_scheme(e.scheme) })),
+                   to_bytes(TyEntry { name: e.name, scheme: canon_scheme(e.scheme) })),
                 ...acc])
 }
 
 #[doc("Pair one table's entries with their sort keys, canonicalised, accumulated in reverse.")]
 pub fn unioninfo_pairs(xs: [UnionInfo], acc: [KV]) : [KV] = match xs {
   [] -> acc
-  [u, ...t] -> unioninfo_pairs(t, [KV(unioninfo_key(u), cache_unioninfo_to_hex(canon_unioninfo(u))), ...acc])
+  [u, ...t] -> unioninfo_pairs(t, [KV(unioninfo_key(u), to_bytes(canon_unioninfo(u))), ...acc])
 }
 
 fn canon_unioninfo(u: UnionInfo) : UnionInfo = match u {
@@ -387,50 +296,47 @@ fn canon_unioninfo(u: UnionInfo) : UnionInfo = match u {
 #[doc("Pair one table's entries with their sort keys, canonicalised, accumulated in reverse.")]
 pub fn opeffarity_pairs(xs: [OpEffArity], acc: [KV]) : [KV] = match xs {
   [] -> acc
-  [a, ...t] -> opeffarity_pairs(t, [KV(opeffarity_key(a), cache_opeffarity_to_hex(a)), ...acc])
+  [a, ...t] -> opeffarity_pairs(t, [KV(opeffarity_key(a), to_bytes(a)), ...acc])
 }
 
 #[doc("Pair one table's entries with their sort keys, canonicalised, accumulated in reverse.")]
 pub fn recinfo_pairs(xs: [RecInfo], acc: [KV]) : [KV] = match xs {
   [] -> acc
-  [r, ...t] -> recinfo_pairs(t, [KV(recinfo_key(r), cache_recinfo_to_hex(r)), ...acc])
+  [r, ...t] -> recinfo_pairs(t, [KV(recinfo_key(r), to_bytes(r)), ...acc])
 }
 
 #[doc("Pair one table's entries with their sort keys, canonicalised, accumulated in reverse.")]
 pub fn suminfo_pairs(xs: [SumInfo], acc: [KV]) : [KV] = match xs {
   [] -> acc
-  [s, ...t] -> suminfo_pairs(t, [KV(suminfo_key(s), cache_suminfo_to_hex(s)), ...acc])
+  [s, ...t] -> suminfo_pairs(t, [KV(suminfo_key(s), to_bytes(s)), ...acc])
 }
 
 #[doc("Pair one table's entries with their sort keys, canonicalised, accumulated in reverse.")]
 pub fn optoeff_pairs(xs: [OpToEff], acc: [KV]) : [KV] = match xs {
   [] -> acc
-  [o, ...t] -> optoeff_pairs(t, [KV(optoeff_key(o), cache_optoeff_to_hex(o)), ...acc])
+  [o, ...t] -> optoeff_pairs(t, [KV(optoeff_key(o), to_bytes(o)), ...acc])
 }
 
 #[doc("Pair one table's entries with their sort keys, canonicalised, accumulated in reverse.")]
 pub fn ualias_pairs(xs: [UAliasEntry], acc: [KV]) : [KV] = match xs {
   [] -> acc
-  [u, ...t] -> ualias_pairs(t, [KV(ualias_key(u), cache_ualias_to_hex(u)), ...acc])
+  [u, ...t] -> ualias_pairs(t, [KV(ualias_key(u), to_bytes(u)), ...acc])
 }
 
 #[doc("Pair one table's entries with their sort keys, canonicalised, accumulated in reverse.")]
 pub fn ctorentry_pairs(xs: [CtorEntry], acc: [KV]) : [KV] = match xs {
   [] -> acc
-  [c, ...t] -> ctorentry_pairs(t, [KV(ctorentry_key(c), cache_ctorentry_to_hex(c)), ...acc])
+  [c, ...t] -> ctorentry_pairs(t, [KV(ctorentry_key(c), to_bytes(c)), ...acc])
 }
 
-#[doc("The canonical serialized form of a `ModuleEnvDelta`'s interface: each of the 8 tables rendered sorted-by-name with var ids renumbered to appearance rank. The `name` field is excluded — a module's interface identity is its exported shapes, not its own name. Two logically-equal interfaces produce byte-identical output.")]
-pub fn mdelta_canon_bytes(d: ModuleEnvDelta) : String =
-  concat_all([render_table(tyentry_pairs(d.ty_entries, [])),
-              render_table(unioninfo_pairs(d.unions, [])),
-              render_table(opeffarity_pairs(d.op_eff_arities, [])),
-              render_table(recinfo_pairs(d.recs, [])),
-              render_table(suminfo_pairs(d.sums, [])),
-              render_table(optoeff_pairs(d.op_to_eff, [])),
-              render_table(ualias_pairs(d.unit_aliases, [])),
-              render_table(ctorentry_pairs(d.constructors, []))])
-
-#[doc("Interface hash of a `ModuleEnvDelta`, as 16 lowercase hex chars over its canonical bytes. Stable across inference order; the value the incremental-rebuild propagation cut compares. A source edit that leaves the interface unchanged yields the same hash, so importers are not invalidated.")]
-pub fn mdelta_iface_hash(d: ModuleEnvDelta) : String =
-  uc_content_hex(mdelta_canon_bytes(d))
+#[doc("Interface hash of a `ModuleEnvDelta`, as 16 hex chars over its canonical form: each of the 8 tables sorted by name with var ids renumbered to appearance rank. The `name` field is excluded — a module's interface identity is its exported shapes, not its own name. Stable across inference order; a source edit that leaves the interface unchanged yields the same hash, so importers are not invalidated.")]
+pub fn mdelta_iface_hash(d: ModuleEnvDelta) : String = {
+  let h0 = hash_table(string_hash(""), tyentry_pairs(d.ty_entries, []))
+  let h1 = hash_table(h0, unioninfo_pairs(d.unions, []))
+  let h2 = hash_table(h1, opeffarity_pairs(d.op_eff_arities, []))
+  let h3 = hash_table(h2, recinfo_pairs(d.recs, []))
+  let h4 = hash_table(h3, suminfo_pairs(d.sums, []))
+  let h5 = hash_table(h4, optoeff_pairs(d.op_to_eff, []))
+  let h6 = hash_table(h5, ualias_pairs(d.unit_aliases, []))
+  uc_hash_hex16(hash_table(h6, ctorentry_pairs(d.constructors, [])))
+}

@@ -91,7 +91,14 @@ measurement and the soundness reasoning.)
   stale-core guard — serving a stale core would typecheck every program
   against old stdlib symbols).
 - `corec_version_bump.sh` — flip a core blob's kaikai-version byte.
+- `corec_format_version_bump.sh` — stamp every warm core blob back to
+  format_version 11 (the hand-written codec's layout); each must miss,
+  re-parse, and be republished under the current version.
 - `corec_corrupt_blob.sh` — truncate a core blob past the header.
+- `corec_derive_roundtrip.sh` — the derived codec round-trips the full
+  parse of every positive sugar / effect / protocol fixture plus the
+  compiler's typer and parser byte-identical (`kaic2
+  --cache-roundtrip-test <file>`).
 
 Run alone with:
 

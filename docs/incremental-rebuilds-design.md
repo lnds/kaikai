@@ -345,3 +345,24 @@ way around the (misdiagnosed) stage1 fault — is the promising direction, now f
 a different reason: size and decode cost, not corruption. Until a representation
 lands whose decode is cheaper than inference, `--user-cache` builds pay the cut
 rather than profit from it.
+
+### The derived codec
+
+The hand-written codec (`compiler.cache_typed`, `compiler.cache_typedprog`,
+`compiler.cache_delta_io` and the per-node helpers of `compiler.cache` /
+`compiler.cache_ast`) is gone: `#[derive(BinSerialize)]` on the AST and
+typed-artifact types encodes the payload, `compiler.cache` keeps only the 76-byte
+header, and every blob is an `Array[Byte]` read and written with
+`file_read_bytes` / `file_write_bytes`. `format_version` is 12. Declaration-level
+`SymId`s are dropped before encoding, because the key hashes these bytes and the
+ids are positions in the stamping build's symbol table; `ESym` and `EHandle` ids
+ride the wire, covered by the key.
+
+The derived encoding costs more than the string-carried one it replaced: the
+runtime boxes every `Byte` of an `Array[Byte]`, where the old codec moved bytes
+with `string_slice` / `int_to_le8`. Measured serial A/B on the 43-module
+`tools/kai` package, `--user-cache` plus the core cache, front-end only: cold
+1.87 → 2.52 s, warm 1.32 → 1.61 s, one-body edit 1.34 → 1.69 s, emitted C
+byte-identical. The codec alone on the 118 KB `protocols.kai` blob: encode ~10×,
+decode ~2.2× the old codec. The representation question above therefore stands,
+now with a cheaper-to-maintain codec and a costlier decode.
