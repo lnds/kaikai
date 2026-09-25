@@ -472,11 +472,6 @@ make rc-budget            # leaked / RSS / wall vs baseline
 make demos-extended       # demos/9d9l + demos/vs + aspirational rerun
 ```
 
-While `.github/workflows/daily.yml` sets `KAI_THREADS=1` (a kaic2-built
-compiler is several times slower under M:N), the nightly run does not
-exercise the default thread count; the gates that pin a thread count
-still run theirs.
-
 If Tier 2 fails, **`main` is not broken** — Tier 0 / Tier 1 already
 gated every commit. Tier 2 produces a diagnostic that opens a lane
 the next morning. Velocity is preserved.
