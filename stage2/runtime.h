@@ -10241,6 +10241,97 @@ static KaiValue *kai_core_string_byte_at_int(KaiValue *s, KaiValue *i) {
     return kai_int(v);
 }
 
+/* ---------- core: Array[Byte] block primitives ----------
+ *
+ * Every Byte is an immortal cell of `kai_byte_cache`, so a Byte slot is
+ * written by pointer store and a displaced one needs no decref. */
+
+static int64_t kai_bytes_int(KaiValue *v) {
+    int64_t n = kai_is_int(v) ? kai_intf(v) : 0;
+    if (v) kai_decref(v);
+    return n;
+}
+
+/* The slots `[off, off + n)` of `a`; traps when the range leaves the array. */
+static KaiValue **kai_bytes_span(const char *op, KaiValue *a, int64_t off, int64_t n) {
+    if (!kai_is_ptr(a) || a->tag != KAI_ARRAY) {
+        fprintf(stderr, "kai: %s: not an array\n", op); exit(1);
+    }
+    if (off < 0 || n < 0 || off > a->as.arr.len || n > a->as.arr.len - off) {
+        /* Outlives this frame: a trap in a fiber is read after the unwind. */
+        static char buf[128];
+        snprintf(buf, sizeof buf, "%s: range %lld..%lld out of range (len=%lld)", op,
+                 (long long) off, (long long) off + (long long) n, (long long) a->as.arr.len);
+        kai_trap_abort(buf);
+    }
+    return a->as.arr.items + off;
+}
+
+static int64_t kai_bytes_width(const char *op, KaiValue *w) {
+    int64_t n = kai_bytes_int(w);
+    if (n < 0 || n > 8) {
+        static char buf[96];
+        snprintf(buf, sizeof buf, "%s: width %lld outside 0..8", op, (long long) n);
+        kai_trap_abort(buf);
+    }
+    return n;
+}
+
+/* `dst[off..off+n) := src[soff..soff+n)`, overlap-safe; returns `dst`. */
+static KaiValue *kai_core_bytes_blit(KaiValue *dst, KaiValue *off, KaiValue *src,
+                                     KaiValue *soff, KaiValue *n) {
+    int64_t o = kai_bytes_int(off), so = kai_bytes_int(soff), len = kai_bytes_int(n);
+    KaiValue **d = kai_bytes_span("bytes_blit", dst, o, len);
+    KaiValue **s = kai_bytes_span("bytes_blit", src, so, len);
+    if (len > 0) memmove(d, s, (size_t) len * sizeof(KaiValue *));
+    kai_decref(src);
+    return dst;
+}
+
+/* The low `width` bytes of `v`, little-endian, at `dst[off]`; returns `dst`. */
+static KaiValue *kai_core_bytes_put_le(KaiValue *dst, KaiValue *off, KaiValue *v, KaiValue *width) {
+    int64_t o = kai_bytes_int(off), x = kai_bytes_int(v);
+    int64_t w = kai_bytes_width("bytes_put_le", width);
+    KaiValue **d = kai_bytes_span("bytes_put_le", dst, o, w);
+    for (int64_t i = 0; i < w; ++i) d[i] = kai_byte((uint8_t) ((uint64_t) x >> (i * 8)));
+    return dst;
+}
+
+/* `width` bytes at `src[off]`, little-endian, as an unsigned Int; width 8
+ * wraps into the two's-complement Int. */
+static KaiValue *kai_core_bytes_get_le(KaiValue *src, KaiValue *off, KaiValue *width) {
+    int64_t o = kai_bytes_int(off);
+    int64_t w = kai_bytes_width("bytes_get_le", width);
+    KaiValue **s = kai_bytes_span("bytes_get_le", src, o, w);
+    uint64_t acc = 0;
+    for (int64_t i = w; i-- > 0;) acc = (acc << 8) | s[i]->as.byte_val;
+    kai_decref(src);
+    return kai_int((int64_t) acc);
+}
+
+/* The bytes of `s` at `dst[off]`; returns `dst`. */
+static KaiValue *kai_core_bytes_put_string(KaiValue *dst, KaiValue *off, KaiValue *s) {
+    int64_t o = kai_bytes_int(off);
+    int64_t len = (kai_is_ptr(s) && s->tag == KAI_STR) ? (int64_t) s->as.s.len : 0;
+    KaiValue **d = kai_bytes_span("bytes_put_string", dst, o, len);
+    for (int64_t i = 0; i < len; ++i) d[i] = kai_byte((uint8_t) s->as.s.bytes[i]);
+    if (s) kai_decref(s);
+    return dst;
+}
+
+/* `src[off..off+n)` as a String, byte-exact. */
+static KaiValue *kai_core_bytes_get_string(KaiValue *src, KaiValue *off, KaiValue *n) {
+    int64_t o = kai_bytes_int(off), len = kai_bytes_int(n);
+    KaiValue **s = kai_bytes_span("bytes_get_string", src, o, len);
+    KaiValue *r = kai_alloc(KAI_STR);
+    r->as.s.len = (size_t) len;
+    r->as.s.bytes = (char *) kai_heap_malloc((size_t) len + 1);
+    for (int64_t i = 0; i < len; ++i) r->as.s.bytes[i] = (char) s[i]->as.byte_val;
+    r->as.s.bytes[len] = '\0';
+    kai_decref(src);
+    return r;
+}
+
 /* `string_hash(s)` — full-width 64-bit FNV-1a over the raw bytes, the
  * Hash protocol's String backend (issue #373). Distinct from the
  * interning hash `kai_str_intern_hash` above, which bucket-truncates
@@ -10410,9 +10501,20 @@ static KaiValue *_kai_core_mailbox_free_thunk(KaiValue *s, KaiValue **a, int n) 
 #define KAI_CORE_THUNK3(nm) \
     static KaiValue *_kai_core_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
     { (void) s; (void) n; return kai_core_##nm(a[0], a[1], a[2]); }
+#define KAI_CORE_THUNK4(nm) \
+    static KaiValue *_kai_core_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) n; return kai_core_##nm(a[0], a[1], a[2], a[3]); }
+#define KAI_CORE_THUNK5(nm) \
+    static KaiValue *_kai_core_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) n; return kai_core_##nm(a[0], a[1], a[2], a[3], a[4]); }
 
 KAI_CORE_THUNK1(int_to_le4)
 KAI_CORE_THUNK1(int_to_le8)
+KAI_CORE_THUNK5(bytes_blit)
+KAI_CORE_THUNK4(bytes_put_le)
+KAI_CORE_THUNK3(bytes_get_le)
+KAI_CORE_THUNK3(bytes_put_string)
+KAI_CORE_THUNK3(bytes_get_string)
 KAI_CORE_THUNK1(int_to_byte)
 KAI_CORE_THUNK1(byte_to_int)
 KAI_CORE_THUNK2(byte_add)

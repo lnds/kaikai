@@ -1,0 +1,105 @@
+# Pins the Array[Byte] block builtins at their edges: empty ranges at the
+# end of the buffer, overlapping copies, bytes >= 128, and the Int extremes.
+
+fn dump_loop(bs: Array[Byte], i: Int, acc: String) : String =
+  if i >= array_length(bs) { acc }
+  else { dump_loop(bs, i + 1, "#{acc}#{byte_to_int(bs[i])},") }
+
+fn dump(label: String, bs: Array[Byte]) : Unit / Stdout =
+  Stdout.print("#{label} #{array_length(bs)}: #{dump_loop(bs, 0, "")}")
+
+fn ramp_loop(bs: Array[Byte], i: Int, start: Int) : Array[Byte] / Mutable =
+  if i >= array_length(bs) { bs }
+  else {
+    let _ = bytes_put_le(bs, i, start + i, 1)
+    ramp_loop(bs, i + 1, start)
+  }
+
+# `n` bytes counting up from `start`, wrapping at 256.
+fn ramp(n: Int, start: Int) : Array[Byte] = ramp_loop(array_make(n, 0u8), 0, start)
+
+fn le8(n: Int) : Array[Byte] = bytes_put_le(array_make(8, 0u8), 0, n, 8)
+
+fn roundtrip8(xs: [Int]) : Unit / Stdout = match xs {
+  []        -> ()
+  [x, ...t] -> {
+    let back = bytes_get_le(le8(x), 0, 8)
+    Stdout.print("le8 #{x} -> #{back} #{back == x}")
+    roundtrip8(t)
+  }
+}
+
+# The Int codec's own bytes and value: `bytes_put_le`/`bytes_get_le` at
+# width 8 must agree with them exactly, since both are on-disk format.
+fn codec_agrees(xs: [Int]) : Unit / Stdout = match xs {
+  []        -> ()
+  [x, ...t] -> {
+    let enc = bin_int_to_bytes(x)
+    let dec = match bin_bytes_to_int(enc, 0) {
+      Ok(c)  -> c.value == bytes_get_le(enc, 0, 8)
+      Err(_) -> false
+    }
+    Stdout.print("codec #{x}: enc #{dump_loop(enc, 0, "") == dump_loop(le8(x), 0, "")} dec #{dec}")
+    codec_agrees(t)
+  }
+}
+
+# The String the byte-at-a-time decode builds from the same bytes.
+fn byte_string_loop(bs: Array[Byte], i: Int, acc: String) : String =
+  if i >= array_length(bs) { acc }
+  else { byte_string_loop(bs, i + 1, string_concat(acc, int_to_byte_string(byte_to_int(bs[i])))) }
+
+fn main() : Unit / Stdout = {
+  let imin = -9223372036854775807 - 1
+  let imax = 9223372036854775807
+
+  dump("src", ramp(6, 250))
+  dump("blit_all", bytes_blit(array_make(6, 0u8), 0, ramp(6, 250), 0, 6))
+  dump("blit_mid", bytes_blit(array_make(8, 0u8), 3, ramp(6, 250), 2, 4))
+  dump("blit_n0_end", bytes_blit(array_make(3, 7u8), 3, ramp(6, 250), 6, 0))
+  dump("blit_empty", bytes_blit(array_make(0, 0u8), 0, array_make(0, 0u8), 0, 0))
+  let fwd = ramp(6, 0)
+  dump("blit_overlap_fwd", bytes_blit(fwd, 2, fwd, 0, 4))
+  let back = ramp(6, 0)
+  dump("blit_overlap_back", bytes_blit(back, 0, back, 2, 4))
+
+  dump("le8_min", le8(imin))
+  dump("le8_max", le8(imax))
+  dump("le8_neg1", le8(-1))
+  dump("le4_neg2", bytes_put_le(array_make(4, 0u8), 0, -2, 4))
+  dump("le4_end", bytes_put_le(array_make(6, 9u8), 2, 305419896, 4))
+  dump("le1_wrap", bytes_put_le(array_make(1, 0u8), 0, 511, 1))
+  dump("le0_end", bytes_put_le(array_make(2, 9u8), 2, 5, 0))
+  roundtrip8([0, 1, -1, 255, 256, -300, 9007199254740993, imin, imax])
+  codec_agrees([0, 1, -1, 255, -256, -300, 9007199254740993, imin, imax])
+  dump("le8_end", bytes_put_le(array_make(10, 9u8), 2, imin, 8))
+  Stdout.print("get8_end #{bytes_get_le(bytes_put_le(array_make(10, 9u8), 2, imin, 8), 2, 8)}")
+  Stdout.print("get0_start #{bytes_get_le(array_make(0, 0u8), 0, 0)}")
+  Stdout.print("le4 of -2 -> #{bytes_get_le(bytes_put_le(array_make(4, 0u8), 0, -2, 4), 0, 4)}")
+  Stdout.print("le4 high end -> #{bytes_get_le(ramp(6, 250), 2, 4)}")
+  Stdout.print("le0 end -> #{bytes_get_le(ramp(6, 250), 6, 0)}")
+
+  dump("str_empty_end", bytes_put_string(array_make(3, 1u8), 3, ""))
+  dump("str_utf8", bytes_put_string(array_make(8, 0u8), 1, "héllo"))
+  let hello = bytes_put_string(array_make(6, 0u8), 0, "héllo")
+  Stdout.print("get_str [#{bytes_get_string(hello, 0, 6)}]")
+  Stdout.print("get_str_mid [#{bytes_get_string(hello, 1, 2)}]")
+  Stdout.print("get_str_empty_end [#{bytes_get_string(hello, 6, 0)}]")
+  # 0xFE/0xFF never occur in UTF-8 and 0xC3 opens a sequence left unfinished.
+  let bad = bytes_put_le(ramp(6, 254), 5, 195, 1)
+  let raw = bytes_get_string(bad, 0, 6)
+  Stdout.print("raw_len #{string_length(raw)} same_as_bytewise #{raw == byte_string_loop(bad, 0, "")}")
+  dump("raw_back", bytes_put_string(array_make(6, 0u8), 0, raw))
+
+  # Each builtin as a first-class value, a closure over its runtime thunk.
+  let blit = bytes_blit
+  let put_le = bytes_put_le
+  let get_le = bytes_get_le
+  let put_str = bytes_put_string
+  let get_str = bytes_get_string
+  let v = array_make(9, 0u8)
+  let _ = blit(v, 0, ramp(2, 1), 0, 2)
+  let _ = put_le(v, 2, -2, 4)
+  let _ = put_str(v, 6, "kai")
+  Stdout.print("values #{dump_loop(v, 0, "")} #{get_le(v, 2, 4)} #{get_str(v, 6, 3)}")
+}
