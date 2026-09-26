@@ -1,0 +1,252 @@
+#[doc("""
+Branch payers for single-read binders.
+
+A match-arm or `let` binder read exactly once, by a bare move, hands its
+birth reference on at that read. When the read sits behind `if` / `match`
+alternatives, a path through a sibling alternative never reaches it, so
+each such alternative releases the binder on entry. The entry drop leaves
+the alternative's own value, and any self-call in it, in tail position.
+
+The drops key on the name, so a binder qualifies only when the function
+binds that name once and reads it once.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.expr_positions
+import compiler.infer
+import compiler.perceus_payer
+import compiler.perceus_plant_drop
+import compiler.sym_read
+import compiler.util
+
+type PbpCx = { binds: [String], pnames: [String], uses: [Use] }
+
+#[doc("Release each qualifying arm and `let` binder on entry to the alternatives that skip its single read.")]
+pub fn pbp_branch_drops(body: Expr, pnames: [String], uses: [Use]) : Expr =
+  pbp_expr(body, PbpCx { binds: pbp_bound_names(body, []), pnames: pnames, uses: uses })
+
+fn pbp_expr(e: Expr, cx: PbpCx) : Expr = {
+  let k1 = prc_map_expr_kind(e.kind, (c) => pbp_expr(c, cx))
+  pbp_rekind(e, match k1 {
+    EMatch(s, arms) -> EMatch(s, map(arms, (a) => pbp_arm(a, cx)))
+    EBlock(ss, ot)  -> pbp_block(ss, ot, cx)
+    _               -> k1
+  })
+}
+
+fn pbp_arm(a: Arm, cx: PbpCx) : Arm = match a {
+  Arm(pat, og, body) -> Arm(pat, og, pbp_pay_all(ppd_pat_binders(pat, []), body, cx))
+}
+
+fn pbp_pay_all(names: [String], scope: Expr, cx: PbpCx) : Expr = match names {
+  []            -> scope
+  [nm, ...rest] -> pbp_pay_all(rest, pbp_pay(nm, scope, cx), cx)
+}
+
+fn pbp_block(ss: [Stmt], ot: Option[Expr], cx: PbpCx) : ExprKind = match ss {
+  []           -> EBlock([], ot)
+  [s, ...rest] -> match pbp_block(rest, ot, cx) {
+    EBlock(rest1, ot1) -> pbp_let(s, rest1, ot1, cx)
+    k                  -> k
+  }
+}
+
+fn pbp_let(s: Stmt, rest: [Stmt], ot: Option[Expr], cx: PbpCx) : ExprKind = match pbp_let_owner(s) {
+  None     -> EBlock([s, ...rest], ot)
+  Some(nm) -> match pbp_pay(nm, mk_expr(EBlock(rest, ot), 0, 0), cx).kind {
+    EBlock(rest1, ot1) -> EBlock([s, ...rest1], ot1)
+    _                  -> EBlock([s, ...rest], ot)
+  }
+}
+
+# A raw `let` carries no rc, so it has no birth reference to release.
+fn pbp_let_owner(s: Stmt) : Option[String] = match s {
+  SLet(pat, _, rhs) -> match pat.pkind {
+    PBind(nm) -> if pbp_is_raw(rhs) { None } else { Some(nm) }
+    _         -> None
+  }
+  _ -> None
+}
+
+fn pbp_is_raw(e: Expr) : Bool = match e.mode {
+  MUnboxed -> true
+  _        -> false
+}
+
+fn pbp_pay(nm: String, scope: Expr, cx: PbpCx) : Expr =
+  if pbp_qualifies(nm, cx) {
+    match pbp_plant(nm, scope) {
+      PbPaid(e) -> e
+      _         -> scope
+    }
+  } else { scope }
+
+fn pbp_qualifies(nm: String, cx: PbpCx) : Bool =
+  not name_is_unused_binder(nm) and not list_has(cx.pnames, nm) and
+  pbp_read_count(nm, cx.uses, 0) == 1 and pbp_count(nm, cx.binds, 0) == 1
+
+fn pbp_read_count(nm: String, uses: [Use], acc: Int) : Int = match uses {
+  []                        -> acc
+  [U(un, _, _, _), ...rest] -> pbp_read_count(nm, rest, if un == nm { acc + 1 } else { acc })
+}
+
+# Planting outcome: the read is not a plain move reachable here, it is
+# reached through plain positions only (nothing to release), or `e` rebuilt
+# with the skipping alternatives paying on entry.
+type PbpOut = PbDecline | PbSame | PbPaid(Expr)
+
+# A short circuit, lambda, handler clause or assert message hides the path;
+# a dup'd read leaves the birth reference owed; a guard read can fall
+# through to a later arm. Each declines.
+fn pbp_plant(nm: String, e: Expr) : PbpOut = match e.kind {
+  EVar(u)         -> if u == nm { PbSame } else { PbDecline }
+  EIf(c, t, oe)   -> pbp_plant_if(nm, e, c, t, oe)
+  EMatch(s, arms) -> pbp_plant_match(nm, e, s, arms)
+  ECall(f, _)     -> if pbp_is_dup(f) { PbDecline } else { pbp_plant_plain(nm, e) }
+  _               -> pbp_plant_plain(nm, e)
+}
+
+# Through a plain position: rebuild only when something below was paid.
+fn pbp_lift(o: PbpOut, f: (Expr) -> Expr) : PbpOut = match o {
+  PbPaid(x) -> PbPaid(f(x))
+  _         -> o
+}
+
+# Through an alternative: the siblings pay even when the path below is plain.
+fn pbp_branch(o: PbpOut, alt: Expr, f: (Expr) -> Expr) : PbpOut = match o {
+  PbDecline -> PbDecline
+  PbSame    -> PbPaid(f(alt))
+  PbPaid(x) -> PbPaid(f(x))
+}
+
+fn pbp_plant_plain(nm: String, e: Expr) : PbpOut = match pbp_reader(nm, xp_positions(e)) {
+  Some(XP(XAll, c)) ->
+    pbp_lift(pbp_plant(nm, c), (c1) => pbp_rekind(e, prc_map_expr_kind(e.kind, (x) => if pbp_mentions(nm, x) { c1 } else { x })))
+  _ -> PbDecline
+}
+
+fn pbp_plant_if(nm: String, e: Expr, c: Expr, t: Expr, oe: Option[Expr]) : PbpOut =
+  if pbp_mentions(nm, c) { pbp_lift(pbp_plant(nm, c), (c1) => pbp_rekind(e, EIf(c1, t, oe))) }
+  else if pbp_mentions(nm, t) {
+    pbp_branch(pbp_plant(nm, t), t, (t1) => pbp_rekind(e, EIf(c, t1, Some(pbp_entry_drop(nm, pbp_else(t, oe))))))
+  }
+  else { pbp_plant_else(nm, e, c, t, oe) }
+
+fn pbp_plant_else(nm: String, e: Expr, c: Expr, t: Expr, oe: Option[Expr]) : PbpOut = match oe {
+  Some(e1) -> pbp_branch(pbp_plant(nm, e1), e1, (e2) => pbp_rekind(e, EIf(c, pbp_entry_drop(nm, t), Some(e2))))
+  None     -> PbDecline
+}
+
+fn pbp_else(t: Expr, oe: Option[Expr]) : Expr = match oe {
+  Some(e1) -> e1
+  None     -> Expr { kind: EUnit, line: t.line, col: t.col, ty: t.ty, mode: t.mode }
+}
+
+fn pbp_plant_match(nm: String, e: Expr, s: Expr, arms: [Arm]) : PbpOut =
+  if pbp_mentions(nm, s) { pbp_lift(pbp_plant(nm, s), (s1) => pbp_rekind(e, EMatch(s1, arms))) }
+  else if pbp_guards_mention(nm, arms) { PbDecline }
+  else {
+    match pbp_reading_body(nm, arms) {
+      Some(b) -> pbp_branch(pbp_plant(nm, b), b, (b1) => pbp_rekind(e, EMatch(s, pbp_pay_arms(nm, arms, b1))))
+      None    -> PbDecline
+    }
+  }
+
+fn pbp_reading_body(nm: String, arms: [Arm]) : Option[Expr] = match arms {
+  []                      -> None
+  [Arm(_, _, b), ...rest] -> if pbp_mentions(nm, b) { Some(b) } else { pbp_reading_body(nm, rest) }
+}
+
+# The reading arm takes its planted body `b1`; every other arm releases on entry.
+fn pbp_pay_arms(nm: String, arms: [Arm], b1: Expr) : [Arm] = map(arms, (a) => match a {
+  Arm(p, og, b) -> Arm(p, og, if pbp_mentions(nm, b) { b1 } else { pbp_entry_drop(nm, b) })
+})
+
+fn pbp_guards_mention(nm: String, arms: [Arm]) : Bool = match arms {
+  []                       -> false
+  [Arm(_, og, _), ...rest] -> match og {
+    Some(g) -> pbp_mentions(nm, g) or pbp_guards_mention(nm, rest)
+    None    -> pbp_guards_mention(nm, rest)
+  }
+}
+
+fn pbp_entry_drop(nm: String, alt: Expr) : Expr =
+  Expr { kind: EBlock([pcs_make_drop_stmt(nm, alt.line, alt.col)], Some(alt)),
+         line: alt.line, col: alt.col, ty: alt.ty, mode: alt.mode }
+
+fn pbp_is_dup(f: Expr) : Bool = match sym_read_kind(f.kind) {
+  EVar(c) -> c == "__perceus_dup"
+  _       -> false
+}
+
+fn pbp_reader(nm: String, ps: [XPos]) : Option[XPos] = match ps {
+  []                  -> None
+  [XP(r, c), ...rest] -> if pbp_mentions(nm, c) { Some(XP(r, c)) } else { pbp_reader(nm, rest) }
+}
+
+fn pbp_mentions(nm: String, e: Expr) : Bool = match e.kind {
+  EVar(u) -> u == nm
+  _       -> pbp_mentions_ps(nm, xp_positions(e))
+}
+
+fn pbp_mentions_ps(nm: String, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(_, c), ...rest] -> pbp_mentions(nm, c) or pbp_mentions_ps(nm, rest)
+}
+
+fn pbp_rekind(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+#[doc("Every name `e` binds: let/var binders, destructuring and arm patterns, lambda and handler-clause params, handler aliases.")]
+pub fn pbp_bound_names(e: Expr, acc: [String]) : [String] = {
+  let local = match e.kind {
+    EBlock(ss, _)   -> pbp_bn_stmts(ss, acc)
+    EMatch(_, arms) -> pbp_bn_arms(arms, acc)
+    ELambda(ps, _)  -> pbp_bn_params(ps, acc)
+    EHandle(_, _, _, _, _, oalias, cls, oret) -> {
+      let a0 = match oalias { Some(al) -> [al, ...acc] None -> acc }
+      let a1 = pbp_bn_clauses(cls, a0)
+      match oret { Some(HR(rb, _, _, _)) -> [rb, ...a1] None -> a1 }
+    }
+    _ -> acc
+  }
+  pbp_bn_ps(xp_positions(e), local)
+}
+
+#[doc("How many times `nm` is bound anywhere in `e`.")]
+pub fn pbp_bind_count(nm: String, e: Expr) : Int = pbp_count(nm, pbp_bound_names(e, []), 0)
+
+fn pbp_count(nm: String, names: [String], acc: Int) : Int = match names {
+  []           -> acc
+  [b, ...rest] -> pbp_count(nm, rest, if b == nm { acc + 1 } else { acc })
+}
+
+fn pbp_bn_ps(ps: [XPos], acc: [String]) : [String] = match ps {
+  []                  -> acc
+  [XP(_, c), ...rest] -> pbp_bn_ps(rest, pbp_bound_names(c, acc))
+}
+
+fn pbp_bn_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
+  []           -> acc
+  [s, ...rest] -> pbp_bn_stmts(rest, match s {
+    SLet(p, _, _)        -> ppd_pat_binders(p, acc)
+    SVar(vn, _, _, _, _) -> [vn, ...acc]
+    _                    -> acc
+  })
+}
+
+fn pbp_bn_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+  []                      -> acc
+  [Arm(p, _, _), ...rest] -> pbp_bn_arms(rest, ppd_pat_binders(p, acc))
+}
+
+fn pbp_bn_params(ps: [Param], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> pbp_bn_params(rest, [p.pname, ...acc])
+}
+
+fn pbp_bn_clauses(cls: [HClause], acc: [String]) : [String] = match cls {
+  []                            -> acc
+  [HC(_, ps, _, _, _), ...rest] -> pbp_bn_clauses(rest, pbp_bn_params(ps, acc))
+}

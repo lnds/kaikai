@@ -55,6 +55,7 @@ import compiler.borrow_infer
 import compiler.perceus_op_arg
 import compiler.perceus_let_own
 import compiler.perceus_payer
+import compiler.perceus_branch_pay
 import compiler.perceus_plant_drop
 import compiler.perceus_tail_drop
 import compiler.consume_index
@@ -1745,7 +1746,8 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         let new_body = ptd_tail_exit_drops(new_body0, name, uses, [], branchy_lets,
                                            pcs_borrow_lookup(bmap, pcs_borrow_key(name, mo)))
         let arm_dropped = pcs_arm_drop_pass(new_body, name, [], uses)
-        let reused_body = pcs_recognise_reuse_expr(arm_dropped)
+        let branch_paid = pbp_branch_drops(arm_dropped, map(params, (p) => p.pname), uses)
+        let reused_body = pcs_recognise_reuse_expr(branch_paid)
         # Boxed LOCALS can still flow to borrowed callee slots; without the
         # caller-side strip a bare last-use arg is a move no borrowing
         # callee releases. Same strip as the mixed path — no params, so no
@@ -1903,7 +1905,8 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # param the payer assigns there.
         let param_dropped = pcs_inject_param_branch_drops(arm_dropped,
           pcs_names_paid_by(owned_moves, uses, psets, PyBranch), name)
-        let reused_body = pcs_recognise_reuse_expr_b(param_dropped, borrowed)
+        let branch_paid = pbp_branch_drops(param_dropped, pnames, uses)
+        let reused_body = pcs_recognise_reuse_expr_b(branch_paid, borrowed)
         # Borrowed params carry no exit obligation — exclude from the
         # unused-param drop. Raw params (mixed-sig) likewise carry no rc,
         # so they must not receive an unused-param drop either.
@@ -4358,9 +4361,9 @@ fn pcs_read_roles_deferred(nm: String, e: Expr) : PcsRR =
 # skip: the raw last-use transfer would leave the skipped path with no
 # payer for the birth ref, so the rewrite dups the read (force_set) and
 # the arm/guard drop planters pay every edge instead. Only `XSc`/`XMsg`
-# reads qualify — an if/match-branch read is covered by the sibling
-# branches' machinery (goto ledger, distributed drops), and forcing it
-# would orphan the birth ref on a value leaf the arm-drop distribution
+# reads qualify — an if/match-branch read keeps its raw move and the
+# sibling alternatives pay on entry (`pbp_branch_drops`), whereas forcing
+# it would orphan the birth ref on a value leaf the arm-drop distribution
 # never reaches. The same value-leaf hole gates the whole arm: when the
 # body hosts a self-tail-call, the planted drop lands only on self-call
 # leaves, so every tail leaf must be one. The fn-wide use count gates
@@ -4504,7 +4507,7 @@ fn pcs_blb_qualifies(nm: String, pat: Pattern, rhs: Expr, rest: [Stmt],
   else if not list_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm) { false }
   else if pcs_count_non_lam_uses(nm, uses, 0) != 1 { false }
   else if pcs_uses_have_in_lam(uses, nm) { false }
-  else if pcs_blb_bind_count(nm, body, 0) != 1 { false }
+  else if pbp_bind_count(nm, body) != 1 { false }
   else {
     match pcs_read_roles(nm, mk_expr(EBlock(rest, ot), pat.line, pat.col), false) {
       PRR(a, brc, blocked) ->
@@ -4569,7 +4572,7 @@ fn pcs_mll_qualifies(nm: String, pat: Pattern, rhs: Expr, body: Expr,
   else if not list_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm) { false }
   else if pcs_count_non_lam_uses(nm, uses, 0) != 1 { false }
   else if pcs_uses_have_in_lam(uses, nm) { false }
-  else if pcs_blb_bind_count(nm, body, 0) != 1 { false }
+  else if pbp_bind_count(nm, body) != 1 { false }
   else {
     match pcs_read_roles(nm, body, false) {
       PRR(a, brc, blocked) ->
@@ -4588,61 +4591,6 @@ fn pcs_blb_payer_ok(nm: String, ot: Option[Expr], fn_name: String) : Bool = matc
   Some(t) -> match pcs_read_roles(nm, t, false) {
     PRR(_, tb, _) -> tb == 0 or not ppd_has_self_call(t, fn_name)
   }
-}
-
-# How many times `nm` is bound anywhere in `e`: let/var binders,
-# destructuring and arm patterns, lambda and handler-clause params.
-fn pcs_blb_bind_count(nm: String, e: Expr, acc: Int) : Int = {
-  let local = match e.kind {
-    EBlock(ss, _)   -> pcs_blb_bc_stmts(nm, ss, 0)
-    EMatch(_, arms) -> pcs_blb_bc_arms(nm, arms, 0)
-    ELambda(ps, _)  -> pcs_blb_bc_params(nm, ps, 0)
-    EHandle(_, _, _, _, _, oalias, cls, oret) -> {
-      let a0 = match oalias { Some(al) -> if al == nm { 1 } else { 0 } None -> 0 }
-      let a1 = pcs_blb_bc_clauses(nm, cls, a0)
-      match oret { Some(HR(rb, _, _, _)) -> if rb == nm { a1 + 1 } else { a1 } None -> a1 }
-    }
-    _ -> 0
-  }
-  pcs_blb_bc_ps(nm, xp_positions(e), acc + local)
-}
-
-fn pcs_blb_bc_ps(nm: String, ps: [XPos], acc: Int) : Int = match ps {
-  []                  -> acc
-  [XP(_, c), ...rest] -> pcs_blb_bc_ps(nm, rest, pcs_blb_bind_count(nm, c, acc))
-}
-
-fn pcs_blb_bc_stmts(nm: String, ss: [Stmt], acc: Int) : Int = match ss {
-  []           -> acc
-  [s, ...rest] -> {
-    let here = match s {
-      SLet(p, _, _)        -> pcs_blb_bc_name(nm, prc_pat_binders(p, []), 0)
-      SVar(vn, _, _, _, _) -> if vn == nm { 1 } else { 0 }
-      _                    -> 0
-    }
-    pcs_blb_bc_stmts(nm, rest, acc + here)
-  }
-}
-
-fn pcs_blb_bc_arms(nm: String, arms: [Arm], acc: Int) : Int = match arms {
-  []                        -> acc
-  [Arm(p, _, _), ...rest] ->
-    pcs_blb_bc_arms(nm, rest, acc + pcs_blb_bc_name(nm, prc_pat_binders(p, []), 0))
-}
-
-fn pcs_blb_bc_params(nm: String, ps: [Param], acc: Int) : Int = match ps {
-  []           -> acc
-  [p, ...rest] -> pcs_blb_bc_params(nm, rest, if p.pname == nm { acc + 1 } else { acc })
-}
-
-fn pcs_blb_bc_clauses(nm: String, cls: [HClause], acc: Int) : Int = match cls {
-  []                            -> acc
-  [HC(_, ps, _, _, _), ...rest] -> pcs_blb_bc_clauses(nm, rest, pcs_blb_bc_params(nm, ps, acc))
-}
-
-fn pcs_blb_bc_name(nm: String, bound: [String], acc: Int) : Int = match bound {
-  []           -> acc
-  [b, ...rest] -> pcs_blb_bc_name(nm, rest, if b == nm { acc + 1 } else { acc })
 }
 
 # Block-exit drops for the `let`s this block binds whose payer is the exit

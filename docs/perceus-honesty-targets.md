@@ -228,9 +228,11 @@ Tier 2 boundary (no demo a user would try in a tutorial hits them).
   Lambda-body lets are still on the brute-force path — a per-lambda-body
   counter is the follow-up.
 
-Three sources that used to sit here are **closed**. An effect-op
+Four sources that used to sit here are **closed**. An effect-op
 argument now reaches its handler as an owned reference and is released on the
-handler side, so nothing an op is called with is orphaned; a block-local
+handler side, so nothing an op is called with is orphaned; a match-arm or
+block `let` binder read once, behind one `if`/`match` alternative, is
+released on entry to the alternatives that skip the read; a block-local
 whose only read sits in the block's tail gets its exit drop after the tail
 value is bound, the one position the block-exit pass cannot reach; and the
 string-intern table no longer pins data-derived strings (number renders,
@@ -247,6 +249,20 @@ balance (`kai_field_borrow`) all landed in the perceus-tier-2 lane
 leak sources that issue catalogued. Branch-aware dup elimination
 (#599 — the `pcs_pass` conservative-dup wall regression) is also
 CLOSED.
+
+### Open leak shapes in user code
+
+Unlike the sources above, these surface in ordinary user programs:
+
+- #2142 — a block `let` inside a match arm, read once, leaks on every evaluation.
+- #2144 — a self-recursive function's early-return leaf leaks an arm binder
+  the recursive paths read (a search that returns early leaks the rest of its list).
+- #2145 — a modulo-cons tail inside a nested `match` leaks the whole input list.
+- #2146 — an arm binder read only behind `and`/`or`, or in a nested guard,
+  leaks when the read is skipped.
+- #2141 — a pattern binder inside a lambda body leaks its projected reference.
+- #2143 — native only: a nested arm binder homonymous with an outer one is
+  released by the outer arm's exit drop (use-after-free under ASAN).
 
 ## Tier 1 — *Show HN honest*
 
