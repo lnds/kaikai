@@ -1690,6 +1690,21 @@ two precise rules:
    the demand external. The readers `bytes_get_le` and
    `bytes_get_string` never require `Mutable`.
 
+4. **A value shares the caller's cells wherever a cell sits in its
+   type.** `[Array[T]]`, `Option[Array[T]]`, a record or sum storing an
+   `Array`/`Ref`, and a closure whose row carries `Mutable` all reach
+   the caller's state, so handing one to a `/ Mutable` callee is
+   observable exactly like handing it the Array itself.
+
+5. **Calling a closure the function did not write is observable.** A
+   closure parameter, a pattern binder, or a closure read from a field
+   mutates whatever it captured, and those captures belong to whoever
+   built it. A lambda literal, a `let` bound to one, and a top-level
+   function stay transparent: the first two are checked with the
+   function body, the last captures nothing. A generic parameter never
+   hides a cell on its own — a callee can reach a value it only knows
+   as `T` only through such a closure.
+
 The typer enforces this by collecting Mutable demand at every
 `array_set` / `array_grow` call site, then walking the typed
 function body once to classify each demand as local (the target
@@ -1700,7 +1715,7 @@ inferred row — the same way `var x := init` masks `State[T]` at
 the surrounding block boundary. A function with even one
 external demand keeps `Mutable` and must declare it.
 
-### Three worked examples
+### Worked examples
 
 #### Example 1 — Local construction, NOT observable, NO `Mutable`
 
@@ -1751,6 +1766,18 @@ fn draw_buffer(buf: Array[Int]) : Unit / Ffi {
 
 `/ Ffi` only. No `Mutable`. `array_get` is pure regardless of
 `buf`'s provenance.
+
+#### Example 4 — Mutation through a callback, IS observable, REQUIRES `Mutable`
+
+```kai
+fn apply[T](x: T, f: (T) -> Unit / Mutable) : Unit / Mutable = f(x)
+
+fn poke(a: Array[Int]) : Unit / Mutable = apply(a, (arr) => { arr[0] := 7 })
+```
+
+Both rows need `/ Mutable`: `apply` calls a closure it did not write,
+and `poke` hands the caller's `a` to a `/ Mutable` callee. Dropping
+either row is a type error.
 
 ### Conservative escape rule (v1 scope)
 

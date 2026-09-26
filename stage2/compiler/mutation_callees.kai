@@ -1,0 +1,118 @@
+#[doc("""
+Which callees the `Mutable` masking pass can see into.
+
+A demand is local only when every cell it can reach was built in the
+function. Calling a closure the function did not write — a parameter, a
+pattern binder, a lambda or handler-clause parameter, a field, a call
+result — may mutate whatever that closure captured, so the pass cannot
+classify it. A lambda literal, a top-level function, a module operation,
+and a `let` naming one of them are transparent: a lambda is walked with
+the function body, and a static function captures nothing.
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.modules
+import compiler.util
+
+#[doc("Every name `body` binds to a closure it cannot see into, the parameters included.")]
+pub fn opaque_binders(params: [Param], body: Expr) : [String] =
+  ob_expr(body, param_names(params, []))
+
+#[doc("True iff calling `callee` runs a closure whose captures the caller cannot see.")]
+pub fn callee_is_opaque(callee: Expr, opaque: [String]) : Bool = match callee.kind {
+  EVar(n)        -> list_has(opaque, n)
+  ESym(_, n)     -> list_has(opaque, n)
+  EModCall(_, _) -> false
+  ELambda(_, _)  -> false
+  _              -> true
+}
+
+#[doc("True iff `e` is a function value the caller sees into or that captures nothing, so passing it cannot hand over a cell.")]
+pub fn fn_value_is_transparent(e: Expr, opaque: [String]) : Bool = match e.ty {
+  Some(t) -> match t {
+    TyFnT(_, _, _) -> not callee_is_opaque(e, opaque)
+    _              -> false
+  }
+  None -> false
+}
+
+#[doc("The call `lhs |> rhs` performs: `lhs` fills the first `_` of `rhs`'s arguments, else leads them; a bare `rhs` is applied to `lhs`.")]
+pub fn pipe_as_call(lhs: Expr, rhs: Expr) : Expr = match rhs.kind {
+  ECall(callee, args_) ->
+    if has_under(args_) { mk_expr(ECall(callee, fill_under(args_, lhs)), rhs.line, rhs.col) }
+    else { mk_expr(ECall(callee, [lhs, ...args_]), rhs.line, rhs.col) }
+  _ -> mk_expr(ECall(rhs, [lhs]), rhs.line, rhs.col)
+}
+
+fn has_under(es: [Expr]) : Bool = match es {
+  []           -> false
+  [e, ...rest] -> match e.kind {
+    EUnder -> true
+    _      -> has_under(rest)
+  }
+}
+
+fn fill_under(es: [Expr], lhs: Expr) : [Expr] = match es {
+  []           -> []
+  [e, ...rest] -> match e.kind {
+    EUnder -> [lhs, ...rest]
+    _      -> [e, ...fill_under(rest, lhs)]
+  }
+}
+
+fn param_names(ps: [Param], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> param_names(rest, [p.pname, ...acc])
+}
+
+fn ob_expr(e: Expr, acc: [String]) : [String] =
+  ob_positions(xp_positions(e), ob_node(e.kind, acc))
+
+fn ob_positions(ps: [XPos], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> match p {
+    XP(_, c) -> ob_positions(rest, ob_expr(c, acc))
+  }
+}
+
+# The binders a node introduces; `ob_expr` walks its sub-expressions.
+fn ob_node(k: ExprKind, acc: [String]) : [String] = match k {
+  EBlock(stmts, _)                    -> ob_stmts(stmts, acc)
+  EMatch(_, arms)                     -> ob_arms(arms, acc)
+  ELambda(ps, _)                      -> param_names(ps, acc)
+  EHandle(_, _, _, _, _, _, cls, ret) -> ob_return(ret, ob_clauses(cls, acc))
+  _                                   -> acc
+}
+
+fn ob_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
+  []           -> acc
+  [s, ...rest] -> ob_stmts(rest, ob_stmt(s, acc))
+}
+
+# A `let` naming a lambda literal or a static function stays transparent;
+# one aliasing an opaque binder, or holding any other value, does not.
+fn ob_stmt(s: Stmt, acc: [String]) : [String] = match s {
+  SLet(pat, _, rhs)      -> if callee_is_opaque(rhs, acc) { pat_binders(pat, acc) } else { acc }
+  SVar(name, _, _, _, _) -> [name, ...acc]
+  _                      -> acc
+}
+
+fn ob_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+  []           -> acc
+  [a, ...rest] -> match a {
+    Arm(pat, _, _) -> ob_arms(rest, pat_binders(pat, acc))
+  }
+}
+
+fn ob_clauses(cls: [HClause], acc: [String]) : [String] = match cls {
+  []           -> acc
+  [c, ...rest] -> match c {
+    HC(_, ps, _, _, _) -> ob_clauses(rest, param_names(ps, acc))
+  }
+}
+
+fn ob_return(ret: Option[HReturn], acc: [String]) : [String] = match ret {
+  Some(HR(name, _, _, _)) -> [name, ...acc]
+  None                    -> acc
+}

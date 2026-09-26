@@ -70,6 +70,12 @@ Derivable: Show, Eq, Ord, Hash, BinSerialize (partial — see
 `docs/binserialize-collections-design.md`), Layout (records of
 `U<N><be|le>` fields — `kai info kinds`), Json.
 
+A derive of Show, Eq or Hash needs the protocol on every type a field
+reaches, including through a list, an Option or a tuple:
+`[(Int, String)]` needs it on `List`, `Pair`, `Int` and `String`. A
+missing one is reported at the declaration, naming the field and the
+path to the type that lacks it.
+
 A derived protocol may be module-qualified — `#[derive(pa.Show)]` —
 which selects that module's protocol when two imports export the same
 name; a bare name exported by two imports is an error naming both.
