@@ -1060,9 +1060,9 @@ __attribute__((always_inline)) KaiValue *kaix_variant_reuse_move_i64(KaiValue *s
   return kai_variant_u(tag, name, n, (uint32_t) kai_slot_mask_of(tag), slots);
 }
 
-/* Used by lambda thunks to read their captured values from the
-   closure's self parameter. i is the capture's index. */
-KaiValue *kaix_capture(KaiValue *self, int i)             { return kai_incref(self->as.clo.captures[i]); }
+/* A lambda thunk's read of capture i. Borrowed: the closure owns its
+   captures and releases them when it dies. */
+KaiValue *kaix_capture(KaiValue *self, int i)             { return self->as.clo.captures[i]; }
 
 KaiValue *kaix_core_list_length(KaiValue *xs)          { return kai_core_list_length(xs); }
 KaiValue *kaix_core_list_append(KaiValue *a, KaiValue *b) { return kai_core_list_append(a, b); }
