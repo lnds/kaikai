@@ -7332,7 +7332,7 @@ test-perceus-read-identity-asan: $(TARGET) build
 	echo "perceus-read-identity-asan OK"
 
 ifeq ($(KAI_LLVM),1)
-test-perceus-read-identity-native: $(TARGET) build
+test-perceus-read-identity-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(READ_IDENTITY_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
