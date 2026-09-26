@@ -73,16 +73,13 @@ Three tiers; the higher tier wins on conflict.
 
 **Stage 2 is built by the previous compiler, Rust/Go-style.** `KAIC_BOOT` is kaikai's `GOROOT_BOOTSTRAP`: it resolves to the previous release's tarball, and the default is `release`. That is what frees stage 2 to use the language it implements — while stage 1 compiled it on every build, the compiler was capped at the kaikai-minimal subset.
 
-The rescue path from a bare `cc` is the **frozen seed**: a `stage2.c` emitted by a release and pinned in a `bootstrap-seed-v*` tag, alongside the `runtime.h` it pairs with (OCaml's `boot/ocamlc` model). Each release freezes the next one. Bootstrap from any machine with `cc`:
+The rescue path from a bare `cc` is the **frozen seed**: a `stage2.c` emitted by a release and pinned in a `bootstrap-seed-v*` tag, alongside the `runtime.h` it pairs with (OCaml's `boot/ocamlc` model). Each release boots from the newest seed and freezes the next one. Bootstrap from any machine with `cc`:
 
 ```sh
-git show bootstrap-seed-v0.125.0:bootstrap/stage2.c  > /tmp/seed/stage2.c
-git show bootstrap-seed-v0.125.0:bootstrap/runtime.h > /tmp/seed/runtime.h
-cc -std=c99 -O1 -I /tmp/seed /tmp/seed/stage2.c -o kaic2-seed -lm
-./kaic2-seed --edition hanga-roa --path stdlib stage2/main.kai > /tmp/self.c
+make kaic2 KAIC_BOOT=seed          # add KAI_LLVM=1 where libLLVM is available
 ```
 
-`#include "runtime.h"` resolves next to the `.c` first, so a generation built from the seed must not sit in the seed's directory — it would pick up the seed's runtime instead of this tree's.
+That picks the newest seed at or below `VERSION`, compiles it against its own `runtime.h`, and takes both hops. Reach for the seed's files by hand only when debugging the seed itself — and then keep the build out of the seed's directory, because `#include "runtime.h"` resolves next to the `.c` and would shadow this tree's runtime with the frozen one.
 
 Stage 0 and stage 1 are frozen, never deleted: GHC is the cautionary tale, having abandoned its C bootstrap and become unbuildable without a prior GHC.
 
