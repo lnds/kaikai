@@ -1,10 +1,10 @@
 #!/bin/sh
 # scripts/build-release.sh — package a kaikai release tarball.
 #
-# Builds the full bootstrap chain (kaic0 → kaic1 → kaic2), assembles the
-# installed-layout directory tree, and produces a gzipped tarball plus a
-# SHA-256 checksum file. Designed to be invoked from CI on a tag push or
-# locally for smoke-testing.
+# Boots kaic2 from the newest bootstrap seed, assembles the installed-layout
+# directory tree, and produces a gzipped tarball plus a SHA-256 checksum
+# file, and the seed the next release boots from. Designed to be invoked from
+# CI on a tag push or locally for smoke-testing; the seed tags must be fetched.
 #
 # Usage:
 #   scripts/build-release.sh [<output-dir>]
@@ -14,6 +14,7 @@
 # Outputs:
 #   dist/kaikai-v<VERSION>-<os>-<arch>.tar.gz
 #   dist/kaikai-v<VERSION>-<os>-<arch>.tar.gz.sha256
+#   dist/bootstrap-seed-v<VERSION>/bootstrap/{stage2.c,runtime.h}
 #
 # Layout inside the tarball:
 #   kaikai-v<VERSION>-<os>-<arch>/
@@ -97,16 +98,18 @@ fi
 export LLVM_CONFIG
 echo "    using $LLVM_CONFIG ($("$LLVM_CONFIG" --version))"
 
-# Bootstrap chain. kaic0 (C) → kaic1 (kaikai-from-C) → kaic2 (self-hosted).
-# kaic0/kaic1 stay cc-only (Tier 1: the bootstrap never couples to
-# libLLVM). Only kaic2 is built KAI_LLVM=1 — FORCE native-capable so a
+# A release anchors the chain of trust in cc: kaic2 boots from the newest
+# bootstrap seed up to VERSION, C that cc alone compiles. The frozen
+# kaic0 → kaic1 chain no longer compiles stage 2; it is still built and
+# self-hosted below. kaic2 is built KAI_LLVM=1 — FORCE native-capable so a
 # missing/broken vendored libLLVM breaks the release loudly instead of
 # silently shipping a C-only binary that cannot honour the native default.
-# A release anchors the chain of trust in cc: stage 1 always boots stage 2.
-unset KAIC_BOOT
-echo "==> bootstrapping kaic0 → kaic1 → kaic2 (kaic2: KAI_LLVM=1, static libLLVM)"
+KAIC_BOOT=seed
+export KAIC_BOOT
+echo "==> building the frozen chain kaic0 → kaic1"
 make -C stage0 kaic0 >&2
 make -C stage1 kaic1 >&2
+echo "==> booting kaic2 from the bootstrap seed (KAI_LLVM=1, static libLLVM)"
 make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" kaic2 >&2
 
 # Verify byte-identical selfhost before packaging — mandatory per CLAUDE.md.
@@ -116,6 +119,23 @@ make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" kaic2 >&2
 echo "==> verifying selfhost byte-identical"
 make -C stage1 selfhost >&2
 make -C stage2 selfhost >&2
+
+# The next release's seed: the C this kaic2 emits for its own source and the
+# runtime.h it pairs with. Linked from those two files alone, as a rescue
+# would, it must reproduce itself.
+SEED="$DIST/bootstrap-seed-v$VERSION"
+echo "==> emitting and verifying bootstrap-seed-v$VERSION"
+rm -rf "$SEED"
+mkdir -p "$SEED/bootstrap"
+cp stage2/build/kaic2b.c "$SEED/bootstrap/stage2.c"
+cp stage2/runtime.h      "$SEED/bootstrap/runtime.h"
+make -s -C stage2 boot-hop HOP_C="$SEED/bootstrap/stage2.c" HOP_BIN="$SEED/kaic2" HOP_INC="$SEED/bootstrap" >&2
+(cd stage2 && KAIKAI_STDLIB_PATH="$ROOT/stdlib" "$SEED/kaic2" --edition "$(cat ../EDITION)" main.kai) > "$SEED/self.c"
+if ! cmp -s "$SEED/bootstrap/stage2.c" "$SEED/self.c"; then
+  echo "build-release.sh: the seed linked against its own runtime.h does not reproduce itself" >&2
+  exit 2
+fi
+rm -f "$SEED/kaic2" "$SEED/self.c"
 
 # The kai binary, built into bin/kai by its own Makefile, which drives kaic2
 # directly. Every step below that runs ./bin/kai needs it.
@@ -343,3 +363,5 @@ echo "==> release artifact:"
 ls -lh "$DIST/$NAME.tar.gz"
 echo "==> sha256:"
 cat "$DIST/$NAME.tar.gz.sha256"
+echo "==> bootstrap seed:"
+ls -l "$SEED/bootstrap"

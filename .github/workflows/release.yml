@@ -149,6 +149,13 @@ jobs:
             dist/kaikai-v${{ steps.meta.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch }}.tar.gz.sha256
           if-no-files-found: error
 
+      - name: Upload bootstrap seed
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-seed-v${{ steps.meta.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch }}
+          path: dist/bootstrap-seed-v${{ steps.meta.outputs.version }}/bootstrap/
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
     needs: build
@@ -175,9 +182,11 @@ jobs:
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
-      - name: Download all artifacts
+      # Tarballs only: the seed artifacts are published by the seed job.
+      - name: Download the tarballs
         uses: actions/download-artifact@v4
         with:
+          pattern: kaikai-v*
           path: dist
           merge-multiple: true
 
@@ -214,6 +223,88 @@ jobs:
               --generate-notes \
               dist/*
           fi
+
+  # The seed the next release boots from, as a tag on a commit whose parent is
+  # this release. Every platform emits it and they must agree byte for byte;
+  # the tag is created once and never moved.
+  seed:
+    name: Publish bootstrap seed
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Download the seeds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bootstrap-seed-*
+          path: seeds
+
+      - name: Require one seed across platforms
+        run: |
+          set -eu
+          first=""
+          for d in seeds/*; do
+            [ -n "$first" ] || { first="$d"; continue; }
+            for f in stage2.c runtime.h; do
+              cmp -s "$first/$f" "$d/$f" && continue
+              echo "::error::$f differs between $(basename "$first") and $(basename "$d"): stage 2 emits platform-dependent C for its own source. No seed is published."
+              sha256sum "$first/$f" "$d/$f"
+              diff "$first/$f" "$d/$f" | head -n 60 || true
+              exit 1
+            done
+          done
+          [ -n "$first" ] || { echo "::error::no seed artifact"; exit 1; }
+          echo "SEED_SRC=$first" >> "$GITHUB_ENV"
+
+      - name: Tag the seed
+        run: |
+          set -eu
+          tag="${{ steps.tag.outputs.tag }}"
+          seed="bootstrap-seed-$tag"
+          c_sha="$(sha256sum "$SEED_SRC/stage2.c" | cut -d' ' -f1)"
+          h_sha="$(sha256sum "$SEED_SRC/runtime.h" | cut -d' ' -f1)"
+          if git ls-remote --exit-code --tags origin "refs/tags/$seed" >/dev/null; then
+            git fetch --depth=1 origin "refs/tags/$seed:refs/tags/$seed"
+            if git show "$seed:bootstrap/stage2.c" | cmp -s - "$SEED_SRC/stage2.c" \
+               && git show "$seed:bootstrap/runtime.h" | cmp -s - "$SEED_SRC/runtime.h"; then
+              echo "$seed is already published with this seed"
+              exit 0
+            fi
+            echo "::error::$seed is already published with a different seed; a seed tag is never moved"
+            exit 1
+          fi
+          mkdir bootstrap
+          cp "$SEED_SRC/stage2.c" "$SEED_SRC/runtime.h" bootstrap/
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bootstrap
+          git commit -q -F - <<EOF
+          build(bootstrap): freeze the stage2.c rescue seed for $tag
+
+          The parent is $tag. bootstrap/stage2.c is the C the parent's kaic2
+          emits for its own source, byte-identical on every release platform.
+          bootstrap/runtime.h is the parent's stage2/runtime.h, the only project
+          header that C includes.
+
+          sha256 bootstrap/stage2.c $c_sha
+          sha256 bootstrap/runtime.h $h_sha
+          EOF
+          git tag -a "$seed" -m "Bootstrap rescue seed emitted by $tag" -m "sha256 bootstrap/stage2.c $c_sha"
+          git push origin "refs/tags/$seed"
 
   update-tap:
     name: Update Homebrew tap formula

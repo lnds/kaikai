@@ -7,8 +7,8 @@ Practical map of the build. Read this before running the compiler or touching a 
 | You want to… | Command (from repo root) |
 |---|---|
 | Run / build a `.kai` program | `./bin/kai run <file.kai>` · `./bin/kai build <file.kai> -o <out>` |
-| Rebuild the compiler after editing `stage2/compiler/*.kai` | `make kaic2-fast` (dev, needs an existing kaic2) · `make kaic2` (bootstrap, C) · `make KAI_LLVM=1 kaic2` (native) · `make kaic2 KAIC_BOOT=auto` (no kaic1; see §KAIC_BOOT) |
-| Full bootstrap from scratch | `make all` (→ `kaic0` → `kaic1` → `kaic2` → `bin/kai`) |
+| Rebuild the compiler after editing `stage2/compiler/*.kai` | `make kaic2-fast` (dev, needs an existing kaic2) · `make kaic2` (boots from the previous release, C) · `make KAI_LLVM=1 kaic2` (native) · `make kaic2 KAIC_BOOT=seed` (offline, `cc` only; see §KAIC_BOOT) |
+| Full bootstrap from scratch | `make all KAIC_BOOT=seed` (`cc` → seed → `kaic2` → `bin/kai`; also builds the frozen `kaic0` → `kaic1`) |
 | Verify a change | `make tier0` (fast) · `make tier1` (full, CI gate) |
 | One backend-parity fixture | `tools/test-backend-parity.sh` (env-driven; see §parity) |
 
@@ -45,8 +45,8 @@ bin/kai` after editing `tools/kai/`, a release ships it as `bin/kai`. The
 bootstrap never goes through it: the Makefiles keep invoking `kaic2` with
 their own flags, and CI builds it from the restored `kaic2` in
 `tools/ci-touch-build.sh`. In a checkout with no `kaic2` it runs `make -C
-stage2 kaic2`, which builds kaic0/kaic1 only if the boot needs them
-(§KAIC_BOOT); an existing `kaic2` is used as is. Gate: `make test-kai-cli`.
+stage2 kaic2`, which boots it as §KAIC_BOOT says; an existing `kaic2` is
+used as is. Gate: `make test-kai-cli`.
 
 ### The shared core cache
 
@@ -116,48 +116,49 @@ Makefile            (root)   — façade: delegates to the stages via `$(MAKE) -
 ```
 kaic0:          $(MAKE) -C stage0 kaic0        # cc *.c → kaic0   (zero deps)
 kaic1: kaic0    $(MAKE) -C stage1 kaic1        # kaic0 compiles stage1 → kaic1
-kaic2: kaic1    $(MAKE) -C stage2 kaic2        # kaic1 compiles stage2 → kaic2
+kaic2:          $(MAKE) -C stage2 kaic2        # the boot compiles stage2 → kaic2 (§KAIC_BOOT)
 ```
 
-(`kaic2` depends on `kaic1` only while the boot is kaic1 — the default; see §KAIC_BOOT.)
-
-Each stage's compiler builds the next. `make kaic2` triggers the whole chain if earlier stages are stale. After editing `stage2/compiler/*.kai`, `make kaic2` is the one command to rebuild. `make KAI_LLVM=1 kaic2` does the same with the in-process libLLVM backend linked (needed for native parity; on mac either put the keg on PATH first — `export PATH=/opt/homebrew/opt/llvm@18/bin:$PATH` — or pass `LLVM_CONFIG=$(brew --prefix llvm@18)/bin/llvm-config`; any LLVM major works, and `tools/gen-runtime-bc.sh` writes the runtime bitcode with the clang matching whichever one resolves). If `KAI_LLVM=1` is forced and llvm-config does not resolve, make stops immediately with an error naming the fix; the Homebrew lib dir needed by llvm-config's `-lzstd` is added to the link line automatically.
+Stage 0 and stage 1 are frozen, not retired: they build from `cc`, tier 1 tests them, and the release self-hosts stage 1, but they do not compile stage 2 — kaikai-minimal cannot keep up with the language stage 2 is written in. `kaic2` depends on `kaic1` only under `KAIC_BOOT=kaic1`, which holds only for trees stage 1 can still parse. After editing `stage2/compiler/*.kai`, `make kaic2` is the one command to rebuild. `make KAI_LLVM=1 kaic2` does the same with the in-process libLLVM backend linked (needed for native parity; on mac either put the keg on PATH first — `export PATH=/opt/homebrew/opt/llvm@18/bin:$PATH` — or pass `LLVM_CONFIG=$(brew --prefix llvm@18)/bin/llvm-config`; any LLVM major works, and `tools/gen-runtime-bc.sh` writes the runtime bitcode with the clang matching whichever one resolves). If `KAI_LLVM=1` is forced and llvm-config does not resolve, make stops immediately with an error naming the fix; the Homebrew lib dir needed by llvm-config's `-lzstd` is added to the link line automatically.
 
 ### `KAIC_BOOT` — the compiler that emits `stage2.c`
 
-`stage2/build/stage2.c` is the whole compiler as one C file, emitted by a *boot* compiler (Go's `GOROOT_BOOTSTRAP`, Rust's stage0). `KAIC_BOOT` selects it; `tools/kaic-boot.sh` implements every mode but the default.
+`stage2/build/stage2.c` is the whole compiler as one C file, emitted by a *boot* compiler (Go's `GOROOT_BOOTSTRAP`, Rust's stage0). `KAIC_BOOT` selects it and `tools/kaic-boot.sh` implements it; every mode goes through the identity record below.
 
 | `KAIC_BOOT` | Boot | An existing `stage2.c` is reused when |
 |---|---|---|
-| unset | `kaic1` (the chain above) | make's mtime rule says so, as always |
-| `kaic1` | `kaic1` | its identity record matches exactly |
-| `release` | the `kaic2` of the newest published release up to `VERSION` (`VERSION`'s own once published), fetched once into `stage2/build/boot/` and verified against the release's published sha256 | its inputs match and its record names a release up to `VERSION` |
-| `auto` | `stage2/kaic2` if this tree sealed it, else `release`, else `kaic1` | its inputs are unchanged (any boot) |
+| `release` (or unset) | the `kaic2` of the newest published release up to `VERSION` (`VERSION`'s own once published), fetched once into `stage2/build/boot/` and verified against the release's published sha256 | its inputs match and its record names a release up to `VERSION` |
+| `seed` | the newest `bootstrap-seed-v*` tag up to `VERSION` (§seed), linked by `cc` against its own `runtime.h` into `stage2/build/boot/<tag>/kaic2`, cached per tag | its inputs match and its record names a seed up to `VERSION` |
+| `kaic1` | `kaic1` (the frozen chain) | its identity record matches exactly |
+| `auto` | `stage2/kaic2` if this tree sealed it, else `release`, else `seed`, else `kaic1` | its inputs are unchanged (any boot) |
 | `<path>` | that binary; kaic1- or kaic2-class by its `--version` | its identity record matches exactly |
 
-**Two hops for a kaic2-class boot** (Rust's stage2; the seed rescue below is the same shape). The boot emits `stage2/build/stage2-a.c`, linked C-only into `stage2/build/kaic2-a`; `kaic2-a` emits `stage2/build/stage2.c`, the C `kaic2` is linked from. The delivered `kaic2` is therefore compiled by this tree's codegen, not the boot's: a codegen fix in the tree reaches the binary in the same build even when the release boot still carries the bug. The price is one more self-compile and one more `cc` of the whole compiler. A kaic1-class boot takes one hop and pays nothing extra — the default, and `scripts/build-release.sh`, stay on kaic1. `stage2-a.c` and `kaic2-a` are scratch: rebuilt on every emit, never recorded, never a boot.
+The default needs the network once per release (then the cached tarball) and a platform the release ships a tarball for; `seed` needs only `cc` and the seed tags. Both are the same compiler: the seed of release N is the C release N's `kaic2` emits for itself.
+
+**Two hops for a kaic2-class boot** (Rust's stage2). The boot emits `stage2/build/stage2-a.c`, linked C-only into `stage2/build/kaic2-a`; `kaic2-a` emits `stage2/build/stage2.c`, the C `kaic2` is linked from. The delivered `kaic2` is therefore compiled by this tree's codegen, not the boot's: a codegen fix in the tree reaches the binary in the same build even when the boot still carries the bug. The price is one more self-compile and one more `cc` of the whole compiler. A kaic1-class boot takes one hop. `stage2-a.c` and `kaic2-a` are scratch: rebuilt on every emit, never recorded, never a boot.
 
 **A release boot is a release that exists.** `VERSION` names the release in progress between a version bump and its publication, so an unpublished `VERSION` resolves to the newest published release (read from its `latest.json` manifest) when that precedes `VERSION`, and to nothing otherwise. Freshness never reaches the network, so it accepts any recorded release up to `VERSION`; `tools/kaic-boot.sh release-id` prints the resolved release (name and tarball sha256) without downloading it.
 
-**Identity, never mtime.** Every emit writes `stage2.c.id`: the boot (kind + sha256 of the binary; for `release` the version and tarball sha256), its class, the hop count, the content hash of every input the boot read, and the sha256 of the C itself. A kaic2-class boot also reads the stdlib core modules — their builtin-effect declarations land in the C — so its inputs include those files and the edition. A switched boot, an edited input, an edited `stage2.c`, or a kaic2-class C that did not take two hops regenerates; a tarball's archived mtimes cannot make an old C look fresh. Linking `kaic2` seals it (`build/kaic2.id` adds the binary's sha256): `auto` boots from the current `kaic2` only while the seal matches, so a binary copied from another checkout — which bakes that checkout's stdlib path — is never a boot. A tree built before records existed, or a CI artifact restored by exact cache key, has no record: the unset and `auto` modes then defer to mtime, an explicit boot regenerates.
+**Identity, never mtime.** Every emit writes `stage2.c.id`: the boot (kind + sha256 of the binary; for `release` the version and tarball sha256), its class, the hop count, the content hash of every input the boot read, and the sha256 of the C itself. A kaic2-class boot also reads the stdlib core modules — their builtin-effect declarations land in the C — so its inputs include those files and the edition. A switched boot, an edited input, an edited `stage2.c`, or a kaic2-class C that did not take two hops regenerates; a tarball's archived mtimes cannot make an old C look fresh. Linking `kaic2` seals it (`build/kaic2.id` adds the binary's sha256): `auto` boots from the current `kaic2` only while the seal matches, so a binary copied from another checkout — which bakes that checkout's stdlib path — is never a boot. A tree built before records existed, or a CI artifact restored by exact cache key, has no record: `auto` then defers to mtime, every other mode regenerates.
 
 Traps:
 
-- **Two hops repair the boot's codegen only while `kaic2-a` still emits correct C.** The boot's codegen compiles `kaic2-a`; a boot bug that breaks the compiler's own C emission corrupts `stage2.c` itself, and no number of hops recovers from it — the way out is the kaic1 boot or a sound release. `make kaic-boot-verify` detects it: the release boot's `kaic2-a` and its `kaic2` must emit the same C for the compiler.
+- **Two hops repair the boot's codegen only while `kaic2-a` still emits correct C.** The boot's codegen compiles `kaic2-a`; a boot bug that breaks the compiler's own C emission corrupts `stage2.c` itself, and no number of hops recovers from it — the way out is an earlier sound release or seed. `make kaic-boot-verify` detects it: each boot's `kaic2-a` and its `kaic2` must emit the same C for the compiler.
 - **A kaic2-class boot reads this tree's stdlib, never the tarball's.** The C is compiled against this tree's `runtime.h`, which pairs with this stdlib; a release's own stdlib declares that release's builtin effects, and a changed effect-op signature makes its C a hard `cc` error against the current runtime.
-- **The boot's codegen meets this tree's runtime.** A kaic2 boot emits the runtime calls its own codegen knows, and `stage2-a.c` is compiled against this tree's `runtime.h`. A runtime change that drops or re-signs a function an older codegen still emits breaks the release boot until the next release; an additive runtime keeps every recent release a valid boot.
+- **The boot's codegen meets this tree's runtime.** A kaic2 boot emits the runtime calls its own codegen knows, and `stage2-a.c` is compiled against this tree's `runtime.h` — for the seed too: only the seed's own C is linked against the seed's `runtime.h`. A runtime change that drops or re-signs a function an older codegen still emits breaks the release and seed boots until the next release; an additive runtime keeps every recent release a valid boot. CI boots every PR from the release, so it gates the seed's codegen against this runtime as well.
+- **A new builtin reaches stdlib core one release late.** The boot compiles this tree's stdlib core, so core may call a builtin only once a published release (and its seed) knows it.
 - **Unavailable falls through, failing does not.** `auto` moves to the next boot only when one is absent (no sealed `kaic2`, no tarball for the platform, no network). A boot that fails to compile the source stops the build with its own error, and a checksum mismatch is fatal in every mode.
-- **A non-kaic1 boot yields a different binary.** The kaic1 boot's `kaic2` is compiled by stage 1's codegen, a kaic2-class boot's by this tree's (through `kaic2-a`), so the binaries differ byte-for-byte. What must agree is the C each resulting `kaic2` emits — `make kaic-boot-verify`.
+- **Different boots can yield different binaries.** `kaic2-a` is compiled by the boot's codegen, so its behaviour — not its source — may differ between boots. What must agree is the C each resulting `kaic2` emits — `make kaic-boot-verify`.
 
 ### `make kaic-boot-verify` — convergence gate
 
-Builds one `kaic2` from the `kaic1` boot and one from the `release` boot (two hops) under `stage2/build/boot-verify/`, and requires byte-identical emitted C from both for the compiler itself and for a sample program — the `kaic2-fast-verify` contract across boots. It also requires the release boot's `kaic2-a` and its `kaic2` to emit the same C for the compiler: the fixed point showing the release's codegen did not miscompile `kaic2-a`. Each boot's `stage2.c` is reused on an exact identity match. Does not touch `stage2/kaic2`; fetches the release on first use.
+Builds one `kaic2` from the `release` boot and one from the `seed` boot (two hops each) under `stage2/build/boot-verify/`, and requires byte-identical emitted C from both for the compiler itself and for a sample program — the `kaic2-fast-verify` contract across boots. It also requires each boot's `kaic2-a` and its `kaic2` to emit the same C for the compiler: the fixed point showing the boot's codegen did not miscompile `kaic2-a`. Each boot's `stage2.c` is reused on an exact identity match. Does not touch `stage2/kaic2`; fetches the release on first use and needs the seed tags.
 
 ### Which boot CI uses
 
 Every CI workflow that builds or consumes a `kaic2` sets `KAIC_BOOT=release` workflow-wide. The consumers need the mode too: the artifact ships `stage2.c.id`, and a job whose mode disagrees with it rebuilds `stage2.c`. The build jobs still build `kaic1`, because tier1 tests stage 1 itself and the artifact carries it; the bootstrap caches fold the resolved release (`release-id`), `EDITION` and `tools/kaic-boot.sh` into their key.
 
-The from-scratch chain runs in two places. The daily `bootstrap-from-scratch` job runs `make kaic-boot-verify` on a clean runner with its own `cc`. The release build (`scripts/build-release.sh`) unsets `KAIC_BOOT`, so every shipped `kaic2` is booted by stage 1.
+The `cc`-only route runs in two places. The daily `bootstrap-from-scratch` job fetches the seed tags and runs `make kaic-boot-verify` on a clean runner with its own `cc`. The release build (`scripts/build-release.sh`) sets `KAIC_BOOT=seed`, so every shipped `kaic2` is booted by C that `cc` alone compiles, and it emits the next seed (§seed). It also builds `kaic0` → `kaic1` and self-hosts stage 1, so the frozen chain stays verified.
 
 ## The package — why `main.kai` is a stub
 
@@ -182,52 +183,37 @@ reachable from `main.kai`, that no `import` dangles, and that the graph stays
 acyclic -- an unreachable module is silently absent from the compiler, not a
 build error.
 
-## Bootstrap seed — rescue from a bare `cc`
+## Bootstrap seed — the `cc` anchor
 
-The seed is the C a released `kaic2` emits for its own source, frozen under a `bootstrap-seed-v<release>` tag. With `cc` alone it yields a C-backend `kaic2`: `cc` → seed `kaic2` → `kaic2-a` → the tree's `kaic2` → fixed point. Stage 0 and stage 1 are not on this path. A native-capable `kaic2` also needs libLLVM for the last hop (`KAI_LLVM=1`, see the bootstrap chain above).
+The seed is the C a released `kaic2` emits for its own source, frozen under a `bootstrap-seed-v<release>` tag (OCaml's `boot/ocamlc`). With `cc` alone it yields a C-backend `kaic2`: `cc` → seed `kaic2` → `kaic2-a` → the tree's `kaic2` → fixed point. Stage 0 and stage 1 are not on this path. Every release boots from it, so the chain of trust stays anchored in `cc` while stage 1 stays frozen. A native-capable `kaic2` also needs libLLVM for the last hop (`KAI_LLVM=1`, see the bootstrap chain above).
 
-- **Where it lives.** The tag points at a commit off `main` whose parent is the release that emitted it (`bootstrap-seed-v0.124.1` → `v0.124.1`). That commit adds `bootstrap/stage2.c` (the seed) and `bootstrap/runtime.h` (the parent's `stage2/runtime.h`, the only project header the seed includes). `main` never carries the seed; the tag's hash pins its content and its parent pins the source it reproduces. A clone fetches it with the other tags; a `--no-tags` clone needs `git fetch origin tag <seed>`.
+- **Where it lives.** The tag points at a commit off `main` whose parent is the release that emitted it (`bootstrap-seed-v0.125.0` → `v0.125.0`). That commit adds `bootstrap/stage2.c` (the seed) and `bootstrap/runtime.h` (the parent's `stage2/runtime.h`, the only project header the seed includes). `main` never carries the seed; the tag's hash pins its content and its parent pins the source it reproduces. A full clone fetches it with the other tags; a shallow or `--no-tags` clone needs `git fetch origin 'refs/tags/bootstrap-seed-v*:refs/tags/bootstrap-seed-v*'`.
 - **Edition.** Emitted under the parent's `EDITION`, the edition `make selfhost` compiles the compiler under, so the seed is byte-identical to that commit's `stage2/build/kaic2b.c` and to what the published release's `kaic2` emits. A bare `kaic2` runs the oldest edition; always pass `--edition`.
 
-Rescue, from the root of the checkout to build:
+> **v1 status (2026-09-26):** the seed tags live on `lnds/kaikai` only; the public mirror does not carry them yet (#2158).
+
+Rescue, from the root of a checkout with the seed tags:
 
 ```sh
-SEED=bootstrap-seed-v0.124.1 ROOT=$PWD ED=$(cat EDITION)
-mkdir -p stage2/build/seed
-git archive $SEED bootstrap | tar -x -C stage2/build/seed
-cc -std=c99 -O2 stage2/build/seed/bootstrap/stage2.c -o stage2/build/seed/kaic2 -lm
-(cd stage2 && KAIKAI_STDLIB_PATH=$ROOT/stdlib build/seed/kaic2 --edition $ED main.kai > build/stage2-a.c)
-cc -std=c99 -O2 -I stage2/build/seed/bootstrap stage2/build/stage2-a.c -o stage2/build/kaic2-a -lm   # seed runtime; -I stage0 breaks it
-make kaic2 KAI_LLVM=1 KAIC_BOOT=$ROOT/stage2/build/kaic2-a   # without libLLVM, drop KAI_LLVM=1: C backend only
-(cd stage2 && ./kaic2 --edition $ED main.kai | cmp - build/stage2.c) && echo "fixed point"
+make kaic2 KAIC_BOOT=seed KAI_LLVM=1   # without libLLVM, drop KAI_LLVM=1: C backend only
+(cd stage2 && ./kaic2 --edition $(cat ../EDITION) main.kai | cmp - build/stage2.c) && echo "fixed point"
 ./bin/kai build --backend=native examples/portfolio/portfolio.kai -o stage2/build/portfolio
 stage2/build/portfolio | diff examples/portfolio/portfolio.out.expected - && echo "native OK"
 ```
 
-- **The seed compiles against its own `runtime.h`.** `-I stage0` binds `#include "runtime.h"` to the stage 0 runtime and the seed does not compile.
-- **Two hops.** `stage2-a.c` is the seed's codegen, so it compiles against the seed's runtime. The `make` hop has `kaic2-a` emit `stage2/build/stage2.c` with the tree's codegen and compiles it against the tree's `runtime.h`, so the final `kaic2` carries no seed codegen defect. That holds only while `kaic2-a`, compiled by the seed's codegen, still emits correct C: a defect that breaks C emission survives any number of hops, and the way out is kaic1 or a sound release.
-- **`KAIC_BOOT` takes the path, not `auto`.** `auto` only boots from a `stage2/kaic2` this tree sealed, so it would skip `kaic2-a` and fall through to the release or kaic1.
-- **The seed bakes no stdlib path.** `KAIKAI_STDLIB_PATH` points it at the tree's `stdlib/`; the `make` hop does the same for `kaic2-a` and the final `kaic2` bakes the path.
+- **The seed links against its own `runtime.h`.** `cc` compiles `bootstrap/stage2.c` with only the seed's directory on the include path; the tree's or stage 0's `runtime.h` need not match the seed's codegen.
+- **Two hops.** `stage2-a.c` is the seed's codegen applied to this tree, compiled against this tree's `runtime.h` exactly as a release boot's is (see Traps above). The `make` hop has `kaic2-a` emit `stage2/build/stage2.c` with the tree's codegen, so the final `kaic2` carries no seed codegen defect — while `kaic2-a` still emits correct C.
+- **The seed bakes no stdlib path.** `tools/kaic-boot.sh` points it at the tree's `stdlib/` through `KAIKAI_STDLIB_PATH`, and does the same for `kaic2-a`; the final `kaic2` bakes the path.
 - **Native is checked twice.** The `KAI_LLVM=1` link refuses a `kaic2` that cannot emit a native object (see Traps); the portfolio build checks a real program against its golden.
-- **The leap is guaranteed only for the seed's parent.** A later tree compiles only while its compiler sources and core stay inside the seed's language; past that, rescue each intervening release in turn, or refresh the seed.
+- **The leap is guaranteed for the trees CI gates.** The newest seed is the newest release's compiler, and CI boots every PR from that release, so every tree on `main` compiles from it. An older seed reaches a later tree only while that tree's compiler sources and core stay inside the seed's language; past that, rescue each intervening release in turn.
 
-Refreshing the seed after release `vX.Y.Z`:
-
-```sh
-git worktree add --detach ../seed vX.Y.Z && cd ../seed && make kaic2
-mkdir bootstrap && cp stage2/runtime.h bootstrap/
-(cd stage2 && ./kaic2 --edition $(cat ../EDITION) main.kai) > bootstrap/stage2.c
-git add bootstrap && git commit -m "build(bootstrap): freeze the stage2.c rescue seed for vX.Y.Z"
-git tag -a bootstrap-seed-vX.Y.Z -m "Bootstrap rescue seed emitted by vX.Y.Z"
-```
-
-Before `git push origin bootstrap-seed-vX.Y.Z`, run the rescue against the new tag in a clean clone of `vX.Y.Z` with libLLVM available: the fixed point and the native portfolio golden must both pass.
+Publishing. `scripts/build-release.sh` emits `dist/bootstrap-seed-v<VERSION>/bootstrap/` from the release's own selfhost (`stage2/build/kaic2b.c` and `stage2/runtime.h`), links it against its own `runtime.h` and requires it to reproduce itself before the release proceeds. The release workflow's `seed` job requires the seeds of every platform to be byte-identical — a difference means stage 2 emits platform-dependent C and fails the job, publishing nothing — then tags the commit and pushes the tag, with the seed's sha256 in the tag message. An existing seed tag is never moved: a rerun with the same seed is a no-op, one with a different seed fails.
 
 ## `make kaic2-fast` — dev rebuild via modular self-compile
 
-`make kaic2` always re-bootstraps: kaic1 reads the whole package and emits one ~212k-line C file, `cc -O2` compiles that giant TU. That is the **trust chain** (a fresh machine needs it), but as a dev rebuild it is all-or-nothing. `make kaic2-fast` is the rebuild path when a working `kaic2` already exists:
+`make kaic2` always re-bootstraps: the boot reads the whole package and emits one ~212k-line C file, `cc -O2` compiles that giant TU. That is the **trust chain** (a fresh machine needs it), but as a dev rebuild it is all-or-nothing. `make kaic2-fast` is the rebuild path when a working `kaic2` already exists:
 
-1. The existing `kaic2` compiles `stage2/main.kai` **directly** — no kaic1, no `cc -O2` of a whole-program TU — through `bin/kai`'s `KAI_MODULAR=1 --backend=c` path: ~86 per-module TUs compiled in parallel with the `.o` content-hash cache, so a one-module edit recompiles one TU.
+1. The existing `kaic2` compiles `stage2/main.kai` **directly** — no boot, no `cc -O2` of a whole-program TU — through `bin/kai`'s `KAI_MODULAR=1 --backend=c` path: ~86 per-module TUs compiled in parallel with the `.o` content-hash cache, so a one-module edit recompiles one TU.
 2. The result lands in a **staging binary** (`stage2/build/kaic2-fast.bin`) and is sanity-gated (`--version` + a golden demo compiled with no flags, exercising the baked stdlib path) before being swapped into `stage2/kaic2`. A broken build never clobbers the working compiler.
 
 Selection is **explicit, never automatic**: `make kaic2` stays pure bootstrap, `make kaic2-fast` is additive and opt-in. Auto-preferring the fast path was rejected — a stale `kaic2` silently building a wrong `kaic2` is the failure mode to avoid; typing `-fast` is the acknowledgment that you trust the binary currently in place.

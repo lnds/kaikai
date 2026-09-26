@@ -194,7 +194,7 @@ STACK :=
 .PHONY: test-kir-inline-trmc-1158 test-kir-while-slot-1158 test-kir-while-param-slot-1173 test-kir-var-escape-state-1173 test-kir-while-raw-cond-1414 test-kir-while-boxed-cond-1414
 .PHONY: test-issue-1331-op-arg-release-asan test-issue-1331-borrowed-op-arg-asan
 .PHONY: test-mn-sigaltstack-asan
-.PHONY: all clean core-cache-warm test-native-wrapper test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-purity test-native-purity-attrs test-driver-holes test-effects test-effects-goldens test-effects-goldens-native test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-issue-1875-success-diag-forwarded test-import-verdicts test-kir-reach-indirect-roots test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-units test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-phase3 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-issue-1542 test-foreign-prelude test-issue-672 test-issue-1194-reassigned-record-field-in-interp test-issue-1263-abandon-across-resumed-frame test-issue-1263-abandon-across-resumed-frame-native test-issue-1564-promoted-cell-across-handle test-issue-1564-promoted-cell-across-handle-native test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-region-1123 test-region-1193-native test-region-1197-parity test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-cflags-shim test-ffi-cflags-shim-native test-issue-1556-main-thread-affinity test-issue-1556-main-thread-affinity-native test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-numeric-div-by-zero-traps test-numeric-div-by-zero-traps-native test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-trmc-spread test-perceus-trmc-spread-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-nested-reuse-asan-native test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1219-bootstrap-seed test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1134-pipe-fusion-native test-perceus-1134-pipe-fusion-terminal-native test-perceus-1186-map-pipe-terminal-field test-perceus-1120-array-borrow test-perceus-1120-array-borrow-native test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1135-vec-value-native test-perceus-1135-vec-raw test-perceus-1135-vec-raw-native test-perceus-1151-vec-push-growth test-perceus-1151-vec-push-growth-native test-perceus-1151-vec-push-growth-asan test-perceus-1153-modcall-linear test-perceus-1153-modcall-linear-native test-perceus-1153-modcall-linear-asan test-perceus-1338-ledger-mn test-perceus-1150-vec-surface test-perceus-1150-vec-surface-native test-perceus-1150-vec-surface-asan test-perceus-1127-borrow-closure test-perceus-1512-fn-name-hoist test-perceus-1127-borrow-hof test-perceus-1127-borrow-hof-native test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1131-modular-escape test-perceus-1295-borrow-slot-nested-arg test-perceus-1295-borrow-slot-nested-arg-asan test-perceus-1303-single-use-branch-leak test-perceus-1303-single-use-branch-leak-asan test-perceus-1302-tcrec-goto-drops test-perceus-1302-tcrec-goto-drops-asan test-perceus-1302-tcrec-goto-drops-native test-perceus-1635-goto-move-collision test-perceus-1635-goto-move-collision-asan test-perceus-1635-goto-move-collision-native test-perceus-1758-cond-exit-drop test-perceus-1758-cond-exit-drop-asan test-perceus-1758-cond-exit-drop-native test-perceus-1765-binop-base-tail test-perceus-1765-binop-base-tail-asan test-perceus-1765-binop-base-tail-native test-perceus-1768-move-gate-positions test-perceus-1768-move-gate-positions-asan test-perceus-1768-move-gate-positions-native test-perceus-1324-char-binder-goto test-perceus-1324-char-binder-goto-asan test-perceus-1324-char-binder-goto-native test-perceus-1395-char-param-raw test-perceus-1395-char-param-raw-asan test-perceus-1395-char-param-raw-native test-perceus-1410-byte-raw-ops test-perceus-1410-byte-raw-ops-asan test-perceus-1410-byte-raw-ops-native test-perceus-1457-fixed-raw-ops test-perceus-1457-fixed-raw-ops-asan test-perceus-1457-fixed-raw-ops-native test-perceus-1637-int-wrap-ops test-perceus-1637-int-wrap-ops-asan test-perceus-1637-int-wrap-ops-native test-issue-1637-div-overflow-trap test-issue-1637-div-overflow-trap-native test-issue-1454-fixed-vec test-issue-1454-fixed-vec-native test-issue-1480-fixed-vec-shapes test-issue-1480-fixed-vec-collect-neg test-issue-1480-fixed-vec-shapes-native test-issue-1481-fixed-vec-border test-issue-1481-fixed-vec-border-native test-issue-1491-fixed-vec-param test-issue-1491-fixed-vec-param-native test-issue-1518-fixed-vec-param-raw test-issue-1518-fixed-vec-param-raw test-issue-1517-linalg-matrix-ops-native test-issue-1517-linalg-matrix-ops test-issue-1517-linalg-matrix-ops-native test-perceus-1464-fixed-raw-ops test-perceus-1464-fixed-raw-ops-asan test-perceus-1464-fixed-raw-ops-native test-issue-1394-byte-box test-issue-1394-byte-box-asan test-issue-1394-byte-box-native test-perceus-1315-borrowed-match-release test-perceus-1315-borrowed-match-release-asan test-perceus-1315-borrowed-match-release-native test-perceus-1355-closure-temp-release test-perceus-1355-closure-temp-release-asan test-perceus-1355-closure-temp-release-native test-perceus-1328-selftail-borrowed-local test-perceus-1328-selftail-borrowed-local-asan test-perceus-1328-selftail-borrowed-local-native test-perceus-1127-borrow-tco-native test-perceus-1130-borrow-pipe test-perceus-1130-borrow-pipe-native test-perceus-1130-hof-tail-drop test-perceus-1130-hof-tail-drop-native test-perceus-1126-read-loop-drop-native test-perceus-1127-borrow-closure test-perceus-1127-borrow-closure-native test-perceus-1127-borrow-hof test-perceus-1117-native-map-pipe-record-leak test-perceus-860-native-cons-leak test-perceus-1048-native-record-leak test-perceus-1112-native-discard-decref test-perceus-747-native-real-slot-uaf test-perceus-872-native-variant-reuse-leak test-perceus-1053-native-trmc-spine-reuse test-perceus-1053-nested-rotation-reuse test-perceus-1104-balance-token-donation test-perceus-1164-cross-call-donation test-perceus-1104-sibling-param-move test-perceus-1136-sized-variant test-perceus-1136-sized-variant-native test-perceus-1156-raw-widen test-perceus-1156-raw-widen-native test-perceus-1160-de-opaque test-perceus-1160-de-opaque-native test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-perceus-1069-projection-reuse test-perceus-1083-variant-spine-free test-native-1083-inline-gate test-native-1083-field-read test-native-static-slot-read test-native-1110-reuse-int-slot test-native-1229-arm-int-binder test-native-1229-writeside test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1565-handler-alias-shadow-native test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-shadowing-arm-lambda-native test-modular-build test-modular-identity test-modular-cache test-modular-hermetic test-native-core-obj test-native-core-obj-bc-state test-native-dead-strip test-modular-selfhost kaic2-fast kaic2-fast-verify kaic-boot-verify boot-hop FORCE test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json test-issue-1852-cross-module-derive-json-native test-home-tu-partition test-native-modular test-issue-1706-runner-mode-key test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes test-native-cgen-quality test-perceus-1180-range-lazy test-perceus-1180-range-lazy-native test-perceus-1180-range-lazy-asan test-perceus-1180-range-sum test-perceus-1180-range-sum-native test-shape-fusion-1200 test-shape-laws-1200 test-mn-native-soundness test-mn-c-clang-soundness test-issue-1588-main-exit-status test-issue-1588-main-exit-status-native test-issue-1590-isatty test-issue-1590-isatty-native test-native-namespace test-issue-1682-user-symbol-namespace test-issue-1682-user-symbol-namespace-native test-perceus-1771-borrow-raw-scrutinee test-perceus-1770-arm-birth-leak test-perceus-1770-arm-birth-leak-asan test-perceus-1770-arm-birth-leak-native test-perceus-1783-interp-intern-leak test-perceus-1783-interp-intern-leak-native test-perceus-1784-variant-rebuild test-perceus-1784-variant-rebuild-asan test-perceus-1784-variant-rebuild-native test-perceus-1786-record-rebuild test-perceus-1786-record-rebuild-asan test-perceus-1786-record-rebuild-native test-perceus-1791-arm-use-scope test-perceus-1791-arm-use-scope-asan test-perceus-1791-arm-use-scope-native test-perceus-1902-block-let-move test-perceus-1902-block-let-move-asan test-perceus-1902-block-let-move-native test-namespace-collisions test-namespace-collisions-neg test-namespace-collisions-native test-namespace-collisions-native-modular test-namespace-collisions-neg-native test-namespace-collisions-modular test-namespace-collisions-neg-modular test-namespace-collisions-asan test-namespace-collisions-testsym test-namespace-collisions-check test-namespace-collisions-diag test-namespace-collisions-nohomespell test-namespace-collisions-c-axes test-perceus-1801-capability-param test-perceus-1801-capability-param-asan test-perceus-1801-capability-param-native test-perceus-1803-op-arg-free test-perceus-1803-op-arg-free-native test-perceus-1803-op-arg-free-asan test-issue-1869-derive-json-lambda-slots-native test-issue-1870-derive-json-contested-field test-issue-1870-derive-json-contested-field-native test-tco-borrow-drop-1902 rc-leak-gate rc-leak-gate-native test-perceus-1961-call-raw-border test-perceus-1961-call-raw-border-native test-perceus-1961-trmc-real-elision test-perceus-1961-trmc-real-elision-native test-issue-1970-nursery-reraise-handler test-issue-1970-nursery-reraise-handler-native test-mutate-negate-shapes test-mutate-site-data test-issue-1969-typer-diag-file test-issue-2022-test-body-builtin-effects test-issue-2022-test-body-builtin-effects-native test-issue-2062-core-builtin-pipe test-issue-2062-core-builtin-pipe-native test-json-report test-json-report-native test-perceus-2032-bang-operand-use test-perceus-2032-bang-operand-use-asan test-perceus-2032-bang-operand-use-native test-perceus-owned-scope-unused-param test-perceus-owned-scope-unused-param-asan test-perceus-owned-scope-unused-param-native test-perceus-block-let-unused-alias test-perceus-block-let-unused-alias-asan test-perceus-block-let-unused-alias-native test-perceus-closure-capture-tail test-perceus-closure-capture-tail-asan test-perceus-borrow-homonym test-perceus-borrow-homonym-asan test-perceus-borrow-homonym-native test-perceus-closure-capture-selftail test-perceus-closure-capture-selftail-asan test-perceus-closure-capture-selftail-native test-actor-orphan-send-suite test-actor-orphan-send-suite-native test-perceus-switch-scrutinee-selftail test-perceus-switch-scrutinee-selftail-asan test-perceus-switch-scrutinee-selftail-native test-perceus-arm-branch-read test-perceus-arm-branch-read-asan test-perceus-arm-branch-read-native test-handle-boxed-slot
+.PHONY: all clean bin-kai core-cache-warm test-native-wrapper test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-purity test-native-purity-attrs test-driver-holes test-effects test-effects-goldens test-effects-goldens-native test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-issue-1875-success-diag-forwarded test-import-verdicts test-kir-reach-indirect-roots test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-units test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-phase3 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-issue-1542 test-foreign-prelude test-issue-672 test-issue-1194-reassigned-record-field-in-interp test-issue-1263-abandon-across-resumed-frame test-issue-1263-abandon-across-resumed-frame-native test-issue-1564-promoted-cell-across-handle test-issue-1564-promoted-cell-across-handle-native test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-region-1123 test-region-1193-native test-region-1197-parity test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-cflags-shim test-ffi-cflags-shim-native test-issue-1556-main-thread-affinity test-issue-1556-main-thread-affinity-native test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-numeric-div-by-zero-traps test-numeric-div-by-zero-traps-native test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-trmc-spread test-perceus-trmc-spread-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-nested-reuse-asan-native test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1219-bootstrap-seed test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1134-pipe-fusion-native test-perceus-1134-pipe-fusion-terminal-native test-perceus-1186-map-pipe-terminal-field test-perceus-1120-array-borrow test-perceus-1120-array-borrow-native test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1135-vec-value-native test-perceus-1135-vec-raw test-perceus-1135-vec-raw-native test-perceus-1151-vec-push-growth test-perceus-1151-vec-push-growth-native test-perceus-1151-vec-push-growth-asan test-perceus-1153-modcall-linear test-perceus-1153-modcall-linear-native test-perceus-1153-modcall-linear-asan test-perceus-1338-ledger-mn test-perceus-1150-vec-surface test-perceus-1150-vec-surface-native test-perceus-1150-vec-surface-asan test-perceus-1127-borrow-closure test-perceus-1512-fn-name-hoist test-perceus-1127-borrow-hof test-perceus-1127-borrow-hof-native test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1131-modular-escape test-perceus-1295-borrow-slot-nested-arg test-perceus-1295-borrow-slot-nested-arg-asan test-perceus-1303-single-use-branch-leak test-perceus-1303-single-use-branch-leak-asan test-perceus-1302-tcrec-goto-drops test-perceus-1302-tcrec-goto-drops-asan test-perceus-1302-tcrec-goto-drops-native test-perceus-1635-goto-move-collision test-perceus-1635-goto-move-collision-asan test-perceus-1635-goto-move-collision-native test-perceus-1758-cond-exit-drop test-perceus-1758-cond-exit-drop-asan test-perceus-1758-cond-exit-drop-native test-perceus-1765-binop-base-tail test-perceus-1765-binop-base-tail-asan test-perceus-1765-binop-base-tail-native test-perceus-1768-move-gate-positions test-perceus-1768-move-gate-positions-asan test-perceus-1768-move-gate-positions-native test-perceus-1324-char-binder-goto test-perceus-1324-char-binder-goto-asan test-perceus-1324-char-binder-goto-native test-perceus-1395-char-param-raw test-perceus-1395-char-param-raw-asan test-perceus-1395-char-param-raw-native test-perceus-1410-byte-raw-ops test-perceus-1410-byte-raw-ops-asan test-perceus-1410-byte-raw-ops-native test-perceus-1457-fixed-raw-ops test-perceus-1457-fixed-raw-ops-asan test-perceus-1457-fixed-raw-ops-native test-perceus-1637-int-wrap-ops test-perceus-1637-int-wrap-ops-asan test-perceus-1637-int-wrap-ops-native test-issue-1637-div-overflow-trap test-issue-1637-div-overflow-trap-native test-issue-1454-fixed-vec test-issue-1454-fixed-vec-native test-issue-1480-fixed-vec-shapes test-issue-1480-fixed-vec-collect-neg test-issue-1480-fixed-vec-shapes-native test-issue-1481-fixed-vec-border test-issue-1481-fixed-vec-border-native test-issue-1491-fixed-vec-param test-issue-1491-fixed-vec-param-native test-issue-1518-fixed-vec-param-raw test-issue-1518-fixed-vec-param-raw test-issue-1517-linalg-matrix-ops-native test-issue-1517-linalg-matrix-ops test-issue-1517-linalg-matrix-ops-native test-perceus-1464-fixed-raw-ops test-perceus-1464-fixed-raw-ops-asan test-perceus-1464-fixed-raw-ops-native test-issue-1394-byte-box test-issue-1394-byte-box-asan test-issue-1394-byte-box-native test-perceus-1315-borrowed-match-release test-perceus-1315-borrowed-match-release-asan test-perceus-1315-borrowed-match-release-native test-perceus-1355-closure-temp-release test-perceus-1355-closure-temp-release-asan test-perceus-1355-closure-temp-release-native test-perceus-1328-selftail-borrowed-local test-perceus-1328-selftail-borrowed-local-asan test-perceus-1328-selftail-borrowed-local-native test-perceus-1127-borrow-tco-native test-perceus-1130-borrow-pipe test-perceus-1130-borrow-pipe-native test-perceus-1130-hof-tail-drop test-perceus-1130-hof-tail-drop-native test-perceus-1126-read-loop-drop-native test-perceus-1127-borrow-closure test-perceus-1127-borrow-closure-native test-perceus-1127-borrow-hof test-perceus-1117-native-map-pipe-record-leak test-perceus-860-native-cons-leak test-perceus-1048-native-record-leak test-perceus-1112-native-discard-decref test-perceus-747-native-real-slot-uaf test-perceus-872-native-variant-reuse-leak test-perceus-1053-native-trmc-spine-reuse test-perceus-1053-nested-rotation-reuse test-perceus-1104-balance-token-donation test-perceus-1164-cross-call-donation test-perceus-1104-sibling-param-move test-perceus-1136-sized-variant test-perceus-1136-sized-variant-native test-perceus-1156-raw-widen test-perceus-1156-raw-widen-native test-perceus-1160-de-opaque test-perceus-1160-de-opaque-native test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-perceus-1069-projection-reuse test-perceus-1083-variant-spine-free test-native-1083-inline-gate test-native-1083-field-read test-native-static-slot-read test-native-1110-reuse-int-slot test-native-1229-arm-int-binder test-native-1229-writeside test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1565-handler-alias-shadow-native test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-shadowing-arm-lambda-native test-modular-build test-modular-identity test-modular-cache test-modular-hermetic test-native-core-obj test-native-core-obj-bc-state test-native-dead-strip test-modular-selfhost kaic2-fast kaic2-fast-verify kaic-boot-verify boot-hop FORCE test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json test-issue-1852-cross-module-derive-json-native test-home-tu-partition test-native-modular test-issue-1706-runner-mode-key test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes test-native-cgen-quality test-perceus-1180-range-lazy test-perceus-1180-range-lazy-native test-perceus-1180-range-lazy-asan test-perceus-1180-range-sum test-perceus-1180-range-sum-native test-shape-fusion-1200 test-shape-laws-1200 test-mn-native-soundness test-mn-c-clang-soundness test-issue-1588-main-exit-status test-issue-1588-main-exit-status-native test-issue-1590-isatty test-issue-1590-isatty-native test-native-namespace test-issue-1682-user-symbol-namespace test-issue-1682-user-symbol-namespace-native test-perceus-1771-borrow-raw-scrutinee test-perceus-1770-arm-birth-leak test-perceus-1770-arm-birth-leak-asan test-perceus-1770-arm-birth-leak-native test-perceus-1783-interp-intern-leak test-perceus-1783-interp-intern-leak-native test-perceus-1784-variant-rebuild test-perceus-1784-variant-rebuild-asan test-perceus-1784-variant-rebuild-native test-perceus-1786-record-rebuild test-perceus-1786-record-rebuild-asan test-perceus-1786-record-rebuild-native test-perceus-1791-arm-use-scope test-perceus-1791-arm-use-scope-asan test-perceus-1791-arm-use-scope-native test-perceus-1902-block-let-move test-perceus-1902-block-let-move-asan test-perceus-1902-block-let-move-native test-namespace-collisions test-namespace-collisions-neg test-namespace-collisions-native test-namespace-collisions-native-modular test-namespace-collisions-neg-native test-namespace-collisions-modular test-namespace-collisions-neg-modular test-namespace-collisions-asan test-namespace-collisions-testsym test-namespace-collisions-check test-namespace-collisions-diag test-namespace-collisions-nohomespell test-namespace-collisions-c-axes test-perceus-1801-capability-param test-perceus-1801-capability-param-asan test-perceus-1801-capability-param-native test-perceus-1803-op-arg-free test-perceus-1803-op-arg-free-native test-perceus-1803-op-arg-free-asan test-issue-1869-derive-json-lambda-slots-native test-issue-1870-derive-json-contested-field test-issue-1870-derive-json-contested-field-native test-tco-borrow-drop-1902 rc-leak-gate rc-leak-gate-native test-perceus-1961-call-raw-border test-perceus-1961-call-raw-border-native test-perceus-1961-trmc-real-elision test-perceus-1961-trmc-real-elision-native test-issue-1970-nursery-reraise-handler test-issue-1970-nursery-reraise-handler-native test-mutate-negate-shapes test-mutate-site-data test-issue-1969-typer-diag-file test-issue-2022-test-body-builtin-effects test-issue-2022-test-body-builtin-effects-native test-issue-2062-core-builtin-pipe test-issue-2062-core-builtin-pipe-native test-json-report test-json-report-native test-perceus-2032-bang-operand-use test-perceus-2032-bang-operand-use-asan test-perceus-2032-bang-operand-use-native test-perceus-owned-scope-unused-param test-perceus-owned-scope-unused-param-asan test-perceus-owned-scope-unused-param-native test-perceus-block-let-unused-alias test-perceus-block-let-unused-alias-asan test-perceus-block-let-unused-alias-native test-perceus-closure-capture-tail test-perceus-closure-capture-tail-asan test-perceus-borrow-homonym test-perceus-borrow-homonym-asan test-perceus-borrow-homonym-native test-perceus-closure-capture-selftail test-perceus-closure-capture-selftail-asan test-perceus-closure-capture-selftail-native test-actor-orphan-send-suite test-actor-orphan-send-suite-native test-perceus-switch-scrutinee-selftail test-perceus-switch-scrutinee-selftail-asan test-perceus-switch-scrutinee-selftail-native test-perceus-arm-branch-read test-perceus-arm-branch-read-asan test-perceus-arm-branch-read-native test-handle-boxed-slot
 all: $(TARGET)
 
 $(KAIC1):
@@ -204,33 +204,26 @@ build:
 	@mkdir -p build
 
 # KAIC_BOOT picks the compiler that turns the package into build/stage2.c
-# (docs/build-system.md §KAIC_BOOT). Unset keeps the kaic1 recipe below;
-# any other value goes through $(BOOT_SH), which reuses a stage2.c only when
-# its recorded identity (boot + content of every input) matches exactly.
+# (docs/build-system.md §KAIC_BOOT): the previous release unless told
+# otherwise. $(BOOT_SH) reuses a stage2.c only when its recorded identity
+# (boot + content of every input) matches exactly.
 # A kaic2-class boot reads this tree's stdlib, never its own: the C must build against this runtime.h.
-KAIC_BOOT ?=
+KAIC_BOOT ?= release
 BOOT_SH   := ../tools/kaic-boot.sh
 STAGE2_ID := build/stage2.c.id
 
-ifneq ($(KAIC_BOOT)$(wildcard $(STAGE2_ID)),)
 ifneq ($(shell KAIC_BOOT='$(KAIC_BOOT)' $(BOOT_SH) fresh build/stage2.c && echo yes),yes)
 build/stage2.c: FORCE
 endif
-endif
 
-ifeq ($(KAIC_BOOT),)
-build/stage2.c: $(PKG_SRCS) $(KAIC1) | build
-	@rm -f $(STAGE2_ID)
-	$(STACK) $(KAIC1) $(SRC) > $@
-else
 build/stage2.c: $(PKG_SRCS) $(if $(filter kaic1,$(KAIC_BOOT)),$(KAIC1)) | build
 	KAIC_BOOT='$(KAIC_BOOT)' $(BOOT_SH) emit $@
-endif
 
-# The first hop of a kaic2-class boot, run by $(BOOT_SH): the boot's C,
-# linked C-only into the compiler that emits the C kaic2 is linked from.
+# A boot's C linked C-only, run by $(BOOT_SH): the seed against the runtime.h
+# it was frozen with (HOP_INC), the first hop of a kaic2-class boot against
+# this tree's.
 boot-hop:
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage0 $(HOP_C) -o $(HOP_BIN) $(LDLIBS_M)
+	$(CC) $(CFLAGS) $(if $(HOP_INC),-I $(HOP_INC),$(CPPFLAGS_CORE) -I ../stage0) $(LDFLAGS_STACK) $(HOP_C) -o $(HOP_BIN) $(LDLIBS_M)
 
 # Announce which backend capability got compiled in, so a dev never has
 # to guess why `kai build` behaves differently across two checkouts (the
@@ -330,31 +323,30 @@ kaic2-fast-verify: $(KAIC2_FAST_STAGING)
 	  && echo "kaic2-fast-verify OK (compiler + sample emitted C byte-identical)" \
 	  || { echo "kaic2-fast-verify: sample DIFF"; exit 1; }
 
-# Convergence gate for KAIC_BOOT: a kaic2 booted from the release boot
-# and one booted from the kaic1 chain must emit byte-identical C
-# for the compiler itself and for a sample program — the kaic2-fast-verify
-# contract across boots — and the release boot's kaic2-a must emit the C its
-# kaic2 emits. Each boot's stage2.c is reused only on an exact identity
-# match. Fetches the release on first use; does not touch ./kaic2.
+# Convergence gate for KAIC_BOOT: a kaic2 booted from the release and one
+# booted from the seed must emit byte-identical C for the compiler itself and
+# for a sample program, and each boot's kaic2 must emit the C its own kaic2-a
+# emitted. Each boot's stage2.c is reused only on an exact identity match.
+# Fetches the release on first use; does not touch ./kaic2.
 BOOT_VERIFY := build/boot-verify
 
 kaic-boot-verify: | build
 	@set -e; \
-	for b in kaic1 release; do \
+	for b in release seed; do \
 	  d=$(BOOT_VERIFY)/$$b; \
 	  KAIC_BOOT=$$b $(BOOT_SH) fresh $$d/stage2.c \
 	    || KAIC_BOOT=$$b $(BOOT_SH) emit $$d/stage2.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage0 $$d/stage2.c -o $$d/kaic2 $(LDLIBS_M); \
 	  ./$$d/kaic2 $(EDITION_FLAG) $(SRC) > $$d/self.c; \
 	  ./$$d/kaic2 $(EDITION_FLAG) ../examples/portfolio/portfolio.kai > $$d/sample.c; \
+	  cmp -s $$d/stage2.c $$d/self.c \
+	    || { echo "kaic-boot-verify: self-compile DIFF between the $$b boot's kaic2-a and kaic2"; exit 1; }; \
 	done; \
-	cmp -s $(BOOT_VERIFY)/kaic1/self.c $(BOOT_VERIFY)/release/self.c \
-	  || { echo "kaic-boot-verify: self-compile DIFF between the kaic1- and release-booted kaic2"; exit 1; }; \
-	cmp -s $(BOOT_VERIFY)/kaic1/sample.c $(BOOT_VERIFY)/release/sample.c \
-	  || { echo "kaic-boot-verify: sample DIFF between the kaic1- and release-booted kaic2"; exit 1; }; \
-	cmp -s $(BOOT_VERIFY)/release/stage2.c $(BOOT_VERIFY)/release/self.c \
-	  || { echo "kaic-boot-verify: self-compile DIFF between the release boot's kaic2-a and kaic2"; exit 1; }; \
-	echo "kaic-boot-verify OK (release- and kaic1-booted kaic2 emit byte-identical C for the compiler and a sample; the release boot's kaic2-a and kaic2 agree)"
+	cmp -s $(BOOT_VERIFY)/release/self.c $(BOOT_VERIFY)/seed/self.c \
+	  || { echo "kaic-boot-verify: self-compile DIFF between the release- and seed-booted kaic2"; exit 1; }; \
+	cmp -s $(BOOT_VERIFY)/release/sample.c $(BOOT_VERIFY)/seed/sample.c \
+	  || { echo "kaic-boot-verify: sample DIFF between the release- and seed-booted kaic2"; exit 1; }; \
+	echo "kaic-boot-verify OK (release- and seed-booted kaic2 emit byte-identical C for the compiler and a sample; each is a fixed point over its own kaic2-a)"
 
 FORCE:
 
@@ -896,7 +888,7 @@ test-issue-1969-typer-diag-file: $(TARGET) build
 # help lines must equal its golden exactly, on both backends.
 IMPORT_VERDICT_FIXTURES := unused-import-load-bearing unused-import-used-bare
 
-test-import-verdicts: $(TARGET) build
+test-import-verdicts: $(TARGET) bin-kai build
 	@set -e; \
 	for fx in $(IMPORT_VERDICT_FIXTURES); do \
 	  dir=../examples/modules/$$fx; \
@@ -916,7 +908,7 @@ test-import-verdicts: $(TARGET) build
 	done; \
 	echo "import-verdicts OK (an unused import is reported as droppable only when the unit can lose it)"
 
-test-issue-1875-success-diag-forwarded: $(TARGET) build
+test-issue-1875-success-diag-forwarded: $(TARGET) bin-kai build
 	@set -e; \
 	fx=../examples/modules/issue-1875-success-diag-forwarded; \
 	want="$$(cat $$fx/main.err.expected)"; \
@@ -947,7 +939,7 @@ test-issue-1875-success-diag-forwarded: $(TARGET) build
 # or `kai test`; a fn only a dead entry or a test block reaches must be absent
 # from a build's IR. Whole-program and partitioned native both prune; C is the
 # oracle.
-test-kir-reach-indirect-roots: $(TARGET) build
+test-kir-reach-indirect-roots: $(TARGET) bin-kai build
 	@set -e; \
 	fx=../examples/modules/kir-reach-indirect-roots; \
 	for spec in "c:KAI_BACKEND=c" "native:KAI_BACKEND=native KAI_NATIVE_MODULAR=0" "native-modular:KAI_BACKEND=native KAI_NATIVE_MODULAR=1"; do \
@@ -1108,7 +1100,7 @@ test-issue-1263-abandon-across-resumed-frame: $(TARGET) build
 	  || { echo "issue-1263 DIFF (C)"; diff ../examples/effects/$$f.out.expected build/s2-$$f-c.out; exit 1; }
 
 # Native half of the same gate — the backend the hang was reported on.
-test-issue-1263-abandon-across-resumed-frame-native: $(TARGET) build
+test-issue-1263-abandon-across-resumed-frame-native: $(TARGET) bin-kai build
 	@set -e; \
 	. ../tools/lib/timeout.sh; \
 	f=issue_1263_abandon_across_resumed_frame; \
@@ -1141,7 +1133,7 @@ test-issue-1564-promoted-cell-across-handle: $(TARGET) build
 	echo "issue-1564 OK (C -O0 + -O2: cell write survives the abandoning handle)"
 
 # Native half — the same loss reproduced on the default backend.
-test-issue-1564-promoted-cell-across-handle-native: $(TARGET) build
+test-issue-1564-promoted-cell-across-handle-native: $(TARGET) bin-kai build
 	@set -e; \
 	f=issue_1564_promoted_cell_across_discarding_handle; \
 	KAI_BACKEND=native ../bin/kai build ../examples/effects/$$f.kai -o build/s2-$$f-nat 2> build/s2-$$f-nat.err \
@@ -1240,7 +1232,7 @@ test-numeric-bigint: $(TARGET) build
 # built with the in-process libLLVM backend. Native-gated: a C-only
 # kaic2 cannot run --backend=native, so this is invoked from the
 # tier1-native workflow, not the C-backend tier1 suite.
-test-numeric-bigint-native: $(TARGET) build
+test-numeric-bigint-native: $(TARGET) bin-kai build
 	@set -e; \
 	for f in bigint_arith bigint_factorial bigint_border bigint_literal bigint_errors; do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/numeric/$$f.kai -o build/$$f-nat 2> build/$$f-nat.err \
@@ -1276,7 +1268,7 @@ test-numeric-decimal-rational: $(TARGET) build
 # DecimalBig + Rational — NATIVE backend parity. Same fixtures and
 # goldens, built with the in-process libLLVM backend. Native-gated;
 # invoked from the tier1-native workflow.
-test-numeric-decimal-rational-native: $(TARGET) build
+test-numeric-decimal-rational-native: $(TARGET) bin-kai build
 	@set -e; \
 	for f in decimal_big_demo rational_demo big_numeric_operators complex_div_operator decimal_operators import_alias_clash; do \
 	KAI_BACKEND=native ../bin/kai build ../examples/numeric/$$f.kai -o build/$$f-nat 2> build/$$f-nat.err \
@@ -1311,7 +1303,7 @@ test-numeric-div-by-zero-traps: $(TARGET) build
 
 # Same fixtures, NATIVE backend parity. Native-gated; invoked from the
 # tier1-native workflow.
-test-numeric-div-by-zero-traps-native: $(TARGET) build
+test-numeric-div-by-zero-traps-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in bigint_div_by_zero_traps rational_div_by_zero_traps \
 	            decimal_big_div_by_zero_traps decimal_div_by_zero_traps; do \
@@ -1344,7 +1336,7 @@ test-issue-1637-div-overflow-trap: $(TARGET) build
 	done
 
 # Same fixtures, NATIVE backend parity.
-test-issue-1637-div-overflow-trap-native: $(TARGET) build
+test-issue-1637-div-overflow-trap-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in int_div_min_overflow_traps int_mod_min_overflow_traps; do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/numeric/$$name.kai -o build/$$name-nat 2> build/$$name-nat.buildlog \
@@ -1435,7 +1427,7 @@ test-ffi-v2-opaque: $(TARGET) build
 # library can run its boundary under `kai test`. The fixture's test
 # blocks must produce the golden on both backends; a cc-only kaic2
 # skips the native leg.
-test-ffi-in-test-blocks: $(TARGET) build
+test-ffi-in-test-blocks: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/ffi/ffi_in_test_blocks.kai; \
 	gold=../examples/ffi/ffi_in_test_blocks.out.expected; \
@@ -1486,7 +1478,7 @@ endif
 # the LINK line: as an extra input next to `-c … -o` clang rejects it
 # ("cannot specify -o when generating multiple output files"). Exercises the
 # kai end-to-end, not raw kaic2 — the routing lives in kai.
-test-ffi-cflags-shim: $(TARGET) build
+test-ffi-cflags-shim: $(TARGET) bin-kai build
 	@set -e; \
 	CFLAGS="../examples/ffi/cflags_shim.c" ../bin/kai build --backend=c ../examples/ffi/cflags_shim_link.kai -o build/cflags-shim-c 2> build/cflags-shim-c.err \
 	  || { echo "ffi-cflags-shim BUILD FAIL (C backend)"; cat build/cflags-shim-c.err; exit 1; }; \
@@ -1496,7 +1488,7 @@ test-ffi-cflags-shim: $(TARGET) build
 	  || { echo "ffi-cflags-shim DIFF (C backend)"; diff ../examples/ffi/cflags_shim_link.out.expected build/cflags-shim-c.out; exit 1; }
 
 ifeq ($(KAI_LLVM),1)
-test-ffi-cflags-shim-native: $(TARGET) build
+test-ffi-cflags-shim-native: $(TARGET) bin-kai build
 	@set -e; \
 	CFLAGS="../examples/ffi/cflags_shim.c" KAI_BACKEND=native ../bin/kai build ../examples/ffi/cflags_shim_link.kai -o build/cflags-shim-nat 2> build/cflags-shim-nat.err \
 	  || { echo "ffi-cflags-shim BUILD FAIL (native)"; cat build/cflags-shim-nat.err; exit 1; }; \
@@ -1517,7 +1509,7 @@ endif
 # that only ran at the default would have gone green on the broken runtime for
 # the wrong reason. Spawned children must still migrate — the pin covers the
 # entry fiber alone — which the nursery half of the fixture exercises.
-test-issue-1556-main-thread-affinity: $(TARGET) build
+test-issue-1556-main-thread-affinity: $(TARGET) bin-kai build
 	@set -e; \
 	CFLAGS="../examples/ffi/main_thread_shim.c" ../bin/kai build --backend=c ../examples/ffi/main_thread_affinity.kai -o build/main-thread-c 2> build/main-thread-c.err \
 	  || { echo "issue-1556 BUILD FAIL (C backend)"; cat build/main-thread-c.err; exit 1; }; \
@@ -1529,7 +1521,7 @@ test-issue-1556-main-thread-affinity: $(TARGET) build
 	echo "issue-1556 OK (C backend, KAI_THREADS 1/2/4/8)"
 
 ifeq ($(KAI_LLVM),1)
-test-issue-1556-main-thread-affinity-native: $(TARGET) build
+test-issue-1556-main-thread-affinity-native: $(TARGET) bin-kai build
 	@set -e; \
 	CFLAGS="../examples/ffi/main_thread_shim.c" KAI_BACKEND=native ../bin/kai build ../examples/ffi/main_thread_affinity.kai -o build/main-thread-nat 2> build/main-thread-nat.err \
 	  || { echo "issue-1556 BUILD FAIL (native)"; cat build/main-thread-nat.err; exit 1; }; \
@@ -1834,7 +1826,7 @@ endif
 # hide them, and require the rebuild to still link and produce identical
 # output. Isolated cache via KAI_CORE_CACHE_DIR.
 ifeq ($(KAI_LLVM),1)
-test-native-core-obj-bc-state: $(TARGET) build
+test-native-core-obj-bc-state: $(TARGET) bin-kai build
 	@set -e; \
 	if [ ! -f ../stage0/runtime_llvm.bc ] || [ ! -f ../stage0/runtime_inline.bc ]; then \
 	  echo "native-core-obj-bc-state SKIP (runtime bitcodes not generated)"; exit 0; fi; \
@@ -1866,7 +1858,7 @@ endif
 # to KAI_NATIVE_DEAD_STRIP=0; (2) the stripped binary is smaller — the strip
 # actually fired. End-to-end through bin/kai: the flags live in kai.
 ifeq ($(KAI_LLVM),1)
-test-native-dead-strip: $(TARGET) build
+test-native-dead-strip: $(TARGET) bin-kai build
 	@set -e; \
 	KAI_BACKEND=native ../bin/kai build ../examples/stdlib/dead_strip_dispatch.kai -o build/dead-strip-on 2> build/dead-strip-on.err \
 	  || { echo "native-dead-strip BUILD FAIL (default)"; cat build/dead-strip-on.err; exit 1; }; \
@@ -2280,7 +2272,7 @@ test-region-1123: $(TARGET) build
 # symbols (`kaix_arena_variant*` for the ctors, `kaix_arena_push` for the
 # region bracket) — the exact check whose absence let that gap ship. Both
 # region fixtures also run to a byte-identical result on the native backend.
-test-region-1193-native: $(TARGET) build
+test-region-1193-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in region_tree_1123 region_tree_escape_1123; do \
 	  f=../examples/perceus/$$name.kai; \
@@ -2313,7 +2305,7 @@ test-region-1193-native: $(TARGET) build
 # A ctor under a live region NEVER takes a reuse token — it bump-allocates fresh
 # so the arena frees it wholesale. The native leg needs LLVM, so this rides
 # tier1-native, not the LLVM-free light suite.
-test-region-1197-parity: $(TARGET) build
+test-region-1197-parity: $(TARGET) bin-kai build
 	@set -e; \
 	for name in region_tree_1123 region_spine_reuse_1197; do \
 	  f=../examples/perceus/$$name.kai; \
@@ -3183,7 +3175,12 @@ test-holes: $(TARGET) build
 #     headers must appear once per hole.
 #   * JSON: validate_holes_json.py confirms the stable schema; in
 #     addition we check the right number of entries.
-test-driver-holes: $(TARGET) build
+# `bin/kai` resolves stdlib and the backend; targets that drive the compiler
+# through the wrapper depend on this, not on $(TARGET) alone.
+bin-kai: $(TARGET)
+	@$(MAKE) -s -C ../tools/kai kai
+
+test-driver-holes: $(TARGET) bin-kai build
 	@set -e; \
 	KAI=../bin/kai; \
 	pretty=../examples/typed_holes/hole_pretty.kai; \
@@ -5759,7 +5756,7 @@ test-perceus-1186-map-pipe-terminal-field: $(TARGET) build
 # Issue #1134 (native) — the fused chain must run byte-identically on the
 # native backend. Native-gated (tier1-native). Same purity source; asserts
 # output parity + the fused cons budget carries to native codegen.
-test-perceus-1134-pipe-fusion-native: $(TARGET) build
+test-perceus-1134-pipe-fusion-native: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/pipe_fusion_purity_1134.kai; \
 	exp=../examples/perceus/pipe_fusion_purity_1134.out.expected; \
@@ -5774,7 +5771,7 @@ test-perceus-1134-pipe-fusion-native: $(TARGET) build
 # over a pure lambda must (a) produce the exact sum and (b) emit a
 # specialised loop with ZERO per-element `call_ind` — the lambda body is
 # inlined into the tcrec loop. Native-gated (tier1-native).
-test-closure-spec-1205: $(TARGET) build
+test-closure-spec-1205: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/closure_spec_1205.kai; \
 	exp=../examples/perceus/closure_spec_1205.out.expected; \
@@ -5798,7 +5795,7 @@ test-closure-spec-1205: $(TARGET) build
 # a backend that declares one spelling and reads the other fails to compile.
 # Run on BOTH backends: the defect was a c/native parity break, so a
 # native-only gate would not have caught it.
-test-closure-spec-mixed-mode-acc: $(TARGET) build
+test-closure-spec-mixed-mode-acc: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/closure_spec_mixed_mode_acc.kai; \
 	exp=../examples/perceus/closure_spec_mixed_mode_acc.out.expected; \
@@ -5817,7 +5814,7 @@ test-closure-spec-mixed-mode-acc: $(TARGET) build
 # return type, so the specialised collect loop unboxes (`i64` indices,
 # record ctor inlined) and carries zero per-element indirect calls.
 # Native-gated (tier1-native).
-test-collect-ground-1208: $(TARGET) build
+test-collect-ground-1208: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/collect_ground_1208.kai; \
 	exp=../examples/perceus/collect_ground_1208.out.expected; \
@@ -5844,7 +5841,7 @@ test-collect-ground-1208: $(TARGET) build
 # perceus drops it once per read (second read = freed memory). Every field
 # of every element must round-trip; the emitted spec must carry the `__csb`
 # bind-once binder (proof the guard fired). Native-gated (tier1-native).
-test-collect-multiread-1208: $(TARGET) build
+test-collect-multiread-1208: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/collect_multiread_1208.kai; \
 	exp=../examples/perceus/collect_multiread_1208.out.expected; \
@@ -5860,7 +5857,7 @@ test-collect-multiread-1208: $(TARGET) build
 # Issue #1134 (native) — the range-headed terminal fold must fold a 1M-wide
 # range in O(1) stack on native (the counting loop is tail-recursive) and
 # produce the exact result. Native-gated (tier1-native).
-test-perceus-1134-pipe-fusion-terminal-native: $(TARGET) build
+test-perceus-1134-pipe-fusion-terminal-native: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/pipe_fusion_terminal_1134.kai; \
 	exp=../examples/perceus/pipe_fusion_terminal_1134.out.expected; \
@@ -5874,7 +5871,7 @@ test-perceus-1134-pipe-fusion-terminal-native: $(TARGET) build
 # Issue #1143 (native) — lambda-stage fusion parity: exact output + the
 # per-element path stays allocation-free on native too. Native-gated
 # (tier1-native).
-test-perceus-1143-pipe-fusion-lambda-native: $(TARGET) build
+test-perceus-1143-pipe-fusion-lambda-native: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/pipe_fusion_lambda_1143.kai; \
 	exp=../examples/perceus/pipe_fusion_lambda_1143.out.expected; \
@@ -5890,7 +5887,7 @@ test-perceus-1143-pipe-fusion-lambda-native: $(TARGET) build
 
 # Issue #1143 (native) — ring/length terminal fusion parity on native.
 # Native-gated (tier1-native).
-test-perceus-1143-pipe-fusion-ring-native: $(TARGET) build
+test-perceus-1143-pipe-fusion-ring-native: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/pipe_fusion_ring_1143.kai; \
 	exp=../examples/perceus/pipe_fusion_ring_1143.out.expected; \
@@ -5909,7 +5906,7 @@ test-perceus-1143-pipe-fusion-ring-native: $(TARGET) build
 # per param before `KRet`. Native-gated (tier1-native); asserts output parity
 # + `leaked` < 1000. The map pipe here projects a field, so no nested-closure
 # capture is involved (the capture-lifecycle residual is a separate concern).
-test-perceus-1117-native-map-pipe-record-leak: $(TARGET) build
+test-perceus-1117-native-map-pipe-record-leak: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/map_pipe_record_leak_1117.kai; \
 	exp=../examples/perceus/map_pipe_record_leak_1117.out.expected; \
@@ -5952,7 +5949,7 @@ test-perceus-1120-array-borrow: $(TARGET) build
 	  && echo "perceus-1120-array-borrow OK (incref_total=$$inc < 150 over 100 reads; container per-access RC elided, only the element escapes)" \
 	  || { echo "perceus-1120-array-borrow FAIL (incref_total=$$inc — container dup regressed, expected ~200 pre-borrow)"; exit 1; }
 
-test-perceus-1120-array-borrow-native: $(TARGET) build
+test-perceus-1120-array-borrow-native: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/array_borrow_read_1120.kai; \
 	exp=../examples/perceus/array_borrow_read_1120.out.expected; \
@@ -6011,7 +6008,7 @@ test-perceus-1135-vec-value: $(TARGET) build
 	  || { echo "perceus-1135-vec FAIL (pure-row output diff)"; diff $$exp build/s2-vec_pure_row.out; exit 1; }; \
 	echo "perceus-1135-vec OK (in-place=150/cow=0 unique, cow=1 shared, 3 storage kinds round-trip, rows stay pure)"
 
-test-perceus-1135-vec-value-native: $(TARGET) build
+test-perceus-1135-vec-value-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(PERCEUS_1135_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
@@ -6065,7 +6062,7 @@ test-perceus-1135-vec-raw: $(TARGET) build
 	       grep vec_ build/s2-vec_rec_raw_fusion_1135.rc || true; exit 1; }; \
 	echo "perceus-1135-vec-raw OK (raw moves ride unique-or-copy; qualified self-call keeps the goto)"
 
-test-perceus-1135-vec-raw-native: $(TARGET) build
+test-perceus-1135-vec-raw-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(PERCEUS_1135_RAW_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
@@ -6103,7 +6100,7 @@ test-perceus-1151-vec-push-growth: $(TARGET) build
 	done; \
 	echo "perceus-1151-vec-push-growth OK (recursive push growth linear on both append regimes)"
 
-test-perceus-1151-vec-push-growth-native: $(TARGET) build
+test-perceus-1151-vec-push-growth-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(PERCEUS_1151_GROWTH_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
@@ -6163,7 +6160,7 @@ test-perceus-1153-modcall-linear: $(TARGET) build
 	  || { echo "perceus-1153-modcall-linear FAIL (module surface missed the raw push fuse)"; exit 1; }; \
 	echo "perceus-1153-modcall-linear OK (module-call loops move the vec: writes in place on both spellings)"
 
-test-perceus-1153-modcall-linear-native: $(TARGET) build
+test-perceus-1153-modcall-linear-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(PERCEUS_1153_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
@@ -6259,7 +6256,7 @@ test-perceus-1150-vec-surface: $(TARGET) build
 	  || { echo "perceus-1150-vec-surface FAIL (collect alloc_total=$$ctot — chain rematerialised)"; exit 1; }; \
 	echo "perceus-1150-vec-surface OK (descent alloc=$$tot cow=0, pin exact, mint, collect alloc=$$ctot)"
 
-test-perceus-1150-vec-surface-native: $(TARGET) build
+test-perceus-1150-vec-surface-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(PERCEUS_1150_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
@@ -6323,7 +6320,7 @@ test-perceus-1126-read-loop-drop: $(TARGET) build
 	  echo "perceus-1126-read-loop-drop OK ($$name: C leaked=$$leaked < 100; array + records reclaimed)"; \
 	done
 
-test-perceus-1126-read-loop-drop-native: $(TARGET) build
+test-perceus-1126-read-loop-drop-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(PERCEUS_1126_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
@@ -6368,7 +6365,7 @@ test-perceus-1127-borrow-closure: $(TARGET) build
 	  && echo "perceus-1127-borrow-closure OK (#1130: incref_total=$$inc < 100 over 1000 iters — closure per-iteration RC collapsed to ~0; leaked=$$leaked bounded)" \
 	  || { echo "perceus-1127-borrow-closure FAIL (incref_total=$$inc — closure ^ NOT borrowed, per-iter dup regressed; expected ~2000 pre-#1130)"; exit 1; }
 
-test-perceus-1127-borrow-closure-native: $(TARGET) build
+test-perceus-1127-borrow-closure-native: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/borrow_closure_1127.kai; \
 	exp=../examples/perceus/borrow_closure_1127.out.expected; \
@@ -6423,7 +6420,7 @@ test-perceus-1127-borrow-hof: $(TARGET) build
 
 # Native half of the HOF gate (runs on the native suite — the tier1 shard's
 # kaic2 is C-only). Split out per the #1126 precedent.
-test-perceus-1127-borrow-hof-native: $(TARGET) build
+test-perceus-1127-borrow-hof-native: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/borrow_stdlib_hof_1127.kai; \
 	exp=../examples/perceus/borrow_stdlib_hof_1127.out.expected; \
@@ -6453,7 +6450,7 @@ test-perceus-1127-borrow-tco: $(TARGET) build
 
 # Native half of the TCO gate (native suite — the tier1 shard's kaic2 is
 # C-only). Split out per the #1126 precedent.
-test-perceus-1127-borrow-tco-native: $(TARGET) build
+test-perceus-1127-borrow-tco-native: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/borrow_tco_descent_1127.kai; \
 	exp=../examples/perceus/borrow_tco_descent_1127.out.expected; \
@@ -6484,7 +6481,7 @@ test-perceus-1130-borrow-pipe: $(TARGET) build
 	  || { echo "perceus-1130-borrow-pipe FAIL (leaked=$$leaked)"; exit 1; }
 
 # Native half (tier1-native suite; the tier1 shard's kaic2 is C-only).
-test-perceus-1130-borrow-pipe-native: $(TARGET) build
+test-perceus-1130-borrow-pipe-native: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/borrow_closure_pipe_1130.kai; \
 	exp=../examples/perceus/borrow_closure_pipe_1130.out.expected; \
@@ -6517,7 +6514,7 @@ test-perceus-1130-hof-tail-drop: $(TARGET) build
 	  || { echo "perceus-1130-hof-tail-drop FAIL (leaked=$$leaked — closure leaked per iter, drop-after-call regressed)"; exit 1; }
 
 # Native half (tier1-native suite).
-test-perceus-1130-hof-tail-drop-native: $(TARGET) build
+test-perceus-1130-hof-tail-drop-native: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/borrow_hof_tail_drop_1130.kai; \
 	exp=../examples/perceus/borrow_hof_tail_drop_1130.out.expected; \
@@ -6555,7 +6552,7 @@ test-perceus-1131-borrow-descent: $(TARGET) build
 # native and the helper link lacks the libLLVM shim). KAI_CACHE=0: the
 # assertion is byte-identity; publishing typed blobs for every compiler
 # module only adds wall-clock.
-test-perceus-1131-modular-escape: $(TARGET) build
+test-perceus-1131-modular-escape: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/borrow_modular_escape_1131.kai; \
 	out=$$(pwd)/build/s2-1131modesc.bin; rm -f $$out; \
@@ -6705,7 +6702,7 @@ test-perceus-1302-tcrec-goto-drops-asan: $(TARGET) build
 # goto-site release ledger, so the native goto-tail path must hold the
 # leak flat too. Split out per the #1126/#1127 precedent (the tier1
 # shard's kaic2 is C-only).
-test-perceus-1302-tcrec-goto-drops-native: $(TARGET) build
+test-perceus-1302-tcrec-goto-drops-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=tcrec_goto_owned_binder_1302; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1302tgdn 2> build/s2-1302tgdn.err \
@@ -6763,7 +6760,7 @@ test-perceus-1635-goto-move-collision-asan: $(TARGET) build
 # Native half: the move set is planted by the shared perceus pass, so the
 # KIR lowering inherits the same over-release (probed red on native before
 # the fix — the recycled cell surfaces as garbage payload there).
-test-perceus-1635-goto-move-collision-native: $(TARGET) build
+test-perceus-1635-goto-move-collision-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=goto_move_name_collision_1635; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1635gmcn 2> build/s2-1635gmcn.err \
@@ -6814,7 +6811,7 @@ test-perceus-1758-cond-exit-drop-asan: $(TARGET) build
 
 # Native half: the move set is planted by the shared perceus pass, so
 # the KIR lowering inherits the same over-release.
-test-perceus-1758-cond-exit-drop-native: $(TARGET) build
+test-perceus-1758-cond-exit-drop-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=owned_param_bare_pass_selfrec_1758; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1758cedn 2> build/s2-1758cedn.err \
@@ -6867,7 +6864,7 @@ test-perceus-1902-block-let-move-asan: $(TARGET) build
 
 # Native half: the move set is planted by the shared perceus pass, so the
 # KIR lowering inherits the same binder decision.
-test-perceus-1902-block-let-move-native: $(TARGET) build
+test-perceus-1902-block-let-move-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=block_let_move_last_1902; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1902blmn 2> build/s2-1902blmn.err \
@@ -6901,7 +6898,7 @@ test-perceus-1961-call-raw-border: $(TARGET) build
 	echo "perceus-1961-call-raw-border OK"
 
 ifeq ($(KAI_LLVM),1)
-test-perceus-1961-call-raw-border-native: $(TARGET) build
+test-perceus-1961-call-raw-border-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=call_raw_result_border_1961; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1961crbn 2> build/s2-1961crbn.err \
@@ -6960,7 +6957,7 @@ test-perceus-2032-bang-operand-use-asan: $(TARGET) build
 ifeq ($(KAI_LLVM),1)
 # The use scan is shared, so the native lowering inherited the same
 # premature release.
-test-perceus-2032-bang-operand-use-native: $(TARGET) build
+test-perceus-2032-bang-operand-use-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=bang_operand_use_scan_2032; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-2032boun 2> build/s2-2032boun.err \
@@ -7010,7 +7007,7 @@ test-perceus-owned-scope-unused-param-asan: $(TARGET) build
 	echo "perceus-owned-scope-unused-param-asan OK"
 
 ifeq ($(KAI_LLVM),1)
-test-perceus-owned-scope-unused-param-native: $(TARGET) build
+test-perceus-owned-scope-unused-param-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=owned_scope_unused_param; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-osupn 2> build/s2-osupn.err \
@@ -7067,7 +7064,7 @@ test-perceus-block-let-unused-alias-asan: $(TARGET) build
 	echo "perceus-block-let-unused-alias-asan OK"
 
 ifeq ($(KAI_LLVM),1)
-test-perceus-block-let-unused-alias-native: $(TARGET) build
+test-perceus-block-let-unused-alias-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(BLOCK_LET_UNUSED_ALIAS_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
@@ -7162,7 +7159,7 @@ test-perceus-closure-capture-selftail-asan: $(TARGET) build
 	echo "perceus-closure-capture-selftail-asan OK"
 
 ifeq ($(KAI_LLVM),1)
-test-perceus-closure-capture-selftail-native: $(TARGET) build
+test-perceus-closure-capture-selftail-native: $(TARGET) bin-kai build
 	@set -e; \
 	for f in $(CLOSURE_CAPTURE_SELFTAIL_FIXTURES); do \
 	  name=$$(basename $$f); \
@@ -7218,7 +7215,7 @@ test-perceus-switch-scrutinee-selftail-asan: $(TARGET) build
 	echo "perceus-switch-scrutinee-selftail-asan OK"
 
 ifeq ($(KAI_LLVM),1)
-test-perceus-switch-scrutinee-selftail-native: $(TARGET) build
+test-perceus-switch-scrutinee-selftail-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(SWITCH_SCRUTINEE_SELFTAIL_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
@@ -7276,7 +7273,7 @@ test-perceus-arm-branch-read-asan: $(TARGET) build
 	echo "perceus-arm-branch-read-asan OK"
 
 ifeq ($(KAI_LLVM),1)
-test-perceus-arm-branch-read-native: $(TARGET) build
+test-perceus-arm-branch-read-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(ARM_BRANCH_READ_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
@@ -7356,7 +7353,7 @@ test-perceus-borrow-homonym-asan: $(TARGET) build
 	echo "perceus-borrow-homonym-asan OK"
 
 ifeq ($(KAI_LLVM),1)
-test-perceus-borrow-homonym-native: $(TARGET) build
+test-perceus-borrow-homonym-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(BORROW_HOMONYM_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
@@ -7394,7 +7391,7 @@ test-perceus-1961-trmc-real-elision: $(TARGET) build
 	echo "perceus-1961-trmc-real-elision OK (leaked=$$leaked)"
 
 ifeq ($(KAI_LLVM),1)
-test-perceus-1961-trmc-real-elision-native: $(TARGET) build
+test-perceus-1961-trmc-real-elision-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=trmc_real_slot_donor_elision; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1961tren 2> build/s2-1961tren.err \
@@ -7458,7 +7455,7 @@ test-perceus-1768-move-gate-positions-asan: $(TARGET) build
 	done; \
 	echo "perceus-1768-move-gate-positions-asan OK"
 
-test-perceus-1768-move-gate-positions-native: $(TARGET) build
+test-perceus-1768-move-gate-positions-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(MOVE_GATE_1768_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1768mgp-n 2> build/s2-1768mgp-n.err \
@@ -7549,7 +7546,7 @@ test-perceus-1770-arm-birth-leak-asan: $(TARGET) build
 	done; \
 	echo "perceus-1770-arm-birth-leak-asan OK"
 
-test-perceus-1770-arm-birth-leak-native: $(TARGET) build
+test-perceus-1770-arm-birth-leak-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(ARM_BIRTH_1770_FIXTURES) $(GUARD_FAIL_1774_FIXTURES) $(BIRTH_PAY_1777_FIXTURES) $(BRANCH_PAY_1780_FIXTURES_NATIVE) $(LET_SC_1785_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1770abl-n 2> build/s2-1770abl-n.err \
@@ -7586,7 +7583,7 @@ test-perceus-1783-interp-intern-leak: $(TARGET) build
 	  && echo "perceus-1783-interp-intern-leak OK (leaked=$$leaked < 100 over 2000 unique interpolations)" \
 	  || { echo "perceus-1783-interp-intern-leak FAIL (leaked=$$leaked — data-derived strings pinned in the intern table)"; exit 1; }
 
-test-perceus-1783-interp-intern-leak-native: $(TARGET) build
+test-perceus-1783-interp-intern-leak-native: $(TARGET) bin-kai build
 	@set -e; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/interp_intern_leak_1783.kai -o build/s2-1783iil-n 2> build/s2-1783iil-n.err \
 	  || { echo "perceus-1783-interp-intern-leak-native FAIL (native build errored)"; cat build/s2-1783iil-n.err; exit 1; }; \
@@ -7644,7 +7641,7 @@ test-perceus-1784-variant-rebuild-asan: $(TARGET) build
 	done; \
 	echo "perceus-1784-variant-rebuild-asan OK"
 
-test-perceus-1784-variant-rebuild-native: $(TARGET) build
+test-perceus-1784-variant-rebuild-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(VARIANT_REBUILD_1784_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1784vr-n 2> build/s2-1784vr-n.err \
@@ -7708,7 +7705,7 @@ test-perceus-1786-record-rebuild-asan: $(TARGET) build
 	done; \
 	echo "perceus-1786-record-rebuild-asan OK"
 
-test-perceus-1786-record-rebuild-native: $(TARGET) build
+test-perceus-1786-record-rebuild-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(RECORD_NESTED_REBUILD_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1786rr-n 2> build/s2-1786rr-n.err \
@@ -7777,7 +7774,7 @@ test-perceus-1791-arm-use-scope-asan: $(TARGET) build
 	done; \
 	echo "perceus-1791-arm-use-scope-asan OK"
 
-test-perceus-1791-arm-use-scope-native: $(TARGET) build
+test-perceus-1791-arm-use-scope-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(ARM_USE_SCOPE_1791_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1791aus-n 2> build/s2-1791aus-n.err \
@@ -7833,7 +7830,7 @@ test-perceus-1801-capability-param-asan: $(TARGET) build
 	done; \
 	echo "perceus-1801-capability-param-asan OK"
 
-test-perceus-1801-capability-param-native: $(TARGET) build
+test-perceus-1801-capability-param-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(CAP_PARAM_1801_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/effects/$$name.kai -o build/s2-1801cap-n 2> build/s2-1801cap-n.err \
@@ -7865,7 +7862,7 @@ test-perceus-1803-op-arg-free: $(TARGET) build
 	done; \
 	echo "perceus-1803-op-arg-free OK (primitive-payload op arg matched in the clause)"
 
-test-perceus-1803-op-arg-free-native: $(TARGET) build
+test-perceus-1803-op-arg-free-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(OP_ARG_1803_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1803oaf-n 2> build/s2-1803oaf-n.err \
@@ -7939,7 +7936,7 @@ test-perceus-1765-binop-base-tail-asan: $(TARGET) build
 
 # Native half: the move set is planted by the shared perceus pass, so
 # the native lowering must stay conservative for the same shape.
-test-perceus-1765-binop-base-tail-native: $(TARGET) build
+test-perceus-1765-binop-base-tail-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=owned_param_binop_base_tail_1765; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1765bbtn 2> build/s2-1765bbtn.err \
@@ -7989,7 +7986,7 @@ test-perceus-1324-char-binder-goto-asan: $(TARGET) build
 # Native half of the #1324 gate: the shape that crashed (guarded arm,
 # goto-site release of a Char-binding match) must print correctly and
 # stay leak-flat — Char matches ride the goto ledger like any other.
-test-perceus-1324-char-binder-goto-native: $(TARGET) build
+test-perceus-1324-char-binder-goto-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=tcrec_char_binder_goto_1324; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1324cbgn 2> build/s2-1324cbgn.err \
@@ -8038,7 +8035,7 @@ test-perceus-1395-char-param-raw-asan: $(TARGET) build
 # Native half: the raw-promoted Char param must print the same values as
 # the C oracle, and the fresh boxes minted at the boxed borders must all
 # be consumed (leak flat).
-test-perceus-1395-char-param-raw-native: $(TARGET) build
+test-perceus-1395-char-param-raw-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=char_param_raw_1395; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1395cprn 2> build/s2-1395cprn.err \
@@ -8087,7 +8084,7 @@ test-perceus-1410-byte-raw-ops-asan: $(TARGET) build
 # Native half: the raw Byte op family must print the same wrapped values
 # as the C oracle, and the fresh boxes minted at the boxed borders must
 # all be consumed (leak flat).
-test-perceus-1410-byte-raw-ops-native: $(TARGET) build
+test-perceus-1410-byte-raw-ops-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=byte_raw_ops_1410; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1410bron 2> build/s2-1410bron.err \
@@ -8137,7 +8134,7 @@ test-perceus-1457-fixed-raw-ops-asan: $(TARGET) build
 # Native half: the raw fixed-width op family must print the same wrapped
 # values as the C oracle, and the fresh boxes minted at the boxed borders
 # must all be consumed (leak flat).
-test-perceus-1457-fixed-raw-ops-native: $(TARGET) build
+test-perceus-1457-fixed-raw-ops-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=fixed_raw_ops_1457; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1457fron 2> build/s2-1457fron.err \
@@ -8185,7 +8182,7 @@ test-perceus-1464-fixed-raw-ops-asan: $(TARGET) build
 # Native half: the i128 register op family must print the same wrapped
 # values as the C oracle (byte-identical), and the fresh boxes minted at
 # the boxed borders (and the boxed div/mod) must all be consumed (leak flat).
-test-perceus-1464-fixed-raw-ops-native: $(TARGET) build
+test-perceus-1464-fixed-raw-ops-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=fixed_raw_ops_1464; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1464fron 2> build/s2-1464fron.err \
@@ -8231,7 +8228,7 @@ test-perceus-1637-int-wrap-ops-asan: $(TARGET) build
 	  || { echo "perceus-1637-int-wrap-ops-asan FAIL (output diff)"; exit 1; }
 
 # Native half: the wrapped values must match the C oracle exactly.
-test-perceus-1637-int-wrap-ops-native: $(TARGET) build
+test-perceus-1637-int-wrap-ops-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=int_wrap_ops_1637; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1637iwon 2> build/s2-1637iwon.err \
@@ -8278,7 +8275,7 @@ test-issue-1454-fixed-vec: $(TARGET) build
 # plus C-vs-native stdout parity. Native-gated: a C-only kaic2 cannot dump
 # the native IR (`KAI_NATIVE_DUMP_IR`). Whole-program (`KAI_NATIVE_MODULAR=0`)
 # so the dump is the single module that defines `main`.
-test-issue-1454-fixed-vec-native: $(TARGET) build
+test-issue-1454-fixed-vec-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=fixed_vec_inline_1454; \
 	KAI_NATIVE_DUMP_IR=build/s2-1454fvn.ll KAI_NATIVE_MODULAR=0 KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1454fvn 2> build/s2-1454fvn.err \
@@ -8316,7 +8313,7 @@ test-issue-1481-fixed-vec-border: $(TARGET) build
 # `vec_push` in the IR) while the pure-inline reads keep their `[n x elem]`
 # alloca, plus stdout parity with the C golden. Native-gated (tier1-native);
 # whole-program so the dump is the single module defining `main`.
-test-issue-1481-fixed-vec-border-native: $(TARGET) build
+test-issue-1481-fixed-vec-border-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=fixed_vec_border_1481; \
 	KAI_NATIVE_DUMP_IR=build/s2-1481fvbn.ll KAI_NATIVE_MODULAR=0 KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1481fvbn 2> build/s2-1481fvbn.err \
@@ -8380,7 +8377,7 @@ test-issue-1480-fixed-vec-collect-neg: $(TARGET) build
 # Native half of #1480: the same three shapes must lower to the inline
 # `[n x elem]` aggregate in native IR too — no dynamic-vec call survives —
 # with stdout parity against the C goldens.
-test-issue-1480-fixed-vec-shapes-native: $(TARGET) build
+test-issue-1480-fixed-vec-shapes-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(FIXED_VEC_1480); do \
 	  KAI_NATIVE_DUMP_IR=build/s2-1480fvn.ll KAI_NATIVE_MODULAR=0 KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1480fvn 2> build/s2-1480fvn.err \
@@ -8420,7 +8417,7 @@ test-issue-1491-fixed-vec-param: $(TARGET) build
 # helper (never a GEP into an aggregate that is not there), the literal
 # binder keeps its inline alloca, and stdout matches the C golden — the
 # parity that would have caught the silent garbage read.
-test-issue-1491-fixed-vec-param-native: $(TARGET) build
+test-issue-1491-fixed-vec-param-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=fixed_vec_param_1491; \
 	KAI_NATIVE_DUMP_IR=build/s2-1491fvpn.ll KAI_NATIVE_MODULAR=0 KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1491fvpn 2> build/s2-1491fvpn.err \
@@ -8455,7 +8452,7 @@ test-issue-1518-fixed-vec-param-raw: $(TARGET) build
 # Native half: the values are the test. A raw-position read of a boxed base
 # reaches the runtime slot; the literal binder keeps its inline alloca so the
 # fix did not push the pure-inline path onto the heap.
-test-issue-1518-fixed-vec-param-raw-native: $(TARGET) build
+test-issue-1518-fixed-vec-param-raw-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=fixed_vec_param_raw_1518; \
 	KAI_NATIVE_DUMP_IR=build/s2-1518fvrn.ll KAI_NATIVE_MODULAR=0 KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1518fvrn 2> build/s2-1518fvrn.err \
@@ -8492,7 +8489,7 @@ test-issue-1517-linalg-matrix-ops: $(TARGET) build
 # The IR assertions pin both directions of the border: a row literal crossing
 # it materialises (`vec_reserve` + `vec_push`), and the pure-inline path is NOT
 # pushed onto the heap (the `[3 x double]` alloca survives).
-test-issue-1517-linalg-matrix-ops-native: $(TARGET) build
+test-issue-1517-linalg-matrix-ops-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=linalg_matrix_ops; \
 	KAI_NATIVE_DUMP_IR=build/s2-1517linn.ll KAI_NATIVE_MODULAR=0 KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1517linn 2> build/s2-1517linn.err \
@@ -8543,7 +8540,7 @@ test-issue-1394-byte-box-asan: $(TARGET) build
 
 # Native half: every Byte border prints the same values as the C oracle
 # (the shape that segfaulted), and the RC ledger stays flat.
-test-issue-1394-byte-box-native: $(TARGET) build
+test-issue-1394-byte-box-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=byte_field_box_1394; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-1394bbn 2> build/s2-1394bbn.err \
@@ -8608,7 +8605,7 @@ test-perceus-1315-borrowed-match-release-asan: $(TARGET) build
 # structural dup), so the borrowed deconstruction stays leak-flat on the
 # native backend too. Split out per the #1302 precedent (the tier1
 # shard's kaic2 is C-only).
-test-perceus-1315-borrowed-match-release-native: $(TARGET) build
+test-perceus-1315-borrowed-match-release-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in borrowed_match_str_payload_1315 borrowed_match_list_payload_1315; do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
@@ -8680,7 +8677,7 @@ test-perceus-1355-closure-temp-release-asan: $(TARGET) build
 
 # Native half of the #1355 gate: the mark's post-call KDrop must release
 # the closure temp on the KIR lowering too, keeping both backends leak-flat.
-test-perceus-1355-closure-temp-release-native: $(TARGET) build
+test-perceus-1355-closure-temp-release-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=closure_temp_borrowed_hof_1355; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
@@ -8744,7 +8741,7 @@ test-perceus-1328-selftail-borrowed-local-asan: $(TARGET) build
 # Native half of the #1328 gate: the planted per-path drop is a plain
 # `__perceus_drop` in the AST, so the KIR lowering must release the same
 # refs and keep the same output — leak flat on the native backend too.
-test-perceus-1328-selftail-borrowed-local-native: $(TARGET) build
+test-perceus-1328-selftail-borrowed-local-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in selftail_borrowed_local_1328 tail_read_borrowed_local_1328 selftail_consuming_multiuse_1328 selftail_arm_binder_move_1328 rethread_param_consuming_read_1328; do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-n 2> build/s2-$$name-n.err \
@@ -8800,7 +8797,7 @@ test-heap-limit: $(TARGET) build
 # Native-gated: only meaningful where libLLVM is linked (tier1-native); a
 # C-only kaic2 cannot run --backend=native, so the target is invoked from the
 # tier1-native workflow, not the C-backend tier1 suite.
-test-perceus-860-native-cons-leak: $(TARGET) build
+test-perceus-860-native-cons-leak: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/native_cons_selftail_leak_860.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-860ncl 2> build/s2-860ncl.err \
@@ -8826,7 +8823,7 @@ test-perceus-860-native-cons-leak: $(TARGET) build
 # `pat_alias_binders`. The gate builds NATIVE under ASAN + no-cell-pool so the
 # double free trips the redzone, then checks output parity; without the dup the
 # binary aborts on the UAF. Native-gated (tier1-native).
-test-perceus-747-native-real-slot-uaf: $(TARGET) build
+test-perceus-747-native-real-slot-uaf: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/native_variant_real_slot_uaf_747.kai; \
 	exp=../examples/perceus/native_variant_real_slot_uaf_747.out.expected; \
@@ -8859,7 +8856,7 @@ test-perceus-747-native-real-slot-uaf: $(TARGET) build
 # We assert free_total >= alloc_total - 10 (it is alloc-3); a regression that
 # drops the record decref makes free_total ~2 while alloc_total ~6000.
 # Native-gated (tier1-native): a C-only kaic2 cannot run --backend=native.
-test-perceus-1048-native-record-leak: $(TARGET) build
+test-perceus-1048-native-record-leak: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/native_record_scope_leak_1048.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1048nrl 2> build/s2-1048nrl.err \
@@ -8886,7 +8883,7 @@ test-perceus-1048-native-record-leak: $(TARGET) build
 # `free_total` must track `alloc_total` (near-total reclaim). A regression that
 # drops the discard decref leaves `free_total` near zero and `leaked` linear.
 # Native-gated (tier1-native): a C-only kaic2 cannot run --backend=native.
-test-perceus-1112-native-discard-decref: $(TARGET) build
+test-perceus-1112-native-discard-decref: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/native_discard_decref_1112.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1112ndd 2> build/s2-1112ndd.err \
@@ -8912,7 +8909,7 @@ test-perceus-1112-native-discard-decref: $(TARGET) build
 # is 4 fixed); a regression that drops one node per recursion level blows past
 # this within a few passes. Native-gated (tier1-native): a C-only kaic2 cannot
 # run --backend=native, so the target is invoked from the tier1-native workflow.
-test-perceus-872-native-variant-reuse-leak: $(TARGET) build
+test-perceus-872-native-variant-reuse-leak: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/native_variant_reuse_leak_872.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-872vrl 2> build/s2-872vrl.err \
@@ -8934,7 +8931,7 @@ test-perceus-872-native-variant-reuse-leak: $(TARGET) build
 # total is O(N) (~1k), without it every level allocates (~1M+). Assert
 # alloc_total < 100000 (100x headroom over the reused figure, 10x below the
 # regressed one) plus golden output. Native-gated (tier1-native), like #872.
-test-perceus-1053-native-trmc-spine-reuse: $(TARGET) build
+test-perceus-1053-native-trmc-spine-reuse: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/trmc_variant_spine_reuse_1053.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1053sr 2> build/s2-1053sr.err \
@@ -8954,7 +8951,7 @@ test-perceus-1053-native-trmc-spine-reuse: $(TARGET) build
 # unique shells (outer overwrite + inner token), so alloc_total stays near
 # one alloc per insert — a fresh-allocating rotation path triples it.
 # Golden output + alloc ceiling, native backend.
-test-perceus-1053-nested-rotation-reuse: $(TARGET) build
+test-perceus-1053-nested-rotation-reuse: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/nested_rotation_reuse_1053.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1053nr 2> build/s2-1053nr.err \
@@ -9005,7 +9002,7 @@ test-perceus-1104-balance-token-donation: $(TARGET) build
 # donor ABI). Same fixture, same gates: alloc_total < 150000 over 100k
 # sequential inserts (native baseline without donation ≈ 815K) AND no
 # reuse_freed line (every captured token is consumed, in-arm or donated).
-test-perceus-1164-cross-call-donation: $(TARGET) build
+test-perceus-1164-cross-call-donation: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/balance_token_donation_1104.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1164ccd 2> build/s2-1164ccd.err \
@@ -9073,7 +9070,7 @@ test-perceus-1136-sized-variant: $(TARGET) build
 	done; \
 	echo "perceus-1136-sized-variant OK (static-kind tests + raw rebuild + poly frontier, C oracle)"
 
-test-perceus-1136-sized-variant-native: $(TARGET) build
+test-perceus-1136-sized-variant-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in variant_static_match_1136 variant_raw_rebuild_1136 variant_poly_frontier_1136; do \
 	  src=../examples/perceus/$$name.kai; \
@@ -9109,7 +9106,7 @@ test-perceus-1180-range-lazy: $(TARGET) build
 	  || { echo "perceus-1180-range-lazy FAIL (zero-step trap message missing)"; cat build/s2-1180-step0.err; exit 1; }; \
 	echo "perceus-1180-range-lazy OK (range value correct through every consumer; zero step traps)"
 
-test-perceus-1180-range-lazy-native: $(TARGET) build
+test-perceus-1180-range-lazy-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=range_lazy_1180; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-nat 2> build/s2-$$name-nat.err \
@@ -9153,7 +9150,7 @@ test-perceus-1180-range-sum: $(TARGET) build
 	  && echo "perceus-1180-range-sum OK (alloc_total=$$tot < 100; sum fused, reduce lazy, nothing materialised)" \
 	  || { echo "perceus-1180-range-sum FAIL (alloc_total=$$tot — range materialised)"; exit 1; }
 
-test-perceus-1180-range-sum-native: $(TARGET) build
+test-perceus-1180-range-sum-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=range_lazy_sum_1180; \
 	KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/s2-$$name-nat 2> build/s2-$$name-nat.err \
@@ -9231,7 +9228,7 @@ test-perceus-1156-raw-widen: $(TARGET) build
 	  || { echo "perceus-1156-raw-widen FAIL ($$name output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1156-$$name.out; exit 1; }; \
 	echo "perceus-1156-raw-widen OK (widened-register raw/boxed arm collision, C oracle)"
 
-test-perceus-1156-raw-widen-native: $(TARGET) build
+test-perceus-1156-raw-widen-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=variant_raw_widen_1156; \
 	src=../examples/perceus/$$name.kai; \
@@ -9260,7 +9257,7 @@ test-perceus-1157-full-mask: $(TARGET) build
 	  || { echo "perceus-1157-full-mask FAIL ($$name output diff)"; diff ../examples/perceus/$$name.out.expected build/s2-1157-$$name.out; exit 1; }; \
 	echo "perceus-1157-full-mask OK (full slot-mask layout, C oracle)"
 
-test-perceus-1157-full-mask-native: $(TARGET) build
+test-perceus-1157-full-mask-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=variant_full_mask_1157; \
 	src=../examples/perceus/$$name.kai; \
@@ -9301,7 +9298,7 @@ test-perceus-1160-de-opaque: $(TARGET) build
 	  echo "perceus-1160-de-opaque OK ($$name, C oracle)"; \
 	done
 
-test-perceus-1160-de-opaque-native: $(TARGET) build
+test-perceus-1160-de-opaque-native: $(TARGET) bin-kai build
 	@set -e; \
 	for name in $(DE_OPAQUE_1160_FIXTURES); do \
 	  src=../examples/perceus/$$name.kai; \
@@ -9316,7 +9313,7 @@ test-perceus-1160-de-opaque-native: $(TARGET) build
 # Issue #1158 — the KIR inliner must not corrupt the TRMC spine of a
 # caller it pastes into: the leaf helper inlines ahead of the modulo-cons
 # step, and the 1M build still runs O(1)-stack with the right checksum.
-test-kir-inline-trmc-1158: $(TARGET) build
+test-kir-inline-trmc-1158: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/kir_inline_trmc_tail_1158.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1158trmc 2> build/s2-1158trmc.err \
@@ -9335,7 +9332,7 @@ test-kir-inline-trmc-1158: $(TARGET) build
 # Issue #1158 — the while/until fusion chain: combinator + lambdas paste
 # into main, the var cells stop escaping, and the canonical State
 # handlers rewrite to registers. The KIR must show slots, not dispatch.
-test-kir-while-slot-1158: $(TARGET) build
+test-kir-while-slot-1158: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/kir_while_slot_1158.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1158wslot 2> build/s2-1158wslot.err \
@@ -9355,7 +9352,7 @@ test-kir-while-slot-1158: $(TARGET) build
 # Issue #1173 — a while whose predicate captures a NON-alias register
 # (the loop bound is a fn param). The dead-closure sweep must clear
 # the fused predicate closure so the var cells still rewrite to slots.
-test-kir-while-param-slot-1173: $(TARGET) build
+test-kir-while-param-slot-1173: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/kir_while_param_slot_1173.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1173wpslot 2> build/s2-1173wpslot.err \
@@ -9375,7 +9372,7 @@ test-kir-while-param-slot-1173: $(TARGET) build
 # Issue #1173 negative — a var whose closure SURVIVES the inliner (it
 # is stored in a list and called through a pattern binding) must keep
 # its dispatched State handler; a slot there would be stale memory.
-test-kir-var-escape-state-1173: $(TARGET) build
+test-kir-var-escape-state-1173: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/var_escapes_stays_state_1173.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1173vesc 2> build/s2-1173vesc.err \
@@ -9393,7 +9390,7 @@ test-kir-var-escape-state-1173: $(TARGET) build
 # comparison lowers a raw i1 condbr (no bool.box, no truthy) and the
 # value-discarded body carries no dead unit ops. Both backends must
 # print the same output.
-test-kir-while-raw-cond-1414: $(TARGET) build
+test-kir-while-raw-cond-1414: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/kir_while_raw_cond_1414.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1414raw 2> build/s2-1414raw.err \
@@ -9425,7 +9422,7 @@ test-kir-while-raw-cond-1414: $(TARGET) build
 # Issue #1414 negative — a predicate comparing against a record field is
 # not raw-marked and must KEEP the boxed condition (the raw shortcut
 # fires only when the comparison is proven raw).
-test-kir-while-boxed-cond-1414: $(TARGET) build
+test-kir-while-boxed-cond-1414: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/kir_while_boxed_cond_1414.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-1414box 2> build/s2-1414box.err \
@@ -9442,7 +9439,7 @@ test-kir-while-boxed-cond-1414: $(TARGET) build
 	  || true; \
 	echo "kir-while-boxed-cond-1414 OK (field-read pred keeps the boxed condbr path)"
 
-test-perceus-882-native-rotation-reuse-crash: $(TARGET) build
+test-perceus-882-native-rotation-reuse-crash: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/gap3_balance_minimal.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-882rot 2> build/s2-882rot.err \
@@ -9465,7 +9462,7 @@ test-perceus-882-native-rotation-reuse-crash: $(TARGET) build
 # miss a regression that corrupts BOTH backends identically; this gate anchors
 # the ABSOLUTE correct output (orig=3) on native against the golden. Both the
 # binary tree and the linear list shapes are exercised in one fixture.
-test-perceus-995-native-shared-reuse-corruption: $(TARGET) build
+test-perceus-995-native-shared-reuse-corruption: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/native_shared_reuse_corruption_995.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-995corr 2> build/s2-995corr.err \
@@ -9481,7 +9478,7 @@ test-perceus-995-native-shared-reuse-corruption: $(TARGET) build
 # the native binary reports a non-zero `reuse_in_place` under KAI_TRACE_RC. A
 # regression that fresh-allocated everywhere (the over-conservative fix) shows
 # reuse_in_place=0 and fails here.
-test-perceus-995-native-dead-donor-reuse: $(TARGET) build
+test-perceus-995-native-dead-donor-reuse: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/native_dead_donor_reuse_995.kai; \
 	KAI_BACKEND=native ../bin/kai build $$src -o build/s2-995dead 2> build/s2-995dead.err \
@@ -9504,7 +9501,7 @@ test-perceus-995-native-dead-donor-reuse: $(TARGET) build
 # against the golden (the original tree must come back un-mutated), then
 # asserts the RECOGNITION ratchet on the emitted C: the projection walk
 # gets fresh allocators, no reuse call.
-test-perceus-1069-projection-reuse: $(TARGET) build
+test-perceus-1069-projection-reuse: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/reuse_projection_scrutinee_1069.kai; \
 	exp=../examples/perceus/reuse_projection_scrutinee_1069.out.expected; \
@@ -9536,7 +9533,7 @@ test-perceus-1069-projection-reuse: $(TARGET) build
 # ceiling separates the two by a wide margin on both backends. The
 # golden also proves a shared subtree survives its parent's teardown
 # (a walk that wrongly consumed a shared child corrupts `size(s)`).
-test-perceus-1083-variant-spine-free: $(TARGET) build
+test-perceus-1083-variant-spine-free: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/variant_spine_free_1083.kai; \
 	exp=../examples/perceus/variant_spine_free_1083.out.expected; \
@@ -9580,7 +9577,7 @@ test-native-1083-inline-gate: $(TARGET)
 # golden, (2) native output == C output, and (3) native alloc_total does NOT
 # exceed the C oracle's under KAI_TRACE_RC — the direct borrow keeps the same
 # RC balance the mask read had (both are #747 borrows, no incref).
-test-native-1083-field-read: $(TARGET) build
+test-native-1083-field-read: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/native_field_read.kai; \
 	exp=../examples/perceus/native_field_read.out.expected; \
@@ -9609,7 +9606,7 @@ test-native-1083-field-read: $(TARGET) build
 # in hot match-arms of a binary tree. Native output must be BYTE-IDENTICAL to
 # the C oracle and RC must stay balanced (the inline read adds no alloc vs C).
 # Native-gated: a C-only kaic2 cannot run --backend=native.
-test-native-static-slot-read: $(TARGET) build
+test-native-static-slot-read: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/native_static_slot_read.kai; \
 	exp=../examples/perceus/native_static_slot_read.out.expected; \
@@ -9642,7 +9639,7 @@ test-native-static-slot-read: $(TARGET) build
 # user fns `@heavy`/`@noisy` — which the native-modular default splits across
 # partition modules (the dumped module then carries them only as `declare`).
 # Pin the whole-program path so the dump is the single module that DEFINES them.
-test-native-purity-attrs: $(TARGET) build
+test-native-purity-attrs: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/purity_licm.kai; \
 	exp=../examples/perceus/purity_licm.out.expected; \
@@ -9670,7 +9667,7 @@ test-native-purity-attrs: $(TARGET) build
 # handed a raw i64 to a tagged dispatch (self-compile SIGSEGV). The single
 # backend-aware rawness verdict keeps the binder's mode and KSlot in lockstep,
 # so native and C agree bit-for-bit.
-test-native-1110-reuse-int-slot: $(TARGET) build
+test-native-1110-reuse-int-slot: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/native_reuse_int_slot_rebuild_1110.kai; \
 	exp=../examples/perceus/native_reuse_int_slot_rebuild_1110.out.expected; \
@@ -9693,7 +9690,7 @@ test-native-1110-reuse-int-slot: $(TARGET) build
 # `MUnboxed` read desynced KSlot from the register. The position-keyed side
 # table keeps the unbox seed's verdict and the KSlot in lockstep, so native and
 # C agree bit-for-bit (the bind_slot_kslot-rescan class, refs #1229).
-test-native-1229-arm-int-binder: $(TARGET) build
+test-native-1229-arm-int-binder: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/native_arm_int_binder_walker_1229.kai; \
 	exp=../examples/perceus/native_arm_int_binder_walker_1229.out.expected; \
@@ -9717,7 +9714,7 @@ test-native-1229-arm-int-binder: $(TARGET) build
 # reuse fork read the stale `mscr`, so the exit drop freed the wrong register
 # (a raw i64 from the nested arm dropped as a pointer). Restoring `mscr` per
 # group keeps each arm's exit drop on its own scrutinee; native == C bit-for-bit.
-test-native-1229-writeside: $(TARGET) build
+test-native-1229-writeside: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/native_reuse_mscr_stale_1229.kai; \
 	exp=../examples/perceus/native_reuse_mscr_stale_1229.out.expected; \
@@ -9740,14 +9737,14 @@ test-native-1229-writeside: $(TARGET) build
 # the default. The script SKIPs (exit 0) on a cc-only kaic2 (DWARF is
 # native-only), so this is safe in the C-only tier1 and meaningful in the
 # native (KAI_LLVM=1) build.
-test-build-modes: $(TARGET) build
+test-build-modes: $(TARGET) bin-kai build
 	@../examples/build-modes/check.sh ../bin/kai build/build-modes-work
 
 # Native codegen quality. Pins the spill ratio in the rb-tree descent's hot
 # loop, the one signal that catches a register-allocation regression: such a
 # change keeps the program correct, the self-host byte-identical and
 # test-build-modes green, so nothing else fails. SKIPs on a cc-only kaic2.
-test-native-cgen-quality: $(TARGET) build
+test-native-cgen-quality: $(TARGET) bin-kai build
 	@../tools/native-cgen-quality-gate.sh ../bin/kai build/native-cgen-quality-work
 
 # Issue #950 — the native backend runs `test` blocks. `kai test` on the
@@ -9756,7 +9753,7 @@ test-native-cgen-quality: $(TARGET) build
 # failure), and the native runner must balance RC on both the pass and
 # the caught-fail path. Both backends are diffed against the golden, and
 # native's KAI_TRACE_RC report must show no leak.
-test-native-test-runner-950: $(TARGET) build
+test-native-test-runner-950: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/native/test_runner_parity.kai; \
 	gold=../examples/native/test_runner_parity.out.expected; \
@@ -9786,7 +9783,7 @@ test-native-test-runner-950: $(TARGET) build
 # C oracle — a pass, a failure at a nonzero iteration, String params read by
 # decref-aware consumers, and multi-param shrinking — and native's
 # KAI_TRACE_RC report must match C's leak count.
-test-native-check-runner: $(TARGET) build
+test-native-check-runner: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/native/check_runner_parity.kai; \
 	gold=../examples/native/check_runner_parity.out.expected; \
@@ -9878,7 +9875,7 @@ test-issue-678-stdout-buffered: $(TARGET) build
 # Two assertions per backend: an Int main exits with that value AND its
 # buffered stdout still lands (returning the status keeps libc's full
 # exit path, unlike os.process.exit's _exit(2)); a Unit main exits 0.
-test-issue-1588-main-exit-status: $(TARGET) build
+test-issue-1588-main-exit-status: $(TARGET) bin-kai build
 	@set -e; \
 	../bin/kai build --backend=c ../examples/runtime/issue_1588_main_exit_status.kai -o build/iss1588-c 2> build/iss1588-c.err \
 	  || { echo "issue-1588 BUILD FAIL (C backend)"; cat build/iss1588-c.err; exit 1; }; \
@@ -9895,7 +9892,7 @@ test-issue-1588-main-exit-status: $(TARGET) build
 	echo "issue-1588 OK (C backend: Int main exits 3 with stdout flushed, Unit main exits 0)"
 
 ifeq ($(KAI_LLVM),1)
-test-issue-1588-main-exit-status-native: $(TARGET) build
+test-issue-1588-main-exit-status-native: $(TARGET) bin-kai build
 	@set -e; \
 	KAI_BACKEND=native ../bin/kai build ../examples/runtime/issue_1588_main_exit_status.kai -o build/iss1588-nat 2> build/iss1588-nat.err \
 	  || { echo "issue-1588 BUILD FAIL (native)"; cat build/iss1588-nat.err; exit 1; }; \
@@ -9920,7 +9917,7 @@ endif
 # half a harness can gate). The true half runs under a pseudo-TTY via
 # util-linux `script -c` where available (Linux CI); BSD script has a
 # different CLI and is exercised manually.
-test-issue-1590-isatty: $(TARGET) build
+test-issue-1590-isatty: $(TARGET) bin-kai build
 	@set -e; \
 	../bin/kai build --backend=c ../examples/effects/isatty_pipe_false.kai -o build/iss1590-c 2> build/iss1590-c.err \
 	  || { echo "issue-1590 BUILD FAIL (C backend)"; cat build/iss1590-c.err; exit 1; }; \
@@ -9939,7 +9936,7 @@ test-issue-1590-isatty: $(TARGET) build
 	fi
 
 ifeq ($(KAI_LLVM),1)
-test-issue-1590-isatty-native: $(TARGET) build
+test-issue-1590-isatty-native: $(TARGET) bin-kai build
 	@set -e; \
 	KAI_BACKEND=native ../bin/kai build ../examples/effects/isatty_pipe_false.kai -o build/iss1590-nat 2> build/iss1590-nat.err \
 	  || { echo "issue-1590 BUILD FAIL (native)"; cat build/iss1590-nat.err; exit 1; }; \
@@ -10100,7 +10097,7 @@ test-issue-1970-nursery-reraise-handler: $(TARGET) build
 	echo "issue-1970 OK (nursery re-raise walks the handler stack; direct raise and remote cancel unchanged)"
 
 ifeq ($(KAI_LLVM),1)
-test-issue-1970-nursery-reraise-handler-native: $(TARGET) build
+test-issue-1970-nursery-reraise-handler-native: $(TARGET) bin-kai build
 	@set -e; \
 	for f in $(ISSUE_1970_FIXTURES); do \
 	  KAI_BACKEND=native ../bin/kai build ../examples/effects/$$f.kai \
@@ -10135,11 +10132,11 @@ define issue_2022_run
 	echo "issue-2022 OK ($(1): test bodies perform builtin effects)"
 endef
 
-test-issue-2022-test-body-builtin-effects: $(TARGET) build
+test-issue-2022-test-body-builtin-effects: $(TARGET) bin-kai build
 	$(call issue_2022_run,c)
 
 ifeq ($(KAI_LLVM),1)
-test-issue-2022-test-body-builtin-effects-native: $(TARGET) build
+test-issue-2022-test-body-builtin-effects-native: $(TARGET) bin-kai build
 	$(call issue_2022_run,native)
 else
 test-issue-2022-test-body-builtin-effects-native:
@@ -10163,11 +10160,11 @@ define orphan_send_run
 	echo "orphan-send OK ($(1): a send to an ended mailbox does not truncate the suite)"
 endef
 
-test-actor-orphan-send-suite: $(TARGET) build
+test-actor-orphan-send-suite: $(TARGET) bin-kai build
 	$(call orphan_send_run,c)
 
 ifeq ($(KAI_LLVM),1)
-test-actor-orphan-send-suite-native: $(TARGET) build
+test-actor-orphan-send-suite-native: $(TARGET) bin-kai build
 	$(call orphan_send_run,native)
 else
 test-actor-orphan-send-suite-native:
@@ -10191,11 +10188,11 @@ define issue_2062_run
 	echo "issue-2062 OK ($(1): a builtin rides the map pipe)"
 endef
 
-test-issue-2062-core-builtin-pipe: $(TARGET) build
+test-issue-2062-core-builtin-pipe: $(TARGET) bin-kai build
 	$(call issue_2062_run,c)
 
 ifeq ($(KAI_LLVM),1)
-test-issue-2062-core-builtin-pipe-native: $(TARGET) build
+test-issue-2062-core-builtin-pipe-native: $(TARGET) bin-kai build
 	$(call issue_2062_run,native)
 else
 test-issue-2062-core-builtin-pipe-native:
@@ -10292,7 +10289,7 @@ test-issue-1565-handler-alias-shadow: $(TARGET) build
 	echo "issue-1565 OK (shadowing diagnostic named)"
 
 ifeq ($(KAI_LLVM),1)
-test-issue-1565-handler-alias-shadow-native: $(TARGET) build
+test-issue-1565-handler-alias-shadow-native: $(TARGET) bin-kai build
 	@set -e; \
 	KAI_BACKEND=native ../bin/kai build ../examples/effects/issue_1565_handler_alias_shadow.kai \
 	  -o build/iss1565-nat 2> build/iss1565-nat.err \
@@ -10892,7 +10889,7 @@ test-perceus-nested-reuse-asan: $(TARGET) build
 # runtime compiles from source with ASAN + KAI_NO_CELL_POOL; both .bc
 # runtimes are hidden — they are uninstrumented, and the inline bitcode
 # would splice uninstrumented hot paths past the sanitizer.
-test-perceus-nested-reuse-asan-native: $(TARGET) build
+test-perceus-nested-reuse-asan-native: $(TARGET) bin-kai build
 	@mv ../stage0/runtime_llvm.bc ../stage0/runtime_llvm.bc.hidnr 2>/dev/null || true; \
 	mv ../stage0/runtime_inline.bc ../stage0/runtime_inline.bc.hidnr 2>/dev/null || true; \
 	st=0; \
@@ -11542,7 +11539,7 @@ test-shadowing: $(TARGET) build
 ifeq ($(KAI_LLVM),1)
 # The native lowering takes a lambda's captures from the same collector
 # as the C emitter, so a missed shadow reads the global on both backends.
-test-shadowing-arm-lambda-native: $(TARGET) build
+test-shadowing-arm-lambda-native: $(TARGET) bin-kai build
 	@set -e; \
 	name=match_arm_binder_captured_by_lambda; \
 	KAI_BACKEND=native ../bin/kai build ../examples/shadowing/$$name.kai -o build/shadowing-$$name-native 2> build/shadowing-$$name-native.err \
@@ -11746,7 +11743,7 @@ test-home-tu-partition: $(TARGET) build
 # Hermetic: build-local cache dir, fixture copied so the edit never
 # dirties the tree, KAI_MODULAR_JOBS capped so the light fan-out doesn't
 # oversubscribe.
-test-modular-cache: $(TARGET) build
+test-modular-cache: $(TARGET) bin-kai build
 	@set -e; \
 	KAI=../bin/kai; \
 	cache=build/modular-cache.d; rm -rf $$cache; \
@@ -11878,7 +11875,7 @@ CMODULAR_SELFHOST_CACHE := $(CURDIR)/build/cmodular-selfhost-cache
 # gate proves the modular link, not the typed-blob cache — publishing typed
 # blobs for every compiler module roughly doubles the build for nothing
 # the gate asserts.
-test-modular-selfhost: $(TARGET) build
+test-modular-selfhost: $(TARGET) bin-kai build
 	@set -e; \
 	out=$$(pwd)/build/modular-selfhost.bin; \
 	rm -f $$out; \
@@ -12125,7 +12122,7 @@ test-issue-1682-user-symbol-namespace: $(TARGET) build
 	  || { echo "issue-1682 DIFF (C)"; diff ../examples/effects/issue_1682_user_symbol_namespace.out.expected build/iss1682.out; exit 1; }
 
 ifeq ($(KAI_LLVM),1)
-test-issue-1682-user-symbol-namespace-native: $(TARGET) build
+test-issue-1682-user-symbol-namespace-native: $(TARGET) bin-kai build
 	@set -e; \
 	KAI_BACKEND=native ../bin/kai build ../examples/effects/issue_1682_user_symbol_namespace.kai -o build/iss1682-nat 2> build/iss1682-nat.err \
 	  || { echo "issue-1682 BUILD FAIL (native)"; cat build/iss1682-nat.err; exit 1; }; \
