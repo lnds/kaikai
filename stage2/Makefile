@@ -2720,8 +2720,9 @@ test-trap-exit-cancel-asan: $(TARGET) build
 # sweep over the stdio-pipe plumbing: pipe()/dup2 fd wiring, the
 # pid-keyed pipe table (malloc'd entries freed at wait), the separate
 # stderr pipe, the chunked read buffer, the EPIPE dead-reader write
-# path, and the read-readiness park of a reader whose child stays silent.
-PROCESS_BASIC_FIXTURES := process_basic process_piped_capture process_piped_pager process_piped_epipe process_piped_big process_read_stdout_timers process_piped_stderr
+# path, and the readiness parks of a reader whose child stays silent and
+# of a writer whose child stops reading.
+PROCESS_BASIC_FIXTURES := process_basic process_piped_capture process_piped_pager process_piped_epipe process_piped_big process_read_stdout_timers process_piped_stderr process_write_stdin_timers
 
 test-process-basic-asan: $(TARGET) build
 	@set -e; \

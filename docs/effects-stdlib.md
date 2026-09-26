@@ -1094,7 +1094,8 @@ effect Process {
   so other fibers and their timers keep running while a child stays
   silent. Draining one pipe to EOF while the child fills the other
   deadlocks; drain each from its own fiber when output is large. `write_stdin`
-  still blocks the OS thread while the pipe is full.
+  on a full pipe parks the fiber until the pipe accepts more, so a child
+  that stops reading its stdin blocks only the writing fiber.
 - `wait` blocks until the child exits and returns its exit
   status. The fiber suspends via the scheduler's reactor
   (`pidfd_open` on Linux; SIGCHLD-driven on macOS / *BSD).
@@ -1152,8 +1153,9 @@ Runtime-installed around `main` when `Process` is in the row.
   Parent-side ends are `FD_CLOEXEC` so a sibling fork cannot hold a
   stray write end open and starve a reader of EOF. SIGPIPE on
   `write_stdin` is suppressed per fd where the OS allows
-  (`F_SETNOSIGPIPE`) and per write elsewhere (mask + drain), so a
-  dead reader is an `Err`, not a process kill.
+  (`F_SETNOSIGPIPE`) and per `write(2)` call elsewhere (mask + drain,
+  never held across a park, since the fiber may resume on another OS
+  thread), so a dead reader is an `Err`, not a process kill.
 - `wait` blocks via the scheduler's reactor: on Linux, register
   the child's `pidfd` with epoll and yield; on macOS / *BSD, a
   SIGCHLD handler wakes the awaiting fiber. Cancellation
