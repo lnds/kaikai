@@ -5466,31 +5466,20 @@ static inline KaiValue *kai_enum_slot_box(int64_t tag) {
     return kai_unit();
 }
 
-/* Issue #293 next-tier — variants whose every arg is itself an
- * immortal singleton (rc==INT32_MAX) are themselves morally
- * immortal: they can never be mutated and have no observable
- * identity. Cache them just like nullary variants. The dominant
- * win is `Some(<immortal>)` and `Ok(<immortal>)`, which the
- * compiler builds by the millions when threading typer/parser
- * results that are themselves nullary variants or cached scalars.
+/* Variants whose every arg is an immortal program-bounded atom are
+ * themselves immortal: they are never mutated and have no observable
+ * identity, so one interned cell serves every construction. The win is
+ * `Some(<nullary>)` / `Ok(<nullary>)`-shaped payloads.
  *
- * Storage — open-addressed table keyed on (tag, name, n, args[0..n]).
- * Capped at n <= 4 to bound the key size. Once the table fills,
- * subsequent lookups walk every bucket without finding the empty
- * sentinel, so installs silently fail and every later invocation
- * falls back to a fresh alloc. The 16384-bucket sizing originally
- * landed for #293 turned out to be ~16x too small for kaic2's
- * self-compile: the typer's `core_table` rebuilds 47 EP variants
- * per call × ~13K calls (issue #297 EP wave, 2026-05-07), and
- * Some/Ok/TyCon-shaped immortal-payload combinations push the
- * working set past 16K well before the core entries land. The
- * larger 262144-bucket sizing absorbs the EP table outright (642K
- * leaks → 45 cached chunks, 99.99% drop) and adds ~16 MB of static
- * .bss to the binary. Collisions still degrade to a fresh non-cached
- * alloc — same behaviour as a full nullary table.
- */
+ * Storage — open-addressed table keyed on (tag, name, n, args[0..n]),
+ * n <= 4. Nested interned variants compound (`Q(Px(..), Px(..))`), so
+ * the number of identities is unbounded and the table can saturate.
+ * Every probe is therefore capped at KAI_IMMORTAL_VAR_PROBE buckets: a
+ * miss costs at most that many, and a key whose window is full is built
+ * as an ordinary cell instead of interned. */
 #define KAI_IMMORTAL_VAR_BUCKETS 262144
 #define KAI_IMMORTAL_VAR_MAXN 4
+#define KAI_IMMORTAL_VAR_PROBE 16
 typedef struct {
     int32_t       tag;
     int           n;
@@ -5574,30 +5563,26 @@ static inline int kai_tag_is_reusable(int32_t tag) {
  * clear) vs primitive (bit set); convention matches stage 2's
  * `variant_slot_mask` emitter. */
 
+/* Only atoms the program text bounds (nullary ctors, interned variants,
+ * literals, unit/bool/nil) may key the intern table. Data scalars (tagged
+ * Int, cached Char and Byte, …) never free either, but `Px(r, g, b, a)`
+ * over data has values^n identities, and interning them saturates the
+ * table. An allowlist, so a scalar that later gains a cache stays out. */
+static inline int kai_slot_internable(KaiValue *p) {
+    if (kai_is_value(p) || p == NULL || p->rc != INT32_MAX) return 0;
+    switch (p->tag) {
+        case KAI_UNIT: case KAI_BOOL: case KAI_NIL:
+        case KAI_STR: case KAI_VARIANT:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 static int kai_slots_all_immortal_ptr(int n, KaiVarSlot *slots) {
     if (n <= 0 || n > KAI_IMMORTAL_VAR_MAXN) return 0;
     for (int i = 0; i < n; i++) {
-        /* An immediate value (tagged Int) has no header and is never
-         * freed — it counts as immortal. A heap value is immortal only
-         * when its rc is saturated. */
-        /* A tagged-Int immediate slot DISQUALIFIES the variant from the
-         * immortal cache. The cache is for variants of BOUNDED cardinality
-         * (nullary ctors, all-immortal-pointer cells like `TLeaf` or
-         * interned-string payloads): caching them wins because a small fixed
-         * set is reused. A tagged Int has no header so it never frees — but a
-         * variant CONTAINING a *variable* tagged Int (`Lit(i)` for arbitrary
-         * `i`) has UNBOUNDED distinct identities. Immortalising it interns one
-         * cache entry per distinct `i`, saturating the fixed open-addressing
-         * table and degrading its linear probe to O(n) — the `variant_match`
-         * super-linear collapse (issue #855). The C backend never hits this:
-         * it builds such cells via `kai_variant_u_fast` with a TYPED `.i64`
-         * slot, bypassing the mask==0 cache path entirely. Excluding tagged-Int
-         * slots here brings the native (all-boxed) path to parity. */
-        if (kai_is_value(slots[i].ptr)) return 0;
-        if (slots[i].ptr == NULL || slots[i].ptr->rc != INT32_MAX) return 0;
-        /* Same for Byte: every Byte is immortal, but `Px(r, g, b, a)` over
-         * data bytes has 256^n identities. */
-        if (slots[i].ptr->tag == KAI_BYTE) return 0;
+        if (!kai_slot_internable(slots[i].ptr)) return 0;
     }
     return 1;
 }
@@ -5626,7 +5611,7 @@ static int kai_immortal_slot_match(KaiImmortalVarBucket *b, int32_t tag,
 static KaiValue *kai_immortal_slot_lookup(int32_t tag, const char *name,
                                           int n, KaiVarSlot *slots) {
     size_t i = kai_immortal_slot_hash(tag, name, n, slots);
-    for (size_t probe = 0; probe < KAI_IMMORTAL_VAR_BUCKETS; probe++) {
+    for (size_t probe = 0; probe < KAI_IMMORTAL_VAR_PROBE; probe++) {
         KaiImmortalVarBucket *b = &kai_immortal_vars[i];
         if (b->name == NULL) return NULL;
         if (kai_immortal_slot_match(b, tag, name, n, slots)) return b->value;
@@ -5635,10 +5620,10 @@ static KaiValue *kai_immortal_slot_lookup(int32_t tag, const char *name,
     return NULL;
 }
 
-static void kai_immortal_slot_install(int32_t tag, const char *name, int n,
-                                      KaiVarSlot *slots, KaiValue *v) {
+static int kai_immortal_slot_install(int32_t tag, const char *name, int n,
+                                     KaiVarSlot *slots, KaiValue *v) {
     size_t i = kai_immortal_slot_hash(tag, name, n, slots);
-    for (size_t probe = 0; probe < KAI_IMMORTAL_VAR_BUCKETS; probe++) {
+    for (size_t probe = 0; probe < KAI_IMMORTAL_VAR_PROBE; probe++) {
         KaiImmortalVarBucket *b = &kai_immortal_vars[i];
         if (b->name == NULL) {
             b->tag = tag;
@@ -5646,11 +5631,11 @@ static void kai_immortal_slot_install(int32_t tag, const char *name, int n,
             b->n = n;
             for (int j = 0; j < n; j++) b->args[j] = slots[j].ptr;
             b->value = v;
-            return;
+            return 1;
         }
         i = (i + 1) & (KAI_IMMORTAL_VAR_BUCKETS - 1);
     }
-    /* Table full — fall back to non-cached behaviour. */
+    return 0;
 }
 
 static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
@@ -5697,8 +5682,10 @@ static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
         v->var_n_args = n;
         kai_slotmask_register(v->variant_tag, 0);
         for (int i = 0; i < n; ++i) kai_var_slots(v)[i] = slots[i];
+        /* Immortal only once the table holds it: an uninstalled cell with a
+         * saturated rc would never be freed. */
         v->rc = INT32_MAX;
-        kai_immortal_slot_install(tag, name, n, slots, v);
+        if (!kai_immortal_slot_install(tag, name, n, slots, v)) v->rc = 1;
         return v;
     }
 
