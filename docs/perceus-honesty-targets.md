@@ -241,6 +241,10 @@ interpolation runs with a flat ledger. The first two were
 unbounded on spawn-heavy code: each pinned fiber wrapper keeps a 64 KiB stack
 mmap alive for the life of the process.
 
+Every Perceus decision reads one table of binder reads, keyed by binder
+identity (a function's repeated binder names are renamed apart first), so the
+rewriter and the payers can no longer disagree on how often a binder is read.
+
 The named architectural debt of early 2026 is **closed**:
 `perceus_pass` multi-read let dup (`pcs_rewrite_estr_span`),
 match-scrutinee real plug (stages 0/1/2), and `kai_field`/`pat_test`
@@ -254,13 +258,13 @@ CLOSED.
 
 Unlike the sources above, these surface in ordinary user programs:
 
-- #2142 — a block `let` inside a match arm, read once, leaks on every evaluation.
 - #2144 — a self-recursive function's early-return leaf leaks an arm binder
   the recursive paths read (a search that returns early leaks the rest of its list).
 - #2145 — a modulo-cons tail inside a nested `match` leaks the whole input list.
 - #2146 — an arm binder read only behind `and`/`or`, or in a nested guard,
   leaks when the read is skipped.
-- #2141 — a pattern binder inside a lambda body leaks its projected reference.
+- #2159 — an arm binder whose last read is a borrow, in an arm that ends in a
+  TRMC step or a self-tail-call, keeps its own reference past the step.
 - #2143 — native only: a nested arm binder homonymous with an outer one is
   released by the outer arm's exit drop (use-after-free under ASAN).
 

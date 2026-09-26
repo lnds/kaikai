@@ -1,0 +1,74 @@
+#[doc("""
+Raw `#{...}` interpolation spans, split and respelled.
+
+An interpolated string keeps its source text until emit, which re-parses
+each `#{...}` body. A pass that renames or wraps a read inside one edits
+the text: it splits the span into parts, re-parses a body, and rewrites
+the identifier tokens the parse placed at known positions. Positions in a
+re-parsed body count from the body's own start (line 1, col 1).
+""")]
+
+import compiler.ast
+import compiler.fnreg
+import compiler.infer
+import compiler.lex
+import compiler.util
+
+#[doc("Replace the identifier token at `(line, col)` of a `#{...}` body with the given text.")]
+pub type IdentEdit = IdentEdit(Int, Int, String)
+
+#[doc("The literal and `#{...}` parts of a string span, or `[]` when it interpolates nothing.")]
+pub fn isp_parts(span: String, is_triple: Bool) : [IPart] = {
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  if has_interp(span, body_start, body_end) {
+    iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
+  } else { [] }
+}
+
+#[doc("Reassemble a string span from its parts, quotes included.")]
+pub fn isp_rebuild(is_triple: Bool, parts: [IPart]) : String = {
+  let q = if is_triple { "\"\"\"" } else { "\"" }
+  concat_all([q, isp_concat(parts, ""), q])
+}
+
+# `"#{"` would lex as an unterminated interpolation: kaikai has no escape
+# for it inside a literal, so the opener is built from two pieces.
+fn isp_concat(parts: [IPart], acc: String) : String = match parts {
+  []           -> acc
+  [p, ...rest] -> match p {
+    IpLit(piece, _) -> isp_concat(rest, concat_all([acc, piece]))
+    IpExp(esrc)     -> isp_concat(rest, concat_all([acc, "#", "{", esrc, "}"]))
+  }
+}
+
+#[doc("Copy a `#{...}` body verbatim except the identifier tokens `edits` name.")]
+pub fn isp_render(esrc: String, edits: [IdentEdit]) : String = match edits {
+  []         -> esrc
+  [_, ...__] -> isp_render_toks(esrc, tokenize(esrc), edits, "", 0)
+}
+
+fn isp_render_toks(esrc: String, toks: [Token], edits: [IdentEdit], acc: String, prev: Int) : String =
+  match toks {
+    [] -> concat_all([acc, string_slice(esrc, prev, string_length(esrc) - prev)])
+    [t, ...rest] -> {
+      let text = match t.kind {
+        TkIdent -> isp_edit_at(edits, t.line, t.col)
+        _       -> None
+      }
+      let piece = match text {
+        Some(s) -> concat_all([string_slice(esrc, prev, t.start - prev), s])
+        None    -> string_slice(esrc, prev, t.start + t.length - prev)
+      }
+      match t.kind {
+        TkEof -> concat_all([acc, string_slice(esrc, prev, string_length(esrc) - prev)])
+        _     -> isp_render_toks(esrc, rest, edits, concat_all([acc, piece]), t.start + t.length)
+      }
+    }
+  }
+
+fn isp_edit_at(edits: [IdentEdit], line: Int, col: Int) : Option[String] = match edits {
+  []                          -> None
+  [IdentEdit(l, c, s), ...rest] -> if l == line and c == col { Some(s) } else { isp_edit_at(rest, line, col) }
+}

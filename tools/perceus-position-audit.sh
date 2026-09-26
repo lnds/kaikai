@@ -22,6 +22,7 @@ BASELINE=tools/perceus-position-baseline.txt
 FILES="stage2/compiler/perceus.kai stage2/compiler/perceus_tail_drop.kai \
 stage2/compiler/perceus_plant_drop.kai stage2/compiler/perceus_op_arg.kai \
 stage2/compiler/perceus_payer.kai stage2/compiler/perceus_let_own.kai \
+stage2/compiler/perceus_reads.kai stage2/compiler/perceus_branch_pay.kai \
 stage2/compiler/emit_tcrec_live.kai"
 
 observed=$(mktemp)

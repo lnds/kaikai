@@ -30,35 +30,27 @@ import compiler.perceus_plant_drop
 pub fn ptd_tail_exit_drops(e: Expr, self_name: String, uses: [Use],
                            move_last_set: [String], forced: [String],
                            self_bpos: [Int]) : Expr =
-  ptd_expr(e, self_name, uses, move_last_set, forced, self_bpos, [])
+  ptd_expr(e, self_name, uses, move_last_set, forced, self_bpos)
 
-# `scope` carries the binder names an enclosing block or lambda already owns.
-# A shadowed name is left alone: its reads cannot be attributed to this
-# block's binding, so a drop here could release a ref it does not own.
 fn ptd_expr(e: Expr, self_name: String, uses: [Use], mls: [String],
-            forced: [String], sbp: [Int], scope: [String]) : Expr =
-  Expr { kind: ptd_kind(e.kind, self_name, uses, mls, forced, sbp, scope),
+            forced: [String], sbp: [Int]) : Expr =
+  Expr { kind: ptd_kind(e.kind, self_name, uses, mls, forced, sbp),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn ptd_kind(k: ExprKind, self_name: String, uses: [Use], mls: [String],
-            forced: [String], sbp: [Int], scope: [String]) : ExprKind = match k {
-  EBlock(stmts, opt_tail) -> ptd_block(stmts, opt_tail, self_name, uses, mls, forced, sbp, scope)
-  ELambda(ps, b) -> {
-    let inner = list_append(scope, map(ps, (p) => p.pname))
-    ELambda(ps, ptd_expr(b, self_name, uses, mls, forced, sbp, inner))
-  }
-  _ -> prc_map_expr_kind(k, (x) => ptd_expr(x, self_name, uses, mls, forced, sbp, scope))
+            forced: [String], sbp: [Int]) : ExprKind = match k {
+  EBlock(stmts, opt_tail) -> ptd_block(stmts, opt_tail, self_name, uses, mls, forced, sbp)
+  _ -> prc_map_expr_kind(k, (x) => ptd_expr(x, self_name, uses, mls, forced, sbp))
 }
 
 fn ptd_block(stmts: [Stmt], opt_tail: Option[Expr], self_name: String,
-             uses: [Use], mls: [String], forced: [String], sbp: [Int], scope: [String]) : ExprKind {
-  let inner  = list_append(scope, ptd_let_binders(stmts, []))
-  let stmts1 = map(stmts, (s) => ptd_stmt(s, self_name, uses, mls, forced, sbp, inner))
+             uses: [Use], mls: [String], forced: [String], sbp: [Int]) : ExprKind {
+  let stmts1 = map(stmts, (s) => ptd_stmt(s, self_name, uses, mls, forced, sbp))
   match opt_tail {
     None    -> EBlock(stmts1, None)
     Some(t) -> {
-      let t1 = ptd_expr(t, self_name, uses, mls, forced, sbp, inner)
-      let orphans = ptd_orphans(stmts, uses, mls, forced, scope, [])
+      let t1 = ptd_expr(t, self_name, uses, mls, forced, sbp)
+      let orphans = ptd_orphans(stmts, uses, mls, forced, [])
       if ppd_has_self_call(t, self_name) { ptd_selfcall_tail(stmts1, t1, self_name, orphans, sbp) }
       else { ptd_wrap(stmts1, t1, orphans) }
     }
@@ -99,7 +91,7 @@ fn ptd_wrap(stmts: [Stmt], tail: Expr, names: [String]) : ExprKind = match names
 # `let` perceus itself synthesised is absent from `uses` and reads as
 # never-read, so only a residual fate counts here.
 fn ptd_orphans(stmts: [Stmt], uses: [Use], mls: [String], forced: [String],
-               scope: [String], acc: [String]) : [String] = match stmts {
+               acc: [String]) : [String] = match stmts {
   []           -> list_reverse(acc)
   [s, ...rest] -> {
     let acc1 = match s {
@@ -109,19 +101,19 @@ fn ptd_orphans(stmts: [Stmt], uses: [Use], mls: [String], forced: [String],
         MUnboxed -> acc
         _        -> match pat.pkind {
           PBind(nm) ->
-            if ptd_needs_drop(nm, stmts, uses, mls, forced, scope) { [nm, ...acc] } else { acc }
+            if ptd_needs_drop(nm, stmts, uses, mls, forced) { [nm, ...acc] } else { acc }
           _ -> acc
         }
       }
       _ -> acc
     }
-    ptd_orphans(rest, uses, mls, forced, scope, acc1)
+    ptd_orphans(rest, uses, mls, forced, acc1)
   }
 }
 
 fn ptd_needs_drop(nm: String, stmts: [Stmt], uses: [Use], mls: [String],
-                  forced: [String], scope: [String]) : Bool =
-  if list_has(scope, nm) or ptd_has_drop(nm, stmts) { false }
+                  forced: [String]) : Bool =
+  if ptd_has_drop(nm, stmts) { false }
   else { pcs_fate_residual(pcs_fate_of(nm, uses, list_has(mls, nm), list_has(forced, nm))) }
 
 # `pcs_append_drops` puts its drops at the top level of the same block, so a
@@ -147,20 +139,9 @@ fn ptd_args_name(args_: [Expr]) : String = match args_ {
   _   -> ""
 }
 
-fn ptd_let_binders(stmts: [Stmt], acc: [String]) : [String] = match stmts {
-  []           -> list_reverse(acc)
-  [s, ...rest] -> match s {
-    SLet(pat, _, _) -> match pat.pkind {
-      PBind(nm) -> ptd_let_binders(rest, [nm, ...acc])
-      _         -> ptd_let_binders(rest, acc)
-    }
-    _ -> ptd_let_binders(rest, acc)
-  }
-}
-
 fn ptd_stmt(s: Stmt, self_name: String, uses: [Use], mls: [String],
-            forced: [String], sbp: [Int], scope: [String]) : Stmt = match s {
-  SLet(p, t, rhs) -> SLet(p, t, ptd_expr(rhs, self_name, uses, mls, forced, sbp, scope))
-  SExprStmt(e)    -> SExprStmt(ptd_expr(e, self_name, uses, mls, forced, sbp, scope))
+            forced: [String], sbp: [Int]) : Stmt = match s {
+  SLet(p, t, rhs) -> SLet(p, t, ptd_expr(rhs, self_name, uses, mls, forced, sbp))
+  SExprStmt(e)    -> SExprStmt(ptd_expr(e, self_name, uses, mls, forced, sbp))
   _               -> s
 }

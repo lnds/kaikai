@@ -1,0 +1,229 @@
+#[doc("""
+The read table: every read of every tracked binder in a body, collected once.
+
+Local binder names are unique within a function body
+(`compiler.unique_binders`), so a name keys exactly one binder and the
+table is keyed by binder identity. The rewriter's dup-or-move decision and
+every payer answer "how often is this binder read" and "which read is its
+last" from this one table; nothing else in the pass re-collects reads.
+
+A read inside a lambda body is a capture: it is flagged, and it blocks the
+last-use transfer. Raw locals and `_` binders are not tracked.
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.infer
+import compiler.lex
+import compiler.interp_span
+import compiler.parse
+import compiler.resolve
+import compiler.util
+
+#[doc("Every read of the names in `scope`, and of every binder the body introduces, anywhere in `body`.")]
+pub fn pcs_read_table(body: Expr, scope: [String]) : [Use] / Console = prt_expr(body, scope, false, [])
+
+fn prt_expr(e: Expr, scope: [String], in_lam: Bool, acc: [Use]) : [Use] / Console = match e.kind {
+  EVar(nm) -> if list_has(scope, nm) { [U(nm, e.line, e.col, in_lam), ...acc] } else { acc }
+  EStr(span, t3) -> prt_interp(isp_parts(span, t3), scope, in_lam, acc)
+  EMatch(s, arms) -> prt_arms(arms, scope, in_lam, prt_expr(s, scope, in_lam, acc))
+  ELambda(ps, body) -> prt_expr(body, list_append(scope, map(ps, (p) => p.pname)), true, acc)
+  EBlock(stmts, opt_tail) -> prt_block(stmts, opt_tail, scope, in_lam, acc)
+  EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
+    let a1 = prt_opt(init_opt, scope, in_lam, prt_expr(body, scope, in_lam, acc))
+    let a2 = prt_clauses(clauses, scope, in_lam, a1)
+    match ret_opt {
+      None -> a2
+      Some(HR(pname, body2, _, _)) -> prt_expr(body2, [pname, ...scope], in_lam, a2)
+    }
+  }
+  # An `ELitUnit` inner is always a numeric literal.
+  ELitUnit(_, _) -> acc
+  _ -> prt_ps(xp_positions(e), scope, in_lam, acc)
+}
+
+fn prt_opt(oe: Option[Expr], scope: [String], in_lam: Bool, acc: [Use]) : [Use] / Console = match oe {
+  None    -> acc
+  Some(e) -> prt_expr(e, scope, in_lam, acc)
+}
+
+fn prt_ps(ps: [XPos], scope: [String], in_lam: Bool, acc: [Use]) : [Use] / Console = match ps {
+  [] -> acc
+  [XP(r, c), ...rest] ->
+    prt_ps(rest, scope, in_lam, prt_expr(c, scope, match r { XLam -> true _ -> in_lam }, acc))
+}
+
+fn prt_arms(arms: [Arm], scope: [String], in_lam: Bool, acc: [Use]) : [Use] / Console = match arms {
+  [] -> acc
+  [Arm(pat, opt_g, body), ...rest] -> {
+    let scope1 = prc_pat_bindings(pat, scope)
+    prt_arms(rest, scope, in_lam, prt_expr(body, scope1, in_lam, prt_opt(opt_g, scope1, in_lam, acc)))
+  }
+}
+
+fn prt_block(stmts: [Stmt], opt_tail: Option[Expr], scope: [String], in_lam: Bool, acc: [Use]) : [Use] / Console =
+  match stmts {
+    [] -> prt_opt(opt_tail, scope, in_lam, acc)
+    [s, ...rest] -> match s {
+      SLet(pat, _, rhs) ->
+        prt_block(rest, opt_tail, prc_pat_bindings_skip_raw(pat, rhs, scope), in_lam, prt_expr(rhs, scope, in_lam, acc))
+      SVar(name, _, rhs, _, _) ->
+        prt_block(rest, opt_tail, [name, ...scope], in_lam, prt_expr(rhs, scope, in_lam, acc))
+      _ -> prt_block(rest, opt_tail, scope, in_lam, prt_exprs(pcs_stmt_exprs(s), scope, in_lam, acc))
+    }
+  }
+
+fn prt_exprs(es: [Expr], scope: [String], in_lam: Bool, acc: [Use]) : [Use] / Console = match es {
+  []           -> acc
+  [e, ...rest] -> prt_exprs(rest, scope, in_lam, prt_expr(e, scope, in_lam, acc))
+}
+
+#[doc("The expressions a statement evaluates, in order.")]
+pub fn pcs_stmt_exprs(s: Stmt) : [Expr] = match s {
+  SAssert(c, opt_m)           -> match opt_m { Some(m) -> [c, m]  None -> [c] }
+  SExprStmt(e)                -> [e]
+  SIndexAssign(b, i, v, _, _) -> [b, i, v]
+  SAssign(b, v, _, _)         -> [b, v]
+  SLet(_, _, rhs)             -> [rhs]
+  SVar(_, _, rhs, _, _)       -> [rhs]
+  SUse(_, _, _)               -> []
+}
+
+# A clause body also sees the handler's state aliases.
+fn prt_clauses(cs: [HClause], scope: [String], in_lam: Bool, acc: [Use]) : [Use] / Console = match cs {
+  [] -> acc
+  [HC(_, params, body, _, _), ...rest] -> {
+    let scope1 = list_append(scope, [...handler_state_aliases(), ...pcs_filter_non_resume(params)])
+    prt_clauses(rest, scope, in_lam, prt_expr(body, scope1, in_lam, acc))
+  }
+}
+
+fn prt_interp(parts: [IPart], scope: [String], in_lam: Bool, acc: [Use]) : [Use] / Console = match parts {
+  [] -> acc
+  [p, ...rest] -> prt_interp(rest, scope, in_lam, match p {
+    IpLit(_, _) -> acc
+    IpExp(esrc) -> prt_opt(parse_interp_expr(esrc), scope, in_lam, acc)
+  })
+}
+
+#[doc("""
+A clause's param names without the trailing `resume`.
+
+`resume(v)` is emitted by a special case and has no runtime value, so
+wrapping a read of it in `__perceus_dup` would reach an undeclared symbol.
+""")]
+pub fn pcs_filter_non_resume(params: [Param]) : [String] = match params {
+  []           -> []
+  [p, ...rest] ->
+    if p.pname == "resume" { pcs_filter_non_resume(rest) }
+    else { [p.pname, ...pcs_filter_non_resume(rest)] }
+}
+
+# ---- the tracked binders of a pattern ----
+
+#[doc("The names a pattern binds that perceus tracks. An `_` rest binder is never bound, so it stays out.")]
+pub fn prc_pat_bindings(pat: Pattern, acc: [String]) : [String] = match pat.pkind {
+  PBind(name)                  -> [name, ...acc]
+  PList(pats, opt_rest)        -> {
+    let acc1 = prc_pats_bindings(pats, acc)
+    match opt_rest {
+      Some(rname) -> if name_is_unused_binder(rname) { acc1 } else { [rname, ...acc1] }
+      None        -> acc1
+    }
+  }
+  PVariant(_, _, subs)         -> prc_pats_bindings(subs, acc)
+  PVariantRecord(_, _, fields) -> prc_pats_bindings(map(fields, prc_pfield_pat), acc)
+  PRecord(fields)              -> prc_pats_bindings(map(fields, prc_pfield_pat), acc)
+  PAs(name, sub)               -> prc_pat_bindings(sub, [name, ...acc])
+  PNarrow(name, _)             -> [name, ...acc]
+  PSurface(sp)                 -> prc_pats_bindings(patsurface_children(sp), acc)
+  _                            -> acc
+}
+
+#[doc("`prc_pat_bindings` of a `let`, except that a single `PBind` over an `MUnboxed` rhs is a raw C scalar with no refcount and stays out.")]
+pub fn prc_pat_bindings_skip_raw(pat: Pattern, rhs: Expr, acc: [String]) : [String] = match pat.pkind {
+  PBind(name) -> match rhs.mode {
+    MUnboxed -> acc
+    _        -> [name, ...acc]
+  }
+  _ -> prc_pat_bindings(pat, acc)
+}
+
+fn prc_pats_bindings(ps: [Pattern], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> prc_pats_bindings(rest, prc_pat_bindings(p, acc))
+}
+
+fn prc_pfield_pat(f: PField) : Pattern = match f { PField(_, p, _) -> p }
+
+# ---- queries ----
+
+#[doc("Last-use class of a name over a read table: never read, read inside a lambda (a capture blocks the last-use transfer), or last read at a position.")]
+pub fn last_use_for(nm: String, uses: [Use]) : LU =
+  if pcs_uses_have_in_lam(uses, nm) { LUBlocked(nm) }
+  else {
+    match prt_latest(nm, uses, None) {
+      None         -> LUUnused(nm)
+      Some((l, c)) -> LUAt(nm, l, c)
+    }
+  }
+
+fn prt_latest(nm: String, uses: [Use], best: Option[(Int, Int)]) : Option[(Int, Int)] = match uses {
+  [] -> best
+  [U(un, ln, cl, _), ...rest] ->
+    prt_latest(nm, rest, if un == nm and prt_after(ln, cl, best) { Some((ln, cl)) } else { best })
+}
+
+fn prt_after(ln: Int, cl: Int, best: Option[(Int, Int)]) : Bool = match best {
+  None         -> true
+  Some((l, c)) -> ln > l or (ln == l and cl > c)
+}
+
+#[doc("The reads of a name outside lambdas; a lambda read is a capture, paid by the closure's own incref.")]
+pub fn pcs_read_count(nm: String, uses: [Use]) : Int = match uses {
+  [] -> 0
+  [U(un, _, _, in_lam), ...rest] ->
+    (if un == nm and not in_lam { 1 } else { 0 }) + pcs_read_count(nm, rest)
+}
+
+#[doc("True when some read of `nm` sits inside a lambda.")]
+pub fn pcs_uses_have_in_lam(uses: [Use], nm: String) : Bool = match uses {
+  []                               -> false
+  [U(un, _, _, in_lam), ...rest] -> (in_lam and un == nm) or pcs_uses_have_in_lam(rest, nm)
+}
+
+#[doc("True when `nm` is read exactly once, outside any lambda.")]
+pub fn pcs_read_once(nm: String, uses: [Use]) : Bool =
+  pcs_read_count(nm, uses) == 1 and not pcs_uses_have_in_lam(uses, nm)
+
+#[doc("True when `nm` appears anywhere in `e`: lambda bodies, handler clauses and `#{...}` bodies included. An interpolation counts by identifier token, so a field name spelled like `nm` counts too.")]
+pub fn pcs_mentions(nm: String, e: Expr) : Bool = match e.kind {
+  EVar(u)        -> u == nm
+  EStr(span, t3) -> pcs_interp_ident_count(nm, span, t3) > 0
+  _              -> prt_mentions_ps(nm, xp_positions(e))
+}
+
+fn prt_mentions_ps(nm: String, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(_, c), ...rest] -> pcs_mentions(nm, c) or prt_mentions_ps(nm, rest)
+}
+
+#[doc("Identifier tokens equal to `nm` inside the `#{...}` parts of a string span. Lexical, so it never sees fewer reads than the parsed table.")]
+pub fn pcs_interp_ident_count(nm: String, span: String, is_triple: Bool) : Int =
+  prt_iic_parts(nm, isp_parts(span, is_triple))
+
+fn prt_iic_parts(nm: String, parts: [IPart]) : Int = match parts {
+  []           -> 0
+  [p, ...rest] -> prt_iic_parts(nm, rest) + match p {
+    IpLit(_, _) -> 0
+    IpExp(esrc) -> prt_iic_toks(nm, esrc, tokenize(esrc))
+  }
+}
+
+fn prt_iic_toks(nm: String, esrc: String, toks: [Token]) : Int = match toks {
+  []           -> 0
+  [t, ...rest] -> prt_iic_toks(nm, esrc, rest) + match t.kind {
+    TkIdent -> if string_slice(esrc, t.start, t.length) == nm { 1 } else { 0 }
+    _       -> 0
+  }
+}

@@ -19,6 +19,7 @@
 import compiler.ast
 import compiler.util
 import compiler.infer
+import compiler.perceus_reads
 
 #[doc("What a binder's reads do with its birth reference: nothing reads it, the last read hands it on, or every read dups and it stays owed.")]
 pub type PcsFate = FUnread | FTransfer | FResidual
@@ -42,7 +43,7 @@ pub fn pcs_fate(lu: LU, nm: String, uses: [Use], moved: Bool, forced: Bool) : Pc
   LUAt(_, _, _) ->
     if forced { FResidual }
     else if moved { FTransfer }
-    else if pcs_count_non_lam_uses(nm, uses, 0) >= 2 { FResidual }
+    else if pcs_read_count(nm, uses) >= 2 { FResidual }
     else { FTransfer }
 }
 
@@ -102,9 +103,9 @@ pub fn pcs_let_payer(nm: String, rhs: Expr, uses: [Use], moved: Bool, forced: Bo
     FTransfer -> PyRead
   }
 
-#[doc("The payer of a match-arm binder's bind-time incref, over the arm's own reads. An `_`-named binder takes no incref and owes nothing.")]
-pub fn pcs_arm_payer(nm: String, arm_uses: [Use]) : PcsPayer =
-  match pcs_fate_of(nm, arm_uses, false, false) {
+#[doc("The payer of a match-arm binder's bind-time incref; `moved` when the rewrite moves its reads. An `_`-named binder takes no incref and owes nothing.")]
+pub fn pcs_arm_payer(nm: String, uses: [Use], moved: Bool) : PcsPayer =
+  match pcs_fate_of(nm, uses, moved, false) {
     FUnread   -> if name_is_unused_binder(nm) { PyNone } else { PyExit }
     FResidual -> PyExit
     FTransfer -> PyRead
@@ -197,47 +198,3 @@ pub fn pcs_make_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =
     ),
     line: ln, col: cl, ty: None, mode: MUnknown
   })
-
-#[doc("Last-use class of a name over a use table: never read, read inside a lambda (a capture blocks the last-use transfer), or last read at a position.")]
-pub fn last_use_for(nm: String, uses: [Use]) : LU =
-  last_use_for_loop(nm, uses, false, -1, -1)
-
-fn last_use_for_loop(nm: String, uses: [Use], blocked: Bool,
-                     mx_line: Int, mx_col: Int) : LU = match uses {
-  []           -> pcs_lu_verdict(nm, blocked, mx_line, mx_col)
-  [u, ...rest] -> match u {
-    U(un, ln, cl, in_lam) ->
-      if un != nm { last_use_for_loop(nm, rest, blocked, mx_line, mx_col) }
-      else if in_lam { last_use_for_loop(nm, rest, true, mx_line, mx_col) }
-      else if pcs_pos_after(ln, cl, mx_line, mx_col) { last_use_for_loop(nm, rest, blocked, ln, cl) }
-      else { last_use_for_loop(nm, rest, blocked, mx_line, mx_col) }
-  }
-}
-
-fn pcs_lu_verdict(nm: String, blocked: Bool, ln: Int, cl: Int) : LU =
-  if blocked { LUBlocked(nm) }
-  else if ln < 0 { LUUnused(nm) }
-  else { LUAt(nm, ln, cl) }
-
-fn pcs_pos_after(ln: Int, cl: Int, l0: Int, c0: Int) : Bool =
-  ln > l0 or (ln == l0 and cl > c0)
-
-#[doc("Count the reads of a name outside lambdas; a lambda read is a capture, paid by the closure's own incref.")]
-pub fn pcs_count_non_lam_uses(nm: String, uses: [Use], acc: Int) : Int = match uses {
-  []           -> acc
-  [u, ...rest] -> pcs_count_non_lam_uses(nm, rest, acc + pcs_plain_read(nm, u))
-}
-
-fn pcs_plain_read(nm: String, u: Use) : Int = match u {
-  U(un, _, _, in_lam) -> if un == nm and not in_lam { 1 } else { 0 }
-}
-
-#[doc("True when some read of `nm` sits inside a lambda.")]
-pub fn pcs_uses_have_in_lam(uses: [Use], nm: String) : Bool = match uses {
-  []           -> false
-  [u, ...rest] -> if pcs_lam_read(nm, u) { true } else { pcs_uses_have_in_lam(rest, nm) }
-}
-
-fn pcs_lam_read(nm: String, u: Use) : Bool = match u {
-  U(un, _, _, in_lam) -> in_lam and un == nm
-}
