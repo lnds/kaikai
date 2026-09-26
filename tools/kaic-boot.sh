@@ -8,10 +8,11 @@
 #   kaic-boot.sh release-id            print the release boot's name and sha256
 #
 # The boot comes from $KAIC_BOOT (docs/build-system.md §KAIC_BOOT):
-#   kaic1 (or unset)  the stage0 -> stage1 chain
-#   release           the kaic2 of the newest published release up to VERSION
-#   auto              a kaic2 this tree sealed, else release, else kaic1
-#   <path>            any kaic1- or kaic2-class binary
+#   release (or unset)  the kaic2 of the newest published release up to VERSION
+#   seed                the newest bootstrap-seed-v* tag up to VERSION, built by cc
+#   kaic1               the stage0 -> stage1 chain
+#   auto                a kaic2 this tree sealed, else release, else seed, else kaic1
+#   <path>              any kaic1- or kaic2-class binary
 #
 # A kaic2-class boot takes two hops: the boot emits <dir>/stage2-a.c, linked
 # into <dir>/kaic2-a, and kaic2-a emits <out.c>, so the C that is linked is
@@ -28,7 +29,7 @@ STAGE2="$ROOT/stage2"
 BOOT_DIR="$STAGE2/build/boot"
 RELEASE_URL="${KAIC_BOOT_URL:-https://github.com/kaikailang-org/kaikai/releases/download}"
 LATEST_URL="${KAIC_BOOT_LATEST_URL:-https://github.com/kaikailang-org/kaikai/releases/latest/download/latest.json}"
-MODE="${KAIC_BOOT:-kaic1}"
+MODE="${KAIC_BOOT:-release}"
 LC_ALL=C
 export LC_ALL
 
@@ -172,6 +173,43 @@ boot_release() {
   BOOT_ID="release $name $(field tarball "$dir/boot.id")"
 }
 
+# The seed is C, so cc alone builds it, against the runtime.h it was frozen
+# with. The linked seed is cached per tag and reused only while the tag still
+# names the commit it was built from and the binary still hashes as recorded.
+seed_version() {
+  want="$(cat "$ROOT/VERSION")"
+  git -C "$ROOT" tag -l 'bootstrap-seed-v*' 2>/dev/null | sed 's/^bootstrap-seed-v//' \
+    | while read -r v; do version_le "$v" "$want" && echo "$v"; done \
+    | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1
+}
+
+seed_cached() {
+  [ -f "$1/boot.id" ] && [ "$(field commit "$1/boot.id")" = "$2" ] \
+    && [ "$(field kaic2 "$1/boot.id")" = "$(sha_of "$1/kaic2" 2>/dev/null)" ]
+}
+
+boot_seed() {
+  command -v git >/dev/null 2>&1 || { say "git not found"; return 1; }
+  ver="$(seed_version)"
+  [ -n "$ver" ] || { say "no bootstrap-seed-v* tag up to v$(cat "$ROOT/VERSION"); fetch them with" \
+    "git fetch origin 'refs/tags/bootstrap-seed-v*:refs/tags/bootstrap-seed-v*'"; return 1; }
+  tag="bootstrap-seed-v$ver"
+  dir="$BOOT_DIR/$tag"
+  commit="$(git -C "$ROOT" rev-parse "$tag^{commit}")"
+  if ! seed_cached "$dir" "$commit"; then
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    git -C "$ROOT" archive "$commit" bootstrap | tar -x -C "$dir"
+    say "cc $tag -> $dir/kaic2"
+    "${MAKE:-make}" -s -C "$STAGE2" boot-hop HOP_C="$dir/bootstrap/stage2.c" HOP_BIN="$dir/kaic2" \
+      HOP_INC="$dir/bootstrap" >&2
+    printf 'commit=%s\nkaic2=%s\n' "$commit" "$(sha_of "$dir/kaic2")" > "$dir/boot.id"
+  fi
+  BOOT_BIN="$dir/kaic2"
+  BOOT_CLASS=kaic2
+  BOOT_ID="seed $tag $commit"
+}
+
 boot_path() {
   [ -x "$1" ] || die "KAIC_BOOT=$1 is not an executable file"
   BOOT_BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
@@ -186,8 +224,9 @@ boot_path() {
 resolve() {
   case "$MODE" in
     kaic1)   boot_kaic1 ;;
-    release) boot_release || die "KAIC_BOOT=release: no release boot available" ;;
-    auto)    boot_self || boot_release || { say "falling back to the kaic1 chain"; boot_kaic1; } ;;
+    release) boot_release || die "KAIC_BOOT=release: no release boot available (KAIC_BOOT=seed needs only cc)" ;;
+    seed)    boot_seed || die "KAIC_BOOT=seed: no seed available" ;;
+    auto)    boot_self || boot_release || boot_seed || { say "falling back to the kaic1 chain"; boot_kaic1; } ;;
     *)       boot_path "$MODE" ;;
   esac
 }
@@ -249,7 +288,7 @@ inputs_match() {
 }
 
 # The recorded boot is the one $MODE selects; auto accepts any. Freshness
-# never reaches the network, so release accepts any release up to VERSION.
+# never reaches the network, so release and seed accept any up to VERSION.
 boot_matches() {
   case "$MODE" in
     auto)    return 0 ;;
@@ -260,18 +299,21 @@ boot_matches() {
              ver="${1#release kaikai-v}"; ver="${ver%%-*}"
              case "$1" in "release kaikai-v$ver-$plat "*)
                version_le "$ver" "$(cat "$ROOT/VERSION")" && return 0 ;; esac ;;
+    seed)    ver="${1#seed bootstrap-seed-v}"; ver="${ver%% *}"
+             case "$1" in "seed bootstrap-seed-v$ver "*)
+               version_le "$ver" "$(cat "$ROOT/VERSION")" && return 0 ;; esac ;;
     *)       [ -x "$MODE" ] && [ "$1" = "path $(sha_of "$MODE")" ] && return 0 ;;
   esac
   return 1
 }
 
-# Without a record the unset and auto modes defer to make's mtime rule (a
-# tree built before records existed, or a CI artifact restored by exact
-# cache key); an explicitly chosen boot requires an exact match.
+# Without a record only auto defers to make's mtime rule (a tree built before
+# records existed, or a CI artifact restored by exact cache key); every other
+# mode requires an exact match.
 cmd_fresh() {
   rec="$1.id"
   if [ ! -f "$rec" ]; then
-    [ -z "${KAIC_BOOT:-}" ] || [ "$MODE" = auto ]
+    [ "$MODE" = auto ]
     return
   fi
   inputs_match "$1" "$rec" && boot_matches "$(field boot "$rec")"

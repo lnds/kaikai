@@ -55,9 +55,13 @@ EOF
 chmod +x "$root/stage1/kaic1"
 
 # A stub cc for the boot-hop target: the "binary" of a C file is a
-# kaic2-class stub that prints a hop-a header, then that C.
+# kaic2-class stub that prints a hop-a header, then that C. Each link is
+# logged with the runtime it was given ("inc=" is this tree's).
+HOP_LOG="$work/cc.log"
+export HOP_LOG
 cat > "$work/hop-cc" <<'EOF'
 #!/bin/sh
+echo "$1 inc=${3:-}" >> "$HOP_LOG"
 { echo '#!/bin/sh'
   echo '[ "$1" = --version ] && { echo "kaic2 stage 2 (self-hosted)"; exit 0; }'
   echo 'echo "/* hop-a stdlib=$KAIKAI_STDLIB_PATH args=$* */"'
@@ -66,7 +70,7 @@ cat > "$work/hop-cc" <<'EOF'
 chmod +x "$2"
 EOF
 chmod +x "$work/hop-cc"
-printf 'boot-hop:\n\t@%s $(HOP_C) $(HOP_BIN)\n' "$work/hop-cc" > "$root/stage2/Makefile"
+printf 'boot-hop:\n\t@%s $(HOP_C) $(HOP_BIN) $(HOP_INC)\n' "$work/hop-cc" > "$root/stage2/Makefile"
 
 # Release tarballs for every platform the script knows, so the test runs
 # on any published host.
@@ -107,13 +111,13 @@ boot_of() { sed -n 's/^boot=//p' "$out.id"; }
 hop_a="$root/stage2/build/stage2-a.c"
 
 # ---- kaic1: record, content checks, strict vs lenient -------------------
-boot "" emit "$out" 2>/dev/null
-grep -q '^/\* kaic1 \*/' "$out" || fail "unset mode did not run kaic1"
+boot kaic1 emit "$out" 2>/dev/null
+grep -q '^/\* kaic1 \*/' "$out" || fail "kaic1 mode did not run kaic1"
 case "$(boot_of)" in "kaic1 "*) ;; *) fail "kaic1 record names boot [$(boot_of)]" ;; esac
 grep -q '^hops=1$' "$out.id" || fail "kaic1 record does not state one hop"
 [ ! -f "$hop_a" ] || fail "a kaic1-class boot took a second hop"
-is_fresh "" "kaic1 record"; is_fresh kaic1 "kaic1 record"; is_fresh auto "kaic1 record"
-is_stale release "kaic1 record under release"
+is_fresh kaic1 "kaic1 record"; is_fresh auto "kaic1 record"
+is_stale "" "kaic1 record, unset"; is_stale release "kaic1 record under release"
 ok "kaic1 emit records its boot; only a matching mode reuses it"
 
 echo 'fn x() = 2' > "$root/stdlib/core/x.kai"
@@ -126,9 +130,9 @@ is_stale kaic1 "stage2.c edited after emit"
 ok "a compiler-source edit or an edited stage2.c invalidates; a stdlib edit does not (kaic1)"
 
 rm -f "$out.id"
-is_fresh "" "no record, unset"; is_fresh auto "no record, auto"
-is_stale kaic1 "no record, explicit kaic1"; is_stale release "no record, explicit release"
-ok "without a record only unset/auto defer to make; an explicit boot rebuilds"
+is_fresh auto "no record, auto"
+is_stale "" "no record, unset"; is_stale kaic1 "no record, explicit kaic1"; is_stale release "no record, explicit release"
+ok "without a record only auto defers to make; every other mode rebuilds"
 
 # ---- release: download, verify, cache, stdlib, identity -----------------
 boot release emit "$out" 2>/dev/null || fail "release emit failed"
@@ -140,8 +144,10 @@ sed 1d "$out" | cmp -s - "$hop_a" || fail "kaic2-a was not linked from the boot'
 case "$(boot_of)" in "release kaikai-v9.9.9-"*) ;; *) fail "release record names boot [$(boot_of)]" ;; esac
 grep -q '^class=kaic2$' "$out.id" || fail "release record is not kaic2-class"
 grep -q '^hops=2$' "$out.id" || fail "release record does not state two hops"
-is_fresh release "release record"; is_stale kaic1 "release record under kaic1"; is_stale "" "release record, unset"
-ok "release boot fetched, verified, run against this tree's stdlib; its kaic2-a emits stage2.c"
+is_fresh release "release record"; is_fresh "" "release record, unset"; is_stale kaic1 "release record under kaic1"
+boot "" emit "$out" 2>/dev/null
+case "$(boot_of)" in "release "*) ;; *) fail "unset mode booted [$(boot_of)]" ;; esac
+ok "release boot (the default) fetched, verified, run against this tree's stdlib; its kaic2-a emits stage2.c"
 
 cp "$out.id" "$work/rec"
 sed '/^hops=/d' "$work/rec" > "$out.id"
@@ -251,5 +257,68 @@ chmod +x "$work/editing-kaic1"
 boot "$work/editing-kaic1" emit "$out" 2>/dev/null
 is_stale "$work/editing-kaic1" "input edited while the boot ran"
 ok "an input edited mid-emit leaves the record stale, never fresh"
+
+# ---- seed: the newest tag up to VERSION, linked against its own runtime --
+g() { git -C "$root" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false -c tag.gpgsign=false "$@"; }
+g init -q
+g add -A
+g commit -q -m base
+base="$(g rev-parse HEAD)"
+# seed_tag <version> [marker]: a commit off base carrying bootstrap/, tagged.
+seed_tag() {
+  mkdir -p "$root/bootstrap"
+  echo "/* seed $1${2:-} */" > "$root/bootstrap/stage2.c"
+  echo "/* runtime $1 */"    > "$root/bootstrap/runtime.h"
+  g add bootstrap
+  g commit -q -m "seed $1"
+  g tag -f "bootstrap-seed-v$1" >/dev/null
+  g checkout -q --detach "$base"
+}
+seed_tag 9.9.8; seed_tag 9.9.9; seed_tag 9.9.10
+seed_dir="$root/stage2/build/boot/bootstrap-seed-v9.9.9"
+
+: > "$HOP_LOG"
+boot seed emit "$out" 2>/dev/null || fail "seed emit failed"
+case "$(boot_of)" in "seed bootstrap-seed-v9.9.9 "*) ;; *) fail "seed record names boot [$(boot_of)]" ;; esac
+grep -q '^class=kaic2$' "$out.id" && grep -q '^hops=2$' "$out.id" || fail "seed record is not a two-hop kaic2-class boot"
+grep -qx '/\* seed 9.9.9 \*/' "$hop_a" || fail "stage2-a.c was not emitted by the 9.9.9 seed"
+[ "$(head -n 1 "$hop_a")" = "/* hop-a stdlib=$root/stdlib args=--edition hanga-roa main.kai */" ] \
+  || fail "the seed did not run with this tree's stdlib and edition: $(head -n 1 "$hop_a")"
+sed 1d "$out" | cmp -s - "$hop_a" || fail "kaic2-a was not linked from the seed's stage2-a.c"
+grep -qx "$seed_dir/bootstrap/stage2.c inc=$seed_dir/bootstrap" "$HOP_LOG" \
+  || fail "the seed was not linked against its own runtime.h: $(cat "$HOP_LOG")"
+grep -qx "$(cd "$root/stage2/build" && pwd)/stage2-a.c inc=" "$HOP_LOG" || fail "hop a was not linked against this tree's runtime.h: $(cat "$HOP_LOG")"
+is_fresh seed "seed record"; is_fresh auto "seed record"
+is_stale "" "seed record, unset"; is_stale release "seed record under release"
+ok "seed boot takes the newest tag up to VERSION, linked against its own runtime.h; its kaic2-a emits stage2.c"
+
+: > "$HOP_LOG"
+boot seed emit "$out" 2>/dev/null
+if grep -q 'bootstrap/stage2.c' "$HOP_LOG"; then fail "a cached seed was relinked"; fi
+echo tampered >> "$seed_dir/kaic2"
+boot seed emit "$out" 2>/dev/null
+grep -q 'bootstrap/stage2.c' "$HOP_LOG" || fail "a tampered cached seed was reused"
+: > "$HOP_LOG"
+seed_tag 9.9.9 " moved"
+boot seed emit "$out" 2>/dev/null
+grep -qx '/\* seed 9.9.9 moved \*/' "$hop_a" || fail "a moved seed tag reused the old seed"
+ok "the linked seed is cached per tag; a tampered binary or a moved tag relinks it"
+
+echo 9.9.8 > "$root/VERSION"
+is_stale seed "a seed following VERSION"
+boot seed emit "$out" 2>/dev/null
+case "$(boot_of)" in "seed bootstrap-seed-v9.9.8 "*) ;; *) fail "VERSION 9.9.8 booted [$(boot_of)]" ;; esac
+echo 9.9.9 > "$root/VERSION"
+is_fresh seed "a seed preceding VERSION"
+ok "a seed up to VERSION is reused, a later one never"
+
+rm -rf "$root/stage2/build/boot"
+offline auto emit "$out" 2>/dev/null
+case "$(boot_of)" in "seed "*) ;; *) fail "auto offline with a seed picked [$(boot_of)]" ;; esac
+for v in 9.9.8 9.9.9 9.9.10; do g tag -d "bootstrap-seed-v$v" >/dev/null; done
+if boot seed emit "$out" 2>/dev/null; then fail "seed mode booted without a seed tag"; fi
+offline auto emit "$out" 2>/dev/null
+case "$(boot_of)" in "kaic1 "*) ;; *) fail "auto offline without a seed picked [$(boot_of)]" ;; esac
+ok "auto falls to the seed when release is unreachable, then to kaic1; seed mode does not fall back"
 
 echo "test-kaic-boot: all cases passed"
