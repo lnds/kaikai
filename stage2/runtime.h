@@ -13331,38 +13331,33 @@ static void _kai_proc_pipe_drop(int pid) {
     }
 }
 
-/* Write all of buf; returns 0 or the failing errno. A dead reader
- * must surface as EPIPE, not kill the process: where the OS has a
- * per-fd opt-out (F_SETNOSIGPIPE) start_piped already set it; else
- * block SIGPIPE for this thread around the write and drain the
- * pending signal so the default disposition never fires. */
-static int _kai_proc_write_all(int fd, const char *buf, size_t len) {
-#if !defined(F_SETNOSIGPIPE)
+/* One write attempt on the non-blocking stdin pipe; returns write(2)'s
+ * result with errno intact. A dead reader must surface as EPIPE, not
+ * kill the process: where the OS has a per-fd opt-out (F_SETNOSIGPIPE)
+ * start_piped already set it; else SIGPIPE is blocked and drained around
+ * this one syscall only. The mask is per-thread and a parked fiber may
+ * resume on another OS thread, so it must never span a park. */
+#if !KAI_SCHED_DECL_ONLY
+static ssize_t _kai_proc_write_once(int fd, const char *buf, size_t len) {
+#if defined(F_SETNOSIGPIPE)
+    return write(fd, buf, len);
+#else
     sigset_t pipe_set, prev_set;
     sigemptyset(&pipe_set);
     sigaddset(&pipe_set, SIGPIPE);
     pthread_sigmask(SIG_BLOCK, &pipe_set, &prev_set);
-#endif
-    int err = 0;
-    size_t off = 0;
-    while (off < len) {
-        ssize_t w = write(fd, buf + off, len - off);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            err = errno;
-            break;
-        }
-        off += (size_t) w;
-    }
-#if !defined(F_SETNOSIGPIPE)
-    if (err == EPIPE) {
+    ssize_t w = write(fd, buf, len);
+    int e = errno;
+    if (w < 0 && e == EPIPE) {
         struct timespec zero = { 0, 0 };
         while (sigtimedwait(&pipe_set, NULL, &zero) >= 0) {}
     }
     pthread_sigmask(SIG_SETMASK, &prev_set, NULL);
+    errno = e;
+    return w;
 #endif
-    return err;
 }
+#endif
 
 /* start(cmd, args) -> Child. fork + execvp; on failure of either
  * primitive, panic with strerror — start has no Result wrapper in
@@ -13603,6 +13598,7 @@ static KaiValue *kai_default_process_start_piped(void *self, KaiValue *cmd, KaiV
         close(in_p[0]);
         wr = in_p[1];
         fcntl(wr, F_SETFD, FD_CLOEXEC);
+        fcntl(wr, F_SETFL, fcntl(wr, F_GETFL) | O_NONBLOCK);
 #if defined(F_SETNOSIGPIPE)
         fcntl(wr, F_SETNOSIGPIPE, 1);
 #endif
@@ -13614,21 +13610,39 @@ static KaiValue *kai_default_process_start_piped(void *self, KaiValue *cmd, KaiV
 
 /* write_stdin(c, data) -> Result[Unit, String]. Writes every byte or
  * reports the failing errno; a reader that died early is Err("Broken
- * pipe"), never a fatal SIGPIPE. Blocks the OS thread while the pipe
- * is full — a child that never reads its stdin deadlocks the writer. */
-static KaiValue *kai_default_process_write_stdin(void *self, KaiValue *child, KaiValue *data, KaiCont *k) {
+ * pipe"), never a fatal SIGPIPE. A full pipe parks the fiber on
+ * write-readiness, never the thread. The fd is looked up again after
+ * each park: a concurrent `close_stdin` or `wait` may have closed it,
+ * and its number reused by an unrelated file. */
+KAI_SCHED_FN KaiValue *kai_default_process_write_stdin(void *self, KaiValue *child, KaiValue *data, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
     (void) self;
     int pid = _kai_process_record_pid(child);
     int fd  = pid > 0 ? _kai_proc_pipe_fd(pid, 0) : -1;
     if (fd < 0) {
         return _kai_process_err_msg(k, "write_stdin: stdin is not piped");
     }
-    if (data && data->tag == KAI_STR && data->as.s.bytes && data->as.s.len > 0) {
-        int err = _kai_proc_write_all(fd, data->as.s.bytes, data->as.s.len);
-        if (err) return _kai_process_err(k, err);
+    if (!data || data->tag != KAI_STR || !data->as.s.bytes) {
+        return _kai_process_ok(k, kai_unit());
+    }
+    kai_reactor_init();
+    const char *buf = data->as.s.bytes;
+    size_t len = data->as.s.len, off = 0;
+    while (off < len) {
+        ssize_t w = _kai_proc_write_once(fd, buf + off, len - off);
+        if (w >= 0) { off += (size_t) w; continue; }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return _kai_process_err(k, errno);
+        kai_reactor_park_socket_write(kai_current_fiber(), fd);
+        fd = _kai_proc_pipe_fd(pid, 0);
+        if (fd < 0) return _kai_process_err_msg(k, "write_stdin: stdin was closed");
     }
     return _kai_process_ok(k, kai_unit());
 }
+#endif
 
 /* close_stdin(c) -> Result[Unit, String]. EOFs the child's stdin.
  * Idempotent — closing an already-closed end is Ok, matching pclose's

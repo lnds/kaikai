@@ -1,0 +1,71 @@
+# A fiber writing to a child that never reads its stdin must not stall
+# the scheduler: once the pipe fills, the parent's 300 ms receive_timeout
+# still fires long before the child's 10 s sleep ends. Killing the child
+# then surfaces the pending write as an error.
+import actor
+import time
+import os.process as proc
+
+type Msg = Wrote | Failed
+
+fn mk_big(s: String, doublings: Int) : String =
+  if doublings == 0 { s } else { mk_big(string_concat(s, s), doublings - 1) }
+
+# 16 bytes doubled 16 times = 1 MiB, more than any default pipe buffer
+fn writer(child: Child, parent: Pid[Msg]) : Unit / Process + Actor[Msg] =
+  match proc.write_stdin(child, mk_big("0123456789abcdef", 16)) {
+    Ok(_) -> Actor.send(parent, Wrote)
+    Err(_) -> Actor.send(parent, Failed)
+  }
+
+fn reap(child: Child) : Unit / Process {
+  let _k = proc.kill(child, 9)
+  let _w = proc.wait(child)
+  ()
+}
+
+fn after_timeout(child: Child, ms: Int) : Int / Process + Actor[Msg] + Stdout {
+  let _k = proc.kill(child, 9)
+  let tail = Actor.receive()
+  let _w = proc.wait(child)
+  if ms >= 3000 {
+    Stdout.print("timeout late: #{ms}ms")
+    1
+  } else {
+    match tail {
+      Failed -> {
+        Stdout.print("timeout fired while the writer waited")
+        Stdout.print("writer saw an error after kill")
+        0
+      }
+      Wrote -> {
+        Stdout.print("unexpected: the whole write succeeded")
+        1
+      }
+    }
+  }
+}
+
+fn main() : Int / Process + Spawn + Clock + Stdout = with_mailbox {
+  match proc.pipe_to("/bin/sleep", ["10"]) {
+    Err(e) -> {
+      Stdout.print("start FAIL: #{e}")
+      1
+    }
+    Ok(child) -> {
+      let me = Actor.self()
+      let t0 = monotonic()
+      let _w = spawn_actor(() => writer(child, me))
+      let got = receive_timeout(millis(300))
+      let ms = duration_to_nanos(elapsed_since(t0, monotonic())) / 1_000_000
+      match got {
+        None -> after_timeout(child, ms)
+        Some(_) -> {
+          reap(child)
+          Stdout.print("write returned first after #{ms}ms")
+          1
+        }
+      }
+    }
+  }
+}
