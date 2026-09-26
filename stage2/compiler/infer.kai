@@ -17,6 +17,7 @@ import compiler.ast
 import compiler.marks
 import compiler.diag_file
 import compiler.spawn_row
+import compiler.mutation_callees
 import compiler.mutation_carriers
 import compiler.kinds
 import compiler.kind_theory
@@ -13692,14 +13693,21 @@ fn mask_local_mutable_demand(st: InferState, params: [Param], body: Expr) : Infe
     # mutation, so passing it to a `/ Mutable` callee is observable iff that
     # argument is a parameter or escapes. Computed up front: both the local-set
     # scan and the demand classifier consult it.
-    let dmut = mutating_record_type_names(st.recs)
+    let dmut = mutating_type_names(carrier_shapes(st.recs, st.sums))
     let local_set = collect_local_arrays(body_resolved, [], dmut)
-    let param_names = mut_collect_param_names(params, [])
+    let opaque = opaque_binders(params, body_resolved)
     let escaped_set = collect_escaped_names(body_resolved, [])
-    if all_demands_local(body_resolved, local_set, escaped_set, param_names, dmut) {
+    if all_demands_local(body_resolved, local_set, escaped_set, opaque, dmut) {
       st_drop_label(st, "Mutable")
     } else { st }
   }
+}
+
+fn carrier_shapes(recs: [RecInfo], sums: [SumInfo]) : [CarrierShape] =
+  list_append(map(recs, record_shape), map(sums, sum_carrier_shape))
+
+fn sum_carrier_shape(s: SumInfo) : CarrierShape = match s {
+  SI(name, _, vs, _) -> sum_shape(name, vs)
 }
 
 fn list_has_label(row: [Label], eff: String) : Bool {
@@ -13948,7 +13956,7 @@ fn field_inits_all_local_origin(fs: [FieldInit], local_so_far: [String], dmut: [
 # carrier value must itself be locally originated.
 fn field_init_local(v: Expr, local_so_far: [String], dmut: [String]) : Bool =
   match v.ty {
-    Some(t) -> if ty_carries_mutation(t, dmut) { rhs_is_local_origin(v, local_so_far, dmut) }
+    Some(t) -> if ty_may_carry_mutation(t, dmut) { rhs_is_local_origin(v, local_so_far, dmut) }
                else { true }
     None    -> true
   }
@@ -13994,7 +14002,7 @@ fn is_inplace_array_op(name: String) : Bool =
 fn rhs_is_constructor(ret_ty: Option[Ty], args_: [Expr], dmut: [String]) : Bool =
   match ret_ty {
     None    -> false
-    Some(t) -> ty_carries_mutation(t, dmut) and not any_arg_carries_mutation(args_, dmut)
+    Some(t) -> ty_may_carry_mutation(t, dmut) and not any_arg_carries_mutation(args_, dmut)
   }
 
 # A call threads a local carrier iff its result carries mutation and every
@@ -14004,14 +14012,14 @@ fn rhs_threads_local_carrier(ret_ty: Option[Ty], args_: [Expr],
                              local_so_far: [String], dmut: [String]) : Bool =
   match ret_ty {
     None    -> false
-    Some(t) -> ty_carries_mutation(t, dmut) and carrier_args_all_local(args_, local_so_far, dmut)
+    Some(t) -> ty_may_carry_mutation(t, dmut) and carrier_args_all_local(args_, local_so_far, dmut)
   }
 
 fn carrier_args_all_local(args_: [Expr], local_so_far: [String], dmut: [String]) : Bool = match args_ {
   []           -> true
   [h, ...rest] -> {
     let arg_ty = match h.ty { Some(t) -> t  None -> TyAny }
-    if ty_carries_mutation(arg_ty, dmut) {
+    if ty_may_carry_mutation(arg_ty, dmut) {
       if rhs_is_local_origin(h, local_so_far, dmut) { carrier_args_all_local(rest, local_so_far, dmut) }
       else { false }
     } else { carrier_args_all_local(rest, local_so_far, dmut) }
@@ -14022,7 +14030,7 @@ fn any_arg_carries_mutation(args_: [Expr], dmut: [String]) : Bool = match args_ 
   []           -> false
   [h, ...rest] -> {
     let arg_ty = match h.ty { Some(t) -> t  None -> TyAny }
-    if ty_carries_mutation(arg_ty, dmut) { true }
+    if ty_may_carry_mutation(arg_ty, dmut) { true }
     else { any_arg_carries_mutation(rest, dmut) }
   }
 }
@@ -14295,28 +14303,29 @@ fn callee_is_mutable_op(callee: Expr) : Bool = match callee.kind {
 # parameter or a constructor that wraps a shared value is rejected (its arg
 # carries mutation and is not local).
 fn mutable_callee_args_all_local(args_: [Expr], locals: [String],
-                                  escaped: [String], params: [String], dmut: [String]) : Bool = match args_ {
+                                  escaped: [String], opaque: [String], dmut: [String]) : Bool = match args_ {
   []           -> true
   [h, ...rest] -> {
     let arg_ty = match h.ty { Some(t) -> t  None -> TyAny }
-    if ty_carries_mutation(arg_ty, dmut) {
+    if ty_may_carry_mutation(arg_ty, dmut) and not fn_value_is_transparent(h, opaque) {
       if arg_is_local_carrier(h, locals, escaped, dmut) {
-        mutable_callee_args_all_local(rest, locals, escaped, params, dmut)
+        mutable_callee_args_all_local(rest, locals, escaped, opaque, dmut)
       } else { false }
-    } else { mutable_callee_args_all_local(rest, locals, escaped, params, dmut) }
+    } else { mutable_callee_args_all_local(rest, locals, escaped, opaque, dmut) }
   }
 }
 
-# A core bytes writer mutates only its first argument, so only that
-# destination can make the demand observable.
+# A writer that mutates only its first argument makes the demand
+# observable only through that destination.
 fn mutable_writer_dst_local(args_: [Expr], locals: [String], escaped: [String], dmut: [String]) : Bool = match args_ {
   []            -> true
   [h, ..._rest] -> arg_is_local_carrier(h, locals, escaped, dmut)
 }
 
-fn callee_is_bytes_writer(callee: Expr) : Bool = match callee.kind {
-  EVar(name) -> is_bytes_writer(name)
-  _          -> false
+fn callee_writes_only_first_arg(callee: Expr) : Bool = match callee.kind {
+  EVar(name)    -> writes_only_first_arg(name)
+  ESym(_, name) -> writes_only_first_arg(name)
+  _             -> false
 }
 
 # A mutation-carrying argument is local iff its origin is local AND, when it
@@ -14330,11 +14339,11 @@ fn arg_is_local_carrier(h: Expr, locals: [String], escaped: [String], dmut: [Str
   }
 
 fn all_demands_local(body: Expr, locals: [String], escaped: [String],
-                     params: [String], dmut: [String]) : Bool =
-  all_demands_local_kind(body.kind, locals, escaped, params, dmut)
+                     opaque: [String], dmut: [String]) : Bool =
+  all_demands_local_kind(body.kind, locals, escaped, opaque, dmut)
 
 fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
-                           params: [String], dmut: [String]) : Bool {
+                           opaque: [String], dmut: [String]) : Bool {
   match k {
     ECall(callee, args_) -> {
       # every Mutable demand now flows through ONE rule: a
@@ -14370,82 +14379,81 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
         ty_callee_has_mutable(callee_ty) or callee_is_mutable_op(callee)
       let here =
         if demands_mutable {
-          if callee_is_bytes_writer(callee) { mutable_writer_dst_local(args_, locals, escaped, dmut) }
-          else { mutable_callee_args_all_local(args_, locals, escaped, params, dmut) }
+          if callee_is_opaque(callee, opaque) { false }
+          else if callee_writes_only_first_arg(callee) { mutable_writer_dst_local(args_, locals, escaped, dmut) }
+          else { mutable_callee_args_all_local(args_, locals, escaped, opaque, dmut) }
         } else { true }
       if not here { false }
-      else if not all_demands_local(callee, locals, escaped, params, dmut) { false }
+      else if not all_demands_local(callee, locals, escaped, opaque, dmut) { false }
       # When the call passed the carrier-locality check, a lambda argument
       # threads a local accumulator: its params inherit the locality the
       # init proved at this site (`foldl(xs, new(), \b -> mutate(b))`). Pass
       # the lambda's params as locals into its body walk. The inheritance is
       # SOUND only because `here` verified every carrier arg (including the
       # init) is local; a shared init would have set `here` false above.
-      else { all_demands_local_in_exprs(args_, locals, escaped, params, dmut, here) }
+      else { all_demands_local_in_exprs(args_, locals, escaped, opaque, dmut, here) }
     }
     EBlock(stmts, tail) -> {
-      if not all_demands_local_in_stmts(stmts, locals, escaped, params, dmut) { false }
+      if not all_demands_local_in_stmts(stmts, locals, escaped, opaque, dmut) { false }
       else { match tail {
-        Some(t) -> all_demands_local(t, locals, escaped, params, dmut)
+        Some(t) -> all_demands_local(t, locals, escaped, opaque, dmut)
         None    -> true
       } }
     }
     EIf(c, t_, eo) -> {
-      if not all_demands_local(c, locals, escaped, params, dmut) { false }
-      else if not all_demands_local(t_, locals, escaped, params, dmut) { false }
+      if not all_demands_local(c, locals, escaped, opaque, dmut) { false }
+      else if not all_demands_local(t_, locals, escaped, opaque, dmut) { false }
       else { match eo {
-        Some(e2) -> all_demands_local(e2, locals, escaped, params, dmut)
+        Some(e2) -> all_demands_local(e2, locals, escaped, opaque, dmut)
         None     -> true
       } }
     }
     EMatch(scr, arms) ->
-      if not all_demands_local(scr, locals, escaped, params, dmut) { false }
-      else { all_demands_local_in_arms(arms, locals, escaped, params, dmut) }
+      if not all_demands_local(scr, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local_in_arms(arms, locals, escaped, opaque, dmut) }
     EBinop(_, a, b)   ->
-      if not all_demands_local(a, locals, escaped, params, dmut) { false }
-      else { all_demands_local(b, locals, escaped, params, dmut) }
-    EUnop(_, x)       -> all_demands_local(x, locals, escaped, params, dmut)
-    EField(b, _)      -> all_demands_local(b, locals, escaped, params, dmut)
+      if not all_demands_local(a, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(b, locals, escaped, opaque, dmut) }
+    EUnop(_, x)       -> all_demands_local(x, locals, escaped, opaque, dmut)
+    EField(b, _)      -> all_demands_local(b, locals, escaped, opaque, dmut)
     EIndex(a, b)      ->
-      if not all_demands_local(a, locals, escaped, params, dmut) { false }
-      else { all_demands_local(b, locals, escaped, params, dmut) }
-    EPipe(a, b)       ->
-      if not all_demands_local(a, locals, escaped, params, dmut) { false }
-      else { all_demands_local(b, locals, escaped, params, dmut) }
+      if not all_demands_local(a, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(b, locals, escaped, opaque, dmut) }
+    EPipe(a, b)       -> all_demands_local(pipe_as_call(a, b), locals, escaped, opaque, dmut)
     EMapPipe(a, b)    ->
-      if not all_demands_local(a, locals, escaped, params, dmut) { false }
-      else { all_demands_local(b, locals, escaped, params, dmut) }
+      if not all_demands_local(a, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(b, locals, escaped, opaque, dmut) }
     EFlatMapPipe(a, b)->
-      if not all_demands_local(a, locals, escaped, params, dmut) { false }
-      else { all_demands_local(b, locals, escaped, params, dmut) }
+      if not all_demands_local(a, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(b, locals, escaped, opaque, dmut) }
     EFilterPipe(a, b) ->
-      if not all_demands_local(a, locals, escaped, params, dmut) { false }
-      else { all_demands_local(b, locals, escaped, params, dmut) }
-    ELambda(_, b)     -> all_demands_local(b, locals, escaped, params, dmut)
-    ERecordLit(_, fs) -> all_demands_local_in_field_inits(fs, locals, escaped, params, dmut)
-    EList(els)        -> all_demands_local_in_list_elems(els, locals, escaped, params, dmut)
+      if not all_demands_local(a, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(b, locals, escaped, opaque, dmut) }
+    ELambda(_, b)     -> all_demands_local(b, locals, escaped, opaque, dmut)
+    ERecordLit(_, fs) -> all_demands_local_in_field_inits(fs, locals, escaped, opaque, dmut)
+    EList(els)        -> all_demands_local_in_list_elems(els, locals, escaped, opaque, dmut)
     ERange(a, b, oc)  -> {
-      if not all_demands_local(a, locals, escaped, params, dmut) { false }
-      else if not all_demands_local(b, locals, escaped, params, dmut) { false }
+      if not all_demands_local(a, locals, escaped, opaque, dmut) { false }
+      else if not all_demands_local(b, locals, escaped, opaque, dmut) { false }
       else { match oc {
-        Some(c) -> all_demands_local(c, locals, escaped, params, dmut)
+        Some(c) -> all_demands_local(c, locals, escaped, opaque, dmut)
         None    -> true
       } }
     }
     EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
-      if not all_demands_local(body, locals, escaped, params, dmut) { false }
+      if not all_demands_local(body, locals, escaped, opaque, dmut) { false }
       else if not (match init_opt {
-        Some(i) -> all_demands_local(i, locals, escaped, params, dmut)
+        Some(i) -> all_demands_local(i, locals, escaped, opaque, dmut)
         None    -> true
       }) { false }
-      else if not all_demands_local_in_hclauses(clauses, locals, escaped, params, dmut) { false }
+      else if not all_demands_local_in_hclauses(clauses, locals, escaped, opaque, dmut) { false }
       else { match ret_opt {
-        Some(HR(_, b, _, _)) -> all_demands_local(b, locals, escaped, params, dmut)
+        Some(HR(_, b, _, _)) -> all_demands_local(b, locals, escaped, opaque, dmut)
         None           -> true
       } }
     }
-    ELitUnit(inner, _) -> all_demands_local(inner, locals, escaped, params, dmut)
-    EBang(inner)       -> all_demands_local(inner, locals, escaped, params, dmut)
+    ELitUnit(inner, _) -> all_demands_local(inner, locals, escaped, opaque, dmut)
+    EBang(inner)       -> all_demands_local(inner, locals, escaped, opaque, dmut)
     _ -> true
   }
 }
@@ -14454,100 +14462,100 @@ fn all_demands_local_kind(k: ExprKind, locals: [String], escaped: [String],
 # check: a lambda argument's params then inherit that proven locality and
 # are walked as locals (the `foldl(xs, new(), \b -> mutate(b))` thread).
 fn all_demands_local_in_exprs(es: [Expr], locals: [String], escaped: [String],
-                              params: [String], dmut: [String], hof_local: Bool) : Bool = match es {
+                              opaque: [String], dmut: [String], hof_local: Bool) : Bool = match es {
   []           -> true
   [h, ...rest] -> {
     let ok = match h.kind {
       ELambda(ps, body) ->
         if hof_local {
           let locals2 = mut_collect_param_names(ps, locals)
-          all_demands_local(body, locals2, escaped, params, dmut)
-        } else { all_demands_local(h, locals, escaped, params, dmut) }
-      _ -> all_demands_local(h, locals, escaped, params, dmut)
+          all_demands_local(body, locals2, escaped, opaque, dmut)
+        } else { all_demands_local(h, locals, escaped, opaque, dmut) }
+      _ -> all_demands_local(h, locals, escaped, opaque, dmut)
     }
     if not ok { false }
-    else { all_demands_local_in_exprs(rest, locals, escaped, params, dmut, hof_local) }
+    else { all_demands_local_in_exprs(rest, locals, escaped, opaque, dmut, hof_local) }
   }
 }
 
 fn all_demands_local_in_stmts(stmts: [Stmt], locals: [String],
-                              escaped: [String], params: [String], dmut: [String]) : Bool = match stmts {
+                              escaped: [String], opaque: [String], dmut: [String]) : Bool = match stmts {
   []           -> true
   [s, ...rest] ->
-    if not all_demands_local_in_stmt(s, locals, escaped, params, dmut) { false }
-    else { all_demands_local_in_stmts(rest, locals, escaped, params, dmut) }
+    if not all_demands_local_in_stmt(s, locals, escaped, opaque, dmut) { false }
+    else { all_demands_local_in_stmts(rest, locals, escaped, opaque, dmut) }
 }
 
 fn all_demands_local_in_stmt(s: Stmt, locals: [String], escaped: [String],
-                              params: [String], dmut: [String]) : Bool {
+                              opaque: [String], dmut: [String]) : Bool {
   match s {
-    SLet(_, _, rhs)             -> all_demands_local(rhs, locals, escaped, params, dmut)
+    SLet(_, _, rhs)             -> all_demands_local(rhs, locals, escaped, opaque, dmut)
     SAssert(c, m) -> {
-      if not all_demands_local(c, locals, escaped, params, dmut) { false }
+      if not all_demands_local(c, locals, escaped, opaque, dmut) { false }
       else { match m {
-        Some(mx) -> all_demands_local(mx, locals, escaped, params, dmut)
+        Some(mx) -> all_demands_local(mx, locals, escaped, opaque, dmut)
         None     -> true
       } }
     }
-    SExprStmt(x)                -> all_demands_local(x, locals, escaped, params, dmut)
+    SExprStmt(x)                -> all_demands_local(x, locals, escaped, opaque, dmut)
     SIndexAssign(b, i, v, _, _) ->
-      if not all_demands_local(b, locals, escaped, params, dmut) { false }
-      else if not all_demands_local(i, locals, escaped, params, dmut) { false }
-      else { all_demands_local(v, locals, escaped, params, dmut) }
+      if not all_demands_local(b, locals, escaped, opaque, dmut) { false }
+      else if not all_demands_local(i, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(v, locals, escaped, opaque, dmut) }
     SAssign(b, v, _, _) ->
-      if not all_demands_local(b, locals, escaped, params, dmut) { false }
-      else { all_demands_local(v, locals, escaped, params, dmut) }
-    SVar(_, _, rhs, _, _)       -> all_demands_local(rhs, locals, escaped, params, dmut)
+      if not all_demands_local(b, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local(v, locals, escaped, opaque, dmut) }
+    SVar(_, _, rhs, _, _)       -> all_demands_local(rhs, locals, escaped, opaque, dmut)
     SUse(_, _, _)               -> true
   }
 }
 
 fn all_demands_local_in_arms(arms: [Arm], locals: [String], escaped: [String],
-                              params: [String], dmut: [String]) : Bool = match arms {
+                              opaque: [String], dmut: [String]) : Bool = match arms {
   []           -> true
   [h, ...rest] -> match h {
     Arm(_, g, b) -> {
       let g_ok = match g {
-        Some(gx) -> all_demands_local(gx, locals, escaped, params, dmut)
+        Some(gx) -> all_demands_local(gx, locals, escaped, opaque, dmut)
         None     -> true
       }
       if not g_ok { false }
-      else if not all_demands_local(b, locals, escaped, params, dmut) { false }
-      else { all_demands_local_in_arms(rest, locals, escaped, params, dmut) }
+      else if not all_demands_local(b, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local_in_arms(rest, locals, escaped, opaque, dmut) }
     }
   }
 }
 
 fn all_demands_local_in_hclauses(cs: [HClause], locals: [String],
-                                  escaped: [String], params: [String], dmut: [String]) : Bool = match cs {
+                                  escaped: [String], opaque: [String], dmut: [String]) : Bool = match cs {
   []           -> true
   [h, ...rest] -> match h {
     HC(_, _, b, _, _) ->
-      if not all_demands_local(b, locals, escaped, params, dmut) { false }
-      else { all_demands_local_in_hclauses(rest, locals, escaped, params, dmut) }
+      if not all_demands_local(b, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local_in_hclauses(rest, locals, escaped, opaque, dmut) }
   }
 }
 
 fn all_demands_local_in_field_inits(fs: [FieldInit], locals: [String],
-                                     escaped: [String], params: [String], dmut: [String]) : Bool = match fs {
+                                     escaped: [String], opaque: [String], dmut: [String]) : Bool = match fs {
   []           -> true
   [h, ...rest] -> match h {
     FI(_, v) ->
-      if not all_demands_local(v, locals, escaped, params, dmut) { false }
-      else { all_demands_local_in_field_inits(rest, locals, escaped, params, dmut) }
+      if not all_demands_local(v, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local_in_field_inits(rest, locals, escaped, opaque, dmut) }
   }
 }
 
 fn all_demands_local_in_list_elems(els: [ListElem], locals: [String],
-                                    escaped: [String], params: [String], dmut: [String]) : Bool = match els {
+                                    escaped: [String], opaque: [String], dmut: [String]) : Bool = match els {
   []           -> true
   [h, ...rest] -> match h {
     ElPlain(x) ->
-      if not all_demands_local(x, locals, escaped, params, dmut) { false }
-      else { all_demands_local_in_list_elems(rest, locals, escaped, params, dmut) }
+      if not all_demands_local(x, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local_in_list_elems(rest, locals, escaped, opaque, dmut) }
     ElSpread(x) ->
-      if not all_demands_local(x, locals, escaped, params, dmut) { false }
-      else { all_demands_local_in_list_elems(rest, locals, escaped, params, dmut) }
+      if not all_demands_local(x, locals, escaped, opaque, dmut) { false }
+      else { all_demands_local_in_list_elems(rest, locals, escaped, opaque, dmut) }
   }
 }
 

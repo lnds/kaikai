@@ -14,11 +14,63 @@ fiber boundary would be mutated as a copy.
 """)]
 
 import compiler.ast
+import compiler.modules
 import compiler.util
+
+#[doc("A nominal type's name with the type expressions its values store: a record's field types, or every payload of a sum's variants.")]
+pub type CarrierShape = CS(String, [TypeExpr])
 
 #[doc("Record type names whose mutation is observable to anyone sharing the value — every record with a transitive `Array`/`Ref` field. `Array`/`Ref` seed the set.")]
 pub fn mutating_record_type_names(recs: [RecInfo]) : [String] =
-  mutrec_fixpoint(recs, ["Ref", "Array"], 0)
+  shape_fixpoint(map(recs, record_shape), ["Ref", "Array"], false, 0)
+
+#[doc("Nominal type names whose values may reach a mutable cell: every record or sum storing an `Array`, a `Ref`, or a closure whose row carries `Mutable`, directly or through another such type. `Array`/`Ref` seed the set.")]
+pub fn mutating_type_names(shapes: [CarrierShape]) : [String] =
+  shape_fixpoint(shapes, ["Ref", "Array"], true, 0)
+
+#[doc("The shape of a record: its name and field types.")]
+pub fn record_shape(r: RecInfo) : CarrierShape = match r {
+  RI(name, _, fields, _) -> CS(name, map(fields, field_type))
+}
+
+#[doc("The shape of a sum: its name and every variant payload.")]
+pub fn sum_shape(name: String, vs: [Variant]) : CarrierShape = CS(name, variant_payloads(vs))
+
+fn variant_payloads(vs: [Variant]) : [TypeExpr] = match vs {
+  []           -> []
+  [v, ...rest] -> match v {
+    Var(_, tes) -> list_append(tes, variant_payloads(rest))
+  }
+}
+
+#[doc("""
+True iff a value of type `t` may reach a mutable cell its holder can observe.
+
+Wider than `ty_carries_mutation`: a carrier may sit in any type argument
+(`[Array[Int]]`, `Option[Array[Int]]`) or in a closure's captures when its
+row carries `Mutable`.
+""")]
+pub fn ty_may_carry_mutation(t: Ty, dmut: [String]) : Bool = match t {
+  TyCon(_, name, args) -> if list_has(dmut, name) { true } else { tys_may_carry_mutation(args, dmut) }
+  TyListT(elem)        -> ty_may_carry_mutation(elem, dmut)
+  TyFnT(_, _, row)     -> labels_name_mutable(row.labels)
+  TyUnion(ts)          -> tys_may_carry_mutation(ts, dmut)
+  TyRefineT(base, _)   -> ty_may_carry_mutation(base, dmut)
+  # A type variable does not count: a callee holding a value only
+  # parametrically can mutate it only through a callback it was handed,
+  # and the pass classifies that callback where it is called.
+  _                    -> false
+}
+
+fn tys_may_carry_mutation(ts: [Ty], dmut: [String]) : Bool = match ts {
+  []           -> false
+  [t, ...rest] -> if ty_may_carry_mutation(t, dmut) { true } else { tys_may_carry_mutation(rest, dmut) }
+}
+
+fn labels_name_mutable(labels: [Label]) : Bool = match labels {
+  []           -> false
+  [l, ...rest] -> if l.eff == "Mutable" { true } else { labels_name_mutable(rest) }
+}
 
 #[doc("True iff `t` carries mutation: head `Array`/`Ref`, or a record named in `dmut`.")]
 pub fn ty_carries_mutation(t: Ty, dmut: [String]) : Bool =
@@ -36,55 +88,78 @@ read, and Bytes are copied by value.
 pub fn is_bytes_writer(name: String) : Bool =
   name == "bytes_blit" or name == "bytes_put_le" or name == "bytes_put_string"
 
+#[doc("The name prefix of a derived `BinSerialize` writer, `fn <prefix><T>(buf: BinBuf, self: T) : BinBuf / Mutable`.")]
+pub fn derived_writer_prefix() : String = "__binser_put_"
+
+#[doc("""
+True iff the callee `name` mutates only its first argument: a core bytes
+writer, or a derived `BinSerialize` writer, which the compiler builds to
+append to its buffer and only read the value it encodes.
+""")]
+pub fn writes_only_first_arg(name: String) : Bool =
+  is_bytes_writer(name) or has_prefix(dotted_bare(name), derived_writer_prefix())
+
+fn has_prefix(s: String, p: String) : Bool =
+  string_length(s) >= string_length(p) and string_slice(s, 0, string_length(p)) == p
+
 #[doc("True iff `t` is `Array[_]` or `Ref[_]` — the heads that carry a cell directly.")]
 pub fn ty_is_mutable_ref(t: Ty) : Bool = match t {
   TyCon(_, name, _) -> if name == "Array" { true } else if name == "Ref" { true } else { false }
   _              -> false
 }
 
-# Iterate to a fixpoint so a record that only embeds another mutating
-# record (HashSet -> HashMap -> Ref) is caught. Bounded by the record
-# count: each pass adds at least one name or stops.
-fn mutrec_fixpoint(recs: [RecInfo], known: [String], passes: Int) : [String] =
-  if passes > list_length(recs) { known }
+# Iterate to a fixpoint so a type that only embeds another mutating
+# type (HashSet -> HashMap -> Ref) is caught. Bounded by the shape count:
+# each pass adds at least one name or stops. `fns` counts a closure
+# field whose row names `Mutable` as a carrier.
+fn shape_fixpoint(shapes: [CarrierShape], known: [String], fns: Bool, passes: Int) : [String] =
+  if passes > list_length(shapes) { known }
   else {
-    let next = mutrec_scan(recs, known, known)
+    let next = shape_scan(shapes, known, fns, known)
     if list_length(next) == list_length(known) { known }
-    else { mutrec_fixpoint(recs, next, passes + 1) }
+    else { shape_fixpoint(shapes, next, fns, passes + 1) }
   }
 
-fn mutrec_scan(recs: [RecInfo], known: [String], acc: [String]) : [String] = match recs {
+fn shape_scan(shapes: [CarrierShape], known: [String], fns: Bool, acc: [String]) : [String] = match shapes {
   []           -> acc
-  [r, ...rest] -> match r {
-    RI(name, _, fields, _) ->
-      if list_has(acc, name) { mutrec_scan(rest, known, acc) }
-      else if rec_fields_name_mutating(fields, known) {
-        mutrec_scan(rest, known, [name, ...acc])
-      } else { mutrec_scan(rest, known, acc) }
+  [s, ...rest] -> match s {
+    CS(name, tes) ->
+      if list_has(acc, name) { shape_scan(rest, known, fns, acc) }
+      else if te_list_names_mutating(tes, known, fns) { shape_scan(rest, known, fns, [name, ...acc]) }
+      else { shape_scan(rest, known, fns, acc) }
   }
 }
 
-fn rec_fields_name_mutating(fields: [FieldDecl], known: [String]) : Bool = match fields {
-  []           -> false
-  [f, ...rest] -> match f {
-    FD(_, _, te, _) ->
-      if te_names_mutating(te, known) { true }
-      else { rec_fields_name_mutating(rest, known) }
-  }
+fn field_type(f: FieldDecl) : TypeExpr = match f {
+  FD(_, _, te, _) -> te
 }
 
-# A field counts when its type-expression names a carrier at its head or
-# nested in a type argument / list element.
-fn te_names_mutating(te: TypeExpr, known: [String]) : Bool = match te.tkind {
+# A type expression counts when it names a carrier at its head, nested in
+# a type argument / list element, or is a closure whose row names `Mutable`.
+fn te_names_mutating(te: TypeExpr, known: [String], fns: Bool) : Bool = match te.tkind {
   TyName(name, targs) ->
     if list_has(known, name) { true }
-    else { te_list_names_mutating(targs, known) }
-  TyList(elem) -> te_names_mutating(elem, known)
+    else { te_list_names_mutating(targs, known, fns) }
+  TyList(elem)        -> te_names_mutating(elem, known, fns)
+  TyFn(_, _, row)     -> fns and row_expr_names_mutable(row)
   _ -> false
 }
 
-fn te_list_names_mutating(tes: [TypeExpr], known: [String]) : Bool = match tes {
+fn te_list_names_mutating(tes: [TypeExpr], known: [String], fns: Bool) : Bool = match tes {
   []           -> false
-  [t, ...rest] -> if te_names_mutating(t, known) { true }
-                  else { te_list_names_mutating(rest, known) }
+  [t, ...rest] -> if te_names_mutating(t, known, fns) { true }
+                  else { te_list_names_mutating(rest, known, fns) }
+}
+
+fn row_expr_names_mutable(row: RowExpr) : Bool = match row {
+  REmpty         -> false
+  RClosed(ls)    -> row_labels_name_mutable(ls)
+  ROpen(_, ls)   -> row_labels_name_mutable(ls)
+}
+
+fn row_labels_name_mutable(ls: [RowLabel]) : Bool = match ls {
+  []           -> false
+  [l, ...rest] -> match l {
+    RL(name, _) -> if name == "Mutable" { true } else { row_labels_name_mutable(rest) }
+  }
 }

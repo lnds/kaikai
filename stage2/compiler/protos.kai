@@ -106,6 +106,7 @@ import compiler.layout_validate
 import compiler.json_shape
 import compiler.json_derive
 import compiler.derive_generic
+import compiler.derive_reach
 
 # ====================================================================
 # Law wrappers (`laws <Theory>` / `axiom <Theory>`).
@@ -1334,53 +1335,45 @@ fn substitute_self_in_kind(k: TyKind) : TyKind {
   }
 }
 
-# m12.8.x: validate that, before expansion, every `#derive(P)` on a
-# sum type can be discharged: each variant field's head type must
-# already have a registered impl of `P` reachable from this
-# compilation unit (an explicit `impl P for T`, another `#derive(P)`
-# on `T`, or a builtin from `derive_builtin_impl`). Records keep the
-# pre-existing v1 behaviour (synthesise the impl, fall through to
-# the runtime panic if an inner field has no impl).
-fn validate_derives(ds: [Decl], df: DiagFiles) : Int / Console {
+# Validate, before expansion, that every `#[derive(P)]` of Eq, Hash or
+# Show can be discharged: each field type must reach an impl of `P`
+# (explicit, derived, or builtin) through every type argument a container
+# impl bounds by `P`, so `[(Int, String)]` needs `P` on `List` and `Pair`.
+fn validate_derives(ds: [Decl], df: DiagFiles) : Int / Console =
+  validate_derives_loop(ds, df, collect_impl_reach(ds, []), 0)
 
-  let future_impls = collect_future_impl_keys(ds, [])
-  validate_derives_loop(ds, df, future_impls, 0)
-}
-
-fn collect_future_impl_keys(ds: [Decl], acc: [String]) : [String] {
+fn collect_impl_reach(ds: [Decl], acc: [ImplReach]) : [ImplReach] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DImpl(pname, _, target, _, _, _, _, isym) ->
-        collect_future_impl_keys(rest,
-          [concat_all([dotted_bare(pname), "/", proto_type_name(target)]), ...acc])
-      DDerive(names, inner, _, _) -> {
-        let acc1 = match inner {
-          DType(_, tname, _, _, _, _, _, _, _) ->
-            add_future_impl_keys(map(names, dotted_bare), tname, acc)
-          _ -> acc
-        }
-        collect_future_impl_keys(rest, acc1)
+      DImpl(pname, _, target, _, _, _, tps, _) ->
+        collect_impl_reach(rest, [impl_reach(dotted_bare(pname), head_tree(target), tps), ...acc])
+      DDerive(names, inner, _, _) -> match inner {
+        DType(_, tname, tps, _, _, _, _, _, _) ->
+          collect_impl_reach(rest, list_append(map(names, (n) => derived_reach(dotted_bare(n), tname, tps)), acc))
+        _ -> collect_impl_reach(rest, acc)
       }
       DUnstable(inner, _, _) ->
-        collect_future_impl_keys([inner, ...rest], acc)
+        collect_impl_reach([inner, ...rest], acc)
       DProtoLaws(_, inner, _, _, _) ->
-        collect_future_impl_keys([inner, ...rest], acc)
+        collect_impl_reach([inner, ...rest], acc)
       DImplAxiom(_, inner, _, _, _) ->
-        collect_future_impl_keys([inner, ...rest], acc)
+        collect_impl_reach([inner, ...rest], acc)
       DConstructor(inner, _, _) ->
-        collect_future_impl_keys([inner, ...rest], acc)
-      _ -> collect_future_impl_keys(rest, acc)
+        collect_impl_reach([inner, ...rest], acc)
+      _ -> collect_impl_reach(rest, acc)
     }
   }
 }
 
-fn add_future_impl_keys(names: [String], tname: String, acc: [String]) : [String] {
-  match names {
-    [] -> acc
-    [n, ...rest] ->
-      add_future_impl_keys(rest, tname, [concat_all([n, "/", tname]), ...acc])
-  }
+fn head_tree(te: TypeExpr) : HeadTree = HT(proto_type_name(te), map(te_type_args(te), head_tree))
+
+fn te_type_args(te: TypeExpr) : [TypeExpr] = match te.tkind {
+  TyName(_, args)   -> args
+  TyList(elem)      -> [elem]
+  TyDim(base, _)    -> te_type_args(base)
+  TyRefine(base, _) -> te_type_args(base)
+  _                 -> []
 }
 
 # Builtin impls bundled with kaikai for primitive types, kept in
@@ -1400,114 +1393,124 @@ pub fn derive_builtin_impl(pname: String, tname: String) : Bool {
   } else { false }
 }
 
-fn validate_derives_loop(ds: [Decl], df: DiagFiles,
-                          future_impls: [String], errs: Int) : Int / Console {
-
+fn validate_derives_loop(ds: [Decl], df: DiagFiles, reach: [ImplReach], errs: Int) : Int / Console {
   match ds {
     [] -> errs
     [d, ...rest] -> match d {
       DDerive(names, inner, line, col) -> {
         let file = decl_diag_file(d, df)
-        let errs1 = validate_derive_decl(map(names, dotted_bare), inner, file,
-                                          future_impls, line, col, errs)
-        validate_derives_loop(rest, df, future_impls, errs1)
+        let errs1 = validate_derive_decl(map(names, dotted_bare), inner, file, reach, line, col, errs)
+        validate_derives_loop(rest, df, reach, errs1)
       }
       DUnstable(inner, _, _) ->
-        validate_derives_loop([inner, ...rest], df, future_impls, errs)
+        validate_derives_loop([inner, ...rest], df, reach, errs)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_derives_loop([inner, ...rest], df, future_impls, errs)
+        validate_derives_loop([inner, ...rest], df, reach, errs)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_derives_loop([inner, ...rest], df, future_impls, errs)
+        validate_derives_loop([inner, ...rest], df, reach, errs)
       DConstructor(inner, _, _) ->
-        validate_derives_loop([inner, ...rest], df, future_impls, errs)
-      _ -> validate_derives_loop(rest, df, future_impls, errs)
+        validate_derives_loop([inner, ...rest], df, reach, errs)
+      _ -> validate_derives_loop(rest, df, reach, errs)
     }
   }
 }
 
-fn validate_derive_decl(names: [String], inner: Decl, file: String,
-                         future_impls: [String], dline: Int, dcol: Int,
-                         errs: Int) : Int / Console {
+# Where a derive reports: the file and position of its declaration.
+type DeriveSite = DS(String, Int, Int)
 
-  match inner {
-    DType(_, tname, tps, body, _, _, _, _, _) -> match body {
-      TBSum(variants) -> validate_derive_sum_protos(names, tname, variants,
-                                                     file, list_append(bound_param_impls(tps), future_impls),
-                                                     dline, dcol, errs)
-      _ -> errs
-    }
-    _ -> errs
+fn validate_derive_decl(names: [String], inner: Decl, file: String, reach: [ImplReach],
+                        dline: Int, dcol: Int, errs: Int) : Int / Console = match inner {
+  DType(_, tname, tps, body, _, _, _, _, _) -> {
+    let fields = derive_field_types(body)
+    let own = list_append(map(names, (n) => derived_reach(n, tname, tps)), param_reach(names, tps))
+    validate_derive_protos(filter(names, derive_reach_checked), tname, fields,
+                           list_append(own, reach), DS(file, dline, dcol), errs)
+  }
+  _ -> errs
+}
+
+fn derive_reach_checked(pname: String) : Bool =
+  pname == "Eq" or pname == "Hash" or pname == "Show"
+
+# A field typed by a parameter the derive bounds is covered by that bound.
+fn param_reach(names: [String], tps: [String]) : [ImplReach] = match names {
+  []          -> []
+  [n, ...rest] ->
+    list_append(map(derive_bound_params(tps), (tp) => IR(reach_key(n, tp), [])), param_reach(rest, tps))
+}
+
+# Each field a derived impl reads, labelled the way a diagnostic names it.
+type DeriveField = DFld(String, TypeExpr)
+
+fn derive_field_types(body: TypeBody) : [DeriveField] = match body {
+  TBSum(variants)  -> variant_fields(variants)
+  TBRecord(fields) -> map(fields, record_field)
+  _                -> []
+}
+
+fn variant_fields(vs: [Variant]) : [DeriveField] = match vs {
+  []           -> []
+  [v, ...rest] -> match v {
+    Var(vname, vargs) -> list_append(variant_args(vname, vargs, 0), variant_fields(rest))
   }
 }
 
-# The derived impl bounds each plain type parameter by the protocol, so
-# a payload typed by one is covered.
-fn bound_param_impls(tps: [String]) : [String] = {
-  let ps = derive_bound_params(tps)
-  list_append(map(ps, (tp) => concat_all(["Eq/", tp])), map(ps, (tp) => concat_all(["Hash/", tp])))
+fn variant_args(vname: String, vargs: [TypeExpr], i: Int) : [DeriveField] = match vargs {
+  []            -> []
+  [te, ...rest] ->
+    [DFld(concat_all(["variant `", vname, "` field #", int_to_string(i)]), te),
+     ...variant_args(vname, rest, i + 1)]
 }
 
-fn validate_derive_sum_protos(names: [String], tname: String, variants: [Variant],
-                                file: String, future_impls: [String],
-                                line: Int, col: Int, errs: Int) : Int / Console {
-
-  match names {
-    [] -> errs
-    [pname, ...rest] -> {
-      let errs1 =
-        if pname == "Eq" or pname == "Hash" {
-          validate_derive_sum_variants(pname, tname, variants, file,
-                                        future_impls, line, col, errs)
-        } else { errs }
-      validate_derive_sum_protos(rest, tname, variants, file, future_impls,
-                                  line, col, errs1)
-    }
-  }
+fn record_field(f: FieldDecl) : DeriveField = match f {
+  FD(_, fname, te, _) -> DFld(concat_all(["field `", fname, "`"]), te)
 }
 
-fn validate_derive_sum_variants(pname: String, tname: String, vs: [Variant],
-                                 file: String, future_impls: [String],
-                                 line: Int, col: Int, errs: Int) : Int / Console {
-
-  match vs {
-    [] -> errs
-    [v, ...rest] -> match v {
-      Var(vname, vargs) -> {
-        let errs1 = validate_derive_variant_args(pname, tname, vname, vargs,
-                                                  0, file, future_impls,
-                                                  line, col, errs)
-        validate_derive_sum_variants(pname, tname, rest, file, future_impls,
-                                      line, col, errs1)
-      }
-    }
-  }
+fn validate_derive_protos(names: [String], tname: String, fields: [DeriveField],
+                          reach: [ImplReach], site: DeriveSite, errs: Int) : Int / Console = match names {
+  []               -> errs
+  [pname, ...rest] ->
+    validate_derive_protos(rest, tname, fields, reach, site,
+                           validate_derive_fields(pname, tname, fields, reach, site, errs))
 }
 
-fn validate_derive_variant_args(pname: String, tname: String, vname: String,
-                                 vargs: [TypeExpr], i: Int, file: String,
-                                 future_impls: [String], line: Int, col: Int,
-                                 errs: Int) : Int / Console {
-  match vargs {
-    [] -> errs
-    [te, ...rest] -> {
-      let head = proto_type_name(te)
-      let key = concat_all([pname, "/", head])
-      let ok = list_has(future_impls, key) or derive_builtin_impl(pname, head)
-      let errs1 =
-        if ok { errs }
-        else {
-          eprint(concat_all([
-            file, ":", int_to_string(line), ":", int_to_string(col),
-            ": error: cannot derive `", pname, "` for `", tname,
-            "`: variant `", vname, "` field #", int_to_string(i),
-            " has type `", head,
-            "` which has no `impl ", pname, " for ", head,
-            "` in this compilation unit"]))
+fn validate_derive_fields(pname: String, tname: String, fields: [DeriveField],
+                          reach: [ImplReach], site: DeriveSite, errs: Int) : Int / Console = match fields {
+  []           -> errs
+  [f, ...rest] -> match f {
+    DFld(what, te) -> {
+      let path = missing_path(pname, head_tree(te), reach, (h) => derive_builtin_impl(pname, h))
+      let errs1 = match path {
+        [] -> errs
+        _  -> {
+          report_derive_missing(pname, tname, what, path, site)
           errs + 1
         }
-      validate_derive_variant_args(pname, tname, vname, rest, i + 1, file,
-                                    future_impls, line, col, errs1)
+      }
+      validate_derive_fields(pname, tname, rest, reach, site, errs1)
     }
+  }
+}
+
+fn last_head(path: [String]) : String = match path {
+  []           -> ""
+  [h]          -> h
+  [_, ...rest] -> last_head(rest)
+}
+
+fn report_derive_missing(pname: String, tname: String, what: String, path: [String],
+                         site: DeriveSite) : Unit / Console = match site {
+  DS(file, line, col) -> {
+    let head = last_head(path)
+    let lacks = concat_all(["no `impl ", pname, " for ", head, "` in this compilation unit"])
+    let tail = match path {
+      [_] -> concat_all([" which has ", lacks])
+      _   -> concat_all(["; `", head, "` has ", lacks])
+    }
+    eprint(concat_all([
+      file, ":", int_to_string(line), ":", int_to_string(col),
+      ": error: cannot derive `", pname, "` for `", tname, "`: ", what,
+      " has type `", path_type(path), "`", tail]))
   }
 }
 
@@ -2265,10 +2268,14 @@ fn derive_binser_decls(tname: String, shown: String, put: Expr, from_b: Expr,
    derive_binser_put_fn(tname, put, line, col),
    derive_binser_shim(tname, shown, line, col)]
 
-# `bin_buf_run(self, <writer>)`: the writer over a fresh buffer.
-fn derive_binser_to_bytes(tname: String, line: Int, col: Int) : Expr =
-  binser_call("bin_buf_run", [mk_ref("self", line, col),
-                              mk_ref(binser_put_name(tname), line, col)], line, col)
+# `bin_buf_bytes(<writer>(bin_buf_new(), self))`: the writer over a fresh
+# buffer. The masking pass keeps this pure because a derived writer
+# mutates only its buffer (`writes_only_first_arg`).
+fn derive_binser_to_bytes(tname: String, line: Int, col: Int) : Expr {
+  let fresh = binser_call("bin_buf_new", [], line, col)
+  let put = binser_call(binser_put_name(tname), [fresh, mk_ref("self", line, col)], line, col)
+  binser_call("bin_buf_bytes", [put], line, col)
+}
 
 # `fn <writer>(buf: BinBuf, self: T) : BinBuf / Mutable` appends `self`
 # to `buf`. Nested derived values are written into the same buffer, so
@@ -2282,7 +2289,7 @@ fn derive_binser_put_fn(tname: String, body: Expr, line: Int, col: Int) : Decl {
       RClosed([RL("Mutable", [])]), body, line, col, None, sym_none())
 }
 
-fn binser_put_name(tname: String) : String = concat_all(["__binser_put_", tname])
+fn binser_put_name(tname: String) : String = concat_all([derived_writer_prefix(), tname])
 
 fn binser_call(name: String, args: [Expr], line: Int, col: Int) : Expr =
   mk_expr(ECall(mk_ref(name, line, col), args), line, col)
@@ -4465,19 +4472,16 @@ fn prc_impls_has(impls: [ProtoImplReg], proto: String, head: String) : Bool {
 # dispatcher panic at runtime.
 #[doc("Post-rewrite static-coherence check over the whole typed program.")]
 pub fn validate_resolved_protocols(typed: TypedProgram, reg: ProtocolReg,
-                                file: String) : Int / Console + File =
+                                df: DiagFiles) : Int / Console + File =
+  validate_resolved_decls(typed.decls, reg, df, 0)
 
-
-  validate_resolved_decls(typed.decls, reg, file, 0)
-
-#[doc("Post-rewrite static-coherence check over a decl list (used after monomorphisation).")]
+#[doc("Post-rewrite static-coherence check over a decl list (used after monomorphisation). Each diagnostic names the file that declares its decl.")]
 pub fn validate_resolved_decls(ds: [Decl], reg: ProtocolReg,
-                            file: String, errs: Int) : Int / Console + File {
-
-
+                            df: DiagFiles, errs: Int) : Int / Console + File {
   match ds {
     [] -> errs
     [d, ...rest] -> {
+      let file = decl_diag_file(d, df)
       # The decl's module scopes which protocols may clear its
       # residual dispatcher calls, mirroring the rewrite.
       let e1 = match d {
@@ -4491,7 +4495,7 @@ pub fn validate_resolved_decls(ds: [Decl], reg: ProtocolReg,
           validate_resolved_expr(body, reg, None, file, errs)
         _ -> errs
       }
-      validate_resolved_decls(rest, reg, file, e1)
+      validate_resolved_decls(rest, reg, df, e1)
     }
   }
 }
