@@ -16626,6 +16626,16 @@ static int kai_read_nthreads(void) {
 }
 
 
+/* Under KAI_TRACE_RC, KAI_TRACE_RC_RUNS=k runs main k times in one process,
+ * so the RC ledger can tell a leak that grows with the work from state that
+ * lives once. Without KAI_TRACE_RC, main runs once. */
+static int kai_read_rc_runs(void) {
+    if (!getenv("KAI_TRACE_RC")) return 1;
+    const char *e = getenv("KAI_TRACE_RC_RUNS");
+    long n = e && *e ? strtol(e, NULL, 10) : 1;
+    return n < 1 ? 1 : (int) n;
+}
+
 /* Run the program. At N=1 this is exactly `kai_main()` — no threads, no
  * fibers spawned for main, byte-identical. At N>1 it starts the worker
  * pool, runs kai_main as a fiber on thread 0, drives thread 0's
@@ -16639,6 +16649,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     if (kai_nthreads <= 1) {
         kai_nthreads = 1;
         KAI_TSAN_BIND_ROOT();
+        for (int run = kai_read_rc_runs(); run > 1; run--) kai_decref(user_main());
         return user_main();
     }
 

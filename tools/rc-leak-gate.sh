@@ -24,6 +24,14 @@
 # backends disagree on how many cells survive to exit for a third of the
 # corpus, so the baseline pins one column each. KAI_LEAK_BACKEND selects
 # the backend (default c); KAI_LEAK_JOBS the worker count.
+#
+# An exact pin cannot tell a leak from state that legitimately lives until
+# exit, so a leak recorded when the pin was taken stays green forever. Each
+# fixture therefore also runs main twice in one process
+# (KAI_TRACE_RC_RUNS=2): growth = leaked(2 runs) - leaked(1 run) is what
+# the program retains per run of its work. It must be 0, except for the
+# known leaks pinned exactly in tools/rc-growth-baseline.txt, one
+# `<name>:<c>:<native>` line each.
 
 set -u
 
@@ -32,6 +40,7 @@ export ROOT="$(pwd)"
 export KAI="$ROOT/bin/kai"
 export WORK="$ROOT/stage2/build/rc-leak-gate"
 export BASELINE="$ROOT/tools/rc-leak-baseline.txt"
+export GROWTH="$ROOT/tools/rc-growth-baseline.txt"
 SKIPS="$ROOT/tools/rc-leak-skips.txt"
 export BACKEND="${KAI_LEAK_BACKEND:-c}"
 export RUN_TIMEOUT="${KAI_LEAK_TIMEOUT:-120}"
@@ -54,7 +63,7 @@ fi
 
 # The baseline column for the backend under test; `-` means skipped there.
 pinned() {
-  local row; row="$(sed -n "s/^$1://p" "$BASELINE" | head -1)"
+  local row; row="$(sed -n "s/^$1://p" "${2:-$BASELINE}" | head -1)"
   [ -n "$row" ] || return
   case "$BACKEND" in
     native) echo "${row#*:}" ;;
@@ -62,27 +71,44 @@ pinned() {
   esac
 }
 
-# One fixture: build, run under the ledger, write `<name>:<leaked>` (or a
-# verdict tag) for the serial comparison pass.
+# The pinned growth: 0 unless the fixture is a known leak.
+pinned_growth() {
+  local g; g="$(pinned "$1" "$GROWTH")"
+  echo "${g:-0}"
+}
+
+# One ledger run of `$1` with main run `$2` times: its `leaked`, or a tag.
+ledger_run() {
+  local bin="$1" runs="$2" rc=0
+  if [ -n "$TIMEOUT_CMD" ]; then
+    "$TIMEOUT_CMD" "$RUN_TIMEOUT" env KAI_THREADS=1 KAI_TRACE_RC=1 KAI_TRACE_RC_RUNS="$runs" "$bin" >"$bin.out" 2>"$bin.err" </dev/null || rc=$?
+  else
+    env KAI_THREADS=1 KAI_TRACE_RC=1 KAI_TRACE_RC_RUNS="$runs" "$bin" >"$bin.out" 2>"$bin.err" </dev/null || rc=$?
+  fi
+  [ "$rc" -eq 124 ] && { echo TIMEOUT; return; }
+  local leaked
+  leaked="$(sed -n 's/^\[KAI_TRACE_RC\] .*leaked=\([0-9-]*\).*/\1/p' "$bin.err" | head -1)"
+  echo "${leaked:-NO-LEDGER}"
+}
+
+# One fixture: build, run under the ledger once and twice, write
+# `<name>:<leaked>:<growth>` (or a verdict tag) for the serial comparison.
 measure_one() {
   local name="$1" bin="$WORK/$1"
   if [ "$(pinned "$name")" = - ]; then echo "$name:-" > "$bin.measured"; return; fi
   if ! "$KAI" build --backend="$BACKEND" "$ROOT/examples/perceus/$name.kai" -o "$bin" >"$bin.build" 2>&1; then
     echo "$name:BUILD-FAIL" > "$bin.measured"; return
   fi
-  local rc=0
-  if [ -n "$TIMEOUT_CMD" ]; then
-    "$TIMEOUT_CMD" "$RUN_TIMEOUT" env KAI_THREADS=1 KAI_TRACE_RC=1 "$bin" >"$bin.out" 2>"$bin.err" </dev/null || rc=$?
-  else
-    env KAI_THREADS=1 KAI_TRACE_RC=1 "$bin" >"$bin.out" 2>"$bin.err" </dev/null || rc=$?
-  fi
-  [ "$rc" -eq 124 ] && { echo "$name:TIMEOUT" > "$bin.measured"; return; }
-  local leaked
-  leaked="$(sed -n 's/^\[KAI_TRACE_RC\] .*leaked=\([0-9-]*\).*/\1/p' "$bin.err" | head -1)"
-  echo "$name:${leaked:-NO-LEDGER}" > "$bin.measured"
+  local once twice growth=-
+  once="$(ledger_run "$bin" 1)"
+  case "$once" in
+    *[!0-9]*) ;;
+    *) twice="$(ledger_run "$bin" 2)"
+       case "$twice" in *[!0-9]*) growth="$twice" ;; *) growth=$((twice - once)) ;; esac ;;
+  esac
+  echo "$name:$once:$growth" > "$bin.measured"
 }
-export -f measure_one pinned
-export BASELINE
+export -f measure_one ledger_run pinned pinned_growth
 
 # Fixtures the gate cannot execute standalone (negative tests, library
 # modules with no main) are listed in tools/rc-leak-skips.txt. Those lines
@@ -106,7 +132,8 @@ xargs -P "$JOBS" -n 1 -I{} bash -c 'measure_one "$@"' _ {} < "$fixtures"
 
 fail=0
 while IFS= read -r name; do
-  measured="$(cut -d: -f2- "$WORK/$name.measured" 2>/dev/null)"
+  measured="$(cut -d: -f2 "$WORK/$name.measured" 2>/dev/null)"
+  growth="$(cut -d: -f3 "$WORK/$name.measured" 2>/dev/null)"
   expect="$(pinned "$name")"
   if [ "$expect" = - ]; then
     continue
@@ -117,6 +144,9 @@ while IFS= read -r name; do
     echo "FAIL $name — leaked=$measured, baseline $expect"
     [ "$measured" = BUILD-FAIL ] && tail -4 "$WORK/$name.build" 2>/dev/null | sed 's/^/    /'
     fail=1
+  elif [ "$growth" != "$(pinned_growth "$name")" ]; then
+    echo "FAIL $name — leaked grows by $growth per run of main, pinned growth $(pinned_growth "$name")"
+    fail=1
   fi
 done < "$fixtures"
 
@@ -126,6 +156,10 @@ while IFS=: read -r name _; do
   case "$name" in ''|\#*) continue ;; esac
   grep -qx "$name" "$fixtures" || { echo "FAIL $name — baseline line has no fixture"; fail=1; }
 done < "$BASELINE"
+while IFS=: read -r name _; do
+  case "$name" in ''|\#*) continue ;; esac
+  grep -qx "$name" "$fixtures" || { echo "FAIL $name — growth line has no fixture"; fail=1; }
+done < "$GROWTH"
 
 [ "$fail" -eq 0 ] || { echo "rc-leak-gate: FAIL"; exit 1; }
 echo "rc-leak-gate: PASS — $total fixtures match their pinned RC ledger."
