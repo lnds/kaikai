@@ -68,17 +68,23 @@ Three tiers; the higher tier wins on conflict.
 ## Three-stage bootstrap
 
 - **Stage 0** — minimal C compiler, zero deps. Compiles kaikai-minimal → portable C.
-- **Stage 1** — intermediate compiler in kaikai-minimal. Compiles enough of full kaikai to produce stage 2 → C.
+- **Stage 1** — intermediate compiler in kaikai-minimal. **Frozen**: it compiles kaikai-minimal, and no longer carries the obligation to compile what stage 2 writes.
 - **Stage 2** — definitive compiler in full kaikai, direct LLVM backend, self-hosted (`docs/stage2-design.md`).
 
-Bootstrap from any machine with `cc`:
+**Stage 2 is built by the previous compiler, Rust/Go-style.** `KAIC_BOOT` is kaikai's `GOROOT_BOOTSTRAP`: it resolves to the previous release's tarball, and the default is `release`. That is what frees stage 2 to use the language it implements — while stage 1 compiled it on every build, the compiler was capped at the kaikai-minimal subset.
+
+The rescue path from a bare `cc` is the **frozen seed**: a `stage2.c` emitted by a release and pinned in a `bootstrap-seed-v*` tag, alongside the `runtime.h` it pairs with (OCaml's `boot/ocamlc` model). Each release freezes the next one. Bootstrap from any machine with `cc`:
 
 ```sh
-cc stage0/*.c -o kaic0
-./kaic0 stage1/compiler.kai > stage1.c && cc stage1.c -I stage0 -o kaic1
-./kaic1 examples/minimal/fizzbuzz.kai -o fizzbuzz
-./fizzbuzz
+git show bootstrap-seed-v0.125.0:bootstrap/stage2.c  > /tmp/seed/stage2.c
+git show bootstrap-seed-v0.125.0:bootstrap/runtime.h > /tmp/seed/runtime.h
+cc -std=c99 -O1 -I /tmp/seed /tmp/seed/stage2.c -o kaic2-seed -lm
+./kaic2-seed --edition hanga-roa --path stdlib stage2/main.kai > /tmp/self.c
 ```
+
+`#include "runtime.h"` resolves next to the `.c` first, so a generation built from the seed must not sit in the seed's directory — it would pick up the seed's runtime instead of this tree's.
+
+Stage 0 and stage 1 are frozen, never deleted: GHC is the cautionary tale, having abandoned its C bootstrap and become unbuildable without a prior GHC.
 
 ## Build system — read before running the compiler or touching a Makefile
 
