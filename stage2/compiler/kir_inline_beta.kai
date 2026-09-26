@@ -9,10 +9,11 @@
 # block — after the pasted body — so the captures outlive every read.
 #
 # The dead-closure sweep then removes a `KClosure` binding whose only
-# remaining uses are its own dup/drop RC ops. The build BORROWS its
+# remaining uses are its own dup/drop RC ops. The build borrows its
 # capture atoms (the runtime closure ctor increfs each one; the
-# closure's free decrefs them), so deleting a dead build orphans no
-# capture refs and frees nothing early.
+# closure's free decrefs them), and a pasted body reads those captures
+# from the caller's registers — alive only through the closure's hold
+# when the caller dropped its own ref before the site.
 
 import compiler.util
 import compiler.kir
@@ -284,48 +285,70 @@ fn kin_alias_cap_is_self(nm: String, ps: [KParam], caps: [KVal]) : Bool = match 
 
 # A closure binding (or a register alias of one) whose only remaining
 # uses are its own dup/drop RC ops is dead: nothing calls, stores,
-# passes or returns it. The build borrows its captures (see the module
-# head), so removal — build, alias copies, and the register's own
-# dup/drops together — is RC-neutral for every capture. Runs to a
-# bounded fixpoint: removing an alias exposes the closure build it read.
+# passes or returns it. Removal keeps the closure's hold on its
+# captures: the build and each dup become a dup of every capture, each
+# drop a drop of every capture, so no capture is released before the
+# closure would have been. Runs to a bounded fixpoint: removing an
+# alias exposes the closure build it read.
 fn kin_dce_closures(bs: [KBlock]) : [KBlock] = kin_dce_fix(bs, 4)
 
 fn kin_dce_fix(bs: [KBlock], fuel: Int) : [KBlock] =
   if fuel <= 0 { bs }
   else {
-    let dead = kin_dce_candidates(kin_clo_env(bs), bs, [])
+    let dead = kin_dce_candidates(kin_clo_env(bs), bs, kin_store_names(bs, []), [])
     match dead {
       [] -> bs
       _  -> kin_dce_fix(kin_dce_rewrite(bs, dead, []), fuel - 1)
     }
   }
 
-fn kin_dce_candidates(env: [KinClo], bs: [KBlock], acc: [String]) : [String] = match env {
+# A re-stored capture register would hand the moved RC ops a different
+# value than the one captured, so such a closure stays.
+fn kin_dce_candidates(env: [KinClo], bs: [KBlock], stores: [String], acc: [KinClo]) : [KinClo] = match env {
   [] -> acc
-  [KCl(n, _, _), ...rest] ->
-    kin_dce_candidates(rest, bs,
-      if kin_name_used(bs, n) { acc } else { [n, ...acc] })
+  [KCl(n, sym, caps), ...rest] ->
+    kin_dce_candidates(rest, bs, stores,
+      if kin_name_used(bs, n) or kin_caps_stored(caps, stores) { acc }
+      else { [KCl(n, sym, caps), ...acc] })
+}
+
+fn kin_caps_stored(caps: [KVal], stores: [String]) : Bool = match caps {
+  []                 -> false
+  [KVar(c), ...rest] -> list_has(stores, c) or kin_caps_stored(rest, stores)
+  [_, ...rest]       -> kin_caps_stored(rest, stores)
 }
 
 # Any non-RC use of register `n` across the fn (op atoms, store
 # values, terminator atoms). The closure's own dup/drop do not count.
 fn kin_name_used(bs: [KBlock], n: String) : Bool = kir_reg_used(bs, n, false)
 
-# Drop the dead closures' KLets and their dup/drop RC statements.
-fn kin_dce_rewrite(bs: [KBlock], dead: [String], acc: [KBlock]) : [KBlock] = match bs {
+fn kin_dce_rewrite(bs: [KBlock], dead: [KinClo], acc: [KBlock]) : [KBlock] = match bs {
   []           -> list_reverse(acc)
   [b, ...rest] -> kin_dce_rewrite(rest, dead,
     [KBlock { label: b.label, stmts: kin_dce_stmts(b.stmts, dead, []), term: b.term,
               region_id: b.region_id }, ...acc])
 }
 
-fn kin_dce_stmts(ss: [KStmt], dead: [String], acc: [KStmt]) : [KStmt] = match ss {
+fn kin_dce_stmts(ss: [KStmt], dead: [KinClo], acc: [KStmt]) : [KStmt] = match ss {
   []           -> list_reverse(acc)
-  [s, ...rest] -> kin_dce_stmts(rest, dead, match s {
-    KLet(n, _, KClosure(_, _, _), _)  -> if list_has(dead, n) { acc } else { [s, ...acc] }
-    KLet(n, _, KLitOp(KVar(_)), _)    -> if list_has(dead, n) { acc } else { [s, ...acc] }
-    KRC(KDup(KVar(n)), _)             -> if list_has(dead, n) { acc } else { [s, ...acc] }
-    KRC(KDrop(KVar(n)), _)            -> if list_has(dead, n) { acc } else { [s, ...acc] }
-    _                                 -> [s, ...acc]
-  })
+  [s, ...rest] -> kin_dce_stmts(rest, dead, kin_dce_stmt(s, dead, acc))
+}
+
+fn kin_dce_stmt(s: KStmt, dead: [KinClo], acc: [KStmt]) : [KStmt] = match s {
+  KLet(n, _, KClosure(_, _, _), pos) -> kin_dce_hold(kin_clo_find(dead, n), true, pos, s, acc)
+  KLet(n, _, KLitOp(KVar(_)), _)     -> match kin_clo_find(dead, n) { Some(_) -> acc  None -> [s, ...acc] }
+  KRC(KDup(KVar(n)), pos)            -> kin_dce_hold(kin_clo_find(dead, n), true, pos, s, acc)
+  KRC(KDrop(KVar(n)), pos)           -> kin_dce_hold(kin_clo_find(dead, n), false, pos, s, acc)
+  _                                  -> [s, ...acc]
+}
+
+fn kin_dce_hold(hit: Option[KinClo], dup: Bool, pos: KPos, s: KStmt, acc: [KStmt]) : [KStmt] = match hit {
+  None                  -> [s, ...acc]
+  Some(KCl(_, _, caps)) -> kin_caps_rc(caps, dup, pos, acc)
+}
+
+fn kin_caps_rc(caps: [KVal], dup: Bool, pos: KPos, acc: [KStmt]) : [KStmt] = match caps {
+  []                 -> acc
+  [KVar(c), ...rest] -> kin_caps_rc(rest, dup, pos, [KRC(if dup { KDup(KVar(c)) } else { KDrop(KVar(c)) }, pos), ...acc])
+  [_, ...rest]       -> kin_caps_rc(rest, dup, pos, acc)
 }
