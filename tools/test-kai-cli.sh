@@ -154,6 +154,27 @@ expect "bench: --iters must be positive" 2 \
 expect "check: --backend is validated" 2 \
   "kai: error: --backend must be 'c' or 'native' (got: llvm)" "$KAI" check --backend llvm x.kai
 
+# mutate checks each mutant with the package's search paths, so a module in a
+# subdirectory still resolves the package root and its dependencies.
+M="$TMP/mut"
+mkdir -p "$M/app/sub" "$M/dep"
+printf 'name = "td"\n' > "$M/dep/kai.toml"
+printf 'pub fn one() : Int = 1\n' > "$M/dep/depone.kai"
+printf 'name = "tm"\n\n[dependencies]\ntd = { path = "../dep" }\n' > "$M/app/kai.toml"
+printf 'pub fn two() : Int = 2\n' > "$M/app/base.kai"
+printf 'import base\nimport depone\npub fn five() : Int = base.two() * 2 + depone.one()\n' > "$M/app/sub/leaf.kai"
+printf 'import nosuch\npub fn six() : Int = nosuch.six() + 1\n' > "$M/app/sub/broken.kai"
+got="$(cd "$M/app" && "$KAI" mutate --module sub/leaf.kai --operator literal --oracle false --json 2>/dev/null)" || true
+case "$got" in
+  '{"mutants": 1, "killed": 1, "compile_failed": 0,'*) ok "mutate: a subdirectory module resolves the package root and its dependencies" ;;
+  *) fail "mutate: subdirectory module"; printf '        got: %s\n' "$got" ;;
+esac
+got="$(cd "$M/app" && "$KAI" mutate --module sub/broken.kai --operator literal --oracle false --json 2>&1)" || true
+case "$got" in
+  *"sub/broken.kai does not typecheck as it stands; skipped"*'{"mutants": 0,'*) ok "mutate: a module that does not typecheck unmutated is skipped" ;;
+  *) fail "mutate: unmutated module that does not typecheck"; printf '%s\n' "$got" | sed 's/^/        /' ;;
+esac
+
 # A dev checkout whose kaic2 exists needs nothing from stages 0-1: its
 # stage0/ holds no Makefile, so any attempt to rebuild kaic0 fails.
 D="$TMP/dev"
