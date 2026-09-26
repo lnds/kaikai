@@ -88,6 +88,7 @@ import compiler.emit_slices
 import compiler.emit_tcrec_live
 import compiler.modular_linkage
 import compiler.region
+import compiler.raw_border
 
 # ====================================================================
 
@@ -5540,7 +5541,7 @@ fn emit_match_raw(src: String, scrut: Expr, arms: [Arm], ty: Option[Ty], cx: Emi
   match scrut.mode {
     MUnboxed ->
       if ty_is_integral_raw(scrut.ty) and arms_all_literal_or_wild(arms) and arms_pbind_safe_for_fast_path(arms) {
-        unbox_boxed_scalar(emit_match_switch(src, scrut, arms, cx), ty)
+        unbox_take_scalar(emit_match_switch(src, scrut, arms, cx), ty)
       } else {
         emit_match_raw_arms(src, scrut, arms, ty, cx)
       }
@@ -6835,38 +6836,6 @@ fn unbox_field_for(opt_ty: Option[Ty]) : String {
   }
 }
 
-# Emit the raw C scalar form of `x`. Caller has already established
-# that `x.ty` is unboxable; the result is `int64_t` / `int` /
-# `uint32_t` (depending on ty), no `KaiValue *` wrapper.
-#
-# When `x.mode` is `MUnboxed` the kind is one of the natively-raw
-# forms (literal, raw EVar, raw arith). When `x.mode` is `MBoxed`
-# we fall back to emitting boxed and tacking on the unbox field —
-# the boundary tactic from `docs/unboxing-phase2-design.md` §3.
-
-# Emit the raw C scalar form of `x`. Caller has already established
-# that `x.ty` is unboxable; the result is `int64_t` / `int` /
-# `uint32_t` (depending on ty), no `KaiValue *` wrapper.
-#
-# When `x.mode` is `MUnboxed` the kind is one of the natively-raw
-# forms (literal, raw EVar, raw arith). When `x.mode` is `MBoxed`
-# we fall back to emitting boxed and tacking on the unbox field —
-# the boundary tactic from `docs/unboxing-phase2-design.md` §3.
-
-# Borrow-read for raw scalar extraction. When a boxed operand is wrapped in
-# `__perceus_dup(inner)` (perceus added an incref assuming an owned read) but
-# the only thing we do with it is extract its raw scalar — `kai_intf(...)`
-# reads the value and keeps no reference — the incref/decref pair cancels.
-# This is exactly Koka's `_borrow` read of a node field in a comparison:
-# `kk_integer_lt_borrow(kx, ky)` reads `ky` from the node without touching RC.
-# Strip the dup so the field read on the rb-tree descent (`kx < kx_node`) is a
-# bare `kai_intf(kai_kx)` instead of `kai_intf(kai_internal_dup(kai_kx))`.
-#
-# Sound for any unboxable scalar: extraction never retains the pointer, so the
-# borrowing read leaves the original owner's count unchanged, and the owner's
-# own drop (arm exit / structural decref) still fires exactly once. The dup
-# would have been net-zero against a matching decref the consumer never issued
-# on a raw scalar — removing both halves is the identity transform Koka makes.
 # True when a payload TypeExpr is `Int` — a tagged immediate, so
 # dup/drop on its slot value is a runtime no-op and can be elided.
 fn ty_te_is_int(te: TypeExpr) : Bool = match te.tkind {
@@ -6874,44 +6843,14 @@ fn ty_te_is_int(te: TypeExpr) : Bool = match te.tkind {
   _ -> false
 }
 
-fn unwrap_perceus_dup_for_borrow(x: Expr) : Expr = match x.kind {
-  ECall(callee, args_) -> match sym_read_kind(callee.kind) {
-    EVar(nm) ->
-      if nm == "__perceus_dup" {
-        match args_ {
-          [inner] -> inner
-          _       -> x
-        }
-      } else { x }
-    _ -> x
-  }
-  _ -> x
-}
-
+# The raw C scalar form of `x`, whose `ty` is unboxable. A `MUnboxed` node
+# is natively raw; any other crosses the box→raw border (`raw_border.kai`).
 fn emit_expr_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
-
-  # Borrow the scalar: a `__perceus_dup` wrapper around the operand is a
-  # redundant incref for a value we only read-and-extract. Strip it BEFORE the
-  # mode split so it is borrowed whether the dup'd call landed as MUnboxed
-  # (→ emit_kind_raw's ECall fallback) or MBoxed (→ boxed-then-unbox).
-  #
-  # CRITICAL: the unbox MUST use the OUTER `x.ty`, not the stripped inner's
-  # `.ty`. The `__perceus_dup(t)` ECall node carries the typer-assigned scalar
-  # type (`TyReal` for a `Real<s>`), but the inner EVar's own `.ty` is often
-  # None — and `unbox_boxed_scalar(.., None)` falls back to `kai_intf` (Int),
-  # which read a `Real` operand's bit pattern as an int64 and produced garbage
-  # (free_fall: `kai_intf(kai_t)` for a `double` arg → `t=4.6e+18`). Thread
-  # `x.ty` through so the field read picks `.r`/`.b`/`.c` correctly.
-  let xb = unwrap_perceus_dup_for_borrow(x)
-
-  # i64-inline (Lane B): a kind-1 raw-bound binder is ALWAYS available as
-  # the raw `kair_<nm>` local, regardless of the unbox pass's mode verdict
-  # on this particular use. Read it directly — no `kai_intf(kai_<nm>)`
-  # boxed-then-unbox (which references the non-existent boxed `kai_<nm>`,
-  # the selfhost `kai_cl` failure). This is the single source of truth:
-  # the bind emitted kair_, so every raw read picks kair_ by membership,
-  # not by mode (the mode can lag when a binder has a raw use the seeding
-  # guards rejected — e.g. a sibling boxed use keeps the EVar MBoxed).
+  # The unbox reads the OUTER `x.ty`: a stripped dup's inner EVar often has
+  # no `ty`, and an untyped unbox reads the payload as an Int.
+  let xb = raw_border_strip_dup(x)
+  # A kind-1 raw-bound binder is always the `kair_` local, whatever mode
+  # verdict this use carries.
   match xb.kind {
     EVar(nm) ->
       if emit_ctx_kind1_raw_has(cx, nm) { cat2("kair_", nm) }
@@ -6923,18 +6862,37 @@ fn emit_expr_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
 fn emit_expr_raw_split(src: String, xb: Expr, x: Expr, cx: EmitCtx) : String / Console {
   match xb.mode {
     MUnboxed -> emit_kind_raw(src, xb, cx)
-    _ -> {
-      let boxed = emit_expr_boxed(src, xb, cx)
-      unbox_boxed_scalar(boxed, x.ty)
-    }
+    _        -> unbox_border(emit_expr_boxed(src, xb, cx), xb, x.ty)
   }
 }
 
-# Extract a raw scalar from a boxed C expression. For Int the value may
-# be a Koka-style tagged immediate OR a heap KAI_INT, so we route
-# through the runtime accessor `kai_intf(...)` which understands both
-# (no `->as.i` deref, which would crash on an immediate). Real/Bool/Char
-# are still always heap values, so the direct field read is sound.
+# The raw payload of `node`'s boxed C form: an owned temporary is consumed,
+# a variable read borrows.
+fn unbox_border(boxed: String, node: Expr, opt_ty: Option[Ty]) : String =
+  if raw_border_owns(node) { unbox_take_scalar(boxed, opt_ty) }
+  else { unbox_boxed_scalar(boxed, opt_ty) }
+
+# Reads the payload and releases the box. Bool and Byte boxes are immortal,
+# so their plain read owes no release.
+fn unbox_take_scalar(boxed: String, opt_ty: Option[Ty]) : String = match opt_ty {
+  Some(t) -> match t {
+    TyInt    -> cat3("kai_take_int(", boxed, ")")
+    TyReal   -> cat3("kai_take_real(", boxed, ")")
+    TyChar   -> cat3("kai_take_char(", boxed, ")")
+    TyInt32  -> cat3("kai_take_int32(", boxed, ")")
+    TyUInt32 -> cat3("kai_take_uint32(", boxed, ")")
+    TyUInt64 -> cat3("kai_take_uint64(", boxed, ")")
+    TyInt128 -> cat3("kai_take_int128(", boxed, ")")
+    TyDimT(inner, _)    -> if ty_is_fixed_vec(t) { unbox_boxed_scalar(boxed, opt_ty) }
+                           else { unbox_take_scalar(boxed, Some(inner)) }
+    TyRefineT(inner, _) -> unbox_take_scalar(boxed, Some(inner))
+    _ -> unbox_boxed_scalar(boxed, opt_ty)
+  }
+  None -> unbox_boxed_scalar(boxed, opt_ty)
+}
+
+# Borrow-reads a raw scalar out of a boxed C expression, leaving its RC
+# untouched. An Int may be a tagged immediate, so it reads via `kai_intf`.
 fn unbox_boxed_scalar(boxed: String, opt_ty: Option[Ty]) : String {
   match opt_ty {
     Some(t) -> match t {
@@ -7042,7 +7000,7 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
       } else {
         # Conservative fallback: boxed expression then unbox.
         let boxed = emit_expr_boxed(src, x, cx)
-        unbox_boxed_scalar(boxed, x.ty)
+        unbox_border(boxed, x, x.ty)
       }
     EUnop(op, inner) ->
       if op == "-" {
@@ -7061,7 +7019,7 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         cat3("(!", emit_expr_raw(src, inner, cx), ")")
       } else {
         let boxed = emit_expr_boxed(src, x, cx)
-        unbox_boxed_scalar(boxed, x.ty)
+        unbox_border(boxed, x, x.ty)
       }
     # Phase 3 unboxing — when the callee resolves to a UFn, emit
     # the raw call inline (`<callee>(<raw args>)`) so the result
@@ -7113,14 +7071,14 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
           Some(s) -> s
           None    -> {
             let boxed = emit_expr_boxed(src, x, cx)
-            unbox_boxed_scalar(boxed, x.ty)
+            unbox_border(boxed, x, x.ty)
           }
         } } }
       _ -> match emit_ufn_raw_call(src, callee_e, args_e, cx) {
         Some(s) -> s
         None    -> {
           let boxed = emit_expr_boxed(src, x, cx)
-          unbox_boxed_scalar(boxed, x.ty)
+          unbox_border(boxed, x, x.ty)
         }
       }
     }
@@ -7140,7 +7098,7 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
       }
       None -> {
         let boxed = emit_expr_boxed(src, x, cx)
-        unbox_boxed_scalar(boxed, x.ty)
+        unbox_border(boxed, x, x.ty)
       }
     }
     # Phase 3 unboxing — single-tail EBlock with no preceding
@@ -7151,7 +7109,7 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         Some(t) -> emit_expr_raw(src, t, cx)
         None -> {
           let boxed = emit_expr_boxed(src, x, cx)
-          unbox_boxed_scalar(boxed, x.ty)
+          unbox_border(boxed, x, x.ty)
         }
       }
       # issue #779 — a multi-statement block with a raw tail (the unbox
@@ -7164,13 +7122,13 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         Some(t) ->
           if emit_block_is_region(cx, x.line, x.col) {
             let boxed = emit_expr_boxed(src, x, cx)
-            unbox_boxed_scalar(boxed, x.ty)
+            unbox_border(boxed, x, x.ty)
           } else {
             emit_block_raw(src, stmts, t, cx)
           }
         None -> {
           let boxed = emit_expr_boxed(src, x, cx)
-          unbox_boxed_scalar(boxed, x.ty)
+          unbox_border(boxed, x, x.ty)
         }
       }
     }
@@ -7191,13 +7149,13 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
       } }
       else {
         let boxed = emit_expr_boxed(src, x, cx)
-        unbox_boxed_scalar(boxed, x.ty)
+        unbox_border(boxed, x, x.ty)
       }
     _ -> {
       # Anything else: emit boxed and unwrap. The unbox_pass should
       # not have marked these MUnboxed in the first place — defensive.
       let boxed = emit_expr_boxed(src, x, cx)
-      unbox_boxed_scalar(boxed, x.ty)
+      unbox_border(boxed, x, x.ty)
     }
   }
 }
@@ -16020,7 +15978,7 @@ fn emit_trmc_slot_inits(src: String, args_e: [Expr], tys_opt: Option[[TypeExpr]]
               Some(ts) -> match trmc_ty_nth(ts, i) { Some(te) -> ty_te_is_int(te) None -> false }
               None     -> false
             }
-            let av = if is_int_slot { unwrap_perceus_dup_for_borrow(a) } else { a }
+            let av = if is_int_slot { raw_border_strip_dup(a) } else { a }
             concat_all(["{.ptr = ", emit_expr(src, av, cx), "}"])
           }
         }
@@ -16083,7 +16041,7 @@ fn emit_trmc_slot_stores(src: String, node: String, cname: String, args_e: [Expr
               Some(ts) -> match trmc_ty_nth(ts, i) { Some(te) -> ty_te_is_int(te) None -> false }
               None     -> false
             }
-            let av = if is_int_slot { unwrap_perceus_dup_for_borrow(a) } else { a }
+            let av = if is_int_slot { raw_border_strip_dup(a) } else { a }
             concat_all([slotpfx, ".ptr = ", emit_expr(src, av, cx), "; "])
           }
         }
@@ -16097,7 +16055,7 @@ fn emit_trmc_slot_stores(src: String, node: String, cname: String, args_e: [Expr
 # wrapper stripped), and `nm`'s arm bind allocated the box; the elided store
 # was its only consumer.
 fn trmc_elided_real_release(a: Expr) : String =
-  match (unwrap_perceus_dup_for_borrow(a)).kind {
+  match (raw_border_strip_dup(a)).kind {
     EVar(nm) -> concat_all(["kai_decref(", c_local(nm), "); "])
     _        -> ""
   }
@@ -16121,7 +16079,7 @@ fn trmc_slot_is_donor_identity(cname: String, a: Expr, i: Int, cx: EmitCtx) : Bo
       else {
         let bn = trmc_donor_binder_nth(binders, i)
         if bn == "" { false }
-        else { match (unwrap_perceus_dup_for_borrow(a)).kind {
+        else { match (raw_border_strip_dup(a)).kind {
           EVar(nm) -> nm == bn
           _        -> false
         } }
