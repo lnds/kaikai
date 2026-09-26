@@ -1322,6 +1322,8 @@ tier1-asan-b: kaic2
 	@echo "tier1-asan OK — a closure-captured arm binder on a self-tail path is released after the args, not before"
 	@$(MAKE) -C stage2 test-perceus-switch-scrutinee-selftail-asan
 	@echo "tier1-asan OK — an arm binder consumed by an integral-literal match scrutinee is not released again at the self-tail goto"
+	@$(MAKE) -C stage2 test-perceus-arm-branch-read-asan
+	@echo "tier1-asan OK — a binder read once behind one alternative is released on entry to the others (no over-release on the reading path)"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,
