@@ -17,12 +17,12 @@
 #
 #   - `perceus_pass` — the entry point: build the `[EFn]` registry via
 #     compiler.fnreg, then rewrite every decl (`perceus_decl` /
-#     `pcs_collect_uses_expr` / `pcs_rewrite_expr`) so each binding
-#     transfers at its last use and earlier reads bump the refcount via
-#     `__perceus_dup`. Who releases what no read transfers is decided in
+#     `pcs_rewrite_expr`) so each binding transfers at its last use and
+#     earlier reads bump the refcount via `__perceus_dup`. Every decision
+#     reads the one table `pcs_read_table` (compiler.perceus_reads) builds.
+#     Who releases what no read transfers is decided in
 #     compiler.perceus_payer.
-#   - The use-collection machinery (`pcs_collect_uses_expr`,
-#     `pcs_branch_aware_skip_params`) is `pub` because the tco pre-pass
+#   - `pcs_branch_aware_skip_params` is `pub` because the tco pre-pass
 #     (`tcrec_*`) consults it to align its goto-loop drops with the wrap's
 #     exit drops.
 #
@@ -34,18 +34,14 @@
 # (`iscan_collect` / `body_is_ffi_extern`), compiler.infer for the
 # `Use` / `LU` / `IPart` / `IScan` types, compiler.lex for `tokenize`,
 # and compiler.parse for `parse_interp_expr`. The AST-functor family
-# (`prc_map_expr_kind`), the type mangler (`prc_mangle_ty`), the
-# pattern-binding walkers (`prc_pat_bindings` /
-# `prc_pat_bindings_skip_raw` / `prc_pat_binders`) and the UFn
+# (`prc_map_expr_kind`), the type mangler (`prc_mangle_ty`) and the UFn
 # predicate (`prc_is_ufn_decl`) are mirrored downward glue with the
 # `prc_` prefix, per the phase-1m `dsg_` discipline (consumers = 1 each
 # from this module ⇒ mirror, not sink).
 
 import compiler.ast
-import compiler.marks
 import compiler.sym_read
 import compiler.util
-import compiler.lex
 import compiler.parse
 import compiler.infer
 import compiler.fnreg
@@ -62,6 +58,8 @@ import compiler.consume_index
 import compiler.fn_index
 import compiler.borrow_view
 import compiler.perceus_raw_slot
+import compiler.perceus_reads
+import compiler.interp_span
 
 # ==================================================================
 # Downward glue mirrors (prc_ prefix) — copied verbatim from the
@@ -130,96 +128,6 @@ fn prc_mangle_ty(t: Ty) : String {
 }
 
 
-fn prc_pat_bindings(pat: Pattern, acc: [String]) : [String] {
-  match pat.pkind {
-    PWild -> acc
-    PLit(_) -> acc
-    PRange(_, _) -> acc
-    PBind(name) -> [name, ...acc]
-    PList(pats, opt_rest) -> {
-      let acc1 = prc_pat_bindings_loop(pats, acc)
-      # An unused-by-convention rest binder is never bound (both backends
-      # elide it), so it must not enter the tracking scope.
-      match opt_rest {
-        Some(rname) -> if name_is_unused_binder(rname) { acc1 } else { [rname, ...acc1] }
-        None -> acc1
-      }
-    }
-    PVariant(_, _, subs) -> prc_pat_bindings_loop(subs, acc)
-    PVariantRecord(_, _, fields) -> prc_pfield_bindings_loop(fields, acc)
-    PRecord(fields) -> prc_pfield_bindings_loop(fields, acc)
-    PHole(_) -> acc
-    PAs(name, sub) -> prc_pat_bindings(sub, [name, ...acc])
-    PNarrow(name, _) -> [name, ...acc]
-    PSurface(sp) -> prc_pat_bindings_loop(patsurface_children(sp), acc)
-  }
-}
-
-# Like `prc_pat_bindings`, but if the pattern is a single `PBind` and
-# the let's RHS is `MUnboxed`, the binding is a raw C scalar and
-# must NOT enter the Perceus tracking scope. All other shapes —
-# destructured lets, wildcards, literals — defer to the standard
-# `prc_pat_bindings` walker. See `docs/unboxing-phase2-design.md` §3
-# (boundary tactic) for the coordination contract.
-fn prc_pat_bindings_skip_raw(pat: Pattern, rhs: Expr, acc: [String]) : [String] {
-  match pat.pkind {
-    PBind(name) -> match rhs.mode {
-      MUnboxed -> acc
-      _        -> [name, ...acc]
-    }
-    _ -> prc_pat_bindings(pat, acc)
-  }
-}
-
-fn prc_pat_bindings_loop(ps: [Pattern], acc: [String]) : [String] {
-  match ps {
-    [] -> acc
-    [p, ...rest] -> prc_pat_bindings_loop(rest, prc_pat_bindings(p, acc))
-  }
-}
-
-fn prc_pfield_bindings_loop(fs: [PField], acc: [String]) : [String] {
-  match fs {
-    [] -> acc
-    [f, ...rest] -> match f {
-      PField(_, sub, _) -> prc_pfield_bindings_loop(rest, prc_pat_bindings(sub, acc))
-    }
-  }
-}
-
-fn prc_pat_binders(pat: Pattern, acc: [String]) : [String] = match pat.pkind {
-  PWild           -> acc
-  PLit(_)         -> acc
-  PRange(_, _)    -> acc
-  PBind(name)     -> [name, ...acc]
-  PList(subs, opt_rest) -> {
-    let acc1 = prc_pat_binders_list(subs, acc)
-    match opt_rest {
-      Some(n) -> if name_is_unused_binder(n) { acc1 } else { [n, ...acc1] }
-      None -> acc1
-    }
-  }
-  PVariant(_, _, subs)     -> prc_pat_binders_list(subs, acc)
-  PVariantRecord(_, _, fs) -> prc_pat_binders_pfields(fs, acc)
-  PRecord(fs)              -> prc_pat_binders_pfields(fs, acc)
-  PHole(_)                 -> acc
-  PAs(name, inner)         -> prc_pat_binders(inner, [name, ...acc])
-  PNarrow(name, _)         -> [name, ...acc]
-  PSurface(sp)             -> prc_pat_binders_list(patsurface_children(sp), acc)
-}
-
-fn prc_pat_binders_list(ps: [Pattern], acc: [String]) : [String] = match ps {
-  [] -> acc
-  [p, ...rest] -> prc_pat_binders_list(rest, prc_pat_binders(p, acc))
-}
-
-fn prc_pat_binders_pfields(fs: [PField], acc: [String]) : [String] = match fs {
-  [] -> acc
-  [f, ...rest] -> match f {
-    PField(_, sub, _) -> prc_pat_binders_pfields(rest, prc_pat_binders(sub, acc))
-  }
-}
-
 fn prc_is_ufn_decl(fns: FnIndex, name: String, mo: Option[String]) : Bool {
   match fnx_ufn_sig(fns, name, mo) {
     Some(_) -> true
@@ -283,7 +191,7 @@ fn prc_raw_names_zip(params: [Param], mask: [Bool]) : [String] = match params {
 # Reads the source AST as the IR. The emitter consumes whatever this
 # function returns; selfhost convergence remains the gate.
 
-# For each `DFn` the pass collects the in-scope reads (`pcs_collect_uses_expr`),
+# For each `DFn` the pass collects the in-scope reads once (`pcs_read_table`),
 # then rewrites the body so every read that does not hand its binder's birth
 # ref on is wrapped in `__perceus_dup`. The drops that release what no read
 # hands on are planted where `compiler.perceus_payer` names the payer.
@@ -1074,7 +982,7 @@ fn pcs_consumes_ps(p: String, ps: [XPos]) : Bool = match ps {
 fn pcs_arms_bind_children(arms: [Arm]) : Bool = match arms {
   []           -> false
   [a, ...rest] -> match a {
-    Arm(pat, _, _) -> match prc_pat_binders(pat, []) { [] -> pcs_arms_bind_children(rest) _ -> true }
+    Arm(pat, _, _) -> match prc_pat_bindings(pat, []) { [] -> pcs_arms_bind_children(rest) _ -> true }
   }
 }
 
@@ -1108,8 +1016,8 @@ fn pcs_elems_bare_var(p: String, els: [ListElem]) : Bool = match els {
 # of the callee (per cmap). ctor slots / match scrutinees / returns consume by
 # construction. A user-fn call whose slot for nm is NOT in the callee's
 # consume set → false (the callee borrows nm; moving it is unsound).
-fn pcs_uses_only_consuming_slots(nm: String, e: Expr, cmap: ConsumeIndex) : Bool =
-  pcs_consuming_slots_kind(nm, e.kind, cmap)
+fn pcs_uses_only_consuming_slots(nm: String, e: Expr, cmap: ConsumeIndex, bm: [BorrowEntry]) : Bool =
+  pcs_consuming_slots_kind(nm, e.kind, cmap, bm)
 
 fn pcs_any_arg_is_lambda(xs: [Expr]) : Bool = match xs {
   []           -> false
@@ -1123,7 +1031,7 @@ fn pcs_name_in_exprs(nm: String, xs: [Expr]) : Bool = match xs {
   [h, ...rest] -> pcs_name_in_expr(nm, h) or pcs_name_in_exprs(nm, rest)
 }
 
-fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: ConsumeIndex) : Bool = match k {
+fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: ConsumeIndex, bm: [BorrowEntry]) : Bool = match k {
   ECall(f, xs) -> {
     # Higher-order conservatism: if ANY arg is a lambda, the call is a
     # higher-order combinator (map/filter/fold). The lambda may FIELD-READ
@@ -1143,17 +1051,17 @@ fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: ConsumeIndex) : Bool 
         EModCall(_, c) -> pcs_name_is_ctor(c)
         _              -> false
       }
-      pcs_consuming_slots_kind(nm, f.kind, cmap) and
-        pcs_consuming_args(nm, xs, consumed, is_ctor, 0, cmap)
+      pcs_consuming_slots_kind(nm, f.kind, cmap, bm) and
+        pcs_consuming_args(nm, xs, list_append(consumed, pcs_borrow_lookup(bm, key)), is_ctor, 0, cmap, bm)
     }
   }
   EMatch(s, arms) -> {
-    let s_ok = match s.kind { EVar(_) -> true _ -> pcs_uses_only_consuming_slots(nm, s, cmap) }
-    s_ok and pcs_consuming_arms(nm, arms, cmap)
+    let s_ok = match s.kind { EVar(_) -> true _ -> pcs_uses_only_consuming_slots(nm, s, cmap, bm) }
+    s_ok and pcs_consuming_arms(nm, arms, cmap, bm)
   }
-  EField(x, _)    -> match x.kind { EVar(uname) -> uname != nm _ -> pcs_uses_only_consuming_slots(nm, x, cmap) }
-  EIndex(a, b)    -> (match a.kind { EVar(uname) -> uname != nm _ -> pcs_uses_only_consuming_slots(nm, a, cmap) }) and
-                      pcs_uses_only_consuming_slots(nm, b, cmap)
+  EField(x, _)    -> match x.kind { EVar(uname) -> uname != nm _ -> pcs_uses_only_consuming_slots(nm, x, cmap, bm) }
+  EIndex(a, b)    -> (match a.kind { EVar(uname) -> uname != nm _ -> pcs_uses_only_consuming_slots(nm, a, cmap, bm) }) and
+                      pcs_uses_only_consuming_slots(nm, b, cmap, bm)
   # Interp reads take a dup and never a consuming slot; lexical presence
   # is the pure stand-in for the collector's parsed view.
   EStr(span, is_triple) -> pcs_interp_ident_count(nm, span, is_triple) == 0
@@ -1163,36 +1071,36 @@ fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: ConsumeIndex) : Bool 
   # Everything else scans its positions: a lambda capture is never
   # move-safe, an assert message blocks on mere presence (it only runs
   # on the aborting path), and the remaining roles apply the slot check.
-  _ -> pcs_consuming_slots_ps(nm, xp_positions_kind(k), cmap)
+  _ -> pcs_consuming_slots_ps(nm, xp_positions_kind(k), cmap, bm)
 }
 
-fn pcs_consuming_slots_ps(nm: String, ps: [XPos], cmap: ConsumeIndex) : Bool = match ps {
+fn pcs_consuming_slots_ps(nm: String, ps: [XPos], cmap: ConsumeIndex, bm: [BorrowEntry]) : Bool = match ps {
   []                  -> true
   [XP(r, c), ...rest] ->
     (match r {
       XLam -> false
       XMsg -> not pcs_name_in_expr(nm, c)
-      _    -> pcs_uses_only_consuming_slots(nm, c, cmap)
-    }) and pcs_consuming_slots_ps(nm, rest, cmap)
+      _    -> pcs_uses_only_consuming_slots(nm, c, cmap, bm)
+    }) and pcs_consuming_slots_ps(nm, rest, cmap, bm)
 }
 
-fn pcs_consuming_args(nm: String, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: ConsumeIndex) : Bool = match xs {
+fn pcs_consuming_args(nm: String, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: ConsumeIndex, bm: [BorrowEntry]) : Bool = match xs {
   []           -> true
   [h, ...rest] -> {
     let here = match h.kind {
       EVar(uname) -> if uname == nm { is_ctor or pcs_has_int(consumed, i) } else { true }
-      _ -> pcs_uses_only_consuming_slots(nm, h, cmap)
+      _ -> pcs_uses_only_consuming_slots(nm, h, cmap, bm)
     }
-    here and pcs_consuming_args(nm, rest, consumed, is_ctor, i + 1, cmap)
+    here and pcs_consuming_args(nm, rest, consumed, is_ctor, i + 1, cmap, bm)
   }
 }
 
-fn pcs_consuming_arms(nm: String, arms: [Arm], cmap: ConsumeIndex) : Bool = match arms {
+fn pcs_consuming_arms(nm: String, arms: [Arm], cmap: ConsumeIndex, bm: [BorrowEntry]) : Bool = match arms {
   []           -> true
   [a, ...rest] -> match a {
     Arm(_, opt_g, b) ->
-      (match opt_g { None -> true Some(g) -> pcs_uses_only_consuming_slots(nm, g, cmap) }) and
-      pcs_uses_only_consuming_slots(nm, b, cmap) and pcs_consuming_arms(nm, rest, cmap)
+      (match opt_g { None -> true Some(g) -> pcs_uses_only_consuming_slots(nm, g, cmap, bm) }) and
+      pcs_uses_only_consuming_slots(nm, b, cmap, bm) and pcs_consuming_arms(nm, rest, cmap, bm)
   }
 }
 
@@ -1302,7 +1210,7 @@ fn pcs_collect_move_last_set(binders: [String], body: Expr, uses: [Use], cmap: C
   [nm, ...rest] -> {
     let acc1 = match last_use_for(nm, uses) {
       LUAt(_, ll, lc) ->
-        if pcs_count_non_lam_uses(nm, uses, 0) >= 2 and pcs_last_use_consuming(nm, ll, lc, body, cmap) {
+        if pcs_read_count(nm, uses) >= 2 and pcs_last_use_consuming(nm, ll, lc, body, cmap) {
           [nm, ...acc]
         } else { acc }
       _ -> acc
@@ -1350,7 +1258,7 @@ fn pcs_bmlp_loop(self_name: String, pnames: [String], body: Expr, uses: [Use],
     else {
       match last_use_for(nm, uses) {
         LUAt(_, _, _) ->
-          if pcs_count_non_lam_uses(nm, uses, 0) >= 2 and
+          if pcs_read_count(nm, uses) >= 2 and
              pcs_max_paths_b_expr(nm, body, bmap) == 1 and
              pcs_nm_absent_from_nonrec_tails(self_name, nm, body, bmap) {
             [nm, ...more]
@@ -1374,9 +1282,9 @@ fn pcs_nm_absent_from_nonrec_tails(self_name: String, nm: String, e: Expr, bmap:
 
 fn pcs_nmant_kind(self_name: String, nm: String, k: ExprKind, bmap: [BorrowEntry]) : Bool / Console = match k {
   ECall(f, _) -> match sym_read_kind(f.kind) {
-    EVar(c)        -> if c == self_name { true } else { not pcs_name_in_expr_k(nm, k) }
-    EModCall(_, c) -> if c == self_name { true } else { not pcs_name_in_expr_k(nm, k) }
-    _              -> not pcs_name_in_expr_k(nm, k)
+    EVar(c)        -> if c == self_name { true } else { not pcs_mentions(nm, mk_expr(k, 0, 0)) }
+    EModCall(_, c) -> if c == self_name { true } else { not pcs_mentions(nm, mk_expr(k, 0, 0)) }
+    _              -> not pcs_mentions(nm, mk_expr(k, 0, 0))
   }
   # The condition evaluates on EVERY path through the if, including the
   # base ones: a CONSUMING read of `nm` there spends the ref the exit
@@ -1403,13 +1311,11 @@ fn pcs_nmant_kind(self_name: String, nm: String, k: ExprKind, bmap: [BorrowEntry
   # scan (riding the position table via the use collector) finds no
   # read of `nm`. Conservative for any new variant: a read anywhere
   # simply withholds the optimisation.
-  _ -> not pcs_name_in_expr_k(nm, k)
+  _ -> not pcs_mentions(nm, mk_expr(k, 0, 0))
 }
 
-fn pcs_name_in_stmts(nm: String, stmts: [Stmt]) : Bool / Console = {
-  let us = pcs_collect_uses_in_block(stmts, None, [nm], false, [])
-  pcs_uses_has_name(us, nm)
-}
+fn pcs_name_in_stmts(nm: String, stmts: [Stmt]) : Bool / Console =
+  pcs_mentions(nm, mk_expr(EBlock(stmts, None), 0, 0))
 
 # A guard evaluates before its arm is chosen — a consuming read of `nm`
 # there lands on base paths too; borrow-discounted reads stay allowed.
@@ -1418,11 +1324,6 @@ fn pcs_nmant_arms(self_name: String, nm: String, arms: [Arm], bmap: [BorrowEntry
   [Arm(_, opt_g, b), ...rest] ->
     (match opt_g { None -> true Some(g) -> pcs_max_paths_b_expr(nm, g, bmap) == 0 }) and
     pcs_nm_absent_from_nonrec_tails(self_name, nm, b, bmap) and pcs_nmant_arms(self_name, nm, rest, bmap)
-}
-
-fn pcs_name_in_expr_k(nm: String, k: ExprKind) : Bool / Console = {
-  let us = pcs_collect_uses_kind(k, 0, 0, [nm], false, [])
-  pcs_uses_has_name(us, nm)
 }
 
 # Issue #817 — every match-arm pattern binder bound anywhere in `body`,
@@ -1443,7 +1344,7 @@ fn pcs_all_arm_binders_ps(ps: [XPos], acc: [String]) : [String] = match ps {
 fn pcs_all_arm_binders_arms(arms: [Arm], acc: [String]) : [String] = match arms {
   []           -> acc
   [Arm(pat, _, body), ...rest] ->
-    pcs_all_arm_binders_arms(rest, pcs_all_arm_binders(body, prc_pat_binders(pat, acc)))
+    pcs_all_arm_binders_arms(rest, pcs_all_arm_binders(body, prc_pat_bindings(pat, acc)))
 }
 
 # Names bound by `let x = f(...)` where `f` returns an opaque handle —
@@ -1562,7 +1463,7 @@ fn pcs_fed_block_handles(stmts: [Stmt], opaque_lets: [String], tail: Option[Expr
 # orphaned. A read-once handle is moved raw into its single shim call (the
 # shim consumes the birth ref), so it needs no drop.
 fn pcs_fed_needs_drop(nm: String, tail: Option[Expr], uses: [Use]) : Bool / Console =
-  pcs_count_non_lam_uses(nm, uses, 0) >= 2 and pcs_name_in_tail(nm, tail)
+  pcs_read_count(nm, uses) >= 2 and pcs_name_in_tail(nm, tail)
 
 fn pcs_fed_make_drops(names: [String]) : [Stmt] = match names {
   []           -> []
@@ -1626,7 +1527,7 @@ fn pcs_arms_escape_nothing(arms: [Arm]) : Bool = match arms {
   []           -> true
   [a, ...rest] -> match a {
     Arm(pat, opt_g, abody) -> {
-      let binders = prc_pat_binders(pat, [])
+      let binders = prc_pat_bindings(pat, [])
       let body_clean = pcs_no_binder_used(binders, abody)
       let guard_clean = match opt_g {
         None    -> true
@@ -1645,9 +1546,8 @@ fn pcs_no_binder_used(binders: [String], e: Expr) : Bool = match binders {
 
 # `nm` does not appear as a read anywhere in `e`. Pure structural walk
 # (no effects) — must stay effect-free so the borrow analysis carries
-# no Console row (the use-collector pcs_collect_uses_expr does, and
-# threading that row through the inference would be both heavy and
-# wrong: inference is a pure query). Reuses the existing
+# no Console row (threading that row through the inference would be both
+# heavy and wrong: inference is a pure query). Reuses the existing
 # pcs_max_paths_in_expr, which counts reads of `nm` purely.
 fn pcs_name_absent(nm: String, e: Expr) : Bool =
   pcs_max_paths_in_expr(nm, e) == 0
@@ -1734,7 +1634,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # ALL-raw UFn: every param is a raw C scalar with no rc, so the
         # body rewrite runs with an EMPTY param scope (issue #703) — no
         # boxed param to dup/drop, no borrow, no arm-move analysis.
-        let uses = pcs_collect_uses_expr(body, [], false, [])
+        let uses = pcs_read_table(body, [])
         # Boxed locals whose single read a short circuit may skip take
         # the same force-dup + exit-drop treatment as the mixed path.
         let branchy_lets = pcs_branchy_let_binders(body, name, uses, [])
@@ -1745,7 +1645,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # orphan the birth ref.
         let new_body = ptd_tail_exit_drops(new_body0, name, uses, [], branchy_lets,
                                            pcs_borrow_lookup(bmap, pcs_borrow_key(name, mo)))
-        let arm_dropped = pcs_arm_drop_pass(new_body, name, [], uses)
+        let arm_dropped = pcs_arm_drop_pass(new_body, name, PcsArmCx { uses: uses, moved: [] })
         let branch_paid = pbp_branch_drops(arm_dropped, map(params, (p) => p.pname), uses)
         let reused_body = pcs_recognise_reuse_expr(branch_paid)
         # Boxed LOCALS can still flow to borrowed callee slots; without the
@@ -1774,7 +1674,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         let cap_pnames = pcs_cap_param_names(params, cap_tys)
         let raw_pnames = pcs_list_union(prc_raw_param_names(fns, name, mo, params), cap_pnames)
         let pnames = pcs_strs_minus(map(params, (p) => p.pname), cap_pnames)
-        let uses = pcs_collect_uses_expr(body, pnames, false, [])
+        let uses = pcs_read_table(body, pnames)
         # Borrow inference (Koka). A borrowed param is inspect-only:
         # the body reads it WITHOUT dup (so it must be in the skip-set,
         # never dup'd) and its match scrutinee is wrapped in
@@ -1797,19 +1697,14 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # emit and moving its binders would double-free (the regexp UAF). This
         # is the half that lets insert_loop's Black arm move l/r instead of
         # spuriously dup'ing them — the ~8.8-nodes-per-insert spine leak.
-        # Both move sets are keyed by NAME over the whole body while their
-        # gates run per arm. A name bound by several arms can qualify in one
-        # arm while another path reads it twice; moving every use would spend
-        # one birth ref twice (over-release). Keep only names no execution
-        # path reads more than once — the borrow-aware global max-path.
-        let arm_moves = pcs_global_single_path(
-          pcs_collect_arm_skip_binders(name, true, body, bmap, cmap, borrowed), body, bmap)
+        # Binder names are unique per fn, so each arm's gate decides for its
+        # own binders only.
+        let arm_moves = pcs_collect_arm_skip_binders(name, true, body, bmap, cmap, borrowed)
         # Issue #817 — goto-tail arm-binders (read once per branch, consumed
         # on every path, consuming slot): moved on EVERY use, the
         # `list.filter`/`map` `kai_t` (tail) case. Distinct from `arm_moves`
         # (reuse-in-place); this is the free-cell-then-goto model.
-        let goto_moves = pcs_global_single_path(
-          pcs_collect_goto_tail_moves(name, body, bmap, cmap, borrowed), body, bmap)
+        let goto_moves = pcs_collect_goto_tail_moves(name, body, bmap, uses, cmap, borrowed)
         let skip_set0 = pcs_list_union(
           pcs_list_union(
             pcs_list_union(
@@ -1839,15 +1734,8 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # moved on every use).
         # `safe_arm_binders` ⊆ `pcs_all_arm_binders` (both walk the same
         # tree; the safe set only adds the cascade gate), so the inter
-        # never drops a safe binder the candidate set lacks. The candidate
-        # set is computed over the whole-body `uses`: a binder name shared
-        # by two arms picks the lexically-last use across both, so its move
-        # only fires if THAT exact `(line,col)` recurs in the binder's own
-        # arm (the `pcs_is_non_last` position gate) — a cross-arm name
-        # collision simply leaves the dup in place (benign: a missed move,
-        # never a wrong one). The `(line,col)` identity of AST nodes makes
-        # a false move impossible.
-        let safe_arm_binders = pcs_collect_safe_arm_binders(name, body, bmap)
+        # never drops a safe binder the candidate set lacks.
+        let safe_arm_binders = pcs_collect_safe_arm_binders(name, body, bmap, uses)
         # Params whose sole consumer is a borrow-discounted re-thread
         # (#1126). They must not dup on any read (the borrow read is
         # stripped; the single re-thread transfers raw), yet — unlike a
@@ -1900,7 +1788,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         let new_body = ptd_tail_exit_drops(new_body1, name, uses, move_last_set,
                                            branchy_lets,
                                            pcs_borrow_lookup(bmap, pcs_borrow_key(name, mo)))
-        let arm_dropped = pcs_arm_drop_pass(new_body, name, pnames, uses)
+        let arm_dropped = pcs_arm_drop_pass(new_body, name, PcsArmCx { uses: uses, moved: rewrite_skip_set })
         # The branch-local drop, in the arms that never read it, for each
         # param the payer assigns there.
         let param_dropped = pcs_inject_param_branch_drops(arm_dropped,
@@ -1960,13 +1848,13 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
     # to drop, but the dup walker is still needed for in-body multi-use
     # bindings.
     DTest(desc, body, ln, cl, mo) -> {
-      let uses = pcs_collect_uses_expr(body, [], false, [])
+      let uses = pcs_read_table(body, [])
       let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap, [])
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DTest(desc, reused_body, ln, cl, mo)
     }
     DBench(desc, body, ln, cl, mo) -> {
-      let uses = pcs_collect_uses_expr(body, [], false, [])
+      let uses = pcs_read_table(body, [])
       let new_body = pcs_rewrite_expr(body, [], uses, false, [], [], bmap, [])
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DBench(desc, reused_body, ln, cl, mo)
@@ -1990,7 +1878,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
     # loop's own drop double-frees (heap-use-after-free → SIGTRAP).
     DCheck(desc, ps, body, ln, cl, mo) -> {
       let pnames = map(ps, (p) => p.pname)
-      let uses = pcs_collect_uses_expr(body, pnames, false, [])
+      let uses = pcs_read_table(body, pnames)
       let skip_set = pcs_branch_aware_skip_params(pnames, body)
       let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, pnames, bmap, [])
       let reused_body = pcs_recognise_reuse_expr(new_body)
@@ -2155,7 +2043,7 @@ fn pcs_try_reuse_arm(scr_ty: Option[Ty], pat: Pattern, body: Expr) : Expr {
       # the counted-owner scrutinee gate (pcs_scr_owned) plus the
       # runtime rc==1 guard establish that together.
       if flat_ok and shape_ok {
-        pcs_try_reuse_variant(body, list_length(ps), prc_pat_binders(pat, []))
+        pcs_try_reuse_variant(body, list_length(ps), prc_pat_bindings(pat, []))
       } else { body }
     }
     # Record rebuild — `{ a, b } -> Rec { a: f(a), b }`. Same shape
@@ -2163,7 +2051,7 @@ fn pcs_try_reuse_arm(scr_ty: Option[Ty], pat: Pattern, body: Expr) : Expr {
     # enforced inside `pcs_try_reuse_record`).
     PRecord(pfs) ->
       if pcs_shape_matches(scr_ty, body.ty) {
-        pcs_try_reuse_record(body, list_length(pfs), prc_pat_binders(pat, []))
+        pcs_try_reuse_record(body, list_length(pfs), prc_pat_bindings(pat, []))
       } else { body }
     _ -> body
   }
@@ -2314,10 +2202,8 @@ fn pcs_try_reuse_record(body: Expr, expected_n: Int, binders: [String]) : Expr {
 #
 # The reuse paths consume exactly ONE incoming reference per rebuild slot
 # and no arm-exit payer runs after a sentinel body, so a pattern binder
-# whose every rebuild read is a `__perceus_dup` wrap (the cross-arm
-# name-collision shape: `last_use_for` sees a sibling arm's read of the
-# same name and marks both non-last) leaves its extraction reference
-# unpaid — one leaked cell per reuse, both backends. Unwrapping the LAST
+# whose every rebuild read is a `__perceus_dup` wrap leaves its extraction
+# reference unpaid — one leaked cell per reuse, both backends. Unwrapping the LAST
 # top-level dup hands that reference to its slot: the raw last-use move
 # the accounting already balances. Conservative: the unwrap fires only
 # when the binder appears NOWHERE outside top-level dup wraps (no raw
@@ -2440,197 +2326,6 @@ fn pcs_zip_fields(fis: [FieldInit], vals: [Expr]) : [FieldInit] = match fis {
   }
 }
 
-# ---- pcs_collect_uses: scope-tracking EVar collection ----
-
-#[doc("Accumulate a [Use] for every in-scope EVar read in an expression, tracking lambda-capture polarity. Pub because the tco pre-pass reuses the same use set for drop alignment.")]
-pub fn pcs_collect_uses_expr(e: Expr, scope: [String], in_lam: Bool, acc: [Use]) : [Use] / Console =
-
-  pcs_collect_uses_kind(e.kind, e.line, e.col, scope, in_lam, acc)
-
-fn pcs_collect_uses_kind(k: ExprKind, line: Int, col: Int, scope: [String],
-                         in_lam: Bool, acc: [Use]) : [Use] / Console {
-
-  match k {
-    EVar(nm) -> if list_has(scope, nm) { [U(nm, line, col, in_lam), ...acc] } else { acc }
-    EStr(span, is_triple) -> pcs_collect_uses_in_interp(span, is_triple, scope, in_lam, acc)
-    EMatch(s, arms) -> pcs_collect_uses_in_arms(arms, scope, in_lam,
-                          pcs_collect_uses_expr(s, scope, in_lam, acc))
-    ELambda(ps, body) -> {
-      let pn = map(ps, (p) => p.pname)
-      pcs_collect_uses_expr(body, list_append(scope, pn), true, acc)
-    }
-    EBlock(stmts, opt_tail) -> pcs_collect_uses_in_block(stmts, opt_tail, scope, in_lam, acc)
-    EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
-      let a1 = pcs_collect_uses_expr(body, scope, in_lam, acc)
-      let a2 = match init_opt {
-        None -> a1
-        Some(e2) -> pcs_collect_uses_expr(e2, scope, in_lam, a1)
-      }
-      let a3 = pcs_collect_uses_in_clauses(clauses, scope, in_lam, a2)
-      match ret_opt {
-        None -> a3
-        Some(hr) -> match hr {
-          HR(pname, body2, _, _) ->
-            pcs_collect_uses_expr(body2, [pname, ...scope], in_lam, a3)
-        }
-      }
-    }
-    # An ELitUnit inner is always a numeric literal — nothing to read.
-    ELitUnit(_, _) -> acc
-    # Everything else descends through the position table in source
-    # order with the same scope; binder-introducing forms keep their
-    # explicit arms above.
-    _ -> pcs_collect_uses_ps(xp_positions_kind(k), scope, in_lam, acc)
-  }
-}
-
-fn pcs_collect_uses_ps(ps: [XPos], scope: [String], in_lam: Bool, acc: [Use]) : [Use] / Console {
-
-  match ps {
-    [] -> acc
-    [XP(r, c), ...rest] ->
-      pcs_collect_uses_ps(rest, scope, in_lam,
-        pcs_collect_uses_expr(c, scope, match r { XLam -> true _ -> in_lam }, acc))
-  }
-}
-
-fn pcs_collect_uses_in_arms(arms: [Arm], scope: [String], in_lam: Bool, acc: [Use]) : [Use] / Console {
-
-  match arms {
-    [] -> acc
-    [a, ...rest] -> match a {
-      Arm(pat, opt_g, body) -> {
-        let scope1 = prc_pat_bindings(pat, scope)
-        let a1 = match opt_g {
-          None -> acc
-          Some(g) -> pcs_collect_uses_expr(g, scope1, in_lam, acc)
-        }
-        let a2 = pcs_collect_uses_expr(body, scope1, in_lam, a1)
-        pcs_collect_uses_in_arms(rest, scope, in_lam, a2)
-      }
-    }
-  }
-}
-
-fn pcs_collect_uses_in_block(stmts: [Stmt], opt_tail: Option[Expr],
-                              scope: [String], in_lam: Bool, acc: [Use]) : [Use] / Console {
-
-  let r = pcs_block_loop(stmts, scope, in_lam, acc)
-  match opt_tail {
-    None -> r.acc
-    Some(e) -> pcs_collect_uses_expr(e, r.scope, in_lam, r.acc)
-  }
-}
-
-type PcsBlockState = { scope: [String], acc: [Use] }
-
-fn pcs_block_loop(stmts: [Stmt], scope: [String], in_lam: Bool,
-                   acc: [Use]) : PcsBlockState / Console {
-
-  match stmts {
-    [] -> PcsBlockState { scope: scope, acc: acc }
-    [s, ...rest] -> {
-      let nxt = match s {
-        SLet(pat, _, rhs) -> {
-          let acc1 = pcs_collect_uses_expr(rhs, scope, in_lam, acc)
-          # Raw locals (Tier 2.5) are not tracked by Perceus —
-          # `int64_t` lives on the C stack and dies at block exit,
-          # there is no refcount to dup/drop. Skip them from scope.
-          PcsBlockState { scope: prc_pat_bindings_skip_raw(pat, rhs, scope), acc: acc1 }
-        }
-        SVar(name, _, rhs, _, _) -> {
-          let acc1 = pcs_collect_uses_expr(rhs, scope, in_lam, acc)
-          PcsBlockState { scope: [name, ...scope], acc: acc1 }
-        }
-        SAssert(c, opt_m) -> {
-          let a1 = pcs_collect_uses_expr(c, scope, in_lam, acc)
-          let a2 = match opt_m {
-            None -> a1
-            Some(m) -> pcs_collect_uses_expr(m, scope, in_lam, a1)
-          }
-          PcsBlockState { scope: scope, acc: a2 }
-        }
-        SExprStmt(e) ->
-          PcsBlockState { scope: scope, acc: pcs_collect_uses_expr(e, scope, in_lam, acc) }
-        SIndexAssign(b, i, v, _, _) -> {
-          let a1 = pcs_collect_uses_expr(b, scope, in_lam, acc)
-          let a2 = pcs_collect_uses_expr(i, scope, in_lam, a1)
-          let a3 = pcs_collect_uses_expr(v, scope, in_lam, a2)
-          PcsBlockState { scope: scope, acc: a3 }
-        }
-        SAssign(b, v, _, _) -> {
-          let a1 = pcs_collect_uses_expr(b, scope, in_lam, acc)
-          let a3 = pcs_collect_uses_expr(v, scope, in_lam, a1)
-          PcsBlockState { scope: scope, acc: a3 }
-        }
-        # m7e §25: SUse has no expression and binds nothing.
-        SUse(_, _, _) -> PcsBlockState { scope: scope, acc: acc }
-      }
-      pcs_block_loop(rest, nxt.scope, in_lam, nxt.acc)
-    }
-  }
-}
-
-fn pcs_collect_uses_in_clauses(cs: [HClause], scope: [String], in_lam: Bool,
-                                acc: [Use]) : [Use] / Console {
-
-  match cs {
-    [] -> acc
-    [h, ...rest] -> match h {
-      HC(_, params, body, _, _) -> {
-        # Filter out the trailing `resume` param. `resume(v)` is
-        # emitted via a special case in emit_call_expr (and
-        # llvm_emit_call) and has no runtime KaiValue representation,
-        # so wrapping `EVar("resume")` in `__perceus_dup` would route
-        # the inner `resume` through `emit_ident_value`'s `kai_resume`
-        # fallback, which is undeclared.
-        let pn = pcs_filter_non_resume(map(params, (p) => p.pname), [])
-        let scope1 = list_append(scope, [...handler_state_aliases(), ...pn])
-        pcs_collect_uses_in_clauses(rest, scope, in_lam,
-          pcs_collect_uses_expr(body, scope1, in_lam, acc))
-      }
-    }
-  }
-}
-
-fn pcs_filter_non_resume(names: [String], acc: [String]) : [String] {
-  match names {
-    [] -> list_reverse(acc)
-    [h, ...rest] ->
-      if h == "resume" { pcs_filter_non_resume(rest, acc) }
-      else { pcs_filter_non_resume(rest, [h, ...acc]) }
-  }
-}
-
-fn pcs_collect_uses_in_interp(span: String, is_triple: Bool, scope: [String],
-                               in_lam: Bool, acc: [Use]) : [Use] / Console {
-
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  let parts = iscan_collect(span, body_end,
-                            IScan { parts: [], lit_start: body_start, i: body_start })
-  pcs_collect_uses_interp_parts(parts, scope, in_lam, acc)
-}
-
-fn pcs_collect_uses_interp_parts(parts: [IPart], scope: [String], in_lam: Bool,
-                                   acc: [Use]) : [Use] / Console {
-
-  match parts {
-    [] -> acc
-    [p, ...rest] -> match p {
-      IpLit(_, _) -> pcs_collect_uses_interp_parts(rest, scope, in_lam, acc)
-      IpExp(esrc) -> {
-        let acc1 = match parse_interp_expr(esrc) {
-          Some(e) -> pcs_collect_uses_expr(e, scope, in_lam, acc)
-          None -> acc
-        }
-        pcs_collect_uses_interp_parts(rest, scope, in_lam, acc1)
-      }
-    }
-  }
-}
-
 # ---- pcs_rewrite: wrap non-last in-scope EVar reads in __perceus_dup ----
 
 fn pcs_rewrite_expr(e: Expr, scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : Expr / Console =
@@ -2694,8 +2389,7 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
         None -> None
         Some(e) -> Some(pcs_rewrite_expr(e, r.scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
       }
-      let exit_drops = pcs_collect_block_let_exit_drops(stmts, scope, uses,
-                                                         opt_tail, move_last_set, force_set, [])
+      let exit_drops = pcs_collect_block_let_exit_drops(stmts, uses, opt_tail, move_last_set, force_set, [])
       EBlock(pcs_append_drops(r.stmts, exit_drops), new_tail)
     }
     EMatch(s, arms) -> EMatch(pcs_rewrite_expr(s, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set),
@@ -2803,63 +2497,16 @@ fn pcs_rewrite_list_elem(el: ListElem, scope: [String], uses: [Use], in_lam: Boo
   ElSpread(e) -> ElSpread(pcs_rewrite_expr(e, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
 }
 
-fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : [Arm] / Console {
-
-  match arms {
-    [] -> []
-    [a, ...rest] -> match a {
-      Arm(pat, opt_g, body) -> {
-        let scope1 = prc_pat_bindings(pat, scope)
-        # The arm-binder per-path move set is precomputed once in
-        # perceus_decl_b (pcs_collect_trmc_arm_moves) — restricted to arms
-        # that are self-recursive modulo-cons (the shape emit turns into a
-        # TRMC step and disposes via the borrow-model). It is already unioned
-        # into the incoming skip_set, so no per-arm recompute here.
-        let body_skip = skip_set
-        let uses1 = pcs_arm_scoped_uses(pat, opt_g, body, uses, in_lam,
-          pcs_list_union(pcs_list_union(skip_set, force_set), move_last_set))
-        let g1 = match opt_g {
-          None -> None
-          Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses1, in_lam, skip_set, force_set, bmap, move_last_set))
-        }
-        let body1 = pcs_rewrite_expr(body, scope1, uses1, in_lam, body_skip, force_set, bmap, move_last_set)
-        [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)]
-      }
+fn pcs_rewrite_arms(arms: [Arm], scope: [String], uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : [Arm] / Console = match arms {
+  [] -> []
+  [Arm(pat, opt_g, body), ...rest] -> {
+    let scope1 = prc_pat_bindings(pat, scope)
+    let g1 = match opt_g {
+      None -> None
+      Some(g) -> Some(pcs_rewrite_expr(g, scope1, uses, in_lam, skip_set, force_set, bmap, move_last_set))
     }
-  }
-}
-
-# A name the pattern rebinds cannot be read together with a sibling arm's
-# binding of the same name, yet the fn-wide use table keys both under one
-# entry: `last_use_for` sees the sibling's read, every read here keeps its
-# dup, and in non-reuse shapes the binder's birth ref is orphaned. Rebuild
-# the table per arm: this arm's binders get entries collected from the
-# arm's own guard + body only; every other name keeps the fn-wide entries.
-# Names under a whole-body move analysis (skip / force / move-last) are
-# left on the fn-wide table — their gates were proven against it, and the
-# move-last position check would misfire against a per-arm last use.
-fn pcs_arm_scoped_uses(pat: Pattern, opt_g: Option[Expr], body: Expr,
-                       uses: [Use], in_lam: Bool, keep: [String]) : [Use] / Console = {
-  let rebound = pcs_strs_minus(prc_pat_binders(pat, []), keep)
-  match rebound {
-    []         -> uses
-    [_, ...__] -> {
-      let g_acc = match opt_g {
-        None    -> []
-        Some(g) -> pcs_collect_uses_expr(g, rebound, in_lam, [])
-      }
-      let local = pcs_collect_uses_expr(body, rebound, in_lam, g_acc)
-      list_append(local, pcs_uses_minus_names(uses, rebound))
-    }
-  }
-}
-
-fn pcs_uses_minus_names(uses: [Use], names: [String]) : [Use] = match uses {
-  []           -> []
-  [u, ...rest] -> match u {
-    U(nm, _, _, _) ->
-      if list_has(names, nm) { pcs_uses_minus_names(rest, names) }
-      else { [u, ...pcs_uses_minus_names(rest, names)] }
+    let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set, force_set, bmap, move_last_set)
+    [Arm(pat, g1, body1), ...pcs_rewrite_arms(rest, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)]
   }
 }
 
@@ -2930,7 +2577,7 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
     [] -> []
     [h, ...rest] -> match h {
       HC(op, params, body, ln, cl) -> {
-        let pn = pcs_filter_non_resume(map(params, (p) => p.pname), [])
+        let pn = pcs_filter_non_resume(params)
         let scope1 = list_append(scope, [...handler_state_aliases(), ...pn])
         let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set, force_set, bmap, [])
         [HC(op, params, body1, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set)]
@@ -3026,40 +2673,6 @@ fn pcs_max_paths_b_ps(nm: String, ps: [XPos], bmap: [BorrowEntry]) : Int = match
   [XP(r, c), ...rest] ->
     (match r { XLam -> 0 _ -> pcs_max_paths_b_expr(nm, c, bmap) }) +
     pcs_max_paths_b_ps(nm, rest, bmap)
-}
-
-# Identifier tokens equal to `nm` inside the `#{...}` parts of a string
-# span. Pure (tokenize, no parse), so the pure counting engines can stay
-# effect-free while agreeing with the collector's parsed view.
-fn pcs_interp_ident_count(nm: String, span: String, is_triple: Bool) : Int = {
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  if not has_interp(span, body_start, body_end) { 0 }
-  else {
-    let parts = iscan_collect(span, body_end,
-                              IScan { parts: [], lit_start: body_start, i: body_start })
-    pcs_iic_parts(nm, parts, 0)
-  }
-}
-
-fn pcs_iic_parts(nm: String, parts: [IPart], acc: Int) : Int = match parts {
-  []           -> acc
-  [p, ...rest] -> match p {
-    IpLit(_, _) -> pcs_iic_parts(nm, rest, acc)
-    IpExp(esrc) -> pcs_iic_parts(nm, rest, acc + pcs_iic_toks(nm, esrc, tokenize(esrc), 0))
-  }
-}
-
-fn pcs_iic_toks(nm: String, esrc: String, toks: [Token], acc: Int) : Int = match toks {
-  []           -> acc
-  [t, ...rest] -> {
-    let hit = match t.kind {
-      TkIdent -> if string_slice(esrc, t.start, t.length) == nm { 1 } else { 0 }
-      _       -> 0
-    }
-    pcs_iic_toks(nm, esrc, rest, acc + hit)
-  }
 }
 
 # Walk args, charging 0 for any arg whose index is a borrowed slot of the
@@ -3175,16 +2788,6 @@ fn pcs_arm_tail_ctor_arms(arms: [Arm]) : Bool = match arms {
 pub fn pcs_branch_aware_skip_locals(binders: [String], body: Expr) : [String] =
   pcs_branch_aware_skip_locals_b(binders, body, [], cix_empty(), [])
 
-# Move-on-every-use is sound for a name only when NO execution path through
-# the whole body reads it more than once: the per-arm gates cannot see a
-# same-named binder in a sibling arm whose path reads it twice.
-fn pcs_global_single_path(names: [String], body: Expr, bmap: [BorrowEntry]) : [String] = match names {
-  []           -> []
-  [h, ...rest] ->
-    if pcs_max_paths_b_expr(h, body, bmap) <= 1 { [h, ...pcs_global_single_path(rest, body, bmap)] }
-    else { pcs_global_single_path(rest, body, bmap) }
-}
-
 # Borrow-aware variant: the max-path count discounts uses of a binder that
 # land in a borrowed callee slot (is_red(l) does not consume l). This is
 # what lets the rb-tree Black arm's l/r pass `mp <= 1` — without it, the
@@ -3194,18 +2797,99 @@ pub fn pcs_branch_aware_skip_locals_b(binders: [String], body: Expr, bmap: [Borr
   []           -> []
   [h, ...rest] -> {
     let mp = pcs_max_paths_b_expr(h, body, bmap)
-    let cv = pcs_consumed_on_every_path(h, body)
+    let cv = pcs_consumed_b_expr(h, body, bmap)
     let ln = pcs_all_consumers_linear(h, body)
-    # Consume-aware (Koka Borrowed dual): every arg-slot use of h must land in
-    # a CONSUMING callee slot. A use in a NON-consuming slot (field-read callee
-    # — regexp nb_add_transition(b)) means the callee borrows h; moving h there
-    # frees it under the callee → UAF. ctor slots / match scrutinees / returns
-    # consume by construction.
-    let cons_ok = pcs_uses_only_consuming_slots(h, body, cmap)
+    # Every arg-slot use of h lands in a consuming slot or a declared borrow
+    # that runs before the consuming read. Any other non-consuming slot
+    # (a field-read callee) would free h under the callee. Ctor slots, match
+    # scrutinees and returns consume by construction. A borrow is no
+    # consumer, so `cv` must not count one either.
+    let cons_ok = pcs_uses_only_consuming_slots(h, body, cmap, bmap) and
+                  not pcs_borrow_after_consume(h, body, bmap)
     let rest_skip = pcs_branch_aware_skip_locals_b(rest, body, bmap, cmap, borrowed)
     if mp <= 1 and cv and ln and cons_ok { [h, ...rest_skip] } else { rest_skip }
   }
 }
+
+# A borrowed-slot read of `nm` after, on the same path, a read that consumed
+# it. Moving every read of `nm` would hand the borrow a value the consuming
+# callee may already have freed. A read stored into a constructor, list or
+# record stays pending until the call that receives it returns, or its
+# statement ends. Source order stands in for evaluation order, which only
+# errs toward keeping the dup.
+fn pcs_borrow_after_consume(nm: String, e: Expr, bmap: [BorrowEntry]) : Bool =
+  pcs_bac(nm, e, bmap, pcs_bac_st(false, false, false)).bad
+
+# A violation seen; `nm` consumed by now; `nm` read into a value not yet consumed.
+type PcsBac = { bad: Bool, done: Bool, pending: Bool }
+
+fn pcs_bac_st(bad: Bool, done: Bool, pending: Bool) : PcsBac = PcsBac { bad: bad, done: done, pending: pending }
+
+fn pcs_bac(nm: String, e: Expr, bmap: [BorrowEntry], st: PcsBac) : PcsBac = match e.kind {
+  EVar(u)         -> pcs_bac_st(st.bad, st.done, st.pending or u == nm)
+  ECall(f, xs)    -> {
+    let a = pcs_bac_args(nm, xs, pcs_borrow_lookup(bmap, pcs_callee_key(f)), 0, bmap,
+                         pcs_bac_st(st.bad, st.done, false))
+    if pcs_name_is_ctor(pcs_callee_name(f)) { pcs_bac_st(a.bad, a.done, st.pending or a.pending) }
+    else { pcs_bac_st(a.bad, a.done or a.pending, st.pending) }
+  }
+  EIf(c, t, oe)   -> {
+    let sc = pcs_bac(nm, c, bmap, st)
+    pcs_bac_join(pcs_bac(nm, t, bmap, sc), match oe { Some(x) -> pcs_bac(nm, x, bmap, sc) None -> sc })
+  }
+  EMatch(s, arms) -> pcs_bac_arms(nm, arms, bmap, pcs_bac(nm, s, bmap, st), pcs_bac_st(false, false, false))
+  EBlock(ss, ot)  -> {
+    let s1 = pcs_bac_stmts(nm, ss, bmap, st)
+    match ot { Some(t) -> pcs_bac(nm, t, bmap, s1) None -> s1 }
+  }
+  _               -> pcs_bac_ps(nm, xp_positions(e), bmap, st)
+}
+
+fn pcs_callee_name(f: Expr) : String = match sym_read_kind(f.kind) {
+  EVar(c)        -> c
+  EModCall(_, c) -> c
+  _              -> ""
+}
+
+fn pcs_bac_join(a: PcsBac, b: PcsBac) : PcsBac =
+  pcs_bac_st(a.bad or b.bad, a.done or b.done, a.pending or b.pending)
+
+fn pcs_bac_ps(nm: String, ps: [XPos], bmap: [BorrowEntry], st: PcsBac) : PcsBac = match ps {
+  []                  -> st
+  [XP(r, c), ...rest] ->
+    pcs_bac_ps(nm, rest, bmap, if xrole_inline(r) { pcs_bac(nm, c, bmap, st) } else { st })
+}
+
+# A statement's value is gone when it ends: whatever it read is spent.
+fn pcs_bac_stmts(nm: String, ss: [Stmt], bmap: [BorrowEntry], st: PcsBac) : PcsBac = match ss {
+  [] -> st
+  [s, ...rest] -> {
+    let a = pcs_bac_ps(nm, map(pcs_stmt_exprs(s), (x) => XP(XAll, x)), bmap, st)
+    pcs_bac_stmts(nm, rest, bmap, pcs_bac_st(a.bad, a.done or a.pending, false))
+  }
+}
+
+fn pcs_bac_arms(nm: String, arms: [Arm], bmap: [BorrowEntry], st: PcsBac, acc: PcsBac) : PcsBac = match arms {
+  [] -> acc
+  [Arm(_, og, b), ...rest] -> {
+    let sg = match og { Some(g) -> pcs_bac(nm, g, bmap, st) None -> st }
+    pcs_bac_arms(nm, rest, bmap, st, pcs_bac_join(acc, pcs_bac(nm, b, bmap, sg)))
+  }
+}
+
+fn pcs_bac_args(nm: String, xs: [Expr], borrowed: [Int], i: Int, bmap: [BorrowEntry], st: PcsBac) : PcsBac =
+  match xs {
+    [] -> st
+    [a, ...rest] -> {
+      let st1 = match a.kind {
+        EVar(u) ->
+          if u == nm and pcs_has_int(borrowed, i) { pcs_bac_st(st.bad or st.done, st.done, st.pending) }
+          else { pcs_bac(nm, a, bmap, st) }
+        _ -> pcs_bac(nm, a, bmap, st)
+      }
+      pcs_bac_args(nm, rest, borrowed, i + 1, bmap, st1)
+    }
+  }
 
 # Issue #817 — cons-cascade safety for a goto-tail arm whose binders are
 # candidates to move. The #3 `kai_decref(_scr)` frees the matched cons
@@ -3220,12 +2904,10 @@ pub fn pcs_branch_aware_skip_locals_b(binders: [String], body: Expr, bmap: [Borr
 # balanced by the cascade) is safe; outside it is not. Borrow-only reads
 # never consume, so they do not block (a `field_read` that dups, or a use
 # that is not the binder's last use, leaves the birth ref for the cascade).
-fn pcs_cons_cascade_safe(binders: [String], body: Expr, self_name: String, bmap: [BorrowEntry]) : Bool / Console = {
-  let uses = pcs_collect_uses_expr(body, binders, false, [])
+fn pcs_cons_cascade_safe(binders: [String], body: Expr, self_name: String, uses: [Use]) : Bool =
   pcs_ccs_all(binders, body, self_name, uses)
-}
 
-fn pcs_ccs_all(binders: [String], body: Expr, self_name: String, uses: [Use]) : Bool / Console = match binders {
+fn pcs_ccs_all(binders: [String], body: Expr, self_name: String, uses: [Use]) : Bool = match binders {
   []           -> true
   [nm, ...rest] -> {
     let ok = match last_use_for(nm, uses) {
@@ -3422,26 +3104,26 @@ fn pcs_bhtsc_arms(self_name: String, arms: [Arm]) : Bool = match arms {
 # in a consuming slot. Separate from `pcs_collect_arm_skip_binders`'
 # `reuse_shape` set (which governs the orthogonal reuse-in-place model);
 # this set governs the free-the-cell-then-goto model. Same 4 gates.
-fn pcs_collect_goto_tail_moves(self_name: String, e: Expr, bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] / Console =
-  pcs_gtm_kind(self_name, e.kind, bmap, cmap, borrowed)
+fn pcs_collect_goto_tail_moves(self_name: String, e: Expr, bmap: [BorrowEntry], uses: [Use], cmap: ConsumeIndex, borrowed: [String]) : [String] / Console =
+  pcs_gtm_kind(self_name, e.kind, bmap, uses, cmap, borrowed)
 
-fn pcs_gtm_kind(self_name: String, k: ExprKind, bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] / Console = match k {
+fn pcs_gtm_kind(self_name: String, k: ExprKind, bmap: [BorrowEntry], uses: [Use], cmap: ConsumeIndex, borrowed: [String]) : [String] / Console = match k {
   EMatch(s, arms) ->
     # Same borrowed-scrutinee inhibition as the arm-skip cascade: a
     # borrowed scrutinee frees no cell, so its arm binders must not move.
     if pcs_scrut_is_borrowed(s, borrowed) {
-      pcs_collect_goto_tail_moves(self_name, s, bmap, cmap, borrowed)
+      pcs_collect_goto_tail_moves(self_name, s, bmap, uses, cmap, borrowed)
     } else {
-      pcs_list_union(pcs_collect_goto_tail_moves(self_name, s, bmap, cmap, borrowed),
-                     pcs_gtm_arms(self_name, arms, bmap, cmap, borrowed))
+      pcs_list_union(pcs_collect_goto_tail_moves(self_name, s, bmap, uses, cmap, borrowed),
+                     pcs_gtm_arms(self_name, arms, bmap, uses, cmap, borrowed))
     }
   EIf(c, t, opt_e) ->
-    pcs_list_union(pcs_collect_goto_tail_moves(self_name, c, bmap, cmap, borrowed),
-      pcs_list_union(pcs_collect_goto_tail_moves(self_name, t, bmap, cmap, borrowed),
-                     match opt_e { None -> [] Some(e2) -> pcs_collect_goto_tail_moves(self_name, e2, bmap, cmap, borrowed) }))
+    pcs_list_union(pcs_collect_goto_tail_moves(self_name, c, bmap, uses, cmap, borrowed),
+      pcs_list_union(pcs_collect_goto_tail_moves(self_name, t, bmap, uses, cmap, borrowed),
+                     match opt_e { None -> [] Some(e2) -> pcs_collect_goto_tail_moves(self_name, e2, bmap, uses, cmap, borrowed) }))
   EBlock(stmts, tail) ->
-    pcs_list_union(pcs_gtm_stmts(self_name, stmts, bmap, cmap, borrowed),
-                   match tail { None -> [] Some(e) -> pcs_collect_goto_tail_moves(self_name, e, bmap, cmap, borrowed) })
+    pcs_list_union(pcs_gtm_stmts(self_name, stmts, bmap, uses, cmap, borrowed),
+                   match tail { None -> [] Some(e) -> pcs_collect_goto_tail_moves(self_name, e, bmap, uses, cmap, borrowed) })
   # A lambda body is a different call frame — a self-tail-call inside it
   # is NOT a goto-tail of the enclosing fn (`pcs_atsc_kind` returns false
   # at ELambda for the same reason). The rewriter also zeroes
@@ -3451,12 +3133,12 @@ fn pcs_gtm_kind(self_name: String, k: ExprKind, bmap: [BorrowEntry], cmap: Consu
   _ -> []
 }
 
-fn pcs_gtm_arms(self_name: String, arms: [Arm], bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] / Console = match arms {
+fn pcs_gtm_arms(self_name: String, arms: [Arm], bmap: [BorrowEntry], uses: [Use], cmap: ConsumeIndex, borrowed: [String]) : [String] / Console = match arms {
   []           -> []
   [a, ...rest] -> match a {
     Arm(pat, opt_g, body) -> {
-      let nested = pcs_collect_goto_tail_moves(self_name, body, bmap, cmap, borrowed)
-      let pb = prc_pat_binders(pat, [])
+      let nested = pcs_collect_goto_tail_moves(self_name, body, bmap, uses, cmap, borrowed)
+      let pb = prc_pat_bindings(pat, [])
       let here = match opt_g {
         # Issue #817 — additionally require cons-cascade safety: the #3
         # `kai_decref(_scr)` frees the matched cons cell when its rc hits
@@ -3468,27 +3150,27 @@ fn pcs_gtm_arms(self_name: String, arms: [Arm], bmap: [BorrowEntry], cmap: Consu
         # → UAF. Block the whole pattern's move when that holds.
         None    -> {
           let pure_tail = pcs_arm_all_tails_self_call(self_name, body)
-          let safe = pure_tail and pcs_cons_cascade_safe(pb, body, self_name, bmap)
+          let safe = pure_tail and pcs_cons_cascade_safe(pb, body, self_name, uses)
           if safe { pcs_branch_aware_skip_locals_b(pb, body, bmap, cmap, borrowed) } else { [] }
         }
         Some(_) -> []
       }
       pcs_list_union(pcs_list_union(here, nested),
-                     pcs_gtm_arms(self_name, rest, bmap, cmap, borrowed))
+                     pcs_gtm_arms(self_name, rest, bmap, uses, cmap, borrowed))
     }
   }
 }
 
-fn pcs_gtm_stmts(self_name: String, stmts: [Stmt], bmap: [BorrowEntry], cmap: ConsumeIndex, borrowed: [String]) : [String] / Console = match stmts {
+fn pcs_gtm_stmts(self_name: String, stmts: [Stmt], bmap: [BorrowEntry], uses: [Use], cmap: ConsumeIndex, borrowed: [String]) : [String] / Console = match stmts {
   []           -> []
   [s, ...rest] -> {
     let here = match s {
-      SLet(_, _, e)       -> pcs_collect_goto_tail_moves(self_name, e, bmap, cmap, borrowed)
-      SVar(_, _, e, _, _) -> pcs_collect_goto_tail_moves(self_name, e, bmap, cmap, borrowed)
-      SExprStmt(e)        -> pcs_collect_goto_tail_moves(self_name, e, bmap, cmap, borrowed)
+      SLet(_, _, e)       -> pcs_collect_goto_tail_moves(self_name, e, bmap, uses, cmap, borrowed)
+      SVar(_, _, e, _, _) -> pcs_collect_goto_tail_moves(self_name, e, bmap, uses, cmap, borrowed)
+      SExprStmt(e)        -> pcs_collect_goto_tail_moves(self_name, e, bmap, uses, cmap, borrowed)
       _                   -> []
     }
-    pcs_list_union(here, pcs_gtm_stmts(self_name, rest, bmap, cmap, borrowed))
+    pcs_list_union(here, pcs_gtm_stmts(self_name, rest, bmap, uses, cmap, borrowed))
   }
 }
 
@@ -3499,56 +3181,56 @@ fn pcs_gtm_stmts(self_name: String, stmts: [Stmt], bmap: [BorrowEntry], cmap: Co
 # whose arm guarantees the #3 shallow-decref cannot cascade into a sibling
 # (the `vpa_sig_params` UAF is excluded — its arm has a leading SLet /
 # inner-match, so it fails `pcs_arm_all_tails_self_call`).
-fn pcs_collect_safe_arm_binders(self_name: String, e: Expr, bmap: [BorrowEntry]) : [String] / Console =
-  pcs_sab_kind(self_name, e.kind, bmap)
+fn pcs_collect_safe_arm_binders(self_name: String, e: Expr, bmap: [BorrowEntry], uses: [Use]) : [String] / Console =
+  pcs_sab_kind(self_name, e.kind, bmap, uses)
 
-fn pcs_sab_kind(self_name: String, k: ExprKind, bmap: [BorrowEntry]) : [String] / Console = match k {
+fn pcs_sab_kind(self_name: String, k: ExprKind, bmap: [BorrowEntry], uses: [Use]) : [String] / Console = match k {
   EMatch(s, arms) ->
-    pcs_list_union(pcs_collect_safe_arm_binders(self_name, s, bmap),
-                   pcs_sab_arms(self_name, arms, bmap))
+    pcs_list_union(pcs_collect_safe_arm_binders(self_name, s, bmap, uses),
+                   pcs_sab_arms(self_name, arms, bmap, uses))
   EIf(c, t, opt_e) ->
-    pcs_list_union(pcs_collect_safe_arm_binders(self_name, c, bmap),
-      pcs_list_union(pcs_collect_safe_arm_binders(self_name, t, bmap),
-                     match opt_e { None -> [] Some(e2) -> pcs_collect_safe_arm_binders(self_name, e2, bmap) }))
+    pcs_list_union(pcs_collect_safe_arm_binders(self_name, c, bmap, uses),
+      pcs_list_union(pcs_collect_safe_arm_binders(self_name, t, bmap, uses),
+                     match opt_e { None -> [] Some(e2) -> pcs_collect_safe_arm_binders(self_name, e2, bmap, uses) }))
   EBlock(stmts, tail) ->
-    pcs_list_union(pcs_sab_stmts(self_name, stmts, bmap),
-                   match tail { None -> [] Some(e) -> pcs_collect_safe_arm_binders(self_name, e, bmap) })
+    pcs_list_union(pcs_sab_stmts(self_name, stmts, bmap, uses),
+                   match tail { None -> [] Some(e) -> pcs_collect_safe_arm_binders(self_name, e, bmap, uses) })
   # Lambda body = different frame; do not descend (mirror of
   # `pcs_gtm_kind` / `pcs_atsc_kind`).
   ELambda(_, _) -> []
   _ -> []
 }
 
-fn pcs_sab_arms(self_name: String, arms: [Arm], bmap: [BorrowEntry]) : [String] / Console = match arms {
+fn pcs_sab_arms(self_name: String, arms: [Arm], bmap: [BorrowEntry], uses: [Use]) : [String] / Console = match arms {
   []           -> []
   [a, ...rest] -> match a {
     Arm(pat, opt_g, body) -> {
-      let nested = pcs_collect_safe_arm_binders(self_name, body, bmap)
-      let pb = prc_pat_binders(pat, [])
+      let nested = pcs_collect_safe_arm_binders(self_name, body, bmap, uses)
+      let pb = prc_pat_bindings(pat, [])
       let here = match opt_g {
         None -> {
           let pure_tail = pcs_arm_all_tails_self_call(self_name, body)
-          let safe = pure_tail and pcs_cons_cascade_safe(pb, body, self_name, bmap)
+          let safe = pure_tail and pcs_cons_cascade_safe(pb, body, self_name, uses)
           if safe { pb } else { [] }
         }
         Some(_) -> []
       }
       pcs_list_union(pcs_list_union(here, nested),
-                     pcs_sab_arms(self_name, rest, bmap))
+                     pcs_sab_arms(self_name, rest, bmap, uses))
     }
   }
 }
 
-fn pcs_sab_stmts(self_name: String, stmts: [Stmt], bmap: [BorrowEntry]) : [String] / Console = match stmts {
+fn pcs_sab_stmts(self_name: String, stmts: [Stmt], bmap: [BorrowEntry], uses: [Use]) : [String] / Console = match stmts {
   []           -> []
   [s, ...rest] -> {
     let here = match s {
-      SLet(_, _, e)       -> pcs_collect_safe_arm_binders(self_name, e, bmap)
-      SVar(_, _, e, _, _) -> pcs_collect_safe_arm_binders(self_name, e, bmap)
-      SExprStmt(e)        -> pcs_collect_safe_arm_binders(self_name, e, bmap)
+      SLet(_, _, e)       -> pcs_collect_safe_arm_binders(self_name, e, bmap, uses)
+      SVar(_, _, e, _, _) -> pcs_collect_safe_arm_binders(self_name, e, bmap, uses)
+      SExprStmt(e)        -> pcs_collect_safe_arm_binders(self_name, e, bmap, uses)
       _                   -> []
     }
-    pcs_list_union(here, pcs_sab_stmts(self_name, rest, bmap))
+    pcs_list_union(here, pcs_sab_stmts(self_name, rest, bmap, uses))
   }
 }
 
@@ -3624,7 +3306,7 @@ fn pcs_collect_arm_skip_arms(self_name: String, tl: Bool, arms: [Arm], bmap: [Bo
       let here = match opt_g {
         None    ->
           if reuse_shape {
-            pcs_branch_aware_skip_locals_b(prc_pat_binders(pat, []), body, bmap, cmap, borrowed)
+            pcs_branch_aware_skip_locals_b(prc_pat_bindings(pat, []), body, bmap, cmap, borrowed)
           } else { [] }
         Some(_) -> []
       }
@@ -4075,167 +3757,57 @@ fn pcs_consumed_b_arms(nm: String, arms: [Arm], bmap: [BorrowEntry]) : Bool = ma
   }
 }
 
-# ---- m5.x §4b: rewrite EVar reads inside EStr interpolation bodies ----
+# ---- dup wraps inside `#{...}` bodies ----
 #
-# `pcs_rewrite_kind` cannot reach EVar reads buried inside `#{...}`
-# because the EStr span is opaque source text. The collector parses the
-# bodies and counts uses correctly, but the rewriter has no transform
-# hook into the span itself. Without this pass, `print("#{show(e)} =
-# #{eval(e)}")` leaves both reads of `e` unwrapped — which is the bug
-# behind R3.
-#
-# Strategy: walk each `#{esrc}` body. Tokenise + parse `esrc` into an
-# Expr, feed it to the existing `pcs_rewrite_expr` (with the outer
-# scope / uses / in_lam) to compute which inner EVar positions need a
-# `__perceus_dup` wrap, then rebuild `esrc` by walking its tokens and
-# replacing the wrapped idents with `__perceus_dup(NAME)`. The result
-# is still valid kaikai source: when emit re-parses the interp body it
-# sees the wrap as a regular ECall and routes through the normal
-# `__perceus_dup` special case in `emit_call_expr`.
-
-type DupMark = DM(Int, Int)   # line, col of an VariantEntry that needs wrapping
+# The span is opaque source text, so the rewrite parses each body, runs
+# `pcs_rewrite_expr` over it with the outer scope and table, and respells
+# every read it wrapped as `__perceus_dup(NAME)` in the text. Emit re-parses
+# the body and sees an ordinary `__perceus_dup` call.
 
 fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [String],
-                          uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : String / Console {
-
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  if not has_interp(span, body_start, body_end) { span }
-  else {
-    let parts = iscan_collect(span, body_end,
-                  IScan { parts: [], lit_start: body_start, i: body_start })
-    let new_parts = pcs_rewrite_iparts(parts, scope, uses, in_lam, [], skip_set, force_set, bmap)
-    let body = pcs_concat_iparts(new_parts, "")
-    let prefix = if is_triple { "\"\"\"" } else { "\"" }
-    concat_all([prefix, body, prefix])
+                          uses: [Use], in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry], move_last_set: [String]) : String / Console =
+  match isp_parts(span, is_triple) {
+    []    -> span
+    parts -> isp_rebuild(is_triple, pcs_rewrite_iparts(parts, scope, uses, in_lam, skip_set, force_set, bmap))
   }
-}
 
 fn pcs_rewrite_iparts(parts: [IPart], scope: [String], uses: [Use],
-                       in_lam: Bool, acc: [IPart], skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [IPart] / Console {
-
+                       in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [IPart] / Console =
   match parts {
-    [] -> list_reverse(acc)
+    [] -> []
     [p, ...rest] -> {
       let p1 = match p {
         IpLit(_, _) -> p
-        IpExp(esrc) -> IpExp(pcs_rewrite_interp_src(esrc, scope, uses, in_lam, skip_set, force_set, bmap))
-      }
-      pcs_rewrite_iparts(rest, scope, uses, in_lam, [p1, ...acc], skip_set, force_set, bmap)
-    }
-  }
-}
-
-fn pcs_concat_iparts(parts: [IPart], acc: String) : String {
-  match parts {
-    [] -> acc
-    [p, ...rest] -> match p {
-      IpLit(piece, _) -> pcs_concat_iparts(rest, concat_all([acc, piece]))
-      # `"#{"` would lex as an unterminated interpolation start because
-      # kaikai has no escape for `#{` in string literals. Build the
-      # opener from `"#"` + `"{"` so the source survives lex.
-      IpExp(esrc) -> pcs_concat_iparts(rest, concat_all([acc, "#", "{", esrc, "}"]))
-    }
-  }
-}
-
-fn pcs_rewrite_interp_src(esrc: String, scope: [String], uses: [Use],
-                           in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : String / Console {
-
-  # Tokenise once for pcs_render_with_marks (it needs the token
-  # stream to map AST positions back to source spans); parse_interp_expr
-  # re-tokenises internally for the AST. The double tokenise keeps
-  # parse.kai's public surface free of the Parser / PExpr workspace
-  # types (issue #677 phase 1h H2).
-  let toks = tokenize(esrc)
-  match parse_interp_expr(esrc) {
-    None -> esrc
-    Some(parsed) -> {
-      let rewritten = pcs_rewrite_expr(parsed, scope, uses, in_lam, skip_set, force_set, bmap, [])
-      let marks = pcs_dup_marks_expr(rewritten, [])
-      match marks {
-        [] -> esrc
-        _  -> pcs_render_with_marks(esrc, toks, marks, "", 0)
-      }
-    }
-  }
-}
-
-# Walk a (rewritten) Expr collecting (line, col) of inner EVars wrapped
-# in `__perceus_dup`. Pure structural recursion — no scope tracking,
-# since pcs_rewrite_expr already encoded the wrap decisions in the AST.
-fn pcs_dup_marks_expr(e: Expr, acc: [DupMark]) : [DupMark] {
-  let acc1 = match e.kind {
-    ECall(f, xs) -> match sym_read_kind(f.kind) {
-      EVar(nm) -> if nm == "__perceus_dup" {
-        match xs {
-          [arg] -> match arg.kind {
-            EVar(_) -> [DM(arg.line, arg.col), ...acc]
-            ESym(_, _) -> [DM(arg.line, arg.col), ...acc]
-            _ -> acc
-          }
-          _ -> acc
+        IpExp(esrc) -> match parse_interp_expr(esrc) {
+          None -> p
+          Some(parsed) -> IpExp(isp_render(esrc, pcs_dup_edits(
+            pcs_rewrite_expr(parsed, scope, uses, in_lam, skip_set, force_set, bmap, []), [])))
         }
-      } else { acc }
+      }
+      [p1, ...pcs_rewrite_iparts(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
+    }
+  }
+
+# Each read the rewrite wrapped in `__perceus_dup`, as a respelling of its token.
+fn pcs_dup_edits(e: Expr, acc: [IdentEdit]) : [IdentEdit] = {
+  let acc1 = match e.kind {
+    ECall(f, [arg]) -> match sym_read_kind(f.kind) {
+      EVar(c) -> match sym_read_kind(arg.kind) {
+        EVar(nm) ->
+          if c == "__perceus_dup" { [IdentEdit(arg.line, arg.col, concat_all(["__perceus_dup(", nm, ")"])), ...acc] }
+          else { acc }
+        _ -> acc
+      }
       _ -> acc
     }
     _ -> acc
   }
-  pcs_dup_marks_subs(e, acc1)
+  pcs_dup_edits_ps(xp_positions(e), acc1)
 }
 
-fn pcs_dup_marks_subs(e: Expr, acc: [DupMark]) : [DupMark] =
-  pcs_dup_marks_ps(xp_positions(e), acc)
-
-fn pcs_dup_marks_ps(ps: [XPos], acc: [DupMark]) : [DupMark] = match ps {
+fn pcs_dup_edits_ps(ps: [XPos], acc: [IdentEdit]) : [IdentEdit] = match ps {
   []                  -> acc
-  [XP(_, c), ...rest] -> pcs_dup_marks_ps(rest, pcs_dup_marks_expr(c, acc))
-}
-
-fn pcs_dup_mark_has(marks: [DupMark], line: Int, col: Int) : Bool {
-  match marks {
-    [] -> false
-    [h, ...rest] -> match h {
-      DM(l, c) ->
-        if l == line and c == col { true }
-        else { pcs_dup_mark_has(rest, line, col) }
-    }
-  }
-}
-
-# Walk tokens of `esrc`, copying source verbatim except at TkIdent
-# tokens whose (line, col) matches a `marks` entry — those get wrapped
-# in `__perceus_dup(NAME)`. Token positions are relative to `esrc`
-# (starting at line 1, col 1) because tokenize() runs on the slice.
-fn pcs_render_with_marks(esrc: String, toks: [Token], marks: [DupMark],
-                           acc: String, prev_end: Int) : String {
-  match toks {
-    [] -> concat_all([acc, string_slice(esrc, prev_end, string_length(esrc) - prev_end)])
-    [t, ...rest] -> match t.kind {
-      TkEof -> concat_all([acc, string_slice(esrc, prev_end, string_length(esrc) - prev_end)])
-      TkIdent ->
-        if pcs_dup_mark_has(marks, t.line, t.col) {
-          let between = string_slice(esrc, prev_end, t.start - prev_end)
-          let txt = string_slice(esrc, t.start, t.length)
-          let chunk = concat_all([between, "__perceus_dup(", txt, ")"])
-          pcs_render_with_marks(esrc, rest, marks,
-                                  concat_all([acc, chunk]),
-                                  t.start + t.length)
-        } else {
-          let chunk = string_slice(esrc, prev_end, (t.start + t.length) - prev_end)
-          pcs_render_with_marks(esrc, rest, marks,
-                                  concat_all([acc, chunk]),
-                                  t.start + t.length)
-        }
-      _ -> {
-        let chunk = string_slice(esrc, prev_end, (t.start + t.length) - prev_end)
-        pcs_render_with_marks(esrc, rest, marks,
-                                concat_all([acc, chunk]),
-                                t.start + t.length)
-      }
-    }
-  }
+  [XP(_, c), ...rest] -> pcs_dup_edits_ps(rest, pcs_dup_edits(c, acc))
 }
 
 # A single-use owned param whose only read sits on some-but-not-all
@@ -4303,7 +3875,7 @@ fn pcs_branchy_single_loop(pnames: [String], body: Expr, uses: [Use],
   [p, ...rest] -> {
     let r = pcs_branchy_single_loop(rest, body, uses, skip)
     if list_has(skip, p) { r }
-    else if pcs_count_non_lam_uses(p, uses, 0) != 1 { r }
+    else if pcs_read_count(p, uses) != 1 { r }
     else {
       match last_use_for(p, uses) {
         LUAt(_, _, _) ->
@@ -4366,9 +3938,7 @@ fn pcs_read_roles_deferred(nm: String, e: Expr) : PcsRR =
 # it would orphan the birth ref on a value leaf the arm-drop distribution
 # never reaches. The same value-leaf hole gates the whole arm: when the
 # body hosts a self-tail-call, the planted drop lands only on self-call
-# leaves, so every tail leaf must be one. The fn-wide use count gates
-# collisions: a name bound by several scopes only qualifies when the
-# whole fn reads it exactly once outside lambdas.
+# leaves, so every tail leaf must be one.
 fn pcs_branchy_arm_binders(e: Expr, fn_name: String, uses: [Use], skip: [String],
                            acc: [String]) : [String] = match e.kind {
   EMatch(s, arms) ->
@@ -4388,7 +3958,7 @@ fn pcs_bab_ps(ps: [XPos], fn_name: String, uses: [Use], skip: [String], acc: [St
 fn pcs_bab_arms(arms: [Arm], fn_name: String, uses: [Use], skip: [String], acc: [String]) : [String] = match arms {
   []           -> acc
   [Arm(pat, og, b), ...rest] -> {
-    let acc1 = pcs_bab_binders(prc_pat_binders(pat, []), og, b, fn_name, uses, skip, acc)
+    let acc1 = pcs_bab_binders(prc_pat_bindings(pat, []), og, b, fn_name, uses, skip, acc)
     let acc2 = match og {
       None    -> acc1
       Some(g) -> pcs_branchy_arm_binders(g, fn_name, uses, skip, acc1)
@@ -4409,8 +3979,7 @@ fn pcs_bab_binders(bound: [String], og: Option[Expr], b: Expr, fn_name: String,
 fn pcs_bab_qualifies(nm: String, og: Option[Expr], b: Expr, fn_name: String,
                      uses: [Use], skip: [String]) : Bool =
   if name_is_unused_binder(nm) or list_has(skip, nm) { false }
-  else if pcs_count_non_lam_uses(nm, uses, 0) != 1 { false }
-  else if pcs_uses_have_in_lam(uses, nm) { false }
+  else if not pcs_read_once(nm, uses) { false }
   else {
     let g_roles = match og {
       None    -> PRR(0, 0, false)
@@ -4455,10 +4024,8 @@ fn pcs_bab_leaves_arms(arms: [Arm], fn_name: String) : Bool = match arms {
 # block, so the raw last-use transfer leaks the birth ref on every
 # skipped evaluation. Forced to dup instead; the block-exit collector
 # pays a statement-position read and the post-tail pass pays a
-# tail-position read. Declines: a tail read whose tail hosts a
-# self-call (the per-path planter cannot guarantee a payer there), and
-# any name bound more than once in the fn — the payers key on the
-# name, so a homonym binding could collect a drop it does not own.
+# tail-position read. Declines a tail read whose tail hosts a self-call:
+# the per-path planter cannot guarantee a payer there.
 fn pcs_branchy_let_binders(body: Expr, fn_name: String, uses: [Use],
                            skip: [String]) : [String] =
   pcs_blb_expr(body, body, fn_name, uses, skip, [])
@@ -4505,9 +4072,7 @@ fn pcs_blb_qualifies(nm: String, pat: Pattern, rhs: Expr, rest: [Stmt],
                      uses: [Use], skip: [String]) : Bool =
   if name_is_unused_binder(nm) or list_has(skip, nm) { false }
   else if not list_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm) { false }
-  else if pcs_count_non_lam_uses(nm, uses, 0) != 1 { false }
-  else if pcs_uses_have_in_lam(uses, nm) { false }
-  else if pbp_bind_count(nm, body) != 1 { false }
+  else if not pcs_read_once(nm, uses) { false }
   else {
     match pcs_read_roles(nm, mk_expr(EBlock(rest, ot), pat.line, pat.col), false) {
       PRR(a, brc, blocked) ->
@@ -4520,9 +4085,9 @@ fn pcs_blb_qualifies(nm: String, pat: Pattern, rhs: Expr, rest: [Stmt],
 # owns what it binds (unlike an arm binder, which aliases the scrutinee
 # and needs the cons-cascade gate), so moving its lone read leaves no
 # orphan and needs no cascade analysis. Gates: exactly one plain read,
-# none in a lambda, the name bound once in the whole body, the read
-# unconditional (never behind a short-circuit or branch edge, whose skipped
-# path would leave the ref unpaid) and landing in a consuming slot.
+# none in a lambda, the read unconditional (never behind a short-circuit or
+# branch edge, whose skipped path would leave the ref unpaid) and landing in
+# a consuming slot.
 fn pcs_collect_move_last_lets(body: Expr, uses: [Use], cmap: ConsumeIndex,
                               skip: [String]) : [String] =
   pcs_mll_expr(body, body, uses, cmap, skip, [])
@@ -4570,9 +4135,7 @@ fn pcs_mll_qualifies(nm: String, pat: Pattern, rhs: Expr, body: Expr,
                      uses: [Use], cmap: ConsumeIndex, skip: [String]) : Bool =
   if name_is_unused_binder(nm) or list_has(skip, nm) { false }
   else if not list_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm) { false }
-  else if pcs_count_non_lam_uses(nm, uses, 0) != 1 { false }
-  else if pcs_uses_have_in_lam(uses, nm) { false }
-  else if pbp_bind_count(nm, body) != 1 { false }
+  else if not pcs_read_once(nm, uses) { false }
   else {
     match pcs_read_roles(nm, body, false) {
       PRR(a, brc, blocked) ->
@@ -4595,23 +4158,19 @@ fn pcs_blb_payer_ok(nm: String, ot: Option[Expr], fn_name: String) : Bool = matc
 
 # Block-exit drops for the `let`s this block binds whose payer is the exit
 # (`pcs_let_payer`). A binding read in the tail is left to
-# `ptd_tail_exit_drops`, which releases after the tail value exists; a name
-# visible in `outer` belongs to an enclosing scope. Destructuring lets are
-# paid by `emit_let_stmt`, which decrefs the composite temp, and raw locals
-# carry no rc.
-fn pcs_collect_block_let_exit_drops(stmts: [Stmt], outer: [String],
-                                     uses: [Use], opt_tail: Option[Expr],
-                                     move_last_set: [String],
-                                     force_set: [String],
-                                     acc: [Stmt]) : [Stmt] / Console {
-
+# `ptd_tail_exit_drops`, which releases after the tail value exists.
+# Destructuring lets are paid by `emit_let_stmt`, which decrefs the composite
+# temp, and raw locals carry no rc.
+fn pcs_collect_block_let_exit_drops(stmts: [Stmt], uses: [Use], opt_tail: Option[Expr],
+                                     move_last_set: [String], force_set: [String],
+                                     acc: [Stmt]) : [Stmt] {
   match stmts {
     [] -> list_reverse(acc)
     [s, ...rest] -> {
       let acc1 = match s {
         SLet(pat, _, rhs) -> match pat.pkind {
           PBind(nm) -> {
-            let in_block = list_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm) and not list_has(outer, nm)
+            let in_block = list_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm)
             let payer = pcs_let_payer(nm, rhs, uses, list_has(move_last_set, nm), list_has(force_set, nm))
             if in_block and pcs_pays(payer, PyExit) and not pcs_name_in_tail(nm, opt_tail) {
               [pcs_make_drop_stmt(nm, pat.line, pat.col), ...acc]
@@ -4621,23 +4180,14 @@ fn pcs_collect_block_let_exit_drops(stmts: [Stmt], outer: [String],
         }
         _ -> acc
       }
-      pcs_collect_block_let_exit_drops(rest, outer, uses, opt_tail, move_last_set, force_set, acc1)
+      pcs_collect_block_let_exit_drops(rest, uses, opt_tail, move_last_set, force_set, acc1)
     }
   }
 }
 
-# True iff `nm` appears in the block's tail expression. Re-runs
-# `pcs_collect_uses_expr` with `[nm]` as scope so the result lists
-# the EVar reads of `nm` and only those.
-fn pcs_name_in_tail(nm: String, opt_tail: Option[Expr]) : Bool / Console {
-
-  match opt_tail {
-    None -> false
-    Some(e) -> {
-      let us = pcs_collect_uses_expr(e, [nm], false, [])
-      pcs_uses_has_name(us, nm)
-    }
-  }
+fn pcs_name_in_tail(nm: String, opt_tail: Option[Expr]) : Bool = match opt_tail {
+  None    -> false
+  Some(e) -> pcs_mentions(nm, e)
 }
 
 # Splice exit-drop SExprStmts into the block. Drops fire LIFO (last
@@ -4652,14 +4202,6 @@ fn pcs_append_drops(stmts: [Stmt], drops: [Stmt]) : [Stmt] {
   }
 }
 
-fn pcs_uses_has_name(uses: [Use], nm: String) : Bool {
-  match uses {
-    [] -> false
-    [h, ...rest] -> match h {
-      U(uname, _, _, _) -> if uname == nm { true } else { pcs_uses_has_name(rest, nm) }
-    }
-  }
-}
 
 # ---- Koka Parc `ownedInScope`: owned sibling-param move + branch-drop ----
 #
@@ -4699,7 +4241,7 @@ fn pcs_owned_scope_move_params(pnames: [String], body: Expr, skip: [String],
       else {
         let mp = pcs_max_paths_b_expr(p, body, bmap)
         let linear = pcs_all_consumers_linear(p, body)
-        let cons_ok = pcs_uses_only_consuming_slots(p, body, cmap)
+        let cons_ok = pcs_uses_only_consuming_slots(p, body, cmap, [])
         let arms_ok = pcs_param_arms_move_safe(p, body)
         let ok = mp <= 1 and linear and cons_ok and arms_ok
         if ok { [p, ...rest_sel] } else { rest_sel }
@@ -4805,326 +4347,75 @@ fn pcs_replace_peeled_match(body: Expr, scr: Expr, arms1: [Arm]) : Expr = {
   }
 }
 
-# Issue #350 — Gap 3: emit `__perceus_drop` for multi-use pattern
-# bindings introduced by match arms. Mirror of the SLet exit-drop
-# pass landed in #342, but for the arm-binding shape that drives
-# the RB tree leak (`balance` / `insert_loop` rotation arms).
+# The arm binders' payers. An arm binder takes its birth ref at bind time
+# (`kai_incref` in `emit_pat_binds`); when no read hands it on, a drop
+# between the body's statements and its tail releases it. A binder read in
+# the tail cannot take that drop — it would fire before the read — and a
+# non-block body that is itself a self-tail-call cannot be wrapped without
+# hiding the call from `tcrec_rewrite_decls`.
 #
-# Each match arm extracts cells from the scrutinee with `kai_incref`
-# at the binding site (`emit_pat_binds`). When a binding has ≥ 2
-# non-lambda uses inside the arm, every read is wrapped in
-# `__perceus_dup` (each consumer takes a fresh ref); the original
-# extract ref is left dangling without an explicit drop, leaking
-# the underlying child cell every time the arm fires.
-#
-# The pass walks the post-`pcs_rewrite_expr` AST, finds each EMatch
-# arm whose pattern introduces multi-use bindings, and inserts a
-# `__perceus_drop(nm)` between the body's statements and its tail.
-# Conservative gates (preserve TCO + avoid use-after-free):
-#   - Skip names already visible in the outer scope (owned upstream).
-#   - Skip names whose `last_use_for` is `LUUnused` or single-use
-#     `LUAt` (the lexically-last raw read transfers the ref).
-#   - Skip names that appear in the body's tail-leaf positions —
-#     a drop fires before the tail evaluates, so a tail-position
-#     read would see a freed cell when the binding's last live ref
-#     was the original.
-#   - For non-EBlock bodies, skip drops when the body is a tail-call
-#     to the enclosing fn (`fn_name`); wrapping such a body in an
-#     EBlock with `__pcs_arm_ret` would hide the self-tail-call from
-#     `tcrec_rewrite_decls` and break TCO (same risk #342 hit).
-#
-# The pass runs *after* `pcs_rewrite_expr` so it sees the
-# `__perceus_dup`-wrapped reads and the canonicalised structure;
-# it runs *before* `pcs_recognise_reuse_expr` so the reuse rewrite
-# operates on the post-drop arm body.
-fn pcs_arm_drop_pass(e: Expr, fn_name: String, outer_scope: [String],
-                     uses: [Use]) : Expr / Console =
+# Runs after `pcs_rewrite_expr`, so it sees the dup-wrapped reads, and
+# before `pcs_recognise_reuse_expr`, so the reuse rewrite sees the drops.
+# The read table plus the binders the rewrite moves on every read. A
+# move-at-last-use binder is not one: the paths that skip its last read
+# still owe a drop. A forced binder's dup'd read is paid
+# by the guard-fail and goto planters, never here: an arm drop planted for it
+# would read, to the branch payer, as its single read.
+type PcsArmCx = { uses: [Use], moved: [String] }
 
-  Expr { kind: pcs_arm_drop_kind(e.kind, e.line, e.col, fn_name, outer_scope, uses),
-         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+fn pcs_arm_drop_pass(e: Expr, fn_name: String, cx: PcsArmCx) : Expr = {
+  let k1 = prc_map_expr_kind(e.kind, (c) => pcs_arm_drop_pass(c, fn_name, cx))
+  let k2 = match k1 {
+    EMatch(scr, arms) -> EMatch(scr, map(arms, (a) => pcs_arm_drops_of(a, fn_name, cx)))
+    _                 -> k1
+  }
+  Expr { kind: k2, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+}
 
-fn pcs_arm_drop_kind(k: ExprKind, line: Int, col: Int, fn_name: String,
-                     outer_scope: [String], uses: [Use]) : ExprKind / Console {
-
-  match k {
-    EMatch(scr, arms) -> {
-      let scr1 = pcs_arm_drop_pass(scr, fn_name, outer_scope, uses)
-      let arms1 = pcs_arm_drop_arms(arms, fn_name, outer_scope, uses)
-      EMatch(scr1, arms1)
+fn pcs_arm_drops_of(a: Arm, fn_name: String, cx: PcsArmCx) : Arm = match a {
+  Arm(pat0, g_rw, body1) -> {
+    # For a block body the drop sits between statements and tail, so a
+    # tail read must be skipped; a non-block body is wrapped and runs first.
+    let pre_tail = pcs_body_is_block_with_tail(body1)
+    # A never-read plain `PBind` is elided to `_` instead of paid: no
+    # bind-incref is emitted, and a bare ctor rebuild stays visible to the
+    # reuse recogniser.
+    let elide = pcs_arm_elide_names(pat0, cx.uses, [])
+    let pat = pcs_pat_elide(pat0, elide)
+    let bound = pcs_strs_minus(prc_pat_bindings(pat0, []), elide)
+    let drops = pcs_collect_arm_drops(bound, pat.line, pat.col, body1, g_rw, cx, pre_tail, [])
+    let body2 = match drops {
+      [] -> body1
+      [_, ...__] -> pcs_inject_arm_drops(body1, drops, fn_name)
     }
-    EBlock(stmts, opt_tail) -> {
-      let stmts1 = pcs_arm_drop_stmts(stmts, fn_name, outer_scope, uses)
-      let tail1 = match opt_tail {
-        None -> None
-        Some(e2) -> Some(pcs_arm_drop_pass(e2, fn_name, outer_scope, uses))
-      }
-      EBlock(stmts1, tail1)
+    # A binder skipped for its tail read, whose tail hosts a self-tail-call,
+    # is closed per goto path instead: the goto skips every exit.
+    let body3 = pcs_arm_tail_drop_body(body2, bound, pat.line, pat.col, g_rw, cx.uses, fn_name)
+    # A falsy guard leaves the arm without running the body or its exits.
+    let g1 = match g_rw {
+      None    -> None
+      Some(g) -> Some(pcs_guard_close_births(g, bound))
     }
-    ELambda(ps, body) -> {
-      let pn = map(ps, (p) => p.pname)
-      ELambda(ps, pcs_arm_drop_pass(body, fn_name, list_append(outer_scope, pn), uses))
-    }
-    EHandle(body, eff, hsym, eff_tas, init_opt, alias, clauses, ret_opt) -> {
-      let body1 = pcs_arm_drop_pass(body, fn_name, outer_scope, uses)
-      let init1 = match init_opt {
-        None -> None
-        Some(e2) -> Some(pcs_arm_drop_pass(e2, fn_name, outer_scope, uses))
-      }
-      let cls1 = pcs_arm_drop_clauses(clauses, fn_name, outer_scope, uses)
-      let ret1 = match ret_opt {
-        None -> None
-        Some(hr) -> match hr {
-          HR(pname, body2, hl, hc) ->
-            Some(HR(pname,
-                    pcs_arm_drop_pass(body2, fn_name, [pname, ...outer_scope], uses),
-                    hl, hc))
-        }
-      }
-      EHandle(body1, eff, hsym, eff_tas, init1, alias, cls1, ret1)
-    }
-    # Issue #528: inlined from `map_expr_kind` (stage 1 lacks row
-    # polymorphism on function-param types).
-    EInt(_, _)        -> k
-    EReal(_, _)       -> k
-    EIntLit(_)        -> k
-    EDecimalLit(_)    -> k
-    EFixed(_, _)      -> k
-    EBool(_)       -> k
-    EChar(_)       -> k
-    EStr(_, _)     -> k
-    EUnit          -> k
-    EVar(_)        -> k
-    EMark(_)        -> k
-    ESym(_, _)        -> k
-    EUnder         -> k
-    EPlaceholder   -> k
-    EHole(_)       -> k
-    ETodo(_)       -> k
-    EExternBody(_) -> k
-    EVariantsOf(_, _) -> k
-    EModCall(_, _) -> k
-    EIntrinsic(name, args_) ->
-      EIntrinsic(name, pcs_arm_drop_expr_list(args_, fn_name, outer_scope, uses))
-    ESurface(sf) ->
-      ESurface(surface_rebuild(sf, pcs_arm_drop_expr_list(surface_children(sf), fn_name, outer_scope, uses)))
-    ECall(callee, args_) ->
-      ECall(pcs_arm_drop_pass(callee, fn_name, outer_scope, uses),
-            pcs_arm_drop_expr_list(args_, fn_name, outer_scope, uses))
-    EField(base, nm)     -> EField(pcs_arm_drop_pass(base, fn_name, outer_scope, uses), nm)
-    EIndex(a, b)         -> EIndex(pcs_arm_drop_pass(a, fn_name, outer_scope, uses),
-                                    pcs_arm_drop_pass(b, fn_name, outer_scope, uses))
-    EBinop(op, a, b)     -> EBinop(op, pcs_arm_drop_pass(a, fn_name, outer_scope, uses),
-                                        pcs_arm_drop_pass(b, fn_name, outer_scope, uses))
-    EUnop(op, x)         -> EUnop(op, pcs_arm_drop_pass(x, fn_name, outer_scope, uses))
-    EIf(c, t_, eo)       -> EIf(pcs_arm_drop_pass(c, fn_name, outer_scope, uses),
-                                  pcs_arm_drop_pass(t_, fn_name, outer_scope, uses),
-                                  pcs_arm_drop_expr_opt(eo, fn_name, outer_scope, uses))
-    ERecordLit(name, fs) -> ERecordLit(name, pcs_arm_drop_fields_init(fs, fn_name, outer_scope, uses))
-    EList(els)           -> EList(pcs_arm_drop_list_elems(els, fn_name, outer_scope, uses))
-    ERange(a, b, opt_step) -> ERange(pcs_arm_drop_pass(a, fn_name, outer_scope, uses),
-                                       pcs_arm_drop_pass(b, fn_name, outer_scope, uses),
-                                       pcs_arm_drop_expr_opt(opt_step, fn_name, outer_scope, uses))
-    EPipe(a, b)          -> EPipe(pcs_arm_drop_pass(a, fn_name, outer_scope, uses),
-                                    pcs_arm_drop_pass(b, fn_name, outer_scope, uses))
-    EMapPipe(a, b)       -> EMapPipe(pcs_arm_drop_pass(a, fn_name, outer_scope, uses),
-                                       pcs_arm_drop_pass(b, fn_name, outer_scope, uses))
-    EFlatMapPipe(a, b)   -> EFlatMapPipe(pcs_arm_drop_pass(a, fn_name, outer_scope, uses),
-                                            pcs_arm_drop_pass(b, fn_name, outer_scope, uses))
-    EFilterPipe(a, b)    -> EFilterPipe(pcs_arm_drop_pass(a, fn_name, outer_scope, uses),
-                                           pcs_arm_drop_pass(b, fn_name, outer_scope, uses))
-    ELitUnit(inner, u)   -> ELitUnit(pcs_arm_drop_pass(inner, fn_name, outer_scope, uses), u)
-    EBang(inner)         -> EBang(pcs_arm_drop_pass(inner, fn_name, outer_scope, uses))
+    Arm(pat, g1, body3)
   }
 }
 
-fn pcs_arm_drop_expr_opt(opt: Option[Expr], fn_name: String, outer_scope: [String], uses: [Use]) : Option[Expr] / Console = match opt {
-  None    -> None
-  Some(x) -> Some(pcs_arm_drop_pass(x, fn_name, outer_scope, uses))
-}
-
-fn pcs_arm_drop_expr_list(es: [Expr], fn_name: String, outer_scope: [String], uses: [Use]) : [Expr] / Console = match es {
-  []           -> []
-  [h, ...rest] -> [pcs_arm_drop_pass(h, fn_name, outer_scope, uses),
-                   ...pcs_arm_drop_expr_list(rest, fn_name, outer_scope, uses)]
-}
-
-fn pcs_arm_drop_fields_init(fs: [FieldInit], fn_name: String, outer_scope: [String], uses: [Use]) : [FieldInit] / Console = match fs {
-  []           -> []
-  [h, ...rest] -> [pcs_arm_drop_field_init(h, fn_name, outer_scope, uses),
-                   ...pcs_arm_drop_fields_init(rest, fn_name, outer_scope, uses)]
-}
-
-fn pcs_arm_drop_field_init(fi: FieldInit, fn_name: String, outer_scope: [String], uses: [Use]) : FieldInit / Console = match fi {
-  FI(name, e) -> FI(name, pcs_arm_drop_pass(e, fn_name, outer_scope, uses))
-}
-
-fn pcs_arm_drop_list_elems(els: [ListElem], fn_name: String, outer_scope: [String], uses: [Use]) : [ListElem] / Console = match els {
-  []           -> []
-  [h, ...rest] -> [pcs_arm_drop_list_elem(h, fn_name, outer_scope, uses),
-                   ...pcs_arm_drop_list_elems(rest, fn_name, outer_scope, uses)]
-}
-
-fn pcs_arm_drop_list_elem(el: ListElem, fn_name: String, outer_scope: [String], uses: [Use]) : ListElem / Console = match el {
-  ElPlain(e)  -> ElPlain(pcs_arm_drop_pass(e, fn_name, outer_scope, uses))
-  ElSpread(e) -> ElSpread(pcs_arm_drop_pass(e, fn_name, outer_scope, uses))
-}
-
-fn pcs_arm_drop_stmts(stmts: [Stmt], fn_name: String, outer_scope: [String],
-                       uses: [Use]) : [Stmt] / Console {
-  match stmts {
-    [] -> []
-    [s, ...rest] -> {
-      let s1 = match s {
-        SLet(pat, ty_opt, rhs) ->
-          SLet(pat, ty_opt, pcs_arm_drop_pass(rhs, fn_name, outer_scope, uses))
-        SVar(name, ty_opt, rhs, ln, cl) ->
-          SVar(name, ty_opt, pcs_arm_drop_pass(rhs, fn_name, outer_scope, uses), ln, cl)
-        SAssert(c, opt_m) -> {
-          let c1 = pcs_arm_drop_pass(c, fn_name, outer_scope, uses)
-          let m1 = match opt_m {
-            None -> None
-            Some(m) -> Some(pcs_arm_drop_pass(m, fn_name, outer_scope, uses))
-          }
-          SAssert(c1, m1)
-        }
-        SExprStmt(e) -> SExprStmt(pcs_arm_drop_pass(e, fn_name, outer_scope, uses))
-        SIndexAssign(b, i, v, ln, cl) ->
-          SIndexAssign(pcs_arm_drop_pass(b, fn_name, outer_scope, uses),
-                       pcs_arm_drop_pass(i, fn_name, outer_scope, uses),
-                       pcs_arm_drop_pass(v, fn_name, outer_scope, uses), ln, cl)
-        SAssign(b, v, ln, cl) ->
-          SAssign(pcs_arm_drop_pass(b, fn_name, outer_scope, uses),
-                   pcs_arm_drop_pass(v, fn_name, outer_scope, uses), ln, cl)
-        SUse(n, ln, cl) -> SUse(n, ln, cl)
-      }
-      [s1, ...pcs_arm_drop_stmts(rest, fn_name, outer_scope, uses)]
-    }
-  }
-}
-
-fn pcs_arm_drop_clauses(cs: [HClause], fn_name: String, outer_scope: [String],
-                         uses: [Use]) : [HClause] / Console {
-  match cs {
-    [] -> []
-    [h, ...rest] -> match h {
-      HC(op, params, body, ln, cl) -> {
-        let pn = pcs_filter_non_resume(map(params, (p) => p.pname), [])
-        let scope1 = list_append(outer_scope, [...handler_state_aliases(), ...pn])
-        let body1 = pcs_arm_drop_pass(body, fn_name, scope1, uses)
-        [HC(op, params, body1, ln, cl),
-         ...pcs_arm_drop_clauses(rest, fn_name, outer_scope, uses)]
-      }
-    }
-  }
-}
-
-fn pcs_arm_drop_arms(arms: [Arm], fn_name: String, outer_scope: [String],
-                      uses: [Use]) : [Arm] / Console {
-
-  match arms {
-    [] -> []
-    [a, ...rest] -> match a {
-      Arm(pat0, opt_g, body) -> {
-        let bound0 = prc_pat_binders(pat0, [])
-        let scope1 = list_append(outer_scope, bound0)
-        let body1 = pcs_arm_drop_pass(body, fn_name, scope1, uses)
-        # For EBlock bodies the drop site sits between stmts and
-        # tail (pre-tail), so a binding read in the tail would see
-        # a freed cell — we must skip those names. For non-block
-        # bodies the drop site sits AFTER the body via the
-        # `__pcs_arm_ret` wrap, so any read inside body is safe
-        # because body fully evaluates first; in that case the
-        # only unsafe bindings are ones tied to a self-tail-call
-        # (handled by `pcs_inject_arm_drops`).
-        let pre_tail = pcs_body_is_block_with_tail(body1)
-        # Rewrite the guard first: the drop planters consult its bare
-        # reads (a guard that consumes a binder pays its birth ref on
-        # both guard edges, so no arm drop may pay it again).
-        let g_rw = match opt_g {
-          None    -> None
-          Some(g) -> Some(pcs_arm_drop_pass(g, fn_name, scope1, uses))
-        }
-        # A plain `PBind` with no read anywhere in the arm is elided to
-        # `_` instead of paid: no bind-incref is emitted, so there is no
-        # birth ref to close, and a bare ctor rebuild stays visible to
-        # the reuse recogniser. Rest/`@`/narrowing binders keep the drop
-        # path — their binding semantics go beyond a plain local.
-        let elide = pcs_arm_elide_names(pat0, body1, g_rw, [])
-        let pat = pcs_pat_elide(pat0, elide)
-        let bound = pcs_strs_minus(bound0, elide)
-        let drops = pcs_collect_arm_drops(bound, pat.line, pat.col, body1,
-                                            g_rw, outer_scope, uses, pre_tail, [])
-        let body2 = match drops {
-          [] -> body1
-          [_, ...__] -> pcs_inject_arm_drops(body1, drops, fn_name)
-        }
-        # A binder the pre-tail site skipped (read in the tail) whose tail
-        # hosts a self-tail-call gets its birth ref closed per goto path
-        # instead: distributed into the self-call leaves where it is dead.
-        # A dup'd read leaves the birth ref unpaid, and the goto skips the
-        # exits that would release it.
-        let body3 = pcs_arm_tail_drop_body(body2, bound, pat.line, pat.col,
-                                            g_rw, outer_scope, fn_name)
-        # The guard is part of the arm's scope: its falsy edge leaves the
-        # arm without running the body — the binders' birth refs must be
-        # paid there.
-        let g1 = match g_rw {
-          None    -> None
-          Some(g) -> Some(pcs_guard_close_births(g, bound, outer_scope))
-        }
-        [Arm(pat, g1, body3),
-         ...pcs_arm_drop_arms(rest, fn_name, outer_scope, uses)]
-      }
-    }
-  }
-}
-
-# Plain `PBind` names of the arm's pattern with no read (lambda reads
-# included) in the rewritten guard or body. Rest binders, `@`-binders,
+# Plain `PBind` names of the arm's pattern that nothing reads. Rest, `@`
 # and narrowing binders never qualify.
-fn pcs_arm_elide_names(pat: Pattern, body: Expr, opt_g: Option[Expr],
-                       acc: [String]) : [String] / Console = match pat.pkind {
+fn pcs_arm_elide_names(pat: Pattern, uses: [Use], acc: [String]) : [String] = match pat.pkind {
   PBind(nm) ->
-    if name_is_unused_binder(nm) { acc }
-    else if pcs_arm_reads_name(nm, body, opt_g) { acc }
-    else { [nm, ...acc] }
-  PList(ps, _)          -> pcs_aen_list(ps, body, opt_g, acc)
-  PVariant(_, _, ps)       -> pcs_aen_list(ps, body, opt_g, acc)
-  PVariantRecord(_, _, fs) -> pcs_aen_fields(fs, body, opt_g, acc)
-  PRecord(fs)           -> pcs_aen_fields(fs, body, opt_g, acc)
-  PAs(_, inner)         -> pcs_arm_elide_names(inner, body, opt_g, acc)
-  PWild                 -> acc
-  PLit(_)               -> acc
-  PRange(_, _)          -> acc
-  PHole(_)              -> acc
-  PNarrow(_, _)         -> acc
-  PSurface(_)           -> acc
+    if name_is_unused_binder(nm) or not pcs_unread(nm, uses) { acc } else { [nm, ...acc] }
+  PList(ps, _)             -> pcs_aen_list(ps, uses, acc)
+  PVariant(_, _, ps)       -> pcs_aen_list(ps, uses, acc)
+  PVariantRecord(_, _, fs) -> pcs_aen_list(map(fs, (f) => match f { PField(_, p, _) -> p }), uses, acc)
+  PRecord(fs)              -> pcs_aen_list(map(fs, (f) => match f { PField(_, p, _) -> p }), uses, acc)
+  PAs(_, inner)            -> pcs_arm_elide_names(inner, uses, acc)
+  _                        -> acc
 }
 
-fn pcs_aen_list(ps: [Pattern], body: Expr, opt_g: Option[Expr],
-                acc: [String]) : [String] / Console = match ps {
+fn pcs_aen_list(ps: [Pattern], uses: [Use], acc: [String]) : [String] = match ps {
   []           -> acc
-  [p, ...rest] -> pcs_aen_list(rest, body, opt_g, pcs_arm_elide_names(p, body, opt_g, acc))
-}
-
-fn pcs_aen_fields(fs: [PField], body: Expr, opt_g: Option[Expr],
-                  acc: [String]) : [String] / Console = match fs {
-  []                          -> acc
-  [PField(_, p, _), ...rest] -> pcs_aen_fields(rest, body, opt_g, pcs_arm_elide_names(p, body, opt_g, acc))
-}
-
-fn pcs_arm_reads_name(nm: String, body: Expr, opt_g: Option[Expr]) : Bool / Console = {
-  let bus = pcs_collect_uses_expr(body, [nm], false, [])
-  if pcs_uses_has_name(bus, nm) { true }
-  else {
-    match opt_g {
-      None    -> false
-      Some(g) -> {
-        let gus = pcs_collect_uses_expr(g, [nm], false, [])
-        pcs_uses_has_name(gus, nm)
-      }
-    }
-  }
+  [p, ...rest] -> pcs_aen_list(rest, uses, pcs_arm_elide_names(p, uses, acc))
 }
 
 fn pcs_pat_elide(pat: Pattern, elide: [String]) : Pattern = match elide {
@@ -5156,30 +4447,18 @@ fn pcs_pe_fields(fs: [PField], elide: [String]) : [PField] =
 # bound (head-first accumulation + `pcs_inject_arm_drops` appends).
 # `opt_g` is the arm's rewritten guard: a bare read there is a move
 # that pays the binder on both guard edges, so no drop may run here.
-fn pcs_collect_arm_drops(bound: [String], ln: Int, cl: Int, body: Expr,
-                          opt_g: Option[Expr], outer_scope: [String],
-                          uses: [Use], pre_tail: Bool,
-                          acc: [Stmt]) : [Stmt] / Console {
-
-  match bound {
-    [] -> list_reverse(acc)
-    [nm, ...rest] -> {
-      let acc1 =
-        if list_has(outer_scope, nm) { acc }
-        else if pre_tail and pcs_name_in_body_tail(nm, body) { acc }
-        else if pcs_guard_has_bare_read(nm, opt_g) { acc }
-        else {
-          # Arm-local reads: the fn-wide table over-counts a name that
-          # sibling arms also bind. A forced binder's dup'd read is paid by
-          # the guard-fail and goto planters, not here. The tcrec goto
-          # ledger reads a planted drop as a consume and does not pay again.
-          let arm_uses = pcs_collect_uses_expr(body, [nm], false, [])
-          if pcs_pays(pcs_arm_payer(nm, arm_uses), PyExit) {
-            [pcs_make_drop_stmt(nm, ln, cl), ...acc]
-          } else { acc }
-        }
-      pcs_collect_arm_drops(rest, ln, cl, body, opt_g, outer_scope, uses, pre_tail, acc1)
-    }
+# The tcrec goto ledger reads a planted drop as a consume and does not pay again.
+fn pcs_collect_arm_drops(bound: [String], ln: Int, cl: Int, body: Expr, opt_g: Option[Expr],
+                         cx: PcsArmCx, pre_tail: Bool, acc: [Stmt]) : [Stmt] = match bound {
+  [] -> list_reverse(acc)
+  [nm, ...rest] -> {
+    let acc1 =
+      if pre_tail and pcs_name_in_body_tail(nm, body) { acc }
+      else if pcs_guard_has_bare_read(nm, opt_g) { acc }
+      else if pcs_pays(pcs_arm_payer(nm, cx.uses, list_has(cx.moved, nm)), PyExit) {
+        [pcs_make_drop_stmt(nm, ln, cl), ...acc]
+      } else { acc }
+    pcs_collect_arm_drops(rest, ln, cl, body, opt_g, cx, pre_tail, acc1)
   }
 }
 
@@ -5198,13 +4477,12 @@ fn pcs_guard_has_bare_read(nm: String, opt_g: Option[Expr]) : Bool = match opt_g
 # Lambda-captured binders are skipped — the goto ledger releases them
 # after the args have built their closures.
 fn pcs_arm_tail_drop_body(body: Expr, bound: [String], ln: Int, cl: Int,
-                          opt_g: Option[Expr], outer_scope: [String],
-                          fn_name: String) : Expr / Console =
+                          opt_g: Option[Expr], uses: [Use], fn_name: String) : Expr =
   match body.kind {
     EBlock(stmts, opt_tail) -> match opt_tail {
       Some(t) ->
         if pcs_is_self_tail_call(t, fn_name) {
-          let drops = pcs_collect_arm_tail_drops(bound, ln, cl, body, opt_g, outer_scope, [])
+          let drops = pcs_collect_arm_tail_drops(bound, ln, cl, body, opt_g, uses, [])
           match drops {
             [] -> body
             [_, ...__] ->
@@ -5218,28 +4496,22 @@ fn pcs_arm_tail_drop_body(body: Expr, bound: [String], ln: Int, cl: Int,
   }
 
 fn pcs_collect_arm_tail_drops(bound: [String], ln: Int, cl: Int, body: Expr,
-                              opt_g: Option[Expr], outer_scope: [String],
-                              acc: [Stmt]) : [Stmt] / Console =
+                              opt_g: Option[Expr], uses: [Use], acc: [Stmt]) : [Stmt] =
   match bound {
     [] -> list_reverse(acc)
     [nm, ...rest] -> {
       let acc1 =
-        if list_has(outer_scope, nm) { acc }
-        else if not pcs_name_in_body_tail(nm, body) { acc }
+        if not pcs_name_in_body_tail(nm, body) { acc }
         # A bare read anywhere in the arm is a move: it pays the birth ref
         # on its own path, so a distributed drop would release it twice.
         # Only a binder whose every read keeps its dup is orphaned. A bare
         # guard read is the same move one edge earlier.
         else if pcs_has_bare_read(nm, body) { acc }
         else if pcs_guard_has_bare_read(nm, opt_g) { acc }
-        else {
-          let arm_uses = pcs_collect_uses_expr(body, [nm], false, [])
-          if pcs_count_non_lam_uses(nm, arm_uses, 0) >= 1 and
-             not pcs_uses_have_in_lam(arm_uses, nm) {
-            [pcs_make_drop_stmt(nm, ln, cl), ...acc]
-          } else { acc }
-        }
-      pcs_collect_arm_tail_drops(rest, ln, cl, body, opt_g, outer_scope, acc1)
+        else if pcs_read_count(nm, uses) >= 1 and not pcs_uses_have_in_lam(uses, nm) {
+          [pcs_make_drop_stmt(nm, ln, cl), ...acc]
+        } else { acc }
+      pcs_collect_arm_tail_drops(rest, ln, cl, body, opt_g, uses, acc1)
     }
   }
 
@@ -5282,8 +4554,8 @@ fn pcs_hbr_list(nm: String, xs: [Expr]) : Bool = match xs {
 # but is invisible to the tcrec ledger scan — the falsy edge never shares
 # a path with the body's goto, and the ledger must keep releasing the
 # binder there.
-fn pcs_guard_close_births(g: Expr, bound: [String], outer_scope: [String]) : Expr {
-  let drops = pcs_guard_fail_drops(bound, g, outer_scope, [])
+fn pcs_guard_close_births(g: Expr, bound: [String]) : Expr {
+  let drops = pcs_guard_fail_drops(bound, g, [])
   match drops {
     [] -> g
     [_, ...__] -> {
@@ -5297,17 +4569,14 @@ fn pcs_guard_close_births(g: Expr, bound: [String], outer_scope: [String]) : Exp
   }
 }
 
-fn pcs_guard_fail_drops(bound: [String], g: Expr, outer_scope: [String],
-                        acc: [Stmt]) : [Stmt] = match bound {
+fn pcs_guard_fail_drops(bound: [String], g: Expr, acc: [Stmt]) : [Stmt] = match bound {
   [] -> list_reverse(acc)
   [nm, ...rest] -> {
     let acc1 =
-      if list_has(outer_scope, nm) { acc }
       # `_`-prefixed binders never bind a local in the emitters.
-      else if name_is_unused_binder(nm) { acc }
-      else if pcs_has_bare_read(nm, g) { acc }
+      if name_is_unused_binder(nm) or pcs_has_bare_read(nm, g) { acc }
       else { [pcs_make_guard_drop_stmt(nm, g.line, g.col), ...acc] }
-    pcs_guard_fail_drops(rest, g, outer_scope, acc1)
+    pcs_guard_fail_drops(rest, g, acc1)
   }
 }
 
@@ -5346,7 +4615,7 @@ fn pcs_body_is_block_with_tail(body: Expr) : Bool {
 #     `EBlock([SLet(__pcs_arm_ret, body), ...drops], Some(EVar(__pcs_arm_ret)))`.
 #     The body executes first (with its bindings live), the drops run
 #     before the wrapped block returns the saved value.
-fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr / Console {
+fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr {
   match body.kind {
     EBlock(stmts, opt_tail) ->
       Expr { kind: EBlock(list_append(stmts, drops), opt_tail),
@@ -5391,11 +4660,11 @@ fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr / Con
 # so the self-call stays in tail position (TCO preserved). Only self-tail-
 # call leaves are touched; a normal-return leaf is left to the surrounding
 # exit-drop machinery.
-fn pcs_distribute_dead_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr / Console =
+fn pcs_distribute_dead_drops(body: Expr, drops: [Stmt], fn_name: String) : Expr =
   Expr { kind: pcs_dd_kind(body.kind, body.line, body.col, body.ty, body.mode, drops, fn_name),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode }
 
-fn pcs_dd_kind(k: ExprKind, ln: Int, cl: Int, ty: Option[Ty], mode: ValueMode, drops: [Stmt], fn_name: String) : ExprKind / Console {
+fn pcs_dd_kind(k: ExprKind, ln: Int, cl: Int, ty: Option[Ty], mode: ValueMode, drops: [Stmt], fn_name: String) : ExprKind {
   match k {
     EIf(c, t, opt_e) ->
       EIf(c, pcs_distribute_dead_drops(t, drops, fn_name),
@@ -5418,7 +4687,7 @@ fn pcs_dd_kind(k: ExprKind, ln: Int, cl: Int, ty: Option[Ty], mode: ValueMode, d
   }
 }
 
-fn pcs_dd_arms(arms: [Arm], drops: [Stmt], fn_name: String) : [Arm] / Console = match arms {
+fn pcs_dd_arms(arms: [Arm], drops: [Stmt], fn_name: String) : [Arm] = match arms {
   []           -> []
   [a, ...rest] -> match a {
     Arm(pat, opt_g, body) ->
@@ -5437,12 +4706,12 @@ fn pcs_dd_arms(arms: [Arm], drops: [Stmt], fn_name: String) : [Arm] / Console = 
 # consume scan). The mixed-consumption shape (`f(if c { [s, ...a] }
 # else { a })`) keeps its historic skipped-edge leak — no static
 # placement is right for both of its edges.
-fn pcs_drops_dead_in(drops: [Stmt], leaf: Expr) : [Stmt] / Console = match drops {
+fn pcs_drops_dead_in(drops: [Stmt], leaf: Expr) : [Stmt] = match drops {
   [] -> []
   [d, ...rest] -> {
     let tl = pcs_drops_dead_in(rest, leaf)
     match pcs_drop_stmt_name(d) {
-      Some(nm) -> if pcs_name_in_expr_k(nm, leaf.kind) { tl } else { [d, ...tl] }
+      Some(nm) -> if pcs_mentions(nm, leaf) { tl } else { [d, ...tl] }
       None     -> tl
     }
   }
@@ -5502,33 +4771,12 @@ fn pcs_arms_have_self_tail(arms: [Arm], fn_name: String) : Bool {
   }
 }
 
-# True iff `nm` appears anywhere in the body's tail expression.
-# For EBlock bodies the drop site sits between stmts and tail, so
-# any read of `nm` in the tail expression (regardless of how deeply
-# nested) would see a decremented binding. For non-block bodies
-# the whole expression is treated as the tail. A scan over the
-# expression with `[nm]` as the in-scope filter spots every read.
-fn pcs_name_in_body_tail(nm: String, body: Expr) : Bool / Console {
-
-  match body.kind {
-    # A self-call arg hoist IS the tail: its temps carry the call's args,
-    # so a read in the temps is a tail read (a pre-tail drop would fire
-    # between a moved read and the call that consumes it).
-    EBlock(stmts, opt_tail) ->
-      if ppd_is_hoist_block(stmts) {
-        let us = pcs_collect_uses_expr(body, [nm], false, [])
-        pcs_uses_has_name(us, nm)
-      }
-      else { match opt_tail {
-        None -> false
-        Some(t) -> {
-          let us = pcs_collect_uses_expr(t, [nm], false, [])
-          pcs_uses_has_name(us, nm)
-        }
-      } }
-    _ -> {
-      let us = pcs_collect_uses_expr(body, [nm], false, [])
-      pcs_uses_has_name(us, nm)
-    }
-  }
+# True iff `nm` appears in the part of `body` a pre-tail drop would precede:
+# the tail of a block (the whole block when a self-call hoist built it —
+# its temps carry the call's args), or all of a non-block body.
+fn pcs_name_in_body_tail(nm: String, body: Expr) : Bool = match body.kind {
+  EBlock(stmts, opt_tail) ->
+    if ppd_is_hoist_block(stmts) { pcs_mentions(nm, body) }
+    else { match opt_tail { None -> false  Some(t) -> pcs_mentions(nm, t) } }
+  _ -> pcs_mentions(nm, body)
 }
