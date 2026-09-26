@@ -35,6 +35,7 @@ import compiler.kir_lower_rec
 import compiler.kir_lower_variant
 import compiler.vec_raw
 import compiler.emit_tcrec_live
+import compiler.raw_border
 
 # Lower a fixed-width vec intrinsic to its inline KIR form: a header-less
 # `[n x elem]` aggregate on the native side (no dynamic `Vec`). Returns
@@ -456,98 +457,89 @@ fn lower_unhandled(x: Expr, st: LowerSt) : LRes / Console {
   LRes(KUnitV, st)
 }
 
-# --- raw (unboxed) Real/Int lowering (asu, Camino A + P1) --------------
+# --- raw (unboxed) scalar lowering ----------------------------------------
 #
-# Lower `x` in RAW position: the result is a raw scalar — an `f64` (`SReal`)
-# for Real, an `i64` (`SInt64`) for Int, or an i1/i32 (`SBool`) for a
-# comparison — NOT a boxed `ptr`. Mirror of the C-direct oracle's
-# `emit_expr_raw` / `emit_kind_raw`, over Real + Int arith/cmp (kir_lower_raw
-# SCOPE). Two cases by `.mode`:
-#   - `MUnboxed` node → it IS a natively-raw form (literal / raw EVar / raw
-#     arith / raw cmp / raw neg): emit the raw op directly, no boxing.
-#   - any other node in raw position → a BOXED value read raw (the box→raw
-#     border, e.g. `self.re` field access, or an Int-returning UFn call in
-#     an arith chain): lower boxed then unbox-borrow by type
-#     (`real.unbox` → `kaix_real_field` / `int.unbox` → `kaix_int_field`,
-#     non-consuming, the oracle's bare `(boxed)->as.r` / `(boxed)->as.i`).
-# The mutual recursion `lower_expr ↔ lower_expr_raw` is why this lives in
-# the Expr-SCC (not the pure `kir_lower_raw` helper module).
-fn lower_expr_raw(x: Expr, st: LowerSt) : LRes / Console =
-  match x.mode {
-    MUnboxed -> lower_expr_raw_kind(x, st)
-    _        -> lower_scalar_unbox_border(x, st)
+# Lower `x` in RAW position: the result is a raw scalar register, not a
+# boxed `ptr`. Mirror of the C oracle's `emit_expr_raw`: a `MUnboxed` node is
+# natively raw; any other crosses the box→raw border (`raw_border.kai`). The
+# mutual recursion with `lower_expr` is why this lives in the Expr-SCC.
+fn lower_expr_raw(x: Expr, st: LowerSt) : LRes / Console = {
+  let xb = raw_operand(x)
+  match xb.mode {
+    MUnboxed -> lower_expr_raw_kind(xb, st)
+    _        -> lower_scalar_unbox_border(xb, st)
   }
-
-# Lower `x` raw at a KNOWN destination slot (a call arg at its param's raw
-# slot). A `MUnboxed` node lowers raw by its own form; a boxed node crosses
-# the border to the GIVEN slot, NOT one inferred from `x.ty`. The type-driven
-# `lower_scalar_unbox_border` mis-routes when the arg's `.ty` is absent /
-# unresolved (a generic-fn `EVar` the typer left untyped — `take(xs, mid)`
-# where `mid`'s ref carries no `Ty`): it falls to `real.unbox` over a boxed
-# Int, the `kaix_int_field(double)` verifier mismatch. Keying off the PARAM's
-# slot (the callee's declared `SInt64`/`SReal`/`SBool`) is exact.
-fn lower_expr_raw_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console =
-  match x.mode {
-    MUnboxed -> lower_expr_raw_kind(x, st)
-    _        -> lower_scalar_unbox_border_at(x, slot, st)
-  }
-
-# The box→raw border at a KNOWN slot: lower boxed, then unbox-borrow through
-# the slot's prim (`int.unbox`/`real.unbox`/`bool.unbox`). A `SBoxed` slot is
-# a lowering bug (a raw arg never targets a boxed param) — fall back to the
-# plain boxed lowering so the value is at least well-formed.
-fn lower_scalar_unbox_border_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console = match slot {
-  SInt64 -> match lower_expr_boxed(x, st) { LRes(bv, st1) -> bind_op_slot(st1, KPrim("int.unbox", [bv]), SInt64, kpos_of(x)) }
-  SReal  -> match lower_expr_boxed(x, st) { LRes(bv, st1) -> bind_op_slot(st1, KPrim("real.unbox", [bv]), SReal, kpos_of(x)) }
-  SBool  -> match lower_expr_boxed(x, st) { LRes(bv, st1) -> bind_op_slot(st1, KPrim("bool.unbox", [bv]), SBool, kpos_of(x)) }
-  SChar  -> match lower_expr_boxed(x, st) { LRes(bv, st1) -> bind_op_slot(st1, KPrim("char.unbox", [bv]), SChar, kpos_of(x)) }
-  SByte  -> match lower_expr_boxed(x, st) { LRes(bv, st1) -> bind_op_slot(st1, KPrim("byte.unbox", [bv]), SByte, kpos_of(x)) }
-  SInt32T -> match lower_expr_boxed(x, st) { LRes(bv, st1) -> bind_op_slot(st1, KPrim("int32.unbox", [bv]), SInt32T, kpos_of(x)) }
-  SUInt32 -> match lower_expr_boxed(x, st) { LRes(bv, st1) -> bind_op_slot(st1, KPrim("uint32.unbox", [bv]), SUInt32, kpos_of(x)) }
-  SUInt64 -> match lower_expr_boxed(x, st) { LRes(bv, st1) -> bind_op_slot(st1, KPrim("uint64.unbox", [bv]), SUInt64, kpos_of(x)) }
-  SInt128 -> match lower_expr_boxed(x, st) { LRes(bv, st1) -> bind_op_slot(st1, KPrim("int128.unbox", [bv]), SInt128, kpos_of(x)) }
-  _      -> lower_expr_boxed(x, st)
 }
 
-# A boxed scalar read in raw position: lower it boxed, then unbox-borrow its
-# raw payload. The border is TYPE-DRIVEN — an Int node crosses through
-# `int.unbox` (→ `kaix_int_field`, slot `SInt64`), a Bool through
-# `bool.unbox` (→ `kaix_bool_field`, slot `SBool`), any other (Real) through
-# `real.unbox` (→ `kaix_real_field`, slot `SReal`). NON-consuming in all
-# cases — the box stays owned by its binding for the normal drop (the
-# oracle's bare `(boxed)->as.i` / `(boxed)->as.b` / `(boxed)->as.r`). The
-# type gate is load-bearing: a Real-only border would `real.unbox` a boxed
-# Bool (`kaix_real_field` reading `as.r` off a Bool) — a silent miscompile +
-# the LLVM type mismatch the verifier rejects. The Bool case is reached by a
-# raw-Bool call arg (a `neg: Bool` param the callee unboxes — `lower_tcrec_
-# args` lowers it raw at the param's `SBool` slot).
-fn lower_scalar_unbox_border(x: Expr, st: LowerSt) : LRes / Console =
-  if kir_ty_is_int(x.ty) {
-    match lower_expr_boxed(x, st) {
-      LRes(bv, st1) -> bind_op_slot(st1, KPrim("int.unbox", [bv]), SInt64, kpos_of(x))
-    }
-  } else if kir_ty_is_bool(x.ty) {
-    match lower_expr_boxed(x, st) {
-      LRes(bv, st1) -> bind_op_slot(st1, KPrim("bool.unbox", [bv]), SBool, kpos_of(x))
-    }
-  } else if kir_ty_is_char(x.ty) {
-    match lower_expr_boxed(x, st) {
-      LRes(bv, st1) -> bind_op_slot(st1, KPrim("char.unbox", [bv]), SChar, kpos_of(x))
-    }
-  } else if kir_ty_is_byte(x.ty) {
-    match lower_expr_boxed(x, st) {
-      LRes(bv, st1) -> bind_op_slot(st1, KPrim("byte.unbox", [bv]), SByte, kpos_of(x))
-    }
-  } else if kir_ty_is_fixed_raw(x.ty) {
-    let slot = kir_fixed_raw_slot(x.ty)
-    match lower_expr_boxed(x, st) {
-      LRes(bv, st1) -> bind_op_slot(st1, KPrim(cat2(kir_fixed_box_name(x.ty), ".unbox"), [bv]), slot, kpos_of(x))
-    }
-  } else {
-    match lower_expr_boxed(x, st) {
-      LRes(bv, st1) -> bind_op_slot(st1, KPrim("real.unbox", [bv]), SReal, kpos_of(x))
-    }
+# Lower `x` raw at a KNOWN destination slot (a call arg at its param's raw
+# slot). The border keys off the param's slot, not `x.ty`: an arg the typer
+# left untyped would otherwise cross as a Real.
+fn lower_expr_raw_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console = {
+  let xb = raw_operand(x)
+  match xb.mode {
+    MUnboxed -> lower_expr_raw_kind(xb, st)
+    _        -> lower_scalar_unbox_border_at(xb, slot, st)
   }
+}
+
+# `x` without a `__perceus_dup` wrap, keeping `x`'s type: the inner read
+# often carries none.
+fn raw_operand(x: Expr) : Expr = {
+  let xb = raw_border_strip_dup(x)
+  Expr { kind: xb.kind, line: xb.line, col: xb.col, ty: x.ty, mode: xb.mode }
+}
+
+# The box→raw border at a KNOWN slot. A `SBoxed` slot is a lowering bug (a
+# raw arg never targets a boxed param): lower plain boxed so the value is at
+# least well-formed.
+fn lower_scalar_unbox_border_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console =
+  match border_unbox_prim(slot) {
+    Some(prim) -> lower_unbox_border(x, prim, slot, st)
+    None       -> lower_expr_boxed(x, st)
+  }
+
+# The type-driven border. The type gate is load-bearing: a Bool crossing
+# through `real.unbox` reads `as.r` off a Bool, which LLVM rejects.
+fn lower_scalar_unbox_border(x: Expr, st: LowerSt) : LRes / Console =
+  lower_scalar_unbox_border_at(x, border_slot_of(x.ty), st)
+
+fn border_slot_of(opt_t: Option[Ty]) : KSlot =
+  if kir_ty_is_int(opt_t) { SInt64 }
+  else if kir_ty_is_bool(opt_t) { SBool }
+  else if kir_ty_is_char(opt_t) { SChar }
+  else if kir_ty_is_byte(opt_t) { SByte }
+  else if kir_ty_is_fixed_raw(opt_t) { kir_fixed_raw_slot(opt_t) }
+  else { SReal }
+
+fn border_unbox_prim(slot: KSlot) : Option[String] = match slot {
+  SInt64  -> Some("int.unbox")
+  SReal   -> Some("real.unbox")
+  SBool   -> Some("bool.unbox")
+  SChar   -> Some("char.unbox")
+  SByte   -> Some("byte.unbox")
+  SInt32T -> Some("int32.unbox")
+  SUInt32 -> Some("uint32.unbox")
+  SUInt64 -> Some("uint64.unbox")
+  SInt128 -> Some("int128.unbox")
+  _       -> None
+}
+
+fn lower_unbox_border(x: Expr, prim: String, slot: KSlot, st: LowerSt) : LRes / Console =
+  lower_unbox_at(x, prim, slot, raw_border_owns(x), st)
+
+# Unbox `x`'s boxed form through `prim`, releasing the box when it is owned.
+fn lower_unbox_at(x: Expr, prim: String, slot: KSlot, owned: Bool, st: LowerSt) : LRes / Console =
+  match lower_expr_boxed(x, st) { LRes(bv, st1) ->
+    match bind_op_slot(st1, KPrim(prim, [bv]), slot, kpos_of(x)) {
+      LRes(rv, st2) -> if owned { LRes(rv, release_border_box(x, slot, bv, st2)) } else { LRes(rv, st2) }
+    } }
+
+# Bool and Byte boxes are immortal, so their read owes no release.
+fn release_border_box(x: Expr, slot: KSlot, bv: KVal, st: LowerSt) : LowerSt = match slot {
+  SBool -> st
+  SByte -> st
+  _     -> ls_emit(st, KRC(KDrop(bv), kpos_of(x)))
+}
 
 # The natively-raw forms (the `MUnboxed` kinds the unbox pass produces).
 # Real arith / neg yield `SReal`; Int arith yields `SInt64`; comparison /
@@ -1117,12 +1109,20 @@ pub fn lower_fn_body_at(body: Expr, ret: KSlot, st: LowerSt) : LRes / Console = 
   SBoxed -> lower_expr(body, st)
   _      -> match body.kind {
     EBlock(stmts, tail) ->
-      if block_is_region(st.regions, body.line, body.col) { lower_expr(body, st) }
+      if block_is_region(st.regions, body.line, body.col) { lower_boxed_body_at(body, ret, st) }
       else { lower_plain_block_at(body, stmts, tail, ret, st) }
     _ -> if fn_body_lowers_raw(body) { lower_expr_raw_at(body, ret, st) }
-         else { lower_expr(body, st) }
+         else { lower_boxed_body_at(body, ret, st) }
   }
 }
+
+# A boxed body at a raw slot crosses the border here rather than in the
+# `KRet`, which could not release an owned temporary's box.
+fn lower_boxed_body_at(body: Expr, ret: KSlot, st: LowerSt) : LRes / Console =
+  match border_unbox_prim(ret) {
+    Some(prim) -> lower_unbox_border(raw_operand(body), prim, ret, st)
+    None       -> lower_expr(body, st)
+  }
 
 fn fn_body_lowers_raw(body: Expr) : Bool =
   if kir_node_is_raw(body) { true }
@@ -1145,14 +1145,29 @@ fn lower_plain_block_at(x: Expr, stmts: [Stmt], tail: Option[Expr], dst: KSlot, 
   # scalar carries no rc).
   let st2 = lower_block_exit_drops(stmts, tail, st1)
   match tail {
-    Some(e) -> match lower_tail_at(e, dst, tcp_after_stmts(st2, stmts)) { LRes(v, st3) -> LRes(v, ls_set_locals(ls_set_renames(st3, snap), lsnap)) }
+    Some(e) -> match lower_tail_at(x, e, dst, tcp_after_stmts(st2, stmts)) { LRes(v, st3) -> LRes(v, ls_set_locals(ls_set_renames(st3, snap), lsnap)) }
     None    -> LRes(KUnitV, ls_set_locals(ls_set_renames(st2, snap), lsnap))
   }
 }
 
-fn lower_tail_at(e: Expr, dst: KSlot, st: LowerSt) : LRes / Console = match dst {
+# A boxed block's tail is the block's own result, owned whatever its form, as
+# the C oracle takes the whole block's box; a raw block's tail crosses the
+# border like any raw operand.
+fn lower_tail_at(x: Expr, e: Expr, dst: KSlot, st: LowerSt) : LRes / Console = match dst {
   SBoxed -> lower_expr(e, st)
-  _      -> lower_fn_body_at(e, dst, st)
+  _      -> match x.mode {
+    MUnboxed -> lower_fn_body_at(e, dst, st)
+    _        -> lower_owned_tail_at(e, dst, st)
+  }
+}
+
+fn lower_owned_tail_at(e: Expr, dst: KSlot, st: LowerSt) : LRes / Console = match e.kind {
+  EBlock(_, _) -> lower_fn_body_at(e, dst, st)
+  _ -> if fn_body_lowers_raw(e) { lower_expr_raw_at(e, dst, st) }
+       else { match border_unbox_prim(dst) {
+         Some(prim) -> lower_unbox_at(e, prim, dst, true, st)
+         None       -> lower_expr(e, st)
+       } }
 }
 
 # A lexical `region { }` block: bump-allocate the body's ctors into a fresh
@@ -1438,6 +1453,7 @@ fn raw_call_let_slot(rhs: Expr) : Option[KSlot] = match rhs.mode {
     ECall(_, _) ->
       if kir_ty_is_real(rhs.ty) { Some(SReal) }
       else if kir_ty_is_int(rhs.ty) { Some(SInt64) }
+      else if kir_ty_is_char(rhs.ty) { Some(SChar) }
       else if kir_ty_is_byte(rhs.ty) { Some(SByte) }
       else if kir_ty_is_fixed_raw(rhs.ty) { Some(kir_fixed_raw_slot(rhs.ty)) }
       else { None }

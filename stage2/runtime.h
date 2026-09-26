@@ -6061,13 +6061,8 @@ static inline KaiValue *kai_variant_slot_box(KaiValue *v, int i) {
     return kai_var_slots(v)[i].ptr;
 }
 
-/* Issue #440 Phase 2 — consume a boxed Int / Real, return the raw
- * scalar and release the boxed temporary. Used by the stage 2
- * emitter when packing a primitive payload into a typed variant
- * slot: the call expression yields a boxed `KaiValue *` (already
- * possibly cached as a singleton), and we want the raw payload to
- * write into `slot.i64` / `slot.r`. Singleton Ints (rc == INT32_MAX)
- * survive the decref unchanged. */
+/* Consume an owned boxed scalar: return its raw payload and release the
+ * box. Cached and immortal boxes survive the decref unchanged. */
 static inline int64_t kai_take_int(KaiValue *v) {
     if (kai_is_value(v)) return kai_untag_int(v);   /* immediate: no header to decref */
     int64_t x = v->as.i;
@@ -6076,6 +6071,31 @@ static inline int64_t kai_take_int(KaiValue *v) {
 }
 static inline double kai_take_real(KaiValue *v) {
     double x = v->as.r;
+    kai_decref(v);
+    return x;
+}
+static inline uint32_t kai_take_char(KaiValue *v) {
+    uint32_t x = v->as.c;
+    kai_decref(v);
+    return x;
+}
+static inline int32_t kai_take_int32(KaiValue *v) {
+    int32_t x = v->as.i32;
+    kai_decref(v);
+    return x;
+}
+static inline uint32_t kai_take_uint32(KaiValue *v) {
+    uint32_t x = v->as.u32;
+    kai_decref(v);
+    return x;
+}
+static inline uint64_t kai_take_uint64(KaiValue *v) {
+    uint64_t x = v->as.u64;
+    kai_decref(v);
+    return x;
+}
+static inline __int128 kai_take_int128(KaiValue *v) {
+    __int128 x = kai_i128_load(v);
     kai_decref(v);
     return x;
 }
