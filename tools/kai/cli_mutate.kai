@@ -105,7 +105,8 @@ type Run = {
   oracle: String,
   gen: String,
   tmp: String,
-  db: [String]
+  db: [String],
+  front: [String]
 }
 
 type Tally = {
@@ -160,6 +161,10 @@ fn survivor(r: Run, f: String, s: Site) : [String] / File + Ffi {
 
 type Verdict = Survived([String]) | Killed | Uncompiled
 
+# A module imports through its package root and dependencies, not its own directory.
+fn typechecks(r: Run, f: String) : Bool / Ffi =
+  cli_proc.run([r.gen, ...r.front] ++ ["--check", f], quiet()) == 0
+
 # The mutant is generated from the pristine copy by the pinned compiler: an oracle may rebuild the live one.
 fn judge(r: Run, f: String, s: Site) : Verdict / Stderr + File + Ffi {
   let orig = "#{r.tmp}/orig.kai"
@@ -169,7 +174,7 @@ fn judge(r: Run, f: String, s: Site) : Verdict / Stderr + File + Ffi {
     Uncompiled
   } else {
     let _ = cli_fs.copy("#{r.tmp}/mutant.kai", f)
-    let checks = cli_proc.run([r.gen, ...paths] ++ ["--check", f], quiet()) == 0
+    let checks = typechecks(r, f)
     let rc = if checks { cli_proc.run(["sh", "-c", r.oracle], quiet()) } else { 1 }
     let _ = cli_fs.copy(orig, f)
     if not checks {
@@ -225,7 +230,26 @@ fn fold_sites(r: Run, f: String, ss: [Site], n: Tally) : Result[Tally, Int] / St
 fn list_sites(r: Run, f: String, ss: [Site]) : Unit / Stdout =
   ss |? (s => selected(r, s.op)) |> foreach(s => Stdout.print("#{s.op}\t#{f}\t#{s.line}:#{s.col}\t#{s.desc}"))
 
-fn module(r: Run, n: Tally, f: String) : Result[Tally, Int] / Stdout + Stderr + File + Ffi =
+# A module that does not check unmutated would bank every mutant as a compile failure.
+fn mutate_module(
+  r: Run,
+  f: String,
+  ss: [Site],
+  n: Tally
+) : Result[Tally, Int] / Stderr + Env + File + Ffi {
+  let rf = Run { ...r, front: cli_compile.front_flags(r.t, f, r.tmp)! }
+  if not typechecks(rf, f) {
+    Stderr.eprint("kai: mutate: #{f} does not typecheck as it stands; skipped")
+    Ok(n)
+  } else {
+    let _ = cli_fs.copy(f, "#{r.tmp}/orig.kai")
+    let after = fold_sites(rf, f, ss, n)!
+    let _ = cli_fs.copy("#{r.tmp}/orig.kai", f)
+    Ok(if full(r, after) { Tally { ...after, stop: true } } else { after })
+  }
+}
+
+fn module(r: Run, n: Tally, f: String) : Result[Tally, Int] / Stdout + Stderr + Env + File + Ffi =
   if n.stop or (not cli_sys.is_file(f)) {
     Ok(n)
   } else {
@@ -242,14 +266,15 @@ fn module(r: Run, n: Tally, f: String) : Result[Tally, Int] / Stdout + Stderr + 
     } else if cli_fs.read_or_empty("#{r.tmp}/sites") == "" {
       Ok(n)
     } else {
-      let _ = cli_fs.copy(f, "#{r.tmp}/orig.kai")
-      let after = fold_sites(r, f, ss, n)!
-      let _ = cli_fs.copy("#{r.tmp}/orig.kai", f)
-      Ok(if full(r, after) { Tally { ...after, stop: true } } else { after })
+      mutate_module(r, f, ss, n)
     }
   }
 
-fn fold_modules(r: Run, fs: [String], n: Tally) : Result[Tally, Int] / Stdout + Stderr + File + Ffi =
+fn fold_modules(
+  r: Run,
+  fs: [String],
+  n: Tally
+) : Result[Tally, Int] / Stdout + Stderr + Env + File + Ffi =
   match fs {
     [] -> Ok(n)
     [f, ...rest] -> {
@@ -289,13 +314,18 @@ fn modules(o: MutateOpts, root: String) : Result[[String], Int] / Stderr + File 
     }
   }
 
-fn sweep(t: Toolchain, o: MutateOpts, root: String, tmp: String) : Result[Int, Int] / Stdout + Stderr + File + Ffi {
+fn sweep(
+  t: Toolchain,
+  o: MutateOpts,
+  root: String,
+  tmp: String
+) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
   let files = modules(o, root)!
   let gen = "#{tmp}/kaic2-pinned"
   let _ = cli_io.copy_exec(t.layout.kaic2, gen)
   let oracle = if o.oracle == "" { "#{t.layout.root}/bin/kai test" } else { o.oracle }
   let db = string.split(cli_fs.read_or_empty("#{root}/tools/mutate-known-equivalent.txt"), "\n")
-  let r = Run { t, o, root, oracle, gen, tmp, db }
+  let r = Run { t, o, root, oracle, gen, tmp, db, front: [] }
   let start = cli_io.epoch()
   let none = Tally { total: 0, killed: 0, compile: 0, survived: 0, equiv: 0, survivors: [], stop: false }
   let n = fold_modules(r, files, none)!
