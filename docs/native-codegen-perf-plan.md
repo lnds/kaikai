@@ -223,6 +223,11 @@ live set stays constant. A follow-up lane can build `Lit(i)` with a typed `.i64`
 slot in the native codegen (the C `_fast` path) to remove the representation
 divergence at the source; the runtime fix then stands as defense-in-depth.
 
+Part (1) did not close the class: cached Byte and Char slots and nested
+interned variants saturate the same table. The table now admits only
+program-bounded atoms (unit, bool, nil, strings, variants), caps every probe
+at 16 buckets, and returns an ordinary cell when an install fails (issue #2122).
+
 ## 4. Optimisation plan (priority-ordered)
 
 Reviewed by `asu`; the corrections below are folded in.
