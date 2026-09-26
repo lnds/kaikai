@@ -60,6 +60,7 @@ import compiler.perceus_tail_drop
 import compiler.consume_index
 import compiler.fn_index
 import compiler.borrow_view
+import compiler.perceus_raw_slot
 
 # ==================================================================
 # Downward glue mirrors (prc_ prefix) — copied verbatim from the
@@ -697,7 +698,8 @@ fn pcs_borrowed_closure_names(borrowed: [String], params: [Param]) : [String] =
 # Caller side: strip the __perceus_dup the rewrite put on an argument
 # that lands in a borrowed parameter slot of the callee. The callee
 # borrows (does not consume) so the caller need not dup → the incref is
-# removed. Uses the global borrow map keyed by callee name.
+# removed. Uses the global borrow map keyed by callee name; a raw param of
+# an unboxed callee is handled by `perceus_raw_slot.kai`.
 #
 # `borrow_last` names are the containers whose sole use IS this borrow —
 # their prim access stays CONSUMING (no strip, no rename): the runtime
@@ -732,7 +734,7 @@ fn pcs_borrowed_closure_names(borrowed: [String], params: [Param]) : [String] =
 # stripped dups (net-zero), and per-read reclassification is unsound
 # where sugar clones share one source position.
 type StripCx = { bmap: [BorrowEntry], borrow_last: [String], bclosures: [String],
-                 fn_names: [String], no_wrap: [String], uses: [Use] }
+                 fn_names: [String], no_wrap: [String], uses: [Use], fns: FnIndex }
 
 fn pcs_strip_borrow_args_d(e: Expr, scx: StripCx) : Expr =
   Expr { kind: pcs_strip_borrow_kind(e.kind, scx),
@@ -754,7 +756,8 @@ fn pcs_strip_borrow_kind(k: ExprKind, scx: StripCx) : ExprKind = match k {
     let keep_consuming = pcs_arg0_is_borrow_last(args_, scx.borrow_last) and
                          (match pcs_prim_borrow_variant(key) { Some(_) -> true None -> false })
     let positions = if keep_consuming { [] } else { pcs_borrow_lookup(scx.bmap, key) }
-    let args2 = pcs_strip_args_at_d(args_, positions, 0, scx)
+    let args2 = prs_mark_raw_moves(pcs_strip_args_at_d(args_, positions, 0, scx),
+                                   prs_raw_arg_positions(callee, scx.fns), scx.no_wrap, scx.uses)
     let callee2 = if keep_consuming { callee }
                   else { pcs_maybe_rename_borrow_prim(callee, key, positions) }
     ECall(pcs_strip_borrow_args_d(callee2, scx), args2)
@@ -828,9 +831,9 @@ fn pcs_strip_args_at_d(args_: [Expr], positions: [Int], i: Int, scx: StripCx) : 
     # borrowed param's single exit-drop still balances.
     let a2 = if borrowed_slot {
                let s = pcs_strip_dup_wrap(a1)
-               if pcs_arg_is_fn_name(s, scx.fn_names) and pcs_arg_is_untracked(s, scx.uses) { pcs_wrap_owned_borrow(s) }
-               else if pcs_arg_is_owned_move(a1, scx) { pcs_wrap_owned_borrow(s) }
-               else if pcs_arg_is_owned_rvalue(s) { pcs_wrap_owned_borrow(s) }
+               if pcs_arg_is_fn_name(s, scx.fn_names) and pcs_arg_is_untracked(s, scx.uses) { prs_wrap_owned_borrow(s) }
+               else if pcs_arg_is_owned_move(a1, scx) { prs_wrap_owned_borrow(s) }
+               else if pcs_arg_is_owned_rvalue(s) { prs_wrap_owned_borrow(s) }
                else { s }
              }
              else if pcs_arg_is_bare_borrowed_closure(a1, scx.bclosures) { pcs_wrap_dup(a1) }
@@ -853,8 +856,7 @@ fn pcs_arg_is_untracked(a: Expr, uses: [Use]) : Bool = match a.kind {
 # the callee — in a borrowed slot that transfer has no taker. Excludes
 # `no_wrap` names (their bare reads balance elsewhere: borrow-through,
 # skip/move sets, exit-dropped locals), lambda-blocked names, and
-# unboxable-typed reads (raw scalars with no rc — a drop temp against
-# one would reference a raw local the emit never declares).
+# unboxable-typed reads, which `prs_mark_raw_moves` handles at raw slots.
 fn pcs_arg_is_owned_move(a: Expr, scx: StripCx) : Bool = match a.kind {
   EVar(nm) ->
     if list_has(scx.no_wrap, nm) { false }
@@ -906,13 +908,6 @@ fn pcs_arg_is_fn_name(a: Expr, fn_names: [String]) : Bool = match a.kind {
   EVar(nm) -> list_has(fn_names, nm)
   _        -> false
 }
-
-fn pcs_wrap_owned_borrow(a: Expr) : Expr =
-  Expr { kind: ECall(
-           Expr { kind: EMark(MkOwnedBorrow), line: a.line, col: a.col,
-                  ty: None, mode: MUnknown },
-           [a]),
-         line: a.line, col: a.col, ty: a.ty, mode: a.mode }
 
 # Names of the known top-level fns (an `EVar` naming one is materialised as
 # a fresh `kai_closure` when passed by value to a borrowed slot).
@@ -1757,7 +1752,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # borrowed/raw/skip sets and no `no_wrap` names.
         let borrow_last = pcs_collect_borrow_last_set(pcs_let_binder_names(body, []), body, prim_bmap)
         let scx = StripCx { bmap: bmap, borrow_last: borrow_last, bclosures: [],
-                            fn_names: fn_names, no_wrap: [], uses: uses }
+                            fn_names: fn_names, no_wrap: [], uses: uses, fns: fns }
         let body_borrow = pcs_strip_borrow_args_d(reused_body, scx)
         DFn(is_pub, name, tparams, params, opt_ret, row, body_borrow, ln, cl, mo, fsym)
       }
@@ -1946,7 +1941,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # branchy singles.
         let no_wrap = pcs_list_union(pcs_list_union(rewrite_skip_set, opaque_lets), branchy_single)
         let scx = StripCx { bmap: bmap, borrow_last: borrow_last, bclosures: borrowed_closures,
-                            fn_names: fn_names, no_wrap: no_wrap, uses: uses }
+                            fn_names: fn_names, no_wrap: no_wrap, uses: uses, fns: fns }
         let body_borrow = pcs_strip_borrow_args_d(body_borrow_call, scx)
         # Last: an op argument and a `let` value are owned, and a borrowed
         # binder is the one read that arrives without a reference of its own.

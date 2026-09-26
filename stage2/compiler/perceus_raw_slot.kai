@@ -1,0 +1,95 @@
+#[doc("""
+Raw parameter slots seen as borrowed slots by the Perceus caller strip.
+
+A raw parameter of an unboxed fn receives a copy of the scalar, never the
+box, so the callee can release nothing handed to it there. A single-use
+boxed binder moved into such a slot is marked for the caller to release
+after the call, like any owned value passed to a borrowing callee.
+""")]
+
+import compiler.ast
+import compiler.sym_read
+import compiler.util
+import compiler.infer
+import compiler.fnreg
+import compiler.fn_index
+import compiler.perceus_payer
+
+#[doc("The argument positions a call passes raw: the set bits of the callee's unboxed-signature mask.")]
+pub fn prs_raw_arg_positions(callee: Expr, fns: FnIndex) : [Int] = match prs_callee_sig(callee, fns) {
+  Some(US(_, _, mask)) -> prs_set_positions(mask, 0)
+  None                 -> []
+}
+
+#[doc("True for a scalar whose box is a heap cell: Real, Char and the fixed-width integers.")]
+pub fn prs_ty_is_heap_scalar(t: Ty) : Bool = match t {
+  TyReal   -> true
+  TyChar   -> true
+  TyInt32  -> true
+  TyUInt32 -> true
+  TyUInt64 -> true
+  TyInt128 -> true
+  TyDimT(inner, _)    -> prs_ty_is_heap_scalar(inner)
+  TyRefineT(inner, _) -> prs_ty_is_heap_scalar(inner)
+  _ -> false
+}
+
+# Resolved the way the unbox pass classifies a UFn call, so both agree on
+# which argument slots are raw.
+fn prs_callee_sig(callee: Expr, fns: FnIndex) : Option[UFnSig] = match callee.kind {
+  ESym(s, _) -> if sym_raw(s) >= 0 { fnx_ufn_sig_sym(fns, s) } else { prs_named_sig(callee, fns) }
+  _          -> prs_named_sig(callee, fns)
+}
+
+fn prs_named_sig(callee: Expr, fns: FnIndex) : Option[UFnSig] = match sym_read_kind(callee.kind) {
+  EVar(name) -> match efn_resolve(fnx_all(fns), name, None) {
+    Some(EFn(_, _, _, sig, _)) -> sig
+    None                       -> None
+  }
+  EModCall(mod, fname) -> fnx_ufn_sig(fns, fname, Some(mod))
+  _                    -> None
+}
+
+fn prs_set_positions(mask: [Bool], i: Int) : [Int] = match mask {
+  []           -> []
+  [m, ...rest] -> if m { [i, ...prs_set_positions(rest, i + 1)] } else { prs_set_positions(rest, i + 1) }
+}
+
+#[doc("An owned argument marked for the caller to release after a call whose slot does not take it.")]
+pub fn prs_wrap_owned_borrow(a: Expr) : Expr =
+  Expr { kind: ECall(
+           Expr { kind: EMark(MkOwnedBorrow), line: a.line, col: a.col,
+                  ty: None, mode: MUnknown },
+           [a]),
+         line: a.line, col: a.col, ty: a.ty, mode: a.mode }
+
+#[doc("Mark each single-use boxed scalar moved into a raw slot at `raws` for release after the call.")]
+pub fn prs_mark_raw_moves(args_: [Expr], raws: [Int], no_wrap: [String], uses: [Use]) : [Expr] =
+  prs_mark_raw_go(args_, raws, 0, no_wrap, uses)
+
+fn prs_mark_raw_go(args_: [Expr], raws: [Int], i: Int, no_wrap: [String], uses: [Use]) : [Expr] = match args_ {
+  []           -> []
+  [a, ...rest] -> {
+    let a2 = if prs_has_pos(raws, i) and prs_is_raw_move(a, no_wrap, uses) { prs_wrap_owned_borrow(a) } else { a }
+    [a2, ...prs_mark_raw_go(rest, raws, i + 1, no_wrap, uses)]
+  }
+}
+
+# The read hands its reference on: a tracked, single-use binder whose box is
+# a heap cell. Raw-bound and borrowed names never reach here as transfers.
+fn prs_is_raw_move(a: Expr, no_wrap: [String], uses: [Use]) : Bool = match a.kind {
+  EVar(nm) -> not list_has(no_wrap, nm) and
+              pcs_fate_transfers(pcs_fate_of(nm, uses, false, false)) and
+              prs_opt_ty_is_heap_scalar(a.ty)
+  _        -> false
+}
+
+fn prs_opt_ty_is_heap_scalar(opt_t: Option[Ty]) : Bool = match opt_t {
+  Some(t) -> prs_ty_is_heap_scalar(t)
+  None    -> false
+}
+
+fn prs_has_pos(xs: [Int], i: Int) : Bool = match xs {
+  []           -> false
+  [x, ...rest] -> x == i or prs_has_pos(rest, i)
+}
