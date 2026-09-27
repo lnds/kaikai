@@ -371,6 +371,7 @@ test-header-deps:
 # A target that runs bin/kai but depends only on kaic2 passes wherever an
 # earlier build left bin/kai behind and fails on a clean runner. Pure text.
 test-bin-kai-prereq:
+	@./tools/audit-bin-kai-prereq.py --self-test
 	@./tools/audit-bin-kai-prereq.py
 
 # Every #!/bin/sh script must parse under dash, not just macOS's
