@@ -179,7 +179,11 @@ static int kai_nthreads = 1;
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
+#if !defined(SO_PEERCRED) && defined(LOCAL_PEERCRED)
+#include <sys/ucred.h>
+#endif
 
 /* Issue #611 — Phase R1 reactor support. `poll()` is the wait
  * primitive (POSIX everywhere we ship), `pthread` powers the file
@@ -12130,19 +12134,26 @@ static KaiValue *_kai_net_make_listener(int fd, int port) {
     return kai_record(2, fields, names);
 }
 
-/* Pull the `fd` slot out of a Conn / Listener record. Returns -1 if
- * the value is the wrong shape (caller falls through to an error
- * return); v1 trusts the typer to keep this honest. */
-static int _kai_net_record_fd(KaiValue *v) {
-    if (!v || v->tag != KAI_RECORD) return -1;
+/* Read a named slot of a handle record. A missing or mistyped slot
+ * reads as NULL / -1 (the caller falls through to an error return);
+ * the typer keeps the shape honest. */
+static KaiValue *_kai_net_record_slot(KaiValue *v, const char *name) {
+    if (!v || v->tag != KAI_RECORD) return NULL;
     for (int i = 0; i < v->as.rec.n_fields; ++i) {
-        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "fd") == 0) {
-            KaiValue *f = v->as.rec.fields[i];
-            if (!kai_is_int(f)) return -1;
-            return (int) kai_intf(f);
+        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], name) == 0) {
+            return v->as.rec.fields[i];
         }
     }
-    return -1;
+    return NULL;
+}
+
+static int64_t _kai_net_record_int(KaiValue *v, const char *name) {
+    KaiValue *f = _kai_net_record_slot(v, name);
+    return (f && kai_is_int(f)) ? kai_intf(f) : -1;
+}
+
+static int _kai_net_record_fd(KaiValue *v) {
+    return (int) _kai_net_record_int(v, "fd");
 }
 
 /* connect(host, port) -> Result[Conn, String]. host is a hostname
@@ -12571,6 +12582,229 @@ static KaiValue *kai_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
             /* Stderr only — the surface op returns Unit. */
             fprintf(stderr, "kai: NetTcp.close: %s\n", strerror(errno));
         }
+    }
+    return kai_cont_resume(k, kai_unit());
+}
+
+/* =================================================================
+ * NetUnix default handler — Unix-domain stream sockets.
+ * =================================================================
+ *
+ * accept / send / recv / recv_timeout / close bridge to the NetTcp
+ * handlers above: past listen/connect they only see an fd. Surface
+ * records:
+ *
+ *   Conn      = { fd: Int }
+ *   Listener  = { fd: Int, path: String, dev: Int, ino: Int }
+ *
+ * `dev`/`ino` identify the filesystem node listen created, so
+ * close_listener never unlinks a socket another process put at the
+ * same path since.
+ */
+
+/* Copy a kaikai String into `buf` as a C path; -1 when it does not
+ * fit or carries a NUL byte (which would silently truncate it). */
+static int _kai_unix_cstr(KaiValue *s, char *buf, size_t cap) {
+    if (!s || s->tag != KAI_STR || s->as.s.len >= cap) return -1;
+    if (memchr(s->as.s.bytes, '\0', s->as.s.len)) return -1;
+    memcpy(buf, s->as.s.bytes, s->as.s.len);
+    buf[s->as.s.len] = '\0';
+    return 0;
+}
+
+static int _kai_unix_addr(struct sockaddr_un *sa, const char *path) {
+    size_t n = strlen(path);
+    if (n == 0 || n >= sizeof(sa->sun_path)) return -1;
+    memset(sa, 0, sizeof(*sa));
+    sa->sun_family = AF_UNIX;
+    memcpy(sa->sun_path, path, n + 1);
+    return 0;
+}
+
+static int _kai_unix_same_node(const char *path, int64_t dev, int64_t ino) {
+    struct stat st;
+    return lstat(path, &st) == 0 && S_ISSOCK(st.st_mode)
+        && (int64_t) st.st_dev == dev && (int64_t) st.st_ino == ino;
+}
+
+/* A socket file whose listener is gone refuses connections. The
+ * probe is non-blocking, so a live listener with a full backlog
+ * (EAGAIN) counts as live. */
+static int _kai_unix_is_stale(const char *path) {
+    struct sockaddr_un sa;
+    if (_kai_unix_addr(&sa, path) < 0) return 0;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    kai_socket_set_nonblock(fd);
+    int rc = connect(fd, (struct sockaddr *) &sa, sizeof(sa));
+    int e = errno;
+    close(fd);
+    return rc < 0 && e == ECONNREFUSED;
+}
+
+/* Bind + chmod + listen at `tmp`, inside a 0700 directory: the socket
+ * is unreachable until it already carries `mode`. umask is not used —
+ * it is process-wide and would race the other scheduler threads. */
+static int _kai_unix_bind_private(const char *tmp, mode_t mode, int *out_fd, struct stat *st) {
+    struct sockaddr_un sa;
+    if (_kai_unix_addr(&sa, tmp) < 0) return ENAMETOOLONG;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return errno;
+    if (bind(fd, (struct sockaddr *) &sa, sizeof(sa)) < 0 || chmod(tmp, mode) < 0
+        || listen(fd, KAI_LISTEN_BACKLOG) < 0 || lstat(tmp, st) < 0) {
+        int e = errno;
+        close(fd);
+        return e;
+    }
+    *out_fd = fd;
+    return 0;
+}
+
+/* link(2), not rename(2): an occupied path fails with EEXIST instead
+ * of being stolen. Only a stale socket is replaced, and only if the
+ * node is still the one that was probed. */
+static int _kai_unix_publish(const char *tmp, const char *path) {
+    if (link(tmp, path) == 0) return 0;
+    if (errno != EEXIST) return errno;
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        if (!S_ISSOCK(st.st_mode)) return EEXIST;
+        if (!_kai_unix_is_stale(path)) return EADDRINUSE;
+        if (_kai_unix_same_node(path, (int64_t) st.st_dev, (int64_t) st.st_ino)) unlink(path);
+    }
+    return link(tmp, path) == 0 ? 0 : errno;
+}
+
+/* The private directory sits beside `path` so link(2) stays on one
+ * filesystem. Its socket path is 12 bytes longer than `path`'s
+ * directory prefix — the sun_path limit applies to it too. */
+static int _kai_unix_listen_at(const char *path, mode_t mode, int *fd, struct stat *st) {
+    const char *slash = strrchr(path, '/');
+    int plen = slash ? (int) (slash - path) + 1 : 0;
+    char dir[KAI_PATH_BUF], tmp[KAI_PATH_BUF];
+    snprintf(dir, sizeof(dir), "%.*s.kaiXXXXXX", plen, path);
+    if (!mkdtemp(dir)) return errno;
+    int e = chmod(dir, 0700) < 0 ? errno : 0;
+    snprintf(tmp, sizeof(tmp), "%s/s", dir);
+    if (e == 0) e = _kai_unix_bind_private(tmp, mode, fd, st);
+    if (e == 0) {
+        e = _kai_unix_publish(tmp, path);
+        if (e != 0) close(*fd);
+    }
+    unlink(tmp);
+    rmdir(dir);
+    return e;
+}
+
+static KaiValue *_kai_unix_make_listener(int fd, const char *path, const struct stat *st) {
+    KaiValue *fields[4] = {
+        kai_int((int64_t) fd), kai_str(path),
+        kai_int((int64_t) st->st_dev), kai_int((int64_t) st->st_ino)
+    };
+    static const char *names[4] = { "fd", "path", "dev", "ino" };
+    return kai_record(4, fields, names);
+}
+
+static KaiValue *_kai_unix_ok(KaiCont *k, KaiValue *v) {
+    return kai_cont_resume(k, kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = v}}));
+}
+
+/* listen(path, mode) -> Result[Listener, String]. */
+static KaiValue *kai_default_netunix_listen(void *self, KaiValue *path, KaiValue *mode, KaiCont *k) {
+    (void) self;
+    char p[KAI_PATH_BUF];
+    struct sockaddr_un probe;
+    if (_kai_unix_cstr(path, p, sizeof(p)) < 0 || !kai_is_int(mode)) {
+        return _kai_net_err_msg(k, "listen: bad arguments");
+    }
+    int64_t m = kai_intf(mode);
+    if (m < 0 || m > 0777) return _kai_net_err_msg(k, "listen: mode outside 0..0o777");
+    if (_kai_unix_addr(&probe, p) < 0) return _kai_net_err_msg(k, "listen: path too long for a Unix socket");
+    int fd = -1;
+    struct stat st;
+    int e = _kai_unix_listen_at(p, (mode_t) m, &fd, &st);
+    if (e == ENAMETOOLONG) return _kai_net_err_msg(k, "listen: path too long for a Unix socket");
+    if (e != 0) return _kai_net_err(k, e);
+    kai_socket_set_nonblock(fd);
+    return _kai_unix_ok(k, _kai_unix_make_listener(fd, p, &st));
+}
+
+/* connect(path) -> Result[Conn, String]. A full backlog answers
+ * EAGAIN (Linux); readiness cannot signal "backlog drained" on an
+ * unconnected socket, so the fiber sleeps briefly and retries. */
+KAI_SCHED_FN KaiValue *kai_default_netunix_connect(void *self, KaiValue *path, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    char p[KAI_PATH_BUF];
+    struct sockaddr_un sa;
+    if (_kai_unix_cstr(path, p, sizeof(p)) < 0) return _kai_net_err_msg(k, "connect: bad arguments");
+    if (_kai_unix_addr(&sa, p) < 0) return _kai_net_err_msg(k, "connect: path too long for a Unix socket");
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return _kai_net_err(k, errno);
+    kai_reactor_init();
+    kai_socket_set_nonblock(fd);
+    while (connect(fd, (struct sockaddr *) &sa, sizeof(sa)) < 0 && errno != EISCONN) {
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EINPROGRESS || errno == EALREADY) {
+            kai_reactor_park_timer(kai_current_fiber(), kai_reactor_now_ns() + 1000000);
+            continue;
+        }
+        int e = errno;
+        close(fd);
+        return _kai_net_err(k, e);
+    }
+    return _kai_unix_ok(k, _kai_net_make_conn(fd));
+}
+#endif
+
+/* The peer's effective uid as the kernel recorded it at connect /
+ * listen time — nothing the peer sends can forge it. */
+static int _kai_unix_peer_uid(int fd, int64_t *uid) {
+#if defined(SO_PEERCRED)
+    struct ucred cred;
+    socklen_t len = sizeof(cred);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0) return errno;
+    *uid = (int64_t) cred.uid;
+    return 0;
+#elif defined(LOCAL_PEERCRED)
+    struct xucred cred;
+    socklen_t len = sizeof(cred);
+    if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &cred, &len) < 0) return errno;
+    if (cred.cr_version != XUCRED_VERSION) return EPROTO;
+    *uid = (int64_t) cred.cr_uid;
+    return 0;
+#else
+    (void) fd; (void) uid;
+    return ENOTSUP;
+#endif
+}
+
+/* peer_uid(c) -> Result[Int, String]. */
+static KaiValue *kai_default_netunix_peer_uid(void *self, KaiValue *c, KaiCont *k) {
+    (void) self;
+    int fd = _kai_net_record_fd(c);
+    if (fd < 0) return _kai_net_err_msg(k, "peer_uid: invalid conn");
+    int64_t uid = -1;
+    int e = _kai_unix_peer_uid(fd, &uid);
+    if (e != 0) return _kai_net_err(k, e);
+    return _kai_unix_ok(k, kai_int(uid));
+}
+
+/* close_listener(l) -> Unit. Unlinks the socket file only while it is
+ * still the node listen created, then closes the fd. */
+static KaiValue *kai_default_netunix_close_listener(void *self, KaiValue *l, KaiCont *k) {
+    (void) self;
+    char p[KAI_PATH_BUF];
+    if (_kai_unix_cstr(_kai_net_record_slot(l, "path"), p, sizeof(p)) == 0
+        && _kai_unix_same_node(p, _kai_net_record_int(l, "dev"), _kai_net_record_int(l, "ino"))) {
+        unlink(p);
+    }
+    int fd = _kai_net_record_fd(l);
+    if (fd >= 0 && close(fd) < 0) {
+        fprintf(stderr, "kai: NetUnix.close_listener: %s\n", strerror(errno));
     }
     return kai_cont_resume(k, kai_unit());
 }

@@ -1805,6 +1805,29 @@ KaiValue *kaix_default_netudp_close(void *self, KaiValue *sock, KaiCont *k) {
     return _op_r;
 }
 
+/* NetUnix: the fd-level ops reuse the kaix_default_nettcp_* forwarders. */
+KaiValue *kaix_default_netunix_listen(void *self, KaiValue *path, KaiValue *mode, KaiCont *k) {
+    KaiValue *_op_r = kai_default_netunix_listen(self, path, mode, k);
+    kai_decref(path);
+    kai_decref(mode);
+    return _op_r;
+}
+KaiValue *kaix_default_netunix_connect(void *self, KaiValue *path, KaiCont *k) {
+    KaiValue *_op_r = kai_default_netunix_connect(self, path, k);
+    kai_decref(path);
+    return _op_r;
+}
+KaiValue *kaix_default_netunix_peer_uid(void *self, KaiValue *c, KaiCont *k) {
+    KaiValue *_op_r = kai_default_netunix_peer_uid(self, c, k);
+    kai_decref(c);
+    return _op_r;
+}
+KaiValue *kaix_default_netunix_close_listener(void *self, KaiValue *l, KaiCont *k) {
+    KaiValue *_op_r = kai_default_netunix_close_listener(self, l, k);
+    kai_decref(l);
+    return _op_r;
+}
+
 /* Issue #141 — LLVM-visible wrappers around the static Log default
  * handlers in runtime.h. The LLVM emitter installs these by name
  * from `kai_main_install_defaults` when `Log` appears in main's
