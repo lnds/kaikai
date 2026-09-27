@@ -17,6 +17,11 @@ declaration. Where several modules declare it and none of them is the
 reader's own, the erasure spells the home the resolver chose — the
 qualified form the backend already resolves by (name, home) — so the
 settled question is not re-asked by name below.
+
+The two halves run apart. The ownership passes read identity, so the
+qualification runs before them and leaves every other reference an
+`ESym`; the erasure proper runs after them. An effect reference keeps
+its id through both: the backend's perform dispatches on it.
 """)]
 
 import compiler.ast
@@ -28,45 +33,52 @@ import compiler.home_tu
 #[doc("The erasure's view of the program: the symbol table the resolver stamped from, and the module whose file is being built.")]
 pub type SymErase = SymErase(SymTab, String)
 
-#[doc("The same declarations with every resolved reference spelled as the backend reads it.")]
-pub fn sym_erase_decls_in(se: SymErase, ds: [Decl]) : [Decl] = match ds {
+# The table, the root module, and whether an uncontested reference keeps
+# its id (the qualification) or is spelled bare (the erasure).
+type SeCx = SeCx(SymTab, String, Bool)
+
+#[doc("The same declarations with every resolved reference spelled as the backend reads it, except an effect reference, which keeps its id.")]
+pub fn sym_erase_decls_in(se: SymErase, ds: [Decl]) : [Decl] = se_decls(se_cx(se, false), ds)
+
+#[doc("The same declarations with each contested reference spelled by its home, and every other resolved reference still carrying its id.")]
+pub fn sym_qualify_decls_in(se: SymErase, ds: [Decl]) : [Decl] = se_decls(se_cx(se, true), ds)
+
+fn se_cx(se: SymErase, keep: Bool) : SeCx = match se { SymErase(tab, target) -> SeCx(tab, target, keep) }
+
+fn se_decls(cx: SeCx, ds: [Decl]) : [Decl] = match ds {
   []           -> []
-  [d, ...rest] -> [sym_erase_decl_in(se, d), ...sym_erase_decls_in(se, rest)]
+  [d, ...rest] -> [se_decl_map(d, (b) => se_expr_at(cx, se_decl_home(cx, d), b)), ...se_decls(cx, rest)]
 }
 
 # The home a declaration's body sits in: the module whose other entries a
 # bare name inside it reaches without qualification.
-fn se_decl_home(se: SymErase, d: Decl) : String = match se {
-  SymErase(_, target) -> match home_tu(d) {
+fn se_decl_home(cx: SeCx, d: Decl) : String = match cx {
+  SeCx(_, target, _) -> match home_tu(d) {
     Some(m) -> m
     None    -> target
   }
 }
 
-#[doc("The same declaration with every resolved reference in its body spelled as the backend reads it.")]
-pub fn sym_erase_decl_in(se: SymErase, d: Decl) : Decl = se_decl_body(se, se_decl_home(se, d), d)
-
-fn se_decl_body(se: SymErase, h: String, d: Decl) : Decl = match d {
-  DFn(p, n, tp, ps, rt, row, body, l, c, mo, fsym) ->
-    DFn(p, n, tp, ps, rt, row, sym_erase_expr_at(se, h, body), l, c, mo, fsym)
-  DTest(desc, body, l, c, mo)      -> DTest(desc, sym_erase_expr_at(se, h, body), l, c, mo)
-  DBench(desc, body, l, c, mo)     -> DBench(desc, sym_erase_expr_at(se, h, body), l, c, mo)
-  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, sym_erase_expr_at(se, h, body), l, c, mo)
-  DConst(p, n, ta, body, mo, l, c, csym) -> DConst(p, n, ta, sym_erase_expr_at(se, h, body), mo, l, c, csym)
-  DConstructor(inner, l, c)        -> DConstructor(se_decl_body(se, h, inner), l, c)
-  DProtoLaws(th, inner, l, c, mo)  -> DProtoLaws(th, se_decl_body(se, h, inner), l, c, mo)
-  DImplAxiom(th, inner, l, c, mo)  -> DImplAxiom(th, se_decl_body(se, h, inner), l, c, mo)
-  DDoc(raw, txt, inner, l, c)      -> DDoc(raw, txt, se_decl_body(se, h, inner), l, c)
-  DAttr(raw, inner, l, c)          -> DAttr(raw, se_decl_body(se, h, inner), l, c)
+fn se_decl_map(d: Decl, f: (Expr) -> Expr) : Decl = match d {
+  DFn(p, n, tp, ps, rt, row, body, l, c, mo, fsym) -> DFn(p, n, tp, ps, rt, row, f(body), l, c, mo, fsym)
+  DTest(desc, body, l, c, mo)      -> DTest(desc, f(body), l, c, mo)
+  DBench(desc, body, l, c, mo)     -> DBench(desc, f(body), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, f(body), l, c, mo)
+  DConst(p, n, ta, body, mo, l, c, csym) -> DConst(p, n, ta, f(body), mo, l, c, csym)
+  DConstructor(inner, l, c)        -> DConstructor(se_decl_map(inner, f), l, c)
+  DProtoLaws(th, inner, l, c, mo)  -> DProtoLaws(th, se_decl_map(inner, f), l, c, mo)
+  DImplAxiom(th, inner, l, c, mo)  -> DImplAxiom(th, se_decl_map(inner, f), l, c, mo)
+  DDoc(raw, txt, inner, l, c)      -> DDoc(raw, txt, se_decl_map(inner, f), l, c)
+  DAttr(raw, inner, l, c)          -> DAttr(raw, se_decl_map(inner, f), l, c)
   _ -> d
 }
 
-fn sym_erase_expr_at(se: SymErase, h: String, e: Expr) : Expr =
-  Expr { kind: sym_erase_kind_at(se, h, e.kind), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+fn se_expr_at(cx: SeCx, h: String, e: Expr) : Expr =
+  Expr { kind: se_kind_at(cx, h, e.kind), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
-fn sym_erase_kind_at(se: SymErase, h: String, k: ExprKind) : ExprKind = match k {
-  ESym(s, n) -> sym_erase_ref(se, h, s, n)
-  _          -> prc_map_expr_kind(k, (sub) => sym_erase_expr_at(se, h, sub))
+fn se_kind_at(cx: SeCx, h: String, k: ExprKind) : ExprKind = match k {
+  ESym(s, n) -> sym_erase_ref(cx, h, s, n)
+  _          -> prc_map_expr_kind(k, (sub) => se_expr_at(cx, h, sub))
 }
 
 # A reference spells its home only where the bare name would leave the
@@ -75,16 +87,20 @@ fn sym_erase_kind_at(se: SymErase, h: String, k: ExprKind) : ExprKind = match k 
 # its own home is not contested there, and the passes that read a
 # self-recursive call by name — the tail-call rewrite among them — only
 # see one when it stays bare.
-fn sym_erase_ref(se: SymErase, h: String, s: SymId, n: String) : ExprKind = match se {
-  SymErase(tab, target) -> {
-    let home = sym_home(tab, s)
-    if home == "" { EVar(n) }
-    else { match sym_class(tab, s) {
-      NCFn -> if se_spellable(tab, target, h, n) { EModCall(home, n) } else { EVar(n) }
-      _    -> EVar(n)
-    } }
+fn sym_erase_ref(cx: SeCx, h: String, s: SymId, n: String) : ExprKind = match cx {
+  SeCx(tab, target, keep) -> match sym_class(tab, s) {
+    NCEffect -> ESym(s, n)
+    NCFn     -> if se_spellable(tab, target, h, n) { se_home_call(tab, s, n, keep) } else { se_bare(keep, s, n) }
+    _        -> se_bare(keep, s, n)
   }
 }
+
+fn se_home_call(tab: SymTab, s: SymId, n: String, keep: Bool) : ExprKind = {
+  let home = sym_home(tab, s)
+  if home == "" { se_bare(keep, s, n) } else { EModCall(home, n) }
+}
+
+fn se_bare(keep: Bool, s: SymId, n: String) : ExprKind = if keep { ESym(s, n) } else { EVar(n) }
 
 # Contested, with no candidate the bare name already answers: a root-file
 # entry wins every bare call in the registry, and the body's own module

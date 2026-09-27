@@ -83,6 +83,7 @@ import compiler.fn_index
 import compiler.rawsafe
 import compiler.perceus
 import compiler.sym_erase
+import compiler.symid_dump
 import compiler.purity
 import compiler.tailfuse
 import compiler.protos
@@ -1571,6 +1572,9 @@ pub type Mode
   # top-level fn, computed over the post-perceus / post-tcrec AST (the
   # same lowered form the backends stamp from). Read-only; no binary.
   | MDumpPurity
+  # `--dump-symids` — the ids unbox and perceus receive and the effect id
+  # each `KPerform` carries, decoded against the symbol table.
+  | MDumpSymIds
   | MDumpLastUse
   # `--dump=evidence-obligations` — per function, the distinct effect-
   # instance evidence obligations the row demands and which supplier
@@ -1986,6 +1990,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MDumpBorrowSafe))
       } else if a == "--dump-purity" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpPurity))
+      } else if a == "--dump-symids" {
+        parse_cli_loop(more, cli_with_mode(opts, MDumpSymIds))
       } else if a == "--dump-last-use" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpLastUse))
       } else if a == "--dump-intervals" {
@@ -5830,16 +5836,12 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # slots (`array_make(1, lit)`) to raw local cells
                       # so the unbox pass below marks arithmetic over
                       # their reads raw on both backends.
-                      # Identity has done its work by here: the resolver
-                      # decided it, and the typer, the protocol rewrite
-                      # and the monomorphiser each consumed it. Below this
-                      # line a name is a C symbol to spell, so each
-                      # reference is spelled once — qualified where the
-                      # bare name would leave the choice open — rather
-                      # than every spelling site carrying a second shape.
-                      # One spelling per local binder from here on: every
-                      # ownership table below keys on the name.
-                      let cell_decls = unique_binders_decls(promote_scalar_cells(sym_erase_decls_in(SymErase(res_tab, target_mod_name), mono_decls)))
+                      # A contested reference is spelled by its home here;
+                      # every other one keeps its id through unbox and
+                      # perceus. One spelling per local binder from here
+                      # on: every ownership table below keys on the name.
+                      let erase_ctx = SymErase(res_tab, target_mod_name)
+                      let cell_decls = unique_binders_decls(promote_scalar_cells(sym_qualify_decls_in(erase_ctx, mono_decls)))
                       # Unbox analysis. Runs between monomorphisation
                       # and perceus so the perceus pass sees post-unbox
                       # modes (it only inserts dup/drop on `MBoxed`
@@ -5882,7 +5884,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # Coupling the order the other way forces tcrec to
                       # re-emulate perceus's exit-drop computation, so a
                       # change to one has to be mirrored in the other.
-                      let post_perceus_decls = perceus_pass_in(unboxed_decls, res_tab, target_mod_name)
+                      # Below the erasure a name is a C symbol to spell.
+                      let post_perceus_decls = sym_erase_decls_in(erase_ctx, perceus_pass_in(unboxed_decls, res_tab, target_mod_name))
                       # TCO is mandatory on BOTH backends.
                       # `tcrec_rewrite_decls` is a pure AST→AST pre-pass
                       # that plants the `__kai_tcrec|...` self-tail-call
@@ -5913,6 +5916,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       let cons_ok = true
                       let perceus_decls = tcrec_rewrite_decls(post_perceus_decls, true, cons_ok, target_mod_name)
                       let use_purity = match mode { MDumpPurity -> true _ -> false }
+                      let use_symids = match mode { MDumpSymIds -> true _ -> false }
                       if mono_bound_errs != 0 { mono_bound_errs }
                       else if mono_inv_errs != 0 { mono_inv_errs }
                       else if mono_dispatch_errs != 0 { mono_dispatch_errs }
@@ -5921,6 +5925,15 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                         # post-perceus / post-tcrec AST the backends stamp
                         # from. Read-only; emit no binary.
                         dump_purity_marks(purity_analyze(perceus_decls)); 0
+                      }
+                      else if use_symids {
+                        let kp = kir_inline_program(lower_to_kir(perceus_decls, region_marks, register_fn_decls_in(perceus_decls, res_tab),
+                                                                 register_variants(perceus_decls), Some(target_mod_name), raw_arm_binders))
+                        let core_names = core_mod_names(core_mods, [])
+                        print(string_join(symid_decl_lines("unbox", res_tab, core_names, cell_decls)
+                                          ++ symid_decl_lines("perceus", res_tab, core_names, unboxed_decls)
+                                          ++ symid_kir_lines(res_tab, core_names, kp), "\n"))
+                        0
                       }
                       else if use_native {
                         # In-process libLLVM native backend. Lower to
