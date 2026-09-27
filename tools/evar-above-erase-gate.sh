@@ -2,7 +2,7 @@
 # A reference minted between the resolver and the erasure carries its id.
 #
 # `resolve` turns a name that reaches a declaration into an `ESym`, and
-# `sym_erase` (driver, just before unbox) turns it back into a spelling
+# `sym_erase` (driver, just after perceus) turns it back into a spelling
 # because below that line a name is a C symbol, not a reference. Between
 # those two points a pass that mints a bare `EVar` re-introduces exactly
 # the ambiguity the resolver settled: the next reader compares spellings
@@ -37,6 +37,9 @@ SRC="$ROOT/stage2/compiler"
 #   fwd_inline,      — mint a primitive or a binder they just bound.
 #   closure_spec_ast,
 #   closure_spec_emit
+#   perceus*,        — mint a binder they just bound, an RC marker
+#   unbox*,            (`__perceus_dup`, `__pcs_ret`), or a runtime
+#   cell_promote       primitive's borrow variant; never a declaration.
 #   cache_ast        — deserialisation; ids are rebuilt on load.
 #   sym_read         — the ESym→EVar reader itself.
 #   emit_tcrec_live  — the matches are prose inside a `#[doc]` block.
@@ -48,13 +51,12 @@ ALLOW="$ALLOW|json_derive|layout_derive|fmt_expr|tailfuse|tailsubst"
 ALLOW="$ALLOW|pipe_fusion|resolve|infer|monomorph|fwd_inline"
 ALLOW="$ALLOW|closure_spec_ast|closure_spec_emit|cache_ast|sym_read"
 ALLOW="$ALLOW|emit_tcrec_live|cache_delta_test|resolve_sym_test"
+ALLOW="$ALLOW|perceus|perceus_plant_drop|perceus_tail_drop|perceus_op_arg"
+ALLOW="$ALLOW|perceus_payer|perceus_let_own|unbox|unbox_native_raw|cell_promote"
 
 # Passes at or below the erasure. `EVar` is their correct form: the name
 # is a C symbol there, and `sym_erase` is what put it back.
-BELOW='sym_erase|perceus|perceus_plant_drop|perceus_tail_drop|perceus_op_arg'
-BELOW="$BELOW|perceus_payer|perceus_let_own"
-BELOW="$BELOW|emit_c|emit_shared|unbox|unbox_native_raw|kir_lower|kir_lower_walk"
-BELOW="$BELOW|cell_promote|region|driver"
+BELOW='sym_erase|emit_c|emit_shared|kir_lower|kir_lower_walk|region|driver'
 
 # Count constructions, not pattern matches. Two forms build one: the
 # `mk_ref` helper every pass should call, and a raw `EVar(...)` that is
