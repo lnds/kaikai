@@ -263,8 +263,12 @@ Unlike the sources above, these surface in ordinary user programs:
 - #2145 — a modulo-cons tail inside a nested `match` leaks the whole input list.
 - #2146 — an arm binder read only behind `and`/`or`, or in a nested guard,
   leaks when the read is skipped.
-- #2159 — an arm binder whose last read is a borrow, in an arm that ends in a
-  TRMC step or a self-tail-call, keeps its own reference past the step.
+- #2205 — an arm binder read only in a block body's tail, when that tail is
+  not a self-tail-call, gets no release.
+- #2209 — native only: a reuse rebuild that keeps an arm binder in its own
+  slot leaks one cell per call when the scrutinee is shared.
+- #2212 — the goto-tail move set can take an arm binder whose reads are all
+  borrows for moved, and nothing releases it.
 - #2143 — native only: a nested arm binder homonymous with an outer one is
   released by the outer arm's exit drop (use-after-free under ASAN).
 

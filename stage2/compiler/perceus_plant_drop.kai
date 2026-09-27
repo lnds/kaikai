@@ -11,7 +11,10 @@
 # never attempted.
 
 import compiler.ast
+import compiler.util
 import compiler.fnreg
+import compiler.sym_read
+import compiler.perceus_reads
 
 pub fn ppd_plant(e: Expr, self_name: String, names: [String]) : Option[Expr] =
   if not ppd_has_self_call(e, self_name) { Some(ppd_wrap_leaf(e, names)) }
@@ -73,22 +76,38 @@ fn ppd_both(a: Option[Expr], b: Option[Expr], f: (Expr, Expr) -> Expr) : Option[
 fn ppd_rekind(e: Expr, k: ExprKind) : Expr =
   Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
-# The plain-leaf wrap: bind the value, drop, yield. The read carries the
-# leaf's type and mode — an unboxed leaf binds a raw local.
-fn ppd_wrap_leaf(e: Expr, names: [String]) : Expr = {
+fn ppd_wrap_leaf(e: Expr, names: [String]) : Expr = ppd_bind_then(e, ppd_drops(names, e.line, e.col))
+
+#[doc("Bind `e`, run `stmts`, yield the value. The read keeps `e`'s type and mode, so an unboxed value binds a raw local.")]
+pub fn ppd_bind_then(e: Expr, stmts: [Stmt]) : Expr = {
   let ret_let = SLet(mk_pat(PBind("__pcs_tret"), e.line, e.col), None, e)
   let ret_var = Expr { kind: EVar("__pcs_tret"), line: e.line, col: e.col,
                        ty: e.ty, mode: e.mode }
-  ppd_rekind(e, EBlock([ret_let, ...ppd_drops(names, e.line, e.col)], Some(ret_var)))
+  ppd_rekind(e, EBlock([ret_let, ...stmts], Some(ret_var)))
 }
+
+#[doc("A call with its args hoisted into temporaries and `stmts` run after the last one; unchanged when it is no call.")]
+pub fn ppd_hoist_then(call: Expr, stmts: [Stmt]) : Expr = match call.kind {
+  ECall(f, xs) -> ppd_hoist_with(call, f, xs, stmts)
+  _            -> call
+}
+
+#[doc("True when `d` is no drop, or drops a name in `names`.")]
+pub fn ppd_drop_among(d: Stmt, names: [String]) : Bool = match ppd_drop_name(d) {
+  Some(nm) -> list_has(names, nm)
+  None     -> true
+}
+
 
 # Bind the args left-to-right (evaluation order unchanged), drop after
 # that last read, re-issue the call as the block tail. Each read carries
 # the argument's type and mode — an unboxed argument binds a raw local.
-fn ppd_hoist_call(e: Expr, f: Expr, xs: [Expr], names: [String]) : Expr {
+fn ppd_hoist_call(e: Expr, f: Expr, xs: [Expr], names: [String]) : Expr =
+  ppd_hoist_with(e, f, xs, ppd_drops(names, e.line, e.col))
+
+fn ppd_hoist_with(e: Expr, f: Expr, xs: [Expr], stmts: [Stmt]) : Expr {
   let call = ppd_rekind(e, ECall(f, ppd_hoist_reads(xs, 0)))
-  ppd_rekind(e, EBlock(list_append(ppd_hoist_lets(xs, 0), ppd_drops(names, e.line, e.col)),
-                       Some(call)))
+  ppd_rekind(e, EBlock(list_append(ppd_hoist_lets(xs, 0), stmts), Some(call)))
 }
 
 fn ppd_hoist_lets(xs: [Expr], i: Int) : [Stmt] = match xs {
@@ -123,6 +142,36 @@ pub fn ppd_is_hoist_block(stmts: [Stmt]) : Bool = match stmts {
 pub fn ppd_drops(names: [String], ln: Int, cl: Int) : [Stmt] = match names {
   []            -> []
   [nm, ...rest] -> [ppd_drop_stmt(nm, ln, cl), ...ppd_drops(rest, ln, cl)]
+}
+
+#[doc("The names a statement list binds, for shadowing checks.")]
+pub fn ppd_let_names(stmts: [Stmt]) : [String] = match stmts {
+  []           -> []
+  [s, ...rest] -> match s {
+    SLet(pat, _, _)     -> prc_pat_bindings(pat, ppd_let_names(rest))
+    SVar(n, _, _, _, _) -> [n, ...ppd_let_names(rest)]
+    _                   -> ppd_let_names(rest)
+  }
+}
+
+#[doc("The binder a `__perceus_drop` statement releases, or `None` for any other statement.")]
+pub fn ppd_drop_name(s: Stmt) : Option[String] = match s {
+  SExprStmt(e) -> match e.kind {
+    ECall(callee, args_) -> match sym_read_kind(callee.kind) {
+      EMark(MkDrop) -> ppd_sole_var(args_)
+      _             -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+fn ppd_sole_var(args_: [Expr]) : Option[String] = match args_ {
+  [a] -> match a.kind {
+    EVar(nm) -> Some(nm)
+    _        -> None
+  }
+  _ -> None
 }
 
 fn ppd_drop_stmt(nm: String, ln: Int, cl: Int) : Stmt =

@@ -87,6 +87,7 @@ import compiler.ffi_v2
 import compiler.emit_ffi_c
 import compiler.emit_slices
 import compiler.emit_tcrec_live
+import compiler.trmc_exit_drops
 import compiler.modular_linkage
 import compiler.region
 import compiler.raw_border
@@ -15228,15 +15229,8 @@ fn trmc_expr_nth(xs: [Expr], i: Int) : Option[Expr] =
     [a, ...rest] -> if i == 0 { Some(a) } else { trmc_expr_nth(rest, i - 1) }
   } }
 
-# Perceus wraps each match-arm / block tail leaf in
-#   EBlock([SLet(__pcs_arm_ret|__pcs_block_ret, INNER), ...drops],
-#          Some(EVar(__pcs_arm_ret|__pcs_block_ret)))
-# so the exit-drops run after the value is computed. For TRMC this wrap
-# hides the modulo-cons ctor from the walker/rewrite. `trmc_unwrap_ret`
-# peels one such wrap to its INNER expression; for a modulo-cons or
-# apply leaf the cctx replaces the wrap's drops (the goto skips them /
-# the apply carries ownership), so the drops are discarded. Returns the
-# original expr unchanged when it is not a *_ret wrap.
+# Peel a Perceus arm-ret wrap to its INNER value, exposing the modulo-cons
+# ctor; `trmc_rewrite_body` replants the wrap's drops (trmc_exit_drops).
 fn trmc_unwrap_ret(e: Expr) : Expr {
   match e.kind {
     EBlock(stmts, opt_tail) -> match opt_tail {
@@ -15282,12 +15276,11 @@ fn trmc_find_ret_let_rhs(stmts: [Stmt], ret_name: String) : Option[Expr] {
 fn trmc_rewrite_body(body0: Expr, nm: String, arity: Int, own_mod: Option[String], c_sym_str: String,
                      params: [Param], pnames: [String], uses: [Use],
                      dm_table: [TcrDm], skip_set: [String], scope: [String], cons_ok: Bool) : Expr {
-  # Peel a Perceus arm/block-ret wrap so the modulo-cons ctor (or the
-  # tail leaf) is visible; the cctx replaces the wrap's exit drops.
   let body = trmc_unwrap_ret(body0)
-  Expr { kind: trmc_rewrite_kind(body.kind, body.line, body.col, nm, arity, own_mod,
+  let out = Expr { kind: trmc_rewrite_kind(body.kind, body.line, body.col, nm, arity, own_mod,
                                   c_sym_str, params, pnames, uses, dm_table, skip_set, scope, cons_ok),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode }
+  txd_plant(out, txd_wrap_drops(body0))
 }
 
 # Build the step-sentinel `ECall` for a modulo-cons leaf: compute the
@@ -15960,12 +15953,10 @@ fn emit_trmc_slot_stores(src: String, node: String, cname: String, args_e: [Expr
   }
 }
 
-# Release the boxed Real a donor-identity slot elision leaves unconsumed.
-# The arg reached `trmc_slot_is_donor_identity` as `EVar(nm)` (a Perceus dup
-# wrapper stripped), and `nm`'s arm bind allocated the box; the elided store
-# was its only consumer.
+# Release the boxed Real a donor-identity slot elision leaves unconsumed:
+# `nm`'s arm bind allocated the box and the elided store was its only consumer.
 fn trmc_elided_real_release(a: Expr) : String =
-  match (raw_border_strip_dup(a)).kind {
+  match a.kind {
     EVar(nm) -> concat_all(["kai_decref(", c_local(nm), "); "])
     _        -> ""
   }
@@ -15974,13 +15965,12 @@ fn trmc_elided_real_release(a: Expr) : String =
 # already in the donated reuse cell. SOUND only when (1) we are inside an
 # arm-top-reuse body whose donor is the cell being rebuilt (`reuse_donor`
 # set), (2) the rebuilt ctor is the SAME as the donor's (so slot layouts
-# coincide — the cell keeps its ctor), and (3) the rebuild arg, stripped of
-# a Perceus dup wrapper, is exactly `EVar(nm)` where `nm` is the donor's
-# positional binder for slot i (same value, same position — not permuted,
-# not transformed). The binder was bound borrow off `_scr[i]` at the arm
-# top; `kai_drop_reuse_token` returned the shell with slot i untouched, so
-# the value is already there. Any mismatch (different ctor, permutation,
-# transformed arg, non-binder slot) keeps the explicit store.
+# coincide — the cell keeps its ctor), and (3) the rebuild arg is a bare
+# `EVar(nm)` where `nm` is the donor's positional binder for slot i (same
+# value, same position — not permuted, not transformed). The binder was bound
+# borrow off `_scr[i]` at the arm top; `kai_drop_reuse_token` returned the
+# shell with slot i untouched, so the value is already there. A dup'd read
+# leaves the binder its own reference for its exit drop, so the store stays.
 fn trmc_slot_is_donor_identity(cname: String, a: Expr, i: Int, cx: EmitCtx) : Bool =
   match cx.reuse_donor {
     None -> false
@@ -15989,7 +15979,7 @@ fn trmc_slot_is_donor_identity(cname: String, a: Expr, i: Int, cx: EmitCtx) : Bo
       else {
         let bn = trmc_donor_binder_nth(binders, i)
         if bn == "" { false }
-        else { match (raw_border_strip_dup(a)).kind {
+        else { match a.kind {
           EVar(nm) -> nm == bn
           _        -> false
         } }
