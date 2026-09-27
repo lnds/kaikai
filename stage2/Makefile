@@ -1573,7 +1573,7 @@ ifeq ($(KAI_LLVM),1)
 # a C-only kaic2. Rides tier1-native (needs the libLLVM native backend).
 MN_SOUNDNESS_ITERS ?= 40
 
-test-mn-native-soundness: $(TARGET)
+test-mn-native-soundness: $(TARGET) bin-kai
 	@../tools/run-mn-native-soundness.sh $(MN_SOUNDNESS_ITERS)
 
 # C-backend soundness under clang (issue #1238). The native gate above runs
@@ -1582,7 +1582,7 @@ test-mn-native-soundness: $(TARGET)
 # plus a raw single-TU -O2 build with no scheduler owner object, the shape
 # these recipes themselves use. Self-skips on a clang-less host. Loops
 # KAI_THREADS=4/8.
-test-mn-c-clang-soundness: $(TARGET)
+test-mn-c-clang-soundness: $(TARGET) bin-kai
 	@../tools/run-mn-c-clang-soundness.sh $(MN_SOUNDNESS_ITERS)
 
 test-native-modular: $(TARGET) build
@@ -3250,10 +3250,10 @@ test-driver-holes: $(TARGET) bin-kai build
 # tools/effects-goldens-skips.txt. The native variant probes the
 # backend and SKIPs (success) on a C-only kaic2 — real native coverage
 # runs where libLLVM is present (tier1-native).
-test-effects-goldens: $(TARGET) build
+test-effects-goldens: $(TARGET) bin-kai build
 	@TARGET_BACKEND=c ../tools/test-effects-goldens.sh
 
-test-effects-goldens-native: $(TARGET) build
+test-effects-goldens-native: $(TARGET) bin-kai build
 	@TARGET_BACKEND=native ../tools/test-effects-goldens.sh
 
 # m7a #3 — parser-level smoke tests for `effect` declarations and
@@ -9625,7 +9625,7 @@ test-perceus-1083-variant-spine-free: $(TARGET) bin-kai build
 # host target-features so the opt pipeline folds the `kaix_*` runtime ops into
 # the rb-tree hot loop. Without the stamp the residual `bl kaix_*` call count
 # jumps from ~168 back past 1000 (areInlineCompatible blocks every inline).
-test-native-1083-inline-gate: $(TARGET)
+test-native-1083-inline-gate: $(TARGET) bin-kai
 	@CC="$(CC)" LLVM_CONFIG="$(LLVM_CONFIG)" ../tools/native-perf/inline-gate.sh
 
 # Issue #1083 — native pointer-slot borrow soundness. A `match` arm that binds
@@ -12082,7 +12082,7 @@ test-fast: test-infer test-infer-check test-lint test-dump-typed test-dump-mono 
 # manifest_parse_error). Without this target, the entire
 # package-manager surface stays a CI blind spot — bugs like #565
 # and #567 only surfaced because ahu tried to integrate.
-test-packages: $(TARGET)
+test-packages: $(TARGET) bin-kai
 	@$(STACK) ../tools/test-packages.sh
 
 # Issue #455 Phase B — user-file incremental cache invalidation gate.
@@ -12208,10 +12208,10 @@ endif
 # prints the right answer and takes the memory with it. Counts differ per
 # backend, so the baseline pins a column each; KAI_LEAK_BACKEND picks which
 # one this run checks.
-rc-leak-gate:
+rc-leak-gate: bin-kai
 	@bash ../tools/rc-leak-gate.sh
 
-rc-leak-gate-native:
+rc-leak-gate-native: bin-kai
 	@if command -v "$(LLVM_CONFIG)" >/dev/null 2>&1; then \
 	  KAI_LEAK_BACKEND=native bash ../tools/rc-leak-gate.sh; \
 	else \
@@ -12227,7 +12227,7 @@ rc-leak-gate-native:
 # libLLVM is absent. Heavy (build x2 x corpus) — cron / RC-path-gated, not a
 # per-PR gate. When libLLVM is present, relinks kaic2 with KAI_LLVM=1 unless
 # the existing binary is already up to date AND native-capable.
-rc-detector:
+rc-detector: bin-kai
 	@if command -v "$(LLVM_CONFIG)" >/dev/null 2>&1; then \
 	  if $(MAKE) -q $(TARGET) 2>/dev/null && ../tools/kaic2-native-capable.sh $(TARGET); then \
 	    echo "rc-detector: $(TARGET) is up to date and native-capable; not rebuilding"; \
@@ -12269,10 +12269,10 @@ NSCOL_RUN = NSCOL_KAIC2='$(KAIC2)' NSCOL_CORE_CACHE='$(TEST_CORE_CACHE)' \
 # One ratcheted axis: run it, then gate its log.
 nscol_axis = $(NSCOL_RUN) $(1) build/nscol-$(1).log; $(NSCOL_RATCHET) $(1) build/nscol-$(1).log
 
-test-namespace-collisions: $(TARGET) build core-cache-warm
+test-namespace-collisions: $(TARGET) bin-kai build core-cache-warm
 	@$(call nscol_axis,c)
 
-test-namespace-collisions-neg: $(TARGET) build core-cache-warm
+test-namespace-collisions-neg: $(TARGET) bin-kai build core-cache-warm
 	@$(call nscol_axis,neg)
 
 # Native backend. A fix verified only on C proves nothing here: the
@@ -12281,19 +12281,19 @@ test-namespace-collisions-neg: $(TARGET) build core-cache-warm
 # class this corpus covers. Built whole-program (`KAI_NATIVE_MODULAR=0`):
 # that is where the KIR names its symbols, and the partitioned build of
 # a one-shot fixture costs several times more with no cache to reuse.
-test-namespace-collisions-native: $(TARGET) build
+test-namespace-collisions-native: $(TARGET) bin-kai build
 	@$(call nscol_axis,native)
 
 # The partitioned native build (`KAI_NATIVE_MODULAR=1`, one object per
 # module, linked afterwards) over the fixtures whose defect lives in
 # emitted or linked symbols: a homonym two partitions each define
 # surfaces at link time here and nowhere in the whole-program build.
-test-namespace-collisions-native-modular: $(TARGET) build
+test-namespace-collisions-native-modular: $(TARGET) bin-kai build
 	@$(call nscol_axis,native-modular)
 
 # The negatives on the native backend: a diagnostic the C path emits and
 # the KIR path skips (or vice versa) is a silent acceptance on one of them.
-test-namespace-collisions-neg-native: $(TARGET) build
+test-namespace-collisions-neg-native: $(TARGET) bin-kai build
 	@$(call nscol_axis,neg-native)
 
 # Separate compilation (`--emit=c-modular`): one translation unit per
@@ -12303,32 +12303,32 @@ test-namespace-collisions-neg-native: $(TARGET) build
 # that no longer conflicts because each TU declares its own, shows up
 # only here. `KAI_MODULAR=1` forces the split even when the core cache
 # is cold.
-test-namespace-collisions-modular: $(TARGET) build
+test-namespace-collisions-modular: $(TARGET) bin-kai build
 	@$(call nscol_axis,modular)
 
 # The negatives under separate compilation. A per-TU emit can accept
 # what the single TU rejects (two prototypes that only clash side by
 # side), so the diagnostic has to come from the compiler, not from `cc`.
-test-namespace-collisions-neg-modular: $(TARGET) build
+test-namespace-collisions-neg-modular: $(TARGET) bin-kai build
 	@$(call nscol_axis,neg-modular)
 
 # ASAN over the memory-corruption members of the corpus: a homonymous
 # constructor makes one module read a slot the other emitted with a
 # different payload type. A clean run on macOS proves nothing about the
 # Linux leak check, so this target gates on sanitizer diagnostics only.
-test-namespace-collisions-asan: $(TARGET) build
+test-namespace-collisions-asan: $(TARGET) bin-kai build
 	@$(call nscol_axis,asan)
 
 # `kai test` path: two tests at the same line:col in different modules
 # mint the same enclosing-function name, so lambdas lifted out of their
 # bodies collide as duplicate C symbols.
-test-namespace-collisions-testsym: $(TARGET) build
+test-namespace-collisions-testsym: $(TARGET) bin-kai build
 	@$(call nscol_axis,testsym)
 
 # `kai check` path: protocol law checks are generated per impl, and an
 # `axiom` exemption declared in one module must not silence the
 # homonymous protocol's impl in another.
-test-namespace-collisions-check: $(TARGET) build
+test-namespace-collisions-check: $(TARGET) bin-kai build
 	@$(call nscol_axis,check)
 
 # Diagnostic quality. A message that merely EXISTS is not enough: an
@@ -12338,7 +12338,7 @@ test-namespace-collisions-check: $(TARGET) build
 # class has to reach. Each line of `DIAG.expected` is a substring the
 # emitted diagnostic must contain. The program may compile (today's
 # ambiguity is a warning); what is asserted is the message.
-test-namespace-collisions-diag: $(TARGET) build core-cache-warm
+test-namespace-collisions-diag: $(TARGET) bin-kai build core-cache-warm
 	@$(call nscol_axis,diag)
 
 # A contested declaration is keyed by a home-spelled name (`Item__da`)
@@ -12347,7 +12347,7 @@ test-namespace-collisions-diag: $(TARGET) build core-cache-warm
 # it. Scanned over every c and neg fixture's stderr rather than over the
 # goldens, which pin only the lines they assert. Not ratcheted: one hit
 # fails the target.
-test-namespace-collisions-nohomespell: $(TARGET) build core-cache-warm
+test-namespace-collisions-nohomespell: $(TARGET) bin-kai build core-cache-warm
 	@$(NSCOL_RUN) nohomespell build/nscol-nohomespell.log; \
 	if grep -q '^namespace-collisions-nohomespell FAIL ' build/nscol-nohomespell.log; then \
 	  echo "namespace-collisions-nohomespell FAIL — a home-spelled name reached user-facing text"; \
