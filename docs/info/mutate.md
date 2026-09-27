@@ -132,8 +132,8 @@ kai mutate --apply 4 --module src/planner.kai        # that module with site 4 a
 ```
 
 `--list --json` prints one JSON object per line, one line per site, in
-the order `--list` walks the modules; `--operator` narrows it as it
-narrows the text listing. Each record carries enough to diff, cache and
+the order `--list` walks the modules; `--operator` narrows it and
+`--limit` caps it across modules, as they do the text listing. Each record carries enough to diff, cache and
 suppress the site without re-reading the source. For this `greet.kai`:
 
 ```kaikai
