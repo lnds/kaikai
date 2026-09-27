@@ -84,6 +84,19 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.127.0 (2026-09-27)
+
+### Added
+
+- **stdlib**: add net.unix, Unix-domain stream sockets (#2197)
+
+### Fixed
+
+- **emit**: evaluate multi-operand forms left to right in the C backend (#2194)
+- **build**: follow scripts in the bin/kai prerequisite audit (#2198)
+- **resolve**: warn about a shadowed handler alias only when a clause reads it (#2192)
+- **typer**: keep effect rows across |> calls and function-typed record fields (#2191)
+
 ## v0.126.0 (2026-09-26)
 
 ### Added
