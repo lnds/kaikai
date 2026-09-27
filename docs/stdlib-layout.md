@@ -276,10 +276,11 @@ stdlib/
   random.kai     effect: Random (top-level module — shipped)
   random_secure.kai  effect: SecureRandom (top-level — shipped via PR #144, closes #140)
   log.kai        effect: Log (top-level module — shipped via PR #145, closes #141)
-  net/           effects: NetTcp + NetUdp + NetDns all shipped; alias `Net = NetTcp + NetUdp + NetDns` now definable (follow-up adds the row alias)
+  net/           effects: NetTcp + NetUdp + NetDns + NetUnix all shipped; alias `Net = NetTcp + NetUdp + NetDns` now definable (follow-up adds the row alias)
     tcp.kai      uses NetTcp (shipped — v1; R2 reactor flipped NetTcp to fiber-parking 2026-05-16 via #630; see effects-stdlib.md sidebar)
     udp.kai      uses NetUdp (shipped — v1 datagram UDP via #354; blocking ops, IPv4 only; `bind`/`send`/`recv`/`close`/`local_port`/`addr`)
     dns.kai      uses NetDns (shipped — issue #352; `resolve`/`resolve_first`/`with_dns`; getaddrinfo shim, IPv4-only, blocking on the OS thread in v1)
+    unix.kai     uses NetUnix (shipped — issue #2186; Unix-domain stream sockets: `listen(path, mode)` race-free mode, `peer_uid`, `close_listener`; fd ops park like NetTcp)
     url.kai      pure URL parsing (planned — folded into http.kai parser today)
     http.kai     (shipped, client only — `http_get/post/put/delete/request`; uses NetTcp + Cancel; still uses libc `getaddrinfo` via NetTcp.connect's implicit path — splitting resolve→connect onto NetDns is the #352 follow-up, not yet done)
   encoding/      pure, stage 2
@@ -497,13 +498,14 @@ security-sensitive code paths.
 - `random_secure` — `int`, `bytes`, cryptographic-grade primitives;
   not seedable
 
-### net (`/ NetTcp`, `/ NetUdp`, `/ NetDns` all shipped)
+### net (`/ NetTcp`, `/ NetUdp`, `/ NetDns`, `/ NetUnix` all shipped)
 
 > **v1 caveat (2026-06-06).** All three leaves of the `Net = NetTcp + NetUdp + NetDns` alias now exist as builtins with runtime handlers and module files — `NetTcp` (#68), `NetUdp` (#354), `NetDns` (#352). The alias is therefore definable; a follow-up lane adds the row alias to `stdlib/effects.kai`. See `docs/effects-stdlib.md` §`NetTcp`, `NetUdp`, `NetDns` v1-status sidebars for reactor + per-effect status.
 
 - `net.tcp` — `connect`, `listen`, `accept`, read/write *(shipped — PR #68; R2 reactor flipped the default handler to fiber-parking via `poll()` 2026-05-16, issue #630 — every blocking op parks the fiber, never the OS thread)*
 - `net.udp` — `bind`, `send`, `recv`, `close`, plus pure `local_port` / `addr` *(shipped — issue #354; v1 datagram UDP over POSIX `SOCK_DGRAM`, blocking ops, IPv4 only; the m8.x reactor lifts NetTcp + NetUdp together)*
 - `net.dns` — `resolve`, `resolve_first`, `with_dns` *(shipped — issue #352; `getaddrinfo(3)` shim, IPv4-only, blocking on the OS thread in v1; `resolve_all` / `reverse_lookup` deferred — reverse DNS is a separate proposal per #352)*
+- `net.unix` — `NetUnix` effect (`listen`, `connect`, `accept`, `send`, `recv`, `recv_timeout`, `peer_uid`, `close`, `close_listener`) plus `listen` and the `owner_only` mode *(shipped — issue #2186; the socket file is created already carrying its mode, `peer_uid` reads `SO_PEERCRED` / `LOCAL_PEERCRED`, stale sockets are replaced and live ones refused; the fd-level ops reuse the NetTcp handlers, so they park the fiber)*
 - `net.url` — pure: `parse`, `format`, `join`, `query_*` *(planned — `http_parse_url` exists inside `net/http.kai` as a private helper but is not exposed as a `net.url` module)*
 - `net.http` — client surface (stable): `http_get`, `http_post`, `http_put`, `http_delete`, `http_request` *(shipped, `/ NetTcp + Cancel`)*; headers, body, timeouts available via the request builder. Automatic redirect following on top of the existing single-call surface: `RedirectPolicy` record, `default_redirect_policy`, `http_follow`, plus the convenience wrappers `http_get_follow` / `http_post_follow` / `http_put_follow` / `http_delete_follow` *(shipped — issue #357)* — RFC 9110 §15.4 method-rewrite rules baked in (303 → GET, 307/308 preserve method/body, 301/302 → GET on POST per browser convention); cross-origin redirects strip Authorization, Proxy-Authorization, Cookie and Cookie2 case-insensitively; same-origin hops preserve them, stripped credentials never return on later hops, and Host overrides are removed on every hop. Cookie persistence remains deferred. The bare `http_request` keeps its single-call semantics so callers wanting explicit 3xx control are unaffected. Uses libc `getaddrinfo` for DNS (no `NetDns` effect yet). Server-side helpers (`#[unstable]`): `http_parse_request`, `http_serialize_response`, `http_status_reason` (pure), and `http_read_request` (`/ NetTcp`) *(shipped — issue #605)* — minimal primitives for hand-rolled HTTP/1.1 servers. The wire helpers reuse the client-side internals (`http_str_index`, `http_parse_header_lines`, `http_format_headers`, `http_header_lookup`); the convenience read loop is the only NetTcp-touching addition.
 

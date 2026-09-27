@@ -29,6 +29,7 @@ and used by the stdlib sparingly.
 | `NetTcp`        | TCP byte-level networking                     | yes (runtime, if in `main`'s row) |
 | `NetUdp`        | UDP byte-level networking                     | yes (runtime, if in `main`'s row) |
 | `NetDns`        | DNS resolution                                | yes (runtime, if in `main`'s row) |
+| `NetUnix`       | Unix-domain stream sockets                    | yes (runtime, if in `main`'s row) |
 | `Process`       | OS-level process spawn, wait, exit            | yes (runtime, if in `main`'s row) |
 | `Signal`        | trap POSIX signals on the running process     | yes (runtime, if in `main`'s row) — Posix only in v1 |
 | `State[T]`      | value-threaded mutable state                  | no (user supplies)    |
@@ -1014,9 +1015,6 @@ let r = with_dns(stub, () => resolve_first("anything"))
   String]`. Lands as a separate `Tls` effect, not as new
   `NetTcp` ops, because the configuration surface (cert chains,
   SNI, ALPN) is large enough to warrant its own design.
-- Unix domain sockets: `uds_connect`, `uds_listen`. Same shape
-  as TCP, deferred until a use case demands them. Likely a
-  fourth `NetUds` effect under the same `Net` alias.
 - Raw / packet sockets: out of scope for stdlib; FFI is the
   right tool for such low-level work.
 - HTTP/2 and HTTP/3: the `net.http` stdlib module ships
@@ -1037,6 +1035,75 @@ remain a `manutara` concern. The wire helpers are the only
 non-`NetTcp.recv`-shaped surface; everything that reads bytes off a
 `Conn` still goes through the v1 blocking default handler, with
 the same caveats pinned in the v1-status sidebar above.
+
+## `NetUnix`
+
+### Declaration
+
+```kai
+effect NetUnix {
+  listen(path: String, mode: Int)               : Result[Listener, String]
+  connect(path: String)                         : Result[Conn, String]
+  accept(l: Listener)                           : Result[Conn, String]
+  send(c: Conn, data: [Int])                    : Result[Int, String]
+  recv(c: Conn, max: Int)                       : Result[[Int], String]
+  recv_timeout(c: Conn, max: Int, nanos: Int)   : Option[Result[[Int], String]]
+  peer_uid(c: Conn)                             : Result[Int, String]
+  close(c: Conn)                                : Unit
+  close_listener(l: Listener)                   : Unit
+}
+```
+
+Unix-domain stream sockets, declared with their `Conn` / `Listener`
+handles in `stdlib/net/unix.kai` (`import net.unix`). The op set is
+`NetTcp`'s with a path in place of host and port, so code written
+against one moves to the other almost unchanged. It is a capability
+of its own: a local daemon carries `/ NetUnix` and is statically
+unable to open an IP socket.
+
+### What the family adds over TCP
+
+- **Access control is the filesystem's.** `listen(path, mode)` creates
+  the socket file already carrying `mode` (`owner_only` is `0600`).
+  The socket is bound inside a fresh `0700` directory beside `path`,
+  given its mode, and only then `link(2)`ed into place, so no client
+  can reach it through a wider mode first. The process umask is not
+  involved — it is process-wide and would race the other scheduler
+  threads. `connect` needs write permission on the socket file, which
+  the kernel checks before a byte is exchanged.
+- **Peer identity.** `peer_uid(c)` returns the effective uid of the
+  process on the other end as the kernel recorded it at connect time
+  (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS) — nothing the
+  peer sends can forge it.
+- **The socket is a file.** It outlives the process that created it,
+  so the family carries its cleanup: `close_listener` closes the
+  listener and unlinks its socket file, and `listen` replaces a socket
+  at `path` that nobody listens on (the leftover of a crash). Both
+  check the filesystem node first: `close_listener` never removes a
+  socket another process has since put at the same path, and `listen`
+  never removes a live socket (`Err("Address already in use")`) or a
+  file that is not a socket (`Err("File exists")`). Telling a live
+  socket from a stale one takes a connect, so the live server sees
+  one connection that closes without data.
+
+### Error model
+
+Same as `NetTcp`: every op except `close` / `close_listener` returns
+`Result[_, String]` carrying the OS error text. `path` must fit the
+platform's `sun_path` (104 bytes on macOS, 108 on Linux), and so must
+the private path the socket is bound at first — `path`'s directory
+plus 12 bytes. A name shorter than 12 bytes in a directory near the
+limit therefore returns `Err` even though `path` itself would fit.
+
+### Default handler
+
+Runtime-installed around `main` when `NetUnix` is in the row.
+`accept`, `send`, `recv`, `recv_timeout` and `close` bridge to the
+`NetTcp` handlers — past `listen` / `connect` they only see a
+non-blocking fd — so they park the fiber on the reactor exactly as
+TCP does, and several fibers can accept on one listener. `connect`
+parks on a short timer while a full backlog answers `EAGAIN`.
+Abstract-namespace (Linux) and datagram Unix sockets are not covered.
 
 ## `Process`
 

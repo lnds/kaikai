@@ -1,0 +1,130 @@
+# NetUnix end to end: the socket file carries its mode on
+# disk, several fibers accept on one listener, peer_uid matches the
+# real uid of the connecting process, and close_listener / listen
+# only ever remove a socket file that is theirs or stale.
+#
+# Every child process (`ls`, `id`) runs before the first print: a
+# block-buffered stdout would otherwise be flushed twice across fork.
+
+import net.unix
+import spawn
+import os.process
+import fs.file
+
+fn capture(cmd: String, args: [String]) : String / Process =
+  match process.pipe_from(cmd, args) {
+    Err(e) -> "start FAIL: #{e}"
+    Ok(c)  -> {
+      let out = match process.read_all(c) { Ok(s) -> s  Err(e) -> "read FAIL: #{e}" }
+      let _ = process.wait(c)
+      out
+    }
+  }
+
+fn serve_one(l: Listener) : Int / NetUnix =
+  match NetUnix.accept(l) {
+    Err(_) -> -1
+    Ok(s)  -> {
+      let uid = match NetUnix.peer_uid(s) { Ok(u) -> u  Err(_) -> -1 }
+      let r = match NetUnix.recv(s, 16) {
+        Ok([b, ..._rest]) -> match NetUnix.send(s, [b + 1]) { Ok(_) -> uid  Err(_) -> -1 }
+        _                 -> -1
+      }
+      NetUnix.close(s)
+      r
+    }
+  }
+
+fn ask(path: String, b: Int) : Int / NetUnix =
+  match NetUnix.connect(path) {
+    Err(_) -> -1
+    Ok(c)  -> {
+      let _ = NetUnix.send(c, [b])
+      let got = match NetUnix.recv(c, 16) { Ok([r, ..._rest]) -> r  _ -> -1 }
+      NetUnix.close(c)
+      got
+    }
+  }
+
+fn show(xs: [Int]) : String = (xs | (x => "#{x}")).join(" ")
+
+fn fan_out(l: Listener, path: String, uid: String) : Unit / NetUnix + Spawn + Stdout = {
+  let got = nursery { n ->
+    let servers = [1, 2, 3] | (_i => n.spawn(() => serve_one(l)))
+    let clients = [10, 20, 30] | (b => n.spawn(() => ask(path, b)))
+    let replies = clients | (f => n.await(f))
+    let uids = servers | (f => n.await(f))
+    [replies, uids]
+  }
+  match got {
+    [replies, uids] -> {
+      Stdout.print("3 fibers accepted, replies: #{show(replies)}")
+      match uids |? (u => "#{u}\n" != uid) {
+        [] -> Stdout.print("peer_uid matches id -u")
+        _  -> Stdout.print("peer_uid FAIL: #{show(uids)} vs #{uid}")
+      }
+    }
+    _ -> Stdout.print("fan-out FAIL")
+  }
+}
+
+fn refuse_live(l: Listener, path: String) : Unit / NetUnix + Stdout = {
+  match listen(path, owner_only) {
+    Ok(l2) -> { Stdout.print("live path FAIL: taken over"); NetUnix.close_listener(l2) }
+    Err(e) -> Stdout.print("live path refused: #{e}")
+  }
+  match NetUnix.accept(l) {
+    Ok(probe) -> { Stdout.print("liveness probe drained"); NetUnix.close(probe) }
+    Err(e)    -> Stdout.print("probe FAIL: #{e}")
+  }
+}
+
+fn check_close(l: Listener, path: String, moved: String) : Unit / NetUnix + File + Stdout = {
+  let _ = file.rename(path, moved)
+  match listen(path, owner_only) {
+    Err(e) -> Stdout.print("relisten FAIL: #{e}")
+    Ok(newer) -> {
+      NetUnix.close_listener(l)
+      match NetUnix.connect(path) {
+        Ok(c)  -> { Stdout.print("close_listener spared a newer socket"); NetUnix.close(c) }
+        Err(e) -> Stdout.print("close_listener FAIL: #{e}")
+      }
+      match listen(moved, owner_only) {
+        Err(e) -> Stdout.print("stale FAIL: #{e}")
+        Ok(revived) -> { Stdout.print("stale socket replaced"); NetUnix.close_listener(revived) }
+      }
+      NetUnix.close_listener(newer)
+      if file.exists(path) or file.exists(moved) { Stdout.print("cleanup FAIL: socket file left") }
+      else { Stdout.print("close_listener removed its socket") }
+    }
+  }
+}
+
+fn check_regular_file(path: String) : Unit / NetUnix + File + Stdout = {
+  let _ = file.write(path, "keep")
+  match listen(path, owner_only) {
+    Ok(l)  -> { Stdout.print("regular file FAIL: replaced"); NetUnix.close_listener(l) }
+    Err(e) -> Stdout.print("regular file refused: #{e}")
+  }
+  if file.read(path) == "keep" { Stdout.print("regular file left alone") }
+  else { Stdout.print("regular file FAIL: modified") }
+  let _ = file.delete(path)
+}
+
+fn main() : Int / NetUnix + Spawn + Process + File + Random + Stdout = {
+  let base = "/tmp/kai-unix-#{Random.int_range(0, 1000000000)}"
+  let path = "#{base}.sock"
+  match listen(path, owner_only) {
+    Err(e) -> { Stdout.print("listen FAIL: #{e}"); 1 }
+    Ok(l) -> {
+      let mode = string_slice(capture("ls", ["-l", path]), 0, 10)
+      let uid = capture("id", ["-u"])
+      Stdout.print("listen ok, on disk: #{mode}")
+      refuse_live(l, path)
+      fan_out(l, path, uid)
+      check_close(l, path, "#{base}.moved")
+      check_regular_file("#{base}.file")
+      0
+    }
+  }
+}

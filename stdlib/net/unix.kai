@@ -1,0 +1,76 @@
+#[doc("""
+The `NetUnix` effect: Unix-domain stream sockets, the local-only
+sibling of `net.tcp`. `import net.unix`.
+
+A server is reached through a path in the filesystem instead of a
+port, so the filesystem's permissions decide who may connect and
+`peer_uid` tells the server who did. The op set mirrors `NetTcp`:
+bytes as `[Int]`, Ok-first `Result`, and blocking ops park the fiber,
+not the OS thread.
+""")]
+
+#[doc("Opaque Unix-socket connection handle. The `fd` is the OS socket descriptor, read by the runtime.")]
+pub type Conn = { priv fd: Int }
+
+#[doc("""
+Opaque Unix-socket listener handle: the descriptor plus the path and
+filesystem node `listen` created, which `close_listener` checks before
+removing the file.
+""")]
+pub type Listener = { priv fd: Int, priv path: String, priv dev: Int, priv ino: Int }
+
+#[doc("""
+Byte-level Unix-domain stream sockets. `listen` / `connect` /
+`accept` open handles; `send` / `recv` / `recv_timeout` / `close`
+behave exactly as in `NetTcp`. `peer_uid` reads the effective uid of
+the process on the other end as the kernel recorded it at connect
+time — nothing the peer sends can forge it. `close_listener` closes a
+listener and removes its socket file. The default handler bridges
+each op to the runtime's sockets.
+""")]
+pub effect NetUnix {
+  listen(path: String, mode: Int) : Result[Listener, String]
+  connect(path: String) : Result[Conn, String]
+  accept(l: Listener) : Result[Conn, String]
+  send(c: Conn, data: [Int]) : Result[Int, String]
+  recv(c: Conn, max: Int) : Result[[Int], String]
+  recv_timeout(c: Conn, max: Int, nanos: Int) : Option[Result[[Int], String]]
+  peer_uid(c: Conn) : Result[Int, String]
+  close(c: Conn) : Unit
+  close_listener(l: Listener) : Unit
+  default {
+    listen(path, mode, resume)       -> $extern_handler("kai_default_netunix_listen")
+    connect(path, resume)            -> $extern_handler("kai_default_netunix_connect")
+    accept(l, resume)                -> $extern_handler("kai_default_nettcp_accept")
+    send(c, data, resume)            -> $extern_handler("kai_default_nettcp_send")
+    recv(c, max, resume)             -> $extern_handler("kai_default_nettcp_recv")
+    recv_timeout(c, max, ns, resume) -> $extern_handler("kai_default_nettcp_recv_timeout")
+    peer_uid(c, resume)              -> $extern_handler("kai_default_netunix_peer_uid")
+    close(c, resume)                 -> $extern_handler("kai_default_nettcp_close")
+    close_listener(l, resume)        -> $extern_handler("kai_default_netunix_close_listener")
+  }
+}
+
+#[doc("Permission bits `0600`: only the socket file's owner can connect.")]
+pub const owner_only : Int = 384
+
+#[doc("""
+Create a socket file at `path` carrying the permission bits `mode`
+(`owner_only` for `0600`; kaikai has no octal literal) and listen on it.
+
+The mode holds from the first moment the socket is reachable: it is
+bound inside a fresh `0700` directory beside `path`, given `mode`,
+and only then linked into place — the process umask plays no part.
+A socket already at `path` that nobody listens on is replaced; a live
+one returns `Err("Address already in use")`, and a file that is not a
+socket is never touched. Telling the two apart takes a connect, so
+the live server sees one connection that closes without data.
+
+`path` must fit the platform's `sun_path` (104 bytes on macOS, 108 on
+Linux), and so must the private path the socket is bound at first,
+which is `path`'s directory plus 12 bytes: a name shorter than 12
+bytes in a directory close to the limit returns `Err` even though
+`path` itself would fit.
+""")]
+pub fn listen(path: String, mode: Int) : Result[Listener, String] / NetUnix =
+  NetUnix.listen(path, mode)
