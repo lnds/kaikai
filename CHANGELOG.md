@@ -84,6 +84,32 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.126.0 (2026-09-26)
+
+### Added
+
+- **cli**: honour every flag kai accepts; expose KAI_KAIC2 and --strict-holes (#2185)
+- **mutate**: --list --json emits the site catalogue; --apply prints one mutant (#2176)
+
+### Fixed
+
+- **perceus**: one read table keyed by binder identity (#2169)
+- **typer**: keep Mutable when a caller's cell crosses an abstraction; derive reports tuple reach (#2168)
+- **mutate**: type-check mutants with the package's search paths (#2162)
+- **runtime**: park write_stdin on pipe readiness instead of blocking the thread (#2163)
+- **kir**: keep a swept closure's captures alive through a beta-reduced body (#2153)
+- **perceus**: release a single-read binder on the alternatives that skip its read (#2152)
+- **runtime**: borrow a closure's capture read on the native backend (#2148)
+- **perceus**: release a single-use scalar binder moved into a raw slot (#2139)
+- **emit**: release owned boxed scalars at the box→raw border (#2135)
+- **runtime**: bound the immortal-variant intern table (#2134)
+
+### Changed
+
+- **cache**: hash cache bytes and write tag bytes in the runtime (#2130)
+- **cache**: derive the KAB2 codec from the AST and typed-artifact types (#2119)
+- **stdlib**: move BinSerialize and string.from_bytes onto the block builtins (#2127)
+
 ## v0.125.0 (2026-09-25)
 
 ### Added
