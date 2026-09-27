@@ -1,0 +1,103 @@
+#[doc("""
+Left-to-right operand sequencing for the C emitter.
+
+C leaves the evaluation order of call arguments and initializer-list
+elements unspecified, and gcc on x86_64 evaluates call arguments right to
+left. kaikai evaluates operands left to right, so when two or more operands
+of one C construct may have side effects, each of them but the last is
+bound to a temporary first:
+
+    f(A, B)   ->   ({ __auto_type _q0 = A; f(_q0, B); })
+
+`__auto_type` keeps each operand's C type without the emitter naming it.
+Nested sequencings reuse the `_q<i>` names; each lives in its own
+statement expression, so an inner one shadows an outer one harmlessly.
+""")]
+
+import compiler.util
+
+#[doc("Operands after sequencing: bindings that run first, and the texts to splice in place of the operands.")]
+pub type SeqOps = SeqOps(String, [String])
+
+#[doc("Sequence operand texts left to right; an operand that cannot have side effects stays inline.")]
+pub fn seq_operands(ops: [String]) : SeqOps = seq_bind(ops, 0, seq_last_live(ops, 0, 0 - 1), "", [])
+
+#[doc("The operand texts to splice into the construct, in source order.")]
+pub fn seq_refs(q: SeqOps) : [String] = match q {
+  SeqOps(_, refs) -> refs
+}
+
+#[doc("The operand texts comma-joined, ready to splice into an argument list.")]
+pub fn seq_joined(q: SeqOps) : String = join_with(seq_refs(q), ", ")
+
+#[doc("Reshape each operand text, e.g. into an initializer-list slot, keeping the bindings.")]
+pub fn seq_map_refs(q: SeqOps, f: (String) -> String) : SeqOps = match q {
+  SeqOps(binds, refs) -> SeqOps(binds, map(refs, f))
+}
+
+#[doc("The bindings as C statements, for a construct emitted in statement position.")]
+pub fn seq_binds(q: SeqOps) : String = match q {
+  SeqOps(binds, _) -> binds
+}
+
+#[doc("Wrap a construct built from `seq_refs(q)` so the bindings of `q` run first.")]
+pub fn seq_wrap(q: SeqOps, expr: String) : String = match q {
+  SeqOps(binds, _) -> if binds == "" { expr } else { concat_all(["({ ", binds, expr, "; })"]) }
+}
+
+#[doc("`head`, the comma-joined operands, then `tail`, with the operands evaluated left to right.")]
+pub fn seq_call(head: String, ops: [String], tail: String) : String {
+  let q = seq_operands(ops)
+  seq_wrap(q, concat_all([head, seq_joined(q), tail]))
+}
+
+#[doc("Two operands joined by a C infix operator, evaluated left to right.")]
+pub fn seq_infix(a: String, op: String, b: String) : String {
+  let q = seq_operands([a, b])
+  match seq_refs(q) {
+    [ra, rb] -> seq_wrap(q, concat_all(["(", ra, " ", op, " ", rb, ")"]))
+    _ -> concat_all(["(", a, " ", op, " ", b, ")"])
+  }
+}
+
+fn seq_bind(ops: [String], i: Int, last: Int, binds: String, refs: [String]) : SeqOps = match ops {
+  [] -> SeqOps(binds, list_reverse(refs))
+  [op, ...rest] ->
+    if i < last and (not seq_inert(op)) {
+      let t = concat_all(["_q", int_to_string(i)])
+      let bind = concat_all(["__auto_type ", t, " = ", op, "; "])
+      seq_bind(rest, i + 1, last, string_concat(binds, bind), [t, ...refs])
+    } else {
+      seq_bind(rest, i + 1, last, binds, [op, ...refs])
+    }
+}
+
+fn seq_last_live(ops: [String], i: Int, last: Int) : Int = match ops {
+  [] -> last
+  [op, ...rest] -> seq_last_live(rest, i + 1, if seq_inert(op) { last } else { i })
+}
+
+# A name, a literal, or a literal boxed by a pure constructor. Anything
+# else may call out, including a Perceus dup or drop, whose order against
+# a sibling that consumes the same value is load-bearing.
+fn seq_inert(op: String) : Bool =
+  if op == "kai_nil()" or op == "kai_unit()" or op == "(KaiValue *)0" {
+    true
+  } else {
+    string_index_of_char(seq_unbox(op, seq_pure_boxes()), '(') < 0
+  }
+
+fn seq_pure_boxes() : [String] =
+  ["kai_int(", "kai_bool(", "kai_char(", "kai_real(", "kai_str_from_bytes("]
+
+fn seq_unbox(op: String, boxes: [String]) : String = match boxes {
+  [] -> op
+  [b, ...rest] -> {
+    let n = string_length(b)
+    if string_length(op) > n and string_slice(op, 0, n) == b {
+      string_slice(op, n, string_length(op) - n)
+    } else {
+      seq_unbox(op, rest)
+    }
+  }
+}

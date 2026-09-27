@@ -81,6 +81,7 @@ import compiler.protos
 import compiler.emit_shared
 import compiler.emit_cache
 import compiler.emit_reuse_donate
+import compiler.emit_seq
 import compiler.vec_raw
 import compiler.ffi_v2
 import compiler.emit_ffi_c
@@ -1453,26 +1454,18 @@ fn unop_cname(op: String) : Option[String] {
   else { None }
 }
 
-fn emit_call_args(src: String, args_e: [Expr], cx: EmitCtx) : String / Console =
+fn emit_arg_vals(src: String, args_e: [Expr], cx: EmitCtx) : [String] / Console =
+  map(args_e, (a) => emit_expr(src, a, cx))
 
-  join_with(map(args_e, (a) => emit_expr(src, a, cx)), ", ")
-
-# Phase 3 unboxing — emit each call argument as a raw C scalar
-# matching the UFn signature's slot ty. `emit_expr_raw` falls back
-# to the boxed-then-unbox boundary form if the arg is MBoxed; for
-# raw children (literal / EVar to a raw param / nested UFn call /
-# raw arith) it emits the native scalar directly. The result is
-# the comma-joined argument list ready for the call site.
-
-# Phase 3 unboxing — emit each call argument as a raw C scalar
-# matching the UFn signature's slot ty. `emit_expr_raw` falls back
-# to the boxed-then-unbox boundary form if the arg is MBoxed; for
-# raw children (literal / EVar to a raw param / nested UFn call /
-# raw arith) it emits the native scalar directly. The result is
-# the comma-joined argument list ready for the call site.
-fn emit_call_args_raw(src: String, args_e: [Expr], cx: EmitCtx) : String / Console =
-
-  join_with(map(args_e, (a) => emit_expr_raw(src, a, cx)), ", ")
+# `<apply>fc, n, (KaiValue *[]){args})`, the callee evaluated before its args.
+fn emit_apply_seq(apply: String, fc: String, args: [String]) : String {
+  let q = seq_operands([fc, ...args])
+  match seq_refs(q) {
+    [rf, ...ra] -> seq_wrap(q, concat_all([apply, rf, ", ", int_to_string(list_length(ra)),
+                                           ", (KaiValue *[]){", join_with(ra, ", "), "})"]))
+    [] -> "kai_unit() /* apply: no callee */"
+  }
+}
 
 # Mixed-param lane (issue #440 follow-up) — marshal each call argument
 # per the callee's raw mask: a raw slot emits `emit_expr_raw` (a raw
@@ -1480,8 +1473,8 @@ fn emit_call_args_raw(src: String, args_e: [Expr], cx: EmitCtx) : String / Conso
 # normal boxed `KaiValue *` path, with Perceus's dup/drop intact). The
 # mask comes from the callee's UFnSig; args past the mask (defensive)
 # default to raw, matching the all-raw signature shape.
-fn emit_call_args_masked(src: String, args_e: [Expr], mask: [Bool], cx: EmitCtx) : String / Console =
-  join_with(emit_call_args_masked_each(src, args_e, mask, cx, []), ", ")
+fn emit_arg_vals_masked(src: String, args_e: [Expr], mask: [Bool], cx: EmitCtx) : [String] / Console =
+  emit_call_args_masked_each(src, args_e, mask, cx, [])
 
 fn emit_call_args_masked_each(src: String, args_e: [Expr], mask: [Bool], cx: EmitCtx, acc: [String]) : [String] / Console {
   match args_e {
@@ -1522,7 +1515,7 @@ fn rp_arg_mask(ptys: [Ty]) : [Bool] = match ptys {
 # Emit a raw-core call: `cname(<marshalled args>)`. The result is a
 # raw scalar consumed in MUnboxed context (no `box_wrap`).
 fn emit_rcore_call(src: String, cname: String, ptys: [Ty], args_e: [Expr], cx: EmitCtx) : String / Console =
-  cat4(cname, "(", emit_call_args_masked(src, args_e, rp_arg_mask(ptys), cx), ")")
+  seq_call(cat2(cname, "("), emit_arg_vals_masked(src, args_e, rp_arg_mask(ptys), cx), ")")
 
 # Emit a single pipe LHS / arg at mask position `i`: raw or boxed.
 fn pipe_arg_masked(src: String, a: Expr, mask: [Bool], i: Int, cx: EmitCtx) : String / Console {
@@ -1589,8 +1582,8 @@ fn emit_op_arg_pass_list(args_e: [Expr], i: Int) : String {
 # Build the `{.ptr = X0}, {.ptr = X1}, ...` slot-list string from a
 # list of arg expressions. Used by the boxed (non-Phase 2) variant
 # constructor path where every slot is a pointer.
-fn emit_call_args_slots(src: String, args_e: [Expr], cx: EmitCtx) : String / Console =
-  join_with(map(args_e, (a) => string_concat("{.ptr = ", string_concat(emit_expr(src, a, cx), "}"))), ", ")
+fn emit_slot_ops(src: String, args_e: [Expr], cx: EmitCtx) : SeqOps / Console =
+  seq_map_refs(seq_operands(emit_arg_vals(src, args_e, cx)), arg_str_as_slot)
 
 # Wrap an already-rendered argument expression as a single boxed slot
 # literal. Used by pipe lowering where the LHS expression is
@@ -1611,15 +1604,15 @@ fn ctor_qual_home(cx: EmitCtx, qual: String, ctor: String) : Option[String] =
   evar_qual_home(cx.variants, qual, ctor)
 
 fn emit_variant_call(home: Option[String], name: String, n_args: Int,
-                        slot_out: String, cx: EmitCtx) : String {
+                        slots: SeqOps, cx: EmitCtx) : String {
   let tag_str = int_to_string(evar_find_tag_arity(cx.variants, home, name, n_args))
   if n_args == 0 {
     concat_all(["kai_variant_u(", tag_str, ", \"", name, "\", 0, 0, NULL)"])
   } else {
-    concat_all([
+    seq_wrap(slots, concat_all([
       emit_variant_ctor(cx), tag_str, ", \"", name, "\", ", int_to_string(n_args),
-      ", 0, (KaiVarSlot[]){", slot_out, "})"
-    ])
+      ", 0, (KaiVarSlot[]){", seq_joined(slots), "})"
+    ]))
   }
 }
 
@@ -1854,9 +1847,9 @@ fn emit_variant_slot_init(src: String, e: Expr, te: TypeExpr,
     # MBoxed) with ty Int must still go through kai_take_int, else a tagged
     # pointer lands in `.i64`. That MODE-vs-ty distinction is the corruption
     # the earlier attempts hit.
-    concat_all(["{.i64 = ", store_raw_int(src, e, cx), "}"])
+    store_raw_int(src, e, cx)
   } else if k == 2 {
-    concat_all(["{.r = kai_take_real(", emit_expr(src, e, cx), ")}"])
+    concat_all(["kai_take_real(", emit_expr(src, e, cx), ")"])
   } else if k == 3 {
     # Enum slot: store the immediate variant_tag. When `e` is a nullary
     # ctor literal (`Red`/`Black`), emit the tag DIRECTLY — skip the
@@ -1867,40 +1860,52 @@ fn emit_variant_slot_init(src: String, e: Expr, te: TypeExpr,
     # non-literal enum expr (a bound variable of enum type) still routes
     # through kai_take_enum to read whatever tag it carries.
     match nullary_ctor_tag(e, cx) {
-      Some(tag) -> concat_all(["{.i64 = ", int_to_string(tag), "}"])
-      None      -> concat_all(["{.i64 = kai_take_enum(", emit_expr(src, e, cx), ")}"])
+      Some(tag) -> int_to_string(tag)
+      None      -> concat_all(["kai_take_enum(", emit_expr(src, e, cx), ")"])
     }
   } else {
-    concat_all(["{.ptr = ", emit_expr(src, e, cx), "}"])
+    emit_expr(src, e, cx)
   }
 }
 
+fn variant_slot_field(te: TypeExpr, cx: EmitCtx) : String {
+  let k = variant_slot_kind(te, cx.enums)
+  if k == 1 or k == 3 { ".i64" } else if k == 2 { ".r" } else { ".ptr" }
+}
+
+# The slot initializers of a typed variant ctor, values sequenced left to
+# right. An arity mismatch against the decl (the typer rejects it earlier)
+# falls back to pointer slots to keep the C compilable.
 fn emit_variant_slot_init_list(src: String, args_e: [Expr], tys: [TypeExpr],
-                               cx: EmitCtx) : String / Console {
+                               cx: EmitCtx) : SeqOps / Console {
+  let q = seq_operands(emit_variant_slot_vals(src, args_e, tys, cx))
+  match q {
+    SeqOps(binds, refs) -> SeqOps(binds, variant_slot_inits(refs, variant_slot_fields(args_e, tys, cx)))
+  }
+}
+
+fn emit_variant_slot_vals(src: String, args_e: [Expr], tys: [TypeExpr], cx: EmitCtx) : [String] / Console =
   match args_e {
-    [] -> ""
+    [] -> []
     [e, ...rest_e] -> match tys {
-      [] -> {
-        # Defensive: arity mismatch between call site and decl; fall
-        # back to pointer slot to keep the C compilable. The typer
-        # would have rejected this earlier.
-        let head = concat_all(["{.ptr = ",
-          emit_expr(src, e, cx), "}"])
-        match rest_e {
-          [] -> head
-          _  -> concat_all([head, ", ",
-            emit_variant_slot_init_list(src, rest_e, [], cx)])
-        }
-      }
-      [t, ...rest_t] -> {
-        let head = emit_variant_slot_init(src, e, t, cx)
-        match rest_e {
-          [] -> head
-          _  -> concat_all([head, ", ",
-            emit_variant_slot_init_list(src, rest_e, rest_t, cx)])
-        }
-      }
+      []             -> [emit_expr(src, e, cx), ...emit_variant_slot_vals(src, rest_e, [], cx)]
+      [t, ...rest_t] -> [emit_variant_slot_init(src, e, t, cx), ...emit_variant_slot_vals(src, rest_e, rest_t, cx)]
     }
+  }
+
+fn variant_slot_fields(args_e: [Expr], tys: [TypeExpr], cx: EmitCtx) : [String] = match args_e {
+  [] -> []
+  [_, ...rest_e] -> match tys {
+    []             -> [".ptr", ...variant_slot_fields(rest_e, [], cx)]
+    [t, ...rest_t] -> [variant_slot_field(t, cx), ...variant_slot_fields(rest_e, rest_t, cx)]
+  }
+}
+
+fn variant_slot_inits(refs: [String], fields: [String]) : [String] = match refs {
+  [] -> []
+  [r, ...rest] -> match fields {
+    []             -> [concat_all(["{.ptr = ", r, "}"]), ...variant_slot_inits(rest, [])]
+    [f, ...rest_f] -> [concat_all(["{", f, " = ", r, "}"]), ...variant_slot_inits(rest, rest_f)]
   }
 }
 
@@ -1918,7 +1923,7 @@ fn emit_variant_call_typed(home: Option[String], name: String, args_e: [Expr],
   if variant_has_primitive_slot(tys, cx.enums) {
     let n = list_length(args_e)
     let mask = variant_slot_mask(tys, cx.enums)
-    let slot_inits = emit_variant_slot_init_list(src, args_e, tys, cx)
+    let slots = emit_variant_slot_init_list(src, args_e, tys, cx)
     let tag_str = int_to_string(evar_find_tag_arity(cx.variants, home, name, n))
     # Outside a region, a primitive-slot ctor goes through the inlined
     # `kai_variant_u_fast(tag, n, slots)`: alloc + slot stores only. Its
@@ -1928,16 +1933,16 @@ fn emit_variant_call_typed(home: Option[String], name: String, args_e: [Expr],
     # region the arena ctor owns the alloc (cells die with the arena, not
     # via RC) and keeps the full (tag,name,n,mask,slots) call shape.
     if cx.in_region {
-      Some(concat_all([
+      Some(seq_wrap(slots, concat_all([
         emit_variant_ctor(cx), tag_str, ", \"", name, "\", ", int_to_string(n),
         ", ", int_to_string(mask),
-        ", (KaiVarSlot[]){", slot_inits, "})"
-      ]))
+        ", (KaiVarSlot[]){", seq_joined(slots), "})"
+      ])))
     } else {
-      Some(concat_all([
+      Some(seq_wrap(slots, concat_all([
         "kai_variant_u_fast(", tag_str, ", ", int_to_string(n),
-        ", (KaiVarSlot[]){", slot_inits, "})"
-      ]))
+        ", (KaiVarSlot[]){", seq_joined(slots), "})"
+      ])))
     }
   } else {
     None
@@ -1964,20 +1969,20 @@ fn emit_arena_variant_rebuild(src: String, cname: String, cargs: [Expr], n: Int,
     match tys_opt {
       Some(ts) -> {
         let mask = variant_slot_mask(ts, cx.enums)
-        let slot_inits = emit_variant_slot_init_list(src, cargs, ts, cx)
-        concat_all([
+        let slots = emit_variant_slot_init_list(src, cargs, ts, cx)
+        seq_wrap(slots, concat_all([
           "kai_arena_variant(", tag_str, ", \"", cname, "\", ", int_to_string(n),
-          ", ", int_to_string(mask), ", (KaiVarSlot[]){", slot_inits, "})"
-        ])
+          ", ", int_to_string(mask), ", (KaiVarSlot[]){", seq_joined(slots), "})"
+        ]))
       }
       None -> "kai_unit() /* arena reuse: typed lookup vanished */"
     }
   } else {
-    let slot_strs = emit_call_args_slots(src, cargs, cx)
-    concat_all([
+    let slots = emit_slot_ops(src, cargs, cx)
+    seq_wrap(slots, concat_all([
       "kai_arena_variant(", tag_str, ", \"", cname, "\", ", int_to_string(n),
-      ", 0, (KaiVarSlot[]){", slot_strs, "})"
-    ])
+      ", 0, (KaiVarSlot[]){", seq_joined(slots), "})"
+    ]))
   }
 }
 
@@ -2001,7 +2006,7 @@ fn emit_reuse_variant_body(src: String, cname: String, cargs: [Expr],
     match tys_opt {
       Some(ts) -> {
         let mask = variant_slot_mask(ts, cx.enums)
-        let slot_inits = emit_variant_slot_init_list(src, cargs, ts, cx)
+        let slots = emit_variant_slot_init_list(src, cargs, ts, cx)
         let tag_str = int_to_string(evar_find_tag_arity(cx.variants, None, cname, n))
         # Koka reuse-in-place for typed cells too (the rb-tree's RBNode
         # carries Int slots). kai_variant_reuse_at donates the consumed
@@ -2009,11 +2014,11 @@ fn emit_reuse_variant_body(src: String, cname: String, cargs: [Expr],
         # allocates fresh — it writes the full KaiVarSlot words so the
         # primitive `.i64`/`.r` slots are stored correctly, unlike the
         # old kai_reuse_or_alloc_variant which assumed mask==0.
-        concat_all([
+        seq_wrap(slots, concat_all([
           "kai_variant_reuse_at(_scr, ", tag_str, ", \"", cname, "\", ", int_to_string(n),
           ", ", int_to_string(mask),
-          ", (KaiVarSlot[]){", slot_inits, "})"
-        ])
+          ", (KaiVarSlot[]){", seq_joined(slots), "})"
+        ]))
       }
       None -> "kai_unit() /* __perceus_reuse_variant: typed lookup vanished */"
     }
@@ -2024,13 +2029,13 @@ fn emit_reuse_variant_body(src: String, cname: String, cargs: [Expr],
       "\", 0, 0, NULL)"
     ])
   } else {
-    let slot_strs = emit_call_args_slots(src, cargs, cx)
+    let slots = emit_slot_ops(src, cargs, cx)
     let tag_str = int_to_string(evar_find_tag_arity(cx.variants, None, cname, n))
-    concat_all([
+    seq_wrap(slots, concat_all([
       "kai_reuse_or_alloc_variant(_scr, ", tag_str, ", \"", cname,
       "\", ", int_to_string(n),
-      ", 0, (KaiVarSlot[]){", slot_strs, "})"
-    ])
+      ", 0, (KaiVarSlot[]){", seq_joined(slots), "})"
+    ]))
   }
 }
 
@@ -2066,11 +2071,7 @@ fn emit_mark_call(src: String, m: Mark, args_e: [Expr], cx: EmitCtx) : String / 
     # (no closure decref), so the caller keeps the ref and drops after its
     # last use. The remaining args keep the owned convention.
     MkApplyBorrow -> match args_e {
-      [fv, ...rest] -> concat_all([
-        "kai_apply_borrow(", emit_expr(src, fv, cx), ", ",
-        int_to_string(list_length(rest)),
-        ", (KaiValue *[]){", emit_call_args(src, rest, cx), "})"
-      ])
+      [fv, ...rest] -> emit_apply_seq("kai_apply_borrow(", emit_expr(src, fv, cx), emit_arg_vals(src, rest, cx))
       _ -> "kai_unit() /* apply borrow: expected closure + args */"
     }
     # A non-modulo-cons tail leaf: plug the leaf value into the open cctx
@@ -2226,16 +2227,14 @@ fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Opti
       if list_has(cx.lcs, callee) { None }
       else { match efn_resolve_sym(cx.fns, ec_callee_sym(f), callee, cx.root_mod) {
         Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) -> {
-          let raw_args = emit_call_args_masked(src, args_e, mask, cx)
-          let raw_call = emit_user_call(c_sym(callee, mo), raw_args, cx)
+          let raw_call = emit_user_call_seq(c_sym(callee, mo), emit_arg_vals_masked(src, args_e, mask, cx), cx)
           Some(ufn_call_result(rt, raw_call))
         }
         _ -> None
       } }
     EModCall(mod, fname) -> match lookup_ufn_sig(cx.fns, fname, Some(mod)) {
       Some(US(_, rt, mask)) -> {
-        let raw_args = emit_call_args_masked(src, args_e, mask, cx)
-        let raw_call = emit_user_call(c_sym(fname, Some(mod)), raw_args, cx)
+        let raw_call = emit_user_call_seq(c_sym(fname, Some(mod)), emit_arg_vals_masked(src, args_e, mask, cx), cx)
         Some(ufn_call_result(rt, raw_call))
       }
       None -> None
@@ -2256,7 +2255,7 @@ fn ec_callee_sym(f: Expr) : SymId = match f.kind {
 
 fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
 
-  let call_args = emit_call_args(src, args_e, cx)
+  let call_vals = emit_arg_vals(src, args_e, cx)
   # The emitter spells a C identifier from the name, and a resolved
   # reference carries the same one, so the two shapes share this whole
   # dispatch rather than duplicating it.
@@ -2306,11 +2305,9 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           # Writes the new state into the enclosing Ev's `state` slot
           # before resuming. `self` is the clause's first argument.
           [a, ns] -> concat_all([
-            "({ self->state = ",
-            emit_expr(src, ns, cx),
-            "; kai_cont_resume(k, ",
-            emit_expr(src, a, cx),
-            "); })"
+            "({ KaiValue *_rv = ", emit_expr(src, a, cx),
+            "; self->state = ", emit_expr(src, ns, cx),
+            "; kai_cont_resume(k, _rv); })"
           ])
           _   -> "kai_unit() /* resume: arity mismatch (expected 1 or 2 args) */"
         }
@@ -2373,11 +2370,8 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
         # back to `kai_cons` and leaves `_scr` intact for the match
         # exit to reclaim.
         match args_e {
-          [_scr, h, t] -> concat_all([
-            "kai_reuse_or_alloc_cons(_scr, ",
-            emit_expr(src, h, cx), ", ",
-            emit_expr(src, t, cx), ")"
-          ])
+          [_scr, h, t] -> seq_call("kai_reuse_or_alloc_cons(_scr, ",
+                                   [emit_expr(src, h, cx), emit_expr(src, t, cx)], ")")
           _ -> "kai_unit() /* __perceus_reuse_cons: arity mismatch (expected 3 args) */"
         }
       } else if callee == "__perceus_reuse_record" {
@@ -2390,14 +2384,14 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           [_scr, lit] -> match lit.kind {
             ERecordLit(_rec_name, fis) -> {
               let n = list_length(fis)
-              let vals  = join_with(map(fis, (fi) => emit_field_init_val(src, fi, cx)), ", ")
+              let vals  = seq_operands(map(fis, (fi) => emit_field_init_val(src, fi, cx)))
               let names = join_with(map(fis, emit_field_init_name), ", ")
-              concat_all([
+              seq_wrap(vals, concat_all([
                 "kai_reuse_or_alloc_record(_scr, ",
                 int_to_string(n),
-                ", (KaiValue *[]){", vals, "}, (const char *[]){", names, "}, ",
+                ", (KaiValue *[]){", seq_joined(vals), "}, (const char *[]){", names, "}, ",
                 int_to_string(record_kept_mask(fis, 0, 0)), "ULL)"
-              ])
+              ]))
             }
             _ -> "kai_unit() /* __perceus_reuse_record: 2nd arg must be a record literal */"
           }
@@ -2702,9 +2696,9 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
         match evar_payload_tys_arity(cx.variants, None, callee, list_length(args_e)) {
           Some(tys) -> match emit_variant_call_typed(None, callee, args_e, tys, src, cx) {
             Some(s) -> s
-            None    -> emit_named_call_lookup(src, callee, ec_callee_sym(f), args_e, call_args, cx)
+            None    -> emit_named_call_lookup(src, callee, ec_callee_sym(f), args_e, call_vals, cx)
           }
-          None -> emit_named_call_lookup(src, callee, ec_callee_sym(f), args_e, call_args, cx)
+          None -> emit_named_call_lookup(src, callee, ec_callee_sym(f), args_e, call_vals, cx)
         }
       }
     }
@@ -2735,19 +2729,13 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
         match evar_payload_tys_in(cx.variants, chome, fname) {
         Some(tys) -> match emit_variant_call_typed(chome, fname, args_e, tys, src, cx) {
           Some(s) -> s
-          None    -> emit_variant_call(chome, fname, list_length(args_e), emit_call_args_slots(src, args_e, cx), cx)
+          None    -> emit_variant_call(chome, fname, list_length(args_e), emit_slot_ops(src, args_e, cx), cx)
         }
-        None -> emit_variant_call(chome, fname, list_length(args_e), emit_call_args_slots(src, args_e, cx), cx)
+        None -> emit_variant_call(chome, fname, list_length(args_e), emit_slot_ops(src, args_e, cx), cx)
       } }
-      None    -> emit_user_call(c_sym(fname, Some(mod)), call_args, cx)
+      None    -> emit_user_call_seq(c_sym(fname, Some(mod)), call_vals, cx)
     }
-    _ -> {
-      let fc = emit_expr(src, f, cx)
-      concat_all([
-        "kai_apply(", fc, ", ", int_to_string(list_length(args_e)),
-        ", (KaiValue *[]){", call_args, "})"
-      ])
-    }
+    _ -> emit_apply_seq("kai_apply(", emit_expr(src, f, cx), call_vals)
   }
 }
 
@@ -2759,80 +2747,28 @@ fn emit_guard_no_intrinsic_mint(callee: String) : Unit =
     panic(cat2("emit_c: perceus intrinsic leaked to closure apply: ", callee))
   } else { () }
 
-# Shared by emit_pipe_expr's EVar / EModCall branches. Same lookup
-# chain as emit_named_call_lookup but parameterised on a pre-built
-# args string (the pipe LHS is already the first argument).
-#
-# `lcs` makes a local closure shadow a same-named top-level fn: the
-# user wrote `let take = ...` and pipe-called `xs |> take(1)`, the
-# local has to win. When `callee` is in lcs we drop straight to the
-# kai_apply branch over the local C variable; the variant / core
-# / efn lookups only fire for genuinely-global names.
-# Phase 3 unboxing — when `callee` resolves to a UFn entry in the
-# EFn table, the call site swaps to the raw calling convention.
-# `emit_pipe_named_lookup` (and its sibling `emit_named_call_lookup`)
-# stay the gateway for both raw and boxed paths so the lookup
-# discipline (lcs shadowing, variant dispatch, core inlining) is
-# centralised. The raw arg string is built lazily inside the UFn
-# arm via `emit_call_args_raw_pipe` (LHS already raw + the rest).
-# The result of the raw call is itself a raw scalar; the parent
-# emit_expr already wraps it via `box_wrap` when it sees the ECall
-# node tagged MUnboxed (set in `ufn_promote_calls`). We re-wrap
-# here as a defensive identity-on-raw boundary because the pipe
-# path may inline through emit_pipe_expr's match without first
-# going through `emit_expr`.
-
-# Shared by emit_pipe_expr's EVar / EModCall branches. Same lookup
-# chain as emit_named_call_lookup but parameterised on a pre-built
-# args string (the pipe LHS is already the first argument).
-#
-# `lcs` makes a local closure shadow a same-named top-level fn: the
-# user wrote `let take = ...` and pipe-called `xs |> take(1)`, the
-# local has to win. When `callee` is in lcs we drop straight to the
-# kai_apply branch over the local C variable; the variant / core
-# / efn lookups only fire for genuinely-global names.
-# Phase 3 unboxing — when `callee` resolves to a UFn entry in the
-# EFn table, the call site swaps to the raw calling convention.
-# `emit_pipe_named_lookup` (and its sibling `emit_named_call_lookup`)
-# stay the gateway for both raw and boxed paths so the lookup
-# discipline (lcs shadowing, variant dispatch, core inlining) is
-# centralised. The raw arg string is built lazily inside the UFn
-# arm via `emit_call_args_raw_pipe` (LHS already raw + the rest).
-# The result of the raw call is itself a raw scalar; the parent
-# emit_expr already wraps it via `box_wrap` when it sees the ECall
-# node tagged MUnboxed (set in `ufn_promote_calls`). We re-wrap
-# here as a defensive identity-on-raw boundary because the pipe
-# path may inline through emit_pipe_expr's match without first
-# going through `emit_expr`.
-fn emit_pipe_named_lookup(src: String, callee: String, csym: SymId, arity: Int, lhs_c: String, args_e: [Expr], args_all: String, cx: EmitCtx) : String / Console =
+# emit_named_call_lookup's dispatch for a pipe call, over operands that
+# already lead with the piped LHS. A local closure (`lcs`) shadows a
+# same-named top-level fn: `let take = ...; xs |> take(1)` calls the local.
+fn emit_pipe_named_lookup(src: String, callee: String, csym: SymId, vals_all: [String], cx: EmitCtx) : String / Console =
   if list_has(cx.lcs, callee) {
-    concat_all([
-      "kai_apply(", c_local(callee), ", ", int_to_string(arity),
-      ", (KaiValue *[]){", args_all, "})"
-    ])
+    emit_apply_seq("kai_apply(", c_local(callee), vals_all)
   } else { match evar_find(cx.variants, callee) {
-    Some(_) -> {
-      let rest_slots = emit_call_args_slots(src, args_e, cx)
-      let lhs_slot = arg_str_as_slot(lhs_c)
-      let slots_all = if list_length(args_e) == 0 { lhs_slot } else { cat3(lhs_slot, ", ", rest_slots) }
-      emit_variant_call(None, callee, arity, slots_all, cx)
-    }
+    Some(_) -> emit_variant_call(None, callee, list_length(vals_all),
+                                 seq_map_refs(seq_operands(vals_all), arg_str_as_slot), cx)
     # A top-level `fn` the program declares under this name answers
     # before the core table: a declaration shadows the builtin it is
     # spelled like, which is what the typer and the native lowering
     # (`c_sym_of_callee`) already read off this same registry.
     None -> match efn_resolve_sym(cx.fns, csym, callee, cx.root_mod) {
-      Some(EFn(_, _, mo, _, _)) -> emit_user_call(c_sym(callee, mo), args_all, cx)
+      Some(EFn(_, _, mo, _, _)) -> emit_user_call_seq(c_sym(callee, mo), vals_all, cx)
       None -> match core_find(cx.core, callee) {
         Some(ep) -> match ep {
-          EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
+          EP(_, cname, _) -> seq_call(cat2(cname, "("), vals_all, ")")
         }
         None -> {
           emit_guard_no_intrinsic_mint(callee)
-          concat_all([
-            "kai_apply(", c_local(callee), ", ", int_to_string(arity),
-            ", (KaiValue *[]){", args_all, "})"
-          ])
+          emit_apply_seq("kai_apply(", c_local(callee), vals_all)
         }
       }
     }
@@ -2849,28 +2785,18 @@ fn emit_pipe_named_lookup(src: String, callee: String, csym: SymId, arity: Int, 
 # closure-thunk emission from the same lookup chain. `lcs` lets a
 # local closure shadow a same-named top-level fn (see
 # emit_pipe_named_lookup).
-fn emit_named_call_lookup(src: String, callee: String, csym: SymId, args_e: [Expr], call_args: String, cx: EmitCtx) : String / Console =
+fn emit_named_call_lookup(src: String, callee: String, csym: SymId, args_e: [Expr], call_vals: [String], cx: EmitCtx) : String / Console =
   if list_has(cx.lcs, callee) {
-    concat_all([
-      "kai_apply(", c_local(callee), ", ", int_to_string(list_length(args_e)),
-      ", (KaiValue *[]){", call_args, "})"
-    ])
+    emit_apply_seq("kai_apply(", c_local(callee), call_vals)
   } else { match evar_find(cx.variants, callee) {
-    # Issue #440 Phase 2 — variant ctor. The typed emit path is
-    # wired through `emit_call_expr_default` (which has access to
-    # `src` + `lams` + `cls`); this lookup-only helper keeps the
-    # boxed-args shape via emit_call_args_slots so the runtime sees a
-    # uniform `kai_variant_u` call (issue #688 dropped the legacy
-    # `kai_variant`).
+    # Variant ctor with boxed slots; the typed-slot path is taken earlier,
+    # in `emit_call_expr_default`.
     Some(_) -> emit_variant_call(None, callee, list_length(args_e),
-                                 emit_call_args_slots(src, args_e, cx),
+                                 emit_slot_ops(src, args_e, cx),
                                  cx)
-    # KIR Lane 1: a raw core prim (in-process libLLVM C-API) is
-    # checked BEFORE the boxed `core_find`. Its args are raw scalars
-    # (a `TyHandle` is a `void *`), so they marshal through
-    # `emit_call_args_raw`, never the boxed `call_args`; the result is
-    # consumed raw (no `box_wrap`), the call site sitting in MUnboxed
-    # context. This is the vehicle that carries a handle unboxed.
+    # A raw core prim (in-process libLLVM C-API) is checked BEFORE the
+    # boxed `core_find`: its args marshal raw per the prim's param types
+    # (a `TyHandle` is a `void *`) and its result is consumed raw.
     None -> match rcore_find(cx.rcore, callee) {
       Some(RP(_, cname, ptys, _)) -> emit_rcore_call(src, cname, ptys, args_e, cx)
       # A top-level `fn` the program declares under this name answers
@@ -2878,17 +2804,14 @@ fn emit_named_call_lookup(src: String, callee: String, csym: SymId, args_e: [Exp
       # spelled like, which is what the typer and the native lowering
       # (`c_sym_of_callee`) already read off this same registry.
       None -> match efn_resolve_sym(cx.fns, csym, callee, cx.root_mod) {
-        Some(EFn(_, _, mo, _, _)) -> emit_user_call(c_sym(callee, mo), call_args, cx)
+        Some(EFn(_, _, mo, _, _)) -> emit_user_call_seq(c_sym(callee, mo), call_vals, cx)
         None -> match core_find(cx.core, callee) {
           Some(ep) -> match ep {
-            EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
+            EP(_, cname, _) -> seq_call(cat2(cname, "("), call_vals, ")")
           }
           None -> {
             emit_guard_no_intrinsic_mint(callee)
-            concat_all([
-              "kai_apply(", c_local(callee), ", ", int_to_string(list_length(args_e)),
-              ", (KaiValue *[]){", call_args, "})"
-            ])
+            emit_apply_seq("kai_apply(", c_local(callee), call_vals)
           }
         }
       }
@@ -2936,6 +2859,11 @@ fn evf_terminal_slot(eff: String, cx: EmitCtx) : String =
 # evidence frame when the callee carries one. The single funnel every
 # user-fn call site routes through, so the frame is filled consistently;
 # a frameless callee (`frame_slots_of` empty) reduces to the legacy form.
+fn emit_user_call_seq(csym: String, vals: [String], cx: EmitCtx) : String {
+  let q = seq_operands(vals)
+  seq_wrap(q, emit_user_call(csym, seq_joined(q), cx))
+}
+
 fn emit_user_call(csym: String, call_args: String, cx: EmitCtx) : String = {
   # A donation-capable callee has a trailing `_donor` param; EVERY call to
   # it must fill that slot. A call inside an arm-top-reuse body (a live
@@ -2995,35 +2923,19 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Con
 
   match rhs.kind {
     ECall(f, args_e) -> match sym_read_kind(f.kind) {
-      # Phase 3 unboxing — pipe into a UFn callee. The piped LHS
-      # becomes the first arg; both LHS and the trailing args are
-      # emitted raw via `emit_expr_raw`. Without this branch the
-      # default `emit_call_args` produces boxed args and the
-      # `kai_<sym>` call site (which has the raw signature post-
-      # Phase-3) takes `KaiValue *` — a hard C type error caught
-      # by tier1 on `m7d_21_pipe_placeholder_basic`.
+      # Pipe into a UFn callee: the piped LHS is param 0 and every arg
+      # marshals per the raw mask, since the callee's C signature is raw.
       EVar(callee) -> {
         if list_has(cx.lcs, callee) {
-          let lhs_c = emit_expr(src, lhs, cx)
-          let rest_args = emit_call_args(src, args_e, cx)
-          let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
-          emit_pipe_named_lookup(src, callee, ec_callee_sym(f), list_length(args_e) + 1, lhs_c, args_e, args_all, cx)
+          emit_pipe_named_lookup(src, callee, ec_callee_sym(f), emit_pipe_vals(src, lhs, args_e, cx), cx)
         } else { match efn_resolve_sym(cx.fns, ec_callee_sym(f), callee, cx.root_mod) {
           Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) -> {
             # Pipe: LHS is param 0, args_e are params 1+. Marshal each
             # per the mask (mixed-param lane, issue #440 follow-up).
-            let lhs_raw = pipe_arg_masked(src, lhs, mask, 0, cx)
-            let rest_raw = emit_call_args_masked(src, args_e, mask_drop1(mask), cx)
-            let args_all = if list_length(args_e) == 0 { lhs_raw } else { cat3(lhs_raw, ", ", rest_raw) }
-            let raw_call = emit_user_call(c_sym(callee, mo), args_all, cx)
+            let raw_call = emit_user_call_seq(c_sym(callee, mo), emit_pipe_vals_masked(src, lhs, args_e, mask, cx), cx)
             ufn_call_result(rt, raw_call)
           }
-          _ -> {
-            let lhs_c = emit_expr(src, lhs, cx)
-            let rest_args = emit_call_args(src, args_e, cx)
-            let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
-            emit_pipe_named_lookup(src, callee, ec_callee_sym(f), list_length(args_e) + 1, lhs_c, args_e, args_all, cx)
-          }
+          _ -> emit_pipe_named_lookup(src, callee, ec_callee_sym(f), emit_pipe_vals(src, lhs, args_e, cx), cx)
         } }
       }
       # m6.2 Phase 3 / v2: piped qualified call `x |> mod.f(args)`.
@@ -3032,44 +2944,26 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Con
       # routes UFn-classified targets through the raw shape too.
       EModCall(mod, fname) -> match lookup_ufn_sig(cx.fns, fname, Some(mod)) {
         Some(US(_, rt, mask)) -> {
-          let lhs_raw = pipe_arg_masked(src, lhs, mask, 0, cx)
-          let rest_raw = emit_call_args_masked(src, args_e, mask_drop1(mask), cx)
-          let args_all = if list_length(args_e) == 0 { lhs_raw } else { cat3(lhs_raw, ", ", rest_raw) }
-          let raw_call = emit_user_call(c_sym(fname, Some(mod)), args_all, cx)
+          let raw_call = emit_user_call_seq(c_sym(fname, Some(mod)), emit_pipe_vals_masked(src, lhs, args_e, mask, cx), cx)
           ufn_call_result(rt, raw_call)
         }
-        None -> {
-          let lhs_c = emit_expr(src, lhs, cx)
-          let rest_args = emit_call_args(src, args_e, cx)
-          let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
-          emit_user_call(c_sym(fname, Some(mod)), args_all, cx)
-        }
+        None -> emit_user_call_seq(c_sym(fname, Some(mod)), emit_pipe_vals(src, lhs, args_e, cx), cx)
       }
       _ -> {
-        let lhs_c = emit_expr(src, lhs, cx)
         let fc = emit_expr(src, f, cx)
-        let rest_args = emit_call_args(src, args_e, cx)
-        let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
-        concat_all([
-          "kai_apply(", fc, ", ", int_to_string(list_length(args_e) + 1),
-          ", (KaiValue *[]){", args_all, "})"
-        ])
+        emit_apply_seq("kai_apply(", fc, emit_pipe_vals(src, lhs, args_e, cx))
       }
     }
     EVar(callee) -> {
       if list_has(cx.lcs, callee) {
-        let lhs_c = emit_expr(src, lhs, cx)
-        emit_pipe_named_lookup(src, callee, ec_callee_sym(rhs), 1, lhs_c, [], lhs_c, cx)
+        emit_pipe_named_lookup(src, callee, ec_callee_sym(rhs), [emit_expr(src, lhs, cx)], cx)
       } else { match efn_resolve_sym(cx.fns, ec_callee_sym(rhs), callee, cx.root_mod) {
         Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) -> {
           let lhs_raw = pipe_arg_masked(src, lhs, mask, 0, cx)
           let raw_call = emit_user_call(c_sym(callee, mo), lhs_raw, cx)
           ufn_call_result(rt, raw_call)
         }
-        _ -> {
-          let lhs_c = emit_expr(src, lhs, cx)
-          emit_pipe_named_lookup(src, callee, ec_callee_sym(rhs), 1, lhs_c, [], lhs_c, cx)
-        }
+        _ -> emit_pipe_named_lookup(src, callee, ec_callee_sym(rhs), [emit_expr(src, lhs, cx)], cx)
       } }
     }
     # m6.2 Phase 3 / v2: piped qualified-call shorthand `x |> mod.f`
@@ -3086,14 +2980,19 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Con
       }
     }
     _ -> {
-      let lhs_c = emit_expr(src, lhs, cx)
-      concat_all([
-        "kai_apply(", emit_expr(src, rhs, cx),
-        ", 1, (KaiValue *[]){", lhs_c, "})"
-      ])
+      let fc = emit_expr(src, rhs, cx)
+      emit_apply_seq("kai_apply(", fc, [emit_expr(src, lhs, cx)])
     }
   }
 }
+
+# The piped LHS followed by the call's own args, as boxed operands.
+fn emit_pipe_vals(src: String, lhs: Expr, args_e: [Expr], cx: EmitCtx) : [String] / Console =
+  [emit_expr(src, lhs, cx), ...emit_arg_vals(src, args_e, cx)]
+
+# The piped LHS as param 0, then the call's args, each marshalled per the UFn mask.
+fn emit_pipe_vals_masked(src: String, lhs: Expr, args_e: [Expr], mask: [Bool], cx: EmitCtx) : [String] / Console =
+  [pipe_arg_masked(src, lhs, mask, 0, cx), ...emit_arg_vals_masked(src, args_e, mask_drop1(mask), cx)]
 
 fn emit_range_expr(src: String, from: Expr, to: Expr, opt_step: Option[Expr],
                    cx: EmitCtx) : String / Console {
@@ -3101,11 +3000,8 @@ fn emit_range_expr(src: String, from: Expr, to: Expr, opt_step: Option[Expr],
   let a = emit_expr(src, from, cx)
   let b = emit_expr(src, to, cx)
   match opt_step {
-    None -> cat5("kai_range(", a, ", ", b, ")")
-    Some(s) -> {
-      let sc = emit_expr(src, s, cx)
-      concat_all(["kai_range_step(", a, ", ", b, ", ", sc, ")"])
-    }
+    None -> seq_call("kai_range(", [a, b], ")")
+    Some(s) -> seq_call("kai_range_step(", [a, b, emit_expr(src, s, cx)], ")")
   }
 }
 
@@ -3132,39 +3028,49 @@ fn is_perceus_dup_call(e: Expr) : Bool = match e.kind {
   _ -> false
 }
 
+# Every element is sequenced at one level, then the spine is built from
+# the refs: nesting a statement expression per cons would multiply the
+# bracket depth of a long literal.
 fn emit_list_tail(src: String, elems: [ListElem], cx: EmitCtx) : String / Console {
-  # Cons cells built lexically inside a `region { }` bump-allocate into the
-  # arena; outside, ordinary RC `kai_cons`.
-  let cons_c = emit_cons_ctor(cx)
-  match elems {
-    [] -> "kai_nil()"
-    # Tail spread `[..., ...xs]`: `kai_incref(xs)` gives the caller
-    # a result whose RC is 1 and leaves xs untouched, matching the
-    # ownership contract list_append used to provide via spine copy
-    # — but in O(1) instead of O(|xs|). This collapses the O(n²)
-    # blowup of the `[x, ...acc]` parser prepend pattern.
-    [el] -> match el {
-      ElPlain(x) -> concat_all([cons_c, emit_expr(src,x, cx), ", kai_nil())"])
-      ElSpread(x) ->
-        # issue #212: if `x` is `__perceus_dup(...)`, the dup already
-        # produces an owned reference; an outer `kai_incref` would
-        # double-bump. Emit the dup's lowering on its own.
-        if is_perceus_dup_call(x) {
-          emit_expr(src, x, cx)
-        } else {
-          concat_all(["kai_incref(", emit_expr(src, x, cx), ")"])
-        }
+  let q = seq_operands(emit_list_elem_vals(src, elems, cx))
+  seq_wrap(q, emit_list_spine(elems, seq_refs(q), emit_cons_ctor(cx)))
+}
+
+fn emit_list_elem_vals(src: String, elems: [ListElem], cx: EmitCtx) : [String] / Console = match elems {
+  [] -> []
+  # Tail spread `[..., ...xs]`: `kai_incref(xs)` gives the caller
+  # a result whose RC is 1 and leaves xs untouched, matching the
+  # ownership contract list_append used to provide via spine copy
+  # — but in O(1) instead of O(|xs|). This collapses the O(n²)
+  # blowup of the `[x, ...acc]` parser prepend pattern.
+  # issue #212: if `x` is `__perceus_dup(...)`, the dup already
+  # produces an owned reference; an outer `kai_incref` would
+  # double-bump.
+  [ElSpread(x)] ->
+    if is_perceus_dup_call(x) { [emit_expr(src, x, cx)] }
+    else { [concat_all(["kai_incref(", emit_expr(src, x, cx), ")"])] }
+  [el, ...rest] -> {
+    let x = match el { ElPlain(e) -> e ElSpread(e) -> e }
+    [emit_expr(src, x, cx), ...emit_list_elem_vals(src, rest, cx)]
+  }
+}
+
+# Cons cells built lexically inside a `region { }` bump-allocate into the
+# arena; outside, ordinary RC `kai_cons` (`cons_c`).
+fn emit_list_spine(elems: [ListElem], refs: [String], cons_c: String) : String = match elems {
+  [] -> "kai_nil()"
+  [el, ...rest] -> match refs {
+    [r, ...rrest] -> match el {
+      ElPlain(_) -> match rest {
+        [] -> concat_all([cons_c, r, ", kai_nil())"])
+        _  -> concat_all([cons_c, r, ", ", emit_list_spine(rest, rrest, cons_c), ")"])
+      }
+      ElSpread(_) -> match rest {
+        [] -> r
+        _  -> concat_all(["kai_core_list_append(", r, ", ", emit_list_spine(rest, rrest, cons_c), ")"])
+      }
     }
-    [el, ...rest] -> match el {
-      ElPlain(x) -> concat_all([
-        cons_c, emit_expr(src,x, cx), ", ",
-        emit_list_tail(src, rest, cx), ")"
-      ])
-      ElSpread(x) -> concat_all([
-        "kai_core_list_append(", emit_expr(src,x, cx), ", ",
-        emit_list_tail(src, rest, cx), ")"
-      ])
-    }
+    [] -> "kai_nil() /* list: element/ref arity */"
   }
 }
 
@@ -3230,13 +3136,15 @@ fn emit_vec_write_rec_fused(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) :
         [v, lit] -> match lit.kind {
           ERecordLit(_, fis) ->
             if vec_elem_is_rec_carrier(cx.recs, lit.ty) {
-              let n = list_length(fis)
-              let vals  = join_with(map(fis, (fi) => emit_field_init_val(src, fi, cx)), ", ")
+              let q = seq_operands([emit_expr(src, v, cx), ...map(fis, (fi) => emit_field_init_val(src, fi, cx))])
               let names = join_with(map(fis, emit_field_init_name), ", ")
-              Some(concat_all([
-                "kai_vec_push_rec_raw(", emit_expr(src, v, cx), ", ", int_to_string(n),
-                ", (KaiValue *[]){", vals, "}, (const char *[]){", names, "})"
-              ]))
+              match seq_refs(q) {
+                [rv, ...rf] -> Some(seq_wrap(q, concat_all([
+                  "kai_vec_push_rec_raw(", rv, ", ", int_to_string(list_length(fis)),
+                  ", (KaiValue *[]){", join_with(rf, ", "), "}, (const char *[]){", names, "})"
+                ])))
+                [] -> None
+              }
             } else { None }
           _ -> None
         }
@@ -3247,12 +3155,15 @@ fn emit_vec_write_rec_fused(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) :
         [v, i, lit] -> match lit.kind {
           ERecordLit(_, fis) ->
             if vec_elem_is_rec_carrier(cx.recs, lit.ty) {
-              let n = list_length(fis)
-              let vals = join_with(map(fis, (fi) => emit_field_init_val(src, fi, cx)), ", ")
-              Some(concat_all([
-                "kai_vec_set_rec_raw(", emit_expr(src, v, cx), ", ", emit_expr(src, i, cx),
-                ", ", int_to_string(n), ", (KaiValue *[]){", vals, "})"
-              ]))
+              let q = seq_operands([emit_expr(src, v, cx), emit_expr(src, i, cx),
+                                    ...map(fis, (fi) => emit_field_init_val(src, fi, cx))])
+              match seq_refs(q) {
+                [rv, ri, ...rf] -> Some(seq_wrap(q, concat_all([
+                  "kai_vec_set_rec_raw(", rv, ", ", ri, ", ", int_to_string(list_length(fis)),
+                  ", (KaiValue *[]){", join_with(rf, ", "), "})"
+                ])))
+                _ -> None
+              }
             } else { None }
           _ -> None
         }
@@ -3266,12 +3177,12 @@ fn emit_vec_write_rec_fused(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) :
 fn emit_record_lit(src: String, fields: [FieldInit], cx: EmitCtx) : String / Console {
 
   let n = list_length(fields)
-  let vals = join_with(map(fields, (fi) => emit_field_init_val(src, fi, cx)), ", ")
+  let vals = seq_operands(map(fields, (fi) => emit_field_init_val(src, fi, cx)))
   let names = join_with(map(fields, emit_field_init_name), ", ")
-  concat_all([
+  seq_wrap(vals, concat_all([
     emit_record_ctor(cx), int_to_string(n),
-    ", (KaiValue *[]){", vals, "}, (const char *[]){", names, "})"
-  ])
+    ", (KaiValue *[]){", seq_joined(vals), "}, (const char *[]){", names, "})"
+  ]))
 }
 
 # ---- match: pattern test + bind emission ----
@@ -4559,7 +4470,10 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # corruption the cell free-list surfaced.
       let new_temps0   = rv_new_temps(src, cargs, tys, 0, arm_cx)
       let overwrites   = rv_overwrites(cargs, tys, 0, cx.enums)
-      let fresh_slots  = emit_variant_slot_init_list(src, cargs, tys, arm_cx)
+      let fresh_q      = emit_variant_slot_init_list(src, cargs, tys, arm_cx)
+      let fresh_rhs    = seq_wrap(fresh_q, concat_all([
+                           "kai_variant_u(", tag_str, ", \"", cname, "\", ", int_to_string(n),
+                           ", ", int_to_string(mask), ", (KaiVarSlot[]){", seq_joined(fresh_q), "})"]))
       # Non-bijective unique branch owns (incref'd) its children, so the OLD
       # pointer slots of `_scr` (which still reference those children) must be
       # decref'd before they are overwritten — else the old reference leaks.
@@ -4628,8 +4542,8 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # alloc consumes it too — else a balance call on a shared child leaves
       # the donor unconsumed (measured 1.79 freed/insert without this).
       # site 1 = shared branch; distinct temp so no lvalue aliases.
-      let fresh_slots_d = if cx.rd_active { rd_donate(fresh_slots, evar_find_tag_arity(cx.variants, None, cname, n), cname, n, mask, 1) }
-                          else { fresh_slots }
+      let fresh_rhs_d = if cx.rd_active { rd_donate(fresh_rhs, evar_find_tag_arity(cx.variants, None, cname, n), cname, n, mask, 1) }
+                        else { fresh_rhs }
       # If the inner token was captured but no sub-ctor consumed it (the
       # rebuild had no same-arity nested ctor), free the cell so it does
       # not leak (Koka drops an unconsumed Available token). After a
@@ -4641,7 +4555,7 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # 0 unique, site 1 shared); it may not live inside the shared branch's
       # `(KaiVarSlot[]){...}` initializer where the rewrite lands.
       let uniq_tmp = if cx.rd_active and new_temps != new_temps1 { rd_tmp_decl(0) } else { "" }
-      let shared_tmp = if cx.rd_active and fresh_slots_d != fresh_slots { rd_tmp_decl(1) } else { "" }
+      let shared_tmp = if cx.rd_active and fresh_rhs_d != fresh_rhs { rd_tmp_decl(1) } else { "" }
       concat_all([
         "if (kai_check_unique(_scr)) { ", uniq_tmp,
         borrow_binds, inner_decision, new_temps, old_drops, overwrites,
@@ -4669,8 +4583,7 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
         # grand-child binds are borrows off the still-live inner; dup each
         # kept boxed grand-child before the fresh rebuild embeds it.
         if has_inner { rv_shared_grand_dups(nested_sp, cx) } else { "" },
-        "_r = kai_variant_u(", tag_str, ", \"", cname, "\", ", int_to_string(n),
-        ", ", int_to_string(mask), ", (KaiVarSlot[]){", fresh_slots_d, "}); ",
+        "_r = ", fresh_rhs_d, "; ",
         "}"
       ])
     }
@@ -6409,12 +6322,6 @@ fn fixed_vec_elem_of(opt_t: Option[Ty]) : Ty = match opt_t {
   None    -> TyInt
 }
 
-# Comma-joined raw C for the elements of a fixed-vec literal.
-fn emit_fixed_vec_elems(src: String, es: [Expr], cx: EmitCtx) : String / Console = match es {
-  []           -> ""
-  [e]          -> emit_expr_raw(src, e, cx)
-  [e, ...rest] -> concat_all([emit_expr_raw(src, e, cx), ", ", emit_fixed_vec_elems(src, rest, cx)])
-}
 
 # The include-guarded `typedef struct { <elem> a[n]; } <cname>;` for a
 # fixed-width vec, emitted at the first local declaration of that type.
@@ -6964,11 +6871,12 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         # `/`/`%` route through the checked helper (handled below).
         let st = raw_signed_c_type(x.ty)
         let ut = raw_unsigned_c_type(x.ty)
-        concat_all(["((", st, ")((", ut, ")(",
-                    emit_expr_raw(src, a, cx),
-                    ") ", raw_op_str(op), " (", ut, ")(",
-                    emit_expr_raw(src, b, cx),
-                    ")))"])
+        let q = seq_operands([emit_expr_raw(src, a, cx), emit_expr_raw(src, b, cx)])
+        match seq_refs(q) {
+          [ra, rb] -> seq_wrap(q, concat_all(["((", st, ")((", ut, ")(", ra,
+                                              ") ", raw_op_str(op), " (", ut, ")(", rb, ")))"]))
+          _ -> "0 /* raw wrap: operand arity */"
+        }
       } else if raw_int_divmod_is_checked(op, x.ty) {
         # Raw `/`/`%` trap on a zero divisor (and the signed helper on
         # INT64_MIN/-1) instead of the bare `a / b` the hardware would run
@@ -6980,15 +6888,10 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         } else {
           if op == "/" { "kai_idiv_chk(" } else { "kai_imod_chk(" }
         }
-        concat_all([checked,
-                    emit_expr_raw(src, a, cx), ", ",
-                    emit_expr_raw(src, b, cx), ")"])
+        seq_call(checked, [emit_expr_raw(src, a, cx), emit_expr_raw(src, b, cx)], ")")
       } else if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) {
-        concat_all(["(",
-                    emit_expr_raw(src, a, cx),
-                    " ", raw_op_str(op), " ",
-                    emit_expr_raw(src, b, cx),
-                    ")"])
+        # Only the left operand is ever hoisted, so `&&`/`||` keep short-circuiting.
+        seq_infix(emit_expr_raw(src, a, cx), raw_op_str(op), emit_expr_raw(src, b, cx))
       } else if op == "^" {
         # Issue #90 — integer power, exponent is a compile-time
         # literal in `[0, 64]` (gated by `pow_exp_is_inlinable`).
@@ -7033,8 +6936,8 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         if callee == "__fixed_vec_lit" {
           # A fixed-width `Vec[e]<n>` literal: a flat by-value C aggregate
           # `(<cname>){ .a = { e0, e1, ... } }`, no heap block, no header.
-          concat_all(["(", raw_c_type(x.ty), "){ .a = { ",
-                      emit_fixed_vec_elems(src, args_e, cx), " } }"])
+          seq_call(concat_all(["(", raw_c_type(x.ty), "){ .a = { "]),
+                   map(args_e, (e) => emit_expr_raw(src, e, cx)), " } }")
         } else if callee == "__fixed_vec_get" {
           # Static-index read into a fixed vec. The index is a compile-time
           # literal and the bound was proved by the typer, so neither form
@@ -7207,11 +7110,11 @@ fn emit_ufn_raw_call_go(src: String, sym: String, args_e: [Expr], mask: [Bool], 
     let names = emit_ob_names(args_e, 0)
     let cx2 = emit_ctx_with_lcs(cx, list_append(cx.lcs, names))
     let binds = emit_ob_binds(src, args_e, 0, cx)
-    let raw_args = emit_call_args_masked(src, emit_ob_rewrite_args(args_e, 0), mask, cx2)
+    let raw_vals = emit_arg_vals_masked(src, emit_ob_rewrite_args(args_e, 0), mask, cx2)
     let drops = emit_ob_drops(args_e, 0)
-    concat_all(["({ ", binds, raw_c_type(Some(rt)), " _bcr = ", emit_user_call(sym, raw_args, cx2), "; ", drops, "_bcr; })"])
+    concat_all(["({ ", binds, raw_c_type(Some(rt)), " _bcr = ", emit_user_call_seq(sym, raw_vals, cx2), "; ", drops, "_bcr; })"])
   } else {
-    emit_user_call(sym, emit_call_args_masked(src, args_e, mask, cx), cx)
+    emit_user_call_seq(sym, emit_arg_vals_masked(src, args_e, mask, cx), cx)
   }
 }
 
@@ -7335,12 +7238,8 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
         # The typer pins `x.ty` to `String` or `[T]` before we get
         # here; an untyped `++` is a typer bug we surface as a panic
         # stub so it shows up in fixtures.
-        let helper = concat_helper_of(x.ty)
-        concat_all([
-          helper, "(",
-          emit_expr(src, a, cx), ", ",
-          emit_expr(src, b, cx), ")"
-        ])
+        seq_call(cat2(concat_helper_of(x.ty), "("),
+                 [emit_expr(src, a, cx), emit_expr(src, b, cx)], ")")
       } else if is_int_order_cmp(op, a, b) {
         # Direct Int order-comparison: both operands are Int, so skip the
         # boxed kai_op_lt/gt/le/ge (type-dispatch + boxed bool + truthy +
@@ -7362,11 +7261,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
         ])
       } else {
         match binop_cname(op) {
-          Some(cn) -> concat_all([
-            cn, "(",
-            emit_expr(src, a, cx), ", ",
-            emit_expr(src, b, cx), ")"
-          ])
+          Some(cn) -> seq_call(cat2(cn, "("), [emit_expr(src, a, cx), emit_expr(src, b, cx)], ")")
           None -> cat3("kai_unit() /* unknown binop: ", op, " */")
         }
       }
@@ -7559,7 +7454,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     # value-position constraint).
     EModCall(mod, fname) -> match evar_find_qual(cx.variants, mod, fname) {
       Some(ar) -> if ar == 0 {
-        emit_variant_call(ctor_qual_home(cx, mod, fname), fname, 0, "", cx)
+        emit_variant_call(ctor_qual_home(cx, mod, fname), fname, 0, seq_operands([]), cx)
       } else {
         cat3("kai_unit() /* non-nullary ctor as value not supported: ", string_concat(mod, string_concat(".", fname)), " */")
       }
@@ -15881,7 +15776,7 @@ fn emit_trmc_variant_step(src: String, sym: String, holeslot: Int, cname: String
   let mask = match tys_opt { Some(ts) -> variant_slot_mask(ts, cx.enums) None -> 0 }
   # Build the slot initialiser list: every slot from args_e except the
   # hole slot (NULL); typed Int/Real slots emit `.i64`/`.r`.
-  let slot_inits = emit_trmc_slot_inits(src, args_e, tys_opt, holeslot, 0, cx)
+  let slot_inits = emit_trmc_slot_inits(src, args_e, tys_opt, holeslot, cx)
   # Extract the self-call's args (the recursion) from the hole slot.
   let self_args = match trmc_expr_nth(args_e, holeslot) {
     Some(e) -> match e.kind { ECall(_, sa) -> sa _ -> [] }
@@ -15923,7 +15818,7 @@ fn emit_trmc_variant_step(src: String, sym: String, holeslot: Int, cname: String
     "if (_arm_ru != NULL && _arm_ru->tag == KAI_VARIANT && _arm_ru->var_n_args == ", int_to_string(n), ") { ",
     "_trmc_node = _arm_ru; ", slot_stores,
     "_trmc_node->variant_tag = ", tag_str, "; _trmc_node->rc = 1; ",
-    "} else { KaiVarSlot _trmc_sl[", int_to_string(n), "] = {", slot_inits, "}; ",
+    "} else { ", seq_binds(slot_inits), "KaiVarSlot _trmc_sl[", int_to_string(n), "] = {", seq_joined(slot_inits), "}; ",
     "_trmc_node = ", trmc_fresh_alloc(cname, tag_str, n, mask, cx), "; } ",
     "_arm_ru = kai_reuse_null; ",
     "_kai_acc = kai_cctx_extend_linear(_kai_acc, _trmc_node, ",
@@ -15933,57 +15828,72 @@ fn emit_trmc_variant_step(src: String, sym: String, holeslot: Int, cname: String
   ])
 }
 
-# Slot initialisers for the TRMC node: position `holeslot` is the open
-# hole (NULL ptr); other positions emit their ctor arg, typed by the
-# payload type list (Int→.i64, Real→.r, else .ptr).
+# Slot initialisers for the TRMC node, values sequenced left to right:
+# position `holeslot` is the open hole (NULL ptr); other positions emit
+# their ctor arg, typed by the payload type list (Int→.i64, Real→.r, else .ptr).
 fn emit_trmc_slot_inits(src: String, args_e: [Expr], tys_opt: Option[[TypeExpr]],
-                        holeslot: Int, i: Int, cx: EmitCtx) : String / Console {
+                        holeslot: Int, cx: EmitCtx) : SeqOps / Console {
+  let q = seq_operands(emit_trmc_slot_vals(src, args_e, tys_opt, holeslot, 0, cx))
+  match q {
+    SeqOps(binds, refs) -> SeqOps(binds, variant_slot_inits(refs, trmc_slot_fields(args_e, tys_opt, 0, cx)))
+  }
+}
+
+fn trmc_slot_kind(tys_opt: Option[[TypeExpr]], i: Int, cx: EmitCtx) : Int = match tys_opt {
+  Some(ts) -> match trmc_ty_nth(ts, i) { Some(t) -> variant_slot_kind(t, cx.enums) None -> 0 }
+  None     -> 0
+}
+
+fn trmc_slot_fields(args_e: [Expr], tys_opt: Option[[TypeExpr]], i: Int, cx: EmitCtx) : [String] = match args_e {
+  [] -> []
+  [_, ...rest] -> {
+    let k = trmc_slot_kind(tys_opt, i, cx)
+    let f = if k == 1 or k == 3 { ".i64" } else if k == 2 { ".r" } else { ".ptr" }
+    [f, ...trmc_slot_fields(rest, tys_opt, i + 1, cx)]
+  }
+}
+
+fn emit_trmc_slot_vals(src: String, args_e: [Expr], tys_opt: Option[[TypeExpr]],
+                       holeslot: Int, i: Int, cx: EmitCtx) : [String] / Console {
   match args_e {
-    [] -> ""
+    [] -> []
     [a, ...rest] -> {
-      let head =
+      let kind = trmc_slot_kind(tys_opt, i, cx)
+      let v =
         if i == holeslot {
-          "{.ptr = (KaiValue *)0}"
+          "(KaiValue *)0"
+        } else if kind == 1 {
+          emit_trmc_int_slot(src, a, cx)
+        } else if kind == 2 {
+          emit_trmc_real_slot(src, a, cx)
+        } else if kind == 3 {
+          # Enum slot in a TRMC rebuild: store the immediate tag,
+          # matching emit_variant_slot_init's enum path. A nullary ctor
+          # literal (`Red`/`Black`) stores its tag directly, skipping the
+          # kai_take_enum(kai_variant_u(...)) singleton round-trip — this
+          # is the hot path for the rb-tree descent's node rebuilds.
+          match nullary_ctor_tag(a, cx) {
+            Some(tag) -> int_to_string(tag)
+            None      -> concat_all(["kai_take_enum(", emit_expr(src, a, cx), ")"])
+          }
         } else {
-          let kind = match tys_opt {
-            Some(ts) -> match trmc_ty_nth(ts, i) { Some(t) -> variant_slot_kind(t, cx.enums) None -> 0 }
-            None     -> 0
+          # Int lives in a pointer slot (kind 0) as a tagged immediate
+          # (the c221cee decision: a tagged Int IS a valid KaiValue*).
+          # perceus wraps the slot value in __perceus_dup, but dup/drop
+          # on a tagged Int is a no-op (kai_incref short-circuits on
+          # kai_is_value) — the call is still emitted and run, ~2 per
+          # node rebuild on the rb-tree descent. Strip the dup when the
+          # slot's declared type is Int: copy the tagged word directly,
+          # no kai_internal_dup call. Safe because no ref is taken (the
+          # immediate has no header) and none is owed (the old node's
+          # slot is overwritten/freed, not the value).
+          let is_int_slot = match tys_opt {
+            Some(ts) -> match trmc_ty_nth(ts, i) { Some(te) -> ty_te_is_int(te) None -> false }
+            None     -> false
           }
-          if kind == 1 {
-            concat_all(["{.i64 = ", emit_trmc_int_slot(src, a, cx), "}"])
-          } else if kind == 2 {
-            concat_all(["{.r = ", emit_trmc_real_slot(src, a, cx), "}"])
-          } else if kind == 3 {
-            # Enum slot in a TRMC rebuild: store the immediate tag,
-            # matching emit_variant_slot_init's enum path. A nullary ctor
-            # literal (`Red`/`Black`) stores its tag directly, skipping the
-            # kai_take_enum(kai_variant_u(...)) singleton round-trip — this
-            # is the hot path for the rb-tree descent's node rebuilds.
-            match nullary_ctor_tag(a, cx) {
-              Some(tag) -> concat_all(["{.i64 = ", int_to_string(tag), "}"])
-              None      -> concat_all(["{.i64 = kai_take_enum(", emit_expr(src, a, cx), ")}"])
-            }
-          } else {
-            # Int lives in a pointer slot (kind 0) as a tagged immediate
-            # (the c221cee decision: a tagged Int IS a valid KaiValue*).
-            # perceus wraps the slot value in __perceus_dup, but dup/drop
-            # on a tagged Int is a no-op (kai_incref short-circuits on
-            # kai_is_value) — the call is still emitted and run, ~2 per
-            # node rebuild on the rb-tree descent. Strip the dup when the
-            # slot's declared type is Int: copy the tagged word directly,
-            # no kai_internal_dup call. Safe because no ref is taken (the
-            # immediate has no header) and none is owed (the old node's
-            # slot is overwritten/freed, not the value).
-            let is_int_slot = match tys_opt {
-              Some(ts) -> match trmc_ty_nth(ts, i) { Some(te) -> ty_te_is_int(te) None -> false }
-              None     -> false
-            }
-            let av = if is_int_slot { raw_border_strip_dup(a) } else { a }
-            concat_all(["{.ptr = ", emit_expr(src, av, cx), "}"])
-          }
+          emit_expr(src, if is_int_slot { raw_border_strip_dup(a) } else { a }, cx)
         }
-      let sep = match rest { [] -> "" _ -> ", " }
-      concat_all([head, sep, emit_trmc_slot_inits(src, rest, tys_opt, holeslot, i + 1, cx)])
+      [v, ...emit_trmc_slot_vals(src, rest, tys_opt, holeslot, i + 1, cx)]
     }
   }
 }
