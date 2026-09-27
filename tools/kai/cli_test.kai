@@ -2,6 +2,7 @@
 
 import os.env
 import cli_blocks
+import cli_caches
 import cli_compile
 import cli_err
 import cli_fs
@@ -16,6 +17,9 @@ type TestOpts = { json: Bool, only: [String], backend: String, extra: [String], 
 
 fn add_only(o: TestOpts, v: String) : TestOpts = TestOpts { ...o, only: o.only ++ [v] }
 
+fn with_backend(o: TestOpts, v: String) : Result[TestOpts, Int] / Stderr =
+  cli_compile.backend_name(v).map(b => TestOpts { ...o, backend: b })
+
 fn parse(args: [String], o: TestOpts) : Result[(TestOpts, [String]), Int] / Stderr =
   match args {
     [] -> Ok((o, []))
@@ -24,12 +28,12 @@ fn parse(args: [String], o: TestOpts) : Result[(TestOpts, [String]), Int] / Stde
     ["--only"] -> cli_err.die("--only needs an argument (see 'kai test --help')")
     ["--only", v, ...rest] -> parse(rest, add_only(o, v))
     ["--backend"] -> cli_err.die("--backend needs an argument (c|native)")
-    ["--backend", v, ...rest] -> parse(rest, TestOpts { ...o, backend: v })
+    ["--backend", v, ...rest] -> parse(rest, with_backend(o, v)!)
     ["--", ...rest] -> Ok((o, rest))
     [a, ...rest] if string.starts_with(a, "--only=") ->
       parse(rest, add_only(o, string.drop_prefix(a, "--only=").unwrap_or("")))
     [a, ...rest] if string.starts_with(a, "--backend=") ->
-      parse(rest, TestOpts { ...o, backend: string.drop_prefix(a, "--backend=").unwrap_or("") })
+      parse(rest, with_backend(o, string.drop_prefix(a, "--backend=").unwrap_or(""))!)
     [a, ...rest] if string.starts_with(a, "-") ->
       parse(rest, TestOpts { ...o, extra: o.extra ++ [a] })
     _ -> Ok((o, args))
@@ -41,7 +45,7 @@ fn label_of(dir: String) : String / File + Ffi =
     None -> dir
   }
 
-# Visit one package: `(ran, failed)` so far, updated.
+# Visit one package: `(ran, failed)` so far, updated. The run inherits the walk's selection and logs.
 fn visit(
   t: Toolchain,
   flags: [String],
@@ -57,9 +61,11 @@ fn visit(
     acc
   } else {
     Stderr.eprint("== kai test #{label}")
+    let pkg = string.drop_prefix(dir, "./").unwrap_or(dir)
     let rc = cli_proc.run(["#{t.layout.root}/bin/kai", "test", ...flags], cli_proc.Spawn {
       ...cli_proc.inherit(),
-      dir: dir
+      dir: dir,
+      set: [("KAI_TEST_PACKAGE", pkg)]
     })
     if rc != 0 { Stderr.eprint("== FAIL #{label}") }
     let next = (acc.fst + 1, acc.snd or rc != 0)
@@ -67,8 +73,8 @@ fn visit(
   }
 }
 
-# `kai test ./...`: every directory below the cwd carrying a kai.toml, each in its own `kai test`.
-fn recursive(t: Toolchain, flags: [String]) : Int / Stderr + File + Ffi {
+# `kai test ./...`: every directory below the cwd carrying a kai.toml, each in its own `kai test`; one verdict over them all.
+fn recursive(t: Toolchain, o: TestOpts, flags: [String], logs: (String, String)) : Int / Stdout + Stderr + File + Ffi {
   let here = cli_sys.cwd()
   let dirs = dir_walk(".")
     |? (p => cli_fs.basename(p) == "kai.toml")
@@ -78,18 +84,20 @@ fn recursive(t: Toolchain, flags: [String]) : Int / Stderr + File + Ffi {
     Stderr.eprint("kai: no kai.toml found under #{here}")
     1
   } else {
-    let r = dirs |> list.foldl((0, false), (acc, d) => visit(t, flags, acc, d))
-    if r.fst == 0 {
-      Stderr.eprint("kai: no buildable packages found under #{here}")
-      1
-    } else if r.snd {
-      1
-    } else {
-      Stderr.eprint("kai: all package tests passed (#{r.fst} package(s))")
-      0
-    }
+    walked(o, logs, here, dirs |> list.foldl((0, false), (acc, d) => visit(t, flags, acc, d)))
   }
 }
+
+# The walk's verdict over `(ran, failed)`: `--only` and `--json` settle here, once for every package.
+fn walked(o: TestOpts, logs: (String, String), here: String, r: (Int, Bool)) : Int / Stdout + Stderr + File + Ffi =
+  if r.fst == 0 {
+    Stderr.eprint("kai: no buildable packages found under #{here}")
+    1
+  } else {
+    let status = verdict(o, logs, if r.snd { 1 } else { 0 })
+    if status == 0 { Stderr.eprint("kai: all package tests passed (#{r.fst} package(s))") }
+    status
+  }
 
 fn log_file(tmp: String, name: String) : String / File {
   let f = "#{tmp}/#{name}"
@@ -129,7 +137,7 @@ fn test_file(t: Toolchain, b: Backend, o: TestOpts, tmp: String, tf: String, sta
 }
 
 # A selection that matched nothing is a caller error, whatever the output format.
-fn verdict(o: TestOpts, logs: (String, String), status: Int) : Int / Stderr + File + Ffi {
+fn verdict(o: TestOpts, logs: (String, String), status: Int) : Int / Stdout + Stderr + File + Ffi {
   let only = string.join(o.only, "\n") != ""
   if logs.fst != "" and o.json { cli_sys.copy_to_stdout(logs.fst) }
   let json_miss = logs.fst != ""
@@ -168,12 +176,12 @@ fn run_suite(
   o: TestOpts,
   rest: [String],
   tmp: String
-) : Result[Int, Int] / Stderr + Env + File + Ffi {
+) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
   let logs = open_logs(o, tmp)
   let b = cli_compile.resolve_backend(o.backend)!
   let rec = if o.backend == "" { [] } else { ["--backend", o.backend] }
   match rest {
-    [s, ..._] if s == "./..." or s == "..." -> Ok(recursive(t, rec ++ o.extra))
+    [s, ..._] if s == "./..." or s == "..." -> Ok(recursive(t, o, rec ++ o.extra, logs))
     _ -> {
       let target = cli_blocks.target(rest, "test")!
       let status = run_all(t, b, o, target.fst, target.snd, tmp)!
@@ -193,7 +201,10 @@ pub fn test_verb(
     Stdout.print(cli_test_help.test_text())
     Ok(0)
   } else {
-    let _ = env.set("KAI_TEST_ONLY", string.join(o.only, "\n"))
+    # A package run inside a `./...` walk keeps the walk's selection.
+    if cli_caches.env_or("KAI_TEST_PACKAGE", "") == "" {
+      let _ = env.set("KAI_TEST_ONLY", string.join(o.only, "\n"))
+    }
     if o.json { let _ = env.set("KAI_TEST_JSON", "1") }
     cli_fs.with_scratch(tmp => run_suite(t, o, parsed.snd, tmp))
   }

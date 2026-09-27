@@ -32,7 +32,9 @@ For each hole the compiler produces a **report**, not an error:
 If the file contains unfilled holes, compilation still **succeeds**
 (warning, not error). The emitter substitutes a runtime panic so the
 binary is runnable; the holes surface on execution, not at build
-time, unless the user opts into `--strict-holes`.
+time, unless the user opts into `--strict-holes` (`kai build
+--strict-holes`, `kai typecheck --strict-holes`), which fails with exit 1
+on any unfilled hole — the gate a CI uses to keep holes off a branch.
 
 ## Output formats
 

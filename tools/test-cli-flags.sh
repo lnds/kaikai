@@ -14,10 +14,9 @@
 # BEFORE it must be recognised. `kai lsp` execs the LSP server, which
 # owns its own arguments.
 #
-# Also pins `kai check`'s backend contract: --backend=c is accepted
-# (it names the only backend the check runner has), native is refused
-# with the C-only explanation, anything else gets the standard
-# backend-value error.
+# Also pins the backend contract: every verb that takes --backend
+# accepts c|native and refuses anything else, and a verb refuses an
+# argument it has no use for rather than dropping it.
 
 set -eu
 
@@ -81,6 +80,21 @@ expect_reject "test --backend without value"   "needs an argument" test --backen
 expect_reject "bench --backend without value"  "needs an argument" bench --backend
 expect_reject "watch --backend without value"  "needs an argument" watch --backend
 expect_reject "test --only without value"      "needs an argument" test --only
+
+# A --backend value is validated on every verb that takes one, never
+# degraded to the default in silence.
+for verb in build run bench test watch; do
+  expect_reject "$verb refuses a bogus backend" "must be 'c' or 'native' (got: metal)" "$verb" --backend=metal x.kai
+done
+expect_reject "test refuses an empty backend"  "must be 'c' or 'native' (got: )" test --backend= x.kai
+
+# Arguments a verb has no use for are an error, never dropped.
+expect_reject "fetch refuses stray args"       "'kai fetch' takes no arguments, got 'x'" fetch x
+expect_reject "show refuses stray args"        "'kai show' takes no arguments, got 'x'" show x
+expect_reject "install --list refuses --force" "--list takes no other arguments" install --list --force
+expect_reject "install --list refuses a spec"  "--list takes no other arguments" install --list .
+expect_reject "info --list refuses stray args" "--list takes no other arguments, got 'x'" info --list x
+expect_reject "info -k takes one keyword"      "-k takes one keyword, got also 'b'" info -k a b
 
 # Reversion proof for the original repro: an explicit --backend=c runs
 # the check runner exactly like the flagless form — no basename noise,

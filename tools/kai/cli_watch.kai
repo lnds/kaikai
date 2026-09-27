@@ -12,24 +12,32 @@ import cli_tool_help
 
 type WatchOpts = { backend: String, help: Bool }
 
+fn with_backend(o: WatchOpts, v: String) : Result[WatchOpts, Int] / Stderr =
+  cli_compile.backend_name(v).map(b => WatchOpts { ...o, backend: b })
+
+# Flags stop at `--` or at the spec; what follows the spec goes to the program.
 fn parse(args: [String], o: WatchOpts) : Result[(WatchOpts, [String]), Int] / Stderr =
   match args {
     [a, ..._] if a == "-h" or a == "--help" -> Ok((WatchOpts { ...o, help: true }, []))
     ["--backend"] -> cli_err.die("--backend needs an argument (c|native)")
-    ["--backend", v, ...rest] -> parse(rest, WatchOpts { ...o, backend: v })
+    ["--backend", v, ...rest] -> parse(rest, with_backend(o, v)!)
     [a, ...rest] if string.starts_with(a, "--backend=") ->
-      parse(rest, WatchOpts { ...o, backend: string.drop_prefix(a, "--backend=").unwrap_or("") })
+      parse(rest, with_backend(o, string.drop_prefix(a, "--backend=").unwrap_or(""))!)
+    ["--", ...rest] -> Ok((o, rest))
     [a, ..._] if string.starts_with(a, "-") ->
       cli_err.die("unknown flag: #{a} (see 'kai watch --help')")
     _ -> Ok((o, args))
   }
 
-fn source(args: [String]) : Result[String, Int] / Stderr + File + Ffi {
-  let src = match args {
-    [] -> cli_spec.resolve("", "building", false)!
-    [a, ..._] if a == "." or string.starts_with(a, "./") -> cli_spec.resolve(a, "building", false)!
-    [a, ..._] -> a
+fn spec_of(args: [String]) : Result[String, Int] / Stderr + File + Ffi =
+  match args {
+    [] -> cli_spec.resolve("", "building", false)
+    [a, ..._] if a == "." or string.starts_with(a, "./") -> cli_spec.resolve(a, "building", false)
+    [a, ..._] -> Ok(a)
   }
+
+fn source(args: [String]) : Result[String, Int] / Stderr + File + Ffi {
+  let src = spec_of(args)!
   if src == "" {
     cli_err.die("missing input file (see 'kai watch --help')")
   } else if not cli_sys.is_file(src) {
@@ -39,20 +47,25 @@ fn source(args: [String]) : Result[String, Int] / Stderr + File + Ffi {
   }
 }
 
+type Session = { t: Toolchain, b: Backend, src: String, args: [String], tmp: String }
+
 # One cycle: the build's stderr is held back, shown after `Build OK` is known, or with `Build FAILED`.
-fn cycle(t: Toolchain, b: Backend, src: String, tmp: String) : Unit / Stdout + Stderr + Env + File + Ffi {
+fn cycle(s: Session) : Unit / Stdout + Stderr + Env + File + Ffi {
+  let t = s.t
+  let src = s.src
+  let tmp = s.tmp
   let bin = "#{tmp}/#{cli_fs.stem(src)}"
   let ts = cli_io.local_hms()
   let err = "#{tmp}/watch.err"
   let saved = cli_io.stderr_to(err)
   cli_sys.clear_no_llvm()
-  let built = cli_compile.compile(t, b, cli_plan.Job { src, tmp, out: bin, verb: "watch", extra: [] })
+  let built = cli_compile.compile(t, s.b, cli_plan.Job { src, tmp, out: bin, verb: "watch", extra: [] })
   cli_io.stderr_restore(saved)
   match built {
     Ok(_) -> {
       cli_sys.copy_to_stderr(err)
       Stdout.print("\n[#{ts}] Build OK")
-      let rc = cli_proc.run([bin], cli_proc.inherit())
+      let rc = cli_proc.run([bin, ...s.args], cli_proc.inherit())
       if rc != 0 { Stdout.print("\n[#{ts}] Program exited with status #{rc}") }
     }
     Err(_) -> {
@@ -62,23 +75,23 @@ fn cycle(t: Toolchain, b: Backend, src: String, tmp: String) : Unit / Stdout + S
   }
 }
 
-fn on_events(t: Toolchain, b: Backend, src: String, tmp: String, fd: Int) : Unit / Stdout + Stderr + Env + File + Ffi =
+fn on_events(s: Session, fd: Int) : Unit / Stdout + Stderr + Env + File + Ffi =
   if cli_sys.read_line(fd) and cli_sys.pending_signal() == 0 {
-    cycle(t, b, src, tmp)
-    on_events(t, b, src, tmp, fd)
+    cycle(s)
+    on_events(s, fd)
   }
 
-fn poll(t: Toolchain, b: Backend, src: String, tmp: String, last: Int) : Unit / Stdout + Stderr + Env + File + Ffi {
+fn poll(s: Session, last: Int) : Unit / Stdout + Stderr + Env + File + Ffi {
   cli_io.msleep(500)
   if cli_sys.pending_signal() == 0 {
-    let now = cli_sys.mtime(src)
-    if now != last { cycle(t, b, src, tmp) }
-    poll(t, b, src, tmp, now)
+    let now = cli_sys.mtime(s.src)
+    if now != last { cycle(s) }
+    poll(s, now)
   }
 }
 
-fn watch(t: Toolchain, flag: String, src: String, tmp: String) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
-  let b = cli_compile.resolve_backend(flag)!
+fn watch(s: Session) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let src = s.src
   let fswatch = cli_proc.which("fswatch").is_some()
   Stdout.print("kaikai watch — recompiling on every save")
   Stdout.print("Watching: #{src}")
@@ -87,17 +100,17 @@ fn watch(t: Toolchain, flag: String, src: String, tmp: String) : Result[Int, Int
   } else {
     Stdout.print("(backend: mtime poll @ 500ms — install fswatch for lower latency)")
   }
-  cycle(t, b, src, tmp)
+  cycle(s)
   if fswatch {
     ["fswatch", "-o", src] |> foreach(a => cli_sys.argv_push(a))
-    on_events(t, b, src, tmp, cli_sys.spawn_reader())
+    on_events(s, cli_sys.spawn_reader())
   } else {
-    poll(t, b, src, tmp, cli_sys.mtime(src))
+    poll(s, cli_sys.mtime(src))
   }
   Ok(0)
 }
 
-#[doc("`kai watch [--backend c|native] [<spec>]`: runs until interrupted.")]
+#[doc("`kai watch [--backend c|native] [<spec>] [args...]`: runs until interrupted, passing the args to every run.")]
 pub fn watch_verb(t: Toolchain, args: [String]) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
   let parsed = parse(args, WatchOpts { backend: "", help: false })!
   if parsed.fst.help {
@@ -105,6 +118,8 @@ pub fn watch_verb(t: Toolchain, args: [String]) : Result[Int, Int] / Stdout + St
     Ok(0)
   } else {
     let src = source(parsed.snd)!
-    cli_fs.with_scratch(tmp => watch(t, parsed.fst.backend, src, tmp))
+    let b = cli_compile.resolve_backend(parsed.fst.backend)!
+    let args = list.drop(parsed.snd, 1)
+    cli_fs.with_scratch(tmp => watch(Session { t, b, src, args, tmp }))
   }
 }

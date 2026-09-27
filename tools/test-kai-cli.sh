@@ -33,6 +33,19 @@ expect() {
   fi
 }
 
+# status <command...>: the exit status alone, output discarded.
+status_of() {
+  st=0
+  "$@" >/dev/null 2>&1 || st=$?
+  echo "$st"
+}
+
+# test_ids <dir> <kai test args...>: the ids `kai test --json` reports, sorted, space-separated.
+test_ids() {
+  (cd "$1" && shift && "$KAI" test --backend=c --json "$@" 2>/dev/null) \
+    | sed -n 's/^{"type":"test","id":"\([^"]*\)".*/\1/p' | LC_ALL=C sort | tr '\n' ' '
+}
+
 # expect_line <label> <want-status> <want-first-line> <command...>
 expect_line() {
   label="$1"; want_status="$2"; want="$3"; shift 3
@@ -55,11 +68,12 @@ esac
 unset KAI_STDLIB KAIKAI_HOME
 expect "env: dev checkout" 0 "KAIKAI_HOME=$ROOT
 KAI_STDLIB=$ROOT/stdlib
-KAI_TOOLCHAIN_ID=$tid" "$KAI" env
+KAI_TOOLCHAIN_ID=$tid
+KAI_KAIC2=$ROOT/stage2/kaic2" "$KAI" env
 expect "env <name>: one value per line" 0 "$tid
 $ROOT" "$KAI" env KAI_TOOLCHAIN_ID KAIKAI_HOME
 expect "env: unknown name" 2 \
-  "kai: error: unknown variable 'NOPE' (known: KAIKAI_HOME, KAI_STDLIB, KAI_TOOLCHAIN_ID)" \
+  "kai: error: unknown variable 'NOPE' (known: KAIKAI_HOME, KAI_STDLIB, KAI_TOOLCHAIN_ID, KAI_KAIC2)" \
   "$KAI" env KAI_STDLIB NOPE
 expect "env: KAI_STDLIB overrides" 0 "/elsewhere" env KAI_STDLIB=/elsewhere "$KAI" env KAI_STDLIB
 expect "env: KAIKAI_HOME names another prefix" 0 "$TMP/home" \
@@ -71,7 +85,7 @@ mkdir -p "$TMP/plugins" "$TMP/noexec"
 cat > "$TMP/plugins/kai-hello" <<'EOF'
 #!/bin/sh
 for a in "$@"; do printf '[%s]' "$a"; done
-printf '\n%s|%s|%s\n' "$KAIKAI_HOME" "$KAI_STDLIB" "$KAI_TOOLCHAIN_ID"
+printf '\n%s|%s|%s|%s\n' "$KAIKAI_HOME" "$KAI_STDLIB" "$KAI_TOOLCHAIN_ID" "$KAI_KAIC2"
 exit 7
 EOF
 chmod +x "$TMP/plugins/kai-hello"
@@ -80,7 +94,7 @@ chmod +x "$TMP/plugins/kai-fmt"
 printf '#!/bin/sh\necho ran\n' > "$TMP/noexec/kai-quiet"
 
 expect "plugin: argv, env, exit status" 7 "[a b][--flag][]
-$ROOT|$ROOT/stdlib|$tid" env PATH="$TMP/plugins:$PATH" "$KAI" hello "a b" --flag ""
+$ROOT|$ROOT/stdlib|$tid|$ROOT/stage2/kaic2" env PATH="$TMP/plugins:$PATH" "$KAI" hello "a b" --flag ""
 expect_line "plugin: never shadows a core verb" 0 "usage: kai fmt [--width N] <file.kai>            # rewrite file in place" \
   env PATH="$TMP/plugins:$PATH" "$KAI" fmt --help
 expect_line "plugin: a non-executable file is skipped" 2 "kai: error: unknown command: quiet" \
@@ -92,6 +106,10 @@ expect_line "help" 0 " _      _ _      _" "$KAI" help
 expect_line "--version" 0 "kaikai $(cat "$ROOT/VERSION") - $(cat "$ROOT/EDITION") (stage 2, self-hosted)" "$KAI" --version
 expect_line "info --list" 0 "$(ls "$ROOT/docs/info" | sed -n 's/\.md$//p' | LC_ALL=C sort | sed -n 1p)" "$KAI" info --list
 expect "fmt --stdin" 0 "fn main() : Int = 0" sh -c 'printf "fn main()   :  Int = 0\n" | "$1" fmt --stdin' _ "$KAI"
+expect "fmt --stdin --check: unformatted is exit 1, nothing printed" 1 "" \
+  sh -c 'printf "fn main()   :  Int = 0\n" | "$1" fmt --stdin --check' _ "$KAI"
+expect "fmt --stdin --check: formatted is exit 0" 0 "" \
+  sh -c 'printf "fn main() : Int = 0\n" | "$1" fmt --stdin --check' _ "$KAI"
 expect_line "no command: usage, exit 2" 2 " _      _ _      _" "$KAI"
 
 # build/run through the binary.
@@ -118,6 +136,30 @@ stats="$(cd "$TMP/prog" && KAI_MODULAR=1 KAI_MODULAR_STATS=1 KAI_MODULAR_JOBS=8 
 case "$stats" in
   *"cache hits=0 compiled="*"hi") ok "build: parallel c-modular compiles into a cold cache" ;;
   *) fail "build: parallel c-modular compiles into a cold cache"; printf '%s\n' "$stats" | sed 's/^/        /' ;;
+esac
+# watch passes the args after the spec to every run of the program.
+"$KAI" watch --backend=c "$TMP/prog/args.kai" "a b" --x > "$TMP/watch.out" 2>&1 &
+wpid=$!
+i=0
+while [ "$i" -lt 240 ] && ! grep -q "Program exited with status 7" "$TMP/watch.out"; do
+  sleep 0.5
+  i=$((i + 1))
+done
+kill "$wpid" 2>/dev/null || true
+wait "$wpid" 2>/dev/null || true
+case "$(cat "$TMP/watch.out")" in
+  *"[a b]"*"[--x]"*"Program exited with status 7"*) ok "watch: the args after the spec reach the program" ;;
+  *) fail "watch: program args"; sed 's/^/        /' "$TMP/watch.out" ;;
+esac
+# --strict-holes: a hole fails the build and the typecheck instead of warning.
+printf 'fn f(x: Int) : Int = ?\nfn main() : Int = 0\n' > "$TMP/prog/hole.kai"
+got="$(status_of "$KAI" build --backend=c "$TMP/prog/hole.kai" -o "$TMP/prog/hole") $(status_of "$KAI" build --backend=c --strict-holes "$TMP/prog/hole.kai" -o "$TMP/prog/hole")"
+got="$got $(status_of "$KAI" typecheck "$TMP/prog/hole.kai") $(status_of "$KAI" typecheck --strict-holes "$TMP/prog/hole.kai")"
+if [ "$got" = "0 1 0 1" ]; then ok "--strict-holes fails build and typecheck on a hole"; else fail "--strict-holes: statuses '$got', want '0 1 0 1'"; fi
+printf 'fn f(x: Int) : Int = x\n# @probe type 1:22\nfn main() : Int = 0\n' > "$TMP/prog/probe.kai"
+case "$("$KAI" typecheck --library-mode "$TMP/prog/probe.kai" 2>&1)" in
+  '{"file": '*'"type": "Int"}]}') ok "typecheck --library-mode answers the probes" ;;
+  *) fail "typecheck --library-mode" ;;
 esac
 traces="$(KAI_TRACE_RC=1 "$KAI" run "$TMP/prog/hello.kai" 2>&1 | grep -c 'KAI_TRACE_RC\] alloc_total=' || true)"
 if [ "$traces" = "1" ]; then ok "run: the RC trace is the program's alone"; else fail "run: $traces RC trace lines, want 1"; fi
@@ -149,6 +191,28 @@ expect_line "test ./...: every package" 0 "kai: all package tests passed (2 pack
 expect "typecheck: a library checks every module it owns" 0 "kai: lib.kai
 kai: lib_test.kai
 kai: tests/t.kai" sh -c 'cd "$1" && "$2" typecheck' _ "$TMP/ws/lib" "$KAI"
+# A JSON report is one document per line, one line per compilation root.
+got="$(cd "$TMP/ws/lib" && "$KAI" lint --json 2>/dev/null)"
+if [ "$(printf '%s\n' "$got" | grep -c '^\[.*\]$')" = 3 ] && [ "$(printf '%s\n' "$got" | wc -l | tr -d ' ')" = 3 ]; then
+  ok "lint --json: a library is one array per module, one per line"
+else
+  fail "lint --json over a library"; printf '%s\n' "$got" | sed 's/^/        /'
+fi
+got="$(cd "$TMP/ws/lib" && "$KAI" typecheck --diags-json 2>/dev/null)"
+if [ "$(printf '%s\n' "$got" | grep -c '^{"file": .*"diagnostics": .*}$')" = 3 ] && [ "$(printf '%s\n' "$got" | wc -l | tr -d ' ')" = 3 ]; then
+  ok "typecheck --diags-json: a library is one object per module, one per line"
+else
+  fail "typecheck --diags-json over a library"; printf '%s\n' "$got" | sed 's/^/        /'
+fi
+# Block ids name the file relative to where kai test runs; ./... owns --json and --only.
+expect "test ids: relative to the package run" 0 "extra_test.kai:extra main.kai:entry tests/a.kai:sibling " test_ids "$Q"
+expect "test ids: led by the sub-package dir" 0 "pkg/extra_test.kai:extra pkg/main.kai:entry pkg/tests/a.kai:sibling " test_ids "$TMP/ws" ./pkg
+expect "test ./... --json: every package's records, ids led by its dir" 0 \
+  "lib/lib_test.kai:lib pkg/extra_test.kai:extra pkg/main.kai:entry pkg/tests/a.kai:sibling " test_ids "$TMP/ws" ./...
+expect "test ./... --only: selects across packages" 0 "lib/lib_test.kai:lib pkg/main.kai:entry " \
+  test_ids "$TMP/ws" --only lib/lib_test.kai:lib --only pkg/main.kai:entry ./...
+expect_line "test ./... --only: no match is exit 1" 1 "kai: no test matched --only" \
+  sh -c 'cd "$1" && { "$2" test --backend=c --only nomatch ./... >"$3" 2>&1; rc=$?; tail -1 "$3"; exit $rc; }' _ "$TMP/ws" "$KAI" "$TMP/rec.log"
 expect "bench: --iters must be positive" 2 \
   "kai: error: --iters value must be a positive integer (got: 0)" "$KAI" bench --iters 0 x.kai
 expect "check: --backend is validated" 2 \
@@ -198,7 +262,24 @@ case "$(uname -s)" in
 esac
 expect "env: installed prefix" 0 "KAIKAI_HOME=$P
 KAI_STDLIB=$P/share/kaikai/stdlib
-KAI_TOOLCHAIN_ID=$ptid" env KAIKAI_HOME="$TMP/home" "$P/bin/kai" env
+KAI_TOOLCHAIN_ID=$ptid
+KAI_KAIC2=$P/libexec/kaikai/kaic2" env KAIKAI_HOME="$TMP/home" "$P/bin/kai" env
+got="$("$P/bin/kai" --version | sed -n 's/^native p2: *//p')"
+if [ "$got" = "optout (this installation ships no runtime bitcode)" ]; then
+  ok "--version: an installation without the bitcode says so"
+else
+  fail "--version p2 line in an installation: '$got'"
+fi
+# Every name a release installs is reserved, whether or not this prefix has it.
+for name in $(sed -n -E 's#.*"\$STAGE/(bin|libexec/kaikai)/([^"]+)".*#\2#p' "$ROOT/scripts/build-release.sh" \
+  | sed 's#.*/##' | LC_ALL=C sort -u); do
+  mkdir -p "$TMP/reserved/$name"
+  printf 'name = "%s"\n' "$name" > "$TMP/reserved/$name/kai.toml"
+  printf 'fn main() : Int = 0\n' > "$TMP/reserved/$name/main.kai"
+  expect_line "install: '$name' is reserved in an installation" 1 \
+    "kai: error: refusing to install '$name': the name is reserved by the kaikai toolchain" \
+    "$P/bin/kai" install "$TMP/reserved/$name"
+done
 ln -s "$P/bin/kai" "$TMP/kai-link"
 expect "env: through a symlinked bin/kai" 0 "$P" "$TMP/kai-link" env KAIKAI_HOME
 mkdir -p "$TMP/brew/bin"

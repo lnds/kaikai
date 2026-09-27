@@ -71,6 +71,18 @@ picture.
 
 See `docs/lsp.md` for the LSP hover format that wraps the same data.
 
+## Holes in a build
+
+A hole does not fail a build: it is a warning, and the binary panics
+if execution reaches it. `--strict-holes` turns every unfilled hole
+into an error, exit 1 — the gate a CI uses to keep holes off a
+branch:
+
+```sh
+kai build --strict-holes .
+kai typecheck --strict-holes .      # same gate, no codegen
+```
+
 ## Where holes are legal
 
 Three positions today:

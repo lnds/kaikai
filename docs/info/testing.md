@@ -18,8 +18,8 @@ matcher DSL — `assert x == 42` is enough. `assert` belongs inside
 
 ```text
 kai test [<spec>|./...]            # run tests
-kai test --json [<spec>]           # machine-readable results
-kai test --only <id> [<spec>]      # run named blocks (repeatable)
+kai test --json [<spec>|./...]     # machine-readable results
+kai test --only <id> [<spec>|./...]  # run named blocks (repeatable)
 kai bench [<spec>] [--iters N]     # run benchmarks
 kai check [<spec>]                 # run property blocks
 ```
@@ -157,8 +157,10 @@ moves to stderr, so the stream stays parseable.
 {"type":"summary","passed":41,"failed":1,"duration_ms":812}
 ```
 
-An `id` is `<file>:<test name>` — the path as given to `kai test` —
-and is stable across runs while the block's name and file hold.
+An `id` is `<file>:<test name>`, the file relative to the directory
+`kai test` runs in, and is stable across runs while the block's name
+and file hold. Under `./...` that directory is where the walk starts,
+so every package's ids carry its directory and stay distinct.
 
 `--only <id>` runs just the named blocks, spelled as `--json` emits
 them, and repeats to name several. The exit code covers the selected
@@ -167,6 +169,7 @@ set; an `--only` that matches nothing is an error, not an empty pass.
 ```sh
 kai test --json .
 kai test --only 'tests/planner_test.kai:orders sites' .
+kai test --json --only 'planner/tests/planner_test.kai:orders sites' ./...
 ```
 
 ## Exit codes

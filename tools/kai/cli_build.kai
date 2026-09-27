@@ -12,12 +12,6 @@ import cli_spec
 import cli_sys
 import cli_toolchain
 
-const REPORT_FLAGS : [String] = [
-  "--holes", "--holes-json", "--holes-scope", "--holes-json-scope", "--diags-json",
-  "--effects-json",
-  "--effect-holes-json", "--library-mode"
-]
-
 type Opts = {
   spec: String,
   out: String,
@@ -25,17 +19,20 @@ type Opts = {
   backend: String,
   opt: String,
   mode: String,
+  strict: Bool,
   help: Bool
 }
 
 fn no_opts() : Opts =
-  Opts { spec: "", out: "", report: "", backend: "", opt: "", mode: "", help: false }
-
-fn backend_value(v: String) : Result[String, Int] / Stderr =
-  if v == "c" or v == "native" {
-    Ok(v)
-  } else {
-    cli_err.die("--backend must be 'c' or 'native' (got: #{v})")
+  Opts {
+    spec: "",
+    out: "",
+    report: "",
+    backend: "",
+    opt: "",
+    mode: "",
+    strict: false,
+    help: false
   }
 
 # Flags `build` and `run` share; `None` when `a` is not one of them.
@@ -46,14 +43,14 @@ fn common_flag(
 ) : Option[Result[(Opts, [String]), Int]] / Stderr =
   if string.starts_with(a, "--backend=") {
     Some(
-      backend_value(string.drop_prefix(a, "--backend=").unwrap_or("")).map(
+      cli_compile.backend_name(string.drop_prefix(a, "--backend=").unwrap_or("")).map(
         b => (Opts { ...o, backend: b }, rest)
       )
     )
   } else if a == "--backend" {
     match rest {
       [] -> Some(cli_err.die("--backend needs an argument (c|native)"))
-      [v, ...more] -> Some(backend_value(v).map(b => (Opts { ...o, backend: b }, more)))
+      [v, ...more] -> Some(cli_compile.backend_name(v).map(b => (Opts { ...o, backend: b }, more)))
     }
   } else if a == "--debug" {
     Some(Ok((Opts { ...o, opt: "0", mode: "debug" }, rest)))
@@ -63,22 +60,31 @@ fn common_flag(
     None
   }
 
+# What `build` reports instead of a binary, and how holes count; `None` when `a` is neither.
+fn report_flag(
+  a: String,
+  rest: [String],
+  o: Opts
+) : Option[Result[(Opts, [String]), Int]] / Stderr =
+  if a == "--strict-holes" {
+    Some(Ok((Opts { ...o, strict: true }, rest)))
+  } else if not cli_compile.REPORT_FLAGS.contains(a) {
+    None
+  } else if o.report != "" {
+    Some(cli_err.die("report-mode flags are mutually exclusive"))
+  } else {
+    Some(Ok((Opts { ...o, report: a }, rest)))
+  }
+
 fn build_flag(a: String, rest: [String], o: Opts) : Result[(Opts, [String]), Int] / Stderr =
   if a == "-o" {
     match rest {
       [] -> cli_err.die("-o needs an argument")
       [v, ...more] -> Ok((Opts { ...o, out: v }, more))
     }
-  } else if REPORT_FLAGS.contains(a) {
-    if o.report != "" {
-      cli_err.die("report-mode flags are mutually exclusive")
-    } else {
-      Ok((Opts { ...o, report: a }, rest))
-    }
   } else if string.starts_with(a, "-") {
-    common_flag(a, rest, o).unwrap_or_else(
-      () => cli_err.die("unknown flag: #{a} (see 'kai build --help')")
-    )
+    let flag = report_flag(a, rest, o).or_else(() => common_flag(a, rest, o))
+    flag.unwrap_or_else(() => cli_err.die("unknown flag: #{a} (see 'kai build --help')"))
   } else if o.spec != "" {
     cli_err.die("only one input supported")
   } else {
@@ -110,6 +116,8 @@ fn parse_run(args: [String], o: Opts) : Result[(Opts, [String]), Int] / Stderr =
     _ -> Ok((o, args))
   }
 
+fn strict_flag(o: Opts) : [String] = if o.strict { ["--strict-holes"] } else { [] }
+
 fn export_profile(o: Opts) : Unit / Env {
   let _ = env.set("KAI_NATIVE_OPT", if o.opt == "" { "2" } else { o.opt })
   let _ = env.set("KAI_BUILD_MODE", if o.mode == "" { "default" } else { o.mode })
@@ -129,13 +137,17 @@ fn entry(spec: String, verb: String) : Result[String, Int] / Stderr + File + Ffi
   if src == "" { cli_err.die("missing input file (see 'kai #{verb} --help')") } else { Ok(src) }
 }
 
-fn report(t: Toolchain, src: String, o: Opts) : Result[Int, Int] / Stderr + Env + File + Ffi =
+fn report(
+  t: Toolchain,
+  src: String,
+  o: Opts
+) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi =
   if o.out != "" {
     cli_err.die("#{o.report} does not produce a binary; drop -o <out>")
   } else if o.backend != "" {
     cli_err.die("#{o.report} is independent of --backend; drop the flag")
   } else {
-    cli_fs.with_scratch(tmp => cli_compile.report(t, src, o.report, tmp))
+    cli_fs.with_scratch(tmp => cli_compile.report(t, src, [o.report, ...strict_flag(o)], tmp))
   }
 
 fn build_binary(t: Toolchain, src: String, o: Opts) : Result[Int, Int] / Stderr + Env + File + Ffi {
@@ -143,7 +155,12 @@ fn build_binary(t: Toolchain, src: String, o: Opts) : Result[Int, Int] / Stderr 
   export_profile(o)
   let out = if o.out == "" { default_out(src) } else { o.out }
   cli_fs.with_scratch(
-    tmp => build_in(t, b, cli_plan.Job { src, tmp, out, verb: "build", extra: [] }, o.mode)
+    tmp => build_in(
+      t,
+      b,
+      cli_plan.Job { src, tmp, out, verb: "build", extra: strict_flag(o) },
+      o.mode
+    )
   )
 }
 

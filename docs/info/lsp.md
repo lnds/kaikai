@@ -112,8 +112,9 @@ lspconfig.kaikai.setup({})
 | -------------- | -------------------------------------------------- |
 | `KAILSP_KAIC2` | Override the `kaic2` binary path used for probes. |
 
-The `kai` wrapper sets `KAILSP_KAIC2` automatically. Override only
-when running the LSP outside the wrapper.
+Unset, the server uses `KAI_KAIC2`, which `kai lsp` exports as
+`kai env` reports it. Set `KAILSP_KAIC2` only to point the server at
+another compiler, or when running it outside the wrapper.
 
 ## Known limitations
 

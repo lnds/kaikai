@@ -9,14 +9,12 @@ import cli_spec
 import cli_test_help
 import cli_tool_help
 
-const REPORT_FLAGS : [String] = [
-  "--holes", "--holes-json", "--holes-scope", "--holes-json-scope", "--diags-json",
-  "--effects-json", "--effect-holes-json"
-]
-
 type RunnerOpts = { iters: String, backend: String, help: Bool }
 
 const NO_OPTS : RunnerOpts = RunnerOpts { iters: "", backend: "", help: false }
+
+fn with_backend(o: RunnerOpts, v: String, rest: [String]) : Result[(RunnerOpts, [String]), Int] / Stderr =
+  cli_compile.backend_name(v).map(b => (RunnerOpts { ...o, backend: b }, rest))
 
 fn backend_flag(
   args: [String],
@@ -24,11 +22,9 @@ fn backend_flag(
 ) : Option[Result[(RunnerOpts, [String]), Int]] / Stderr =
   match args {
     ["--backend"] -> Some(cli_err.die("--backend needs an argument (c|native)"))
-    ["--backend", v, ...rest] -> Some(Ok((RunnerOpts { ...o, backend: v }, rest)))
+    ["--backend", v, ...rest] -> Some(with_backend(o, v, rest))
     [a, ...rest] if string.starts_with(a, "--backend=") ->
-      Some(
-        Ok((RunnerOpts { ...o, backend: string.drop_prefix(a, "--backend=").unwrap_or("") }, rest))
-      )
+      Some(with_backend(o, string.drop_prefix(a, "--backend=").unwrap_or(""), rest))
     _ -> None
   }
 
@@ -118,8 +114,6 @@ pub fn check_verb(
   if o.help {
     Stdout.print(cli_test_help.check_text())
     Ok(0)
-  } else if not (o.backend == "" or o.backend == "c" or o.backend == "native") {
-    cli_err.die("--backend must be 'c' or 'native' (got: #{o.backend})")
   } else {
     let b = cli_compile.resolve_backend(o.backend)!
     let target = cli_blocks.target(parsed.snd, "check")!
@@ -128,13 +122,14 @@ pub fn check_verb(
   }
 }
 
-type TypecheckOpts = { spec: String, mode: String, help: Bool }
+type TypecheckOpts = { spec: String, mode: String, strict: Bool, help: Bool }
 
 fn parse_typecheck(args: [String], o: TypecheckOpts) : Result[TypecheckOpts, Int] / Stderr =
   match args {
     [] -> Ok(o)
     [a, ..._] if a == "-h" or a == "--help" -> Ok(TypecheckOpts { ...o, help: true })
-    [a, ...rest] if REPORT_FLAGS.contains(a) ->
+    ["--strict-holes", ...rest] -> parse_typecheck(rest, TypecheckOpts { ...o, strict: true })
+    [a, ...rest] if cli_compile.REPORT_FLAGS.contains(a) ->
       if o.mode != "" {
         cli_err.die("report-mode flags are mutually exclusive")
       } else {
@@ -150,26 +145,26 @@ fn parse_typecheck(args: [String], o: TypecheckOpts) : Result[TypecheckOpts, Int
       }
   }
 
-fn report_one(t: Toolchain, root: String, flag: String, tmp: String, rel: String, status: Int) : Result[Int, Int] / Stderr + Env + File + Ffi = {
+fn report_one(t: Toolchain, root: String, mode: [String], tmp: String, rel: String, status: Int) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi = {
   Stderr.eprint("kai: #{rel}")
-  let rc = cli_compile.report(t, "#{root}/#{rel}", flag, tmp)!
+  let rc = cli_compile.report(t, "#{root}/#{rel}", mode, tmp)!
   Ok(if rc != 0 { 1 } else { status })
 }
 
-# Every module the package owns, each its own compilation root: with no entry there is no import graph to walk.
+# Every module the package owns, each its own compilation root and so its own report: with no entry there is no import graph to walk.
 fn report_package(
   t: Toolchain,
   pkg: String,
-  flag: String,
+  mode: [String],
   tmp: String
-) : Result[Int, Int] / Stderr + Env + File + Ffi {
+) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
   let root = cli_fs.absolute(pkg)
   let tests = cli_blocks.tests_of(root) | (p => string.drop_prefix(p, "#{root}/").unwrap_or(p))
   let files = cli_blocks.source_files(root) ++ tests
   if list.is_empty(files) {
     cli_err.die("no .kai files found in #{pkg}")
   } else {
-    cli_blocks.fold_files(files, 0, (rel, st) => report_one(t, root, flag, tmp, rel, st))
+    cli_blocks.fold_files(files, 0, (rel, st) => report_one(t, root, mode, tmp, rel, st))
   }
 }
 
@@ -178,33 +173,33 @@ fn report_spec(
   t: Toolchain,
   spec: String,
   action: String,
-  flag: String,
+  mode: [String],
   verb: String,
   tmp: String
-) : Result[Int, Int] / Stderr + Env + File + Ffi {
+) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
   let src = cli_spec.resolve(spec, action, true)!
   let root = cli_blocks.package_root(spec)
   if src != "" {
-    cli_compile.report(t, src, flag, tmp)
+    cli_compile.report(t, src, mode, tmp)
   } else if root == "" {
     cli_err.die("missing input file (see 'kai #{verb} --help')")
   } else {
-    report_package(t, root, flag, tmp)
+    report_package(t, root, mode, tmp)
   }
 }
 
-#[doc("`kai typecheck [<report flag>] [<spec>]`: the front end alone, exit 1 on any diagnostic error.")]
+#[doc("`kai typecheck [<report flag>] [--strict-holes] [<spec>]`: the front end alone, exit 1 on any diagnostic error.")]
 pub fn typecheck_verb(
   t: Toolchain,
   args: [String]
 ) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
-  let o = parse_typecheck(args, TypecheckOpts { spec: "", mode: "", help: false })!
+  let o = parse_typecheck(args, TypecheckOpts { spec: "", mode: "", strict: false, help: false })!
   if o.help {
     Stdout.print(cli_test_help.typecheck_text())
     Ok(0)
   } else {
-    let flag = if o.mode == "" { "--check" } else { o.mode }
-    cli_fs.with_scratch(tmp => report_spec(t, o.spec, "checking", flag, "typecheck", tmp))
+    let mode = [if o.mode == "" { "--check" } else { o.mode }] ++ (if o.strict { ["--strict-holes"] } else { [] })
+    cli_fs.with_scratch(tmp => report_spec(t, o.spec, "checking", mode, "typecheck", tmp))
   }
 }
 
@@ -235,7 +230,7 @@ pub fn lint_verb(
     Stdout.print(cli_tool_help.lint_text())
     Ok(0)
   } else {
-    let flag = if o.json { "--lint-json" } else { "--lint" }
-    cli_fs.with_scratch(tmp => report_spec(t, o.spec, "linting", flag, "lint", tmp))
+    let mode = [if o.json { "--lint-json" } else { "--lint" }]
+    cli_fs.with_scratch(tmp => report_spec(t, o.spec, "linting", mode, "lint", tmp))
   }
 }
