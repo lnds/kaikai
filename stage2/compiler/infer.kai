@@ -40,6 +40,7 @@ import compiler.fixed_vec_match
 import compiler.home_spell
 import compiler.infer_unit_alias
 import compiler.tycon_scheme_home
+import compiler.scope_file
 import compiler.homonym
 
 # ====================================================================
@@ -472,7 +473,7 @@ fn inf_mangle_ty(t: Ty) : String {
       "F_", inf_join_with(map(ps, inf_mangle_ty), "_"),
       "_R_", inf_mangle_ty(ret), "_E"
     ])
-    TyCon(_, cname, tas) -> {
+    TyCon(_, cname, tas, _) -> {
       match tas {
         [] -> cname
         [_h, ..._rest] -> concat_all([cname, "_O_",
@@ -913,7 +914,7 @@ fn inf_resolve_ty(t: TypeExpr, hv: TyHomeView) : Ty {
     # a compound row reaching *type* position (not dissolved
     # by alias substitution) — resolve to an undeclared name so the
     # natural "unknown type" cascade reports it.
-    TyRow(_) -> TyCon(None, "__row_in_type_position__", [])
+    TyRow(_) -> TyCon(None, "__row_in_type_position__", [], sym_none())
     TySurface(_) -> panic("inf_resolve_ty: surface type not lowered")
   }
 }
@@ -1126,8 +1127,8 @@ fn inf_ty_eq(a: Ty, b: Ty) : Bool {
     # Used by the monomorphiser to key specialisations; without
     # this check, `tuple.Pair` and a user-defined `Pair` would
     # collapse to one mangled symbol.
-    TyCon(am, an, atas) -> match b {
-      TyCon(bm, bn, btas) -> module_slot_compat(am, bm) and an == bn and inf_ty_list_eq(atas, btas)
+    TyCon(am, an, atas, _) -> match b {
+      TyCon(bm, bn, btas, _) -> module_slot_compat(am, bm) and an == bn and inf_ty_list_eq(atas, btas)
       _ -> false
     }
     TyDimT(ab, _) -> match b { TyDimT(bb, _) -> inf_ty_eq(ab, bb) _ -> false }
@@ -1152,7 +1153,7 @@ fn inf_ty_eq(a: Ty, b: Ty) : Bool {
 fn pipe_elem_ty(t: Ty) : Option[Ty] {
   match t {
     TyListT(e)       -> Some(e)
-    TyCon(_, _, [a, ...]) -> Some(a)
+    TyCon(_, _, [a, ...], _) -> Some(a)
     _                -> None
   }
 }
@@ -1198,7 +1199,7 @@ fn inf_ty_head_name(t: Ty) : Option[String] {
     TyInt128         -> Some("Int128")
     TyHandle         -> Some("Handle")
     TyListT(_)     -> Some("List")
-    TyCon(_, name, _) -> Some(name)
+    TyCon(_, name, _, _) -> Some(name)
     # a dimensioned value dispatches on the underlying base
     # type's head — `Decimal<USD>` → `Decimal`, mirroring the
     # `proto_type_name` collapse on the syntactic side.
@@ -1280,7 +1281,7 @@ pub fn inf_ty_to_string_ow(owners: [HeadOwnerEntry], t: Ty) : String {
       inf_ty_to_string_ow(owners, ret),
       inf_row_to_string_suffix(row)
     ])
-    TyCon(_, cname, tas) -> {
+    TyCon(_, cname, tas, _) -> {
       let shown = inf_tycon_display_ow(owners, cname)
       match tas {
         [] -> shown
@@ -1356,7 +1357,7 @@ pub fn inf_ty_to_string(t: Ty) : String {
       inf_ty_to_string(ret),
       inf_row_to_string_suffix(row)
     ])
-    TyCon(_, cname, tas) -> {
+    TyCon(_, cname, tas, _) -> {
       match tas {
         [] -> cname
         _ -> concat_all([cname, "[", inf_join_with(map(tas, inf_tycon_arg_to_string), ", "), "]"])
@@ -1899,7 +1900,7 @@ fn record_carrier_of(ty: Option[Ty]) : Option[Pair[Option[String], String]] =
 
 
 fn record_carrier_t(t: Ty) : Option[Pair[Option[String], String]] = match t {
-  TyCon(mo, name, _) -> Some(Pair { fst: mo, snd: name })
+  TyCon(mo, name, _, _) -> Some(Pair { fst: mo, snd: name })
   TyRefineT(inner, _) -> record_carrier_t(inner)
   TyDimT(inner, _)    -> record_carrier_t(inner)
   _ -> None
@@ -2843,11 +2844,11 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
                # `let s : Stream[String, File + ReadFault]` annotation
                # unifies with the inferred carrier.
                row_kind: [RowKindEntry],
-               # the whole-program type-home table (`tsh_collect`). Lets
+               # the whole-program type-home table (`tsh_homes`). Lets
                # any resolver reached from the env stamp a nominal type's
-               # module slot, so the annotation side of a type agrees with
+               # module slot and identity, so the annotation side of a type agrees with
                # the constructor scheme and the record table.
-               ty_homes: [TyHomeEntry],
+               ty_homes: TyHomes,
                # name index over `entries`, keyed by each entry's bucket
                # key (last `::`-segment). Mirrors `entries` exactly: every
                # prepend to `entries` prepends to this index too, so
@@ -2874,10 +2875,14 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
 pub type HeadOwnerEntry = HOE(String, [String])
 
 #[doc("infer: the empty typing environment.")]
-pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], ty_homes: [], index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }
+pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }
 
 # What a bare type name in the program being typed denotes.
-fn env_home_view(env: TyEnv) : TyHomeView = tsh_view(env.ty_homes, None)
+fn env_home_view(env: TyEnv, mo: Option[String]) : TyHomeView = tsh_view(env.ty_homes, mo)
+
+fn st_home_view(st: InferState) : TyHomeView = env_home_view(st.env, st_mo(st))
+
+fn st_mo(st: InferState) : Option[String] = if st.home == "" { None } else { Some(st.home) }
 
 fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv {
   let k = ty_bucket_key(name)
@@ -3256,30 +3261,30 @@ pub fn add_core_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "core_program_name", scheme: mono(fn_ty([], TyString)) },
     TyEntry { name: "stdlib_path",    scheme: mono(fn_ty([], TyString)) },
     TyEntry { name: "abspath",        scheme: mono(fn_ty([TyString], TyString)) },
-    TyEntry { name: "read_file",      scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyString, TyString]), ["File"])) },
-    TyEntry { name: "write_file",     scheme: mono(fn_ty_eff([TyString, TyString], TyCon(None, "Result", [TyUnit, TyString]), ["File"])) },
+    TyEntry { name: "read_file",      scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyString, TyString], sym_none()), ["File"])) },
+    TyEntry { name: "write_file",     scheme: mono(fn_ty_eff([TyString, TyString], TyCon(None, "Result", [TyUnit, TyString], sym_none()), ["File"])) },
     # fs/file expansion. `file_exists` returns Bool;
     # `file_delete` / `file_rename` return Result[Unit, String] (Ok
     # first). All three carry the `File` effect in their scheme row.
     TyEntry { name: "file_exists",    scheme: mono(fn_ty_eff([TyString], TyBool, ["File"])) },
-    TyEntry { name: "file_delete",    scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyUnit, TyString]), ["File"])) },
-    TyEntry { name: "file_rename",    scheme: mono(fn_ty_eff([TyString, TyString], TyCon(None, "Result", [TyUnit, TyString]), ["File"])) },
+    TyEntry { name: "file_delete",    scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyUnit, TyString], sym_none()), ["File"])) },
+    TyEntry { name: "file_rename",    scheme: mono(fn_ty_eff([TyString, TyString], TyCon(None, "Result", [TyUnit, TyString], sym_none()), ["File"])) },
     # Binary file IO. Both ride the `File` effect in their scheme row.
     # `file_read_bytes` returns Result[Array[Byte], String] so the
     # buffer surface lines up with BinSerialize — cache
     # layers and crypto consumers round-trip bytes (including 0x00)
     # without paying a list-to-array conversion at the boundary.
     # `file_write_bytes` is the symmetric write.
-    TyEntry { name: "file_read_bytes",  scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyCon(None, "Array", [TyByte]), TyString]), ["File"])) },
-    TyEntry { name: "file_write_bytes", scheme: mono(fn_ty_eff([TyString, TyCon(None, "Array", [TyByte])], TyCon(None, "Result", [TyUnit, TyString]), ["File"])) },
+    TyEntry { name: "file_read_bytes",  scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyCon(None, "Array", [TyByte], sym_none()), TyString], sym_none()), ["File"])) },
+    TyEntry { name: "file_write_bytes", scheme: mono(fn_ty_eff([TyString, TyCon(None, "Array", [TyByte], sym_none())], TyCon(None, "Result", [TyUnit, TyString], sym_none()), ["File"])) },
     # fs/dir surface. list_dir / walk return [String]
     # (cons-list); create_dir / remove_dir return Result[Unit, String]
     # (Ok first). All four carry the `File` effect in their scheme row.
     TyEntry { name: "dir_list_dir",   scheme: mono(fn_ty_eff([TyString], list_ty(TyString), ["File"])) },
-    TyEntry { name: "dir_create_dir", scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyUnit, TyString]), ["File"])) },
-    TyEntry { name: "dir_remove_dir", scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyUnit, TyString]), ["File"])) },
+    TyEntry { name: "dir_create_dir", scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyUnit, TyString], sym_none()), ["File"])) },
+    TyEntry { name: "dir_remove_dir", scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyUnit, TyString], sym_none()), ["File"])) },
     TyEntry { name: "dir_walk",       scheme: mono(fn_ty_eff([TyString], list_ty(TyString), ["File"])) },
-    TyEntry { name: "read_line",      scheme: mono(fn_ty_eff([], TyCon(None, "Result", [TyString, TyString]), ["Stdin"])) },
+    TyEntry { name: "read_line",      scheme: mono(fn_ty_eff([], TyCon(None, "Result", [TyString, TyString], sym_none()), ["Stdin"])) },
     # byte-oriented stdin read. Returns a String of at
     # most `n` bytes; on EOF the result is shorter (possibly empty).
     # No Result wrapper — the LSP framing use case treats a short
@@ -3295,8 +3300,8 @@ pub fn add_core_sigs(env: TyEnv) : TyEnv {
     # Conversions
     TyEntry { name: "int_to_string",  scheme: mono(fn_ty([TyInt],    TyString)) },
     TyEntry { name: "real_to_string", scheme: mono(fn_ty([TyReal],   TyString)) },
-    TyEntry { name: "string_to_int",  scheme: mono(fn_ty([TyString], TyCon(None, "Option", [TyInt]))) },
-    TyEntry { name: "string_to_real", scheme: mono(fn_ty([TyString], TyCon(None, "Option", [TyReal]))) },
+    TyEntry { name: "string_to_int",  scheme: mono(fn_ty([TyString], TyCon(None, "Option", [TyInt], sym_none()))) },
+    TyEntry { name: "string_to_real", scheme: mono(fn_ty([TyString], TyCon(None, "Option", [TyReal], sym_none()))) },
     TyEntry { name: "char_to_int",    scheme: mono(fn_ty([TyChar],   TyInt)) },
     TyEntry { name: "int_to_char",    scheme: mono(fn_ty([TyInt],    TyChar)) },
     # 1-byte raw String constructor (cache codec primitive).
@@ -3320,11 +3325,11 @@ pub fn add_core_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "int_to_le8", scheme: mono(fn_ty([TyInt], TyString)) },
     # Array[Byte] block primitives. The writers mutate their first argument
     # in place and return it; the readers are effect-free.
-    TyEntry { name: "bytes_blit",       scheme: mono(fn_ty_eff([TyCon(None, "Array", [TyByte]), TyInt, TyCon(None, "Array", [TyByte]), TyInt, TyInt], TyCon(None, "Array", [TyByte]), ["Mutable"])) },
-    TyEntry { name: "bytes_put_le",     scheme: mono(fn_ty_eff([TyCon(None, "Array", [TyByte]), TyInt, TyInt, TyInt], TyCon(None, "Array", [TyByte]), ["Mutable"])) },
-    TyEntry { name: "bytes_get_le",     scheme: mono(fn_ty([TyCon(None, "Array", [TyByte]), TyInt, TyInt], TyInt)) },
-    TyEntry { name: "bytes_put_string", scheme: mono(fn_ty_eff([TyCon(None, "Array", [TyByte]), TyInt, TyString], TyCon(None, "Array", [TyByte]), ["Mutable"])) },
-    TyEntry { name: "bytes_get_string", scheme: mono(fn_ty([TyCon(None, "Array", [TyByte]), TyInt, TyInt], TyString)) },
+    TyEntry { name: "bytes_blit",       scheme: mono(fn_ty_eff([TyCon(None, "Array", [TyByte], sym_none()), TyInt, TyCon(None, "Array", [TyByte], sym_none()), TyInt, TyInt], TyCon(None, "Array", [TyByte], sym_none()), ["Mutable"])) },
+    TyEntry { name: "bytes_put_le",     scheme: mono(fn_ty_eff([TyCon(None, "Array", [TyByte], sym_none()), TyInt, TyInt, TyInt], TyCon(None, "Array", [TyByte], sym_none()), ["Mutable"])) },
+    TyEntry { name: "bytes_get_le",     scheme: mono(fn_ty([TyCon(None, "Array", [TyByte], sym_none()), TyInt, TyInt], TyInt)) },
+    TyEntry { name: "bytes_put_string", scheme: mono(fn_ty_eff([TyCon(None, "Array", [TyByte], sym_none()), TyInt, TyString], TyCon(None, "Array", [TyByte], sym_none()), ["Mutable"])) },
+    TyEntry { name: "bytes_get_string", scheme: mono(fn_ty([TyCon(None, "Array", [TyByte], sym_none()), TyInt, TyInt], TyString)) },
     TyEntry { name: "real_bits",   scheme: mono(fn_ty([TyReal],   TyInt)) },
     # int_to_real: lossless cast (Int → Real). Used by stdlib/math/real.kai
     # for floor/ceil/round/trunc, which need to round-trip through Int.
@@ -3339,7 +3344,7 @@ pub fn add_core_sigs(env: TyEnv) : TyEnv {
     # `u8_to_int` is lossless widening. Arithmetic
     # (`u8_add`, `u8_sub`) wraps mod 256 per the C `uint8_t` semantics
     # — overflow is defined, not UB. Comparison ops mirror Int.
-    TyEntry { name: "int_to_byte",      scheme: mono(fn_ty([TyInt],            TyCon(None, "Result", [TyByte, TyString]))) },
+    TyEntry { name: "int_to_byte",      scheme: mono(fn_ty([TyInt],            TyCon(None, "Result", [TyByte, TyString], sym_none()))) },
     TyEntry { name: "byte_to_int",      scheme: mono(fn_ty([TyByte],             TyInt)) },
     TyEntry { name: "byte_add",         scheme: mono(fn_ty([TyByte, TyByte],       TyByte)) },
     TyEntry { name: "byte_sub",         scheme: mono(fn_ty([TyByte, TyByte],       TyByte)) },
@@ -3399,7 +3404,7 @@ pub fn add_core_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "string_slice",   scheme: mono(fn_ty([TyString, TyInt, TyInt],  TyString)) },
     TyEntry { name: "string_split",   scheme: mono(fn_ty([TyString, TyString],      list_ty(TyString))) },
     TyEntry { name: "string_contains",scheme: mono(fn_ty([TyString, TyString],      TyBool)) },
-    TyEntry { name: "char_at",        scheme: mono(fn_ty([TyString, TyInt],         TyCon(None, "Option", [TyChar]))) },
+    TyEntry { name: "char_at",        scheme: mono(fn_ty([TyString, TyInt],         TyCon(None, "Option", [TyChar], sym_none()))) },
 
     # Lists (monomorphic over element type `0`).
     TyEntry { name: "list_length",    scheme: scheme([0], fn_ty([list_ty(tv(0))],                    TyInt)) },
@@ -3426,13 +3431,13 @@ pub fn add_core_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "each",   scheme: scheme_full([0],    [0], TyFnT([list_ty(tv(0)), TyFnT([tv(0)], TyUnit, row_with_tail(0))], TyUnit, row_with_tail(0))) },
 
     # Opaque mutable arrays.
-    TyEntry { name: "array_make",   scheme: scheme([0], fn_ty([TyInt, tv(0)],                                TyCon(None, "Array", [tv(0)]))) },
+    TyEntry { name: "array_make",   scheme: scheme([0], fn_ty([TyInt, tv(0)],                                TyCon(None, "Array", [tv(0)], sym_none()))) },
     # Length-0 array of any element type — the polymorphic empty no
     # `array_make` can build, since `array_make` needs a reified `init`
     # even for n=0. Effect-free (no slot is observably written).
-    TyEntry { name: "array_empty",  scheme: scheme([0], fn_ty([],                                            TyCon(None, "Array", [tv(0)]))) },
-    TyEntry { name: "array_length", scheme: scheme([0], fn_ty([TyCon(None, "Array", [tv(0)])],                      TyInt)) },
-    TyEntry { name: "array_get",    scheme: scheme([0], fn_ty([TyCon(None, "Array", [tv(0)]), TyInt],               tv(0))) },
+    TyEntry { name: "array_empty",  scheme: scheme([0], fn_ty([],                                            TyCon(None, "Array", [tv(0)], sym_none()))) },
+    TyEntry { name: "array_length", scheme: scheme([0], fn_ty([TyCon(None, "Array", [tv(0)], sym_none())],                      TyInt)) },
+    TyEntry { name: "array_get",    scheme: scheme([0], fn_ty([TyCon(None, "Array", [tv(0)], sym_none()), TyInt],               tv(0))) },
     # bare `array_set` / `array_grow` (the desugar of `a[i] := v`)
     # raise the `Mutable` demand on the caller's row via their scheme. The
     # provenance-masking pass (`mask_local_mutable_demand`) still drops
@@ -3440,41 +3445,41 @@ pub fn add_core_sigs(env: TyEnv) : TyEnv {
     # it gates on the label being present and walks the AST by name, so it is
     # agnostic to how the label entered the row. `array_make` / `array_length`
     # / `array_get` stay effect-free (constructor and reads).
-    TyEntry { name: "array_set",    scheme: scheme([0], fn_ty_eff([TyCon(None, "Array", [tv(0)]), TyInt, tv(0)], TyCon(None, "Array", [tv(0)]), ["Mutable"])) },
-    TyEntry { name: "array_grow",   scheme: scheme([0], fn_ty_eff([TyCon(None, "Array", [tv(0)]), TyInt, tv(0)], TyCon(None, "Array", [tv(0)]), ["Mutable"])) },
+    TyEntry { name: "array_set",    scheme: scheme([0], fn_ty_eff([TyCon(None, "Array", [tv(0)], sym_none()), TyInt, tv(0)], TyCon(None, "Array", [tv(0)], sym_none()), ["Mutable"])) },
+    TyEntry { name: "array_grow",   scheme: scheme([0], fn_ty_eff([TyCon(None, "Array", [tv(0)], sym_none()), TyInt, tv(0)], TyCon(None, "Array", [tv(0)], sym_none()), ["Mutable"])) },
     # Vec[T] — the pure value vector. Every op is EFFECT-FREE: `vec_set` /
     # `vec_push` return the result vector instead of mutating a reference,
     # so no `Mutable` demand ever enters the row. The runtime mutates in
     # place only behind the rc==1 uniqueness check, which no witness can
     # observe; a shared vector copies on write.
-    TyEntry { name: "vec_make",   scheme: scheme([0], fn_ty([TyInt, tv(0)],                                  TyCon(None, "Vec", [tv(0)]))) },
-    TyEntry { name: "vec_empty",  scheme: scheme([0], fn_ty([],                                              TyCon(None, "Vec", [tv(0)]))) },
-    TyEntry { name: "vec_length", scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)])],                          TyInt)) },
-    TyEntry { name: "vec_get",    scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)]), TyInt],                   tv(0))) },
-    TyEntry { name: "vec_set",    scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)]), TyInt, tv(0)],     TyCon(None, "Vec", [tv(0)]))) },
-    TyEntry { name: "vec_push",   scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)]), tv(0)],            TyCon(None, "Vec", [tv(0)]))) },
-    TyEntry { name: "vec_slice",  scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)]), TyInt, TyInt],     TyCon(None, "Vec", [tv(0)]))) },
-    TyEntry { name: "vec_tail_from", scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)]), TyInt],         TyCon(None, "Vec", [tv(0)]))) },
-    TyEntry { name: "vec_reserve", scheme: scheme([0], fn_ty([TyInt],                                        TyCon(None, "Vec", [tv(0)]))) },
-    TyEntry { name: "vec_from_list", scheme: scheme([0], fn_ty([TyListT(tv(0))],                             TyCon(None, "Vec", [tv(0)]))) },
+    TyEntry { name: "vec_make",   scheme: scheme([0], fn_ty([TyInt, tv(0)],                                  TyCon(None, "Vec", [tv(0)], sym_none()))) },
+    TyEntry { name: "vec_empty",  scheme: scheme([0], fn_ty([],                                              TyCon(None, "Vec", [tv(0)], sym_none()))) },
+    TyEntry { name: "vec_length", scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)], sym_none())],                          TyInt)) },
+    TyEntry { name: "vec_get",    scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)], sym_none()), TyInt],                   tv(0))) },
+    TyEntry { name: "vec_set",    scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)], sym_none()), TyInt, tv(0)],     TyCon(None, "Vec", [tv(0)], sym_none()))) },
+    TyEntry { name: "vec_push",   scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)], sym_none()), tv(0)],            TyCon(None, "Vec", [tv(0)], sym_none()))) },
+    TyEntry { name: "vec_slice",  scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)], sym_none()), TyInt, TyInt],     TyCon(None, "Vec", [tv(0)], sym_none()))) },
+    TyEntry { name: "vec_tail_from", scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)], sym_none()), TyInt],         TyCon(None, "Vec", [tv(0)], sym_none()))) },
+    TyEntry { name: "vec_reserve", scheme: scheme([0], fn_ty([TyInt],                                        TyCon(None, "Vec", [tv(0)], sym_none()))) },
+    TyEntry { name: "vec_from_list", scheme: scheme([0], fn_ty([TyListT(tv(0))],                             TyCon(None, "Vec", [tv(0)], sym_none()))) },
     # mailbox runtime — type-erased entries (Msg flows
     # through TyAny). The polymorphic surface is in stdlib/actor.kai
     # where `with_mailbox[Msg]` and `Actor[Msg]`'s clauses re-attach
     # the right Msg to send/receive. mailbox_alloc returns a Pid
     # whose Msg type is fresh at the call site (TyAny unifies with
     # whatever the surrounding context expects).
-    TyEntry { name: "mailbox_alloc",         scheme: scheme([0], fn_ty([],                                       TyCon(None, "Pid", [tv(0)]))) },
-    TyEntry { name: "mailbox_alloc_bounded", scheme: scheme([0], fn_ty([TyInt, TyInt],                            TyCon(None, "Pid", [tv(0)]))) },
-    TyEntry { name: "mailbox_send",          scheme: scheme([0], fn_ty([TyCon(None, "Pid", [tv(0)]), tv(0)],           TyUnit)) },
-    TyEntry { name: "mailbox_recv",          scheme: scheme([0], fn_ty([TyCon(None, "Pid", [tv(0)])],                  tv(0))) },
-    TyEntry { name: "mailbox_recv_timeout",  scheme: scheme([0], fn_ty([TyCon(None, "Pid", [tv(0)]), TyInt],          TyCon(None, "Option", [tv(0)]))) },
-    TyEntry { name: "mailbox_free",          scheme: scheme([0], fn_ty([TyCon(None, "Pid", [tv(0)])],                  TyUnit)) },
+    TyEntry { name: "mailbox_alloc",         scheme: scheme([0], fn_ty([],                                       TyCon(None, "Pid", [tv(0)], sym_none()))) },
+    TyEntry { name: "mailbox_alloc_bounded", scheme: scheme([0], fn_ty([TyInt, TyInt],                            TyCon(None, "Pid", [tv(0)], sym_none()))) },
+    TyEntry { name: "mailbox_send",          scheme: scheme([0], fn_ty([TyCon(None, "Pid", [tv(0)], sym_none()), tv(0)],           TyUnit)) },
+    TyEntry { name: "mailbox_recv",          scheme: scheme([0], fn_ty([TyCon(None, "Pid", [tv(0)], sym_none())],                  tv(0))) },
+    TyEntry { name: "mailbox_recv_timeout",  scheme: scheme([0], fn_ty([TyCon(None, "Pid", [tv(0)], sym_none()), TyInt],          TyCon(None, "Option", [tv(0)], sym_none()))) },
+    TyEntry { name: "mailbox_free",          scheme: scheme([0], fn_ty([TyCon(None, "Pid", [tv(0)], sym_none())],                  TyUnit)) },
     # Tier 2 spawn_actor — alloc-without-stamp + reassign owner.
     # Used by stdlib/actor.kai's `spawn_actor` / `spawn_actor_policy`.
-    TyEntry { name: "mailbox_alloc_unowned", scheme: scheme([0],    fn_ty([],                                       TyCon(None, "Pid", [tv(0)]))) },
-    TyEntry { name: "mailbox_alloc_bounded_unowned", scheme: scheme([0], fn_ty([TyInt, TyInt],                      TyCon(None, "Pid", [tv(0)]))) },
-    TyEntry { name: "mailbox_assign_owner",  scheme: scheme([0, 1], fn_ty([TyCon(None, "Pid", [tv(0)]), TyCon(None, "Fiber", [tv(1)])], TyUnit)) },
-    TyEntry { name: "spawn_actor_fiber",      scheme: scheme([0, 1], fn_ty([TyCon(None, "Pid", [tv(0)]), tv(1)], TyCon(None, "Fiber", [TyUnit]))) },
+    TyEntry { name: "mailbox_alloc_unowned", scheme: scheme([0],    fn_ty([],                                       TyCon(None, "Pid", [tv(0)], sym_none()))) },
+    TyEntry { name: "mailbox_alloc_bounded_unowned", scheme: scheme([0], fn_ty([TyInt, TyInt],                      TyCon(None, "Pid", [tv(0)], sym_none()))) },
+    TyEntry { name: "mailbox_assign_owner",  scheme: scheme([0, 1], fn_ty([TyCon(None, "Pid", [tv(0)], sym_none()), TyCon(None, "Fiber", [tv(1)], sym_none())], TyUnit)) },
+    TyEntry { name: "spawn_actor_fiber",      scheme: scheme([0, 1], fn_ty([TyCon(None, "Pid", [tv(0)], sym_none()), tv(1)], TyCon(None, "Fiber", [TyUnit], sym_none()))) },
     # No `unitless` TyEntry: that escape leaked typer-internal erasure
     # as a callable. The idiomatic equivalents are `print("#{x}")` for
     # output and multiplication by a unit-bearing factor for conversions.
@@ -3565,10 +3570,10 @@ fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
   # so `ctor_needs_qualification` and `check_expr_against`'s ECall
   # path can route `Result.Ok(x)` and `Response.Ok(x)` to distinct
   # schemes without flipping the bare slot's protection.
-  let some_sc = scheme([0],    fn_ty([tv(0)], TyCon(None, "Option", [tv(0)])))
-  let none_sc = scheme([0],    TyCon(None, "Option", [tv(0)]))
-  let ok_sc   = scheme([0, 1], fn_ty([tv(0)], TyCon(None, "Result", [tv(0), tv(1)])))
-  let err_sc  = scheme([0, 1], fn_ty([tv(1)], TyCon(None, "Result", [tv(0), tv(1)])))
+  let some_sc = scheme([0],    fn_ty([tv(0)], TyCon(None, "Option", [tv(0)], sym_none())))
+  let none_sc = scheme([0],    TyCon(None, "Option", [tv(0)], sym_none()))
+  let ok_sc   = scheme([0, 1], fn_ty([tv(0)], TyCon(None, "Result", [tv(0), tv(1)], sym_none())))
+  let err_sc  = scheme([0, 1], fn_ty([tv(1)], TyCon(None, "Result", [tv(0), tv(1)], sym_none())))
   let es = [
     # Bare entries — the load-bearing keys that bare core code uses.
     TyEntry { name: "Some", scheme: some_sc },
@@ -3732,7 +3737,7 @@ fn canon_uvars_ty(t: Ty, m: [IntPair]) : Ty {
     TyListT(inner) -> TyListT(canon_uvars_ty(inner, m))
     TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => canon_uvars_ty(p, m)),
                                   canon_uvars_ty(ret, m), canon_uvars_row(row, m))
-    TyCon(mo_, name, tas) -> TyCon(mo_, name, map(tas, (a) => canon_uvars_ty(a, m)))
+    TyCon(mo_, name, tas, sid) -> TyCon(mo_, name, map(tas, (a) => canon_uvars_ty(a, m)), sid)
     # the shape var id is a tvar, not a unit var — leave it, recurse arg.
     TyShapeApp(sv, arg) -> TyShapeApp(sv, canon_uvars_ty(arg, m))
     TyDimT(base, u) -> TyDimT(canon_uvars_ty(base, m), canon_uvars_unit(u, m))
@@ -3809,7 +3814,7 @@ fn canon_tvars_ty(t: Ty, m: [IntPair]) : Ty {
     TyListT(inner) -> TyListT(canon_tvars_ty(inner, m))
     TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => canon_tvars_ty(p, m)),
                                   canon_tvars_ty(ret, m), canon_tvars_row(row, m))
-    TyCon(mo_, name, tas) -> TyCon(mo_, name, map(tas, (a) => canon_tvars_ty(a, m)))
+    TyCon(mo_, name, tas, sid) -> TyCon(mo_, name, map(tas, (a) => canon_tvars_ty(a, m)), sid)
     TyShapeApp(sv, arg) -> match intpair_lookup(m, sv) {
       Some(b) -> TyShapeApp(b, canon_tvars_ty(arg, m))
       None    -> TyShapeApp(sv, canon_tvars_ty(arg, m))
@@ -3948,7 +3953,7 @@ pub fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind], hv: TyHomeView) : T
     # a compound row reaching *type* position (not dissolved
     # by alias substitution) — resolve to an undeclared name so the
     # natural "unknown type" cascade reports it.
-    TyRow(_) -> TyCon(None, "__row_in_type_position__", [])
+    TyRow(_) -> TyCon(None, "__row_in_type_position__", [], sym_none())
     TySurface(_) -> panic("resolve_ty_with_tparams: surface type not lowered")
   }
 }
@@ -4124,7 +4129,7 @@ fn validate_nominal_row_vars_decl(d: Decl, file: String) : Int / Console + File 
 # The constructed type and its fields are stamped from `hv`, the same
 # view the annotation side uses: a stamped head only meets an unstamped
 # one by the permissive rule, so both sides have to share it.
-fn scheme_of_variant(type_name: String, tparams: [String], v: Variant,
+fn scheme_of_variant(type_name: String, tsym: SymId, tparams: [String], v: Variant,
                      hv: TyHomeView) : TyScheme {
   match v {
     Var(_ctor_name, vargs) -> {
@@ -4160,7 +4165,7 @@ fn scheme_of_variant(type_name: String, tparams: [String], v: Variant,
       let ids = tparam_ids(tparams)
       let tvar_ids = map(tvar_names, (n) => tpbind_id_of(binds, n))
       let rvar_ids = map(rvar_names, (n) => tpbind_id_of(binds, n))
-      let result = TyCon(tsh_slot(hv, type_name), type_name, map(ids, (i) => head_slot_for(i, rvar_ids)))
+      let result = TyCon(tsh_slot(hv, type_name), type_name, map(ids, (i) => head_slot_for(i, rvar_ids)), tsym)
       match vargs {
         [] -> scheme(ids, result)
         _  -> scheme_full(tvar_ids, rvar_ids, fn_ty(arg_tys, result))
@@ -4191,14 +4196,15 @@ fn names_excluding(xs: [String], drop: [String]) : [String] {
 }
 
 fn add_variants_of_decl(env: TyEnv, d: Decl, top_names: [String],
-      tab: SymTab, target: String, hv: TyHomeView) : TyEnv {
+      tab: SymTab, target: String, homes: TyHomes) : TyEnv {
   match d {
-    DType(is_pub, tname, tparams, body, _, _, mo, _, _) -> match body {
+    DType(is_pub, tname, tparams, body, _, _, mo, _, tsym) -> match body {
       # A private type's constructors are unreachable from another
       # module, so they get no home key: they can neither be named
       # through a qualifier nor make a bare name ambiguous elsewhere.
       TBSum(vs) -> add_variants_loop(env, if is_pub { mo } else { None },
-                                        tname, tparams, vs, top_names, tab, target, hv)
+                                        tname, tsym, tparams, vs, top_names, tab, target,
+                                        tsh_view(homes, mo))
       _ -> env
     }
     _ -> env
@@ -4219,7 +4225,7 @@ fn add_variants_of_decl(env: TyEnv, d: Decl, top_names: [String],
 # scheme even if `Foo` is also a type, since pattern matching there
 # goes through the variant-as-callable path.
 fn add_variants_loop(env: TyEnv, home: Option[String],
-                       tname: String, tparams: [String],
+                       tname: String, tsym: SymId, tparams: [String],
                        vs: [Variant], top_names: [String],
                        tab: SymTab, target: String, hv: TyHomeView) : TyEnv {
   match vs {
@@ -4231,9 +4237,9 @@ fn add_variants_loop(env: TyEnv, home: Option[String],
           _  -> false
         }
         if shadows {
-          add_variants_loop(env, home, tname, tparams, rest, top_names, tab, target, hv)
+          add_variants_loop(env, home, tname, tsym, tparams, rest, top_names, tab, target, hv)
         } else {
-          let sc = scheme_of_variant(tname, tparams, v, hv)
+          let sc = scheme_of_variant(tname, tsym, tparams, v, hv)
           # Ctor overloading at use sites: always
           # register the qualified `<tname>::<cname>` key so disambiguation
           # at match / annotated construction sites can pick this variant
@@ -4258,7 +4264,7 @@ fn add_variants_loop(env: TyEnv, home: Option[String],
           } else {
             ty_env_add_sym(env_h, ty_decl_sym(tab, NCCtor, cname, home, target), cname, sc)
           }
-          add_variants_loop(env2, home, tname, tparams, rest, top_names, tab, target, hv)
+          add_variants_loop(env2, home, tname, tsym, tparams, rest, top_names, tab, target, hv)
         }
       }
     }
@@ -4314,9 +4320,9 @@ fn collect_unions_loop(ds: [Decl], acc: [UnionInfo], hv: TyHomeView) : [UnionInf
     [d, ...rest] -> match decl_transparent_inner(d) {
       Some(inner) -> collect_unions_loop([inner, ...rest], acc, hv)
       None -> match d {
-        DType(_, name, _, body, line, col, _, _, _) -> match body {
+        DType(_, name, _, body, line, col, mo, _, _) -> match body {
           TBSum(vs) -> {
-            let comps = variants_to_component_tys(vs, hv)
+            let comps = variants_to_component_tys(vs, tsh_at(hv, mo))
             collect_unions_loop(rest, [UI(name, comps, line, col), ...acc], hv)
           }
           _ -> collect_unions_loop(rest, acc, hv)
@@ -4360,7 +4366,7 @@ fn ty_names(ts: [Ty]) : [String] {
   match ts {
     [] -> []
     [t, ...rest] -> match t {
-      TyCon(_, n, _) -> [n, ...ty_names(rest)]
+      TyCon(_, n, _, _) -> [n, ...ty_names(rest)]
       _           -> ty_names(rest)
     }
   }
@@ -4623,7 +4629,8 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk: [
           # A name the view cannot settle stays empty, and
           # `tag_tycon_modules` stamps what is still bare post-typing.
           else { TyCon(tsh_slot(hv, name), name,
-                       resolve_tycon_args(tas, row_kind_slots_of(rk, name), 0, tpbinds, rbinds, rk, hv)) }
+                       resolve_tycon_args(tas, row_kind_slots_of(rk, name), 0, tpbinds, rbinds, rk, hv),
+                       tsh_sym(hv, name)) }
         }
       }
       }
@@ -4644,7 +4651,7 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk: [
     # a compound row reaching *type* position (not dissolved
     # by alias substitution). Resolve to an undeclared name so the
     # natural "unknown type" cascade reports it.
-    TyRow(_) -> TyCon(None, "__row_in_type_position__", [])
+    TyRow(_) -> TyCon(None, "__row_in_type_position__", [], sym_none())
     TySurface(_) -> panic("resolve_ty_with_binds: surface type not lowered")
   }
 }
@@ -4808,10 +4815,11 @@ infer: project a function declaration to its quantified type scheme.
 
 The row-kind table binds a row var sourced only in a `T[..., e]`
 position (`from_list(...) : Stream[t, e]`) as a row var; `homes`
-stamps each nominal type in the signature with its declaring module.
+stamps each nominal type in the signature with its declaring module
+and identity.
 """)]
 pub fn fn_scheme_of_decl(d: Decl, row_kind_table: [RowKindEntry],
-                         homes: [TyHomeEntry]) : Option[TyScheme] {
+                         homes: TyHomes) : Option[TyScheme] {
   match d {
     DFn(_, fname, tparams, params, opt_ret, rexpr, _, _, _, dmo, fsym) -> {
       let hv = tsh_view(homes, dmo)
@@ -4995,7 +5003,7 @@ fn is_implicit_tparam_candidate(name: String) : Bool {
 # declaring module as the scheme is built, not after the typer unified.
 fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
                     top_names: [String], rk_table: [RowKindEntry],
-                    tab: SymTab, target: String, homes: [TyHomeEntry]) : EnvWithArities {
+                    tab: SymTab, target: String, homes: TyHomes) : EnvWithArities {
   match ds {
     [] -> EnvWithArities { env: env, arities: ar_acc }
     [d, ...rest] -> {
@@ -5036,7 +5044,7 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
         # redeclaration of `type SplitN = ...`).
         DType(_, dt_name, dt_tparams, _, _, _, _, _, _) -> {
           let env1 = ty_env_add_decl_marker(env, dt_name, list_length(dt_tparams))
-          let env2 = add_variants_of_decl(env1, d, top_names, tab, target, tsh_view(homes, None))
+          let env2 = add_variants_of_decl(env1, d, top_names, tab, target, homes)
           EnvWithArities { env: env2, arities: ar_acc }
         }
         DEffect(_, eff_name, tparams, ops, _, _, _, emo, _) -> {
@@ -5311,7 +5319,7 @@ fn build_ty_env_seed() : BuiltEnv {
 }
 
 fn build_ty_env_module(seed: BuiltEnv, decls: [Decl], unions: [UnionInfo],
-                        top_names: [String], homes: [TyHomeEntry]) : BuiltEnv {
+                        top_names: [String], homes: TyHomes) : BuiltEnv {
   let rk_table = compute_row_kind_slots(decls)
   let env_with_unions = TyEnv {
     entries: seed.env.entries, fresh: seed.env.fresh, unions: unions, constructors: seed.env.constructors,
@@ -5343,7 +5351,7 @@ fn build_ty_env_inherited(seed: BuiltEnv, inherited: ModuleEnvDelta,
                             decls: [Decl], unions: [UnionInfo],
                             top_names: [String], rk_table: [RowKindEntry],
                             tab: SymTab, target: String,
-                            homes: [TyHomeEntry]) : BuiltEnv {
+                            homes: TyHomes) : BuiltEnv {
   # `inherited.ty_entries` are newer than the seed (prepended at head).
   # Prepend them onto BOTH the seed entries and the seed index in one
   # pass, sharing each entry exactly as `ty_env_add` does -- never
@@ -5373,7 +5381,7 @@ pub fn build_ty_env(decls: [Decl]) : BuiltEnv {
   # harvest the union summary once and stash it on the
   # env so every downstream typer query (`variants_of_type`,
   # `union_upcast_ok`, the collision diagnostic) sees the same data.
-  let homes = tsh_collect(decls)
+  let homes = tsh_homes(decls, st_empty(), fv_empty(), "")
   let unions = collect_unions(decls, tsh_view(homes, None))
   # pre-compute top-level type names so variant
   # registration can skip ctor entries whose name shadows.
@@ -6288,9 +6296,9 @@ fn apply_ty_opt(s: Subst, t: Ty) : Option[Ty] {
         Some(ps1) -> Some(TyFnT(ps1, opt_ty_or(rt, ret), opt_row_or(rw, row)))
       }
     }
-    TyCon(mo_, name, atys) -> match apply_tys_opt(s, atys) {
+    TyCon(mo_, name, atys, sid) -> match apply_tys_opt(s, atys) {
       None      -> None
-      Some(as1) -> Some(TyCon(mo_, name, as1))
+      Some(as1) -> Some(TyCon(mo_, name, as1, sid))
     }
     # Once the shape var binds to a constructor witness, reconstruct the
     # concrete applied type (`s := List, A := Int` → `TyListT(Int)`), so
@@ -6942,7 +6950,7 @@ fn apply_ty_keep_row_labels(s: Subst, t: Ty) : Ty {
       TyFnT(apply_ty_keep_row_labels_list(s, params),
             apply_ty_keep_row_labels(s, ret),
             apply_row_tail_only(s, row))
-    TyCon(mo_, name, atys) -> TyCon(mo_, name, apply_ty_keep_row_labels_list(s, atys))
+    TyCon(mo_, name, atys, sid) -> TyCon(mo_, name, apply_ty_keep_row_labels_list(s, atys), sid)
     TyShapeApp(sv, arg) -> match subst_lookup(s, sv) {
       Some(wit) -> shape_reapply(apply_ty_keep_row_labels(s, wit), apply_ty_keep_row_labels(s, arg))
       None      -> TyShapeApp(sv, apply_ty_keep_row_labels(s, arg))
@@ -6976,7 +6984,7 @@ fn occurs(v: Int, t: Ty, s: Subst) : Bool {
     TyVarT(n) -> n == v
     TyListT(inner) -> occurs(v, inner, s)
     TyFnT(params, ret, _) -> occurs_any(v, [ret, ...params], s)
-    TyCon(_, _, atys) -> occurs_any(v, atys, s)
+    TyCon(_, _, atys, _) -> occurs_any(v, atys, s)
     # the shape var id shares the tvar pool, so `v` may be the head; it
     # also occurs inside the argument.
     TyShapeApp(sv, arg) -> v == sv or occurs(v, arg, s)
@@ -7123,8 +7131,8 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
     # name coincide. Same-name types from different modules are
     # distinct (the load-bearing rule for shadowing). Both `None`
     # — language-level builtins / root-file types — also coincide.
-    TyCon(am, an, aa) -> match b {
-      TyCon(bm, bn, ba) -> {
+    TyCon(am, an, aa, _) -> match b {
+      TyCon(bm, bn, ba, _) -> {
         if module_slot_compat(am, bm) and an == bn { unify_list(env, aa, ba, s) }
         # implicit upcast inside structural
         # unification. When the two TyCons disagree, accept the
@@ -7150,7 +7158,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
       # rules above. Only `Decimal` has a UoM-decorated form; the other
       # named records do not.
       TyDimT(bb, bu) -> match bb {
-        TyCon(_, bn, ba) ->
+        TyCon(_, bn, ba, _) ->
           # A fixed-width `Vec[t]<n>` has a distinct inline layout, so it
           # never collapses into a bare `Vec[t]` — even at `<1>`. The
           # numeric `Real ≡ Real<1>` collapse below is untouched.
@@ -7178,8 +7186,8 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
       # mirroring the bare-numeric arms. Lets a `Decimal<USD>` value
       # flow into a fn expecting bare `Decimal` only when the units
       # cancel — anything else is a unit mismatch.
-      TyCon(_, bn, ba) -> match ab {
-        TyCon(_, an, aa) ->
+      TyCon(_, bn, ba, _) -> match ab {
+        TyCon(_, an, aa, _) ->
           # A fixed-width `Vec[t]<n>` never collapses into a bare `Vec[t]`
           # (distinct inline layout); the numeric collapse above stays.
           if an == "Vec" { None }
@@ -7230,8 +7238,8 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
 # `TyCon(None,"List",[])`; `reapply` maps that head back to `TyListT`.
 #[doc("The nullary constructor witness a `Shape` variable binds to when applied against a saturated arity-1 type.")]
 pub fn shape_witness_of(t: Ty) : Option[Ty] = match t {
-  TyListT(_) -> Some(TyCon(None, "List", []))
-  TyCon(m, n, targs) -> match targs { [_one] -> Some(TyCon(m, n, [])) _ -> None }
+  TyListT(_) -> Some(TyCon(None, "List", [], sym_none()))
+  TyCon(m, n, targs, sid) -> match targs { [_one] -> Some(TyCon(m, n, [], sid)) _ -> None }
   _ -> None
 }
 
@@ -7239,7 +7247,7 @@ pub fn shape_witness_of(t: Ty) : Option[Ty] = match t {
 #[doc("The single type argument of a saturated arity-1 type (for shape-app decomposition).")]
 pub fn shape_arg_of(t: Ty) : Ty = match t {
   TyListT(inner) -> inner
-  TyCon(_, _, [a]) -> a
+  TyCon(_, _, [a], _) -> a
   _ -> TyAny
 }
 
@@ -7251,8 +7259,8 @@ pub fn shape_arg_of(t: Ty) : Ty = match t {
 # through unchanged.
 #[doc("Reconstruct a concrete applied type from a resolved shape witness and its argument.")]
 pub fn shape_reapply(wit: Ty, arg: Ty) : Ty = match wit {
-  TyCon(_, "List", []) -> TyListT(arg)
-  TyCon(m, n, []) -> TyCon(m, n, [arg])
+  TyCon(_, "List", [], _) -> TyListT(arg)
+  TyCon(m, n, [], sid) -> TyCon(m, n, [arg], sid)
   _ -> wit
 }
 
@@ -8134,8 +8142,8 @@ fn ty_eq_shape(a: Ty, b: Ty) : Bool {
       _ -> false
     }
     # Hanga Roa: shape equality respects module_origin too.
-    TyCon(am, an, atas) -> match bx {
-      TyCon(bm, bn, btas) -> module_slot_compat(am, bm) and an == bn and ty_list_eq_shape(atas, btas)
+    TyCon(am, an, atas, _) -> match bx {
+      TyCon(bm, bn, btas, _) -> module_slot_compat(am, bm) and an == bn and ty_list_eq_shape(atas, btas)
       _ -> false
     }
     # shape-equality on unions is point-wise on
@@ -8688,8 +8696,8 @@ fn find_mismatched_tycons(expected: Ty, found: Ty) : Option[TyConPair] {
     # Hanga Roa: same-name TyCons from different modules are a real
     # mismatch — flag them so the diagnostic can render the modules
     # and show the user the actual confusion.
-    TyCon(em, en, eas) -> match found {
-      TyCon(fm, fname, fas) -> if option_str_eq(em, fm) and en == fname {
+    TyCon(em, en, eas, _) -> match found {
+      TyCon(fm, fname, fas, _) -> if option_str_eq(em, fm) and en == fname {
         find_mismatch_in_list(eas, fas)
       } else {
         Some(TyConPair { exp: expected, fnd: found })
@@ -8715,8 +8723,8 @@ fn find_mismatch_in_list(es: [Ty], fs: [Ty]) : Option[TyConPair] {
 
 fn tycon_pair_or_none(expected: Ty, found: Ty) : Option[TyConPair] {
   match expected {
-    TyCon(_, _, _) -> match found {
-      TyCon(_, _, _) -> Some(TyConPair { exp: expected, fnd: found })
+    TyCon(_, _, _, _) -> match found {
+      TyCon(_, _, _, _) -> Some(TyConPair { exp: expected, fnd: found })
       _           -> None
     }
     _ -> None
@@ -8772,7 +8780,7 @@ fn emit_union_focus_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console 
 
 fn tycon_name_or_empty(t: Ty) : String {
   match t {
-    TyCon(_, n, _) -> n
+    TyCon(_, n, _, _) -> n
     _           -> ""
   }
 }
@@ -8784,8 +8792,8 @@ fn tycon_name_or_empty(t: Ty) : String {
 # zero-arg variants of `U`, so a value of type `A` lifts to `U`.
 fn union_upcast_ok(env: TyEnv, expected: Ty, found: Ty) : Bool {
   match expected {
-    TyCon(_, u_name, u_args) -> match found {
-      TyCon(_, t_name, t_args) -> {
+    TyCon(_, u_name, u_args, _) -> match found {
+      TyCon(_, t_name, t_args, _) -> {
         # An upcast lifts a component into a DIFFERENT parent, between
         # bare nominal heads only. Without the self-name guard, a sum
         # type whose variant repeats the type's name upcasts to itself
@@ -8833,7 +8841,7 @@ fn emit_type_hint(expected: Ty, found: Ty) : Unit / Console {
       TyInt -> diag_help("convert with `int_to_char(n)`")
       _     -> ()
     }
-    TyCon(_, nm, _) -> {
+    TyCon(_, nm, _, _) -> {
       if nm == "Option" {
         diag_help("wrap the value with `Some(...)`, or use `None` if absent")
       } else { () }
@@ -8940,7 +8948,7 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
 
 fn param_ty_or_fresh(st: InferState, pm: Param) : TyRes {
   match pm.ptype {
-    Some(te) -> ty_res(st, inf_resolve_ty(te, env_home_view(st.env)))
+    Some(te) -> ty_res(st, inf_resolve_ty(te, st_home_view(st)))
     None     -> st_fresh_ty(st)
   }
 }
@@ -8953,7 +8961,7 @@ fn param_ty_or_fresh_with_rvbinds(st: InferState, pm: Param, rbinds: [RVBind]) :
 fn param_ty_or_fresh_with_binds(st: InferState, pm: Param,
                                 tpbinds: [TPBind], rbinds: [RVBind]) : TyRes {
   match pm.ptype {
-    Some(te) -> ty_res(st, resolve_ty_with_binds(te, tpbinds, rbinds, st.env.row_kind, env_home_view(st.env)))
+    Some(te) -> ty_res(st, resolve_ty_with_binds(te, tpbinds, rbinds, st.env.row_kind, st_home_view(st)))
     None     -> st_fresh_ty(st)
   }
 }
@@ -9046,11 +9054,11 @@ fn rec_instantiate(st: InferState, ri: RecInfo) : RecInst {
       let n = list_length(tps)
       let env2 = advance_fresh(st.env, n)
       let binds = rec_tpbinds_loop(tps, start, 0, [])
-      let flds = rec_field_tys(fs, binds, env_home_view(st.env))
+      let flds = rec_field_tys(fs, binds, st_home_view(st))
       let atys = fresh_tv_range(start, n)
       RecInst {
         st: st_set_env(st, env2),
-        result_ty: TyCon(mo, nm, atys),
+        result_ty: TyCon(mo, nm, atys, tsh_decl_sym(st.env.ty_homes, mo, nm)),
         fields: flds
       }
     }
@@ -9300,9 +9308,9 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
 fn synth_variants_of(st: InferState, ty_expr: TypeExpr, e: Expr) : Inferred / Console + File {
 
 
-  let ty = inf_resolve_ty(ty_expr, env_home_view(st.env))
+  let ty = inf_resolve_ty(ty_expr, st_home_view(st))
   match ty {
-    TyCon(tm, name, _) -> {
+    TyCon(tm, name, _, tsym) -> {
       let vc = check_variants_nullary(st.env, name)
       match vc {
         VCOk(names) -> {
@@ -9314,7 +9322,7 @@ fn synth_variants_of(st: InferState, ty_expr: TypeExpr, e: Expr) : Inferred / Co
           # collapse to the same bare ctor name. Dedup before
           # emitting so `variants[Suit]()` returns each tag once.
           let names_dedup = union_merge_unique([], names)
-          let result_ty = TyListT(TyCon(tm, name, []))
+          let result_ty = TyListT(TyCon(tm, name, [], tsym))
           let resolved = with_ty(
             mk_expr(EVariantsOf(ty_expr, names_dedup), e.line, e.col),
             result_ty)
@@ -9404,7 +9412,7 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
           Some(t) -> [t]
           None    -> []
         }
-        _ -> inf_resolve_ty_list(eff_tyargs, env_home_view(st.env))
+        _ -> inf_resolve_ty_list(eff_tyargs, st_home_view(st))
       }
       # A `with Eff as a` binding makes `a` a first-class capability value of
       # type `Eff[ty_args]` so it can be passed as a call argument (§6 named
@@ -9420,7 +9428,7 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       let cap_tyargs = take_first_tys(resolved_eff_tyargs, cap_arity)
       let st_capbound = match alias_opt {
         Some(a) -> st_set_env(st_aliased,
-                     ty_env_add(st_aliased.env, a, mono(TyCon(None, eff_name, cap_tyargs))))
+                     ty_env_add(st_aliased.env, a, mono(TyCon(None, eff_name, cap_tyargs, sym_none()))))
         None    -> st_aliased
       }
       let prev_row = st_capbound.row
@@ -9749,7 +9757,7 @@ fn check_clause_param_annotation(st: InferState, p: Param,
     Some(te) ->
       if ty_is_generic_slot(declared) { st }
       else {
-        st_unify(st, inf_resolve_ty(te, env_home_view(st.env)), apply_ty(st.sub, declared),
+        st_unify(st, inf_resolve_ty(te, st_home_view(st)), apply_ty(st.sub, declared),
                   "handler clause parameter annotation", p.pline, p.pcol)
       }
   }
@@ -9971,8 +9979,8 @@ fn ty_dischargeable(a: Ty, b: Ty, s: Subst) : Bool {
       TyAny     -> true
       _ -> match ax {
         TyListT(ai) -> match bx { TyListT(bi) -> ty_dischargeable(ai, bi, s) _ -> false }
-        TyCon(am, an, aas) -> match bx {
-          TyCon(bm, bn, bas) ->
+        TyCon(am, an, aas, _) -> match bx {
+          TyCon(bm, bn, bas, _) ->
             module_slot_compat(am, bm) and an == bn and ty_list_dischargeable(aas, bas, s)
           _ -> false
         }
@@ -10073,7 +10081,7 @@ fn synth_bang(st: InferState, inner: Expr, line: Int, col: Int) : Inferred / Con
   let it_now = apply_ty(ri.st.sub, ri.ty)
   let inner_typed = with_ty(ri.expr, it_now)
   match it_now {
-    TyCon(_, name, args_) ->
+    TyCon(_, name, args_, _) ->
       if name == "Option" {
         match args_ {
           [t] -> bang_finish_option(ri.st, inner_typed, t, line, col)
@@ -10103,7 +10111,7 @@ fn bang_finish_option(st: InferState, inner_typed: Expr, t: Ty,
     Some(rt) -> {
       let rt_now = apply_ty(st.sub, rt)
       match rt_now {
-        TyCon(_, rname, rargs) ->
+        TyCon(_, rname, rargs, _) ->
           if rname == "Option" {
             match rargs {
               [_] ->
@@ -10131,7 +10139,7 @@ fn bang_finish_result(st: InferState, inner_typed: Expr, e_ty: Ty, t: Ty,
     Some(rt) -> {
       let rt_now = apply_ty(st.sub, rt)
       match rt_now {
-        TyCon(_, rname, rargs) ->
+        TyCon(_, rname, rargs, _) ->
           if rname == "Result" {
             match rargs {
               [_, ret_e_ty] -> {
@@ -10954,7 +10962,7 @@ fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String,
 
 
   match obj_ty {
-    TyCon(_, name, _) ->
+    TyCon(_, name, _, _) ->
       if name == "Ref" {
         let key_opt =
           if ident == "get" { Some("Mutable.ref_get") }
@@ -10983,7 +10991,7 @@ fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String,
 # field-wins-on-ties precedence rule before attempting UFCS lookup.
 fn record_has_field(st: InferState, obj_ty: Ty, ident: String) : Bool {
   match obj_ty {
-    TyCon(_, cname, cargs) -> match rec_find_with_field(st.recs, cname, list_length(cargs), ident) {
+    TyCon(_, cname, cargs, _) -> match rec_find_with_field(st.recs, cname, list_length(cargs), ident) {
       None -> false
       Some(ri) -> {
         let inst = rec_instantiate(st, ri)
@@ -11162,7 +11170,7 @@ fn first_param_head_is_concrete(t: Ty) : Bool = match t {
   TyInt128       -> true
   TyListT(_)   -> true
   TyFnT(_, _, _) -> true
-  TyCon(_, _, _)  -> true
+  TyCon(_, _, _, _)  -> true
   TyDimT(_, _) -> true
   _            -> false
 }
@@ -11296,7 +11304,7 @@ fn cap_eff_of_var(st: InferState, name: String) : Option[Label] =
     None     -> None
     Some(sc) -> match sc {
       Scheme(_, _, _, _, ty) -> match apply_ty(st.sub, ty) {
-        TyCon(_, ename, targs) ->
+        TyCon(_, ename, targs, _) ->
           if is_effect_in_env(st.env, ename) { Some(Label { eff: ename, ty_args: targs }) }
           else { None }
         _ -> None
@@ -11597,7 +11605,7 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
   let r = synth(st, obj)
   let applied = apply_ty(r.st.sub, r.ty)
   match applied {
-    TyCon(_, cname, cargs) -> match rec_find_with_field(r.st.recs, cname, list_length(cargs), fnm) {
+    TyCon(_, cname, cargs, _) -> match rec_find_with_field(r.st.recs, cname, list_length(cargs), fnm) {
       None -> field_non_record_or_partial_app(r.st, r.expr, fnm, line, col)
       Some(ri) -> {
         let inst = rec_instantiate(r.st, ri)
@@ -11750,7 +11758,7 @@ fn decl_row_concrete_labels(row: RowExpr, hv: TyHomeView) : [Label] {
 fn drain_one_deferred_field(st: InferState, recv: Ty, fnm: String,
                              res_id: Int, line: Int, col: Int) : InferState / Console + File + Mutable {
   match recv {
-    TyCon(_, cname, cargs) -> match rec_find_with_field(st.recs, cname, list_length(cargs), fnm) {
+    TyCon(_, cname, cargs, _) -> match rec_find_with_field(st.recs, cname, list_length(cargs), fnm) {
       Some(ri) -> {
         let inst = rec_instantiate(st, ri)
         let st1 = st_unify(inst.st, inst.result_ty, recv, "deferred field access", line, col)
@@ -11842,7 +11850,7 @@ fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Infe
   let coll_ty = apply_ty(probe.st.sub, probe.ty)
   let st_re = st_past_probe(st, probe.st)
   match coll_ty {
-    TyCon(_, cname, _) ->
+    TyCon(_, cname, _, _) ->
       if cname == "Vec" { synth_vec_index(probe.st, coll, ix, line, col) }
       else {
         let callee =
@@ -11855,7 +11863,7 @@ fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Infe
     # is a bare struct field load with the bound proved at compile time
     # (no runtime check). A dynamic index is declined in v1.
     TyDimT(inner, _) -> match inner {
-      TyCon(_, cname, _) ->
+      TyCon(_, cname, _, _) ->
         if cname == "Vec" {
           if ty_is_fixed_vec(coll_ty) { synth_fixed_vec_index(probe.st, coll, ix, coll_ty, line, col) }
           else {
@@ -12238,7 +12246,7 @@ fn ty_is_concrete_nonprim(t: Ty) : Bool {
     TyVarT(_)       -> false
     TyDimT(inner, _)    -> ty_is_concrete_nonprim(inner)
     TyRefineT(inner, _) -> ty_is_concrete_nonprim(inner)
-    TyCon(_, _, _)     -> true
+    TyCon(_, _, _, _)     -> true
     _               -> false
   }
 }
@@ -14570,7 +14578,7 @@ fn synth_record_lit(st: InferState, nm: String, fis: [FieldInit], line: Int, col
   match lookup {
     None -> {
       let r = synth_field_inits(st, fis, [], line, col)
-      let ty = tsh_tycon(env_home_view(st.env), nm, [])
+      let ty = tsh_tycon(st_home_view(st), nm, [])
       let root = with_ty(mk_expr(ERecordLit(nm, r.fis), line, col), ty)
       mk_inferred(r.st, ty, root)
     }
@@ -14592,11 +14600,11 @@ fn synth_record_lit(st: InferState, nm: String, fis: [FieldInit], line: Int, col
 # unifier reports it.
 fn try_lower_decimal_uom_lit(value: Expr, expected: Ty) : Expr {
   match expected {
-    TyDimT(TyCon(_, "Decimal", _), u_field) -> match value.kind {
+    TyDimT(TyCon(_, "Decimal", _, dsym), u_field) -> match value.kind {
       ELitUnit(inner, u_lit) ->
         if inf_unit_eq(u_lit, u_field) {
-          let target_ty = TyDimT(TyCon(None, "Decimal", []), unit_canon(u_field))
-          match mint_literal(inner, TyCon(None, "Decimal", [])) {
+          let target_ty = TyDimT(TyCon(None, "Decimal", [], dsym), unit_canon(u_field))
+          match mint_literal(inner, TyCon(None, "Decimal", [], dsym)) {
             MintOk(e) -> with_ty(e, target_ty)
             _ -> value
           }
@@ -14675,7 +14683,7 @@ fn synth_let_rhs_or_mint(st: InferState, rhs: Expr, te: TypeExpr,
 
 fn mint_let_textual(st: InferState, rhs: Expr, te: TypeExpr,
                     line: Int, col: Int) : Inferred / Console + File + Mutable {
-  let expected = apply_ty(st.sub, inf_resolve_ty_rk(te, st.env.row_kind, env_home_view(st.env)))
+  let expected = apply_ty(st.sub, inf_resolve_ty_rk(te, st.env.row_kind, st_home_view(st)))
   match mint_literal(rhs, expected) {
     MintOk(e2) -> {
       let ty = match e2.ty { Some(t) -> t None -> expected }
@@ -14690,18 +14698,19 @@ fn mint_let_textual(st: InferState, rhs: Expr, te: TypeExpr,
 }
 
 fn synth_mint_decimal(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
-  match mint_literal(e, TyCon(None, "Decimal", [])) {
+  let dec = TyCon(None, "Decimal", [], tsh_decl_sym(st.env.ty_homes, Some("decimal"), "Decimal"))
+  match mint_literal(e, dec) {
     MintOk(e2) -> {
-      let ty = match e2.ty { Some(t) -> t None -> TyCon(None, "Decimal", []) }
+      let ty = match e2.ty { Some(t) -> t None -> dec }
       mk_inferred(st, ty, e2)
     }
     MintErr(msg) -> {
       diag_error(st.file, e.line, e.col, msg)
-      mk_inferred(st_bump_err(st), TyCon(None, "Decimal", []), e)
+      mk_inferred(st_bump_err(st), dec, e)
     }
     MintNone -> {
       diag_error(st.file, e.line, e.col, "numeric literal has no concrete type in context")
-      mk_inferred(st_bump_err(st), TyCon(None, "Decimal", []), e)
+      mk_inferred(st_bump_err(st), dec, e)
     }
   }
 }
@@ -14818,24 +14827,24 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
       let rr = match ann {
         Some(te) -> match rhs.kind {
           EMatch(_, _) -> {
-            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, env_home_view(amb_st.env))
+            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, st_home_view(amb_st))
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           EIf(_, _, _) -> {
-            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, env_home_view(amb_st.env))
+            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, st_home_view(amb_st))
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           # Fix B: route EList through bidirectional check so element
           # literals can be retagged to Byte when expected is [Byte]
           # (and a Vec annotation mints the literal to a vec build).
           EList(_) -> {
-            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, env_home_view(amb_st.env))
+            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, st_home_view(amb_st))
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           # a Vec-annotated map-pipe chain collects into the vec
           # (pre-sized when the head is a pure range).
           EMapPipe(_, _) -> {
-            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, env_home_view(amb_st.env))
+            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, st_home_view(amb_st))
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           # route ECall/EVar with annotation
@@ -14843,11 +14852,11 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
           # qualified `<parent>::<cname>` matches the annotation
           # resolves to the qualified scheme.
           ECall(_, _) -> {
-            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, env_home_view(amb_st.env))
+            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, st_home_view(amb_st))
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           EVar(_) -> {
-            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, env_home_view(amb_st.env))
+            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, st_home_view(amb_st))
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           # a bare numeric literal coins directly to the annotated carrier
@@ -14866,20 +14875,20 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
       let minted = match ann {
         None -> MintedExpr { st: rr.st, pair: ExprTy { expr: rr.expr, ty: rr.ty } }
         Some(te) -> maybe_mint_literal(rr.st, rr.expr, rr.ty,
-                                       apply_ty(rr.st.sub, inf_resolve_ty_rk(te, rr.st.env.row_kind, env_home_view(rr.st.env))),
+                                       apply_ty(rr.st.sub, inf_resolve_ty_rk(te, rr.st.env.row_kind, st_home_view(rr.st))),
                                        pat.line, pat.col)
       }
       let lower_pair = minted.pair
       let binding_st = match ann {
         None -> minted.st
         Some(te) -> {
-          let declared = inf_resolve_ty_rk(te, minted.st.env.row_kind, env_home_view(minted.st.env))
+          let declared = inf_resolve_ty_rk(te, minted.st.env.row_kind, st_home_view(minted.st))
           st_unify(minted.st, declared, lower_pair.ty, ann_label, pat.line, pat.col)
         }
       }
       let binding_ty0 = match ann {
         None -> lower_pair.ty
-        Some(te) -> inf_resolve_ty_rk(te, rr.st.env.row_kind, env_home_view(rr.st.env))
+        Some(te) -> inf_resolve_ty_rk(te, rr.st.env.row_kind, st_home_view(rr.st))
       }
       # The fixed-width inline representation is an optimisation of a
       # LITERAL: a `let x : Vec[e]<n> = [ ... ]` binds a flat aggregate.
@@ -14921,7 +14930,7 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
       let probe = synth(st, b)
       let base_ty = apply_ty(probe.st.sub, probe.ty)
       match base_ty {
-        TyCon(_, "Map", _) -> {
+        TyCon(_, "Map", _, _) -> {
           let ri = synth(probe.st, i)
           let rv = synth(ri.st, v)
           diag_error(st.file, line, col,
@@ -15096,7 +15105,7 @@ fn check_narrow_pattern(st: InferState, name: String, ty_expr: TypeExpr,
                          expected: Ty, line: Int, col: Int) : InferState / Console + File {
 
 
-  let narrow_ty = inf_resolve_ty(ty_expr, env_home_view(st.env))
+  let narrow_ty = inf_resolve_ty(ty_expr, st_home_view(st))
   let scrut_now = apply_ty(st.sub, expected)
   match scrut_now {
     TyUnion(parts) -> if ty_list_contains(parts, narrow_ty) {
@@ -15109,9 +15118,9 @@ fn check_narrow_pattern(st: InferState, name: String, ty_expr: TypeExpr,
       let env2 = ty_env_add(st.env, name, mono(narrow_ty))
       st_bump_err(st_set_env(st, env2))
     }
-    TyCon(_, u_name, _) -> {
+    TyCon(_, u_name, _, _) -> {
       let narrow_name = match narrow_ty {
-        TyCon(_, n, _) -> n
+        TyCon(_, n, _, _) -> n
         _           -> ""
       }
       let comps = if narrow_name == "" { [] } else { variants_of_type(st.env, u_name) }
@@ -15190,7 +15199,7 @@ fn check_variant_pattern(st: InferState, cname: String, subpats: [Pattern], expe
   # and non-shadowing user variants keep working.
   let applied = apply_ty(st.sub, expected)
   let sc_opt = match applied {
-    TyCon(_, parent, _) -> match ty_env_lookup_qualified(st.env, parent, cname) {
+    TyCon(_, parent, _, _) -> match ty_env_lookup_qualified(st.env, parent, cname) {
       Some(sc) -> Some(sc)
       None     -> ty_env_lookup(st.env, cname)
     }
@@ -15300,7 +15309,7 @@ fn check_record_pattern(st: InferState, pfs: [PField], expected: Ty, line: Int, 
 
   let applied = apply_ty(st.sub, expected)
   match applied {
-    TyCon(_, nm, nargs) -> {
+    TyCon(_, nm, nargs, _) -> {
       let probe = pfield_list_probe(pfs)
       let arity = list_length(nargs)
       let lookup = if probe == "" {
@@ -15593,7 +15602,7 @@ fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : In
   # structural — `name`'s narrow type was bound during typing in
   # `check_narrow_pattern`, so the body's typed AST is already
   # consistent.
-  let arms_narrowed = expand_narrow_arms(ra.arms, st_post.env)
+  let arms_narrowed = expand_narrow_arms(ra.arms, st_post.env, st_mo(st_post))
   # the parser emits `PVariantRecord(home, name, fields)` for
   # any `Name { ... }` pattern, even when `Name` is a record alias
   # (`type P = { x: Int, y: Int }`) rather than a sum-type ctor with
@@ -15645,7 +15654,7 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
   let ty = apply_ty(ra.st.sub, expected)
   let scr_final = apply_ty(ra.st.sub, rs_.ty)
   let st_post = check_exhaustive(ra.st, ra.arms, scr_final, line, col)
-  let arms_narrowed = expand_narrow_arms(ra.arms, st_post.env)
+  let arms_narrowed = expand_narrow_arms(ra.arms, st_post.env, st_mo(st_post))
   let arms_codegen  = rewrite_record_alias_arms(arms_narrowed, st_post.recs)
   let root = with_ty(mk_expr(EMatch(rs_.expr, arms_codegen), line, col), ty)
   mk_inferred(st_post, ty, root)
@@ -15658,7 +15667,7 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
 # an if-chain over `vec_length` / `vec_get` / `vec_tail_from`.
 fn vec_match_route(scr_ty: Ty, arms: [Arm]) : Bool =
   match scr_ty {
-    TyCon(_, name, _) -> name == "Vec" and vec_match_has_list_arm(arms)
+    TyCon(_, name, _, _) -> name == "Vec" and vec_match_has_list_arm(arms)
     _                 -> false
   }
 
@@ -15907,13 +15916,13 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
       # literal builds a pre-sized vec instead of a cons list. A BARE
       # literal keeps denoting the cons list — only annotation /
       # argument context reaches here.
-      TyCon(_, hname, hargs) ->
+      TyCon(_, hname, hargs, _) ->
         if hname == "Vec" { check_vec_lit_against(st, els, hargs, e.line, e.col) }
         else { synth(st, e) }
       # Fixed-width Vec context: `Vec[T]<k>` fixes the literal's
       # length by its habitant.
       TyDimT(inner, u) -> match inner {
-        TyCon(_, hname, hargs) ->
+        TyCon(_, hname, hargs, _) ->
           if hname == "Vec" { check_fixed_vec_lit(st, els, hargs, u, e.line, e.col) }
           else { synth(st, e) }
         _ -> synth(st, e)
@@ -15976,7 +15985,7 @@ fn ctor_check_or_synth(st: InferState, e: Expr, callee: Expr, args_: [Expr],
     EVar(cname) -> {
       let applied = apply_ty(st.sub, expected)
       match applied {
-        TyCon(_, parent, _) -> match ty_env_lookup_qualified(st.env, parent, cname) {
+        TyCon(_, parent, _, _) -> match ty_env_lookup_qualified(st.env, parent, cname) {
           Some(_) -> {
             let qcallee = mk_expr(EModCall(parent, cname), callee.line, callee.col)
             let rewritten = mk_expr(ECall(qcallee, args_), line, col)
@@ -16000,7 +16009,7 @@ fn nullary_ctor_check_or_synth(st: InferState, e: Expr, expected: Ty) : Inferred
     EVar(cname) -> {
       let applied = apply_ty(st.sub, expected)
       match applied {
-        TyCon(_, parent, _) -> match ty_env_lookup_qualified(st.env, parent, cname) {
+        TyCon(_, parent, _, _) -> match ty_env_lookup_qualified(st.env, parent, cname) {
           Some(_) -> {
             let qe = mk_expr(EModCall(parent, cname), e.line, e.col)
             synth(st, qe)
@@ -16217,7 +16226,7 @@ fn ctor_needs_qualification(env: TyEnv, cname: String, parent: String) : Bool {
 # the kai_byte(...) lowering.
 fn ty_is_vec_head(t: Ty) : Bool =
   match t {
-    TyCon(_, name, _) -> name == "Vec"
+    TyCon(_, name, _, _) -> name == "Vec"
     _                 -> false
   }
 
@@ -16237,7 +16246,7 @@ fn check_vec_lit_against(st: InferState, els: [ListElem], hargs: [Ty],
   } else {
     let elem_exp = match hargs { [t] -> apply_ty(st.sub, t)  _ -> TyAny }
     let checked = check_vec_elems(st, els, elem_exp, line, col, [])
-    let vty = TyCon(None, "Vec", [apply_ty(checked.st.sub, elem_exp)])
+    let vty = TyCon(None, "Vec", [apply_ty(checked.st.sub, elem_exp)], sym_none())
     mk_inferred(checked.st, vty, vec_lit_build(list_reverse(checked.elems), vty, line, col))
   }
 }
@@ -16514,7 +16523,7 @@ fn elem_synth_unify(st: InferState, ex: Expr, elem_ty: Ty,
 #[doc("True when a type is `Vec`-headed, seeing through any `Dim` brand — the fixed-width representation reads this to keep a `Vec<1>` distinct from the dynamic `Vec`.")]
 pub fn ty_vec_headed(t: Ty) : Bool = match t {
   TyDimT(inner, _) -> ty_vec_headed(inner)
-  TyCon(_, name, _) -> name == "Vec"
+  TyCon(_, name, _, _) -> name == "Vec"
   _ -> false
 }
 
@@ -16669,15 +16678,15 @@ fn rewrite_record_alias_pfields(fs: [PField], recs: [RecInfo]) : [PField] {
 # variant tag (any variant of `A`'s own decl). Dispatching on both
 # keeps narrowing observably correct under whichever runtime layout
 # the user constructed the value with.
-fn expand_narrow_arms(arms: [Arm], env: TyEnv) : [Arm] {
+fn expand_narrow_arms(arms: [Arm], env: TyEnv, mo: Option[String]) : [Arm] {
   match arms {
     [] -> []
     [a, ...rest] -> match a {
       Arm(pat, guard, body) -> match pat.pkind {
         PNarrow(name, ty_expr) -> {
-          let narrow_ty = inf_resolve_ty(ty_expr, env_home_view(env))
+          let narrow_ty = inf_resolve_ty(ty_expr, env_home_view(env, mo))
           let tycon_name = match narrow_ty {
-            TyCon(_, n, _) -> n
+            TyCon(_, n, _, _) -> n
             _           -> ""
           }
           let inner_vs = if tycon_name == "" { [] } else { variants_of_type(env, tycon_name) }
@@ -16687,9 +16696,9 @@ fn expand_narrow_arms(arms: [Arm], env: TyEnv) : [Arm] {
           # own ctors).
           let all_vs = if tycon_name == "" { inner_vs } else { [tycon_name, ...inner_vs] }
           let expanded = expand_narrow_one(all_vs, name, guard, body, pat.line, pat.col)
-          list_append(expanded, expand_narrow_arms(rest, env))
+          list_append(expanded, expand_narrow_arms(rest, env, mo))
         }
-        _ -> [a, ...expand_narrow_arms(rest, env)]
+        _ -> [a, ...expand_narrow_arms(rest, env, mo)]
       }
     }
   }
@@ -16782,10 +16791,10 @@ fn extract_return_tycon(sc: TyScheme) : Option[String] {
   match sc {
     Scheme(_, _, _, _, ty) -> match ty {
       TyFnT(_, ret, _) -> match ret {
-        TyCon(_, nm, _) -> Some(nm)
+        TyCon(_, nm, _, _) -> Some(nm)
         _            -> None
       }
-      TyCon(_, nm, _) -> Some(nm)
+      TyCon(_, nm, _, _) -> Some(nm)
       _            -> None
     }
   }
@@ -16973,10 +16982,10 @@ fn extract_return_tycon_arity(sc: TyScheme) : Option[TyConArity] {
   match sc {
     Scheme(_, _, _, _, ty) -> match ty {
       TyFnT(_, ret, _) -> match ret {
-        TyCon(_, nm, tas) -> Some(TCA(nm, list_length(tas)))
+        TyCon(_, nm, tas, _) -> Some(TCA(nm, list_length(tas)))
         _              -> None
       }
-      TyCon(_, nm, tas) -> Some(TCA(nm, list_length(tas)))
+      TyCon(_, nm, tas, _) -> Some(TCA(nm, list_length(tas)))
       _              -> None
     }
   }
@@ -17081,7 +17090,7 @@ fn ty_component_names(ts: [Ty], acc: [String]) : [String] {
   match ts {
     [] -> list_reverse(acc)
     [t, ...rest] -> match t {
-      TyCon(_, nm, _) -> ty_component_names(rest, [nm, ...acc])
+      TyCon(_, nm, _, _) -> ty_component_names(rest, [nm, ...acc])
       _ -> ty_component_names(rest, acc)
     }
   }
@@ -17159,7 +17168,7 @@ fn check_variants_nullary_marked(es: [TyEntry], target: String, prefix: String,
           Scheme(_, _, _, _, ty) -> match ty {
             # Zero-arg variant: scheme is the bare TyCon (e.g. `Hearts`
             # for `type Suit = Hearts | ...`).
-            TyCon(_, nm, _) ->
+            TyCon(_, nm, _, _) ->
               if nm == target {
                 check_variants_nullary_marked(rest, target, prefix, [visible_name, ...ok_acc], err_acc)
               } else {
@@ -17168,7 +17177,7 @@ fn check_variants_nullary_marked(es: [TyEntry], target: String, prefix: String,
             # N-ary variant: scheme is a TyFnT returning the target.
             # Empty args list means nullary; non-empty means payload.
             TyFnT(pargs, ret, _) -> match ret {
-              TyCon(_, nm, _) ->
+              TyCon(_, nm, _, _) ->
                 if nm == target {
                   let args_empty = match pargs { [] -> true _ -> false }
                   if args_empty {
@@ -17280,7 +17289,7 @@ fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int
   if has_catch_all(arms) { st }
   else {
     match scr_ty {
-      TyCon(_, tycon, scr_tas) -> {
+      TyCon(_, tycon, scr_tas, _) -> {
         # thread the scrutinee's tycon arity so private
         # core types of the same bare name but different arity
         # (e.g. `Tree[k, v]` in `stdlib/collections/map.kai`) do not
@@ -17372,7 +17381,7 @@ fn check_union_component(st: InferState, arms: [Arm], comp: Ty,
 
 
   match comp {
-    TyCon(_, tycon, comp_tas) -> {
+    TyCon(_, tycon, comp_tas, _) -> {
       if arms_cover_narrow(arms, tycon) { st }
       else {
         # arity-aware variant lookup; see `check_exhaustive`.
@@ -18026,7 +18035,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # called from user code); a future pass threading the inferred
       # return into the scheme is the proper fix for callable helpers.
       let opt_declared = match opt_ret {
-        Some(rty) -> Some(resolve_ty_with_binds(rty, tpbinds, rbinds, env.row_kind, env_home_view(env)))
+        Some(rty) -> Some(resolve_ty_with_binds(rty, tpbinds, rbinds, env.row_kind, env_home_view(env, mo)))
         None      -> None
       }
       # thread the declared return type through the body walk
@@ -18086,7 +18095,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # error). Recurses on its own sub so a field whose result type is
       # itself the receiver of a later deferred field resolves too.
       let st2f = drain_deferred_fields(st2pre, list_reverse(st2pre.deferred_fields),
-                                       decl_row_concrete_labels(row, env_home_view(env)))
+                                       decl_row_concrete_labels(row, env_home_view(env, mo)))
       # the bare calls whose candidates only a settled argument type
       # tells apart drain after the fields: a call on `b.field` needs
       # the field's own receiver resolved first.
@@ -18282,9 +18291,9 @@ fn infer_const_body(file: String, env: TyEnv, core_len: Int,
   let st_init = st_set_sums(st_init1, sums)
   let rr = synth_let_rhs_or_mint(st_init, cbody, cte, line, col)
   let minted = maybe_mint_literal(rr.st, rr.expr, rr.ty,
-                                  apply_ty(rr.st.sub, inf_resolve_ty_rk(cte, rr.st.env.row_kind, env_home_view(rr.st.env))),
+                                  apply_ty(rr.st.sub, inf_resolve_ty_rk(cte, rr.st.env.row_kind, st_home_view(rr.st))),
                                   line, col)
-  let declared = inf_resolve_ty_rk(cte, minted.st.env.row_kind, env_home_view(minted.st.env))
+  let declared = inf_resolve_ty_rk(cte, minted.st.env.row_kind, st_home_view(minted.st))
   let st2c = st_unify(minted.st, declared, minted.pair.ty, "const annotation", line, col)
   let hd = drain_deferred_homs(st2c, list_reverse(st2c.deferred_homs), [])
   let st2 = hd.st
@@ -18674,7 +18683,7 @@ fn check_body_row(st: InferState, fname: String, declared: RowExpr,
       # The body-vs-declared subset check is still the primary check;
       # this added pass surfaces the unhandled top-level row.
       let st1 = check_body_row_label_loop(st, fname, st.row,
-                                            inf_row_labels_of_rls(lbs, env_home_view(st.env)),
+                                            inf_row_labels_of_rls(lbs, st_home_view(st)),
                                             line, col)
       if fname == "main" {
         check_main_row_handlable(st1, st.row, line, col, decls)
@@ -19255,7 +19264,7 @@ type ProgramData = {
   sums:       [SumInfo],
   # the whole-program type-home table this module's tables were
   # stamped from; the delta below stamps its own from the same one.
-  homes:      [TyHomeEntry]
+  homes:      TyHomes
 }
 
 # variant that seeds the working tables from an
@@ -19283,7 +19292,7 @@ type ProgramData = {
 fn collect_program_data_inherited(file: String, df: DiagFiles, decls: [Decl],
                                     inherited: ModuleEnvDelta,
                                     all_program_decls: [Decl],
-                                    tab: SymTab)
+                                    tab: SymTab, views: FileViews)
                                     : ProgramData / Console + File {
   # expand `unit Newton = kg * m / sec^2` aliases at the AST
   # level before any pass that calls inf_resolve_ty. After this pass no
@@ -19311,7 +19320,7 @@ fn collect_program_data_inherited(file: String, df: DiagFiles, decls: [Decl],
   # full stream shows that. Every structure carrying a nominal head is
   # stamped from this one view, so the annotation side, the constructor
   # schemes and the union components agree on a type's home.
-  let homes = tsh_collect(rk_src_decls)
+  let homes = tsh_homes(rk_src_decls, tab, views, module_name_of_path(file))
   let hview = tsh_view(homes, None)
   let unions_here = collect_unions(decls_a, hview)
   let unions_all = list_append(unions_here, inherited.unions)
@@ -19382,12 +19391,12 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
                      proto_impls: [ProtoImplReg],
                      head_owners: [HeadOwnerEntry],
                      kind_theories: [KindTheory],
-                     tab: SymTab,
+                     tab: SymTab, views: FileViews,
                      verbose: Bool) : TypecheckedModule / Console + File {
 
 
   let data0 = collect_program_data_inherited(file, df, mod.decls, inherited,
-                                                all_program_decls, tab)
+                                                all_program_decls, tab, views)
   # attach the per-compile head-owner cache to the env
   # the typer walks. The cache is built once per `compile_source`
   # invocation from the post-`expand_imports` decl stream + module
@@ -19522,7 +19531,7 @@ fn typecheck_program(file: String, df: DiagFiles, modules: [ModuleDecls],
                       proto_impls: [ProtoImplReg],
                       verbose: Bool) : TypedProgram / Console + File =
   typecheck_program_with_head_owners(file, df, modules, proto_impls,
-                                     head_owner_seed(), [], st_empty(), verbose)
+                                     head_owner_seed(), [], st_empty(), fv_empty(), verbose)
 
 # variant accepting the per-compile head-owner cache. The
 # cache is built once by `compile_source` after `expand_imports`
@@ -19533,7 +19542,7 @@ fn typecheck_program_with_head_owners(file: String, df: DiagFiles, modules: [Mod
                                        proto_impls: [ProtoImplReg],
                                        head_owners: [HeadOwnerEntry],
                                        kind_theories: [KindTheory],
-                                       tab: SymTab,
+                                       tab: SymTab, views: FileViews,
                                        verbose: Bool) : TypedProgram / Console + File {
 
 
@@ -19544,7 +19553,7 @@ fn typecheck_program_with_head_owners(file: String, df: DiagFiles, modules: [Mod
   let all_program_decls = flatten_module_decls(modules, [])
   typecheck_program_loop(file, df, modules, module_env_delta_empty(),
                           all_program_decls,
-                          proto_impls, head_owners, kind_theories, tab, verbose,
+                          proto_impls, head_owners, kind_theories, tab, views, verbose,
                           [], 0, [], [], [], [], [], 0, 0)
 }
 
@@ -19579,7 +19588,7 @@ fn typecheck_program_loop(file: String, df: DiagFiles, modules: [ModuleDecls],
                             proto_impls: [ProtoImplReg],
                             head_owners: [HeadOwnerEntry],
                             kind_theories: [KindTheory],
-                            tab: SymTab,
+                            tab: SymTab, views: FileViews,
                             verbose: Bool,
                             acc_decls: [Decl],
                             acc_errs: Int,
@@ -19607,14 +19616,14 @@ fn typecheck_program_loop(file: String, df: DiagFiles, modules: [ModuleDecls],
     }
     [m, ...rest] -> {
       let r = typecheck_module(file, df, m, acc_delta, all_program_decls,
-                                  proto_impls, head_owners, kind_theories, tab, verbose)
+                                  proto_impls, head_owners, kind_theories, tab, views, verbose)
       let next_delta = merge_env_deltas(acc_delta, r.delta)
       let next_core_len = match core_len_acc {
         0 -> r.typed.core_len
         _ -> core_len_acc
       }
       typecheck_program_loop(file, df, rest, next_delta, all_program_decls,
-                              proto_impls, head_owners, kind_theories, tab, verbose,
+                              proto_impls, head_owners, kind_theories, tab, views, verbose,
                               prepend_reverse_decls(r.typed.decls, acc_decls),
                               acc_errs + r.typed.errs,
                               llvm_prepend_reverse(r.typed.insts, acc_insts),
@@ -19916,7 +19925,7 @@ fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
                                proto_impls: [ProtoImplReg]) : TypedProgram / Console + File =
   infer_program_with_protos_cached(file, diag_files_flat(file), decls, verbose,
                                    proto_impls, head_owner_seed(),
-                                   atomic_kind_theories(decls), st_empty())
+                                   atomic_kind_theories(decls), st_empty(), fv_empty())
 
 # variant accepting the per-compile head-owner cache. The
 # `compile_source` driver builds the cache from the post-`expand_imports`
@@ -19928,7 +19937,7 @@ pub fn infer_program_with_protos_cached(file: String, df: DiagFiles, decls: [Dec
                                        proto_impls: [ProtoImplReg],
                                        head_owners: [HeadOwnerEntry],
                                        kind_theories: [KindTheory],
-                                       tab: SymTab) : TypedProgram / Console + File {
+                                       tab: SymTab, views: FileViews) : TypedProgram / Console + File {
 
 
   # Hanga Roa modular typecheck: partition the post-cascade decl
@@ -19948,7 +19957,7 @@ pub fn infer_program_with_protos_cached(file: String, df: DiagFiles, decls: [Dec
     [_]          -> [ModuleDecls { name: None, decls: decls }]
     _            -> mods0
   }
-  typecheck_program_with_head_owners(file, df, mods, proto_impls, head_owners, kind_theories, tab, verbose)
+  typecheck_program_with_head_owners(file, df, mods, proto_impls, head_owners, kind_theories, tab, views, verbose)
 }
 
 
@@ -20012,7 +20021,7 @@ fn synth_find_arg(scope: [TyEntry], want: Ty, fresh: Int, avoid: [String], sub: 
       if list_has_string(avoid, te.name) or (not synth_return_structural(te.scheme)) {
         synth_find_arg(rest, want, fresh, avoid, sub)
       } else {
-        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], ty_homes: [], index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
+        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
         match unify(inst.ty, want, sub) {
           Some(sub1) -> Some(ArgMatch { name: te.name, sub: sub1, fresh: inst.env.fresh })
           None       -> synth_find_arg(rest, want, fresh, avoid, sub)
@@ -20041,7 +20050,7 @@ fn synth_find_args(scope: [TyEntry], params: [Ty], fresh: Int, avoid: [String],
 # Try entry `te` as a direct match or a 1-level application against
 # `expected`. Returns rendered candidate text or None.
 fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int) : Option[String] / Mutable {
-  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], ty_homes: [], index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
+  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
   match unify(inst.ty, expected, subst_empty()) {
     Some(_) -> Some(te.name)
     None    -> match inst.ty {
