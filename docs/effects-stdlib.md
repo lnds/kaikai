@@ -1595,6 +1595,8 @@ clause. An **enclosing binding of either name wins**: a clause inside a
 `handle` that sits under `let log = ...` reads that `log`, not the
 handler state, and the compiler warns that the alias is unavailable
 there. Rename the enclosing binding to reach the state under its alias.
+A `var` is unaffected: it reaches its cell without going through either
+name.
 
 ### Telling two effects apart by their type parameter
 
