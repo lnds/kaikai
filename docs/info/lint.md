@@ -15,13 +15,17 @@ effect-aware — not just a text scan.
 
 ```text
 kai lint [<spec>]                  # human-readable warnings
-kai lint --json [<spec>]           # findings as a JSON array
+kai lint --json [<spec>]           # findings as JSON, one line per root
 ```
 
 `<spec>` is a `.kai` file or a package (`.` / `./<sub>`), the same as
 `kai build` / `kai test`. A package with an entry point is linted once
-from that entry; a package without one — a library — is linted module
-by module, so its whole surface is covered either way.
+from that entry, and the findings cover the entry file; a package
+without one — a library — is linted module by module.
+
+`--json` prints one JSON array of `{file, line, col, rule, severity,
+message}` per compilation root, each on its own line (NDJSON): one
+line for a file or a package's entry, one per module for a library.
 
 ## Rules
 

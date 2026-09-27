@@ -70,13 +70,15 @@ $ kai env
 KAIKAI_HOME=/Users/x/.kaikai
 KAI_STDLIB=/Users/x/.kaikai/share/kaikai/stdlib
 KAI_TOOLCHAIN_ID=1790102223-92641704
+KAI_KAIC2=/Users/x/.kaikai/libexec/kaikai/kaic2
 $ kai env KAI_STDLIB             # just the value, one per name
 /Users/x/.kaikai/share/kaikai/stdlib
 ```
 
 A command `kai` does not know runs as a plugin, the git/cargo model:
-`kai foo a b` executes `kai-foo` with `a b`, the three variables above
-already exported, and exits with its status. The plugins the toolchain
+`kai foo a b` executes `kai-foo` with `a b`, the variables above
+already exported, and exits with its status. `KAI_KAIC2` is how a
+plugin reaches the compiler, which is not on `PATH`. The plugins the toolchain
 ships (`libexec/kaikai/plugins/`, `kai upgrade` among them) come first,
 then the first executable `kai-foo` on `PATH`. A plugin run directly
 recovers the same values with `kai env`. A plugin never shadows a
