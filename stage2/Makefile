@@ -4356,7 +4356,11 @@ test-effects: $(TARGET) build
 	for f in ../examples/effects/array_mutable_required.kai \
 	         ../examples/effects/string_builder_append_requires_mutable.kai \
 	         ../examples/effects/array_record_forward_requires_mutable.kai \
-	         ../examples/effects/bytes_writer_param_requires_mutable.kai; do \
+	         ../examples/effects/bytes_writer_param_requires_mutable.kai \
+	         ../examples/effects/pipe_callee_row_propagates.kai \
+	         ../examples/effects/pipe_array_write_requires_mutable.kai \
+	         ../examples/effects/record_field_fn_row_escape.kai \
+	         ../examples/effects/record_field_fn_row_extra.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=$${f%.kai}.err.expected; \
 	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
@@ -4368,7 +4372,7 @@ test-effects: $(TARGET) build
 	      || { echo "effects FAIL $$name (missing diagnostic: $$line)"; \
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
-	  echo "effects OK $$name (parameter-mutation rejected)"; \
+	  echo "effects OK $$name (rejected with the expected diagnostic)"; \
 	done; \
 	for f in ../examples/effects/prelude_effect_via_scheme.kai; do \
 	  name=$$(basename $$f .kai); \
