@@ -175,6 +175,65 @@ case "$got" in
   *) fail "mutate: unmutated module that does not typecheck"; printf '%s\n' "$got" | sed 's/^/        /' ;;
 esac
 
+# The driver surface: `--list --json` prints one JSON object per site and
+# line, and `--apply` prints the module with exactly that site's byte span
+# replaced. Multibyte text ahead of every site keeps bytes and characters apart.
+U="$TMP/mutdrv"
+mkdir -p "$U" "$TMP/mutant"
+printf 'name = "tdrv"\n' > "$U/kai.toml"
+cat > "$U/greet.kai" <<'EOF'
+# Saludo: ñandú, café, 🎉 — multibyte text before every site.
+fn label(n: Int) : String = if "ñ" != "é" and n >= 2 { "muchos 🎉" } else { "uno ñ" }
+
+fn main() = print(label(2))
+EOF
+printf 'pub fn two() : Int = 1 + 1\n' > "$U/helper.kai"
+if command -v python3 >/dev/null 2>&1; then
+  status=0
+  got="$(cd "$U" && python3 - "$KAI" "$TMP/mutant/greet.kai" 2>&1 <<'PY'
+import json, subprocess, sys
+kai, mutant = sys.argv[1], sys.argv[2]
+def mutate(*args):
+    r = subprocess.run([kai, "mutate", *args], capture_output=True)
+    assert r.returncode == 0, (args, r.stderr)
+    return r.stdout
+def ndjson(out):
+    return [json.loads(l) for l in out.decode().splitlines()]
+src = open("greet.kai", "rb").read()
+sites = ndjson(mutate("--list", "--json", "--module", "greet.kai"))
+keys = {"id", "file", "line", "col", "operator", "start", "end", "original",
+        "replacement", "enclosing", "ordinal", "description"}
+assert sites, "no sites listed"
+for s in sites:
+    assert set(s) == keys, s
+    a, b = s["start"]["byte"], s["end"]["byte"]
+    assert src[a:b].decode() == s["original"], s
+    assert s["start"]["col"] == a - src.rfind(b"\n", 0, a), s
+    want = src[:a] + s["replacement"].encode() + src[b:]
+    assert mutate("--apply", str(s["id"]), "--module", "greet.kai") == want, s
+cmp = [s for s in sites if s["operator"] == "compare"]
+assert [(s["original"], s["replacement"], s["enclosing"]) for s in cmp] == [(">=", ">", "greet.label/1")], cmp
+line = src[src.rfind(b"\n", 0, cmp[0]["start"]["byte"]) + 1:cmp[0]["start"]["byte"]]
+assert len(line.decode()) != len(line), "no multibyte text ahead of the site on its line"
+assert ndjson(mutate("--list", "--json", "--operator", "compare", "--module", "greet.kai")) == cmp
+listed = {s["file"].rsplit("/", 1)[-1] for s in ndjson(mutate("--list", "--json"))}
+assert listed == {"greet.kai", "helper.kai"}, listed
+open(mutant, "wb").write(mutate("--apply", str(cmp[0]["id"]), "--module", "greet.kai"))
+PY
+)" || status=$?
+  if [ "$status" -eq 0 ]; then
+    ok "mutate: --list --json carries each site's byte span, and --apply splices exactly it"
+  else
+    fail "mutate: --list --json / --apply roundtrip"; printf '%s\n' "$got" | sed 's/^/        /'
+  fi
+  expect "mutate: the applied mutant builds and behaves as the listed site says" 0 "uno ñ" \
+    "$KAI" run "$TMP/mutant/greet.kai"
+else
+  echo "test-kai-cli: warning: python3 not found; skipping the mutate JSON roundtrip" >&2
+fi
+expect_line "mutate: --apply names a site the module does not have" 1 "mutate: no site 99 (the file has 7)" \
+  sh -c 'cd "$1" && "$2" mutate --apply 99 --module greet.kai' _ "$U" "$KAI"
+
 # A dev checkout whose kaic2 exists needs nothing from stages 0-1: its
 # stage0/ holds no Makefile, so any attempt to rebuild kaic0 fails.
 D="$TMP/dev"

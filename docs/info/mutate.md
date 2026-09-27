@@ -121,37 +121,57 @@ Three things keep it usable:
 
 ## External drivers
 
-The compiler splits the work the same way for any driver: `kaic2
---mutate-list-json <file>` catalogues the sites, `kaic2 --mutate-apply
-<i> <file>` prints the source with site `i` applied. Each JSON site
-carries enough to diff, cache and suppress it without re-reading the
-source:
+A driver that owns the scheduling, caching and timeouts asks `kai
+mutate` only for what the mutants are. Both requests are read-only:
+nothing is built, no oracle runs, no file is written.
 
-```json
-{"id": 4, "file": "src/planner.kai", "line": 42, "col": 7,
- "operator": "compare",
- "start": {"line": 42, "col": 7, "byte": 1180},
- "end":   {"line": 42, "col": 9, "byte": 1182},
- "original": ">=", "replacement": ">",
- "enclosing": "planner.order_sites/2", "ordinal": 1,
- "description": "shift a comparison boundary"}
+```text
+kai mutate --list --json                             # every site of the package
+kai mutate --list --json --module src/planner.kai    # one module's sites
+kai mutate --apply 4 --module src/planner.kai        # that module with site 4 applied
 ```
 
+`--list --json` prints one JSON object per line, one line per site, in
+the order `--list` walks the modules; `--operator` narrows it as it
+narrows the text listing. Each record carries enough to diff, cache and
+suppress the site without re-reading the source. For this `greet.kai`:
+
+```kaikai
+# Saludo: ñandú, café, 🎉 — multibyte text before every site.
+fn label(n: Int) : String = if "ñ" != "é" and n >= 2 { "muchos 🎉" } else { "uno ñ" }
+
+fn main() = print(label(2))
+```
+
+```text
+$ kai mutate --list --json --module greet.kai --operator compare
+{"id": 2, "file": "greet.kai", "line": 2, "col": 51, "operator": "compare", "start": {"line": 2, "col": 51, "byte": 119}, "end": {"line": 2, "col": 53, "byte": 121}, "original": ">=", "replacement": ">", "enclosing": "greet.label/1", "ordinal": 1, "description": "shift a comparison boundary"}
+```
+
+- `id` — the site's index within its module, what `--apply` takes.
+- `file` — the module as `--module` named it, or the absolute path the
+  package walk found.
 - `start` / `end` — the half-open span the mutation rewrites; line and
-  column 1-based, byte offset 0-based. The mutant is exactly the source
-  with `[start.byte, end.byte)` replaced by `replacement`.
+  column 1-based, byte offset 0-based. Columns count bytes, not
+  characters: each `é` ahead of a site on its line adds two.
 - `original` — the span's source text; `replacement` — what replaces
   it, `""` for a deletion (an `arm` site's span is the whole arm).
 - `enclosing` — the declaration the site lives in: `module.fn/arity`,
   `module.CONST`, or `module.(Show for Color).show/1` for an impl
-  method.
+  method, where `module` is the file's name without `.kai`.
 - `ordinal` — 1-based rank among the sites sharing `enclosing`,
   `operator` and `original`, in source order.
 
 `enclosing` + `operator` + `original` + `ordinal` identify a site
 across edits elsewhere in the file, which `<file>:<line>:<operator>`
-does not. A site whose span cannot be resolved reports these keys as
-`null`.
+does not. A site whose span cannot be resolved reports `start`, `end`,
+`original` and `replacement` as `null`.
+
+`--apply <id> --module <file>` prints the module's source with
+`[start.byte, end.byte)` replaced by `replacement`, and nothing else. The
+mutant always parses; it need not type-check — a mutant the compiler
+rejects is a kill of the least interesting kind, and building it is the
+driver's job. A site the module does not have exits 1.
 
 ## Equivalent mutants
 

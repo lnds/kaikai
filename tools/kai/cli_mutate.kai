@@ -11,6 +11,7 @@ import cli_err
 import cli_fs
 import cli_info_json
 import cli_io
+import cli_mutate_driver
 import cli_proc
 import cli_sys
 import cli_toolchain
@@ -24,6 +25,7 @@ type MutateOpts = {
   module: String,
   ops: [String],
   limit: String,
+  apply: Option[String],
   list_only: Bool,
   json: Bool,
   help: Bool
@@ -31,7 +33,8 @@ type MutateOpts = {
 
 # The flags that take a value, and what the value is.
 const VALUED : [(String, String)] = [
-  ("--oracle", "a command"), ("--module", "a file"), ("--operator", "a name"), ("--limit", "a count")
+  ("--oracle", "a command"), ("--module", "a file"), ("--operator", "a name"), ("--limit", "a count"),
+  ("--apply", "a site id")
 ]
 
 type Valued = { flag: String, value: String, rest: [String] }
@@ -53,6 +56,8 @@ fn set(o: MutateOpts, v: Valued) : MutateOpts =
     MutateOpts { ...o, module: v.value }
   } else if v.flag == "--operator" {
     MutateOpts { ...o, ops: o.ops ++ cli_proc.words(v.value) }
+  } else if v.flag == "--apply" {
+    MutateOpts { ...o, apply: Some(v.value) }
   } else {
     MutateOpts { ...o, limit: v.value }
   }
@@ -77,26 +82,32 @@ fn parse(args: [String], o: MutateOpts) : Result[MutateOpts, Int] / Stderr =
     }
   }
 
+fn digits(s: String) : Bool = string.chars(s) |> list.all(c => char.is_digit(c))
+
+# `--apply` prints one mutant: every flag that shapes a run would be silently ignored.
+fn validate_apply(o: MutateOpts, id: String) : Result[Unit, Int] / Stderr =
+  if id == "" or not digits(id) {
+    cli_err.die("--apply takes a site id, got '#{id}'")
+  } else if o.module == "" {
+    cli_err.die("--apply requires --module: a site id numbers the sites of one module")
+  } else if o.spec != "" or o.oracle != "" or o.limit != "" or o.list_only or o.json or not list.is_empty(o.ops) {
+    cli_err.die("--apply takes only --module: it prints one mutant and runs nothing")
+  } else {
+    Ok(())
+  }
+
 fn validate(o: MutateOpts) : Result[Unit, Int] / Stderr =
-  if not (string.chars(o.limit) |> list.all(c => char.is_digit(c))) {
+  if not digits(o.limit) {
     cli_err.die("--limit takes a positive integer, got '#{o.limit}'")
   } else {
     match o.ops |> list.find(op => not OPERATORS.contains(op)) {
       Some(op) -> cli_err.die("unknown operator: #{op} (see 'kai mutate --help')")
-      None -> Ok(())
+      None -> match o.apply {
+        Some(id) -> validate_apply(o, id)
+        None -> Ok(())
+      }
     }
   }
-
-#[doc("One mutation site as `kaic2 --mutate-list` prints it.")]
-type Site = { id: String, op: String, line: String, col: String, desc: String }
-
-# `while IFS=<tab> read -r …`: an unterminated last line is never read.
-fn sites(text: String) : [Site] =
-  list.take(string.split(text, "\n"), list.length(string.split(text, "\n")) - 1)
-    | (l => match cli_proc.read_fields(l, '\t', 5) {
-      [id, op, line, col, desc] -> Site { id, op, line, col, desc }
-      _ -> Site { id: "", op: "", line: "", col: "", desc: "" }
-    })
 
 type Run = {
   t: Toolchain,
@@ -148,9 +159,6 @@ fn equivalent(r: Run, f: String, s: Site) : Result[Bool, Int] / Stderr {
   }
 }
 
-fn gen_spawn(out: String) : Spawn =
-  cli_proc.Spawn { ...cli_proc.inherit(), out: out, err: "/dev/null", unset: ["KAI_TRACE_RC"] }
-
 fn quiet() : Spawn = cli_proc.Spawn { ...cli_proc.inherit(), out: "/dev/null", err: "/dev/null" }
 
 fn survivor(r: Run, f: String, s: Site) : [String] / File + Ffi {
@@ -170,7 +178,7 @@ fn judge(r: Run, f: String, s: Site) : Verdict / Stderr + File + Ffi {
   let orig = "#{r.tmp}/orig.kai"
   let paths = ["--path", cli_fs.dirname(f), "--path", r.t.layout.stdlib]
   let apply = [r.gen, ...paths] ++ ["--mutate-apply", s.id, orig]
-  if cli_proc.run(apply, gen_spawn("#{r.tmp}/mutant.kai")) != 0 {
+  if cli_proc.run(apply, cli_mutate_driver.gen_spawn("#{r.tmp}/mutant.kai", "/dev/null")) != 0 {
     Uncompiled
   } else {
     let _ = cli_fs.copy("#{r.tmp}/mutant.kai", f)
@@ -227,8 +235,15 @@ fn fold_sites(r: Run, f: String, ss: [Site], n: Tally) : Result[Tally, Int] / St
     }
   }
 
-fn list_sites(r: Run, f: String, ss: [Site]) : Unit / Stdout =
-  ss |? (s => selected(r, s.op)) |> foreach(s => Stdout.print("#{s.op}\t#{f}\t#{s.line}:#{s.col}\t#{s.desc}"))
+# The JSON records come in catalogue order, so the text listing's operators select them.
+fn list_sites(r: Run, f: String, ss: [Site]) : Unit / Stdout + File + Ffi =
+  if r.o.json {
+    list.zip(ss, cli_mutate_driver.site_records(r.t, f, r.tmp))
+      |? (p => selected(r, p.fst.op))
+      |> foreach(p => Stdout.print(p.snd))
+  } else {
+    ss |? (s => selected(r, s.op)) |> foreach(s => Stdout.print("#{s.op}\t#{f}\t#{s.line}:#{s.col}\t#{s.desc}"))
+  }
 
 # A module that does not check unmutated would bank every mutant as a compile failure.
 fn mutate_module(
@@ -249,24 +264,26 @@ fn mutate_module(
   }
 }
 
+fn listed(r: Run, f: String, ss: [Site], n: Tally) : Result[Tally, Int] / Stdout + Stderr + Env + File + Ffi =
+  if r.o.list_only {
+    list_sites(r, f, ss)
+    Ok(n)
+  } else if list.is_empty(ss) {
+    Ok(n)
+  } else {
+    mutate_module(r, f, ss, n)
+  }
+
 fn module(r: Run, n: Tally, f: String) : Result[Tally, Int] / Stdout + Stderr + Env + File + Ffi =
   if n.stop or (not cli_sys.is_file(f)) {
     Ok(n)
   } else {
-    let dir = cli_fs.dir_of(f).unwrap_or(".")
-    let argv = [r.t.layout.kaic2, "--path", dir, "--path", r.t.layout.stdlib, "--mutate-list", f]
-    let listed = cli_proc.run(argv, gen_spawn("#{r.tmp}/sites"))
-    let ss = sites(cli_fs.read_or_empty("#{r.tmp}/sites"))
-    if listed != 0 {
-      Stderr.eprint("kai: mutate: #{f} does not parse; skipped")
-      Ok(n)
-    } else if r.o.list_only {
-      list_sites(r, f, ss)
-      Ok(n)
-    } else if cli_fs.read_or_empty("#{r.tmp}/sites") == "" {
-      Ok(n)
-    } else {
-      mutate_module(r, f, ss, n)
+    match cli_mutate_driver.sites(r.t, f, r.tmp) {
+      None -> {
+        Stderr.eprint("kai: mutate: #{f} does not parse; skipped")
+        Ok(n)
+      }
+      Some(ss) -> listed(r, f, ss, n)
     }
   }
 
@@ -342,7 +359,7 @@ fn package_root(spec: String) : Result[String, Int] / Stderr + Ffi {
   if cli_sys.is_dir(dir) { Ok(dir) } else { cli_err.die("cannot open #{given}") }
 }
 
-#[doc("`kai mutate [<spec>] [--oracle <cmd>] [--module <file>] [--operator <name>] [--limit <n>] [--list] [--json]`: 1 when a mutant survives.")]
+#[doc("`kai mutate [<spec>] [--oracle <cmd>] [--module <file>] [--operator <name>] [--limit <n>] [--list] [--json] [--apply <id>]`: 1 when a mutant survives.")]
 pub fn mutate_verb(t: Toolchain, args: [String]) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
   let none = MutateOpts {
     spec: "",
@@ -350,6 +367,7 @@ pub fn mutate_verb(t: Toolchain, args: [String]) : Result[Int, Int] / Stdout + S
     module: "",
     ops: [],
     limit: "",
+    apply: None,
     list_only: false,
     json: false,
     help: false
@@ -361,7 +379,12 @@ pub fn mutate_verb(t: Toolchain, args: [String]) : Result[Int, Int] / Stdout + S
   } else {
     validate(o)!
     cli_toolchain.ensure_built(t)!
-    let root = package_root(o.spec)!
-    cli_fs.with_scratch(tmp => sweep(t, o, root, tmp))
+    match o.apply {
+      Some(id) -> cli_mutate_driver.apply(t, o.module, id)
+      None -> {
+        let root = package_root(o.spec)!
+        cli_fs.with_scratch(tmp => sweep(t, o, root, tmp))
+      }
+    }
   }
 }
