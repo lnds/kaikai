@@ -530,7 +530,10 @@ fn main() : Int / Stdout = {
 ```
 
 In a function type, the row appears after `/`: `: T / E1 + E2`.
-Empty row means pure. A row label takes type args (`/ State[Int] +
+Empty row means pure. A row after an arrow type binds to that arrow:
+`fn f() : (Int) -> Int / Log` is pure and returns a closure that
+performs `Log`, while `fn f() : ((Int) -> Int) / Log` performs `Log`
+and returns a pure closure. A row label takes type args (`/ State[Int] +
 Reader[String]`); a lowercase name is a row VARIABLE (`fn each[a, e](
 xs: [a], f: (a) -> Unit / e) : Unit / e` — the tail stays open and
 unifies with the caller's row); `/ ?e` is a row hole (`kai info
