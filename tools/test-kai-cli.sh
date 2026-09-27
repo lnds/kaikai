@@ -227,7 +227,7 @@ PY
     fail "mutate: --list --json / --apply roundtrip"; printf '%s\n' "$got" | sed 's/^/        /'
   fi
   expect "mutate: the applied mutant builds and behaves as the listed site says" 0 "uno ñ" \
-    "$KAI" run "$TMP/mutant/greet.kai"
+    "$KAI" run --backend=c "$TMP/mutant/greet.kai"
 else
   echo "test-kai-cli: warning: python3 not found; skipping the mutate JSON roundtrip" >&2
 fi
