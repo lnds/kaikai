@@ -10347,11 +10347,13 @@ test-issue-1565-handler-alias-shadow: $(TARGET) build
 	  | grep -q 'is the enclosing binding, not the handler state' \
 	  || { echo "issue-1565 FAIL (no shadowing diagnostic)"; exit 1; }; \
 	echo "issue-1565 OK (shadowing diagnostic named)"; \
-	if $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
-	     ../examples/effects/var_init_log_no_alias_warning.kai 2>&1 >/dev/null \
-	     | grep -q 'is the enclosing binding, not the handler state'; then \
-	  echo "issue-1565 FAIL (shadowing warning on a handler whose clauses never read the alias)"; exit 1; \
-	fi; \
+	for f in var_init_log_no_alias_warning var_cell_under_state_binding; do \
+	  if $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
+	       ../examples/effects/$$f.kai 2>&1 >/dev/null \
+	       | grep -q 'is the enclosing binding, not the handler state'; then \
+	    echo "issue-1565 FAIL ($$f: shadowing warning on a handler whose clauses never read the alias)"; exit 1; \
+	  fi; \
+	done; \
 	echo "issue-1565 OK (no warning when the clauses never read the alias)"
 
 ifeq ($(KAI_LLVM),1)
