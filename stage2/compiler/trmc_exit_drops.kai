@@ -1,0 +1,187 @@
+#[doc("""
+Exit drops across a TRMC modulo-cons step.
+
+Perceus runs an arm's exit drops after its value:
+`{ let __pcs_arm_ret = INNER; drops; __pcs_arm_ret }`. The TRMC rewrite peels
+that wrap to expose the modulo-cons ctor, so the drops move into each leaf of
+the rewritten INNER. Both backends evaluate a step's ctor heads, then the
+self-call's arguments, in order. A step binds the drops around the rightmost
+boxed operand at or after the last read of a dropped binder; a raw operand
+would pay a box round trip on the native lowering, so a step with no such
+operand keeps no drops. An apply leaf binds them around its whole value.
+
+A binder passed bare into the self-call keeps its reference: that slot may
+only borrow it. A Perceus reuse rebuild keeps no drops, since the native
+apply lowering reads its shape.
+""")]
+
+import compiler.ast
+import compiler.fnreg
+import compiler.perceus_reads
+import compiler.emit_shared
+import compiler.perceus_plant_drop
+
+#[doc("The drops a Perceus arm-ret wrap runs after its value; `[]` when `e` is no such wrap or holds anything but drops.")]
+pub fn txd_wrap_drops(e: Expr) : [Stmt] = match e.kind {
+  EBlock(stmts, opt_tail) -> match opt_tail {
+    Some(t) -> match t.kind {
+      EVar(tn) -> if txd_is_ret_name(tn) { txd_only_drops(txd_after_let(stmts, tn)) } else { [] }
+      _        -> []
+    }
+    None -> []
+  }
+  _ -> []
+}
+
+fn txd_is_ret_name(tn: String) : Bool = tn == "__pcs_arm_ret" or tn == "__pcs_block_ret"
+
+fn txd_after_let(stmts: [Stmt], tn: String) : [Stmt] = match stmts {
+  []           -> []
+  [s, ...rest] -> if txd_binds(s, tn) { rest } else { txd_after_let(rest, tn) }
+}
+
+fn txd_binds(s: Stmt, tn: String) : Bool = match s {
+  SLet(pat, _, _) -> match pat.pkind {
+    PBind(nm) -> nm == tn
+    _         -> false
+  }
+  _ -> false
+}
+
+fn txd_only_drops(stmts: [Stmt]) : [Stmt] =
+  if all(stmts, (s) => txd_named(ppd_drop_name(s))) { stmts } else { [] }
+
+fn txd_named(o: Option[String]) : Bool = match o {
+  Some(_) -> true
+  None    -> false
+}
+
+#[doc("Plant `drops` into every TRMC step and apply leaf of a rewritten body, after the leaf's last read.")]
+pub fn txd_plant(e: Expr, drops: [Stmt]) : Expr = match drops {
+  []         -> e
+  [_, ...__] -> Expr { kind: txd_kind(e.kind, drops), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+}
+
+fn txd_kind(k: ExprKind, drops: [Stmt]) : ExprKind = match k {
+  EIf(c, t, opt_e) -> EIf(c, txd_plant(t, drops), txd_plant_opt(opt_e, drops))
+  EMatch(s, arms)  -> EMatch(s, map(arms, (a) => txd_arm(a, drops)))
+  EBlock(stmts, opt_tail) -> match opt_tail {
+    Some(t) -> EBlock(stmts, Some(txd_plant(t, txd_unshadowed(drops, ppd_let_names(stmts)))))
+    None    -> k
+  }
+  ECall(f, xs) -> match f.kind {
+    EVar(callee)       -> if es_trmc_is_step_sentinel(callee) { ECall(f, txd_step_args(xs, txd_hole(callee), drops)) } else { k }
+    EMark(MkTrmcApply) -> ECall(f, map(xs, (leaf) => txd_apply_leaf(leaf, drops)))
+    _                  -> k
+  }
+  _ -> k
+}
+
+fn txd_apply_leaf(leaf: Expr, drops: [Stmt]) : Expr = match leaf.kind {
+  ECall(f, _) -> match f.kind {
+    EVar(c) -> if string_starts_with_q(c, "__perceus_reuse") { leaf } else { ppd_bind_then(leaf, drops) }
+    _       -> ppd_bind_then(leaf, drops)
+  }
+  _ -> ppd_bind_then(leaf, drops)
+}
+
+fn txd_plant_opt(opt_e: Option[Expr], drops: [Stmt]) : Option[Expr] = match opt_e {
+  Some(e) -> Some(txd_plant(e, drops))
+  None    -> None
+}
+
+fn txd_arm(a: Arm, drops: [Stmt]) : Arm = match a {
+  Arm(pat, g, body) -> Arm(pat, g, txd_plant(body, txd_unshadowed(drops, prc_pat_bindings(pat, []))))
+}
+
+# A drop whose binder a nested scope rebinds would release the inner value.
+fn txd_unshadowed(drops: [Stmt], names: [String]) : [Stmt] =
+  filter(drops, (d) => not ppd_drop_among(d, names))
+
+fn txd_hole(callee: String) : Int = match es_tcrec_split_pipe(callee) {
+  [_, _, h, ..._] -> es_tcrec_parse_decimal(h)
+  _               -> 0 - 1
+}
+
+fn txd_step_args(xs: [Expr], hole: Int, drops: [Stmt]) : [Expr] = match txd_nth(xs, hole) {
+  Some(se) -> match se.kind {
+    ECall(sf, sa) -> txd_plant_step(xs, hole, se, sf, sa, filter(drops, (d) => not txd_passed(d, sa)))
+    _             -> xs
+  }
+  None -> xs
+}
+
+# Operands in evaluation order: the ctor heads, then the self-call's args.
+fn txd_plant_step(xs: [Expr], hole: Int, se: Expr, sf: Expr, sa: [Expr], kept: [Stmt]) : [Expr] = {
+  let heads = txd_without(xs, hole, 0)
+  let j = txd_pick(list_append(heads, sa), map(kept, (d) => txd_drop_binder(d)))
+  let nh = list_length(heads)
+  let wrap = (a: Expr) => ppd_bind_then(a, kept)
+  if j < 0 or list_length(kept) == 0 { xs }
+  else if j < nh { txd_map_nth(xs, if j < hole { j } else { j + 1 }, wrap) }
+  else {
+    let se2 = Expr { kind: ECall(sf, txd_map_nth(sa, j - nh, wrap)), line: se.line, col: se.col, ty: se.ty, mode: se.mode }
+    txd_map_nth(xs, hole, (_a: Expr) => se2)
+  }
+}
+
+fn txd_drop_binder(d: Stmt) : String = match ppd_drop_name(d) {
+  Some(nm) -> nm
+  None     -> ""
+}
+
+# The rightmost boxed operand at or after the last read of any `names`.
+fn txd_pick(ops: [Expr], names: [String]) : Int =
+  txd_rightmost_boxed(ops, txd_last_read(ops, names, 0, 0), 0, 0 - 1)
+
+fn txd_last_read(ops: [Expr], names: [String], i: Int, acc: Int) : Int = match ops {
+  []           -> acc
+  [a, ...rest] -> txd_last_read(rest, names, i + 1, if any(names, (n) => pcs_mentions(n, a)) { i } else { acc })
+}
+
+fn txd_rightmost_boxed(ops: [Expr], from: Int, i: Int, acc: Int) : Int = match ops {
+  []           -> acc
+  [a, ...rest] -> txd_rightmost_boxed(rest, from, i + 1, if i >= from and txd_boxed(a) { i } else { acc })
+}
+
+fn txd_boxed(a: Expr) : Bool = match a.mode {
+  MUnboxed -> false
+  _        -> match a.ty {
+    Some(t) -> not ty_is_unboxable_t(t)
+    None    -> false
+  }
+}
+
+fn txd_nth(xs: [Expr], i: Int) : Option[Expr] = match xs {
+  []           -> None
+  [a, ...rest] -> if i == 0 { Some(a) } else { txd_nth(rest, i - 1) }
+}
+
+fn txd_without(xs: [Expr], skip: Int, i: Int) : [Expr] = match xs {
+  []           -> []
+  [a, ...rest] -> if i == skip { txd_without(rest, skip, i + 1) } else { [a, ...txd_without(rest, skip, i + 1)] }
+}
+
+fn txd_map_nth(xs: [Expr], j: Int, f: (Expr) -> Expr) : [Expr] = match xs {
+  []           -> []
+  [a, ...rest] -> if j == 0 { [f(a), ...rest] } else { [a, ...txd_map_nth(rest, j - 1, f)] }
+}
+
+fn txd_passed(d: Stmt, sa: [Expr]) : Bool = match ppd_drop_name(d) {
+  Some(nm) -> any(sa, (x) => txd_is_ref_to(x, nm))
+  None     -> true
+}
+
+fn txd_is_ref_to(x: Expr, nm: String) : Bool = match x.kind {
+  EVar(v)     -> v == nm
+  ECall(f, a) -> txd_is_wrapper(f) and any(a, (y) => txd_is_ref_to(y, nm))
+  _           -> false
+}
+
+# The RC marks pass the operand through. A `__perceus_dup` hands the callee
+# its own reference, so the binder's still needs the drop.
+fn txd_is_wrapper(f: Expr) : Bool = match f.kind {
+  EMark(_) -> true
+  EVar(c)  -> c != "__perceus_dup" and string_starts_with_q(c, "__perceus_")
+  _        -> false
+}
