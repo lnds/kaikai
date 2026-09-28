@@ -1357,6 +1357,10 @@ tier1-asan-b: kaic2
 	@echo "tier1-asan OK — a list spread consumes its operand; a borrowed param in a spread is dup'd first (no use-after-free)"
 	@$(MAKE) -C stage2 test-perceus-reuse-untaken-slot-asan
 	@echo "tier1-asan OK — a reuse arm releases the slots its rebuild does not take, once (no over-release)"
+	@$(MAKE) -C stage2 test-perceus-branch-param-selftail-asan
+	@echo "tier1-asan OK — a self-tail branch that skips a param's only read releases it once (no over-release)"
+	@$(MAKE) -C stage2 test-perceus-trmc-raw-operand-drop-asan
+	@echo "tier1-asan OK — a TRMC step drops a binder after its raw-argument read, not before (no use-after-free)"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,

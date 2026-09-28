@@ -52,6 +52,7 @@ import compiler.perceus_owned_pos
 import compiler.perceus_lend_tail
 import compiler.perceus_payer
 import compiler.perceus_branch_pay
+import compiler.perceus_branch_plant
 import compiler.perceus_path_move
 import compiler.perceus_plant_drop
 import compiler.perceus_tail_drop
@@ -1588,7 +1589,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
                                            pcs_borrow_lookup(bmap, pcs_borrow_key(name, mo)))
         let arm_dropped = pcs_arm_drop_pass(new_body, name, PcsArmCx { uses: uses, moved: [], boxed_bpos: [], borrow_only: [],
                                                                        borrowed: [], bmap: [], forced: branchy_lets })
-        let branch_paid = pbp_branch_drops(arm_dropped, map(params, (p) => p.pname), uses, [])
+        let branch_paid = pbp_branch_drops(arm_dropped, map(params, (p) => p.pname), uses, [], [])
         let reused_body = pcs_recognise_reuse_expr(branch_paid)
         # Boxed LOCALS can still flow to borrowed callee slots; without the
         # caller-side strip a bare last-use arg is a move no borrowing
@@ -1729,7 +1730,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         let force_all = pcs_list_union(pcs_list_union(branchy_single, branchy_arms), branchy_lets)
         # The exit drop keeps the #1126 borrow-move params: only their
         # re-thread moves, and the base path still owns the container.
-        let psets = PcsParamSets { moved: skip_set, forced: force_all, branch: owned_moves }
+        let psets = PcsParamSets { moved: skip_set, forced: force_all }
         let new_body0 = pcs_rewrite_expr(body, pnames, uses, false, rewrite_skip_set, force_all, bmap, move_last_set)
         let new_body1 = pcs_force_opaque_exit_drops(new_body0, opaque_lets, uses)
         # The block-exit collector below declines a binding whose last read
@@ -1744,11 +1745,10 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
                                             PcsArmCx { uses: uses, moved: rewrite_skip_set, boxed_bpos: boxed_bpos,
                                                       borrow_only: borrow_only, borrowed: borrowed, bmap: bmap,
                                                       forced: force_all })
-        # The branch-local drop, in the arms that never read it, for each
-        # param the payer assigns there.
-        let param_dropped = pcs_inject_param_branch_drops(arm_dropped,
-          pcs_names_paid_by(owned_moves, uses, psets, PyBranch), name)
-        let branch_paid = pbp_branch_drops(param_dropped, pnames, uses, path_moves)
+        # A param its read pays is released on the paths that skip the read.
+        let read_paid = pcs_strs_minus(pcs_names_paid_by(pnames, uses, psets, PyRead),
+                                       pcs_list_union(borrowed, raw_pnames))
+        let branch_paid = pbp_branch_drops(arm_dropped, pnames, uses, path_moves, read_paid)
         # Every owned position a borrowed binder reaches takes a dup, before
         # reuse recognition turns a ctor or cons literal into a reuse cell.
         let owned_body = pop_own_positions(branch_paid, pcs_strs_minus(borrowed, raw_pnames),
@@ -4148,8 +4148,8 @@ fn pcs_append_drops(stmts: [Stmt], drops: [Stmt]) : [Stmt] {
 # fn exit. Parc nets this to zero on the consuming path (move at the single
 # use, no exit drop) and drops the param only in the branch that never reads
 # it (`ownedInScope`, Parc.hs:984-990). This selects such params so the
-# rewriter moves them (skip-set) and `pcs_inject_param_branch_drops` plants
-# the branch-local drop the exit drop used to cover.
+# rewriter moves them (skip-set) and `pbp_branch_drops` releases them on the
+# paths that skip the read.
 #
 # Safety fence (matches Parc's Borrowed dual + the arm-binder path's
 # `pcs_uses_only_consuming_slots` guard, adversarially reviewed):
@@ -4162,6 +4162,7 @@ fn pcs_append_drops(stmts: [Stmt], drops: [Stmt]) : [Stmt] {
 #      consuming, no arm reads twice.
 #   5. no arm guard mentions p — a guard can fall through, so a guard
 #      read can neither consume nor host the branch drop soundly.
+#   6. every path that skips the read can take an entry drop.
 # A never-read param may be selected: its payer is still the entry drop
 # (`pcs_param_payer`), so no branch drop is planted for it.
 # Narrow shape only: the fn body is a single top-level EMatch (possibly
@@ -4179,7 +4180,7 @@ fn pcs_owned_scope_move_params(pnames: [String], body: Expr, skip: [String],
         let linear = pcs_all_consumers_linear(p, body)
         let cons_ok = pcs_uses_only_consuming_slots(p, body, cmap, [])
         let arms_ok = pcs_param_arms_move_safe(p, body)
-        let ok = mp <= 1 and linear and cons_ok and arms_ok
+        let ok = mp <= 1 and linear and cons_ok and arms_ok and pbl_plantable(p, body)
         if ok { [p, ...rest_sel] } else { rest_sel }
       }
     }
@@ -4218,69 +4219,6 @@ fn pcs_peel_ret_wrap(body: Expr) : Expr = match body.kind {
     _ -> body
   }
   _ -> body
-}
-
-# Plant `__perceus_drop(p)` into every top-level-match arm that never reads
-# `p`, for each `p` the rewriter moved. Reuses `pcs_inject_arm_drops` so the
-# drop lands post-body (TCO-safe: a self-tail arm gets the drop distributed
-# into its dead leaves; RBLeaf's ctor tail is wrapped). Walks only the peeled
-# top-level match — the same narrow shape `pcs_owned_scope_move_params` gated.
-fn pcs_inject_param_branch_drops(body: Expr, params: [String], fn_name: String) : Expr / Console =
-  match params {
-    []           -> body
-    [_, ..._]    -> match pcs_peel_ret_wrap(body).kind {
-      EMatch(scr, arms) -> {
-        let arms1 = pcs_param_drop_arms(arms, params, fn_name)
-        pcs_replace_peeled_match(body, scr, arms1)
-      }
-      _ -> body
-    }
-  }
-
-fn pcs_param_drop_arms(arms: [Arm], params: [String], fn_name: String) : [Arm] / Console = match arms {
-  []           -> []
-  [a, ...rest] -> match a {
-    Arm(pat, opt_g, body) -> {
-      let dead = pcs_params_dead_in_arm(params, body)
-      let body1 = match dead {
-        []        -> body
-        [_, ..._] -> pcs_inject_arm_drops(body, map(dead, (p) => pcs_make_drop_stmt(p, pat.line, pat.col)), fn_name, false)
-      }
-      [Arm(pat, opt_g, body1), ...pcs_param_drop_arms(rest, params, fn_name)]
-    }
-  }
-}
-
-fn pcs_params_dead_in_arm(params: [String], body: Expr) : [String] = match params {
-  []           -> []
-  [p, ...rest] -> {
-    let r = pcs_params_dead_in_arm(rest, body)
-    if pcs_name_in_expr(p, body) { r } else { [p, ...r] }
-  }
-}
-
-# Rebuild `body` with the peeled top-level match's arms replaced. Mirrors the
-# `pcs_peel_ret_wrap` shape: rewrites the wrap's `SLet(__pcs_ret, match)` rhs,
-# or the bare match when unwrapped.
-fn pcs_replace_peeled_match(body: Expr, scr: Expr, arms1: [Arm]) : Expr = {
-  let m = Expr { kind: EMatch(scr, arms1), line: body.line, col: body.col,
-                 ty: body.ty, mode: body.mode }
-  match body.kind {
-    EBlock(stmts, tail) -> match stmts {
-      [SLet(pat, ann, rhs), ...rest] -> match pat.pkind {
-        PBind(nm) ->
-          if nm == "__pcs_ret" {
-            let m2 = Expr { kind: EMatch(scr, arms1), line: rhs.line, col: rhs.col,
-                            ty: rhs.ty, mode: rhs.mode }
-            Expr { kind: EBlock([SLet(pat, ann, m2), ...rest], tail),
-                   line: body.line, col: body.col, ty: body.ty, mode: body.mode }
-          } else { m }
-        _ -> m
-      }
-      _ -> m
-    }
-    _ -> m
-  }
 }
 
 # The arm binders' payers. An arm binder takes its birth ref at bind time
