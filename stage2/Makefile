@@ -10364,7 +10364,15 @@ test-issue-1565-handler-alias-shadow: $(TARGET) build
 	    echo "issue-1565 FAIL ($$f: shadowing warning on a handler whose clauses never read the alias)"; exit 1; \
 	  fi; \
 	done; \
-	echo "issue-1565 OK (no warning when the clauses never read the alias)"
+	echo "issue-1565 OK (no warning when the clauses never read the alias)"; \
+	for f in issue_1565_handler_alias_shadow state_binding_read_in_clauses; do \
+	  if $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
+	       ../examples/effects/$$f.kai 2>&1 >/dev/null \
+	       | grep -q 'unused binding'; then \
+	    echo "issue-1565 FAIL ($$f: a binding read only inside handler clauses reported unused)"; exit 1; \
+	  fi; \
+	done; \
+	echo "issue-1565 OK (a binding read only inside handler clauses is used)"
 
 ifeq ($(KAI_LLVM),1)
 test-issue-1565-handler-alias-shadow-native: $(TARGET) bin-kai build
