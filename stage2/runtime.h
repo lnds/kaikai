@@ -16759,6 +16759,16 @@ static KaiValue *(*kai_user_main_fn)(void) = NULL;
 static KaiValue  *kai_user_main_result = NULL;
 #endif
 
+/* Under KAI_TRACE_RC, KAI_TRACE_RC_RUNS=k runs main k times in one process,
+ * at any thread count, so the RC ledger can tell a leak that grows with the
+ * work from state that lives once. Without KAI_TRACE_RC, main runs once. */
+static int kai_read_rc_runs(void) {
+    if (!getenv("KAI_TRACE_RC")) return 1;
+    const char *e = getenv("KAI_TRACE_RC_RUNS");
+    long n = e && *e ? strtol(e, NULL, 10) : 1;
+    return n < 1 ? 1 : (int) n;
+}
+
 #if defined(__APPLE__) || defined(__clang__)
 #  pragma clang diagnostic push
 #  pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -16771,6 +16781,7 @@ static void kai_bootstrap_trampoline(void) {
     KaiFiber *self = kai_active_fiber;
     kai_drain_pending_free();
     self->state = KAI_FIBER_RUNNING;
+    for (int run = kai_read_rc_runs(); run > 1; run--) kai_decref(kai_user_main_fn());
     kai_user_main_result = kai_user_main_fn();
     self->state = KAI_FIBER_DONE;
     /* Program is over: flip the shutdown flag. kai_sched_bootstrap wakes
@@ -16873,16 +16884,6 @@ static int kai_read_nthreads(void) {
     return (int) n;
 }
 
-
-/* Under KAI_TRACE_RC, KAI_TRACE_RC_RUNS=k runs main k times in one process,
- * so the RC ledger can tell a leak that grows with the work from state that
- * lives once. Without KAI_TRACE_RC, main runs once. */
-static int kai_read_rc_runs(void) {
-    if (!getenv("KAI_TRACE_RC")) return 1;
-    const char *e = getenv("KAI_TRACE_RC_RUNS");
-    long n = e && *e ? strtol(e, NULL, 10) : 1;
-    return n < 1 ? 1 : (int) n;
-}
 
 /* Run the program. At N=1 this is exactly `kai_main()` — no threads, no
  * fibers spawned for main, byte-identical. At N>1 it starts the worker
