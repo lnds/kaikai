@@ -7418,7 +7418,7 @@ endif
 # its word without leaving a box behind. The ledger bound catches the
 # per-step leak; the ASAN companion catches a release of something the step
 # still reads.
-TRMC_STEP_LEDGER_FIXTURES := trmc_step_ledger_2145 trmc_int_slot_box reuse_int_slot_box
+TRMC_STEP_LEDGER_FIXTURES := trmc_step_ledger_2145 trmc_int_slot_box reuse_int_slot_box trmc_boxed_int_binder
 
 test-perceus-trmc-step-ledger: $(TARGET) build
 	@set -e; \
