@@ -34,6 +34,7 @@ import compiler.loop_lower
 import compiler.doc_attr
 import compiler.native_prims
 import compiler.infer_index
+import compiler.index_coll
 import compiler.variant_index
 import compiler.lit_mint
 import compiler.pipe_fusion
@@ -11837,14 +11838,10 @@ fn field_non_record_or_partial_app(st: InferState, obj_expr: Expr, fnm: String,
 # to `hashmap.get(coll, ix)` (both return `Option[V]`); any
 # other container — including unresolved type variables — falls back
 # to `array_get(coll, ix)` so the unifier produces the existing
-# "expected `Array[T]`" error message at the call site. The dispatch
-# walks `coll` once with `synth` to read its inferred type, then
-# constructs an `ECall` AST and re-synthesises it so the core
-# scheme of the chosen callee is the source of truth for the argument
-# types, return type, AND effect row — the `HashMap` lowering picks up
-# `hashmap_get`'s `/ Mutable` automatically (HashMap is a mutable
-# table; even a read dereferences its `Ref` cells). Re-walking `coll`
-# is cheap and avoids us reimplementing the call-typing rule inline.
+# "expected `Array[T]`" error message at the call site. The chosen
+# callee's scheme types the arguments, the result AND the effect row —
+# `hashmap_get`'s `/ Mutable` included. `coll` is walked exactly once:
+# the call is typed against a placeholder (`compiler.index_coll`).
 #
 # Design note (not a smell — kept as a closed 3-case dispatch on
 # purpose): a smell audit flagged the `name == "Map"` test as wanting
@@ -11860,57 +11857,61 @@ fn field_non_record_or_partial_app(st: InferState, obj_expr: Expr, fnm: String,
 # protocol over `?t` can only emit a generic "no `Index` impl" or
 # re-hardcode the Array bias inside the resolver.
 fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
-
-
   let probe = synth(st, coll)
   let coll_ty = apply_ty(probe.st.sub, probe.ty)
-  let st_re = st_past_probe(st, probe.st)
+  let ph = ixc_ref(coll)
   match coll_ty {
     TyCon(_, cname, _, _) ->
-      if cname == "Vec" { synth_vec_index(probe.st, coll, ix, line, col) }
-      else {
-        let callee =
-          if cname == "Map"          { mk_expr(EModCall("map", "get"), line, col) }
-          else if cname == "HashMap" { mk_expr(EModCall("hashmap", "get"), line, col) }
-          else                       { mk_ref("array_get", line, col) }
-        synth(st_re, mk_expr(ECall(callee, [coll, ix]), line, col))
-      }
+      if cname == "Vec" { synth_vec_index(probe, coll_ty, ph, ix, line, col) }
+      else { synth_on_coll(probe, coll_ty, ECall(index_getter(cname, line, col), [ph, ix]), line, col) }
     # A fixed-width vec (`Vec[T]<n>`) reads inline: a static literal index
     # is a bare struct field load with the bound proved at compile time
     # (no runtime check). A dynamic index is declined in v1.
     TyDimT(inner, _) -> match inner {
       TyCon(_, cname, _, _) ->
         if cname == "Vec" {
-          if ty_is_fixed_vec(coll_ty) { synth_fixed_vec_index(probe.st, coll, ix, coll_ty, line, col) }
+          if ty_is_fixed_vec(coll_ty) { synth_fixed_vec_index(probe.st, probe.expr, ix, coll_ty, line, col) }
           else {
-            let bare = mk_expr(ECall(mk_ref("__detach_unit", line, col), [coll]), line, col)
-            synth_vec_index(probe.st, bare, ix, line, col)
+            let bare = mk_expr(ECall(mk_ref("__detach_unit", line, col), [ph]), line, col)
+            synth_vec_index(probe, coll_ty, bare, ix, line, col)
           }
-        } else {
-          synth(st_re, mk_expr(ECall(mk_ref("array_get", line, col), [coll, ix]), line, col))
-        }
-      _ -> synth(st_re, mk_expr(ECall(mk_ref("array_get", line, col), [coll, ix]), line, col))
+        } else { synth_on_coll(probe, coll_ty, ECall(index_getter("", line, col), [ph, ix]), line, col) }
+      _ -> synth_on_coll(probe, coll_ty, ECall(index_getter("", line, col), [ph, ix]), line, col)
     }
-    _ -> synth(st_re, mk_expr(ECall(mk_ref("array_get", line, col), [coll, ix]), line, col))
+    _ -> synth_on_coll(probe, coll_ty, ECall(index_getter("", line, col), [ph, ix]), line, col)
   }
+}
+
+fn index_getter(cname: String, line: Int, col: Int) : Expr =
+  if cname == "Map"          { mk_expr(EModCall("map", "get"), line, col) }
+  else if cname == "HashMap" { mk_expr(EModCall("hashmap", "get"), line, col) }
+  else                       { mk_ref("array_get", line, col) }
+
+# Types the read `k`, whose collection is the placeholder, against the
+# probe's type for it, then splices the probe's typed collection back.
+fn synth_on_coll(probe: Inferred, t: Ty, k: ExprKind, line: Int,
+      col: Int) : Inferred / Console + File + Mutable {
+  let st1 = st_set_env(probe.st, ty_env_add(probe.st.env, ixc_name(), mono(t)))
+  let r = synth(st1, mk_expr(k, line, col))
+  mk_inferred(st_restore_entries(probe.st, r.st), r.ty, ixc_splice(r.expr, probe.expr))
 }
 
 # `xs[i]` on a Vec reads the element; `xs[a..b]` (inclusive, like the
 # range literal) is the O(1) slice — the same view `[h, ...t]` binds.
-fn synth_vec_index(st: InferState, coll: Expr, ix: Expr,
+fn synth_vec_index(probe: Inferred, t: Ty, coll: Expr, ix: Expr,
                    line: Int, col: Int) : Inferred / Console + File + Mutable =
   match ix.kind {
     ERange(a, b, None) -> {
       let slen = mk_expr(EBinop("+", mk_expr(EBinop("-", b, a), line, col),
                                 mk_expr(mk_int_synth(1), line, col)),
                          line, col)
-      synth(st, mk_expr(ECall(mk_ref("vec_slice", line, col), [coll, a, slen]), line, col))
+      synth_on_coll(probe, t, ECall(mk_ref("vec_slice", line, col), [coll, a, slen]), line, col)
     }
     ERange(_, _, Some(_)) -> {
-      diag_error(st.file, line, col, "a stepped range cannot slice a Vec — a slice is one contiguous view")
-      mk_inferred(st_bump_err(st), TyAny, with_ty(mk_expr(EIndex(coll, ix), line, col), TyAny))
+      diag_error(probe.st.file, line, col, "a stepped range cannot slice a Vec — a slice is one contiguous view")
+      mk_inferred(st_bump_err(probe.st), TyAny, with_ty(mk_expr(EIndex(probe.expr, ix), line, col), TyAny))
     }
-    _ -> synth(st, mk_expr(ECall(mk_ref("vec_get", line, col), [coll, ix]), line, col))
+    _ -> synth_on_coll(probe, t, ECall(mk_ref("vec_get", line, col), [coll, ix]), line, col)
   }
 
 # `v[k]` on a fixed-width `Vec[e]<n>`: a static literal index in range
@@ -11942,11 +11943,10 @@ fn synth_fixed_vec_index(st: InferState, coll: Expr, ix: Expr, coll_ty: Ty,
 # The `__fixed_vec_get`/`_get_dyn` call node, typed at the element and
 # marked unboxed: the read yields a raw scalar out of the flat aggregate.
 fn fixed_vec_index_node(st: InferState, coll: Expr, ix: Expr, prim: String, elem: Ty,
-                        line: Int, col: Int) : Inferred / Console + File + Mutable {
-  let cr = synth(st, coll)
-  let call = ECall(mk_ref(prim, line, col), [cr.expr, ix])
+                        line: Int, col: Int) : Inferred {
+  let call = ECall(mk_ref(prim, line, col), [coll, ix])
   let node = Expr { kind: call, line: line, col: col, ty: Some(elem), mode: MUnboxed }
-  mk_inferred(cr.st, elem, node)
+  mk_inferred(st, elem, node)
 }
 
 # Binop typing is deliberately coarse: numeric operators unify their
