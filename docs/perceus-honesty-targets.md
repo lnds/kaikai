@@ -228,7 +228,7 @@ Tier 2 boundary (no demo a user would try in a tutorial hits them).
   Lambda-body lets are still on the brute-force path — a per-lambda-body
   counter is the follow-up.
 
-Four sources that used to sit here are **closed**. An effect-op
+Five sources that used to sit here are **closed**. An effect-op
 argument now reaches its handler as an owned reference and is released on the
 handler side, so nothing an op is called with is orphaned; a match-arm or
 block `let` binder read at most once per path, each read a move, is
@@ -236,10 +236,12 @@ released on entry to the alternatives that skip it, the skipped edge of an
 `and`/`or` and a guard's fall-through included, and an arm whose tails are
 self-calls releases its binders on its value leaves too; a block-local
 whose only read sits in the block's tail gets its exit drop after the tail
-value is bound, the one position the block-exit pass cannot reach; and the
+value is bound, the one position the block-exit pass cannot reach; the
 string-intern table no longer pins data-derived strings (number renders,
 paths, dir entries) immortal — interning is literal-only, so unique-value
-interpolation runs with a flat ledger. The first two were
+interpolation runs with a flat ledger; and a modulo-cons step, like the
+tcrec goto, releases what the enclosing match exits it jumps over would
+have. The first two were
 unbounded on spawn-heavy code: each pinned fiber wrapper keeps a 64 KiB stack
 mmap alive for the life of the process.
 
@@ -260,9 +262,11 @@ CLOSED.
 
 Unlike the sources above, these surface in ordinary user programs:
 
-- #2145 — a modulo-cons tail inside a nested `match` leaks the whole input list.
 - #2143 — native only: a nested arm binder homonymous with an outer one is
   released by the outer arm's exit drop (use-after-free under ASAN).
+- #2222 — native only: a binder bound under a record or tuple field's list,
+  variant or `@` pattern owns no reference, so a release planned for it frees
+  cells the scrutinee still holds. The branch payers leave these binders out.
 
 ## Tier 1 — *Show HN honest*
 

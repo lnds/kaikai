@@ -1349,6 +1349,8 @@ tier1-asan-b: kaic2
 	@echo "tier1-asan OK — a binder read at most once per path is released on entry to the alternatives that skip it (no over-release on the reading path)"
 	@$(MAKE) -C stage2 test-perceus-read-identity-asan
 	@echo "tier1-asan OK — binder reads come from one table keyed by identity: no arm inherits a sibling's move, no borrow reads a consumed binder"
+	@$(MAKE) -C stage2 test-perceus-trmc-step-ledger-asan
+	@echo "tier1-asan OK — a modulo-cons step releases the enclosing matches' pending cells and binders, nothing it still reads"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,

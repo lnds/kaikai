@@ -1839,7 +1839,7 @@ fn match_finish_tok(owned: Bool, sd: String, free_tok: Bool, r: LRes) : LRes =
 # pre-ledger lowering; seeding it too would release the scrutinee twice.
 fn tcp_seed_arm(owned: Bool, sd: String, binders: [String],
                 body: Expr, pend0: [String], st: LowerSt) : LowerSt =
-  if not tcl_has_goto(body) { ls_set_tcpend(st, []) }
+  if not tcl_has_exit(body) { ls_set_tcpend(st, []) }
   else {
     let with_scr = if owned and not arm_body_all_tail_self_tcrec(body) {
       list_append(pend0, [tcl_scr_entry(sd)])
@@ -1883,7 +1883,7 @@ fn arms_all_tail_self_tcrec(arms: [Arm]) : Bool = match arms {
 # reuse arm's `__perceus_reuse_*` consumption, an arm-top token): only the
 # ENCLOSING entries survive into the body — this match adds nothing.
 fn tcp_seed_inherit(body: Expr, pend0: [String], st: LowerSt) : LowerSt =
-  if tcl_has_goto(body) { ls_set_tcpend(st, pend0) } else { ls_set_tcpend(st, []) }
+  if tcl_has_exit(body) { ls_set_tcpend(st, pend0) } else { ls_set_tcpend(st, []) }
 
 # Seed mirroring `lower_arm_rc`'s three branches: an arm-top-reuse arm and
 # a `__perceus_reuse_*` arm add nothing (their RC rides the token / the
@@ -3666,7 +3666,7 @@ fn lower_trmc_step(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes /
       match lower_exprs(trmc_drop_nth(cargs, hole, 0, []), st, []) {
         LResMany(heads, st1) ->
           lower_trmc_seal(x, sym, hole, cname, es_tcrec_parse_decimal(dropmask_str),
-                          heads, trmc_self_args(cargs, hole), st1)
+                          heads, cargs, st1)
       }
     }
     _ -> LRes(KUnitV, st)
@@ -3676,11 +3676,11 @@ fn lower_trmc_step(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes /
 # Split out of `lower_trmc_step` so the head/rebind lowerings sit at one
 # nesting level each (the back-edge mirrors `lower_tcrec`'s `KTcrecGoto`).
 fn lower_trmc_seal(x: Expr, sym: String, hole: Int, cname: String, dropmask: Int,
-                   heads: [KVal], self_args: [Expr], st: LowerSt) : LRes / Console =
+                   heads: [KVal], cargs: [Expr], st: LowerSt) : LRes / Console =
   # P3: lower the rebinds at the recursing fn's param slots (raw for a raw
   # param), so the TRMC back-edge re-stores them raw — no per-step
   # `kaix_int` re-box. Same `lower_tcrec_args` the `KTcrecGoto` path uses.
-  match lower_tcrec_args(self_args, lookup_ufn_by_csym(st.fns, sym), st) {
+  match lower_tcrec_args(trmc_self_args(cargs, hole), lookup_ufn_by_csym(st.fns, sym), st) {
     LResMany(reb, st1) -> {
       # The variant ctor tag is resolved here (as `KCon` resolves it), so the
       # backend builds the spine cell without a name→tag table. The builtin-
@@ -3691,12 +3691,11 @@ fn lower_trmc_seal(x: Expr, sym: String, hole: Int, cname: String, dropmask: Int
       # so the native step lays each slot at its kind like KCon/KConReuse do —
       # the same `ls_ctor_mask` (`variant_slot_mask`) the fresh route reads.
       let slot_mask = if trmc_cname_is_cons(cname) { 0 } else { ls_ctor_mask(st1, cname) }
-      # The `__kai_cons_s` reuse-cons step drops the consumed scrutinee; its
-      # register is THIS match's fresh `<join>$sd` (st.mscr), not the old fixed
-      # `__pcs_scr_drop` literal (which aliased nested matches in the native
-      # flat table). `__kai_cons` (no `_s`) has nothing to free → "".
-      seal_tail(st1, KTrmcStep(cat3("_kai_", sym, "_entry"), hole, cname, tag, slot_mask, dropmask,
-                               heads, assigns_of(reb, 0, []), st1.mscr, st1.in_region, kpos_of(x)))
+      # Like the tcrec goto, the step leaves every enclosing match: it
+      # releases the ledger's pending entries the ctor args do not consume.
+      seal_tail(tcp_goto_drops(cargs, st1),
+                KTrmcStep(cat3("_kai_", sym, "_entry"), hole, cname, tag, slot_mask, dropmask,
+                          heads, assigns_of(reb, 0, []), st1.in_region, kpos_of(x)))
     }
   }
 
@@ -3724,19 +3723,15 @@ fn trmc_self_args(xs: [Expr], hole: Int) : [Expr] = match xs {
 
 # The trmc apply mark → KTrmcApply (plug leaf into the open hole).
 #
-# A `KTrmcApply` is a terminal RET — it does NOT flow to the match's L0
-# continuation where `match_finish` plants the owned-scrutinee exit drop. When
-# the leaf is a variant CON-REUSE of the scrutinee (`Node(Red, ins(l,..),..)` —
-# reuse-in-place increfs the donor to survive that exit drop), skipping the drop
-# leaves the reused cell with an inflated rc → one leaked node per recursion
-# level (#872). Emit the scrutinee drop here, before the terminal, mirroring the
-# token free in `nemit_trmc_apply`. Gated on a reuse-of-scrutinee leaf so a cons
-# spine (`map`/`filter`, whose scrutinee the step already dropped) is untouched.
+# A `KTrmcApply` is a terminal RET: it skips every enclosing match exit, so it
+# releases the ledger's pending entries the leaf does not consume. A reuse arm
+# seeds no entry for its own scrutinee; a leaf that con-reuses it increfs the
+# donor to survive the skipped exit drop, so that drop is emitted here.
 fn lower_trmc_apply(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
   [leaf] -> match lower_expr(leaf, st) { LRes(lv, st1) -> {
     let st2 = if st1.mscr == "" or not trmc_apply_leaf_reuses_scr(leaf) { st1 }
               else { ls_emit(st1, KRC(KDrop(KVar(st1.mscr)), kpos_of(x))) }
-    seal_tail(st2, KTrmcApply(lv, kpos_of(x))) } }
+    seal_tail(tcp_goto_drops(cargs, st2), KTrmcApply(lv, kpos_of(x))) } }
   _ -> LRes(KUnitV, st)
 }
 

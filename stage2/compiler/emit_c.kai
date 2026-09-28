@@ -15691,11 +15691,8 @@ fn emit_trmc_step(src: String, sym: String, holeslot: Int, cname: String,
                   cx: EmitCtx) : String / Console {
   # Builtin cons modulo-cons step — the markers `__kai_cons` / `__kai_cons_s`
   # mean the node is a `kai_cons` cell, not a registered variant, so it takes
-  # the cons-specific build path (hole at the cdr). The `_s` variant also
-  # decref's the consumed scrutinee `_scr` (the reuse-cons arm shape; see
-  # `trmc_reuse_cons_modcons`).
-  if cname == trmc_cons_cname()     { emit_trmc_cons_step(src, sym, dropmask, pnames, args_e, false, cx) }
-  else if cname == trmc_cons_scr_cname() { emit_trmc_cons_step(src, sym, dropmask, pnames, args_e, true, cx) }
+  # the cons-specific build path (hole at the cdr).
+  if cname == trmc_cons_cname() or cname == trmc_cons_scr_cname() { emit_trmc_cons_step(src, sym, dropmask, pnames, args_e, cx) }
   else { emit_trmc_variant_step(src, sym, holeslot, cname, dropmask, pnames, args_e, cx) }
 }
 
@@ -15707,14 +15704,11 @@ fn emit_trmc_step(src: String, sym: String, holeslot: Int, cname: String,
 # but for the cons layout; no `_arm_ru` donation (cons arms never capture a
 # reuse token — see `try_arm_top_reuse`), so the cell is fresh-allocated.
 #
-# `drop_scr` is set for the reuse-cons arm shape: the goto jumps over the
-# match's exit `kai_decref(_scr)`, so without it the consumed input cons
-# would leak one cell per level. The decref runs AFTER `head`/`self_args`
-# are read (they alias incref'd copies `kai_h`/`kai_t`, independent of
-# `_scr`'s own slots), dropping `_scr`'s head+tail refs and freeing the
-# cell. The raw-EList shape (`build`) has no scrutinee and never sets it.
+# Like the tcrec goto, the step leaves every enclosing match: after the args
+# are read it releases the ledger's pending entries they do not consume, the
+# scrutinees' exit decrefs among them.
 fn emit_trmc_cons_step(src: String, sym: String, dropmask: Int, pnames: [String],
-                       args_e: [Expr], drop_scr: Bool, cx: EmitCtx) : String / Console {
+                       args_e: [Expr], cx: EmitCtx) : String / Console {
   let head_c = match args_e { [h, _] -> emit_expr(src, h, cx) _ -> "kai_unit() /* trmc cons: bad args */" }
   let self_args = match args_e {
     [_, t] -> match t.kind { ECall(_, sa) -> sa _ -> [] }
@@ -15730,17 +15724,13 @@ fn emit_trmc_cons_step(src: String, sym: String, dropmask: Int, pnames: [String]
     None                  -> tcrec_emit_drops(pnames, dropmask, 0)
   }
   let rebinds  = tcrec_emit_rebinds(pnames, 0)
-  # The goto leaves before the match-exit `kai_decref(_scr)`, so the drop
-  # is planted here (the goto-skip is why the leak existed). `_scr`'s head
-  # and tail are dropped + the cell freed; the incref'd `kai_h`/`kai_t`
-  # copies the rebuild already captured survive.
-  let scr_drop = if drop_scr { "kai_decref(_scr); " } else { "" }
+  let live     = tcl_goto_drops(cx.tcpend, args_e)
   let cons_c = emit_cons_ctor(cx)
   concat_all([
     "({ KaiValue *_trmc_node = ", cons_c, head_c, ", (KaiValue *)0); ",
     "_kai_acc = kai_cctx_extend_linear(_kai_acc, _trmc_node, ",
     "kai_field_addr_create(&_trmc_node->as.cons.tail)); ",
-    arg_lets, scr_drop, drops, rebinds,
+    arg_lets, live, drops, rebinds,
     "goto ", c_user_entry_label(sym), "; (KaiValue *)0; })"
   ])
 }
@@ -15794,6 +15784,7 @@ fn emit_trmc_variant_step(src: String, sym: String, holeslot: Int, cname: String
     None                  -> tcrec_emit_drops(pnames, dropmask, 0)
   }
   let rebinds  = tcrec_emit_rebinds(pnames, 0)
+  let live     = tcl_goto_drops(cx.tcpend, args_e)
   let slot_stores = emit_trmc_slot_stores(src, "_trmc_node", cname, args_e, tys_opt, holeslot, 0, cx)
   concat_all([
     # Build the spine node REUSING `_arm_ru` (the token the arm-top
@@ -15816,7 +15807,7 @@ fn emit_trmc_variant_step(src: String, sym: String, holeslot: Int, cname: String
     "_arm_ru = kai_reuse_null; ",
     "_kai_acc = kai_cctx_extend_linear(_kai_acc, _trmc_node, ",
     "kai_field_addr_create(&kai_var_slots(_trmc_node)[", int_to_string(holeslot), "].ptr)); ",
-    arg_lets, drops, rebinds,
+    arg_lets, live, drops, rebinds,
     "goto ", c_user_entry_label(sym), "; (KaiValue *)0; })"
   ])
 }
