@@ -925,12 +925,11 @@ fn tcrec_mask_of(sig: Option[UFnSig]) : [Bool] = match sig {
 
 # --- List literals (and interpolation, which desugars to a list) --------
 
-# `[e0, ..., ...spread]` → a cons/nil/append spine. Reproduces the C
-# emitter's `emit_list_tail` (the byte-id oracle): nil for the empty
-# tail, `kai_cons(h, t)` for a plain head, `kai_core_list_append(h, t)`
-# for a mid-list spread, and a `kai_incref(h)` fast-path for a trailing
-# spread (O(1) ownership transfer, not an O(n) spine copy). Head is
-# lowered before the tail to keep left-to-right evaluation order. Inside
+# `[e0, ..., ...spread]` → a cons/nil/append spine, mirroring the C
+# emitter's `emit_list_tail`: nil for the empty tail, `kai_cons(h, t)` for a
+# plain head, `kai_core_list_append(h, t)` for a mid-list spread, and the
+# operand itself for a trailing spread (it consumes like a ctor slot). Head
+# is lowered before the tail to keep left-to-right evaluation order. Inside
 # a region the cons cells bump-allocate: `kai_cons` becomes `kai_arena_cons`.
 fn lower_list(elems: [ListElem], pos: KPos, st: LowerSt) : LRes / Console = match elems {
   [] -> bind_op(st, KPrim("kai_nil", []), pos)
@@ -945,17 +944,11 @@ fn lower_list(elems: [ListElem], pos: KPos, st: LowerSt) : LRes / Console = matc
 # inside a region, the RC-heap ctor otherwise.
 fn region_cons_prim(st: LowerSt) : String = if st.in_region { "kai_arena_cons" } else { "kai_cons" }
 
-# The final element: a plain head conses onto `nil`; a trailing spread is
-# `kai_incref(xs)` — unless `xs` is a `__perceus_dup(...)` (already owned;
-# an outer incref would double-bump, issue #212), in which case the dup's
-# own lowering is the result.
 fn lower_list_last(el: ListElem, pos: KPos, st: LowerSt) : LRes / Console = match el {
   ElPlain(x) -> match lower_expr(x, st) { LRes(hdv, st1) ->
     match bind_op(st1, KPrim("kai_nil", []), pos) { LRes(nilv, st2) ->
       bind_op(st2, KPrim(region_cons_prim(st2), [hdv, nilv]), pos) } }
-  ElSpread(x) -> if is_perceus_dup_expr(x) { lower_expr(x, st) }
-    else { match lower_expr(x, st) { LRes(spv, st1) ->
-      bind_op(st1, KPrim("kai_incref", [spv]), pos) } }
+  ElSpread(x) -> lower_expr(x, st)
 }
 
 # A head (plain or spread) joined to the lowered rest by `prim`
@@ -964,15 +957,6 @@ fn lower_list_cons(x: Expr, rest: [ListElem], prim: String, pos: KPos, st: Lower
   match lower_expr(x, st) { LRes(hdv, st1) ->
     match lower_list(rest, pos, st1) { LRes(tlv, st2) ->
       bind_op(st2, KPrim(prim, [hdv, tlv]), pos) } }
-
-# Is `x` a `__perceus_dup(arg)` call? (Issue #212: a spread over a dup is
-# already owned, so the list spine must not re-incref it.) The callee name
-# is compared with `==` (not a literal pattern — kaikai patterns do not
-# bind string literals nested inside a constructor pattern).
-fn is_perceus_dup_expr(x: Expr) : Bool = match x.kind {
-  ECall(f, _) -> match sym_read_kind(f.kind) { EVar(nm) -> nm == "__perceus_dup" _ -> false }
-  _ -> false
-}
 
 # --- Holes / todo! → panic stub -----------------------------------------
 

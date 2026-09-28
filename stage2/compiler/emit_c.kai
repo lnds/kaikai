@@ -3018,27 +3018,6 @@ fn emit_range_expr(src: String, from: Expr, to: Expr, opt_step: Option[Expr],
 
 # ---- list literal emission ----
 
-# issue #212 — when the spread argument is already wrapped in a
-# `__perceus_dup` (e.g. on a non-last-use read of a list-typed
-# parameter), the dup already incref'd the value. Wrapping that in
-# the structural `kai_incref` of the tail-spread emit double-incref's
-# the cell, blocking `kai_check_unique` on the recursive accumulator
-# spine and leaking +1 reference per iteration.
-
-# issue #212 — when the spread argument is already wrapped in a
-# `__perceus_dup` (e.g. on a non-last-use read of a list-typed
-# parameter), the dup already incref'd the value. Wrapping that in
-# the structural `kai_incref` of the tail-spread emit double-incref's
-# the cell, blocking `kai_check_unique` on the recursive accumulator
-# spine and leaking +1 reference per iteration.
-fn is_perceus_dup_call(e: Expr) : Bool = match e.kind {
-  ECall(callee, _) -> match sym_read_kind(callee.kind) {
-    EVar(nm) -> nm == "__perceus_dup"
-    _ -> false
-  }
-  _ -> false
-}
-
 # Every element is sequenced at one level, then the spine is built from
 # the refs: nesting a statement expression per cons would multiply the
 # bracket depth of a long literal.
@@ -3049,17 +3028,6 @@ fn emit_list_tail(src: String, elems: [ListElem], cx: EmitCtx) : String / Consol
 
 fn emit_list_elem_vals(src: String, elems: [ListElem], cx: EmitCtx) : [String] / Console = match elems {
   [] -> []
-  # Tail spread `[..., ...xs]`: `kai_incref(xs)` gives the caller
-  # a result whose RC is 1 and leaves xs untouched, matching the
-  # ownership contract list_append used to provide via spine copy
-  # — but in O(1) instead of O(|xs|). This collapses the O(n²)
-  # blowup of the `[x, ...acc]` parser prepend pattern.
-  # issue #212: if `x` is `__perceus_dup(...)`, the dup already
-  # produces an owned reference; an outer `kai_incref` would
-  # double-bump.
-  [ElSpread(x)] ->
-    if is_perceus_dup_call(x) { [emit_expr(src, x, cx)] }
-    else { [concat_all(["kai_incref(", emit_expr(src, x, cx), ")"])] }
   [el, ...rest] -> {
     let x = match el { ElPlain(e) -> e ElSpread(e) -> e }
     [emit_expr(src, x, cx), ...emit_list_elem_vals(src, rest, cx)]
@@ -3067,7 +3035,9 @@ fn emit_list_elem_vals(src: String, elems: [ListElem], cx: EmitCtx) : [String] /
 }
 
 # Cons cells built lexically inside a `region { }` bump-allocate into the
-# arena; outside, ordinary RC `kai_cons` (`cons_c`).
+# arena; outside, ordinary RC `kai_cons` (`cons_c`). A spread consumes its
+# operand like a ctor slot: a trailing one becomes the tail as is, a middle
+# one is released by `kai_core_list_append`.
 fn emit_list_spine(elems: [ListElem], refs: [String], cons_c: String) : String = match elems {
   [] -> "kai_nil()"
   [el, ...rest] -> match refs {
@@ -14000,20 +13970,6 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: [BorrowEnt
           if tcrec_any_unused(params, uses) { d }
           else {
             let c_sym_str = c_sym(name, mo)
-            # Issue #92: precompute the rule-3 dropmask side table BEFORE
-            # entering the rewrite. The pre-pass walks `body` once,
-            # inspects each call site's args via `tcrec_args_have_evar`,
-            # and produces `[TcrDm]` (a list of int triples). The rewrite
-            # then threads only `[TcrDm]` and never touches `[Expr]` during
-            # the per-site dropmask compute.
-            #
-            # The `borrow_flags` are the per-param "is single use a
-            # borrow position" predicate (see `tcrec_use_is_borrow`). They
-            # gate rule-3 firing so the goto's extra drop is only planted
-            # at borrow uses, never at consume uses. Without this, rule 3
-            # double-decrefs values whose single use already consumed
-            # them (e.g. direct call args like `lex_next(l)`).
-            let borrow_flags = tcrec_compute_borrow_flags(params, body, [])
             # Skip-set aligned with pcs_pass's wrap-skip decisions: the
             # derived set under-approximates on a rewritten body (the
             # reuse recogniser replaces the cons the classifier judged
@@ -14035,7 +13991,7 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: [BorrowEnt
             # rule never re-adds a bit rules 1+2 already set.
             let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
             let dm_table = tcrec_collect_dm_table(body, name, arity, mo, params,
-                                                   pnames, uses, borrow_flags, [], [], [],
+                                                   pnames, uses, [], [], [],
                                                    bmap, base_mask)
             # TRMC: when the fn is modulo-cons-eligible (a constructor
             # in tail position with a self-call slot) AND its effect row
@@ -14178,8 +14134,6 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
           if tcrec_any_unused(params, uses) { d }
           else {
             let c_sym_str = c_sym(name, mo)
-            # Issue #92: same precomputation as the non-pcs-ret-wrap branch.
-            let borrow_flags = tcrec_compute_borrow_flags(params, inner, [])
             # Skip-set aligned with pcs_pass's wrap-skip decisions —
             # widened with the params the rewriter left bare (raw
             # transfer), same as the non-wrap branch. Plus the #1127
@@ -14190,7 +14144,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
                                pcs_branch_aware_skip_params_b(pnames, inner, bmap)))
             let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
             let dm_table = tcrec_collect_dm_table(inner, name, arity, mo, params,
-                                                   pnames, uses, borrow_flags, [], [], [],
+                                                   pnames, uses, [], [], [],
                                                    bmap, base_mask)
             # TRMC: when the inner body is modulo-cons-eligible and the
             # effect row is affine, rewrite the INNER via the cctx path
@@ -14267,9 +14221,8 @@ fn tcrec_any_unused(params: [Param], uses: [Use]) : Bool {
 }
 
 # Per-call-site dropmask: bit `i` is set iff param `i`'s payer is the exit
-# drop, which the goto jumps past. A single-use param whose read sits
-# outside the call's args is rule 3's case (`tcrec_rule3_mask_b`); a
-# never-read param never gets here (`tcrec_any_unused` bails first).
+# drop, which the goto jumps past. A never-read param never gets here
+# (`tcrec_any_unused` bails first).
 fn tcrec_compute_site_dropmask(params: [Param], uses: [Use], skip_set: [String],
                                 i: Int, acc: Int) : Int {
   match params {
@@ -14285,127 +14238,62 @@ fn tcrec_compute_site_dropmask(params: [Param], uses: [Use], skip_set: [String],
 fn tcrec_pow2(n: Int) : Int =
   if n <= 0 { 1 } else { 2 * tcrec_pow2(n - 1) }
 
-# ---- m37 / TCO — rule-3 side table (issue #92) ---------------------
+# ---- TCO — per-site drop side table ---------------------------------
 #
-# Rule 3 drops a parameter `p` at a recursive self-tail-call site
-# when:
-#
-#   - last_use_for(p) == LUAt with count == 1 (single non-lambda
-#     read), AND
-#   - p does NOT appear anywhere in that call site's args.
-#
-# That combination means p's single use lives OUTSIDE the args (e.g.
-# the scrutinee of an enclosing `match`); the goto skips that match's
-# exit `kai_decref` so without an explicit drop in the goto block we
-# leak one cell per iteration. The canonical shape is `nth_loop` in
-# `examples/tco/list_nth_shape.kai`.
-#
-# Three previous attempts at re-landing this rule (PR #41, PR #48
-# commits 522b9df + bd54356) hit the same Linux glibc tcache abort.
-# The common factor was threading `[Expr]` (the call's args) into,
-# through, or near `tcrec_compute_site_dropmask` — even when wrapped
-# in a closure. A refcount imbalance in stage 1's perceus emit fires
-# on that shape on Linux but not macOS.
-#
-# This implementation avoids the bug class entirely: a pre-pass walks
-# the body once at the start of `tcrec_rewrite_decl`, computes the
-# rule-3 mask for every recursive call site, and stores the result as
-# a list of plain int triples (`TcrDm(line, col, mask)`). The rewrite
-# then looks up the mask by `(line, col)` and OR-combines it with the
-# rules-1+2 base mask. No `[Expr]` value flows through the dropmask
-# computation; the side table is the same shape as `[Use]` (a list of
-# small int-tuple records), already known to thread safely through
-# the rewrite.
-
-# ---- m37 / TCO — rule-3 side table (issue #92) ---------------------
-#
-# Rule 3 drops a parameter `p` at a recursive self-tail-call site
-# when:
-#
-#   - last_use_for(p) == LUAt with count == 1 (single non-lambda
-#     read), AND
-#   - p does NOT appear anywhere in that call site's args.
-#
-# That combination means p's single use lives OUTSIDE the args (e.g.
-# the scrutinee of an enclosing `match`); the goto skips that match's
-# exit `kai_decref` so without an explicit drop in the goto block we
-# leak one cell per iteration. The canonical shape is `nth_loop` in
-# `examples/tco/list_nth_shape.kai`.
-#
-# Three previous attempts at re-landing this rule (PR #41, PR #48
-# commits 522b9df + bd54356) hit the same Linux glibc tcache abort.
-# The common factor was threading `[Expr]` (the call's args) into,
-# through, or near `tcrec_compute_site_dropmask` — even when wrapped
-# in a closure. A refcount imbalance in stage 1's perceus emit fires
-# on that shape on Linux but not macOS.
-#
-# This implementation avoids the bug class entirely: a pre-pass walks
-# the body once at the start of `tcrec_rewrite_decl`, computes the
-# rule-3 mask for every recursive call site, and stores the result as
-# a list of plain int triples (`TcrDm(line, col, mask)`). The rewrite
-# then looks up the mask by `(line, col)` and OR-combines it with the
-# rules-1+2 base mask. No `[Expr]` value flows through the dropmask
-# computation; the side table is the same shape as `[Use]` (a list of
-# small int-tuple records), already known to thread safely through
-# the rewrite.
-type TcrDm = TcrDm(Int, Int, Int)   # call-site line, col, rule-3 mask
+# A self-tail-call site owes the goto an extra drop of `p` when every read
+# of `p` in its args sits in a borrowed callee slot: the callee never
+# releases it and the goto rebinds the slot over it. The mask is computed
+# once per site in a pre-pass and looked up by `(line, col)` during the
+# rewrite, so no `[Expr]` flows through the dropmask computation.
+type TcrDm = TcrDm(Int, Int, Int)   # call-site line, col, drop mask
 
 # Pre-pass entry: walks `body` in tail position the same way
-# `tcrec_rewrite_kind` does. At every recursive self-tail-call site
-# it records TcrDm(f.line, f.col, rule3_mask) where `f` is the EVar
-# callee. Args are inspected once (via `tcrec_args_have_evar`) to
-# build the int mask, then discarded.
-
-# Pre-pass entry: walks `body` in tail position the same way
-# `tcrec_rewrite_kind` does. At every recursive self-tail-call site
-# it records TcrDm(f.line, f.col, rule3_mask) where `f` is the EVar
-# callee. Args are inspected once (via `tcrec_args_have_evar`) to
-# build the int mask, then discarded.
+# `tcrec_rewrite_kind` does, recording one TcrDm per self-tail-call site.
 fn tcrec_collect_dm_table(body: Expr, nm: String, arity: Int, own_mod: Option[String],
                           params: [Param], pnames: [String],
-                          uses: [Use], borrow_flags: [Bool],
+                          uses: [Use],
                           scope: [String], hoisted: [Expr], acc: [TcrDm],
                           bmap: [BorrowEntry], base_mask: Int) : [TcrDm] =
-  tcrec_collect_dm_kind(body.kind, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, hoisted, acc, bmap, base_mask)
+  tcrec_collect_dm_kind(body.kind, nm, arity, own_mod, params, pnames, uses, scope, hoisted, acc, bmap, base_mask)
 
 # `hoisted` carries the RHS of the `__pcs_ta*` arg-hoist lets the perceus
-# tail-drop pass placed above a self-call. Rule 3's "param appears in the
-# args" test must see those exprs as args — they ARE the call's arguments,
-# evaluated one statement earlier — or the mask flips at hoisted sites.
+# tail-drop pass placed above a self-call. The mask must see those exprs as
+# args — they ARE the call's arguments, evaluated one statement earlier — or
+# it flips at hoisted sites.
 fn tcrec_collect_dm_kind(k: ExprKind, nm: String, arity: Int, own_mod: Option[String],
                          params: [Param], pnames: [String], uses: [Use],
-                         borrow_flags: [Bool], scope: [String], hoisted: [Expr],
+                         scope: [String], hoisted: [Expr],
                          acc: [TcrDm], bmap: [BorrowEntry], base_mask: Int) : [TcrDm] {
   match k {
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
         if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
-          let mask = tcrec_rule3_mask_b(params, uses, list_append(xs, hoisted), borrow_flags, bmap, base_mask, 0, 0)
+          let mask = tcrec_site_drop_mask(params, list_append(xs, hoisted), bmap, base_mask, 0, 0)
           [TcrDm(f.line, f.col, mask), ...acc]
         } else { acc }
-      # Same-module qualified self-call: same rule-3 mask as the bare shape.
+      # Same-module qualified self-call: same mask as the bare shape.
       EModCall(callmod, callee) ->
         if callee == nm and tcrec_modcall_is_self(callmod, own_mod) and
            not list_has(scope, nm) and list_length(xs) == arity {
-          let mask = tcrec_rule3_mask_b(params, uses, list_append(xs, hoisted), borrow_flags, bmap, base_mask, 0, 0)
+          let mask = tcrec_site_drop_mask(params, list_append(xs, hoisted), bmap, base_mask, 0, 0)
           [TcrDm(f.line, f.col, mask), ...acc]
         } else { acc }
       _ -> acc
     }
     EIf(_, t, opt_e) -> {
-      let a1 = tcrec_collect_dm_table(t, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, hoisted, acc, bmap, base_mask)
+      let a1 = tcrec_collect_dm_table(t, nm, arity, own_mod, params, pnames, uses, scope, hoisted, acc, bmap, base_mask)
       match opt_e {
         None -> a1
-        Some(e2) -> tcrec_collect_dm_table(e2, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, hoisted, a1, bmap, base_mask)
+        Some(e2) -> tcrec_collect_dm_table(e2, nm, arity, own_mod, params, pnames, uses, scope, hoisted, a1, bmap, base_mask)
       }
     }
-    EMatch(_, arms) -> tcrec_collect_dm_arms(arms, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, hoisted, acc, bmap, base_mask)
+    EMatch(_, arms) -> tcrec_collect_dm_arms(arms, nm, arity, own_mod, params, pnames, uses, scope, hoisted, acc, bmap, base_mask)
     EBlock(stmts, opt_tail) -> {
       let scope1 = tcrec_block_scope(stmts, scope)
       let hoisted1 = tcrec_hoisted_arg_rhs(stmts, hoisted)
       match opt_tail {
         None -> acc
-        Some(e) -> tcrec_collect_dm_table(e, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope1, hoisted1, acc, bmap, base_mask)
+        Some(e) -> tcrec_collect_dm_table(e, nm, arity, own_mod, params, pnames, uses, scope1, hoisted1, acc, bmap, base_mask)
       }
     }
     _ -> acc
@@ -14428,7 +14316,7 @@ fn tcrec_hoisted_arg_rhs(stmts: [Stmt], acc: [Expr]) : [Expr] {
 }
 
 fn tcrec_collect_dm_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], params: [Param],
-                         pnames: [String], uses: [Use], borrow_flags: [Bool],
+                         pnames: [String], uses: [Use],
                          scope: [String], hoisted: [Expr], acc: [TcrDm],
                          bmap: [BorrowEntry], base_mask: Int) : [TcrDm] {
   match arms {
@@ -14436,74 +14324,22 @@ fn tcrec_collect_dm_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[St
     [a, ...rest] -> match a {
       Arm(pat, _, body) -> {
         let scope1 = pat_bindings(pat, scope)
-        let a1 = tcrec_collect_dm_table(body, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope1, hoisted, acc, bmap, base_mask)
-        tcrec_collect_dm_arms(rest, nm, arity, own_mod, params, pnames, uses, borrow_flags, scope, hoisted, a1, bmap, base_mask)
+        let a1 = tcrec_collect_dm_table(body, nm, arity, own_mod, params, pnames, uses, scope1, hoisted, acc, bmap, base_mask)
+        tcrec_collect_dm_arms(rest, nm, arity, own_mod, params, pnames, uses, scope, hoisted, a1, bmap, base_mask)
       }
     }
   }
 }
 
-# For each param i: bit i set iff rule 3 fires at this call site
-# (LUAt + count==1 + param does not appear in args + single use is
-# in a borrow position).
-#
-# Issue #92 fix: the borrow-position check is the load-bearing
-# addition. Rule 3 plants `kai_internal_drop(kai_p)` in the goto
-# block to reinstate a decref the goto skips. That is correct when
-# the single use is in a borrow position (e.g. match scrutinee:
-# `_scr = kai_p; ...; kai_decref(_scr);` — goto skips the post-do-
-# while decref, so we re-add it. Or list tail spread: `kai_incref(p)`
-# leaves the original ref alive, exit drops the goto skips would
-# free it). The drop is WRONG when the single use is a consume
-# (e.g. direct call arg `f(p)`: callee consumes p inline; nothing is
-# skipped by the goto; an extra drop is a double-decref). The
-# `borrow_flags[i]` bit gates the firing on this distinction.
-
-# For each param i: bit i set iff rule 3 fires at this call site
-# (LUAt + count==1 + param does not appear in args + single use is
-# in a borrow position).
-#
-# Issue #92 fix: the borrow-position check is the load-bearing
-# addition. Rule 3 plants `kai_internal_drop(kai_p)` in the goto
-# block to reinstate a decref the goto skips. That is correct when
-# the single use is in a borrow position (e.g. match scrutinee:
-# `_scr = kai_p; ...; kai_decref(_scr);` — goto skips the post-do-
-# while decref, so we re-add it. Or list tail spread: `kai_incref(p)`
-# leaves the original ref alive, exit drops the goto skips would
-# free it). The drop is WRONG when the single use is a consume
-# (e.g. direct call arg `f(p)`: callee consumes p inline; nothing is
-# skipped by the goto; an extra drop is a double-decref). The
-# `borrow_flags[i]` bit gates the firing on this distinction.
-fn tcrec_rule3_mask(params: [Param], uses: [Use], args: [Expr],
-                    borrow_flags: [Bool], i: Int, acc: Int) : Int =
-  tcrec_rule3_mask_b(params, uses, args, borrow_flags, [], 0, i, acc)
-
-# `base_mask` carries the bits the rules-1+2 pass already set, so the
-# borrowed-arg rule never re-adds one (the masks are summed, not or'd).
-fn tcrec_rule3_mask_b(params: [Param], uses: [Use], args: [Expr],
-                      borrow_flags: [Bool], bmap: [BorrowEntry], base_mask: Int,
-                      i: Int, acc: Int) : Int {
-  match params {
-    [] -> acc
-    [p, ...rest] -> {
-      let fire = pcs_fate_transfers(pcs_fate_of(p.pname, uses, false, false)) and
-                 not tcrec_args_have_evar(args, p.pname) and
-                 tcrec_nth_bool(borrow_flags, i, false)
-      # The value handed to a BORROWED callee slot in these very args is
-      # never released by the callee, and the goto is about to rebind the
-      # slot over it. Nothing else on this path consumes it, so the goto
-      # owes the drop.
-      let borrow_fire =
-        not fire and
-        not tcrec_bit_is_set(base_mask, i) and
-        tcrec_args_borrow_only(args, p.pname, bmap)
-      let acc1 = if fire or borrow_fire { acc + tcrec_pow2(i) } else { acc }
-      let rest_flags = match borrow_flags {
-        [] -> []
-        [_, ...t] -> t
-      }
-      tcrec_rule3_mask_b(rest, uses, args, rest_flags, bmap, base_mask, i + 1, acc1)
-    }
+# `base_mask` carries the bits the base pass already set, so a site never
+# re-adds one (the masks are summed, not or'd).
+fn tcrec_site_drop_mask(params: [Param], args: [Expr], bmap: [BorrowEntry], base_mask: Int,
+                        i: Int, acc: Int) : Int = match params {
+  [] -> acc
+  [p, ...rest] -> {
+    let fire = not tcrec_bit_is_set(base_mask, i) and tcrec_args_borrow_only(args, p.pname, bmap)
+    let acc1 = if fire { acc + tcrec_pow2(i) } else { acc }
+    tcrec_site_drop_mask(rest, args, bmap, base_mask, i + 1, acc1)
   }
 }
 
@@ -14563,397 +14399,6 @@ fn tcrec_all_reads_e(e: Expr, p: String) : Int = match e.kind {
 fn tcrec_all_reads_ps(ps: [XPos], p: String) : Int = match ps {
   []                  -> 0
   [XP(_, c), ...rest] -> tcrec_all_reads_e(c, p) + tcrec_all_reads_ps(rest, p)
-}
-
-# List index helper for `[Bool]`. Returns `dflt` if `i` is out of bounds.
-
-# List index helper for `[Bool]`. Returns `dflt` if `i` is out of bounds.
-fn tcrec_nth_bool(xs: [Bool], i: Int, dflt: Bool) : Bool {
-  match xs {
-    [] -> dflt
-    [h, ...rest] -> if i <= 0 { h } else { tcrec_nth_bool(rest, i - 1, dflt) }
-  }
-}
-
-# Issue #92 — single-use borrow predicate. CONSERVATIVE: returns true
-# only when the (presumed unique by caller's count==1 precondition)
-# `EVar(p)` occurrence is a list-tail-spread `[..., ...p]`. That is
-# the one position whose decref the goto path is GUARANTEED to skip,
-# regardless of perceus's downstream choices, because
-# `kai_incref(p)` for the cons cell leaves the original ref alive
-# and only the goto-skipped exit-drops would release it.
-#
-# Match scrutinees (`match p { ... }`) are deliberately NOT treated as
-# borrow here even though they superficially look like one. Whether
-# the post-do-while `kai_decref(_scr)` is reachable from the recursive
-# call depends on perceus's "tail-always-sentinel" arm-shape decision
-# (issue #309): if every tail leaf of the arm body is a self-tail-
-# call, perceus injects an early `kai_decref(_scr)` BEFORE the goto,
-# and rule 3's extra drop becomes a double-decref. The
-# scrutinee-borrow case requires per-call-site reasoning over the
-# enclosing arm body, which is out of scope for this fix; the leak
-# the canonical `nth_loop` fixture exhibits remains bounded
-# (one cons cell per iteration) and falls under the existing
-# rules-1+2 conservative dropmask.
-#
-# Every other position (call args, binop operands, field/index that
-# internally dup-and-decref, etc.) consumes `p` inline; rule 3 there
-# would double-decref.
-
-# Issue #92 — single-use borrow predicate. CONSERVATIVE: returns true
-# only when the (presumed unique by caller's count==1 precondition)
-# `EVar(p)` occurrence is a list-tail-spread `[..., ...p]`. That is
-# the one position whose decref the goto path is GUARANTEED to skip,
-# regardless of perceus's downstream choices, because
-# `kai_incref(p)` for the cons cell leaves the original ref alive
-# and only the goto-skipped exit-drops would release it.
-#
-# Match scrutinees (`match p { ... }`) are deliberately NOT treated as
-# borrow here even though they superficially look like one. Whether
-# the post-do-while `kai_decref(_scr)` is reachable from the recursive
-# call depends on perceus's "tail-always-sentinel" arm-shape decision
-# (issue #309): if every tail leaf of the arm body is a self-tail-
-# call, perceus injects an early `kai_decref(_scr)` BEFORE the goto,
-# and rule 3's extra drop becomes a double-decref. The
-# scrutinee-borrow case requires per-call-site reasoning over the
-# enclosing arm body, which is out of scope for this fix; the leak
-# the canonical `nth_loop` fixture exhibits remains bounded
-# (one cons cell per iteration) and falls under the existing
-# rules-1+2 conservative dropmask.
-#
-# Every other position (call args, binop operands, field/index that
-# internally dup-and-decref, etc.) consumes `p` inline; rule 3 there
-# would double-decref.
-fn tcrec_use_is_borrow(body: Expr, p: String) : Bool =
-  tcrec_use_borrow_kind(body.kind, p)
-
-fn tcrec_use_borrow_kind(k: ExprKind, p: String) : Bool {
-  match k {
-    EList(elems) -> tcrec_elems_use_borrow(elems, p)
-    EMatch(s, arms) ->
-      if tcrec_use_borrow_kind(s.kind, p) { true }
-      else { tcrec_arms_use_borrow(arms, p) }
-    ECall(f, xs) ->
-      if tcrec_use_borrow_kind(f.kind, p) { true }
-      else { tcrec_args_use_borrow(xs, p) }
-    EBinop(_, l, r) ->
-      if tcrec_use_borrow_kind(l.kind, p) { true }
-      else { tcrec_use_borrow_kind(r.kind, p) }
-    EUnop(_, x) -> tcrec_use_borrow_kind(x.kind, p)
-    EField(x, _) -> tcrec_use_borrow_kind(x.kind, p)
-    EIndex(x, i) ->
-      if tcrec_use_borrow_kind(x.kind, p) { true }
-      else { tcrec_use_borrow_kind(i.kind, p) }
-    EIf(c, t, opt_e) ->
-      if tcrec_use_borrow_kind(c.kind, p) { true }
-      else if tcrec_use_borrow_kind(t.kind, p) { true }
-      else { match opt_e {
-        None -> false
-        Some(e2) -> tcrec_use_borrow_kind(e2.kind, p)
-      } }
-    EBlock(stmts, opt_tail) ->
-      if tcrec_stmts_use_borrow(stmts, p) { true }
-      else { match opt_tail {
-        None -> false
-        Some(e) -> tcrec_use_borrow_kind(e.kind, p)
-      } }
-    ERange(lo, hi, opt_by) ->
-      if tcrec_use_borrow_kind(lo.kind, p) { true }
-      else if tcrec_use_borrow_kind(hi.kind, p) { true }
-      else { match opt_by {
-        None -> false
-        Some(e) -> tcrec_use_borrow_kind(e.kind, p)
-      } }
-    ERecordLit(_, fis) -> tcrec_fis_use_borrow(fis, p)
-    EPipe(l, r) ->
-      if tcrec_use_borrow_kind(l.kind, p) { true }
-      else { tcrec_use_borrow_kind(r.kind, p) }
-    EMapPipe(l, r) ->
-      if tcrec_use_borrow_kind(l.kind, p) { true }
-      else { tcrec_use_borrow_kind(r.kind, p) }
-    EFlatMapPipe(l, r) ->
-      if tcrec_use_borrow_kind(l.kind, p) { true }
-      else { tcrec_use_borrow_kind(r.kind, p) }
-    EFilterPipe(l, r) ->
-      if tcrec_use_borrow_kind(l.kind, p) { true }
-      else { tcrec_use_borrow_kind(r.kind, p) }
-    EBang(inner) -> tcrec_use_borrow_kind(inner.kind, p)
-    # Lambda bodies are excluded from the count by
-    # `pcs_count_non_lam_uses`, so they cannot be the unique use.
-    ELambda(_, _) -> false
-    _ -> false
-  }
-}
-
-fn tcrec_args_use_borrow(args: [Expr], p: String) : Bool {
-  match args {
-    [] -> false
-    [h, ...rest] ->
-      if tcrec_use_borrow_kind(h.kind, p) { true }
-      else { tcrec_args_use_borrow(rest, p) }
-  }
-}
-
-fn tcrec_arms_use_borrow(arms: [Arm], p: String) : Bool {
-  match arms {
-    [] -> false
-    [a, ...rest] -> match a {
-      Arm(_, opt_g, body) -> {
-        let g_hit = match opt_g {
-          None -> false
-          Some(g) -> tcrec_use_borrow_kind(g.kind, p)
-        }
-        if g_hit { true }
-        else if tcrec_use_borrow_kind(body.kind, p) { true }
-        else { tcrec_arms_use_borrow(rest, p) }
-      }
-    }
-  }
-}
-
-fn tcrec_stmts_use_borrow(stmts: [Stmt], p: String) : Bool {
-  match stmts {
-    [] -> false
-    [s, ...rest] -> {
-      let here = match s {
-        SLet(_, _, e) -> tcrec_use_borrow_kind(e.kind, p)
-        SVar(_, _, e, _, _) -> tcrec_use_borrow_kind(e.kind, p)
-        SAssert(c, opt_m) ->
-          if tcrec_use_borrow_kind(c.kind, p) { true }
-          else { match opt_m {
-            None -> false
-            Some(m) -> tcrec_use_borrow_kind(m.kind, p)
-          } }
-        SExprStmt(e) -> tcrec_use_borrow_kind(e.kind, p)
-        SIndexAssign(b, i, v, _, _) ->
-          if tcrec_use_borrow_kind(b.kind, p) { true }
-          else if tcrec_use_borrow_kind(i.kind, p) { true }
-          else { tcrec_use_borrow_kind(v.kind, p) }
-        SAssign(b, v, _, _) ->
-          if tcrec_use_borrow_kind(b.kind, p) { true }
-          else { tcrec_use_borrow_kind(v.kind, p) }
-        SUse(_, _, _) -> false
-      }
-      if here { true } else { tcrec_stmts_use_borrow(rest, p) }
-    }
-  }
-}
-
-fn tcrec_elems_use_borrow(elems: [ListElem], p: String) : Bool {
-  match elems {
-    [] -> false
-    [e, ...rest] -> {
-      let here = match e {
-        ElSpread(x) -> match x.kind {
-          EVar(nm) -> nm == p
-          _ -> tcrec_use_borrow_kind(x.kind, p)
-        }
-        ElPlain(x) -> tcrec_use_borrow_kind(x.kind, p)
-      }
-      if here { true } else { tcrec_elems_use_borrow(rest, p) }
-    }
-  }
-}
-
-fn tcrec_fis_use_borrow(fis: [FieldInit], p: String) : Bool {
-  match fis {
-    [] -> false
-    [h, ...rest] -> match h {
-      FI(_, e) ->
-        if tcrec_use_borrow_kind(e.kind, p) { true }
-        else { tcrec_fis_use_borrow(rest, p) }
-    }
-  }
-}
-
-# Per-param borrow flag, computed once at fn entry. Bit i (== flag at
-# index i in the returned [Bool]) is true iff param i's single
-# non-lambda use is in a borrow position. Only meaningful when
-# `pcs_count_non_lam_uses(p) == 1`; the rule-3 mask gates on count
-# before consulting this flag.
-
-# Per-param borrow flag, computed once at fn entry. Bit i (== flag at
-# index i in the returned [Bool]) is true iff param i's single
-# non-lambda use is in a borrow position. Only meaningful when
-# `pcs_count_non_lam_uses(p) == 1`; the rule-3 mask gates on count
-# before consulting this flag.
-fn tcrec_compute_borrow_flags(params: [Param], body: Expr, acc: [Bool]) : [Bool] {
-  match params {
-    [] -> list_reverse(acc)
-    [p, ...rest] -> {
-      let flag = tcrec_use_is_borrow(body, p.pname)
-      tcrec_compute_borrow_flags(rest, body, [flag, ...acc])
-    }
-  }
-}
-
-# True iff EVar(p) appears anywhere inside `args` (recursively). Only
-# called from the pre-pass walker; never threaded through the rewrite.
-
-# True iff EVar(p) appears anywhere inside `args` (recursively). Only
-# called from the pre-pass walker; never threaded through the rewrite.
-fn tcrec_args_have_evar(args: [Expr], p: String) : Bool {
-  match args {
-    [] -> false
-    [h, ...rest] ->
-      if tcrec_expr_has_evar(h, p) { true }
-      else { tcrec_args_have_evar(rest, p) }
-  }
-}
-
-fn tcrec_expr_has_evar(e: Expr, p: String) : Bool =
-  tcrec_kind_has_evar(e.kind, p)
-
-fn tcrec_kind_has_evar(k: ExprKind, p: String) : Bool {
-  match k {
-    EVar(nm) -> nm == p
-    ECall(f, xs) ->
-      if tcrec_expr_has_evar(f, p) { true } else { tcrec_args_have_evar(xs, p) }
-    EBinop(_, l, r) ->
-      if tcrec_expr_has_evar(l, p) { true } else { tcrec_expr_has_evar(r, p) }
-    EUnop(_, x) -> tcrec_expr_has_evar(x, p)
-    EField(x, _) -> tcrec_expr_has_evar(x, p)
-    EIndex(x, i) ->
-      if tcrec_expr_has_evar(x, p) { true } else { tcrec_expr_has_evar(i, p) }
-    EIf(c, t, opt_e) ->
-      if tcrec_expr_has_evar(c, p) { true }
-      else if tcrec_expr_has_evar(t, p) { true }
-      else { match opt_e {
-        None -> false
-        Some(e2) -> tcrec_expr_has_evar(e2, p)
-      } }
-    EMatch(s, arms) ->
-      if tcrec_expr_has_evar(s, p) { true }
-      else { tcrec_arms_have_evar(arms, p) }
-    EBlock(stmts, opt_tail) ->
-      if tcrec_stmts_have_evar(stmts, p) { true }
-      else { match opt_tail {
-        None -> false
-        Some(e) -> tcrec_expr_has_evar(e, p)
-      } }
-    EList(elems) -> tcrec_list_elems_have_evar(elems, p)
-    ERange(lo, hi, opt_by) ->
-      if tcrec_expr_has_evar(lo, p) { true }
-      else if tcrec_expr_has_evar(hi, p) { true }
-      else { match opt_by {
-        None -> false
-        Some(e) -> tcrec_expr_has_evar(e, p)
-      } }
-    ERecordLit(_, fis) -> tcrec_field_inits_have_evar(fis, p)
-    EPipe(l, r) ->
-      if tcrec_expr_has_evar(l, p) { true } else { tcrec_expr_has_evar(r, p) }
-    EMapPipe(l, r) ->
-      if tcrec_expr_has_evar(l, p) { true } else { tcrec_expr_has_evar(r, p) }
-    EFlatMapPipe(l, r) ->
-      if tcrec_expr_has_evar(l, p) { true } else { tcrec_expr_has_evar(r, p) }
-    EFilterPipe(l, r) ->
-      if tcrec_expr_has_evar(l, p) { true } else { tcrec_expr_has_evar(r, p) }
-    EBang(inner) -> tcrec_expr_has_evar(inner, p)
-    EStr(span, is_triple) -> tcrec_str_has_evar(span, is_triple, p)
-    ELambda(_, body) -> tcrec_expr_has_evar(body, p)
-    _ -> false
-  }
-}
-
-fn tcrec_arms_have_evar(arms: [Arm], p: String) : Bool {
-  match arms {
-    [] -> false
-    [a, ...rest] -> match a {
-      Arm(_, opt_g, body) -> {
-        let g_hit = match opt_g {
-          None -> false
-          Some(g) -> tcrec_expr_has_evar(g, p)
-        }
-        if g_hit { true }
-        else if tcrec_expr_has_evar(body, p) { true }
-        else { tcrec_arms_have_evar(rest, p) }
-      }
-    }
-  }
-}
-
-fn tcrec_stmts_have_evar(stmts: [Stmt], p: String) : Bool {
-  match stmts {
-    [] -> false
-    [s, ...rest] -> {
-      let here = match s {
-        SLet(_, _, e) -> tcrec_expr_has_evar(e, p)
-        SVar(_, _, e, _, _) -> tcrec_expr_has_evar(e, p)
-        SAssert(c, opt_m) ->
-          if tcrec_expr_has_evar(c, p) { true }
-          else { match opt_m {
-            None -> false
-            Some(m) -> tcrec_expr_has_evar(m, p)
-          } }
-        SExprStmt(e) -> tcrec_expr_has_evar(e, p)
-        SIndexAssign(b, i, v, _, _) ->
-          if tcrec_expr_has_evar(b, p) { true }
-          else if tcrec_expr_has_evar(i, p) { true }
-          else { tcrec_expr_has_evar(v, p) }
-        SAssign(b, v, _, _) ->
-          if tcrec_expr_has_evar(b, p) { true }
-          else { tcrec_expr_has_evar(v, p) }
-        SUse(_, _, _) -> false
-      }
-      if here { true } else { tcrec_stmts_have_evar(rest, p) }
-    }
-  }
-}
-
-fn tcrec_list_elems_have_evar(elems: [ListElem], p: String) : Bool {
-  match elems {
-    [] -> false
-    [e, ...rest] -> {
-      let here = match e {
-        ElPlain(x) -> tcrec_expr_has_evar(x, p)
-        ElSpread(x) -> tcrec_expr_has_evar(x, p)
-      }
-      if here { true } else { tcrec_list_elems_have_evar(rest, p) }
-    }
-  }
-}
-
-fn tcrec_field_inits_have_evar(fis: [FieldInit], p: String) : Bool {
-  match fis {
-    [] -> false
-    [h, ...rest] -> match h {
-      FI(_, e) ->
-        if tcrec_expr_has_evar(e, p) { true }
-        else { tcrec_field_inits_have_evar(rest, p) }
-    }
-  }
-}
-
-# Conservative fallback for interpolated strings: assume any interp
-# segment (`#{...}`) might reference `p`. The exact-decode path
-# (`scan_uses_interp_parts` + friends) requires re-lexing and is
-# overkill — rule 3 erring on the safe side just means we skip a
-# drop opportunity (revert to the current conservative dropmask),
-# never that we double-free. A bare-string literal with no `#{`
-# clearly cannot reference any binding, so we short-circuit it.
-
-# Conservative fallback for interpolated strings: assume any interp
-# segment (`#{...}`) might reference `p`. The exact-decode path
-# (`scan_uses_interp_parts` + friends) requires re-lexing and is
-# overkill — rule 3 erring on the safe side just means we skip a
-# drop opportunity (revert to the current conservative dropmask),
-# never that we double-free. A bare-string literal with no `#{`
-# clearly cannot reference any binding, so we short-circuit it.
-fn tcrec_str_has_evar(span: String, _is_triple: Bool, _p: String) : Bool =
-  tcrec_span_has_interp(span, 0, string_length(span))
-
-fn tcrec_span_has_interp(s: String, i: Int, n: Int) : Bool {
-  if i + 1 >= n { false }
-  else { match char_at(s, i) {
-    None -> false
-    Some(c) ->
-      if c == '#' {
-        match char_at(s, i + 1) {
-          Some(d) -> if d == '{' { true } else { tcrec_span_has_interp(s, i + 1, n) }
-          None -> false
-        }
-      } else { tcrec_span_has_interp(s, i + 1, n) }
-  } }
 }
 
 # The perceus rewrite records its ownership decision in the body itself:
@@ -15127,13 +14572,9 @@ fn tcrec_fields_raw_read(fis: [FieldInit], p: String) : Bool {
   }
 }
 
-# Lookup the rule-3 mask for the call site at (line, col). Returns 0
-# if the call site is not in the table (e.g. shadowed by a local
-# binding the rewriter walks into separately).
-
-# Lookup the rule-3 mask for the call site at (line, col). Returns 0
-# if the call site is not in the table (e.g. shadowed by a local
-# binding the rewriter walks into separately).
+# The side-table mask for the call site at (line, col); 0 when the site
+# is absent (e.g. shadowed by a local binding the rewriter walks into
+# separately).
 fn tcrec_lookup_dm(table: [TcrDm], line: Int, col: Int) : Int {
   match table {
     [] -> 0
@@ -15284,7 +14725,7 @@ fn trmc_rewrite_body(body0: Expr, nm: String, arity: Int, own_mod: Option[String
 }
 
 # Build the step-sentinel `ECall` for a modulo-cons leaf: compute the
-# per-site dropmask (base + rule-3), make the sentinel callee, and apply
+# per-site dropmask (base + side table), make the sentinel callee, and apply
 # it to the ctor args (`args` carries the self-call at slot `h`). Shared
 # by the user-ctor, builtin-cons-literal, and reuse-cons leaves so the
 # dropmask discipline stays single-sourced.
@@ -15293,11 +14734,11 @@ fn trmc_make_step_call(cname: String, args: [Expr], h: Int, line: Int, col: Int,
                        uses: [Use], dm_table: [TcrDm], skip_set: [String]) : ExprKind {
   let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
   let self_e = trmc_expr_nth(args, h)
-  let rule3_mask = match self_e {
+  let site_mask = match self_e {
     Some(se) -> tcrec_lookup_dm(dm_table, se.line, se.col)
     None     -> 0
   }
-  let dropmask = base_mask + rule3_mask
+  let dropmask = base_mask + site_mask
   let sentinel = trmc_make_step_sentinel(c_sym_str, h, cname, dropmask, pnames)
   ECall(Expr { kind: EVar(sentinel), line: line, col: col, ty: None, mode: MBoxed }, args)
 }
@@ -15351,11 +14792,11 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int, o
           # tcrec; the self-call sits at slot `h`.
           let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
           let self_e = trmc_expr_nth(xs, h)
-          let rule3_mask = match self_e {
+          let site_mask = match self_e {
             Some(se) -> tcrec_lookup_dm(dm_table, se.line, se.col)
             None     -> 0
           }
-          let dropmask = base_mask + rule3_mask
+          let dropmask = base_mask + site_mask
           let sentinel = trmc_make_step_sentinel(c_sym_str, h, cname, dropmask, pnames)
           ECall(Expr { kind: EVar(sentinel), line: line, col: col, ty: f.ty, mode: f.mode }, xs)
         }
@@ -15403,12 +14844,8 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
         if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
-          # Rules 1+2 (LUBlocked / LUAt count >= 2) are per-fn — same
-          # at every site. Rule 3 (LUAt count == 1 + p not in args)
-          # is per-site and looked up by (line, col) in the side table
-          # built once at `tcrec_rewrite_decl` entry. The two masks are
-          # disjoint by construction (rule 1+2 fires on count==0 or
-          # count>=2; rule 3 fires only on count==1) so OR == ADD.
+          # The base mask is per-fn; the side-table mask is per-site and
+          # never re-adds a base bit, so OR == ADD.
           tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, c_sym_str)
         } else { k }
       # A qualified call to the enclosing module with the fn's own name
@@ -15452,8 +14889,8 @@ fn tcrec_make_step_site(f: Expr, xs: [Expr], params: [Param], pnames: [String],
                         uses: [Use], dm_table: [TcrDm], skip_set: [String],
                         c_sym_str: String) : ExprKind {
   let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
-  let rule3_mask = tcrec_lookup_dm(dm_table, f.line, f.col)
-  let dropmask = base_mask + rule3_mask
+  let site_mask = tcrec_lookup_dm(dm_table, f.line, f.col)
+  let dropmask = base_mask + site_mask
   let sentinel = tcrec_make_sentinel(c_sym_str, dropmask, pnames)
   ECall(
     Expr { kind: EVar(sentinel), line: f.line, col: f.col,

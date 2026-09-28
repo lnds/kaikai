@@ -50,6 +50,7 @@ import compiler.expr_positions
 import compiler.borrow_infer
 import compiler.perceus_op_arg
 import compiler.perceus_let_own
+import compiler.perceus_spread_own
 import compiler.perceus_lend_tail
 import compiler.perceus_payer
 import compiler.perceus_branch_pay
@@ -1007,14 +1008,15 @@ fn pcs_fields_bare_var(p: String, fis: [FieldInit]) : Bool = match fis {
   }
 }
 
-# A spread `[...p]` copies out of p without taking the cell — only a
-# plain element slot stores the ref.
+# A plain slot and a trailing spread store the ref; a middle spread copies
+# the spine out and releases it.
 fn pcs_elems_bare_var(p: String, els: [ListElem]) : Bool = match els {
   []           -> false
   [h, ...rest] -> {
-    let here = match h {
-      ElPlain(e)  -> match sym_read_kind(e.kind) { EVar(nm) -> nm == p _ -> false }
-      ElSpread(_) -> false
+    let stores = match h { ElPlain(e) -> Some(e) ElSpread(e) -> match rest { [] -> Some(e) _ -> None } }
+    let here = match stores {
+      Some(e) -> match sym_read_kind(e.kind) { EVar(nm) -> nm == p _ -> false }
+      None    -> false
     }
     here or pcs_elems_bare_var(p, rest)
   }
@@ -1518,7 +1520,7 @@ fn pcs_inspected_kind(nm: String, k: ExprKind) : Bool = match sym_read_kind(k) {
   # statement forms are ignored by this analysis.
   EBlock(stmts, tail) -> pcs_inspected_block(nm, stmts, tail)
   ELambda(_, b)       -> pcs_name_absent(nm, b)   # capture = owned
-  EList(els)          -> pcs_inspected_elems(nm, els)   # spread tail owns
+  EList(els)          -> pcs_inspected_elems(nm, els)
   EStr(_, _)          -> false   # interpolation reads are owned (conservative)
   EHandle(_, _, _, _, _, _, _, _) -> false   # conservative: handlers are owned
   _ -> pcs_inspected_ps(nm, xp_positions_kind(k))
@@ -1602,7 +1604,7 @@ fn pcs_inspected_elems(nm: String, els: [ListElem]) : Bool = match els {
   [el, ...rest] -> {
     let ok = match el {
       ElPlain(e)  -> pcs_name_only_inspected(nm, e)
-      ElSpread(e) -> pcs_name_absent(nm, e)   # spread tail owns the value
+      ElSpread(e) -> pcs_name_absent(nm, e)   # a spread consumes its operand
     }
     if ok { pcs_inspected_elems(nm, rest) } else { false }
   }
@@ -1816,7 +1818,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         let param_dropped = pcs_inject_param_branch_drops(arm_dropped,
           pcs_names_paid_by(owned_moves, uses, psets, PyBranch), name)
         let branch_paid = pbp_branch_drops(param_dropped, pnames, uses, path_moves)
-        let reused_body = pcs_recognise_reuse_expr_b(branch_paid, borrowed)
+        let reused_body = pcs_recognise_reuse_expr_b(pso_own_spreads(branch_paid, borrowed), borrowed)
         # Borrowed params carry no exit obligation — exclude from the
         # unused-param drop. Raw params (mixed-sig) likewise carry no rc,
         # so they must not receive an unused-param drop either.
@@ -2750,10 +2752,10 @@ fn pcs_max_paths_b_arms(nm: String, arms: [Arm], best: Int, bmap: [BorrowEntry])
 #      is a linear consumer: a call to a user-defined fn (which
 #      pcs_pass made linear by construction) or a variant/record
 #      that owns the slot. Non-linear consumers (intrinsics,
-#      capability ops, raw field access on a borrowed record,
-#      list-spread tails `[..., ...nm]`) internally incref their
-#      arg, and a raw transfer would leak or double-free.
-#[doc("Params whose transfer must be skipped because some branch reads them through an incref-ing op (capability ops, borrowed field access, spread tails). Pub: tco consults it.")]
+#      capability ops, raw field access on a borrowed record)
+#      internally incref their arg, and a raw transfer would leak or
+#      double-free.
+#[doc("Params whose transfer must be skipped because some branch reads them through an incref-ing op (capability ops, borrowed field access). Pub: tco consults it.")]
 pub fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] =
   pcs_branch_aware_skip_params_b(pnames, body, [])
 
@@ -3561,7 +3563,7 @@ fn pcs_consumers_linear_kind(nm: String, k: ExprKind) : Bool = match k {
     }
     s_ok and pcs_consumers_linear_arms(nm, arms)
   }
-  EList(els)          -> pcs_consumers_linear_elems(nm, els)   # spread tail increfs
+  EList(els)          -> pcs_consumers_linear_elems(nm, els)
   # Everything else checks its inline positions; deferred bodies
   # (lambda closures, handler clauses) are handled separately.
   _ -> pcs_consumers_linear_ps(nm, xp_positions_kind(k))
@@ -3698,19 +3700,8 @@ fn pcs_consumers_linear_arms(nm: String, arms: [Arm]) : Bool = match arms {
 fn pcs_consumers_linear_elems(nm: String, els: [ListElem]) : Bool = match els {
   []           -> true
   [h, ...rest] -> {
-    let h_ok = match h {
-      ElPlain(e)  -> pcs_all_consumers_linear(nm, e)
-      ElSpread(e) -> match sym_read_kind(e.kind) {
-        # `[x, ...nm]` lowers to `kai_cons(x, kai_incref(nm))`
-        # (see `emit_list_tail` in the emitter): the spread tail is
-        # increfed, not transferred. A bare `EVar(nm)` spread is
-        # therefore a non-linear consumer of `nm` — the conservative
-        # dup wrap MUST stay.
-        EVar(uname) -> uname != nm
-        _           -> pcs_all_consumers_linear(nm, e)
-      }
-    }
-    h_ok and pcs_consumers_linear_elems(nm, rest)
+    let e = match h { ElPlain(x) -> x ElSpread(x) -> x }
+    pcs_all_consumers_linear(nm, e) and pcs_consumers_linear_elems(nm, rest)
   }
 }
 
