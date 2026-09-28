@@ -7307,10 +7307,12 @@ test-perceus-arm-branch-read-native:
 endif
 
 # A modulo-cons step leaves every enclosing match: it releases their pending
-# scrutinee cells and unmoved binders, as the tcrec goto does. The ledger
-# bound catches the per-step leak; the ASAN companion catches a release of
-# something the step still reads.
-TRMC_STEP_LEDGER_FIXTURES := trmc_step_ledger_2145
+# scrutinee cells and unmoved binders, as the tcrec goto does. An Int slot
+# above the immediate range, written by a step or a reuse rebuild, stores
+# its word without leaving a box behind. The ledger bound catches the
+# per-step leak; the ASAN companion catches a release of something the step
+# still reads.
+TRMC_STEP_LEDGER_FIXTURES := trmc_step_ledger_2145 trmc_int_slot_box reuse_int_slot_box
 
 test-perceus-trmc-step-ledger: $(TARGET) build
 	@set -e; \
