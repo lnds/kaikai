@@ -4410,8 +4410,6 @@ fn pcs_arm_drops_of(a: Arm, fn_name: String, cx: PcsArmCx) : Arm = match a {
       [] -> body1
       [_, ...__] -> pcs_inject_arm_drops(body1, drops, fn_name, owed_ok)
     }
-    # A binder skipped for its tail read, whose tail hosts a self-tail-call,
-    # is closed per goto path instead: the goto skips every exit.
     let body3 = pcs_arm_tail_drop_body(body2, bound, pat.line, pat.col, g_rw, cx.uses, fn_name, owed_ok)
     # A falsy guard leaves the arm without running the body or its exits.
     let g1 = match g_rw {
@@ -4489,29 +4487,24 @@ fn pcs_guard_has_bare_read(nm: String, opt_g: Option[Expr]) : Bool = match opt_g
   Some(g) -> pcs_has_bare_read(nm, g)
 }
 
-# The block-body counterpart of the non-block `pcs_distribute_dead_drops`
-# route: binders whose reads sit in the block's tail cannot take the
-# pre-tail drop, and when that tail hosts a self-tail-call the goto also
-# skips every exit that could release them. Close each goto path
-# individually: the drop lands in the self-call leaves where the binder
-# is dead. A leaf with a bare read of the binder is left untouched, so
-# a moved read is never followed by a release.
-# Lambda-captured binders are skipped — the goto ledger releases them
-# after the args have built their closures.
+# Binders whose reads sit in a block's tail cannot take the pre-tail drop.
+# A tail hosting a self-tail-call has each goto path closed at its leaf
+# (the goto skips every exit); any other tail is ret-wrapped, so the drops
+# run after its value. A binder with a bare read is left alone, so a moved
+# read is never followed by a release. Lambda-captured binders are skipped
+# — the goto ledger releases them after the args have built their closures.
 fn pcs_arm_tail_drop_body(body: Expr, bound: [String], ln: Int, cl: Int,
                           opt_g: Option[Expr], uses: [Use], fn_name: String, owed_ok: Bool) : Expr =
   match body.kind {
     EBlock(stmts, opt_tail) -> match opt_tail {
-      Some(t) ->
-        if pcs_is_self_tail_call(t, fn_name) {
-          let drops = pcs_collect_arm_tail_drops(bound, ln, cl, body, opt_g, uses, [])
-          match drops {
-            [] -> body
-            [_, ...__] ->
-              Expr { kind: EBlock(stmts, Some(pcs_distribute_dead_drops(t, drops, fn_name, owed_ok))),
-                     line: body.line, col: body.col, ty: body.ty, mode: body.mode }
-          }
-        } else { body }
+      Some(t) -> match pcs_collect_arm_tail_drops(bound, ln, cl, body, opt_g, uses, []) {
+        []    -> body
+        drops -> {
+          let t1 = if pcs_is_self_tail_call(t, fn_name) { pcs_distribute_dead_drops(t, drops, fn_name, owed_ok) }
+                   else { pcs_arm_ret_wrap(t, drops) }
+          Expr { kind: EBlock(stmts, Some(t1)), line: body.line, col: body.col, ty: body.ty, mode: body.mode }
+        }
+      }
       None -> body
     }
     _ -> body
@@ -4648,21 +4641,18 @@ fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: String, owed_ok: Boo
       if pcs_is_self_tail_call(body, fn_name) {
         pcs_distribute_dead_drops(body, drops, fn_name, owed_ok)
       }
-      else {
-        let ret_name = "__pcs_arm_ret"
-        let ret_let = SLet(
-          Pattern { pkind: PBind(ret_name), line: body.line, col: body.col },
-          None,
-          body
-        )
-        let stmts = [ret_let, ...drops]
-        let tail = Expr { kind: EVar(ret_name), line: body.line, col: body.col,
-                          ty: body.ty, mode: body.mode }
-        Expr { kind: EBlock(stmts, Some(tail)),
-               line: body.line, col: body.col, ty: body.ty, mode: body.mode }
-      }
+      else { pcs_arm_ret_wrap(body, drops) }
     }
   }
+}
+
+# `{ let __pcs_arm_ret = body; drops; __pcs_arm_ret }`: the TRMC rewrite
+# peels this exact shape and replants its drops.
+fn pcs_arm_ret_wrap(body: Expr, drops: [Stmt]) : Expr = {
+  let ret_name = "__pcs_arm_ret"
+  let ret_let = SLet(Pattern { pkind: PBind(ret_name), line: body.line, col: body.col }, None, body)
+  let tail = Expr { kind: EVar(ret_name), line: body.line, col: body.col, ty: body.ty, mode: body.mode }
+  Expr { kind: EBlock([ret_let, ...drops], Some(tail)), line: body.line, col: body.col, ty: body.ty, mode: body.mode }
 }
 
 # Close each self-tail-call leaf of `body` for `drops`: the goto skips
