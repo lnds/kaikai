@@ -49,6 +49,7 @@
 # compiler.unbox (`expr_has_interp_use` / `uses_have_in_lam`).
 
 import compiler.ast
+import compiler.head_tag_decl
 import compiler.sym_read
 import compiler.kinds
 import compiler.util
@@ -2207,8 +2208,8 @@ pub fn ffi_kind_of_ty(t: TypeExpr) : FfiRetKind {
 # `KaiValue*(...)` shape (String / Unit / List / Option / Result) and is
 # registered directly. See `emit_impl_shim_defs` (fix-proto-eq-abi).
 #[doc("Row for one `__pimpl_*` entry: the C symbol name, the proto name, the kaikai type name (head), the impl fn's arity, and its unboxed signature (Some when scalar, None when boxed). Heterogeneous- mangled impls…")]
-pub type PimplRow = PR(String, String, String, Int, Option[UFnSig], String)
-#                  c_sym    proto   type_name arity      unboxed sig   op_name
+pub type PimplRow = PR(String, String, String, Int, Option[UFnSig], String, Option[String])
+#                  c_sym    proto   type_name arity      unboxed sig   op_name impl home
 
 #[doc("AST collector walking pimpl rows. `fns` is the EFn registry, used to recover each pimpl's unboxed signature (the unbox pass stamps it there).")]
 pub fn collect_pimpl_rows(ds: [Decl], fns: [EFn], acc: [PimplRow]) : [PimplRow] {
@@ -2222,7 +2223,7 @@ pub fn collect_pimpl_rows(ds: [Decl], fns: [EFn], acc: [PimplRow]) : [PimplRow] 
               let csym = c_sym(name, mo)
               let arity = list_length(params)
               let sig = lookup_ufn_sig(fns, name, mo)
-              collect_pimpl_rows(rest, fns, [pr_with_csym(pr, csym, arity, sig), ...acc])
+              collect_pimpl_rows(rest, fns, [pr_with_csym(pr, csym, arity, sig, mo), ...acc])
             }
             None -> collect_pimpl_rows(rest, fns, acc)
           }
@@ -2235,15 +2236,15 @@ pub fn collect_pimpl_rows(ds: [Decl], fns: [EFn], acc: [PimplRow]) : [PimplRow] 
   }
 }
 
-#[doc("Attach the minted C symbol + unboxed signature to a decoded protocol-impl row.")]
-pub fn pr_with_csym(pr: PimplRow, csym: String, arity: Int, sig: Option[UFnSig]) : PimplRow {
-  match pr { PR(_, p, t, _, _, op) -> PR(csym, p, t, arity, sig, op) }
+#[doc("Attach the minted C symbol, unboxed signature and impl home to a decoded protocol-impl row.")]
+pub fn pr_with_csym(pr: PimplRow, csym: String, arity: Int, sig: Option[UFnSig], home: Option[String]) : PimplRow {
+  match pr { PR(_, p, t, _, _, op, _) -> PR(csym, p, t, arity, sig, op, home) }
 }
 
 #[doc("True when this pimpl row has an unboxed (raw-scalar) C signature and so needs a boxed shim before it can be registered in the impl table. A row is unboxed when the unbox pass classified it (`Some(US ...)`) AND it touches a raw scalar at the ABI boundary — either a scalar PARAM or a scalar RETURN. The return-only branch covers arity-0 impls like `Default` (`Default_Int_default() : Int` is emitted `i64 ()*` but the impl table bitcasts the slot to `%KaiValue* ()*` — clang's LLVM verifier rejects the mismatch; the C backend gets an implicit cast and only the LLVM smoke test catches it). issue fix-default-shim.")]
 pub fn pimpl_row_is_unboxed(pr: PimplRow) : Bool {
   match pr {
-    PR(_, _, _, _, sig, _) -> match sig {
+    PR(_, _, _, _, sig, _, _) -> match sig {
       None -> false
       Some(US(pts, rt, _)) -> any_param_scalar(pts) or ty_is_scalar(rt)
     }
@@ -2276,13 +2277,6 @@ pub fn ty_is_scalar(t: Ty) : Bool {
   }
 }
 
-# Parse `__pimpl_<P>_<T>_<op>` or `__pimpl_<P>_<T>_<op>__a_<args>`
-# back into (proto, type_name). The proto is the stdlib name (Show,
-# Eq, ...) for v1; user protos return None to skip.
-
-# Parse `__pimpl_<P>_<T>_<op>` or `__pimpl_<P>_<T>_<op>__a_<args>`
-# back into (proto, type_name). The proto is the stdlib name (Show,
-# Eq, ...) for v1; user protos return None to skip.
 #[doc("Parse `__pimpl_<P>_<T>_<op>` or `__pimpl_<P>_<T>_<op>__a_<args>` back into (proto, type_name). The proto is the stdlib name (Show, Eq, ...) for v1; user protos return None to skip.")]
 pub fn parse_pimpl_name(name: String) : Option[PimplRow] {
   # name = "__pimpl_" ++ <rest>; cut prefix.
@@ -2308,7 +2302,7 @@ pub fn parse_pimpl_name(name: String) : Option[PimplRow] {
           else {
             let tname = string_slice(rest1, 0, last)
             let op = string_slice(rest1, last + 1, m - last - 1)
-            Some(PR("", p, tname, 0, None, op))
+            Some(PR("", p, tname, 0, None, op, None))
           }
         }
       }
@@ -2435,45 +2429,8 @@ fn collect_v2h_pairs(vs: [VariantEntry], decls: [Decl], acc: [Int]) : [Int] {
   }
 }
 
-# For a constructor `name`, find the sum type it belongs to and look
-# up that sum's head tag. Builtins use the reserved ids; user sums
-# would need a registry — out of scope for v1 (the dispatcher's
-# runtime panic catches the miss).
-
-# For a constructor `name`, find the sum type it belongs to and look
-# up that sum's head tag. Builtins use the reserved ids; user sums
-# would need a registry — out of scope for v1 (the dispatcher's
-# runtime panic catches the miss).
-# Dense head-tag registry for user-declared nominal types. Every DType
-# with a TBRecord or TBSum body gets a stable head tag starting at
-# KAI_USER_HEAD_TAG_BASE (20, runtime.h:158), assigned by declaration
-# order among record/sum decls only (aliases / effect aliases do not
-# count and do not increment the index). Giving EVERY user type a tag —
-# impl or not — is sound: kai_lookup_impl returns NULL for tagless types
-# and the structural fallback recurses per field, so a nested field that
-# DOES carry an impl still dispatches. Presence of an impl is `lookup !=
-# NULL`, never `tag >= 20`.
-#[doc("Head tag for a user-declared record/sum type `tname`: 20 + its declaration index among record/sum decls, or -1 if not found.")]
-pub fn user_type_head_tag(tname: String, decls: [Decl]) : Int =
-  user_type_head_tag_loop(tname, decls, 0)
-
-#[doc("Indexed walk backing user_type_head_tag; idx advances only on record/sum DTypes.")]
-pub fn user_type_head_tag_loop(tname: String, decls: [Decl], idx: Int) : Int {
-  match decls {
-    [] -> 0 - 1
-    [d, ...rest] -> match d {
-      DType(_, dn, _, body, _, _, _, _, _) -> match body {
-        TBRecord(_) -> if dn == tname { 20 + idx } else { user_type_head_tag_loop(tname, rest, idx + 1) }
-        TBSum(_)    -> if dn == tname { 20 + idx } else { user_type_head_tag_loop(tname, rest, idx + 1) }
-        _           -> user_type_head_tag_loop(tname, rest, idx)
-      }
-      _ -> user_type_head_tag_loop(tname, rest, idx)
-    }
-  }
-}
-
 #[doc("Integer head tag for a builtin type name (Int -> 3, Real -> 4, Bool -> 2, ...) or a user record/sum type (dense, >= 20); -1 for unknown types. The runtime-table identity backing both LLVM-text (`_kai_proto_init_llvm`) and in-process native emission. Pub for unit testing.")]
-pub fn stdlib_head_tag_int(tname: String, decls: [Decl]) : Int {
+pub fn stdlib_head_tag_int(home: Option[String], tname: String, decls: [Decl]) : Int {
   if tname == "Int"          { 3 }
   else if tname == "Real"    { 4 }
   else if tname == "Bool"    { 2 }
@@ -2488,7 +2445,7 @@ pub fn stdlib_head_tag_int(tname: String, decls: [Decl]) : Int {
   else if tname == "Result"  { 17 }
   else if tname == "Signal"  { 18 }
   else if tname == "ProcessExit" { 19 }
-  else { user_type_head_tag(tname, decls) }
+  else { impl_target_head_tag(home, tname, decls) }
 }
 
 #[doc("Integer protocol ID for a stdlib protocol name (Show -> 0, Eq -> 1, Hash -> 3, ...); -1 for unknown protocols (the runtime hashmap never finds them). The integer counterpart of `stdlib_proto_id_c`, shared by both the LLVM-text and in-process native impl-table registration.")]
@@ -2606,50 +2563,7 @@ pub fn enum_names_has(enums: [String], name: String) : Bool {
   }
 }
 
-# Two-phase on purpose: find the owning sum first, then resolve its
-# head tag in a separate walk. A single loop threading the full decl
-# list alongside its own recursion tail aliases the list against its
-# sub-spine, which the RC pass over-frees.
-#[doc("Head tag for the sum type owning constructor `ctor`, or -1 if no user sum declares it.")]
-pub fn user_ctor_type_head_tag(ctor: String, decls: [Decl]) : Int =
-  user_ctor_type_head_tag_in(None, ctor, decls)
-
-#[doc("Head tag of the sum type declaring `ctor` in module `home`, or -1 when no such sum exists.")]
-pub fn user_ctor_type_head_tag_in(home: Option[String], ctor: String, decls: [Decl]) : Int =
-  match ctor_owner_sum_in(home, ctor, decls) {
-    Some(dn) -> user_type_head_tag(dn, decls)
-    None     -> 0 - 1
-  }
-
-#[doc("Name of the sum type declaring constructor `ctor`, or None.")]
-pub fn ctor_owner_sum(ctor: String, ds: [Decl]) : Option[String] =
-  ctor_owner_sum_in(None, ctor, ds)
-
-#[doc("Name of the sum type declaring `ctor` in module `home`, or None. A `None` home takes the first declarer, as before homes existed.")]
-pub fn ctor_owner_sum_in(home: Option[String], ctor: String, ds: [Decl]) : Option[String] {
-  match ds {
-    [] -> None
-    [d, ...rest] -> match d {
-      DType(_, dn, _, body, _, _, mo, _, _) -> match body {
-        TBSum(vs) ->
-          if ctor_in_variants(ctor, vs) and ctor_home_matches(mo, home) { Some(dn) }
-          else { ctor_owner_sum_in(home, ctor, rest) }
-        _ -> ctor_owner_sum_in(home, ctor, rest)
-      }
-      _ -> ctor_owner_sum_in(home, ctor, rest)
-    }
-  }
-}
-
-#[doc("True when constructor `ctor` appears among the variant list `vs`.")]
-pub fn ctor_in_variants(ctor: String, vs: [Variant]) : Bool {
-  match vs {
-    [] -> false
-    [Var(cname, _), ...rest] -> if cname == ctor { true } else { ctor_in_variants(ctor, rest) }
-  }
-}
-
-#[doc("For a constructor `name`, find the sum type it belongs to and look up that sum's head tag. Builtins use the reserved ids; user sums resolve to dense user head tags via user_ctor_type_head_tag.")]
+#[doc("For a constructor `name`, find the sum type it belongs to and look up that sum's head tag. Builtins use the reserved ids; user sums resolve to their declaration's dense head tag.")]
 pub fn variant_head_tag_for(name: String, decls: [Decl]) : Int =
   variant_head_tag_for_in(None, name, decls)
 
@@ -2667,7 +2581,7 @@ pub fn variant_head_tag_for_in(home: Option[String], name: String, decls: [Decl]
   else if name == "SigWinch" { 18 }
   else if name == "Exited" { 19 }
   else if name == "Signaled" { 19 }
-  else { user_ctor_type_head_tag_in(home, name, decls) }
+  else { ctor_owner_head_tag(home, name, decls) }
 }
 
 # m7e §24: build a RowExpr from the body-performed labels collected
