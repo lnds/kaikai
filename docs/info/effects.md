@@ -163,6 +163,10 @@ of issue #533).
 
 Coverage rules (typer):
 
+0. **Every op needs a clause** — a `handle ... with Eff` lists every
+   op of `Eff`, even ones nothing performs, except an op the
+   `default { }` block bridges with `$extern_handler`. Otherwise:
+   `handler for Eff does not cover every op: missing ...`.
 1. **Inside a `handle ... with Eff { clauses }`** — the listed
    clauses discharge the op; the `default { }` block is unused at
    that call site.
