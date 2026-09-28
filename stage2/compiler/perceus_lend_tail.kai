@@ -1,0 +1,147 @@
+# A match-arm binder read in a borrowed parameter slot is lent to that call,
+# not handed over.
+#
+# The arm's bind dups every pointer child, and when the function's own tail
+# call becomes the loop back-edge, the goto ledger must release that dup. It
+# judges consumption syntactically, so a bare read in a call argument looked
+# like a move and the dup survived: a borrowed descent kept all of its
+# structure but the head alive, and a binder the arm also inspected through a
+# borrowing callee kept one reference per step. Marking the read
+# `__perceus_borrow` tells the ledger the call does not consume the binder;
+# both backends emit the wrapped read unchanged.
+#
+# The back-edge is stricter. There the read becomes the next step's borrowed
+# parameter, so it must stay alive after the goto releases the dup: only a
+# child of a borrowed scrutinee is marked, whose parent the caller keeps
+# alive for the whole loop, and one level down the children of a match over
+# such a child. A child of an OWNED scrutinee keeps its dup: the goto
+# releases that parent too, and the dup is then the child's only reference.
+#
+# Binder names are unique per function, so a binder never shadows another
+# name this pass tracks.
+
+import compiler.ast
+import compiler.ast_map
+import compiler.infer
+import compiler.modules
+import compiler.sym_read
+import compiler.util
+
+#[doc("Mark the arm binders read in borrowed boxed slots; `slots` gives a callee's and `bpos` those of `self_name`.")]
+pub fn plt_lend_binders(e: Expr, self_name: String, bpos: [Int], borrowed: [String],
+                        slots: (Expr) -> [Int]) : Expr =
+  if not plt_has_back_edge(e, self_name) { e }
+  else {
+    plt_expr(e, PltCx { self_name: self_name, bpos: bpos, borrowed: borrowed, slots: slots },
+             PltScope { bound: [], lent: [] }, true)
+  }
+
+# Only a goto ledger reads the marks, and only a tail self-call becomes a goto.
+fn plt_has_back_edge(e: Expr, self_name: String) : Bool = match e.kind {
+  ECall(f, _)     -> plt_is_self(f, self_name)
+  EMatch(_, arms) -> plt_arms_back_edge(arms, self_name)
+  EIf(_, t, oe)   -> plt_has_back_edge(t, self_name) or plt_opt_back_edge(oe, self_name)
+  EBlock(_, bt)   -> plt_opt_back_edge(bt, self_name)
+  _               -> false
+}
+
+fn plt_arms_back_edge(arms: [Arm], self_name: String) : Bool = match arms {
+  []                  -> false
+  [Arm(_, _, b), ...rest] -> plt_has_back_edge(b, self_name) or plt_arms_back_edge(rest, self_name)
+}
+
+fn plt_opt_back_edge(oe: Option[Expr], self_name: String) : Bool = match oe {
+  None    -> false
+  Some(x) -> plt_has_back_edge(x, self_name)
+}
+
+type PltCx = { self_name: String, bpos: [Int], borrowed: [String], slots: (Expr) -> [Int] }
+
+# `bound`: the arm binders in scope; `lent`: those whose parent outlives the loop.
+type PltScope = { bound: [String], lent: [String] }
+
+fn plt_expr(e: Expr, cx: PltCx, sc: PltScope, tail: Bool) : Expr =
+  Expr { kind: plt_kind(e.kind, cx, sc, tail), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn plt_kind(k: ExprKind, cx: PltCx, sc: PltScope, tail: Bool) : ExprKind = match k {
+  EMatch(s, arms)     -> {
+    let lends = plt_scrut_lends(s, cx.borrowed, sc.lent)
+    EMatch(plt_expr(s, cx, sc, false), map(arms, (a) => plt_arm(a, lends, cx, sc, tail)))
+  }
+  EIf(c, t, oe)       ->
+    EIf(plt_expr(c, cx, sc, false), plt_expr(t, cx, sc, tail),
+        prc_map_opt_expr(oe, (x) => plt_expr(x, cx, sc, tail)))
+  EBlock(stmts, bt)   ->
+    EBlock(map(stmts, (s) => prc_map_stmt_exprs(s, (x) => plt_expr(x, cx, sc, false))),
+           prc_map_opt_expr(bt, (x) => plt_expr(x, cx, sc, tail)))
+  ECall(f, xs)        -> ECall(f, plt_call_args(f, xs, cx, sc, tail))
+  ELambda(_, _)       -> k
+  _                   -> prc_map_expr_kind(k, (x) => plt_expr(x, cx, sc, false))
+}
+
+fn plt_arm(a: Arm, lends: Bool, cx: PltCx, sc: PltScope, tail: Bool) : Arm = match a {
+  Arm(p, g, b) -> {
+    let sc1 = PltScope { bound: pat_binders(p, sc.bound),
+                         lent: if lends { pat_binders(p, sc.lent) } else { sc.lent } }
+    Arm(p, prc_map_opt_expr(g, (x) => plt_expr(x, cx, sc1, false)), plt_expr(b, cx, sc1, tail))
+  }
+}
+
+# A scrutinee lends its children when it reads a borrowed param (bare or
+# already wrapped by the callee flip) or a child that is itself lent.
+fn plt_scrut_lends(s: Expr, borrowed: [String], lent: [String]) : Bool = match sym_read_kind(s.kind) {
+  EVar(nm)    -> list_has(borrowed, nm) or list_has(lent, nm)
+  ECall(f, _) -> match f.kind { EMark(MkBorrow) -> true  _ -> false }
+  _           -> false
+}
+
+# Only the back-edge takes over a `__perceus_owned_borrow` read: a plain call
+# drops that ref itself after returning. The slot lookup runs only for a call
+# that passes a tracked binder.
+fn plt_call_args(f: Expr, xs: [Expr], cx: PltCx, sc: PltScope, tail: Bool) : [Expr] = {
+  let xs1 = map(xs, (x) => plt_expr(x, cx, sc, false))
+  let back_edge = tail and plt_is_self(f, cx.self_name)
+  let names = if back_edge { sc.lent } else { sc.bound }
+  if plt_any_named(xs1, names, back_edge) {
+    plt_args(xs1, if back_edge { cx.bpos } else { (cx.slots)(f) }, names, back_edge, 0)
+  } else { xs1 }
+}
+
+fn plt_any_named(xs: [Expr], names: [String], back_edge: Bool) : Bool = match xs {
+  []           -> false
+  [a, ...rest] -> plt_names(a, names, back_edge) or plt_any_named(rest, names, back_edge)
+}
+
+fn plt_names(a: Expr, names: [String], back_edge: Bool) : Bool = match sym_read_kind(plt_read(a, back_edge).kind) {
+  EVar(nm) -> list_has(names, nm)
+  _        -> false
+}
+
+# The read an argument makes: on the back-edge, under its owned-borrow mark.
+fn plt_read(a: Expr, back_edge: Bool) : Expr = if back_edge { plt_owned_inner(a) } else { a }
+
+fn plt_is_self(f: Expr, self_name: String) : Bool = match sym_read_kind(f.kind) {
+  EVar(nm)        -> nm == self_name
+  EModCall(_, nm) -> nm == self_name
+  _               -> false
+}
+
+fn plt_args(xs: [Expr], pos: [Int], names: [String], back_edge: Bool, i: Int) : [Expr] = match xs {
+  []           -> []
+  [a, ...rest] -> {
+    let a1 = if list_has_int(pos, i) { plt_arg(a, names, back_edge) } else { a }
+    [a1, ...plt_args(rest, pos, names, back_edge, i + 1)]
+  }
+}
+
+fn plt_arg(a: Expr, names: [String], back_edge: Bool) : Expr =
+  if plt_names(a, names, back_edge) { plt_borrow(plt_read(a, back_edge)) } else { a }
+
+fn plt_owned_inner(a: Expr) : Expr = match a.kind {
+  ECall(f, [x]) -> match f.kind { EMark(MkOwnedBorrow) -> x  _ -> a }
+  _             -> a
+}
+
+fn plt_borrow(a: Expr) : Expr =
+  Expr { kind: ECall(Expr { kind: EMark(MkBorrow), line: a.line, col: a.col, ty: None, mode: MUnknown }, [a]),
+         line: a.line, col: a.col, ty: a.ty, mode: a.mode }
