@@ -61,6 +61,7 @@ import compiler.borrow_view
 import compiler.perceus_raw_slot
 import compiler.perceus_reads
 import compiler.interp_span
+import compiler.perceus_rethread
 
 # ==================================================================
 # Downward glue mirrors (prc_ prefix) — copied verbatim from the
@@ -1652,7 +1653,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # orphan the birth ref.
         let new_body = ptd_tail_exit_drops(new_body0, name, uses, [], branchy_lets,
                                            pcs_borrow_lookup(bmap, pcs_borrow_key(name, mo)))
-        let arm_dropped = pcs_arm_drop_pass(new_body, name, PcsArmCx { uses: uses, moved: [], boxed_bpos: [] })
+        let arm_dropped = pcs_arm_drop_pass(new_body, name, PcsArmCx { uses: uses, moved: [], boxed_bpos: [], borrow_only: [], borrowed: [], bmap: [] })
         let branch_paid = pbp_branch_drops(arm_dropped, map(params, (p) => p.pname), uses)
         let reused_body = pcs_recognise_reuse_expr(branch_paid)
         # Boxed LOCALS can still flow to borrowed callee slots; without the
@@ -1750,13 +1751,16 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # arm that never re-threads owns the container and must free it.
         let borrow_move_params = pcs_collect_borrow_move_last_params(
           name, pnames, body, uses, bmap, borrowed, skip_set)
+        # Arm binders of a borrowed param read only in borrowed slots: released
+        # as their arm starts, every read a borrow.
+        let borrow_only = prt_borrow_only_binders(body, borrowed, (c) => pcs_user_borrow_slots(bmap, c))
         let move_last_set = pcs_strs_minus(
           pcs_list_union(
             pcs_strs_inter(
               pcs_collect_move_last_set(pcs_all_arm_binders(body, []), body, uses, cmap, []),
               safe_arm_binders),
             pcs_collect_move_last_lets(body, uses, cmap, skip_set)),
-          skip_set)
+          pcs_list_union(skip_set, borrow_only))
         # Let-bound opaque handles whose birth ref needs an end-of-scope
         # drop (each shim call consumes a dup; the birth ref is released
         # here, even when the last use is in tail position).
@@ -1796,7 +1800,8 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         let new_body = ptd_tail_exit_drops(new_body1, name, uses, move_last_set, branchy_lets, self_bpos)
         let boxed_bpos = pcs_boxed_positions(self_bpos, params, raw_pnames, 0)
         let arm_dropped = pcs_arm_drop_pass(new_body, name,
-                                            PcsArmCx { uses: uses, moved: rewrite_skip_set, boxed_bpos: boxed_bpos })
+                                            PcsArmCx { uses: uses, moved: rewrite_skip_set, boxed_bpos: boxed_bpos,
+                                                      borrow_only: borrow_only, borrowed: borrowed, bmap: bmap })
         # The branch-local drop, in the arms that never read it, for each
         # param the payer assigns there.
         let param_dropped = pcs_inject_param_branch_drops(arm_dropped,
@@ -1838,7 +1843,8 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # the skip/move/reuse sets (union already includes borrowed + raw
         # params) plus the exit-dropped opaque locals and force-dup'd
         # branchy singles.
-        let no_wrap = pcs_list_union(pcs_list_union(rewrite_skip_set, opaque_lets), branchy_single)
+        let no_wrap = pcs_list_union(pcs_list_union(pcs_list_union(rewrite_skip_set, opaque_lets), branchy_single),
+                                     borrow_only)
         let scx = StripCx { bmap: bmap, borrow_last: borrow_last, bclosures: borrowed_closures,
                             fn_names: fn_names, no_wrap: no_wrap, uses: uses, fns: fns }
         let body_borrow = pcs_strip_borrow_args_d(body_borrow_call, scx)
@@ -4374,7 +4380,17 @@ fn pcs_replace_peeled_match(body: Expr, scr: Expr, arms1: [Arm]) : Expr = {
 # would read, to the branch payer, as its single read.
 # `boxed_bpos` gates the after-args drop: a boxed argument bound in a
 # borrowed self slot would lose the borrow strip's view of it.
-type PcsArmCx = { uses: [Use], moved: [String], boxed_bpos: [Int] }
+# `borrow_only` binders are released on arm entry (`perceus_rethread`); an
+# arm re-checks its own, since two scopes may bind one name.
+type PcsArmCx = { uses: [Use], moved: [String], boxed_bpos: [Int], borrow_only: [String],
+                  borrowed: [String], bmap: [BorrowEntry] }
+
+# A user fn's borrowed positions; a borrowing prim keeps its own
+# consuming-last-use rule, so it lends no slot here.
+fn pcs_user_borrow_slots(bmap: [BorrowEntry], callee: String) : [Int] = match pcs_prim_borrow_variant(callee) {
+  Some(_) -> []
+  None    -> pcs_borrow_lookup(bmap, callee)
+}
 
 fn pcs_boxed_positions(bpos: [Int], params: [Param], raw: [String], i: Int) : [Int] = match params {
   []           -> []
@@ -4387,13 +4403,16 @@ fn pcs_boxed_positions(bpos: [Int], params: [Param], raw: [String], i: Int) : [I
 fn pcs_arm_drop_pass(e: Expr, fn_name: String, cx: PcsArmCx) : Expr = {
   let k1 = prc_map_expr_kind(e.kind, (c) => pcs_arm_drop_pass(c, fn_name, cx))
   let k2 = match k1 {
-    EMatch(scr, arms) -> EMatch(scr, map(arms, (a) => pcs_arm_drops_of(a, fn_name, cx)))
+    EMatch(scr, arms) -> {
+      let on_param = prt_scr_is_param(scr, cx.borrowed)
+      EMatch(scr, map(arms, (a) => pcs_arm_drops_of(a, fn_name, cx, on_param)))
+    }
     _                 -> k1
   }
   Expr { kind: k2, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 }
 
-fn pcs_arm_drops_of(a: Arm, fn_name: String, cx: PcsArmCx) : Arm = match a {
+fn pcs_arm_drops_of(a: Arm, fn_name: String, cx: PcsArmCx, on_param: Bool) : Arm = match a {
   Arm(pat0, g_rw, body1) -> {
     # For a block body the drop sits between statements and tail, so a
     # tail read must be skipped; a non-block body is wrapped and runs first.
@@ -4403,7 +4422,11 @@ fn pcs_arm_drops_of(a: Arm, fn_name: String, cx: PcsArmCx) : Arm = match a {
     # reuse recogniser.
     let elide = pcs_arm_elide_names(pat0, cx.uses, [])
     let pat = pcs_pat_elide(pat0, elide)
-    let bound = pcs_strs_minus(prc_pat_bindings(pat0, []), elide)
+    let bound_all = pcs_strs_minus(prc_pat_bindings(pat0, []), elide)
+    let entry = if on_param {
+      pcs_strs_inter(prt_arm_borrow_only(pat0, g_rw, body1, (c) => pcs_user_borrow_slots(cx.bmap, c)), cx.borrow_only)
+    } else { [] }
+    let bound = pcs_strs_minus(bound_all, entry)
     let drops = pcs_collect_arm_drops(bound, pat.line, pat.col, body1, g_rw, cx, pre_tail, [])
     let owed_ok = match cx.boxed_bpos { [] -> true  _ -> false }
     let body2 = match drops {
@@ -4411,12 +4434,17 @@ fn pcs_arm_drops_of(a: Arm, fn_name: String, cx: PcsArmCx) : Arm = match a {
       [_, ...__] -> pcs_inject_arm_drops(body1, drops, fn_name, owed_ok)
     }
     let body3 = pcs_arm_tail_drop_body(body2, bound, pat.line, pat.col, g_rw, cx.uses, fn_name, owed_ok)
+    let body4 = match entry {
+      [] -> body3
+      _  -> Expr { kind: EBlock(map(entry, (nm) => pcs_make_drop_stmt(nm, pat.line, pat.col)), Some(body3)),
+                   line: body3.line, col: body3.col, ty: body3.ty, mode: body3.mode }
+    }
     # A falsy guard leaves the arm without running the body or its exits.
     let g1 = match g_rw {
       None    -> None
-      Some(g) -> Some(pcs_guard_close_births(g, bound))
+      Some(g) -> Some(pcs_guard_close_births(g, bound_all))
     }
-    Arm(pat, g1, body3)
+    Arm(pat, g1, body4)
   }
 }
 
