@@ -1,0 +1,163 @@
+#[doc("""
+The identity side of protocol dispatch.
+
+An impl entry names the type it is for twice: by the bare name the
+source wrote, and by the declaration that name denotes from the impl's
+module. A call dispatches on its receiver's type the same way — the
+head's name and the `TyCon`'s identity. An entry serves a receiver only
+when both agree, so a root `Pair` and `core.tuple.Pair` share a name
+and never an impl.
+
+The registry is stamped with the resolver the typer stamps `TyCon`s
+with, over the same table, so the two identities agree by construction
+rather than by comparing spellings.
+
+Two impls may still mint the same function symbol, one for each of two
+homonymous types. A root impl's symbol then names the root module in
+its type part: the root file is read last, so no other module's symbols
+depend on how the root spells its own.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.impl_index
+import compiler.tycon_scheme_home
+
+#[doc("A dispatch receiver: its head name and the identity of the declaration it names (`sym_none()` for a head with no declaration).")]
+pub type DispHead = DispHead(String, SymId)
+
+#[doc("The head name of a dispatch receiver.")]
+pub fn dh_name(h: DispHead) : String = match h { DispHead(n, _) -> n }
+
+#[doc("The head names of a list of dispatch receivers.")]
+pub fn dh_names(hs: [DispHead]) : [String] = map(hs, dh_name)
+
+#[doc("True when two dispatch receivers name the same declaration under the same head.")]
+pub fn dh_same(a: DispHead, b: DispHead) : Bool = match a {
+  DispHead(an, asym) -> match b {
+    DispHead(bn, bsym) -> an == bn and sym_raw(asym) == sym_raw(bsym)
+  }
+}
+
+#[doc("The function symbol an impl entry mints.")]
+pub fn pir_sym(p: ProtoImplReg) : String = match p { PIR(_, _, _, m, _, _, _, _) -> m }
+
+#[doc("The identity a type's dispatch head carries: the `TyCon`'s id, looking through units and refinements.")]
+pub fn ty_head_sym(t: Ty) : SymId = match t {
+  TyCon(_, _, _, s)  -> s
+  TyDimT(base, _)    -> ty_head_sym(base)
+  TyRefineT(base, _) -> ty_head_sym(base)
+  _ -> sym_none()
+}
+
+#[doc("True when `p` is an impl for the receiver `h`: the same head name and the same declaration.")]
+pub fn pir_serves(p: ProtoImplReg, h: DispHead) : Bool = match p {
+  PIR(_, t, _, _, _, _, _, s) -> match h {
+    DispHead(n, hs) -> t == n and sym_raw(s) == sym_raw(hs)
+  }
+}
+
+#[doc("The registry with every impl entry stamped with its target type's identity, read from `homes` at the impl's own module.")]
+pub fn reg_with_target_ids(reg: ProtocolReg, homes: TyHomes) : ProtocolReg = {
+  let impls = map(reg.impls, (p) => pir_stamp(p, homes))
+  ProtocolReg { ops: reg.ops, impls: impls, op_names: reg.op_names,
+                tparams: reg.tparams, origins: reg.origins, dkeys: reg.dkeys,
+                impl_index: build_impl_index(impls), cores: reg.cores,
+                imports: reg.imports }
+}
+
+fn pir_stamp(p: ProtoImplReg, homes: TyHomes) : ProtoImplReg = match p {
+  PIR(k, t, o, m, ans, rh, home, _) ->
+    PIR(k, t, o, m, ans, rh, home, tsh_sym(tsh_view(homes, home), t))
+}
+
+#[doc("The head of an impl method's declared return type; empty when the entry records none.")]
+pub fn pir_ret_head(p: ProtoImplReg) : String = match p { PIR(_, _, _, _, _, rh, _, _) -> rh }
+
+#[doc("The type an impl method's call returns, headed by its declared return: the target's own identity when that head is the target, none otherwise.")]
+pub fn pir_ret_ty(p: ProtoImplReg) : Option[Ty] = match p {
+  PIR(_, t, _, _, _, rh, _, s) ->
+    if rh == "" { None }
+    else { Some(TyCon(None, rh, [], if rh == t { s } else { sym_none() })) }
+}
+
+#[doc("An impl symbol minted by two impl entries of distinct homes: the old spelling and the one the root entry takes instead.")]
+pub type ImplRename = ImplRename(String, String)
+
+#[doc("The renames that keep every impl symbol unique: each root entry whose symbol a non-root entry also mints takes the root module into its type part.")]
+pub fn impl_symbol_renames(impls: [ProtoImplReg], root: String) : [ImplRename] =
+  isr_collect(impls, impls, root, [])
+
+fn isr_collect(ps: [ProtoImplReg], all: [ProtoImplReg], root: String,
+      acc: [ImplRename]) : [ImplRename] = match ps {
+  [] -> acc
+  [p, ...rest] -> match p {
+    PIR(k, t, _, m, _, _, None, _) ->
+      if isr_minted_elsewhere(all, m) and not isr_has(acc, m) {
+        isr_collect(rest, all, root, [ImplRename(m, isr_spell(k, t, m, root)), ...acc])
+      } else { isr_collect(rest, all, root, acc) }
+    _ -> isr_collect(rest, all, root, acc)
+  }
+}
+
+fn isr_minted_elsewhere(ps: [ProtoImplReg], m: String) : Bool = match ps {
+  [] -> false
+  [PIR(_, _, _, qm, _, _, qh, _), ...rest] -> match qh {
+    Some(_) -> if qm == m { true } else { isr_minted_elsewhere(rest, m) }
+    None    -> isr_minted_elsewhere(rest, m)
+  }
+}
+
+fn isr_has(rs: [ImplRename], m: String) : Bool = match rs {
+  [] -> false
+  [ImplRename(o, _), ...rest] -> if o == m { true } else { isr_has(rest, m) }
+}
+
+# `__pimpl_<key>_<type>` leads every impl symbol; the root module goes
+# right after the type, so the op and any proto-arg suffix stay put.
+fn isr_spell(k: String, t: String, m: String, root: String) : String = {
+  let head = concat_all(["__pimpl_", k, "_", t])
+  let n = string_length(head)
+  concat_all([head, "__", root, string_slice(m, n, string_length(m) - n)])
+}
+
+#[doc("The spelling `m` takes under `rs`, or `m` itself.")]
+pub fn impl_renamed(rs: [ImplRename], m: String) : String = match rs {
+  [] -> m
+  [ImplRename(o, n), ...rest] -> if o == m { n } else { impl_renamed(rest, m) }
+}
+
+#[doc("The registry with each renamed root entry minting its new symbol.")]
+pub fn reg_with_renames(reg: ProtocolReg, rs: [ImplRename]) : ProtocolReg = match rs {
+  [] -> reg
+  _  -> ProtocolReg { ops: reg.ops, impls: map(reg.impls, (p) => pir_renamed(p, rs)),
+                      op_names: reg.op_names, tparams: reg.tparams,
+                      origins: reg.origins, dkeys: reg.dkeys,
+                      impl_index: reg.impl_index, cores: reg.cores,
+                      imports: reg.imports }
+}
+
+fn pir_renamed(p: ProtoImplReg, rs: [ImplRename]) : ProtoImplReg = match p {
+  PIR(k, t, o, m, ans, rh, None, s) -> PIR(k, t, o, impl_renamed(rs, m), ans, rh, None, s)
+  _ -> p
+}
+
+#[doc("The root file's declarations with each renamed impl symbol spelled anew, at its definition and at every reference. A bare name read in the root file denotes the root's own declaration, so the rename changes no reference's meaning.")]
+pub fn decls_with_renames(ds: [Decl], rs: [ImplRename]) : [Decl] = match rs {
+  [] -> ds
+  _  -> map(ds, (d) => decl_renamed(d, rs))
+}
+
+fn decl_renamed(d: Decl, rs: [ImplRename]) : Decl = match d {
+  DFn(p, n, tp, ps, rt, row, body, l, c, None, s) ->
+    DFn(p, impl_renamed(rs, n), tp, ps, rt, row, expr_renamed(body, rs), l, c, None, s)
+  _ -> d
+}
+
+fn expr_renamed(e: Expr, rs: [ImplRename]) : Expr =
+  Expr { kind: kind_renamed(e.kind, rs), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn kind_renamed(k: ExprKind, rs: [ImplRename]) : ExprKind = match k {
+  EVar(n) -> EVar(impl_renamed(rs, n))
+  _ -> prc_map_expr_kind(k, (sub) => expr_renamed(sub, rs))
+}
