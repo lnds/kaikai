@@ -567,7 +567,9 @@ worth noting so the syntax is not mystery:
 - `Eff.op(args)` resolves the handler by the effect's **class**
   (`docs/dispatch-honesty-targets.md`): a user / value-transportable
   effect reads the evidence the caller supplied (a frame slot it
-  filled, or the capability value of a named instance) — no walk; a
+  filled, or the capability value of a named instance) — no walk,
+  except inside a `handle` of that effect in the same function, where
+  the lexically enclosing handler wins over the caller's slot; a
   fiber-local builtin (`Cancel`/`Link`/`Monitor`/`Spawn`/`Actor`)
   resolves through the runtime's per-fiber disposition; a frameless
   perform of a default-bearing builtin (e.g. in `main`) falls to the

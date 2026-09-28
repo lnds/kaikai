@@ -20,7 +20,10 @@ effects; a bounded runtime lookup retained for fiber-local builtins and Ffi.**
 A user effect's op call resolves through the evidence the caller supplied — a
 frame slot (`__evf[]`) the call site fills, or, for a named instance, the
 capability value bound to `kai_<name>` (the handle's own evidence node, or a
-`c: Eff` parameter). No walk, no name match. The fiber-local builtins
+`c: Eff` parameter). No walk, no name match — except inside a `handle` of the
+same effect in the function itself: there the lexically enclosing handler
+wins, so the op (and any call made there) resolves through the stack lookup,
+not the caller's slot. The fiber-local builtins
 (`Cancel`/`Link`/`Monitor`/`Spawn`/`Actor`) resolve through the runtime's
 per-fiber disposition (`kai_evidence_lookup_node`), because their handler is
 installed inside the fiber and must not cross a `spawn`. `Ffi` is a zero-op
