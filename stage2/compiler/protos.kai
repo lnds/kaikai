@@ -93,6 +93,8 @@ import compiler.diag
 import compiler.util
 import compiler.fnreg
 import compiler.impl_index
+import compiler.impl_identity
+import compiler.scope_view
 import compiler.modules
 import compiler.proto_key
 import compiler.proto_resolve
@@ -645,7 +647,7 @@ fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
           PkHome(Some(m)) -> m
           _ -> ""
         }
-        let key = concat_all([mo_key, "!", pname, "/", tname, "[",
+        let key = concat_all([mo_key, "!", pname, "/", impl_target_key(ps, tname, from), "[",
                               arg_names_mangle(arg_names), "]"])
         let proto_local = list_has(proto_names, pname)
         let type_local = list_has(local_types, tname) or
@@ -1150,7 +1152,7 @@ fn lower_impls(ds: [Decl], reg: ProtocolReg, ps: PScope, acc_fns: [Decl]) : Lowe
           PkHome(ph) -> proto_key_of(reg.dkeys, pname, ph)
           _ -> pname
         }
-        let r = lower_impl_methods(key, tname, arg_names, methods, reg, acc_fns)
+        let r = lower_impl_methods(key, tname, arg_names, from, methods, reg, acc_fns)
         lower_impls(rest, r.reg, ps, r.fns)
       }
       DDerive(_, inner, _, _) -> lower_impls([inner, ...rest], reg, ps, acc_fns)
@@ -1162,6 +1164,15 @@ fn lower_impls(ds: [Decl], reg: ProtocolReg, ps: PScope, acc_fns: [Decl]) : Lowe
     }
   }
 }
+
+# The declaration a duplicate check compares: what the impl's module
+# sees under the target's name. Every impl resolves in the same table,
+# so the ids compare with each other; they never meet a `TyCon`'s.
+fn impl_target_key(ps: PScope, tname: String, from: Option[String]) : String =
+  match sv_resolve(ps_tab(ps), ps_view(ps, from), NCType, tname) {
+    SvSym(s) -> concat_all([tname, "#", int_to_string(sym_raw(s))])
+    _        -> tname
+  }
 
 # The module an impl block lives in, read off its first method's
 # origin stamp (the cascade tags every method with the enclosing
@@ -1181,7 +1192,7 @@ type LowerImplsRes = { reg: ProtocolReg, fns: [Decl] }
 # return. `pkey` is the impl's protocol dispatch key, not necessarily
 # the surface name — mangling and the PIR entry both carry it.
 fn lower_impl_methods(pkey: String, tname: String, arg_names: [String],
-                      methods: [Decl],
+                      home: Option[String], methods: [Decl],
                       reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
   match methods {
     [] -> LowerImplsRes { reg: reg, fns: acc_fns }
@@ -1194,7 +1205,7 @@ fn lower_impl_methods(pkey: String, tname: String, arg_names: [String],
         let mangled = proto_impl_mangled_with_args(pkey, tname, op_name, arg_names)
         let new_fn = DFn(false, mangled, tparams, params, ret, row, body, line, col, mo, sym_none())
         let ret_head = match ret { Some(rte) -> proto_type_name(rte)  None -> tname }
-        let entry = PIR(pkey, tname, op_name, mangled, arg_names, ret_head)
+        let entry = PIR(pkey, tname, op_name, mangled, arg_names, ret_head, home, sym_none())
         let reg1 = ProtocolReg {
           ops: reg.ops,
           impls: [entry, ...reg.impls],
@@ -1205,9 +1216,9 @@ fn lower_impl_methods(pkey: String, tname: String, arg_names: [String],
           impl_index: reg.impl_index,
           cores: reg.cores, imports: reg.imports
         }
-        lower_impl_methods(pkey, tname, arg_names, rest, reg1, [new_fn, ...acc_fns])
+        lower_impl_methods(pkey, tname, arg_names, home, rest, reg1, [new_fn, ...acc_fns])
       }
-      _ -> lower_impl_methods(pkey, tname, arg_names, rest, reg, acc_fns)
+      _ -> lower_impl_methods(pkey, tname, arg_names, home, rest, reg, acc_fns)
     }
   }
 }
@@ -3489,10 +3500,13 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   let local_fns = collect_local_fn_arities_mo(stripped)
   let user_renamed = rename_proto_calls_decls_mo(stripped, raw_op_arities, core_op_arities, local_fns, target_mod, imports)
   let impl_renamed = rename_proto_calls_decls_mo(lower_res.fns, raw_op_arities, core_op_arities, local_fns, target_mod, imports)
-  let final_decls = list_append(user_renamed, list_append(impl_renamed, dispatchers))
+  # Two homonymous types' impls mint one symbol; the root entry's is
+  # respelled so every impl function keeps a name of its own.
+  let renames = impl_symbol_renames(lower_res.reg.impls, target_mod)
+  let final_decls = decls_with_renames(list_append(user_renamed, list_append(impl_renamed, dispatchers)), renames)
   # Index the now-final impl table once; the post-inference rewrite's
   # per-spec scans consult it instead of walking `reg.impls` linearly.
-  let indexed_reg = reg_with_impl_index(lower_res.reg)
+  let indexed_reg = reg_with_impl_index(reg_with_renames(lower_res.reg, renames))
   LoweredProtocols { decls: final_decls, reg: indexed_reg, errs: errs }
 }
 
@@ -4292,23 +4306,23 @@ fn resolve_protocol_calls_expr(e: Expr, reg: ProtocolReg,
 }
 
 # When `kind` is a rewritten `ECall(EVar("__pimpl_..."), _)` whose impl
-# declares a return head differing from `cur_ty`, return the corrected
-# `Some(TyCon(None, ret_head, []))`. Otherwise return `cur_ty` unchanged.
+# declares a return head differing from `cur_ty`, return the impl's
+# return type. Otherwise return `cur_ty` unchanged.
 fn proto_rewrite_corrected_ty(kind: ExprKind, cur_ty: Option[Ty], reg: ProtocolReg) : Option[Ty] {
   match kind {
     ECall(callee, _) -> match callee.kind {
       EVar(sym) -> {
         let pool = if ii_built(reg.impl_index) { ii_sym_bucket(reg.impl_index, sym) }
                    else { reg.impls }
-        let rh = impl_ret_head_by_sym(pool, sym)
-        if rh == "" { cur_ty }
-        else {
-          let cur_head = match cur_ty {
-            Some(t) -> match ty_head_name(t) { Some(n) -> n  None -> "" }
-            None    -> ""
+        match pir_by_sym(pool, sym) {
+          None -> cur_ty
+          Some(p) -> {
+            let cur_head = match cur_ty {
+              Some(t) -> match ty_head_name(t) { Some(n) -> n  None -> "" }
+              None    -> ""
+            }
+            if pir_ret_head(p) == cur_head { cur_ty } else { pir_ret_ty(p) }
           }
-          if rh == cur_head { cur_ty }
-          else { Some(TyCon(None, rh, [], sym_none())) }
         }
       }
       _ -> cur_ty
@@ -4317,15 +4331,12 @@ fn proto_rewrite_corrected_ty(kind: ExprKind, cur_ty: Option[Ty], reg: ProtocolR
   }
 }
 
-# Find the registered impl whose mangled fn name is `sym` and return
-# its declared return head; "" when `sym` is not an impl symbol.
-fn impl_ret_head_by_sym(impls: [ProtoImplReg], sym: String) : String {
+# The registered impl whose fn symbol is `sym`; none when `sym` is not
+# an impl symbol. Impl symbols are unique, so the first hit is the one.
+fn pir_by_sym(impls: [ProtoImplReg], sym: String) : Option[ProtoImplReg] {
   match impls {
-    [] -> ""
-    [it, ...rest] -> match it {
-      PIR(_, _, _, mg, _, rh) ->
-        if mg == sym { rh } else { impl_ret_head_by_sym(rest, sym) }
-    }
+    [] -> None
+    [it, ...rest] -> if pir_sym(it) == sym { Some(it) } else { pir_by_sym(rest, sym) }
   }
 }
 
@@ -4376,10 +4387,10 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
 # builtin EBinop (which lowers to kai_op_eq_v / direct compare).
 fn prc_rewrite_cmp_binop(op: String, l: Expr, r: Expr, reg: ProtocolReg) : ExprKind {
   if op == "==" or op == "!=" {
-    match prc_cmp_custom_head(reg, "Eq", l.ty) {
+    match prc_cmp_impl(reg, "Eq", "eq", l.ty) {
       None -> EBinop(op, l, r)
-      Some(head) -> {
-        let mangled = concat_all(["__pimpl_Eq_", head, "_eq"])
+      Some(p) -> {
+        let mangled = pir_sym(p)
         let eqcall = prc_mk_ty(ECall(mk_ref(mangled, l.line, l.col), [l, r]),
                                l.line, l.col, Some(TyBool))
         if op == "==" {
@@ -4390,10 +4401,10 @@ fn prc_rewrite_cmp_binop(op: String, l: Expr, r: Expr, reg: ProtocolReg) : ExprK
       }
     }
   } else if op == "<" or op == ">" or op == "<=" or op == ">=" {
-    match prc_cmp_custom_head(reg, "Ord", l.ty) {
+    match prc_cmp_impl(reg, "Ord", "cmp", l.ty) {
       None -> EBinop(op, l, r)
-      Some(head) -> {
-        let mangled = concat_all(["__pimpl_Ord_", head, "_cmp"])
+      Some(p) -> {
+        let mangled = pir_sym(p)
         let cmpcall = prc_mk_ty(ECall(mk_ref(mangled, l.line, l.col), [l, r]),
                                 l.line, l.col, Some(TyInt))
         let zero = prc_mk_ty(mk_int_synth(0), l.line, l.col, Some(TyInt))
@@ -4411,28 +4422,18 @@ fn prc_rewrite_cmp_binop(op: String, l: Expr, r: Expr, reg: ProtocolReg) : ExprK
 fn prc_mk_ty(k: ExprKind, line: Int, col: Int, ty: Option[Ty]) : Expr =
   Expr { kind: k, line: line, col: col, ty: ty, mode: MUnknown }
 
-# Head type name iff `proto` (Eq / Ord) has a user `impl proto for T`
-# registered for the operand's root type. `None` when the type is
-# fully structural (no custom impl) or unresolved → keep the builtin.
-# v1 checks the root type only; a contained field with a custom impl
-# is a documented follow-up (the compiler's own comparisons are all
-# fully structural, so root-only suffices for self-host correctness).
-fn prc_cmp_custom_head(reg: ProtocolReg, proto: String, ty: Option[Ty]) : Option[String] {
-  match ty {
-    None -> None
-    Some(t) -> match prc_ty_head_name(t) {
-      None -> None
-      Some(head) ->
-        if prc_reg_has_impl(reg, proto, head) { Some(head) } else { None }
-    }
-  }
-}
-
-# Root head name of a Ty, for impl-table lookup. Only nominal TyCon
-# heads can carry a user impl; everything else returns None.
-fn prc_ty_head_name(t: Ty) : Option[String] {
-  match t {
-    TyCon(_, name, _, _) -> Some(name)
+# The `impl proto` entry serving the operand's root type, by the type's
+# identity. `None` when the type is fully structural (no custom impl)
+# or unresolved → keep the builtin. v1 checks the root type only; a
+# contained field with a custom impl is a documented follow-up (the
+# compiler's own comparisons are all fully structural, so root-only
+# suffices for self-host correctness).
+fn prc_cmp_impl(reg: ProtocolReg, proto: String, opname: String,
+                ty: Option[Ty]) : Option[ProtoImplReg] = match ty {
+  None -> None
+  Some(t) -> match t {
+    TyCon(_, name, _, s) ->
+      find_impl_for(impl_pool(reg, proto, name), proto, DispHead(name, s), opname)
     _ -> None
   }
 }
@@ -4441,21 +4442,17 @@ fn prc_ty_head_name(t: Ty) : Option[String] {
 # narrows the scan to the `(proto, head)` bucket; the same membership
 # predicate then runs over that short list (or the full table when the
 # index is the unbuilt placeholder), so the answer is unchanged.
-#[doc("True iff `reg` holds an `impl proto for head` entry (user or derive-synthesised); O(1) via the impl index when built.")]
-pub fn prc_reg_has_impl(reg: ProtocolReg, proto: String, head: String) : Bool =
-  if ii_built(reg.impl_index) {
-    prc_impls_has(ii_key_bucket(reg.impl_index, proto, head), proto, head)
-  } else {
-    prc_impls_has(reg.impls, proto, head)
-  }
+#[doc("True iff `reg` holds an `impl proto` entry for the receiver `h` (user or derive-synthesised); O(1) via the impl index when built.")]
+pub fn prc_reg_has_impl(reg: ProtocolReg, proto: String, h: DispHead) : Bool =
+  prc_impls_has(impl_pool(reg, proto, dh_name(h)), proto, h)
 
-fn prc_impls_has(impls: [ProtoImplReg], proto: String, head: String) : Bool {
+fn prc_impls_has(impls: [ProtoImplReg], proto: String, h: DispHead) : Bool {
   match impls {
     [] -> false
     [pir, ...rest] -> match pir {
-      PIR(p, t, _, _, _, _) ->
-        if p == proto and t == head { true }
-        else { prc_impls_has(rest, proto, head) }
+      PIR(p, _, _, _, _, _, _, _) ->
+        if p == proto and pir_serves(pir, h) { true }
+        else { prc_impls_has(rest, proto, h) }
     }
   }
 }
@@ -4721,19 +4718,19 @@ fn validate_proto_call_at(e: Expr, reg: ProtocolReg, cm: Option[String], file: S
             [] -> errs
             [self_arg, ..._rest_args] -> match self_arg.ty {
               None -> errs
-              Some(ty) -> match ty_head_name(ty) {
+              Some(ty) -> match ty_disp_head(ty) {
                 None -> errs
                 # Collision-aware: an impl under ANY protocol declaring
                 # `opname` clears the call (the bare name carries no
                 # protocol, so `Ring.add` and `Add.add` are both valid
                 # targets for `add`).
-                Some(tname) -> match find_impl_any_proto(reg, opname, tname, cm) {
+                Some(h) -> match find_impl_any_proto(reg, opname, h, cm) {
                   Some(_) -> validate_dispatch_unique(e, args_, reg, cm, opname, file, errs)
                   None -> {
                     let pname = first_proto_of_op(reg, opname)
                     diag_error(file, e.line, e.col,
                       concat_all(["no impl of `", pname,
-                                  "` for type `", tname,
+                                  "` for type `", dh_name(h),
                                   "` (operation `", opname, "`)"]))
                     errs + 1
                   }
@@ -5144,9 +5141,9 @@ fn validate_inv_clauses(cs: [HClause], file: String, bound: [String],
 # Returns None when the shapes do not align (the inferred return is
 # still a tyvar, or a structural mismatch the unifier would have
 # already rejected).
-fn self_head_in_ret(declared: TypeExpr, inferred: Ty) : Option[String] {
+fn self_head_in_ret(declared: TypeExpr, inferred: Ty) : Option[DispHead] {
   let n = te_self_count(declared)
-  if n == 0 { ty_head_name(inferred) }
+  if n == 0 { ty_disp_head(inferred) }
   else if n == 1 { align_self_head(declared, inferred) }
   else { None }
 }
@@ -5180,10 +5177,10 @@ fn te_list_self_count(tes: [TypeExpr]) : Int = match tes {
 # the same constructor at every step (the typer already unified them),
 # so the walk pairs children positionally and recurses until it lands
 # on the `Self` leaf.
-fn align_self_head(declared: TypeExpr, inferred: Ty) : Option[String] {
+fn align_self_head(declared: TypeExpr, inferred: Ty) : Option[DispHead] {
   match declared.tkind {
     TyName(name, targs) ->
-      if name == "Self" { ty_head_name(inferred) }
+      if name == "Self" { ty_disp_head(inferred) }
       else { align_self_in_args(targs, ty_con_args(inferred)) }
     TyList(inner) -> {
       match inferred {
@@ -5202,7 +5199,7 @@ fn align_self_head(declared: TypeExpr, inferred: Ty) : Option[String] {
 
 # Walk paired declared/inferred argument lists; the one carrying `Self`
 # (guaranteed unique by the `te_self_count == 1` gate) yields the head.
-fn align_self_in_args(decls: [TypeExpr], infs: [Ty]) : Option[String] {
+fn align_self_in_args(decls: [TypeExpr], infs: [Ty]) : Option[DispHead] {
   match decls {
     [] -> None
     [d, ...drest] -> {
@@ -5282,7 +5279,7 @@ fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
               # candidate against its own return-derived Self type.
               # Decline while any argument's type is still unresolved
               # (no head) — dispatching then would be premature.
-              match args_head_names(args_) {
+              match args_disp_heads(args_) {
                 None -> None
                 Some(_) ->
                   try_rewrite_ret_candidates(proto_cands_own_first(proto_ops_lookup_all(reg, opname), cm),
@@ -5338,10 +5335,10 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
           match self_head_in_ret(ret_te, ret_ty) {
             None -> try_rewrite_ret_candidates(rest, callee, args_, reg, cm,
                                                opname, ret_ty)
-            Some(self_name) ->
-              match find_impl_by_recv(impl_pool(reg, pkey, self_name), pkey, opname, self_name) {
-                Some(impl_fn) -> {
-                  let new_callee = mk_ref(impl_fn, callee.line, callee.col)
+            Some(self_head) ->
+              match find_impl_by_recv(impl_pool(reg, pkey, dh_name(self_head)), pkey, opname, self_head) {
+                Some(p) -> {
+                  let new_callee = mk_ref(pir_sym(p), callee.line, callee.col)
                   Some(ECall(new_callee, args_))
                 }
                 None -> try_rewrite_ret_candidates(rest, callee, args_, reg, cm,
@@ -5422,8 +5419,8 @@ fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
   if proto_matches_ambiguous(ms) { None }
   else { match ms {
     [] -> None
-    [PMatch(_, _, impl_fn), ..._] ->
-      Some(ECall(mk_ref(impl_fn, callee.line, callee.col), args_))
+    [PMatch(_, _, p), ..._] ->
+      Some(ECall(mk_ref(pir_sym(p), callee.line, callee.col), args_))
   } }
 }
 
@@ -5437,7 +5434,7 @@ fn proto_matches_for(cands: [ProtoOpReg], args_: [Expr], reg: ProtocolReg,
   proto_ranked_matches(cands, cm, reg.cores, (po) => proto_serves(po, args_, reg, cm, opname))
 
 fn proto_serves(po: ProtoOpReg, args_: [Expr], reg: ProtocolReg,
-                cm: Option[String], opname: String) : Option[String] = match po {
+                cm: Option[String], opname: String) : Option[ProtoImplReg] = match po {
   POR(pname, _, params, ret, _, _, pmo) -> {
     let skip = list_length(params) != list_length(args_) or
                not proto_visible_from(reg.origins, pname, pmo, cm) or
@@ -5567,24 +5564,23 @@ fn impl_pool(reg: ProtocolReg, pname: String, recv: String) : [ProtoImplReg] =
 # own tparam list — a contested name must not read a homonym's.
 fn find_proto_impl_for_args(reg: ProtocolReg, pkey: String, pname: String,
                              pmo: Option[String], opname: String,
-                             args_: [Expr]) : Option[String] {
+                             args_: [Expr]) : Option[ProtoImplReg] {
   # A `Shape`-carrier protocol dispatches single, on the container arg;
   # its ops carry ordinary function parameters (`map(xs, f)`) whose types
   # have no dispatch head. Read the head from the first container-typed
   # argument and ignore the rest, so a function arg does not veto the
-  # lookup the way `args_head_names` (all-or-nothing) would.
+  # lookup the way `args_disp_heads` (all-or-nothing) would.
   if proto_is_shape_carrier_at(reg.tparams, pname, pmo) {
     match first_container_head(args_) {
       None -> None
-      Some(a) -> find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
+      Some(a) -> find_impl_homogeneous(impl_pool(reg, pkey, dh_name(a)), pkey, opname, a)
     }
   } else {
-  let names = args_head_names(args_)
-  match names {
+  match args_disp_heads(args_) {
     None -> None
     Some(ns) -> match ns {
       [] -> None
-      [a] -> find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
+      [a] -> find_impl_homogeneous(impl_pool(reg, pkey, dh_name(a)), pkey, opname, a)
       [a, b] -> {
         # A `Shape` carrier is the single dispatch container, NOT a
         # heterogeneous proto-arg — its ops (`map(xs, f)`) take an
@@ -5597,39 +5593,39 @@ fn find_proto_impl_for_args(reg: ProtocolReg, pkey: String, pname: String,
           # op shape (`Numeric.pow_int(Self, Int)` etc.). Only the
           # homogeneous (recv=a) lookup applies; the second arg is
           # not a proto-arg.
-          find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
+          find_impl_homogeneous(impl_pool(reg, pkey, dh_name(a)), pkey, opname, a)
         } else {
           # Pass 1a: heterogeneous (recv=a, proto_args=[b]) — covers
           #          `impl Add[Real] for Complex` for Complex + Real.
           # Pass 1b: homogeneous (recv=a) — covers `impl Add for
           #          Complex` for Complex + Complex.
-          match find_impl_with_args(impl_pool(reg, pkey, a), pkey, opname, a, [b]) {
-            Some(fn_name) -> Some(fn_name)
+          match find_impl_with_args(impl_pool(reg, pkey, dh_name(a)), pkey, opname, a, [b]) {
+            Some(hit) -> Some(hit)
             None -> {
-              match find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a) {
-                Some(fn_name) ->
-                  if a == b { Some(fn_name) }
-                  else { find_impl_with_args(impl_pool(reg, pkey, b), pkey, opname, b, [a]) }
-                None -> find_impl_with_args(impl_pool(reg, pkey, b), pkey, opname, b, [a])
+              match find_impl_homogeneous(impl_pool(reg, pkey, dh_name(a)), pkey, opname, a) {
+                Some(hit) ->
+                  if dh_same(a, b) { Some(hit) }
+                  else { find_impl_with_args(impl_pool(reg, pkey, dh_name(b)), pkey, opname, b, [a]) }
+                None -> find_impl_with_args(impl_pool(reg, pkey, dh_name(b)), pkey, opname, b, [a])
               }
             }
           }
         }
       }
-      [a, ..._rest] -> find_impl_homogeneous(impl_pool(reg, pkey, a), pkey, opname, a)
+      [a, ..._rest] -> find_impl_homogeneous(impl_pool(reg, pkey, dh_name(a)), pkey, opname, a)
     }
   }
   }
 }
 
-# The head name of the first argument that carries a concrete type
+# The dispatch head of the first argument that carries a concrete type
 # constructor (a container), skipping function-typed and unresolved
 # args. This is the dispatch receiver for a `Shape`-carrier op.
-fn first_container_head(args_: [Expr]) : Option[String] = match args_ {
+fn first_container_head(args_: [Expr]) : Option[DispHead] = match args_ {
   [] -> None
   [e, ...rest] -> match e.ty {
-    Some(ty) -> match ty_head_name(ty) {
-      Some(n) -> Some(n)
+    Some(ty) -> match ty_disp_head(ty) {
+      Some(h) -> Some(h)
       None    -> first_container_head(rest)
     }
     None -> first_container_head(rest)
@@ -5640,13 +5636,14 @@ fn first_container_head(args_: [Expr]) : Option[String] = match args_ {
 # is exactly `[recv]` (homogeneous parametrised form). Heterogeneous
 # entries are skipped.
 fn find_impl_homogeneous(impls: [ProtoImplReg], pname: String,
-                          opname: String, recv: String) : Option[String] {
+                          opname: String, recv: DispHead) : Option[ProtoImplReg] {
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, t, o, fn_name, ans, _) ->
-        if p == pname and t == recv and o == opname and is_homogeneous_args(ans, recv) {
-          Some(fn_name)
+      PIR(p, _, o, _, ans, _, _, _) ->
+        if p == pname and o == opname and pir_serves(it, recv) and
+           is_homogeneous_args(ans, dh_name(recv)) {
+          Some(it)
         } else {
           find_impl_homogeneous(rest, pname, opname, recv)
         }
@@ -5660,28 +5657,32 @@ fn is_homogeneous_args(reg_args: [String], recv: String) : Bool = match reg_args
   _ -> false
 }
 
-fn args_head_names(args_: [Expr]) : Option[[String]] = match args_ {
+# The dispatch head of every argument, or None when any is unresolved.
+fn args_disp_heads(args_: [Expr]) : Option[[DispHead]] = match args_ {
   [] -> Some([])
   [e, ...rest] -> match e.ty {
     None -> None
-    Some(ty) -> match ty_head_name(ty) {
+    Some(ty) -> match ty_disp_head(ty) {
       None -> None
-      Some(n) -> match args_head_names(rest) {
+      Some(h) -> match args_disp_heads(rest) {
         None -> None
-        Some(ns) -> Some([n, ...ns])
+        Some(hs) -> Some([h, ...hs])
       }
     }
   }
 }
 
+# The receiver's identity decides the impl; the proto-args still match
+# by head name.
 fn find_impl_with_args(impls: [ProtoImplReg], pname: String, opname: String,
-                        recv: String, args: [String]) : Option[String] {
+                        recv: DispHead, args: [DispHead]) : Option[ProtoImplReg] {
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, t, o, fn_name, ans, _) ->
-        if p == pname and t == recv and o == opname and arg_names_match(ans, recv, args) {
-          Some(fn_name)
+      PIR(p, _, o, _, ans, _, _, _) ->
+        if p == pname and o == opname and pir_serves(it, recv) and
+           arg_names_match(ans, dh_name(recv), dh_names(args)) {
+          Some(it)
         } else {
           find_impl_with_args(rest, pname, opname, recv, args)
         }
@@ -5698,12 +5699,12 @@ fn find_impl_with_args(impls: [ProtoImplReg], pname: String, opname: String,
 # unified by the typer; single-dispatch v1 keys each impl uniquely on
 # `(protocol, op, Self-type)`, so matching on those three is sound.
 fn find_impl_by_recv(impls: [ProtoImplReg], pname: String, opname: String,
-                      recv: String) : Option[String] {
+                      recv: DispHead) : Option[ProtoImplReg] {
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, t, o, fn_name, _, _) ->
-        if p == pname and t == recv and o == opname { Some(fn_name) }
+      PIR(p, _, o, _, _, _, _, _) ->
+        if p == pname and o == opname and pir_serves(it, recv) { Some(it) }
         else { find_impl_by_recv(rest, pname, opname, recv) }
     }
   }
@@ -5784,6 +5785,12 @@ fn scan_trailing_digits(s: String, n: Int) : Int {
 # the same mangling proto_type_name applies on the impl side. Lists,
 # Option, Result, and primitive builtins get their canonical names;
 # user-defined records / sums use TyCon's name.
+#[doc("The dispatch receiver a type presents: its head name and the identity of the declaration it names.")]
+pub fn ty_disp_head(t: Ty) : Option[DispHead] = match ty_head_name(t) {
+  Some(n) -> Some(DispHead(n, ty_head_sym(t)))
+  None    -> None
+}
+
 #[doc("Root head name of a Ty for impl-table lookup (Int, List, the TyCon name, ...); None for tyvars/unions and other non-nominal heads.")]
 pub fn ty_head_name(t: Ty) : Option[String] {
   match t {
@@ -5823,23 +5830,6 @@ pub fn ty_head_name(t: Ty) : Option[String] {
   }
 }
 
-# Walks the registry's impl table for a (protocol-op, type-name)
-# match. The op-name search visits each impl entry's protocol's
-# ops to find which protocol the op belongs to; for the v1 we look
-# the op up first to know `pname`, then iterate impls for a matching
-# (pname, tname).
-fn find_impl(reg: ProtocolReg, opname: String, tname: String) : Option[String] {
-  match proto_op_lookup(reg, opname) {
-    None -> None
-    Some(po) -> match po {
-      POR(pname, _, _, _, _, _, pmo) -> {
-        let pkey = proto_key_of(reg.dkeys, pname, pmo)
-        find_impl_for(impl_pool(reg, pkey, tname), pkey, tname, opname)
-      }
-    }
-  }
-}
-
 # Collision-aware: `opname` may be declared by several protocols
 # (`add` by `Add[a]` and a user `Ring`). Returns an impl when ANY
 # declaring protocol VISIBLE from `cm` has one for `tname`, so the
@@ -5847,26 +5837,26 @@ fn find_impl(reg: ProtocolReg, opname: String, tname: String) : Option[String] {
 # and flag a spurious "no impl". Returns the owning protocol name
 # alongside.
 fn find_impl_any_proto(reg: ProtocolReg, opname: String,
-                        tname: String, cm: Option[String]) : Option[ImplHit] =
-  find_impl_any_proto_loop(proto_ops_lookup_all(reg, opname), reg, opname, tname, cm)
+                        recv: DispHead, cm: Option[String]) : Option[ImplHit] =
+  find_impl_any_proto_loop(proto_ops_lookup_all(reg, opname), reg, opname, recv, cm)
 
 #[doc("A resolved impl hit: the owning protocol and the impl fn symbol.")]
 pub type ImplHit = ImplHit(String, String)
 
 fn find_impl_any_proto_loop(cands: [ProtoOpReg], reg: ProtocolReg,
-                             opname: String, tname: String,
+                             opname: String, recv: DispHead,
                              cm: Option[String]) : Option[ImplHit] {
   match cands {
     [] -> None
     [po, ...rest] -> match po {
       POR(pname, _, _, _, _, _, pmo) -> {
         if not proto_visible_from(reg.origins, pname, pmo, cm) {
-          find_impl_any_proto_loop(rest, reg, opname, tname, cm)
+          find_impl_any_proto_loop(rest, reg, opname, recv, cm)
         } else {
           let pkey = proto_key_of(reg.dkeys, pname, pmo)
-          match find_impl_for(impl_pool(reg, pkey, tname), pkey, tname, opname) {
-            Some(fn_name) -> Some(ImplHit(pname, fn_name))
-            None -> find_impl_any_proto_loop(rest, reg, opname, tname, cm)
+          match find_impl_for(impl_pool(reg, pkey, dh_name(recv)), pkey, recv, opname) {
+            Some(p) -> Some(ImplHit(pname, pir_sym(p)))
+            None -> find_impl_any_proto_loop(rest, reg, opname, recv, cm)
           }
         }
       }
@@ -5882,14 +5872,14 @@ fn first_proto_of_op(reg: ProtocolReg, opname: String) : String {
   }
 }
 
-fn find_impl_for(impls: [ProtoImplReg], pname: String, tname: String,
-                  opname: String) : Option[String] {
+fn find_impl_for(impls: [ProtoImplReg], pname: String, recv: DispHead,
+                  opname: String) : Option[ProtoImplReg] {
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, t, op, fn_name, _, _) ->
-        if p == pname and t == tname and op == opname { Some(fn_name) }
-        else { find_impl_for(rest, pname, tname, opname) }
+      PIR(p, _, op, _, _, _, _, _) ->
+        if p == pname and op == opname and pir_serves(it, recv) { Some(it) }
+        else { find_impl_for(rest, pname, recv, opname) }
     }
   }
 }
