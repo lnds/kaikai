@@ -8037,7 +8037,7 @@ test-perceus-1791-arm-use-scope-native: $(TARGET) bin-kai build
 # the caller's frame. The fixtures cross the call boundary with boxed op
 # arguments (String, record, variant, list), a stateful handler, and three
 # simultaneous instances of one effect.
-CAP_PARAM_1801_FIXTURES := capability_param_dispatch capability_param_multi_instance capability_param_stateful capability_param_boxed_args
+CAP_PARAM_1801_FIXTURES := capability_param_dispatch capability_param_multi_instance capability_param_stateful capability_param_boxed_args capability_param_core_type_homonym
 
 test-perceus-1801-capability-param: $(TARGET) build
 	@set -e; \
