@@ -414,6 +414,11 @@ path lands in Stage C of the #533 trilogy.
 
 #### Coverage algorithm
 
+A `handle ... with Eff` must give a clause to every op of `Eff`,
+except an op the `default { }` block bridges with `$extern_handler`;
+otherwise the typer rejects the handle itself with `handler for Eff
+does not cover every op`, even when no call performs the missing op.
+
 For every directly-performed `Eff.op(...)` inside a function body,
 the typer walks the lexical stack of enclosing handles:
 
@@ -834,10 +839,11 @@ they first need to be acted on.
 
 3. **Ordering of `with`-clauses.** Must all ops appear?
    *Decided:* yes — exhaustive, analogue of pattern-match
-   exhaustiveness. Any omitted op is a compile error ("handler
-   does not cover Eff.op2"). Enforced by the handler-validation
-   work that landed under #517; fixtures live in
-   `examples/negative/handle_leak/`.
+   exhaustiveness. An op without a clause is a compile error
+   (`handler for Eff does not cover every op: missing op2`), whether
+   or not anything performs it. The one exception is an op the
+   effect's `default { }` block bridges with `$extern_handler`.
+   Fixtures: `examples/negative/effects_phase2/partial_handle_*.kai`.
 
 4. **What does `main` look like?** `fn main() : Unit / Io` with
    the runtime installing the Io handler implicitly, or
