@@ -29,12 +29,38 @@ import compiler.util
 
 #[doc("Mark the arm binders read in borrowed boxed slots; `slots` gives a callee's and `bpos` those of `self_name`.")]
 pub fn plt_lend_binders(e: Expr, self_name: String, bpos: [Int], borrowed: [String],
-                        slots: (Expr) -> [Int]) : Expr =
-  if not plt_has_back_edge(e, self_name) { e }
-  else {
-    plt_expr(e, PltCx { self_name: self_name, bpos: bpos, borrowed: borrowed, slots: slots },
-             PltScope { bound: [], lent: [] }, true)
+                        slots: (Expr) -> [Int]) : Expr = {
+  let cx = PltCx { self_name: self_name, bpos: bpos, borrowed: borrowed, slots: slots }
+  let sc = PltScope { bound: [], lent: [] }
+  if plt_has_back_edge(e, self_name) { plt_expr(e, cx, sc, true) } else { plt_rebuilds(e, cx, sc) }
+}
+
+# Without a back-edge only a reuse rebuild reads the marks: on a shared
+# donor the native rebuild gives a kept child one reference per use, and a
+# borrowed read takes none.
+fn plt_rebuilds(e: Expr, cx: PltCx, sc: PltScope) : Expr =
+  Expr { kind: plt_rebuilds_kind(e.kind, cx, sc), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn plt_rebuilds_kind(k: ExprKind, cx: PltCx, sc: PltScope) : ExprKind = match k {
+  EMatch(s, arms)       -> EMatch(plt_rebuilds(s, cx, sc), map(arms, (a) => plt_rebuild_arm(a, cx, sc)))
+  ECall(f, [scr, rb])   ->
+    if plt_is_reuse(f) { ECall(f, [scr, plt_expr(rb, cx, sc, false)]) }
+    else { prc_map_expr_kind(k, (x) => plt_rebuilds(x, cx, sc)) }
+  ELambda(_, _)         -> k
+  _                     -> prc_map_expr_kind(k, (x) => plt_rebuilds(x, cx, sc))
+}
+
+fn plt_rebuild_arm(a: Arm, cx: PltCx, sc: PltScope) : Arm = match a {
+  Arm(p, g, b) -> {
+    let sc1 = PltScope { bound: pat_binders(p, sc.bound), lent: sc.lent }
+    Arm(p, g, plt_rebuilds(b, cx, sc1))
   }
+}
+
+fn plt_is_reuse(f: Expr) : Bool = match f.kind {
+  EVar(nm) -> nm == "__perceus_reuse_variant" or nm == "__perceus_reuse_cons"
+  _        -> false
+}
 
 # Only a goto ledger reads the marks, and only a tail self-call becomes a goto.
 fn plt_has_back_edge(e: Expr, self_name: String) : Bool = match e.kind {
