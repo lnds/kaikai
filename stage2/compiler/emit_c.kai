@@ -658,12 +658,12 @@ pub fn report_ambig_efns(amb: [AmbigEntry], used: [String]) : Unit / Console = m
 # runtime reusable-tag bitset so `kai_variant_u` stops immortalising
 # them (which would saturate their rc and block reuse-in-place). Runs
 # over the post-Perceus AST inside `emit_program`.
-pub fn collect_reuse_ctors(decls: [Decl], acc: [String]) : [String] = match decls {
+fn collect_reuse_ctors(decls: [Decl], acc: [ReuseCtorName]) : [ReuseCtorName] = match decls {
   []           -> acc
   [d, ...rest] -> collect_reuse_ctors(rest, collect_reuse_ctors_decl(d, acc))
 }
 
-fn collect_reuse_ctors_decl(d: Decl, acc: [String]) : [String] = match d {
+fn collect_reuse_ctors_decl(d: Decl, acc: [ReuseCtorName]) : [ReuseCtorName] = match d {
   DFn(_, _, _, _, _, _, body, _, _, _, fsym) -> walk_reuse_ctors(body, acc)
   DTest(_, body, _, _, _)     -> walk_reuse_ctors(body, acc)
   DBench(_, body, _, _, _)    -> walk_reuse_ctors(body, acc)
@@ -671,19 +671,25 @@ fn collect_reuse_ctors_decl(d: Decl, acc: [String]) : [String] = match d {
   _ -> acc
 }
 
-# Pull the ctor name out of a `__perceus_reuse_variant`'s second arg,
-# which is `ECall(EVar(ctor) | EModCall(_, ctor), _)`. None for any
-# other shape.
-fn reuse_ctor_name(ctor: Expr) : Option[String] = match reuse_ctor_home_name(ctor) {
-  Some(RCN(_, cname)) -> Some(cname)
-  None                -> None
-}
-
 # The rebuild's constructor with the module it names, so a reuse arm can
 # check that the pattern and the rebuild mean the SAME ctor. Reusing the
 # donor cell across two homonyms would write one module's layout into the
 # other's cell.
 type ReuseCtorName = RCN(Option[String], String)
+
+# The rebuild's ctor keyed by the module that declares it: its type's home,
+# else the qualifier it was written with. Homonyms across modules share a name.
+fn reuse_ctor_ref(ctor: Expr) : Option[ReuseCtorName] = match reuse_ctor_home_name(ctor) {
+  Some(RCN(q, cname)) -> match ctor.ty {
+    Some(TyCon(Some(m), _, _, _)) -> Some(RCN(Some(m), cname))
+    _                             -> Some(RCN(q, cname))
+  }
+  None -> None
+}
+
+fn rcn_eq(a: ReuseCtorName, b: ReuseCtorName) : Bool = match a {
+  RCN(ha, na) -> match b { RCN(hb, nb) -> na == nb and ctor_home_matches(ha, hb) and ctor_home_matches(hb, ha) }
+}
 
 fn reuse_ctor_home_name(ctor: Expr) : Option[ReuseCtorName] = match ctor.kind {
   ECall(cf, _) -> match cf.kind {
@@ -705,7 +711,7 @@ fn reuse_same_ctor(phome: Option[String], pname: String, b: ReuseCtorName) : Boo
       bname == pname and (ctor_home_matches(bhome, phome) or ctor_home_matches(phome, bhome))
   }
 
-fn walk_reuse_ctors(e: Expr, acc: [String]) : [String] = {
+fn walk_reuse_ctors(e: Expr, acc: [ReuseCtorName]) : [ReuseCtorName] = {
   # Detect the reuse-variant call shape at this node, then recurse via
   # the shared `walk_bare_callees` traversal for the sub-expressions.
   # We reuse the existing full ExprKind walker to descend; it already
@@ -715,9 +721,9 @@ fn walk_reuse_ctors(e: Expr, acc: [String]) : [String] = {
       EVar(nm) ->
         if nm == "__perceus_reuse_variant" {
           match args_ {
-            [_scr, ctor] -> match reuse_ctor_name(ctor) {
-              Some(cn) -> if list_has(acc, cn) { acc } else { [cn, ...acc] }
-              None     -> acc
+            [_scr, ctor] -> match reuse_ctor_ref(ctor) {
+              Some(r) -> if any(acc, (x) => rcn_eq(x, r)) { acc } else { [r, ...acc] }
+              None    -> acc
             }
             _ -> acc
           }
@@ -732,7 +738,7 @@ fn walk_reuse_ctors(e: Expr, acc: [String]) : [String] = {
 # Descend into every child expression. Mirrors `walk_bare_callees`'s
 # structural recursion but invokes `walk_reuse_ctors` so the reuse-call
 # detection fires at every level.
-fn walk_reuse_ctors_children(k: ExprKind, acc: [String]) : [String] = match k {
+fn walk_reuse_ctors_children(k: ExprKind, acc: [ReuseCtorName]) : [ReuseCtorName] = match k {
   ECall(callee, args_) -> walk_reuse_ctors_list(args_, walk_reuse_ctors(callee, acc))
   EIntrinsic(_, args_)  -> walk_reuse_ctors_list(args_, acc)
   ESurface(sf)  -> walk_reuse_ctors_list(surface_children(sf), acc)
@@ -774,12 +780,12 @@ fn walk_reuse_ctors_children(k: ExprKind, acc: [String]) : [String] = match k {
   _ -> acc
 }
 
-fn walk_reuse_ctors_list(es: [Expr], acc: [String]) : [String] = match es {
+fn walk_reuse_ctors_list(es: [Expr], acc: [ReuseCtorName]) : [ReuseCtorName] = match es {
   []           -> acc
   [h, ...rest] -> walk_reuse_ctors_list(rest, walk_reuse_ctors(h, acc))
 }
 
-fn walk_reuse_ctors_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+fn walk_reuse_ctors_arms(arms: [Arm], acc: [ReuseCtorName]) : [ReuseCtorName] = match arms {
   []           -> acc
   [a, ...rest] -> match a {
     Arm(_, opt_guard, body) -> {
@@ -789,14 +795,14 @@ fn walk_reuse_ctors_arms(arms: [Arm], acc: [String]) : [String] = match arms {
   }
 }
 
-fn walk_reuse_ctors_fields(fs: [FieldInit], acc: [String]) : [String] = match fs {
+fn walk_reuse_ctors_fields(fs: [FieldInit], acc: [ReuseCtorName]) : [ReuseCtorName] = match fs {
   []           -> acc
   [f, ...rest] -> match f {
     FI(_, e) -> walk_reuse_ctors_fields(rest, walk_reuse_ctors(e, acc))
   }
 }
 
-fn walk_reuse_ctors_elems(els: [ListElem], acc: [String]) : [String] = match els {
+fn walk_reuse_ctors_elems(els: [ListElem], acc: [ReuseCtorName]) : [ReuseCtorName] = match els {
   []           -> acc
   [el, ...rest] -> match el {
     ElPlain(e)  -> walk_reuse_ctors_elems(rest, walk_reuse_ctors(e, acc))
@@ -804,7 +810,7 @@ fn walk_reuse_ctors_elems(els: [ListElem], acc: [String]) : [String] = match els
   }
 }
 
-fn walk_reuse_ctors_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
+fn walk_reuse_ctors_stmts(ss: [Stmt], acc: [ReuseCtorName]) : [ReuseCtorName] = match ss {
   []           -> acc
   [s, ...rest] -> match s {
     SLet(_, _, e)        -> walk_reuse_ctors_stmts(rest, walk_reuse_ctors(e, acc))
@@ -825,7 +831,7 @@ fn walk_reuse_ctors_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
   }
 }
 
-fn walk_reuse_ctors_clauses(cs: [HClause], acc: [String]) : [String] = match cs {
+fn walk_reuse_ctors_clauses(cs: [HClause], acc: [ReuseCtorName]) : [ReuseCtorName] = match cs {
   []           -> acc
   [c, ...rest] -> match c {
     HC(_, _, body, _, _) -> walk_reuse_ctors_clauses(rest, walk_reuse_ctors(body, acc))
@@ -9969,13 +9975,11 @@ fn filter_primitive_slot_ctors(variants: [VariantEntry], enums: [String]) : [Var
   }
 }
 
-# Map reuse-target ctor names to their integer tags via the global
-# EVar table. Names with no tag (defensive — should not happen for a
-# recognised ctor) are dropped. Pub so the LLVM backend reuses the
-# same name→tag mapping (backend parity — issue #118 layer 3).
-pub fn reuse_ctor_tags(names: [String], variants: [VariantEntry], acc: [Int]) : [Int] = match names {
+# Map reuse-target ctors to their integer tags, each resolved under the
+# module that declares it. A ctor with no tag is dropped.
+fn reuse_ctor_tags(names: [ReuseCtorName], variants: [VariantEntry], acc: [Int]) : [Int] = match names {
   []           -> acc
-  [n, ...rest] -> match evar_find_tag_opt(variants, n) {
+  [RCN(h, n), ...rest] -> match evar_find_tag_opt_in(variants, h, n) {
     Some(t) -> reuse_ctor_tags(rest, variants, [t, ...acc])
     None    -> reuse_ctor_tags(rest, variants, acc)
   }
