@@ -599,51 +599,54 @@ pub fn assigns_of(vs: [KVal], idx: Int, acc: [KAssign]) : [KAssign] = match vs {
   [v, ...rest] -> assigns_of(rest, idx + 1, list_append(acc, [KAsg(idx, v)]))
 }
 
-# Wrap each value atom as a boxed slot-init. i64-inline (SIInt64) is
-# decided from the constructor's CtorIntSlots; the boxed default is
-# correct, just not yet optimised.
-pub fn boxed_inits(vs: [KVal], acc: [KSlotInit]) : [KSlotInit] = match vs {
-  [] -> acc
-  [v, ...rest] -> boxed_inits(rest, list_append(acc, [SIBoxed(v)]))
-}
-
 # Wrap each value atom as a slot-init typed by the ctor's declared payload
-# kind: 1 (Int) → `SIInt64`, 2 (Real) → `SIReal`, 3 (enum) → `SIEnum`, else
-# `SIBoxed`. The KIND is the definition's, read from the SAME
+# kind (`ctor_slot_kinds_in`): 1 (Int) → `SIInt64`, 2 (Real) → `SIReal`,
+# 3 (enum) → `SIEnum`, else `SIBoxed`. The kinds come from the SAME
 # `variant_slot_kind`/`evar_payload_tys` the native mask (`ls_ctor_mask`) +
-# drop-walker read, so construction, drop and read stay in lockstep. A typed
-# slot may still hold a boxed `KVal` here — the emitter (`nemit_slot_word`)
-# absorbs the boxed→raw border (borrow for the tagged Int, consuming
-# `kaix_take_real`/`kaix_take_enum` for Real/enum), so a tagged pointer never
-# lands raw. Builtins fall through to `SIBoxed` (their mask is 0 per
-# `ls_ctor_mask`).
+# drop-walker read, so construction, drop and read stay in lockstep. The
+# emitter consumes a boxed Real/enum value (`kaix_take_real`/`kaix_take_enum`)
+# but reads an Int word without consuming, so an Int slot's value must arrive
+# raw: above the immediate range a boxed Int is a heap box nothing releases.
 pub fn typed_inits(vs: [KVal], name: String, st: LowerSt) : [KSlotInit] =
   typed_inits_in(vs, None, name, st)
 
 #[doc("Slot initialisers for ctor `name` as declared by `home`; builtins stay boxed.")]
 pub fn typed_inits_in(vs: [KVal], home: Option[String], name: String, st: LowerSt) : [KSlotInit] =
+  kind_inits(vs, ctor_slot_kinds_in(home, name, st), [])
+
+#[doc("The declared slot kind of each payload slot of ctor `name` (0 boxed, 1 Int, 2 Real, 3 enum); empty for a builtin or unknown ctor.")]
+pub fn ctor_slot_kinds_in(home: Option[String], name: String, st: LowerSt) : [Int] =
   match evar_payload_tys_in(st.vs, home, name) {
-    Some(tys) -> if evar_find_tag_in(st.vs, home, name) < user_variant_tag_base() {
-                   boxed_inits(vs, [])
-                 } else { typed_inits_idx(vs, tys, st.enums, []) }
-    None      -> boxed_inits(vs, [])
+    Some(tys) -> if evar_find_tag_in(st.vs, home, name) < user_variant_tag_base() { [] }
+                 else { map(tys, (t) => variant_slot_kind(t, st.enums)) }
+    None      -> []
   }
 
-fn typed_inits_idx(vs: [KVal], tys: [TypeExpr], enums: [String], acc: [KSlotInit]) : [KSlotInit] = match vs {
+#[doc("The kind at slot `i` of a slot-kind list; 0 (boxed) past its end.")]
+pub fn kind_at(ks: [Int], i: Int) : Int = match ks {
+  []           -> 0
+  [k, ...rest] -> if i == 0 { k } else { kind_at(rest, i - 1) }
+}
+
+#[doc("The mask kinds of slots `i` up to `n` of a ctor, in slot order, skipping slot `hole`.")]
+pub fn mask_kinds_but(mask: Int, hole: Int, i: Int, n: Int) : [Int] =
+  if i >= n { [] }
+  else if i == hole { mask_kinds_but(mask, hole, i + 1, n) }
+  else { [variant_mask_kind(mask, i), ...mask_kinds_but(mask, hole, i + 1, n)] }
+
+fn kind_inits(vs: [KVal], ks: [Int], acc: [KSlotInit]) : [KSlotInit] = match vs {
   [] -> acc
-  [v, ...vrest] -> match tys {
-    [t, ...trest] -> typed_inits_idx(vrest, trest, enums, list_append(acc, [typed_init_one(v, t, enums)]))
-    []            -> typed_inits_idx(vrest, [], enums, list_append(acc, [SIBoxed(v)]))
+  [v, ...vrest] -> match ks {
+    [k, ...krest] -> kind_inits(vrest, krest, list_append(acc, [kind_init(v, k)]))
+    []            -> kind_inits(vrest, [], list_append(acc, [SIBoxed(v)]))
   }
 }
 
-fn typed_init_one(v: KVal, t: TypeExpr, enums: [String]) : KSlotInit = {
-  let k = variant_slot_kind(t, enums)
+fn kind_init(v: KVal, k: Int) : KSlotInit =
   if k == 1 { SIInt64(v) }
   else if k == 2 { SIReal(v) }
   else if k == 3 { SIEnum(v) }
   else { SIBoxed(v) }
-}
 
 # The full 2-bit-per-slot mask for a ctor, from its declared payload types
 # (`variant_slot_mask` — Int, Real AND enum slots, the same mask the C

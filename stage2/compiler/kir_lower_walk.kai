@@ -3077,7 +3077,7 @@ fn lower_reuse_flat_fork(x: Expr, donor: KVal, cn: String, cargs: [Expr], st: Lo
     let plan = st0.rnested
     let uses = reuse_gc_uses(map(cargs, reuse_unlent), st0.reuse_gc)
     let st_gc = emit_reuse_gc_increfs(donor, uses, pos, st0)
-    match lower_exprs(cargs, st_gc, []) { LResMany(avs, st1) -> {
+    match lower_kinds_vals(cargs, ctor_slot_kinds_in(None, cn, st_gc), 0, st_gc, []) { LResMany(avs, st1) -> {
       let st_decl = ls_emit(st1, KLet(rjoin, SBoxed, KLitOp(KUnitV), pos))
       match bind_op(st_decl, KCall("kaix_check_unique", [donor]), pos) { LRes(uv, st_u) ->
         match three_labels(st_u) { LSL3(l_uniq, l_shared, l_join, st_l) -> {
@@ -3111,7 +3111,7 @@ fn lower_reuse_nested_fresh(x: Expr, cn: String, cargs: [Expr], st: LowerSt) : L
   # off — there is no stolen shell on the fresh path). The donor's
   # uniqueness is independent of this scrutinee's, so the shared branch
   # still absorbs the caller's shell — the C backend's shared-branch site.
-  match lower_reuse_args_donate(cargs, "", 0, true, false, st, []) { LResDon(avs, _, st1) -> {
+  match lower_reuse_args_donate(cargs, ctor_slot_kinds_in(None, cn, st), "", 0, true, false, st, []) { LResDon(avs, _, st1) -> {
     let tag = ls_variant_tag(st1, cn)
     let st_dup = emit_reuse_leaf_dups(reuse_gc_uses(cargs, st1.reuse_gc), kpos_of(x), st1)
     bind_op(st_dup, KCon(cn, tag, ls_ctor_mask(st1, cn), typed_inits(avs, cn, st1), st1.in_region), kpos_of(x))
@@ -3156,7 +3156,7 @@ fn lower_reuse_nested_dual(x: Expr, donor: KVal, cn: String, cargs: [Expr],
           let st_a = rn_direct_acct(directs, donor, uses, pos, st_fork)
           # The recolor-wrap shape has no inner steal; the nested rebuild
           # cell consumes the cross-call donor instead (inner stage off).
-          match lower_reuse_args_donate(cargs, "", 0, true, false, st_a, []) { LResDon(avs_u, _, st_d) ->
+          match lower_reuse_args_donate(cargs, ctor_slot_kinds_in(None, cn, st_a), "", 0, true, false, st_a, []) { LResDon(avs_u, _, st_d) ->
             match bind_op(st_d, KConReuse(RkVariantMove, donor, cn, ls_variant_tag(st_d, cn), typed_inits(avs_u, cn, st_d)), pos) { LRes(ru, st_u2) ->
               ls_seal(ls_emit(reuse_neutralise_exit_drop(st_u2, pos), KStore(rjoin, ru, pos)), KBr(l_join, pos), l_shared) } }
         } else { match ls_fresh_reg(st_fork) { LSReg(innerreg, st_r1) ->
@@ -3165,7 +3165,7 @@ fn lower_reuse_nested_dual(x: Expr, donor: KVal, cn: String, cargs: [Expr],
           let st_t = ls_emit(st_i, KLet(tokreg, SBoxed, KTokenSteal(KVar(innerreg), n_inner), pos))
           let st_a = rn_grand_acct(grands, innerreg, tokreg, uses, pos,
                        rn_direct_acct(directs, donor, uses, pos, st_t))
-          match lower_reuse_args_donate(cargs, tokreg, n_inner, false, false, st_a, []) {
+          match lower_reuse_args_donate(cargs, ctor_slot_kinds_in(None, cn, st_a), tokreg, n_inner, false, false, st_a, []) {
             LResDon(avs_u, donated, st_d) -> {
               let st_f = if donated { st_d } else { ls_emit(st_d, KRC(KFreeToken(KVar(tokreg)), pos)) }
               match bind_op(st_f, KConReuse(RkVariantMove, donor, cn, ls_variant_tag(st_f, cn), typed_inits(avs_u, cn, st_f)), pos) { LRes(ru, st_u2) ->
@@ -3188,33 +3188,47 @@ fn lower_reuse_nested_dual(x: Expr, donor: KVal, cn: String, cargs: [Expr],
 # the inner token's register name (fresh `KVar` per use); `donated = true`
 # at entry disables the inner stage (the fresh path, which has no stolen
 # shell). Returns the INNER-donation flag only.
-fn lower_reuse_args_donate(es: [Expr], tokreg: String, n_inner: Int, donated: Bool,
+fn lower_reuse_args_donate(es: [Expr], ks: [Int], tokreg: String, n_inner: Int, donated: Bool,
                            ddone: Bool, st: LowerSt, acc: [KVal]) : LResDon / Console = match es {
   [] -> LResDon(acc, donated, st)
   [e, ...rest] -> match donate_ctor_name(e, n_inner, donated) {
     Some(cn2) -> match e.kind {
-      ECall(_, cas) -> match lower_exprs(cas, st, []) { LResMany(avs, st1) -> {
+      ECall(_, cas) -> match lower_kinds_vals(cas, ctor_slot_kinds_in(None, cn2, st), 0, st, []) { LResMany(avs, st1) -> {
         let tokv = KVar(tokreg)
         match bind_op(st1, KConReuse(RkTokenVariant, tokv, cn2, ls_variant_tag(st1, cn2), typed_inits(avs, cn2, st1)), kpos_of(e)) { LRes(v, st2) ->
-          lower_reuse_args_donate(rest, tokreg, n_inner, true, ddone, st2, list_append(acc, [v])) }
+          lower_reuse_args_donate(rest, ks, tokreg, n_inner, true, ddone, st2, list_append(acc, [v])) }
       } }
       # Unreachable (donate_ctor_name proved ECall); lower normally.
-      _ -> match lower_expr(e, st) { LRes(v, st1) ->
-        lower_reuse_args_donate(rest, tokreg, n_inner, donated, ddone, st1, list_append(acc, [v])) }
+      _ -> match lower_at_kind(e, kind_at(ks, list_length(acc)), st) { LRes(v, st1) ->
+        lower_reuse_args_donate(rest, ks, tokreg, n_inner, donated, ddone, st1, list_append(acc, [v])) }
     }
     None -> match donor_ctor_name(e, donated and not ddone) {
       Some(cn3) -> match e.kind {
-        ECall(_, cas) -> match lower_exprs(cas, st, []) { LResMany(avs, st1) ->
+        ECall(_, cas) -> match lower_kinds_vals(cas, ctor_slot_kinds_in(None, cn3, st), 0, st, []) { LResMany(avs, st1) ->
           match bind_op(st1, KConReuse(RkDonorVariant, KUnitV, cn3, ls_variant_tag(st1, cn3), typed_inits(avs, cn3, st1)), kpos_of(e)) { LRes(v, st2) ->
-            lower_reuse_args_donate(rest, tokreg, n_inner, donated, true, st2, list_append(acc, [v])) } }
-        _ -> match lower_expr(e, st) { LRes(v, st1) ->
-          lower_reuse_args_donate(rest, tokreg, n_inner, donated, ddone, st1, list_append(acc, [v])) }
+            lower_reuse_args_donate(rest, ks, tokreg, n_inner, donated, true, st2, list_append(acc, [v])) } }
+        _ -> match lower_at_kind(e, kind_at(ks, list_length(acc)), st) { LRes(v, st1) ->
+          lower_reuse_args_donate(rest, ks, tokreg, n_inner, donated, ddone, st1, list_append(acc, [v])) }
       }
-      None -> match lower_expr(e, st) { LRes(v, st1) ->
-        lower_reuse_args_donate(rest, tokreg, n_inner, donated, ddone, st1, list_append(acc, [v])) }
+      None -> match lower_at_kind(e, kind_at(ks, list_length(acc)), st) { LRes(v, st1) ->
+        lower_reuse_args_donate(rest, ks, tokreg, n_inner, donated, ddone, st1, list_append(acc, [v])) }
     }
   }
 }
+
+# Args lowered at their slot kinds `ks`: a kind-1 Int slot lowers raw, as
+# `lower_ctor_args` does, since the emitter reads that word without
+# consuming the box a boxed value would bring.
+# `ks` must come from the entry the rebuild's tag uses: by name here, by arity in `lower_ctor_args`.
+fn lower_kinds_vals(es: [Expr], ks: [Int], i: Int, st: LowerSt, acc: [KVal]) : LResMany / Console = match es {
+  [] -> LResMany(acc, st)
+  [e, ...rest] -> match lower_at_kind(e, kind_at(ks, i), st) {
+    LRes(v, st1) -> lower_kinds_vals(rest, ks, i + 1, st1, list_append(acc, [v]))
+  }
+}
+
+fn lower_at_kind(e: Expr, k: Int, st: LowerSt) : LRes / Console =
+  if k == 1 { lower_expr_raw_at(e, SInt64, st) } else { lower_expr(e, st) }
 
 # The ctor name of a rebuild arg that can absorb the CROSS-CALL donor: any
 # nested sub-ctor call, once the inner token has been placed (`ready`) and
@@ -3273,7 +3287,7 @@ fn lower_reuse_dual(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Ex
       match three_labels(st_u) { LSL3(l_uniq, l_shared, l_join, st_l) -> {
         let st_fork = ls_seal(st_l, KCondBr(uv, l_uniq, l_shared, pos), l_uniq)
         # UNIQUE: direct slots stay borrows (no dup); rebuild; reuse in place.
-        let st_ub = match lower_exprs(cargs, st_fork, []) { LResMany(avs_u, st_u1) -> {
+        let st_ub = match lower_kinds_vals(cargs, ctor_slot_kinds_in(None, cn, st_fork), 0, st_fork, []) { LResMany(avs_u, st_u1) -> {
           let tag_u = ls_variant_tag(st_u1, cn)
           match bind_op(st_u1, KConReuse(rk, donor, cn, tag_u, typed_inits(avs_u, cn, st_u1)), pos) { LRes(ru, st_u2) ->
             ls_seal(ls_emit(st_u2, KStore(rjoin, ru, pos)), KBr(l_join, pos), l_shared) } } }
@@ -3282,7 +3296,7 @@ fn lower_reuse_dual(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Ex
         # builtin list ctor, not a registered variant, so a `KCon` here would
         # build a variant-shaped cell whose `as.cons` reads are garbage.
         let st_sd = emit_direct_dups(st.reuse_gc, pos, st_ub)
-        let st_sb = match lower_exprs(cargs, st_sd, []) { LResMany(avs_s, st_s1) ->
+        let st_sb = match lower_kinds_vals(cargs, ctor_slot_kinds_in(None, cn, st_sd), 0, st_sd, []) { LResMany(avs_s, st_s1) ->
           match bind_op(st_s1, reuse_fresh_op(rk, cn, avs_s, st_s1), pos) { LRes(rs, st_s2) ->
             ls_seal(ls_emit(st_s2, KStore(rjoin, rs, pos)), KBr(l_join, pos), l_join) } }
         LRes(KVar(rjoin), st_sb)
@@ -3645,12 +3659,16 @@ fn lower_trmc_step(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes /
   match es_tcrec_split_pipe(callee) {
     [_, sym, hole_str, cname, dropmask_str, ..._pnames] -> {
       let hole = es_tcrec_parse_decimal(hole_str)
+      # The full slot mask of the spine ctor (0 for the builtin cons spine),
+      # so the native step lays each slot at its kind like KCon/KConReuse do —
+      # the same `ls_ctor_mask` (`variant_slot_mask`) the fresh route reads.
+      let slot_mask = if trmc_cname_is_cons(cname) { 0 } else { ls_ctor_mask(st, cname) }
       # Lower the non-hole ctor args (head value(s)) left-to-right, then the
       # self-call's args (the rebinds) — preserving evaluation order.
-      match lower_exprs(trmc_drop_nth(cargs, hole, 0, []), st, []) {
+      match lower_kinds_vals(trmc_drop_nth(cargs, hole, 0, []), mask_kinds_but(slot_mask, hole, 0, list_length(cargs)), 0, st, []) {
         LResMany(heads, st1) ->
           lower_trmc_seal(x, sym, hole, cname, es_tcrec_parse_decimal(dropmask_str),
-                          heads, cargs, st1)
+                          slot_mask, heads, cargs, st1)
       }
     }
     _ -> LRes(KUnitV, st)
@@ -3660,7 +3678,7 @@ fn lower_trmc_step(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes /
 # Split out of `lower_trmc_step` so the head/rebind lowerings sit at one
 # nesting level each (the back-edge mirrors `lower_tcrec`'s `KTcrecGoto`).
 fn lower_trmc_seal(x: Expr, sym: String, hole: Int, cname: String, dropmask: Int,
-                   heads: [KVal], cargs: [Expr], st: LowerSt) : LRes / Console =
+                   slot_mask: Int, heads: [KVal], cargs: [Expr], st: LowerSt) : LRes / Console =
   # P3: lower the rebinds at the recursing fn's param slots (raw for a raw
   # param), so the TRMC back-edge re-stores them raw — no per-step
   # `kaix_int` re-box. Same `lower_tcrec_args` the `KTcrecGoto` path uses.
@@ -3671,10 +3689,6 @@ fn lower_trmc_seal(x: Expr, sym: String, hole: Int, cname: String, dropmask: Int
       # cons spine (`__kai_cons` / `__kai_cons_s`) is not a registered variant
       # → tag -1 (its backend path is cons-specific and ignores the tag).
       let tag = if trmc_cname_is_cons(cname) { 0 - 1 } else { ls_variant_tag(st1, cname) }
-      # The full slot mask of the spine ctor (0 for the builtin cons spine),
-      # so the native step lays each slot at its kind like KCon/KConReuse do —
-      # the same `ls_ctor_mask` (`variant_slot_mask`) the fresh route reads.
-      let slot_mask = if trmc_cname_is_cons(cname) { 0 } else { ls_ctor_mask(st1, cname) }
       # Like the tcrec goto, the step leaves every enclosing match: it
       # releases the ledger's pending entries the ctor args do not consume.
       seal_tail(tcp_goto_drops(cargs, st1),
