@@ -996,9 +996,8 @@ fn walk_bare_callees_clauses(cs: [HClause], acc: [String]) : [String] = match cs
 #     contract with caller).
 #   - Any binder whose name starts with `_` (including `__`-prefixed
 #     compiler-internal names like `__cv_*`, `__pcs_ret`): never warn.
-#     `name_is_unused` already encodes the user-facing convention; we
-#     extend the silence to `__`-prefixed names here because every
-#     desugar that synthesises locals uses that namespace.
+#     The silence covers `__`-prefixed names because every desugar
+#     that synthesises locals uses that namespace.
 #
 # The walker runs post-typer / pre-monomorphise (alongside
 # `report_ambig_efns`). Running pre-mono avoids duplicate diagnostics
@@ -1014,9 +1013,6 @@ fn walk_bare_callees_clauses(cs: [HClause], acc: [String]) : [String] = match cs
 # *used*, not unused.
 
 fn name_is_silenced(name: String) : Bool {
-  # `_`-prefixed (including `__`-prefixed compiler-internal names) =
-  # intentionally unused. `name_is_unused` only matches `_x` (not
-  # `__x`); for diagnostics we silence the broader `_*` family.
   match char_at(name, 0) {
     Some(c0) -> c0 == '_'
     None -> false
@@ -3493,13 +3489,7 @@ fn emit_pat_binds(src: String, pat: Pattern, scr: String, is_alias: Bool,
     PLit(_) -> ""
     PRange(_, _) -> ""
     PBind(name) ->
-      # #293 Phase 2.3/2.4: `_`-prefixed names are unused-by-convention.
-      # Treat them as wildcards so cons head / variant arg / record
-      # field allocations balance.
-      if name_is_unused(name) {
-        if is_alias { "" }
-        else { concat_all(["kai_decref(", scr, "); "]) }
-      } else if is_alias {
+      if is_alias {
         concat_all(["KaiValue *", c_local(name), " = kai_incref(", scr, "); "])
       } else {
         concat_all(["KaiValue *", c_local(name), " = ", scr, "; "])
@@ -3547,12 +3537,7 @@ fn emit_pat_binds_list(src: String, pats: [Pattern], opt_rest: Option[String],
                        cur: String, i: Int, cx: EmitCtx) : String {
   match pats {
     [] -> match opt_rest {
-      # `_`-prefixed rest binder: unused by convention (same treatment as
-      # PBind). Binding it would incref a ref nothing releases; the
-      # scrutinee's own release covers the tail cells.
-      Some(name) ->
-        if name_is_unused(name) { "" }
-        else { concat_all(["KaiValue *", c_local(name), " = kai_incref(", cur, "); "]) }
+      Some(name) -> concat_all(["KaiValue *", c_local(name), " = kai_incref(", cur, "); "])
       None -> ""
     }
     [p, ...rest] -> {
@@ -3613,7 +3598,7 @@ fn pat_kind1_binders_subs(subs: [Pattern], tys: [TypeExpr], i: Int, cx: EmitCtx,
     [sp, ...rest] -> {
       let k = match list_nth_ty(tys, i) { Some(t) -> variant_slot_kind(t, cx.enums) None -> 0 }
       let acc1 = match sp.pkind {
-        PBind(nm) -> if k == 1 and not name_is_unused(nm) { [nm, ...acc] } else { acc }
+        PBind(nm) -> if k == 1 { [nm, ...acc] } else { acc }
         PVariant(_, _, _)        -> pat_kind1_binders(sp, cx, acc)
         PList(_, _)           -> pat_kind1_binders(sp, cx, acc)
         PRecord(_)            -> pat_kind1_binders(sp, cx, acc)
@@ -3694,16 +3679,14 @@ fn emit_pat_binds_variant(src: String, subs: [Pattern], tys: [TypeExpr], scr: St
   }
 }
 
-# True iff a sub-pattern binds no name and reads no value — PWild or an
-# `_`-prefixed (unused-by-convention) PBind. Such a pattern over an
-# unboxed scalar slot needs no slot read emitted at all (the scalar has
+# True iff a sub-pattern binds no name and reads no value. Such a
+# pattern over an unboxed scalar slot needs no slot read emitted at all (the scalar has
 # no RC to release). PLit is NOT included: a literal slot pattern is a
 # TEST, handled on the test side, and reaches emit_pat_binds as "" only
 # after the test matched — here we only gate the bind read.
 fn pat_binds_nothing(p: Pattern) : Bool = match p.pkind {
-  PWild     -> true
-  PBind(nm) -> name_is_unused(nm)
-  _         -> false
+  PWild -> true
+  _     -> false
 }
 
 fn emit_pat_binds_record(src: String, fields: [PField], scr: String,
@@ -3737,20 +3720,6 @@ fn emit_pat_binds_record(src: String, fields: [PField], scr: String,
   }
 }
 
-fn name_is_unused(name: String) : Bool {
-  # `_`-prefixed user-facing names signal "unused" by convention.
-  # Excludes `__`-prefixed compiler-internal names (e.g. `__cv_*` from
-  # m12.6 const-pattern desugar, `__pcs_ret` / `__perceus_*` from
-  # perceus_pass) which the body still references.
-  match char_at(name, 0) {
-    Some(c0) -> c0 == '_' and match char_at(name, 1) {
-      Some(c1) -> c1 != '_'
-      None -> true
-    }
-    None -> false
-  }
-}
-
 fn pat_is_destructuring(p: Pattern) : Bool {
   match p.pkind {
     PBind(_) -> false
@@ -3781,7 +3750,7 @@ fn emit_match_arms(src: String, arms: [Arm], scr_alias: Option[String], scr_ty: 
 fn pbind_raw_alias(pat: Pattern, scr: String, scr_ty: Option[Ty]) : String =
   match pat.pkind {
     PBind(name) ->
-      if name_is_unused(name) or not scr_ty_raw_scalar(scr_ty) { "" }
+      if not scr_ty_raw_scalar(scr_ty) { "" }
       else {
         concat_all([raw_c_type(scr_ty), " kair_", name, " = ",
                     unbox_boxed_scalar(scr, scr_ty), "; (void) kair_", name, "; "])
@@ -3985,7 +3954,7 @@ pub fn arm_ptr_binders(subs: [Pattern], tys: [TypeExpr], i: Int, enums: [String]
     [sp, ...rest] -> {
       let k = match list_nth_ty(tys, i) { Some(t) -> variant_slot_kind(t, enums) None -> 0 }
       let here = match sp.pkind {
-        PBind(nm) -> if k == 0 and not name_is_unused(nm) { [nm] } else { [] }
+        PBind(nm) -> if k == 0 { [nm] } else { [] }
         _         -> []
       }
       list_append(here, arm_ptr_binders(rest, tys, i + 1, enums))
@@ -4259,7 +4228,7 @@ fn emit_arm_top_reuse(src: String, atr: ArmTopReuse, body: Expr,
 fn arm_donor_binders(subs: [Pattern], i: Int) : [String] = match subs {
   []            -> []
   [sp, ...rest] -> {
-    let here = match sp.pkind { PBind(nm) -> if name_is_unused(nm) { "" } else { nm } _ -> "" }
+    let here = match sp.pkind { PBind(nm) -> nm _ -> "" }
     [here, ...arm_donor_binders(rest, i + 1)]
   }
 }
@@ -4277,8 +4246,7 @@ fn emit_arm_borrow_binds(src: String, subs: [Pattern], tys: [TypeExpr], i: Int,
       let slot = concat_all(["kai_var_slots(_scr)[", int_to_string(i), "]"])
       let here = match sp.pkind {
         PBind(nm) ->
-          if name_is_unused(nm) { "" }
-          else if k == 1 { concat_all(["int64_t kair_", nm, " = ", slot, ".i64; (void) kair_", nm, "; "]) }
+          if k == 1 { concat_all(["int64_t kair_", nm, " = ", slot, ".i64; (void) kair_", nm, "; "]) }
           else if k == 2 { concat_all(["KaiValue *", c_local(nm), " = kai_real(", slot, ".r); "]) }
           else if k == 3 { concat_all(["KaiValue *", c_local(nm), " = kai_enum_slot_box(", slot, ".i64); "]) }
           else { concat_all(["KaiValue *", c_local(nm), " = ", slot, ".ptr; "]) }
@@ -4355,8 +4323,7 @@ fn pat_binders_list_local(ps: [Pattern], acc: [String]) : [String] = match ps {
 fn rv_all_used_once(binders: [String], cargs: [Expr]) : Bool = match binders {
   [] -> true
   [nm, ...rest] ->
-    if name_is_unused(nm) { rv_all_used_once(rest, cargs) }
-    else if rv_count_uses_args(nm, cargs, 0) == 1 { rv_all_used_once(rest, cargs) }
+    if rv_count_uses_args(nm, cargs, 0) == 1 { rv_all_used_once(rest, cargs) }
     else { false }
 }
 
@@ -4607,8 +4574,7 @@ fn rv_slot_binds(src: String, subs: [Pattern], tys: [TypeExpr], i: Int, borrow: 
       let here = match sp.pkind {
         PWild -> ""
         PBind(nm) ->
-          if name_is_unused(nm) { "" }
-          else if k == 1 { concat_all(["int64_t kair_", nm, " = ", slot, ".i64; (void) kair_", nm, "; "]) }
+          if k == 1 { concat_all(["int64_t kair_", nm, " = ", slot, ".i64; (void) kair_", nm, "; "]) }
           else if k == 2 { concat_all(["KaiValue *", c_local(nm), " = kai_real(", slot, ".r); "]) }
           else if k == 3 { concat_all(["KaiValue *", c_local(nm), " = kai_enum_slot_box(", slot, ".i64); "]) }
           else if borrow { concat_all(["KaiValue *", c_local(nm), " = ", slot, ".ptr; "]) }
@@ -4664,8 +4630,7 @@ fn rv_nested_binds_loop(isubs: [Pattern], itys: [TypeExpr], inner: String,
       let here = match sp.pkind {
         PWild -> ""
         PBind(nm) ->
-          if name_is_unused(nm) { "" }
-          else if k == 1 { concat_all(["int64_t kair_", nm, " = ", slot, ".i64; (void) kair_", nm, "; "]) }
+          if k == 1 { concat_all(["int64_t kair_", nm, " = ", slot, ".i64; (void) kair_", nm, "; "]) }
           else if k == 2 { concat_all(["KaiValue *", c_local(nm), " = kai_real(", slot, ".r); "]) }
           else if k == 3 { concat_all(["KaiValue *", c_local(nm), " = kai_enum_slot_box(", slot, ".i64); "]) }
           else           { concat_all(["KaiValue *", c_local(nm), " = ", slot, ".ptr; "]) }
@@ -4718,7 +4683,7 @@ fn rv_nested_dups_loop(isubs: [Pattern], itys: [TypeExpr], j: Int, cx: EmitCtx) 
     [sp, ...rest] -> {
       let k = match list_nth_ty(itys, j) { Some(t) -> variant_slot_kind(t, cx.enums) None -> 0 }
       let here = match sp.pkind {
-        PBind(nm) -> if k == 0 and not name_is_unused(nm) {
+        PBind(nm) -> if k == 0 {
                        concat_all(["kai_incref(", c_local(nm), "); "])
                      } else { "" }
         _ -> ""
@@ -4936,7 +4901,7 @@ fn reuse_kept_drops(subs: [Pattern], cargs: [Expr], ptys: [TypeExpr], i: Int,
     let k = match list_nth_ty(ptys, i) { Some(t) -> variant_slot_kind(t, cx.enums) None -> 0 }
     let here = match sp.pkind {
       PBind(nm) ->
-        if k == 0 and not name_is_unused(nm) and reuse_carg_reads(cargs, nm) {
+        if k == 0 and reuse_carg_reads(cargs, nm) {
           concat_all(["kai_decref(", c_local(nm), "); "])
         } else { "" }
       _ -> ""
@@ -5396,7 +5361,7 @@ fn tcp_rc_binders(pat: Pattern, cx: EmitCtx) : [String] =
 fn tcp_rc_binders_loop(all: [String], raw: [String]) : [String] = match all {
   [] -> []
   [n, ...rest] ->
-    if list_has(raw, n) or name_is_unused(n) { tcp_rc_binders_loop(rest, raw) }
+    if list_has(raw, n) { tcp_rc_binders_loop(rest, raw) }
     else { [n, ...tcp_rc_binders_loop(rest, raw)] }
 }
 
