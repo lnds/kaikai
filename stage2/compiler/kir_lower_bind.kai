@@ -36,6 +36,7 @@ import compiler.util
 import compiler.emit_shared
 import compiler.kir
 import compiler.kir_lower
+import compiler.kir_pat_alias
 
 # --- top-level arm binds (the switch already tested the tag) ------------
 
@@ -217,32 +218,54 @@ fn bind_record_subfields(fields: [PField], v: KVal, body: Expr, st: LowerSt) : L
     bind_record_subfields(rest, v, body, bind_field_pattern(fname, sub, v, body, st))
 }
 
-# A field whose sub-pattern is a nested VARIANT / VARIANT-RECORD
-# (`snd: JReal(r)`) is now SOUND to bind: the decision tree (`lm_field_tests`
-# / `rec_emit_tests`) tested the field's tag before this bind runs, so
-# reading the field and binding the payload's inner names is dominated by a
-# passed tag test. The variant/record/as cases all read the field into a
-# fresh register and recurse through `bind_pattern_fields_any`.
-fn bind_field_pattern(fname: String, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match sub.pkind {
-  PBind(name)          -> ls_emit(st, KLet(name, SBoxed, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)))
-  PRecord(_)           -> bind_field_nested(fname, sub, v, body, st)
-  PAs(name, _)         -> bind_field_as(fname, name, sub, v, body, st)
-  PVariant(_, _, _)       -> bind_field_nested(fname, sub, v, body, st)
-  PVariantRecord(_, _, _) -> bind_field_nested(fname, sub, v, body, st)
-  # A LIST field (`match (xs, ys) { ([x, ...xt], [y, ...yt]) -> … }` — the
-  # tuple sugar makes each side a `Pair` field). The decision tree already
-  # tested the field's length (`lm_field_len_test`), so walking the cells to
-  # bind the element and rest names is dominated by that test.
-  PList(pats, opt_rest) ->
-    match bind_op(st, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)) {
-      LRes(fv, st1) -> bind_list_cells(pats, opt_rest, fv, sub, st1) }
-  _                    -> st
+# A plain field binder owns the field read (`kai_op_field` increfs).
+fn bind_field_pattern(fname: String, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console =
+  match sub.pkind {
+    PBind(name) -> ls_emit(st, KLet(name, SBoxed, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)))
+    PAs(name, inner) ->
+      if field_sub_destructures(inner) { bind_field_owned(fname, sub, v, body, st) }
+      else { bind_field_as(fname, name, sub, v, body, st) }
+    _ -> if field_sub_destructures(sub) { bind_field_owned(fname, sub, v, body, st) } else { st }
+  }
+
+fn field_sub_destructures(p: Pattern) : Bool = match p.pkind {
+  PRecord(_)              -> true
+  PVariant(_, _, _)       -> true
+  PVariantRecord(_, _, _) -> true
+  PList(_, _)             -> true
+  PAs(_, inner)           -> field_sub_destructures(inner)
+  _                       -> false
 }
 
-# Bind a list pattern's element/rest names off an OWNING field read: each
-# element is `KProj(cur, 0)`, the tail `KProj(cur, 1)`, and a `...rest`
-# binds whatever cell the walk stands on. Emits no tests — the decision
-# tree owns those.
+# A destructuring field sub-pattern binds its names as borrows of an owning
+# field read. Each alias binder then takes its own reference and the read is
+# released, so every binder owns exactly one reference, as on the C backend
+# (`emit_pat_binds_record`). The decision tree already tested the field's
+# shape, so these binds are dominated by that test.
+fn bind_field_owned(fname: String, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console = {
+  let pos = KAt(sub.line, sub.col)
+  match bind_op(st, KPrim("kai_op_field", [v, KStrV(fname)]), pos) { LRes(fv, st1) -> {
+    let st2 = bind_field_sub(sub, fv, body, st1)
+    let st3 = dup_binders(pat_alias_binders(sub, st2.vs), pos, st2)
+    ls_emit(st3, KRC(KDrop(fv), pos))
+  } }
+}
+
+fn bind_field_sub(sub: Pattern, fv: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match sub.pkind {
+  PList(pats, opt_rest) -> bind_list_cells(pats, opt_rest, fv, sub, st)
+  PAs(name, inner) ->
+    bind_field_sub(inner, fv, body, ls_emit(st, KLet(name, SBoxed, KLitOp(fv), KAt(sub.line, sub.col))))
+  _ -> bind_pattern_fields_any(sub, fv, body, st)
+}
+
+fn dup_binders(names: [String], pos: KPos, st: LowerSt) : LowerSt = match names {
+  []           -> st
+  [n, ...rest] -> dup_binders(rest, pos, ls_emit(st, KRC(KDup(KVar(ls_reg_of(st, n))), pos)))
+}
+
+# Bind a list pattern's element/rest names as borrows of the cells under
+# `cur`: each element is `KProj(cur, 0)`, the tail `KProj(cur, 1)`, and a
+# `...rest` binds whatever cell the walk stands on. Emits no tests.
 fn bind_list_cells(pats: [Pattern], opt_rest: Option[String], cur: KVal,
                    sp: Pattern, st: LowerSt) : LowerSt / Console = match pats {
   [] -> match opt_rest {
@@ -261,15 +284,8 @@ fn bind_list_head(hp: Pattern, headv: KVal, st: LowerSt) : LowerSt / Console = m
   _           -> st
 }
 
-# A nested-record / tag-tested-variant field: read the field into a fresh
-# register (owned `kai_op_field`), then bind the sub-pattern against it
-# through the shared `bind_pattern_fields_any` recursion.
-fn bind_field_nested(fname: String, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console =
-  match bind_op(st, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)) { LRes(fv, st1) ->
-    bind_pattern_fields_any(sub, fv, body, st1) }
-
-# An as-pattern field (`f: name @ inner`): bind the field to `name`, then
-# the inner pattern against the same field value.
+# An as-pattern field whose inner pattern binds no cells (`f: name @ x`):
+# `name` owns the field read outright.
 fn bind_field_as(fname: String, name: String, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console =
   match bind_op(st, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)) { LRes(fv, st1) -> {
     let st2 = ls_emit(st1, KLet(name, SBoxed, KLitOp(fv), KAt(sub.line, sub.col)))
