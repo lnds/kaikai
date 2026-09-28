@@ -3196,7 +3196,7 @@ fn emit_pat_test(src: String, pat: Pattern, scr: String, cx: EmitCtx) : String /
     # A `PRange` is desugared to a binder + comparison guard before emit,
     # so it never reaches here; treat it as always-matching defensively.
     PRange(_, _) -> "1"
-    PLit(e) -> concat_all(["kai_op_eq(", scr, ", ", emit_expr(src,e, cx), ")"])
+    PLit(e) -> emit_pat_test_lit(src, e, scr, cx)
     PList(pats, opt_rest) -> emit_pat_test_list(src, pats, opt_rest, scr, cx)
     PVariant(hm, name, subs) -> emit_pat_test_variant(src, hm, name, subs, scr, cx)
     PVariantRecord(hm, name, fields) -> emit_pat_test_variant_record(src, hm, name, fields, scr, cx)
@@ -3213,6 +3213,20 @@ fn emit_pat_test(src: String, pat: Pattern, scr: String, cx: EmitCtx) : String /
     PSurface(_) -> panic("emit_pat_test: surface pattern not lowered")
   }
 }
+
+# `kai_op_eq` borrows both operands, and a String, Real or fixed-width
+# literal is a fresh box the test must release.
+fn emit_pat_test_lit(src: String, e: Expr, scr: String, cx: EmitCtx) : String / Console =
+  match e.kind {
+    EStr(_, _)   -> emit_pat_test_boxed_lit(src, e, scr, cx)
+    EReal(_, _)  -> emit_pat_test_boxed_lit(src, e, scr, cx)
+    EFixed(_, _) -> emit_pat_test_boxed_lit(src, e, scr, cx)
+    _            -> concat_all(["kai_op_eq(", scr, ", ", emit_expr(src, e, cx), ")"])
+  }
+
+fn emit_pat_test_boxed_lit(src: String, e: Expr, scr: String, cx: EmitCtx) : String / Console =
+  concat_all(["({ KaiValue *_pl = ", emit_expr(src, e, cx), "; int _pe = kai_op_eq(", scr,
+              ", _pl); kai_decref(_pl); _pe; })"])
 
 fn emit_pat_test_list(src: String, pats: [Pattern], opt_rest: Option[String],
                       scr: String, cx: EmitCtx) : String / Console {
@@ -3318,17 +3332,9 @@ fn emit_pat_test_variant(src: String, home: Option[String], name: String,
   cat3(base, emit_pat_test_variant_subs(src, subs, tys, scr, 0, cx), ")")
 }
 
-# Pull a borrowed boxed view of slot `i` against the typed shape. For
-# pointer slots returns the alias expression — no RC bump. For Int /
-# Real slots wraps in `kai_int`/`kai_real`, which allocates a fresh
-# boxed temporary the caller owns. Phase 2 test paths must release
-# any temporary they create.
-
-# Pull a borrowed boxed view of slot `i` against the typed shape. For
-# pointer slots returns the alias expression — no RC bump. For Int /
-# Real slots wraps in `kai_int`/`kai_real`, which allocates a fresh
-# boxed temporary the caller owns. Phase 2 test paths must release
-# any temporary they create.
+# A boxed view of slot `i` for a pattern test: the alias for a pointer slot,
+# a `kai_int` immediate for an Int slot, and for a Real slot a fresh box the
+# test must release (a Real literal compares the raw slot instead).
 fn slot_read_for_test(scr: String, i: Int, tys: [TypeExpr], enums: [String]) : String {
   let k = match list_nth_ty(tys, i) { Some(t) -> variant_slot_kind(t, enums) None -> 0 }
   if k == 1 {
@@ -3356,39 +3362,6 @@ fn emit_enum_slot_test(scr: String, i: Int, sp: Pattern, cx: EmitCtx) : String =
     _ -> "1"
   }
 
-# Borrowed read for pattern tests on primitive slots. Returns a
-# raw-scalar-aware test expression that does NOT allocate when the
-# pattern only checks equality against a literal — but since
-# `emit_pat_test` operates on boxed `KaiValue *`, we go through the
-# boxed read above. The freshly boxed temp leaks unless the caller
-# wraps the test in a statement-expression that decrefs it; for the
-# Phase 2 MVP we only emit unboxed slots when the variant's typed
-# arms use PBind / PWild (not PLit), which means the test side
-# stays boxed only on pointer slots — primitive slots cannot occur
-# in PLit's emit because the literal slot pattern is reached only
-# for PVariant args, which we route through PBind below. The
-# `slot_read_for_test` helper therefore stays simple. The
-# emit_pat_test arm itself does not introduce allocations for the
-# inline literal cases on primitive slots (#440 follow-up): Phase 2
-# routes them through a `slots[i].i64 == LITERAL` check via the
-# specialised PLit path.
-
-# Borrowed read for pattern tests on primitive slots. Returns a
-# raw-scalar-aware test expression that does NOT allocate when the
-# pattern only checks equality against a literal — but since
-# `emit_pat_test` operates on boxed `KaiValue *`, we go through the
-# boxed read above. The freshly boxed temp leaks unless the caller
-# wraps the test in a statement-expression that decrefs it; for the
-# Phase 2 MVP we only emit unboxed slots when the variant's typed
-# arms use PBind / PWild (not PLit), which means the test side
-# stays boxed only on pointer slots — primitive slots cannot occur
-# in PLit's emit because the literal slot pattern is reached only
-# for PVariant args, which we route through PBind below. The
-# `slot_read_for_test` helper therefore stays simple. The
-# emit_pat_test arm itself does not introduce allocations for the
-# inline literal cases on primitive slots (#440 follow-up): Phase 2
-# routes them through a `slots[i].i64 == LITERAL` check via the
-# specialised PLit path.
 fn list_nth_ty(xs: [TypeExpr], i: Int) : Option[TypeExpr] = match xs {
   [] -> None
   [h, ...rest] -> if i == 0 { Some(h) } else { list_nth_ty(rest, i - 1) }
@@ -3425,6 +3398,8 @@ fn emit_pat_test_variant_subs(src: String, subs: [Pattern], tys: [TypeExpr], scr
       let t =
         if k == 3 {
           emit_enum_slot_test(scr, i, sp, cx)
+        } else if k == 2 and pat_is_real_lit(sp) {
+          emit_real_slot_lit_test(scr, i, sp)
         } else {
           let sub_scr =
             if k == 0 {
@@ -3437,6 +3412,21 @@ fn emit_pat_test_variant_subs(src: String, subs: [Pattern], tys: [TypeExpr], scr
       concat_all([" && ", t, emit_pat_test_variant_subs(src, rest, tys, scr, i + 1, cx)])
     }
   }
+}
+
+fn pat_is_real_lit(p: Pattern) : Bool = match p.pkind {
+  PLit(e) -> match e.kind { EReal(_, _) -> true  _ -> false }
+  _       -> false
+}
+
+# A Real slot holds the raw double: compare it in place, with no box on
+# either side.
+fn emit_real_slot_lit_test(scr: String, i: Int, p: Pattern) : String = match p.pkind {
+  PLit(e) -> match e.kind {
+    EReal(r, _) -> concat_all(["(kai_var_slots(", scr, ")[", int_to_string(i), "].r == ", real_to_string(r), ")"])
+    _           -> "0"
+  }
+  _       -> "0"
 }
 
 fn emit_pat_test_record(src: String, fields: [PField], scr: String,
