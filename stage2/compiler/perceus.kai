@@ -53,6 +53,7 @@ import compiler.perceus_let_own
 import compiler.perceus_lend_tail
 import compiler.perceus_payer
 import compiler.perceus_branch_pay
+import compiler.perceus_path_move
 import compiler.perceus_plant_drop
 import compiler.perceus_tail_drop
 import compiler.consume_index
@@ -1652,8 +1653,9 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # orphan the birth ref.
         let new_body = ptd_tail_exit_drops(new_body0, name, uses, [], branchy_lets,
                                            pcs_borrow_lookup(bmap, pcs_borrow_key(name, mo)))
-        let arm_dropped = pcs_arm_drop_pass(new_body, name, PcsArmCx { uses: uses, moved: [], boxed_bpos: [], borrow_only: [], borrowed: [], bmap: [] })
-        let branch_paid = pbp_branch_drops(arm_dropped, map(params, (p) => p.pname), uses)
+        let arm_dropped = pcs_arm_drop_pass(new_body, name, PcsArmCx { uses: uses, moved: [], boxed_bpos: [], borrow_only: [],
+                                                                       borrowed: [], bmap: [], forced: branchy_lets })
+        let branch_paid = pbp_branch_drops(arm_dropped, map(params, (p) => p.pname), uses, [])
         let reused_body = pcs_recognise_reuse_expr(branch_paid)
         # Boxed LOCALS can still flow to borrowed callee slots; without the
         # caller-side strip a bare last-use arg is a move no borrowing
@@ -1768,7 +1770,14 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # params too, so the re-thread transfers raw. The exit-drop set
         # (`skip_set`) deliberately excludes them: the base arm still frees
         # the container. Keep the two sets distinct.
-        let rewrite_skip_set = pcs_list_union(skip_set, borrow_move_params)
+        let moved0 = pcs_list_union(skip_set, borrow_move_params)
+        # Arm binders read at most once per path move on every read; the
+        # branch payer releases them on the alternatives that skip them.
+        let path_moves = ppm_path_moves(body, uses, pcs_list_union(moved0, pnames), borrowed,
+          (nm, b) => pcs_max_paths_in_expr(nm, b) <= 1 and pcs_all_consumers_linear(nm, b) and
+                     pcs_uses_only_consuming_slots(nm, b, cmap, []),
+          (f) => pcs_borrow_lookup(bmap, pcs_callee_key(f)))
+        let rewrite_skip_set = pcs_list_union(moved0, path_moves)
         # Single-use params whose only read sits on some-but-not-all paths:
         # forced to dup at the read (force_set) and released by a forced
         # exit drop, so the paths that skip the read stay balanced.
@@ -1800,12 +1809,13 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         let boxed_bpos = pcs_boxed_positions(self_bpos, params, raw_pnames, 0)
         let arm_dropped = pcs_arm_drop_pass(new_body, name,
                                             PcsArmCx { uses: uses, moved: rewrite_skip_set, boxed_bpos: boxed_bpos,
-                                                      borrow_only: borrow_only, borrowed: borrowed, bmap: bmap })
+                                                      borrow_only: borrow_only, borrowed: borrowed, bmap: bmap,
+                                                      forced: force_all })
         # The branch-local drop, in the arms that never read it, for each
         # param the payer assigns there.
         let param_dropped = pcs_inject_param_branch_drops(arm_dropped,
           pcs_names_paid_by(owned_moves, uses, psets, PyBranch), name)
-        let branch_paid = pbp_branch_drops(param_dropped, pnames, uses)
+        let branch_paid = pbp_branch_drops(param_dropped, pnames, uses, path_moves)
         let reused_body = pcs_recognise_reuse_expr_b(branch_paid, borrowed)
         # Borrowed params carry no exit obligation — exclude from the
         # unused-param drop. Raw params (mixed-sig) likewise carry no rc,
@@ -3946,15 +3956,10 @@ fn pcs_read_roles_deferred(nm: String, e: Expr) : PcsRR =
   }
 
 # Arm binders whose ONLY read a short circuit inside their own arm may
-# skip: the raw last-use transfer would leave the skipped path with no
-# payer for the birth ref, so the rewrite dups the read (force_set) and
-# the arm/guard drop planters pay every edge instead. Only `XSc`/`XMsg`
-# reads qualify — an if/match-branch read keeps its raw move and the
-# sibling alternatives pay on entry (`pbp_branch_drops`), whereas forcing
-# it would orphan the birth ref on a value leaf the arm-drop distribution
-# never reaches. The same value-leaf hole gates the whole arm: when the
-# body hosts a self-tail-call, the planted drop lands only on self-call
-# leaves, so every tail leaf must be one.
+# skip: the rewrite dups the read (force_set) and the arm and guard drop
+# planters pay every edge. Only `XSc`/`XMsg` reads qualify; any other read
+# keeps its raw move and the branch payer releases it on the skipping
+# alternatives.
 fn pcs_branchy_arm_binders(e: Expr, fn_name: String, uses: [Use], skip: [String],
                            acc: [String]) : [String] = match e.kind {
   EMatch(s, arms) ->
@@ -4005,12 +4010,9 @@ fn pcs_bab_qualifies(nm: String, og: Option[Expr], b: Expr, fn_name: String,
     match pcs_rr_merge(g_roles, b_roles) {
       PRR(a, brc, blocked) ->
         if a != 0 or brc != 1 or blocked { false }
-        # A guard read pays through the guard-fail drop plus the
-        # zero-use body drop — machinery every body shape carries. A
-        # body read is paid by the distributed drop, which reaches
-        # every path only when each tail leaf is a self-call; the
-        # non-goto wrap placement over-releases the native lowering's
-        # alias-bound pattern binders, so those arms keep the raw move.
+        # A guard read pays through the guard-fail drop plus the body
+        # drop. A body read is forced only when every tail leaf is a
+        # self-call, where the goto ledger pays it.
         else {
           match b_roles {
             PRR(_, bb, _) ->
@@ -4382,7 +4384,7 @@ fn pcs_replace_peeled_match(body: Expr, scr: Expr, arms1: [Arm]) : Expr = {
 # `borrow_only` binders are released on arm entry (`perceus_rethread`); an
 # arm re-checks its own, since two scopes may bind one name.
 type PcsArmCx = { uses: [Use], moved: [String], boxed_bpos: [Int], borrow_only: [String],
-                  borrowed: [String], bmap: [BorrowEntry] }
+                  borrowed: [String], bmap: [BorrowEntry], forced: [String] }
 
 # A user fn's borrowed positions; a borrowing prim keeps its own
 # consuming-last-use rule, so it lends no slot here.
@@ -4502,7 +4504,7 @@ fn pcs_collect_arm_drops(bound: [String], ln: Int, cl: Int, body: Expr, opt_g: O
     let acc1 =
       if pre_tail and pcs_name_in_body_tail(nm, body) { acc }
       else if pcs_guard_has_bare_read(nm, opt_g) { acc }
-      else if pcs_pays(pcs_arm_payer(nm, cx.uses, list_has(cx.moved, nm)), PyExit) {
+      else if pcs_pays(pcs_arm_payer(nm, cx.uses, list_has(cx.moved, nm), list_has(cx.forced, nm)), PyExit) {
         [pcs_make_drop_stmt(nm, ln, cl), ...acc]
       } else { acc }
     pcs_collect_arm_drops(rest, ln, cl, body, opt_g, cx, pre_tail, acc1)
@@ -4527,7 +4529,7 @@ fn pcs_arm_tail_drop_body(body: Expr, bound: [String], ln: Int, cl: Int,
       Some(t) -> match pcs_collect_arm_tail_drops(bound, ln, cl, body, opt_g, uses, []) {
         []    -> body
         drops -> {
-          let t1 = if pcs_is_self_tail_call(t, fn_name) { pcs_distribute_dead_drops(t, drops, fn_name, owed_ok) }
+          let t1 = if pcs_is_self_tail_call(t, fn_name) { pcs_distribute_dead_drops(t, drops, fn_name, owed_ok, []) }
                    else { pcs_arm_ret_wrap(t, drops) }
           Expr { kind: EBlock(stmts, Some(t1)), line: body.line, col: body.col, ty: body.ty, mode: body.mode }
         }
@@ -4643,30 +4645,19 @@ fn pcs_body_is_block_with_tail(body: Expr) : Bool {
   }
 }
 
-# Insert drops into the arm body. Three shapes:
-#   - body is `EBlock(stmts, opt_tail)`: append drops between stmts
-#     and tail. The tail position is preserved so `tcrec_rewrite_decls`
-#     can still detect a self-tail-call inside the tail expression.
-#   - body is a non-block expression that itself is a self-tail-call
-#     (`ECall(EVar(fn_name), args)`): leave alone. Wrapping it would
-#     hide the call from the TCO rewrite and risk a stack overflow
-#     (same regression #342 worked around). The drops are skipped —
-#     bindings appearing in tail are filtered upstream, so this
-#     only fires when the body has no draftable drops anyway.
-#   - body is any other non-block expression: wrap as
-#     `EBlock([SLet(__pcs_arm_ret, body), ...drops], Some(EVar(__pcs_arm_ret)))`.
-#     The body executes first (with its bindings live), the drops run
-#     before the wrapped block returns the saved value.
+# Insert drops into the arm body. A block body takes them between its
+# statements and its tail. A body whose tail leaves include a self-tail-call
+# cannot be wrapped, since the wrap would hide the call from TCO, so each
+# leaf pays on its own path. Any other body is wrapped: its value is bound,
+# the drops run, the value is yielded. TRMC replants the wrap's drops.
 fn pcs_inject_arm_drops(body: Expr, drops: [Stmt], fn_name: String, owed_ok: Bool) : Expr {
   match body.kind {
     EBlock(stmts, opt_tail) ->
       Expr { kind: EBlock(list_append(stmts, drops), opt_tail),
              line: body.line, col: body.col, ty: body.ty, mode: body.mode }
     _ -> {
-      # The ret wrap would hide a self-tail-call from the TCO rewrite, so
-      # each goto path is closed at its leaf instead.
       if pcs_is_self_tail_call(body, fn_name) {
-        pcs_distribute_dead_drops(body, drops, fn_name, owed_ok)
+        pcs_distribute_dead_drops(body, drops, fn_name, owed_ok, [])
       }
       else { pcs_arm_ret_wrap(body, drops) }
     }
@@ -4682,54 +4673,87 @@ fn pcs_arm_ret_wrap(body: Expr, drops: [Stmt]) : Expr = {
   Expr { kind: EBlock([ret_let, ...drops], Some(tail)), line: body.line, col: body.col, ty: body.ty, mode: body.mode }
 }
 
-# Close each self-tail-call leaf of `body` for `drops`: the goto skips
-# every exit. A binder the leaf never mentions drops before the call; one
-# it reads only through dups drops after the hoisted args (`owed_ok`),
+# Close each tail leaf of `body` for `drops`: the goto skips every exit.
+# A self-tail-call leaf drops a binder it never mentions before the call,
+# and one it reads only through dups after the hoisted args (`owed_ok`),
 # since the borrow strip may later turn a dup into a bare read the goto
-# ledger takes for a move. A binder with a bare read pays on its own path.
-# Only self-tail-call leaves are touched.
-fn pcs_distribute_dead_drops(body: Expr, drops: [Stmt], fn_name: String, owed_ok: Bool) : Expr =
-  Expr { kind: pcs_dd_kind(body.kind, body.line, body.col, body.ty, body.mode, drops, fn_name, owed_ok),
+# ledger takes for a move; a binder with a bare read pays on its own path.
+# A modulo-cons leaf is left to the TRMC rewrite. A value leaf releases,
+# after its value is built, every binder it does not move except those in
+# `held`, the names a nested scope rebinds.
+fn pcs_distribute_dead_drops(body: Expr, drops: [Stmt], fn_name: String, owed_ok: Bool, held: [String]) : Expr =
+  Expr { kind: pcs_dd_kind(body.kind, body.line, body.col, body.ty, body.mode, drops, fn_name, owed_ok, held),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode }
 
-fn pcs_dd_kind(k: ExprKind, ln: Int, cl: Int, ty: Option[Ty], mode: ValueMode, drops: [Stmt], fn_name: String, owed_ok: Bool) : ExprKind {
+fn pcs_dd_kind(k: ExprKind, ln: Int, cl: Int, ty: Option[Ty], mode: ValueMode, drops: [Stmt], fn_name: String,
+               owed_ok: Bool, held: [String]) : ExprKind {
   match k {
     EIf(c, t, opt_e) ->
-      EIf(c, pcs_distribute_dead_drops(t, drops, fn_name, owed_ok),
-          match opt_e { None -> None Some(e) -> Some(pcs_distribute_dead_drops(e, drops, fn_name, owed_ok)) })
-    EMatch(s, arms) -> EMatch(s, pcs_dd_arms(arms, drops, fn_name, owed_ok))
+      EIf(c, pcs_distribute_dead_drops(t, drops, fn_name, owed_ok, held),
+          match opt_e { None -> None Some(e) -> Some(pcs_distribute_dead_drops(e, drops, fn_name, owed_ok, held)) })
+    EMatch(s, arms) -> EMatch(s, pcs_dd_arms(arms, drops, fn_name, owed_ok, held))
     EBlock(stmts, opt_tail) -> match opt_tail {
-      Some(t) -> EBlock(stmts, Some(pcs_dd_scoped(t, drops, fn_name, owed_ok, ppd_let_names(stmts))))
+      Some(t) -> EBlock(stmts, Some(pcs_dd_scoped(t, drops, fn_name, owed_ok, held, ppd_let_names(stmts))))
       None    -> k
     }
-    _ -> pcs_dd_leaf(Expr { kind: k, line: ln, col: cl, ty: ty, mode: mode }, drops, fn_name, owed_ok)
+    _ -> pcs_dd_leaf(Expr { kind: k, line: ln, col: cl, ty: ty, mode: mode }, drops, fn_name, owed_ok, held)
   }
 }
 
-fn pcs_dd_leaf(leaf: Expr, drops: [Stmt], fn_name: String, owed_ok: Bool) : ExprKind =
-  if not pcs_is_self_tail_call(leaf, fn_name) { leaf.kind }
+fn pcs_dd_leaf(leaf: Expr, drops: [Stmt], fn_name: String, owed_ok: Bool, held: [String]) : ExprKind =
+  if pcs_is_self_tail_call(leaf, fn_name) { pcs_dd_goto_leaf(leaf, drops, owed_ok) }
+  else if pcs_is_modcons_leaf(leaf, fn_name) { leaf.kind }
   else {
-    let owed = if owed_ok { filter(drops, (d) => pcs_drop_owed_in(d, leaf)) } else { [] }
-    let paid = match owed { [] -> leaf  _ -> ppd_hoist_then(leaf, owed) }
-    match pcs_drops_dead_in(drops, leaf) {
-      []   -> paid.kind
-      dead -> EBlock(dead, Some(paid))
+    match filter(pcs_unmoved_names(drops, leaf), (nm) => not list_has(held, nm)) {
+      []    -> leaf.kind
+      names -> ppd_bind_then(leaf, ppd_drops(names, leaf.line, leaf.col)).kind
     }
   }
 
-fn pcs_dd_arms(arms: [Arm], drops: [Stmt], fn_name: String, owed_ok: Bool) : [Arm] = match arms {
+fn pcs_dd_goto_leaf(leaf: Expr, drops: [Stmt], owed_ok: Bool) : ExprKind = {
+  let owed = if owed_ok { filter(drops, (d) => pcs_drop_owed_in(d, leaf)) } else { [] }
+  let paid = match owed { [] -> leaf  _ -> ppd_hoist_then(leaf, owed) }
+  match pcs_drops_dead_in(drops, leaf) {
+    []   -> paid.kind
+    dead -> EBlock(dead, Some(paid))
+  }
+}
+
+fn pcs_dd_arms(arms: [Arm], drops: [Stmt], fn_name: String, owed_ok: Bool, held: [String]) : [Arm] = match arms {
   []           -> []
   [a, ...rest] -> match a {
     Arm(pat, opt_g, body) ->
-      [Arm(pat, opt_g, pcs_dd_scoped(body, drops, fn_name, owed_ok, prc_pat_bindings(pat, []))),
-       ...pcs_dd_arms(rest, drops, fn_name, owed_ok)]
+      [Arm(pat, opt_g, pcs_dd_scoped(body, drops, fn_name, owed_ok, held, prc_pat_bindings(pat, []))),
+       ...pcs_dd_arms(rest, drops, fn_name, owed_ok, held)]
+  }
+}
+
+# A leaf the TRMC rewrite lowers to a goto step: a cons or constructor
+# rebuild with a self-call in one slot.
+fn pcs_is_modcons_leaf(e: Expr, fn_name: String) : Bool = match e.kind {
+  EList(_)    -> pcs_body_has_cons_self_tail(fn_name, e)
+  ECall(_, _) -> pcs_arm_self_modulo_cons(fn_name, e)
+  _           -> false
+}
+
+# The binders of `drops` the leaf does not move.
+fn pcs_unmoved_names(drops: [Stmt], leaf: Expr) : [String] = match drops {
+  []           -> []
+  [d, ...rest] -> {
+    let tl = pcs_unmoved_names(rest, leaf)
+    match ppd_drop_name(d) {
+      Some(nm) -> if pcs_has_bare_read(nm, leaf) { tl } else { [nm, ...tl] }
+      None     -> tl
+    }
   }
 }
 
 # Under a scope binding `names`: a rebound name would make a leaf read the
 # inner binder, not the dropped one, so no drop moves past the leaf's reads.
-fn pcs_dd_scoped(body: Expr, drops: [Stmt], fn_name: String, owed_ok: Bool, names: [String]) : Expr =
-  pcs_distribute_dead_drops(body, drops, fn_name, owed_ok and not any(drops, (d) => ppd_drop_among(d, names)))
+fn pcs_dd_scoped(body: Expr, drops: [Stmt], fn_name: String, owed_ok: Bool, held: [String],
+                 names: [String]) : Expr =
+  pcs_distribute_dead_drops(body, drops, fn_name, owed_ok and not any(drops, (d) => ppd_drop_among(d, names)),
+                            list_append(names, held))
 
 fn pcs_drop_owed_in(d: Stmt, leaf: Expr) : Bool = match ppd_drop_name(d) {
   Some(nm) -> pcs_mentions(nm, leaf) and not pcs_has_bare_read(nm, leaf)

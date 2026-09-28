@@ -1,0 +1,190 @@
+#[doc("""
+Entry drops for a binder read at most once per path, its reads bare moves.
+
+Each alternative on the way to the reads that holds none of them releases
+the binder on entry. The entry drop leaves the alternative's own value,
+and any self-call in it, in tail position. Alternatives are `if` branches,
+`match` arms, and the skipped edge of an `and` / `or`, which pays inside
+the expression so the right operand keeps its position. A read in a
+nested arm's guard may fall through to a later arm, so it becomes a dup
+and every arm of that match counts as an alternative.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.expr_positions
+import compiler.infer
+import compiler.perceus_payer
+import compiler.perceus_reads
+import compiler.sym_read
+
+#[doc("`scope` with every path that skips the reads of `nm` releasing it on entry; unchanged when no path can pay.")]
+pub fn pbl_paid(nm: String, scope: Expr) : Expr = match pbl_plant(nm, scope) {
+  PbPaid(e) -> e
+  _         -> scope
+}
+
+#[doc("True when every path through `scope` can pay `nm` with entry drops, the reads being bare moves.")]
+pub fn pbl_plantable(nm: String, scope: Expr) : Bool = match pbl_plant(nm, scope) {
+  PbDecline -> false
+  _         -> true
+}
+
+# Planting outcome: some read is not a plain move reachable here, every
+# path reaches a read (nothing to release), or `e` rebuilt with the
+# skipping alternatives paying on entry.
+type PblOut = PbDecline | PbSame | PbPaid(Expr)
+
+# A lambda, handler clause or assert message hides the path, and a dup'd
+# read leaves the birth reference owed; each declines.
+fn pbl_plant(nm: String, e: Expr) : PblOut = match sym_read_kind(e.kind) {
+  EVar(u)          -> if u == nm { PbSame } else { PbDecline }
+  EIf(c, t, oe)    -> pbl_plant_if(nm, e, c, t, oe)
+  EMatch(s, arms)  -> pbl_plant_match(nm, e, s, arms)
+  EBinop(op, a, b) -> if op == "and" or op == "or" { pbl_plant_sc(nm, e, op, a, b) } else { pbl_plant_plain(nm, e) }
+  ECall(f, _)      -> if pbl_is_dup(f) { PbDecline } else { pbl_plant_plain(nm, e) }
+  _                -> pbl_plant_plain(nm, e)
+}
+
+# Through a plain position: rebuild only when something below was paid.
+fn pbl_lift(o: PblOut, f: (Expr) -> Expr) : PblOut = match o {
+  PbPaid(x) -> PbPaid(f(x))
+  _         -> o
+}
+
+fn pbl_plant_plain(nm: String, e: Expr) : PblOut = match pbl_reader(nm, xp_positions(e)) {
+  Some(XP(XAll, c)) ->
+    pbl_lift(pbl_plant(nm, c), (c1) => pbl_rekind(e, prc_map_expr_kind(e.kind, (x) => if pcs_mentions(nm, x) { c1 } else { x })))
+  _ -> PbDecline
+}
+
+# One alternative: planted when it reads `nm`, released on entry when not.
+fn pbl_alt(nm: String, alt: Expr) : PblOut =
+  if pcs_mentions(nm, alt) { pbl_plant(nm, alt) } else { PbPaid(pbl_entry_drop(nm, alt)) }
+
+fn pbl_or_same(o: PblOut, e: Expr) : Expr = match o {
+  PbPaid(x) -> x
+  _         -> e
+}
+
+fn pbl_plant_if(nm: String, e: Expr, c: Expr, t: Expr, oe: Option[Expr]) : PblOut =
+  if pcs_mentions(nm, c) { pbl_lift(pbl_plant(nm, c), (c1) => pbl_rekind(e, EIf(c1, t, oe))) }
+  else {
+    let el = pbl_else(t, oe)
+    pbl_both(pbl_alt(nm, t), pbl_alt(nm, el), (t1, e1) => pbl_rekind(e, EIf(c, pbl_or_same(t1, t), Some(pbl_or_same(e1, el)))))
+  }
+
+# Two sibling alternatives: rebuilt when either was paid.
+fn pbl_both(a: PblOut, b: PblOut, f: (PblOut, PblOut) -> Expr) : PblOut = match a {
+  PbDecline -> PbDecline
+  PbSame    -> match b {
+    PbDecline -> PbDecline
+    PbSame    -> PbSame
+    PbPaid(_) -> PbPaid(f(a, b))
+  }
+  PbPaid(_) -> match b {
+    PbDecline -> PbDecline
+    _         -> PbPaid(f(a, b))
+  }
+}
+
+fn pbl_else(t: Expr, oe: Option[Expr]) : Expr = match oe {
+  Some(e1) -> e1
+  None     -> Expr { kind: EUnit, line: t.line, col: t.col, ty: t.ty, mode: t.mode }
+}
+
+# The skipped edge pays inside the expression: `a and b` becomes
+# `(a or { drop; false }) and b`, `a or b` becomes `(a and { drop; true }) or b`.
+# Lowering to an `if` instead would put `b` in tail position, a goto the
+# short circuit never made.
+fn pbl_plant_sc(nm: String, e: Expr, op: String, a: Expr, b: Expr) : PblOut =
+  if pcs_mentions(nm, a) { pbl_lift(pbl_plant(nm, a), (a1) => pbl_rekind(e, EBinop(op, a1, b))) }
+  else { pbl_sc_paid(nm, e, op, a, b, pbl_plant(nm, b)) }
+
+fn pbl_sc_paid(nm: String, e: Expr, op: String, a: Expr, b: Expr, ob: PblOut) : PblOut = match ob {
+  PbDecline -> PbDecline
+  _         -> {
+    let skip = pbl_entry_drop(nm, pbl_rekind(b, EBool(op == "or")))
+    PbPaid(pbl_rekind(e, EBinop(op, pbl_rekind(e, EBinop(pbl_dual(op), a, skip)), pbl_or_same(ob, b))))
+  }
+}
+
+fn pbl_dual(op: String) : String = if op == "and" { "or" } else { "and" }
+
+fn pbl_plant_match(nm: String, e: Expr, s: Expr, arms: [Arm]) : PblOut =
+  if pcs_mentions(nm, s) { pbl_lift(pbl_plant(nm, s), (s1) => pbl_rekind(e, EMatch(s1, arms))) }
+  else {
+    match pbl_arms(nm, arms) {
+      PaDecline          -> PbDecline
+      PaArms(_, false)   -> PbSame
+      PaArms(arms1, true) -> PbPaid(pbl_rekind(e, EMatch(s, arms1)))
+    }
+  }
+
+# The arms with each body planted or paid on entry, and whether any changed.
+type PblArms = PaDecline | PaArms([Arm], Bool)
+
+fn pbl_arms(nm: String, arms: [Arm]) : PblArms = match arms {
+  []                       -> PaArms([], false)
+  [Arm(p, og, b), ...rest] -> match pbl_arms(nm, rest) {
+    PaDecline         -> PaDecline
+    PaArms(rest1, ch) -> match pbl_guard(nm, og) {
+      PgDecline      -> PaDecline
+      PgKeep         -> pbl_arm_body(nm, Arm(p, og, b), rest1, ch)
+      PgDup(g1)      -> pbl_arm_body(nm, Arm(p, Some(g1), b), rest1, true)
+    }
+  }
+}
+
+fn pbl_arm_body(nm: String, a: Arm, rest1: [Arm], ch: Bool) : PblArms = match a {
+  Arm(p, og, b) -> match pbl_alt(nm, b) {
+    PbDecline  -> PaDecline
+    PbSame     -> PaArms([a, ...rest1], ch)
+    PbPaid(b1) -> PaArms([Arm(p, og, b1), ...rest1], true)
+  }
+}
+
+# A guard read may fall through to a later arm, which no static entry drop
+# can tell from an arm the guard never ran for: the read becomes a dup and
+# the arm bodies pay. An interpolated read cannot take the dup.
+type PblGuard = PgDecline | PgKeep | PgDup(Expr)
+
+fn pbl_guard(nm: String, og: Option[Expr]) : PblGuard = match og {
+  Some(g) ->
+    if not pcs_mentions(nm, g) { PgKeep }
+    else if pbl_spans_mention(nm, g) { PgDecline }
+    else { PgDup(pbl_dup_reads(nm, g)) }
+  None -> PgKeep
+}
+
+fn pbl_dup_reads(nm: String, e: Expr) : Expr = match sym_read_kind(e.kind) {
+  EVar(u) -> if u == nm { pbl_rekind(e, ECall(mk_ref("__perceus_dup", e.line, e.col), [e])) } else { e }
+  _       -> pbl_rekind(e, prc_map_expr_kind(e.kind, (c) => pbl_dup_reads(nm, c)))
+}
+
+fn pbl_spans_mention(nm: String, e: Expr) : Bool = match e.kind {
+  EStr(span, t3) -> pcs_interp_ident_count(nm, span, t3) > 0
+  _              -> pbl_spans_mention_ps(nm, xp_positions(e))
+}
+
+fn pbl_spans_mention_ps(nm: String, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(_, c), ...rest] -> pbl_spans_mention(nm, c) or pbl_spans_mention_ps(nm, rest)
+}
+
+fn pbl_entry_drop(nm: String, alt: Expr) : Expr =
+  Expr { kind: EBlock([pcs_make_drop_stmt(nm, alt.line, alt.col)], Some(alt)),
+         line: alt.line, col: alt.col, ty: alt.ty, mode: alt.mode }
+
+fn pbl_is_dup(f: Expr) : Bool = match sym_read_kind(f.kind) {
+  EVar(c) -> c == "__perceus_dup"
+  _       -> false
+}
+
+fn pbl_reader(nm: String, ps: [XPos]) : Option[XPos] = match ps {
+  []                  -> None
+  [XP(r, c), ...rest] -> if pcs_mentions(nm, c) { Some(XP(r, c)) } else { pbl_reader(nm, rest) }
+}
+
+fn pbl_rekind(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }

@@ -1346,7 +1346,7 @@ tier1-asan-b: kaic2
 	@$(MAKE) -C stage2 test-perceus-switch-scrutinee-selftail-asan
 	@echo "tier1-asan OK — an arm binder consumed by an integral-literal match scrutinee is not released again at the self-tail goto"
 	@$(MAKE) -C stage2 test-perceus-arm-branch-read-asan
-	@echo "tier1-asan OK — a binder read once behind one alternative is released on entry to the others (no over-release on the reading path)"
+	@echo "tier1-asan OK — a binder read at most once per path is released on entry to the alternatives that skip it (no over-release on the reading path)"
 	@$(MAKE) -C stage2 test-perceus-read-identity-asan
 	@echo "tier1-asan OK — binder reads come from one table keyed by identity: no arm inherits a sibling's move, no borrow reads a consumed binder"
 

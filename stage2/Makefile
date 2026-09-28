@@ -7245,11 +7245,11 @@ test-perceus-switch-scrutinee-selftail-native:
 	@echo "perceus-switch-scrutinee-selftail-native SKIP (C-only build; native backend not compiled)"
 endif
 
-# A binder read once by a move behind one `if`/`match` alternative: the
-# alternatives that skip the read release it on entry. The ledger bound
-# catches the per-evaluation leak; the ASAN companion catches an
-# over-release on the path that does read.
-ARM_BRANCH_READ_FIXTURES := arm_branch_single_read_2138
+# A binder read at most once per path, each read a move: the alternatives
+# that skip every read release it on entry, `and`/`or` and guards included.
+# The ledger bound catches the per-evaluation leak; the ASAN companion
+# catches an over-release on the path that does read.
+ARM_BRANCH_READ_FIXTURES := arm_branch_single_read_2138 path_move_read_2144 short_circuit_read_2146 short_circuit_field_cell
 
 test-perceus-arm-branch-read: $(TARGET) build
 	@set -e; \
