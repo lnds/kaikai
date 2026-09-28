@@ -1355,6 +1355,8 @@ tier1-asan-b: kaic2
 	@echo "tier1-asan OK — a borrowed param read into an owned position takes a dup (no early free of the caller's value)"
 	@$(MAKE) -C stage2 test-perceus-spread-consumes-asan
 	@echo "tier1-asan OK — a list spread consumes its operand; a borrowed param in a spread is dup'd first (no use-after-free)"
+	@$(MAKE) -C stage2 test-perceus-reuse-untaken-slot-asan
+	@echo "tier1-asan OK — a reuse arm releases the slots its rebuild does not take, once (no over-release)"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,

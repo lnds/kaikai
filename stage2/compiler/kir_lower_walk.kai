@@ -12,7 +12,6 @@
 # so the two translators (KIR→C, KIR→LLVM) stay dumb.
 
 import compiler.ast
-import compiler.ast_map
 import compiler.marks
 import compiler.sym_read
 import compiler.util
@@ -20,12 +19,12 @@ import compiler.kinds
 import compiler.fnreg
 import compiler.emit_shared
 import compiler.infer
-import compiler.perceus_reads
 import compiler.region
 import compiler.kir
 import compiler.kir_lower
 import compiler.kir_pat_alias
 import compiler.kir_lower_reuse
+import compiler.reuse_uses
 import compiler.kir_lower_raw
 import compiler.cell_promote
 import compiler.loop_lower
@@ -3082,7 +3081,7 @@ fn lower_reuse_flat_fork(x: Expr, donor: KVal, cn: String, cargs: [Expr], st: Lo
     # after `lower_exprs` settles against the WRONG pattern's plan (an
     # inner arm's slot 0 projected out of the outer donor — over-release).
     let plan = st0.rnested
-    let uses = reuse_gc_uses(map(cargs, reuse_unlent), st0.reuse_gc)
+    let uses = reuse_taken_uses(cargs, st0.reuse_gc)
     let st_gc = emit_reuse_gc_increfs(donor, uses, pos, st0)
     match lower_kinds_vals(cargs, ctor_slot_kinds_in(hm, cn, st_gc), 0, st_gc, []) { LResMany(avs, st1) -> {
       let st_decl = ls_emit(st1, KLet(rjoin, SBoxed, KLitOp(KUnitV), pos))
@@ -3290,12 +3289,16 @@ fn lower_reuse_dual(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Ex
   match ls_fresh_reg(st) { LSReg(rjoin, st0) -> {
     let pos = kpos_of(x)
     let hm = ctor_home_of_expr_ty(x)
+    # A direct slot the rebuild does not take has no owner once overwritten:
+    # the unique branch drops it, the shared branch does not dup it.
+    let uses = reuse_taken_uses(cargs, st.reuse_gc)
     let st_decl = ls_emit(st0, KLet(rjoin, SBoxed, KLitOp(KUnitV), pos))
     match bind_op(st_decl, KCall("kaix_check_unique", [donor]), pos) { LRes(uv, st_u) ->
       match three_labels(st_u) { LSL3(l_uniq, l_shared, l_join, st_l) -> {
         let st_fork = ls_seal(st_l, KCondBr(uv, l_uniq, l_shared, pos), l_uniq)
         # UNIQUE: direct slots stay borrows (no dup); rebuild; reuse in place.
-        let st_ub = match lower_kinds_vals(cargs, ctor_slot_kinds_in(hm, cn, st_fork), 0, st_fork, []) { LResMany(avs_u, st_u1) -> {
+        let st_ub = match lower_kinds_vals(cargs, ctor_slot_kinds_in(hm, cn, st_fork), 0, st_fork, []) { LResMany(avs_u, st_u0) -> {
+          let st_u1 = rn_flat_unique_drops(rn_directs(st.rnested), donor, uses, pos, st_u0)
           let tag_u = ls_variant_tag_in(st_u1, hm, cn)
           match bind_op(st_u1, KConReuse(rk, donor, cn, tag_u, typed_inits_in(avs_u, hm, cn, st_u1)), pos) { LRes(ru, st_u2) ->
             ls_seal(ls_emit(st_u2, KStore(rjoin, ru, pos)), KBr(l_join, pos), l_shared) } } }
@@ -3303,7 +3306,7 @@ fn lower_reuse_dual(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Ex
         # rebuild allocates a real KAI_CONS cell (`kai_cons`) — `Cons` is the
         # builtin list ctor, not a registered variant, so a `KCon` here would
         # build a variant-shaped cell whose `as.cons` reads are garbage.
-        let st_sd = emit_direct_dups(st.reuse_gc, pos, st_ub)
+        let st_sd = emit_direct_dups(rn_taken(st.reuse_gc, uses), pos, st_ub)
         let st_sb = match lower_kinds_vals(cargs, ctor_slot_kinds_in(hm, cn, st_sd), 0, st_sd, []) { LResMany(avs_s, st_s1) ->
           match bind_op(st_s1, reuse_fresh_op(rk, hm, cn, avs_s, st_s1), pos) { LRes(rs, st_s2) ->
             ls_seal(ls_emit(st_s2, KStore(rjoin, rs, pos)), KBr(l_join, pos), l_join) } }
@@ -3370,51 +3373,6 @@ fn emit_reuse_gc_increfs(donor: KVal, uses: [String], pos: KPos, st: LowerSt) : 
 fn emit_reuse_leaf_dups(uses: [String], pos: KPos, st: LowerSt) : LowerSt = match uses {
   []           -> st
   [n, ...rest] -> emit_reuse_leaf_dups(rest, pos, ls_emit(st, KRC(KDup(KVar(ls_reg_of(st, n))), pos)))
-}
-
-# The multiset of scrutinee pointer-binder USES the rebuild args reach —
-# EVERY occurrence, whatever shape carries it (a call arg, a nested ctor,
-# a match scrutinee, an if branch, a block tail). A kept child used
-# anywhere still needs the shared-donor incref: when the donor is shared,
-# the reuse fresh-allocs the rebuild but the donor keeps its own reference
-# to the child, and the use would consume / reuse-in-place that
-# still-aliased child. A use this walk misses is a child freed while the
-# shared donor's slot still points at it — the donor's later cascade then
-# frees or reads freed memory. `KIncrefIfShared` is conditional, so a
-# unique donor pays nothing and the use MOVEs the child as before.
-# `pcs_read_table` (scoped to the binder names) is the same
-# full-coverage walker perceus's own dup discipline runs on.
-fn reuse_gc_uses(cargs: [Expr], gc: [String]) : [String] / Console = match gc {
-  [] -> []
-  _  -> reuse_gc_uses_exprs(cargs, gc, [])
-}
-
-fn reuse_gc_uses_exprs(es: [Expr], gc: [String], acc: [String]) : [String] / Console = match es {
-  []           -> acc
-  [e, ...rest] -> reuse_gc_uses_exprs(rest, gc,
-                    reuse_gc_use_names(pcs_read_table(e, gc), gc, acc))
-}
-
-# A read under `__perceus_borrow` is lent to a borrowing call and takes no
-# reference; only the flat fork, whose unique-branch drops follow the args,
-# drops it from the uses.
-fn reuse_unlent(e: Expr) : Expr = match e.kind {
-  ECall(f, _) -> match f.kind {
-    EMark(MkBorrow) -> Expr { kind: EUnit, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
-    _               -> Expr { kind: prc_map_expr_kind(e.kind, reuse_unlent), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
-  }
-  _ -> Expr { kind: prc_map_expr_kind(e.kind, reuse_unlent), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
-}
-
-# The collector grows its scope with lambda params, so it returns their
-# uses too — keep only the names that are actually donor binders.
-fn reuse_gc_use_names(us: [Use], gc: [String], acc: [String]) : [String] = match us {
-  []           -> acc
-  [u, ...rest] -> match u {
-    U(nm, _, _, _) ->
-      if name_in_list(gc, nm) { reuse_gc_use_names(rest, gc, [nm, ...acc]) }
-      else { reuse_gc_use_names(rest, gc, acc) }
-  }
 }
 
 # The record-reuse rebuild is an `ERecordLit` (perceus wraps it directly);
