@@ -1,0 +1,80 @@
+#[doc("""
+An `_`-prefixed binder is an ordinary binder whose name only silences the
+unused warning.
+
+A pattern binder spelled that way and never read becomes a wildcard here,
+and an unread `..._t` rest becomes the anonymous rest. This runs once, as
+patterns are lowered, so every later pass reads "unused" from the pattern's
+shape and never from a name. A read binder stays bound whatever its name.
+
+A read is anything `pcs_mentions` sees, lambdas and interpolations
+included; an over-count only keeps a binder bound, which is always sound.
+""")]
+
+import compiler.ast
+import compiler.perceus_reads
+
+#[doc("True when `name` asks for the unused warning to stay silent: one leading `_`. A `__` prefix marks a compiler-internal name, which is exempt.")]
+pub fn ub_silenced_name(name: String) : Bool = match char_at(name, 0) {
+  Some(c0) -> c0 == '_' and match char_at(name, 1) {
+    Some(c1) -> c1 != '_'
+    None     -> true
+  }
+  None -> false
+}
+
+#[doc("The binder an anonymous list rest takes at the `[` of `(line, col)`. Unique per pattern, since two rests never share a `[`.")]
+pub fn ub_rest_sentinel(line: Int, col: Int) : String =
+  concat_all(["__list_rest_", int_to_string(line), "_", int_to_string(col), "__"])
+
+#[doc("The arm with its pattern's unread `_`-prefixed binders made wildcards. The guard and the body are the binders' scope.")]
+pub fn ub_arm(a: Arm) : Arm = match a {
+  Arm(p, g, b) -> Arm(ub_pat(p, (n) => ub_read_in_arm(n, g, b)), g, b)
+}
+
+#[doc("The block's statements with each `let` pattern's unread `_`-prefixed binders made wildcards. A `let` binds for the statements after it and the tail.")]
+pub fn ub_block(ss: [Stmt], tail: Option[Expr]) : [Stmt] = match ss {
+  [] -> []
+  [s, ...rest] -> [ub_stmt(s, rest, tail), ...ub_block(rest, tail)]
+}
+
+fn ub_stmt(s: Stmt, rest: [Stmt], tail: Option[Expr]) : Stmt = match s {
+  SLet(p, ty, e) -> SLet(ub_pat(p, (n) => ub_read_after(n, rest, tail)), ty, e)
+  _              -> s
+}
+
+fn ub_read_in_arm(n: String, g: Option[Expr], b: Expr) : Bool =
+  pcs_mentions(n, b) or match g {
+    Some(ge) -> pcs_mentions(n, ge)
+    None     -> false
+  }
+
+fn ub_read_after(n: String, rest: [Stmt], tail: Option[Expr]) : Bool =
+  pcs_mentions(n, mk_expr(EBlock(rest, tail), 0, 0))
+
+fn ub_pat(p: Pattern, read: (String) -> Bool) : Pattern = match p.pkind {
+  PBind(n) -> if ub_silenced_name(n) and not read(n) { mk_pat(PWild, p.line, p.col) } else { p }
+  PList(ps, rest) ->
+    mk_pat(PList(ub_pats(ps, read), ub_rest(rest, read, p.line, p.col)), p.line, p.col)
+  PVariant(h, n, ps)        -> mk_pat(PVariant(h, n, ub_pats(ps, read)), p.line, p.col)
+  PVariantRecord(h, n, fs)  -> mk_pat(PVariantRecord(h, n, ub_fields(fs, read)), p.line, p.col)
+  PRecord(fs)               -> mk_pat(PRecord(ub_fields(fs, read)), p.line, p.col)
+  PAs(n, sub)               -> mk_pat(PAs(n, ub_pat(sub, read)), p.line, p.col)
+  _                         -> p
+}
+
+fn ub_pats(ps: [Pattern], read: (String) -> Bool) : [Pattern] = match ps {
+  [] -> []
+  [p, ...rest] -> [ub_pat(p, read), ...ub_pats(rest, read)]
+}
+
+fn ub_fields(fs: [PField], read: (String) -> Bool) : [PField] = match fs {
+  [] -> []
+  [PField(name, sub, short), ...rest] -> [PField(name, ub_pat(sub, read), short), ...ub_fields(rest, read)]
+}
+
+fn ub_rest(rest: Option[String], read: (String) -> Bool, line: Int, col: Int) : Option[String] =
+  match rest {
+    Some(r) -> if ub_silenced_name(r) and not read(r) { Some(ub_rest_sentinel(line, col)) } else { rest }
+    None    -> None
+  }
