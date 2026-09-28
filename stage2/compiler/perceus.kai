@@ -48,9 +48,7 @@ import compiler.fnreg
 import compiler.ast_map
 import compiler.expr_positions
 import compiler.borrow_infer
-import compiler.perceus_op_arg
-import compiler.perceus_let_own
-import compiler.perceus_spread_own
+import compiler.perceus_owned_pos
 import compiler.perceus_lend_tail
 import compiler.perceus_payer
 import compiler.perceus_branch_pay
@@ -622,14 +620,6 @@ fn pcs_borrowed_closure_names(borrowed: [String], params: [Param]) : [String] =
 # does not touch.
 # Context for the caller-side borrow strip.
 #
-# `bclosures` (issue #1130) — the current fn's borrowed function-typed
-# params. They live in the skip-set (never dup'd on a read), so when one
-# flows to an OWNED argument slot of a callee it would reach a consuming
-# callee with no incref → use-after-free. Dup-on-consume (rule 3, Koka
-# `parcBorrowApp`): re-insert `__perceus_dup(f)` at that owned-exit. The
-# decision is local — it uses only the callee's `bmap` positions, so the
-# balance closes inside this decl regardless of partition grouping.
-#
 # `fn_names` (issue #1130 rule 1) — the known top-level fns. A bare fn name
 # in a borrowed slot materialises a fresh `kai_closure` the callee borrows
 # but no one drops; it is marked `__perceus_owned_borrow` here for the emit
@@ -646,7 +636,7 @@ fn pcs_borrowed_closure_names(borrowed: [String], params: [Param]) : [String] =
 # call. Multi-use names are never marked: their bare borrowed reads are
 # stripped dups (net-zero), and per-read reclassification is unsound
 # where sugar clones share one source position.
-type StripCx = { bmap: [BorrowEntry], borrow_last: [String], bclosures: [String],
+type StripCx = { bmap: [BorrowEntry], borrow_last: [String],
                  fn_names: [String], no_wrap: [String], uses: [Use], fns: FnIndex }
 
 fn pcs_strip_borrow_args_d(e: Expr, scx: StripCx) : Expr =
@@ -745,9 +735,6 @@ fn pcs_strip_args_at_d(args_: [Expr], positions: [Int], i: Int, scx: StripCx) : 
     # ref in a local C statement-expression, invisible to tcrec/TCO.
     # A bare read the rewrite classified as a MOVE takes the same mark:
     # its delegated release never happens in a borrowing callee.
-    # Owned slot carrying a bare borrowed closure: dup-on-consume (#1130,
-    # rule 3) — the callee consumes it, so pay the incref here so the
-    # borrowed param's single exit-drop still balances.
     let a2 = if borrowed_slot {
                let s = pcs_strip_dup_wrap(a1)
                if pcs_arg_is_fn_name(s, scx.fn_names) and pcs_arg_is_untracked(s, scx.uses) { prs_wrap_owned_borrow(s) }
@@ -755,7 +742,6 @@ fn pcs_strip_args_at_d(args_: [Expr], positions: [Int], i: Int, scx: StripCx) : 
                else if pcs_arg_is_owned_rvalue(s) { prs_wrap_owned_borrow(s) }
                else { s }
              }
-             else if pcs_arg_is_bare_borrowed_closure(a1, scx.bclosures) { pcs_wrap_dup(a1) }
              else { a1 }
     [a2, ...pcs_strip_args_at_d(rest, positions, i + 1, scx)]
   }
@@ -810,15 +796,6 @@ fn pcs_ty_is_rc(ty: Option[Ty]) : Bool = match ty {
   None    -> false
 }
 
-# A bare `EVar(f)` argument (no dup wrap — it was suppressed by the skip-
-# set) whose name is a borrowed closure param of the current fn. Flowing to
-# an owned slot, it needs the dup-on-consume. A borrowing-indirect-call arg
-# is a CALL of `f`, not a value-flow, so it is not matched here.
-fn pcs_arg_is_bare_borrowed_closure(a: Expr, bclosures: [String]) : Bool = match sym_read_kind(a.kind) {
-  EVar(nm) -> list_has(bclosures, nm)
-  _        -> false
-}
-
 # A bare top-level fn name passed by value (the emit materialises a fresh
 # `kai_closure`, like a lambda literal). A local/param is never marked —
 # it is borrow-through or tracked, and dropping it would over-free.
@@ -835,13 +812,6 @@ fn pcs_efn_names_loop(fns: [EFn]) : [String] = match fns {
   []           -> []
   [f, ...rest] -> match f { EFn(nm, _, _, _, _) -> [nm, ...pcs_efn_names_loop(rest)] }
 }
-
-fn pcs_wrap_dup(a: Expr) : Expr =
-  Expr { kind: ECall(
-           Expr { kind: EVar("__perceus_dup"), line: a.line, col: a.col,
-                  ty: None, mode: MUnknown },
-           [a]),
-         line: a.line, col: a.col, ty: a.ty, mode: a.mode }
 
 #[doc("True when the int list contains `t`.")]
 pub fn pcs_has_int(xs: [Int], t: Int) : Bool = match xs {
@@ -1664,7 +1634,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # callee releases. Same strip as the mixed path — no params, so no
         # borrowed/raw/skip sets and no `no_wrap` names.
         let borrow_last = pcs_collect_borrow_last_set(pcs_let_binder_names(body, []), body, prim_bmap)
-        let scx = StripCx { bmap: bmap, borrow_last: borrow_last, bclosures: [],
+        let scx = StripCx { bmap: bmap, borrow_last: borrow_last,
                             fn_names: fn_names, no_wrap: [], uses: uses, fns: fns }
         let body_borrow = pcs_strip_borrow_args_d(reused_body, scx)
         DFn(is_pub, name, tparams, params, opt_ret, row, body_borrow, ln, cl, mo, fsym)
@@ -1818,7 +1788,11 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         let param_dropped = pcs_inject_param_branch_drops(arm_dropped,
           pcs_names_paid_by(owned_moves, uses, psets, PyBranch), name)
         let branch_paid = pbp_branch_drops(param_dropped, pnames, uses, path_moves)
-        let reused_body = pcs_recognise_reuse_expr_b(pso_own_spreads(branch_paid, borrowed), borrowed)
+        # Every owned position a borrowed binder reaches takes a dup, before
+        # reuse recognition turns a ctor or cons literal into a reuse cell.
+        let owned_body = pop_own_positions(branch_paid, pcs_strs_minus(borrowed, raw_pnames),
+                                           (f) => pcs_borrow_lookup(bmap, pcs_callee_key(f)))
+        let reused_body = pcs_recognise_reuse_expr_b(owned_body, borrowed)
         # Borrowed params carry no exit obligation — exclude from the
         # unused-param drop. Raw params (mixed-sig) likewise carry no rc,
         # so they must not receive an unused-param drop either.
@@ -1846,25 +1820,17 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         # consume, so the closure's exit drop frees it exactly once.
         let borrowed_closures = pcs_borrowed_closure_names(borrowed, params)
         let body_borrow_call = pcs_wrap_borrow_calls(body_borrow_scr, borrowed_closures)
-        # Dup-on-consume (#1130 rule 3): a borrowed closure flowing to an
-        # owned callee slot re-dups here, so `map`/`filter` that delegate to
-        # an owned private loop stay sound (the loop gets a genuinely owned
-        # ref). Threaded into the strip so it fires per owned-exit.
         # Bare-move detection: names whose bare reads are NOT owned moves —
         # the skip/move/reuse sets (union already includes borrowed + raw
         # params) plus the exit-dropped opaque locals and force-dup'd
         # branchy singles.
         let no_wrap = pcs_list_union(pcs_list_union(pcs_list_union(rewrite_skip_set, opaque_lets), branchy_single),
                                      borrow_only)
-        let scx = StripCx { bmap: bmap, borrow_last: borrow_last, bclosures: borrowed_closures,
+        let scx = StripCx { bmap: bmap, borrow_last: borrow_last,
                             fn_names: fn_names, no_wrap: no_wrap, uses: uses, fns: fns }
         let body_borrow = pcs_strip_borrow_args_d(body_borrow_call, scx)
-        # Last: an op argument and a `let` value are owned, and a borrowed
-        # binder is the one read that arrives without a reference of its own.
-        let body_op_args = poa_own_op_args(body_borrow, borrowed)
-        let body_lets = plo_own_let_values(body_op_args, borrowed)
         let self_bpos = pcs_borrow_positions(map(params, (p) => p.pname), pcs_strs_minus(borrowed, raw_pnames), 0)
-        let body_lent = plt_lend_binders(body_lets, name, self_bpos, borrowed,
+        let body_lent = plt_lend_binders(body_borrow, name, self_bpos, borrowed,
                                          (f) => pcs_boxed_borrow_slots(bmap, fns, f))
         DFn(is_pub, name, tparams, params, opt_ret, row, body_lent, ln, cl, mo, fsym)
       }

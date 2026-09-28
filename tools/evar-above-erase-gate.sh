@@ -51,8 +51,8 @@ ALLOW="$ALLOW|json_derive|layout_derive|fmt_expr|tailfuse|tailsubst"
 ALLOW="$ALLOW|pipe_fusion|resolve|infer|monomorph|fwd_inline"
 ALLOW="$ALLOW|closure_spec_ast|closure_spec_emit|cache_ast|sym_read"
 ALLOW="$ALLOW|emit_tcrec_live|cache_delta_test|resolve_sym_test"
-ALLOW="$ALLOW|perceus|perceus_plant_drop|perceus_tail_drop|perceus_op_arg"
-ALLOW="$ALLOW|perceus_payer|perceus_let_own|unbox|unbox_native_raw|cell_promote"
+ALLOW="$ALLOW|perceus|perceus_plant_drop|perceus_tail_drop|perceus_owned_pos"
+ALLOW="$ALLOW|perceus_payer|unbox|unbox_native_raw|cell_promote"
 ALLOW="$ALLOW|perceus_branch_plant"
 
 # Passes at or below the erasure. `EVar` is their correct form: the name
