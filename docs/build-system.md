@@ -154,11 +154,13 @@ Traps:
 
 Builds one `kaic2` from the `release` boot and one from the `seed` boot (two hops each) under `stage2/build/boot-verify/`, and requires byte-identical emitted C from both for the compiler itself and for a sample program — the `kaic2-fast-verify` contract across boots. It also requires each boot's `kaic2-a` and its `kaic2` to emit the same C for the compiler: the fixed point showing the boot's codegen did not miscompile `kaic2-a`. Each boot's `stage2.c` is reused on an exact identity match. Does not touch `stage2/kaic2`; fetches the release on first use and needs the seed tags.
 
+It runs in two halves: `make kaic-boot-verify-one BOOT=release|seed` builds one boot's `kaic2` and checks its fixed point, independently of the other boot; `make kaic-boot-verify-cross` compares the two halves' `self.c` and `sample.c`. `make kaic-boot-verify` runs both halves in series, then the cross check.
+
 ### Which boot CI uses
 
 Every CI workflow that builds or consumes a `kaic2` sets `KAIC_BOOT=release` workflow-wide. The consumers need the mode too: the artifact ships `stage2.c.id`, and a job whose mode disagrees with it rebuilds `stage2.c`. The build jobs still build `kaic1`, because tier1 tests stage 1 itself and the artifact carries it; the bootstrap caches fold the resolved release (`release-id`), `EDITION` and `tools/kaic-boot.sh` into their key.
 
-The `cc`-only route runs in two places. The daily `bootstrap-from-scratch` job fetches the seed tags and runs `make kaic-boot-verify` on a clean runner with its own `cc`. The release build (`scripts/build-release.sh`) sets `KAIC_BOOT=seed`, so every shipped `kaic2` is booted by C that `cc` alone compiles, and it emits the next seed (§seed). It also builds `kaic0` → `kaic1` and self-hosts stage 1, so the frozen chain stays verified.
+The `cc`-only route runs in two places. The daily `bootstrap-boot` jobs run one `kaic-boot-verify-one` half each, in parallel on clean runners with their own `cc` (the seed job fetches the seed tags), and `bootstrap-from-scratch` runs `kaic-boot-verify-cross` on their outputs. The release build (`scripts/build-release.sh`) sets `KAIC_BOOT=seed`, so every shipped `kaic2` is booted by C that `cc` alone compiles, and it emits the next seed (§seed). It also builds `kaic0` → `kaic1` and self-hosts stage 1, so the frozen chain stays verified.
 
 ## The package — why `main.kai` is a stub
 
