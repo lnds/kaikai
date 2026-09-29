@@ -877,7 +877,8 @@ fn find_proto_op(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] {
 # substitutes to `arg_heads[i]` (or the target when `arg_heads == []`,
 # the homogeneous default per the lower_impls rule). Parameters are
 # compared structurally, so two instantiations of one constructor are
-# distinguished; the return below still compares head names only.
+# distinguished; the return below compares head names only, except a
+# function type, which has no meaningful head and compares structurally.
 # Unannotated impl params (`ptype == None`) are not checked — the
 # typer infers them; a pre-typer pass has no signal to compare against.
 fn check_sig_heads(impl_params: [Param], proto_params: [Param],
@@ -904,21 +905,30 @@ fn check_sig_heads(impl_params: [Param], proto_params: [Param],
   else { match impl_ret_opt {
     None -> e_params
     Some(impl_ret) -> {
-      let ih = proto_type_name(impl_ret)
-      let ph = sig_head_subst(proto_ret, tname, proto_tps, arg_heads)
-      if ih == ph { e_params }
+      let ok = match proto_ret.tkind {
+        TyFn(_, _, _) -> sig_type_matches(impl_ret, sig_subst(proto_ret, tname, target, proto_tps, arg_heads))
+        _ -> proto_type_name(impl_ret) == sig_head_subst(proto_ret, tname, proto_tps, arg_heads)
+      }
+      if ok { e_params }
       else {
         eprint(concat_all([
           file, ":", int_to_string(line), ":", int_to_string(col),
           ": error: impl method `", op_name, "` in `",
           pname, " for ", tname,
           "` returns `", type_text(impl_ret),
-          "` but protocol declares return type `", ph, "`"]))
+          "` but protocol declares return type `", sig_ret_display(proto_ret, tname, target, proto_tps, arg_heads), "`"]))
         e_params + 1
       }
     }
   } }
 }
+
+fn sig_ret_display(t: TypeExpr, tname: String, target: TypeExpr,
+                   proto_tps: [String], arg_heads: [String]) : String =
+  match t.tkind {
+    TyFn(_, _, _) -> type_text(sig_subst(t, tname, target, proto_tps, arg_heads))
+    _ -> sig_head_subst(t, tname, proto_tps, arg_heads)
+  }
 
 # An impl is heterogeneous iff it carries explicit bracket args and
 # at least one of them differs from the target head. Legacy un-
@@ -990,9 +1000,49 @@ fn sig_type_matches(impl_t: TypeExpr, proto_t: TypeExpr) : Bool {
       TyList(iinner) -> sig_type_matches(iinner, pinner)
       _ -> false
     }
+    TyFn(pps, pret, prow) -> match impl_t.tkind {
+      TyFn(ips, iret, irow) ->
+        sig_types_match(ips, pps) and sig_type_matches(iret, pret) and sig_rows_match(irow, prow)
+      _ -> false
+    }
     _ -> proto_type_name(impl_t) == proto_type_name(proto_t)
   }
 }
+
+# Two closed rows match when their label sets do.
+fn sig_rows_match(ir: RowExpr, pr: RowExpr) : Bool =
+  # Compatibility with an open row is undecided, so it is not rejected.
+  row_is_open(ir) or row_is_open(pr)
+    or (sig_labels_within(row_labels_of(ir), row_labels_of(pr), true)
+      and sig_labels_within(row_labels_of(pr), row_labels_of(ir), false))
+
+fn row_is_open(r: RowExpr) : Bool = match r { ROpen(_, _) -> true  _ -> false }
+
+fn row_labels_of(r: RowExpr) : [RowLabel] =
+  match r { REmpty -> []  RClosed(ls) -> ls  ROpen(_, ls) -> ls }
+
+# Every label of `xs` has a counterpart in `ys`; `xs_impl` says which side is the impl's.
+fn sig_labels_within(xs: [RowLabel], ys: [RowLabel], xs_impl: Bool) : Bool =
+  match xs {
+    [] -> true
+    [x, ...rest] -> sig_label_in(x, ys, xs_impl) and sig_labels_within(rest, ys, xs_impl)
+  }
+
+fn sig_label_in(x: RowLabel, ys: [RowLabel], x_impl: Bool) : Bool =
+  match ys {
+    [] -> false
+    [y, ...rest] ->
+      (if x_impl { sig_label_matches(x, y) } else { sig_label_matches(y, x) })
+        or sig_label_in(x, rest, x_impl)
+  }
+
+fn sig_label_matches(i: RowLabel, p: RowLabel) : Bool =
+  match i {
+    RL(inm, iargs) -> match p {
+      RL(pnm, pargs) ->
+        inm == pnm and (pargs == [] or iargs == [] or sig_types_match(iargs, pargs))
+    }
+  }
 
 fn sig_types_match(its: [TypeExpr], pts: [TypeExpr]) : Bool {
   match pts {
@@ -1024,7 +1074,24 @@ fn sig_subst(t: TypeExpr, tname: String, target: TypeExpr,
       }
     }
     TyList(inner) -> mk_ty(TyList(sig_subst(inner, tname, target, proto_tps, arg_heads)), t.line, t.col)
+    TyFn(ps, ret, row) -> {
+      let sps = map(ps, (p) => sig_subst(p, tname, target, proto_tps, arg_heads))
+      let sret = sig_subst(ret, tname, target, proto_tps, arg_heads)
+      mk_ty(TyFn(sps, sret, sig_subst_row(row, tname, target, proto_tps, arg_heads)), t.line, t.col)
+    }
     _ -> t
+  }
+}
+
+fn sig_subst_row(r: RowExpr, tname: String, target: TypeExpr,
+                 proto_tps: [String], arg_heads: [String]) : RowExpr {
+  let sub = (l: RowLabel) => match l {
+    RL(n, args) -> RL(n, map(args, (a) => sig_subst(a, tname, target, proto_tps, arg_heads)))
+  }
+  match r {
+    REmpty -> REmpty
+    RClosed(ls) -> RClosed(map(ls, sub))
+    ROpen(tail, ls) -> ROpen(tail, map(ls, sub))
   }
 }
 
