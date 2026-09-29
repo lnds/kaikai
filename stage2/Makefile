@@ -2734,7 +2734,7 @@ test-trap-exit-cancel-asan: $(TARGET) build
 # stderr pipe, the chunked read buffer, the EPIPE dead-reader write
 # path, and the readiness parks of a reader whose child stays silent and
 # of a writer whose child stops reading.
-PROCESS_BASIC_FIXTURES := process_basic process_piped_capture process_piped_pager process_piped_epipe process_piped_big process_read_stdout_timers process_piped_stderr process_write_stdin_timers
+PROCESS_BASIC_FIXTURES := process_basic process_piped_capture process_piped_pager process_piped_epipe process_piped_big process_read_stdout_timers process_piped_stderr process_write_stdin_timers process_kill_group
 
 test-process-basic-asan: $(TARGET) build
 	@set -e; \
