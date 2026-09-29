@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Validate --holes-json output against the stable schema.
 
-Exit 0 iff the file parses as a JSON array and every element carries
-the fixed key set from docs/typed-holes.md.
+Exit 0 iff the file parses as a JSON array, every element carries
+the fixed key set from docs/typed-holes.md, and every candidate is a
+source expression: no typer-internal key (`#<id>.op`, `T::C`, `__x`).
 """
 import json
 import sys
@@ -21,6 +22,8 @@ REQUIRED = {
 }
 
 VALID_KINDS = {"hole", "todo"}
+
+INTERNAL_MARKS = ("#", "::", "__")
 
 
 def main() -> int:
@@ -49,6 +52,10 @@ def main() -> int:
         if row["kind"] == "todo" and not isinstance(row["message"], str):
             print(f"entry {i}: todo sites must have a string message", file=sys.stderr)
             return 1
+        for c in row["candidates"]:
+            if any(m in c["expr"] for m in INTERNAL_MARKS):
+                print(f"entry {i}: candidate {c['expr']!r} is not a source expression", file=sys.stderr)
+                return 1
     return 0
 
 

@@ -7,11 +7,13 @@ Emits the `--holes-json`, `--holes-json-scope`, `--effects-json` and
 
 import compiler.util
 import compiler.diag
+import compiler.diag_file
 import compiler.ast
 import compiler.infer
 import compiler.infer_dump
 import compiler.infer_json_base
 import compiler.infer_effects_json
+import compiler.hole_scope
 
 # ---- `--holes-json`: machine-readable hole reports ----
 #
@@ -39,13 +41,14 @@ fn json_candidates(cs: [String]) : String =
   concat_all(["[", inf_join_with(map(cs, json_candidate), ", "), "]"])
 
 fn json_hole_report(file: String, doc_items: [DocItem], rh: ResolvedHole,
-                    toplevel_len: Int, full: Bool) : String {
+                    toplevel_len: Int, hidden: [String], full: Bool) : String {
   match rh {
     RH(kind, line, col, ty, scope, env_fresh) -> {
       let kj = hole_kind_json(kind)
-      let shown = if full { scope } else { drop_last_entries(scope, toplevel_len) }
-      let elided = list_length(scope) - list_length(shown)
-      let cands = synth_candidates(scope, ty, env_fresh)
+      let visible = hole_visible_scope(scope, toplevel_len, hidden)
+      let shown = if full { visible } else { hole_local_scope(scope, toplevel_len) }
+      let elided = list_length(visible) - list_length(shown)
+      let cands = synth_candidates(visible, ty, env_fresh)
       # the surrounding declaration's `#[doc(...)]` text,
       # resolved by source position against the root file's doc side
       # table. null when the surrounding decl is undocumented.
@@ -91,39 +94,26 @@ fn hole_kind_json(k: HoleKind) : HoleKindJson {
   }
 }
 
-#[doc("infer: --holes-json structured typed-hole report over the build front-end's typed program. doc_items is the root file's doc side table; `full` lists every reachable binding instead of the hole's locals.")]
-pub fn dump_holes_json(file: String, tp: TypedProgram, doc_items: [DocItem], full: Bool) : Int / Console + File {
-
-  let body = inf_join_with(map(tp.holes, (h) => json_hole_report(file, doc_items, h, tp.toplevel_len, full)), ", ")
+#[doc("infer: --holes-json structured typed-hole report over the build front-end's typed program. doc_items is the root file's doc side table; `hidden` names the top-level bindings the root file cannot reach; `full` lists every reachable binding instead of the hole's locals.")]
+pub fn dump_holes_json(file: String, tp: TypedProgram, doc_items: [DocItem], hidden: [String], full: Bool) : Int / Console + File {
+  let body = inf_join_with(map(tp.holes, (h) => json_hole_report(file, doc_items, h, tp.toplevel_len, hidden, full)), ", ")
   print(concat_all(["[", body, "]"]))
   tp.errs
 }
 
 # ---- `--effects-json`: per-fn effect graph as data ----
 #
-# For each user-declared `DFn` in the typed AST, emit a JSON object
-# capturing the effects performed by the body and the handlers
-# installed within it. Effect detection is post-inference: the typed
-# `EVar("Eff.op")` references inside the body name the effects;
-# `EHandle` nodes name the handlers. Returns the inference's error
-# count so a typer-rejected program still produces a non-zero exit.
-#
 # Schema (stable):
-#   [{"fn": String, "line": Int, "col": Int,
+#   [{"file": String, "fn": String, "line": Int, "col": Int,
 #     "effects": [String],
 #     "handlers_installed": [{"effect": String, "line": Int, "col": Int}]}]
 #
-# `effects` lists each *distinct* effect performed by the body in
-# declaration order of first appearance (sorted lexicographically
-# would also be fine — the schema does not promise an order, but
-# stable across runs is the only invariant a consumer needs).
-# Compiler-internal aliases like `__proto_show` are filtered out.
+# Every function the compilation sees is reported, auto-loaded core
+# included; `file` is the one declaring it, so a consumer filters on it.
 
-
-#[doc("infer: --effects-json structured effect-row report over the build front-end's typed program.")]
-pub fn dump_effects_json(file: String, tp: TypedProgram) : Int / Console + File {
-
-  let entries = effects_walk_decls(tp.decls, [])
+#[doc("infer: --effects-json structured effect-row report over the build front-end's typed program; `df` attributes each function to its file.")]
+pub fn dump_effects_json(df: DiagFiles, tp: TypedProgram) : Int / Console + File {
+  let entries = effects_walk_decls(tp.decls, df, [])
   let body = inf_join_with(map(entries, effects_json_entry), ", ")
   print(concat_all(["[", body, "]"]))
   tp.errs

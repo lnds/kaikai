@@ -1003,6 +1003,11 @@ test-typecheck: kaic2
 	./bin/kai typecheck examples/typecheck/clean.kai --holes-json > /tmp/kaikai-typecheck-hj.out 2>&1 \
 	  && grep -q '^\[\]$$' /tmp/kaikai-typecheck-hj.out \
 	  || { echo "test-typecheck FAIL — --holes-json mount broken"; cat /tmp/kaikai-typecheck-hj.out; exit 1; }; \
+	eff=examples/typecheck/effects_file.kai; \
+	./bin/kai typecheck $$eff --effects-json > /tmp/kaikai-typecheck-ej.out 2>&1 \
+	  && python3 scripts/effects_json_files.py /tmp/kaikai-typecheck-ej.out $$eff > /tmp/kaikai-typecheck-ej.got \
+	  && diff $${eff%.kai}.out.expected /tmp/kaikai-typecheck-ej.got \
+	  || { echo "test-typecheck FAIL — --effects-json records must name their file"; head -c 2000 /tmp/kaikai-typecheck-ej.out; exit 1; }; \
 	echo "test-typecheck OK — clean exit 0, negative rejected with build-identical diagnostic, JSON mounts live"
 
 # Check-vs-build diagnostic identity (issue #1427): every compile-time

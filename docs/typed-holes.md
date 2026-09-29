@@ -91,6 +91,12 @@ where each element describes one hole. Stable schema:
 reachable bindings not listed. `kai build --holes-json-scope` lists
 everything in `in_scope` (core included) with `scope_elided: 0`.
 
+A reachable binding is one the root file can write at the hole: a
+candidate or `in_scope` entry never names a top-level declaration
+private to another module, nor a compiler-internal key (an operation
+keyed by effect identity, a `Type::Ctor` lookup key, a `__`-prefixed
+helper).
+
 `kind` is `"hole"` for `?` / `?name` and `"todo"` for `todo!("msg")`,
 which share the typed-hole pipeline (see *Implementation notes*).
 `message` carries the `todo!` argument for `"todo"` kinds, `null`
