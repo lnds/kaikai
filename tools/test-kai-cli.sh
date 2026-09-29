@@ -239,6 +239,16 @@ case "$got" in
   *) fail "mutate: unmutated module that does not typecheck"; printf '%s\n' "$got" | sed 's/^/        /' ;;
 esac
 
+# A module without sites lists nothing and counts no mutant.
+N="$ROOT/examples/mutate"
+expect "mutate: --list over a module without sites is empty" 0 "$(cat "$N/no_sites.sites.expected")" \
+  sh -c 'cd "$1" && "$2" mutate --list --module no_sites.kai 2>/dev/null' _ "$N" "$KAI"
+got="$(cd "$N" && "$KAI" mutate --module no_sites.kai --oracle true --json 2>/dev/null)" || true
+case "$got" in
+  '{"mutants": 0, "killed": 0, "compile_failed": 0,'*) ok "mutate: a module without sites counts no mutant" ;;
+  *) fail "mutate: module without sites"; printf '        got: %s\n' "$got" ;;
+esac
+
 # The driver surface: `--list --json` prints one JSON object per site and
 # line, and `--apply` prints the module with exactly that site's byte span
 # replaced. Multibyte text ahead of every site keeps bytes and characters apart.
