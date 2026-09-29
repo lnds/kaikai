@@ -45,6 +45,7 @@
 
 import compiler.util
 import compiler.ast
+import compiler.expr_positions
 import compiler.sym_read
 import compiler.parse
 import compiler.infer
@@ -950,221 +951,75 @@ pub fn ty_is_unboxable_t(t: Ty) : Bool {
   }
 }
 
-# True iff `t` is one of the integral unboxable types — `Int`,
-# `Bool`, `Char`. `Real` is a `double`, which has no `%` operator
-# and cannot be a C `switch` operand. Used to gate operations that
-# only apply to integral raw scalars.
-
+#[doc("Every read of a binder in `e`, in source order; `in_lam` marks a read inside a lambda or handler clause.")]
 pub fn scan_uses_expr(e: Expr, in_lam: Bool) : [Use] / Console =
+  list_reverse(su_expr(e, in_lam, []))
 
-  scan_uses_kind(e.kind, e.line, e.col, in_lam)
+#[doc("`scan_uses_expr` over a statement list.")]
+pub fn scan_uses_in_stmts(stmts: [Stmt], in_lam: Bool) : [Use] / Console =
+  scan_uses_expr(mk_expr(EBlock(stmts, None), 0, 0), in_lam)
 
-pub fn scan_uses_kind(k: ExprKind, line: Int, col: Int, in_lam: Bool) : [Use] / Console {
+#[doc("The binder reads inside the `#{...}` slots of an interpolated string span.")]
+pub fn scan_uses_in_interp(span: String, is_triple: Bool, in_lam: Bool) : [Use] / Console =
+  list_reverse(su_interp(span, is_triple, in_lam, []))
 
-  match sym_read_kind(k) {
-    EVar(nm) -> [U(nm, line, col, in_lam)]
-    # Interpolated strings hide EVar refs inside `#{...}` segments —
-    # the lexer keeps the raw source span and emit re-parses at code
-    # gen. Mirror `fv_interp` (5700-5725) so a binding read only via
-    # interpolation never gets mis-classified as `LUUnused`.
-    EStr(span, is_triple) -> scan_uses_in_interp(span, is_triple, in_lam)
-    ECall(f, xs) -> list_append(scan_uses_expr(f, in_lam),
-                                scan_uses_in_exprs(xs, in_lam))
-    EField(x, _) -> scan_uses_expr(x, in_lam)
-    EIndex(x, i) -> list_append(scan_uses_expr(x, in_lam),
-                                scan_uses_expr(i, in_lam))
-    EBinop(_, l, r) -> list_append(scan_uses_expr(l, in_lam),
-                                   scan_uses_expr(r, in_lam))
-    EUnop(_, x) -> scan_uses_expr(x, in_lam)
-    EIf(c, t, opt_e) -> {
-      let p1 = list_append(scan_uses_expr(c, in_lam), scan_uses_expr(t, in_lam))
-      match opt_e {
-        None -> p1
-        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
-      }
-    }
-    EMatch(s, arms) -> list_append(scan_uses_expr(s, in_lam),
-                                    scan_uses_in_arms(arms, in_lam))
-    ELambda(_, body) -> scan_uses_expr(body, true)
-    ERecordLit(_, fis) -> scan_uses_in_field_inits(fis, in_lam)
-    EList(elems) -> scan_uses_in_list_elems(elems, in_lam)
-    ERange(lo, hi, opt_by) -> {
-      let p1 = list_append(scan_uses_expr(lo, in_lam), scan_uses_expr(hi, in_lam))
-      match opt_by {
-        None -> p1
-        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
-      }
-    }
-    EBlock(stmts, opt_tail) -> {
-      let p1 = scan_uses_in_stmts(stmts, in_lam)
-      match opt_tail {
-        None -> p1
-        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
-      }
-    }
-    EPipe(l, r) -> list_append(scan_uses_expr(l, in_lam),
-                                scan_uses_expr(r, in_lam))
-    EMapPipe(l, r) -> list_append(scan_uses_expr(l, in_lam),
-                                   scan_uses_expr(r, in_lam))
-    EFlatMapPipe(l, r) -> list_append(scan_uses_expr(l, in_lam),
-                                       scan_uses_expr(r, in_lam))
-    EFilterPipe(l, r) -> list_append(scan_uses_expr(l, in_lam),
-                                      scan_uses_expr(r, in_lam))
-    EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
-      let p1 = scan_uses_expr(body, in_lam)
-      let p2 = match init_opt {
-        None -> p1
-        Some(e2) -> list_append(p1, scan_uses_expr(e2, in_lam))
-      }
-      # Op clauses compile to separate functions reading captures from a
-      # boxed env slot — a read inside one is a lambda-style capture, so
-      # the captured binding must stay boxed. Body, init and the return
-      # clause run inline in the enclosing function.
-      let p3 = list_append(p2, scan_uses_in_clauses(clauses, true))
-      match ret_opt {
-        None -> p3
-        Some(hr) -> match hr {
-          HR(_, body2, _, _) -> list_append(p3, scan_uses_expr(body2, in_lam))
-        }
-      }
-    }
-    # Intrinsic args are live sub-expressions — a loop intrinsic's
-    # lambdas run in place, so reads inside them must count as uses.
-    EIntrinsic(_, args_) -> scan_uses_in_exprs(args_, in_lam)
-    # `x!` and `x<unit>` evaluate their operand in place. Omitting them
-    # lets the catch-all hide the reads inside, and a binding read only
-    # through one would be mis-classified `LUUnused` — the emitter then
-    # decrefs it while a later consumer still holds it.
-    EBang(x) -> scan_uses_expr(x, in_lam)
-    ELitUnit(x, _) -> scan_uses_expr(x, in_lam)
-    ESurface(sf) -> scan_uses_in_exprs(surface_children(sf), in_lam)
-    _ -> []
+# Uses are consed onto `acc` in reverse; the public entries restore source order.
+fn su_expr(e: Expr, in_lam: Bool, acc: [Use]) : [Use] / Console = match sym_read_kind(e.kind) {
+  EVar(nm) -> [U(nm, e.line, e.col, in_lam), ...acc]
+  # Interpolation reads live in the raw span, not in child nodes.
+  EStr(span, is_triple) -> su_interp(span, is_triple, in_lam, acc)
+  # An op clause compiles to its own function reading captures from a
+  # boxed env, so its reads count as in-lambda; the return clause runs
+  # inline, which the shared position table does not distinguish.
+  EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
+    let a1 = su_opt(init_opt, in_lam, su_expr(body, in_lam, acc))
+    let a2 = su_clauses(clauses, su_opt_return(ret_opt, in_lam, a1))
+    a2
   }
+  _ -> su_positions(xp_positions(e), in_lam, acc)
 }
 
-pub fn scan_uses_in_exprs(es: [Expr], in_lam: Bool) : [Use] / Console {
-
-  match es {
-    [] -> []
-    [h, ...rest] -> list_append(scan_uses_expr(h, in_lam),
-                                scan_uses_in_exprs(rest, in_lam))
-  }
+fn su_positions(ps: [XPos], in_lam: Bool, acc: [Use]) : [Use] / Console = match ps {
+  [] -> acc
+  [XP(r, x), ...rest] -> su_positions(rest, in_lam, su_expr(x, in_lam or not xrole_inline(r), acc))
 }
 
-pub fn scan_uses_in_arms(arms: [Arm], in_lam: Bool) : [Use] / Console {
-
-  match arms {
-    [] -> []
-    [h, ...rest] -> match h {
-      Arm(_, guard_opt, body) -> {
-        let p1 = match guard_opt {
-          None -> []
-          Some(g) -> scan_uses_expr(g, in_lam)
-        }
-        let p2 = list_append(p1, scan_uses_expr(body, in_lam))
-        list_append(p2, scan_uses_in_arms(rest, in_lam))
-      }
-    }
-  }
+fn su_opt(o: Option[Expr], in_lam: Bool, acc: [Use]) : [Use] / Console = match o {
+  None -> acc
+  Some(x) -> su_expr(x, in_lam, acc)
 }
 
-pub fn scan_uses_in_field_inits(fis: [FieldInit], in_lam: Bool) : [Use] / Console {
-
-  match fis {
-    [] -> []
-    [h, ...rest] -> match h {
-      FI(_, e) -> list_append(scan_uses_expr(e, in_lam),
-                              scan_uses_in_field_inits(rest, in_lam))
-    }
-  }
+fn su_opt_return(o: Option[HReturn], in_lam: Bool, acc: [Use]) : [Use] / Console = match o {
+  None -> acc
+  Some(HR(_, b, _, _)) -> su_expr(b, in_lam, acc)
 }
 
-pub fn scan_uses_in_list_elems(es: [ListElem], in_lam: Bool) : [Use] / Console {
-
-  match es {
-    [] -> []
-    [h, ...rest] -> {
-      let inner = match h {
-        ElPlain(e) -> e
-        ElSpread(e) -> e
-      }
-      list_append(scan_uses_expr(inner, in_lam),
-                  scan_uses_in_list_elems(rest, in_lam))
-    }
-  }
+fn su_clauses(cs: [HClause], acc: [Use]) : [Use] / Console = match cs {
+  [] -> acc
+  [HC(_, _, b, _, _), ...rest] -> su_clauses(rest, su_expr(b, true, acc))
 }
 
-pub fn scan_uses_in_stmts(stmts: [Stmt], in_lam: Bool) : [Use] / Console {
-
-  match stmts {
-    [] -> []
-    [h, ...rest] -> {
-      let p1 = match h {
-        SLet(_, _, rhs) -> scan_uses_expr(rhs, in_lam)
-        SAssert(c, opt_msg) -> {
-          let q = scan_uses_expr(c, in_lam)
-          match opt_msg {
-            None -> q
-            Some(e2) -> list_append(q, scan_uses_expr(e2, in_lam))
-          }
-        }
-        SExprStmt(e) -> scan_uses_expr(e, in_lam)
-        SIndexAssign(arr, idx, val, _, _) -> {
-          let q1 = list_append(scan_uses_expr(arr, in_lam),
-                               scan_uses_expr(idx, in_lam))
-          list_append(q1, scan_uses_expr(val, in_lam))
-        }
-        SAssign(lhs, val, _, _) ->
-          list_append(scan_uses_expr(lhs, in_lam), scan_uses_expr(val, in_lam))
-        SVar(_, _, init, _, _) -> scan_uses_expr(init, in_lam)
-        # m7e §25: SUse has no expression — no uses to scan.
-        SUse(_, _, _) -> []
-      }
-      list_append(p1, scan_uses_in_stmts(rest, in_lam))
-    }
-  }
-}
-
-pub fn scan_uses_in_clauses(cs: [HClause], in_lam: Bool) : [Use] / Console {
-
-  match cs {
-    [] -> []
-    [h, ...rest] -> match h {
-      HC(_, _, body, _, _) -> list_append(scan_uses_expr(body, in_lam),
-                                          scan_uses_in_clauses(rest, in_lam))
-    }
-  }
-}
-
-# Re-parse an `EStr` span to surface `#{expr}` interpolations and
-# scan each parsed sub-expression for EVar refs. Mirrors `fv_interp`.
-
-pub fn scan_uses_in_interp(span: String, is_triple: Bool, in_lam: Bool) : [Use] / Console {
-
+fn su_interp(span: String, is_triple: Bool, in_lam: Bool, acc: [Use]) : [Use] / Console {
   let n = string_length(span)
   let body_start = if is_triple { 3 } else { 1 }
   let body_end = if is_triple { n - 3 } else { n - 1 }
   let parts = iscan_collect(span, body_end,
                             IScan { parts: [], lit_start: body_start, i: body_start })
-  scan_uses_interp_parts(parts, in_lam)
+  su_interp_parts(parts, in_lam, acc)
 }
 
-pub fn scan_uses_interp_parts(parts: [IPart], in_lam: Bool) : [Use] / Console {
-
-  match parts {
-    [] -> []
-    [p, ...rest] -> match p {
-      IpLit(_, _) -> scan_uses_interp_parts(rest, in_lam)
-      IpExp(esrc) -> {
-        let head = match parse_interp_expr(esrc) {
-          Some(e) -> scan_uses_expr(e, in_lam)
-          None -> []
-        }
-        list_append(head, scan_uses_interp_parts(rest, in_lam))
-      }
+fn su_interp_parts(parts: [IPart], in_lam: Bool, acc: [Use]) : [Use] / Console = match parts {
+  [] -> acc
+  [IpLit(_, _), ...rest] -> su_interp_parts(rest, in_lam, acc)
+  [IpExp(esrc), ...rest] -> {
+    let a1 = match parse_interp_expr(esrc) {
+      Some(e) -> su_expr(e, in_lam, acc)
+      None -> acc
     }
+    su_interp_parts(rest, in_lam, a1)
   }
 }
+
 
 # Find the last-use record for `nm` among `uses`. A single in-lambda
 # reference forces `LUBlocked`; otherwise the max (line, col) wins.
