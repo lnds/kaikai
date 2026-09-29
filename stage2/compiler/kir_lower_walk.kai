@@ -2072,13 +2072,30 @@ fn lower_lit_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
   [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
   [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
     match lit_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
-      # A literal arm's catch-all binder aliases the scrutinee with NO
-      # bind-incref (lit_emit_arm), so only the exit-drop entry is seeded.
-      let st_drop = tcp_seed_arm(owned, sd, [], body, pend0, st_body)
+      let st_drop = whole_binder_rc(p, scrv, body, owned, sd, pend0, st_body)
       let st_done = lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop))
       if lit_arm_is_catchall(p) { st_done }
       else { lower_lit_arms(rest, scrv, join, lcont, owned, sd, pend0, reopen(st_done, fail_lbl)) }
     } } }
+}
+
+# A literal or record arm's whole-value binder aliases a register scrutinee
+# with no incref, so it takes a structural dup exactly like a variant or list
+# arm's alias binders: an owned scrutinee's exit drop would otherwise free the
+# value the arm body returns. A literal-atom scrutinee (an inlined constant)
+# is materialised afresh at each read, so its binder is no alias.
+fn whole_binder_rc(p: Pattern, scrv: KVal, body: Expr, owned: Bool, sd: String,
+                   pend0: [String], st: LowerSt) : LowerSt = {
+  let aliases = match scrv { KVar(_) -> not arm_reuses(body, st)  _ -> false }
+  let binders = if aliases { whole_binders(p) } else { [] }
+  let st_dup = lm_dup_alias_binders(binders, KAt(p.line, p.col), st)
+  tcp_seed_arm(owned, sd, binders, body, pend0, st_dup)
+}
+
+fn whole_binders(p: Pattern) : [String] = match p.pkind {
+  PBind(name)  -> [name]
+  PAs(name, _) -> [name]
+  _            -> []
 }
 
 # `match scr { <record patterns> }`: a field-test fail-chain mirroring the
@@ -2111,10 +2128,10 @@ fn lower_record_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
   [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
   [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
     match rec_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
-      # Record-arm field binds arrive OWNED (`kai_op_field` increfs) but are
-      # not part of the structural-dup set; seed only the exit-drop entry
-      # (an unconsumed field binder on a goto path stays a bounded leak).
-      let st_drop = tcp_seed_arm(owned, sd, [], body, pend0, st_body)
+      # Field binds arrive OWNED (`kai_op_field` increfs); only a whole-value
+      # binder aliases the scrutinee (an unconsumed field binder on a goto
+      # path stays a bounded leak).
+      let st_drop = whole_binder_rc(p, scrv, body, owned, sd, pend0, st_body)
       let st_done = lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop))
       if rec_arm_is_catchall(p) { st_done }
       else { lower_record_arms(rest, scrv, join, lcont, owned, sd, pend0, reopen(st_done, fail_lbl)) }
