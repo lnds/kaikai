@@ -5885,6 +5885,22 @@ test-closure-spec-mixed-mode-acc: $(TARGET) bin-kai build
 	done; \
 	echo "closure-spec-mixed-mode-acc OK (raw-declared accumulator boxes on demand; c and native agree)"
 
+# Two specs of one higher-order fn each copy its inner lambda at the same
+# source position; each copy must reach its own transitive spec. Both
+# backends: test-pipes-collections runs this fixture on C only.
+test-closure-spec-inner-lambda: $(TARGET) bin-kai build
+	@set -e; \
+	src=../examples/pipes/collections/closure_spec_inner_lambda.kai; \
+	exp=../examples/pipes/collections/closure_spec_inner_lambda.out.expected; \
+	for be in c native; do \
+	  KAI_BACKEND=$$be ../bin/kai build $$src -o build/s2-csil 2> build/s2-csil.err \
+	    || { echo "closure-spec-inner-lambda FAIL ($$be build errored)"; cat build/s2-csil.err; exit 1; }; \
+	  ./build/s2-csil > build/s2-csil.out; \
+	  diff -q $$exp build/s2-csil.out > /dev/null \
+	    || { echo "closure-spec-inner-lambda FAIL ($$be output diff)"; diff $$exp build/s2-csil.out; exit 1; }; \
+	done; \
+	echo "closure-spec-inner-lambda OK (each spec keeps its own closure; c and native agree)"
+
 # Issue #1208 (native) — grounding a return-only tparam from the call
 # site. `let v: Vec[Point] = [a..b] | stage` collects into a Vec whose
 # element type is return-only; mono now grounds it from the annotated
