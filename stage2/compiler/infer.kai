@@ -6787,26 +6787,46 @@ pub fn labels_empty(ls: [Label]) : Bool {
 fn bind_row_tails(at: Option[Int], bt: Option[Int],
                   oleft: [Label], oright: [Label],
                   s: Subst) : Option[Subst] / Mutable {
+  if not row_tails_compatible(at, bt, oleft, oright) { None }
+  else { bind_compatible_row_tails(at, bt, oleft, oright, s) }
+}
+
+# The one rule deciding whether two rows' leftover labels can be
+# reconciled: a closed side admits none of the other side's leftovers,
+# an open side absorbs them through its tail.
+fn row_tails_compatible(at: Option[Int], bt: Option[Int],
+                        oleft: [Label], oright: [Label]) : Bool {
+  let a_admits = match at { Some(_) -> true None -> labels_empty(oright) }
+  let b_admits = match bt { Some(_) -> true None -> labels_empty(oleft) }
+  a_admits and b_admits
+}
+
+# Pure shape check of two function-type rows: pairs the labels as
+# `unify_row` does and applies the same tail rule, binding nothing.
+fn row_shape_compatible(a: Row, b: Row, s: Subst) : Bool {
+  let p = partition_labels_sub(a.labels, b.labels, s)
+  row_tails_compatible(a.tail, b.tail, p.only_left, p.only_right)
+}
+
+fn rows_label_free(a: Row, b: Row) : Bool = labels_empty(a.labels) and labels_empty(b.labels)
+
+fn bind_compatible_row_tails(at: Option[Int], bt: Option[Int],
+                             oleft: [Label], oright: [Label],
+                             s: Subst) : Option[Subst] / Mutable {
   match at {
     None -> match bt {
-      None -> if labels_empty(oleft) and labels_empty(oright) { Some(s) } else { None }
+      None -> Some(s)
       Some(b_id) -> {
-        if not labels_empty(oright) { None }
-        else {
-          let r = Row { labels: oleft, tail: None, display_alias: None }
-          if occurs_row(b_id, r, s) { None }
-          else { Some(subst_row_extend(s, b_id, r)) }
-        }
+        let r = Row { labels: oleft, tail: None, display_alias: None }
+        if occurs_row(b_id, r, s) { None }
+        else { Some(subst_row_extend(s, b_id, r)) }
       }
     }
     Some(a_id) -> match bt {
       None -> {
-        if not labels_empty(oleft) { None }
-        else {
-          let r = Row { labels: oright, tail: None, display_alias: None }
-          if occurs_row(a_id, r, s) { None }
-          else { Some(subst_row_extend(s, a_id, r)) }
-        }
+        let r = Row { labels: oright, tail: None, display_alias: None }
+        if occurs_row(a_id, r, s) { None }
+        else { Some(subst_row_extend(s, a_id, r)) }
       }
       Some(b_id) -> {
         if a_id == b_id and labels_empty(oleft) and labels_empty(oright) { Some(s) }
@@ -8065,8 +8085,10 @@ fn ty_eq_shape(a: Ty, b: Ty) : Bool {
     TyInt128   -> match bx { TyInt128 -> true _ -> false }
     TyHandle   -> match bx { TyHandle -> true _ -> false }
     TyListT(ai) -> match bx { TyListT(bi) -> ty_eq_shape(ai, bi) _ -> false }
-    TyFnT(ap, ar, _) -> match bx {
-      TyFnT(bp, br, _) -> ty_list_eq_shape(ap, bp) and ty_eq_shape(ar, br)
+    TyFnT(ap, ar, arow) -> match bx {
+      TyFnT(bp, br, brow) ->
+        ty_list_eq_shape(ap, bp) and ty_eq_shape(ar, br)
+          and (rows_label_free(arow, brow) or row_shape_compatible(arow, brow, subst_empty()))
       _ -> false
     }
     # Hanga Roa: shape equality respects module_origin too.
@@ -9854,20 +9876,17 @@ fn filter_labels_matching_res(xs: [Label], eff_name: String, tyargs: [Ty],
   match xs {
     [] -> FilterResult { kept: [], sub: sub }
     [h, ...rest] -> {
-      if h.eff == eff_name and label_args_dischargeable(h.ty_args, tyargs, sub) {
-        # Guard passed — bind the cell's element type via the real unify.
-        # `unify_list` cannot widen the row, only resolve the shared
-        # tyvars; on the rare structural-mismatch the guard let through
-        # (it should not, being a superset check) we keep the old subst
-        # and still discharge, preserving the prior shallow semantics.
-        let sub1 = match unify_list(ty_env_empty(), h.ty_args, tyargs, sub) {
-          Some(s) -> s
-          None    -> sub
+      # The guard ignores a function type's effect row; `unify` compares
+      # it, so a label the unify rejects stays undischarged.
+      let bound = if h.eff == eff_name and label_args_dischargeable(h.ty_args, tyargs, sub) {
+        unify_list(ty_env_empty(), h.ty_args, tyargs, sub)
+      } else { None }
+      match bound {
+        Some(sub1) -> filter_labels_matching_res(rest, eff_name, tyargs, sub1)
+        None -> {
+          let r = filter_labels_matching_res(rest, eff_name, tyargs, sub)
+          FilterResult { kept: [h, ...r.kept], sub: r.sub }
         }
-        filter_labels_matching_res(rest, eff_name, tyargs, sub1)
-      } else {
-        let r = filter_labels_matching_res(rest, eff_name, tyargs, sub)
-        FilterResult { kept: [h, ...r.kept], sub: r.sub }
       }
     }
   }
@@ -9912,8 +9931,10 @@ fn ty_dischargeable(a: Ty, b: Ty, s: Subst) : Bool {
             module_slot_compat(am, bm) and an == bn and ty_list_dischargeable(aas, bas, s)
           _ -> false
         }
-        TyFnT(aps, ar, _) -> match bx {
-          TyFnT(bps, br, _) -> ty_list_dischargeable(aps, bps, s) and ty_dischargeable(ar, br, s)
+        TyFnT(aps, ar, arow) -> match bx {
+          TyFnT(bps, br, brow) ->
+            ty_list_dischargeable(aps, bps, s) and ty_dischargeable(ar, br, s)
+              and (rows_label_free(arow, brow) or row_shape_compatible(arow, brow, s))
           _ -> false
         }
         TyUnion(aps) -> match bx {
