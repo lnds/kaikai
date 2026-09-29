@@ -84,6 +84,90 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.128.0 (2026-09-29)
+
+### BREAKING CHANGE
+
+- `effects` in --effects-json means the function's declared
+effect row, no longer the operations its body performs directly.
+
+### Added
+
+- **stdlib**: start a child in its own process group and signal the whole group (#2318)
+
+### Fixed
+
+- **emit**: resolve a variant payload's enum layout from its declaring module (#2315)
+- **compiler**: resolve a closure argument by its symbol, not its spelling
+- **cli**: remove a plain file in remove_tree and report whether the path is gone
+- **cache**: key a package's cache by the compiler that writes it (#2311)
+- **compiler**: key an inner lambda's closure spec by its host decl (#2309)
+- **emit**: key the os builtin constructors by their declaring module
+- **typer**: a pipe stage's element type comes from the head's combinator
+- **kir**: keep a catch-all binder alive past an owned scrutinee's drop
+- **typer**: a function type's effect row tells two effect labels apart
+- **typer**: binding the unresolved-row sentinel is a no-op, not a trap
+- **driver**: list every flag the parser accepts in --help
+- **region**: the pinned-region gate sees a direct effect-op call
+- **infer**: --dump-last-use sees reads inside loop bodies
+- **region**: find region markers in every expression position
+- **refinements**: check call-site refinements inside loop bodies
+- **protos**: compare function types structurally in impl coherence
+- **region**: the pinned-region gate sees through loop bodies
+- **lint**: effect and idiom lints walk every expression position
+- **typer**: one renderer for surface types, rows and units
+- **lint**: lint a package module by module even when it has an entry
+- **mutate**: a module without sites lists nothing and counts no mutant
+- **typer**: report each function's effect row in --effects-json
+- **lint**: expression lints walk every expression position
+- **doc**: render the effect row of function types in signatures
+- **typer**: scope the JSON reports to what the user wrote and can reach
+- **fmt**: keep a const's trailing comment on its line
+- **lint**: dead_code_unused_priv walks every expression position
+- **kir**: a destructuring let owns its value
+- **perceus**: pay a binder on every path that skips its last read
+- **compiler**: bind a read `_`-prefixed pattern binder like any other
+- **runtime**: honour KAI_TRACE_RC_RUNS at every thread count
+- **typer**: bind a Vec slice's start once
+- **unbox**: read a home-spelled ctor's Int slots in the native raw predicate
+- **kir**: plan a cons reuse without a list pattern nested in a variant slot
+- **perceus**: a reuse arm releases the slots its rebuild does not take
+- **effects**: a handle wins over the caller's evidence for its own effect (#2254)
+- **typer**: walk an indexed collection once
+- **kir**: take a reuse rebuild's home from its ctor, not the reuse wrapper
+- **emit**: resolve reuse and TRMC rebuild ctors by their type's home
+- **typer**: reject a handler that leaves an op without a clause (#2249)
+- **perceus**: decide capability params by the declaration they name
+- **resolve**: walk root-file bodies from the root home
+- **perceus**: dup a borrowed binder read into any position that owns it
+- **emit**: key runtime impl rows and variant heads by declaration
+- **kir**: lower an Int slot's value raw at TRMC steps and reuse rebuilds
+- **perceus**: a list spread consumes its operand like a ctor slot
+- **emit**: release the ledger at a TRMC step, as the tcrec goto does
+- **perceus**: pay a binder read at most once per path on the paths that skip it
+- **native**: a binder projected out of a record field owns its reference
+- **native**: take no shared-donor reference for a borrowed read in a reuse rebuild
+- **perceus**: release a literal passed straight into a borrowed slot
+- **perceus**: release a borrowed parameter's borrow-only arm binders on entry
+- **perceus**: release a block tail's borrow-only arm binders after its value
+- **emit**: an enclosing `state` read only inside handler clauses is a live, captured binding
+- **emit**: resolve a handler or lambda nested in an op clause on the C backend
+- **kir**: lower each if branch from the ledger its condition left
+- **kir**: lower String `++` to the consuming concat
+- **emit**: release the boxed literal a literal pattern compares against
+- **perceus**: release an arm binder lent to a borrowed slot at the goto
+- **protos**: key protocol impls by the identity of their target type (#2223)
+- **perceus**: release a borrow-last arm binder across TRMC steps and gotos (#2218)
+- **typer**: keep a discarded index probe's type variables out of the re-walk (#2207)
+- **resolve**: a `var` reads its own cell under an enclosing `state` binding (#2206)
+- **fmt**: keep the parentheses that bind an effect row outside an arrow type (#2202)
+
+### Changed
+
+- **fnreg**: scan binder uses with an accumulator over the position table
+- **compiler**: keep SymIds through unbox, Perceus and KPerform
+- **typer**: carry the declaration's SymId in TyCon (#2216)
+
 ## v0.127.0 (2026-09-27)
 
 ### Added
