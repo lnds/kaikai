@@ -1151,15 +1151,27 @@ fn inf_ty_eq(a: Ty, b: Ty) : Bool {
 }
 
 
-# The element type a `|` / `||` / `|?` combinator feeds its function:
-# the `A` of a list `[A]` or a head `T[A, ...]`. Used to thread the
-# receiver type into a point-free section's lambda up front.
-fn pipe_elem_ty(t: Ty) : Option[Ty] {
-  match t {
-    TyListT(e)       -> Some(e)
-    TyCon(_, _, [a, ...], _) -> Some(a)
-    _                -> None
+# The element type a `|` / `||` / `|?` stage receives, read from the
+# head's own combinator: its first parameter is the container, its second
+# takes the element. Unifying the container binds only the combinator's
+# fresh instantiation, which the call would bind the same way.
+type PipeElem = PE(Ty, Subst)
+
+fn pipe_elem_from_callee(env: TyEnv, sub: Subst, callee_ty: Ty, lhs_ty: Ty) : Option[PipeElem] / Mutable =
+  match apply_ty(sub, callee_ty) {
+    TyFnT([container, stage], _, _) -> match apply_ty(sub, stage) {
+      TyFnT([elem], _, _) -> match unify_env(env, container, lhs_ty, sub) {
+        Some(s1) -> Some(PE(apply_ty(s1, elem), s1))
+        None     -> None
+      }
+      _ -> None
+    }
+    _ -> None
   }
+
+fn pipe_elem_ty(pe: Option[PipeElem]) : Option[Ty] = match pe {
+  Some(PE(t, _)) -> Some(t)
+  None           -> None
 }
 
 # A point-free section the parser synthesised has a single
@@ -1173,12 +1185,12 @@ fn is_point_free_lambda(rhs: Expr) : Bool =
   }
 
 # Infer a pipe / combinator function argument. A point-free section
-# gets its `__pl` receiver pinned to `lhs_ty`'s element type up front
+# gets its `__pl` receiver pinned to the stage's element type up front
 # (so `.length()` resolves its UFCS dispatch); everything else takes
 # the plain synth path unchanged.
-fn synth_pipe_rhs(st: InferState, rhs: Expr, lhs_ty: Ty) : Inferred / Console + File + Mutable =
+fn synth_pipe_rhs(st: InferState, rhs: Expr, elem: Option[Ty]) : Inferred / Console + File + Mutable =
   if is_point_free_lambda(rhs) {
-    match pipe_elem_ty(apply_ty(st.sub, lhs_ty)) {
+    match elem {
       Some(et) -> match rhs.kind {
         ELambda(ps, body) ->
           synth_lambda_threaded(st, ps, body, Some(et), rhs.line, rhs.col)
@@ -13180,7 +13192,7 @@ fn pipe_op_has_impl(impls: [ProtoImplReg], head: String, op: String) : Bool = ma
 # "did you mean `|>`" diagnostic. A stage that matches neither side is
 # a real mismatch and returns None.
 fn pipe_stage_wants_container(env: TyEnv, sub: Subst, lhs_ty: Ty,
-                                stage_ty: Ty) : Option[Ty] / Mutable {
+                                stage_ty: Ty, elem: Option[Ty]) : Option[Ty] / Mutable {
   match apply_ty(sub, stage_ty) {
     TyFnT([p], _ret, _row) -> {
       let param = apply_ty(sub, p)
@@ -13199,7 +13211,7 @@ fn pipe_stage_wants_container(env: TyEnv, sub: Subst, lhs_ty: Ty,
       # elem trial that decides. A stage that can take the element is the
       # pipe working as declared; only elem-fail + container-fit is apply
       # confusion.
-      let takes_elem = match pipe_elem_ty(container) {
+      let takes_elem = match elem {
         Some(et) -> match unify_env(env, param, apply_ty(sub, et), sub) {
           Some(_) -> true
           None    -> false
@@ -13225,12 +13237,12 @@ fn pipe_surface_op(op: String) : String =
 # The `|` → `|>` suggestion. Names the stage when it has one so the
 # message reads as the user's own code, not the desugared `map` call.
 fn emit_pipe_wants_apply(file: String, op: String, stage: Expr, param: Ty,
-                          lhs_ty: Ty, line: Int, col: Int) : Unit / Console + File {
+                          elem: Option[Ty], line: Int, col: Int) : Unit / Console + File {
   let what = match callee_display_name(stage) {
     Some(nm) -> "`#{nm}` takes"
     None     -> "the stage takes"
   }
-  let elem_txt = match pipe_elem_ty(lhs_ty) {
+  let elem_txt = match elem {
     Some(et) -> inf_ty_to_string(et)
     None     -> "the element"
   }
@@ -13324,9 +13336,15 @@ fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
                 st_bump_err(rl.st)
               }
           }
-          let rf = synth_pipe_rhs(st_after_diag, rhs, lhs_ty)
-          let rc = synth(rf.st, with_ty(mk_expr(callee_kind, line, col), TyAny))
-          let rv = st_fresh_ty(rc.st)
+          let rc = synth(st_after_diag, with_ty(mk_expr(callee_kind, line, col), TyAny))
+          let pe = pipe_elem_from_callee(rc.st.env, rc.st.sub, rc.ty, lhs_ty)
+          let st_pe = match pe {
+            Some(PE(_, s)) -> st_set_sub(rc.st, s)
+            None           -> rc.st
+          }
+          let elem = pipe_elem_ty(pe)
+          let rf = synth_pipe_rhs(st_pe, rhs, elem)
+          let rv = st_fresh_ty(rf.st)
           let fr = subst_fresh_row(rv.st.sub)
           let st_fresh = st_set_sub(rv.st, fr.subst)
           let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
@@ -13337,10 +13355,9 @@ fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
           # match identically — the surface-level lane should not
           # change unrelated diagnostic strings.
           let pipe_callee = mk_expr(callee_kind, line, col)
-          let st2 = match pipe_stage_wants_container(st_fresh.env, st_fresh.sub, rl.ty, rf.ty) {
+          let st2 = match pipe_stage_wants_container(st_fresh.env, st_fresh.sub, rl.ty, rf.ty, elem) {
             Some(param) -> {
-              emit_pipe_wants_apply(st_fresh.file, op, rhs, param,
-                                    apply_ty(st_fresh.sub, rl.ty), line, col)
+              emit_pipe_wants_apply(st_fresh.file, op, rhs, param, elem, line, col)
               st_bump_err(st_fresh)
             }
             None ->
