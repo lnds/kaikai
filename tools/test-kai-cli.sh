@@ -222,6 +222,26 @@ expect "bench: --iters must be positive" 2 \
 expect "check: --backend is validated" 2 \
   "kai: error: --backend must be 'c' or 'native' (got: llvm)" "$KAI" check --backend llvm x.kai
 
+# A package's cache lives under the compiler's toolchain id: an entry another
+# compiler wrote is removed, never read, and both the parse and the typed
+# blobs land in the current toolchain's directory.
+C="$TMP/cachekey"
+mkdir -p "$C/.kai-cache/0-0"
+printf 'name = "ck"\n' > "$C/kai.toml"
+printf 'pub fn two() : Int = 2\n' > "$C/util.kai"
+printf 'import util\nfn main() : Int = util.two() - 2\n' > "$C/main.kai"
+printf 'x' > "$C/.kai-cache/0-0/tm-0.kab"
+printf 'x' > "$C/.kai-cache/stale.kab"
+tid="$("$KAI" env KAI_TOOLCHAIN_ID)"
+(cd "$C" && "$KAI" build --backend=c . -o "$TMP/ck.bin" >/dev/null 2>&1) || true
+got="$(ls "$C/.kai-cache")"
+if [ "$got" = "$tid" ] && ls "$C/.kai-cache/$tid" | grep -q '^tm-' \
+   && ls "$C/.kai-cache/$tid" | grep -q '^[0-9a-f]*-[0-9a-f]*\.kab$'; then
+  ok "cache: a package's entries live under the toolchain id; another toolchain's are removed"
+else
+  fail "cache keyed by toolchain id"; printf '        tid %s, .kai-cache: %s\n' "$tid" "$(ls -R "$C/.kai-cache" | tr '\n' ' ')"
+fi
+
 # mutate checks each mutant with the package's search paths, so a module in a
 # subdirectory still resolves the package root and its dependencies.
 M="$TMP/mut"

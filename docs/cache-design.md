@@ -202,7 +202,7 @@ semantic refactor will likely change the delta's shape.
 | Layer | What it caches | Where it lives | When it invalidates |
 |---|---|---|---|
 | **Phase A** | Stdlib core modules (immutable from user POV) | `~/.cache/kaikai/core modules-v<N>/<sha>.kab` | stdlib file changes OR kaikai version bump OR cache format bump |
-| **Phase B** | User-side files (mutable) | `<project>/.kai-cache/<content_hash>-<dep_hash>.kab` | source changes OR any transitive import changes OR kaikai version bump OR cache format bump |
+| **Phase B** | User-side files (mutable) | `<project>/.kai-cache/<toolchain-id>/<content_hash>-<dep_hash>.kab` | source changes OR any transitive import changes OR a different compiler binary OR cache format bump |
 
 Both use the same on-disk format (KAB1, defined below). What
 varies across the three sub-phases is the *payload schema*:
@@ -515,8 +515,13 @@ The user-file analogue of A.0: a per-project, content-addressable cache
 of post-parse `[Decl]` for user modules, with correct transitive
 invalidation. New module `stage2/compiler/user_cache.kai`; the driver's
 import resolver consults it before lexing each imported module. The
-`kai` driver creates `<project>/.kai-cache/` and passes
-`--user-cache` automatically when the entry sits under a `kai.toml`;
+`kai` driver creates `<project>/.kai-cache/<toolchain-id>/` and passes it
+as `--user-cache-dir` with `--user-cache` automatically when the entry sits
+under a `kai.toml`. The toolchain id is the compiler binary's mtime and
+size, so a rebuilt or swapped compiler never reads another's entries; the
+driver removes every other toolchain's directory, and turns the cache off
+when the id cannot be read. Both the post-parse and the typed blobs live
+in that directory;
 `KAI_CACHE=0` disables it and `KAI_CACHE=1` forces it on for a loose
 file. The package gate is what makes the typed rebuild cut below pay:
 a loose file partitions into one bucket the cut cannot split, so it

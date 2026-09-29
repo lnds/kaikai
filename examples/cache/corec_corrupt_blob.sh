@@ -13,6 +13,8 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAI="$ROOT/bin/kai"
+# bin/kai keys a project's cache by the compiler it runs.
+CACHE_TID="$("$KAI" env KAI_TOOLCHAIN_ID)"
 PROJ="$(mktemp -d)"
 trap 'rm -rf "$PROJ"' EXIT INT TERM
 
@@ -30,7 +32,7 @@ fi
 # header still validates but the AST payload is gone, so the decoder
 # returns None and the loader re-parses that module. The worst case: a
 # corruption the header alone cannot catch.
-blob="$(ls -S "$PROJ/.kai-cache/core-"*.kab 2>/dev/null | head -1)"
+blob="$(ls -S "$PROJ/.kai-cache/$CACHE_TID/core-"*.kab 2>/dev/null | head -1)"
 if [ -z "$blob" ] || [ ! -f "$blob" ]; then
   echo "corec_corrupt_blob FAIL — no core blob was written"
   exit 1
