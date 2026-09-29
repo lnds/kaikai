@@ -13,6 +13,10 @@ than every binary operator, so a bare prefix is well-formed only on an
 atom. `make -C stage2 test-mutate-negate-shapes` pins the catalogue and
 `--check`s every `negate` mutant.
 
+`no_sites.kai` has nothing to mutate: its catalogue
+(`no_sites.sites.expected`) is empty and a run counts no mutant.
+`tools/test-kai-cli.sh` checks both through `kai mutate`.
+
 `site_data.kai` pins the `--mutate-list-json` catalogue in
 `site_data.sites.json.expected`: every operator, an arm inside an impl
 method, a const, and a repeated `(operator, original)` pair.
