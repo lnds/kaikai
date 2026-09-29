@@ -125,37 +125,6 @@ fn lookup_hofn_any(hofns: [Decl], name: String) : Option[Decl] =
     [d, ...rest] -> if cs_decl_name(d) == name { Some(d) } else { lookup_hofn_any(rest, name) }
   }
 
-# A bare-reference argument specialises only against a top-level
-# (tparam-free) fn: it has no capture environment.
-# Resolve a bare fn reference to its single top-level decl. A name with
-# MORE THAN ONE definition is a protocol op (`cmp`, `show` — one `fn cmp`
-# per impl type) that reifies into a runtime dispatcher; inlining one
-# impl's body would break dispatch for every other type. Only a name with
-# exactly one tparam-free decl is a plain fn safe to inline.
-fn lookup_named_fn(ds: [Decl], name: String) : Option[Decl] =
-  if count_named_fn(ds, name, 0) == 1 { first_named_fn(ds, name) } else { None }
-
-fn count_named_fn(ds: [Decl], name: String, acc: Int) : Int =
-  match ds {
-    [] -> acc
-    [d, ...rest] -> match d {
-      DFn(_, n, tps, _, _, _, _, _, _, _, _) ->
-        if n == name and list_length(tps) == 0 { count_named_fn(rest, name, acc + 1) }
-        else { count_named_fn(rest, name, acc) }
-      _ -> count_named_fn(rest, name, acc)
-    }
-  }
-
-fn first_named_fn(ds: [Decl], name: String) : Option[Decl] =
-  match ds {
-    [] -> None
-    [d, ...rest] -> match d {
-      DFn(_, n, tps, _, _, _, _, _, _, _, _) ->
-        if n == name and list_length(tps) == 0 { Some(d) } else { first_named_fn(rest, name) }
-      _ -> first_named_fn(rest, name)
-    }
-  }
-
 # ---- request collection (read-only walk) ----
 
 # Only root-file decls (`mo == None`) seed specialisation requests: the
@@ -415,8 +384,9 @@ fn return_only_exists(in_ret: [String], in_params: [String]) : Bool =
 fn is_tyvar_name(n: String) : Bool = not name_is_global(n)
 
 # A functional argument qualifies iff it is a syntactic lambda that
-# captures nothing beyond its own params, or a bare reference to a
-# top-level fn — and its resolved row is PURE. An effectful closure is
+# captures nothing beyond its own params, or a resolved reference to a
+# monomorphic top-level fn — and its resolved row is PURE. An `EVar` is a
+# local binder, never a top-level fn. An effectful closure is
 # left alone: a `map`/pipe over it observes per-element effect ordering
 # that inlining the stage into the loop would reorder (soundness, the
 # same gate pipe fusion applies).
@@ -426,23 +396,31 @@ fn classify_closure(a: Expr, all: [Decl]) : Option[ClosureArg] =
     match a.kind {
       ELambda(ps, b) ->
         if captures_free(b, cs_param_names(ps)) { None } else { Some(CaLambda(ps, b)) }
-      # A `__`-prefixed name is a compiler-synthesised symbol — a protocol
-      # dispatcher (`__proto_cmp`) or impl (`__pimpl_*`) reified from a bare
-      # op reference. Inlining one impl's body breaks dispatch for every
-      # other type, so these are never specialised.
-      EVar(name)    -> cs_named(name, all)
-      ESym(_, name) -> cs_named(name, all)
+      ESym(s, name) -> cs_named(s, name, all)
       _ -> None
     }
   }
 
-# A `__`-prefixed name is a compiler-synthesised symbol — a protocol
-# dispatcher (`__proto_cmp`) or impl (`__pimpl_*`) reified from a bare op
-# reference. Inlining one impl's body breaks dispatch for every other
-# type, so these are never specialised.
-fn cs_named(name: String, all: [Decl]) : Option[ClosureArg] =
-  if is_synthesised(name) { None }
-  else { match lookup_named_fn(all, name) { Some(d) -> Some(CaNamedFn(d))  None -> None } }
+# The declaration the resolver chose for a reference, found by its id: a
+# bare-name lookup can land on a homonym (a generic root `helper` shadowing
+# an imported monomorphic one). A `__`-prefixed name is a compiler-
+# synthesised symbol — a protocol dispatcher (`__proto_cmp`) or impl
+# (`__pimpl_*`) — whose body is one impl among many, so it is never inlined.
+fn cs_named(s: SymId, name: String, all: [Decl]) : Option[ClosureArg] =
+  if sym_raw(s) < 0 or is_synthesised(name) { None }
+  else { match monomorphic_fn_with_sym(all, sym_raw(s)) { Some(d) -> Some(CaNamedFn(d))  None -> None } }
+
+fn monomorphic_fn_with_sym(ds: [Decl], id: Int) : Option[Decl] =
+  match ds {
+    [] -> None
+    [d, ...rest] -> match d {
+      DFn(_, _, tps, _, _, _, _, _, _, _, ds_sym) ->
+        if sym_raw(ds_sym) == id {
+          if list_length(tps) == 0 { Some(d) } else { None }
+        } else { monomorphic_fn_with_sym(rest, id) }
+      _ -> monomorphic_fn_with_sym(rest, id)
+    }
+  }
 
 fn is_synthesised(n: String) : Bool =
   match char_at(n, 1) {
