@@ -5,10 +5,10 @@ groups.
 The self-tail rewrite keys on a function's own name, so it sees a cycle
 of length one and nothing longer. This pass supplies the missing shape:
 an edge `f -> g` for every call to `g` sitting in TAIL position in `f`'s
-body, and the strongly connected components of that graph. A component
-of two or more members is a mutual tail recursion — the
-`is_even`/`is_odd` shape — which the fusion rewrite turns into a single
-self-recursive function the existing goto-loop already optimises.
+body. A strongly connected component of two or more members
+(`tailgraph_scc`) is a mutual tail recursion — the `is_even`/`is_odd`
+shape — which the fusion rewrite turns into a single self-recursive
+function the existing goto-loop already optimises.
 
 Tail position is the same notion the self-tail gate walks: the branches
 of an `if`, the bodies of `match` arms, and a block's trailing
@@ -48,11 +48,12 @@ pub fn tgnode_mo(n: TgNode) : Option[String] = match n { TgN(_, mo, _, _) -> mo 
 fn tgnode_arity(n: TgNode) : Int = match n { TgN(_, _, a, _) -> a }
 
 fn tgnode_sym(n: TgNode) : SymId = match n { TgN(_, _, _, s) -> s }
-#[doc("The node indices making up a mutually recursive group, in ascending order.")]
+#[doc("The node indices making up a mutually recursive group, in reverse breadth-first order of tail calls from its lowest-index member.")]
 pub fn tggroup_members(g: TgGroup) : [Int] = match g { TgGrp(xs) -> xs }
 #[doc("The nodes of a tail-call graph, in declaration order.")]
 pub fn tailgraph_nodes(g: TailGraph) : [TgNode] = match g { TG(ns, _) -> ns }
-fn tailgraph_edges(g: TailGraph) : [TgEdge] = match g { TG(_, es) -> es }
+#[doc("The tail-call edges of a tail-call graph.")]
+pub fn tailgraph_edges(g: TailGraph) : [TgEdge] = match g { TG(_, es) -> es }
 
 # ---- entry points --------------------------------------------------
 
@@ -61,11 +62,6 @@ pub fn tailgraph_build(decls: [Decl]) : TailGraph {
   let nodes = tg_collect_nodes(decls)
   TG(nodes, tg_collect_edges(decls, nodes))
 }
-
-#[doc("The mutually recursive tail-call groups of `g`: every strongly connected component with two or more members, each as node indices in ascending order. Self-loops are excluded — a component of one member is the self-tail case the existing rewrite already handles.")]
-pub fn tailgraph_groups(g: TailGraph) : [TgGroup] =
-  tg_groups_from(g, tg_index_range(list_length(tailgraph_nodes(g)), 0), [])
-
 
 # ---- nodes ---------------------------------------------------------
 
@@ -276,68 +272,3 @@ fn tg_block_scope(stmts: [Stmt], scope: [String]) : [String] {
     _ -> scope
   }
 }
-
-# ---- strongly connected components ---------------------------------
-#
-# Reachability closure rather than Tarjan: the graph has one node per
-# top-level function and the closure is computed once per component, so
-# the simpler formulation stays well inside the pass budget and needs no
-# explicit stack.
-
-fn tg_groups_from(g: TailGraph, idxs: [Int], seen: [Int]) : [TgGroup] {
-  match idxs {
-    [] -> []
-    [i, ...rest] ->
-      if tg_has_int(seen, i) { tg_groups_from(g, rest, seen) }
-      else { tg_group_at(g, i, rest, seen) }
-    _ -> []
-  }
-}
-
-fn tg_group_at(g: TailGraph, i: Int, rest: [Int], seen: [Int]) : [TgGroup] {
-  let comp = tg_component_of(g, i)
-  if list_length(comp) >= 2 {
-    [TgGrp(comp), ...tg_groups_from(g, rest, list_append(seen, comp))]
-  } else { tg_groups_from(g, rest, [i, ...seen]) }
-}
-
-# The component of `i` is every node reachable from `i` that also
-# reaches `i` back.
-fn tg_component_of(g: TailGraph, i: Int) : [Int] {
-  let fwd = tg_reach_forward(g, [i], [])
-  tg_keep_mutual(g, fwd, i, [])
-}
-
-fn tg_keep_mutual(g: TailGraph, cands: [Int], i: Int, acc: [Int]) : [Int] {
-  match cands {
-    [] -> list_reverse(acc)
-    [c, ...rest] ->
-      if tg_has_int(tg_reach_forward(g, [c], []), i) { tg_keep_mutual(g, rest, i, [c, ...acc]) }
-      else { tg_keep_mutual(g, rest, i, acc) }
-    _ -> list_reverse(acc)
-  }
-}
-
-fn tg_reach_forward(g: TailGraph, frontier: [Int], seen: [Int]) : [Int] {
-  match frontier {
-    [] -> seen
-    [n, ...rest] ->
-      if tg_has_int(seen, n) { tg_reach_forward(g, rest, seen) }
-      else { tg_reach_forward(g, list_append(rest, tg_succs(tailgraph_edges(g), n)), [n, ...seen]) }
-    _ -> seen
-  }
-}
-
-fn tg_succs(es: [TgEdge], from: Int) : [Int] = match es {
-  [] -> []
-  [TgE(a, b), ...rest] -> if a == from { [b, ...tg_succs(rest, from)] } else { tg_succs(rest, from) }
-  _ -> []
-}
-
-fn tg_has_int(xs: [Int], t: Int) : Bool = match xs {
-  [] -> false
-  [x, ...rest] -> if x == t { true } else { tg_has_int(rest, t) }
-  _ -> false
-}
-
-fn tg_index_range(n: Int, i: Int) : [Int] = if i >= n { [] } else { [i, ...tg_index_range(n, i + 1)] }
