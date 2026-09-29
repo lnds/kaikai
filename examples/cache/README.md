@@ -40,7 +40,8 @@ Or in a batch:
 # Phase B user-file incremental cache fixtures (#455)
 
 Six `userb_*.sh` fixtures pin the invalidation contract of the per-
-project user cache (`<project>/.kai-cache/<content>-<dep>.kab`, written
+project user cache (`<project>/.kai-cache/<toolchain-id>/<content>-<dep>.kab`
+under `bin/kai`, written
 by `stage2/compiler/user_cache.kai`). Unlike the Phase A fixtures, the
 Phase B cache is wired end-to-end: each fixture builds a throwaway
 multi-module project under `/tmp` with `KAI_CACHE=1` (the opt-in the
@@ -73,7 +74,8 @@ These run in CI via `make test` (the `test-user-cache` target, also in
 ## Phase A.1 — core (auto-loaded stdlib) cache (issue #825)
 
 Four `corec_*.sh` fixtures pin the invalidation contract of the
-**core** post-parse cache (`<project>/.kai-cache/core-<content>.kab`,
+**core** post-parse cache (`<project>/.kai-cache/<toolchain-id>/core-<content>.kab`
+under `bin/kai`,
 written by `stage2/compiler/core_cache.kai`). This is the lever that
 actually crosses the ≤150 ms cold-trivial target: a warm build
 deserialises the 12 auto-loaded core modules instead of re-lexing and
