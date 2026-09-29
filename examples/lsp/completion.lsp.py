@@ -26,6 +26,7 @@ def recv():
     return json.loads(proc.stdout.read(n))
 
 src = "fn greet(name: String) : Unit / Stdout = print(string_concat(\"hi \", name))\n"
+src += "fn twice[e](f: () -> Unit / e) : Unit / e = { f(); f() }\n"
 
 send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
 init = recv()
@@ -54,7 +55,10 @@ assert "map" in labels, "stdlib `map` missing"
 
 # Detail strings must include the function arrow.
 greet = next(it for it in items if it["label"] == "greet")
-assert "->" in greet["detail"], greet
+assert greet["detail"] == "(name: String) -> Unit / Stdout", greet
+# A function-typed parameter keeps its own effect row.
+twice = next(it for it in items if it["label"] == "twice")
+assert twice["detail"] == "(f: () -> Unit / e) -> Unit / e", twice
 
 send({"jsonrpc":"2.0","id":3,"method":"shutdown","params":None}); recv()
 send({"jsonrpc":"2.0","method":"exit"})
