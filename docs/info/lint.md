@@ -19,13 +19,12 @@ kai lint --json [<spec>]           # findings as JSON, one line per root
 ```
 
 `<spec>` is a `.kai` file or a package (`.` / `./<sub>`), the same as
-`kai build` / `kai test`. A package with an entry point is linted once
-from that entry, and the findings cover the entry file; a package
-without one — a library — is linted module by module.
+`kai build` / `kai test`. A package is linted module by module, with or
+without an entry point: each module the package owns is its own root.
 
 `--json` prints one JSON array of `{file, line, col, rule, severity,
 message}` per compilation root, each on its own line (NDJSON): one
-line for a file or a package's entry, one per module for a library.
+line for a file, one per module for a package.
 
 ## Rules
 

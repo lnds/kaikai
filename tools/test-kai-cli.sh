@@ -198,6 +198,10 @@ if [ "$(printf '%s\n' "$got" | grep -c '^\[.*\]$')" = 3 ] && [ "$(printf '%s\n' 
 else
   fail "lint --json over a library"; printf '%s\n' "$got" | sed 's/^/        /'
 fi
+# A package with an entry is still linted module by module: the imported module's findings are reported.
+L="$ROOT/examples/lint/pkg_entry"
+expect "lint: a package with an entry lints the modules it imports" 0 "$(cat "$L/lint.expected")" \
+  sh -c 'cd "$1" && "$2" lint . 2>/dev/null | sed "s|^.*/pkg_entry/||"' _ "$L" "$KAI"
 got="$(cd "$TMP/ws/lib" && "$KAI" typecheck --diags-json 2>/dev/null)"
 if [ "$(printf '%s\n' "$got" | grep -c '^{"file": .*"diagnostics": .*}$')" = 3 ] && [ "$(printf '%s\n' "$got" | wc -l | tr -d ' ')" = 3 ]; then
   ok "typecheck --diags-json: a library is one object per module, one per line"
