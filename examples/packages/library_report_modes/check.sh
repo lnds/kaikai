@@ -93,14 +93,17 @@ out="$(ok_run lib lint .)"
 saw "dead_code_unused_priv" "$out" "'kai lint .' did not report a finding in an unreachable module"
 rm -f "$TMP/lib/smelly.kai"
 
-# 6 — a package WITH an entry keeps resolving through the entry alone.
+# 6 — a package WITH an entry typechecks through the entry, but lints
+# module by module: a lint reports on its root file alone.
 mkdir -p "$TMP/app"
 printf 'name = "app"\nedition = "hanga-roa"\n' > "$TMP/app/kai.toml"
-printf 'fn main() : Int = 0\n' > "$TMP/app/main.kai"
+printf 'import util\n\nfn main() : Int = util.zero()\n' > "$TMP/app/main.kai"
+printf 'fn unused_helper(n: Int) : Int = n * 3\n\npub fn zero() : Int = 0\n' > "$TMP/app/util.kai"
 out="$(ok_run app typecheck .)"
 saw "entry point: main.kai" "$out" "'kai typecheck .' stopped resolving the entry of a binary package"
 out="$(ok_run app lint .)"
-saw "entry point: main.kai" "$out" "'kai lint .' stopped resolving the entry of a binary package"
+saw "main.kai" "$out" "'kai lint .' did not lint the entry of a binary package"
+saw "dead_code_unused_priv" "$out" "'kai lint .' did not lint a module the entry imports"
 
 # 7 — a directory with no manifest and no entry still errors: the fix
 # widens what a package reaches, it does not make every directory a
