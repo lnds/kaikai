@@ -282,8 +282,14 @@ static int remove_entry(const char *p, const struct stat *st, int flag, struct F
     return flag == FTW_DP ? rmdir(p) : unlink(p);
 }
 
-void kaicli_remove_tree(const char *path) {
-    nftw(path, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
+/* nftw does not visit a lone non-directory on every platform, so one is
+   unlinked directly; the outcome is read back rather than taken from nftw. */
+int kaicli_remove_tree(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return errno == ENOENT;
+    if (S_ISDIR(st.st_mode)) nftw(path, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
+    else unlink(path);
+    return lstat(path, &st) != 0 && errno == ENOENT;
 }
 
 /* `cat path >&2`: the file's exact bytes on stderr. */
