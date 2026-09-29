@@ -17,6 +17,8 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAI="$ROOT/bin/kai"
+# bin/kai keys a project's cache by the compiler it runs.
+CACHE_TID="$("$KAI" env KAI_TOOLCHAIN_ID)"
 PROJ="$(mktemp -d)"
 trap 'rm -rf "$PROJ"' EXIT INT TERM
 
@@ -35,7 +37,7 @@ if [ "$out1" != "7" ]; then
   exit 1
 fi
 
-blob="$(ls "$PROJ/.kai-cache/"*.kab 2>/dev/null | head -1)"
+blob="$(ls "$PROJ/.kai-cache/$CACHE_TID/"*.kab 2>/dev/null | head -1)"
 if [ -z "$blob" ] || [ ! -f "$blob" ]; then
   echo "userb_version_bump FAIL — no cache blob was written"
   exit 1
