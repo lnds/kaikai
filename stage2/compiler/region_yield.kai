@@ -1,6 +1,8 @@
 #[doc("The pinned-region gate: a `region { }` body may not reach a fiber suspension point. Errors when a region's body demands a suspending effect (Spawn/Actor/Cancel/Link/Monitor) directly or through a call, since an arena pointer that outlives a park would dangle after a migrating fiber resumes on another thread.")]
 
 import compiler.ast
+import compiler.expr_positions
+import compiler.loop_lower
 import compiler.region
 import compiler.util
 
@@ -45,23 +47,23 @@ fn ry_decl(d: Decl, regions: [RegionMark], file: String) : Int / Console {
   }
 }
 
-# Visit every region site in `e`, including inside lambdas and nested
-# regions: a region within a spawned closure is still its own push/pop
-# bracket and must hold the invariant on its own. Each region found is
-# checked against its OWN body's suspending row.
+# Visit every region site in `e`, in every position: a region within a
+# spawned closure or a loop body is still its own push/pop bracket and
+# must hold the invariant on its own. Each region found is checked
+# against its OWN body's suspending row.
 fn ry_sites(e: Expr, regions: [RegionMark], file: String) : Int / Console {
   let here = match e.kind {
     EBlock(_, _) ->
       if ry_pos_is_region(regions, e.line, e.col) { ry_check_region(e, file) } else { 0 }
     _ -> 0
   }
-  here + ry_sites_children(ry_all_children(e.kind), regions, file)
+  here + ry_sites_ps(xp_positions(e), regions, file)
 }
 
-fn ry_sites_children(xs: [Expr], regions: [RegionMark], file: String) : Int / Console {
-  match xs {
-    []           -> 0
-    [x, ...rest] -> ry_sites(x, regions, file) + ry_sites_children(rest, regions, file)
+fn ry_sites_ps(ps: [XPos], regions: [RegionMark], file: String) : Int / Console {
+  match ps {
+    []                  -> 0
+    [XP(_, x), ...rest] -> ry_sites(x, regions, file) + ry_sites_ps(rest, regions, file)
   }
 }
 
@@ -106,12 +108,26 @@ fn ry_first_suspend(effs: [String]) : Option[String] {
 # descending into lambda bodies: a closure's body runs when it is CALLED,
 # not where it is written, so a `spawn(() -> Actor.receive())` does not
 # make the enclosing region span a yield (the `Spawn` on the spawn call
-# itself does). Nested regions ARE walked: their ctors run inside this
-# body, so an effect they reach is reachable here too.
+# itself does). A loop intrinsic's lambdas are the exception: their
+# bodies run in place. Nested regions and handler clauses ARE walked:
+# they run inside this body, so an effect they reach is reachable here.
 
 fn ry_effects_in_expr(e: Expr, acc: [String]) : [String] {
   let a1 = ry_effects_here(e, acc)
-  ry_effects_in_exprs(ry_body_children(e.kind), a1)
+  match e.kind {
+    EIntrinsic(nm, xs) ->
+      if is_loop_intrinsic(nm) { ry_effects_in_exprs(map(xs, loop_arg_body), a1) }
+      else { ry_effects_in_ps(xp_positions(e), a1) }
+    _ -> ry_effects_in_ps(xp_positions(e), a1)
+  }
+}
+
+fn ry_effects_in_ps(ps: [XPos], acc: [String]) : [String] {
+  match ps {
+    []                     -> acc
+    [XP(XLam, _), ...rest] -> ry_effects_in_ps(rest, acc)
+    [XP(_, x), ...rest]    -> ry_effects_in_ps(rest, ry_effects_in_expr(x, acc))
+  }
 }
 
 fn ry_effects_here(e: Expr, acc: [String]) : [String] {
@@ -177,94 +193,5 @@ fn ry_mem(name: String, xs: [String]) : Bool {
   match xs {
     []           -> false
     [x, ...rest] -> if x == name { true } else { ry_mem(name, rest) }
-  }
-}
-
-# ---- child extractors ------------------------------------------------
-#
-# `ry_body_children` powers the region-body effect walk: it drops lambda
-# bodies (deferred execution) but keeps everything else, nested regions
-# included. `ry_all_children` powers the region-site walk and keeps
-# lambda bodies too, so a region written inside a closure is still found.
-
-fn ry_body_children(k: ExprKind) : [Expr] {
-  match k {
-    ELambda(_, _) -> []
-    _             -> ry_children(k)
-  }
-}
-
-fn ry_all_children(k: ExprKind) : [Expr] = ry_children(k)
-
-fn ry_children(k: ExprKind) : [Expr] {
-  match k {
-    ECall(callee, xs)   -> [callee, ...xs]
-    EField(base, _)     -> [base]
-    EIndex(a, b)        -> [a, b]
-    EBinop(_, a, b)     -> [a, b]
-    EUnop(_, x)         -> [x]
-    EIf(c, t, eo)       -> [c, t, ...ry_opt(eo)]
-    EMatch(scr, arms)   -> [scr, ...ry_arm_exprs(arms)]
-    ELambda(_, body)    -> [body]
-    ERecordLit(_, fis)  -> ry_field_exprs(fis)
-    EList(els)          -> ry_elem_exprs(els)
-    ERange(a, b, so)    -> [a, b, ...ry_opt(so)]
-    EBlock(ss, tail)    -> list_append(ry_stmt_exprs(ss), ry_opt(tail))
-    EPipe(a, b)         -> [a, b]
-    EMapPipe(a, b)      -> [a, b]
-    EFlatMapPipe(a, b)  -> [a, b]
-    EFilterPipe(a, b)   -> [a, b]
-    ELitUnit(inner, _)  -> [inner]
-    EBang(inner)        -> [inner]
-    EHandle(body, _, _, _, init, _, _, _) -> [body, ...ry_opt(init)]
-    _                   -> []
-  }
-}
-
-fn ry_opt(o: Option[Expr]) : [Expr] {
-  match o {
-    Some(x) -> [x]
-    None    -> []
-  }
-}
-
-fn ry_arm_exprs(arms: [Arm]) : [Expr] {
-  match arms {
-    []                      -> []
-    [Arm(_, g, b), ...rest] -> list_append(list_append(ry_opt(g), [b]), ry_arm_exprs(rest))
-  }
-}
-
-fn ry_field_exprs(fis: [FieldInit]) : [Expr] {
-  match fis {
-    []                  -> []
-    [FI(_, v), ...rest] -> [v, ...ry_field_exprs(rest)]
-  }
-}
-
-fn ry_elem_exprs(els: [ListElem]) : [Expr] {
-  match els {
-    []                     -> []
-    [ElPlain(x), ...rest]  -> [x, ...ry_elem_exprs(rest)]
-    [ElSpread(x), ...rest] -> [x, ...ry_elem_exprs(rest)]
-  }
-}
-
-fn ry_stmt_exprs(ss: [Stmt]) : [Expr] {
-  match ss {
-    []           -> []
-    [s, ...rest] -> list_append(ry_stmt_expr_list(s), ry_stmt_exprs(rest))
-  }
-}
-
-fn ry_stmt_expr_list(s: Stmt) : [Expr] {
-  match s {
-    SExprStmt(x)                -> [x]
-    SLet(_, _, rhs)             -> [rhs]
-    SAssert(c, mo)              -> [c, ...ry_opt(mo)]
-    SIndexAssign(b, i, v, _, _) -> [b, i, v]
-    SAssign(b, v, _, _) -> [b, v]
-    SVar(_, _, rhs, _, _)       -> [rhs]
-    SUse(_, _, _)               -> []
   }
 }
