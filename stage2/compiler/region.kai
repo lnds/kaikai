@@ -51,7 +51,9 @@
 # free (kai_check_unique returns 0).
 
 import compiler.ast
+import compiler.ast_map
 import compiler.diag_file
+import compiler.expr_positions
 
 # ---- side table ----------------------------------------------------
 
@@ -163,306 +165,56 @@ fn rw_decl(d: Decl, file: String, w: RWalk) : RWDecl {
 
 type RWExpr = { expr: Expr, w: RWalk }
 
-# Recurse an expression. The only special case is the region marker
-# `ECall(EVar("region"), [block])`: recognise it, record the region,
-# and unwrap to the bare block (after recursing INTO the block so
-# nested regions are handled too).
-fn rw_expr(e: Expr, file: String, w: RWalk) : RWExpr {
-  match e.kind {
-    ECall(callee, call_args) -> {
-      match rw_region_marker(callee, call_args) {
-        Some(rm) -> {
-          # Recurse into the block first (nested regions, inner markers).
-          let inner = rw_expr(rm.block, file, w)
-          # Record this region. The marker's own line/col is the
-          # `region` keyword position; nth disambiguates duplicates.
-          let nth = inner.w.nth
-          let mark = RM(file, e.line, e.col, nth, rm.name)
-          let w2 = RWalk { regions: [mark, ...inner.w.regions], nth: nth + 1 }
-          # Unwrap: the region's value IS the block's value. Downstream
-          # sees a plain block; the emitters route it to the arena via the
-          # side table keyed on this RegionMark's source position.
-          RWExpr { expr: inner.expr, w: w2 }
-        }
-        None -> {
-          let rc = rw_expr(callee, file, w)
-          let ra = rw_exprs(call_args, file, rc.w)
-          RWExpr { expr: rebuild(e, ECall(rc.expr, ra.exprs)), w: ra.w }
-        }
-      }
-    }
-    EField(x, nm) -> {
-      let r = rw_expr(x, file, w)
-      RWExpr { expr: rebuild(e, EField(r.expr, nm)), w: r.w }
-    }
-    EIndex(a, b) -> {
-      let ra = rw_expr(a, file, w)
-      let rb = rw_expr(b, file, ra.w)
-      RWExpr { expr: rebuild(e, EIndex(ra.expr, rb.expr)), w: rb.w }
-    }
-    EBinop(op, a, b) -> {
-      let ra = rw_expr(a, file, w)
-      let rb = rw_expr(b, file, ra.w)
-      RWExpr { expr: rebuild(e, EBinop(op, ra.expr, rb.expr)), w: rb.w }
-    }
-    EUnop(op, x) -> {
-      let r = rw_expr(x, file, w)
-      RWExpr { expr: rebuild(e, EUnop(op, r.expr)), w: r.w }
-    }
-    EIf(c, t, eo) -> {
-      let rc = rw_expr(c, file, w)
-      let rt = rw_expr(t, file, rc.w)
-      match eo {
-        None -> RWExpr { expr: rebuild(e, EIf(rc.expr, rt.expr, None)), w: rt.w }
-        Some(e2) -> {
-          let re = rw_expr(e2, file, rt.w)
-          RWExpr { expr: rebuild(e, EIf(rc.expr, rt.expr, Some(re.expr))), w: re.w }
-        }
-      }
-    }
-    EMatch(scr, arms) -> {
-      let rs = rw_expr(scr, file, w)
-      let ra = rw_arms(arms, file, rs.w)
-      RWExpr { expr: rebuild(e, EMatch(rs.expr, ra.arms)), w: ra.w }
-    }
-    ELambda(ps, body) -> {
-      let r = rw_expr(body, file, w)
-      RWExpr { expr: rebuild(e, ELambda(ps, r.expr)), w: r.w }
-    }
-    ERecordLit(nm, fis) -> {
-      let r = rw_fields(fis, file, w)
-      RWExpr { expr: rebuild(e, ERecordLit(nm, r.fields)), w: r.w }
-    }
-    EList(elems) -> {
-      let r = rw_elems(elems, file, w)
-      RWExpr { expr: rebuild(e, EList(r.elems)), w: r.w }
-    }
-    ERange(lo, hi, by) -> {
-      let rl = rw_expr(lo, file, w)
-      let rh = rw_expr(hi, file, rl.w)
-      match by {
-        None -> RWExpr { expr: rebuild(e, ERange(rl.expr, rh.expr, None)), w: rh.w }
-        Some(s) -> {
-          let rs = rw_expr(s, file, rh.w)
-          RWExpr { expr: rebuild(e, ERange(rl.expr, rh.expr, Some(rs.expr))), w: rs.w }
-        }
-      }
-    }
-    EBlock(stmts, tail) -> {
-      let rs = rw_stmts(stmts, file, w)
-      match tail {
-        None -> RWExpr { expr: rebuild(e, EBlock(rs.stmts, None)), w: rs.w }
-        Some(e2) -> {
-          let rt = rw_expr(e2, file, rs.w)
-          RWExpr { expr: rebuild(e, EBlock(rs.stmts, Some(rt.expr))), w: rt.w }
-        }
-      }
-    }
-    EPipe(l, r) -> {
-      let rl = rw_expr(l, file, w)
-      let rr = rw_expr(r, file, rl.w)
-      RWExpr { expr: rebuild(e, EPipe(rl.expr, rr.expr)), w: rr.w }
-    }
-    EMapPipe(l, r) -> {
-      let rl = rw_expr(l, file, w)
-      let rr = rw_expr(r, file, rl.w)
-      RWExpr { expr: rebuild(e, EMapPipe(rl.expr, rr.expr)), w: rr.w }
-    }
-    EFlatMapPipe(l, r) -> {
-      let rl = rw_expr(l, file, w)
-      let rr = rw_expr(r, file, rl.w)
-      RWExpr { expr: rebuild(e, EFlatMapPipe(rl.expr, rr.expr)), w: rr.w }
-    }
-    EFilterPipe(l, r) -> {
-      let rl = rw_expr(l, file, w)
-      let rr = rw_expr(r, file, rl.w)
-      RWExpr { expr: rebuild(e, EFilterPipe(rl.expr, rr.expr)), w: rr.w }
-    }
-    EBang(x) -> {
-      let r = rw_expr(x, file, w)
-      RWExpr { expr: rebuild(e, EBang(r.expr)), w: r.w }
-    }
-    ELitUnit(inner, u) -> {
-      let r = rw_expr(inner, file, w)
-      RWExpr { expr: rebuild(e, ELitUnit(r.expr, u)), w: r.w }
-    }
-    _ -> RWExpr { expr: e, w: w }
-  }
+# The marks are recorded and the markers unwrapped by two walks over the
+# same tree, so both must reach exactly the same positions: each descends
+# through the shared tables, never a hand-written list of variants.
+fn rw_expr(e: Expr, file: String, w: RWalk) : RWExpr =
+  RWExpr { expr: rw_unwrap(e), w: rw_marks(e, file, w) }
+
+fn rw_unwrap(e: Expr) : Expr = match region_marker_of(e) {
+  Some(rm) -> rw_unwrap(rm.block)
+  None -> Expr { kind: prc_map_expr_kind(e.kind, rw_unwrap), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 }
 
-# Build the new Expr preserving line/col/ty/mode, swapping only kind.
-fn rebuild(e: Expr, k: ExprKind) : Expr =
-  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+# An inner region takes its ordinal before the region enclosing it.
+fn rw_marks(e: Expr, file: String, w: RWalk) : RWalk = match region_marker_of(e) {
+  Some(rm) -> {
+    let inner = rw_marks(rm.block, file, w)
+    let mark = RM(file, e.line, e.col, inner.nth, rm.name)
+    RWalk { regions: [mark, ...inner.regions], nth: inner.nth + 1 }
+  }
+  None -> rw_marks_at(xp_positions(e), file, w)
+}
+
+fn rw_marks_at(ps: [XPos], file: String, w: RWalk) : RWalk = match ps {
+  [] -> w
+  [XP(_, x), ...rest] -> rw_marks_at(rest, file, rw_marks(x, file, w))
+}
 
 # The recognised region marker: the block body plus the region's binder
 # name (empty for the bare form).
 type RegionMarker = { block: Expr, name: String }
 
-# Is `callee`/`call_args` a region marker? Two shapes:
+# Two shapes:
 #   bare   `ECall(EVar("region"), [block])`              — name = ""
 #   named  `ECall(EVar("region"), [ELambda([r], block)])` — name = "r"
-# Returns the block and name when it matches. The parameter is
-# `call_args`, NOT `args`: a binding/param named `args` in a compiler
-# module shadows the core `args()` and stage 1 mis-compiles it into a
-# spurious "non-exhaustive match" runtime panic far from this call site
-# (memory feedback_kaikai_param_args_shadow; every other compiler module
-# spells the ECall arg list `args_` for the same reason).
-fn rw_region_marker(callee: Expr, call_args: [Expr]) : Option[RegionMarker] {
-  match callee.kind {
-    EVar(nm) ->
-      if nm == "region" {
-        match call_args {
-          [arg] -> match arg.kind {
-            ELambda(ps, body) -> match ps {
-              [p0] -> Some(RegionMarker { block: body, name: p0.pname })
-              _ -> None
-            }
-            _ -> Some(RegionMarker { block: arg, name: "" })
-          }
-          _ -> None
-        }
-      } else { None }
+fn region_marker_of(e: Expr) : Option[RegionMarker] = match e.kind {
+  ECall(callee, call_args) -> match callee.kind {
+    EVar(nm) -> if nm == "region" { region_marker_arg(call_args) } else { None }
     _ -> None
   }
+  _ -> None
 }
 
-type RWExprs = { exprs: [Expr], w: RWalk }
-
-fn rw_exprs(es: [Expr], file: String, w: RWalk) : RWExprs {
-  match es {
-    [] -> RWExprs { exprs: [], w: w }
-    [h, ...rest] -> {
-      let rh = rw_expr(h, file, w)
-      let rr = rw_exprs(rest, file, rh.w)
-      RWExprs { exprs: [rh.expr, ...rr.exprs], w: rr.w }
+fn region_marker_arg(call_args: [Expr]) : Option[RegionMarker] = match call_args {
+  [arg] -> match arg.kind {
+    ELambda(ps, body) -> match ps {
+      [p0] -> Some(RegionMarker { block: body, name: p0.pname })
+      _ -> None
     }
+    _ -> Some(RegionMarker { block: arg, name: "" })
   }
-}
-
-type RWArms = { arms: [Arm], w: RWalk }
-
-fn rw_arms(arms: [Arm], file: String, w: RWalk) : RWArms {
-  match arms {
-    [] -> RWArms { arms: [], w: w }
-    [a, ...rest] -> {
-      let ra = rw_arm(a, file, w)
-      let rr = rw_arms(rest, file, ra.w)
-      RWArms { arms: [ra.arm, ...rr.arms], w: rr.w }
-    }
-  }
-}
-
-type RWArm = { arm: Arm, w: RWalk }
-
-fn rw_arm(a: Arm, file: String, w: RWalk) : RWArm {
-  match a {
-    Arm(pat, guard, body) -> {
-      let gres = match guard {
-        None -> RWGuard { guard: None, w: w }
-        Some(g) -> {
-          let rg = rw_expr(g, file, w)
-          RWGuard { guard: Some(rg.expr), w: rg.w }
-        }
-      }
-      let rb = rw_expr(body, file, gres.w)
-      RWArm { arm: Arm(pat, gres.guard, rb.expr), w: rb.w }
-    }
-  }
-}
-
-type RWGuard = { guard: Option[Expr], w: RWalk }
-
-type RWFields = { fields: [FieldInit], w: RWalk }
-
-fn rw_fields(fis: [FieldInit], file: String, w: RWalk) : RWFields {
-  match fis {
-    [] -> RWFields { fields: [], w: w }
-    [h, ...rest] -> match h {
-      FI(nm, e) -> {
-        let re = rw_expr(e, file, w)
-        let rr = rw_fields(rest, file, re.w)
-        RWFields { fields: [FI(nm, re.expr), ...rr.fields], w: rr.w }
-      }
-    }
-  }
-}
-
-type RWElems = { elems: [ListElem], w: RWalk }
-
-fn rw_elems(es: [ListElem], file: String, w: RWalk) : RWElems {
-  match es {
-    [] -> RWElems { elems: [], w: w }
-    [h, ...rest] -> {
-      let re = match h {
-        ElPlain(e) -> {
-          let r = rw_expr(e, file, w)
-          RWElem { elem: ElPlain(r.expr), w: r.w }
-        }
-        ElSpread(e) -> {
-          let r = rw_expr(e, file, w)
-          RWElem { elem: ElSpread(r.expr), w: r.w }
-        }
-      }
-      let rr = rw_elems(rest, file, re.w)
-      RWElems { elems: [re.elem, ...rr.elems], w: rr.w }
-    }
-  }
-}
-
-type RWElem = { elem: ListElem, w: RWalk }
-
-type RWStmts = { stmts: [Stmt], w: RWalk }
-
-fn rw_stmts(ss: [Stmt], file: String, w: RWalk) : RWStmts {
-  match ss {
-    [] -> RWStmts { stmts: [], w: w }
-    [h, ...rest] -> {
-      let rh = rw_stmt(h, file, w)
-      let rr = rw_stmts(rest, file, rh.w)
-      RWStmts { stmts: [rh.stmt, ...rr.stmts], w: rr.w }
-    }
-  }
-}
-
-type RWStmt = { stmt: Stmt, w: RWalk }
-
-fn rw_stmt(s: Stmt, file: String, w: RWalk) : RWStmt {
-  match s {
-    SLet(pat, ty, e) -> {
-      let r = rw_expr(e, file, w)
-      RWStmt { stmt: SLet(pat, ty, r.expr), w: r.w }
-    }
-    SVar(nm, ty, e, l, c) -> {
-      let r = rw_expr(e, file, w)
-      RWStmt { stmt: SVar(nm, ty, r.expr, l, c), w: r.w }
-    }
-    SIndexAssign(tgt, idx, e, l, c) -> {
-      let rt = rw_expr(tgt, file, w)
-      let ri = rw_expr(idx, file, rt.w)
-      let re = rw_expr(e, file, ri.w)
-      RWStmt { stmt: SIndexAssign(rt.expr, ri.expr, re.expr, l, c), w: re.w }
-    }
-    SAssign(tgt, e, l, c) -> {
-      let rt = rw_expr(tgt, file, w)
-      let re = rw_expr(e, file, rt.w)
-      RWStmt { stmt: SAssign(rt.expr, re.expr, l, c), w: re.w }
-    }
-    SExprStmt(e) -> {
-      let r = rw_expr(e, file, w)
-      RWStmt { stmt: SExprStmt(r.expr), w: r.w }
-    }
-    SAssert(e, mo) -> {
-      let re = rw_expr(e, file, w)
-      match mo {
-        None -> RWStmt { stmt: SAssert(re.expr, None), w: re.w }
-        Some(m) -> {
-          let rm = rw_expr(m, file, re.w)
-          RWStmt { stmt: SAssert(re.expr, Some(rm.expr)), w: rm.w }
-        }
-      }
-    }
-    _ -> RWStmt { stmt: s, w: w }
-  }
+  _ -> None
 }
 
 # --- Region-brand detection (shared by both backends) ------------------
