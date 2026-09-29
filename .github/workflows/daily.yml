@@ -99,22 +99,63 @@ jobs:
   # The Tier 1 promise that a machine with only `cc` builds the compiler:
   # cc -> the frozen seed -> kaic2, no prior kaikai binary, the runner's own
   # cc. Every other CI build boots from the release, so this is where the
-  # seed is verified. Its kaic2 must be a fixed point and emit byte-identical
-  # C to the release-booted one, for the compiler itself and a sample program.
+  # seed is verified. Each boot's kaic2 must be a fixed point, and the two
+  # must emit byte-identical C for the compiler itself and a sample program.
+  # The boots are independent until that comparison, so they run in parallel.
   # No `ref:`: a dispatch verifies the dispatched branch.
-  bootstrap-from-scratch:
+  bootstrap-boot:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        boot: [release, seed]
     steps:
       - uses: actions/checkout@v4
 
       - name: Fetch the bootstrap seeds
+        if: matrix.boot == 'seed'
         run: git fetch --depth=1 origin 'refs/tags/bootstrap-seed-v*:refs/tags/bootstrap-seed-v*'
 
-      - name: cc -> seed -> kaic2, converging with the release boot
+      - name: ${{ matrix.boot }} -> kaic2, a fixed point over its kaic2-a
         run: |
           cc --version | head -1
-          make kaic-boot-verify
+          make kaic-boot-verify-one BOOT=${{ matrix.boot }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boot-verify-${{ matrix.boot }}
+          path: |
+            stage2/build/boot-verify/${{ matrix.boot }}/self.c
+            stage2/build/boot-verify/${{ matrix.boot }}/sample.c
+          retention-days: 3
+
+  bootstrap-from-scratch:
+    needs: bootstrap-boot
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require both boots
+        if: needs.bootstrap-boot.result != 'success'
+        run: |
+          echo "a boot job did not succeed: ${{ needs.bootstrap-boot.result }}"
+          exit 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: boot-verify-*
+          path: boot-verify
+
+      - name: release- and seed-booted kaic2 emit the same C
+        run: |
+          for b in release seed; do
+            mkdir -p stage2/build/boot-verify/$b
+            cp boot-verify/boot-verify-$b/self.c boot-verify/boot-verify-$b/sample.c stage2/build/boot-verify/$b/
+          done
+          make kaic-boot-verify-cross
 
       - name: Open issue on failure
         if: (failure() || cancelled()) && github.event_name == 'schedule'
