@@ -13,17 +13,31 @@ fn newer(a: String, b: String) : Bool / Ffi = cli_sys.mtime(a) > cli_sys.mtime(b
 
 fn stale(src: String, bin: String) : Bool / Ffi = (not cli_sys.is_exec(bin)) or newer(src, bin)
 
-# Wait for another invocation's build lock; true once `bin` is current.
-fn await_lock(lock: String, src: String, bin: String, waited: Int) : Bool / File + Ffi =
+# Wait for another invocation's build lock; Ok(true) once `bin` is current.
+fn await_lock(
+  lock: String,
+  src: String,
+  bin: String,
+  waited: Int
+) : Result[Bool, Int] / Stderr + File + Ffi =
   match dir_create_dir(lock) {
-    Ok(_) -> false
+    Ok(_) -> Ok(false)
     Err(_) -> if waited >= 120 {
-      cli_sys.remove_tree(lock)
-      await_lock(lock, src, bin, waited)
+      break_lock(lock)
     } else {
       cli_sys.sleep(1)
-      if stale(src, bin) { await_lock(lock, src, bin, waited + 1) } else { true }
+      if stale(src, bin) { await_lock(lock, src, bin, waited + 1) } else { Ok(true) }
     }
+  }
+
+# Take over a lock its holder never released.
+fn break_lock(lock: String) : Result[Bool, Int] / Stderr + File + Ffi =
+  if not cli_sys.remove_tree(lock) {
+    cli_err.die("cannot remove stale build lock #{lock}")
+  } else if dir_create_dir(lock).is_ok() {
+    Ok(false)
+  } else {
+    cli_err.die("cannot take build lock #{lock}")
   }
 
 fn build_now(
@@ -52,13 +66,25 @@ pub fn build_helper(
   bin: String
 ) : Result[Unit, Int] / Stderr + File + Ffi {
   let lock = "#{bin}.lock"
-  if (not stale(src, bin)) or await_lock(lock, src, bin, 0) {
+  if not stale(src, bin) {
     Ok(())
   } else {
-    let r = if stale(src, bin) { build_now(t, label, src, bin) } else { Ok(()) }
-    cli_sys.remove_tree(lock)
-    r
+    await_lock(lock, src, bin, 0).and_then(
+      current => if current { Ok(()) } else { build_locked(t, label, src, bin, lock) }
+    )
   }
+}
+
+fn build_locked(
+  t: Toolchain,
+  label: String,
+  src: String,
+  bin: String,
+  lock: String
+) : Result[Unit, Int] / Stderr + File + Ffi {
+  let r = if stale(src, bin) { build_now(t, label, src, bin) } else { Ok(()) }
+  let _ = cli_sys.remove_tree(lock)
+  r
 }
 
 #[doc("The kai-pkg helper: shipped in an installed prefix, built on first use in a checkout.")]
