@@ -5901,6 +5901,21 @@ test-closure-spec-inner-lambda: $(TARGET) bin-kai build
 	done; \
 	echo "closure-spec-inner-lambda OK (each spec keeps its own closure; c and native agree)"
 
+# A closure argument named like another declaration (a generic root fn, a
+# module-private fn, a shadowed local) specialises to the resolver's choice.
+test-closure-spec-homonym: $(TARGET) bin-kai build
+	@set -e; \
+	src=../examples/pipes/collections/closure_spec_homonym.kai; \
+	exp=../examples/pipes/collections/closure_spec_homonym.out.expected; \
+	for be in c native; do \
+	  KAI_BACKEND=$$be ../bin/kai build $$src -o build/s2-cshm 2> build/s2-cshm.err \
+	    || { echo "closure-spec-homonym FAIL ($$be build errored)"; cat build/s2-cshm.err; exit 1; }; \
+	  ./build/s2-cshm > build/s2-cshm.out; \
+	  diff -q $$exp build/s2-cshm.out > /dev/null \
+	    || { echo "closure-spec-homonym FAIL ($$be output diff)"; diff $$exp build/s2-cshm.out; exit 1; }; \
+	done; \
+	echo "closure-spec-homonym OK (each closure argument keeps its resolved identity; c and native agree)"
+
 # Issue #1208 (native) — grounding a return-only tparam from the call
 # site. `let v: Vec[Point] = [a..b] | stage` collects into a Vec whose
 # element type is return-only; mono now grounds it from the annotated
