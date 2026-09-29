@@ -1,15 +1,12 @@
 name: daily
 
-# Tier 2 cron — runs `make daily` once a day on main HEAD plus on
-# manual dispatch. Tier 2 (per CLAUDE.md / docs/testing-tiers.md)
-# is diagnostic, not a gate: failures here do NOT block PRs.
-# Instead, a failed run opens an issue tagged `daily-failure` so
-# the next morning's lane has a concrete entry point.
+# Tier 2 cron — `make daily` once a day on main HEAD plus on manual dispatch.
+# Tier 2 (per CLAUDE.md / docs/testing-tiers.md) is diagnostic, not a gate:
+# failures here do NOT block PRs. Instead, a failed run opens an issue tagged
+# `daily-failure` so the next morning's lane has a concrete entry point.
 #
-# Schedule: 02:00 UTC ≈ 22:00 / 23:00 Chile (the maintainer's
-# evening), matching the "end-of-day" cadence pinned in CLAUDE.md.
-# Adjust if the dev rhythm shifts; the literal time is not
-# load-bearing, the daily cadence is.
+# Schedule: 02:00 UTC ≈ 22:00 / 23:00 Chile (the maintainer's evening). The
+# literal time is not load-bearing, the daily cadence is.
 
 on:
   schedule:
@@ -24,17 +21,20 @@ concurrency:
   group: daily-main
   cancel-in-progress: false
 
+# `make daily` split into parallel jobs: one build publishes kaic2, and each
+# `daily-part` runs a disjoint piece of the verification on it. The parts
+# union to `make daily` (see the `daily:` comment in the Makefile). No `ref:`:
+# a dispatch verifies the dispatched branch; the cron runs the default branch.
 jobs:
-  daily:
+  daily-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # A release boot compiles the whole compiler twice; a slow runner took 34 min.
+    timeout-minutes: 75
     env:
       # The boot of stage2.c (docs/build-system.md §KAIC_BOOT).
       KAIC_BOOT: release
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: main
 
       - name: Install toolchain (clang for LLVM backend tests)
         run: |
@@ -49,15 +49,86 @@ jobs:
           clang --version
           make --version | head -1
 
-      - name: make daily
-        id: daily
-        run: make CC=clang daily
+      - name: Build kaic1 and the release-booted C-only kaic2
+        run: make CC=clang kaic1 kaic2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daily-kaic2-c
+          path: |
+            stage0/*.o
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/stage2.c
+            stage2/build/stage2.c.id
+            stage2/build/kaic2.id
+          retention-days: 3
+          if-no-files-found: error
+
+  daily-part:
+    needs: daily-build
+    runs-on: ubuntu-latest
+    # No object cache here: the shard-4/6 self-hosts compile cold every night,
+    # and one took 35 min on a slow runner.
+    timeout-minutes: 90
+    env:
+      KAIC_BOOT: release
+    strategy:
+      fail-fast: false
+      matrix:
+        part:
+          - tier1-shard-1
+          - tier1-shard-2
+          - tier1-shard-3
+          - tier1-shard-4
+          - tier1-shard-5
+          - tier1-shard-6
+          - tier1-shard-7 FMT_PROPERTY_SHARD=1/2
+          - tier1-shard-7 FMT_PROPERTY_SHARD=2/2
+          - tier1-unsharded
+          - daily-tail
+    name: daily-part (${{ matrix.part }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          command -v clang >/dev/null 2>&1 || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends clang
+          }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: daily-kaic2-c
+
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+
+      - name: make ${{ matrix.part }}
+        run: make CC=clang ${{ matrix.part }}
+
+  daily:
+    needs: [daily-build, daily-part]
+    # `always()`: a part killed at its timeout reports `cancelled`, and that
+    # must still reach the gate and the issue below.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require the build and every part
+        run: |
+          echo "build=${{ needs.daily-build.result }} parts=${{ needs.daily-part.result }}"
+          [ "${{ needs.daily-build.result }}" = success ] && [ "${{ needs.daily-part.result }}" = success ] \
+            || { echo "::error::daily FAIL — the build or a part did not succeed"; exit 1; }
+          echo "daily OK — every part green"
 
       - name: Open issue on daily failure
-        # `cancelled()` covers the timeout case: a job killed at
-        # `timeout-minutes` reports `cancelled`, not `failure`, so a
-        # `failure()`-only guard let every timed-out run pass silently with
-        # no diagnostic. A timeout IS a signal worth an issue.
+        # `cancelled()` covers a timeout, which reports `cancelled`, not `failure`.
         if: (failure() || cancelled()) && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

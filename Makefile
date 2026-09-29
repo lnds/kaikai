@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-symid-pipeline test-decl-symid-survives test-evar-above-erase test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-mn-idle-cpu test-upgrade-resolver test-release-platforms test-kaic-boot test-native-probe test-cli-flags test-kai-cli test-eval-order-gcc clean warm-core tier0 test-header-deps test-bin-kai-prereq test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 test-light-partition test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily coverage-probe rc-budget stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-binserialize-linearity test-rc-budget bin/kai test-walker-catchall-audit
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-symid-pipeline test-decl-symid-survives test-evar-above-erase test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-mn-idle-cpu test-upgrade-resolver test-release-platforms test-kaic-boot test-native-probe test-cli-flags test-kai-cli test-eval-order-gcc clean warm-core tier0 test-header-deps test-bin-kai-prereq test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 test-light-partition test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily daily-tail tier1-unsharded coverage-probe rc-budget stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-binserialize-linearity test-rc-budget bin/kai test-walker-catchall-audit
 
 # A bare kaic2 with no `--edition` runs the OLDEST edition (tongariki),
 # so a recipe driving the binary directly would test the previous
@@ -1402,17 +1402,23 @@ tier1-backend-parity: bin/kai
 # not per-PR. If it fails, `main` stays unbroken (Tier 0/1 gated every
 # commit) but a diagnostic opens a lane the next morning.
 #
-# `tier1-asan` and `tier1-backend-parity` are deliberately NOT in this
-# target: both already run path-gated on PRs (and thus on every merge to
-# main that touches their paths), and together they pushed the cron past
-# its 30-min budget — every scheduled run was silently `cancelled` at the
-# timeout, producing no diagnostic at all. Keep the daily under its budget
-# so it actually completes; the two heavy gates keep their per-PR coverage.
-# `selfhost` is here rather than on the PR path: the native half of the
-# byte-identity gate already runs per-PR in tier1-native, and the C half
-# costs two whole compiler generations for a check nothing gates on.
-daily: tier1 selfhost stress-fixtures coverage-probe rc-budget test-binserialize-budget
+# `tier1-asan` and `tier1-backend-parity` are deliberately NOT here: both run
+# path-gated on PRs. `selfhost` is here rather than on the PR path: the native
+# half of the byte-identity gate already runs per-PR in tier1-native, and the
+# C half costs two whole compiler generations.
+#
+# CI splits `daily` across parallel jobs (.github/workflows/daily.yml): the
+# seven tier1 shards, `tier1-unsharded`, and `daily-tail`. Their union is
+# `daily`; a phase added here or to `tier1` needs an owner among them.
+daily: tier1 daily-tail
 	@echo "daily OK — tier1 + C selfhost + stress fixtures + coverage probe + RC budget + BinSerialize budget"
+
+daily-tail: selfhost stress-fixtures coverage-probe rc-budget test-binserialize-budget
+	@echo "daily-tail OK — C selfhost + stress fixtures + coverage probe + RC budget + BinSerialize budget"
+
+# The `tier1` prerequisites that no tier1-shard-N runs.
+tier1-unsharded: test-stage0 test-stage1 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-migrate test-mn-determinism test-runtime-global-audit
+	@echo "tier1-unsharded OK — stage0/stage1 tests + phase4 demos + multi-module/import probes + migrate + M:N determinism + runtime-global audit"
 
 # Stress fixtures: closed regressions that exercise patterns the
 # per-feature suite does not — R3 scrutinee-reuse RC

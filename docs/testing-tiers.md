@@ -462,15 +462,21 @@ reach zero**, exactly like the skip-list in `tests/fmt_selfhost.sh`.
 
 ## Tier 2 — `make daily` (end of day / cron)
 
-~10-20 minutes. Runs once a day on `main` HEAD, not on each PR.
+Runs once a day on `main` HEAD, not on each PR.
 
 ```
 make tier1
-make stress-fixtures      # see "Stress fixtures" below
-make coverage-probe       # see "Coverage probe" below
-make rc-budget            # leaked / RSS / wall vs baseline
-make demos-extended       # demos/9d9l + demos/vs + aspirational rerun
+make daily-tail           # C selfhost + stress fixtures + coverage probe
+                          # + RC budget + BinSerialize budget
 ```
+
+`make daily` runs both in series, locally. In CI
+(`.github/workflows/daily.yml`) one job builds `kaic2` and publishes it,
+then parallel jobs split the work: the seven `tier1-shard-N` targets
+(shard 7 in two corpus parts), `tier1-unsharded` (the `tier1` phases no
+shard runs) and `daily-tail`. The union is `make daily`. A closing `daily`
+job fails unless every part succeeded and opens the `daily-failure`
+issue.
 
 If Tier 2 fails, **`main` is not broken** — Tier 0 / Tier 1 already
 gated every commit. Tier 2 produces a diagnostic that opens a lane
