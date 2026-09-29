@@ -63,6 +63,7 @@ import compiler.unbox
 import compiler.name_scope
 import compiler.evidence_scan
 import compiler.perceus_payer
+import compiler.type_home
 
 # ====================================================================
 
@@ -74,8 +75,11 @@ import compiler.perceus_payer
 #[doc("Build-time wrapper selection (build/test/bench/check) passed to the emitters; the driver consumes it from here.")]
 pub type BuildMode = BMBuild | BMTest | BMBench | BMCheck
 
-#[doc("Emit-side variant table entry: declaring module, constructor name, arity, payload type list, head tag.")]
-pub type VariantEntry = EV(Option[String], String, Int, [TypeExpr], Int)
+# The slot kinds are resolved once, from the declaring module, so every
+# consumer reads the same layout verdict instead of re-reading a payload
+# type name that a homonym elsewhere could shadow.
+#[doc("Emit-side variant table entry: declaring module, constructor name, arity, payload slot kinds, head tag.")]
+pub type VariantEntry = EV(Option[String], String, Int, [Int], Int)
 
 #[doc("EFn-table filter/selector: prefer module.")]
 # Issue #748: when lowering the body of module `m`, rotate the EFn table
@@ -436,14 +440,14 @@ fn evar_entry_arity(vs: [VariantEntry], home: Option[String], target: String, ar
 # walk runs off the end, every remaining slot classifies boxed, and a raw
 # Int64 slot receives a pointer the consumer then dereferences as an
 # integer. Fall back only when the fallback's arity still matches.
-#[doc("The payload types of ctor `target` with `arity` slots, preferring the entry declared by `home`.")]
-pub fn evar_payload_tys_arity(vs: [VariantEntry], home: Option[String], target: String,
-                                 arity: Int) : Option[[TypeExpr]] =
+#[doc("The payload slot kinds of ctor `target` with `arity` slots, preferring the entry declared by `home`.")]
+pub fn evar_slot_kinds_arity(vs: [VariantEntry], home: Option[String], target: String,
+                             arity: Int) : Option[[Int]] =
   match evar_entry_arity(vs, home, target, arity) {
-    Some(EV(_, _, _, tys, _)) -> Some(tys)
-    None                      -> match evar_payload_tys_in(vs, home, target) {
-      Some(tys) -> if list_length(tys) == arity { Some(tys) } else { None }
-      None      -> None
+    Some(EV(_, _, _, ks, _)) -> Some(ks)
+    None                     -> match evar_slot_kinds_in(vs, home, target) {
+      Some(ks) -> if list_length(ks) == arity { Some(ks) } else { None }
+      None     -> None
     }
   }
 
@@ -483,30 +487,21 @@ pub fn evar_find_tag_opt_in(vs: [VariantEntry], home: Option[String], target: St
 pub fn evar_find_tag_opt(vs: [VariantEntry], target: String) : Option[Int] =
   evar_find_tag_opt_in(vs, None, target)
 
-#[doc("The declared payload types of ctor target as declared by `home`, or None when it is not a registered variant.")]
-pub fn evar_payload_tys_in(vs: [VariantEntry], home: Option[String], target: String) : Option[[TypeExpr]] =
+#[doc("The payload slot kinds of ctor target as declared by `home`, or None when it is not a registered variant.")]
+pub fn evar_slot_kinds_in(vs: [VariantEntry], home: Option[String], target: String) : Option[[Int]] =
   match evar_entry(vs, home, target) {
-    None             -> None
-    Some(EV(_, _, _, tys, _)) -> Some(tys)
+    None                     -> None
+    Some(EV(_, _, _, ks, _)) -> Some(ks)
   }
 
-#[doc("The declared payload types of ctor target, or None when it is not a registered variant.")]
-pub fn evar_payload_tys(vs: [VariantEntry], target: String) : Option[[TypeExpr]] =
-  evar_payload_tys_in(vs, None, target)
+#[doc("The payload slot kinds of ctor target, or None when it is not a registered variant.")]
+pub fn evar_slot_kinds(vs: [VariantEntry], target: String) : Option[[Int]] =
+  evar_slot_kinds_in(vs, None, target)
 
-# A tagged Int rides `.i64`, a Real `.r`, an enum its immediate tag; anything
-# else is a boxed `KaiValue *`. Shared by both backends so the slot mask never
-# diverges between the C-text and native emitters.
-#[doc("Slot-kind code for a payload type: 1 Int, 2 Real, 3 enum, 0 boxed pointer.")]
-pub fn variant_slot_kind(te: TypeExpr, enums: [String]) : Int = match te.tkind {
-  TyName(n, targs) ->
-    if list_length(targs) == 0 {
-      if n == "Int" { 1 }
-      else if n == "Real" { 2 }
-      else if enum_names_has(enums, n) { 3 }
-      else { 0 }
-    } else { 0 }
-  _ -> 0
+#[doc("The slot kind at slot `i` of a kind list (0 boxed, 1 Int, 2 Real, 3 enum); 0 past its end.")]
+pub fn kind_at(ks: [Int], i: Int) : Int = match ks {
+  []           -> 0
+  [k, ...rest] -> if i == 0 { k } else { kind_at(rest, i - 1) }
 }
 
 # Plain arithmetic, no `<<`/`bit_or`: the stage-1 compiler does not parse the
@@ -518,18 +513,15 @@ pub fn variant_slot_pos(i: Int) : Int =
 #[doc("The slot kind that a variant slot mask records for slot i: 0 boxed, 1 Int, 2 Real, 3 enum.")]
 pub fn variant_mask_kind(mask: Int, i: Int) : Int = (mask / variant_slot_pos(i)) % 4
 
-fn variant_slot_mask_loop(tys: [TypeExpr], i: Int, acc: Int, enums: [String]) : Int = match tys {
+fn variant_slot_mask_loop(ks: [Int], i: Int, acc: Int) : Int = match ks {
   [] -> acc
-  [t, ...rest] ->
+  [k, ...rest] ->
     if i >= 16 { 0 }
-    else {
-      let k = variant_slot_kind(t, enums)
-      variant_slot_mask_loop(rest, i + 1, acc + (k * variant_slot_pos(i)), enums)
-    }
+    else { variant_slot_mask_loop(rest, i + 1, acc + (k * variant_slot_pos(i))) }
 }
 
-#[doc("The 2-bit-per-slot mask for a payload type list (0 when > 16 slots overflow the field).")]
-pub fn variant_slot_mask(tys: [TypeExpr], enums: [String]) : Int = variant_slot_mask_loop(tys, 0, 0, enums)
+#[doc("The 2-bit-per-slot mask for a payload slot-kind list (0 when > 16 slots overflow the field).")]
+pub fn variant_slot_mask(ks: [Int]) : Int = variant_slot_mask_loop(ks, 0, 0)
 
 # Plain arithmetic for the same stage-1 reason as variant_slot_pos.
 fn record_kept_pos(i: Int) : Int =
@@ -565,18 +557,10 @@ pub fn record_kept_mask(fis: [FieldInit], i: Int, acc: Int) : Int = match fis {
   }
 }
 
-#[doc("The i-th payload type of a slot list, or None past the end. Shared by construction + read.")]
-pub fn variant_nth_ty(xs: [TypeExpr], i: Int) : Option[TypeExpr] = match xs {
-  [] -> None
-  [h, ...rest] -> if i == 0 { Some(h) } else { variant_nth_ty(rest, i - 1) }
-}
-
-#[doc("True iff any slot of the payload is a primitive (Int/Real/enum) — the typed-construction gate.")]
-pub fn variant_has_primitive_slot(tys: [TypeExpr], enums: [String]) : Bool = match tys {
+#[doc("True iff any payload slot is a primitive (Int/Real/enum) — the typed-construction gate.")]
+pub fn variant_has_primitive_slot(ks: [Int]) : Bool = match ks {
   [] -> false
-  [t, ...rest] ->
-    if variant_slot_kind(t, enums) != 0 { true }
-    else { variant_has_primitive_slot(rest, enums) }
+  [k, ...rest] -> if k != 0 { true } else { variant_has_primitive_slot(rest) }
 }
 
 #[doc("The fixed table of built-in variant constructors (Option/Result/etc.) every emit run seeds.")]
@@ -604,8 +588,8 @@ pub fn builtin_variants() : [VariantEntry] =
    # read slots[0].i64 not slots[0].ptr. Registering the payload type
    # here drives emit_pat_test_variant through the typed (Phase 2 #440)
    # slot-read path.
-   EV(os_home(), "Exited", 1, [es_ty_name_zero("Int")], 9),
-   EV(os_home(), "Signaled", 1, [es_ty_name_zero("Int")], 10),
+   EV(os_home(), "Exited", 1, [1], 9),
+   EV(os_home(), "Signaled", 1, [1], 10),
    EV(os_home(), "SigWinch", 0, [], 11)]
 
 # A core file's declarations take its basename as their home.
@@ -641,7 +625,7 @@ fn evar_key_of(v: VariantEntry) : String = match v {
 
 #[doc("Register a declaration's variant constructors into the EVar table with stable name-keyed tags.")]
 pub fn register_variants(decls: [Decl]) : [VariantEntry] {
-  let pending = suv_pending_decls(decls, [])
+  let pending = suv_pending_decls(decls, type_home_table(decls), [])
   if list_length(pending) > 60000 {
     panic("too many variant constructors for the uint16 tag space")
   } else {
@@ -653,28 +637,29 @@ pub fn register_variants(decls: [Decl]) : [VariantEntry] {
 # that declares it. A repeat of the same key keeps its first
 # arity/payload (builtins re-emitted as synthetic DTypes by the
 # core-inject pass). Tags are assigned later.
-fn suv_pending_decls(ds: [Decl], acc: [VariantEntry]) : [VariantEntry] {
+fn suv_pending_decls(ds: [Decl], hs: [TyHome], acc: [VariantEntry]) : [VariantEntry] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
       DType(_, _, _, body, _, _, mo, _, _) -> match body {
-        TBSum(vs) -> suv_pending_decls(rest, suv_pending_vs(vs, mo, acc))
-        _         -> suv_pending_decls(rest, acc)
+        TBSum(vs) -> suv_pending_decls(rest, hs, suv_pending_vs(vs, mo, hs, acc))
+        _         -> suv_pending_decls(rest, hs, acc)
       }
-      _ -> suv_pending_decls(rest, acc)
+      _ -> suv_pending_decls(rest, hs, acc)
     }
   }
 }
 
-fn suv_pending_vs(vs: [Variant], home: Option[String], acc: [VariantEntry]) : [VariantEntry] {
+fn suv_pending_vs(vs: [Variant], home: Option[String], hs: [TyHome], acc: [VariantEntry]) : [VariantEntry] {
   match vs {
     [] -> acc
     [v, ...rest] -> match v {
       Var(n, tys) ->
         if suv_is_builtin(home, n) or suv_seen(acc, home, n) {
-          suv_pending_vs(rest, home, acc)
+          suv_pending_vs(rest, home, hs, acc)
         } else {
-          suv_pending_vs(rest, home, [EV(home, n, list_length(tys), tys, 0), ...acc])
+          let ks = map(tys, (t) => payload_slot_kind(hs, home, t))
+          suv_pending_vs(rest, home, hs, [EV(home, n, list_length(tys), ks, 0), ...acc])
         }
     }
   }
@@ -2505,75 +2490,6 @@ pub fn stdlib_proto_op_id_int(pname: String, opname: String) : Int {
 pub fn stdlib_proto_op_id_c(pname: String, opname: String) : String =
   int_to_string(stdlib_proto_op_id_int(pname, opname))
 
-# Koka-style enum representation: a sum type whose EVERY constructor is
-# nullary (zero payload) is "enum-like" — its values carry no data, only
-# identity. Such a type's value, when stored as a CONSTRUCTOR SLOT of
-# another variant, is emitted as the immediate `variant_tag` (i64) under
-# KAI_VAR_SLOT_ENUM instead of a pointer to the interned singleton.
-# This removes one heap dereference from every read of that field
-# (e.g. `is_red`'s `node.color`). Standalone values (`let c = Red`)
-# stay boxed singletons — only the slot representation changes.
-#[doc("True iff `tname` names a user sum type all of whose constructors are nullary (zero payload) — the enum-like representation eligibility.")]
-pub fn type_is_enum_like(tname: String, decls: [Decl]) : Bool {
-  match decls {
-    [] -> false
-    [d, ...rest] -> match d {
-      DType(_, dn, _, body, _, _, _, _, _) -> match body {
-        TBSum(vs) ->
-          if dn == tname { all_variants_nullary(vs) }
-          else { type_is_enum_like(tname, rest) }
-        _ -> type_is_enum_like(tname, rest)
-      }
-      _ -> type_is_enum_like(tname, rest)
-    }
-  }
-}
-
-#[doc("True iff every constructor in `vs` carries an empty payload list. A single payload-carrying ctor disqualifies the whole type (the mixed case stays boxed).")]
-pub fn all_variants_nullary(vs: [Variant]) : Bool {
-  match vs {
-    [] -> true
-    [v, ...rest] -> match v {
-      Var(_, payload) -> match payload {
-        [] -> all_variants_nullary(rest)
-        _  -> false
-      }
-    }
-  }
-}
-
-# Precompute the set of enum-like type NAMES once at emission start, so
-# the slot-kind classifier (`variant_slot_kind`) can decide ENUM via a
-# cheap name-membership test instead of re-walking the decl list per
-# slot. Threaded through EmitCtx.enums.
-#[doc("Collect the names of every enum-like (all-nullary) user sum type declared in `decls`.")]
-pub fn collect_enum_type_names(decls: [Decl]) : [String] =
-  collect_enum_type_names_loop(decls, [])
-
-#[doc("Backing fold for collect_enum_type_names.")]
-pub fn collect_enum_type_names_loop(decls: [Decl], acc: [String]) : [String] {
-  match decls {
-    [] -> acc
-    [d, ...rest] -> match d {
-      DType(_, dn, _, body, _, _, _, _, _) -> match body {
-        TBSum(vs) ->
-          if all_variants_nullary(vs) { collect_enum_type_names_loop(rest, [dn, ...acc]) }
-          else { collect_enum_type_names_loop(rest, acc) }
-        _ -> collect_enum_type_names_loop(rest, acc)
-      }
-      _ -> collect_enum_type_names_loop(rest, acc)
-    }
-  }
-}
-
-#[doc("Membership test over the precomputed enum-like type-name list.")]
-pub fn enum_names_has(enums: [String], name: String) : Bool {
-  match enums {
-    [] -> false
-    [h, ...rest] -> if h == name { true } else { enum_names_has(rest, name) }
-  }
-}
-
 #[doc("For a constructor `name`, find the sum type it belongs to and look up that sum's head tag. Builtins use the reserved ids; user sums resolve to their declaration's dense head tag.")]
 pub fn variant_head_tag_for(name: String, decls: [Decl]) : Int =
   variant_head_tag_for_in(None, name, decls)
@@ -3646,10 +3562,6 @@ pub fn row_to_string_suffix(r: Row) : String {
 
 # ====================================================================
 # downward glue mirrors (es_ prefix) — originals in main head/driver
-
-#[doc("Construct a zero-position TyName TypeExpr (downward glue mirror, phase 1r).")]
-fn es_ty_name_zero(name: String) : TypeExpr =
-  TypeExpr { tkind: TyName(name, []), line: 0, col: 0 }
 
 #[doc("Project a row's labels to their bare effect names (downward glue mirror, phase 1r).")]
 fn es_row_label_names(labels: [RowLabel]) : [String] {

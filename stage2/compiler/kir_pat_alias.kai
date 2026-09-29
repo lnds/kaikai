@@ -19,47 +19,20 @@
 import compiler.ast
 import compiler.emit_shared
 
-# Slot kind of a variant payload type (mirror of emit_c's `variant_slot_kind`
-# for the pointer/scalar split). 0 = pointer, 1 = Int, 2 = Real.
-# `pa_slot_needs_dup` maps kind to whether the native binder is a heap-box
-# BORROW of the cell's storage (0) or an owned / no-RC read (1, 2). An enum
-# slot maps to 0/pointer via the empty enum list; its binder holds the
-# immortal interned singleton, so the alias dup it gets is a runtime no-op —
-# same net effect as the C oracle's alias-shaped enum bind.
-pub fn pa_slot_kind(te: TypeExpr) : Int = match te.tkind {
-  TyName(n, targs) ->
-    if list_length(targs) == 0 {
-      if n == "Int" { 1 } else if n == "Real" { 2 } else { 0 }
-    } else { 0 }
-  _ -> 0
-}
+# Pointer/scalar split of a variant slot kind: 0 = pointer, 1 = Int,
+# 2 = Real. `pa_slot_needs_dup` maps kind to whether the native binder is a
+# heap-box BORROW of the cell's storage (0) or an owned / no-RC read (1, 2).
+# An enum slot maps to 0/pointer: its binder holds the immortal interned
+# singleton, so the alias dup it gets is a runtime no-op — same net effect
+# as the C oracle's alias-shaped enum bind.
+fn pa_slot_kind(k: Int) : Int = if k == 3 { 0 } else { k }
 
-# A ctor's payload type list from the variant registry, or [] if unknown
-# (every slot then classifies pointer — conservative, but an unknown ctor
-# never reaches a native owned variant arm: the registry is populated for
-# user + builtin ctors by the time the lowering runs).
-pub fn pa_payload_tys(vs: [VariantEntry], target: String) : [TypeExpr] =
-  pa_payload_tys_in(vs, None, target)
-
-#[doc("A ctor's payload type list as declared by `home`, or [] if unknown.")]
-pub fn pa_payload_tys_in(vs: [VariantEntry], home: Option[String], target: String) : [TypeExpr] =
-  match evar_payload_tys_in(vs, home, target) {
-    Some(tys) -> tys
-    None      -> []
+#[doc("A ctor's pointer/scalar slot kinds narrowed by `home` and `arity`, or [] if unknown.")]
+pub fn pa_kinds_at(vs: [VariantEntry], home: Option[String], target: String, arity: Int) : [Int] =
+  match evar_slot_kinds_arity(vs, home, target, arity) {
+    Some(ks) -> map(ks, pa_slot_kind)
+    None     -> []
   }
-
-#[doc("A ctor's payload type list narrowed by `home` and `arity`, or [] if unknown.")]
-pub fn pa_tys_at(vs: [VariantEntry], home: Option[String], target: String, arity: Int) : [TypeExpr] =
-  match evar_payload_tys_arity(vs, home, target, arity) {
-    Some(tys) -> tys
-    None      -> []
-  }
-
-# Nth element of a TypeExpr list (slot-position lookup), None past the end.
-pub fn pa_nth_ty(tys: [TypeExpr], n: Int) : Option[TypeExpr] = match tys {
-  []           -> None
-  [t, ...rest] -> if n == 0 { Some(t) } else { pa_nth_ty(rest, n - 1) }
-}
 
 #[doc("""
 Every binder a match arm reaches over a heap-box BORROW path — the set the
@@ -87,7 +60,7 @@ fn pab_pat(p: Pattern, vs: [VariantEntry], acc: [String]) : [String] = match p.p
     }
     pab_pats(pats, vs, a1)
   }
-  PVariant(hm, cname, subs) -> pab_variant_slots(subs, pa_tys_at(vs, hm, cname, list_length(subs)), 0, vs, acc)
+  PVariant(hm, cname, subs) -> pab_variant_slots(subs, pa_kinds_at(vs, hm, cname, list_length(subs)), 0, vs, acc)
   _ -> acc
 }
 
@@ -96,12 +69,12 @@ fn pab_pats(pats: [Pattern], vs: [VariantEntry], acc: [String]) : [String] = mat
   [hp, ...rest] -> pab_pats(rest, vs, pab_pat(hp, vs, acc))
 }
 
-fn pab_variant_slots(subs: [Pattern], tys: [TypeExpr], idx: Int, vs: [VariantEntry], acc: [String]) : [String] = match subs {
+fn pab_variant_slots(subs: [Pattern], ks: [Int], idx: Int, vs: [VariantEntry], acc: [String]) : [String] = match subs {
   []            -> acc
   [sp, ...rest] -> {
-    let k = match pa_nth_ty(tys, idx) { Some(te) -> pa_slot_kind(te) None -> 0 }
+    let k = kind_at(ks, idx)
     let acc1 = if pa_slot_needs_dup(k) { pab_pat(sp, vs, acc) } else { acc }
-    pab_variant_slots(rest, tys, idx + 1, vs, acc1)
+    pab_variant_slots(rest, ks, idx + 1, vs, acc1)
   }
 }
 
@@ -125,7 +98,7 @@ pub fn pat_direct_alias_slots(p: Pattern, vs: [VariantEntry]) : [String] = match
     let heads = pa_list_direct_heads(pats, [])
     match opt_rest { None -> heads Some(name) -> [name, ...heads] }
   }
-  PVariant(hm, cname, subs) -> pa_variant_direct_slots(subs, pa_tys_at(vs, hm, cname, list_length(subs)), 0, [])
+  PVariant(hm, cname, subs) -> pa_variant_direct_slots(subs, pa_kinds_at(vs, hm, cname, list_length(subs)), 0, [])
   PBind(name)  -> [name]
   PAs(name, _) -> [name]
   _            -> []
@@ -139,15 +112,15 @@ fn pa_list_direct_heads(pats: [Pattern], acc: [String]) : [String] = match pats 
   }
 }
 
-fn pa_variant_direct_slots(subs: [Pattern], tys: [TypeExpr], idx: Int, acc: [String]) : [String] = match subs {
+fn pa_variant_direct_slots(subs: [Pattern], ks: [Int], idx: Int, acc: [String]) : [String] = match subs {
   []            -> acc
   [sp, ...rest] -> {
-    let k = match pa_nth_ty(tys, idx) { Some(te) -> pa_slot_kind(te) None -> 0 }
+    let k = kind_at(ks, idx)
     let acc1 = match sp.pkind {
       PBind(name) -> if k == 0 { [name, ...acc] } else { acc }
       _           -> acc
     }
-    pa_variant_direct_slots(rest, tys, idx + 1, acc1)
+    pa_variant_direct_slots(rest, ks, idx + 1, acc1)
   }
 }
 

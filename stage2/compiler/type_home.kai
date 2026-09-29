@@ -1,0 +1,99 @@
+# compiler/type_home.kai — which declaration a nominal type name denotes.
+#
+# A type name alone does not identify a type: a user module and a core
+# module may both declare `Sig`. The table here records every nominal
+# declaration with its module, and the lookup resolves a name as seen
+# from one module. Both the TyCon stamping pass and the variant slot
+# layout read this one rule, so they never disagree on which homonym a
+# name means.
+
+import compiler.ast
+
+#[doc("One nominal type declaration: its name, the module declaring it, and whether every constructor is nullary.")]
+pub type TyHome = TH(String, Option[String], Bool)
+
+#[doc("Every nominal type declared in `ds`, once per (name, module) pair.")]
+pub fn type_home_table(ds: [Decl]) : [TyHome] = th_table_loop(ds, [])
+
+fn th_table_loop(ds: [Decl], acc: [TyHome]) : [TyHome] = match ds {
+  [] -> acc
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> th_table_loop([inner, ...rest], acc)
+    None -> match d {
+      DType(_, nm, _, body, _, _, mo, _, _) -> match body {
+        TBAlias(_)       -> th_table_loop(rest, acc)
+        TBEffectAlias(_) -> th_table_loop(rest, acc)
+        TBSum(vs)        -> th_table_loop(rest, th_record(acc, nm, mo, all_variants_nullary(vs)))
+        _                -> th_table_loop(rest, th_record(acc, nm, mo, false))
+      }
+      _ -> th_table_loop(rest, acc)
+    }
+  }
+}
+
+#[doc("True iff every constructor in `vs` carries an empty payload.")]
+pub fn all_variants_nullary(vs: [Variant]) : Bool = match vs {
+  [] -> true
+  [Var(_, payload), ...rest] -> match payload {
+    [] -> all_variants_nullary(rest)
+    _  -> false
+  }
+}
+
+# A core segment is re-injected alongside its own declaration, so the
+# same (name, home) pair arrives twice; recording it once keeps the
+# uniqueness test in the lookup meaningful.
+fn th_record(acc: [TyHome], nm: String, mo: Option[String], en: Bool) : [TyHome] =
+  if th_has(acc, nm, mo) { acc } else { [TH(nm, mo, en), ...acc] }
+
+fn th_has(hs: [TyHome], nm: String, mo: Option[String]) : Bool = match hs {
+  [] -> false
+  [TH(n, m, _), ...rest] ->
+    if n == nm and same_home(m, mo) { true } else { th_has(rest, nm, mo) }
+}
+
+#[doc("True iff two module slots name the same module (both empty counts as equal).")]
+pub fn same_home(a: Option[String], b: Option[String]) : Bool = match a {
+  None    -> match b { None -> true    Some(_) -> false }
+  Some(x) -> match b { None -> false   Some(y) -> x == y }
+}
+
+#[doc("The declaration type name `nm` denotes from module `cur`: one in `cur` wins, else a sole declaration anywhere; None when absent or contested.")]
+pub fn type_home_entry(hs: [TyHome], nm: String, cur: Option[String]) : Option[TyHome] =
+  th_scan(hs, nm, cur, None, 0)
+
+# Declaring `cur` answers immediately, even after other homes were seen;
+# otherwise exactly one declaration elsewhere answers.
+fn th_scan(hs: [TyHome], nm: String, cur: Option[String],
+           found: Option[TyHome], n: Int) : Option[TyHome] = match hs {
+  [] -> if n == 1 { found } else { None }
+  [h, ...rest] -> match h {
+    TH(hn, hm, _) ->
+      if hn != nm { th_scan(rest, nm, cur, found, n) }
+      else if same_home(hm, cur) { Some(h) }
+      else { th_scan(rest, nm, cur, Some(h), n + 1) }
+  }
+}
+
+#[doc("The module declaring type `nm` as seen from `cur`; None for the root, an unknown name, or a contested one.")]
+pub fn type_home_of(hs: [TyHome], nm: String, cur: Option[String]) : Option[String] =
+  match type_home_entry(hs, nm, cur) {
+    Some(TH(_, m, _)) -> m
+    None              -> None
+  }
+
+# A tagged Int rides `.i64`, a Real `.r`, and an all-nullary sum its
+# immediate tag instead of a pointer to the interned singleton; anything
+# else — including a contested name — is a boxed `KaiValue *`.
+#[doc("Slot-kind code of payload type `te` declared in module `cur`: 1 Int, 2 Real, 3 enum, 0 boxed pointer.")]
+pub fn payload_slot_kind(hs: [TyHome], cur: Option[String], te: TypeExpr) : Int = match te.tkind {
+  TyName(n, targs) ->
+    if list_length(targs) != 0 { 0 }
+    else if n == "Int" { 1 }
+    else if n == "Real" { 2 }
+    else { match type_home_entry(hs, n, cur) {
+      Some(TH(_, _, en)) -> if en { 3 } else { 0 }
+      None               -> 0
+    } }
+  _ -> 0
+}
