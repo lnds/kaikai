@@ -2041,6 +2041,24 @@ KaiValue *kaix_default_process_start_piped(void *self, KaiValue *cmd, KaiValue *
     kai_decref(pipe_stderr);
     return _op_r;
 }
+KaiValue *kaix_default_process_kill_group(void *self, KaiValue *child, KaiValue *sig, KaiCont *k) {
+    KaiValue *_op_r = kai_default_process_kill_group(self, child, sig, k);
+    kai_decref(child);
+    kai_decref(sig);
+    return _op_r;
+}
+KaiValue *kaix_default_process_start_group(void *self, KaiValue *cmd, KaiValue *args,
+                                           KaiValue *pipe_stdin, KaiValue *pipe_stdout,
+                                           KaiValue *pipe_stderr, KaiCont *k) {
+    KaiValue *_op_r = kai_default_process_start_group(self, cmd, args, pipe_stdin, pipe_stdout,
+                                                      pipe_stderr, k);
+    kai_decref(cmd);
+    kai_decref(args);
+    kai_decref(pipe_stdin);
+    kai_decref(pipe_stdout);
+    kai_decref(pipe_stderr);
+    return _op_r;
+}
 KaiValue *kaix_default_process_write_stdin(void *self, KaiValue *child, KaiValue *data, KaiCont *k) {
     KaiValue *_op_r = kai_default_process_write_stdin(self, child, data, k);
     kai_decref(child);

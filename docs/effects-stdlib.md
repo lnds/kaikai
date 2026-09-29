@@ -1121,6 +1121,9 @@ effect Process {
   close_stdin(c: Child)               : Result[Unit, String]
   read_stdout(c: Child)               : Result[String, String]
   read_stderr(c: Child)               : Result[String, String]
+  start_group(cmd: String, args: [String], pipe_stdin: Bool,
+              pipe_stdout: Bool, pipe_stderr: Bool) : Result[Child, String]
+  kill_group(c: Child, sig: Int)      : Result[Unit, String]
 }
 ```
 
@@ -1178,7 +1181,17 @@ effect Process {
   > cancel-aware redesign queues for R2 in Orongo.
 - `kill` delivers a signal to the child. The signal set is the
   POSIX-canonical subset (`SIGTERM`, `SIGKILL`, `SIGINT`, …)
-  declared by the `os.process` module.
+  declared by the `os.process` module. It reaches the child only,
+  not the processes the child started.
+- `start_group` is `start_piped` with the child as leader of a new
+  process group (`setpgid`); `kill_group` signals that whole group
+  (`kill(-pgid, sig)`), so a chain like `sh -> launcher -> program`
+  dies together. `kill_group` on a child started any other way is
+  `Err` and never signals the caller's own group. The group is
+  opt-in because a child outside the terminal's foreground group
+  does not receive Ctrl-C and is stopped (SIGTTIN) when it reads the
+  terminal — pagers and editors keep using `start` / `start_piped`.
+  The `os.process` surface is `start_in_group` / `kill_group`.
 - `exit` terminates the current process with the given code. It
   never resumes; the return type is `Nothing`. The canonical user
   surface for this op is `os.exit` (top-level helper exposed by
