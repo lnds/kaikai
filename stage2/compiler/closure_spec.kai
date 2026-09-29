@@ -54,7 +54,7 @@ fn cspec_fixpoint(ds: [Decl], hofns: [Decl], emitted: [String], fuel: Int) : [De
   }
 
 fn req_spec_name(r: CSpecReq) : String =
-  match r { CSReq(callee, _, ca, _, _) -> cspec_name(cs_decl_mo(callee), cs_decl_name(callee), closure_disc(ca)) }
+  match r { CSReq(callee, _, _, disc) -> cspec_name(cs_decl_mo(callee), cs_decl_name(callee), disc) }
 
 fn dedup_reqs(reqs: [CSpecReq], emitted: [String], seen: [String]) : [CSpecReq] =
   match reqs {
@@ -167,12 +167,12 @@ fn cs_collect_decls(ds: [Decl], all: [Decl], hofns: [Decl]) : [CSpecReq] =
   match ds {
     [] -> []
     [d, ...rest] -> {
-      let here = if cs_specialisable_host(d) { cs_collect_expr(decl_body(d), all, hofns) } else { [] }
+      let here = if cs_specialisable_host(d) { cs_collect_expr(decl_body(d), cs_decl_name(d), all, hofns) } else { [] }
       list_append(here, cs_collect_decls(rest, all, hofns))
     }
   }
 
-# A spec is named for the `(line, col)` of its call site. A derived body
+# A spec is named for its lambda's body position. A derived body
 # carries the position of the `type` it was derived from, so two nested
 # combinators inside one derive share a key and their specs collide —
 # the encoder that writes a payload gets the decoder's inlined stage.
@@ -188,24 +188,24 @@ fn cs_decl_is_derived(d: Decl) : Bool = match d {
 
 # Bottom-up read walk: a request per specialisable `G(args)`. Children
 # first so nested folds are discovered too.
-fn cs_collect_expr(e: Expr, all: [Decl], hofns: [Decl]) : [CSpecReq] = {
-  let kid_reqs = collect_kids(cspec_kids(e), all, hofns)
-  list_append(kid_reqs, site_req(e, all, hofns))
+fn cs_collect_expr(e: Expr, host: String, all: [Decl], hofns: [Decl]) : [CSpecReq] = {
+  let kid_reqs = collect_kids(cspec_kids(e), host, all, hofns)
+  list_append(kid_reqs, site_req(e, host, all, hofns))
 }
 
-fn collect_kids(es: [Expr], all: [Decl], hofns: [Decl]) : [CSpecReq] =
+fn collect_kids(es: [Expr], host: String, all: [Decl], hofns: [Decl]) : [CSpecReq] =
   match es {
     [] -> []
-    [k, ...rest] -> list_append(cs_collect_expr(k, all, hofns), collect_kids(rest, all, hofns))
+    [k, ...rest] -> list_append(cs_collect_expr(k, host, all, hofns), collect_kids(rest, host, all, hofns))
   }
 
 # A specialisation request for this node when it is a higher-order call
 # on an env-empty closure; empty otherwise.
-fn site_req(e: Expr, all: [Decl], hofns: [Decl]) : [CSpecReq] =
+fn site_req(e: Expr, host: String, all: [Decl], hofns: [Decl]) : [CSpecReq] =
   match e.kind {
     ECall(callee, args_) -> match callee_ref(callee) {
       Some(CRef(modn, name)) -> match lookup_hofn(hofns, modn, name) {
-        Some(hd) -> req_of(e, args_, hd, all)
+        Some(hd) -> req_of(args_, hd, host, all)
         None     -> []
       }
       None -> []
@@ -213,12 +213,12 @@ fn site_req(e: Expr, all: [Decl], hofns: [Decl]) : [CSpecReq] =
     _ -> []
   }
 
-fn req_of(e: Expr, args_: [Expr], hd: Decl, all: [Decl]) : [CSpecReq] = {
+fn req_of(args_: [Expr], hd: Decl, host: String, all: [Decl]) : [CSpecReq] = {
   let idx = first_fn_param_idx(decl_params(hd), 0)
   if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(hd, idx) { [] }
   else {
     match classify_closure(elem_at(args_, idx), all) {
-      Some(ca) -> [CSReq(hd, idx, ca, e.line, e.col)]
+      Some(ca) -> [CSReq(hd, idx, ca, closure_disc(host, ca))]
       None     -> []
     }
   }
@@ -236,25 +236,25 @@ fn rewrite_decl(d: Decl, all: [Decl], hofns: [Decl]) : Decl =
   match d {
     DFn(p, n, tp, ps, rt, row, body, l, c, mo, fsym) ->
       if cs_specialisable_host(d) {
-        DFn(p, n, tp, ps, rt, row, rewrite_expr(body, all, hofns), l, c, mo, fsym)
+        DFn(p, n, tp, ps, rt, row, rewrite_expr(body, n, all, hofns), l, c, mo, fsym)
       } else { d }
     _ -> d
   }
 
 # Rewrite bottom-up: children via the shared functor, then this node.
-fn rewrite_expr(e: Expr, all: [Decl], hofns: [Decl]) : Expr = {
-  let e1 = Expr { kind: map_expr_kind(e.kind, (k) => rewrite_expr(k, all, hofns)),
+fn rewrite_expr(e: Expr, host: String, all: [Decl], hofns: [Decl]) : Expr = {
+  let e1 = Expr { kind: map_expr_kind(e.kind, (k) => rewrite_expr(k, host, all, hofns)),
                   line: e.line, col: e.col, ty: e.ty, mode: e.mode }
-  retarget_site(e1, all, hofns)
+  retarget_site(e1, host, all, hofns)
 }
 
-# A specialisable higher-order call `G(args)` becomes `G__cspec__L_C(rest)`
+# A specialisable higher-order call `G(args)` becomes `G__cspec__<disc>(rest)`
 # with the functional argument dropped; other nodes pass through.
-fn retarget_site(e: Expr, all: [Decl], hofns: [Decl]) : Expr =
+fn retarget_site(e: Expr, host: String, all: [Decl], hofns: [Decl]) : Expr =
   match e.kind {
     ECall(callee, args_) -> match callee_ref(callee) {
       Some(CRef(modn, name)) -> match lookup_hofn(hofns, modn, name) {
-        Some(hd) -> retarget_call(e, callee, args_, hd, all)
+        Some(hd) -> retarget_call(e, callee, args_, hd, host, all)
         None     -> e
       }
       None -> e
@@ -262,13 +262,13 @@ fn retarget_site(e: Expr, all: [Decl], hofns: [Decl]) : Expr =
     _ -> e
   }
 
-fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, all: [Decl]) : Expr = {
+fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, host: String, all: [Decl]) : Expr = {
   let idx = first_fn_param_idx(decl_params(hd), 0)
   if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(hd, idx) { e }
   else {
     match classify_closure(elem_at(args_, idx), all) {
       Some(ca) -> {
-        let nm = cspec_name(cs_decl_mo(hd), cs_decl_name(hd), closure_disc(ca))
+        let nm = cspec_name(cs_decl_mo(hd), cs_decl_name(hd), closure_disc(host, ca))
         Expr { kind: ECall(retarget_callee(callee, nm), drop_at(args_, idx)),
                line: e.line, col: e.col, ty: e.ty, mode: e.mode }
       }
