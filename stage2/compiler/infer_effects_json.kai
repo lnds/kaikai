@@ -1,34 +1,35 @@
-#[doc("""Effect-usage walker behind the typer's `--effects-json` report.
+#[doc("""Per-function records behind the typer's `--effects-json` report.
 
-Collects, per function, the effects its body invokes and the handlers it
-installs, as the entries `--effects-json` serialises.
+A record carries the function's effect row, which is what a caller must
+handle, and the handlers its body installs. A top-level function's row is
+its declared one: an unannotated top-level function is pure.
 """)]
 
 import compiler.util
 import compiler.ast
 import compiler.diag_file
+import compiler.expr_positions
 import compiler.infer
 import compiler.infer_json_base
 import compiler.infer_effects_names
 
-#[doc("infer: per-function effect-usage record behind `--effects-json`.")]
+#[doc("infer: per-function effect record behind `--effects-json`; `row_open` marks a row polymorphic in further effects.")]
 pub type EffEntry = { file: String, fn_name: String, line: Int, col: Int,
-                  effs: [String], handlers: [EffHandle] }
+                  effs: [String], row_open: Bool, handlers: [EffHandle] }
 
-#[doc("infer: collect per-function effect usage across a typed declaration list; `df` names the file each function is declared in.")]
+#[doc("infer: collect per-function effect records across a typed declaration list; `df` names the file each function is declared in.")]
 pub fn effects_walk_decls(decls: [Decl], df: DiagFiles, acc: [EffEntry]) : [EffEntry] {
   match decls {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DFn(_, name, _, _, _, _, body, line, col, _, _) ->
+      DFn(_, name, _, _, _, row, body, line, col, _, _) ->
         if effects_skip_internal(name) {
           effects_walk_decls(rest, df, acc)
         } else {
-          let acc0 = EffUseAcc { effs: [], handlers: [] }
-          let used = effects_collect_expr(body, acc0)
           let entry = EffEntry { file: decl_diag_file(d, df), fn_name: name,
                                   line: line, col: col,
-                                  effs: used.effs, handlers: used.handlers }
+                                  effs: effects_row_labels(row), row_open: effects_row_open(row),
+                                  handlers: effects_handlers(body, []) }
           effects_walk_decls(rest, df, [entry, ...acc])
         }
       _ -> effects_walk_decls(rest, df, acc)
@@ -36,184 +37,30 @@ pub fn effects_walk_decls(decls: [Decl], df: DiagFiles, acc: [EffEntry]) : [EffE
   }
 }
 
-fn effects_collect_expr(e: Expr, acc: EffUseAcc) : EffUseAcc =
-  effects_collect_kind(e.kind, e.line, e.col, acc)
-
-fn effects_collect_kind(k: ExprKind, line: Int, col: Int,
-                         acc: EffUseAcc) : EffUseAcc {
-  match k {
-    EVar(name) -> {
-      # `Eff.op` qualified names — desugar_op_calls flattens
-      # EField(EVar(eff), op) into EVar("eff.op") before this point.
-      match effects_split_qualified(name) {
-        Some(eff) -> EffUseAcc {
-          effs: effects_add_unique(eff, acc.effs),
-          handlers: acc.handlers
-        }
-        None -> acc
-      }
-    }
-    EHandle(body, eff_name, _, _, init_opt, _, clauses, ret_opt) -> {
-      let h = EH(eff_name, line, col)
-      let acc1 = EffUseAcc { effs: acc.effs,
-                              handlers: [h, ...acc.handlers] }
-      let acc2 = effects_collect_expr(body, acc1)
-      let acc3 = match init_opt {
-        Some(e2) -> effects_collect_expr(e2, acc2)
-        None     -> acc2
-      }
-      let acc4 = effects_collect_clauses(clauses, acc3)
-      effects_collect_opt_return(ret_opt, acc4)
-    }
-    EBlock(stmts, tail) -> {
-      let a1 = effects_collect_stmts(stmts, acc)
-      match tail {
-        Some(t) -> effects_collect_expr(t, a1)
-        None    -> a1
-      }
-    }
-    EMatch(scr, arms) -> {
-      let a1 = effects_collect_expr(scr, acc)
-      effects_collect_arms(arms, a1)
-    }
-    ECall(callee, args_) -> {
-      let a1 = effects_collect_expr(callee, acc)
-      effects_collect_exprs(args_, a1)
-    }
-    EField(base, _) -> effects_collect_expr(base, acc)
-    EIndex(a, b) -> {
-      let a1 = effects_collect_expr(a, acc)
-      effects_collect_expr(b, a1)
-    }
-    EBinop(_, a, b) -> {
-      let a1 = effects_collect_expr(a, acc)
-      effects_collect_expr(b, a1)
-    }
-    EUnop(_, x) -> effects_collect_expr(x, acc)
-    EIf(c, t_, eo) -> {
-      let a1 = effects_collect_expr(c, acc)
-      let a2 = effects_collect_expr(t_, a1)
-      match eo {
-        Some(e2) -> effects_collect_expr(e2, a2)
-        None     -> a2
-      }
-    }
-    ELambda(_, b) -> effects_collect_expr(b, acc)
-    ERecordLit(_, fields) -> effects_collect_fields(fields, acc)
-    EList(elems) -> effects_collect_elems(elems, acc)
-    ERange(a, b, opt_step) -> {
-      let a1 = effects_collect_expr(a, acc)
-      let a2 = effects_collect_expr(b, a1)
-      match opt_step {
-        Some(s) -> effects_collect_expr(s, a2)
-        None    -> a2
-      }
-    }
-    EPipe(a, b) -> {
-      let a1 = effects_collect_expr(a, acc)
-      effects_collect_expr(b, a1)
-    }
-    EMapPipe(a, b) -> {
-      let a1 = effects_collect_expr(a, acc)
-      effects_collect_expr(b, a1)
-    }
-    EFlatMapPipe(a, b) -> {
-      let a1 = effects_collect_expr(a, acc)
-      effects_collect_expr(b, a1)
-    }
-    EFilterPipe(a, b) -> {
-      let a1 = effects_collect_expr(a, acc)
-      effects_collect_expr(b, a1)
-    }
-    ELitUnit(inner, _) -> effects_collect_expr(inner, acc)
-    EBang(inner) -> effects_collect_expr(inner, acc)
-    _ -> acc
-  }
+fn effects_row_labels(row: RowExpr) : [String] = match row {
+  REmpty         -> []
+  RClosed(ls)    -> effects_label_names(ls, [])
+  ROpen(_, ls)   -> effects_label_names(ls, [])
 }
 
-fn effects_collect_exprs(es: [Expr], acc: EffUseAcc) : EffUseAcc {
-  match es {
-    [] -> acc
-    [h, ...rest] -> effects_collect_exprs(rest, effects_collect_expr(h, acc))
-  }
+fn effects_row_open(row: RowExpr) : Bool = match row {
+  ROpen(_, _) -> true
+  _           -> false
 }
 
-fn effects_collect_stmts(ss: [Stmt], acc: EffUseAcc) : EffUseAcc {
-  match ss {
-    [] -> acc
-    [s, ...rest] -> match s {
-      SLet(_, _, rhs) -> effects_collect_stmts(rest, effects_collect_expr(rhs, acc))
-      SAssert(c, m) -> {
-        let a1 = effects_collect_expr(c, acc)
-        let a2 = match m { Some(mx) -> effects_collect_expr(mx, a1) None -> a1 }
-        effects_collect_stmts(rest, a2)
-      }
-      SExprStmt(x) -> effects_collect_stmts(rest, effects_collect_expr(x, acc))
-      SIndexAssign(b, i, v, _, _) -> {
-        let a1 = effects_collect_expr(b, acc)
-        let a2 = effects_collect_expr(i, a1)
-        let a3 = effects_collect_expr(v, a2)
-        effects_collect_stmts(rest, a3)
-      }
-      SAssign(b, v, _, _) -> {
-        let a1 = effects_collect_expr(b, acc)
-        let a3 = effects_collect_expr(v, a1)
-        effects_collect_stmts(rest, a3)
-      }
-      SVar(_, _, rhs, _, _) -> effects_collect_stmts(rest, effects_collect_expr(rhs, acc))
-      SUse(_, _, _) -> effects_collect_stmts(rest, acc)
-    }
-  }
+fn effects_label_names(ls: [RowLabel], acc: [String]) : [String] = match ls {
+  []                    -> acc
+  [RL(n, _), ...rest]   -> effects_label_names(rest, effects_add_unique(n, acc))
 }
 
-fn effects_collect_arms(arms: [Arm], acc: EffUseAcc) : EffUseAcc {
-  match arms {
-    [] -> acc
-    [a, ...rest] -> match a {
-      Arm(_, g, b) -> {
-        let a1 = match g { Some(gg) -> effects_collect_expr(gg, acc) None -> acc }
-        let a2 = effects_collect_expr(b, a1)
-        effects_collect_arms(rest, a2)
-      }
-    }
-  }
+fn effects_handlers(e: Expr, acc: [EffHandle]) : [EffHandle] = match e.kind {
+  EHandle(_, eff, _, _, _, _, _, _) -> effects_handlers_ps(xp_positions(e), [EH(eff, e.line, e.col), ...acc])
+  _                                 -> effects_handlers_ps(xp_positions(e), acc)
 }
 
-fn effects_collect_fields(fs: [FieldInit], acc: EffUseAcc) : EffUseAcc {
-  match fs {
-    [] -> acc
-    [f, ...rest] -> match f {
-      FI(_, v) -> effects_collect_fields(rest, effects_collect_expr(v, acc))
-    }
-  }
-}
-
-fn effects_collect_elems(els: [ListElem], acc: EffUseAcc) : EffUseAcc {
-  match els {
-    [] -> acc
-    [el, ...rest] -> match el {
-      ElPlain(x)  -> effects_collect_elems(rest, effects_collect_expr(x, acc))
-      ElSpread(x) -> effects_collect_elems(rest, effects_collect_expr(x, acc))
-    }
-  }
-}
-
-fn effects_collect_clauses(cs: [HClause], acc: EffUseAcc) : EffUseAcc {
-  match cs {
-    [] -> acc
-    [c, ...rest] -> match c {
-      HC(_, _, b, _, _) -> effects_collect_clauses(rest, effects_collect_expr(b, acc))
-    }
-  }
-}
-
-fn effects_collect_opt_return(opt: Option[HReturn], acc: EffUseAcc) : EffUseAcc {
-  match opt {
-    None -> acc
-    Some(r) -> match r {
-      HR(_, b, _, _) -> effects_collect_expr(b, acc)
-    }
-  }
+fn effects_handlers_ps(ps: [XPos], acc: [EffHandle]) : [EffHandle] = match ps {
+  []                  -> acc
+  [XP(_, c), ...rest] -> effects_handlers_ps(rest, effects_handlers(c, acc))
 }
 
 #[doc("infer: one `--effects-json` record, rendered as a JSON object.")]
@@ -226,7 +73,8 @@ pub fn effects_json_entry(e: EffEntry) : String =
     ", \"col\": ", int_to_string(e.col),
     ", \"effects\": [",
     inf_join_with(map(e.effs, json_str), ", "),
-    "], \"handlers_installed\": [",
+    "], \"row_open\": ", if e.row_open { "true" } else { "false" },
+    ", \"handlers_installed\": [",
     inf_join_with(map(e.handlers, effects_json_handler), ", "),
     "]}"
   ])

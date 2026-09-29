@@ -5,7 +5,7 @@ Usage: effects_json_files.py <report.json> <root.kai>
 
 Fails unless every record carries a `file` that exists, and at least one
 record belongs to another file (the auto-loaded core). Prints the root
-file's records as `<fn> <line>:<col>`, for a golden diff.
+file's records, with their row and handlers, for a golden diff.
 """
 import json
 import os
@@ -28,7 +28,9 @@ def main() -> int:
         return 1
     for r in data:
         if os.path.realpath(r["file"]) == root:
-            print(f"{r['fn']} {r['line']}:{r['col']}")
+            hs = ", ".join(f"{h['effect']}@{h['line']}:{h['col']}" for h in r["handlers_installed"])
+            row = ", ".join(r["effects"]) + (" + ..." if r["row_open"] else "")
+            print(f"{r['fn']} {r['line']}:{r['col']} row [{row}] handlers [{hs}]")
     return 0
 
 
