@@ -17,30 +17,80 @@ import compiler.lint_effects
 
 # ---- discard_pure_value ----------------------------------------------
 
-#[doc("Run every lint over the root-file decls of a typed program; returns findings in source order. `file` names the root module for the effect-row lints. `src` is the pre-lowering AST, which the dead-code lint reads to tell a user-declared fn from a synthesised one.")]
-pub fn lint_program(file: String, decls: [Decl], src: [Decl]) : [LintFinding] {
-  let exprs   = lint_walk_decls(decls, [])
-  let program = list_append(deadcode_findings(decls, deadcode_declared_fns(src)),
-                            effect_findings(decls, module_name_of_path(file)))
-  list_append(exprs, program)
+#[doc("Run every lint over the decls a unit owns; returns each finding paired with the file that declares it. `src` is the pre-lowering AST, which the dead-code lint reads to tell a user-declared fn from a synthesised one.")]
+pub fn lint_program(df: DiagFiles, owned_mods: [String], decls: [Decl],
+                    src: [Decl]) : [FileFinding] {
+  let owned = lint_owned(decls, module_name_of_path(df_root(df)), owned_mods, [])
+  list_append(lint_walk_decls(owned, df, []),
+              lint_program_wide(owned, decls, df, src))
 }
 
-fn lint_walk_decls(decls: [Decl], acc: [LintFinding]) : [LintFinding] {
+# A unit merges every imported module into one decl stream, so linting it
+# whole would report on the stdlib too. `owned_mods` names the modules the
+# package itself declares; a decl from anywhere else is not its code.
+fn lint_owned(ds: [Decl], root_mod: String, owned_mods: [String],
+              acc: [Decl]) : [Decl] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] ->
+    if decl_is_owned(d, root_mod, owned_mods) {
+      lint_owned(rest, root_mod, owned_mods, [d, ...acc])
+    } else { lint_owned(rest, root_mod, owned_mods, acc) }
+}
+
+# A pub decl of the root file is stamped with the root module's own name,
+# so the root module belongs to the owned set alongside the imports.
+# Whether `d` was declared by the unit under lint: the root file
+# (unstamped or stamped with `root_mod`) or one of `owned_mods`.
+fn decl_is_owned(d: Decl, root_mod: String, owned_mods: [String]) : Bool =
+  match decl_home_module(d) {
+    None    -> true
+    Some(m) -> m == root_mod or list_has(owned_mods, m)
+  }
+
+# Reachability is judged against the whole unit while the report covers
+# only what the package owns: a private fn called from anywhere in the
+# unit is alive, and a stdlib decl is never reported on.
+fn lint_program_wide(owned: [Decl], all: [Decl], df: DiagFiles,
+                     src: [Decl]) : [FileFinding] {
+  let dead = deadcode_file_findings(owned, all, deadcode_declared_fns(src), df)
+  list_append(dead, lint_effects_per_file(owned, df, []))
+}
+
+# The effect-row lint reads the root module name, which differs per file.
+fn lint_effects_per_file(ds: [Decl], df: DiagFiles, acc: [FileFinding]) : [FileFinding] =
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> {
+      let f = decl_diag_file(d, df)
+      lint_effects_per_file(rest, df,
+        prepend_tagged(effect_findings([d], module_name_of_path(f)), f, acc))
+    }
+  }
+
+fn lint_walk_decls(decls: [Decl], df: DiagFiles, acc: [FileFinding]) : [FileFinding] {
   match decls {
     [] -> list_reverse(acc)
-    [d, ...rest] -> lint_walk_decls(rest, lint_decl(d, acc))
+    [d, ...rest] -> lint_walk_decls(rest, df, lint_decl(d, df, acc))
   }
 }
 
-# Only decls authored in the root file (module_origin = None) are linted.
-fn lint_decl(d: Decl, acc: [LintFinding]) : [LintFinding] {
+fn lint_decl(d: Decl, df: DiagFiles, acc: [FileFinding]) : [FileFinding] {
   match d {
-    DFn(_, _, _, _, _, _, body, _, _, mo, _) -> match mo {
-      None    -> lint_expr(body, acc)
-      Some(_) -> acc
-    }
+    DFn(_, _, _, _, _, _, body, _, _, _, _) ->
+      prepend_tagged(lint_expr(body, []), decl_diag_file(d, df), acc)
     _ -> acc
   }
+}
+
+# Pair each finding with the file that declares it.
+fn prepend_tagged(xs: [LintFinding], file: String,
+                      acc: [FileFinding]) : [FileFinding] =
+  prepend_tagged_loop(list_reverse(xs), file, acc)
+
+fn prepend_tagged_loop(xs: [LintFinding], file: String,
+                       acc: [FileFinding]) : [FileFinding] = match xs {
+  [] -> acc
+  [x, ...rest] -> prepend_tagged_loop(rest, file, [FF(file, x), ...acc])
 }
 
 # Recursion into sub-expressions is what reaches blocks nested inside
@@ -272,18 +322,19 @@ fn lint_infer(file: String, decls: [Decl],
                                    atomic_kind_theories(decls), st_empty(), fv_empty())
 
 #[doc("Run lints over a typed program and print human-readable findings; always returns 0 (lints never block a build). `src` is the AST before protocol lowering.")]
-pub fn run_lint(file: String, decls: [Decl], src: [Decl],
-                 head_owners: [HeadOwnerEntry]) : Int / Console + File {
+pub fn run_lint(file: String, df: DiagFiles, owned_mods: [String], decls: [Decl],
+                 src: [Decl], head_owners: [HeadOwnerEntry]) : Int / Console + File {
   let r = lint_infer(file, decls, head_owners)
-  let findings = lint_program(file, r.decls, src)
-  lint_report_text(file, findings)
+  lint_report_text(lint_program(df, owned_mods, r.decls, src))
   0
 }
 
-fn lint_report_text(file: String, findings: [LintFinding]) : Unit / Console {
+fn lint_report_text(findings: [FileFinding]) : Unit / Console {
   match findings {
     [] -> ()
-    [f, ...rest] -> { print(lint_finding_text(file, f)) lint_report_text(file, rest) }
+    [ff, ...rest] -> match ff {
+      FF(file, f) -> { print(lint_finding_text(file, f)) lint_report_text(rest) }
+    }
   }
 }
 
@@ -296,16 +347,16 @@ fn lint_finding_text(file: String, f: LintFinding) : String {
 }
 
 #[doc("Run lints over a typed program and print findings as a JSON array; always returns 0 (lints never block a build). `src` is the AST before protocol lowering.")]
-pub fn run_lint_json(file: String, decls: [Decl], src: [Decl],
+pub fn run_lint_json(file: String, df: DiagFiles, owned_mods: [String],
+                      decls: [Decl], src: [Decl],
                       head_owners: [HeadOwnerEntry]) : Int / Console + File {
   let r = lint_infer(file, decls, head_owners)
-  let findings = lint_program(file, r.decls, src)
-  print(concat_all(["[", lint_json_body(file, findings), "]"]))
+  print(concat_all(["[", lint_json_body(lint_program(df, owned_mods, r.decls, src)), "]"]))
   0
 }
 
-fn lint_json_body(file: String, findings: [LintFinding]) : String =
-  string_join(map(findings, (f) => lint_finding_json(file, f)), ", ")
+fn lint_json_body(findings: [FileFinding]) : String =
+  string_join(map(findings, (ff) => match ff { FF(file, f) -> lint_finding_json(file, f) }), ", ")
 
 fn lint_finding_json(file: String, f: LintFinding) : String {
   match f {

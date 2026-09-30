@@ -198,10 +198,15 @@ if [ "$(printf '%s\n' "$got" | grep -c '^\[.*\]$')" = 3 ] && [ "$(printf '%s\n' 
 else
   fail "lint --json over a library"; printf '%s\n' "$got" | sed 's/^/        /'
 fi
-# A package with an entry is still linted module by module: the imported module's findings are reported.
+# An entry-less package is linted module by module; every module's findings are reported.
 L="$ROOT/examples/lint/pkg_entry"
-expect "lint: a package with an entry lints the modules it imports" 0 "$(cat "$L/lint.expected")" \
+expect "lint: a library lints every module it owns" 0 "$(cat "$L/lint.expected")" \
   sh -c 'cd "$1" && "$2" lint . 2>/dev/null | sed "s|^.*/pkg_entry/||"' _ "$L" "$KAI"
+# A package with an entry is one unit: a name a sibling's import made visible
+# resolves, and a non-entry file's own findings are still reported.
+U="$ROOT/examples/lint/pkg_unit_scope"
+expect "lint: a package with an entry is linted as one unit" 0 "$(cat "$U/lint.expected")" \
+  sh -c 'cd "$1" && "$2" lint . 2>/dev/null | sed "s|^.*/pkg_unit_scope/||"' _ "$U" "$KAI"
 got="$(cd "$TMP/ws/lib" && "$KAI" typecheck --diags-json 2>/dev/null)"
 if [ "$(printf '%s\n' "$got" | grep -c '^{"file": .*"diagnostics": .*}$')" = 3 ] && [ "$(printf '%s\n' "$got" | wc -l | tr -d ' ')" = 3 ]; then
   ok "typecheck --diags-json: a library is one object per module, one per line"
