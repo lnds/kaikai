@@ -1,0 +1,42 @@
+# A closed PR's caches are dead weight: GitHub scopes a cache to the ref
+# that wrote it, so nothing else can ever read them, and they are evicted
+# only when the repo hits its 10 GB ceiling — taking live caches with them.
+# The self-host object cache alone is ~1 GB per PR, so a handful of merged
+# PRs is enough to evict the vendored libLLVM the release boots from, which
+# costs 25 minutes per platform to rebuild.
+
+name: pr-cache-cleanup
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  actions: write   # deleting a cache needs write; the default is read
+
+jobs:
+  evict:
+    name: Evict the closed PR's caches
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Delete every cache scoped to this PR's merge ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF: refs/pull/${{ github.event.pull_request.number }}/merge
+        run: |
+          set -euo pipefail
+          freed=0
+          n=0
+          # One page is enough: a single PR cannot hold 100 caches.
+          while read -r id bytes key; do
+            [ -n "$id" ] || continue
+            if gh api --method DELETE "repos/$REPO/actions/caches/$id" >/dev/null 2>&1; then
+              freed=$((freed + bytes)); n=$((n + 1))
+              echo "deleted $key ($((bytes / 1048576)) MB)"
+            else
+              echo "::warning::could not delete cache $id ($key)"
+            fi
+          done < <(gh api "repos/$REPO/actions/caches?per_page=100" \
+                     --jq ".actions_caches[] | select(.ref == \"$REF\") | \"\(.id) \(.size_in_bytes) \(.key)\"")
+          echo "$n cache(s) deleted, $((freed / 1048576)) MB freed" >> "$GITHUB_STEP_SUMMARY"
