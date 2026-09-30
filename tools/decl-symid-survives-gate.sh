@@ -40,7 +40,7 @@ ALLOW='parse|desugar|cache_ast|protos|json_derive|layout_derive|.*_test'
 scan() {
   for f in "$SRC"/*.kai; do
     n=$(tr '\n' ' ' < "$f" \
-        | grep -oE "D(Fn|Const)\([^()]*(\([^()]*\))?[^()]*, *sym_none\(\)" \
+        | grep -oE "D(Fn|Const)\([^()]*(\([^()]*\))?[^()]*, *(sym_none|fnid_none)\(\)" \
         | wc -l | tr -d ' ')
     [ "$n" -gt 0 ] && printf '%s %s\n' "$(basename "$f" .kai)" "$n"
   done

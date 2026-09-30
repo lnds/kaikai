@@ -864,7 +864,7 @@ fn walk_bare_callees(e: Expr, acc: [String]) : [String] = match e.kind {
   EUnit               -> acc
   EVar(_)             -> acc
   EMark(_)             -> acc
-  ESym(_, _)             -> acc
+  ESym(_, _, _)             -> acc
   EUnder              -> acc
   EPlaceholder        -> acc
   EHole(_)            -> acc
@@ -1137,7 +1137,7 @@ fn report_unused_in_expr(file: String, e: Expr) : Unit / Console + File {
     EUnit -> ()
     EVar(_) -> ()
     EMark(_) -> ()
-    ESym(_, _) -> ()
+    ESym(_, _, _) -> ()
     EUnder -> ()
     EPlaceholder -> ()
     EHole(_) -> ()
@@ -2217,9 +2217,9 @@ fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Opti
 # The identity a callee carries, or none when the reference was never
 # stamped. Read before the kind is normalised to a spelling, so the
 # lookup can answer by declaration rather than by name.
-fn ec_callee_sym(f: Expr) : SymId = match f.kind {
-  ESym(s, _) -> s
-  _          -> sym_none()
+fn ec_callee_sym(f: Expr) : FnId = match f.kind {
+  ESym(s, inst, _) -> FnId(s, inst)
+  _                -> fnid_none()
 }
 
 fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
@@ -2719,7 +2719,7 @@ fn emit_guard_no_intrinsic_mint(callee: String) : Unit =
 # emit_named_call_lookup's dispatch for a pipe call, over operands that
 # already lead with the piped LHS. A local closure (`lcs`) shadows a
 # same-named top-level fn: `let take = ...; xs |> take(1)` calls the local.
-fn emit_pipe_named_lookup(src: String, callee: String, csym: SymId, vals_all: [String], cx: EmitCtx) : String / Console =
+fn emit_pipe_named_lookup(src: String, callee: String, csym: FnId, vals_all: [String], cx: EmitCtx) : String / Console =
   if list_has(cx.lcs, callee) {
     emit_apply_seq("kai_apply(", c_local(callee), vals_all)
   } else { match evar_find(cx.variants, callee) {
@@ -2754,7 +2754,7 @@ fn emit_pipe_named_lookup(src: String, callee: String, csym: SymId, vals_all: [S
 # closure-thunk emission from the same lookup chain. `lcs` lets a
 # local closure shadow a same-named top-level fn (see
 # emit_pipe_named_lookup).
-fn emit_named_call_lookup(src: String, callee: String, csym: SymId, args_e: [Expr], call_vals: [String], cx: EmitCtx) : String / Console =
+fn emit_named_call_lookup(src: String, callee: String, csym: FnId, args_e: [Expr], call_vals: [String], cx: EmitCtx) : String / Console =
   if list_has(cx.lcs, callee) {
     emit_apply_seq("kai_apply(", c_local(callee), call_vals)
   } else { match evar_find(cx.variants, callee) {
@@ -7033,7 +7033,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
   # on what the normaliser can still produce, so removing it is a
   # compile error rather than dead-code cleanup.
   match sym_read_kind(x.kind) {
-    ESym(_, name) -> emit_ident_value(name, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
+    ESym(_, _, name) -> emit_ident_value(name, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
     EMark(m) -> emit_ident_value(mark_name(m), cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
     # Fix B (bidirectional list literals): when an Int literal is
     # checked against a Byte-context (e.g. inside `let bs: [Byte] = [65, 66]`),
@@ -10779,7 +10779,7 @@ fn desugar_interp_kind(k: ExprKind, cx: InterpCtx,
     EUnit          -> k
     EVar(_)        -> k
     EMark(_)        -> k
-    ESym(_, _)        -> k
+    ESym(_, _, _)        -> k
     EUnder         -> k
     EPlaceholder   -> k
     EHole(_)       -> k
@@ -11136,12 +11136,7 @@ type CModuleTU = { stem: String, body: String }
 
 #[doc("Issue #748 — separate-compilation entry point. Emits the program as N per-module translation units plus two shared headers, joined into one marker-delimited String the `bin/kai` wrapper splits into files. Reuses every `emit_program` section emitter; the only new work is partitioning `decls` by module-origin.")]
 pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark]) : String / Console + Mutable =
-  emit_program_modular_with_tab(file, src, raw_decls, bmode, target_origin, regions,
-                                st_build(raw_decls, ""))
-
-#[doc("`emit_program_modular` under the program's symbol table.")]
-pub fn emit_program_modular_with_tab(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], tab: SymTab) : String / Console + Mutable =
-  match emit_program_modular_cached_with_tab(file, src, raw_decls, bmode, target_origin, regions, [], [], tab) {
+  match emit_program_modular_cached(file, src, raw_decls, bmode, target_origin, regions, [], []) {
     EMO(stream, _) -> stream
   }
 
@@ -11149,16 +11144,12 @@ pub fn emit_program_modular_with_tab(file: String, src: String, raw_decls: [Decl
 pub type EmitModularOut = EMO(String, [CTU])
 
 #[doc("As `emit_program_modular`, with the core emit cache threaded through: TUs whose stem appears in `cached` splice the cached body instead of emitting; freshly emitted TUs whose module origin appears in `cacheable` are returned for the caller to persist.")]
-pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], cached: [CTU], cacheable: [String]) : EmitModularOut / Console + Mutable =
-  emit_program_modular_cached_with_tab(file, src, raw_decls, bmode, target_origin, regions, cached, cacheable, st_build(raw_decls, ""))
-
-#[doc("`emit_program_modular_cached` under the program's symbol table, so registry identities match the ones stamped on call sites.")]
-pub fn emit_program_modular_cached_with_tab(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], cached: [CTU], cacheable: [String], tab: SymTab) : EmitModularOut / Console + Mutable {
+pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], cached: [CTU], cacheable: [String]) : EmitModularOut / Console + Mutable {
 
   let alias_resolved = rewrite_alias_decls(raw_decls)
   let eff_names = collect_effect_names(alias_resolved)
   let decls = desugar_op_calls_decls(alias_resolved, eff_names)
-  let fns = register_fn_decls_in(decls, tab)
+  let fns = register_fn_decls(decls)
   let variants = register_variants(decls)
   let op_quals = collect_op_qualified_names(decls)
   let globals = build_globals(fns, variants, eff_names, op_quals, const_names(decls))
@@ -11312,12 +11303,7 @@ fn assemble_modular_output(nonce: String, sliced: [SlicedHeaders], tus: [CModule
 }
 
 #[doc("Emit-layer entry point emit_program")]
-pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark]) : String / Console + Mutable =
-  emit_program_with_tab(file, src, raw_decls, bmode, target_origin, regions,
-                        st_build(raw_decls, ""))
-
-#[doc("Emit the C translation unit. `tab` is the program's symbol table, so registry identities match the ones the resolver stamped on call sites.")]
-pub fn emit_program_with_tab(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], tab: SymTab) : String / Console + Mutable {
+pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark]) : String / Console + Mutable {
 
   # m7a #6c: rewrite `Eff.op(args)` callees from `EField(EVar(Eff), op)`
   # to `EVar("Eff.op")` before code emission. The typer (synth_op_call_with_scheme)
@@ -11329,7 +11315,7 @@ pub fn emit_program_with_tab(file: String, src: String, raw_decls: [Decl], bmode
   let alias_resolved = rewrite_alias_decls(raw_decls)
   let eff_names = collect_effect_names(alias_resolved)
   let decls = desugar_op_calls_decls(alias_resolved, eff_names)
-  let fns = register_fn_decls_in(decls, tab)
+  let fns = register_fn_decls(decls)
   let variants = register_variants(decls)
   let op_quals = collect_op_qualified_names(decls)
   let globals = build_globals(fns, variants, eff_names, op_quals, const_names(decls))
@@ -13693,7 +13679,7 @@ fn tcrec_is_direct_self_call(e: Expr, nm: String, arity: Int, own_mod: Option[St
 fn tcrec_expr_has_self_call(e: Expr, nm: String, arity: Int, own_mod: Option[String]) : Bool =
   match e.kind {
     EVar(_)             -> false
-    ESym(_, _)             -> false
+    ESym(_, _, _)             -> false
     EInt(_, _)             -> false
     EReal(_, _)            -> false
     EIntLit(_)            -> false
@@ -14038,7 +14024,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
     None -> d
     Some(triple) -> match triple {
       TcrecPcsTriple(before, inner, after) -> {
-        let fsym = match d { DFn(_, _, _, _, _, _, _, _, _, _, s) -> s  _ -> sym_none() }
+        let fsym = match d { DFn(_, _, _, _, _, _, _, _, _, _, s) -> s  _ -> fnid_none() }
         # TRMC eligibility (modulo-cons through arm-wraps) OR an ordinary
         # direct tail self-call qualifies the inner for rewrite.
         # `allow_trmc` is false on the LLVM backend (it cannot lower the
@@ -14406,7 +14392,7 @@ fn tcrec_dup_arg_raw_read(xs: [Expr], p: String) : Bool {
   match xs {
     [a] -> match a.kind {
       EVar(_) -> false
-      ESym(_, _) -> false
+      ESym(_, _, _) -> false
       _       -> tcrec_expr_raw_read(a, p)
     }
     _ -> tcrec_args_raw_read(xs, p)

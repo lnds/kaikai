@@ -49,9 +49,6 @@ import compiler.expr_positions
 import compiler.sym_read
 import compiler.parse
 import compiler.infer
-import compiler.symtab
-import compiler.symtab_build
-import compiler.decl_names
 
 # m6.2 v2: EFn now carries the decl's module of origin. None for
 # decls authored in the root file; Some(m) for decls imported from
@@ -88,7 +85,7 @@ pub type UFnSig = US([Ty], Ty, [Bool])
 # answer one home's question with the other's declaration — the failure
 # the name plus module_origin pair could only paper over with a
 # first-match fallback.
-pub type EFn  = EFn(String, Int, Option[String], Option[UFnSig], SymId)
+pub type EFn  = EFn(String, Int, Option[String], Option[UFnSig], FnId)
 # Issue #440 Phase 2 — payload type list per variant. Carries the
 # parsed `[TypeExpr]` of the constructor's args so the emitter can
 # decide which slots to inline-unbox (Int / Real). Empty list means
@@ -155,13 +152,13 @@ pub fn efn_resolve(fns: [EFn], target: String, root_mod: Option[String]) : Optio
 # unchanged — root-file fns already win via `efn_pick_root`.
 
 #[doc("The registry entry declared by `s`, or `None` when no entry carries that identity.")]
-pub fn efn_of_sym(fns: [EFn], s: SymId) : Option[EFn] =
-  if sym_raw(s) < 0 { None } else { efn_of_sym_loop(fns, sym_raw(s)) }
+pub fn efn_of_sym(fns: [EFn], s: FnId) : Option[EFn] =
+  if sym_raw(fnid_sym(s)) < 0 { None } else { efn_of_sym_loop(fns, s) }
 
-fn efn_of_sym_loop(fns: [EFn], raw: Int) : Option[EFn] = match fns {
+fn efn_of_sym_loop(fns: [EFn], s: FnId) : Option[EFn] = match fns {
   [] -> None
   [h, ...rest] ->
-    if sym_raw(efn_sym(h)) == raw { Some(h) } else { efn_of_sym_loop(rest, raw) }
+    if fnid_eq(efn_sym(h), s) { Some(h) } else { efn_of_sym_loop(rest, s) }
 }
 
 #[doc("""
@@ -173,7 +170,7 @@ never trade places here. The name path stays for the references no
 resolver stamped — a synthesised callee, a spelling minted downstream —
 which is also why it keeps its first-match fallback.
 """)]
-pub fn efn_resolve_sym(fns: [EFn], s: SymId, target: String, root_mod: Option[String]) : Option[EFn] =
+pub fn efn_resolve_sym(fns: [EFn], s: FnId, target: String, root_mod: Option[String]) : Option[EFn] =
   match efn_of_sym(fns, s) {
     Some(e) -> Some(e)
     None    -> efn_resolve(fns, target, root_mod)
@@ -206,10 +203,10 @@ pub fn efn_pick_root(cands: [EFn], root_mod: Option[String]) : Option[EFn] {
 # m6.2 v2: arity helper that wraps the new resolver. Codegen call
 # sites that previously consumed `Option[Int]` keep working unchanged.
 
-pub fn fn_of_decl(d: Decl) : Option[EFn] = fn_of_decl_sym(d, sym_none())
+pub fn fn_of_decl(d: Decl) : Option[EFn] = fn_of_decl_sym(d, fnid_none())
 
 #[doc("The registry entry for `d`, carrying `s` as the declaration's identity.")]
-pub fn fn_of_decl_sym(d: Decl, s: SymId) : Option[EFn] {
+pub fn fn_of_decl_sym(d: Decl, s: FnId) : Option[EFn] {
   match d {
     DFn(_, name, tparams, params, opt_ret, row, body, _, _, mo, _) ->
       Some(EFn(name, list_length(params), mo,
@@ -218,8 +215,8 @@ pub fn fn_of_decl_sym(d: Decl, s: SymId) : Option[EFn] {
   }
 }
 
-#[doc("The identity `e` was registered with, or `sym_none()` when the registry was built without a symbol table.")]
-pub fn efn_sym(e: EFn) : SymId = match e { EFn(_, _, _, _, s) -> s }
+#[doc("The identity `e` was registered with, or `fnid_none()` when the registry was built without a symbol table.")]
+pub fn efn_sym(e: EFn) : FnId = match e { EFn(_, _, _, _, s) -> s }
 
 # Phase 3 unboxing (issue #383): classify a top-level DFn as
 # unboxed-signature candidate. Returns `Some(US(param_tys, ret_ty))`
@@ -596,50 +593,19 @@ pub fn all_params_unboxable(ps: [Param]) : Bool {
   }
 }
 
-#[doc("The registry under the program's own symbol table, so an entry's identity is the one the resolver stamped on call sites.")]
-pub fn register_fn_decls_in(decls: [Decl], tab: SymTab) : [EFn] =
-  rfd_loop(decls, tab, "")
-
-# A caller with no table builds one over this stream. Its ids answer
-# only within the registry it produces: `efn_resolve_sym` compares them
-# against `ESym` identities minted by the resolver's table, and two
-# tables built over different stages of the decl stream number the same
-# declaration differently. Prefer `register_fn_decls_in`.
-pub fn register_fn_decls(decls: [Decl]) : [EFn] =
-  register_fn_decls_in(decls, st_build(decls, ""))
-
-# The home follows the decl stream the same way the name table walks it,
-# so an entry's identity is the one its own module owns rather than
-# whichever home happened to be registered first.
-fn rfd_loop(ds: [Decl], tab: SymTab, cur: String) : [EFn] = match ds {
-  [] -> []
-  [d, ...rest] -> {
-    let home = decl_home_hint_reset(d, cur, "")
-    match fn_of_decl_sym(d, rfd_sym(tab, d, home)) {
-      Some(fs) -> [fs, ...rfd_loop(rest, tab, home)]
-      None     -> rfd_loop(rest, tab, home)
-    }
+#[doc("The function registry of a decl stream, each entry carrying the identity its declaration was stamped with.")]
+pub fn register_fn_decls(decls: [Decl]) : [EFn] = match decls {
+  []           -> []
+  [d, ...rest] -> match fn_of_decl_sym(d, rfd_sym(d)) {
+    Some(fs) -> [fs, ...register_fn_decls(rest)]
+    None     -> register_fn_decls(rest)
   }
 }
 
-fn rfd_sym(tab: SymTab, d: Decl, home: String) : SymId = match d {
-  DFn(_, name, _, _, _, _, _, _, _, mo, _) -> rfd_lookup(tab, name, rfd_home(mo, home))
-  _ -> sym_none()
+fn rfd_sym(d: Decl) : FnId = match d {
+  DFn(_, _, _, _, _, _, _, _, _, _, fid) -> fid
+  _ -> fnid_none()
 }
-
-fn rfd_home(mo: Option[String], home: String) : String = match mo {
-  Some(m) -> m
-  None    -> home
-}
-
-fn rfd_lookup(tab: SymTab, name: String, home: String) : SymId =
-  match st_module(tab, home) {
-    None    -> sym_none()
-    Some(m) -> match st_lookup(tab, NCFn, name, m) {
-      Some(s) -> s
-      None    -> sym_none()
-    }
-  }
 
 # m6.2 v2: a pair of an ambiguous bare-name and the surface names of
 # the modules that export it. Constructed by `find_ambig_efns` and
