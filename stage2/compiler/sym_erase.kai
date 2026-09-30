@@ -1,16 +1,15 @@
 #[doc("""
 Erases resolved identity back to a spelling, at the one boundary where
-a name stops being a reference and becomes a C symbol.
+a name stops being a reference and becomes a C symbol — except where the
+backend still decides by it.
 
 Identity is what the resolver decided and what the typer and the
-monomorphiser consume. Below them the passes no longer ask *which*
-declaration a name means — that question is settled — they spell an
-identifier for the backend. Feeding them an `ESym` would make every one
-of those spelling sites carry a second shape for no decision it makes.
-
-So the boundary is explicit and lives in one place, rather than each
-downstream pass growing its own `ESym` arm that quietly means `EVar`.
-A pass that ever needs the identity again reads it above this line.
+monomorphiser consume. Below them most passes no longer ask *which*
+declaration a name means; they spell an identifier for the backend, and
+an `ESym` there would give every spelling site a second shape for no
+decision it makes. The backend does still decide which function a call
+names and which effect a perform reaches, so those references keep
+their id, and a pass reading them by name normalises with `sym_read`.
 
 A bare spelling only carries the decision where the name answers to one
 declaration. Where several modules declare it and none of them is the
@@ -20,8 +19,9 @@ settled question is not re-asked by name below.
 
 The two halves run apart. The ownership passes read identity, so the
 qualification runs before them and leaves every other reference an
-`ESym`; the erasure proper runs after them. An effect reference keeps
-its id through both: the backend's perform dispatches on it.
+`ESym`; the erasure proper runs after them. An effect or function
+reference keeps its id through both: the backend dispatches a perform on
+the one and resolves a call by the other.
 """)]
 
 import compiler.ast
@@ -77,8 +77,8 @@ fn se_expr_at(cx: SeCx, h: String, e: Expr) : Expr =
   Expr { kind: se_kind_at(cx, h, e.kind), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn se_kind_at(cx: SeCx, h: String, k: ExprKind) : ExprKind = match k {
-  ESym(s, n) -> sym_erase_ref(cx, h, s, n)
-  _          -> prc_map_expr_kind(k, (sub) => se_expr_at(cx, h, sub))
+  ESym(s, inst, n) -> sym_erase_ref(cx, h, s, inst, n)
+  _                -> prc_map_expr_kind(k, (sub) => se_expr_at(cx, h, sub))
 }
 
 # A reference spells its home only where the bare name would leave the
@@ -86,21 +86,22 @@ fn se_kind_at(cx: SeCx, h: String, k: ExprKind) : ExprKind = match k {
 # file, and none of them the body's own module. A name reached from inside
 # its own home is not contested there, and the passes that read a
 # self-recursive call by name — the tail-call rewrite among them — only
-# see one when it stays bare.
-fn sym_erase_ref(cx: SeCx, h: String, s: SymId, n: String) : ExprKind = match cx {
+# see one when it stays bare. A specialisation was placed by the
+# monomorphiser, so there is nothing left to contest.
+fn sym_erase_ref(cx: SeCx, h: String, s: SymId, inst: Int, n: String) : ExprKind = match cx {
   SeCx(tab, target, keep) -> match sym_class(tab, s) {
-    NCEffect -> ESym(s, n)
-    NCFn     -> if se_spellable(tab, target, h, n) { se_home_call(tab, s, n, keep) } else { se_bare(keep, s, n) }
-    _        -> se_bare(keep, s, n)
+    NCEffect -> ESym(s, inst, n)
+    NCFn     -> if inst == spec_none() and se_spellable(tab, target, h, n) { se_home_call(tab, s, n) } else { ESym(s, inst, n) }
+    _        -> se_bare(keep, s, inst, n)
   }
 }
 
-fn se_home_call(tab: SymTab, s: SymId, n: String, keep: Bool) : ExprKind = {
+fn se_home_call(tab: SymTab, s: SymId, n: String) : ExprKind = {
   let home = sym_home(tab, s)
-  if home == "" { se_bare(keep, s, n) } else { EModCall(home, n) }
+  if home == "" { ESym(s, spec_none(), n) } else { EModCall(home, n) }
 }
 
-fn se_bare(keep: Bool, s: SymId, n: String) : ExprKind = if keep { ESym(s, n) } else { EVar(n) }
+fn se_bare(keep: Bool, s: SymId, inst: Int, n: String) : ExprKind = if keep { ESym(s, inst, n) } else { EVar(n) }
 
 # Contested, with no candidate the bare name already answers: a root-file
 # entry wins every bare call in the registry, and the body's own module

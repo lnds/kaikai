@@ -111,7 +111,7 @@ fn mono_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EUnit          -> k
     EVar(_)        -> k
     EMark(_)        -> k
-    ESym(_, _)        -> k
+    ESym(_, _, _)        -> k
     EUnder         -> k
     EPlaceholder   -> k
     EHole(_)       -> k
@@ -766,7 +766,7 @@ fn count_tyvar_in_kind(k: ExprKind, atv: [Int], auv: [Int]) : Int {
     EUnit          -> 0
     EVar(_)        -> 0
     EMark(_)        -> 0
-    ESym(_, _)        -> 0
+    ESym(_, _, _)        -> 0
     EUnder         -> 0
     EPlaceholder   -> 0
     EHole(_)       -> 0
@@ -1366,7 +1366,7 @@ fn lookup_poly_fn(polys: PolyIx, name: String) : Option[Decl] =
 # the name. An unresolved callee still walks by name.
 fn lookup_poly_fn_at(polys: PolyIx, callee: Expr, name: String) : Option[Decl] =
   match callee.kind {
-    ESym(s, _) -> if sym_raw(s) >= 0 {
+    ESym(s, inst, _) -> if sym_raw(s) >= 0 and inst == spec_none() {
       match lookup_poly_fn_sym(poly_ix_fns(polys), s) {
         Some(d) -> Some(d)
         None    -> lookup_poly_fn(polys, name)
@@ -1385,7 +1385,7 @@ fn lookup_poly_fn_sym(fns: [PolyFn], s: SymId) : Option[Decl] = match fns {
 }
 
 fn poly_decl_sym(d: Decl) : SymId = match d {
-  DFn(_, _, _, _, _, _, _, _, _, _, fsym) -> fsym
+  DFn(_, _, _, _, _, _, _, _, _, _, fsym) -> fnid_sym(fsym)
   _ -> sym_none()
 }
 
@@ -1645,7 +1645,16 @@ fn tuple_in(tuples: [MonoTuple], t: MonoTuple) : Bool {
 # lossy — a `TyCon`'s module slot is dropped at mangle time — so the
 # index is a CANDIDATE filter: `ts_mem` re-runs `tuple_eq` over the
 # bucket chain, picking the exact membership the linear `tuple_in` did.
-type TupleSet = { items: [MonoTuple], idx: NameIndex[MonoTuple] }
+#
+# Each distinct tuple is also numbered among its template's instances, in
+# the order it first joins the set; that number is the instance index of
+# the spec's `FnId`. A number never changes once given.
+type TupleSet = { items: [MonoTuple], idx: NameIndex[TupleAt], tmpls: NameIndex[String] }
+
+type TupleAt = TA(MonoTuple, Int)
+
+# One template: the key its tuples are discovered under.
+fn mt_tmpl_key(t: MonoTuple) : String = match t { MT(mo, name, _, _) -> cat3(mt_mo_key(mo), "|", name) }
 
 fn tuple_key(t: MonoTuple) : String =
   match t { MT(mo, name, tys, units) ->
@@ -1656,10 +1665,22 @@ fn mt_mo_key(mo: Option[String]) : String = match mo {
   Some(m) -> m
 }
 
-fn ts_empty() : TupleSet = TupleSet { items: [], idx: idx_empty() }
+fn ts_empty() : TupleSet = TupleSet { items: [], idx: idx_empty(), tmpls: idx_empty() }
 
 fn ts_add(ts: TupleSet, t: MonoTuple) : TupleSet =
-  TupleSet { items: [t, ...ts.items], idx: idx_prepend(ts.idx, tuple_key(t), t) }
+  if ts_mem(ts, t) { TupleSet { items: [t, ...ts.items], idx: ts.idx, tmpls: ts.tmpls } }
+  else {
+    let tk = mt_tmpl_key(t)
+    let k = ts_count_key(idx_chain(ts.tmpls, tk), tk, 0)
+    TupleSet { items: [t, ...ts.items], idx: idx_prepend(ts.idx, tuple_key(t), TA(t, k)),
+               tmpls: idx_prepend(ts.tmpls, tk, tk) }
+  }
+
+# A hash bucket can mix templates, so the count re-tests the key.
+fn ts_count_key(chain: [String], tk: String, n: Int) : Int = match chain {
+  []           -> n
+  [h, ...rest] -> ts_count_key(rest, tk, if h == tk { n + 1 } else { n })
+}
 
 fn ts_add_all(ts: TupleSet, ts_new: [MonoTuple]) : TupleSet = match ts_new {
   []           -> ts
@@ -1668,8 +1689,15 @@ fn ts_add_all(ts: TupleSet, ts_new: [MonoTuple]) : TupleSet = match ts_new {
 
 fn ts_of(xs: [MonoTuple]) : TupleSet = ts_add_all(ts_empty(), xs)
 
-fn ts_mem(ts: TupleSet, t: MonoTuple) : Bool =
-  tuple_in(idx_chain(ts.idx, tuple_key(t)), t)
+fn ts_mem(ts: TupleSet, t: MonoTuple) : Bool = ts_inst(ts, t) >= 0
+
+# The instance index of `t` among its template's tuples, or `spec_none()`.
+fn ts_inst(ts: TupleSet, t: MonoTuple) : Int = ta_find(idx_chain(ts.idx, tuple_key(t)), t)
+
+fn ta_find(chain: [TupleAt], t: MonoTuple) : Int = match chain {
+  []           -> spec_none()
+  [h, ...rest] -> match h { TA(u, k) -> if tuple_eq(u, t) { k } else { ta_find(rest, t) } }
+}
 
 # Reduce `tp.insts` to distinct `(name, [Ty], [UnitExprT])` triples
 # whose `name` matches a polymorphic DFn. Empty tuples (calls to
@@ -1966,7 +1994,7 @@ fn emit_spec(d: Decl, mt: MonoTuple, insts: InstIndex, polys: PolyIx,
               local_arities: [OpAr]) : SpecEmitOut {
   match mt { MT(_, _, tys, units) -> {
     let sm = build_subst_map(d, tys, units)
-    let spec0 = specialise_decl(d, tys, units)
+    let spec0 = specialise_decl(d, tys, units, ts_inst(all_tuples, mt))
     let spec1a = subst_decl(spec0, sm)
     # Issue #174: post-subst, the spec body's `Expr.ty` annotations
     # are now concrete (TyVar `T` substituted to e.g. `Int`).
@@ -2037,64 +2065,64 @@ fn retarget_self_calls_decl(d: Decl, orig_name: String, mangled: String) : Decl 
     match d {
       DFn(p, n, tp, ps, rt, row, body, ln, cl, mo, fsym) ->
         DFn(p, n, tp, ps, rt, row,
-            retarget_self_calls_expr(body, sw_params(ps, []), orig_name, mangled),
+            retarget_self_calls_expr(body, sw_params(ps, []), orig_name, spec_ref_kind(fsym, mangled)),
             ln, cl, mo, fsym)
       _ -> d
     }
   }
 }
 
-fn retarget_self_calls_expr(e: Expr, sh: [String], orig_name: String, mangled: String) : Expr =
-  Expr { kind: retarget_self_calls_kind(e.kind, sh, orig_name, mangled),
+fn retarget_self_calls_expr(e: Expr, sh: [String], orig_name: String, spec: ExprKind) : Expr =
+  Expr { kind: retarget_self_calls_kind(e.kind, sh, orig_name, spec),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 fn retarget_self_calls_kind(k: ExprKind, sh: [String], orig_name: String,
-      mangled: String) : ExprKind {
+      spec: ExprKind) : ExprKind {
   match k {
     ECall(callee, args_) -> match sym_read_kind(callee.kind) {
       # The single rewrite the walker performs: `f(args)` where f is
-      # the bare original name becomes `mangled(args)`. Args still
+      # the bare original name becomes a call to the spec. Args still
       # recurse so nested self-calls inside arg expressions also get
       # retargeted.
       EVar(name) ->
         if name == orig_name and not list_has(sh, name) {
-          let new_callee = Expr { kind: EVar(mangled),
+          let new_callee = Expr { kind: spec,
                                    line: callee.line, col: callee.col,
                                    ty: callee.ty, mode: callee.mode }
-          let new_args = map(args_, (a) => retarget_self_calls_expr(a, sh, orig_name, mangled))
+          let new_args = map(args_, (a) => retarget_self_calls_expr(a, sh, orig_name, spec))
           ECall(new_callee, new_args)
         } else {
           ECall(callee,
-                map(args_, (a) => retarget_self_calls_expr(a, sh, orig_name, mangled)))
+                map(args_, (a) => retarget_self_calls_expr(a, sh, orig_name, spec)))
         }
-      _ -> ECall(retarget_self_calls_expr(callee, sh, orig_name, mangled),
-                  map(args_, (a) => retarget_self_calls_expr(a, sh, orig_name, mangled)))
+      _ -> ECall(retarget_self_calls_expr(callee, sh, orig_name, spec),
+                  map(args_, (a) => retarget_self_calls_expr(a, sh, orig_name, spec)))
     }
     # Binding forms extend the shadow set for their body; the generic
     # mapper cannot, so they are spelled out here.
-    ELambda(ps, b) -> ELambda(ps, retarget_self_calls_expr(b, sw_params(ps, sh), orig_name, mangled))
+    ELambda(ps, b) -> ELambda(ps, retarget_self_calls_expr(b, sw_params(ps, sh), orig_name, spec))
     EMatch(scr, arms) ->
-      EMatch(retarget_self_calls_expr(scr, sh, orig_name, mangled),
-             map(arms, (a) => retarget_arm(a, sh, orig_name, mangled)))
-    EBlock(stmts, tail) -> match retarget_stmts(stmts, sh, orig_name, mangled, []) {
+      EMatch(retarget_self_calls_expr(scr, sh, orig_name, spec),
+             map(arms, (a) => retarget_arm(a, sh, orig_name, spec)))
+    EBlock(stmts, tail) -> match retarget_stmts(stmts, sh, orig_name, spec, []) {
       RSS(ss1, sh1) ->
         EBlock(ss1, match tail {
-          Some(t) -> Some(retarget_self_calls_expr(t, sh1, orig_name, mangled))
+          Some(t) -> Some(retarget_self_calls_expr(t, sh1, orig_name, spec))
           None    -> None
         })
     }
-    _ -> mono_map_expr_kind(k, (sub) => retarget_self_calls_expr(sub, sh, orig_name, mangled))
+    _ -> mono_map_expr_kind(k, (sub) => retarget_self_calls_expr(sub, sh, orig_name, spec))
   }
 }
 
-fn retarget_arm(a: Arm, sh: [String], orig_name: String, mangled: String) : Arm = match a {
+fn retarget_arm(a: Arm, sh: [String], orig_name: String, spec: ExprKind) : Arm = match a {
   Arm(p, guard, body) -> {
     let sh1 = pat_binders(p, sh)
     Arm(p, match guard {
-          Some(g) -> Some(retarget_self_calls_expr(g, sh1, orig_name, mangled))
+          Some(g) -> Some(retarget_self_calls_expr(g, sh1, orig_name, spec))
           None    -> None
         },
-        retarget_self_calls_expr(body, sh1, orig_name, mangled))
+        retarget_self_calls_expr(body, sh1, orig_name, spec))
   }
 }
 
@@ -2103,16 +2131,16 @@ fn retarget_arm(a: Arm, sh: [String], orig_name: String, mangled: String) : Arm 
 # the whole block's binders.
 type RetStmts = RSS([Stmt], [String])
 
-fn retarget_stmts(ss: [Stmt], sh: [String], orig_name: String, mangled: String,
+fn retarget_stmts(ss: [Stmt], sh: [String], orig_name: String, spec: ExprKind,
       acc: [Stmt]) : RetStmts = match ss {
   [] -> RSS(list_reverse(acc), sh)
   [s, ...rest] ->
-    retarget_stmts(rest, retarget_stmt_binders(s, sh), orig_name, mangled,
-                   [retarget_stmt(s, sh, orig_name, mangled), ...acc])
+    retarget_stmts(rest, retarget_stmt_binders(s, sh), orig_name, spec,
+                   [retarget_stmt(s, sh, orig_name, spec), ...acc])
 }
 
-fn retarget_stmt(s: Stmt, sh: [String], orig_name: String, mangled: String) : Stmt =
-  mono_map_stmt_exprs(s, (x) => retarget_self_calls_expr(x, sh, orig_name, mangled))
+fn retarget_stmt(s: Stmt, sh: [String], orig_name: String, spec: ExprKind) : Stmt =
+  mono_map_stmt_exprs(s, (x) => retarget_self_calls_expr(x, sh, orig_name, spec))
 
 fn retarget_stmt_binders(s: Stmt, sh: [String]) : [String] = match s {
   SLet(p, _, _)       -> pat_binders(p, sh)
@@ -2254,7 +2282,7 @@ fn discover_new_tuples_kind(k: ExprKind, insts: InstIndex, polys: PolyIx,
     EUnit          -> acc
     EVar(_)        -> acc
     EMark(_)        -> acc
-    ESym(_, _)        -> acc
+    ESym(_, _, _)        -> acc
     EUnder         -> acc
     EPlaceholder   -> acc
     EHole(_)       -> acc
@@ -2418,12 +2446,24 @@ fn bare_callee_mo(polys: PolyIx, name: String, host_mo: Option[String]) : Option
 
 # Build the retargeted callee for a bare call: an `EModCall` into the host
 # module when the spec is module-tagged, else a plain `EVar`.
-fn bare_spec_callee(callee: Expr, mangled: String, bmo: Option[String]) : Expr =
+fn bare_spec_callee(callee: Expr, mangled: String, bmo: Option[String], fid: FnId) : Expr =
   match bmo {
     Some(m) -> Expr { kind: EModCall(m, mangled),
                       line: callee.line, col: callee.col, ty: callee.ty, mode: callee.mode }
-    None    -> Expr { kind: EVar(mangled),
+    None    -> Expr { kind: spec_ref_kind(fid, mangled),
                       line: callee.line, col: callee.col, ty: callee.ty, mode: callee.mode }
+  }
+
+# A reference to spec `fid`. The mangled name is only what the backend
+# spells; the identity is the template's id and the instance index.
+fn spec_ref_kind(fid: FnId, mangled: String) : ExprKind =
+  if sym_raw(fnid_sym(fid)) >= 0 { ESym(fnid_sym(fid), fnid_inst(fid), mangled) } else { EVar(mangled) }
+
+# The identity of `name`'s spec for `t`, from the template the tuple names.
+fn spec_fnid(polys: PolyIx, tuples: TupleSet, name: String, t: MonoTuple) : FnId =
+  match lookup_poly_fn_for(polys, name, mt_mo(t)) {
+    Some(d) -> FnId(poly_decl_sym(d), ts_inst(tuples, t))
+    None    -> fnid_none()
   }
 
 fn rewrite_callsites_decl_sm(d: Decl, insts: InstIndex,
@@ -2503,9 +2543,10 @@ fn rewrite_bare_call(name: String, callee: Expr, new_args: [Expr], ret_ty: Optio
   match resolve_call_inst(insts, polys, name, callee, new_args, ret_ty, sm) {
     Some(MIPair(tys, units)) -> {
       let bmo = bare_callee_mo(polys, name, host_mo)
-      if ts_mem(tuples, MT(bmo, name, tys, units)) {
+      let t = MT(bmo, name, tys, units)
+      if ts_mem(tuples, t) {
         let mangled = mono_mangle_name(name, tys, units)
-        ECall(bare_spec_callee(callee, mangled, bmo), new_args)
+        ECall(bare_spec_callee(callee, mangled, bmo, spec_fnid(polys, tuples, name, t)), new_args)
       } else { ECall(callee, new_args) }
     }
     None -> ECall(callee, new_args)
@@ -2819,7 +2860,7 @@ fn subst_param_sig(p: Param, subst: [SigSubst]) : Param =
                         pline: p.pline, pcol: p.pcol, pborrow: p.pborrow }
   }
 
-fn specialise_decl(d: Decl, tys: [Ty], units: [UnitExprT]) : Decl {
+fn specialise_decl(d: Decl, tys: [Ty], units: [UnitExprT], inst: Int) : Decl {
   match d {
     DFn(is_pub, name, _, params, opt_ret, row, body, ln, cl, mo, fsym) -> {
       let mangled = mono_mangle_name(name, tys, units)
@@ -2829,7 +2870,7 @@ fn specialise_decl(d: Decl, tys: [Ty], units: [UnitExprT]) : Decl {
         None -> None
         Some(te) -> Some(apply_sig_subst_te(te, subst))
       }
-      DFn(is_pub, mangled, [], params1, opt_ret1, row, body, ln, cl, mo, fsym)
+      DFn(is_pub, mangled, [], params1, opt_ret1, row, body, ln, cl, mo, FnId(fnid_sym(fsym), inst))
     }
     _ -> d
   }
