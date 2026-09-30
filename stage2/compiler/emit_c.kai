@@ -479,20 +479,6 @@ fn emit_variant_ctor(cx: EmitCtx) : String = if cx.in_region { "kai_arena_varian
 
 # ====================================================================
 
-fn efn_find(fns: [EFn], target: String) : Option[EFn] {
-  match fns {
-    [] -> None
-    [h, ...rest] -> match h {
-      EFn(n, _, _, _, _) -> if n == target { Some(h) } else { efn_find(rest, target) }
-    }
-  }
-}
-
-fn efn_find_arity(fns: [EFn], target: String, root_mod: Option[String]) : Option[Int] = match efn_resolve(fns, target, root_mod) {
-  Some(EFn(_, ar, _, _, _)) -> Some(ar)
-  None                   -> None
-}
-
 fn ctor_int_slots_of(ks: [Int]) : [Bool] = map(ks, (k) => k == 1)
 
 # Build the [CtorIntSlots] map the unbox pass consumes. One entry per
@@ -1382,7 +1368,7 @@ fn list_head_or(xs: [String], fallback: String) : String = match xs {
 # LLVM backend has had this guard since m3d (`llvm_local_find`
 # in `llvm_emit_expr`); the C backend was missing it until m14
 # v1.x.
-fn emit_ident_value(name: String, lcs: [String], fns: [EFn], variants: [VariantEntry], core: [ECore], root_mod: Option[String]) : String {
+fn emit_ident_value(name: String, fid: FnId, lcs: [String], fns: [EFn], variants: [VariantEntry], core: [ECore], root_mod: Option[String]) : String {
   if list_has(lcs, name) { c_local(name) }
   else { match evar_find(variants, name) {
     # A bare nullary ctor ident (RBLeaf, None, ...) — read the seeded
@@ -1398,7 +1384,7 @@ fn emit_ident_value(name: String, lcs: [String], fns: [EFn], variants: [VariantE
     # before the core table: a declaration shadows the builtin it is
     # spelled like, which is what the typer and the native lowering
     # (`c_sym_of_callee`) already read off this same registry.
-    None -> match efn_resolve(fns, name, root_mod) {
+    None -> match efn_resolve_sym(fns, fid, name, root_mod) {
       Some(EFn(_, ar, mo, _, _)) ->
         cat5("kai_closure(&", c_user_thunk_sym(c_sym(name, mo)), ", ", int_to_string(ar), ", 0, NULL)")
       None -> match core_find(core, name) {
@@ -2890,7 +2876,7 @@ fn evf_require_walk(eff: String) : String =
 
 fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Console {
 
-  match rhs.kind {
+  match sym_read_kind(rhs.kind) {
     ECall(f, args_e) -> match sym_read_kind(f.kind) {
       # Pipe into a UFn callee: the piped LHS is param 0 and every arg
       # marshals per the raw mask, since the callee's C signature is raw.
@@ -7033,8 +7019,8 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
   # on what the normaliser can still produce, so removing it is a
   # compile error rather than dead-code cleanup.
   match sym_read_kind(x.kind) {
-    ESym(_, _, name) -> emit_ident_value(name, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
-    EMark(m) -> emit_ident_value(mark_name(m), cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
+    ESym(s, inst, name) -> emit_ident_value(name, FnId(s, inst), cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
+    EMark(m) -> emit_ident_value(mark_name(m), fnid_none(), cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
     # Fix B (bidirectional list literals): when an Int literal is
     # checked against a Byte-context (e.g. inside `let bs: [Byte] = [65, 66]`),
     # the typer rewrites the node's ty to TyByte. Emit a Byte
@@ -7069,10 +7055,10 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
       else if not list_has(cx.lcs, name) {
         match const_body_of(cx.consts, name) {
           Some(body) -> emit_expr(src, body, cx)
-          None       -> emit_ident_value(name, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
+          None       -> emit_ident_value(name, fnid_none(), cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
         }
       }
-      else { emit_ident_value(name, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod) }
+      else { emit_ident_value(name, fnid_none(), cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod) }
     EUnder       -> "kai_unit() /* _ */"
     EPlaceholder -> "kai_unit() /* placeholder */"
     ECall(f, args_e) -> emit_call_expr(src, f, args_e, emit_ctx_route_brand(cx, x.ty))
@@ -14170,7 +14156,7 @@ fn tcrec_collect_dm_kind(k: ExprKind, nm: String, arity: Int, own_mod: Option[St
                          scope: [String], hoisted: [Expr],
                          acc: [TcrDm], bmap: [BorrowEntry], base_mask: Int) : [TcrDm] {
   match k {
-    ECall(f, xs) -> match f.kind {
+    ECall(f, xs) -> match sym_read_kind(f.kind) {
       EVar(callee) ->
         if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
           let mask = tcrec_site_drop_mask(params, list_append(xs, hoisted), bmap, base_mask, 0, 0)
@@ -14746,7 +14732,7 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
                       own_mod: Option[String], c_sym_str: String, params: [Param], pnames: [String],
                       uses: [Use], dm_table: [TcrDm], skip_set: [String], scope: [String]) : ExprKind {
   match k {
-    ECall(f, xs) -> match f.kind {
+    ECall(f, xs) -> match sym_read_kind(f.kind) {
       EVar(callee) ->
         if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
           # The base mask is per-fn; the side-table mask is per-site and
