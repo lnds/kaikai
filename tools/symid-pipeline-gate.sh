@@ -70,4 +70,15 @@ need '^efn pick__mono__String/1#[0-9]+ pick@spec_instance_ids raw=001>0$'
   && [ "$(id_of '^efn pick#')" = "$(id_of '^perceus main pick__mono__Int/0#')" ] \
   || fail "a specialisation carries an id other than its generic's"
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, root calls reach root declarations, and each specialisation is its generic's id plus its own instance"
+# The unbox pass classifies a callee by the declaration it names. `pkg`'s
+# own `one` is all-raw while a stdlib `one` shares its name; read by name,
+# `direct` took the homonym's boxed class and unboxed its own result.
+MATFIX="$ROOT/examples/namespace-collisions/own_fn_call_forms_matrix"
+kir=$(cd "$MATFIX" && "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --emit=kir \
+        --path "$MATFIX" --path "$ROOT/stdlib" main.kai 2>/dev/null)
+direct=$(printf '%s\n' "$kir" | awk '/^fn pkg__direct\(/{on=1} on{print} on&&/^}/{exit}')
+[ -n "$direct" ] || { out=$kir; fail "no pkg__direct in the KIR dump"; }
+printf '%s\n' "$direct" | grep -q 'int.unbox' \
+  && { out=$direct; fail "pkg.direct re-unboxes its own callee's result"; }
+
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, root calls reach root declarations, each specialisation is its generic's id plus its own instance, and a callee's signature class is its own declaration's"

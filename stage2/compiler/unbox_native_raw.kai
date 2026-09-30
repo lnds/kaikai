@@ -22,6 +22,7 @@
 import compiler.ast
 import compiler.sym_read
 import compiler.fnreg
+import compiler.fn_index
 
 # True iff EVERY use of the kind-1 Int arm binder `nm` in `e` is a shape the
 # native backend lowers raw-safe: an operand of a raw-arith / comparison
@@ -47,12 +48,12 @@ import compiler.fnreg
 # binder stays boxed. Conservative by exclusion: an unmodelled form forces
 # boxed. STRICTER than the C oracle's mode-slave seeding, which the
 # native's non-total load-border cannot match.
-pub fn native_arm_binder_raw_safe(nm: String, e: Expr, cis: [CtorIntSlots], fns: [EFn]) : Bool / Console = match e.kind {
+pub fn native_arm_binder_raw_safe(nm: String, e: Expr, cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match e.kind {
   EUnit -> false
   _     -> nab_uses_ok(nm, e, cis, fns)
 }
 
-fn nab_uses_ok(nm: String, e: Expr, cis: [CtorIntSlots], fns: [EFn]) : Bool / Console = match sym_read_kind(e.kind) {
+fn nab_uses_ok(nm: String, e: Expr, cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match sym_read_kind(e.kind) {
   EVar(n)          -> n != nm
   EInt(_, _)       -> true
   EReal(_, _)      -> true
@@ -77,7 +78,7 @@ fn nab_uses_ok(nm: String, e: Expr, cis: [CtorIntSlots], fns: [EFn]) : Bool / Co
 # (the `SIInt64` init stores the register raw); any other position recurses
 # (and forces boxed on an unmodelled shape as usual). `flags` is consumed in
 # lockstep with the args, so each arg sees its own slot's flag.
-fn nab_ctor_args_ok(nm: String, flags: [Bool], xs: [Expr], cis: [CtorIntSlots], fns: [EFn]) : Bool / Console = match xs {
+fn nab_ctor_args_ok(nm: String, flags: [Bool], xs: [Expr], cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match xs {
   []           -> true
   [x, ...rest] -> match flags {
     [f, ...fr] -> {
@@ -94,7 +95,7 @@ fn nab_ctor_args_ok(nm: String, flags: [Bool], xs: [Expr], cis: [CtorIntSlots], 
 # call site passes the register at the param slot, no box mint); a boxed
 # position or a non-var arg recurses. Mask and args walk in lockstep,
 # mirroring `nab_ctor_args_ok`.
-fn nab_call_args_ok(nm: String, mask: [Bool], xs: [Expr], cis: [CtorIntSlots], fns: [EFn]) : Bool / Console = match xs {
+fn nab_call_args_ok(nm: String, mask: [Bool], xs: [Expr], cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match xs {
   []           -> true
   [x, ...rest] -> match mask {
     [m, ...mr] -> {
@@ -111,13 +112,13 @@ fn nab_call_args_ok(nm: String, mask: [Bool], xs: [Expr], cis: [CtorIntSlots], f
 # head yields None (conservative). A raw binder feeding a call the KIR
 # later takes indirect (locals-shadow) is still sound: the boxed-arg
 # border re-boxes the raw register at the call, it just stops paying off.
-# Same root_mod gap as call_resolves_to_ufn in unbox.kai.
-fn nab_callee_raw_mask(nm: String, f: Expr, fns: [EFn]) : Option[[Bool]] = match sym_read_kind(f.kind) {
+# Same unstamped-head caveat as call_resolves_to_ufn in unbox.kai.
+fn nab_callee_raw_mask(nm: String, f: Expr, fns: FnIndex) : Option[[Bool]] = match sym_read_kind(f.kind) {
   EVar(n) ->
     if n == nm { None }
-    else { match efn_resolve(fns, n, None) {
-      Some(EFn(_, _, _, Some(US(_, _, mask)), _)) -> Some(mask)
-      _ -> None
+    else { match fnx_callee_sig(fns, f) {
+      Some(US(_, _, mask)) -> Some(mask)
+      None -> None
     } }
   _ -> None
 }
@@ -142,7 +143,7 @@ fn nab_op_is_raw(op: String) : Bool =
 # A binop operand: `EVar(nm)` (the raw use) is safe iff its SIBLING is a
 # raw-Int form; a non-`nm` operand must be a raw-Int form too (var / Int lit)
 # for the whole binop to lower raw. Anything else keeps the binder boxed.
-fn nab_operand(nm: String, e: Expr, cis: [CtorIntSlots], fns: [EFn]) : Bool / Console = match e.kind {
+fn nab_operand(nm: String, e: Expr, cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match e.kind {
   EVar(_)    -> true
   ESym(_, _, _)    -> true
   EInt(_, _) -> true
@@ -151,12 +152,12 @@ fn nab_operand(nm: String, e: Expr, cis: [CtorIntSlots], fns: [EFn]) : Bool / Co
 }
 
 fn nab_is_var(nm: String, e: Expr) : Bool = match sym_read_kind(e.kind) { EVar(n) -> n == nm _ -> false }
-fn nab_opt(nm: String, oe: Option[Expr], cis: [CtorIntSlots], fns: [EFn]) : Bool / Console = match oe { None -> true Some(e) -> nab_uses_ok(nm, e, cis, fns) }
-fn nab_stmts(nm: String, ss: [Stmt], cis: [CtorIntSlots], fns: [EFn]) : Bool / Console = match ss {
+fn nab_opt(nm: String, oe: Option[Expr], cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match oe { None -> true Some(e) -> nab_uses_ok(nm, e, cis, fns) }
+fn nab_stmts(nm: String, ss: [Stmt], cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match ss {
   []           -> true
   [s, ...rest] -> nab_stmt(nm, s, cis, fns) and nab_stmts(nm, rest, cis, fns)
 }
-fn nab_stmt(nm: String, s: Stmt, cis: [CtorIntSlots], fns: [EFn]) : Bool / Console = match s {
+fn nab_stmt(nm: String, s: Stmt, cis: [CtorIntSlots], fns: FnIndex) : Bool / Console = match s {
   SExprStmt(e)    -> nab_uses_ok(nm, e, cis, fns)
   SLet(_, _, rhs) -> nab_uses_ok(nm, rhs, cis, fns)
   _               -> not nab_stmt_mentions(nm, s)
