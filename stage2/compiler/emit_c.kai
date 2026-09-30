@@ -5817,13 +5817,14 @@ fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
   }
 }
 
-fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], variants: [VariantEntry], cls: [ClauseInfo], consts: [Decl], effs: [Decl], recs: [RecInfo], core: [ECore], rcore: [RCore], evf: [FnEvidenceFrame], root_mod: Option[String]) : String / Console =
-
+fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], variants: [VariantEntry], cls: [ClauseInfo], consts: [Decl], effs: [Decl], recs: [RecInfo], core: [ECore], rcore: [RCore], evf: [FnEvidenceFrame], root_mod: Option[String]) : String / Console = {
   # Lambda/closure bodies carry the evidence-frame table so a call site
   # inside one fills a frame-carrying callee's evidence (the by-name walk
   # stays the fallback for any effect the frame does not carry).
-  concat_all(map(lams, (l) => emit_lam_helper(src, l, EmitCtx { lcs: [], fns: fns_prefer_module(fns, lam_mo(l), root_mod), variants: variants, lams: lams, cls: cls,
+  let fbm = fns_by_mod_warm(fns, map(lams, lam_mo), root_mod)
+  concat_all(map(lams, (l) => emit_lam_helper(src, l, EmitCtx { lcs: [], fns: fns_by_mod_table(fbm, lam_mo(l), root_mod), variants: variants, lams: lams, cls: cls,
                                                                 regions: [], in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: consts, effs: effs, ffi_reg: [], cur_enc_fn: "", recs: recs, core: core, rcore: rcore, evf: evf, rd_active: false, rd_capable: [], tcpend: [], root_mod: root_mod })))
+}
 
 fn emit_one_lam_forward(l: LamInfo) : String =
   concat_all(["static KaiValue *", lam_symbol(l), "(KaiValue *, KaiValue **, int);\n"])
@@ -6093,9 +6094,10 @@ fn emit_expr_in_clause(src: String, e: Expr, cx: EmitCtx, stateful: Bool) : Stri
 # name, and it is emitted from the ClauseInfo side table rather than the
 # Decl loop, so it must rotate the EFn table to its module itself — the
 # `fns_prefer_module` contract every body emitter answers to.
-fn emit_clause_bodies(src: String, cs: [ClauseInfo], cx: EmitCtx) : String / Console =
-
-  concat_all(map(cs, (c) => emit_clause_body(src, c, emit_ctx_with_enc_fn(emit_ctx_with_fns(cx, fns_prefer_module(cx.fns, clause_mo(c), cx.root_mod)), clause_sym(c)))))
+fn emit_clause_bodies(src: String, cs: [ClauseInfo], cx: EmitCtx) : String / Console = {
+  let fbm = fns_by_mod_warm(cx.fns, map(cs, clause_mo), cx.root_mod)
+  concat_all(map(cs, (c) => emit_clause_body(src, c, emit_ctx_with_enc_fn(emit_ctx_with_fns(cx, fns_by_mod_table(fbm, clause_mo(c), cx.root_mod)), clause_sym(c)))))
+}
 
 # m7c-d — emit each clause as a top-level LLVM function. Mirrors
 # `emit_clause_body`/`emit_clause_sig` from the C backend. The
@@ -9214,22 +9216,16 @@ fn fn_bodies_loop(src: String, decls: [Decl], cx: EmitCtx, fbm: FnsByMod, const_
 #      when test_mode is on) ----
 
 fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr, line: Int,
-                cx: EmitCtx, target_origin: Option[String], test_enc: String) : String / Console {
+                cx: EmitCtx, test_enc: String) : String / Console {
 
   # desc_span is the raw source of the description including its quotes,
   # so it's already a valid C string literal. We wrap the body in
   # setjmp/longjmp: kai_assert_check inside the body can longjmp us out
   # on failure, and the test still counts as a tried test.
-  # Issue #335: rotate the EFn table so the target file's own module
-  # entries come first. `efn_resolve`'s ambiguous fallback then
-  # resolves a bare name (e.g. `concat([])`) to the same-module entry
-  # rather than a sibling core's clashing export. Mirrors the rotate
-  # `emit_fn_body` already does for DFn bodies.
-  let body_fns = fns_prefer_module(cx.fns, target_origin, cx.root_mod)
   # `test_enc` is the runner symbol the collector stamped on this test's
   # lambdas, so `find_lam` resolves them (a test body's lambda otherwise
   # looked up under the wrong enc_fn → "non-callable").
-  let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+  let body_cx = EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
                           regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: test_enc, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, root_mod: cx.root_mod }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
@@ -9257,12 +9253,12 @@ fn test_decls(decls: [Decl]) : [Decl] =
   filter(decls, (d) => match d { DTest(_, _, _, _, _) -> true _ -> false })
 
 fn emit_one_test(src: String, cx: EmitCtx,
-                 target_origin: Option[String], id_d: DeclWithId) : String / Console {
+                 id_d: DeclWithId) : String / Console {
 
   match id_d {
     DWI(id, d) -> match d {
       DTest(desc_span, body, tl, tc, mo) ->
-        emit_test_fn(src, id, desc_span, body, tl, cx, target_origin, runner_enc_fn("test", mo, tl, tc))
+        emit_test_fn(src, id, desc_span, body, tl, cx, runner_enc_fn("test", mo, tl, tc))
       _ -> ""
     }
   }
@@ -9286,11 +9282,17 @@ fn number_tests_loop(decls: [Decl], id: Int, acc: [DeclWithId]) : [DeclWithId] {
 fn number_tests(decls: [Decl]) : [DeclWithId] =
   number_tests_loop(decls, 0, [])
 
+# A runner body resolves its bare calls against the target file's own
+# module first, like a fn body of that module.
+fn runner_ctx(cx: EmitCtx, target_origin: Option[String]) : EmitCtx =
+  emit_ctx_with_fns(cx, fns_prefer_module(cx.fns, target_origin, cx.root_mod))
+
 fn emit_all_tests(src: String, decls: [Decl], cx: EmitCtx,
                   target_origin: Option[String]) : String / Console {
 
   let numbered = number_tests(decls)
-  concat_all(map(numbered, (dwi) => emit_one_test(src, cx, target_origin, dwi)))
+  let rcx = runner_ctx(cx, target_origin)
+  concat_all(map(numbered, (dwi) => emit_one_test(src, rcx, dwi)))
 }
 
 fn test_count(decls: [Decl]) : Int = list_length(test_decls(decls))
@@ -9317,11 +9319,9 @@ fn test_call_list(n: Int, i: Int) : String {
 # panic the process, since timing aborted code is meaningless.
 
 fn emit_bench_fn(src: String, id: Int, desc_span: String, body: Expr,
-                 cx: EmitCtx, target_origin: Option[String], bench_enc: String) : String / Console {
+                 cx: EmitCtx, bench_enc: String) : String / Console {
 
-  # Issue #335: same file-local rotate as emit_test_fn.
-  let body_fns = fns_prefer_module(cx.fns, target_origin, cx.root_mod)
-  let body_cx = EmitCtx { lcs: cx.lcs, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+  let body_cx = EmitCtx { lcs: cx.lcs, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
                           regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: bench_enc, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, root_mod: cx.root_mod }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
@@ -9353,12 +9353,12 @@ fn bench_decls(decls: [Decl]) : [Decl] =
   filter(decls, (d) => match d { DBench(_, _, _, _, _) -> true _ -> false })
 
 fn emit_one_bench(src: String, cx: EmitCtx,
-                  target_origin: Option[String], id_d: DeclWithId) : String / Console {
+                  id_d: DeclWithId) : String / Console {
 
   match id_d {
     DWI(id, d) -> match d {
       DBench(desc_span, body, bl, bc, mo) ->
-        emit_bench_fn(src, id, desc_span, body, cx, target_origin, runner_enc_fn("bench", mo, bl, bc))
+        emit_bench_fn(src, id, desc_span, body, cx, runner_enc_fn("bench", mo, bl, bc))
       _ -> ""
     }
   }
@@ -9381,7 +9381,8 @@ fn emit_all_benches(src: String, decls: [Decl], cx: EmitCtx,
                     target_origin: Option[String]) : String / Console {
 
   let numbered = number_benches(decls)
-  concat_all(map(numbered, (dwi) => emit_one_bench(src, cx, target_origin, dwi)))
+  let rcx = runner_ctx(cx, target_origin)
+  concat_all(map(numbered, (dwi) => emit_one_bench(src, rcx, dwi)))
 }
 
 fn bench_count(decls: [Decl]) : Int = list_length(bench_decls(decls))
@@ -9665,12 +9666,10 @@ fn emit_check_param_inits_assign(params: [Param]) : String {
 }
 
 fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body: Expr,
-                 cx: EmitCtx, target_origin: Option[String], check_enc: String) : String / Console {
+                 cx: EmitCtx, check_enc: String) : String / Console {
 
   let lcs2 = list_append(check_param_names(params), cx.lcs)
-  # Issue #335: same file-local rotate as emit_test_fn.
-  let body_fns = fns_prefer_module(cx.fns, target_origin, cx.root_mod)
-  let body_cx = EmitCtx { lcs: lcs2, fns: body_fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
+  let body_cx = EmitCtx { lcs: lcs2, fns: cx.fns, variants: cx.variants, lams: cx.lams, cls: cx.cls,
                           regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: check_enc, recs: cx.recs, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, root_mod: cx.root_mod }
   let body_c = emit_expr(src, body, body_cx)
   # Issue #438: hoist param locals to function scope so the post-loop
@@ -9722,12 +9721,12 @@ fn check_decls(decls: [Decl]) : [Decl] =
   filter(decls, (d) => match d { DCheck(_, _, _, _, _, _) -> true _ -> false })
 
 fn emit_one_check(src: String, cx: EmitCtx,
-                  target_origin: Option[String], id_d: DeclWithId) : String / Console {
+                  id_d: DeclWithId) : String / Console {
 
   match id_d {
     DWI(id, d) -> match d {
       DCheck(desc_span, ps, body, cl, cc, mo) ->
-        emit_check_fn(src, id, desc_span, ps, body, cx, target_origin, runner_enc_fn("check", mo, cl, cc))
+        emit_check_fn(src, id, desc_span, ps, body, cx, runner_enc_fn("check", mo, cl, cc))
       _ -> ""
     }
   }
@@ -9750,7 +9749,8 @@ fn emit_all_checks(src: String, decls: [Decl], cx: EmitCtx,
                    target_origin: Option[String]) : String / Console {
 
   let numbered = number_checks(decls)
-  concat_all(map(numbered, (dwi) => emit_one_check(src, cx, target_origin, dwi)))
+  let rcx = runner_ctx(cx, target_origin)
+  concat_all(map(numbered, (dwi) => emit_one_check(src, rcx, dwi)))
 }
 
 fn check_count(decls: [Decl]) : Int = list_length(check_decls(decls))
