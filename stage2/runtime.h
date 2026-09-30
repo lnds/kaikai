@@ -5480,8 +5480,10 @@ static inline KaiValue *kai_enum_slot_box(int64_t tag) {
  * the number of identities is unbounded and the table can saturate.
  * Every probe is therefore capped at KAI_IMMORTAL_VAR_PROBE buckets: a
  * miss costs at most that many, and a key whose window is full is built
- * as an ordinary cell instead of interned. */
-#define KAI_IMMORTAL_VAR_BUCKETS 262144
+ * as an ordinary cell instead of interned. The capacity is also what a
+ * saturating program retains forever, so it tracks the measured working
+ * set with headroom rather than a worst case. */
+#define KAI_IMMORTAL_VAR_BUCKETS 4096
 #define KAI_IMMORTAL_VAR_MAXN 4
 #define KAI_IMMORTAL_VAR_PROBE 16
 typedef struct {
