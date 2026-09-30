@@ -84,6 +84,18 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.128.1 (2026-09-30)
+
+### Fixed
+
+- **lint**: lint a package with an entry as one unit (#2330)
+- **emit**: resolve functions by identity instead of by name (#2328)
+
+### Changed
+
+- **runtime**: size the immortal-variant intern table to its working set (#2326)
+- **resolve**: index the scope chain's outermost scope (#2323)
+
 ## v0.128.0 (2026-09-29)
 
 ### BREAKING CHANGE
