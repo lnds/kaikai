@@ -58,8 +58,14 @@ need '^kperform spoken Loud\.say#[0-9]+ Loud@main$'
 # annotation is a `TyCon` naming the effect, so the op dispatched against
 # that binder's evidence node must name the declaration the others do.
 need '^kperform through_cap Loud\.say#l#[0-9]+ Loud@main$'
-[ "$(printf '%s\n' "$out" | grep -E '^kperform (spoken|through_cap) Loud\.say' | sed -E 's/.*#([0-9-]+) .*/\1/' | sort -u | wc -l | tr -d ' ')" = 1 ] \
-  || fail "the capability-dispatched perform carries a different id than the written ones"
+# A named instance used inside its handle body dispatches against that
+# handle's evidence node and names the effect its head resolved to.
+need '^kperform named Loud\.say#n#[0-9]+ Loud@main$'
+
+# Every way of writing the op names one declaration: on the row alias, on
+# the effect, through a capability parameter, and through a named instance.
+[ "$(printf '%s\n' "$out" | grep -E '^kperform (spoken|through_cap|named) Loud\.say' | sed -E 's/.*#([0-9-]+) .*/\1/' | sort -u | wc -l | tr -d ' ')" = 1 ] \
+  || fail "the four ways of writing Loud.say do not all carry one id"
 
 # A root call reaches the root declaration even when a core homonym
 # exists, and a name the root does not declare still reaches the core.
@@ -103,4 +109,4 @@ direct=$(printf '%s\n' "$kir" | awk '/^fn pkg__direct\(/{on=1} on{print} on&&/^}
 printf '%s\n' "$direct" | grep -q 'int.unbox' \
   && { out=$direct; fail "pkg.direct re-unboxes its own callee's result"; }
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, an op written on a row alias or dispatched through a capability carries its effect's id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, and a callee's signature class is its own declaration's"
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, and a callee's signature class is its own declaration's"

@@ -7801,7 +7801,10 @@ type EffUse = EU(String, Int, Int)
 # prologue's `kai_alias_<a>_id` C local is not in scope across
 # the lambda boundary, so tagged dispatch would emit invalid C.
 #[doc("infer: an effect-alias binding (alias name, effect name, taggable).")]
-pub type AliasBinding = AB(String, String, Bool)   # alias_name, eff_name, taggable
+# alias_name, eff_name, taggable, and the declaration the `handle` head
+# resolved to: an op dispatched through the alias names that effect, so it
+# must carry the same identity a written head does.
+pub type AliasBinding = AB(String, String, Bool, SymId)
 
 # `TyRes` is the narrow result returned by pure type operations that
 # don't consume or produce an expression (fresh var, instantiate a
@@ -8147,11 +8150,11 @@ fn st_set_row(st: InferState, new_row: [Label]) : InferState =
 # non-taggable so try_op_call's alias-fallback emits a bare
 # dispatch key (no `@<alias>` suffix) and codegen falls back to
 # the legacy name-keyed lookup.
-fn st_push_alias(st: InferState, alias: String, eff: String) : InferState =
+fn st_push_alias(st: InferState, alias: String, eff: String, esym: SymId) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses,
-               aliases: [AB(alias, eff, true), ...st.aliases],
+               aliases: [AB(alias, eff, true, esym), ...st.aliases],
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
                ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, home: st.home }
 
@@ -8244,10 +8247,18 @@ fn st_push_op_payload_vars(st: InferState, eff: String, ids: [Int]) : InferState
 pub fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
   match aliases {
     [] -> None
-    [AB(alias, eff, _), ...rest] ->
+    [AB(alias, eff, _, _), ...rest] ->
       if alias == name { Some(eff) } else { lookup_alias(rest, name) }
   }
 }
+
+#[doc("The declaration the `handle` head bound to `name` resolved to, or `sym_none()` when `name` is no alias in scope.")]
+pub fn lookup_alias_sym(aliases: [AliasBinding], name: String) : SymId =
+  match aliases {
+    [] -> sym_none()
+    [AB(alias, _, _, s), ...rest] ->
+      if alias == name { s } else { lookup_alias_sym(rest, name) }
+  }
 
 # variant of lookup_alias that also returns the binding's
 # taggability flag. Used by try_op_call's alias-fallback to decide
@@ -8255,7 +8266,7 @@ pub fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
 fn lookup_alias_taggable(aliases: [AliasBinding], name: String) : Option[Bool] {
   match aliases {
     [] -> None
-    [AB(alias, _, t), ...rest] ->
+    [AB(alias, _, t, _), ...rest] ->
       if alias == name { Some(t) } else { lookup_alias_taggable(rest, name) }
   }
 }
@@ -8266,7 +8277,7 @@ fn lookup_alias_taggable(aliases: [AliasBinding], name: String) : Option[Bool] {
 fn aliases_disable_tag(aliases: [AliasBinding]) : [AliasBinding] {
   match aliases {
     [] -> []
-    [AB(a, e, _), ...rest] -> [AB(a, e, false), ...aliases_disable_tag(rest)]
+    [AB(a, e, _, s), ...rest] -> [AB(a, e, false, s), ...aliases_disable_tag(rest)]
   }
 }
 
@@ -9358,7 +9369,7 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       }
       # alias rebinds the capability inside the body.
       let st_aliased = match alias_opt {
-        Some(a) -> st_push_alias(init_typed_st.st, a, eff_name)
+        Some(a) -> st_push_alias(init_typed_st.st, a, eff_name, hsym)
         None    -> init_typed_st.st
       }
       # when a stateful handler omits the explicit `[T]`
@@ -10843,8 +10854,15 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
                   # `taggable`: the codegen dispatch tag is suppressed
                   # inside a lambda, but row identity must hold there too
                   # (the `while` thunks are lambdas).
+                  # A cell keeps its by-id dispatch, so its callee stays
+                  # unstamped; a user effect's named instance names the
+                  # declaration the `handle` head resolved to.
+                  let asym = if eff_is_cell_effect(eff) { sym_none() }
+                             else { lookup_alias_sym(st.aliases, name) }
                   match ty_env_lookup(st.env, lookup_key) {
-                    Some(sc) -> Some(record_op_res(synth_op_call_with_scheme_keys(st, sc, args_, lookup_key, dispatch_key, Some(name), line, col), lookup_key, Some(name), taggable, line, col))
+                    Some(sc) -> Some(op_callee_carries(
+                                       record_op_res(synth_op_call_with_scheme_keys(st, sc, args_, lookup_key, dispatch_key, Some(name), line, col), lookup_key, Some(name), taggable, line, col),
+                                       asym))
                     None ->
                       if is_effect_in_env(st.env, eff) {
                         Some(synth_op_call_unknown_op(st, eff, real_op, line, col))
