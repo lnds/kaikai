@@ -51,6 +51,7 @@
 import compiler.util
 import compiler.diag
 import compiler.ast
+import compiler.effect_alias_scope
 import compiler.diag_file
 import compiler.refinements
 import compiler.native_prims
@@ -81,6 +82,12 @@ pub type Env = { chain: ScopeChain, had_error: Bool, file: String,
               # a use of `X` as a value is the one-member-sum mistake
               # and earns a targeted help line.
               alias_heads: [String],
+              # A row alias (`type Console = Stdout + Stderr + Stdin`) is
+              # an `NCType`, so an op call written on it has no effect
+              # declaration to stamp. These settle it to the component
+              # that declares the op (`effect_alias_scope`).
+              row_aliases: [RowAlias],
+              eff_ops: [EffOps],
               # Structured diagnostic collection for T3
               # (`cannot find <name> in this scope`). Mirrors
               # `InferState.diags` semantics (reverse order, flipped at
@@ -92,10 +99,11 @@ pub type Env = { chain: ScopeChain, had_error: Bool, file: String,
 
 #[doc("Fresh resolver env for `file` with a single empty scope and no errors.")]
 pub fn env_new(file: String) : Env =
-  Env { chain: ch_new(), had_error: false, file: file, alias_heads: [], diags: [], rs: rs_off() }
+  Env { chain: ch_new(), had_error: false, file: file, alias_heads: [],
+        row_aliases: [], eff_ops: [], diags: [], rs: rs_off() }
 
 fn env_with_chain(e: Env, c: ScopeChain) : Env =
-  Env { chain: c, had_error: e.had_error, file: e.file, alias_heads: e.alias_heads, diags: e.diags, rs: e.rs }
+  Env { ...e, chain: c }
 
 fn env_push(e: Env) : Env = env_with_chain(e, ch_push(e.chain))
 
@@ -156,17 +164,15 @@ fn env_shadowed(e: Env, name: String) : Bool = ch_shadows(e.chain, name)
 fn env_all_names(e: Env) : [String] = ch_names(e.chain)
 
 fn env_note_alias_head(e: Env, head: String) : Env =
-  Env { chain: e.chain, had_error: e.had_error, file: e.file,
-        alias_heads: [head, ...e.alias_heads], diags: e.diags, rs: e.rs }
+  Env { ...e, alias_heads: [head, ...e.alias_heads] }
 
 fn env_mark_err(e: Env) : Env =
-  Env { chain: e.chain, had_error: true, file: e.file, alias_heads: e.alias_heads, diags: e.diags, rs: e.rs }
+  Env { ...e, had_error: true }
 
 # Push a Diagnostic onto the Env accumulator. Used by the T3 emit
 # site in parallel with its existing `diag_error` call.
 fn env_push_diag(e: Env, d: Diagnostic) : Env =
-  Env { chain: e.chain, had_error: e.had_error, file: e.file,
-        alias_heads: e.alias_heads, diags: [d, ...e.diags], rs: e.rs }
+  Env { ...e, diags: [d, ...e.diags] }
 
 fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env / Console + File {
 
@@ -396,7 +402,7 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
       }
     }
     EField(base, fname) -> match chk_expr(e, base) {
-      RExpr(e1, b1) -> RKind(e1, EField(chk_op_base(e1, b1), fname))
+      RExpr(e1, b1) -> RKind(e1, EField(chk_op_base(e1, b1, fname), fname))
     }
     EIndex(base, idx) -> match chk_expr(e, base) {
       RExpr(e1, b1) -> match chk_expr(e1, idx) {
@@ -565,12 +571,35 @@ fn chk_handle_sym(e: Env, en: String) : SymId =
 # The effect heading an op call `Eff.op` is settled the way a handler
 # head is. A name the value lookup left bare is not a value, and a local
 # binder of that name keeps it.
-fn chk_op_base(e: Env, b: Expr) : Expr = match b.kind {
+fn chk_op_base(e: Env, b: Expr, op: String) : Expr = match b.kind {
   EVar(n) -> if env_shadowed(e, n) { b } else {
-    let s = chk_handle_sym(e, n)
-    if sym_raw(s) >= 0 { Expr { kind: ESym(s, spec_none(), n), line: b.line, col: b.col, ty: b.ty, mode: b.mode } } else { b }
+    let h = chk_op_head(e, n, op)
+    match h {
+      None -> b
+      Some(OpHead(s, eff)) -> Expr { kind: ESym(s, spec_none(), eff), line: b.line,
+                                 col: b.col, ty: b.ty, mode: b.mode }
+    }
   }
   _ -> b
+}
+
+# The identity of a stamped op head, with the effect name that id belongs
+# to: written on a row alias the two differ, and the atomic component's
+# name is what the row label and the evidence key must carry.
+type HeadSym = OpHead(SymId, String)
+
+fn chk_op_head(e: Env, head: String, op: String) : Option[HeadSym] = {
+  let direct = chk_handle_sym(e, head)
+  if sym_raw(direct) >= 0 { Some(OpHead(direct, head)) }
+  else {
+    match alias_op_owner(e.eff_ops, alias_components(e.row_aliases, head, 0), op) {
+      None      -> None
+      Some(eff) -> {
+        let s = chk_handle_sym(e, eff)
+        if sym_raw(s) >= 0 { Some(OpHead(s, eff)) } else { None }
+      }
+    }
+  }
 }
 
 fn chk_handle(e: Env, x: Expr, body: Expr, en: String, ta: [TypeExpr],
@@ -934,6 +963,9 @@ fn register_one(e: Env, d: Decl) : Env {
           TyName(head, []) -> env_note_alias_head(e1, head)
           _ -> e1
         }
+        TBEffectAlias(labels) ->
+          if list_is_empty(labels) { e1 }
+          else { Env { ...e1, row_aliases: [RA(name, labels), ...e1.row_aliases] } }
         _ -> e1
       }
     }
@@ -941,7 +973,10 @@ fn register_one(e: Env, d: Decl) : Env {
     DBench(_, _, _, _, _) -> e
     DCheck(_, _, _, _, _, _) -> e
     DImport(ik, _, _) -> register_import(e, ik)
-    DEffect(_, name, _, _, _, _, _, _, _) -> env_add(e, name, NCEffect)
+    DEffect(_, name, _, ops, _, _, _, _, _) -> {
+      let e1 = env_add(e, name, NCEffect)
+      Env { ...e1, eff_ops: [EO(name, eff_op_names(ops, [])), ...e1.eff_ops] }
+    }
     # stripped pre-resolve; never reaches register_one in practice.
     # No-op for completeness so the match stays exhaustive.
     DProtocol(_, _, _, _, _, _, _, _) -> e
@@ -1067,7 +1102,7 @@ pub fn rds_env(r: RDecls) : Env = match r { RDecls(e, _) -> e }
 fn rds_decls(r: RDecls) : [Decl] = match r { RDecls(_, ds) -> ds }
 
 fn env_with_rs(e: Env, rs: ResState) : Env =
-  Env { chain: e.chain, had_error: e.had_error, file: e.file, alias_heads: e.alias_heads, diags: e.diags, rs: rs }
+  Env { ...e, rs: rs }
 
 
 # The env's file follows the decl being walked, so an error inside an
@@ -1088,7 +1123,7 @@ fn chk_files_loop(e: Env, ds: [Decl], df: DiagFiles, target: String,
 }
 
 fn env_with_file(e: Env, file: String) : Env =
-  Env { chain: e.chain, had_error: e.had_error, file: file, alias_heads: e.alias_heads, diags: e.diags, rs: e.rs }
+  Env { ...e, file: file }
 
 # Arity table built from every DEffect in the program. Effects are
 # declared in stdlib source and loaded before this runs, so every

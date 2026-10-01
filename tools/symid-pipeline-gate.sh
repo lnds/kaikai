@@ -39,6 +39,21 @@ id_of() {
 [ "$(id_of '^perceus send Sink\.put#')" = "$(id_of '^kperform sink__send Sink\.put#')" ] \
   || fail "KPerform carries a different effect id than Perceus read"
 
+# An op written on a row alias carries the identity of the component that
+# declares it, same as one written on the effect directly. The alias is an
+# `NCType` and declares no ops, so settling it is the resolver's job: a
+# miss leaves the perform with `sym_none()` while the program still runs,
+# which only an id dump catches.
+ALIASFIX="$ROOT/examples/effects/perform_through_row_alias"
+out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
+        --path "$ALIASFIX" --path "$ROOT/stdlib" "$ALIASFIX/main.kai")
+
+need '^kperform spoken Loud\.say#[0-9]+ Loud@main$'
+[ "$(printf '%s\n' "$out" | grep -cE '^kperform spoken Loud\.say#[0-9]+ Loud@main$')" = 2 ] \
+  || fail "the alias-written and directly written performs do not both carry Loud's id"
+[ "$(printf '%s\n' "$out" | grep -E '^kperform spoken ' | sed -E 's/.*#([0-9-]+) .*/\1/' | sort -u | wc -l | tr -d ' ')" = 1 ] \
+  || fail "the two performs of Loud.say carry different ids"
+
 # A root call reaches the root declaration even when a core homonym
 # exists, and a name the root does not declare still reaches the core.
 ROOTFIX="$ROOT/examples/namespace-collisions/root_fn_shadows_core_fn"
@@ -81,4 +96,4 @@ direct=$(printf '%s\n' "$kir" | awk '/^fn pkg__direct\(/{on=1} on{print} on&&/^}
 printf '%s\n' "$direct" | grep -q 'int.unbox' \
   && { out=$direct; fail "pkg.direct re-unboxes its own callee's result"; }
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, root calls reach root declarations, each specialisation is its generic's id plus its own instance, and a callee's signature class is its own declaration's"
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, an op written on a row alias carries its component's id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, and a callee's signature class is its own declaration's"
