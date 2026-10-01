@@ -67,6 +67,28 @@ need '^kperform named Loud\.say#n#[0-9]+ Loud@main$'
 [ "$(printf '%s\n' "$out" | grep -E '^kperform (spoken|through_cap|named) Loud\.say' | sed -E 's/.*#([0-9-]+) .*/\1/' | sort -u | wc -l | tr -d ' ')" = 1 ] \
   || fail "the four ways of writing Loud.say do not all carry one id"
 
+# A declaration keeps its identity through the typer's cache. A cached module
+# is stored without its declaration-level ids (they index one build's table),
+# so a warm build would reach the late passes with `#-1` on every function,
+# type, effect and protocol while a cold build reaches them stamped — and both
+# still run. Same invocation twice over one cache dir: the second is warm.
+CACHE="$(mktemp -d)"
+trap 'rm -rf "$CACHE"' EXIT
+own_lines() {
+  "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --user-cache --user-cache-dir "$CACHE" \
+    --core-cache-dir "$CACHE" --dump-symids \
+    --path "$ALIASFIX" --path "$ROOT/stdlib" "$ALIASFIX/main.kai" | grep -E '^own '
+}
+cold=$(own_lines)
+warm=$(own_lines)
+out=$(printf 'cold:\n%s\nwarm:\n%s\n' "$cold" "$warm")
+need '^cold:$'
+printf '%s\n' "$cold" | grep -qE '^own effect Loud#[0-9]+ Loud@main$' \
+  || fail "a cold build lost an effect declaration's id"
+printf '%s\n' "$warm" | grep -q '#-1' \
+  && fail "a warm build reaches the late passes with a declaration stripped of its id"
+[ "$cold" = "$warm" ] || fail "a warm build's declaration ids differ from a cold build's"
+
 # A root call reaches the root declaration even when a core homonym
 # exists, and a name the root does not declare still reaches the core.
 ROOTFIX="$ROOT/examples/namespace-collisions/root_fn_shadows_core_fn"
@@ -109,4 +131,4 @@ direct=$(printf '%s\n' "$kir" | awk '/^fn pkg__direct\(/{on=1} on{print} on&&/^}
 printf '%s\n' "$direct" | grep -q 'int.unbox' \
   && { out=$direct; fail "pkg.direct re-unboxes its own callee's result"; }
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, and a callee's signature class is its own declaration's"
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, declarations keep their ids through a warm cache, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, and a callee's signature class is its own declaration's"
