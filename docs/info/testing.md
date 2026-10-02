@@ -20,6 +20,7 @@ matcher DSL — `assert x == 42` is enough. `assert` belongs inside
 kai test [<spec>|./...]            # run tests
 kai test --json [<spec>|./...]     # machine-readable results
 kai test --only <id> [<spec>|./...]  # run named blocks (repeatable)
+kai test -j <n> [<spec>|./...]     # build up to n test binaries at once
 kai bench [<spec>] [--iters N]     # run benchmarks
 kai check [<spec>]                 # run property blocks
 ```
@@ -121,6 +122,12 @@ find them: `kai test`, `kai test .` and each package `./...` visits
 run the suite, and only the entry binary is skipped. `kai build` and
 `kai run` still require an entry, having nothing to build without
 one.
+
+`kai test` builds these binaries in parallel — one per CPU by
+default, `-j <n>` (`--jobs <n>`) to bound it, `-j 1` to build each
+in its turn — and runs them one at a time, in order. Each file's
+build output prints right before its results, so the output and the
+exit status are the same at any job count.
 
 A file outside the import graph that declares blocks but is not
 named `*_test.kai` cannot safely run as a root, so the driver warns,

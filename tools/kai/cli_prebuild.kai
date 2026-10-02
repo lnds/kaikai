@@ -1,0 +1,174 @@
+#[doc("""
+Runner builds ahead of their runs: up to `jobs` child `kai test`
+compiles in flight, each in its own scratch with its output captured.
+The runs stay serial and in order, each after its build's replayed
+output, so the run reads as if every build happened in its turn.
+""")]
+
+import os.env
+import cli_blocks
+import cli_compile
+import cli_fs
+import cli_plan
+import cli_proc
+import cli_sys
+import cli_toolchain
+
+#[doc("The variable naming the binary a child `kai test` builds from its one file instead of running it.")]
+pub const BUILD_ONLY : String = "KAI_TEST_BUILD_ONLY"
+
+type Ctx = { t: Toolchain, b: Backend, pass: Pass, jobs: Int, tmp: String }
+
+# A started child build: its handle and the stem of its captured stdout/stderr.
+type Slot = { pid: Int, log: String }
+
+# The backend a child builds with. Children wait for one build in place: it settles
+# the backend's degradation and the package's first-use setup (kai-pkg, the lock,
+# `[native]` objects), which concurrent first builds would race on.
+fn ahead_backend(b: Backend, warmed: Bool) : Option[String] / Ffi =
+  if not warmed {
+    None
+  } else if cli_sys.no_llvm() {
+    Some("c")
+  } else {
+    Some(b.name)
+  }
+
+fn start(c: Ctx, backend: String, r: Runner) : Slot / Ffi {
+  let log = "#{r.out}.build"
+  let argv =
+    ["#{c.t.layout.root}/bin/kai", "test", "--backend", backend, ...c.pass.extra, "--", r.src]
+  let sp =
+    cli_proc.Spawn {
+      ...cli_proc.inherit(),
+      out: "#{log}.out",
+      err: "#{log}.err",
+      set: [(BUILD_ONLY, r.out)]
+    }
+  Slot { pid: cli_proc.start(argv, sp), log }
+}
+
+# Start the next runners until `c.jobs` builds are in flight.
+fn fill(c: Ctx, backend: String, upcoming: [Runner], slots: [Slot]) : ([Runner], [Slot]) / Ffi =
+  match upcoming {
+    [r, ...rest] if list.length(slots) < c.jobs ->
+      fill(c, backend, rest, slots ++ [start(c, backend, r)])
+    _ -> (upcoming, slots)
+  }
+
+fn finish(s: Slot) : Int / Ffi = if s.pid < 0 { 127 } else { cli_sys.wait(s.pid) }
+
+fn drain(slots: [Slot]) : Unit / Ffi = slots
+  |> foreach(s => {
+    let _ = finish(s)
+  })
+
+# The build a runner's turn waits on, its output replayed: its status.
+fn built(s: Slot) : Int / Ffi {
+  let rc = finish(s)
+  if cli_sys.size("#{s.log}.out") > 0 { cli_sys.copy_to_stdout("#{s.log}.out") }
+  cli_plan.replay("#{s.log}.err")
+  rc
+}
+
+# One runner's turn: built ahead when a child holds it, else in place.
+fn turn(
+  c: Ctx,
+  r: Runner,
+  slots: [Slot],
+  status: Int
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  if r.header != "" { Stderr.eprint(r.header) }
+  match slots {
+    [s, ...rest] -> {
+      let rc = built(s)
+      if rc != 0 {
+        drain(rest)
+        Err(rc)
+      } else {
+        Ok(cli_blocks.ran(r.src, r.out, c.tmp, status))
+      }
+    }
+    [] -> {
+      cli_compile.compile(c.t, c.b, cli_blocks.runner_job(c.pass, r, c.tmp))!
+      Ok(cli_blocks.ran(r.src, r.out, c.tmp, status))
+    }
+  }
+}
+
+fn steps_loop(
+  c: Ctx,
+  steps: [Step],
+  upcoming: [Runner],
+  slots: [Slot],
+  status: Int,
+  warmed: Bool
+) : Result[Int, Int] / Stderr + Env + File + Ffi =
+  match steps {
+    [] -> Ok(status)
+    [Warn(msg), ...rest] -> {
+      Stderr.eprint(msg)
+      steps_loop(c, rest, upcoming, slots, status, warmed)
+    }
+    [Build(r), ...rest] -> if cli_sys.pending_signal() != 0 {
+      drain(slots)
+      Ok(status)
+    } else {
+      let next = match ahead_backend(c.b, warmed) {
+        Some(name) -> fill(c, name, upcoming, slots)
+        None -> (upcoming, slots)
+      }
+      let ahead = match next.snd {
+        [] -> list.drop(next.fst, 1)
+        _ -> next.fst
+      }
+      let st = turn(c, r, next.snd, status)!
+      steps_loop(c, rest, ahead, list.drop(next.snd, 1), st, true)
+    }
+  }
+
+fn runners(steps: [Step]) : [Runner] =
+  steps
+    || (s => match s {
+      Build(r) -> [r]
+      Warn(_) -> []
+    })
+
+#[doc("""
+Take `steps` in order with up to `jobs` runner builds in flight; one job
+builds each in place. `warmed` says a build already ran in place;
+until one has, the first runner builds in place.
+""")]
+pub fn run(
+  t: Toolchain,
+  b: Backend,
+  pass: Pass,
+  jobs: Int,
+  steps: [Step],
+  status: Int,
+  tmp: String,
+  warmed: Bool
+) : Result[Int, Int] / Stderr + Env + File + Ffi =
+  if jobs <= 1 {
+    cli_blocks.run_steps(t, b, pass, steps, status, tmp)
+  } else {
+    cli_toolchain.ensure_built(t)!
+    steps_loop(Ctx { t, b, pass, jobs, tmp }, steps, runners(steps), [], status, warmed)
+  }
+
+#[doc("A child's side: build runner `src` into `out` with the parent run's `--backend` and kaic2 flags; nothing runs.")]
+pub fn build_only(
+  t: Toolchain,
+  backend: String,
+  extra: [String],
+  src: String,
+  out: String
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let _ = env.unset(BUILD_ONLY)
+  let b = cli_compile.resolve_backend(backend)!
+  let pass = cli_blocks.Pass { kind: "test", flag: "--test", extra }
+  let r = cli_blocks.Runner { src, out, header: "" }
+  cli_fs.with_scratch(
+    tmp => cli_compile.compile(t, b, cli_blocks.runner_job(pass, r, tmp)).map(u => 0)
+  )
+}

@@ -158,31 +158,23 @@ pub fn run_binary(file: String, bin: String, tmp: String) : Int / Env + File + F
 #[doc("One discovery pass: what kind of block, the flag that compiles it, and the kaic2 flags forwarded after it.")]
 pub type Pass = { kind: String, flag: String, extra: [String] }
 
-fn runner(t: Toolchain, b: Backend, root: String, rel: String, pass: Pass, tmp: String) : Result[
-  Int,
-  Int
-] / Stderr + Env + File + Ffi {
-  if cli_caches.env_or("KAI_TEST_JSON", "") == "" { Stderr.eprint("== kai #{pass.kind} #{rel}") }
-  let stem = string.drop_suffix(rel, ".kai").unwrap_or(rel)
-  let bin = "#{tmp}/#{string.replace(stem, "/", "_")}-r"
-  let job = cli_plan.Job {
-    src: "#{root}/#{rel}",
-    tmp,
-    out: bin,
-    verb: pass.kind,
-    extra: [pass.flag, ...pass.extra]
-  }
-  cli_compile.compile(t, b, job)!
-  Ok(run_binary("#{root}/#{rel}", bin, tmp))
-}
+#[doc("A runner binary to build from `src` into `out` and run, announced by `header` (empty: silently).")]
+pub type Runner = { src: String, out: String, header: String }
 
-#[doc("Fold `step` over `files` from `status`, stopping early once an interrupt is pending.")]
-pub fn fold_files[e](
-  files: [String],
+#[doc("One step of a pass, in run order: build and run a runner, or print a warning.")]
+pub type Step = Build(Runner) | Warn(String)
+
+#[doc("The kaic2 job that builds runner `r` for `pass`, with `tmp` as its scratch dir.")]
+pub fn runner_job(pass: Pass, r: Runner, tmp: String) : Job =
+  cli_plan.Job { src: r.src, tmp, out: r.out, verb: pass.kind, extra: [pass.flag, ...pass.extra] }
+
+#[doc("Fold `step` over `items` from `status`, stopping early once an interrupt is pending.")]
+pub fn fold_files[a, e](
+  items: [a],
   status: Int,
-  step: (String, Int) -> Result[Int, Int] / e
+  step: (a, Int) -> Result[Int, Int] / e
 ) : Result[Int, Int] / Ffi + e =
-  match files {
+  match items {
     [] -> Ok(status)
     _ if cli_sys.pending_signal() != 0 -> Ok(status)
     [f, ...rest] -> {
@@ -191,43 +183,76 @@ pub fn fold_files[e](
     }
   }
 
-fn discovered(
+#[doc("Run binary `bin` built from `src`: its status when it failed, else `status`.")]
+pub fn ran(src: String, bin: String, tmp: String, status: Int) : Int / Env + File + Ffi {
+  let rc = run_binary(src, bin, tmp)
+  if rc != 0 { rc } else { status }
+}
+
+fn take_step(t: Toolchain, b: Backend, pass: Pass, tmp: String, s: Step, status: Int) : Result[
+  Int,
+  Int
+] / Stderr + Env + File + Ffi =
+  match s {
+    Warn(msg) -> {
+      Stderr.eprint(msg)
+      Ok(status)
+    }
+    Build(r) -> {
+      if r.header != "" { Stderr.eprint(r.header) }
+      cli_compile.compile(t, b, runner_job(pass, r, tmp))!
+      Ok(ran(r.src, r.out, tmp, status))
+    }
+  }
+
+#[doc("Take `steps` in order, building each runner in place: the last failing status, else `status`.")]
+pub fn run_steps(
   t: Toolchain,
   b: Backend,
+  pass: Pass,
+  steps: [Step],
+  status: Int,
+  tmp: String
+) : Result[Int, Int] / Stderr + Env + File + Ffi =
+  fold_files(steps, status, (s, st) => take_step(t, b, pass, tmp, s, st))
+
+fn announce(pass: Pass, rel: String) : String / Env =
+  if cli_caches.env_or("KAI_TEST_JSON", "") == "" { "== kai #{pass.kind} #{rel}" } else { "" }
+
+fn discovered(
   root: String,
   reach: [String],
   pass: Pass,
   tmp: String,
-  rel: String,
-  status: Int
-) : Result[Int, Int] / Stderr + Env + File + Ffi =
+  rel: String
+) : [Step] / Env + File + Ffi =
   if reach.contains(rel) or (not declares("#{root}/#{rel}", pass.kind)) {
-    Ok(status)
+    []
   } else if string.ends_with(rel, "_test.kai") {
-    let rc = runner(t, b, root, rel, pass, tmp)!
-    Ok(if rc != 0 { rc } else { status })
+    let stem = string.drop_suffix(rel, ".kai").unwrap_or(rel)
+    let out = "#{tmp}/#{string.replace(stem, "/", "_")}-r"
+    [Build(Runner { src: "#{root}/#{rel}", out, header: announce(pass, rel) })]
   } else {
-    Stderr.eprint(
-      "kai: warning: #{rel} declares #{pass.kind} blocks but is not reachable from the entry point; rename it to *_test.kai (or move it under tests/) so package #{pass.kind} runs include it"
-    )
-    Ok(status)
+    [
+      Warn(
+        "kai: warning: #{rel} declares #{pass.kind} blocks but is not reachable from the entry point; rename it to *_test.kai (or move it under tests/) so package #{pass.kind} runs include it"
+      )
+    ]
   }
 
 #[doc("""
-Run every unreachable `*_test.kai` of package `root` holding `pass.kind`
-blocks; `src` is the entry (empty for a library). Warns when no file of
-the package declares such blocks (`found` covers the entry side). Returns
-the last failing status, else `status`.
+The steps for every unreachable `*_test.kai` of package `root` holding
+`pass.kind` blocks, binaries under `tmp`; `src` is the entry (empty for
+a library). Ends with a warning when no file of the package declares
+such blocks (`found` covers the entry side).
 """)]
-pub fn run_package(
-  t: Toolchain,
-  b: Backend,
+pub fn package_steps(
   root: String,
   src: String,
   pass: Pass,
-  status: Int,
-  found: Bool
-) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  found: Bool,
+  tmp: String
+) : [Step] / Env + File + Ffi {
   let root_abs = cli_fs.absolute(root)
   let reach = if src == "" {
     []
@@ -237,10 +262,27 @@ pub fn run_package(
   }
   let files = source_files(root_abs)
   let any = found or (files |> list.any(rel => declares("#{root_abs}/#{rel}", pass.kind)))
+  let steps = files || (rel => discovered(root_abs, reach, pass, tmp, rel))
+  if any {
+    steps
+  } else {
+    steps ++ [Warn("kai: warning: no #{pass.kind} blocks found in this package")]
+  }
+}
+
+#[doc("Run every unreachable `*_test.kai` of package `root` holding `pass.kind` blocks (see `package_steps`): the last failing status, else `status`.")]
+pub fn run_package(
+  t: Toolchain,
+  b: Backend,
+  root: String,
+  src: String,
+  pass: Pass,
+  status: Int,
+  found: Bool
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
   let tmp = cli_fs.scratch_dir()
-  let r = fold_files(files, status, (rel, st) => discovered(t, b, root_abs, reach, pass, tmp, rel, st))
+  let r = run_steps(t, b, pass, package_steps(root, src, pass, found, tmp), status, tmp)
   let _ = cli_sys.remove_tree(tmp)
-  if not any { Stderr.eprint("kai: warning: no #{pass.kind} blocks found in this package") }
   r
 }
 
