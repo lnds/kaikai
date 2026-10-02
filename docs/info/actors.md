@@ -64,6 +64,60 @@ spawn/install surface:
 `Monitor` lets one actor observe another's lifecycle. See
 `docs/actors.md` for the full surface.
 
+## Testing: the mailbox is a handler
+
+`Actor[Msg]` is an effect and `with_mailbox` is an ordinary handler,
+so a test can install its own and answer every receive from a
+script — including letting a deadline expire with no time passing.
+The test below runs instantly against a 5-second `receive_timeout`:
+
+```kaikai
+import actor
+import time
+
+type Msg = Tick(Int) | Done
+
+fn gather(seen: [String]) : [String] / Actor[Msg] =
+  match receive_timeout(seconds(5)) {
+    None          -> seen ++ ["timeout"]
+    Some(Tick(n)) -> gather(seen ++ ["tick #{n}"])
+    Some(Done)    -> seen ++ ["done"]
+  }
+
+fn replay(script: [Option[Msg]]) : [String] =
+  handle {
+    gather([])
+  } with Actor[Msg](script) {
+    receive_timeout(ns, resume) -> match state {
+      []              -> resume(Some(Done), [])
+      [next, ...rest] -> resume(next, rest)
+    }
+    receive(resume)        -> panic("receive is not scripted")
+    send(pid, msg, resume) -> resume((), state)
+    self(resume)           -> panic("a scripted mailbox has no Pid")
+    return(x)              -> x
+  }
+
+test "a deadline expires with no time passing" {
+  assert replay([Some(Tick(1)), Some(Tick(2)), None]) == ["tick 1", "tick 2", "timeout"]
+  assert replay([Some(Tick(7))]) == ["tick 7", "done"]
+}
+
+fn main() : Int = 0
+```
+
+The handler needs a clause for each of the four ops, even the ones
+the code under test never calls. `receive`, `receive_timeout` and
+`send` can be scripted; `self` cannot — user code has no way to build
+a `Pid[Msg]`, and `Actor.self()` inside the clause has no handler to
+reach. Code that calls `Actor.self()` cannot be driven by a scripted
+mailbox.
+
+The handler does not reach into `spawn_actor`: the spawned fiber gets
+its own real mailbox, and the compiler does not warn. Run the actor's
+body function (`gather` above) directly under the scripted handler
+instead of spawning it.
+
 ## Parallelism
 
 Actors run in parallel across OS threads by default — as many as the
