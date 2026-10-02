@@ -12,8 +12,9 @@ These properties are what stands in for a downstream regression:
    bucket lookup returns exactly what a linear walk over the columns
    returns. A hash that dropped an entry would silently resolve a name
    to `None`.
-4. **Ids are dense and stream-ordered.** Every id in `0 .. count - 1`
-   reads back the entry that occupied that position.
+4. **An id is a function of its entry.** The stream reversed, with an
+   unrelated entry added, gives every entry the id it had, and a repeated
+   entry is one symbol.
 5. **A module is a symbol, and an owner is its id.** Every declaration
    is owned by the module symbol spelling its home; a module is owned by
    nothing. Two homonymous declarations report two owner ids.
@@ -98,48 +99,75 @@ fn stt_is_none(o: Option[SymId]) : Bool = match o {
   Some(_) -> false
 }
 
-# The index must answer what a walk over the columns answers, for every
+# The index must answer what a walk over every row answers, for every
 # name the table holds.
-fn stt_index_matches_scan(t: SymTab, i: Int) : Bool =
-  if i >= st_count(t) { true }
-  else {
-    let name = sym_name(t, SymId(i))
-    if stt_ids_eq(st_by_name(t, name), stt_scan(t, name, 0, [])) {
-      stt_index_matches_scan(t, i + 1)
-    } else { false }
-  }
+fn stt_index_matches_scan(t: SymTab) : Bool = stt_index_each(t, st_ids(t))
 
-fn stt_scan(t: SymTab, name: String, i: Int, acc: [Int]) : [Int] =
-  if i >= st_count(t) { list_reverse(acc) }
-  else if sym_name(t, SymId(i)) == name { stt_scan(t, name, i + 1, [i, ...acc]) }
-  else { stt_scan(t, name, i + 1, acc) }
-
-fn stt_ids_eq(xs: [SymId], ys: [Int]) : Bool = match xs {
-  [] -> match ys { [] -> true  _ -> false }
-  [x, ...xr] -> match ys {
-    []         -> false
-    [y, ...yr] -> if sym_raw(x) == y { stt_ids_eq(xr, yr) } else { false }
+fn stt_index_each(t: SymTab, ids: [SymId]) : Bool = match ids {
+  [] -> true
+  [s, ...rest] -> {
+    let name = sym_name(t, s)
+    let scan = stt_scan(t, name, st_ids(t), [])
+    stt_same_set(st_by_name(t, name), scan) and stt_index_each(t, rest)
   }
 }
 
-fn stt_dense(t: SymTab, es: [NEnt], i: Int) : Bool = match es {
-  [] -> i == st_count(t)
-  [e, ...rest] ->
-    if stt_row_matches(t, SymId(i), e) { stt_dense(t, rest, i + 1) } else { false }
+fn stt_scan(t: SymTab, name: String, ids: [SymId], acc: [SymId]) : [SymId] = match ids {
+  [] -> acc
+  [s, ...rest] -> stt_scan(t, name, rest, if sym_name(t, s) == name { [s, ...acc] } else { acc })
+}
+
+fn stt_same_set(xs: [SymId], ys: [SymId]) : Bool =
+  list_length(xs) == list_length(ys) and stt_all_in(xs, ys)
+
+fn stt_all_in(xs: [SymId], ys: [SymId]) : Bool = match xs {
+  [] -> true
+  [x, ...rest] -> stt_has(ys, x) and stt_all_in(rest, ys)
+}
+
+fn stt_has(ys: [SymId], x: SymId) : Bool = match ys {
+  [] -> false
+  [y, ...rest] -> sym_raw(y) == sym_raw(x) or stt_has(rest, x)
+}
+
+fn stt_ids_are_derived(es: [NEnt]) : Bool {
+  let moved = list_append(list_reverse(es), [NEnt(NCFn, "unrelated", "elsewhere", true)])
+  stt_derived(st_of_entries(es), st_of_entries(moved), es)
+}
+
+# Every entry reads back its own row, under the id the other table gives it.
+fn stt_derived(a: SymTab, b: SymTab, es: [NEnt]) : Bool = match es {
+  [] -> true
+  [e, ...rest] -> match stt_id_of(a, e) {
+    None    -> false
+    Some(s) -> stt_row_matches(a, s, e) and stt_same_id(stt_id_of(b, e), s) and stt_derived(a, b, rest)
+  }
+}
+
+fn stt_id_of(t: SymTab, e: NEnt) : Option[SymId] = match e {
+  NEnt(cls, name, home, _) -> match st_module(t, home) {
+    None    -> None
+    Some(m) -> st_lookup(t, cls, name, m)
+  }
+}
+
+fn stt_same_id(o: Option[SymId], s: SymId) : Bool = match o {
+  None    -> false
+  Some(x) -> sym_raw(x) == sym_raw(s)
 }
 
 # A module owns nothing and every declaration is owned by the module
 # spelling its home — the invariant that makes `sym_home` derived rather
 # than stored.
-fn stt_owners_are_modules(t: SymTab, i: Int) : Bool =
-  if i >= st_count(t) { true }
-  else {
-    let s = SymId(i)
+fn stt_owners_are_modules(t: SymTab, ids: [SymId]) : Bool = match ids {
+  [] -> true
+  [s, ...rest] -> {
     let ok = if ncls_same(sym_class(t, s), NCModule) {
       sym_raw(sym_owner(t, s)) == sym_raw(sym_none())
     } else { stt_owned_by_module(t, s, sym_home(t, s)) }
-    if ok { stt_owners_are_modules(t, i + 1) } else { false }
+    ok and stt_owners_are_modules(t, rest)
   }
+}
 
 # Every column of row `s` reads back the entry that occupied its slot.
 fn stt_row_matches(t: SymTab, s: SymId, e: NEnt) : Bool = match e {
@@ -186,9 +214,7 @@ fn stt_untagged_takes_target(t: SymTab) : Bool =
     Some(s) -> sym_home(t, s) == "root"
   }
 
-# Two homonymous modules are two ids, and each owns its own `f`. This
-# is the shape a `home` string cannot represent: the two spell alike, so
-# only the ids tell them apart.
+# `pkg.a` is mentioned twice with `pkg.b` between, and declares `f` twice.
 fn stt_homonym_modules() : [NEnt] = [
   NEnt(NCFn, "f", "pkg.a", true),
   NEnt(NCFn, "g", "pkg.b", true),
@@ -198,21 +224,19 @@ fn stt_homonym_modules() : [NEnt] = [
 # The stream mentions `pkg.a` twice with `pkg.b` between them, so a
 # builder keying on the previous entry alone would mint a second
 # `pkg.a`. One module symbol per distinct home, whatever the order.
-fn stt_homes_are_one_symbol_each(t: SymTab) : Bool {
-  let mods = stt_modules(t, 0, [])
-  if list_length(mods) != 2 { false } else { stt_f_rows_share_an_owner(t) }
+fn stt_homes_are_one_symbol_each(t: SymTab) : Bool =
+  stt_modules(t, st_ids(t), 0) == 2 and stt_repeat_is_one_symbol(t)
+
+fn stt_modules(t: SymTab, ids: [SymId], n: Int) : Int = match ids {
+  [] -> n
+  [s, ...rest] -> stt_modules(t, rest, if ncls_same(sym_class(t, s), NCModule) { n + 1 } else { n })
 }
 
-fn stt_modules(t: SymTab, i: Int, acc: [Int]) : [Int] =
-  if i >= st_count(t) { list_reverse(acc) }
-  else if ncls_same(sym_class(t, SymId(i)), NCModule) { stt_modules(t, i + 1, [i, ...acc]) }
-  else { stt_modules(t, i + 1, acc) }
-
-# Both `f` rows are two ids owned by the one `pkg.a` symbol.
-fn stt_f_rows_share_an_owner(t: SymTab) : Bool =
-  match st_candidates(t, NCFn, "f") {
-    [a, b] -> sym_raw(a) != sym_raw(b) and sym_same_owner(t, a, b)
-    _      -> false
+# The two `f` entries of `pkg.a` are one key, so one symbol.
+fn stt_repeat_is_one_symbol(t: SymTab) : Bool =
+  match stt_only(st_candidates(t, NCFn, "f")) {
+    None    -> false
+    Some(s) -> sym_home(t, s) == "pkg.a" and st_count(t) == 4
   }
 
 # A use of `f` written in `pkg.b` reaches nothing of its own, and a use
@@ -302,10 +326,10 @@ pub fn symtab_selftest() : String {
   else if stt_homonyms_are_distinct(t) == false { "FAIL: homonymous fns share an id or a home" }
   else if stt_classes_are_separate(t) == false { "FAIL: type and effect collapsed into one class" }
   else if stt_lookup_is_exact(t) == false { "FAIL: home-qualified lookup picked the wrong row" }
-  else if stt_index_matches_scan(t, 0) == false { "FAIL: bucket index disagrees with a column scan" }
-  else if stt_owners_are_modules(t, 0) == false { "FAIL: a symbol is not owned by its home's module" }
-  else if stt_dense(t, es, list_length(stt_homes_of(es))) == false { "FAIL: ids are not dense in stream order" }
-  else if stt_homes_are_one_symbol_each(hm) == false { "FAIL: one home minted more than one module symbol" }
+  else if stt_index_matches_scan(t) == false { "FAIL: bucket index disagrees with a row scan" }
+  else if stt_owners_are_modules(t, st_ids(t)) == false { "FAIL: a symbol is not owned by its home's module" }
+  else if stt_ids_are_derived(es) == false { "FAIL: an id moved with the stream's order or contents" }
+  else if stt_homes_are_one_symbol_each(hm) == false { "FAIL: one home or one repeated key minted more than one symbol" }
   else if stt_resolution_reads_owners() == false { "FAIL: resolution did not decide by owner id" }
   else if stt_build_walks_decls() == false { "FAIL: the decl walker lost a home or an id" }
   else if stt_proto_keys() == false { "FAIL: a protocol dispatch key ignored contestedness or its core home" }

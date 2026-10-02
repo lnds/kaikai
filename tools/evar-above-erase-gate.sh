@@ -42,7 +42,6 @@ SRC="$ROOT/stage2/compiler"
 #   perceus*,        — mint a binder they just bound, an RC marker
 #   unbox*,            (`__perceus_dup`, `__pcs_ret`), or a runtime
 #   cell_promote       primitive's borrow variant; never a declaration.
-#   cache_ast        — deserialisation; ids are rebuilt on load.
 #   sym_read         — the ESym→EVar reader itself.
 #   emit_tcrec_live  — the matches are prose inside a `#[doc]` block.
 #   cache_delta_test,— fixtures; they build the node they assert on.
@@ -51,7 +50,7 @@ ALLOW='ast|parse|desugar|surface_lower|modules|type_scope|effect_scope'
 ALLOW="$ALLOW|const_pattern|refinements|refine_enforce|vec_surface|protos"
 ALLOW="$ALLOW|json_derive|layout_derive|fmt_expr|tailfuse|tailsubst"
 ALLOW="$ALLOW|pipe_fusion|resolve|infer|monomorph|fwd_inline"
-ALLOW="$ALLOW|closure_spec_ast|closure_spec_emit|cache_ast|sym_read"
+ALLOW="$ALLOW|closure_spec_ast|closure_spec_emit|sym_read"
 ALLOW="$ALLOW|emit_tcrec_live|cache_delta_test|resolve_sym_test"
 ALLOW="$ALLOW|perceus|perceus_plant_drop|perceus_tail_drop|perceus_owned_pos"
 ALLOW="$ALLOW|perceus_payer|unbox|unbox_native_raw|cell_promote"
