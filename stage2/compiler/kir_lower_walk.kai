@@ -397,29 +397,6 @@ fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # read from `inner.ty` via the shared `bang_success_variant`.
   EBang(inner)       -> lower_bang(x, inner, st)
 
-  # Forms the resolve / desugar / typer passes rewrite away before codegen
-  # (`EMapPipe`/`EFlatMapPipe`/`EFilterPipe` → ECall, `EPipe` desugared,
-  # `EIndex` → call, `EUnder`/`EPlaceholder` pattern-only). These never
-  # reach a post-perceus AST; lowering to unit keeps the match exhaustive
-  # and mirrors the emitters' dead arms.
-  #
-  # `EPipe` SURVIVES to codegen: the typer (`infer.kai`'s `synth_pipe`)
-  # rebuilds `EPipe(lhs, ECall(f, args))` / `EPipe(lhs, EModCall(m, f))`
-  # rather than desugaring to `ECall`, leaving each emitter its own pipe
-  # desugaring (emit_c has `emit_pipe_expr`, the byte-id oracle). `lower_pipe`
-  # mirrors it: rewrite the pipe to the equivalent `ECall` with `lhs`
-  # spliced in as the FIRST argument, then delegate to `lower_call` — so the
-  # full named-call dispatch (ctor / core / efn / variant / kaix_apply)
-  # is reused unchanged. The earlier burn-down-3 partial cut "trapped" only
-  # because it built the `ECall` callee/args by hand and reached an unhandled
-  # shape; routing through `lower_call` (the same path a non-piped call
-  # takes) makes the multi-candidate combinators (`filter`/`map`/`each`)
-  # fall out for free. Closes the pipe-lowering family (collatz / euler1 /
-  # fizzbuzz / imc / capture output-mismatch + quicksort's infinite-recursion
-  # SIGSEGV, where a lost `filter` left `sort(unit)` recursing on a non-
-  # shrinking input).
-  EPipe(lhs, rhs)    -> lower_pipe(x, lhs, rhs, st)
-
   # A promoted var cell in boxed position: a read boxes the raw register
   # at its scalar type; a write stores the raw value and yields unit. A
   # loop intrinsic pastes its pred/body lambda bodies into an inline
@@ -433,10 +410,10 @@ fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
     else { lower_unhandled(x, st) }
 
   # Forms the resolve / desugar / typer passes rewrite away before codegen
-  # (`EMapPipe`/`EFlatMapPipe`/`EFilterPipe` → ECall, `EIndex` → call,
-  # `EUnder`/`EPlaceholder` pattern-only). These never reach a post-perceus
-  # AST; lowering to unit keeps the match exhaustive and mirrors the
-  # emitters' dead arms.
+  # (every pipe → ECall, `EIndex` → call, `EUnder`/`EPlaceholder`
+  # pattern-only). These never reach a post-perceus AST; lowering to unit
+  # keeps the match exhaustive and mirrors the emitters' dead arms.
+  EPipe(_, _)        -> LRes(KUnitV, st)
   EMapPipe(_, _)     -> LRes(KUnitV, st)
   EFlatMapPipe(_, _) -> LRes(KUnitV, st)
   EFilterPipe(_, _)  -> LRes(KUnitV, st)
@@ -2818,31 +2795,6 @@ fn lower_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = m
     let rf = lower_expr(f, st)
     match rf { LRes(fv, st1) -> match lower_exprs(cargs, st1, []) {
       LResMany(avs, st2) -> bind_op(st2, KCallIndirect(fv, avs), kpos_of(x)) } }
-  }
-}
-
-# `lhs |> rhs` — splice `lhs` in as the FIRST argument of the call `rhs`
-# names, then delegate to `lower_call`. This is the post-perceus desugar
-# the C-direct oracle (`emit_pipe_expr`) does at codegen, reproduced node-
-# for-node so the two backends agree:
-#   - `lhs |> f(a, b)`        → `f(lhs, a, b)`        (ECall callee splice)
-#   - `lhs |> mod.g(a)`       → `mod.g(lhs, a)`       (EModCall callee splice)
-#   - `lhs |> f`  / `mod.g`   → `f(lhs)` / `mod.g(lhs)` (bare callee)
-#   - `lhs |> <expr>`         → `(<expr>)(lhs)`        (indirect, kaix_apply)
-# A spliced `ECall` carries the SAME callee `Expr` the typer resolved
-# (variant / core / efn / local), so `lower_call`'s dispatch picks the
-# right shape with no special-casing — the burn-down-3 lesson: route through
-# `lower_call`, do not hand-build the callee. The synthetic `ECall` reuses
-# `rhs`'s position so a lowering error still points at the user's call.
-fn lower_pipe(x: Expr, lhs: Expr, rhs: Expr, st: LowerSt) : LRes / Console = match rhs.kind {
-  ECall(f, cargs) -> lower_call(x, f, [lhs, ...cargs], st)
-  EVar(_)         -> lower_call(x, rhs, [lhs], st)
-  ESym(_, _, _)         -> lower_call(x, rhs, [lhs], st)
-  EModCall(_, _)  -> lower_call(x, rhs, [lhs], st)
-  _ -> {
-    let rf = lower_expr(rhs, st)
-    match rf { LRes(fv, st1) -> match lower_expr(lhs, st1) {
-      LRes(av, st2) -> bind_op(st2, KCallIndirect(fv, [av]), kpos_of(x)) } }
   }
 }
 

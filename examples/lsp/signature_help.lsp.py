@@ -26,9 +26,11 @@ def recv():
     return json.loads(proc.stdout.read(n))
 
 src = """fn add(x: Int, y: Int) : Int = x + y
+fn neg(x: Int) : Int = 0 - x
 
 fn main() : Unit / Stdout = {
   print(int_to_string(add(3, 4)))
+  print(int_to_string(neg(1) |> add(5)))
 }
 """
 
@@ -43,11 +45,11 @@ send({"jsonrpc":"2.0","method":"textDocument/didOpen",
       "params":{"textDocument":{"uri":URI,"languageId":"kaikai","version":1,"text":src}}})
 recv()  # publishDiagnostics
 
-# Position the cursor inside `add(3, 4)` — line 3 col 25 (0-indexed)
+# Position the cursor inside `add(3, 4)` — line 4 col 25 (0-indexed)
 # is just past `add(`. The walker returns the innermost enclosing
 # call, which is `add` here.
 send({"jsonrpc":"2.0","id":2,"method":"textDocument/signatureHelp",
-      "params":{"textDocument":{"uri":URI},"position":{"line":3,"character":25}}})
+      "params":{"textDocument":{"uri":URI},"position":{"line":4,"character":25}}})
 r = recv()
 result = r["result"]
 assert result is not None, r
@@ -60,10 +62,17 @@ assert "Int" in label, label
 # Also exercise the outer `int_to_string` call by pointing the
 # cursor between `int_to_string(` and `add(`.
 send({"jsonrpc":"2.0","id":3,"method":"textDocument/signatureHelp",
-      "params":{"textDocument":{"uri":URI},"position":{"line":3,"character":21}}})
+      "params":{"textDocument":{"uri":URI},"position":{"line":4,"character":21}}})
 r2 = recv()
 label2 = r2["result"]["signatures"][0]["label"]
 assert "int_to_string" in label2, label2
+
+# Inside the args of a piped call: the pipe's call, not its first stage.
+send({"jsonrpc":"2.0","id":4,"method":"textDocument/signatureHelp",
+      "params":{"textDocument":{"uri":URI},"position":{"line":5,"character":36}}})
+r3 = recv()
+label3 = r3["result"]["signatures"][0]["label"]
+assert "add" in label3, label3
 
 send({"jsonrpc":"2.0","id":99,"method":"shutdown","params":None}); recv()
 send({"jsonrpc":"2.0","method":"exit"})
@@ -72,3 +81,4 @@ proc.stdin.close(); proc.wait(timeout=5)
 print("signature_help: OK")
 print(f"  inside add(...)         -> {label}")
 print(f"  inside int_to_string(...) -> {label2}")
+print(f"  inside |> add(...)      -> {label3}")
