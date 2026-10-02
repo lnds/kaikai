@@ -4655,8 +4655,7 @@ fn core_emit_key(cc: CoreCacheOpt, edition: String, decls: [Decl],
 fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl],
                              bmode: BuildMode, target_mod_name: String,
                              regions: [RegionMark], cc: CoreCacheOpt,
-                             core_mods: [ModuleEntry], edition: String,
-                             tab: SymTab)
+                             core_mods: [ModuleEntry], edition: String)
                              : String / Console + File + Mutable = {
   let plain = match bmode { BMBuild -> true _ -> false }
   let cacheable = core_mod_names(core_mods, [])
@@ -4880,13 +4879,19 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # home while the qualifier is still written.
             let ts_eff_names = collect_effect_names(list_append(core_decls_l, eff_scoped))
             let ts_coll = ts_collect(list_append(core_decls_l, eff_scoped), target_mod_name, ts_eff_names)
+            # The program's one symbol table. Later passes that mint
+            # declarations extend it; ids are derived, so none moves.
+            let early_tab = st_build(list_append(core_decls_l, eff_scoped), target_mod_name)
+            let sym_views = fv_build(scope_imports(mod_scopes, module_table),
+                                     sel_imports,
+                                     core_mod_names(core_mods, []),
+                                     target_mod_name)
             # A bare type two imports both export is an error, decided
             # against the symbol table before the ladder respells the
             # declarations: past this point the use site no longer
             # spells what the author wrote.
-            let ty_scope_errs = tschk_segmented(seg_marks, eff_scoped,
-              list_append(core_decls_l, eff_scoped), mod_scopes, module_table,
-              target_mod_name, core_mod_names(core_mods, []), sel_imports, diag_ctx)
+            let ty_scope_errs = tschk_segmented(seg_marks, eff_scoped, early_tab, sym_views,
+              target_mod_name, diag_ctx)
             let scoped_decls = ts_segmented(seg_marks, eff_scoped, ts_coll,
               mod_scopes, module_table, target_mod_name, core_mod_names(core_mods, []), sel_imports)
             let eff_scope_errs = eschk_segmented(seg_marks, scoped_decls, es_coll,
@@ -5240,22 +5245,10 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # top-level fns + a registry the post-inference rewrite
             # consumes. The registry-driven dispatch resolution runs
             # later, after `infer_program` populates `Expr.ty`.
-            # Protocol scoping resolves through the chain, so the table
-            # is built here — over the pre-lowering stream, where the
-            # `DProtocol` decls are still live and `nt_collect` sees
-            # them as the `NCProtocol` declarations they are.
-            let proto_tab = st_build(post_use_decls, target_mod_name)
-            let proto_ps = PScope(proto_tab,
-                                  fv_build(proto_tab,
-                                           scope_imports(mod_scopes, module_table),
-                                           sel_imports,
-                                           core_mod_names(core_mods, []),
-                                           target_mod_name),
-                                  target_mod_name)
             let lowered = lower_protocols(post_use_decls, diag_ctx, target_mod_name,
                                           core_mod_names(core_mods, []),
                                           scope_imports(mod_scopes, module_table),
-                                          proto_ps)
+                                          PScope(early_tab, sym_views, target_mod_name))
             # Lift `#{x}` interp parts into
             # `string_concat_all([..., show(x), ...])` so the typer +
             # protocol-call rewrite see them. Conditional on `Show`
@@ -5367,18 +5360,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # `f`'s brand differs from the surrounding scope's.
             let nursery_brand_errs = check_nursery_brand_mismatch_decls(
               all_decls, diag_ctx, brand_calls, brand_registry)
-            # Every file resolves under what it imports: the loader's
-            # import table, its selective picks and the prelude cores.
-            # The lowering replaced each `DProtocol` with dispatchers, so
-            # the protocols are carried over from `proto_tab`: every id
-            # minted in this compilation then names a row of this table.
-            let res_tab = st_of_entries(list_append(nt_collect(all_decls, target_mod_name),
-                                                    nt_protocols(post_use_decls, target_mod_name)))
-            let res_views = fv_build(res_tab,
-                                     scope_imports(mod_scopes, module_table),
-                                     sel_imports,
-                                     core_mod_names(core_mods, []),
-                                     target_mod_name)
+            let sym_tab = st_extend(early_tab, nt_collect(all_decls, target_mod_name))
+            let proto_ps = PScope(sym_tab, sym_views, target_mod_name)
             let proto_reg = lowered.reg
             let proto_errs = lowered.errs
             if doc_errs > 0 { doc_errs }
@@ -5420,55 +5403,55 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
               MEnv -> { dump_env(build_ty_env(all_decls).env); 0 }
               MInfer -> dump_infer(path, all_decls)
               MDumpTyped -> {
-                let rd = resolve_decls_views(diag_ctx, all_decls, res_views, res_tab, target_mod_name)
+                let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_typed(path, all_decls) }
               }
               MDumpTypedCore -> {
-                let rd = resolve_decls_views(diag_ctx, all_decls, res_views, res_tab, target_mod_name)
+                let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_typed_core(path, all_decls) }
               }
               MDumpMono -> {
-                let rd = resolve_decls_views(diag_ctx, all_decls, res_views, res_tab, target_mod_name)
+                let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_mono(path, all_decls) }
               }
               MDumpMonoOut -> {
-                let rd = resolve_decls_views(diag_ctx, all_decls, res_views, res_tab, target_mod_name)
+                let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_mono_out(path, all_decls) }
               }
               MDumpRawSafe -> {
-                let rd = resolve_decls_views(diag_ctx, all_decls, res_views, res_tab, target_mod_name)
+                let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_rawsafe(path, all_decls) }
               }
               MDumpBorrowSafe -> {
-                let rd = resolve_decls_views(diag_ctx, all_decls, res_views, res_tab, target_mod_name)
+                let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_borrowsafe(path, all_decls) }
               }
               MDumpLastUse -> {
-                let rd = resolve_decls_views(diag_ctx, all_decls, res_views, res_tab, target_mod_name)
+                let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_last_use(path, all_decls) }
               }
               MDumpIntervals -> {
-                let rd = resolve_decls_views(diag_ctx, all_decls, res_views, res_tab, target_mod_name)
+                let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_intervals(path, all_decls) }
               }
               MDumpCallElision -> {
-                let rd = resolve_decls_views(diag_ctx, all_decls, res_views, res_tab, target_mod_name)
+                let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_call_elision(path, all_decls) }
@@ -5510,7 +5493,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # answers position-keyed queries against the typed
                 # AST. Probes are read from `# @probe` comments in
                 # the source so a fixture is self-describing.
-                let rd = resolve_decls_views(diag_ctx, all_decls, res_views, res_tab, target_mod_name)
+                let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_library_mode(path, src, all_decls) }
@@ -5533,7 +5516,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # The head-owner cache is the same one a build computes:
                 # a lint that rejected a pipe the build accepts would be
                 # unusable on idiomatic code.
-                let rd = resolve_decls_views(diag_ctx, all_decls, res_views, res_tab, target_mod_name)
+                let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else {
@@ -5544,7 +5527,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 }
               }
               MLintJson -> {
-                let rd = resolve_decls_views(diag_ctx, all_decls, res_views, res_tab, target_mod_name)
+                let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else {
@@ -5555,14 +5538,14 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 }
               }
               _ -> {
-                let rd = resolve_decls_views(diag_ctx, all_decls, res_views, res_tab, target_mod_name)
+                let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 # Each impl entry takes its target's identity from the
                 # resolver the typer stamps `TyCon`s with, over the same
                 # table, so dispatch compares identities of one origin.
                 let proto_reg = reg_with_target_ids(proto_reg,
-                                  tsh_homes(all_decls, rd.tab, res_views, target_mod_name))
+                                  tsh_homes(all_decls, rd.tab, sym_views, target_mod_name))
                 if chk != 0 { chk }
                 else {
                   # Build the per-compile head-owner cache once from the
@@ -5599,7 +5582,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # synthesised dispatch is typed like any other body and
                   # the self-tail rewrite downstream turns the cycle into
                   # the goto-loop it already emits.
-                  let typed_prog0 = tcut_infer_program(path, diag_ctx, tailfuse_decls(all_decls), tcut_dir, lowered.reg.impls, head_owners, kind_theories, rd.tab, res_views, false)
+                  let typed_prog0 = tcut_infer_program(path, diag_ctx, tailfuse_decls(all_decls), tcut_dir, lowered.reg.impls, head_owners, kind_theories, rd.tab, sym_views, false)
                   # Post-inference protocol-call rewrite. `Expr.ty` is
                   # populated for every node now, so each `op(x, ...)`
                   # call can be redirected to the matching
@@ -5652,7 +5635,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                     nr_report_program_tab(diag_ctx, typed_prog.decls, target_mod_name,
                                       lowered.reg, early_const_uses,
                                       core_mod_names(core_mods, []),
-                                      post_use_decls, root_picks, res_tab)
+                                      post_use_decls, root_picks, sym_tab)
                   # Warn on unused local `let` and pattern bindings in
                   # the root file's decls. Scoped to root
                   # decls (mo == None) by `report_unused_in_decl` so
@@ -5752,7 +5735,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # every other one keeps its id through unbox and
                       # perceus. One spelling per local binder from here
                       # on: every ownership table below keys on the name.
-                      let erase_ctx = SymErase(res_tab, target_mod_name)
+                      let erase_ctx = SymErase(sym_tab, target_mod_name)
                       let cell_decls = unique_binders_decls(promote_scalar_cells(sym_qualify_decls_in(erase_ctx, mono_decls)))
                       # Unbox analysis. Runs between monomorphisation
                       # and perceus so the perceus pass sees post-unbox
@@ -5797,7 +5780,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # re-emulate perceus's exit-drop computation, so a
                       # change to one has to be mirrored in the other.
                       # Below the erasure a name is a C symbol to spell.
-                      let post_perceus_decls = sym_erase_decls_in(erase_ctx, perceus_pass_in(unboxed_decls, res_tab, res_views, target_mod_name))
+                      let post_perceus_decls = sym_erase_decls_in(erase_ctx, perceus_pass_in(unboxed_decls, sym_tab, sym_views, target_mod_name))
                       # TCO is mandatory on BOTH backends.
                       # `tcrec_rewrite_decls` is a pure AST→AST pre-pass
                       # that plants the `__kai_tcrec|...` self-tail-call
@@ -5842,11 +5825,11 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                         let kp = kir_inline_program(lower_to_kir(perceus_decls, region_marks, register_fn_decls(perceus_decls),
                                                                  register_variants(perceus_decls), Some(target_mod_name), raw_arm_binders))
                         let core_names = core_mod_names(core_mods, [])
-                        print(string_join(symid_decl_lines("unbox", res_tab, core_names, cell_decls)
-                                          ++ symid_decl_lines("perceus", res_tab, core_names, unboxed_decls)
-                                          ++ symid_own_lines(res_tab, core_names, perceus_decls)
-                                          ++ symid_kir_lines(res_tab, core_names, kp)
-                                          ++ symid_efn_lines(res_tab, core_names, register_fn_decls(perceus_decls)), "\n"))
+                        print(string_join(symid_decl_lines("unbox", sym_tab, core_names, cell_decls)
+                                          ++ symid_decl_lines("perceus", sym_tab, core_names, unboxed_decls)
+                                          ++ symid_own_lines(sym_tab, core_names, perceus_decls)
+                                          ++ symid_kir_lines(sym_tab, core_names, kp)
+                                          ++ symid_efn_lines(sym_tab, core_names, register_fn_decls(perceus_decls)), "\n"))
                         0
                       }
                       else if use_native {
@@ -5918,7 +5901,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                           emit_kir(perceus_decls, region_marks, kir_inline_on)
                         } else if use_modular {
                           # Per-module .c/.h stream; the wrapper splits + links.
-                          emit_modular_maybe_cached(path, src, perceus_decls, bmode, target_mod_name, region_marks, core_cache, core_mods, edition, res_tab)
+                          emit_modular_maybe_cached(path, src, perceus_decls, bmode, target_mod_name, region_marks, core_cache, core_mods, edition)
                         } else {
                           emit_program(path, src, perceus_decls, bmode, Some(target_mod_name), region_marks)
                         }
