@@ -943,7 +943,7 @@ pub fn lam_symbol(l: LamInfo) : String = match l {
 # any clause body that names an enclosing-fn parameter triggered the
 # `use of undeclared identifier 'kai_<param>'` C error tracked as R9.
 #[doc("a #6c: each handler op clause becomes a top-level C function. The id pair (handle_line, handle_col) plus op_name uniquely names the clause (HCs do not nest within the same…")]
-pub type ClauseInfo = CI(Int, Int, String, String, [Param], Expr, Bool, String, [String], Option[String])
+pub type ClauseInfo = CI(Int, Int, String, String, [Param], Expr, Bool, String, [String], Option[String], SymId)
 
 #[doc("The symbol a handler clause's body lifts into; it is the enclosing fn of the lambdas and handles nested in that body.")]
 pub fn clause_body_sym(enc_fn: String, line: Int, col: Int, op: String, params: [Param]) : String =
@@ -952,7 +952,7 @@ pub fn clause_body_sym(enc_fn: String, line: Int, col: Int, op: String, params: 
 
 #[doc("The symbol a recorded clause's body lifts into.")]
 pub fn clause_sym(c: ClauseInfo) : String = match c {
-  CI(line, col, _, op, params, _, _, enc_fn, _, _) -> clause_body_sym(enc_fn, line, col, op, params)
+  CI(line, col, _, op, params, _, _, enc_fn, _, _, _) -> clause_body_sym(enc_fn, line, col, op, params)
 }
 
 #[doc("The handler-state aliases a stateful handler actually binds, given the enclosing local scope.")]
@@ -966,7 +966,7 @@ pub fn lam_mo(l: LamInfo) : Option[String] = match l {
 
 #[doc("The module a handler clause came from, for rotating the EFn table to it before its body resolves a bare call.")]
 pub fn clause_mo(c: ClauseInfo) : Option[String] = match c {
-  CI(_, _, _, _, _, _, _, _, _, mo) -> mo
+  CI(_, _, _, _, _, _, _, _, _, mo, _) -> mo
 }
 
 #[doc("Look up a lifted lambda by enclosing fn + source position. The (enc_fn, line, col) triple is unique even when two modules share a lambda at the same line/col.")]
@@ -1501,14 +1501,14 @@ pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
     ETodo(_) -> st
     EExternBody(_) -> st
     EBang(inner) -> collect_expr(inner, st)
-    EHandle(body, eff_name, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
+    EHandle(body, eff_name, hsym, _, init_opt, alias_opt, clauses, ret_opt) -> {
       let stateful = match init_opt { Some(_) -> true None -> false }
       let s_init = match init_opt { Some(ie) -> collect_expr(ie, st) None -> st }
       # m4c #4: stamp each clause with the current enclosing fn name
       # set by collect_decl (DFn / DTest) or the surrounding ELambda.
       # emit-time install code reads back the same string so install
       # and clause-body symbols agree.
-      let s0 = lc_record_clauses(clauses, eff_name, stateful, x.line, x.col, s_init.cur_enc_fn, s_init)
+      let s0 = lc_record_clauses(clauses, eff_name, hsym, stateful, x.line, x.col, s_init.cur_enc_fn, s_init)
       # m12.8.x phase 4 followup: when `with Eff(init) as name { body }`
       # binds an alias, mark `name` as an in-scope global for the body
       # walk so any inner lambda's free-var analysis treats references
@@ -1582,7 +1582,7 @@ fn collect_loop_args(args_: [Expr], st: LamCollect) : LamCollect / Console = mat
 # install path mint matching prefixed symbols
 # (`_kai_<enc>__clause_<l>_<c>_<op>`).
 #[doc("a #6c: append one ClauseInfo per HClause of this handle. The (line, col) of the EHandle node is reused as the clause's stable id; the op_name disambiguates among clauses of the…")]
-pub fn lc_record_clauses(cs: [HClause], eff: String, stateful: Bool,
+pub fn lc_record_clauses(cs: [HClause], eff: String, esym: SymId, stateful: Bool,
                      hline: Int, hcol: Int, enc_fn: String,
                      st: LamCollect) : LamCollect / Console {
 
@@ -1600,13 +1600,13 @@ pub fn lc_record_clauses(cs: [HClause], eff: String, stateful: Bool,
         let own_for_fv = list_concat_strings(map(params, (pm) => pm.pname), live_aliases)
         let raw_caps = fv_expr(body, own_for_fv, st.scope.resolves, [])
         let caps = filter_clause_captures(raw_caps)
-        let info = CI(hline, hcol, eff, op_name, params, body, stateful, enc_fn, caps, st.cur_mo)
+        let info = CI(hline, hcol, eff, op_name, params, body, stateful, enc_fn, caps, st.cur_mo, esym)
         let st1 = LamCollect {
           next_id: st.next_id, lams: st.lams,
           clauses: [info, ...st.clauses], scope: st.scope,
           cur_enc_fn: st.cur_enc_fn, cur_mo: st.cur_mo
         }
-        lc_record_clauses(rest, eff, stateful, hline, hcol, enc_fn, st1)
+        lc_record_clauses(rest, eff, esym, stateful, hline, hcol, enc_fn, st1)
       }
     }
   }
@@ -2671,6 +2671,20 @@ pub fn default_block_owner_mo(eff_name: String, decls: [Decl]) : Option[String] 
           match defblk { Some(_) -> mo  None -> default_block_owner_mo(eff_name, rest) }
         } else { default_block_owner_mo(eff_name, rest) }
       _ -> default_block_owner_mo(eff_name, rest)
+    }
+  }
+}
+
+#[doc("Identity of the effect decl that owns the resolved `default { }` block, or `sym_none()` when none does. Selects the decl exactly as `find_effect_default_block` does, so the id and the ops agree.")]
+pub fn default_block_owner_sym(eff_name: String, decls: [Decl]) : SymId {
+  match decls {
+    [] -> sym_none()
+    [d, ...rest] -> match d {
+      DEffect(_, n, _, _, defblk, _, _, _, s) ->
+        if n == eff_name {
+          match defblk { Some(_) -> s  None -> default_block_owner_sym(eff_name, rest) }
+        } else { default_block_owner_sym(eff_name, rest) }
+      _ -> default_block_owner_sym(eff_name, rest)
     }
   }
 }
