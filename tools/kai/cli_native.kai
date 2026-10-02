@@ -29,12 +29,19 @@ fn local_module(src_dir: String, line: String) : Bool / Ffi {
     or cli_sys.is_file("#{src_dir}/#{head}.kai")
 }
 
-# Partitioning pays only when a local module can be reused: count imports that resolve next to the entry.
-fn imports_local(p: Plan) : Bool / File + Ffi =
+# Partitioning pays only when a local module can be reused: count imports that resolve
+# next to the entry or, for a file under a package (a test beside its sources), at its root.
+fn imports_local(p: Plan) : Bool / File + Ffi {
+  let roots =
+    if p.manifest == "" or p.manifest == p.src_dir { [p.src_dir] } else { [p.src_dir, p.manifest] }
   string.split(cli_fs.read_or_empty(p.job.src), "\n")
     |? (l => list.head(cli_proc.words(l)) == Some("import")
       and string.starts_with(string.trim_left(l), "import"))
-    |> list.any(l => local_module(p.src_dir, l))
+    |> list.any(l => local_in(roots, l))
+}
+
+fn local_in(roots: [String], line: String) : Bool / Ffi =
+  roots |> list.any(r => local_module(r, line))
 
 #[doc("Whether this native build partitions per module: `KAI_NATIVE_MODULAR` forces it, else a local import decides; never `--debug`.")]
 pub fn modular(p: Plan) : Bool / Env + File + Ffi {
@@ -71,13 +78,16 @@ fn modular_link(
   cli_plan.link(p, argv, "native-modular")
 }
 
+# One object dir per package, so every entry of it — each test file — shares the
+# partitions it projects identically; an entry outside any package keeps its own.
 fn modular_dir(p: Plan, abs: String) : String / Env + File + Ffi {
   let t = p.t
   let bc_tag =
     if t.inline_bc == "" { "none" } else { cli_hash.digest([cli_hash.Bytes(t.inline_bc)]) }
   let tid = cli_layout.toolchain_id(t.layout)
+  let owner = if p.manifest == "" { abs } else { cli_fs.absolute(p.manifest) }
   let key =
-    cli_hash.digest([cli_hash.Text("#{abs}\n#{bc_tag}\n#{if tid == "" { "0" } else { tid }}")])
+    cli_hash.digest([cli_hash.Text("#{owner}\n#{bc_tag}\n#{if tid == "" { "0" } else { tid }}")])
   let dir = "#{cli_caches.root("KAI_NATIVE_MODULAR_CACHE_DIR", "nmodular", t.os)}/#{key}"
   if cli_fs.mkdir_p(dir) { dir } else { p.job.tmp }
 }
@@ -91,12 +101,13 @@ pub fn build_modular(p: Plan) : Result[Outcome, Int] / Stderr + Env + File + Ffi
   let t = p.t
   let base = cli_fs.basename(p.job.src)
   let abs = "#{p.src_dir}/#{base}"
-  let entry = "#{modular_dir(p, abs)}/#{base}"
+  let entry = "#{p.job.tmp}/#{base}"
   let objs_file = "#{p.job.tmp}/native-modular.objs"
   let err = "#{p.job.tmp}/native-modular.err"
   let _ = cli_fs.copy(p.job.src, entry)
   let sp = cli_plan.kaic2_spawn([("KAI_NATIVE_RUNTIME_INLINE_BC", t.inline_bc)], objs_file, err)
-  let rc = cli_proc.run(cli_plan.kaic2(p, ["--emit=native-modular"], entry), sp)
+  let emit = ["--emit=native-modular", "--native-obj-dir", modular_dir(p, abs)]
+  let rc = cli_proc.run(cli_plan.kaic2(p, emit, entry), sp)
   cli_plan.rewrite_paths(err, entry, abs)
   if rc == 0 and cli_sys.size(objs_file) > 0 {
     cli_plan.replay(err)
@@ -193,16 +204,22 @@ pub fn build_whole(p: Plan) : Result[Outcome, Int] / Stderr + Env + File + Ffi {
     } else {
       cli_plan.rewrite_paths(err, entry, dbg)
       cli_plan.replay(err)
-      if rc != 0 {
-        Err(1)
-      } else if not cli_sys.is_file(obj) {
-        cli_err.die("native backend: no object produced (expected #{obj})")
-      } else {
-        let objs = if cli_sys.size(objs_file) > 0 { cli_plan.listed(objs_file) } else { [obj] }
-        whole_link(p, objs)!
-        collect_dsym(p.job.out)
-        Ok(Linked)
-      }
+      if rc != 0 { Err(1) } else { link_whole_objects(p, obj, objs_file) }
     }
   }
 }
+
+# The objects kaic2 listed (else the one it wrote), linked into the job's binary.
+fn link_whole_objects(
+  p: Plan,
+  obj: String,
+  objs_file: String
+) : Result[Outcome, Int] / Stderr + Env + File + Ffi =
+  if not cli_sys.is_file(obj) {
+    cli_err.die("native backend: no object produced (expected #{obj})")
+  } else {
+    let objs = if cli_sys.size(objs_file) > 0 { cli_plan.listed(objs_file) } else { [obj] }
+    whole_link(p, objs)!
+    collect_dsym(p.job.out)
+    Ok(Linked)
+  }
