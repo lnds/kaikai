@@ -48,6 +48,17 @@ the compiler-synthesised `Ffi` capability — so a test can call an
 effect has no handler at the runner's entry; handle it inside the
 body (`handle { ... } with MyEff { ... }`).
 
+The same move keeps a test from performing an effect it would rather
+not: install your own handler over the code under test. An actor's
+mailbox is the main case — a scripted `Actor[Msg]` handler feeds
+messages and expires deadlines without waiting (`kai info actors`
+§*Testing: the mailbox is a handler*). A handler clause must return,
+so a fake cannot emulate *blocking*: a mailbox can be replaced because
+it is the thing that waits, but a fake pipe cannot say "nothing yet",
+since `Ok("")` from `read_stdout` already means EOF. Where the OS
+boundary is what is under test, a real subprocess remains the
+instrument.
+
 ## Property checks
 
 ```kaikai
