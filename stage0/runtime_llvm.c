@@ -2126,16 +2126,18 @@ extern void kai_main_teardown_defaults(void);
 
 /* Test/bench runner forwarders. The native `kai test`/`bench` driver
  * (the synthetic `kai_main` the emitter builds in test/bench mode)
- * calls one `kaix_*_run_one` per block, passing the block's body fn
- * (which returns the block's final boxed value), then ends with the
- * matching `*_summary_exit`. The setjmp landing pad + accounting live
+ * registers each test block's body fn (which returns the block's final
+ * boxed value) and drives them, or calls one `kaix_bench_run_one` per
+ * bench block, then ends with the matching `*_summary_exit`. The setjmp landing pad + accounting live
  * in runtime.h's `kai_test_run_one` / `kai_bench_run_one`; these are
  * the `kaix_` names the LLVM call sites reference. `*_summary_exit`
  * prints the summary and `exit()`s with its code, so the process exit
  * status matches the C-direct `int main`'s `return kai_*_summary()`
  * without the shim's `int main` needing to know the build mode. */
-void kaix_test_run_one(const char *desc, KaiValue *(*body)(void)) { kai_test_run_one(desc, body); }
-void kaix_test_line(int line) { kai_test_line(line); }
+void kaix_test_register(const char *desc, KaiValue *(*body)(void), int line, const char *home) {
+    kai_test_register(NULL, desc, body, line, home);
+}
+void kaix_test_drive(void) { kai_test_drive(); }
 void kaix_bench_run_one(const char *desc, KaiValue *(*body)(void)) { kai_bench_run_one(desc, body); }
 void kaix_test_summary_exit(void)  { exit(kai_test_summary()); }
 void kaix_bench_summary_exit(void) { exit(kai_bench_summary()); }

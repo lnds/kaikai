@@ -226,6 +226,9 @@ run_check_script "library_test_discovery" "library_test_discovery/check.sh"
 # `kai test -j` builds test binaries in parallel yet reads exactly as -j 1.
 run_check_script "parallel_test_builds" "parallel_test_builds/check.sh"
 
+# One directory's test files build as one binary, each checked alone first.
+run_check_script "grouped_test_builds" "grouped_test_builds/check.sh"
+
 # The report-mode verbs reach the same package: a library is checked and
 # linted module by module instead of dying on the entry it does not have.
 run_check_script "library_report_modes" "library_report_modes/check.sh"

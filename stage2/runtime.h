@@ -10781,6 +10781,66 @@ static void kai_test_run_one(const char *desc, KaiValue *(*body)(void)) {
     kai_test_suite_ns += kai_test_now_ns() - t0;
 }
 
+/* Test blocks register before any runs. A grouped build links several test
+   files into one binary and runs it once per file: KAI_TEST_HOMES then names,
+   in run order, the modules whose blocks that file's own build would run.
+   Unset, every block runs in declaration order. The C backend registers its
+   self-contained `_kai_test_<id>`; the native one a body for run_one. */
+typedef struct {
+    void (*run)(void);
+    const char *desc;
+    KaiValue *(*body)(void);
+    int line;
+    const char *home;
+} KaiTestEntry;
+
+static KAI_TLS KaiTestEntry *kai_test_entries = NULL;
+static KAI_TLS int kai_test_nentries = 0;
+
+static void kai_test_register(void (*run)(void), const char *desc,
+                              KaiValue *(*body)(void), int line, const char *home) {
+    if ((kai_test_nentries & (kai_test_nentries - 1)) == 0) {
+        int cap = kai_test_nentries == 0 ? 16 : kai_test_nentries * 2;
+        KaiTestEntry *grown = (KaiTestEntry *)realloc(kai_test_entries, (size_t)cap * sizeof(KaiTestEntry));
+        if (!grown) { fprintf(stderr, "kai: out of memory registering tests\n"); exit(2); }
+        kai_test_entries = grown;
+    }
+    KaiTestEntry e = { run, desc, body, line, home ? home : "" };
+    kai_test_entries[kai_test_nentries++] = e;
+}
+
+static void kai_test_run_entry(const KaiTestEntry *e) {
+    if (e->run) { e->run(); return; }
+    kai_test_line(e->line);
+    kai_test_run_one(e->desc, e->body);
+}
+
+static void kai_test_run_home(const char *home, size_t len) {
+    for (int i = 0; i < kai_test_nentries; i++) {
+        const char *h = kai_test_entries[i].home;
+        if (strlen(h) == len && strncmp(h, home, len) == 0) kai_test_run_entry(&kai_test_entries[i]);
+    }
+}
+
+/* The list is read once and removed, so a program the tests start does not inherit it. */
+static void kai_test_drive(void) {
+    const char *env = getenv("KAI_TEST_HOMES");
+    if (!env || !*env) {
+        for (int i = 0; i < kai_test_nentries; i++) kai_test_run_entry(&kai_test_entries[i]);
+        return;
+    }
+    char *homes = strdup(env);
+    unsetenv("KAI_TEST_HOMES");
+    for (const char *p = homes; *p; ) {
+        while (*p == ' ') p++;
+        const char *end = p;
+        while (*end && *end != ' ') end++;
+        if (end > p) kai_test_run_home(p, (size_t)(end - p));
+        p = end;
+    }
+    free(homes);
+}
+
 /* ---------- bench harness hooks (used by --bench runs) ----------
  * bench v1.x (issue #437): per-iteration timings collected into a
  * sample buffer; on finalize we sort and report median + MAD + mean

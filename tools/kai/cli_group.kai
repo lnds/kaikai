@@ -1,0 +1,144 @@
+#[doc("""
+Grouped test builds: the test files one directory holds build as one
+binary that runs once per file. Each file is still checked on its own
+first, as the root it is when built alone, so a file that does not
+build alone fails exactly as it would; the group only shares the
+build. Within the binary a file's run is the blocks its own build would
+run, in the order it would run them (`kaic2 --test-plan`).
+""")]
+
+import os.env
+import cli_blocks
+import cli_compile
+import cli_fs
+import cli_plan
+import cli_pool
+
+#[doc("The variable naming the output a child `kai test` builds instead of running.")]
+pub const BUILD_ONLY : String = "KAI_TEST_BUILD_ONLY"
+
+#[doc("The variable naming what that child builds: `check`, `group`, or a whole runner when unset.")]
+pub const BUILD_KIND : String = "KAI_TEST_BUILD_KIND"
+
+#[doc("Test files sharing a directory, built as one binary into `out`.")]
+pub type Group = { members: [Runner], out: String }
+
+fn ident_char(c: Char, first: Bool) : Bool =
+  c == '_' or char.is_alpha(c) or (not first) and char.is_digit(c)
+
+# A stem kaic2 can load as a module and mint symbols from.
+fn loadable(r: Runner) : Bool = match string.chars(cli_fs.stem(r.src)) {
+  [] -> false
+  [c, ...rest] -> ident_char(c, true) and list.all(rest, d => ident_char(d, false))
+}
+
+fn same_dir(a: Runner, b: Runner) : Bool = cli_fs.dirname(a.src) == cli_fs.dirname(b.src)
+
+# Consecutive loadable runners of one directory, in order; a group of one builds alone.
+fn runs_of(rs: [Runner], acc: [[Runner]]) : [[Runner]] =
+  match rs, acc {
+    [], _ -> list.reverse(acc)
+    [r, ...rest], [cur, ...done] if loadable(r)
+      and list.all(cur, c => loadable(c) and same_dir(c, r)) ->
+      runs_of(rest, [cur ++ [r], ...done])
+    [r, ...rest], _ -> runs_of(rest, [[r], ...acc])
+  }
+
+#[doc("The groups `rs` forms (two or more files each), the `n`-th binary at `<tmp>/group<n>-g`.")]
+pub fn groups(rs: [Runner], tmp: String) : [Group] =
+  list.enumerate(runs_of(rs, []) |? (g => list.length(g) > 1))
+    | (p => Group { members: p.snd, out: "#{tmp}/group#{p.fst}-g" })
+
+#[doc("The group runner `r` belongs to, if any.")]
+pub fn group_of(gs: [Group], r: Runner) : Option[Group] =
+  list.find(gs, g => list.any(g.members, m => m.src == r.src))
+
+#[doc("The child that builds runner `r` whole.")]
+pub fn full_task(extra: [String], r: Runner) : Task =
+  cli_pool.Task {
+    key: "full:#{r.src}",
+    args: [...extra, "--", r.src],
+    set: [(BUILD_ONLY, r.out)],
+    log: "#{r.out}.build"
+  }
+
+#[doc("The child that checks runner `r` as a root on its own.")]
+pub fn check_task(extra: [String], r: Runner) : Task =
+  cli_pool.Task {
+    key: "check:#{r.src}",
+    args: [...extra, "--", r.src],
+    set: [(BUILD_ONLY, r.out), (BUILD_KIND, "check")],
+    log: "#{r.out}.check"
+  }
+
+#[doc("The child that builds `members` as one binary into `out`, under `key`.")]
+pub fn group_task(extra: [String], members: [Runner], key: String, out: String) : Task =
+  cli_pool.Task {
+    key,
+    args: [...extra, "--", ...members | (m => m.src)],
+    set: [(BUILD_ONLY, out), (BUILD_KIND, "group")],
+    log: "#{out}.build"
+  }
+
+#[doc("The run order `kaic2 --test-plan` wrote for `stem` into `plan`, space-separated.")]
+pub fn homes(plan: String, stem: String) : String / File =
+  match list.find(
+    string.split(cli_fs.read_or_empty(plan), "\n"),
+    l => string.starts_with(l, "#{stem}\t")
+  ) {
+    Some(l) -> string.drop_prefix(l, "#{stem}\t").unwrap_or("")
+    None -> ""
+  }
+
+# A root module name no member's stem takes.
+fn root_stem(stems: [String], name: String) : String =
+  if stems.contains(name) { root_stem(stems, "#{name}_") } else { name }
+
+fn build_group(
+  t: Toolchain,
+  b: Backend,
+  pass: Pass,
+  srcs: [String],
+  out: String,
+  tmp: String
+) : Result[Unit, Int] / Stderr + Env + File + Ffi {
+  let stems = srcs | (s => cli_fs.stem(s))
+  let root = "#{tmp}/#{root_stem(stems, "kai_test_group")}.kai"
+  let _ = write_file(root, "")
+  let roots = stems || (s => ["--test-root", s])
+  let job = cli_plan.Job {
+    src: root,
+    tmp,
+    out,
+    verb: "test",
+    extra: [pass.flag, ...pass.extra, ...roots, "--test-plan", "#{out}.plan"]
+  }
+  cli_compile.compile_in(t, b, job, cli_fs.dirname(list.head(srcs).unwrap_or(".")))
+}
+
+#[doc("A child's side: build what `BUILD_KIND` names from `srcs` into `out` with the parent run's backend and kaic2 flags; nothing runs.")]
+pub fn build_only(
+  t: Toolchain,
+  backend: String,
+  extra: [String],
+  srcs: [String],
+  out: String
+) : Result[Int, Int] / Stderr + Env + File + Ffi {
+  let kind = env.get(BUILD_KIND).unwrap_or("")
+  let _ = env.unset(BUILD_ONLY)
+  let _ = env.unset(BUILD_KIND)
+  let b = cli_compile.resolve_backend(backend)!
+  let pass = cli_blocks.Pass { kind: "test", flag: "--test", extra }
+  let job = (tmp: String) => cli_blocks.runner_job(
+    pass,
+    cli_blocks.Runner { src: list.head(srcs).unwrap_or(""), out, header: "" },
+    tmp
+  )
+  cli_fs.with_scratch(
+    tmp => match kind {
+      "check" -> cli_compile.front_check(t, b, job(tmp)).map(u => 0)
+      "group" -> build_group(t, b, pass, srcs, out, tmp).map(u => 0)
+      _ -> cli_compile.compile(t, b, job(tmp)).map(u => 0)
+    }
+  )
+}

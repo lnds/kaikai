@@ -1,129 +1,133 @@
 #[doc("""
-Runner builds ahead of their runs: up to `jobs` child `kai test`
-compiles in flight, each in its own scratch with its output captured.
-The runs stay serial and in order, each after its build's replayed
-output, so the run reads as if every build happened in its turn.
+A package's test runs with their builds started ahead: up to `jobs`
+child `kai test` builds in flight, each in its own scratch with its
+output captured. Test files sharing a directory build as one binary
+(`cli_group`), each checked alone first. The runs stay serial and in
+order, each after its own build or check output, so a run reads as if
+every file were built in its turn.
 """)]
 
-import os.env
 import cli_blocks
 import cli_compile
 import cli_fs
-import cli_plan
-import cli_proc
+import cli_group
+import cli_pool
 import cli_sys
 import cli_toolchain
 
-#[doc("The variable naming the binary a child `kai test` builds from its one file instead of running it.")]
-pub const BUILD_ONLY : String = "KAI_TEST_BUILD_ONLY"
+type Ctx = { t: Toolchain, b: Backend, pass: Pass, tmp: String, groups: [Group] }
 
-type Ctx = { t: Toolchain, b: Backend, pass: Pass, jobs: Int, tmp: String }
+# The pool, the group binaries built so far (keyed by group), and the aggregate status.
+type St = { pool: Pool, built: [(String, String)], status: Int, warmed: Bool }
 
-# A started child build: its handle and the stem of its captured stdout/stderr.
-type Slot = { pid: Int, log: String }
+# Children start only after one build ran in place: it settles the backend's
+# degradation and the package's first-use setup (kai-pkg, the lock, `[native]`
+# objects), which concurrent first builds would race on.
+fn backend(c: Ctx) : String / Ffi = if cli_sys.no_llvm() { "c" } else { c.b.name }
 
-# The backend a child builds with. Children wait for one build in place: it settles
-# the backend's degradation and the package's first-use setup (kai-pkg, the lock,
-# `[native]` objects), which concurrent first builds would race on.
-fn ahead_backend(b: Backend, warmed: Bool) : Option[String] / Ffi =
-  if not warmed {
-    None
-  } else if cli_sys.no_llvm() {
-    Some("c")
+fn fill(c: Ctx, st: St) : St / Ffi =
+  if st.warmed { St { ...st, pool: cli_pool.fill(st.pool, backend(c)) } } else { st }
+
+fn await(c: Ctx, st: St, key: String) : (Done, St) / Ffi {
+  let r = cli_pool.await(st.pool, backend(c), key)
+  (r.fst, St { ...st, pool: r.snd })
+}
+
+fn fail[a](st: St, rc: Int) : Result[a, Int] / Ffi {
+  cli_pool.drain(st.pool)
+  Err(rc)
+}
+
+fn ran(c: Ctx, st: St, r: Runner, bin: String, homes: String) : St / Env + File + Ffi =
+  St { ...st, status: cli_blocks.ran_in(r.src, bin, c.tmp, homes, st.status) }
+
+# A runner built on its own: in place before any child may start, else by its child.
+fn alone(c: Ctx, st: St, r: Runner) : Result[St, Int] / Stderr + Env + File + Ffi =
+  if not st.warmed {
+    cli_compile.compile(c.t, c.b, cli_blocks.runner_job(c.pass, r, c.tmp))!
+    Ok(ran(c, St { ...st, warmed: true }, r, r.out, ""))
   } else {
-    Some(b.name)
+    let w = await(c, st, "full:#{r.src}")
+    cli_pool.replay(w.fst)
+    if w.fst.rc != 0 { fail(w.snd, w.fst.rc) } else { Ok(ran(c, w.snd, r, r.out, "")) }
   }
 
-fn start(c: Ctx, backend: String, r: Runner) : Slot / Ffi {
-  let log = "#{r.out}.build"
-  let argv =
-    ["#{c.t.layout.root}/bin/kai", "test", "--backend", backend, ...c.pass.extra, "--", r.src]
-  let sp =
-    cli_proc.Spawn {
-      ...cli_proc.inherit(),
-      out: "#{log}.out",
-      err: "#{log}.err",
-      set: [(BUILD_ONLY, r.out)]
+# The first member whose check failed; each check's output stays for its own turn.
+fn first_failed(c: Ctx, st: St, ms: [Runner], i: Int) : (Option[Int], St) / Ffi =
+  match ms {
+    [] -> (None, st)
+    [m, ...rest] -> {
+      let w = await(c, st, "check:#{m.src}")
+      if w.fst.rc != 0 { (Some(i), w.snd) } else { first_failed(c, w.snd, rest, i + 1) }
     }
-  Slot { pid: cli_proc.start(argv, sp), log }
-}
-
-# Start the next runners until `c.jobs` builds are in flight.
-fn fill(c: Ctx, backend: String, upcoming: [Runner], slots: [Slot]) : ([Runner], [Slot]) / Ffi =
-  match upcoming {
-    [r, ...rest] if list.length(slots) < c.jobs ->
-      fill(c, backend, rest, slots ++ [start(c, backend, r)])
-    _ -> (upcoming, slots)
   }
 
-fn finish(s: Slot) : Int / Ffi = if s.pid < 0 { 127 } else { cli_sys.wait(s.pid) }
-
-fn drain(slots: [Slot]) : Unit / Ffi = slots
-  |> foreach(s => {
-    let _ = finish(s)
-  })
-
-# The build a runner's turn waits on, its output replayed: its status.
-fn built(s: Slot) : Int / Ffi {
-  let rc = finish(s)
-  if cli_sys.size("#{s.log}.out") > 0 { cli_sys.copy_to_stdout("#{s.log}.out") }
-  cli_plan.replay("#{s.log}.err")
-  rc
-}
-
-# One runner's turn: built ahead when a child holds it, else in place.
-fn turn(
-  c: Ctx,
-  r: Runner,
-  slots: [Slot],
-  status: Int
-) : Result[Int, Int] / Stderr + Env + File + Ffi {
-  if r.header != "" { Stderr.eprint(r.header) }
-  match slots {
-    [s, ...rest] -> {
-      let rc = built(s)
-      if rc != 0 {
-        drain(rest)
-        Err(rc)
+# A failed group build: rebuilt from the members before the first one that does not
+# check alone, which then stops the run in its turn; when every member checks alone,
+# the group build's failure is the run's.
+fn rebuild(c: Ctx, st: St, g: Group, failed: Done) : Result[(String, St), Int] / Stderr + Ffi {
+  let k = first_failed(c, st, g.members, 0)
+  match k.fst {
+    Some(n) -> {
+      let out = "#{g.out}-#{n}"
+      let t = cli_group.group_task(c.pass.extra, list.take(g.members, n), "group:#{out}", out)
+      let w = cli_pool.now(k.snd.pool, backend(c), t)
+      if w.fst.rc == 0 {
+        Ok((out, St { ...k.snd, pool: w.snd }))
       } else {
-        Ok(cli_blocks.ran(r.src, r.out, c.tmp, status))
+        cli_pool.replay(w.fst)
+        fail(St { ...k.snd, pool: w.snd }, w.fst.rc)
       }
     }
-    [] -> {
-      cli_compile.compile(c.t, c.b, cli_blocks.runner_job(c.pass, r, c.tmp))!
-      Ok(cli_blocks.ran(r.src, r.out, c.tmp, status))
+    None -> {
+      cli_pool.replay(failed)
+      fail(k.snd, failed.rc)
     }
   }
 }
 
-fn steps_loop(
-  c: Ctx,
-  steps: [Step],
-  upcoming: [Runner],
-  slots: [Slot],
-  status: Int,
-  warmed: Bool
-) : Result[Int, Int] / Stderr + Env + File + Ffi =
+fn group_bin(c: Ctx, st: St, g: Group) : Result[(String, St), Int] / Stderr + Ffi =
+  match list.find(st.built, b => b.fst == g.out) {
+    Some(b) -> Ok((b.snd, st))
+    None -> {
+      let w = await(c, st, "group:#{g.out}")
+      let got = if w.fst.rc == 0 { Ok((g.out, w.snd)) } else { rebuild(c, w.snd, g, w.fst) }
+      got.map(p => (p.fst, St { ...p.snd, built: p.snd.built ++ [(g.out, p.fst)] }))
+    }
+  }
+
+fn grouped(c: Ctx, st: St, g: Group, r: Runner) : Result[St, Int] / Stderr + Env + File + Ffi {
+  let w = await(c, st, "check:#{r.src}")
+  cli_pool.replay(w.fst)
+  if w.fst.rc != 0 {
+    fail(w.snd, w.fst.rc)
+  } else {
+    let b = group_bin(c, w.snd, g)!
+    Ok(ran(c, b.snd, r, b.fst, cli_group.homes("#{b.fst}.plan", cli_fs.stem(r.src))))
+  }
+}
+
+fn turn(c: Ctx, st: St, r: Runner) : Result[St, Int] / Stderr + Env + File + Ffi {
+  if r.header != "" { Stderr.eprint(r.header) }
+  let ready = fill(c, st)
+  match cli_group.group_of(c.groups, r) {
+    Some(g) -> grouped(c, ready, g, r)
+    None -> alone(c, ready, r)
+  }
+}
+
+fn steps_loop(c: Ctx, steps: [Step], st: St) : Result[Int, Int] / Stderr + Env + File + Ffi =
   match steps {
-    [] -> Ok(status)
+    [] -> Ok(st.status)
     [Warn(msg), ...rest] -> {
       Stderr.eprint(msg)
-      steps_loop(c, rest, upcoming, slots, status, warmed)
+      steps_loop(c, rest, st)
     }
     [Build(r), ...rest] -> if cli_sys.pending_signal() != 0 {
-      drain(slots)
-      Ok(status)
+      cli_pool.drain(st.pool)
+      Ok(st.status)
     } else {
-      let next = match ahead_backend(c.b, warmed) {
-        Some(name) -> fill(c, name, upcoming, slots)
-        None -> (upcoming, slots)
-      }
-      let ahead = match next.snd {
-        [] -> list.drop(next.fst, 1)
-        _ -> next.fst
-      }
-      let st = turn(c, r, next.snd, status)!
-      steps_loop(c, rest, ahead, list.drop(next.snd, 1), st, true)
+      steps_loop(c, rest, turn(c, st, r)!)
     }
   }
 
@@ -134,10 +138,26 @@ fn runners(steps: [Step]) : [Runner] =
       Warn(_) -> []
     })
 
+fn leads(g: Group, r: Runner) : Bool =
+  list.head(g.members).map(m => m.src == r.src).unwrap_or(false)
+
+# In run order: each runner's whole build or its check, a group's build ahead of its first check.
+fn queue(c: Ctx, rs: [Runner]) : [Task] =
+  rs
+    || (r => match cli_group.group_of(c.groups, r) {
+      None -> [cli_group.full_task(c.pass.extra, r)]
+      Some(g) -> (if leads(g, r) {
+        [cli_group.group_task(c.pass.extra, g.members, "group:#{g.out}", g.out)]
+      } else {
+        []
+      })
+        ++ [cli_group.check_task(c.pass.extra, r)]
+    })
+
 #[doc("""
-Take `steps` in order with up to `jobs` runner builds in flight; one job
-builds each in place. `warmed` says a build already ran in place;
-until one has, the first runner builds in place.
+Take `steps` in order with up to `jobs` builds in flight. `warmed` says
+a build already ran in place; until one has, the first runner builds in
+place and on its own, and no child starts.
 """)]
 pub fn run(
   t: Toolchain,
@@ -148,27 +168,11 @@ pub fn run(
   status: Int,
   tmp: String,
   warmed: Bool
-) : Result[Int, Int] / Stderr + Env + File + Ffi =
-  if jobs <= 1 {
-    cli_blocks.run_steps(t, b, pass, steps, status, tmp)
-  } else {
-    cli_toolchain.ensure_built(t)!
-    steps_loop(Ctx { t, b, pass, jobs, tmp }, steps, runners(steps), [], status, warmed)
-  }
-
-#[doc("A child's side: build runner `src` into `out` with the parent run's `--backend` and kaic2 flags; nothing runs.")]
-pub fn build_only(
-  t: Toolchain,
-  backend: String,
-  extra: [String],
-  src: String,
-  out: String
 ) : Result[Int, Int] / Stderr + Env + File + Ffi {
-  let _ = env.unset(BUILD_ONLY)
-  let b = cli_compile.resolve_backend(backend)!
-  let pass = cli_blocks.Pass { kind: "test", flag: "--test", extra }
-  let r = cli_blocks.Runner { src, out, header: "" }
-  cli_fs.with_scratch(
-    tmp => cli_compile.compile(t, b, cli_blocks.runner_job(pass, r, tmp)).map(u => 0)
-  )
+  cli_toolchain.ensure_built(t)!
+  let rs = runners(steps)
+  let shared = if warmed { rs } else { list.drop(rs, 1) }
+  let c = Ctx { t, b, pass, tmp, groups: cli_group.groups(shared, tmp) }
+  let pool = cli_pool.new("#{t.layout.root}/bin/kai", jobs, queue(c, shared))
+  steps_loop(c, steps, St { pool, built: [], status, warmed })
 }

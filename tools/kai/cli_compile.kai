@@ -1,5 +1,6 @@
 #[doc("Compile an entry file to a binary: resolve the package around it, then build through the chosen backend.")]
 
+import path
 import cli_caches
 import cli_cmodular
 import cli_csingle
@@ -163,11 +164,18 @@ fn search_flags(
 
 #[doc("Resolve the package around `job.src`: search paths, edition, `[unstable]` opt-ins, caches, native dependencies.")]
 pub fn plan(t: Toolchain, job: Job) : Result[Plan, Int] / Stderr + Env + File + Ffi =
+  plan_in(t, job, cli_fs.dir_of(job.src).unwrap_or("."))
+
+#[doc("`plan` with `src_dir` standing in for the entry's own directory: the build resolves as if the entry sat there.")]
+pub fn plan_in(
+  t: Toolchain,
+  job: Job,
+  src_dir: String
+) : Result[Plan, Int] / Stderr + Env + File + Ffi =
   if not cli_sys.is_file(job.src) {
     not_found(job.src, job.verb)
   } else {
     cli_toolchain.ensure_built(t)!
-    let src_dir = cli_fs.dir_of(job.src).unwrap_or(".")
     let manifest = cli_manifest.find_dir(src_dir).unwrap_or("")
     let edition = edition_flag(t.layout, manifest)!
     let pkg = if manifest == "" { [] } else { cli_pkg.path_flags(t, manifest, job.tmp)! }
@@ -175,7 +183,16 @@ pub fn plan(t: Toolchain, job: Job) : Result[Plan, Int] / Stderr + Env + File + 
     check_cc(t, native)!
     let inputs = native_link_inputs(t, native, job.tmp)!
     let flags = search_flags(t, src_dir, manifest, pkg, edition)
-    Ok(cli_plan.Plan { t, job, src_dir, manifest, flags, native, native_objs: inputs.fst, libs: inputs.snd })
+    Ok(cli_plan.Plan {
+      t,
+      job,
+      src_dir,
+      manifest,
+      flags,
+      native,
+      native_objs: inputs.fst,
+      libs: inputs.snd
+    })
   }
 
 fn whole_program(p: Plan, b: Backend) : Result[Unit, Int] / Stderr + Env + File + Ffi =
@@ -216,11 +233,51 @@ fn dispatch(p: Plan, b: Backend) : Result[Unit, Int] / Stderr + Env + File + Ffi
     cli_csingle.build(p)
   }
 
+fn effective(b: Backend) : Backend / Ffi =
+  if (not b.explicit) and cli_sys.no_llvm() {
+    cli_plan.Backend { name: "c", explicit: true }
+  } else {
+    b
+  }
+
 #[doc("Build `job.src` into `job.out` through backend `b`; once an implicit native degraded, the rest of the run builds C without a note.")]
-pub fn compile(t: Toolchain, b: Backend, job: Job) : Result[Unit, Int] / Stderr + Env + File + Ffi {
-  let p = plan(t, job)!
-  let degraded = (not b.explicit) and cli_sys.no_llvm()
-  dispatch(p, if degraded { cli_plan.Backend { name: "c", explicit: true } } else { b })
+pub fn compile(t: Toolchain, b: Backend, job: Job) : Result[Unit, Int] / Stderr + Env + File + Ffi =
+  dispatch(plan(t, job)!, effective(b))
+
+#[doc("`compile` resolving the build from `src_dir` instead of the entry's directory (see `plan_in`).")]
+pub fn compile_in(
+  t: Toolchain,
+  b: Backend,
+  job: Job,
+  src_dir: String
+) : Result[Unit, Int] / Stderr + Env + File + Ffi =
+  dispatch(plan_in(t, job, src_dir)!, effective(b))
+
+#[doc("""
+Run only the front end of the build `compile` would run: the same
+diagnostics under the same path, and the status a failed build of that
+backend reports; nothing is emitted or linked.
+""")]
+pub fn front_check(
+  t: Toolchain,
+  b: Backend,
+  job: Job
+) : Result[Unit, Int] / Stderr + Env + File + Ffi {
+  let p = plan(t, cli_plan.Job { ...job, extra: job.extra ++ ["--check"] })!
+  if effective(b).name == "c" {
+    let rc = cli_proc.run(cli_plan.kaic2(p, [], job.src), cli_plan.kaic2_spawn([], "/dev/null", ""))
+    if rc == 0 { Ok(()) } else { Err(rc) }
+  } else {
+    let base = cli_fs.basename(job.src)
+    let entry = "#{job.tmp}/#{base}"
+    let shown = if path.is_absolute(job.src) { job.src } else { "#{p.src_dir}/#{base}" }
+    let err = "#{job.tmp}/check.err"
+    let _ = cli_fs.copy(job.src, entry)
+    let rc = cli_proc.run(cli_plan.kaic2(p, [], entry), cli_plan.kaic2_spawn([], "/dev/null", err))
+    cli_plan.rewrite_paths(err, entry, shown)
+    cli_plan.replay(err)
+    if rc == 0 { Ok(()) } else { Err(1) }
+  }
 }
 
 #[doc("The kaic2 flags ahead of `src` for a front-end-only run: the package's search paths, edition, `[unstable]` opt-ins and caches.")]
