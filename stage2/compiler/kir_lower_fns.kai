@@ -534,17 +534,11 @@ fn lower_clause_params_idx(params: [Param], i: Int, n: Int, acc: [KParam]) : [KP
 
 # Canonicalise op-thunk layout so the Ev field index of an op is intrinsic
 # to the EFFECT, not to a particular handler. A `KPerform` resolves an op's
-# field statically (from the innermost matching handler) but derefs whichever
-# node the fiber carries at runtime — a parent handler in-scope, or the effect's
-# default node in a spawned child (evidence does not cross the spawn boundary,
-# so the child resolves the effect to its default). If a handler's op_thunks
-# and the default node disagree on order, the static field lands on the wrong
-# slot of the default node. Reorder each handler of a DEFAULT-carrying effect
-# into that effect's default-block order and fill omitted ops with the default
-# forwarder — so install (nemit_install_ops) and dispatch (nfx_op_field) match
-# the default node WITHOUT dropping any slot. A handler for an effect with no
-# default block is left untouched: no default node exists to disagree with, and
-# its op_thunks are self-consistent across its own install and dispatch.
+# field statically from one handler decl of the effect, but derefs whichever
+# node the fiber carries at runtime — any other handler of the same effect, or
+# its default node. A DEFAULT-carrying effect's handlers take the default-block
+# order, omitted ops filled with the default forwarder; every other handler
+# takes the effect's declaration order (the C backend's `Ev` struct layout).
 fn canon_handler_op_order(hs: [KHandlerDecl], decls: [Decl]) : [KHandlerDecl] = match hs {
   [] -> []
   [h, ...rest] -> [canon_one_handler(h, decls), ...canon_handler_op_order(rest, decls)]
@@ -555,19 +549,57 @@ fn canon_handler_op_order(hs: [KHandlerDecl], decls: [Decl]) : [KHandlerDecl] = 
 # the WRONG decl's default ops. Reorder only when the resolved default block is a
 # superset of the handler's ops — i.e. the handler and the default belong to the
 # same effect. A homonym whose ops the default block does not cover is left
-# untouched (it has no runtime default node of its own to disagree with).
+# untouched by the default and laid out by its own declaration instead.
 fn canon_one_handler(h: KHandlerDecl, decls: [Decl]) : KHandlerDecl =
   match kir_default_for_effect(h.eff, decls) {
-    None     -> h
+    None     -> canon_decl_order(h, decls)
     Some(kd) -> match kd {
       KDef(_, _, defops) ->
         if op_thunks_covered_by(h.op_thunks, defops) {
-          KHandlerDecl { eff: h.eff, eff_sym: h.eff_sym, sym: h.sym,
-                         op_thunks: reorder_op_thunks(defops, h.op_thunks),
-                         ret_thunk: h.ret_thunk, env_caps: h.env_caps }
-        } else { h }
+          KHandlerDecl { ...h, op_thunks: reorder_op_thunks(defops, h.op_thunks) }
+        } else { canon_decl_order(h, decls) }
     }
   }
+
+# The typer rejects a handler that omits an op, so a handler of the effect is
+# a permutation of its declared ops; a decl it is not a permutation of belongs
+# to a homonym and leaves the handler as written.
+fn canon_decl_order(h: KHandlerDecl, decls: [Decl]) : KHandlerDecl =
+  match find_effect_ops(h, decls) {
+    None      -> h
+    Some(ops) ->
+      if op_thunks_covered_by(h.op_thunks, ops) and defops_handled_by(ops, h.op_thunks) {
+        KHandlerDecl { ...h, op_thunks: reorder_op_thunks(ops, h.op_thunks) }
+      } else { h }
+  }
+
+# The handled effect's ops as `KDefOp`s in declaration order: by id when the
+# handler is stamped, else by name.
+fn find_effect_ops(h: KHandlerDecl, decls: [Decl]) : Option[[KDefOp]] = match decls {
+  [] -> None
+  [d, ...rest] -> match d {
+    DEffect(_, eff, _, ops, _, _, _, _, esym) ->
+      if effect_decl_matches(h, eff, esym) { Some(decl_op_names(ops)) }
+      else { find_effect_ops(h, rest) }
+    _ -> find_effect_ops(h, rest)
+  }
+}
+
+fn defops_handled_by(ops: [KDefOp], thunks: [KOpThunk]) : Bool = match ops {
+  []                     -> true
+  [KDOp(op, _), ...rest] -> match find_op_thunk(thunks, op) {
+    None    -> false
+    Some(_) -> defops_handled_by(rest, thunks)
+  }
+}
+
+fn effect_decl_matches(h: KHandlerDecl, eff: String, esym: SymId) : Bool =
+  if sym_raw(h.eff_sym) >= 0 { sym_raw(h.eff_sym) == sym_raw(esym) } else { h.eff == eff }
+
+fn decl_op_names(ops: [EffectOp]) : [KDefOp] = match ops {
+  [] -> []
+  [EOp(op, _, _, _, _, _), ...rest] -> [KDOp(op, ""), ...decl_op_names(rest)]
+}
 
 # True when every op the handler provides appears in `defops` (the resolved
 # default block's op set) — the guard that a name-resolved default belongs to
