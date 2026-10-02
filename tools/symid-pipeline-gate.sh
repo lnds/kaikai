@@ -88,11 +88,10 @@ need '^own effect Log__rb#[0-9]+ Log@rb$'
 [ "$(id_of '^kperform ra__run Log__ra')" = "$(id_of '^own effect Log__ra')" ] \
   || fail "a perform carries a different id than the declaration it names"
 
-# A declaration keeps its identity through the typer's cache. A cached module
-# is stored without its declaration-level ids (they index one build's table),
-# so a warm build would reach the late passes with `#-1` on every function,
-# type, effect and protocol while a cold build reaches them stamped — and both
-# still run. Same invocation twice over one cache dir: the second is warm.
+# A declaration keeps its identity through the typer's cache: a warm build
+# must reach the late passes with the ids a cold build stamps, not `#-1` —
+# both would still run. Same invocation twice over one cache dir: the second
+# is warm.
 CACHE="$(mktemp -d)"
 trap 'rm -rf "$CACHE"' EXIT
 own_lines() {
@@ -109,6 +108,36 @@ printf '%s\n' "$cold" | grep -qE '^own effect Loud#[0-9]+ Loud@main$' \
 printf '%s\n' "$warm" | grep -q '#-1' \
   && fail "a warm build reaches the late passes with a declaration stripped of its id"
 [ "$cold" = "$warm" ] || fail "a warm build's declaration ids differ from a cold build's"
+
+# An id is derived from (home, class, name), not from where the declaration
+# sits in the stream: two programs whose root `main` sits among different
+# declarations give it one id.
+main_id() {
+  "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
+    --path "$1" --path "$ROOT/stdlib" "$1/main.kai" 2>/dev/null \
+    | grep -E '^own fn main#[0-9]+ main@main$' | sed -E 's/.*#([0-9]+) .*/\1/'
+}
+# A root file's home is the target, which its bytes do not spell. The same
+# source under another target name must miss the first one's cache entry,
+# not restore declarations homed there.
+TWIN="$(mktemp -d)"
+trap 'rm -rf "$CACHE" "$TWIN"' EXIT
+cp "$ALIASFIX/main.kai" "$TWIN/twin.kai"
+twin_own() {
+  "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --user-cache --user-cache-dir "$1" \
+    --core-cache-dir "$1" --dump-symids \
+    --path "$TWIN" --path "$ROOT/stdlib" "$TWIN/twin.kai" | grep -E '^own '
+}
+shared=$(twin_own "$CACHE")
+fresh=$(twin_own "$TWIN")
+out=$(printf 'over main.kai cache:\n%s\nfresh:\n%s\n' "$shared" "$fresh")
+printf '%s\n' "$shared" | grep -q '@main$' && fail "a cached root restored ids homed under another target"
+[ "$shared" = "$fresh" ] || fail "a root compiled over another target's cache differs from a fresh build"
+
+a=$(main_id "$ALIASFIX")
+b=$(main_id "$HOMOFIX")
+out="alias main#$a, homonym main#$b"
+[ -n "$a" ] && [ "$a" = "$b" ] || fail "one declaration key carries two ids across two programs"
 
 # A root call reaches the root declaration even when a core homonym
 # exists, and a name the root does not declare still reaches the core.
@@ -152,4 +181,4 @@ direct=$(printf '%s\n' "$kir" | awk '/^fn pkg__direct\(/{on=1} on{print} on&&/^}
 printf '%s\n' "$direct" | grep -q 'int.unbox' \
   && { out=$direct; fail "pkg.direct re-unboxes its own callee's result"; }
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, and a callee's signature class is its own declaration's"
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, and a callee's signature class is its own declaration's"
