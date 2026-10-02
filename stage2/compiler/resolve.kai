@@ -52,6 +52,7 @@ import compiler.util
 import compiler.diag
 import compiler.ast
 import compiler.effect_alias_scope
+import compiler.home_spell
 import compiler.diag_file
 import compiler.refinements
 import compiler.native_prims
@@ -88,6 +89,7 @@ pub type Env = { chain: ScopeChain, had_error: Bool, file: String,
               # that declares the op (`effect_alias_scope`).
               row_aliases: [RowAlias],
               eff_ops: [EffOps],
+              eff_spellings: [EffSpelling],
               # Structured diagnostic collection for T3
               # (`cannot find <name> in this scope`). Mirrors
               # `InferState.diags` semantics (reverse order, flipped at
@@ -100,7 +102,7 @@ pub type Env = { chain: ScopeChain, had_error: Bool, file: String,
 #[doc("Fresh resolver env for `file` with a single empty scope and no errors.")]
 pub fn env_new(file: String) : Env =
   Env { chain: ch_new(), had_error: false, file: file, alias_heads: [],
-        row_aliases: [], eff_ops: [], diags: [], rs: rs_off() }
+        row_aliases: [], eff_ops: [], eff_spellings: [], diags: [], rs: rs_off() }
 
 fn env_with_chain(e: Env, c: ScopeChain) : Env =
   Env { ...e, chain: c }
@@ -566,7 +568,23 @@ fn chk_pipe(e: Env, a: Expr, b: Expr,
 # The effect a handler head names. A qualifier picks the module
 # outright; a bare name climbs the scope view like any other class.
 fn chk_handle_sym(e: Env, en: String) : SymId =
-  if rs_recording(e.rs) { rs_effect_sym(e.rs, en) } else { sym_none() }
+  if rs_recording(e.rs) {
+    let s = rs_effect_sym(e.rs, en)
+    if sym_raw(s) >= 0 { s } else { chk_spelled_effect_sym(e, en) }
+  } else { sym_none() }
+
+# A contested effect is spelled `E__home` before the resolver runs, a name
+# the table does not hold: it registers the declaration under the name its
+# author wrote. The spelling table, built from the same declarations, maps
+# the spelled head back to that name and the module declaring it.
+fn chk_spelled_effect_sym(e: Env, spelled: String) : SymId =
+  match es_lookup(e.eff_spellings, spelled) {
+    None -> sym_none()
+    Some(ESp(_, display, mo)) -> match mo {
+      None    -> sym_none()
+      Some(m) -> rs_decl_owner_sym(rs_at_home(e.rs, m), NCEffect, display)
+    }
+  }
 
 # The effect heading an op call `Eff.op` is settled the way a handler
 # head is. A name the value lookup left bare is not a value, and a local
@@ -872,7 +890,7 @@ fn chk_decl(e: Env, d: Decl) : RDecl / Console + File {
     # "no module".
     DEffect(p_, n, tps, ops, dblk, l, c, mo, _) ->
       RDecl(e, DEffect(p_, n, tps, ops, dblk, l, c, mo,
-                       env_decl_owner_sym(e, NCEffect, n)))
+                       env_decl_owner_sym(e, NCEffect, hs_display(n, mo))))
     # protocol / impl / derive decls are stripped by `lower_protocols`
     # before `check_program` runs, so reaching one here means the
     # pipeline was driven directly into `chk_decl` (e.g. via `--check`
@@ -973,9 +991,10 @@ fn register_one(e: Env, d: Decl) : Env {
     DBench(_, _, _, _, _) -> e
     DCheck(_, _, _, _, _, _) -> e
     DImport(ik, _, _) -> register_import(e, ik)
-    DEffect(_, name, _, ops, _, _, _, _, _) -> {
+    DEffect(_, name, _, ops, _, _, _, mo, _) -> {
       let e1 = env_add(e, name, NCEffect)
-      Env { ...e1, eff_ops: [EO(name, eff_op_names(ops, [])), ...e1.eff_ops] }
+      Env { ...e1, eff_ops: [EO(name, eff_op_names(ops, [])), ...e1.eff_ops],
+                   eff_spellings: es_note(e1.eff_spellings, name, mo) }
     }
     # stripped pre-resolve; never reaches register_one in practice.
     # No-op for completeness so the match stays exhaustive.
