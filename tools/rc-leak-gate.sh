@@ -135,16 +135,17 @@ while IFS= read -r name; do
   measured="$(cut -d: -f2 "$WORK/$name.measured" 2>/dev/null)"
   growth="$(cut -d: -f3 "$WORK/$name.measured" 2>/dev/null)"
   expect="$(pinned "$name")"
-  if [ "$expect" = - ]; then
-    continue
-  elif [ -z "$expect" ]; then
+  [ "$expect" = - ] && continue
+  if [ -z "$expect" ]; then
     echo "FAIL $name — not in $(basename "$BASELINE"); measured leaked=$measured"
     fail=1
   elif [ "$measured" != "$expect" ]; then
     echo "FAIL $name — leaked=$measured, baseline $expect"
     [ "$measured" = BUILD-FAIL ] && tail -4 "$WORK/$name.build" 2>/dev/null | sed 's/^/    /'
     fail=1
-  elif [ "$growth" != "$(pinned_growth "$name")" ]; then
+  fi
+  # Checked even when leaked failed: a moved pin says nothing about growth.
+  if [ "$growth" != - ] && [ "$growth" != "$(pinned_growth "$name")" ]; then
     echo "FAIL $name — leaked grows by $growth per run of main, pinned growth $(pinned_growth "$name")"
     fail=1
   fi
