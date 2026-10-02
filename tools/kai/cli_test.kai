@@ -7,33 +7,65 @@ import cli_compile
 import cli_err
 import cli_fs
 import cli_manifest
-import cli_plan
+import cli_prebuild
 import cli_proc
 import cli_sys
 import cli_test_help
 
-# `--json` and `--only` shape how the runners report and what they run, not how they compile.
-type TestOpts = { json: Bool, only: [String], backend: String, extra: [String], help: Bool }
+# `--json` and `--only` shape how the runners report and what they run, not how they compile; `jobs` 0 is one per CPU.
+type TestOpts = {
+  json: Bool,
+  only: [String],
+  backend: String,
+  jobs: Int,
+  extra: [String],
+  help: Bool
+}
 
 fn add_only(o: TestOpts, v: String) : TestOpts = TestOpts { ...o, only: o.only ++ [v] }
 
+fn with_jobs(o: TestOpts, v: String) : Result[TestOpts, Int] / Stderr =
+  match string.to_int(v) {
+    Some(n) if n > 0 -> Ok(TestOpts { ...o, jobs: n })
+    _ -> cli_err.die("--jobs must be a positive integer (got: #{v})")
+  }
+
 fn with_backend(o: TestOpts, v: String) : Result[TestOpts, Int] / Stderr =
   cli_compile.backend_name(v).map(b => TestOpts { ...o, backend: b })
+
+const VALUED : [String] = ["--only", "--backend", "-j", "--jobs"]
+
+fn missing(a: String) : String =
+  match a {
+    "--only" -> "--only needs an argument (see 'kai test --help')"
+    "--backend" -> "--backend needs an argument (c|native)"
+    _ -> "#{a} needs an argument (a job count)"
+  }
+
+# `--key=value` reads as `--key value` for the flags that take one.
+fn split_valued(a: String) : [String] =
+  match string.index_of(a, "=") {
+    Some(i) if VALUED.contains(string_slice(a, 0, i)) ->
+      [string_slice(a, 0, i), string_slice(a, i + 1, string_length(a) - i - 1)]
+    _ -> [a]
+  }
+
+fn valued(o: TestOpts, flag: String, v: String) : Result[TestOpts, Int] / Stderr =
+  match flag {
+    "--only" -> Ok(add_only(o, v))
+    "--backend" -> with_backend(o, v)
+    _ -> with_jobs(o, v)
+  }
 
 fn parse(args: [String], o: TestOpts) : Result[(TestOpts, [String]), Int] / Stderr =
   match args {
     [] -> Ok((o, []))
     [a, ..._] if a == "-h" or a == "--help" -> Ok((TestOpts { ...o, help: true }, []))
     ["--json", ...rest] -> parse(rest, TestOpts { ...o, json: true })
-    ["--only"] -> cli_err.die("--only needs an argument (see 'kai test --help')")
-    ["--only", v, ...rest] -> parse(rest, add_only(o, v))
-    ["--backend"] -> cli_err.die("--backend needs an argument (c|native)")
-    ["--backend", v, ...rest] -> parse(rest, with_backend(o, v)!)
+    [a] if VALUED.contains(a) -> cli_err.die(missing(a))
+    [a, v, ...rest] if VALUED.contains(a) -> parse(rest, valued(o, a, v)!)
     ["--", ...rest] -> Ok((o, rest))
-    [a, ...rest] if string.starts_with(a, "--only=") ->
-      parse(rest, add_only(o, string.drop_prefix(a, "--only=").unwrap_or("")))
-    [a, ...rest] if string.starts_with(a, "--backend=") ->
-      parse(rest, with_backend(o, string.drop_prefix(a, "--backend=").unwrap_or(""))!)
+    [a, ...rest] if split_valued(a) != [a] -> parse(split_valued(a) ++ rest, o)
     [a, ...rest] if string.starts_with(a, "-") ->
       parse(rest, TestOpts { ...o, extra: o.extra ++ [a] })
     _ -> Ok((o, args))
@@ -74,7 +106,12 @@ fn visit(
 }
 
 # `kai test ./...`: every directory below the cwd carrying a kai.toml, each in its own `kai test`; one verdict over them all.
-fn recursive(t: Toolchain, o: TestOpts, flags: [String], logs: (String, String)) : Int / Stdout + Stderr + File + Ffi {
+fn recursive(
+  t: Toolchain,
+  o: TestOpts,
+  flags: [String],
+  logs: (String, String)
+) : Int / Stdout + Stderr + File + Ffi {
   let here = cli_sys.cwd()
   let dirs = dir_walk(".")
     |? (p => cli_fs.basename(p) == "kai.toml")
@@ -89,7 +126,12 @@ fn recursive(t: Toolchain, o: TestOpts, flags: [String], logs: (String, String))
 }
 
 # The walk's verdict over `(ran, failed)`: `--only` and `--json` settle here, once for every package.
-fn walked(o: TestOpts, logs: (String, String), here: String, r: (Int, Bool)) : Int / Stdout + Stderr + File + Ffi =
+fn walked(
+  o: TestOpts,
+  logs: (String, String),
+  here: String,
+  r: (Int, Bool)
+) : Int / Stdout + Stderr + File + Ffi =
   if r.fst == 0 {
     Stderr.eprint("kai: no buildable packages found under #{here}")
     1
@@ -105,35 +147,39 @@ fn log_file(tmp: String, name: String) : String / File {
   f
 }
 
+fn jobs_of(o: TestOpts) : Int / Ffi = if o.jobs > 0 { o.jobs } else { cli_sys.ncpu() }
+
+fn jobs_flag(o: TestOpts) : [String] =
+  if o.jobs > 0 { ["--jobs", int_to_string(o.jobs)] } else { [] }
+
+fn tests_dir_step(o: TestOpts, tmp: String, tf: String) : Step =
+  cli_blocks.Build(cli_blocks.Runner {
+    src: tf,
+    out: "#{tmp}/#{cli_fs.stem(tf)}-t",
+    header: if o.json { "" } else { "== kai test #{tf}" }
+  })
+
 # The entry, then its `tests/` sibling, then the package's unreachable test files.
 fn run_all(t: Toolchain, b: Backend, o: TestOpts, src: String, root: String, tmp: String) : Result[
   Int,
   Int
 ] / Stderr + Env + File + Ffi {
-  let extra = ["--test", ...o.extra]
+  let pass = cli_blocks.Pass { kind: "test", flag: "--test", extra: o.extra }
   let entry_status = if src == "" {
     0
   } else {
-    let bin = "#{tmp}/#{cli_fs.stem(src)}-t"
-    cli_compile.compile(t, b, cli_plan.Job { src, tmp, out: bin, verb: "test", extra })!
-    cli_blocks.run_binary(src, bin, tmp)
+    let entry = cli_blocks.Runner { src, out: "#{tmp}/#{cli_fs.stem(src)}-t", header: "" }
+    cli_compile.compile(t, b, cli_blocks.runner_job(pass, entry, tmp))!
+    cli_blocks.run_binary(src, entry.out, tmp)
   }
   let tests = cli_blocks.tests_of(if src == "" { root } else { cli_fs.dirname(src) })
-  let status = cli_blocks.fold_files(tests, entry_status, (tf, st) => test_file(t, b, o, tmp, tf, st))!
-  if root == "" {
-    Ok(status)
+  let pkg = if root == "" {
+    []
   } else {
-    let pass = cli_blocks.Pass { kind: "test", flag: "--test", extra: o.extra }
-    cli_blocks.run_package(t, b, root, src, pass, status, not list.is_empty(tests))
+    cli_blocks.package_steps(root, src, pass, not list.is_empty(tests), tmp)
   }
-}
-
-fn test_file(t: Toolchain, b: Backend, o: TestOpts, tmp: String, tf: String, status: Int) : Result[Int, Int] / Stderr + Env + File + Ffi = {
-  let bin = "#{tmp}/#{cli_fs.stem(tf)}-t"
-  if not o.json { Stderr.eprint("== kai test #{tf}") }
-  cli_compile.compile(t, b, cli_plan.Job { src: tf, tmp, out: bin, verb: "test", extra: ["--test", ...o.extra] })!
-  let rc = cli_blocks.run_binary(tf, bin, tmp)
-  Ok(if rc != 0 { rc } else { status })
+  let steps = (tests | (tf => tests_dir_step(o, tmp, tf))) ++ pkg
+  cli_prebuild.run(t, b, pass, jobs_of(o), steps, entry_status, tmp, src != "")
 }
 
 # A selection that matched nothing is a caller error, whatever the output format.
@@ -179,7 +225,7 @@ fn run_suite(
 ) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
   let logs = open_logs(o, tmp)
   let b = cli_compile.resolve_backend(o.backend)!
-  let rec = if o.backend == "" { [] } else { ["--backend", o.backend] }
+  let rec = (if o.backend == "" { [] } else { ["--backend", o.backend] }) ++ jobs_flag(o)
   match rest {
     [s, ..._] if s == "./..." or s == "..." -> Ok(recursive(t, o, rec ++ o.extra, logs))
     _ -> {
@@ -190,13 +236,11 @@ fn run_suite(
   }
 }
 
-#[doc("`kai test [options] [<spec>|./...]`: the aggregate exit status.")]
-pub fn test_verb(
+fn suite(
   t: Toolchain,
-  args: [String]
-) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
-  let parsed = parse(args, TestOpts { json: false, only: [], backend: "", extra: [], help: false })!
-  let o = parsed.fst
+  o: TestOpts,
+  rest: [String]
+) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi =
   if o.help {
     Stdout.print(cli_test_help.test_text())
     Ok(0)
@@ -206,6 +250,19 @@ pub fn test_verb(
       let _ = env.set("KAI_TEST_ONLY", string.join(o.only, "\n"))
     }
     if o.json { let _ = env.set("KAI_TEST_JSON", "1") }
-    cli_fs.with_scratch(tmp => run_suite(t, o, parsed.snd, tmp))
+    cli_fs.with_scratch(tmp => run_suite(t, o, rest, tmp))
+  }
+
+#[doc("`kai test [options] [<spec>|./...]`: the aggregate exit status.")]
+pub fn test_verb(
+  t: Toolchain,
+  args: [String]
+) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
+  let parsed =
+    parse(args, TestOpts { json: false, only: [], backend: "", jobs: 0, extra: [], help: false })!
+  let o = parsed.fst
+  match cli_caches.env_or(cli_prebuild.BUILD_ONLY, "") {
+    "" -> suite(t, o, parsed.snd)
+    out -> cli_prebuild.build_only(t, o.backend, o.extra, list.head(parsed.snd).unwrap_or(""), out)
   }
 }
