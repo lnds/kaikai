@@ -181,4 +181,26 @@ direct=$(printf '%s\n' "$kir" | awk '/^fn pkg__direct\(/{on=1} on{print} on&&/^}
 printf '%s\n' "$direct" | grep -q 'int.unbox' \
   && { out=$direct; fail "pkg.direct re-unboxes its own callee's result"; }
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, and a callee's signature class is its own declaration's"
+# A UFCS callee carries the id of the declaration the receiver's type
+# picked, cold and warm: an imported fn, one chained on another, a private
+# fn called inside its own module, and a root fn. A local binder spelled
+# like the root fn keeps its own reference, so the root id appears once.
+UFCSFIX="$ROOT/examples/namespace-collisions/ufcs_callee_identity"
+ufcs_lines() {
+  "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --user-cache --user-cache-dir "$CACHE" \
+    --core-cache-dir "$CACHE" --dump-symids \
+    --path "$UFCSFIX" --path "$ROOT/stdlib" "$UFCSFIX/main.kai" | grep -E '^perceus (main|twice) (bump|twice|scale)#'
+}
+for pass in cold warm; do
+  out=$(ufcs_lines)
+  [ "$(printf '%s\n' "$out" | grep -cE '^perceus twice bump#[0-9]+ bump@ma$')" = 2 ] \
+    || fail "$pass: a private fn called by UFCS in its own module lost its id"
+  [ "$(printf '%s\n' "$out" | grep -cE '^perceus main twice#[0-9]+ twice@ma$')" = 3 ] \
+    || fail "$pass: an imported or chained UFCS callee lost its id"
+  [ "$(printf '%s\n' "$out" | grep -cE '^perceus main twice#[0-9]+ twice@main$')" = 1 ] \
+    || fail "$pass: a root fn spelled like an imported one lost its id"
+  [ "$(printf '%s\n' "$out" | grep -cE '^perceus main scale#[0-9]+ scale@main$')" = 1 ] \
+    || fail "$pass: the root fn and the local binder that shadows it do not resolve apart"
+done
+
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, and a UFCS callee names the declaration its receiver picked"
