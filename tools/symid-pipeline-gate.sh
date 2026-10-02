@@ -67,6 +67,27 @@ need '^kperform named Loud\.say#n#[0-9]+ Loud@main$'
 [ "$(printf '%s\n' "$out" | grep -E '^kperform (spoken|through_cap|named) Loud\.say' | sed -E 's/.*#([0-9-]+) .*/\1/' | sort -u | wc -l | tr -d ' ')" = 1 ] \
   || fail "the four ways of writing Loud.say do not all carry one id"
 
+# Two modules each declare `effect Log`. A contested effect is spelled
+# `Log__<home>` before the resolver runs, a name the symbol table does not
+# hold, so its performs reached KIR with no identity and the two were told
+# apart by the spelling alone. Each perform decodes to the `Log` its own
+# module declares, and the two ids differ.
+HOMOFIX="$ROOT/examples/effects/homonym_perform_ids"
+out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
+        --path "$HOMOFIX" --path "$ROOT/stdlib" "$HOMOFIX/main.kai" 2>/dev/null)
+
+need '^kperform ra__run Log__ra\.tally#[0-9]+ Log@ra$'
+need '^kperform rb__run Log__rb\.total#[0-9]+ Log@rb$'
+need '^kperform rb__run Log__rb\.tally#[0-9]+ Log@rb$'
+need '^own effect Log__ra#[0-9]+ Log@ra$'
+need '^own effect Log__rb#[0-9]+ Log@rb$'
+[ "$(id_of '^kperform ra__run Log__ra')" != "$(id_of '^kperform rb__run Log__rb\.total')" ] \
+  || fail "the performs of two homonymous effects carry one id"
+[ "$(id_of '^kperform rb__run Log__rb\.total')" = "$(id_of '^kperform rb__run Log__rb\.tally')" ] \
+  || fail "two ops of one effect carry different ids"
+[ "$(id_of '^kperform ra__run Log__ra')" = "$(id_of '^own effect Log__ra')" ] \
+  || fail "a perform carries a different id than the declaration it names"
+
 # A declaration keeps its identity through the typer's cache. A cached module
 # is stored without its declaration-level ids (they index one build's table),
 # so a warm build would reach the late passes with `#-1` on every function,
@@ -131,4 +152,4 @@ direct=$(printf '%s\n' "$kir" | awk '/^fn pkg__direct\(/{on=1} on{print} on&&/^}
 printf '%s\n' "$direct" | grep -q 'int.unbox' \
   && { out=$direct; fail "pkg.direct re-unboxes its own callee's result"; }
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, declarations keep their ids through a warm cache, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, and a callee's signature class is its own declaration's"
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, and a callee's signature class is its own declaration's"
