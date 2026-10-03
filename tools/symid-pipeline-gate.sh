@@ -286,4 +286,32 @@ need '^ctor pat ra Circle#[0-9]+ Circle@ma$'
 need '^ctor pat ra Sq#[0-9]+ Sq@ma$'
 printf '%s\n' "$out" | grep -q ' Circle#none$' && fail "a nested constructor pattern reached unbox with no home"
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, and a constructor site, nested or not, names the home its type picked"
+# A qualified call carries the id of the declaration its qualifier names,
+# cold and warm alike, and a generic two modules share is specialised per
+# the qualifier's home rather than per the module whose body holds the call.
+QFIX="$ROOT/examples/namespace-collisions/qualified_call_carries_identity"
+QCACHE="$(mktemp -d)"
+trap 'rm -rf "$CACHE" "$TWIN" "$CUTCACHE" "$CTORCACHE" "$QCACHE"' EXIT
+for pass in cold warm; do
+  out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --user-cache --user-cache-dir "$QCACHE" \
+          --core-cache-dir "$QCACHE" --dump-symids --path "$QFIX" --path "$ROOT/stdlib" "$QFIX/main.kai")
+  need '^perceus main twice#[0-9]+ twice@qa$'
+  need '^perceus main label#[0-9]+ label@qa$'
+  need '^perceus main label#[0-9]+ label@qb$'
+  need '^perceus main label#[0-9]+ label@main$'
+  need '^efn wrap__mono__Int/0#[0-9]+ wrap@qa '
+  need '^efn wrap__mono__String/0#[0-9]+ wrap@qb '
+done
+
+# A call spelled like the function whose body holds it, but naming another
+# module's, reaches the passes that read self-calls by name spelled by its
+# home, never as a bare name they would loop back into the caller.
+HFIX="$ROOT/examples/namespace-collisions/qualified_call_in_homonym_body"
+out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
+        --path "$HFIX" --path "$ROOT/stdlib" "$HFIX/main.kai")
+printf '%s\n' "$out" | grep -qE '^perceus (twice|half) (twice|half)#[0-9]+ (twice|half)@ma$' \
+  && fail "a homonym of the enclosing function reached Perceus as a bare self-call"
+[ "$(printf '%s\n' "$out" | grep -cE '^perceus step step#[0-9]+ step@ma$')" = 1 ] \
+  || fail "mb.step's call to ma.step reached Perceus as a bare self-call"
+
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, a qualified call names the one its qualifier homes, and a constructor site, nested or not, names the home its type picked"
