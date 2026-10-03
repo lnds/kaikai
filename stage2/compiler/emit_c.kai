@@ -43,10 +43,10 @@
 # compiler.protos, and compiler.emit_shared (the backend-shared layer).
 
 import compiler.ast
+import compiler.effect_default
 import compiler.type_text
 import compiler.marks
 import compiler.sym_read
-import compiler.diag_file
 import compiler.kinds
 import compiler.home_tu
 import compiler.loop_lower
@@ -2183,7 +2183,6 @@ fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Opti
     _ -> None
   }
 }
-
 
 
 # The identity a callee carries, or none when the reference was never
@@ -10453,20 +10452,20 @@ type InterpCtx = { op_names: [String], op_arities: [OpAr],
 #[doc("Emit-layer entry point desugar_interp_decls. `show_home` is the core module whose `Show` every user-side `#{...}` binds to (`None` leaves the op bare); `cores` names the core modules, whose own interpolations stay bare — they are typed before that module's dispatchers exist. `ts_coll`/`es_coll` are the contested type/effect tables the freshly-parsed interp fragments respell against.")]
 pub fn desugar_interp_decls(ds: [Decl], op_names: [String], op_arities: [OpAr],
       global_mt: [ModuleEntry], scopes: [ModScope], coll: [NEnt],
-      ts_coll: [TSEntry], es_coll: [ESEntry],
+      ts_coll: [TSEntry], es_coll: [ESEntry], tab: SymTab, views: FileViews,
       target: String, file: String, show_home: Option[String],
       cores: [String]) : [Decl] / Console + File {
 
   if not list_has(op_names, "show") { ds }
   else { desugar_interp_decls_loop(ds, op_names, op_arities, global_mt, scopes,
-                                    coll, ts_coll, es_coll,
+                                    coll, ts_coll, es_coll, tab, views,
                                     scope_imports(scopes, global_mt),
                                     target, file, show_home, cores, target, []) }
 }
 
 fn desugar_interp_decls_loop(ds: [Decl], op_names: [String], op_arities: [OpAr],
       global_mt: [ModuleEntry], scopes: [ModScope], coll: [NEnt],
-      ts_coll: [TSEntry], es_coll: [ESEntry], imps: [ModImports],
+      ts_coll: [TSEntry], es_coll: [ESEntry], tab: SymTab, views: FileViews, imps: [ModImports],
       target: String, file: String, show_home: Option[String], cores: [String],
       cur: String, acc: [Decl]) : [Decl] / Console + File {
 
@@ -10483,10 +10482,10 @@ fn desugar_interp_decls_loop(ds: [Decl], op_names: [String], op_arities: [OpAr],
                            ts: if list_length(ts_coll) == 0 { None }
                                else { Some(ts_ctx(ts_coll, home, target, cores, scopes, global_mt, imps, [])) },
                            es: if list_length(es_coll) == 0 { None }
-                               else { Some(es_ctx(es_coll, home, target, cores, scopes, global_mt, imps, [])) },
+                               else { Some(es_ctx(es_coll, home, target, cores, scopes, global_mt, tab, views)) },
                            locals: [] }
       desugar_interp_decls_loop(rest, op_names, op_arities, global_mt, scopes,
-                                coll, ts_coll, es_coll, imps,
+                                coll, ts_coll, es_coll, tab, views, imps,
                                 target, file, show_home, cores, home,
                                 [desugar_interp_decl(d, cx), ...acc])
     }
@@ -11202,290 +11201,6 @@ fn emit_ffi_header_stream(src: String, ffi_structs: String, out_c: String) : Str
   ])
 }
 
-# m7b #1b — closed effect aliases (Doc A §*Open questions* #5).
-# An effect alias `type Io = Console + Stdin + Env + File` is a name
-# that expands to a fixed label set in row position. The resolver
-# performs a DFS expansion before any RowExpr is consumed; cycles and
-# non-effect labels in alias bodies are rejected here. After
-# rewriting, RowExpr.RClosed labels reference only declared effects.
-#
-# AliasCand: candidate alias decl harvested from the AST.
-#   name     — the type-decl name
-#   raw      — the labels as written (effects or other alias names)
-#   explicit — true for `TBEffectAlias` (explicit `+` form); false for
-#              `TBAlias(TyName(n, []))` (single-name form). Implicit
-#              candidates whose label is not an effect/alias are
-#              silently treated as regular type aliases instead of
-#              effect aliases. Cycles are still rejected for both.
-#   line/col — source position for diagnostics.
-
-# m7b #1b — closed effect aliases (Doc A §*Open questions* #5).
-# An effect alias `type Io = Console + Stdin + Env + File` is a name
-# that expands to a fixed label set in row position. The resolver
-# performs a DFS expansion before any RowExpr is consumed; cycles and
-# non-effect labels in alias bodies are rejected here. After
-# rewriting, RowExpr.RClosed labels reference only declared effects.
-#
-# AliasCand: candidate alias decl harvested from the AST.
-#   name     — the type-decl name
-#   raw      — the labels as written (effects or other alias names)
-#   explicit — true for `TBEffectAlias` (explicit `+` form); false for
-#              `TBAlias(TyName(n, []))` (single-name form). Implicit
-#              candidates whose label is not an effect/alias are
-#              silently treated as regular type aliases instead of
-#              effect aliases. Cycles are still rejected for both.
-#   line/col — source position for diagnostics.
-#[doc("b #1b — closed effect aliases (Doc A §*Open questions* #5). An effect alias `type Io = Console + Stdin + Env + File` is a name that expands to a fixed label set in row…")]
-pub fn collect_alias_cands(decls: [Decl], df: DiagFiles) : [AliasCand] {
-  match decls {
-    [] -> []
-    [d, ...rest] -> match decl_transparent_inner(d) {
-      Some(inner) -> collect_alias_cands([inner, ...rest], df)
-      None -> {
-        let f = decl_diag_file(d, df)
-        let here = match d {
-          DType(_, name, _, body, line, col, _, _, _) -> match body {
-            TBEffectAlias(labels) -> [AC(name, labels, true, line, col, f)]
-            TBAlias(ty) -> match ty.tkind {
-              TyName(n, targs) ->
-                if targs == [] { [AC(name, [n], false, line, col, f)] }
-                else { [] }
-              _ -> []
-            }
-            _ -> []
-          }
-          _ -> []
-        }
-        list_append(here, collect_alias_cands(rest, df))
-      }
-    }
-  }
-}
-
-fn cand_names_of(cands: [AliasCand]) : [String] {
-  match cands {
-    [] -> []
-    [c, ...rest] -> match c {
-      AC(n, _, _, _, _, _) -> [n, ...cand_names_of(rest)]
-    }
-  }
-}
-
-fn find_alias_cand(cands: [AliasCand], name: String) : Option[AliasCand] {
-  match cands {
-    [] -> None
-    [c, ...rest] -> match c {
-      AC(n, _, _, _, _, _) -> if n == name { Some(c) } else { find_alias_cand(rest, name) }
-    }
-  }
-}
-
-fn alias_status(entries: [AEntry], name: String) : AStatus {
-  match entries {
-    [] -> AsTodo
-    [e, ...rest] -> match e {
-      AEnt(en, es) -> if en == name { es } else { alias_status(rest, name) }
-    }
-  }
-}
-
-fn alias_set_status(entries: [AEntry], name: String, status: AStatus) : [AEntry] {
-  match entries {
-    [] -> [AEnt(name, status)]
-    [e, ...rest] -> match e {
-      AEnt(en, es) ->
-        if en == name { [AEnt(en, status), ...rest] }
-        else { [AEnt(en, es), ...alias_set_status(rest, name, status)] }
-    }
-  }
-}
-
-fn prepend_rev_strs(xs: [String], acc: [String]) : [String] {
-  match xs {
-    [] -> acc
-    [x, ...rest] -> prepend_rev_strs(rest, [x, ...acc])
-  }
-}
-
-fn dedup_strs(xs: [String]) : [String] = dedup_strs_loop(xs, [])
-
-fn dedup_strs_loop(xs: [String], acc: [String]) : [String] {
-  match xs {
-    [] -> list_reverse(acc)
-    [x, ...rest] ->
-      if list_has(acc, x) { dedup_strs_loop(rest, acc) }
-      else { dedup_strs_loop(rest, [x, ...acc]) }
-  }
-}
-
-fn cand_pos(cands: [AliasCand], name: String) : AliasPos {
-  match find_alias_cand(cands, name) {
-    None -> AliasPos { line: 0, col: 0 }
-    Some(c) -> match c {
-      AC(_, _, _, ln, co, _) -> AliasPos { line: ln, col: co }
-    }
-  }
-}
-
-# The file that declared the alias; `fallback` covers a name with no
-# candidate, where there is no decl to attribute to.
-fn cand_file_of(cands: [AliasCand], name: String, fallback: String) : String {
-  match find_alias_cand(cands, name) {
-    None -> fallback
-    Some(c) -> match c {
-      AC(_, _, _, _, _, f) -> f
-    }
-  }
-}
-
-fn resolve_alias(name: String, cands: [AliasCand], cand_ns: [String],
-                 eff_names: [String], file: String, st: AliasResolveState) : AliasResolveOne / Console + File {
-
-
-  match alias_status(st.entries, name) {
-    AsDone(labels) -> AliasResolveOne { st: st, r: Some(labels) }
-    AsFail -> AliasResolveOne { st: st, r: None }
-    AsActive -> {
-      let pos = cand_pos(cands, name)
-      diag_error(cand_file_of(cands, name, file), pos.line, pos.col,
-        string_concat("cyclic effect alias: ", name))
-      diag_note("an alias can only expand to declared effects, not back to itself")
-      diag_help("break the cycle: list each effect explicitly in the body of `type #{name} = ...`")
-      let st2 = AliasResolveState {
-        entries: alias_set_status(st.entries, name, AsFail),
-        errs:    st.errs + 1
-      }
-      AliasResolveOne { st: st2, r: None }
-    }
-    AsTodo -> {
-      match find_alias_cand(cands, name) {
-        None -> AliasResolveOne { st: st, r: None }
-        Some(c) -> match c {
-          AC(_, raw, explicit, line, col, cand_file) -> {
-            let entries1 = alias_set_status(st.entries, name, AsActive)
-            let st1 = AliasResolveState { entries: entries1, errs: st.errs }
-            let r = resolve_alias_labels(raw, cands, cand_ns, eff_names, cand_file,
-                                         name, explicit, line, col, st1, [])
-            match r.r {
-              None -> {
-                let entries2 = alias_set_status(r.st.entries, name, AsFail)
-                AliasResolveOne { st: AliasResolveState { entries: entries2, errs: r.st.errs }, r: None }
-              }
-              Some(labels) -> {
-                let unique = dedup_strs(labels)
-                let entries2 = alias_set_status(r.st.entries, name, AsDone(unique))
-                AliasResolveOne { st: AliasResolveState { entries: entries2, errs: r.st.errs }, r: Some(unique) }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-fn resolve_alias_labels(raw: [String], cands: [AliasCand], cand_ns: [String],
-                        eff_names: [String], file: String,
-                        parent: String, explicit: Bool, pline: Int, pcol: Int,
-                        st: AliasResolveState, acc: [String]) : AliasResolveOne / Console + File {
-
-
-  match raw {
-    [] -> AliasResolveOne { st: st, r: Some(list_reverse(acc)) }
-    [label, ...rest] -> {
-      if list_has(eff_names, label) {
-        resolve_alias_labels(rest, cands, cand_ns, eff_names, file, parent,
-                             explicit, pline, pcol, st, [label, ...acc])
-      } else if list_has(cand_ns, label) {
-        let r = resolve_alias(label, cands, cand_ns, eff_names, file, st)
-        match r.r {
-          None -> AliasResolveOne { st: r.st, r: None }
-          Some(sub) ->
-            resolve_alias_labels(rest, cands, cand_ns, eff_names, file, parent,
-                                 explicit, pline, pcol, r.st,
-                                 prepend_rev_strs(sub, acc))
-        }
-      } else {
-        if explicit {
-          diag_error(file, pline, pcol,
-            concat_all(["unknown effect in alias body: ", label,
-                        " (declared as part of `", parent, "`)"]))
-          let st1 = AliasResolveState { entries: st.entries, errs: st.errs + 1 }
-          AliasResolveOne { st: st1, r: None }
-        } else {
-          AliasResolveOne { st: st, r: None }
-        }
-      }
-    }
-  }
-}
-
-#[doc("Emit-layer entry point resolve_alias_cands")]
-pub fn resolve_alias_cands(cands: [AliasCand], eff_names: [String], file: String) : AliasResolution / Console + File {
-
-
-  let cand_ns = cand_names_of(cands)
-  resolve_alias_cands_loop(cands, cand_ns, eff_names, file,
-                           AliasResolveState { entries: [], errs: 0 }, cands, [])
-}
-
-fn resolve_alias_cands_loop(all_cands: [AliasCand], cand_ns: [String],
-                            eff_names: [String], file: String,
-                            st: AliasResolveState, todo: [AliasCand],
-                            acc: [AliasResult]) : AliasResolution / Console + File {
-
-
-  match todo {
-    [] -> AliasResolution { aliases: list_reverse(acc), errs: st.errs }
-    [c, ...rest] -> match c {
-      # A name declared as a first-class `effect` is an effect, not an
-      # alias: skip registering an alias entry for it so a row label
-      # resolves to the effect. This is the row-level counterpart of
-      # `resolve_alias_labels`' effect-vs-alias check on the body.
-      AC(name, _, _, _, _, _) ->
-        if list_has(eff_names, name) {
-          resolve_alias_cands_loop(all_cands, cand_ns, eff_names, file, st, rest, acc)
-        } else {
-          let r = resolve_alias(name, all_cands, cand_ns, eff_names, file, st)
-          let acc1 = match r.r {
-            Some(labels) -> [AR(name, labels), ...acc]
-            None -> acc
-          }
-          resolve_alias_cands_loop(all_cands, cand_ns, eff_names, file, r.st, rest, acc1)
-        }
-    }
-  }
-}
-
-fn find_alias(aliases: [AliasResult], name: String) : Option[AliasResult] {
-  match aliases {
-    [] -> None
-    [a, ...rest] -> match a {
-      AR(n, _) -> if n == name { Some(a) } else { find_alias(rest, name) }
-    }
-  }
-}
-
-# Substitute every alias name in `labels` with its expanded form.
-# Effect names pass through unchanged. Duplicates introduced by
-# expansion are removed by the caller.
-
-# Substitute every alias name in `labels` with its expanded form.
-# Effect names pass through unchanged. Duplicates introduced by
-# expansion are removed by the caller.
-fn expand_label_list(labels: [String], aliases: [AliasResult]) : [String] {
-  match labels {
-    [] -> []
-    [l, ...rest] -> {
-      let here = match find_alias(aliases, l) {
-        Some(AR(_, expanded)) -> expanded
-        None -> [l]
-      }
-      list_append(here, expand_label_list(rest, aliases))
-    }
-  }
-}
-
 fn expand_aliases_in_row(re: RowExpr, aliases: [AliasResult]) : RowExpr {
   match re {
     REmpty -> REmpty
@@ -11511,9 +11226,9 @@ fn expand_row_labels(ls: [RowLabel], aliases: [AliasResult]) : [RowLabel] {
   match ls {
     [] -> []
     [l, ...rest] -> match l {
-      RL(name, []) -> {
+      RL(name, [], _) -> {
         let here = match find_alias(aliases, name) {
-          Some(AR(_, expanded)) -> map(expanded, (n) => RL(n, []))
+          Some(expanded) -> expanded
           None -> [l]
         }
         list_append(here, expand_row_labels(rest, aliases))
@@ -11521,14 +11236,6 @@ fn expand_row_labels(ls: [RowLabel], aliases: [AliasResult]) : [RowLabel] {
       # Parameterised label: pass through unchanged (no alias is
       # registered with type args today).
       _ -> [l, ...expand_row_labels(rest, aliases)]
-    }
-  }
-}
-
-fn row_label_eq(a: RowLabel, b: RowLabel) : Bool {
-  match a {
-    RL(an, _) -> match b {
-      RL(bn, _) -> an == bn
     }
   }
 }
@@ -11541,19 +11248,10 @@ fn dedup_row_labels_loop(ls: [RowLabel], seen: [String], acc: [RowLabel]) : [Row
   match ls {
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
-      RL(n, targs) -> {
-        # Issue #472 — parametric effects (e.g. `Actor[Request]` vs
-        # `Actor[Reply]`) must NOT collapse to a single label. Key by
-        # name+rendered-args so each instantiation survives dedup; bare
-        # labels (no args) keep using the name alone.
-        # NOTE: the field is named `targs` not `args` because `args` is a
-        # core builtin (cli argv) and stage 1 wrongly resolves the
-        # local binding to that — see project_kaikai_param_args_shadow
-        # memo.
-        let key = match targs {
-          [] -> n
-          _  -> concat_all([n, "[", join_with(map(targs, type_key), ","), "]"])
-        }
+      RL(n, targs, ls) -> {
+        # Key by name, declaration and rendered args: two homonymous
+        # effects, or `Actor[Request]` and `Actor[Reply]`, both survive.
+        let key = concat_all([n, "#", int_to_string(sym_raw(ls)), "[", join_with(map(targs, type_key), ","), "]"])
         if list_has(seen, key) {
           dedup_row_labels_loop(rest, seen, acc)
         } else {
@@ -11855,7 +11553,7 @@ fn apply_tp_subst_row(r: RowExpr, subst: [TPSubst]) : RowExpr {
         Some(rep) -> match rep.tkind {
           TyName(nm, []) -> {
             if name_first_is_upper(nm) {
-              RClosed(label_concat_rls(labels1, [RL(nm, [])]))
+              RClosed(label_concat_rls(labels1, [RL(nm, [], sym_none())]))
             } else {
               ROpen(nm, labels1)
             }
@@ -11876,8 +11574,8 @@ fn apply_tp_subst_rls(ls: [RowLabel], subst: [TPSubst]) : [RowLabel] {
   match ls {
     [] -> []
     [rl, ...rest] -> match rl {
-      RL(name, ts) -> [
-        RL(name, apply_tp_subst_te_list(ts, subst)),
+      RL(name, ts, s) -> [
+        RL(name, apply_tp_subst_te_list(ts, subst), s),
         ...apply_tp_subst_rls(rest, subst)
       ]
     }
@@ -11983,8 +11681,8 @@ fn expand_ta_rls(ls: [RowLabel], table: [TAEntry], aliases: [AliasResult], fuel:
   match ls {
     [] -> []
     [rl, ...rest] -> match rl {
-      RL(name, ts) -> [
-        RL(name, expand_ta_te_list(ts, table, aliases, fuel)),
+      RL(name, ts, s) -> [
+        RL(name, expand_ta_te_list(ts, table, aliases, fuel), s),
         ...expand_ta_rls(rest, table, aliases, fuel)
       ]
     }
@@ -12596,7 +12294,7 @@ fn mangle_rls(ls: [RowLabel], entries: [PrivTyEntry],
   match ls {
     [] -> []
     [rl, ...rest] -> match rl {
-      RL(name, ts) -> [RL(name, mangle_te_list(ts, entries, home_mod)),
+      RL(name, ts, s) -> [RL(name, mangle_te_list(ts, entries, home_mod), s),
                         ...mangle_rls(rest, entries, home_mod)]
     }
   }
@@ -12855,76 +12553,9 @@ fn mangle_hreturn(r: HReturn, entries: [PrivTyEntry],
 # whole rows; this helper is the building block when row-mismatch
 # rendering lands.
 
-# m7b #1d — display-time alias preservation (Doc A §*Open questions*
-# #5). Render a label set using the largest alias that fully covers
-# it; remaining labels (those outside the alias) are appended with
-# `+`. The alias rewrite at resolve time is value-preserving, so the
-# choice is purely cosmetic — diagnostics keep the user's `Io`
-# spelling when it still describes the row, and fall back to the
-# expanded labels on partial coverage. Currently no diagnostic prints
-# whole rows; this helper is the building block when row-mismatch
-# rendering lands.
-fn row_to_diag_string(labels: [String], aliases: [AliasResult]) : String {
-  if labels == [] { "(empty)" }
-  else {
-    match best_alias_cover(aliases, labels, None) {
-      None -> join_with(labels, " + ")
-      Some(AR(alias_name, alias_labels)) -> {
-        let leftover = subtract_strings(labels, alias_labels)
-        if leftover == [] { alias_name }
-        else { string_concat(alias_name, string_concat(" + ", join_with(leftover, " + "))) }
-      }
-    }
-  }
-}
-
 # Return the alias whose label set is a subset of `labels` and that
 # covers the largest number of labels. Ties prefer the alias seen
 # first (lexically earlier in source).
-
-# Return the alias whose label set is a subset of `labels` and that
-# covers the largest number of labels. Ties prefer the alias seen
-# first (lexically earlier in source).
-fn best_alias_cover(aliases: [AliasResult], labels: [String],
-                    best: Option[AliasResult]) : Option[AliasResult] {
-  match aliases {
-    [] -> best
-    [a, ...rest] -> match a {
-      AR(_, alabels) -> {
-        let covers = labels_subset(alabels, labels)
-        let new_best =
-          if covers and better_cover(best, alabels) { Some(a) }
-          else { best }
-        best_alias_cover(rest, labels, new_best)
-      }
-    }
-  }
-}
-
-fn better_cover(prev: Option[AliasResult], candidate_labels: [String]) : Bool {
-  match prev {
-    None -> true
-    Some(AR(_, p)) -> list_length(candidate_labels) > list_length(p)
-  }
-}
-
-fn labels_subset(small: [String], big: [String]) : Bool {
-  match small {
-    [] -> true
-    [x, ...rest] ->
-      if list_has(big, x) { labels_subset(rest, big) }
-      else { false }
-  }
-}
-
-fn subtract_strings(xs: [String], ys: [String]) : [String] {
-  match xs {
-    [] -> []
-    [x, ...rest] ->
-      if list_has(ys, x) { subtract_strings(rest, ys) }
-      else { [x, ...subtract_strings(rest, ys)] }
-  }
-}
 
 fn sig_of_decl(d: Decl) : Option[Ty] {
   match d {

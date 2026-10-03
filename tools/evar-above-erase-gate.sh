@@ -27,7 +27,7 @@ SRC="$ROOT/stage2/compiler"
 #   ast              — `mk_ref` itself, the one constructor.
 #   parse, desugar,  — run before the resolver; there is no id yet.
 #   surface_lower,
-#   modules, type_scope, effect_scope, const_pattern, refinements,
+#   modules, type_scope, effect_scope(_ids), const_pattern, refinements,
 #   refine_enforce, vec_surface, protos, json_derive, layout_derive,
 #   fmt_expr, tailfuse, tailsubst, pipe_fusion, resolve
 #   infer            — mints calls to runtime primitives (`array_get`,
@@ -46,7 +46,7 @@ SRC="$ROOT/stage2/compiler"
 #   emit_tcrec_live  — the matches are prose inside a `#[doc]` block.
 #   cache_delta_test,— fixtures; they build the node they assert on.
 #   resolve_sym_test
-ALLOW='ast|parse|desugar|surface_lower|modules|type_scope|effect_scope'
+ALLOW='ast|parse|desugar|surface_lower|modules|type_scope|effect_scope|effect_scope_ids'
 ALLOW="$ALLOW|const_pattern|refinements|refine_enforce|vec_surface|protos"
 ALLOW="$ALLOW|json_derive|layout_derive|fmt_expr|tailfuse|tailsubst"
 ALLOW="$ALLOW|pipe_fusion|resolve|infer|monomorph|fwd_inline"
