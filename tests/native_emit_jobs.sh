@@ -62,4 +62,19 @@ if ! grep -q "native object emit failed" "$work/err-4"; then
   echo "native-emit-jobs FAIL: the emit failure was not reported"; cat "$work/err-4"; exit 1
 fi
 
-echo "native-emit-jobs: PASS (objects identical for 1 and 4 threads; a failed emit fails the build)"
+# An exit taken while partitions are still on the workers keeps its own
+# status: exit() would otherwise tear down LLVM's statics under them, and
+# the process hangs or dies on a signal instead.
+rc=0
+KAI_NATIVE_JOBS=4 KAI_NATIVE_EMIT_EXIT_AFTER=1 \
+  KAI_NATIVE_RUNTIME_INLINE_BC="$ROOT/stage0/runtime_inline.bc" \
+  "$ROOT/tools/lib/timeout.sh" 300 "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" \
+  --emit=native-modular --native-obj-dir "$work/nm-exit" --path "$ROOT/stdlib" --path "$FX" \
+  "$FX/main.kai" >/dev/null 2>"$work/err-exit" || rc=$?
+if [ "$rc" -ne 3 ]; then
+  echo "native-emit-jobs FAIL: an exit with partitions in flight returned $rc, expected 3"
+  cat "$work/err-exit"
+  exit 1
+fi
+
+echo "native-emit-jobs: PASS (objects identical for 1 and 4 threads; a failed emit fails the build; an exit mid-emit keeps its status)"
