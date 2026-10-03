@@ -5308,17 +5308,14 @@ fn build_ty_env_module(seed: BuiltEnv, decls: [Decl], unions: [UnionInfo],
 # stream, which only the caller knows: a `T[..., e]` annotation in one
 # module resolves the row slot of a type declared in another, and a
 # name declared once here may be declared again elsewhere.
-fn build_ty_env_inherited(seed: BuiltEnv, inherited: ModuleEnvDelta,
+fn build_ty_env_inherited(seed: BuiltEnv, inh: TyEnvParts, inherited: ModuleEnvDelta,
                             decls: [Decl], unions: [UnionInfo],
                             top_names: [String], rk_table: [RowKindEntry],
                             tab: SymTab, target: String,
                             homes: TyHomes) : BuiltEnv {
-  # `inherited.ty_entries` are newer than the seed (prepended at head).
-  # Prepend them onto BOTH the seed entries and the seed index in one
-  # pass, sharing each entry exactly as `ty_env_add` does -- never
-  # re-walking an already-stored list, which double-consumes its
-  # backbone under Perceus.
-  let env_in = match ty_env_prepend_batch(inherited.ty_entries, seed.env.entries, seed.env.index, seed.env.vindex) {
+  # `inh` already carries `inherited.ty_entries` on top of the seed, in
+  # entries and indexes alike: the fold extends it module by module.
+  let env_in = match inh {
     TEP(seeded_entries, seeded_index, seeded_vindex) -> TyEnv {
       entries: seeded_entries, fresh: seed.env.fresh, unions: unions,
       constructors: list_append(inherited.constructors, seed.env.constructors),
@@ -19352,9 +19349,10 @@ type ProgramData = {
   homes:      TyHomes
 }
 
-#[doc("infer: the tables every module's typecheck reads unchanged, built once over the full program decl stream: the built-in seed, the row-kind slots, the type homes and the effect-alias resolution.")]
+#[doc("infer: the tables every module's typecheck reads, built once over the full program decl stream: the built-in seed, the env entries and indexes of every module typed so far, the row-kind slots, the type homes and the effect-alias resolution.")]
 pub type TcShared = {
   seed:      BuiltEnv,
+  inh:       TyEnvParts,
   rk_table:  [RowKindEntry],
   homes:     TyHomes,
   alias_res: AliasResolution
@@ -19365,13 +19363,25 @@ pub fn tc_shared(file: String, df: DiagFiles, all_program_decls: [Decl],
                  tab: SymTab, views: FileViews) : TcShared / Console + File {
   let alias_cands = inf_collect_alias_cands(all_program_decls, df)
   let eff_names = collect_effect_names(all_program_decls)
+  let seed = build_ty_env_seed()
   TcShared {
-    seed: build_ty_env_seed(),
+    seed: seed,
+    inh: TEP(seed.env.entries, seed.env.index, seed.env.vindex),
     rk_table: compute_row_kind_slots(all_program_decls),
     homes: tsh_homes(all_program_decls, tab, views, module_name_of_path(file)),
     alias_res: inf_resolve_alias_cands(alias_cands, eff_names, file)
   }
 }
+
+#[doc("infer: fold a typed module's env entries into the shared tables, so the next module starts from the entries and indexes of everything typed before it.")]
+pub fn tc_shared_extend(sh: TcShared, delta: ModuleEnvDelta) : TcShared =
+  match sh.inh {
+    TEP(es, ix, vx) -> TcShared {
+      seed: sh.seed,
+      inh: ty_env_prepend_batch(delta.ty_entries, es, ix, vx),
+      rk_table: sh.rk_table, homes: sh.homes, alias_res: sh.alias_res
+    }
+  }
 
 # variant that seeds the working tables from an
 # inherited `ModuleEnvDelta` (typically the core's). Each table
@@ -19412,7 +19422,7 @@ fn collect_program_data_inherited(file: String, decls: [Decl],
   let unions_here = collect_unions(decls_a, hview)
   let unions_all = list_append(unions_here, inherited.unions)
   let top_names = collect_top_type_names(decls_a)
-  let built = build_ty_env_inherited(sh.seed, inherited, decls_a,
+  let built = build_ty_env_inherited(sh.seed, sh.inh, inherited, decls_a,
                                        unions_all, top_names, sh.rk_table, tab,
                                        module_name_of_path(file), sh.homes)
   let recs_here = collect_records(decls_a)
@@ -19685,12 +19695,13 @@ fn typecheck_program_loop(file: String, df: DiagFiles, modules: [ModuleDecls],
       let r = typecheck_module(file, df, m, acc_delta, all_program_decls,
                                   proto_impls, head_owners, kind_theories, tab, sh, verbose)
       let next_delta = merge_env_deltas(acc_delta, r.delta)
+      let next_sh = tc_shared_extend(sh, r.delta)
       let next_core_len = match core_len_acc {
         0 -> r.typed.core_len
         _ -> core_len_acc
       }
       typecheck_program_loop(file, df, rest, next_delta, all_program_decls,
-                              proto_impls, head_owners, kind_theories, tab, sh, verbose,
+                              proto_impls, head_owners, kind_theories, tab, next_sh, verbose,
                               prepend_reverse_decls(r.typed.decls, acc_decls),
                               acc_errs + r.typed.errs,
                               llvm_prepend_reverse(r.typed.insts, acc_insts),
