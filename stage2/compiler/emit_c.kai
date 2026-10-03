@@ -3400,19 +3400,26 @@ fn pat_kind1_binders_subs(subs: [Pattern], tys: [Int], i: Int, cx: EmitCtx, acc:
   match subs {
     [] -> acc
     [sp, ...rest] -> {
-      let k = kind_at(tys, i)
-      let acc1 = match sp.pkind {
-        PBind(nm) -> if k == 1 { [nm, ...acc] } else { acc }
-        PVariant(_, _, _)        -> pat_kind1_binders(sp, cx, acc)
-        PList(_, _)           -> pat_kind1_binders(sp, cx, acc)
-        PRecord(_)            -> pat_kind1_binders(sp, cx, acc)
-        PVariantRecord(_, _, _) -> pat_kind1_binders(sp, cx, acc)
-        PAs(_, _)             -> pat_kind1_binders(sp, cx, acc)
-        _ -> acc
-      }
+      let acc1 = if kind_at(tys, i) == 1 { list_append(kind1_slot_binders(sp), acc) }
+                 else { pat_kind1_binders(sp, cx, acc) }
       pat_kind1_binders_subs(rest, tys, i + 1, cx, acc1)
     }
   }
+
+# The names a sub-pattern binds on a kind-1 Int slot, each declared as the
+# raw `kair_<nm>`. The single decision both the bind route and the scope
+# collector read; a literal or wildcard binds nothing.
+fn kind1_slot_binders(sp: Pattern) : [String] = match sp.pkind {
+  PBind(nm)       -> [nm]
+  PAs(nm, inner)  -> [nm, ...kind1_slot_binders(inner)]
+  _ -> []
+}
+
+fn kind1_slot_decls(names: [String], scr: String, i: Int) : String = match names {
+  [] -> ""
+  [nm, ...rest] -> concat_all(["int64_t kair_", nm, " = kai_var_slots(", scr, ")[", int_to_string(i),
+                               "].i64; (void) kair_", nm, "; ", kind1_slot_decls(rest, scr, i)])
+}
 
 fn emit_pat_binds_variant(src: String, subs: [Pattern], tys: [Int], scr: String, i: Int,
                           cx: EmitCtx) : String {
@@ -3450,27 +3457,12 @@ fn emit_pat_binds_variant(src: String, subs: [Pattern], tys: [Int], scr: String,
         # with malloc no longer the bottleneck, eliding it removes
         # ~18M no-op calls from the rb-tree's is_red hot path.
         emit_pat_binds_variant(src, rest, tys, scr, i + 1, cx)
-      } else if k == 1 and (match sp.pkind { PBind(_) -> true _ -> false }) {
-        # i64-inline (Lane B): a kind-1 Int slot bound by a NAMED PBind
-        # binds the RAW int64 uniformly as `int64_t kair_<nm> = slot.i64`
-        # (no kai_int box at bind). The name joins cx.kind1_raw so EVar
-        # reads in the body pick `kair_<nm>` (MUnboxed) or
-        # `kai_int(kair_<nm>)` (MBoxed), and a re-store into a kind-1 slot
-        # writes `kair_<nm>` directly — killing the kai_int/kai_take_int
-        # round-trip that made the naive kind-1 net-negative. The slot
-        # carries no RC (the drop walker skips kind-1), so the raw read
-        # takes no ref and needs no drop. A PLit on a kind-1 slot is a
-        # TEST (handled in emit_pat_test) and binds nothing — it never
-        # reaches here (the k==1 guard requires PBind). A nested PVariant
-        # on an Int slot is impossible (Int is a leaf type).
-        let nm = match sp.pkind { PBind(n) -> n _ -> "" }
-        let raw = concat_all(["int64_t kair_", nm, " = kai_var_slots(", scr, ")[", int_to_string(i), "].i64; (void) kair_", nm, "; "])
-        let cx1 = emit_ctx_with_kind1_raw(cx, [nm, ...cx.kind1_raw])
-        cat2(raw, emit_pat_binds_variant(src, rest, tys, scr, i + 1, cx1))
       } else if k == 1 {
-        # kind-1 slot with a non-PBind sub-pattern (a PLit test that the
-        # test side already consumed). Bind nothing, read nothing.
-        emit_pat_binds_variant(src, rest, tys, scr, i + 1, cx)
+        # The raw read takes no ref: a kind-1 slot carries no RC.
+        let names = kind1_slot_binders(sp)
+        cat2(kind1_slot_decls(names, scr, i),
+             emit_pat_binds_variant(src, rest, tys, scr, i + 1,
+                                    emit_ctx_with_kind1_raw(cx, list_append(names, cx.kind1_raw))))
       } else {
         let sub_scr = concat_all(["kai_real(", "kai_var_slots(", scr, ")[", int_to_string(i), "].r)"])
         # The primitive slot read allocates a fresh boxed temp; the
@@ -7745,7 +7737,7 @@ fn expr_is_perceus_drop_call(x: Expr) : Bool {
 fn emit_stmt(src: String, s: Stmt, cx: EmitCtx) : String / Console {
 
   match s {
-    SLet(pat, _, rhs) -> emit_let_stmt(src, pat, rhs, cx)
+    SLet(pat, _, rhs) -> emit_let_stmt_with_drops(src, pat, rhs, [], cx)
     SAssert(cond, opt_msg) -> emit_assert_stmt(src, cond, opt_msg, cx)
     # A discarded expression emits as a plain C statement where the form
     # allows (cell writes, ifs, blocks, loops — no unit materialisation),
@@ -7797,29 +7789,32 @@ fn emit_block_stmts_loop(src: String, stmts: [Stmt], drops: [String],
       SLet(pat, _, _) -> list_append(cx.lcs, pat_binders(pat, []))
       _ -> cx.lcs
     }
-    let k1 = stmt_kind1_raw_after(s, cx.kind1_raw)
+    let k1 = stmt_kind1_raw_after(s, cx.kind1_raw, cx)
     emit_block_stmts_loop(src, rest, drops,
                           emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, lcs1), k1),
                           string_concat(acc, out))
   }
 }
 
-# A `let` binder that the unbox pass marked MUnboxed is declared as the raw
-# `int64_t kair_<nm>` and has no boxed `kaiv_<nm>` local, so later reads must
-# resolve through `kind1_raw` (raw directly, or `kai_int(kair_<nm>)` in a
-# boxed consumer) exactly as an arm binder does. A boxed rebind of the same
-# name drops it again: the shadowing declaration is a real `kaiv_<nm>`, and
-# leaving the name in the set would send its reads to a `kair_` that the
-# new binding never declared.
-fn stmt_kind1_raw_after(s: Stmt, ks: [String]) : [String] = match s {
+# The raw binders in scope after `s`: a `let` binder declared `kair_<nm>`
+# (an MUnboxed rhs, or a kind-1 slot of a destructuring pattern) has no
+# boxed `kaiv_<nm>` local, so later reads resolve through `kind1_raw`
+# exactly as an arm binder does. Every other binder the `let` introduces
+# is a real `kaiv_<nm>` and shadows any outer raw one of the same name.
+fn stmt_kind1_raw_after(s: Stmt, ks: [String], cx: EmitCtx) : [String] = match s {
   SLet(pat, _, rhs) -> match pat.pkind {
     PBind(nm) -> match rhs.mode {
       MUnboxed -> if list_has(ks, nm) { ks } else { [nm, ...ks] }
       _        -> list_drop_name(ks, nm)
     }
-    _ -> ks
+    _ -> pat_kind1_binders(pat, cx, list_drop_names(ks, pat_binders(pat, [])))
   }
   _ -> ks
+}
+
+fn list_drop_names(names: [String], targets: [String]) : [String] = match targets {
+  [] -> names
+  [t, ...rest] -> list_drop_names(list_drop_name(names, t), rest)
 }
 
 fn list_drop_name(names: [String], target: String) : [String] = match names {
@@ -7863,9 +7858,8 @@ fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
       MUnboxed -> {
         let raw = emit_expr_raw(src, rhs, cx)
         let cty = raw_c_type(rhs.ty)
-        # #846 companion (C oracle): break the C declarator self-scope when
-        # this binder shadows an outer same-name `let` whose RHS reads it
-        # (`let x = f(x)`). See `emit_let_stmt`'s MUnboxed arm.
+        # A shadowing `let x = f(x)`: the C declarator puts the new `kair_x`
+        # in scope inside its own initializer, so evaluate into a temp first.
         if list_has(cx.lcs, name) {
           let tmp = shadow_tmp(name, pat)
           concat_all([cty, " ", tmp, " = ", raw, "; ", cty, " kair_", name, " = ", tmp, "; "])
@@ -7890,13 +7884,8 @@ fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
     # returns an owned reference, so the discard site decrefs).
     PWild -> emit_stmt_discard_or_drop(src, rhs, cx)
     _ -> {
-      # m7d §28: same shape as emit_let_stmt's destructuring path —
-      # bind a unique temp and emit pattern binds INTO the enclosing
-      # block so the destructured names stay in scope for the rest
-      # of the block. Drops do not apply to destructured names; the
-      # `drops` argument here is for PBind only.
-      # #293 Phase 1.3: same RC discipline as the no-drops path —
-      # alias=true so each binder increfs, then drop the composite.
+      # Binds land in the enclosing block so the names stay in scope for
+      # its rest; the binds incref (alias=true) and the composite drops.
       let rhs_c = emit_expr(src, rhs, cx)
       let tmp = concat_all(["_letv_", int_to_string(pat.line), "_",
                               int_to_string(pat.col)])
@@ -7912,60 +7901,6 @@ fn emit_let_stmt_with_drops(src: String, pat: Pattern, rhs: Expr,
 # surface binder's `kair_`/`kai_` name.
 fn shadow_tmp(name: String, pat: Pattern) : String =
   concat_all(["_shadow_", name, "_", int_to_string(pat.line), "_", int_to_string(pat.col)])
-
-fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, cx: EmitCtx) : String / Console {
-
-  match pat.pkind {
-    PBind(name) -> match rhs.mode {
-      MUnboxed -> {
-        let raw = emit_expr_raw(src, rhs, cx)
-        let cty = raw_c_type(rhs.ty)
-        # A `let x` that shadows an outer `let x` whose RHS reads the outer
-        # `x` (`let x = f(x)`): the C declarator `<cty> kair_x = <raw>`
-        # puts the NEW `kair_x` in scope inside its own initializer, so
-        # `raw`'s read of `kair_x` binds to the just-declared, uninitialised
-        # inner one — garbage. (C's block `{ }` scoping already protects a
-        # read of the OUTER `x` AFTER the inner block; only the
-        # self-referential initialiser breaks.) Break the C self-scope by
-        # evaluating `raw` into a uniquely-named temp BEFORE the shadowing
-        # declaration, so the read still resolves to the outer `kair_x`.
-        if list_has(cx.lcs, name) {
-          let tmp = shadow_tmp(name, pat)
-          concat_all([cty, " ", tmp, " = ", raw, "; ", cty, " kair_", name, " = ", tmp, "; "])
-        } else { concat_all([cty, " kair_", name, " = ", raw, "; "]) }
-      }
-      _ -> {
-        let rhs_c = emit_expr(src, rhs, cx)
-        # Same self-scope hazard for a boxed shadowing binder (see the
-        # MUnboxed arm): `KaiValue *kai_x = <rhs reading kai_x>` self-binds.
-        if list_has(cx.lcs, name) {
-          let tmp = shadow_tmp(name, pat)
-          concat_all(["KaiValue *", tmp, " = ", rhs_c, "; KaiValue *", c_local(name), " = ", tmp, "; "])
-        } else { concat_all(["KaiValue *", c_local(name), " = ", rhs_c, "; "]) }
-      }
-    }
-    PWild -> emit_stmt_discard_or_drop(src, rhs, cx)
-    _ -> {
-      # m7d §28: destructuring let. Bind a unique temp and emit the
-      # pattern's binds INTO THE ENCLOSING BLOCK (no `{...}`
-      # wrapping) so the destructured names stay in scope for the
-      # rest of the block. The temp name carries the source location
-      # to avoid shadowing across nested let-destructurings.
-      let rhs_c = emit_expr(src, rhs, cx)
-      let tmp = concat_all(["_letv_", int_to_string(pat.line), "_",
-                              int_to_string(pat.col)])
-      # #293 Phase 1.3 — destructuring let RC discipline. Treat children
-      # as alias storage (is_alias=true) so each PBind increfs, then
-      # drop `tmp` so the composite alloc balances. Field-typed children
-      # already incref via `kai_op_field`; the alias flip only changes
-      # cons.head/tail and var.args[i] sites which previously aliased
-      # without bumping the rc. The `kai_decref(tmp)` at the end of the
-      # binds releases the ownership transferred from the RHS.
-      let binds = emit_pat_binds(src, pat, tmp, true, cx)
-      concat_all(["KaiValue *", tmp, " = ", rhs_c, "; ", binds, "kai_decref(", tmp, "); "])
-    }
-  }
-}
 
 fn emit_assert_stmt(src: String, cond: Expr, opt_msg: Option[Expr],
                     cx: EmitCtx) : String / Console {
