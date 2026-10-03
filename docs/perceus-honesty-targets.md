@@ -199,6 +199,14 @@ runtime RC ledger (`KAI_TRACE_RC=1`) and pins its allocation count in
 corpus asserted stdout only, so a leak was invisible: the program printed
 the right answer and took the memory with it.
 
+An exact pin cannot tell a leak from state that lives until exit, so the
+gate also runs `main` twice in one process (`KAI_TRACE_RC_RUNS=2`):
+growth = leaked(2 runs) − leaked(1 run) is what one run of the work
+retains. Growth must be 0 except for the known leaks pinned in
+`tools/rc-growth-baseline.txt` (`examples/perceus`) and
+`tools/rc-effects-growth-baseline.txt` (`examples/effects`, held to growth
+only). Both files are ratchets that only shrink.
+
 Reading the numbers: a program that still holds its structure when `main`
 returns exits without a final free walk, so whatever is live at exit
 counts as leaked. `leaked` at or below `live_peak` is that residue — a
