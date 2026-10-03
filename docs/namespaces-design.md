@@ -44,6 +44,12 @@ Generalised over every class of name, with the module dimension included:
 4. **Unique symbol** — exactly one candidate across imports.
 5. **Otherwise: a compile error demanding disambiguation.**
 
+The auto-loaded core modules sit on a rung of their own, below what the
+file imports: a bare name an import declares settles to the import, and
+the core declaration stays reachable qualified (`effects.Log`). Effect
+names follow the same ladder as every other class, so a bare `Log` means
+the same declaration in a row, a `handle` head and a perform.
+
 Step 5 is the whole point. Never first-wins, never last-wins, never
 import-order, never declaration-order. The kind-system doc already
 justifies this — *"order-of-declaration must NOT change a program's

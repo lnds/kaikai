@@ -14,6 +14,7 @@ import compiler.util
 import compiler.chars
 import compiler.diag
 import compiler.ast
+import compiler.effect_default
 import compiler.type_text
 import compiler.sym_read
 import compiler.marks
@@ -48,6 +49,7 @@ import compiler.tycon_scheme_home
 import compiler.scope_file
 import compiler.homonym
 import compiler.record_fields
+import compiler.effect_alias
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule, `inf_` prefix)
@@ -59,93 +61,6 @@ import compiler.record_fields
 # imported symbols (AST types from compiler.ast, core string/list
 # ops), so the mirrors are exact and carry no further coupling.
 
-fn inf_alias_set_status(entries: [AEntry], name: String, status: AStatus) : [AEntry] {
-  match entries {
-    [] -> [AEnt(name, status)]
-    [e, ...rest] -> match e {
-      AEnt(en, es) ->
-        if en == name { [AEnt(en, status), ...rest] }
-        else { [AEnt(en, es), ...inf_alias_set_status(rest, name, status)] }
-    }
-  }
-}
-
-
-fn inf_alias_status(entries: [AEntry], name: String) : AStatus {
-  match entries {
-    [] -> AsTodo
-    [e, ...rest] -> match e {
-      AEnt(en, es) -> if en == name { es } else { inf_alias_status(rest, name) }
-    }
-  }
-}
-
-
-fn inf_all_clauses_extern_handler(cs: [HClause]) : Bool = match cs {
-  []           -> true
-  [c, ...rest] -> match c {
-    HC(_, _, body, _, _) -> match inf_extern_handler_c_symbol(body) {
-      None    -> false
-      Some(_) -> inf_all_clauses_extern_handler(rest)
-    }
-  }
-}
-
-fn inf_cand_names_of(cands: [AliasCand]) : [String] {
-  match cands {
-    [] -> []
-    [c, ...rest] -> match c {
-      AC(n, _, _, _, _, _) -> [n, ...inf_cand_names_of(rest)]
-    }
-  }
-}
-
-
-fn inf_cand_pos(cands: [AliasCand], name: String) : AliasPos {
-  match inf_find_alias_cand(cands, name) {
-    None -> AliasPos { line: 0, col: 0 }
-    Some(c) -> match c {
-      AC(_, _, _, ln, co, _) -> AliasPos { line: ln, col: co }
-    }
-  }
-}
-
-# The file that declared the alias; `fallback` covers a name with no
-# candidate, where there is no decl to attribute to.
-fn inf_cand_file_of(cands: [AliasCand], name: String, fallback: String) : String {
-  match inf_find_alias_cand(cands, name) {
-    None -> fallback
-    Some(c) -> match c {
-      AC(_, _, _, _, _, f) -> f
-    }
-  }
-}
-
-
-fn inf_collect_alias_cands(decls: [Decl], df: DiagFiles) : [AliasCand] {
-  match decls {
-    [] -> []
-    [d, ...rest] -> {
-      let f = decl_diag_file(d, df)
-      let here = match d {
-        DType(_, name, _, body, line, col, _, _, _) -> match body {
-          TBEffectAlias(labels) -> [AC(name, labels, true, line, col, f)]
-          TBAlias(ty) -> match ty.tkind {
-            TyName(n, targs) ->
-              if targs == [] { [AC(name, [n], false, line, col, f)] }
-              else { [] }
-            _ -> []
-          }
-          _ -> []
-        }
-        _ -> []
-      }
-      list_append(here, inf_collect_alias_cands(rest, df))
-    }
-  }
-}
-
-
 fn inf_collect_op_to_eff(decls: [Decl]) : [OpToEff] {
   match decls {
     [] -> []
@@ -155,18 +70,6 @@ fn inf_collect_op_to_eff(decls: [Decl]) : [OpToEff] {
                     inf_collect_op_to_eff(rest))
       _ -> inf_collect_op_to_eff(rest)
     }
-  }
-}
-
-
-fn inf_dedup_strs(xs: [String]) : [String] = inf_dedup_strs_loop(xs, [])
-
-fn inf_dedup_strs_loop(xs: [String], acc: [String]) : [String] {
-  match xs {
-    [] -> list_reverse(acc)
-    [x, ...rest] ->
-      if list_has(acc, x) { inf_dedup_strs_loop(rest, acc) }
-      else { inf_dedup_strs_loop(rest, [x, ...acc]) }
   }
 }
 
@@ -182,21 +85,9 @@ fn inf_eff_has_op(eff_name: String, op_name: String, op_to_eff: [OpToEff]) : Boo
   }
 }
 
-# alias-aware op-call resolution lives inside
-# `try_op_call` (typer) and `desugar_op_calls_callee` (emit) instead
-# of as a standalone walker — a separate pre-pass blew the selfhost
-# stack when traversing compiler.kai's deep AST. The helpers
-# `inf_find_alias` / `inf_find_eff_for_alias_op` / `inf_eff_has_op` (defined
-# above) are consulted at each call site.
-
-
-fn inf_effect_default_block_all_extern(eff_name: String, decls: [Decl]) : Bool =
-  match inf_find_effect_default_block(eff_name, decls) {
-    None         -> false
-    Some(defblk) -> match defblk {
-      DBlk(clauses, _, _, _) -> inf_all_clauses_extern_handler(clauses)
-    }
-  }
+# Alias-aware op-call resolution lives inside `try_op_call` rather than in
+# a standalone walker: a separate pre-pass blew the selfhost stack on the
+# compiler's own deep AST.
 
 
 fn inf_indent_of(depth: Int) : String {
@@ -207,72 +98,19 @@ fn inf_indent_of(depth: Int) : String {
 pub fn inf_emit_line(depth: Int, s: String) : Unit / Console = print("#{inf_indent_of(depth)}#{s}")
 
 
-fn inf_extern_handler_c_symbol(body: Expr) : Option[String] =
-  match body.kind {
-    EIntrinsic(name, args_) ->
-      if name == "extern_handler" {
-        match args_ {
-          [a] -> match a.kind {
-            EStr(span, is_triple) ->
-              if is_triple { None }
-              else { Some(inf_strip_string_quotes(span)) }
-            _ -> None
-          }
-          _ -> None
-        }
-      } else { None }
-    _ -> None
-  }
-
-# Strip leading `"` and trailing `"` from a string-literal span and
-# resolve the minimal escape set the C-identifier surface uses: `\"`
-# survives only as a defensive case (no C identifier contains `"`),
-# and no other escape is meaningful here. Returns "" if the span has
-# no outer quotes (defensive against malformed AST).
-
-fn inf_find_alias(aliases: [AliasResult], name: String) : Option[AliasResult] {
-  match aliases {
-    [] -> None
-    [a, ...rest] -> match a {
-      AR(n, _) -> if n == name { Some(a) } else { inf_find_alias(rest, name) }
-    }
-  }
-}
-
 # Substitute every alias name in `labels` with its expanded form.
 # Effect names pass through unchanged. Duplicates introduced by
 # expansion are removed by the caller.
 
-fn inf_find_alias_cand(cands: [AliasCand], name: String) : Option[AliasCand] {
-  match cands {
-    [] -> None
-    [c, ...rest] -> match c {
-      AC(n, _, _, _, _, _) -> if n == name { Some(c) } else { inf_find_alias_cand(rest, name) }
-    }
-  }
-}
-
-
-fn inf_find_eff_for_alias_op(components: [String], op_to_eff: [OpToEff], op_name: String) : Option[String] {
+fn inf_find_eff_for_alias_op(components: [RowLabel], op_to_eff: [OpToEff], op_name: String) : Option[RowLabel] {
   match components {
     [] -> None
     [c, ...rest] ->
-      if inf_eff_has_op(c, op_name, op_to_eff) { Some(c) }
+      if inf_eff_has_op(rl_name(c), op_name, op_to_eff) { Some(c) }
       else { inf_find_eff_for_alias_op(rest, op_to_eff, op_name) }
   }
 }
 
-
-fn inf_find_effect_default_block(eff_name: String, decls: [Decl]) : Option[DefaultBlock] {
-  match decls {
-    [] -> None
-    [d, ...rest] -> match d {
-      DEffect(_, n, _, _, defblk, _, _, _, _) ->
-        if n == eff_name { defblk } else { inf_find_effect_default_block(eff_name, rest) }
-      _ -> inf_find_effect_default_block(eff_name, rest)
-    }
-  }
-}
 
 # Op-level coverage walker.
 #
@@ -690,14 +528,6 @@ fn inf_ops_to_eff_pairs(eff_name: String, ops: [EffectOp]) : [OpToEff] {
 # unaffected: it passes the stdlib file as the *target* (which keeps
 # its own test blocks intact through `compile_source`).
 
-fn inf_prepend_rev_strs(xs: [String], acc: [String]) : [String] {
-  match xs {
-    [] -> acc
-    [x, ...rest] -> inf_prepend_rev_strs(rest, [x, ...acc])
-  }
-}
-
-
 fn inf_proto_dispatch_tag_prefix() : String = "__kai_proto_dispatch__:"
 
 
@@ -720,127 +550,6 @@ fn inf_raw_lit_for_c(piece: String) : String =
 
 # `st.parts` accumulates in REVERSE here for O(1) prepend; the public
 # inf_iscan_collect entry point reverses once at the end.
-
-fn inf_resolve_alias(name: String, cands: [AliasCand], cand_ns: [String],
-                 eff_names: [String], file: String, st: AliasResolveState) : AliasResolveOne / Console + File {
-
-
-  match inf_alias_status(st.entries, name) {
-    AsDone(labels) -> AliasResolveOne { st: st, r: Some(labels) }
-    AsFail -> AliasResolveOne { st: st, r: None }
-    AsActive -> {
-      let pos = inf_cand_pos(cands, name)
-      diag_error(inf_cand_file_of(cands, name, file), pos.line, pos.col,
-        string_concat("cyclic effect alias: ", name))
-      diag_note("an alias can only expand to declared effects, not back to itself")
-      diag_help("break the cycle: list each effect explicitly in the body of `type #{name} = ...`")
-      let st2 = AliasResolveState {
-        entries: inf_alias_set_status(st.entries, name, AsFail),
-        errs:    st.errs + 1
-      }
-      AliasResolveOne { st: st2, r: None }
-    }
-    AsTodo -> {
-      match inf_find_alias_cand(cands, name) {
-        None -> AliasResolveOne { st: st, r: None }
-        Some(c) -> match c {
-          AC(_, raw, explicit, line, col, cand_file) -> {
-            let entries1 = inf_alias_set_status(st.entries, name, AsActive)
-            let st1 = AliasResolveState { entries: entries1, errs: st.errs }
-            let r = inf_resolve_alias_labels(raw, cands, cand_ns, eff_names, cand_file,
-                                         name, explicit, line, col, st1, [])
-            match r.r {
-              None -> {
-                let entries2 = inf_alias_set_status(r.st.entries, name, AsFail)
-                AliasResolveOne { st: AliasResolveState { entries: entries2, errs: r.st.errs }, r: None }
-              }
-              Some(labels) -> {
-                let unique = inf_dedup_strs(labels)
-                let entries2 = inf_alias_set_status(r.st.entries, name, AsDone(unique))
-                AliasResolveOne { st: AliasResolveState { entries: entries2, errs: r.st.errs }, r: Some(unique) }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-
-fn inf_resolve_alias_cands(cands: [AliasCand], eff_names: [String], file: String) : AliasResolution / Console + File {
-
-
-  let cand_ns = inf_cand_names_of(cands)
-  inf_resolve_alias_cands_loop(cands, cand_ns, eff_names, file,
-                           AliasResolveState { entries: [], errs: 0 }, cands, [])
-}
-
-
-fn inf_resolve_alias_cands_loop(all_cands: [AliasCand], cand_ns: [String],
-                            eff_names: [String], file: String,
-                            st: AliasResolveState, todo: [AliasCand],
-                            acc: [AliasResult]) : AliasResolution / Console + File {
-
-
-  match todo {
-    [] -> AliasResolution { aliases: list_reverse(acc), errs: st.errs }
-    [c, ...rest] -> match c {
-      # A name declared as a first-class `effect` is an effect, not an
-      # alias: skip registering an alias entry for it so a row label
-      # resolves to the effect.
-      AC(name, _, _, _, _, _) ->
-        if list_has(eff_names, name) {
-          inf_resolve_alias_cands_loop(all_cands, cand_ns, eff_names, file, st, rest, acc)
-        } else {
-          let r = inf_resolve_alias(name, all_cands, cand_ns, eff_names, file, st)
-          let acc1 = match r.r {
-            Some(labels) -> [AR(name, labels), ...acc]
-            None -> acc
-          }
-          inf_resolve_alias_cands_loop(all_cands, cand_ns, eff_names, file, r.st, rest, acc1)
-        }
-    }
-  }
-}
-
-
-fn inf_resolve_alias_labels(raw: [String], cands: [AliasCand], cand_ns: [String],
-                        eff_names: [String], file: String,
-                        parent: String, explicit: Bool, pline: Int, pcol: Int,
-                        st: AliasResolveState, acc: [String]) : AliasResolveOne / Console + File {
-
-
-  match raw {
-    [] -> AliasResolveOne { st: st, r: Some(list_reverse(acc)) }
-    [label, ...rest] -> {
-      if list_has(eff_names, label) {
-        inf_resolve_alias_labels(rest, cands, cand_ns, eff_names, file, parent,
-                             explicit, pline, pcol, st, [label, ...acc])
-      } else if list_has(cand_ns, label) {
-        let r = inf_resolve_alias(label, cands, cand_ns, eff_names, file, st)
-        match r.r {
-          None -> AliasResolveOne { st: r.st, r: None }
-          Some(sub) ->
-            inf_resolve_alias_labels(rest, cands, cand_ns, eff_names, file, parent,
-                                 explicit, pline, pcol, r.st,
-                                 inf_prepend_rev_strs(sub, acc))
-        }
-      } else {
-        if explicit {
-          diag_error(file, pline, pcol,
-            concat_all(["unknown effect in alias body: ", label,
-                        " (declared as part of `", parent, "`)"]))
-          let st1 = AliasResolveState { entries: st.entries, errs: st.errs + 1 }
-          AliasResolveOne { st: st1, r: None }
-        } else {
-          AliasResolveOne { st: st, r: None }
-        }
-      }
-    }
-  }
-}
-
 
 # True when `name` is a fixed-width boundary annotation. On the kaikai
 # side such a value is a plain `Int` (or
@@ -978,8 +687,8 @@ fn inf_row_labels_of_rls(ls: [RowLabel], hv: TyHomeView) : [Label] {
   match ls {
     [] -> []
     [rl, ...rest] -> match rl {
-      RL(name, ts) -> [
-        Label { eff: name, ty_args: inf_resolve_ty_list(ts, hv), sym: sym_none() },
+      RL(name, ts, s) -> [
+        Label { eff: name, ty_args: inf_resolve_ty_list(ts, hv), sym: s },
         ...inf_row_labels_of_rls(rest, hv)
       ]
     }
@@ -1006,7 +715,9 @@ fn inf_row_of_expr(re: RowExpr, hv: TyHomeView) : Row {
 }
 
 
-fn inf_row_to_string_suffix(r: Row) : String {
+fn inf_row_to_string_suffix(r: Row) : String = inf_row_suffix_ow([], r)
+
+fn inf_row_suffix_ow(owners: [HeadOwnerEntry], r: Row) : String {
   # a row with no labels is treated as "pure" in display
   # form, whether its tail is None (truly closed empty) or Some(_)
   # (a free row var with no demand on it — the phantom that
@@ -1021,7 +732,7 @@ fn inf_row_to_string_suffix(r: Row) : String {
     if labels_empty(r.labels) {
       ""
     } else {
-      let lbs = inf_join_with(map(r.labels, label_to_string), " + ")
+      let lbs = inf_join_with(map(r.labels, (l) => label_display(owners, label_to_string(l))), " + ")
       let tail_s = match r.tail {
         None -> ""
         Some(v) -> {
@@ -1085,18 +796,6 @@ fn inf_starts_with_loop(s: String, prefix: String, i: Int) : Bool {
 
 fn inf_string_starts_with_q(s: String, prefix: String) : Bool =
   inf_starts_with_loop(s, prefix, 0)
-
-
-fn inf_strip_string_quotes(span: String) : String {
-  let n = string_length(span)
-  if n < 2 { "" }
-  else {
-    let first_q = match char_at(span, 0) { Some(c) -> c == '"' _ -> false }
-    let last_q  = match char_at(span, n - 1) { Some(c) -> c == '"' _ -> false }
-    if first_q and last_q { string_slice(span, 1, n - 2) }
-    else { span }
-  }
-}
 
 
 # assemble the full
@@ -1297,7 +996,7 @@ pub fn inf_ty_to_string_ow(owners: [HeadOwnerEntry], t: Ty) : String {
     TyFnT(ps, ret, row) -> concat_all([
       "(", inf_join_with(inf_ty_string_list_ow(owners, ps), ", "), ") -> ",
       inf_ty_to_string_ow(owners, ret),
-      inf_row_to_string_suffix(row)
+      inf_row_suffix_ow(owners, row)
     ])
     TyCon(_, cname, tas, _) -> {
       let shown = inf_tycon_display_ow(owners, cname)
@@ -1320,7 +1019,7 @@ fn inf_ty_string_list_ow(owners: [HeadOwnerEntry], ts: [Ty]) : [String] =
 
 fn inf_tycon_arg_to_string_ow(owners: [HeadOwnerEntry], t: Ty) : String =
   match inf_row_carrier_of(t) {
-    Some(row) -> if labels_empty(row.labels) { "_" } else { inf_join_with(map(row.labels, label_to_string), " + ") }
+    Some(row) -> if labels_empty(row.labels) { "_" } else { inf_join_with(map(row.labels, (l) => label_display(owners, label_to_string(l))), " + ") }
     None      -> inf_ty_to_string_ow(owners, t)
   }
 
@@ -1339,11 +1038,19 @@ fn inf_head_owner_of(owners: [HeadOwnerEntry], cname: String) : Option[String] =
 pub fn inf_tycon_display_ow(owners: [HeadOwnerEntry], cname: String) : String =
   match inf_head_owner_of(owners, cname) {
     None -> cname
+    Some("") -> root_written(cname, 0, string_length(cname))
     Some(own) -> {
       let disp = hs_display(cname, Some(own))
       if disp == cname { cname } else { concat_all([own, ".", disp]) }
     }
   }
+
+# A root spelling is a core effect's name plus the root's suffix, and is
+# recorded only when that prefix is one.
+fn root_written(n: String, i: Int, len: Int) : String =
+  if i + 1 >= len { n }
+  else if char_at(n, i) == Some('_') and char_at(n, i + 1) == Some('_') { string_slice(n, 0, i) }
+  else { root_written(n, i + 1, len) }
 
 fn first_string(xs: [String]) : Option[String] = match xs {
   [] -> None
@@ -1452,7 +1159,7 @@ pub type OpToEff = OEFP(String, String)
 
 
 #[doc("infer: `label_to_rl_zero` — typer/effect support type.")]
-pub fn label_to_rl_zero(lab: Label) : RowLabel = RL(lab.eff, [])
+pub fn label_to_rl_zero(lab: Label) : RowLabel = RL(lab.eff, [], lab.sym)
 
 # walk a typed Expr collecting effect labels from
 # every call site's callee type. Used only on `main`'s body to fix
@@ -1469,7 +1176,7 @@ pub fn label_to_rl_zero(lab: Label) : RowLabel = RL(lab.eff, [])
 # unified with the lambda's row at the call site).
 
 #[doc("infer: `HandleFrame` — typer/effect support type.")]
-pub type HandleFrame = HF(String, [String], [String], Int, Int)
+pub type HandleFrame = HF(String, SymId, [String], [String], Int, Int)
 
 # Two-list signature so the per-module body walk (first arg) can still
 # iterate this pass's DFns while effect-existence lookups (second arg)
@@ -1481,40 +1188,6 @@ pub type HandleFrame = HF(String, [String], [String], Int, Int)
 
 #[doc("infer: `FieldDeclWithHome` — typer/effect support type.")]
 pub type FieldDeclWithHome = FDH(FieldDecl, Option[String])
-
-
-# The trailing file is the source of the decl that introduced the
-# alias, carried so a diagnostic names it rather than the root path.
-#[doc("infer: `AliasCand` — typer/effect support type.")]
-pub type AliasCand = AC(String, [String], Bool, Int, Int, String)
-
-# AliasResult: a candidate that resolved to a flat label list.
-
-#[doc("infer: `AliasResult` — typer/effect support type.")]
-pub type AliasResult = AR(String, [String])
-
-# DFS expansion status for an alias name.
-
-#[doc("infer: `AStatus` — typer/effect support type.")]
-pub type AStatus = AsTodo | AsActive | AsDone([String]) | AsFail
-
-
-#[doc("infer: `AEntry` — typer/effect support type.")]
-pub type AEntry = AEnt(String, AStatus)
-
-
-#[doc("infer: `AliasResolveState` — typer/effect support type.")]
-pub type AliasResolveState = { entries: [AEntry], errs: Int }
-
-#[doc("infer: `AliasResolveOne` — typer/effect support type.")]
-pub type AliasResolveOne   = { st: AliasResolveState, r: Option[[String]] }
-
-#[doc("infer: `AliasPos` — typer/effect support type.")]
-pub type AliasPos     = { line: Int, col: Int }
-
-
-#[doc("infer: `AliasResolution` — typer/effect support type.")]
-pub type AliasResolution = { aliases: [AliasResult], errs: Int }
 
 
 #[doc("infer: `Use` — typer/effect support type.")]
@@ -2184,15 +1857,15 @@ fn default_block_extern_ops(defblk: Option[DefaultBlock]) : [String] =
 # desugar.kai (kept local here because this lane touches only infer.kai).
 # Effects absent from the table (lookup `None`) resolve to `[]` at the use
 # site, matching the old scan on an effect with no `default { }` block.
-type EffDefaultOps = EDOps(String, [String])
+type EffDefaultOps = EDOps(SymId, [String])
 
 
 fn build_effect_default_op_map(decls: [Decl]) : [EffDefaultOps] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DEffect(_, name, _, _, defblk, _, _, _, _) ->
-        [EDOps(name, default_block_extern_ops(defblk)),
+      DEffect(_, _, _, _, defblk, _, _, _, s) ->
+        [EDOps(s, default_block_extern_ops(defblk)),
          ...build_effect_default_op_map(rest)]
       _ -> build_effect_default_op_map(rest)
     }
@@ -2202,22 +1875,20 @@ fn build_effect_default_op_map(decls: [Decl]) : [EffDefaultOps] {
 
 # Lookup matching `effect_default_op_names`'s contract: an undeclared
 # effect (no table entry) returns `[]`, exactly as the original scan does
-# when `inf_find_effect_default_block` finds no DEffect.
-fn effect_default_op_map_get(table: [EffDefaultOps], eff_name: String) : [String] {
-  match table {
-    [] -> []
-    [h, ...rest] -> match h {
-      EDOps(n, ops) ->
-        if n == eff_name { ops } else { effect_default_op_map_get(rest, eff_name) }
-    }
-  }
+# when the effect's declaration carries no `default { }` block.
+fn effect_default_op_map_get(table: [EffDefaultOps], s: SymId) : [String] =
+  if sym_raw(s) < 0 { [] } else { edop_get(table, sym_raw(s)) }
+
+fn edop_get(table: [EffDefaultOps], id: Int) : [String] = match table {
+  [] -> []
+  [EDOps(n, ops), ...rest] -> if sym_raw(n) == id { ops } else { edop_get(rest, id) }
 }
 
 
 fn extern_handler_op_names(cs: [HClause]) : [String] = match cs {
   []           -> []
   [c, ...rest] -> match c {
-    HC(name, _, body, _, _) -> match inf_extern_handler_c_symbol(body) {
+    HC(name, _, body, _, _) -> match extern_handler_c_symbol(body) {
       None    -> extern_handler_op_names(rest)
       Some(_) -> [name, ...extern_handler_op_names(rest)]
     }
@@ -2225,12 +1896,15 @@ fn extern_handler_op_names(cs: [HClause]) : [String] = match cs {
 }
 
 
-fn find_top_eff_frame(stack: [HandleFrame], eff_name: String) : Option[HandleFrame] {
+# The innermost handle of the effect a perform names: the same spelling,
+# and the same declaration whenever both carry one.
+fn find_top_eff_frame(stack: [HandleFrame], eff_name: String, esym: SymId) : Option[HandleFrame] {
   match stack {
     []           -> None
     [f, ...rest] -> match f {
-      HF(n, _, _, _, _) ->
-        if n == eff_name { Some(f) } else { find_top_eff_frame(rest, eff_name) }
+      HF(n, hs, _, _, _, _) ->
+        if label_same(Label { eff: n, ty_args: [], sym: hs }, Label { eff: eff_name, ty_args: [], sym: esym }) { Some(f) }
+        else { find_top_eff_frame(rest, eff_name, esym) }
     }
   }
 }
@@ -2270,8 +1944,9 @@ fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
       # Detect `Eff.op(...)` shape produced by synth_op_call_with_scheme.
       # The callee is `EVar("Eff.op")` (possibly with an `@alias` suffix on
       # the dispatch key — strip that before splitting).
+      let csym = match callee.kind { ESym(s, _, _) -> s  _ -> sym_none() }
       let head_errs = match sym_read_kind(callee.kind) {
-        EVar(key) -> check_op_call_coverage(file, decls, eff_map, fname, key,
+        EVar(key) -> check_op_call_coverage(file, decls, eff_map, fname, key, csym,
                                               stack, e.line, e.col)
         _ -> 0
       }
@@ -2337,11 +2012,11 @@ fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
     }
     EBang(inner)       -> walk_coverage_expr(file, decls, eff_map, fname, inner, stack, acc)
     ELitUnit(inner, _) -> walk_coverage_expr(file, decls, eff_map, fname, inner, stack, acc)
-    EHandle(body, eff_name, _, _, init_opt, _, clauses, ret_opt) -> {
+    EHandle(body, eff_name, hsym, _, init_opt, _, clauses, ret_opt) -> {
       let clause_ops = handle_clause_op_names(clauses)
-      let default_ops = effect_default_op_map_get(eff_map, eff_name)
-      let frame = HF(eff_name, clause_ops, default_ops, e.line, e.col)
-      let missing = handler_missing_ops(decls, eff_name, clause_ops, default_ops)
+      let default_ops = effect_default_op_map_get(eff_map, hsym)
+      let frame = HF(eff_name, hsym, clause_ops, default_ops, e.line, e.col)
+      let missing = handler_missing_ops(effect_decl_of(hsym, decls), clause_ops, default_ops)
       let a0 = acc + report_partial_handler(file, eff_name, missing, e.line, e.col)
       let a1 = match init_opt {
         Some(i) -> walk_coverage_expr(file, decls, eff_map, fname, i, stack, a0)
@@ -2495,7 +2170,7 @@ fn walk_coverage_clauses(file: String, decls: [Decl], eff_map: [EffDefaultOps],
 
 fn check_op_call_coverage(file: String, decls: [Decl],
                            eff_map: [EffDefaultOps], fname: String,
-                           key: String, stack: [HandleFrame],
+                           key: String, esym: SymId, stack: [HandleFrame],
                            line: Int, col: Int) : Int / Console + File {
   let bare = strip_alias_suffix(key)
   if not string_contains_dot(bare) { 0 }
@@ -2509,9 +2184,9 @@ fn check_op_call_coverage(file: String, decls: [Decl],
     # show up via `is_effect_declared`.
     if not is_effect_declared(eff_name, decls) { 0 }
     else {
-      match find_top_eff_frame(stack, eff_name) {
+      match find_top_eff_frame(stack, eff_name, esym) {
         Some(frame) -> match frame {
-          HF(_, clause_ops, _default_ops, _, _) ->
+          HF(_, _, clause_ops, _default_ops, _, _) ->
             if list_has_string(clause_ops, op_name) { 0 }
             else {
               # Spec step 3 ("enclosing handle exists, op not in
@@ -2526,7 +2201,7 @@ fn check_op_call_coverage(file: String, decls: [Decl],
               # default block and synthesize the missing clauses; at
               # that point this branch flips to check `_default_ops`
               # and discharges.
-              report_uncovered_op(file, fname, eff_name, op_name, decls,
+              report_uncovered_op(file, fname, eff_name, op_name, esym, decls,
                                    line, col, false)
               1
             }
@@ -2539,10 +2214,10 @@ fn check_op_call_coverage(file: String, decls: [Decl],
             # source-level `default { }` block bridging via
             # `$extern_handler` gets auto-installed at main. The
             # check is now uniform — no special builtin list.
-            let default_ops = effect_default_op_map_get(eff_map, eff_name)
+            let default_ops = effect_default_op_map_get(eff_map, esym)
             if list_has_string(default_ops, op_name) { 0 }
             else {
-              report_uncovered_op(file, fname, eff_name, op_name, decls,
+              report_uncovered_op(file, fname, eff_name, op_name, esym, decls,
                                    line, col, true)
               1
             }
@@ -2591,7 +2266,7 @@ fn is_effect_declared(eff_name: String, decls: [Decl]) : Bool {
 # does not fill the gap" — the help lines differ.
 
 fn report_uncovered_op(file: String, fname: String, eff_raw: String,
-                        op_name: String, decls: [Decl],
+                        op_name: String, esym: SymId, decls: [Decl],
                         line: Int, col: Int, at_main: Bool) : Unit / Console + File {
   # The row and the handler tables key the effect by its spelled name;
   # what the reader is told to write is the name their source spells.
@@ -2599,7 +2274,7 @@ fn report_uncovered_op(file: String, fname: String, eff_raw: String,
   let qualified = concat_all([eff_name, ".", op_name])
   let header = concat_all(["effect not handled: ", qualified])
   diag_error(file, line, col, header)
-  let default_status = describe_default_status(eff_raw, op_name, decls)
+  let default_status = describe_default_status(eff_name, op_name, effect_decl_default(effect_decl_of(esym, decls)))
   diag_note(default_status)
   if at_main {
     diag_help(concat_all(["wrap the call in `handle { ... } with ",
@@ -2618,8 +2293,8 @@ fn report_uncovered_op(file: String, fname: String, eff_raw: String,
 
 
 fn describe_default_status(eff_name: String, op_name: String,
-                            decls: [Decl]) : String {
-  match inf_find_effect_default_block(eff_name, decls) {
+                            dblk: Option[DefaultBlock]) : String {
+  match dblk {
     None ->
       concat_all(["effect `", eff_name,
                   "` declares no `default { }` block, so no fallback handler exists"])
@@ -3181,7 +2856,11 @@ fn fn_ty(ps: [Ty], ret: Ty) : Ty = TyFnT(ps, ret, inf_row_empty())
 # exactly as for a stdlib fn written `: T / Stdout`. Empty `effs` degrades to
 # `fn_ty`.
 fn fn_ty_eff(ps: [Ty], ret: Ty, effs: [String]) : Ty =
-  TyFnT(ps, ret, labels_to_closed_row(map(effs, (e) => Label { eff: e, ty_args: [], sym: sym_none() })))
+  TyFnT(ps, ret, labels_to_closed_row(map(effs, (e) => Label { eff: e, ty_args: [], sym: core_effect_sym(e) })))
+
+# A builtin's effect is the core declaration, never a homonym in scope.
+fn core_effect_sym(e: String) : SymId =
+  sym_derive(NCEffect, e, if e == "Process" { "os" } else { "effects" })
 
 # open-tail Row for row-polymorphic
 # core signatures (each/map/filter/reduce). The row var id
@@ -4763,8 +4442,8 @@ fn row_labels_of_rls_with_binds(ls: [RowLabel], tpbinds: [TPBind], rbinds: [RVBi
   match ls {
     [] -> []
     [rl, ...rest] -> match rl {
-      RL(name, ts) -> [
-        Label { eff: name, ty_args: map(ts, (te) => resolve_ty_with_binds(te, tpbinds, rbinds, [], hv)), sym: sym_none() },
+      RL(name, ts, s) -> [
+        Label { eff: name, ty_args: map(ts, (te) => resolve_ty_with_binds(te, tpbinds, rbinds, [], hv)), sym: s },
         ...row_labels_of_rls_with_binds(rest, tpbinds, rbinds, hv)
       ]
     }
@@ -4943,7 +4622,7 @@ fn collect_implicit_in_row_labels(labels: [RowLabel], declared: [String], acc: [
   match labels {
     [] -> acc
     [l, ...rest] -> match l {
-      RL(_, tas) -> collect_implicit_in_row_labels(rest, declared,
+      RL(_, tas, _) -> collect_implicit_in_row_labels(rest, declared,
                        collect_implicit_in_typeexprs(tas, declared, acc))
     }
   }
@@ -10851,19 +10530,19 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
                   # and the runtime evidence stack is queried with
                   # the right key. Ambiguity (multiple components
                   # share an op_name) resolves to the leftmost.
-                  match inf_find_alias(st.type_aliases, name) {
+                  match find_alias(st.type_aliases, name) {
                     # Not an effect, not a `with..as` alias, not a type alias —
                     # last shot: a capability PARAMETER (`c: Eff`), provided by
                     # the caller (§6 named instances). Op dispatches against the
                     # param's evidence; effect does not join the row.
                     None -> cap_op_call(st, name, op_name, args_, line, col)
-                    Some(AR(_, components)) ->
+                    Some(components) ->
                       match inf_find_eff_for_alias_op(components, st.op_to_eff, op_name) {
                         None -> None
-                        Some(real_eff) -> {
+                        Some(RL(real_eff, _, rsym)) -> {
                           let key2 = string_concat(real_eff, string_concat(".", op_name))
                           match ty_env_lookup(st.env, key2) {
-                            Some(sc) -> Some(record_op_res(synth_op_call_with_scheme(st, sc, args_, key2, sym_none(), line, col), key2, None, false, line, col))
+                            Some(sc) -> Some(op_callee_carries(record_op_res(synth_op_call_with_scheme(st, sc, args_, key2, rsym, line, col), key2, None, false, line, col), rsym))
                             None ->
                               if is_effect_in_env(st.env, real_eff) {
                                 Some(synth_op_call_unknown_op(st, real_eff, op_name, line, col))
@@ -11010,7 +10689,8 @@ fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String,
               # (via `synth_many`); `synth` on `EVar(name)` is a pure
               # env lookup, so a second walk is idempotent.
               let all_args = [obj, ...args_]
-              Some(synth_op_call_with_scheme(st, sc, all_args, key, sym_none(), line, col))
+              let ms = core_effect_sym("Mutable")
+              Some(op_callee_carries(synth_op_call_with_scheme(st, sc, all_args, key, ms, line, col), ms))
             }
           }
         }
@@ -13100,16 +12780,37 @@ pub fn build_head_owner_map(decls: [Decl], modules: [ModuleEntry],
 # its owner. Effects join types here: the runtime keys a perform on the
 # spelled label, so only the diagnostic un-spells it.
 #[doc("The home each home-spelled declaration in `ds` was keyed by, as head-owner entries a diagnostic un-spells names with.")]
-pub fn spelled_head_owners(ds: [Decl], acc: [HeadOwnerEntry]) : [HeadOwnerEntry] = match ds {
+pub fn spelled_head_owners(ds: [Decl], acc: [HeadOwnerEntry]) : [HeadOwnerEntry] =
+  sho_loop(ds, root_spelled_owners(ds, bare_module_effects(ds, []), acc))
+
+# A root effect is home-spelled only when a module's effect holds its bare
+# name; it reads back as that bare name, the one its source wrote.
+fn root_spelled_owners(ds: [Decl], bare: [String], acc: [HeadOwnerEntry]) : [HeadOwnerEntry] = match ds {
+  [] -> acc
+  [DEffect(_, name, _, _, _, _, _, None, _), ...rest] -> {
+    let w = root_written(name, 0, string_length(name))
+    root_spelled_owners(rest, bare, if w != name and list_has(bare, w) { [HOE(name, [""]), ...acc] } else { acc })
+  }
+  [_, ...rest] -> root_spelled_owners(rest, bare, acc)
+}
+
+fn bare_module_effects(ds: [Decl], acc: [String]) : [String] = match ds {
+  [] -> acc
+  [DEffect(_, name, _, _, _, _, _, Some(m), _), ...rest] ->
+    bare_module_effects(rest, if hs_display(name, Some(m)) == name { [name, ...acc] } else { acc })
+  [_, ...rest] -> bare_module_effects(rest, acc)
+}
+
+fn sho_loop(ds: [Decl], acc: [HeadOwnerEntry]) : [HeadOwnerEntry] = match ds {
   [] -> acc
   [d, ...rest] -> match decl_transparent_inner(d) {
-    Some(inner) -> spelled_head_owners([inner, ...rest], acc)
+    Some(inner) -> sho_loop([inner, ...rest], acc)
     None -> match d {
       DType(true, name, _, _, _, _, Some(m), _, _) ->
-        spelled_head_owners(rest, spelled_owner(name, m, acc))
+        sho_loop(rest, spelled_owner(name, m, acc))
       DEffect(_, name, _, _, _, _, _, Some(m), _) ->
-        spelled_head_owners(rest, spelled_owner(name, m, acc))
-      _ -> spelled_head_owners(rest, acc)
+        sho_loop(rest, spelled_owner(name, m, acc))
+      _ -> sho_loop(rest, acc)
     }
   }
 }
@@ -17754,6 +17455,20 @@ fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int,
 # ---- per-decl entry + dumper ----
 
 # One `row <fn> <eff>#<id>` line per label the body's row carries.
+fn print_sig_ids(nm: String, ls: [RowLabel]) : Unit / Console = match ls {
+  [] -> ()
+  [RL(n, _, s), ...rest] -> {
+    print("sig #{nm} #{n}##{int_to_string(sym_raw(s))}")
+    print_sig_ids(nm, rest)
+  }
+}
+
+fn row_expr_labels(r: RowExpr) : [RowLabel] = match r {
+  REmpty -> []
+  RClosed(ls) -> ls
+  ROpen(_, ls) -> ls
+}
+
 fn print_row_ids(nm: String, row: [Label]) : Unit / Console = match row {
   [] -> ()
   [l, ...rest] -> {
@@ -18188,6 +17903,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
         print_row_ids(nm, st2.row)
+        print_sig_ids(nm, row_expr_labels(row))
       } else { () }
       # Hanga Roa: tag every call-site instance with the enclosing
       # DFn's module_origin so downstream consumers (`--dump-mono`,
@@ -18790,7 +18506,7 @@ fn only_non_absorbed_labels(st: InferState, row: [Label], decls: [Decl]) : [Labe
   match row {
     [] -> []
     [h, ...rest] ->
-      if effect_has_default_handler(st, h.eff, decls) {
+      if label_absorbed(h, decls) {
         only_non_absorbed_labels(st, rest, decls)
       } else {
         [h, ...only_non_absorbed_labels(st, rest, decls)]
@@ -18806,134 +18522,13 @@ fn only_non_absorbed_labels(st: InferState, row: [Label], decls: [Decl]) : [Labe
 fn test_non_absorbed_labels(st: InferState, row: [Label], decls: [Decl]) : [Label] =
   only_non_absorbed_labels(st, filter(row, (h) => h.eff != "Ffi"), decls)
 
-# predicate matching the absorbable-by-main set.
-# Stays in sync with the builtin effects injected by
-# `inject_builtin_effects`: the fixed default-handler list from
-# `default_shims_for` (Stdout..Spawn) plus the parametric stdlib
-# effects (State, Reader, Writer) whose handlers are installed by
-# user-written or desugar-generated `with State[T](init) { ... }`
-# wrappers rather than by `emit_main_wrapper`. `Ffi` is excluded
-# (capability tag with no handler). Anything
-# outside this list is either a user-declared effect or a
-# capability-only label and must NOT be absorbed silently by main.
-#
-# The `st` parameter lets the check confirm that the in-scope
-# `effect <name>` declaration matches the runtime's expected op
-# shape (parallels emit-time `effect_default_compatible`): a user-
-# declared `effect Log { trace }` shadows the canonical `Log` and
-# the runtime's default handler is NOT installed, so the label
-# must NOT be absorbed.
-fn effect_has_default_handler(st: InferState, name: String, decls: [Decl]) : Bool {
-  # absorption is gated on the source-level `default { }`
-  # block carrying all-`$extern_handler` clauses. Parametric stdlib
-  # effects (State[T], Reader[T], Writer[W]) keep their earlier
-  # absorption since they have no runtime default — `var x = init`
-  # depends on it (the row-arithmetic gap discussed in the historic
-  # comment on `is_absorbable_stdlib_eff`).
-  # A declaration in this file's own home answers for a use written
-  # here, but only when it is not itself the one carrying the default:
-  # a root file using the prelude's `Stdout` has no declaration of its
-  # own, and a root file that DOES declare `Stdout` shadows the prelude
-  # one, whose runtime handler serves ops this declaration does not have.
-  let _ = st
-  if inf_effect_default_block_all_extern(name, decls) { true }
-  else if is_parametric_handlerless_stdlib_eff(name) { true }
-  else { false }
-}
+# A label `main` absorbs: the declaration it names carries an all-extern
+# default, or it is a parametric stdlib effect whose handler the `var`
+# desugar installs. A root homonym without a default names itself, so the
+# prelude's handler is never installed for its ops.
+fn label_absorbed(h: Label, decls: [Decl]) : Bool =
+  effect_decl_default_all_extern(effect_decl_of(h.sym, decls)) or is_parametric_handlerless_stdlib_eff(h.eff)
 
-
-
-# A use written in `home` reaches the declaration `home` makes, not a
-# homonym elsewhere. When the local one declares no `default { }` and a
-# foreign one does, absorbing the label would install a runtime handler
-# for the FOREIGN declaration's ops — a call then lands on a clause with
-# a different signature. `home` is `""` for the root file, matching the
-# `None` module tag a root declaration carries.
-fn inf_home_shadows_default(name: String, decls: [Decl], home: String) : Bool {
-  if inf_home_decl_without_default(name, decls, home) {
-    inf_foreign_decl_with_default(name, decls, home)
-  } else { false }
-}
-
-fn inf_home_decl_without_default(name: String, decls: [Decl], home: String) : Bool =
-  match decls {
-    [] -> false
-    [d, ...rest] -> match d {
-      DEffect(_, n, _, _, defblk, _, _, mo, _) ->
-        if n == name and inf_mo_str(mo) == home { inf_defblk_absent(defblk) }
-        else { inf_home_decl_without_default(name, rest, home) }
-      _ -> inf_home_decl_without_default(name, rest, home)
-    }
-  }
-
-# "Foreign" is decided by identity, not by module tag: two declarations
-# can share a tag spelling and still be different declarations, and the
-# root file's tag is `None`, which is also what an untagged one carries.
-# The local declaration's own id is what the foreign one must differ from.
-fn inf_foreign_decl_with_default(name: String, decls: [Decl], home: String) : Bool =
-  inf_foreign_with_default_loop(name, decls, home,
-                                inf_home_decl_sym(name, decls, home))
-
-fn inf_foreign_with_default_loop(name: String, decls: [Decl], home: String,
-      mine: SymId) : Bool = match decls {
-  [] -> false
-  [d, ...rest] -> match d {
-    DEffect(_, n, _, _, defblk, _, _, mo, esym) ->
-      if n == name and inf_other_decl(esym, mine, mo, home) { inf_defblk_all_extern(defblk) }
-      else { inf_foreign_with_default_loop(name, rest, home, mine) }
-    _ -> inf_foreign_with_default_loop(name, rest, home, mine)
-  }
-}
-
-# A different declaration: by id when both are stamped, by module tag
-# when either is not (a prelude effect the table does not hold).
-fn inf_other_decl(esym: SymId, mine: SymId, mo: Option[String], home: String) : Bool =
-  if inf_both_stamped(esym, mine) { sym_raw(esym) != sym_raw(mine) }
-  else { inf_mo_str(mo) != home }
-
-fn inf_both_stamped(a: SymId, b: SymId) : Bool =
-  if sym_raw(a) >= 0 { sym_raw(b) >= 0 } else { false }
-
-fn inf_home_decl_sym(name: String, decls: [Decl], home: String) : SymId =
-  match decls {
-    [] -> sym_none()
-    [d, ...rest] -> match d {
-      DEffect(_, n, _, _, _, _, _, mo, esym) ->
-        if n == name and inf_mo_str(mo) == home { esym }
-        else { inf_home_decl_sym(name, rest, home) }
-      _ -> inf_home_decl_sym(name, rest, home)
-    }
-  }
-
-fn inf_mo_str(mo: Option[String]) : String = match mo {
-  None    -> ""
-  Some(m) -> m
-}
-
-fn inf_defblk_absent(defblk: Option[DefaultBlock]) : Bool = match defblk {
-  None    -> true
-  Some(_) -> false
-}
-
-fn inf_defblk_all_extern(defblk: Option[DefaultBlock]) : Bool = match defblk {
-  None      -> false
-  Some(blk) -> match blk {
-    DBlk(clauses, _, _, _) -> inf_all_clauses_extern_handler(clauses)
-  }
-}
-
-
-# `main`'s own declared row: a label written here belongs to this file,
-# so a declaration the root file makes answers for it. A root `effect Log`
-# with no `default { }` shadowing the prelude's is NOT absorbed — the
-# prelude handler serves the prelude declaration's ops, and installing it
-# lets a call reach a clause with a different signature. A use that
-# arrives from another module keeps the ordinary rule: that module
-# declared nothing, so nothing shadows.
-fn inf_main_absorbs(st: InferState, name: String, decls: [Decl]) : Bool {
-  if inf_home_shadows_default(name, decls, st.home) { false }
-  else { effect_has_default_handler(st, name, decls) }
-}
 
 # Parametric stdlib effects whose handlers are always user-installed
 # (`var x = init` desugar wraps `with State[T](init) { ... }`). They
@@ -18961,7 +18556,7 @@ fn check_main_row_handlable(st: InferState, body_row: [Label],
       # directly. Treat it as handlable here so `main : Int / Ffi`
       # still typechecks; the REmpty path keeps rejecting an
       # undeclared Ffi label so the silent contract holds.
-      let st1 = if h.eff == "Ffi" or inf_main_absorbs(st, h.eff, decls) { st }
+      let st1 = if h.eff == "Ffi" or label_absorbed(h, decls) { st }
       else {
         let use_eu = lookup_eff_use(st.eff_uses, h.eff)
         match use_eu {
@@ -19349,7 +18944,8 @@ type ProgramData = {
   sums:       [SumInfo],
   # the whole-program type-home table this module's tables were
   # stamped from; the delta below stamps its own from the same one.
-  homes:      TyHomes
+  homes:      TyHomes,
+  seed_len:   Int                # entries the built-in seed contributes
 }
 
 # variant that seeds the working tables from an
@@ -19431,9 +19027,9 @@ fn collect_program_data_inherited(file: String, df: DiagFiles, decls: [Decl],
   let alias_src_decls = if list_length(all_program_decls) > 0 {
     all_program_decls
   } else { decls_a }
-  let alias_cands = inf_collect_alias_cands(alias_src_decls, df)
+  let alias_cands = collect_alias_cands(alias_src_decls, df)
   let eff_names_for_alias = collect_effect_names(alias_src_decls)
-  let alias_res = inf_resolve_alias_cands(alias_cands, eff_names_for_alias, file)
+  let alias_res = resolve_alias_cands(alias_cands, eff_names_for_alias, file)
   let op_to_eff_here = inf_collect_op_to_eff(decls_a)
   let op_to_eff_all = list_append(op_to_eff_here, inherited.op_to_eff)
   # sum-type registry for the region-brand walker.
@@ -19442,7 +19038,7 @@ fn collect_program_data_inherited(file: String, df: DiagFiles, decls: [Decl],
   ProgramData {
     decls_a: decls_a, built: built, recs: recs_all,
     alias_res: alias_res, op_to_eff: op_to_eff_all, sums: sums_all,
-    homes: homes
+    homes: homes, seed_len: list_length(seed.env.entries)
   }
 }
 
@@ -19513,7 +19109,7 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
   let data = ProgramData { decls_a: data0.decls_a, built: built1,
                             recs: data0.recs, alias_res: data0.alias_res,
                             op_to_eff: data0.op_to_eff, sums: data0.sums,
-                            homes: data0.homes }
+                            homes: data0.homes, seed_len: data0.seed_len }
   # Hanga Roa modular typecheck: `infer_all_loop` keeps a per-decl
   # `all_decls` pointer so `check_main_row_handlable` /
   # `check_body_row` can look up `DEffect default { ... }` blocks
@@ -19567,8 +19163,7 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
   # added by `add_decls_loop` over this module. `add_decls_loop`
   # cons-prepends, so the new entries occupy the head of the list;
   # the same shape holds for `op_eff_arities`.
-  let n_inherited = list_length(inherited.ty_entries) +
-                     list_length(build_ty_env_seed().env.entries)
+  let n_inherited = list_length(inherited.ty_entries) + data.seed_len
   let n_total = list_length(data.built.env.entries)
   let n_new = n_total - n_inherited
   let new_entries = take_entries(data.built.env.entries, n_new, [])

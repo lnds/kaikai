@@ -1,0 +1,177 @@
+#[doc("""
+Closed effect aliases: `type Io = Console + File` names a fixed set of
+effect labels. Each alias resolves once, transitively, to the effect
+labels it stands for, and every label keeps the declaration the effect
+pass settled where the alias was written; a row that writes the alias
+expands to exactly those labels.
+
+`type X = A + B` is an explicit alias, and an unknown label in its body
+is an error. `type X = A` is a candidate only: when `A` names no effect
+or alias it is an ordinary type alias. A cycle is an error either way.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.diag
+import compiler.diag_file
+
+#[doc("An alias candidate: its name, the labels as written, whether it is the explicit `+` form, its position, and the file declaring it.")]
+pub type AliasCand = AC(String, [RowLabel], Bool, Int, Int, String)
+
+#[doc("A resolved alias: its name and the effect labels it expands to.")]
+pub type AliasResult = AR(String, [RowLabel])
+
+#[doc("Every alias that resolved, and the number of errors resolution reported.")]
+pub type AliasResolution = { aliases: [AliasResult], errs: Int }
+
+type AStatus = AsTodo | AsActive | AsDone([RowLabel]) | AsFail
+
+type AEntry = AEnt(String, AStatus)
+
+type AState = { entries: [AEntry], errs: Int }
+
+type AOne = { st: AState, r: Option[[RowLabel]] }
+
+# What every lookup during one resolution reads.
+type ACtx = { cands: [AliasCand], effs: [String], file: String }
+
+#[doc("The alias candidates `decls` declares, in stream order.")]
+pub fn collect_alias_cands(decls: [Decl], df: DiagFiles) : [AliasCand] = match decls {
+  [] -> []
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> collect_alias_cands([inner, ...rest], df)
+    None        -> list_append(alias_cand_of(d, decl_diag_file(d, df)), collect_alias_cands(rest, df))
+  }
+}
+
+fn alias_cand_of(d: Decl, f: String) : [AliasCand] = match d {
+  DType(_, name, _, TBEffectAlias(labels), line, col, _, _, _) -> [AC(name, labels, true, line, col, f)]
+  DType(_, name, _, TBAlias(ty), line, col, _, _, _) -> match ty.tkind {
+    TyName(n, []) -> [AC(name, [RL(n, [], sym_none())], false, line, col, f)]
+    _ -> []
+  }
+  _ -> []
+}
+
+#[doc("Resolve every candidate that is not itself an effect name; a candidate that fails is dropped and its error counted.")]
+pub fn resolve_alias_cands(cands: [AliasCand], eff_names: [String], file: String) : AliasResolution / Console + File =
+  ea_loop(ACtx { cands: cands, effs: eff_names, file: file }, cands, AState { entries: [], errs: 0 }, [])
+
+fn ea_loop(cx: ACtx, todo: [AliasCand], st: AState, acc: [AliasResult]) : AliasResolution / Console + File = match todo {
+  [] -> AliasResolution { aliases: list_reverse(acc), errs: st.errs }
+  [AC(name, _, _, _, _, _), ...rest] ->
+    # A name declared as an effect is an effect, so a row label resolves to it.
+    if list_has(cx.effs, name) { ea_loop(cx, rest, st, acc) }
+    else {
+      let one = ea_resolve(cx, name, st)
+      ea_loop(cx, rest, one.st, match one.r { Some(ls) -> [AR(name, ls), ...acc]  None -> acc })
+    }
+}
+
+fn ea_resolve(cx: ACtx, name: String, st: AState) : AOne / Console + File = match ea_status(st.entries, name) {
+  AsDone(ls) -> AOne { st: st, r: Some(ls) }
+  AsFail     -> AOne { st: st, r: None }
+  AsActive   -> ea_cycle(cx, name, st)
+  AsTodo     -> match ea_cand(cx.cands, name) {
+    None -> AOne { st: st, r: None }
+    Some(c) -> ea_expand_cand(cx, name, c, ea_set(st, name, AsActive))
+  }
+}
+
+fn ea_expand_cand(cx: ACtx, name: String, c: AliasCand, st: AState) : AOne / Console + File = match c {
+  AC(_, raw, explicit, line, col, f) -> {
+    let one = ea_labels(cx, raw, AliasAt(name, explicit, line, col, f), st, [])
+    match one.r {
+      None     -> AOne { st: ea_set(one.st, name, AsFail), r: None }
+      Some(ls) -> {
+        let unique = ea_dedup(ls, [])
+        AOne { st: ea_set(one.st, name, AsDone(unique)), r: Some(unique) }
+      }
+    }
+  }
+}
+
+# The alias whose body is being expanded, for the diagnostic an unknown
+# label in it reports.
+type AliasAt = AliasAt(String, Bool, Int, Int, String)
+
+fn ea_labels(cx: ACtx, raw: [RowLabel], at: AliasAt, st: AState, acc: [RowLabel]) : AOne / Console + File = match raw {
+  [] -> AOne { st: st, r: Some(list_reverse(acc)) }
+  [l, ...rest] -> {
+    let n = rl_name(l)
+    if list_has(cx.effs, n) { ea_labels(cx, rest, at, st, [l, ...acc]) }
+    else { match ea_cand(cx.cands, n) {
+      Some(_) -> {
+        let sub = ea_resolve(cx, n, st)
+        match sub.r {
+          None     -> AOne { st: sub.st, r: None }
+          Some(ls) -> ea_labels(cx, rest, at, sub.st, list_append(list_reverse(ls), acc))
+        }
+      }
+      None -> ea_unknown(at, n, st)
+    } }
+  }
+}
+
+fn ea_unknown(at: AliasAt, n: String, st: AState) : AOne / Console + File = match at {
+  AliasAt(parent, explicit, line, col, f) ->
+    if not explicit { AOne { st: st, r: None } }
+    else {
+      diag_error(f, line, col, concat_all(["unknown effect in alias body: ", n,
+                                           " (declared as part of `", parent, "`)"]))
+      AOne { st: AState { entries: st.entries, errs: st.errs + 1 }, r: None }
+    }
+}
+
+fn ea_cycle(cx: ACtx, name: String, st: AState) : AOne / Console + File = {
+  let pos = match ea_cand(cx.cands, name) {
+    Some(AC(_, _, _, l, c, f)) -> AliasAt(name, true, l, c, f)
+    None -> AliasAt(name, true, 0, 0, cx.file)
+  }
+  match pos {
+    AliasAt(_, _, l, c, f) -> diag_error(f, l, c, string_concat("cyclic effect alias: ", name))
+  }
+  diag_note("an alias can only expand to declared effects, not back to itself")
+  diag_help("break the cycle: list each effect explicitly in the body of `type #{name} = ...`")
+  let st1 = ea_set(st, name, AsFail)
+  AOne { st: AState { entries: st1.entries, errs: st1.errs + 1 }, r: None }
+}
+
+fn ea_cand(cands: [AliasCand], name: String) : Option[AliasCand] = match cands {
+  [] -> None
+  [c, ...rest] -> match c { AC(n, _, _, _, _, _) -> if n == name { Some(c) } else { ea_cand(rest, name) } }
+}
+
+fn ea_status(es: [AEntry], name: String) : AStatus = match es {
+  [] -> AsTodo
+  [AEnt(n, s), ...rest] -> if n == name { s } else { ea_status(rest, name) }
+}
+
+fn ea_set(st: AState, name: String, s: AStatus) : AState =
+  AState { entries: [AEnt(name, s), ...ea_drop(st.entries, name)], errs: st.errs }
+
+fn ea_drop(es: [AEntry], name: String) : [AEntry] = match es {
+  [] -> []
+  [AEnt(n, s), ...rest] -> if n == name { rest } else { [AEnt(n, s), ...ea_drop(rest, name)] }
+}
+
+# One label per declaration: two homonymous effects both survive.
+fn ea_dedup(ls: [RowLabel], acc: [RowLabel]) : [RowLabel] = match ls {
+  [] -> list_reverse(acc)
+  [l, ...rest] -> if ea_has(acc, l) { ea_dedup(rest, acc) } else { ea_dedup(rest, [l, ...acc]) }
+}
+
+fn ea_has(ls: [RowLabel], l: RowLabel) : Bool = match ls {
+  [] -> false
+  [h, ...rest] -> ea_same(h, l) or ea_has(rest, l)
+}
+
+fn ea_same(a: RowLabel, b: RowLabel) : Bool = match a {
+  RL(an, _, asym) -> match b { RL(bn, _, bsym) -> an == bn and sym_raw(asym) == sym_raw(bsym) }
+}
+
+#[doc("The labels the alias `name` expands to, or None when `name` is no resolved alias.")]
+pub fn find_alias(aliases: [AliasResult], name: String) : Option[[RowLabel]] = match aliases {
+  [] -> None
+  [AR(n, ls), ...rest] -> if n == name { Some(ls) } else { find_alias(rest, name) }
+}

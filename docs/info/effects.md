@@ -283,6 +283,18 @@ when inferred. NetUdp / NetDns are reserved as part of the planned
 `Net` aggregate but are not shipped in v1 — `NetTcp` is the only
 network effect available today.
 
+An effect you declare or import with a stdlib effect's name shadows it
+for bare uses in that file; the stdlib one stays reachable qualified:
+
+```kai
+effect Log { note(n: Int) : Unit }
+
+fn report() : Unit / Log + effects.Log = {
+  Log.note(1)                  # this file's Log
+  effects.Log.info("done")     # the stdlib Log
+}
+```
+
 ## NOT IN KAIKAI
 
 - `do { ... }` notation (Haskell). Effect-using code is just a
