@@ -1,0 +1,87 @@
+#[doc("""
+Child `kai` processes started ahead of need: queued in the order they
+will be needed, at most `jobs` in flight, each awaited by its key. A
+finished task keeps its status and captured output, so one awaited early
+can still be replayed in its turn.
+""")]
+
+import cli_plan
+import cli_proc
+import cli_sys
+
+#[doc("A queued child: its key, the `kai` arguments after the backend, its environment additions, and where its stdout/stderr land (`<log>.out`, `<log>.err`).")]
+pub type Task = { key: String, args: [String], set: [(String, String)], log: String }
+
+#[doc("A finished child: its key, exit status, and log stem.")]
+pub type Done = { key: String, rc: Int, log: String }
+
+#[doc("A child in flight: its key, process handle, and log stem.")]
+pub type Slot = { key: String, pid: Int, log: String }
+
+#[doc("The pool: the `kai` binary, the job limit, the queue, the children in flight, and the finished ones.")]
+pub type Pool = { kai: String, jobs: Int, todo: [Task], running: [Slot], done: [Done] }
+
+#[doc("A pool running `kai` children, at most `jobs` at once, over `tasks` in order.")]
+pub fn new(kai: String, jobs: Int, tasks: [Task]) : Pool =
+  Pool { kai, jobs: if jobs < 1 { 1 } else { jobs }, todo: tasks, running: [], done: [] }
+
+fn start(p: Pool, backend: String, t: Task) : Slot / Ffi {
+  let sp =
+    cli_proc.Spawn { ...cli_proc.inherit(), out: "#{t.log}.out", err: "#{t.log}.err", set: t.set }
+  Slot {
+    key: t.key,
+    pid: cli_proc.start([p.kai, "test", "--backend", backend, ...t.args], sp),
+    log: t.log
+  }
+}
+
+#[doc("Start queued tasks with `backend` until `jobs` children are in flight.")]
+pub fn fill(p: Pool, backend: String) : Pool / Ffi =
+  match p.todo {
+    [t, ...rest] if list.length(p.running) < p.jobs ->
+      fill(Pool { ...p, todo: rest, running: p.running ++ [start(p, backend, t)] }, backend)
+    _ -> p
+  }
+
+fn reap(s: Slot) : Done / Ffi =
+  Done { key: s.key, rc: if s.pid < 0 { 127 } else { cli_sys.wait(s.pid) }, log: s.log }
+
+fn finished(p: Pool, key: String) : Option[Done] = list.find(p.done, d => d.key == key)
+
+#[doc("The task `key` finished, starting it first if still queued: its result and the pool after it.")]
+pub fn await(p: Pool, backend: String, key: String) : (Done, Pool) / Ffi =
+  match finished(p, key) {
+    Some(d) -> (d, p)
+    None -> match list.find(p.running, s => s.key == key) {
+      Some(s) -> {
+        let d = reap(s)
+        let rest = Pool { ...p, running: p.running |? (r => r.key != key), done: p.done ++ [d] }
+        (d, fill(rest, backend))
+      }
+      None -> match list.find(p.todo, t => t.key == key) {
+        Some(t) -> {
+          let d = reap(start(p, backend, t))
+          (d, Pool { ...p, todo: p.todo |? (q => q.key != key), done: p.done ++ [d] })
+        }
+        None -> (Done { key, rc: 127, log: "" }, p)
+      }
+    }
+  }
+
+#[doc("Run `t` now, beside whatever is in flight: its result and the pool after it.")]
+pub fn now(p: Pool, backend: String, t: Task) : (Done, Pool) / Ffi {
+  let d = reap(start(p, backend, t))
+  (d, Pool { ...p, done: p.done ++ [d] })
+}
+
+#[doc("Wait for every child still in flight; queued tasks never start.")]
+pub fn drain(p: Pool) : Unit / Ffi = p.running
+  |> foreach(s => {
+    let _ = reap(s)
+  })
+
+#[doc("Replay a finished child's captured stdout, then its stderr.")]
+pub fn replay(d: Done) : Unit / Ffi {
+  if cli_sys.size("#{d.log}.out") > 0 { cli_sys.copy_to_stdout("#{d.log}.out") }
+  cli_plan.replay("#{d.log}.err")
+}

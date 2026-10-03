@@ -34,15 +34,18 @@ pub fn nemit_skip_user_main(f: KFn, bmode: BuildMode) : Bool =
   nemit_is_runner_mode(bmode) and f.sym == "main"
 
 # Emit the synthetic `kai_main` driver for the active runner mode. Opens
-# `kai_main` with the shim's `ptr ()` signature, calls one
-# `kaix_<kind>_run_one(desc, &runner)` per matching block, then the
-# matching `*_summary_exit` (which prints the summary and `exit()`s with
-# its code). The block ends `unreachable`: `*_summary_exit` never
+# `kai_main` with the shim's `ptr ()` signature, registers and drives the
+# test blocks or runs each bench block, then calls the matching
+# `*_summary_exit` (which prints the summary and `exit()`s with its code). The block ends `unreachable`: `*_summary_exit` never
 # returns, but a basic block still needs a terminator.
 pub fn nemit_build_runner_driver(ctx: Handle, runners: [KRunner], bmode: BuildMode) : Unit / Console =
   if nemit_is_runner_mode(bmode) {
     ndriver_open_kai_main(ctx)
     nemit_runner_calls(ctx, runners, bmode)
+    match bmode {
+      BMTest -> { let _d = ncall_sig0(ctx, "kaix_test_drive", native_ctx_voidt(ctx)) }
+      _ -> ()
+    }
     let _e = ncall_sig0(ctx, ndriver_exit_sym(bmode), native_ctx_voidt(ctx))
     llvm_build_unreachable(native_ctx_b(ctx))
   } else { () }
@@ -63,12 +66,6 @@ fn ndriver_exit_sym(bmode: BuildMode) : String = match bmode {
   BMBench -> "kaix_bench_summary_exit"
   BMCheck -> "kaix_check_summary_exit"
   _       -> "kaix_test_summary_exit"
-}
-
-# The `*_run_one` forwarder for a test or bench runner.
-fn nrunner_call_sym(kind: KRunnerKind) : String = match kind {
-  KRBench -> "kaix_bench_run_one"
-  _       -> "kaix_test_run_one"
 }
 
 # Does this runner belong to the active driver mode? Each mode runs only
@@ -107,31 +104,28 @@ fn nemit_check_runner_call(ctx: Handle, r: KRunner, specs: [String]) : Unit / Co
   ()
 }
 
-# `kaix_<kind>_run_one(i8* desc, ptr body) -> void`. `desc` is the
-# block's source span, decoded to its literal bytes before it is
-# materialised as a global string. `body` is the runner fn's address — its
-# `Function*` handle, declared `ptr ()` to match the body fn the lowering
-# emitted; under opaque pointers the handle IS the `ptr` argument.
+# A test block registers `(desc, body, line, home)` for `kaix_test_drive`; a
+# bench block runs in place through `kaix_bench_run_one(desc, body)`. `desc`
+# is the block's source span decoded to its literal bytes; `body` is the
+# runner fn's `Function*` handle, which under opaque pointers IS the `ptr`.
 fn nemit_one_runner_call(ctx: Handle, r: KRunner) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
-  let desc = llvm_build_string_span(native_ctx_b(ctx), nemit_decode_span(r.desc))
+  let b = native_ctx_b(ctx)
+  let desc = llvm_build_string_span(b, nemit_decode_span(r.desc))
   let bodyfn = llvm_get_or_declare_fn(native_ctx_m(ctx), r.sym, llvm_fn_type_0(p))
-  nemit_stamp_runner_line(ctx, r)
-  let _c = ncall_sig2(ctx, nrunner_call_sym(r.kind), native_ctx_voidt(ctx), p, p, desc, bodyfn)
-  ()
-}
-
-# The block's declaration line, stamped immediately before its `run_one`
-# so a machine-readable record names the site it describes. Bench blocks
-# have no such record, so only test runners pay the call.
-fn nemit_stamp_runner_line(ctx: Handle, r: KRunner) : Unit / Console = match r.kind {
-  KRTest -> {
-    let i32t = native_ctx_i32t(ctx)
-    let _l = ncall_sig1(ctx, "kaix_test_line", native_ctx_voidt(ctx), i32t,
-                        llvm_const_i32(i32t, r.line))
-    ()
+  match r.kind {
+    KRTest -> {
+      let i32t = native_ctx_i32t(ctx)
+      let home = llvm_build_string_span(b, r.home)
+      let _c = ncall_sig4(ctx, "kaix_test_register", native_ctx_voidt(ctx), p, p, i32t, p,
+                          desc, bodyfn, llvm_const_i32(i32t, r.line), home)
+      ()
+    }
+    _ -> {
+      let _c = ncall_sig2(ctx, "kaix_bench_run_one", native_ctx_voidt(ctx), p, p, desc, bodyfn)
+      ()
+    }
   }
-  _ -> ()
 }
 
 # The defaults `kai_main_install_defaults` stamps: a runner driver calls

@@ -20,7 +20,7 @@ matcher DSL — `assert x == 42` is enough. `assert` belongs inside
 kai test [<spec>|./...]            # run tests
 kai test --json [<spec>|./...]     # machine-readable results
 kai test --only <id> [<spec>|./...]  # run named blocks (repeatable)
-kai test -j <n> [<spec>|./...]     # build up to n test binaries at once
+kai test -j <n> [<spec>|./...]     # up to n builds at once
 kai bench [<spec>] [--iters N]     # run benchmarks
 kai check [<spec>]                 # run property blocks
 ```
@@ -123,11 +123,21 @@ run the suite, and only the entry binary is skipped. `kai build` and
 `kai run` still require an entry, having nothing to build without
 one.
 
-`kai test` builds these binaries in parallel — one per CPU by
-default, `-j <n>` (`--jobs <n>`) to bound it, `-j 1` to build each
-in its turn — and runs them one at a time, in order. Each file's
-build output prints right before its results, so the output and the
-exit status are the same at any job count.
+The test files of one directory build as ONE binary that runs once
+per file, so a package is compiled once rather than once per file.
+Each file is first checked on its own, as the root it is when built
+alone, and a file that does not check fails with its own error, after
+the files before it ran. A file's run is exactly the blocks its own
+build would run, in the same order. Files that each check alone but
+cannot build together fail the run with the shared build's error
+before any test runs: two test files declaring the same `impl`, for
+example. Move what they share into a module both import.
+
+`kai test` runs these builds in parallel — one per CPU by default,
+`-j <n>` (`--jobs <n>`) to bound it — and runs the binaries one at a
+time, in order. Each file's check output prints right before its
+results, so the output and the exit status are the same at any job
+count.
 
 A file outside the import graph that declares blocks but is not
 named `*_test.kai` cannot safely run as a root, so the driver warns,
