@@ -28,9 +28,9 @@
 #   shared with the post-parse synthesiser in main.kai.
 # - try_eval_int / try_eval_pred — the partial evaluator; try_eval_int
 #   is also used by the `^` integer-power codegen (C and LLVM paths).
-# - check_call_site_refinements / dump_call_elision — the call-site
-#   analysis over the typed program, driven from the driver after
-#   inference and from the --dump-call-elision flag.
+# - classify_arg_vs_pred / classify_requires_clause — the per-call
+#   discharge primitives the call-site check (compiler.call_site_check)
+#   drives over the typed program.
 #
 # Cross-module dependencies
 #
@@ -52,11 +52,9 @@
 import compiler.util
 import compiler.chars
 import compiler.ast
-import compiler.expr_positions
 import compiler.sym_read
 import compiler.intervals
 import compiler.refine_help
-import compiler.call_site_target
 
 # m12.6.x #3 v2: the synthesised pred-fn name for a refinement-type
 # alias. Centralised so the call-site builder and the post-parse
@@ -1133,162 +1131,6 @@ fn eval_real_cmp(op: String, a: Real, b: Real) : Bool {
 }
 
 
-# ====================================================================
-# Issue #83 sub-case 3 — call-site substitution analysis
-# ====================================================================
-#
-# Walks every typed fn body looking for calls whose callee, named by id,
-# has `requires` clauses (or refined-param predicates) that can be
-# discharged at compile time from what we know about the args. It runs
-# after inference, where a pipe is the call it spells; a placeholder's
-# immediately applied lambda and a constant argument are seen through:
-#
-#   1. **Literal arg**: substitute the integer into the callee's
-#      predicate and run `try_eval_pred`.
-#   2. **Refined-binding arg**: when the arg is an `EVar(x)` whose
-#      type is `TyRefine` in the caller's signature, the caller's
-#      refinement (with `self ↦ x`) is checked against the callee's
-#      predicate (with `param ↦ x`) using the same canonical /
-#      interval-based entailment as the in-callee path.
-#   3. **Unrefined-binding arg**: no info, leave the runtime assert
-#      in place. Status quo.
-#
-# Two outputs:
-#
-#   - `--dump-call-elision`: per call-site report, useful for
-#     fixtures.
-#   - `check_call_site_refinements`: when the caller passes a refined
-#     binding whose refinement is strictly weaker than the callee's
-#     pre, that's a static error pointing at the call site. No flag
-#     needed; refining a parameter is opt-in already.
-
-# A callee's contract entry: param name + predicate the caller must
-# discharge for that param. For `requires P` the param is the special
-# `__contract` (P uses param names directly); for refined params the
-# param's name is the refinement's `self` stand-in.
-type CalleeReq = CRq(String, Expr)
-
-type CalleeSig = CSig(String, SymId, [String], [CalleeReq])  # name, id, param names, requirements
-
-# What a call-site walk consults: the contracted callees and the
-# constants an argument may name.
-type CallCtx = CallCtx([CalleeSig], [ConstVal])
-
-# Build the table of fns with non-empty contracts. Tparam-rewritten
-# fns (`with_protocol_tparams`) are skipped — protocol impls are
-# resolved later in the pipeline and their contracts get re-emitted
-# at that point.
-fn collect_callee_sigs(decls: [Decl]) : [CalleeSig] {
-  collect_callee_sigs_loop(decls, [])
-}
-
-fn collect_callee_sigs_loop(decls: [Decl], acc: [CalleeSig]) : [CalleeSig] {
-  match decls {
-    [] -> list_reverse(acc)
-    [d, ...rest] -> match d {
-      DFn(_, name, _, params, _, _, body, _, _, _, fid) -> {
-        let reqs = extract_callee_reqs(params, body)
-        if list_is_empty(reqs) or sym_raw(fnid_sym(fid)) < 0 { collect_callee_sigs_loop(rest, acc) }
-        else {
-          let pnames = collect_param_names(params, [])
-          collect_callee_sigs_loop(rest, [CSig(name, fnid_sym(fid), pnames, reqs), ...acc])
-        }
-      }
-      _ -> collect_callee_sigs_loop(rest, acc)
-    }
-  }
-}
-
-fn collect_param_names(params: [Param], acc: [String]) : [String] = match params {
-  [] -> list_reverse(acc)
-  [p, ...rest] -> collect_param_names(rest, [p.pname, ...acc])
-}
-
-# Walk the body's leading asserts to recover the original `requires`
-# predicates `wrap_with_contracts` desugared. They live at the front
-# of an EBlock as `SAssert(pred, Some("requires violated..."))`. We
-# stop at the first non-`requires` assert (so `ensures` asserts after
-# `let result = body` aren't picked up). Refined-param predicates
-# also produce a CalleeReq (with `self ↦ pname` already applied so
-# downstream entailment treats them as ordinary predicates over the
-# parameter).
-fn extract_callee_reqs(params: [Param], body: Expr) : [CalleeReq] {
-  let from_params = extract_param_refinement_reqs(params, [])
-  let from_asserts = extract_requires_asserts(body)
-  list_append(from_asserts, from_params)
-}
-
-fn extract_param_refinement_reqs(params: [Param], acc: [CalleeReq]) : [CalleeReq] {
-  match params {
-    [] -> list_reverse(acc)
-    [p, ...rest] -> match p.ptype {
-      Some(t) -> match t.tkind {
-        TyRefine(_, pred) ->
-          extract_param_refinement_reqs(rest, [CRq(p.pname, subst_self(pred, p.pname)), ...acc])
-        _ -> extract_param_refinement_reqs(rest, acc)
-      }
-      None -> extract_param_refinement_reqs(rest, acc)
-    }
-  }
-}
-
-fn extract_requires_asserts(body: Expr) : [CalleeReq] = match body.kind {
-  EBlock(stmts, _) -> extract_requires_loop(stmts, [])
-  _ -> []
-}
-
-fn extract_requires_loop(stmts: [Stmt], acc: [CalleeReq]) : [CalleeReq] {
-  match stmts {
-    [] -> list_reverse(acc)
-    [s, ...rest] -> match s {
-      SAssert(pred, Some(msg)) -> if assert_msg_is_requires(msg) {
-        extract_requires_loop(rest, [CRq("__requires", pred), ...acc])
-      } else { list_reverse(acc) }
-      _ -> list_reverse(acc)
-    }
-  }
-}
-
-fn assert_msg_is_requires(msg: Expr) : Bool = match msg.kind {
-  EStr(s, _) -> string_starts_with_requires(s)
-  _ -> false
-}
-
-# The desugared message is a quoted string of the form
-# `"requires violated at line N"` (quotes included in EStr's raw
-# span). Match the prefix `"requires` rather than calling
-# string_starts_with_q which is defined later in the file but is
-# semantically what we want.
-fn string_starts_with_requires(s: String) : Bool {
-  let n = string_length(s)
-  if n < 10 { false } else {
-    let c0 = char_at(s, 0)
-    let c1 = char_at(s, 1)
-    match c0 { Some(q) -> match c1 {
-      Some(r) -> q == '"' and r == 'r' and starts_with_after_quote(s, 1, "requires")
-      None -> false
-    } None -> false }
-  }
-}
-
-fn starts_with_after_quote(s: String, off: Int, prefix: String) : Bool {
-  let n = string_length(prefix)
-  pred_starts_with_loop(s, off, prefix, 0, n)
-}
-
-fn pred_starts_with_loop(s: String, soff: Int, prefix: String, poff: Int, n: Int) : Bool {
-  if poff >= n { true }
-  else {
-    match char_at(s, soff) {
-      Some(cs) -> match char_at(prefix, poff) {
-        Some(cp) -> if cs == cp { pred_starts_with_loop(s, soff + 1, prefix, poff + 1, n) } else { false }
-        None -> false
-      }
-      None -> false
-    }
-  }
-}
-
 # Refinement bindings visible inside a function body: each entry
 # pairs a binding name with its self-substituted refinement predicate.
 # `let` bindings without explicit refinement annotations contribute
@@ -1323,10 +1165,6 @@ fn lookup_caller_refinement(refs: [RefBinding], name: String) : Option[Expr] {
 # Fixtures pin these via `--dump-call-elision`.
 #[doc("Classification of a predicate discharge attempt: elided (proven), runtime (undecided), or loose (statically refuted, with reason).")]
 pub type CallSiteStatus = CSElided | CSRuntime | CSLoose(String)
-
-# Outcome record: callee name, param name (or "__requires"), the
-# discharged predicate as it was tested, and the status.
-type CallSiteReport = CSR(String, String, Expr, CallSiteStatus, Int, Int)
 
 # Classify one (callee_param, caller_arg) discharge attempt.
 #
@@ -1530,92 +1368,11 @@ fn expr_pred_is_scalar_lit(e: Expr) : Bool = match e.kind {
   _ -> false
 }
 
-# Walk a body expression collecting reports for every call whose callee
-# a contract table entry names by id. Calls through closures and
-# unresolved callees are skipped.
-fn analyze_calls(e: Expr, cx: CallCtx, caller_refs: [RefBinding],
-                 acc: [CallSiteReport]) : [CallSiteReport] = match e.kind {
-  ECall(callee, call_args) -> {
-    let acc1 = analyze_calls_in_args(call_args, cx, caller_refs, acc)
-    match call_target(callee, call_args) {
-      Some(t) -> analyze_target(t, cx, caller_refs, acc1)
-      None -> analyze_calls(callee, cx, caller_refs, acc1)
-    }
-  }
-  _ -> analyze_calls_in_positions(xp_positions(e), cx, caller_refs, acc)
-}
-
-fn analyze_target(t: CallTarget, cx: CallCtx, caller_refs: [RefBinding],
-                  acc: [CallSiteReport]) : [CallSiteReport] = match t {
-  CallTarget(id, site, args, binders, values) -> {
-    let acc1 = if list_is_empty(binders) { acc } else { analyze_calls_in_args(args, cx, caller_refs, acc) }
-    match cx {
-      CallCtx(sigs, consts) -> match lookup_callee_sig(sigs, id) {
-        None -> acc1
-        Some(CSig(fname, _, pnames, reqs)) ->
-          classify_call(fname, pnames, bound_args(args, binders, values, consts), reqs,
-                        caller_refs, acc1, site.line, site.col)
-      }
-    }
-  }
-}
-
-# The arguments as the callee receives them: lambda binders replaced by
-# the values applied to them, constants by their definitions.
-fn bound_args(args: [Expr], binders: [String], values: [Expr], consts: [ConstVal]) : [Expr] = match args {
-  [] -> []
-  [a, ...rest] -> [fold_const_refs(subst_params(a, binders, values), consts),
-                   ...bound_args(rest, binders, values, consts)]
-}
-
-fn analyze_calls_in_args(call_args: [Expr], cx: CallCtx, caller_refs: [RefBinding],
-                          acc: [CallSiteReport]) : [CallSiteReport] = match call_args {
-  [] -> acc
-  [a, ...rest] -> analyze_calls_in_args(rest, cx, caller_refs, analyze_calls(a, cx, caller_refs, acc))
-}
-
-fn analyze_calls_in_positions(xs: [XPos], cx: CallCtx, caller_refs: [RefBinding],
-                               acc: [CallSiteReport]) : [CallSiteReport] = match xs {
-  [] -> acc
-  [XP(_, x), ...rest] -> analyze_calls_in_positions(rest, cx, caller_refs, analyze_calls(x, cx, caller_refs, acc))
-}
-
-fn lookup_callee_sig(sigs: [CalleeSig], id: SymId) : Option[CalleeSig] = match sigs {
-  [] -> None
-  [s, ...rest] -> match s {
-    CSig(_, k, _, _) -> if sym_raw(k) == sym_raw(id) { Some(s) } else { lookup_callee_sig(rest, id) }
-  }
-}
-
-# Drive the per-arg classification. For each requirement, find the
-# arg the callee param it refers to maps to (positional, by name) and
-# classify. `__requires` predicates are checked by substituting EVERY
-# param name in the predicate with its corresponding arg before
-# folding.
-fn classify_call(fname: String, pnames: [String], call_args: [Expr], reqs: [CalleeReq],
-                 caller_refs: [RefBinding], acc: [CallSiteReport],
-                 line: Int, col: Int) : [CallSiteReport] = match reqs {
-  [] -> acc
-  [r, ...rest] -> match r {
-    CRq(pname, pred) -> {
-      let status = if pname == "__requires" {
-        classify_requires_clause(pred, pnames, call_args, caller_refs)
-      } else {
-        match arg_for_param(pnames, call_args, pname) {
-          Some(arg) -> classify_arg_vs_pred(pred, pname, arg, caller_refs)
-          None -> CSRuntime
-        }
-      }
-      let rep = CSR(fname, pname, pred, status, line, col)
-      classify_call(fname, pnames, call_args, rest, caller_refs, [rep, ...acc], line, col)
-    }
-  }
-}
-
 # A `requires` predicate may mention any param; substitute each param
 # name with the corresponding arg expression (literal or refined
 # binding) and either fold or check entailment.
-fn classify_requires_clause(pred: Expr, pnames: [String], call_args: [Expr],
+#[doc("Classify a `requires` predicate against a call's arguments: substitute every parameter, then fold or check entailment by a refined caller binding.")]
+pub fn classify_requires_clause(pred: Expr, pnames: [String], call_args: [Expr],
                              caller_refs: [RefBinding]) : CallSiteStatus {
   let subst = subst_params(pred, pnames, call_args)
   let folded = pred_canon(subst)
@@ -1647,7 +1404,8 @@ fn classify_requires_clause(pred: Expr, pnames: [String], call_args: [Expr],
 
 # Simultaneous: an argument that mentions another parameter's name is
 # never substituted again.
-fn subst_params(pred: Expr, pnames: [String], call_args: [Expr]) : Expr = match pred.kind {
+#[doc("Substitute each parameter name in an expression by the call argument in its position, in one pass.")]
+pub fn subst_params(pred: Expr, pnames: [String], call_args: [Expr]) : Expr = match pred.kind {
   EVar(s) -> match arg_for_param(pnames, call_args, s) { Some(a) -> a  None -> pred }
   EBinop(op, a, b) -> mk_expr(EBinop(op, subst_params(a, pnames, call_args), subst_params(b, pnames, call_args)), pred.line, pred.col)
   EUnop(op, x) -> mk_expr(EUnop(op, subst_params(x, pnames, call_args)), pred.line, pred.col)
@@ -1660,7 +1418,8 @@ fn subst_params_list(es: [Expr], pnames: [String], call_args: [Expr]) : [Expr] =
   [h, ...t] -> [subst_params(h, pnames, call_args), ...subst_params_list(t, pnames, call_args)]
 }
 
-fn arg_for_param(pnames: [String], call_args: [Expr], target: String) : Option[Expr] = match pnames {
+#[doc("The call argument bound to the parameter named `target`, by position.")]
+pub fn arg_for_param(pnames: [String], call_args: [Expr], target: String) : Option[Expr] = match pnames {
   [] -> None
   [n, ...rest_n] -> match call_args {
     [] -> None
@@ -1683,69 +1442,3 @@ fn free_var_of_pred(e: Expr) : Option[String] = match e.kind {
   EVar(s) -> Some(s)
   _ -> None
 }
-
-# Drive analyze_calls over a whole program. Each fn body is walked
-# with the fn's own param refinements as the caller environment.
-fn analyze_program_calls(decls: [Decl]) : [CallSiteReport] {
-  let cx = CallCtx(collect_callee_sigs(decls), collect_const_vals(decls))
-  analyze_program_calls_loop(decls, cx, [])
-}
-
-fn analyze_program_calls_loop(decls: [Decl], cx: CallCtx,
-                                acc: [CallSiteReport]) : [CallSiteReport] = match decls {
-  [] -> list_reverse(acc)
-  [d, ...rest] -> match d {
-    DFn(_, _, _, params, _, _, body, _, _, _, _) -> {
-      let refs = collect_caller_refinements(params, [])
-      let acc1 = analyze_calls(body, cx, refs, acc)
-      analyze_program_calls_loop(rest, cx, acc1)
-    }
-    _ -> analyze_program_calls_loop(rest, cx, acc)
-  }
-}
-
-# `--dump-call-elision`: per-call-site report, one line per
-# (callee, param) pair, in source order. Format mirrors
-# `--dump-intervals`: `callee.param @line:col -> status`.
-#[doc("Print the per-call-site refinement-elision report for the --dump-call-elision flag.")]
-pub fn dump_call_elision(file: String, decls: [Decl]) : Int / Console {
-  let reports = analyze_program_calls(decls)
-  reports |> each(dump_call_elision_one)
-  0
-}
-
-fn dump_call_elision_one(r: CallSiteReport) : Unit / Console = match r {
-  CSR(fname, pname, pred, status, line, col) -> {
-    let prefix = concat_all([fname, ".", pname, " @", int_to_string(line), ":",
-                             int_to_string(col), " `", expr_show_pred(pred), "`"])
-    match status {
-      CSElided -> print("#{prefix} -> elided")
-      CSRuntime -> print("#{prefix} -> runtime")
-      CSLoose(reason) -> print("#{prefix} -> loose (#{reason})")
-    }
-  }
-}
-
-# Compile-time strictness: a refined binding passed where the callee
-# wants a strictly stronger predicate is a static error. The reason
-# string surfaces via the diagnostic so the user sees `>= 0 doesn't
-# entail > 0`. Returns the number of errors emitted.
-#[doc("Static check: error on each call passing a refined binding whose predicate is strictly weaker than the callee requires. Returns the error count.")]
-pub fn check_call_site_refinements(file: String, decls: [Decl]) : Int / Console {
-  let reports = analyze_program_calls(decls)
-  check_call_site_loop(file, reports, 0)
-}
-
-fn check_call_site_loop(file: String, reports: [CallSiteReport], errs: Int) : Int / Console = match reports {
-  [] -> errs
-  [r, ...rest] -> match r {
-    CSR(fname, _, _, status, line, col) -> match status {
-      CSLoose(reason) -> {
-        eprint("#{file}:#{int_to_string(line)}:#{int_to_string(col)}: error: call to `#{fname}`: #{reason}\n")
-        check_call_site_loop(file, rest, errs + 1)
-      }
-      _ -> check_call_site_loop(file, rest, errs)
-    }
-  }
-}
-
