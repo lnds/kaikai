@@ -2948,16 +2948,47 @@ static void kai_arena_pop(void) {
     kai_arena_free(&kai_arena_stack[--kai_arena_sp]);
 }
 
-/* Immortal-sentinel test on the shared `rc` field. A Fiber[T] handle's rc
- * is written atomically from two threads (kai_incref/kai_decref FIBER arm);
- * the sentinel check runs before the tag is known, so on the same field it
- * must use the same atomicity or TSAN reports a race (plain read vs atomic
- * write). A relaxed load compiles to the same mov/ldr as a plain read on
- * x86/arm — no branch on kai_nthreads, no barrier — so N=1 stays byte-for-
- * byte the same hot path while TSAN still sees a synchronized access at N>1. */
-static inline int kai_rc_is_immortal(const KaiValue *v) {
+/* `rc >= KAI_RC_SPECIAL` is never a plain count: INT32_MAX is immortal and
+ * KAI_RC_SPECIAL + n is an atomic count of n, for handles shared across
+ * threads (Fiber[T]). A plain count traps before it reaches KAI_RC_SPECIAL,
+ * so the hot path tells all three apart with one compare and never reads
+ * the tag or kai_nthreads. The load is relaxed-atomic because an atomic
+ * cell's rc is written from several threads; on x86/arm it is a plain ldr. */
+#define KAI_RC_SPECIAL 0x40000000
+
+static inline int32_t kai_rc_load(const KaiValue *v) {
     return atomic_load_explicit((const _Atomic int32_t *) &v->rc,
-                                memory_order_relaxed) == INT32_MAX;
+                                memory_order_relaxed);
+}
+
+static inline int kai_rc_is_immortal(const KaiValue *v) {
+    return kai_rc_load(v) == INT32_MAX;
+}
+
+/* Put a fresh cell (rc 1) under the atomic count. */
+static inline void kai_rc_make_atomic(KaiValue *v) {
+    atomic_store_explicit((_Atomic int32_t *) &v->rc, KAI_RC_SPECIAL + 1,
+                          memory_order_relaxed);
+}
+
+static __attribute__((noinline, cold)) void kai_rc_overflow(const KaiValue *v) {
+    fprintf(stderr, "kai: reference count overflow on a %s cell\n",
+            v->tag == KAI_FIBER ? "fiber" : "heap");
+    abort();
+}
+
+/* An atomic cell's increment, and the trap for a plain count about to
+ * reach KAI_RC_SPECIAL. */
+static __attribute__((noinline)) KaiValue *kai_incref_special(KaiValue *v, int32_t r) {
+    if (r < KAI_RC_SPECIAL) kai_rc_overflow(v);
+    if (atomic_fetch_add_explicit((_Atomic int32_t *) &v->rc, 1,
+                                  memory_order_relaxed) >= INT32_MAX - 1)
+        kai_rc_overflow(v);
+    KAI_CTR_INC(kai_rc_incref_total);
+#ifdef KAI_TRACE_RC
+    kai_rc_history_log(v, /* op=incref */ 1, v->tag);
+#endif
+    return v;
 }
 
 /* Increment a reference. Pure fast path — no free, no out-of-line case
@@ -2967,25 +2998,16 @@ static inline int kai_rc_is_immortal(const KaiValue *v) {
  * bracketed a single increment and blocked the inline. Under tracing the
  * counters still fire. Koka's kk_block_dup is likewise inline. */
 static inline KaiValue *kai_incref(KaiValue *v) {
-    if (kai_is_value(v) || !v || kai_rc_is_immortal(v)) {
-#ifdef KAI_TRACE_RC
-        if (v && !kai_is_value(v)) kai_rc_history_log(v, /* op=incref */ 1, v->tag);
-#endif
-        return v;
-    }
-    /* Fiber[T] wrappers carry atomic rc — cross-thread scheduler handles
-     * (the rule at KaiValue). At N=1 no worker thread exists, so the plain
-     * increment below stays byte-identical. */
-    if (kai_nthreads > 1 && v->tag == KAI_FIBER) {
-        atomic_fetch_add_explicit((_Atomic int32_t *) &v->rc, 1,
-                                  memory_order_relaxed);
-        KAI_CTR_INC(kai_rc_incref_total);
+    if (kai_is_value(v) || !v) return v;
+    int32_t r = kai_rc_load(v);
+    if (r >= KAI_RC_SPECIAL - 1) {
+        if (r != INT32_MAX) return kai_incref_special(v, r);
 #ifdef KAI_TRACE_RC
         kai_rc_history_log(v, /* op=incref */ 1, v->tag);
 #endif
         return v;
     }
-    v->rc++;
+    v->rc = r + 1;
     /* #812 — counter ALWAYS compiled (parallels kai_rc_alloc_total),
      * reported only under the KAI_TRACE_RC env var. Behind `#ifdef
      * KAI_TRACE_RC` it stayed 0 in every `kai build` binary (the wrapper
@@ -3807,6 +3829,7 @@ static void kai_drain_pending_free(void) {
  * wrapper from spawn-enqueue until the trampoline tail (R4 fix). */
 static KAI_RC_NOINLINE KaiValue *kai_fiber_value(KaiFiber *f) {
     KaiValue *v = kai_alloc(KAI_FIBER);
+    kai_rc_make_atomic(v);
     v->as.fib = f;
     f->value  = v;
     return v;
@@ -4519,11 +4542,11 @@ static void kai_free_cons_spine(KaiValue *v) {
         KaiValue *tail = v->as.cons.tail;   /* capture BEFORE recycle poisons v */
         kai_decref(head);                   /* O(1) cascade for str/record; counters intact */
         KAI_RECYCLE_CELL(v);                /* trace+poison+recycle+free_total++/live_now-- */
-        /* Continue only for a real, unique cons cell. A nil/singleton
-         * (kai_is_value or rc==INT32_MAX), a non-cons, or a shared
-         * (rc!=1) tail hands off to kai_decref for its own free path. */
+        /* Continue only for a real, unique cons cell. A nil/singleton,
+         * an immortal or atomic cell, a non-cons, or a shared (rc!=1)
+         * tail hands off to kai_decref for its own free path. */
         if (kai_is_value(tail) || !tail ||
-            tail->rc == INT32_MAX ||
+            kai_rc_load(tail) >= KAI_RC_SPECIAL ||
             tail->tag != (int32_t) KAI_CONS ||
             tail->rc != 1) {
             kai_decref(tail);               /* counters + cascade for the boundary case */
@@ -4570,8 +4593,8 @@ static KAI_RC_NOINLINE void kai_free_variant_spine(KaiValue *v, int next_slot,
             if (mask != 0 && kai_var_slot_kind(mask, i) != KAI_VAR_SLOT_PTR) continue;
             KaiValue *c = kai_var_slots(v)[i].ptr;
             if (!kai_is_ptr(c)) continue;         /* immediate / null: no RC */
-            int32_t rc = c->rc;
-            if (rc == INT32_MAX) continue;        /* saturated singleton */
+            int32_t rc = kai_rc_load(c);
+            if (rc >= KAI_RC_SPECIAL) { kai_decref(c); continue; }
             if (rc == 1) {
                 if (c->tag == (int32_t) KAI_VARIANT &&
                     n_pending < KAI_VARIANT_SPINE_CAP) {
@@ -4632,8 +4655,8 @@ static void kai_free_value(KaiValue *v) {
                 if (fmask != 0 && kai_var_slot_kind(fmask, i) != KAI_VAR_SLOT_PTR) continue;
                 KaiValue *c = kai_var_slots(v)[i].ptr;
                 if (!kai_is_ptr(c)) continue;
-                int32_t crc = c->rc;
-                if (crc == INT32_MAX) continue;
+                int32_t crc = kai_rc_load(c);
+                if (crc >= KAI_RC_SPECIAL) { kai_decref(c); continue; }
                 if (crc == 1) {
                     if (c->tag == (int32_t) KAI_VARIANT) {
                         kai_free_variant_spine(v, i + 1, c);
@@ -4783,26 +4806,44 @@ static void kai_decref_free(KaiValue *v) {
  * every drop). Under tracing the counters still fire for full fidelity.
  * KAI_PROF_ENTER/EXIT dropped from the hot path: they bracket a cold
  * helper now, and the inline body must stay small to be inlined. */
+/* An atomic cell's decrement. The release orders this thread's writes to
+ * the cell before the drop; the last owner's acquire makes every other
+ * owner's writes visible before the free. TSAN does not model a standalone
+ * fence, so its build folds both into the fetch_sub. */
+static __attribute__((noinline)) void kai_decref_atomic(KaiValue *v) {
+    KAI_CTR_INC(kai_rc_decref_total);
+#ifdef KAI_TRACE_RC
+    kai_rc_history_log(v, /* op=decref */ 2, v->tag);
+#endif
+#if defined(KAI_TSAN_FIBERS)
+    int32_t old = atomic_fetch_sub_explicit((_Atomic int32_t *) &v->rc, 1,
+                                            memory_order_acq_rel);
+#else
+    int32_t old = atomic_fetch_sub_explicit((_Atomic int32_t *) &v->rc, 1,
+                                            memory_order_release);
+#endif
+    if (old != KAI_RC_SPECIAL + 1) return;
+#if !defined(KAI_TSAN_FIBERS)
+    atomic_thread_fence(memory_order_acquire);
+#endif
+    atomic_store_explicit((_Atomic int32_t *) &v->rc, 0, memory_order_relaxed);
+    kai_decref_free(v);
+}
+
 static inline void kai_decref(KaiValue *v) {
-    if (kai_is_value(v) || !v || kai_rc_is_immortal(v)) return;
+    if (kai_is_value(v) || !v) return;
+    int32_t r = kai_rc_load(v);
+    if (r >= KAI_RC_SPECIAL) {
+        if (r != INT32_MAX) kai_decref_atomic(v);
+        return;
+    }
     /* #812 — always-compiled counter (see kai_incref). */
     KAI_CTR_INC(kai_rc_decref_total);
 #ifdef KAI_TRACE_RC
     kai_rc_history_log(v, /* op=decref */ 2, v->tag);
 #endif
-    /* A Fiber[T] wrapper is a scheduler-owned handle to a unit of
-     * execution running on another thread: the spawner drops the caller
-     * ref while the trampoline drops the scheduler ref, on two threads at
-     * once. Its rc is atomic — handle metadata, not the jewel (the user
-     * data inside the fiber's private heap stays non-atomic). See the
-     * cross-thread-handle rule at KaiValue. */
-    if (kai_nthreads > 1 && v->tag == KAI_FIBER) {
-        if (atomic_fetch_sub_explicit((_Atomic int32_t *) &v->rc, 1,
-                                      memory_order_acq_rel) == 1)
-            kai_decref_free(v);
-        return;
-    }
-    if (--v->rc == 0) kai_decref_free(v);
+    v->rc = r - 1;
+    if (r == 1) kai_decref_free(v);
 }
 
 /* m5 #4 — Perceus dup/drop wrappers callable as KaiValue-returning fns.
@@ -5588,7 +5629,7 @@ static inline int kai_tag_is_reusable(int32_t tag) {
  * over data has values^n identities, and interning them saturates the
  * table. An allowlist, so a scalar that later gains a cache stays out. */
 static inline int kai_slot_internable(KaiValue *p) {
-    if (kai_is_value(p) || p == NULL || p->rc != INT32_MAX) return 0;
+    if (kai_is_value(p) || p == NULL || !kai_rc_is_immortal(p)) return 0;
     switch (p->tag) {
         case KAI_UNIT: case KAI_BOOL: case KAI_NIL:
         case KAI_STR: case KAI_VARIANT:
@@ -6171,7 +6212,7 @@ static inline int kai_check_unique(KaiValue *v) {
      * kk_datatype_ptr_is_unique is likewise a single refcount test.
      * Also marked inline (was a plain `static int` — a real call on the
      * hot path). */
-    return v != NULL && !kai_is_value(v) && v->rc == 1;
+    return v != NULL && !kai_is_value(v) && kai_rc_load(v) == 1;
 }
 
 /* Conditional incref for a variant reuse arm whose donor is SHARED. When the
@@ -6387,6 +6428,8 @@ static inline KaiReuse kai_ptr_reuse(KaiValue *v) { return v; }
  * about to use — the 14x-tree leak/UAF from the misplaced first attempt.
  * Koka's kk_block_drop_reuse is likewise refcount-only; child drops happen
  * via explicit emit-side dup/decref, never inside the reuse primitive. */
+/* Only Fiber and Pid cells are atomic, never a variant, so the plain
+ * decrements below cannot meet an atomic count. */
 static inline KaiReuse kai_drop_reuse_token(KaiValue *v, int n) {
     if (v == NULL || kai_is_value(v) || v->tag != KAI_VARIANT ||
         v->var_n_args != n) {
