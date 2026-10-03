@@ -296,9 +296,9 @@ typedef enum {
                      * Haskell `IORef` lineage. */
     /* Cross-thread-handle rule: KAI_FIBER and KAI_PID are runtime-owned
      * handles to a unit of execution or a channel reachable from more than
-     * one scheduler thread, so their rc is atomic (fiber) or the box
-     * immortal (pid) by construction. Everything the user's program builds
-     * as data stays non-atomic and crosses threads only by copy-on-send. */
+     * one scheduler thread, so their rc is atomic by construction.
+     * Everything the user's program builds as data stays non-atomic and
+     * crosses threads only by copy-on-send. */
     KAI_FIBER,      /* m8 #3: Spawn / Fiber[T] handle (opaque) */
     KAI_PID,        /* m8 #7: Actor[Msg] / Pid[Msg] handle (opaque) */
     KAI_BYTE,         /* Lane 4 (#473): unsigned 8-bit integer, nominal */
@@ -4424,8 +4424,8 @@ static void kai_mailbox_close(KaiMailbox *mb) {
     kai_mailbox_unpin(mb);
 }
 
-/* A mailbox has exactly one Pid box, immortal and shared by every handle
- * (copies across threads incref it), and closing nulls its `as.mb`. So a
+/* A mailbox has exactly one Pid box, shared by every handle (copies across
+ * threads incref it atomically), and closing nulls its `as.mb`. So a
  * NULL there means "ended" and no handle can point at a freed mailbox. Under
  * M:N the stripe lock orders a sender's read-and-pin against the owner's
  * null, closing the window where the mailbox could be released between the
@@ -4467,14 +4467,9 @@ static KaiMailbox *kai_mailbox_pin(KaiValue *pid) {
 static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
     KaiValue *v = kai_alloc(KAI_PID);
     v->as.mb = mb;
-    /* A Pid is a shared, non-owning identity: the mailbox outlives every
-     * handle to it and is freed by its allocating scope, never by rc. One
-     * mailbox is shared across the scheduler threads that send to it (that
-     * is the point of an actor), so its handle boxes are duplicated and
-     * dropped on many threads at once. Marking the box immortal keeps those
-     * touches off the non-atomic rc field — no cross-thread rc race, and the
-     * decref-to-free path was already a no-op here. */
-    v->rc = INT32_MAX;
+    /* Senders on any scheduler thread dup and drop this box, so its count is
+     * atomic. Freeing it never touches the mailbox, which its scope owns. */
+    kai_rc_make_atomic(v);
     return v;
 }
 
@@ -5901,7 +5896,7 @@ static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
  * thread could touch may be shared — every leaf is rebuilt too. The only
  * values that may cross by pointer are those RC does not apply to
  * (immortal singletons) or whose rc is atomic by construction (the
- * Fiber[T] handle, the immortal Pid box) — the cross-thread-handle rule
+ * Fiber[T] handle, the Pid box) — the cross-thread-handle rule
  * at KaiTag.
  *
  * The switch is exhaustive over KaiTag on purpose and has NO `default:`.
@@ -6040,7 +6035,7 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
             return kai_incref(v);
 
         /* Handles to a unit of execution / a channel, not data. A Fiber[T]
-         * wrapper carries an atomic rc and a Pid box is immortal, so both are
+         * wrapper and a Pid box both carry an atomic rc, so both are
          * already sound to reach from two threads — and copying them would
          * destroy the identity they exist to carry. */
         case KAI_FIBER:
