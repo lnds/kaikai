@@ -1185,7 +1185,7 @@ fn list_head_or(xs: [String], fallback: String) : String = match xs {
 # in `llvm_emit_expr`); the C backend was missing it until m14
 # v1.x.
 fn emit_ident_value(name: String, fid: FnId, fx: FnIndex, lcs: [String], fns: [EFn], variants: [VariantEntry], core: [ECore], root_mod: Option[String]) : String {
-  if list_has(lcs, name) { c_local(name) }
+  if sym_raw(fnid_sym(fid)) < 0 and list_has(lcs, name) { c_local(name) }
   else { match evar_find(variants, name) {
     # A bare nullary ctor ident (RBLeaf, None, ...) — read the seeded
     # singleton from kai_enum_by_tag via kai_nullary_fast (array load)
@@ -1979,7 +1979,7 @@ fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Opti
 
   match sym_read_kind(f.kind) {
     EVar(callee) ->
-      if list_has(cx.lcs, callee) { None }
+      if ec_local_callee(f, callee, cx) { None }
       else { match fnx_resolve(cx.fx, cx.fns, ec_callee_sym(f), callee, cx.root_mod) {
         Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) -> {
           let raw_call = emit_user_call_seq(c_sym(callee, mo), emit_arg_vals_masked(src, args_e, mask, cx), cx)
@@ -2003,6 +2003,11 @@ fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Opti
 # The identity a callee carries, or none when the reference was never
 # stamped. Read before the kind is normalised to a spelling, so the
 # lookup can answer by declaration rather than by name.
+# A resolved callee names a declaration, never a binder, even where a
+# binder in scope shares its spelling.
+fn ec_local_callee(f: Expr, callee: String, cx: EmitCtx) : Bool =
+  sym_raw(fnid_sym(ec_callee_sym(f))) < 0 and list_has(cx.lcs, callee)
+
 fn ec_callee_sym(f: Expr) : FnId = match f.kind {
   ESym(s, inst, _) -> FnId(s, inst)
   _                -> fnid_none()
@@ -2506,7 +2511,7 @@ fn emit_guard_no_intrinsic_mint(callee: String) : Unit =
 # emission from the same lookup chain. A local closure (`lcs`) shadows a
 # same-named top-level fn: `let take = ...; take(xs, 1)` calls the local.
 fn emit_named_call_lookup(src: String, callee: String, csym: FnId, args_e: [Expr], call_vals: [String], cx: EmitCtx) : String / Console =
-  if list_has(cx.lcs, callee) {
+  if sym_raw(fnid_sym(csym)) < 0 and list_has(cx.lcs, callee) {
     emit_apply_seq("kai_apply(", c_local(callee), call_vals)
   } else { match evar_find(cx.variants, callee) {
     # Variant ctor with boxed slots; the typed-slot path is taken earlier,
@@ -6642,7 +6647,7 @@ fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option
 
   match sym_read_kind(f.kind) {
     EVar(callee) ->
-      if list_has(cx.lcs, callee) { None }
+      if ec_local_callee(f, callee, cx) { None }
       else { match fnx_resolve(cx.fx, cx.fns, ec_callee_sym(f), callee, cx.root_mod) {
         # Mixed-param lane: only take the raw-call path when the callee
         # RETURNS raw (a raw context cannot consume a boxed result).
@@ -6694,6 +6699,33 @@ fn emit_expr(src: String, x: Expr, cx: EmitCtx) : String / Console {
   }
 }
 
+# A declaration a binder in scope shares the spelling of.
+fn emit_decl_value(src: String, name: String, fid: FnId, cx: EmitCtx) : String / Console =
+  match const_body_of(cx.consts, name) {
+    Some(body) -> emit_expr(src, body, cx)
+    None       -> emit_ident_value(name, fid, cx.fx, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
+  }
+
+fn emit_var_value(src: String, name: String, cx: EmitCtx) : String / Console =
+  # i64-inline (Lane B): a kind-1 raw-bound binder used in a BOXED
+  # context (this is the boxed emit path) is materialised on demand
+  # from its raw alias: `kai_int(kair_<name>)`. The raw form is read
+  # by emit_kind_raw (MUnboxed uses). Box-on-use means the kai_int is
+  # only emitted where a boxed consumer exists — no dead box.
+  if emit_ctx_kind1_raw_has(cx, name) { cat3("kai_int(kair_", name, ")") }
+  # A const is a literal with a name: materialise its body inline at
+  # the use site (no global, no boxing, no call) so the unbox pass
+  # treats it exactly like the literal it stands for. A same-named
+  # local shadows the const (locals are in `lcs`), so only consult
+  # the const catalogue when `name` is not lexically bound.
+  else if not list_has(cx.lcs, name) {
+    match const_body_of(cx.consts, name) {
+      Some(body) -> emit_expr(src, body, cx)
+      None       -> emit_ident_value(name, fnid_none(), cx.fx, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
+    }
+  }
+  else { emit_ident_value(name, fnid_none(), cx.fx, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod) }
+
 fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
 
   # `sym_read_kind` has already folded `ESym` into `EVar`, so this arm
@@ -6723,24 +6755,8 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     EStr(span, is_triple) -> emit_string_expr(src, span, is_triple, cx)
     EUnit        -> "kai_unit()"
     EVar(name)   ->
-      # i64-inline (Lane B): a kind-1 raw-bound binder used in a BOXED
-      # context (this is the boxed emit path) is materialised on demand
-      # from its raw alias: `kai_int(kair_<name>)`. The raw form is read
-      # by emit_kind_raw (MUnboxed uses). Box-on-use means the kai_int is
-      # only emitted where a boxed consumer exists — no dead box.
-      if emit_ctx_kind1_raw_has(cx, name) { cat3("kai_int(kair_", name, ")") }
-      # A const is a literal with a name: materialise its body inline at
-      # the use site (no global, no boxing, no call) so the unbox pass
-      # treats it exactly like the literal it stands for. A same-named
-      # local shadows the const (locals are in `lcs`), so only consult
-      # the const catalogue when `name` is not lexically bound.
-      else if not list_has(cx.lcs, name) {
-        match const_body_of(cx.consts, name) {
-          Some(body) -> emit_expr(src, body, cx)
-          None       -> emit_ident_value(name, fnid_none(), cx.fx, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
-        }
-      }
-      else { emit_ident_value(name, fnid_none(), cx.fx, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod) }
+      if ec_local_callee(x, name, cx) or not list_has(cx.lcs, name) { emit_var_value(src, name, cx) }
+      else { emit_decl_value(src, name, ec_callee_sym(x), cx) }
     EUnder       -> "kai_unit() /* _ */"
     EPlaceholder -> "kai_unit() /* placeholder */"
     ECall(f, args_e) -> emit_call_expr(src, f, args_e, emit_ctx_route_brand(cx, x.ty))

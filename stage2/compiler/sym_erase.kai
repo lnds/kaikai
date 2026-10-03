@@ -47,7 +47,24 @@ fn se_cx(se: SymErase, keep: Bool) : SeCx = match se { SymErase(tab, target) -> 
 
 fn se_decls(cx: SeCx, ds: [Decl]) : [Decl] = match ds {
   []           -> []
-  [d, ...rest] -> [se_decl_map(d, (b) => se_expr_at(cx, se_decl_home(cx, d), b)), ...se_decls(cx, rest)]
+  [d, ...rest] -> {
+    let at = SeAt(se_decl_home(cx, d), se_decl_name(d))
+    [se_decl_map(d, (b) => se_expr_at(cx, at, b)), ...se_decls(cx, rest)]
+  }
+}
+
+# Where a body sits: its home, and the name of the function it is the
+# body of (empty for a test, a bench, a check or a constant).
+type SeAt = SeAt(String, String)
+
+fn se_decl_name(d: Decl) : String = match d {
+  DFn(_, n, _, _, _, _, _, _, _, _, _) -> n
+  DConstructor(inner, _, _)        -> se_decl_name(inner)
+  DProtoLaws(_, inner, _, _, _)    -> se_decl_name(inner)
+  DImplAxiom(_, inner, _, _, _)    -> se_decl_name(inner)
+  DDoc(_, _, inner, _, _)          -> se_decl_name(inner)
+  DAttr(_, inner, _, _)            -> se_decl_name(inner)
+  _ -> ""
 }
 
 # The home a declaration's body sits in: the module whose other entries a
@@ -73,25 +90,21 @@ fn se_decl_map(d: Decl, f: (Expr) -> Expr) : Decl = match d {
   _ -> d
 }
 
-fn se_expr_at(cx: SeCx, h: String, e: Expr) : Expr =
-  Expr { kind: se_kind_at(cx, h, e.kind), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+fn se_expr_at(cx: SeCx, at: SeAt, e: Expr) : Expr =
+  Expr { kind: se_kind_at(cx, at, e.kind), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
-fn se_kind_at(cx: SeCx, h: String, k: ExprKind) : ExprKind = match k {
-  ESym(s, inst, n) -> sym_erase_ref(cx, h, s, inst, n)
-  _                -> prc_map_expr_kind(k, (sub) => se_expr_at(cx, h, sub))
+fn se_kind_at(cx: SeCx, at: SeAt, k: ExprKind) : ExprKind = match k {
+  ESym(s, inst, n) -> sym_erase_ref(cx, at, s, inst, n)
+  _                -> prc_map_expr_kind(k, (sub) => se_expr_at(cx, at, sub))
 }
 
 # A reference spells its home only where the bare name would leave the
-# decision open: a function several modules declare, none of them the root
-# file, and none of them the body's own module. A name reached from inside
-# its own home is not contested there, and the passes that read a
-# self-recursive call by name — the tail-call rewrite among them — only
-# see one when it stays bare. A specialisation was placed by the
-# monomorphiser, so there is nothing left to contest.
-fn sym_erase_ref(cx: SeCx, h: String, s: SymId, inst: Int, n: String) : ExprKind = match cx {
+# decision open, or would be taken for a self-call. A specialisation was
+# placed by the monomorphiser, so there is nothing left to contest.
+fn sym_erase_ref(cx: SeCx, at: SeAt, s: SymId, inst: Int, n: String) : ExprKind = match cx {
   SeCx(tab, target, keep) -> match sym_class(tab, s) {
     NCEffect -> ESym(s, inst, n)
-    NCFn     -> if inst == spec_none() and se_spellable(tab, target, h, n) { se_home_call(tab, s, n) } else { ESym(s, inst, n) }
+    NCFn     -> if inst == spec_none() and se_spellable(tab, target, at, s, n) { se_home_call(tab, s, n) } else { ESym(s, inst, n) }
     _        -> se_bare(keep, s, inst, n)
   }
 }
@@ -103,20 +116,28 @@ fn se_home_call(tab: SymTab, s: SymId, n: String) : ExprKind = {
 
 fn se_bare(keep: Bool, s: SymId, inst: Int, n: String) : ExprKind = if keep { ESym(s, inst, n) } else { EVar(n) }
 
-# Contested, with no candidate the bare name already answers: a root-file
-# entry wins every bare call in the registry, and the body's own module
-# answers one before any import does.
-fn se_spellable(tab: SymTab, target: String, h: String, n: String) : Bool = {
-  let cands = st_candidates(tab, NCFn, n)
-  se_many(cands) and not se_any_home(tab, cands, target) and not se_any_home(tab, cands, h)
+# Contested, and either no candidate is one the bare name already answers
+# (a root-file entry wins every bare call in the registry, and the body's
+# own module answers one before any import does), or the reference shares
+# its spelling with the function whose body holds it without being it:
+# the passes that read a self-call by name — the tail-call rewrite among
+# them — would loop it back into the caller.
+fn se_spellable(tab: SymTab, target: String, at: SeAt, s: SymId, n: String) : Bool = match at {
+  SeAt(h, me) -> {
+    let cands = st_candidates(tab, NCFn, n)
+    se_many(cands) and (se_open(tab, cands, target, h) or (n == me and sym_home(tab, s) != h))
+  }
+}
+
+fn se_open(tab: SymTab, cands: [SymId], target: String, h: String) : Bool =
+  not se_any_home(tab, cands, target) and not se_any_home(tab, cands, h)
+
+fn se_any_home(tab: SymTab, cands: [SymId], home: String) : Bool = match cands {
+  []           -> false
+  [c, ...rest] -> if sym_home(tab, c) == home { true } else { se_any_home(tab, rest, home) }
 }
 
 fn se_many(cands: [SymId]) : Bool = match cands {
   [_, _, ..._] -> true
   _            -> false
-}
-
-fn se_any_home(tab: SymTab, cands: [SymId], home: String) : Bool = match cands {
-  []           -> false
-  [c, ...rest] -> if sym_home(tab, c) == home { true } else { se_any_home(tab, rest, home) }
 }
