@@ -676,7 +676,7 @@ lambda_expr ::= IDENT '=>' or_expr                     (* unary arrow *)
               | '{' lambda_params? '->' block_body '}'  (* lambda block *)
 ```
 
-Lambda BODIES are parsed via `parse_or`, not the full expression
+Lambda BODIES are parsed at the `or` level (`parse_bin_or`), not the full expression
 production (issue #422). This is deliberate so a top-level pipe on
 the call site binds outside the lambda: `xs | (x => x + 1) |> f`
 parses as `(xs | (x => x + 1)) |> f`, not `xs | ((x => x + 1) |> f)`.
@@ -892,21 +892,21 @@ form on fn decls or match arms.
 
 ## §3 — Operator precedence and associativity
 
-From tightest (binds first) to loosest (binds last). Each level
-resolves against the level above it.
+From tightest (binds first) to loosest (binds last). Levels 4–10 are
+one precedence-climbing loop (`bin_level` in `parse.kai`).
 
 | Level | Operators                                     | Associativity        | Parser fn          |
 |------:|-----------------------------------------------|----------------------|--------------------|
 |     1 | call `f(args)`, field `.`, index `[i]`, postfix `!`, trailing-lambda | Postfix              | `parse_postfix`    |
 |     2 | `^` (power)                                   | Right                | `parse_pow`        |
 |     3 | unary `-`, `not`, `@`                         | Prefix               | `parse_unary`      |
-|     4 | `*`, `/`, `%`                                 | Left                 | `parse_mul`        |
-|     5 | `+`, `-` (binary)                             | Left                 | `parse_add`        |
-|     6 | `++` (concat)                                 | Right                | `parse_concat`     |
-|     7 | `==`, `!=`, `<`, `>`, `<=`, `>=`              | **Non-associative**  | `parse_cmp`        |
-|     8 | `and`                                         | Left (short-circuit) | `parse_and`        |
-|     9 | `or`                                          | Left (short-circuit) | `parse_or`         |
-|    10 | `\|>`, `\|`, `\|\|`, `\|?`                     | Left                 | `parse_pipe`       |
+|     4 | `*`, `/`, `%`                                 | Left                 | `parse_bin` (loop) |
+|     5 | `+`, `-` (binary)                             | Left                 | `parse_bin` (loop) |
+|     6 | `++` (concat)                                 | Right                | `parse_bin` (loop) |
+|     7 | `==`, `!=`, `<`, `>`, `<=`, `>=`              | **Non-associative**  | `parse_bin` (loop) |
+|     8 | `and`                                         | Left (short-circuit) | `parse_bin` (loop) |
+|     9 | `or`                                          | Left (short-circuit) | `parse_bin` (loop) |
+|    10 | `\|>`, `\|`, `\|\|`, `\|?`                     | Left                 | `parse_bin` (loop) |
 
 Notes:
 
