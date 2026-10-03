@@ -675,6 +675,7 @@ test-cli-flags: kaic2
 # `kai-<verb>` plugin on PATH, and prefix resolution in the installed layout.
 test-kai-cli: kaic2
 	@tools/test-kai-cli.sh
+	@tests/kai_test_jobs.sh
 
 # Operand evaluation order under gcc on x86_64, which evaluates call
 # arguments right to left. The script refuses any other host.
