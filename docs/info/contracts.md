@@ -32,9 +32,10 @@ fn main() : Unit / Stdout {
 ```
 
 `requires` sits between the return type and the body; `ensures` names
-the return value `result`. Both are checked; a literal argument that
-provably violates a `requires` is a compile error, and a runtime
-violation panics:
+the return value `result`. Both are checked; a literal or constant
+argument that provably violates a `requires` is a compile error, whether
+it is passed directly, through `|>`, or through the `_` placeholder, and
+a runtime violation panics:
 
 ```
 panic: requires violated in `divide`
