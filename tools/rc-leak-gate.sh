@@ -35,6 +35,13 @@
 # known leaks pinned exactly in tools/baselines/rc-growth/<name>, one
 # `<c>:<native>` line each.
 #
+# A fiber still queued at exit that never started is released by the ledger
+# and reported apart, so an actor left unsynchronised costs no pin. One that
+# started and is still alive at an `exit_code=0` fails the fixture: its frames
+# hold references the ledger cannot settle. A runtime abort reports
+# `exit_code=abort` and leaves frames alive by definition, so it is measured
+# as before.
+#
 # examples/effects is held to growth only: its fixtures print through
 # handlers, fibers and timers, so only the per-run retention is pinned, in
 # tools/baselines/rc-effects-growth/<name> (a `-` column skips the backend).
@@ -111,9 +118,81 @@ ledger_run() {
     env KAI_THREADS=1 KAI_TRACE_RC=1 KAI_TRACE_RC_RUNS="$runs" "$bin" >"$bin.out" 2>"$bin.err" </dev/null || rc=$?
   fi
   case "$rc" in 124|137) echo TIMEOUT; return ;; esac
-  local leaked
+  local leaked started
+  started="$(sed -n 's/^\[KAI_TRACE_RC\] *fibers_started_at_exit=\([0-9]*\).*/\1/p' "$bin.err" | head -1)"
+  if [ -n "$started" ] && grep -q '^\[KAI_TRACE_RC\] *exit_code=0$' "$bin.err"; then
+    echo "FIBERS-STARTED-AT-EXIT=$started"; return
+  fi
+  if [ -n "$started" ]; then echo "$started" > "$bin.aborted-fibers"; else rm -f "$bin.aborted-fibers"; fi
   leaked="$(sed -n 's/^\[KAI_TRACE_RC\] .*leaked=\([0-9-]*\).*/\1/p' "$bin.err" | head -1)"
   echo "${leaked:-NO-LEDGER}"
+}
+
+# The exit-fiber verdicts on programs built here: an actor that never starts is
+# settled (growth 0), one parked in `receive` at a clean exit fails, and a
+# runtime abort with a fiber parked is measured and noted.
+self_test() {
+  local dir="$WORK/self-test" once twice parked aborted
+  mkdir -p "$dir"
+  cat > "$dir/unstarted.kai" <<'EOF'
+import actor
+
+fn idle() : Unit / Actor[String] = ()
+
+fn main() : Unit / Spawn = with_mailbox {
+  let _k = spawn_actor(() => idle())
+  ()
+}
+EOF
+  cat > "$dir/started.kai" <<'EOF'
+import actor
+
+fn kid(parent: Pid[String]) : Unit / Actor[String] = {
+  Actor.send(parent, "ready")
+  let _never = Actor.receive()
+  ()
+}
+
+fn main() : Unit / Spawn = with_mailbox {
+  let me = Actor.self()
+  let _k = spawn_actor(() => kid(me))
+  let _ready = Actor.receive()
+  ()
+}
+EOF
+  cat > "$dir/aborted.kai" <<'EOF'
+import spawn
+
+fn main() : Int / Spawn = {
+  var counter := 0
+  let reader = () => { let _ = counter; () }
+  nursery { n ->
+    let _f = n.spawn(() => { let g = reader; g(); () })
+    ()
+  }
+  0
+}
+EOF
+  for p in unstarted started aborted; do
+    "$KAI" build --backend="$BACKEND" "$dir/$p.kai" -o "$dir/$p" >"$dir/$p.build" 2>&1 \
+      || { echo "rc-leak-gate self-test: FAIL — $p does not build"; sed 's/^/  /' "$dir/$p.build"; return 1; }
+  done
+  once="$(ledger_run "$dir/unstarted" 1)"
+  grep -q 'fibers_unstarted_at_exit=1$' "$dir/unstarted.err" \
+    || { echo "rc-leak-gate self-test: FAIL — an unstarted actor is not settled"; return 1; }
+  twice="$(ledger_run "$dir/unstarted" 2)"
+  [ "$((twice - once))" -eq 0 ] \
+    || { echo "rc-leak-gate self-test: FAIL — an unstarted actor grows by $((twice - once))"; return 1; }
+  parked="$(ledger_run "$dir/started" 1)"
+  [ "$parked" = FIBERS-STARTED-AT-EXIT=1 ] \
+    || { echo "rc-leak-gate self-test: FAIL — a parked actor at exit reads as $parked"; return 1; }
+  aborted="$(ledger_run "$dir/aborted" 1)"
+  case "$aborted" in
+    ''|*[!0-9-]*) echo "rc-leak-gate self-test: FAIL — an abort with a parked fiber reads as $aborted"; return 1 ;;
+  esac
+  [ -f "$dir/aborted.aborted-fibers" ] \
+    || { echo "rc-leak-gate self-test: FAIL — an abort with a parked fiber is not noted"; return 1; }
+  echo "rc-leak-gate self-test OK"
 }
 
 # One fixture `<corpus>/<name>`: build, run under the ledger once and twice,
@@ -157,6 +236,7 @@ fixtures="$WORK/fixtures.txt"
 collect_fixtures > "$fixtures"
 total="$(wc -l < "$fixtures" | tr -d ' ')"
 
+self_test || exit 1
 echo "rc-leak-gate: $total fixtures, $BACKEND backend, $JOBS workers"
 xargs -P "$JOBS" -n 1 -I{} bash -c 'measure_one "$@"' _ {} < "$fixtures"
 
@@ -178,6 +258,8 @@ while IFS= read -r id; do
   else
     case "$measured" in ''|*[!0-9-]*) echo "FAIL $id — $measured"; fail=1 ;; esac
   fi
+  [ -f "$WORK/$corpus-$name.aborted-fibers" ] && \
+    echo "note $id — exit_code=abort with $(cat "$WORK/$corpus-$name.aborted-fibers") started fiber(s) alive; measured as before"
   [ "$measured" = BUILD-FAIL ] && tail -4 "$WORK/$corpus-$name.build" 2>/dev/null | sed 's/^/    /'
   # A run cannot free more than it allocated: negative growth means the
   # ledger missed allocations, never a fixed leak.
