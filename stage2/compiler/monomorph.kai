@@ -1364,16 +1364,28 @@ fn lookup_poly_fn(polys: PolyIx, name: String) : Option[Decl] =
 # it — the bare-name walk below answers with whichever decl comes first
 # in the stream, which is the wrong one as soon as two modules define
 # the name. An unresolved callee still walks by name.
+#
+# A resolved callee no poly decl answers by id is not generic, even when a
+# generic elsewhere shares its spelling; only where some poly decl of that
+# name carries no id is the miss inconclusive, and the name decides.
 fn lookup_poly_fn_at(polys: PolyIx, callee: Expr, name: String) : Option[Decl] =
   match callee.kind {
     ESym(s, inst, _) -> if sym_raw(s) >= 0 and inst == spec_none() {
       match lookup_poly_fn_sym(poly_ix_fns(polys), s) {
         Some(d) -> Some(d)
-        None    -> lookup_poly_fn(polys, name)
+        None    -> if poly_named_all_stamped(poly_ix_fns(polys), name) { None }
+                   else { lookup_poly_fn(polys, name) }
       }
     } else { lookup_poly_fn(polys, name) }
     _ -> lookup_poly_fn(polys, name)
   }
+
+fn poly_named_all_stamped(fns: [PolyFn], name: String) : Bool = match fns {
+  [] -> true
+  [PFn(n, d), ...rest] ->
+    if n == name and sym_raw(poly_decl_sym(d)) < 0 { false }
+    else { poly_named_all_stamped(rest, name) }
+}
 
 fn lookup_poly_fn_sym(fns: [PolyFn], s: SymId) : Option[Decl] = match fns {
   [] -> None
@@ -2081,11 +2093,11 @@ fn retarget_self_calls_kind(k: ExprKind, sh: [String], orig_name: String,
   match k {
     ECall(callee, args_) -> match sym_read_kind(callee.kind) {
       # The single rewrite the walker performs: `f(args)` where f is
-      # the bare original name becomes a call to the spec. Args still
+      # the original itself becomes a call to the spec. Args still
       # recurse so nested self-calls inside arg expressions also get
       # retargeted.
       EVar(name) ->
-        if name == orig_name and not list_has(sh, name) {
+        if rsc_is_self(callee.kind, sh, orig_name, spec) {
           let new_callee = Expr { kind: spec,
                                    line: callee.line, col: callee.col,
                                    ty: callee.ty, mode: callee.mode }
@@ -2114,6 +2126,22 @@ fn retarget_self_calls_kind(k: ExprKind, sh: [String], orig_name: String,
     _ -> mono_map_expr_kind(k, (sub) => retarget_self_calls_expr(sub, sh, orig_name, spec))
   }
 }
+
+# A resolved callee is the template only by id: another module's homonym
+# called from the body shares the spelling and nothing else. The spec
+# reference carries the template's id; without one the spelling decides.
+fn rsc_is_self(callee: ExprKind, sh: [String], orig_name: String, spec: ExprKind) : Bool =
+  match callee {
+    ESym(s, _, n) -> match spec {
+      ESym(t, _, _) -> if sym_raw(s) >= 0 { sym_raw(s) == sym_raw(t) } else { rsc_named(n, sh, orig_name) }
+      _             -> rsc_named(n, sh, orig_name)
+    }
+    EVar(n) -> rsc_named(n, sh, orig_name)
+    _       -> false
+  }
+
+fn rsc_named(n: String, sh: [String], orig_name: String) : Bool =
+  n == orig_name and not list_has(sh, n)
 
 fn retarget_arm(a: Arm, sh: [String], orig_name: String, spec: ExprKind) : Arm = match a {
   Arm(p, guard, body) -> {
@@ -2210,7 +2238,7 @@ fn discover_new_tuples_expr(e: Expr, insts: InstIndex, polys: PolyIx,
   let acc1 = discover_new_tuples_kind(e.kind, insts, polys, existing, sm, acc, host_mo)
   match e.kind {
     ECall(callee, args_) -> match sym_read_kind(callee.kind) {
-      EVar(name) -> discover_call_tuple(name, None, callee, args_, e.ty, insts, polys, existing, sm, acc1, host_mo)
+      EVar(name) -> discover_call_tuple(name, sym_call_mo(polys, callee), callee, args_, e.ty, insts, polys, existing, sm, acc1, host_mo)
       # A qualified call `mod.fn(...)` seeds a spec only when `fn` is a
       # `[T:P]` generic that `mod` actually defines. When the name is unique
       # to one module the tuple stays `None` (the bare-name `DFn` lookup
@@ -2232,7 +2260,7 @@ fn discover_call_tuple(name: String, cmo: Option[String], callee: Expr, args_: [
                         ret_ty: Option[Ty], insts: InstIndex, polys: PolyIx,
                         existing: TupleSet, sm: SubstMap,
                         acc1: [MonoTuple], host_mo: Option[String]) : [MonoTuple] {
-  let is_user_poly = match lookup_poly_fn(polys, name) {
+  let is_user_poly = match lookup_poly_fn_at(polys, callee, name) {
     Some(_) -> true None -> false
   }
   if not is_user_poly { acc1 }
@@ -2434,9 +2462,30 @@ fn discover_new_tuples_clauses(cs: [HClause], insts: InstIndex, polys: PolyIx,
 # applied to the looked-up `(tys, units)` at each call site so that
 # internal polymorphic-flow-through calls retarget to their spec
 # mangled names.
-# The callee module a bare call retargets to: `Some(host)` for a
-# module-shared name (binds to the enclosing module's spec), else `None`.
-fn bare_callee_mo(polys: PolyIx, name: String, host_mo: Option[String]) : Option[String] =
+# The module a resolved callee's spec is tagged with: the home of the
+# template its id names, when that name is shared across modules. A
+# qualified call reaches here as a resolved reference, so its home comes
+# from the id and never from the module whose body holds the call.
+fn sym_call_mo(polys: PolyIx, callee: Expr) : Option[String] = match callee.kind {
+  ESym(s, inst, n) ->
+    if inst != spec_none() or not name_shared(polys, n) { None }
+    else { match lookup_poly_fn_sym(poly_ix_fns(polys), s) {
+      Some(d) -> mono_canon_mo(poly_decl_mo(d), poly_ix_target(polys))
+      None    -> None
+    } }
+  _ -> None
+}
+
+# The callee module a bare call retargets to: the resolved callee's home,
+# else `Some(host)` for a module-shared name (binds to the enclosing
+# module's spec), else `None`.
+fn bare_callee_mo(polys: PolyIx, callee: Expr, name: String, host_mo: Option[String]) : Option[String] =
+  match sym_call_mo(polys, callee) {
+    Some(m) -> Some(m)
+    None    -> bare_host_mo(polys, name, host_mo)
+  }
+
+fn bare_host_mo(polys: PolyIx, name: String, host_mo: Option[String]) : Option[String] =
   match host_mo {
     None    -> None
     Some(m) ->
@@ -2516,7 +2565,7 @@ fn rewrite_bare_call(name: String, callee: Expr, new_args: [Expr], ret_ty: Optio
                       sm: SubstMap, host_mo: Option[String]) : ExprKind =
   match resolve_call_inst(insts, polys, name, callee, new_args, ret_ty, sm) {
     Some(MIPair(tys, units)) -> {
-      let bmo = bare_callee_mo(polys, name, host_mo)
+      let bmo = bare_callee_mo(polys, callee, name, host_mo)
       let t = MT(bmo, name, tys, units)
       if ts_mem(tuples, t) {
         let mangled = mono_mangle_name(name, tys, units)
