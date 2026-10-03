@@ -1,0 +1,220 @@
+#[doc("""
+The module table: what an `import` binds and how a written qualifier
+reaches the module, its exports and its home.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.diag_file
+
+# ModuleEntry records the surface name a user wrote on an
+# `import` line, the public names that file exports, and the
+# absolute path the file was loaded from. The resolver collects one
+# per import in expand_imports; later passes use
+# the table to disambiguate `mod.fn` qualified calls from
+# record-field projections.
+#
+# `name` is the surface form: the last segment of `IkPath("a.b.c")`
+# (=> `c`), the alias from `IkAlias`, or the last segment of
+# `IkSelective`. `exports` is the list of pub fn / pub type / pub
+# effect / pub protocol names declared in the imported file's
+# top-level (non-import) decls. Selective imports do NOT pre-filter
+# this list — concat semantics still bring every public decl
+# into the unqualified scope, so the qualified surface mirrors that.
+pub type ModuleEntry = ME(String, [String], String, [String])
+
+
+#[doc("The module bound to `name` in this file's qualifier table, if any.")]
+pub fn mt_lookup(mt: [ModuleEntry], name: String) : Option[ModuleEntry] {
+  match mt {
+    [] -> None
+    [me, ...rest] -> match me {
+      ME(mn, _, _, _) -> if mn == name { Some(me) } else { mt_lookup(rest, name) }
+    }
+  }
+}
+
+#[doc("True when the module exports `fn_name` at its top level.")]
+pub fn me_has_export(me: ModuleEntry, fn_name: String) : Bool = match me {
+  ME(_, exports, _, _) -> list_has(exports, fn_name)
+}
+
+# Returns true when `fn_name` is in the module's unstable
+# export list. Callers use this from EField -> EModCall rewriting to
+# decide whether to emit the unstable-consumer warning.
+#[doc("True when the module marks `fn_name` unstable.")]
+pub fn me_export_is_unstable(me: ModuleEntry, fn_name: String) : Bool = match me {
+  ME(_, _, _, unstable) -> list_has(unstable, fn_name)
+}
+
+# Collect the absolute origin path of every ModuleEntry
+# in `mes`. Used to pre-seed the import resolver's `visited` set with
+# the paths of every `--core` file so a user `import` of the same
+# module is a no-op instead of a duplicate-symbol link error.
+pub fn collect_module_origins(mes: [ModuleEntry], acc: [String]) : [String] = match mes {
+  [] -> list_reverse(acc)
+  [me, ...rest] -> match me {
+    ME(_, _, origin, _) -> collect_module_origins(rest, [origin, ...acc])
+  }
+}
+
+#[doc("Project the module table onto the (module, file) pairs diagnostic attribution needs.")]
+pub fn module_files(mes: [ModuleEntry], acc: [ModFile]) : [ModFile] = match mes {
+  [] -> list_reverse(acc)
+  [me, ...rest] -> match me {
+    ME(name, _, origin, _) -> module_files(rest, [MF(name, origin), ...acc])
+  }
+}
+
+
+# Find an already-registered entry by the file it was loaded from.
+# A file reached twice under two surface names owns one set of
+# exports; the second importer re-keys those exports under its own
+# binding rather than re-reading the file.
+pub fn mt_lookup_origin(mt: [ModuleEntry], path: String) : Option[ModuleEntry] {
+  match mt {
+    [] -> None
+    [me, ...rest] -> match me {
+      ME(_, _, origin, _) -> if origin == path { Some(me) } else { mt_lookup_origin(rest, path) }
+    }
+  }
+}
+
+# The import bindings one file wrote, keyed by the module that wrote
+# them. An import alias is scoped to its file: two files may bind the
+# same module under different names, and neither name is visible in
+# the other. The empty module name owns the root file's imports.
+#
+# A scope entry is keyed by the name its file wrote, which under an
+# alias is not the name the module's decls were tagged with. Only these
+# per-file entries may carry an alias — the global table stays keyed by
+# tagged names, or `me_emit_name` could not tell the two apart.
+pub type ModScope = MScope(String, [ModuleEntry])
+
+# The qualifier table a decl from `home` resolves through: that
+# module's own imports, else the global table. The fallback carries
+# the names every file sees without importing them (auto-loaded core
+# modules), which no per-file import list records.
+#
+# Alias entries come first, so a written name resolves to the file its
+# own module meant. They keep that file's origin path, which is what
+# lets `me_emit_name` recover the name codegen minted symbols under.
+#
+# A global entry under a name the file binds itself is left out: the
+# file's binding already answers that name, and counting the global one
+# would let another file's import make this file's qualifier contested.
+pub fn ms_table(scopes: [ModScope], home: String, global: [ModuleEntry]) : [ModuleEntry] =
+  match scopes {
+    [] -> global
+    [MScope(m, mt), ...rest] ->
+      if m == home { list_append(mt, filter(global, (g) => not mt_binds(mt, me_name(g)))) }
+      else { ms_table(rest, home, global) }
+  }
+
+fn me_name(me: ModuleEntry) : String = match me { ME(n, _, _, _) -> n }
+
+fn mt_binds(mt: [ModuleEntry], name: String) : Bool = match mt {
+  []            -> false
+  [me, ...rest] -> me_name(me) == name or mt_binds(rest, name)
+}
+
+#[doc("The module a read of `q.member` goes through: of the modules bound to `q`, the first that exports `member`, else the first.")]
+pub fn mt_lookup_member(mt: [ModuleEntry], q: String, member: String) : Option[ModuleEntry] =
+  match mt_rivals(mt, q, member) {
+    [me, ..._] -> Some(me)
+    []         -> mt_lookup(mt, q)
+  }
+
+#[doc("Every distinct module bound to `q` that exports `member`, in binding order; two or more make `q.member` ambiguous.")]
+pub fn mt_rivals(mt: [ModuleEntry], q: String, member: String) : [ModuleEntry] =
+  mt_rivals_loop(mt, q, member, [])
+
+fn mt_rivals_loop(mt: [ModuleEntry], q: String, member: String, acc: [ModuleEntry]) : [ModuleEntry] = match mt {
+  [] -> list_reverse(acc)
+  [me, ...rest] -> match me {
+    ME(n, exports, origin, _) ->
+      if n == q and list_has(exports, member) and not me_origin_in(acc, origin) {
+        mt_rivals_loop(rest, q, member, [me, ...acc])
+      } else { mt_rivals_loop(rest, q, member, acc) }
+  }
+}
+
+fn me_origin_in(mes: [ModuleEntry], origin: String) : Bool = match mes {
+  []            -> false
+  [ME(_, _, o, _), ...rest] -> o == origin or me_origin_in(rest, origin)
+}
+
+#[doc("`mt_lookup_member`, warning at the read when several modules bound to `q` export `member`.")]
+pub fn mt_lookup_member_at(mt: [ModuleEntry], q: String, member: String, file: String, line: Int, col: Int) : Option[ModuleEntry] / Console + File {
+  mt_warn_rivals(mt, q, member, file, line, col)
+  mt_lookup_member(mt, q, member)
+}
+
+#[doc("The home of the module a read of `q.member` goes through, or `q` when no module is bound to it.")]
+pub fn mt_member_home(mt: [ModuleEntry], q: String, member: String) : String = match mt_lookup_member(mt, q, member) {
+  Some(me) -> me_emit_name(mt, me, q)
+  None     -> q
+}
+
+#[doc("`mt` without its first binding of `q`: the bindings left once one import named `q` has claimed its own.")]
+pub fn mt_drop_first(mt: [ModuleEntry], q: String) : [ModuleEntry] = match mt {
+  []            -> []
+  [me, ...rest] -> if me_name(me) == q { rest } else { [me, ...mt_drop_first(rest, q)] }
+}
+
+#[doc("Warn that `q.member` names a member several modules bound to `q` export, at the read; the first binding answers.")]
+pub fn mt_warn_rivals(mt: [ModuleEntry], q: String, member: String, file: String, line: Int, col: Int) : Unit / Console + File =
+  match map(mt_rivals(mt, q, member), (me) => home_path(me_emit_name(mt, me, q))) {
+    [first, second, ...rest] -> {
+      diag_warning(file, line, col, concat_all(["`", q, ".", member, "` is exported by more than one module bound to `", q, "`: ",
+                                                join_with([first, second, ...rest], ", ")]))
+      diag_help(concat_all(["this resolves to `", first, "`; to reach another, bind it under its own name: `import ", second, " as ", q, "2`"]))
+    }
+    _ -> ()
+  }
+
+#[doc("The name codegen minted the symbols of `me` under: the last entry of its file in `mt`, else `written`.")]
+pub fn me_emit_name(mt: [ModuleEntry], me: ModuleEntry, written: String) : String =
+  match me {
+    ME(_, _, origin, _) -> me_last_name_for_origin(mt, origin, written)
+  }
+
+#[doc("How the reader whose table is `mt` names the module homed at `home`: the reader's own binding for that module's file, else the module's import path.")]
+pub fn mt_spell_home(mt: [ModuleEntry], home: String) : String = match mt_lookup(mt, home) {
+  Some(ME(_, _, origin, _)) -> me_first_name_for_origin(mt, origin, home_path(home))
+  None                      -> home_path(home)
+}
+
+fn me_first_name_for_origin(mt: [ModuleEntry], origin: String, dflt: String) : String = match mt {
+  []                        -> dflt
+  [ME(n, _, o, _), ...rest] -> if o == origin { n } else { me_first_name_for_origin(rest, origin, dflt) }
+}
+
+# A home spells its import path's `.` as `__`.
+fn home_path(home: String) : String = home_path_loop(home, 0, string_length(home), "")
+
+fn home_path_loop(s: String, i: Int, n: Int, acc: String) : String =
+  if i >= n { acc }
+  else if i + 1 < n and string_slice(s, i, 2) == "__" { home_path_loop(s, i + 2, n, string_concat(acc, ".")) }
+  else { home_path_loop(s, i + 1, n, string_concat(acc, string_slice(s, i, 1))) }
+
+#[doc("The last name `mt` binds the file at `origin` under, else `acc`.")]
+pub fn me_last_name_for_origin(mt: [ModuleEntry], origin: String, acc: String) : String =
+  match mt {
+    [] -> acc
+    [ME(n, _, o, _), ...rest] ->
+      me_last_name_for_origin(rest, origin, if o == origin { n } else { acc })
+  }
+
+#[doc("The tagged module name behind a written qualifier: the name codegen keys symbols by, recovering the global tag when `written` is a per-file alias. `written` itself when the table has no such entry.")]
+pub fn mt_tagged_name(mt: [ModuleEntry], written: String) : String =
+  match mt_lookup(mt, written) {
+    Some(me) -> me_emit_name(mt, me, written)
+    None     -> written
+  }
+
+#[doc("`fname` when the module exports it.")]
+pub fn me_lookup_export(me: ModuleEntry, fname: String) : Option[String] = match me {
+  ME(_, exports, _, _) ->
+    if list_has(exports, fname) { Some(fname) } else { None }
+}

@@ -54,6 +54,7 @@ import compiler.util
 import compiler.diag
 import compiler.ast
 import compiler.diag_file
+import compiler.module_table
 import compiler.expr_positions
 import compiler.lex
 import compiler.parse
@@ -103,22 +104,6 @@ fn mods_join_with(xs: [String], sep: String) : String = string_join(xs, sep)
 # Cycles are handled by a visited-set: re-imports are skipped, not
 # reported. A → B → A still works — the second visit to A is a
 # no-op.
-
-# ModuleEntry records the surface name a user wrote on an
-# `import` line, the public names that file exports, and the
-# absolute path the file was loaded from. The resolver collects one
-# per import in expand_imports; later passes use
-# the table to disambiguate `mod.fn` qualified calls from
-# record-field projections.
-#
-# `name` is the surface form: the last segment of `IkPath("a.b.c")`
-# (=> `c`), the alias from `IkAlias`, or the last segment of
-# `IkSelective`. `exports` is the list of pub fn / pub type / pub
-# effect / pub protocol names declared in the imported file's
-# top-level (non-import) decls. Selective imports do NOT pre-filter
-# this list — concat semantics still bring every public decl
-# into the unqualified scope, so the qualified surface mirrors that.
-pub type ModuleEntry = ME(String, [String], String, [String])
 
 # Directory portion of a path. "a/b/c.kai" -> "a/b". If no slash,
 # returns "." (current dir).
@@ -282,88 +267,6 @@ fn join_with_arrow(xs: [String], acc: String) : String {
 # `let` patterns, `match` arm patterns, handle clause params, and
 # `with State[T](init) as alias` aliases.
 
-#[doc("The module bound to `name` in this file's qualifier table, if any.")]
-pub fn mt_lookup(mt: [ModuleEntry], name: String) : Option[ModuleEntry] {
-  match mt {
-    [] -> None
-    [me, ...rest] -> match me {
-      ME(mn, _, _, _) -> if mn == name { Some(me) } else { mt_lookup(rest, name) }
-    }
-  }
-}
-
-#[doc("True when the module exports `fn_name` at its top level.")]
-pub fn me_has_export(me: ModuleEntry, fn_name: String) : Bool = match me {
-  ME(_, exports, _, _) -> list_has(exports, fn_name)
-}
-
-# Returns true when `fn_name` is in the module's unstable
-# export list. Callers use this from EField -> EModCall rewriting to
-# decide whether to emit the unstable-consumer warning.
-fn me_export_is_unstable(me: ModuleEntry, fn_name: String) : Bool = match me {
-  ME(_, _, _, unstable) -> list_has(unstable, fn_name)
-}
-
-# Collect the absolute origin path of every ModuleEntry
-# in `mes`. Used to pre-seed the import resolver's `visited` set with
-# the paths of every `--core` file so a user `import` of the same
-# module is a no-op instead of a duplicate-symbol link error.
-pub fn collect_module_origins(mes: [ModuleEntry], acc: [String]) : [String] = match mes {
-  [] -> list_reverse(acc)
-  [me, ...rest] -> match me {
-    ME(_, _, origin, _) -> collect_module_origins(rest, [origin, ...acc])
-  }
-}
-
-#[doc("Project the module table onto the (module, file) pairs diagnostic attribution needs.")]
-pub fn module_files(mes: [ModuleEntry], acc: [ModFile]) : [ModFile] = match mes {
-  [] -> list_reverse(acc)
-  [me, ...rest] -> match me {
-    ME(name, _, origin, _) -> module_files(rest, [MF(name, origin), ...acc])
-  }
-}
-
-
-# Find an already-registered entry by the file it was loaded from.
-# A file reached twice under two surface names owns one set of
-# exports; the second importer re-keys those exports under its own
-# binding rather than re-reading the file.
-pub fn mt_lookup_origin(mt: [ModuleEntry], path: String) : Option[ModuleEntry] {
-  match mt {
-    [] -> None
-    [me, ...rest] -> match me {
-      ME(_, _, origin, _) -> if origin == path { Some(me) } else { mt_lookup_origin(rest, path) }
-    }
-  }
-}
-
-# The import bindings one file wrote, keyed by the module that wrote
-# them. An import alias is scoped to its file: two files may bind the
-# same module under different names, and neither name is visible in
-# the other. The empty module name owns the root file's imports.
-#
-# A scope entry is keyed by the name its file wrote, which under an
-# alias is not the name the module's decls were tagged with. Only these
-# per-file entries may carry an alias — the global table stays keyed by
-# tagged names, or `me_emit_name` could not tell the two apart.
-pub type ModScope = MScope(String, [ModuleEntry])
-
-# The qualifier table a decl from `home` resolves through: that
-# module's own imports, else the global table. The fallback carries
-# the names every file sees without importing them (auto-loaded core
-# modules), which no per-file import list records.
-#
-# Alias entries come first, so a written name resolves to the file its
-# own module meant. They keep that file's origin path, which is what
-# lets `me_emit_name` recover the name codegen minted symbols under.
-pub fn ms_table(scopes: [ModScope], home: String, global: [ModuleEntry]) : [ModuleEntry] =
-  match scopes {
-    [] -> global
-    [MScope(m, mt), ...rest] ->
-      if m == home { list_append(mt, global) } else { ms_table(rest, home, global) }
-  }
-
-
 fn name_starts_upper(name: String) : Bool = match char_at(name, 0) {
   Some(c) -> c >= 'A' and c <= 'Z'
   None    -> false
@@ -376,37 +279,6 @@ fn name_starts_upper(name: String) : Bool = match char_at(name, 0) {
 # registered globally, which per-file alias entries are prepended to.
 # Scanning from the end finds it regardless of how many aliases name
 # the same file.
-fn me_emit_name(mt: [ModuleEntry], me: ModuleEntry, written: String) : String =
-  match me {
-    ME(_, _, origin, _) -> me_last_name_for_origin(mt, origin, written)
-  }
-
-#[doc("How the reader whose table is `mt` names the module homed at `home`: the reader's own binding for that module's file, else the module's import path.")]
-pub fn mt_spell_home(mt: [ModuleEntry], home: String) : String = match mt_lookup(mt, home) {
-  Some(ME(_, _, origin, _)) -> me_first_name_for_origin(mt, origin, home_path(home))
-  None                      -> home_path(home)
-}
-
-fn me_first_name_for_origin(mt: [ModuleEntry], origin: String, dflt: String) : String = match mt {
-  []                        -> dflt
-  [ME(n, _, o, _), ...rest] -> if o == origin { n } else { me_first_name_for_origin(rest, origin, dflt) }
-}
-
-# A home spells its import path's `.` as `__`.
-fn home_path(home: String) : String = home_path_loop(home, 0, string_length(home), "")
-
-fn home_path_loop(s: String, i: Int, n: Int, acc: String) : String =
-  if i >= n { acc }
-  else if i + 1 < n and string_slice(s, i, 2) == "__" { home_path_loop(s, i + 2, n, string_concat(acc, ".")) }
-  else { home_path_loop(s, i + 1, n, string_concat(acc, string_slice(s, i, 1))) }
-
-fn me_last_name_for_origin(mt: [ModuleEntry], origin: String, acc: String) : String =
-  match mt {
-    [] -> acc
-    [ME(n, _, o, _), ...rest] ->
-      me_last_name_for_origin(rest, origin, if o == origin { n } else { acc })
-  }
-
 #[doc("Each file's direct imports as tagged module names, keyed by the importing file's tagged name (`\"\"` = root).")]
 pub fn scope_imports(scopes: [ModScope], global: [ModuleEntry]) : [ModImports] = match scopes {
   [] -> []
@@ -418,18 +290,6 @@ fn scope_tagged_names(mes: [ModuleEntry], global: [ModuleEntry]) : [String] = ma
   [] -> []
   [ME(written, _, origin, _), ...rest] ->
     [me_last_name_for_origin(global, origin, written), ...scope_tagged_names(rest, global)]
-}
-
-#[doc("The tagged module name behind a written qualifier: the name codegen keys symbols by, recovering the global tag when `written` is a per-file alias. `written` itself when the table has no such entry.")]
-pub fn mt_tagged_name(mt: [ModuleEntry], written: String) : String =
-  match mt_lookup(mt, written) {
-    Some(me) -> me_emit_name(mt, me, written)
-    None     -> written
-  }
-
-fn me_lookup_export(me: ModuleEntry, fname: String) : Option[String] = match me {
-  ME(_, exports, _, _) ->
-    if list_has(exports, fname) { Some(fname) } else { None }
 }
 
 # Collect the bindings introduced by a pattern. Used by SLet,
@@ -534,7 +394,7 @@ fn qualtype_te(te: TypeExpr, mt: [ModuleEntry], file: String) : TypeExpr / Conso
     match split_dotted_qualifier(name) {
       None -> TypeExpr { tkind: TyName(name, targs1), line: te.line, col: te.col }
       Some(parts) -> match parts {
-        QSplit(mod, ty) -> match mt_lookup(mt, mod) {
+        QSplit(mod, ty) -> match mt_lookup_member_at(mt, mod, ty, file, te.line, te.col) {
           None -> {
             let _ = qt_diag_unknown_mod(mod, ty, file, te.line, te.col)
             # Sentinel name forces the typer cascade to fail.
@@ -625,7 +485,7 @@ fn qualtype_member(name: String, mt: [ModuleEntry], file: String, line: Int, col
   match split_dotted_qualifier(name) {
     None -> name
     Some(parts) -> match parts {
-      QSplit(mod, ty) -> match mt_lookup(mt, mod) {
+      QSplit(mod, ty) -> match mt_lookup_member_at(mt, mod, ty, file, line, col) {
         None -> {
           let _ = qt_diag_unknown_mod(mod, ty, file, line, col)
           "__qualtype_bad__"
@@ -695,7 +555,7 @@ fn qualtype_expr_kind_at(k: ExprKind, mt: [ModuleEntry], file: String, line: Int
     match split_dotted_qualifier(name) {
       None -> ERecordLit(name, fs1)
       Some(parts) -> match parts {
-        QSplit(mod, ty) -> match mt_lookup(mt, mod) {
+        QSplit(mod, ty) -> match mt_lookup_member_at(mt, mod, ty, file, line, col) {
           None -> {
             let _ = qt_diag_unknown_mod(mod, ty, file, line, col)
             ERecordLit("__qualtype_bad__", fs1)
@@ -1018,7 +878,7 @@ fn qtchk_te(te: TypeExpr, mt: [ModuleEntry]) : Int = match te.tkind {
     match split_dotted_qualifier(name) {
       None -> inner
       Some(parts) -> match parts {
-        QSplit(mod, ty) -> match mt_lookup(mt, mod) {
+        QSplit(mod, ty) -> match mt_lookup_member(mt, mod, ty) {
           None -> inner + 1
           Some(me) -> if me_has_export(me, ty) { inner } else { inner + 1 }
         }
@@ -1072,7 +932,7 @@ fn qtchk_variants(vs: [Variant], mt: [ModuleEntry]) : Int = match vs {
 fn qtchk_member(name: String, mt: [ModuleEntry]) : Int = match split_dotted_qualifier(name) {
   None -> 0
   Some(parts) -> match parts {
-    QSplit(mod, ty) -> match mt_lookup(mt, mod) {
+    QSplit(mod, ty) -> match mt_lookup_member(mt, mod, ty) {
       None -> 1
       Some(me) -> if me_has_export(me, ty) { 0 } else { 1 }
     }
@@ -1458,7 +1318,7 @@ fn rqc_habitant_qualifier(inner: Expr, mid: String, locals: [String],
   EVar(mod) ->
     if list_has(locals, mod) { None }
     else if not name_starts_upper(mid) { None }
-    else { match mt_lookup(mt, mod) {
+    else { match mt_lookup_member(mt, mod, mid) {
       Some(me) -> if me_has_export(me, mid) { Some(mid) } else { None }
       None -> None
     } }
@@ -1489,7 +1349,7 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
         # diagnostic for a typo like `bit._adn`.
         EVar(string_concat("bit", fname))
       } else {
-        match mt_lookup(mt, name) {
+        match mt_lookup_member_at(mt, name, fname, file, e.line, e.col) {
           Some(me) ->
             # Prefix-fallback — `list.take` resolves to the
             # actual export `list_take` when the bare form is not
@@ -1702,14 +1562,14 @@ fn rqc_pat(pat: Pattern, mt: [ModuleEntry], file: String) : Pattern / Console + 
   _ -> pat
 }
 
-fn pat_qualifier_ok(q: String, ctor: String, mt: [ModuleEntry]) : Bool = match mt_lookup(mt, q) {
+fn pat_qualifier_ok(q: String, ctor: String, mt: [ModuleEntry]) : Bool = match mt_lookup_member(mt, q, ctor) {
   Some(me) -> me_has_export(me, ctor)
   None -> false
 }
 
 fn rqc_pat_qualifier(q: String, ctor: String, mt: [ModuleEntry], file: String, line: Int, col: Int) : Option[String] / Console + File =
 
-  match mt_lookup(mt, q) {
+  match mt_lookup_member_at(mt, q, ctor, file, line, col) {
     Some(me) ->
       if me_has_export(me, ctor) {
         Some(me_emit_name(mt, me, q))
