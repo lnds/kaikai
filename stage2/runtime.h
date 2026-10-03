@@ -4489,8 +4489,7 @@ static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
     return v;
 }
 
-/* Issue #817 — the recycle-this-cell tail shared by kai_free_value's
- * non-cons cases and kai_free_cons_spine's per-cell reclaim. Runs the
+/* The recycle-this-cell tail of kai_free_one. Runs the
  * trace/poison bookkeeping (#812 counters, #296 alloc-site credit,
  * history log, poison stamp) and returns the chunk to the pool (or
  * libc), then bumps the free counters. Must run exactly once per
@@ -4538,166 +4537,163 @@ static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
 #define KAI_RC_RECYCLE_POOL(_kc) free(_kc)
 #endif
 
-/* Issue #817 — free a cons cell's payload and walk a UNIQUE tail spine
- * iteratively, so a 40K-element list frees in O(1) stack instead of O(n)
- * recursion (the recursive `kai_decref(tail)` overflowed a 64 KiB fiber
- * stack once filter/map stopped leaking the spine). Precondition: `v` is
- * a KAI_CONS cell whose rc just hit 0 (we own its free). Each head — and
- * any shared (rc>1) or non-cons tail — goes through the ordinary
- * `kai_decref` so its counters, guards and cascade stay intact; only the
- * unique cons spine is consumed by the loop. Each cell is reclaimed via
- * KAI_RECYCLE_CELL, the same path the post-switch tail uses. */
-static void kai_free_cons_spine(KaiValue *v) {
-    for (;;) {
-        KaiValue *head = v->as.cons.head;
-        KaiValue *tail = v->as.cons.tail;   /* capture BEFORE recycle poisons v */
-        kai_decref(head);                   /* O(1) cascade for str/record; counters intact */
-        KAI_RECYCLE_CELL(v);                /* trace+poison+recycle+free_total++/live_now-- */
-        /* Continue only for a real, unique cons cell. A nil/singleton,
-         * an immortal or atomic cell, a non-cons, or a shared (rc!=1)
-         * tail hands off to kai_decref for its own free path. */
-        if (kai_is_value(tail) || !tail ||
-            kai_rc_load(tail) >= KAI_RC_SPECIAL ||
-            tail->tag != (int32_t) KAI_CONS ||
-            tail->rc != 1) {
-            kai_decref(tail);               /* counters + cascade for the boundary case */
-            return;
-        }
-        /* We are the unique owner of `tail`; consume it as `kai_decref`
-         * would (counter + trace history) but without the recursive call.
-         * (The FIRST cell's decref counter was charged by the `kai_decref`
-         * that called us; the loop charges the counter for each tail cell
-         * it consumes here, so the total stays byte-identical to the
-         * recursive version.) */
-        KAI_CTR_INC(kai_rc_decref_total);
+/* An atomic cell's decrement; 1 when it was the last owner. The release
+ * orders this thread's writes to the cell before the drop; the last owner's
+ * acquire makes every other owner's writes visible before the free. TSAN
+ * does not model a standalone fence, so its build folds both into the
+ * fetch_sub. */
+static __attribute__((noinline)) int kai_drop_atomic_hits_zero(KaiValue *v) {
+    KAI_CTR_INC(kai_rc_decref_total);
 #ifdef KAI_TRACE_RC
-        kai_rc_history_log(tail, /* op=decref */ 2, tail->tag);
+    kai_rc_history_log(v, /* op=decref */ 2, v->tag);
 #endif
-        tail->rc = 0;
-        v = tail;                           /* loop, no stack growth */
-    }
+#if defined(KAI_TSAN_FIBERS)
+    int32_t old = atomic_fetch_sub_explicit((_Atomic int32_t *) &v->rc, 1,
+                                            memory_order_acq_rel);
+#else
+    int32_t old = atomic_fetch_sub_explicit((_Atomic int32_t *) &v->rc, 1,
+                                            memory_order_release);
+#endif
+    if (old != KAI_RC_SPECIAL + 1) return 0;
+#if !defined(KAI_TSAN_FIBERS)
+    atomic_thread_fence(memory_order_acquire);
+#endif
+    atomic_store_explicit((_Atomic int32_t *) &v->rc, 0, memory_order_relaxed);
+    return 1;
 }
 
-/* Iterative unique-variant tree free — the tree analogue of
- * kai_free_cons_spine. Entered from kai_free_value's KAI_VARIANT case
- * only once a unique (rc==1) variant child (`first`) is found: `v` has
- * rc 0 and its slots below `next_slot` already released. A unique
- * variant child transfers ownership to the walk (rc set to 0, no
- * decref — that per-node decrement is the traffic this path deletes)
- * through a worklist bounded by tree depth; immediate, shared,
- * saturated, primitive, and non-variant slots cascade through
- * kai_decref, and a full worklist falls back to kai_decref's recursive
- * path. Out of line on purpose: the worklist frame (and its stack
- * guard) must not tax the common shared-children free. Each block
- * frees whole via KAI_RECYCLE_CELL, exactly once per cell. */
-#define KAI_VARIANT_SPINE_CAP 128
-static KAI_RC_NOINLINE void kai_free_variant_spine(KaiValue *v, int next_slot,
-                                                   KaiValue *first) {
-    KaiValue *pending[KAI_VARIANT_SPINE_CAP];
-    int n_pending = 0;
-    first->rc = 0;
-    pending[n_pending++] = first;
-    for (;;) {
-        uint32_t mask = kai_slot_mask_of(v->variant_tag);
-        int n_args = v->var_n_args;
-        for (int i = next_slot; i < n_args; ++i) {
-            if (mask != 0 && kai_var_slot_kind(mask, i) != KAI_VAR_SLOT_PTR) continue;
-            KaiValue *c = kai_var_slots(v)[i].ptr;
-            if (!kai_is_ptr(c)) continue;         /* immediate / null: no RC */
-            int32_t rc = kai_rc_load(c);
-            if (rc >= KAI_RC_SPECIAL) { kai_decref(c); continue; }
-            if (rc == 1) {
-                if (c->tag == (int32_t) KAI_VARIANT &&
-                    n_pending < KAI_VARIANT_SPINE_CAP) {
-                    c->rc = 0;
-                    pending[n_pending++] = c;
-                    continue;
-                }
-                kai_decref(c);                    /* unique non-variant: own free path */
-                continue;
-            }
-            /* Shared: kai_decref's rc>1 arm unfolded — one rc load, no
-             * re-checks. Must stay behaviourally identical to kai_decref. */
-            KAI_CTR_INC(kai_rc_decref_total);
+/* One reference dropped: 1 when the cell just reached rc 0 and must be
+ * freed. The counters and trace fire exactly as a decref's. */
+static inline int kai_drop_hits_zero(KaiValue *v) {
+    if (kai_is_value(v) || !v) return 0;
+    int32_t r = kai_rc_load(v);
+    if (r >= KAI_RC_SPECIAL) return r != INT32_MAX && kai_drop_atomic_hits_zero(v);
+    KAI_CTR_INC(kai_rc_decref_total);
 #ifdef KAI_TRACE_RC
-            kai_rc_history_log(c, /* op=decref */ 2, c->tag);
+    kai_rc_history_log(v, /* op=decref */ 2, v->tag);
 #endif
-            c->rc = rc - 1;
-        }
-        KAI_RECYCLE_CELL(v);
-        if (n_pending == 0) return;
-        v = pending[--n_pending];
-        next_slot = 0;
-    }
+    v->rc = r - 1;
+    return r == 1;
 }
 
-static void kai_free_value(KaiValue *v) {
+/* A free reclaims a cell's children by recursion up to KAI_FREE_DEPTH
+ * levels, as deep as a shallow structure ever needs, and below that drains
+ * the rest through this stack of pending cells instead of recursing: a
+ * structure of any depth takes bounded C stack. Thread-local, never a local
+ * array: a free runs at the deepest point of whatever dropped the last
+ * reference, often on a 64 KiB fiber stack, and must not add to it. Past
+ * the inline buffer the pending cells spill to the heap until the drain
+ * finishes. A free never switches context, so the thread cannot change
+ * under it. */
+#define KAI_FREE_DEPTH 16
+#define KAI_FREE_STACK_LOCAL 64
+typedef struct {
+    KaiValue **items;
+    int n, cap, active;
+    KaiValue *local[KAI_FREE_STACK_LOCAL];
+} KaiFreeStack;
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiFreeStack kai_free_stack;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiFreeStack kai_free_stack;
+#  endif
+#else
+static KAI_TLS KaiFreeStack kai_free_stack;
+#endif
+
+static KAI_RC_NOINLINE void kai_free_stack_grow(KaiFreeStack *st) {
+    int cap = st->cap * 2;
+    KaiValue **grown = (KaiValue **) malloc(sizeof(KaiValue *) * (size_t) cap);
+    if (!grown) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    memcpy(grown, st->items, sizeof(KaiValue *) * (size_t) st->n);
+    if (st->items != st->local) free(st->items);
+    st->items = grown;
+    st->cap = cap;
+}
+
+static inline void kai_free_stack_push(KaiFreeStack *st, KaiValue *v) {
+    if (st->n == st->cap) kai_free_stack_grow(st);
+    st->items[st->n++] = v;
+}
+
+static void kai_free_rec(KaiValue *v, int depth);
+static void kai_free_drain(KaiValue *v);
+
+/* Reclaim a child that just reached rc 0: onto the stack while draining,
+ * by recursion while the depth budget lasts, else through a fresh drain. */
+static inline __attribute__((always_inline))
+void kai_free_child(KaiValue *c, int depth, KaiFreeStack *st) {
+    if (st) kai_free_stack_push(st, c);
+    else if (depth < KAI_FREE_DEPTH) kai_free_rec(c, depth + 1);
+    else kai_free_drain(c);
+}
+
+static inline void kai_drop_child(KaiValue *c, int depth, KaiFreeStack *st) {
+    if (!kai_drop_hits_zero(c)) return;
+#ifdef KAI_PROFILE_RC
+    kai_prof_decref_to_zero_n++;
+#endif
+    kai_free_child(c, depth, st);
+}
+
+/* One body for both modes; each wrapper inlines it with `st` fixed, so the
+ * recursive mode never tests for a stack. */
+static inline __attribute__((always_inline))
+void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
+  for (;;) {
+    KaiValue *next = NULL;
     KAI_PROF_ENTER();
     switch ((KaiTag) v->tag) {
         case KAI_STR:
             free(v->as.s.bytes);
             break;
         case KAI_CONS:
-            /* Issue #817 — iterative spine free; reclaims v and the whole
-             * unique tail spine, then returns (it already ran the recycle
-             * + counters for v, so we must NOT fall to the post-switch
-             * tail — that would double-free v). */
-            kai_free_cons_spine(v);
-            KAI_PROF_EXIT(free);
-            return;
+            /* A unique tail continues this loop at the same depth, so a
+             * list of any length frees in O(1) stack. */
+            kai_drop_child(v->as.cons.head, depth, st);
+            if (kai_drop_hits_zero(v->as.cons.tail)) next = v->as.cons.tail;
+            break;
         case KAI_RECORD:
-            for (int i = 0; i < v->as.rec.n_fields; ++i) kai_decref(v->as.rec.fields[i]);
+            for (int i = 0; i < v->as.rec.n_fields; ++i) kai_drop_child(v->as.rec.fields[i], depth, st);
             free(v->as.rec.fields);
             free((void *) v->as.rec.names);
             break;
         case KAI_VARIANT: {
             /* Only pointer slots carry RC (mask kind PTR; mask==0 means
              * all-PTR; the mask lookup is hoisted — the tag is fixed
-             * across the loop). A unique variant child hands the whole
-             * subtree to the iterative walk, which recycles v and
-             * returns — must NOT fall to the post-switch tail (that
-             * would double-free v). Shared children take kai_decref's
-             * rc>1 arm unfolded: one rc load, no re-checks. FAM payload
-             * slots are inline in this block — the whole block returns
-             * to the per-arity variant pool at the recycle step. */
+             * across the loop). A unique variant child transfers to the
+             * free stack with no decrement: it is the per-node traffic of
+             * a tree free. Every other slot drops as a decref would. FAM
+             * payload slots are inline in this block — the whole block
+             * returns to the per-arity variant pool at the recycle step. */
             uint32_t fmask = kai_slot_mask_of(v->variant_tag);
             int fn_args = v->var_n_args;
             for (int i = 0; i < fn_args; ++i) {
                 if (fmask != 0 && kai_var_slot_kind(fmask, i) != KAI_VAR_SLOT_PTR) continue;
                 KaiValue *c = kai_var_slots(v)[i].ptr;
-                if (!kai_is_ptr(c)) continue;
-                int32_t crc = kai_rc_load(c);
-                if (crc >= KAI_RC_SPECIAL) { kai_decref(c); continue; }
-                if (crc == 1) {
-                    if (c->tag == (int32_t) KAI_VARIANT) {
-                        kai_free_variant_spine(v, i + 1, c);
-                        KAI_PROF_EXIT(free);
-                        return;
-                    }
-                    kai_decref(c);
-                    continue;
+                if (kai_is_ptr(c) && kai_rc_load(c) == 1 && c->tag == (int32_t) KAI_VARIANT) {
+                    c->rc = 0;
+                    kai_free_child(c, depth, st);
+                } else {
+                    kai_drop_child(c, depth, st);
                 }
-                KAI_CTR_INC(kai_rc_decref_total);
-#ifdef KAI_TRACE_RC
-                kai_rc_history_log(c, /* op=decref */ 2, c->tag);
-#endif
-                c->rc = crc - 1;
             }
         }
             break;
         case KAI_CLOSURE:
-            for (int i = 0; i < v->as.clo.n_captures; ++i) kai_decref(v->as.clo.captures[i]);
+            for (int i = 0; i < v->as.clo.n_captures; ++i) kai_drop_child(v->as.clo.captures[i], depth, st);
             free(v->as.clo.captures);
             break;
         case KAI_ARRAY:
-            for (int64_t i = 0; i < v->as.arr.len; ++i) kai_decref(v->as.arr.items[i]);
+            for (int64_t i = 0; i < v->as.arr.len; ++i) kai_drop_child(v->as.arr.items[i], depth, st);
             free(v->as.arr.items);
             break;
         case KAI_VEC: {
             /* A view owns nothing but its ref on the owner: release it
              * and stop — elements and block belong to the owner. */
             if (v->as.vec.view_of) {
-                kai_decref(v->as.vec.view_of);
+                kai_drop_child(v->as.vec.view_of, depth, st);
                 break;
             }
             /* Only boxed elements carry RC; raw / inline-record elements
@@ -4705,19 +4701,19 @@ static void kai_free_value(KaiValue *v) {
              * the elements are ONE allocation (see kai_vec_meta). */
             if (kai_vec_meta(v)->ekind == KAI_VEC_EK_BOXED) {
                 KaiValue **items = (KaiValue **) kai_vec_elems(v);
-                for (int64_t i = 0; i < v->as.vec.len; ++i) kai_decref(items[i]);
+                for (int64_t i = 0; i < v->as.vec.len; ++i) kai_drop_child(items[i], depth, st);
             }
             free(v->as.vec.data);
             break;
         }
         case KAI_REF:
             /* A Ref owns one strong reference to its cell. */
-            kai_decref(v->as.ref.cell);
+            kai_drop_child(v->as.ref.cell, depth, st);
             break;
         case KAI_FIBER:
             if (v->as.fib) {
-                kai_decref(v->as.fib->thunk);
-                kai_decref(v->as.fib->result);
+                kai_drop_child(v->as.fib->thunk, depth, st);
+                kai_drop_child(v->as.fib->result, depth, st);
                 /* Phase 5: free any remaining link nodes. Normally
                  * the trampoline's kai_link_propagate_terminate
                  * empties this chain; the safety net here covers
@@ -4742,7 +4738,7 @@ static void kai_free_value(KaiValue *v) {
                     KaiMonitorNode *mn = v->as.fib->monitor_head;
                     while (mn) {
                         KaiMonitorNode *next = mn->next;
-                        if (mn->target_pid) kai_decref(mn->target_pid);
+                        if (mn->target_pid) kai_drop_child(mn->target_pid, depth, st);
                         free(mn);
                         mn = next;
                     }
@@ -4789,11 +4785,38 @@ static void kai_free_value(KaiValue *v) {
             break;
         default: break;
     }
-    /* Issue #817 — recycle this cell (trace+poison+pool+counters). The
-     * same path kai_free_cons_spine uses per spine cell. */
+    /* Recycle this cell (trace+poison+pool+counters). */
     KAI_RECYCLE_CELL(v);
     KAI_PROF_EXIT(free);
+    if (!next) return;
+#ifdef KAI_PROFILE_RC
+    kai_prof_decref_to_zero_n++;
+#endif
+    v = next;
+  }
 }
+
+/* noinline: the free stack's address stays inside this activation, which
+ * never switches context, so it cannot be cached across a park. */
+__attribute__((noinline))
+static void kai_free_drain(KaiValue *v) {
+    KaiFreeStack *st = &kai_free_stack;
+    if (st->active) { kai_free_stack_push(st, v); return; }
+    if (!st->items) { st->items = st->local; st->cap = KAI_FREE_STACK_LOCAL; }
+    st->active = 1;
+    st->items[st->n++] = v;
+    while (st->n > 0) kai_free_one(st->items[--st->n], 0, st);
+    st->active = 0;
+    if (st->items != st->local) {
+        free(st->items);
+        st->items = st->local;
+        st->cap = KAI_FREE_STACK_LOCAL;
+    }
+}
+
+static void kai_free_rec(KaiValue *v, int depth) { kai_free_one(v, depth, NULL); }
+
+static void kai_free_value(KaiValue *v) { kai_free_rec(v, 0); }
 
 /* Out-of-line drop-to-zero path: the cell reached rc==0, reclaim it.
  * Split out of kai_decref so the common case (decrement, still live)
@@ -4817,44 +4840,8 @@ static void kai_decref_free(KaiValue *v) {
  * every drop). Under tracing the counters still fire for full fidelity.
  * KAI_PROF_ENTER/EXIT dropped from the hot path: they bracket a cold
  * helper now, and the inline body must stay small to be inlined. */
-/* An atomic cell's decrement. The release orders this thread's writes to
- * the cell before the drop; the last owner's acquire makes every other
- * owner's writes visible before the free. TSAN does not model a standalone
- * fence, so its build folds both into the fetch_sub. */
-static __attribute__((noinline)) void kai_decref_atomic(KaiValue *v) {
-    KAI_CTR_INC(kai_rc_decref_total);
-#ifdef KAI_TRACE_RC
-    kai_rc_history_log(v, /* op=decref */ 2, v->tag);
-#endif
-#if defined(KAI_TSAN_FIBERS)
-    int32_t old = atomic_fetch_sub_explicit((_Atomic int32_t *) &v->rc, 1,
-                                            memory_order_acq_rel);
-#else
-    int32_t old = atomic_fetch_sub_explicit((_Atomic int32_t *) &v->rc, 1,
-                                            memory_order_release);
-#endif
-    if (old != KAI_RC_SPECIAL + 1) return;
-#if !defined(KAI_TSAN_FIBERS)
-    atomic_thread_fence(memory_order_acquire);
-#endif
-    atomic_store_explicit((_Atomic int32_t *) &v->rc, 0, memory_order_relaxed);
-    kai_decref_free(v);
-}
-
 static inline void kai_decref(KaiValue *v) {
-    if (kai_is_value(v) || !v) return;
-    int32_t r = kai_rc_load(v);
-    if (r >= KAI_RC_SPECIAL) {
-        if (r != INT32_MAX) kai_decref_atomic(v);
-        return;
-    }
-    /* #812 — always-compiled counter (see kai_incref). */
-    KAI_CTR_INC(kai_rc_decref_total);
-#ifdef KAI_TRACE_RC
-    kai_rc_history_log(v, /* op=decref */ 2, v->tag);
-#endif
-    v->rc = r - 1;
-    if (r == 1) kai_decref_free(v);
+    if (kai_drop_hits_zero(v)) kai_decref_free(v);
 }
 
 /* m5 #4 — Perceus dup/drop wrappers callable as KaiValue-returning fns.
@@ -6572,7 +6559,7 @@ __attribute__((always_inline)) static inline KaiValue *kai_variant_reuse_at(KaiV
          * (the wildcard-slot rebuild `MErr(_, _) -> MVal(99, [1])`). An
          * aliased slot is a kept child moved in place — its bookkeeping
          * already balanced, same guard as kai_reuse_or_alloc_variant.
-         * Slot-kind decode mirrors kai_free_variant_spine: mask 0 means
+         * Slot-kind decode mirrors kai_free_one: mask 0 means
          * all-pointer, else 2 bits per slot. */
         uint32_t donor_mask = kai_slot_mask_of(_scr->variant_tag);
         for (int i = 0; i < n; ++i) {
