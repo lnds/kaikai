@@ -24,6 +24,13 @@
 #     examples/negative/<category>/<name>/lib.kai        (or any siblings)
 #     examples/negative/<category>/<name>/main.err.expected
 #
+#   User-cache variant (any kaic2 fixture):
+#     <stem>.user-cache                                  (empty marker)
+#   The fixture also runs with `--user-cache` against a private cache,
+#   cold then warm. Each run must reject with an ordinary exit code and
+#   the same stderr as the run without the cache. Markers are also picked
+#   up under examples/namespace-collisions/.
+#
 # Single-file fixtures whose `.err.expected` ends in `.kaic1.err.expected`
 # are routed to stage1/kaic1 instead — used to assert clean stage 1
 # rejection of stage-2-only features (e.g. protocol impls).
@@ -143,12 +150,42 @@ run_one() {
   fi
 
   if grep -qF "$needle" "$errfile"; then
-    echo "PASS $rel"
+    if [ -f "$dir/$stem.user-cache" ]; then
+      run_user_cache "$rel" "$src" "$errfile" "$extra_flags"
+    else
+      echo "PASS $rel"
+    fi
   else
     echo "MISS $rel — diagnostic mismatch"
     echo "  want: $needle"
     echo "  got : $(head -1 "$errfile")"
   fi
+}
+
+# run_user_cache: the parse cache sits in front of the resolver, so a
+# rejection it fails to reproduce (a crash, a different diagnostic) is
+# invisible to the plain run.
+run_user_cache() {
+  rel="$1"; src="$2"; plain="$3"; flags="$4"
+  ucdir="$plain.ucache"
+  mkdir -p "$ucdir"
+  for pass in cold warm; do
+    ucerr="$plain.$pass"
+    rc=0
+    # shellcheck disable=SC2086 — flags is intentionally word-split.
+    "$KAIC2" $flags --user-cache --user-cache-dir "$ucdir" "$src" > /dev/null 2> "$ucerr" || rc=$?
+    if [ "$rc" -eq 0 ] || [ "$rc" -gt 127 ]; then
+      echo "MISS $rel — --user-cache ($pass) exit $rc"
+      echo "  got : $(head -1 "$ucerr")"
+      return
+    fi
+    if ! cmp -s "$plain" "$ucerr"; then
+      echo "MISS $rel — --user-cache ($pass) stderr differs from the uncached run"
+      echo "  got : $(head -1 "$ucerr")"
+      return
+    fi
+  done
+  echo "PASS $rel (+user-cache)"
 }
 
 # run_one_runtime: typer-accepts-but-runtime-rejects fixtures. Compile
@@ -227,9 +264,12 @@ results="$tmp/results"
 # the language has not yet closed. Find every compile-time + runtime
 # golden, fan out over xargs -P. Each worker prints its own lines; the
 # null-delimited find + xargs -0 keeps paths with spaces intact.
-find "$ROOT/examples/negative" \
-  \( -name '*.err.expected' -o -name '*.diag.expected' -o -name '*.run.err.expected' \) \
-  -not -path '*/silent_contract/*' -print0 2>/dev/null \
+{ find "$ROOT/examples/negative" \
+    \( -name '*.err.expected' -o -name '*.diag.expected' -o -name '*.run.err.expected' \) \
+    -not -path '*/silent_contract/*' -print0 2>/dev/null
+  find "$ROOT/examples/namespace-collisions" -name '*.user-cache' 2>/dev/null \
+    | sed 's/\.user-cache$/.err.expected/' | tr '\n' '\0'
+} \
   | sort -z \
   | xargs -0 -P "$JOBS" -n1 "$self" __worker "$tmp" \
   > "$results"
