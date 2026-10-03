@@ -249,6 +249,15 @@ produced a wrong "this works" verdict on a program that was corrupt:
 - **Reading output by eye.** Both cases above were reported as passing
   because the output "looked right" in a terminal.
 
+- **A deterministic selfhost.** `stage2/kaic2` is linked from C that
+  this tree's own codegen emitted (the boot takes two hops), so a
+  Perceus or emit change also compiles the compiler. `kaic2b.c ==
+  kaic2c.c` holds just as well for a compiler that miscompiles itself
+  the same way every time: a skip-set change once freed a param inside
+  the native lowering and the selfhost stayed byte-identical, while
+  native programs printed wrong values. Only running golden-diffed
+  fixtures through the built `kaic2`, on both backends, shows it.
+
 What to use instead:
 
 - Compare the **value** against the expected bytes — `diff` against a
