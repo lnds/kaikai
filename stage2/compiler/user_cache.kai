@@ -369,3 +369,73 @@ pub fn uc_write(cache_dir: String, content_hex: String, dep_hex: String,
   let blob = cache_serialize_module(decls, uc_header_sha(content_hex, dep_hex))
   cache_publish_bytes(uc_blob_path(cache_dir, content_hex, dep_hex), blob)
 }
+
+# ---- source inputs of a compile ------------------------------------------
+
+#[doc("""
+The sources the import closure of `root_path` reads besides the root, as
+absolute paths in discovery order. A file that does not exist is listed
+with a leading `-`, so its later appearance changes the list. Each
+source's own imports are kept in `memo_dir` by content (none when empty),
+so a closure shared by many roots is scanned once.
+""")]
+pub fn uc_input_files(root_path: String, src: String, search_paths: [String],
+                      memo_dir: String) : [String] / Console + File = {
+  let w = UIW(search_paths, memo_dir)
+  let st0 = UIF([abspath(root_path)], [])
+  match uif_imports(w, dir_of(root_path), uif_imports_of(w, src), st0) {
+    UIF(_, out) -> list_reverse(out)
+  }
+}
+
+#[doc("The `cores` and the closure of their imports, listed as `uc_input_files` lists a root's.")]
+pub fn uc_core_input_files(cores: [String], search_paths: [String]) : [String] / Console + File =
+  match uif_files(UIW(search_paths, ""), cores, UIF([], [])) { UIF(_, out) -> list_reverse(out) }
+
+# Where the walk resolves imports, and where it keeps each source's own.
+type UifWalk = UIW([String], String)
+
+# Files already met, and the listing so far, newest first.
+type UifState = UIF([String], [String])
+
+fn uif_imports(w: UifWalk, base: String, mods: [String], st: UifState) : UifState / Console + File =
+  match w { UIW(sp, _) -> match mods {
+    [] -> st
+    [m, ...rest] -> uif_imports(w, base, rest, match find_module_file(base, m, sp) {
+      CF(raw, opt_src) -> uif_visit(w, abspath(raw), opt_src, st)
+    })
+  } }
+
+fn uif_files(w: UifWalk, paths: [String], st: UifState) : UifState / Console + File = match paths {
+  [] -> st
+  [p, ...rest] -> {
+    let opt_src = match read_file(p) { Ok(s) -> Some(s)  Err(_) -> None }
+    uif_files(w, rest, uif_visit(w, abspath(p), opt_src, st))
+  }
+}
+
+fn uif_visit(w: UifWalk, abs: String, opt_src: Option[String], st: UifState) : UifState / Console + File =
+  match st {
+    UIF(seen, out) -> if list_has(seen, abs) { st } else { match opt_src {
+      None    -> UIF([abs, ...seen], [cat2("-", abs), ...out])
+      Some(s) -> uif_imports(w, dir_of(abs), uif_imports_of(w, s), UIF([abs, ...seen], [abs, ...out]))
+    } }
+  }
+
+# A source's imports, from the memo when a scan of the same content left
+# one. An entry ends with a `.` line, so a truncated one reads as a miss.
+fn uif_imports_of(w: UifWalk, src: String) : [String] / Console + File = match w {
+  UIW(_, "") -> uc_import_paths(src, tokenize(src))
+  UIW(_, dir) -> {
+    let f = concat_all([dir, "/", uc_content_hex(src), "-", int_to_string(string_length(src))])
+    match read_file(f) {
+      Ok(text) if string_length(text) >= 2 and string_slice(text, string_length(text) - 2, 2) == "\n." ->
+        filter(string_split(string_slice(text, 0, string_length(text) - 2), "\n"), (l) => l != "")
+      _ -> {
+        let found = uc_import_paths(src, tokenize(src))
+        cache_publish(f, concat_all([string_join(found, "\n"), "\n."]))
+        found
+      }
+    }
+  }
+}

@@ -1,0 +1,193 @@
+#[doc("""
+A package's per-file checks, memoised by everything they read.
+
+A check's diagnostics and status are a function of its inputs: the
+compiler binary, its arguments, the entry's source, every other source
+the compile reads (the import closure and the core modules, by path and
+content) and the `KAI` environment the compiler sees. A memo entry under
+the package's user cache replays them byte for byte.
+
+`KAI_GUARD_MEMO=0` turns the memo off; `KAI_GUARD_MEMO=shadow` also runs
+the check on every hit and fails the run on any difference.
+""")]
+
+import os.env
+import cli_fs
+import cli_plan
+import cli_proc
+import cli_sys
+
+#[doc("The variable a parent run sets to the compiler binary's digest, so its children need not hash it again.")]
+pub const TOOLCHAIN_ENV : String = "KAI_GUARD_TOOLCHAIN"
+
+#[doc("The variable a parent run sets to the digest of the core modules and their imports, which every check of the run reads alike.")]
+pub const CORE_ENV : String = "KAI_GUARD_CORE"
+
+const FORMAT : String = "kai-guard-memo 2"
+
+#[doc("""
+Run the check `argv`, whose last element is the entry the user knows as
+`shown`, leaving its stderr in `err` with the entry renamed to `shown`:
+from its memo entry on a hit, by running it otherwise. Returns its status.
+""")]
+pub fn guarded(argv: [String], shown: String, err: String) : Int / Env + File + Ffi {
+  let mode = env.get("KAI_GUARD_MEMO").unwrap_or("")
+  let dir = memo_dir(argv)
+  if mode == "0" or dir == "" {
+    fresh(argv, shown, err)
+  } else {
+    match key_of(argv, shown, err) {
+      None -> fresh(argv, shown, err)
+      Some(key) -> memoised(mode, "#{dir}/#{key}", argv, shown, err)
+    }
+  }
+}
+
+#[doc("The digest of the compiler binary at `kaic2`, as 64 hex digits.")]
+pub fn toolchain_digest(kaic2: String) : String / Ffi {
+  cli_sys.sha_reset()
+  let _ = cli_sys.sha_file(kaic2)
+  cli_sys.sha_hex()
+}
+
+#[doc("The digest of the core modules `kaic2` loads and their import closure, by path and content.")]
+pub fn core_digest(kaic2: String, scratch: String) : String / File + Ffi {
+  let listing = cli_proc.capture(
+    [kaic2, "--guard-core-inputs"],
+    cli_plan.kaic2_spawn([], "", "/dev/null"),
+    "#{scratch}/core-inputs"
+  )
+  cli_sys.sha_reset()
+  field(int_to_string(listing.fst))
+  lines(listing.snd) |> foreach(l => feed_input(l))
+  cli_sys.sha_hex()
+}
+
+fn memoised(mode: String, entry: String, argv: [String], shown: String, err: String) : Int / Env + File + Ffi =
+  match load(entry) {
+    None -> {
+      let rc = fresh(argv, shown, err)
+      store(entry, rc, err)
+      rc
+    }
+    Some(hit) -> if mode == "shadow" {
+      shadow(hit, fresh(argv, shown, err), shown, err)
+    } else {
+      let _ = write_file(err, hit.snd)
+      hit.fst
+    }
+  }
+
+fn fresh(argv: [String], shown: String, err: String) : Int / File + Ffi {
+  let rc = cli_proc.run(argv, cli_plan.kaic2_spawn([], "/dev/null", err))
+  let entry = list.last(argv).unwrap_or(shown)
+  if entry != shown { cli_plan.rewrite_paths(err, entry, shown) }
+  rc
+}
+
+fn shadow(hit: (Int, String), rc: Int, shown: String, err: String) : Int / File + Ffi =
+  if hit.fst == rc and hit.snd == cli_fs.read_or_empty(err) {
+    rc
+  } else {
+    let _ = write_file(err, "#{cli_fs.read_or_empty(err)}kai: guard memo differs from the check of #{shown} (memo status #{hit.fst}, check status #{rc})\n")
+    if rc == 0 { 1 } else { rc }
+  }
+
+# The memo lives beside the parse cache of the package the check runs in.
+fn memo_dir(argv: [String]) : String =
+  match argv {
+    [] -> ""
+    ["--user-cache-dir", d, ..._] -> "#{d}/guards"
+    [_, ...rest] -> memo_dir(rest)
+  }
+
+# A status from a signal (a crash, a kill under memory pressure) is not
+# the check's verdict, so it is never recorded.
+fn store(entry: String, rc: Int, err: String) : Unit / File + Ffi =
+  if rc >= 0 and rc < 128 and cli_sys.pending_signal() == 0 {
+    let _ = cli_fs.mkdir_p(cli_fs.dirname(entry))
+    let part = "#{entry}.#{cli_sys.getpid()}.part"
+    let text = cli_fs.read_or_empty(err)
+    match write_file(part, "#{FORMAT}\n#{rc}\n#{string_length(text)}\n#{text}") {
+      Ok(_) -> {
+        let _ = file_rename(part, entry)
+      }
+      Err(_) -> ()
+    }
+  }
+
+# An entry that does not parse, or whose stderr is not the length it
+# records, is a miss.
+fn load(entry: String) : Option[(Int, String)] / File =
+  match read_file(entry) {
+    Err(_) -> None
+    Ok(s) -> match line_off(s) {
+      Some(h) if h.fst == FORMAT -> status_and_text(h.snd)
+      _ -> None
+    }
+  }
+
+fn status_and_text(s: String) : Option[(Int, String)] =
+  match line_off(s) {
+    None -> None
+    Some(r) -> match line_off(r.snd) {
+      None -> None
+      Some(n) -> match (string.to_int(r.fst), string.to_int(n.fst)) {
+        (Some(rc), Some(len)) if len == string_length(n.snd) -> Some((rc, n.snd))
+        _ -> None
+      }
+    }
+  }
+
+# The first line of `s` and what follows it.
+fn line_off(s: String) : Option[(String, String)] =
+  string.index_of(s, "\n").map(i => (string_slice(s, 0, i), string_slice(s, i + 1, string_length(s) - i - 1)))
+
+fn key_of(argv: [String], shown: String, err: String) : Option[String] / Env + File + Ffi {
+  let entry = list.last(argv).unwrap_or("")
+  let flags = list.take(argv, list.length(argv) - 1)
+  let listing = cli_proc.capture(
+    flags ++ ["--guard-inputs", entry],
+    cli_plan.kaic2_spawn([], "", "/dev/null"),
+    "#{err}.inputs"
+  )
+  if listing.fst != 0 {
+    None
+  } else {
+    let kaic2 = list.head(argv).unwrap_or("")
+    let tool = match env.get(TOOLCHAIN_ENV) { Some(d) -> d  None -> toolchain_digest(kaic2) }
+    let core = match env.get(CORE_ENV) { Some(d) -> d  None -> core_digest(kaic2, cli_fs.dirname(err)) }
+    cli_sys.sha_reset()
+    cli_sys.sha_str("#{FORMAT}\n#{tool}\n#{core}\n")
+    argv |> foreach(a => field(if a == entry { shown } else { a }))
+    feed_file("<entry>", entry)
+    lines(listing.snd) |> foreach(l => feed_input(l))
+    kai_env() |> foreach(v => field(v))
+    Some(cli_sys.sha_hex())
+  }
+}
+
+fn lines(s: String) : [String] = string.split(s, "\n") |? (l => l != "")
+
+fn feed_input(line: String) : Unit / Ffi =
+  if string.starts_with(line, "-") { field("missing #{line}") } else { feed_file(line, line) }
+
+# Every field is length-prefixed, so no two splits of the same bytes digest alike.
+fn field(s: String) : Unit / Ffi = cli_sys.sha_str("#{string_length(s)}:#{s}")
+
+fn feed_file(label: String, file: String) : Unit / Ffi {
+  field(label)
+  field(int_to_string(cli_sys.size(file)))
+  let _ = cli_sys.sha_file(file)
+}
+
+# The compiler reads `KAI*` variables. `KAI_TEST_*` belong to the test
+# binaries and the runner and carry per-run paths; `KAI_GUARD_*` steer
+# this memo, and the binary's digest is keyed on its own.
+fn kai_env() : [String] / Env =
+  env.entries()
+    |? (p => string.starts_with(p.fst, "KAI")
+      and (not string.starts_with(p.fst, "KAI_TEST_"))
+      and (not string.starts_with(p.fst, "KAI_GUARD_")))
+    | (p => "#{p.fst}=#{p.snd}")
+    |> list.sort
