@@ -636,13 +636,8 @@ fn decode_char(span: String) : Char {
 # ====================================================================
 #
 # These are implemented below. Listed here as a reading aid.
-#  parse_expr   -> parse_pipe
-#  parse_pipe   -> parse_or ("|>" parse_or)*
-#  parse_or     -> parse_and ("or" parse_and)*
-#  parse_and    -> parse_cmp ("and" parse_cmp)*
-#  parse_cmp    -> parse_add (cmpop parse_add)?        (no chains)
-#  parse_add    -> parse_mul ([+-] parse_mul)*
-#  parse_mul    -> parse_unary ([*/%] parse_unary)*
+#  parse_expr   -> parse_bin at the pipe level
+#  parse_bin    -> parse_unary (binop parse_unary)*   (one loop for every level, see `bin_level`)
 #  parse_unary  -> ("-" | "not")? parse_postfix
 #  parse_postfix-> parse_primary (call | field | index)*
 #  parse_primary-> literal | ident | "(" expr ")" | if | match | block | record | list | lambda
@@ -695,7 +690,7 @@ fn err_el(p: Parser) : PEL = PEL { p: p, r: None }
 fn parse_expr(p: Parser) : PExpr / Console {
   if p.depth >= nest_max() { err_e(p_too_deep(p)) }
   else {
-    let r = parse_pipe(p_at_depth(p, p.depth + 1))
+    let r = parse_bin(p_at_depth(p, p.depth + 1), bin_pipe())
     PExpr { p: p_at_depth(r.p, p.depth), r: r.r }
   }
 }
@@ -714,15 +709,6 @@ pub fn parse_interp_expr(src: String) : Option[Expr] / Console {
 # The pseudo-file every interpolation sub-parse runs under. Diagnostics
 # from that parse are suppressed: the span belongs to no user file.
 pub fn interp_parse_file() : String = "<interp>"
-
-fn parse_pipe(p: Parser) : PExpr / Console {
-
-  let r = parse_or(p)
-  match r.r {
-    None -> r
-    Some(lhs) -> parse_pipe_rest(r.p, lhs)
-  }
-}
 
 # Outcome of a pipeline placeholder substitution attempt.
 # `PPRPassthrough` keeps the legacy first-arg behaviour. The other
@@ -1041,304 +1027,129 @@ fn desugar_placeholder_arg(arg: Expr) : Expr {
 fn desugar_placeholder_args(args_: [Expr]) : [Expr] =
   map(args_, desugar_placeholder_arg)
 
-fn parse_pipe_rest(p: Parser, lhs: Expr) : PExpr / Console {
+# Binary operators by precedence, loosest first: the four pipes, `or`,
+# `and`, the comparisons, `++`, additive, multiplicative. Every level is
+# left-associative except `++` (right) and the comparisons, which do not
+# chain: `a < b < c` is an error, not a chain. The `|` variant separator
+# in `type T = A | B` is parsed by `parse_sum_body`, not here.
+fn bin_pipe() : Int = 1
+fn bin_or() : Int = 2
+fn bin_cmp() : Int = 4
+fn bin_concat() : Int = 5
+fn bin_tightest() : Int = 7
 
-  # `|>` (apply), `|` (map), and `||` (flat-map) all sit at the lowest
-  # binop level, left-associative. The `|` variant separator in
-  # `type T = A | B` is parsed by `parse_sum_body`, not the expression
-  # grammar, so there is no ambiguity here.
-  #
-  # Pipe operators may also lead a continuation line. The peeked
-  # parser skips leading newlines so `xs\n  |> f\n  |> g` parses
-  # the same as `xs |>\n  f |>\n  g`. If the next non-newline token is
-  # NOT a pipe we return the ORIGINAL `p` — those newlines belong to
-  # the enclosing statement boundary, not the pipe chain.
-  #
-  # `|` and `||` are typed as `EMapPipe` / `EFlatMapPipe` AST nodes.
-  # The typer dispatches them against the head type of the LHS via the
-  # head-type-to-module map (see `head_type_module` and
-  # `synth_map_pipe` / `synth_flat_map_pipe`) and rewrites the node
-  # into a `<module>.map(xs, f)` / `<module>.flat_map(xs, f)` call.
-  # This lets `[T]` and any future container-shaped head type share
-  # one surface without a hardcoded receiver.
-  let p_look = p_skip_newlines(p)
-  if p_at(p_look, TkPipeApply) {
-    let t = p_peek(p_look)
-    let p1 = p_skip_newlines(p_advance(p_look))
-    let r = parse_or(p1)
-    match r.r {
-      None -> err_e(r.p)
-      Some(rhs) -> {
-        # Pipeline placeholder. If the rhs is a call whose
-        # arg list contains exactly one `_`, the apply pipe lands
-        # the lhs at that position instead of as the first arg.
-        # `let __pipe = lhs in f(args[_ := __pipe])` — the let
-        # binding ensures the lhs is evaluated once, even if it has
-        # side effects. The default-first-arg behaviour stays for
-        # calls with no `_`. Multiple `_` in the same call would
-        # silently duplicate side effects, so we reject them.
-        match try_pipe_placeholder(t.line, t.col, lhs, rhs, r.p) {
-          PPRError(p2)         -> err_e(p2)
-          PPRSubstituted(e, p2) -> parse_pipe_rest(p2, e)
-          PPRPassthrough       -> parse_pipe_rest(r.p, mk_expr(EPipe(lhs, rhs), t.line, t.col))
-        }
-      }
-    }
-  } else if p_at(p_look, TkPipe) {
-    let t = p_peek(p_look)
-    let p1 = p_skip_newlines(p_advance(p_look))
-    let r = parse_or(p1)
-    match r.r {
-      None -> err_e(r.p)
-      Some(rhs) -> parse_pipe_rest(r.p, mk_expr(EMapPipe(lhs, rhs), t.line, t.col))
-    }
-  } else if p_at(p_look, TkBarBar) {
-    let t = p_peek(p_look)
-    let p1 = p_skip_newlines(p_advance(p_look))
-    let r = parse_or(p1)
-    match r.r {
-      None -> err_e(r.p)
-      Some(rhs) -> parse_pipe_rest(r.p, mk_expr(EFlatMapPipe(lhs, rhs), t.line, t.col))
-    }
-  } else if p_at(p_look, TkPipeQuestion) {
-    let t = p_peek(p_look)
-    let p1 = p_skip_newlines(p_advance(p_look))
-    let r = parse_or(p1)
-    match r.r {
-      None -> err_e(r.p)
-      Some(rhs) -> parse_pipe_rest(r.p, mk_expr(EFilterPipe(lhs, rhs), t.line, t.col))
-    }
-  } else {
-    ok_e(p, lhs)
-  }
-}
+fn bin_level(k: TokKind) : Int =
+  if tk_is(k, TkPipeApply) or tk_is(k, TkPipe) or tk_is(k, TkBarBar) or tk_is(k, TkPipeQuestion) { 1 }
+  else if tk_is(k, TkOr) { 2 }
+  else if tk_is(k, TkAnd) { 3 }
+  else if is_cmp_tok(k) { 4 }
+  else if tk_is(k, TkPlusPlus) { 5 }
+  else if tk_is(k, TkPlus) or tk_is(k, TkMinus) { 6 }
+  else if tk_is(k, TkStar) or tk_is(k, TkSlash) or tk_is(k, TkPercent) { 7 }
+  else { 0 }
 
-fn parse_or(p: Parser) : PExpr / Console {
+# An operator may also lead a continuation line, unless it can start an
+# expression: `-` (unary minus) and `%` (`%{ }` / `%[ ]`) must end the
+# previous line instead.
+fn bin_leads_line(k: TokKind) : Bool =
+  not tk_is(k, TkMinus) and not tk_is(k, TkPercent)
 
-  let r = parse_and(p)
-  match r.r {
-    None -> r
-    Some(lhs) -> parse_or_rest(r.p, lhs)
-  }
-}
+# The operator after an operand, at a level in [lo, hi]: on the same line,
+# or leading the next non-blank one. Newlines that lead to anything else
+# belong to the enclosing statement, so the caller keeps its own parser.
+type BinOp = { p: Parser, tok: Token, level: Int }
 
-# Binary operators below the pipe level may also lead a continuation
-# line, same shape as `parse_pipe_rest`: peek past newlines and only
-# commit when the next token is the operator — otherwise parse from
-# the ORIGINAL parser, since those newlines belong to the enclosing
-# statement boundary. Only tokens that cannot start an expression are
-# eligible; `-` (unary prefix) and `%` (map/set literal opener) CAN,
-# so they never lead a continuation line.
-fn parse_or_rest(p: Parser, lhs: Expr) : PExpr / Console {
-
-  if p_at(p, TkOr) {
-    let t = p_peek(p)
-    let r = parse_and(p_skip_newlines(p_advance(p)))
-    match r.r {
-      None -> err_e(r.p)
-      Some(rhs) -> parse_or_rest(r.p, mk_expr(EBinop("or", lhs, rhs), t.line, t.col))
-    }
+fn bin_op_at(p: Parser, lo: Int, hi: Int) : Option[BinOp] = {
+  let t = p_peek(p)
+  let lv = bin_level(t.kind)
+  if lv > 0 {
+    if lv >= lo and lv <= hi { Some(BinOp { p: p, tok: t, level: lv }) } else { None }
   } else {
     let p_look = p_skip_newlines(p)
-    if p_at(p_look, TkOr) {
-      let t = p_peek(p_look)
-      let r = parse_and(p_skip_newlines(p_advance(p_look)))
-      match r.r {
-        None -> err_e(r.p)
-        Some(rhs) -> parse_or_rest(r.p, mk_expr(EBinop("or", lhs, rhs), t.line, t.col))
-      }
-    } else { ok_e(p, lhs) }
+    let t1 = p_peek(p_look)
+    let l1 = bin_level(t1.kind)
+    if l1 > 0 and l1 >= lo and l1 <= hi and bin_leads_line(t1.kind) {
+      Some(BinOp { p: p_look, tok: t1, level: l1 })
+    } else { None }
   }
 }
 
-fn parse_and(p: Parser) : PExpr / Console {
+# The loosest operator that may follow once `op` is combined: the same
+# level again for a left-associative one, strictly looser after a
+# comparison (no chaining) or after `++`, whose right operand already took
+# the rest of its chain.
+fn bin_ceiling(op: BinOp) : Int =
+  if op.level == bin_cmp() or op.level == bin_concat() { op.level - 1 } else { op.level }
 
-  let r = parse_cmp(p)
+fn parse_bin(p: Parser, lo: Int) : PExpr / Console {
+  let r = parse_unary(p)
   match r.r {
     None -> r
-    Some(lhs) -> parse_and_rest(r.p, lhs)
+    Some(lhs) -> parse_bin_rest(r.p, lhs, lo, bin_tightest())
   }
 }
 
-fn parse_and_rest(p: Parser, lhs: Expr) : PExpr / Console {
-
-  if p_at(p, TkAnd) {
-    let t = p_peek(p)
-    let r = parse_cmp(p_skip_newlines(p_advance(p)))
-    match r.r {
-      None -> err_e(r.p)
-      Some(rhs) -> parse_and_rest(r.p, mk_expr(EBinop("and", lhs, rhs), t.line, t.col))
-    }
-  } else {
-    let p_look = p_skip_newlines(p)
-    if p_at(p_look, TkAnd) {
-      let t = p_peek(p_look)
-      let r = parse_cmp(p_skip_newlines(p_advance(p_look)))
+fn parse_bin_rest(p: Parser, lhs: Expr, lo: Int, hi: Int) : PExpr / Console =
+  match bin_op_at(p, lo, hi) {
+    None -> ok_e(p, lhs)
+    Some(op) -> {
+      let r = parse_bin_step(op, lhs)
       match r.r {
-        None -> err_e(r.p)
-        Some(rhs) -> parse_and_rest(r.p, mk_expr(EBinop("and", lhs, rhs), t.line, t.col))
+        None -> r
+        Some(e) -> parse_bin_rest(r.p, e, lo, bin_ceiling(op))
       }
-    } else { ok_e(p, lhs) }
+    }
+  }
+
+fn parse_bin_step(op: BinOp, lhs: Expr) : PExpr / Console = {
+  let t = op.tok
+  let rhs_lo = if op.level == bin_concat() { op.level } else { op.level + 1 }
+  let r = parse_bin(p_skip_newlines(p_advance(op.p)), rhs_lo)
+  match r.r {
+    None -> err_e(r.p)
+    Some(rhs) ->
+      if op.level == bin_pipe() { bin_pipe_node(r.p, t, lhs, rhs) }
+      else if op.level == bin_cmp() { bin_cmp_node(r.p, t, lhs, rhs) }
+      else { ok_e(r.p, mk_expr(EBinop(op_of_tok(t.kind), lhs, rhs), t.line, t.col)) }
   }
 }
+
+# `|>` (apply), `|` (map), `||` (flat-map) and `|?` (filter). The typer
+# rewrites the map-like three against the head type of the left side.
+fn bin_pipe_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
+  if tk_is(t.kind, TkPipeApply) {
+    # A `_` in the call's arguments receives the left side instead of the
+    # first argument; `try_pipe_placeholder` evaluates it once.
+    match try_pipe_placeholder(t.line, t.col, lhs, rhs, p) {
+      PPRError(p2)          -> err_e(p2)
+      PPRSubstituted(e, p2) -> ok_e(p2, e)
+      PPRPassthrough        -> ok_e(p, mk_expr(EPipe(lhs, rhs), t.line, t.col))
+    }
+  }
+  else if tk_is(t.kind, TkPipe) { ok_e(p, mk_expr(EMapPipe(lhs, rhs), t.line, t.col)) }
+  else if tk_is(t.kind, TkBarBar) { ok_e(p, mk_expr(EFlatMapPipe(lhs, rhs), t.line, t.col)) }
+  else { ok_e(p, mk_expr(EFilterPipe(lhs, rhs), t.line, t.col)) }
 
 fn is_cmp_tok(k: TokKind) : Bool {
   tk_is(k, TkEqEq) or tk_is(k, TkNeq) or tk_is(k, TkLt) or tk_is(k, TkGt) or tk_is(k, TkLe) or tk_is(k, TkGe)
 }
 
-# Comparison is deliberately non-associative (see `kaikai-minimal.md`
-# → Operator precedence): `a < b < c` is a syntax error, not a chain.
-# A plain fall-through would report "expected `fn`, `type`, ..." at
-# the outer statement parser, which is useless. Instead, when we see
-# a second comparison token right after `lhs OP rhs`, we emit a
-# tailored diagnostic pointing at the offending `OP'` and suggesting
-# the `and`-based rewrite.
-fn parse_cmp(p: Parser) : PExpr / Console {
-
-  let r = parse_concat(p)
-  match r.r {
-    None -> r
-    Some(lhs) -> parse_cmp_rest(r.p, lhs)
-  }
-}
-
-fn parse_cmp_rest(p: Parser, lhs: Expr) : PExpr / Console {
-
-  let t = p_peek(p)
-  if is_cmp_tok(t.kind) {
-    let op = op_of_tok(t.kind)
-    let r2 = parse_concat(p_skip_newlines(p_advance(p)))
-    match r2.r {
-      None -> err_e(r2.p)
-      Some(rhs) -> {
-        let after = p_peek(r2.p)
-        if is_cmp_tok(after.kind) {
-          let hint = "comparison is non-associative; write `... and ... #{op_of_tok(after.kind)} ...` instead"
-          err_e(p_error(r2.p, after, hint))
-        } else {
-          ok_e(r2.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
-        }
-      }
-    }
+# A second comparison right after `lhs OP rhs` gets a tailored diagnostic;
+# falling through would report "expected `fn`, `type`, ..." at the
+# enclosing statement, which is useless.
+fn bin_cmp_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console = {
+  let after = p_peek(p)
+  if is_cmp_tok(after.kind) {
+    let hint = "comparison is non-associative; write `... and ... #{op_of_tok(after.kind)} ...` instead"
+    err_e(p_error(p, after, hint))
   } else {
-    let p_look = p_skip_newlines(p)
-    let t1 = p_peek(p_look)
-    if is_cmp_tok(t1.kind) {
-      let op = op_of_tok(t1.kind)
-      let r2 = parse_concat(p_skip_newlines(p_advance(p_look)))
-      match r2.r {
-        None -> err_e(r2.p)
-        Some(rhs) -> {
-          let after = p_peek(r2.p)
-          if is_cmp_tok(after.kind) {
-            let hint = "comparison is non-associative; write `... and ... #{op_of_tok(after.kind)} ...` instead"
-            err_e(p_error(r2.p, after, hint))
-          } else {
-            ok_e(r2.p, mk_expr(EBinop(op, lhs, rhs), t1.line, t1.col))
-          }
-        }
-      }
-    } else { ok_e(p, lhs) }
+    ok_e(p, mk_expr(EBinop(op_of_tok(t.kind), lhs, rhs), t.line, t.col))
   }
 }
 
-# `++` sits one slot below comparison, one above additive (`+`/`-`).
-# Right-associative, so `a ++ b ++ c` parses
-# as `a ++ (b ++ c)` — which matches both `string_concat` and
-# `list_append` since both are the natural fold direction (no
-# spine duplication on the head list / left string).
-fn parse_concat(p: Parser) : PExpr / Console {
-
-  let r = parse_add(p)
-  match r.r {
-    None -> r
-    Some(lhs) -> {
-      if p_at(r.p, TkPlusPlus) {
-        let t = p_peek(r.p)
-        let rr = parse_concat(p_skip_newlines(p_advance(r.p)))
-        match rr.r {
-          None -> err_e(rr.p)
-          Some(rhs) -> ok_e(rr.p, mk_expr(EBinop("++", lhs, rhs), t.line, t.col))
-        }
-      } else {
-        let p_look = p_skip_newlines(r.p)
-        if p_at(p_look, TkPlusPlus) {
-          let t = p_peek(p_look)
-          let rr = parse_concat(p_skip_newlines(p_advance(p_look)))
-          match rr.r {
-            None -> err_e(rr.p)
-            Some(rhs) -> ok_e(rr.p, mk_expr(EBinop("++", lhs, rhs), t.line, t.col))
-          }
-        } else { ok_e(r.p, lhs) }
-      }
-    }
-  }
-}
-
-fn parse_add(p: Parser) : PExpr / Console {
-
-  let r = parse_mul(p)
-  match r.r {
-    None -> r
-    Some(lhs) -> parse_add_rest(r.p, lhs)
-  }
-}
-
-fn parse_add_rest(p: Parser, lhs: Expr) : PExpr / Console {
-
-  let t = p_peek(p)
-  if tk_is(t.kind, TkPlus) or tk_is(t.kind, TkMinus) {
-    let op = op_of_tok(t.kind)
-    let r = parse_mul(p_skip_newlines(p_advance(p)))
-    match r.r {
-      None -> err_e(r.p)
-      Some(rhs) -> parse_add_rest(r.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
-    }
-  } else {
-    let p_look = p_skip_newlines(p)
-    if p_at(p_look, TkPlus) {
-      let t2 = p_peek(p_look)
-      let r = parse_mul(p_skip_newlines(p_advance(p_look)))
-      match r.r {
-        None -> err_e(r.p)
-        Some(rhs) -> parse_add_rest(r.p, mk_expr(EBinop("+", lhs, rhs), t2.line, t2.col))
-      }
-    } else { ok_e(p, lhs) }
-  }
-}
-
-fn parse_mul(p: Parser) : PExpr / Console {
-
-  let r = parse_unary(p)
-  match r.r {
-    None -> r
-    Some(lhs) -> parse_mul_rest(r.p, lhs)
-  }
-}
-
-fn parse_mul_rest(p: Parser, lhs: Expr) : PExpr / Console {
-
-  let t = p_peek(p)
-  if tk_is(t.kind, TkStar) or tk_is(t.kind, TkSlash) or tk_is(t.kind, TkPercent) {
-    let op = op_of_tok(t.kind)
-    let r = parse_unary(p_skip_newlines(p_advance(p)))
-    match r.r {
-      None -> err_e(r.p)
-      Some(rhs) -> parse_mul_rest(r.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
-    }
-  } else {
-    let p_look = p_skip_newlines(p)
-    let t2 = p_peek(p_look)
-    if tk_is(t2.kind, TkStar) or tk_is(t2.kind, TkSlash) {
-      let op = op_of_tok(t2.kind)
-      let r = parse_unary(p_skip_newlines(p_advance(p_look)))
-      match r.r {
-        None -> err_e(r.p)
-        Some(rhs) -> parse_mul_rest(r.p, mk_expr(EBinop(op, lhs, rhs), t2.line, t2.col))
-      }
-    } else { ok_e(p, lhs) }
-  }
-}
+# An expression that stops before a pipe: an arrow lambda's body, whose
+# trailing pipe chains at the enclosing level.
+fn parse_bin_or(p: Parser) : PExpr / Console = parse_bin(p, bin_or())
 
 # Consume a `.field` chain after the base of a `@`-deref, building an
 # `EField` path. `@n.a.b` derefs the ref `n.a.b`; the chain stops at
@@ -2416,13 +2227,13 @@ fn parse_ident_primary(p: Parser, t: Token) : PExpr / Console {
   else if name == "ensure" and p_at(p1, TkLparen) {
     parse_ensure_primary(p1, t)
   }
-  # Lambda: `name => body`. Body is parsed via `parse_or`, NOT
+  # Lambda: `name => body`. Body is parsed via `parse_bin_or`, NOT
   # `parse_expr`, so a top-level pipe operator (`|`, `||`, `|?`,
   # `|>`) terminates the body and chains at the enclosing pipe
   # level.
   else if p_at(p1, TkFatArrow) {
     let p2 = p_advance(p1)
-    let r = parse_or(p2)
+    let r = parse_bin_or(p2)
     match r.r {
       None -> err_e(r.p)
       Some(body) -> {
@@ -2866,13 +2677,13 @@ fn parse_paren_or_lambda(p: Parser, t: Token) : PExpr / Console {
   # and we re-parse from the original position.
   let p1 = p_skip_newlines(p_advance(p))
   # Empty parens: unit, or zero-arg lambda. Lambda body is parsed
-  # via `parse_or` so a trailing pipe operator chains at the
+  # via `parse_bin_or` so a trailing pipe operator chains at the
   # enclosing level.
   if p_at(p1, TkRparen) {
     let p2 = p_advance(p1)
     if p_at(p2, TkFatArrow) {
       let p3 = p_advance(p2)
-      let r = parse_or(p3)
+      let r = parse_bin_or(p3)
       match r.r {
         None -> err_e(r.p)
         Some(body) -> ok_e(r.p, mk_expr(ELambda([], body), t.line, t.col))
@@ -2882,10 +2693,10 @@ fn parse_paren_or_lambda(p: Parser, t: Token) : PExpr / Console {
     }
   } else {
     # Try lambda: tentatively scan for an ident list ending with `)` `=>`.
-    # Body parsed via `parse_or`.
+    # Body parsed via `parse_bin_or`.
     match try_parse_lambda_params(p1) {
       Some(res) -> {
-        let r = parse_or(res.p)
+        let r = parse_bin_or(res.p)
         match r.r {
           None -> err_e(r.p)
           Some(body) -> ok_e(r.p, mk_expr(ELambda(res.params, body), t.line, t.col))
@@ -3839,30 +3650,30 @@ fn parse_multi_arm(p: Parser, n: Int) : PMArm / Console {
     None -> err_marm(r_pats.p)
     Some(pats) -> {
       let p1 = p_skip_newlines(r_pats.p)
-      let guard_opt_r =
-        if p_at(p1, TkIf) {
-          let prev_atl = p1.allow_trailing_lambda
-          let pg = p_with_trailing_lambda(p_advance(p1), false)
-          let rg = parse_expr(pg)
-          let rg_p = p_with_trailing_lambda(rg.p, prev_atl)
-          match rg.r {
-            None -> PExpr { p: rg_p, r: None }
-            Some(g) -> PExpr { p: rg_p, r: Some(g) }
-          }
-        } else {
-          PExpr { p: p1, r: None }
-        }
-      let p2 = p_skip_newlines(guard_opt_r.p)
-      if not p_at(p2, TkArrow) {
-        err_marm(p_error_here(p2, "expected `->` in multi-arg match arm"))
-      } else {
-        let p3 = p_skip_newlines(p_advance(p2))
-        let rb = parse_expr(p3)
-        match rb.r {
-          None -> err_marm(rb.p)
-          Some(body) -> ok_marm(rb.p, MMArm(pats, guard_opt_r.r, body))
-        }
-      }
+      let guard_opt_r = parse_arm_guard(p1, TkIf)
+      parse_marm_body(guard_opt_r, pats, "expected `->` in multi-arg match arm")
+    }
+  }
+}
+
+# An arm's optional guard after `kw`, read with trailing lambdas off so a
+# guard ending in a call does not swallow the arm body's `{`.
+fn parse_arm_guard(p: Parser, kw: TokKind) : PExpr / Console =
+  if p_at(p, kw) {
+    let rg = parse_expr(p_with_trailing_lambda(p_advance(p), false))
+    PExpr { p: p_with_trailing_lambda(rg.p, p.allow_trailing_lambda), r: rg.r }
+  } else { PExpr { p: p, r: None } }
+
+# `-> body` after an arm's patterns and optional guard.
+fn parse_marm_body(g: PExpr, pats: [Pattern], missing_arrow: String) : PMArm / Console = {
+  let p2 = p_skip_newlines(g.p)
+  if not p_at(p2, TkArrow) {
+    err_marm(p_error_here(p2, missing_arrow))
+  } else {
+    let rb = parse_expr(p_skip_newlines(p_advance(p2)))
+    match rb.r {
+      None -> err_marm(rb.p)
+      Some(body) -> ok_marm(rb.p, MMArm(pats, g.r, body))
     }
   }
 }
@@ -4073,19 +3884,7 @@ fn parse_arm(p: Parser) : PArm / Console {
       # `parse_match`: the guard expression cannot eat the `->` (or
       # an arm body's `{`) by extending into a trailing lambda. Off
       # the flag for the guard, restore for the body.
-      let guard_opt_r =
-        if p_at(p1, TkIf) {
-          let prev_atl = p1.allow_trailing_lambda
-          let pg = p_with_trailing_lambda(p_advance(p1), false)
-          let rg = parse_expr(pg)
-          let rg_p = p_with_trailing_lambda(rg.p, prev_atl)
-          match rg.r {
-            None -> PExpr { p: rg_p, r: None }
-            Some(g) -> PExpr { p: rg_p, r: Some(g) }
-          }
-        } else {
-          PExpr { p: p1, r: None }
-        }
+      let guard_opt_r = parse_arm_guard(p1, TkIf)
       match guard_opt_r.r {
         None -> if guard_opt_r.p.had_error { err_a(guard_opt_r.p) } else {
           parse_arm_body(guard_opt_r.p, pat_eff, None)
@@ -4738,7 +4537,7 @@ fn parse_optional_refinement(base: PTy) : PTy / Console {
 fn parse_refinement_predicate(p: Parser, line: Int, col: Int) : PExpr / Console {
 
   let t = p_peek(p)
-  if is_cmp_token(t.kind) {
+  if is_cmp_tok(t.kind) {
     let lhs = mk_ref("self", line, col)
     parse_refinement_cmp_with(p, lhs, line, col)
   } else if is_matches_sugar_start(p, t) {
@@ -4780,16 +4579,6 @@ fn refinement_matches_sugar_at(p: Parser) : Bool {
   else if tk_is(t.kind, TkRegex) { true }
   else if tk_is(t.kind, TkIdent) { true }
   else if tk_is(t.kind, TkString) { true }
-  else { false }
-}
-
-fn is_cmp_token(k: TokKind) : Bool {
-  if tk_is(k, TkLt) { true }
-  else if tk_is(k, TkLe) { true }
-  else if tk_is(k, TkEqEq) { true }
-  else if tk_is(k, TkNeq) { true }
-  else if tk_is(k, TkGt) { true }
-  else if tk_is(k, TkGe) { true }
   else { false }
 }
 
@@ -6423,30 +6212,8 @@ fn parse_case_multi_arm(p: Parser, n: Int) : PMArm / Console {
     None -> err_marm(r_pats.p)
     Some(pats) -> {
       let p1 = p_skip_newlines(r_pats.p)
-      let guard_opt_r =
-        if p_at(p1, TkWhen) {
-          let prev_atl = p1.allow_trailing_lambda
-          let pg = p_with_trailing_lambda(p_advance(p1), false)
-          let rg = parse_expr(pg)
-          let rg_p = p_with_trailing_lambda(rg.p, prev_atl)
-          match rg.r {
-            None -> PExpr { p: rg_p, r: None }
-            Some(g) -> PExpr { p: rg_p, r: Some(g) }
-          }
-        } else {
-          PExpr { p: p1, r: None }
-        }
-      let p2 = p_skip_newlines(guard_opt_r.p)
-      if not p_at(p2, TkArrow) {
-        err_marm(p_error_here(p2, "expected `->` in case-arm"))
-      } else {
-        let p3 = p_skip_newlines(p_advance(p2))
-        let rb = parse_expr(p3)
-        match rb.r {
-          None -> err_marm(rb.p)
-          Some(body) -> ok_marm(rb.p, MMArm(pats, guard_opt_r.r, body))
-        }
-      }
+      let guard_opt_r = parse_arm_guard(p1, TkWhen)
+      parse_marm_body(guard_opt_r, pats, "expected `->` in case-arm")
     }
   }
 }
