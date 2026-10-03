@@ -1,0 +1,73 @@
+#[doc("""
+Self-call recognition for the tail-call and modulo-cons rewrites.
+
+A modulo-cons site is admitted only when exactly one constructor slot is
+a direct self-call and every other slot is free of self-calls at any
+depth. The search descends every position `xp_positions` enumerates,
+deferred ones included, so a self-call inside a lambda body or a handler
+clause still disqualifies the site. Koka's `isTotal` demand on the other
+slots is met by the affine-row gate, not by their shape: with no
+suspendable effect, nothing re-enters the open spine while a slot runs.
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.sym_read
+
+#[doc("True when a call qualified by `callmod` targets the function's own module; a root-file function (`own_mod = None`) never self-calls through a qualified name.")]
+pub fn tcrec_modcall_is_self(callmod: String, own_mod: Option[String]) : Bool =
+  match own_mod {
+    None    -> false
+    Some(m) -> callmod == m
+  }
+
+#[doc("True when `e` is itself a call to `nm` with `arity` arguments, bare or qualified by the function's own module.")]
+pub fn tcrec_is_direct_self_call(e: Expr, nm: String, arity: Int, own_mod: Option[String]) : Bool =
+  match e.kind {
+    ECall(f, xs) -> list_length(xs) == arity and tcrec_callee_is_self(f, nm, own_mod)
+    _ -> false
+  }
+
+fn tcrec_callee_is_self(f: Expr, nm: String, own_mod: Option[String]) : Bool =
+  match sym_read_kind(f.kind) {
+    EVar(callee)              -> callee == nm
+    EModCall(callmod, callee) -> callee == nm and tcrec_modcall_is_self(callmod, own_mod)
+    _ -> false
+  }
+
+#[doc("True when `e` contains a self-call to `nm` in any position, including lambda bodies and handler clauses.")]
+pub fn tcrec_expr_has_self_call(e: Expr, nm: String, arity: Int, own_mod: Option[String]) : Bool =
+  tcrec_is_direct_self_call(e, nm, arity, own_mod) or tcrec_positions_have_self_call(xp_positions(e), nm, arity, own_mod)
+
+fn tcrec_positions_have_self_call(ps: [XPos], nm: String, arity: Int, own_mod: Option[String]) : Bool =
+  match ps {
+    [] -> false
+    [XP(_, c), ...rest] -> tcrec_expr_has_self_call(c, nm, arity, own_mod) or tcrec_positions_have_self_call(rest, nm, arity, own_mod)
+  }
+
+#[doc("The slot index of a modulo-cons site's hole: the one direct self-call among `xs`, provided no other slot hides a self-call.")]
+pub fn tcrec_ctor_modcons_slot(xs: [Expr], nm: String, arity: Int, own_mod: Option[String]) : Option[Int] =
+  match tcrec_sole_direct_slot(xs, nm, arity, own_mod, 0, None) {
+    Some(h) -> if tcrec_slots_hide_self_call(xs, h, nm, arity, own_mod, 0) { None } else { Some(h) }
+    None    -> None
+  }
+
+# The hole is located before any deep search, so a tail constructor with no
+# direct self-call costs one shallow pass over its slots.
+fn tcrec_sole_direct_slot(xs: [Expr], nm: String, arity: Int, own_mod: Option[String], i: Int, found: Option[Int]) : Option[Int] =
+  match xs {
+    [] -> found
+    [a, ...rest] ->
+      if not tcrec_is_direct_self_call(a, nm, arity, own_mod) { tcrec_sole_direct_slot(rest, nm, arity, own_mod, i + 1, found) }
+      else { match found {
+        Some(_) -> None
+        None    -> tcrec_sole_direct_slot(rest, nm, arity, own_mod, i + 1, Some(i))
+      } }
+  }
+
+fn tcrec_slots_hide_self_call(xs: [Expr], hole: Int, nm: String, arity: Int, own_mod: Option[String], i: Int) : Bool =
+  match xs {
+    [] -> false
+    [a, ...rest] ->
+      (i != hole and tcrec_expr_has_self_call(a, nm, arity, own_mod)) or tcrec_slots_hide_self_call(rest, hole, nm, arity, own_mod, i + 1)
+  }
