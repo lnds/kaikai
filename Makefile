@@ -80,7 +80,7 @@ test-multi-module: kaic2
 	@set -e; \
 	root=$$(pwd); \
 	kai="$$root/bin/kai"; \
-	for case in multi-module multi-module/issue-237 multi-module/issue-897-shadow multi-module/issue-898-qualified-generic multi-module/issue-962-root-fns-isolation multi-module/pipe_custom_type multi-module/pipe_two_types_same_pkg; do \
+	for case in multi-module multi-module/issue-237 multi-module/issue-897-shadow multi-module/issue-898-qualified-generic multi-module/issue-962-root-fns-isolation multi-module/pipe_custom_type multi-module/pipe_two_types_same_pkg multi-module/bound_impl_other_module; do \
 	  src_dir="$$root/examples/$$case"; \
 	  exp="$$src_dir/main.out.expected"; \
 	  out_abs=$$(mktemp); \
@@ -1009,6 +1009,13 @@ test-typecheck: kaic2
 	  echo "test-typecheck FAIL — negative diagnostic missing the golden first line"; \
 	  cat /tmp/kaikai-typecheck-neg.err; exit 1; \
 	fi; \
+	mono_neg=examples/negative/protocols/bound_imported_fn/main.kai; \
+	./bin/kai typecheck $$mono_neg > /dev/null 2> /tmp/kaikai-typecheck-mono.err \
+	  && { echo "test-typecheck FAIL — a bound violated at a mono instantiation was accepted"; exit 1; }; \
+	grep -qF "$$(head -1 $${mono_neg%.kai}.err.expected)" /tmp/kaikai-typecheck-mono.err \
+	  || { echo "test-typecheck FAIL — mono-time diagnostic differs from the build's"; cat /tmp/kaikai-typecheck-mono.err; exit 1; }; \
+	./bin/kai typecheck examples/multi-module/bound_impl_other_module/main.kai \
+	  || { echo "test-typecheck FAIL — bound satisfied by an impl in another module was rejected"; exit 1; }; \
 	./bin/kai typecheck examples/typecheck/clean.kai --diags-json > /tmp/kaikai-typecheck-dj.out 2>&1 \
 	  && grep -q '"diagnostics": \[\]' /tmp/kaikai-typecheck-dj.out \
 	  || { echo "test-typecheck FAIL — --diags-json mount broken"; cat /tmp/kaikai-typecheck-dj.out; exit 1; }; \

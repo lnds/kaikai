@@ -8,9 +8,8 @@
 # examples/negative/** it runs kaic2 twice — build mode and --check —
 # and diffs the two stderr streams.
 #
-# Fixtures whose error only surfaces in a later phase (monomorph
-# instantiation, backend subset gaps) are out of --check's scope by
-# design: build rejects, --check accepts. Those live in
+# Fixtures whose error only surfaces in a backend (subset gaps) are
+# out of --check's scope by design: build rejects, --check accepts. Those live in
 # tools/check-parity-skips.txt (one relpath per line, reason after
 # whitespace). A skip is ratcheted: if --check starts rejecting a
 # skipped fixture, the entry is stale and the gate fails so the list

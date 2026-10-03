@@ -127,9 +127,10 @@ full build. Exit 0 means well-typed; on error the diagnostics are
 identical to a build's. The JSON report flags ride it
 (`kai typecheck file.kai --diags-json`), so the compile-fix loop is:
 typecheck, read the JSON, patch, repeat; build once it comes back
-clean. Errors that only surface in later phases (monomorphisation,
-backend subset gaps) can still fail that final build — typecheck-clean
-is necessary, not sufficient.
+clean. A bound violated at a concrete instantiation is a typecheck
+error too; backend subset gaps can still fail that final build, and
+the report flags stop before monomorphisation — typecheck-clean is
+necessary, not sufficient.
 
 ### Structured diagnostics
 

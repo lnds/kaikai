@@ -91,14 +91,12 @@ import compiler.purity
 import compiler.tailfuse
 import compiler.protos
 import compiler.home_tu
-import compiler.fwd_inline
 import compiler.emit_shared
-import compiler.tycon_home
 import compiler.emit_cache
 import compiler.emit_c
 import compiler.name_report
 import compiler.name_uses
-import compiler.monomorph
+import compiler.mono_front
 import compiler.kir
 import compiler.kir_inline
 import compiler.kir_dump
@@ -106,7 +104,6 @@ import compiler.emit_native
 import compiler.emit_native_core
 import compiler.emit_native_modular
 import compiler.lint
-import compiler.closure_spec
 import compiler.law_checks
 
 
@@ -184,48 +181,6 @@ fn dump_token(src: String, t: Token) : Unit / Console {
 
 fn dump_tokens(src: String, tokens: [Token]) : Unit / Console {
   tokens |> each((t) => dump_token(src, t))
-}
-
-# Emit one diagnostic per free-fn protocol-bound violation caught at a
-# concrete instantiation. Returns the count so the exit code reflects
-# them.
-fn report_bound_violations(file: String, vs: [BoundViolation]) : Int / Console + File {
-  match vs {
-    [] -> 0
-    [v, ...rest] -> match v {
-      BV(msg, line, col) -> {
-        diag_error(file, line, col, msg)
-        1 + report_bound_violations(file, rest)
-      }
-    }
-  }
-}
-
-# Monomorphisation invariant reporter: print one diag per spec leak,
-# return total leak count (0 = clean). Lives near `diag_error` so
-# its row is `Console`-only and the caller's row inference picks it
-# up cleanly.
-fn report_mono_leaks(file: String, rs: [MLeakRecord]) : Int / Console + File {
-
-  match rs {
-    [] -> 0
-    [r, ...rest] -> match r {
-      MLeakRec(name, n, loc) -> {
-        let loc_s = match loc {
-          Some(MLeakAt(line, col, ty_s)) ->
-            concat_all([" first at ", int_to_string(line), ":",
-                        int_to_string(col), " ty=", ty_s])
-          None -> ""
-        }
-        diag_error(file, 0, 0,
-          concat_all(["m4c Phase 3 invariant: spec '", name,
-                       "' has ", int_to_string(n),
-                       " TyVarT/UVar leak(s) in body Expr.ty",
-                       loc_s]))
-        n + report_mono_leaks(file, rest)
-      }
-    }
-  }
 }
 
 # ====================================================================
@@ -5651,74 +5606,20 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   else {
                     let hole_errs = if strict_holes { strict_holes_check(path, all_decls) } else { 0 }
                     if hole_errs != 0 { hole_errs }
-                    else if is_check_mode(mode) { 0 }
+                    else if is_check_mode(mode) {
+                      mono_front(typed_prog, proto_reg, post_local_arities, fn_bounds,
+                                 proto_ps, target_mod_name, path, diag_ctx).errs
+                    }
                     else if is_report_mode(mode) { run_report_dump(mode, diag_ctx, pa_hidden_from_root(pa_segs, target_mod_name), typed_prog, docs.items) }
                     else {
-                      # The typer leaves a nominal type's `module_origin`
-                      # empty when its name alone does not settle the home
-                      # (a core literal, a name declared twice). Stamp it
-                      # once here, so every downstream consumer of
-                      # `Expr.ty` reads a type's home rather than only its
-                      # name.
-                      let homed_prog = typed_prog_with_decls(
-                        typed_prog, tag_tycon_modules(typed_prog.decls))
-                      # Inline trivial forwarders so the module surface
-                      # exposes the primitive call shape the downstream
-                      # fusion / borrow / linearity analyses key on.
-                      let fwd_prog0 = inline_trivial_forwarders(homed_prog)
-                      # Specialise higher-order calls on env-empty lambdas /
-                      # named fns, inlining the stage into the loop so the
-                      # per-element indirect closure call is gone. Runs before
-                      # mono: each spec closes its effect row to pure (the
-                      # inlined stage performs nothing), so mono grounds it to
-                      # concrete types and unbox lands the loop's scalars.
-                      let fwd_prog = typed_prog_with_decls(fwd_prog0, closure_spec_pass(fwd_prog0.decls))
-                      # Monomorphise: specialise each polymorphic spec
-                      # and substitute body type / unit per spec.
-                      let mono_out = monomorphise(fwd_prog, proto_reg,
-                                                     post_local_arities, fn_bounds,
-                                                     proto_ps, target_mod_name)
-                      let mono_decls = match mono_out { MonoOut(ds, _, _) -> ds }
-                      # Free-fn protocol bounds checked at each concrete
-                      # instantiation: a `[T: P]` bound is a precondition
-                      # on the caller's type, enforced even when the
-                      # callee body never dispatches the bounded op.
-                      let mono_bound_viols = match mono_out { MonoOut(_, _, vs) -> vs }
-                      let mono_bound_errs = report_bound_violations(path, mono_bound_viols)
-                      # Evidence-param threading (#820 L2). Compute the
-                      # per-function evidence obligations pre-mono and
-                      # re-key them onto the specialised symbols, so each
-                      # mono spec carries the obligations its row demands.
-                      # This is the only honest half of "thread through
-                      # monomorphisation" the frontend can do alone: mono
-                      # transports the metadata across the type fan-out;
-                      # L3 consumes it to materialise the hidden params.
-                      # Codegen reads none of it here (byte-id proves it),
-                      # so the result is exercised, not consumed.
+                      let mf = mono_front(typed_prog, proto_reg, post_local_arities, fn_bounds,
+                                          proto_ps, target_mod_name, path, diag_ctx)
+                      let mono_decls = mf.decls
+                      # Per-function evidence obligations, computed pre-mono
+                      # and re-keyed onto the specialised symbols. Codegen
+                      # reads none of it: the result is exercised, not consumed.
                       let _ev_meta = reindex_evidence_params(
-                        inject_evidence_params(fwd_prog.decls), mono_decls)
-                      # Per-spec leak records
-                      # carry only TyVarT/UVar ids in the spec's
-                      # SubstMap domain — any leak means body subst
-                      # missed a node and the spec would behave like
-                      # a polymorphic copy. Free typer tyvars whose
-                      # ids fall outside the domain are skipped.
-                      let mono_leaks = match mono_out { MonoOut(_, ls, _) -> ls }
-                      let mono_inv_errs = report_mono_leaks(path, mono_leaks)
-                      # Post-mono protocol-dispatch validation. After
-                      # monomorphisation each
-                      # specialised body has concrete `Expr.ty`
-                      # annotations and the per-spec call-rewrite has
-                      # retargeted what it could to `__pimpl_*`
-                      # entries. Anything that survives as
-                      # `__proto_<op>(x : ConcreteT)` reflects a
-                      # polymorphic impl whose body recurses on a
-                      # type parameter that lacks a corresponding
-                      # impl for the concrete instantiation. Report
-                      # it as a compile-time error instead of letting
-                      # the dispatcher panic at runtime.
-                      let mono_dispatch_errs =
-                        validate_resolved_decls(mono_decls, proto_reg, diag_ctx, 0)
+                        inject_evidence_params(mf.prog.decls), mono_decls)
                       # In-process libLLVM native backend. Computed BEFORE
                       # unbox so the pass can gate raw-binder promotion on the
                       # backend: the native load-border is NOT total, so a
@@ -5812,9 +5713,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       let perceus_decls = tcrec_rewrite_decls(post_perceus_decls, true, cons_ok, target_mod_name)
                       let use_purity = match mode { MDumpPurity -> true _ -> false }
                       let use_symids = match mode { MDumpSymIds -> true _ -> false }
-                      if mono_bound_errs != 0 { mono_bound_errs }
-                      else if mono_inv_errs != 0 { mono_inv_errs }
-                      else if mono_dispatch_errs != 0 { mono_dispatch_errs }
+                      if mf.errs != 0 { mf.errs }
                       else if use_purity {
                         # Confirmed-purity side table over the same
                         # post-perceus / post-tcrec AST the backends stamp
