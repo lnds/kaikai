@@ -22,8 +22,10 @@
 
 import compiler.util
 import compiler.ast
+import compiler.ast_map
 import compiler.emit_shared
 import compiler.type_home
+import compiler.tycon_pat
 
 #[doc("Stamp every `TyCon` in the typed decls with the module declaring that type, and qualify the constructor sites whose home that reveals.")]
 pub fn tag_tycon_modules(ds: [Decl]) : [Decl] = {
@@ -32,7 +34,7 @@ pub fn tag_tycon_modules(ds: [Decl]) : [Decl] = {
     [] -> ds
     _  -> {
       let ctors = th_ctor_names(ds, [])
-      map(ds, (d) => th_decl(d, THC(homes, ctors, None)))
+      map(ds, (d) => th_decl(d, THC(homes, ctors, None, tpay_table(ds))))
     }
   }
 }
@@ -44,7 +46,7 @@ pub fn tag_tycon_modules(ds: [Decl]) : [Decl] = {
 # The current module is what resolves a contested type name. Two modules
 # declaring `Err` are two types, and the one a decl means is its own
 # module's — the same rule the resolver applies to the name itself.
-type THCtx = THC([TyHome], [String], Option[String])
+type THCtx = THC([TyHome], [String], Option[String], [TPay])
 
 fn th_ctor_names(ds: [Decl], acc: [String]) : [String] = match ds {
   [] -> acc
@@ -95,7 +97,7 @@ fn th_expr(e: Expr, hs: THCtx) : Expr = {
   th_qualify_call(walked, hs)
 }
 
-fn th_is_ctor(hs: THCtx, nm: String) : Bool = match hs { THC(_, cs, _) -> list_has(cs, nm) }
+fn th_is_ctor(hs: THCtx, nm: String) : Bool = match hs { THC(_, cs, _, _) -> list_has(cs, nm) }
 
 # A qualifier reads as the TYPE only when it names the node's own type;
 # a module of the same spelling — or a home this pass already wrote —
@@ -115,19 +117,34 @@ fn th_res_name(t: Option[Ty]) : Option[String] = match t {
 
 # The home a type NAME denotes in the module being walked.
 fn th_type_home(hs: THCtx, nm: String) : Option[String] = match hs {
-  THC(t, _, cur) -> type_home_of(t, nm, cur)
+  THC(t, _, cur, _) -> type_home_of(t, nm, cur)
 }
 
 fn th_in_module(hs: THCtx, mo: Option[String]) : THCtx = match hs {
-  THC(t, cs, _) -> THC(t, cs, mo)
+  THC(t, cs, _, ps) -> THC(t, cs, mo, ps)
 }
 
 fn th_kind(k: ExprKind, hs: THCtx) : ExprKind = match k {
   EMatch(scr, arms) -> {
     let scr2 = th_expr(scr, hs)
-    EMatch(scr2, map(arms, (a) => th_arm(a, ty_home(scr2.ty), hs)))
+    EMatch(scr2, map(arms, (a) => th_arm(a, scr2.ty, hs)))
   }
+  EBlock(ss, tail) -> EBlock(map(ss, (s) => th_stmt(s, hs)), th_opt_expr(tail, hs))
   _ -> map_expr_kind(k, (sub) => th_expr(sub, hs))
+}
+
+# A `let` pattern is tested against its right-hand side's type.
+fn th_stmt(s: Stmt, hs: THCtx) : Stmt = match s {
+  SLet(p, ann, rhs) -> {
+    let rhs2 = th_expr(rhs, hs)
+    match hs { THC(t, _, _, ps) -> SLet(tp_pat(p, rhs2.ty, t, ps), ann, rhs2) }
+  }
+  _ -> prc_map_stmt_exprs(s, (x) => th_expr(x, hs))
+}
+
+fn th_opt_expr(e: Option[Expr], hs: THCtx) : Option[Expr] = match e {
+  None    -> None
+  Some(x) -> Some(th_expr(x, hs))
 }
 
 # A constructor site names its home, or names nothing the emitter can
@@ -184,25 +201,14 @@ fn th_with_callee(e: Expr, f: Expr, cargs: [Expr], m: String, nm: String) : Expr
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 
-fn th_arm(a: Arm, home: Option[String], hs: THCtx) : Arm = match a {
-  Arm(pat, guard, body) ->
-    Arm(th_pat(pat, home),
-        match guard { None -> None Some(g) -> Some(th_expr(g, hs)) },
-        th_expr(body, hs))
-}
-
-# Only the arm's OWN constructor takes the scrutinee's home: a
-# sub-pattern tests a payload slot, whose type this pass does not know.
-fn th_pat(p: Pattern, home: Option[String]) : Pattern =
-  match p.pkind {
-    PVariant(None, nm, subs) -> match home {
-      None    -> p
-      Some(_) -> Pattern { pkind: PVariant(home, nm, subs), line: p.line, col: p.col }
-    }
-    PAs(nm, sub) ->
-      Pattern { pkind: PAs(nm, th_pat(sub, home)), line: p.line, col: p.col }
-    _ -> p
+fn th_arm(a: Arm, scr_ty: Option[Ty], hs: THCtx) : Arm = match a {
+  Arm(pat, guard, body) -> match hs {
+    THC(t, _, _, ps) ->
+      Arm(tp_pat(pat, scr_ty, t, ps),
+          match guard { None -> None Some(g) -> Some(th_expr(g, hs)) },
+          th_expr(body, hs))
   }
+}
 
 fn ty_home(t: Option[Ty]) : Option[String] = match t {
   Some(TyCon(mo, _, _, _))     -> mo

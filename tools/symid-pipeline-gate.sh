@@ -267,4 +267,13 @@ for pass in cold warm; do
 done
 [ "$ctor_cold" = "$ctor_warm" ] || fail "a warm build's constructor ids differ from a cold build's"
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, and a constructor site names the home its type picked"
+# A sub-pattern is tested against its payload slot's type, so a homonym
+# nested under `Some(...)` names the module the slot's type picked.
+NESTFIX="$ROOT/examples/namespace-collisions/ctor_nested_option_payload"
+out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
+        --path "$NESTFIX" --path "$ROOT/stdlib" "$NESTFIX/main.kai" | grep '^ctor ' || true)
+need '^ctor pat ra Circle#[0-9]+ Circle@ma$'
+need '^ctor pat ra Sq#[0-9]+ Sq@ma$'
+printf '%s\n' "$out" | grep -q ' Circle#none$' && fail "a nested constructor pattern reached unbox with no home"
+
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, and a constructor site, nested or not, names the home its type picked"

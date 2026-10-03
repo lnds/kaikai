@@ -1,0 +1,178 @@
+# compiler/tycon_pat.kai — stamp a pattern's constructors, sub-patterns
+# included, with the home their expected type names.
+#
+# A match arm or a `let` pattern is tested against a known type. A
+# sub-pattern is tested against a payload slot, whose type is the
+# constructor's declared payload with the outer type's arguments
+# substituted, so the declaration tables carry the type down without
+# re-running inference.
+
+import compiler.ast
+import compiler.type_home
+
+#[doc("A declared payload shape: a constructor's slots, or a record type's fields, with the type parameters they mention.")]
+pub type TPay = TPV(Option[String], String, [String], [TypeExpr])
+              | TPR(Option[String], String, [String], [FieldDecl])
+
+#[doc("The payload shapes of every sum constructor and record type in `ds`, plus the builtin constructors no declaration carries.")]
+pub fn tpay_table(ds: [Decl]) : [TPay] = tp_collect(ds, tp_builtins())
+
+fn tp_builtins() : [TPay] =
+  [TPV(None, "Some", ["a"], [tp_name("a")]),
+   TPV(None, "Ok", ["t", "e"], [tp_name("t")]),
+   TPV(None, "Err", ["t", "e"], [tp_name("e")])]
+
+fn tp_name(n: String) : TypeExpr = TypeExpr { tkind: TyName(n, []), line: 0, col: 0 }
+
+fn tp_collect(ds: [Decl], acc: [TPay]) : [TPay] = match ds {
+  [] -> acc
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> tp_collect([inner, ...rest], acc)
+    None -> match d {
+      DType(_, _, tps, TBSum(vs), _, _, mo, _, _) -> tp_collect(rest, tp_variants(vs, mo, tps, acc))
+      DType(_, tn, tps, TBRecord(fs), _, _, mo, _, _) -> tp_collect(rest, [TPR(mo, tn, tps, fs), ...acc])
+      _ -> tp_collect(rest, acc)
+    }
+  }
+}
+
+fn tp_variants(vs: [Variant], mo: Option[String], tps: [String], acc: [TPay]) : [TPay] = match vs {
+  [] -> acc
+  [Var(n, tys), ...rest] -> tp_variants(rest, mo, tps, [TPV(mo, n, tps, tys), ...acc])
+}
+
+#[doc("`p` with every bare constructor pattern it holds stamped with the home its expected type `ty` names.")]
+pub fn tp_pat(p: Pattern, ty: Option[Ty], hs: [TyHome], pays: [TPay]) : Pattern = {
+  let k = match p.pkind {
+    PVariant(h, nm, subs) -> {
+      let home = tp_home_or(h, ty)
+      PVariant(home, nm, tp_subs(subs, tp_slot_tys(pays, hs, home, nm, ty), hs, pays))
+    }
+    PVariantRecord(h, nm, fs) -> PVariantRecord(h, nm, tp_fields(fs, ty, hs, pays))
+    PRecord(fs)               -> PRecord(tp_fields(fs, ty, hs, pays))
+    PList(subs, r)            -> PList(tp_each(subs, tp_elem(ty), hs, pays), r)
+    PAs(n, sub)               -> PAs(n, tp_pat(sub, ty, hs, pays))
+    other                     -> other
+  }
+  Pattern { pkind: k, line: p.line, col: p.col }
+}
+
+fn tp_each(ps: [Pattern], ty: Option[Ty], hs: [TyHome], pays: [TPay]) : [Pattern] = match ps {
+  [] -> []
+  [p, ...rest] -> [tp_pat(p, ty, hs, pays), ...tp_each(rest, ty, hs, pays)]
+}
+
+fn tp_home_or(h: Option[String], ty: Option[Ty]) : Option[String] = match h {
+  Some(_) -> h
+  None    -> tp_ty_home(ty)
+}
+
+fn tp_ty_home(t: Option[Ty]) : Option[String] = match t {
+  Some(TyCon(mo, _, _, _))  -> mo
+  Some(TyRefineT(inner, _)) -> tp_ty_home(Some(inner))
+  Some(TyDimT(inner, _))    -> tp_ty_home(Some(inner))
+  _                         -> None
+}
+
+fn tp_args(t: Option[Ty]) : [Ty] = match t {
+  Some(TyCon(_, _, args, _))  -> args
+  Some(TyRefineT(inner, _)) -> tp_args(Some(inner))
+  _                         -> []
+}
+
+fn tp_elem(t: Option[Ty]) : Option[Ty] = match t {
+  Some(TyListT(e)) -> Some(e)
+  _                -> None
+}
+
+fn tp_subs(ps: [Pattern], tys: [Option[Ty]], hs: [TyHome], pays: [TPay]) : [Pattern] = match ps {
+  [] -> []
+  [p, ...rest] -> match tys {
+    []           -> [tp_pat(p, None, hs, pays), ...tp_subs(rest, [], hs, pays)]
+    [t, ...more] -> [tp_pat(p, t, hs, pays), ...tp_subs(rest, more, hs, pays)]
+  }
+}
+
+fn tp_fields(fs: [PField], ty: Option[Ty], hs: [TyHome], pays: [TPay]) : [PField] = match fs {
+  [] -> []
+  [PField(fname, p, sh), ...rest] ->
+    [PField(fname, tp_pat(p, tp_field_ty(pays, hs, ty, fname), hs, pays), sh), ...tp_fields(rest, ty, hs, pays)]
+}
+
+# A slot's type is only known when exactly the constructor this home
+# declares is found; anything else leaves the slot untyped.
+fn tp_slot_tys(pays: [TPay], hs: [TyHome], home: Option[String], nm: String, ty: Option[Ty]) : [Option[Ty]] =
+  match tp_find_ctor(pays, home, nm) {
+    Some(TPV(mo, _, tps, tes)) -> map(tes, (te) => tp_te(te, tps, tp_args(ty), mo, hs))
+    _                          -> []
+  }
+
+fn tp_find_ctor(pays: [TPay], home: Option[String], nm: String) : Option[TPay] = match pays {
+  [] -> None
+  [x, ...rest] -> match x {
+    TPV(mo, n, _, _) -> if n == nm and tp_home_fits(mo, home) { Some(x) } else { tp_find_ctor(rest, home, nm) }
+    _                -> tp_find_ctor(rest, home, nm)
+  }
+}
+
+# A builtin is declared nowhere, so it answers whatever home its
+# expected type carries.
+fn tp_home_fits(decl: Option[String], want: Option[String]) : Bool = match decl {
+  None    -> true
+  Some(m) -> match want { Some(w) -> m == w  None -> false }
+}
+
+fn tp_field_ty(pays: [TPay], hs: [TyHome], ty: Option[Ty], fname: String) : Option[Ty] = match ty {
+  Some(TyCon(mo, tn, args, _)) -> match tp_find_rec(pays, mo, tn) {
+    Some(TPR(dmo, _, tps, fds)) -> match tp_fd(fds, fname) {
+      Some(te) -> tp_te(te, tps, args, dmo, hs)
+      None     -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+fn tp_find_rec(pays: [TPay], mo: Option[String], tn: String) : Option[TPay] = match pays {
+  [] -> None
+  [x, ...rest] -> match x {
+    TPR(dmo, n, _, _) -> if n == tn and tp_home_fits(dmo, mo) { Some(x) } else { tp_find_rec(rest, mo, tn) }
+    _                 -> tp_find_rec(rest, mo, tn)
+  }
+}
+
+fn tp_fd(fds: [FieldDecl], fname: String) : Option[TypeExpr] = match fds {
+  [] -> None
+  [FD(_, n, te, _), ...rest] -> if n == fname { Some(te) } else { tp_fd(rest, fname) }
+}
+
+# A payload type expression read in its declaring module: a type
+# parameter takes the scrutinee's argument, a type name its home there.
+fn tp_te(te: TypeExpr, tps: [String], args: [Ty], cur: Option[String], hs: [TyHome]) : Option[Ty] =
+  match te.tkind {
+    TyName(n, targs) -> match tp_param_at(tps, args, n) {
+      Some(t) -> Some(t)
+      None    -> Some(TyCon(type_home_of(hs, n, cur), n, tp_te_args(targs, tps, args, cur, hs), sym_none()))
+    }
+    TyList(inner) -> match tp_te(inner, tps, args, cur, hs) {
+      Some(t) -> Some(TyListT(t))
+      None    -> None
+    }
+    _ -> None
+  }
+
+fn tp_te_args(tes: [TypeExpr], tps: [String], args: [Ty], cur: Option[String], hs: [TyHome]) : [Ty] = match tes {
+  [] -> []
+  [te, ...rest] -> match tp_te(te, tps, args, cur, hs) {
+    Some(t) -> [t, ...tp_te_args(rest, tps, args, cur, hs)]
+    None    -> [TyAny, ...tp_te_args(rest, tps, args, cur, hs)]
+  }
+}
+
+fn tp_param_at(tps: [String], args: [Ty], n: String) : Option[Ty] = match tps {
+  [] -> None
+  [p, ...rest] -> match args {
+    [] -> None
+    [a, ...more] -> if p == n { Some(a) } else { tp_param_at(rest, more, n) }
+  }
+}
