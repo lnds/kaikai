@@ -5870,7 +5870,7 @@ test-closure-spec-1205: $(TARGET) bin-kai build
 	diff -q $$exp build/s2-cs1205.out > /dev/null \
 	  || { echo "closure-spec-1205 FAIL (output diff)"; diff $$exp build/s2-cs1205.out; exit 1; }; \
 	$(KAIC2) --emit=kir --path ../stdlib $$src > build/s2-cs1205.kir 2>/dev/null; \
-	awk '/^fn (vec__)?foldl_loop__cspec.*mono/,/^}/' build/s2-cs1205.kir > build/s2-cs1205-loop.kir; \
+	awk '/^fn collections__vec__foldl_loop__cspec.*mono/,/^}/' build/s2-cs1205.kir > build/s2-cs1205-loop.kir; \
 	test -s build/s2-cs1205-loop.kir \
 	  || { echo "closure-spec-1205 FAIL (no specialised loop emitted — closure not specialised)"; exit 1; }; \
 	if grep -F -q 'call_ind' build/s2-cs1205-loop.kir; then \
