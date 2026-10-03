@@ -7878,7 +7878,7 @@ test-perceus-pipe-borrowed-slot-alignment: $(TARGET) build
 # module under test, so a signature change in it fails here instead of
 # rotting in a file nothing builds. `intervals` is split off because it costs
 # an order of magnitude more than the others.
-test-compiler-units: $(TARGET) build
+test-compiler-units: $(TARGET) bin-kai build
 	@$(STACK) set -e; \
 	for t in chars diag util; do \
 	  ../bin/kai test tests/test_$$t.kai > build/s2-unit-$$t.out 2>&1 \
@@ -7886,7 +7886,7 @@ test-compiler-units: $(TARGET) build
 	done; \
 	echo "compiler-units OK (chars, diag, util)"
 
-test-compiler-intervals: $(TARGET) build
+test-compiler-intervals: $(TARGET) bin-kai build
 	@$(STACK) set -e; \
 	../bin/kai test tests/test_intervals.kai > build/s2-unit-intervals.out 2>&1 \
 	  || { echo "compiler-intervals FAIL"; cat build/s2-unit-intervals.out; exit 1; }; \
