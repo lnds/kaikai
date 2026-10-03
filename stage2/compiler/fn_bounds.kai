@@ -1,0 +1,80 @@
+#[doc("""
+compiler.fn_bounds — protocol bounds of free fns, keyed by declaration identity.
+
+The parser writes a bound `[T: P]` into the tparam string and surface
+lowering strips it, so the bounds are read off the surface stream and
+carried to the monomorphiser as a table keyed by the declaring fn's
+`SymId`. A call into any module is then checked against the bounds of the
+decl it resolves to, never against a same-named fn elsewhere.
+""")]
+
+import compiler.ast
+import compiler.parse
+
+#[doc("A bounded fn's declaration identity and its per-tparam protocol bounds.")]
+pub type SymBounds = SB(SymId, [FnTPBound])
+
+#[doc("Surface-stream bounds of every bounded free fn, keyed by (name, module origin); a root-file fn has origin `None`.")]
+pub fn collect_surface_bounds(ds: [Decl]) : [FnBoundsRec] = surface_bounds_loop(ds, [])
+
+fn surface_bounds_loop(ds: [Decl], acc: [FnBoundsRec]) : [FnBoundsRec] = match ds {
+  [] -> acc
+  [d, ...rest] -> surface_bounds_loop(rest, surface_bounds_of(d, acc))
+}
+
+fn surface_bounds_of(d: Decl, acc: [FnBoundsRec]) : [FnBoundsRec] = match d {
+  DFn(_, name, tps, _, _, _, _, _, _, mo, _) -> match fn_tp_bounds_of(tps) {
+    [] -> acc
+    bs -> [FBR(name, mo, bs), ...acc]
+  }
+  DDoc(_, _, inner, _, _) -> surface_bounds_of(inner, acc)
+  DAttr(_, inner, _, _)   -> surface_bounds_of(inner, acc)
+  _ -> acc
+}
+
+#[doc("Re-key surface bounds onto the `SymId` of the resolved fn decls they belong to.")]
+pub fn bounds_by_sym(ds: [Decl], recs: [FnBoundsRec], target_mod: String) : [SymBounds] =
+  match recs {
+    [] -> []
+    _  -> sym_bounds_loop(ds, recs, target_mod, [])
+  }
+
+fn sym_bounds_loop(ds: [Decl], recs: [FnBoundsRec], target_mod: String,
+                   acc: [SymBounds]) : [SymBounds] = match ds {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DFn(_, name, tps, _, _, _, _, _, _, mo, fsym) ->
+      if list_length(tps) == 0 or sym_raw(fnid_sym(fsym)) < 0 {
+        sym_bounds_loop(rest, recs, target_mod, acc)
+      }
+      else {
+        match find_bounds(recs, name, mo, target_mod) {
+          Some(bs) -> sym_bounds_loop(rest, recs, target_mod, [SB(fnid_sym(fsym), bs), ...acc])
+          None     -> sym_bounds_loop(rest, recs, target_mod, acc)
+        }
+      }
+    _ -> sym_bounds_loop(rest, recs, target_mod, acc)
+  }
+}
+
+# A surface record with no origin is a root-file fn, which the driver tags
+# `Some(target)` when public and leaves untagged otherwise.
+fn find_bounds(recs: [FnBoundsRec], name: String, mo: Option[String],
+               target_mod: String) : Option[[FnTPBound]] = match recs {
+  [] -> None
+  [FBR(n, rmo, bs), ...rest] ->
+    if n == name and origin_matches(rmo, mo, target_mod) { Some(bs) }
+    else { find_bounds(rest, name, mo, target_mod) }
+}
+
+fn origin_matches(rec_mo: Option[String], decl_mo: Option[String], target_mod: String) : Bool =
+  match rec_mo {
+    Some(r) -> match decl_mo { Some(m) -> r == m  None -> false }
+    None    -> match decl_mo { None -> true  Some(m) -> m == target_mod }
+  }
+
+#[doc("The bounds recorded for the fn declared as `s`, or `None` when it has none.")]
+pub fn bounds_of_sym(tbl: [SymBounds], s: SymId) : Option[[FnTPBound]] = match tbl {
+  [] -> None
+  [SB(t, bs), ...rest] -> if sym_raw(t) == sym_raw(s) { Some(bs) } else { bounds_of_sym(rest, s) }
+}
