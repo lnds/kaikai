@@ -1,9 +1,13 @@
-# Issue #1591 — the reader dies before consuming: `true` exits without
-# reading its piped stdin. Repeated writes must eventually surface
-# `Err` (EPIPE) instead of killing the parent with the default fatal
-# SIGPIPE — exactly a pager quit by the user mid-stream. 64 × 64 KiB
-# overflows any pipe buffer, and a write blocked on a full pipe is
-# woken with EPIPE when the reader end closes.
+# The reader dies before draining: it reads one byte and exits.
+# Repeated writes must eventually surface `Err` (EPIPE) instead of
+# killing the parent with the default fatal SIGPIPE — exactly a pager
+# quit by the user mid-stream. 64 × 64 KiB overflows any pipe buffer,
+# and a write blocked on a full pipe is woken with EPIPE when the
+# reader end closes.
+#
+# The first write is the byte the reader must consume before it can
+# exit, so it is always `Ok` and every run takes the same Ok-then-Err
+# path.
 import os.process
 
 fn spam(c: Child, chunk: String, tries: Int) : Bool / Process =
@@ -19,18 +23,21 @@ fn mk_big(s: String, doublings: Int) : String =
   if doublings == 0 { s } else { mk_big(string_concat(s, s), doublings - 1) }
 
 fn main() : Int / Process + Stdout =
-  match process.pipe_to("true", []) {
+  match process.pipe_to("sh", ["-c", "head -c 1 > /dev/null"]) {
     Err(e) -> { Stdout.print(string_concat("start FAIL: ", e)); 1 }
-    Ok(c)  ->
-      # 16 bytes doubled 12 times = 64 KiB per attempt
-      if spam(c, mk_big("0123456789abcdef", 12), 64) == false {
-        Stdout.print("FAIL: no write error after 4 MiB")
-        1
-      } else {
-        match process.wait(c) {
-          Err(e)        -> { Stdout.print(string_concat("wait FAIL: ", e)); 1 }
-          Ok(Exited(0)) -> { Stdout.print("dead reader surfaced as error"); 0 }
-          Ok(_)         -> { Stdout.print("wait FAIL: abnormal exit"); 1 }
+    Ok(c)  -> match process.write_stdin(c, "x") {
+      Err(e) -> { Stdout.print(string_concat("first write FAIL: ", e)); 1 }
+      Ok(_)  ->
+        # 16 bytes doubled 12 times = 64 KiB per attempt
+        if spam(c, mk_big("0123456789abcdef", 12), 64) == false {
+          Stdout.print("FAIL: no write error after 4 MiB")
+          1
+        } else {
+          match process.wait(c) {
+            Err(e)        -> { Stdout.print(string_concat("wait FAIL: ", e)); 1 }
+            Ok(Exited(0)) -> { Stdout.print("dead reader surfaced as error"); 0 }
+            Ok(_)         -> { Stdout.print("wait FAIL: abnormal exit"); 1 }
+          }
         }
-      }
+    }
   }
