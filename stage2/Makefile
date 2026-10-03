@@ -2853,16 +2853,18 @@ test-mutate-site-data: $(TARGET) build
 # fixture, run `--dump-call-elision` and diff against the golden.
 # The fixture set covers alpha-matching (alpha_equiv), operator
 # canonicalisation (operator_flip), literal call-site (call_site_literal),
-# refined-binding call-site (call_site_refined), and the unrefined
-# fall-through (call_site_unproven). The negative fixture lives in
-# test-call-elision-neg below.
+# refined-binding call-site (call_site_refined), the unrefined
+# fall-through (call_site_unproven), and calls spelled as a pipe,
+# placeholder, applied lambda or constant (call_site_pipe). The
+# negative fixture lives in test-call-elision-neg below.
 test-call-elision: $(TARGET) build
 	@set -e; \
 	for f in ../examples/intervals/alpha_equiv.kai \
 	         ../examples/intervals/operator_flip.kai \
 	         ../examples/intervals/call_site_literal.kai \
 	         ../examples/intervals/call_site_refined.kai \
-	         ../examples/intervals/call_site_unproven.kai; do \
+	         ../examples/intervals/call_site_unproven.kai \
+	         ../examples/intervals/call_site_pipe.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
 	  $(KAIC2) $(TEST_CORE_CACHE) --dump-call-elision $$f > build/ce-$$name.out 2>&1 \

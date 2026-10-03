@@ -28,9 +28,9 @@
 #   shared with the post-parse synthesiser in main.kai.
 # - try_eval_int / try_eval_pred — the partial evaluator; try_eval_int
 #   is also used by the `^` integer-power codegen (C and LLVM paths).
-# - check_call_site_refinements / dump_call_elision — the issue #83
-#   call-site analysis entry points, driven from main.kai's pipeline
-#   and the --dump-call-elision flag.
+# - check_call_site_refinements / dump_call_elision — the call-site
+#   analysis over the typed program, driven from the driver after
+#   inference and from the --dump-call-elision flag.
 #
 # Cross-module dependencies
 #
@@ -56,6 +56,7 @@ import compiler.expr_positions
 import compiler.sym_read
 import compiler.intervals
 import compiler.refine_help
+import compiler.call_site_target
 
 # m12.6.x #3 v2: the synthesised pred-fn name for a refinement-type
 # alias. Centralised so the call-site builder and the post-parse
@@ -1136,9 +1137,11 @@ fn eval_real_cmp(op: String, a: Real, b: Real) : Bool {
 # Issue #83 sub-case 3 — call-site substitution analysis
 # ====================================================================
 #
-# Walks every user fn looking for `ECall(EVar(callee), args)` whose
-# callee's `requires` clauses (or refined-param predicates) can be
-# discharged at compile time from what we know about the args:
+# Walks every typed fn body looking for calls whose callee, named by id,
+# has `requires` clauses (or refined-param predicates) that can be
+# discharged at compile time from what we know about the args. It runs
+# after inference, where a pipe is the call it spells; a placeholder's
+# immediately applied lambda and a constant argument are seen through:
 #
 #   1. **Literal arg**: substitute the integer into the callee's
 #      predicate and run `try_eval_pred`.
@@ -1150,9 +1153,7 @@ fn eval_real_cmp(op: String, a: Real, b: Real) : Bool {
 #   3. **Unrefined-binding arg**: no info, leave the runtime assert
 #      in place. Status quo.
 #
-# The analysis is intentionally a syntactic AST pass — it sees the
-# parser's `TyRefine` shape directly, with no need for the
-# `infer_program` substitution. Two outputs:
+# Two outputs:
 #
 #   - `--dump-call-elision`: per call-site report, useful for
 #     fixtures.
@@ -1167,7 +1168,11 @@ fn eval_real_cmp(op: String, a: Real, b: Real) : Bool {
 # param's name is the refinement's `self` stand-in.
 type CalleeReq = CRq(String, Expr)
 
-type CalleeSig = CSig(String, [String], [CalleeReq])  # name, param names, requirements
+type CalleeSig = CSig(String, SymId, [String], [CalleeReq])  # name, id, param names, requirements
+
+# What a call-site walk consults: the contracted callees and the
+# constants an argument may name.
+type CallCtx = CallCtx([CalleeSig], [ConstVal])
 
 # Build the table of fns with non-empty contracts. Tparam-rewritten
 # fns (`with_protocol_tparams`) are skipped — protocol impls are
@@ -1181,12 +1186,12 @@ fn collect_callee_sigs_loop(decls: [Decl], acc: [CalleeSig]) : [CalleeSig] {
   match decls {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DFn(_, name, _, params, _, _, body, _, _, _, _) -> {
+      DFn(_, name, _, params, _, _, body, _, _, _, fid) -> {
         let reqs = extract_callee_reqs(params, body)
-        if list_is_empty(reqs) { collect_callee_sigs_loop(rest, acc) }
+        if list_is_empty(reqs) or sym_raw(fnid_sym(fid)) < 0 { collect_callee_sigs_loop(rest, acc) }
         else {
           let pnames = collect_param_names(params, [])
-          collect_callee_sigs_loop(rest, [CSig(name, pnames, reqs), ...acc])
+          collect_callee_sigs_loop(rest, [CSig(name, fnid_sym(fid), pnames, reqs), ...acc])
         }
       }
       _ -> collect_callee_sigs_loop(rest, acc)
@@ -1525,51 +1530,60 @@ fn expr_pred_is_scalar_lit(e: Expr) : Bool = match e.kind {
   _ -> false
 }
 
-# Walk a body expression collecting reports for every ECall(EVar, ...).
-# Calls into anonymous lambdas, method calls, etc. are skipped — the
-# entailment table is keyed by fn name and we don't track higher-order
-# values.
-# A call site names its callee whether or not resolve stamped it: the
-# signature table is keyed by the declared name either way.
-fn rf_callee_name(k: ExprKind) : Option[String] = match k {
-  EVar(n)    -> Some(n)
-  ESym(_, _, n) -> Some(n)
-  _          -> None
-}
-
-fn analyze_calls(e: Expr, sigs: [CalleeSig], caller_refs: [RefBinding],
+# Walk a body expression collecting reports for every call whose callee
+# a contract table entry names by id. Calls through closures and
+# unresolved callees are skipped.
+fn analyze_calls(e: Expr, cx: CallCtx, caller_refs: [RefBinding],
                  acc: [CallSiteReport]) : [CallSiteReport] = match e.kind {
   ECall(callee, call_args) -> {
-    let acc1 = analyze_calls_in_args(call_args, sigs, caller_refs, acc)
-    match rf_callee_name(callee.kind) {
-      Some(fname) -> match lookup_callee_sig(sigs, fname) {
-        None -> acc1
-        Some(cs) -> match cs {
-          CSig(_, pnames, reqs) -> classify_call(fname, pnames, call_args, reqs, caller_refs, acc1, callee.line, callee.col)
-        }
-      }
-      None -> analyze_calls(callee, sigs, caller_refs, acc1)
+    let acc1 = analyze_calls_in_args(call_args, cx, caller_refs, acc)
+    match call_target(callee, call_args) {
+      Some(t) -> analyze_target(t, cx, caller_refs, acc1)
+      None -> analyze_calls(callee, cx, caller_refs, acc1)
     }
   }
-  _ -> analyze_calls_in_positions(xp_positions(e), sigs, caller_refs, acc)
+  _ -> analyze_calls_in_positions(xp_positions(e), cx, caller_refs, acc)
 }
 
-fn analyze_calls_in_args(call_args: [Expr], sigs: [CalleeSig], caller_refs: [RefBinding],
+fn analyze_target(t: CallTarget, cx: CallCtx, caller_refs: [RefBinding],
+                  acc: [CallSiteReport]) : [CallSiteReport] = match t {
+  CallTarget(id, site, args, binders, values) -> {
+    let acc1 = if list_is_empty(binders) { acc } else { analyze_calls_in_args(args, cx, caller_refs, acc) }
+    match cx {
+      CallCtx(sigs, consts) -> match lookup_callee_sig(sigs, id) {
+        None -> acc1
+        Some(CSig(fname, _, pnames, reqs)) ->
+          classify_call(fname, pnames, bound_args(args, binders, values, consts), reqs,
+                        caller_refs, acc1, site.line, site.col)
+      }
+    }
+  }
+}
+
+# The arguments as the callee receives them: lambda binders replaced by
+# the values applied to them, constants by their definitions.
+fn bound_args(args: [Expr], binders: [String], values: [Expr], consts: [ConstVal]) : [Expr] = match args {
+  [] -> []
+  [a, ...rest] -> [fold_const_refs(subst_params(a, binders, values), consts),
+                   ...bound_args(rest, binders, values, consts)]
+}
+
+fn analyze_calls_in_args(call_args: [Expr], cx: CallCtx, caller_refs: [RefBinding],
                           acc: [CallSiteReport]) : [CallSiteReport] = match call_args {
   [] -> acc
-  [a, ...rest] -> analyze_calls_in_args(rest, sigs, caller_refs, analyze_calls(a, sigs, caller_refs, acc))
+  [a, ...rest] -> analyze_calls_in_args(rest, cx, caller_refs, analyze_calls(a, cx, caller_refs, acc))
 }
 
-fn analyze_calls_in_positions(xs: [XPos], sigs: [CalleeSig], caller_refs: [RefBinding],
+fn analyze_calls_in_positions(xs: [XPos], cx: CallCtx, caller_refs: [RefBinding],
                                acc: [CallSiteReport]) : [CallSiteReport] = match xs {
   [] -> acc
-  [XP(_, x), ...rest] -> analyze_calls_in_positions(rest, sigs, caller_refs, analyze_calls(x, sigs, caller_refs, acc))
+  [XP(_, x), ...rest] -> analyze_calls_in_positions(rest, cx, caller_refs, analyze_calls(x, cx, caller_refs, acc))
 }
 
-fn lookup_callee_sig(sigs: [CalleeSig], name: String) : Option[CalleeSig] = match sigs {
+fn lookup_callee_sig(sigs: [CalleeSig], id: SymId) : Option[CalleeSig] = match sigs {
   [] -> None
   [s, ...rest] -> match s {
-    CSig(n, _, _) -> if n == name { Some(s) } else { lookup_callee_sig(rest, name) }
+    CSig(_, k, _, _) -> if sym_raw(k) == sym_raw(id) { Some(s) } else { lookup_callee_sig(rest, id) }
   }
 }
 
@@ -1631,12 +1645,19 @@ fn classify_requires_clause(pred: Expr, pnames: [String], call_args: [Expr],
   }
 }
 
-fn subst_params(pred: Expr, pnames: [String], call_args: [Expr]) : Expr = match pnames {
-  [] -> pred
-  [n, ...rest_n] -> match call_args {
-    [] -> pred
-    [a, ...rest_a] -> subst_params(subst_var(pred, n, a), rest_n, rest_a)
-  }
+# Simultaneous: an argument that mentions another parameter's name is
+# never substituted again.
+fn subst_params(pred: Expr, pnames: [String], call_args: [Expr]) : Expr = match pred.kind {
+  EVar(s) -> match arg_for_param(pnames, call_args, s) { Some(a) -> a  None -> pred }
+  EBinop(op, a, b) -> mk_expr(EBinop(op, subst_params(a, pnames, call_args), subst_params(b, pnames, call_args)), pred.line, pred.col)
+  EUnop(op, x) -> mk_expr(EUnop(op, subst_params(x, pnames, call_args)), pred.line, pred.col)
+  ECall(f, xs) -> mk_expr(ECall(subst_params(f, pnames, call_args), subst_params_list(xs, pnames, call_args)), pred.line, pred.col)
+  _ -> pred
+}
+
+fn subst_params_list(es: [Expr], pnames: [String], call_args: [Expr]) : [Expr] = match es {
+  [] -> []
+  [h, ...t] -> [subst_params(h, pnames, call_args), ...subst_params_list(t, pnames, call_args)]
 }
 
 fn arg_for_param(pnames: [String], call_args: [Expr], target: String) : Option[Expr] = match pnames {
@@ -1665,20 +1686,21 @@ fn free_var_of_pred(e: Expr) : Option[String] = match e.kind {
 
 # Drive analyze_calls over a whole program. Each fn body is walked
 # with the fn's own param refinements as the caller environment.
-fn analyze_program_calls(decls: [Decl], sigs: [CalleeSig]) : [CallSiteReport] {
-  analyze_program_calls_loop(decls, sigs, [])
+fn analyze_program_calls(decls: [Decl]) : [CallSiteReport] {
+  let cx = CallCtx(collect_callee_sigs(decls), collect_const_vals(decls))
+  analyze_program_calls_loop(decls, cx, [])
 }
 
-fn analyze_program_calls_loop(decls: [Decl], sigs: [CalleeSig],
+fn analyze_program_calls_loop(decls: [Decl], cx: CallCtx,
                                 acc: [CallSiteReport]) : [CallSiteReport] = match decls {
   [] -> list_reverse(acc)
   [d, ...rest] -> match d {
     DFn(_, _, _, params, _, _, body, _, _, _, _) -> {
       let refs = collect_caller_refinements(params, [])
-      let acc1 = analyze_calls(body, sigs, refs, acc)
-      analyze_program_calls_loop(rest, sigs, acc1)
+      let acc1 = analyze_calls(body, cx, refs, acc)
+      analyze_program_calls_loop(rest, cx, acc1)
     }
-    _ -> analyze_program_calls_loop(rest, sigs, acc)
+    _ -> analyze_program_calls_loop(rest, cx, acc)
   }
 }
 
@@ -1687,8 +1709,7 @@ fn analyze_program_calls_loop(decls: [Decl], sigs: [CalleeSig],
 # `--dump-intervals`: `callee.param @line:col -> status`.
 #[doc("Print the per-call-site refinement-elision report for the --dump-call-elision flag.")]
 pub fn dump_call_elision(file: String, decls: [Decl]) : Int / Console {
-  let sigs = collect_callee_sigs(decls)
-  let reports = analyze_program_calls(decls, sigs)
+  let reports = analyze_program_calls(decls)
   reports |> each(dump_call_elision_one)
   0
 }
@@ -1711,8 +1732,7 @@ fn dump_call_elision_one(r: CallSiteReport) : Unit / Console = match r {
 # entail > 0`. Returns the number of errors emitted.
 #[doc("Static check: error on each call passing a refined binding whose predicate is strictly weaker than the callee requires. Returns the error count.")]
 pub fn check_call_site_refinements(file: String, decls: [Decl]) : Int / Console {
-  let sigs = collect_callee_sigs(decls)
-  let reports = analyze_program_calls(decls, sigs)
+  let reports = analyze_program_calls(decls)
   check_call_site_loop(file, reports, 0)
 }
 
