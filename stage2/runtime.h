@@ -929,6 +929,10 @@ static int       kai_op_truthy(KaiValue *v);
 #endif
 #define KAI_CTR_INC(v) atomic_fetch_add_explicit(&(v), 1, memory_order_relaxed)
 
+/* The status the program chose (main's result or an explicit exit), plus one;
+ * 0 while the run has not chosen one, so a runtime abort reads as such. */
+KAI_RT_ATOMIC_COUNTER(kai_chosen_exit_plus1);
+
 /* Refcount tracing (m5 #0): always-compiled counters; the per-process
    report at exit is gated on the env var KAI_TRACE_RC. The counters
    add 4 increments per kai_alloc and 2 per kai_free_value — cheap
@@ -1187,8 +1191,12 @@ static const char *kai_rc_tag_name(int t) {
     }
 }
 
+typedef struct { int unstarted, started; } KaiExitFibers;
+static KaiExitFibers kai_rc_settle_exit_fibers(void);
+
 static void kai_rc_report(void) {
     if (!getenv("KAI_TRACE_RC")) return;
+    KaiExitFibers ef = kai_rc_settle_exit_fibers();
     KaiRcLedgerSum s;
     kai_rc_ledger_sum(&s);
     int64_t leaked = s.alloc_total - s.free_total;
@@ -1198,6 +1206,13 @@ static void kai_rc_report(void) {
         (long long) s.free_total,
         (long long) leaked,
         (long long) s.live_peak);
+    if (ef.unstarted > 0)
+        fprintf(stderr, "[KAI_TRACE_RC]   fibers_unstarted_at_exit=%d\n", ef.unstarted);
+    if (ef.started > 0)
+        fprintf(stderr, "[KAI_TRACE_RC]   fibers_started_at_exit=%d\n", ef.started);
+    int64_t chosen = atomic_load(&kai_chosen_exit_plus1);
+    if (chosen > 0) fprintf(stderr, "[KAI_TRACE_RC]   exit_code=%lld\n", (long long) (chosen - 1));
+    else            fprintf(stderr, "[KAI_TRACE_RC]   exit_code=abort\n");
     for (int i = 0; i < 16; i++) {
         if (s.alloc_by_tag[i] > 0) {
             fprintf(stderr, "[KAI_TRACE_RC]   tag %-7s allocs=%lld\n",
@@ -1332,6 +1347,7 @@ static const char *kai_rc_op_name(int32_t op) {
 
 static void kai_rc_strict_report(void) {
     if (getenv("KAI_TRACE_RC_QUIET")) return;
+    (void) kai_rc_settle_exit_fibers();
     KaiRcLedgerSum s;
     kai_rc_ledger_sum(&s);
     int64_t leaked = s.alloc_total - s.free_total;
@@ -7881,6 +7897,7 @@ static KaiValue *kai_core_panic(KaiValue *msg) {
 
 static KaiValue *kai_core_exit(KaiValue *code) {
     int c = (kai_is_int(code)) ? (int) kai_intf(code) : 0;
+    atomic_store(&kai_chosen_exit_plus1, (c & 0xff) + 1);
     kai_exit(c);
     return kai_unit();
 }
@@ -8980,7 +8997,9 @@ static void kai_set_args(int argc, char **argv) {
  * Returning the code lets libc run the full exit path; unlike
  * `os.process.exit`'s _exit(2), buffered stdio is still flushed. */
 static int kai_main_exit_status(KaiValue *result) {
-    return kai_is_int(result) ? (int) (kai_intf(result) & 0xff) : 0;
+    int status = kai_is_int(result) ? (int) (kai_intf(result) & 0xff) : 0;
+    atomic_store(&kai_chosen_exit_plus1, status + 1);
+    return status;
 }
 
 static KaiValue *kai_core_args(void) {
@@ -16744,6 +16763,49 @@ static void kai_sched_unpark(KaiFiber *target) {
     target->state = KAI_FIBER_READY;
     kai_parked_count--;
     kai_sched_enqueue(target);
+}
+
+/* At exit a queued fiber that never started holds only its spawn's
+ * references, so the ledger releases them and counts it apart; one that did
+ * start has live frames and is only counted. `cancel_pad_set` is clear
+ * exactly until the trampoline starts the body. */
+static KaiFiber *kai_exit_queue_take(KaiFiber **head, KaiFiber **tail) {
+    KaiFiber *f = *head;
+    *head = NULL;
+    *tail = NULL;
+    return f;
+}
+
+static KaiExitFibers kai_rc_settle_exit_fibers(void) {
+    static KaiExitFibers settled;
+    static int done;
+    if (done) return settled;
+    done = 1;
+    KaiFiber *queues[KAI_MAX_THREADS];
+    int nq = 0;
+    if (kai_nthreads > 1) {
+        for (int i = 0; i < kai_nthreads; i++) {
+            KaiSchedSlot *sl = &kai_sched_slots[i];
+            pthread_mutex_lock(&sl->mu);
+            queues[nq++] = kai_exit_queue_take(&sl->steal_head, &sl->steal_tail);
+            pthread_mutex_unlock(&sl->mu);
+        }
+        settled.started = atomic_load(&kai_blocked_fiber_count);
+    } else {
+        queues[nq++] = kai_exit_queue_take(&kai_ready_head, &kai_ready_tail);
+        settled.started = kai_parked_count;
+    }
+    for (int q = 0; q < nq; q++) {
+        for (KaiFiber *f = queues[q], *next; f; f = next) {
+            next = f->sched_next;
+            f->sched_next = NULL;
+            if (f->cancel_pad_set) { settled.started++; continue; }
+            settled.unstarted++;
+            f->state = KAI_FIBER_CANCELLED;
+            kai_decref(f->value);
+        }
+    }
+    return settled;
 }
 
 /* Trampoline: the entry point makecontext installs on every spawned
