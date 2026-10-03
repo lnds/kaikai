@@ -19789,36 +19789,15 @@ fn tbl_others(mods: [ModuleDecls], target_mod: String,
                   else { tbl_others(rest, target_mod, [m, ...acc]) }
 }
 
-# Walk decls left-to-right, bucketing each decl under its home
-# module. Buckets are accumulated in first-appearance order;
-# within a bucket decls keep source order.
-#
-# Two-phase walk:
-#   (`seen_anchor=false`): builtin / synthetic decls
-#     (`inject_builtin_effects` emits DEffect / DType for the
-#     canonical Stdout/Stderr/... before any user decl). They are
-#     untagged but conceptually language-level, not target-level.
-#     We collect them into the `__builtin__` bucket so the target
-#     does not absorb them.
-#   (`seen_anchor=true`): every untagged decl is target-
-#     authored (the cascade preserves source order, so once any
-#     anchored decl appears we are past the synthetic core).
-#
-# The phase flip happens at the first decl carrying an explicit
-# `module_origin` of its own.
+# Bucket each decl under its home module. Buckets keep first-appearance
+# order; within a bucket decls keep source order.
 fn partition_by_homes_loop(decls: [Decl], target_mod: String,
                               acc: [HomeBucket]) : [ModuleDecls] =
   buckets_finish(partition_by_homes_walk(decls, target_mod, "__builtin__", acc), [])
 
-# Walk decls left-to-right, threading the running `current_anchor`
-# module (= the home of the most recently seen DFn / DType /
-# DAttribPure that carried an explicit `module_origin`). Decls
-# whose own kind cannot carry a `module_origin` (DEffect, DUnit,
-# DUse) attribute to the `current_anchor` — they live in the same
-# physical .kai file as the surrounding tagged DFns. The starting
-# anchor is `__builtin__`, so any untagged decl emitted before
-# the first real module's first tagged DFn (the synthetic
-# `inject_builtin_effects` block) lands in `__builtin__`.
+# Walk decls left-to-right, threading the running anchor: the home of
+# the nearest decl that names one, which a decl with no origin slot
+# inherits. The starting anchor is `__builtin__`.
 fn partition_by_homes_walk(decls: [Decl], target_mod: String,
                               current_anchor: String,
                               acc: [HomeBucket]) : [HomeBucket] = match decls {
@@ -19830,95 +19809,63 @@ fn partition_by_homes_walk(decls: [Decl], target_mod: String,
       None    -> current_anchor
     }
     let home = decide_partition_home(d, target_mod, anchor1)
-    # once a genuine target-authored decl (a `mo = None`
-    # DFn, which `decide_partition_home` routes to `target_mod`) is
-    # seen, advance the anchor to `target_mod` so the target file's own
-    # `test`/`bench` blocks — which carry no origin and now resolve to
-    # the anchor — stay in the target bucket rather than leaking back
-    # to the last core module. Core tests keep their module's
-    # anchor; only the post-core target decls flip this.
     let next_anchor = if home == target_mod { target_mod } else { anchor1 }
     let acc1 = bucket_push(acc, home, d, [])
     partition_by_homes_walk(rest_d, target_mod, next_anchor, acc1)
   }
 }
 
-# Per-decl bucketing rule, given the running anchor module:
-#   - DFn with an explicit `mo`: that module (anchor).
-#   - DFn with `mo = None`: `target_mod` (target-authored fns).
-#   - DType with `mo = Some(m)`: that module.
-#   - DType with `mo = None`: `anchor` (untagged DType belongs
-#     to the same physical file as the surrounding tagged DFns).
-#   - DEffect with `mo = Some(m)`: that module; `mo = None`:
-#     `target_mod` (a root-declared effect is target-authored).
-#   - DUnit / DUse / DAxiom: `anchor` for the same "same-file" reason.
-#   - DTest / DBench / DCheck: `target_mod` (these never live
-#     inside a core file).
-#   - Wrappers (DAttribPure, DDerive, DUnstable, DImpl): recurse
-#     into the inner decl.
+# Per-decl bucketing rule. Every decl kind with a `module_origin` slot
+# is stamped at load time for an imported or core module, so an empty
+# slot means the root file wrote it: it goes to `target_mod`. Only the
+# kinds with no slot (`use`, a non-`pub` axiom) follow the running
+# anchor, the home of the nearest decl before them.
 fn decide_partition_home(d: Decl, target_mod: String,
-                            anchor: String) : String = match d {
-  DFn(_, _, _, _, _, _, _, _, _, mo, fsym) -> match mo {
-    Some(m) -> m
-    None    -> target_mod
-  }
-  DType(_, _, _, _, _, _, mo, _, _) -> match mo {
-    Some(m) -> m
-    None    -> anchor
-  }
-  DEffect(_, _, _, _, _, _, _, mo, _) -> match mo {
-    Some(m) -> m
-    None    -> target_mod
-  }
-  DUnit(_, _, _, _, _, _, _)             -> anchor
-  DUse(_, _, _)                        -> anchor
-  DUseKind(_, _, _, _)                 -> anchor
-  DAxiom(_, _, _, _, _, _, _, _, _, _) -> anchor
-  # a `test`/`bench`/`check` block lives in the same
-  # physical .kai file as the surrounding decls, so it belongs to the
-  # running `anchor` module — NOT unconditionally `target_mod`. The
-  # old `-> target_mod` rule assumed tests never appear in a core
-  # module file; when a core module IS the intrinsic-test target it
-  # sent core/char.kai's test blocks to the target bucket, *creating*
-  # that bucket before tuple/option/list contributed their records, so
-  # the target was typed too early and could not see `Pair`/`Option`.
-  # With the anchor seeded to `target_mod` once a genuine target decl
-  # is seen (see `partition_by_homes_walk`), a target-authored test
-  # still resolves to `target_mod` while a core test stays with its module.
-  DTest(_, _, _, _, _)                    -> anchor
-  DBench(_, _, _, _, _)                   -> anchor
-  DCheck(_, _, _, _, _, _)                -> anchor
-  DDerive(_, inner, _, _)              -> decide_partition_home(inner, target_mod, anchor)
-  DUnstable(inner, _, _)               -> decide_partition_home(inner, target_mod, anchor)
-  DProtoLaws(_, inner, _, _, _)           -> decide_partition_home(inner, target_mod, anchor)
-  DImplAxiom(_, inner, _, _, _)           -> decide_partition_home(inner, target_mod, anchor)
-  DConstructor(inner, _, _)            -> decide_partition_home(inner, target_mod, anchor)
-  DImpl(_, _, _, sub, _, _, _, _)            -> match sub {
-    [] -> anchor
-    [m, ..._] -> decide_partition_home(m, target_mod, anchor)
-  }
-  _ -> anchor
+                            anchor: String) : String = match decl_explicit_module_origin(d) {
+  Some(m) -> m
+  None    -> if decl_has_origin_slot(d) { target_mod } else { anchor }
 }
 
-# Like `decl_explicit_home` but specialised for the partition
-# walker: returns `Some(m)` when this decl declares its OWN home,
-# `None` when it inherits from the running anchor. DType and DEffect
-# count as explicit because the `tag_*` passes write their `mo`;
-# DUnit does not (it carries no `module_origin` field).
+# Wrappers delegate to the decl they wrap; an impl to its first method.
 fn decl_explicit_module_origin(d: Decl) : Option[String] = match d {
-  DFn(_, _, _, _, _, _, _, _, _, mo, fsym) -> mo
-  DType(_, _, _, _, _, _, mo, _, _)        -> mo
-  DEffect(_, _, _, _, _, _, _, mo, _)   -> mo
-  DDerive(_, inner, _, _)         -> decl_explicit_module_origin(inner)
-  DUnstable(inner, _, _)          -> decl_explicit_module_origin(inner)
-  DProtoLaws(_, inner, _, _, _)      -> decl_explicit_module_origin(inner)
-  DImplAxiom(_, inner, _, _, _)      -> decl_explicit_module_origin(inner)
-  DConstructor(inner, _, _)       -> decl_explicit_module_origin(inner)
-  DImpl(_, _, _, sub, _, _, _, _)       -> match sub {
+  DFn(_, _, _, _, _, _, _, _, _, mo, _)   -> mo
+  DType(_, _, _, _, _, _, mo, _, _)       -> mo
+  DEffect(_, _, _, _, _, _, _, mo, _)     -> mo
+  DProtocol(_, _, _, _, _, _, mo, _)      -> mo
+  DConst(_, _, _, _, mo, _, _, _)         -> mo
+  DExternType(_, _, _, _, mo)             -> mo
+  DKind(_, _, _, _, _, _, _, mo)          -> mo
+  DTheory(_, _, _, _, mo)                 -> mo
+  DUnit(_, _, _, _, _, _, mo)             -> mo
+  DUseKind(_, _, _, mo)                   -> mo
+  DTest(_, _, _, _, mo)                   -> mo
+  DBench(_, _, _, _, mo)                  -> mo
+  DCheck(_, _, _, _, _, mo)               -> mo
+  DDerive(_, inner, _, _)                 -> decl_explicit_module_origin(inner)
+  DUnstable(inner, _, _)                  -> decl_explicit_module_origin(inner)
+  DProtoLaws(_, inner, _, _, _)           -> decl_explicit_module_origin(inner)
+  DImplAxiom(_, inner, _, _, _)           -> decl_explicit_module_origin(inner)
+  DConstructor(inner, _, _)               -> decl_explicit_module_origin(inner)
+  DImpl(_, _, _, sub, _, _, _, _)         -> match sub {
     [] -> None
     [m, ..._] -> decl_explicit_module_origin(m)
   }
   _ -> None
+}
+
+fn decl_has_origin_slot(d: Decl) : Bool = match d {
+  DUse(_, _, _)                        -> false
+  DAxiom(_, _, _, _, _, _, _, _, _, _) -> false
+  DImpl(_, _, _, sub, _, _, _, _)      -> match sub {
+    [] -> false
+    [m, ..._] -> decl_has_origin_slot(m)
+  }
+  DDerive(_, inner, _, _)              -> decl_has_origin_slot(inner)
+  DUnstable(inner, _, _)               -> decl_has_origin_slot(inner)
+  DProtoLaws(_, inner, _, _, _)        -> decl_has_origin_slot(inner)
+  DImplAxiom(_, inner, _, _, _)        -> decl_has_origin_slot(inner)
+  DConstructor(inner, _, _)            -> decl_has_origin_slot(inner)
+  _ -> true
 }
 
 fn opt_str_is_some(o: Option[String]) : Bool = match o {
