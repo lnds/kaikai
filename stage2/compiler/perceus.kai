@@ -2474,7 +2474,7 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_se
       # outside the Perceus scope so EVar reads of them are not
       # rewritten into `__perceus_dup` calls (which expect boxed
       # arguments).
-      PcsRwStmt { stmt: SLet(pat, ty_opt, rhs1),
+      PcsRwStmt { stmt: SLet(pcs_let_pat_elide(pat, uses), ty_opt, rhs1),
                   scope: prc_pat_bindings_skip_raw(pat, rhs, scope) }
     }
     SVar(name, ty_opt, rhs, ln, cl) -> {
@@ -4077,9 +4077,8 @@ fn pcs_blb_payer_ok(nm: String, ot: Option[Expr], fn_name: String) : Bool = matc
 
 # Block-exit drops for the `let`s this block binds whose payer is the exit
 # (`pcs_let_payer`). A binding read in the tail is left to
-# `ptd_tail_exit_drops`, which releases after the tail value exists.
-# Destructuring lets are paid by `emit_let_stmt`, which decrefs the composite
-# temp, and raw locals carry no rc.
+# `ptd_tail_exit_drops`, which releases after the tail value exists. Raw
+# locals carry no rc.
 fn pcs_collect_block_let_exit_drops(stmts: [Stmt], uses: [Use], opt_tail: Option[Expr],
                                      move_last_set: [String], force_set: [String],
                                      acc: [Stmt]) : [Stmt] {
@@ -4095,13 +4094,36 @@ fn pcs_collect_block_let_exit_drops(stmts: [Stmt], uses: [Use], opt_tail: Option
               [pcs_make_drop_stmt(nm, pat.line, pat.col), ...acc]
             } else { acc }
           }
-          _ -> acc
+          PWild -> acc
+          _ -> pcs_drop_stmts(pcs_let_exit_paid(pcs_let_pat_elide(pat, uses), uses, opt_tail, move_last_set, force_set),
+                              pat.line, pat.col, acc)
         }
         _ -> acc
       }
       pcs_collect_block_let_exit_drops(rest, uses, opt_tail, move_last_set, force_set, acc1)
     }
   }
+}
+
+# A destructuring `let` binds each name with its own reference, as an arm
+# does: a never-read plain binder is elided to `_`, so it takes none.
+fn pcs_let_pat_elide(pat: Pattern, uses: [Use]) : Pattern = match pat.pkind {
+  PBind(_) -> pat
+  _        -> pcs_pat_elide(pat, pcs_arm_elide_names(pat, uses, []))
+}
+
+# The binders of a destructuring `let` the block exit pays: each holds a
+# bind-time reference, owed like an arm binder's.
+fn pcs_let_exit_paid(pat: Pattern, uses: [Use], opt_tail: Option[Expr],
+                     move_last_set: [String], force_set: [String]) : [String] =
+  filter(prc_pat_bindings(pat, []), (nm) => {
+    pcs_pays(pcs_arm_payer(nm, uses, list_has(move_last_set, nm), list_has(force_set, nm)), PyExit)
+      and not pcs_name_in_tail(nm, opt_tail)
+  })
+
+fn pcs_drop_stmts(names: [String], ln: Int, cl: Int, acc: [Stmt]) : [Stmt] = match names {
+  [] -> acc
+  [nm, ...rest] -> pcs_drop_stmts(rest, ln, cl, [pcs_make_drop_stmt(nm, ln, cl), ...acc])
 }
 
 fn pcs_name_in_tail(nm: String, opt_tail: Option[Expr]) : Bool = match opt_tail {
