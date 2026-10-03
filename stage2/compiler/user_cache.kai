@@ -239,17 +239,23 @@ fn uc_scan_dot(src: String, toks: [Token], acc: String) : UcDottedPath = match t
 # to memo; it is then replayed into the caller under the caller's dedup.
 # Walking in the caller's state directly would bake that caller's
 # already-visited set into the memo and make it unsound to reuse.
+#
+# Because each closure starts with an empty visited set, `open` (the files
+# whose closures are still being walked) is what stops an import cycle: a
+# file met again on its own path is cut. A cycle fails the build when the
+# resolver reaches it, and a parse blob depends only on its own source, so
+# a cut closure costs reuse at most.
 fn uc_hash_dep(base_dir: String, mod_path: String,
-               search_paths: [String], st: UcDepState)
+               search_paths: [String], open: [String], st: UcDepState)
                : UcDepState / Console + File =
   match find_module_file(base_dir, mod_path, search_paths) {
     CF(raw_path, opt_src) -> {
       let abs = abspath(raw_path)
-      if uds_seen(st, abs) { st }
+      if uds_seen(st, abs) or list_has(open, abs) { st }
       else { match uc_memo_get(uds_memo(st), abs) {
         Some(pairs) -> uds_replay(st, pairs)
         None -> {
-          let sub = uc_hash_dep_fresh(abs, opt_src, search_paths,
+          let sub = uc_hash_dep_fresh(abs, opt_src, search_paths, [abs, ...open],
                                       UDS([], [], uds_memo(st)))
           match sub { UDS(_, pairs, m) ->
             uds_replay(uds_with_memo(st, uc_memo_put(m, abs, pairs)), pairs)
@@ -261,7 +267,7 @@ fn uc_hash_dep(base_dir: String, mod_path: String,
 
 # Walk one file's own closure from an isolated state.
 fn uc_hash_dep_fresh(abs: String, opt_src: Option[String],
-                     search_paths: [String], st: UcDepState)
+                     search_paths: [String], open: [String], st: UcDepState)
                      : UcDepState / Console + File = match opt_src {
   # A missing dep hashes to empty but is still recorded distinct
   # from a present one, so its later appearance reinvalidates.
@@ -269,16 +275,16 @@ fn uc_hash_dep_fresh(abs: String, opt_src: Option[String],
   Some(src) -> {
     let st1 = uds_push(st, abs, uc_content_hex(src))
     let imports = uc_import_paths(src, tokenize(src))
-    uc_hash_deps(dir_of(abs), imports, search_paths, st1)
+    uc_hash_deps(dir_of(abs), imports, search_paths, open, st1)
   }
 }
 
 fn uc_hash_deps(base_dir: String, mods: [String],
-                search_paths: [String], st: UcDepState)
+                search_paths: [String], open: [String], st: UcDepState)
                 : UcDepState / Console + File = match mods {
   [] -> st
-  [m, ...rest] -> uc_hash_deps(base_dir, rest, search_paths,
-                                uc_hash_dep(base_dir, m, search_paths, st))
+  [m, ...rest] -> uc_hash_deps(base_dir, rest, search_paths, open,
+                                uc_hash_dep(base_dir, m, search_paths, open, st))
 }
 
 #[doc("Transitive dependency hash for a file: string_hash over the concatenated content hashes of every import reachable from it, in stable discovery order, as 16 hex chars. Imports are recovered by token scan, so this never parses. Changes when any transitive import changes. Returns the hash alongside the memo, grown with every closure walked, for the next file in the same compile.")]
@@ -286,7 +292,7 @@ pub fn uc_dep_hex_memo(root_path: String, src: String, toks: [Token],
                        search_paths: [String], memo: UcDepMemo)
                        : UcDepHex / Console + File = {
   let st = uc_hash_deps(dir_of(root_path), uc_import_paths(src, toks),
-                         search_paths, UDS([], [], memo))
+                         search_paths, [abspath(root_path)], UDS([], [], memo))
   match st { UDS(_, pairs, m) ->
     UDHex(uc_hash_hex16(string_hash(concat_all(uc_pair_hexes(pairs, [])))), m)
   }
