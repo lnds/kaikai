@@ -28,6 +28,7 @@ pattern): it does not mutate the AST.
 
 import compiler.ast
 import compiler.util
+import compiler.infer_index
 
 #[doc("One node of the tail-call graph: a top-level function's name, its module origin, its arity, and the id of the declaration it stands for. Arity is carried because a call whose argument count differs from the declaration is not a tail call the rewrite can fuse; the id is what a resolved call matches on, so two same-named functions are two nodes whatever they spell.")]
 pub type TgNode = TgN(String, Option[String], Int, SymId)
@@ -75,7 +76,6 @@ fn tg_collect_nodes(decls: [Decl]) : [TgNode] = match decls {
     Some(n) -> [n, ...tg_collect_nodes(rest)]
     None    -> tg_collect_nodes(rest)
   }
-  _ -> []
 }
 
 fn tg_node_of_decl(d: Decl) : Option[TgNode] = match d {
@@ -83,26 +83,32 @@ fn tg_node_of_decl(d: Decl) : Option[TgNode] = match d {
   _ -> None
 }
 
-fn tg_find_node(ns: [TgNode], name: String, mo: Option[String], i: Int) : Int = match ns {
-  [] -> 0 - 1
-  [n, ...rest] ->
-    if tgnode_name(n) == name and mo_eq(tgnode_mo(n), mo) { i }
-    else { tg_find_node(rest, name, mo, i + 1) }
-  _ -> 0 - 1
+# The nodes with their list index, by name and by declaration id; each
+# chain keeps list order, so its first hit is the list's first hit.
+type TgIx = { by_name: NameIndex[(Int, TgNode)], by_sym: NameIndex[(Int, TgNode)] }
+
+fn tg_index(rev: [(Int, TgNode)], ix: TgIx) : TgIx = match rev {
+  [] -> ix
+  [(i, n), ...rest] -> tg_index(rest, TgIx { by_name: idx_prepend(ix.by_name, tgnode_name(n), (i, n)),
+                                             by_sym: idx_prepend_sym(ix.by_sym, tgnode_sym(n), (i, n)) })
 }
 
-fn tg_node_at(ns: [TgNode], i: Int) : Option[TgNode] = match ns {
+fn tg_numbered(ns: [TgNode], i: Int, acc: [(Int, TgNode)]) : [(Int, TgNode)] = match ns {
+  [] -> acc
+  [n, ...rest] -> tg_numbered(rest, i + 1, [(i, n), ...acc])
+}
+
+fn tg_first(chain: [(Int, TgNode)], hit: (TgNode) -> Bool) : Option[(Int, TgNode)] = match chain {
   [] -> None
-  [n, ...rest] -> if i <= 0 { Some(n) } else { tg_node_at(rest, i - 1) }
-  _ -> None
+  [(i, n), ...rest] -> if hit(n) { Some((i, n)) } else { tg_first(rest, hit) }
 }
 
 # ---- edges ---------------------------------------------------------
 
 fn tg_collect_edges(decls: [Decl], nodes: [TgNode]) : [TgEdge] =
-  tg_edges_loop(decls, nodes, 0, [])
+  tg_edges_loop(decls, tg_index(tg_numbered(nodes, 0, []), TgIx { by_name: idx_empty(), by_sym: idx_empty() }), 0, [])
 
-fn tg_edges_loop(decls: [Decl], nodes: [TgNode], i: Int, acc: [TgEdge]) : [TgEdge] {
+fn tg_edges_loop(decls: [Decl], nodes: TgIx, i: Int, acc: [TgEdge]) : [TgEdge] {
   match decls {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
@@ -111,30 +117,28 @@ fn tg_edges_loop(decls: [Decl], nodes: [TgNode], i: Int, acc: [TgEdge]) : [TgEdg
           tg_add_targets(tg_tail_targets(body, mo, nodes, []), nodes, i, acc))
       _ -> tg_edges_loop(rest, nodes, i, acc)
     }
-    _ -> list_reverse(acc)
   }
 }
 
-fn tg_add_targets(targets: [Int], nodes: [TgNode], from: Int, acc: [TgEdge]) : [TgEdge] {
+fn tg_add_targets(targets: [Int], nodes: TgIx, from: Int, acc: [TgEdge]) : [TgEdge] {
   match targets {
     [] -> acc
     [t, ...rest] ->
       if tg_has_edge(acc, from, t) { tg_add_targets(rest, nodes, from, acc) }
       else { tg_add_targets(rest, nodes, from, [TgE(from, t), ...acc]) }
-    _ -> acc
   }
 }
 
+# The edges of `from` sit at the head of `es`: they are the last added.
 fn tg_has_edge(es: [TgEdge], from: Int, to: Int) : Bool = match es {
   [] -> false
-  [TgE(a, b), ...rest] -> if a == from and b == to { true } else { tg_has_edge(rest, from, to) }
-  _ -> false
+  [TgE(a, b), ...rest] -> if a != from { false } else if b == to { true } else { tg_has_edge(rest, from, to) }
 }
 
-fn tg_tail_targets(body: Expr, mo: Option[String], nodes: [TgNode], scope: [String]) : [Int] =
+fn tg_tail_targets(body: Expr, mo: Option[String], nodes: TgIx, scope: [String]) : [Int] =
   tg_walk_tail(body.kind, mo, nodes, scope)
 
-fn tg_walk_tail(k: ExprKind, mo: Option[String], nodes: [TgNode], scope: [String]) : [Int] {
+fn tg_walk_tail(k: ExprKind, mo: Option[String], nodes: TgIx, scope: [String]) : [Int] {
   match k {
     ECall(f, xs) -> tg_call_target(f.kind, list_length(xs), mo, nodes, scope)
     EIf(_, t, opt_e) ->
@@ -146,26 +150,25 @@ fn tg_walk_tail(k: ExprKind, mo: Option[String], nodes: [TgNode], scope: [String
   }
 }
 
-fn tg_walk_opt(opt_e: Option[Expr], mo: Option[String], nodes: [TgNode], scope: [String]) : [Int] =
+fn tg_walk_opt(opt_e: Option[Expr], mo: Option[String], nodes: TgIx, scope: [String]) : [Int] =
   match opt_e {
     None    -> []
     Some(e) -> tg_walk_tail(e.kind, mo, nodes, scope)
   }
 
-fn tg_walk_arms(arms: [Arm], mo: Option[String], nodes: [TgNode], scope: [String]) : [Int] {
+fn tg_walk_arms(arms: [Arm], mo: Option[String], nodes: TgIx, scope: [String]) : [Int] {
   match arms {
     [] -> []
     [Arm(pat, _, abody), ...rest] ->
       list_append(tg_walk_tail(abody.kind, mo, nodes, pat_bindings(pat, scope)),
                   tg_walk_arms(rest, mo, nodes, scope))
-    _ -> []
   }
 }
 
 # A tail that only reads back a `let` from the same block hides the
 # call in that binding; the call is the real tail position.
 fn tg_walk_block(stmts: [Stmt], opt_tail: Option[Expr], mo: Option[String],
-                 nodes: [TgNode], scope: [String]) : [Int] {
+                 nodes: TgIx, scope: [String]) : [Int] {
   match opt_tail {
     None    -> []
     Some(e) -> tg_walk_block_tail(e, stmts, mo, nodes, scope)
@@ -173,7 +176,7 @@ fn tg_walk_block(stmts: [Stmt], opt_tail: Option[Expr], mo: Option[String],
 }
 
 fn tg_walk_block_tail(e: Expr, stmts: [Stmt], mo: Option[String],
-                      nodes: [TgNode], scope: [String]) : [Int] {
+                      nodes: TgIx, scope: [String]) : [Int] {
   match e.kind {
     EVar(tn) -> if tg_is_ret_wrap(tn) { tg_walk_ret_wrap(stmts, tn, mo, nodes, scope) } else { [] }
     _        -> tg_walk_tail(e.kind, mo, nodes, scope)
@@ -181,7 +184,7 @@ fn tg_walk_block_tail(e: Expr, stmts: [Stmt], mo: Option[String],
 }
 
 fn tg_walk_ret_wrap(stmts: [Stmt], tn: String, mo: Option[String],
-                    nodes: [TgNode], scope: [String]) : [Int] {
+                    nodes: TgIx, scope: [String]) : [Int] {
   match tg_find_let_rhs(stmts, tn) {
     Some(inner) -> tg_walk_tail(inner.kind, mo, nodes, scope)
     None        -> []
@@ -196,7 +199,6 @@ fn tg_find_let_rhs(stmts: [Stmt], target: String) : Option[Expr] = match stmts {
     SLet(p, _, rhs) -> if tg_pattern_binds(p, target) { Some(rhs) } else { tg_find_let_rhs(rest, target) }
     _ -> tg_find_let_rhs(rest, target)
   }
-  _ -> None
 }
 
 fn tg_pattern_binds(p: Pattern, target: String) : Bool = match p.pkind {
@@ -205,7 +207,7 @@ fn tg_pattern_binds(p: Pattern, target: String) : Bool = match p.pkind {
 }
 
 fn tg_call_target(fk: ExprKind, argc: Int, mo: Option[String],
-                  nodes: [TgNode], scope: [String]) : [Int] {
+                  nodes: TgIx, scope: [String]) : [Int] {
   match fk {
     # A resolved callee names one declaration, so the node is found by
     # id and no (name, module) pair has to agree. A local binder still
@@ -221,38 +223,28 @@ fn tg_call_target(fk: ExprKind, argc: Int, mo: Option[String],
 }
 
 
-fn tg_resolve_sym(s: SymId, callee: String, mo: Option[String], argc: Int,
-                  nodes: [TgNode], scope: [String]) : [Int] {
-  if list_has(scope, callee) { [] }
-  else {
-    let i = tg_find_sym(nodes, s, 0)
-    if i < 0 { tg_resolve_in(callee, mo, argc, nodes, scope) }
-    else { tg_arity_ok(nodes, i, argc) }
-  }
-}
-
 # A node whose declaration is the one the call resolved to. Nodes built
 # from decls the resolver never stamped carry no id and never match.
-fn tg_find_sym(ns: [TgNode], s: SymId, i: Int) : Int = match ns {
-  [] -> 0 - 1
-  [n, ...rest] ->
-    if sym_raw(tgnode_sym(n)) >= 0 and sym_raw(tgnode_sym(n)) == sym_raw(s) { i }
-    else { tg_find_sym(rest, s, i + 1) }
-  _ -> 0 - 1
+fn tg_resolve_sym(s: SymId, callee: String, mo: Option[String], argc: Int,
+                  nodes: TgIx, scope: [String]) : [Int] {
+  if list_has(scope, callee) { [] }
+  else { match tg_first(idx_chain_sym(nodes.by_sym, s), (n) => sym_raw(tgnode_sym(n)) >= 0 and sym_raw(tgnode_sym(n)) == sym_raw(s)) {
+    Some(at) -> tg_arity_ok(at, argc)
+    None     -> tg_resolve_in(callee, mo, argc, nodes, scope)
+  } }
 }
 
 fn tg_resolve_in(callee: String, mo: Option[String], argc: Int,
-                 nodes: [TgNode], scope: [String]) : [Int] {
+                 nodes: TgIx, scope: [String]) : [Int] {
   if list_has(scope, callee) { [] }
-  else {
-    let i = tg_find_node(nodes, callee, mo, 0)
-    if i < 0 { [] } else { tg_arity_ok(nodes, i, argc) }
-  }
+  else { match tg_first(idx_chain(nodes.by_name, callee), (n) => tgnode_name(n) == callee and mo_eq(tgnode_mo(n), mo)) {
+    Some(at) -> tg_arity_ok(at, argc)
+    None     -> []
+  } }
 }
 
-fn tg_arity_ok(nodes: [TgNode], i: Int, argc: Int) : [Int] = match tg_node_at(nodes, i) {
-  Some(n) -> if tgnode_arity(n) == argc { [i] } else { [] }
-  None    -> []
+fn tg_arity_ok(at: (Int, TgNode), argc: Int) : [Int] = match at {
+  (i, n) -> if tgnode_arity(n) == argc { [i] } else { [] }
 }
 
 fn tg_modcall_is_own(callmod: String, mo: Option[String]) : Bool = match mo {
@@ -273,7 +265,6 @@ fn tg_block_scope(stmts: [Stmt], scope: [String]) : [String] {
       }
       tg_block_scope(rest, scope1)
     }
-    _ -> scope
   }
 }
 
@@ -290,7 +281,6 @@ fn tg_groups_from(g: TailGraph, idxs: [Int], seen: [Int]) : [TgGroup] {
     [i, ...rest] ->
       if tg_has_int(seen, i) { tg_groups_from(g, rest, seen) }
       else { tg_group_at(g, i, rest, seen) }
-    _ -> []
   }
 }
 
@@ -314,7 +304,6 @@ fn tg_keep_mutual(g: TailGraph, cands: [Int], i: Int, acc: [Int]) : [Int] {
     [c, ...rest] ->
       if tg_has_int(tg_reach_forward(g, [c], []), i) { tg_keep_mutual(g, rest, i, [c, ...acc]) }
       else { tg_keep_mutual(g, rest, i, acc) }
-    _ -> list_reverse(acc)
   }
 }
 
@@ -324,20 +313,17 @@ fn tg_reach_forward(g: TailGraph, frontier: [Int], seen: [Int]) : [Int] {
     [n, ...rest] ->
       if tg_has_int(seen, n) { tg_reach_forward(g, rest, seen) }
       else { tg_reach_forward(g, list_append(rest, tg_succs(tailgraph_edges(g), n)), [n, ...seen]) }
-    _ -> seen
   }
 }
 
 fn tg_succs(es: [TgEdge], from: Int) : [Int] = match es {
   [] -> []
   [TgE(a, b), ...rest] -> if a == from { [b, ...tg_succs(rest, from)] } else { tg_succs(rest, from) }
-  _ -> []
 }
 
 fn tg_has_int(xs: [Int], t: Int) : Bool = match xs {
   [] -> false
   [x, ...rest] -> if x == t { true } else { tg_has_int(rest, t) }
-  _ -> false
 }
 
 fn tg_index_range(n: Int, i: Int) : [Int] = if i >= n { [] } else { [i, ...tg_index_range(n, i + 1)] }
