@@ -369,10 +369,15 @@ A module's home is its **package-relative path**, not its basename, and
 the full identity is `(package, path)`. Two packages may each contain
 `net/http`.
 
-The home is assigned once, when the module is parsed, from its canonical
-path — never from the spelling the importing file used. Today the tag
-comes from the importer's chosen name, so a module's identity, and every
-symbol it emits, depends on which import first reached it.
+The home is assigned once, when the module is loaded, from the path it was
+imported through — never from the name the importing file bound it to.
+`import a.util` homes the module at `a__util` (a `.` is spelled `__`, so
+the home stays an identifier piece of every symbol minted from it), and
+`import a.util as u` homes it there too. The auto-loaded core modules form
+the prelude and keep their prelude names as homes (`list`, `string`); a
+user module whose path would take a core home is homed under `local__`.
+Two files that would still map to one home — `a__b.kai` beside `a/b.kai`
+— are rejected at the import that reaches the second, naming both files.
 
 Import aliases are per-file surface: `import loop as lp` makes `lp`
 resolve to the home `loop` in that file and never enters a global table.

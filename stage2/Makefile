@@ -12401,7 +12401,7 @@ test-issue-1870-derive-json-contested-field: $(TARGET) build
 # `home_tu` per-case partition: one fixture whose c-modular split lands
 # each symbol in the TU `home_tu` names. Asserts every decl-to-TU case
 # from one stream — a root pub fn in main.c, a root private fn + main +
-# lambdas in __root__.c, an imported pub fn in widget.c, and its
+# lambdas in __root__.c, an imported pub fn in lib__widget.c (`lib.widget`'s home), and its
 # program-dependent mono spec in __root__.c (module TUs stay
 # program-independent for the core-TU cache) — then runs the
 # whole-program build to pin the output. A shift in any case (the
@@ -12421,8 +12421,8 @@ test-home-tu-partition: $(TARGET) build
 	assert_tu "root private fn"    "kaiu_helper"                  "__root__.c"; \
 	assert_tu "fn main"            "kai_main.void. .$$"          "__root__.c"; \
 	assert_tu "root lambda"        "_kaiu_lam_main_19_14"         "__root__.c"; \
-	assert_tu "imported pub fn"    "kaiu_widget__label"           "widget.c"; \
-	assert_tu "cross-module spec"  "kaiu_widget__wrap__mono__Int" "__root__.c"; \
+	assert_tu "imported pub fn"    "kaiu_lib__widget__label"           "lib__widget.c"; \
+	assert_tu "cross-module spec"  "kaiu_lib__widget__wrap__mono__Int" "__root__.c"; \
 	$(KAIC2) --path ../stdlib --path $$fx $$fx/main.kai > build/home_tu_partition.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/home_tu_partition.c -o build/home_tu_partition $(LDLIBS_M); \
 	./build/home_tu_partition > build/home_tu_partition.out; \
