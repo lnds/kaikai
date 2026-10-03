@@ -236,6 +236,14 @@ Checks that the fast path builds the *same compiler* as the one in place: the fa
 - `make selfhost` — the byte-identity fixed point: `kaic2` compiles its own source to `kaic2b.c`, that compiles to `kaic2b`, which recompiles the source to `kaic2c.c`; asserts `kaic2b.c == kaic2c.c`. The definitive "did I break the compiler" check.
 - **Trust CI for the full battery.** Locally run the minimum gate (`make selfhost` + the smoke of your change); leave `tier1`/`tier1-native` to CI.
 
+## Adding a test target or a pin — files that do not conflict
+
+Shared lists and tables are laid out so that two PRs adding or changing *different* entries never conflict:
+
+- **tier1 light pool** — one target per line in `stage2/test-lists/light.txt`. **Native-wrapper pool** (the only list the native job runs) — `stage2/test-lists/native-wrapper.txt`. Keep each file sorted (`LC_ALL=C sort -u`); `test-light-partition` (tier0) fails on disorder or a repeat. Position does not matter: `tools/tier1-light-plan.sh` assigns shards by measured cost.
+- **`.PHONY`** — every target in those two lists is phony through `.PHONY: $(TEST_LIGHT_TARGETS) $(TEST_NATIVE_WRAPPER_TARGETS)`. Any other new target declares its own `.PHONY:` line next to its recipe; never extend the long `.PHONY: all …` line.
+- **Gate pins** — `tools/baselines/<gate>/<key>`, one file per fixture or axis (see `tools/baselines/README.md`). Add a file to pin, edit it to lower, delete it to retire.
+
 ## Backend parity — one fixture
 
 To diff a fixture's output between backends, use the harness, do not hand-roll native-vs-C:

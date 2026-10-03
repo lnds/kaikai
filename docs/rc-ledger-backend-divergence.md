@@ -115,7 +115,7 @@ column converges on native's.
 The ledger is sound on both backends. It is not the case that a leak measured
 on one backend is uninformative about the other — but the two columns are not
 interchangeable either, because they measure two genuinely different programs.
-`tools/rc-leak-baseline.txt` pinning both columns is correct, and stays correct.
+`tools/baselines/rc-leak/` pinning both columns is correct, and stays correct.
 
 The important consequence is the reverse of the one feared: a fixture whose
 columns differ is not a counting artefact to be normalised away. It is a

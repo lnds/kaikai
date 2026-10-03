@@ -258,7 +258,7 @@ What to use instead:
 - Use **ASAN with `KAI_NO_CELL_POOL`** as the detector. The pool is
   what hides the failure; turning it off is what makes a UAF abort at
   the point of the bug rather than somewhere unrelated later.
-- Treat `tools/rc-leak-baseline.txt` as a **ratchet, not a proof**. It
+- Treat `tools/baselines/rc-leak/` as a **ratchet, not a proof**. It
   catches a count that moves, which is its job; it cannot catch a count
   that was always wrong in a self-cancelling way.
 

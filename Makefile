@@ -173,7 +173,7 @@ demos-no-regression: kaic2
 	$(MAKE) -C demos no-regression
 
 # Perceus RC leak ledger: every examples/perceus fixture's allocation count
-# pinned in tools/rc-leak-baseline.txt. The corpus's other harnesses diff
+# pinned in tools/baselines/rc-leak/. The corpus's other harnesses diff
 # stdout, which a leak survives untouched.
 rc-leak-gate: kaic2
 	$(MAKE) -C stage2 rc-leak-gate
