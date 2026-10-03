@@ -15182,6 +15182,7 @@ static int kai_reactor_signal_drain(void) {
  * byte to the completion pipe to wake the scheduler. */
 static void *kai_filepool_worker(void *arg) {
     (void) arg;
+    kai_rc_ledger_register();
     for (;;) {
         pthread_mutex_lock(&kai_filepool_mu);
         while (!kai_filepool_q_head) {
@@ -15195,7 +15196,7 @@ static void *kai_filepool_worker(void *arg) {
         /* Sentinel item with NULL `work` signals shutdown — not
          * exercised in v1 (the runtime never tears down) but kept
          * symmetric with the queue protocol. */
-        if (!item->work) return NULL;
+        if (!item->work) { kai_rc_ledger_fold(); return NULL; }
 
         KaiValue *r = item->work(item->arg);
 
