@@ -42,6 +42,7 @@
 import compiler.ast
 import compiler.sym_read
 import compiler.util
+import compiler.core_prims
 import compiler.parse
 import compiler.infer
 import compiler.fnreg
@@ -288,26 +289,6 @@ fn pcs_borrow_decls(decls: [Decl], planned: Bool, acc: [BorrowDecl]) : [BorrowDe
   }
 }
 
-# Read-only runtime primitives that borrow their container. A closed
-# table (array_get arg0, array_length arg0): the prim reads the array
-# without consuming it, so the caller need not dup and the runtime
-# `_borrow` variant skips the container decref. Any other position is
-# owned as before. Not derived by body inspection (a prim has no kaikai
-# body) — this is the hard-coded dual of `pcs_borrow_params`.
-fn pcs_prim_borrow_positions(nm: String) : [Int] =
-  if nm == "array_get" or nm == "array_length" or
-     nm == "vec_get" or nm == "vec_length" { [0] } else { [] }
-
-# The borrow variant symbol for a read-only prim, or None if `nm` is not
-# a borrowing prim. The rename routes the call to the `_borrow` runtime
-# body that does NOT decref the container.
-fn pcs_prim_borrow_variant(nm: String) : Option[String] =
-  if nm == "array_get" { Some("array_get_borrow") }
-  else if nm == "array_length" { Some("array_length_borrow") }
-  else if nm == "vec_get" { Some("vec_get_borrow") }
-  else if nm == "vec_length" { Some("vec_length_borrow") }
-  else { None }
-
 # Seed the borrow map with the read-only prims, EXCEPT any a user fn
 # shadows (a user `fn array_get(...)` owns its arg; borrowing it would
 # be a use-after-free in user code). The same non-shadowed predicate
@@ -315,13 +296,13 @@ fn pcs_prim_borrow_variant(nm: String) : Option[String] =
 # them from one map entry makes a strip-without-rename (double free) or
 # rename-without-strip (leak) impossible.
 fn pcs_seed_prim_borrows(user_fns: [String], acc: [BorrowEntry]) : [BorrowEntry] =
-  pcs_seed_prim(["array_get", "array_length", "vec_get", "vec_length"], user_fns, acc)
+  pcs_seed_prim(core_borrowing_prims(), user_fns, acc)
 
 fn pcs_seed_prim(prims: [String], user_fns: [String], acc: [BorrowEntry]) : [BorrowEntry] = match prims {
   []           -> acc
   [p, ...rest] ->
     if list_has(user_fns, p) { pcs_seed_prim(rest, user_fns, acc) }
-    else { pcs_seed_prim(rest, user_fns, [BwE(p, pcs_prim_borrow_positions(p)), ...acc]) }
+    else { pcs_seed_prim(rest, user_fns, [BwE(p, [0]), ...acc]) }
 }
 
 fn pcs_user_fn_names(decls: [Decl], acc: [String]) : [String] = match decls {
@@ -619,7 +600,7 @@ fn pcs_strip_borrow_kind(k: ExprKind, scx: StripCx) : ExprKind = match k {
     # consuming: suppress the dup strip and the rename so the runtime
     # decref reclaims the container. Earlier borrowed reads are rewritten.
     let keep_consuming = pcs_arg0_is_borrow_last(args_, scx.borrow_last) and
-                         (match pcs_prim_borrow_variant(key) { Some(_) -> true None -> false })
+                         (match core_borrow_variant(key) { Some(_) -> true None -> false })
     let positions = if keep_consuming { [] } else { pcs_borrow_lookup(scx.bmap, key) }
     let args2 = prs_mark_raw_moves(pcs_strip_args_at_d(args_, positions, 0, scx),
                                    prs_raw_arg_positions(callee, scx.fns), scx.no_wrap, scx.uses)
@@ -654,7 +635,7 @@ fn pcs_arg0_is_borrow_last(args_: [Expr], borrow_last: [String]) : Bool = match 
 
 fn pcs_maybe_rename_borrow_prim(callee: Expr, key: String, positions: [Int]) : Expr =
   if pcs_has_int(positions, 0) {
-    match pcs_prim_borrow_variant(key) {
+    match core_borrow_variant(key) {
       Some(v) -> Expr { kind: EVar(v), line: callee.line, col: callee.col,
                         ty: callee.ty, mode: callee.mode }
       None    -> callee
@@ -4245,7 +4226,7 @@ type PcsArmCx = { uses: [Use], moved: [String], boxed_bpos: [Int], borrow_only: 
 
 # A user fn's borrowed positions; a borrowing prim keeps its own
 # consuming-last-use rule, so it lends no slot here.
-fn pcs_user_borrow_slots(bmap: [BorrowEntry], callee: String) : [Int] = match pcs_prim_borrow_variant(callee) {
+fn pcs_user_borrow_slots(bmap: [BorrowEntry], callee: String) : [Int] = match core_borrow_variant(callee) {
   Some(_) -> []
   None    -> pcs_borrow_lookup(bmap, callee)
 }
