@@ -2240,14 +2240,13 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           [a] -> concat_all([
             "kai_cont_resume(k, ", emit_expr(src, a, cx), ")"
           ])
-          # m7b #11: 2-arg resume `resume(v, new_state)` — used in
-          # parameterised handler clauses (`State[T]` / `Writer[W]`).
-          # Writes the new state into the enclosing Ev's `state` slot
-          # before resuming. `self` is the clause's first argument.
+          # 2-arg resume `resume(v, new_state)`: the Ev owns its state, so
+          # the new state replaces the old one, which is released only
+          # after `ns` is evaluated (it may be built from `state`).
           [a, ns] -> concat_all([
             "({ KaiValue *_rv = ", emit_expr(src, a, cx),
-            "; self->state = ", emit_expr(src, ns, cx),
-            "; kai_cont_resume(k, _rv); })"
+            "; KaiValue *_os = self->state; self->state = ", emit_expr(src, ns, cx),
+            "; kai_decref(_os); kai_cont_resume(k, _rv); })"
           ])
           _   -> "kai_unit() /* resume: arity mismatch (expected 1 or 2 args) */"
         }
@@ -7546,7 +7545,8 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
     Some(ie) -> concat_all(["_ev.state = ", emit_expr(src, ie, cx), "; "])
     None     -> ""
   }
-  let ret_c = match ret_opt {
+  let stateful = match init_opt { Some(_) -> true None -> false }
+  let ret_v = match ret_opt {
     Some(r) -> match r {
       HR(pname, rexpr, _, _) -> {
         # A stateful handler's return clause sees the state aliases too
@@ -7554,18 +7554,20 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
         # inline in the enclosing function, so an alias whose name is
         # already an enclosing local keeps that local: redeclaring it
         # would shadow the user's binding in the same C block.
-        let stateful = match init_opt { Some(_) -> true None -> false }
         let prologue = concat_all(map(live_state_aliases(stateful, cx.lcs),
                                       (nm) => "KaiValue *#{c_local(nm)} = _ev.state; "))
         concat_all([
           "KaiValue *", c_local(pname), " = _body_result; ",
           prologue,
-          emit_expr(src, rexpr, cx), ";"
+          "KaiValue *_hr = ", emit_expr(src, rexpr, cx), "; "
         ])
       }
     }
-    None -> "_body_result;"
+    None -> "KaiValue *_hr = _body_result; "
   }
+  # The Ev owns its final state; both exits (normal and discard) meet
+  # here, after the return clause has read it.
+  let ret_c = concat_all([ret_v, if stateful { "kai_decref(_ev.state); " } else { "" }, "_hr;"])
   # m7a #6e: handle owns a jmp_buf and a discard-value slot. If a
   # clause discards `resume`, the op-call site unwinds the evidence
   # past this handle's node and longjmps here; the setjmp-else branch

@@ -12,9 +12,11 @@
 # Soundness rests on the same premise the desugar rewrite stands on: a
 # var cell is addressable only through its alias id (`op@a` + the
 # `__alias_id__a` register), never by an unaliased State perform from
-# user code. The pass still bails on any unaliased State perform in the
-# fn, on a same-name sibling install, and on any non-get/set use of the
-# alias.
+# user code. An unaliased State perform anywhere in the program (a
+# handler clause reading a var declared in the handler body) reaches the
+# nearest cell dynamically, from another fn, so the pass then rewrites
+# nothing. It also bails on a same-name sibling install and on any
+# non-get/set use of the alias.
 
 import compiler.util
 import compiler.kir
@@ -27,7 +29,7 @@ type KvsCell = KVC(String, String)
 
 #[doc("Rewrite every canonical, non-escaping var-cell State handler in the program to a mutable register (install→let, get→dup+read, set→drop+store, pop→final drop, landing pad→unreachable).")]
 pub fn kvs_program(kp: KProgram) : KProgram = {
-  let canon = kvs_canonical_sites(kp.handlers, kp.fns, [])
+  let canon = if kvs_program_unaliased(kp.fns) { [] } else { kvs_canonical_sites(kp.handlers, kp.fns, []) }
   match canon {
     [] -> kp
     _  -> KProgram { types: kp.types,
@@ -45,9 +47,10 @@ pub fn kvs_program(kp: KProgram) : KProgram = {
 # --- Canonical-handler recognition --------------------------------------
 
 # A var-cell handler is the desugar-minted State pair: a stateful `get`
-# clause `dup c; dup c; resume(k, c)` over the var-cell alias `c`, a
-# stateful `set` clause `dup v; resume2(k, (), v)`, no cross-clause
-# captures. Anything else (a user State handler) is left alone.
+# clause `dup c; resume(k, c)` over the var-cell alias `c`, a
+# stateful `set` clause `resume2(k, (), v)` with or without a leading
+# `dup v` (Perceus picks dup or move per site), no cross-clause captures.
+# Anything else (a user State handler) is left alone.
 fn kvs_canonical_sites(hs: [KHandlerDecl], fns: [KFn], acc: [String]) : [String] = match hs {
   []           -> acc
   [h, ...rest] -> kvs_canonical_sites(rest, fns,
@@ -75,8 +78,8 @@ fn kvs_get_canonical(sym: String, fns: [KFn]) : Bool = match kvs_find_fn(fns, sy
   None    -> false
   Some(f) -> match f.blocks {
     [b] -> match b.stmts {
-      [KRC(KDup(KVar(s1)), _), KRC(KDup(KVar(s2)), _), KLet(t, _, KResumeOp(KVar(k), KVar(s3)), _)] ->
-        s1 == var_cell_alias() and s2 == s1 and s3 == s1 and k == kir_resume_reg() and kvs_ret_is(b.term, t)
+      [KRC(KDup(KVar(s1)), _), KLet(t, _, KResumeOp(KVar(k), KVar(s2)), _)] ->
+        s1 == var_cell_alias() and s2 == s1 and k == kir_resume_reg() and kvs_ret_is(b.term, t)
       _ -> false
     }
     _ -> false
@@ -87,13 +90,18 @@ fn kvs_set_canonical(sym: String, fns: [KFn]) : Bool = match kvs_find_fn(fns, sy
   None    -> false
   Some(f) -> match f.blocks {
     [b] -> match b.stmts {
-      [KRC(KDup(KVar(v1)), _), KLet(t, _, KResume2Op(KVar(k), KUnitV, KVar(v2)), _)] ->
-        v1 == v2 and k == kir_resume_reg() and kvs_first_param_is(f.params, v1) and kvs_ret_is(b.term, t)
+      [KRC(KDup(KVar(d)), _), KLet(t, _, KResume2Op(KVar(k), KUnitV, KVar(v)), _)] ->
+        d == v and kvs_set_resumes(f.params, k, v, b.term, t)
+      [KLet(t, _, KResume2Op(KVar(k), KUnitV, KVar(v)), _)] ->
+        kvs_set_resumes(f.params, k, v, b.term, t)
       _ -> false
     }
     _ -> false
   }
 }
+
+fn kvs_set_resumes(ps: [KParam], k: String, v: String, term: KTerm, t: String) : Bool =
+  k == kir_resume_reg() and kvs_first_param_is(ps, v) and kvs_ret_is(term, t)
 
 fn kvs_first_param_is(ps: [KParam], nm: String) : Bool = match ps {
   [p, ..._] -> p.name == nm
@@ -125,10 +133,9 @@ fn kvs_fn(f: KFn, canon: [String]) : KFn = {
 # The fn's rewritable cells: a canonical install whose alias is unique
 # among ALL of the fn's aliased installs, whose alias register is never
 # read as an atom, and whose `@alias` performs are all get/0 or set/1
-# shapes — while the fn carries no unaliased State perform at all.
+# shapes.
 fn kvs_admissible_cells(bs: [KBlock], canon: [String]) : [KvsCell] =
-  if kvs_has_unaliased_state(bs) { [] }
-  else { kvs_filter_cells(kvs_installs(bs, []), bs, canon, []) }
+  kvs_filter_cells(kvs_installs(bs, []), bs, canon, [])
 
 fn kvs_installs(bs: [KBlock], acc: [KvsCell]) : [KvsCell] = match bs {
   []           -> acc
@@ -161,6 +168,11 @@ fn kvs_alias_count(cells: [KvsCell], a: String) : Int = match cells {
 }
 
 # --- Condition scans ------------------------------------------------------
+
+fn kvs_program_unaliased(fs: [KFn]) : Bool = match fs {
+  []           -> false
+  [f, ...rest] -> kvs_has_unaliased_state(f.blocks) or kvs_program_unaliased(rest)
+}
 
 fn kvs_has_unaliased_state(bs: [KBlock]) : Bool = match bs {
   []           -> false
@@ -279,9 +291,12 @@ fn kvs_rewrite_term(t: KTerm, sjregs: [String]) : KTerm = match t {
 }
 
 # install → cell let; setjmp → dropped; pop → the cell's final drop;
-# bind-ev-state → dropped; get@a → dup + read; set@a → drop + store.
+# bind-ev-state → dropped, with the handle exit's state release after
+# it (the pop's drop pays it); get@a → dup + read; set@a → drop + store.
 fn kvs_rewrite_stmts(ss: [KStmt], cells: [KvsCell], sjregs: [String], acc: [KStmt]) : [KStmt] = match ss {
   []           -> list_reverse(acc)
+  [KBindEvState(_, site, _), KRC(KDrop(KVar(c)), _), ...rest] if c == var_cell_alias() and kvs_site_rewritten(cells, site) ->
+    kvs_rewrite_stmts(rest, cells, sjregs, acc)
   [s, ...rest] -> kvs_rewrite_stmts(rest, cells, sjregs, match s {
     KInstall(_, site, Some(init), Some(_), p) -> match kvs_cell_of_site(cells, site) {
       Some(_) -> [KLet(kvs_cell_reg(site), SBoxed, KLitOp(init), p), ...acc]
@@ -308,6 +323,11 @@ fn kvs_rewrite_stmts(ss: [KStmt], cells: [KvsCell], sjregs: [String], acc: [KStm
     }
     _ -> [s, ...acc]
   })
+}
+
+fn kvs_site_rewritten(cells: [KvsCell], site: String) : Bool = match kvs_cell_of_site(cells, site) {
+  Some(_) -> true
+  None    -> false
 }
 
 type KvsHit = KvsGet(String) | KvsSet(String, KVal) | KvsNoCell
