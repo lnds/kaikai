@@ -24,6 +24,10 @@
 #     examples/negative/<category>/<name>/lib.kai        (or any siblings)
 #     examples/negative/<category>/<name>/main.err.expected
 #
+#   Forbidden lines (any kaic2 fixture):
+#     <stem>.forbidden                                   (one substring per line)
+#   None may appear in stderr: pins a diagnostic as the only one.
+#
 #   User-cache variant (any kaic2 fixture):
 #     <stem>.user-cache                                  (empty marker)
 #   The fixture also runs with `--user-cache` against a private cache,
@@ -136,7 +140,7 @@ run_one() {
       fi
     done < "$exp"
     if [ -z "$missing" ]; then
-      echo "PASS $rel"
+      finish_pass "$rel" "$dir" "$stem" "$src" "$errfile" "$extra_flags"
     else
       printf 'MISS %s — diagnostic body mismatch%b\n' "$rel" "$missing"
     fi
@@ -150,15 +154,31 @@ run_one() {
   fi
 
   if grep -qF "$needle" "$errfile"; then
-    if [ -f "$dir/$stem.user-cache" ]; then
-      run_user_cache "$rel" "$src" "$errfile" "$extra_flags"
-    else
-      echo "PASS $rel"
-    fi
+    finish_pass "$rel" "$dir" "$stem" "$src" "$errfile" "$extra_flags"
   else
     echo "MISS $rel — diagnostic mismatch"
     echo "  want: $needle"
     echo "  got : $(head -1 "$errfile")"
+  fi
+}
+
+# finish_pass: the checks a matching rejection must still clear.
+finish_pass() {
+  rel="$1"; dir="$2"; stem="$3"; src="$4"; errfile="$5"; flags="$6"
+  if [ -f "$dir/$stem.forbidden" ]; then
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      if grep -qF -- "$line" "$errfile"; then
+        echo "MISS $rel — forbidden diagnostic present"
+        echo "  got : $(grep -F -- "$line" "$errfile" | head -1)"
+        return
+      fi
+    done < "$dir/$stem.forbidden"
+  fi
+  if [ -f "$dir/$stem.user-cache" ]; then
+    run_user_cache "$rel" "$src" "$errfile" "$flags"
+  else
+    echo "PASS $rel"
   fi
 }
 
