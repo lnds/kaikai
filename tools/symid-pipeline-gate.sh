@@ -240,4 +240,31 @@ for step in two one two one; do
   [ "$got" = "$want" ] || fail "a cached typed blob carried a UFCS callee's form across programs"
 done
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, and a UFCS callee names the declaration its receiver picked"
+# A constructor's home is its identity: an arm tests, and a construction
+# builds, the declaration its type picked, so two modules' homonyms carry
+# two ids, the same cold and warm.
+CTORFIX="$ROOT/examples/namespace-collisions/ctor_match_from_third_module"
+CTORCACHE="$(mktemp -d)"
+trap 'rm -rf "$CACHE" "$TWIN" "$CUTCACHE" "$CTORCACHE"' EXIT
+ctor_lines() {
+  "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --user-cache --user-cache-dir "$CTORCACHE" \
+    --core-cache-dir "$CTORCACHE" --dump-symids --path "$CTORFIX" --path "$ROOT/stdlib" \
+    "$CTORFIX/main.kai" | grep '^ctor ' || true
+}
+ctor_cold=$(ctor_lines)
+ctor_warm=$(ctor_lines)
+for pass in cold warm; do
+  if [ "$pass" = cold ]; then out=$ctor_cold; else out=$ctor_warm; fi
+  need '^ctor pat pa Tok#[0-9]+ Tok@ma$'
+  need '^ctor pat pb Tok#[0-9]+ Tok@mb$'
+  need '^ctor mod main Tok#[0-9]+ Tok@ma$'
+  need '^ctor mod main Tok#[0-9]+ Tok@mb$'
+  printf '%s\n' "$out" | grep -q ' Tok#none$' && fail "$pass: a constructor site reached unbox with no home"
+  [ "$(id_of '^ctor pat pa Tok#')" != "$(id_of '^ctor pat pb Tok#')" ] \
+    || fail "$pass: two modules' homonymous constructors carry one id"
+  [ "$(id_of '^ctor pat pa Tok#')" = "$(id_of '^ctor mod main Tok#[0-9]+ Tok@ma$')" ] \
+    || fail "$pass: the arm and the construction of one constructor carry different ids"
+done
+[ "$ctor_cold" = "$ctor_warm" ] || fail "a warm build's constructor ids differ from a cold build's"
+
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, and a constructor site names the home its type picked"
