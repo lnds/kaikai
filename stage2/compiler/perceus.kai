@@ -2336,10 +2336,12 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
         None -> None
         Some(e2) -> Some(pcs_rewrite_expr(e2, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set))
       }
-      # The aliases are borrowed views of the handler's slot: every read dups.
+      # The aliases are borrowed views of the handler's slot, and a clause
+      # borrows its captures from the handle's env: every read of either dups.
       let aliases = handle_live_aliases(init_opt, scope)
       let alias_force = list_append(aliases, force_set)
-      let cls1 = pcs_rewrite_clauses(clauses, list_append(scope, aliases), uses, in_lam, skip_set, alias_force, bmap)
+      let cls1 = pcs_rewrite_clauses(clauses, list_append(scope, aliases), uses, in_lam, skip_set,
+                                     list_append(scope, alias_force), bmap)
       let ret1 = match ret_opt {
         None -> None
         Some(hr) -> match hr {
@@ -2509,6 +2511,8 @@ fn pcs_rewrite_stmt(s: Stmt, scope: [String], uses: [Use], in_lam: Bool, skip_se
   }
 }
 
+# Each op argument reaches its clause owned, so the clause pays the ones
+# its reads do not hand on, as a fn pays its params.
 fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
                         in_lam: Bool, skip_set: [String], force_set: [String], bmap: [BorrowEntry]) : [HClause] / Console {
 
@@ -2518,10 +2522,26 @@ fn pcs_rewrite_clauses(cs: [HClause], scope: [String], uses: [Use],
       HC(op, params, body, ln, cl) -> {
         let scope1 = list_append(scope, pcs_filter_non_resume(params))
         let body1 = pcs_rewrite_expr(body, scope1, uses, in_lam, skip_set, force_set, bmap, [])
-        [HC(op, params, body1, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
+        let paid = pcs_wrap_param_drops(body1, pcs_clause_owned_params(params, body), uses,
+                                        PcsParamSets { moved: skip_set, forced: force_set })
+        [HC(op, params, paid, ln, cl), ...pcs_rewrite_clauses(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
       }
     }
   }
+}
+
+# A `$extern_handler` body hands its arguments to the runtime shim, which
+# releases them.
+fn pcs_clause_owned_params(params: [Param], body: Expr) : [Param] = match body.kind {
+  EIntrinsic(name, _) -> if name == "extern_handler" { [] } else { pcs_op_arg_params(params) }
+  _                   -> pcs_op_arg_params(params)
+}
+
+# The continuation is always the last param, whatever its name.
+fn pcs_op_arg_params(params: [Param]) : [Param] = match params {
+  []           -> []
+  [_]          -> []
+  [p, ...rest] -> [p, ...pcs_op_arg_params(rest)]
 }
 
 # Dup predicate: wrap this read in `__perceus_dup` unless it hands the
