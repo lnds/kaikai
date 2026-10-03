@@ -2124,8 +2124,9 @@ fn lower_record_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
 # instead of trapping (Linus review #3).
 fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
   match match_preamble(x, scrv, owned, st) { LSPre(join, sd, st_decl) ->
-    match two_labels(st_decl) { LSL2(lcont, ldef, st4) ->
-      match plan_arms(arms, st4, []) { ArmPlan(cases, st5) -> {
+    match two_labels(st_decl) { LSL2(lcont, ldef, st4) -> {
+      let tagged = map(arms, (a) => match a { Arm(p, _, _) -> (arm_tag(p, st4), a) })
+      match plan_arms(tagged, st4, []) { ArmPlan(cases, st5) -> {
         let pend0 = st5.tcpend
         let st6 = ls_seal(st5, KSwitch(tagv, cases, ldef, kpos_of(x)), ldef)
         # The default block holds the catch-all arm's body (a `_` or other
@@ -2137,9 +2138,9 @@ fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, owned: Bool,
         # by one arm lowers its body directly in the case block; a tag SHARED
         # by N arms (`Exited(0)`/`Exited(_)`) opens a sub-fail-chain in the
         # case block that discriminates on the payload (kir_lower_variant).
-        let st8 = lower_variant_groups(cases, arms, scrv, join, lcont, ldef, owned, sd, st6.mscr, pend0, ls_set_renames(st7, st6.renames))
+        let st8 = lower_variant_groups(cases, tagged, scrv, join, lcont, ldef, owned, sd, st6.mscr, pend0, ls_set_renames(st7, st6.renames))
         match_finish_tok(owned, sd, arms_have_arm_top(arms, st8), LRes(KVar(join), ls_set_tcpend(reopen(st8, lcont), pend0)))
-      } } } }
+      } } } } }
 
 # True iff any arm of this variant match captures an arm-top reuse token, so
 # the continuation must free an unconsumed token (#872).
@@ -2156,15 +2157,12 @@ fn arms_have_arm_top(arms: [Arm], st: LowerSt) : Bool = match arms {
 # duplicate i32 switch entry LLVM rejects (the `Duplicate integer as switch
 # case` native-parity family). The case label is the GROUP block; each
 # group's arms are recovered by tag in `lower_variant_groups`.
-fn plan_arms(arms: [Arm], st: LowerSt, acc: [KCase]) : ArmPlan / Console = match arms {
-  [] -> ArmPlan(acc, st)
-  [Arm(p, _, _), ...rest] -> {
-    let tag = arm_tag(p, st)
-    if tag < 0 { plan_arms(rest, st, acc) }
-    else if kcase_has_tag(acc, tag) { plan_arms(rest, st, acc) }
+fn plan_arms(tagged: [(Int, Arm)], st: LowerSt, acc: [KCase]) : ArmPlan / Console = match tagged {
+  [] -> ArmPlan(list_reverse(acc), st)
+  [(tag, _), ...rest] ->
+    if tag < 0 or kcase_has_tag(acc, tag) { plan_arms(rest, st, acc) }
     else { match ls_fresh_label(st) { LSLabel(lbl, st1) ->
-      plan_arms(rest, st1, list_append(acc, [KC(tag, lbl)])) } }
-  }
+      plan_arms(rest, st1, [KC(tag, lbl), ...acc]) } }
 }
 
 # Has a switch case for `tag` already been planned? (dedup of a shared tag).
@@ -2274,11 +2272,11 @@ fn arm_tag(p: Pattern, st: LowerSt) : Int = match (arm_disc_pat(p)).pkind {
 # `match_preamble` of its own) reads the stale name in
 # `reuse_neutralise_exit_drop` — storing/dropping the wrong register, a raw
 # scalar from the nested arm freed as a pointer (#1229).
-fn lower_variant_groups(cases: [KCase], arms: [Arm], scrv: KVal, join: String,
+fn lower_variant_groups(cases: [KCase], arms: [(Int, Arm)], scrv: KVal, join: String,
                         lcont: String, ldef: String, owned: Bool, sd: String, mscr0: String, pend0: [String], st: LowerSt) : LowerSt / Console = match cases {
   [] -> st
   [KC(tag, lbl), ...crest] -> {
-    let group = arms_with_tag(arms, tag, st)
+    let group = arms_with_tag(arms, tag)
     let st1 = lower_one_group(group, scrv, join, lcont, lbl, ldef, owned, sd, mscr0, pend0, ls_set_mscr(st, mscr0))
     lower_variant_groups(crest, arms, scrv, join, lcont, ldef, owned, sd, mscr0, pend0, st1)
   }
@@ -2379,12 +2377,10 @@ fn variant_arm_arity(p: Pattern, vs: [VariantEntry]) : Int = match p.pkind {
   _                     -> 0
 }
 
-# The VARIANT arms whose top-level tag is `tag`, in source order.
-fn arms_with_tag(arms: [Arm], tag: Int, st: LowerSt) : [Arm] = match arms {
+# The arms whose top-level tag is `tag`, in source order.
+fn arms_with_tag(arms: [(Int, Arm)], tag: Int) : [Arm] = match arms {
   [] -> []
-  [a, ...rest] -> match a { Arm(p, _, _) ->
-    if arm_is_default(p) or arm_tag(p, st) != tag { arms_with_tag(rest, tag, st) }
-    else { [a, ...arms_with_tag(rest, tag, st)] } }
+  [(t, a), ...rest] -> if t == tag { [a, ...arms_with_tag(rest, tag)] } else { arms_with_tag(rest, tag) }
 }
 
 # Lower one tag group into its case block `lbl`. A lone arm that does NOT
