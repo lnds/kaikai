@@ -203,20 +203,29 @@ for pass in cold warm; do
     || fail "$pass: the root fn and the local binder that shadows it do not resolve apart"
 done
 
+# A root fn spelled like a stdlib export and the export itself: each UFCS
+# callee carries the id of the one its receiver's type picked.
+VSFIX="$ROOT/examples/namespace-collisions/ufcs_callee_vs_stdlib"
+out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
+        --path "$ROOT/stdlib" "$VSFIX/main.kai")
+need '^perceus main reverse#[0-9]+ reverse@main$'
+need '^perceus main reverse#[0-9]+ reverse@list$'
+
 # Whether a UFCS callee carries an id depends on which modules declare its
 # name, so `ma`'s cached typed blob must not travel between a program where
 # its pick is uncontested and one where it is contested, in either order.
+# Both programs carry byte-identical copies of `ma` and `mc`.
 CUT="$ROOT/examples/ufcs/contest_cut"
 CUTCACHE="$(mktemp -d)"
 trap 'rm -rf "$CACHE" "$TWIN" "$CUTCACHE"' EXIT
 cut_ids() {
   "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --user-cache --user-cache-dir "$CUTCACHE" \
-    --core-cache-dir "$CUTCACHE" --dump-symids "$@" --path "$CUT/one" --path "$ROOT/stdlib" \
+    --core-cache-dir "$CUTCACHE" --dump-symids "$@" --path "$ROOT/stdlib" \
     | grep -cE '^perceus run twice#[0-9]+ twice@mc$' || true
 }
 for step in two one two one; do
   want=0; [ "$step" = one ] && want=1
-  got=$(if [ "$step" = two ]; then cut_ids --path "$CUT/two" "$CUT/two/main.kai"; else cut_ids "$CUT/one/main.kai"; fi)
+  got=$(cut_ids --path "$CUT/$step" "$CUT/$step/main.kai")
   out="step $step: $got id line(s), want $want"
   [ "$got" = "$want" ] || fail "a cached typed blob carried a UFCS callee's form across programs"
 done
