@@ -962,7 +962,7 @@ fn inf_resolve_args_rk(targs: [TypeExpr], idxs: [Int], i: Int, table: [RowKindEn
 # or a bare row var. Resolves to a row carrier matching the inferred one.
 fn inf_resolve_row_arg(a: TypeExpr, hv: TyHomeView) : Ty = match a.tkind {
   TyRow(rexpr) -> row_arg_carrier(inf_row_of_expr(rexpr, hv))
-  TyName(eff, []) -> row_arg_carrier(Row { labels: [Label { eff: eff, ty_args: [] }], tail: None, display_alias: None })
+  TyName(eff, []) -> row_arg_carrier(Row { labels: [Label { eff: eff, ty_args: [], sym: sym_none() }], tail: None, display_alias: None })
   _ -> inf_resolve_ty(a, hv)
 }
 
@@ -979,7 +979,7 @@ fn inf_row_labels_of_rls(ls: [RowLabel], hv: TyHomeView) : [Label] {
     [] -> []
     [rl, ...rest] -> match rl {
       RL(name, ts) -> [
-        Label { eff: name, ty_args: inf_resolve_ty_list(ts, hv) },
+        Label { eff: name, ty_args: inf_resolve_ty_list(ts, hv), sym: sym_none() },
         ...inf_row_labels_of_rls(rest, hv)
       ]
     }
@@ -3181,7 +3181,7 @@ fn fn_ty(ps: [Ty], ret: Ty) : Ty = TyFnT(ps, ret, inf_row_empty())
 # exactly as for a stdlib fn written `: T / Stdout`. Empty `effs` degrades to
 # `fn_ty`.
 fn fn_ty_eff(ps: [Ty], ret: Ty, effs: [String]) : Ty =
-  TyFnT(ps, ret, labels_to_closed_row(map(effs, (e) => Label { eff: e, ty_args: [] })))
+  TyFnT(ps, ret, labels_to_closed_row(map(effs, (e) => Label { eff: e, ty_args: [], sym: sym_none() })))
 
 # open-tail Row for row-polymorphic
 # core signatures (each/map/filter/reduce). The row var id
@@ -3717,7 +3717,7 @@ fn canon_uvars_row(r: Row, m: [IntPair]) : Row {
 }
 
 fn canon_uvars_label(l: Label, m: [IntPair]) : Label =
-  Label { eff: l.eff, ty_args: map(l.ty_args, (a) => canon_uvars_ty(a, m)) }
+  Label { ...l, ty_args: map(l.ty_args, (a) => canon_uvars_ty(a, m)) }
 
 fn canon_uvars_unit(u: UnitExprT, m: [IntPair]) : UnitExprT {
   match u {
@@ -3795,7 +3795,7 @@ fn canon_tvars_row(r: Row, m: [IntPair]) : Row {
 }
 
 fn canon_tvars_label(l: Label, m: [IntPair]) : Label =
-  Label { eff: l.eff, ty_args: map(l.ty_args, (a) => canon_tvars_ty(a, m)) }
+  Label { ...l, ty_args: map(l.ty_args, (a) => canon_tvars_ty(a, m)) }
 
 # Canonicalise a list of ResolvedCS records by applying the bound-id
 # redirect maps to each CS's tys / units. Mirrors the canon_*_expr
@@ -4764,7 +4764,7 @@ fn row_labels_of_rls_with_binds(ls: [RowLabel], tpbinds: [TPBind], rbinds: [RVBi
     [] -> []
     [rl, ...rest] -> match rl {
       RL(name, ts) -> [
-        Label { eff: name, ty_args: map(ts, (te) => resolve_ty_with_binds(te, tpbinds, rbinds, [], hv)) },
+        Label { eff: name, ty_args: map(ts, (te) => resolve_ty_with_binds(te, tpbinds, rbinds, [], hv)), sym: sym_none() },
         ...row_labels_of_rls_with_binds(rest, tpbinds, rbinds, hv)
       ]
     }
@@ -6512,7 +6512,7 @@ fn label_concat(a: [Label], b: [Label]) : [Label] {
 fn apply_label_args_opt(s: Subst, l: Label) : Option[Label] =
   match apply_tys_opt(s, l.ty_args) {
     None      -> None
-    Some(as1) -> Some(Label { eff: l.eff, ty_args: as1 })
+    Some(as1) -> Some(Label { ...l, ty_args: as1 })
   }
 
 fn apply_label_args(s: Subst, l: Label) : Label = match apply_label_args_opt(s, l) {
@@ -6642,12 +6642,24 @@ type FindRemove = { found: Label, remain: [Label] }
 #      non-unifiable collision — the args check is pure (`ty_eq_shape`
 #      for concrete-concrete, flex for any TyVar side), so no spurious
 #      bindings escape the partition decision.
-fn find_remove_label_best(target: Label, ls: [Label], s: Subst) : Option[FindRemove] {
-  match find_remove_label_concrete(target, ls, s, []) {
+#
+# The tiers run first over the candidates naming the target's own
+# declaration, then over any it is compatible with: an unstamped label
+# matches both of two homonyms, so it must not claim one the stamped
+# label's twin owns.
+fn find_remove_label_best(target: Label, ls: [Label], s: Subst) : Option[FindRemove] =
+  match find_remove_label_tiers(target, ls, s, (a, b) => label_same_id(a, b)) {
     Some(fr) -> Some(fr)
-    None -> match find_remove_label_tyvar_args(target, ls, s, []) {
+    None     -> find_remove_label_tiers(target, ls, s, (a, b) => label_same(a, b))
+  }
+
+fn find_remove_label_tiers(target: Label, ls: [Label], s: Subst,
+                           same: (Label, Label) -> Bool) : Option[FindRemove] {
+  match find_remove_label_concrete(target, ls, s, [], same) {
+    Some(fr) -> Some(fr)
+    None -> match find_remove_label_tyvar_args(target, ls, s, [], same) {
       Some(fr) -> Some(fr)
-      None     -> find_remove_label_unifiable(target, ls, s, [])
+      None     -> find_remove_label_unifiable(target, ls, s, [], same)
     }
   }
 }
@@ -6662,28 +6674,28 @@ fn find_remove_label_best(target: Label, ls: [Label], s: Subst) : Option[FindRem
 # partition leaves them as distinct only_left / only_right labels
 # instead of forcing `Bool ≡ Int`.
 fn find_remove_label_unifiable(target: Label, ls: [Label], s: Subst,
-                               seen: [Label]) : Option[FindRemove] {
+                               seen: [Label], same: (Label, Label) -> Bool) : Option[FindRemove] {
   match ls {
     [] -> None
     [h, ...rest] -> {
-      if h.eff == target.eff and labels_args_unify(h.ty_args, target.ty_args, s) {
+      if same(h, target) and labels_args_unify(h.ty_args, target.ty_args, s) {
         Some(FindRemove { found: h, remain: label_concat(seen, rest) })
       } else {
-        find_remove_label_unifiable(target, rest, s, label_concat(seen, [h]))
+        find_remove_label_unifiable(target, rest, s, label_concat(seen, [h]), same)
       }
     }
   }
 }
 
 fn find_remove_label_concrete(target: Label, ls: [Label], s: Subst,
-                                seen: [Label]) : Option[FindRemove] {
+                                seen: [Label], same: (Label, Label) -> Bool) : Option[FindRemove] {
   match ls {
     [] -> None
     [h, ...rest] -> {
-      if h.eff == target.eff and labels_args_unify_concrete(h.ty_args, target.ty_args, s) {
+      if same(h, target) and labels_args_unify_concrete(h.ty_args, target.ty_args, s) {
         Some(FindRemove { found: h, remain: label_concat(seen, rest) })
       } else {
-        find_remove_label_concrete(target, rest, s, label_concat(seen, [h]))
+        find_remove_label_concrete(target, rest, s, label_concat(seen, [h]), same)
       }
     }
   }
@@ -6707,15 +6719,15 @@ fn find_remove_label_concrete(target: Label, ls: [Label], s: Subst,
 # resolved to a conflicting concrete is rejected, leaving the two
 # `State[_]` labels to coexist as distinct row entries.
 fn find_remove_label_tyvar_args(target: Label, ls: [Label], s: Subst,
-                                  seen: [Label]) : Option[FindRemove] {
+                                  seen: [Label], same: (Label, Label) -> Bool) : Option[FindRemove] {
   match ls {
     [] -> None
     [h, ...rest] -> {
-      let tyvar_mate = h.eff == target.eff and label_args_have_tyvar(h.ty_args, s) and labels_args_unify(h.ty_args, target.ty_args, s)
+      let tyvar_mate = same(h, target) and label_args_have_tyvar(h.ty_args, s) and labels_args_unify(h.ty_args, target.ty_args, s)
       if tyvar_mate {
         Some(FindRemove { found: h, remain: label_concat(seen, rest) })
       } else {
-        find_remove_label_tyvar_args(target, rest, s, label_concat(seen, [h]))
+        find_remove_label_tyvar_args(target, rest, s, label_concat(seen, [h]), same)
       }
     }
   }
@@ -7779,7 +7791,7 @@ pub type DeferredField = DFd(Int, String, Int, Int, Int)  # recv tyvar id, field
 # at drain time so the receiver-to-payload link the `match` binder made
 # is visible.
 #[doc("infer: `OpPayloadVars` — a parametric op call's effect name + live row-arg tyvar ids.")]
-pub type OpPayloadVars = OPV(String, [Int])  # eff name, row ty_arg tyvar ids
+pub type OpPayloadVars = OPV(String, SymId, [Int])  # eff name, its id, row ty_arg tyvar ids
 
 # a single effect-op call's resolution, captured at `try_op_call`.
 # `fn_name` is the enclosing function (stamped by `infer_decl` once the
@@ -7958,7 +7970,7 @@ fn record_op_res(r: Inferred, key: String, alias_opt: Option[String],
 # non-unifiable ty_args are kept distinct so a body can perform e.g.
 # `Reader[Int]` and `Reader[String]` and have both flow through.
 fn st_add_label(st: InferState, lab: Label, line: Int, col: Int) : InferState {
-  if label_present_unifiable(st.row, lab, st.sub) { st }
+  if label_present_unifiable(st.row, lab, st.sub) { st_set_row(st, label_settle_in(st.row, lab, st.sub)) }
   else {
     InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                  recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
@@ -8008,7 +8020,7 @@ fn find_unifiable_label_args(row: [Label], target: Label, s: Subst) : Option[[Ty
   match row {
     [] -> None
     [h, ...rest] ->
-      if h.eff == target.eff and labels_args_unify(h.ty_args, target.ty_args, s) {
+      if label_same(h, target) and labels_args_unify(h.ty_args, target.ty_args, s) {
         Some(h.ty_args)
       } else { find_unifiable_label_args(rest, target, s) }
   }
@@ -8024,10 +8036,6 @@ fn st_unify_ty_args(st: InferState, a: [Ty], b: [Ty], line: Int, col: Int) : Inf
     }
   }
 
-# Compatibility wrapper for stateless / non-parametric op calls. The
-# pattern carries no type args.
-fn st_add_effect(st: InferState, eff: String, line: Int, col: Int) : InferState =
-  st_add_label(st, Label { eff: eff, ty_args: [] }, line, col)
 
 # Fold `st_add_label` over a list of labels. Used by `synth_call` to
 # propagate every label the callee declared into the caller's row, so
@@ -8060,13 +8068,32 @@ fn label_present_unifiable(row: [Label], target: Label, s: Subst) : Bool {
   match row {
     [] -> false
     [h, ...rest] ->
-      if h.eff == target.eff and labels_args_unify(h.ty_args, target.ty_args, s) {
+      if label_same(h, target) and labels_args_unify(h.ty_args, target.ty_args, s) {
         true
       } else {
         label_present_unifiable(rest, target, s)
       }
   }
 }
+
+# Two labels name one effect: one spelling, and one declaration whenever
+# both know theirs. A label still unsettled matches by spelling alone.
+fn label_same(a: Label, b: Label) : Bool =
+  a.eff == b.eff and (sym_raw(a.sym) < 0 or sym_raw(b.sym) < 0 or sym_raw(a.sym) == sym_raw(b.sym))
+
+fn label_same_id(a: Label, b: Label) : Bool =
+  a.eff == b.eff and sym_raw(a.sym) >= 0 and sym_raw(a.sym) == sym_raw(b.sym)
+
+# `lab` is already in `row` up to its id: an unsettled twin takes `lab`'s
+# id rather than shadowing it, so a dedup never drops the settled one.
+fn label_settle_in(row: [Label], lab: Label, s: Subst) : [Label] =
+  if sym_raw(lab.sym) < 0 { row }
+  else { map(row, (h) => label_settle_one(h, lab, s)) }
+
+fn label_settle_one(h: Label, lab: Label, s: Subst) : Label =
+  if sym_raw(h.sym) < 0 and h.eff == lab.eff and labels_args_unify(h.ty_args, lab.ty_args, s) {
+    Label { ...h, sym: lab.sym }
+  } else { h }
 
 # Speculative arity + unification check on two ty_arg lists. Wrong
 # arity → no match. Used by st_add_label and the handler-filter pass.
@@ -8259,14 +8286,14 @@ fn st_push_deferred_hom(st: InferState, dh: DeferredHom) : InferState =
 # record an op call's effect name + live row-arg tyvar ids
 # BEFORE `st_add_label`'s dedup can drop the label. Only parametric ops
 # (non-empty id list) carry a payload tyvar a deferred field could need.
-fn st_push_op_payload_vars(st: InferState, eff: String, ids: [Int]) : InferState =
+fn st_push_op_payload_vars(st: InferState, eff: String, esym: SymId, ids: [Int]) : InferState =
   match ids {
     [] -> st
     _  -> InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                        recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                        row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                        clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-                       ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: [OPV(eff, ids), ...st.op_payload_labels], op_res: st.op_res, in_clause: st.in_clause, home: st.home }
+                       ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: [OPV(eff, esym, ids), ...st.op_payload_labels], op_res: st.op_res, in_clause: st.in_clause, home: st.home }
   }
 
 #[doc("infer: `lookup_alias` — typer entry point invoked by the driver.")]
@@ -9449,7 +9476,7 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       # carries a `[]` label even when `with Cell(0)` infers an Int state, so
       # matching against `[Int]` would leave the label undischarged.
       let discharge_eff = label_eff_with_alias(eff_name, alias_opt)
-      let filt = filter_labels_matching_res(rb.st.row, discharge_eff,
+      let filt = filter_labels_matching_res(rb.st.row, discharge_eff, hsym,
                                               cap_tyargs, rb.st.sub)
       let body_row_minus = filt.kept
       let rb_st1 = st_set_sub(rb.st, filt.sub)
@@ -9920,20 +9947,21 @@ fn check_clause_arity(st: InferState, eff_name: String, op_name: String,
 # `Reader[String]` handler) never leaves a partial binding behind.
 type FilterResult = { kept: [Label], sub: Subst }
 
-fn filter_labels_matching_res(xs: [Label], eff_name: String, tyargs: [Ty],
+fn filter_labels_matching_res(xs: [Label], eff_name: String, hsym: SymId, tyargs: [Ty],
                                sub: Subst) : FilterResult / Mutable {
   match xs {
     [] -> FilterResult { kept: [], sub: sub }
     [h, ...rest] -> {
       # The guard ignores a function type's effect row; `unify` compares
       # it, so a label the unify rejects stays undischarged.
-      let bound = if h.eff == eff_name and label_args_dischargeable(h.ty_args, tyargs, sub) {
+      let handled = label_same(h, Label { eff: eff_name, ty_args: [], sym: hsym })
+      let bound = if handled and label_args_dischargeable(h.ty_args, tyargs, sub) {
         unify_list(ty_env_empty(), h.ty_args, tyargs, sub)
       } else { None }
       match bound {
-        Some(sub1) -> filter_labels_matching_res(rest, eff_name, tyargs, sub1)
+        Some(sub1) -> filter_labels_matching_res(rest, eff_name, hsym, tyargs, sub1)
         None -> {
-          let r = filter_labels_matching_res(rest, eff_name, tyargs, sub)
+          let r = filter_labels_matching_res(rest, eff_name, hsym, tyargs, sub)
           FilterResult { kept: [h, ...r.kept], sub: r.sub }
         }
       }
@@ -10015,7 +10043,7 @@ fn merge_label_lists(a: [Label], b: [Label], sub: Subst) : [Label] {
     [] -> a
     [h, ...rest] ->
       if label_present_unifiable(a, h, sub) {
-        merge_label_lists(a, rest, sub)
+        merge_label_lists(label_settle_in(a, h, sub), rest, sub)
       } else {
         merge_label_lists([h, ...a], rest, sub)
       }
@@ -10798,7 +10826,7 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
         # the runtime evidence stack and the diagnostics are keyed by.
         let named_key = ty_op_key_name(name, op_name)
         match op_lookup_either(st.env, key, named_key) {
-          Some(sc) -> Some(op_callee_carries(record_op_res(synth_op_call_with_scheme(st, sc, args_, named_key, line, col), named_key, None, false, line, col), bsym))
+          Some(sc) -> Some(op_callee_carries(record_op_res(synth_op_call_with_scheme(st, sc, args_, named_key, bsym, line, col), named_key, None, false, line, col), bsym))
           None ->
             if is_effect_in_env(st.env, name) {
               Some(synth_op_call_unknown_op(st, name, op_name, line, col))
@@ -10835,7 +10863,7 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
                         Some(real_eff) -> {
                           let key2 = string_concat(real_eff, string_concat(".", op_name))
                           match ty_env_lookup(st.env, key2) {
-                            Some(sc) -> Some(record_op_res(synth_op_call_with_scheme(st, sc, args_, key2, line, col), key2, None, false, line, col))
+                            Some(sc) -> Some(record_op_res(synth_op_call_with_scheme(st, sc, args_, key2, sym_none(), line, col), key2, None, false, line, col))
                             None ->
                               if is_effect_in_env(st.env, real_eff) {
                                 Some(synth_op_call_unknown_op(st, real_eff, op_name, line, col))
@@ -10887,7 +10915,7 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
                              else { lookup_alias_sym(st.aliases, name) }
                   match ty_env_lookup(st.env, lookup_key) {
                     Some(sc) -> Some(op_callee_carries(
-                                       record_op_res(synth_op_call_with_scheme_keys(st, sc, args_, lookup_key, dispatch_key, Some(name), line, col), lookup_key, Some(name), taggable, line, col),
+                                       record_op_res(synth_op_call_with_scheme_keys(st, sc, args_, lookup_key, dispatch_key, Some(name), lookup_alias_sym(st.aliases, name), line, col), lookup_key, Some(name), taggable, line, col),
                                        asym))
                     None ->
                       if is_effect_in_env(st.env, eff) {
@@ -10982,7 +11010,7 @@ fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String,
               # (via `synth_many`); `synth` on `EVar(name)` is a pure
               # env lookup, so a second walk is idempotent.
               let all_args = [obj, ...args_]
-              Some(synth_op_call_with_scheme(st, sc, all_args, key, line, col))
+              Some(synth_op_call_with_scheme(st, sc, all_args, key, sym_none(), line, col))
             }
           }
         }
@@ -11321,7 +11349,7 @@ fn cap_eff_of_var(st: InferState, name: String) : Option[CapEff] =
       Scheme(_, _, _, _, ty) -> match apply_ty(st.sub, ty) {
         TyCon(_, ename, targs, esym) ->
           if is_effect_in_env(st.env, ename) {
-            Some(CapEff(Label { eff: ename, ty_args: targs }, esym))
+            Some(CapEff(Label { eff: ename, ty_args: targs, sym: esym }, esym))
           } else { None }
         _ -> None
       }
@@ -11383,14 +11411,14 @@ fn synth_op_call_unknown_op(st: InferState, eff_name: String, op_name: String,
 }
 
 fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
-                              key: String, line: Int, col: Int) : Inferred / Console + File + Mutable {
+                              key: String, esym: SymId, line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
   # most call sites pass a single key — both the type
   # lookup key and the codegen dispatch key are the same. No alias:
   # a direct `Eff.op(...)` call is not a `with ... as <name>` cell, so
   # its row label keeps the bare effect name.
-  synth_op_call_with_scheme_keys(st, sc, args_, key, key, None, line, col)
+  synth_op_call_with_scheme_keys(st, sc, args_, key, key, None, esym, line, col)
 }
 
 # An op call on a PROVIDED capability (`c.op(...)` where `c: Eff` is a value
@@ -11417,7 +11445,7 @@ fn synth_op_call_provided(st: InferState, sc: TyScheme, args_: [Expr],
 
 fn synth_op_call_with_scheme_keys(st: InferState, sc: TyScheme, args_: [Expr],
                                    lookup_key: String, dispatch_key: String,
-                                   row_alias: Option[String],
+                                   row_alias: Option[String], esym: SymId,
                                    line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
@@ -11446,13 +11474,13 @@ fn synth_op_call_with_scheme_keys(st: InferState, sc: TyScheme, args_: [Expr],
   # `with <eff> as <name>` cells stay distinct labels (see
   # `label_eff_with_alias`). The suffix is discharged symmetrically by
   # the cell's own handler and stripped for display.
-  let lab = Label { eff: label_eff_with_alias(eff_n, row_alias), ty_args: row_args }
+  let lab = Label { eff: label_eff_with_alias(eff_n, row_alias), ty_args: row_args, sym: esym }
   # stash the effect name + live payload tyvar ids before
   # `st_add_label`, whose dedup may drop this label against a sibling op's
   # concrete label of the same effect. The deferred-field drain reads it
   # to pin a receiver the dropped label was the only carrier for, under
   # the final sub so the `match` binder's receiver-to-payload link shows.
-  let st2p = st_push_op_payload_vars(st2, label_eff_with_alias(eff_n, row_alias), eff_fresh)
+  let st2p = st_push_op_payload_vars(st2, label_eff_with_alias(eff_n, row_alias), esym, eff_fresh)
   # The `@alias` in `lab.eff` keeps distinct cells apart, so this only
   # threads ty_args between ops of the same cell (`cur.set` → `cur.get`).
   let st2u = st_unify_dedup_label(st2p, lab, line, col)
@@ -11513,8 +11541,7 @@ fn resolve_fresh_ids(ids: [Int], sub: Subst) : [Ty] {
   }
 }
 
-# Extract `Eff` from `Eff.op` so st_add_effect can record only the
-# label, not the dotted form.
+# Extract `Eff` from `Eff.op`.
 #[doc("infer: `dotted_prefix` — typer entry point invoked by the driver.")]
 pub fn dotted_prefix(s: String) : String =
   dotted_prefix_loop(s, 0, string_length(s))
@@ -11740,14 +11767,14 @@ fn pin_via_op_vars(st: InferState, rrep: Int, ops: [OpPayloadVars],
   match ops {
     [] -> st
     [op, ...rest] -> match op {
-      OPV(eff, ids) ->
+      OPV(eff, esym, ids) ->
         if ids_share_rep(ids, rrep, st.sub) {
           # The receiver is in this op's payload class. Rebuild the op's
           # label with ty_args resolved under the FINAL sub, then unify
           # it against its declared counterpart — pinning the receiver's
           # still-free class members (the payload position) to the
           # declared concrete type.
-          let lab = Label { eff: eff, ty_args: resolve_fresh_ids(ids, st.sub) }
+          let lab = Label { eff: eff, ty_args: resolve_fresh_ids(ids, st.sub), sym: esym }
           match find_matching_declared(declared, lab, st) {
             Some(st1) -> st1
             None      -> pin_via_op_vars(st, rrep, rest, declared)
@@ -17726,6 +17753,15 @@ fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int,
 
 # ---- per-decl entry + dumper ----
 
+# One `row <fn> <eff>#<id>` line per label the body's row carries.
+fn print_row_ids(nm: String, row: [Label]) : Unit / Console = match row {
+  [] -> ()
+  [l, ...rest] -> {
+    print("row #{nm} #{l.eff}##{int_to_string(sym_raw(l.sym))}")
+    print_row_ids(nm, rest)
+  }
+}
+
 fn print_inferred_fn(nm: String, final_ret: Ty, param_tys: [Ty], line: Int, col: Int) : Unit / Console {
   let fn_t = fn_ty(param_tys, final_ret)
   print("fn #{nm} : #{inf_ty_to_string(fn_t)} @#{int_to_string(line)}:#{int_to_string(col)}")
@@ -18151,6 +18187,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       let st2 = hd.st
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
+        print_row_ids(nm, st2.row)
       } else { () }
       # Hanga Roa: tag every call-site instance with the enclosing
       # DFn's module_origin so downstream consumers (`--dump-mono`,
@@ -19037,7 +19074,7 @@ fn find_matching_declared(declared: [Label], target: Label,
   match declared {
     [] -> None
     [d, ...rest] ->
-      if d.eff == target.eff and labels_args_unify(d.ty_args, target.ty_args, st.sub) {
+      if label_same(d, target) and labels_args_unify(d.ty_args, target.ty_args, st.sub) {
         Some(unify_label_args_into(d.ty_args, target.ty_args, st))
       } else {
         find_matching_declared(rest, target, st)

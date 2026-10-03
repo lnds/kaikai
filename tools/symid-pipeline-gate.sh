@@ -88,6 +88,16 @@ need '^own effect Log__rb#[0-9]+ Log@rb$'
 [ "$(id_of '^kperform ra__run Log__ra')" = "$(id_of '^own effect Log__ra')" ] \
   || fail "a perform carries a different id than the declaration it names"
 
+# The row label a perform adds carries the same id, and two ops of one
+# effect settle into one label.
+row_id() {
+  printf '%s\n' "$out" | grep -E "$1" | sed -E 's/.*#([0-9-]+)$/\1/'
+}
+[ "$(row_id '^row run Log__ra#')" = "$(id_of '^own effect Log__ra')" ] \
+  || fail "a body row label carries a different id than the effect it names"
+[ "$(printf '%s\n' "$out" | grep -cE '^row run Log__rb#[0-9]+$')" = 1 ] \
+  || fail "two ops of one effect left two row labels"
+
 # A root effect shares its name with a core one. From a module that
 # declares no `Log` the bare perform climbs to the core, which the root
 # cannot shadow there; the root's own perform keeps the root's id.
