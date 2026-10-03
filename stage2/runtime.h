@@ -9089,7 +9089,8 @@ static KaiValue *kai_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
  * there is no window where the child runs with an unwired mailbox and no
  * cross-thread write to owner_fiber. Because the stamp completes before
  * this returns, Monitor/Link in the spawning fiber resolve owner_fiber
- * synchronously. Consumes `pid` (the caller keeps its own Pid handle). */
+ * synchronously. Consumes `pid` and `thunk`: the fiber holds its own
+ * reference to the thunk, the caller keeps its own Pid handle. */
 static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMailbox *stamp_mb);
 KAI_SCHED_FN KaiValue *kai_core_spawn_actor_fiber(KaiValue *pid, KaiValue *thunk)
 #if KAI_SCHED_DECL_ONLY
@@ -9099,6 +9100,7 @@ KAI_SCHED_FN KaiValue *kai_core_spawn_actor_fiber(KaiValue *pid, KaiValue *thunk
     KaiMailbox *mb = (pid && pid->tag == KAI_PID) ? pid->as.mb : NULL;
     KaiValue *f = kai_spawn_fiber_stamped(thunk, mb);
     if (pid) kai_decref(pid);
+    kai_decref(thunk);
     return f;
 }
 #endif
