@@ -16819,11 +16819,9 @@ static KaiExitFibers kai_rc_settle_exit_fibers(void) {
  * marks the fiber CANCELLED instead of DONE. cancel_pad_set is the
  * gate the hook reads before attempting the longjmp.
  *
- * RC contract: f->thunk is owned by f for f's entire lifetime;
- * kai_apply consumes (#298), so the trampoline incref's the thunk
- * before each invocation to keep f->thunk's lifetime independent of
- * the call. kai_free_value's KAI_FIBER branch decrefs both thunk and
- * result when f's RC drops. */
+ * RC contract: f->thunk is owned by f for f's entire lifetime and the
+ * trampoline only borrows it. kai_free_value's KAI_FIBER branch decrefs
+ * both thunk and result when f's RC drops. */
 static void kai_fiber_uc_link_landing(void) {
     kai_active_fiber = &kai_main_fiber;
     KAI_TSAN_SWITCH_TO_ROOT();
@@ -16876,8 +16874,8 @@ static void kai_fiber_trampoline(void) {
     kai_drain_pending_free();
     if (setjmp(self->cancel_pad) == 0) {
         self->cancel_pad_set = 1;
-        /* kai_apply consumes (#298): give it its own ref, keep f->thunk. */
-        self->result = kai_apply(kai_incref(self->thunk), 0, NULL);
+        /* Borrowed: a cancel longjmps past any release after the call. */
+        self->result = kai_apply_borrow(self->thunk, 0, NULL);
         self->cancel_pad_set = 0;
         self->state  = KAI_FIBER_DONE;
     } else {
