@@ -30,6 +30,7 @@ import compiler.handler_alias
 import compiler.handler_cover
 import compiler.decl_names
 import compiler.symtab
+import compiler.symtab_build
 import compiler.modules
 import compiler.loop_lower
 import compiler.doc_attr
@@ -2800,7 +2801,12 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
                # came from. A name bucket holds every homonym and leaves
                # the reader to tell them apart; an id bucket holds one
                # declaration, so a settled use needs no tie-break.
-               sindex: NameIndex[TyEntry] }
+               sindex: NameIndex[SymEntry] }
+
+# Entries are only prepended, so a later count above the registered one
+# means a newer binder shadows the bare name.
+#[doc("infer: a declaration's scheme and the count of same-spelled entries in its name bucket when it registered.")]
+pub type SymEntry = SymE(TyScheme, Int)
 
 # head-owner cache entry. `head` is the bare type name
 # (`List`, `MyBox`, ...); `mods` is the list of modules whose
@@ -2819,6 +2825,9 @@ fn env_home_view(env: TyEnv, mo: Option[String]) : TyHomeView = tsh_view(env.ty_
 fn st_home_view(st: InferState) : TyHomeView = env_home_view(st.env, st_mo(st))
 
 fn st_mo(st: InferState) : Option[String] = if st.home == "" { None } else { Some(st.home) }
+
+# The module a use in the decl under inference is read from.
+fn st_reader(st: InferState) : String = if st.home == "" { tsh_target(st.env.ty_homes) } else { st.home }
 
 fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv {
   let k = ty_bucket_key(name)
@@ -2841,9 +2850,25 @@ fn ty_env_add_sym(env: TyEnv, s: SymId, name: String, sc: TyScheme) : TyEnv {
             constructors: named.constructors, head_owners: named.head_owners,
             root_fns: named.root_fns, row_kind: named.row_kind, ty_homes: named.ty_homes,
             index: named.index, vindex: named.vindex,
-            sindex: idx_prepend_sym(named.sindex, s, TyEntry { name: name, scheme: sc }) }
+            sindex: idx_prepend_sym(named.sindex, s, SymE(sc, ty_bare_count(named, name))) }
   }
 }
+
+fn ty_bare_count(env: TyEnv, name: String) : Int =
+  ty_bare_count_loop(idx_chain(env.index, ty_bucket_key(name)), name, 0)
+
+fn ty_bare_count_loop(es: [TyEntry], name: String, n: Int) : Int = match es {
+  []           -> n
+  [e, ...rest] -> ty_bare_count_loop(rest, name, if e.name == name { n + 1 } else { n })
+}
+
+# The declaration `s` is what a bare `name` reads here: registered under
+# that id, and no binder spelled `name` registered after it.
+fn ty_env_bare_is_sym(env: TyEnv, s: SymId, name: String) : Bool =
+  match idx_chain_sym(env.sindex, s) {
+    []                 -> false
+    [SymE(_, k), ..._] -> ty_bare_count(env, name) == k
+  }
 
 # The key an effect op is registered and looked up under, derived from
 # the effect's identity. `<id>` is an integer the table minted, so two
@@ -2880,8 +2905,8 @@ fn ty_op_key_name(eff_name: String, op_name: String) : String =
 #[doc("infer: the scheme registered for the declaration `s`, or None when nothing registered one.")]
 pub fn ty_env_lookup_sym(env: TyEnv, s: SymId) : Option[TyScheme] =
   match idx_chain_sym(env.sindex, s) {
-    []        -> None
-    [e, ..._] -> Some(e.scheme)
+    []                  -> None
+    [SymE(sc, _), ..._] -> Some(sc)
   }
 
 # The id `tab` holds for the declaration `mo` homes under `name`. An
@@ -10996,9 +11021,8 @@ type PickResult = { st: InferState, inst_ty: Ty, fresh: [Int], unit_fresh: [Int]
                     mod: String }
 
 # shared shape used by `synth_ufcs_dispatch`. Pairs the
-# instantiated state with the resolved callee form — `EModCall(m,
-# fname)` for module-qualified picks, `EVar(fname)` for the bare-
-# name fallback (root-file user fns with no `module_origin`).
+# instantiated state with the resolved callee form: the picked
+# declaration's `ESym`, or a bare `EVar` for a binder with no id.
 type UfcsPick = { st: InferState, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
                   callee_kind: ExprKind }
 
@@ -11171,32 +11195,21 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
                         line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
-  # walk every `<mod>::<ident>` qualified candidate and
-  # pick the first whose first parameter unifies with the receiver
-  # type. Without this, two modules exporting `map` (option, list,
-  # ...) collide and the legacy `ty_env_lookup` returns the most-
-  # recently-prepended scheme — load-order, not receiver type.
-  # On a match the callee is rewritten to `EModCall(mod, ident)` so
-  # codegen mints `kai_<mod>__<ident>` directly and bypasses
-  # `efn_resolve`'s name-only lookup.
-  #
-  # Fallback: when `ident` has no qualified candidates (a user-
-  # defined fn in the root file with `module_origin = None`, e.g.
-  # `paint(c: Color)` in `examples/ufcs/over_union_component.kai`),
-  # consult the legacy bare-name `ty_env_lookup` path so root-file
-  # UFCS dispatch keeps working unchanged.
+  # The receiver's type picks among the modules declaring `ident`; a
+  # name no module-tagged declaration answers (a root-file fn, a local
+  # binder, a core signature) reads what the bare name reads.
   let candidates = ty_env_collect_candidates(st.env, ident)
   let picked = match pick_by_first_arg(st, candidates, obj_ty) {
     Some(p) -> Some(UfcsPick { st: p.st, inst_ty: p.inst_ty,
                                 fresh: p.fresh, unit_fresh: p.unit_fresh,
-                                callee_kind: EModCall(p.mod, ident) })
+                                callee_kind: ufcs_home_callee(st.env, st_reader(st), ident, p.mod) })
     None -> match ty_env_lookup(st.env, ident) {
       None -> None
       Some(sc) -> {
         let inst = st_instantiate_report(st, sc)
         Some(UfcsPick { st: inst.st, inst_ty: inst.ty,
                          fresh: inst.fresh, unit_fresh: inst.unit_fresh,
-                         callee_kind: EVar(ident) })
+                         callee_kind: ufcs_bare_callee(st.env, ident) })
       }
     }
   }
@@ -11249,6 +11262,22 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
       }
     }
   }
+}
+
+# The function `home` declares under `ident`, by its id where a bare
+# `ident` read from `reader` names one function. Where several modules
+# declare it the receiver's type settled the contest, and the
+# home-qualified call is the form a settled contest takes: an id there
+# reads as a bare use the name report must reject.
+fn ufcs_home_callee(env: TyEnv, reader: String, ident: String, home: String) : ExprKind =
+  if tsh_fn_settled(env.ty_homes, ident, reader) { ESym(sym_derive(NCFn, ident, home), spec_none(), ident) }
+  else { EModCall(home, ident) }
+
+# A root-file function when no binder registered after it shadows the
+# bare name; otherwise the binder, which carries no id here.
+fn ufcs_bare_callee(env: TyEnv, ident: String) : ExprKind {
+  let s = sym_derive(NCFn, ident, tsh_target(env.ty_homes))
+  if ty_env_bare_is_sym(env, s, ident) { ESym(s, spec_none(), ident) } else { EVar(ident) }
 }
 
 # Q4 diagnostic — the receiver's type is statically known (or `TyAny`
