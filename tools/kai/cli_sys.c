@@ -368,6 +368,12 @@ int64_t kaicli_ncpu(void) {
     return n > 0 ? n : 4;
 }
 
+int64_t kaicli_phys_mem(void) {
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long size = sysconf(_SC_PAGESIZE);
+    return pages > 0 && size > 0 ? (int64_t) pages * (int64_t) size : 0;
+}
+
 /* ---- SHA-256 over a byte stream fed in pieces (FIPS 180-4) ---- */
 
 static const uint32_t K[64] = {
