@@ -27,6 +27,10 @@ Scalars cross directly:
 | `String`    | `const char *` (copied in on return via `kai_str`) |
 | `Unit`      | `void` (return only) |
 
+`Int32`, `UInt32` and `UInt64` also cross at their exact C width. Any other
+type in an `extern "C" fn` signature, parameter or return, is rejected at
+check time unless it names a declared `extern "C" type` or `opaque`.
+
 The compiler emits a forward declaration over these C types
 (`extern <ret> sym(<params>);`) on both backends, so the call links
 without an implicit declaration. The declaration IS the binding
