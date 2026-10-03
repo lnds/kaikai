@@ -1524,6 +1524,11 @@ int64_t kai_jmpbuf_size(void) { return (int64_t) sizeof(jmp_buf); }
  * op site can find the landing pad on a discard. `jmp` is the `i8*`
  * cast of the handle's `alloca`'d `jmp_buf`; `discard_slot` is the
  * `i8*` cast of the handle's `%KaiValue*` discard alloca. */
+/* The native backend reserves the evidence node as `[8 x ptr]` and the
+ * continuation as `[8 x i32]` (emit_native_fx.kai, emit_native_def.kai). */
+typedef char kaix_evidence_fits_node[(sizeof(KaiEvidence) <= 8 * sizeof(void *)) ? 1 : -1];
+typedef char kaix_cont_fits_slot[(sizeof(KaiCont) <= 8 * sizeof(int32_t)) ? 1 : -1];
+
 void kaix_evidence_push_with_jmp(KaiEvidence *node, const char *eff_label,
                                  void *handler, void *jmp, void *discard_slot) {
     kai_evidence_push_with_jmp(node, eff_label, handler,

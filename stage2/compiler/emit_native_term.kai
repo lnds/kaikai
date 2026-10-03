@@ -104,7 +104,7 @@ fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl], fns
   nemit_allocas(ctx, collect_fn_specs(f))
   # Reserve the effect-frame allocas (Ev / node / jmp_buf / discard / cont)
   # in the entry head too, before the param seed branches away.
-  nemit_fx_allocas(ctx, f)
+  nemit_fx_allocas(ctx, f, handlers)
   # Reserve the TRMC cctx accumulator allocas (`_kai_acc_res` /
   # `_kai_acc_hole`) when the body has a `KTrmcStep` — they must live in
   # the entry block to be visible across the goto-loop.
@@ -193,8 +193,7 @@ fn nclause_direct_count(ps: [KParam], acc: Int) : Int = match ps {
 # params 1..d; `k` (PResume) is the last LLVM param (d+1). A PDirect(i)
 # reads LLVM param `1 + i` (after self); PResume reads the last param.
 # A PEnvCapture(j) reads the j-th slot of the Ev `env` array (byte 8) via
-# `kaix_clause_env_get`. PEvidence (aliased-by-id handlers) is still a
-# later subset — abort loud.
+# `kaix_clause_env_get`.
 #
 # The continuation param is registered under `kir_resume_reg()`, NOT its
 # surface name: the translator names the `PResume` param after the surface
@@ -248,7 +247,7 @@ fn nemit_seed_clause_loop(ctx: Handle, ps: [KParam], fnval: Handle, d: Int) : Un
       # for perceus's per-clause isolation. `__self` (LLVM param 0) is the
       # dispatched Ev; `kaix_clause_env_get` reads byte-8 then indexes.
       PEnvCapture(j) -> nemit_seed_clause_envcap(ctx, pp.name, j)
-      _          -> nemit_unsupported(ctx, "clause param origin (PEvidence = subset 2b by-id alias dispatch)")
+      PCapture(_) -> nemit_unsupported(ctx, "a closure-capture param in a handler clause (lowering invariant)")
     }
     nemit_seed_clause_loop(ctx, rest, fnval, d)
   }
@@ -282,7 +281,6 @@ pub fn nemit_declare_thunk(ctx: Handle, sym: String) : Handle = {
 
 # Seed a thunk's params: a `PDirect(i)` reads `args[i]`; a `PCapture(j)`
 # reads `kaix_capture(self, j)`. `self` is param 0, `args` is param 1.
-# (A `PResume`/`PEvidence` is clause-only — a later subset, abort.)
 fn nemit_seed_thunk_params(ctx: Handle, ps: [KParam], fnval: Handle) : Unit / Console = {
   let self_v = llvm_get_param(fnval, 0)
   let args_v = llvm_get_param(fnval, 1)
@@ -297,7 +295,7 @@ fn nemit_seed_thunk_loop(ctx: Handle, ps: [KParam], self_v: Handle, args_v: Hand
       PCapture(j) -> nemit_store_reg(ctx, p.name,
         ncall_sig2(ctx, "kaix_capture", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_i32t(ctx),
                    self_v, llvm_const_i32(native_ctx_i32t(ctx), j)))
-      _ -> nemit_unsupported(ctx, "thunk param origin (resume/evidence = subset 2)")
+      _ -> nemit_unsupported(ctx, "a clause-only param in a lambda thunk (lowering invariant)")
     }
     nemit_seed_thunk_loop(ctx, rest, self_v, args_v)
   }
@@ -345,7 +343,6 @@ fn nemit_stmts(ctx: Handle, cur_fn: String, ss: [KStmt], handlers: [KHandlerDecl
 
 # `KLet` evaluates its op and stores the result; `KDo` evaluates for
 # effect; `KStore` writes a slot; `KRC` is a dup/drop runtime call.
-# Effect frame markers (`KInstall`/`KPop`) are a later subset.
 # A value emitted purely for effect (`KDo`, an RC op) yields a result
 # Handle the walk discards. It MUST be captured in a `let h = <handle-fn>`
 # binding — a bare `nemit_op(ctx, op); ()` leaves the Handle (an LLVM
@@ -533,14 +530,11 @@ fn nemit_rc(ctx: Handle, rc: KRCOp) : Unit / Console = match rc {
   # Null-safe shell-only free of an unconsumed reuse token (no cascade into
   # the moved-out children).
   KFreeToken(t) -> { let _d = nemit_call1(ctx, "kaix_reuse_free", nemit_atom(ctx, t)); () }
-  KDropReuse(_) -> nemit_unsupported(ctx, "KDropReuse (reuse tokens = later subset)")
 }
 
 # --- terminators --------------------------------------------------------
 
-# Pure control flow (ret/br/condbr/switch/unreachable) + the TCO back-edge
-# (`KTcrecGoto`) are subset 1; effect resume + TRMC + explicit tail calls
-# are later subsets.
+# Control flow, the TCO back-edge (`KTcrecGoto`) and the TRMC steps.
 fn nemit_term(ctx: Handle, t: KTerm, ret: KSlot) : Unit / Console = match t {
   # P3: a raw-return fn returns the value at its raw slot (`ret i64`/`f64`/
   # `i1`), so `nemit_atom_raw` materialises a raw literal directly + loads a
@@ -556,7 +550,6 @@ fn nemit_term(ctx: Handle, t: KTerm, ret: KSlot) : Unit / Console = match t {
   KSwitch(v, cs, def, _) -> nemit_switch(ctx, v, cs, def)
   KUnreachable(_)       -> { llvm_build_unreachable(native_ctx_b(ctx)); () }
   KTcrecGoto(l, asg, dropmask, _) -> nemit_tcrec(ctx, l, asg, dropmask)
-  KTailCall(_, _, _)    -> nemit_unsupported(ctx, "KTailCall (later subset)")
   KTrmcStep(_, hole, cname, tag, slot_mask, dropmask, heads, asg, in_region, _) -> nemit_trmc_step(ctx, hole, cname, tag, slot_mask, dropmask, heads, asg, in_region)
   KTrmcApply(leaf, _)   -> nemit_trmc_apply(ctx, leaf)
 }
