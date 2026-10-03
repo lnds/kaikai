@@ -6,13 +6,16 @@ CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -g -O2
 # allocation profile itself (eager char-cache warm, per-thread scheduler
 # bookkeeping), which moves alloc_total/leaked baselines — not because the
 # ledger under-reports.
-# macOS caps the main-thread stack at the LINKED size, not the ulimit
-# soft limit (ulimit -s only matters where the kernel is the
-# allocator — i.e. Linux). The Tongariki kai fmt lane (2026-05-01)
-# tipped self-host past the 8 MB default at -O0, so on Darwin we
-# link with a 128 MB main-thread stack. Linux honours the runtime
-# ulimit -s 65520 set in the `STACK` prefix below, so it needs no
-# linker flag.
+# The compiler runs `main` on a fixed 1 GiB stack (KAI_MAIN_STACK_SIZE,
+# runtime.h) at every KAI_THREADS and on every host, so how deep an input
+# it accepts never depends on `ulimit -s`. Reserved, not committed: a run
+# pays only for the pages its deepest recursion touches.
+KAI_MAIN_STACK := -DKAI_MAIN_STACK_SIZE=1073741824
+
+# Test binaries keep the OS budget. On Darwin the main-thread stack is the
+# LINKED size, so they link with 128 MB; it governs only KAI_THREADS=1,
+# where main runs on the thread stack. At N>1 main is a fiber sized by
+# max(8 MB, RLIMIT_STACK).
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 LDFLAGS_STACK := -Wl,-stack_size,0x8000000
@@ -193,7 +196,7 @@ STACK :=
 
 .PHONY: test-kir-inline-trmc-1158 test-kir-while-slot-1158 test-kir-while-param-slot-1173 test-kir-while-vcell-moved-set test-kir-var-escape-state-1173 test-kir-while-raw-cond-1414 test-kir-while-boxed-cond-1414
 .PHONY: test-issue-1331-op-arg-release-asan test-issue-1331-borrowed-op-arg-asan
-.PHONY: test-mn-sigaltstack-asan
+.PHONY: test-mn-sigaltstack-asan test-main-stack-sized
 .PHONY: all clean bin-kai core-cache-warm test-native-wrapper test test-fast test-costly-parallel test-tokens test-ast test-check test-run test-blocks test-holes test-lint test-purity test-native-purity-attrs test-driver-holes test-effects test-effects-goldens test-effects-goldens-native test-effect-runtime test-link-runtime test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-issue-1875-success-diag-forwarded test-import-verdicts test-kir-reach-indirect-roots test-sugars test-pipes test-pipes-collections test-match test-literals test-string test-loop test-records test-diagnostics test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-units test-stdlib-survey test-stdlib-crypto-asan test-stdlib-regex-predicate-asan test-http-client-asan test-env-mutate-asan test-securerandom-asan test-match-pbind-catchall-asan test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-match-backtrack-unify test-unbox-phase2 test-unbox-phase3 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-trace test-trace-asan test-issue-501 test-issue-743 test-issue-842 test-issue-1542 test-foreign-prelude test-issue-672 test-issue-1194-reassigned-record-field-in-interp test-issue-1263-abandon-across-resumed-frame test-issue-1263-abandon-across-resumed-frame-native test-issue-1564-promoted-cell-across-handle test-issue-1564-promoted-cell-across-handle-native test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-region-1123 test-region-1193-native test-region-1197-parity test-log-asan test-ffi-extern-c test-ffi-scalar-char test-ffi-cflags-shim test-ffi-cflags-shim-native test-issue-1556-main-thread-affinity test-issue-1556-main-thread-affinity-native test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-bigint-native test-numeric-decimal-rational test-numeric-decimal-rational-native test-numeric-div-by-zero-traps test-numeric-div-by-zero-traps-native test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-perceus-issue118 test-perceus-issue118-asan test-perceus-issue298 test-perceus-issue298-asan test-perceus-issue350 test-perceus-issue350-asan test-perceus-trmc-spread test-perceus-trmc-spread-asan test-perceus-issue703 test-perceus-issue703-asan test-issue-779 test-issue-779-asan test-perceus-enum-slot test-perceus-enum-slot-asan test-perceus-int-cache test-perceus-int-cache-asan test-int-field-inline test-int-field-inline-asan test-perceus-nested-reuse test-perceus-nested-reuse-asan test-perceus-nested-reuse-asan-native test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1219-bootstrap-seed test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1134-pipe-fusion-native test-perceus-1134-pipe-fusion-terminal-native test-perceus-1186-map-pipe-terminal-field test-perceus-1120-array-borrow test-perceus-1120-array-borrow-native test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1135-vec-value-native test-perceus-1135-vec-raw test-perceus-1135-vec-raw-native test-perceus-1151-vec-push-growth test-perceus-1151-vec-push-growth-native test-perceus-1151-vec-push-growth-asan test-perceus-1153-modcall-linear test-perceus-1153-modcall-linear-native test-perceus-1153-modcall-linear-asan test-perceus-1338-ledger-mn test-perceus-1150-vec-surface test-perceus-1150-vec-surface-native test-perceus-1150-vec-surface-asan test-perceus-1127-borrow-closure test-perceus-1512-fn-name-hoist test-perceus-1127-borrow-hof test-perceus-1127-borrow-hof-native test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1131-modular-escape test-perceus-1295-borrow-slot-nested-arg test-perceus-1295-borrow-slot-nested-arg-asan test-perceus-1303-single-use-branch-leak test-perceus-1303-single-use-branch-leak-asan test-perceus-1302-tcrec-goto-drops test-perceus-1302-tcrec-goto-drops-asan test-perceus-1302-tcrec-goto-drops-native test-perceus-1635-goto-move-collision test-perceus-1635-goto-move-collision-asan test-perceus-1635-goto-move-collision-native test-perceus-1758-cond-exit-drop test-perceus-1758-cond-exit-drop-asan test-perceus-1758-cond-exit-drop-native test-perceus-1765-binop-base-tail test-perceus-1765-binop-base-tail-asan test-perceus-1765-binop-base-tail-native test-perceus-1768-move-gate-positions test-perceus-1768-move-gate-positions-asan test-perceus-1768-move-gate-positions-native test-perceus-1324-char-binder-goto test-perceus-1324-char-binder-goto-asan test-perceus-1324-char-binder-goto-native test-perceus-1395-char-param-raw test-perceus-1395-char-param-raw-asan test-perceus-1395-char-param-raw-native test-perceus-1410-byte-raw-ops test-perceus-1410-byte-raw-ops-asan test-perceus-1410-byte-raw-ops-native test-perceus-1457-fixed-raw-ops test-perceus-1457-fixed-raw-ops-asan test-perceus-1457-fixed-raw-ops-native test-perceus-1637-int-wrap-ops test-perceus-1637-int-wrap-ops-asan test-perceus-1637-int-wrap-ops-native test-issue-1637-div-overflow-trap test-issue-1637-div-overflow-trap-native test-issue-1454-fixed-vec test-issue-1454-fixed-vec-native test-issue-1480-fixed-vec-shapes test-issue-1480-fixed-vec-collect-neg test-issue-1480-fixed-vec-shapes-native test-issue-1481-fixed-vec-border test-issue-1481-fixed-vec-border-native test-issue-1491-fixed-vec-param test-issue-1491-fixed-vec-param-native test-issue-1518-fixed-vec-param-raw test-issue-1518-fixed-vec-param-raw test-issue-1517-linalg-matrix-ops-native test-issue-1517-linalg-matrix-ops test-issue-1517-linalg-matrix-ops-native test-perceus-1464-fixed-raw-ops test-perceus-1464-fixed-raw-ops-asan test-perceus-1464-fixed-raw-ops-native test-issue-1394-byte-box test-issue-1394-byte-box-asan test-issue-1394-byte-box-native test-perceus-1315-borrowed-match-release test-perceus-1315-borrowed-match-release-asan test-perceus-1315-borrowed-match-release-native test-perceus-1355-closure-temp-release test-perceus-1355-closure-temp-release-asan test-perceus-1355-closure-temp-release-native test-perceus-1328-selftail-borrowed-local test-perceus-1328-selftail-borrowed-local-asan test-perceus-1328-selftail-borrowed-local-native test-perceus-1127-borrow-tco-native test-perceus-1130-borrow-pipe test-perceus-1130-borrow-pipe-native test-perceus-1130-hof-tail-drop test-perceus-1130-hof-tail-drop-native test-perceus-1126-read-loop-drop-native test-perceus-1127-borrow-closure test-perceus-1127-borrow-closure-native test-perceus-1127-borrow-hof test-perceus-1117-native-map-pipe-record-leak test-perceus-860-native-cons-leak test-perceus-1048-native-record-leak test-perceus-1112-native-discard-decref test-perceus-747-native-real-slot-uaf test-perceus-872-native-variant-reuse-leak test-perceus-1053-native-trmc-spine-reuse test-perceus-1053-nested-rotation-reuse test-perceus-1104-balance-token-donation test-perceus-1164-cross-call-donation test-perceus-1104-sibling-param-move test-perceus-1136-sized-variant test-perceus-1136-sized-variant-native test-perceus-1156-raw-widen test-perceus-1156-raw-widen-native test-perceus-1160-de-opaque test-perceus-1160-de-opaque-native test-perceus-882-native-rotation-reuse-crash test-perceus-995-native-shared-reuse-corruption test-perceus-995-native-dead-donor-reuse test-perceus-1069-projection-reuse test-perceus-1083-variant-spine-free test-native-1083-inline-gate test-native-1083-field-read test-native-static-slot-read test-native-1110-reuse-int-slot test-native-1229-arm-int-binder test-native-1229-writeside test-issue-892-mono-arg-unbox test-heap-limit test-unions test-aliases test-sequence test-ufcs test-rc-trace-callsite selfhost test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1565-handler-alias-shadow-native test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-attributes test-doc-attr test-shadowing test-shadowing-arm-lambda-native test-modular-build test-modular-identity test-modular-cache test-modular-hermetic test-native-core-obj test-native-core-obj-bc-state test-native-dead-strip test-modular-selfhost kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross boot-hop FORCE test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json test-issue-1852-cross-module-derive-json-native test-home-tu-partition test-native-modular test-issue-1706-runner-mode-key test-packages test-kir test-user-cache test-core-cache test-independence-oracle test-batch-isolation test-native-selfhost-gate rc-detector test-build-modes test-native-cgen-quality test-perceus-1180-range-lazy test-perceus-1180-range-lazy-native test-perceus-1180-range-lazy-asan test-perceus-1180-range-sum test-perceus-1180-range-sum-native test-shape-fusion-1200 test-shape-laws-1200 test-mn-native-soundness test-mn-c-clang-soundness test-issue-1588-main-exit-status test-issue-1588-main-exit-status-native test-issue-1590-isatty test-issue-1590-isatty-native test-native-namespace test-issue-1682-user-symbol-namespace test-issue-1682-user-symbol-namespace-native test-perceus-1771-borrow-raw-scrutinee test-perceus-1770-arm-birth-leak test-perceus-1770-arm-birth-leak-asan test-perceus-1770-arm-birth-leak-native test-perceus-1783-interp-intern-leak test-perceus-1783-interp-intern-leak-native test-perceus-1784-variant-rebuild test-perceus-1784-variant-rebuild-asan test-perceus-1784-variant-rebuild-native test-perceus-1786-record-rebuild test-perceus-1786-record-rebuild-asan test-perceus-1786-record-rebuild-native test-perceus-1791-arm-use-scope test-perceus-1791-arm-use-scope-asan test-perceus-1791-arm-use-scope-native test-perceus-1902-block-let-move test-perceus-1902-block-let-move-asan test-perceus-1902-block-let-move-native test-namespace-collisions test-namespace-collisions-neg test-namespace-collisions-native test-namespace-collisions-native-modular test-namespace-collisions-neg-native test-namespace-collisions-modular test-namespace-collisions-neg-modular test-namespace-collisions-asan test-namespace-collisions-testsym test-namespace-collisions-check test-namespace-collisions-diag test-namespace-collisions-nohomespell test-namespace-collisions-c-axes test-perceus-1801-capability-param test-perceus-1801-capability-param-asan test-perceus-1801-capability-param-native test-perceus-1803-op-arg-free test-perceus-1803-op-arg-free-native test-perceus-1803-op-arg-free-asan test-issue-1869-derive-json-lambda-slots-native test-issue-1870-derive-json-contested-field test-issue-1870-derive-json-contested-field-native test-tco-borrow-drop-1902 rc-leak-gate rc-leak-gate-native test-perceus-1961-call-raw-border test-perceus-1961-call-raw-border-native test-perceus-1961-trmc-real-elision test-perceus-1961-trmc-real-elision-native test-issue-1970-nursery-reraise-handler test-issue-1970-nursery-reraise-handler-native test-mutate-negate-shapes test-mutate-site-data test-issue-1969-typer-diag-file test-issue-2022-test-body-builtin-effects test-issue-2022-test-body-builtin-effects-native test-issue-2062-core-builtin-pipe test-issue-2062-core-builtin-pipe-native test-json-report test-json-report-native test-perceus-2032-bang-operand-use test-perceus-2032-bang-operand-use-asan test-perceus-2032-bang-operand-use-native test-perceus-owned-scope-unused-param test-perceus-owned-scope-unused-param-asan test-perceus-owned-scope-unused-param-native test-perceus-block-let-unused-alias test-perceus-block-let-unused-alias-asan test-perceus-block-let-unused-alias-native test-perceus-closure-capture-tail test-perceus-closure-capture-tail-asan test-perceus-borrow-homonym test-perceus-borrow-homonym-asan test-perceus-borrow-homonym-native test-perceus-closure-capture-selftail test-perceus-closure-capture-selftail-asan test-perceus-closure-capture-selftail-native test-actor-orphan-send-suite test-actor-orphan-send-suite-native test-perceus-switch-scrutinee-selftail test-perceus-switch-scrutinee-selftail-asan test-perceus-switch-scrutinee-selftail-native test-perceus-arm-branch-read test-perceus-arm-branch-read-asan test-perceus-arm-branch-read-native test-perceus-read-identity test-perceus-read-identity-asan test-perceus-read-identity-native test-handle-boxed-slot test-perceus-trmc-step-ledger test-perceus-trmc-step-ledger-asan test-perceus-trmc-step-ledger-native test-perceus-spread-consumes test-perceus-spread-consumes-asan test-perceus-spread-consumes-native test-perceus-borrow-own test-perceus-borrow-own-asan test-perceus-borrow-own-native test-modules-ctor-homonym test-modules-ctor-homonym-native test-index-coll-diag-once test-perceus-reuse-untaken-slot test-perceus-reuse-untaken-slot-asan test-perceus-reuse-untaken-slot-native test-slice-bound-once test-slice-bound-once-native test-rc-runs-every-thread-count test-rc-runs-every-thread-count-native test-perceus-branch-param-selftail test-perceus-branch-param-selftail-asan test-perceus-branch-param-selftail-native test-perceus-trmc-raw-operand-drop test-perceus-trmc-raw-operand-drop-asan test-perceus-trmc-raw-operand-drop-native test-perceus-pipe-borrowed-slot-alignment test-perceus-pipe-borrowed-slot-alignment-asan test-perceus-pipe-borrowed-slot-alignment-native
 all: $(TARGET)
 
@@ -223,7 +226,7 @@ build/stage2.c: $(PKG_SRCS) $(if $(filter kaic1,$(KAIC_BOOT)),$(KAIC1)) | build
 # it was frozen with (HOP_INC), the first hop of a kaic2-class boot against
 # this tree's.
 boot-hop:
-	$(CC) $(CFLAGS) $(if $(HOP_INC),-I $(HOP_INC),$(CPPFLAGS_CORE) -I ../stage0) $(LDFLAGS_STACK) $(HOP_C) -o $(HOP_BIN) $(LDLIBS_M)
+	$(CC) $(CFLAGS) $(if $(HOP_INC),-I $(HOP_INC),$(CPPFLAGS_CORE) -I ../stage0) $(KAI_MAIN_STACK) $(HOP_C) -o $(HOP_BIN) $(LDLIBS_M)
 
 # Announce which backend capability got compiled in, so a dev never has
 # to guess why `kai build` behaves differently across two checkouts (the
@@ -234,7 +237,7 @@ ifeq ($(KAI_LLVM),1)
 else
 	@echo "building stage2: C-only$(if $(KAI_LLVM_AUTO), (no $(LLVM_CONFIG) in PATH; run make KAI_LLVM=1 for native),)"
 endif
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(LDFLAGS_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M) $(LLVM_LDFLAGS)
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M) $(LLVM_LDFLAGS)
 	@if [ -f $(STAGE2_ID) ]; then $(BOOT_SH) seal $< $@; else rm -f build/$@.id; fi
 ifeq ($(KAI_LLVM),1)
 	@# Linking libLLVM does not prove native works: a kaic2 compiled by kaic2
@@ -264,7 +267,7 @@ endif
 # is for the edit-check loop only, never for CI or the selfhost oracle.
 CFLAGS_DEV := $(filter-out -O2 -O1,$(CFLAGS)) -O0
 kaic2-dev: build/stage2.c $(RUNTIME_H)
-	$(CC) $(CFLAGS_DEV) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(LDFLAGS_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M) $(LLVM_LDFLAGS)
+	$(CC) $(CFLAGS_DEV) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M) $(LLVM_LDFLAGS)
 	@echo "kaic2-dev OK (-O0; edit-loop binary, not for CI/selfhost)"
 
 # --- Dev fast rebuild: modular self-compile ---------------------------
@@ -296,7 +299,7 @@ kaic2-fast: $(KAIC2_FAST_STAGING)
 	  || { echo "kaic2-fast FAIL (--version) — keeping existing ./$(TARGET)"; exit 1; }; \
 	./$(KAIC2_FAST_STAGING) $(EDITION_FLAG) ../examples/portfolio/portfolio.kai > build/kaic2-fast-smoke.c \
 	  || { echo "kaic2-fast FAIL (smoke compile) — keeping existing ./$(TARGET)"; exit 1; }; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage0 build/kaic2-fast-smoke.c -o build/kaic2-fast-smoke $(LDLIBS_M); \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(KAI_MAIN_STACK) -I ../stage0 build/kaic2-fast-smoke.c -o build/kaic2-fast-smoke $(LDLIBS_M); \
 	./build/kaic2-fast-smoke > build/kaic2-fast-smoke.out; \
 	diff -q ../examples/portfolio/portfolio.out.expected build/kaic2-fast-smoke.out > /dev/null \
 	  || { echo "kaic2-fast FAIL (smoke DIFF) — keeping existing ./$(TARGET)"; diff ../examples/portfolio/portfolio.out.expected build/kaic2-fast-smoke.out; exit 1; }; \
@@ -343,7 +346,7 @@ kaic-boot-verify-one: | build
 	d=$(BOOT_VERIFY)/$(BOOT); \
 	KAIC_BOOT=$(BOOT) $(BOOT_SH) fresh $$d/stage2.c \
 	  || KAIC_BOOT=$(BOOT) $(BOOT_SH) emit $$d/stage2.c; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage0 $$d/stage2.c -o $$d/kaic2 $(LDLIBS_M); \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(KAI_MAIN_STACK) -I ../stage0 $$d/stage2.c -o $$d/kaic2 $(LDLIBS_M); \
 	./$$d/kaic2 $(EDITION_FLAG) $(SRC) > $$d/self.c; \
 	./$$d/kaic2 $(EDITION_FLAG) ../examples/portfolio/portfolio.kai > $$d/sample.c; \
 	cmp -s $$d/stage2.c $$d/self.c \
@@ -362,7 +365,7 @@ FORCE:
 
 # Token stream must match stage 1 (which already matches stage 0).
 test-tokens: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/minimal/*.kai ../stage1/compiler.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) --tokens $$f | awk '{$$1=$$1; print}' > build/s2-$$name.tok; \
@@ -374,7 +377,7 @@ test-tokens: $(TARGET) build
 
 # --ast smoke test (format is indented, readable, not byte-compared).
 test-ast: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) --ast $$f > build/s2-$$name.ast && echo "ast OK $$name" \
@@ -383,7 +386,7 @@ test-ast: $(TARGET) build
 
 # --types smoke test: every top-level decl gets a signature dumped.
 test-types: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) --types $$f > build/s2-$$name.types && echo "types OK $$name" \
@@ -392,7 +395,7 @@ test-types: $(TARGET) build
 
 # --env smoke test: full type environment (prelude + variants + user decls).
 test-env: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) --env $$f > build/s2-$$name.env && echo "env OK $$name" \
@@ -543,7 +546,7 @@ test-infer-check: $(TARGET) build
 
 # Checker: undefined-name resolution runs clean on every example.
 test-check: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $$f > /dev/null \
@@ -2500,6 +2503,33 @@ test-mn-sigaltstack-asan: $(TARGET) build
 	    && echo "mn-sigaltstack-asan OK $$name (KAI_THREADS=$$n)" \
 	    || { echo "mn-sigaltstack-asan DIFF $$name (KAI_THREADS=$$n)"; \
 	         diff ../examples/effects/$$name.out.expected build/$$name-asan.out; exit 1; }; \
+	done
+
+# A build defining KAI_MAIN_STACK_SIZE (the compiler's) gives `main` that
+# stack at every thread count: a recursion past 8 MB completes, and one past
+# the budget is caught by the guard page with the diagnostic, at N=1 too.
+MAIN_STACK_THREADS := 1 8
+
+test-main-stack-sized: $(TARGET) build
+	@set -e; \
+	for name in main_stack_sized main_stack_sized_overflow; do \
+	  $(KAIC2) --path ../stdlib ../examples/runtime/$$name.kai > build/s2-$$name.c; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -DKAI_MAIN_STACK_SIZE=67108864 -I ../stage0 \
+	        build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
+	done; \
+	for n in $(MAIN_STACK_THREADS); do \
+	  KAI_THREADS=$$n ./build/s2-main_stack_sized > build/s2-main_stack_sized.out 2>&1 \
+	    || { echo "main-stack-sized FAIL (KAI_THREADS=$$n: deep recursion overflowed)"; \
+	         cat build/s2-main_stack_sized.out; exit 1; }; \
+	  diff -q ../examples/runtime/main_stack_sized.out.expected build/s2-main_stack_sized.out > /dev/null \
+	    || { echo "main-stack-sized DIFF (KAI_THREADS=$$n)"; \
+	         diff ../examples/runtime/main_stack_sized.out.expected build/s2-main_stack_sized.out; exit 1; }; \
+	  rc=0; KAI_THREADS=$$n ./build/s2-main_stack_sized_overflow > /dev/null \
+	    2> build/s2-main_stack_sized_overflow.err || rc=$$?; \
+	  [ $$rc -ne 0 ] && grep -q "fiber stack overflow" build/s2-main_stack_sized_overflow.err \
+	    || { echo "main-stack-sized FAIL (KAI_THREADS=$$n: overflow not diagnosed, exit=$$rc)"; \
+	         cat build/s2-main_stack_sized_overflow.err; exit 1; }; \
+	  echo "main-stack-sized OK (KAI_THREADS=$$n: 300K deep completes, 3M deep diagnosed)"; \
 	done
 
 # Issue #501 — handler that does not call `resume`, on a `Nothing`-
@@ -4560,7 +4590,7 @@ test-effects: $(TARGET) build
 # with a specific diagnostic (negative cases — every line of
 # `<name>.err.expected` must be a substring of the compiler's stderr).
 test-sugars: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/sugars/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/sugars/$$name.out.expected; \
@@ -4607,7 +4637,7 @@ test-sugars: $(TARGET) build
 # `<name>.lint-json.expected`. The linter must exit 0 in every case —
 # a lint never blocks a build — so a non-zero exit fails the gate.
 test-lint: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/lint/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_txt=../examples/lint/$$name.lint.expected; \
@@ -4641,7 +4671,7 @@ test-lint: $(TARGET) build
 # Lives in its own target so a regression in spread desugaring shows
 # up under a clearly named gate.
 test-records: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/records/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/records/$$name.out.expected; \
@@ -4681,7 +4711,7 @@ test-records: $(TARGET) build
 # run cleanly — they exist to pin regression cases like a wildcard
 # `_` arm suppressing the non-exhaustive diagnostic.
 test-diagnostics: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/diagnostics/*.kai; do \
 	  [ -e $$f ] || continue; \
 	  name=$$(basename $$f .kai); \
@@ -4761,7 +4791,7 @@ test-slice-bound-once test-slice-bound-once-native: $(TARGET) bin-kai build
 # regression in the multi-arg desugaring shows up under a clearly
 # named gate rather than buried in the sugars suite.
 test-match: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/match/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/match/$$name.out.expected; \
@@ -4799,7 +4829,7 @@ test-match: $(TARGET) build
 # Positive cases verify round-trip values up to signed 64-bit max;
 # negative cases assert the lexer's malformed-literal diagnostic.
 test-literals: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/literals/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/literals/$$name.out.expected; \
@@ -4841,7 +4871,7 @@ test-literals: $(TARGET) build
 # as `test-stdlib`. Diff / `.err.expected` discipline mirrors
 # `test-literals`.
 test-string: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/string/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/string/$$name.out.expected; \
@@ -4883,7 +4913,7 @@ test-string: $(TARGET) build
 # `parse_pipe_rest` does not regress it. Same diff/golden discipline
 # as test-sugars.
 test-pipes: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/pipes/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/pipes/$$name.out.expected; \
@@ -4924,7 +4954,7 @@ test-pipes: $(TARGET) build
 # why they live in their own subdir rather than the flat
 # `examples/pipes/*.kai` glob.
 test-pipes-collections: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/pipes/collections/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/pipes/collections/$$name.out.expected; \
@@ -4947,7 +4977,7 @@ test-pipes-collections: $(TARGET) build
 # Positive cases run on both backends (C and LLVM) when an
 # `.out.expected` file is present.
 test-protocols: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/protocols/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  case "$$name" in poly_scalar_dispatch|bare_narrow_in_assert) continue ;; esac; \
@@ -5072,7 +5102,7 @@ test-link-runtime: build
 # and the C linker rejected the binary. Pinned in
 # `docs/m4c-real-specialisation.md`.
 test-m4c: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/effects/m4c_run_with.kai ../examples/effects/m4c_handler_in_body.kai ../examples/effects/m4c_flow_through.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -5122,13 +5152,13 @@ bench-effects: build
 
 # The compiler's own sources compile without a single warning.
 selfhost: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	$(KAIC2) $(SRC) > build/kaic2b.c 2> build/kaic2b.err || { cat build/kaic2b.err >&2; exit 1; }; \
 	cat build/kaic2b.err >&2; \
 	if grep -q '^warning:' build/kaic2b.err; then \
 	  echo "selfhost warnings: the compiler's own sources must compile without a warning"; exit 1; \
 	fi; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LDFLAGS_STACK) -I ../stage0 build/kaic2b.c -o build/kaic2b $(LDLIBS_M) ; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(KAI_MAIN_STACK) -I ../stage0 build/kaic2b.c -o build/kaic2b $(LDLIBS_M) ; \
 	./build/kaic2b $(EDITION_FLAG) $(SRC) > build/kaic2c.c; \
 	diff -q build/kaic2b.c build/kaic2c.c > /dev/null \
 	  && echo "selfhost determinism: OK (kaic2b.c == kaic2c.c)" \
@@ -5144,7 +5174,7 @@ selfhost: $(TARGET) build
 DEMOS_CORE := portfolio usd_to_eur
 
 test-demos-core: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for name in $(DEMOS_CORE); do \
 	  src=../examples/$$name/$$name.kai; \
 	  exp=../examples/$$name/$$name.out.expected; \
@@ -5177,7 +5207,7 @@ test-demos-core: $(TARGET) build
 ASPIRATIONAL_DEMOS := event_logger audit_handler pipeline_reorder_smoke
 
 test-aspirational: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for name in $(ASPIRATIONAL_DEMOS); do \
 	  src=../examples/aspirational/$$name/$$name.kai; \
 	  exp=../examples/aspirational/$$name/$$name.out.expected; \
@@ -7881,7 +7911,7 @@ test-perceus-pipe-borrowed-slot-alignment: $(TARGET) build
 # rotting in a file nothing builds. `intervals` is split off because it costs
 # an order of magnitude more than the others.
 test-compiler-units: $(TARGET) bin-kai build
-	@$(STACK) set -e; \
+	@set -e; \
 	for t in chars diag util; do \
 	  ../bin/kai test tests/test_$$t.kai > build/s2-unit-$$t.out 2>&1 \
 	    || { echo "compiler-units FAIL ($$t)"; cat build/s2-unit-$$t.out; exit 1; }; \
@@ -7889,7 +7919,7 @@ test-compiler-units: $(TARGET) bin-kai build
 	echo "compiler-units OK (chars, diag, util)"
 
 test-compiler-intervals: $(TARGET) bin-kai build
-	@$(STACK) set -e; \
+	@set -e; \
 	../bin/kai test tests/test_intervals.kai > build/s2-unit-intervals.out 2>&1 \
 	  || { echo "compiler-intervals FAIL"; cat build/s2-unit-intervals.out; exit 1; }; \
 	echo "compiler-intervals OK"
@@ -11905,7 +11935,7 @@ test-env-mutate-asan: $(TARGET) build
 # target so a regression in the head-type-to-module dispatch path or
 # the rejection diagnostics shows up under a clearly-named gate.
 test-sequence: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/sequence/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/sequence/$$name.out.expected; \
@@ -11939,7 +11969,7 @@ test-sequence: $(TARGET) build
 	done
 
 test-ufcs: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/ufcs/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/ufcs/$$name.out.expected; \
@@ -11974,7 +12004,7 @@ test-ufcs: $(TARGET) build
 	done
 
 test-unions: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/unions/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/unions/$$name.out.expected; \
@@ -12017,7 +12047,7 @@ test-unions: $(TARGET) build
 # `union_two_components_unchanged` fixture is the regression guard
 # for issue #187 (multi-component nominal-union semantics).
 test-aliases: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/types/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/types/$$name.out.expected; \
@@ -12084,7 +12114,7 @@ test-rc-trace-callsite: $(TARGET) build
 # surprise. The native backend's parity is gated separately by the
 # native-vs-C ratchet (tools/test-backend-parity.sh).
 test-violations: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/refinements/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_run_err=../examples/refinements/$$name.run.err.expected; \
@@ -12133,7 +12163,7 @@ test-violations: $(TARGET) build
 # expected file's first line must appear in the error output as a
 # substring). Stdlib prelude is loaded so `Show`/`Eq` resolve.
 test-attributes: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	preludes=""; \
 	for f in ../examples/attributes/*.kai; do \
 	  name=$$(basename $$f .kai); \
@@ -12173,7 +12203,7 @@ test-attributes: $(TARGET) build
 # The duplicate-doc / second-module-doc rejections live in
 # examples/negative/doc/ under tools/test-negative.sh.
 test-doc-attr: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	$(KAIC2) $(TEST_CORE_CACHE) --doc-json ../examples/doc/doc_json_basic.kai > build/doc-json-basic.out; \
 	diff ../examples/doc/doc_json_basic.doc.expected build/doc-json-basic.out > /dev/null \
 	  && echo "doc-attr OK doc-json golden" \
@@ -12199,7 +12229,7 @@ test-doc-attr: $(TARGET) build
 # (the tier1 chain) so byte-identical selfhost + the closing PR's
 # acceptance gate both touch this target.
 test-shadowing: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	for f in ../examples/shadowing/*.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/shadowing/$$name.out.expected; \
@@ -12278,7 +12308,7 @@ MODULAR_FIXTURES = ../examples/multi-module/main.kai \
                    ../examples/shadowing/user_pub_fn_arity_diff_vs_core.kai \
                    ../examples/shadowing/user_pub_fn_same_arity_shadows_core.kai
 test-modular-build: $(TARGET) build
-	@$(STACK) set -e; \
+	@set -e; \
 	i=0; \
 	for f in $(MODULAR_FIXTURES); do \
 	  i=$$((i + 1)); \
@@ -12654,7 +12684,7 @@ core-cache-warm: $(TARGET) build
 	  echo "core-cache-warm OK ($(TEST_CORE_CACHE_DIR))"; \
 	else echo "core-cache-warm off (KAI_CORE_CACHE=0)"; fi
 
-TEST_LIGHT_TARGETS := test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-purity test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-holes test-driver-holes test-effects test-effects-goldens test-effects-goldens-native test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-units test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-phase3 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-runtime-shadow test-issue-501 test-issue-743 test-issue-842 test-issue-1542 test-foreign-prelude test-issue-672 test-issue-1194-reassigned-record-field-in-interp test-issue-1263-abandon-across-resumed-frame test-issue-1564-promoted-cell-across-handle test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-region-1123 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-trmc-spread test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1219-bootstrap-seed test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1143-pipe-fusion-lambda test-perceus-1143-pipe-fusion-ring test-perceus-1186-map-pipe-terminal-field test-perceus-1120-array-borrow test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1135-vec-raw test-perceus-1151-vec-push-growth test-perceus-1153-modcall-linear test-perceus-1338-ledger-mn test-perceus-1150-vec-surface test-perceus-1127-borrow-closure test-perceus-1512-fn-name-hoist test-perceus-1127-borrow-hof test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1295-borrow-slot-nested-arg test-perceus-1303-single-use-branch-leak test-perceus-1302-tcrec-goto-drops test-perceus-1635-goto-move-collision test-perceus-1324-char-binder-goto test-perceus-1395-char-param-raw test-perceus-1410-byte-raw-ops test-perceus-1457-fixed-raw-ops test-perceus-1637-int-wrap-ops test-issue-1637-div-overflow-trap test-issue-1454-fixed-vec test-issue-1480-fixed-vec-shapes test-issue-1480-fixed-vec-collect-neg test-issue-1481-fixed-vec-border test-issue-1491-fixed-vec-param test-issue-1518-fixed-vec-param-raw test-issue-1517-linalg-matrix-ops test-perceus-1464-fixed-raw-ops test-issue-1394-byte-box test-perceus-1315-borrowed-match-release test-perceus-1355-closure-temp-release test-perceus-1328-selftail-borrowed-local test-perceus-1130-borrow-pipe test-perceus-1130-hof-tail-drop test-perceus-1104-balance-token-donation test-perceus-1104-sibling-param-move test-perceus-1136-sized-variant test-perceus-1156-raw-widen test-issue-892-mono-arg-unbox test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-struct test-ffi-in-test-blocks test-ffi-cflags-shim test-issue-1556-main-thread-affinity test-native-modular test-issue-1706-runner-mode-key test-issue-1426-cross-module-derive-show test-issue-1852-cross-module-derive-json test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json-native test-native-core-obj test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-decimal-rational test-numeric-div-by-zero-traps test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-unused-bindings test-attributes test-doc-attr test-shadowing test-modular-build test-modular-identity test-modular-cache test-modular-hermetic test-issue-963-cross-module-mono test-home-tu-partition test-kir test-batch-isolation test-perceus-1180-range-lazy test-perceus-1180-range-sum test-shape-fusion-1200 test-shape-laws-1200 test-issue-1588-main-exit-status test-issue-1590-isatty test-issue-1682-user-symbol-namespace test-pipes-collections test-perceus-1758-cond-exit-drop test-perceus-1765-binop-base-tail test-perceus-1768-move-gate-positions test-perceus-1771-borrow-raw-scrutinee test-perceus-1770-arm-birth-leak test-perceus-1783-interp-intern-leak test-perceus-1784-variant-rebuild test-perceus-1786-record-rebuild test-perceus-1791-arm-use-scope test-perceus-1801-capability-param test-perceus-1803-op-arg-free test-issue-1875-success-diag-forwarded test-issue-1869-derive-json-lambda-slots-native test-issue-1870-derive-json-contested-field test-issue-1870-derive-json-contested-field-native test-perceus-1902-block-let-move test-tco-borrow-drop-1902 test-perceus-1961-call-raw-border test-perceus-1961-trmc-real-elision test-issue-1970-nursery-reraise-handler test-mutate-negate-shapes test-mutate-site-data test-issue-1969-typer-diag-file test-issue-2022-test-body-builtin-effects test-issue-2022-test-body-builtin-effects-native test-issue-2062-core-builtin-pipe test-issue-2062-core-builtin-pipe-native test-json-report test-json-report-native test-perceus-2032-bang-operand-use test-kir-reach-indirect-roots test-perceus-owned-scope-unused-param test-import-verdicts test-perceus-block-let-unused-alias test-perceus-closure-capture-tail test-perceus-borrow-homonym test-perceus-closure-capture-selftail test-actor-orphan-send-suite test-actor-orphan-send-suite-native test-perceus-switch-scrutinee-selftail test-perceus-arm-branch-read test-perceus-read-identity test-tycon-ids test-perceus-trmc-step-ledger test-perceus-spread-consumes test-perceus-borrow-own test-modules-ctor-homonym test-index-coll-diag-once test-perceus-reuse-untaken-slot test-slice-bound-once test-rc-runs-every-thread-count test-perceus-branch-param-selftail test-perceus-trmc-raw-operand-drop test-dump-last-use test-stdlib-map-pipes test-perceus-pipe-borrowed-slot-alignment test-compiler-units test-compiler-intervals
+TEST_LIGHT_TARGETS := test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-purity test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-holes test-driver-holes test-effects test-effects-goldens test-effects-goldens-native test-effect-runtime test-link-runtime test-sugars test-pipes test-match test-literals test-string test-loop test-records test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-units test-protocols test-proto-scalar-dispatch test-bare-narrow-assert test-demos-core test-aspirational test-m4c test-match-backtrack-unify test-unbox-phase2 test-unbox-phase3 test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-runtime-shadow test-issue-501 test-issue-743 test-issue-842 test-issue-1542 test-foreign-prelude test-issue-672 test-issue-1194-reassigned-record-field-in-interp test-issue-1263-abandon-across-resumed-frame test-issue-1564-promoted-cell-across-handle test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-region-1123 test-perceus-issue82 test-perceus-issue118 test-perceus-issue298 test-perceus-issue350 test-perceus-trmc-spread test-perceus-issue703 test-issue-779 test-perceus-enum-slot test-perceus-int-cache test-int-field-inline test-perceus-nested-reuse test-perceus-812-tracer test-perceus-817-filter-leak test-perceus-1219-bootstrap-seed test-perceus-1117-map-pipe-record-leak test-perceus-1134-pipe-fusion test-perceus-1134-pipe-fusion-ordering test-perceus-1134-pipe-fusion-terminal test-perceus-1143-pipe-fusion-lambda test-perceus-1143-pipe-fusion-ring test-perceus-1186-map-pipe-terminal-field test-perceus-1120-array-borrow test-perceus-1126-read-loop-drop test-perceus-1135-vec-value test-perceus-1135-vec-raw test-perceus-1151-vec-push-growth test-perceus-1153-modcall-linear test-perceus-1338-ledger-mn test-perceus-1150-vec-surface test-perceus-1127-borrow-closure test-perceus-1512-fn-name-hoist test-perceus-1127-borrow-hof test-perceus-1127-borrow-tco test-perceus-1131-borrow-descent test-perceus-1295-borrow-slot-nested-arg test-perceus-1303-single-use-branch-leak test-perceus-1302-tcrec-goto-drops test-perceus-1635-goto-move-collision test-perceus-1324-char-binder-goto test-perceus-1395-char-param-raw test-perceus-1410-byte-raw-ops test-perceus-1457-fixed-raw-ops test-perceus-1637-int-wrap-ops test-issue-1637-div-overflow-trap test-issue-1454-fixed-vec test-issue-1480-fixed-vec-shapes test-issue-1480-fixed-vec-collect-neg test-issue-1481-fixed-vec-border test-issue-1491-fixed-vec-param test-issue-1518-fixed-vec-param-raw test-issue-1517-linalg-matrix-ops test-perceus-1464-fixed-raw-ops test-issue-1394-byte-box test-perceus-1315-borrowed-match-release test-perceus-1355-closure-temp-release test-perceus-1328-selftail-borrowed-local test-perceus-1130-borrow-pipe test-perceus-1130-hof-tail-drop test-perceus-1104-balance-token-donation test-perceus-1104-sibling-param-move test-perceus-1136-sized-variant test-perceus-1156-raw-widen test-issue-892-mono-arg-unbox test-unions test-aliases test-sequence test-ufcs test-ffi-extern-c test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-struct test-ffi-in-test-blocks test-ffi-cflags-shim test-issue-1556-main-thread-affinity test-native-modular test-issue-1706-runner-mode-key test-issue-1426-cross-module-derive-show test-issue-1852-cross-module-derive-json test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json-native test-native-core-obj test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-decimal-rational test-numeric-div-by-zero-traps test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-rc-trace-callsite test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-violations test-unused-bindings test-attributes test-doc-attr test-shadowing test-modular-build test-modular-identity test-modular-cache test-modular-hermetic test-issue-963-cross-module-mono test-home-tu-partition test-kir test-batch-isolation test-perceus-1180-range-lazy test-perceus-1180-range-sum test-shape-fusion-1200 test-shape-laws-1200 test-issue-1588-main-exit-status test-issue-1590-isatty test-issue-1682-user-symbol-namespace test-pipes-collections test-perceus-1758-cond-exit-drop test-perceus-1765-binop-base-tail test-perceus-1768-move-gate-positions test-perceus-1771-borrow-raw-scrutinee test-perceus-1770-arm-birth-leak test-perceus-1783-interp-intern-leak test-perceus-1784-variant-rebuild test-perceus-1786-record-rebuild test-perceus-1791-arm-use-scope test-perceus-1801-capability-param test-perceus-1803-op-arg-free test-issue-1875-success-diag-forwarded test-issue-1869-derive-json-lambda-slots-native test-issue-1870-derive-json-contested-field test-issue-1870-derive-json-contested-field-native test-perceus-1902-block-let-move test-tco-borrow-drop-1902 test-perceus-1961-call-raw-border test-perceus-1961-trmc-real-elision test-issue-1970-nursery-reraise-handler test-mutate-negate-shapes test-mutate-site-data test-issue-1969-typer-diag-file test-issue-2022-test-body-builtin-effects test-issue-2022-test-body-builtin-effects-native test-issue-2062-core-builtin-pipe test-issue-2062-core-builtin-pipe-native test-json-report test-json-report-native test-perceus-2032-bang-operand-use test-kir-reach-indirect-roots test-perceus-owned-scope-unused-param test-import-verdicts test-perceus-block-let-unused-alias test-perceus-closure-capture-tail test-perceus-borrow-homonym test-perceus-closure-capture-selftail test-actor-orphan-send-suite test-actor-orphan-send-suite-native test-perceus-switch-scrutinee-selftail test-perceus-arm-branch-read test-perceus-read-identity test-tycon-ids test-perceus-trmc-step-ledger test-perceus-spread-consumes test-perceus-borrow-own test-modules-ctor-homonym test-index-coll-diag-once test-perceus-reuse-untaken-slot test-slice-bound-once test-rc-runs-every-thread-count test-perceus-branch-param-selftail test-perceus-trmc-raw-operand-drop test-dump-last-use test-stdlib-map-pipes test-perceus-pipe-borrowed-slot-alignment test-compiler-units test-compiler-intervals test-main-stack-sized
 
 # Targets that drive `bin/kai` with KAI_BACKEND=native. On a kaic2 built
 # without libLLVM the wrapper degrades to the C backend, so running these
@@ -12715,7 +12745,7 @@ test-fast: test-infer test-infer-check test-lint test-dump-typed test-dump-mono 
 # package-manager surface stays a CI blind spot — bugs like #565
 # and #567 only surfaced because ahu tried to integrate.
 test-packages: $(TARGET) bin-kai
-	@$(STACK) ../tools/test-packages.sh
+	@../tools/test-packages.sh
 
 # Issue #455 Phase B — user-file incremental cache invalidation gate.
 # Runs the negative fixtures (edit source / edit import / edit
