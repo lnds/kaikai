@@ -7828,8 +7828,16 @@ static KaiValue *kai_core_panic(KaiValue *msg) {
     return kai_unit();
 }
 
+#ifdef KAI_LLVM
+static void kai_emit_pool_drain(void);
+#endif
 static KaiValue *kai_core_exit(KaiValue *code) {
     int c = (kai_is_int(code)) ? (int) kai_intf(code) : 0;
+#ifdef KAI_LLVM
+    /* Before exit(): LLVM's lazily built statics are torn down by it while a
+     * queued partition may still be using them. */
+    kai_emit_pool_drain();
+#endif
     exit(c);
     return kai_unit();
 }
@@ -20017,8 +20025,7 @@ static void kai_llvm_stamp_host_features(LLVMModuleRef m) {
  * using the host target machine. Returns 0 on success, non-zero on a
  * verify or codegen failure (the driver surfaces the error and aborts).
  * One process: no `.ll` text, no `clang` subprocess. */
-static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runtime) {
-    const char *out = path->as.s.bytes;
+static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runtime) {
     int64_t rc = 0;
     char *err = NULL;
 
@@ -20037,7 +20044,6 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
     if (LLVMVerifyModule((LLVMModuleRef) m, LLVMReturnStatusAction, &err)) {
         fprintf(stderr, "kai: native module verify failed: %s\n", err ? err : "?");
         if (err) LLVMDisposeMessage(err);
-        if (path) kai_decref(path);
         return 1;
     }
     if (err) { LLVMDisposeMessage(err); err = NULL; }
@@ -20051,7 +20057,6 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
         fprintf(stderr, "kai: native target lookup failed: %s\n", err ? err : "?");
         if (err) LLVMDisposeMessage(err);
         LLVMDisposeMessage(triple);
-        if (path) kai_decref(path);
         return 1;
     }
     char *cpu = LLVMGetHostCPUName();
@@ -20082,7 +20087,6 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
     if (merge_rc) {
         LLVMDisposeTargetMachine(tm);
         LLVMDisposeMessage(triple);
-        if (path) kai_decref(path);
         return 1;
     }
 
@@ -20098,7 +20102,6 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
     if (kai_llvm_run_passes((LLVMModuleRef) m, tm)) {
         LLVMDisposeTargetMachine(tm);
         LLVMDisposeMessage(triple);
-        if (path) kai_decref(path);
         return 1;
     }
 
@@ -20148,14 +20151,126 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
 
     LLVMDisposeTargetMachine(tm);
     LLVMDisposeMessage(triple);
-    if (path) kai_decref(path);
     return rc;
+}
+
+/* Partition emit pool. With KAI_NATIVE_JOBS > 1 a partition's verify, runtime
+ * merge, O2 and emit run on a worker while the walk builds the next partition.
+ * A partition owns its LLVMContext, so a worker shares no LLVM state with the
+ * walk or another worker, and it never touches the kaikai heap. The `exit`
+ * prim drains the queue, so every queued object is published before the
+ * process exits; a failed one exits 1. */
+typedef struct KaiEmitJob { LLVMModuleRef m; char *out; struct KaiEmitJob *next; } KaiEmitJob;
+
+#define KAI_EMIT_MAX_WORKERS 64
+static pthread_mutex_t kai_emit_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t kai_emit_work_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t kai_emit_idle_cv = PTHREAD_COND_INITIALIZER;
+static KaiEmitJob *kai_emit_head = NULL, *kai_emit_tail = NULL;
+static pthread_t kai_emit_threads[KAI_EMIT_MAX_WORKERS];
+static int kai_emit_nworkers = -1, kai_emit_started = 0, kai_emit_busy = 0;
+static int kai_emit_failed = 0, kai_emit_stop = 0;
+static char **kai_emit_outs = NULL;
+static size_t kai_emit_nouts = 0, kai_emit_capouts = 0;
+
+static int kai_emit_pool_on(void) {
+    if (kai_emit_nworkers < 0) {
+        const char *e = getenv("KAI_NATIVE_JOBS");
+        long n = (e && e[0]) ? strtol(e, NULL, 10) : 1;
+        kai_emit_nworkers = n > KAI_EMIT_MAX_WORKERS ? KAI_EMIT_MAX_WORKERS : (int) n;
+    }
+    return kai_emit_nworkers > 1;
+}
+
+static void *kai_emit_worker(void *arg) {
+    (void) arg;
+    for (;;) {
+        pthread_mutex_lock(&kai_emit_mu);
+        while (!kai_emit_head && !kai_emit_stop) pthread_cond_wait(&kai_emit_work_cv, &kai_emit_mu);
+        KaiEmitJob *job = kai_emit_head;
+        if (!job) { pthread_mutex_unlock(&kai_emit_mu); return NULL; }
+        kai_emit_head = job->next;
+        if (!kai_emit_head) kai_emit_tail = NULL;
+        pthread_mutex_unlock(&kai_emit_mu);
+        int64_t rc = kai_llvm_emit_object_impl(job->m, job->out, 2);
+        free(job->out);
+        free(job);
+        pthread_mutex_lock(&kai_emit_mu);
+        if (rc) kai_emit_failed++;
+        if (--kai_emit_busy == 0) pthread_cond_broadcast(&kai_emit_idle_cv);
+        pthread_mutex_unlock(&kai_emit_mu);
+    }
+}
+
+static void kai_emit_pool_drain(void) {
+    if (!kai_emit_started) return;
+    pthread_mutex_lock(&kai_emit_mu);
+    kai_emit_stop = 1;
+    pthread_cond_broadcast(&kai_emit_work_cv);
+    while (kai_emit_busy > 0) pthread_cond_wait(&kai_emit_idle_cv, &kai_emit_mu);
+    int failed = kai_emit_failed;
+    kai_emit_started = 0;
+    pthread_mutex_unlock(&kai_emit_mu);
+    for (int i = 0; i < kai_emit_nworkers; i++) pthread_join(kai_emit_threads[i], NULL);
+    if (failed) { fflush(NULL); _exit(1); }
+}
+
+/* Workers block SIGCHLD so the reactor's wake signal stays on the scheduler. */
+static void kai_emit_pool_start(void) {
+    LLVMInitializeNativeTarget();
+    LLVMInitializeNativeAsmPrinter();
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, (size_t) 64 << 20);
+    sigset_t block_set, prev_set;
+    sigemptyset(&block_set);
+    sigaddset(&block_set, SIGCHLD);
+    pthread_sigmask(SIG_BLOCK, &block_set, &prev_set);
+    for (int i = 0; i < kai_emit_nworkers; i++) {
+        if (pthread_create(&kai_emit_threads[i], &attr, kai_emit_worker, NULL) != 0) {
+            fprintf(stderr, "kai: native emit pthread_create failed: %s\n", strerror(errno));
+            exit(1);
+        }
+    }
+    pthread_sigmask(SIG_SETMASK, &prev_set, NULL);
+    pthread_attr_destroy(&attr);
+    kai_emit_started = 1;
+}
+
+/* An object already queued is not queued again: outputs are content-addressed,
+ * and two writers of one path would race on its temp name. */
+static int kai_emit_seen(const char *out) {
+    for (size_t i = 0; i < kai_emit_nouts; i++) if (strcmp(kai_emit_outs[i], out) == 0) return 1;
+    if (kai_emit_nouts == kai_emit_capouts) {
+        kai_emit_capouts = kai_emit_capouts ? kai_emit_capouts * 2 : 64;
+        kai_emit_outs = (char **) realloc(kai_emit_outs, kai_emit_capouts * sizeof(char *));
+    }
+    kai_emit_outs[kai_emit_nouts++] = strdup(out);
+    return 0;
+}
+
+static int64_t kai_emit_pool_submit(LLVMModuleRef m, const char *out) {
+    pthread_mutex_lock(&kai_emit_mu);
+    if (!kai_emit_started) kai_emit_pool_start();
+    if (kai_emit_seen(out)) { pthread_mutex_unlock(&kai_emit_mu); return 0; }
+    KaiEmitJob *job = (KaiEmitJob *) malloc(sizeof(KaiEmitJob));
+    job->m = m;
+    job->out = strdup(out);
+    job->next = NULL;
+    if (kai_emit_tail) kai_emit_tail->next = job; else kai_emit_head = job;
+    kai_emit_tail = job;
+    kai_emit_busy++;
+    pthread_cond_signal(&kai_emit_work_cv);
+    pthread_mutex_unlock(&kai_emit_mu);
+    return 0;
 }
 
 /* Whole-program object: merge the runtime bitcode + internalise so O2 inlines
  * the `kaix_*` bodies. The default single-TU native path. */
 static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
-    return kai_llvm_emit_object_impl(m, path, 1);
+    int64_t rc = kai_llvm_emit_object_impl(m, path->as.s.bytes, 1);
+    kai_decref(path);
+    return rc;
 }
 
 /* One partition of a modular build. With KAI_NATIVE_RUNTIME_INLINE_BC set,
@@ -20165,7 +20280,10 @@ static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
  * owner TU linked by cc (the legacy path). Cross-TU user symbols keep external
  * linkage either way. */
 static int64_t kai_llvm_emit_object_raw(void *m, KaiValue *path) {
-    return kai_llvm_emit_object_impl(m, path, 2);
+    int64_t rc = kai_emit_pool_on() ? kai_emit_pool_submit((LLVMModuleRef) m, path->as.s.bytes)
+                                    : kai_llvm_emit_object_impl(m, path->as.s.bytes, 2);
+    kai_decref(path);
+    return rc;
 }
 #else /* !KAI_LLVM */
 /* Default / bootstrap build: libLLVM is not linked, so the C-API
