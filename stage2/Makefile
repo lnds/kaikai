@@ -11793,7 +11793,7 @@ test-perceus-trmc-spread-asan: $(TARGET) build
 # exact shape `pcs_sub_is_flat` now admits. The golden is the post-insert
 # node count: a token used by the rebuild AND freed afterward (the
 # double-use bug the lane hit) drops a subtree, so size comes out SHORT.
-PERCEUS_NESTED_REUSE_FIXTURES := nested_pattern_reuse_balance native_variant_reuse_leak_872 native_variant_reuse_double_use_872 reuse_nested_subpattern reuse_nested_shared_donor
+PERCEUS_NESTED_REUSE_FIXTURES := nested_pattern_reuse_balance native_variant_reuse_leak_872 native_variant_reuse_double_use_872 reuse_nested_subpattern reuse_nested_shared_donor nested_reuse_shared_consumed_leaf
 
 test-perceus-nested-reuse: $(TARGET) build
 	@set -e; \
