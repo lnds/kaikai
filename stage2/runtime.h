@@ -71,6 +71,19 @@
 #include <execinfo.h>   /* backtrace() for the --debug panic stack trace (#500) */
 #include <dlfcn.h>      /* dladdr() — main-image load address to de-slide PIE frames */
 
+/* Every runtime exit goes through kai_exit: exit() tears down LLVM's lazily
+ * built statics, so the native emit pool is drained first. */
+#ifdef KAI_LLVM
+static void kai_emit_pool_drain(int code);
+#endif
+static void kai_exit(int code) __attribute__((noreturn));
+static void kai_exit(int code) {
+#ifdef KAI_LLVM
+    kai_emit_pool_drain(code);
+#endif
+    exit(code);
+}
+
 /* Purity attribute for a confirmed memory-clean fn (issue #1139): the C
  * emitter prefixes `KAI_CONST` on the signature of a fn whose lowered
  * body performs no memory access, so `cc -O2` can CSE / hoist / fold
@@ -425,7 +438,7 @@ static void kai_register_variant_head_pairs(const int32_t *pairs, int32_t n) {
     int32_t *tbl;
     for (i = 0; i + 1 < n; i += 2) if (pairs[i] > max_tag) max_tag = pairs[i];
     tbl = (int32_t *) calloc((size_t) max_tag + 1, sizeof(int32_t));
-    if (!tbl) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!tbl) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     for (i = 0; i + 1 < n; i += 2) tbl[pairs[i]] = pairs[i + 1];
     kai_register_variant_heads(tbl, max_tag + 1);
 }
@@ -2208,7 +2221,7 @@ static void kai_heap_charge(size_t sz) {
         fprintf(stderr,
             "kai: heap limit exceeded (KAI_MAX_HEAP=%s, used %zu bytes)\n",
             getenv("KAI_MAX_HEAP"), kai_heap_committed);
-        exit(1);
+        kai_exit(1);
     }
     kai_heap_committed += sz;
 }
@@ -2218,14 +2231,14 @@ static void kai_heap_charge(size_t sz) {
 static void *kai_heap_malloc(size_t sz) {
     kai_heap_charge(sz);
     void *p = malloc(sz);
-    if (!p) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!p) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     return p;
 }
 
 static void *kai_heap_realloc(void *ptr, size_t old_sz, size_t new_sz) {
     if (new_sz > old_sz) kai_heap_charge(new_sz - old_sz);
     void *p = realloc(ptr, new_sz);
-    if (!p) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!p) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     return p;
 }
 
@@ -2473,7 +2486,7 @@ static void *kai_slab_alloc(size_t sz) {
     if (!kai_slab_cur || kai_slab_off + sz > KAI_SLAB_SIZE) {
         kai_heap_charge(KAI_SLAB_SIZE);
         char *slab = (char *) malloc(KAI_SLAB_SIZE);
-        if (!slab) { fprintf(stderr, "kai: out of memory (slab)\n"); exit(1); }
+        if (!slab) { fprintf(stderr, "kai: out of memory (slab)\n"); kai_exit(1); }
         if (kai_slab_count == kai_slab_cap) {
             int ncap = kai_slab_cap == 0 ? 64 : kai_slab_cap * 2;
             kai_slab_list = (char **) realloc(kai_slab_list, (size_t) ncap * sizeof(char *));
@@ -2542,7 +2555,7 @@ static KaiValue *kai_alloc(KaiTag tag) {
     kai_heap_charge(sizeof(KaiValue));
     KaiValue *v = (KaiValue *) calloc(1, sizeof(KaiValue));
 #endif
-    if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!v) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     v->rc = 1;
     v->tag = (uint8_t) tag;
     /* trace */
@@ -2621,7 +2634,7 @@ static KaiValue *kai_alloc_var(int n) {
     kai_heap_charge(bsz);
     v = (KaiValue *) calloc(1, bsz);
 #endif
-    if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!v) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     v->rc = 1;
     v->tag = (uint8_t) KAI_VARIANT;
     kai_rc_count_alloc((int) KAI_VARIANT);
@@ -2675,7 +2688,7 @@ static KaiValue *kai_alloc_var_nz(int n) {
      * kai_var_block_free's #else frees it. */
     v = (KaiValue *) kai_heap_malloc(kai_var_block_size(n));
 #endif
-    if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!v) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     v->rc = 1;
     v->tag = (uint8_t) KAI_VARIANT;
     kai_rc_count_alloc((int) KAI_VARIANT);
@@ -2826,9 +2839,9 @@ static KaiArenaChunk *kai_arena_chunk_new(size_t need) {
     if (need > cap) cap = need;               /* oversized single object */
     kai_heap_charge(sizeof(KaiArenaChunk) + cap);
     KaiArenaChunk *c = (KaiArenaChunk *) malloc(sizeof(KaiArenaChunk));
-    if (!c) { fprintf(stderr, "kai: out of memory (arena chunk)\n"); exit(1); }
+    if (!c) { fprintf(stderr, "kai: out of memory (arena chunk)\n"); kai_exit(1); }
     c->data = (unsigned char *) malloc(cap);
-    if (!c->data) { fprintf(stderr, "kai: out of memory (arena data)\n"); exit(1); }
+    if (!c->data) { fprintf(stderr, "kai: out of memory (arena data)\n"); kai_exit(1); }
     c->next = NULL;
     c->used = 0;
     c->cap  = cap;
@@ -2918,7 +2931,7 @@ static KAI_TLS int      kai_arena_sp = 0;
 static KaiArena *kai_arena_push(void) {
     if (kai_arena_sp >= KAI_ARENA_STACK_MAX) {
         fprintf(stderr, "kai: region nesting exceeds %d\n", KAI_ARENA_STACK_MAX);
-        exit(1);
+        kai_exit(1);
     }
     KaiArena *a = &kai_arena_stack[kai_arena_sp++];
     kai_arena_init(a);
@@ -3463,7 +3476,7 @@ static void kai_trap_abort(const char *msg) {
         /* Unreachable. */
     }
     fprintf(stderr, "kai: trap: %s\n", msg ? msg : "runtime trap");
-    exit(1);
+    kai_exit(1);
 }
 
 /* Ready queue (intrusive singly-linked, head/tail). Fibers go on the queue
@@ -4004,7 +4017,7 @@ static inline void kai_mbox_unlock(KaiMailbox *mb) { if (mb->mu_inited) pthread_
  * parent would corrupt its own lookups whenever it already owns one. */
 static KaiMailbox *kai_mailbox_new(int cap, int overflow, int owned) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
-    if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!mb) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     kai_mailbox_init_mu(mb);
     mb->cap      = cap;
     mb->overflow = overflow;
@@ -4190,7 +4203,7 @@ static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
     /* m8 #8 + Phase 4: enforce policy on full. */
     if (!kai_mailbox_reserve_slot(mb, msg)) return;
     KaiMboxNode *node = (KaiMboxNode *) calloc(1, sizeof(KaiMboxNode));
-    if (!node) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!node) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     node->msg  = msg;
     node->next = NULL;
     if (mb->tail) { mb->tail->next = node; }
@@ -4218,7 +4231,7 @@ static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
 static void kai_mailbox_push_cross_thread(KaiMailbox *mb, KaiValue *msg) {
     if (!kai_mailbox_reserve_slot(mb, msg)) return;
     KaiMboxNode *node = (KaiMboxNode *) calloc(1, sizeof(KaiMboxNode));
-    if (!node) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!node) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     node->msg  = msg;
     node->next = NULL;
     if (mb->tail) mb->tail->next = node;
@@ -5891,7 +5904,7 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
         case KAI_RECORD: {
             int n = v->as.rec.n_fields;
             KaiValue **fields = (KaiValue **) malloc((size_t) (n > 0 ? n : 1) * sizeof(KaiValue *));
-            if (!fields) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); exit(1); }
+            if (!fields) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); kai_exit(1); }
             for (int i = 0; i < n; ++i) fields[i] = kai_deep_copy(v->as.rec.fields[i], mode);
             KaiValue *c = kai_record(n, fields, v->as.rec.names);
             c->as.rec.head_type_tag = v->as.rec.head_type_tag;
@@ -5903,7 +5916,7 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
             if (n <= 0) return kai_variant_u(v->variant_tag, kai_variant_name_of(v->variant_tag), 0, 0, NULL);
             uint32_t mask = kai_slot_mask_of(v->variant_tag);
             KaiVarSlot *slots = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
-            if (!slots) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); exit(1); }
+            if (!slots) { fprintf(stderr, "kai: out of memory (region copy-out)\n"); kai_exit(1); }
             /* Respect the per-slot kind: a primitive slot (Int/Real/Enum)
              * holds a raw scalar, NOT a pointer — deep-copying it as a
              * pointer dereferences the integer as an address (UAF/segfault).
@@ -5967,7 +5980,7 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
             KaiValue **caps = NULL;
             if (nc > 0) {
                 caps = (KaiValue **) malloc((size_t) nc * sizeof(KaiValue *));
-                if (!caps) { fprintf(stderr, "kai: out of memory (closure copy-out)\n"); exit(1); }
+                if (!caps) { fprintf(stderr, "kai: out of memory (closure copy-out)\n"); kai_exit(1); }
                 for (int i = 0; i < nc; ++i) caps[i] = kai_deep_copy(v->as.clo.captures[i], mode);
             }
             /* kai_closure increfs each capture; we already own a fresh
@@ -6528,7 +6541,7 @@ __attribute__((always_inline)) static inline KaiValue *kai_variant_reuse_at(KaiV
 /* Allocate an array of `len` slots, each initialised to `init`
    (incref'd once per slot). Caller owns the returned array. */
 static KAI_RC_NOINLINE KaiValue *kai_array_make(int64_t len, KaiValue *init) {
-    if (len < 0) { fprintf(stderr, "kai: array_make: negative length\n"); exit(1); }
+    if (len < 0) { fprintf(stderr, "kai: array_make: negative length\n"); kai_exit(1); }
     KaiValue *v = kai_alloc(KAI_ARRAY);
     v->as.arr.len = len;
     v->as.arr.cap = len > 0 ? len : 1;
@@ -6543,7 +6556,7 @@ static KAI_RC_NOINLINE KaiValue *kai_array_make(int64_t len, KaiValue *init) {
    <= current len this is a no-op beyond the incref. */
 static KaiValue *kai_array_grow_impl(KaiValue *a, int64_t new_len, KaiValue *init) {
     if (!a || a->tag != KAI_ARRAY) {
-        fprintf(stderr, "kai: array_grow: not an array\n"); exit(1);
+        fprintf(stderr, "kai: array_grow: not an array\n"); kai_exit(1);
     }
     if (new_len > a->as.arr.cap) {
         int64_t nc = a->as.arr.cap * 2;
@@ -6560,7 +6573,7 @@ static KaiValue *kai_array_grow_impl(KaiValue *a, int64_t new_len, KaiValue *ini
 /* O(1) read. Callers own the returned reference. */
 static KaiValue *kai_array_get_impl(KaiValue *a, int64_t i) {
     if (!a || a->tag != KAI_ARRAY) {
-        fprintf(stderr, "kai: array_get: not an array\n"); exit(1);
+        fprintf(stderr, "kai: array_get: not an array\n"); kai_exit(1);
     }
     if (i < 0 || i >= a->as.arr.len) {
         static char buf[96];
@@ -6575,7 +6588,7 @@ static KaiValue *kai_array_get_impl(KaiValue *a, int64_t i) {
    Returns the same array (incref'd) so callers can thread it. */
 static KaiValue *kai_array_set_impl(KaiValue *a, int64_t i, KaiValue *v) {
     if (!a || a->tag != KAI_ARRAY) {
-        fprintf(stderr, "kai: array_set: not an array\n"); exit(1);
+        fprintf(stderr, "kai: array_set: not an array\n"); kai_exit(1);
     }
     if (i < 0 || i >= a->as.arr.len) {
         static char buf[96];
@@ -6752,7 +6765,7 @@ static KaiValue *kai_vec_read_elem(KaiVecMeta *m, const char *slot) {
 }
 
 static KAI_RC_NOINLINE KaiValue *kai_vec_make(int64_t len, KaiValue *init) {
-    if (len < 0) { fprintf(stderr, "kai: vec_make: negative length\n"); exit(1); }
+    if (len < 0) { fprintf(stderr, "kai: vec_make: negative length\n"); kai_exit(1); }
     KaiVecMeta m;
     memset(&m, 0, sizeof(m));
     if (len > 0) kai_vec_classify(&m, init);
@@ -6794,7 +6807,7 @@ static KAI_RC_NOINLINE KaiValue *kai_vec_clone(KaiValue *v, int64_t cap) {
 
 static void kai_vec_bounds(KaiValue *v, int64_t i, const char *op) {
     if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
-        fprintf(stderr, "kai: %s: not a vec\n", op); exit(1);
+        fprintf(stderr, "kai: %s: not a vec\n", op); kai_exit(1);
     }
     if (i < 0 || i >= v->as.vec.len) {
         static char buf[96];
@@ -6886,7 +6899,7 @@ static KaiValue *kai_vec_set_impl(KaiValue *v, int64_t i, KaiValue *x) {
  * shared copies first. An empty PENDING vec classifies from `x`. */
 static KaiValue *kai_vec_push_impl(KaiValue *v, KaiValue *x) {
     if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
-        fprintf(stderr, "kai: vec_push: not a vec\n"); exit(1);
+        fprintf(stderr, "kai: vec_push: not a vec\n"); kai_exit(1);
     }
     int64_t len = v->as.vec.len;
     {
@@ -6970,7 +6983,7 @@ static void kai_vec_store_rec_fields(KaiVecMeta *m, char *slot, int64_t n,
 static KaiValue *kai_vec_push_rec_raw(KaiValue *v, int64_t n,
                                       KaiValue **xs, const char **names) {
     if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
-        fprintf(stderr, "kai: vec_push: not a vec\n"); exit(1);
+        fprintf(stderr, "kai: vec_push: not a vec\n"); kai_exit(1);
     }
     int64_t len = v->as.vec.len;
     {
@@ -7035,7 +7048,7 @@ static KaiValue *kai_vec_set_rec_raw(KaiValue *v, KaiValue *i, int64_t n,
 
 static KaiValue *kai_vec_slice_impl(KaiValue *v, int64_t start, int64_t slen) {
     if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
-        fprintf(stderr, "kai: vec_slice: not a vec\n"); exit(1);
+        fprintf(stderr, "kai: vec_slice: not a vec\n"); kai_exit(1);
     }
     int64_t len = v->as.vec.len;
     if (start < 0 || slen < 0 || start > len || slen > len - start) {
@@ -7068,7 +7081,7 @@ static KaiValue *kai_vec_slice_impl(KaiValue *v, int64_t start, int64_t slen) {
 /* `[h, ...t]`'s tail: everything from `start` on. */
 static KaiValue *kai_vec_tail_from_impl(KaiValue *v, int64_t start) {
     if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
-        fprintf(stderr, "kai: vec_slice: not a vec\n"); exit(1);
+        fprintf(stderr, "kai: vec_slice: not a vec\n"); kai_exit(1);
     }
     return kai_vec_slice_impl(v, start, v->as.vec.len - start);
 }
@@ -7186,7 +7199,7 @@ static KAI_RC_NOINLINE KaiValue *kai_closure(KaiFn fn, int arity, int n_captures
 static KaiValue *kai_apply(KaiValue *clo, int argc, KaiValue **argv) {
     if (!clo || clo->tag != KAI_CLOSURE) {
         fprintf(stderr, "kai: attempted to call a non-callable value\n");
-        exit(1);
+        kai_exit(1);
     }
     KaiValue *r = clo->as.clo.fn(clo, argv, argc);
     kai_decref(clo);
@@ -7203,7 +7216,7 @@ static KaiValue *kai_apply(KaiValue *clo, int argc, KaiValue **argv) {
 static KaiValue *kai_apply_borrow(KaiValue *clo, int argc, KaiValue **argv) {
     if (!clo || clo->tag != KAI_CLOSURE) {
         fprintf(stderr, "kai: attempted to call a non-callable value\n");
-        exit(1);
+        kai_exit(1);
     }
     return clo->as.clo.fn(clo, argv, argc);
 }
@@ -7212,14 +7225,14 @@ static KaiValue *kai_apply_borrow(KaiValue *clo, int argc, KaiValue **argv) {
 
 static KaiValue *kai_op_field(KaiValue *rec, const char *name) {
     if (!rec || rec->tag != KAI_RECORD) {
-        fprintf(stderr, "kai: field access on non-record\n"); exit(1);
+        fprintf(stderr, "kai: field access on non-record\n"); kai_exit(1);
     }
     for (int i = 0; i < rec->as.rec.n_fields; ++i) {
         if (strcmp(rec->as.rec.names[i], name) == 0) {
             return kai_incref(rec->as.rec.fields[i]);
         }
     }
-    fprintf(stderr, "kai: no such field `%s`\n", name); exit(1);
+    fprintf(stderr, "kai: no such field `%s`\n", name); kai_exit(1);
 }
 
 /* Constant-index field read. Same RC contract as kai_op_field (increfs the
@@ -7228,7 +7241,7 @@ static KaiValue *kai_op_field(KaiValue *rec, const char *name) {
    declaration-order layout. */
 static KaiValue *kai_op_field_at(KaiValue *rec, int i) {
     if (!rec || rec->tag != KAI_RECORD) {
-        fprintf(stderr, "kai: field access on non-record\n"); exit(1);
+        fprintf(stderr, "kai: field access on non-record\n"); kai_exit(1);
     }
     return kai_incref(rec->as.rec.fields[i]);
 }
@@ -7242,14 +7255,14 @@ static KaiValue *kai_op_field_at(KaiValue *rec, int i) {
    bindings still own their own refs. */
 static KaiValue *kai_op_field_borrow(KaiValue *rec, const char *name) {
     if (!rec || rec->tag != KAI_RECORD) {
-        fprintf(stderr, "kai: field access on non-record\n"); exit(1);
+        fprintf(stderr, "kai: field access on non-record\n"); kai_exit(1);
     }
     for (int i = 0; i < rec->as.rec.n_fields; ++i) {
         if (strcmp(rec->as.rec.names[i], name) == 0) {
             return rec->as.rec.fields[i];
         }
     }
-    fprintf(stderr, "kai: no such field `%s`\n", name); exit(1);
+    fprintf(stderr, "kai: no such field `%s`\n", name); kai_exit(1);
 }
 
 /* ---------- equality ---------- */
@@ -7824,13 +7837,13 @@ static KaiValue *kai_core_panic(KaiValue *msg) {
     fputc('\n', stderr);
     funlockfile(stderr);
     if (__kai_build_debug) kai_panic_backtrace();
-    exit(1);
+    kai_exit(1);
     return kai_unit();
 }
 
 static KaiValue *kai_core_exit(KaiValue *code) {
     int c = (kai_is_int(code)) ? (int) kai_intf(code) : 0;
-    exit(c);
+    kai_exit(c);
     return kai_unit();
 }
 
@@ -8553,7 +8566,7 @@ static KaiValue *kai_op_add(KaiValue *a, KaiValue *b) {
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) + (uint64_t) kai_intf(b)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r + b->as.r);
     else if ((r = kai_fixed_arith(a, b, '+')) != NULL) { /* boxed fixed-width */ }
-    else { fprintf(stderr, "kai: type mismatch in +\n"); exit(1); }
+    else { fprintf(stderr, "kai: type mismatch in +\n"); kai_exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -8563,7 +8576,7 @@ static KaiValue *kai_op_sub(KaiValue *a, KaiValue *b) {
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) - (uint64_t) kai_intf(b)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r - b->as.r);
     else if ((r = kai_fixed_arith(a, b, '-')) != NULL) { /* boxed fixed-width */ }
-    else { fprintf(stderr, "kai: type mismatch in -\n"); exit(1); }
+    else { fprintf(stderr, "kai: type mismatch in -\n"); kai_exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -8573,7 +8586,7 @@ static KaiValue *kai_op_mul(KaiValue *a, KaiValue *b) {
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_int((int64_t)((uint64_t) kai_intf(a) * (uint64_t) kai_intf(b)));
     else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) r = kai_real(a->as.r * b->as.r);
     else if ((r = kai_fixed_arith(a, b, '*')) != NULL) { /* boxed fixed-width */ }
-    else { fprintf(stderr, "kai: type mismatch in *\n"); exit(1); }
+    else { fprintf(stderr, "kai: type mismatch in *\n"); kai_exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -8589,7 +8602,7 @@ static KaiValue *kai_op_div(KaiValue *a, KaiValue *b) {
     } else if (kai_is_ptr(a) && a->tag == KAI_REAL && kai_is_ptr(b) && b->tag == KAI_REAL) {
         r = kai_real(a->as.r / b->as.r);
     } else if ((r = kai_fixed_div(a, b)) != NULL) { /* boxed fixed-width */ }
-    else { fprintf(stderr, "kai: type mismatch in /\n"); exit(1); }
+    else { fprintf(stderr, "kai: type mismatch in /\n"); kai_exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -8598,10 +8611,10 @@ static KaiValue *kai_op_idiv(KaiValue *a, KaiValue *b) {
     int64_t av = 0, bv = 0;
     if      (kai_is_int(a))  av = kai_intf(a);
     else if (kai_is_ptr(a) && a->tag == KAI_REAL) av = (int64_t) a->as.r;
-    else { fprintf(stderr, "kai: type mismatch in //\n"); exit(1); }
+    else { fprintf(stderr, "kai: type mismatch in //\n"); kai_exit(1); }
     if      (kai_is_int(b))  bv = kai_intf(b);
     else if (kai_is_ptr(b) && b->tag == KAI_REAL) bv = (int64_t) b->as.r;
-    else { fprintf(stderr, "kai: type mismatch in //\n"); exit(1); }
+    else { fprintf(stderr, "kai: type mismatch in //\n"); kai_exit(1); }
     if (bv == 0) { kai_trap_abort("divide by zero"); }
     KaiValue *r = kai_int(av / bv);
     kai_decref(a); kai_decref(b);
@@ -8631,7 +8644,7 @@ static KaiValue *kai_op_mod(KaiValue *a, KaiValue *b) {
         __int128 y = kai_i128_load(b); if (y == 0) { kai_trap_abort("mod by zero"); }
         /* `x % -1` is 0 by definition; the direct op is UB at I128_MIN. */
         r = kai_int128(y == -1 ? (__int128) 0 : kai_i128_load(a) % y);
-    } else { fprintf(stderr, "kai: type mismatch in %%\n"); exit(1); }
+    } else { fprintf(stderr, "kai: type mismatch in %%\n"); kai_exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -8719,7 +8732,7 @@ static KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
             kai_decref(a); kai_decref(b);
             return kai_bool(_o_r);
         }
-        fprintf(stderr, "kai: type mismatch in <\n"); exit(1);
+        fprintf(stderr, "kai: type mismatch in <\n"); kai_exit(1);
     }
     kai_decref(a); kai_decref(b);
     return r;
@@ -8749,7 +8762,7 @@ static KaiValue *kai_op_gt(KaiValue *a, KaiValue *b) {
             kai_decref(a); kai_decref(b);
             return kai_bool(_o_r);
         }
-        fprintf(stderr, "kai: type mismatch in >\n"); exit(1);
+        fprintf(stderr, "kai: type mismatch in >\n"); kai_exit(1);
     }
     kai_decref(a); kai_decref(b);
     return r;
@@ -8805,7 +8818,7 @@ static KaiValue *kai_op_ne_v(KaiValue *a, KaiValue *b) {
  * dispatches through this helper, never through the protocol. */
 static KaiValue *kai_op_pow_int(KaiValue *a, KaiValue *b) {
     if (!kai_is_int(b)) {
-        fprintf(stderr, "kai: type mismatch in ^ (exponent must be Int)\n"); exit(1);
+        fprintf(stderr, "kai: type mismatch in ^ (exponent must be Int)\n"); kai_exit(1);
     }
     int64_t e = kai_intf(b);
     KaiValue *r;
@@ -8825,7 +8838,7 @@ static KaiValue *kai_op_pow_int(KaiValue *a, KaiValue *b) {
         for (int64_t i = 0; i < k; i++) { acc *= base; }
         if (e < 0) { acc = 1.0 / acc; }
         r = kai_real(acc);
-    } else { fprintf(stderr, "kai: type mismatch in ^\n"); exit(1); }
+    } else { fprintf(stderr, "kai: type mismatch in ^\n"); kai_exit(1); }
     kai_decref(a); kai_decref(b);
     return r;
 }
@@ -8838,7 +8851,7 @@ static KaiValue *kai_op_neg(KaiValue *a) {
     else if (kai_is_ptr(a) && a->tag == KAI_UINT32) r = kai_uint32((uint32_t)(-a->as.u32));
     else if (kai_is_ptr(a) && a->tag == KAI_UINT64) r = kai_uint64((uint64_t)(-a->as.u64));
     else if (kai_is_ptr(a) && a->tag == KAI_INT128) r = kai_int128((__int128)(-(unsigned __int128) kai_i128_load(a)));
-    else { fprintf(stderr, "kai: type mismatch in unary -\n"); exit(1); }
+    else { fprintf(stderr, "kai: type mismatch in unary -\n"); kai_exit(1); }
     kai_decref(a);
     return r;
 }
@@ -8846,7 +8859,7 @@ static KaiValue *kai_op_neg(KaiValue *a) {
 static KaiValue *kai_op_boolnot(KaiValue *a) {
     KaiValue *r;
     if (a->tag == KAI_BOOL) r = kai_bool(!a->as.b);
-    else { fprintf(stderr, "kai: type mismatch in `not`\n"); exit(1); }
+    else { fprintf(stderr, "kai: type mismatch in `not`\n"); kai_exit(1); }
     kai_decref(a);
     return r;
 }
@@ -8875,7 +8888,7 @@ static KaiValue *kai_range(KaiValue *from, KaiValue *to) {
 
 static KaiValue *kai_range_step(KaiValue *from, KaiValue *to, KaiValue *step) {
     int64_t s = kai_intf(step);
-    if (s == 0) { fprintf(stderr, "kai: zero step in range\n"); exit(1); }
+    if (s == 0) { fprintf(stderr, "kai: zero step in range\n"); kai_exit(1); }
     return kai_range_new(kai_intf(from), kai_intf(to), s);
 }
 
@@ -9082,7 +9095,7 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg)
 {
     if (!pid || pid->tag != KAI_PID) {
         fprintf(stderr, "kai: mailbox_send: argument is not a Pid\n");
-        exit(1);
+        kai_exit(1);
     }
     /* A send to an ended mailbox succeeds and the message is dropped: the
      * sender cannot know whether the receiver is still alive. */
@@ -9114,7 +9127,7 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_recv(KaiValue *pid)
 {
     if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
         fprintf(stderr, "kai: mailbox_recv: argument is not a Pid\n");
-        exit(1);
+        kai_exit(1);
     }
     /* kai_mailbox_pop returns the stored ref (mailbox transferred its
      * ownership to the caller). Consume the input `pid` ref so the
@@ -9136,7 +9149,7 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_recv_timeout(KaiValue *pid, KaiValue *ti
 {
     if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
         fprintf(stderr, "kai: mailbox_recv_timeout: argument is not a Pid\n");
-        exit(1);
+        kai_exit(1);
     }
     int64_t ns = kai_intf(timeout_nanos);
     kai_decref(timeout_nanos);
@@ -9213,7 +9226,7 @@ static KAI_RC_NOINLINE KaiValue *kai_core_read_file(KaiValue *path) {
                 v->as.s.len = (size_t) n;
                 kai_heap_charge((size_t) n + 1);
                 v->as.s.bytes = (char *) malloc((size_t) n + 1);
-                if (!v->as.s.bytes) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                if (!v->as.s.bytes) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
                 size_t got = fread(v->as.s.bytes, 1, (size_t) n, fp);
                 fclose(fp);
                 v->as.s.bytes[got] = '\0';
@@ -9348,7 +9361,7 @@ static KaiValue *kai_core_file_read_chunk(KaiValue *h, KaiValue *max) {
         r = _kai_file_ok(kai_str(""));
     } else {
         char *buf = (char *) malloc((size_t) cap);
-        if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        if (!buf) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
         ssize_t got;
         do { got = read(fd, buf, (size_t) cap); } while (got < 0 && errno == EINTR);
         if (got < 0) {
@@ -9359,7 +9372,7 @@ static KaiValue *kai_core_file_read_chunk(KaiValue *h, KaiValue *max) {
             v->as.s.len = (size_t) got;
             kai_heap_charge((size_t) got + 1);
             v->as.s.bytes = (char *) malloc((size_t) got + 1);
-            if (!v->as.s.bytes) { free(buf); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+            if (!v->as.s.bytes) { free(buf); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
             memcpy(v->as.s.bytes, buf, (size_t) got);
             v->as.s.bytes[got] = '\0';
             free(buf);
@@ -9549,7 +9562,7 @@ static KaiValue *kai_core_file_read_bytes(KaiValue *path) {
                  * redundant default-incref/decref pair on every
                  * position. */
                 unsigned char *buf = (unsigned char *) malloc((size_t) n + 1);
-                if (!buf) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                if (!buf) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
                 size_t got = fread(buf, 1, (size_t) n, fp);
                 fclose(fp);
                 KaiValue *arr = kai_alloc(KAI_ARRAY);
@@ -9557,7 +9570,7 @@ static KaiValue *kai_core_file_read_bytes(KaiValue *path) {
                 arr->as.arr.cap = got > 0 ? (int64_t) got : 1;
                 kai_heap_charge((size_t) arr->as.arr.cap * sizeof(KaiValue *));
                 arr->as.arr.items = (KaiValue **) malloc((size_t) arr->as.arr.cap * sizeof(KaiValue *));
-                if (!arr->as.arr.items) { free(buf); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                if (!arr->as.arr.items) { free(buf); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
                 for (size_t i = 0; i < got; ++i) arr->as.arr.items[i] = kai_byte(buf[i]);
                 free(buf);
                 r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = arr}});
@@ -9595,7 +9608,7 @@ static KaiValue *kai_core_file_write_bytes(KaiValue *path, KaiValue *bytes) {
             unsigned char *out = NULL;
             if (n > 0) {
                 out = (unsigned char *) malloc((size_t) n);
-                if (!out) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                if (!out) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
                 for (int64_t i = 0; i < n; ++i) {
                     KaiValue *e = bytes->as.arr.items[i];
                     if (!e || e->tag != KAI_BYTE) { ok = 0; break; }
@@ -9652,7 +9665,7 @@ static KaiValue *kai_core_dir_list_dir(KaiValue *path) {
              * deterministic enough for fixtures. */
             size_t cap = 16, n = 0;
             char **names = (char **) malloc(cap * sizeof(char *));
-            if (!names) { closedir(d); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+            if (!names) { closedir(d); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
             struct dirent *e;
             while ((e = readdir(d)) != NULL) {
                 const char *nm = e->d_name;
@@ -9660,11 +9673,11 @@ static KaiValue *kai_core_dir_list_dir(KaiValue *path) {
                 if (n + 1 > cap) {
                     cap *= 2;
                     names = (char **) realloc(names, cap * sizeof(char *));
-                    if (!names) { closedir(d); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                    if (!names) { closedir(d); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
                 }
                 size_t len = strlen(nm);
                 char *copy = (char *) malloc(len + 1);
-                if (!copy) { closedir(d); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                if (!copy) { closedir(d); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
                 memcpy(copy, nm, len + 1);
                 names[n++] = copy;
             }
@@ -9739,7 +9752,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
 
     size_t cap = 16, top = 0;
     char **stack = (char **) malloc(cap * sizeof(char *));
-    if (!stack) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!stack) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
 
     char rbuf[KAI_PATH_BUF];
     size_t rlen = root->as.s.len < sizeof(rbuf) - 1 ? root->as.s.len : sizeof(rbuf) - 1;
@@ -9747,7 +9760,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
     rbuf[rlen] = '\0';
     {
         char *copy = (char *) malloc(rlen + 1);
-        if (!copy) { free(stack); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        if (!copy) { free(stack); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
         memcpy(copy, rbuf, rlen + 1);
         stack[top++] = copy;
     }
@@ -9756,7 +9769,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
      * reads in walk order. */
     size_t fcap = 32, fn = 0;
     char **files = (char **) malloc(fcap * sizeof(char *));
-    if (!files) { free(stack[0]); free(stack); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!files) { free(stack[0]); free(stack); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
 
     while (top > 0) {
         char *dir_path = stack[--top];
@@ -9766,9 +9779,9 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
          * deterministic depth-first order. */
         size_t ccap = 16, cn = 0;
         char **child_paths = (char **) malloc(ccap * sizeof(char *));
-        if (!child_paths) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        if (!child_paths) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
         char *child_kinds = (char *) malloc(ccap); /* 'f' / 'd' / 's' (skip) */
-        if (!child_kinds) { free(child_paths); closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        if (!child_kinds) { free(child_paths); closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
         struct dirent *e;
         while ((e = readdir(d)) != NULL) {
             const char *nm = e->d_name;
@@ -9776,7 +9789,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
             size_t dlen = strlen(dir_path);
             size_t nlen = strlen(nm);
             char *full = (char *) malloc(dlen + 1 + nlen + 1);
-            if (!full) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+            if (!full) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
             memcpy(full, dir_path, dlen);
             int needs_sep = (dlen > 0 && dir_path[dlen - 1] != '/');
             size_t off = dlen;
@@ -9794,7 +9807,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
                 ccap *= 2;
                 child_paths = (char **) realloc(child_paths, ccap * sizeof(char *));
                 child_kinds = (char *)  realloc(child_kinds, ccap);
-                if (!child_paths || !child_kinds) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                if (!child_paths || !child_kinds) { closedir(d); free(dir_path); fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
             }
             child_paths[cn] = full;
             child_kinds[cn] = kind;
@@ -9809,7 +9822,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
                 if (fn + 1 > fcap) {
                     fcap *= 2;
                     files = (char **) realloc(files, fcap * sizeof(char *));
-                    if (!files) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                    if (!files) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
                 }
                 files[fn++] = child_paths[i];
             }
@@ -9822,7 +9835,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
                 if (top + 1 > cap) {
                     cap *= 2;
                     stack = (char **) realloc(stack, cap * sizeof(char *));
-                    if (!stack) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+                    if (!stack) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
                 }
                 stack[top++] = child_paths[i];
             } else if (k != 'f') {
@@ -9850,7 +9863,7 @@ static KaiValue *kai_core_dir_walk(KaiValue *root) {
 static KaiValue *kai_core_read_line(void) {
     size_t cap = KAI_READ_BUF_INIT, n = 0;
     char *buf = (char *) malloc(cap);
-    if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!buf) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     int ch;
     while ((ch = fgetc(stdin)) != EOF && ch != '\n') {
         if (n + 1 >= cap) { cap *= 2; buf = (char *) realloc(buf, cap); }
@@ -9886,7 +9899,7 @@ static KaiValue *kai_core_read_bytes(KaiValue *n) {
     if (n) kai_decref(n);
     if (want <= 0) return kai_str_from_bytes("", 0);
     char *buf = (char *) malloc((size_t) want);
-    if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!buf) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     size_t got = 0;
     while (got < (size_t) want) {
         ssize_t r = read(STDIN_FILENO, buf + got, (size_t) want - got);
@@ -10268,7 +10281,7 @@ static int64_t kai_bytes_int(KaiValue *v) {
 /* The slots `[off, off + n)` of `a`; traps when the range leaves the array. */
 static KaiValue **kai_bytes_span(const char *op, KaiValue *a, int64_t off, int64_t n) {
     if (!kai_is_ptr(a) || a->tag != KAI_ARRAY) {
-        fprintf(stderr, "kai: %s: not an array\n", op); exit(1);
+        fprintf(stderr, "kai: %s: not an array\n", op); kai_exit(1);
     }
     if (off < 0 || n < 0 || off > a->as.arr.len || n > a->as.arr.len - off) {
         /* Outlives this frame: a trap in a fiber is read after the unwind. */
@@ -10802,7 +10815,7 @@ static void kai_test_register(void (*run)(void), const char *desc,
     if ((kai_test_nentries & (kai_test_nentries - 1)) == 0) {
         int cap = kai_test_nentries == 0 ? 16 : kai_test_nentries * 2;
         KaiTestEntry *grown = (KaiTestEntry *)realloc(kai_test_entries, (size_t)cap * sizeof(KaiTestEntry));
-        if (!grown) { fprintf(stderr, "kai: out of memory registering tests\n"); exit(2); }
+        if (!grown) { fprintf(stderr, "kai: out of memory registering tests\n"); kai_exit(2); }
         kai_test_entries = grown;
     }
     KaiTestEntry e = { run, desc, body, line, home ? home : "" };
@@ -10917,7 +10930,7 @@ static void kai_bench_ensure_capacity(int n) {
     long long *r = (long long *)realloc(kai_bench_samples, (size_t)n * sizeof(long long));
     if (!r) {
         fprintf(stderr, "kai_bench: out of memory reserving %d samples\n", n);
-        exit(1);
+        kai_exit(1);
     }
     kai_bench_samples = r;
     kai_bench_samples_cap = n;
@@ -11478,7 +11491,7 @@ static KaiValue *kai_cont_resume(KaiCont *k, KaiValue *v) {
         fprintf(stderr,
             "kai: continuation resumed twice (handler #%llu)\n",
             (unsigned long long) k->handler_id);
-        exit(1);
+        kai_exit(1);
     }
     k->status = KAI_CONT_RESUMED;
     return k->fn(k->env, v);
@@ -11553,7 +11566,7 @@ KAI_SCHED_FN KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k)
 
     size_t cap = KAI_READ_BUF_INIT, n = 0;
     char *buf = (char *) malloc(cap);
-    if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!buf) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
 
     for (;;) {
         if (n + 1 >= cap) { cap *= 2; buf = (char *) realloc(buf, cap); }
@@ -11585,7 +11598,7 @@ KAI_SCHED_FN KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k)
                 fprintf(stderr,
                     "kai: stdin: multiple fibers reading concurrently "
                     "is undefined; serialize via an actor\n");
-                exit(1);
+                kai_exit(1);
             }
             /* Resumed: drain helper cleared the waiter slot. Loop
              * to retry the read. */
@@ -11629,7 +11642,7 @@ KAI_SCHED_FN KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, Kai
     kai_reactor_stdin_set_nonblocking();
 
     char *buf = (char *) malloc((size_t) want);
-    if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!buf) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     size_t got = 0;
 
     while (got < (size_t) want) {
@@ -11644,7 +11657,7 @@ KAI_SCHED_FN KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, Kai
                 fprintf(stderr,
                     "kai: stdin: multiple fibers reading concurrently "
                     "is undefined; serialize via an actor\n");
-                exit(1);
+                kai_exit(1);
             }
         } else if (errno == EINTR) {
             continue;
@@ -12049,7 +12062,7 @@ static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue
     if (lo_v >= hi_v) {
         fprintf(stderr, "kai: Random.int_range: lo (%lld) >= hi (%lld)\n",
                 (long long) lo_v, (long long) hi_v);
-        exit(1);
+        kai_exit(1);
     }
     _kai_pcg32_ensure_seeded();
     uint64_t delta = (uint64_t) (hi_v - lo_v);
@@ -12100,7 +12113,7 @@ static KaiValue *kai_default_clock_wall_now(void *self, KaiCont *k) {
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
         fprintf(stderr, "kai: Clock.wall_now: clock_gettime failed: %s\n",
                 strerror(errno));
-        exit(1);
+        kai_exit(1);
     }
     return kai_cont_resume(k, _kai_clock_make_record(
         (int64_t) ts.tv_sec, (int64_t) ts.tv_nsec));
@@ -12112,7 +12125,7 @@ static KaiValue *kai_default_clock_monotonic_now(void *self, KaiCont *k) {
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
         fprintf(stderr, "kai: Clock.monotonic_now: clock_gettime failed: %s\n",
                 strerror(errno));
-        exit(1);
+        kai_exit(1);
     }
     return kai_cont_resume(k, _kai_clock_make_record(
         (int64_t) ts.tv_sec, (int64_t) ts.tv_nsec));
@@ -12535,7 +12548,7 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue
     int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
     if (cap <= 0) {
         fputs("kai: NetTcp.recv: max must be > 0\n", stderr);
-        exit(1);
+        kai_exit(1);
     }
     if (cap > (1 << 20)) cap = 1 << 20;  /* 1 MiB ceiling for v1 */
     unsigned char *buf = (unsigned char *) malloc((size_t) cap);
@@ -12587,7 +12600,7 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_recv_timeout(void *self, KaiValue *c,
     int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
     if (cap <= 0) {
         fputs("kai: NetTcp.recv_timeout: max must be > 0\n", stderr);
-        exit(1);
+        kai_exit(1);
     }
     if (cap > (1 << 20)) cap = 1 << 20;  /* 1 MiB ceiling for v1 */
     int64_t budget = (kai_is_int(ns)) ? kai_intf(ns) : 0;
@@ -13121,7 +13134,7 @@ static KaiValue *kai_default_netudp_recv(void *self, KaiValue *sock, KaiValue *m
     int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
     if (cap <= 0) {
         fputs("kai: NetUdp.recv: max must be > 0\n", stderr);
-        exit(1);
+        kai_exit(1);
     }
     if (cap > (1 << 16)) cap = 1 << 16;  /* IPv4 datagram ceiling */
     unsigned char *buf = (unsigned char *) malloc((size_t) cap);
@@ -13600,7 +13613,7 @@ static void _kai_proc_pipe_forget(int pid) {
 
 static void _kai_proc_pipe_add(int pid, int in_fd, int out_fd, int err_fd, int own_group) {
     KaiProcPipe *e = (KaiProcPipe *) malloc(sizeof(KaiProcPipe));
-    if (!e) { fputs("kai: out of memory\n", stderr); exit(1); }
+    if (!e) { fputs("kai: out of memory\n", stderr); kai_exit(1); }
     e->pid = pid; e->in_fd = in_fd; e->out_fd = out_fd; e->err_fd = err_fd;
     e->own_group = own_group;
     pthread_mutex_lock(&kai_proc_pipes_mu);
@@ -13703,7 +13716,7 @@ static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *
     (void) self;
     if (!cmd || cmd->tag != KAI_STR) {
         fputs("kai: Process.start: cmd must be a String\n", stderr);
-        exit(1);
+        kai_exit(1);
     }
     kai_reactor_init();
     /* cmd is heap-allocated by kai_str_from_bytes with a trailing
@@ -13713,7 +13726,7 @@ static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *
     char **argv = _kai_process_build_argv(cmd_cstr, args, &argc);
     if (!argv) {
         fputs("kai: Process.start: out of memory building argv\n", stderr);
-        exit(1);
+        kai_exit(1);
     }
 
     pid_t pid = fork();
@@ -13721,7 +13734,7 @@ static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *
         int e = errno;
         _kai_process_free_argv(argv, argc);
         fprintf(stderr, "kai: Process.start: fork: %s\n", strerror(e));
-        exit(1);
+        kai_exit(1);
     }
     if (pid == 0) {
         /* Child: replace image. execvp searches PATH for relative
@@ -13917,7 +13930,7 @@ static KaiValue *_kai_process_spawn(KaiValue *cmd, KaiValue *args, KaiValue *pip
     const char *cmd_cstr = cmd->as.s.bytes ? cmd->as.s.bytes : "";
     int argc = 0;
     char **argv = _kai_process_build_argv(cmd_cstr, args, &argc);
-    if (!argv) { fputs("kai: out of memory\n", stderr); exit(1); }
+    if (!argv) { fputs("kai: out of memory\n", stderr); kai_exit(1); }
     kai_reactor_init();
     pid_t pid = fork();
     if (pid < 0) {
@@ -14049,7 +14062,7 @@ static KaiValue *_kai_proc_read_chunk(KaiValue *child, int which, KaiCont *k) {
     kai_reactor_init();
     enum { KAI_PROC_READ_CHUNK = 65536 };
     char *buf = (char *) malloc(KAI_PROC_READ_CHUNK);
-    if (!buf) { fputs("kai: out of memory\n", stderr); exit(1); }
+    if (!buf) { fputs("kai: out of memory\n", stderr); kai_exit(1); }
     ssize_t n;
     for (;;) {
         n = read(fd, buf, KAI_PROC_READ_CHUNK);
@@ -14229,7 +14242,7 @@ static void _kai_securerandom_fill(unsigned char *buf, size_t n) {
         if (got < 0) {
             if (errno == EINTR) continue;
             fprintf(stderr, "kai: SecureRandom: getrandom failed: %s\n", strerror(errno));
-            exit(1);
+            kai_exit(1);
         }
         off += (size_t) got;
     }
@@ -14252,7 +14265,7 @@ static KaiValue *kai_default_securerandom_int_range(void *self, KaiValue *min_v,
     if (lo > hi) {
         fprintf(stderr, "kai: SecureRandom.int: min (%lld) > max (%lld)\n",
                 (long long) lo, (long long) hi);
-        exit(1);
+        kai_exit(1);
     }
     unsigned char buf[8];
     _kai_securerandom_fill(buf, sizeof(buf));
@@ -14279,7 +14292,7 @@ static KaiValue *kai_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCo
     unsigned char *buf = (unsigned char *) malloc((size_t) n);
     if (!buf) {
         fputs("kai: SecureRandom.bytes: out of memory\n", stderr);
-        exit(1);
+        kai_exit(1);
     }
     _kai_securerandom_fill(buf, (size_t) n);
     KaiValue *acc = kai_nil();
@@ -14874,7 +14887,7 @@ static void kai_reactor_mark_ready(KaiFiber *f) {
         int ncap = kai_reactor_ready_cap ? kai_reactor_ready_cap * 2 : 16;
         KaiFiber **nb = (KaiFiber **) realloc(kai_reactor_ready_batch,
                                               (size_t) ncap * sizeof(KaiFiber *));
-        if (!nb) { fprintf(stderr, "kai: reactor ready-batch realloc failed\n"); exit(1); }
+        if (!nb) { fprintf(stderr, "kai: reactor ready-batch realloc failed\n"); kai_exit(1); }
         kai_reactor_ready_batch = nb;
         kai_reactor_ready_cap   = ncap;
     }
@@ -15308,7 +15321,7 @@ static void kai_reactor_init(void) {
         pipe(kai_reactor_filepool_pipe) != 0 ||
         pipe(kai_reactor_signal_pipe)   != 0) {
         fprintf(stderr, "kai: reactor pipe() failed: %s\n", strerror(errno));
-        exit(1);
+        kai_exit(1);
     }
     for (int i = 0; i < 3; i++) {
         int fds[3][2] = {
@@ -15335,7 +15348,7 @@ static void kai_reactor_init(void) {
         if (old.sa_handler != SIG_DFL && old.sa_handler != SIG_IGN) {
             fprintf(stderr,
                 "kai: reactor cannot install SIGCHLD — slot already taken\n");
-            exit(1);
+            kai_exit(1);
         }
     }
     struct sigaction sa;
@@ -15371,7 +15384,7 @@ static void kai_reactor_init_filepool(void) {
                            kai_filepool_worker, NULL) != 0) {
             fprintf(stderr, "kai: reactor pthread_create failed: %s\n",
                     strerror(errno));
-            exit(1);
+            kai_exit(1);
         }
         pthread_detach(kai_filepool_threads[i]);
     }
@@ -15748,7 +15761,7 @@ static void kai_reactor_wait(void) {
         pfds = (struct pollfd *) malloc((size_t) max_fds * sizeof(*pfds));
         if (!pfds) {
             fprintf(stderr, "kai: reactor pfds malloc failed\n");
-            exit(1);
+            kai_exit(1);
         }
         heap_alloced = 1;
     }
@@ -15819,7 +15832,7 @@ static void kai_reactor_wait(void) {
     if (kai_nthreads > 1) atomic_store(&kai_reactor_idle, 0);
     if (rc < 0 && errno != EINTR) {
         fprintf(stderr, "kai: reactor poll() failed: %s\n", strerror(errno));
-        exit(1);
+        kai_exit(1);
     }
 
     /* Drain in a fixed order under the lock again — the drains unlink
@@ -16180,12 +16193,12 @@ static void *kai_stack_map(size_t stack_size) {
     if (region == MAP_FAILED) {
         fprintf(stderr, "kai: mmap failed allocating fiber stack (%zu bytes)\n",
                 total);
-        exit(1);
+        kai_exit(1);
     }
     if (mprotect(region, page, PROT_NONE) != 0) {
         fprintf(stderr, "kai: mprotect guard page failed for fiber stack\n");
         munmap(region, total);
-        exit(1);
+        kai_exit(1);
     }
     return region;
 }
@@ -16210,7 +16223,7 @@ static void kai_fiber_init_ctx_sized(KaiFiber *f, size_t stack_size) {
     kai_install_fiber_sigsegv_handler();
     if (getcontext(&f->ctx) != 0) {
         fprintf(stderr, "kai: getcontext failed for new fiber\n");
-        exit(1);
+        kai_exit(1);
     }
     {
         size_t ps = kai_page_size();
@@ -16413,7 +16426,7 @@ static void kai_sched_check_deadlock(void) {
         "kai: all workers idle with fibers parked (%d parked) — deadlock\n",
         atomic_load(&kai_blocked_fiber_count));
     kai_park_trace_dump();
-    exit(1);
+    kai_exit(1);
 }
 
 /* Park this worker until a waker hands it a permit or shutdown begins.
@@ -16642,7 +16655,7 @@ static void kai_sched_park(void) {
         fprintf(stderr,
             "kai: deadlock — fiber parked with empty run queue (%d parked total)\n",
             kai_parked_count);
-        exit(1);
+        kai_exit(1);
     }
     if (next == current) {
         /* The reactor wake promoted us before we picked anyone else.
@@ -16714,7 +16727,7 @@ static void kai_fiber_uc_link_landing(void) {
     KAI_TSAN_SWITCH_TO_ROOT();
     setcontext(&kai_main_fiber.ctx);
     fprintf(stderr, "kai: fiber uc_link landing failed to reach the scheduler root\n");
-    exit(1);
+    kai_exit(1);
 }
 
 /* Per-thread context whose entry point is the landing above. Every fiber
@@ -16818,7 +16831,7 @@ static void kai_fiber_trampoline(void) {
         for (KaiFiber *c = self->awaiters_head; c; c = c->awaiters_next) n++;
         if (n > 8) {
             wake = (KaiFiber **) malloc((size_t) n * sizeof(KaiFiber *));
-            if (!wake) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+            if (!wake) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
         }
         KaiFiber *a = self->awaiters_head;
         while (a) {
@@ -16844,7 +16857,7 @@ static void kai_fiber_trampoline(void) {
         for (KaiSelectWaiter *c = self->select_waiters_head; c; c = c->next) n++;
         if (n > 8) {
             swake = (KaiFiber **) malloc((size_t) n * sizeof(KaiFiber *));
-            if (!swake) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+            if (!swake) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
         }
         KaiSelectWaiter *s = self->select_waiters_head;
         while (s) {
@@ -16921,7 +16934,7 @@ static void kai_fiber_trampoline(void) {
         fprintf(stderr,
             "kai: fiber finished with empty run queue (%d parked) — deadlock\n",
             kai_parked_count);
-        exit(1);
+        kai_exit(1);
     }
     next->state = KAI_FIBER_RUNNING;
     kai_active_fiber = next;
@@ -17011,7 +17024,7 @@ static KaiValue *kai_run_main_on_sized_stack(KaiValue *(*user_main)(void)) {
     kai_main_fiber.stack_size = size;
     if (getcontext(&ctx) != 0) {
         fprintf(stderr, "kai: getcontext failed for main\n");
-        exit(1);
+        kai_exit(1);
     }
     kai_ctx_set_stack(&ctx, (char *) region + ps, size);
     ctx.uc_link = &host;
@@ -17165,7 +17178,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
      * stack, not a fiber one: raising the thread count must not shrink the
      * stack budget a working program already had. */
     KaiFiber *root = (KaiFiber *) calloc(1, sizeof(KaiFiber));
-    if (!root) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!root) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     root->home_thread = 0;
     /* Thread 0 IS the OS thread the process entered `main` on, so pinning
      * the entry fiber here is what makes `main` observably main-thread —
@@ -17193,14 +17206,14 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
                            kai_worker_thread_main, (void *) (intptr_t) i) != 0) {
             fprintf(stderr, "kai: scheduler pthread_create failed: %s\n",
                     strerror(errno));
-            exit(1);
+            kai_exit(1);
         }
     }
 
     /* F2 — start the dedicated reactor thread. */
     if (pthread_create(&kai_reactor_thread, NULL, kai_reactor_thread_main, NULL) != 0) {
         fprintf(stderr, "kai: reactor pthread_create failed: %s\n", strerror(errno));
-        exit(1);
+        kai_exit(1);
     }
 
 
@@ -17258,10 +17271,10 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_yield(void *self, KaiCont *k)
 static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMailbox *stamp_mb) {
     if (!thunk || thunk->tag != KAI_CLOSURE) {
         fprintf(stderr, "kai: Spawn.spawn called with non-closure value\n");
-        exit(1);
+        kai_exit(1);
     }
     KaiFiber *f = (KaiFiber *) calloc(1, sizeof(KaiFiber));
-    if (!f) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    if (!f) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     f->parent       = kai_current_fiber();
     /* The fiber owns its thunk for its whole lifetime. At N=1 an incref
      * suffices (one thread). At N>1 the fiber may run on another
@@ -17358,7 +17371,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiC
     (void) self;
     if (!fib_v || fib_v->tag != KAI_FIBER || !fib_v->as.fib) {
         fprintf(stderr, "kai: Spawn.await called on non-fiber value\n");
-        exit(1);
+        kai_exit(1);
     }
     KaiFiber *f = fib_v->as.fib;
     /* Issue #679: a fiber cancelled mid-flight (e.g. cancelled
@@ -17394,11 +17407,11 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
     (void) self;
     if (!fibs_v || (fibs_v->tag != KAI_CONS && fibs_v->tag != KAI_NIL)) {
         fprintf(stderr, "kai: Spawn.select called on non-list value\n");
-        exit(1);
+        kai_exit(1);
     }
     if (fibs_v->tag == KAI_NIL) {
         fprintf(stderr, "kai: Spawn.select called on empty list\n");
-        exit(1);
+        kai_exit(1);
     }
     /* Collect the candidates once: the list is walked repeatedly below and
      * a cons cell read is not cheaper than an array index. */
@@ -17408,7 +17421,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
     KaiFiber **fibs = fibs_stack;
     if (n > 8) {
         fibs = (KaiFiber **) malloc((size_t) n * sizeof(KaiFiber *));
-        if (!fibs) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        if (!fibs) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     }
     {
         int i = 0;
@@ -17416,7 +17429,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
             KaiValue *elem = c->as.cons.head;
             if (!elem || elem->tag != KAI_FIBER || !elem->as.fib) {
                 fprintf(stderr, "kai: Spawn.select: list element is not a fiber\n");
-                exit(1);
+                kai_exit(1);
             }
             fibs[i++] = elem->as.fib;
         }
@@ -17437,7 +17450,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_select(void *self, KaiValue *fibs_v, Ka
     KaiSelectWaiter *nodes = nodes_stack;
     if (n > 8) {
         nodes = (KaiSelectWaiter *) malloc((size_t) n * sizeof(KaiSelectWaiter));
-        if (!nodes) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+        if (!nodes) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
     }
     KaiFiber *me     = kai_current_fiber();
     KaiFiber *winner = NULL;
@@ -17621,7 +17634,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_enter(void *self, KaiCont *k)
     (void) self;
     KaiFiber *f = kai_current_fiber();
     KaiNursery *n = (KaiNursery *) calloc(1, sizeof(KaiNursery));
-    if (!n) { fprintf(stderr, "kai: out of memory (nursery scope)\n"); exit(1); }
+    if (!n) { fprintf(stderr, "kai: out of memory (nursery scope)\n"); kai_exit(1); }
     n->children_head = NULL;
     n->parent        = f->nursery_top;
     f->nursery_top   = n;
@@ -17759,7 +17772,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
             /* Unreachable. */
         }
         fputs("kai: nursery child cancelled; no survivors\n", stderr);
-        exit(1);
+        kai_exit(1);
     }
     return kai_cont_resume(k, kai_unit());
 }
@@ -17784,7 +17797,7 @@ static KaiValue *kai_default_cancel_raise(void *self, KaiCont *k) {
         /* Unreachable. */
     }
     fputs("kai: Cancel.raise: unhandled (fiber cancelled)\n", stderr);
-    exit(0);
+    kai_exit(0);
 }
 
 /* Phase 5 — Link runtime registry.
@@ -17815,7 +17828,7 @@ static void kai_link_add_bidirectional(KaiFiber *a, KaiFiber *b) {
     KaiLinkNode *nb = (KaiLinkNode *) calloc(1, sizeof(KaiLinkNode));
     if (!na || !nb) {
         fprintf(stderr, "kai: out of memory (link)\n");
-        exit(1);
+        kai_exit(1);
     }
     na->peer = b; na->next = a->linked_head; a->linked_head = na;
     nb->peer = a; nb->next = b->linked_head; b->linked_head = nb;
@@ -17959,7 +17972,7 @@ static void kai_monitor_add(KaiFiber *target, KaiFiber *observer, KaiValue *targ
     KaiMonitorNode *n = (KaiMonitorNode *) malloc(sizeof(KaiMonitorNode));
     if (!n) {
         fprintf(stderr, "kai: out of memory (monitor)\n");
-        exit(1);
+        kai_exit(1);
     }
     n->observer   = observer;
     n->target_pid = target_pid;
@@ -18408,7 +18421,7 @@ static KaiEvidence *kai_evidence_require(KaiEvidence *node, const char *eff_labe
     if (node == NULL || node->handler == NULL) {
         if (getenv("KAI_DEBUG_EVIDENCE")) kai_evidence_diag(node, eff_label);
         fprintf(stderr, "kai: effect not handled in fiber: %s\n", eff_label);
-        exit(1);
+        kai_exit(1);
     }
     return node;
 }
@@ -18422,7 +18435,7 @@ static KaiEvidence *kai_evidence_require(KaiEvidence *node, const char *eff_labe
 static KaiEvidence *kai_evidence_require_reachable(KaiEvidence *node, const char *cap_name) {
     if (node == NULL || node->handler == NULL) {
         fprintf(stderr, "kai: capability not reachable in this fiber: %s\n", cap_name);
-        exit(1);
+        kai_exit(1);
     }
     return node;
 }
@@ -20018,8 +20031,7 @@ static void kai_llvm_stamp_host_features(LLVMModuleRef m) {
  * using the host target machine. Returns 0 on success, non-zero on a
  * verify or codegen failure (the driver surfaces the error and aborts).
  * One process: no `.ll` text, no `clang` subprocess. */
-static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runtime) {
-    const char *out = path->as.s.bytes;
+static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runtime) {
     int64_t rc = 0;
     char *err = NULL;
 
@@ -20038,7 +20050,6 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
     if (LLVMVerifyModule((LLVMModuleRef) m, LLVMReturnStatusAction, &err)) {
         fprintf(stderr, "kai: native module verify failed: %s\n", err ? err : "?");
         if (err) LLVMDisposeMessage(err);
-        if (path) kai_decref(path);
         return 1;
     }
     if (err) { LLVMDisposeMessage(err); err = NULL; }
@@ -20052,7 +20063,6 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
         fprintf(stderr, "kai: native target lookup failed: %s\n", err ? err : "?");
         if (err) LLVMDisposeMessage(err);
         LLVMDisposeMessage(triple);
-        if (path) kai_decref(path);
         return 1;
     }
     char *cpu = LLVMGetHostCPUName();
@@ -20083,7 +20093,6 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
     if (merge_rc) {
         LLVMDisposeTargetMachine(tm);
         LLVMDisposeMessage(triple);
-        if (path) kai_decref(path);
         return 1;
     }
 
@@ -20099,7 +20108,6 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
     if (kai_llvm_run_passes((LLVMModuleRef) m, tm)) {
         LLVMDisposeTargetMachine(tm);
         LLVMDisposeMessage(triple);
-        if (path) kai_decref(path);
         return 1;
     }
 
@@ -20149,14 +20157,142 @@ static int64_t kai_llvm_emit_object_impl(void *m, KaiValue *path, int link_runti
 
     LLVMDisposeTargetMachine(tm);
     LLVMDisposeMessage(triple);
-    if (path) kai_decref(path);
     return rc;
+}
+
+/* Partition emit pool. With KAI_NATIVE_JOBS > 1 a partition's verify, runtime
+ * merge, O2 and emit run on a worker while the walk builds the next partition.
+ * A partition owns its LLVMContext, so a worker shares no LLVM state with the
+ * walk or another worker, and it never touches the kaikai heap. The `exit`
+ * prim drains the queue, so every queued object is published before the
+ * process exits; a failed one exits 1. */
+typedef struct KaiEmitJob { LLVMModuleRef m; char *out; struct KaiEmitJob *next; } KaiEmitJob;
+
+#define KAI_EMIT_MAX_WORKERS 64
+static pthread_mutex_t kai_emit_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t kai_emit_work_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t kai_emit_idle_cv = PTHREAD_COND_INITIALIZER;
+static KaiEmitJob *kai_emit_head = NULL;
+static KaiEmitJob *kai_emit_tail = NULL;
+static pthread_t kai_emit_threads[KAI_EMIT_MAX_WORKERS];
+static int kai_emit_nworkers = -1;
+static int kai_emit_started = 0;
+static int kai_emit_busy = 0;
+static int kai_emit_failed = 0;
+static int kai_emit_stop = 0;
+static char **kai_emit_outs = NULL;
+static size_t kai_emit_nouts = 0;
+static size_t kai_emit_capouts = 0;
+
+static int kai_emit_pool_on(void) {
+    if (kai_emit_nworkers < 0) {
+        const char *e = getenv("KAI_NATIVE_JOBS");
+        long n = (e && e[0]) ? strtol(e, NULL, 10) : 1;
+        kai_emit_nworkers = n > KAI_EMIT_MAX_WORKERS ? KAI_EMIT_MAX_WORKERS : (int) n;
+    }
+    return kai_emit_nworkers > 1;
+}
+
+static void *kai_emit_worker(void *arg) {
+    (void) arg;
+    for (;;) {
+        pthread_mutex_lock(&kai_emit_mu);
+        while (!kai_emit_head && !kai_emit_stop) pthread_cond_wait(&kai_emit_work_cv, &kai_emit_mu);
+        KaiEmitJob *job = kai_emit_head;
+        if (!job) { pthread_mutex_unlock(&kai_emit_mu); return NULL; }
+        kai_emit_head = job->next;
+        if (!kai_emit_head) kai_emit_tail = NULL;
+        pthread_mutex_unlock(&kai_emit_mu);
+        int64_t rc = kai_llvm_emit_object_impl(job->m, job->out, 2);
+        free(job->out);
+        free(job);
+        pthread_mutex_lock(&kai_emit_mu);
+        if (rc) kai_emit_failed++;
+        if (--kai_emit_busy == 0) pthread_cond_broadcast(&kai_emit_idle_cv);
+        pthread_mutex_unlock(&kai_emit_mu);
+    }
+}
+
+static void kai_emit_pool_drain(int code) {
+    if (!kai_emit_started) return;
+    pthread_mutex_lock(&kai_emit_mu);
+    while (code != 0 && kai_emit_head) {
+        KaiEmitJob *job = kai_emit_head;
+        kai_emit_head = job->next;
+        free(job->out);
+        free(job);
+        kai_emit_busy--;
+    }
+    kai_emit_tail = kai_emit_head;
+    kai_emit_stop = 1;
+    pthread_cond_broadcast(&kai_emit_work_cv);
+    while (kai_emit_busy > 0) pthread_cond_wait(&kai_emit_idle_cv, &kai_emit_mu);
+    int failed = kai_emit_failed;
+    kai_emit_started = 0;
+    pthread_mutex_unlock(&kai_emit_mu);
+    for (int i = 0; i < kai_emit_nworkers; i++) pthread_join(kai_emit_threads[i], NULL);
+    if (failed && code == 0) { fflush(NULL); _exit(1); }
+}
+
+/* Workers block SIGCHLD so the reactor's wake signal stays on the scheduler. */
+static void kai_emit_pool_start(void) {
+    LLVMInitializeNativeTarget();
+    LLVMInitializeNativeAsmPrinter();
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, (size_t) 64 << 20);
+    sigset_t block_set, prev_set;
+    sigemptyset(&block_set);
+    sigaddset(&block_set, SIGCHLD);
+    pthread_sigmask(SIG_BLOCK, &block_set, &prev_set);
+    for (int i = 0; i < kai_emit_nworkers; i++) {
+        if (pthread_create(&kai_emit_threads[i], &attr, kai_emit_worker, NULL) != 0) {
+            fprintf(stderr, "kai: native emit pthread_create failed: %s\n", strerror(errno));
+            _exit(1);
+        }
+    }
+    pthread_sigmask(SIG_SETMASK, &prev_set, NULL);
+    pthread_attr_destroy(&attr);
+    kai_emit_started = 1;
+}
+
+/* An object already queued is not queued again: outputs are content-addressed,
+ * and two writers of one path would race on its temp name. */
+static int kai_emit_seen(const char *out) {
+    for (size_t i = 0; i < kai_emit_nouts; i++) if (strcmp(kai_emit_outs[i], out) == 0) return 1;
+    if (kai_emit_nouts == kai_emit_capouts) {
+        kai_emit_capouts = kai_emit_capouts ? kai_emit_capouts * 2 : 64;
+        kai_emit_outs = (char **) realloc(kai_emit_outs, kai_emit_capouts * sizeof(char *));
+    }
+    kai_emit_outs[kai_emit_nouts++] = strdup(out);
+    return 0;
+}
+
+static int64_t kai_emit_pool_submit(LLVMModuleRef m, const char *out) {
+    pthread_mutex_lock(&kai_emit_mu);
+    if (!kai_emit_started) kai_emit_pool_start();
+    if (kai_emit_seen(out)) { pthread_mutex_unlock(&kai_emit_mu); return 0; }
+    KaiEmitJob *job = (KaiEmitJob *) malloc(sizeof(KaiEmitJob));
+    job->m = m;
+    job->out = strdup(out);
+    job->next = NULL;
+    if (kai_emit_tail) kai_emit_tail->next = job; else kai_emit_head = job;
+    kai_emit_tail = job;
+    kai_emit_busy++;
+    pthread_cond_signal(&kai_emit_work_cv);
+    pthread_mutex_unlock(&kai_emit_mu);
+    /* Test hook: an exit taken while partitions are in flight. */
+    const char *after = getenv("KAI_NATIVE_EMIT_EXIT_AFTER");
+    if (after && (size_t) strtol(after, NULL, 10) == kai_emit_nouts) kai_exit(3);
+    return 0;
 }
 
 /* Whole-program object: merge the runtime bitcode + internalise so O2 inlines
  * the `kaix_*` bodies. The default single-TU native path. */
 static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
-    return kai_llvm_emit_object_impl(m, path, 1);
+    int64_t rc = kai_llvm_emit_object_impl(m, path->as.s.bytes, 1);
+    kai_decref(path);
+    return rc;
 }
 
 /* One partition of a modular build. With KAI_NATIVE_RUNTIME_INLINE_BC set,
@@ -20166,7 +20302,10 @@ static int64_t kai_llvm_emit_object(void *m, KaiValue *path) {
  * owner TU linked by cc (the legacy path). Cross-TU user symbols keep external
  * linkage either way. */
 static int64_t kai_llvm_emit_object_raw(void *m, KaiValue *path) {
-    return kai_llvm_emit_object_impl(m, path, 2);
+    int64_t rc = kai_emit_pool_on() ? kai_emit_pool_submit((LLVMModuleRef) m, path->as.s.bytes)
+                                    : kai_llvm_emit_object_impl(m, path->as.s.bytes, 2);
+    kai_decref(path);
+    return rc;
 }
 #else /* !KAI_LLVM */
 /* Default / bootstrap build: libLLVM is not linked, so the C-API
@@ -20180,7 +20319,7 @@ static void *kai_llvm_native_unavailable(void) {
         "kai: the native (in-process libLLVM) backend is not built into this "
         "compiler.\n     Rebuild stage2 with `make KAI_LLVM=1` to enable "
         "`--emit=native`.\n");
-    exit(1);
+    kai_exit(1);
     return NULL;
 }
 static void *kai_llvm_module_new(KaiValue *name) { (void) name; return kai_llvm_native_unavailable(); }
