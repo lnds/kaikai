@@ -1387,6 +1387,8 @@ tier1-asan-b: kaic2
 	@echo "tier1-asan OK — a TRMC step drops a binder after its raw-argument read, not before (no use-after-free)"
 	@$(MAKE) -C stage2 test-perceus-pipe-borrowed-slot-alignment-asan
 	@echo "tier1-asan OK — a piped call keeps each argument's ownership on its own parameter (no use-after-free)"
+	@$(MAKE) -C stage2 test-trmc-slot-forms-asan
+	@echo "tier1-asan OK — a modulo-cons step with record, list, call, lambda and handler slots stays sanitizer-clean"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,
