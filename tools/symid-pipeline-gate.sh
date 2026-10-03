@@ -203,4 +203,22 @@ for pass in cold warm; do
     || fail "$pass: the root fn and the local binder that shadows it do not resolve apart"
 done
 
+# Whether a UFCS callee carries an id depends on which modules declare its
+# name, so `ma`'s cached typed blob must not travel between a program where
+# its pick is uncontested and one where it is contested, in either order.
+CUT="$ROOT/examples/ufcs/contest_cut"
+CUTCACHE="$(mktemp -d)"
+trap 'rm -rf "$CACHE" "$TWIN" "$CUTCACHE"' EXIT
+cut_ids() {
+  "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --user-cache --user-cache-dir "$CUTCACHE" \
+    --core-cache-dir "$CUTCACHE" --dump-symids "$@" --path "$CUT/one" --path "$ROOT/stdlib" \
+    | grep -cE '^perceus run twice#[0-9]+ twice@mc$' || true
+}
+for step in two one two one; do
+  want=0; [ "$step" = one ] && want=1
+  got=$(if [ "$step" = two ]; then cut_ids --path "$CUT/two" "$CUT/two/main.kai"; else cut_ids "$CUT/one/main.kai"; fi)
+  out="step $step: $got id line(s), want $want"
+  [ "$got" = "$want" ] || fail "a cached typed blob carried a UFCS callee's form across programs"
+done
+
 echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, and a UFCS callee names the declaration its receiver picked"
