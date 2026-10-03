@@ -14351,8 +14351,39 @@ static size_t kai_fiber_stack_size(void) {
  * make the thread count decide whether a deeply recursive program
  * survives. Track the main thread instead (RLIMIT_STACK, floored at the
  * conventional 8 MiB), and let a larger explicit KAI_FIBER_STACK_SIZE
- * still win. */
+ * still win. A build defining KAI_MAIN_STACK_SIZE fixes the budget
+ * outright, at every thread count, whatever the environment says. */
+static int kai_stack_map_flags(void) {
+    int flags = MAP_PRIVATE | MAP_ANON;
+#if defined(MAP_NORESERVE)
+    flags |= MAP_NORESERVE;
+#endif
+    return flags;
+}
+
+#if defined(KAI_MAIN_STACK_SIZE)
+/* Whether the host grants a stack reservation of `size` bytes plus guard. */
+static int kai_stack_fits(size_t size) {
+    size_t total = size + kai_page_size();
+    void *r = mmap(NULL, total, PROT_READ | PROT_WRITE, kai_stack_map_flags(), -1, 0);
+    if (r == MAP_FAILED) return 0;
+    munmap(r, total);
+    return 1;
+}
+#endif
+
 static size_t kai_main_fiber_stack_size(void) {
+#if defined(KAI_MAIN_STACK_SIZE)
+    /* A host that refuses the reservation (RLIMIT_AS, strict overcommit)
+     * gets the largest halving that fits, never less than 8 MiB. */
+    static size_t granted = 0;
+    if (granted == 0) {
+        size_t want = (size_t) (KAI_MAIN_STACK_SIZE);
+        while (want / 2 >= 8 * 1024 * 1024 && !kai_stack_fits(want)) want /= 2;
+        granted = want;
+    }
+    return granted;
+#endif
     size_t sz = 8 * 1024 * 1024;
     struct rlimit rl;
     if (getrlimit(RLIMIT_STACK, &rl) == 0
@@ -16138,6 +16169,42 @@ static void kai_nursery_propagate_failure(KaiFiber *self);
 #  pragma clang diagnostic push
 #  pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
+/* [guard page | stack_size bytes], low to high; the caller munmaps
+ * stack_size + one page. MAP_NORESERVE keeps a large stack a pure address
+ * reservation: pages are committed only as the stack reaches them. */
+static void *kai_stack_map(size_t stack_size) {
+    size_t page = kai_page_size();
+    size_t total = stack_size + page;
+    void *region = mmap(NULL, total, PROT_READ | PROT_WRITE, kai_stack_map_flags(), -1, 0);
+    if (region == MAP_FAILED) {
+        fprintf(stderr, "kai: mmap failed allocating fiber stack (%zu bytes)\n",
+                total);
+        exit(1);
+    }
+    if (mprotect(region, page, PROT_NONE) != 0) {
+        fprintf(stderr, "kai: mprotect guard page failed for fiber stack\n");
+        munmap(region, total);
+        exit(1);
+    }
+    return region;
+}
+
+/* Point `c` at the usable stack [lo, lo + size). TRAP (macOS): makecontext
+ * bzeroes the whole uc_stack, which commits every page of a large reserved
+ * stack up front. Hand it only the top window instead; the frames below grow
+ * on into the rest of the mapping, down to the guard page. */
+static void kai_ctx_set_stack(ucontext_t *c, void *lo, size_t size) {
+#if defined(__APPLE__)
+    size_t window = 256 * 1024;
+    if (size > window) {
+        lo = (char *) lo + (size - window);
+        size = window;
+    }
+#endif
+    c->uc_stack.ss_sp   = lo;
+    c->uc_stack.ss_size = size;
+}
+
 static void kai_fiber_init_ctx_sized(KaiFiber *f, size_t stack_size) {
     kai_install_fiber_sigsegv_handler();
     if (getcontext(&f->ctx) != 0) {
@@ -16157,23 +16224,9 @@ static void kai_fiber_init_ctx_sized(KaiFiber *f, size_t stack_size) {
      * We store stack_base as the mmap base so munmap covers both;
      * stack_size remains the usable size, and total = stack_size +
      * page_size whenever we need to release the region. */
-    size_t page = kai_page_size();
-    size_t total = f->stack_size + page;
-    void *region = mmap(NULL, total, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (region == MAP_FAILED) {
-        fprintf(stderr, "kai: mmap failed allocating fiber stack (%zu bytes)\n",
-                total);
-        exit(1);
-    }
-    if (mprotect(region, page, PROT_NONE) != 0) {
-        fprintf(stderr, "kai: mprotect guard page failed for fiber stack\n");
-        munmap(region, total);
-        exit(1);
-    }
+    void *region = kai_stack_map(f->stack_size);
     f->stack_base = region;
-    f->ctx.uc_stack.ss_sp   = (char *) region + page;
-    f->ctx.uc_stack.ss_size = f->stack_size;
+    kai_ctx_set_stack(&f->ctx, (char *) region + kai_page_size(), f->stack_size);
     f->ctx.uc_link          = kai_uc_link_target();
     makecontext(&f->ctx, kai_fiber_trampoline, 0);
 }
@@ -16933,6 +16986,42 @@ static void kai_bootstrap_trampoline(void) {
     KAI_TSAN_SWITCH_TO_ROOT();
     setcontext(&kai_main_fiber.ctx);
 }
+
+#if defined(KAI_MAIN_STACK_SIZE)
+static void kai_sized_main_trampoline(void) {
+    for (int run = kai_read_rc_runs(); run > 1; run--) kai_decref(kai_user_main_fn());
+    kai_user_main_result = kai_user_main_fn();
+}
+
+/* One thread, main on a stack of KAI_MAIN_STACK_SIZE instead of the OS
+ * one, so the budget does not depend on the thread count. Same OS thread:
+ * main stays observably main-thread. Recorded as the root fiber's stack
+ * so an overflow there gets the guard-page diagnostic. */
+static KaiValue *kai_run_main_on_sized_stack(KaiValue *(*user_main)(void)) {
+    size_t size = kai_main_fiber_stack_size();
+    size_t ps = kai_page_size();
+    if (size % ps != 0) size = ((size / ps) + 1) * ps;
+    kai_install_fiber_sigsegv_handler();
+    kai_active_fiber_anchor();
+    kai_user_main_fn = user_main;
+    ucontext_t host, ctx;
+    void *region = kai_stack_map(size);
+    kai_main_fiber.stack_base = region;
+    kai_main_fiber.stack_size = size;
+    if (getcontext(&ctx) != 0) {
+        fprintf(stderr, "kai: getcontext failed for main\n");
+        exit(1);
+    }
+    kai_ctx_set_stack(&ctx, (char *) region + ps, size);
+    ctx.uc_link = &host;
+    makecontext(&ctx, kai_sized_main_trampoline, 0);
+    swapcontext(&host, &ctx);
+    kai_main_fiber.stack_base = NULL;
+    kai_main_fiber.stack_size = 0;
+    munmap(region, size + ps);
+    return kai_user_main_result;
+}
+#endif
 #if defined(__APPLE__) || defined(__clang__)
 #  pragma clang diagnostic pop
 #endif
@@ -17036,6 +17125,9 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     if (kai_nthreads <= 1) {
         kai_nthreads = 1;
         KAI_TSAN_BIND_ROOT();
+#if defined(KAI_MAIN_STACK_SIZE)
+        return kai_run_main_on_sized_stack(user_main);
+#endif
         for (int run = kai_read_rc_runs(); run > 1; run--) kai_decref(user_main());
         return user_main();
     }

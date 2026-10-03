@@ -71,6 +71,17 @@ size; the budget is a pure runtime parameter, no language surface.
   x86_64, 16 KiB on macOS arm64). Read once on first
   `Spawn.spawn`. Out-of-range values fall back to the default and
   log a warning to stderr.
+- **`main`'s stack**: the OS thread stack at `KAI_THREADS=1`; at N>1
+  `main` is a fiber of `max(8 MiB, RLIMIT_STACK)` (capped at 64 MiB).
+  A build that defines `KAI_MAIN_STACK_SIZE` fixes the budget at every
+  thread count, whatever `ulimit -s` says: `main` then runs on a
+  reserved stack of that size on the same OS thread. `kaic2` is built
+  with 1 GiB, so how deep an input the compiler accepts is the same on
+  every host. A host that refuses the reservation (`RLIMIT_AS`, strict
+  overcommit) gets the largest halving that fits, never under 8 MiB.
+  A reserved stack commits only the pages it reaches; on
+  macOS `makecontext` zero-fills its whole `uc_stack`, so it is handed
+  just the top 256 KiB and the frames grow on below.
 - **Allocation**: `mmap(MAP_PRIVATE | MAP_ANON)` of `stack_size +
   one page`, with the bottom page (low address) flipped to
   `PROT_NONE` via `mprotect`. Stacks grow down on x86_64 / arm64,
