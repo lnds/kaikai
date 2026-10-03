@@ -52,6 +52,7 @@ import compiler.cache_delta_test
 import compiler.symtab_test
 import compiler.resolve_sym_test
 import compiler.modules
+import compiler.module_home
 import compiler.import_uses
 import compiler.import_unit
 import compiler.qual_head
@@ -947,6 +948,12 @@ fn rs_has(rs: ResolveState, p: String) : Bool = list_has(rs.visited, p)
 
 fn rs_in_progress(rs: ResolveState, p: String) : Bool = list_has(rs.in_progress, p)
 
+# The file whose imports are being resolved: the innermost load.
+fn rs_importer(rs: ResolveState) : String = match rs.in_progress {
+  [f, ..._] -> f
+  []        -> ""
+}
+
 fn rs_push_in_progress(rs: ResolveState, p: String) : ResolveState =
   ResolveState { visited: rs.visited, in_progress: [p, ...rs.in_progress], rev_decls: rs.rev_decls, rev_segs: rs.rev_segs, rev_modules: rs.rev_modules, scopes: rs.scopes, rev_sels: rs.rev_sels, errs: rs.errs, dep_memo: rs.dep_memo, imports: rs.imports }
 
@@ -1174,15 +1181,7 @@ fn uc_resolve_decls(cache_res: UcLookup, abs_path: String, src: String,
     }
   }
 
-# A user module named like a core is another module: its home must not
-# be the core's, or both mint the same symbols and share one cache row.
-fn user_module_home(import_name: String, cores: [ModuleEntry]) : String =
-  match mt_lookup(cores, import_name) {
-    Some(_) -> string_concat("local_", import_name)
-    None    -> import_name
-  }
-
-fn resolve_module(base_dir: String, mod_path: String, import_name: String, search_paths: [String], cores: [ModuleEntry], owner: String, cache_dir: String, rs: ResolveState) : ResolveState / Console + File {
+fn resolve_module(base_dir: String, mod_path: String, import_name: String, line: Int, col: Int, search_paths: [String], cores: [ModuleEntry], owner: String, cache_dir: String, rs: ResolveState) : ResolveState / Console + File {
 
   let cf = find_module_file(base_dir, mod_path, search_paths)
   match cf {
@@ -1233,7 +1232,12 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
           }
         }
       }
-      else {
+      else { match home_taken_by(list_append(rs.rev_modules, cores), module_home(mod_path, cores), abs_path) {
+        Some(first) -> {
+          report_home_clash(rs_importer(rs), line, col, first, abs_path)
+          rs_bump_errs(rs)
+        }
+        None -> {
         # Push before recursing; pop + mark visited after, on every
         # branch of the load (missing file, lex error, parse error,
         # or success), so the stack stays balanced.
@@ -1274,7 +1278,7 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
                   # The module's home keys its decls, its segment and the
                   # imports it owns; the importer's spelling is a per-file
                   # binding onto it.
-                  let home = user_module_home(import_name, cores)
+                  let home = module_home(mod_path, cores)
                   let rs2 = process_imports(base_dir, decls, search_paths, cores, home, cache_dir, rs_doc)
                   let kept = non_import_decls(decls)
                   # Validate same-module name collisions before the
@@ -1300,7 +1304,10 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
                     let unstable_exports = collect_unstable_exports(kept, [])
                     let entry = ME(home, exports, abs_path, unstable_exports)
                     let bound = ME(import_name, exports, abs_path, unstable_exports)
-                    rs_bind_in(rs_add_module(rs3, entry), owner, bound)
+                    # A module may qualify its own names by its file name,
+                    # which is not its home once the path is nested.
+                    let own = ME(last_segment(mod_path), exports, abs_path, unstable_exports)
+                    rs_bind_in(rs_bind_in(rs_add_module(rs3, entry), owner, bound), home, own)
                   }
                 } }
               }
@@ -1308,7 +1315,8 @@ fn resolve_module(base_dir: String, mod_path: String, import_name: String, searc
           }
         }
         rs_mark(rs_pop_in_progress(rs_done), abs_path)
-      }
+        }
+      } }
     }
   }
 }
@@ -1334,17 +1342,17 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], core
           diag_error(importer_file(rs), line, col, import_chain_msg())
           rs_bump_errs(rs)
         }
-        DImport(ik, _, _) -> match ik {
+        DImport(ik, il, ic) -> match ik {
           # surface name = last segment of dotted path.
-          IkPath(p)         -> resolve_module(base_dir, p, last_segment(p), search_paths, cores, owner, cache_dir, rs)
+          IkPath(p)         -> resolve_module(base_dir, p, last_segment(p), il, ic, search_paths, cores, owner, cache_dir, rs)
           # surface name = alias.
-          IkAlias(p, alias) -> resolve_module(base_dir, p, alias, search_paths, cores, owner, cache_dir, rs)
+          IkAlias(p, alias) -> resolve_module(base_dir, p, alias, il, ic, search_paths, cores, owner, cache_dir, rs)
           # surface name = last segment (selective imports keep the
           # prefix surface binding, same as IkPath). The named list
           # scopes unqualified names, and decides which contested type
           # a bare one denotes here.
           IkSelective(p, names) ->
-            resolve_module(base_dir, p, last_segment(p), search_paths, cores, owner, cache_dir,
+            resolve_module(base_dir, p, last_segment(p), il, ic, search_paths, cores, owner, cache_dir,
                            rs_add_sel(rs, owner, last_segment(p), names))
           # Import holes are not module loads — they are
           # diagnostic-only. The symbol-index pass runs separately
@@ -1437,7 +1445,7 @@ fn load_test_roots(base_dir: String, roots: [String], search_paths: [String], co
   match roots {
     [] -> rs
     [r, ...rest] -> load_test_roots(base_dir, rest, search_paths, cores, cache_dir,
-                                    resolve_module(base_dir, r, r, search_paths, cores, "", cache_dir, rs))
+                                    resolve_module(base_dir, r, r, 0, 0, search_paths, cores, "", cache_dir, rs))
   }
 
 # What each core module can be referred to by, keyed by canonical origin.
@@ -5626,7 +5634,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                     nr_report_program_tab(diag_ctx, typed_prog.decls, target_mod_name,
                                       lowered.reg, early_const_uses,
                                       core_mod_names(core_mods, []),
-                                      post_use_decls, root_picks, sym_tab)
+                                      post_use_decls, root_picks, sym_tab,
+                                      ms_table(mod_scopes, "", module_table))
                   # Unused local bindings in the root file's fns and in every
                   # runner block; warnings only.
                   report_unused_in_decls(path, module_table, typed_prog.decls)
