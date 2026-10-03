@@ -10,26 +10,18 @@ name: tier1-macos-mn
 # thread-locals: `KAI_TLS` expands to tls_model("initial-exec") under clang,
 # and no other job links that attribute for a Mach-O target.
 #
-# Path-gated like the other concurrency tiers, and deliberately narrower
-# than tier1-tsan: `stage2/Makefile` is excluded (build plumbing, touched
-# several times a day, and a real scheduler change also touches a runtime
-# header). No push-to-main trigger either — the PR run already covered the
-# same diff, and macOS is the scarcest runner pool.
+# Scoped like the other concurrency tiers, and deliberately narrower than
+# tier1-tsan: `stage2/Makefile` is excluded (build plumbing, touched several
+# times a day, and a real scheduler change also touches a runtime header).
+# It reports on EVERY pull request so it can be a required check: the
+# `scope` job decides on ubuntu whether the diff reaches the M:N surface,
+# and when it does not, `tier1-macos-mn` reports success from an ubuntu
+# runner without touching the scarce macOS pool. A merge-group run reports
+# without running: the PR run already gated the same diff. No push-to-main
+# trigger either, for the same reason.
 on:
   pull_request:
-    paths:
-      - 'stage0/runtime.h'
-      - 'stage0/runtime_llvm.c'
-      - 'stage2/runtime.h'
-      - 'stdlib/actor.kai'
-      - 'stdlib/spawn.kai'
-      - 'demos/parallel_actors/**'
-      - 'examples/effects/mn_*'
-      - 'tools/run-mn-determinism.sh'
-      - 'tools/run-mn-deadlock-banner.sh'
-      - 'tools/lib/timeout.sh'
-      - 'tools/lib/single-tu.sh'
-      - '.github/workflows/tier1-macos-mn.yml'
+  merge_group:
   workflow_dispatch:
 
 # Cancel a superseded PR run; never cancel a main run — on main
@@ -43,8 +35,42 @@ permissions:
   contents: read
 
 jobs:
+  scope:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.mn.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+      - name: Does this diff reach the macOS M:N surface?
+        id: mn
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request) ;;
+            workflow_dispatch) echo "run=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+            *) echo "run=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          CHANGED=$(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}")
+          MATCHED=$(echo "$CHANGED" | grep -E \
+            '^(stage0/runtime\.h|stage0/runtime_llvm\.c|stage2/runtime\.h|stdlib/(actor|spawn)\.kai|demos/parallel_actors/.*|examples/effects/mn_[^/]*|tools/run-mn-determinism\.sh|tools/run-mn-deadlock-banner\.sh|tools/lib/timeout\.sh|tools/lib/single-tu\.sh|\.github/workflows/tier1-macos-mn\.yml)$' \
+            || true)
+          if [ -z "$MATCHED" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Diff touches no M:N surface; tier1-macos-mn reports without running."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "M:N surface touched:"; echo "$MATCHED"
+          fi
+
   tier1-macos-mn:
-    runs-on: macos-14
+    needs: scope
+    if: ${{ !cancelled() }}
+    runs-on: ${{ needs.scope.outputs.run == 'true' && 'macos-14' || 'ubuntu-latest' }}
     # The ceiling covers the uncached two-hop bootstrap plus the worst case
     # where every repeat of every fixture burns MN_RUN_TIMEOUT.
     timeout-minutes: 40
@@ -56,22 +82,34 @@ jobs:
       # The boot of stage2.c (docs/build-system.md §KAIC_BOOT).
       KAIC_BOOT: release
     steps:
+      - name: Scope gate to the M:N surface
+        run: |
+          if [ "${{ needs.scope.result }}" != "success" ]; then
+            echo "::error::tier1-macos-mn FAIL — the scope job did not succeed"; exit 1
+          fi
+          if [ "${{ needs.scope.outputs.run }}" != "true" ]; then
+            echo "tier1-macos-mn OK — the diff touches no M:N surface; the macOS gate is not exercised."
+          fi
+
       - uses: actions/checkout@v4
+        if: needs.scope.outputs.run == 'true'
         with:
           fetch-depth: 0
 
       - name: Build the release-booted C-only kaic2
+        if: needs.scope.outputs.run == 'true'
         run: make kaic2
 
       # Blocking. macOS is where the M:N identity bugs reproduced and Linux
       # did not, so a failure here is the signal this job exists for.
       - name: M:N determinism gate (macOS/arm64)
+        if: needs.scope.outputs.run == 'true'
         run: |
           set -o pipefail
           make test-mn-determinism 2>&1 | tee "$RUNNER_TEMP/$LOG"
 
       - name: Report
-        if: always()
+        if: always() && needs.scope.outputs.run == 'true'
         run: |
           {
             echo "## M:N determinism — macOS/arm64"
@@ -87,6 +125,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Working tree clean check
+        if: needs.scope.outputs.run == 'true'
         run: |
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error::working tree dirty after tier1-macos-mn"
