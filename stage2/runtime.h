@@ -14353,9 +14353,36 @@ static size_t kai_fiber_stack_size(void) {
  * conventional 8 MiB), and let a larger explicit KAI_FIBER_STACK_SIZE
  * still win. A build defining KAI_MAIN_STACK_SIZE fixes the budget
  * outright, at every thread count, whatever the environment says. */
+static int kai_stack_map_flags(void) {
+    int flags = MAP_PRIVATE | MAP_ANON;
+#if defined(MAP_NORESERVE)
+    flags |= MAP_NORESERVE;
+#endif
+    return flags;
+}
+
+#if defined(KAI_MAIN_STACK_SIZE)
+/* Whether the host grants a stack reservation of `size` bytes plus guard. */
+static int kai_stack_fits(size_t size) {
+    size_t total = size + kai_page_size();
+    void *r = mmap(NULL, total, PROT_READ | PROT_WRITE, kai_stack_map_flags(), -1, 0);
+    if (r == MAP_FAILED) return 0;
+    munmap(r, total);
+    return 1;
+}
+#endif
+
 static size_t kai_main_fiber_stack_size(void) {
 #if defined(KAI_MAIN_STACK_SIZE)
-    return (size_t) (KAI_MAIN_STACK_SIZE);
+    /* A host that refuses the reservation (RLIMIT_AS, strict overcommit)
+     * gets the largest halving that fits, never less than 8 MiB. */
+    static size_t granted = 0;
+    if (granted == 0) {
+        size_t want = (size_t) (KAI_MAIN_STACK_SIZE);
+        while (want / 2 >= 8 * 1024 * 1024 && !kai_stack_fits(want)) want /= 2;
+        granted = want;
+    }
+    return granted;
 #endif
     size_t sz = 8 * 1024 * 1024;
     struct rlimit rl;
@@ -16148,11 +16175,7 @@ static void kai_nursery_propagate_failure(KaiFiber *self);
 static void *kai_stack_map(size_t stack_size) {
     size_t page = kai_page_size();
     size_t total = stack_size + page;
-    int flags = MAP_PRIVATE | MAP_ANON;
-#if defined(MAP_NORESERVE)
-    flags |= MAP_NORESERVE;
-#endif
-    void *region = mmap(NULL, total, PROT_READ | PROT_WRITE, flags, -1, 0);
+    void *region = mmap(NULL, total, PROT_READ | PROT_WRITE, kai_stack_map_flags(), -1, 0);
     if (region == MAP_FAILED) {
         fprintf(stderr, "kai: mmap failed allocating fiber stack (%zu bytes)\n",
                 total);
