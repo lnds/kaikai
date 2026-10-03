@@ -6,8 +6,9 @@
 # downstream analysis keyed on the primitive's call shape (raw element
 # fusion, borrow reads, consumer linearity) misses the module spelling
 # and the qualified surface silently costs more than the builtin one.
-# This pass rewrites each saturated `mod.fn(args…)` call to such a
-# forwarder into the direct primitive call.
+# This pass rewrites each saturated call to such a forwarder — by its
+# id, or by `mod.fn` where a call still spells its home — into the
+# direct primitive call.
 #
 # Runs post-typer (Expr.ty stamped, protocol calls resolved), pre-
 # monomorph, on both backends. Soundness fences:
@@ -23,9 +24,11 @@
 import compiler.ast
 import compiler.desugar
 import compiler.infer
+import compiler.decl_names
+import compiler.symtab_build
 
-# One inlinable forwarder: qualified key "mod.fn", primitive, arity.
-type FwdEntry = FW(String, String, Int)
+# One inlinable forwarder: qualified key "mod.fn", its id, primitive, arity.
+type FwdEntry = FW(String, SymId, String, Int)
 
 #[doc("Rewrites every saturated qualified call to a trivial forwarder (a pub module fn whose body just forwards its params, in order, to a runtime primitive) into the direct primitive call, so the module surface hits the same fused/raw paths as the builtin spelling.")]
 pub fn inline_trivial_forwarders(typed: TypedProgram) : TypedProgram = {
@@ -65,7 +68,7 @@ fn fwd_add(d: Decl, fn_names: [String], acc: [FwdEntry]) : [FwdEntry] = match d 
     Some(m) ->
       if is_pub and fwd_row_is_empty(row) {
         match fwd_prim_of(params, body, fn_names) {
-          Some(prim) -> [FW(concat_all([m, ".", name]), prim, list_length(params)), ...acc]
+          Some(prim) -> [FW(concat_all([m, ".", name]), sym_derive(NCFn, name, m), prim, list_length(params)), ...acc]
           None       -> acc
         }
       } else { acc }
@@ -129,23 +132,33 @@ fn fwd_rw_expr(e: Expr, fwds: [FwdEntry]) : Expr = {
 # `mod.fn(args…)` whose callee is a collected forwarder at matching
 # arity → the direct primitive call. Args recurse either way.
 fn fwd_try_call(k: ExprKind, fwds: [FwdEntry]) : Option[ExprKind] = match k {
-  ECall(callee, args_) -> match callee.kind {
-    EModCall(m, f) ->
-      match fwd_lookup(fwds, concat_all([m, ".", f]), list_length(args_)) {
-        Some(prim) -> Some(ECall(
-          Expr { kind: EVar(prim), line: callee.line, col: callee.col,
-                 ty: callee.ty, mode: callee.mode },
-          map(args_, (a) => fwd_rw_expr(a, fwds))))
-        None -> None
-      }
-    _ -> None
+  ECall(callee, args_) -> match fwd_callee_prim(callee.kind, fwds, list_length(args_)) {
+    Some(prim) -> Some(ECall(
+      Expr { kind: EVar(prim), line: callee.line, col: callee.col,
+             ty: callee.ty, mode: callee.mode },
+      map(args_, (a) => fwd_rw_expr(a, fwds))))
+    None -> None
   }
   _ -> None
+}
+
+fn fwd_callee_prim(k: ExprKind, fwds: [FwdEntry], arity: Int) : Option[String] = match k {
+  ESym(s, inst, _) -> if inst == spec_none() { fwd_lookup_sym(fwds, s, arity) } else { None }
+  EModCall(m, f)   -> fwd_lookup(fwds, concat_all([m, ".", f]), arity)
+  _                -> None
 }
 
 fn fwd_lookup(fwds: [FwdEntry], key: String, arity: Int) : Option[String] = match fwds {
   []           -> None
   [e, ...rest] -> match e {
-    FW(k, prim, a) -> if k == key and a == arity { Some(prim) } else { fwd_lookup(rest, key, arity) }
+    FW(k, _, prim, a) -> if k == key and a == arity { Some(prim) } else { fwd_lookup(rest, key, arity) }
+  }
+}
+
+fn fwd_lookup_sym(fwds: [FwdEntry], s: SymId, arity: Int) : Option[String] = match fwds {
+  []           -> None
+  [e, ...rest] -> match e {
+    FW(_, id, prim, a) ->
+      if sym_raw(id) == sym_raw(s) and a == arity { Some(prim) } else { fwd_lookup_sym(rest, s, arity) }
   }
 }

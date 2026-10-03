@@ -59,6 +59,8 @@ import compiler.perceus_tail_drop
 import compiler.consume_index
 import compiler.fn_index
 import compiler.borrow_view
+import compiler.decl_names
+import compiler.symtab_build
 import compiler.perceus_raw_slot
 import compiler.perceus_reads
 import compiler.interp_span
@@ -219,7 +221,7 @@ pub fn perceus_pass_in(decls: [Decl], tab: SymTab, views: FileViews,
   # Consume-map (Koka Borrowed dual): per-fn CONSUMED param positions. A caller
   # may MOVE a binder into a consuming slot; a non-consuming slot (field-read
   # callee like regexp nb_add_transition) must keep the caller's ref.
-  let cmap = pcs_build_consume_map(decls, cix_empty())
+  let cmap = pcs_build_consume_map(decls, root, cix_empty())
   # Names of `extern "C" fn` shims whose return type is an opaque handle.
   # A `let h = f(...)` with such an `f` binds a handle box that must move
   # at its last consuming use (the shim there decrefs the box); otherwise
@@ -653,9 +655,9 @@ fn pcs_boxed_borrow_slots(bmap: [BorrowEntry], fns: FnIndex, f: Expr) : [Int] = 
   filter(pcs_borrow_lookup(bmap, pcs_callee_key(f)), (i) => not pcs_has_int(raw, i))
 }
 
-# The call key for a callee expr — bare EVar or resolved EModCall.
-#[doc("Call key for a callee expression: the bare name, or `mod.name` for a resolved module call.")]
-pub fn pcs_callee_key(callee: Expr) : String = match sym_read_kind(callee.kind) {
+#[doc("Call key for a callee expression: a resolved function's id, `mod.name` for a home-spelled call, else the bare name.")]
+pub fn pcs_callee_key(callee: Expr) : String = match callee.kind {
+  ESym(s, inst, nm) -> if inst == spec_none() and sym_raw(s) >= 0 { bv_id_key(s) } else { nm }
   EVar(nm)          -> nm
   EModCall(m, nm)   -> concat_all([m, ".", nm])
   _                 -> ""
@@ -819,12 +821,12 @@ pub fn pcs_borrow_params(pnames: [String], body: Expr) : [String] = match pnames
 # caller's ref (dup), else the value's life after the call reads freed memory
 # (the regexp UAF). Keyed per fn (qualified + bare, like the borrow map).
 
-fn pcs_build_consume_map(decls: [Decl], acc: ConsumeIndex) : ConsumeIndex = match decls {
+fn pcs_build_consume_map(decls: [Decl], root: String, acc: ConsumeIndex) : ConsumeIndex = match decls {
   []           -> acc
-  [d, ...rest] -> pcs_build_consume_map(rest, pcs_consume_entry_of(d, acc))
+  [d, ...rest] -> pcs_build_consume_map(rest, root, pcs_consume_entry_of(d, root, acc))
 }
 
-fn pcs_consume_entry_of(d: Decl, acc: ConsumeIndex) : ConsumeIndex = match d {
+fn pcs_consume_entry_of(d: Decl, root: String, acc: ConsumeIndex) : ConsumeIndex = match d {
   DFn(_, name, _, params, _, _, body, _, _, mo, fsym) -> {
     let pnames = map(params, (p) => p.pname)
     # An FFI shim's body is opaque to the consuming-use walk, so a normal
@@ -834,12 +836,24 @@ fn pcs_consume_entry_of(d: Decl, acc: ConsumeIndex) : ConsumeIndex = match d {
     let positions = if body_is_ffi_extern(body) { pcs_ffi_consumed_positions(params, 0) }
                     else { pcs_consumed_positions(pnames, body, 0) }
     let qual = CE(pcs_borrow_key(name, mo), positions)
-    match mo {
+    let named = match mo {
       None    -> cix_add(acc, qual)
       Some(_) -> cix_add_newest_first(acc, [CE(name, positions), qual])
     }
+    pcs_consume_id_entry(named, name, pcs_home_of(mo, root), positions)
   }
   _ -> acc
+}
+
+# The declaration's id key. A specialisation spells a name of its own, so
+# its key never meets its template's.
+fn pcs_consume_id_entry(acc: ConsumeIndex, name: String, home: String,
+      positions: [Int]) : ConsumeIndex =
+  cix_add(acc, CE(bv_id_key(sym_derive(NCFn, name, home)), positions))
+
+fn pcs_home_of(mo: Option[String], root: String) : String = match mo {
+  Some(m) -> m
+  None    -> root
 }
 
 fn pcs_ffi_consumed_positions(params: [Param], i: Int) : [Int] = match params {
@@ -4269,9 +4283,12 @@ type PcsArmCx = { uses: [Use], moved: [String], boxed_bpos: [Int], borrow_only: 
 
 # A user fn's borrowed positions; a borrowing prim keeps its own
 # consuming-last-use rule, so it lends no slot here.
-fn pcs_user_borrow_slots(bmap: [BorrowEntry], callee: String) : [Int] = match core_borrow_variant(callee) {
-  Some(_) -> []
-  None    -> pcs_borrow_lookup(bmap, callee)
+fn pcs_user_borrow_slots(bmap: [BorrowEntry], callee: Expr) : [Int] = match sym_read_name(callee.kind) {
+  Some(c) -> match core_borrow_variant(c) {
+    Some(_) -> []
+    None    -> pcs_borrow_lookup(bmap, pcs_callee_key(callee))
+  }
+  None -> []
 }
 
 fn pcs_boxed_positions(bpos: [Int], params: [Param], raw: [String], i: Int) : [Int] = match params {
