@@ -1,0 +1,117 @@
+#[doc("""
+The identity each constructor site of the program's own functions
+carries into unbox, decoded against the symbol table. Core modules are
+left out.
+
+A line is `ctor <form> <fn> <written>#<id> <decl>@<home>`, or
+`ctor <form> <fn> <written>#none` when no home reaches the site. The
+form is how the tree spells it: `sym` (a resolved reference), `bare`
+(a name with no home), `mod` (a qualified reference), `pat` and
+`patrec` (a variant pattern, positional or with fields). A constructor
+has no id slot of its own: its home is the identity, and the id is the
+one the table derives from (home, name).
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.symtab
+import compiler.decl_names
+
+type CdCx = CdCx(SymTab, String)
+
+#[doc("One line per constructor site in the bodies of the functions outside the `core` modules.")]
+pub fn ctor_site_lines(tab: SymTab, core: [String], ds: [Decl]) : [String] = match ds {
+  []           -> []
+  [d, ...rest] -> cd_decl(tab, core, d) ++ ctor_site_lines(tab, core, rest)
+}
+
+fn cd_decl(tab: SymTab, core: [String], d: Decl) : [String] = match d {
+  DFn(_, n, _, _, _, _, body, _, _, mo, _) ->
+    if cd_user(mo, core) { list_reverse(cd_expr(CdCx(tab, n), body, [])) } else { [] }
+  _ -> []
+}
+
+fn cd_user(mo: Option[String], core: [String]) : Bool = match mo {
+  None    -> true
+  Some(m) -> not list_has(core, m)
+}
+
+fn cd_expr(cx: CdCx, e: Expr, acc: [String]) : [String] =
+  cd_children(cx, xp_positions(e), cd_node(cx, e.kind, acc))
+
+fn cd_node(cx: CdCx, k: ExprKind, acc: [String]) : [String] = match k {
+  ESym(s, _, n)   -> if cd_is_ctor_sym(cx, s) { [cd_line(cx, "sym", n, Some(s)), ...acc] } else { acc }
+  EVar(n)         -> if cd_is_ctor_name(cx, n) { [cd_line(cx, "bare", n, None), ...acc] } else { acc }
+  EModCall(q, n)  -> if cd_is_ctor_name(cx, n) { [cd_line(cx, "mod", n, cd_in_home(cx, q, n)), ...acc] } else { acc }
+  EMatch(_, arms) -> cd_arms(cx, arms, acc)
+  EBlock(ss, _)   -> cd_stmts(cx, ss, acc)
+  _               -> acc
+}
+
+fn cd_children(cx: CdCx, ps: [XPos], acc: [String]) : [String] = match ps {
+  []                  -> acc
+  [XP(_, c), ...rest] -> cd_children(cx, rest, cd_expr(cx, c, acc))
+}
+
+fn cd_arms(cx: CdCx, arms: [Arm], acc: [String]) : [String] = match arms {
+  []                      -> acc
+  [Arm(p, _, _), ...rest] -> cd_arms(cx, rest, cd_pat(cx, p, acc))
+}
+
+fn cd_stmts(cx: CdCx, ss: [Stmt], acc: [String]) : [String] = match ss {
+  []                       -> acc
+  [SLet(p, _, _), ...rest] -> cd_stmts(cx, rest, cd_pat(cx, p, acc))
+  [_, ...rest]             -> cd_stmts(cx, rest, acc)
+}
+
+fn cd_pat(cx: CdCx, p: Pattern, acc: [String]) : [String] = match p.pkind {
+  PVariant(h, n, subs)     -> cd_pats(cx, subs, [cd_line(cx, "pat", n, cd_pat_home(cx, h, n)), ...acc])
+  PVariantRecord(h, n, fs) -> cd_pfields(cx, fs, [cd_line(cx, "patrec", n, cd_pat_home(cx, h, n)), ...acc])
+  PList(subs, _)           -> cd_pats(cx, subs, acc)
+  PRecord(fs)              -> cd_pfields(cx, fs, acc)
+  PAs(_, inner)            -> cd_pat(cx, inner, acc)
+  _                        -> acc
+}
+
+fn cd_pats(cx: CdCx, ps: [Pattern], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> cd_pats(cx, rest, cd_pat(cx, p, acc))
+}
+
+fn cd_pfields(cx: CdCx, fs: [PField], acc: [String]) : [String] = match fs {
+  []                         -> acc
+  [PField(_, p, _), ...rest] -> cd_pfields(cx, rest, cd_pat(cx, p, acc))
+}
+
+fn cd_pat_home(cx: CdCx, h: Option[String], n: String) : Option[SymId] = match h {
+  None    -> None
+  Some(m) -> cd_in_home(cx, m, n)
+}
+
+fn cd_in_home(cx: CdCx, q: String, n: String) : Option[SymId] = match cx {
+  CdCx(tab, _) -> match st_module(tab, q) {
+    None    -> None
+    Some(m) -> st_lookup(tab, NCCtor, n, m)
+  }
+}
+
+fn cd_is_ctor_sym(cx: CdCx, s: SymId) : Bool = match cx {
+  CdCx(tab, _) -> st_valid(tab, s) and ncls_same(sym_class(tab, s), NCCtor)
+}
+
+# A name some declaration gives a constructor, or one of the builtins no
+# declaration carries.
+fn cd_is_ctor_name(cx: CdCx, n: String) : Bool = match cx {
+  CdCx(tab, _) -> match st_candidates(tab, NCCtor, n) {
+    [] -> list_has(["Some", "None", "Ok", "Err"], n)
+    _  -> true
+  }
+}
+
+fn cd_line(cx: CdCx, form: String, n: String, s: Option[SymId]) : String = match cx {
+  CdCx(tab, f) -> match s {
+    None    -> concat_all(["ctor ", form, " ", f, " ", n, "#none"])
+    Some(x) -> concat_all(["ctor ", form, " ", f, " ", n, "#", int_to_string(sym_raw(x)), " ",
+                           sym_name(tab, x), "@", sym_home(tab, x)])
+  }
+}
