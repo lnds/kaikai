@@ -88,6 +88,16 @@ need '^own effect Log__rb#[0-9]+ Log@rb$'
 [ "$(id_of '^kperform ra__run Log__ra')" = "$(id_of '^own effect Log__ra')" ] \
   || fail "a perform carries a different id than the declaration it names"
 
+# A root effect shares its name with a core one. From a module that
+# declares no `Log` the bare perform climbs to the core, which the root
+# cannot shadow there; the root's own perform keeps the root's id.
+COREFIX="$ROOT/examples/effects/core_perform_id_under_root_homonym"
+out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
+        --path "$COREFIX" --path "$ROOT/stdlib" "$COREFIX/main.kai" 2>/dev/null)
+
+need '^kperform mc__go Log\.info!?#[0-9]+ Log@effects$'
+need '^kperform main Log\.note!?#[0-9]+ Log@main$'
+
 # A declaration keeps its identity through the typer's cache: a warm build
 # must reach the late passes with the ids a cold build stamps, not `#-1` —
 # both would still run. Same invocation twice over one cache dir: the second
