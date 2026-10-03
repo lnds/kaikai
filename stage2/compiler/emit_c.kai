@@ -1516,22 +1516,6 @@ fn rp_arg_mask(ptys: [Ty]) : [Bool] = match ptys {
 fn emit_rcore_call(src: String, cname: String, ptys: [Ty], args_e: [Expr], cx: EmitCtx) : String / Console =
   seq_call(cat2(cname, "("), emit_arg_vals_masked(src, args_e, rp_arg_mask(ptys), cx), ")")
 
-# Emit a single pipe LHS / arg at mask position `i`: raw or boxed.
-fn pipe_arg_masked(src: String, a: Expr, mask: [Bool], i: Int, cx: EmitCtx) : String / Console {
-  let is_raw = match mask {
-        [m, ..._] -> m
-        [] -> true
-      }
-  if is_raw { emit_expr_raw(src, a, cx) }
-  else { emit_expr(src, a, cx) }
-}
-
-# Drop the first mask entry (the pipe LHS consumed param 0); the
-# remaining entries align with `args_e` (params 1+).
-fn mask_drop1(mask: [Bool]) : [Bool] = match mask {
-        [_, ...r] -> r
-        [] -> []
-      }
 
 # m8.x bug #12: emit `KaiValue *_op_arg_<i> = <expr>; ` for each
 # arg of an op call. The args are evaluated *before* the
@@ -2703,44 +2687,10 @@ fn emit_guard_no_intrinsic_mint(callee: String) : Unit =
     panic(cat2("emit_c: perceus intrinsic leaked to closure apply: ", callee))
   } else { () }
 
-# emit_named_call_lookup's dispatch for a pipe call, over operands that
-# already lead with the piped LHS. A local closure (`lcs`) shadows a
-# same-named top-level fn: `let take = ...; xs |> take(1)` calls the local.
-fn emit_pipe_named_lookup(src: String, callee: String, csym: FnId, vals_all: [String], cx: EmitCtx) : String / Console =
-  if list_has(cx.lcs, callee) {
-    emit_apply_seq("kai_apply(", c_local(callee), vals_all)
-  } else { match evar_find(cx.variants, callee) {
-    Some(_) -> emit_variant_call(None, callee, list_length(vals_all),
-                                 seq_map_refs(seq_operands(vals_all), arg_str_as_slot), cx)
-    # A top-level `fn` the program declares under this name answers
-    # before the core table: a declaration shadows the builtin it is
-    # spelled like, which is what the typer and the native lowering
-    # (`c_sym_of_callee`) already read off this same registry.
-    None -> match fnx_resolve(cx.fx, cx.fns, csym, callee, cx.root_mod) {
-      Some(EFn(_, _, mo, _, _)) -> emit_user_call_seq(c_sym(callee, mo), vals_all, cx)
-      None -> match core_find(cx.core, callee) {
-        Some(ep) -> match ep {
-          EP(_, cname, _) -> seq_call(cat2(cname, "("), vals_all, ")")
-        }
-        None -> {
-          emit_guard_no_intrinsic_mint(callee)
-          emit_apply_seq("kai_apply(", c_local(callee), vals_all)
-        }
-      }
-    }
-  } }
-
 # Shared by emit_call_expr's EVar non-special branch and its
-# EModCall (m6.2) branch. Picks variant / core / user-fn /
-# closure-thunk emission from the same lookup chain. `lcs` lets a
-# local closure shadow a same-named top-level fn (see
-# emit_pipe_named_lookup).
-
-# Shared by emit_call_expr's EVar non-special branch and its
-# EModCall (m6.2) branch. Picks variant / core / user-fn /
-# closure-thunk emission from the same lookup chain. `lcs` lets a
-# local closure shadow a same-named top-level fn (see
-# emit_pipe_named_lookup).
+# EModCall branch. Picks variant / core / user-fn / closure-thunk
+# emission from the same lookup chain. A local closure (`lcs`) shadows a
+# same-named top-level fn: `let take = ...; take(xs, 1)` calls the local.
 fn emit_named_call_lookup(src: String, callee: String, csym: FnId, args_e: [Expr], call_vals: [String], cx: EmitCtx) : String / Console =
   if list_has(cx.lcs, callee) {
     emit_apply_seq("kai_apply(", c_local(callee), call_vals)
@@ -2874,81 +2824,6 @@ fn evf_require_walk(eff: String) : String =
     concat_all(["kai_evidence_require(kai_evidence_lookup_node(\"", eff,
                 "\"), \"", eff, "\")"])
   }
-
-fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, cx: EmitCtx) : String / Console {
-
-  match sym_read_kind(rhs.kind) {
-    ECall(f, args_e) -> match sym_read_kind(f.kind) {
-      # Pipe into a UFn callee: the piped LHS is param 0 and every arg
-      # marshals per the raw mask, since the callee's C signature is raw.
-      EVar(callee) -> {
-        if list_has(cx.lcs, callee) {
-          emit_pipe_named_lookup(src, callee, ec_callee_sym(f), emit_pipe_vals(src, lhs, args_e, cx), cx)
-        } else { match fnx_resolve(cx.fx, cx.fns, ec_callee_sym(f), callee, cx.root_mod) {
-          Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) -> {
-            # Pipe: LHS is param 0, args_e are params 1+. Marshal each
-            # per the mask (mixed-param lane, issue #440 follow-up).
-            let raw_call = emit_user_call_seq(c_sym(callee, mo), emit_pipe_vals_masked(src, lhs, args_e, mask, cx), cx)
-            ufn_call_result(rt, raw_call)
-          }
-          _ -> emit_pipe_named_lookup(src, callee, ec_callee_sym(f), emit_pipe_vals(src, lhs, args_e, cx), cx)
-        } }
-      }
-      # m6.2 Phase 3 / v2: piped qualified call `x |> mod.f(args)`.
-      # Mint the prefixed symbol directly — same logic as the
-      # non-piped EModCall branch in emit_call_expr. Phase 3
-      # routes UFn-classified targets through the raw shape too.
-      EModCall(mod, fname) -> match lookup_ufn_sig(cx.fns, fname, Some(mod)) {
-        Some(US(_, rt, mask)) -> {
-          let raw_call = emit_user_call_seq(c_sym(fname, Some(mod)), emit_pipe_vals_masked(src, lhs, args_e, mask, cx), cx)
-          ufn_call_result(rt, raw_call)
-        }
-        None -> emit_user_call_seq(c_sym(fname, Some(mod)), emit_pipe_vals(src, lhs, args_e, cx), cx)
-      }
-      _ -> {
-        let fc = emit_expr(src, f, cx)
-        emit_apply_seq("kai_apply(", fc, emit_pipe_vals(src, lhs, args_e, cx))
-      }
-    }
-    EVar(callee) -> {
-      if list_has(cx.lcs, callee) {
-        emit_pipe_named_lookup(src, callee, ec_callee_sym(rhs), [emit_expr(src, lhs, cx)], cx)
-      } else { match fnx_resolve(cx.fx, cx.fns, ec_callee_sym(rhs), callee, cx.root_mod) {
-        Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) -> {
-          let lhs_raw = pipe_arg_masked(src, lhs, mask, 0, cx)
-          let raw_call = emit_user_call(c_sym(callee, mo), lhs_raw, cx)
-          ufn_call_result(rt, raw_call)
-        }
-        _ -> emit_pipe_named_lookup(src, callee, ec_callee_sym(rhs), [emit_expr(src, lhs, cx)], cx)
-      } }
-    }
-    # m6.2 Phase 3 / v2: piped qualified-call shorthand `x |> mod.f`
-    # (no parens) — same direct mint as the parens form.
-    EModCall(mod, fname) -> match lookup_ufn_sig(cx.fns, fname, Some(mod)) {
-      Some(US(_, rt, mask)) -> {
-        let lhs_raw = pipe_arg_masked(src, lhs, mask, 0, cx)
-        let raw_call = emit_user_call(c_sym(fname, Some(mod)), lhs_raw, cx)
-        ufn_call_result(rt, raw_call)
-      }
-      None -> {
-        let lhs_c = emit_expr(src, lhs, cx)
-        emit_user_call(c_sym(fname, Some(mod)), lhs_c, cx)
-      }
-    }
-    _ -> {
-      let fc = emit_expr(src, rhs, cx)
-      emit_apply_seq("kai_apply(", fc, [emit_expr(src, lhs, cx)])
-    }
-  }
-}
-
-# The piped LHS followed by the call's own args, as boxed operands.
-fn emit_pipe_vals(src: String, lhs: Expr, args_e: [Expr], cx: EmitCtx) : [String] / Console =
-  [emit_expr(src, lhs, cx), ...emit_arg_vals(src, args_e, cx)]
-
-# The piped LHS as param 0, then the call's args, each marshalled per the UFn mask.
-fn emit_pipe_vals_masked(src: String, lhs: Expr, args_e: [Expr], mask: [Bool], cx: EmitCtx) : [String] / Console =
-  [pipe_arg_masked(src, lhs, mask, 0, cx), ...emit_arg_vals_masked(src, args_e, mask_drop1(mask), cx)]
 
 fn emit_range_expr(src: String, from: Expr, to: Expr, opt_step: Option[Expr],
                    cx: EmitCtx) : String / Console {
@@ -7267,12 +7142,9 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
         }
       }
     }
-    EPipe(a, b) -> emit_pipe_expr(src, a, b, cx)
-    # issue #201: `|` and `||` are rewritten by the typer (synth_map_pipe /
-    # synth_flat_map_pipe) into a `<module>.<op>(lhs, f)` ECall before
-    # codegen runs, so these arms are unreachable in practice. They exist
-    # to keep the exhaustive match valid; a fall-through here is a typer
-    # bug — emit a panic so the regression is loud at runtime.
+    # The typer rewrites every pipe into the call it spells, so these arms
+    # only keep the match exhaustive; reaching one is a typer bug.
+    EPipe(_, _)        -> "kai_core_panic(kai_str(\"unreachable: EPipe survived typer\"))"
     EMapPipe(_, _)     -> "kai_core_panic(kai_str(\"unreachable: EMapPipe survived typer\"))"
     EFlatMapPipe(_, _) -> "kai_core_panic(kai_str(\"unreachable: EFlatMapPipe survived typer\"))"
     EFilterPipe(_, _)  -> "kai_core_panic(kai_str(\"unreachable: EFilterPipe survived typer\"))"
