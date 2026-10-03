@@ -1,0 +1,96 @@
+#[doc("""
+Which constructors Perceus turned into reuse targets, shared by both backends.
+
+The runtime interns a variant whose slots are all immortal. Interning a reuse
+target saturates its refcount, so `kai_check_unique` never passes and the
+cell is never rewritten in place. Each backend stamps the tags returned by
+`reusable_tags` into the runtime at startup so construction leaves them out
+of the intern table.
+""")]
+
+import compiler.ast
+import compiler.sym_read
+import compiler.expr_positions
+import compiler.emit_shared
+
+#[doc("A rebuild's constructor: the module that declares it, if known, and its name.")]
+pub type ReuseCtorName = RCN(Option[String], String)
+
+#[doc("The tags of every constructor a `__perceus_reuse_variant` rebuild names in the post-Perceus `decls`.")]
+pub fn reusable_tags(decls: [Decl], variants: [VariantEntry]) : [Int] =
+  reuse_ctor_tags(collect_reuse_ctors(decls, []), variants, [])
+
+fn reuse_ctor_tags(names: [ReuseCtorName], variants: [VariantEntry], acc: [Int]) : [Int] = match names {
+  []           -> acc
+  [RCN(h, n), ...rest] -> match evar_find_tag_opt_in(variants, h, n) {
+    Some(t) -> reuse_ctor_tags(rest, variants, [t, ...acc])
+    None    -> reuse_ctor_tags(rest, variants, acc)
+  }
+}
+
+#[doc("The rebuild's ctor keyed by the module that declares it: its type's home, else the qualifier it was written with.")]
+pub fn reuse_ctor_ref(ctor: Expr) : Option[ReuseCtorName] = match reuse_ctor_home_name(ctor) {
+  Some(RCN(q, cname)) -> match ctor.ty {
+    Some(TyCon(Some(m), _, _, _)) -> Some(RCN(Some(m), cname))
+    _                             -> Some(RCN(q, cname))
+  }
+  None -> None
+}
+
+fn rcn_eq(a: ReuseCtorName, b: ReuseCtorName) : Bool = match a {
+  RCN(ha, na) -> match b { RCN(hb, nb) -> na == nb and ctor_home_matches(ha, hb) and ctor_home_matches(hb, ha) }
+}
+
+#[doc("The ctor a rebuild call names, with the qualifier it was written with. The qualifier may name the type rather than the module.")]
+pub fn reuse_ctor_home_name(ctor: Expr) : Option[ReuseCtorName] = match ctor.kind {
+  ECall(cf, _) -> match cf.kind {
+    EVar(cname)          -> Some(RCN(None, cname))
+    EModCall(m, cname)   -> Some(RCN(Some(m), cname))
+    _                    -> None
+  }
+  _ -> None
+}
+
+#[doc("Whether a pattern's ctor and a rebuild's ctor are the same: names match and homes do not contradict.")]
+pub fn reuse_same_ctor(phome: Option[String], pname: String, b: ReuseCtorName) : Bool =
+  match b {
+    RCN(bhome, bname) ->
+      bname == pname and (ctor_home_matches(bhome, phome) or ctor_home_matches(phome, bhome))
+  }
+
+fn collect_reuse_ctors(decls: [Decl], acc: [ReuseCtorName]) : [ReuseCtorName] = match decls {
+  []           -> acc
+  [d, ...rest] -> collect_reuse_ctors(rest, collect_reuse_ctors_decl(d, acc))
+}
+
+fn collect_reuse_ctors_decl(d: Decl, acc: [ReuseCtorName]) : [ReuseCtorName] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _, _) -> walk_reuse_ctors(body, acc)
+  DTest(_, body, _, _, _)     -> walk_reuse_ctors(body, acc)
+  DBench(_, body, _, _, _)    -> walk_reuse_ctors(body, acc)
+  DCheck(_, _, body, _, _, _) -> walk_reuse_ctors(body, acc)
+  _ -> acc
+}
+
+fn walk_reuse_ctors(e: Expr, acc: [ReuseCtorName]) : [ReuseCtorName] =
+  walk_reuse_ctors_positions(xp_positions(e), add_reuse_ctor(e.kind, acc))
+
+fn walk_reuse_ctors_positions(ps: [XPos], acc: [ReuseCtorName]) : [ReuseCtorName] = match ps {
+  []                 -> acc
+  [XP(_, x), ...rest] -> walk_reuse_ctors_positions(rest, walk_reuse_ctors(x, acc))
+}
+
+fn add_reuse_ctor(k: ExprKind, acc: [ReuseCtorName]) : [ReuseCtorName] = match k {
+  ECall(callee, [_scr, ctor]) ->
+    if is_reuse_variant_callee(callee) {
+      match reuse_ctor_ref(ctor) {
+        Some(r) -> if any(acc, (x) => rcn_eq(x, r)) { acc } else { [r, ...acc] }
+        None    -> acc
+      }
+    } else { acc }
+  _ -> acc
+}
+
+fn is_reuse_variant_callee(callee: Expr) : Bool = match sym_read_kind(callee.kind) {
+  EVar(nm) -> nm == "__perceus_reuse_variant"
+  _        -> false
+}

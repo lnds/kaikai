@@ -177,6 +177,11 @@ while IFS= read -r id; do
     case "$measured" in ''|*[!0-9-]*) echo "FAIL $id — $measured"; fail=1 ;; esac
   fi
   [ "$measured" = BUILD-FAIL ] && tail -4 "$WORK/$corpus-$name.build" 2>/dev/null | sed 's/^/    /'
+  # A run cannot free more than it allocated: negative growth means the
+  # ledger missed allocations, never a fixed leak.
+  case "$growth" in
+    -[0-9]*) echo "FAIL $id — growth $growth per run: frees counted without their allocations"; fail=1; continue ;;
+  esac
   # Checked even when leaked failed: a moved pin says nothing about growth.
   if [ "$growth" != - ] && [ "$growth" != "$(pinned_growth "$corpus" "$name")" ]; then
     echo "FAIL $id — leaked grows by $growth per run of main, pinned growth $(pinned_growth "$corpus" "$name")"
