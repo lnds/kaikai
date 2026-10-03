@@ -1,19 +1,13 @@
 # compiler/util.kai — low-level string / list helpers shared across
-# compiler phases.
-#
-# Extracted from main.kai under issue #677 Phase 1h (sub-lane H1a) to
-# break an import cycle: the refinement-discharge module (refinements.kai,
-# extracted in H1) needs these helpers, but it cannot import main.kai
-# (kaikai forbids module import cycles — see compiler/ast.kai for the
-# same constraint). Pulling the shared helpers down into a leaf module
-# both modules can import resolves it.
+# compiler phases. A leaf module, so any phase can import it without a
+# cycle.
 #
 # Public surface
 #
 # - cat2 / cat3 / cat4 / cat5 / concat_all — the "small string helpers"
 #   family; thin wrappers over string_concat / string_concat_all that
 #   keep call sites terse.
-# - append_char — append a single Char to a String accumulator.
+# - append_char / byte_str — a byte-valued Char as a String.
 # - char_at_or_zero — total char_at: returns a sentinel instead of
 #   Option, for hot scan loops that have already bounds-checked.
 # - list_has — membership test on a [String].
@@ -21,18 +15,13 @@
 # - string_lt / string_lt_loop — lexicographic less-than for ASCII
 #   strings (the lexer guarantees plain identifiers, so it is a
 #   complete order over the symbols it compares).
-# - escape_str_body_for_c / esc_body_loop — escape a string body for
-#   embedding in emitted C (newline / tab / CR / quote).
+# - escape_str_body_for_c — escape a string body for embedding in
+#   emitted C (newline / tab / CR / quote).
 #
 # Cross-module dependencies
 #
 # - stdlib core only — string_concat, string_concat_all, char_at,
 #   char_to_int, string_length. No AST, no diag, no lex.
-#
-# Single-line `#[doc(...)]` only — kaic1 still consumes the
-# concatenated bundle and does not accept triple-quoted strings
-# inside attributes (#677 Phase 2 retires that constraint once
-# separate compilation lands).
 
 # ---- small string helpers ----
 
@@ -85,7 +74,10 @@ fn sb_to_list(parts: Array[String], i: Int, acc: [String]) : [String] {
 pub fn sb_build(b: SB) : String = string_concat_all(sb_to_list(b.parts, b.len - 1, []))
 
 #[doc("Append a single byte-valued Char (0..255, from byte-indexed char_at) to a String accumulator, byte-exact.")]
-pub fn append_char(acc: String, c: Char) : String = cat2(acc, int_to_byte_string(char_to_int(c)))
+pub fn append_char(acc: String, c: Char) : String = cat2(acc, byte_str(c))
+
+#[doc("A byte-valued Char (0..255, from byte-indexed char_at) as a one-byte String.")]
+pub fn byte_str(c: Char) : String = int_to_byte_string(char_to_int(c))
 
 #[doc("Total char_at: return the char at index i, or the sentinel 'x' when out of bounds.")]
 pub fn char_at_or_zero(span: String, i: Int) : Char {
@@ -171,10 +163,11 @@ pub fn string_lt_loop(a: String, b: String, i: Int) : Bool {
 
 #[doc("Escape a string body for embedding in emitted C: newline, CR, tab, and double-quote.")]
 pub fn escape_str_body_for_c(body: String) : String =
-  esc_body_loop(body, string_length(body), 0, "")
+  concat_all(list_reverse(esc_body_loop(body, string_length(body), 0, [])))
 
-#[doc("Tail-recursive worker for escape_str_body_for_c, scanning from index i.")]
-pub fn esc_body_loop(body: String, n: Int, i: Int, acc: String) : String {
+# Pieces are gathered newest-first and joined once: appending to one
+# growing String copies it per char.
+fn esc_body_loop(body: String, n: Int, i: Int, acc: [String]) : [String] {
   if i >= n { acc }
   else {
     match char_at(body, i) {
@@ -182,15 +175,15 @@ pub fn esc_body_loop(body: String, n: Int, i: Int, acc: String) : String {
       Some(c) -> {
         if c == '\\' and i + 1 < n {
           match char_at(body, i + 1) {
-            None -> esc_body_loop(body, n, i + 1, append_char(acc, c))
-            Some(nx) -> esc_body_loop(body, n, i + 2, append_char(append_char(acc, c), nx))
+            None -> esc_body_loop(body, n, i + 1, [byte_str(c), ...acc])
+            Some(nx) -> esc_body_loop(body, n, i + 2, [byte_str(nx), byte_str(c), ...acc])
           }
         }
-        else if char_to_int(c) == 10 { esc_body_loop(body, n, i + 1, cat2(acc, "\\n")) }
-        else if char_to_int(c) == 13 { esc_body_loop(body, n, i + 1, cat2(acc, "\\r")) }
-        else if char_to_int(c) == 9  { esc_body_loop(body, n, i + 1, cat2(acc, "\\t")) }
-        else if c == '"'             { esc_body_loop(body, n, i + 1, cat2(acc, "\\\"")) }
-        else                         { esc_body_loop(body, n, i + 1, append_char(acc, c)) }
+        else if char_to_int(c) == 10 { esc_body_loop(body, n, i + 1, ["\\n", ...acc]) }
+        else if char_to_int(c) == 13 { esc_body_loop(body, n, i + 1, ["\\r", ...acc]) }
+        else if char_to_int(c) == 9  { esc_body_loop(body, n, i + 1, ["\\t", ...acc]) }
+        else if c == '"'             { esc_body_loop(body, n, i + 1, ["\\\"", ...acc]) }
+        else                         { esc_body_loop(body, n, i + 1, [byte_str(c), ...acc]) }
       }
     }
   }
@@ -207,12 +200,12 @@ pub fn esc_body_loop(body: String, n: Int, i: Int, acc: String) : String {
 
 #[doc("Re-encode already-decoded bytes as the body of a C string literal.")]
 pub fn c_encode_bytes(body: String) : String =
-  c_encode_loop(body, string_length(body), 0, "")
+  concat_all(list_reverse(c_encode_loop(body, string_length(body), 0, [])))
 
 fn c_encode_hex2(v: Int) : String =
   string_concat(json_hex_digit(v / 16), json_hex_digit(v % 16))
 
-fn c_encode_loop(body: String, n: Int, i: Int, acc: String) : String {
+fn c_encode_loop(body: String, n: Int, i: Int, acc: [String]) : [String] {
   if i >= n { acc }
   else {
     match char_at(body, i) {
@@ -232,7 +225,7 @@ fn c_encode_loop(body: String, n: Int, i: Int, acc: String) : String {
             else { esc }
           }
           else { int_to_byte_string(b) }
-        c_encode_loop(body, n, i + 1, string_concat(acc, piece))
+        c_encode_loop(body, n, i + 1, [piece, ...acc])
       }
     }
   }
