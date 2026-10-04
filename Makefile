@@ -1136,20 +1136,17 @@ test-native-diag-path: kaic2
 test-watch-survives-error: kaic2
 	@./tests/watch_survives_error.sh
 
-# Issue #487 — `--diags-json` regression. Each fixture under
-# examples/library_mode/diags_*.kai compiles a deliberately-broken
-# source; the collected [Diagnostic] is serialised to JSON and diffed
-# against the .diags.expected golden. The fixtures pin the m11 v1 +
-# v1.x template wording (T1, T2, T3, T4, T5) so an unintended
-# refactor that changes the user-facing message fails this gate
-# before LSP-side consumers (#447) drift.
+# `--diags-json` goldens. Each examples/library_mode/diags_*.kai is a
+# deliberately broken source whose JSON document is diffed against its
+# .diags.expected, pinning the shape and wording LSP consumers read.
 test-diagnostics-collected: kaic2
 	@set -e; \
 	root=$$(pwd); \
 	cd "$$root"; \
 	for fx in diags_t1_type_mismatch diags_t2_non_exhaustive \
 	          diags_t3_unbound_name diags_t4_wrong_arity \
-	          diags_t5_missing_effect diags_multiple_errors; do \
+	          diags_t5_missing_effect diags_multiple_errors \
+	          diags_mono_bound; do \
 	  src="examples/library_mode/$$fx.kai"; \
 	  exp="examples/library_mode/$$fx.diags.expected"; \
 	  out=$$(mktemp); \
