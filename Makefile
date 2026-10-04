@@ -718,8 +718,10 @@ test-release-platforms:
 # KAIC_BOOT resolution and the stage2.c identity record (pure shell, no
 # compiler, no network: stub boots and a file:// release). The boot must run
 # only when make builds: a recipe line naming $$(MAKE) runs even under -n/-q.
+# The link of a boot's C rides along: its object cache, with the real cc.
 test-kaic-boot:
 	@tools/test-kaic-boot.sh
+	@tools/test-kaic-link.sh
 	@out=$$($(MAKE) -n -C stage2 kaic2 KAIC_BOOT=/nonexistent/kaic2 2>&1); \
 	case "$$out" in *"kaic-boot: "*) echo "test-kaic-boot: FAIL: make -n ran the boot:"; echo "$$out"; exit 1 ;; esac; \
 	echo "test-kaic-boot: ok — make -n prints the boot, never runs it"

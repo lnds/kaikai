@@ -224,9 +224,11 @@ build/stage2.c: $(PKG_SRCS) $(if $(filter kaic1,$(KAIC_BOOT)),$(KAIC1)) | build
 
 # A boot's C linked C-only, run by $(BOOT_SH): the seed against the runtime.h
 # it was frozen with (HOP_INC), the first hop of a kaic2-class boot against
-# this tree's.
+# this tree's. $(LINK_SH) takes one translation unit or a c-modular stream
+# (KAIC_BOOT_MODULAR=1), read from the file itself.
+LINK_SH := ../tools/kaic-link.sh
 boot-hop:
-	$(CC) $(CFLAGS) $(if $(HOP_INC),-I $(HOP_INC),$(CPPFLAGS_CORE) -I ../stage0) $(KAI_MAIN_STACK) $(HOP_C) -o $(HOP_BIN) $(LDLIBS_M)
+	CC='$(CC)' LDLIBS='$(LDLIBS_M)' $(LINK_SH) $(HOP_C) $(HOP_BIN) $(CFLAGS) $(if $(HOP_INC),-I $(HOP_INC),$(CPPFLAGS_CORE) -I ../stage0) $(KAI_MAIN_STACK)
 
 # Announce which backend capability got compiled in, so a dev never has
 # to guess why `kai build` behaves differently across two checkouts (the
@@ -237,7 +239,7 @@ ifeq ($(KAI_LLVM),1)
 else
 	@echo "building stage2: C-only$(if $(KAI_LLVM_AUTO), (no $(LLVM_CONFIG) in PATH; run make KAI_LLVM=1 for native),)"
 endif
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M) $(LLVM_LDFLAGS)
+	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0
 	@if [ -f $(STAGE2_ID) ]; then $(BOOT_SH) seal $< $@; else rm -f build/$@.id; fi
 ifeq ($(KAI_LLVM),1)
 	@# Linking libLLVM does not prove native works: a kaic2 compiled by kaic2
@@ -267,7 +269,7 @@ endif
 # is for the edit-check loop only, never for CI or the selfhost oracle.
 CFLAGS_DEV := $(filter-out -O2 -O1,$(CFLAGS)) -O0
 kaic2-dev: build/stage2.c $(RUNTIME_H)
-	$(CC) $(CFLAGS_DEV) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0 $< -o $@ $(LDLIBS_M) $(LLVM_LDFLAGS)
+	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS_DEV) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0
 	@echo "kaic2-dev OK (-O0; edit-loop binary, not for CI/selfhost)"
 
 # --- Dev fast rebuild: modular self-compile ---------------------------
@@ -345,7 +347,7 @@ kaic-boot-verify-one: | build
 	case "$(BOOT)" in release|seed) ;; *) echo "kaic-boot-verify-one: BOOT must be release or seed"; exit 2 ;; esac; \
 	d=$(BOOT_VERIFY)/$(BOOT); \
 	KAIC_BOOT=$(BOOT) $(BOOT_SH) fresh $$d/stage2.c \
-	  || KAIC_BOOT=$(BOOT) $(BOOT_SH) emit $$d/stage2.c; \
+	  || KAIC_BOOT=$(BOOT) KAIC_BOOT_MODULAR= $(BOOT_SH) emit $$d/stage2.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(KAI_MAIN_STACK) -I ../stage0 $$d/stage2.c -o $$d/kaic2 $(LDLIBS_M); \
 	./$$d/kaic2 $(EDITION_FLAG) $(SRC) > $$d/self.c; \
 	./$$d/kaic2 $(EDITION_FLAG) ../examples/portfolio/portfolio.kai > $$d/sample.c; \

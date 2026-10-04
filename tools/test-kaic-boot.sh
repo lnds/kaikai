@@ -10,6 +10,7 @@
 # kaic2-a linked from the boot's own C.
 
 set -eu
+unset KAIC_BOOT_MODULAR
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOOT_SH="$SCRIPT_DIR/kaic-boot.sh"
@@ -48,7 +49,7 @@ make_kaic2() {
   cat > "$1" <<EOF
 #!/bin/sh
 [ "\$1" = --version ] && { echo "kaic2 stage 2 (self-hosted)"; exit 0; }
-echo "/* $2 stdlib=\$KAIKAI_STDLIB_PATH args=\$* */"; cat "\$3"
+echo "/* $2 stdlib=\$KAIKAI_STDLIB_PATH args=\$* */"; for src; do :; done; cat "\$src"
 EOF
   chmod +x "$1"
 }
@@ -148,6 +149,18 @@ is_fresh release "release record"; is_fresh "" "release record, unset"; is_stale
 boot "" emit "$out" 2>/dev/null
 case "$(boot_of)" in "release "*) ;; *) fail "unset mode booted [$(boot_of)]" ;; esac
 ok "release boot (the default) fetched, verified, run against this tree's stdlib; its kaic2-a emits stage2.c"
+
+(KAIC_BOOT_MODULAR=1; export KAIC_BOOT_MODULAR; boot release emit "$out" 2>/dev/null) || fail "modular release emit failed"
+[ "$(head -n 1 "$hop_a")" = "/* release stdlib=$root/stdlib args=--emit=c-modular --edition hanga-roa main.kai */" ] \
+  || fail "KAIC_BOOT_MODULAR=1 did not ask the boot for c-modular: $(head -n 1 "$hop_a")"
+[ "$(head -n 1 "$out")" = "/* hop-a stdlib=$root/stdlib args=--emit=c-modular --edition hanga-roa main.kai */" ] \
+  || fail "KAIC_BOOT_MODULAR=1 did not ask kaic2-a for c-modular: $(head -n 1 "$out")"
+grep -q '^hops=2$' "$out.id" || fail "a modular emit does not record two hops"
+is_fresh release "modular C, knob unset"
+boot release emit "$out" 2>/dev/null
+[ "$(head -n 1 "$out")" = "/* hop-a stdlib=$root/stdlib args=--edition hanga-roa main.kai */" ] \
+  || fail "an emit without the knob still asked for c-modular: $(head -n 1 "$out")"
+ok "KAIC_BOOT_MODULAR=1 asks both hops for c-modular; the knob shapes an emit, never freshness"
 
 cp "$out.id" "$work/rec"
 sed '/^hops=/d' "$work/rec" > "$out.id"
