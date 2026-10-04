@@ -226,6 +226,66 @@ into this gate. New fixtures that fail on one backend but not the
 other should not merge until the divergence is resolved or
 explicitly skipped with a tracking issue.
 
+## Generated-program differential test
+
+The parity corpus above only holds the combinations somebody wrote.
+`tools/progen` (a kaikai program) generates the ones nobody did: from a
+seed it prints one well-typed, terminating, deterministic program, and
+`tools/progen-diff.sh` builds each on both backends and compares stdout
+and exit code. No expected output is involved — C is the reference, so
+any divergence is a bug whatever the right answer is.
+
+**What a generated program contains.** `Int`, `Bool` and `[Int]`
+expressions; one record type and one sum type with nested payloads;
+`let` and block bodies; `if`; `match` over the sum, lists and `Int`
+with nested patterns, ranges and guards; lambdas and closures over
+locals; the four pipes with lambdas, closures and bare function names
+as stages; top-level functions that call earlier ones, recurse down a
+list, or use a clause-block body; functions named after core builtins;
+and locals, parameters and lambda parameters that shadow globals,
+record fields and each other. It contains no effects beyond `Stdout`,
+no fibers, no I/O. Every program prints the values it computes and a
+checksum over all of them.
+
+Programs are well-typed by construction (the generator builds each
+expression for a requested type in a tracked scope — nothing is
+generated and filtered), terminate (a function calls only functions
+declared before it, or recurses down a list), and cannot trap (divisors
+are non-zero literals; products, function results and list lengths are
+reduced, so no value nears the `Int` range). A program that fails to
+compile on both backends is therefore a finding too: either the
+front-end or the generator is wrong.
+
+**Running it.**
+
+```sh
+tools/progen-diff.sh <first-seed> <count>     # needs a KAI_LLVM=1 kaic2
+stage2/build/progen-diff/progen <seed>        # print one program
+```
+
+Each seed is classified `agree`, `output-differs`, `exit-differs`,
+`crash`, `timeout`, `c-rejects`, `native-rejects`, `both-reject`, or
+`bad-program`. Anything but `agree` keeps its program, build logs and
+outputs under `stage2/build/progen-diff/findings/<seed>/` and prints a
+one-line reproduction command.
+
+**Known bugs.** `tools/progen-diff-skips.txt` lists them as
+`<class>:<issue>:<regex>`, the regex matched against the finding's
+evidence. A matching finding is reported as known and does not fail the
+run. On a new finding: reduce the program by hand, open one issue per
+distinct bug, and add its signature. The entry is deleted by the PR
+that closes the issue.
+
+**Cadence.** The `progen-diff` workflow runs nightly and on dispatch,
+never on a pull request. Its seed base is the UTC date, so every night
+covers new programs; a night with a new finding uploads the programs
+and opens that night's issue (label `progen-diff`). On every PR the
+light target `test-progen-smoke` keeps the generator from rotting as
+the language changes: it must build, regenerate a pinned program byte
+for byte (`tools/progen-seed.expected`; refresh with
+`tools/progen-smoke.sh --update`), and its programs must build and run
+on the C backend.
+
 ## A clean exit is not a pass (RC verification)
 
 Three signals that look like evidence and are not, each of which

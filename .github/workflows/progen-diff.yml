@@ -1,0 +1,134 @@
+name: progen-diff
+
+# Differential test over randomly generated programs, native against C.
+#
+# tools/progen emits a well-typed, terminating program per seed;
+# tools/progen-diff.sh builds each on both backends and compares stdout
+# and exit code. The hand-written parity corpus only holds combinations
+# somebody thought to write; this covers the ones nobody did, and needs no
+# expected output, because C is the reference.
+#
+# Cron and manual dispatch only, never a pull request: thousands of builds
+# do not fit the PR runner pool, and a finding here is a bug already on
+# main, not something the PR under test introduced. The per-PR guard that
+# the generator still works is the light target `test-progen-smoke`.
+#
+# The seed base is the UTC date, so each night covers programs no earlier
+# night did, and a night's findings reproduce from its date. A run that
+# finds a divergence not listed in tools/progen-diff-skips.txt uploads the
+# programs and opens (or comments on) that night's issue.
+on:
+  # Clear of daily (02:00), rc-detector (02:30), rc-native-census (03:30)
+  # and tier1-mn-corpus (04:00).
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+    inputs:
+      first:
+        description: "First seed (default: the UTC date as YYYYMMDD0000)"
+        type: string
+        default: ''
+      count:
+        description: Seeds to run, time budget permitting
+        type: string
+        default: '3000'
+
+concurrency:
+  group: progen-diff-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+# The boot of stage2.c (docs/build-system.md §KAIC_BOOT).
+env:
+  KAIC_BOOT: release
+
+jobs:
+  progen-diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Install toolchain (clang + libLLVM)"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm-dev
+          LLVM_CONFIG="$(command -v llvm-config || ls /usr/bin/llvm-config-* 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$LLVM_CONFIG" ]; then
+            echo "::error::no llvm-config found after installing llvm-dev"; exit 1
+          fi
+          echo "LLVM_CONFIG=$LLVM_CONFIG" >> "$GITHUB_ENV"
+          echo "using $LLVM_CONFIG ($($LLVM_CONFIG --version))"
+
+      - name: "Build kaic2 (KAI_LLVM=1) and bin/kai"
+        run: |
+          make -C stage2 CC=clang LLVM_CONFIG="$LLVM_CONFIG" KAI_LLVM=1 kaic2
+          make -s -C tools/kai kai
+
+      # The runner stops starting seeds once its budget is spent, so the
+      # outer deadline only fires on a wedge. Exit 1 means new findings;
+      # anything else non-zero is the run itself failing.
+      - name: "Run the differential test"
+        id: diff
+        env:
+          FIRST: ${{ inputs.first }}
+          COUNT: ${{ inputs.count }}
+          PROGEN_BUDGET: 2700
+        run: |
+          first="${FIRST:-$(( $(date -u +%Y%m%d) * 10000 ))}"
+          echo "first=$first" >> "$GITHUB_OUTPUT"
+          rc=0
+          ./tools/ci-bounded-step.sh 3600 "progen-diff" \
+            ./tools/progen-diff.sh "$first" "${COUNT:-3000}" > progen-diff-report.txt 2>&1 || rc=$?
+          cat progen-diff-report.txt
+          if grep -q '^NEW ' progen-diff-report.txt; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$rc"
+
+      - name: "Upload the divergent programs"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: progen-diff-findings
+          path: |
+            progen-diff-report.txt
+            stage2/build/progen-diff/results
+            stage2/build/progen-diff/findings/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: "Open or update the night's issue"
+        if: always() && steps.diff.outputs.found == 'true' && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FIRST: ${{ steps.diff.outputs.first }}
+        run: |
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          today=$(date -u +%Y-%m-%d)
+          title="progen-diff: generated programs diverge on $today"
+          # `--label` only attaches a label that already exists.
+          gh label create progen-diff \
+            --color 5319E7 --description "Nightly generated-program differential finding" 2>/dev/null || true
+          {
+            echo "The nightly differential run over generated programs found divergences between the C and native backends that \`tools/progen-diff-skips.txt\` does not list (commit \`${{ github.sha }}\`, first seed \`$FIRST\`)."
+            echo
+            echo '```'
+            grep -E "^(progen-diff:|NEW |  )" progen-diff-report.txt | head -60
+            echo '```'
+            echo
+            echo "Run: ${run_url} (the programs, build logs and outputs are in the \`progen-diff-findings\` artifact)."
+            echo
+            echo "Each \`NEW\` line carries its reproduction command. For each distinct bug: reduce the program, open an issue, and add its signature to \`tools/progen-diff-skips.txt\`. Close this issue once every finding has one."
+          } > issue-body.md
+          # One issue per night, keyed by its title: a re-run comments on it.
+          open=$(gh issue list --label progen-diff --state open --limit 100 --json number,title \
+            --jq "[.[] | select(.title == \"$title\")][0].number // empty") || open=
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body-file issue-body.md
+          else
+            gh issue create --title "$title" --label progen-diff --body-file issue-body.md
+          fi

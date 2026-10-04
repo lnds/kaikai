@@ -11,6 +11,7 @@ Practical map of the build. Read this before running the compiler or touching a 
 | Full bootstrap from scratch | `make all KAIC_BOOT=seed` (`cc` → seed → `kaic2` → `bin/kai`; also builds the frozen `kaic0` → `kaic1`) |
 | Verify a change | `make tier0` (fast) · `make tier1` (full, CI gate) |
 | One backend-parity fixture | `tools/test-backend-parity.sh` (env-driven; see §parity) |
+| Diff the backends over generated programs | `tools/progen-diff.sh <first-seed> <count>` (see `docs/testing-tiers.md` §Generated-program differential test) |
 
 **Do NOT** call `kaic2` raw, pass `--path ../stdlib` by hand, or reconstruct a `cc … -I ../stage0` line from Makefile recipes. `bin/kai` does all of that. **Do NOT** compile `stage2/main.kai` as "the compiler" — it is a 33-line stub (see §package).
 
