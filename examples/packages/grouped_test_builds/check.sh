@@ -4,8 +4,9 @@
 # first, so one that does not build on its own fails as it does alone; a
 # file's run is the blocks its own build would run, in that build's order; a
 # failure that only the shared build hits fails the run before any test runs.
-# Also: a block's unused binding is reported in the file that declares it, and
-# a module that does not parse fails the build even when nothing uses it.
+# Also: a block's unused binding is reported in the file that declares it,
+# a module that does not parse fails the build even when nothing uses it, and
+# a block reaches its own file's functions whatever else the build holds.
 
 set -eu
 
@@ -84,5 +85,21 @@ printf 'import lib.bad\n\nfn main() {\n  print("ran")\n}\n' > "$TMP/broken/main.
 rc=0; (cd "$TMP/broken" && "$KAI" run main.kai > "$TMP/out" 2>&1) || rc=$?
 [ "$rc" -ne 0 ] || fail "a module that does not parse built"
 if grep -q "^ran$" "$TMP/out"; then fail "the program ran despite the parse error"; fi
+
+# 6 — a file's own function is the one its blocks call, though a protocol op
+# has the same name.
+mk_pkg shadow
+printf 'fn one() : Int = 41\n\ntest "own one" {\n  assert one() + 1 == 42\n}\n' > "$TMP/shadow/tests/a_test.kai"
+printf 'test "b" {\n  assert 1 + 1 == 2\n}\n' > "$TMP/shadow/tests/b_test.kai"
+run shadow
+[ "$(cat "$TMP/rc")" -eq 0 ] || { cat "$TMP/err"; fail "a block called the protocol op instead of its file's function"; }
+
+# 7 — a file that opens with a block reaches its own function, not the one of
+# the same name in the file loaded before it.
+mk_pkg first
+printf 'fn helper() : Int = 1\n\ntest "a" {\n  assert helper() == 1\n}\n' > "$TMP/first/tests/a_test.kai"
+printf 'test "b" {\n  assert helper() == 2\n}\n\nfn helper() : Int = 2\n' > "$TMP/first/tests/b_test.kai"
+run first
+[ "$(cat "$TMP/rc")" -eq 0 ] || { cat "$TMP/err"; fail "a block reached the function of the file loaded before its own"; }
 
 echo "grouped_test_builds: OK"
