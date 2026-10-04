@@ -1,0 +1,100 @@
+# compiler/range_patterns.kai — `lo..hi` interval patterns, at any depth,
+# lowered to binders plus range checks conjoined into the arm guard.
+
+import compiler.util
+import compiler.ast
+import compiler.desugar
+
+# Rewrite `lo..hi` interval patterns, at any depth, into a binder plus a
+# comparison conjoined into the arm guard — the shape a `case n when n >= lo
+# and n <= hi` arm produces, so both backends lower it as an ordinary guard.
+# The range checks run before the user's guard, which may rely on them. The
+# bounds are literals (the parser rejects anything else).
+#[doc("Rewrite `lo..hi` match patterns, at any depth, into binders plus `>= lo and <= hi` guard checks.")]
+pub fn desugar_range_patterns_decls(decls: [Decl]) : [Decl] =
+  map(decls, (d) => drp_decl(d))
+
+fn drp_decl(d: Decl) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, mo, fsym) ->
+    DFn(p, n, tps, ps, ret, row, drp_expr(body), l, c, mo, fsym)
+  DTest(desc, body, l, c, mo) -> DTest(desc, drp_expr(body), l, c, mo)
+  DBench(desc, body, l, c, mo) -> DBench(desc, drp_expr(body), l, c, mo)
+  DConst(p, n, ty, body, mo, l, c, csym) -> DConst(p, n, ty, drp_expr(body), mo, l, c, csym)
+  DUnstable(inner, l, c) -> DUnstable(drp_decl(inner), l, c)
+  DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, drp_decl(inner), l, c, mo)
+  DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, drp_decl(inner), l, c, mo)
+  DConstructor(inner, l, c) -> DConstructor(drp_decl(inner), l, c)
+  _ -> d
+}
+
+fn drp_expr(e: Expr) : Expr {
+  match e.kind {
+    EMatch(scr, arms) ->
+      mk_expr(EMatch(drp_expr(scr), map(arms, (a) => drp_arm(a))), e.line, e.col)
+    _ -> mk_expr(dsg_map_expr_kind(e.kind, (sub) => drp_expr(sub)), e.line, e.col)
+  }
+}
+
+fn drp_arm(a: Arm) : Arm = match a {
+  Arm(pat, guard, body) -> {
+    let guard1 = match guard { Some(g) -> Some(drp_expr(g)) None -> None }
+    match drp_pat(pat, []) {
+      DrpPat(p1, checks) -> Arm(p1, drp_guard(list_reverse(checks), guard1), drp_expr(body))
+    }
+  }
+}
+
+# A pattern with its ranges replaced by binders, and the checks they owe
+# (reversed source order).
+type DrpPat = DrpPat(Pattern, [Expr])
+
+fn drp_pat(p: Pattern, acc: [Expr]) : DrpPat = match p.pkind {
+  PRange(lo, hi) -> {
+    let nm = concat_all(["__range_", int_to_string(p.line), "_", int_to_string(p.col), "__"])
+    let v = mk_ref(nm, p.line, p.col)
+    let ge = mk_expr(EBinop(">=", v, lo), p.line, p.col)
+    let le = mk_expr(EBinop("<=", v, hi), p.line, p.col)
+    DrpPat(mk_pat(PBind(nm), p.line, p.col), [mk_expr(EBinop("and", ge, le), p.line, p.col), ...acc])
+  }
+  PVariant(hm, cn, subs) -> match drp_pats(subs, [], acc) {
+    DrpPats(subs1, acc1) -> DrpPat(mk_pat(PVariant(hm, cn, subs1), p.line, p.col), acc1)
+  }
+  PVariantRecord(hm, cn, fs) -> match drp_fields(fs, [], acc) {
+    DrpFields(fs1, acc1) -> DrpPat(mk_pat(PVariantRecord(hm, cn, fs1), p.line, p.col), acc1)
+  }
+  PRecord(fs) -> match drp_fields(fs, [], acc) {
+    DrpFields(fs1, acc1) -> DrpPat(mk_pat(PRecord(fs1), p.line, p.col), acc1)
+  }
+  PList(ps, rest) -> match drp_pats(ps, [], acc) {
+    DrpPats(ps1, acc1) -> DrpPat(mk_pat(PList(ps1, rest), p.line, p.col), acc1)
+  }
+  PAs(name, sub) -> match drp_pat(sub, acc) {
+    DrpPat(sub1, acc1) -> DrpPat(mk_pat(PAs(name, sub1), p.line, p.col), acc1)
+  }
+  _ -> DrpPat(p, acc)
+}
+
+type DrpPats = DrpPats([Pattern], [Expr])
+
+fn drp_pats(ps: [Pattern], out: [Pattern], acc: [Expr]) : DrpPats = match ps {
+  [] -> DrpPats(list_reverse(out), acc)
+  [q, ...rest] -> match drp_pat(q, acc) { DrpPat(q1, acc1) -> drp_pats(rest, [q1, ...out], acc1) }
+}
+
+type DrpFields = DrpFields([PField], [Expr])
+
+fn drp_fields(fs: [PField], out: [PField], acc: [Expr]) : DrpFields = match fs {
+  [] -> DrpFields(list_reverse(out), acc)
+  [PField(n, sub, sh), ...rest] -> match drp_pat(sub, acc) {
+    DrpPat(sub1, acc1) -> drp_fields(rest, [PField(n, sub1, sh), ...out], acc1)
+  }
+}
+
+# The range checks, conjoined in source order ahead of the user's guard.
+fn drp_guard(checks: [Expr], guard: Option[Expr]) : Option[Expr] = match checks {
+  [] -> guard
+  [c, ...rest] -> match drp_guard(rest, guard) {
+    None -> Some(c)
+    Some(g) -> Some(mk_expr(EBinop("and", c, g), c.line, c.col))
+  }
+}

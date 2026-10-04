@@ -100,7 +100,9 @@ fn main() : Unit / Stdout = {
 `lo..hi` matches when the scrutinee falls in the inclusive interval.
 Both bounds are Int or Char literals — no expressions, no step. A range
 arm is exactly a `when lo <= x <= hi` guard, so a catch-all is still
-required (an interval never covers all of `Int`).
+required (an interval never covers all of `Int`). A range may sit at any
+depth of a pattern (`Some(1..9)`, `(0..1, y)`, `{ x: 0..2, y }`); its
+check runs before the arm's own guard.
 
 ```kaikai
 fn classify(n: Int) : String = match n {
