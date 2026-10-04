@@ -4419,6 +4419,7 @@ static void kai_mailbox_close(KaiMailbox *mb) {
     }
     kai_mbox_lock(mb);
     mb->closed = 1;
+    mb->owner_fiber = NULL;
     KaiMboxNode *node = mb->head;
     mb->head = mb->tail = NULL;
     mb->len = 0;
@@ -18107,8 +18108,19 @@ static int kai_monitor_remove(KaiFiber *target, KaiFiber *observer, KaiValue *ta
  * Monitor with Link+trap_exit, which delivers the
  * "Normal"/"Crashed" string into the same mailbox. */
 static void kai_monitor_propagate_terminate(KaiFiber *self) {
+    /* Unowning the mailbox and detaching the chain under its lock orders
+     * this against kai_monitor_watch: a watcher either lands on the chain
+     * walked here or finds no owner and delivers itself. Unowning also
+     * keeps owner_fiber from dangling once this fiber is freed. */
+    KaiMailbox *own = self->mailbox && self->mailbox->owner_fiber == self
+        ? self->mailbox : NULL;
+    if (own) {
+        kai_mbox_lock(own);
+        own->owner_fiber = NULL;
+    }
     KaiMonitorNode *mn = self->monitor_head;
     self->monitor_head = NULL;
+    if (own) kai_mbox_unlock(own);
     while (mn) {
         KaiMonitorNode *next = mn->next;
         KaiFiber *observer = mn->observer;
@@ -18127,11 +18139,30 @@ static void kai_monitor_propagate_terminate(KaiFiber *self) {
     }
 }
 
+/* Watch `target_pid` from the current fiber. A target that has already
+ * ended (mailbox closed, or owner terminated) is reported at once, as if
+ * it had died right after the call. */
+static void kai_monitor_watch(KaiValue *target_pid) {
+    KaiFiber   *observer = kai_current_fiber();
+    KaiMailbox *mb       = kai_mailbox_pin(target_pid);
+    int         watching = 0;
+    if (mb) {
+        kai_mbox_lock(mb);
+        if (mb->owner_fiber) {
+            kai_monitor_add(mb->owner_fiber, observer, target_pid);
+            watching = 1;
+        }
+        kai_mbox_unlock(mb);
+        kai_mailbox_unpin(mb);
+    }
+    if (!watching && observer->mailbox) {
+        kai_deliver_to_mailbox(observer->mailbox, kai_incref(target_pid));
+    }
+}
+
 static KaiValue *kai_default_monitor_monitor(void *self, KaiValue *target, KaiCont *k) {
     (void) self;
-    if (target && target->tag == KAI_PID && target->as.mb && target->as.mb->owner_fiber) {
-        kai_monitor_add(target->as.mb->owner_fiber, kai_current_fiber(), target);
-    }
+    if (target && target->tag == KAI_PID) kai_monitor_watch(target);
     /* v1 simplification — return the same Pid as the ref. The
      * spec's `MonitorRef` is opaque; identifying the monitored
      * fiber by its own pid is sufficient for demonitor and for the
@@ -18144,8 +18175,12 @@ static KaiValue *kai_default_monitor_monitor(void *self, KaiValue *target, KaiCo
 
 static KaiValue *kai_default_monitor_demonitor(void *self, KaiValue *ref, KaiCont *k) {
     (void) self;
-    if (ref && ref->tag == KAI_PID && ref->as.mb && ref->as.mb->owner_fiber) {
-        kai_monitor_remove(ref->as.mb->owner_fiber, kai_current_fiber(), ref);
+    KaiMailbox *mb = (ref && ref->tag == KAI_PID) ? kai_mailbox_pin(ref) : NULL;
+    if (mb) {
+        kai_mbox_lock(mb);
+        if (mb->owner_fiber) kai_monitor_remove(mb->owner_fiber, kai_current_fiber(), ref);
+        kai_mbox_unlock(mb);
+        kai_mailbox_unpin(mb);
     }
     return kai_cont_resume(k, kai_unit());
 }

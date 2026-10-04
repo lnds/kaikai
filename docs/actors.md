@@ -370,7 +370,9 @@ effect Monitor {
 `monitor(pid)` registers the current actor as an observer of
 `pid`. When `pid` terminates (normal return, crash, or
 cancellation), the observer receives a `MonitorDown` message
-**on its own mailbox**:
+**on its own mailbox**. A `pid` that has already terminated when
+`monitor` runs is reported at once, as on the BEAM, so a monitor
+never waits on a target that is already gone:
 
 ```kai
 type MonitorDown = MonitorDown(ref: MonitorRef, cause: TerminationCause)
