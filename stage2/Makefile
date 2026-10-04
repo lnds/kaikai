@@ -11176,7 +11176,9 @@ endif
 # Differential pattern-match gate: one generated program per pattern class
 # (tools/pattern-shape-gen.py), compared against the generator's own
 # expected table. The per-class pins in tools/pattern-shape-baseline.txt
-# only go down.
+# only go down. Each program also holds matches complete without a
+# catch-all; the C run additionally typechecks matches built around a value
+# no arm covers, and every one of them must be rejected.
 define pattern_shapes_run
 	@mkdir -p build/pattern-shapes-$(1)
 	@python3 ../tools/pattern-shape-gen.py gate ../bin/kai $(1) \

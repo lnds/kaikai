@@ -13,6 +13,12 @@ class loses only that class's combinations. The gate pins, per class and
 backend, how many combinations diverge from the expected table; a count
 may only go down, and a lower count must lower its pin.
 
+The exhaustiveness checker is tested the same way. Each class program
+also carries matches complete without a catch-all, built to cover their
+type's constructors, which must compile and run. A separate program holds
+matches built around a value no arm covers, which the typechecker must
+reject one by one.
+
   pattern-shape-gen.py emit <dir>
   pattern-shape-gen.py gate <kai> <backend> <baseline> <workdir>
 """
@@ -22,6 +28,7 @@ import subprocess
 import sys
 
 SEED = 7
+COVERAGE_SEED = 11
 FUNCS_PER_TYPE = 3
 MAX_DEPTH = 3
 
@@ -553,6 +560,96 @@ def test_values(rng, t, arms):
     return vals
 
 
+# --- coverage cases ---------------------------------------------------
+
+
+def cover_pats(rng, t, depth=0):
+    """Patterns that together match every value of `t`."""
+    k = t[0]
+    if k == "Bool":
+        return [("lit", True), ("lit", False)]
+    if k in ("Int", "Real") or depth >= 2:
+        return [("wild",)]
+    if k in RECORDS:
+        fields = RECORDS[k]
+        i = rng.randrange(len(fields))
+        return [("rec", k, [(f, s if j == i else ("wild",)) for j, (f, _) in enumerate(fields)])
+                for s in cover_pats(rng, fields[i][1], depth + 1)]
+    if is_sum(t):
+        out = []
+        for name, args in ctors_of(t):
+            if args and rng.random() < 0.5:
+                i = rng.randrange(len(args))
+                out += [("ctor", name, [s if j == i else ("wild",) for j in range(len(args))])
+                        for s in cover_pats(rng, args[i], depth + 1)]
+            else:
+                out.append(("ctor", name, [("wild",)] * len(args)))
+        return out
+    if k == "Tup":
+        if rng.random() < 0.5:
+            return [("tup", s, ("wild",)) for s in cover_pats(rng, t[1], depth + 1)]
+        return [("tup", ("wild",), s) for s in cover_pats(rng, t[2], depth + 1)]
+    if k == "List":
+        return [("list", [], None)] + [("list", [s], "_") for s in cover_pats(rng, t[1], depth + 1)]
+    raise ValueError(t)
+
+
+def random_arms(rng, t, nested_ranges, n, keep):
+    """Up to `n` random arms (some guarded) that `keep` accepts, with the
+    typer's redundancy rule respected; returns (arms, unguarded heads)."""
+    arms, seen = [], set()
+    for _ in range(n):
+        names = Names(nested_ranges)
+        pat = structured_pat(rng, t, 0, names) if t[0] not in ("Int", "Bool", "Real") \
+            else leaf_pat(rng, t, names)
+        arm = Arm(t, pat, None, 1000 * (len(arms) + 1))
+        arm.guard = gen_guard(rng, arm.bs)
+        head = arm_head(pat)
+        if (arm.guard is None and head in seen) or "*" in seen or not keep(arm):
+            continue
+        arms.append(arm)
+        if arm.guard is None and head is not None:
+            seen.add(head)
+    return arms, seen
+
+
+def gen_complete(rng, fid, t, nested_ranges):
+    """A match with no catch-all whose unguarded arms still cover `t`."""
+    arms, seen = random_arms(rng, t, nested_ranges, rng.randint(0, 2), lambda a: True)
+    if "*" not in seen:
+        for pat in cover_pats(rng, t):
+            head = arm_head(pat)
+            if head is None or head not in seen:
+                arms.append(Arm(t, pat, None, 1000 * (len(arms) + 1)))
+                if head is not None:
+                    seen.add(head)
+    return Match(fid, t, arms, test_values(rng, t, arms))
+
+
+def gen_incomplete(rng, fid, t, nested_ranges):
+    """A match whose unguarded arms all miss one value: the typechecker
+    must reject it."""
+    v = rand_val(rng, t)
+    arms, _ = random_arms(rng, t, nested_ranges, rng.randint(2, 5),
+                          lambda a: a.guard is not None or not match_pat(t, a.pat, v, {}))
+    if not arms:
+        a = Arm(t, ("bind", "b0"), None, 1000)
+        a.guard = ("b0", t, 0)
+        arms = [a]
+    return Match(fid, t, arms, [v])
+
+
+def coverage_cases():
+    """Per class: matches complete without a catch-all, and incomplete ones."""
+    rng = random.Random(COVERAGE_SEED)
+    cases = {}
+    for name, types, nr in CLASSES:
+        complete = [gen_complete(rng, 0, t, nr) for t in types if t[0] not in ("Int", "Real")]
+        incomplete = [gen_incomplete(rng, 0, t, nr) for t in types for _ in range(2)]
+        cases[name] = (complete, incomplete)
+    return cases
+
+
 # Each class is one program: a backend that cannot build a class loses only
 # that class's combinations, and the ratchet pins each class separately.
 CLASSES = [
@@ -629,7 +726,70 @@ def class_matches(name, types, nested_ranges, rng):
 
 def generate():
     rng = random.Random(SEED)
-    return [(name, class_matches(name, types, nr, rng)) for name, types, nr in CLASSES]
+    cases = coverage_cases()
+    out = []
+    for name, types, nr in CLASSES:
+        matches = class_matches(name, types, nr, rng)
+        for m in cases[name][0]:
+            m.fid = len(matches)
+            matches.append(m)
+        out.append((name, matches))
+    return out
+
+
+def incomplete_program():
+    """One program of every class's incomplete matches, and the line each
+    match starts on."""
+    matches, starts, out = [], {}, [DECLS]
+    for name, (_, incomplete) in coverage_cases().items():
+        for m in incomplete:
+            m.fid = len(matches)
+            matches.append((name, m))
+    deps = []
+    for _, m in matches:
+        for a in m.arms:
+            for _, bt in a.bs:
+                obs_deps(bt, deps)
+    out += [obs_fn_body(t) for t in deps]
+    line = sum(chunk.count("\n") + 2 for chunk in out) + 1
+    for name, m in matches:
+        starts[line] = (name, m)
+        src = m.source()
+        out.append(src)
+        line += src.count("\n") + 2
+    out.append("fn main() : Unit / Stdout = Stdout.print(\"unreachable\")")
+    return "\n\n".join(out) + "\n", starts
+
+
+def reject_gate(kai, d):
+    """Every incomplete match must be rejected, naming its own line."""
+    src, starts = incomplete_program()
+    path = "%s/ps_incomplete.kai" % d
+    with open(path, "w") as f:
+        f.write(src)
+    res = subprocess.run([kai, "typecheck", path], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True)
+    rejected, at_header, other = set(), False, []
+    for ln in res.stdout.splitlines():
+        if ln.startswith("error: non-exhaustive match"):
+            at_header = True
+        elif ln.startswith("error"):
+            other.append(ln)
+        elif at_header and "-->" in ln:
+            rejected.add(int(ln.rsplit(":", 2)[-2]))
+            at_header = False
+    rc = 1 if other else 0
+    for ln in sorted(set(other))[:8]:
+        print("pattern-shape reject: unexpected %s" % ln)
+    for name in [c[0] for c in CLASSES]:
+        mine = [(ln, m) for ln, (n, m) in starts.items() if n == name]
+        missed = [(ln, m) for ln, m in mine if ln not in rejected]
+        verdict = "ok" if not missed else "ACCEPTED A NON-EXHAUSTIVE MATCH"
+        print("pattern-shape reject %-18s %4d/%-4d accepted  %s" % (name, len(missed), len(mine), verdict))
+        for ln, m in missed:
+            rc = 1
+            print("  line %d: no arm covers %s\n%s" % (ln, kai_val(m.t, m.values[0]), m.source()))
+    return rc
 
 
 def program(matches):
@@ -660,6 +820,8 @@ def labels(matches):
 
 
 def emit(d):
+    with open("%s/ps_incomplete.kai" % d, "w") as f:
+        f.write(incomplete_program()[0])
     for name, matches in generate():
         with open("%s/ps_%s.kai" % (d, name.replace("-", "_")), "w") as f:
             f.write(program(matches))
@@ -701,7 +863,7 @@ def read_baseline(path):
 
 def gate(kai, backend, baseline, d):
     pins = read_baseline(baseline)
-    rc = 0
+    rc = reject_gate(kai, d) if backend == "c" else 0
     for name, matches in generate():
         bad, total, detail = run_class(kai, backend, d, name, matches)
         pin = pins.get((name, backend), 0)
