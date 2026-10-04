@@ -67,6 +67,7 @@ import compiler.modules
 import compiler.module_table
 import compiler.qual_head
 import compiler.name_scope
+import compiler.infer_index
 import compiler.name_uses
 import compiler.type_scope_table
 import compiler.type_scope
@@ -1107,46 +1108,106 @@ fn report_unused_in_hclauses(file: String, cs: [HClause]) : Unit / Console + Fil
 #      that name out of `acc` for refs after the shadow point.
 #   3. Warn on any pat-binder absent from that ref set.
 fn report_unused_in_block(file: String, stmts: [Stmt], tail: Option[Expr]) : Unit / Console + File {
+  # The block's binders count as local, so a handler clause's read of a
+  # state alias one of them names is a read of that binder.
+  let scope = ns_shadow(ns_empty(), ru_binders(stmts, []))
+  let tail_reads = match tail {
+    Some(t) -> ru_mark(idx_empty(), fv_expr(t, [], scope, []), true)
+    None    -> idx_empty()
+  }
+  ru_walk(file, stmts, ru_live_after(list_reverse(stmts), scope, idx_empty(), []), tail_reads, tail)
+}
 
+fn ru_binders(stmts: [Stmt], acc: [String]) : [String] = match stmts {
+  [] -> acc
+  [SLet(pat, _, _), ...rest] -> ru_binders(rest, pat_bindings(pat, acc))
+  [SVar(name, _, _, _, _), ...rest] -> ru_binders(rest, [name, ...acc])
+  [_, ...rest] -> ru_binders(rest, acc)
+}
+
+# Whether a name is read after a statement: the newest entry for it wins,
+# so a later binding of the name hides the reads beyond it.
+type RuLive = RuRead(String, Bool)
+
+# The reads after each statement, in block order. Walking from the end,
+# the reads after a statement are its own reads plus those after the next
+# one that its binders do not hide, so the block is scanned once.
+fn ru_live_after(rev: [Stmt], scope: NameScope, live: NameIndex[RuLive],
+                 acc: [NameIndex[RuLive]]) : [NameIndex[RuLive]] / Console =
+  match rev {
+    [] -> acc
+    [s, ...earlier] -> ru_live_after(earlier, scope, ru_step(live, scope, s), [live, ...acc])
+  }
+
+fn ru_step(live: NameIndex[RuLive], scope: NameScope, s: Stmt) : NameIndex[RuLive] / Console = match s {
+  SLet(pat, _, rhs) -> ru_mark(ru_mark(live, pat_bindings(pat, []), false), fv_expr(rhs, [], scope, []), true)
+  SVar(name, _, rhs, _, _) -> ru_mark(ru_mark(live, [name], false), fv_expr(rhs, [], scope, []), true)
+  _ -> ru_mark(live, fv_stmt(s, [], scope, []), true)
+}
+
+fn ru_mark(live: NameIndex[RuLive], names: [String], read: Bool) : NameIndex[RuLive] = match names {
+  [] -> live
+  [n, ...rest] -> ru_mark(idx_prepend(live, n, RuRead(n, read)), rest, read)
+}
+
+# A bucket also holds the names that hash alike, so the entry is matched by name.
+fn ru_read(chain: [RuLive], nm: String) : Bool = match chain {
+  [] -> false
+  [RuRead(n, read), ...rest] -> if n == nm { read } else { ru_read(rest, nm) }
+}
+
+# The tail is checked without the block's later bindings in scope, so its
+# reads count for every binder of the block.
+fn ru_used(ubs: [UBind], live: NameIndex[RuLive], tail_reads: NameIndex[RuLive]) : [String] = match ubs {
+  [] -> []
+  [UB(nm, _, _), ...rest] ->
+    if ru_read(idx_chain(live, nm), nm) or ru_read(idx_chain(tail_reads, nm), nm) {
+      [nm, ...ru_used(rest, live, tail_reads)]
+    } else {
+      ru_used(rest, live, tail_reads)
+    }
+}
+
+fn ru_walk(file: String, stmts: [Stmt], lives: [NameIndex[RuLive]], tail_reads: NameIndex[RuLive],
+           tail: Option[Expr]) : Unit / Console + File =
   match stmts {
     [] -> match tail {
       Some(t) -> report_unused_in_expr(file, t)
       None    -> ()
     }
-    [s, ...rest] -> {
-      match s {
-        SLet(pat, _, rhs) -> {
-          report_unused_in_expr(file, rhs)
-          let ubs = pat_ubinds(pat, [])
-          let scope = ubind_scope(ubs)
-          let rest_refs = fv_stmts(rest, [], scope, [])
-          let refs = match tail {
-            Some(t) -> fv_expr(t, [], scope, rest_refs)
-            None    -> rest_refs
-          }
-          report_unused_ubinds(file, ubs, refs)
-        }
-        SVar(_, _, rhs, _, _) -> report_unused_in_expr(file, rhs)
-        SAssert(c, opt_m) -> {
-          report_unused_in_expr(file, c)
-          match opt_m { Some(m) -> report_unused_in_expr(file, m) None -> () }
-        }
-        SExprStmt(x) -> report_unused_in_expr(file, x)
-        SIndexAssign(b, i, v, _, _) -> {
-          report_unused_in_expr(file, b)
-          report_unused_in_expr(file, i)
-          report_unused_in_expr(file, v)
-        }
-        SAssign(b, v, _, _) -> {
-          report_unused_in_expr(file, b)
-          report_unused_in_expr(file, v)
-        }
-        SUse(_, _, _) -> ()
+    [s, ...rest] -> match lives {
+      [] -> ()
+      [live, ...more] -> {
+        ru_stmt(file, s, live, tail_reads)
+        ru_walk(file, rest, more, tail_reads, tail)
       }
-      report_unused_in_block(file, rest, tail)
     }
   }
-}
+
+fn ru_stmt(file: String, s: Stmt, live: NameIndex[RuLive], tail_reads: NameIndex[RuLive]) : Unit / Console + File =
+  match s {
+    SLet(pat, _, rhs) -> {
+      report_unused_in_expr(file, rhs)
+      let ubs = pat_ubinds(pat, [])
+      report_unused_ubinds(file, ubs, ru_used(ubs, live, tail_reads))
+    }
+    SVar(_, _, rhs, _, _) -> report_unused_in_expr(file, rhs)
+    SAssert(c, opt_m) -> {
+      report_unused_in_expr(file, c)
+      match opt_m { Some(m) -> report_unused_in_expr(file, m) None -> () }
+    }
+    SExprStmt(x) -> report_unused_in_expr(file, x)
+    SIndexAssign(b, i, v, _, _) -> {
+      report_unused_in_expr(file, b)
+      report_unused_in_expr(file, i)
+      report_unused_in_expr(file, v)
+    }
+    SAssign(b, v, _, _) -> {
+      report_unused_in_expr(file, b)
+      report_unused_in_expr(file, v)
+    }
+    SUse(_, _, _) -> ()
+  }
 
 fn list_head_or(xs: [String], fallback: String) : String = match xs {
   [] -> fallback
