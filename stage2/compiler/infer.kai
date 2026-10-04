@@ -14,6 +14,7 @@ import compiler.util
 import compiler.chars
 import compiler.diag
 import compiler.ast
+import compiler.exhaust
 import compiler.effect_default
 import compiler.type_text
 import compiler.sym_read
@@ -17091,7 +17092,93 @@ fn build_nonexhaustive_diag(file: String, line: Int, col: Int,
   mk_diag(SevError, file, line, col, header,
           build_nonexhaustive_related(file, line, col, missing, covered))
 
-fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState / Console + File {
+fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState / Console + File = {
+  let st1 = check_exhaustive_ctors(st, arms, scr_ty, line, col)
+  if st1.errs == st.errs { check_exhaustive_matrix(st1, arms, scr_ty, line, col) } else { st1 }
+}
+
+# Arms naming every constructor can still miss a value: a guard, a literal
+# or a nested pattern narrows what an arm covers.
+fn check_exhaustive_matrix(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState / Console + File =
+  match x_match_verdict(arms, XCtors(x_table_rows(st, x_ctor_names(x_arm_pats(arms), []), scr_ty, []))) {
+    XMissing([w, ..._]) -> report_uncovered(st, w, line, col)
+    _                   -> st
+  }
+
+fn report_uncovered(st: InferState, w: String, line: Int, col: Int) : InferState / Console + File = {
+  let header = if w == "_" { "non-exhaustive match: the arms' literals and guards do not cover every value" }
+               else { "non-exhaustive match: no arm covers `#{w}`" }
+  let help_msg = "add an arm for the uncovered values, or a wildcard `_` arm; a guarded arm covers nothing on its own"
+  diag_error(st.file, line, col, header)
+  diag_help(help_msg)
+  st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, line, col, header, [ri_help(st.file, line, col, help_msg)])))
+}
+
+fn x_arm_pats(arms: [Arm]) : [Pattern] = match arms {
+  [] -> []
+  [Arm(p, _, _), ...rest] -> [p, ...x_arm_pats(rest)]
+}
+
+# Each constructor name's siblings. A name the scrutinee's type does not
+# declare is looked up bare, and left out when more than one type declares
+# it: the check then answers unknown rather than read the wrong type.
+fn x_table_rows(st: InferState, names: [String], scr_ty: Ty, acc: [(String, [XSib])]) : [(String, [XSib])] = match names {
+  [] -> acc
+  [cn, ...rest] -> match x_ctor_scheme(st.env, cn, scr_ty) {
+    Some(sc) -> x_table_rows(st, rest, scr_ty, [(cn, x_ctor_siblings(st.env, cn, sc)), ...acc])
+    None -> match rec_find(st.recs, cn) {
+      Some(_) -> x_table_rows(st, rest, scr_ty, [(cn, [XSib(cn, cn)]), ...acc])
+      None    -> x_table_rows(st, rest, scr_ty, acc)
+    }
+  }
+}
+
+fn x_ctor_scheme(env: TyEnv, cn: String, scr_ty: Ty) : Option[TyScheme] = {
+  let own = match scr_ty {
+    TyCon(_, parent, _, _) -> ty_env_lookup_qualified(env, parent, cn)
+    _                      -> None
+  }
+  match own {
+    Some(sc) -> Some(sc)
+    None     -> if x_ctor_ambiguous(env, cn) { None } else { ty_env_lookup(env, cn) }
+  }
+}
+
+fn x_ctor_ambiguous(env: TyEnv, cn: String) : Bool = match ty_env_lookup(env, cn) {
+  None -> false
+  Some(sc) -> match extract_return_tycon(sc) {
+    Some(parent) ->
+      if parent == "Result" or parent == "Option" { not list_is_empty(ty_env_qualified_parents_excluding_builtin(env, cn)) }
+      else { list_length(ty_env_qualified_parents(env, cn)) > 1 }
+    None -> true
+  }
+}
+
+# A type with no variant list has the one constructor.
+fn x_ctor_siblings(env: TyEnv, cn: String, sc: TyScheme) : [XSib] = match x_scheme_ret(sc) {
+  Some((tycon, ar)) -> match variants_of_type_arity(env, tycon, ar) {
+    []   -> [XSib(cn, cn)]
+    sibs -> map(sibs, (s) => XSib(s, x_ctor_spelling(env, s, tycon)))
+  }
+  None -> [XSib(cn, cn)]
+}
+
+fn x_ctor_spelling(env: TyEnv, cn: String, tycon: String) : String =
+  match ty_env_lookup_qualified(env, tycon, cn) {
+    Some(Scheme(_, _, _, _, TyFnT(params, _, _))) ->
+      if list_is_empty(params) { cn } else { concat_all([cn, "(", inf_join_with(map(params, (p) => "_"), ", "), ")"]) }
+    _ -> cn
+  }
+
+fn x_scheme_ret(sc: TyScheme) : Option[(String, Int)] = match sc {
+  Scheme(_, _, _, _, ty) -> match ty {
+    TyFnT(_, TyCon(_, nm, tas, _), _) -> Some((nm, list_length(tas)))
+    TyCon(_, nm, tas, _)              -> Some((nm, list_length(tas)))
+    _                                 -> None
+  }
+}
+
+fn check_exhaustive_ctors(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState / Console + File {
 
   if has_catch_all(arms) { st }
   else {

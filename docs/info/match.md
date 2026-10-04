@@ -148,10 +148,27 @@ fn main() : Unit / Stdout = Stdout.print(f("hi"))
 
 ## Exhaustiveness
 
-Missing arms surface as `non-exhaustive match: missing <pattern>`.
-The checker reports a specific witness pattern, not a generic error.
-Use `_` only when you genuinely want a catch-all; do not use it to
+Missing arms surface as `non-exhaustive match: missing <variant>`, or
+`non-exhaustive match: no arm covers <pattern>` when the gap sits inside
+a pattern. The checker reports a specific witness pattern, not a generic
+error. Use `_` only when you genuinely want a catch-all; do not use it to
 silence the checker.
+
+Coverage looks through nested patterns: `Some(0)` covers only part of
+`Some`, and `(Red, _)` only part of a pair. A guarded arm covers nothing
+on its own, so `Some(x) if x > 0` still needs a `Some(_)` arm after it.
+Only `true` and `false` exhaust a literal type: a match over `Int`,
+`Char`, `String` or `Real` literals needs a catch-all.
+
+```kaikai
+fn sign(o: Option[Int]) : Int = match o {
+  Some(x) if x > 0 -> 1
+  Some(_)          -> 0
+  None             -> 0 - 1
+}
+
+fn main() : Unit / Stdout = Stdout.print("#{sign(Some(4))}")
+```
 
 ## `case`-led fn body
 

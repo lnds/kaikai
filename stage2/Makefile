@@ -4844,19 +4844,22 @@ test-slice-bound-once test-slice-bound-once-native: $(TARGET) bin-kai build
 	done; \
 	echo "slice-bound-once OK ($(SLICE_BACKEND): each slice bound typed and evaluated once)"
 
-# `examples/match/`: each fixture either fails to compile with every line
-# of `<name>.err.expected` in the compiler's stderr, or builds and runs to
-# `<name>.out.expected`. With a `<name>.run.err.expected` the run must also
-# exit nonzero with exactly those bytes on stderr. `$(1)` names the backend,
-# `$(2)` builds `$$f` into `$$bin`, sending the compiler's stderr to `$$cerr`.
+# `examples/match/`: each fixture (a `.kai`, or a directory's `main.kai`)
+# either fails to compile with every line of `<base>.err.expected` in the
+# compiler's stderr, or builds and runs to `<base>.out.expected`. With a
+# `<base>.run.err.expected` the run must also exit nonzero with exactly those
+# bytes on stderr. `$(1)` names the backend, `$(2)` builds `$$f` into `$$bin`,
+# sending the compiler's stderr to `$$cerr`.
 define match_fixtures_run
 	@set -e; \
-	for f in ../examples/match/*.kai; do \
-	  name=$$(basename $$f .kai); \
+	for f in ../examples/match/*.kai ../examples/match/*/main.kai; do \
+	  [ -f $$f ] || continue; \
+	  base=$${f%.kai}; \
+	  case $$f in */main.kai) name=$$(basename $$(dirname $$f)) ;; *) name=$$(basename $$f .kai) ;; esac; \
 	  bin=build/m-$(1)-$$name; cerr=$$bin.cerr; \
-	  exp_out=../examples/match/$$name.out.expected; \
-	  exp_err=../examples/match/$$name.err.expected; \
-	  exp_run_err=../examples/match/$$name.run.err.expected; \
+	  exp_out=$$base.out.expected; \
+	  exp_err=$$base.err.expected; \
+	  exp_run_err=$$base.run.err.expected; \
 	  rc=0; $(2) || rc=$$?; \
 	  if [ -f $$exp_err ]; then \
 	    [ $$rc -ne 0 ] || { echo "match-$(1) FAIL $$name (expected error, got success)"; exit 1; }; \
