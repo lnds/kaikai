@@ -1204,10 +1204,11 @@ fn pcs_nm_absent_from_nonrec_tails(self_name: String, nm: String, e: Expr, bmap:
   pcs_nmant_kind(self_name, nm, e.kind, bmap)
 
 fn pcs_nmant_kind(self_name: String, nm: String, k: ExprKind, bmap: [BorrowEntry]) : Bool / Console = match k {
+  # A base-path call may lend `nm` to a borrowed slot: that read takes no ref.
   ECall(f, _) -> match sym_read_kind(f.kind) {
-    EVar(c)        -> if c == self_name { true } else { not pcs_mentions(nm, mk_expr(k, 0, 0)) }
-    EModCall(_, c) -> if c == self_name { true } else { not pcs_mentions(nm, mk_expr(k, 0, 0)) }
-    _              -> not pcs_mentions(nm, mk_expr(k, 0, 0))
+    EVar(c)        -> c == self_name or pcs_max_paths_b_expr(nm, mk_expr(k, 0, 0), bmap) == 0
+    EModCall(_, c) -> c == self_name or pcs_max_paths_b_expr(nm, mk_expr(k, 0, 0), bmap) == 0
+    _              -> pcs_max_paths_b_expr(nm, mk_expr(k, 0, 0), bmap) == 0
   }
   # The condition evaluates on EVERY path through the if, including the
   # base ones: a CONSUMING read of `nm` there spends the ref the exit
@@ -1632,7 +1633,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
         let skip_set0 = pcs_list_union(
           pcs_list_union(
             pcs_list_union(
-              pcs_list_union(pcs_branch_aware_skip_params(pnames, body), borrowed),
+              pcs_list_union(pcs_branch_aware_skip_params(pnames, body, bmap), borrowed),
               arm_moves),
             goto_moves),
           raw_pnames)
@@ -1816,7 +1817,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: [BorrowEntry], cmap: ConsumeIndex
     DCheck(desc, ps, body, ln, cl, mo) -> {
       let pnames = map(ps, (p) => p.pname)
       let uses = pcs_read_table(body, pnames)
-      let skip_set = pcs_branch_aware_skip_params(pnames, body)
+      let skip_set = pcs_branch_aware_skip_params(pnames, body, bmap)
       let new_body = pcs_rewrite_expr(body, pnames, uses, false, skip_set, pnames, bmap, [])
       let reused_body = pcs_recognise_reuse_expr(new_body)
       DCheck(desc, ps, reused_body, ln, cl, mo)
@@ -2686,19 +2687,17 @@ fn pcs_max_paths_b_arms(nm: String, arms: [Arm], best: Int, bmap: [BorrowEntry])
 #      capability ops, raw field access on a borrowed record)
 #      internally incref their arg, and a raw transfer would leak or
 #      double-free.
-#[doc("Params whose transfer must be skipped because some branch reads them through an incref-ing op (capability ops, borrowed field access). Pub: tco consults it.")]
-pub fn pcs_branch_aware_skip_params(pnames: [String], body: Expr) : [String] =
-  pcs_branch_aware_skip_params_b(pnames, body, [])
-
-#[doc("Borrow-aware `pcs_branch_aware_skip_params`: a read landing in a borrowed callee slot witnesses no consumption, so the param keeps its drop.")]
-pub fn pcs_branch_aware_skip_params_b(pnames: [String], body: Expr,
-                                      bmap: [BorrowEntry]) : [String] = match pnames {
+#[doc("Params that transfer raw on every path. A read in a borrowed callee slot of `bmap` consumes nothing, so such a param keeps its drop. Pub: tco consults it.")]
+pub fn pcs_branch_aware_skip_params(pnames: [String], body: Expr,
+                                    bmap: [BorrowEntry]) : [String] = match pnames {
   []           -> []
   [h, ...rest] -> {
-    let mp = pcs_max_paths_b_expr(h, body, bmap)
+    # Borrowed reads still count here: the branch planter assumes one read
+    # per path, and a lent read ahead of the move is a second one.
+    let mp = pcs_max_paths_in_expr(h, body)
     let cv = pcs_consumed_b_expr(h, body, bmap)
     let ln = pcs_all_consumers_linear(h, body)
-    let rest_skip = pcs_branch_aware_skip_params_b(rest, body, bmap)
+    let rest_skip = pcs_branch_aware_skip_params(rest, body, bmap)
     if mp <= 1 and cv and ln { [h, ...rest_skip] } else { rest_skip }
   }
 }
