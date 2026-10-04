@@ -11466,6 +11466,12 @@ test-tco-fuse-order: $(TARGET) build
 	  ./build/tco-$$f > build/tco-$$f.out; \
 	  diff ../examples/tco/$$f.out.expected build/tco-$$f.out || { echo "tco-fuse-order DIFF ($$f output)"; exit 1; }; \
 	done; \
+	for f in mutual_module_homonym; do \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/tco/$$f.kai > build/tco-$$f.c; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-$$f.c -o build/tco-$$f $(LDLIBS_M) ; \
+	  ./build/tco-$$f > build/tco-$$f.out; \
+	  diff ../examples/tco/$$f.out.expected build/tco-$$f.out || { echo "tco-fuse-order DIFF ($$f output)"; exit 1; }; \
+	done; \
 	echo "tco-fuse-order OK (fused member order and output)"
 
 # A string literal with 200K escapes compiles: decoding it must run in
