@@ -4844,47 +4844,57 @@ test-slice-bound-once test-slice-bound-once-native: $(TARGET) bin-kai build
 	done; \
 	echo "slice-bound-once OK ($(SLICE_BACKEND): each slice bound typed and evaluated once)"
 
-# Issue #129 — multi-arg `match` sugar. Each .kai under
-# `examples/match/` either compiles + runs to a known stdout
-# (positive cases — diffed against `<name>.out.expected`) or fails
-# with a specific diagnostic (negative cases — every line of
-# `<name>.err.expected` must be a substring of the compiler's stderr).
-# Mirrors `test-sugars` mechanically; lives in its own target so a
-# regression in the multi-arg desugaring shows up under a clearly
-# named gate rather than buried in the sugars suite.
-test-match: $(TARGET) build
+# `examples/match/`: each fixture either fails to compile with every line
+# of `<name>.err.expected` in the compiler's stderr, or builds and runs to
+# `<name>.out.expected`. With a `<name>.run.err.expected` the run must also
+# exit nonzero with exactly those bytes on stderr. `$(1)` names the backend,
+# `$(2)` builds `$$f` into `$$bin`, sending the compiler's stderr to `$$cerr`.
+define match_fixtures_run
 	@set -e; \
 	for f in ../examples/match/*.kai; do \
 	  name=$$(basename $$f .kai); \
+	  bin=build/m-$(1)-$$name; cerr=$$bin.cerr; \
 	  exp_out=../examples/match/$$name.out.expected; \
 	  exp_err=../examples/match/$$name.err.expected; \
+	  exp_run_err=../examples/match/$$name.run.err.expected; \
+	  rc=0; $(2) || rc=$$?; \
 	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/m2-$$name.err || rc=$$?; \
-	    if [ $$rc -eq 0 ]; then \
-	      echo "match FAIL $$name (expected error, got success)"; exit 1; \
-	    fi; \
+	    [ $$rc -ne 0 ] || { echo "match-$(1) FAIL $$name (expected error, got success)"; exit 1; }; \
 	    while read -r line; do \
-	      grep -q "$$line" build/m2-$$name.err \
-	        || { echo "match FAIL $$name (missing diagnostic: $$line)"; \
-	             cat build/m2-$$name.err; exit 1; }; \
+	      grep -q "$$line" $$cerr \
+	        || { echo "match-$(1) FAIL $$name (missing diagnostic: $$line)"; cat $$cerr; exit 1; }; \
 	    done < $$exp_err; \
-	    echo "match OK $$name (rejected as expected)"; \
-	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/m2-$$name.c \
-	      || { echo "match FAIL $$name (kaic2 errored)"; exit 1; }; \
-	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/m2-$$name.c -o build/m2-$$name $(LDLIBS_M) \
-	      || { echo "match FAIL $$name (C compile failed)"; exit 1; }; \
-	    ./build/m2-$$name > build/m2-$$name.out \
-	      || { echo "match FAIL $$name (run errored)"; cat build/m2-$$name.out; exit 1; }; \
-	    if [ -f $$exp_out ]; then \
-	      diff -q $$exp_out build/m2-$$name.out > /dev/null \
-	        && echo "match OK $$name" \
-	        || { echo "match DIFF $$name"; diff $$exp_out build/m2-$$name.out; exit 1; }; \
-	    else \
-	      echo "match OK $$name (no golden, ran clean)"; \
-	    fi; \
+	    echo "match-$(1) OK $$name (rejected as expected)"; \
+	    continue; \
 	  fi; \
+	  [ $$rc -eq 0 ] || { echo "match-$(1) FAIL $$name (build errored)"; cat $$cerr; exit 1; }; \
+	  rc=0; ./$$bin > $$bin.out 2> $$bin.err || rc=$$?; \
+	  if [ -f $$exp_run_err ]; then \
+	    [ $$rc -ne 0 ] || { echo "match-$(1) FAIL $$name (expected a runtime panic, got success)"; exit 1; }; \
+	    diff -q $$exp_run_err $$bin.err > /dev/null \
+	      || { echo "match-$(1) DIFF $$name (stderr)"; diff $$exp_run_err $$bin.err; exit 1; }; \
+	  else \
+	    [ $$rc -eq 0 ] || { echo "match-$(1) FAIL $$name (run errored)"; cat $$bin.err; exit 1; }; \
+	  fi; \
+	  if [ -f $$exp_out ]; then \
+	    diff -q $$exp_out $$bin.out > /dev/null \
+	      || { echo "match-$(1) DIFF $$name"; diff $$exp_out $$bin.out; exit 1; }; \
+	  fi; \
+	  echo "match-$(1) OK $$name"; \
 	done
+endef
+
+test-match: $(TARGET) build
+	$(call match_fixtures_run,c,{ $(KAIC2) $(TEST_CORE_CACHE) $$f > $$bin.c 2> $$cerr \
+	  && $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 $$bin.c -o $$bin $(LDLIBS_M) 2>> $$cerr; })
+
+ifeq ($(KAI_LLVM),1)
+test-match-native: $(TARGET) bin-kai build
+	$(call match_fixtures_run,native,KAI_BACKEND=native ../bin/kai build $$f -o $$bin 2> $$cerr)
+else
+test-match-native:
+	@echo "test-match-native: SKIP (KAI_LLVM != 1)"
+endif
 
 # issue #156 — hex (`0x[0-9a-fA-F]+`) and binary (`0b[01]+`) integer
 # literal fixtures. Same diff / `.err.expected` discipline as test-sugars.

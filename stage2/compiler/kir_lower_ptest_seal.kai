@@ -1,0 +1,93 @@
+# compiler/kir_lower_ptest_seal.kai — the single tests pattern lowering
+# chains: a tag, a literal, a raw slot word, a cons/nil cell. Each one seals
+# the open block with a branch to its `ok` or `fail` label.
+
+import compiler.ast
+import compiler.kir
+import compiler.kir_lower
+import compiler.kir_lower_bind
+import compiler.kir_lit_eq
+
+#[doc("Where a test goes: `ok` on a match, `fail` on a mismatch.")]
+pub type PtTo = PtTo(String, String)
+
+#[doc("A raw slot compare: the comparison prim and the slot's raw repr.")]
+pub type PtRaw = PtRaw(String, KSlot)
+
+#[doc("The label a match goes to.")]
+pub fn pt_ok(to: PtTo) : String = match to { PtTo(ok, _) -> ok }
+
+#[doc("The label a mismatch goes to.")]
+pub fn pt_fail(to: PtTo) : String = match to { PtTo(_, fail) -> fail }
+
+#[doc("Seal the open block with an unconditional branch to `ok`.")]
+pub fn pt_br(st: LowerSt, ok: String) : LowerSt = ls_seal(st, KBr(ok, KNoPos), ok)
+
+#[doc("Seal the open block with `condbr cond ? ok : fail`.")]
+pub fn pt_condbr(cond: KVal, to: PtTo, pos: KPos, st: LowerSt) : LowerSt = match to {
+  PtTo(ok, fail) -> ls_seal(st, KCondBr(cond, ok, fail, pos), fail)
+}
+
+#[doc("Test `v` for equality with the literal atom `lit`.")]
+pub fn pt_seal_eq(v: KVal, lit: KVal, to: PtTo, pos: KPos, st: LowerSt) : LowerSt / Console = match to {
+  PtTo(ok, fail) -> kle_seal_eq(v, lit, ok, fail, pos, st)
+}
+
+#[doc("The runtime tag of constructor `c`.")]
+pub fn pt_tag(st: LowerSt, c: KCtorRef) : Int = match c {
+  KCR(home, cn) -> ls_variant_tag_in(st, home, cn)
+}
+
+#[doc("Test `v`'s constructor tag against `c`'s, and nothing of its payload.")]
+pub fn pt_seal_tag(v: KVal, c: KCtorRef, to: PtTo, p: Pattern, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KPrim("kai_tag_eq", [v, KIntV(pt_tag(st, c))]), KAt(p.line, p.col)) {
+    LRes(cond, st1) -> pt_condbr(cond, to, KAt(p.line, p.col), st1) }
+
+#[doc("`condbr (<prim> cur) ? <fresh block> : fail_lbl`, continuing in the fresh block; `prim` is a cons/nil predicate.")]
+pub fn pt_cell_test(cur: KVal, prim: String, fail_lbl: String, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KPrim(prim, [cur]), KNoPos) { LRes(cond, st1) ->
+    match ls_fresh_label(st1) { LSLabel(cont, st2) ->
+      reopen(pt_condbr(cond, PtTo(cont, fail_lbl), KNoPos, st2), cont) } }
+
+#[doc("The boxed-Bool predicate a list cell test calls for a cons cell.")]
+pub fn pt_is_cons() : String = "kai_is_cons_b"
+
+#[doc("The boxed-Bool predicate a list cell test calls for the empty list.")]
+pub fn pt_is_nil() : String = "kai_is_nil_b"
+
+#[doc("The KIR atom of a literal pattern's expression.")]
+pub fn pt_lit_atom(lit: Expr) : KVal = match lit.kind {
+  EInt(n, _)       -> kir_int_atom(lit, n)
+  EBool(b)         -> KBoolV(b)
+  EChar(c)         -> KCharV(c)
+  EStr(span, _)    -> KStrV(span)
+  EReal(r, _)      -> KRealV(r)
+  EFixed(span, ty) -> KFixedV(span, ty)
+  _                -> KUnitV
+}
+
+#[doc("The raw word compare testing `sp` against slot `idx` of `c`, or `None` when the slot must be projected.")]
+pub fn pt_slot_raw(st: LowerSt, c: KCtorRef, idx: Int, sp: Pattern) : Option[(PtRaw, KVal)] =
+  match sp.pkind {
+    PLit(lit)            -> pt_raw_cmp(slot_kind_of(st, c, idx), pt_lit_atom(lit))
+    PVariant(hm, cn, []) ->
+      if slot_kind_of(st, c, idx) == 3 { Some((PtRaw("i==", SInt64), KIntV(pt_tag(st, kcr_of_pat(hm, cn))))) } else { None }
+    _                    -> None
+  }
+
+# A raw Int or Real slot compares its raw word: the boxed route would mint a
+# re-box the non-consuming `kai_eq_raw` never releases.
+fn pt_raw_cmp(kind: Int, lit: KVal) : Option[(PtRaw, KVal)] = match lit {
+  KIntV(_)  -> if kind == 1 { Some((PtRaw("i==", SInt64), lit)) } else { None }
+  KRealV(_) -> if kind == 2 { Some((PtRaw("f==", SReal), lit)) } else { None }
+  _         -> None
+}
+
+#[doc("Test slot `idx` of `v` by comparing its raw word with `lit`.")]
+pub fn pt_seal_raw_eq(idx: Int, r: PtRaw, lit: KVal, v: KVal, to: PtTo, sp: Pattern,
+                      st: LowerSt) : LowerSt / Console = match r {
+  PtRaw(cmp, kslot) ->
+    match bind_op_slot(st, KProj(v, idx), kslot, KAt(sp.line, sp.col)) { LRes(sv, st1) ->
+      match bind_op_slot(st1, KPrim(cmp, [sv, lit]), SBool, KAt(sp.line, sp.col)) { LRes(cond, st2) ->
+        pt_condbr(cond, to, KAt(sp.line, sp.col), st2) } }
+}

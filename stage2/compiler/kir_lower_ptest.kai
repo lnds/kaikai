@@ -1,0 +1,107 @@
+# compiler/kir_lower_ptest.kai — the test half of pattern lowering.
+#
+# One recursion tests a value against every pattern shape (literal, variant,
+# variant record, record or tuple, list, as-pattern), so a shape nests under
+# any other: a list in a variant slot, a tuple in a list cell, a record arm
+# under a guard. Each test reads borrowed and routes a mismatch to the arm's
+# fail label; the binds run afterwards (`kir_lower_bind`), dominated by the
+# tests. A test that is not emitted is a silent miscompile, never a loud one.
+
+import compiler.ast
+import compiler.kir
+import compiler.kir_lower
+import compiler.kir_lower_bind
+import compiler.kir_lower_ptest_seal
+import compiler.kir_lower_variant
+
+#[doc("Test `v` against `p`: a match branches to the `ok` label, a mismatch to `fail`.")]
+pub fn pt_seal(p: Pattern, v: KVal, to: PtTo, st: LowerSt) : LowerSt / Console = match p.pkind {
+  PLit(lit)                  -> pt_seal_eq(v, pt_lit_atom(lit), to, KAt(p.line, p.col), st)
+  PVariant(hm, cn, subs)     -> pt_seal_ctor(kcr_of_pat(hm, cn), subs, v, to, p, st)
+  PVariantRecord(hm, cn, fs) -> pt_seal_ctor_record(kcr_of_pat(hm, cn), fs, v, to, p, st)
+  PRecord(fs)                -> pt_br(pt_field_tests(fs, v, pt_fail(to), st), pt_ok(to))
+  PList(pats, rest)          -> pt_seal_list(pats, rest, v, to, st)
+  PAs(_, inner)              -> pt_seal(inner, v, to, st)
+  _                          -> pt_br(st, pt_ok(to))
+}
+
+#[doc("Emit `p`'s tests against `v` and continue in a fresh block on a match; emits nothing for a pattern that always matches.")]
+pub fn pt_test(p: Pattern, v: KVal, fail_lbl: String, st: LowerSt) : LowerSt / Console =
+  if psub_is_discriminating(p) {
+    match ls_fresh_label(st) { LSLabel(ok, st1) -> reopen(pt_seal(p, v, PtTo(ok, fail_lbl), st1), ok) }
+  } else { st }
+
+#[doc("The payload tests of a variant arm whose tag a switch already matched, reopened at `body_lbl`.")]
+pub fn pt_arm_subtests(p: Pattern, scrv: KVal, body_lbl: String, fail_lbl: String,
+                       st: LowerSt) : LowerSt / Console = match p.pkind {
+  PVariant(hm, cn, subs)   -> reopen(pt_slot_tests(kcr_of_pat(hm, cn), subs, scrv, 0, PtTo(body_lbl, fail_lbl), st), body_lbl)
+  PVariantRecord(_, _, fs) -> reopen(pt_br(pt_field_tests(fs, scrv, fail_lbl, st), body_lbl), body_lbl)
+  PAs(_, inner)            -> pt_arm_subtests(inner, scrv, body_lbl, fail_lbl, st)
+  _                        -> reopen(pt_br(st, body_lbl), body_lbl)
+}
+
+#[doc("Test each discriminating field of a record-shaped value, continuing in a fresh block once all pass.")]
+pub fn pt_field_tests(fields: [PField], v: KVal, fail_lbl: String,
+                      st: LowerSt) : LowerSt / Console = match fields {
+  [] -> st
+  [PField(fname, sub, _), ...rest] ->
+    if psub_is_discriminating(sub) {
+      match bind_op(st, KPrim("kai_op_field_borrow", [v, KStrV(fname)]), KAt(sub.line, sub.col)) {
+        LRes(fv, st1) -> pt_field_tests(rest, v, fail_lbl, pt_test(sub, fv, fail_lbl, st1)) }
+    } else { pt_field_tests(rest, v, fail_lbl, st) }
+}
+
+# A constructor's tag, then its payload's discriminating slots. A miss at any
+# depth routes to the one fail label: the arm fails as a unit.
+fn pt_seal_ctor(c: KCtorRef, subs: [Pattern], v: KVal, to: PtTo, p: Pattern,
+                st: LowerSt) : LowerSt / Console =
+  match ls_fresh_label(st) { LSLabel(sub, st1) ->
+    pt_slot_tests(c, subs, v, 0, to, reopen(pt_seal_tag(v, c, PtTo(sub, pt_fail(to)), p, st1), sub)) }
+
+fn pt_seal_ctor_record(c: KCtorRef, fields: [PField], v: KVal, to: PtTo, p: Pattern,
+                       st: LowerSt) : LowerSt / Console =
+  match ls_fresh_label(st) { LSLabel(sub, st1) -> {
+    let st2 = reopen(pt_seal_tag(v, c, PtTo(sub, pt_fail(to)), p, st1), sub)
+    pt_br(pt_field_tests(fields, v, pt_fail(to), st2), pt_ok(to))
+  } }
+
+# The discriminating payload slots of `c`, chained through fresh blocks.
+fn pt_slot_tests(c: KCtorRef, subs: [Pattern], v: KVal, idx: Int, to: PtTo,
+                 st: LowerSt) : LowerSt / Console = match subs {
+  [] -> pt_br(st, pt_ok(to))
+  [sp, ...rest] ->
+    if psub_is_discriminating(sp) {
+      match ls_fresh_label(st) { LSLabel(cont, st1) ->
+        pt_slot_tests(c, rest, v, idx + 1, to, reopen(pt_seal_slot(c, sp, v, idx, PtTo(cont, pt_fail(to)), st1), cont)) }
+    } else { pt_slot_tests(c, rest, v, idx + 1, to, st) }
+}
+
+# One slot: a raw word compare when the slot's kind allows one, else the
+# slot projected at its static kind and tested recursively.
+fn pt_seal_slot(c: KCtorRef, sp: Pattern, v: KVal, idx: Int, to: PtTo,
+                st: LowerSt) : LowerSt / Console = match sp.pkind {
+  PAs(_, inner) -> pt_seal_slot(c, inner, v, idx, to, st)
+  _ -> match pt_slot_raw(st, c, idx, sp) {
+    Some((r, lit)) -> pt_seal_raw_eq(idx, r, lit, v, to, sp, st)
+    None -> match bind_op(st, bind_slot_op(st, c, idx, v), KAt(sp.line, sp.col)) {
+      LRes(sv, st1) -> pt_seal(sp, sv, to, st1) }
+  }
+}
+
+# A list's shape: a cons per fixed element (testing a discriminating element
+# in place), then nil unless a rest pattern takes the tail.
+fn pt_seal_list(pats: [Pattern], rest: Option[String], cur: KVal, to: PtTo,
+                st: LowerSt) : LowerSt / Console = match pats {
+  [] -> match rest {
+    Some(_) -> pt_br(st, pt_ok(to))
+    None    -> pt_br(pt_cell_test(cur, pt_is_nil(), pt_fail(to), st), pt_ok(to))
+  }
+  [hp, ...more] -> {
+    let st1 = pt_cell_test(cur, pt_is_cons(), pt_fail(to), st)
+    let st2 = if psub_is_discriminating(hp) {
+      match bind_op(st1, KProj(cur, 0), KAt(hp.line, hp.col)) { LRes(headv, st3) -> pt_test(hp, headv, pt_fail(to), st3) }
+    } else { st1 }
+    match bind_op(st2, KProj(cur, 1), KAt(hp.line, hp.col)) { LRes(tailv, st4) ->
+      pt_seal_list(more, rest, tailv, to, st4) }
+  }
+}
