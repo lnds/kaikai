@@ -703,6 +703,7 @@ test-kai-cli: kaic2
 	@tools/test-kai-cli.sh
 	@tests/kai_test_jobs.sh
 	@tests/guard_memo.sh
+	@tests/bin_memo.sh
 
 # Operand evaluation order under gcc on x86_64, which evaluates call
 # arguments right to left. The script refuses any other host.

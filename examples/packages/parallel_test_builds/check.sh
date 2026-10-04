@@ -70,7 +70,7 @@ printf 'test "broken" {\n  assert nope() == 1\n}\n' >> "$TMP/app/tests/b_test.ka
 same app .
 mixed app .
 [ "$(cat "$TMP/rc.4")" -ne 0 ] || fail "a compile error did not fail the run"
-grep -q "a doubles" "$TMP/err.4" || fail "the files before the error did not run"
+grep -q "a doubles" "$TMP/err.4" || { cat "$TMP/err.4" >&2; fail "the files before the error did not run"; }
 if grep -q "c doubles" "$TMP/err.4"; then fail "a file after the compile error ran"; fi
 
 # 4 — every run builds the sources as they are now: an edit to the package or to a test shows.
