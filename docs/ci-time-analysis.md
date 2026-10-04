@@ -47,6 +47,50 @@
 > unchanged: `tier1-tsan` is a job in `tier1.yml` that always reports, and
 > `tier1-mn-corpus` is an aggregator job in `tier1-native.yml`.
 
+> **Addendum (2026-10-03).** The shard split had drifted until four tier1
+> shards ran 21-22 min while the two fmt-property halves ran ~10 and tier0
+> ~8: the job count was fine, the work was in the wrong jobs. Three causes,
+> each measured from the phase timestamps of green runs:
+>
+> - **The cost table was stale.** Targets had been added daily and the
+>   bases no longer matched the shards' fixed work (one was off by 230 s),
+>   so the planner balanced numbers that were not the runner's.
+> - **The long targets had nowhere to go.** `test-stdlib`, `test-sugars` and
+>   `test-effects` are serial loops of 8-13 min each; `make -j` does not
+>   shorten them, so a slice ends when its longest target does. Only two
+>   shards had little enough fixed work to hold one, and the third pole
+>   landed on a shard that already carried 11 min of it.
+> - **Three jobs ran half empty.**
+>
+> Fixed: both fmt-property halves carry a light slice (eight slices, not
+> six) plus fixed work moved off the full shards — the CLI/tooling tail on
+> shard 7, the demos baseline on shard 8 — and the Perceus RC leak ledger
+> runs in the tier0 job after its gates. That leaves three shards with
+> little fixed work, one per pole. `tier1-native` got the same treatment by
+> moving steps between existing jobs: the curated smoke to the native RC
+> leak job, and the tail of shard 2's single-fixture gates to shard 1.
+>
+> **Keeping it balanced.** Each light target now runs in its own make and
+> prints `tier1-light-cost <target> <wall s> <user> <sys>`; each slice and
+> each shard print their wall time. Per-target wall time is not additive
+> under `make -j`, so the table keeps two numbers per target: CPU seconds
+> (user + sys, which do add up across targets sharing a runner) and wall
+> seconds (which bound the slice the target is in). The planner models a
+> slice as `base + max(total CPU / parallelism, longest wall)`. To refresh,
+> feed the logs of one or more green runs of PRs that touch the compiler:
+>
+> ```sh
+> gh run view <run-id> --log > run.log
+> tools/tier1-light-costs-refresh.sh run.log    # rewrites tools/tier1-light-costs.txt
+> make test-light-partition                     # prints the new plan
+> ```
+>
+> The script rewrites the target rows and the `base` lines (a shard's wall
+> minus its slice's) with the median of the samples, and reports each
+> slice's utilisation; set `parallelism` near the highest. Runner speed
+> varies ~1.5x between hosts for identical work, so several runs beat one
+> and no plan removes that spread.
+
 All numbers below are **measured**, never dry-run. CI durations come from the
 GitHub Actions REST API for real `main` runs on `ubuntu-latest`; local splits
 come from `/usr/bin/time -p` on a 14-core / 24 GB macOS host with no

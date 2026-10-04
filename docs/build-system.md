@@ -232,7 +232,7 @@ Checks that the fast path builds the *same compiler* as the one in place: the fa
 ## Verification targets (root)
 
 - `make tier0` — fast pre-commit sanity (`selfhost` + `demos-no-regression` + arena + heap-limit). Run before committing compiler changes.
-- `make tier1` — full suite, the CI merge gate (sharded as `tier1-shard-1/2/3` in CI; `make test` + demos + fmt + negatives + stdlib-modules + audits + …).
+- `make tier1` — full suite, the CI merge gate (sharded as `tier1-shard-1` … `tier1-shard-8` in CI; `make test` + demos + fmt + negatives + stdlib-modules + audits + …).
 - `make selfhost` — the byte-identity fixed point: `kaic2` compiles its own source to `kaic2b.c`, that compiles to `kaic2b`, which recompiles the source to `kaic2c.c`; asserts `kaic2b.c == kaic2c.c`. The definitive "did I break the compiler" check.
 - **Trust CI for the full battery.** Locally run the minimum gate (`make selfhost` + the smoke of your change); leave `tier1`/`tier1-native` to CI.
 

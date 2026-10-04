@@ -1,4 +1,4 @@
-.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-symid-pipeline test-decl-symid-survives test-evar-above-erase test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-mn-idle-cpu test-upgrade-resolver test-release-platforms test-kaic-boot test-native-probe test-cli-flags test-kai-cli test-eval-order-gcc clean warm-core tier0 test-header-deps test-bin-kai-prereq test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 test-light-partition test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily daily-tail tier1-unsharded coverage-probe rc-budget stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-binserialize-linearity test-rc-budget bin/kai test-walker-catchall-audit
+.PHONY: bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-symid-pipeline test-decl-symid-survives test-evar-above-erase test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-mn-idle-cpu test-upgrade-resolver test-release-platforms test-kaic-boot test-native-probe test-cli-flags test-kai-cli test-eval-order-gcc clean warm-core tier0 test-header-deps test-bin-kai-prereq test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 tier1-shard-8 test-light-partition test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily daily-tail tier1-unsharded coverage-probe rc-budget stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-binserialize-linearity test-rc-budget bin/kai test-walker-catchall-audit
 
 # A bare kaic2 with no `--edition` runs the OLDEST edition (tongariki),
 # so a recipe driving the binary directly would test the previous
@@ -536,31 +536,34 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 # pre-built kaic2 and an aggregator job (`tier1`) gates on all of them — the
 # Required check name is unchanged.
 #
-# Every shard but 7 carries one light slice. The slices are planned by
-# measured cost (tools/tier1-light-plan.sh), and each shard's fixed work
-# below is its `base` in tools/tier1-light-costs.txt, so the planner packs
-# the light pool around it. Moving a phase between shards means updating
-# those bases.
+# Every shard carries one light slice. The slices are planned by measured
+# cost (tools/tier1-light-plan.sh), and each shard's fixed work below is its
+# `base` in tools/tier1-light-costs.txt, so the planner packs the light pool
+# around it. Each shard prints `tier1-shard-wall <shard> <seconds>` when it
+# finishes; tools/tier1-light-costs-refresh.sh reads the bases back from
+# those lines, so moving a phase between shards needs one refresh.
 #
-#  shard 1 — the 4 GB self-compiles + stateful caches (memory-bound), demos,
-#            then the CPU-light CLI/tooling tail.
+#  shard 1 — the 4 GB self-compiles + stateful caches (memory-bound).
 #  shard 2 — the namespace-collision corpus (C axes).
-#  shard 3 — the Perceus RC leak ledger + partition linearity + core text.
+#  shard 3 — partition + BinSerialize linearity, core text, HTTP redirects.
 #  shard 4 — the whole-compiler modular self-host.
 #  shard 5 — fmt fixtures + fmt self-hosting, packages, editions, kai info.
 #  shard 6 — the modular-escape gate.
-#  shard 7 — fmt meaning-preservation over the whole corpus, alone, split
-#            across runners: FMT_PROPERTY_SHARD=I/N selects part I (unset
-#            runs the whole corpus).
+#  shard 7 — fmt meaning-preservation, corpus part 1/2 + the CLI/tooling tail.
+#  shard 8 — fmt meaning-preservation, corpus part 2/2 + the demos baseline.
+#
+# The Perceus RC leak ledger rides the tier0 CI job, after its gates: that
+# job has the headroom and no shard does. It is not part of `tier0` locally.
 #
 # The two modular self-hosts (shards 4 and 6) only detect regressions in the
 # sources they compile, so CI passes TIER1_SELFHOSTS=0 on PRs that touch no
-# compiler source. The light slices on those shards run either way.
+# compiler source. The light slices on those shards run either way, and the
+# plan never reads the flag: every shard must compute the same slices.
 #
 # Coverage invariant (do not break): the set
 #   { test-costly-parallel, test-heap-limit, test-user-cache,
 #     test-core-cache, test-modular-selfhost, test-perceus-1131-modular-escape,
-#     light(1/6) .. light(6/6), test-fmt-property, demos-no-regression,
+#     light(1/8) .. light(8/8), test-fmt-property, demos-no-regression,
 #     test-fmt, test-fmt-package, test-fmt-width, test-fmt-selfhost,
 #     test-fmt-help-scope, test-bench, test-check, test-typecheck,
 #     test-check-parity, test-library-mode, test-lsp,
@@ -570,73 +573,96 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 #     test-private-type-shadow-audit, test-private-record-shadow-audit,
 #     test-canonical-aliases, test-info, test-doc, test-upgrade-resolver,
 #     test-release-platforms, test-kaic-boot, test-cli-flags, test-kai-cli,
-#     rc-leak-gate, test-partition-linearity, test-binserialize-linearity,
+#     test-partition-linearity, test-binserialize-linearity,
 #     test-core-text, test-http-redirects }
-# covers the prerequisites of `tier1` (the light slices union to
-# TEST_LIGHT_TARGETS, asserted by `test-light-partition` in tier0). Adding a
-# phase to `tier1` means adding it to a shard.
-TIER1_LIGHT_SLICES := 6
+# plus rc-leak-gate covers the prerequisites of `tier1` (the light slices
+# union to TEST_LIGHT_TARGETS, asserted by `test-light-partition` in tier0).
+# Adding a phase to `tier1` means adding it to a shard.
+TIER1_LIGHT_SLICES := 8
 TIER1_SELFHOSTS ?= 1
 tier1-light-slice = $(MAKE) -C stage2 test-light-shard SHARD=$(1) SHARDS=$(TIER1_LIGHT_SLICES)
+tier1-shard-start = @date +%s > stage2/build/tier1-shard.start
+tier1-shard-wall = @echo "tier1-shard-wall $(1) $$(( $$(date +%s) - $$(cat stage2/build/tier1-shard.start) )) selfhosts=$(TIER1_SELFHOSTS)"
+TIER1_CLI_TAIL := test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-doc test-upgrade-resolver test-release-platforms test-kaic-boot test-cli-flags test-kai-cli
 
 test-light-partition:
 	$(MAKE) -C stage2 test-light-partition SHARDS=$(TIER1_LIGHT_SLICES)
 
 tier1-shard-1: kaic2
+	$(tier1-shard-start)
 	$(MAKE) -C stage2 test-costly-parallel
 	$(MAKE) -C stage2 test-heap-limit
 	$(MAKE) -C stage2 test-user-cache
 	$(MAKE) -C stage2 test-core-cache
-	$(MAKE) demos-no-regression
-	$(MAKE) test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-doc test-upgrade-resolver test-release-platforms test-kaic-boot test-cli-flags test-kai-cli
 	$(call tier1-light-slice,1)
-	@echo "tier1-shard-1 OK — costly self-compiles + caches + demos + CLI/tooling tail + light slice 1/$(TIER1_LIGHT_SLICES)"
+	$(call tier1-shard-wall,1)
+	@echo "tier1-shard-1 OK — costly self-compiles + caches + light slice 1/$(TIER1_LIGHT_SLICES)"
 
 # The matrix gate runs right after the C-only namespace-collision axes so it
 # reads their ratchet status (tests/namespace_matrix.sh refuses green over a
 # red axis).
 tier1-shard-2: kaic2
+	$(tier1-shard-start)
 	$(call tier1-light-slice,2)
 	$(MAKE) -C stage2 test-namespace-collisions-c-axes
 	$(MAKE) test-namespace-matrix
+	$(call tier1-shard-wall,2)
 	@echo "tier1-shard-2 OK — light slice 2/$(TIER1_LIGHT_SLICES) + namespace-collision corpus (C axes) under ratchet"
 
 tier1-shard-3: kaic2
+	$(tier1-shard-start)
 	$(call tier1-light-slice,3)
-	$(MAKE) -C stage2 rc-leak-gate
 	$(MAKE) test-partition-linearity test-binserialize-linearity test-core-text test-http-redirects
-	@echo "tier1-shard-3 OK — light slice 3/$(TIER1_LIGHT_SLICES) + Perceus RC leak ledger + partition + BinSerialize linearity + core text contracts"
+	$(call tier1-shard-wall,3)
+	@echo "tier1-shard-3 OK — light slice 3/$(TIER1_LIGHT_SLICES) + partition + BinSerialize linearity + core text contracts"
 
 # The two modular self-hosts sit in separate shards: each rebuilds the whole
 # compiler, and a PR touching stage2/compiler/** misses the warm cache by
 # construction, so the pair does not fit one job's budget.
 tier1-shard-4: kaic2
+	$(tier1-shard-start)
 ifneq ($(TIER1_SELFHOSTS),0)
 	$(MAKE) -C stage2 test-modular-selfhost
 endif
 	$(call tier1-light-slice,4)
+	$(call tier1-shard-wall,4)
 	@echo "tier1-shard-4 OK — whole-compiler c-modular link (TIER1_SELFHOSTS=$(TIER1_SELFHOSTS)) + light slice 4/$(TIER1_LIGHT_SLICES)"
 
 tier1-shard-5: kaic2
+	$(tier1-shard-start)
 	$(MAKE) test-fmt test-fmt-package test-fmt-width test-fmt-selfhost test-fmt-help-scope test-independence-oracle test-packages test-editions test-info
 	$(call tier1-light-slice,5)
+	$(call tier1-shard-wall,5)
 	@echo "tier1-shard-5 OK — fmt fixtures + fmt self-hosting + packages + editions + kai info + light slice 5/$(TIER1_LIGHT_SLICES)"
 
 tier1-shard-6: kaic2
+	$(tier1-shard-start)
 ifneq ($(TIER1_SELFHOSTS),0)
 	$(MAKE) -C stage2 test-perceus-1131-modular-escape
 endif
 	$(call tier1-light-slice,6)
+	$(call tier1-shard-wall,6)
 	@echo "tier1-shard-6 OK — modular-escape gate (TIER1_SELFHOSTS=$(TIER1_SELFHOSTS)) + light slice 6/$(TIER1_LIGHT_SLICES)"
 
-# fmt-property gets its own shard because it must run UNCONDITIONALLY: the
-# corpus it formats can regress from a stdlib or fixture change, so it may
-# not be gated on a compiler-source touch, and it leaves no headroom on a
-# shard that carries anything else. CI runs it as parallel parts via
-# FMT_PROPERTY_SHARD=I/N on the make command line (exported to the script).
+# fmt-property runs UNCONDITIONALLY: the corpus it formats can regress from a
+# stdlib or fixture change, so it may not ride a shard gated on a
+# compiler-source touch. The sweep is CPU-bound, so shards 7 and 8 each take
+# one half of the corpus (tests/fmt_property.sh reads FMT_PROPERTY_SHARD).
 tier1-shard-7: kaic2
-	$(MAKE) test-fmt-property
-	@echo "tier1-shard-7 OK — fmt meaning-preservation, corpus part $(or $(FMT_PROPERTY_SHARD),1/1)"
+	$(tier1-shard-start)
+	$(MAKE) test-fmt-property FMT_PROPERTY_SHARD=1/2
+	$(MAKE) $(TIER1_CLI_TAIL)
+	$(call tier1-light-slice,7)
+	$(call tier1-shard-wall,7)
+	@echo "tier1-shard-7 OK — fmt meaning-preservation (corpus part 1/2) + CLI/tooling tail + light slice 7/$(TIER1_LIGHT_SLICES)"
+
+tier1-shard-8: kaic2
+	$(tier1-shard-start)
+	$(MAKE) test-fmt-property FMT_PROPERTY_SHARD=2/2
+	$(MAKE) demos-no-regression
+	$(call tier1-light-slice,8)
+	$(call tier1-shard-wall,8)
+	@echo "tier1-shard-8 OK — fmt meaning-preservation (corpus part 2/2) + demos baseline + light slice 8/$(TIER1_LIGHT_SLICES)"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
@@ -1429,8 +1455,8 @@ daily-tail: selfhost stress-fixtures coverage-probe rc-budget test-binserialize-
 	@echo "daily-tail OK — C selfhost + stress fixtures + coverage probe + RC budget + BinSerialize budget"
 
 # The `tier1` prerequisites that no tier1-shard-N runs.
-tier1-unsharded: test-stage0 test-stage1 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-migrate test-mn-determinism test-runtime-global-audit
-	@echo "tier1-unsharded OK — stage0/stage1 tests + phase4 demos + multi-module/import probes + migrate + M:N determinism + runtime-global audit"
+tier1-unsharded: test-stage0 test-stage1 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-migrate test-mn-determinism test-runtime-global-audit rc-leak-gate
+	@echo "tier1-unsharded OK — stage0/stage1 tests + phase4 demos + multi-module/import probes + migrate + M:N determinism + runtime-global audit + Perceus RC leak ledger"
 
 # Stress fixtures: closed regressions that exercise patterns the
 # per-feature suite does not — R3 scrutinee-reuse RC

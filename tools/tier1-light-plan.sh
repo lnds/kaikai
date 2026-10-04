@@ -6,12 +6,13 @@
 #   tier1-light-plan.sh --check <shards> <target>...   assert the slices
 #                                                      partition the pool
 #
-# Costs come from tools/tier1-light-costs.txt. The assignment is greedy
-# longest-processing-time: targets in descending cost each go to the slice
-# whose projected wall-clock is lowest after taking it. A slice's
+# Costs come from tools/tier1-light-costs.txt: per target, the CPU seconds
+# it burns and the wall seconds it takes inside a slice. The assignment is
+# greedy longest-processing-time: targets in descending wall time each go to
+# the slice whose projected wall-clock is lowest after taking it. A slice's
 # wall-clock is modelled as its fixed base plus the larger of
-#   total cost / parallelism                   (throughput-bound)
-#   longest + contention * (total - longest)   (bound by its serial pole)
+#   total CPU / parallelism    (throughput-bound)
+#   longest target's wall      (bound by its serial pole)
 # because a slice runs under `make -j` yet no target finishes faster than
 # its own serial loop. Each slice prints longest first, so `make -j` starts
 # its long poles before the short targets.
@@ -43,30 +44,32 @@ shards=$1
 shift
 
 echo "$*" | awk -v mode="$mode" -v want="$shard" -v n="$shards" '
-  function cost(t) { return (t in c) ? c[t] : dflt }
-  function wall(k, add,   big, tot, pole) {
-    big = (add > mx[k]) ? add : mx[k]
-    tot = sum[k] + add
-    pole = big + (tot - big) * slow
-    return base[k] + ((tot / par > pole) ? tot / par : pole)
+  function cpu(t) { return (t in c) ? c[t] : dflt }
+  function pole(t) { return (t in p) ? p[t] : dflt }
+  function wall(k, addc, addp,   big, work) {
+    big = (addp > mx[k]) ? addp : mx[k]
+    work = (sum[k] + addc) / par
+    return base[k] + ((work > big) ? work : big)
   }
   function place(t,   k, best, bw, w) {
-    best = 1; bw = wall(1, cost(t))
+    best = 1; bw = wall(1, cpu(t), pole(t))
     for (k = 2; k <= n; k++) {
-      w = wall(k, cost(t))
+      w = wall(k, cpu(t), pole(t))
       if (w < bw || (w == bw && sum[k] < sum[best])) { best = k; bw = w }
     }
-    sum[best] += cost(t); if (cost(t) > mx[best]) mx[best] = cost(t)
+    sum[best] += cpu(t); if (pole(t) > mx[best]) mx[best] = pole(t)
     slice[best] = slice[best] " " t
   }
-  function before(a, b) { return cost(a) > cost(b) || (cost(a) == cost(b) && a < b) }
+  function before(a, b) {
+    if (pole(a) != pole(b)) return pole(a) > pole(b)
+    return cpu(a) > cpu(b) || (cpu(a) == cpu(b) && a < b)
+  }
   FNR == NR {
     if ($0 ~ /^[ \t]*(#|$)/) next
     if ($1 == "base") base[$2] = $3
     else if ($1 == "default") dflt = $2
     else if ($1 == "parallelism") par = $2
-    else if ($1 == "contention") slow = $2
-    else c[$1] = $2
+    else { c[$1] = $2; p[$1] = (NF > 2) ? $3 : $2 }
     next
   }
   { m = split($0, t, " ") }
@@ -81,7 +84,7 @@ echo "$*" | awk -v mode="$mode" -v want="$shard" -v n="$shards" '
     for (k = 1; k <= n; k++) {
       cnt = split(slice[k], s, " ")
       for (i = 1; i <= cnt; i++) got[s[i]]++
-      printf "tier1-light-plan: slice %d/%d: %d targets, ~%ds\n", k, n, cnt, wall(k, 0)
+      printf "tier1-light-plan: slice %d/%d: %d targets, ~%ds (base %d, cpu %d, pole %d)\n", k, n, cnt, wall(k, 0, 0), base[k], sum[k], mx[k]
     }
     for (x in seen) if (got[x] != 1) { print "tier1-light-plan FAIL: " x " assigned " got[x] + 0 " times" > "/dev/stderr"; bad = 1 }
     for (x in got) if (!(x in seen)) { print "tier1-light-plan FAIL: " x " assigned but not in the pool" > "/dev/stderr"; bad = 1 }

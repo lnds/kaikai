@@ -429,23 +429,21 @@ be fixed or excused against an open, numbered issue.
 
 Cost is four `kaic2` invocations per file, ~18 minutes serial, so the
 script fans out over `$(nproc)` workers (`FMT_PROPERTY_JOBS` overrides) —
-the work is per-file independent. It owns `tier1-shard-7`, and the
-placement took several corrections worth recording. It cannot ride shard-1
-with its sibling fmt gates: that shard already ran ~30 minutes, the job
-ceiling, and adding this gate cancelled it — after the gate itself had
-passed. It cannot ride shard-4 or shard-6 either: those are gated on
-`compiler-touch` and skip on a PR that changes no compiler source, which
-would leave a formatter gate silently inert exactly when nobody touched
-the formatter — and the corpus it checks can still regress from a stdlib
-or fixture change. Nor does it fit beside another gate on an
-unconditional shard: ~20 minutes leaves no headroom under the job
-ceiling. Hence its own shard, unconditional. The sweep is one CPU-bound `xargs`
-fan-out with no serial section, and on a 4-vCPU runner it took 16–26
-minutes for the same corpus depending on the host, so `tier1-shard-7` is a
-two-leg matrix: `FMT_PROPERTY_SHARD=I/N` keeps the sorted corpus lines
-whose number is congruent to I mod N — disjoint and total by construction,
-with the kept count asserted — and the aggregator is green only when every
-leg is. Unset, the script sweeps the whole corpus. Note the harness passes
+the work is per-file independent. It rides `tier1-shard-7` and
+`tier1-shard-8`, half the corpus each, and the placement took several
+corrections worth recording. It cannot ride shard-4 or shard-6: those are
+gated on `compiler-touch` and skip on a PR that changes no compiler
+source, which would leave a formatter gate silently inert exactly when
+nobody touched the formatter — and the corpus it checks can still regress
+from a stdlib or fixture change. Nor does the whole sweep fit one job: it
+is one CPU-bound `xargs` fan-out with no serial section, and on a 4-vCPU
+runner it took 16–26 minutes for the same corpus depending on the host.
+So the two shards pass `FMT_PROPERTY_SHARD=1/2` and `2/2`:
+`FMT_PROPERTY_SHARD=I/N` keeps the sorted corpus lines whose number is
+congruent to I mod N — disjoint and total by construction, with the kept
+count asserted. A half takes about ten minutes, so each of the two shards
+also carries other tier1 work (the CLI/tooling tail, the demos baseline)
+and a light slice. Unset, the script sweeps the whole corpus. Note the harness passes
 `--path stdlib`: without it most of the corpus fails to resolve its
 imports and is silently dropped as unparseable, which costs about a
 quarter of the coverage.
@@ -481,9 +479,10 @@ make daily-tail           # C selfhost + stress fixtures + coverage probe
 
 `make daily` runs both in series, locally. In CI
 (`.github/workflows/daily.yml`) one job builds `kaic2` and publishes it,
-then parallel jobs split the work: the seven `tier1-shard-N` targets
-(shard 7 in two corpus parts), `tier1-unsharded` (the `tier1` phases no
-shard runs) and `daily-tail`. The union is `make daily`. A closing `daily`
+then parallel jobs split the work: the eight `tier1-shard-N` targets,
+`tier1-unsharded` (the `tier1` phases no shard runs, among them the
+Perceus RC leak ledger, which on a PR rides the tier0 job) and
+`daily-tail`. The union is `make daily`. A closing `daily`
 job fails unless every part succeeded and opens the `daily-failure`
 issue.
 
