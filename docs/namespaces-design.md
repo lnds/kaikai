@@ -449,6 +449,13 @@ and the qualified form, and keeps today's resolution — which is safe here
 because for this class today's resolution is a defined choice rather than
 corruption.
 
+The same holds for a qualified read through a qualifier two imports bind
+(`import a.util` and `import b.util`, then `util.who`). When only one of
+the bound modules exports the member, the read reaches that one and
+nothing is reported. When several export it, `hanga-roa` warns, naming
+each module and the `as` form that separates them, and the first import
+answers; `orongo` makes it an error.
+
 **Not surface, still breaking.** Two consequences fall outside the
 stability rule but need announcing:
 
