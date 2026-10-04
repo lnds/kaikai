@@ -1,0 +1,179 @@
+# compiler/exhaust.kai — whether a match's arms cover every value.
+#
+# Maranget's usefulness test over the arms' pattern matrix: the match is
+# exhaustive when an all-wildcard row is useless after the arms, and the
+# search for that row yields a witness, a value no arm matches. A guarded
+# arm covers nothing. Only Bool literals complete a column, so a match over
+# an Int, a Char, a String or a Real needs a catch-all. A column the
+# constructor table cannot place answers `XUnknown`: the check may miss a
+# gap, never invent one.
+
+import compiler.ast
+import compiler.util
+import compiler.exhaust_head
+
+#[doc("A constructor of a sum type: its name and how a witness spells it with wildcard payload.")]
+pub type XSib = XSib(String, String)
+
+#[doc("Every constructor of the type each constructor name belongs to.")]
+pub type XCtors = XCtors([(String, [XSib])])
+
+#[doc("A coverage verdict: every value covered, a witness per column of a missed value, or undecidable.")]
+pub type XVerdict = XCovered | XMissing([String]) | XUnknown
+
+#[doc("The coverage of a match's arms over its scrutinee.")]
+pub fn x_match_verdict(arms: [Arm], tab: XCtors) : XVerdict =
+  x_useful(x_rows(arms, []), 1, tab)
+
+#[doc("Every constructor name a list of patterns mentions, at any depth.")]
+pub fn x_ctor_names(pats: [Pattern], acc: [String]) : [String] = match pats {
+  [] -> acc
+  [p, ...rest] -> x_ctor_names(rest, x_pat_ctor_names(p, acc))
+}
+
+fn x_pat_ctor_names(p: Pattern, acc: [String]) : [String] = match p.pkind {
+  PVariant(_, cn, subs)     -> x_ctor_names(subs, [cn, ...acc])
+  PVariantRecord(_, cn, fs) -> x_ctor_names(x_field_pats(fs), [cn, ...acc])
+  PRecord(fs)               -> x_ctor_names(x_field_pats(fs), acc)
+  PList(pats, _)            -> x_ctor_names(pats, acc)
+  PAs(_, inner)             -> x_pat_ctor_names(inner, acc)
+  _                         -> acc
+}
+
+fn x_field_pats(fs: [PField]) : [Pattern] = match fs {
+  [] -> []
+  [PField(_, sub, _), ...rest] -> [sub, ...x_field_pats(rest)]
+}
+
+# The arms that cover what their pattern matches, one single-column row each.
+fn x_rows(arms: [Arm], acc: [[Pattern]]) : [[Pattern]] = match arms {
+  [] -> list_reverse(acc)
+  [Arm(p, None, _), ...rest] -> x_rows(rest, [[p], ...acc])
+  [Arm(p, Some(g), _), ...rest] -> match g.kind {
+    EBool(true) -> x_rows(rest, [[p], ...acc])
+    _           -> x_rows(rest, acc)
+  }
+}
+
+# Some vector of `n` values matches no row of `rows`.
+fn x_useful(rows: [[Pattern]], n: Int, tab: XCtors) : XVerdict =
+  if n == 0 { match rows { [] -> XMissing([])  _ -> XCovered } }
+  else {
+    let keys = x_column_keys(rows, [])
+    match x_signature(keys, rows, tab) {
+      XSigComplete     -> x_split(keys, rows, n, tab, XCovered)
+      XSigOpen(absent) -> x_prepend(absent, x_useful(x_default(rows, []), n - 1, tab))
+      XSigUnknown      -> XUnknown
+    }
+  }
+
+fn x_prepend(w: String, v: XVerdict) : XVerdict = match v {
+  XMissing(ws) -> XMissing([w, ...ws])
+  _            -> v
+}
+
+# A column's constructors: a complete signature, or an open one with a
+# witness for a value none of them heads.
+type XSig = XSigComplete | XSigOpen(String) | XSigUnknown
+
+fn x_signature(keys: [String], rows: [[Pattern]], tab: XCtors) : XSig =
+  if x_any_head(rows, xh_is_odd) { XSigUnknown }
+  else if x_any_head(rows, xh_is_lit) { XSigOpen("_") }
+  else { x_keys_signature(keys, tab) }
+
+fn x_keys_signature(keys: [String], tab: XCtors) : XSig = match keys {
+  [] -> XSigOpen("_")
+  [k, ..._] ->
+    if k == "{}" or k == "()" { XSigComplete }
+    else if k == "[]" or k == "::" { x_first_absent(["[]", "::"], ["[]", "[_, ..._]"], keys) }
+    else if k == "true" or k == "false" { x_first_absent(["true", "false"], ["true", "false"], keys) }
+    else { x_variant_signature(keys, tab) }
+}
+
+fn x_first_absent(need: [String], spell: [String], keys: [String]) : XSig = match (need, spell) {
+  ([k, ...ks], [s, ...ss]) -> if list_has(keys, k) { x_first_absent(ks, ss, keys) } else { XSigOpen(s) }
+  _                        -> XSigComplete
+}
+
+fn x_variant_signature(keys: [String], tab: XCtors) : XSig = match keys {
+  [] -> XSigOpen("_")
+  [k, ..._] -> match x_siblings(xh_key_name(k), tab) {
+    None -> XSigUnknown
+    Some(sibs) ->
+      if x_keys_among(keys, sibs) { x_absent_sibling(sibs, keys) } else { XSigUnknown }
+  }
+}
+
+fn x_keys_among(keys: [String], sibs: [XSib]) : Bool = match keys {
+  [] -> true
+  [k, ...rest] -> x_sib_named(sibs, xh_key_name(k)) and x_keys_among(rest, sibs)
+}
+
+fn x_sib_named(sibs: [XSib], nm: String) : Bool = match sibs {
+  [] -> false
+  [XSib(s, _), ...rest] -> s == nm or x_sib_named(rest, nm)
+}
+
+fn x_absent_sibling(sibs: [XSib], keys: [String]) : XSig = match sibs {
+  [] -> XSigComplete
+  [XSib(nm, spelled), ...rest] ->
+    if list_has(keys, xh_variant_key(nm)) { x_absent_sibling(rest, keys) } else { XSigOpen(spelled) }
+}
+
+fn x_siblings(cn: String, tab: XCtors) : Option[[XSib]] = match tab {
+  XCtors(entries) -> x_assoc(entries, cn)
+}
+
+fn x_assoc(entries: [(String, [XSib])], cn: String) : Option[[XSib]] = match entries {
+  [] -> None
+  [(k, v), ...rest] -> if k == cn { Some(v) } else { x_assoc(rest, cn) }
+}
+
+fn x_any_head(rows: [[Pattern]], pred: (XHead) -> Bool) : Bool = match rows {
+  [] -> false
+  [r, ...rest] -> pred(xh_row_head(r)) or x_any_head(rest, pred)
+}
+
+# The distinct constructor keys heading the rows, in first-seen order.
+fn x_column_keys(rows: [[Pattern]], acc: [String]) : [String] = match rows {
+  [] -> list_reverse(acc)
+  [r, ...rest] -> match xh_row_head(r) {
+    XCon(k, _) -> if list_has(acc, k) { x_column_keys(rest, acc) } else { x_column_keys(rest, [k, ...acc]) }
+    _          -> x_column_keys(rest, acc)
+  }
+}
+
+# A complete signature: a value is missed iff it is missed under some
+# constructor of the column.
+fn x_split(keys: [String], rows: [[Pattern]], n: Int, tab: XCtors, seen: XVerdict) : XVerdict =
+  match keys {
+    [] -> seen
+    [k, ...rest] -> match x_under(k, rows, n, tab) {
+      XMissing(ws) -> XMissing(ws)
+      XUnknown     -> x_split(rest, rows, n, tab, XUnknown)
+      XCovered     -> x_split(rest, rows, n, tab, seen)
+    }
+  }
+
+# The rows specialised to constructor `k`, with a missed vector's leading
+# sub-witnesses folded back under `k`.
+fn x_under(k: String, rows: [[Pattern]], n: Int, tab: XCtors) : XVerdict = {
+  let names = xh_column_fields(k, rows)
+  let arity = xh_arity(k, rows, names)
+  if arity < 0 { XUnknown }
+  else {
+    match x_useful(xh_specialize(k, arity, names, rows), arity + n - 1, tab) {
+      XMissing(ws) -> XMissing([xh_spell(k, names, xh_take(ws, arity)), ...xh_drop(ws, arity)])
+      v            -> v
+    }
+  }
+}
+
+# The rows headed by a wildcard, the head dropped.
+fn x_default(rows: [[Pattern]], acc: [[Pattern]]) : [[Pattern]] = match rows {
+  [] -> list_reverse(acc)
+  [r, ...rest] -> match xh_row_head(r) {
+    XAny -> x_default(rest, [xh_row_tail(r), ...acc])
+    _    -> x_default(rest, acc)
+  }
+}
