@@ -1200,7 +1200,7 @@ fn emit_ident_value(name: String, fid: FnId, fx: FnIndex, lcs: [String], fns: [E
     # before the core table: a declaration shadows the builtin it is
     # spelled like, which is what the typer and the native lowering
     # (`c_sym_of_callee`) already read off this same registry.
-    None -> match fnx_resolve(fx, fns, fid, name, root_mod) {
+    None -> match fnx_callee(fx, fns, fid, name, root_mod, (n) => ec_in_core(core, n)) {
       Some(EFn(_, ar, mo, _, _)) ->
         cat5("kai_closure(&", c_user_thunk_sym(c_sym(name, mo)), ", ", int_to_string(ar), ", 0, NULL)")
       None -> match core_find(core, name) {
@@ -1980,7 +1980,7 @@ fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Opti
   match sym_read_kind(f.kind) {
     EVar(callee) ->
       if list_has(cx.lcs, callee) { None }
-      else { match fnx_resolve(cx.fx, cx.fns, ec_callee_sym(f), callee, cx.root_mod) {
+      else { match ec_callee(cx, ec_callee_sym(f), callee) {
         Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) -> {
           let raw_call = emit_user_call_seq(c_sym(callee, mo), emit_arg_vals_masked(src, args_e, mask, cx), cx)
           Some(ufn_call_result(rt, raw_call))
@@ -2003,6 +2003,39 @@ fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Opti
 # The identity a callee carries, or none when the reference was never
 # stamped. Read before the kind is normalised to a spelling, so the
 # lookup can answer by declaration rather than by name.
+# A raw-core C-API call yields a raw scalar (a `void *` handle, `int64_t`
+# or unit), so it is emitted inline with per-param-marshalled args, never
+# a boxed round-trip that would read a `void *` as an Int. A top-level fn
+# declared under the prim's name shadows it.
+fn emit_raw_rcore(src: String, callee_e: Expr, callee: String, args_e: [Expr], cx: EmitCtx) : Option[String] / Console =
+  match ec_callee(cx, ec_callee_sym(callee_e), callee) {
+    Some(_) -> None
+    None    -> match rcore_find(cx.rcore, callee) {
+      Some(RP(_, cname, ptys, _)) -> Some(emit_rcore_call(src, cname, ptys, args_e, cx))
+      None                        -> None
+    }
+  }
+
+# The fn a call reaches; an unstamped builtin name reaches none.
+fn ec_callee(cx: EmitCtx, fid: FnId, name: String) : Option[EFn] =
+  fnx_callee(cx.fx, cx.fns, fid, name, cx.root_mod,
+             (n) => ec_in_core(cx.core, n) or ec_in_rcore(cx.rcore, n))
+
+fn ec_in_core(core: [ECore], n: String) : Bool = match core_find(core, n) {
+  Some(_) -> true
+  None    -> false
+}
+
+fn ec_in_rcore(rcore: [RCore], n: String) : Bool = match rcore_find(rcore, n) {
+  Some(_) -> true
+  None    -> false
+}
+
+fn ec_declared(cx: EmitCtx, f: Expr) : Bool = match fnx_of_sym(cx.fx, ec_callee_sym(f)) {
+  Some(_) -> true
+  None    -> false
+}
+
 fn ec_callee_sym(f: Expr) : FnId = match f.kind {
   ESym(s, inst, _) -> FnId(s, inst)
   _                -> fnid_none()
@@ -2021,7 +2054,11 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
       # the continuation's `fn` (currently kai_cont_identity, until
       # the full CPS transform reifies the rest of the caller's
       # body). Doc C §*resume representation*.
-      if trmc_is_step_sentinel(callee) {
+      # A reference stamped to a declared fn calls it, whatever builtin
+      # or intrinsic shares its name.
+      if ec_declared(cx, f) {
+        emit_named_call_lookup(src, callee, ec_callee_sym(f), args_e, call_vals, cx)
+      } else if trmc_is_step_sentinel(callee) {
         # TRMC modulo-cons site, planted by `trmc_rewrite_decl`. The
         # callee carries `__kai_trmc|<sym>|<holeslot>|<cname>|<dropmask>|<p0>|...`
         # and `args_e` are the original ctor args (arg[holeslot] is the
@@ -2514,17 +2551,16 @@ fn emit_named_call_lookup(src: String, callee: String, csym: FnId, args_e: [Expr
     Some(_) -> emit_variant_call(None, callee, list_length(args_e),
                                  emit_slot_ops(src, args_e, cx),
                                  cx)
-    # A raw core prim (in-process libLLVM C-API) is checked BEFORE the
-    # boxed `core_find`: its args marshal raw per the prim's param types
-    # (a `TyHandle` is a `void *`) and its result is consumed raw.
-    None -> match rcore_find(cx.rcore, callee) {
-      Some(RP(_, cname, ptys, _)) -> emit_rcore_call(src, cname, ptys, args_e, cx)
-      # A top-level `fn` the program declares under this name answers
-      # before the core table: a declaration shadows the builtin it is
-      # spelled like, which is what the typer and the native lowering
-      # (`c_sym_of_callee`) already read off this same registry.
-      None -> match fnx_resolve(cx.fx, cx.fns, csym, callee, cx.root_mod) {
-        Some(EFn(_, _, mo, _, _)) -> emit_user_call_seq(c_sym(callee, mo), call_vals, cx)
+    # A top-level `fn` the program declares under this name answers
+    # before either core table: a declaration shadows the builtin it is
+    # spelled like, which is what the typer and the native lowering
+    # (`c_sym_of_callee_st`) already read off this same registry.
+    None -> match ec_callee(cx, csym, callee) {
+      Some(EFn(_, _, mo, _, _)) -> emit_user_call_seq(c_sym(callee, mo), call_vals, cx)
+      # A raw core prim is checked before the boxed `core_find`: its args
+      # marshal raw per the prim's param types and its result is raw.
+      None -> match rcore_find(cx.rcore, callee) {
+        Some(RP(_, cname, ptys, _)) -> emit_rcore_call(src, cname, ptys, args_e, cx)
         None -> match core_find(cx.core, callee) {
           Some(ep) -> match ep {
             EP(_, cname, _) -> seq_call(cat2(cname, "("), call_vals, ")")
@@ -6527,13 +6563,8 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
             }
             _ -> "0 /* tcrec: malformed sentinel */"
           }
-        } else { match rcore_find(cx.rcore, callee) {
-          # KIR Lane 1: a raw-core C-API call already yields a raw
-          # scalar (a `void *` handle / `int64_t` / unit), so emit it
-          # inline with per-param-marshalled args — no boxed-then-unbox
-          # round-trip (which would `(...)->as.i` a `void *`, corrupting
-          # the pointer).
-          Some(RP(_, cname, ptys, _)) -> emit_rcore_call(src, cname, ptys, args_e, cx)
+        } else { match emit_raw_rcore(src, callee_e, callee, args_e, cx) {
+          Some(s) -> s
           None -> match emit_ufn_raw_call(src, callee_e, args_e, cx) {
           Some(s) -> s
           None    -> {
@@ -6643,7 +6674,7 @@ fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option
   match sym_read_kind(f.kind) {
     EVar(callee) ->
       if list_has(cx.lcs, callee) { None }
-      else { match fnx_resolve(cx.fx, cx.fns, ec_callee_sym(f), callee, cx.root_mod) {
+      else { match ec_callee(cx, ec_callee_sym(f), callee) {
         # Mixed-param lane: only take the raw-call path when the callee
         # RETURNS raw (a raw context cannot consume a boxed result).
         # Args are still marshalled per the mask — boxed params pass
