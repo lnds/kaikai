@@ -84,6 +84,139 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.129.0 (2026-10-04)
+
+### BREAKING CHANGE
+
+- an imported module's effect now shadows a core effect of
+the same name for bare uses in the importing file; the core one is
+reachable as `effects.<Name>` (or the core module that declares it). A
+file that relied on a bare `Stdout`/`Log`/… meaning the builtin while
+importing a homonym must qualify it.
+- `kai typecheck` rejects a program declaring more than
+60000 variant constructors, which it accepted before (a build of such a
+program always panicked).
+- two files that map to one home are now an error naming
+both: a file whose name contains `__` beside a directory spelling the
+same path (`a__b.kai` and `a/b.kai`), or a user `list.kai` beside
+`local/list.kai`. Each compiled before only when one of the pair was
+aliased. Rename one of the two files.
+- a program that calls an imported bounded generic at a type
+with no impl of the bound, previously accepted, is now rejected.
+- a program that calls an imported bounded generic at a type
+with no impl of the bound, previously accepted, is now rejected.
+- a literal or constant argument that violates the
+`requires` or a refined parameter of a module-qualified callee, or of a
+method call resolved between homonymous modules, is now a compile error
+instead of a run-time panic. No program in the repository changes
+verdict.
+- a method call whose name a root or directly imported fn
+of the same arity declares now reaches that fn instead of the protocol
+op's impl. Measured over the repository: one site changes, the
+`cross_impl_vs_fn` fixture, which is now a negative. A method call at an
+arity no op declares (`[3, 1, 2].max()`) now compiles as an ordinary
+method call instead of failing against the dispatcher.
+- test files that each build alone but cannot build together
+now fail kai test with the shared build's error before any test runs, where
+each used to pass on its own. The case is two files of one directory
+declaring the same impl (or anything else the compiler rejects twice in one
+unit); move what they share into a module both import. A build that imports
+a module with a syntax error now fails even when nothing uses the module.
+- a literal or constant argument that violates a
+callee's `requires` or refined parameter through `|>`, the `_`
+placeholder, an applied lambda or a named constant is now a compile
+error instead of a run-time panic. The dump modes (`--dump-typed`,
+`--dump-mono`, ...) and `--library-mode` no longer fail on a contract
+violation; build, run, test, check and lint still do. No program in the
+repository changes verdict.
+- `kai typecheck` and `kaic2 --check` now reject programs
+whose protocol bound fails at a concrete instantiation. `kai build`
+already rejected every one of them.
+- record literals that omit a declared field, name an
+undeclared one, or repeat a field no longer compile.
+
+### Added
+
+- **typer**: send a method call on a protocol op where the prefix call goes (#2367)
+- **cli**: build a directory's test files as one binary (#2366)
+- **cli**: build kai test binaries in parallel with -j (#2356)
+
+### Fixed
+
+- **compiler**: a test block resolves names from the file that declares it (#2448)
+- **effects**: resolve effect names on the one scope ladder and carry their ids on every row (#2409)
+- **native**: give a shared nested rebuild's borrowed leaves their reference before the args run (#2443)
+- **tco**: a resolved call to a non-member keeps its callee (#2397)
+- **emit**: emit a function value by the id it carries (#2397)
+- **resolve**: carry the id of the function a qualified call names (#2397)
+- **compiler**: decode a string literal's escapes in one tail-recursive loop (#2410)
+- **native**: size handler frames from the handler and move the constructor-capacity verdict to the front-end (#2421)
+- **desugar**: test a range pattern at any depth of a match arm (#2418)
+- **modules**: resolve a qualifier two imports bind by the member each exports (#2408)
+- **modules**: home a module by the path it was imported through (#2394)
+- **perceus**: release an owned param whose read lands in a borrowed slot (#2420)
+- **emit**: pay a TRMC fn's exit drops in its base case (#2417)
+- **perceus**: give handler clauses the lambda contract for their captures (#2399)
+- **perceus**: release the op arguments a handler clause does not hand on (#2393)
+- **resolve**: a call reaches the declaration it names, never a builtin spelled the same (#2415)
+- **cache**: stop the dependency hash at an import cycle (#2412)
+- **test**: keep kai test within its job count (#2414)
+- **typecheck**: enforce protocol bounds of another module's pub fn (#2385)
+- **perceus**: release a field read passed where the callee only borrows (#2404)
+- **perceus**: pay a destructuring let's binders like an arm's (#2400)
+- **runtime**: give the compiler's main a fixed stack at every thread count (#2388)
+- **emit**: keep a let pattern's raw Int binders in scope after the let (#2389)
+- **perceus**: decide a handler's state alias by the binder a read reaches, not its spelling (#2381)
+- **ffi**: reject extern fn signatures naming non-foreign types at check time (#2386)
+- **typer**: stamp nested and let constructor patterns from their slot's type (#2380)
+- **compiler**: take a qualified fn value's arity from its own declaration (#2379)
+- **parse**: bound expression nesting and import-chain depth with a diagnostic (#2376)
+- **effects**: resolve a module's bare effect head through the scope ladder (#2373)
+- **refinements**: check module-qualified and contested method calls against their contracts
+- **typer**: stamp the picked declaration's id on a UFCS callee (#2362)
+- **refinements**: check call-site contracts on the typed program
+- **kir**: keep moved var-cell sets as registers and release handler state (#2360)
+- **typer**: desugar the apply pipe into the call it spells (#2359)
+- **typecheck**: run monomorphisation under --check so a bound violated at an instantiation is reported (#2361)
+- **perceus**: align a piped call's argument slots with the callee's parameters (#2349)
+- **native**: lay out every handler's ops in the effect's declaration order (#2345)
+- **typer**: reject record literals with a missing, unknown, or duplicate field (#2344)
+- **resolve**: stamp the performs and declarations of a home-spelled effect (#2339)
+- **typer**: give declarations back their ids after a cache hit (#2337)
+- **typer**: carry an effect's identity through a named instance (#2335)
+- **typer**: carry an effect's identity through a capability passed as a value (#2334)
+- **resolve**: settle an op written on a row alias to the effect that declares it (#2333)
+
+### Changed
+
+- **test**: memoise kai test's per-file checks by every input they read (#2448)
+- **emit**: pass the caller's evidence frame through when the callee's is the same (#2406)
+- **emit**: decide a modulo-cons slot's self-calls by expression positions (#2390)
+- **runtime**: tell atomic and immortal refcounts apart by threshold (#2419)
+- **compiler**: build the typer's per-program tables once and index type-home lookups (#2411)
+- **compiler**: find tail-call groups with a linear SCC pass (#2402)
+- **native**: optimise and emit module objects on worker threads (#2384)
+- **scope**: look up contested value names through a name index (#2395)
+- **typer**: build the constructor-payload table once per program, not per decl (#2403)
+- **cache**: file each decl in its own module's typed bucket (#2401)
+- **native**: register Perceus reuse targets so construction never interns them (#2398)
+- **compiler**: index the tail-call graph and contested value table by name (#2391)
+- **compiler**: gather literal escapes into a list and join once (#2392)
+- **typer**: carry the effect's SymId on row labels (#2375)
+- **compiler**: answer name-contest queries from a name index (#2387)
+- **compiler**: index the evidence-frame table by emitted symbol (#2383)
+- **compiler**: resolve each match arm's tag once in native lowering (#2378)
+- **typecheck**: skip the call-site rewrite under --check (#2374)
+- **compiler**: answer fn-name and signature lookups from the fn index (#2370)
+- **perceus**: read the borrowing prims from the core registry (#2369)
+- **perceus**: the tail-call rewrite reads the borrow set Perceus planned (#2365)
+- **native**: share native-modular objects across a package's test files (#2363)
+- **perceus**: carry the borrowed-param set into KIR as KParam.mode (#2358)
+- **compiler**: build one symbol table and extend it across the front end (#2350)
+- **resolve**: stamp a contested effect's id where its spelling is minted (#2347)
+- **compiler**: derive SymId from home, class and name (#2346)
+- **native**: find a perform's handler by effect id (#2338)
+
 ## v0.128.1 (2026-09-30)
 
 ### Fixed
