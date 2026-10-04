@@ -106,7 +106,24 @@ out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
         --path "$COREFIX" --path "$ROOT/stdlib" "$COREFIX/main.kai" 2>/dev/null)
 
 need '^kperform mc__go Log\.info!?#[0-9]+ Log@effects$'
-need '^kperform main Log\.note!?#[0-9]+ Log@main$'
+need '^kperform main Log__main\.note!?#[0-9]+ Log@main$'
+
+# The core effect stays nameable from that root as `effects.Log`: a handle
+# head, a qualified perform and a row label each carry the core's id, and
+# an alias keeps the components its own module settled.
+QUALFIX="$ROOT/examples/effects/core_effect_named_qualified"
+out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
+        --path "$QUALFIX" --path "$ROOT/stdlib" "$QUALFIX/main.kai" 2>/dev/null)
+
+need '^kperform both Log\.info#[0-9]+ Log@effects$'
+need '^kperform both Log__main\.note#[0-9]+ Log@main$'
+need '^unbox main with Log#[0-9]+ Log@effects$'
+need '^unbox main with Log__main#[0-9]+ Log@main$'
+need '^kperform ma__go Log__ma\.note#[0-9]+ Log@ma$'
+[ "$(row_id '^row both Log#')" = "$(id_of '^kperform both Log\.info')" ] \
+  || fail "a qualified row label carries a different id than the core effect"
+[ "$(row_id '^row main Stdout#')" = "$(id_of '^kperform ma__go Stdout\.print')" ] \
+  || fail "a builtin's row label carries a different id than its core declaration"
 
 # A declaration keeps its identity through the typer's cache: a warm build
 # must reach the late passes with the ids a cold build stamps, not `#-1` —

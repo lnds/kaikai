@@ -431,10 +431,9 @@ the typer walks the lexical stack of enclosing handles:
    the typer rejects partial handles whose omitted op would have
    needed this merge.
 3. **Main absorption** — no enclosing `handle ... with Eff`, the
-   function is `main`, and `Eff`'s `default { }` block (or the
-   legacy hardcoded handler set, for the 16 canonical builtins not
-   yet migrated) declares `op` → the auto-installed default at
-   `main` discharges it.
+   function is `main`, and the `default { }` block of the declaration
+   the label names declares `op` → the auto-installed default at
+   `main` discharges it. A homonym's default never stands in.
 4. **Reject** — otherwise the typer emits `effect not handled:
    Eff.op` with a diagnostic note describing the default-block
    status (no block, partial block, kaikai-bodied clause, or
@@ -877,6 +876,13 @@ they first need to be acted on.
    works via the standard module surface (`import` /
    `pub effect`). Open extension is intentionally out of scope —
    user-declared default handlers track separately under #533.
+   An effect name resolves like any other name
+   (`docs/namespaces-design.md` §1): the file's own declaration, then
+   its imports, then the core modules. An imported `Stdout` therefore
+   shadows the builtin in that file, which stays reachable as
+   `effects.Stdout`. Every row label, `handle` head and perform carries
+   the declaration it resolved to, so two effects sharing a name never
+   discharge, absorb or default for each other.
 
 ## Next steps
 

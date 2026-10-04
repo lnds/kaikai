@@ -1,11 +1,10 @@
 # compiler/effect_scope.kai — module scoping for effect names.
 #
-# Every declaration, row label, handler head, `use`, and `E.op` perform
-# of a contested effect name is respelled per its declaring module
-# (effect_scope_table). Runs on the parsed stream before the qualifier
-# passes: a handler head still carries its `m.E` and a perform its
-# `m.E.op`, so the qualifier picks the home here and the uncontested
-# forms are left for those passes to validate and strip.
+# Every row label and handler head is settled here to the declaration it
+# names, by the scope ladder, and stamped with its id; a contested name is
+# also respelled per its declaring module (effect_scope_table). Runs on the
+# parsed stream before the qualifier passes, while a head still carries its
+# `m.E` and a perform its `m.E.op`: past them the qualifier is gone.
 
 import compiler.util
 import compiler.ast
@@ -13,43 +12,31 @@ import compiler.modules
 import compiler.module_table
 import compiler.scope_walk
 import compiler.effect_scope_table
-import compiler.name_contest
+import compiler.effect_scope_ids
 import compiler.effect_scope_types
 import compiler.decl_names
 import compiler.symtab_build
+import compiler.symtab
+import compiler.scope_file
 
-#[doc("Respell the contested effect names of each import segment under its own module's viewpoint; the decls past the marks are the root file's.")]
+#[doc("Settle every effect reference of each import segment under its own file's view: stamp the declaration it names and respell a contested one; the decls past the marks are the root file's.")]
 pub fn es_segmented(segs: [ImportSeg], decls: [Decl], coll: [ESEntry],
       scopes: [ModScope], global: [ModuleEntry], target: String,
-      cores: [String], sels: [SelImport]) : [Decl] =
-  if list_length(coll) == 0 { decls }
-  else { es_seg_loop(segs, decls, coll, scopes, global, target, cores,
-                     scope_imports(scopes, global), sels) }
-
-fn es_seg_loop(segs: [ImportSeg], decls: [Decl], coll: [ESEntry],
-      scopes: [ModScope], global: [ModuleEntry], target: String,
-      cores: [String], imps: [ModImports], sels: [SelImport]) : [Decl] = match segs {
-  [] -> es_decls(decls, es_ctx(coll, target, target, cores, scopes, global, imps, sels))
+      cores: [String], tab: SymTab, views: FileViews) : [Decl] = match segs {
+  [] -> es_decls(decls, es_ctx(coll, target, target, cores, scopes, global, tab, views))
   [ISeg(mod_name, n), ...rest] -> {
     let home = if mod_name == "" { target } else { mod_name }
-    list_append(es_decls(seg_take(decls, n), es_ctx(coll, home, target, cores, scopes, global, imps, sels)),
-                es_seg_loop(rest, seg_drop(decls, n), coll, scopes, global, target, cores, imps, sels))
+    list_append(es_decls(seg_take(decls, n), es_ctx(coll, home, target, cores, scopes, global, tab, views)),
+                es_segmented(rest, seg_drop(decls, n), coll, scopes, global, target, cores, tab, views))
   }
 }
 
-#[doc("One module's viewpoint: its home, the root's, the cores, its imports and its qualifier table.")]
+#[doc("One module's viewpoint: its home, the root's, the cores, its qualifier table, and the symbol table with the file's scope view.")]
 pub fn es_ctx(coll: [ESEntry], home: String, target: String, cores: [String],
-      scopes: [ModScope], global: [ModuleEntry], imps: [ModImports],
-      sels: [SelImport]) : ESCtx = {
+      scopes: [ModScope], global: [ModuleEntry], tab: SymTab, views: FileViews) : ESCtx = {
   let owner = if home == target { "" } else { home }
-  let mt = ms_table(scopes, owner, global)
   ESCtx { coll: coll, home: home, target: target, cores: cores,
-          imports: es_imports_of(imps, owner), picks: nt_picks_of(sels, owner, mt), mt: mt }
-}
-
-fn es_imports_of(imps: [ModImports], owner: String) : [String] = match imps {
-  [] -> []
-  [MImp(o, names), ...rest] -> if o == owner { names } else { es_imports_of(rest, owner) }
+          mt: ms_table(scopes, owner, global), tab: tab, view: fv_of(views, home) }
 }
 
 fn es_decls(ds: [Decl], cx: ESCtx) : [Decl] = match ds {
@@ -57,7 +44,8 @@ fn es_decls(ds: [Decl], cx: ESCtx) : [Decl] = match ds {
   [d, ...rest] -> [es_decl(d, cx), ...es_decls(rest, cx)]
 }
 
-fn es_decl(d: Decl, cx: ESCtx) : Decl = match d {
+#[doc("One declaration through the pass, from the viewpoint `cx`.")]
+pub fn es_decl(d: Decl, cx: ESCtx) : Decl = match d {
   DFn(p, n, tps, ps, ret, row, body, l, c, mo, fsym) ->
     DFn(p, n, tps, es_params(ps, cx), es_ty_opt(ret, cx), es_row(row, cx),
         es_expr(body, sw_params(ps, []), cx), l, c, mo, fsym)
@@ -104,19 +92,21 @@ fn es_pop(o: ProtoOp, cx: ESCtx) : ProtoOp = match o {
 fn es_dblk(o: Option[DefaultBlock], cx: ESCtx) : Option[DefaultBlock] = match o {
   None -> None
   Some(DBlk(hcs, ret, l, c)) ->
-    Some(DBlk(sw_hclauses(hcs, [], (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (n) => es_head(n, cx)),
-              sw_hreturn_opt(ret, [], (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (n) => es_head(n, cx)),
+    Some(DBlk(sw_hclauses(hcs, [], (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (n, hs) => es_head(n, hs, cx)),
+              sw_hreturn_opt(ret, [], (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (n, hs) => es_head(n, hs, cx)),
               l, c))
 }
 
 fn es_expr(e: Expr, sh: [String], cx: ESCtx) : Expr =
-  sw_expr(e, sh, (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (n) => es_head(n, cx))
+  sw_expr(e, sh, (x, s) => es_leaf(x, s, cx), (t) => es_ty(t, cx), (n, hs) => es_head(n, hs, cx))
 
 #[doc("Respell the contested effect names of one free-standing expression under the context's viewpoint; interpolation fragments surface after the decl-level pass ran.")]
 pub fn es_expr_scoped(e: Expr, cx: ESCtx) : Expr = es_expr(e, [], cx)
 
-# A handler head: `m.E` picks the home, a bare `E` follows the ladder.
-fn es_head(n: String, cx: ESCtx) : String = es_resolve_ref(cx, n)
+# A handler head: `m.E` picks the home, a bare `E` follows the ladder. An
+# id already stamped is kept: the qualifier that chose it is gone.
+fn es_head(n: String, hs: SymId, cx: ESCtx) : SwHead =
+  SwHead(es_resolve_ref(cx, n), if sym_raw(hs) >= 0 { hs } else { es_ref_sym(cx, n) })
 
 # A perform: `E.op` with `E` free, or `m.E.op` with `m` free.
 fn es_leaf(e: Expr, sh: [String], cx: ESCtx) : Option[Expr] = match e.kind {
@@ -139,11 +129,12 @@ fn es_qualified_perform(e: Expr, inner: Expr, mid: String, op: String,
   EVar(m) ->
     if list_has(sh, m) { None }
     else { match es_resolve_qualified(cx, m, mid) {
-      Some(s) -> Some(es_re(e, EField(es_re(inner, EVar(s)), op)))
+      Some(s) -> Some(es_re(e, EField(es_re(inner, es_qualified_base(cx, m, mid, s)), op)))
       None -> None
     } }
   _ -> None
 }
+
 
 fn es_re(e: Expr, k: ExprKind) : Expr =
   Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
