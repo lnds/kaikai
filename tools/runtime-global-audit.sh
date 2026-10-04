@@ -63,7 +63,17 @@ fi
 # a bare type token (a leading `static`/`const`/type word, no `;`, no `(`,
 # no `#`, no `{`) fused with the following indented line — so the one-line
 # matcher below sees the whole declaration.
+# A counter declared through `KAI_RT_COUNTER(type name, init)` is a global
+# too: the macro expands to the definition, so it is read off the call.
 enumerate() {
+  local f="$1"
+  {
+    enumerate_plain "$f"
+    sed -nE 's/^KAI_RT_COUNTER\([^,]*[ *]([A-Za-z_][A-Za-z0-9_]*),.*/\1/p' "$f"
+  } | sort -u
+}
+
+enumerate_plain() {
   local f="$1"
   awk '
     prev != "" {
