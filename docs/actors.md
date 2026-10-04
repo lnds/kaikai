@@ -348,10 +348,15 @@ we do not care about". It is a reserved form for `link` and
 own signatures. See §*Open questions* #3 for why it is special.
 
 Installing a link between the current actor and `pid` means:
-if either actor crashes (unhandled effect or panic), the other
-receives `Cancel.raise()`. Links are bidirectional by
-construction; the scheduler maintains a set of linked peers
-per actor and delivers cancellation on fault.
+when either actor terminates — normal return, crash, or
+cancellation — the other receives `Cancel.raise()`, unless it
+traps exits (§*Trap-exit semantics*). Links are bidirectional by
+construction; the scheduler maintains a set of linked peers per
+actor. A link follows the fiber behind `pid`, not its mailbox
+scope: it fires when that fiber terminates, even if the scope
+closed earlier. A `pid` whose fiber has already terminated when
+`link` runs is reported at once, with the reason it terminated
+for, exactly as if it had terminated right after the call.
 
 Use when two actors depend on each other symmetrically — a
 worker and its job queue, two sides of a handshake. Do **not**
@@ -370,9 +375,11 @@ effect Monitor {
 `monitor(pid)` registers the current actor as an observer of
 `pid`. When `pid` terminates (normal return, crash, or
 cancellation), the observer receives a `MonitorDown` message
-**on its own mailbox**. A `pid` that has already terminated when
-`monitor` runs is reported at once, as on the BEAM, so a monitor
-never waits on a target that is already gone:
+**on its own mailbox**. Like a link, a monitor follows the fiber
+behind `pid`, not its mailbox scope. A `pid` whose fiber has
+already terminated when `monitor` runs is reported at once, as on
+the BEAM, so a monitor never waits on a target that is already
+gone:
 
 ```kai
 type MonitorDown = MonitorDown(ref: MonitorRef, cause: TerminationCause)
@@ -451,15 +458,17 @@ setting `cancel_requested`:
 |---|---|
 | normal return (`KAI_FIBER_DONE`)         | `"Normal"`  |
 | `Cancel.raise()` or `Spawn.cancel(...)` (`KAI_FIBER_CANCELLED`) | `"Crashed"` |
+| a runtime trap (out-of-range index, …) | `"Trapped: <message>"` |
 
 The fiber drains those messages with `Actor.receive()` exactly
 like any other mailbox traffic. Two requirements for delivery:
 
 1. The fiber must be inside a `with_mailbox { ... }` (or
    `with_mailbox_policy`) scope when its peer terminates — the
-   runtime locates the mailbox through the fiber's most-recently-
-   allocated mailbox slot. Without one, the propagation falls
-   back to the default `cancel_requested` behaviour.
+   runtime delivers into the fiber's innermost open mailbox, and
+   closing a nested one makes the enclosing one current again.
+   Without one, the propagation falls back to the default
+   `cancel_requested` behaviour.
 2. The fiber's message type must be `String` (or accept
    `String`) so the runtime's pre-built `"Normal"` /
    `"Crashed"` payloads round-trip through the typed mailbox.
