@@ -18,6 +18,11 @@
 # into <dir>/kaic2-a, and kaic2-a emits <out.c>, so the C that is linked is
 # this tree's codegen. A kaic1-class boot takes one.
 #
+# KAIC_BOOT_MODULAR=1 makes a kaic2-class boot emit both hops as a
+# `--emit=c-modular` stream, one translation unit per module, which
+# tools/kaic-link.sh compiles in parallel. It shapes a new emit only: a C
+# file is reused in whichever form it has.
+#
 # <out.c>.id records the boot, the hop count and the content hash of every
 # input the boot read. A C file is reused only on an exact match — mtimes
 # decide nothing. The hop-a files are scratch, never recorded or reused.
@@ -237,7 +242,9 @@ resolve() {
 # compiled against this tree's runtime.h, which pairs with this stdlib.
 run_boot() {
   if [ "$BOOT_CLASS" = kaic2 ]; then
-    (cd "$STAGE2" && KAIKAI_STDLIB_PATH="$ROOT/stdlib" "$BOOT_BIN" --edition "$(edition)" main.kai)
+    form=""
+    [ "${KAIC_BOOT_MODULAR:-}" != 1 ] || form=--emit=c-modular
+    (cd "$STAGE2" && KAIKAI_STDLIB_PATH="$ROOT/stdlib" "$BOOT_BIN" $form --edition "$(edition)" main.kai)
   else
     (cd "$STAGE2" && "$BOOT_BIN" main.kai)
   fi
