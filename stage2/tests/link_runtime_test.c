@@ -34,6 +34,15 @@ static int chain_has(KaiFiber *f, KaiFiber *target) {
     return 0;
 }
 
+/* The trampoline's termination tail: detach, then walk both chains. */
+static void terminate(KaiFiber *f, KaiExitReason reason) {
+    KaiLinkNode    *links;
+    KaiMonitorNode *monitors;
+    kai_fiber_detach_watchers(f, reason, &links, &monitors);
+    kai_link_propagate_terminate(f, links, reason);
+    kai_monitor_propagate_terminate(monitors);
+}
+
 int main(void) {
     /* Three fibers; we'll link A↔B and A↔C, then terminate A. */
     KaiFiber a = {0}, b = {0}, c = {0};
@@ -70,7 +79,7 @@ int main(void) {
     /* Propagate from a (simulates trampoline termination of a).
      * Reason CRASHED — peers without trap_exit get cancel_requested
      * regardless, so the existing assertions hold. */
-    kai_link_propagate_terminate(&a, KAI_EXIT_CRASHED);
+    terminate(&a, KAI_EXIT_CRASHED);
     check("a chain emptied",      a.linked_head == NULL);
     check("b cancel_requested",   b.cancel_requested == 1);
     check("c cancel_requested",   c.cancel_requested == 1);
@@ -81,8 +90,8 @@ int main(void) {
     check("c chain emptied",      c.linked_head == NULL);
 
     /* Re-propagating from b/c is a no-op (no chain). */
-    kai_link_propagate_terminate(&b, KAI_EXIT_NORMAL);
-    kai_link_propagate_terminate(&c, KAI_EXIT_NORMAL);
+    terminate(&b, KAI_EXIT_NORMAL);
+    terminate(&c, KAI_EXIT_NORMAL);
     check("re-propagate harmless", failed == 0);
 
     /* Mailbox owner_fiber roundtrip: alloc, set, read back. */
@@ -93,6 +102,10 @@ int main(void) {
         KaiMailbox *mb = kai_mailbox_alloc();
         check("mailbox owner is current fiber", mb->owner_fiber == &owner);
         check("alloc stamps owner.mailbox",     owner.mailbox == mb);
+        KaiMailbox *inner = kai_mailbox_alloc();
+        check("nested alloc shadows the outer", owner.mailbox == inner);
+        kai_mailbox_close(inner);
+        check("nested close restores the outer", owner.mailbox == mb);
         kai_mailbox_close(mb);
         check("close clears owner.mailbox",     owner.mailbox == NULL);
         kai_active_fiber = &kai_main_fiber;  /* restore */
@@ -119,7 +132,7 @@ int main(void) {
         kai_link_add_bidirectional(&dying, &watcher);
 
         /* Normal exit. */
-        kai_link_propagate_terminate(&dying, KAI_EXIT_NORMAL);
+        terminate(&dying, KAI_EXIT_NORMAL);
         check("trap-exit: cancel_requested NOT set",
               watcher.cancel_requested == 0);
         check("trap-exit: mailbox got 1 message",
@@ -136,7 +149,7 @@ int main(void) {
 
         /* Re-link + crash. */
         kai_link_add_bidirectional(&dying, &watcher);
-        kai_link_propagate_terminate(&dying, KAI_EXIT_CRASHED);
+        terminate(&dying, KAI_EXIT_CRASHED);
         check("trap-exit: still no cancel_requested",
               watcher.cancel_requested == 0);
         check("trap-exit: mailbox now has 2 messages",
@@ -161,7 +174,7 @@ int main(void) {
         plain.state = KAI_FIBER_RUNNING;
         plain.trap_exit = 0;
         kai_link_add_bidirectional(&dying, &plain);
-        kai_link_propagate_terminate(&dying, KAI_EXIT_CRASHED);
+        terminate(&dying, KAI_EXIT_CRASHED);
         check("plain peer cancel_requested",     plain.cancel_requested == 1);
         check("plain peer chain emptied",        plain.linked_head == NULL);
     }
@@ -174,7 +187,7 @@ int main(void) {
         watcher.trap_exit = 1;
         watcher.mailbox   = NULL;  /* explicit no-mailbox case */
         kai_link_add_bidirectional(&dying, &watcher);
-        kai_link_propagate_terminate(&dying, KAI_EXIT_NORMAL);
+        terminate(&dying, KAI_EXIT_NORMAL);
         check("trap_exit without mailbox falls back to cancel",
               watcher.cancel_requested == 1);
     }
