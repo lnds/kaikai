@@ -1628,14 +1628,11 @@ void kaix_env_set(void *env, int64_t j, KaiValue *v) {
     ((KaiValue **) env)[j] = v;
 }
 
-/* Clause prologue read: fetch capture `j` from `self->env` (byte 8) and
- * return it dup'd — perceus analyses each clause body in isolation and
- * assumes a private reference it may consume; the env holds one borrow
- * scoped to the install stmt-expr (mirror of emit_c's
- * `kai_internal_dup(_env->kai_<name>)`). */
+/* Clause prologue read: capture `j` from `self->env` (byte 8), borrowed.
+ * Perceus dups every read of a capture, as emit_c's prologue assumes. */
 KaiValue *kaix_clause_env_get(void *self, int j) {
     KaiValue **env = *((KaiValue ***)((char *) self + 8));
-    return kai_internal_dup(env[j]);
+    return env[j];
 }
 
 /* m7c-d — non-static wrappers for the default-handler clause
