@@ -1008,15 +1008,15 @@ static void kai_vec_count_cow(void) { kai_vec_cow_total++; }
  * cell crosses a function boundary the token cannot. This counter is the
  * exact upper bound on what an interprocedural token-pass would recover —
  * if it is small relative to alloc_total, #2 is not worth the ABI cost. */
-static KAI_TLS int64_t kai_rc_reuse_free_total = 0;
+KAI_RT_COUNTER(int64_t kai_rc_reuse_free_total, 0);
 /* #2 parity probe — kai_drop_reuse_token outcome split. unique = shell
  * handed back (donatable); null_shared = rc>1 so cannot steal; null_mismatch
  * = wrong tag/arity (e.g. RBLeaf scrutinee). Tells whether the wasted fresh
  * allocs are a sharing problem (would need a different fix) or genuinely the
  * inter-frame balance case (token-pass). */
-static KAI_TLS int64_t kai_rc_tok_unique = 0;
-static KAI_TLS int64_t kai_rc_tok_null_shared = 0;
-static KAI_TLS int64_t kai_rc_tok_null_mismatch = 0;
+KAI_RT_COUNTER(int64_t kai_rc_tok_unique, 0);
+KAI_RT_COUNTER(int64_t kai_rc_tok_null_shared, 0);
+KAI_RT_COUNTER(int64_t kai_rc_tok_null_mismatch, 0);
 /* Phase 1.B.1 — incref/decref call counters (the ones that actually
  * touch `rc`; pinned/INT32_MAX short-circuits are NOT counted). Lets a
  * borrow optimisation that elides incref/decref pairs show its effect
