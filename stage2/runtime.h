@@ -724,6 +724,13 @@ struct KaiValue {
          * mailbox (that happens when the with_mailbox / spawn_actor
          * scope exits). */
         struct KaiMailbox *mb;
+        /* KAI_PID: `pid.mb` is `mb`. `owner` is the exit record of the
+         * fiber that owns the mailbox, one reference per box, so links
+         * and monitors find that fiber even after the mailbox closed. */
+        struct {
+            struct KaiMailbox   *mb;
+            struct KaiFiberExit *owner;
+        } pid;
         /* FFI v2 (#417): opaque C handle. The parked pointer is borrowed
          * external memory — the box's RC frees only the KaiValue, never
          * `foreign_ptr` (the driver calls the C destructor itself). */
@@ -3081,6 +3088,7 @@ struct KaiSelectWaiter {
 };
 typedef struct KaiLinkNode KaiLinkNode;  /* Phase 5 — defined below */
 typedef struct KaiMonitorNode KaiMonitorNode;  /* Tier 2 Monitor — defined below */
+typedef struct KaiFiberExit KaiFiberExit;
 
 struct KaiFiber {
     KaiEvidence    *evidence_top;
@@ -3178,16 +3186,9 @@ struct KaiFiber {
      * it must be set before the link that should respect it; later
      * toggles affect future propagations only. */
     int             trap_exit;
-    /* Tier 2 — most-recently-allocated mailbox owned by this fiber.
-     * Set by kai_mailbox_alloc[_bounded] and cleared by
-     * kai_mailbox_close. Read by kai_link_propagate_terminate when
-     * trap_exit=1 to find a delivery target for the Exit string.
-     * v1 simplification: nested with_mailbox is not tracked — the
-     * inner allocation overwrites and the inner free clears the
-     * slot, leaving the outer mailbox unreachable to the trap-exit
-     * walker until the inner scope exits. Demos do not nest.
-     * Forward-declared as struct KaiMailbox * because the full
-     * KaiMailbox typedef sits below KaiFiber in this header. */
+    /* Innermost open mailbox this fiber owns; each one links to the
+     * mailbox it shadows through `outer`, and closing one unlinks it.
+     * Link/monitor deliveries to this fiber land here. */
     struct KaiMailbox *mailbox;
     /* Tier 2 — intrusive list of fibers monitoring this one. Each
      * Monitor.monitor(target_pid) call from an observer fiber
@@ -3294,6 +3295,9 @@ struct KaiFiber {
      * imbalance eventually walks a shadow stack off its fixed-size mapping.
      * See KAI_TSAN_SWITCH_TO. */
     void *tsan_fiber;
+    /* Created when a mailbox is first stamped with this fiber as owner;
+     * see KaiFiberExit. */
+    _Atomic(KaiFiberExit *) exit_rec;
 };
 
 /* Issue #959 — one open structured-concurrency scope. Children spawned
@@ -3361,7 +3365,8 @@ struct KaiNursery {
     0,                   /* pending_park — not a reactor park */          \
     0,                   /* reactor_fired */                              \
     NULL,                /* commit_next */                               \
-    NULL                 /* tsan_fiber — bound on this thread's first switch */ \
+    NULL,                /* tsan_fiber — bound on this thread's first switch */ \
+    NULL                 /* exit_rec */                                  \
 }
 /* `kai_active_fiber` cannot be statically initialised to `&kai_main_fiber`
  * now that both are `_Thread_local`: the address of a thread-local is not a
@@ -3908,6 +3913,8 @@ struct KaiMailbox {
      * lands in m8.x #6) will set owner_fiber to the spawned
      * fiber instead. */
     KaiFiber    *owner_fiber;
+    /* The owner's mailbox this one shadows while open. */
+    KaiMailbox  *outer;
     /* M:N — guards the node list against a cross-thread `Actor.send`.
      * A same-thread send (owner on the sender's thread, the only case
      * at N=1) takes the fast path and never locks. A cross-thread send
@@ -3955,6 +3962,57 @@ struct KaiMonitorNode {
     KaiValue       *target_pid;
     KaiMonitorNode *next;
 };
+
+/* How a fiber looks through the pids of the mailboxes it owns: alive, or
+ * ended and why. The fiber and every such Pid box hold a reference, so a
+ * link or monitor placed through a pid reaches the fiber for as long as it
+ * runs, even after the mailbox scope closed, and learns its real exit once
+ * it is gone. `lock` orders the fiber's terminate detach against link and
+ * monitor placement on it. */
+/* Normal (DONE), Crashed (CANCELLED) or Trapped (a runtime trap), as
+ * trap-exit delivery reports it. */
+typedef enum {
+    KAI_EXIT_NORMAL  = 0,
+    KAI_EXIT_CRASHED = 1,
+    KAI_EXIT_TRAPPED = 2
+} KaiExitReason;
+
+struct KaiFiberExit {
+    _Atomic int  refs;
+    _Atomic int  lock;
+    KaiFiber    *fiber;   /* NULL once the fiber has ended */
+    int          reason;  /* KaiExitReason, valid once `fiber` is NULL */
+    const char  *msg;     /* static trap message, or NULL */
+};
+
+static void kai_fiber_exit_lock(KaiFiberExit *x) {
+    if (kai_nthreads <= 1) return;
+    while (atomic_exchange_explicit(&x->lock, 1, memory_order_acquire)) { }
+}
+
+static void kai_fiber_exit_unlock(KaiFiberExit *x) {
+    if (kai_nthreads > 1) atomic_store_explicit(&x->lock, 0, memory_order_release);
+}
+
+static void kai_fiber_exit_unref(KaiFiberExit *x) {
+    if (x && atomic_fetch_sub_explicit(&x->refs, 1, memory_order_acq_rel) == 1) free(x);
+}
+
+/* `f`'s exit record with one more reference. Must run before `f` can
+ * terminate: on `f` itself, or before it is enqueued. */
+static KaiFiberExit *kai_fiber_exit_ref(KaiFiber *f) {
+    KaiFiberExit *x = atomic_load_explicit(&f->exit_rec, memory_order_acquire);
+    if (!x) {
+        KaiFiberExit *fresh = (KaiFiberExit *) calloc(1, sizeof(KaiFiberExit));
+        if (!fresh) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+        atomic_init(&fresh->refs, 1);
+        fresh->fiber = f;
+        if (atomic_compare_exchange_strong(&f->exit_rec, &x, fresh)) x = fresh;
+        else free(fresh);
+    }
+    atomic_fetch_add_explicit(&x->refs, 1, memory_order_relaxed);
+    return x;
+}
 
 /* Phase 4 forward decls: mailbox push/pop park/wake the calling
  * fiber via the scheduler primitives, which are defined further
@@ -4067,7 +4125,10 @@ static KaiMailbox *kai_mailbox_new(int cap, int overflow, int owned) {
     atomic_init(&mb->pins, 1);
     if (owned) {
         mb->owner_fiber = kai_current_fiber();
-        if (mb->owner_fiber) mb->owner_fiber->mailbox = mb;
+        if (mb->owner_fiber) {
+            mb->outer = mb->owner_fiber->mailbox;
+            mb->owner_fiber->mailbox = mb;
+        }
     }
     return mb;
 }
@@ -4416,10 +4477,12 @@ static void kai_mailbox_unpin(KaiMailbox *mb) {
  * later pushes drop theirs, and senders parked on a full BlockSender mailbox
  * are woken to observe the close instead of waiting forever. */
 static void kai_mailbox_close(KaiMailbox *mb) {
-    /* Nested with_mailbox: the inner close clears the slot even though the
-     * outer mailbox is still alive. */
-    if (mb->owner_fiber && mb->owner_fiber->mailbox == mb) {
-        mb->owner_fiber->mailbox = NULL;
+    /* Only the owner closes, so its chain is not read concurrently here.
+     * An aborted inner scope never closes, so `mb` need not be innermost. */
+    if (mb->owner_fiber) {
+        KaiMailbox **slot = &mb->owner_fiber->mailbox;
+        while (*slot && *slot != mb) slot = &(*slot)->outer;
+        if (*slot) *slot = mb->outer;
     }
     kai_mbox_lock(mb);
     mb->closed = 1;
@@ -4488,6 +4551,7 @@ static KaiMailbox *kai_mailbox_pin(KaiValue *pid) {
 static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
     KaiValue *v = kai_alloc(KAI_PID);
     v->as.mb = mb;
+    if (mb->owner_fiber) v->as.pid.owner = kai_fiber_exit_ref(mb->owner_fiber);
     /* Senders on any scheduler thread dup and drop this box, so its count is
      * atomic. Freeing it never touches the mailbox, which its scope owns. */
     kai_rc_make_atomic(v);
@@ -4749,6 +4813,21 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
                     }
                     v->as.fib->monitor_head = NULL;
                 }
+                /* A fiber freed without terminating never ran to an exit;
+                 * its pids must not keep pointing at it. */
+                {
+                    KaiFiberExit *x = atomic_load_explicit(&v->as.fib->exit_rec,
+                                                           memory_order_acquire);
+                    if (x) {
+                        kai_fiber_exit_lock(x);
+                        if (x->fiber == v->as.fib) {
+                            x->fiber  = NULL;
+                            x->reason = KAI_EXIT_CRASHED;
+                        }
+                        kai_fiber_exit_unlock(x);
+                        kai_fiber_exit_unref(x);
+                    }
+                }
                 /* R4 fix — when the trampoline drops the scheduler's
                  * ref on its own wrapper at DONE/CANCELLED, the wrapper
                  * may go to RC=0 here while we are still running on
@@ -4781,6 +4860,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
             /* The mailbox is owned by the with_mailbox / spawn_actor
              * scope, NOT by the Pid value. Dropping a Pid handle
              * does not free the mailbox. */
+            kai_fiber_exit_unref(v->as.pid.owner);
             break;
         case KAI_BYTE:
             /* Unreachable: every Byte is an immortal kai_byte_cache cell. */
@@ -9087,7 +9167,9 @@ static KaiValue *kai_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
     if (pid && pid->tag == KAI_PID && pid->as.mb &&
         fiber && fiber->tag == KAI_FIBER && fiber->as.fib) {
         pid->as.mb->owner_fiber = fiber->as.fib;
+        pid->as.mb->outer       = fiber->as.fib->mailbox;
         fiber->as.fib->mailbox  = pid->as.mb;
+        if (!pid->as.pid.owner) pid->as.pid.owner = kai_fiber_exit_ref(fiber->as.fib);
     }
     /* m5.x flip Phase 3 closeout (issue #82): consume input refs. */
     if (pid)   kai_decref(pid);
@@ -9102,14 +9184,13 @@ static KaiValue *kai_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
  * this returns, Monitor/Link in the spawning fiber resolve owner_fiber
  * synchronously. Consumes `pid` and `thunk`: the fiber holds its own
  * reference to the thunk, the caller keeps its own Pid handle. */
-static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMailbox *stamp_mb);
+static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiValue *stamp_pid);
 KAI_SCHED_FN KaiValue *kai_core_spawn_actor_fiber(KaiValue *pid, KaiValue *thunk)
 #if KAI_SCHED_DECL_ONLY
 ;
 #else
 {
-    KaiMailbox *mb = (pid && pid->tag == KAI_PID) ? pid->as.mb : NULL;
-    KaiValue *f = kai_spawn_fiber_stamped(thunk, mb);
+    KaiValue *f = kai_spawn_fiber_stamped(thunk, (pid && pid->tag == KAI_PID) ? pid : NULL);
     if (pid) kai_decref(pid);
     kai_decref(thunk);
     return f;
@@ -16207,20 +16288,16 @@ static ucontext_t *kai_uc_link_target(void);
 
 /* Phase 5 forward decl: link propagation runs in the trampoline's
  * termination tail; the helper itself is defined alongside the
- * Link default handler further down. The reason argument distinguishes
- * Normal (DONE) from Crashed (CANCELLED) and Trapped (a runtime trap)
- * for trap-exit delivery. */
-typedef enum {
-    KAI_EXIT_NORMAL  = 0,
-    KAI_EXIT_CRASHED = 1,
-    KAI_EXIT_TRAPPED = 2
-} KaiExitReason;
+ * Link default handler further down. */
 
-static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason);
+static void kai_fiber_detach_watchers(KaiFiber *self, KaiExitReason reason,
+                                      KaiLinkNode **links, KaiMonitorNode **monitors);
+static void kai_link_propagate_terminate(KaiFiber *self, KaiLinkNode *ln,
+                                         KaiExitReason reason);
 /* Tier 2 Monitor — observers learn about target's termination via a
  * single push of `target_pid` into observer->mailbox. Defined
  * alongside the Monitor default handler further down. */
-static void kai_monitor_propagate_terminate(KaiFiber *self);
+static void kai_monitor_propagate_terminate(KaiMonitorNode *mn);
 /* Eager nursery cancel-on-fail — defined alongside the nursery ops
  * further down. */
 static void kai_nursery_propagate_failure(KaiFiber *self);
@@ -16892,14 +16969,17 @@ static void kai_fiber_trampoline(void) {
      *     instead of being cancelled.
      * The exit reason: DONE → Normal, trapped → Trapped, otherwise
      * CANCELLED → Crashed. */
-    kai_link_propagate_terminate(self,
-        self->state == KAI_FIBER_DONE ? KAI_EXIT_NORMAL
-        : self->trapped ? KAI_EXIT_TRAPPED : KAI_EXIT_CRASHED);
+    KaiExitReason   exit_reason = self->state == KAI_FIBER_DONE ? KAI_EXIT_NORMAL
+                                : self->trapped ? KAI_EXIT_TRAPPED : KAI_EXIT_CRASHED;
+    KaiLinkNode    *links;
+    KaiMonitorNode *monitors;
+    kai_fiber_detach_watchers(self, exit_reason, &links, &monitors);
+    kai_link_propagate_terminate(self, links, exit_reason);
 
     /* Tier 2 Monitor — push our pid into each observer's mailbox.
      * Observers do not get cancel_requested set; monitors are
      * unidirectional and fault-isolated. */
-    kai_monitor_propagate_terminate(self);
+    kai_monitor_propagate_terminate(monitors);
 
     /* Wake awaiters. Each was parked in Spawn.await / Spawn.select /
      * nursery_join. Snapshot the chain under this fiber's slot lock so it
@@ -17360,7 +17440,8 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_yield(void *self, KaiCont *k)
  * optionally stamps `stamp_mb` as its mailbox BEFORE enqueue (so the
  * owner is wired before the child can be stolen and before this returns),
  * and returns the RC=2 Fiber[T] wrapper. */
-static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMailbox *stamp_mb) {
+static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiValue *stamp_pid) {
+    KaiMailbox *stamp_mb = stamp_pid ? stamp_pid->as.mb : NULL;
     if (!thunk || thunk->tag != KAI_CLOSURE) {
         fprintf(stderr, "kai: Spawn.spawn called with non-closure value\n");
         kai_exit(1);
@@ -17397,6 +17478,7 @@ static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiMai
     if (stamp_mb) {
         stamp_mb->owner_fiber = f;
         f->mailbox            = stamp_mb;
+        if (!stamp_pid->as.pid.owner) stamp_pid->as.pid.owner = kai_fiber_exit_ref(f);
     }
     /* R4 fix — allocate the wrapper before enqueue so the scheduler
      * can hold its own incref on the value. Without this second ref a
@@ -17902,12 +17984,10 @@ static KaiValue *kai_default_cancel_raise(void *self, KaiCont *k) {
  *
  * v1 simplifications:
  *  - `Pid[Nothing]` is the type-erased existential pid the typer
- *    uses for link/monitor ops; we resolve via `peer->as.mb->owner_fiber`.
+ *    uses for link/monitor ops; we resolve via the pid's exit record.
  *  - Self-links (a == b) are dropped.
- *  - If the peer mailbox has no owner_fiber (mailbox alloc'd
- *    outside any fiber context, e.g. before runtime init), the
- *    link is silently dropped — caller cannot observe failure
- *    because the op is `Unit`.
+ *  - A pid with no owner (mailbox alloc'd outside any fiber context)
+ *    links nothing.
  *  - Duplicate links between the same pair are not de-dup'd; the
  *    propagation walk sets cancel_requested idempotently, so the
  *    duplicates are harmless beyond the wasted KaiLinkNode.
@@ -17951,32 +18031,28 @@ static void kai_deliver_to_mailbox(KaiMailbox *mb, KaiValue *msg) {
     }
 }
 
-static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason) {
-    KaiLinkNode *ln = self->linked_head;
-    self->linked_head = NULL;
+/* Tell `peer` that a fiber linked to it ended: a trap-exit'd peer with a
+ * mailbox receives the reason string, any other is cancelled at its next
+ * yield point. */
+static void kai_link_notify(KaiFiber *peer, KaiExitReason reason, const char *trap_msg) {
+    if (!(peer->trap_exit && peer->mailbox)) {
+        peer->cancel_requested = 1;
+    } else if (reason == KAI_EXIT_TRAPPED) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Trapped: %s", trap_msg ? trap_msg : "runtime trap");
+        kai_deliver_to_mailbox(peer->mailbox, kai_str_dyn(buf));
+    } else {
+        const char *txt = (reason == KAI_EXIT_NORMAL) ? "Normal" : "Crashed";
+        kai_deliver_to_mailbox(peer->mailbox, kai_str(txt));
+    }
+}
+
+static void kai_link_propagate_terminate(KaiFiber *self, KaiLinkNode *ln, KaiExitReason reason) {
     while (ln) {
         KaiLinkNode *next = ln->next;
         KaiFiber *peer = ln->peer;
         if (peer) {
-            if (peer->trap_exit && peer->mailbox) {
-                /* Trap-exit delivery: push the reason string into the
-                 * peer's mailbox. The mailbox holds an owning ref on
-                 * each msg (kai_mailbox_push convention via
-                 * mailbox_send's incref). Wake any parked receiver
-                 * — that's exactly what kai_mailbox_push already does
-                 * via its recv_waiter handoff. */
-                if (reason == KAI_EXIT_TRAPPED) {
-                    char buf[256];
-                    snprintf(buf, sizeof(buf), "Trapped: %s",
-                             self->trap_msg ? self->trap_msg : "runtime trap");
-                    kai_deliver_to_mailbox(peer->mailbox, kai_str_dyn(buf));
-                } else {
-                    const char *txt = (reason == KAI_EXIT_NORMAL) ? "Normal" : "Crashed";
-                    kai_deliver_to_mailbox(peer->mailbox, kai_str(txt));
-                }
-            } else {
-                peer->cancel_requested = 1;
-            }
+            kai_link_notify(peer, reason, self->trap_msg);
             /* Remove our back-link from peer's chain (linear scan;
              * v1 chains are short — typically 1-2 entries). At N>1 a
              * link straddling two threads mutates the peer's chain from
@@ -18001,11 +18077,24 @@ static void kai_link_propagate_terminate(KaiFiber *self, KaiExitReason reason) {
     }
 }
 
+/* Link the current fiber to `peer_pid`'s owner. A peer that has already
+ * ended is reported at once, as if it had ended right after the call. */
+static void kai_link_watch(KaiValue *peer_pid) {
+    KaiFiberExit *x = peer_pid->as.pid.owner;
+    if (!x) return;
+    KaiFiber *self = kai_current_fiber();
+    kai_fiber_exit_lock(x);
+    KaiFiber     *peer   = x->fiber;
+    KaiExitReason reason = (KaiExitReason) x->reason;
+    const char   *msg    = x->msg;
+    if (peer) kai_link_add_bidirectional(self, peer);
+    kai_fiber_exit_unlock(x);
+    if (!peer) kai_link_notify(self, reason, msg);
+}
+
 static KaiValue *kai_default_link_link(void *self, KaiValue *peer, KaiCont *k) {
     (void) self;
-    if (peer && peer->tag == KAI_PID && peer->as.mb && peer->as.mb->owner_fiber) {
-        kai_link_add_bidirectional(kai_current_fiber(), peer->as.mb->owner_fiber);
-    }
+    if (peer && peer->tag == KAI_PID) kai_link_watch(peer);
     return kai_cont_resume(k, kai_unit());
 }
 
@@ -18111,20 +18200,27 @@ static int kai_monitor_remove(KaiFiber *target, KaiFiber *observer, KaiValue *ta
  * not encoded in the v1 message — observers that need it can pair
  * Monitor with Link+trap_exit, which delivers the
  * "Normal"/"Crashed" string into the same mailbox. */
-static void kai_monitor_propagate_terminate(KaiFiber *self) {
-    /* Unowning the mailbox and detaching the chain under its lock orders
-     * this against kai_monitor_watch: a watcher either lands on the chain
-     * walked here or finds no owner and delivers itself. Unowning also
-     * keeps owner_fiber from dangling once this fiber is freed. */
-    KaiMailbox *own = self->mailbox && self->mailbox->owner_fiber == self
-        ? self->mailbox : NULL;
-    if (own) {
-        kai_mbox_lock(own);
-        own->owner_fiber = NULL;
+/* Mark `self` ended on its exit record and detach its link and monitor
+ * chains under the record's lock. kai_link_watch and kai_monitor_watch
+ * place under the same lock, so each either lands on a chain detached
+ * here or finds the fiber gone and reports the exit itself. */
+static void kai_fiber_detach_watchers(KaiFiber *self, KaiExitReason reason,
+                                      KaiLinkNode **links, KaiMonitorNode **monitors) {
+    KaiFiberExit *x = atomic_load_explicit(&self->exit_rec, memory_order_acquire);
+    if (x) {
+        kai_fiber_exit_lock(x);
+        x->fiber  = NULL;
+        x->reason = reason;
+        x->msg    = self->trap_msg;
     }
-    KaiMonitorNode *mn = self->monitor_head;
+    *links    = self->linked_head;
+    *monitors = self->monitor_head;
+    self->linked_head  = NULL;
     self->monitor_head = NULL;
-    if (own) kai_mbox_unlock(own);
+    if (x) kai_fiber_exit_unlock(x);
+}
+
+static void kai_monitor_propagate_terminate(KaiMonitorNode *mn) {
     while (mn) {
         KaiMonitorNode *next = mn->next;
         KaiFiber *observer = mn->observer;
@@ -18144,20 +18240,18 @@ static void kai_monitor_propagate_terminate(KaiFiber *self) {
 }
 
 /* Watch `target_pid` from the current fiber. A target that has already
- * ended (mailbox closed, or owner terminated) is reported at once, as if
- * it had died right after the call. */
+ * ended is reported at once, as if it had ended right after the call. */
 static void kai_monitor_watch(KaiValue *target_pid) {
-    KaiFiber   *observer = kai_current_fiber();
-    KaiMailbox *mb       = kai_mailbox_pin(target_pid);
-    int         watching = 0;
-    if (mb) {
-        kai_mbox_lock(mb);
-        if (mb->owner_fiber) {
-            kai_monitor_add(mb->owner_fiber, observer, target_pid);
+    KaiFiber     *observer = kai_current_fiber();
+    KaiFiberExit *x        = target_pid->as.pid.owner;
+    int           watching = 0;
+    if (x) {
+        kai_fiber_exit_lock(x);
+        if (x->fiber) {
+            kai_monitor_add(x->fiber, observer, target_pid);
             watching = 1;
         }
-        kai_mbox_unlock(mb);
-        kai_mailbox_unpin(mb);
+        kai_fiber_exit_unlock(x);
     }
     if (!watching && observer->mailbox) {
         kai_deliver_to_mailbox(observer->mailbox, kai_incref(target_pid));
@@ -18179,12 +18273,11 @@ static KaiValue *kai_default_monitor_monitor(void *self, KaiValue *target, KaiCo
 
 static KaiValue *kai_default_monitor_demonitor(void *self, KaiValue *ref, KaiCont *k) {
     (void) self;
-    KaiMailbox *mb = (ref && ref->tag == KAI_PID) ? kai_mailbox_pin(ref) : NULL;
-    if (mb) {
-        kai_mbox_lock(mb);
-        if (mb->owner_fiber) kai_monitor_remove(mb->owner_fiber, kai_current_fiber(), ref);
-        kai_mbox_unlock(mb);
-        kai_mailbox_unpin(mb);
+    KaiFiberExit *x = (ref && ref->tag == KAI_PID) ? ref->as.pid.owner : NULL;
+    if (x) {
+        kai_fiber_exit_lock(x);
+        if (x->fiber) kai_monitor_remove(x->fiber, kai_current_fiber(), ref);
+        kai_fiber_exit_unlock(x);
     }
     return kai_cont_resume(k, kai_unit());
 }
