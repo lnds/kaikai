@@ -16,10 +16,11 @@
 # protects is the EXACT number: a regression that retains one extra
 # reference per iteration moves it, whatever its baseline was.
 #
-# tools/rc-leak-baseline.txt holds one `<name>:<c>:<native>` line per
-# fixture. A fixture whose count differs from its pinned value FAILS; an
-# unlisted fixture FAILS (a new fixture must record its measurement). A
-# column holding `-` skips the fixture on that backend.
+# tools/baselines/rc-leak/<name> holds one `<c>:<native>` line per
+# fixture. A fixture whose count differs from its pinned value FAILS; a
+# fixture with no file FAILS (a new fixture must record its measurement). A
+# column holding `-` skips the fixture on that backend. One file per
+# fixture keeps two changes to different fixtures from ever conflicting.
 #
 # Counts are deterministic per backend but NOT equal across them: the two
 # backends disagree on how many cells survive to exit for a third of the
@@ -31,12 +32,12 @@
 # fixture therefore also runs main twice in one process
 # (KAI_TRACE_RC_RUNS=2): growth = leaked(2 runs) - leaked(1 run) is what
 # the program retains per run of its work. It must be 0, except for the
-# known leaks pinned exactly in tools/rc-growth-baseline.txt, one
-# `<name>:<c>:<native>` line each.
+# known leaks pinned exactly in tools/baselines/rc-growth/<name>, one
+# `<c>:<native>` line each.
 #
 # examples/effects is held to growth only: its fixtures print through
 # handlers, fibers and timers, so only the per-run retention is pinned, in
-# tools/rc-effects-growth-baseline.txt (a `-` column skips the backend).
+# tools/baselines/rc-effects-growth/<name> (a `-` column skips the backend).
 
 set -u
 
@@ -44,7 +45,7 @@ cd "$(dirname "$0")/.."
 export ROOT="$(pwd)"
 export KAI="$ROOT/bin/kai"
 export WORK="$ROOT/stage2/build/rc-leak-gate"
-export BASELINE="$ROOT/tools/rc-leak-baseline.txt"
+export BASELINE="$ROOT/tools/baselines/rc-leak"
 SKIPS="$ROOT/tools/rc-leak-skips.txt"
 export BACKEND="${KAI_LEAK_BACKEND:-c}"
 export RUN_TIMEOUT="${KAI_LEAK_TIMEOUT:-120}"
@@ -67,10 +68,10 @@ if [ "$BACKEND" = native ]; then
 fi
 
 # The growth ratchet of a corpus.
-growth_file() {
+growth_dir() {
   case "$1" in
-    effects) echo "$ROOT/tools/rc-effects-growth-baseline.txt" ;;
-    *)       echo "$ROOT/tools/rc-growth-baseline.txt" ;;
+    effects) echo "$ROOT/tools/baselines/rc-effects-growth" ;;
+    *)       echo "$ROOT/tools/baselines/rc-growth" ;;
   esac
 }
 
@@ -79,8 +80,9 @@ exact_pinned() { [ "$1" = perceus ]; }
 
 # The baseline column for the backend under test; `-` means skipped there.
 pinned() {
-  local row; row="$(sed -n "s/^$1://p" "${2:-$BASELINE}" | head -1)"
-  [ -n "$row" ] || return
+  local pin="${2:-$BASELINE}/$1" row
+  [ -f "$pin" ] || return
+  row="$(head -1 "$pin")"
   case "$BACKEND" in
     native) echo "${row#*:}" ;;
     *)      echo "${row%%:*}" ;;
@@ -90,12 +92,12 @@ pinned() {
 # A fixture skipped on this backend carries `-` in the file that pins it.
 skipped() {
   if exact_pinned "$1"; then [ "$(pinned "$2")" = - ]
-  else [ "$(pinned "$2" "$(growth_file "$1")")" = - ]; fi
+  else [ "$(pinned "$2" "$(growth_dir "$1")")" = - ]; fi
 }
 
 # The pinned growth: 0 unless the fixture is a known leak.
 pinned_growth() {
-  local g; g="$(pinned "$2" "$(growth_file "$1")")"
+  local g; g="$(pinned "$2" "$(growth_dir "$1")")"
   echo "${g:-0}"
 }
 
@@ -133,7 +135,7 @@ measure_one() {
   esac
   echo "$once:$growth" > "$bin.measured"
 }
-export -f measure_one ledger_run pinned pinned_growth skipped growth_file exact_pinned
+export -f measure_one ledger_run pinned pinned_growth skipped growth_dir exact_pinned
 
 # A fixture with an `.err.expected` golden is a compile-error test, and a
 # `library` or `harness` line in tools/rc-leak-skips.txt names one the gate
@@ -167,7 +169,7 @@ while IFS= read -r id; do
   if exact_pinned "$corpus"; then
     expect="$(pinned "$name")"
     if [ -z "$expect" ]; then
-      echo "FAIL $id — not in $(basename "$BASELINE"); measured leaked=$measured"
+      echo "FAIL $id — no pin at tools/baselines/rc-leak/$name; measured leaked=$measured"
       fail=1
     elif [ "$measured" != "$expect" ]; then
       echo "FAIL $id — leaked=$measured, baseline $expect"
@@ -189,17 +191,18 @@ while IFS= read -r id; do
   fi
 done < "$fixtures"
 
-# A baseline line with no fixture behind it: the fixture was renamed or
-# deleted and the line was left orphaned.
+# A pin with no fixture behind it: the fixture was renamed or deleted and
+# the pin was left orphaned.
 orphans() {
-  local corpus="$1" file="$2" name
-  while IFS=: read -r name _; do
-    case "$name" in ''|\#*) continue ;; esac
-    grep -qx "$corpus/$name" "$fixtures" || { echo "FAIL $corpus/$name — $(basename "$file") line has no fixture"; fail=1; }
-  done < "$file"
+  local corpus="$1" dir="$2" pin name
+  for pin in "$dir"/*; do
+    [ -f "$pin" ] || continue
+    name="$(basename "$pin")"
+    grep -qx "$corpus/$name" "$fixtures" || { echo "FAIL $corpus/$name — ${dir#"$ROOT"/}/$name has no fixture"; fail=1; }
+  done
 }
 orphans perceus "$BASELINE"
-for corpus in $CORPORA; do orphans "$corpus" "$(growth_file "$corpus")"; done
+for corpus in $CORPORA; do orphans "$corpus" "$(growth_dir "$corpus")"; done
 
 [ "$fail" -eq 0 ] || { echo "rc-leak-gate: FAIL"; exit 1; }
 echo "rc-leak-gate: PASS — $total fixtures match their pinned RC ledger."

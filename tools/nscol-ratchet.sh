@@ -3,8 +3,8 @@
 #
 # The corpus carries fixtures whose defect is still live, so a plain
 # exit-code gate would never be green and would get switched off. Instead
-# each axis has an allowed failure count in tools/nscol-baseline.txt
-# (`<axis>:<count>`): more failures than the baseline is a regression and
+# each axis has an allowed failure count in tools/baselines/nscol/<axis>
+# (one number; a missing file means 0): more failures than the baseline is a regression and
 # fails naming the fixtures; fewer is progress and the baseline should
 # come down so it cannot bounce back.
 #
@@ -18,7 +18,7 @@
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BASELINE_FILE="$ROOT/tools/nscol-baseline.txt"
+BASELINE_DIR="$ROOT/tools/baselines/nscol"
 
 [ $# -eq 2 ] || { echo "usage: $0 <axis> <log>" >&2; exit 2; }
 axis="$1"
@@ -32,7 +32,7 @@ ran=$(echo "$verdicts" | awk 'NF { print $3 }' | sort -u | grep -c . || true)
 failing="$(echo "$verdicts" | awk '$2 != "OK" { print $3 }' | sort -u)"
 fail=$(echo "$failing" | grep -c . || true)
 
-baseline=$(grep -E "^$axis:" "$BASELINE_FILE" 2>/dev/null | head -1 | cut -d: -f2 | tr -d ' ')
+baseline=$(head -1 "$BASELINE_DIR/$axis" 2>/dev/null | tr -d ' ')
 baseline="${baseline:-0}"
 
 status_dir="$(dirname "$log")"
@@ -61,13 +61,13 @@ if [ "$fail" -gt "$baseline" ]; then
   cat "$log"
   echo "fix path: the fixture(s) above regressed (or a new red fixture landed"
   echo "          without raising the baseline on purpose); a deliberate new"
-  echo "          red-by-design row raises $axis in tools/nscol-baseline.txt"
+  echo "          red-by-design row raises tools/baselines/nscol/$axis"
   exit 1
 fi
 
 if [ "$fail" -lt "$baseline" ]; then
   echo "$name OK (improved) — $fail of $ran failing < baseline $baseline; detail: $log"
-  echo "  suggest: set $axis:$fail in tools/nscol-baseline.txt"
+  echo "  suggest: write $fail to tools/baselines/nscol/$axis"
 else
   echo "$name OK — $fail of $ran failing at baseline $baseline; detail: $log"
 fi

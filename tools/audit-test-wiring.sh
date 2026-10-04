@@ -41,8 +41,9 @@ allow() { grep -qE "^$1:$2:" "$ALLOWLIST"; }
 # test-* definition, not .PHONY, comments stripped — so a target named
 # only by .PHONY or a comment still counts as orphaned. For fixture
 # dirs: the full harness sources, comments stripped. Workflows and
-# tools/ scripts count for both (this audit and its allowlist excluded).
-cat .github/workflows/*.yml > "$tmp/shared"
+# tools/ scripts count for both (this audit and its allowlist excluded),
+# and so do the target lists the Makefile reads.
+cat .github/workflows/*.yml stage2/test-lists/*.txt > "$tmp/shared"
 find tools -name '*.sh' ! -name 'audit-test-wiring.sh' -exec cat {} + >> "$tmp/shared"
 
 grep -hE '\btest-[a-z0-9-]+' $MAKEFILES \

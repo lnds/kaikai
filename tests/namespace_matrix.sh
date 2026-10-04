@@ -202,7 +202,7 @@ for st in "$ROOT"/stage2/build/nscol-*.status; do
   [ -f "$st" ] || continue
   read -r axis failing _ < "$st"
   seen=$((seen + 1))
-  allowed=$(grep -E "^$axis:" "$ROOT/tools/nscol-baseline.txt" | head -1 | cut -d: -f2 | tr -d ' ')
+  allowed=$(head -1 "$ROOT/tools/baselines/nscol/$axis" 2>/dev/null | tr -d ' ')
   if [ "$failing" -gt "${allowed:-0}" ]; then
     echo "namespace_matrix FAIL — axis '$axis' has $failing failing fixtures, baseline ${allowed:-0} (see stage2/build/nscol-$axis.fail)"
     red=$((red + 1))
