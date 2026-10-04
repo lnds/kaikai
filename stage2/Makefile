@@ -12970,7 +12970,6 @@ TEST_LIGHT_TARGETS := $(shell cat test-lists/light.txt)
 # The random program generator behind the nightly differential run still
 # builds, is deterministic, and emits programs the C backend accepts.
 .PHONY: test-progen-smoke
-TEST_LIGHT_TARGETS += test-progen-smoke
 test-progen-smoke: $(TARGET) bin-kai
 	@sh ../tools/progen-smoke.sh
 

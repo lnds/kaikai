@@ -34,8 +34,8 @@ set -eu
 
 here=$(dirname "$0")
 costs="$here/tier1-light-costs.txt"
-pool=$(sed -n 's/^TEST_LIGHT_TARGETS := //p' "$here/../stage2/Makefile")
-[ -n "$pool" ] || { echo "tier1-light-costs-refresh: no TEST_LIGHT_TARGETS in stage2/Makefile" >&2; exit 2; }
+pool=$(grep -v '^[[:space:]]*$' "$here/../stage2/test-lists/light.txt" | tr '\n' ' ')
+[ -n "$pool" ] || { echo "tier1-light-costs-refresh: no targets in stage2/test-lists/light.txt" >&2; exit 2; }
 
 tmp=$(mktemp)
 trap 'rm -f "$tmp" "$tmp.rows"' EXIT

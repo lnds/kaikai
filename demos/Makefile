@@ -74,7 +74,7 @@ verify:
 	  fi; \
 	  runenv=""; \
 	  if [ -f $$d/main.env ]; then runenv="env $$(tr '\n' ' ' < $$d/main.env)"; fi; \
-	  if ! $$runenv $(BUILD)/$$d-bin > $(BUILD)/$$d.out 2>> $(BUILD)/$$d.err; then \
+	  if ! $$runenv $(BUILD)/$$d-bin < /dev/null > $(BUILD)/$$d.out 2>> $(BUILD)/$$d.err; then \
 	    err=$$(tail -1 $(BUILD)/$$d.err 2>/dev/null | sed 's/^[[:space:]]*//'); \
 	    [ -z "$$err" ] && err="runtime error"; \
 	    echo "FAIL runtime: $$err" > $(BUILD)/$$d.status; \
