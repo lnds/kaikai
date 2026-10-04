@@ -18547,7 +18547,27 @@ static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
  * the backend's lifetime (disposed by the process exit, like the
  * out-of-process backends). A handle crosses to kaikai as a raw
  * `void *` (`TyHandle`, never boxed, never RC). */
-static LLVMContextRef kai_llvm_ctx = NULL;
+/* The context and the emit pool are process-global: a partition queued from
+ * one translation unit is drained by the exit taken in another. Under
+ * KAI_SEPARATE_COMPILATION each therefore gets one shared copy; a per-TU
+ * copy drains an empty queue and the process exits before the object is
+ * written. The copy is defined by the KAI_RUNTIME_OWNER TU, or by the one
+ * that declares itself KAI_LLVM_STATE_OWNER when the runtime owner is
+ * compiled without this block. */
+#if defined(KAI_SEPARATE_COMPILATION)
+#  define KAI_LLVM_STATE
+extern LLVMContextRef kai_llvm_ctx;
+#else
+#  define KAI_LLVM_STATE static
+#endif
+#if !defined(KAI_SEPARATE_COMPILATION) || defined(KAI_RUNTIME_OWNER) || defined(KAI_LLVM_STATE_OWNER)
+#  define KAI_LLVM_STATE_HERE 1
+#else
+#  define KAI_LLVM_STATE_HERE 0
+#endif
+#if KAI_LLVM_STATE_HERE
+KAI_LLVM_STATE LLVMContextRef kai_llvm_ctx = NULL;
+#endif
 
 /* Create a fresh context + module named `name`. Returns the module
  * handle. `name` is a kaikai `String` (a boxed `KaiValue *`); read its
@@ -20212,20 +20232,38 @@ static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runt
 typedef struct KaiEmitJob { LLVMModuleRef m; char *out; struct KaiEmitJob *next; } KaiEmitJob;
 
 #define KAI_EMIT_MAX_WORKERS 64
-static pthread_mutex_t kai_emit_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t kai_emit_work_cv = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t kai_emit_idle_cv = PTHREAD_COND_INITIALIZER;
-static KaiEmitJob *kai_emit_head = NULL;
-static KaiEmitJob *kai_emit_tail = NULL;
-static pthread_t kai_emit_threads[KAI_EMIT_MAX_WORKERS];
-static int kai_emit_nworkers = -1;
-static int kai_emit_started = 0;
-static int kai_emit_busy = 0;
-static int kai_emit_failed = 0;
-static int kai_emit_stop = 0;
-static char **kai_emit_outs = NULL;
-static size_t kai_emit_nouts = 0;
-static size_t kai_emit_capouts = 0;
+#if defined(KAI_SEPARATE_COMPILATION)
+extern pthread_mutex_t kai_emit_mu;
+extern pthread_cond_t kai_emit_work_cv;
+extern pthread_cond_t kai_emit_idle_cv;
+extern KaiEmitJob *kai_emit_head;
+extern KaiEmitJob *kai_emit_tail;
+extern pthread_t kai_emit_threads[KAI_EMIT_MAX_WORKERS];
+extern int kai_emit_nworkers;
+extern int kai_emit_started;
+extern int kai_emit_busy;
+extern int kai_emit_failed;
+extern int kai_emit_stop;
+extern char **kai_emit_outs;
+extern size_t kai_emit_nouts;
+extern size_t kai_emit_capouts;
+#endif
+#if KAI_LLVM_STATE_HERE
+KAI_LLVM_STATE pthread_mutex_t kai_emit_mu = PTHREAD_MUTEX_INITIALIZER;
+KAI_LLVM_STATE pthread_cond_t kai_emit_work_cv = PTHREAD_COND_INITIALIZER;
+KAI_LLVM_STATE pthread_cond_t kai_emit_idle_cv = PTHREAD_COND_INITIALIZER;
+KAI_LLVM_STATE KaiEmitJob *kai_emit_head = NULL;
+KAI_LLVM_STATE KaiEmitJob *kai_emit_tail = NULL;
+KAI_LLVM_STATE pthread_t kai_emit_threads[KAI_EMIT_MAX_WORKERS];
+KAI_LLVM_STATE int kai_emit_nworkers = -1;
+KAI_LLVM_STATE int kai_emit_started = 0;
+KAI_LLVM_STATE int kai_emit_busy = 0;
+KAI_LLVM_STATE int kai_emit_failed = 0;
+KAI_LLVM_STATE int kai_emit_stop = 0;
+KAI_LLVM_STATE char **kai_emit_outs = NULL;
+KAI_LLVM_STATE size_t kai_emit_nouts = 0;
+KAI_LLVM_STATE size_t kai_emit_capouts = 0;
+#endif
 
 static int kai_emit_pool_on(void) {
     if (kai_emit_nworkers < 0) {

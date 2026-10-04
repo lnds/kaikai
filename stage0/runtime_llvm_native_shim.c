@@ -24,7 +24,11 @@
  *
  * Angle-bracket include, like runtime_llvm.c: `<runtime.h>` obeys the `-I`
  * search order (stage2 ahead of stage0), binding to the Koka runtime.
+ *
+ * The runtime owner it links beside is compiled without the LLVM block, so
+ * this TU defines the block's shared state.
  */
+#define KAI_LLVM_STATE_OWNER 1
 #include <runtime.h>
 
 #ifdef KAI_LLVM
