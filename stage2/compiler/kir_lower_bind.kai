@@ -17,22 +17,10 @@
 # `kir_lower_match.kai` / `kir_lower_rec.kai` use for the list / record
 # decision trees.
 #
-# SOUNDNESS — the test/bind split (asu review). A `KSwitch` (or the
-# list/record decision tree) discriminates the tag of the TOP-LEVEL arm
-# pattern before this module's binds run, so binding the direct sub-slots
-# of that arm is safe. A NESTED `PVariant` / `PVariantRecord` sub-pattern
-# (`Node(_, .., Node(R, ..))`, `Some(JReal(r))`) carries its OWN tag
-# discriminant that NO test has emitted yet — binding its inner names
-# without that test would be a silent miscompile (a false-green build that
-# diverges at runtime). So a nested variant sub-pattern is NOT a mechanical
-# bind: it routes to `bind_unsupported_nested`, which traps loud and leaves
-# the binder unbound (the backend then refuses the module). A nested plain
-# `PRecord` is safe — a record has a single shape, no tag to test — so it
-# binds. This keeps the mechanical unbound-register family cleanly split
-# from the nested-variant-test family (a separate burn-down gap).
+# The binds run after the arm's tests (`kir_lower_ptest`), so a nested
+# sub-pattern's names are projected only once its shape is confirmed.
 
 import compiler.ast
-import compiler.util
 import compiler.emit_shared
 import compiler.kir
 import compiler.kir_lower
@@ -136,21 +124,8 @@ pub fn bind_slot_op(st: LowerSt, c: KCtorRef, idx: Int, scrv: KVal) : KOp =
   }
 
 # Bind ONE positional slot's sub-pattern. A `PBind` aliases the slot; a
-# nested plain record projects the slot and recurses; an as-pattern binds
-# then descends; a nested VARIANT WITH payload traps loud (see the
-# soundness note). A NULLARY nested variant (`Branch(Red, ..)` — a no-arg
-# ctor / enum slot) binds NOTHING: it carries no inner name, only a tag the
-# shared-tag decision tree (kir_lower_variant) already tested, so it is a
-# safe no-op here, not the nested-variant-test gap. `PWild`/`PLit`/`PHole`
-# bind nothing (a `PLit` was a test on the switch / sub-chain path).
-# A nested VARIANT sub-pattern is now SOUND to bind: the decision tree's
-# `var_seal_variant` (kir_lower_variant) tested its tag (and recursed into
-# its own discriminating sub-slots) before this bind runs, so projecting the
-# slot and binding the payload's inner names is dominated by a passed tag
-# test — no false-green. A NULLARY ctor (`Red`, `None`) carries no inner
-# name, so it stays a no-op. The payload-bearing case projects the slot and
-# recurses through `bind_pattern_fields_any` (which binds a `PVariant`'s
-# direct sub-binders), the SAME shared bind recursion the record path uses.
+# structured sub-pattern projects the slot and recurses; a nullary ctor, a
+# literal or a wildcard binds nothing. The arm's tests already ran.
 fn bind_slot_pattern(c: KCtorRef, sp: Pattern, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console = match sp.pkind {
   # A kind-0 pointer slot binder reads a direct `.ptr` borrow (`KProjBorrow`);
   # every other slot stays the mask-consulting `KProj`. The read op matches the
@@ -160,13 +135,10 @@ fn bind_slot_pattern(c: KCtorRef, sp: Pattern, scrv: KVal, idx: Int, body: Expr,
   PAs(name, _)         -> bind_nested_as(c, sp, name, scrv, idx, body, st)
   PVariant(_, _, subs)    -> if nullary_slot_ctor(subs) { st } else { bind_nested_slot(c, sp, scrv, idx, body, st) }
   PVariantRecord(_, _, _) -> bind_nested_slot(c, sp, scrv, idx, body, st)
+  PList(_, _)          -> bind_nested_slot(c, sp, scrv, idx, body, st)
   _                    -> st
 }
 
-# A nested ctor with no payload (`Red`, `None`) binds no inner name — the
-# shared-tag decision tree tested its tag, so binding is a no-op. A ctor
-# WITH payload is bound by `bind_nested_slot` (its sub-binders need
-# projecting), gated by the tag test the decision tree emitted.
 fn nullary_slot_ctor(subs: [Pattern]) : Bool = match subs {
   [] -> true
   _  -> false
@@ -200,6 +172,7 @@ pub fn bind_pattern_fields_any(p: Pattern, v: KVal, body: Expr, st: LowerSt) : L
   PVariant(hm, cn, subs)       -> bind_sub_binders(kcr_of_pat(hm, cn), subs, v, 0, body, st)
   PVariantRecord(_, _, fields) -> bind_record_subfields(fields, v, body, st)
   PRecord(fields)           -> bind_record_subfields(fields, v, body, st)
+  PList(pats, opt_rest)     -> bind_list_cells(pats, opt_rest, v, p, st)
   _                         -> st
 }
 
@@ -253,7 +226,6 @@ pub fn bind_let_owned(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = 
 }
 
 fn bind_field_sub(sub: Pattern, fv: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match sub.pkind {
-  PList(pats, opt_rest) -> bind_list_cells(pats, opt_rest, fv, sub, st)
   PAs(name, inner) ->
     bind_field_sub(inner, fv, body, ls_emit(st, KLet(name, SBoxed, KLitOp(fv), KAt(sub.line, sub.col))))
   _ -> bind_pattern_fields_any(sub, fv, body, st)
@@ -292,19 +264,6 @@ fn bind_field_as(fname: String, name: String, sub: Pattern, v: KVal, body: Expr,
     let st2 = ls_emit(st1, KLet(name, SBoxed, KLitOp(fv), KAt(sub.line, sub.col)))
     bind_pattern_fields_any(as_inner(sub), fv, body, st2)
   } }
-
-# --- soundness guard ----------------------------------------------------
-
-# A nested VARIANT sub-pattern needs a tag TEST this module does not emit
-# (the nested-variant-test family). Trap LOUD and bind nothing: the binder
-# stays unbound, so the backend refuses the module rather than silently
-# miscompiling. NEVER bind a nested variant's inner names against an
-# untested value (the false-green a `bind_sub_binders` recursion would be).
-fn bind_unsupported_nested(p: Pattern, st: LowerSt) : LowerSt / Console = {
-  eprint(concat_all(["kir: nested variant sub-pattern needs a tag test (subset gap: nested-variant-test) at ",
-                     int_to_string(p.line), ":", int_to_string(p.col)]))
-  st
-}
 
 # The inner pattern of a `PAs(name, inner)`.
 pub fn as_inner(p: Pattern) : Pattern = match p.pkind {

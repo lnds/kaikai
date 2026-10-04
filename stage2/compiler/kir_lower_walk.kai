@@ -32,9 +32,10 @@ import compiler.loop_lower
 import compiler.kir_lower_bind
 import compiler.kir_lower_match
 import compiler.kir_lower_lit
-import compiler.kir_lit_eq
 import compiler.kir_lower_rec
 import compiler.kir_lower_variant
+import compiler.kir_lower_ptest
+import compiler.kir_lower_ptest_seal
 import compiler.vec_raw
 import compiler.emit_tcrec_live
 import compiler.raw_border
@@ -1903,8 +1904,7 @@ fn arms_have_trmc_step(arms: [Arm]) : Bool = match arms {
 # the arm body on success and to the next arm on failure; the head/tail
 # `KProj` binds land in the matched-body block. A shared `join` register
 # (materialised before the chain, like `lower_if`) collects each body's
-# value. The chain ends `KUnreachable` — kaikai matches are exhaustive, so
-# the final fail is dead (Linus review #3, as `lower_default_arm`).
+# value. The chain's final fail panics (`seal_match_miss`).
 fn lower_list_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
   match match_preamble(x, scrv, owned, st) { LSPre(join, sd, st1) ->
     match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
@@ -1971,7 +1971,7 @@ fn match_preamble(x: Expr, scrv: KVal, owned: Bool, st: LowerSt) : LSPre =
 # a condbr (body vs the fresh fail label); the body lowers into the join +
 # branches to `lcont`; the next arm reopens the fail label. A catch-all arm
 # matches unconditionally and ends the chain (later arms are dead). With no
-# catch-all the last fail label is sealed `KUnreachable`.
+# catch-all the last fail label panics.
 #
 # Issue #858 — after `lm_emit_arm` binds the arm's alias binders (head /
 # tail / rest, all borrows of the scrutinee slots), emit a structural
@@ -1982,7 +1982,7 @@ fn match_preamble(x: Expr, scrv: KVal, owned: Bool, st: LowerSt) : LSPre =
 # owns the kept children's RC) so a dup there would double-incref.
 fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
                    owned: Bool, sd: String, pend0: [String], st: LowerSt) : LowerSt / Console = match arms {
-  [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
+  [] -> seal_match_miss(st, lcont)
   [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
     match lm_emit_arm(p, scrv, body_lbl, arm_reuses(body, st1), st1) { LMArm(st_body, fail_lbl) -> {
       # A non-reuse owned arm structurally dups EVERY alias binder it reaches
@@ -2023,9 +2023,7 @@ fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
 # arm) and structurally identical to `lower_list_match`. Each literal arm
 # emits `condbr (kai_eq_raw scr lit) ? body : next`; the catch-all binds the
 # whole scrutinee and ends the chain. The join slot + `__pcs_scr` alias come
-# from the shared `match_preamble`; the chain ends `KUnreachable` when no
-# catch-all is present (the typer made the match exhaustive — e.g.
-# `true`/`false` — so the final fail is dead, Linus review #3).
+# from the shared `match_preamble`; with no catch-all the final fail panics.
 fn lower_lit_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
   match match_preamble(x, scrv, owned, st) { LSPre(join, sd, st1) ->
     match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
@@ -2038,11 +2036,10 @@ fn lower_lit_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) :
 # test seals the current block into a condbr (body vs a fresh fail label);
 # the body lowers into the join + branches to `lcont`; the next arm reopens
 # the fail label. A catch-all arm matches unconditionally and ends the chain
-# (later arms are dead). With no catch-all the last fail label is sealed
-# `KUnreachable`.
+# (later arms are dead). With no catch-all the last fail label panics.
 fn lower_lit_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
                   owned: Bool, sd: String, pend0: [String], st: LowerSt) : LowerSt / Console = match arms {
-  [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
+  [] -> seal_match_miss(st, lcont)
   [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
     match lit_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
       let st_drop = whole_binder_rc(p, scrv, body, owned, sd, pend0, st_body)
@@ -2079,8 +2076,7 @@ fn whole_binders(p: Pattern) : [String] = match p.pkind {
 # binding fields on the success path, then lowers its body; an arm with no
 # literal fields is a catch-all that binds its fields and ends the chain.
 # The join slot + `__pcs_scr` alias come from the shared `match_preamble`;
-# the chain ends `KUnreachable` when no catch-all is present (the typer made
-# the match exhaustive, so the final fail is dead, Linus review #3).
+# with no catch-all the final fail panics.
 fn lower_record_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
   match match_preamble(x, scrv, owned, st) { LSPre(join, sd, st1) ->
     match ls_fresh_label(st1) { LSLabel(lcont, st2) -> {
@@ -2094,11 +2090,10 @@ fn lower_record_match(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt
 # fail label); the body lowers into the join + branches to `lcont`; the next
 # arm reopens the fail label. A catch-all arm (a record with no literal
 # fields, or a non-record pattern) matches unconditionally and ends the
-# chain (later arms are dead). With no catch-all the last fail label is
-# sealed `KUnreachable`.
+# chain (later arms are dead). With no catch-all the last fail label panics.
 fn lower_record_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
                      owned: Bool, sd: String, pend0: [String], st: LowerSt) : LowerSt / Console = match arms {
-  [] -> ls_seal(st, KUnreachable(KNoPos), lcont)
+  [] -> seal_match_miss(st, lcont)
   [Arm(p, _, body), ...rest] -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
     match rec_emit_arm(p, scrv, body_lbl, st1) { LMArm(st_body, fail_lbl) -> {
       # Field binds arrive OWNED (`kai_op_field` increfs); only a whole-value
@@ -2113,10 +2108,8 @@ fn lower_record_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
 
 # Build the switch + per-arm blocks + default + continuation, given the
 # already-lowered scrutinee atom and tag register (`match_preamble` set up
-# the join slot + `__pcs_scr` alias). The default block is `KUnreachable`:
-# kaikai matches are exhaustive, so the switch never falls through; emitting
-# a unit store there would silently make a non-exhaustive program return ()
-# instead of trapping (Linus review #3).
+# the join slot + `__pcs_scr` alias). With no catch-all the default block
+# panics.
 fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
   match match_preamble(x, scrv, owned, st) { LSPre(join, sd, st_decl) ->
     match two_labels(st_decl) { LSL2(lcont, ldef, st4) -> {
@@ -2126,8 +2119,7 @@ fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, owned: Bool,
         let st6 = ls_seal(st5, KSwitch(tagv, cases, ldef, kpos_of(x)), ldef)
         # The default block holds the catch-all arm's body (a `_` or other
         # non-variant pattern → tag -1, routed here rather than to a
-        # duplicate switch case). With no catch-all the match is variant-
-        # exhaustive, so the default is `KUnreachable` (Linus review #3).
+        # duplicate switch case). With no catch-all the default panics.
         let st7 = lower_default_arm(arms, scrv, join, lcont, ldef, owned, sd, pend0, st6)
         # One switch case per DISTINCT tag (plan_arms dedups). A tag matched
         # by one arm lowers its body directly in the case block; a tag SHARED
@@ -2166,8 +2158,8 @@ fn kcase_has_tag(cases: [KCase], tag: Int) : Bool = match cases {
   [KC(t, _), ...rest] -> if t == tag { true } else { kcase_has_tag(rest, tag) }
 }
 
-# Lower the catch-all arm's body into the default block, or seal it
-# `KUnreachable` when the match is variant-exhaustive. This path now only
+# Lower the catch-all arm's body into the default block, or a panic when
+# there is none. This path now only
 # runs for a VARIANT match with a single wildcard/binder default arm:
 # literal-discriminated dispatch (`match n { 0 -> ...; 1 -> ... }`) is
 # diverted to `lower_lit_match` (kir_lower_lit.kai) BEFORE this switch is
@@ -2191,8 +2183,14 @@ fn lower_default_arm(arms: [Arm], scrv: KVal, join: String, lcont: String,
       let st_drop = tcp_seed_after_arm_rc(owned, sd, p, body, pend0, st_rc)
       lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop))
     }
-    None -> ls_seal(reopen(st, ldef), KUnreachable(KNoPos), lcont)
+    None -> seal_match_miss(reopen(st, ldef), lcont)
   }
+
+# A match that no arm matched panics, as the C backend does: the typer does
+# not prove every match exhaustive, so this block is reachable.
+fn seal_match_miss(st: LowerSt, next: String) : LowerSt / Console =
+  match lower_panic_stub(kir_quote("non-exhaustive match"), st) {
+    LRes(_, st1) -> ls_seal(st1, KUnreachable(KNoPos), next) }
 
 # Alias a match-arm binder to the whole scrutinee. When `name` already names
 # a register in scope (a fn param / outer binder of the SAME name — `match n {
@@ -2254,12 +2252,11 @@ fn arm_tag(p: Pattern, st: LowerSt) : Int = match (arm_disc_pat(p)).pkind {
 # source order. A tag matched by ONE arm lowers that arm's binds + body
 # directly in the case block. A tag SHARED by N arms opens a sub-fail-chain
 # in the case block: each discriminating arm tests its payload
-# (`var_emit_subtests`) and branches to its own body on success / the next
+# (`pt_arm_subtests`) and branches to its own body on success / the next
 # arm on failure; the tag's catch-all arm (`Exited(_)`) ends the chain
 # unconditionally. The chain's final fail routes to `ldef` (the switch
 # default): "no arm of this tag matched" is exactly "fell through the
-# switch" — `ldef` carries the global `_` body or is `KUnreachable` when the
-# match is exhaustive (Linus review #3, mirror of `lower_default_arm`).
+# switch" — `ldef` carries the global `_` body or the miss panic.
 # `mscr0` is this match's `mscr` as of the preamble (its own `<join>$sd` when
 # owned, else the enclosing match's). It is restored before EACH group: a prior
 # group's body may run a nested match that leaves `mscr` pointing at ITS
@@ -2388,7 +2385,7 @@ fn arms_with_tag(arms: [(Int, Arm)], tag: Int) : [Arm] = match arms {
 # every `Some(_)` (the lone-arm-skips-sub-test miscompile — `Some(91)` would
 # capture `Some(49)`). Such an arm routes through the same sub-fail-chain a
 # shared tag uses, with the single arm's miss falling to `ldef` (the switch
-# default = the global `_` body or `KUnreachable`). A shared tag (N>1 arms)
+# default = the global `_` body or the miss panic). A shared tag (N>1 arms)
 # always opens the chain.
 fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
                    lbl: String, ldef: String, owned: Bool, sd: String, mscr0: String, pend0: [String], st: LowerSt) : LowerSt / Console = match group {
@@ -2406,8 +2403,8 @@ fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
 # The sub-fail-chain for a tag shared by N>1 arms. Each arm: if it
 # discriminates on its payload, test it (`condbr` to its body on match / a
 # fresh fail label on mismatch); if it is the tag's catch-all, branch
-# unconditionally to its body (ending the chain — later arms are dead, which
-# the typer's redundancy check forbids). After binding its fields, the arm's
+# unconditionally to its body (ending the chain — later arms are dead). After
+# binding its fields, the arm's
 # body lowers into the shared join. The last fail label routes to `ldef`.
 fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
                      fail_lbl: String, ldef: String, owned: Bool, sd: String, mscr0: String, pend0: [String], st: LowerSt) : LowerSt / Console = match group {
@@ -2431,38 +2428,11 @@ fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
     } }
 }
 
-# Emit a discriminating variant arm's payload sub-tests + field binds,
-# routing a miss to `fail_lbl` and leaving the cursor at `body_lbl` with the
-# arm's binders in scope. The common case is `var_emit_subtests` (the test)
-# followed by `bind_pattern_fields` (the bind) — TEST precedes BIND, as the
-# oracle does. The exception is a payload slot that is itself a LIST PATTERN
-# (`Some([x, y])`): a list pattern interleaves its length test with its
-# head/tail binds (`lm_emit_cells`), so it cannot be split into a test pass
-# then a bind pass. Such a slot is lowered by `lm_emit_cells` against the
-# PROJECTED slot value — the list decision-tree machinery (kir_lower_match)
-# entered from a variant slot, the mirror of how a nested variant head re-
-# enters the variant machinery from a list cell. This seam lives in the walk
-# (not kir_lower_variant) because only the walk imports BOTH kir_lower_variant
-# and kir_lower_match — variant cannot call lm_emit_cells without an import
-# cycle (variant <- match). A slot-list arm has exactly one discriminating
-# slot (the list); a mixed multi-slot payload with a list stays the documented
-# subset gap (`bind_unsupported_nested` traps loud, never silent-wrong).
+# A discriminating variant arm: its payload tests route a miss to
+# `fail_lbl`, then its binders are projected in the matched body.
 fn emit_arm_subtests_and_binds(p: Pattern, scrv: KVal, body: Expr, body_lbl: String,
                                fail_lbl: String, st: LowerSt) : LowerSt / Console =
-  match var_arm_lone_list_slot(p) {
-    Some(VLSlot(idx, pats, opt_rest)) ->
-      match var_proj_slot(scrv, idx, p, st) { LRes(slotv, st1) -> {
-        let st2 = reopen(lm_emit_cells(pats, opt_rest, slotv, body_lbl, fail_lbl, false, st1), body_lbl)
-        # The list slot's own head/tail names bound via lm_emit_cells; the
-        # sibling binder/wildcard slots still need their KLet. A PList slot is
-        # a no-op in bind_pattern_fields, so this binds the siblings only.
-        bind_pattern_fields(p, scrv, body, st2)
-      } }
-    None -> {
-      let st3 = var_emit_subtests(p, scrv, body_lbl, fail_lbl, st)
-      bind_pattern_fields(p, scrv, body, st3)
-    }
-  }
+  bind_pattern_fields(p, scrv, body, pt_arm_subtests(p, scrv, body_lbl, fail_lbl, st))
 
 # --- Guarded / all-binder match: the linear fail-chain ------------------
 #
@@ -2480,10 +2450,7 @@ fn emit_arm_subtests_and_binds(p: Pattern, scrv: KVal, body: Expr, body_lbl: Str
 #   3. if guarded, evaluates the guard and `condbr`s to the body on truthy /
 #      the next arm's fail label on falsy (the guard can reject post-match);
 #   4. lowers its body into the shared `join`, then branches to `lcont`.
-# The chain's final fail seals `KUnreachable` — the typer guarantees the
-# match is exhaustive, so the last arm (unguarded or a catch-all) always
-# matches and the trailing fail is dead (Linus review #3, as the other
-# chains). The binds are pure slot aliases (`KLitOp(scrv)` / `KProj`), so a
+# The chain's final fail panics, as the other chains. The binds are pure slot aliases (`KLitOp(scrv)` / `KProj`), so a
 # rejected guard's unused binder owns nothing — no drop is owed (the oracle
 # emits none either; byte-id parity by construction).
 fn lower_guard_chain(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt) : LRes / Console =
@@ -2497,21 +2464,15 @@ fn lower_guard_chain(x: Expr, arms: [Arm], scrv: KVal, owned: Bool, st: LowerSt)
 # Each arm pre-allocates `next_fail`, the block where the REST of the chain
 # starts. Both the pattern test (mismatch) AND the guard (falsy) route there,
 # so a rejected arm — for either reason — falls to the next in source order
-# (the oracle's `if (pat) { binds; if (truthy(g)) {…} }` fall-through). The
-# terminal arm (the typer guarantees one matches) seals `next_fail`
-# `KUnreachable`. Keeping `next_fail` distinct from the body label is what
+# (the oracle's `if (pat) { binds; if (truthy(g)) {…} }` fall-through). An
+# arm that always matches seals `next_fail` `KUnreachable`. Keeping `next_fail` distinct from the body label is what
 # lets a guarded BINDER arm (`n if … ->`) fail to the next arm rather than
 # loop back onto its own body.
 fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
                     owned: Bool, sd: String, pend0: [String], st: LowerSt) : LowerSt / Console = match arms {
-  # No arms left: control reaches here only through the previous arm's
-  # `next_fail` (the block currently open, `st.cl`). The typer guarantees
-  # the match is exhaustive, so this fall-through is dead — seal it
-  # `KUnreachable` (the LLVM verifier rejects an open block with no
-  # terminator). A fresh dead successor is opened and immediately discarded
-  # by the caller's `reopen(lcont)`.
-  [] -> match ls_fresh_label(st) { LSLabel(dead, st1) ->
-    ls_seal(st1, KUnreachable(KNoPos), dead) }
+  # No arm matched: the open block is the last arm's `next_fail`. The fresh
+  # successor is discarded by the caller's `reopen(lcont)`.
+  [] -> match ls_fresh_label(st) { LSLabel(dead, st1) -> seal_match_miss(st1, dead) }
   [Arm(p, opt_guard, body), ...rest] -> match ls_fresh_label(st) { LSLabel(next_fail, st0) ->
     match guard_emit_pat_test(p, scrv, next_fail, arm_reuses(body, st0), st0) {
       LMArm(st_body, _) -> {
@@ -2563,30 +2524,9 @@ fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
 fn guard_emit_pat_test(p: Pattern, scrv: KVal, fail_lbl: String,
                        reuse_arm: Bool, st: LowerSt) : LMArm / Console =
   match p.pkind {
-    PLit(lit) -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) -> {
-      let st2 = guard_lit_test(lit, scrv, body_lbl, fail_lbl, st1)
-      LMArm(reopen(st2, body_lbl), fail_lbl)
-    } }
-    # Top-level variant: test the constructor tag, then (when a sub-pattern
-    # discriminates — `Some(0) if g`) the payload sub-slots, all routing a
-    # miss to `fail_lbl`. A plain `Some(n)` (no discriminating sub) reduces
-    # to the bare tag test.
-    PVariant(hm, cname, subs) -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) -> {
-      let st2 = guard_emit_variant_test(kcr_of_pat(hm, cname), subs, scrv, body_lbl, fail_lbl, p, st1)
-      LMArm(reopen(st2, body_lbl), fail_lbl)
-    } }
-    PVariantRecord(hm, cname, _) -> match ls_fresh_label(st) { LSLabel(body_lbl, st1) -> {
-      let st2 = var_seal_tag_of(scrv, kcr_of_pat(hm, cname), body_lbl, fail_lbl, p, st1)
-      LMArm(reopen(st2, body_lbl), fail_lbl)
-    } }
     # An as-pattern emits the inner pattern's test (the binder is bound after,
     # by `bind_default_pattern`); `a @ A` tests the `A` tag, `a @ _` passes.
     PAs(_, inner) -> guard_emit_pat_test(inner, scrv, fail_lbl, reuse_arm, st)
-    # Non-discriminating: always matches — branch straight to a fresh body.
-    PWild        -> guard_pat_passthrough(p, fail_lbl, st)
-    PBind(_)     -> guard_pat_passthrough(p, fail_lbl, st)
-    PNarrow(_, _) -> guard_pat_passthrough(p, fail_lbl, st)
-    PHole(_)     -> guard_pat_passthrough(p, fail_lbl, st)
     # A list arm reuses the list-match cell walk, which takes the caller's
     # fail label directly. It binds head/tail/rest as it tests (the same
     # borrow-then-dup discipline as the unguarded chain: `lower_arm_rc`
@@ -2595,31 +2535,11 @@ fn guard_emit_pat_test(p: Pattern, scrv: KVal, fail_lbl: String,
       let st2 = lm_emit_cells(pats, opt_rest, scrv, body_lbl, fail_lbl, reuse_arm, st1)
       LMArm(reopen(st2, body_lbl), fail_lbl)
     } }
-    # A guarded record arm is not routed here in practice; keep the trap
-    # loud so a future route change surfaces instead of miscompiling.
-    PRecord(_)  -> { eprint("kir: guarded record-pattern arm not yet lowered"); guard_pat_passthrough(p, fail_lbl, st) }
-    _ -> guard_pat_passthrough(p, fail_lbl, st)
+    _ -> if psub_is_discriminating(p) {
+      match ls_fresh_label(st) { LSLabel(body_lbl, st1) ->
+        LMArm(reopen(pt_seal(p, scrv, PtTo(body_lbl, fail_lbl), st1), body_lbl), fail_lbl) }
+    } else { guard_pat_passthrough(p, fail_lbl, st) }
   }
-
-# `kai_eq_raw scr lit` → condbr body/fail, the whole-scrutinee literal test.
-fn guard_lit_test(lit: Expr, scrv: KVal, body_lbl: String, fail_lbl: String,
-                  st: LowerSt) : LowerSt / Console =
-  kle_seal_eq(scrv, lit_atom(lit), body_lbl, fail_lbl, KAt(lit.line, lit.col), st)
-
-# Test a top-level variant pattern: its constructor tag, then (when a
-# sub-pattern discriminates — `Some(0)`) the payload sub-slots, all routing
-# a miss to `fail_lbl`. A plain `Some(n)` (no discriminating sub) is just
-# the tag test. Mirrors `var_seal_variant`'s top-level shape but tests the
-# scrutinee directly (no enclosing slot to project).
-fn guard_emit_variant_test(c: KCtorRef, subs: [Pattern], scrv: KVal,
-                           body_lbl: String, fail_lbl: String, p: Pattern,
-                           st: LowerSt) : LowerSt / Console =
-  if any_discriminating(subs) {
-    match ls_fresh_label(st) { LSLabel(sub_lbl, st1) -> {
-      let st2 = var_seal_tag_of(scrv, c, sub_lbl, fail_lbl, p, st1)
-      var_emit_slot_tests(c, subs, scrv, 0, body_lbl, fail_lbl, reopen(st2, sub_lbl))
-    } }
-  } else { var_seal_tag_of(scrv, c, body_lbl, fail_lbl, p, st) }
 
 # A pattern that always matches: open one fresh body label, branch to it.
 # `fail_lbl` (the next arm's start) is echoed back untouched — the binder's
