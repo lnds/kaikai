@@ -93,12 +93,6 @@ pub fn nfx_jmpbuf_reg(sym: String) : String = cat2("__jmpbuf_", sym)
 # escaping resume would dangle this; the one-shot check in `kir_lower_fns`
 # (`check_resume_one_shot`) is the structural guard that keeps it safe.
 pub fn nfx_env_reg(sym: String) : String = cat2("__env_", sym)
-# Fixed capacity of the env array (and the Ev blob). The alloca pass can
-# not see the per-handle capture count, so it over-reserves; the install
-# must NOT write past this, and `nemit_install_env` aborts loud if a
-# handle's cross-clause capture union exceeds it (no core handle is close,
-# but a silent stack overwrite is unacceptable — fail at compile time).
-pub fn nfx_env_cap() : Int = 16
 # The discard slot is the value the longjmp lands with; the KIR discard
 # block reads it as `KVar("__kai_discard_<sym>")` (kir_lower_walk.kai's
 # `lower_handle_discard`), per install-SITE so nested same-effect handles
@@ -117,8 +111,8 @@ pub fn nfx_cont_reg() : String = "__kai_cont"
 # alongside the register allocas. Called from `nemit_fn_with` after
 # `nemit_allocas`, before the param seed.
 
-pub fn nemit_fx_allocas(ctx: Handle, f: KFn) : Unit / Console = {
-  nfx_alloca_blocks(ctx, f.blocks)
+pub fn nemit_fx_allocas(ctx: Handle, f: KFn, handlers: [KHandlerDecl]) : Unit / Console = {
+  nfx_alloca_blocks(ctx, handlers, f.blocks)
   # A clause's continuation is referenced as `KVar(kir_resume_reg())` (the
   # translator's fixed resume name), but the `PResume` param is collected
   # under its surface name (`resume`), so no resume alloca exists from
@@ -169,21 +163,21 @@ pub fn nfx_reserve_named(ctx: Handle, name: String) : Unit / Console = {
   } else { () }
 }
 
-fn nfx_alloca_blocks(ctx: Handle, bs: [KBlock]) : Unit / Console = match bs {
+fn nfx_alloca_blocks(ctx: Handle, handlers: [KHandlerDecl], bs: [KBlock]) : Unit / Console = match bs {
   [] -> ()
-  [b, ...rest] -> { nfx_alloca_stmts(ctx, b.stmts); nfx_alloca_blocks(ctx, rest) }
+  [b, ...rest] -> { nfx_alloca_stmts(ctx, handlers, b.stmts); nfx_alloca_blocks(ctx, handlers, rest) }
 }
 
-fn nfx_alloca_stmts(ctx: Handle, ss: [KStmt]) : Unit / Console = match ss {
+fn nfx_alloca_stmts(ctx: Handle, handlers: [KHandlerDecl], ss: [KStmt]) : Unit / Console = match ss {
   [] -> ()
-  [s, ...rest] -> { nfx_alloca_stmt(ctx, s); nfx_alloca_stmts(ctx, rest) }
+  [s, ...rest] -> { nfx_alloca_stmt(ctx, handlers, s); nfx_alloca_stmts(ctx, handlers, rest) }
 }
 
 # A KInstall reserves the Ev blob + node + jmp_buf + discard slot; a
 # KLet/KDo whose op is a KPerform reserves the KaiCont. Everything else is
 # a no-op for the alloca pass.
-fn nfx_alloca_stmt(ctx: Handle, s: KStmt) : Unit / Console = match s {
-  KInstall(_, sym, _, alias, _) -> { nfx_reserve_install(ctx, sym); nfx_reserve_alias(ctx, alias) }
+fn nfx_alloca_stmt(ctx: Handle, handlers: [KHandlerDecl], s: KStmt) : Unit / Console = match s {
+  KInstall(_, sym, _, alias, _) -> { nfx_reserve_install(ctx, sym, nfx_find_handler(handlers, sym)); nfx_reserve_alias(ctx, alias) }
   KLet(_, _, op, _) -> nfx_alloca_op(ctx, op)
   KDo(op, _)        -> nfx_alloca_op(ctx, op)
   _                 -> ()
@@ -196,27 +190,20 @@ fn nfx_alloca_op(ctx: Handle, op: KOp) : Unit / Console = match op {
 
 # Reserve the four install-frame allocas, registered under per-install-SITE
 # names (derived from `sym`, the handler-decl symbol — unique per `handle`
-# site). The Ev blob is `[3 + nops x ptr]`; nops is unknown here (the
-# handler decl is not threaded into the alloca pass), so reserve a generous
-# fixed `[16 x ptr]` — larger than any single effect's op count in the
-# core, and the unused tail is never read (the install writes only the
-# header + the real op slots). The jmp_buf is runtime-sized via
-# `kai_jmpbuf_size`. Each alloca is a `let` (handle-binder exclusion).
-# Two nested handles of the same effect get distinct `sym`s → distinct
-# allocas → distinct KaiEvidence nodes (no parent-chain self-cycle, #789).
-fn nfx_reserve_install(ctx: Handle, sym: String) : Unit / Console = {
+# site). The Ev blob is `[3 + nops x ptr]` and the clause-capture env one
+# slot per handle-union capture, both sized from the handler decl. The
+# jmp_buf is runtime-sized via `kai_jmpbuf_size`. Each alloca is a `let`
+# (handle-binder exclusion). Two nested handles of the same effect get
+# distinct `sym`s → distinct allocas → distinct KaiEvidence nodes.
+fn nfx_reserve_install(ctx: Handle, sym: String, h: Option[KHandlerDecl]) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
-  let evty = llvm_array_type(p, 16)
+  let evty = llvm_array_type(p, nfx_op_base() + nfx_handler_ops(h))
   let ev = llvm_build_alloca(native_ctx_b(ctx), evty, cat2(nfx_ev_reg(sym), ".addr"))
   native_ctx_add_reg(ctx, nfx_ev_reg(sym), ev, -1)
   let node = llvm_build_alloca(native_ctx_b(ctx), llvm_array_type(p, 8), cat2(nfx_node_reg(sym), ".addr"))
   native_ctx_add_reg(ctx, nfx_node_reg(sym), node, -1)
-  # Clause-capture env array — `[nfx_env_cap x ptr]` like the Ev blob
-  # (op-count and capture-count are both unknown in the alloca pass; the cap
-  # over-covers any core handle, and the unused tail is never read — the
-  # install fills only the real capture slots, the clause prologue indexes
-  # only those). Slot -1: a raw `Value*`, never an RC binder.
-  let env = llvm_build_alloca(native_ctx_b(ctx), llvm_array_type(p, nfx_env_cap()), cat2(nfx_env_reg(sym), ".addr"))
+  # Slot -1: a raw `Value*`, never an RC binder.
+  let env = llvm_build_alloca(native_ctx_b(ctx), llvm_array_type(p, nfx_handler_caps(h)), cat2(nfx_env_reg(sym), ".addr"))
   native_ctx_add_reg(ctx, nfx_env_reg(sym), env, -1)
   # `kai_jmpbuf_size() -> i64`: declare it i64-returning (NOT the all-boxed
   # `ptr()` `nemit_call0` assumes), then `alloca i8, i64 %size` — the array
@@ -230,6 +217,18 @@ fn nfx_reserve_install(ctx: Handle, sym: String) : Unit / Console = {
   native_ctx_add_reg(ctx, nfx_discard_reg(sym), disc, 0)
   let _s = llvm_build_store(native_ctx_b(ctx), llvm_const_null(p), disc)
   ()
+}
+
+# An install with no handler decl is refused at emit (`nemit_install`); one
+# slot keeps its allocas well-formed until then.
+fn nfx_handler_ops(h: Option[KHandlerDecl]) : Int = match h {
+  Some(d) -> list_length(d.op_thunks)
+  None    -> 1
+}
+
+fn nfx_handler_caps(h: Option[KHandlerDecl]) : Int = match h {
+  Some(d) -> if list_length(d.env_caps) > 1 { list_length(d.env_caps) } else { 1 }
+  None    -> 1
 }
 
 # Reserve the `__alias_id__<a>` register for an aliased install (`with Eff
