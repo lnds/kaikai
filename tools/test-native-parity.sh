@@ -112,11 +112,7 @@ for fix in "$FIXDIR"/*.kai; do
   # --- native backend: emit object in-process, link, run ---
   obj="$WORK/$name.o"
   nbin="$WORK/$name-native"
-  if ! env KAI_NATIVE_RUNTIME_BC="$RUNTIME_LLVM_BC" "$KAIC2" $EDITION_FLAG --emit=native -o "$obj" "$fix" >/dev/null 2>"$WORK/$name.nemit.err"; then
-    # --emit=native prints the object path; -o is ignored by the
-    # current spine, so fall back to the source-derived path.
-    :
-  fi
+  env KAI_NATIVE_RUNTIME_BC="$RUNTIME_LLVM_BC" "$KAIC2" $EDITION_FLAG --emit=native "$fix" >/dev/null 2>"$WORK/$name.nemit.err" || :
   # The spine derives the object path from the source: foo.kai -> foo.o.
   src_obj="${fix%.kai}.o"
   if [ -f "$src_obj" ]; then

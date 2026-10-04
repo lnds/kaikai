@@ -1,5 +1,5 @@
 #!/bin/sh
-# CLI flag-hygiene gate for the bin/kai driver.
+# CLI flag-hygiene gate for the bin/kai driver and kaic2.
 #
 # Property: an argument that starts with '-' and is not a recognised
 # flag of the subcommand fails fast with an "unknown flag" diagnostic
@@ -22,6 +22,7 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KAI="$ROOT/bin/kai"
+CMD="$KAI"
 PASS=0
 FAIL=0
 
@@ -32,7 +33,7 @@ ok()   { printf '  ok    %s\n' "$1"; PASS=$((PASS + 1)); }
 expect_reject() {
   label="$1"; want="$2"; shift 2
   status=0
-  out="$("$KAI" "$@" 2>&1)" || status=$?
+  out="$("$CMD" "$@" 2>&1)" || status=$?
   if [ "$status" -ne 2 ]; then
     fail "$label (exit $status, want 2)"
     printf '%s\n' "$out" | sed 's/^/        /'
@@ -98,6 +99,14 @@ expect_reject "install --list refuses --force" "--list takes no other arguments"
 expect_reject "install --list refuses a spec"  "--list takes no other arguments" install --list .
 expect_reject "info --list refuses stray args" "--list takes no other arguments, got 'x'" info --list x
 expect_reject "info -k takes one keyword"      "-k takes one keyword, got also 'b'" info -k a b
+
+# kaic2 itself: an unknown option, or an option missing its value, is a
+# usage error with exit 2, never a path or a silent success.
+CMD="$ROOT/stage2/kaic2"
+expect_reject "kaic2 rejects unknown option"   "unknown option \`$BOGUS\`" "$BOGUS" --check x.kai
+expect_reject "kaic2 rejects -j1"              "unknown option \`-j1\`" -j1 --check x.kai
+expect_reject "kaic2 --path needs a value"     "--path requires a directory argument" --check x.kai --path
+CMD="$KAI"
 
 # Reversion proof for the original repro: an explicit --backend=c runs
 # the check runner exactly like the flagless form — no basename noise,

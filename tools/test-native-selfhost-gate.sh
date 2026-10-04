@@ -193,7 +193,7 @@ elif [ "$count" -eq 0 ]; then
   # can run: a crashing compiler takes the whole gate with it and the job
   # reports a bare exit code. Guard each capture so a non-zero status is
   # data, not a fatal error, and a signal death names its signal.
-  nc="$("$BIN" --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)" || ncrc=$?
+  nc="$("$BIN" --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)" || ncrc=$?
   ncrc="${ncrc:-0}"
   if [ "$ncrc" -gt 128 ]; then
     echo "::error::native-selfhost-gate FAIL — the native-built compiler died on signal $((ncrc - 128)) compiling the sample program."
@@ -201,24 +201,24 @@ elif [ "$count" -eq 0 ]; then
     echo "  not startup. Sample: $SAMPLE"
     rm -f "$BIN"; exit 1
   fi
-  oc="$("$KAIC2" $EDITION_FLAG --emit=c --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)" || ocrc=$?
+  oc="$("$KAIC2" $EDITION_FLAG --path "$ROOT/stdlib" "$SAMPLE" 2>/dev/null)" || ocrc=$?
   ocrc="${ocrc:-0}"
   # The trivial sample derives nothing, so the `#[derive(Layout)]` impl
   # builder never runs. Re-run the SAME native binary over a Layout-deriving
   # program so that codegen lowers under the native backend, and assert
   # byte-identical C vs the oracle — a native codegen bug in the derive
   # (crash or corruption) fails here. Reuses `$BIN`, so it costs a
-  # `--emit=c` + diff, not a rebuild.
+  # C emit + diff, not a rebuild.
   LAYOUT="$ROOT/examples/sugars/kinds_layout_derive.kai"
   lnc=""; loc=""; lncrc=0; locrc=0
   if [ -f "$LAYOUT" ]; then
-    lnc="$("$BIN" --emit=c --path "$ROOT/stdlib" "$LAYOUT" 2>/dev/null)" || lncrc=$?
+    lnc="$("$BIN" --path "$ROOT/stdlib" "$LAYOUT" 2>/dev/null)" || lncrc=$?
     lncrc="${lncrc:-0}"
     if [ "$lncrc" -gt 128 ]; then
       echo "::error::native-selfhost-gate FAIL — the native-built compiler died on signal $((lncrc - 128)) compiling $LAYOUT."
       rm -f "$BIN"; exit 1
     fi
-    loc="$("$KAIC2" $EDITION_FLAG --emit=c --path "$ROOT/stdlib" "$LAYOUT" 2>/dev/null)" || locrc=$?
+    loc="$("$KAIC2" $EDITION_FLAG --path "$ROOT/stdlib" "$LAYOUT" 2>/dev/null)" || locrc=$?
     locrc="${locrc:-0}"
   fi
   rm -f "$BIN"
