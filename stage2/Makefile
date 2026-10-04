@@ -7535,7 +7535,7 @@ endif
 # that skip every read release it on entry, `and`/`or` and guards included.
 # The ledger bound catches the per-evaluation leak; the ASAN companion
 # catches an over-release on the path that does read.
-ARM_BRANCH_READ_FIXTURES := arm_branch_single_read_2138 path_move_read_2144 short_circuit_read_2146 short_circuit_field_cell
+ARM_BRANCH_READ_FIXTURES := arm_branch_single_read_2138 path_move_read_2144 short_circuit_read_2146 short_circuit_field_cell guard_only_binder_body_drop
 
 test-perceus-arm-branch-read: $(TARGET) build
 	@set -e; \
