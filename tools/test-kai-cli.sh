@@ -336,6 +336,18 @@ else
 fi
 expect_line "mutate: --apply names a site the module does not have" 1 "mutate: no site 99 (the file has 7)" \
   sh -c 'cd "$1" && "$2" mutate --apply 99 --module greet.kai' _ "$U" "$KAI"
+# `enclosing` names the module by its path in the package, so two files of
+# one name in different directories never share a key.
+H="$TMP/homonym_util"
+mkdir -p "$H/a" "$H/b"
+printf 'name = "homonym_util"\n' > "$H/kai.toml"
+printf '#[doc("Two or more.")]\npub fn f(n: Int) : Bool = n >= 2\n' > "$H/a/util.kai"
+cp "$H/a/util.kai" "$H/b/util.kai"
+got="$(cd "$H" && for m in a/util.kai b/util.kai; do "$KAI" mutate --list --json --operator compare --module "$m"; done 2>&1 | grep -o '"enclosing": "[^"]*"' | tr '\n' ' ')"
+case "$got" in
+  '"enclosing": "a.util.f/1" "enclosing": "b.util.f/1" ') ok "mutate: enclosing names the module by its package path" ;;
+  *) fail "mutate: enclosing of same-named modules"; printf '        got: %s\n' "$got" ;;
+esac
 # `--limit` caps a listing across modules as it caps a run: greet.kai has 7 sites, helper.kai 2.
 all="$(cd "$U" && "$KAI" mutate --list --json 2>&1)"
 expect "mutate: --list --json --limit caps the sites across modules" 0 "$(printf '%s\n' "$all" | head -n 8)" \
