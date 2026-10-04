@@ -58,6 +58,10 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <stddef.h>
+/* The leak-site tracer extends the RC ledger, so it switches the ledger on. */
+#if defined(KAI_TRACE_RC_LEAKSITE) && !defined(KAI_TRACE_RC)
+#define KAI_TRACE_RC 1
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
