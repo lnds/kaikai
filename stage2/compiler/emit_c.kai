@@ -91,6 +91,7 @@ import compiler.ffi_v2
 import compiler.emit_ffi_c
 import compiler.emit_slices
 import compiler.emit_tcrec_live
+import compiler.trmc_self_call
 import compiler.trmc_exit_drops
 import compiler.modular_linkage
 import compiler.region
@@ -13112,55 +13113,6 @@ pub fn dump_mono_out(file: String, decls: [Decl]) : Int / Console + File {
 fn tcrec_has_tail_self_call(body: Expr, nm: String, arity: Int, own_mod: Option[String], cons_ok: Bool) : Bool =
   tcrec_walk_tail(body.kind, nm, arity, own_mod, [], cons_ok)
 
-# ---- TRMC (tail-recursion-modulo-cons) recognition -----------------
-#
-# Port of Koka's hasCTailCall/hasCTailCallArg (Core/CTail.hs:193-227).
-# A modulo-cons site is a constructor application in tail position
-# exactly ONE of whose argument slots is a direct self-call (the
-# recursion "modulo" the constructor), with every other slot a total
-# (effect-free, self-call-free) expression.
-#
-# `tcrec_ctor_modcons_slot(xs, nm, arity)` returns Some(i) where `i`
-# is the slot index carrying the self-call, else None. The slot
-# becomes the cctx hole; the constructor is built with a hole there,
-# the cctx is extended to point at it, and the loop variable rebinds
-# to the self-call's arguments (the TRMC goto).
-#
-# v1 restrictions (conservative, mirror Koka's affine path):
-#   - exactly one slot is the self-call (single-recursive modulo-cons);
-#   - the self-call is a direct `nm(...)` with matching arity;
-#   - every other slot is self-call-free (checked by
-#     `tcrec_expr_has_self_call`). Koka additionally requires the other
-#     args be `isTotal`; kaikai's match/if guards already ran, and the
-#     ctor args here are simple binders/primitives, so self-call-free
-#     is the load-bearing predicate. Nested-ctor modulo-cons (Koka's
-#     recurse-into-other-con case) is DEFERRED — not needed for rb-tree.
-fn tcrec_ctor_modcons_slot(xs: [Expr], nm: String, arity: Int, own_mod: Option[String]) : Option[Int] =
-  tcrec_ctor_modcons_scan(xs, nm, arity, own_mod, 0, None)
-
-fn tcrec_ctor_modcons_scan(xs: [Expr], nm: String, arity: Int, own_mod: Option[String], i: Int,
-                           found: Option[Int]) : Option[Int] {
-  match xs {
-    [] -> found
-    [a, ...rest] -> {
-      if tcrec_is_direct_self_call(a, nm, arity, own_mod) {
-        # A second self-call slot disqualifies (not single-recursive).
-        match found {
-          Some(_) -> None
-          None    -> tcrec_ctor_modcons_scan(rest, nm, arity, own_mod, i + 1, Some(i))
-        }
-      } else if tcrec_expr_has_self_call(a, nm, arity, own_mod) {
-        # Self-call buried inside a non-modulo-cons position (e.g. an
-        # argument to a regular fn nested in this slot) → not a clean
-        # modulo-cons site; bail.
-        None
-      } else {
-        tcrec_ctor_modcons_scan(rest, nm, arity, own_mod, i + 1, found)
-      }
-    }
-  }
-}
-
 # ---- TRMC for the BUILTIN cons (`[h, ...self(t)]`) ------------------
 #
 # The dominant list-build idiom is the cons literal, not a user ctor:
@@ -13217,90 +13169,6 @@ fn trmc_reuse_cons_modcons(callee: String, xs: [Expr], nm: String, arity: Int, o
     _ -> None
   } }
 
-# A self-call is `nm(...)` with matching arity. The qualified form
-# `EModCall(mod, nm)` is a self-call ONLY when `mod` names the
-# function's own module (`own_mod`); a foreign call with the same
-# bare name (e.g. `decimal.cmp` inside `money.cmp`) must NOT be
-# mistaken for recursion, or TRMC rewrites it into a `goto` that
-# rebinds the loop vars to the foreign call's args and corrupts the
-# spine. Root-file fns (own_mod = None) never self-call via EModCall.
-fn tcrec_modcall_is_self(callmod: String, own_mod: Option[String]) : Bool =
-  match own_mod {
-    None    -> false
-    Some(m) -> callmod == m
-  }
-
-fn tcrec_is_direct_self_call(e: Expr, nm: String, arity: Int, own_mod: Option[String]) : Bool =
-  match e.kind {
-    ECall(f, xs) -> match sym_read_kind(f.kind) {
-      EVar(callee)              -> callee == nm and list_length(xs) == arity
-      EModCall(callmod, callee) -> callee == nm and list_length(xs) == arity and tcrec_modcall_is_self(callmod, own_mod)
-      _ -> false
-    }
-    _ -> false
-  }
-
-# Does `e` contain a self-call to `nm` anywhere (any position)? Used to
-# reject ctor slots (other than the modulo-cons one) that hide a
-# recursion the TRMC rewrite would otherwise drop.
-fn tcrec_expr_has_self_call(e: Expr, nm: String, arity: Int, own_mod: Option[String]) : Bool =
-  match e.kind {
-    EVar(_)             -> false
-    ESym(_, _, _)             -> false
-    EInt(_, _)             -> false
-    EReal(_, _)            -> false
-    EIntLit(_)            -> false
-    EDecimalLit(_)        -> false
-    EFixed(_, _)           -> false
-    EStr(_, _)          -> false
-    EBool(_)            -> false
-    EChar(_)            -> false
-    EUnit               -> false
-    EUnder              -> false
-    ECall(f, xs) -> {
-      let here = match sym_read_kind(f.kind) {
-        EVar(callee)              -> callee == nm and list_length(xs) == arity
-        EModCall(callmod, callee) -> callee == nm and list_length(xs) == arity and tcrec_modcall_is_self(callmod, own_mod)
-        _ -> false
-      }
-      here or tcrec_any_has_self_call(xs, nm, arity, own_mod) or tcrec_expr_has_self_call(f, nm, arity, own_mod)
-    }
-    EBinop(_, a, b)     -> tcrec_expr_has_self_call(a, nm, arity, own_mod) or tcrec_expr_has_self_call(b, nm, arity, own_mod)
-    EUnop(_, a)         -> tcrec_expr_has_self_call(a, nm, arity, own_mod)
-    EIf(c, t, oe)       -> tcrec_expr_has_self_call(c, nm, arity, own_mod) or tcrec_expr_has_self_call(t, nm, arity, own_mod) or (match oe { Some(x) -> tcrec_expr_has_self_call(x, nm, arity, own_mod) None -> false })
-    EBlock(stmts, ot)   -> tcrec_stmts_have_self_call(stmts, nm, arity, own_mod) or (match ot { Some(x) -> tcrec_expr_has_self_call(x, nm, arity, own_mod) None -> false })
-    EMatch(s, arms)     -> tcrec_expr_has_self_call(s, nm, arity, own_mod) or tcrec_arms_have_self_call(arms, nm, arity, own_mod)
-    EField(a, _)        -> tcrec_expr_has_self_call(a, nm, arity, own_mod)
-    EIndex(a, b)        -> tcrec_expr_has_self_call(a, nm, arity, own_mod) or tcrec_expr_has_self_call(b, nm, arity, own_mod)
-    EIntrinsic(_, xs)   -> tcrec_any_has_self_call(xs, nm, arity, own_mod)
-    ESurface(sf)   -> tcrec_any_has_self_call(surface_children(sf), nm, arity, own_mod)
-    _                   -> true   # conservative: unknown shape may hide a self-call
-  }
-
-fn tcrec_any_has_self_call(xs: [Expr], nm: String, arity: Int, own_mod: Option[String]) : Bool =
-  match xs {
-    [] -> false
-    [a, ...rest] -> tcrec_expr_has_self_call(a, nm, arity, own_mod) or tcrec_any_has_self_call(rest, nm, arity, own_mod)
-  }
-
-fn tcrec_stmts_have_self_call(stmts: [Stmt], nm: String, arity: Int, own_mod: Option[String]) : Bool =
-  match stmts {
-    [] -> false
-    [s, ...rest] -> {
-      let here = match s {
-        SLet(_, _, rhs)      -> tcrec_expr_has_self_call(rhs, nm, arity, own_mod)
-        SExprStmt(e)         -> tcrec_expr_has_self_call(e, nm, arity, own_mod)
-        _ -> false
-      }
-      here or tcrec_stmts_have_self_call(rest, nm, arity, own_mod)
-    }
-  }
-
-fn tcrec_arms_have_self_call(arms: [Arm], nm: String, arity: Int, own_mod: Option[String]) : Bool =
-  match arms {
-    [] -> false
-    [Arm(_, _, body), ...rest] -> tcrec_expr_has_self_call(body, nm, arity, own_mod) or tcrec_arms_have_self_call(rest, nm, arity, own_mod)
-  }
 
 fn tcrec_walk_tail(k: ExprKind, nm: String, arity: Int, own_mod: Option[String], scope: [String], cons_ok: Bool) : Bool {
   match k {
