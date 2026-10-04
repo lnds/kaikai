@@ -1421,7 +1421,7 @@ test-numeric-literal-mint: $(TARGET) build
 # with an actionable `--backend=c` diagnostic (issue #923).
 test-ffi-v2-struct: $(TARGET) build
 	@set -e; \
-	$(KAIC2) $(TEST_CORE_CACHE) --backend=c ../examples/ffi/v2_struct_by_value.kai > build/v2_struct.stream; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/ffi/v2_struct_by_value.kai > build/v2_struct.stream; \
 	rm -rf build/v2_struct.d; mkdir -p build/v2_struct.d; \
 	nonce=$$(sed -n '1s/^\/\/KAIDELIM://p' build/v2_struct.stream); \
 	awk -v dir=build/v2_struct.d -v pfx="//KAIFILE:$$nonce::" 'index($$0, pfx) == 1 { out = dir "/" substr($$0, length(pfx) + 1); next } out { print > out }' build/v2_struct.stream; \
@@ -1444,7 +1444,7 @@ test-ffi-v2-struct: $(TARGET) build
 # the native-vs-C parity ratchet.
 test-ffi-v2-opaque: $(TARGET) build
 	@set -e; \
-	$(KAIC2) $(TEST_CORE_CACHE) --backend=c ../examples/ffi/v2_opaque_handle.kai > build/v2_opaque.c; \
+	$(KAIC2) $(TEST_CORE_CACHE) ../examples/ffi/v2_opaque_handle.kai > build/v2_opaque.c; \
 	$(CC) $(CFLAGS) -Wno-absolute-value -I ../stage2 -I ../stage0 build/v2_opaque.c ../examples/ffi/v2_shim.c -o build/v2_opaque-c $(LDLIBS_M); \
 	./build/v2_opaque-c > build/v2_opaque.out; \
 	diff -q ../examples/ffi/v2_opaque_handle.out.expected build/v2_opaque.out > /dev/null \
@@ -13154,7 +13154,7 @@ test-native-namespace: $(TARGET)
 # clause / cleanup). Verifies BOTH backends still agree once the symbols move.
 test-issue-1682-user-symbol-namespace: $(TARGET) build
 	@set -e; \
-	$(KAIC2) $(TEST_CORE_CACHE) --backend=c --path ../stdlib \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib \
 	  ../examples/effects/issue_1682_user_symbol_namespace.kai > build/iss1682.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss1682.c -o build/iss1682 $(LDLIBS_M); \
 	./build/iss1682 > build/iss1682.out; \
