@@ -26,7 +26,9 @@ stdlib ones for your types is the common case.
 
 An `impl P[A] for T` must live in the module that declares `P`, the
 head of `T`, or the head of a protocol argument `A`. Anywhere else it
-is a compile error: write the impl beside the type.
+is a compile error: write the impl beside the type. Builtins (`Int`,
+`[a]`, `Option[a]`, ...) belong to no module, so implement a CORE
+protocol for one by wrapping it in a type of your own.
 
 ## Example
 
