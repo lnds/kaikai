@@ -18887,6 +18887,7 @@ typedef struct {
     KaiNFrame *frames; int nframes, framecap;
     int ok;
     int in_fn;   /* begin_fn/end_fn nesting guard (fail loud, not corrupt) */
+    void *pad;   /* the landing block a call unwinds to; NULL for none */
     /* DWARF debug info (#500), populated only in --debug. `dib` is the
      * module DIBuilder, `difile` the source DIFile, `dicu` the compile
      * unit, `disub` the CURRENT function's DISubprogram (the scope every
@@ -19001,7 +19002,7 @@ static KaiValue *kai_native_ctx_begin_fn(void *cv, void *fnval) {
     if (c->in_fn) { fprintf(stderr, "kai: native begin_fn nested (compiler bug)\n"); c->ok = 0; return kai_unit(); }
     for (int i = 0; i < c->nregs; i++) free(c->regs[i].name);
     for (int i = 0; i < c->nblks; i++) free(c->blks[i].label);
-    c->nregs = 0; c->nblks = 0; c->fnval = fnval; c->in_fn = 1;
+    c->nregs = 0; c->nblks = 0; c->fnval = fnval; c->in_fn = 1; c->pad = NULL;
     /* DWARF (#500): start each fn with NO subprogram + no current location.
      * Only a fn that calls `native_di_subprogram` (the user-fn walk) gets a
      * scope; a synthetic fn (thunk / runtime hook / runner driver) keeps
@@ -19013,7 +19014,11 @@ static KaiValue *kai_native_ctx_begin_fn(void *cv, void *fnval) {
     if (c->b) LLVMSetCurrentDebugLocation2((LLVMBuilderRef) c->b, NULL);
     return kai_unit();
 }
-static KaiValue *kai_native_ctx_end_fn(void *cv) { ((KaiNativeCtx *) cv)->in_fn = 0; return kai_unit(); }
+static KaiValue *kai_native_ctx_end_fn(void *cv) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    c->in_fn = 0; c->pad = NULL;
+    return kai_unit();
+}
 
 static KaiValue *kai_native_ctx_add_reg(void *cv, KaiValue *name, void *alloca, int64_t slot) {
     KaiNativeCtx *c = (KaiNativeCtx *) cv;
@@ -19439,6 +19444,71 @@ static void *kai_llvm_build_call_n(void *b, void *fn, void *fnty, void *buf) {
     return (void *) LLVMBuildCall2((LLVMBuilderRef) b, (LLVMTypeRef) fnty,
                                    (LLVMValueRef) fn, (LLVMValueRef *) bf->xs,
                                    (unsigned) bf->n, "");
+}
+
+/* --- table-driven unwinding ---
+ * While a landing block of the function being built is set,
+ * `native_build_call` emits `invoke` to it and continues in a fresh
+ * block; otherwise it emits a plain call. A function emitted while
+ * another is open (a thunk, an FFI wrapper) never reaches its pad. */
+static KaiValue *kai_native_ctx_set_pad(void *cv, void *bb) {
+    ((KaiNativeCtx *) cv)->pad = bb;
+    return kai_unit();
+}
+static void *kai_native_ctx_pad(void *cv) { return ((KaiNativeCtx *) cv)->pad; }
+static void *kai_llvm_get_insert_block(void *b) {
+    return (void *) LLVMGetInsertBlock((LLVMBuilderRef) b);
+}
+static void *kai_native_build_call(void *cv, void *fn, void *fnty, void *buf) {
+    KaiNativeCtx *c = (KaiNativeCtx *) cv;
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) buf;
+    LLVMBuilderRef b = (LLVMBuilderRef) c->b;
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(b);
+    if (!c->pad || LLVMGetBasicBlockParent((LLVMBasicBlockRef) c->pad) != LLVMGetBasicBlockParent(here))
+        return (void *) LLVMBuildCall2(b, (LLVMTypeRef) fnty, (LLVMValueRef) fn,
+                                       (LLVMValueRef *) bf->xs, (unsigned) bf->n, "");
+    LLVMBasicBlockRef next = LLVMAppendBasicBlockInContext(
+        LLVMGetModuleContext((LLVMModuleRef) c->m), LLVMGetBasicBlockParent(here), "");
+    LLVMMoveBasicBlockAfter(next, here);
+    LLVMValueRef r = LLVMBuildInvoke2(b, (LLVMTypeRef) fnty, (LLVMValueRef) fn,
+                                      (LLVMValueRef *) bf->xs, (unsigned) bf->n,
+                                      next, (LLVMBasicBlockRef) c->pad, "");
+    LLVMPositionBuilderAtEnd(b, next);
+    return (void *) r;
+}
+/* `invoke` continues at `then_bb` on return and at `unwind_bb` when an
+ * unwind passes through the call; the landing pad there is a cleanup that
+ * `resume`s the unwind once it has released the frame's references. */
+static void *kai_llvm_build_invoke_n(void *b, void *fn, void *fnty, void *buf,
+                                     void *then_bb, void *unwind_bb) {
+    KaiLlvmBuf *bf = (KaiLlvmBuf *) buf;
+    return (void *) LLVMBuildInvoke2((LLVMBuilderRef) b, (LLVMTypeRef) fnty,
+                                     (LLVMValueRef) fn, (LLVMValueRef *) bf->xs,
+                                     (unsigned) bf->n, (LLVMBasicBlockRef) then_bb,
+                                     (LLVMBasicBlockRef) unwind_bb, "");
+}
+static void *kai_llvm_build_landingpad_cleanup(void *b) {
+    LLVMBasicBlockRef bb = LLVMGetInsertBlock((LLVMBuilderRef) b);
+    LLVMContextRef ctx = LLVMGetTypeContext(LLVMTypeOf(LLVMGetBasicBlockParent(bb)));
+    LLVMTypeRef fields[2] = { LLVMPointerTypeInContext(ctx, 0), LLVMInt32TypeInContext(ctx) };
+    LLVMTypeRef ty = LLVMStructTypeInContext(ctx, fields, 2, 0);
+    LLVMValueRef lp = LLVMBuildLandingPad((LLVMBuilderRef) b, ty, NULL, 0, "");
+    LLVMSetCleanup(lp, 1);
+    return (void *) lp;
+}
+static KaiValue *kai_llvm_build_resume(void *b, void *lp) {
+    LLVMBuildResume((LLVMBuilderRef) b, (LLVMValueRef) lp);
+    return kai_unit();
+}
+static KaiValue *kai_llvm_set_personality(void *fn, void *pers) {
+    LLVMSetPersonalityFn((LLVMValueRef) fn, (LLVMValueRef) pers);
+    return kai_unit();
+}
+/* Asynchronous unwind tables (UWTableKind::Async = 2), so an unwind can
+ * walk through the function from any of its calls. */
+static KaiValue *kai_llvm_add_uwtable(void *fn) {
+    kai_llvm_add_enum_fn_attr((LLVMValueRef) fn, "uwtable", 7, 2);
+    return kai_unit();
 }
 
 /* --- function lookup / declaration ---
@@ -20767,6 +20837,15 @@ static KaiValue *kai_llvm_build_ret_void(void *b) { (void) b; kai_llvm_native_un
 static void *kai_llvm_fn_type_boxed(void *p, int64_t n) { (void) p; (void) n; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_fn_type_n(void *r, void *buf) { (void) r; (void) buf; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_build_call_n(void *b, void *fn, void *t, void *buf) { (void) b; (void) fn; (void) t; (void) buf; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_invoke_n(void *b, void *fn, void *t, void *buf, void *tb, void *ub) { (void) b; (void) fn; (void) t; (void) buf; (void) tb; (void) ub; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_build_landingpad_cleanup(void *b) { (void) b; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_native_ctx_set_pad(void *c, void *bb) { (void) c; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
+static void *kai_native_ctx_pad(void *c) { (void) c; return kai_llvm_native_unavailable(); }
+static void *kai_llvm_get_insert_block(void *b) { (void) b; return kai_llvm_native_unavailable(); }
+static void *kai_native_build_call(void *c, void *fn, void *t, void *buf) { (void) c; (void) fn; (void) t; (void) buf; return kai_llvm_native_unavailable(); }
+static KaiValue *kai_llvm_build_resume(void *b, void *lp) { (void) b; (void) lp; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_set_personality(void *fn, void *pers) { (void) fn; (void) pers; kai_llvm_native_unavailable(); return kai_unit(); }
+static KaiValue *kai_llvm_add_uwtable(void *fn) { (void) fn; kai_llvm_native_unavailable(); return kai_unit(); }
 static KaiValue *kai_llvm_position_at_start(void *b, void *bb) { (void) b; (void) bb; kai_llvm_native_unavailable(); return kai_unit(); }
 static void *kai_llvm_get_or_declare_fn(void *m, KaiValue *nm, void *t) { (void) m; (void) nm; (void) t; return kai_llvm_native_unavailable(); }
 static void *kai_llvm_get_param(void *fn, int64_t i) { (void) fn; (void) i; return kai_llvm_native_unavailable(); }
