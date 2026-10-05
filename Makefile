@@ -1243,8 +1243,87 @@ test-editions: kaic2
 #
 # CI runs the two shards as parallel jobs (the tier1-asan job in
 # tier1.yml) on the shared kaic2 build, so the split point balances the
-# legs around the demos block. Locally
-# `make tier1-asan` runs both shards in sequence.
+# legs around the demos block. Each shard's legs run under `make -j`:
+# every leg writes its own build/ files, and the core cache is warmed
+# before the fan-out. Locally `make tier1-asan` runs both shards in
+# sequence.
+TIER1_ASAN_JOBS ?= 4
+TIER1_ASAN_LEGS_A := \
+	test-mn-sigaltstack-asan \
+	test-namespace-collisions-asan \
+	test-trace-asan \
+	test-runtime-shadow-asan \
+	test-signal-trap-asan \
+	test-log-asan \
+	test-trap-exit-cancel-asan \
+	test-process-basic-asan \
+	test-perceus-issue82-asan \
+	test-ffi-extern-c-asan \
+	test-perceus-issue118-asan \
+	test-perceus-issue298-asan \
+	test-perceus-issue350-asan \
+	test-perceus-trmc-spread-asan
+TIER1_ASAN_LEGS_B := \
+	test-perceus-issue703-asan \
+	test-issue-779-asan \
+	test-perceus-enum-slot-asan \
+	test-perceus-int-cache-asan \
+	test-int-field-inline-asan \
+	test-perceus-nested-reuse-asan \
+	test-match-pbind-catchall-asan \
+	test-http-client-asan \
+	test-stdlib-crypto-asan \
+	test-stdlib-regex-predicate-asan \
+	test-env-mutate-asan \
+	test-securerandom-asan \
+	test-perceus-1151-vec-push-growth-asan \
+	test-perceus-1153-modcall-linear-asan \
+	test-perceus-1150-vec-surface-asan \
+	test-perceus-1180-range-lazy-asan \
+	test-perceus-1295-borrow-slot-nested-arg-asan \
+	test-perceus-1303-single-use-branch-leak-asan \
+	test-perceus-1315-borrowed-match-release-asan \
+	test-perceus-1328-selftail-borrowed-local-asan \
+	test-issue-1331-op-arg-release-asan \
+	test-perceus-1355-closure-temp-release-asan \
+	test-perceus-1324-char-binder-goto-asan \
+	test-perceus-1395-char-param-raw-asan \
+	test-issue-1394-byte-box-asan \
+	test-perceus-1410-byte-raw-ops-asan \
+	test-perceus-1457-fixed-raw-ops-asan \
+	test-perceus-1637-int-wrap-ops-asan \
+	test-perceus-1464-fixed-raw-ops-asan \
+	test-issue-1331-borrowed-op-arg-asan \
+	test-perceus-1758-cond-exit-drop-asan \
+	test-perceus-1765-binop-base-tail-asan \
+	test-perceus-1768-move-gate-positions-asan \
+	test-perceus-1770-arm-birth-leak-asan \
+	test-perceus-1784-variant-rebuild-asan \
+	test-perceus-1786-record-rebuild-asan \
+	test-perceus-1791-arm-use-scope-asan \
+	test-perceus-1302-tcrec-goto-drops-asan \
+	test-perceus-1635-goto-move-collision-asan \
+	test-perceus-1801-capability-param-asan \
+	test-perceus-1803-op-arg-free-asan \
+	test-perceus-1902-block-let-move-asan \
+	test-perceus-2032-bang-operand-use-asan \
+	test-perceus-owned-scope-unused-param-asan \
+	test-perceus-block-let-unused-alias-asan \
+	test-perceus-closure-capture-tail-asan \
+	test-perceus-borrow-homonym-asan \
+	test-perceus-closure-capture-selftail-asan \
+	test-perceus-switch-scrutinee-selftail-asan \
+	test-perceus-arm-branch-read-asan \
+	test-perceus-read-identity-asan \
+	test-perceus-trmc-step-ledger-asan \
+	test-perceus-borrow-own-asan \
+	test-perceus-spread-consumes-asan \
+	test-perceus-reuse-untaken-slot-asan \
+	test-perceus-branch-param-selftail-asan \
+	test-perceus-trmc-raw-operand-drop-asan \
+	test-perceus-pipe-borrowed-slot-alignment-asan \
+	test-trmc-slot-forms-asan
+
 tier1-asan: tier1-asan-a tier1-asan-b
 
 tier1-asan-a: kaic2 test-arena
@@ -1268,153 +1347,14 @@ tier1-asan-a: kaic2 test-arena
 	  exit 1; \
 	fi; \
 	echo "tier1-asan OK — $$got/$$expected demos pass under ASAN+UBSan, no sanitizer diagnostics"
-	@$(MAKE) -C stage2 test-mn-sigaltstack-asan
-	@echo "tier1-asan OK — sigaltstack fixture passes under ASAN+UBSan at KAI_THREADS=1/2/8/16 (alternate-stack ownership gate)"
-	@$(MAKE) -C stage2 test-namespace-collisions-asan
-	@$(MAKE) -C stage2 test-trace-asan
-	@echo "tier1-asan OK — trace fixtures pass under ASAN+UBSan (R10/R11 regression gate)"
-	@$(MAKE) -C stage2 test-runtime-shadow-asan
-	@echo "tier1-asan OK — issue #78 fixture passes under ASAN+UBSan (runtime helper rename gate)"
-	@$(MAKE) -C stage2 test-signal-trap-asan
-	@echo "tier1-asan OK — issue #107 fixture passes under ASAN+UBSan (Signal effect runtime gate)"
-	@$(MAKE) -C stage2 test-log-asan
-	@echo "tier1-asan OK — issue #141 fixture passes under ASAN+UBSan (Log default handler / clock_gettime / strftime gate)"
-	@$(MAKE) -C stage2 test-trap-exit-cancel-asan
-	@echo "tier1-asan OK — issue #103 fixture passes under ASAN+UBSan (trap-exit / outer Cancel handler gate)"
-	@$(MAKE) -C stage2 test-process-basic-asan
-	@echo "tier1-asan OK — issue #126 fixture passes under ASAN+UBSan (Process effect runtime gate)"
-	@$(MAKE) -C stage2 test-perceus-issue82-asan
-	@echo "tier1-asan OK — issue #82 fixture passes under ASAN+UBSan (Perceus leak-audit gate)"
-	@$(MAKE) -C stage2 test-ffi-extern-c-asan
-	@echo "tier1-asan OK — m12.7.x FFI fixture passes under ASAN+UBSan (extern_c shim memory gate)"
-	@$(MAKE) -C stage2 test-perceus-issue118-asan
-	@echo "tier1-asan OK — issue #118 fixtures pass under ASAN+UBSan (Perceus reuse-in-place gate)"
-	@$(MAKE) -C stage2 test-perceus-issue298-asan
-	@echo "tier1-asan OK — issue #298 fixture passes under ASAN+UBSan (closure capture lifecycle gate)"
-	@$(MAKE) -C stage2 test-perceus-issue350-asan
-	@echo "tier1-asan OK — issue #350 fixtures pass under ASAN+UBSan (arm-binding multi-use drop gate)"
-	@$(MAKE) -C stage2 test-perceus-trmc-spread-asan
-	@echo "tier1-asan OK — TRMC shared pass-through arg fixture passes under ASAN+UBSan (dropmask / wrap-skip alignment gate)"
+	@$(MAKE) -C stage2 core-cache-warm
+	@$(MAKE) -C stage2 -j$(TIER1_ASAN_JOBS) $(TIER1_ASAN_LEGS_A)
+	@echo "tier1-asan-a OK — $(words $(TIER1_ASAN_LEGS_A)) fixture legs pass under ASAN+UBSan"
 
 tier1-asan-b: kaic2
-	@$(MAKE) -C stage2 test-perceus-issue703-asan
-	@echo "tier1-asan OK — issue #703 fixture passes under ASAN+UBSan (UFn-body let-bound variant double-match gate)"
-	@$(MAKE) -C stage2 test-issue-779-asan
-	@echo "tier1-asan OK — issue #779 fixture passes under ASAN+UBSan (multi-stmt block raw-tail drop-threading gate)"
-	@$(MAKE) -C stage2 test-perceus-enum-slot-asan
-	@echo "tier1-asan OK — enum-slot fixture passes under ASAN+UBSan (enum-as-int extract/re-intern soundness gate)"
-	@$(MAKE) -C stage2 test-perceus-int-cache-asan
-	@echo "tier1-asan OK — Phase 1.A fixture passes under ASAN+UBSan (widened small-int cache pinned-slot gate)"
-	@$(MAKE) -C stage2 test-int-field-inline-asan
-	@echo "tier1-asan OK — i64-inline variant Int-field battery passes under ASAN+UBSan (raw-binder soundness gate)"
-	@$(MAKE) -C stage2 test-perceus-nested-reuse-asan
-	@echo "tier1-asan OK — nested-pattern reuse fixture passes under ASAN+UBSan (balance rotation outer+inner cell reuse gate)"
-	@$(MAKE) -C stage2 test-match-pbind-catchall-asan
-	@echo "tier1-asan OK — issue #91 fixture passes under ASAN+UBSan (PBind catch-all fast-path raw-local gate)"
-	@$(MAKE) -C stage2 test-http-client-asan
-	@echo "tier1-asan OK — net.http client fixture passes under ASAN+UBSan (Tier S1 lane #3 gate)"
-	@$(MAKE) -C stage2 test-stdlib-crypto-asan
-	@echo "tier1-asan OK — issue #139 fixture passes under ASAN+UBSan (crypto byte-buffer + 64-bit modular gate)"
-	@$(MAKE) -C stage2 test-stdlib-regex-predicate-asan
-	@echo "tier1-asan OK — issue #85 fixture passes under ASAN+UBSan (regex sigil + matches predicate runtime gate)"
-	@$(MAKE) -C stage2 test-env-mutate-asan
-	@echo "tier1-asan OK — issue #127 fixture passes under ASAN+UBSan (Env set/unset/vars buffer-ownership gate)"
-	@$(MAKE) -C stage2 test-securerandom-asan
-	@echo "tier1-asan OK — issue #140 fixture passes under ASAN+UBSan (SecureRandom default-handler gate)"
-	@$(MAKE) -C stage2 test-perceus-1151-vec-push-growth-asan
-	@echo "tier1-asan OK — issue #1151 fixtures pass under ASAN+UBSan (Vec push growth-at-capacity gate)"
-	@$(MAKE) -C stage2 test-perceus-1153-modcall-linear-asan
-	@echo "tier1-asan OK — issue #1153 fixtures pass under ASAN+UBSan (module-call linearity gate)"
-	@$(MAKE) -C stage2 test-perceus-1150-vec-surface-asan
-	@echo "tier1-asan OK — issue #1150 fixtures pass under ASAN+UBSan (Vec slices / minting / collect)"
-	@$(MAKE) -C stage2 test-perceus-1180-range-lazy-asan
-	@echo "tier1-asan OK — issue #1180 fixture passes under ASAN+UBSan (lazy-range norm / fallback gate)"
-	@$(MAKE) -C stage2 test-perceus-1295-borrow-slot-nested-arg-asan
-	@echo "tier1-asan OK — issue #1295 fixture passes under ASAN+UBSan (borrowed-slot nested-arg use-count gate)"
-	@$(MAKE) -C stage2 test-perceus-1303-single-use-branch-leak-asan
-	@echo "tier1-asan OK — issue #1303 fixture passes under ASAN+UBSan (branchy single-use param exit-drop gate)"
-	@$(MAKE) -C stage2 test-perceus-1315-borrowed-match-release-asan
-	@echo "tier1-asan OK — issue #1315 fixtures pass under ASAN+UBSan (borrowed-scrutinee release gate)"
-	@$(MAKE) -C stage2 test-perceus-1328-selftail-borrowed-local-asan
-	@echo "tier1-asan OK — issue #1328 fixtures pass under ASAN+UBSan (multi-use borrowed-local exit-drop gate)"
-	@$(MAKE) -C stage2 test-issue-1331-op-arg-release-asan
-	@echo "tier1-asan OK — issue #1331 fixture passes under ASAN+UBSan (op-arg + tail-read-local release gate)"
-	@$(MAKE) -C stage2 test-perceus-1355-closure-temp-release-asan
-	@echo "tier1-asan OK — issue #1355 fixture passes under ASAN+UBSan (closure temp in borrowed HOF slot, no double-free)"
-	@$(MAKE) -C stage2 test-perceus-1324-char-binder-goto-asan
-	@echo "tier1-asan OK — issue #1324 fixture passes under ASAN+UBSan (Char-binding match on the tcrec goto ledger)"
-	@$(MAKE) -C stage2 test-perceus-1395-char-param-raw-asan
-	@echo "tier1-asan OK — issue #1395 fixture passes under ASAN+UBSan (raw Char param, fresh box per consuming use)"
-	@$(MAKE) -C stage2 test-issue-1394-byte-box-asan
-	@echo "tier1-asan OK — issue #1394 fixture passes under ASAN+UBSan (Byte literal boxes through the Byte constructor)"
-	@$(MAKE) -C stage2 test-perceus-1410-byte-raw-ops-asan
-	@echo "tier1-asan OK — issue #1410 fixture passes under ASAN+UBSan (raw Byte op family, fresh box per boxed border)"
-	@$(MAKE) -C stage2 test-perceus-1457-fixed-raw-ops-asan
-	@echo "tier1-asan OK — issue #1457 fixture passes under ASAN+UBSan (raw Int32/UInt32/UInt64 op family, fresh box per boxed border)"
-	@$(MAKE) -C stage2 test-perceus-1637-int-wrap-ops-asan
-	@echo "tier1-asan OK — issue #1637 fixture passes under ASAN+UBSan (Int shift/neg/pow family wraps, no signed-overflow UB)"
-	@$(MAKE) -C stage2 test-perceus-1464-fixed-raw-ops-asan
-	@echo "tier1-asan OK — issue #1464 fixture passes under ASAN+UBSan (raw Int128 op family, boxed div/mod, fresh box per boxed border)"
-	@$(MAKE) -C stage2 test-issue-1331-borrowed-op-arg-asan
-	@echo "tier1-asan OK — issue #1331 fixture passes under ASAN+UBSan (borrowed binder into an op arg)"
-	@$(MAKE) -C stage2 test-perceus-1758-cond-exit-drop-asan
-	@echo "tier1-asan OK — issue #1758 fixture passes under ASAN+UBSan (borrow-move-last param read in a base-arm if condition)"
-	@$(MAKE) -C stage2 test-perceus-1765-binop-base-tail-asan
-	@echo "tier1-asan OK — issue #1765 fixture passes under ASAN+UBSan (borrow-move-last param read under a base-arm binop tail)"
-	@$(MAKE) -C stage2 test-perceus-1768-move-gate-positions-asan
-	@echo "tier1-asan OK — issue #1768 fixtures pass under ASAN+UBSan (assert/guard/projection/handler-clause/interp read positions vs move gates)"
-	@$(MAKE) -C stage2 test-perceus-1770-arm-birth-leak-asan
-	@echo "tier1-asan OK — issue #1770/#1774 fixtures pass under ASAN+UBSan (arm-binder birth refs paid on goto-tail leaves and guard-fail edges, no over-release)"
-	@$(MAKE) -C stage2 test-perceus-1784-variant-rebuild-asan
-	@echo "tier1-asan OK — issue #1784 fixtures pass under ASAN+UBSan (diagonal kept child + wildcard donor slot on recognised variant rebuilds)"
-	@$(MAKE) -C stage2 test-perceus-1786-record-rebuild-asan
-	@echo "tier1-asan OK — issue #1786/#1787 fixtures pass under ASAN+UBSan (record same-field kept mask, sentinel dup unwrap, nested-flat fresh path)"
-	@$(MAKE) -C stage2 test-perceus-1791-arm-use-scope-asan
-	@echo "tier1-asan OK — issue #1791 fixture passes under ASAN+UBSan (per-arm use scope for colliding pattern binders, no over-release)"
-	@$(MAKE) -C stage2 test-perceus-1302-tcrec-goto-drops-asan
-	@echo "tier1-asan OK — issue #1302 fixture passes under ASAN+UBSan (tcrec goto-tail release ledger, no over-free)"
-	@$(MAKE) -C stage2 test-perceus-1635-goto-move-collision-asan
-	@echo "tier1-asan OK — issue #1635 fixture passes under ASAN+UBSan (goto move-set name collision, no stale-cell read)"
-	@$(MAKE) -C stage2 test-perceus-1801-capability-param-asan
-	@echo "tier1-asan OK — issue #1801 fixtures pass under ASAN+UBSan (capability params carry no RC traffic, evidence node never dropped)"
-	@$(MAKE) -C stage2 test-perceus-1803-op-arg-free-asan
-	@echo "tier1-asan OK — issue #1803 fixture passes under ASAN+UBSan (clause-body binder vs continuation register gate)"
-	@$(MAKE) -C stage2 test-perceus-1902-block-let-move-asan
-	@echo "tier1-asan OK — block-let move-at-last-use fixture passes under ASAN+UBSan (no over-release when the lone read transfers the birth ref)"
-	@$(MAKE) -C stage2 test-perceus-2032-bang-operand-use-asan
-	@echo "tier1-asan OK — a binder read only through a propagation operand keeps its ref (use scan sees the node, no use-after-free)"
-	@$(MAKE) -C stage2 test-perceus-owned-scope-unused-param-asan
-	@echo "tier1-asan OK — a never-read owned param is released once (entry drop only, no branch drops on top)"
-	@$(MAKE) -C stage2 test-perceus-block-let-unused-alias-asan
-	@echo "tier1-asan OK — a never-read block let bound to an alias is released once (exit drop, no double free when the source stays live)"
-	@$(MAKE) -C stage2 test-perceus-closure-capture-tail-asan
-	@echo "tier1-asan OK — a pattern binder captured by a lambda in a self tail call's arguments stays live on the C backend"
-	@$(MAKE) -C stage2 test-perceus-borrow-homonym-asan
-	@echo "tier1-asan OK — a bare callee homonymous across modules reads the calling module's borrow convention (no use-after-free)"
-	@$(MAKE) -C stage2 test-perceus-closure-capture-selftail-asan
-	@echo "tier1-asan OK — a closure-captured arm binder on a self-tail path is released after the args, not before"
-	@$(MAKE) -C stage2 test-perceus-switch-scrutinee-selftail-asan
-	@echo "tier1-asan OK — an arm binder consumed by an integral-literal match scrutinee is not released again at the self-tail goto"
-	@$(MAKE) -C stage2 test-perceus-arm-branch-read-asan
-	@echo "tier1-asan OK — a binder read at most once per path is released on entry to the alternatives that skip it (no over-release on the reading path)"
-	@$(MAKE) -C stage2 test-perceus-read-identity-asan
-	@echo "tier1-asan OK — binder reads come from one table keyed by identity: no arm inherits a sibling's move, no borrow reads a consumed binder"
-	@$(MAKE) -C stage2 test-perceus-trmc-step-ledger-asan
-	@echo "tier1-asan OK — a modulo-cons step releases the enclosing matches' pending cells and binders, nothing it still reads"
-	@$(MAKE) -C stage2 test-perceus-borrow-own-asan
-	@echo "tier1-asan OK — a borrowed param read into an owned position takes a dup (no early free of the caller's value)"
-	@$(MAKE) -C stage2 test-perceus-spread-consumes-asan
-	@echo "tier1-asan OK — a list spread consumes its operand; a borrowed param in a spread is dup'd first (no use-after-free)"
-	@$(MAKE) -C stage2 test-perceus-reuse-untaken-slot-asan
-	@echo "tier1-asan OK — a reuse arm releases the slots its rebuild does not take, once (no over-release)"
-	@$(MAKE) -C stage2 test-perceus-branch-param-selftail-asan
-	@echo "tier1-asan OK — a self-tail branch that skips a param's only read releases it once (no over-release)"
-	@$(MAKE) -C stage2 test-perceus-trmc-raw-operand-drop-asan
-	@echo "tier1-asan OK — a TRMC step drops a binder after its raw-argument read, not before (no use-after-free)"
-	@$(MAKE) -C stage2 test-perceus-pipe-borrowed-slot-alignment-asan
-	@echo "tier1-asan OK — a piped call keeps each argument's ownership on its own parameter (no use-after-free)"
-	@$(MAKE) -C stage2 test-trmc-slot-forms-asan
-	@echo "tier1-asan OK — a modulo-cons step with record, list, call, lambda and handler slots stays sanitizer-clean"
+	@$(MAKE) -C stage2 core-cache-warm
+	@$(MAKE) -C stage2 -j$(TIER1_ASAN_JOBS) $(TIER1_ASAN_LEGS_B)
+	@echo "tier1-asan-b OK — $(words $(TIER1_ASAN_LEGS_B)) fixture legs pass under ASAN+UBSan"
 
 # Backend-parity: build every entry-point fixture under the documented
 # example dirs + demos with the native backend AND the C-direct oracle,
