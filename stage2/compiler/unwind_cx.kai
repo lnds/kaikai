@@ -1,0 +1,83 @@
+#[doc("The context that decides whether a call can unwind, and its lookups.")]
+
+import compiler.ast
+import compiler.util
+import compiler.unwind_clauses
+
+#[doc("""
+What decides whether a call can unwind: the declared effects, every
+declared fn with the class of its row, the effects that can unwind,
+whether every effect can, the types that can carry a closure, and the
+fns that install a handler.
+""")]
+pub type UnwCx = { effs: [String], fns: Array[[UnwFn]], unw: [String], all: Bool, carriers: [String], handles: [String] }
+
+#[doc("""
+A declared fn and the class of its row: 1 can unwind, 2 is open with
+nothing that can (the call unwinds only through what its arguments
+bring), 0 cannot.
+""")]
+pub type UnwFn = UF(String, Int)
+
+#[doc("A context that finds no call able to unwind.")]
+pub fn unw_cx_empty() : UnwCx = UnwCx { effs: [], fns: array_make(1, []), unw: [], all: false, carriers: [], handles: [] }
+
+#[doc("The class of a declared row: 1 can unwind, 2 is open with nothing that can, 0 cannot.")]
+pub fn unw_row_class(row: RowExpr, ucx: UnwCx) : Int = match row {
+  REmpty       -> 0
+  RClosed(ls)  -> if unw_labels(rl_names(ls), false, ucx) { 1 } else { 0 }
+  ROpen(_, ls) -> if unw_labels(rl_names(ls), false, ucx) { 1 } else { 2 }
+}
+
+#[doc("The bucket of `n` in a table of `size` buckets.")]
+pub fn unw_bucket(n: String, size: Int) : Int = uc_hash(n, 0, 0) % size
+
+# Kept below 2^20 at every step, so the hash never leaves the immediate range.
+fn uc_hash(s: String, i: Int, h: Int) : Int =
+  if i >= string_length(s) { h } else { uc_hash(s, i + 1, (h * 31 + string_byte_at_int(s, i)) % 1048573) }
+
+#[doc("True when a call through a value of type `t` can unwind; an unknown type can.")]
+pub fn unw_ty_unwinds(t: Option[Ty], ucx: UnwCx) : Bool = match t {
+  Some(TyFnT(_, _, row)) -> match row.tail {
+    Some(_) -> true
+    None    -> uc_labels_unwind(row.labels, ucx)
+  }
+  _ -> true
+}
+
+fn uc_labels_unwind(ls: [Label], ucx: UnwCx) : Bool = match ls {
+  [] -> false
+  [l, ...rest] -> ucx.all or unw_effect_unwinds(l.eff, ucx) or uc_labels_unwind(rest, ucx)
+}
+
+#[doc("""
+The class of the fns declared as `n`, the one that can unwind first:
+1 can unwind, 2 is open, 0 cannot, -1 when no fn is declared as `n`.
+""")]
+pub fn unw_fn_class(n: String, ucx: UnwCx) : Int = uc_best(ucx.fns[unw_bucket(n, array_length(ucx.fns))], n, 0 - 1)
+
+#[doc("The class of two, the one that can unwind first.")]
+pub fn unw_class_max(a: Int, b: Int) : Int =
+  if a == 1 or b == 1 { 1 } else if a == 2 or b == 2 { 2 } else if a == 0 or b == 0 { 0 } else { 0 - 1 }
+
+fn uc_best(fs: [UnwFn], n: String, acc: Int) : Int = match fs {
+  [] -> acc
+  [UF(m, c), ...rest] -> if m != n { uc_best(rest, n, acc) } else { uc_best(rest, n, unw_class_max(c, acc)) }
+}
+
+#[doc("True when a perform of effect `e` can unwind.")]
+pub fn unw_effect_unwinds(e: String, ucx: UnwCx) : Bool = ucx.all or list_has(ucx.unw, unw_bare_effect(e))
+
+#[doc("True when `t` names a declared effect: a capability parameter, never owned.")]
+pub fn unw_is_cap_param(ucx: UnwCx, t: Option[TypeExpr]) : Bool = match t {
+  Some(te) -> match te.tkind {
+    TyName(n, _) -> list_has(ucx.effs, n)
+    _            -> false
+  }
+  None -> false
+}
+
+#[doc("True when a row with effects `names`, open or not, can unwind.")]
+pub fn unw_labels(names: [String], open: Bool, ucx: UnwCx) : Bool =
+  if ucx.all { open or names != [] }
+  else { open or unw_any_effect_in(names, ucx.unw) }

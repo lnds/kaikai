@@ -25,7 +25,6 @@ under-release (a bounded leak), never over-release (a double-free).
 import compiler.ast
 import compiler.expr_positions
 import compiler.util
-import compiler.fnreg
 import compiler.modules
 import compiler.emit_shared
 
@@ -33,7 +32,23 @@ import compiler.emit_shared
 pub fn tcl_scr_entry(cvar: String) : String = cat2("@scr:", cvar)
 
 #[doc("True when a ledger entry names a scrutinee alias (never filtered).")]
-pub fn tcl_is_scr(e: String) : Bool = string_starts_with_q(e, "@scr:")
+pub fn tcl_is_scr(e: String) : Bool = tcl_tagged(e, 115)
+
+#[doc("Ledger entry for an unwind-stack push under fiber local `f`: the goto pops it.")]
+pub fn tcl_unw_entry(f: String) : String = cat2("@unw:", f)
+
+#[doc("True when a ledger entry is an unwind-stack push (never filtered).")]
+pub fn tcl_is_unw(e: String) : Bool = tcl_tagged(e, 117)
+
+# `@?..:` with `?` the byte `b`: a binder never starts with `@`.
+fn tcl_tagged(e: String, b: Int) : Bool =
+  string_byte_at_int(e, 0) == 64 and string_byte_at_int(e, 1) == b and string_byte_at_int(e, 4) == 58
+
+#[doc("The fiber local an unwind ledger entry pops through.")]
+pub fn tcl_unw_reg(e: String) : String = string_slice(e, 5, string_length(e) - 5)
+
+#[doc("`pend` without the unwind entry for `f`.")]
+pub fn tcl_drop_unw(pend: [String], f: String) : [String] = tcl_remove(pend, tcl_unw_entry(f))
 
 #[doc("The bare name a ledger entry releases: the scrutinee register, or the binder name.")]
 pub fn tcl_reg(e: String) : String =
@@ -68,12 +83,23 @@ fn tcl_remove_all(pend: [String], names: [String]) : [String] = match names {
 }
 
 #[doc("Drop the binder entries that expression `e` consumes (or might consume).")]
-pub fn tcl_filter(pend: [String], e: Expr) : [String] = match pend {
+pub fn tcl_filter(pend: [String], e: Expr) : [String] = tcl_filter_from(pend, e, tcl_first_consumed(pend, e, 0))
+
+fn tcl_filter_from(pend: [String], e: Expr, i: Int) : [String] = match pend {
   [] -> []
   [p, ...rest] ->
-    if not tcl_is_scr(p) and tcl_consumes(e, p) { tcl_filter(rest, e) }
-    else { [p, ...tcl_filter(rest, e)] }
+    if i < 0 { pend }
+    else if i > 0 { [p, ...tcl_filter_from(rest, e, i - 1)] }
+    else { tcl_filter_from(rest, e, tcl_first_consumed(rest, e, 0)) }
 }
+
+# Index of the first entry `e` consumes, or -1: the entries before it are kept as they are.
+fn tcl_first_consumed(pend: [String], e: Expr, i: Int) : Int = match pend {
+  [] -> 0 - 1
+  [p, ...rest] -> if tcl_drops(p, e) { i } else { tcl_first_consumed(rest, e, i + 1) }
+}
+
+fn tcl_drops(p: String, e: Expr) : Bool = not tcl_is_scr(p) and not tcl_is_unw(p) and tcl_consumes(e, p)
 
 #[doc("`tcl_filter` over a statement list, also dropping entries a `let`/`var` rebinds.")]
 pub fn tcl_filter_stmts(pend: [String], stmts: [Stmt]) : [String] = match stmts {
@@ -101,13 +127,17 @@ every binder entry the tail-call arguments do not themselves consume.
 pub fn tcl_goto_entries(pend: [String], args: [Expr]) : [String] = match pend {
   [] -> []
   [p, ...rest] ->
-    if tcl_is_scr(p) or not tcl_args_consume(args, p) { [p, ...tcl_goto_entries(rest, args)] }
+    if tcl_is_scr(p) or tcl_is_unw(p) or not tcl_args_consume(args, p) { [p, ...tcl_goto_entries(rest, args)] }
     else { tcl_goto_entries(rest, args) }
 }
 
-#[doc("C release statements for the goto site, one per `tcl_goto_entries` entry.")]
+#[doc("C release statements for the goto site: a decref per `tcl_goto_entries` entry, a pop per unwind entry.")]
 pub fn tcl_goto_drops(pend: [String], args: [Expr]) : String =
-  concat_all(map(tcl_goto_entries(pend, args), (p) => concat_all(["kai_decref(", tcl_cname(p), "); "])))
+  concat_all(map(tcl_goto_entries(pend, args), tcl_goto_release))
+
+fn tcl_goto_release(p: String) : String =
+  if tcl_is_unw(p) { concat_all(["kai_unw_pop(", tcl_unw_reg(p), "); "]) }
+  else { concat_all(["kai_decref(", tcl_cname(p), "); "]) }
 
 fn tcl_args_consume(args: [Expr], nm: String) : Bool = match args {
   [] -> false
@@ -151,9 +181,8 @@ fn tcl_consumes_list(xs: [Expr], nm: String) : Bool = match xs {
   [x, ...rest] -> tcl_consumes(x, nm) or tcl_consumes_list(rest, nm)
 }
 
-# An interpolation span is raw source; a substring hit is the
-# conservative stand-in for "the span reads this binder".
-fn tcl_span_mentions(span: String, nm: String) : Bool =
+#[doc("True when an interpolation span might read `nm`: the span is raw source, so a substring hit is the conservative stand-in.")]
+pub fn tcl_span_mentions(span: String, nm: String) : Bool =
   tcl_contains_loop(span, nm, 0, string_length(span), string_length(nm))
 
 fn tcl_contains_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Bool =

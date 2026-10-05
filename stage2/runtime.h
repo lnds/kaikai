@@ -3076,6 +3076,9 @@ typedef enum {
 } KaiFiberState;
 
 typedef struct KaiFiber   KaiFiber;
+/* `n` consecutive slots a frame owns across a call that can unwind; a
+ * non-local exit that skips the frame releases each non-NULL slot. */
+typedef struct { KaiValue **base; intptr_t n; } KaiUnwEntry;
 typedef struct KaiNursery KaiNursery;     /* issue #959 — defined below */
 
 /* One selector's membership in one candidate's select chain. A fiber in
@@ -3298,6 +3301,11 @@ struct KaiFiber {
     /* Created when a mailbox is first stamped with this fiber as owner;
      * see KaiFiberExit. */
     _Atomic(KaiFiberExit *) exit_rec;
+    /* Stack of KaiUnwEntry runs. Every landing pad records its height and
+     * a non-local exit releases what lies above the pad it jumps to. */
+    KaiUnwEntry    *unw_buf;
+    uint32_t        unw_top;
+    uint32_t        unw_cap;
 };
 
 /* Issue #959 — one open structured-concurrency scope. Children spawned
@@ -3366,7 +3374,8 @@ struct KaiNursery {
     0,                   /* reactor_fired */                              \
     NULL,                /* commit_next */                               \
     NULL,                /* tsan_fiber — bound on this thread's first switch */ \
-    NULL                 /* exit_rec */                                  \
+    NULL,                /* exit_rec */                                  \
+    NULL, 0, 0           /* unw_buf, unw_top, unw_cap */                 \
 }
 /* `kai_active_fiber` cannot be statically initialised to `&kai_main_fiber`
  * now that both are `_Thread_local`: the address of a thread-local is not a
@@ -4852,6 +4861,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
                         munmap(v->as.fib->stack_base,
                                v->as.fib->stack_size + kai_page_size());
                     }
+                    free(v->as.fib->unw_buf);
                     free(v->as.fib);
                 }
             }
@@ -7953,6 +7963,7 @@ static KaiValue *kai_core_panic(KaiValue *msg) {
             memcpy(buf, msg->as.s.bytes, (size_t) n);
         }
         buf[n] = '\0';
+        kai_decref(msg);
         kai_trap_abort(buf);
     }
     flockfile(stderr);
@@ -8266,8 +8277,22 @@ static KaiValue *kai_core_array_length_borrow(KaiValue *a) {
     return kai_int(len);
 }
 
+/* An out-of-range index on a call that consumes its container (and the
+ * value it writes): the trap's unwind skips the call's own release, so
+ * the trap pays it first. */
+static void kai_index_check_owned(int64_t len, int64_t i, KaiValue *c, KaiValue *x) {
+    if (i >= 0 && i < len) return;
+    static char buf[96];
+    snprintf(buf, sizeof(buf), "index %lld out of range (len=%lld)",
+             (long long) i, (long long) len);
+    kai_decref(c);
+    if (x) kai_decref(x);
+    kai_trap_abort(buf);
+}
+
 static KaiValue *kai_core_array_get(KaiValue *a, KaiValue *i) {
     int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    if (kai_is_ptr(a) && a->tag == KAI_ARRAY) kai_index_check_owned(a->as.arr.len, idx, a, NULL);
     KaiValue *r = kai_array_get_impl(a, idx);
     if (a) kai_decref(a);
     if (i) kai_decref(i);
@@ -8285,6 +8310,7 @@ static KaiValue *kai_core_array_get_borrow(KaiValue *a, KaiValue *i) {
 
 static KaiValue *kai_core_array_set(KaiValue *a, KaiValue *i, KaiValue *v) {
     int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    if (kai_is_ptr(a) && a->tag == KAI_ARRAY) kai_index_check_owned(a->as.arr.len, idx, a, v);
     /* impl returns kai_incref(a) — a fresh ref the caller owns.
      * Our input `a` ref is therefore redundant under the callee-
      * consumes convention; decref it so the array's refcount only
@@ -8337,6 +8363,7 @@ static KaiValue *kai_core_vec_length(KaiValue *v) {
 
 static KaiValue *kai_core_vec_get(KaiValue *v, KaiValue *i) {
     int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    if (kai_is_ptr(v) && v->tag == KAI_VEC) kai_index_check_owned(v->as.vec.len, idx, v, NULL);
     KaiValue *r = kai_vec_get_impl(v, idx);
     if (v) kai_decref(v);
     if (i) kai_decref(i);
@@ -8345,6 +8372,7 @@ static KaiValue *kai_core_vec_get(KaiValue *v, KaiValue *i) {
 
 static KaiValue *kai_core_vec_set(KaiValue *v, KaiValue *i, KaiValue *x) {
     int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
+    if (kai_is_ptr(v) && v->tag == KAI_VEC) kai_index_check_owned(v->as.vec.len, idx, v, x);
     if (i) kai_decref(i);
     return kai_vec_set_impl(v, idx, x);   /* consumes v and x */
 }
@@ -17967,6 +17995,7 @@ static KaiValue *kai_default_cancel_raise(void *self, KaiCont *k) {
     KaiFiber *f = kai_current_fiber();
     if (f->cancel_pad_set) {
         f->cancel_delivered = 1;
+        kai_evidence_unwind_all();
         longjmp(f->cancel_pad, 1);
         /* Unreachable. */
     }
@@ -18139,6 +18168,7 @@ static void kai_check_trap_exit_cancel_bypass(void) {
     if (!f || !f->cancel_pad_set) return;
     if (!kai_fiber_has_trap_exit_link(f)) return;
     f->cancel_delivered = 1;
+    kai_evidence_unwind_all();
     longjmp(f->cancel_pad, 1);
     /* Unreachable. */
 }
@@ -18308,7 +18338,56 @@ struct KaiEvidence {
     /* Guards against running the same cleanup twice when a normal exit
      * races an unwind through the same node. */
     int          cleanup_done;
+    /* The fiber's unwind-stack height when the node was pushed: what lies
+     * above it belongs to frames an exit through this node discards. */
+    uint32_t     unw_mark;
 };
+
+static KAI_RC_NOINLINE void kai_unw_grow(KaiFiber *f) {
+    uint32_t cap = f->unw_cap ? f->unw_cap * 2 : 64;
+    KaiUnwEntry *buf = (KaiUnwEntry *) realloc(f->unw_buf, (size_t) cap * sizeof(KaiUnwEntry));
+    if (buf == NULL) {
+        fputs("kai: out of memory growing the unwind stack\n", stderr);
+        kai_exit(1);
+    }
+    f->unw_buf = buf;
+    f->unw_cap = cap;
+}
+
+/* Register `n` slots the calling frame owns across a call that can exit
+ * non-locally. Returns the fiber so the pop needs no second lookup: the
+ * fiber survives a migration across threads, a cached TLS address does not. */
+static inline KaiFiber *kai_unw_push_on(KaiFiber *f, KaiValue **base, intptr_t n) {
+    if (f->unw_top == f->unw_cap) kai_unw_grow(f);
+    f->unw_buf[f->unw_top].base = base;
+    f->unw_buf[f->unw_top].n    = n;
+    f->unw_top++;
+    return f;
+}
+
+static inline KaiFiber *kai_unw_push(KaiValue **base, intptr_t n) {
+    return kai_unw_push_on(kai_current_fiber(), base, n);
+}
+
+/* `kai_unw_push` with the fiber looked up once per C frame: `*cache`
+ * starts NULL and a frame never changes fiber. */
+static inline KaiFiber *kai_unw_push_c(KaiFiber **cache, KaiValue **base, intptr_t n) {
+    KaiFiber *f = *cache;
+    if (__builtin_expect(f == NULL, 0)) f = *cache = kai_current_fiber();
+    return kai_unw_push_on(f, base, n);
+}
+
+static inline void kai_unw_pop(KaiFiber *f) { f->unw_top--; }
+
+/* Release every slot above `mark`, innermost frame first. */
+static void kai_unw_release_to(KaiFiber *f, uint32_t mark) {
+    while (f->unw_top > mark) {
+        KaiUnwEntry e = f->unw_buf[--f->unw_top];
+        for (intptr_t i = 0; i < e.n; i++) {
+            if (e.base[i] != NULL) kai_decref(e.base[i]);
+        }
+    }
+}
 
 /* Run one node's `finally` in its installation-time evidence context.
  * Restoring `evidence_top` to `node->parent` is load-bearing: a cleanup
@@ -18339,6 +18418,7 @@ static void kai_evidence_push(KaiEvidence *node, const char *eff_label, void *ha
     node->cleanup      = NULL;
     node->cleanup_env  = NULL;
     node->cleanup_done = 0;
+    node->unw_mark     = f->unw_top;
     f->evidence_top    = node;
 }
 /* Connect a frame-supplied default node to its Ev WITHOUT pushing it on the
@@ -18354,6 +18434,7 @@ static void kai_evidence_init_default(KaiEvidence *node, const char *eff_label, 
     node->cleanup      = NULL;
     node->cleanup_env  = NULL;
     node->cleanup_done = 0;
+    node->unw_mark     = 0;
 }
 
 /* m7a #6e: like kai_evidence_push but also stamps the handle's
@@ -18373,6 +18454,7 @@ static void kai_evidence_push_with_jmp(KaiEvidence *node, const char *eff_label,
     node->cleanup      = NULL;
     node->cleanup_env  = NULL;
     node->cleanup_done = 0;
+    node->unw_mark     = f->unw_top;
     f->evidence_top    = node;
 }
 
@@ -18415,6 +18497,7 @@ static void kai_evidence_unwind_to(KaiEvidence *node) {
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *stop = node->parent;
     for (KaiEvidence *n = f->evidence_top; n != NULL && n != stop; n = n->parent) {
+        kai_unw_release_to(f, n->unw_mark);
         kai_evidence_run_cleanup(n);
     }
     f->evidence_top = stop;
@@ -18425,8 +18508,10 @@ static void kai_evidence_unwind_to(KaiEvidence *node) {
 static void kai_evidence_unwind_all(void) {
     KaiFiber *f = kai_current_fiber();
     for (KaiEvidence *n = f->evidence_top; n != NULL; n = n->parent) {
+        kai_unw_release_to(f, n->unw_mark);
         kai_evidence_run_cleanup(n);
     }
+    kai_unw_release_to(f, 0);
     f->evidence_top = NULL;
 }
 

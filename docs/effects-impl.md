@@ -2140,6 +2140,59 @@ race or visibility window to lose by passing a plain
 the local in the `setjmp` function — that is where the
 optimiser's hoisting decision lives.
 
+### Releasing owned references on a non-local exit
+
+A handler clause that abandons `resume`, a delivered cancellation and
+the trap-exit bypass leave through `longjmp`, skipping the Perceus drops
+of every frame between the jump and its landing pad. Each fiber keeps an
+**unwind stack** of entries `{ base, n }`, each naming `n` slots that
+hold owned references. A frame pushes an entry around a call that can
+exit non-locally, naming the binders it owns and has not handed on yet,
+and pops it when the call returns. Every evidence node records the
+stack height at its push (`unw_mark`). `kai_evidence_unwind_to` releases
+the entries above each skipped node's mark before running that node's
+`finally` cleanup, so the releases interleave innermost-first with the
+cleanups. A cancellation or a trap-exit bypass releases the whole stack.
+
+The analysis lives in `stage2/compiler/unwind_*.kai`, shared by both
+emitters:
+
+- **Which calls can unwind** (`unwind_effects.kai`, once per program).
+  A call unwinds when its row holds an effect that some clause may
+  abandon, or `Cancel`. An effect also unwinds when one of its clauses
+  can itself unwind, because that jump leaves through the performing
+  frames; the set is computed to a fixed point. A runtime default
+  handler (`$extern_handler`) resumes. When any fn's row names `Spawn`
+  or `Link`, a fiber can be cancelled from outside at any perform, so
+  every call with a non-empty row unwinds. A frame with no such call
+  gets no bracket, so code that cannot unwind pays nothing. The typer
+  holds a fn's body to its declared row, so a fn whose row cannot
+  unwind and that installs no handler is not walked at all.
+- **What a site registers** (`unwind_walk.kai`). The pending set is the
+  goto-tail ledger's (`emit_tcrec_live.kai`). A binder enters with its
+  birth reference and leaves at the first mention that might consume
+  it, so an error can only under-release (a bounded leak). Siblings
+  evaluated in unspecified order exclude each other's consumptions. A
+  name an enclosing bracket already holds is excluded too, because the
+  push precedes argument evaluation and one reference never sits in two
+  live entries. Other cases:
+  - An owned-borrow argument stays held across the call that borrows it.
+  - A match registers its owned scrutinee slot. Its arm binders count
+    once the arm has taken its own reference; a reuse arm never does.
+  - A `handle` registers the outer binders that outlive it below its
+    own mark, plus its state slot, since `resume(v, s)` replaces the
+    state.
+- **Brackets.** C emits
+  `kai_unw_push_c(&_uwfb, (KaiValue *[]){…}, n)`, looking the fiber up
+  once per C function. The native lowering emits the `kai_unw_fiber` /
+  `kai_unw_push` / `kai_unw_pop` KIR prims; the fiber sits in a frame
+  slot read on the first push. A tcrec goto out of a registered match pops
+  through the same ledger that releases its scrutinee.
+
+A trap raised from pure code is not a call that can unwind: the
+references its caller frames hold leak when it lands in a fiber's
+cancel pad.
+
 ### Scheduled follow-up: m7c-e setjmp landing pad
 
 The C backend's m7a #6e flow uses `setjmp(_jmp)` in the handle

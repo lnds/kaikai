@@ -1,0 +1,151 @@
+#[doc("The binders a frame introduces and the small name-set operations the unwind analysis runs on them.")]
+
+import compiler.ast
+import compiler.util
+import compiler.expr_positions
+
+#[doc("True when a match on `s` owns its scrutinee (it is not a borrow).")]
+pub fn unw_scr_owned(s: Expr) : Bool = match s.kind {
+  ECall(f, _) -> match f.kind {
+    EMark(MkBorrow) -> false
+    _               -> true
+  }
+  _ -> true
+}
+
+#[doc("The names among `xs` that bind a local (`_`-prefixed ones do not).")]
+pub fn unw_rc_names(xs: [String]) : [String] = match xs {
+  [] -> []
+  [x, ...rest] -> if string_starts_with_q(x, "_") { unw_rc_names(rest) } else { [x, ...unw_rc_names(rest)] }
+}
+
+#[doc("The binders of every owned match's arms in `e`, after `acc`.")]
+pub fn unw_arm_binders(e: Expr, acc: [String]) : [String] = match e.kind {
+  EMatch(s, arms) -> uw_arm_binders_arms(arms, unw_scr_owned(s), unw_arm_binders(s, acc))
+  ELambda(_, _) -> acc
+  EIntrinsic(name, xs) ->
+    if unw_is_loop(name) { uw_arm_binders_loop(xs, acc) } else { uw_arm_binders_ps(xp_positions(e), acc) }
+  _ -> uw_arm_binders_ps(xp_positions(e), acc)
+}
+
+fn uw_arm_binders_ps(ps: [XPos], acc: [String]) : [String] = match ps {
+  [] -> acc
+  [XP(r, c), ...rest] -> uw_arm_binders_ps(rest, if xrole_inline(r) { unw_arm_binders(c, acc) } else { acc })
+}
+
+fn uw_arm_binders_arms(arms: [Arm], owned: Bool, acc: [String]) : [String] = match arms {
+  [] -> acc
+  [Arm(pat, og, b), ...rest] -> {
+    let own = if owned { list_append(unw_rc_names(pat_binders(pat, [])), acc) } else { acc }
+    let a1 = match og { None -> own Some(g) -> unw_arm_binders(g, own) }
+    uw_arm_binders_arms(rest, owned, unw_arm_binders(b, a1))
+  }
+}
+
+fn uw_arm_binders_loop(xs: [Expr], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [x, ...rest] -> {
+    let b = match x.kind { ELambda(_, body) -> body _ -> x }
+    uw_arm_binders_loop(rest, unw_arm_binders(b, acc))
+  }
+}
+
+#[doc("True when `name` is a loop intrinsic whose lambda body is pasted inline.")]
+pub fn unw_is_loop(name: String) : Bool =
+  name == "__loop_while" or name == "__loop_until" or name == "__loop_repeat"
+
+#[doc("Every binder `e` introduces, after `acc`, repeats kept; lambda bodies other than pasted loop bodies are other frames.")]
+pub fn unw_binders(e: Expr, acc: [String]) : [String] = match e.kind {
+  EBlock(ss, ot) -> uw_binders_opt(ot, uw_binders_stmts(ss, acc))
+  EMatch(s, arms) -> uw_binders_arms(arms, unw_binders(s, acc))
+  ELambda(_, _) -> acc
+  EIntrinsic(name, xs) ->
+    if unw_is_loop(name) { uw_binders_loop(xs, acc) } else { uw_binders_ps(xp_positions(e), acc) }
+  EHandle(body, _, _, _, oi, _, _, oret) -> {
+    let a1 = unw_binders(body, uw_binders_opt(oi, acc))
+    match oret {
+      None -> a1
+      Some(HR(p, b, _, _)) -> unw_binders(b, [p, ...a1])
+    }
+  }
+  _ -> uw_binders_ps(xp_positions(e), acc)
+}
+
+fn uw_binders_ps(ps: [XPos], acc: [String]) : [String] = match ps {
+  [] -> acc
+  [XP(r, c), ...rest] -> if xrole_inline(r) { uw_binders_ps(rest, unw_binders(c, acc)) } else { uw_binders_ps(rest, acc) }
+}
+
+fn uw_binders_opt(o: Option[Expr], acc: [String]) : [String] = match o {
+  None    -> acc
+  Some(x) -> unw_binders(x, acc)
+}
+
+fn uw_binders_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
+  [] -> acc
+  [s, ...rest] -> {
+    let inner = uw_binders_ps(xp_positions(Expr { kind: EBlock([s], None), line: 0, col: 0, ty: None, mode: MUnknown }), acc)
+    uw_binders_stmts(rest, list_append(unw_stmt_binders(s), inner))
+  }
+}
+
+fn uw_binders_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+  [] -> acc
+  [Arm(pat, og, b), ...rest] ->
+    uw_binders_arms(rest, unw_binders(b, uw_binders_opt(og, list_append(pat_binders(pat, []), acc))))
+}
+
+fn uw_binders_loop(xs: [Expr], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [x, ...rest] -> match x.kind {
+    ELambda(ps, b) -> uw_binders_loop(rest, unw_binders(b, list_append(map(ps, (p) => p.pname), acc)))
+    _ -> uw_binders_loop(rest, unw_binders(x, acc))
+  }
+}
+
+#[doc("The names `xs` holds more than once.")]
+pub fn unw_dups(xs: [String], seen: [String], acc: [String]) : [String] = match xs {
+  [] -> acc
+  [x, ...rest] ->
+    if list_has(seen, x) { unw_dups(rest, seen, if list_has(acc, x) { acc } else { [x, ...acc] }) }
+    else { unw_dups(rest, [x, ...seen], acc) }
+}
+
+#[doc("The names of `xs` not in `ys`, in order.")]
+pub fn unw_minus(xs: [String], ys: [String]) : [String] = if ub_meets(xs, ys) { ub_minus(xs, ys) } else { xs }
+
+fn ub_minus(xs: [String], ys: [String]) : [String] = match xs {
+  [] -> []
+  [x, ...rest] -> if list_has(ys, x) { ub_minus(rest, ys) } else { [x, ...ub_minus(rest, ys)] }
+}
+
+fn ub_meets(xs: [String], ys: [String]) : Bool = match xs {
+  [] -> false
+  [x, ...rest] -> list_has(ys, x) or ub_meets(rest, ys)
+}
+
+fn ub_within(xs: [String], ys: [String]) : Bool = match xs {
+  [] -> true
+  [x, ...rest] -> list_has(ys, x) and ub_within(rest, ys)
+}
+
+#[doc("The names of `xs` also in `ys`, in order.")]
+pub fn unw_inter(xs: [String], ys: [String]) : [String] = if ub_within(xs, ys) { xs } else { ub_inter(xs, ys) }
+
+fn ub_inter(xs: [String], ys: [String]) : [String] = match xs {
+  [] -> []
+  [x, ...rest] -> if list_has(ys, x) { [x, ...ub_inter(rest, ys)] } else { ub_inter(rest, ys) }
+}
+
+#[doc("`xs` plus the names of `ys` it lacks.")]
+pub fn unw_union(xs: [String], ys: [String]) : [String] = match ys {
+  [] -> xs
+  [y, ...rest] -> if list_has(xs, y) { unw_union(xs, rest) } else { unw_union([y, ...xs], rest) }
+}
+
+#[doc("The names statement `s` binds.")]
+pub fn unw_stmt_binders(s: Stmt) : [String] = match s {
+  SLet(pat, _, _)        -> pat_binders(pat, [])
+  SVar(n, _, _, _, _)    -> [n]
+  _                      -> []
+}
