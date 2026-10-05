@@ -21,8 +21,8 @@
 #   it: `desugar_var_decls` (var -> Ref-cell), axiom lowering
 #   (`lower_axioms` / `lower_axiom_one`), refinement pred-fn synthesis
 #   (`synthesize_refine_pred_fns`), pattern-narrow lowering
-#   (`lower_pattern_narrow_decls`), and contract-predicate validation
-#   (`validate_contract_predicates_decls`). Consts are NOT lowered —
+#   and pattern-narrow lowering (`lower_pattern_narrow_decls`).
+#   Consts are NOT lowered —
 #   `DConst` survives intact as a value through the whole pipeline.
 # - C. `use Effect` desugar: strip file-level `use` decls and rewrite
 #   bare op references in their scope to qualified `Eff.op` calls.
@@ -289,21 +289,6 @@ fn dsg_rename_pfields_names(fs: [PField], acc: [String]) : [String] {
       PField(_, sub, _) -> dsg_rename_pfields_names(rest, dsg_rename_pat_names(sub, acc))
     }
   }
-}
-
-fn dsg_string_starts_with_q(s: String, prefix: String) : Bool =
-  dsg_starts_with_loop(s, prefix, 0)
-
-fn dsg_starts_with_loop(s: String, prefix: String, i: Int) : Bool {
-  let pn = string_length(prefix)
-  if i >= pn { true }
-  else { match char_at(s, i) {
-    None -> false
-    Some(sc) -> match char_at(prefix, i) {
-      None -> true
-      Some(pc) -> if sc == pc { dsg_starts_with_loop(s, prefix, i + 1) } else { false }
-    }
-  } }
 }
 
 # ====================================================================
@@ -1110,8 +1095,8 @@ pub fn lower_axiom_one(d: Decl) : Decl {
 # Synthesise a refinement-predicate fn for every `type X = Base where
 # pred` alias. The fn is named `__ref_pred_X(self: Base) : Bool` and
 # carries the same predicate expression the user wrote. It has an
-# empty effect row, so the contract-predicate validator admits calls
-# to it (purity is read off the row). parse_optional_arm_refine
+# empty effect row, so a contract predicate may call it.
+# parse_optional_arm_refine
 # references this name when it sees `match { p : X -> ... }`; the
 # resolver later binds the call to this synthesised fn.
 #
@@ -1271,163 +1256,6 @@ fn lower_narrow_arm(a: Arm, aliases: [String]) : Arm {
         }
         _ -> Arm(pat, guard1, body1)
       }
-    }
-  }
-}
-
-# post-parse validation of contract predicates.
-# Walks every DFn body looking for SAsserts whose msg span tags
-# them as contract-derived (`"requires violated at ..."` or
-# `"ensures violated at ..."`) and runs find_impure_call on each
-# cond using `closed_pure_names ++ user_pure_names`. Returns the
-# error count; the driver folds it into the program's exit code.
-#[doc("Reject `requires`/`ensures` predicates that call effectful functions; returns the error count.")]
-pub fn validate_contract_predicates_decls(decls: [Decl],
-                                       df: DiagFiles) : Int / Console {
-
-  # `decls` is both the traversal target and the purity-resolution
-  # context: it includes the core + every imported module (built
-  # in driver.kai as `core ++ user`), so a predicate calling
-  # `money.is_zero` resolves the callee's row cross-module.
-  validate_contract_decls_loop(decls, decls, df, 0)
-}
-
-fn validate_contract_decls_loop(ds: [Decl], ctx: [Decl],
-                                 df: DiagFiles, errs: Int) : Int / Console {
-
-  match ds {
-    [] -> errs
-    [d, ...rest] -> match d {
-      DFn(_, _, _, _, _, _, body, _, _, _, fsym) -> {
-        let de = validate_contract_expr(body, ctx, decl_diag_file(d, df))
-        validate_contract_decls_loop(rest, ctx, df, errs + de)
-      }
-      _ -> validate_contract_decls_loop(rest, ctx, df, errs)
-    }
-  }
-}
-
-fn validate_contract_expr(e: Expr, ctx: [Decl], file: String) : Int / Console {
-
-  match e.kind {
-    EBlock(stmts, opt_tail) -> {
-      let s_errs = validate_contract_stmts(stmts, ctx, file, 0)
-      let t_errs = match opt_tail {
-        Some(t) -> validate_contract_expr(t, ctx, file)
-        None -> 0
-      }
-      s_errs + t_errs
-    }
-    EIf(c, t_, eo) -> {
-      let c_e = validate_contract_expr(c, ctx, file)
-      let t_e = validate_contract_expr(t_, ctx, file)
-      let e_e = match eo {
-        Some(eb) -> validate_contract_expr(eb, ctx, file)
-        None -> 0
-      }
-      c_e + t_e + e_e
-    }
-    EMatch(scr, arms) -> {
-      let scr_e = validate_contract_expr(scr, ctx, file)
-      validate_contract_arms(arms, ctx, file, scr_e)
-    }
-    ECall(f, args_) -> {
-      let fe = validate_contract_expr(f, ctx, file)
-      validate_contract_exprs(args_, ctx, file, fe)
-    }
-    ELambda(_, body) -> validate_contract_expr(body, ctx, file)
-    EBinop(_, a, b) -> validate_contract_expr(a, ctx, file) +
-                        validate_contract_expr(b, ctx, file)
-    EUnop(_, x) -> validate_contract_expr(x, ctx, file)
-    EField(b, _) -> validate_contract_expr(b, ctx, file)
-    _ -> 0
-  }
-}
-
-fn validate_contract_exprs(es: [Expr], ctx: [Decl], file: String, acc: Int) : Int / Console {
-
-  match es {
-    [] -> acc
-    [e, ...rest] -> validate_contract_exprs(rest, ctx, file,
-                                             acc + validate_contract_expr(e, ctx, file))
-  }
-}
-
-fn validate_contract_arms(arms: [Arm], ctx: [Decl], file: String, acc: Int) : Int / Console {
-
-  match arms {
-    [] -> acc
-    [a, ...rest] -> match a {
-      Arm(_, opt_g, body) -> {
-        let g_e = match opt_g {
-          Some(g) -> validate_contract_expr(g, ctx, file)
-          None -> 0
-        }
-        let b_e = validate_contract_expr(body, ctx, file)
-        validate_contract_arms(rest, ctx, file, acc + g_e + b_e)
-      }
-    }
-  }
-}
-
-fn validate_contract_stmts(stmts: [Stmt], ctx: [Decl], file: String, acc: Int) : Int / Console {
-
-  match stmts {
-    [] -> acc
-    [s, ...rest] -> {
-      let se = validate_contract_stmt(s, ctx, file)
-      validate_contract_stmts(rest, ctx, file, acc + se)
-    }
-  }
-}
-
-fn validate_contract_stmt(s: Stmt, ctx: [Decl], file: String) : Int / Console {
-
-  match s {
-    SAssert(cond, opt_msg) -> {
-      let kind_opt = contract_assert_kind(opt_msg)
-      let body_e = validate_contract_expr(cond, ctx, file)
-      match kind_opt {
-        None -> body_e
-        Some(kind) -> match find_impure_call(cond, ctx) {
-          None -> body_e
-          Some(name) -> {
-            diag_error_from_src(file, "", cond.line, cond.col,
-              concat_all([
-                "`", kind, "` predicate calls effectful function `", name,
-                "`. Refinement / contract predicates may only call ",
-                "effect-pure functions (those with an empty effect row)."
-              ]))
-            body_e + 1
-          }
-        }
-      }
-    }
-    SLet(_, _, rhs) -> validate_contract_expr(rhs, ctx, file)
-    SExprStmt(x) -> validate_contract_expr(x, ctx, file)
-    SIndexAssign(b, i, v, _, _) ->
-      validate_contract_expr(b, ctx, file) +
-      validate_contract_expr(i, ctx, file) +
-      validate_contract_expr(v, ctx, file)
-    SAssign(b, v, _, _) ->
-      validate_contract_expr(b, ctx, file) +
-      validate_contract_expr(v, ctx, file)
-    _ -> 0
-  }
-}
-
-# Detect a contract-derived SAssert by matching the msg span shape
-# preds_to_asserts emits. Returns the kind string, or None for
-# user-written asserts.
-fn contract_assert_kind(opt_msg: Option[Expr]) : Option[String] {
-  match opt_msg {
-    None -> None
-    Some(m) -> match m.kind {
-      EStr(span, false) ->
-        if dsg_string_starts_with_q(span, "\"requires violated") { Some("requires") }
-        else if dsg_string_starts_with_q(span, "\"ensures violated") { Some("ensures") }
-        else { None }
-      _ -> None
     }
   }
 }
