@@ -543,7 +543,8 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 # finishes; tools/tier1-light-costs-refresh.sh reads the bases back from
 # those lines, so moving a phase between shards needs one refresh.
 #
-#  shard 1 — the 4 GB self-compiles + stateful caches (memory-bound).
+#  shard 1 — the 4 GB self-compiles + stateful caches (memory-bound), and
+#            the second half of the Perceus RC leak ledger.
 #  shard 2 — the namespace-collision corpus (C axes).
 #  shard 3 — partition + BinSerialize linearity, core text, HTTP redirects,
 #            fmt meaning-preservation corpus part 1/3.
@@ -553,8 +554,9 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 #  shard 7 — the CLI/tooling tail.
 #  shard 8 — fmt meaning-preservation part 3/3 + the demos baseline.
 #
-# The Perceus RC leak ledger rides the tier0 CI job, after its gates: that
-# job has the headroom and no shard does. It is not part of `tier0` locally.
+# The Perceus RC leak ledger is split in two (KAI_LEAK_SHARD): the tier0 CI
+# job runs the first half after its gates, shard 1 the second. It is not
+# part of `tier0` locally.
 #
 # The two modular self-hosts (shards 4 and 6) only detect regressions in the
 # sources they compile, so CI passes TIER1_SELFHOSTS=0 on PRs that touch no
@@ -576,8 +578,9 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 #     test-release-platforms, test-kaic-boot, test-cli-flags, test-kai-cli,
 #     test-partition-linearity, test-binserialize-linearity,
 #     test-core-text, test-http-redirects }
-# plus rc-leak-gate covers the prerequisites of `tier1` (the light slices
-# union to TEST_LIGHT_TARGETS, asserted by `test-light-partition` in tier0).
+# plus both halves of rc-leak-gate cover the prerequisites of `tier1` (the
+# light slices union to TEST_LIGHT_TARGETS, asserted by
+# `test-light-partition` in tier0).
 # Adding a phase to `tier1` means adding it to a shard.
 TIER1_LIGHT_SLICES := 8
 TIER1_SELFHOSTS ?= 1
@@ -595,6 +598,7 @@ tier1-shard-1: kaic2
 	$(MAKE) -C stage2 test-heap-limit
 	$(MAKE) -C stage2 test-user-cache
 	$(MAKE) -C stage2 test-core-cache
+	KAI_LEAK_SHARD=2/2 $(MAKE) rc-leak-gate
 	$(call tier1-light-slice,1)
 	$(call tier1-shard-wall,1)
 	@echo "tier1-shard-1 OK — costly self-compiles + caches + light slice 1/$(TIER1_LIGHT_SLICES)"
