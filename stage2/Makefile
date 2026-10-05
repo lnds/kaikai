@@ -3081,42 +3081,10 @@ test-stdlib-survey: $(TARGET) build
 	echo ""; \
 	echo "test-stdlib-survey: $$pass pass, $$fail fail"
 
-test-stdlib: $(TARGET) build
-	@set -e; \
-	for f in ../examples/stdlib/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  case "$$name" in bench_*|check_*|*_lib|qualified_call_in_prelude|issue_219_typer_modcall|issue_318_kai_test_prelude_scope) continue ;; esac; \
-	  exp_err=../examples/stdlib/$$name.err.expected; \
-	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
-	      > /dev/null 2> build/stdlib-$$name.err || rc=$$?; \
-	    if [ $$rc -eq 0 ]; then \
-	      echo "stdlib FAIL $$name (expected error, got success)"; exit 1; \
-	    fi; \
-	    while read -r line; do \
-	      grep -qF "$$line" build/stdlib-$$name.err \
-	        || { echo "stdlib FAIL $$name (missing diagnostic: $$line)"; \
-	             cat build/stdlib-$$name.err; exit 1; }; \
-	    done < $$exp_err; \
-	    echo "stdlib OK $$name (rejected as expected)"; \
-	    continue; \
-	  fi; \
-	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/stdlib-$$name.c \
-	    || { echo "stdlib FAIL $$name (kaic2 errored)"; exit 1; }; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/stdlib-$$name.c -o build/stdlib-$$name $(LDLIBS_M) \
-	    || { echo "stdlib FAIL $$name (C compile failed)"; exit 1; }; \
-	  in=../examples/stdlib/$$name.in; \
-	  if [ -f $$in ]; then \
-	    ./build/stdlib-$$name < $$in > build/stdlib-$$name.out \
-	      || { echo "stdlib FAIL $$name (run errored)"; cat build/stdlib-$$name.out; exit 1; }; \
-	  else \
-	    ./build/stdlib-$$name > build/stdlib-$$name.out \
-	      || { echo "stdlib FAIL $$name (run errored)"; cat build/stdlib-$$name.out; exit 1; }; \
-	  fi; \
-	  diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name.out > /dev/null \
-	    && echo "stdlib OK $$name" \
-	    || { echo "stdlib DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name.out; exit 1; }; \
-	done
+# One target per fixture, so the pool fans out under `make -j`.
+STDLIB_FIXTURES := $(filter-out bench_% check_% %_lib qualified_call_in_prelude issue_219_typer_modcall issue_318_kai_test_prelude_scope,$(basename $(notdir $(wildcard ../examples/stdlib/*.kai))))
+
+test-stdlib: $(addprefix test-stdlib-fixture-,$(STDLIB_FIXTURES))
 	@# m13: assert bit ops lowered as compiler intrinsics. Under the
 	@# Koka tagged-Int runtime a small Int is an immediate (no heap
 	@# `->as.i` slot), so the operand is decoded inline via `kai_intf(_a)`
@@ -3160,6 +3128,40 @@ test-stdlib: $(TARGET) build
 	@grep -F -q '__builtin_popcountll' build/stdlib-bits_dotted.c \
 	  || { echo "stdlib FAIL bits_dotted (popcount not inlined)"; exit 1; }
 	@echo "stdlib OK bits_dotted intrinsic-lowered"
+
+test-stdlib-fixture-%: $(TARGET) build core-cache-warm
+	@set -e; \
+	name=$*; f=../examples/stdlib/$$name.kai; \
+	exp_err=../examples/stdlib/$$name.err.expected; \
+	if [ -f $$exp_err ]; then \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f \
+	    > /dev/null 2> build/stdlib-$$name.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "stdlib FAIL $$name (expected error, got success)"; exit 1; \
+	  fi; \
+	  while read -r line; do \
+	    grep -qF "$$line" build/stdlib-$$name.err \
+	      || { echo "stdlib FAIL $$name (missing diagnostic: $$line)"; \
+	           cat build/stdlib-$$name.err; exit 1; }; \
+	  done < $$exp_err; \
+	  echo "stdlib OK $$name (rejected as expected)"; \
+	  exit 0; \
+	fi; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/stdlib-$$name.c \
+	  || { echo "stdlib FAIL $$name (kaic2 errored)"; exit 1; }; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/stdlib-$$name.c -o build/stdlib-$$name $(LDLIBS_M) \
+	  || { echo "stdlib FAIL $$name (C compile failed)"; exit 1; }; \
+	in=../examples/stdlib/$$name.in; \
+	if [ -f $$in ]; then \
+	  ./build/stdlib-$$name < $$in > build/stdlib-$$name.out \
+	    || { echo "stdlib FAIL $$name (run errored)"; cat build/stdlib-$$name.out; exit 1; }; \
+	else \
+	  ./build/stdlib-$$name > build/stdlib-$$name.out \
+	    || { echo "stdlib FAIL $$name (run errored)"; cat build/stdlib-$$name.out; exit 1; }; \
+	fi; \
+	diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name.out > /dev/null \
+	  && echo "stdlib OK $$name" \
+	  || { echo "stdlib DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name.out; exit 1; }
 
 # Issue #139 — crypto_hash_basic under ASAN+UBSan. SHA-2 + HMAC are
 # heavy on byte-buffer churn (per-block 64-element message schedules,
@@ -3395,12 +3397,100 @@ test-effects-goldens: $(TARGET) bin-kai build
 test-effects-goldens-native: $(TARGET) bin-kai build
 	@TARGET_BACKEND=native ../tools/test-effects-goldens.sh
 
-# m7a #3 — parser-level smoke tests for `effect` declarations and
-# the `T / Eff + Eff` row syntax. Each .kai file dumps to AST and
-# the test asserts grep-able markers exist (or, for negatives,
-# that the expected diagnostic fires). Semantic checks (row
-# inferred from body equals declared row) are m7a #8.
-test-effects: $(TARGET) build
+# Effects, handlers, fibers and actors, one target per case so the cases
+# fan out under `make -j`. Each case writes only build/s2-<its fixture>.*.
+TEST_EFFECTS_CASES := \
+	test-effects-parse_effect \
+	test-effects-parse_row_syntax \
+	test-effects-row_match_higher_order \
+	test-effects-row_pure_to_effectful \
+	test-effects-op_call_basic \
+	test-effects-handle_basic \
+	test-effects-handle_alias \
+	test-effects-handle_removes_effect \
+	test-effects-m7a_6a_struct_emit \
+	test-effects-m7a_6b_handle_runs \
+	test-effects-m7a_6c_op_dispatch \
+	test-effects-m7a_6d_resume_check \
+	test-effects-m7a_6d_double_resume \
+	test-effects-m7a_6e_discard_resume \
+	test-effects-m7a_6f_clause_typed \
+	test-effects-m7a_7_default_console \
+	test-effects-m7a_7_default_env \
+	test-effects-m7a_7_default_file \
+	test-effects-m7a_7_default_stdin \
+	test-effects-m7b_1_alias_io \
+	test-effects-m7b_1_alias_single \
+	test-effects-m7b_12_row_var_pure_body \
+	test-effects-m7b_11_state_basic \
+	test-effects-m7b_11_followup_arity_error \
+	test-effects-m8_2_yield_noop \
+	test-effects-m8_3_spawn_await_value \
+	test-effects-m8_3_spawn_console \
+	test-effects-m8x_2_yield_interleave \
+	test-effects-m8x_3_cancel_at_yield \
+	test-effects-m8x_4_recv_blocking \
+	test-effects-m8x_4_request_reply \
+	test-effects-m8x_4_block_sender \
+	test-effects-issue_763_spawn_actor_policy_block_sender \
+	test-effects-issue_763_drop_oldest_invariant \
+	test-effects-m8_trap_exit \
+	test-effects-issue_103_trap_exit_cancel_handler \
+	test-effects-m8_spawn_per_op_generics \
+	test-effects-m8_spawn_per_op_row_generics \
+	test-effects-m8_monitor \
+	test-effects-m8_4_cancel_uncaught \
+	test-effects-m8_4_cancel_caught \
+	test-effects-m8_5_nursery_join \
+	test-effects-m8x_9_nursery_autojoin \
+	test-effects-m8x_10_nursery_cancel_on_fail \
+	test-effects-nursery_cancel_on_fail_eager \
+	test-effects-m8_6_fiber_inside_ok \
+	test-effects-m8_6_fiber_escapes \
+	test-effects-m8x_6_fiber_in_result \
+	test-effects-m8x_6_pid_escapes \
+	test-effects-m8x_7_fiber_in_sum \
+	test-effects-m8x_7_recursive_sum_no_breach \
+	test-effects-m8x_8_nursery_cap \
+	test-effects-m8x_8_brand_through_match \
+	test-effects-m8x_8_brand_generic_roundtrip_ok \
+	test-effects-m8x_8_brand_opaque_helper_warns \
+	test-effects-m8x_8_sibling_nursery_mismatch \
+	test-effects-m8x_8_brand_dump \
+	test-effects-m8_7_actor_self_send \
+	test-effects-m8_8_mailbox_drop_oldest \
+	test-effects-m8_8_mailbox_drop_newest \
+	test-effects-m8_9_supervision_pattern \
+	test-effects-m8_12_self_delegating_handler \
+	test-effects-m8_fiber_discard \
+	test-effects-mn_trampoline_tail_steal \
+	test-effects-mn_cross_thread_scalar_share \
+	test-effects-m8_fiber_stack_overflow \
+	test-effects-m12_8_y_phase4 \
+	test-effects-issue_107_signal_trap \
+	test-effects-signal_sigwinch_trap \
+	test-effects-m8x_signal_await_parks \
+	test-effects-process_basic \
+	test-effects-process_piped_capture \
+	test-effects-issue_141_log_default \
+	test-effects-array_mutable_explicit \
+	test-effects-local_ref_masks_mutable \
+	test-effects-mutable_user_handler_over_default \
+	test-effects-array_mutable_required \
+	test-effects-prelude_effect_via_scheme \
+	test-effects-issue_308_user_log_effect \
+	test-effects-dual_actor_send_only \
+	test-effects-dual_actor_missing_one \
+	test-effects-file_stream_roundtrip \
+	test-effects-file_stream_mock \
+	test-effects-file_stream_open_missing \
+	test-effects-stdout-specs \
+	test-effects-wc
+.PHONY: $(TEST_EFFECTS_CASES)
+
+test-effects: $(TEST_EFFECTS_CASES)
+
+test-effects-parse_effect: $(TARGET) build core-cache-warm
 	@set -e; \
 	for f in ../examples/effects/parse_effect.kai; do \
 	  name=$$(basename $$f .kai); \
@@ -3410,7 +3500,10 @@ test-effects: $(TARGET) build
 	    && grep -q "op \"print\"" build/s2-$$name.ast \
 	    && echo "effects OK $$name" \
 	    || { echo "effects FAIL $$name"; cat build/s2-$$name.ast; exit 1; }; \
-	done; \
+	done
+
+test-effects-parse_row_syntax: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/parse_row_syntax.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --ast $$f > build/s2-$$name.ast \
@@ -3418,44 +3511,65 @@ test-effects: $(TARGET) build
 	    && grep -q "row Io + Fail" build/s2-$$name.ast \
 	    && echo "effects OK $$name" \
 	    || { echo "effects FAIL $$name"; cat build/s2-$$name.ast; exit 1; }; \
-	done; \
+	done
+
+test-effects-row_match_higher_order: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/row_match_higher_order.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (row match accepted)" \
 	    || { echo "effects FAIL $$name (matching rows rejected)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
+	done
+
+test-effects-row_pure_to_effectful: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/row_pure_to_effectful.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (pure-to-effectful elaboration accepted)" \
 	    || { echo "effects FAIL $$name (pure-to-effectful elaboration rejected)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
+	done
+
+test-effects-op_call_basic: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/op_call_basic.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (op call accepted)" \
 	    || { echo "effects FAIL $$name (op call rejected)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
+	done
+
+test-effects-handle_basic: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/handle_basic.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --ast $$f > build/s2-$$name.ast 2> build/s2-$$name.err \
 	    && grep -q "handle Io" build/s2-$$name.ast \
 	    && echo "effects OK $$name (handle parsed)" \
 	    || { echo "effects FAIL $$name"; cat build/s2-$$name.err build/s2-$$name.ast; exit 1; }; \
-	done; \
+	done
+
+test-effects-handle_alias: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/handle_alias.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (alias resolved)" \
 	    || { echo "effects FAIL $$name"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
+	done
+
+test-effects-handle_removes_effect: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/handle_removes_effect.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (handle removes effect)" \
 	    || { echo "effects FAIL $$name (handle did not remove effect)"; cat build/s2-$$name.err; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7a_6a_struct_emit: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7a_6a_struct_emit.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3473,7 +3587,10 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name \
 	    && echo "effects OK $$name (struct emitted + compiles + runs)" \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7a_6b_handle_runs: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7a_6b_handle_runs.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3487,7 +3604,10 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name \
 	    && echo "effects OK $$name (handle prologue/epilogue + return clause runs)" \
 	    || { echo "effects FAIL $$name (binary asserts failed)"; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7a_6c_op_dispatch: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7a_6c_op_dispatch.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3503,7 +3623,10 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name \
 	    && echo "effects OK $$name (op dispatch + clause body runs end-to-end)" \
 	    || { echo "effects FAIL $$name (binary asserts failed)"; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7a_6d_resume_check: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7a_6d_resume_check.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3516,7 +3639,10 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name \
 	    && echo "effects OK $$name (one-shot resume runs through KaiCont)" \
 	    || { echo "effects FAIL $$name (binary asserts failed)"; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7a_6d_double_resume: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7a_6d_double_resume.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3529,7 +3655,10 @@ test-effects: $(TARGET) build
 	  grep -q "continuation resumed twice (handler #" build/s2-$$name.run.err \
 	    && echo "effects OK $$name (double resume aborted with diagnostic)" \
 	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.run.err; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7a_6e_discard_resume: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7a_6e_discard_resume.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3543,7 +3672,10 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name \
 	    && echo "effects OK $$name (discard, discard+return, no-discard all pass)" \
 	    || { echo "effects FAIL $$name (binary asserts failed)"; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7a_6f_clause_typed: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7a_6f_clause_typed.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3553,7 +3685,10 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name \
 	    && echo "effects OK $$name (clause body + return clause type-checked + ran)" \
 	    || { echo "effects FAIL $$name (binary asserts failed)"; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7a_7_default_console: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7a_7_default_console.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3574,7 +3709,10 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (wrong default-handler output)"; \
 	         echo "stdout:"; cat build/s2-$$name.out; \
 	         echo "stderr:"; cat build/s2-$$name.run.err; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7a_7_default_env: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7a_7_default_env.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3590,7 +3728,10 @@ test-effects: $(TARGET) build
 	    && grep -q "^PATH set$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (default Env: args + var)" \
 	    || { echo "effects FAIL $$name (output unexpected)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7a_7_default_file: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7a_7_default_file.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3605,7 +3746,10 @@ test-effects: $(TARGET) build
 	  grep -q "^hello from kaikai$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (default File: write+read roundtrip)" \
 	    || { echo "effects FAIL $$name (roundtrip output wrong)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7a_7_default_stdin: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7a_7_default_stdin.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3624,7 +3768,10 @@ test-effects: $(TARGET) build
 	  grep -q "^eof$$" build/s2-$$name.out2 \
 	    && echo "effects OK $$name (default Stdin: read_line None on EOF)" \
 	    || { echo "effects FAIL $$name (None path output wrong)"; cat build/s2-$$name.out2; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7b_1_alias_io: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7b_1_alias_io.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3639,7 +3786,10 @@ test-effects: $(TARGET) build
 	  grep -q "^hello via alias$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (Io alias resolves + runs)" \
 	    || { echo "effects FAIL $$name (alias output wrong)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7b_1_alias_single: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7b_1_alias_single.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3651,7 +3801,10 @@ test-effects: $(TARGET) build
 	  grep -q "^single-alias works$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (single-effect alias resolves + runs)" \
 	    || { echo "effects FAIL $$name (alias output wrong)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7b_12_row_var_pure_body: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7b_12_row_var_pure_body.kai \
 	         ../examples/effects/m7b_12_row_var_console.kai \
 	         ../examples/effects/m7b_12_row_var_compose.kai \
@@ -3664,7 +3817,10 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name > /dev/null \
 	    && echo "effects OK $$name (row var instantiated + ran)" \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7b_11_state_basic: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7b_11_state_basic.kai \
 	         ../examples/effects/m7b_11_reader_basic.kai \
 	         ../examples/effects/m7b_11_writer_basic.kai \
@@ -3686,7 +3842,10 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name \
 	    && echo "effects OK $$name (parametric effect runs end-to-end)" \
 	    || { echo "effects FAIL $$name (binary asserts failed)"; exit 1; }; \
-	done; \
+	done
+
+test-effects-m7b_11_followup_arity_error: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m7b_11_followup_arity_error.kai \
 	         ../examples/effects/m7b_11_followup_diag_type_args.kai \
 	         ../examples/effects/m7b_11_followup_resume_type.kai \
@@ -3703,7 +3862,10 @@ test-effects: $(TARGET) build
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
 	  echo "effects OK $$name (rejected with expected diagnostic)"; \
-	done; \
+	done
+
+test-effects-m8_2_yield_noop: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_2_yield_noop.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3719,7 +3881,10 @@ test-effects: $(TARGET) build
 	    && grep -q "^after yield$$"  build/s2-$$name.out \
 	    && echo "effects OK $$name (default Spawn: yield resumes inline)" \
 	    || { echo "effects FAIL $$name (wrong default-handler output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_3_spawn_await_value: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_3_spawn_await_value.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3734,7 +3899,10 @@ test-effects: $(TARGET) build
 	  grep -q "^42$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (fiber_spawn → fiber_await round-trip)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_3_spawn_console: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_3_spawn_console.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3749,7 +3917,10 @@ test-effects: $(TARGET) build
 	    && grep -q "^after await$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (effect row propagates through fiber_spawn)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8x_2_yield_interleave: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_2_yield_interleave.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -3762,7 +3933,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (cooperative scheduler interleaves yielding fibers)" \
 	    || { echo "effects FAIL $$name (interleave output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8x_3_cancel_at_yield: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_3_cancel_at_yield.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -3775,7 +3949,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Cancel delivered at yield-point hook unwinds fiber)" \
 	    || { echo "effects FAIL $$name (cancel output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8x_4_recv_blocking: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_4_recv_blocking.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -3788,7 +3965,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Actor.receive parks on empty; sender wakeup unblocks)" \
 	    || { echo "effects FAIL $$name (recv-blocking output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8x_4_request_reply: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_4_request_reply.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -3801,7 +3981,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (two-actor request/reply: client parks on receive, server replies, client resumes)" \
 	    || { echo "effects FAIL $$name (request-reply output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8x_4_block_sender: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_4_block_sender.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -3814,7 +3997,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Bounded(_, BlockSender) parks sender on full; receiver wakeup unblocks)" \
 	    || { echo "effects FAIL $$name (block-sender output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-issue_763_spawn_actor_policy_block_sender: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/issue_763_spawn_actor_policy_block_sender.kai \
 	         ../examples/effects/issue_763_spawn_actor_policy_drop_oldest.kai; do \
 	  name=$$(basename $$f .kai); \
@@ -3828,7 +4014,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (spawn_actor_policy: explicit MailboxPolicy reaches the spawned actor's mailbox)" \
 	    || { echo "effects FAIL $$name (issue #763 spawn_actor_policy output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-issue_763_drop_oldest_invariant: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/issue_763_drop_oldest_invariant.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -3841,7 +4030,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (DropOldest sheds the oldest; the newest cap sends survive in order, thread-count independent)" \
 	    || { echo "effects FAIL $$name (drop-oldest invariant violated)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_trap_exit: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_trap_exit.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -3854,7 +4046,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (trap_exit=1: linked peer DONE/CANCELLED delivers Normal/Crashed string to mailbox)" \
 	    || { echo "effects FAIL $$name (trap-exit output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-issue_103_trap_exit_cancel_handler: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/issue_103_trap_exit_cancel_handler.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -3867,7 +4062,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (trap_exit overrides outer Cancel handler installed at the spawn site)" \
 	    || { echo "effects FAIL $$name (issue #103 regression: outer Cancel handler intercepted child termination)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_spawn_per_op_generics: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_spawn_per_op_generics.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3882,7 +4080,10 @@ test-effects: $(TARGET) build
 	    && grep -q "^cancelled$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (per-op [T] flows through Spawn.spawn / await / select / cancel)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_spawn_per_op_row_generics: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_spawn_per_op_row_generics.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3895,7 +4096,10 @@ test-effects: $(TARGET) build
 	    && grep -q "^42$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (per-op [T, e] row flows through Spawn.spawn directly)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_monitor: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_monitor.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3907,7 +4111,10 @@ test-effects: $(TARGET) build
 	  grep -q "^worker monitored$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (Monitor.monitor delivery on CANCELLED termination, supervisor not cancelled)" \
 	    || { echo "effects FAIL $$name (no MonitorDown delivery)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_4_cancel_uncaught: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_4_cancel_uncaught.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3927,7 +4134,10 @@ test-effects: $(TARGET) build
 	  grep -q "Cancel.raise: unhandled" build/s2-$$name.run.err \
 	    && echo "effects OK $$name (default Cancel: banner + exit 0)" \
 	    || { echo "effects FAIL $$name (banner missing on stderr)"; cat build/s2-$$name.run.err; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_4_cancel_caught: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_4_cancel_caught.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3944,7 +4154,10 @@ test-effects: $(TARGET) build
 	    && grep -v "^never reached$$" build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (with Cancel handler unwinds + clause value returned)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_5_nursery_join: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_5_nursery_join.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3956,7 +4169,10 @@ test-effects: $(TARGET) build
 	  grep -q "^33$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (nursery join: 11 + 22 = 33)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8x_9_nursery_autojoin: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_9_nursery_autojoin.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3968,7 +4184,10 @@ test-effects: $(TARGET) build
 	  diff -q ../examples/effects/$$name.out.expected build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (nursery auto-join: both children before return, no explicit await)" \
 	    || { echo "effects FAIL $$name (auto-join order)"; diff ../examples/effects/$$name.out.expected build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8x_10_nursery_cancel_on_fail: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_10_nursery_cancel_on_fail.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3982,7 +4201,10 @@ test-effects: $(TARGET) build
 	    && grep -q "no survivors" build/s2-$$name.run.err \
 	    && echo "effects OK $$name (cancel-on-fail: sibling cancelled, failure re-raised out of scope)" \
 	    || { echo "effects FAIL $$name (cancel-on-fail)"; cat build/s2-$$name.out build/s2-$$name.run.err; exit 1; }; \
-	done; \
+	done
+
+test-effects-nursery_cancel_on_fail_eager: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/nursery_cancel_on_fail_eager.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -3996,7 +4218,10 @@ test-effects: $(TARGET) build
 	    && grep -q "no survivors" build/s2-$$name.run.err \
 	    && echo "effects OK $$name (eager cancel-on-fail: sibling unparked at the child's raise, not at join)" \
 	    || { echo "effects FAIL $$name (eager cancel-on-fail)"; cat build/s2-$$name.out build/s2-$$name.run.err; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_6_fiber_inside_ok: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_6_fiber_inside_ok.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4008,7 +4233,10 @@ test-effects: $(TARGET) build
 	  grep -q "^99$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (Fiber used locally, returned as Int)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_6_fiber_escapes: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_6_fiber_escapes.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/effects/$$name.err.expected; \
@@ -4022,7 +4250,10 @@ test-effects: $(TARGET) build
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
 	  echo "effects OK $$name (Fiber escape rejected with diagnostic)"; \
-	done; \
+	done
+
+test-effects-m8x_6_fiber_in_result: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_6_fiber_in_result.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/effects/$$name.err.expected; \
@@ -4036,7 +4267,10 @@ test-effects: $(TARGET) build
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
 	  echo "effects OK $$name (Fiber escape detected through Result type-arg)"; \
-	done; \
+	done
+
+test-effects-m8x_6_pid_escapes: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_6_pid_escapes.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/effects/$$name.err.expected; \
@@ -4050,7 +4284,10 @@ test-effects: $(TARGET) build
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
 	  echo "effects OK $$name (Pid escape rejected with diagnostic)"; \
-	done; \
+	done
+
+test-effects-m8x_7_fiber_in_sum: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_7_fiber_in_sum.kai \
 	         ../examples/effects/m8x_7_pid_in_sum.kai; do \
 	  name=$$(basename $$f .kai); \
@@ -4065,7 +4302,10 @@ test-effects: $(TARGET) build
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
 	  echo "effects OK $$name (sum-payload Fiber/Pid escape detected, issue #71)"; \
-	done; \
+	done
+
+test-effects-m8x_7_recursive_sum_no_breach: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_7_recursive_sum_no_breach.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4078,7 +4318,10 @@ test-effects: $(TARGET) build
 	  grep -q "^7$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (recursive sum traversal terminates, no false positive)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8x_8_nursery_cap: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_8_nursery_cap.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4091,7 +4334,10 @@ test-effects: $(TARGET) build
 	  grep -q "^33$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (cap-binding nursery n.spawn / n.await, issue #71 prereq)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8x_8_brand_through_match: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_8_brand_through_match.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4104,7 +4350,10 @@ test-effects: $(TARGET) build
 	  grep -q "^123$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (same-nursery let-chain through brand check)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8x_8_brand_generic_roundtrip_ok: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_8_brand_generic_roundtrip_ok.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4117,7 +4366,10 @@ test-effects: $(TARGET) build
 	  grep -q "^7$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (brand survives generic round-trip, same nursery)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8x_8_brand_opaque_helper_warns: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_8_brand_opaque_helper_warns.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4133,7 +4385,10 @@ test-effects: $(TARGET) build
 	  grep -q "^8$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (brand tracking loss is announced, not silent)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8x_8_sibling_nursery_mismatch: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_8_sibling_nursery_mismatch.kai \
 	         ../examples/effects/m8x_8_brand_propagation_let_chain.kai \
 	         ../examples/effects/m8x_8_brand_through_generic.kai; do \
@@ -4149,7 +4404,10 @@ test-effects: $(TARGET) build
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
 	  echo "effects OK $$name (sibling-nursery brand mismatch, issue #71 option (b))"; \
-	done; \
+	done
+
+test-effects-m8x_8_brand_dump: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_8_brand_dump.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=../examples/effects/$$name.brands.expected; \
@@ -4159,7 +4417,10 @@ test-effects: $(TARGET) build
 	  diff -u $$exp build/s2-$$name.brands \
 	    && echo "effects OK $$name (--dump-brands golden, issue #71 option (b))" \
 	    || { echo "effects FAIL $$name (--dump-brands diverged from golden)"; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_7_actor_self_send: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_7_actor_self_send.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4172,7 +4433,10 @@ test-effects: $(TARGET) build
 	    && grep -q "^world$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (Actor[String] self-send + receive FIFO)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_8_mailbox_drop_oldest: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_8_mailbox_drop_oldest.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4186,7 +4450,10 @@ test-effects: $(TARGET) build
 	    && ! grep -q "^a$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (Bounded(2, DropOldest) evicts head)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_8_mailbox_drop_newest: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_8_mailbox_drop_newest.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4200,7 +4467,10 @@ test-effects: $(TARGET) build
 	    && ! grep -q "^c$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (Bounded(2, DropNewest) discards new)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_9_supervision_pattern: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_9_supervision_pattern.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4213,7 +4483,10 @@ test-effects: $(TARGET) build
 	    && grep -q "^22$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (supervision pattern: workers report through Actor mailbox)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_12_self_delegating_handler: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_12_self_delegating_handler.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4229,7 +4502,10 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name \
 	    && echo "effects OK $$name (m8 bug #12: self-delegating handler resolves to outer + per-fiber save/restore paired (C))" \
 	    || { echo "effects FAIL $$name (C binary exit non-zero — infinite-loop regression?)"; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_fiber_discard: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_fiber_discard.kai \
 	         ../examples/effects/m8_fiber_discard_yields.kai; do \
 	  name=$$(basename $$f .kai); \
@@ -4243,7 +4519,10 @@ test-effects: $(TARGET) build
 	  diff -u $$exp_out build/s2-$$name.out \
 	    && echo "effects OK $$name (R4: fiber-discard does not deadlock)" \
 	    || { echo "effects FAIL $$name (output diff)"; exit 1; }; \
-	done; \
+	done
+
+test-effects-mn_trampoline_tail_steal: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/mn_trampoline_tail_steal.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_out=../examples/effects/$$name.out.expected; \
@@ -4263,7 +4542,10 @@ test-effects: $(TARGET) build
 	  test "$$bad" = 0 \
 	    && echo "effects OK $$name (trampoline tail keeps fiber identity across a steal: $$ran/$$ran clean at KAI_THREADS=8)" \
 	    || { echo "effects FAIL $$name ($$bad of $$ran bad at KAI_THREADS=8)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-mn_cross_thread_scalar_share: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/mn_cross_thread_scalar_share.kai \
 	         ../examples/effects/mn_await_result_share.kai \
 	         ../examples/effects/mn_str_intern_race.kai; do \
@@ -4282,7 +4564,10 @@ test-effects: $(TARGET) build
 	  test "$$bad" = 0 \
 	    && echo "effects OK $$name (cross-thread invariant: $(MN_INVARIANT_ITERS)/$(MN_INVARIANT_ITERS) clean at KAI_THREADS=8)" \
 	    || { echo "effects FAIL $$name ($$bad of $(MN_INVARIANT_ITERS) bad at KAI_THREADS=8)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8_fiber_stack_overflow: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8_fiber_stack_overflow.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4301,7 +4586,10 @@ test-effects: $(TARGET) build
 	           echo '--- stderr:'; cat build/s2-$$name.stderr; \
 	           echo '--- stdout:'; cat build/s2-$$name.out; exit 1; }; \
 	  done; \
-	done; \
+	done
+
+test-effects-m12_8_y_phase4: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m12_8_y_phase4_*.kai; do \
 	  [ -e $$f ] || continue; \
 	  name=$$(basename $$f .kai); \
@@ -4333,7 +4621,10 @@ test-effects: $(TARGET) build
 	      echo "effects OK $$name (ran clean)"; \
 	    fi; \
 	  fi; \
-	done; \
+	done
+
+test-effects-issue_107_signal_trap: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/issue_107_signal_trap.kai ../examples/effects/signal_pending_before_await.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -4352,7 +4643,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Signal.on/off/await: SIGINT trap → clean exit 0)" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-signal_sigwinch_trap: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/signal_sigwinch_trap.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -4371,7 +4665,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (SIGWINCH trap → clean exit 0)" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-m8x_signal_await_parks: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/m8x_signal_await_parks.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -4390,7 +4687,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (R4: Signal.await() parks fiber; compute fiber interleaves)" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-process_basic: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/process_basic.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -4407,7 +4707,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (Process.start + wait: /bin/echo hello → Exited(0))" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-process_piped_capture: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/process_piped_capture.kai \
 	         ../examples/effects/process_piped_pager.kai \
 	         ../examples/effects/process_piped_epipe.kai \
@@ -4426,7 +4729,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (popen-shaped Process stdio pipes)" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-issue_141_log_default: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/issue_141_log_default.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -4447,7 +4753,10 @@ test-effects: $(TARGET) build
 	  grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\] ERROR default-e$$' build/s2-$$name.stderr \
 	    || { echo "effects FAIL $$name (ERROR line missing or malformed)"; cat build/s2-$$name.stderr; exit 1; }; \
 	  echo "effects OK $$name (issue #141: default Log handler → ISO 8601 + level + msg on stderr, all 4 levels)"; \
-	done; \
+	done
+
+test-effects-array_mutable_explicit: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/array_mutable_explicit.kai \
 	         ../examples/effects/array_read_only_no_mutable.kai \
 	         ../examples/effects/array_local_masks_mutable.kai \
@@ -4465,7 +4774,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (issue #251 + #252 Mutable provenance + masking)" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-local_ref_masks_mutable: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/local_ref_masks_mutable.kai \
 	         ../examples/effects/local_hashmap_masks_mutable.kai \
 	         ../examples/effects/string_builder_build_correct.kai \
@@ -4481,7 +4793,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (issue #531 local Ref/HashMap masks Mutable, unconditional default install)" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-mutable_user_handler_over_default: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/mutable_user_handler_over_default.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4491,7 +4806,10 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	    && echo "effects OK $$name (issue #531 user Mutable handler wins over base default, LIFO)" \
 	    || { echo "effects FAIL $$name (user handler did not shadow base default)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-array_mutable_required: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/array_mutable_required.kai \
 	         ../examples/effects/string_builder_append_requires_mutable.kai \
 	         ../examples/effects/array_record_forward_requires_mutable.kai \
@@ -4512,7 +4830,10 @@ test-effects: $(TARGET) build
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
 	  echo "effects OK $$name (rejected with the expected diagnostic)"; \
-	done; \
+	done
+
+test-effects-prelude_effect_via_scheme: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/prelude_effect_via_scheme.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp=$${f%.kai}.out.expected; \
@@ -4525,7 +4846,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (prelude builtin effect propagates via scheme row, not name table)" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-issue_308_user_log_effect: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/issue_308_user_log_effect.kai \
 	         ../examples/effects/issue_308_stdlib_log_unchanged.kai; do \
 	  name=$$(basename $$f .kai); \
@@ -4539,7 +4863,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (issue #308: user effect shadows stdlib)" \
 	    || { echo "effects FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-dual_actor_send_only: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/actors/dual_actor_send_only.kai \
 	         ../examples/actors/dual_actor_request_reply.kai \
 	         ../examples/actors/dual_actor_receive_only.kai \
@@ -4558,7 +4885,10 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "actors OK $$name (issue #532 nested Actor[T] absorbed)" \
 	    || { echo "actors FAIL $$name (output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-dual_actor_missing_one: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/actors/dual_actor_missing_one.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=../examples/actors/$$name.err.expected; \
@@ -4572,7 +4902,10 @@ test-effects: $(TARGET) build
 	           cat build/s2-$$name.err; exit 1; }; \
 	  done < $$exp_err; \
 	  echo "actors OK $$name (issue #472 missing parametric label still diagnosed)"; \
-	done; \
+	done
+
+test-effects-file_stream_roundtrip: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/file_stream_roundtrip.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4590,7 +4923,10 @@ test-effects: $(TARGET) build
 	  grep -q "^hello streaming world$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (#771 chunked write+read roundtrip)" \
 	    || { echo "effects FAIL $$name (roundtrip output wrong)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-file_stream_mock: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/file_stream_mock.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4602,7 +4938,10 @@ test-effects: $(TARGET) build
 	  grep -q "^mock: ababab$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (#771 chunked ops interceptable via handle)" \
 	    || { echo "effects FAIL $$name (mock output wrong)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-file_stream_open_missing: $(TARGET) build core-cache-warm
+	@set -e; \
 	for f in ../examples/effects/file_stream_open_missing.kai; do \
 	  name=$$(basename $$f .kai); \
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
@@ -4614,7 +4953,10 @@ test-effects: $(TARGET) build
 	  grep -q "^open_read failed: open_read: cannot open file$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (#771 open_read missing -> inspectable Err)" \
 	    || { echo "effects FAIL $$name (negative output wrong)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-stdout-specs: $(TARGET) build core-cache-warm
+	@set -e; \
 	for spec in \
 	  "stream_early_stop|^early_stop count=3$$|#801 push carrier early-stop via take" \
 	  "stream_mock_disk|^mock errors=2$$|#801 read_lines mocked via handle...with File" \
@@ -4639,7 +4981,10 @@ test-effects: $(TARGET) build
 	  grep -q "$$pat" build/s2-$$name.out \
 	    && echo "effects OK $$name ($$desc)" \
 	    || { echo "effects FAIL $$name (output mismatch; want /$$pat/)"; cat build/s2-$$name.out; exit 1; }; \
-	done; \
+	done
+
+test-effects-wc: $(TARGET) build core-cache-warm
+	@set -e; \
 	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../demos/wc.kai > build/s2-wc.c 2> build/s2-wc.err \
 	  || { echo "effects FAIL wc (kaic2 errored)"; cat build/s2-wc.err; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-wc.c -o build/s2-wc $(LDLIBS_M) \
@@ -4650,54 +4995,54 @@ test-effects: $(TARGET) build
 	  && echo "effects OK wc (#801 demo: lines/words/chars in one fold over read_lines)" \
 	  || { echo "effects FAIL wc (output mismatch; want '2 9 44 <path>')"; cat build/s2-wc.out; exit 1; }
 
-# m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,
-# lambda-block as expression, double trailing lambdas) and m7b #6
-# (array indexing `a[i]` / `a[i] := v`). Each .kai under
+# Syntax sugars, one target per fixture. Each .kai under
 # `examples/sugars/` either compiles + runs to a known stdout
 # (positive cases — diffed against `<name>.out.expected`) or fails
 # with a specific diagnostic (negative cases — every line of
 # `<name>.err.expected` must be a substring of the compiler's stderr).
-test-sugars: $(TARGET) build
+SUGARS_FIXTURES := $(basename $(notdir $(wildcard ../examples/sugars/*.kai)))
+
+test-sugars: $(addprefix test-sugars-fixture-,$(SUGARS_FIXTURES))
+
+test-sugars-fixture-%: $(TARGET) build core-cache-warm
 	@set -e; \
-	for f in ../examples/sugars/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  exp_out=../examples/sugars/$$name.out.expected; \
-	  exp_err=../examples/sugars/$$name.err.expected; \
-	  case "$$name" in \
-	    complex_literal_*) extra_flags="--path ../stdlib" ;; \
-	    coll_literal_*) extra_flags="--path ../stdlib" ;; \
-	    shape_kind_*) extra_flags="--path ../stdlib" ;; \
-	    kinds_dim_*) extra_flags="--path ../stdlib" ;; \
-	    kinds_module_lit_carrier) extra_flags="--path ../stdlib" ;; \
-	    *) extra_flags="" ;; \
-	  esac; \
-	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$extra_flags $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
-	    if [ $$rc -eq 0 ]; then \
-	      echo "sugars FAIL $$name (expected error, got success)"; exit 1; \
-	    fi; \
-	    while read -r line; do \
-	      grep -q "$$line" build/s2-$$name.err \
-	        || { echo "sugars FAIL $$name (missing diagnostic: $$line)"; \
-	             cat build/s2-$$name.err; exit 1; }; \
-	    done < $$exp_err; \
-	    echo "sugars OK $$name (rejected as expected)"; \
-	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) $$extra_flags $$f > build/$$name.c \
-	      || { echo "sugars FAIL $$name (kaic2 errored)"; exit 1; }; \
-	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) \
-	      || { echo "sugars FAIL $$name (C compile failed)"; exit 1; }; \
-	    ./build/$$name > build/$$name.out \
-	      || { echo "sugars FAIL $$name (run errored)"; cat build/$$name.out; exit 1; }; \
-	    if [ -f $$exp_out ]; then \
-	      diff -q $$exp_out build/$$name.out > /dev/null \
-	        && echo "sugars OK $$name" \
-	        || { echo "sugars DIFF $$name"; diff $$exp_out build/$$name.out; exit 1; }; \
-	    else \
-	      echo "sugars OK $$name (no golden, ran clean)"; \
-	    fi; \
+	name=$*; f=../examples/sugars/$$name.kai; \
+	exp_out=../examples/sugars/$$name.out.expected; \
+	exp_err=../examples/sugars/$$name.err.expected; \
+	case "$$name" in \
+	  complex_literal_*) extra_flags="--path ../stdlib" ;; \
+	  coll_literal_*) extra_flags="--path ../stdlib" ;; \
+	  shape_kind_*) extra_flags="--path ../stdlib" ;; \
+	  kinds_dim_*) extra_flags="--path ../stdlib" ;; \
+	  kinds_module_lit_carrier) extra_flags="--path ../stdlib" ;; \
+	  *) extra_flags="" ;; \
+	esac; \
+	if [ -f $$exp_err ]; then \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$extra_flags $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "sugars FAIL $$name (expected error, got success)"; exit 1; \
 	  fi; \
-	done
+	  while read -r line; do \
+	    grep -q "$$line" build/s2-$$name.err \
+	      || { echo "sugars FAIL $$name (missing diagnostic: $$line)"; \
+	           cat build/s2-$$name.err; exit 1; }; \
+	  done < $$exp_err; \
+	  echo "sugars OK $$name (rejected as expected)"; \
+	else \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$extra_flags $$f > build/$$name.c \
+	    || { echo "sugars FAIL $$name (kaic2 errored)"; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M) \
+	    || { echo "sugars FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/$$name > build/$$name.out \
+	    || { echo "sugars FAIL $$name (run errored)"; cat build/$$name.out; exit 1; }; \
+	  if [ -f $$exp_out ]; then \
+	    diff -q $$exp_out build/$$name.out > /dev/null \
+	      && echo "sugars OK $$name" \
+	      || { echo "sugars DIFF $$name"; diff $$exp_out build/$$name.out; exit 1; }; \
+	  else \
+	    echo "sugars OK $$name (no golden, ran clean)"; \
+	  fi; \
+	fi
 
 # kai lint (#966). Each .kai under `examples/lint/` runs through the
 # `--lint` and `--lint-json` reporter modes; the human text is diffed
@@ -13338,16 +13683,16 @@ test-namespace-collisions-nohomespell: $(TARGET) bin-kai build core-cache-warm
 	echo "namespace-collisions-nohomespell OK — no home-spelled name in any diagnostic"
 
 # The C-only axes, gated together in one tier1 shard (no libLLVM there);
-# native/native-modular/neg-native ride tier1-native and asan rides
-# tier1-asan. Every axis runs even when an earlier one is red, so one
-# regression cannot hide another. Each axis already fans out over the
-# cores, so the axes themselves run one after another.
+# native/native-modular/neg-native ride tier1-native, asan rides
+# tier1-asan, and the unratcheted nohomespell scan is a light target.
+# Every axis runs even when an earlier one is red, so one regression
+# cannot hide another. Each axis already fans out over the cores, so the
+# axes themselves run one after another.
 test-namespace-collisions-c-axes: $(TARGET) build
 	@rc=0; \
 	for t in test-namespace-collisions test-namespace-collisions-neg \
 	         test-namespace-collisions-modular test-namespace-collisions-neg-modular \
 	         test-namespace-collisions-diag test-namespace-collisions-testsym \
-	         test-namespace-collisions-nohomespell \
 	         test-namespace-collisions-check; do \
 	  $(MAKE) $$t || rc=1; \
 	done; \

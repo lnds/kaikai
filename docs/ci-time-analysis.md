@@ -90,6 +90,19 @@
 > slice's utilisation; set `parallelism` near the highest. Runner speed
 > varies ~1.5x between hosts for identical work, so several runs beat one
 > and no plan removes that spread.
+>
+> **Addendum (2026-10-04).** With the table refreshed, the floor was the
+> three long targets themselves: `test-stdlib`, `test-effects` and
+> `test-sugars` were serial loops of 10-17 min, 9-11 min and 8-10 min on the
+> runner, so their slices could not finish sooner whatever the plan. Each is
+> now a set of per-fixture make targets (`test-stdlib-fixture-%`,
+> `test-sugars-fixture-%`, one target per case in `TEST_EFFECTS_CASES`) that
+> share the slice's jobserver, so they spread over the runner's cores like
+> any other light work. The second floor was shard 7's fixed work (fmt
+> meaning-preservation half + CLI tail, ~18 min), which left its slice
+> empty: fmt-property now runs in thirds on shards 3, 6 and 8, shard 7 keeps
+> the CLI tail, and the unratcheted nohomespell scan moved from shard 2's
+> C-axes block into the light pool.
 
 All numbers below are **measured**, never dry-run. CI durations come from the
 GitHub Actions REST API for real `main` runs on `ubuntu-latest`; local splits
