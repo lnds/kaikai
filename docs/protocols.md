@@ -203,10 +203,18 @@ pointing at the missing impl — no silent fallback to bytes or
 Money[u]` appears in the same compilation unit, the resolver emits a
 duplicate-impl error.
 
-**Orphan rule** (Rust-style): an `impl P for T` is allowed only when
-**P** is declared in the current module **or** **T** is declared in
-the current module. This prevents two foreign packages defining
-conflicting impls on a type they both import.
+**Orphan rule** (Rust-style): an `impl P[A1, ..] for T` is allowed
+only when the current module declares **P**, the head of **T**, or
+the head of some protocol argument **Ai**. `impl Add[Complex] for Real`
+in the module declaring `Complex` is legal (see *Heterogeneous
+arithmetic*); `impl Add[List[Complex]] for Real` is not, because the
+argument's head is `List`. "Declares" means the declaration's home
+module, never a same-spelled name. This prevents two foreign packages
+defining conflicting impls on a type they both import.
+
+Blanket impls (`impl[T] P[T] for X`) would additionally need Rust's
+condition that no uncovered type parameter appears before the first
+local type.
 
 The orphan rule keeps coherence local: the compiler can determine the
 single applicable impl by searching only the modules transitively

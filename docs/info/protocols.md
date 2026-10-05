@@ -22,6 +22,12 @@ arithmetic family Add[a] / Sub[a] / Mul[a] / Div[a] / Rem[a].
 Most user code never declares a new protocol. Implementing the
 stdlib ones for your types is the common case.
 
+## Orphan rule
+
+An `impl P[A] for T` must live in the module that declares `P`, the
+head of `T`, or the head of a protocol argument `A`. Anywhere else it
+is a compile error: write the impl beside the type.
+
 ## Example
 
 ```kaikai
