@@ -1,0 +1,105 @@
+#[doc("""
+The orphan rule: an `impl P[A1, ..] for T` must live in the module that
+declares `P`, the head of `T`, or the head of some `Ai`.
+
+"Declares" is the declaration's home module, never a same-spelled name.
+Builtin targets (`Int`, `List`, ...) have no declaring module and are
+exempt.
+""")]
+
+import compiler.ast
+import compiler.decl_names
+import compiler.module_table
+import compiler.proto_resolve
+import compiler.type_text
+import compiler.util
+
+#[doc("An impl as the orphan rule judges it. `proto_home` is `None` when the protocol did not resolve, which its own diagnostic reports.")]
+pub type OrphanImpl = {
+  pspell: String,
+  proto_home: Option[String],
+  args: [TypeExpr],
+  target: TypeExpr,
+  from: Option[String],
+  impl_mod: String
+}
+
+#[doc("What the rule resolves type names against: the scope chain, and the program's type declarations by the spelling they reach the impl with.")]
+pub type OrphanScope = OrphanScope(PScope, [TypeSpelling])
+
+#[doc("The orphan-rule diagnostic for `o`, or `None` when the impl is legal.")]
+pub fn orphan_error(os: OrphanScope, o: OrphanImpl) : Option[String] = match o.proto_home {
+  None -> None
+  Some(ph) ->
+    if ph == o.impl_mod or orphan_exempt(o.target) or orphan_any_local(os, [o.target, ...o.args], o) { None }
+    else { Some(orphan_text(os, o, ph)) }
+}
+
+fn orphan_exempt(t: TypeExpr) : Bool =
+  list_has(["Int", "Real", "Bool", "Char", "String", "Unit", "List", "Option", "Result"],
+           orphan_head(t))
+
+fn orphan_any_local(os: OrphanScope, ts: [TypeExpr], o: OrphanImpl) : Bool = match ts {
+  [] -> false
+  [t, ...rest] -> orphan_owner(os, orphan_head(t), o.from) == Some(o.impl_mod) or
+                  orphan_any_local(os, rest, o)
+}
+
+fn orphan_head(t: TypeExpr) : String = match t.tkind {
+  TyName(n, _) -> n
+  TyList(_) -> "List"
+  TyDim(base, _) -> orphan_head(base)
+  TyRefine(base, _) -> orphan_head(base)
+  _ -> ""
+}
+
+# A contested type reaches here home-spelled, which no scope resolves;
+# its declaration is the one carrying that exact spelling.
+fn orphan_owner(os: OrphanScope, n: String, from: Option[String]) : Option[String] = match os {
+  OrphanScope(ps, sp) -> match ps_type_owner(ps, n, from) {
+    Some(h) -> Some(h)
+    None    -> match orphan_spelling(sp, n) {
+      Some(TSp(_, _, home)) -> Some(home)
+      None -> None
+    }
+  }
+}
+
+fn orphan_spelling(sp: [TypeSpelling], n: String) : Option[TypeSpelling] = match sp {
+  [] -> None
+  [e, ...rest] -> match e { TSp(s, _, _) -> if s == n { Some(e) } else { orphan_spelling(rest, n) } }
+}
+
+fn orphan_text(os: OrphanScope, o: OrphanImpl, ph: String) : String {
+  let head = orphan_head(o.target)
+  let thome = match orphan_owner(os, head, o.from) {
+    Some(m) -> concat_all(["`", mt_spell_home([], m), "`"])
+    None    -> "no module"
+  }
+  let pshown = match o.args {
+    [] -> o.pspell
+    _  -> concat_all([o.pspell, "[", orphan_list(os, o.args), "]"])
+  }
+  concat_all(["orphan rule: `impl ", pshown, " for ", orphan_shown(os, o.target),
+              "` is in module `", mt_spell_home([], o.impl_mod), "`, but `", o.pspell,
+              "` is declared in `", mt_spell_home([], ph),
+              "` and `", orphan_name(os, head), "` in ", thome,
+              "; an impl must live in the module of its protocol, its type, or a protocol argument's type"])
+}
+
+# A type as its source wrote it, never the spelling a contested name carries.
+fn orphan_shown(os: OrphanScope, t: TypeExpr) : String = match t.tkind {
+  TyName(n, []) -> orphan_name(os, n)
+  TyName(n, args) -> concat_all([orphan_name(os, n), "[", orphan_list(os, args), "]"])
+  _ -> type_text(t)
+}
+
+fn orphan_list(os: OrphanScope, ts: [TypeExpr]) : String =
+  join_with(map(ts, (t) => orphan_shown(os, t)), ", ")
+
+fn orphan_name(os: OrphanScope, n: String) : String = match os {
+  OrphanScope(_, sp) -> match orphan_spelling(sp, n) {
+    Some(TSp(_, written, _)) -> written
+    None -> n
+  }
+}

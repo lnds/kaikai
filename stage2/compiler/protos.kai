@@ -99,6 +99,7 @@ import compiler.scope_view
 import compiler.modules
 import compiler.proto_key
 import compiler.proto_resolve
+import compiler.proto_orphan
 import compiler.home_spell
 import compiler.decl_names
 import compiler.name_report
@@ -502,64 +503,20 @@ fn proto_ops_lookup_all_loop(ops: [ProtoOpReg], target: String) : [ProtoOpReg] {
   }
 }
 
-# Collect every protocol the program declares. Used by the
-# orphan-rule validation: an `impl P for T` is allowed only if `P` is
-# declared in the same compilation unit (here: in `decls`) or `T` is.
-fn collect_proto_names(ds: [Decl], acc: [String]) : [String] {
-  match ds {
-    [] -> acc
-    [d, ...rest] -> match d {
-      DProtocol(_, name, _, _, _, _, _, _) -> collect_proto_names(rest, [name, ...acc])
-      DDerive(_, inner, _, _) -> collect_proto_names([inner, ...rest], acc)
-      DUnstable(inner, _, _) -> collect_proto_names([inner, ...rest], acc)
-      DProtoLaws(_, inner, _, _, _) -> collect_proto_names([inner, ...rest], acc)
-      DImplAxiom(_, inner, _, _, _) -> collect_proto_names([inner, ...rest], acc)
-      DConstructor(inner, _, _) -> collect_proto_names([inner, ...rest], acc)
-      _ -> collect_proto_names(rest, acc)
-    }
-  }
-}
-
-fn collect_local_type_names(ds: [Decl], acc: [String]) : [String] {
-  match ds {
-    [] -> acc
-    [d, ...rest] -> match d {
-      DType(_, name, _, _, _, _, _, _, _) -> collect_local_type_names(rest, [name, ...acc])
-      DDerive(_, inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
-      DUnstable(inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
-      DProtoLaws(_, inner, _, _, _) -> collect_local_type_names([inner, ...rest], acc)
-      DImplAxiom(_, inner, _, _, _) -> collect_local_type_names([inner, ...rest], acc)
-      DConstructor(inner, _, _) -> collect_local_type_names([inner, ...rest], acc)
-      _ -> collect_local_type_names(rest, acc)
-    }
-  }
-}
-
-# Builtin-primitive type names — `Int`, `Real`, etc. — are treated
-# as "always local" for the purpose of the orphan rule when they
-# appear as the impl target. This matches the spec: stdlib ships
-# the canonical impls for primitives, and user code can still write
-# `impl Show for [a]` (target = list-of-tparam) without colliding.
-fn proto_builtin_type_names() : [String] =
-  ["Int", "Real", "Bool", "Char", "String", "Unit",
-   "List", "Option", "Result"]
-
-# Validate: the orphan rule (protocol or target type must be local),
-# single-impl-per-(P,T) coherence, and that the impl's protocol name
-# resolves to a protocol its module can see. Reports each violation on
+# Validate: the orphan rule, single-impl-per-(P,T) coherence, and that
+# the impl's protocol name resolves to a protocol its module can see. Reports each violation on
 # stderr and returns the count of reported errors.
 fn validate_impls(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
-                  reg: ProtocolReg, proto_names: [String],
-                  local_types: [String], target_mod: String,
+                  reg: ProtocolReg, target_mod: String,
                   ps: PScope) : Int / Console + File {
-  validate_impls_loop(ds, homes, df, reg, proto_names, local_types,
-                      target_mod, ps, [], 0)
+  validate_impls_loop(ds, homes, df, reg, target_mod, ps,
+                      OrphanScope(ps, nt_type_spellings(ds, target_mod)), [], 0)
 }
 
 fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
-                       reg: ProtocolReg, proto_names: [String],
-                       local_types: [String], target_mod: String,
-                       ps: PScope, seen: [String], errs: Int) : Int / Console + File {
+                       reg: ProtocolReg, target_mod: String,
+                       ps: PScope, os: OrphanScope, seen: [String],
+                       errs: Int) : Int / Console + File {
   match ds {
     [] -> errs
     [d, ...rest] -> match homes {
@@ -587,17 +544,21 @@ fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
         }
         let key = concat_all([mo_key, "!", pname, "/", impl_target_key(ps, tname, from), "[",
                               arg_names_mangle(arg_names), "]"])
-        let proto_local = list_has(proto_names, pname)
-        let type_local = list_has(local_types, tname) or
-                         list_has(proto_builtin_type_names(), tname)
-        let errs1 =
-          if not proto_local and not type_local {
-            eprint(concat_all([
-              file, ":", int_to_string(line), ":", int_to_string(col),
-              ": error: orphan rule: `impl ", pname, " for ", tname,
-              "` requires either the protocol or the target type to be declared in this compilation unit"]))
+        let proto_home = match res {
+          PkHome(ph) -> Some(proto_home_name(ph, target_mod))
+          _ -> None
+        }
+        let orphan = OrphanImpl { pspell: pspell, proto_home: proto_home, args: proto_args,
+                                  target: target, from: from,
+                                  impl_mod: proto_home_name(from, target_mod) }
+        let errs1 = match orphan_error(os, orphan) {
+          Some(msg) -> {
+            eprint(concat_all([file, ":", int_to_string(line), ":", int_to_string(col),
+                               ": error: ", msg]))
             errs + 1
-          } else { errs }
+          }
+          None -> errs
+        }
         let errs2 =
           if list_has(seen, key) {
             eprint(concat_all([
@@ -628,26 +589,19 @@ fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
           }
         }
         let seen1 = if list_has(seen, key) { seen } else { [key, ...seen] }
-        validate_impls_loop(rest, hrest, df, reg, proto_names,
-                            local_types, target_mod, ps, seen1, errs3)
+        validate_impls_loop(rest, hrest, df, reg, target_mod, ps, os, seen1, errs3)
       }
       DDerive(_, inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
-                            local_types, target_mod, ps, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, errs)
       DUnstable(inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
-                            local_types, target_mod, ps, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, errs)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
-                            local_types, target_mod, ps, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, errs)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
-                            local_types, target_mod, ps, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, errs)
       DConstructor(inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, proto_names,
-                            local_types, target_mod, ps, seen, errs)
-      _ -> validate_impls_loop(rest, hrest, df, reg, proto_names,
-                               local_types, target_mod, ps, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, errs)
+      _ -> validate_impls_loop(rest, hrest, df, reg, target_mod, ps, os, seen, errs)
       }
     }
   }
@@ -3491,10 +3445,8 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # Step 3 — coherence: orphan + duplicate-impl + protocol-visibility
   # validation. Needs `reg0.origins` to resolve each impl's protocol
   # name from its own module.
-  let proto_names = collect_proto_names(expanded, [])
-  let local_types = collect_local_type_names(expanded, [])
   let coh_errs = validate_impls(expanded, homes, df, reg0,
-                                proto_names, local_types, target_mod, ps)
+                                target_mod, ps)
   # Step 3b — issue #535: validate each impl block against its
   # protocol's declared operations (missing methods, wrong arity,
   # head-name signature mismatch), resolved against the protocol the

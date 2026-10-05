@@ -60,15 +60,17 @@ grep -q "cannot find \`core\`" "$TMP/err" || fail "the file's own error was not 
 grep -q "ok   a" "$TMP/err" || fail "the file before it did not run"
 if grep -q "ok   c" "$TMP/err"; then fail "the file after it ran"; fi
 
-# 3 — files that each build alone but not together fail the run, before any test runs.
+# 3 — files that each build alone but not together fail the run, before any
+# test runs: each binds one C symbol under its own signature.
 mk_pkg dup
-printf 'pub type Shape = Sq(Int)\n' > "$TMP/dup/lib/shape.kai"
-for t in a b; do
-  printf 'import lib.shape\n\nimpl Show for shape.Shape {\n  fn show(s: shape.Shape) : String = "%s"\n}\n\ntest "%s" {\n  assert show(shape.Sq(1)) == "%s"\n}\n' "$t" "$t" "$t" > "$TMP/dup/tests/${t}_test.kai"
-done
+mkdir -p "$TMP/dup/c"
+printf '#include <stdint.h>\nint32_t grouped_probe(void) { return 7; }\n' > "$TMP/dup/c/probe.c"
+printf '\n[native]\nsources = ["c/probe.c"]\n' >> "$TMP/dup/kai.toml"
+printf 'extern "C"("grouped_probe") fn probe() : I32 / Ffi\n\ntest "a" {\n  assert 1 == 1\n}\n' > "$TMP/dup/tests/a_test.kai"
+printf 'extern "C"("grouped_probe") fn probe() : Int / Ffi\n\ntest "b" {\n  assert 1 == 1\n}\n' > "$TMP/dup/tests/b_test.kai"
 run dup
 [ "$(cat "$TMP/rc")" -ne 0 ] || fail "test files that do not build together passed"
-grep -q "duplicate impl" "$TMP/err" || fail "the shared build's error was not reported"
+grep -q "conflicting declarations of extern function" "$TMP/err" || fail "the shared build's error was not reported"
 if grep -q "ok   a" "$TMP/err"; then fail "a test ran although the shared build failed"; fi
 
 # 4 — an unused binding in an imported module's block names that module's file.
