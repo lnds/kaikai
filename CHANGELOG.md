@@ -84,6 +84,57 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.130.0 (2026-10-05)
+
+### BREAKING CHANGE
+
+- kaic2 exits 2 on an option it does not know, and on an
+option missing its value, where it used to ignore the first and exit 0
+on the second. `kai test` forwards unrecognised flags to kaic2, so a
+mistyped flag there now fails the run instead of vanishing.
+- a match that relied on literals, guards or nested
+patterns without a catch-all and did not cover every value no longer
+compiles. Add the arm the diagnostic names, or a wildcard `_` arm. No
+match in the compiler, the stdlib or the examples needed a change.
+
+### Added
+
+- **stdlib**: derive Eq and Hash through tuples (#2466)
+- **lsp**: --diags-json reports what kai build rejects with (#2460)
+
+### Fixed
+
+- **runtime**: resolve links and monitors through the fiber behind a pid (#2457)
+- **emit**: fold only a self-call that passes the functional param into a closure spec (#2434)
+- **emit**: box a raw binder's boxed read by the read's type (#2449)
+- **emit**: specialise a closure argument only where its param is visible (#2435)
+- **mutate**: name a site's module by its path in the package (#2174)
+- **runtime**: build the leak-site tracer on its own flag (#2431)
+- **runtime**: declare the RC ledger's reuse-token counters once per program (#2431)
+- **cli**: kaic2 rejects an unknown option and exits 2 on a malformed command line (#2372)
+- **typer**: reject a match whose literals, guards or nested patterns leave a value uncovered (#2454)
+- **perceus**: leave a binder its own guard reads to the guard (#2455)
+- **kir**: test every sub-pattern of a native match arm and panic on a miss (#2452)
+- **runtime**: report a monitor on an actor that has already ended (#2453)
+- **runtime**: free a structure of any depth in bounded stack (#2451)
+- **runtime**: release a cancelled fiber's spawn closure (#2451)
+- **runtime**: settle fibers that never started before the RC ledger reports (#2451)
+- **runtime**: release the thunk spawn_actor_fiber hands to its fiber (#2451)
+- **runtime**: free a Pid box when its last handle drops (#2451)
+
+### Changed
+
+- **compiler**: declare the core calls inserted after resolution in one place (#2476)
+- **compiler**: read name bytes without building an Option[Char] in hot string helpers (#2474)
+- **typer**: look up union variant claims through a name index (#2470)
+- **lexer**: read source bytes as Ints and move the cursor once per token (#2469)
+- **typer**: settle a match's coverage without the pattern matrix when its arms decide it (#2426)
+- **compiler**: scan each block once for unused and inline-released lets (#2372)
+- **test**: keep kai test's binaries by every input their build reads (#2372)
+- **compiler**: sort registered variants once and dedup by key (#2450)
+- **parse**: parse binary operators with one precedence loop (#2450)
+- **build**: link the boot one translation unit per module, in parallel (#2447)
+
 ## v0.129.0 (2026-10-04)
 
 ### BREAKING CHANGE
