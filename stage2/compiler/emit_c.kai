@@ -103,6 +103,7 @@ import compiler.unwind_pend
 import compiler.unwind_effects
 import compiler.unwind_cx
 import compiler.emit_unwind_c
+import compiler.kir_pat_alias
 
 # ====================================================================
 
@@ -3788,7 +3789,7 @@ fn expr_is_borrowed_binder(e: Expr, borrowed: [String]) : Bool =
 
 # Arm-top reuse plan: the consumed PVariant's ctor name, its payload tys,
 # the pointer-slot binders (dup in shared branch), and the scrutinee arity.
-type ArmTopReuse = ArmTopReuse(String, [Pattern], [Int], [String], Int)
+type ArmTopReuse = ArmTopReuse(String, [Pattern], [Int], [String], Int, [Int])
 
 # Detect a match arm eligible for the coupled arm-top reuse: a PVariant the
 # arm consumes, whose body contains a TRMC step (the hot insert_loop shape).
@@ -3867,7 +3868,8 @@ fn try_arm_top_reuse(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReuse
             let ptr_binders = arm_ptr_binders(subs, tys, 0)
             match ptr_binders {
               [] -> None
-              _  -> Some(ArmTopReuse(cname, subs, tys, ptr_binders, list_length(subs)))
+              _  -> Some(ArmTopReuse(cname, subs, tys, ptr_binders, list_length(subs),
+                                     pat_unbound_ptr_slots(pat, cx.variants)))
             }
           } else { None }
         None -> None
@@ -3978,7 +3980,7 @@ pub fn arm_moved_binders(binders: [String], body: Expr) : [String] = match binde
 fn emit_arm_top_reuse(src: String, atr: ArmTopReuse, body: Expr,
                       arm_cx: EmitCtx, cx: EmitCtx) : String / Console {
   match atr {
-    ArmTopReuse(atr_cname, subs, tys, ptr_binders, n) -> {
+    ArmTopReuse(atr_cname, subs, tys, ptr_binders, n, unbound) -> {
       # Transcribe perceus's signature: dup in the shared branch EXACTLY the
       # ptr binders perceus MOVED (bare use in the body, no __perceus_dup).
       # Reading the decision off the AST (not recomputing the branch-aware
@@ -4010,6 +4012,7 @@ fn emit_arm_top_reuse(src: String, atr: ArmTopReuse, body: Expr,
         borrow_binds,
         "KaiReuse _arm_ru = kai_drop_reuse_token(_scr, ", int_to_string(n), "); ",
         "if (_arm_ru == kai_reuse_null) { ", shared_dups, "} ",
+        concat_all(map(unbound, arm_unbound_slot_drop)),
         # The token-steal consumed the shell's ownership (Koka: a cell that
         # becomes a reuse-token is no longer a live RC value). Neutralise the
         # match-exit `kai_decref(_scr)` so it does not double-dispose the cell
@@ -4041,10 +4044,11 @@ fn arm_donor_binders(subs: [Pattern], i: Int) : [String] = match subs {
   }
 }
 
-# Borrow binds for the arm-top model: pointer slots are aliased WITHOUT
+# Borrow binds for the arm-top model: a PBind pointer slot is aliased WITHOUT
 # incref (the move/dup decision is taken at the arm top, not here); Int/Real
 # slots box a fresh owning value (same as the owned path — primitives carry
-# no RC so there is no sharing concern). PWild / unused slots bind nothing.
+# no RC so there is no sharing concern). Any other pointer sub-pattern binds
+# its nested names as the owned path does, with their own reference.
 fn emit_arm_borrow_binds(src: String, subs: [Pattern], tys: [Int], i: Int,
                          cx: EmitCtx) : String {
   match subs {
@@ -4058,12 +4062,19 @@ fn emit_arm_borrow_binds(src: String, subs: [Pattern], tys: [Int], i: Int,
           else if k == 2 { concat_all(["KaiValue *", c_local(nm), " = kai_real(", slot, ".r); "]) }
           else if k == 3 { concat_all(["KaiValue *", c_local(nm), " = kai_enum_slot_box(", slot, ".i64); "]) }
           else { concat_all(["KaiValue *", c_local(nm), " = ", slot, ".ptr; "]) }
-        _ -> ""
+        _ -> if k == 0 { emit_pat_binds(src, sp, concat_all([slot, ".ptr"]), true, cx) } else { "" }
       }
       cat2(here, emit_arm_borrow_binds(src, rest, tys, i + 1, cx))
     }
   }
 }
+
+# A stolen shell hands its children to the arm, but only PBind slots move
+# into binders; every other pointer child is released here on the unique
+# path, or nothing would ever drop it. A shared shell keeps them.
+fn arm_unbound_slot_drop(i: Int) : String =
+  concat_all(["if (_arm_ru != kai_reuse_null) { kai_decref(kai_var_slots(_arm_ru)[",
+              int_to_string(i), "].ptr); } "])
 
 type ReuseVariantArm = ReuseVariantArm([Pattern], Option[String], String, [Expr], [Int])
 
