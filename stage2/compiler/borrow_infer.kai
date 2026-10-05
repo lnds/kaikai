@@ -24,15 +24,16 @@
 import compiler.ast
 import compiler.sym_read
 import compiler.borrow_escape
+import compiler.self_call
 
 # Borrow the parameters of a non-`pub` function body under the relaxed rule.
-# `self_name` is the function's own (qualified) name for self-call detection;
+# `self_name` identifies the function's own calls;
 # `explicit` lists positions already borrowed via `^` (a pub signature or an
 # explicit annotation) so inference never contradicts a stated convention.
-pub fn borrow_infer_params(self_name: String, pnames: [String], body: Expr) : [String] =
+pub fn borrow_infer_params(self_name: SelfRef, pnames: [String], body: Expr) : [String] =
   binf_loop(self_name, pnames, pnames, 0, body)
 
-fn binf_loop(self_name: String, all: [String], rem: [String], i: Int, body: Expr) : [String] =
+fn binf_loop(self_name: SelfRef, all: [String], rem: [String], i: Int, body: Expr) : [String] =
   match rem {
     []           -> []
     [h, ...rest] -> {
@@ -44,16 +45,16 @@ fn binf_loop(self_name: String, all: [String], rem: [String], i: Int, body: Expr
 # A parameter at position `i` is borrowable iff every read of it in `body`
 # is inspection | callee | self-borrow-through. `binf_uses_ok` walks the
 # body proving the discipline holds; any owned exit returns false.
-fn binf_param_borrowable(self_name: String, nm: String, i: Int, body: Expr) : Bool = {
+fn binf_param_borrowable(self_name: SelfRef, nm: String, i: Int, body: Expr) : Bool = {
   # A parameter never read at all is trivially borrowable (nothing to own).
   # A parameter read only through borrowable positions is borrowable too.
   binf_uses_ok(self_name, nm, i, body)
 }
 
-fn binf_uses_ok(self_name: String, nm: String, i: Int, e: Expr) : Bool =
+fn binf_uses_ok(self_name: SelfRef, nm: String, i: Int, e: Expr) : Bool =
   binf_kind_ok(self_name, nm, i, e.kind)
 
-fn binf_kind_ok(self_name: String, nm: String, i: Int, k: ExprKind) : Bool = match sym_read_kind(k) {
+fn binf_kind_ok(self_name: SelfRef, nm: String, i: Int, k: ExprKind) : Bool = match sym_read_kind(k) {
   # Inspection: `nm` as a bare scrutinee. A component the arm binds is an
   # interior pointer of the borrowed `nm` (no dup-on-bind), so it is safe
   # only while it stays borrowed too — `binf_match_ok` disqualifies if any
@@ -64,8 +65,8 @@ fn binf_kind_ok(self_name: String, nm: String, i: Int, k: ExprKind) : Bool = mat
   # is not borrowable through it. A self-call passing `nm` at its own
   # position `i` is borrow-through (see binf_call_ok).
   ECall(f, xs) -> match sym_read_kind(f.kind) {
-    EVar(c)        -> if c == nm { false } else { binf_call_ok(self_name, nm, i, c, xs) }
-    EModCall(_, c) -> binf_call_ok(self_name, nm, i, c, xs)
+    EVar(c)        -> if c == nm { false } else { binf_call_ok(self_name, nm, i, f, xs) }
+    EModCall(_, _) -> binf_call_ok(self_name, nm, i, f, xs)
     _              -> binf_uses_ok(self_name, nm, i, f) and binf_args_ok(self_name, nm, i, xs)
   }
   EIntrinsic(_, xs)   -> binf_args_ok(self_name, nm, i, xs)
@@ -89,7 +90,7 @@ fn binf_kind_ok(self_name: String, nm: String, i: Int, k: ExprKind) : Bool = mat
 
 # Forms that neither consume nor store `nm` — it stays borrowable iff every
 # sub-expression keeps it borrowable. Leaves (literals) never reference `nm`.
-fn binf_transparent_ok(self_name: String, nm: String, i: Int, k: ExprKind) : Bool = match k {
+fn binf_transparent_ok(self_name: SelfRef, nm: String, i: Int, k: ExprKind) : Bool = match k {
   EBinop(_, a, b)     -> binf_uses_ok(self_name, nm, i, a) and binf_uses_ok(self_name, nm, i, b)
   EUnop(_, x)         -> binf_uses_ok(self_name, nm, i, x)
   EIf(c, t, oe)       -> binf_uses_ok(self_name, nm, i, c) and
@@ -110,7 +111,7 @@ fn binf_transparent_ok(self_name: String, nm: String, i: Int, k: ExprKind) : Boo
 # spine, consumed cell-by-cell) wants OWNERSHIP — borrow is a read/HOF lever,
 # not a reuse or spine-consume lever, so `nm` is disqualified there. A
 # non-bare scrutinee, and every arm body/guard, must stay borrowable.
-fn binf_match_ok(self_name: String, nm: String, i: Int, s: Expr, arms: [Arm]) : Bool = {
+fn binf_match_ok(self_name: SelfRef, nm: String, i: Int, s: Expr, arms: [Arm]) : Bool = {
   let reuse_target = match sym_read_kind(s.kind) {
     EVar(u) -> u == nm and (binf_arms_rebuild_ctor(arms) or binf_arms_list_deconstruct(arms))
     _       -> false
@@ -143,14 +144,14 @@ fn binf_match_ok(self_name: String, nm: String, i: Int, s: Expr, arms: [Arm]) : 
 # position it is an owned pass. If `c` is another fn, `nm` in any arg is an
 # owned pass (its borrow map is not assumed). Either way the callee itself
 # (`c`) being `nm` is fine — that is the callee-position read.
-fn binf_call_ok(self_name: String, nm: String, i: Int, c: String, xs: [Expr]) : Bool =
-  if c == self_name { binf_self_args_ok(self_name, nm, i, xs, 0) }
+fn binf_call_ok(self_name: SelfRef, nm: String, i: Int, f: Expr, xs: [Expr]) : Bool =
+  if is_self_callee(f, self_name) { binf_self_args_ok(self_name, nm, i, xs, 0) }
   else { binf_args_ok(self_name, nm, i, xs) }
 
 # Self-call args: `nm` at position `i` is borrow-through (skip the owned
 # check on that slot); every other slot must not carry a bare `nm` in owned
 # position but may still inspect/borrow-through it in a sub-expression.
-fn binf_self_args_ok(self_name: String, nm: String, i: Int, xs: [Expr], j: Int) : Bool = match xs {
+fn binf_self_args_ok(self_name: SelfRef, nm: String, i: Int, xs: [Expr], j: Int) : Bool = match xs {
   []           -> true
   [a, ...rest] -> {
     let here = if j == i { binf_arg_is_borrow_through(nm, a) or binf_uses_ok(self_name, nm, i, a) }
@@ -212,7 +213,7 @@ fn binf_name_is_ctor(nm: String) : Bool = match char_at(nm, 0) {
 
 # Non-self call args: `nm` must be absent in owned position. A sub-inspection
 # (`f(is_red(nm))`) is still borrowable; a bare `nm` argument is owned.
-fn binf_args_ok(self_name: String, nm: String, i: Int, xs: [Expr]) : Bool = match xs {
+fn binf_args_ok(self_name: SelfRef, nm: String, i: Int, xs: [Expr]) : Bool = match xs {
   []           -> true
   [a, ...rest] -> {
     let here = match sym_read_kind(a.kind) {
@@ -223,7 +224,7 @@ fn binf_args_ok(self_name: String, nm: String, i: Int, xs: [Expr]) : Bool = matc
   }
 }
 
-fn binf_arms_ok(self_name: String, nm: String, i: Int, arms: [Arm]) : Bool = match arms {
+fn binf_arms_ok(self_name: SelfRef, nm: String, i: Int, arms: [Arm]) : Bool = match arms {
   []           -> true
   [a, ...rest] -> match a {
     Arm(_, opt_g, abody) -> {
@@ -234,17 +235,17 @@ fn binf_arms_ok(self_name: String, nm: String, i: Int, arms: [Arm]) : Bool = mat
   }
 }
 
-fn binf_opt_ok(self_name: String, nm: String, i: Int, oe: Option[Expr]) : Bool = match oe {
+fn binf_opt_ok(self_name: SelfRef, nm: String, i: Int, oe: Option[Expr]) : Bool = match oe {
   None    -> true
   Some(e) -> binf_uses_ok(self_name, nm, i, e)
 }
 
-fn binf_stmts_ok(self_name: String, nm: String, i: Int, stmts: [Stmt]) : Bool = match stmts {
+fn binf_stmts_ok(self_name: SelfRef, nm: String, i: Int, stmts: [Stmt]) : Bool = match stmts {
   []           -> true
   [s, ...rest] -> binf_exprs_ok(self_name, nm, i, stmt_exprs(s)) and binf_stmts_ok(self_name, nm, i, rest)
 }
 
-fn binf_exprs_ok(self_name: String, nm: String, i: Int, es: [Expr]) : Bool = match es {
+fn binf_exprs_ok(self_name: SelfRef, nm: String, i: Int, es: [Expr]) : Bool = match es {
   []           -> true
   [e, ...rest] -> binf_uses_ok(self_name, nm, i, e) and binf_exprs_ok(self_name, nm, i, rest)
 }
