@@ -12225,21 +12225,21 @@ test-perceus-nested-reuse: $(TARGET) build
 test-perceus-nested-reuse-asan: $(TARGET) build
 	@set -e; \
 	for name in $(PERCEUS_NESTED_REUSE_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/$$name-asan.c; \
+	  $(KAIC2) --path ../stdlib ../examples/perceus/$$name.kai > build/nr-$$name-asan.c; \
 	  $(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	        -DKAI_NO_CELL_POOL \
 	        -Wno-unused-function -Wno-unused-variable $(LDFLAGS_STACK) \
-	        -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c $(LDLIBS_M); \
+	        -I ../stage2 -I ../stage0 build/nr-$$name-asan.c -o build/nr-$$name-asan-c $(LDLIBS_M); \
 	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-	    ./build/$$name-asan-c > build/$$name-asan.out 2> build/$$name-asan.err; \
-	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
+	    ./build/nr-$$name-asan-c > build/nr-$$name-asan.out 2> build/nr-$$name-asan.err; \
+	  if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/nr-$$name-asan.err; then \
 	    echo "perceus-nested-reuse-asan FAIL $$name — sanitizer diagnostic:"; \
-	    cat build/$$name-asan.err; exit 1; \
+	    cat build/nr-$$name-asan.err; exit 1; \
 	  fi; \
-	  diff -q ../examples/perceus/$$name.out.expected build/$$name-asan.out > /dev/null \
+	  diff -q ../examples/perceus/$$name.out.expected build/nr-$$name-asan.out > /dev/null \
 	    && echo "perceus-nested-reuse-asan OK $$name" \
-	    || { echo "perceus-nested-reuse-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name-asan.out; exit 1; }; \
+	    || { echo "perceus-nested-reuse-asan DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/nr-$$name-asan.out; exit 1; }; \
 	done
 
 # Native sibling: the default backend proves the same RC soundness. The
