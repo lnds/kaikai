@@ -19295,6 +19295,10 @@ static LLVMCodeGenOptLevel kai_llvm_cgen_level(void) {
 static KaiValue *kai_llvm_backend_tag(void) {
     const char *off = getenv("KAI_NATIVE_CORE_OBJ");
     if (off && strcmp(off, "0") == 0) return kai_str("");
+    /* A debug build's DWARF names the program's own source file, so its core
+     * object is never program-invariant: no tag, no shared core object. */
+    const char *mode = getenv("KAI_BUILD_MODE");
+    if (mode && strcmp(mode, "debug") == 0) return kai_str("");
     const char *lvl = getenv("KAI_NATIVE_OPT");
     if (lvl && lvl[0] && strcmp(lvl, "2") != 0) return kai_str("");
     char bc[64], inlbc[64], tag[512];
