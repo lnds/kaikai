@@ -17,8 +17,9 @@ B="$ROOT/examples/stdlib/core_hit_mono"
 
 rm -rf "$WORK"; mkdir -p "$WORK/a" "$WORK/b"
 
+# Every run compiles: a memoised binary would skip the warm build the gate checks.
 run() { # cache-dir program out
-  KAI_CORE_CACHE_DIR="$1" KAI_CORE_CACHE_STATS=1 "$KAI" run "$2.kai" > "$3.out" 2> "$3.err"
+  KAI_BIN_MEMO=0 KAI_CORE_CACHE_DIR="$1" KAI_CORE_CACHE_STATS=1 "$KAI" run "$2.kai" > "$3.out" 2> "$3.err"
 }
 
 run "$WORK/a" "$A" "$WORK/a-cold"
