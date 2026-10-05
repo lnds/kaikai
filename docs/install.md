@@ -55,7 +55,7 @@ export KAI_BACKEND=c
 | `KAI_NATIVE_OPT`| Optimisation level for the native backend's in-process LLVM pipeline (`0|1|2|3|s|z`; default `2`). |
 | `KAI_NATIVE_JOBS`| Threads the native backend optimises and emits module objects on (default: the `-j` of `kai test`, else the CPU count). The objects are identical for any value. |
 | `KAI_GUARD_MEMO`| The memo of `kai test`'s per-file checks, kept in the package's user cache: `0` turns it off, `shadow` also runs every hit and fails the run on any difference (default: on in a package). |
-| `KAI_BIN_MEMO`  | The memo of `kai test`'s test binaries, kept in the package's user cache: `0` turns it off (default: on in a package). |
+| `KAI_BIN_MEMO`  | The memo of the binaries `kai test` and `kai run` build, kept in the package's user cache, else the shared core cache: `0` turns it off (default: on). |
 | `KAI_NO_STDLIB` | If `1`, skip the auto-loaded stdlib core modules. |
 
 ## The native backend and libLLVM
@@ -71,6 +71,8 @@ A C compiler (`cc`) is still needed to link the emitted native object
 against the runtime and to drive the C backend; the Xcode Command Line
 Tools (macOS) or your distro's `build-essential` / `gcc` (Linux) provide
 it.
+
+On macOS the first run of each newly built binary waits for the system's assessment of new executables; adding your terminal under System Settings → Privacy & Security → Developer Tools skips it.
 
 If you build `kaic2` yourself from a checkout, native capability is
 auto-detected from `llvm-config`: present → native-capable, absent →

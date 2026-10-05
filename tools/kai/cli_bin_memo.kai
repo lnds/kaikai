@@ -1,11 +1,12 @@
 #[doc("""
-`kai test`'s binaries, memoised by everything their build reads.
+The binaries of `kai test` and `kai run`, memoised by everything their build reads.
 
-A test binary is a function of the compiler, its arguments, the entry,
+A binary is a function of the compiler, its arguments, the entry,
 every source the compile reads, the runtime and C toolchain the link
 uses, and the environment both see. A memo entry under the package's
-user cache keeps the binary, and the run order a grouped build writes
-beside it; a hit copies them where the build would have written them.
+user cache, or the shared core cache outside a package, keeps the
+binary, and the run order a grouped build writes beside it; a hit puts
+them where the build would have written them.
 
 `KAI_BIN_MEMO=0` turns the memo off.
 """)]
@@ -14,6 +15,7 @@ import os.env
 import cli_fs
 import cli_guard_memo
 import cli_memo_key
+import cli_memo_place
 import cli_plan
 import cli_proc
 import cli_sys
@@ -41,24 +43,26 @@ pub fn built(
   build: () -> Result[Unit, Int] / e,
   degraded: () -> Unit / e
 ) : Result[Unit, Int] / Env + File + Ffi + e {
-  let dir = memo_dir(p)
-  if dir == "" or p.job.verb != "test" or env.get("KAI_BIN_MEMO").unwrap_or("") == "0" {
+  let dir = cli_memo_place.dir(p.flags)
+  if dir == "" or not memoised_verb(p.job.verb) or env.get("KAI_BIN_MEMO").unwrap_or("") == "0" {
     build()
   } else {
-    match key_of(p, backend) {
+    match key_of(p, backend, dir) {
       None -> build()
-      Some(key) -> from_memo(p.job.out, "#{dir}/#{key}", build, degraded)
+      Some(key) -> from_memo(p.job, "#{dir}/#{key}", build, degraded)
     }
   }
 }
 
+fn memoised_verb(verb: String) : Bool = verb == "test" or verb == "run"
+
 fn from_memo(
-  out: String,
+  job: Job,
   entry: String,
   build: () -> Result[Unit, Int] / e,
   degraded: () -> Unit / e
 ) : Result[Unit, Int] / File + Ffi + e =
-  match restore(entry, out) {
+  match restore(entry, job.verb, job.out) {
     Some(m) -> {
       if m.degraded and not cli_sys.no_llvm() { degraded() }
       Ok(())
@@ -66,18 +70,12 @@ fn from_memo(
     None -> {
       let before = cli_sys.no_llvm()
       let r = build()
-      if r.is_ok() and cli_sys.pending_signal() == 0 { keep(entry, out, (not before) and cli_sys.no_llvm()) }
+      if r.is_ok() and cli_sys.pending_signal() == 0 { keep(entry, job.verb, job.out, (not before) and cli_sys.no_llvm()) }
       r
     }
   }
 
-fn memo_dir(p: Plan) : String =
-  match cli_memo_key.user_cache_dir(p.flags) {
-    "" -> ""
-    d -> "#{d}/bins"
-  }
-
-fn key_of(p: Plan, backend: String) : Option[String] / Env + File + Ffi {
+fn key_of(p: Plan, backend: String, dir: String) : Option[String] / Env + File + Ffi {
   let job = p.job
   let argv = cli_plan.kaic2(p, [], job.src)
   let listing = cli_proc.capture(
@@ -90,7 +88,7 @@ fn key_of(p: Plan, backend: String) : Option[String] / Env + File + Ffi {
   } else {
     let tool = match env.get(cli_guard_memo.TOOLCHAIN_ENV) {
       Some(d) -> d
-      None -> cli_guard_memo.toolchain_digest(p.t.layout.kaic2)
+      None -> cli_memo_place.toolchain_digest(dir, p.t.layout.kaic2)
     }
     let core = match env.get(cli_guard_memo.CORE_ENV) {
       Some(d) -> d
@@ -132,14 +130,14 @@ fn feed_if_file(f: String) : Unit / Ffi =
 # entry is a miss, and whether the build fell back to C.
 type Meta = { bin: Int, plan: Int, degraded: Bool }
 
-fn restore(entry: String, out: String) : Option[Meta] / File + Ffi =
+fn restore(entry: String, verb: String, out: String) : Option[Meta] / File + Ffi =
   match meta(entry) {
     None -> None
     Some(m) -> if m.bin == cli_sys.size("#{entry}/bin")
       and m.plan == cli_sys.size("#{entry}/plan")
-      and copied("#{entry}/bin", out)
-      and (m.plan < 0 or copied("#{entry}/plan", "#{out}.plan"))
-      and run(["touch", "#{entry}/meta"]) {
+      and cli_memo_place.put(verb, "#{entry}/bin", out)
+      and (m.plan < 0 or cli_memo_place.copied("#{entry}/plan", "#{out}.plan"))
+      and cli_memo_place.quiet(["touch", "#{entry}/meta"]) {
       Some(m)
     } else {
       None
@@ -163,12 +161,12 @@ fn meta(entry: String) : Option[Meta] / File =
   }
 
 # Written aside and renamed into place, so a reader sees a whole entry or none.
-fn keep(entry: String, out: String, degraded: Bool) : Unit / File + Ffi {
+fn keep(entry: String, verb: String, out: String, degraded: Bool) : Unit / File + Ffi {
   let part = "#{entry}.#{cli_sys.getpid()}.part"
   let plan = "#{out}.plan"
   let staged = cli_fs.mkdir_p(part)
-    and copied(out, "#{part}/bin")
-    and ((not cli_sys.is_file(plan)) or copied(plan, "#{part}/plan"))
+    and cli_memo_place.put(verb, out, "#{part}/bin")
+    and ((not cli_sys.is_file(plan)) or cli_memo_place.copied(plan, "#{part}/plan"))
     and write_file("#{part}/meta", "#{FORMAT}\n#{cli_sys.size(out)}\n#{cli_sys.size(plan)}\n#{if degraded { 1 } else { 0 }}\n").is_ok()
   if not (staged and file_rename(part, entry).is_ok()) {
     let _ = cli_sys.remove_tree(part)
@@ -179,7 +177,7 @@ fn keep(entry: String, out: String, degraded: Bool) : Unit / File + Ffi {
 # The least recently used entries past `KEEP` go.
 fn evict(dir: String) : Unit / File + Ffi {
   let used = dir_list_dir(dir)
-    |? (e => not string.ends_with(e, ".part"))
+    |? (e => e != "toolchain" and not string.ends_with(e, ".part"))
     | (e => (cli_sys.mtime("#{dir}/#{e}/meta"), e))
     |> list.sort_by((a, b) => cmp(a.fst, b.fst))
   list.take(used, list.length(used) - KEEP) |> foreach(u => {
@@ -187,7 +185,3 @@ fn evict(dir: String) : Unit / File + Ffi {
   })
 }
 
-fn copied(from: String, to: String) : Bool / Ffi = run(["cp", from, to])
-
-fn run(argv: [String]) : Bool / Ffi =
-  cli_proc.run(argv, cli_proc.Spawn { ...cli_proc.inherit(), out: "/dev/null", err: "/dev/null" }) == 0
