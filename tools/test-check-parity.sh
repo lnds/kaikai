@@ -6,7 +6,12 @@
 # exit code and byte-identical stderr. This script proves it over the
 # whole compile-time negative corpus: for every fixture under
 # examples/negative/** it runs kaic2 twice — build mode and --check —
-# and diffs the two stderr streams.
+# and diffs the two stderr streams. The --check run is `--diags-json`
+# (the same front-end, plus the JSON document on stdout carrying the
+# exit status), so the same run also feeds tools/diags-json-parity.py:
+# the errors the document reports must be the ones stderr prints.
+# The programs in ACCEPTS build cleanly, so their --diags-json run must
+# print no error and report status 0.
 #
 # Fixtures whose error only surfaces in a backend (subset gaps) are
 # out of --check's scope by design: build rejects, --check accepts. Those live in
@@ -36,6 +41,15 @@ KAIC2="$ROOT/stage2/kaic2"
 # this gate must exercise.
 EDITION_FLAG="--edition $(cat "$ROOT/EDITION")"
 SKIPS="$ROOT/tools/check-parity-skips.txt"
+ACCEPTS="
+examples/actors/dual_actor_request_reply.kai
+examples/diags_json/main_stdout_row.kai
+examples/effects/alias_inline_row.kai
+examples/effects/default_block_full_user_handle.kai
+examples/modules/export_derived_record/main.kai
+examples/protocols/default_basic.kai
+examples/protocols/free_fn_bound_satisfied.kai
+"
 
 if [ ! -x "$KAIC2" ]; then
   echo "test-check-parity FAIL — stage2/kaic2 not built (run 'make kaic2' first)"
@@ -73,9 +87,19 @@ run_one() {
   rc_build=0
   # shellcheck disable=SC2086 — extra_flags is intentionally word-split.
   "$KAIC2" $EDITION_FLAG $extra_flags "$src" > /dev/null 2> "$tmp/$key.build.err" || rc_build=$?
-  rc_check=0
+  rc_dj=0
   # shellcheck disable=SC2086
-  "$KAIC2" $EDITION_FLAG $extra_flags --check "$src" > /dev/null 2> "$tmp/$key.check.err" || rc_check=$?
+  "$KAIC2" $EDITION_FLAG $extra_flags --diags-json "$src" > "$tmp/$key.dj" 2> "$tmp/$key.check.err" || rc_dj=$?
+  if [ "$rc_dj" -ne 0 ]; then
+    echo "DIFF $rel — --diags-json exit $rc_dj (expected a document and exit 0)"
+    return
+  fi
+  rc_check=$(grep -o '"status": [0-9]*' "$tmp/$key.dj" | head -1 | cut -d' ' -f2)
+  if [ -z "$rc_check" ]; then
+    echo "DIFF $rel — --diags-json printed no document"
+    return
+  fi
+  echo "DJ $rel $tmp/$key.check.err $tmp/$key.dj"
 
   if reason=$(skip_reason "$rel"); then
     if [ "$rc_build" -ne 0 ] && [ "$rc_check" -eq 0 ]; then
@@ -98,9 +122,25 @@ run_one() {
   echo "PASS $rel"
 }
 
+# An accepting program: --diags-json prints no error and reports status 0.
+accept_one() {
+  rel="$1"
+  key="$2/accept_$(echo "$rel" | tr '/' '_')"
+  # shellcheck disable=SC2086 — EDITION_FLAG is intentionally word-split.
+  "$KAIC2" $EDITION_FLAG --path "$ROOT/stdlib" --diags-json "$ROOT/$rel" > "$key.dj" 2> "$key.err" || true
+  errs=$(grep -c 'error: ' "$key.err" || true)
+  status=$(grep -o '"status": [0-9]*' "$key.dj" | cut -d' ' -f2)
+  if [ "$errs" = "0" ] && [ "$status" = "0" ]; then echo "ACCEPT $rel"
+  else echo "REJECT $rel — --diags-json printed $errs error(s), status ${status:-none}"; fi
+}
+
 # ---- worker mode -----------------------------------------------------
 if [ "${1:-}" = "__worker" ]; then
   run_one "$3" "$2"
+  exit 0
+fi
+if [ "${1:-}" = "__accept" ]; then
+  accept_one "$3" "$2"
   exit 0
 fi
 
@@ -120,16 +160,25 @@ find "$ROOT/examples/negative" \
   | xargs -0 -P "$JOBS" -n1 "$self" __worker "$tmp" \
   > "$results"
 
-cat "$results"
+# shellcheck disable=SC2086 — ACCEPTS is intentionally word-split.
+printf '%s\n' $ACCEPTS | xargs -P "$JOBS" -n1 "$self" __accept "$tmp" >> "$results"
+
+grep -v '^DJ ' "$results" || true
 
 pass=$(grep -c '^PASS ' "$results" 2>/dev/null || true)
 skip=$(grep -c '^SKIP ' "$results" 2>/dev/null || true)
 diffs=$(grep -c '^DIFF ' "$results" 2>/dev/null || true)
 stale=$(grep -c '^STALE ' "$results" 2>/dev/null || true)
+rejects=$(grep -c '^REJECT ' "$results" 2>/dev/null || true)
 
 echo
-echo "test-check-parity summary: $pass PASS, $skip SKIP, $diffs DIFF, $stale STALE"
+accepts=$(grep -c '^ACCEPT ' "$results" 2>/dev/null || true)
+echo "test-check-parity summary: $pass PASS, $skip SKIP, $diffs DIFF, $stale STALE, $accepts ACCEPT, $rejects REJECT"
 
-if [ "$diffs" -ne 0 ] || [ "$stale" -ne 0 ]; then
+dj=0
+grep '^DJ ' "$results" | cut -d' ' -f2- > "$tmp/dj-manifest"
+python3 "$ROOT/tools/diags-json-parity.py" "$tmp/dj-manifest" "$ROOT/tools/diags-json-parity-baseline.txt" || dj=1
+
+if [ "$diffs" -ne 0 ] || [ "$stale" -ne 0 ] || [ "$dj" -ne 0 ] || [ "$rejects" -ne 0 ]; then
   exit 1
 fi

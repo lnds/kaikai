@@ -13,6 +13,7 @@
 import compiler.util
 import compiler.chars
 import compiler.diag
+import compiler.verdicts
 import compiler.kinds
 import compiler.kind_theory
 import compiler.kind_validate
@@ -131,9 +132,21 @@ fn wants_law_checks(m: Mode) : Bool = match m {
 # before monomorphisation, so diagnostics are identical to a build's
 # front-end by construction.
 fn is_check_mode(m: Mode) : Bool = match m {
-  MCheck -> true
-  _      -> false
+  MCheck     -> true
+  MDiagsJson -> true
+  _          -> false
 }
+
+# `--diags-json` names the file its document reports on.
+fn diags_json_file(m: Mode, path: String) : Option[String] = match m {
+  MDiagsJson -> Some(path)
+  _          -> None
+}
+
+# A stage that stops before the resolver exits with its count alone, so
+# under `--diags-json` its document is printed here.
+fn close_front(m: Mode, path: String, rc: Int) : Int / Console =
+  if rc == 0 { 0 } else { vd_exit(diags_json_file(m, path), [vd_count(rc)]) }
 
 # Hole/effect report modes ride the build arm's front-end for the same
 # reason --check does: the legacy infer_program entry carries no
@@ -196,29 +209,23 @@ fn dump_tokens(src: String, tokens: [Token]) : Unit / Console {
 # error scanning
 # ====================================================================
 
-fn report_one_error(path: String, src: String, t: Token, msg: String) : Unit / Console =
+# Every `TkError` token, reported to stderr in source order.
+fn lex_diags(path: String, src: String, ts: [Token]) : [Diagnostic] / Console = lex_diags_loop(path, src, ts, [])
 
-  diag_error_from_src(path, src, t.line, t.col, msg)
-
-fn report_errors_loop(path: String, src: String, ts: [Token], count: Int) : Int / Console {
-
-  match ts {
-    [] -> count
-    [t, ...rest] -> match t.kind {
-      TkError(msg) -> {
-        report_one_error(path, src, t, msg)
-        report_errors_loop(path, src, rest, count + 1)
-      }
-      _ -> report_errors_loop(path, src, rest, count)
+fn lex_diags_loop(path: String, src: String, ts: [Token], acc: [Diagnostic]) : [Diagnostic] / Console = match ts {
+  [] -> finalize_diags(acc)
+  [t, ...rest] -> match t.kind {
+    TkError(msg) -> {
+      diag_error_from_src(path, src, t.line, t.col, msg)
+      lex_diags_loop(path, src, rest, push_diag(acc, mk_diag(SevError, path, t.line, t.col, msg, [])))
     }
+    _ -> lex_diags_loop(path, src, rest, acc)
   }
 }
 
 # Returns 0 on success, 1 if any TkError tokens appeared (all reported to stderr).
-fn report_errors(path: String, src: String, tokens: [Token]) : Int / Console {
-
-  if report_errors_loop(path, src, tokens, 0) > 0 { 1 } else { 0 }
-}
+fn report_errors(path: String, src: String, tokens: [Token]) : Int / Console =
+  if list_is_empty(lex_diags(path, src, tokens)) { 0 } else { 1 }
 
 # ====================================================================
 # AST dumper (for --ast)
@@ -3939,39 +3946,6 @@ fn compile_to_module(file: String, decls: [Decl]) : TypedModule / Console + File
   TypedModule { tm_file: file, tm_decls: r.decls }
 }
 
-# Collected structured diagnostics for library / LSP consumers. The
-# pair carries the same TypedModule produced by `compile_to_module`
-# plus a flat `[Diagnostic]` covering these templates:
-#   - type mismatch in function call (callee notes)
-#   - non-exhaustive match (sum / list / union component)
-#   - cannot find name in scope (did-you-mean)
-#   - wrong number of arguments
-#   - missing effect on the enclosing row
-#
-# Other diagnostics (monomorphisation invariants, row-label arity,
-# refinement violations, etc.) still print to stderr but are NOT
-# collected here.
-#
-# Order: source order at the per-decl level, with unbound-name
-# (Env-borne) diags prepended ahead of typer diags. Stable across runs.
-type ModuleWithDiags = { tm: TypedModule, diagnostics: [Diagnostic] }
-
-fn compile_to_module_with_diags(file: String, decls: [Decl]) : ModuleWithDiags / Console + File {
-
-  # Unbound-name diagnostics live on `Env` during the lexical-scope
-  # walk; run that pre-pass so they surface alongside the typer's.
-  let e0 = env_new(file)
-  let e1 = add_all(e0, core_names())
-  let e2 = register_decls(e1, decls, module_name_of_path(file))
-  let e3 = rds_env(chk_decls(e2, decls))
-  let t3_diags = finalize_diags(e3.diags)
-  let r = infer_program(file, decls, false)
-  ModuleWithDiags {
-    tm: TypedModule { tm_file: file, tm_decls: r.decls },
-    diagnostics: list_append(t3_diags, r.diags)
-  }
-}
-
 # ---------------- JSON serialization ----------------
 
 fn lib_json_pos(line: Int, col: Int) : String =
@@ -4406,57 +4380,6 @@ fn dump_library_mode(file: String, src: String, decls: [Decl]) : Int / Console +
   0
 }
 
-# Serialize a single Diagnostic to the LSP-style JSON shape.
-# Field order matches the schema documented near `type Diagnostic`.
-fn diag_to_json(d: Diagnostic) : String {
-  match d {
-    D(sev, file, line, col, msg, related) -> {
-      let rel_strs = map(related, related_to_json)
-      concat_all([
-        "{\"severity\": ", json_str(severity_to_string(sev)),
-        ", \"file\": ", json_str(file),
-        ", \"line\": ", int_to_string(line),
-        ", \"col\": ", int_to_string(col),
-        ", \"message\": ", json_str(msg),
-        ", \"related\": [", join_with(rel_strs, ", "), "]",
-        "}"
-      ])
-    }
-  }
-}
-
-fn related_to_json(r: RelatedInfo) : String {
-  match r {
-    DR(file, line, col, msg) ->
-      concat_all([
-        "{\"file\": ", json_str(file),
-        ", \"line\": ", int_to_string(line),
-        ", \"col\": ", int_to_string(col),
-        ", \"message\": ", json_str(msg),
-        "}"
-      ])
-  }
-}
-
-# `--diags-json` driver. Runs the same lex → parse → resolve → infer
-# pipeline as `dump_library_mode`, but exposes the collected
-# diagnostics as a JSON array. Returns 0 even when
-# diagnostics fired — the success of the driver is "produced JSON",
-# not "compiled cleanly". Fixtures still assert specific message
-# content against a golden.
-fn dump_diags_json(file: String, decls: [Decl]) : Int / Console + File {
-
-  let md = compile_to_module_with_diags(file, decls)
-  let entries = map(md.diagnostics, diag_to_json)
-  print(concat_all([
-    "{\"file\": ", json_str(file),
-    ", \"diagnostics\": [",
-    join_with(entries, ", "),
-    "]}"
-  ]))
-  0
-}
-
 # ============================================================
 
 # `kai migrate` body: rewrite the decls, re-emit through the fmt-
@@ -4686,7 +4609,9 @@ fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl],
 fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, core_decls: [Decl], core_mods: [ModuleEntry], core_segs: [CoreSegment], package_name: String, unstable_optins: [String], edition: String, user_cache: Bool, batch_out: Option[String], core_cache: CoreCacheOpt, test_roots: [String], test_plan: String) : Int / Console + File {
 
   let tokens = tokenize(src)
-  let lex_errs = report_errors(path, src, tokens)
+  let lexed = lex_diags(path, src, tokens)
+  let lex_errs = if list_is_empty(lexed) { 0 } else { 1 }
+  let json = diags_json_file(mode, path)
   match mode {
     MTokens -> {
       dump_tokens(src, tokens)
@@ -4695,11 +4620,11 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
     MHelp -> { usage(); 0 }
     MUsageError -> { usage(); 2 }
     _ -> {
-      if lex_errs != 0 { lex_errs }
+      if lex_errs != 0 { vd_exit(json, [Verdict(lex_errs, lexed)]) }
       else {
         let parsed = parse_program(path, src, tokens)
         match parsed.decls {
-          None -> 1
+          None -> vd_exit(json, [Verdict(1, parse_diags(parsed))])
           Some(own_decls) -> match mode {
             # `kai fmt`. Pretty-print right after parse, before any
             # desugaring runs, so the formatted output
@@ -5527,16 +5452,6 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 let all_decls = rd.decls
                 if chk != 0 { chk } else { dump_library_mode(path, src, all_decls) }
               }
-              MDiagsJson -> {
-                # Run lex → parse → resolve → infer with the diagnostic
-                # emit sites collecting structured diagnostics in
-                # parallel with their stderr output. Print the collected
-                # list as JSON for LSP-style consumers. Stderr is silenced
-                # so the JSON stream is the sole stdout content; the
-                # broken sources used by fixtures still produce useful
-                # diagnostics.
-                dump_diags_json(path, all_decls)
-              }
               MLint -> {
                 # Lints read the typed AST, so a clean typecheck is the
                 # precondition. A type-rejected program returns its error
@@ -5575,7 +5490,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # table, so dispatch compares identities of one origin.
                 let proto_reg = reg_with_target_ids(proto_reg,
                                   tsh_homes(all_decls, rd.tab, sym_views, target_mod_name))
-                if chk != 0 { chk }
+                if chk != 0 { vd_exit(json, [Verdict(chk, rd.diags)]) }
                 else {
                   # Build the per-compile head-owner cache once from the
                   # post-`expand_imports` decl stream + the
@@ -5638,7 +5553,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # but has no matching impl. Polymorphic helpers whose
                   # receiver is a TyVar at this point keep the runtime
                   # fallthrough behaviour.
-                  let dispatch_errs =
+                  let dispatch_diags =
                     validate_resolved_protocols(typed_prog, proto_reg, diag_ctx)
                   # Rep invariant verifier. Fails the compile when any
                   # of the three structural properties is violated. See
@@ -5650,7 +5565,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # pointer. Fail the compile if any region body can reach
                   # a suspending effect — the typed row already carries
                   # the transitive reach a syntactic scan would miss.
-                  let region_yield_errs = region_yield_findings(typed_prog.decls, region_marks, path)
+                  let region_yield_diags = region_yield_findings(typed_prog.decls, region_marks, path)
                   # #789 op-name collision diagnostic. The by-name handler
                   # walk binds the wrong evidence when an op name is shared
                   # by ≥2 effects and the call is not disambiguated; the
@@ -5673,20 +5588,18 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # Unused local bindings in the root file's fns and in every
                   # runner block; warnings only.
                   report_unused_in_decls(path, module_table, typed_prog.decls)
-                  if typed_prog.errs != 0 { typed_prog.errs }
-                  else if contract_errs != 0 { contract_errs }
-                  else if dispatch_errs != 0 { dispatch_errs }
-                  else if inv_errs != 0 { inv_errs }
-                  else if region_yield_errs != 0 { region_yield_errs }
-                  else if collision_errs != 0 { collision_errs }
-                  else if name_errs != 0 { name_errs }
+                  let typed_vds = [Verdict(typed_prog.errs, typed_prog.diags), vd_count(contract_errs),
+                                   vd_rendered(dispatch_diags), vd_count(inv_errs), vd_rendered(region_yield_diags),
+                                   vd_count(collision_errs), vd_count(name_errs)]
+                  if vd_failed(typed_vds) { vd_exit(json, typed_vds) }
                   else {
                     let hole_errs = if strict_holes { strict_holes_check(path, all_decls) } else { 0 }
-                    if hole_errs != 0 { hole_errs }
+                    if hole_errs != 0 { vd_exit(json, [...typed_vds, vd_count(hole_errs)]) }
                     else if is_check_mode(mode) {
-                      mono_front(typed_prog, proto_reg, post_local_arities,
+                      let mf = mono_front(typed_prog, proto_reg, post_local_arities,
                                  bounds_by_sym(typed_prog.decls, surface_fn_bounds, target_mod_name),
-                                 proto_ps, target_mod_name, path, diag_ctx, true).errs
+                                 proto_ps, target_mod_name, path, diag_ctx, true)
+                      vd_exit(json, [...typed_vds, mf.verdict])
                     }
                     else if is_report_mode(mode) { run_report_dump(mode, diag_ctx, pa_hidden_from_root(pa_segs, target_mod_name), typed_prog, docs.items) }
                     else {
@@ -5792,7 +5705,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       let perceus_decls = tcrec_rewrite_decls(post_perceus_decls, true, cons_ok, target_mod_name)
                       let use_purity = match mode { MDumpPurity -> true _ -> false }
                       let use_symids = match mode { MDumpSymIds -> true _ -> false }
-                      if mf.errs != 0 { mf.errs }
+                      if vd_failed([mf.verdict]) { vd_exit(None, [mf.verdict]) }
                       else if use_purity {
                         # Confirmed-purity side table over the same
                         # post-perceus / post-tcrec AST the backends stamp
@@ -6065,7 +5978,7 @@ pub fn run(opts: CliOptions) : Int / Console + File {
           None -> 1
           Some(pls) -> match pls {
             PLS(pds, pmods, psegs) -> match read_file(p) {
-              Ok(src) -> compile_source(p, opts.mode, opts.backend, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache, None, opts.core_cache, opts.test_roots, opts.test_plan)
+              Ok(src) -> close_front(opts.mode, p, compile_source(p, opts.mode, opts.backend, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache, None, opts.core_cache, opts.test_roots, opts.test_plan))
               Err(msg) -> { eprint("kaic2: #{p}: #{msg}"); 1 }
             }
           }

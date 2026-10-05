@@ -42,10 +42,13 @@ $ kai lsp        # block on stdio; reads JSON-RPC frames
   diagnostic carrying the inferred type — e.g.
   `unfilled hole ?conversion: expected Real<F>` — so editors can
   underline the `?` and agents can read the expected type without
-  shelling out. Only the T1–T5 *error* diagnostics migrated to the
-  structured collector are visible (~11 of 239 emit sites — the
-  rest still print to stderr). An empty array publishes on a clean
-  buffer so previous markers clear.
+  shelling out. `--diags-json` runs the same front-end as
+  `kai typecheck` and stops where it stops; a diagnostic reaches the
+  editor once the pass that raises it collects it (lexer, parser,
+  resolver, typer mismatches, post-typer and monomorphisation
+  checks). `tools/diags-json-parity-baseline.txt` lists the negative
+  fixtures whose errors still print to stderr only. An empty array
+  publishes on a clean buffer so previous markers clear.
 * **documentSymbol** walks the parser-level decls and emits the
   outline panel content. `DFn` (incl. lowered `const`),
   `DEffect`, `DProtocol`, `DUnit`, `DTest`, `DBench` are

@@ -1,6 +1,7 @@
 #[doc("The pinned-region gate: a `region { }` body may not reach a fiber suspension point. Errors when a region's body demands a suspending effect (Spawn/Actor/Cancel/Link/Monitor) directly or through a call, since an arena pointer that outlives a park would dangle after a migrating fiber resumes on another thread.")]
 
 import compiler.ast
+import compiler.diag
 import compiler.expr_positions
 import compiler.loop_lower
 import compiler.region
@@ -20,30 +21,30 @@ import compiler.util
 pub fn ry_suspending_effects() : [String] =
   ["Spawn", "Actor", "Cancel", "Link", "Monitor"]
 
-#[doc("Fail the compile for every `region { }` whose body can reach a fiber suspension point; returns the error count.")]
-pub fn region_yield_findings(decls: [Decl], regions: [RegionMark], file: String) : Int / Console =
-  ry_decls(decls, regions, file, 0)
+#[doc("Fail the compile for every `region { }` whose body can reach a fiber suspension point; returns the diagnostics, already printed.")]
+pub fn region_yield_findings(decls: [Decl], regions: [RegionMark], file: String) : [Diagnostic] / Console =
+  ry_decls(decls, regions, file, [])
 
-fn ry_decls(decls: [Decl], regions: [RegionMark], file: String, acc: Int) : Int / Console {
+fn ry_decls(decls: [Decl], regions: [RegionMark], file: String, acc: [Diagnostic]) : [Diagnostic] / Console {
   match decls {
     []           -> acc
-    [d, ...rest] -> ry_decls(rest, regions, file, acc + ry_decl(d, regions, file))
+    [d, ...rest] -> ry_decls(rest, regions, file, list_append(acc, ry_decl(d, regions, file)))
   }
 }
 
-fn ry_decl(d: Decl, regions: [RegionMark], file: String) : Int / Console {
+fn ry_decl(d: Decl, regions: [RegionMark], file: String) : [Diagnostic] / Console {
   match d {
     DFn(_, _, _, _, _, _, body, _, _, _, _) -> ry_sites(body, regions, file)
     DTest(_, body, _, _, _)                  -> ry_sites(body, regions, file)
     DBench(_, body, _, _, _)                 -> ry_sites(body, regions, file)
     DCheck(_, _, body, _, _, _)              -> ry_sites(body, regions, file)
-    DImpl(_, _, _, ms, _, _, _, _)              -> ry_decls(ms, regions, file, 0)
+    DImpl(_, _, _, ms, _, _, _, _)              -> ry_decls(ms, regions, file, [])
     DDerive(_, inner, _, _)               -> ry_decl(inner, regions, file)
     DUnstable(inner, _, _)                -> ry_decl(inner, regions, file)
     DProtoLaws(_, inner, _, _, _)            -> ry_decl(inner, regions, file)
     DImplAxiom(_, inner, _, _, _)            -> ry_decl(inner, regions, file)
     DConstructor(inner, _, _)             -> ry_decl(inner, regions, file)
-    _                                     -> 0
+    _                                     -> []
   }
 }
 
@@ -51,19 +52,19 @@ fn ry_decl(d: Decl, regions: [RegionMark], file: String) : Int / Console {
 # spawned closure or a loop body is still its own push/pop bracket and
 # must hold the invariant on its own. Each region found is checked
 # against its OWN body's suspending row.
-fn ry_sites(e: Expr, regions: [RegionMark], file: String) : Int / Console {
+fn ry_sites(e: Expr, regions: [RegionMark], file: String) : [Diagnostic] / Console {
   let here = match e.kind {
     EBlock(_, _) ->
-      if ry_pos_is_region(regions, e.line, e.col) { ry_check_region(e, file) } else { 0 }
-    _ -> 0
+      if ry_pos_is_region(regions, e.line, e.col) { ry_check_region(e, file) } else { [] }
+    _ -> []
   }
-  here + ry_sites_ps(xp_positions(e), regions, file)
+  list_append(here, ry_sites_ps(xp_positions(e), regions, file))
 }
 
-fn ry_sites_ps(ps: [XPos], regions: [RegionMark], file: String) : Int / Console {
+fn ry_sites_ps(ps: [XPos], regions: [RegionMark], file: String) : [Diagnostic] / Console {
   match ps {
-    []                  -> 0
-    [XP(_, x), ...rest] -> ry_sites(x, regions, file) + ry_sites_ps(rest, regions, file)
+    []                  -> []
+    [XP(_, x), ...rest] -> list_append(ry_sites(x, regions, file), ry_sites_ps(rest, regions, file))
   }
 }
 
@@ -82,15 +83,15 @@ fn ry_pos_is_region(ms: [RegionMark], line: Int, col: Int) : Bool {
 # A region body reaching a suspending op. The suspending effect is the
 # first one demanded (deterministic diagnostic); the whole set is what
 # the invariant forbids.
-fn ry_check_region(e: Expr, file: String) : Int / Console {
+fn ry_check_region(e: Expr, file: String) : [Diagnostic] / Console {
   match ry_first_suspend(ry_effects_in_expr(e, [])) {
     Some(eff) -> {
-      eprint(concat_all([file, ":", int_to_string(e.line), ":", int_to_string(e.col),
-        ": error: a `region { }` block may not reach a `", eff,
-        "` suspension point — a region never spans a yield (the pinned-region invariant), so an arena pointer would dangle after a migrating fiber resumes on another thread\n"]))
-      1
+      let msg = concat_all(["a `region { }` block may not reach a `", eff,
+        "` suspension point — a region never spans a yield (the pinned-region invariant), so an arena pointer would dangle after a migrating fiber resumes on another thread"])
+      eprint(concat_all([file, ":", int_to_string(e.line), ":", int_to_string(e.col), ": error: ", msg, "\n"]))
+      [mk_diag(SevError, file, e.line, e.col, msg, [])]
     }
-    None -> 0
+    None -> []
   }
 }
 

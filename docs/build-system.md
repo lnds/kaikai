@@ -30,7 +30,7 @@ Practical map of the build. Read this before running the compiler or touching a 
 
 A C-only `kaic2` prints `note: native backend unavailable … using the C backend` and falls back — harmless. Subcommands: `build`, `run`, `test`, `bench`, `check`, `typecheck`, plus `--holes-json` / `--diags-json` / `--effects-json` for structured output.
 
-`./bin/kai typecheck <file.kai>` is the fast edit-loop answer to "does this compile?": it runs the full front-end (resolve + infer + protocol/kind/effect checks) and monomorphisation, then stops — no codegen, no `cc`, no link, so it behaves identically on a C-only and a native `kaic2`. Diagnostics and exit code are identical to a build's, a bound violated at a concrete instantiation included (gate: `make test-check-parity`); errors that only surface in a backend subset gap are out of its scope by design, and the report flags stop before monomorphisation. The JSON report flags ride it (`kai typecheck f.kai --diags-json`).
+`./bin/kai typecheck <file.kai>` is the fast edit-loop answer to "does this compile?": it runs the full front-end (resolve + infer + protocol/kind/effect checks) and monomorphisation, then stops — no codegen, no `cc`, no link, so it behaves identically on a C-only and a native `kaic2`. Diagnostics and exit code are identical to a build's, a bound violated at a concrete instantiation included (gate: `make test-check-parity`); errors that only surface in a backend subset gap are out of its scope by design, and the other report flags stop before monomorphisation. The JSON report flags ride it; `kai typecheck f.kai --diags-json` reports the same run as JSON, gated against the negative corpus by `make test-check-parity` (`tools/diags-json-parity.py`).
 
 ### The kai binary (`tools/kai`)
 

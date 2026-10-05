@@ -64,12 +64,12 @@ import compiler.nest_limit
 # parser state
 # ====================================================================
 #
-# advanced and `had_error` possibly flipped. We don't carry a token
+# advanced and `error` possibly set. We don't carry a token
 # index — `rest` is the unconsumed suffix of the token list, so
 # p_advance is O(1) (takes tail). Peek-ahead uses list destructuring
 # up to depth 3, which covers every lookahead stage 0 does.
 
-pub type Parser = { file: String, src: String, rest: [Token], had_error: Bool,
+pub type Parser = { file: String, src: String, rest: [Token], error: Option[Diagnostic],
                 # Trailing lambdas attach to Calls, but the condition
                 # of `if` / `match` (and similar prefix constructs that
                 # take an Expr followed by a `{`-block) must not consume
@@ -95,7 +95,7 @@ pub type Parser = { file: String, src: String, rest: [Token], had_error: Bool,
                 depth: Int }
 
 # A result = a new parser plus an optional payload. `None` means the
-# parser failed (had_error is set on `p`). This mirrors stage 0's
+# parser failed (`error` is set on `p`). This mirrors stage 0's
 # error-then-stop style.
 
 type PExpr   = { p: Parser, r: Option[Expr] }
@@ -114,20 +114,37 @@ type PPF     = { p: Parser, r: Option[PField] }
 type PEL     = { p: Parser, r: Option[ListElem] }
 
 fn parser_new(file: String, src: String, toks: [Token]) : Parser =
-  Parser { file: file, src: src, rest: toks, had_error: false,
+  Parser { file: file, src: src, rest: toks, error: None,
            allow_trailing_lambda: true, allow_record_lit: true,
            kind_reg: prescan_kinds(src, toks), depth: 0 }
 
-fn p_mark_err(p: Parser) : Parser =
-  Parser { file: p.file, src: p.src, rest: p.rest, had_error: true,
+fn p_mark_err(p: Parser, d: Diagnostic) : Parser =
+  Parser { file: p.file, src: p.src, rest: p.rest, error: Some(d),
            allow_trailing_lambda: p.allow_trailing_lambda,
            allow_record_lit: p.allow_record_lit, kind_reg: p.kind_reg,
            depth: p.depth }
 
+fn p_failed(p: Parser) : Bool = match p.error {
+  Some(_) -> true
+  None    -> false
+}
+
+# Report a parse error at (line, col) and mark the parser failed with it.
+fn p_fail_at(p: Parser, line: Int, col: Int, msg: String) : Parser / Console = {
+  diag_error_from_src(p.file, p.src, line, col, msg)
+  p_mark_err(p, mk_diag(SevError, p.file, line, col, msg, []))
+}
+
+#[doc("The diagnostic a failed parse reported, if any.")]
+pub fn parse_diags(r: PParser) : [Diagnostic] = match r.p.error {
+  Some(d) -> [d]
+  None    -> []
+}
+
 fn p_advance(p: Parser) : Parser {
   match p.rest {
     [_, ...rest1] -> Parser { file: p.file, src: p.src, rest: rest1,
-                              had_error: p.had_error,
+                              error: p.error,
                               allow_trailing_lambda: p.allow_trailing_lambda,
                               allow_record_lit: p.allow_record_lit,
                               kind_reg: p.kind_reg, depth: p.depth }
@@ -278,7 +295,7 @@ fn p_skip_newlines(p: Parser) : Parser {
 # to restore the original flag value after the cond parses by
 # threading the flag back via `p_with_trailing_lambda(p, true)`.
 fn p_with_trailing_lambda(p: Parser, allow: Bool) : Parser {
-  Parser { file: p.file, src: p.src, rest: p.rest, had_error: p.had_error,
+  Parser { file: p.file, src: p.src, rest: p.rest, error: p.error,
            allow_trailing_lambda: allow, allow_record_lit: p.allow_record_lit,
            kind_reg: p.kind_reg, depth: p.depth }
 }
@@ -287,13 +304,13 @@ fn p_with_trailing_lambda(p: Parser, allow: Bool) : Parser {
 # Mirrors `p_with_trailing_lambda`: `if` / `match` disable it for the
 # cond, delimiters re-enable it for their interior.
 fn p_with_record_lit(p: Parser, allow: Bool) : Parser {
-  Parser { file: p.file, src: p.src, rest: p.rest, had_error: p.had_error,
+  Parser { file: p.file, src: p.src, rest: p.rest, error: p.error,
            allow_trailing_lambda: p.allow_trailing_lambda, allow_record_lit: allow,
            kind_reg: p.kind_reg, depth: p.depth }
 }
 
 fn p_at_depth(p: Parser, d: Int) : Parser {
-  Parser { file: p.file, src: p.src, rest: p.rest, had_error: p.had_error,
+  Parser { file: p.file, src: p.src, rest: p.rest, error: p.error,
            allow_trailing_lambda: p.allow_trailing_lambda,
            allow_record_lit: p.allow_record_lit, kind_reg: p.kind_reg, depth: d }
 }
@@ -314,15 +331,12 @@ fn p_skip_newlines_and_semis(p: Parser) : Parser {
 
 fn p_error(p: Parser, t: Token, msg: String) : Parser / Console {
 
-  if p.had_error { p }
-  else {
-    # An interpolation fragment is re-parsed by several consumers, and
-    # its span names no file the user wrote. `check_interp_parses`
-    # reports the failure once, against the real position.
-    if p.file == interp_parse_file() { () }
-    else { diag_error_from_src(p.file, p.src, t.line, t.col, msg) }
-    p_mark_err(p)
-  }
+  if p_failed(p) { p }
+  # An interpolation fragment is re-parsed by several consumers, and
+  # its span names no file the user wrote. `check_interp_parses`
+  # reports the failure once, against the real position.
+  else if p.file == interp_parse_file() { p_mark_err(p, mk_diag(SevError, p.file, t.line, t.col, msg, [])) }
+  else { p_fail_at(p, t.line, t.col, msg) }
 }
 
 fn p_error_here(p: Parser, msg: String) : Parser / Console = p_error(p, p_peek(p), msg)
@@ -3421,7 +3435,7 @@ fn parse_let(p: Parser, t: Token) : PStmt / Console {
         } else {
           PTy { p: pa, r: None }
         }
-      if ty_opt_r.p.had_error and not pa.had_error { err_s(ty_opt_r.p) }
+      if p_failed(ty_opt_r.p) and not p_failed(pa) { err_s(ty_opt_r.p) }
       else {
         let p_eq = p_skip_newlines(ty_opt_r.p)
         if not p_at(p_eq, TkEq) {
@@ -3465,7 +3479,7 @@ fn parse_var(p: Parser, t: Token) : PStmt / Console {
       } else {
         PTy { p: p2, r: None }
       }
-    if ty_opt_r.p.had_error and not p2.had_error { err_s(ty_opt_r.p) }
+    if p_failed(ty_opt_r.p) and not p_failed(p2) { err_s(ty_opt_r.p) }
     else {
       let p_eq = p_skip_newlines(ty_opt_r.p)
       if p_at(p_eq, TkEq) {
@@ -3886,7 +3900,7 @@ fn parse_arm(p: Parser) : PArm / Console {
       # the flag for the guard, restore for the body.
       let guard_opt_r = parse_arm_guard(p1, TkIf)
       match guard_opt_r.r {
-        None -> if guard_opt_r.p.had_error { err_a(guard_opt_r.p) } else {
+        None -> if p_failed(guard_opt_r.p) { err_a(guard_opt_r.p) } else {
           parse_arm_body(guard_opt_r.p, pat_eff, None)
         }
         Some(g) -> parse_arm_body(guard_opt_r.p, pat_eff, Some(g))
@@ -6076,7 +6090,7 @@ fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl / Console {
             } else {
               PTy { p: p3, r: None }
             }
-          if ret_r.p.had_error and not p3.had_error { err_d(ret_r.p) }
+          if p_failed(ret_r.p) and not p_failed(p3) { err_d(ret_r.p) }
           else {
             # Optional effect-row suffix: `T / Io + Fail`.
             let row_r = parse_row_suffix(ret_r.p)
@@ -6316,7 +6330,7 @@ fn contract_surface(body: Expr, reqs: [Expr], enss: [Expr], t: Token) : Expr {
 # If a contract predicate folds to `false` at parse time,
 # emit a compile-time error pointing at the clause keyword. The
 # contract list still accumulates the predicate so downstream stmts
-# parse cleanly; the parser's `had_error` flag aborts code emission
+# parse cleanly; the parser's `error` aborts code emission
 # at the end of the file, the same path as any other parse error.
 fn check_pred_not_false(p: Parser, pred: Expr, kind: String, kw: Token) : Parser / Console {
 
@@ -7033,9 +7047,8 @@ fn finish_doc_attr(p: Parser, raw: String, text: String, t: Token) : PDecl / Con
       None -> err_d(inner.p)
       Some(d) -> match d {
         DDoc(_, _, _, il, ic) -> {
-          diag_error_from_src(ph.file, ph.src, il, ic,
-            "duplicate `#[doc(...)]` on the same declaration — an item takes at most one doc attribute")
-          err_d(p_mark_err(inner.p))
+          err_d(p_fail_at(inner.p, il, ic,
+            "duplicate `#[doc(...)]` on the same declaration — an item takes at most one doc attribute"))
         }
         _ -> ok_d(inner.p, DDoc(raw, text, d, t.line, t.col))
       }
@@ -8059,10 +8072,10 @@ fn parse_program_loop(p: Parser, acc: [Decl], bacc: [FnBoundsRec]) : PParser / C
   if p_at(p0, TkEof) {
     # A parser that accumulated errors (e.g. via
     # check_pred_not_false in parse_contracts_loop) must not let
-    # the driver claim success. Surface had_error as `decls: None`
+    # the driver claim success. Surface the error as `decls: None`
     # so the entry point exits non-zero, even when every decl
     # parsed in shape.
-    if p0.had_error { PParser { p: p0, decls: None, fn_bounds: [] } }
+    if p_failed(p0) { PParser { p: p0, decls: None, fn_bounds: [] } }
     else { PParser { p: p0, decls: Some(list_reverse(acc)), fn_bounds: list_reverse(bacc) } }
   }
   else {
@@ -8095,10 +8108,7 @@ pub fn parse_program(file: String, src: String, toks: [Token]) : PParser / Conso
     None -> r
     Some(ds) -> match nest_first_over(ds) {
       None -> r
-      Some(e) -> {
-        diag_error_from_src(file, src, e.line, e.col, nest_msg())
-        PParser { p: p_mark_err(r.p), decls: None, fn_bounds: [] }
-      }
+      Some(e) -> PParser { p: p_fail_at(r.p, e.line, e.col, nest_msg()), decls: None, fn_bounds: [] }
     }
   }
 }
