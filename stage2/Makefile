@@ -13461,10 +13461,10 @@ test-user-cache: $(TARGET)
 # smoke test. The kaic2 binary must be built first because the fixtures
 # invoke bin/kai (which uses it) and kaic2 directly.
 # Pruning reaches a protocol through its operations' names; this calls
-# every operation the core prelude declares, generated from the protocol
+# every operation the core declares, generated from the protocol
 # declarations, and checks each builds pruned whenever it builds whole.
-test-prelude-ops: $(TARGET)
-	@../tools/prelude-ops-gate.sh
+test-core-ops: $(TARGET)
+	@../tools/core-ops-gate.sh
 
 test-core-cache: $(TARGET)
 	@set -e; \

@@ -1,18 +1,18 @@
 #!/bin/bash
-# Prelude protocol-operation gate. Pruning reaches a protocol through the
+# Core protocol-operation gate. Pruning reaches a protocol through the
 # names of its operations; one missed operation drops the impls a call
-# needs. For every operation of every protocol the core prelude declares,
+# needs. For every operation of every protocol the core declares,
 # generated from those declarations, a program calls it directly on a
 # primitive that has an impl, and must build and run with pruning on
-# whenever it builds with the whole prelude.
+# whenever it builds with the whole core.
 
 set -u
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 KAIC2="$ROOT/stage2/kaic2"
-WORK="$ROOT/stage2/build/prelude-ops"
+WORK="$ROOT/stage2/build/core-ops"
 EDITION="$(cat "$ROOT/EDITION")"
-[ -x "$KAIC2" ] || { echo "prelude-ops: SKIP — no stage2/kaic2"; exit 0; }
+[ -x "$KAIC2" ] || { echo "core-ops: SKIP — no stage2/kaic2"; exit 0; }
 rm -rf "$WORK"; mkdir -p "$WORK"
 
 printf 'fn main() : Int = 0\n' > "$WORK/probe.kai"
@@ -55,8 +55,8 @@ pass=0; skip=0; fail=0
 check() { # $1 label, $2 callee, $3 primitive, $4 result type, $5 arguments
   local dir="$WORK/$1"; mkdir -p "$dir"
   printf 'fn main() : Unit / Stdout = {\n  let _v : %s = %s(%s)\n  Stdout.print("ok")\n}\n' "$4" "$2" "$5" > "$dir/main.kai"
-  if ! (cd "$dir" && "$KAIC2" --edition "$EDITION" --full-prelude main.kai > full.c 2> full.err); then
-    echo "  skip $1 on $3 — does not build with the whole prelude"; skip=$((skip+1)); return
+  if ! (cd "$dir" && "$KAIC2" --edition "$EDITION" --full-core main.kai > full.c 2> full.err); then
+    echo "  skip $1 on $3 — does not build with the whole core"; skip=$((skip+1)); return
   fi
   if ! (cd "$dir" && "$KAIC2" --edition "$EDITION" main.kai > main.c 2> main.err); then
     echo "  FAIL $1 on $3 — builds whole, not pruned:"; sed 's/^/    /' "$dir/main.err" | head -5
@@ -84,6 +84,6 @@ while IFS='|' read -r proto op params ret; do
 done < "$WORK/ops"
 
 total="$(wc -l < "$WORK/ops" | tr -d ' ')"
-[ "$total" -gt 0 ] || { echo "prelude-ops: FAIL — no protocol operation found in the core prelude"; exit 1; }
-[ "$fail" -eq 0 ] || { echo "prelude-ops: FAIL — $fail of $total operations"; exit 1; }
-echo "prelude-ops OK — $pass of $total operations built pruned and ran; $skip skipped"
+[ "$total" -gt 0 ] || { echo "core-ops: FAIL — no protocol operation found in the core"; exit 1; }
+[ "$fail" -eq 0 ] || { echo "core-ops: FAIL — $fail of $total operations"; exit 1; }
+echo "core-ops OK — $pass of $total operations built pruned and ran; $skip skipped"
