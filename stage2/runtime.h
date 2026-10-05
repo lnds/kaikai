@@ -18312,14 +18312,9 @@ static void kai_monitor_watch(KaiValue *target_pid) {
 static KaiValue *kai_default_monitor_monitor(void *self, KaiValue *target, KaiCont *k) {
     (void) self;
     if (target && target->tag == KAI_PID) kai_monitor_watch(target);
-    /* v1 simplification — return the same Pid as the ref. The
-     * spec's `MonitorRef` is opaque; identifying the monitored
-     * fiber by its own pid is sufficient for demonitor and for the
-     * fixture-level "which fiber died" pattern. The user-facing
-     * type alias `MonitorRef = Pid[Nothing]` is pinned in
-     * docs/actors.md §*Monitors — unidirectional* (v1 simplification).
-     */
-    return kai_cont_resume(k, target);
+    /* The ref is the monitored pid itself. The shim releases `target`
+     * once this returns, so the ref carries its own reference. */
+    return kai_cont_resume(k, kai_incref(target));
 }
 
 static KaiValue *kai_default_monitor_demonitor(void *self, KaiValue *ref, KaiCont *k) {
