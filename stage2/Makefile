@@ -13499,7 +13499,7 @@ test-user-cache: $(TARGET)
 test-core-ops: $(TARGET)
 	@../tools/core-ops-gate.sh
 
-test-core-cache: $(TARGET)
+test-core-cache: $(TARGET) bin-kai
 	@set -e; \
 	for f in ../examples/cache/corec_*.sh ../examples/cache/emitc_*.sh ../examples/cache/wrapper_*.sh ../examples/cache/ncoreobj_*.sh ../examples/cache/nmodular_*.sh; do \
 	  sh "$$f" || { echo "core-cache FAIL: $$f"; exit 1; }; \

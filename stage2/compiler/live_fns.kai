@@ -1,0 +1,109 @@
+# compiler/live_fns.kai -- the functions a typed program can run.
+#
+# A function runs when a decl that is not a function names it (the tests,
+# constants and effect default handlers), when `main` does, or when a
+# running function does. A dispatcher picks an impl at run time, so one
+# that runs reaches every impl of an operation of its name. The answer
+# reads only the bodies of functions that run, so a build that lowered the
+# whole core and one that lowered only what the program reaches agree.
+
+import compiler.util
+import compiler.ast
+import compiler.expr_positions
+import compiler.infer_index
+import compiler.emit_shared
+import compiler.core_reach
+import compiler.fnreg
+
+#[doc("The decls of `decls` that can run: every decl that is not a function, `main`, and each function they name, transitively.")]
+pub fn live_decls(decls: [Decl]) : [Decl] = {
+  let fns = filter(decls, lf_is_fn)
+  let st0 = LfSt { live: idx_empty(), fns: lf_index(fns, idx_empty()), impls: lf_impls(fns, idx_empty()), work: [] }
+  let st = lf_drain(lf_decls(filter(decls, (d) => not lf_is_fn(d)), lf_ref(st0, "main")))
+  filter(decls, (d) => not lf_is_fn(d) or lf_in(st.live, lf_name(d)))
+}
+
+type LfSt = { live: NameIndex[String], fns: NameIndex[Decl], impls: NameIndex[LfImpl], work: [Decl] }
+
+# An impl's name, filed under one tail of it.
+type LfImpl = LfImpl(String, String)
+
+fn lf_is_fn(d: Decl) : Bool = match d {
+  DFn(_, _, _, _, _, _, _, _, _, _, _) -> true
+  _ -> false
+}
+
+fn lf_name(d: Decl) : String = match d {
+  DFn(_, n, _, _, _, _, _, _, _, _, _) -> n
+  _ -> ""
+}
+
+fn lf_index(fns: [Decl], ix: NameIndex[Decl]) : NameIndex[Decl] = match fns {
+  [] -> ix
+  [d, ...rest] -> lf_index(rest, idx_prepend(ix, lf_name(d), d))
+}
+
+# Each impl `__pimpl_<P>_<T>_<op>` under every tail of its name that
+# follows an underscore, so an operation name finds it.
+fn lf_impls(fns: [Decl], ix: NameIndex[LfImpl]) : NameIndex[LfImpl] = match fns {
+  [] -> ix
+  [d, ...rest] -> {
+    let n = lf_name(d)
+    let p = "__pimpl_"
+    lf_impls(rest, if string_starts_with_q(n, p) { lf_tails(n, string_length(p), ix) } else { ix })
+  }
+}
+
+fn lf_tails(n: String, i: Int, ix: NameIndex[LfImpl]) : NameIndex[LfImpl] =
+  if i >= string_length(n) { ix }
+  else if string_byte_at_int(n, i) == 95 {
+    let tail = string_slice(n, i + 1, string_length(n) - i - 1)
+    lf_tails(n, i + 1, idx_prepend(ix, tail, LfImpl(tail, n)))
+  } else { lf_tails(n, i + 1, ix) }
+
+fn lf_in(ix: NameIndex[String], n: String) : Bool = list_has(idx_chain(ix, n), n)
+
+fn lf_ref(st: LfSt, n: String) : LfSt =
+  if lf_in(st.live, n) { st }
+  else {
+    LfSt { ...st, live: idx_prepend(st.live, n, n),
+                  work: list_append(filter(idx_chain(st.fns, n), (d) => lf_name(d) == n), st.work) }
+  }
+
+fn lf_op(st: LfSt, op: String) : LfSt = lf_impl_refs(st, op, idx_chain(st.impls, op))
+
+# Buckets are keyed by hash, so each entry re-tests the tail.
+fn lf_impl_refs(st: LfSt, op: String, xs: [LfImpl]) : LfSt = match xs {
+  [] -> st
+  [LfImpl(tail, n), ...rest] -> lf_impl_refs(if tail == op { lf_ref(st, n) } else { st }, op, rest)
+}
+
+fn lf_drain(st: LfSt) : LfSt = match st.work {
+  [] -> st
+  [d, ...rest] -> lf_drain(lf_decls([d], LfSt { ...st, work: rest }))
+}
+
+fn lf_decls(ds: [Decl], st: LfSt) : LfSt = match ds {
+  [] -> st
+  [d, ...rest] -> lf_decls(rest, lf_exprs(cr_decl_exprs(d), st))
+}
+
+fn lf_exprs(es: [Expr], st: LfSt) : LfSt = match es {
+  [] -> st
+  [e, ...rest] -> lf_exprs(rest, lf_expr(e, st))
+}
+
+fn lf_expr(e: Expr, st: LfSt) : LfSt = match e.kind {
+  EVar(n)        -> lf_ref(st, n)
+  ESym(_, _, n)  -> lf_ref(st, n)
+  EModCall(_, n) -> lf_ref(st, n)
+  ETodo(_)       ->
+    if proto_dispatch_marker_in(e) { match proto_dispatch_parts(e) { PDP(_, op) -> lf_op(st, op) } }
+    else { st }
+  _ -> lf_positions(xp_positions(e), st)
+}
+
+fn lf_positions(ps: [XPos], st: LfSt) : LfSt = match ps {
+  [] -> st
+  [XP(_, x), ...rest] -> lf_positions(rest, lf_expr(x, st))
+}
