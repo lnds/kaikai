@@ -1,0 +1,106 @@
+# compiler/ncore_index.kai -- finds the cached native core object before
+# the core is typed.
+#
+# The object's key hashes the core's KIR, which exists only after typing
+# the whole core. Every other input of that key, plus the compiler
+# arguments and the `KAI_*` environment, forms a pre-key; a full compile
+# records which object its pre-key produced. The record is trusted only
+# while the core's KIR does not depend on the program, so a full compile
+# that finds a different object under the same pre-key marks the pre-key
+# as conflicting, and no build prunes under it again.
+
+import compiler.util
+import compiler.user_cache
+import compiler.fnreg
+
+#[doc("The compiler arguments and `KAI_*` environment a cached core object may depend on, as one canonical string. Arguments that only locate inputs or caches are left out; `input` is the source path.")]
+pub fn ncore_build_inputs(argv: [String], env: [Pair[String, String]], input: String) : String =
+  concat_all([string_join(ni_args(argv, input, []), "\n"), "\n--\n",
+              string_join(ni_sort(ni_kai_vars(env, [])), "\n")])
+
+#[doc("The pre-key of the core object built under these inputs: every input of the object's key except its KIR, plus `inputs` from `ncore_build_inputs`.")]
+pub fn ncore_pre_key(toolchain: String, edition: String, tag: String, srcs_hex: String,
+                     inputs: String) : String =
+  uc_content_hex(concat_all(["NCP1\n", toolchain, "\n", edition, "\n", tag, "\n", srcs_hex, "\n", inputs]))
+
+#[doc("The core object recorded under `pre` in `dir`, when the record exists, is not conflicting, and the object is still there.")]
+pub fn ncore_index_lookup(dir: String, pre: String) : Option[String] / File =
+  match read_file(ni_path(dir, pre)) {
+    Err(_) -> None
+    Ok(obj) ->
+      if obj == ni_conflict() { None }
+      else { match read_file(obj) { Ok(_) -> Some(obj)  Err(_) -> None } }
+  }
+
+#[doc("Record that a full compile under `pre` produced `obj`; an empty `pre` records nothing. A record naming a different object marks `pre` as conflicting instead.")]
+pub fn ncore_index_record(dir: String, pre: String, obj: String, stats: Bool) : Unit / Console + File =
+  if pre == "" { () } else { match read_file(ni_path(dir, pre)) {
+    Ok(prev) ->
+      if prev == obj or prev == ni_conflict() { () }
+      else {
+        let _s = if stats { eprint("kaic2: native-core-index: conflict, pruning disabled for these inputs") } else { () }
+        cache_publish(ni_path(dir, pre), ni_conflict())
+      }
+    Err(_) -> cache_publish(ni_path(dir, pre), obj)
+  } }
+
+fn ni_path(dir: String, pre: String) : String = concat_all([dir, "/ncore-pre-", pre])
+
+fn ni_conflict() : String = "conflict"
+
+# Flags whose value only locates sources or caches.
+fn ni_skips_value(a: String) : Bool =
+  a == "--path" or a == "--core-cache-dir" or a == "--toolchain-id" or a == "--user-cache-dir"
+
+fn ni_skips_flag(a: String) : Bool = a == "--core-cache-stats" or a == "--user-cache"
+
+fn ni_args(argv: [String], input: String, acc: [String]) : [String] = match argv {
+  [] -> list_reverse(acc)
+  [a, ...rest] ->
+    if ni_skips_value(a) { ni_args(list_drop1(rest), input, acc) }
+    else if ni_skips_flag(a) or a == input { ni_args(rest, input, acc) }
+    else { ni_args(rest, input, [a, ...acc]) }
+}
+
+fn list_drop1(xs: [String]) : [String] = match xs {
+  [] -> []
+  [_, ...rest] -> rest
+}
+
+fn ni_kai_vars(env: [Pair[String, String]], acc: [String]) : [String] = {
+  let debug = ni_debug(env)
+  ni_kai_vars_loop(env, debug, acc)
+}
+
+fn ni_kai_vars_loop(env: [Pair[String, String]], debug: Bool, acc: [String]) : [String] = match env {
+  [] -> acc
+  [p, ...rest] ->
+    ni_kai_vars_loop(rest, debug,
+                     if ni_shapes_object(p.fst, debug) { [concat_all([p.fst, "=", p.snd]), ...acc] } else { acc })
+}
+
+# Every `KAI_*` variable counts except those the emitter never reads: the
+# test and bench knobs reach only the built program's runtime, and the
+# source path for debug info is read only in a debug build. A variable
+# wrongly counted costs a cache miss, one wrongly left out a wrong object.
+fn ni_shapes_object(name: String, debug: Bool) : Bool =
+  string_starts_with_q(name, "KAI_")
+    and not string_starts_with_q(name, "KAI_TEST_")
+    and not string_starts_with_q(name, "KAI_BENCH_")
+    and (debug or name != "KAI_DEBUG_SRC")
+
+fn ni_debug(env: [Pair[String, String]]) : Bool = match env {
+  [] -> false
+  [p, ...rest] -> (p.fst == "KAI_BUILD_MODE" and p.snd == "debug") or ni_debug(rest)
+}
+
+# Insertion sort: the `KAI_*` variables of one process are a handful.
+fn ni_sort(xs: [String]) : [String] = match xs {
+  [] -> []
+  [h, ...rest] -> ni_insert(h, ni_sort(rest))
+}
+
+fn ni_insert(x: String, sorted: [String]) : [String] = match sorted {
+  [] -> [x]
+  [h, ...rest] -> if string_lt(x, h) { [x, h, ...rest] } else { [h, ...ni_insert(x, rest)] }
+}

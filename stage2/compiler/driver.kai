@@ -116,6 +116,7 @@ import compiler.emit_native_modular
 import compiler.lint
 import compiler.law_checks
 import compiler.core_reach
+import compiler.ncore_index
 
 
 # ====================================================================
@@ -1691,12 +1692,14 @@ pub type Backend = BkC | BkNative | BkCModular | BkNativeModular
 # derivation, which is correct whenever the entry is compiled in place.
 # `nmod_dir` holds the native-modular partition objects; empty puts them
 # next to the entry. `full_core` keeps the core functions the program
-# cannot reach.
+# cannot reach. `inputs` are the arguments and environment a cached native
+# core object may depend on (`ncore_build_inputs`).
 pub type CoreCacheOpt = { dir: String, toolchain: String, stats: Bool, proj_dir: String, nmod_dir: String,
-                           full_core: Bool }
+                           full_core: Bool, inputs: String }
 
 fn cc_opt_off() : CoreCacheOpt =
-  CoreCacheOpt { dir: "", toolchain: "", stats: false, proj_dir: "", nmod_dir: "", full_core: false }
+  CoreCacheOpt { dir: "", toolchain: "", stats: false, proj_dir: "", nmod_dir: "", full_core: false,
+                 inputs: "" }
 
 pub type CliOptions = { mode: Mode, backend: Backend, path: Option[String], cores: [String],
                     core_caches: [String], cache_sha: String,
@@ -2137,6 +2140,11 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
     }
   }
 }
+
+#[doc("Record the arguments and `KAI_*` environment this run was started with, which a cached native core object is keyed by before typing.")]
+pub fn with_build_inputs(opts: CliOptions, argv: [String], env: [Pair[String, String]]) : CliOptions =
+  cli_with_cc_opt(opts, CoreCacheOpt { ...opts.core_cache,
+    inputs: ncore_build_inputs(argv, env, match opts.path { Some(p) -> p  None -> "" }) })
 
 #[doc("Parse argv into CliOptions: mode, path, cores, search paths, edition, and feature flags. Driver entry point called by fn main().")]
 pub fn parse_cli(argv: [String]) : CliOptions / Console {
@@ -4496,7 +4504,7 @@ fn lint_owned_mods(expanded: ExpandedProgram) : [String] =
 
 # Pruning makes the core program-dependent, so it runs only where the
 # compile writes no cache entry keyed without the program.
-fn core_prunes(mode: Mode, backend: Backend, cc: CoreCacheOpt) : Bool = {
+fn core_prunes(mode: Mode, backend: Backend, cc: CoreCacheOpt, core_hit: Option[String]) : Bool = {
   let emits = match mode {
     MDefault   -> true
     MTest      -> true
@@ -4505,7 +4513,8 @@ fn core_prunes(mode: Mode, backend: Backend, cc: CoreCacheOpt) : Bool = {
     MBatchList -> true
     _          -> false
   }
-  emits and not cc.full_core and not core_cache_writes(backend, cc)
+  emits and not cc.full_core
+    and (not core_cache_writes(backend, cc) or core_hit_reusable(backend, core_hit))
 }
 
 # Whether this compile writes a core artifact keyed by the core sources and
@@ -4515,11 +4524,11 @@ fn core_prunes(mode: Mode, backend: Backend, cc: CoreCacheOpt) : Bool = {
 # not one: its blobs are keyed by the decls each module was typed with, so
 # a pruned module publishes under its own key.
 fn core_cache_writes(backend: Backend, cc: CoreCacheOpt) : Bool = match backend {
-    BkC             -> false
-    BkNative        -> native_core_cached(cc)
-    BkCModular      -> true
-    BkNativeModular -> true
-  }
+  BkC             -> false
+  BkNative        -> native_core_cached(cc)
+  BkCModular      -> true
+  BkNativeModular -> true
+}
 
 # The directory the typed cut publishes module blobs into; empty when the
 # cut is off. Builds ride the project cache only; the front-end-only modes
@@ -4534,6 +4543,51 @@ fn prune_note(stats: Bool, prunes: Bool, cut: CoreCut) : Unit / Console =
   else if not prunes { eprint("kaic2: core-prune: off") }
   else { match cut { CoreCut(_, d) -> eprint("kaic2: core-prune: dropped #{list_length(d)} core functions") } }
 
+# A native build whose core object the cache already holds writes nothing.
+fn core_hit_reusable(backend: Backend, core_hit: Option[String]) : Bool = match backend {
+  BkNative -> is_some(core_hit)
+  _        -> false
+}
+
+# The joined core source hashes the native core object is keyed by; empty
+# when that cache is not in play.
+fn native_core_srcs(backend: Backend, cc: CoreCacheOpt, core_names: [String]) : String / Console + File =
+  match backend {
+    BkNative ->
+      if native_core_cached(cc) and list_length(core_names) > 0 {
+        match core_src_hexes(core_module_paths(), []) {
+          None -> ""
+          Some(hx) -> string_join(hx, "\n")
+        }
+      } else { "" }
+    _ -> ""
+  }
+
+fn native_core_pre(cc: CoreCacheOpt, edition: String, srcs: String) : String =
+  if srcs == "" { "" } else { ncore_pre_key(cc.toolchain, edition, llvm_backend_tag(), srcs, cc.inputs) }
+
+# The single-TU native emit: link a core object the cache holds, emit and
+# cache the core object, or emit the whole program as one object. Prints
+# one object path per line for the wrapper to link.
+fn native_single_emit(kp: KProgram, decls: [Decl], vs: [VariantEntry], fns: [EFn], bmode: BuildMode,
+                      obj: String, path: String, core_names: [String], reuse: Option[String],
+                      cfg: NCoreCfg) : Int / Console + File = match reuse {
+  Some(co) -> print_objects(build_native_core_reuse(kp, decls, vs, fns, bmode, obj, path, co, core_names, cfg.stats))
+  None ->
+    if cfg.srcs_hex != "" { print_objects(build_native_core_split(kp, decls, vs, fns, bmode, obj, path, cfg, core_names)) }
+    else {
+      let rc = build_native_object(kp, decls, vs, fns, bmode, obj, path)
+      if rc == 0 { print(obj); 0 } else { rc }
+    }
+}
+
+fn print_objects(objs: [String]) : Int / Console = match objs {
+  [] -> 1
+  _ -> { print(string_join(objs, "\n")); 0 }
+}
+
+fn native_core_hit(cc: CoreCacheOpt, pre: String) : Option[String] / File =
+  if pre == "" { None } else { ncore_index_lookup(cc.dir, pre) }
 
 fn native_core_cached(cc: CoreCacheOpt) : Bool =
   cc.dir != "" and cc.toolchain != "" and llvm_backend_tag() != ""
@@ -5559,7 +5613,10 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # `map / flat_map / filter` participates in `|`, `||`,
                   # `|?` automatically — no compiler change required when
                   # a downstream package adds a new pipe-eligible type.
-                  let prunes = core_prunes(mode, backend, core_cache)
+                  let nsrcs = native_core_srcs(backend, core_cache, core_mod_names(core_mods, []))
+                  let npre = native_core_pre(core_cache, edition, nsrcs)
+                  let core_hit = native_core_hit(core_cache, npre)
+                  let prunes = core_prunes(mode, backend, core_cache, core_hit)
                   let cut = if prunes {
                               core_reach(all_decls, core_mod_names(core_mods, []), proto_reg)
                             } else { CoreCut(all_decls, []) }
@@ -5771,7 +5828,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       let misses = if pruned { core_cut_misses(mono_decls, dropped) } else { [] }
                       if vd_failed([mf.verdict]) { vd_exit(None, [mf.verdict]) }
                       else if list_length(misses) > 0 { core_cut_fail("references a core function pruning dropped", misses) }
-                      else if pruned and core_cache_writes(backend, core_cache) {
+                      else if pruned and core_cache_writes(backend, core_cache)
+                                     and not core_hit_reusable(backend, core_hit) {
                         core_cut_fail("would write a core cache entry from a pruned core", [])
                       }
                       else if use_purity {
@@ -5823,23 +5881,11 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                         # capture a freed (empty) tag and every backend-tag
                         # component (triple, opt level, bitcode ids) would
                         # silently drop out of the core-object key.
-                        let nsrcs = if native_core_cached(core_cache) and list_length(ncore_names) > 0 {
-                          match core_src_hexes(core_module_paths(), []) {
-                            None -> ""
-                            Some(hx) -> string_join(hx, "\n")
-                          }
-                        } else { "" }
-                        if nsrcs != "" {
-                          let ncfg = NCoreCfg { dir: core_cache.dir, toolchain: core_cache.toolchain,
-                                                edition: edition, tag: llvm_backend_tag(), srcs_hex: nsrcs,
-                                                stats: core_cache.stats }
-                          let objs = build_native_core_split(kp, perceus_decls, nvariants, nfns,
-                                                             bmode, obj_path, path, ncfg, ncore_names)
-                          match objs { [] -> 1 _ -> { print(string_join(objs, "\n")); 0 } }
-                        } else {
-                          let rc = build_native_object(kp, perceus_decls, nvariants, nfns, bmode, obj_path, path)
-                          if rc == 0 { print(obj_path); 0 } else { rc }
-                        }
+                        native_single_emit(kp, perceus_decls, nvariants, nfns, bmode, obj_path, path, ncore_names,
+                                           if pruned { core_hit } else { None },
+                                           NCoreCfg { dir: core_cache.dir, toolchain: core_cache.toolchain,
+                                                      edition: edition, tag: llvm_backend_tag(), srcs_hex: nsrcs,
+                                                      stats: core_cache.stats, pre: npre })
                       }
                       else if use_native_modular {
                         # Native separate compilation: partition the KIR by
