@@ -640,12 +640,54 @@ pub fn bin_int_to_bytes(n: Int) : Array[Byte] = {
 
 #[doc("Decode an 8-byte little-endian two's-complement Int starting at `pos`; `Err` past end of buffer.")]
 pub fn bin_bytes_to_int(buf: Array[Byte], pos: Int) : Result[BinCursor[Int], String] = {
-  if not bin_have(buf, pos, 8) {
-    Err("unexpected end of buffer")
-  } else {
-    Ok(BinCursor { value: bytes_get_le(buf, pos, 8), pos: pos + 8 })
-  }
+  let e = bin_int_end(buf, pos)
+  if e < 0 { Err(bin_end_error(e)) } else { Ok(BinCursor { value: bin_int_at(buf, pos), pos: e }) }
 }
+
+# Direct leaf readers: a derived decoder validates a leaf with
+# `bin_<t>_end` and reads it with `bin_<t>_at`, so a leaf allocates no
+# `Result` or `BinCursor` of its own.
+
+#[doc("The offset just past an encoded `Int` at `pos`, or a negative code `bin_end_error` names.")]
+pub fn bin_int_end(buf: Array[Byte], pos: Int) : Int =
+  if bin_have(buf, pos, 8) { pos + 8 } else { -1 }
+
+#[doc("The offset just past an encoded `Bool` at `pos`, or a negative code `bin_end_error` names.")]
+pub fn bin_bool_end(buf: Array[Byte], pos: Int) : Int =
+  if not bin_have(buf, pos, 1) { -1 }
+  else if bytes_get_le(buf, pos, 1) > 1 { -2 }
+  else { pos + 1 }
+
+#[doc("The offset just past an encoded `String` at `pos`, or a negative code `bin_end_error` names.")]
+pub fn bin_string_end(buf: Array[Byte], pos: Int) : Int =
+  if not bin_have(buf, pos, 4) { -1 }
+  else {
+    let n = bytes_get_le(buf, pos, 4)
+    if bin_have(buf, pos + 4, n) { pos + 4 + n } else { -3 }
+  }
+
+#[doc("The sum tag byte at `pos`, or a negative code `bin_end_error` names.")]
+pub fn bin_tag_at(buf: Array[Byte], pos: Int) : Int =
+  if bin_have(buf, pos, 1) { bytes_get_le(buf, pos, 1) } else { -1 }
+
+#[doc("The decode error for a negative `bin_<t>_end` or `bin_tag_at` result.")]
+pub fn bin_end_error(code: Int) : String =
+  if code == -2 { "BinSerialize Bool: byte out of range" }
+  else if code == -3 { "BinSerialize String: truncated payload" }
+  else { "unexpected end of buffer" }
+
+#[doc("The `Int` encoded at `pos`; `bin_int_end` must have accepted it.")]
+pub fn bin_int_at(buf: Array[Byte], pos: Int) : Int = bytes_get_le(buf, pos, 8)
+
+#[doc("The `Bool` encoded at `pos`; `bin_bool_end` must have accepted it.")]
+pub fn bin_bool_at(buf: Array[Byte], pos: Int) : Bool = bytes_get_le(buf, pos, 1) == 1
+
+#[doc("The `String` encoded at `pos`; `bin_string_end` must have accepted it.")]
+pub fn bin_string_at(buf: Array[Byte], pos: Int) : String =
+  bytes_get_string(buf, pos + 4, bytes_get_le(buf, pos, 4))
+
+#[doc("The `Char` encoded at `pos`; `bin_int_end` must have accepted it.")]
+pub fn bin_char_at(buf: Array[Byte], pos: Int) : Char = int_to_char(bin_int_at(buf, pos))
 
 #[doc("""
 Write a 4-byte little-endian length prefix into positions
@@ -664,23 +706,6 @@ fn bin_string_to_bytes(s: String) : Array[Byte] = {
   bytes_put_string(buf, 4, s)
 }
 
-# Read 4 LE bytes from `buf` at `pos` and return the resulting Int.
-fn bin_read_len4(buf: Array[Byte], pos: Int) : Result[Int, String] = {
-  if not bin_have(buf, pos, 4) {
-    Err("unexpected end of buffer")
-  } else {
-    Ok(bytes_get_le(buf, pos, 4))
-  }
-}
-
-# Rebuild a String from `k` raw bytes, byte-exact.
-fn bin_collect_chars(buf: Array[Byte], pos: Int, k: Int) : Result[String, String] = {
-  if not bin_have(buf, pos, k) {
-    Err("unexpected end of buffer")
-  } else {
-    Ok(bytes_get_string(buf, pos, k))
-  }
-}
 
 #[doc("""
 Fold `combine` over `stage(i)` for each `i` in the inclusive range
@@ -792,122 +817,42 @@ impl BinSerialize for Bool {
   fn to_bytes(self: Bool) : Array[Byte] =
     if self { array_one_byte(bin_byte(1)) } else { array_one_byte(bin_byte(0)) }
   fn from_bytes(buf: Array[Byte], pos: Int) : Result[BinCursor[Bool], String] = {
-    match bin_byte_at(buf, pos) {
-      Err(m) -> Err(m)
-      Ok(b)  -> {
-        let n = byte_to_int(b)
-        if n == 0 { Ok(BinCursor { value: false, pos: pos + 1 }) }
-        else if n == 1 { Ok(BinCursor { value: true,  pos: pos + 1 }) }
-        else { Err("BinSerialize Bool: byte out of range") }
-      }
-    }
+    let e = bin_bool_end(buf, pos)
+    if e < 0 { Err(bin_end_error(e)) } else { Ok(BinCursor { value: bin_bool_at(buf, pos), pos: e }) }
   }
 }
 
 impl BinSerialize for String {
   fn to_bytes(self: String) : Array[Byte] = bin_string_to_bytes(self)
   fn from_bytes(buf: Array[Byte], pos: Int) : Result[BinCursor[String], String] = {
-    match bin_read_len4(buf, pos) {
-      Err(m) -> Err(m)
-      Ok(n)  -> {
-        let body_pos = pos + 4
-        if not bin_have(buf, body_pos, n) {
-          Err("BinSerialize String: truncated payload")
-        } else {
-          match bin_collect_chars(buf, body_pos, n) {
-            Err(m) -> Err(m)
-            Ok(s)  -> Ok(BinCursor { value: s, pos: body_pos + n })
-          }
-        }
-      }
-    }
+    let e = bin_string_end(buf, pos)
+    if e < 0 { Err(bin_end_error(e)) } else { Ok(BinCursor { value: bin_string_at(buf, pos), pos: e }) }
   }
 }
 
 impl BinSerialize for Real {
   fn to_bytes(self: Real) : Array[Byte] = bin_string_to_bytes(real_to_string(self))
   fn from_bytes(buf: Array[Byte], pos: Int) : Result[BinCursor[Real], String] = {
-    match bin_read_len4(buf, pos) {
-      Err(m) -> Err(m)
-      Ok(n)  -> {
-        let body_pos = pos + 4
-        if not bin_have(buf, body_pos, n) {
-          Err("BinSerialize Real: truncated payload")
-        } else {
-          match bin_collect_chars(buf, body_pos, n) {
-            Err(m) -> Err(m)
-            Ok(s)  -> match string_to_real(s) {
-              Some(r) -> Ok(BinCursor { value: r, pos: body_pos + n })
-              None    -> Err("BinSerialize Real: invalid decimal payload")
-            }
-          }
-        }
+    let e = bin_string_end(buf, pos)
+    if e == -3 { Err("BinSerialize Real: truncated payload") }
+    else if e < 0 { Err(bin_end_error(e)) }
+    else {
+      match string_to_real(bin_string_at(buf, pos)) {
+        Some(r) -> Ok(BinCursor { value: r, pos: e })
+        None    -> Err("BinSerialize Real: invalid decimal payload")
       }
     }
   }
 }
 
-# Per-type wrappers: single-dispatch picks the impl from the first
-# argument's type. For `to_bytes(self)` that is Self, so dispatch is
-# correct. For `from_bytes(buf, pos)` Self appears only in the return
-# position, so a bare `from_bytes(bs, 0)` dispatches on the buffer's
-# type and finds no impl (same limitation Serialize.from_string and
-# Default.default ride). These sibling names give a non-overloaded
-# entry point for each primitive impl; the derive pass synthesises an
-# analogous `<tname>_from_bytes` helper for each derived type.
+# Single dispatch picks the impl from the first argument's type, and
+# `from_bytes(buf, pos)` has `Self` only in its return type, so a bare
+# `from_bytes(bs, 0)` finds no impl. `int_from_bytes` and the derived
+# `<tname>_from_bytes` shims are the non-overloaded entry points.
 
 #[doc("Decodes an `Int` (as written by the integer codec) from `buf` at `pos`, returning the value and the next position. The non-overloaded entry point for `Int`'s `BinSerialize.from_bytes`.")]
 pub fn int_from_bytes(buf: Array[Byte], pos: Int) : Result[BinCursor[Int], String] =
   bin_bytes_to_int(buf, pos)
-
-fn bool_from_bytes(buf: Array[Byte], pos: Int) : Result[BinCursor[Bool], String] = {
-  match bin_byte_at(buf, pos) {
-    Err(m) -> Err(m)
-    Ok(b)  -> {
-      let n = byte_to_int(b)
-      if n == 0 { Ok(BinCursor { value: false, pos: pos + 1 }) }
-      else if n == 1 { Ok(BinCursor { value: true,  pos: pos + 1 }) }
-      else { Err("BinSerialize Bool: byte out of range") }
-    }
-  }
-}
-
-fn string_from_bytes(buf: Array[Byte], pos: Int) : Result[BinCursor[String], String] = {
-  match bin_read_len4(buf, pos) {
-    Err(m) -> Err(m)
-    Ok(n)  -> {
-      let body_pos = pos + 4
-      if not bin_have(buf, body_pos, n) {
-        Err("BinSerialize String: truncated payload")
-      } else {
-        match bin_collect_chars(buf, body_pos, n) {
-          Err(m) -> Err(m)
-          Ok(s)  -> Ok(BinCursor { value: s, pos: body_pos + n })
-        }
-      }
-    }
-  }
-}
-
-fn real_from_bytes(buf: Array[Byte], pos: Int) : Result[BinCursor[Real], String] = {
-  match bin_read_len4(buf, pos) {
-    Err(m) -> Err(m)
-    Ok(n)  -> {
-      let body_pos = pos + 4
-      if not bin_have(buf, body_pos, n) {
-        Err("BinSerialize Real: truncated payload")
-      } else {
-        match bin_collect_chars(buf, body_pos, n) {
-          Err(m) -> Err(m)
-          Ok(s)  -> match string_to_real(s) {
-            Some(r) -> Ok(BinCursor { value: r, pos: body_pos + n })
-            None    -> Err("BinSerialize Real: invalid decimal payload")
-          }
-        }
-      }
-    }
-  }
-}
 
 # ---- Collection combinators ---------------------------------------
 #
@@ -923,10 +868,8 @@ pub fn bin_char_to_bytes(c: Char) : Array[Byte] = bin_int_to_bytes(char_to_int(c
 
 #[doc("Decodes a `Char` (encoded as its codepoint) from `buf` at `pos`, returning the value and the next position.")]
 pub fn bin_char_from_bytes(buf: Array[Byte], pos: Int) : Result[BinCursor[Char], String] = {
-  match bin_bytes_to_int(buf, pos) {
-    Err(m) -> Err(m)
-    Ok(c)  -> Ok(BinCursor { value: int_to_char(c.value), pos: c.pos })
-  }
+  let e = bin_int_end(buf, pos)
+  if e < 0 { Err(bin_end_error(e)) } else { Ok(BinCursor { value: bin_char_at(buf, pos), pos: e }) }
 }
 
 #[doc("""
@@ -941,7 +884,7 @@ pub fn bin_list_to_bytes[T, e](xs: [T], enc: (T) -> Array[Byte] / e) : Array[Byt
   let rev   = bin_foldl(xs, none, (acc, x) => [enc(x), ...acc])
   let total = bin_foldl(rev, 4, (n, c) => n + array_length(c))
   let dst   = array_make(total, bin_zero())
-  # 4-byte LE prefix matches `bin_read_len4` on decode; `bin_int_to_bytes`
+  # 4-byte LE prefix matches `bin_list_from_bytes` on decode; `bin_int_to_bytes`
   # writes 8 bytes, which would desync the cursor.
   let _ = bin_write_len4(dst, 0, list_length(xs))
   bin_fill_back(dst, total, rev)
@@ -981,12 +924,10 @@ pub fn bin_list_from_bytes_loop[T](buf: Array[Byte], pos: Int,
 pub fn bin_list_from_bytes[T](buf: Array[Byte], pos: Int,
                             dec: (Array[Byte], Int) -> Result[BinCursor[T], String])
                           : Result[BinCursor[[T]], String] = {
-  match bin_read_len4(buf, pos) {
-    Err(m) -> Err(m)
-    Ok(n)  -> {
-      let acc0: [T] = []
-      bin_list_from_bytes_loop(buf, pos + 4, dec, n, acc0)
-    }
+  if not bin_have(buf, pos, 4) { Err("unexpected end of buffer") }
+  else {
+    let acc0: [T] = []
+    bin_list_from_bytes_loop(buf, pos + 4, dec, bytes_get_le(buf, pos, 4), acc0)
   }
 }
 
@@ -1005,19 +946,17 @@ pub fn bin_option_to_bytes[T, e](o: Option[T], enc: (T) -> Array[Byte] / e) : Ar
 pub fn bin_option_from_bytes[T](buf: Array[Byte], pos: Int,
                               dec: (Array[Byte], Int) -> Result[BinCursor[T], String])
                             : Result[BinCursor[Option[T]], String] = {
-  match bin_byte_at(buf, pos) {
-    Err(m) -> Err(m)
-    Ok(b)  -> {
-      let tag = byte_to_int(b)
-      if tag == 0 { Ok(BinCursor { value: None, pos: pos + 1 }) }
-      else if tag == 1 {
-        match dec(buf, pos + 1) {
-          Err(m) -> Err(m)
-          Ok(c)  -> Ok(BinCursor { value: Some(c.value), pos: c.pos })
-        }
+  if not bin_have(buf, pos, 1) { Err("unexpected end of buffer") }
+  else {
+    let tag = bytes_get_le(buf, pos, 1)
+    if tag == 0 { Ok(BinCursor { value: None, pos: pos + 1 }) }
+    else if tag == 1 {
+      match dec(buf, pos + 1) {
+        Err(m) -> Err(m)
+        Ok(c)  -> Ok(BinCursor { value: Some(c.value), pos: c.pos })
       }
-      else { Err("BinSerialize Option: tag out of range") }
     }
+    else { Err("BinSerialize Option: tag out of range") }
   }
 }
 
@@ -1047,6 +986,30 @@ pub fn bin_buf_put(b: BinBuf, src: Array[Byte]) : BinBuf / Mutable = {
 pub fn bin_buf_byte(b: BinBuf, n: Int) : BinBuf / Mutable =
   if n < 0 or n > 255 { panic(string_concat("bin_buf_byte: tag out of 0..255: ", int_to_string(n))) }
   else { BinBuf { bytes: bytes_put_le(bin_buf_room(b, 1), b.len, n, 1), len: b.len + 1 } }
+
+#[doc("Appends `n` in the wire form of `Int.to_bytes`: 8 little-endian bytes. Rides `Mutable`.")]
+pub fn bin_buf_put_int(b: BinBuf, n: Int) : BinBuf / Mutable =
+  BinBuf { bytes: bytes_put_le(bin_buf_room(b, 8), b.len, n, 8), len: b.len + 8 }
+
+#[doc("Appends `x` in the wire form of `Bool.to_bytes`: one byte, 0 or 1. Rides `Mutable`.")]
+pub fn bin_buf_put_bool(b: BinBuf, x: Bool) : BinBuf / Mutable =
+  BinBuf { bytes: bytes_put_le(bin_buf_room(b, 1), b.len, if x { 1 } else { 0 }, 1), len: b.len + 1 }
+
+#[doc("Appends `s` in the wire form of `String.to_bytes`: a 4-byte LE byte length, then the raw bytes. Rides `Mutable`.")]
+pub fn bin_buf_put_string(b: BinBuf, s: String) : BinBuf / Mutable = {
+  let n   = string_length(s)
+  let dst = bin_buf_room(b, 4 + n)
+  let _   = bytes_put_le(dst, b.len, n, 4)
+  BinBuf { bytes: bytes_put_string(dst, b.len + 4, s), len: b.len + 4 + n }
+}
+
+#[doc("Appends `r` in the wire form of `Real.to_bytes`: its decimal text as a `String`. Rides `Mutable`.")]
+pub fn bin_buf_put_real(b: BinBuf, r: Real) : BinBuf / Mutable =
+  bin_buf_put_string(b, real_to_string(r))
+
+#[doc("Appends `c` in the wire form of `bin_char_to_bytes`: its codepoint as an `Int`. Rides `Mutable`.")]
+pub fn bin_buf_put_char(b: BinBuf, c: Char) : BinBuf / Mutable =
+  bin_buf_put_int(b, char_to_int(c))
 
 #[doc("Appends `xs` in the wire form of `bin_list_to_bytes`: a 4-byte LE count, then `put` of each element.")]
 pub fn bin_buf_put_list[T](b: BinBuf, xs: [T], put: (BinBuf, T) -> BinBuf / Mutable) : BinBuf / Mutable = {

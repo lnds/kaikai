@@ -2435,20 +2435,33 @@ fn derive_binser_put_via(comb: String, acc: Expr, v: Expr, elem: TypeExpr, write
   binser_call(comb, [acc, v, mk_expr(ELambda([bw, bx], body), line, lcol)], line, col)
 }
 
-# The encoder is the mangled per-type symbol, not the `to_bytes`
-# dispatcher: inside a combinator's lambda the monomorpher does not
-# carry the instantiated type to the dispatcher call.
+# A primitive leaf is written straight into the buffer. Any other head
+# appends its mangled per-type encoder, not the `to_bytes` dispatcher:
+# inside a combinator's lambda the monomorpher does not carry the
+# instantiated type to the dispatcher call.
 fn derive_binser_put_leaf(acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
                            line: Int, col: Int) : Expr {
   let head = proto_type_name(ftype)
   if list_has(writers, head) {
     binser_call(binser_put_name(head), [acc, v], line, col)
   } else {
-    let enc = if head == "Char" { "bin_char_to_bytes" }
-              else { proto_mangled_fn("BinSerialize", head, "to_bytes") }
-    binser_call("bin_buf_put", [acc, binser_call(enc, [v], line, col)], line, col)
+    match binser_prim_writer(head) {
+      Some(w) -> binser_call(w, [acc, v], line, col)
+      None    -> {
+        let enc = proto_mangled_fn("BinSerialize", head, "to_bytes")
+        binser_call("bin_buf_put", [acc, binser_call(enc, [v], line, col)], line, col)
+      }
+    }
   }
 }
+
+fn binser_prim_writer(head: String) : Option[String] =
+  if head == "Int" { Some("bin_buf_put_int") }
+  else if head == "String" { Some("bin_buf_put_string") }
+  else if head == "Bool" { Some("bin_buf_put_bool") }
+  else if head == "Real" { Some("bin_buf_put_real") }
+  else if head == "Char" { Some("bin_buf_put_char") }
+  else { None }
 
 fn derive_binser_decode_call(buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
                                line: Int, col: Int) : Expr =
@@ -2521,11 +2534,77 @@ fn derive_binser_put_record(acc: Expr, fields: [FieldDecl], idx: Int, writers: [
   }
 }
 
+# --- field decoders -------------------------------------------------
+#
+# Field K at cursor `posK` is either a primitive leaf, validated with
+# `let eK = bin_<t>_end(buf, posK)` and read in place by `bin_<t>_at`
+# when the value is built, or any other type, matched out of
+# `__pimpl_BinSerialize_<Tk>_from_bytes(buf, posK)` into `pK`.
+fn derive_binser_field_guard(ftype: TypeExpr, idx: Int, pos_e: Expr, then_e: Expr,
+                               line: Int, fcol: Int, col: Int) : Expr {
+  let buf_e = mk_ref("buf", line, fcol)
+  match binser_prim_reader(ftype) {
+    Some(r) -> {
+      let evar = binser_end_var(idx)
+      let end_e = binser_call(binser_prim_end(r), [buf_e, pos_e], line, col)
+      let bad = mk_expr(EBinop("<", mk_ref(evar, line, col), mk_expr(mk_int_synth(0), line, col)), line, col)
+      let err = binser_call("Err", [binser_call("bin_end_error", [mk_ref(evar, line, col)], line, col)], line, col)
+      let bind = SLet(mk_pat(PBind(evar), line, col), None, end_e)
+      mk_expr(EBlock([bind], Some(mk_expr(EIf(bad, err, Some(then_e)), line, col))), line, col)
+    }
+    None -> derive_binser_match_result(derive_binser_decode_call(buf_e, pos_e, ftype, line, fcol),
+                                       binser_cursor_var(idx), then_e, line, col)
+  }
+}
+
+# The cursor just past field `idx`.
+fn derive_binser_field_next(ftype: TypeExpr, idx: Int, line: Int, col: Int) : Expr =
+  match binser_prim_reader(ftype) {
+    Some(_) -> mk_ref(binser_end_var(idx), line, col)
+    None    -> mk_expr(EField(mk_ref(binser_cursor_var(idx), line, col), "pos"), line, col)
+  }
+
+# The decoded value of field `idx`, which starts at `pos_e`.
+fn derive_binser_field_value(ftype: TypeExpr, idx: Int, pos_e: Expr, line: Int, col: Int) : Expr =
+  match binser_prim_reader(ftype) {
+    Some(r) -> binser_call(binser_prim_at(r), [mk_ref("buf", line, col), pos_e], line, col)
+    None    -> mk_expr(EField(mk_ref(binser_cursor_var(idx), line, col), "value"), line, col)
+  }
+
+# The values of `ftypes`, the first starting at `pos_e`.
+fn derive_binser_field_values(ftypes: [TypeExpr], idx: Int, pos_e: Expr,
+                                line: Int, col: Int) : [Expr] =
+  match ftypes {
+    [] -> []
+    [ft, ...rest] ->
+      [derive_binser_field_value(ft, idx, pos_e, line, col),
+       ...derive_binser_field_values(rest, idx + 1, derive_binser_field_next(ft, idx, line, col), line, col)]
+  }
+
+fn binser_cursor_var(idx: Int) : String = concat_all(["p", int_to_string(idx)])
+
+fn binser_end_var(idx: Int) : String = concat_all(["__e", int_to_string(idx)])
+
+# A primitive leaf's reader family (`Char` reads its codepoint through
+# `Int`'s validator). `Real` decodes through its impl: its payload can
+# fail to parse after it validates.
+fn binser_prim_reader(ftype: TypeExpr) : Option[String] =
+  match ftype.tkind {
+    TyName(tn, []) ->
+      if tn == "Int" or tn == "Bool" or tn == "String" or tn == "Char" { Some(string_to_lower_ascii(tn)) }
+      else { None }
+    _ -> None
+  }
+
+fn binser_prim_end(r: String) : String =
+  concat_all(["bin_", if r == "char" { "int" } else { r }, "_end"])
+
+fn binser_prim_at(r: String) : String = concat_all(["bin_", r, "_at"])
+
 # --- record decoder -------------------------------------------------
 #
-# Threaded chain of `match __pimpl_BinSerialize_<Tk>_from_bytes(buf, posK) {
-#   Err(m) -> Err(m); Ok(p_K) -> ... }` ending in
-# `Ok((T { f1: p_1.fst, ..., fN: p_N.fst }, posN))`.
+# The field-decoder chain, ending in
+# `Ok(BinCursor { value: T { f1: <value 0>, ... }, pos: <cursor N> })`.
 #
 # Empty record short-circuits to `Ok((T {}, pos))` so the empty-fields
 # case still emits a valid impl.
@@ -2541,8 +2620,7 @@ fn derive_binser_record_from_bytes(tname: String, fields: [FieldDecl],
 
 # `remaining` walks left-to-right; `all_fields` is captured so the
 # final `Ok` builder can construct the record literal in declaration
-# order. `pos_e` is the expression naming the current cursor (`pos`
-# initially, then `pK.snd` for the K-th field).
+# order. `pos_e` is the cursor of the field at `idx`.
 fn derive_binser_record_decode_chain(tname: String, remaining: [FieldDecl],
                                        all_fields: [FieldDecl], idx: Int,
                                        pos_e: Expr, line: Int, col: Int) : Expr {
@@ -2550,48 +2628,39 @@ fn derive_binser_record_decode_chain(tname: String, remaining: [FieldDecl],
     [] -> derive_binser_record_ok_value(tname, all_fields, pos_e, line, col)
     [fd, ...rest] -> match fd {
       FD(_, _, ftype, _) -> {
+        let then_e = derive_binser_record_decode_chain(tname, rest, all_fields, idx + 1,
+                                                        derive_binser_field_next(ftype, idx, line, col),
+                                                        line, col)
         # One column inside the field's writer slot, so writer and
         # decoder lambdas of one field stay distinct.
-        let fcol = col + idx * 16 + 1
-        let buf_e = mk_ref("buf", line, fcol)
-        let call = derive_binser_decode_call(buf_e, pos_e, ftype, line, fcol)
-        let pvar = concat_all(["p", int_to_string(idx)])
-        let next_pos = mk_expr(EField(mk_ref(pvar, line, col), "pos"),
-                                line, col)
-        let then_e = derive_binser_record_decode_chain(tname, rest, all_fields,
-                                                        idx + 1, next_pos,
-                                                        line, col)
-        derive_binser_match_result(call, pvar, then_e, line, col)
+        derive_binser_field_guard(ftype, idx, pos_e, then_e, line, col + idx * 16 + 1, col)
       }
     }
   }
 }
 
-# Build `Ok(BinCursor { value: T { f1: p0.value, ... }, pos: pos_e })`.
 fn derive_binser_record_ok_value(tname: String, fields: [FieldDecl],
                                    pos_e: Expr, line: Int, col: Int) : Expr {
-  let parts = derive_binser_record_field_inits(fields, 0, line, col)
-  let rec_e = mk_expr(ERecordLit(tname, parts), line, col)
-  let cur_e = mk_expr(ERecordLit("BinCursor",
-                                [FI("value", rec_e),
-                                 FI("pos", pos_e)]), line, col)
-  mk_expr(ECall(mk_ref("Ok", line, col), [cur_e]), line, col)
+  let vals = derive_binser_field_values(map(fields, field_decl_type), 0, mk_ref("pos", line, col), line, col)
+  let rec_e = mk_expr(ERecordLit(tname, derive_binser_field_inits(fields, vals)), line, col)
+  binser_ok_cursor(rec_e, pos_e, line, col)
 }
 
-fn derive_binser_record_field_inits(fields: [FieldDecl], i: Int,
-                                      line: Int, col: Int) : [FieldInit] {
+fn derive_binser_field_inits(fields: [FieldDecl], vals: [Expr]) : [FieldInit] =
   match fields {
-    [] -> []
-    [fd, ...rest] -> match fd {
-      FD(_, name, _, _) -> {
-        let v = mk_expr(EField(mk_ref(concat_all(["p", int_to_string(i)]),
-                                        line, col), "value"),
-                         line, col)
-        [FI(name, v),
-         ...derive_binser_record_field_inits(rest, i + 1, line, col)]
-      }
+    [FD(_, name, _, _), ...rest] -> match vals {
+      [v, ...vs] -> [FI(name, v), ...derive_binser_field_inits(rest, vs)]
+      []         -> []
     }
+    _ -> []
   }
+
+fn field_decl_type(fd: FieldDecl) : TypeExpr = match fd { FD(_, _, t, _) -> t }
+
+# `Ok(BinCursor { value: value_e, pos: pos_e })`.
+fn binser_ok_cursor(value_e: Expr, pos_e: Expr, line: Int, col: Int) : Expr {
+  let cur_e = mk_expr(ERecordLit("BinCursor", [FI("value", value_e), FI("pos", pos_e)]), line, col)
+  binser_call("Ok", [cur_e], line, col)
 }
 
 # Wrap an `Err(m) -> Err(m); Ok(pvar) -> then_e` match around a
@@ -2672,30 +2741,26 @@ fn derive_binser_put_payload(acc: Expr, vargs: [TypeExpr], i: Int, writers: [Str
 
 # --- sum decoder ----------------------------------------------------
 #
-# `match bin_byte_at(buf, pos) {
-#   Err(m) -> Err(m)
-#   Ok(__tag) ->
-#     if __tag == 0 { <decode V0 payload> }
-#     else if __tag == 1 { <decode V1 payload> }
-#     ...
-#     else { Err("BinSerialize <tname>: invalid tag") }
-# }`
+# `let __tag = bin_tag_at(buf, pos)
+#  if __tag < 0 { Err(bin_end_error(__tag)) }
+#  else if __tag == 0 { <decode V0 payload> }
+#  ...
+#  else { Err("BinSerialize <tname>: invalid tag") }`
 #
-# Each per-variant payload chain is identical in shape to the
-# record-field chain: thread `__pimpl_BinSerialize_<Tk>_from_bytes`
-# Result-matches and end with `Ok((Variant(p0.fst, p1.fst, ...), posN))`.
+# Each per-variant payload chain is the record-field chain, ending in
+# the variant's constructor call.
 fn derive_binser_sum_from_bytes(tname: String, variants: [Variant],
                                   line: Int, col: Int) : Expr {
-  let tag_call = mk_expr(ECall(mk_ref("bin_byte_at", line, col),
-                                [mk_ref("buf", line, col),
-                                 mk_ref("pos", line, col)]),
-                          line, col)
+  let tag_e = binser_call("bin_tag_at", [mk_ref("buf", line, col), mk_ref("pos", line, col)], line, col)
   let inner_pos = mk_expr(EBinop("+", mk_ref("pos", line, col),
                                        mk_expr(mk_int_synth(1), line, col)),
                            line, col)
   let chain = derive_binser_sum_tag_chain(tname, variants, 0, inner_pos,
                                             line, col)
-  derive_binser_match_result(tag_call, "__tag", chain, line, col)
+  let bad = mk_expr(EBinop("<", mk_ref("__tag", line, col), mk_expr(mk_int_synth(0), line, col)), line, col)
+  let err = binser_call("Err", [binser_call("bin_end_error", [mk_ref("__tag", line, col)], line, col)], line, col)
+  let bind = SLet(mk_pat(PBind("__tag"), line, col), None, tag_e)
+  mk_expr(EBlock([bind], Some(mk_expr(EIf(bad, err, Some(chain)), line, col))), line, col)
 }
 
 fn derive_binser_sum_tag_chain(tname: String, variants: [Variant], idx: Int,
@@ -2707,14 +2772,7 @@ fn derive_binser_sum_tag_chain(tname: String, variants: [Variant], idx: Int,
                             false), line, col)]),
                    line, col)
     [v, ...rest] -> {
-      # `__tag` is a Byte after Lane 4; promote to Int via
-      # `byte_to_int` so the `==` comparison stays Int-Int (we
-      # already enumerate tags as Int indices) without needing a
-      # `byte_eq` rewrite at every variant.
-      let tag_i = mk_expr(ECall(mk_ref("byte_to_int", line, col),
-                                  [mk_ref("__tag", line, col)]),
-                           line, col)
-      let cond = mk_expr(EBinop("==", tag_i,
+      let cond = mk_expr(EBinop("==", mk_ref("__tag", line, col),
                                        mk_expr(mk_int_synth(idx), line, col)),
                           line, col)
       # The variant's writer window, shifted by half so writer and
@@ -2730,60 +2788,32 @@ fn derive_binser_sum_tag_chain(tname: String, variants: [Variant], idx: Int,
 }
 
 # Same shape as record-decode chain, but the final `Ok` builds a
-# constructor call `Variant(p0.value, p1.value, ...)` instead of a
-# record literal.
+# constructor call instead of a record literal.
 fn derive_binser_sum_payload_decode(tname: String, v: Variant,
                                       start_pos: Expr, line: Int, col: Int) : Expr {
   match v {
     Var(name, vargs) -> match vargs {
-      [] -> {
-        let ctor = mk_ref(name, line, col)
-        let cur = mk_expr(ERecordLit("BinCursor",
-                                    [FI("value", ctor),
-                                     FI("pos", start_pos)]), line, col)
-        mk_expr(ECall(mk_ref("Ok", line, col), [cur]), line, col)
-      }
-      _  -> derive_binser_sum_decode_chain(name, vargs, vargs, 0, start_pos,
+      [] -> binser_ok_cursor(mk_ref(name, line, col), start_pos, line, col)
+      _  -> derive_binser_sum_decode_chain(name, vargs, vargs, 0, start_pos, start_pos,
                                              line, col)
     }
   }
 }
 
 fn derive_binser_sum_decode_chain(vname: String, remaining: [TypeExpr],
-                                    all_vargs: [TypeExpr], idx: Int,
+                                    all_vargs: [TypeExpr], idx: Int, start_pos: Expr,
                                     pos_e: Expr, line: Int, col: Int) : Expr {
   match remaining {
     [] -> {
-      let args = derive_binser_sum_ctor_args(all_vargs, 0, line, col)
-      let ctor = mk_expr(ECall(mk_ref(vname, line, col), args), line, col)
-      let cur = mk_expr(ERecordLit("BinCursor",
-                                  [FI("value", ctor),
-                                   FI("pos", pos_e)]), line, col)
-      mk_expr(ECall(mk_ref("Ok", line, col), [cur]), line, col)
+      let args = derive_binser_field_values(all_vargs, 0, start_pos, line, col)
+      binser_ok_cursor(binser_call(vname, args, line, col), pos_e, line, col)
     }
     [vt, ...rest] -> {
-      let fcol = col + idx * 16 + 1
-      let buf_e = mk_ref("buf", line, fcol)
-      let call = derive_binser_decode_call(buf_e, pos_e, vt, line, fcol)
-      let pvar = concat_all(["p", int_to_string(idx)])
-      let next_pos = mk_expr(EField(mk_ref(pvar, line, col), "pos"),
-                              line, col)
-      let then_e = derive_binser_sum_decode_chain(vname, rest, all_vargs,
-                                                     idx + 1, next_pos,
-                                                     line, col)
-      derive_binser_match_result(call, pvar, then_e, line, col)
+      let then_e = derive_binser_sum_decode_chain(vname, rest, all_vargs, idx + 1, start_pos,
+                                                   derive_binser_field_next(vt, idx, line, col),
+                                                   line, col)
+      derive_binser_field_guard(vt, idx, pos_e, then_e, line, col + idx * 16 + 1, col)
     }
-  }
-}
-
-fn derive_binser_sum_ctor_args(vargs: [TypeExpr], i: Int,
-                                 line: Int, col: Int) : [Expr] {
-  match vargs {
-    [] -> []
-    [_, ...rest] ->
-      [mk_expr(EField(mk_ref(concat_all(["p", int_to_string(i)]),
-                               line, col), "value"), line, col),
-       ...derive_binser_sum_ctor_args(rest, i + 1, line, col)]
   }
 }
 

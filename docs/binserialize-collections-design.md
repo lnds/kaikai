@@ -112,20 +112,29 @@ The writer threads the buffer through the fields, choosing per
 | `tkind` | writer emits | decode emits |
 |---|---|---|
 | `TyName(X, _)` X derives BinSerialize | `__binser_put_X(acc, self.f)` | `__pimpl_BinSerialize_X_from_bytes(buf, pos)` |
-| `TyName(X, _)` X with a hand-written impl (Int, Bool, String, Real, ...) | `bin_buf_put(acc, __pimpl_BinSerialize_X_to_bytes(self.f))` | `__pimpl_BinSerialize_X_from_bytes(buf, pos)` |
+| `TyName(T, [])`, T one of Int, Bool, String, Char | `bin_buf_put_<t>(acc, self.f)` | field: `bin_<t>_end(buf, pos)` checked, then `bin_<t>_at(buf, pos)` (Char validates with `bin_int_end`); element: as below |
+| `TyName("Real", _)` | `bin_buf_put_real(acc, self.f)` | `__pimpl_BinSerialize_Real_from_bytes(buf, pos)` |
+| `TyName(X, _)` X with a hand-written impl | `bin_buf_put(acc, __pimpl_BinSerialize_X_to_bytes(self.f))` | `__pimpl_BinSerialize_X_from_bytes(buf, pos)` |
 | `TyList(t)` | `bin_buf_put_list(acc, self.f, (b, x) => <put(t)>)` | `bin_list_from_bytes(buf, pos, { b, p -> <decode_call(t)>(b, p) })` |
 | `TyName("Option", [t])` | `bin_buf_put_option(acc, self.f, (b, x) => <put(t)>)` | `bin_option_from_bytes(buf, pos, { b, p -> <decode_call(t)>(b, p) })` |
-| `TyName("Char", _)` | `bin_buf_put(acc, bin_char_to_bytes(self.f))` | `bin_char_from_bytes(buf, pos)` |
+
+A primitive leaf is written straight into the buffer, and a primitive
+field or payload is decoded without a `Result` or `BinCursor` of its
+own: `bin_<t>_end` returns the offset past the leaf or a negative code
+that `bin_end_error` turns into the impl's message. An element of a
+list or option still decodes through its impl (`Char` through
+`bin_char_from_bytes`), since the combinator's element decoder returns
+a cursor.
 
 `put(t)` and `decode_call(t)` are recursive over `t`: nested
 `TyList(TyList(Int))` produces
 
 ```kai
-bin_buf_put_list(acc, self.f, (b, x) => bin_buf_put_list(b, x, (b2, y) => bin_buf_put(b2, to_bytes(y))))
+bin_buf_put_list(acc, self.f, (b, x) => bin_buf_put_list(b, x, (b2, y) => bin_buf_put_int(b2, y)))
 ```
 
 Sum variants write their declaration index with `bin_buf_byte` and then
-the payload the same way. The `bin_buf_*` writers produce the same bytes
+the payload the same way; the decoder reads the tag with `bin_tag_at`. The `bin_buf_*` writers produce the same bytes
 as `bin_list_to_bytes` / `bin_option_to_bytes`, which remain for direct
 use.
 
