@@ -111,7 +111,9 @@ gated by `tools/test-negative.sh`, wired into Tier 1 via the
   harness compiles via kaic2 → cc, runs the binary, asserts non-zero
   exit, and greps stderr for the panic message. Used for contracts
   that `docs/effects-impl.md` declares runtime-only (one-shot resume
-  is the prototype).
+  is the prototype). A runtime fixture in the backend-parity corpus
+  (`tools/lib/corpus.sh`) also runs there, so every backend must print
+  the same panic the C golden pins.
 
 Two optional siblings:
 
