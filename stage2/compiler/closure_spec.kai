@@ -18,6 +18,7 @@ import compiler.util
 import compiler.pipe_fusion
 import compiler.closure_spec_ast
 import compiler.closure_spec_emit
+import compiler.self_call
 
 #[doc("Specialise every higher-order call on a known env-empty closure; returns the decls with per-site specs appended and their call sites retargeted. Runs post-monomorphisation so each specialised callee is already concrete — the inlined loop body unboxes exactly like the hand-written recursion.")]
 pub fn closure_spec_pass(ds: [Decl]) : [Decl] = {
@@ -281,7 +282,7 @@ fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, host: String, a
 # it lives in the row, not a `TyName`, and the spec closes it.
 fn hofn_specialisable(hd: Decl, idx: Int) : Bool =
   match hd {
-    DFn(_, n, _, ps, rt, _, body, _, _, _, _) -> {
+    DFn(_, n, _, ps, rt, _, body, _, _, _, fsym) -> {
       # A return-only tparam alone is fine — mono grounds it from the call
       # site's resolved return type, and unbox lands the loop's element.
       # The unsound case is narrower: a return-only tparam that the body
@@ -290,7 +291,7 @@ fn hofn_specialisable(hd: Decl, idx: Int) : Bool =
       # A collect uses `vec_push`/`vec_reserve` (parametric, element opaque)
       # and specialises; `map_sum`'s `zero()` still declines.
       let unsound_ret = any_return_only(drop_param_at(ps, idx), rt) and body_has_arity0_proto_op(body)
-      let flow_ok = functional_param_safe(body, param_name_at(ps, idx), n)
+      let flow_ok = functional_param_safe(body, param_name_at(ps, idx), SelfRef(fsym, n))
       not unsound_ret and flow_ok
     }
     _ -> false
@@ -335,8 +336,8 @@ fn callee_is_proto_op(callee: Expr) : Bool =
 # once. A body that applies it and passes it only to its OWN recursion (a
 # fold's loop step `foldl_loop(..., f(acc,x), f)`) is safe too, since
 # `retarget_self` folds that into the same spec.
-fn functional_param_safe(body: Expr, fname: String, self_name: String) : Bool =
-  not (param_applied(body, fname) and passed_to_other(body, fname, self_name))
+fn functional_param_safe(body: Expr, fname: String, me: SelfRef) : Bool =
+  not (param_applied(body, fname) and passed_to_other(body, fname, me))
 
 # `fname` appears in callee position (`fname(...)`).
 fn param_applied(e: Expr, fname: String) : Bool =
@@ -352,23 +353,22 @@ fn kids_applied(es: [Expr], fname: String) : Bool =
     [k, ...rest] -> param_applied(k, fname) or kids_applied(rest, fname)
   }
 
-# `fname` appears as a plain argument in a call to a fn OTHER than
-# `self_name`.
-fn passed_to_other(e: Expr, fname: String, self_name: String) : Bool =
+# `fname` appears as a plain argument in a call to a fn other than `me`.
+fn passed_to_other(e: Expr, fname: String, me: SelfRef) : Bool =
   match e.kind {
-    ECall(callee, args_) -> call_passes_to_other(callee, args_, fname, self_name)
-    _ -> kids_passed(cspec_kids(e), fname, self_name)
+    ECall(callee, args_) -> call_passes_to_other(callee, args_, fname, me)
+    _ -> kids_passed(cspec_kids(e), fname, me)
   }
 
-fn call_passes_to_other(callee: Expr, args_: [Expr], fname: String, self_name: String) : Bool = {
-  let here = not callee_is(callee, self_name) and args_have_var(args_, fname)
-  here or passed_to_other(callee, fname, self_name) or kids_passed(args_, fname, self_name)
+fn call_passes_to_other(callee: Expr, args_: [Expr], fname: String, me: SelfRef) : Bool = {
+  let here = not is_self_callee(callee, me) and args_have_var(args_, fname)
+  here or passed_to_other(callee, fname, me) or kids_passed(args_, fname, me)
 }
 
-fn kids_passed(es: [Expr], fname: String, self_name: String) : Bool =
+fn kids_passed(es: [Expr], fname: String, me: SelfRef) : Bool =
   match es {
     [] -> false
-    [k, ...rest] -> passed_to_other(k, fname, self_name) or kids_passed(rest, fname, self_name)
+    [k, ...rest] -> passed_to_other(k, fname, me) or kids_passed(rest, fname, me)
   }
 
 fn callee_is(callee: Expr, name: String) : Bool =
