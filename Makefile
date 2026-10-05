@@ -1283,6 +1283,7 @@ TIER1_ASAN_LEGS_A := \
 	test-perceus-issue350-asan \
 	test-perceus-trmc-spread-asan
 TIER1_ASAN_LEGS_B := \
+	test-cancel-clause-ubsan \
 	test-perceus-issue703-asan \
 	test-issue-779-asan \
 	test-perceus-enum-slot-asan \
