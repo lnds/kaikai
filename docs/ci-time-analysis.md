@@ -118,6 +118,12 @@
 > `stage2/test-lists/native-gates-{1,2}.txt`. Three gates hide the
 > runtime bitcode in `stage0/` while they run, so they stay serial steps.
 > The bin/kai native-wrapper targets moved from shard 1b to shard 2.
+>
+> On a PR that touches no compiler source, shards 4 and 6 skip their
+> self-hosts, and the plan used to give them the same light load anyway.
+> The plan now reads `TIER1_SELFHOSTS`, using the `base0` lines of the cost
+> table when it is 0. CI passes the same value to every shard, because
+> shards that saw different values would compute different slices.
 
 All numbers below are **measured**, never dry-run. CI durations come from the
 GitHub Actions REST API for real `main` runs on `ubuntu-latest`; local splits

@@ -560,8 +560,10 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 #
 # The two modular self-hosts (shards 4 and 6) only detect regressions in the
 # sources they compile, so CI passes TIER1_SELFHOSTS=0 on PRs that touch no
-# compiler source. The light slices on those shards run either way, and the
-# plan never reads the flag: every shard must compute the same slices.
+# compiler source. The light slices on those shards run either way. The
+# plan reads the flag (shards 4 and 6 carry less fixed work without their
+# self-hosts), so CI passes the same value to every shard: shards that saw
+# different values would compute different slices.
 #
 # Coverage invariant (do not break): the set
 #   { test-costly-parallel, test-heap-limit, test-user-cache,
@@ -584,7 +586,7 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 # Adding a phase to `tier1` means adding it to a shard.
 TIER1_LIGHT_SLICES := 8
 TIER1_SELFHOSTS ?= 1
-tier1-light-slice = $(MAKE) -C stage2 test-light-shard SHARD=$(1) SHARDS=$(TIER1_LIGHT_SLICES)
+tier1-light-slice = $(MAKE) -C stage2 test-light-shard SHARD=$(1) SHARDS=$(TIER1_LIGHT_SLICES) TIER1_SELFHOSTS=$(TIER1_SELFHOSTS)
 tier1-shard-start = @date +%s > stage2/build/tier1-shard.start
 tier1-shard-wall = @echo "tier1-shard-wall $(1) $$(( $$(date +%s) - $$(cat stage2/build/tier1-shard.start) )) selfhosts=$(TIER1_SELFHOSTS)"
 TIER1_CLI_TAIL := test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stdlib-modules test-private-type-shadow-audit test-private-record-shadow-audit test-canonical-aliases test-doc test-upgrade-resolver test-release-platforms test-kaic-boot test-cli-flags test-kai-cli
