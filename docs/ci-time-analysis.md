@@ -108,8 +108,10 @@
 > not a serial floor, so the planner treated it as a pole it was not. The
 > cost table lists such targets as `elastic`: the plan counts their CPU
 > only and orders every target by the larger of its wall time and its
-> CPU / parallelism. `test-protocols`, a serial loop that stretched from
-> 432 s to 584 s in a crowded slice, got the same fan-out.
+> CPU / parallelism. `test-protocols` and `test-modular-build` (behind
+> `test-modular-identity`), serial loops that stretched to 584 s and 634 s
+> in crowded slices, got the same fan-out. The `tier1-asan` shards run
+> their `-asan` legs under `make -j` as well.
 
 All numbers below are **measured**, never dry-run. CI durations come from the
 GitHub Actions REST API for real `main` runs on `ubuntu-latest`; local splits

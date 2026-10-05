@@ -12936,46 +12936,49 @@ MODULAR_FIXTURES = ../examples/multi-module/main.kai \
                    ../examples/shadowing/user_shadows_and_qualified_coexist.kai \
                    ../examples/shadowing/user_pub_fn_arity_diff_vs_core.kai \
                    ../examples/shadowing/user_pub_fn_same_arity_shadows_core.kai
-test-modular-build: $(TARGET) build
+MODULAR_CASES := $(shell seq 1 $(words $(MODULAR_FIXTURES)))
+
+# One target per fixture, so the cases fan out under `make -j`. A case's
+# outputs are named by its position in MODULAR_FIXTURES.
+test-modular-build: $(addprefix test-modular-build-case-,$(MODULAR_CASES))
+
+test-modular-build-case-%: $(TARGET) build
 	@set -e; \
-	i=0; \
-	for f in $(MODULAR_FIXTURES); do \
-	  i=$$((i + 1)); \
-	  name=modular-$$i; \
-	  srcdir=$$(cd "$$(dirname $$f)" && pwd); \
-	  exp=$${f%.kai}.out.expected; \
-	  [ -f $$exp ] || exp=$$(dirname $$f)/main.out.expected; \
-	  mod=build/$$name.d; rm -rf $$mod; mkdir -p $$mod; \
-	  $(KAIC2) --emit=c-modular --path ../stdlib --path "$$srcdir" $$f \
-	    > build/$$name.stream \
-	    || { echo "modular FAIL $$name (kaic2 errored)"; exit 1; }; \
-	  nonce=$$(sed -n '1s|^//KAIDELIM:||p' build/$$name.stream); \
-	  [ -n "$$nonce" ] || { echo "modular FAIL $$name (no //KAIDELIM marker)"; exit 1; }; \
-	  awk -v dir="$$mod" -v pfx="//KAIFILE:$$nonce::" \
-	    'index($$0,pfx)==1{out=dir"/"substr($$0,length(pfx)+1);next} out{print > out}' \
-	    build/$$name.stream; \
-	  cp runtime.h $$mod/runtime.h 2>/dev/null || true; \
-	  objs=""; \
-	  for c in $$mod/*.c; do \
-	    o=$${c%.c}.o; \
-	    defs=-DKAI_SEPARATE_COMPILATION=1; \
-	    [ "$$(basename $$c)" = "__root__.c" ] && defs="$$defs -DKAI_RUNTIME_OWNER=1"; \
-	    $(CC) $(CFLAGS) $$defs -I $$mod -I ../stage2 -I ../stage0 -c $$c -o $$o \
-	      || { echo "modular FAIL $$name (compile $$(basename $$c))"; exit 1; }; \
-	    objs="$$objs $$o"; \
-	  done; \
-	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) $$objs -o build/$$name.bin $(LDLIBS_M) \
-	    || { echo "modular FAIL $$name (link)"; exit 1; }; \
-	  ./build/$$name.bin > build/$$name.out \
-	    || { echo "modular FAIL $$name (run)"; cat build/$$name.out; exit 1; }; \
-	  if [ -f $$exp ]; then \
-	    diff -q $$exp build/$$name.out > /dev/null \
-	      && echo "modular OK $$name ($$(basename $$(dirname $$f))/$$(basename $$f))" \
-	      || { echo "modular DIFF $$name"; diff $$exp build/$$name.out; exit 1; }; \
-	  else \
-	    echo "modular OK $$name (no golden, linked + ran clean)"; \
-	  fi; \
-	done
+	f=$(word $*,$(MODULAR_FIXTURES)); \
+	name=modular-$*; \
+	srcdir=$$(cd "$$(dirname $$f)" && pwd); \
+	exp=$${f%.kai}.out.expected; \
+	[ -f $$exp ] || exp=$$(dirname $$f)/main.out.expected; \
+	mod=build/$$name.d; rm -rf $$mod; mkdir -p $$mod; \
+	$(KAIC2) --emit=c-modular --path ../stdlib --path "$$srcdir" $$f \
+	  > build/$$name.stream \
+	  || { echo "modular FAIL $$name (kaic2 errored)"; exit 1; }; \
+	nonce=$$(sed -n '1s|^//KAIDELIM:||p' build/$$name.stream); \
+	[ -n "$$nonce" ] || { echo "modular FAIL $$name (no //KAIDELIM marker)"; exit 1; }; \
+	awk -v dir="$$mod" -v pfx="//KAIFILE:$$nonce::" \
+	  'index($$0,pfx)==1{out=dir"/"substr($$0,length(pfx)+1);next} out{print > out}' \
+	  build/$$name.stream; \
+	cp runtime.h $$mod/runtime.h 2>/dev/null || true; \
+	objs=""; \
+	for c in $$mod/*.c; do \
+	  o=$${c%.c}.o; \
+	  defs=-DKAI_SEPARATE_COMPILATION=1; \
+	  [ "$$(basename $$c)" = "__root__.c" ] && defs="$$defs -DKAI_RUNTIME_OWNER=1"; \
+	  $(CC) $(CFLAGS) $$defs -I $$mod -I ../stage2 -I ../stage0 -c $$c -o $$o \
+	    || { echo "modular FAIL $$name (compile $$(basename $$c))"; exit 1; }; \
+	  objs="$$objs $$o"; \
+	done; \
+	$(CC) $(CFLAGS) $(LDFLAGS_STACK) $$objs -o build/$$name.bin $(LDLIBS_M) \
+	  || { echo "modular FAIL $$name (link)"; exit 1; }; \
+	./build/$$name.bin > build/$$name.out \
+	  || { echo "modular FAIL $$name (run)"; cat build/$$name.out; exit 1; }; \
+	if [ -f $$exp ]; then \
+	  diff -q $$exp build/$$name.out > /dev/null \
+	    && echo "modular OK $$name ($$(basename $$(dirname $$f))/$$(basename $$f))" \
+	    || { echo "modular DIFF $$name"; diff $$exp build/$$name.out; exit 1; }; \
+	else \
+	  echo "modular OK $$name (no golden, linked + ran clean)"; \
+	fi
 
 # Pointer-identity gate for the shared runtime state (issue #1033). stdout
 # diffs cannot see identity: two disjoint per-TU copies of a singleton or the
