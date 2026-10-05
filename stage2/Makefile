@@ -5395,47 +5395,46 @@ test-pipes-collections: $(TARGET) build
 	    || { echo "pipes-collections DIFF $$name"; diff $$exp_out build/pc-$$name.out; exit 1; }; \
 	done
 
-# m12.8 — single-dispatch protocols. Each .kai under
+# Single-dispatch protocols, one target per fixture. Each .kai under
 # `examples/protocols/` either compiles + runs to a known stdout
 # (positive cases — diffed against `<name>.out.expected`) or fails
 # with a specific diagnostic substring (negative cases — every line
 # of `<name>.err.expected` must appear in the compiler's stderr).
-# Positive cases run on both backends (C and LLVM) when an
-# `.out.expected` file is present.
-test-protocols: $(TARGET) build
+PROTOCOLS_FIXTURES := $(filter-out poly_scalar_dispatch bare_narrow_in_assert,$(basename $(notdir $(wildcard ../examples/protocols/*.kai))))
+
+test-protocols: $(addprefix test-protocols-fixture-,$(PROTOCOLS_FIXTURES))
+
+test-protocols-fixture-%: $(TARGET) build core-cache-warm
 	@set -e; \
-	for f in ../examples/protocols/*.kai; do \
-	  name=$$(basename $$f .kai); \
-	  case "$$name" in poly_scalar_dispatch|bare_narrow_in_assert) continue ;; esac; \
-	  exp_out=../examples/protocols/$$name.out.expected; \
-	  exp_err=../examples/protocols/$$name.err.expected; \
-	  if [ -f $$exp_err ]; then \
-	    rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/p2-$$name.err || rc=$$?; \
-	    if [ $$rc -eq 0 ]; then \
-	      echo "protocols FAIL $$name (expected error, got success)"; exit 1; \
-	    fi; \
-	    while read -r line; do \
-	      grep -qF "$$line" build/p2-$$name.err \
-	        || { echo "protocols FAIL $$name (missing diagnostic: $$line)"; \
-	             cat build/p2-$$name.err; exit 1; }; \
-	    done < $$exp_err; \
-	    echo "protocols OK $$name (rejected as expected)"; \
-	  else \
-	    $(KAIC2) $(TEST_CORE_CACHE) $$f > build/p2-$$name.c \
-	      || { echo "protocols FAIL $$name (kaic2 errored)"; exit 1; }; \
-	    $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/p2-$$name.c -o build/p2-$$name $(LDLIBS_M) \
-	      || { echo "protocols FAIL $$name (C compile failed)"; exit 1; }; \
-	    ./build/p2-$$name > build/p2-$$name.out \
-	      || { echo "protocols FAIL $$name (run errored)"; cat build/p2-$$name.out; exit 1; }; \
-	    if [ -f $$exp_out ]; then \
-	      diff -q $$exp_out build/p2-$$name.out > /dev/null \
-	        && echo "protocols OK $$name (C)" \
-	        || { echo "protocols DIFF $$name (C)"; diff $$exp_out build/p2-$$name.out; exit 1; }; \
-	    else \
-	      echo "protocols OK $$name (no golden, ran clean)"; \
-	    fi; \
+	name=$*; f=../examples/protocols/$$name.kai; \
+	exp_out=../examples/protocols/$$name.out.expected; \
+	exp_err=../examples/protocols/$$name.err.expected; \
+	if [ -f $$exp_err ]; then \
+	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/p2-$$name.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "protocols FAIL $$name (expected error, got success)"; exit 1; \
 	  fi; \
-	done
+	  while read -r line; do \
+	    grep -qF "$$line" build/p2-$$name.err \
+	      || { echo "protocols FAIL $$name (missing diagnostic: $$line)"; \
+	           cat build/p2-$$name.err; exit 1; }; \
+	  done < $$exp_err; \
+	  echo "protocols OK $$name (rejected as expected)"; \
+	else \
+	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/p2-$$name.c \
+	    || { echo "protocols FAIL $$name (kaic2 errored)"; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/p2-$$name.c -o build/p2-$$name $(LDLIBS_M) \
+	    || { echo "protocols FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/p2-$$name > build/p2-$$name.out \
+	    || { echo "protocols FAIL $$name (run errored)"; cat build/p2-$$name.out; exit 1; }; \
+	  if [ -f $$exp_out ]; then \
+	    diff -q $$exp_out build/p2-$$name.out > /dev/null \
+	      && echo "protocols OK $$name (C)" \
+	      || { echo "protocols DIFF $$name (C)"; diff $$exp_out build/p2-$$name.out; exit 1; }; \
+	  else \
+	    echo "protocols OK $$name (no golden, ran clean)"; \
+	  fi; \
+	fi
 
 # Regression for the protocol-dispatch ABI mismatch (fix-proto-eq-abi).
 # `examples/protocols/poly_scalar_dispatch.kai` uses `test` blocks

@@ -25,7 +25,7 @@
 # A target's row is its CPU time (user + sys, which adds up across targets
 # sharing a runner) and its wall time (which bounds the slice it is in). A
 # base is the shard's wall minus its slice's. The comment header and the
-# `default` / `parallelism` lines are kept as they are; targets with no
+# `default` / `parallelism` / `elastic` lines are kept as they are; targets with no
 # sample keep their old row, and rows for targets no longer in the pool
 # are dropped. The report on stderr gives each slice's utilisation (CPU /
 # wall): `parallelism` should sit near the highest one.
@@ -53,7 +53,7 @@ cat "$@" | awk -v pool="$pool" -v rows="$tmp.rows" '
   FNR == NR {
     if ($0 ~ /^[ \t]*#/ && !body) { print; next }
     body = 1
-    if ($1 == "default" || $1 == "parallelism") keep[++nkeep] = $0
+    if ($1 == "default" || $1 == "parallelism" || $1 == "elastic") keep[++nkeep] = $0
     else if ($1 == "base") { oldbase[$2] = $3; if ($2 > nbase) nbase = $2 }
     else if (NF >= 2) { oldc[$1] = $2; oldw[$1] = (NF > 2) ? $3 : $2 }
     next
