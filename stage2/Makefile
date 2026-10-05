@@ -3372,15 +3372,17 @@ test-driver-holes: $(TARGET) bin-kai build
 	  build/driver-hole-pipe.json \
 	  || { echo "driver-holes FAIL hole_pipe (content)"; cat build/driver-hole-pipe.json; exit 1; }; \
 	echo "driver-holes OK hole_pipe (--holes-json rides the build front-end: convention-pipe dispatch)"; \
-	src=../examples/typed_holes/hole_candidates_source.kai; \
-	$$KAI build --holes-json $$src > build/driver-hole-src.json; \
-	python3 ../scripts/validate_holes_json.py build/driver-hole-src.json \
-	  || { echo "driver-holes FAIL hole_candidates_source (schema / internal candidate)"; cat build/driver-hole-src.json; exit 1; }; \
-	python3 -c "import json,sys; [print('?%s: %s' % (r['name'], ', '.join(c['expr'] for c in r['candidates']))) for r in json.load(open(sys.argv[1]))]" \
-	  build/driver-hole-src.json > build/driver-hole-src.got; \
-	diff $${src%.kai}.out.expected build/driver-hole-src.got \
-	  || { echo "driver-holes FAIL hole_candidates_source (candidates drifted)"; exit 1; }; \
-	echo "driver-holes OK hole_candidates_source (candidates are source expressions the root can reach)"; \
+	for src in ../examples/typed_holes/hole_candidates_*.kai; do \
+	  name=$$(basename $$src .kai); \
+	  $$KAI build --holes-json $$src > build/driver-$$name.json; \
+	  python3 ../scripts/validate_holes_json.py build/driver-$$name.json \
+	    || { echo "driver-holes FAIL $$name (schema / internal candidate)"; cat build/driver-$$name.json; exit 1; }; \
+	  python3 -c "import json,sys; [print('?%s: %s' % (r['name'], ', '.join(c['expr'] for c in r['candidates']))) for r in json.load(open(sys.argv[1]))]" \
+	    build/driver-$$name.json > build/driver-$$name.got; \
+	  diff $${src%.kai}.out.expected build/driver-$$name.got \
+	    || { echo "driver-holes FAIL $$name (candidates drifted)"; exit 1; }; \
+	  echo "driver-holes OK $$name (candidate golden)"; \
+	done; \
 	echo "driver-holes OK"
 
 # Effects golden gate. Backend parity diffs native against the C

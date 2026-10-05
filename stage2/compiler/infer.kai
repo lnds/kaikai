@@ -17598,9 +17598,13 @@ fn resolve_callsites(css: [CallSite], sub: Subst, mo: Option[String]) : [Resolve
 # type from context but can remain a TyVarT if the hole sits in a
 # position that doesn't constrain (e.g. the whole body of a fn with
 # no declared return).
+#[doc("infer: the function a hole sits in and its parameter names, or none for a hole outside a function.")]
+#[derive(BinSerialize)]
+pub type HoleOwner = HOwner(String, [String]) | HNoOwner
+
 #[doc("infer: `ResolvedHole` — driver-facing type.")]
 #[derive(BinSerialize)]
-pub type ResolvedHole = RH(HoleKind, Int, Int, Ty, [TyEntry], Int)
+pub type ResolvedHole = RH(HoleKind, Int, Int, Ty, [TyEntry], Int, HoleOwner)
 
 # a typed effect-hole resolution. Recorded
 # per occurrence of `?` or `?name` in row tail position; one instance
@@ -17761,13 +17765,13 @@ pub fn drop_last_entries(es: [TyEntry], n: Int) : [TyEntry] {
   if keep <= 0 { [] } else { take_entries(es, keep, []) }
 }
 
-fn resolve_holes(hs: [HoleSite], sub: Subst) : [ResolvedHole] {
+fn resolve_holes(hs: [HoleSite], sub: Subst, owner: HoleOwner) : [ResolvedHole] {
   match hs {
     [] -> []
     [h, ...rest] -> match h {
       HS(kind, line, col, fresh, scope, env_fresh) ->
-        [RH(kind, line, col, apply_ty(sub, TyVarT(fresh)), scope, env_fresh),
-         ...resolve_holes(rest, sub)]
+        [RH(kind, line, col, apply_ty(sub, TyVarT(fresh)), scope, env_fresh, owner),
+         ...resolve_holes(rest, sub, owner)]
     }
   }
 }
@@ -17979,7 +17983,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # instances authored in the user's root file from those that
       # come through core or other modules.
       let resolved0 = resolve_callsites(list_reverse(st2.insts), st2.sub, mo)
-      let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub)
+      let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub, HOwner(nm, map(ps, (p) => p.pname)))
       # apply the final substitution to every
       # `Expr.ty` annotation in the body so the post-inference protocol-
       # call rewrite can read concrete head types from sites whose
@@ -18126,7 +18130,7 @@ fn infer_test_body(file: String, env: TyEnv, core_len: Int,
   let hd = drain_deferred_homs(st2pre, list_reverse(st2pre.deferred_homs), [])
   let st2 = hd.st
   let resolved = resolve_callsites(list_reverse(st2.insts), st2.sub, None)
-  let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub)
+  let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub, HNoOwner)
   let final_body = hom_retarget(finalise_typed_expr(st2.sub, rb.expr), hd.picks)
   TypedDecl {
     decl: test_decl_with_body(d, final_body),
@@ -18172,7 +18176,7 @@ fn infer_const_body(file: String, env: TyEnv, core_len: Int,
     decl: DConst(is_pub, cname, cte, final_body, mo, line, col, csym),
     errs: st2.errs,
     insts: resolved,
-    holes: resolve_holes(list_reverse(st2.holes), st2.sub),
+    holes: resolve_holes(list_reverse(st2.holes), st2.sub, HNoOwner),
     row_holes: [],
     diags: finalize_diags(st2.diags),
     op_res: stamp_op_res_fname(list_reverse(st2.op_res), cname)
@@ -19686,7 +19690,7 @@ pub fn list_has_int(xs: [Int], n: Int) : Bool {
 }
 
 # Reject entries whose return type after stripping TyFnT is a bare
-# bound variable — the scheme accepts anything, so suggesting it is
+# bound variable or `Nothing` — either fits any hole, so suggesting it is
 # noise. Accept structural return types (TyCon, TyList, primitives),
 # which still constrain the substitution meaningfully.
 fn synth_return_structural(sc: TyScheme) : Bool {
@@ -19694,9 +19698,11 @@ fn synth_return_structural(sc: TyScheme) : Bool {
     Scheme(vars, _, _, _, ty) -> match ty {
       TyFnT(_, ret, _) -> match ret {
         TyVarT(v) -> not list_has_int(vars, v)
+        TyAny     -> false
         _         -> true
       }
       TyVarT(v) -> not list_has_int(vars, v)
+      TyAny     -> false
       _         -> true
     }
   }
@@ -19750,7 +19756,7 @@ fn synth_find_args(scope: [TyEntry], params: [Ty], fresh: Int, avoid: [String],
 
 # Try entry `te` as a direct match or a 1-level application against
 # `expected`. Returns rendered candidate text or None.
-fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int) : Option[String] / Mutable {
+fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int, owner: HoleOwner) : Option[String] / Mutable {
   let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], root_fns: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
   match unify(inst.ty, expected, subst_empty()) {
     Some(_) -> Some(te.name)
@@ -19761,7 +19767,9 @@ fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int) 
             None     -> None
             Some(s0) -> match synth_find_args(all_scope, ps, inst.env.fresh, [te.name], s0, []) {
               None    -> None
-              Some(m) -> Some(concat_all([te.name, "(", inf_join_with(m.names, ", "), ")"]))
+              Some(m) ->
+                if synth_reenters_owner(owner, te.name, m.names) { None }
+                else { Some(concat_all([te.name, "(", inf_join_with(m.names, ", "), ")"])) }
             }
           }
         } else { None }
@@ -19771,18 +19779,25 @@ fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int) 
   }
 }
 
+# The function a hole sits in, applied to its own parameters unchanged,
+# type-checks as a filler for its body and never terminates.
+fn synth_reenters_owner(owner: HoleOwner, head: String, args: [String]) : Bool = match owner {
+  HOwner(nm, params) -> nm == head and args == params
+  HNoOwner           -> false
+}
+
 fn synth_candidates_loop(all: [TyEntry], cur: [TyEntry], expected: Ty, fresh: Int,
-                         acc: [String], max: Int) : [String] {
+                         owner: HoleOwner, acc: [String], max: Int) : [String] {
   if list_length(acc) >= max { list_reverse(acc) }
   else { match cur {
     [] -> list_reverse(acc)
-    [te, ...rest] -> match synth_try_entry(all, te, expected, fresh) {
-      Some(expr) -> synth_candidates_loop(all, rest, expected, fresh, [expr, ...acc], max)
-      None       -> synth_candidates_loop(all, rest, expected, fresh, acc, max)
+    [te, ...rest] -> match synth_try_entry(all, te, expected, fresh, owner) {
+      Some(expr) -> synth_candidates_loop(all, rest, expected, fresh, owner, [expr, ...acc], max)
+      None       -> synth_candidates_loop(all, rest, expected, fresh, owner, acc, max)
     }
   } }
 }
 
 #[doc("infer: names in scope whose type unifies with a hole's expected type.")]
-pub fn synth_candidates(scope: [TyEntry], expected: Ty, fresh: Int) : [String] =
-  synth_candidates_loop(scope, scope, expected, fresh, [], 8)
+pub fn synth_candidates(scope: [TyEntry], expected: Ty, fresh: Int, owner: HoleOwner) : [String] =
+  synth_candidates_loop(scope, scope, expected, fresh, owner, [], 8)
