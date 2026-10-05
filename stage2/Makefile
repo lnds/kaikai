@@ -1998,7 +1998,7 @@ test-ffi-pub-axiom-cross-module: $(TARGET) build
 # `--path ../stdlib` so `import loop` resolves; the compile + run
 # is the regression — the bug closed here was a typer fault that
 # made `import loop` itself fail to typecheck whenever any `repeat`
-# from the auto-loaded core preludes (list / string) was a
+# from the auto-loaded cores (list / string) was a
 # candidate. Output diffed against the golden.
 test-issue-248-loop-sugars: $(TARGET) build
 	@set -e; \
@@ -5293,7 +5293,7 @@ test-literals: $(TARGET) build
 # added in `stdlib/core/string.kai` (`length`, `concat`, `slice`,
 # `to_int`) plus a regression guard that the qualified surface
 # and the flat PRELUDE primitive agree byte-for-byte. Loads the
-# core preludes (so `string.length` etc. resolve) — same shape
+# cores (so `string.length` etc. resolve) — same shape
 # as `test-stdlib`. Diff / `.err.expected` discipline mirrors
 # `test-literals`.
 test-string: $(TARGET) build
@@ -10956,6 +10956,13 @@ test-build-modes: $(TARGET) bin-kai build
 # test-build-modes green, so nothing else fails. SKIPs on a cc-only kaic2.
 test-native-cgen-quality: $(TARGET) bin-kai build
 	@../tools/native-cgen-quality-gate.sh ../bin/kai build/native-cgen-quality-work
+
+# A warm native build finds the cached core object before typing, under a
+# pre-key that leaves the core's KIR out: sound only while that KIR does
+# not depend on the program. Two very different programs must share one
+# core object, and their pruned warm builds must match their goldens.
+test-ncore-prekey: $(TARGET) bin-kai build
+	@../tools/ncore-prekey-gate.sh $$(pwd)/../bin/kai $$(pwd)/build/ncore-prekey-work
 
 # Issue #950 — the native backend runs `test` blocks. `kai test` on the
 # fixture must produce the SAME summary + exit code on native as on the C

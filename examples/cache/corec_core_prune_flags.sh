@@ -41,6 +41,15 @@ expect off     --emit=c-modular --core-cache-dir @CC --toolchain-id @TID
 if "$KAIC2" --emit=native "$WORK/main.kai" > /dev/null 2> "$WORK/probe.err"; then
   expect dropped --emit=native
   expect off     --emit=native --core-cache-dir @CC --toolchain-id @TID
+  # A second build under the same cache finds the core object before typing.
+  WARM="$WORK/warm"; mkdir -p "$WARM"
+  cp "$WORK/main.kai" "$WARM/main.kai"
+  for run in cold warm; do
+    (cd "$WARM" && "$KAIC2" $EDITION_FLAG --core-cache-stats --emit=native --core-cache-dir "$WARM" \
+       --toolchain-id "$TID" main.kai > out 2> "$run.err") || { cat "$WARM/$run.err"; fail "native $run build failed"; }
+  done
+  grep -q "core-prune: off" "$WARM/cold.err" || fail "cold native build with a core cache pruned"
+  grep -q "core-prune: dropped" "$WARM/warm.err" || { cat "$WARM/warm.err"; fail "warm native build did not prune on a core-object hit"; }
   expect off     --emit=native-modular
 else
   echo "corec_core_prune_flags: native backend unavailable, native rows skipped"
