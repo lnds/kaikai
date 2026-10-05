@@ -2,7 +2,9 @@ name: release
 
 # Triggered by version tag pushes (`v*`) — produces a GitHub Release with
 # platform-specific tarballs as assets. Manual dispatch is also allowed
-# for re-running against an existing tag if a build needs to be redone.
+# for re-running against an existing tag if a build needs to be redone,
+# or, with mirror_seed_only, for copying an already published seed tag to
+# the public mirror and nothing else.
 on:
   push:
     tags:
@@ -13,6 +15,11 @@ on:
         description: "Tag to build (e.g. v0.39.0)"
         required: true
         type: string
+      mirror_seed_only:
+        description: "Only copy the tag's bootstrap seed to kaikailang-org/kaikai"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -31,6 +38,7 @@ jobs:
             os_name: linux
             arch: x86_64
     runs-on: ${{ matrix.os }}
+    if: ${{ !inputs.mirror_seed_only }}
     # Static-libLLVM cold build (Lane 1.5 flip: the shipped kaic2 links
     # libLLVM IN so `kai build` runs the native default with no system
     # LLVM). On a cache HIT the vendored build/ is reused and the long
@@ -378,9 +386,12 @@ jobs:
           git commit -m "chore(formula): bump to v${version}"
           git push origin HEAD
 
+  # The seed tag goes to the mirror too, on top of the mirror's snapshot of
+  # the release, so a mirror clone can boot with cc alone.
   publish-source:
     name: Mirror filtered source to kaikailang-org/kaikai
-    needs: release
+    needs: [release, seed]
+    if: ${{ !cancelled() && (inputs.mirror_seed_only || (needs.release.result == 'success' && needs.seed.result == 'success')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -395,6 +406,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Checkout work repo at tag (no persisted creds)
+        if: ${{ !inputs.mirror_seed_only }}
         # persist-credentials: false is load-bearing. With the default
         # (true), actions/checkout installs http.extraheader with the
         # ephemeral GITHUB_TOKEN. That header applies to every push to
@@ -408,6 +420,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify VERSION matches tag
+        if: ${{ !inputs.mirror_seed_only }}
         run: |
           ver="$(cat VERSION)"
           tag="${{ steps.tag.outputs.tag }}"
@@ -417,6 +430,7 @@ jobs:
           fi
 
       - name: Apply public-mirror overlay
+        if: ${{ !inputs.mirror_seed_only }}
         run: |
           # Replace CLAUDE.md / add CONTRIBUTING.md / scrub the one
           # internal-lane-report reference in docs/decisions/.
@@ -453,6 +467,7 @@ jobs:
           # .github/ stay; only the workflows dir requires the scope.
 
       - name: Push orphan snapshot as main + tag
+        if: ${{ !inputs.mirror_seed_only }}
         env:
           PUBLISH_TOKEN: ${{ secrets.TAP_PAT }}
         run: |
@@ -479,3 +494,38 @@ jobs:
           git push public HEAD:refs/heads/main --force
           git tag -f "$tag"
           git push public "refs/tags/${tag}" --force
+
+      # Never moves a published seed tag: a mirror seed with the same
+      # bootstrap/ is a no-op, a different one fails.
+      - name: Push the bootstrap seed onto the mirror's tag
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          MIRROR_URL: https://x-access-token:${{ secrets.TAP_PAT }}@github.com/kaikailang-org/kaikai.git
+          GIT_AUTHOR_NAME: kaikai-release-bot
+          GIT_AUTHOR_EMAIL: kaikai-release-bot@users.noreply.github.com
+          GIT_COMMITTER_NAME: kaikai-release-bot
+          GIT_COMMITTER_EMAIL: kaikai-release-bot@users.noreply.github.com
+        run: |
+          set -eu
+          seed="bootstrap-seed-$TAG"
+          export GIT_DIR="$RUNNER_TEMP/seed.git"
+          git init -q --bare "$GIT_DIR"
+          git fetch -q --no-tags --depth=1 "$SOURCE_URL" "refs/tags/$seed:refs/source/seed"
+          if git ls-remote --exit-code "$MIRROR_URL" "refs/tags/$seed" >/dev/null; then
+            git fetch -q --no-tags --depth=1 "$MIRROR_URL" "refs/tags/$seed:refs/mirror/seed"
+            if [ "$(git rev-parse refs/source/seed:bootstrap)" = "$(git rev-parse refs/mirror/seed:bootstrap)" ]; then
+              echo "$seed is already on the mirror with this seed"
+              exit 0
+            fi
+            echo "::error::$seed is already on the mirror with a different seed; a seed tag is never moved"
+            exit 1
+          fi
+          git fetch -q --no-tags --depth=1 "$MIRROR_URL" "refs/tags/$TAG:refs/mirror/release"
+          tree="$({ git ls-tree "refs/mirror/release^{tree}"
+                    printf '040000 tree %s\tbootstrap\n' "$(git rev-parse refs/source/seed:bootstrap)"; } \
+            | git mktree)"
+          commit="$(git log -1 --format=%B refs/source/seed \
+            | git commit-tree "$tree" -p "refs/mirror/release^{commit}")"
+          git for-each-ref --format='%(contents)' refs/source/seed | git tag -a "$seed" -F - "$commit"
+          git push -q "$MIRROR_URL" "refs/tags/$seed"
