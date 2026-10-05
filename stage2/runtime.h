@@ -18621,17 +18621,12 @@ static void kai_evidence_unwind_all(void) {
  * site); strcmp is the fallback for edge cases like dynamically-
  * generated label strings. */
 
-/* Issue #682 — mirror of the compiler-emitted `struct EvCancel` so
- * the runtime can dispatch `Cancel.raise()` synthetically when a
- * sibling-initiated cancel lands at a yield point with a user
- * `with Cancel { raise(_) -> ... }` handler in scope. The compiler
- * emits the same layout in every translation unit that imports the
- * Cancel effect (see the EvCancel struct in the generated C); the
- * prefix (`handler_id`, `env`, `state`, then op fn pointers) is
- * fixed by the Ev-struct convention documented in
- * `docs/effects-impl.md` §*Evidence layout*. Since Cancel has a
- * single op (`raise`), the runtime mirror is two pointers wide and
- * stable across compiler versions within an edition. */
+/* The evidence of the builtin `Cancel`. The runtime dispatches a user
+ * `with Cancel { raise(_) -> ... }` clause itself when a cancellation
+ * lands at a yield point or a scope exit, so the generated C names this
+ * struct for Cancel instead of emitting its own: the clause is then
+ * called through its exact function type. The layout is the Ev-struct
+ * convention (`handler_id`, `env`, `state`, then the op pointers). */
 typedef struct KaiRtEvCancel KaiRtEvCancel;
 struct KaiRtEvCancel {
     KaiHandlerId handler_id;
