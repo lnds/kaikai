@@ -40,6 +40,8 @@ import compiler.loop_lower
 import compiler.doc_attr
 import compiler.native_prims
 import compiler.infer_index
+import compiler.refinements
+import compiler.fmt
 import compiler.index_coll
 import compiler.variant_index
 import compiler.lit_mint
@@ -14667,7 +14669,7 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
       OneStmt { st: after, stmt: SLet(pat, ann, lower_pair.expr) }
     }
     SAssert(cond, msg) -> {
-      let rc = synth(st, cond)
+      let rc = synth_assert_cond(st, cond, contract_assert_kind(msg))
       let s1 = st_unify(rc.st, rc.ty, TyBool, "assert condition", cond.line, cond.col)
       let rm = match msg {
         None -> InferredOptExpr { st: s1, expr: None }
@@ -18711,6 +18713,36 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
         }
       }
       check_body_row_label_loop(st1, fname, rest, declared, fline, fcol)
+    }
+  }
+}
+
+# A contract predicate is synthesised against an empty row, so what it
+# performs is its own and not hidden by the enclosing body's effects.
+fn synth_assert_cond(st: InferState, cond: Expr, kind: Option[String]) : Inferred / Console + File + Mutable =
+  match kind {
+    None    -> synth(st, cond)
+    Some(k) -> {
+      let r = synth(InferState { ...st, row: [], eff_uses: [] }, cond)
+      let st1 = reject_predicate_effect(r.st, k, r.st.row, cond)
+      Inferred { st: InferState { ...st1, row: st.row, eff_uses: st.eff_uses }, ty: r.ty, expr: r.expr }
+    }
+  }
+
+fn reject_predicate_effect(st: InferState, kind: String, performed: [Label], cond: Expr) : InferState / Console + File = match performed {
+  [] -> st
+  [lab, ..._] -> match lookup_eff_use(st.eff_uses, lab.eff) {
+    EU(_, uline, ucol) -> {
+      let line = if uline >= 0 { uline } else { cond.line }
+      let col  = if ucol  >= 0 { ucol  } else { cond.col }
+      let what = match callee_at(cond, line, col) {
+        Some(f) -> "calls effectful function `#{fmt_expr_text(f)}`"
+        None    -> "performs `#{label_display(st.env.head_owners, label_to_string(apply_label_args(st.sub, lab)))}`"
+      }
+      let header = concat_all(["`", kind, "` predicate ", what, ". Refinement / contract predicates may only ",
+                               "call effect-pure functions (those with an empty effect row)."])
+      diag_error(st.file, line, col, header)
+      st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, line, col, header, [])))
     }
   }
 }

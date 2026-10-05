@@ -19,11 +19,9 @@
 #   (also parser-coupled), which in turn calls this module's
 #   `try_eval_pred`.
 #
-# Public surface (8 pub fns; everything else is module-private)
+# Public surface (everything else is module-private)
 #
 # - wrap_with_contracts — called from parse_decl to desugar a fn body.
-# - find_impure_call / refinement_pure_names — the contract-purity
-#   checker, reached from validate_contract_predicates.
 # - synth_refine_pred_fn_name — the refinement-alias pred-fn name,
 #   shared with the post-parse synthesiser in main.kai.
 # - try_eval_int / try_eval_pred — the partial evaluator; try_eval_int
@@ -52,11 +50,11 @@
 import compiler.util
 import compiler.chars
 import compiler.ast
-import compiler.sym_read
 import compiler.intervals
 import compiler.refine_help
 import compiler.fmt
 import compiler.fmt_refine
+import compiler.expr_positions
 
 # m12.6.x #3 v2: the synthesised pred-fn name for a refinement-type
 # alias. Centralised so the call-site builder and the post-parse
@@ -64,127 +62,6 @@ import compiler.fmt_refine
 #[doc("Mint the synthesised predicate-fn name for a refinement-type alias (`__ref_pred_<Type>`).")]
 pub fn synth_refine_pred_fn_name(tyname: String) : String =
   string_concat("__ref_pred_", tyname)
-
-# Enforce that a contract predicate (`requires` / `ensures`) calls
-# only effect-pure functions. Walks the Expr tree once; the first
-# call to a function whose declared effect row is non-empty lands as
-# an error pointing at the offending span.
-#
-# Purity is NOT a hand-maintained name list: a function is pure iff
-# its declared effect row is `REmpty` (the `: T` form with no `/ e`).
-# That fact lives on the function's type, computed and checked by the
-# effect system — the typer already rejects a `REmpty` signature whose
-# body performs an effect. So we read the row off the callee's `DFn`
-# in `decls` (which by construction includes the core + every
-# imported module, so cross-module calls resolve) and admit the call
-# when the row is empty. A callee that resolves to no `DFn` (operator
-# desugar, compiler builtin) carries no effect row and is admitted:
-# effects only ever enter through a fn with a non-empty row.
-#
-# What is allowed:
-#  - Literals (Int, Real, Bool, Char, String, EUnit)
-#  - EVar (parameter / `self` / `result` / outer locals)
-#  - EField, EIndex (read-only access)
-#  - EBinop, EUnop (the standard arithmetic / boolean operators)
-#  - EIf (allowed for short-circuiting)
-#  - ECall / EModCall whose callee is an effect-pure fn (row `REmpty`)
-
-# True when `name` resolves to a `DFn` whose declared effect row is
-# empty, or to no `DFn` at all (operator / builtin — no row to carry
-# an effect). Threads `decls` as the resolution context; matches on
-# the bare fn name (qualified calls land here with the op name only,
-# the same key the typer's qualified env uses).
-#[doc("True when a callee name is effect-pure: its DFn row is REmpty, or it resolves to no DFn.")]
-pub fn callee_is_effect_pure(name: String, decls: [Decl]) : Bool =
-  match decl_row_of_fn(name, decls) {
-    None       -> true        # not a DFn — operator / builtin, no effect row
-    Some(row)  -> match row {
-      REmpty -> true
-      _      -> false
-    }
-  }
-
-# Find the declared effect row of the `DFn` named `name` in `decls`.
-# `None` when no such `DFn` exists. Unwraps the decl wrappers
-# (`DAttribPure` is gone, but `DDerive` / origin-tagged fns still
-# nest a DFn) so a wrapped pure fn still resolves.
-fn decl_row_of_fn(name: String, decls: [Decl]) : Option[RowExpr] {
-  match decls {
-    [] -> None
-    [d, ...rest] -> match d {
-      DFn(_, dn, _, _, _, row, _, _, _, _, _) ->
-        if dn == name { Some(row) } else { decl_row_of_fn(name, rest) }
-      _ -> decl_row_of_fn(name, rest)
-    }
-  }
-}
-
-# Walk an Expr looking for the first call whose callee is not
-# effect-pure. Returns the offending name, or None when pure.
-#[doc("Find the first call in an Expr to a non-effect-pure fn; None when the expression is pure.")]
-pub fn find_impure_call(e: Expr, decls: [Decl]) : Option[String] {
-  match e.kind {
-    EInt(_, _)  -> None
-    EReal(_, _) -> None
-    EIntLit(_) -> None
-    EDecimalLit(_) -> None
-    EFixed(_, _) -> None
-    EBool(_) -> None
-    EChar(_) -> None
-    EStr(_, _) -> None
-    EUnit -> None
-    EVar(_) -> None
-    ESym(_, _, _) -> None
-    EField(b, _) -> find_impure_call(b, decls)
-    EIndex(a, b) -> match find_impure_call(a, decls) {
-      Some(n) -> Some(n)
-      None -> find_impure_call(b, decls)
-    }
-    EBinop(_, a, b) -> match find_impure_call(a, decls) {
-      Some(n) -> Some(n)
-      None -> find_impure_call(b, decls)
-    }
-    EUnop(_, x) -> find_impure_call(x, decls)
-    EIf(c, t_, eo) -> match find_impure_call(c, decls) {
-      Some(n) -> Some(n)
-      None -> match find_impure_call(t_, decls) {
-        Some(n) -> Some(n)
-        None -> match eo {
-          Some(eb) -> find_impure_call(eb, decls)
-          None -> None
-        }
-      }
-    }
-    ECall(callee, args_) -> {
-      let callee_check = match sym_read_kind(callee.kind) {
-        EVar(name) ->
-          if callee_is_effect_pure(name, decls) { None }
-          else { Some(name) }
-        # Qualified calls (`module.op(...)`) land as EModCall carrying
-        # the bare op name — the same key `decls` is indexed by.
-        EModCall(_, name) ->
-          if callee_is_effect_pure(name, decls) { None }
-          else { Some(name) }
-        _ -> Some(fmt_expr_text(callee))
-      }
-      match callee_check {
-        Some(n) -> Some(n)
-        None -> find_impure_call_args(args_, decls)
-      }
-    }
-    _ -> Some("<unsupported>")
-  }
-}
-
-fn find_impure_call_args(args_: [Expr], decls: [Decl]) : Option[String] {
-  match args_ {
-    [] -> None
-    [a, ...rest] -> match find_impure_call(a, decls) {
-      Some(n) -> Some(n)
-      None -> find_impure_call_args(rest, decls)
-    }
-  }
-}
 
 # m12.6.b: desugar contracts into asserts inside the body. The
 # semantics are:
@@ -1292,6 +1169,32 @@ pub fn reported_binding_span(ident: String) : String =
 # reference an already-consumed param. Shared by the C and LLVM emitters.
 pub fn assert_span_is_requires(span: String) : Bool =
   assert_span_prefix_loop(span, "\"requires violated", 0)
+
+#[doc("The callee of the call written at (`line`, `col`) inside `e`, or None when no call starts there.")]
+pub fn callee_at(e: Expr, line: Int, col: Int) : Option[Expr] = match e.kind {
+  ECall(f, _) -> if e.line == line and e.col == col { Some(f) } else { callee_at_xps(xp_positions(e), line, col) }
+  _           -> callee_at_xps(xp_positions(e), line, col)
+}
+
+fn callee_at_xps(xps: [XPos], line: Int, col: Int) : Option[Expr] = match xps {
+  [] -> None
+  [XP(_, x), ...rest] -> match callee_at(x, line, col) {
+    Some(f) -> Some(f)
+    None    -> callee_at_xps(rest, line, col)
+  }
+}
+
+#[doc("The contract clause (`requires` or `ensures`) an assert was lowered from, or None for a user-written assert.")]
+pub fn contract_assert_kind(opt_msg: Option[Expr]) : Option[String] = match opt_msg {
+  Some(m) -> match m.kind {
+    EStr(span, false) ->
+      if assert_span_is_requires(span) { Some("requires") }
+      else if assert_span_prefix_loop(span, "\"ensures violated", 0) { Some("ensures") }
+      else { None }
+    _ -> None
+  }
+  None -> None
+}
 
 fn assert_span_prefix_loop(s: String, prefix: String, i: Int) : Bool {
   let pn = string_length(prefix)
