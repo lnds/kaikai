@@ -124,6 +124,12 @@
 > The plan now reads `TIER1_SELFHOSTS`, using the `base0` lines of the cost
 > table when it is 0. CI passes the same value to every shard, because
 > shards that saw different values would compute different slices.
+>
+> The namespace-collision corpus was shard 2's whole fixed work. Its two
+> C-modular axes now run on shard 3, each with its own ratchet. The C axis
+> itself cannot be split by fixture index: its ratchet gates a failure
+> count over the whole axis, so two halves on two runners could not share
+> that budget soundly.
 
 All numbers below are **measured**, never dry-run. CI durations come from the
 GitHub Actions REST API for real `main` runs on `ubuntu-latest`; local splits
