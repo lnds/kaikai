@@ -57,6 +57,15 @@ void * kaix_core_llvm_build_array_alloca(void *b, void *elemty, void *count, Kai
 void * kaix_core_llvm_build_array_gep(void *b, void *arrty, void *arr, void *idx) { return kai_llvm_build_array_gep(b, arrty, arr, idx); }
 KaiValue * kaix_core_llvm_build_br(void *b, void *bb) { return kai_llvm_build_br(b, bb); }
 void * kaix_core_llvm_build_call_n(void *b, void *fn, void *fnty, void *buf) { return kai_llvm_build_call_n(b, fn, fnty, buf); }
+void * kaix_core_llvm_build_invoke_n(void *b, void *fn, void *fnty, void *buf, void *tb, void *ub) { return kai_llvm_build_invoke_n(b, fn, fnty, buf, tb, ub); }
+void * kaix_core_llvm_build_landingpad_cleanup(void *b) { return kai_llvm_build_landingpad_cleanup(b); }
+KaiValue * kaix_core_native_ctx_set_pad(void *cv, void *bb) { return kai_native_ctx_set_pad(cv, bb); }
+void * kaix_core_native_ctx_pad(void *cv) { return kai_native_ctx_pad(cv); }
+void * kaix_core_llvm_get_insert_block(void *b) { return kai_llvm_get_insert_block(b); }
+void * kaix_core_native_build_call(void *cv, void *fn, void *fnty, void *buf) { return kai_native_build_call(cv, fn, fnty, buf); }
+KaiValue * kaix_core_llvm_build_resume(void *b, void *lp) { return kai_llvm_build_resume(b, lp); }
+KaiValue * kaix_core_llvm_set_personality(void *fn, void *pers) { return kai_llvm_set_personality(fn, pers); }
+KaiValue * kaix_core_llvm_add_uwtable(void *fn) { return kai_llvm_add_uwtable(fn); }
 KaiValue * kaix_core_llvm_build_cond_br(void *b, void *cond, void *then_bb, void *else_bb) { return kai_llvm_build_cond_br(b, cond, then_bb, else_bb); }
 void * kaix_core_llvm_build_fbinop(void *b, int64_t op, void *a, void *c) { return kai_llvm_build_fbinop(b, op, a, c); }
 void * kaix_core_llvm_build_fcmp(void *b, int64_t pred, void *a, void *c) { return kai_llvm_build_fcmp(b, pred, a, c); }
