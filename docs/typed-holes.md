@@ -97,6 +97,12 @@ private to another module, nor a compiler-internal key (an operation
 keyed by effect identity, a `Type::Ctor` lookup key, a `__`-prefixed
 helper).
 
+Two shapes fit a hole without moving toward a filler, so neither is a
+candidate: the enclosing function applied to its own parameters
+unchanged (it never returns), and a call whose result is `Nothing`. A
+recursive call on other arguments, such as a sub-term bound by a
+pattern, stays.
+
 `kind` is `"hole"` for `?` / `?name` and `"todo"` for `todo!("msg")`,
 which share the typed-hole pipeline (see *Implementation notes*).
 `message` carries the `todo!` argument for `"todo"` kinds, `null`
