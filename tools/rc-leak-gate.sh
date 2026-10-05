@@ -25,7 +25,9 @@
 # Counts are deterministic per backend but NOT equal across them: the two
 # backends disagree on how many cells survive to exit for a third of the
 # corpus, so the baseline pins one column each. KAI_LEAK_BACKEND selects
-# the backend (default c); KAI_LEAK_JOBS the worker count.
+# the backend (default c); KAI_LEAK_JOBS the worker count; KAI_LEAK_SHARD=I/N
+# measures every N-th fixture from the I-th, while the orphan check below
+# still sees the whole corpus.
 #
 # An exact pin cannot tell a leak from state that legitimately lives until
 # exit, so a leak recorded when the pin was taken stays green forever. Each
@@ -234,11 +236,20 @@ collect_fixtures() {
 
 fixtures="$WORK/fixtures.txt"
 collect_fixtures > "$fixtures"
-total="$(wc -l < "$fixtures" | tr -d ' ')"
+
+shard="${KAI_LEAK_SHARD:-1/1}"
+si="${shard%/*}"; sn="${shard#*/}"
+case "$si/$sn" in
+  *[!0-9/]*|/*|*/) echo "rc-leak-gate: KAI_LEAK_SHARD='$shard' is not I/N" >&2; exit 2 ;;
+esac
+[ "$si" -ge 1 ] && [ "$si" -le "$sn" ] || { echo "rc-leak-gate: KAI_LEAK_SHARD='$shard' is not I/N with 1 <= I <= N" >&2; exit 2; }
+shard_list="$WORK/shard.txt"
+awk -v i="$si" -v n="$sn" '(NR - i) % n == 0' "$fixtures" > "$shard_list"
+total="$(wc -l < "$shard_list" | tr -d ' ')"
 
 self_test || exit 1
-echo "rc-leak-gate: $total fixtures, $BACKEND backend, $JOBS workers"
-xargs -P "$JOBS" -n 1 -I{} bash -c 'measure_one "$@"' _ {} < "$fixtures"
+echo "rc-leak-gate: $total of $(wc -l < "$fixtures" | tr -d ' ') fixtures (shard $si/$sn), $BACKEND backend, $JOBS workers"
+xargs -P "$JOBS" -n 1 -I{} bash -c 'measure_one "$@"' _ {} < "$shard_list"
 
 fail=0
 while IFS= read -r id; do
@@ -271,7 +282,7 @@ while IFS= read -r id; do
     echo "FAIL $id — leaked grows by $growth per run of main, pinned growth $(pinned_growth "$corpus" "$name")"
     fail=1
   fi
-done < "$fixtures"
+done < "$shard_list"
 
 # A pin with no fixture behind it: the fixture was renamed or deleted and
 # the pin was left orphaned.
