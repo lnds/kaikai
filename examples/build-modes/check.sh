@@ -21,6 +21,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$HERE/panic_trace.kai"
 mkdir -p "$WORK"
 
+# Sizes compare builds made in the same cache state: a warm build links a
+# pruned core, so a shared cache warmed by other builds skews them.
+KAI_CORE_CACHE_DIR="$WORK/core-cache"
+rm -rf "$KAI_CORE_CACHE_DIR"
+export KAI_CORE_CACHE_DIR
+
 fail() { echo "build-modes check FAIL: $1" >&2; exit 1; }
 
 # Detect native availability: a default build that prints the C-only note
