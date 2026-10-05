@@ -256,7 +256,8 @@ mmap alive for the life of the process.
 
 A non-local exit (a handler clause that abandons `resume`, a delivered
 cancellation) releases what the frames it jumps over still owned, through
-the per-fiber unwind stack (`docs/effects-impl.md`).
+the per-fiber unwind stack (`docs/effects-impl.md`). A mailbox scope frees its
+mailbox in its handler's `finally`, so the mailbox is released on those paths too.
 
 Every Perceus decision reads one table of binder reads, keyed by binder
 identity (a function's repeated binder names are renamed apart first), so the

@@ -969,6 +969,12 @@ KAI_RT_COUNTER(int64_t kai_rc_alloc_by_tag[16], {0});
  * after the singletons. */
 KAI_RT_COUNTER(int64_t kai_arena_alloc_total, 0);
 KAI_RT_COUNTER(int64_t kai_arena_free_total, 0);
+/* Mailboxes are malloc'd outside the RC ledger; a scope that ends without
+ * closing its mailbox shows as mailbox_live != 0 at exit. */
+KAI_RT_COUNTER(int64_t kai_mbox_alloc_total, 0);
+KAI_RT_COUNTER(int64_t kai_mbox_free_total, 0);
+static __attribute__((noinline)) void kai_mbox_count_alloc(void) { kai_mbox_alloc_total++; }
+static __attribute__((noinline)) void kai_mbox_count_free(void) { kai_mbox_free_total++; }
 /* issue #118 — Perceus reuse-in-place counter. Bumped by every
  * successful in-place rewrite in kai_reuse_or_alloc_* (further down). */
 KAI_RT_COUNTER(int64_t kai_rc_reuse_total, 0);
@@ -1058,6 +1064,7 @@ typedef struct {
     int64_t alloc_total, free_total, live_peak;
     int64_t alloc_by_tag[16];
     int64_t arena_alloc_total, arena_free_total;
+    int64_t mbox_alloc_total, mbox_free_total;
     int64_t reuse_total, vec_inplace_total, vec_cow_total;
     int64_t reuse_free_total, tok_unique, tok_null_shared, tok_null_mismatch;
 #ifdef KAI_TRACE_RC
@@ -1069,6 +1076,7 @@ typedef struct KaiRcLedgerBlock {
     const int64_t *alloc_total, *free_total, *live_peak;
     const int64_t *alloc_by_tag;
     const int64_t *arena_alloc_total, *arena_free_total;
+    const int64_t *mbox_alloc_total, *mbox_free_total;
     const int64_t *reuse_total, *vec_inplace_total, *vec_cow_total;
     const int64_t *reuse_free_total, *tok_unique, *tok_null_shared, *tok_null_mismatch;
 #ifdef KAI_TRACE_RC
@@ -1103,6 +1111,8 @@ static void kai_rc_ledger_fill(KaiRcLedgerBlock *b) {
     b->alloc_by_tag      = kai_rc_alloc_by_tag;
     b->arena_alloc_total = &kai_arena_alloc_total;
     b->arena_free_total  = &kai_arena_free_total;
+    b->mbox_alloc_total  = &kai_mbox_alloc_total;
+    b->mbox_free_total   = &kai_mbox_free_total;
     b->reuse_total       = &kai_rc_reuse_total;
     b->vec_inplace_total = &kai_vec_inplace_total;
     b->vec_cow_total     = &kai_vec_cow_total;
@@ -1122,6 +1132,8 @@ static void kai_rc_ledger_add(KaiRcLedgerSum *s, const KaiRcLedgerBlock *b) {
     for (int i = 0; i < 16; i++) s->alloc_by_tag[i] += b->alloc_by_tag[i];
     s->arena_alloc_total += *b->arena_alloc_total;
     s->arena_free_total  += *b->arena_free_total;
+    s->mbox_alloc_total  += *b->mbox_alloc_total;
+    s->mbox_free_total   += *b->mbox_free_total;
     s->reuse_total       += *b->reuse_total;
     s->vec_inplace_total += *b->vec_inplace_total;
     s->vec_cow_total     += *b->vec_cow_total;
@@ -1269,6 +1281,13 @@ static void kai_rc_report(void) {
             (long long) s.arena_alloc_total,
             (long long) s.arena_free_total,
             (long long) (s.arena_alloc_total - s.arena_free_total));
+    }
+    if (s.mbox_alloc_total > 0) {
+        fprintf(stderr,
+            "[KAI_TRACE_RC]   mailbox_alloc=%lld mailbox_free=%lld mailbox_live=%lld\n",
+            (long long) s.mbox_alloc_total,
+            (long long) s.mbox_free_total,
+            (long long) (s.mbox_alloc_total - s.mbox_free_total));
     }
 }
 
@@ -4128,6 +4147,7 @@ static inline void kai_mbox_unlock(KaiMailbox *mb) { if (mb->mu_inited) pthread_
 static KaiMailbox *kai_mailbox_new(int cap, int overflow, int owned) {
     KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
     if (!mb) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+    kai_mbox_count_alloc();
     kai_mailbox_init_mu(mb);
     mb->cap      = cap;
     mb->overflow = overflow;
@@ -4480,6 +4500,7 @@ static void kai_mailbox_unpin(KaiMailbox *mb) {
     if (atomic_fetch_sub_explicit(&mb->pins, 1, memory_order_acq_rel) != 1) return;
     if (mb->mu_inited) pthread_mutex_destroy(&mb->mu);
     free(mb);
+    kai_mbox_count_free();
 }
 
 /* End the owning scope: queued messages are released on the owner's thread,
