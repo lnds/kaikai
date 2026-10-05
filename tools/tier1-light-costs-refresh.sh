@@ -24,7 +24,8 @@
 #
 # A target's row is its CPU time (user + sys, which adds up across targets
 # sharing a runner) and its wall time (which bounds the slice it is in). A
-# base is the shard's wall minus its slice's. The comment header and the
+# base is the shard's wall minus its slice's: `base` from runs with
+# selfhosts=1, `base0` from runs with selfhosts=0. The comment header and the
 # `default` / `parallelism` / `elastic` lines are kept as they are; targets with no
 # sample keep their old row, and rows for targets no longer in the pool
 # are dropped. The report on stderr gives each slice's utilisation (CPU /
@@ -55,6 +56,7 @@ cat "$@" | awk -v pool="$pool" -v rows="$tmp.rows" '
     body = 1
     if ($1 == "default" || $1 == "parallelism" || $1 == "elastic") keep[++nkeep] = $0
     else if ($1 == "base") { oldbase[$2] = $3; if ($2 > nbase) nbase = $2 }
+    else if ($1 == "base0") oldbase0[$2] = $3
     else if (NF >= 2) { oldc[$1] = $2; oldw[$1] = (NF > 2) ? $3 : $2 }
     next
   }
@@ -68,8 +70,10 @@ cat "$@" | awk -v pool="$pool" -v rows="$tmp.rows" '
       slice[$(i + 1)] = $(i + 2)
       printf "slice %s: wall %ds, cpu %ds, utilisation %.2f\n", $(i + 1), $(i + 2), runcpu, ($(i + 2) > 0) ? runcpu / $(i + 2) : 0 > "/dev/stderr"
       runcpu = 0
-    } else if ($(i + 3) == "selfhosts=1" && ($(i + 1) in slice)) {
-      add(base, $(i + 1), $(i + 2) - slice[$(i + 1)]); delete slice[$(i + 1)]
+    } else if ($(i + 3) ~ /^selfhosts=[01]$/ && ($(i + 1) in slice)) {
+      if ($(i + 3) == "selfhosts=1") add(base, $(i + 1), $(i + 2) - slice[$(i + 1)])
+      else add(base0, $(i + 1), $(i + 2) - slice[$(i + 1)])
+      delete slice[$(i + 1)]
       if ($(i + 1) > nbase) nbase = $(i + 1)
     }
   }
@@ -80,6 +84,10 @@ cat "$@" | awk -v pool="$pool" -v rows="$tmp.rows" '
     for (k = 1; k <= nbase; k++) {
       if (k in base) print "base", k, ceil(median(base[k]))
       else { print "base", k, oldbase[k] + 0; print "base " k ": no sample, kept" > "/dev/stderr" }
+    }
+    for (k = 1; k <= nbase; k++) {
+      if (k in base0) print "base0", k, ceil(median(base0[k]))
+      else if (k in oldbase0) print "base0", k, oldbase0[k]
     }
     print ""
     n = split(pool, t, " ")

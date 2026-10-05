@@ -19,6 +19,9 @@
 # CPU and no pole. Each slice prints longest first, so `make -j` starts
 # its long poles before the short targets.
 #
+# A shard's fixed work depends on TIER1_SELFHOSTS: with it 0, a `base0`
+# line replaces that shard's `base`. Every shard must see the same value.
+#
 # Every shard computes the whole plan and keeps its own slice, so the
 # slices partition the pool by construction; --check re-derives all of
 # them and fails if a target is lost, duplicated, or listed twice.
@@ -45,7 +48,7 @@ fi
 shards=$1
 shift
 
-echo "$*" | awk -v mode="$mode" -v want="$shard" -v n="$shards" '
+echo "$*" | awk -v mode="$mode" -v want="$shard" -v n="$shards" -v selfhosts="${TIER1_SELFHOSTS:-1}" '
   function cpu(t) { return (t in c) ? c[t] : dflt }
   function pole(t) { return (t in el) ? 0 : (t in p) ? p[t] : dflt }
   function wall(k, addc, addp,   big, work) {
@@ -69,7 +72,8 @@ echo "$*" | awk -v mode="$mode" -v want="$shard" -v n="$shards" '
   }
   FNR == NR {
     if ($0 ~ /^[ \t]*(#|$)/) next
-    if ($1 == "base") base[$2] = $3
+    if ($1 == "base") { if (!($2 in base)) base[$2] = $3 }
+    else if ($1 == "base0") { if (selfhosts == 0) base[$2] = $3 }
     else if ($1 == "default") dflt = $2
     else if ($1 == "parallelism") par = $2
     else if ($1 == "elastic") el[$2] = 1

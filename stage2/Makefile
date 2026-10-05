@@ -13375,8 +13375,9 @@ test-light-parallel: $(TARGET) build core-cache-warm
 SHARD  ?= 1
 SHARDS ?= 1
 TIER1_LIGHT_PLAN = ../tools/tier1-light-plan.sh
+TIER1_SELFHOSTS ?= 1
 test-light-shard: $(TARGET) bin-kai build core-cache-warm
-	@slice=$$(sh $(TIER1_LIGHT_PLAN) $(SHARD) $(SHARDS) $(TEST_LIGHT_TARGETS)) || exit 1; \
+	@slice=$$(TIER1_SELFHOSTS=$(TIER1_SELFHOSTS) sh $(TIER1_LIGHT_PLAN) $(SHARD) $(SHARDS) $(TEST_LIGHT_TARGETS)) || exit 1; \
 	echo "test-light-shard $(SHARD)/$(SHARDS): $$(echo $$slice | wc -w | tr -d ' ') targets"; \
 	start=$$(date +%s); rc=0; \
 	[ -z "$$slice" ] || $(MAKE) -j$(TEST_JOBS) $$(printf ' tier1-light-timed-%s' $$slice) || rc=$$?; \
@@ -13397,7 +13398,8 @@ test-light-partition:
 	@for f in test-lists/light.txt test-lists/native-wrapper.txt test-lists/native-gates-1.txt test-lists/native-gates-2.txt; do \
 	  LC_ALL=C sort -c -u $$f || { echo "test-light-partition FAIL: $$f must hold one target per line, sorted, no repeats"; exit 1; }; \
 	done
-	@sh $(TIER1_LIGHT_PLAN) --check $(SHARDS) $(TEST_LIGHT_TARGETS)
+	@TIER1_SELFHOSTS=1 sh $(TIER1_LIGHT_PLAN) --check $(SHARDS) $(TEST_LIGHT_TARGETS)
+	@TIER1_SELFHOSTS=0 sh $(TIER1_LIGHT_PLAN) --check $(SHARDS) $(TEST_LIGHT_TARGETS)
 
 test: $(TARGET) build
 	@$(MAKE) test-costly-parallel
