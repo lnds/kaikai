@@ -7441,13 +7441,10 @@ type InferState = { file: String, env: TyEnv, core_len: Int, sub: Subst, recs: [
                     # analysis sees the op-name collision where it is
                     # actually decided.
                     op_res: [OpResolution],
-                    # true while type-checking a handler op-clause body.
-                    # `resume` is only legal in call position (`resume(v)`);
-                    # any value-position use (`let k = resume`, `f(resume)`)
-                    # escapes the clause and is rejected. Set on clause entry,
-                    # cleared inside lambdas (where `resume` is an ordinary
-                    # identifier), restored by `st_restore_entries`.
-                    in_clause: Bool,
+                    # The continuation of the op clause under inference,
+                    # its last param: legal only in call position. None
+                    # inside a lambda, where the name is an ordinary one.
+                    in_clause: Option[String],
                     # module the decl under inference belongs to; "" for
                     # the root file. A constructor this home declares is
                     # never ambiguous at a use site inside it.
@@ -7569,7 +7566,7 @@ fn infer_state_new_full_aliases(file: String, env: TyEnv, core_len: Int,
                recs: recs, errs: 0, insts: [], holes: [], row: [],
                eff_uses: [], aliases: [], clause_resume: None,
                op_eff_arities: op_eff_arities, ret_ty: None,
-               type_aliases: type_aliases, op_to_eff: op_to_eff, proto_impls: [], sums: [], diags: [], deferred_fields: [], deferred_homs: [], op_payload_labels: [], op_res: [], in_clause: false, home: "" }
+               type_aliases: type_aliases, op_to_eff: op_to_eff, proto_impls: [], sums: [], diags: [], deferred_fields: [], deferred_homs: [], op_payload_labels: [], op_res: [], in_clause: None, home: "" }
 
 fn st_set_proto_impls(st: InferState, pis: [ProtoImplReg]) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
@@ -7933,7 +7930,7 @@ fn st_set_home_str(st: InferState, h: String) : InferState =
                deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: st.op_payload_labels,
                op_res: st.op_res, in_clause: st.in_clause, home: h }
 
-fn st_set_in_clause(st: InferState, b: Bool) : InferState =
+fn st_set_in_clause(st: InferState, b: Option[String]) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
@@ -8830,12 +8827,19 @@ fn synth_sym_read(st: InferState, sy: SymId, nm: String,
     None -> synth_name_read(st, nm, e)
   }
 
+fn names_clause_continuation(st: InferState, nm: String) : Bool = match st.in_clause {
+  Some(k) -> k == nm
+  None    -> false
+}
+
 fn synth_name_read(st: InferState, nm: String, e: Expr) : Inferred / Console + File + Mutable =
-  if nm == "resume" and st.in_clause {
-    diag_error(st.file, e.line, e.col,
-      "`resume` may only be called, not used as a value: it cannot escape its handler clause")
-    diag_help("call the continuation directly, e.g. `resume(v)`")
-    inferred_leaf(st_bump_err(st), TyAny, e)
+  if names_clause_continuation(st, nm) {
+    let header = "`#{nm}` may only be called, not used as a value: it cannot escape its handler clause"
+    let help_msg = "call the continuation directly, e.g. `#{nm}(v)`"
+    diag_error(st.file, e.line, e.col, header)
+    diag_help(help_msg)
+    let d = mk_diag(SevError, st.file, e.line, e.col, header, [ri_help(st.file, e.line, e.col, help_msg)])
+    inferred_leaf(st_bump_err(st_push_diag(st, d)), TyAny, e)
   } else { match ty_env_lookup(st.env, nm) {
     Some(sc) -> {
       let r = st_instantiate_report(st, sc)
@@ -9325,7 +9329,7 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
         # that requires a `kai_alias_<a>_id` C local that is not
         # in scope here. Same boundary the rewrite-pass enforces
         # in `rewrite_alias_clause`.
-        let st_clause_in = st_set_in_clause(st_disable_alias_tag(st_resume), true)
+        let st_clause_in = st_set_in_clause(st_disable_alias_tag(st_resume), clause_continuation(params))
         let rb = synth(st_clause_in, body)
         let st_out0 = st_restore_entries(outer, rb.st)
         let st_out = st_set_clause_resume(st_out0, outer.clause_resume)
@@ -10408,9 +10412,9 @@ fn hom_commit(st: InferState, nm: String, m: String, want: Ty,
 # (`bind_resume_param_typed` bound it to `(answer) -> ?fresh`). Done here
 # rather than via the generic `synth(callee)` path so the callee `resume`
 # never reaches the value-position guard in the `synth` `EVar` arm.
-fn synth_resume_call_stateless(st: InferState, args_: [Expr], callee: Expr,
+fn synth_resume_call_stateless(st: InferState, name: String, args_: [Expr], callee: Expr,
                                 line: Int, col: Int) : Inferred / Console + File + Mutable {
-  let callee_ty = match ty_env_lookup(st.env, "resume") {
+  let callee_ty = match ty_env_lookup(st.env, name) {
     Some(sc) -> (st_instantiate_report(st, sc)).ty
     None     -> TyAny
   }
@@ -10421,7 +10425,7 @@ fn synth_resume_call_stateless(st: InferState, args_: [Expr], callee: Expr,
   let expected = TyFnT(ra.tys, rv.ty, Row { labels: [], tail: Some(fr.id), display_alias: None })
   let st_unif = st_unify_call(st_fresh, callee, callee_ty, ra.tys, expected, line, col)
   let ty = apply_ty(st_unif.sub, rv.ty)
-  let resume_root = with_ty(mk_ref("resume", callee.line, callee.col), callee_ty)
+  let resume_root = with_ty(mk_ref(canonical_continuation(), callee.line, callee.col), callee_ty)
   let root = with_ty(mk_expr(ECall(resume_root, ra.exprs), line, col), ty)
   mk_inferred(st_unif, ty, root)
 }
@@ -10438,12 +10442,10 @@ fn try_resume_call(st: InferState, callee: Expr, args_: [Expr],
 
   match callee.kind {
     EVar(name) ->
-      if name == "resume" {
+      if names_clause_continuation(st, name) {
         match st.clause_resume {
           Some(rb) -> Some(synth_resume_call(st, rb, args_, callee, line, col))
-          None -> if st.in_clause {
-            Some(synth_resume_call_stateless(st, args_, callee, line, col))
-          } else { None }
+          None     -> Some(synth_resume_call_stateless(st, name, args_, callee, line, col))
         }
       } else { None }
     _ -> None
@@ -10479,7 +10481,7 @@ fn synth_resume_call(st: InferState, rb: ResumeBind, args_: [Expr],
         }
       }
       let ty = apply_ty(st_after.sub, rv.ty)
-      let resume_root = with_ty(mk_ref("resume", callee.line, callee.col), TyAny)
+      let resume_root = with_ty(mk_ref(canonical_continuation(), callee.line, callee.col), TyAny)
       let root = with_ty(mk_expr(ECall(resume_root, ra.exprs), line, col), ty)
       mk_inferred(st_after, ty, root)
     }
@@ -12410,18 +12412,9 @@ fn synth_lambda_threaded(st: InferState, ps: [Param], body: Expr,
   # restores ret_ty from `outer` after the walk, so subsequent
   # siblings of the lambda see the function-level ret_ty unchanged.
   let st_in2 = st_set_ret_ty(st_in, None)
-  # the same boundary applies to clause_resume.
-  # `resume(v)` only makes sense inside the immediate handler clause
-  # that introduced it; a lambda lifted out of the clause body does
-  # not have access to the clause's continuation. Without this, a lambda
-  # inside `raise(resume) -> { (() => resume(v))() }` would type-
-  # check `resume(v)` against the outer clause's answer/state types
-  # — silently accepting code that, at runtime, calls the wrong
-  # continuation. Mirror the alias-tag boundary at line 14294.
-  # inside a lambda lifted out of the clause body, `resume` is an
-  # ordinary identifier (a shadowing param binds it; otherwise it falls
-  # to the env), so the value-position rejection does not apply here.
-  let st_in3 = st_set_in_clause(st_set_clause_resume(st_in2, None), false)
+  # A lambda lifted out of a clause body does not reach the clause's
+  # continuation: inside it the continuation's name is an ordinary one.
+  let st_in3 = st_set_in_clause(st_set_clause_resume(st_in2, None), None)
   let rb = synth(st_in3, body)
   # keep the row labels in their raw form so a downstream
   # `unify_row` partition can see TyVar payloads (an `Actor[?T]` mint-
