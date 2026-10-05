@@ -1,0 +1,285 @@
+# compiler/prelude_reach.kai -- the core-prelude functions a build can
+# reach, so the rest are never typed, lowered or emitted.
+#
+# Runs on the resolved program, after protocol lowering has turned every
+# impl method into a `__pimpl_*` function and every protocol operation
+# into a `__proto_*` dispatcher. Every decl outside the core prelude is a
+# root, and so is every core decl that is not a function. A function is
+# reached by name, homonyms included. A field access reaches its name
+# too, since `x.f(..)` may be method sugar the typer resolves to `f`. A
+# protocol is reached through its dispatcher or an operator that is sugar
+# for it, and keeps every impl, because the dispatcher picks one at run
+# time. A pipe keeps the core functions the typer inserts for it.
+
+import compiler.util
+import compiler.ast
+import compiler.expr_positions
+import compiler.infer_index
+import compiler.core_refs
+import compiler.emit_shared
+import compiler.evidence_inject
+
+#[doc("A pruned program: the decls a build keeps and the names of the core functions it dropped.")]
+pub type PreludeCut = PreludeCut([Decl], [String])
+
+#[doc("Drop the core-prelude functions nothing in `decls` can reach. `core_mods` are the core modules; `reg` the protocol registry, whose impl entries map each `__pimpl_*` to its protocol.")]
+pub fn prelude_reach(decls: [Decl], core_mods: [String], reg: ProtocolReg) : PreludeCut / Console = {
+  let core_fns = filter(decls, (d) => pr_is_core_fn(d, core_mods))
+  let st0 = PrSt { live: idx_empty(), fns: pr_index(core_fns, idx_empty()), impls: reg.impls,
+                   disps: pr_dispatchers(core_fns, []), protos: [], bps: [], trigs: [], work: [] }
+  let st = pr_drain(pr_decls(filter(decls, (d) => not pr_is_core_fn(d, core_mods)), st0))
+  PreludeCut(filter(decls, (d) => not pr_is_core_fn(d, core_mods) or pr_in(st.live, pr_name(d))),
+             map(filter(core_fns, (d) => not pr_in(st.live, pr_name(d))), pr_name))
+}
+
+#[doc("The dropped core functions `decls` still reference, each a reachability rule pruning is missing. A specialisation counts as its template; a name some decl in `decls` declares is never a miss. Run it on the monomorphised program: later passes read and drop local binders, whose names can coincide with a dropped function.")]
+pub fn prelude_cut_misses(decls: [Decl], dropped: [String]) : [String] / Console = {
+  let declared = pr_name_set(map(filter(decls, pr_is_fn), (d) => evi_demangle_base(pr_name(d))), idx_empty())
+  let ck = PrCheck { gone: pr_name_set(dropped, idx_empty()), declared: declared, misses: [] }
+  list_uniq(pr_check_decls(decls, ck).misses)
+}
+
+# ---- names -------------------------------------------------------------
+
+fn pr_is_core_fn(d: Decl, core_mods: [String]) : Bool = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo, _) -> match mo {
+    Some(m) -> list_has(core_mods, m)
+    None    -> false
+  }
+  _ -> false
+}
+
+fn pr_is_fn(d: Decl) : Bool = match d {
+  DFn(_, _, _, _, _, _, _, _, _, _, _) -> true
+  _ -> false
+}
+
+fn pr_name(d: Decl) : String = match d {
+  DFn(_, n, _, _, _, _, _, _, _, _, _) -> n
+  _ -> ""
+}
+
+fn pr_index(fns: [Decl], ix: NameIndex[Decl]) : NameIndex[Decl] = match fns {
+  [] -> ix
+  [d, ...rest] -> pr_index(rest, idx_prepend(ix, pr_name(d), d))
+}
+
+fn pr_name_set(ns: [String], ix: NameIndex[String]) : NameIndex[String] = match ns {
+  [] -> ix
+  [n, ...rest] -> pr_name_set(rest, idx_prepend(ix, n, n))
+}
+
+# Buckets are keyed by hash, so membership re-tests the name.
+fn pr_in(ix: NameIndex[String], n: String) : Bool = list_has(idx_chain(ix, n), n)
+
+fn pr_named(ds: [Decl], n: String) : Bool = match ds {
+  [] -> false
+  [d, ...rest] -> pr_name(d) == n or pr_named(rest, n)
+}
+
+# ---- reachability ------------------------------------------------------
+
+# `live` holds the reached core function names; `work` the reached
+# functions whose bodies are still to scan.
+type PrSt = { live: NameIndex[String], fns: NameIndex[Decl], impls: [ProtoImplReg],
+              disps: [PrDisp], protos: [String], bps: [Int], trigs: [Int], work: [Decl] }
+
+# A dispatcher and its protocol. The typer calls a dispatcher by name
+# when it lowers an operator, so a reached protocol reaches them too.
+type PrDisp = PrDisp(String, String)
+
+fn pr_dispatchers(fns: [Decl], acc: [PrDisp]) : [PrDisp] = match fns {
+  [] -> acc
+  [d, ...rest] -> pr_dispatchers(rest, match d {
+    DFn(_, n, _, _, _, _, body, _, _, _, _) ->
+      if not proto_dispatch_marker_in(body) { acc }
+      else { match proto_dispatch_parts(body) { PDP(p, _) -> [PrDisp(p, n), ...acc] } }
+    _ -> acc
+  })
+}
+
+fn pr_disp_fns(ds: [PrDisp], p: String, acc: [String]) : [String] = match ds {
+  [] -> acc
+  [PrDisp(proto, n), ...rest] -> pr_disp_fns(rest, p, if proto == p { [n, ...acc] } else { acc })
+}
+
+fn pr_drain(st: PrSt) : PrSt / Console = match st.work {
+  [] -> st
+  [d, ...rest] -> pr_drain(pr_decl(d, pr_with_work(st, rest)))
+}
+
+fn pr_with_work(st: PrSt, w: [Decl]) : PrSt =
+  PrSt { ...st, work: w }
+
+# Reaching a name reaches every core function spelled so; references to
+# anything else cost one lookup and no allocation.
+fn pr_ref(st: PrSt, n: String) : PrSt =
+  if pr_in(st.live, n) { st }
+  else {
+    let ds = idx_chain(st.fns, n)
+    if not pr_named(ds, n) { st }
+    else {
+      PrSt { ...st, live: idx_prepend(st.live, n, n), work: pr_push_named(ds, n, st.work) }
+    }
+  }
+
+fn pr_push_named(ds: [Decl], n: String, w: [Decl]) : [Decl] = match ds {
+  [] -> w
+  [d, ...rest] -> pr_push_named(rest, n, if pr_name(d) == n { [d, ...w] } else { w })
+}
+
+fn pr_refs(st: PrSt, ns: [String]) : PrSt = match ns {
+  [] -> st
+  [n, ...rest] -> pr_refs(pr_ref(st, n), rest)
+}
+
+# A reached protocol reaches every impl and dispatcher of it.
+fn pr_proto(st: PrSt, p: String) : PrSt =
+  if p == "" or list_has(st.protos, p) { st }
+  else {
+    pr_refs(PrSt { ...st, protos: [p, ...st.protos] }, pr_impl_fns(st.impls, p, pr_disp_fns(st.disps, p, [])))
+  }
+
+fn pr_impl_fns(impls: [ProtoImplReg], p: String, acc: [String]) : [String] = match impls {
+  [] -> acc
+  [PIR(proto, _, _, fname, _, _, _, _), ...rest] ->
+    pr_impl_fns(rest, p, if proto == p { [fname, ...acc] } else { acc })
+}
+
+fn pr_binop(st: PrSt, op: String) : PrSt = {
+  let bp = binop_proto(op)
+  let k = pr_bp_rank(bp)
+  if k == 0 or list_has_int(st.bps, k) { st }
+  else {
+    pr_proto(PrSt { ...st, bps: [k, ...st.bps] }, op_proto_protocol(bp))
+  }
+}
+
+fn pr_bp_rank(bp: BinopProto) : Int = match bp {
+  BpNone -> 0
+  BpAdd  -> 1
+  BpSub  -> 2
+  BpMul  -> 3
+  BpDiv  -> 4
+  BpRem  -> 5
+  BpEq   -> 6
+  BpOrd  -> 7
+}
+
+# A pipe reaches the core functions the typer inserts for it.
+fn pr_trig(st: PrSt, t: CoreTrigger) : PrSt = {
+  let k = pr_trig_rank(t)
+  if list_has_int(st.trigs, k) { st }
+  else {
+    pr_refs(PrSt { ...st, trigs: [k, ...st.trigs] },
+            map(filter(variants[CoreFn](), (cf) => core_fn_fires_on(cf, t)), core_fn_name))
+  }
+}
+
+fn pr_trig_rank(t: CoreTrigger) : Int = match t {
+  TrMapPipe     -> 1
+  TrFlatMapPipe -> 2
+  TrFilterPipe  -> 3
+  TrRangeApply  -> 4
+}
+
+fn list_has_int(xs: [Int], k: Int) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> h == k or list_has_int(rest, k)
+}
+
+fn pr_decls(ds: [Decl], st: PrSt) : PrSt / Console = match ds {
+  [] -> st
+  [d, ...rest] -> pr_decls(rest, pr_decl(d, st))
+}
+
+fn pr_decl(d: Decl, st: PrSt) : PrSt / Console =
+  pr_exprs(pr_decl_exprs(d), st)
+
+fn pr_exprs(es: [Expr], st: PrSt) : PrSt / Console = match es {
+  [] -> st
+  [e, ...rest] -> pr_exprs(rest, pr_expr(e, st))
+}
+
+fn pr_expr(e: Expr, st: PrSt) : PrSt / Console = match e.kind {
+  EVar(n)        -> pr_ref(st, n)
+  ESym(_, _, n)  -> pr_ref(st, n)
+  EModCall(_, n) -> pr_ref(st, n)
+  ETodo(_)       ->
+    if proto_dispatch_marker_in(e) { match proto_dispatch_parts(e) { PDP(p, _) -> pr_proto(st, p) } }
+    else { st }
+  k -> pr_positions(xp_positions(e), pr_node(k, st))
+}
+
+# What a node reaches beyond its children's references.
+fn pr_node(k: ExprKind, st: PrSt) : PrSt = match k {
+  EField(_, n)       -> pr_ref(st, n)
+  EBinop(op, _, _)   -> pr_binop(st, op)
+  EMapPipe(_, _)     -> pr_trig(st, TrMapPipe)
+  EFlatMapPipe(_, _) -> pr_trig(st, TrFlatMapPipe)
+  EFilterPipe(_, _)  -> pr_trig(st, TrFilterPipe)
+  EPipe(head, _)     -> match head.kind { ERange(_, _, _) -> pr_trig(st, TrRangeApply)  _ -> st }
+  _ -> st
+}
+
+fn pr_positions(ps: [XPos], st: PrSt) : PrSt / Console = match ps {
+  [] -> st
+  [XP(_, x), ...rest] -> pr_positions(rest, pr_expr(x, st))
+}
+
+# The expressions a decl evaluates: bodies, constant initialisers and
+# the clauses of an effect's default handler.
+fn pr_decl_exprs(d: Decl) : [Expr] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _, _)   -> [body]
+  DTest(_, body, _, _, _)                   -> [body]
+  DBench(_, body, _, _, _)                  -> [body]
+  DCheck(_, _, body, _, _, _)               -> [body]
+  DConst(_, _, _, body, _, _, _, _)         -> [body]
+  DEffect(_, _, _, _, Some(DBlk(cs, ret, _, _)), _, _, _, _) ->
+    list_append(map(cs, pr_clause_body), pr_ret_body(ret))
+  DUnstable(inner, _, _)                    -> pr_decl_exprs(inner)
+  DConstructor(inner, _, _)                 -> pr_decl_exprs(inner)
+  DDoc(_, _, inner, _, _)                   -> pr_decl_exprs(inner)
+  DAttr(_, inner, _, _)                     -> pr_decl_exprs(inner)
+  _ -> []
+}
+
+fn pr_clause_body(c: HClause) : Expr = match c { HC(_, _, b, _, _) -> b }
+
+fn pr_ret_body(o: Option[HReturn]) : [Expr] = match o {
+  Some(HR(_, b, _, _)) -> [b]
+  None -> []
+}
+
+# ---- the post-lowering check -------------------------------------------
+
+type PrCheck = { gone: NameIndex[String], declared: NameIndex[String], misses: [String] }
+
+fn pr_check_decls(ds: [Decl], ck: PrCheck) : PrCheck / Console = match ds {
+  [] -> ck
+  [d, ...rest] -> pr_check_decls(rest, pr_check_exprs(pr_decl_exprs(d), ck))
+}
+
+fn pr_check_exprs(es: [Expr], ck: PrCheck) : PrCheck / Console = match es {
+  [] -> ck
+  [e, ...rest] -> pr_check_exprs(rest, pr_check_expr(e, ck))
+}
+
+fn pr_check_expr(e: Expr, ck: PrCheck) : PrCheck / Console = match e.kind {
+  EVar(n)        -> pr_check_ref(ck, n)
+  ESym(_, _, n)  -> pr_check_ref(ck, n)
+  EModCall(_, n) -> pr_check_ref(ck, n)
+  _ -> pr_check_positions(xp_positions(e), ck)
+}
+
+fn pr_check_positions(ps: [XPos], ck: PrCheck) : PrCheck / Console = match ps {
+  [] -> ck
+  [XP(_, x), ...rest] -> pr_check_positions(rest, pr_check_expr(x, ck))
+}
+
+fn pr_check_ref(ck: PrCheck, n0: String) : PrCheck = {
+  let n = evi_demangle_base(n0)
+  if pr_in(ck.gone, n) and not pr_in(ck.declared, n) {
+    PrCheck { gone: ck.gone, declared: ck.declared, misses: [n, ...ck.misses] }
+  } else { ck }
+}
