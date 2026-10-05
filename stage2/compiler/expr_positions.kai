@@ -91,9 +91,7 @@ pub fn xp_positions_kind(k: ExprKind) : [XPos] = match k {
   EIndex(a, b)       -> [XP(XAll, a), XP(XAll, b)]
   # `and` / `or` short-circuit: the right operand runs on some paths only,
   # and no alternative covers the skipped path.
-  EBinop(op, a, b)   ->
-    if op == "and" or op == "or" { [XP(XAll, a), XP(XSc, b)] }
-    else { [XP(XAll, a), XP(XAll, b)] }
+  EBinop(op, a, b)   -> [XP(XAll, a), XP(if xp_short_circuit(op) { XSc } else { XAll }, b)]
   EUnop(_, x)        -> [XP(XAll, x)]
   EIf(c, t, oe)      -> [XP(XAll, c), XP(XBr, t), ...xp_opt(XBr, oe)]
   EMatch(s, arms)    -> [XP(XAll, s), ...xp_arms(arms)]
@@ -101,15 +99,14 @@ pub fn xp_positions_kind(k: ExprKind) : [XPos] = match k {
   ERecordLit(_, fs)  -> xp_fields(fs)
   EList(els)         -> xp_elems(els)
   ERange(a, b, os)   -> [XP(XAll, a), XP(XAll, b), ...xp_opt(XAll, os)]
-  EBlock(ss, ot)     -> list_append(xp_stmts(ss), xp_opt(XAll, ot))
+  EBlock(ss, ot)     -> xp_stmts(ss, xp_opt(XAll, ot))
   EPipe(a, b)        -> [XP(XAll, a), XP(XAll, b)]
   EMapPipe(a, b)     -> [XP(XAll, a), XP(XAll, b)]
   EFlatMapPipe(a, b) -> [XP(XAll, a), XP(XAll, b)]
   EFilterPipe(a, b)  -> [XP(XAll, a), XP(XAll, b)]
   EBang(x)           -> [XP(XAll, x)]
   EHandle(body, _, _, _, oi, _, cls, oret) ->
-    list_append([...xp_opt(XAll, oi), XP(XAll, body), ...xp_clauses(cls)],
-                xp_hret(oret))
+    xp_onto(XAll, oi, [XP(XAll, body), ...xp_clauses(cls, xp_hret(oret))])
   ELitUnit(x, _)     -> [XP(XAll, x)]
   EIntrinsic(_, xs)  -> xp_all(xs)
   ESurface(sf)       -> xp_all(surface_children(sf))
@@ -120,32 +117,41 @@ fn xp_all(xs: [Expr]) : [XPos] = match xs {
   [h, ...rest] -> [XP(XAll, h), ...xp_all(rest)]
 }
 
-fn xp_opt(r: XRole, o: Option[Expr]) : [XPos] = match o {
-  None    -> []
-  Some(x) -> [XP(r, x)]
+fn xp_opt(r: XRole, o: Option[Expr]) : [XPos] = xp_onto(r, o, [])
+
+# `o`'s position, if any, in front of `tail`.
+fn xp_onto(r: XRole, o: Option[Expr], tail: [XPos]) : [XPos] = match o {
+  None    -> tail
+  Some(x) -> [XP(r, x), ...tail]
+}
+
+fn xp_short_circuit(op: String) : Bool = match string_length(op) {
+  3 -> string_byte_at_int(op, 0) == 97 and string_byte_at_int(op, 1) == 110 and string_byte_at_int(op, 2) == 100
+  2 -> string_byte_at_int(op, 0) == 111 and string_byte_at_int(op, 1) == 114
+  _ -> false
 }
 
 # A guard runs only if the pattern matched; a body only if the guard
 # also passed. Both are branch positions of the match.
 fn xp_arms(arms: [Arm]) : [XPos] = match arms {
   []           -> []
-  [Arm(_, og, b), ...rest] ->
-    list_append([...xp_opt(XBr, og), XP(XBr, b)], xp_arms(rest))
+  [Arm(_, og, b), ...rest] -> xp_onto(XBr, og, [XP(XBr, b), ...xp_arms(rest)])
 }
 
-fn xp_stmts(ss: [Stmt]) : [XPos] = match ss {
-  []           -> []
-  [s, ...rest] -> list_append(xp_stmt(s), xp_stmts(rest))
+# The statements' positions in front of `tail`.
+fn xp_stmts(ss: [Stmt], tail: [XPos]) : [XPos] = match ss {
+  []           -> tail
+  [s, ...rest] -> xp_stmt(s, xp_stmts(rest, tail))
 }
 
-fn xp_stmt(s: Stmt) : [XPos] = match s {
-  SLet(_, _, rhs)             -> [XP(XAll, rhs)]
-  SVar(_, _, init, _, _)      -> [XP(XAll, init)]
-  SExprStmt(x)                -> [XP(XAll, x)]
-  SAssert(c, om)              -> [XP(XAll, c), ...xp_opt(XMsg, om)]
-  SIndexAssign(a, i, v, _, _) -> [XP(XAll, a), XP(XAll, i), XP(XAll, v)]
-  SAssign(a, v, _, _)         -> [XP(XAll, a), XP(XAll, v)]
-  SUse(_, _, _)               -> []
+fn xp_stmt(s: Stmt, tail: [XPos]) : [XPos] = match s {
+  SLet(_, _, rhs)             -> [XP(XAll, rhs), ...tail]
+  SVar(_, _, init, _, _)      -> [XP(XAll, init), ...tail]
+  SExprStmt(x)                -> [XP(XAll, x), ...tail]
+  SAssert(c, om)              -> [XP(XAll, c), ...xp_onto(XMsg, om, tail)]
+  SIndexAssign(a, i, v, _, _) -> [XP(XAll, a), XP(XAll, i), XP(XAll, v), ...tail]
+  SAssign(a, v, _, _)         -> [XP(XAll, a), XP(XAll, v), ...tail]
+  SUse(_, _, _)               -> tail
 }
 
 fn xp_fields(fs: [FieldInit]) : [XPos] = match fs {
@@ -161,9 +167,9 @@ fn xp_elems(els: [ListElem]) : [XPos] = match els {
   }
 }
 
-fn xp_clauses(cls: [HClause]) : [XPos] = match cls {
-  []           -> []
-  [HC(_, _, b, _, _), ...rest] -> [XP(XCl, b), ...xp_clauses(rest)]
+fn xp_clauses(cls: [HClause], tail: [XPos]) : [XPos] = match cls {
+  []           -> tail
+  [HC(_, _, b, _, _), ...rest] -> [XP(XCl, b), ...xp_clauses(rest, tail)]
 }
 
 fn xp_hret(o: Option[HReturn]) : [XPos] = match o {

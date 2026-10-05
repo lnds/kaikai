@@ -254,6 +254,11 @@ of the self-call. The first two were
 unbounded on spawn-heavy code: each pinned fiber wrapper keeps a 64 KiB stack
 mmap alive for the life of the process.
 
+A non-local exit (a handler clause that abandons `resume`, a delivered
+cancellation) releases what the frames it jumps over still owned, through
+the per-fiber unwind stack (`docs/effects-impl.md`). A mailbox scope frees its
+mailbox in its handler's `finally`, so the mailbox is released on those paths too.
+
 Every Perceus decision reads one table of binder reads, keyed by binder
 identity (a function's repeated binder names are renamed apart first), so the
 rewriter and the payers can no longer disagree on how often a binder is read.
@@ -273,6 +278,9 @@ Unlike the sources above, these surface in ordinary user programs:
 
 - #2143 — native only: a nested arm binder homonymous with an outer one is
   released by the outer arm's exit drop (use-after-free under ASAN).
+- #2424 — a trap raised from pure code (an out-of-range index, a division by
+  zero) inside a spawned fiber leaks the references its caller frames hold:
+  only calls whose row can unwind are bracketed.
 - #2222 — native only: a binder bound under a record or tuple field's list,
   variant or `@` pattern owns no reference, so a release planned for it frees
   cells the scrutinee still holds. The branch payers leave these binders out.

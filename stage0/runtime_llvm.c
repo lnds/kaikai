@@ -1355,6 +1355,12 @@ KaiValue *kaix_core_ref_set(KaiValue *r, KaiValue *v)                 { return k
  * the static resolution; that lands when the native walk grows UoM. */
 KaiValue *kaix_core_unit_name(KaiValue *x)                            { if (x) kai_decref(x); return kai_str(""); }
 
+/* Unwind-stack pop: a leaf store on the fiber the push returned, so it is
+ * safe to inline. The push reads the active fiber and stays owner-side. */
+void kaix_unw_pop(KaiFiber *f) { kai_unw_pop(f); }
+KaiFiber *kaix_unw_push_f(KaiFiber **cache, KaiValue **base, int64_t n) { return kai_unw_push_c(cache, base, (intptr_t) n); }
+KaiFiber *kaix_unw_push_ev_state_f(KaiFiber **cache, void *ev) { return kai_unw_push_c(cache, (KaiValue **)((char *) ev + 16), 1); }
+
 /* m7c-c / m7c-d — kaix_* wrappers around the static runtime
  * helpers in runtime.h. The LLVM IR can only see externally-
  * linkable symbols, so these thin shims expose every helper the
@@ -1386,6 +1392,9 @@ KaiEvidence *kaix_evidence_lookup_or_default(const char *eff_label, KaiEvidence 
 void kaix_check_cancel_yield_point(void) { kai_check_cancel_yield_point(); }
 
 void kaix_evidence_pop(void) { kai_evidence_pop(); }
+
+
+/* The Ev's state slot (byte 16, as kaix_clause_state_get reads it). */
 
 void *kaix_evidence_lookup_handler(const char *eff_label) {
     KaiEvidence *node = kai_evidence_lookup_node(eff_label);

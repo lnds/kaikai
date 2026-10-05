@@ -1,0 +1,126 @@
+#[doc("""
+Whether a call can unwind. A fn is judged by its declared row; one whose
+row is open with nothing that can unwind does so only through what its
+arguments bring. A perform by its effect; a closure by its type.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.expr_positions
+import compiler.marks
+import compiler.chars
+import compiler.unwind_clauses
+import compiler.unwind_cx
+
+# Whether an argument of type `t` can bring an effect that unwinds: a
+# closure whose row can, a value that can carry a closure, an unknown.
+fn ue_carries(t: Option[Ty], ucx: UnwCx) : Bool = match t {
+  Some(x) -> ue_ty_carries(x, ucx)
+  None    -> true
+}
+
+fn ue_ty_carries(t: Ty, ucx: UnwCx) : Bool = match t {
+  TyFnT(_, _, _)          -> unw_ty_unwinds(Some(t), ucx)
+  TyListT(a)              -> ue_ty_carries(a, ucx)
+  TyCon(_, n, args, _)    -> list_has(ucx.carriers, unw_bare_effect(n)) or ue_tys_carry(args, ucx) or unw_effect_unwinds(n, ucx)
+  TyDimT(a, _)            -> ue_ty_carries(a, ucx)
+  TyRefineT(a, _)         -> ue_ty_carries(a, ucx)
+  TyUnion(ts)             -> ue_tys_carry(ts, ucx)
+  TyVarT(_)               -> true
+  TyAny                   -> true
+  TyShapeApp(_, _)        -> true
+  _                       -> false
+}
+
+fn ue_tys_carry(ts: [Ty], ucx: UnwCx) : Bool = match ts {
+  [] -> false
+  [t, ...rest] -> ue_ty_carries(t, ucx) or ue_tys_carry(rest, ucx)
+}
+
+fn ue_args_carry(xs: [Expr], ucx: UnwCx) : Bool = match xs {
+  [] -> false
+  [x, ...rest] -> ue_arg_carries(x, ucx) or ue_args_carry(rest, ucx)
+}
+
+# A lambda literal brings what its body can do, whatever its row says; a
+# mark around an argument changes who owns it, not what it can do.
+fn ue_arg_carries(x: Expr, ucx: UnwCx) : Bool = match x.kind {
+  ELambda(_, body) -> unw_scan(body, ucx)
+  ECall(g, [y]) -> match g.kind {
+    EMark(_) -> ue_arg_carries(y, ucx)
+    _        -> ue_carries(x.ty, ucx)
+  }
+  _ -> ue_carries(x.ty, ucx)
+}
+
+# ---- the scan --------------------------------------------------------------
+
+#[doc("Whether any call `e` makes in place may unwind; a lambda or clause body runs in its own frame.")]
+pub fn unw_scan(e: Expr, ucx: UnwCx) : Bool = match e.kind {
+  ECall(f, xs) -> ue_call(f, xs, [], true, ucx) or ue_scan_ps(xp_positions(e), ucx)
+  _ -> ue_scan_ps(xp_positions(e), ucx)
+}
+
+fn ue_scan_ps(ps: [XPos], ucx: UnwCx) : Bool = match ps {
+  [] -> false
+  [XP(r, c), ...rest] -> (xrole_inline(r) and unw_scan(c, ucx)) or ue_scan_ps(rest, ucx)
+}
+
+#[doc("""
+True when the call of `f` on `xs` can unwind. A callee named in `locals`
+is a closure, judged by its type; a fn by its declared row; a perform by
+its effect. Tail-call sentinels and marks other than the borrowing
+indirect call are not calls.
+""")]
+pub fn unw_call_unwinds(f: Expr, xs: [Expr], locals: [String], ucx: UnwCx) : Bool = ue_call(f, xs, locals, false, ucx)
+
+# `scan` also judges a fn callee by its type, which covers a closure the
+# scan cannot tell from a fn: it must answer yes wherever the walk does.
+fn ue_call(f: Expr, xs: [Expr], locals: [String], scan: Bool, ucx: UnwCx) : Bool = match f.kind {
+  EMark(MkApplyBorrow) -> match xs {
+    [clo, ..._] -> unw_ty_unwinds(clo.ty, ucx)
+    []          -> false
+  }
+  EMark(_) -> false
+  EVar(n) -> ue_named(f, n, xs, locals, scan, ucx)
+  ESym(_, _, n) -> ue_named(f, n, xs, locals, scan, ucx)
+  EModCall(m, n) -> if ue_is_effect_name(m) { unw_effect_unwinds(m, ucx) } else { ue_fn(f, n, xs, scan, ucx) }
+  _ -> unw_ty_unwinds(f.ty, ucx)
+}
+
+fn ue_named(f: Expr, n: String, xs: [Expr], locals: [String], scan: Bool, ucx: UnwCx) : Bool =
+  if list_has(locals, n) { unw_ty_unwinds(f.ty, ucx) }
+  else if ue_is_perform(n) { unw_effect_unwinds(ue_head(n, 0), ucx) }
+  else { ue_fn(f, n, xs, scan, ucx) }
+
+# A fn is judged by its declared row. The scan cannot tell a local
+# closure from a fn, so it also asks the callee's type.
+fn ue_fn(f: Expr, n: String, xs: [Expr], scan: Bool, ucx: UnwCx) : Bool = {
+  let c = ue_class(n, ucx)
+  if c == 1 { true }
+  else if c == 2 { ue_args_carry(xs, ucx) }
+  else if c == 0 or ue_internal(n) { false }
+  else { scan and unw_ty_unwinds(f.ty, ucx) }
+}
+
+fn ue_class(n: String, ucx: UnwCx) : Int = {
+  let c = unw_fn_class(n, ucx)
+  if c == 1 or unw_last_dot(n) < 0 { c } else { unw_class_max(c, unw_fn_class(unw_bare_effect(n), ucx)) }
+}
+
+# A `__`-prefixed callee is a compiler-internal form, never a call.
+fn ue_internal(n: String) : Bool = string_byte_at_int(n, 0) == 95 and string_byte_at_int(n, 1) == 95
+
+# `E.op` performs E.
+fn ue_is_perform(n: String) : Bool = unw_last_dot(n) >= 0 and ue_is_effect_name(n)
+
+fn ue_head(n: String, i: Int) : String =
+  if i >= string_length(n) { n }
+  else if string_byte_at_int(n, i) == 46 { string_slice(n, 0, i) }
+  else { ue_head(n, i + 1) }
+
+# A qualifier spelled with a capital is an effect, so the call is a perform.
+fn ue_is_effect_name(m: String) : Bool = match char_at(m, 0) {
+  Some(c) -> ch_is_upper(c)
+  None    -> false
+}

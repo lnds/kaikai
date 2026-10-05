@@ -1,0 +1,115 @@
+#[doc("""
+Which calls can exit non-locally, decided once per program.
+
+A call unwinds when its effect row holds an effect some handler may
+abandon its continuation for, or `Cancel`. A clause abandons when one of
+its paths finishes without calling `resume`, and an effect whose clause
+can itself unwind is as good as abandoning: the jump leaves through the
+frames that performed it. When the program can cancel a fiber from
+outside (`Spawn`, `Link`), every perform is a cancellation point, so
+every call with a non-empty row unwinds.
+
+The decision may only err toward "unwinds": a call wrongly taken for
+one that cannot leaves its frame's references to leak on that jump.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.emit_shared
+import compiler.unwind_clauses
+import compiler.unwind_carriers
+import compiler.unwind_cx
+import compiler.unwind_calls
+
+#[doc("The unwind context of a program: its decls and every handler clause in them.")]
+pub fn unw_cx(decls: [Decl], clauses: [ClauseInfo]) : UnwCx = {
+  let effs = ue_effect_names(decls, [])
+  let all = ue_rows_cancel(decls)
+  let hs = unw_clauses(clauses, decls)
+  let carriers = unw_carriers(decls)
+  let unw = if all { [] } else { ue_fix(hs, decls, effs, carriers, unw_abandoning(hs, ["Cancel"])) }
+  let c = ue_cx(decls, effs, carriers, unw, all)
+  UnwCx { effs: c.effs, fns: c.fns, unw: c.unw, all: c.all, carriers: c.carriers, handles: ue_handle_fns(clauses, []) }
+}
+
+fn ue_cx(decls: [Decl], effs: [String], carriers: [String], unw: [String], all: Bool) : UnwCx = {
+  let base = UnwCx { effs: effs, fns: array_make(1, []), unw: unw, all: all, carriers: carriers, handles: [] }
+  UnwCx { effs: effs, unw: unw, all: all, carriers: carriers, fns: ue_table(decls, base), handles: [] }
+}
+
+fn ue_handle_fns(cs: [ClauseInfo], acc: [String]) : [String] = match cs {
+  [] -> acc
+  [CI(_, _, _, _, _, _, _, enc, _, _, _), ...rest] -> ue_handle_fns(rest, if list_has(acc, enc) { acc } else { [enc, ...acc] })
+}
+
+fn ue_effect_names(decls: [Decl], acc: [String]) : [String] = match decls {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DEffect(_, name, _, _, _, _, _, _, _) -> ue_effect_names(rest, [name, ...acc])
+    _ -> ue_effect_names(rest, acc)
+  }
+}
+
+fn ue_table(decls: [Decl], ucx: UnwCx) : Array[[UnwFn]] = {
+  let t = array_make(1024, [])
+  foreach(decls, (d) => match d {
+    DFn(_, name, _, _, _, row, _, _, _, _, _) -> {
+      let b = unw_bucket(name, 1024)
+      t[b] := [UF(name, unw_row_class(row, ucx)), ...t[b]]
+    }
+    _ -> ()
+  })
+  t
+}
+
+
+# ---- cancellation from outside -------------------------------------------
+
+fn ue_rows_cancel(decls: [Decl]) : Bool = match decls {
+  [] -> false
+  [d, ...rest] -> match d {
+    DFn(_, _, _, _, _, row, _, _, _, _, _) -> ue_row_cancels(row) or ue_rows_cancel(rest)
+    _ -> ue_rows_cancel(rest)
+  }
+}
+
+fn ue_row_cancels(row: RowExpr) : Bool = match row {
+  REmpty       -> false
+  RClosed(ls)  -> ue_cancel_label(rl_names(ls))
+  ROpen(_, ls) -> ue_cancel_label(rl_names(ls))
+}
+
+fn ue_cancel_label(ns: [String]) : Bool = unw_any_effect_in(ns, ["Spawn", "Link"])
+
+# Adds every effect one of whose clauses can unwind, until none is added.
+fn ue_fix(hs: [UnwClause], decls: [Decl], effs: [String], carriers: [String], unw: [String]) : [String] = {
+  let ucx = ue_cx(decls, effs, carriers, unw, false)
+  let more = ue_unwinding_clauses(hs, ucx, unw)
+  if list_length(more) == list_length(unw) { unw } else { ue_fix(hs, decls, effs, carriers, more) }
+}
+
+fn ue_unwinding_clauses(hs: [UnwClause], ucx: UnwCx, acc: [String]) : [String] = match hs {
+  [] -> acc
+  [UnwC(eff, k, body), ...rest] ->
+    if list_has(acc, eff) or not ue_clause_unwinds(body, k, ucx) { ue_unwinding_clauses(rest, ucx, acc) }
+    else { ue_unwinding_clauses(rest, ucx, [eff, ...acc]) }
+}
+
+# A clause's resume in tail position returns into the perform: only its
+# arguments can unwind there.
+fn ue_clause_unwinds(e: Expr, k: String, ucx: UnwCx) : Bool = match e.kind {
+  ECall(f, xs) -> match f.kind {
+    EVar(n) -> if n == k { ue_any_scan(xs, ucx) } else { unw_scan(e, ucx) }
+    _       -> unw_scan(e, ucx)
+  }
+  EBlock(ss, Some(t)) -> ue_stmts_scan(ss, ucx) or ue_clause_unwinds(t, k, ucx)
+  EIf(c, t, Some(el)) -> unw_scan(c, ucx) or ue_clause_unwinds(t, k, ucx) or ue_clause_unwinds(el, k, ucx)
+  _ -> unw_scan(e, ucx)
+}
+
+fn ue_any_scan(xs: [Expr], ucx: UnwCx) : Bool = match xs {
+  [] -> false
+  [x, ...rest] -> unw_scan(x, ucx) or ue_any_scan(rest, ucx)
+}
+
+fn ue_stmts_scan(ss: [Stmt], ucx: UnwCx) : Bool = unw_scan(mk_expr(EBlock(ss, None), 0, 0), ucx)
