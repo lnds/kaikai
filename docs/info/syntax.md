@@ -776,15 +776,13 @@ compile-time error that points you here.)
 
 ```kaikai
 import math.bigint
-import math.bigint_convert as bc
-import math.bigint_proto
 
 fn main() : Unit / Stdout = {
   let a = 1000000007n                          # `n` suffix → BigInt
   let sq = bigint.mul(a, a)                    # exact, even past 2^64
   Stdout.print(show(sq))                       # Show renders decimal
   let big = 340282366920938463463374607431768211456n   # past i64, exact
-  Stdout.print(bc.to_string(bigint.add(big, a)))
+  Stdout.print(bigint.to_string(bigint.add(big, a)))
 }
 ```
 
@@ -805,7 +803,6 @@ are total, `div` takes an explicit truncating target scale.
 
 ```kaikai
 import decimal_big as db
-import decimal_big_proto
 
 fn main() : Unit / Stdout =
   match db.parse("123456789012345678901234567890.123456789") {
@@ -825,7 +822,6 @@ and `recip` stay exact and reduced.
 
 ```kaikai
 import rational as rat
-import rational_proto
 import math.bigint
 
 fn main() : Unit / Stdout = {

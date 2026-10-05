@@ -136,7 +136,6 @@ carrier `t` (`Decimal`, `BigInt`, `Int`, ...) tagged with currency
 ```kaikai
 import money
 import decimal as dec
-import decimal_proto
 
 fn main() : Unit / Stdout = {
   let a: Money[dec.Decimal]<USD> = 10.50<USD>
