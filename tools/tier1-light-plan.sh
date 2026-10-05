@@ -8,13 +8,15 @@
 #
 # Costs come from tools/tier1-light-costs.txt: per target, the CPU seconds
 # it burns and the wall seconds it takes inside a slice. The assignment is
-# greedy longest-processing-time: targets in descending wall time each go to
-# the slice whose projected wall-clock is lowest after taking it. A slice's
+# greedy longest-processing-time: targets in descending size (the larger of
+# their wall time and CPU / parallelism) each go to the slice whose
+# projected wall-clock is lowest after taking it. A slice's
 # wall-clock is modelled as its fixed base plus the larger of
 #   total CPU / parallelism    (throughput-bound)
 #   longest target's wall      (bound by its serial pole)
 # because a slice runs under `make -j` yet no target finishes faster than
-# its own serial loop. Each slice prints longest first, so `make -j` starts
+# its own serial loop. An `elastic` target fans its work out, so it adds
+# CPU and no pole. Each slice prints longest first, so `make -j` starts
 # its long poles before the short targets.
 #
 # Every shard computes the whole plan and keeps its own slice, so the
@@ -45,7 +47,7 @@ shift
 
 echo "$*" | awk -v mode="$mode" -v want="$shard" -v n="$shards" '
   function cpu(t) { return (t in c) ? c[t] : dflt }
-  function pole(t) { return (t in p) ? p[t] : dflt }
+  function pole(t) { return (t in el) ? 0 : (t in p) ? p[t] : dflt }
   function wall(k, addc, addp,   big, work) {
     big = (addp > mx[k]) ? addp : mx[k]
     work = (sum[k] + addc) / par
@@ -60,8 +62,9 @@ echo "$*" | awk -v mode="$mode" -v want="$shard" -v n="$shards" '
     sum[best] += cpu(t); if (pole(t) > mx[best]) mx[best] = pole(t)
     slice[best] = slice[best] " " t
   }
+  function size(t) { return (pole(t) > cpu(t) / par) ? pole(t) : cpu(t) / par }
   function before(a, b) {
-    if (pole(a) != pole(b)) return pole(a) > pole(b)
+    if (size(a) != size(b)) return size(a) > size(b)
     return cpu(a) > cpu(b) || (cpu(a) == cpu(b) && a < b)
   }
   FNR == NR {
@@ -69,6 +72,7 @@ echo "$*" | awk -v mode="$mode" -v want="$shard" -v n="$shards" '
     if ($1 == "base") base[$2] = $3
     else if ($1 == "default") dflt = $2
     else if ($1 == "parallelism") par = $2
+    else if ($1 == "elastic") el[$2] = 1
     else { c[$1] = $2; p[$1] = (NF > 2) ? $3 : $2 }
     next
   }

@@ -103,6 +103,13 @@
 > empty: fmt-property now runs in thirds on shards 3, 6 and 8, shard 7 keeps
 > the CLI tail, and the unratcheted nohomespell scan moved from shard 2's
 > C-axes block into the light pool.
+>
+> A fanned-out target's measured wall time is its share of a busy runner,
+> not a serial floor, so the planner treated it as a pole it was not. The
+> cost table lists such targets as `elastic`: the plan counts their CPU
+> only and orders every target by the larger of its wall time and its
+> CPU / parallelism. `test-protocols`, a serial loop that stretched from
+> 432 s to 584 s in a crowded slice, got the same fan-out.
 
 All numbers below are **measured**, never dry-run. CI durations come from the
 GitHub Actions REST API for real `main` runs on `ubuntu-latest`; local splits
