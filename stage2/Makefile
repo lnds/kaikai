@@ -13340,6 +13340,17 @@ test-native-wrapper: $(TARGET) build
 	  || { echo "test-native-wrapper FAIL: $(TARGET) has no native backend (build with KAI_LLVM=1)"; exit 1; }
 	@$(MAKE) -j$(TEST_JOBS) $(TEST_NATIVE_WRAPPER_TARGETS)
 
+# Single-fixture native gates, one list per tier1-native shard. They write
+# disjoint build/ files, so a shard runs its list under one `make -j`.
+TEST_NATIVE_GATES_1 := $(shell cat test-lists/native-gates-1.txt)
+TEST_NATIVE_GATES_2 := $(shell cat test-lists/native-gates-2.txt)
+NATIVE_GATE_JOBS ?= 4
+
+test-native-gates-%: $(TARGET) build core-cache-warm
+	@../tools/kaic2-native-capable.sh $(TARGET) \
+	  || { echo "test-native-gates-$* FAIL: $(TARGET) has no native backend (build with KAI_LLVM=1)"; exit 1; }
+	@$(MAKE) -j$(NATIVE_GATE_JOBS) $(TEST_NATIVE_GATES_$*)
+
 test-light-parallel: $(TARGET) build core-cache-warm
 	@$(MAKE) -j$(TEST_JOBS) $(TEST_LIGHT_TARGETS)
 
@@ -13383,7 +13394,7 @@ tier1-light-timed-%:
 	exit $$rc
 
 test-light-partition:
-	@for f in test-lists/light.txt test-lists/native-wrapper.txt; do \
+	@for f in test-lists/light.txt test-lists/native-wrapper.txt test-lists/native-gates-1.txt test-lists/native-gates-2.txt; do \
 	  LC_ALL=C sort -c -u $$f || { echo "test-light-partition FAIL: $$f must hold one target per line, sorted, no repeats"; exit 1; }; \
 	done
 	@sh $(TIER1_LIGHT_PLAN) --check $(SHARDS) $(TEST_LIGHT_TARGETS)

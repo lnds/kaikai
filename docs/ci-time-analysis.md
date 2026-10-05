@@ -112,6 +112,12 @@
 > `test-modular-identity`), serial loops that stretched to 584 s and 634 s
 > in crowded slices, got the same fan-out. The `tier1-asan` shards run
 > their `-asan` legs under `make -j` as well.
+>
+> `tier1-native` ran ~105 single-fixture gates as serial workflow steps on
+> shards 1 and 2. They now run as one `make -j` per shard over
+> `stage2/test-lists/native-gates-{1,2}.txt`. Three gates hide the
+> runtime bitcode in `stage0/` while they run, so they stay serial steps.
+> The bin/kai native-wrapper targets moved from shard 1b to shard 2.
 
 All numbers below are **measured**, never dry-run. CI durations come from the
 GitHub Actions REST API for real `main` runs on `ubuntu-latest`; local splits
