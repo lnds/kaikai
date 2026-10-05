@@ -25,10 +25,8 @@ import collections.map
 import collections.set
 import collections.hashmap
 import math.bigint
-import math.bigint_convert as bc
 import decimal as d
 import decimal_big as db
-import decimal_big_proto
 
 fn show(o: Option[Int]) : String = match o {
   Some(v) -> int_to_string(v)
@@ -44,7 +42,7 @@ fn main() : Unit / Stdout + Mutable {
   hashmap.put(h, "k", 7)
   Stdout.print("hashmap index: #{show(h["k"])}")
   let x : bigint.BigInt = 340282366920938463463374607431768211456
-  Stdout.print("bigint: #{bc.to_string(x)}")
+  Stdout.print("bigint: #{bigint.to_string(x)}")
   let y : d.Decimal = 0.20
   Stdout.print("decimal: #{d.to_string(y)}")
   let z : db.DecimalBig = 3.141592653589793238462643383279

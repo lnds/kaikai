@@ -116,28 +116,22 @@ echo "$pkg_imp_out" | grep -q "Imports a stdlib module" \
 echo "$pkg_imp_out" | grep -q "go" \
   || fail "'kai doc pkg/withimport' did not list the go item"
 
-# 8. `impl` blocks render in the module page and resolve via drill-down.
-#    A `_proto` stdlib module's ENTIRE content is impls — before the
-#    fix its page rendered an empty item list.
-proto_out="$("$KAI" doc decimal_proto 2>&1)" || fail "'kai doc decimal_proto' exited non-zero"
-echo "$proto_out" | grep -q "Add_for_Decimal" \
-  || fail "'kai doc decimal_proto' did not list the Add impl"
-echo "$proto_out" | grep -q "Div_for_Decimal" \
-  || fail "'kai doc decimal_proto' did not list the Div impl"
-
-impl_sym_out="$("$KAI" doc decimal_proto.Add_for_Decimal 2>&1)" \
-  || fail "'kai doc decimal_proto.Add_for_Decimal' exited non-zero"
-echo "$impl_sym_out" | grep -q "^# decimal_proto.Add_for_Decimal" \
-  || fail "impl drill-down missing header"
-echo "$impl_sym_out" | grep -q "add(self: dec.Decimal, rhs: dec.Decimal) -> dec.Decimal" \
-  || fail "impl drill-down missing method signature"
-
-# Mixed module (fns + impls): the fns render as before, PLUS its impl.
+# 8. `impl` blocks render in the module page beside the fns and resolve
+#    via drill-down.
 decimal_out="$("$KAI" doc decimal 2>&1)" || fail "'kai doc decimal' exited non-zero"
 echo "$decimal_out" | grep -q "add " \
   || fail "'kai doc decimal' lost its fn listing"
-echo "$decimal_out" | grep -q "Numeric_for_Decimal" \
-  || fail "'kai doc decimal' did not list its Numeric impl"
+for impl in Numeric_for_Decimal Add_for_Decimal Div_for_Decimal; do
+  echo "$decimal_out" | grep -q "$impl" \
+    || fail "'kai doc decimal' did not list $impl"
+done
+
+impl_sym_out="$("$KAI" doc decimal.Add_for_Decimal 2>&1)" \
+  || fail "'kai doc decimal.Add_for_Decimal' exited non-zero"
+echo "$impl_sym_out" | grep -q "^# decimal.Add_for_Decimal" \
+  || fail "impl drill-down missing header"
+echo "$impl_sym_out" | grep -q "add(self: Decimal, rhs: Decimal) -> Decimal" \
+  || fail "impl drill-down missing method signature"
 
 # 9. Synopsis = first sentence, not physical line 1. `spawn`'s module
 #    doc wraps its first sentence across a line break; a "cut at line
