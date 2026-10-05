@@ -49,6 +49,8 @@ examples/effects/default_block_full_user_handle.kai
 examples/modules/export_derived_record/main.kai
 examples/protocols/default_basic.kai
 examples/protocols/free_fn_bound_satisfied.kai
+examples/refinements/contracts_passing.kai
+examples/stdlib/money_basic.kai
 "
 
 if [ ! -x "$KAIC2" ]; then
