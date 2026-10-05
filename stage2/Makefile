@@ -13300,13 +13300,23 @@ TEST_JOBS ?= 8
 # fan-outs below depend on `core-cache-warm` to populate the cache serially
 # first; their children then only read. A truncated blob fails the KAB2
 # decode and falls back to a fresh parse — a miss, never wrong decls.
-TEST_CORE_CACHE_TID = $(shell stat -f '%m-%z' $(TARGET) 2>/dev/null || stat -c '%Y-%s' $(TARGET) 2>/dev/null)
+# GNU stat first: on Linux `stat -f` is a filesystem stat that succeeds and
+# prints a paragraph, so it cannot be the probe that fails over.
+TEST_CORE_CACHE_TID = $(shell stat -c '%Y-%s' $(TARGET) 2>/dev/null || stat -f '%m-%z' $(TARGET) 2>/dev/null)
 TEST_CORE_CACHE_DIR = build/core-cache/$(TEST_CORE_CACHE_TID)
 ifeq ($(KAI_CORE_CACHE),0)
 TEST_CORE_CACHE :=
 else
 TEST_CORE_CACHE = $(if $(TEST_CORE_CACHE_TID),--core-cache-dir $(TEST_CORE_CACHE_DIR),)
 endif
+
+# The cache dir is scoped by one `<mtime>-<size>` token; anything else leaks
+# into every fixture compile's argv and unscopes the cache.
+test-core-cache-tid: $(TARGET)
+	@case '$(TEST_CORE_CACHE_TID)' in \
+	  *[!0-9-]*|''|-*|*-|*-*-*) echo "test-core-cache-tid FAIL: '$(TEST_CORE_CACHE_TID)' is not <mtime>-<size>"; exit 1 ;; \
+	esac; \
+	echo "test-core-cache-tid OK ($(TEST_CORE_CACHE_TID))"
 
 core-cache-warm: $(TARGET) build
 	@if [ -n "$(TEST_CORE_CACHE)" ]; then \
