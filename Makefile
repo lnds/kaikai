@@ -545,12 +545,13 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 #
 #  shard 1 — the 4 GB self-compiles + stateful caches (memory-bound).
 #  shard 2 — the namespace-collision corpus (C axes).
-#  shard 3 — partition + BinSerialize linearity, core text, HTTP redirects.
+#  shard 3 — partition + BinSerialize linearity, core text, HTTP redirects,
+#            fmt meaning-preservation corpus part 1/3.
 #  shard 4 — the whole-compiler modular self-host.
 #  shard 5 — fmt fixtures + fmt self-hosting, packages, editions, kai info.
-#  shard 6 — the modular-escape gate.
-#  shard 7 — fmt meaning-preservation, corpus part 1/2 + the CLI/tooling tail.
-#  shard 8 — fmt meaning-preservation, corpus part 2/2 + the demos baseline.
+#  shard 6 — the modular-escape gate, fmt meaning-preservation part 2/3.
+#  shard 7 — the CLI/tooling tail.
+#  shard 8 — fmt meaning-preservation part 3/3 + the demos baseline.
 #
 # The Perceus RC leak ledger rides the tier0 CI job, after its gates: that
 # job has the headroom and no shard does. It is not part of `tier0` locally.
@@ -613,8 +614,9 @@ tier1-shard-3: kaic2
 	$(tier1-shard-start)
 	$(call tier1-light-slice,3)
 	$(MAKE) test-partition-linearity test-binserialize-linearity test-core-text test-http-redirects
+	$(MAKE) test-fmt-property FMT_PROPERTY_SHARD=1/3
 	$(call tier1-shard-wall,3)
-	@echo "tier1-shard-3 OK — light slice 3/$(TIER1_LIGHT_SLICES) + partition + BinSerialize linearity + core text contracts"
+	@echo "tier1-shard-3 OK — light slice 3/$(TIER1_LIGHT_SLICES) + partition + BinSerialize linearity + core text contracts + fmt meaning-preservation (corpus part 1/3)"
 
 # The two modular self-hosts sit in separate shards: each rebuilds the whole
 # compiler, and a PR touching stage2/compiler/** misses the warm cache by
@@ -640,29 +642,25 @@ tier1-shard-6: kaic2
 ifneq ($(TIER1_SELFHOSTS),0)
 	$(MAKE) -C stage2 test-perceus-1131-modular-escape
 endif
+	$(MAKE) test-fmt-property FMT_PROPERTY_SHARD=2/3
 	$(call tier1-light-slice,6)
 	$(call tier1-shard-wall,6)
-	@echo "tier1-shard-6 OK — modular-escape gate (TIER1_SELFHOSTS=$(TIER1_SELFHOSTS)) + light slice 6/$(TIER1_LIGHT_SLICES)"
+	@echo "tier1-shard-6 OK — modular-escape gate (TIER1_SELFHOSTS=$(TIER1_SELFHOSTS)) + fmt meaning-preservation (corpus part 2/3) + light slice 6/$(TIER1_LIGHT_SLICES)"
 
-# fmt-property runs UNCONDITIONALLY: the corpus it formats can regress from a
-# stdlib or fixture change, so it may not ride a shard gated on a
-# compiler-source touch. The sweep is CPU-bound, so shards 7 and 8 each take
-# one half of the corpus (tests/fmt_property.sh reads FMT_PROPERTY_SHARD).
 tier1-shard-7: kaic2
 	$(tier1-shard-start)
-	$(MAKE) test-fmt-property FMT_PROPERTY_SHARD=1/2
 	$(MAKE) $(TIER1_CLI_TAIL)
 	$(call tier1-light-slice,7)
 	$(call tier1-shard-wall,7)
-	@echo "tier1-shard-7 OK — fmt meaning-preservation (corpus part 1/2) + CLI/tooling tail + light slice 7/$(TIER1_LIGHT_SLICES)"
+	@echo "tier1-shard-7 OK — CLI/tooling tail + light slice 7/$(TIER1_LIGHT_SLICES)"
 
 tier1-shard-8: kaic2
 	$(tier1-shard-start)
-	$(MAKE) test-fmt-property FMT_PROPERTY_SHARD=2/2
+	$(MAKE) test-fmt-property FMT_PROPERTY_SHARD=3/3
 	$(MAKE) demos-no-regression
 	$(call tier1-light-slice,8)
 	$(call tier1-shard-wall,8)
-	@echo "tier1-shard-8 OK — fmt meaning-preservation (corpus part 2/2) + demos baseline + light slice 8/$(TIER1_LIGHT_SLICES)"
+	@echo "tier1-shard-8 OK — fmt meaning-preservation (corpus part 3/3) + demos baseline + light slice 8/$(TIER1_LIGHT_SLICES)"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info

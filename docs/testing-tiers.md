@@ -489,21 +489,21 @@ be fixed or excused against an open, numbered issue.
 
 Cost is four `kaic2` invocations per file, ~18 minutes serial, so the
 script fans out over `$(nproc)` workers (`FMT_PROPERTY_JOBS` overrides) —
-the work is per-file independent. It rides `tier1-shard-7` and
-`tier1-shard-8`, half the corpus each, and the placement took several
-corrections worth recording. It cannot ride shard-4 or shard-6: those are
-gated on `compiler-touch` and skip on a PR that changes no compiler
-source, which would leave a formatter gate silently inert exactly when
-nobody touched the formatter — and the corpus it checks can still regress
-from a stdlib or fixture change. Nor does the whole sweep fit one job: it
+the work is per-file independent. It rides `tier1-shard-3`, `tier1-shard-6`
+and `tier1-shard-8`, a third of the corpus each, and the placement took
+several corrections worth recording. It must run unconditionally: shard-4
+and shard-6 skip their self-hosts on a PR that changes no compiler source,
+and a formatter gate that went quiet with them would be silently inert
+exactly when nobody touched the formatter — the corpus it checks can still
+regress from a stdlib or fixture change. On shard-6 it sits outside the
+`TIER1_SELFHOSTS` guard. Nor does the whole sweep fit one job: it
 is one CPU-bound `xargs` fan-out with no serial section, and on a 4-vCPU
 runner it took 16–26 minutes for the same corpus depending on the host.
-So the two shards pass `FMT_PROPERTY_SHARD=1/2` and `2/2`:
+So the three shards pass `FMT_PROPERTY_SHARD=1/3`, `2/3` and `3/3`:
 `FMT_PROPERTY_SHARD=I/N` keeps the sorted corpus lines whose number is
 congruent to I mod N — disjoint and total by construction, with the kept
-count asserted. A half takes about ten minutes, so each of the two shards
-also carries other tier1 work (the CLI/tooling tail, the demos baseline)
-and a light slice. Unset, the script sweeps the whole corpus. Note the harness passes
+count asserted. A third takes about six minutes, so each of the three
+shards also carries other tier1 work and a light slice. Unset, the script sweeps the whole corpus. Note the harness passes
 `--path stdlib`: without it most of the corpus fails to resolve its
 imports and is silently dropped as unparseable, which costs about a
 quarter of the coverage.
