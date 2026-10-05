@@ -216,6 +216,10 @@ Blanket impls (`impl[T] P[T] for X`) would additionally need Rust's
 condition that no uncovered type parameter appears before the first
 local type.
 
+A builtin type (`Int`, `[a]`, `Option[a]`, ...) is declared by no
+module, so it never makes an impl local: the protocol or a protocol
+argument must.
+
 The orphan rule keeps coherence local: the compiler can determine the
 single applicable impl by searching only the modules transitively
 imported. No global registry.
@@ -329,7 +333,9 @@ The m12.8 milestone shipped five protocols; issue #258 added
 Stdlib provides default impls for all primitives (`Int`, `Real`,
 `Bool`, `Char`, `String`, `Unit`, `[a]`, `Option[a]`, `Result[a, e]`,
 records auto-derived via #derive, sum types auto-derived). User-defined
-opaque types must `impl` themselves. The parametric containers carry
+opaque types must `impl` themselves. A builtin never makes an impl
+local under the orphan rule (see *Coherence rules*): wrap it in a type
+of your own. The parametric containers carry
 `Show` / `Eq` / `Ord` / `Hash` (see `stdlib/protocols.kai`); `Serialize`
 on parametric containers needs return-type-driven dispatch and is
 deferred to a later increment.
