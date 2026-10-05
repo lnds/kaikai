@@ -292,15 +292,28 @@ int kaicli_remove_tree(const char *path) {
     return lstat(path, &st) != 0 && errno == ENOENT;
 }
 
+/* While set, everything kaicli_copy_to_stderr writes is also appended here. */
+static char *compile_tee;
+
+void kaicli_tee_compile_stderr(const char *path) {
+    free(compile_tee);
+    compile_tee = (path && *path) ? strdup(path) : NULL;
+}
+
 /* `cat path >&2`: the file's exact bytes on stderr. */
 void kaicli_copy_to_stderr(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return;
+    FILE *tee = compile_tee ? fopen(compile_tee, "ab") : NULL;
     char buf[65536];
     size_t n;
     fflush(stdout);
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) fwrite(buf, 1, n, stderr);
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        fwrite(buf, 1, n, stderr);
+        if (tee) fwrite(buf, 1, n, tee);
+    }
     fflush(stderr);
+    if (tee) fclose(tee);
     fclose(f);
 }
 

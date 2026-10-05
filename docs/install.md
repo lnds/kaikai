@@ -55,7 +55,7 @@ export KAI_BACKEND=c
 | `KAI_NATIVE_OPT`| Optimisation level for the native backend's in-process LLVM pipeline (`0|1|2|3|s|z`; default `2`). |
 | `KAI_NATIVE_JOBS`| Threads the native backend optimises and emits module objects on (default: the `-j` of `kai test`, else the CPU count). The objects are identical for any value. |
 | `KAI_GUARD_MEMO`| The memo of `kai test`'s per-file checks, kept in the package's user cache: `0` turns it off, `shadow` also runs every hit and fails the run on any difference (default: on in a package). |
-| `KAI_BIN_MEMO`  | The memo of the binaries `kai test` and `kai run` build, kept in the package's user cache, else the shared core cache: `0` turns it off (default: on). |
+| `KAI_BIN_MEMO`  | The memo of the binaries `kai test` and `kai run` build, kept in the package's user cache, else the shared core cache; a hit prints the compiler's diagnostics as the build did. `0` turns it off, and a run with `KAI_CORE_CACHE_STATS=1` or `KAI_MODULAR_STATS=1` always compiles (default: on). |
 | `KAI_NO_STDLIB` | If `1`, skip the auto-loaded stdlib core modules. |
 
 ## The native backend and libLLVM

@@ -1,7 +1,9 @@
 #!/bin/sh
 # The memo of `kai run`'s binaries hands back the binary a build would
 # produce, and misses whenever an input of the build changed: a source the
-# entry imports, a flag, the build mode, the `KAI` environment.
+# entry imports, a flag, the build mode, the `KAI` environment. A hit
+# prints the compiler's diagnostics as the build did, and a run that asks
+# for cache statistics always compiles.
 #
 # Every compiler `kai run` starts goes through a shim that logs the builds
 # it really runs. Each scenario runs with the memo on and then off (the
@@ -105,6 +107,14 @@ scenario import-reverted 0 "$solo" -- main.kai
 scenario flag-release 1 "$solo" -- --release main.kai
 scenario mode-debug 1 "$solo" -- --debug main.kai
 scenario env-changed 1 "$solo" KAI_MEMO_PROBE=1 -- main.kai
+scenario stats 1 "$solo" KAI_CORE_CACHE_STATS=1 -- main.kai
+scenario stats-again 1 "$solo" KAI_CORE_CACHE_STATS=1 -- main.kai
+
+printf 'fn main() : Unit / Stdout = {\n  let unused = 3\n  Stdout.print("w")\n}\n' > "$solo/warn.kai"
+scenario warning-cold 1 "$solo" -- warn.kai
+scenario warning-warm 0 "$solo" -- warn.kai
+grep -q 'unused binding' "$work/warning-warm-memo.out" \
+  || { echo "  FAIL warning-warm: a hit dropped the compiler's warning"; fail=$((fail + 1)); }
 scenario back-to-plain 0 "$solo" -- main.kai
 
 for f in "$work"/core/*/bins/*/bin; do
