@@ -56,6 +56,7 @@
 #include <dirent.h>
 #include <math.h>
 #include <setjmp.h>
+#include <unwind.h>
 #include <signal.h>
 #include <stddef.h>
 /* The leak-site tracer extends the RC ledger, so it switches the ledger on. */
@@ -3325,6 +3326,8 @@ struct KaiFiber {
     KaiUnwEntry    *unw_buf;
     uint32_t        unw_top;
     uint32_t        unw_cap;
+    /* The trampoline's frame address: a trap's unwind stops there. */
+    uintptr_t       unwind_frame;
 };
 
 /* Issue #959 — one open structured-concurrency scope. Children spawned
@@ -3394,7 +3397,8 @@ struct KaiNursery {
     NULL,                /* commit_next */                               \
     NULL,                /* tsan_fiber — bound on this thread's first switch */ \
     NULL,                /* exit_rec */                                  \
-    NULL, 0, 0           /* unw_buf, unw_top, unw_cap */                 \
+    NULL, 0, 0,          /* unw_buf, unw_top, unw_cap */                 \
+    0                    /* unwind_frame — main has no pad */            \
 }
 /* `kai_active_fiber` cannot be statically initialised to `&kai_main_fiber`
  * now that both are `_Thread_local`: the address of a thread-local is not a
@@ -3535,6 +3539,72 @@ static void kai_set_active_fiber(KaiFiber *f) {
 
 static void kai_evidence_unwind_all(void);
 
+/* A trap leaves through the unwinder rather than a bare longjmp, so the
+ * landing pads of the frames it crosses release their references. The
+ * stop function lands once the walk reaches `frame` (the fiber's
+ * trampoline or the test harness) or the end of the walkable stack; when
+ * the walk cannot start or stops early, or the stack is too short for the
+ * unwinder, `land` runs at once — exactly the longjmp it replaces. The
+ * exception object lives on the heap: a landing pad runs on the frames the
+ * raising call sat below, and `resume` reads the object back. */
+typedef struct {
+    struct _Unwind_Exception ex;
+    uintptr_t                frame;
+    void                   (*land)(void *);
+    void                    *arg;
+} KaiTrapUnwind;
+
+#define KAI_TRAP_EXCEPTION_CLASS 0x4b41490054524150ULL /* "KAI\0TRAP" */
+#define KAI_TRAP_UNWIND_ROOM     (16 * 1024)
+
+static _Unwind_Reason_Code kai_trap_stop(int version, _Unwind_Action actions,
+                                         _Unwind_Exception_Class cls,
+                                         struct _Unwind_Exception *ex,
+                                         struct _Unwind_Context *ctx, void *arg) {
+    (void) version; (void) cls; (void) ex;
+    KaiTrapUnwind *u = (KaiTrapUnwind *) arg;
+    if ((actions & _UA_END_OF_STACK) || (uintptr_t) _Unwind_GetCFA(ctx) > u->frame) {
+        void (*land)(void *) = u->land;
+        void *land_arg = u->arg;
+        free(u);
+        land(land_arg);
+    }
+    return _URC_NO_REASON;
+}
+
+static size_t kai_page_size(void);
+
+/* Room left below this frame on a fiber's mapped stack; the OS stack
+ * (`base` NULL) is taken to have enough. */
+static int kai_trap_unwind_room(void *base) {
+    if (!base) return 1;
+    uintptr_t here = (uintptr_t) __builtin_frame_address(0);
+    uintptr_t low  = (uintptr_t) base + kai_page_size();
+    return here > low && here - low > KAI_TRAP_UNWIND_ROOM;
+}
+
+__attribute__((noreturn, noinline))
+static void kai_trap_unwind(uintptr_t frame, void *stack_base, void (*land)(void *), void *arg) {
+    KaiTrapUnwind *u = (frame && kai_trap_unwind_room(stack_base))
+                           ? (KaiTrapUnwind *) calloc(1, sizeof *u) : NULL;
+    if (u) {
+        u->ex.exception_class = KAI_TRAP_EXCEPTION_CLASS;
+        u->frame = frame;
+        u->land  = land;
+        u->arg   = arg;
+        _Unwind_ForcedUnwind(&u->ex, kai_trap_stop, u);
+        free(u);
+    }
+    land(arg);
+    __builtin_unreachable();
+}
+
+static void kai_trap_land_fiber(void *arg) {
+    KaiFiber *f = (KaiFiber *) arg;
+    kai_evidence_unwind_all();
+    longjmp(f->cancel_pad, 1);
+}
+
 /* A recoverable runtime trap (index out of range, divide by zero,
  * non-exhaustive match). With a fiber pad installed, unwind to it
  * like Cancel — the trampoline reports the fiber TRAPPED and a
@@ -3546,9 +3616,7 @@ static void kai_trap_abort(const char *msg) {
     if (f && f->cancel_pad_set) {
         f->trapped  = 1;
         f->trap_msg = msg;
-        kai_evidence_unwind_all();
-        longjmp(f->cancel_pad, 1);
-        /* Unreachable. */
+        kai_trap_unwind(f->unwind_frame, f->stack_base, kai_trap_land_fiber, f);
     }
     fprintf(stderr, "kai: trap: %s\n", msg ? msg : "runtime trap");
     kai_exit(1);
@@ -10786,6 +10854,7 @@ static KAI_TLS long long   kai_test_suite_ns     = 0;
 static KAI_TLS int         kai_test_reported     = 0;
 static KAI_TLS jmp_buf     kai_test_jmp;
 static KAI_TLS int         kai_test_in_progress  = 0;
+static KAI_TLS uintptr_t   kai_test_frame        = 0;
 
 static long long kai_test_now_ns(void) {
     struct timespec ts;
@@ -10934,6 +11003,17 @@ static void kai_test_fail(const char *desc, const char *msg) {
             msg  ? msg  : "assertion failed");
 }
 
+static void kai_test_land(void *arg) {
+    (void) arg;
+    longjmp(kai_test_jmp, 1);
+}
+
+/* A failed assertion leaves the test body through the unwinder. */
+__attribute__((noreturn))
+static void kai_test_unwind(void) {
+    kai_trap_unwind(kai_test_frame, NULL, kai_test_land, NULL);
+}
+
 static int kai_test_summary(void) {
     int failed = kai_test_count_total - kai_test_count_passed;
     if (kai_test_json_mode()) {
@@ -10962,6 +11042,7 @@ static void kai_test_run_one(const char *desc, KaiValue *(*body)(void)) {
     if (!kai_test_selected(kai_test_file(), desc)) return;
     long long t0 = kai_test_now_ns();
     kai_test_begin(desc);
+    kai_test_frame = (uintptr_t) __builtin_frame_address(0);
     if (setjmp(kai_test_jmp) == 0) {
         kai_test_in_progress = 1;
         KaiValue *r = body();
@@ -11537,7 +11618,7 @@ static void kai_assert_check(KaiValue *cond, const char *msg) {
     if (ok) return;
     if (kai_test_in_progress) {
         kai_test_fail(kai_test_current, msg ? msg : "assertion failed");
-        longjmp(kai_test_jmp, 1);
+        kai_test_unwind();
     } else {
         kai_core_panic(kai_str(msg ? msg : "assertion failed"));
     }
@@ -11575,7 +11656,7 @@ static void kai_assert_check_with_value(KaiValue *cond, const char *base_msg,
     if (kai_test_in_progress) {
         kai_test_fail(kai_test_current, full->as.s.bytes);
         kai_decref(full);
-        longjmp(kai_test_jmp, 1);
+        kai_test_unwind();
     } else {
         kai_core_panic(full);
     }
@@ -16990,6 +17071,7 @@ static void kai_fiber_trampoline(void) {
      * struct free left behind by the previous fiber's
      * `kai_decref(self->value)` before we touch our own state. */
     kai_drain_pending_free();
+    self->unwind_frame = (uintptr_t) __builtin_frame_address(0);
     if (setjmp(self->cancel_pad) == 0) {
         self->cancel_pad_set = 1;
         /* Borrowed: a cancel longjmps past any release after the call. */
