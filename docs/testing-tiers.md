@@ -502,8 +502,8 @@ runner it took 16–26 minutes for the same corpus depending on the host.
 So the three shards pass `FMT_PROPERTY_SHARD=1/3`, `2/3` and `3/3`:
 `FMT_PROPERTY_SHARD=I/N` keeps the sorted corpus lines whose number is
 congruent to I mod N — disjoint and total by construction, with the kept
-count asserted. A third takes about six minutes, so each of the three
-shards also carries other tier1 work and a light slice. Unset, the script sweeps the whole corpus. Note the harness passes
+count asserted. A third takes five to nine minutes depending on the host,
+so each of the three shards also carries other tier1 work and a light slice. Unset, the script sweeps the whole corpus. Note the harness passes
 `--path stdlib`: without it most of the corpus fails to resolve its
 imports and is silently dropped as unparseable, which costs about a
 quarter of the coverage.
