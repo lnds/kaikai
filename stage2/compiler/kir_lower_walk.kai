@@ -41,6 +41,7 @@ import compiler.vec_raw
 import compiler.emit_tcrec_live
 import compiler.raw_border
 import compiler.handler_alias
+import compiler.refinements
 
 # Lower a fixed-width vec intrinsic to its inline KIR form: a header-less
 # `[n x elem]` aggregate on the native side (no dynamic `Vec`). Returns
@@ -1356,19 +1357,26 @@ fn lower_stmt(s: Stmt, st: LowerSt) : LowerSt / Console = match s {
     }
   }
   # `assert cond` / `assert cond, "msg"` → `kai_assert_check(cond, msg)`,
-  # the SAME runtime entry the C-direct oracle's `emit_assert_stmt` emits
-  # (it consults `kai_test_in_progress` at runtime — abort outside a test,
-  # longjmp to the harness inside one). The earlier `kai_assert(cond)`
-  # one-arg form had no runtime symbol on the native path (`kaix_assert`
-  # is undefined; only `kaix_assert_check` exists), so the object failed
-  # to link — the whole missing-symbols family. The message is the literal
-  # span when present, else `"assertion failed"` (mirror of the oracle's
-  # `msg_lit`); the issue-#86 value-carrying form is a later refinement.
-  SAssert(cond, opt_msg) -> match lower_expr(cond, st) {
-    LRes(v, st1) -> ls_emit(st1, KDo(KPrim("kai_assert_check", [v, KStrV(kir_assert_msg(opt_msg))]), KNoPos))
+  # the SAME runtime entry the C-direct oracle's `emit_assert_stmt` emits.
+  SAssert(cond, opt_msg) -> match assert_reported_binding(cond, opt_msg) {
+    Some(CtrId(ident, idnode, _)) -> lower_assert_with_value(cond, kir_assert_msg(opt_msg), ident, idnode, st)
+    None -> match lower_expr(cond, st) {
+      LRes(v, st1) -> ls_emit(st1, KDo(KPrim("kai_assert_check", [v, KStrV(kir_assert_msg(opt_msg))]), KNoPos))
+    }
   }
   _ -> st
 }
+
+# The runtime consumes the reported value, so it is an owned ref taken
+# BEFORE the condition, which consumes the binding: a boxed binding is
+# dup'd, a raw one is boxed fresh by `lower_expr`.
+fn lower_assert_with_value(cond: Expr, msg: String, ident: String, idnode: Expr, st: LowerSt) : LowerSt / Console =
+  match lower_expr(idnode, st) { LRes(iv, st1) -> {
+    let st2 = if kir_node_is_raw(idnode) { st1 } else { ls_emit(st1, KRC(KDup(iv), KNoPos)) }
+    match lower_expr(cond, st2) { LRes(cv, st3) ->
+      ls_emit(st3, KDo(KPrim("kai_assert_check_with_value",
+                             [cv, KStrV(msg), KStrV(reported_binding_span(ident)), iv]), KNoPos)) }
+  } }
 
 # The assert message span (quote-wrapped, as `KStrV` carries it): a plain
 # string-literal message keeps its source span; anything else (or no

@@ -54,9 +54,10 @@ kai_corpus_entry_points() {
 #      File the issue first; the skip is the bookmark, the issue the work.
 #   2. First line contains "// skip-backend-parity" — for fixtures that are
 #      intentionally backend-specific.
-#   3. A sibling `.err.expected` / `.diag.expected` / `.run.err.expected`
-#      declares the fixture negative-by-design; tools/test-negative.sh owns
-#      it against its golden.
+#   3. A sibling `.err.expected` / `.diag.expected` declares the fixture
+#      rejected at compile time; tools/test-negative.sh owns it against its
+#      golden. A `.run.err.expected` fixture builds, so it stays: its panic
+#      text is pinned on C by the golden and on every other backend here.
 kai_corpus_is_skipped() {
   local fixture="$1" dir base
   if [ -f "$KAI_CORPUS_SKIPS" ] && grep -q "^${fixture}:" "$KAI_CORPUS_SKIPS" 2>/dev/null; then
@@ -74,7 +75,7 @@ kai_corpus_is_skipped() {
       ;;
   esac
   base="${fixture%.kai}"
-  if [ -f "$base.err.expected" ] || [ -f "$base.diag.expected" ] || [ -f "$base.run.err.expected" ]; then
+  if [ -f "$base.err.expected" ] || [ -f "$base.diag.expected" ]; then
     return 0
   fi
   return 1
