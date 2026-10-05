@@ -13716,9 +13716,17 @@ test-namespace-collisions-nohomespell: $(TARGET) bin-kai build core-cache-warm
 test-namespace-collisions-c-axes: $(TARGET) build
 	@rc=0; \
 	for t in test-namespace-collisions test-namespace-collisions-neg \
-	         test-namespace-collisions-modular test-namespace-collisions-neg-modular \
 	         test-namespace-collisions-diag test-namespace-collisions-testsym \
 	         test-namespace-collisions-check; do \
+	  $(MAKE) $$t || rc=1; \
+	done; \
+	exit $$rc
+
+# The two C-modular axes ride a different tier1 shard from the rest, so the
+# corpus's fixed work is split. Each axis keeps its own ratchet and status.
+test-namespace-collisions-modular-axes: $(TARGET) build
+	@rc=0; \
+	for t in test-namespace-collisions-modular test-namespace-collisions-neg-modular; do \
 	  $(MAKE) $$t || rc=1; \
 	done; \
 	exit $$rc
