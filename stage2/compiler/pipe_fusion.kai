@@ -1,4 +1,5 @@
 import compiler.ast
+import compiler.core_refs
 
 # Map-pipe deforestation (issue #1134). `map g . map f = map (g . f)`
 # collapses two map traversals into one — one result list, zero
@@ -218,9 +219,9 @@ fn pipe_fusion_apply_stages(stages: [Expr], acc: Expr, line: Int, col: Int) : Ex
 pub fn pipe_fusion_fold_rewrite(ff: FusedFold, line: Int, col: Int) : Expr =
   match ff.term {
     TermLength               -> pipe_fusion_length_call(ff.source, line, col)
-    TermFoldl(init, combine) -> pipe_fusion_stage_fold(ff, "map_foldl", [init, combine], line, col)
-    TermSum                  -> pipe_fusion_stage_fold(ff, "map_sum", [], line, col)
-    TermProduct              -> pipe_fusion_stage_fold(ff, "map_product", [], line, col)
+    TermFoldl(init, combine) -> pipe_fusion_stage_fold(ff, CfMapFoldl, [init, combine], line, col)
+    TermSum                  -> pipe_fusion_stage_fold(ff, CfMapSum, [], line, col)
+    TermProduct              -> pipe_fusion_stage_fold(ff, CfMapProduct, [], line, col)
   }
 
 #[doc("""
@@ -254,7 +255,7 @@ pub fn pipe_fusion_generic_fold_rewrite(ff: FusedFold, foldl_disp: String,
       pipe_fusion_fold_with(ff.source, init, comb, foldl_disp,
         list_append(staged.binds, hoisted.binds), line, col)
     }
-    _ -> pipe_fusion_stage_fold(ff, "map_foldl", [], line, col)
+    _ -> pipe_fusion_stage_fold(ff, CfMapFoldl, [], line, col)
   }
 }
 
@@ -295,18 +296,16 @@ fn pipe_fusion_compose_combiner(stage: Expr, combine: Expr,
 
 # `<target>(source-args..., stage, extra...)` with the lambda stages
 # hoisted into `let` binds ahead of the call.
-fn pipe_fusion_stage_fold(ff: FusedFold, op: String, extra: [Expr],
+fn pipe_fusion_stage_fold(ff: FusedFold, cf: CoreFn, extra: [Expr],
                           line: Int, col: Int) : Expr {
   let bound = pipe_fusion_bind_stages(ff.stages, line, col)
   let call = match ff.source.kind {
     ERange(a, b, None) ->
-      fold_call("protocols", concat_all(["range_", op]),
-                [a, b, bound.stage, ...extra], line, col)
+      fold_call(range_fold(cf, false), [a, b, bound.stage, ...extra], line, col)
     ERange(a, b, Some(step)) ->
-      fold_call("protocols", concat_all(["range_step_", op]),
-                [a, b, step, bound.stage, ...extra], line, col)
+      fold_call(range_fold(cf, true), [a, b, step, bound.stage, ...extra], line, col)
     _ ->
-      fold_call("list", op, [ff.source, bound.stage, ...extra], line, col)
+      fold_call(cf, [ff.source, bound.stage, ...extra], line, col)
   }
   match bound.binds {
     [] -> call
@@ -318,13 +317,21 @@ fn pipe_fusion_stage_fold(ff: FusedFold, op: String, extra: [Expr],
 # the mapped length is the source's length.
 fn pipe_fusion_length_call(source: Expr, line: Int, col: Int) : Expr =
   match source.kind {
-    ERange(a, b, None)       -> fold_call("protocols", "range_length", [a, b], line, col)
-    ERange(a, b, Some(step)) -> fold_call("protocols", "range_step_length", [a, b, step], line, col)
-    _                        -> fold_call("list", "length", [source], line, col)
+    ERange(a, b, None)       -> fold_call(CfRangeLength, [a, b], line, col)
+    ERange(a, b, Some(step)) -> fold_call(CfRangeStepLength, [a, b, step], line, col)
+    _                        -> fold_call(CfListLength, [source], line, col)
   }
 
-fn fold_call(mod: String, fname: String, args: [Expr], line: Int, col: Int) : Expr =
-  mk_expr(ECall(mk_expr(EModCall(mod, fname), line, col), args), line, col)
+# The range-headed counterpart of a list fold.
+fn range_fold(cf: CoreFn, stepped: Bool) : CoreFn = match cf {
+  CfMapFoldl   -> if stepped { CfRangeStepMapFoldl } else { CfRangeMapFoldl }
+  CfMapSum     -> if stepped { CfRangeStepMapSum } else { CfRangeMapSum }
+  CfMapProduct -> if stepped { CfRangeStepMapProduct } else { CfRangeMapProduct }
+  _            -> cf
+}
+
+fn fold_call(cf: CoreFn, args: [Expr], line: Int, col: Int) : Expr =
+  mk_expr(ECall(mk_expr(EModCall(core_fn_home(cf), core_fn_name(cf)), line, col), args), line, col)
 
 # A map-pipe chain in Vec-expected context — the collect shape. The
 # stages are raw (pre-synth) so the typer's purity gate can read each
@@ -345,16 +352,16 @@ pub fn pipe_fusion_as_collect(e: Expr) : Option[FusedCollect] =
 pub fn pipe_fusion_collect_rewrite(fc: FusedCollect, line: Int, col: Int) : Option[Expr] =
   match fc.source.kind {
     ERange(a, b, None) ->
-      Some(pipe_fusion_collect_call("range_map_collect_vec", [a, b], fc.stages, line, col))
+      Some(pipe_fusion_collect_call(CfRangeMapCollectVec, [a, b], fc.stages, line, col))
     ERange(a, b, Some(step)) ->
-      Some(pipe_fusion_collect_call("range_step_map_collect_vec", [a, b, step], fc.stages, line, col))
+      Some(pipe_fusion_collect_call(CfRangeStepMapCollectVec, [a, b, step], fc.stages, line, col))
     _ -> None
   }
 
-fn pipe_fusion_collect_call(op: String, head: [Expr], stages: [Expr],
+fn pipe_fusion_collect_call(cf: CoreFn, head: [Expr], stages: [Expr],
                             line: Int, col: Int) : Expr {
   let bound = pipe_fusion_bind_stages(stages, line, col)
-  let call = fold_call("protocols", op, [...head, bound.stage], line, col)
+  let call = fold_call(cf, [...head, bound.stage], line, col)
   match bound.binds {
     [] -> call
     _  -> mk_expr(EBlock(bound.binds, Some(call)), line, col)

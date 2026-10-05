@@ -14,6 +14,7 @@ import compiler.util
 import compiler.chars
 import compiler.diag
 import compiler.ast
+import compiler.core_refs
 import compiler.exhaust
 import compiler.effect_default
 import compiler.type_text
@@ -11835,34 +11836,20 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
 # captured by `binop_should_dispatch_proto` are NOT matched here.
 fn binop_dispatch_proto_heterogeneous(st: InferState, op: String,
                                         lt: Ty, rt: Ty) : Bool {
-  let proto = binop_proto_name(op)
-  if proto == "" { false }
+  let l_prim = ty_is_concrete_prim(lt)
+  let r_prim = ty_is_concrete_prim(rt)
+  let l_user = ty_is_concrete_nonprim(lt)
+  let r_user = ty_is_concrete_nonprim(rt)
+  let pair_prim_user = (l_prim and r_user) or (r_prim and l_user)
+  let pair_user_user_diff = l_user and r_user and not ty_same_head(lt, rt)
+  if not (pair_prim_user or pair_user_user_diff) { false }
   else {
-    let l_prim = ty_is_concrete_prim(lt)
-    let r_prim = ty_is_concrete_prim(rt)
-    let l_user = ty_is_concrete_nonprim(lt)
-    let r_user = ty_is_concrete_nonprim(rt)
-    let pair_prim_user = (l_prim and r_user) or (r_prim and l_user)
-    let pair_user_user_diff = l_user and r_user and not ty_same_head(lt, rt)
-    if not (pair_prim_user or pair_user_user_diff) {
-      false
-    } else {
-      match binop_pick_proto_dispatch(st.proto_impls, proto, binop_proto_method(op),
-                                       lt, rt, st.sub) {
-        Some(_) -> true
-        None -> false
-      }
-    }
+    let bp = binop_proto(op)
+    let proto = op_proto_protocol(bp)
+    let picked = if proto == "" { None }
+                 else { binop_pick_proto_dispatch(st.proto_impls, proto, op_proto_method(bp), lt, rt, st.sub) }
+    match picked { Some(_) -> true  None -> false }
   }
-}
-
-fn binop_proto_name(op: String) : String {
-  if op == "+" { "Add" }
-  else if op == "-" { "Sub" }
-  else if op == "*" { "Mul" }
-  else if op == "/" { "Div" }
-  else if op == "%" { "Rem" }
-  else { "" }
 }
 
 fn ty_is_concrete_prim(t: Ty) : Bool {
@@ -12006,21 +11993,13 @@ fn ty_is_concrete_nonprim(t: Ty) : Bool {
 # generated the dispatcher fn under that name (when the matching
 # protocol is declared); the post-inference rewrite then redirects to
 # `__pimpl_<P>_<T>_<op>`.
-fn binop_proto_method(op: String) : String {
-  if op == "+" { "add" }
-  else if op == "-" { "sub" }
-  else if op == "*" { "mul" }
-  else if op == "%" { "rem" }
-  else { "div" }
-}
-
 fn synth_binop_proto(st: InferState, op: String, le: Expr, lt: Ty,
                       re: Expr, rt: Ty,
                       line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
   let st_h = binop_check_against_impl(st, op, lt, rt, line, col)
-  let dispatcher = inf_proto_dispatcher_name(binop_proto_method(op))
+  let dispatcher = inf_proto_dispatcher_name(op_proto_method(binop_proto(op)))
   let callee = mk_ref(dispatcher, line, col)
   synth_call(st_h, callee, [le, re], line, col)
 }
@@ -12033,8 +12012,9 @@ fn synth_binop_proto(st: InferState, op: String, le: Expr, lt: Ty,
 # winner is re-checked.
 fn binop_check_against_impl(st: InferState, op: String, lt0: Ty, rt0: Ty,
                             line: Int, col: Int) : InferState / Console + File + Mutable {
-  let proto = binop_proto_name(op)
-  let method = binop_proto_method(op)
+  let bp = binop_proto(op)
+  let proto = op_proto_protocol(bp)
+  let method = op_proto_method(bp)
   let lt = apply_ty(st.sub, lt0)
   let rt = apply_ty(st.sub, rt0)
   match binop_impl_sym(st.proto_impls, proto, method, lt, rt, st.sub) {
@@ -13038,8 +13018,9 @@ fn emit_pipe_wants_apply(file: String, op: String, stage: Expr, param: Ty,
   diag_help("did you mean `|>` (apply to the whole value)?")
 }
 
-fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
+fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
                         line: Int, col: Int) : Inferred / Console + File + Mutable {
+  let op = core_fn_name(cf)
 
 
   let rl = synth(st, lhs)
@@ -13150,7 +13131,7 @@ fn synth_pipe_dispatch(st: InferState, op: String, lhs: Expr, rhs: Expr,
               st_unify_call(st_fresh, pipe_callee, rc.ty, [rl.ty, rf.ty], expected, line, col)
           }
           let ty = apply_ty(st2.sub, rv.ty)
-          let fused = try_fuse_map_pipe(st2, op, rc.expr, rl.expr, rf.expr, ty, line, col)
+          let fused = try_fuse_map_pipe(st2, cf, rc.expr, rl.expr, rf.expr, ty, line, col)
           mk_inferred(fused.st, ty, fused.root)
         }
       }
@@ -13168,18 +13149,18 @@ type FusedPipe = { root: Expr, st: InferState }
 # resolved here; the composed lambda is built typed (never re-synthesised)
 # so the shared, in-place-mutated substitution is not forked. Any other
 # `op`, an impure stage, or a non-map LHS leaves the call untouched.
-fn try_fuse_map_pipe(st: InferState, op: String, callee: Expr,
+fn try_fuse_map_pipe(st: InferState, cf: CoreFn, callee: Expr,
                      lhs: Expr, stage: Expr, ty: Ty,
                      line: Int, col: Int) : FusedPipe {
   let unfused = with_ty(mk_expr(ECall(callee, [lhs, stage]), line, col), ty)
-  if op != "map" { FusedPipe { root: unfused, st: st } }
-  else { match pipe_fusion_as_map_call(lhs) {
+  let candidate = match cf { CfPipeMap -> pipe_fusion_as_map_call(lhs)  _ -> None }
+  match candidate {
     None -> FusedPipe { root: unfused, st: st }
     Some(inner) ->
       if fuse_stages_pure(st.sub, inner.stage, stage) {
         fuse_emit(st, callee, inner, stage, ty, line, col)
       } else { FusedPipe { root: unfused, st: st } }
-  } }
+  }
 }
 
 # Both stage closures must be pure to reorder them. Reads the resolved
@@ -13379,12 +13360,12 @@ fn join_modules_for_diag(mods: [String]) : String {
 fn synth_map_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable =
 
 
-  synth_pipe_dispatch(st, "map", lhs, rhs, line, col)
+  synth_pipe_dispatch(st, CfPipeMap, lhs, rhs, line, col)
 
 fn synth_flat_map_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable =
 
 
-  synth_pipe_dispatch(st, "flat_map", lhs, rhs, line, col)
+  synth_pipe_dispatch(st, CfPipeFlatMap, lhs, rhs, line, col)
 
 # `xs |? p` — filter-pipe. Mirrors `synth_map_pipe` /
 # `synth_flat_map_pipe` but resolves to `<module>.filter`. The
@@ -13393,7 +13374,7 @@ fn synth_flat_map_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int
 fn synth_filter_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable =
 
 
-  synth_pipe_dispatch(st, "filter", lhs, rhs, line, col)
+  synth_pipe_dispatch(st, CfPipeFilter, lhs, rhs, line, col)
 
 # Mutable provenance / masking pass.
 #
