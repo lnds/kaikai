@@ -117,7 +117,7 @@
 > shards 1 and 2. They now run as one `make -j` per shard over
 > `stage2/test-lists/native-gates-{1,2}.txt`. Three gates hide the
 > runtime bitcode in `stage0/` while they run, so they stay serial steps.
-> The bin/kai native-wrapper targets moved from shard 1b to shard 2.
+> The bin/kai native-wrapper targets run on shard 1, the lightest native shard.
 >
 > On a PR that touches no compiler source, shards 4 and 6 skip their
 > self-hosts, and the plan used to give them the same light load anyway.
