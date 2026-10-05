@@ -84,6 +84,45 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.131.0 (2026-10-05)
+
+### BREAKING CHANGE
+
+- the modules decimal_proto, decimal_big_proto,
+rational_proto, math.bigint_proto and math.bigint_convert are removed.
+Drop `import decimal_proto`, `import decimal_big_proto`,
+`import rational_proto` and `import math.bigint_proto`: importing the
+type's module (decimal, decimal_big, rational, math.bigint) now brings
+its operators and Show/Eq/Ord impls. Replace `import math.bigint_convert`
+with `import math.bigint` and `bigint_convert.f` with `bigint.f`
+(to_string, from_string, divmod, div, op_div, rem).
+
+### Fixed
+
+- **protocols**: move protocol impls into their types' modules (#2496)
+- **runtime**: give the monitor ref its own reference to the pid (#2492)
+- **holes**: drop candidates that only re-enter the function or never return (#2495)
+- **compiler**: register the reuse tags of the functions a program can run (#2494)
+- **contracts**: judge a predicate's purity by its inferred effect row (#2493)
+- **perceus**: count an assert's reads when inferring borrowed parameters (#2491)
+- **kai**: print the compiler's diagnostics on a binary memo hit (#2490)
+- **contracts**: print the offending argument on a native requires panic (#2489)
+- **contracts**: print a violated predicate with the formatter's expression printer (#2488)
+- **perceus**: release the references a non-local exit jumps over (#2483)
+- **native**: key the cached core object by build mode (#2486)
+- **fmt**: reprint char literals with their source spelling (#2481)
+- **compiler**: reach every protocol that declares a called operation's name (#2485)
+
+### Changed
+
+- **runtime**: leave a trap and a failed test assertion through the unwinder (#2498)
+- **compiler**: index a module's own imports by name in its qualifier table (#2497)
+- **kai**: memoise kai run's binary like kai test's (#2487)
+- **derive**: write and read BinSerialize primitive leaves in place (#2481)
+- **compiler**: prune the core on a warm native core-object hit (#2482)
+- **compiler**: name the core reachability pass by the core (#2485)
+- **compiler**: type and emit only the core-prelude functions a build reaches (#2480)
+
 ## v0.130.0 (2026-10-05)
 
 ### BREAKING CHANGE
