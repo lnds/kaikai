@@ -84,6 +84,43 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.133.0 (2026-10-06)
+
+### BREAKING CHANGE
+
+- a piped call now counts the piped value when it picks
+the binding. In a file that declares or sees a protocol operation of
+the call's name and arity, `xs |> foldl(0, f)` over a list reached
+`list.foldl` only because the old rename miscounted the arguments; it
+now reaches the protocol operation, as `foldl(xs, 0, f)` always did.
+Qualify the call (`xs |> list.foldl(0, f)`) to keep the list fold.
+- a bare function name that two core modules export
+(`length`, `reverse`, `is_empty`, ...) is now rejected in value position
+(`let f = length`, `list.map(xs, is_empty)`), as it already was when
+called. The error replaces a silent miscompile: such a reference
+type-checked as one module's function and ran the other's
+(`list.map(["", "c"], is_empty)` printed `[false, false]`). Migration:
+qualify it (`string.is_empty`, `list.length`).
+
+### Fixed
+
+- **emit**: release the Option or Result box that `!` unwraps (#2533)
+- **cspec**: give each pasted copy of a variable argument its own read (#2532)
+- **resolve**: resolve a bare call on the ladder by its arity, protocol operations included (#2530)
+- **perceus**: release a binder on the branch of a self-call argument that does not move it (#2529)
+- **cspec**: give a pasted closure's inner lambdas an identity per call site (#2528)
+- **compiler**: loop a self tail call in a function with a parameter it never reads (#2527)
+- **kir**: keep a block's value and a dead closure alias apart from reused register names (#2525)
+- **resolve**: stamp local binders so no pass re-dispatches them by spelling (#2523)
+- **perceus**: release a frame's references when a trap unwinds through it (#2516)
+
+### Changed
+
+- **runtime**: keep every freed variant block on an uncapped per-arity free list (#2524)
+- **native**: keep the allocating slot re-box out of kaix_variant_arg (#2522)
+- **runtime**: count RC events in a plain global while the process has one thread (#2520)
+- **typer**: leave a lambda's type unapplied until finalise (#2518)
+
 ## v0.132.0 (2026-10-06)
 
 ### BREAKING CHANGE
