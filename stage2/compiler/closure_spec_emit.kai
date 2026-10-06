@@ -4,6 +4,7 @@
 # shared AST helpers in closure_spec_ast.
 
 import compiler.ast
+import compiler.expr_positions
 import compiler.sym_read
 import compiler.util
 import compiler.emit_shared
@@ -37,7 +38,8 @@ pub fn emit_cspec(r: CSpecReq, all: [Decl]) : Decl =
         let sname = cspec_name(mo, n, disc)
         let fname = param_name_at(ps, idx)
         let body0 = qualify_own_calls(body, [n, fname], mo, all)
-        let body1 = beta_apply_all(retarget_self(body0, SelfRef(fsym, n), idx, sname, fname), fname, ca)
+        let sh = shares_closure(ca, body0, fname)
+        let body1 = beta_apply_all(retarget_self(body0, SelfRef(fsym, n), idx, sname, fname), fname, ca, sh)
         let ps1 = drop_param_at(ps, idx)
         # Only pure closures reach here (classify_closure gate), so the
         # spec carries no effect: close its row to empty and drop the
@@ -119,34 +121,59 @@ fn passes_param(args_: [Expr], idx: Int, fname: String) : Bool =
 # inner higher-order call too — this is how the transitive chain
 # `foldl → foldl_loop` reaches the loop that carries the per-element
 # indirect call.
-fn beta_apply_all(e: Expr, fname: String, ca: ClosureArg) : Expr =
+fn beta_apply_all(e: Expr, fname: String, ca: ClosureArg, sh: Bool) : Expr =
   match sym_local_kind(e.kind) {
     ECall(callee, args_) -> match sym_read_kind(callee.kind) {
       EVar(n) ->
-        if n == fname { inline_apply(ca, map(args_, (a) => beta_apply_all(a, fname, ca))) }
-        else { beta_descend(e, fname, ca) }
-      _ -> beta_descend(e, fname, ca)
+        if n == fname {
+          let args1 = map(args_, (a) => beta_apply_all(a, fname, ca, sh))
+          if sh { remap(e, ECall(closure_literal(ca, callee), args1)) } else { inline_apply(ca, args1) }
+        }
+        else { beta_descend(e, fname, ca, sh) }
+      _ -> beta_descend(e, fname, ca, sh)
     }
     EVar(n) -> if n == fname { closure_literal(ca, e) } else { e }
     # A binder that re-binds the functional param's name hides the param
     # in its scope.
-    ELambda(ps, _) -> if list_has(cs_param_names(ps), fname) { e } else { beta_descend(e, fname, ca) }
+    ELambda(ps, _) -> if list_has(cs_param_names(ps), fname) { e } else { beta_descend(e, fname, ca, sh) }
     EMatch(scr, arms) ->
-      remap(e, EMatch(beta_apply_all(scr, fname, ca), map(arms, (a) => beta_arm(a, fname, ca))))
-    EBlock(ss, t) -> remap(e, beta_block(ss, t, fname, ca))
-    _ -> beta_descend(e, fname, ca)
+      remap(e, EMatch(beta_apply_all(scr, fname, ca, sh), map(arms, (a) => beta_arm(a, fname, ca, sh))))
+    EBlock(ss, t) -> remap(e, beta_block(ss, t, fname, ca, sh))
+    _ -> beta_descend(e, fname, ca, sh)
   }
 
-fn beta_arm(a: Arm, fname: String, ca: ClosureArg) : Arm =
+# A lambda is identified by its position, so a closure body holding a
+# lambda is pasted only where the callee applies it once. Otherwise each
+# application calls the closure's literal at its own site, which gives the
+# inner lambdas an identity per site.
+fn shares_closure(ca: ClosureArg, body: Expr, fname: String) : Bool = match ca {
+  CaLambda(_, b) -> holds_lambda(b) and applications(body, fname) > 1
+  CaNamedFn(_)   -> false
+}
+
+fn applications(e: Expr, fname: String) : Int = {
+  let here = match sym_local_kind(e.kind) {
+    ECall(callee, _) -> match sym_read_kind(callee.kind) { EVar(n) -> if n == fname { 1 } else { 0 }  _ -> 0 }
+    _ -> 0
+  }
+  foldl(xp_positions(e), here, (acc, p) => match p { XP(_, c) -> acc + applications(c, fname) })
+}
+
+fn holds_lambda(e: Expr) : Bool = match e.kind {
+  ELambda(_, _) -> true
+  _ -> any(xp_positions(e), (p) => match p { XP(_, c) -> holds_lambda(c) })
+}
+
+fn beta_arm(a: Arm, fname: String, ca: ClosureArg, sh: Bool) : Arm =
   match a {
     Arm(pat, g, b) ->
       if list_has(cs_pat_binders(pat, []), fname) { a }
-      else { Arm(pat, map_opt(g, (x) => beta_apply_all(x, fname, ca)), beta_apply_all(b, fname, ca)) }
+      else { Arm(pat, map_opt(g, (x) => beta_apply_all(x, fname, ca, sh)), beta_apply_all(b, fname, ca, sh)) }
   }
 
-fn beta_block(ss: [Stmt], t: Option[Expr], fname: String, ca: ClosureArg) : ExprKind =
-  match beta_stmts(ss, fname, ca) {
-    BetaStmts(ss1, true)  -> EBlock(ss1, map_opt(t, (x) => beta_apply_all(x, fname, ca)))
+fn beta_block(ss: [Stmt], t: Option[Expr], fname: String, ca: ClosureArg, sh: Bool) : ExprKind =
+  match beta_stmts(ss, fname, ca, sh) {
+    BetaStmts(ss1, true)  -> EBlock(ss1, map_opt(t, (x) => beta_apply_all(x, fname, ca, sh)))
     BetaStmts(ss1, false) -> EBlock(ss1, t)
   }
 
@@ -154,14 +181,14 @@ fn beta_block(ss: [Stmt], t: Option[Expr], fname: String, ca: ClosureArg) : Expr
 # whether the param is still visible after them.
 type BetaStmts = BetaStmts([Stmt], Bool)
 
-fn beta_stmts(ss: [Stmt], fname: String, ca: ClosureArg) : BetaStmts =
+fn beta_stmts(ss: [Stmt], fname: String, ca: ClosureArg, sh: Bool) : BetaStmts =
   match ss {
     [] -> BetaStmts([], true)
     [s, ...rest] -> {
-      let s1 = map_stmt_exprs(s, (x) => beta_apply_all(x, fname, ca))
+      let s1 = map_stmt_exprs(s, (x) => beta_apply_all(x, fname, ca, sh))
       if list_has(stmt_binders(s), fname) { BetaStmts([s1, ...rest], false) }
       else {
-        match beta_stmts(rest, fname, ca) { BetaStmts(rs, live) -> BetaStmts([s1, ...rs], live) }
+        match beta_stmts(rest, fname, ca, sh) { BetaStmts(rs, live) -> BetaStmts([s1, ...rs], live) }
       }
     }
   }
@@ -173,8 +200,8 @@ fn stmt_binders(s: Stmt) : [String] =
     _ -> []
   }
 
-fn beta_descend(e: Expr, fname: String, ca: ClosureArg) : Expr =
-  Expr { kind: map_expr_kind(e.kind, (k) => beta_apply_all(k, fname, ca)),
+fn beta_descend(e: Expr, fname: String, ca: ClosureArg, sh: Bool) : Expr =
+  Expr { kind: map_expr_kind(e.kind, (k) => beta_apply_all(k, fname, ca, sh)),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 
 # The closure as a first-class value, to substitute for a bare use of
