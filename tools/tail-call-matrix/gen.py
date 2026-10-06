@@ -9,6 +9,7 @@ own. Mutual shapes also come with a form ahead of the tail call (lambda,
 record, list, interpolation, pipe). Prints the shape names, one per line.
 """
 import sys
+from itertools import product
 
 TURNS = 5000000
 
@@ -44,6 +45,10 @@ def shape_fns(tag, shape, arity, row, unread, form=None):
         body = (f"{sig(go, 3, unread, row)} =\n"
                 f"  if n == 0 {{ acc }} else {{ {go}({args(3, unread, 'n - 1', 'acc + 1' + reads(3, unread))}) }}\n")
         return body, f"{go}({args(3, unread, str(TURNS), '0')})"
+    if shape == "ring":
+        return ring_fns(tag, row)
+    if arity == "swapped":
+        return swap_fns(tag, row)
     kf, kg = 3, {"equal": 3, "smaller": 2, "larger": 4}[arity]
     ping, pong = f"{tag}_ping", f"{tag}_pong"
     pre, step = FORMS[form] if form else ("", "acc + 1")
@@ -53,17 +58,35 @@ def shape_fns(tag, shape, arity, row, unread, form=None):
             f"  {ping}({args(kf, unread, 'n - 1', 'acc' + reads(kg, False))})\n")
     return body, f"{ping}({args(kf, unread, str(TURNS), '0')})"
 
-shapes = []
-for shape in ("self", "mutual"):
-    for arity in (("equal",) if shape == "self" else ("equal", "smaller", "larger")):
-        for row in (False, True):
-            for unread in (False, True):
-                for fiber in ("main", "spawned"):
-                    shapes.append((shape, arity, row, unread, fiber, None))
-for form in FORMS:
-    for row in (False, True):
-        for fiber in ("main", "spawned"):
-            shapes.append(("mutual", "equal", row, False, fiber, form))
+# Three members of three arities: the dispatch has to tell more than two
+# arms apart.
+def ring_fns(tag, row):
+    eff = " / Tick" if row else ""
+    a, b, c = f"{tag}_a", f"{tag}_b", f"{tag}_c"
+    body = (f"fn {a}(n: Int, acc: Int, x0: Int) : Int{eff} =\n"
+            f"  if n == 0 {{ acc }} else {{ {b}(n, acc + 1 + x0 - x0) }}\n\n"
+            f"fn {b}(n: Int, acc: Int) : Int{eff} = {c}(n, acc, 1, 2)\n\n"
+            f"fn {c}(n: Int, acc: Int, x0: Int, x1: Int) : Int{eff} = {a}(n - 1, acc + x0 - x0 + x1 - x1, 3)\n")
+    return body, f"{a}({TURNS}, 0, 3)"
+
+# The members take their parameters in different orders, so one of them
+# lands in the slots out of order, and its calls pass computed arguments.
+def swap_fns(tag, row):
+    eff = " / Tick" if row else ""
+    ping, pong = f"{tag}_ping", f"{tag}_pong"
+    body = (f"fn {ping}(n: Int, s: String, acc: Int) : Int{eff} =\n"
+            f"  if n == 0 {{ acc }} else {{ {pong}(s ++ \"\", acc + 1, n - 1 + 1) }}\n\n"
+            f"fn {pong}(s: String, acc: Int, n: Int) : Int{eff} =\n"
+            f"  {ping}(n - 1, s ++ \"\", acc + string_length(s) - 1)\n")
+    return body, f"{ping}({TURNS}, \"x\", 0)"
+
+BOOLS = (False, True)
+FIBERS = ("main", "spawned")
+shapes = [("self", "equal", r, u, f, None) for r, u, f in product(BOOLS, BOOLS, FIBERS)]
+shapes += [("mutual", a, r, u, f, None)
+           for a, r, u, f in product(("equal", "smaller", "larger"), BOOLS, BOOLS, FIBERS)]
+shapes += [("mutual", "equal", r, False, f, form) for form, r, f in product(FORMS, BOOLS, FIBERS)]
+shapes += [(sh, ar, r, False, f, None) for (sh, ar), r, f in product((("ring", "mixed"), ("mutual", "swapped")), BOOLS, FIBERS)]
 
 out = ["import spawn\n", "effect Tick {\n  next(v: Int) : Int\n}\n",
        "type Box = { v: Int }\n", "fn ident(v: Int) : Int = v\n"]
