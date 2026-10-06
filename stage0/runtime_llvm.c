@@ -954,6 +954,13 @@ KaiValue *kaix_incref_if_token_null(KaiReuse token, KaiValue *child) {
   return child;
 }
 
+/* Arm-top reuse, unique donor: release pointer slot `i`, a child no binder
+ * moved out of the stolen shell. A null token (shared donor) keeps it. */
+KaiReuse kaix_drop_slot_if_token(KaiReuse token, int32_t i) {
+  if (token != kai_reuse_null) kai_decref(kai_var_slots(token)[i].ptr);
+  return token;
+}
+
 /* Borrow read of a variant pointer slot — the bind-site uses this in the
  * UNIQUE branch so the child is moved (not duplicated) into the rebuild.
  * Unlike `kaix_variant_arg` (which boxes typed slots and is borrow for
