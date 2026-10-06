@@ -1,0 +1,78 @@
+#[doc("""
+Native landing pads: the blocks a trap's unwind enters on its way out of
+a frame. A pad releases the boxed registers its `kai_pad_open` names and
+resumes the unwind; every call emitted while it is open is an `invoke`
+to it (`native_build_call`).
+""")]
+
+import compiler.kir
+import compiler.emit_native_fn
+
+#[doc("True when `op` opens a landing pad.")]
+pub fn npad_is_open(op: KOp) : Bool = match op {
+  KPrim(nm, _) -> nm == "kai_pad_open"
+  _ -> false
+}
+
+#[doc("True when `op` closes a landing pad.")]
+pub fn npad_is_close(op: KOp) : Bool = match op {
+  KPrim(nm, _) -> nm == "kai_pad_close"
+  _ -> false
+}
+
+#[doc("Builds the pad named `reg` that releases the registers of `op`, and opens it.")]
+pub fn nemit_pad_open(ctx: Handle, reg: String, op: KOp) : Unit / Console = match op {
+  KPrim(_, regs) -> {
+    let b = native_ctx_b(ctx)
+    let fnval = native_ctx_fnval(ctx)
+    let here = llvm_get_insert_block(b)
+    let pad = llvm_append_block(native_ctx_m(ctx), fnval, "pad")
+    llvm_position_at_end(b, pad)
+    let lp = llvm_build_landingpad_cleanup(b)
+    npad_release(ctx, regs)
+    let _r = llvm_build_resume(b, lp)
+    llvm_position_at_end(b, here)
+    npad_arm(ctx, fnval)
+    native_ctx_add_block(ctx, npad_label(reg), pad)
+    native_ctx_set_pad(ctx, pad)
+  }
+  _ -> ()
+}
+
+#[doc("Reopens the pad enclosing the one `op` closes, or none.")]
+pub fn nemit_pad_close(ctx: Handle, op: KOp) : Unit = match op {
+  KPrim(_, [KVar(outer)]) -> native_ctx_set_pad(ctx, native_ctx_find_block(ctx, npad_label(outer)))
+  _ -> native_ctx_set_pad(ctx, native_ctx_find_block(ctx, npad_label("")))
+}
+
+# The decrefs are plain calls: a pad never unwinds into another.
+fn npad_release(ctx: Handle, regs: [KVal]) : Unit / Console = match regs {
+  [] -> ()
+  [v, ...rest] -> {
+    match v {
+      KVar(r) -> if native_ctx_reg_slot(ctx, r) == 0 { npad_decref(ctx, nemit_atom(ctx, v)) } else { () }
+      _ -> ()
+    }
+    npad_release(ctx, rest)
+  }
+}
+
+fn npad_decref(ctx: Handle, x: Handle) : Unit = {
+  let pt = llvm_buf_new(); llvm_buf_push(pt, native_ctx_ptrt(ctx))
+  let fnty = llvm_fn_type_n(native_ctx_voidt(ctx), pt); llvm_buf_free(pt)
+  let fnv = llvm_get_or_declare_fn(native_ctx_m(ctx), "kaix_decref", fnty)
+  let ab = llvm_buf_new(); llvm_buf_push(ab, x)
+  let _c = llvm_build_call_n(native_ctx_b(ctx), fnv, fnty, ab)
+  llvm_buf_free(ab)
+}
+
+fn npad_arm(ctx: Handle, fnval: Handle) : Unit = {
+  let none = llvm_buf_new()
+  let pfty = llvm_fn_type_n(native_ctx_i32t(ctx), none); llvm_buf_free(none)
+  let pers = llvm_get_or_declare_fn(native_ctx_m(ctx), "__gcc_personality_v0", pfty)
+  let _p = llvm_set_personality(fnval, pers)
+  let _u = llvm_add_uwtable(fnval)
+  ()
+}
+
+fn npad_label(reg: String) : String = string_concat("pad:", reg)

@@ -84,9 +84,10 @@ else
 fi
 # The writer's identity is part of the key: a host that changes clang (or
 # whose llvm-config moves to another major) must re-emit, or it keeps
-# linking a bitcode written for a different LLVM.
+# linking a bitcode written for a different LLVM. This script is too, so a
+# change to its flags re-emits.
 input_hash() {
-  { $SHA256 "$RUNTIME_C" "$RUNTIME_H"
+  { $SHA256 "$RUNTIME_C" "$RUNTIME_H" "$ROOT/tools/gen-runtime-bc.sh"
     printf '%s\n' "$(resolve_clang 2>/dev/null || echo none)"
     printf '%s\n' "$(clang_major "$(resolve_clang 2>/dev/null || echo false)" 2>/dev/null || echo 0)"
   } | $SHA256 | awk '{print $1}'
@@ -213,7 +214,10 @@ fi
 # static helpers are pre-optimised. The target data layout is the build
 # host's native one (clang's default) — exactly what the in-process module
 # carries on this platform, so the link is layout-correct by construction.
-"$CLANG" -std=c99 -Wno-unused-function -Wno-unused-variable -O2 -emit-llvm -c \
+# `-fexceptions` keeps a trap's path from being `nounwind`: without it LLVM
+# turns every `invoke` that reaches a trap into a call, and no landing pad
+# runs.
+"$CLANG" -std=c99 -Wno-unused-function -Wno-unused-variable -O2 -fexceptions -emit-llvm -c \
   -DKAI_HOT_ONLY=1 -DKAI_SEPARATE_COMPILATION=1 \
   -I "$ROOT/stage2" -I "$ROOT/stage0" \
   "$RUNTIME_C" -o "$BC_OUT"
@@ -221,7 +225,7 @@ fi
 # The native-modular twin. Identical flags today (the split made the two
 # bitcodes content-identical), kept as a distinct artifact so the two native
 # link paths can evolve independently and their staleness keys stay separate.
-"$CLANG" -std=c99 -Wno-unused-function -Wno-unused-variable -O2 -emit-llvm -c \
+"$CLANG" -std=c99 -Wno-unused-function -Wno-unused-variable -O2 -fexceptions -emit-llvm -c \
   -DKAI_HOT_ONLY=1 -DKAI_SEPARATE_COMPILATION=1 \
   -I "$ROOT/stage2" -I "$ROOT/stage0" \
   "$RUNTIME_C" -o "$BC_INLINE"

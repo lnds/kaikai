@@ -36,23 +36,39 @@ registered only once the emitter has bound it with its own reference
 (`own`), which a reuse arm never does. `scr` asks the next `match` to
 register its scrutinee; `mstack` holds the enclosing native matches that
 registered theirs. `fib` is the native register holding the frame's
-fiber cache, absent until the lowering makes one.
+fiber cache, absent until the lowering makes one. `traps` asks for the
+native landing pads; `pad` is the open one, if any.
 """)]
-pub type UnwFrame = { ucx: UnwCx, sites: [UnwSite], arms: [String], own: [String], scr: Bool, mstack: [UnwM], fib: Option[String] }
+pub type UnwFrame = { ucx: UnwCx, sites: [UnwSite], arms: [String], own: [String], scr: Bool, mstack: [UnwM], fib: Option[String], traps: Bool, pad: UnwPadOpen }
+
+#[doc("An open landing pad: the register naming it and every register it releases, the enclosing pads' included; `pushed` are the registers the enclosing brackets hold.")]
+pub type UnwPadOpen = { reg: String, regs: [String], pushed: [String] }
+
+fn up_no_pad() : UnwPadOpen = UnwPadOpen { reg: "", regs: [], pushed: [] }
 
 #[doc("A native match's registered scrutinee: its exit-drop register and the pushing fiber register.")]
 pub type UnwM = UnwM(String, String)
 
 #[doc("A frame with no sites, carrying `ucx` for the frames nested in it.")]
-pub fn unw_frame_none(ucx: UnwCx) : UnwFrame = UnwFrame { ucx: ucx, sites: [], arms: [], own: [], scr: false, mstack: [], fib: None }
+pub fn unw_frame_none(ucx: UnwCx) : UnwFrame = UnwFrame { ucx: ucx, sites: [], arms: [], own: [], scr: false, mstack: [], fib: None, traps: false, pad: up_no_pad() }
+
+#[doc("`u` asking every frame nested in it for the native landing pads.")]
+pub fn unw_with_traps(u: UnwFrame) : UnwFrame =
+  UnwFrame { ucx: u.ucx, sites: u.sites, arms: u.arms, own: u.own, scr: u.scr, mstack: u.mstack, fib: u.fib, traps: true, pad: u.pad }
+
+#[doc("`u` with the landing pad `p` open.")]
+pub fn unw_with_pad(u: UnwFrame, p: UnwPadOpen) : UnwFrame =
+  UnwFrame { ucx: u.ucx, sites: u.sites, arms: u.arms, own: u.own, scr: u.scr, mstack: u.mstack, fib: u.fib, traps: u.traps, pad: p }
 
 #[doc("A frame with nothing to register under `u`'s context: `u` itself when it is one.")]
-pub fn unw_blank(u: UnwFrame) : UnwFrame = if up_blank(u) { u } else { unw_frame_none(u.ucx) }
+pub fn unw_blank(u: UnwFrame) : UnwFrame = if up_blank(u) { u } else { up_keep_traps(unw_frame_none(u.ucx), u.traps) }
+
+fn up_keep_traps(u: UnwFrame, traps: Bool) : UnwFrame = if traps { unw_with_traps(u) } else { u }
 
 fn up_blank(u: UnwFrame) : Bool = match u.fib {
   Some(_) -> false
   None    -> not u.scr and list_length(u.sites) == 0 and list_length(u.arms) == 0
-             and list_length(u.own) == 0 and list_length(u.mstack) == 0
+             and list_length(u.own) == 0 and list_length(u.mstack) == 0 and u.pad.reg == ""
 }
 
 #[doc("""
@@ -62,20 +78,21 @@ unwind and that installs no handler makes no call that can.
 """)]
 pub fn unw_fn_frame(u: UnwFrame, enc: String, row: Option[RowExpr], seeds: [String], params: [String], body: Expr) : UnwFrame / Console =
   match row {
-    Some(r) -> if unw_row_class(r, u.ucx) == 0 and not list_has(u.ucx.handles, enc) { unw_blank(u) }
+    Some(r) -> if not u.traps and unw_row_class(r, u.ucx) == 0 and not list_has(u.ucx.handles, enc) { unw_blank(u) }
                else { unw_frame(u, seeds, params, body) }
     None -> unw_frame(u, seeds, params, body)
   }
 
 #[doc("The frame of `body` with owned entry binders `seeds` among its params `params`.")]
 pub fn unw_frame(u: UnwFrame, seeds: [String], params: [String], body: Expr) : UnwFrame =
-  if not unw_scan(body, u.ucx) { unw_blank(u) }
+  if not u.traps and not unw_scan(body, u.ucx) { unw_blank(u) }
   else {
     let ucx = u.ucx
     let bound = unw_binders(body, params)
     let banned = unw_dups(bound, [], [])
-    UnwFrame { ucx: ucx, sites: unw_walk(ucx, unw_minus(seeds, banned), bound, banned, params, body),
-               arms: unw_minus(unw_arm_binders(body, []), banned), own: [], scr: false, mstack: [], fib: None }
+    UnwFrame { ucx: ucx, sites: unw_walk(ucx, unw_minus(seeds, banned), bound, banned, params, body, u.traps),
+               arms: unw_minus(unw_arm_binders(body, []), banned), own: [], scr: false, mstack: [], fib: None,
+               traps: u.traps, pad: up_no_pad() }
   }
 
 #[doc("The names among `names` the emitter may register: a match-arm binder only once its arm owns it.")]
@@ -88,11 +105,11 @@ pub fn unw_admit(u: UnwFrame, names: [String]) : [String] = match names {
 
 #[doc("`u` with the arm binders `names` owned by the arm being emitted.")]
 pub fn unw_owning(u: UnwFrame, names: [String]) : UnwFrame =
-  if u.arms == [] { u } else { UnwFrame { ucx: u.ucx, sites: u.sites, arms: u.arms, own: list_append(names, u.own), scr: u.scr, mstack: u.mstack, fib: u.fib } }
+  if u.arms == [] { u } else { UnwFrame { ucx: u.ucx, sites: u.sites, arms: u.arms, own: list_append(names, u.own), scr: u.scr, mstack: u.mstack, fib: u.fib, traps: u.traps, pad: u.pad } }
 
 #[doc("`u` with its fiber held in native register `f`.")]
 pub fn unw_with_fib(u: UnwFrame, f: String) : UnwFrame =
-  UnwFrame { ucx: u.ucx, sites: u.sites, arms: u.arms, own: u.own, scr: u.scr, mstack: u.mstack, fib: Some(f) }
+  UnwFrame { ucx: u.ucx, sites: u.sites, arms: u.arms, own: u.own, scr: u.scr, mstack: u.mstack, fib: Some(f), traps: u.traps, pad: u.pad }
 
 #[doc("The native register holding `u`'s fiber cache.")]
 pub fn unw_fib(u: UnwFrame) : String = match u.fib {
@@ -102,16 +119,16 @@ pub fn unw_fib(u: UnwFrame) : String = match u.fib {
 
 #[doc("`u` asking (or not) the next `match` to register its scrutinee.")]
 pub fn unw_with_scr(u: UnwFrame, b: Bool) : UnwFrame =
-  UnwFrame { ucx: u.ucx, sites: u.sites, arms: u.arms, own: u.own, scr: b, mstack: u.mstack, fib: u.fib }
+  UnwFrame { ucx: u.ucx, sites: u.sites, arms: u.arms, own: u.own, scr: b, mstack: u.mstack, fib: u.fib, traps: u.traps, pad: u.pad }
 
 #[doc("`u` recording that the match dropping `sd` registered its scrutinee under fiber register `f`.")]
 pub fn unw_mpush(u: UnwFrame, sd: String, f: String) : UnwFrame =
-  UnwFrame { ucx: u.ucx, sites: u.sites, arms: u.arms, own: u.own, scr: u.scr, mstack: [UnwM(sd, f), ...u.mstack], fib: u.fib }
+  UnwFrame { ucx: u.ucx, sites: u.sites, arms: u.arms, own: u.own, scr: u.scr, mstack: [UnwM(sd, f), ...u.mstack], fib: u.fib, traps: u.traps, pad: u.pad }
 
 #[doc("`u` without the record of the match dropping `sd`; unchanged when that match registered nothing.")]
 pub fn unw_mpop(u: UnwFrame, sd: String) : UnwFrame = match u.mstack {
   [UnwM(d, _), ...rest] ->
-    if d == sd { UnwFrame { ucx: u.ucx, sites: u.sites, arms: u.arms, own: u.own, scr: u.scr, mstack: rest, fib: u.fib } } else { u }
+    if d == sd { UnwFrame { ucx: u.ucx, sites: u.sites, arms: u.arms, own: u.own, scr: u.scr, mstack: rest, fib: u.fib, traps: u.traps, pad: u.pad } } else { u }
   _ -> u
 }
 

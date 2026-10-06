@@ -23,6 +23,9 @@ import compiler.region
 import compiler.kir
 import compiler.kir_lower
 import compiler.unwind_pend
+import compiler.unwind_pads
+import compiler.unwind_sites
+import compiler.kir_lower_pads
 import compiler.fn_index
 import compiler.kir_pat_alias
 import compiler.kir_lower_reuse
@@ -210,7 +213,14 @@ type LRes2 = LRes2([KVal], LowerSt)
 # FORM set (see kir_lower_raw SCOPE) fall straight to the boxed dispatch.
 # Non-`MUnboxed` nodes (the boxed families other lanes own) never enter
 # the raw branch: purely additive.
-pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console =
+pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console = match unw_pad_names(st.unw.sites, x) {
+  Some(ns) -> match lower_pad_begin(x, ns, st) { PadB(outer, st1) -> match lower_expr_unpadded(x, st1) {
+    LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
+  } }
+  None     -> lower_expr_unpadded(x, st)
+}
+
+fn lower_expr_unpadded(x: Expr, st: LowerSt) : LRes / Console =
   if kir_node_is_raw(x) {
     match lower_expr_raw(x, st) {
       LRes(rawv, st1) -> bind_op(st1, KPrim(kir_raw_box_prim(x.ty), [rawv]), kpos_of(x))
@@ -260,7 +270,14 @@ fn lower_fixed_vec_materialize(x: Expr, st: LowerSt) : LRes / Console = {
 # The boxed-position dispatch (the original `lower_expr` body). Reached
 # either directly (non-raw node) or as the boxed fallback inside the raw
 # path (`lower_expr_raw`'s box→raw border lowers boxed here then unboxes).
-fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
+fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match unw_pad_names(st.unw.sites, x) {
+  Some(ns) -> match lower_pad_begin(x, ns, st) { PadB(outer, st1) -> match lower_expr_boxed_unpadded(x, st1) {
+    LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
+  } }
+  None     -> lower_expr_boxed_unpadded(x, st)
+}
+
+fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # Atoms: no statement, the literal IS the value.
   EInt(n, _) -> LRes(kir_int_atom(x, n), st)
   EReal(r, _)           -> LRes(KRealV(r), st)
@@ -447,7 +464,14 @@ fn lower_unhandled(x: Expr, st: LowerSt) : LRes / Console {
 # boxed `ptr`. Mirror of the C oracle's `emit_expr_raw`: a `MUnboxed` node is
 # natively raw; any other crosses the box→raw border (`raw_border.kai`). The
 # mutual recursion with `lower_expr` is why this lives in the Expr-SCC.
-fn lower_expr_raw(x: Expr, st: LowerSt) : LRes / Console = {
+fn lower_expr_raw(x: Expr, st: LowerSt) : LRes / Console = match unw_pad_names(st.unw.sites, x) {
+  Some(ns) -> match lower_pad_begin(x, ns, st) { PadB(outer, st1) -> match lower_expr_raw_unpadded(x, st1) {
+    LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
+  } }
+  None     -> lower_expr_raw_unpadded(x, st)
+}
+
+fn lower_expr_raw_unpadded(x: Expr, st: LowerSt) : LRes / Console = {
   let xb = raw_operand(x)
   match xb.mode {
     MUnboxed -> lower_expr_raw_kind(xb, st)
@@ -458,7 +482,14 @@ fn lower_expr_raw(x: Expr, st: LowerSt) : LRes / Console = {
 # Lower `x` raw at a KNOWN destination slot (a call arg at its param's raw
 # slot). The border keys off the param's slot, not `x.ty`: an arg the typer
 # left untyped would otherwise cross as a Real.
-fn lower_expr_raw_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console = {
+fn lower_expr_raw_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console = match unw_pad_names(st.unw.sites, x) {
+  Some(ns) -> match lower_pad_begin(x, ns, st) { PadB(outer, st1) -> match lower_expr_raw_at_unpadded(x, slot, st1) {
+    LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
+  } }
+  None     -> lower_expr_raw_at_unpadded(x, slot, st)
+}
+
+fn lower_expr_raw_at_unpadded(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console = {
   let xb = raw_operand(x)
   match xb.mode {
     MUnboxed -> lower_expr_raw_kind(xb, st)
@@ -1358,13 +1389,18 @@ fn lower_stmt(s: Stmt, st: LowerSt) : LowerSt / Console = match s {
   }
   # `assert cond` / `assert cond, "msg"` → `kai_assert_check(cond, msg)`,
   # the SAME runtime entry the C-direct oracle's `emit_assert_stmt` emits.
-  SAssert(cond, opt_msg) -> match assert_reported_binding(cond, opt_msg) {
-    Some(CtrId(ident, idnode, _)) -> lower_assert_with_value(cond, kir_assert_msg(opt_msg), ident, idnode, st)
-    None -> match lower_expr(cond, st) {
-      LRes(v, st1) -> ls_emit(st1, KDo(KPrim("kai_assert_check", [v, KStrV(kir_assert_msg(opt_msg))]), KNoPos))
-    }
+  SAssert(cond, opt_msg) -> match unw_pad_at(st.unw.sites, cond.line, cond.col, unw_assert_key()) {
+    Some(ns) -> match lower_pad_begin(cond, ns, st) { PadB(outer, st1) -> lower_pad_end(cond, outer, lower_assert(cond, opt_msg, st1)) }
+    None     -> lower_assert(cond, opt_msg, st)
   }
   _ -> st
+}
+
+fn lower_assert(cond: Expr, opt_msg: Option[Expr], st: LowerSt) : LowerSt / Console = match assert_reported_binding(cond, opt_msg) {
+  Some(CtrId(ident, idnode, _)) -> lower_assert_with_value(cond, kir_assert_msg(opt_msg), ident, idnode, st)
+  None -> match lower_expr(cond, st) {
+    LRes(v, st1) -> ls_emit(st1, KDo(KPrim("kai_assert_check", [v, KStrV(kir_assert_msg(opt_msg))]), KNoPos))
+  }
 }
 
 # The runtime consumes the reported value, so it is an owned ref taken
@@ -2810,10 +2846,8 @@ fn lower_call_bracketed(x: Expr, f: Expr, cargs: [Expr], clo: Option[UnwCallee],
   match ls_fresh_reg(st) { LSReg(fr, st0) -> {
       let held = map(names, (n) => KVar(ls_reg_of(st0, n)))
       let st1 = ls_emit(st0, KLet(fr, SBoxed, KPrim("kai_unw_push", [KVar(unw_fib(st0.unw)), ...held]), kpos_of(x)))
-      let r = match clo {
-        Some(UkTransfer(n)) -> lower_apply_borrow(x, [kir_unw_var(f, n), ...cargs], st1)
-        Some(UkDup(n))      -> lower_apply_borrow(x, [kir_unw_var(f, n), ...cargs], st1)
-        None                -> lower_call_at(x, f, cargs, st1)
+      let r = match lower_bracket_begin(map(names, (n) => ls_reg_of(st0, n)), st1) { PadB(outer, sb) ->
+        match lower_call_in_bracket(x, f, cargs, clo, sb) { LRes(v, se) -> LRes(v, lower_bracket_end(outer, se)) }
       }
       match r { LRes(v, st2) -> {
         let st3 = ls_emit(st2, KDo(KPrim("kai_unw_pop", [KVar(fr)]), kpos_of(x)))
@@ -2823,6 +2857,12 @@ fn lower_call_bracketed(x: Expr, f: Expr, cargs: [Expr], clo: Option[UnwCallee],
         }
       } }
     } }
+
+fn lower_call_in_bracket(x: Expr, f: Expr, cargs: [Expr], clo: Option[UnwCallee], st: LowerSt) : LRes / Console = match clo {
+  Some(UkTransfer(n)) -> lower_apply_borrow(x, [kir_unw_var(f, n), ...cargs], st)
+  Some(UkDup(n))      -> lower_apply_borrow(x, [kir_unw_var(f, n), ...cargs], st)
+  None                -> lower_call_at(x, f, cargs, st)
+}
 
 type UnwCallee = UkTransfer(String) | UkDup(String)
 
