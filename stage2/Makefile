@@ -6458,6 +6458,26 @@ test-closure-spec-homonym: $(TARGET) bin-kai build
 	done; \
 	echo "closure-spec-homonym OK (each closure argument keeps its resolved identity; c and native agree)"
 
+# A fn that applies its functional param and passes it to a homonym is not
+# folding into itself: the homonym is declined like its renamed twin.
+test-closure-spec-self-homonym: $(TARGET) bin-kai build
+	@set -e; \
+	src=../examples/pipes/collections/closure_spec_self_homonym.kai; \
+	exp=../examples/pipes/collections/closure_spec_self_homonym.out.expected; \
+	for be in c native; do \
+	  KAI_BACKEND=$$be ../bin/kai build $$src -o build/s2-cssh 2> build/s2-cssh.err \
+	    || { echo "closure-spec-self-homonym FAIL ($$be build errored)"; cat build/s2-cssh.err; exit 1; }; \
+	  ./build/s2-cssh > build/s2-cssh.out; \
+	  diff -q $$exp build/s2-cssh.out > /dev/null \
+	    || { echo "closure-spec-self-homonym FAIL ($$be output diff)"; diff $$exp build/s2-cssh.out; exit 1; }; \
+	done; \
+	$(KAIC2) --emit=kir --path ../stdlib $$src > build/s2-cssh.kir 2>/dev/null; \
+	if grep -E -q '^fn (foldl|fold_seeded)__cspec' build/s2-cssh.kir; then \
+	  echo "closure-spec-self-homonym FAIL (a fn that hands its functional param to another fn was specialised)"; \
+	  grep -E '^fn (foldl|fold_seeded)__cspec' build/s2-cssh.kir; exit 1; \
+	fi; \
+	echo "closure-spec-self-homonym OK (homonym declined like its twin; c and native agree)"
+
 # Issue #1208 (native) — grounding a return-only tparam from the call
 # site. `let v: Vec[Point] = [a..b] | stage` collects into a Vec whose
 # element type is return-only; mono now grounds it from the annotated
