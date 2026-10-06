@@ -504,23 +504,21 @@ fn proto_ops_lookup_all_loop(ops: [ProtoOpReg], target: String) : [ProtoOpReg] {
 }
 
 # Validate: the orphan rule, single-impl-per-(P,T) coherence, and that
-# the impl's protocol name resolves to a protocol its module can see. Reports each violation on
-# stderr and returns the count of reported errors.
+# the impl's protocol name resolves to a protocol its module can see.
 fn validate_impls(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
                   reg: ProtocolReg, target_mod: String,
-                  ps: PScope) : Int / Console + File {
-  validate_impls_loop(ds, homes, df, reg, target_mod, ps,
-                      OrphanScope(ps, nt_type_spellings(ds, target_mod)), [], 0)
-}
+                  ps: PScope) : [Diagnostic] =
+  list_reverse(validate_impls_loop(ds, homes, df, reg, target_mod, ps,
+                                   OrphanScope(ps, nt_type_spellings(ds, target_mod)), [], []))
 
 fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
                        reg: ProtocolReg, target_mod: String,
                        ps: PScope, os: OrphanScope, seen: [String],
-                       errs: Int) : Int / Console + File {
+                       acc: [Diagnostic]) : [Diagnostic] {
   match ds {
-    [] -> errs
+    [] -> acc
     [d, ...rest] -> match homes {
-      [] -> errs
+      [] -> acc
       [h, ...hrest] -> match d {
       DImpl(pspell, proto_args, target, _, line, col, _, isym) -> {
         let file = decl_diag_file(d, df)
@@ -551,61 +549,46 @@ fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
         let orphan = OrphanImpl { pspell: pspell, proto_home: proto_home, args: proto_args,
                                   target: target, from: from,
                                   impl_mod: proto_home_name(from, target_mod) }
-        let errs1 = match orphan_error(os, orphan) {
-          Some(msg) -> {
-            eprint(concat_all([file, ":", int_to_string(line), ":", int_to_string(col),
-                               ": error: ", msg]))
-            errs + 1
-          }
-          None -> errs
+        let acc1 = match orphan_error(os, orphan) {
+          Some(msg) -> [proto_err(file, line, col, msg), ...acc]
+          None -> acc
         }
-        let errs2 =
+        let acc2 =
           if list_has(seen, key) {
-            eprint(concat_all([
-              file, ":", int_to_string(line), ":", int_to_string(col),
-              ": error: duplicate impl: `impl ", pname, " for ", tname,
-              "` already exists in this compilation unit"]))
-            errs1 + 1
-          } else { errs1 }
-        let errs3 = match res {
-          PkHome(_) -> errs2
-          PkPrivate(m) -> {
-            eprint(concat_all([
-              file, ":", int_to_string(line), ":", int_to_string(col),
-              ": error: protocol `", pname, "` is declared in module `", m,
-              "` but is not `pub`"]))
-            errs2 + 1
-          }
-          PkUnknown -> {
-            eprint(concat_all([
-              file, ":", int_to_string(line), ":", int_to_string(col),
-              ": error: unknown protocol `", pname, "` in `impl`"]))
-            errs2 + 1
-          }
-          PkAmbiguous(cands) -> {
-            nr_error_ambiguous(file, line, col, NCProtocol, pname,
-                               map(cands, (c) => proto_home_name(c, target_mod)), "", [])
-            errs2 + 1
-          }
+            [proto_err(file, line, col, concat_all(["duplicate impl: `impl ", pname, " for ", tname,
+                             "` already exists in this compilation unit"])), ...acc1]
+          } else { acc1 }
+        let acc3 = match res {
+          PkHome(_) -> acc2
+          PkPrivate(m) ->
+            [proto_err(file, line, col, concat_all(["protocol `", pname, "` is declared in module `", m,
+                             "` but is not `pub`"])), ...acc2]
+          PkUnknown -> [proto_err(file, line, col, concat_all(["unknown protocol `", pname, "` in `impl`"])), ...acc2]
+          PkAmbiguous(cands) ->
+            [nr_ambiguous_diag(file, line, col, NCProtocol, pname,
+                               map(cands, (c) => proto_home_name(c, target_mod)), "", []), ...acc2]
         }
         let seen1 = if list_has(seen, key) { seen } else { [key, ...seen] }
-        validate_impls_loop(rest, hrest, df, reg, target_mod, ps, os, seen1, errs3)
+        validate_impls_loop(rest, hrest, df, reg, target_mod, ps, os, seen1, acc3)
       }
       DDerive(_, inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, acc)
       DUnstable(inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, acc)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, acc)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, acc)
       DConstructor(inner, _, _) ->
-        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, errs)
-      _ -> validate_impls_loop(rest, hrest, df, reg, target_mod, ps, os, seen, errs)
+        validate_impls_loop([inner, ...rest], homes, df, reg, target_mod, ps, os, seen, acc)
+      _ -> validate_impls_loop(rest, hrest, df, reg, target_mod, ps, os, seen, acc)
       }
     }
   }
 }
+
+fn proto_err(file: String, line: Int, col: Int, msg: String) : Diagnostic =
+  mk_diag(SevError, file, line, col, msg, [])
 
 # A registry home as a diagnostic names it: the root file by its module name.
 fn proto_home_name(mo: Option[String], target_mod: String) : String = match mo {
@@ -647,17 +630,16 @@ fn proto_home_name(mo: Option[String], target_mod: String) : String = match mo {
 
 fn validate_impl_methods(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
                          reg: ProtocolReg, target_mod: String,
-                         ps: PScope) : Int / Console {
-  validate_impl_methods_loop(ds, homes, df, reg, target_mod, ps, 0)
-}
+                         ps: PScope) : [Diagnostic] =
+  list_reverse(validate_impl_methods_loop(ds, homes, df, reg, target_mod, ps, []))
 
 fn validate_impl_methods_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
                               reg: ProtocolReg, target_mod: String,
-                              ps: PScope, errs: Int) : Int / Console {
+                              ps: PScope, acc: [Diagnostic]) : [Diagnostic] {
   match ds {
-    [] -> errs
+    [] -> acc
     [d, ...rest] -> match homes {
-      [] -> errs
+      [] -> acc
       [h, ...hrest] -> match d {
       DImpl(pspell, proto_args, target, methods, line, col, _, isym) -> {
         let file = decl_diag_file(d, df)
@@ -674,7 +656,7 @@ fn validate_impl_methods_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
           _ -> []
         }
         if proto_ops == [] {
-          validate_impl_methods_loop(rest, hrest, df, reg, target_mod, ps, errs)
+          validate_impl_methods_loop(rest, hrest, df, reg, target_mod, ps, acc)
         } else {
           # Protocol tparams substitute against the impl's bracket
           # arguments. Legacy `impl P for T` (`proto_args == []`) is
@@ -693,23 +675,23 @@ fn validate_impl_methods_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
           let all_op_names = proto_op_names(proto_ops, [])
           let e1 = check_missing_methods(proto_ops, methods, pname, tname,
                                          all_op_names,
-                                         file, line, col, errs)
+                                         file, line, col, acc)
           let e2 = check_impl_methods(methods, proto_ops, pname, tname, target,
                                        proto_tps, arg_heads, file, e1)
           validate_impl_methods_loop(rest, hrest, df, reg, target_mod, ps, e2)
         }
       }
       DDerive(_, inner, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, errs)
+        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, acc)
       DUnstable(inner, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, errs)
+        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, acc)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, errs)
+        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, acc)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, errs)
+        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, acc)
       DConstructor(inner, _, _) ->
-        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, errs)
-      _ -> validate_impl_methods_loop(rest, hrest, df, reg, target_mod, ps, errs)
+        validate_impl_methods_loop([inner, ...rest], homes, df, reg, target_mod, ps, acc)
+      _ -> validate_impl_methods_loop(rest, hrest, df, reg, target_mod, ps, acc)
       }
     }
   }
@@ -729,25 +711,23 @@ fn check_missing_methods(proto_ops: [ProtoOpReg], methods: [Decl],
                          pname: String, tname: String,
                          all_op_names: [String],
                          file: String, line: Int, col: Int,
-                         errs: Int) : Int / Console {
+                         acc: [Diagnostic]) : [Diagnostic] {
   match proto_ops {
-    [] -> errs
+    [] -> acc
     [op, ...rest] -> match op {
       POR(_, opname, _, _, _, _, _) -> {
-        let errs1 =
-          if impl_has_method(methods, opname) { errs }
+        let acc1 =
+          if impl_has_method(methods, opname) { acc }
           else {
-            eprint(concat_all([
-              file, ":", int_to_string(line), ":", int_to_string(col),
-              ": error: impl `", pname, " for ", tname,
-              "` is missing required method `", opname, "`"]))
-            eprint(concat_all([
-              "  = note: protocol `", pname,
-              "` declares operations: ", proto_join_with(all_op_names, ", ")]))
-            errs + 1
+            [mk_diag(SevError, file, line, col,
+               concat_all(["impl `", pname, " for ", tname,
+                           "` is missing required method `", opname, "`"]),
+               [ri_note(file, line, col,
+                  concat_all(["protocol `", pname, "` declares operations: ",
+                              proto_join_with(all_op_names, ", ")]))]), ...acc]
           }
         check_missing_methods(rest, methods, pname, tname, all_op_names,
-                              file, line, col, errs1)
+                              file, line, col, acc1)
       }
     }
   }
@@ -770,34 +750,28 @@ fn impl_has_method(methods: [Decl], opname: String) : Bool {
 fn check_impl_methods(methods: [Decl], proto_ops: [ProtoOpReg],
                       pname: String, tname: String, target: TypeExpr,
                       proto_tps: [String], arg_heads: [String],
-                      file: String, errs: Int) : Int / Console {
+                      file: String, acc: [Diagnostic]) : [Diagnostic] {
   match methods {
-    [] -> errs
+    [] -> acc
     [d, ...rest] -> match d {
       DFn(_, op_name, _, params, ret_opt, _, _, line, col, _, fsym) -> {
-        let errs1 = match find_proto_op(proto_ops, op_name) {
-          None -> {
-            eprint(concat_all([
-              file, ":", int_to_string(line), ":", int_to_string(col),
-              ": error: impl `", pname, " for ", tname,
-              "` declares method `", op_name,
-              "` which is not an operation of protocol `", pname, "`"]))
-            errs + 1
-          }
+        let acc1 = match find_proto_op(proto_ops, op_name) {
+          None ->
+            [proto_err(file, line, col,
+               concat_all(["impl `", pname, " for ", tname,
+                           "` declares method `", op_name,
+                           "` which is not an operation of protocol `", pname, "`"])), ...acc]
           Some(op) -> match op {
             POR(_, _, proto_params, proto_ret, _, _, _) -> {
               let pa = list_length(params)
               let pp = list_length(proto_params)
               let e_ar =
-                if pa == pp { errs }
+                if pa == pp { acc }
                 else {
-                  eprint(concat_all([
-                    file, ":", int_to_string(line), ":", int_to_string(col),
-                    ": error: impl method `", op_name, "` in `",
-                    pname, " for ", tname,
-                    "` has arity ", int_to_string(pa),
-                    " but protocol declares arity ", int_to_string(pp)]))
-                  errs + 1
+                  [proto_err(file, line, col,
+                     concat_all(["impl method `", op_name, "` in `", pname, " for ", tname,
+                                 "` has arity ", int_to_string(pa),
+                                 " but protocol declares arity ", int_to_string(pp)])), ...acc]
                 }
               if pa == pp {
                 check_sig_heads(params, proto_params, ret_opt, proto_ret,
@@ -809,10 +783,10 @@ fn check_impl_methods(methods: [Decl], proto_ops: [ProtoOpReg],
           }
         }
         check_impl_methods(rest, proto_ops, pname, tname, target,
-                           proto_tps, arg_heads, file, errs1)
+                           proto_tps, arg_heads, file, acc1)
       }
       _ -> check_impl_methods(rest, proto_ops, pname, tname, target,
-                              proto_tps, arg_heads, file, errs)
+                              proto_tps, arg_heads, file, acc)
     }
   }
 }
@@ -842,10 +816,10 @@ fn check_sig_heads(impl_params: [Param], proto_params: [Param],
                    target: TypeExpr,
                    proto_tps: [String], arg_heads: [String],
                    file: String, line: Int, col: Int,
-                   errs: Int) : Int / Console {
+                   acc: [Diagnostic]) : [Diagnostic] {
   let e_params = check_sig_param_heads(impl_params, proto_params, tname, target,
                                         proto_tps, arg_heads,
-                                        op_name, pname, file, errs)
+                                        op_name, pname, file, acc)
   # Return-type check applies only when the impl is homogeneous w.r.t.
   # the protocol's tparams. Heterogeneous impls (`impl P[Other] for T`
   # with Other != T) often produce a *promoted* result type that the
@@ -866,13 +840,12 @@ fn check_sig_heads(impl_params: [Param], proto_params: [Param],
       }
       if ok { e_params }
       else {
-        eprint(concat_all([
-          file, ":", int_to_string(line), ":", int_to_string(col),
-          ": error: impl method `", op_name, "` in `",
-          pname, " for ", tname,
-          "` returns `", proto_type_text(impl_ret, file),
-          "` but protocol declares return type `", sig_ret_display(proto_ret, tname, target, proto_tps, arg_heads, file), "`"]))
-        e_params + 1
+        [proto_err(file, line, col,
+           concat_all(["impl method `", op_name, "` in `", pname, " for ", tname,
+                       "` returns `", proto_type_text(impl_ret, file),
+                       "` but protocol declares return type `",
+                       sig_ret_display(proto_ret, tname, target, proto_tps, arg_heads, file), "`"])),
+         ...e_params]
       }
     }
   } }
@@ -907,35 +880,32 @@ fn check_sig_param_heads(impl_ps: [Param], proto_ps: [Param], tname: String,
                          target: TypeExpr,
                          proto_tps: [String], arg_heads: [String],
                          op_name: String, pname: String,
-                         file: String, errs: Int) : Int / Console {
+                         file: String, acc: [Diagnostic]) : [Diagnostic] {
   match impl_ps {
-    [] -> errs
+    [] -> acc
     [ip, ...irest] -> match proto_ps {
-      [] -> errs
+      [] -> acc
       [pp, ...prest] -> {
-        let errs1 = match ip.ptype {
-          None -> errs
+        let acc1 = match ip.ptype {
+          None -> acc
           Some(it) -> match pp.ptype {
-            None -> errs
+            None -> acc
             Some(pt) -> {
               let ps = sig_subst(pt, tname, target, proto_tps, arg_heads)
-              if sig_type_matches(it, ps) { errs }
+              if sig_type_matches(it, ps) { acc }
               else {
-                eprint(concat_all([
-                  file, ":", int_to_string(ip.pline), ":", int_to_string(ip.pcol),
-                  ": error: impl method `", op_name, "` in `",
-                  pname, " for ", tname,
-                  "`: parameter `", ip.pname,
-                  "` has type `", proto_type_text(it, file),
-                  "` but protocol declares `", proto_type_text(ps, file), "`"]))
-                errs + 1
+                [proto_err(file, ip.pline, ip.pcol,
+                   concat_all(["impl method `", op_name, "` in `", pname, " for ", tname,
+                               "`: parameter `", ip.pname,
+                               "` has type `", proto_type_text(it, file),
+                               "` but protocol declares `", proto_type_text(ps, file), "`"])), ...acc]
               }
             }
           }
         }
         check_sig_param_heads(irest, prest, tname, target,
                               proto_tps, arg_heads,
-                              op_name, pname, file, errs1)
+                              op_name, pname, file, acc1)
       }
     }
   }
@@ -3407,7 +3377,7 @@ fn validate_derive_ord_one(file: String, tname: String, fname: String,
 # with protocols / impls lowered into ordinary fn decls, plus a
 # threaded ProtocolReg the post-inference rewrite consumes.
 #[doc("Result of pass A: the decl stream with impls lowered, the threaded ProtocolReg, and an error count.")]
-pub type LoweredProtocols = { decls: [Decl], reg: ProtocolReg, errs: Int }
+pub type LoweredProtocols = { decls: [Decl], reg: ProtocolReg, errs: Int, diags: [Diagnostic] }
 
 #[doc("Pass A: expand #[derive], validate coherence, lower impls + emit dispatchers, strip protocol decls. `cores` names the stdlib core modules, whose protocols keep their bare dispatch identity; `imports` is each file's direct import list, the scope a bare protocol head resolves through.")]
 pub fn lower_protocols(decls: [Decl], df: DiagFiles,
@@ -3445,14 +3415,16 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # Step 3 — coherence: orphan + duplicate-impl + protocol-visibility
   # validation. Needs `reg0.origins` to resolve each impl's protocol
   # name from its own module.
-  let coh_errs = validate_impls(expanded, homes, df, reg0,
-                                target_mod, ps)
+  let coh_diags = validate_impls(expanded, homes, df, reg0, target_mod, ps)
+  each(coh_diags, render_diag)
   # Step 3b — issue #535: validate each impl block against its
   # protocol's declared operations (missing methods, wrong arity,
   # head-name signature mismatch), resolved against the protocol the
   # impl's own module sees — never a same-named one elsewhere.
-  let impl_errs = validate_impl_methods(expanded, homes, df, reg0, target_mod, ps)
-  let errs = pre_errs + derive_errs + coh_errs + impl_errs
+  let impl_diags = validate_impl_methods(expanded, homes, df, reg0, target_mod, ps)
+  each(impl_diags, render_diag)
+  let diags = list_append(coh_diags, impl_diags)
+  let errs = pre_errs + derive_errs + list_length(diags)
   # Step 4 — lower each DImpl method into a top-level DFn (mangled
   # name) and record the (P, T) -> impl_fn entry in the registry.
   let lower_res = lower_impls(expanded, reg0, ps, [])
@@ -3499,7 +3471,7 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # Index the now-final impl table once; the post-inference rewrite's
   # per-spec scans consult it instead of walking `reg.impls` linearly.
   let indexed_reg = reg_with_impl_index(reg_with_renames(lower_res.reg, renames))
-  LoweredProtocols { decls: final_decls, reg: indexed_reg, errs: errs }
+  LoweredProtocols { decls: final_decls, reg: indexed_reg, errs: errs, diags: diags }
 }
 
 # Attach a freshly-built `ImplIndex` to a finalised registry. The impl
