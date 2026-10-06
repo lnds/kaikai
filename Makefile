@@ -240,9 +240,9 @@ tier0-gates: test-kai-namespace test-native-namespace test-module-name-ident dem
 test-compile-alloc:
 	@./tools/compile-alloc-gate.sh
 
-# A ceiling on the cells the typer allocates checking list literals nested
-# as deep as the parser allows: a walk that re-applies the substitution to
-# a whole type at each level makes them cubic in the depth.
+# Ceilings on the cells the typer allocates checking list literals and
+# lambdas nested as deep as the parser allows: re-applying the substitution
+# to a whole type at each level makes them superlinear in the depth.
 test-nest-alloc:
 	@./tools/nest-alloc-gate.sh
 
