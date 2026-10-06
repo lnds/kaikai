@@ -197,7 +197,7 @@ boot_seed() {
   command -v git >/dev/null 2>&1 || { say "git not found"; return 1; }
   ver="$(seed_version)"
   [ -n "$ver" ] || { say "no bootstrap-seed-v* tag up to v$(cat "$ROOT/VERSION"); fetch them with" \
-    "git fetch origin 'refs/tags/bootstrap-seed-v*:refs/tags/bootstrap-seed-v*'"; return 1; }
+    "git fetch https://github.com/kaikailang-org/kaikai.git 'refs/tags/bootstrap-seed-v*:refs/tags/bootstrap-seed-v*'"; return 1; }
   tag="bootstrap-seed-v$ver"
   dir="$BOOT_DIR/$tag"
   commit="$(git -C "$ROOT" rev-parse "$tag^{commit}")"
