@@ -6648,6 +6648,10 @@ static inline KaiReuse kai_drop_reuse_token(KaiValue *v, int n) {
  * double-frees on non-bijective rebuilds — see lane memory). The donated
  * cell already has the right slots[] array length (n_args >= n checked);
  * we overwrite the slot words, retag, and reset rc=1. */
+static inline void kai_reuse_free(KaiReuse at);
+
+/* A token whose arity cannot host the rebuild is still owned here: every
+ * caller nulls its copy before the call, so it is freed, never dropped. */
 static inline KaiValue *kai_variant_at(KaiReuse at, int32_t tag,
                                        const char *name, int n, uint32_t mask,
                                        KaiVarSlot *slots) {
@@ -6670,6 +6674,7 @@ static inline KaiValue *kai_variant_at(KaiReuse at, int32_t tag,
         (void) mask; (void) name;
         return at;
     }
+    kai_reuse_free(at);
     return kai_variant_u(tag, name, n, mask, slots);
 }
 
