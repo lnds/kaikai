@@ -60,6 +60,7 @@ import compiler.resolve_state
 import compiler.scope_file
 import compiler.scope_chain
 import compiler.handler_alias
+import compiler.resolve_callee
 
 # ====================================================================
 # checker: name resolution
@@ -94,12 +95,15 @@ pub type Env = { chain: ScopeChain, had_error: Bool, file: String,
               diags: [Diagnostic],
               # The resolution the walk produces. Inert unless the
               # entry point turned it on.
-              rs: ResState }
+              rs: ResState,
+              callees: CalleeTab,
+              larity: [LocalArity] }
 
 #[doc("Fresh resolver env for `file` with a single empty scope and no errors.")]
 pub fn env_new(file: String) : Env =
   Env { chain: ch_new(), had_error: false, file: file, alias_heads: [],
-        row_aliases: [], eff_ops: [], eff_spellings: [], diags: [], rs: rs_off() }
+        row_aliases: [], eff_ops: [], eff_spellings: [], diags: [], rs: rs_off(),
+        callees: ct_empty(), larity: [] }
 
 fn env_with_chain(e: Env, c: ScopeChain) : Env =
   Env { ...e, chain: c }
@@ -395,11 +399,7 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
     ESym(_, _, _) -> rk_same(e, x.kind)
     EVar(name) -> chk_var(e, name, x)
     EMark(_) -> rk_same(e, x.kind)
-    ECall(f, xs) -> match chk_expr(e, f) {
-      RExpr(e1, f1) -> match chk_exprs(e1, xs) {
-        RExprs(e2, xs1) -> RKind(e2, ECall(f1, xs1))
-      }
-    }
+    ECall(f, xs) -> chk_call(e, f, xs, list_length(xs))
     EField(base, fname) -> match chk_expr(e, base) {
       RExpr(e1, b1) -> RKind(e1, EField(chk_op_base(e1, b1, fname), fname))
     }
@@ -463,7 +463,7 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
         }
       }
     }
-    EPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EPipe(l, r))
+    EPipe(a, b) -> chk_apply_pipe(e, a, b)
     EMapPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EMapPipe(l, r))
     EFlatMapPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EFlatMapPipe(l, r))
     EFilterPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EFilterPipe(l, r))
@@ -504,7 +504,13 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
 # spelling; a declaration carries the id the ladder reached. An unbound
 # name is reported and left as written, so the diagnostics downstream
 # still read a spelling.
-fn chk_var(e: Env, name: String, x: Expr) : RKind / Console + File {
+fn chk_var(e: Env, name: String, x: Expr) : RKind / Console + File =
+  match value_proto(env_call_cx(e), name) {
+    Some(d) -> RKind(e, disp_ref(e, d))
+    None    -> chk_name(e, name, x)
+  }
+
+fn chk_name(e: Env, name: String, x: Expr) : RKind / Console + File {
   if env_has(e, name) {
     match env_lookup(e, name) {
       Some(s) -> RKind(e, ESym(s, spec_none(), name))
@@ -558,13 +564,115 @@ fn unbound_hint(e: Env, name: String) : Option[String] =
 
 fn rx_envs(r: RExprs) : Env = match r { RExprs(e, _) -> e }
 
+# A pipe stage named bare is called with the piped value alone.
 fn chk_pipe(e: Env, a: Expr, b: Expr,
       mk: (Expr, Expr) -> ExprKind) : RKind / Console + File =
   match chk_expr(e, a) {
-    RExpr(e1, a1) -> match chk_expr(e1, b) {
+    RExpr(e1, a1) -> match chk_stage(e1, b) {
       RExpr(e2, b1) -> RKind(e2, mk(a1, b1))
     }
   }
+
+fn chk_stage(e: Env, b: Expr) : RExpr / Console + File = match b.kind {
+  EVar(name) -> chk_callee(e, name, b, 1)
+  _          -> chk_expr(e, b)
+}
+
+# `x |> f(a, b)` calls `f(x, a, b)`; a `_` among the arguments is the
+# slot the piped value fills instead.
+fn chk_apply_pipe(e: Env, a: Expr, b: Expr) : RKind / Console + File =
+  match chk_expr(e, a) {
+    RExpr(e1, a1) -> match b.kind {
+      ECall(f, xs) -> match chk_call(e1, f, xs, list_length(xs) + piped_slot(xs)) {
+        RKind(e2, k) -> RKind(e2, EPipe(a1, Expr { kind: k, line: b.line, col: b.col, ty: b.ty, mode: b.mode }))
+      }
+      _ -> match chk_stage(e1, b) { RExpr(e2, b1) -> RKind(e2, EPipe(a1, b1)) }
+    }
+  }
+
+fn piped_slot(xs: [Expr]) : Int = match xs {
+  [] -> 1
+  [x, ...rest] -> match x.kind { EUnder -> 0  _ -> piped_slot(rest) }
+}
+
+# ---- calls ----
+
+fn env_call_cx(e: Env) : CallCx = CallCx(e.chain, e.rs, e.callees, e.larity)
+
+# A call `f(args)` with `n` arguments, the piped value counted. A bare
+# callee climbs the ladder with that arity; a method call reaches a
+# protocol operation when nothing nearer answers that arity.
+fn chk_call(e: Env, f: Expr, xs: [Expr], n: Int) : RKind / Console + File = {
+  let rf = match f.kind {
+    EVar(name) -> chk_callee(e, name, f, n)
+    _          -> chk_expr(e, f)
+  }
+  match rf {
+    RExpr(e1, f1) -> match chk_exprs(e1, xs) {
+      RExprs(e2, xs1) -> method_call(e2, f1, xs1)
+    }
+  }
+}
+
+fn method_call(e: Env, f: Expr, xs: [Expr]) : RKind / Console + File = match f.kind {
+  EField(recv, op) ->
+    if names_effect(e, recv) { RKind(e, ECall(f, xs)) }
+    else { match method_proto(env_call_cx(e), op, list_length(xs) + 1) {
+      Some(d) -> RKind(e, ECall(at(disp_ref(e, d), f), [recv, ...xs]))
+      None    -> RKind(e, ECall(f, xs))
+    } }
+  _ -> RKind(e, ECall(f, xs))
+}
+
+fn names_effect(e: Env, recv: Expr) : Bool = match recv.kind {
+  ESym(s, _, _) -> if sym_is_local(s) or not rs_recording(e.rs) { false }
+                   else { match sym_class(e.rs.tab, s) { NCEffect -> true  _ -> false } }
+  _             -> false
+}
+
+# A bare callee: the binding the ladder reaches at this arity, or, when
+# nothing fits, the name read as a value so the arity error names the
+# nearest binding.
+fn chk_callee(e: Env, name: String, x: Expr, n: Int) : RExpr / Console + File = {
+  let cx = env_call_cx(e)
+  let h = call_hit(cx, name, n)
+  let e1 = match skip_warning(cx, name, n, h) {
+    Some(msg) -> warn_skip(e, x, msg)
+    None      -> e
+  }
+  match h {
+    Hit(RLocal(s), _) -> RExpr(e1, sym_ref(s, name, x))
+    Hit(RDecl(s), _)  -> RExpr(e1, sym_ref(s, name, x))
+    Hit(RProto(d), _) -> RExpr(e1, at(disp_ref(e1, d), x))
+    Hit(RBare, _)     -> RExpr(e1, x)
+    Hit(RNone, _)     -> chk_expr_named(e1, name, x)
+  }
+}
+
+# A dispatcher carries its identity: two modules may each declare a
+# protocol with an operation of one name.
+fn disp_ref(e: Env, d: Disp) : ExprKind = match d {
+  Disp(Some(s), name) -> if rs_recording(e.rs) and st_valid(e.rs.tab, s) { ESym(s, spec_none(), name) }
+                         else { EVar(name) }
+  Disp(None, name)    -> EVar(name)
+}
+
+fn at(k: ExprKind, x: Expr) : Expr = Expr { kind: k, line: x.line, col: x.col, ty: x.ty, mode: x.mode }
+
+fn sym_ref(s: SymId, name: String, x: Expr) : Expr =
+  Expr { kind: ESym(s, spec_none(), name), line: x.line, col: x.col, ty: x.ty, mode: x.mode }
+
+fn chk_expr_named(e: Env, name: String, x: Expr) : RExpr / Console + File =
+  match chk_name(e, name, x) {
+    RKind(e1, k) -> RExpr(e1, Expr { kind: k, line: x.line, col: x.col, ty: x.ty, mode: x.mode })
+  }
+
+fn warn_skip(e: Env, x: Expr, msg: String) : Env / Console + File = {
+  let help = "rename one of the two, or qualify the call to name the one it means"
+  diag_warning(e.file, x.line, x.col, msg)
+  diag_help(help)
+  env_push_diag(e, mk_diag(SevWarning, e.file, x.line, x.col, msg, [ri_help(e.file, x.line, x.col, help)]))
+}
 
 # `Eff as log` makes `log` a binding that names the capability inside
 # the body, so it is pushed in a scope of its own and disappears with
@@ -794,7 +902,7 @@ type RStmt = RStmt(Env, Stmt)
 fn chk_stmt(e: Env, s: Stmt) : RStmt / Console + File {
   match s {
     SLet(pat, ta, rhs) -> match chk_expr(e, rhs) {
-      RExpr(e1, r1) -> RStmt(bind_pat(e1, pat), SLet(pat, ta, r1))
+      RExpr(e1, r1) -> RStmt(note_arity(bind_pat(e1, pat), pat, binder_arity(Some(rhs), ta)), SLet(pat, ta, r1))
     }
     SAssert(cond, opt_msg) -> match chk_expr(e, cond) {
       RExpr(e1, c1) -> match opt_msg {
@@ -838,7 +946,22 @@ fn chk_stmt(e: Env, s: Stmt) : RStmt / Console + File {
 fn add_params(e: Env, ps: [Param]) : Env {
   match ps {
     [] -> e
-    [p, ...rest] -> add_params(env_bind_local(e, p.pname), rest)
+    [p, ...rest] -> add_params(note_bound_arity(env_bind_local(e, p.pname), p.pname, binder_arity(None, p.ptype)), rest)
+  }
+}
+
+# A binder whose definition fixes its arity records it, so a call of
+# another arity passes it over for the next binding of its name.
+fn note_arity(e: Env, pat: Pattern, a: Option[Int]) : Env = match pat.pkind {
+  PBind(name) -> note_bound_arity(e, name, a)
+  _           -> e
+}
+
+fn note_bound_arity(e: Env, name: String, a: Option[Int]) : Env = match a {
+  None    -> e
+  Some(n) -> match ch_locals(e.chain, name) {
+    [s, ..._] -> Env { ...e, larity: [LocalArity(s, n), ...e.larity] }
+    []        -> e
   }
 }
 
@@ -1065,8 +1188,8 @@ pub fn resolve_decls(df: DiagFiles, decls: [Decl], target: String) : ResolvedDec
 
 #[doc("Resolve `decls` whose files resolve under `views`, against the table `tab` those views index.")]
 pub fn resolve_decls_views(df: DiagFiles, decls: [Decl], views: FileViews,
-      tab: SymTab, target: String) : ResolvedDecls / Console + File {
-  let r = resolve_program_views(df, decls, views, tab, target)
+      tab: SymTab, target: String, ops: [ProtoRung]) : ResolvedDecls / Console + File {
+  let r = resolve_program_views(df, decls, views, tab, target, ops)
   ResolvedDecls { errs: r.errs, decls: if r.errs == 0 { r.decls } else { decls }, tab: r.tab, diags: r.diags }
 }
 
@@ -1075,7 +1198,7 @@ pub type ResolvedDecls = { errs: Int, decls: [Decl], tab: SymTab, diags: [Diagno
 
 #[doc("Resolve a program and keep the resolution: the same checks `check_program` runs, with every use site recorded against `tab`.")]
 pub fn resolve_program_with(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : Resolution / Console + File =
-  resolve_run(df, decls, rs_on(tab, target), tab)
+  resolve_run(df, decls, rs_on(tab, target), tab, [])
 
 #[doc("Resolve a program against the symbol table its own declarations build.")]
 pub fn resolve_program(df: DiagFiles, decls: [Decl], target: String) : Resolution / Console + File =
@@ -1083,14 +1206,15 @@ pub fn resolve_program(df: DiagFiles, decls: [Decl], target: String) : Resolutio
 
 #[doc("Resolve a program whose files resolve under `views`: a bare name climbs the file's own imports, picks and cores, not its home alone.")]
 pub fn resolve_program_views(df: DiagFiles, decls: [Decl], views: FileViews,
-      tab: SymTab, target: String) : Resolution / Console + File =
-  resolve_run(df, decls, rs_on_views(tab, views, target, core_names()), tab)
+      tab: SymTab, target: String, ops: [ProtoRung]) : Resolution / Console + File =
+  resolve_run(df, decls, rs_on_views(tab, views, target, core_names()), tab, ops)
 
-fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState, tab: SymTab) : Resolution / Console + File {
+fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState, tab: SymTab,
+      ops: [ProtoRung]) : Resolution / Console + File {
   let file = df_root(df)
-  let e0 = env_with_rs(env_new(file), rs0)
-  let e1 = add_all(e0, core_names())
   let target = rs_home_name(rs0)
+  let e0 = Env { ...env_with_rs(env_new(file), rs0), callees: ct_build(decls, target, ops) }
+  let e1 = add_all(e0, core_names())
   let e2 = register_decls(e1, decls, target)
   let walked = chk_decls_files(e2, decls, df, target)
   let e3 = rds_env(walked)
@@ -1125,7 +1249,7 @@ fn chk_files_loop(e: Env, ds: [Decl], df: DiagFiles, target: String,
       acc: [Decl]) : RDecls / Console + File = match ds {
   [] -> RDecls(e, list_reverse(acc))
   [d, ...rest] -> {
-    let at = env_at_decl(env_with_file(e, decl_diag_file(d, df)), d, target)
+    let at = env_at_decl(env_with_file(Env { ...e, larity: [] }, decl_diag_file(d, df)), d, target)
     match chk_decl(at, d) {
       RDecl(e1, d1) -> chk_files_loop(e1, rest, df, target, [d1, ...acc])
     }

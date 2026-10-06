@@ -1,0 +1,260 @@
+#[doc("""
+What a bare call's arity is checked against while the resolver climbs
+the ladder: every function's arity by its identity, and the protocol
+operations.
+
+A bare name reaches the nearest binding of it — a local, the reader's
+own module, its selective picks, its imports, a protocol operation, the
+core, any other exporter. A call carries its arity, so a nearer binding
+of another arity is passed over, never chosen: `min(1, 2)` beside a root
+`fn min(xs)` reaches `Ord.min`. The check runs here, once; every pass
+downstream reads the identity stamped on the callee.
+""")]
+
+import compiler.ast
+import compiler.decl_names
+import compiler.symtab_build
+import compiler.infer_index
+import compiler.modules
+import compiler.symtab
+import compiler.scope_view
+import compiler.scope_chain
+import compiler.resolve_state
+
+#[doc("One protocol operation a bare call may reach: its name, its arity, its dispatcher, its protocol's home (`None` for the root file) and whether that protocol is exported.")]
+pub type ProtoRung = ProtoRung(String, Int, String, Option[String], Bool)
+
+#[doc("The arities of a program's functions by identity, its protocol operations, and the module of the root file.")]
+pub type CalleeTab = { arities: NameIndex[Int], ops: [ProtoRung], target: String }
+
+#[doc("A table that knows no arity and no operation: every call fits whatever it reaches.")]
+pub fn ct_empty() : CalleeTab = CalleeTab { arities: idx_empty(), ops: [], target: "" }
+
+#[doc("The table for `decls`, homed under `target`, with the protocol operations `ops`.")]
+pub fn ct_build(decls: [Decl], target: String, ops: [ProtoRung]) : CalleeTab =
+  CalleeTab { arities: ct_arities(decls, target, target, idx_empty()), ops: ops, target: target }
+
+fn ct_arities(ds: [Decl], home: String, target: String, ix: NameIndex[Int]) : NameIndex[Int] =
+  match ds {
+    [] -> ix
+    [d, ...rest] -> {
+      let h = decl_home_hint_reset(d, home, target)
+      ct_arities(rest, h, target, ct_note(ix, d, h))
+    }
+  }
+
+fn ct_note(ix: NameIndex[Int], d: Decl, home: String) : NameIndex[Int] = match d {
+  DFn(_, n, _, ps, _, _, _, _, _, _, _) -> idx_prepend_sym(ix, sym_derive(NCFn, n, home), list_length(ps))
+  DConstructor(inner, _, _) -> ct_note(ix, inner, home)
+  DDoc(_, _, inner, _, _)   -> ct_note(ix, inner, home)
+  DAttr(_, inner, _, _)     -> ct_note(ix, inner, home)
+  _ -> ix
+}
+
+#[doc("The arity of the function `s`, or `None` for a declaration with no fixed one: a constant, a constructor.")]
+pub fn ct_arity(ct: CalleeTab, s: SymId) : Option[Int] = match idx_chain_sym(ct.arities, s) {
+  [a, ..._] -> Some(a)
+  []        -> None
+}
+
+#[doc("Whether a call of arity `n` fits `s`: a declaration of no fixed arity fits any call.")]
+pub fn ct_fits(ct: CalleeTab, s: SymId, n: Int) : Bool = match ct_arity(ct, s) {
+  Some(a) -> a == n
+  None    -> true
+}
+
+#[doc("A protocol operation's dispatcher: its identity, or `None` when protocols of several homes declare the operation and the type settles which, and its name.")]
+pub type Disp = Disp(Option[SymId], String)
+
+#[doc("""
+The dispatcher a use of `name` reaches on the protocol rung, read from
+`home`: an operation of that name, of arity `n` when the use is a call,
+declared by a protocol the reader sees. A module sees its own protocols
+and the exported ones of other modules; only the root file sees its
+own. Two homes declaring the operation make a contest the type settles.
+""")]
+pub fn ct_proto(ct: CalleeTab, name: String, n: Option[Int], home: String) : Option[Disp] =
+  match filter(ct.ops, (r) => rung_fits(r, name, n) and rung_seen(r, home, ct.target)) {
+    [] -> None
+    [r, ...rest] -> {
+      let h = rung_home(r, ct.target)
+      let id = if all(rest, (o) => rung_home(o, ct.target) == h) { Some(sym_derive(NCFn, rung_name(r), h)) } else { None }
+      Some(Disp(id, rung_name(r)))
+    }
+  }
+
+fn rung_fits(r: ProtoRung, name: String, n: Option[Int]) : Bool = match r {
+  ProtoRung(op, a, _, _, _) -> op == name and ct_arity_ok(n, a)
+}
+
+fn rung_seen(r: ProtoRung, home: String, target: String) : Bool = match r {
+  ProtoRung(_, _, _, mo, exported) -> match mo {
+    None    -> home == target
+    Some(m) -> m == home or exported
+  }
+}
+
+fn rung_home(r: ProtoRung, target: String) : String = match r {
+  ProtoRung(_, _, _, mo, _) -> match mo { Some(m) -> m  None -> target }
+}
+
+fn rung_name(r: ProtoRung) : String = match r { ProtoRung(_, _, disp, _, _) -> disp }
+
+fn ct_arity_ok(n: Option[Int], a: Int) : Bool = match n {
+  Some(k) -> k == a
+  None    -> true
+}
+
+#[doc("A local binder whose definition fixes its arity: a lambda, or a function-typed annotation.")]
+pub type LocalArity = LocalArity(SymId, Int)
+
+#[doc("What the climb reads: the scopes in force, the resolution state, the table, and the local arities.")]
+pub type CallCx = CallCx(ScopeChain, ResState, CalleeTab, [LocalArity])
+
+#[doc("What a bare use reached: a binder, a declaration, a name left as written (a builtin, a constructor, a contest the type settles), a protocol operation's dispatcher, or nothing that fits.")]
+pub type Reach = RLocal(SymId) | RDecl(SymId) | RBare | RProto(Disp) | RNone
+
+#[doc("The nearer binding a call passed over because its arity did not fit: a local of that arity, or a declaration.")]
+pub type Skip = SkNone | SkLocal(Int) | SkDecl(SymId)
+
+#[doc("A call's answer and what it passed over on the way.")]
+pub type Hit = Hit(Reach, Skip)
+
+#[doc("The arity a binder's definition fixes, if any: a lambda's parameter count, else a function-typed annotation's.")]
+pub fn binder_arity(rhs: Option[Expr], ta: Option[TypeExpr]) : Option[Int] = match ta {
+  Some(t) -> match t.tkind { TyFn(ps, _, _) -> Some(list_length(ps))  _ -> None }
+  None -> match rhs {
+    Some(x) -> match x.kind { ELambda(ps, _) -> Some(list_length(ps))  _ -> None }
+    None -> None
+  }
+}
+
+#[doc("""
+What a bare call of `name` with `n` arguments reaches. The nearest
+binding whose arity fits answers: a local, then the reader's own module,
+its picks and its imports, then a protocol operation, then the core and
+any module that exports it. A protocol operation outranks a core
+function of the same name and arity: `add(1, 2)` is `Add.add`, never
+`complex.add`. `RNone` when nothing fits, so the caller reads the name
+as a value and the arity error names the nearest binding.
+""")]
+pub fn call_hit(cx: CallCx, name: String, n: Int) : Hit = match cx {
+  CallCx(chain, _, _, las) -> {
+    let ls = ch_locals(chain, name)
+    match la_first_fit(las, ls, n) {
+      Some(s) -> Hit(RLocal(s), SkNone)
+      None    -> decl_hit(cx, name, n, la_skip(las, ls))
+    }
+  }
+}
+
+# Only the innermost binder of a name competes: a `let` hides every
+# outer binder of its name, whatever the arities.
+fn la_first_fit(las: [LocalArity], ls: [SymId], n: Int) : Option[SymId] = match ls {
+  [] -> None
+  [s, ..._] -> match la_of(las, s) {
+    Some(a) -> if a == n { Some(s) } else { None }
+    None    -> Some(s)
+  }
+}
+
+fn la_skip(las: [LocalArity], ls: [SymId]) : Skip = match ls {
+  [s, ..._] -> match la_of(las, s) { Some(a) -> SkLocal(a)  None -> SkNone }
+  []        -> SkNone
+}
+
+fn la_of(las: [LocalArity], s: SymId) : Option[Int] = match las {
+  [] -> None
+  [LocalArity(t, a), ...rest] -> if sym_raw(t) == sym_raw(s) { Some(a) } else { la_of(rest, s) }
+}
+
+fn decl_hit(cx: CallCx, name: String, n: Int, sk0: Skip) : Hit = match cx {
+  CallCx(_, rs, ct, _) -> {
+    let fits = (s) => ct_fits(ct, s, n)
+    let near = rs_rungs_call(rs, name, near_rungs(), fits)
+    match near {
+      RsCall(RcNone, sk) -> match ct_proto(ct, name, Some(n), rs_home_name(rs)) {
+        Some(d) -> Hit(RProto(d), sk_join(sk0, sk))
+        None    -> rs_hit(rs_rungs_call(rs, name, far_rungs(), fits), sk_join(sk0, sk))
+      }
+      _ -> rs_hit(near, sk0)
+    }
+  }
+}
+
+fn near_rungs() : [SvRung] = [SvOwn, SvPicks, SvImports]
+
+fn far_rungs() : [SvRung] = [SvCores, SvAny]
+
+fn rs_rungs_call(rs: ResState, name: String, rungs: [SvRung], fits: (SymId) -> Bool) : RsCall =
+  if rs_recording(rs) { rs_call_sym(rs, name, rungs, fits) } else { RsCall(RcNone, None) }
+
+fn rs_hit(c: RsCall, sk0: Skip) : Hit = match c {
+  RsCall(RcSym(s), sk) -> Hit(RDecl(s), sk_join(sk0, sk))
+  RsCall(RcBare, sk)   -> Hit(RBare, sk_join(sk0, sk))
+  RsCall(RcNone, _)    -> Hit(RNone, SkNone)
+}
+
+fn sk_join(sk0: Skip, sk: Option[SymId]) : Skip = match sk0 {
+  SkNone -> match sk { Some(s) -> SkDecl(s)  None -> SkNone }
+  _      -> sk0
+}
+
+#[doc("The dispatcher a bare `name` used as a value reaches, if any: the call ladder with no arity to check, so a binding nearer than the protocol rung answers first.")]
+pub fn value_proto(cx: CallCx, name: String) : Option[Disp] = match cx {
+  CallCx(chain, rs, ct, _) ->
+    if not list_is_empty(ch_locals(chain, name)) { None }
+    else if near_binds(rs, name, (s) => true) { None }
+    else { ct_proto(ct, name, None, rs_home_name(rs)) }
+}
+
+#[doc("The dispatcher a method call `recv.op(...)` with `n` arguments, the receiver counted, reaches when no binding nearer than the protocol rung answers a call of that arity.")]
+pub fn method_proto(cx: CallCx, op: String, n: Int) : Option[Disp] = match cx {
+  CallCx(chain, rs, ct, _) ->
+    if not list_is_empty(ch_locals(chain, op)) { None }
+    else if near_binds(rs, op, (s) => ct_fits(ct, s, n)) { None }
+    else { ct_proto(ct, op, Some(n), rs_home_name(rs)) }
+}
+
+fn near_binds(rs: ResState, name: String, fits: (SymId) -> Bool) : Bool =
+  if not rs_recording(rs) { false }
+  else { match rs_call_sym(rs, name, near_rungs(), fits) {
+    RsCall(RcNone, _) -> false
+    _                 -> true
+  } }
+
+#[doc("""
+The warning a call earns when it passed over a binding the user wrote —
+a local, or a declaration outside the core — for one of another arity,
+read from a module that is not a core. `None` otherwise: the core's own
+homonyms of different arity (`list.max` and `Ord.max`) coexist by design.
+""")]
+pub fn skip_warning(cx: CallCx, name: String, n: Int, h: Hit) : Option[String] = match cx {
+  CallCx(_, rs, ct, _) ->
+    if rs_in_core(rs) { None }
+    else { match h {
+      Hit(RNone, _)      -> None
+      Hit(_, SkNone)     -> None
+      Hit(r, SkLocal(a)) -> Some(skip_text(name, n, concat_all(["the local `", name, "`"]), a, r, rs))
+      Hit(r, SkDecl(s))  -> if rs_is_core_sym(rs, s) { None } else { match ct_arity(ct, s) {
+        Some(a) -> Some(skip_text(name, n, sym_text(rs, s, name), a, r, rs))
+        None    -> None
+      } }
+    } }
+}
+
+fn skip_text(name: String, n: Int, skipped: String, a: Int, r: Reach, rs: ResState) : String =
+  concat_all(["call to `", name, "` with ", int_to_string(n), " argument", plural(n), " skips ",
+              skipped, ", which takes ", int_to_string(a), ", and reaches ", reach_text(name, r, rs)])
+
+fn plural(n: Int) : String = if n == 1 { "" } else { "s" }
+
+fn sym_text(rs: ResState, s: SymId, name: String) : String =
+  concat_all(["`", sym_home(rs.tab, s), ".", name, "`"])
+
+fn reach_text(name: String, r: Reach, rs: ResState) : String = match r {
+  RDecl(s)  -> sym_text(rs, s, name)
+  RProto(_) -> concat_all(["the protocol operation `", name, "`"])
+  RLocal(_) -> concat_all(["the local `", name, "`"])
+  _         -> concat_all(["the core `", name, "`"])
+}
