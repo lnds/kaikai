@@ -84,6 +84,41 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.132.0 (2026-10-06)
+
+### BREAKING CHANGE
+
+- a call of a handler clause's continuation from a lambda
+inside that clause is now a compile error. The docs admit the shape, but
+it never compiled to a working program on either backend.
+- `impl P for Int` (or any builtin: Real, Bool, Char,
+String, Unit, `[a]`, Option, Result) is now an error unless the module
+declares P or the head of one of P's arguments. Migrate by wrapping the
+builtin in a type of your own (`type Score = Score(Int)`) and
+implementing the protocol for that, or by declaring the impl in the
+protocol's module.
+
+### Fixed
+
+- **native**: allocate a call's evidence frame in the entry block (#2517)
+- **emit**: free an arm-top reuse token a TRMC step cannot host (#2511)
+- **emit**: decide a closure spec's self-calls by identity, not by name (#2510)
+- **emit**: bind a variant pattern's nested slot binders in the C backend (#2509)
+- **typer**: reject calling the continuation from inside a lambda (#2508)
+- **typer**: identify a handler clause's continuation by position, not by the name resume (#2505)
+- **lsp**: report kind, contract and protocol-coherence errors in --diags-json (#2506)
+- **protocols**: drop the builtin-type orphan exemption (#2503)
+- **perceus**: recognise a fn's calls of itself by identity, not by name (#2502)
+- **runtime**: call a user Cancel clause through its own function type (#2501)
+- **protocols**: enforce the orphan rule per module (#2499)
+- **perceus**: release a fixed vec read through a parameter (#2500)
+
+### Changed
+
+- **typer**: resolve only the root at each level of the occurs check (#2513)
+- **compiler**: index the module-to-file table diagnostics read by module (#2512)
+- **compiler**: look up Perceus' borrow map through buckets (#2504)
+
 ## v0.131.0 (2026-10-05)
 
 ### BREAKING CHANGE
