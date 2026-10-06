@@ -250,7 +250,7 @@ fn plan_binds(body: Expr, names: [String], args_: [Expr], line: Int, col: Int) :
       [] -> BindPlan { repls: [], lets: [] }
       [a, ...arest] -> {
         let rest = plan_binds(body, nrest, arest, line, col)
-        if bind_once_needed(body, n) {
+        if bind_once_needed(body, n, a) {
           let fresh = concat_all(["__csb_", int_to_string(line), "_", int_to_string(col), "_", n])
           BindPlan { repls: [mk_ref(fresh, line, col), ...rest.repls],
                      lets: [SLet(mk_pat(PBind(fresh), line, col), None, a), ...rest.lets] }
@@ -261,15 +261,22 @@ fn plan_binds(body: Expr, names: [String], args_: [Expr], line: Int, col: Int) :
     }
   }
 
-# Bind-once is needed iff the param is read more than once AND its value
-# carries RC. Reads are counted syntactically over `EVar(param)`, rounding
-# up (both `if` arms count; an occurrence under a nested lambda counts) —
-# over-counting only adds a redundant `let`, never a UAF. RC-carrying is
-# the same representation predicate perceus uses for dup/drop, not a local
-# scalar whitelist.
-fn bind_once_needed(body: Expr, name: String) : Bool = {
+# Bind-once is needed iff the param is read more than once AND either its
+# value carries RC or the argument is not a single variable. Reads are
+# counted syntactically over `EVar(param)`, rounding up (both `if` arms
+# count; an occurrence under a nested lambda counts) — over-counting only
+# adds a redundant `let`, never a UAF. A scalar type does not make a copy
+# free: a boxed Int outside the immediate range lives on the heap, and the
+# copies of a compound argument would share the positions Perceus keys its
+# reads by. A variable argument substitutes at each read's own position.
+fn bind_once_needed(body: Expr, name: String, arg: Expr) : Bool = {
   let occ = count_param_reads(body, name)
-  occ.n > 1 and not opt_ty_unboxable(occ.ty)
+  occ.n > 1 and (not opt_ty_unboxable(occ.ty) or not arg_is_var(arg))
+}
+
+fn arg_is_var(a: Expr) : Bool = match sym_local_kind(a.kind) {
+  EVar(_) -> true
+  _       -> false
 }
 
 fn opt_ty_unboxable(ot: Option[Ty]) : Bool =
@@ -304,7 +311,7 @@ fn count_reads_kids(es: [Expr], name: String, acc: ReadCount) : ReadCount =
 fn subst_scoped(e: Expr, names: [String], args_: [Expr]) : Expr =
   match sym_local_kind(e.kind) {
     EVar(n) -> match index_of(names, n, 0) {
-      Some(i) -> elem_at(args_, i)
+      Some(i) -> at_read(elem_at(args_, i), e)
       None    -> e
     }
     ELambda(ps, b) -> {
@@ -316,6 +323,13 @@ fn subst_scoped(e: Expr, names: [String], args_: [Expr]) : Expr =
     EBlock(ss, t) -> remap(e, subst_block(ss, t, names, args_))
     _ -> remap(e, map_expr_kind(e.kind, (k) => subst_scoped(k, names, args_)))
   }
+
+# A variable argument takes the position of the read it replaces, so two
+# reads of one param stay two reads.
+fn at_read(arg: Expr, read: Expr) : Expr = match sym_local_kind(arg.kind) {
+  EVar(_) -> Expr { kind: arg.kind, line: read.line, col: read.col, ty: arg.ty, mode: arg.mode }
+  _       -> arg
+}
 
 # Thread block-let shadowing: each binder removes its name from the
 # substitution for the rest of the block; the rhs sees the pre-binding
