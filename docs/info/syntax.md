@@ -257,6 +257,10 @@ never a module. `import ?name` is the dependency hole: the resolver
 searches packages for a symbol named `name` (`kai info holes`); a
 bare `import ?` is rejected.
 
+A local binder (`let`, a parameter, a pattern binder) shadows every
+declaration of its name — a root function, a core function, a protocol
+operation — whether it is called, piped into or passed as a value.
+
 When two imports declare the same name, qualify the use — the
 qualifier names the module the declaration comes from:
 
