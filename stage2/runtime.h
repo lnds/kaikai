@@ -951,11 +951,30 @@ KAI_RT_ATOMIC_COUNTER(kai_chosen_exit_plus1);
    enough that the always-on path costs ~ns per allocation, but small
    enough that we keep them on rather than ifdef'ing them in/out
    (otherwise a measurement run would need a runtime rebuild). */
-KAI_RT_COUNTER(int64_t kai_rc_alloc_total, 0);
-KAI_RT_COUNTER(int64_t kai_rc_free_total, 0);
-KAI_RT_COUNTER(int64_t kai_rc_live_now, 0);
-KAI_RT_COUNTER(int64_t kai_rc_live_peak, 0);
-KAI_RT_COUNTER(int64_t kai_rc_alloc_by_tag[16], {0});
+/* The per-cell counters. While the process has one thread they live in a
+ * plain global, which the hot path updates inline; a thread-local costs a TLV
+ * lookup per access on Mach-O. Before the runtime starts a second thread the
+ * global moves into the starting thread's block and every thread counts in
+ * its own. The ledger reads only the thread-local blocks, so a report settles
+ * the global into them first. */
+typedef struct {
+    int64_t alloc_total, free_total, live_now, live_peak, reuse_total;
+    int64_t alloc_by_tag[16];
+} KaiRcHot;
+KAI_RT_COUNTER(KaiRcHot kai_rc_hot, {0});
+/* C emitted by an older compiler (the bootstrap hop) bumps this name directly. */
+KAI_RT_COUNTER(int64_t kai_rc_reuse_total, 0);
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiRcHot kai_rc_hot_st;
+extern int kai_rc_mt;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiRcHot kai_rc_hot_st;
+int kai_rc_mt;
+#  endif
+#else
+static KaiRcHot kai_rc_hot_st;
+static int kai_rc_mt;
+#endif
 /* issue #120 — opt-in Perceus regions. Dedicated arena counters,
  * distinct from kai_rc_alloc_total / kai_rc_free_total so a region's
  * bulk lifecycle is visible without polluting the per-value RC ledger.
@@ -976,10 +995,6 @@ KAI_RT_COUNTER(int64_t kai_mbox_alloc_total, 0);
 KAI_RT_COUNTER(int64_t kai_mbox_free_total, 0);
 static __attribute__((noinline)) void kai_mbox_count_alloc(void) { kai_mbox_alloc_total++; }
 static __attribute__((noinline)) void kai_mbox_count_free(void) { kai_mbox_free_total++; }
-/* issue #118 — Perceus reuse-in-place counter. Bumped by every
- * successful in-place rewrite in kai_reuse_or_alloc_* (further down). */
-KAI_RT_COUNTER(int64_t kai_rc_reuse_total, 0);
-
 /* Vec uniqueness counters: writes that mutated a unique (rc == 1)
  * buffer in place vs. writes that had to copy a shared one. */
 KAI_RT_COUNTER(int64_t kai_vec_inplace_total, 0);
@@ -987,32 +1002,51 @@ KAI_RT_COUNTER(int64_t kai_vec_cow_total, 0);
 
 /* The RC/vec trace ledgers are per-thread and summed at exit. A stale slot
  * mis-attributes counts between threads — wrong telemetry, not corruption —
- * but the address resolves exactly as the allocator slots do, so the
- * bookkeeping is routed through noinline accessors on the same discipline: the
- * slot is materialised and updated inside one activation, never spilled across
- * a park. Grouped per event (one call per alloc/free) so the hot path pays one
- * out-of-line hop, not one per counter. */
-__attribute__((noinline))
-static void kai_rc_count_alloc(int tag) {
-    kai_rc_alloc_total++;
-    kai_rc_live_now++;
-    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
-    if (tag >= 0 && tag < 16) kai_rc_alloc_by_tag[tag]++;
+ * but the address resolves exactly as the allocator slots do, so every
+ * thread-local update runs inside a noinline activation, never spilled
+ * across a park. */
+static inline void kai_rc_hot_alloc(KaiRcHot *h, int tag) {
+    h->alloc_total++;
+    if (++h->live_now > h->live_peak) h->live_peak = h->live_now;
+    if (tag >= 0 && tag < 16) h->alloc_by_tag[tag]++;
 }
-__attribute__((noinline))
-static void kai_rc_count_free(void) {
-    kai_rc_free_total++;
-    kai_rc_live_now--;
+static inline void kai_rc_hot_live_inc(KaiRcHot *h) {
+    if (++h->live_now > h->live_peak) h->live_peak = h->live_now;
 }
-__attribute__((noinline))
-static void kai_rc_count_live_inc(void) {
-    kai_rc_live_now++;
-    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
+
+__attribute__((noinline)) static void kai_rc_tls_alloc(int tag) { kai_rc_hot_alloc(&kai_rc_hot, tag); }
+__attribute__((noinline)) static void kai_rc_tls_free(void) { kai_rc_hot.free_total++; kai_rc_hot.live_now--; }
+__attribute__((noinline)) static void kai_rc_tls_live_inc(void) { kai_rc_hot_live_inc(&kai_rc_hot); }
+__attribute__((noinline)) static void kai_rc_tls_live_sub(int64_t n) { kai_rc_hot.live_now -= n; }
+__attribute__((noinline)) static void kai_rc_tls_reuse(void) { kai_rc_hot.reuse_total++; }
+
+/* Called on the only running thread, before it starts a second one. */
+__attribute__((noinline)) static void kai_rc_go_mt(void) {
+    if (kai_rc_mt) return;
+    kai_rc_hot = kai_rc_hot_st;
+    kai_rc_mt = 1;
 }
-__attribute__((noinline))
-static void kai_rc_count_live_sub(int64_t n) { kai_rc_live_now -= n; }
-__attribute__((noinline))
-static void kai_rc_count_reuse(void) { kai_rc_reuse_total++; }
+
+__attribute__((noinline)) static void kai_rc_settle(void) {
+    if (!kai_rc_mt) kai_rc_hot = kai_rc_hot_st;
+}
+
+static inline void kai_rc_count_alloc(int tag) {
+    if (kai_rc_mt) kai_rc_tls_alloc(tag); else kai_rc_hot_alloc(&kai_rc_hot_st, tag);
+}
+static inline void kai_rc_count_free(void) {
+    if (kai_rc_mt) kai_rc_tls_free();
+    else { kai_rc_hot_st.free_total++; kai_rc_hot_st.live_now--; }
+}
+static inline void kai_rc_count_live_inc(void) {
+    if (kai_rc_mt) kai_rc_tls_live_inc(); else kai_rc_hot_live_inc(&kai_rc_hot_st);
+}
+static inline void kai_rc_count_live_sub(int64_t n) {
+    if (kai_rc_mt) kai_rc_tls_live_sub(n); else kai_rc_hot_st.live_now -= n;
+}
+static inline void kai_rc_count_reuse(void) {
+    if (kai_rc_mt) kai_rc_tls_reuse(); else kai_rc_hot_st.reuse_total++;
+}
 __attribute__((noinline))
 static void kai_vec_count_inplace(void) { kai_vec_inplace_total++; }
 __attribute__((noinline))
@@ -1078,7 +1112,7 @@ typedef struct KaiRcLedgerBlock {
     const int64_t *alloc_by_tag;
     const int64_t *arena_alloc_total, *arena_free_total;
     const int64_t *mbox_alloc_total, *mbox_free_total;
-    const int64_t *reuse_total, *vec_inplace_total, *vec_cow_total;
+    const int64_t *reuse_total, *reuse_emitted, *vec_inplace_total, *vec_cow_total;
     const int64_t *reuse_free_total, *tok_unique, *tok_null_shared, *tok_null_mismatch;
 #ifdef KAI_TRACE_RC
     const int64_t *free_by_tag;
@@ -1106,15 +1140,16 @@ KAI_RT_COUNTER(int kai_rc_ledger_done, 0);
 /* Pointers are captured on the owning thread — that is what binds each
  * field to THIS thread's TLS instance. */
 static void kai_rc_ledger_fill(KaiRcLedgerBlock *b) {
-    b->alloc_total       = &kai_rc_alloc_total;
-    b->free_total        = &kai_rc_free_total;
-    b->live_peak         = &kai_rc_live_peak;
-    b->alloc_by_tag      = kai_rc_alloc_by_tag;
+    b->alloc_total       = &kai_rc_hot.alloc_total;
+    b->free_total        = &kai_rc_hot.free_total;
+    b->live_peak         = &kai_rc_hot.live_peak;
+    b->alloc_by_tag      = kai_rc_hot.alloc_by_tag;
     b->arena_alloc_total = &kai_arena_alloc_total;
     b->arena_free_total  = &kai_arena_free_total;
     b->mbox_alloc_total  = &kai_mbox_alloc_total;
     b->mbox_free_total   = &kai_mbox_free_total;
-    b->reuse_total       = &kai_rc_reuse_total;
+    b->reuse_total       = &kai_rc_hot.reuse_total;
+    b->reuse_emitted     = &kai_rc_reuse_total;
     b->vec_inplace_total = &kai_vec_inplace_total;
     b->vec_cow_total     = &kai_vec_cow_total;
     b->reuse_free_total  = &kai_rc_reuse_free_total;
@@ -1135,7 +1170,7 @@ static void kai_rc_ledger_add(KaiRcLedgerSum *s, const KaiRcLedgerBlock *b) {
     s->arena_free_total  += *b->arena_free_total;
     s->mbox_alloc_total  += *b->mbox_alloc_total;
     s->mbox_free_total   += *b->mbox_free_total;
-    s->reuse_total       += *b->reuse_total;
+    s->reuse_total       += *b->reuse_total + *b->reuse_emitted;
     s->vec_inplace_total += *b->vec_inplace_total;
     s->vec_cow_total     += *b->vec_cow_total;
     s->reuse_free_total  += *b->reuse_free_total;
@@ -1180,6 +1215,7 @@ static __attribute__((noinline)) void kai_rc_ledger_fold(void) {
 }
 
 static __attribute__((noinline)) void kai_rc_ledger_sum(KaiRcLedgerSum *s) {
+    kai_rc_settle();
     kai_rc_ledger_register();
     pthread_mutex_lock(&kai_rc_ledger_mu);
     *s = kai_rc_ledger_folded;
@@ -6383,7 +6419,7 @@ static inline int64_t kai_take_enum(KaiValue *v) {
  * before storing the incoming ones, exactly as `kai_free_value`
  * would have during a paired free + alloc.
  *
- * The trace counter `kai_rc_reuse_total` increments on every
+ * The reuse counter (`kai_rc_count_reuse`) increments on every
  * successful in-place rewrite (see top of file).
  */
 static inline int kai_check_unique(KaiValue *v) {
@@ -15655,6 +15691,7 @@ static void kai_reactor_init_filepool(void) {
     sigaddset(&block_set, SIGCHLD);
     pthread_sigmask(SIG_BLOCK, &block_set, &prev_set);
     for (int i = 0; i < KAI_FILEPOOL_WORKERS; i++) {
+        kai_rc_go_mt();
         if (pthread_create(&kai_filepool_threads[i], NULL,
                            kai_filepool_worker, NULL) != 0) {
             fprintf(stderr, "kai: reactor pthread_create failed: %s\n",
@@ -17518,6 +17555,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
 
     /* Start workers 1..N-1. */
     for (int i = 1; i < kai_nthreads; i++) {
+        kai_rc_go_mt();
         if (pthread_create(&kai_worker_threads[i], NULL,
                            kai_worker_thread_main, (void *) (intptr_t) i) != 0) {
             fprintf(stderr, "kai: scheduler pthread_create failed: %s\n",
@@ -17527,6 +17565,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     }
 
     /* F2 — start the dedicated reactor thread. */
+    kai_rc_go_mt();
     if (pthread_create(&kai_reactor_thread, NULL, kai_reactor_thread_main, NULL) != 0) {
         fprintf(stderr, "kai: reactor pthread_create failed: %s\n", strerror(errno));
         kai_exit(1);
@@ -20766,6 +20805,7 @@ static void kai_emit_pool_start(void) {
     sigaddset(&block_set, SIGCHLD);
     pthread_sigmask(SIG_BLOCK, &block_set, &prev_set);
     for (int i = 0; i < kai_emit_nworkers; i++) {
+        kai_rc_go_mt();
         if (pthread_create(&kai_emit_threads[i], &attr, kai_emit_worker, NULL) != 0) {
             fprintf(stderr, "kai: native emit pthread_create failed: %s\n", strerror(errno));
             _exit(1);
