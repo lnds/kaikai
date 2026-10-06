@@ -2409,26 +2409,22 @@ static KAI_TLS int kai_slot_pool_n[KAI_SLOT_POOL_MAXN + 1];
  * in one allocation), keyed by arity. Replaces the cell_pool + slot_pool
  * pair for variants — one push/pop instead of two, one cache line per
  * node instead of a header here and a slots[] array somewhere else.
- * Arity 0..8 covers every variant the functional rebuild churns; larger
- * arities fall through to malloc/free. A pooled block already has the
- * right byte size for its arity, so reuse is size-matched by
- * construction (the reuse recognisers only ever rewrite same-arity). */
-#define KAI_VAR_BLOCK_POOL_MAXN 8
-#define KAI_VAR_BLOCK_POOL_CAP  1048576
-/* Per-arity free-list of whole variant blocks. TLS holds (MAXN+1)
- * pointers; each arity's backing store is calloc'd lazily on first push
- * (kai_var_block_pool_ensure). Restores the lazy footprint — see the
- * cell-pool note above. */
+ * A pooled block already has the right byte size for its arity, so reuse
+ * is size-matched by construction (the reuse recognisers only ever
+ * rewrite same-arity). */
+#define KAI_VAR_BLOCK_POOL_MAXN 255   /* every arity var_n_args can hold */
+/* Per-arity free list of whole variant blocks, threaded through the dead
+ * blocks themselves: a freed block's first word holds the next one. It has
+ * no cap, because a block is slab memory that cannot go back to libc; a
+ * capped pool would strand every block past the cap. The allocator
+ * rewrites the whole header of a block it hands out. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS KaiValue **kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1];
-extern KAI_TLS int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
+extern KAI_TLS KaiValue *kai_var_block_free_head[KAI_VAR_BLOCK_POOL_MAXN + 1];
 #  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS KaiValue **kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1];
-KAI_TLS int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
+KAI_TLS KaiValue *kai_var_block_free_head[KAI_VAR_BLOCK_POOL_MAXN + 1];
 #  endif
 #else
-static KAI_TLS KaiValue **kai_var_block_pool[KAI_VAR_BLOCK_POOL_MAXN + 1];
-static KAI_TLS int kai_var_block_pool_n[KAI_VAR_BLOCK_POOL_MAXN + 1];
+static KAI_TLS KaiValue *kai_var_block_free_head[KAI_VAR_BLOCK_POOL_MAXN + 1];
 #endif
 
 /* Lazy backing-store materialisation for the free-list pools. Each pool's
@@ -2448,12 +2444,6 @@ static inline int kai_slot_pool_ensure(int n) {
         kai_slot_pool[n] = (KaiVarSlot **) calloc(KAI_SLOT_POOL_CAP, sizeof(KaiVarSlot *));
     }
     return kai_slot_pool[n] != NULL;
-}
-static inline int kai_var_block_pool_ensure(int n) {
-    if (!kai_var_block_pool[n]) {
-        kai_var_block_pool[n] = (KaiValue **) calloc(KAI_VAR_BLOCK_POOL_CAP, sizeof(KaiValue *));
-    }
-    return kai_var_block_pool[n] != NULL;
 }
 
 /* Free-list pool ops routed through noinline accessors: the pool base and
@@ -2479,20 +2469,15 @@ static int kai_cell_pool_push(KaiValue *v) {
 }
 __attribute__((noinline))
 static KaiValue *kai_var_block_pool_pop(int n) {
-    if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN && kai_var_block_pool_n[n] > 0) {
-        return kai_var_block_pool[n][--kai_var_block_pool_n[n]];
-    }
-    return NULL;
+    if (n < 0 || n > KAI_VAR_BLOCK_POOL_MAXN) return NULL;
+    KaiValue *v = kai_var_block_free_head[n];
+    if (v) kai_var_block_free_head[n] = *(KaiValue **) v;
+    return v;
 }
 __attribute__((noinline))
-static int kai_var_block_pool_push(KaiValue *v, int n) {
-    if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN
-        && kai_var_block_pool_n[n] < KAI_VAR_BLOCK_POOL_CAP
-        && kai_var_block_pool_ensure(n)) {
-        kai_var_block_pool[n][kai_var_block_pool_n[n]++] = v;
-        return 1;
-    }
-    return 0;
+static void kai_var_block_pool_push(KaiValue *v, int n) {
+    *(KaiValue **) v = kai_var_block_free_head[n];
+    kai_var_block_free_head[n] = v;
 }
 
 /* ---------- variant-block slab allocator (issue: malloc 6.2% of bench) ----------
@@ -2511,10 +2496,8 @@ static int kai_var_block_pool_push(KaiValue *v, int n) {
  * The free path (kai_var_block_free) NEVER calls libc free on an
  * individual block — a slab-interior pointer is not a malloc'd address,
  * so free() on it is UB/corruption. Instead a freed block goes to the
- * arity-keyed block pool (the free-list that already exists); a pool-full
- * or over-arity spill is simply DROPPED (the cell stays in its slab,
- * reclaimed when the whole slab is freed at exit — not an observable
- * leak). The slabs themselves are tracked and freed in kai_slab_teardown
+ * arity-keyed block free list, which has no cap and covers every
+ * arity, so no block is stranded. The slabs themselves are tracked and freed in kai_slab_teardown
  * (registered via atexit) so ASAN sees still-reachable == 0.
  *
  * Soundness net: if any free() ever reaches a slab-interior pointer, ASAN
@@ -2799,17 +2782,13 @@ static KaiValue *kai_alloc_var_nz(int n) {
  *
  * Slab-only invariant: every block lives inside a malloc'd slab
  * (kai_slab_alloc), so it is NOT a standalone malloc'd address — calling
- * libc free() on it is UB/corruption. So there is NO free(v) here. A
- * block that cannot rejoin the pool (pool full, or arity > MAXN) is
- * simply DROPPED: it stays in its slab and is reclaimed wholesale by
- * kai_slab_teardown at exit. Not an observable leak (ASAN: reachable via
- * the slab list until teardown). If a free() ever reaches here on a slab
- * pointer, ASAN fires "free on non-malloc'd address" at once. */
+ * libc free() on it is UB/corruption. So there is NO free(v) here: the
+ * block rejoins its arity's free list, and the slabs are reclaimed
+ * wholesale by kai_slab_teardown at exit. If a free() ever reaches here on
+ * a slab pointer, ASAN fires "free on non-malloc'd address" at once. */
 static void kai_var_block_free(KaiValue *v, int n) {
-    (void) v;
 #ifdef KAI_CELL_POOL_ACTIVE
-    if (kai_var_block_pool_push(v, n)) return;
-    /* spill: drop into the slab; teardown reclaims it at exit. */
+    kai_var_block_pool_push(v, n);
 #else
     /* No cell pool: blocks come from plain malloc/calloc (kai_alloc_var
      * #else), so free them individually — no slab to reclaim them, and
