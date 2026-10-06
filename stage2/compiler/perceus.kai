@@ -4554,7 +4554,9 @@ fn pcs_dd_kind(k: ExprKind, ln: Int, cl: Int, ty: Option[Ty], mode: ValueMode, d
           match opt_e { None -> None Some(e) -> Some(pcs_distribute_dead_drops(e, drops, fn_name, owed_ok, held)) })
     EMatch(s, arms) -> EMatch(s, pcs_dd_arms(arms, drops, fn_name, owed_ok, held))
     EBlock(stmts, opt_tail) -> match opt_tail {
-      Some(t) -> EBlock(stmts, Some(pcs_dd_scoped(t, drops, fn_name, owed_ok, held, ppd_let_names(stmts))))
+      Some(t) ->
+        if ppd_is_hoist_block(stmts) { pcs_dd_hoisted(Expr { kind: k, line: ln, col: cl, ty: ty, mode: mode }, drops, owed_ok) }
+        else { EBlock(stmts, Some(pcs_dd_scoped(t, drops, fn_name, owed_ok, held, ppd_let_names(stmts)))) }
       None    -> k
     }
     _ -> pcs_dd_leaf(Expr { kind: k, line: ln, col: cl, ty: ty, mode: mode }, drops, fn_name, owed_ok, held)
@@ -4571,7 +4573,8 @@ fn pcs_dd_leaf(leaf: Expr, drops: [Stmt], fn_name: SelfRef, owed_ok: Bool, held:
     }
   }
 
-fn pcs_dd_goto_leaf(leaf: Expr, drops: [Stmt], owed_ok: Bool) : ExprKind = {
+fn pcs_dd_goto_leaf(leaf0: Expr, drops: [Stmt], owed_ok: Bool) : ExprKind = {
+  let leaf = pcs_dd_pay_paths(drops, leaf0)
   let owed = if owed_ok { filter(drops, (d) => pcs_drop_owed_in(d, leaf)) } else { [] }
   let paid = match owed { [] -> leaf  _ -> ppd_hoist_then(leaf, owed) }
   match pcs_drops_dead_in(drops, leaf) {
@@ -4616,15 +4619,39 @@ fn pcs_dd_scoped(body: Expr, drops: [Stmt], fn_name: SelfRef, owed_ok: Bool, hel
   pcs_distribute_dead_drops(body, drops, fn_name, owed_ok and not any(drops, (d) => ppd_drop_among(d, names)),
                             list_append(names, held))
 
+# A self-call whose arguments an inner scope already hoisted: the argument
+# lets are part of the leaf, so its reads there count, and an owed drop
+# runs after the last of them.
+fn pcs_dd_hoisted(blk: Expr, drops: [Stmt], owed_ok: Bool) : ExprKind = {
+  let paid = pcs_dd_pay_paths(drops, blk)
+  let owed = if owed_ok { filter(drops, (d) => pcs_drop_owed_in(d, paid)) } else { [] }
+  let after = match paid.kind {
+    EBlock(ss, t) -> EBlock(list_append(ss, owed), t)
+    k             -> k
+  }
+  match pcs_drops_dead_in(drops, paid) {
+    []   -> after
+    dead -> EBlock(dead, Some(Expr { kind: after, line: blk.line, col: blk.col, ty: blk.ty, mode: blk.mode }))
+  }
+}
+
+# A binder the leaf moves on some of its paths only: the alternatives inside
+# the leaf that skip the move release it on entry.
+fn pcs_dd_pay_paths(drops: [Stmt], leaf: Expr) : Expr = match drops {
+  []           -> leaf
+  [d, ...rest] -> pcs_dd_pay_paths(rest, match ppd_drop_name(d) {
+    Some(nm) -> if pcs_has_bare_read(nm, leaf) { pbl_paid(nm, leaf) } else { leaf }
+    None     -> leaf
+  })
+}
+
 fn pcs_drop_owed_in(d: Stmt, leaf: Expr) : Bool = match ppd_drop_name(d) {
   Some(nm) -> pcs_mentions(nm, leaf) and not pcs_has_bare_read(nm, leaf)
   None     -> false
 }
 
 # Drops whose binder the leaf never mentions, closure captures included —
-# only those may run before the leaf's argument evaluation. The
-# mixed-consumption shape (`f(if c { [s, ...a] } else { a })`) keeps its
-# skipped-edge leak: no static placement is right for both of its edges.
+# only those may run before the leaf's argument evaluation.
 fn pcs_drops_dead_in(drops: [Stmt], leaf: Expr) : [Stmt] = match drops {
   [] -> []
   [d, ...rest] -> {
