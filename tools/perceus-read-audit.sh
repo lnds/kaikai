@@ -2,13 +2,13 @@
 # Read-table audit for the ownership passes.
 #
 # stage2/compiler/perceus_reads.kai builds the one table of binder reads
-# (`pcs_read_table`) and answers every question about it. Two ways a second
+# (`pcs_use_index`) and answers every question about it. Two ways a second
 # derivation can creep back in, both checked here:
 #
 # - A perceus-family file other than perceus_reads.kai spelling a `U(...)`
 #   read entry: building or scanning the table by hand instead of asking
 #   perceus_reads.kai.
-# - A new function calling `pcs_read_table`: every caller re-derives the
+# - A new function calling `pcs_use_index`: every caller re-derives the
 #   table for its own body. The callers are pinned in the baseline, one
 #   `<file> <fn>` per line; a caller not listed fails, and a listed caller
 #   that no longer calls fails too (shrink the baseline in that commit).
@@ -31,7 +31,7 @@ audit() {
   fi
   observed=$(mktemp)
   for f in "$ROOT"/stage2/compiler/*.kai; do
-    grep -n 'pcs_read_table(' "$f" | grep -v 'pub fn pcs_read_table' | cut -d: -f1 | while read -r ln; do
+    grep -n 'pcs_use_index(' "$f" | grep -v 'pub fn pcs_use_index' | cut -d: -f1 | while read -r ln; do
       awk -v t="$ln" 'NR<=t && /^(pub )?fn /{n=$2; sub(/\(.*/, "", n)} NR==t{print n; exit}' "$f"
     done | sort -u | sed "s|^|$(basename "$f") |"
   done | sort > "$observed"
@@ -59,7 +59,7 @@ self_test() {
   mkdir -p "$tmp/tools" "$tmp/stage2/compiler"
   cp tools/perceus-read-baseline.txt "$tmp/tools/"
   cp stage2/compiler/*.kai "$tmp/stage2/compiler/"
-  printf '\nfn pra_probe(e: Expr) : [Use] / Console = pcs_read_table(e, [])\n' >> "$tmp/stage2/compiler/perceus_payer.kai"
+  printf '\nfn pra_probe(e: Expr) : UseIx / Console = pcs_use_index(e, [])\n' >> "$tmp/stage2/compiler/perceus_payer.kai"
   audit "$tmp" > /dev/null; rc=$?
   cp stage2/compiler/perceus_payer.kai "$tmp/stage2/compiler/"
   printf '\nfn pra_probe(u: Use) : String = match u { U(n, _, _, _) -> n }\n' >> "$tmp/stage2/compiler/perceus_tail_drop.kai"
