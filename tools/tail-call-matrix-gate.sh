@@ -5,7 +5,9 @@
 # tools/tail-call-matrix/gen.py writes one program holding a loop per shape:
 # a self or a mutual tail call, the callee taking as many, fewer or more
 # parameters than the caller, with or without an effect row, with or
-# without a parameter it never reads, on the main fiber or a spawned one.
+# without a parameter it never reads, on the main fiber or a spawned one,
+# and mutual calls whose caller builds a lambda, record, list, interpolated
+# string or pipe first.
 # The program is built once per backend and run once per shape: five
 # million turns on a 64 KB fiber stack, where a call that is not a jump
 # overflows. A (backend, shape) listed in tools/tail-call-matrix/
