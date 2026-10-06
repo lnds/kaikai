@@ -19673,7 +19673,9 @@ static void *kai_llvm_build_alloca_entry(void *cv, void *ty, KaiValue *name) {
     KaiNativeCtx *c = (KaiNativeCtx *) cv;
     LLVMBuilderRef b = (LLVMBuilderRef) c->b;
     LLVMBasicBlockRef cur = LLVMGetInsertBlock(b);
-    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock((LLVMValueRef) c->fnval);
+    /* The insert block's function: `c->fnval` can name another function
+     * than the one being built. */
+    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(cur));
     LLVMValueRef first = LLVMGetFirstInstruction(entry);
     if (first) LLVMPositionBuilderBefore(b, first);
     else LLVMPositionBuilderAtEnd(b, entry);

@@ -1991,6 +1991,19 @@ test-ffi-pub-axiom-cross-module: $(TARGET) build
 	       diff ../examples/effects/ffi_pub_axiom_cross_module/main.out.expected \
 	            build/ffi_pub_axiom_cross_module.out; exit 1; }
 
+# A tail loop on a spawned fiber that calls an effectful function each turn
+# runs in constant stack; native runs the same fixtures in backend parity.
+TAIL_LOOP_FRAMED = tail_loop_framed_call tail_loop_process_op
+test-tail-loop-framed-call: $(TARGET) build
+	@set -e; for n in $(TAIL_LOOP_FRAMED); do \
+	  d=../examples/effects/$$n; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --path $$d $$d/main.kai > build/$$n.c; \
+	  $(CC) $(CFLAGS) -I ../stage2 -I ../stage0 build/$$n.c -o build/$$n-c $(LDLIBS_M); \
+	  ./build/$$n-c > build/$$n.out; \
+	  diff -q $$d/main.out.expected build/$$n.out > /dev/null \
+	    || { echo "tail-loop-framed-call DIFF ($$n)"; diff $$d/main.out.expected build/$$n.out; exit 1; }; \
+	done; echo "tail-loop-framed-call OK (C backend)"
+
 # Issue #248 fixtures — stdlib `loop` helpers under the m7b §5
 # double-trailing-lambda sugar. Three positive fixtures exercise
 # `until { cond } { body }`, `while { cond } { body }`, and the
