@@ -36,6 +36,18 @@ SRC="$ROOT/examples/perceus/rb_tree_bench.kai"
 # built to fold. A generous ceiling (a handful survive at loop edges); a broken
 # stamp jumps every per-node op back to a call and blows far past it.
 HOT_RE='kaix_(internal_dup|internal_drop|variant_arg|variant_arg_borrow|variant_masked|field_at|int_field|real_field|proj|projkind|tag_of)'
+# A call names one of these ops exactly: a longer runtime symbol that shares the
+# prefix (the cold `kaix_variant_arg_scalar` re-box path) is not a hot op.
+HOT_CALL="(bl|call).*${HOT_RE}([^A-Za-z0-9_]|\$)"
+for _l in "bl	_kaix_variant_arg" "call	401a20 <kaix_variant_arg>" "bl	_kaix_internal_dup"; do
+  printf '%s\n' "$_l" | grep -qE "$HOT_CALL" \
+    || { echo "native-perf/inline-gate: self-test FAIL — '$_l' is a hot-path call and must count"; exit 1; }
+done
+for _l in "bl	_kaix_variant_arg_scalar" "call	401a20 <kaix_variant_arg_scalar>"; do
+  if printf '%s\n' "$_l" | grep -qE "$HOT_CALL"; then
+    echo "native-perf/inline-gate: self-test FAIL — '$_l' is not a hot op and must not count"; exit 1
+  fi
+done
 THRESHOLD="${INLINE_GATE_THRESHOLD:-50}"
 
 LLVM_CONFIG="${LLVM_CONFIG:-llvm-config}"
@@ -80,7 +92,7 @@ else
   echo "native-perf/inline-gate: SKIP (no otool/objdump to disassemble)"
   exit 0
 fi
-CALLS="$($DISASM "$BIN" | grep -cE "(bl|call).*$HOT_RE" || true)"
+CALLS="$($DISASM "$BIN" | grep -cE "$HOT_CALL" || true)"
 
 echo "native-perf/inline-gate: residual hot-path kaix_ calls = $CALLS (threshold $THRESHOLD)"
 if [ "$CALLS" -gt "$THRESHOLD" ]; then

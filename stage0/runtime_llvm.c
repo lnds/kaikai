@@ -671,9 +671,16 @@ int32_t kaix_variant_tag_of(KaiValue *v) {
    ctor-bound survivor needs +1 over the cascade, a TRMC recursive-child
    that br's to the loop needs a bare move) and leaked. Borrow collapses
    both to one rule, identical to the C backend. */
+/* Int and Real slots may allocate a box; out of line, they keep
+ * kaix_variant_arg cheap enough for the inliner to fold into every match arm. */
+__attribute__((noinline, cold))
+static KaiValue *kaix_variant_arg_scalar(KaiValue *v, int i) {
+    return kai_variant_slot_box(v, i);
+}
+
 KaiValue *kaix_variant_arg(KaiValue *v, int i) {
-    /* The slot mask discriminates the read: any typed slot (Int / Real /
-     * enum) re-boxes through `kai_variant_slot_box` — the SAME boxed-view
+    /* The slot mask discriminates the read: a typed slot (Int / Real /
+     * enum) re-boxes exactly as `kai_variant_slot_box` does — the boxed-view
      * accessor the C backend uses (`slot_read_for_test`) — so a raw word
      * is never dereferenced as a pointer.
      *
@@ -685,10 +692,9 @@ KaiValue *kaix_variant_arg(KaiValue *v, int i) {
      * `is_alias=false` path — such binders are excluded from the
      * bind-site dup set). */
     uint32_t k = kai_var_slot_kind(kai_slot_mask_of(v->variant_tag), i);
-    if (k != KAI_VAR_SLOT_PTR) {
-        return kai_variant_slot_box(v, i);
-    }
-    return kai_var_slots(v)[i].ptr;   /* borrow (no incref) */
+    if (k == KAI_VAR_SLOT_PTR)  return kai_var_slots(v)[i].ptr;   /* borrow (no incref) */
+    if (k == KAI_VAR_SLOT_ENUM) return kai_enum_slot_box(kai_var_slots(v)[i].i64);
+    return kaix_variant_arg_scalar(v, i);
 }
 
 /* i64-inline parity (#747) — read a kind-1 Int (or kind-3 enum) slot as a
