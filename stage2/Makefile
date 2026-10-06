@@ -13538,6 +13538,11 @@ TEST_LIGHT_TARGETS := $(shell cat test-lists/light.txt)
 test-progen-smoke: $(TARGET) bin-kai
 	@sh ../tools/progen-smoke.sh
 
+# Every call in tail position inside a recursive group is a jump on both
+# backends: one generated program, one shape per run, on a 64 KB fiber.
+test-tail-call-matrix: $(TARGET) bin-kai
+	@../tools/tail-call-matrix-gate.sh
+
 # Targets that drive `bin/kai` with KAI_BACKEND=native. On a kaic2 built
 # without libLLVM the wrapper degrades to the C backend, so running these
 # in the C-built tier1 job asserts nothing about native — they belong to
