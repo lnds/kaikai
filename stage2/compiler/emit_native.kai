@@ -27,6 +27,7 @@ import compiler.ast
 import compiler.kir
 import compiler.fnreg
 import compiler.purity
+import compiler.purity_traps
 import compiler.evidence_frame
 import compiler.emit_shared
 import compiler.emit_native_di
@@ -87,8 +88,9 @@ pub fn nemit_build_module(ctx: Handle, kp: KProgram, decls: [Decl], variants: [V
   # LOWERED body is memory-clean. Computed once here over the same
   # post-perceus decls the C backend sees, so both stamp the same set.
   let const_syms = purity_const_syms(purity_analyze(decls))
+  let free_syms = trapfree_syms(decls)
   # Declare every program fn first (forward + cross-TU references).
-  nemit_declare_fns(ctx, all_fns, const_syms)
+  nemit_declare_fns(ctx, all_fns, const_syms, free_syms)
   # A builtin effect (`Stdout`) has no user `KHandlerDecl`; synthesise one per
   # default-block effect so `nemit_perform` resolves the op's field index.
   # DISPATCH uses `synth_defaults` (the SUPERSET) because a dead fn's
@@ -173,7 +175,7 @@ fn nfilter_user_main(fns: [KFn], bmode: BuildMode) : [KFn] =
 # Declare every `KFnNormal` (all-boxed) + `KFnClause` (the clause ABI) up
 # front so a call/install site resolves the symbol even when the definition
 # comes later in the list. (Lambda thunks declare lazily at their use.)
-fn nemit_declare_fns(ctx: Handle, fns: [KFn], const_syms: [String]) : Unit = match fns {
+fn nemit_declare_fns(ctx: Handle, fns: [KFn], const_syms: [String], free_syms: [String]) : Unit = match fns {
   [] -> ()
   [f, ...rest] -> match f.kind {
     # `KFnFfi` shares the all-boxed declaration: its callers invoke the
@@ -182,7 +184,7 @@ fn nemit_declare_fns(ctx: Handle, fns: [KFn], const_syms: [String]) : Unit = mat
     # purity attribute: the shim calls into arbitrary C.
     KFnFfi(_, _, _) -> {
       let _f = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym), llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params)))
-      nemit_declare_fns(ctx, rest, const_syms)
+      nemit_declare_fns(ctx, rest, const_syms, free_syms)
     }
     KFnNormal -> {
       # Bind the declaration handle in a `let` (the handle-binder
@@ -200,28 +202,27 @@ fn nemit_declare_fns(ctx: Handle, fns: [KFn], const_syms: [String]) : Unit = mat
       # boxed `ptr (ptr × n)` for a fully-boxed fn, so non-UFn decls are
       # unchanged.
       let _d = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym), nfn_llvm_type(ctx, f))
-      # Stamp purity attributes on the declaration (#1139). `nounwind`
-      # broadly on every normal kaikai fn (no EH unwinding; a trap longjmps
-      # past nounwind frames, orthogonal to the attribute). `memory(none)`
-      # only when the confirmation table proved the body memory-clean.
-      let _nu = llvm_add_nounwind(_d)
+      # `memory(none)` only when the confirmation table proved the body
+      # memory-clean; `nounwind` only when nothing in it can trap, since a
+      # trap unwinds through these frames.
+      let _nu = if nname_present(free_syms, f.sym) { llvm_add_nounwind(_d) } else { () }
       let _mn = if nname_present(const_syms, f.sym) { llvm_add_memory_none(_d) } else { () }
-      nemit_declare_fns(ctx, rest, const_syms)
+      nemit_declare_fns(ctx, rest, const_syms, free_syms)
     }
     # A clause thunk is referenced by the install (`kaix_ev_set_op` stores
     # its address) before its own definition is walked, so forward-declare
     # it with the clause ABI `ptr (ptr self, <args>, ptr k)`.
     KFnClause -> {
       let _c = nemit_declare_clause(ctx, f.sym, f.params)
-      nemit_declare_fns(ctx, rest, const_syms)
+      nemit_declare_fns(ctx, rest, const_syms, free_syms)
     }
     # The install arms the cleanup thunk's address before its own definition
     # is walked, so forward-declare it with the `void (ptr self)` ABI.
     KFnCleanup -> {
       let _c = nemit_declare_cleanup(ctx, f.sym)
-      nemit_declare_fns(ctx, rest, const_syms)
+      nemit_declare_fns(ctx, rest, const_syms, free_syms)
     }
-    _ -> nemit_declare_fns(ctx, rest, const_syms)
+    _ -> nemit_declare_fns(ctx, rest, const_syms, free_syms)
   }
 }
 

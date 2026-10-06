@@ -8,6 +8,12 @@ site must not register, because a sibling evaluated in unspecified order
 might consume them first, or because an enclosing bracket already holds
 them (its push precedes the evaluation of its arguments, and one
 reference must never sit in two live entries).
+
+With `traps` the walk also finds the native landing pads: each call or
+operator that can trap, with the binders pending across it. A pad never
+encloses a bracket: an expression whose operands hold one gets no pad, so
+a reference is released either by the unwinder or by the jump, never by
+both, and the brackets are the ones the walk finds without `traps`.
 """)]
 
 import compiler.ast
@@ -19,19 +25,20 @@ import compiler.unwind_calls
 import compiler.unwind_binders
 import compiler.unwind_sites
 import compiler.unwind_reads
+import compiler.unwind_pads
 
 # `banned` names a binder bound twice in the frame: a mention cannot say
 # which binding it reads, so neither is ever registered. `locals` are
 # every binder of the frame, the test for a call through a local closure.
 # `jumps` are the params a tail-call goto may release without naming them.
-type UwFx = { ucx: UnwCx, banned: [String], locals: [String], body: Expr, jumps: [String] }
+type UwFx = { ucx: UnwCx, banned: [String], locals: [String], body: Expr, jumps: [String], traps: Bool }
 
 type UwR = { pend: [String], sites: [UnwSite] }
 
-#[doc("The sites of the frame `body`: `pend` its owned entry binders, `bound` every binder it introduces, `banned` those bound twice.")]
-pub fn unw_walk(ucx: UnwCx, pend: [String], bound: [String], banned: [String], params: [String], body: Expr) : [UnwSite] = {
+#[doc("The sites of the frame `body`: `pend` its owned entry binders, `bound` every binder it introduces, `banned` those bound twice; `traps` adds the native landing pads.")]
+pub fn unw_walk(ucx: UnwCx, pend: [String], bound: [String], banned: [String], params: [String], body: Expr, traps: Bool) : [UnwSite] = {
   let fx = UwFx { ucx: ucx, banned: banned, locals: bound, body: body,
-                  jumps: if tcl_has_goto(body) { params } else { [] } }
+                  jumps: if tcl_has_goto(body) { params } else { [] }, traps: traps }
   uw_expr(body, pend, [], fx, []).sites
 }
 
@@ -48,8 +55,15 @@ fn uw_expr(e: Expr, pend: [String], z: [String], fx: UwFx, sites: [UnwSite]) : U
   ECall(f, xs) ->
     if unw_call_unwinds(f, xs, fx.locals, fx.ucx) { uw_site(e, f, xs, pend, z, fx, sites) }
     else if unw_lending(f) { UwR { pend: unw_filter(pend, e), sites: uw_nary(e, pend, z, fx, sites).sites } }
+    else if fx.traps and unw_call_traps(f) { uw_pad_op(e, Some(UwLends(f, xs)), pend, z, fx, sites) }
     else { uw_nary(e, pend, z, fx, sites) }
-  _ -> uw_nary(e, pend, z, fx, sites)
+  _ -> if fx.traps and uw_op_traps(e) { uw_pad_op(e, None, pend, z, fx, sites) } else { uw_nary(e, pend, z, fx, sites) }
+}
+
+fn uw_op_traps(e: Expr) : Bool = match e.kind {
+  EIndex(_, _)     -> true
+  EBinop(op, _, _) -> unw_op_traps(op)
+  _                -> false
 }
 
 fn uw_if(c: Expr, t: Expr, oe: Option[Expr], pend: [String], z: [String], fx: UwFx, sites: [UnwSite]) : UwR = {
@@ -78,6 +92,27 @@ fn uw_site(e: Expr, f: Expr, xs: [Expr], pend: [String], z: [String], fx: UwFx, 
   let r = uw_nary(e, pend, z, fx, [])
   let held = unw_minus(unw_union(unw_inter(live, r.pend), unw_lent(f, xs, live)), fx.banned)
   UwR { pend: r.pend, sites: unw_add(UnwCall(e.line, e.col, unw_callee_key(f), held), unw_merge(r.sites, held, sites)) }
+}
+
+# An expression that can trap releases what is live across it through a
+# landing pad, and what a call only lends; with a bracket in its operands
+# it has none.
+fn uw_pad_op(e: Expr, lends: Option[UwLends], pend: [String], z: [String], fx: UwFx, sites: [UnwSite]) : UwR = {
+  let live = unw_minus(pend, z)
+  let r = uw_nary(e, pend, z, fx, [])
+  if uw_all_pads(r.sites) {
+    let lent = match lends { Some(UwLends(f, xs)) -> unw_lent(f, xs, live) None -> [] }
+    let held = unw_minus(unw_union(unw_inter(live, r.pend), lent), fx.banned)
+    UwR { pend: r.pend, sites: unw_add(UnwPad(e.line, e.col, unw_pad_key(e), held), unw_merge(r.sites, held, sites)) }
+  } else { UwR { pend: r.pend, sites: unw_merge(r.sites, [], sites) } }
+}
+
+type UwLends = UwLends(Expr, [Expr])
+
+
+fn uw_all_pads(ss: [UnwSite]) : Bool = match ss {
+  [] -> true
+  [s, ...rest] -> unw_is_pad(s) and uw_all_pads(rest)
 }
 
 # Children evaluated in unspecified order: each child is walked once, and
@@ -128,8 +163,22 @@ fn uw_stmt(s: Stmt, pend: [String], z: [String], fx: UwFx, sites: [UnwSite]) : U
     UwR { pend: unw_union(r.pend, uw_owned_let(pat, rhs, fx)), sites: r.sites }
   }
   SExprStmt(x) -> uw_expr(x, pend, z, fx, sites)
-  _ -> uw_stmt_nary(xp_positions(Expr { kind: EBlock([s], None), line: 0, col: 0, ty: None, mode: MUnknown }),
+  SAssert(c, _) -> if fx.traps { uw_assert(s, c, pend, z, fx, sites) } else { uw_stmt_generic(s, pend, z, fx, sites) }
+  _ -> uw_stmt_generic(s, pend, z, fx, sites)
+}
+
+fn uw_stmt_generic(s: Stmt, pend: [String], z: [String], fx: UwFx, sites: [UnwSite]) : UwR =
+  uw_stmt_nary(xp_positions(Expr { kind: EBlock([s], None), line: 0, col: 0, ty: None, mode: MUnknown }),
                     pend, z, fx, sites, s)
+
+# A failed `assert` leaves the frame like a trap.
+fn uw_assert(s: Stmt, c: Expr, pend: [String], z: [String], fx: UwFx, sites: [UnwSite]) : UwR = {
+  let live = unw_minus(pend, z)
+  let r = uw_stmt_generic(s, pend, z, fx, [])
+  if uw_all_pads(r.sites) {
+    let held = unw_minus(unw_inter(live, r.pend), fx.banned)
+    UwR { pend: r.pend, sites: unw_add(UnwPad(c.line, c.col, unw_assert_key(), held), unw_merge(r.sites, held, sites)) }
+  } else { UwR { pend: r.pend, sites: unw_merge(r.sites, [], sites) } }
 }
 
 fn uw_stmt_nary(ps: [XPos], pend: [String], z: [String], fx: UwFx, sites: [UnwSite], s: Stmt) : UwR = {
@@ -196,9 +245,14 @@ fn uw_handle(e: Expr, body: Expr, oi: Option[Expr], oret: Option[HReturn],
 # A match scope is a site only when an arm holds a call that can unwind:
 # the emitter then registers the scrutinee for the arms' extent.
 fn uw_scope_site(e: Expr, before: [UnwSite], after: [UnwSite]) : [UnwSite] =
-  if list_length(after) == list_length(before) { after }
+  if uw_brackets(after) == uw_brackets(before) { after }
   else if unw_match_at(after, e.line, e.col) { after }
   else { [UnwMatch(e.line, e.col), ...after] }
+
+fn uw_brackets(ss: [UnwSite]) : Int = match ss {
+  [] -> 0
+  [s, ...rest] -> if unw_is_pad(s) { uw_brackets(rest) } else { 1 + uw_brackets(rest) }
+}
 
 # A pasted loop body runs in this frame, once per iteration: a binder the
 # loop consumes anywhere may already be gone, and one bound inside lives

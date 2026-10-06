@@ -2187,9 +2187,41 @@ emitters:
   slot read on the first push. A tcrec goto out of a registered match pops
   through the same ledger that releases its scrutinee.
 
-A trap raised from pure code is not a call that can unwind: the
-references its caller frames hold leak when it lands in a fiber's
-cancel pad.
+### Traps and failed assertions
+
+A trap (an out-of-range index, a division by zero, a `panic`) inside a
+fiber with a cancel pad, and a failed `assert` under `kai test`, leave
+through `_Unwind_ForcedUnwind` rather than a bare `longjmp`. The trap
+first releases the fiber's unwind stack while every frame it points into
+is still live. The unwinder then walks out to the fiber trampoline (or
+the test harness) and lands there exactly as the `longjmp` did. When the
+walk cannot start, or the fiber's stack is too short for the unwinder,
+the `longjmp` runs at once. A trap with no pad, in the main fiber, still
+exits the process.
+
+On the native backend the walk enters **landing pads**. With the
+`traps` mode on, the walk in `unwind_walk.kai` also finds every
+expression that can trap: every call but the compiler's internal forms,
+integer `/` and `%`, an index, and an `assert`. Each one records the
+binders pending across it, computed by the same ledger as a bracket.
+The KIR lowering (`kir_lower_pads.kai`) opens a pad around each such
+expression with `kai_pad_open(regs…)` and closes it with
+`kai_pad_close`. Every call emitted while a pad is open becomes an
+`invoke` whose unwind edge enters a cleanup block. That block releases
+the pad's registers, including the enclosing pads' registers, and
+resumes the unwind (`emit_native_pads.kai`).
+
+A pad never encloses a bracket: an expression whose operands hold one
+gets no pad. So a reference is released by the unwinder or by the jump,
+never by both, and the lowering asserts the two sets disjoint. The
+runtime bitcode is built with `-fexceptions`, so a function that can
+trap is not `nounwind` and LLVM keeps the `invoke`s that reach it.
+Emitted functions carry no explicit `nounwind`: LLVM infers it where no
+call can unwind, and it then drops the pads there.
+
+The C backend has no pads: a trap leaks what its frames held. Frames of
+C code that a closure was called back from (the runtime's higher-order
+functions) have no pads on either backend.
 
 ### Discarded continuations on both backends
 

@@ -1,0 +1,73 @@
+#[doc("""
+Native landing pads around the expressions that can trap.
+
+`kai_pad_open(regs...)` binds a register naming a pad that releases
+`regs` (the enclosing pads' included, since an unwind leaves the frame
+from the innermost one) and makes it the pad every call until the
+matching `kai_pad_close` unwinds to. `kai_pad_close(outer?)` reopens the
+enclosing pad, or none. The C backend has no pads: a trap there still
+leaks what its frames owned.
+
+A reference is released either by a pad or by the jump that unwinds the
+bracket holding it, never both: a register a bracket holds is never in a
+pad, which the lowering asserts in both directions.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.kir
+import compiler.kir_lower
+import compiler.unwind_pend
+
+#[doc("The state a pad or bracket opened over, restored when it closes; `None` when nothing opened.")]
+pub type PadB = PadB(Option[UnwPadOpen], LowerSt)
+
+#[doc("Opens, before lowering `x`, a landing pad releasing the admitted binders among `names` not already released.")]
+pub fn lower_pad_begin(x: Expr, names: [String], st: LowerSt) : PadB = {
+  let outer = st.unw.pad
+  let own = filter(map(unw_admit(st.unw, names), (n) => ls_reg_of(st, n)), (r) => not list_has(outer.regs, r))
+  match own {
+    [] -> PadB(None, st)
+    _  -> {
+      lp_disjoint(own, outer.pushed, "a pad releases a register a bracket holds")
+      let regs = lp_union(outer.regs, own)
+      match ls_fresh_reg(st) { LSReg(pr, st1) -> {
+        let st2 = ls_emit(st1, KLet(pr, SBoxed, KPrim("kai_pad_open", map(regs, (r) => KVar(r))), kpos_of(x)))
+        PadB(Some(outer), ls_with_unw(st2, unw_with_pad(st2.unw, UnwPadOpen { reg: pr, regs: regs, pushed: outer.pushed })))
+      } }
+    }
+  }
+}
+
+#[doc("Closes, after lowering `x`, the pad `lower_pad_begin` opened, reopening the one around it.")]
+pub fn lower_pad_end(x: Expr, outer: Option[UnwPadOpen], st: LowerSt) : LowerSt = match outer {
+  None -> st
+  Some(o) -> {
+    let back = if o.reg == "" { [] } else { [KVar(o.reg)] }
+    let st1 = ls_emit(st, KDo(KPrim("kai_pad_close", back), kpos_of(x)))
+    ls_with_unw(st1, unw_with_pad(st1.unw, o))
+  }
+}
+
+#[doc("`st` with the registers `held` pushed by a bracket, asserting no open pad releases them; returns the pad state to restore.")]
+pub fn lower_bracket_begin(held: [String], st: LowerSt) : PadB = {
+  let outer = st.unw.pad
+  lp_disjoint(held, outer.regs, "a bracket holds a register a pad releases")
+  PadB(Some(outer), ls_with_unw(st, unw_with_pad(st.unw, UnwPadOpen { reg: outer.reg, regs: outer.regs, pushed: lp_union(outer.pushed, held) })))
+}
+
+#[doc("`st` with the bracket `lower_bracket_begin` pushed popped from the pad state.")]
+pub fn lower_bracket_end(outer: Option[UnwPadOpen], st: LowerSt) : LowerSt = match outer {
+  None -> st
+  Some(o) -> ls_with_unw(st, unw_with_pad(st.unw, o))
+}
+
+fn lp_disjoint(a: [String], b: [String], what: String) : Unit = match a {
+  [] -> ()
+  [r, ...rest] -> if list_has(b, r) { panic(concat_all(["kir: ", what, ": ", r])) } else { lp_disjoint(rest, b, what) }
+}
+
+fn lp_union(a: [String], b: [String]) : [String] = match b {
+  [] -> a
+  [r, ...rest] -> lp_union(if list_has(a, r) { a } else { list_append(a, [r]) }, rest)
+}

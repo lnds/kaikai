@@ -3600,9 +3600,7 @@ static void kai_trap_unwind(uintptr_t frame, void *stack_base, void (*land)(void
 }
 
 static void kai_trap_land_fiber(void *arg) {
-    KaiFiber *f = (KaiFiber *) arg;
-    kai_evidence_unwind_all();
-    longjmp(f->cancel_pad, 1);
+    longjmp(((KaiFiber *) arg)->cancel_pad, 1);
 }
 
 /* A recoverable runtime trap (index out of range, divide by zero,
@@ -3616,6 +3614,10 @@ static void kai_trap_abort(const char *msg) {
     if (f && f->cancel_pad_set) {
         f->trapped  = 1;
         f->trap_msg = msg;
+        /* Before the walk: once a landing pad has run, the frames below it
+         * are dead and the unwinder's own calls reuse their stack, which
+         * the unwind entries point into. */
+        kai_evidence_unwind_all();
         kai_trap_unwind(f->unwind_frame, f->stack_base, kai_trap_land_fiber, f);
     }
     fprintf(stderr, "kai: trap: %s\n", msg ? msg : "runtime trap");
@@ -10860,6 +10862,7 @@ static KAI_TLS int         kai_test_reported     = 0;
 static KAI_TLS jmp_buf     kai_test_jmp;
 static KAI_TLS int         kai_test_in_progress  = 0;
 static KAI_TLS uintptr_t   kai_test_frame        = 0;
+static KAI_TLS uint32_t    kai_test_unw_mark     = 0;
 
 static long long kai_test_now_ns(void) {
     struct timespec ts;
@@ -11013,9 +11016,13 @@ static void kai_test_land(void *arg) {
     longjmp(kai_test_jmp, 1);
 }
 
-/* A failed assertion leaves the test body through the unwinder. */
+static void kai_unw_release_to(KaiFiber *f, uint32_t mark);
+
+/* A failed assertion leaves the test body through the unwinder, releasing
+ * the body's unwind entries first, while the frames they point into live. */
 __attribute__((noreturn))
 static void kai_test_unwind(void) {
+    kai_unw_release_to(kai_current_fiber(), kai_test_unw_mark);
     kai_trap_unwind(kai_test_frame, NULL, kai_test_land, NULL);
 }
 
@@ -11048,6 +11055,7 @@ static void kai_test_run_one(const char *desc, KaiValue *(*body)(void)) {
     long long t0 = kai_test_now_ns();
     kai_test_begin(desc);
     kai_test_frame = (uintptr_t) __builtin_frame_address(0);
+    kai_test_unw_mark = kai_current_fiber()->unw_top;
     if (setjmp(kai_test_jmp) == 0) {
         kai_test_in_progress = 1;
         KaiValue *r = body();
@@ -19381,15 +19389,11 @@ static KaiValue *kai_llvm_add_sret_call(void *m, void *call, void *sty) {
     kai_llvm_sret_attr_at((LLVMModuleRef) m, (LLVMValueRef) call, 1, (LLVMTypeRef) sty);
     return kai_unit();
 }
-/* Purity/aliasing function attributes (issue #1139). Attached at
- * `LLVMAttributeFunctionIndex` on the declaration, so every call site the
- * optimizer sees carries the promise. `nounwind` is broad: kaikai has no
- * exception unwinding (a trap longjmps past nounwind frames, which is
- * orthogonal to the attribute — it names EH-personality unwinding only).
- * `memory(none)` is stamped ONLY on a confirmed-pure scalar fn (no alloc,
- * no RC, no pointer read); it takes the MemoryEffects bitmask, and
- * `none()` is 0. willreturn is NEVER stamped — kaikai does not model
- * termination, and a memory(none) fn that traps must not be DCE'd. */
+/* Function attributes, attached at `LLVMAttributeFunctionIndex` on the
+ * declaration so every call site the optimizer sees carries them.
+ * `memory(none)` takes the MemoryEffects bitmask, and `none()` is 0. A trap
+ * unwinds, so a fn that can trap must not be `nounwind`; and `willreturn` is
+ * never stamped, or a memory(none) fn that traps could be deleted. */
 static void kai_llvm_add_enum_fn_attr(LLVMValueRef fn, const char *name,
                                       unsigned name_len, uint64_t val) {
     LLVMContextRef ctx = LLVMGetTypeContext(LLVMTypeOf(fn));
