@@ -257,9 +257,29 @@ never a module. `import ?name` is the dependency hole: the resolver
 searches packages for a symbol named `name` (`kai info holes`); a
 bare `import ?` is rejected.
 
-A local binder (`let`, a parameter, a pattern binder) shadows every
-declaration of its name — a root function, a core function, a protocol
-operation — whether it is called, piped into or passed as a value.
+A bare name reaches the nearest binding of it, in this order: a local
+binder (`let`, a parameter, a pattern binder), the file's own
+declarations, its selective picks, its imported modules, a protocol
+operation, a core module function, any other exporter. A call checks
+its arity on every rung — the piped value counts — and passes over a
+binding of another arity, with a warning when that binding is one you
+wrote:
+
+```kaikai
+fn min(xs: [Int]) : Int = 100
+
+fn main() : Unit / Stdout = {
+  let a = min([1])            # your `min`: 100
+  let b = min(1, 2)           # Ord.min: 1 (warns: skips your min/1)
+  let c = [1] |> min          # your `min`, called with one argument
+  let d = max([3, 9])         # list.max: Some(9)
+  let e = max(3, 9)           # Ord.max: 9
+  Stdout.print("#{a} #{b} #{c} #{d} #{e}")
+}
+```
+
+Qualify (`list.max(xs)`) or use the method form (`3.max(9)`) to name
+the binding explicitly.
 
 When two imports declare the same name, qualify the use — the
 qualifier names the module the declaration comes from:
