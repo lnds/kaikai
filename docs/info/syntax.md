@@ -260,7 +260,8 @@ bare `import ?` is rejected.
 A bare name reaches the nearest binding of it, in this order: a local
 binder (`let`, a parameter, a pattern binder), the file's own
 declarations, its selective picks, its imported modules, a protocol
-operation, a core module function, any other exporter. A call checks
+operation (the file's own protocols first, then those of its imports
+and the core), a core module function, any other exporter. A call checks
 its arity on every rung — the piped value counts — and passes over a
 binding of another arity, with a warning when that binding is one you
 wrote:

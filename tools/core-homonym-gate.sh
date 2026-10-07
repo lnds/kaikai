@@ -21,6 +21,12 @@
 # A call that passes over a binding the user wrote for one of another
 # arity must warn, in --diags-json too.
 #
+# The fixtures listed in `fixtures` each pin a decision a pass after the
+# resolver once made by spelling; every mode runs them cold and again on
+# a warm user cache. And a root function spelled like any parameter of a
+# core function must leave the core's own bodies compiling exactly as
+# they do without it, monolithic and modular alike.
+#
 # Each program and its oracle, every homonym renamed away, must print the
 # expected lines: a use that reaches the core instead of the binding, or a
 # core use that reaches a binding, changes one.
@@ -196,6 +202,92 @@ for mode in ${*:-c native}; do
     done
   done
   [ $mfail -eq 1 ] && fail=1 || echo "core-homonym-gate OK ($mode)"
+done
+
+fixtures="proto_rung_own_import_core derive_minted_ref_private_home generic_homonyms_spec_by_identity
+tail_call_to_core_homonym fused_groups_homonym_leads core_local_named_like_root_fn"
+for mode in ${*:-c native}; do
+  case $mode in
+    c)              env="KAI_BACKEND=c" ;;
+    native)         env="KAI_BACKEND=native KAI_NATIVE_MODULAR=0" ;;
+    modular)        env="KAI_BACKEND=c KAI_MODULAR=1" ;;
+    native-modular) env="KAI_BACKEND=native KAI_NATIVE_MODULAR=1" ;;
+  esac
+  mfail=0
+  for fx in $fixtures; do
+    work="$DIR/fx-$mode/$fx"
+    mkdir -p "$work"
+    cp "$ROOT/examples/namespace-collisions/$fx"/*.kai "$work/"
+    for pass in cold warm; do
+      got="$work/got-$pass"
+      if (cd "$work" && env $env KAI_CACHE=1 "$KAI" run main.kai > "$got" 2> "$got.err") \
+         && diff -u "$ROOT/examples/namespace-collisions/$fx/main.out.expected" "$got" > "$got.diff"; then
+        :
+      else
+        echo "core-homonym-gate FAIL ($mode, $fx, $pass)"
+        head -20 "$got.diff" 2>/dev/null || true
+        head -10 "$got.err" 2>/dev/null || true
+        mfail=1
+      fi
+    done
+  done
+  [ $mfail -eq 1 ] && fail=1 || echo "core-homonym-gate OK ($mode, fixtures cold+warm)"
+done
+
+# Every parameter name of a public core function.
+pnames=$(cat "$ROOT"/stdlib/core/*.kai "$ROOT/stdlib/protocols.kai" \
+         | grep -E '^pub fn ' | sed -E 's/^[^(]*\((.*)\).*/\1/' | tr ',' '\n' \
+         | sed -nE 's/^ *\^?([a-z_][a-z_0-9]*) *:.*/\1/p' | sort -u)
+gen_bodies() {
+  out="$DIR/$2/bodies"
+  mkdir -p "$out"
+  {
+    echo 'import collections.map'
+    echo
+    for n in $pnames; do printf 'fn %s%s(a: String) : Int = 0\n\n' "$1" "$n"; done
+    cat <<'KAI'
+fn main() : Unit / Stdout = {
+  let suffix = "!"
+  let p = Pair { fst: ["l", "r"], snd: 7 }
+  let q = tuple.map_snd(tuple.map_fst(p, (xs) => ["n", ...xs]), (n) => n + 1)
+  let xs = list.map([3, 1, 2], (x) => x * 2)
+  let s = list.foldl(list.filter(xs, (x) => x > 2), 0, (acc, x) => acc + x)
+  let o = option.map(Some("o"), (v) => "#{v}#{suffix}")
+  let r = result.map(Ok(4), (v) => v + 1)
+  let m = map.put(map.empty(), "k", 3)
+  let sorted = list.sort_by(xs, (a, b) => b - a)
+KAI
+    printf '  let k = string.join(["%s"], "")\n' "$1"
+    echo '  Stdout.print("#{q.fst} #{q.snd} #{s} #{o} #{r} #{map.get(m, "k")} #{sorted} #{k}")'
+    echo '}'
+  } > "$out/main.kai"
+}
+gen_bodies "" homonym
+gen_bodies "my_" oracle
+# The definitions of core functions in an emitted C file, specialisations
+# excluded: a specialisation's symbol carries the root call site.
+core_bodies() {
+  awk '/^(static )?[A-Za-z_][A-Za-z_0-9 *]*kaiu_[a-z_0-9]+__[A-Za-z_0-9]+\(.*\) \{$/ {
+         name = $0; sub(/\(.*/, "", name); sub(/.* \*?/, "", name)
+         on = (name !~ /__mono__|__cspec__|__kai_fused_|_thunk$|^kaiu_main__/)
+         if (on) print "@@ " name
+         next }
+       on { print; if ($0 ~ /^}/) on = 0 }' "$1"
+}
+for emit in "" "--emit=c-modular"; do
+  for prog in homonym oracle; do
+    (cd "$DIR/$prog/bodies" && "$ROOT/stage2/kaic2" $emit --path . --path "$ROOT/stdlib" main.kai \
+       > "$DIR/bodies-$prog.c" 2> "$DIR/bodies-$prog.err") || true
+    core_bodies "$DIR/bodies-$prog.c" > "$DIR/bodies-$prog.txt"
+  done
+  label=${emit:-whole}
+  if [ -s "$DIR/bodies-oracle.txt" ] && diff -u "$DIR/bodies-oracle.txt" "$DIR/bodies-homonym.txt" > "$DIR/bodies.diff"; then
+    echo "core-homonym-gate OK (core bodies, $label)"
+  else
+    echo "core-homonym-gate FAIL (core bodies, $label: a root name changed how a core body compiles)"
+    head -30 "$DIR/bodies.diff"; head -5 "$DIR/bodies-homonym.err"
+    fail=1
+  fi
 done
 
 json=$(cd "$DIR/skip" && "$KAI" typecheck --diags-json main.kai 2>/dev/null || true)

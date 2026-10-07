@@ -321,14 +321,17 @@ for pass in cold warm; do
 done
 
 # A call spelled like the function whose body holds it, but naming another
-# module's, reaches the passes that read self-calls by name spelled by its
-# home, never as a bare name they would loop back into the caller.
+# module's, carries that module's declaration's id, never the caller's.
 HFIX="$ROOT/examples/namespace-collisions/qualified_call_in_homonym_body"
 out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
         --path "$HFIX" --path "$ROOT/stdlib" "$HFIX/main.kai")
-printf '%s\n' "$out" | grep -qE '^perceus (twice|half) (twice|half)#[0-9]+ (twice|half)@ma$' \
-  && fail "a homonym of the enclosing function reached Perceus as a bare self-call"
-[ "$(printf '%s\n' "$out" | grep -cE '^perceus step step#[0-9]+ step@ma$')" = 1 ] \
-  || fail "mb.step's call to ma.step reached Perceus as a bare self-call"
+need '^perceus twice twice#[0-9]+ twice@ma$'
+need '^perceus half half#[0-9]+ half@ma$'
+printf '%s\n' "$out" | grep -qE '^perceus (twice|half) (twice|half)#[0-9]+ (twice|half)@main$' \
+  && fail "a homonym of the enclosing function reached Perceus as a self-call"
+[ "$(printf '%s\n' "$out" | grep -cE '^perceus step step#[0-9]+ step@ma$')" = 2 ] \
+  || fail "mb.step's call to ma.step lost ma.step's id"
+printf '%s\n' "$out" | grep -qE '^perceus step step#[0-9]+ step@mb$' \
+  && fail "mb.step's call to ma.step reached Perceus as a self-call"
 
 echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, a qualified call names the one its qualifier homes, and a constructor site, nested or not, names the home its type picked"

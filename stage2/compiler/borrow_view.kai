@@ -1,177 +1,28 @@
 #[doc("""
-Per-module views of Perceus' interprocedural borrow map.
-
-A bare callee name answers to the declaration the emitter links the call
-to, and which one that is depends on the calling body's module: its own
-declaration first, then the root file's, then the first in program order.
-A name several declarations share therefore has no program-wide answer;
-its borrowed positions are resolved once per calling module. A name only
-one declaration carries answers alike from every body and is stored once,
-as is every module-qualified key and every declaration's id key.
+Perceus' interprocedural borrow map: each function's borrowed positions,
+keyed by the identity of the declaration or specialisation, over the
+core prims, which have no identity and are keyed by name.
 """)]
 
 import compiler.ast
-import compiler.infer_index
-import compiler.decl_names
-import compiler.symtab_build
 import compiler.borrow_map
 
-#[doc("One function's borrow verdict: its bare name, declaring module, and borrowed positions.")]
-pub type BorrowDecl = BD(String, Option[String], [Int])
+#[doc("One function's borrow verdict: its identity and borrowed positions.")]
+pub type BorrowDecl = BD(FnId, [Int])
 
-#[doc("The borrow map as each calling module reads it; `foreign` serves a module that declares no function.")]
-pub type BorrowViews = { root_home: String, views: [ModView], foreign: BorrowMap }
+#[doc("The map of every verdict with a borrowed position, over the `seed` rows.")]
+pub fn bv_build(bds: [BorrowDecl], seed: [BorrowEntry]) : BorrowMap = bm_of(bv_rows(bds, seed))
 
-#[doc("One calling module's view: its module key and the borrow map its bodies read.")]
-pub type ModView = MV(String, BorrowMap)
-
-#[doc("Build the views from every function's verdict in program order. `root` names the root file's module; `seed` joins every view unchanged.")]
-pub fn bv_build(bds: [BorrowDecl], root: String, seed: [BorrowEntry]) : BorrowViews = {
-  let ix = bv_index(list_reverse(bds), idx_empty())
-  let shared = bm_of(bv_shared(bds, ix, root, seed))
-  let contested = bv_contested(bds, ix, [])
-  let keys = bv_module_keys(bds, root, [""])
-  BorrowViews {
-    root_home: root,
-    views: map(keys, (k) => MV(k, bm_extend(bv_view(contested, ix, Some(k), root), shared))),
-    foreign: bm_extend(bv_view(contested, ix, None, root), shared)
+fn bv_rows(bds: [BorrowDecl], acc: [BorrowEntry]) : [BorrowEntry] = match bds {
+  []                 -> acc
+  [BD(fid, ps), ...rest] -> match ps {
+    [] -> bv_rows(rest, acc)
+    _  -> bv_rows(rest, if sym_raw(fnid_sym(fid)) < 0 { acc } else { [BwE(bv_fid_key(fid), ps), ...acc] })
   }
 }
 
-#[doc("The borrow map a body declared in module `mo` reads.")]
-pub fn bv_for(v: BorrowViews, mo: Option[String]) : BorrowMap =
-  bv_find(v.views, bv_modkey(mo, v.root_home), v.foreign)
-
-#[doc("The borrow map the body of declaration `d` reads.")]
-pub fn bv_for_decl(v: BorrowViews, d: Decl) : BorrowMap = bv_for(v, bv_decl_mo(d))
-
-fn bv_decl_mo(d: Decl) : Option[String] = match d {
-  DFn(_, _, _, _, _, _, _, _, _, mo, _) -> mo
-  DTest(_, _, _, _, mo)                 -> mo
-  DBench(_, _, _, _, mo)                -> mo
-  DCheck(_, _, _, _, _, mo)             -> mo
-  _                                     -> None
-}
-
-fn bv_find(views: [ModView], k: String, fallback: BorrowMap) : BorrowMap = match views {
-  []           -> fallback
-  [v, ...rest] -> match v {
-    MV(vk, es) -> if vk == k { es } else { bv_find(rest, k, fallback) }
-  }
-}
-
-# The root file spells its module two ways: `None` on private helpers and
-# `Some(root)` on `pub` declarations. Both are the key "".
-fn bv_modkey(mo: Option[String], root: String) : String = match mo {
-  None    -> ""
-  Some(m) -> if m == root { "" } else { m }
-}
-
-fn bv_index(bds: [BorrowDecl], ix: NameIndex[BorrowDecl]) : NameIndex[BorrowDecl] = match bds {
-  []           -> ix
-  [b, ...rest] -> bv_index(rest, idx_prepend(ix, bv_name(b), b))
-}
-
-fn bv_name(b: BorrowDecl) : String = match b { BD(n, _, _) -> n }
-
-fn bv_positions(b: BorrowDecl) : [Int] = match b { BD(_, _, ps) -> ps }
-
-# Every declaration named `n`, in program order.
-fn bv_cands(ix: NameIndex[BorrowDecl], n: String) : [BorrowDecl] =
-  bv_named(idx_chain(ix, n), n)
-
-fn bv_named(chain: [BorrowDecl], n: String) : [BorrowDecl] = match chain {
-  []           -> []
-  [b, ...rest] -> if bv_name(b) == n { [b, ...bv_named(rest, n)] } else { bv_named(rest, n) }
-}
-
-fn bv_is_unique(cands: [BorrowDecl]) : Bool = match cands {
-  [_] -> true
-  _   -> false
-}
-
-# Id and module-qualified keys, plus the bare key of every uncontested name.
-fn bv_shared(bds: [BorrowDecl], ix: NameIndex[BorrowDecl], root: String,
-      acc: [BorrowEntry]) : [BorrowEntry] = match bds {
-  []           -> acc
-  [b, ...rest] -> bv_shared(rest, ix, root, bv_shared_of(b, ix, root, acc))
-}
-
-fn bv_shared_of(b: BorrowDecl, ix: NameIndex[BorrowDecl], root: String,
-      acc: [BorrowEntry]) : [BorrowEntry] = match b {
-  BD(n, mo, ps) -> match ps {
-    [] -> acc
-    _  -> {
-      let home = match mo { Some(m) -> m  None -> root }
-      let acc0 = [BwE(bv_id_key(sym_derive(NCFn, n, home)), ps), ...acc]
-      let acc1 = match mo {
-        None    -> acc0
-        Some(m) -> [BwE(concat_all([m, ".", n]), ps), ...acc0]
-      }
-      if bv_is_unique(bv_cands(ix, n)) { [BwE(n, ps), ...acc1] } else { acc1 }
-    }
-  }
-}
-
-#[doc("The borrow-map key of the declaration `s` names; no spelling can collide with it.")]
-pub fn bv_id_key(s: SymId) : String = string_concat("#", int_to_string(sym_raw(s)))
-
-# Names several declarations share, at least one of them borrowing.
-fn bv_contested(bds: [BorrowDecl], ix: NameIndex[BorrowDecl], acc: [String]) : [String] = match bds {
-  []           -> acc
-  [b, ...rest] -> {
-    let n = bv_name(b)
-    let hit = match bv_positions(b) {
-      [] -> false
-      _  -> not list_has(acc, n) and not bv_is_unique(bv_cands(ix, n))
-    }
-    bv_contested(rest, ix, if hit { [n, ...acc] } else { acc })
-  }
-}
-
-fn bv_module_keys(bds: [BorrowDecl], root: String, acc: [String]) : [String] = match bds {
-  []           -> acc
-  [b, ...rest] -> match b {
-    BD(_, mo, _) -> {
-      let k = bv_modkey(mo, root)
-      bv_module_keys(rest, root, if list_has(acc, k) { acc } else { [k, ...acc] })
-    }
-  }
-}
-
-# The rows a view adds: each contested name, as the calling module reads it.
-fn bv_view(contested: [String], ix: NameIndex[BorrowDecl], own: Option[String], root: String) : [BorrowEntry] = match contested {
-  []           -> []
-  [n, ...rest] -> {
-    let tail = bv_view(rest, ix, own, root)
-    match bv_winner(bv_cands(ix, n), own, root) {
-      [] -> tail
-      ps -> [BwE(n, ps), ...tail]
-    }
-  }
-}
-
-# The emitter's pick for a bare name: the calling module's own
-# declaration, else the root file's, else the first in program order.
-fn bv_winner(cands: [BorrowDecl], own: Option[String], root: String) : [Int] = {
-  let mine = match own { Some(k) -> bv_first_in(cands, k, root) None -> None }
-  match mine {
-    Some(ps) -> ps
-    None     -> match bv_first_in(cands, "", root) {
-      Some(ps) -> ps
-      None     -> bv_first_positions(cands)
-    }
-  }
-}
-
-fn bv_first_in(cands: [BorrowDecl], k: String, root: String) : Option[[Int]] = match cands {
-  []           -> None
-  [b, ...rest] -> match b {
-    BD(_, mo, ps) -> if bv_modkey(mo, root) == k { Some(ps) } else { bv_first_in(rest, k, root) }
-  }
-}
-
-fn bv_first_positions(cands: [BorrowDecl]) : [Int] = match cands {
-  []     -> []
-  [b, ..._] -> bv_positions(b)
+#[doc("The map key of the function instance `fid`; no spelling can collide with it.")]
+pub fn bv_fid_key(fid: FnId) : String = {
+  let k = string_concat("#", int_to_string(sym_raw(fnid_sym(fid))))
+  if fnid_inst(fid) == spec_none() { k } else { concat_all([k, "/", int_to_string(fnid_inst(fid))]) }
 }

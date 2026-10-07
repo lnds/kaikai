@@ -225,7 +225,7 @@ arguments:
   2. a declaration in the reader's own file;
   3. a name its selective imports pick (`import m.{f}`);
   4. a declaration of a module it imports;
-  5. a protocol operation (`show`, `cmp`, `min`, `add`, …);
+  5. a protocol operation (`show`, `cmp`, `min`, `add`, …): one the reader's own protocols declare, else one of a protocol its imports or the core declare, else any other module's;
   6. a function of a core module (`list.max`, `complex.add`);
   7. any other module that exports the name.
 
