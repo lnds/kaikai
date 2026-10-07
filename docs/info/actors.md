@@ -19,6 +19,11 @@ can be set per actor — `BlockSender` parks the sender on a full
 mailbox (backpressure). `receive()` is selective: future
 `receive_match { }` selects on pattern (deferred to Orongo).
 
+`send` takes its message type from the destination, not from the
+sender's `Msg`: `send[T](pid: Pid[T], msg: T)`. An actor with an
+`Actor[Reply]` mailbox sends a `Request` to a `Pid[Request]` without a
+`Request` mailbox of its own.
+
 A `send` to an actor that has ended succeeds and the message is
 dropped, as on the BEAM; use `Monitor` to learn that a peer is gone.
 
@@ -108,7 +113,9 @@ fn main() : Int = 0
 
 The handler needs a clause for each of the four ops, even the ones
 the code under test never calls. `receive`, `receive_timeout` and
-`send` can be scripted; `self` cannot — user code has no way to build
+`send` can be scripted; a `send` clause serves every message type, so
+it may count, drop or forward the message but not inspect it. `self`
+cannot — user code has no way to build
 a `Pid[Msg]`, and `Actor.self()` inside the clause has no handler to
 reach. Code that calls `Actor.self()` cannot be driven by a scripted
 mailbox.

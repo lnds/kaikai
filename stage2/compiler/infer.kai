@@ -7404,7 +7404,8 @@ fn record_op_res(r: Inferred, key: String, alias_opt: Option[String],
 # `eff` but unifiable ty_args dedup; labels with the same `eff` but
 # non-unifiable ty_args are kept distinct so a body can perform e.g.
 # `Reader[Int]` and `Reader[String]` and have both flow through.
-fn st_add_label(st: InferState, lab: Label, line: Int, col: Int) : InferState {
+fn st_add_label(st0: InferState, lab: Label, line: Int, col: Int) : InferState {
+  let st = st_set_row(st0, drop_phantom_twins(st0.row, lab))
   if label_present_unifiable(st.row, lab, st.sub) { st_set_row(st, label_settle_in(st.row, lab, st.sub)) }
   else {
     InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
@@ -9618,16 +9619,31 @@ fn ty_list_dischargeable(a: [Ty], b: [Ty], s: Subst) : Bool {
 # Merge two label lists, deduplicating by (eff name + unifiable
 # ty_args). Used when synth_handle stitches the outer row back with
 # the body's residual labels.
-fn merge_label_lists(a: [Label], b: [Label], sub: Subst) : [Label] {
+fn merge_label_lists(a0: [Label], b: [Label], sub: Subst) : [Label] {
   match b {
-    [] -> a
-    [h, ...rest] ->
+    [] -> a0
+    [h, ...rest] -> {
+      let a = drop_phantom_twins(a0, h)
       if label_present_unifiable(a, h, sub) {
         merge_label_lists(label_settle_in(a, h, sub), rest, sub)
       } else {
         merge_label_lists([h, ...a], rest, sub)
       }
+    }
   }
+}
+
+# A phantom label (every argument `TyAny`) only demands some instance of
+# its effect. It must not stand in for a sibling that pins one, so a pinning
+# label replaces it; a phantom joining a row with a sibling is dropped by the
+# dedup, which treats `TyAny` as unifiable.
+fn drop_phantom_twins(row: [Label], lab: Label) : [Label] =
+  if label_is_phantom(lab) { row }
+  else { filter(row, (h) => not (label_same(h, lab) and label_is_phantom(h))) }
+
+fn label_is_phantom(l: Label) : Bool = match l.ty_args {
+  []   -> false
+  args -> all(args, (t) => match t { TyAny -> true _ -> false })
 }
 
 # A hole gets a fresh TyVarT and records its source position and the
@@ -11049,14 +11065,15 @@ fn synth_op_call_with_scheme_keys(st: InferState, sc: TyScheme, args_: [Expr],
   # `kai_alias_<a>_id` local. Type-level lookups (op_eff_arities,
   # row label) still use the bare `lookup_key`.
   let inst = st_instantiate_report(st, sc)
+  let eff_fresh = take_first(inst.fresh, lookup_op_eff_arity(st.op_eff_arities, lookup_key))
+  # Read before unifying: the substitution's slots mutate in place.
+  let pinned = map(eff_fresh, (id) => occurs(id, inst.ty, inst.st.sub))
   let ra = synth_many(inst.st, args_)
   let rv = st_fresh_ty(ra.st)
   let expected = fn_ty(ra.tys, rv.ty)
   let st2 = st_unify(rv.st, inst.ty, expected, string_concat("op call ", lookup_key), line, col)
   let eff_n = dotted_prefix(lookup_key)
-  let eff_arity = lookup_op_eff_arity(st2.op_eff_arities, lookup_key)
-  let eff_fresh = take_first(inst.fresh, eff_arity)
-  let row_args = resolve_fresh_ids(eff_fresh, st2.sub)
+  let row_args = phantom_eff_args(eff_fresh, pinned, st2.sub)
   # tag the row label with the cell alias so two distinct
   # `with <eff> as <name>` cells stay distinct labels (see
   # `label_eff_with_alias`). The suffix is discharged symmetrically by
@@ -11121,6 +11138,17 @@ fn take_first(xs: [Int], n: Int) : [Int] {
 # Apply the substitution to a list of fresh-tyvar ids, producing the
 # resolved type for each. Avoids an inline lambda that would capture
 # the substitution and confuse stage 1's capture analyser.
+# An effect parameter the op's signature never mentions is not fixed by the
+# call (`Actor.send`): any instance of the effect serves it, so its label
+# argument is `TyAny`, which never pins the instance.
+fn phantom_eff_args(ids: [Int], pinned: [Bool], sub: Subst) : [Ty] = match ids {
+  [] -> []
+  [id, ...rest] -> match pinned {
+    [p, ...prest] -> [if p { apply_ty(sub, TyVarT(id)) } else { TyAny }, ...phantom_eff_args(rest, prest, sub)]
+    []            -> resolve_fresh_ids(ids, sub)
+  }
+}
+
 fn resolve_fresh_ids(ids: [Int], sub: Subst) : [Ty] {
   match ids {
     [] -> []
@@ -18961,8 +18989,8 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
             EU(_, uline, ucol) -> {
               let line = if uline >= 0 { uline } else { fline }
               let col  = if ucol  >= 0 { ucol  } else { fcol  }
-              let lab_str = label_display(st.env.head_owners,
-                                          label_to_string(apply_label_args(st.sub, lab)))
+              let applied = apply_label_args(st.sub, lab)
+              let lab_str = label_display(st.env.head_owners, label_diag_string(st.sub, applied))
               # Template 5 — missing effect. Header keeps the
               # legacy "effect not handled: <label>" wording so all
               # prior fixtures still match; the shape notes
@@ -18974,24 +19002,23 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
               let n1 = "`#{fname}`'s declared row does not include `#{lab_str}`"
               let n2 = "missing effect: `#{lab_str}`"
               let n3 = "enclosing row: #{render_declared_row(declared)}"
-              let h1 = "either declare `#{fname} : ... / #{lab_str}`, or wrap this call site in `handle { ... } with #{lab_str} { ... }`"
-              let h2 = "add `/ #{lab_str}` to `#{fname}`'s return type"
-              let h3 = "or wrap the call in `handle { ... } with #{lab_str} { ... }`"
+              let helps = if any(applied.ty_args, (t) => ty_is_free_var(st.sub, t)) {
+                ["replace each `_` in `#{lab_str}` with the instance `#{fname}` runs under, a concrete type or one of its type parameters, and declare it in `#{fname}`'s row"]
+              } else {
+                ["either declare `#{fname} : ... / #{lab_str}`, or wrap this call site in `handle { ... } with #{lab_str} { ... }`",
+                 "add `/ #{lab_str}` to `#{fname}`'s return type",
+                 "or wrap the call in `handle { ... } with #{lab_str} { ... }`"]
+              }
               diag_note(n1)
               diag_note(n2)
               diag_note(n3)
-              diag_help(h1)
-              diag_help(h2)
-              diag_help(h3)
+              foreach(helps, (h) => diag_help(h))
               # T5 collected diagnostic.
-              let related = [
+              let related = list_append([
                 ri_note(st.file, line, col, n1),
                 ri_note(st.file, line, col, n2),
-                ri_note(st.file, line, col, n3),
-                ri_help(st.file, line, col, h1),
-                ri_help(st.file, line, col, h2),
-                ri_help(st.file, line, col, h3)
-              ]
+                ri_note(st.file, line, col, n3)
+              ], map(helps, (h) => ri_help(st.file, line, col, h)))
               let d = mk_diag(SevError, st.file, line, col, header, related)
               st_bump_err(st_push_diag(st, d))
             }
@@ -19103,6 +19130,20 @@ pub fn label_display(owners: [HeadOwnerEntry], lab: String) : String = {
   if i < 0 { inf_tycon_display_ow(owners, lab) }
   else { string_concat(inf_tycon_display_ow(owners, string_slice(lab, 0, i)),
                        string_slice(lab, i, string_length(lab) - i)) }
+}
+
+# A type argument no use fixed shows as `_`: any instance serves the call.
+fn label_diag_string(s: Subst, l: Label) : String = match l.ty_args {
+  []   -> label_to_string(l)
+  args -> concat_all([strip_label_alias(l.eff), "[",
+                      inf_join_with(map(args, (t) => if ty_is_free_var(s, t) { "_" } else { inf_ty_to_string(t) }), ", "),
+                      "]"])
+}
+
+fn ty_is_free_var(s: Subst, t: Ty) : Bool = match t {
+  TyVarT(v) -> not subst_is_rigid(s, v)
+  TyAny     -> true
+  _         -> false
 }
 
 #[doc("infer: `label_to_string` — driver-facing type.")]
