@@ -1,0 +1,159 @@
+#[doc("""
+Whole-body read summaries, every name at once.
+
+Some Perceus questions are asked of a function's whole body for each of
+its binders: is a name read only as a bare argument in a borrowed slot,
+and how is each read reached — directly, behind a short circuit, or from
+a deferred body. Asked one name at a time, every binder walks the body
+again, which grows with the square of the function. These walks visit
+the body once and index what they find by name.
+""")]
+
+import compiler.ast
+import compiler.sym_read
+import compiler.expr_positions
+import compiler.perceus_reads
+import compiler.name_ix
+import compiler.lex
+import compiler.interp_span
+
+#[doc("A read outside lambdas, and whether it is a bare argument in a slot its callee borrows.")]
+pub type SlotRead = SR(String, Bool)
+
+#[doc("How a read is reached: directly, behind a short circuit, or from a deferred body (a lambda, a handler clause or an interpolation).")]
+pub type ReadRole = RDirect | RShort | RDeferred
+
+#[doc("A read of a name and how it is reached.")]
+pub type RoleRead = RoleR(String, ReadRole)
+
+#[doc("The reads outside lambdas of every name in `body`; `borrowed_at` gives the parameter slots a callee borrows.")]
+pub fn pbr_slot_reads(body: Expr, borrowed_at: (Expr) -> [Int]) : NameIx[SlotRead] =
+  ni_wrap(pbr_sr(body, borrowed_at, false, ni_buckets()))
+
+#[doc("True when `nm` is read outside lambdas and every such read is a bare argument in a borrowed slot.")]
+pub fn pbr_only_lent(ix: NameIx[SlotRead], nm: String) : Bool = pbr_lent_go(ni_bucket(ix, nm), nm, false)
+
+fn pbr_lent_go(rs: [SlotRead], nm: String, seen: Bool) : Bool = match rs {
+  [] -> seen
+  [SR(n, lent), ...rest] ->
+    if n != nm { pbr_lent_go(rest, nm, seen) } else if lent { pbr_lent_go(rest, nm, true) } else { false }
+}
+
+fn pbr_sr(e: Expr, borrowed_at: (Expr) -> [Int], lent: Bool, acc: Array[[SlotRead]]) : Array[[SlotRead]] / Mutable =
+  match sym_read_kind(e.kind) {
+    EVar(u)         -> ni_add(acc, u, SR(u, lent))
+    EStr(span, t3)  -> pbr_sr_names(pbr_interp_idents(span, t3), lent, acc)
+    ECall(f, xs)    -> pbr_sr_args(xs, borrowed_at(f), 0, borrowed_at, lent, pbr_sr(f, borrowed_at, lent, acc))
+    EIf(c, t, oe)   -> pbr_sr_opt(oe, borrowed_at, lent, pbr_sr(t, borrowed_at, lent, pbr_sr(c, borrowed_at, lent, acc)))
+    EMatch(s, arms) -> pbr_sr_arms(arms, borrowed_at, lent, pbr_sr(s, borrowed_at, lent, acc))
+    _               -> pbr_sr_ps(xp_positions_kind(e.kind), borrowed_at, lent, acc)
+  }
+
+fn pbr_sr_names(ns: [String], lent: Bool, acc: Array[[SlotRead]]) : Array[[SlotRead]] / Mutable = match ns {
+  [] -> acc
+  [n, ...rest] -> pbr_sr_names(rest, lent, ni_add(acc, n, SR(n, lent)))
+}
+
+# A bare variable in a borrowed slot is lent to the callee, not consumed;
+# a compound argument consumes its own reads while it is evaluated.
+fn pbr_sr_args(xs: [Expr], slots: [Int], i: Int, borrowed_at: (Expr) -> [Int], lent: Bool,
+               acc: Array[[SlotRead]]) : Array[[SlotRead]] / Mutable = match xs {
+  [] -> acc
+  [h, ...rest] -> {
+    let bare = match sym_read_kind(prc_peel_unit(h).kind) { EVar(_) -> true  _ -> false }
+    let here = lent or (bare and pbr_has(slots, i))
+    pbr_sr_args(rest, slots, i + 1, borrowed_at, lent, pbr_sr(h, borrowed_at, here, acc))
+  }
+}
+
+fn pbr_sr_opt(oe: Option[Expr], borrowed_at: (Expr) -> [Int], lent: Bool, acc: Array[[SlotRead]]) : Array[[SlotRead]] / Mutable =
+  match oe {
+    None    -> acc
+    Some(e) -> pbr_sr(e, borrowed_at, lent, acc)
+  }
+
+fn pbr_sr_arms(arms: [Arm], borrowed_at: (Expr) -> [Int], lent: Bool, acc: Array[[SlotRead]]) : Array[[SlotRead]] / Mutable =
+  match arms {
+    [] -> acc
+    [Arm(_, og, body), ...rest] ->
+      pbr_sr_arms(rest, borrowed_at, lent, pbr_sr(body, borrowed_at, lent, pbr_sr_opt(og, borrowed_at, lent, acc)))
+  }
+
+fn pbr_sr_ps(ps: [XPos], borrowed_at: (Expr) -> [Int], lent: Bool, acc: Array[[SlotRead]]) : Array[[SlotRead]] / Mutable =
+  match ps {
+    [] -> acc
+    [XP(r, c), ...rest] -> pbr_sr_ps(rest, borrowed_at, lent, match r {
+      XLam -> acc
+      _    -> pbr_sr(c, borrowed_at, lent, acc)
+    })
+  }
+
+fn pbr_has(xs: [Int], t: Int) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> h == t or pbr_has(rest, t)
+}
+
+#[doc("How every read in `body` is reached.")]
+pub fn pbr_role_reads(body: Expr) : NameIx[RoleRead] = ni_wrap(pbr_rr(body, RDirect, ni_buckets()))
+
+#[doc("`nm`'s direct reads, its reads behind a short circuit, and whether a deferred body or an interpolation mentions it.")]
+pub fn pbr_roles_of(ix: NameIx[RoleRead], nm: String) : (Int, Int, Bool) = pbr_roles_go(ni_bucket(ix, nm), nm, 0, 0, false)
+
+fn pbr_roles_go(rs: [RoleRead], nm: String, d: Int, s: Int, k: Bool) : (Int, Int, Bool) = match rs {
+  [] -> (d, s, k)
+  [RoleR(n, r), ...rest] ->
+    if n != nm { pbr_roles_go(rest, nm, d, s, k) }
+    else { match r {
+      RDirect   -> pbr_roles_go(rest, nm, d + 1, s, k)
+      RShort    -> pbr_roles_go(rest, nm, d, s + 1, k)
+      RDeferred -> pbr_roles_go(rest, nm, d, s, true)
+    } }
+}
+
+fn pbr_rr(e: Expr, role: ReadRole, acc: Array[[RoleRead]]) : Array[[RoleRead]] / Mutable = match sym_read_kind(e.kind) {
+  EVar(u)        -> ni_add(acc, u, RoleR(u, role))
+  EStr(span, t3) -> pbr_rr_names(pbr_interp_idents(span, t3), acc)
+  _              -> pbr_rr_ps(xp_positions(e), role, acc)
+}
+
+fn pbr_rr_names(ns: [String], acc: Array[[RoleRead]]) : Array[[RoleRead]] / Mutable = match ns {
+  [] -> acc
+  [n, ...rest] -> pbr_rr_names(rest, ni_add(acc, n, RoleR(n, RDeferred)))
+}
+
+# A deferred body taints every read beneath it, short circuits included.
+fn pbr_rr_ps(ps: [XPos], role: ReadRole, acc: Array[[RoleRead]]) : Array[[RoleRead]] / Mutable = match ps {
+  [] -> acc
+  [XP(r, c), ...rest] -> {
+    let inner = match role {
+      RDeferred -> RDeferred
+      _ -> match r {
+        XSc  -> RShort
+        XMsg -> RShort
+        XLam -> RDeferred
+        XCl  -> RDeferred
+        _    -> role
+      }
+    }
+    pbr_rr_ps(rest, role, pbr_rr(c, inner, acc))
+  }
+}
+
+# Every identifier token in the `#{...}` parts of a span, once per occurrence.
+fn pbr_interp_idents(span: String, is_triple: Bool) : [String] = pbr_ii_parts(isp_parts(span, is_triple), [])
+
+fn pbr_ii_parts(parts: [IPart], acc: [String]) : [String] = match parts {
+  []           -> acc
+  [p, ...rest] -> pbr_ii_parts(rest, match p {
+    IpLit(_, _) -> acc
+    IpExp(esrc) -> pbr_ii_toks(esrc, tokenize(esrc), acc)
+  })
+}
+
+fn pbr_ii_toks(esrc: String, toks: [Token], acc: [String]) : [String] = match toks {
+  []           -> acc
+  [t, ...rest] -> pbr_ii_toks(esrc, rest, match t.kind {
+    TkIdent -> [string_slice(esrc, t.start, t.length), ...acc]
+    _       -> acc
+  })
+}

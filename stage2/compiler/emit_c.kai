@@ -80,6 +80,7 @@ import compiler.perceus
 import compiler.borrow_view
 import compiler.borrow_map
 import compiler.perceus_payer
+import compiler.perceus_reads
 import compiler.protos
 import compiler.emit_shared
 import compiler.head_tag_decl
@@ -13126,7 +13127,7 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap)
         if not tcrec_has_tail_self_call(body, name, arity, mo, cons_ok) { d }
         else {
           let pnames = map(params, (p) => p.pname)
-          let uses = pcs_read_table(body, pnames)
+          let uses = pcs_use_index(body, pnames)
           {
             let c_sym_str = c_sym(name, mo)
             # Skip-set aligned with pcs_pass's wrap-skip decisions: the
@@ -13286,7 +13287,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
         if not has_direct and not is_trmc_inner { d }
         else {
           let pnames = map(params, (p) => p.pname)
-          let uses = pcs_read_table(inner, pnames)
+          let uses = pcs_use_index(inner, pnames)
           {
             let c_sym_str = c_sym(name, mo)
             # Skip-set aligned with pcs_pass's wrap-skip decisions —
@@ -13367,7 +13368,7 @@ fn tcrec_rebuild_pcs_ret_wrap(orig: Expr, before: [Stmt], new_inner: Expr,
 # Per-call-site dropmask: bit `i` is set iff param `i`'s payer is the exit
 # drop, which the goto jumps past. A never-read param is owned and paid by
 # the entry drop, which the goto re-runs.
-fn tcrec_compute_site_dropmask(params: [Param], uses: [Use], skip_set: [String],
+fn tcrec_compute_site_dropmask(params: [Param], uses: UseIx, skip_set: [String],
                                 i: Int, acc: Int) : Int {
   match params {
     [] -> acc
@@ -13395,7 +13396,7 @@ type TcrDm = TcrDm(Int, Int, Int)   # call-site line, col, drop mask
 # `tcrec_rewrite_kind` does, recording one TcrDm per self-tail-call site.
 fn tcrec_collect_dm_table(body: Expr, nm: String, arity: Int, own_mod: Option[String],
                           params: [Param], pnames: [String],
-                          uses: [Use],
+                          uses: UseIx,
                           scope: [String], hoisted: [Expr], acc: [TcrDm],
                           bmap: BorrowMap, base_mask: Int) : [TcrDm] =
   tcrec_collect_dm_kind(body.kind, nm, arity, own_mod, params, pnames, uses, scope, hoisted, acc, bmap, base_mask)
@@ -13405,7 +13406,7 @@ fn tcrec_collect_dm_table(body: Expr, nm: String, arity: Int, own_mod: Option[St
 # args — they ARE the call's arguments, evaluated one statement earlier — or
 # it flips at hoisted sites.
 fn tcrec_collect_dm_kind(k: ExprKind, nm: String, arity: Int, own_mod: Option[String],
-                         params: [Param], pnames: [String], uses: [Use],
+                         params: [Param], pnames: [String], uses: UseIx,
                          scope: [String], hoisted: [Expr],
                          acc: [TcrDm], bmap: BorrowMap, base_mask: Int) : [TcrDm] {
   match k {
@@ -13460,7 +13461,7 @@ fn tcrec_hoisted_arg_rhs(stmts: [Stmt], acc: [Expr]) : [Expr] {
 }
 
 fn tcrec_collect_dm_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], params: [Param],
-                         pnames: [String], uses: [Use],
+                         pnames: [String], uses: UseIx,
                          scope: [String], hoisted: [Expr], acc: [TcrDm],
                          bmap: BorrowMap, base_mask: Int) : [TcrDm] {
   match arms {
@@ -13801,7 +13802,7 @@ fn tcrec_split_pipe(s: String) : [String] = es_tcrec_split_pipe(s)
 # recursed into — they are non-tail and `emit_expr` evaluates
 # them normally on emit.
 fn tcrec_rewrite_body(body: Expr, nm: String, arity: Int, own_mod: Option[String], c_sym_str: String,
-                      params: [Param], pnames: [String], uses: [Use],
+                      params: [Param], pnames: [String], uses: UseIx,
                       dm_table: [TcrDm], skip_set: [String], scope: [String]) : Expr =
   Expr { kind: tcrec_rewrite_kind(body.kind, body.line, body.col, nm, arity, own_mod,
                                    c_sym_str, params, pnames, uses, dm_table, skip_set, scope),
@@ -13859,7 +13860,7 @@ fn trmc_find_ret_let_rhs(stmts: [Stmt], ret_name: String) : Option[Expr] {
 # tcrec uses, computed from the self-call's args; it reconciles
 # Perceus's exit-drops that the goto skips.
 fn trmc_rewrite_body(body0: Expr, nm: String, arity: Int, own_mod: Option[String], c_sym_str: String,
-                     params: [Param], pnames: [String], uses: [Use],
+                     params: [Param], pnames: [String], uses: UseIx,
                      dm_table: [TcrDm], skip_set: [String], scope: [String], cons_ok: Bool) : Expr {
   let body = trmc_unwrap_ret(body0)
   let out = Expr { kind: trmc_rewrite_kind(body.kind, body.line, body.col, nm, arity, own_mod,
@@ -13875,7 +13876,7 @@ fn trmc_rewrite_body(body0: Expr, nm: String, arity: Int, own_mod: Option[String
 # dropmask discipline stays single-sourced.
 fn trmc_make_step_call(cname: String, args: [Expr], h: Int, line: Int, col: Int,
                        c_sym_str: String, params: [Param], pnames: [String],
-                       uses: [Use], dm_table: [TcrDm], skip_set: [String]) : ExprKind {
+                       uses: UseIx, dm_table: [TcrDm], skip_set: [String]) : ExprKind {
   let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
   let self_e = trmc_expr_nth(args, h)
   let site_mask = match self_e {
@@ -13889,7 +13890,7 @@ fn trmc_make_step_call(cname: String, args: [Expr], h: Int, line: Int, col: Int,
 
 fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int, own_mod: Option[String],
                      c_sym_str: String, params: [Param], pnames: [String],
-                     uses: [Use], dm_table: [TcrDm], skip_set: [String], scope: [String], cons_ok: Bool) : ExprKind {
+                     uses: UseIx, dm_table: [TcrDm], skip_set: [String], scope: [String], cons_ok: Bool) : ExprKind {
   match k {
     EIf(c, t, opt_e) -> {
       let t1 = trmc_rewrite_body(t, nm, arity, own_mod, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, cons_ok)
@@ -13967,7 +13968,7 @@ fn trmc_wrap_apply(leaf: Expr) : ExprKind =
         [leaf])
 
 fn trmc_rewrite_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], c_sym_str: String,
-                     params: [Param], pnames: [String], uses: [Use],
+                     params: [Param], pnames: [String], uses: UseIx,
                      dm_table: [TcrDm], skip_set: [String], scope: [String], acc: [Arm], cons_ok: Bool) : [Arm] {
   match arms {
     [] -> list_reverse(acc)
@@ -13983,7 +13984,7 @@ fn trmc_rewrite_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String
 
 fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
                       own_mod: Option[String], c_sym_str: String, params: [Param], pnames: [String],
-                      uses: [Use], dm_table: [TcrDm], skip_set: [String], scope: [String]) : ExprKind {
+                      uses: UseIx, dm_table: [TcrDm], skip_set: [String], scope: [String]) : ExprKind {
   match k {
     ECall(f, xs) -> match sym_read_kind(f.kind) {
       EVar(callee) ->
@@ -14030,7 +14031,7 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
 # Plant the goto sentinel for one recognised self-call site (shared by
 # the bare-EVar and qualified-EModCall shapes).
 fn tcrec_make_step_site(f: Expr, xs: [Expr], params: [Param], pnames: [String],
-                        uses: [Use], dm_table: [TcrDm], skip_set: [String],
+                        uses: UseIx, dm_table: [TcrDm], skip_set: [String],
                         c_sym_str: String) : ExprKind {
   let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
   let site_mask = tcrec_lookup_dm(dm_table, f.line, f.col)
@@ -14043,7 +14044,7 @@ fn tcrec_make_step_site(f: Expr, xs: [Expr], params: [Param], pnames: [String],
 }
 
 fn tcrec_rewrite_arms(arms: [Arm], nm: String, arity: Int, own_mod: Option[String], c_sym_str: String,
-                      params: [Param], pnames: [String], uses: [Use],
+                      params: [Param], pnames: [String], uses: UseIx,
                       dm_table: [TcrDm], skip_set: [String], scope: [String], acc: [Arm]) : [Arm] {
   match arms {
     [] -> list_reverse(acc)
