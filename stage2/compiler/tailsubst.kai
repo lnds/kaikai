@@ -7,7 +7,8 @@ member's body to read those names instead.
 
 The fused entry's names are minted, not borrowed from any member, so
 the substitution cannot rename a read into a name one of that member's
-own locals already binds — which is why the walk needs no scope.
+own locals already binds. A local that reuses a parameter's name
+shadows it, so below that binder the name is no longer renamed.
 
 The walk is a plain structural substitution, and a form it does not
 descend into would leave a parameter read spelled the old way.
@@ -17,6 +18,7 @@ a body it rejects stays unfused rather than half-renamed.
 
 import compiler.ast
 import compiler.util
+import compiler.tailrename
 
 #[doc("Rewrite `body` so that reads of the parameters in `from` name the correspondingly positioned parameters in `to`. Positions that already agree are left alone, so a member whose parameter names match the lead's is returned untouched.")]
 pub fn tfsubst_rename_params(body: Expr, from: [Param], to: [Param]) : Expr =
@@ -81,27 +83,14 @@ fn tfsubst_stmt_walkable(s: Stmt) : Bool = match s {
   _               -> false
 }
 
-fn tf_rename_pairs(from: [Param], to: [Param]) : [[String]] {
-  match from {
-    [] -> []
-    [f, ...frest] -> match to {
-      [] -> []
-      [t, ...trest] ->
-        if f.pname == t.pname { tf_rename_pairs(frest, trest) }
-        else { [[f.pname, t.pname], ...tf_rename_pairs(frest, trest)] }
-      _ -> []
-    }
-    _ -> []
-  }
-}
 
 # ---- variable substitution -----------------------------------------
 
-fn tf_subst_vars(e: Expr, pairs: [[String]]) : Expr =
+fn tf_subst_vars(e: Expr, pairs: [Rename]) : Expr =
   if list_is_empty(pairs) { e }
   else { mk_expr(tf_subst_kind(e.kind, pairs), e.line, e.col) }
 
-fn tf_subst_kind(k: ExprKind, pairs: [[String]]) : ExprKind {
+fn tf_subst_kind(k: ExprKind, pairs: [Rename]) : ExprKind {
   match k {
     EVar(n) -> EVar(tf_subst_name(n, pairs))
     ESym(s, _, n) -> tf_subst_local(k, s, n, pairs)
@@ -111,7 +100,7 @@ fn tf_subst_kind(k: ExprKind, pairs: [[String]]) : ExprKind {
     EIf(c, t, opt_e) ->
       EIf(tf_subst_vars(c, pairs), tf_subst_vars(t, pairs), tf_subst_opt(opt_e, pairs))
     EMatch(s, arms) -> EMatch(tf_subst_vars(s, pairs), tf_subst_arms(arms, pairs))
-    EBlock(stmts, opt_tail) -> EBlock(tf_subst_stmts(stmts, pairs), tf_subst_opt(opt_tail, pairs))
+    EBlock(stmts, opt_tail) -> tf_subst_block(stmts, opt_tail, pairs, [])
     EField(a, fld) -> EField(tf_subst_vars(a, pairs), fld)
     EIndex(a, b) -> EIndex(tf_subst_vars(a, pairs), tf_subst_vars(b, pairs))
     _ -> k
@@ -120,50 +109,47 @@ fn tf_subst_kind(k: ExprKind, pairs: [[String]]) : ExprKind {
 
 # A renamed parameter becomes the fused function's own binder, which the
 # resolver never saw; any other reference keeps the identity it carries.
-fn tf_subst_local(k: ExprKind, s: SymId, n: String, pairs: [[String]]) : ExprKind = {
+fn tf_subst_local(k: ExprKind, s: SymId, n: String, pairs: [Rename]) : ExprKind = {
   let m = tf_subst_name(n, pairs)
   if sym_is_local(s) and m != n { EVar(m) } else { k }
 }
 
-fn tf_subst_opt(opt_e: Option[Expr], pairs: [[String]]) : Option[Expr] = match opt_e {
+fn tf_subst_opt(opt_e: Option[Expr], pairs: [Rename]) : Option[Expr] = match opt_e {
   None    -> None
   Some(e) -> Some(tf_subst_vars(e, pairs))
 }
 
-fn tf_subst_list(xs: [Expr], pairs: [[String]]) : [Expr] = match xs {
+fn tf_subst_list(xs: [Expr], pairs: [Rename]) : [Expr] = match xs {
   [] -> []
   [x, ...rest] -> [tf_subst_vars(x, pairs), ...tf_subst_list(rest, pairs)]
   _ -> []
 }
 
-fn tf_subst_arms(arms: [Arm], pairs: [[String]]) : [Arm] = match arms {
+fn tf_subst_arms(arms: [Arm], pairs: [Rename]) : [Arm] = match arms {
   [] -> []
-  [Arm(p, guard, body), ...rest] ->
-    [Arm(p, tf_subst_opt(guard, pairs), tf_subst_vars(body, pairs)),
+  [Arm(p, guard, body), ...rest] -> {
+    let inner = tf_unbind(pairs, pat_bindings(p, []))
+    [Arm(p, tf_subst_opt(guard, inner), tf_subst_vars(body, inner)),
      ...tf_subst_arms(rest, pairs)]
+  }
   _ -> []
 }
 
-fn tf_subst_stmts(stmts: [Stmt], pairs: [[String]]) : [Stmt] = match stmts {
-  [] -> []
-  [s, ...rest] -> [tf_subst_stmt(s, pairs), ...tf_subst_stmts(rest, pairs)]
-  _ -> []
+# A `let` rhs still reads the parameter it may shadow; the statements
+# after it read the new binding.
+fn tf_subst_block(stmts: [Stmt], tail: Option[Expr], pairs: [Rename], acc: [Stmt]) : ExprKind = match stmts {
+  [] -> EBlock(list_reverse(acc), tf_subst_opt(tail, pairs))
+  [s, ...rest] -> tf_subst_block(rest, tail, tf_stmt_unbind(s, pairs), [tf_subst_stmt(s, pairs), ...acc])
 }
 
-fn tf_subst_stmt(s: Stmt, pairs: [[String]]) : Stmt = match s {
+
+
+fn tf_subst_stmt(s: Stmt, pairs: [Rename]) : Stmt = match s {
   SLet(p, t, rhs)   -> SLet(p, t, tf_subst_vars(rhs, pairs))
   SExprStmt(e)      -> SExprStmt(tf_subst_vars(e, pairs))
   _                 -> s
 }
 
-fn tf_subst_name(n: String, pairs: [[String]]) : String = match pairs {
-  [] -> n
-  [pair, ...rest] -> match pair {
-    [from, to] -> if n == from { to } else { tf_subst_name(n, rest) }
-    _          -> tf_subst_name(n, rest)
-  }
-  _ -> n
-}
 
 # A body carrying a form the parameter substitution does not descend
 # into would keep a read spelled the old way once the fused entry
