@@ -278,10 +278,10 @@ run. On a new finding: reduce the program by hand, open one issue per
 distinct bug, and add its signature. The entry is deleted by the PR
 that closes the issue.
 
-**Cadence.** The `progen-diff` workflow runs nightly and on dispatch,
-never on a pull request. Its seed base is the UTC date, so every night
-covers new programs; a night with a new finding uploads the programs
-and opens that night's issue (label `progen-diff`). On every PR the
+**Cadence.** The `progen-diff` workflow runs weekly (Friday night,
+Chile time) and on dispatch, never on a pull request. Its seed base is
+the UTC date, so every run covers new programs; a run with a new
+finding uploads the programs and opens that run's issue (label `progen-diff`). On every PR the
 light target `test-progen-smoke` keeps the generator from rotting as
 the language changes: it must build, regenerate a pinned program byte
 for byte (`tools/progen-seed.expected`; refresh with
