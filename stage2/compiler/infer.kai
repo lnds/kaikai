@@ -7559,9 +7559,9 @@ pub type OpPayloadVars = OPV(String, SymId, [Int])  # eff name, its id, row ty_a
 #[derive(BinSerialize)]
 pub type OpResolution = OPR(String, String, [String], String, Option[String], Bool, Int, Int)
 
-# answer type + handler-state type for the currently-walked
-# clause body of a stateful handler.
-type ResumeBind = RB(Ty, Ty)
+# answer type, handler-state type and handle result type for the
+# currently-walked clause body of a stateful handler.
+type ResumeBind = RB(Ty, Ty, Ty)
 
 # first-use record per effect label in the current body.
 # `check_body_row` reads this when it needs to point a diagnostic
@@ -9288,17 +9288,18 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       # every clause name must be a declared op of `eff_name`.
       let st_out2 = check_clause_names(st_out_eff, eff_name, clauses, e.line, e.col)
       let stateful = match init_opt { Some(_) -> true None -> false }
-      let cs_typed = check_clauses_types(st_out2, eff_name, clauses,
-                                          stateful, init_typed_st.state_ty,
-                                          resolved_eff_tyargs)
-      let r_typed = check_return_clause_opt(cs_typed.st, ret_opt, rb.ty,
+      let r_typed = check_return_clause_opt(st_out2, ret_opt, rb.ty,
                                              stateful, init_typed_st.state_ty)
+      let cs_typed = check_clauses_types(r_typed.st, eff_name, clauses,
+                                          stateful, init_typed_st.state_ty,
+                                          resolved_eff_tyargs, r_typed.ty)
+      let hty = apply_ty(cs_typed.st.sub, r_typed.ty)
       let new_e = with_ty(
         mk_expr(EHandle(rb.expr, eff_name, hsym, eff_tyargs, init_typed_st.init_opt,
                          alias_opt, cs_typed.clauses, r_typed.ret_opt),
                 e.line, e.col),
-        r_typed.ty)
-      mk_inferred(r_typed.st, r_typed.ty, new_e)
+        hty)
+      mk_inferred(cs_typed.st, hty, new_e)
     }
     _ -> mk_inferred(st, TyAny, with_ty(e, TyAny))
   }
@@ -9382,16 +9383,18 @@ fn check_return_clause_opt(st: InferState, ret_opt: Option[HReturn],
 # task.
 type ClausesTyped = { st: InferState, clauses: [HClause] }
 
+# `result_ty` is the handle's type: what `resume` returns and what every
+# op clause evaluates to.
 fn check_clauses_types(st: InferState, eff_name: String, cs: [HClause],
                         stateful: Bool, state_ty: Option[Ty],
-                        eff_tyargs: [Ty]) : ClausesTyped / Console + File + Mutable =
+                        eff_tyargs: [Ty], result_ty: Ty) : ClausesTyped / Console + File + Mutable =
 
 
-  check_clauses_types_loop(st, eff_name, cs, stateful, state_ty, eff_tyargs, [])
+  check_clauses_types_loop(st, eff_name, cs, stateful, state_ty, eff_tyargs, result_ty, [])
 
 fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
                              stateful: Bool, state_ty: Option[Ty],
-                             eff_tyargs: [Ty], acc: [HClause]) : ClausesTyped / Console + File + Mutable {
+                             eff_tyargs: [Ty], result_ty: Ty, acc: [HClause]) : ClausesTyped / Console + File + Mutable {
 
 
   match cs {
@@ -9402,7 +9405,7 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
           let ft = check_finally_clause(st, op_name, params, body, line, col,
                                          stateful, state_ty)
           check_clauses_types_loop(ft.st, eff_name, rest, stateful, state_ty,
-                                    eff_tyargs, [ft.clause, ...acc])
+                                    eff_tyargs, result_ty, [ft.clause, ...acc])
         } else {
       {
         let outer = st
@@ -9423,7 +9426,7 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
         # concrete answer/state types so `resume(v)` / `resume(v, ns)`
         # are typechecked precisely.
         let bind_res = bind_clause_env_typed(st_arity, eff_name, op_name, params,
-                                              stateful, state_ty, eff_tyargs)
+                                              stateful, state_ty, eff_tyargs, result_ty)
         let sty = match state_ty { Some(t) -> t None -> TyAny }
         let env_bound = bind_res.st.env
         let env_with_sl = if stateful { add_state_aliases(env_bound, st.env, sty) } else { env_bound }
@@ -9432,7 +9435,7 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
         let st_resume = if stateful {
           match state_ty {
             Some(sv) -> st_set_clause_resume(st_env,
-              Some(RB(answer_resolved, sv)))
+              Some(RB(answer_resolved, sv, result_ty)))
             None -> st_env
           }
         } else { st_env }
@@ -9448,7 +9451,8 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
         # in `rewrite_alias_clause`.
         let st_clause_in = st_set_in_clause(st_disable_alias_tag(st_resume), clause_cont_of(params))
         let rb = synth(st_clause_in, body)
-        let st_out0 = st_restore_entries(outer, rb.st)
+        let st_res = st_unify(rb.st, result_ty, rb.ty, "handler clause result", line, col)
+        let st_out0 = st_restore_entries(outer, st_res)
         let st_out = st_set_clause_resume(st_out0, outer.clause_resume)
         # keep the typed body so the
         # alias-aware op resolution that fired inside `synth` (e.g.
@@ -9459,7 +9463,7 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
         # original `EField(EVar("Console"), "print")` shape.
         let new_clause = HC(op_name, params, rb.expr, line, col)
         check_clauses_types_loop(st_out, eff_name, rest, stateful, state_ty,
-                                  eff_tyargs, [new_clause, ...acc])
+                                  eff_tyargs, result_ty, [new_clause, ...acc])
       }
         }
     }
@@ -9508,7 +9512,7 @@ type ClauseBindRes = { st: InferState, answer_ty: Ty }
 
 fn bind_clause_env_typed(st: InferState, eff_name: String, op_name: String,
                           params: [Param], stateful: Bool,
-                          state_ty: Option[Ty], eff_tyargs: [Ty]) : ClauseBindRes / Console + File + Mutable {
+                          state_ty: Option[Ty], eff_tyargs: [Ty], result_ty: Ty) : ClauseBindRes / Console + File + Mutable {
 
 
   let key = string_concat(eff_name, string_concat(".", op_name))
@@ -9525,7 +9529,7 @@ fn bind_clause_env_typed(st: InferState, eff_name: String, op_name: String,
       match inst.ty {
         TyFnT(arg_tys, ret_ty, _) -> {
           let bound = bind_params_with_sig_typed(st_unified, params, arg_tys, ret_ty,
-                                                   stateful, state_ty)
+                                                   stateful, state_ty, result_ty)
           ClauseBindRes { st: bound, answer_ty: ret_ty }
         }
         _ -> ClauseBindRes { st: bind_params_lenient(st_unified, params), answer_ty: TyAny }
@@ -9558,17 +9562,17 @@ fn unify_eff_tparams(st: InferState, fresh: [Int], tys: [Ty],
 
 fn bind_params_with_sig_typed(st: InferState, params: [Param], arg_tys: [Ty],
                                 ret_ty: Ty, stateful: Bool,
-                                state_ty: Option[Ty]) : InferState / Console + File + Mutable {
+                                state_ty: Option[Ty], result_ty: Ty) : InferState / Console + File + Mutable {
   match params {
     []      -> st
-    [last]  -> bind_resume_param_typed(st, last, ret_ty, stateful, state_ty)
+    [last]  -> bind_resume_param_typed(st, last, ret_ty, stateful, result_ty)
     [p, ...rest] -> match arg_tys {
       []           -> bind_params_lenient(st, params)
       [a, ...rest_a] -> {
         let st_ann = check_clause_param_annotation(st, p, a)
         let env1 = ty_env_add(st_ann.env, p.pname, mono(a))
         bind_params_with_sig_typed(st_set_env(st_ann, env1), rest, rest_a, ret_ty,
-                                     stateful, state_ty)
+                                     stateful, state_ty, result_ty)
       }
     }
   }
@@ -9605,20 +9609,18 @@ fn ty_is_generic_slot(t: Ty) : Bool {
   }
 }
 
-# stateless clauses bind `resume : (answer_ty) -> ?fresh`.
+# stateless clauses bind `resume : (answer_ty) -> result_ty`.
 # Stateful clauses still bind `resume` to mono(TyAny) at the env
 # level (so name lookup succeeds and arity errors don't surface as
 # "unknown identifier"); the actual precise typing of `resume(v)` and
 # `resume(v, ns)` is performed by synth_call's special-case using the
 # st.clause_resume binding pushed by check_clauses_types.
 fn bind_resume_param_typed(st: InferState, p: Param, ret_ty: Ty,
-                            stateful: Bool, state_ty: Option[Ty]) : InferState {
+                            stateful: Bool, result_ty: Ty) : InferState {
   if stateful {
     st_set_env(st, ty_env_add(st.env, p.pname, mono(TyAny)))
   } else {
-    let f = st_fresh_ty(st)
-    let resume_ty = TyFnT([ret_ty], f.ty, inf_row_empty())
-    st_set_env(f.st, ty_env_add(f.st.env, p.pname, mono(resume_ty)))
+    st_set_env(st, ty_env_add(st.env, p.pname, mono(TyFnT([ret_ty], result_ty, inf_row_empty()))))
   }
 }
 
@@ -10580,9 +10582,9 @@ fn synth_resume_call(st: InferState, rb: ResumeBind, args_: [Expr],
 
 
   match rb {
-    RB(answer_ty, state_ty) -> {
+    RB(answer_ty, state_ty, result_ty) -> {
       let ra = synth_many(st, args_)
-      let rv = st_fresh_ty(ra.st)
+      let rv = ty_res(ra.st, result_ty)
       # st_unify treats the first arg as `expected` and the second as
       # `found`; the resume answer is what the clause must produce, so
       # answer_ty is the `expected` slot.

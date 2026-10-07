@@ -7547,7 +7547,7 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
     None     -> ""
   }
   let stateful = match init_opt { Some(_) -> true None -> false }
-  let ret_v = match ret_opt {
+  let exit = match ret_opt {
     Some(r) -> match r {
       HR(pname, rexpr, _, _) -> {
         # A stateful handler's return clause sees the state aliases too
@@ -7557,26 +7557,27 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
         # would shadow the user's binding in the same C block.
         let prologue = concat_all(map(live_state_aliases(stateful, cx.lcs),
                                       (nm) => "KaiValue *#{c_local(nm)} = _ev.state; "))
-        concat_all([
-          "KaiValue *", c_local(pname), " = _body_result; ",
-          prologue,
-          "KaiValue *_hr = ", emit_expr(src, rexpr, cx), "; "
-        ])
+        HandleExit {
+          decl: "KaiValue *_hr; ",
+          normal: concat_all(["{ KaiValue *", c_local(pname), " = _body_result; ", prologue,
+                              "_hr = ", emit_expr(src, rexpr, cx), "; } "]),
+          discard: "_hr = _discard; ",
+          merge: ""
+        }
       }
     }
-    None -> "KaiValue *_hr = _body_result; "
+    None -> HandleExit { decl: "", normal: "", discard: "_body_result = _discard; ",
+                         merge: "KaiValue *_hr = _body_result; " }
   }
   # Below the landing pad's mark: the references that outlive the handle
   # and the state slot, released only by an exit that passes the handle.
   let uw = emit_unw_handle(hline, hcol, stateful, cx)
   # The Ev owns its final state; both exits (normal and discard) meet
   # here, after the return clause has read it.
-  let ret_c = concat_all([ret_v, uw.pop, if stateful { "kai_decref(_ev.state); " } else { "" }, "_hr;"])
-  # m7a #6e: handle owns a jmp_buf and a discard-value slot. If a
-  # clause discards `resume`, the op-call site unwinds the evidence
-  # past this handle's node and longjmps here; the setjmp-else branch
-  # picks the discarded value as `_body_result` and the return clause
-  # runs as usual.
+  let ret_c = concat_all([exit.merge, uw.pop, if stateful { "kai_decref(_ev.state); " } else { "" }, "_hr;"])
+  # If a clause discards `resume`, the op-call site unwinds the evidence
+  # past this handle's node and longjmps here; the discarded value is
+  # the handle's result as is, so the return clause does not run.
   # Push uses the *_with_jmp variant so the op site can find the
   # jmp via the looked-up KaiEvidence node.
   # issue #501: `_discard` is volatile-qualified because it is a local
@@ -7613,6 +7614,7 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
     "jmp_buf _jmp; ",
     "KaiValue * volatile _discard = NULL; ",
     "KaiValue *_body_result; ",
+    exit.decl,
     alias_id_c,
     "if (setjmp(_jmp) == 0) { ",
       "kai_evidence_push_with_jmp(&_node, \"", eff_name, "\", &_ev, &_jmp, (KaiValue **) &_discard); ",
@@ -7620,8 +7622,9 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
       "_body_result = ", body_c, "; ",
       fin_c.run,
       "kai_evidence_pop(); ",
+      exit.normal,
     "} else { ",
-      "_body_result = _discard; ",
+      exit.discard,
     "} ",
     ret_c,
     " })"
@@ -7629,6 +7632,10 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
 }
 
 type Cleanup = { arm: String, run: String }
+
+# Where a handle's two exits meet. Only the normal exit passes through
+# the return clause; a discarded value is the handle's result as is.
+type HandleExit = { decl: String, normal: String, discard: String, merge: String }
 
 type UnwHandleC = { vars: String, state: String, pop: String }
 
