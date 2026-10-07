@@ -771,15 +771,29 @@ The first form still builds values, but the `e` slot resolves as an
 ordinary type parameter, and passing the value to a generic function
 fails to unify. Give the type a field whose row position mentions `e`.
 
-**Row-kind slots are not yet checked at a `fn` signature.** Inside
-the effect position of a function type, rows unify as specified —
-`() -> Unit / Beep` is rejected where `() -> Unit / Log` is expected.
-In a row-kind *slot* of a nominal type reached through a function
-signature, the slot is not resolved as a row: `Box[Beep]` is accepted
-where `Box[Log]` is expected, and even `Box[Int]` is accepted, with
-the unhandled effect surfacing at runtime instead of compile time.
-Ordinary type parameters of the same type are still checked. Tracked
-in #1542.
+**Records carry a row the same way.** A record whose function-typed
+field mentions a tparam after `/` has a row-kind slot, exactly as a
+sum constructor does:
+
+```kaikai
+type Hook[e] = { run: (Int) -> Unit / e }
+
+fn fire(h: Hook[Stdout], n: Int) : Unit / Stdout = h.run(n)
+```
+
+Every use of the record — a literal, a field read, a record pattern,
+a spread — instantiates a fresh row variable for the slot, shared by
+the head's `e` and the field's `/ e`. Reading `h.run` is pure;
+applying it raises `e` into the caller's row, so `fire` must declare
+`Stdout`. A spread builds a new literal, so `Hook { ...h, run: g }`
+may change the row. A record with no row-kind tparam keeps each
+field's row closed on its declared labels
+(`examples/effects/record_row_param.kai`).
+
+**Row-kind slots are invariant.** Unifying two carriers unifies their
+rows, so `Hook[Stdout]` is not accepted where `Hook[Stdout + Log]` is
+expected, nor `Box[Beep]` where `Box[Log]` is — there is no row
+subtyping (see *Out of scope*).
 
 ## Out of scope for v1
 
