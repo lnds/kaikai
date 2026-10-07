@@ -652,7 +652,7 @@ fn inf_resolve_ty_list(ts: [TypeExpr], hv: TyHomeView) : [Ty] =
 fn inf_resolve_ty_rk(t: TypeExpr, table: [RowKindEntry], hv: TyHomeView) : Ty {
   match t.tkind {
     TyName(name, targs) ->
-      match row_kind_slots_of(table, name) {
+      match row_kind_slots_of(table, name, hv) {
         [] -> inf_resolve_ty(t, hv)
         idxs -> tsh_tycon(hv, name, inf_resolve_args_rk(targs, idxs, 0, table, hv))
       }
@@ -3677,7 +3677,7 @@ fn head_slot_for(i: Int, rvar_ids: [Int]) : Ty =
 # a row carrier even when the surrounding fn never mentions `e` after a
 # `/` — the `from_list[t,e](xs:[t]) : Stream[t,e]` case, where the row
 # var is sourced, not threaded from an argument.
-pub type RowKindEntry = RKE(String, [Int])
+pub type RowKindEntry = RKE(String, [Int], SymId)
 
 # Build the per-type row-kind-slot table from the whole decl stream.
 fn compute_row_kind_slots(decls: [Decl]) : [RowKindEntry] {
@@ -3691,11 +3691,11 @@ fn compute_row_kind_slots(decls: [Decl]) : [RowKindEntry] {
 }
 
 fn row_kind_entry_of(d: Decl) : Option[RowKindEntry] = match d {
-  DType(_, name, tparams, body, _, _, _, _, _) -> {
+  DType(_, name, tparams, body, _, _, _, _, sid) -> {
     let row_names = row_names_of_typebody(body)
     match row_names {
       [] -> None
-      _  -> Some(RKE(name, row_kind_indices(tparams, row_names, 0)))
+      _  -> Some(RKE(name, row_kind_indices(tparams, row_names, 0), sid))
     }
   }
   _ -> None
@@ -3731,11 +3731,16 @@ fn row_kind_indices(tparams: [String], row_names: [String], i: Int) : [Int] = ma
 }
 
 # Row-kind slot indices declared for `name`, or [] if the type declares none.
-fn row_kind_slots_of(table: [RowKindEntry], name: String) : [Int] = match table {
+# The row-kind slots of the type `name` reaches from `hv`: a homonym
+# declared elsewhere has slots of its own.
+fn row_kind_slots_of(table: [RowKindEntry], name: String, hv: TyHomeView) : [Int] =
+  rk_slots_by(table, name, tsh_sym(hv, name))
+
+fn rk_slots_by(table: [RowKindEntry], name: String, s: SymId) : [Int] = match table {
   [] -> []
-  [e, ...rest] -> match e {
-    RKE(n, idxs) -> if n == name { idxs } else { row_kind_slots_of(rest, name) }
-  }
+  [RKE(n, idxs, es), ...rest] ->
+    if n == name and (sym_raw(s) < 0 or sym_raw(es) < 0 or sym_raw(es) == sym_raw(s)) { idxs }
+    else { rk_slots_by(rest, name, s) }
 }
 
 # Reject a nominal type whose ctor field uses an effect-row variable
@@ -4116,44 +4121,44 @@ fn collect_rvars_in_params(ps: [Param], acc: [String]) : [String] {
 # type (`e` in `from_list(...) : Stream[t, e]`), consulting the
 # per-type row-kind table. These join `collect_decl_rvars` so the row
 # var is bound + generalised even when it never appears after a `/`.
-fn collect_rowkind_args_decl(d: Decl, table: [RowKindEntry]) : [String] = match d {
+fn collect_rowkind_args_decl(d: Decl, table: [RowKindEntry], hv: TyHomeView) : [String] = match d {
   DFn(_, _, tparams, params, opt_ret, _, _, _, _, _, fsym) -> {
-    let a0 = collect_rowkind_args_params(params, table, tparams, [])
+    let a0 = collect_rowkind_args_params(params, table, tparams, [], hv)
     match opt_ret {
-      Some(rty) -> collect_rowkind_args_te(rty, table, tparams, a0)
+      Some(rty) -> collect_rowkind_args_te(rty, table, tparams, a0, hv)
       None      -> a0
     }
   }
   _ -> []
 }
 
-fn collect_rowkind_args_params(ps: [Param], table: [RowKindEntry], tparams: [String], acc: [String]) : [String] = match ps {
+fn collect_rowkind_args_params(ps: [Param], table: [RowKindEntry], tparams: [String], acc: [String], hv: TyHomeView) : [String] = match ps {
   [] -> acc
   [p, ...rest] -> {
     let a1 = match p.ptype {
-      Some(te) -> collect_rowkind_args_te(te, table, tparams, acc)
+      Some(te) -> collect_rowkind_args_te(te, table, tparams, acc, hv)
       None     -> acc
     }
-    collect_rowkind_args_params(rest, table, tparams, a1)
+    collect_rowkind_args_params(rest, table, tparams, a1, hv)
   }
 }
 
-fn collect_rowkind_args_te(t: TypeExpr, table: [RowKindEntry], tparams: [String], acc: [String]) : [String] = match t.tkind {
+fn collect_rowkind_args_te(t: TypeExpr, table: [RowKindEntry], tparams: [String], acc: [String], hv: TyHomeView) : [String] = match t.tkind {
   TyName(name, tas) -> {
-    let here = collect_rowkind_args_at(tas, row_kind_slots_of(table, name), 0, tparams, acc)
-    collect_rowkind_args_tes(tas, table, tparams, here)
+    let here = collect_rowkind_args_at(tas, row_kind_slots_of(table, name, hv), 0, tparams, acc)
+    collect_rowkind_args_tes(tas, table, tparams, here, hv)
   }
-  TyList(inner) -> collect_rowkind_args_te(inner, table, tparams, acc)
-  TyFn(ps, ret, _) -> collect_rowkind_args_te(ret, table, tparams, collect_rowkind_args_tes(ps, table, tparams, acc))
-  TyDim(base, _) -> collect_rowkind_args_te(base, table, tparams, acc)
-  TyRefine(base, _) -> collect_rowkind_args_te(base, table, tparams, acc)
+  TyList(inner) -> collect_rowkind_args_te(inner, table, tparams, acc, hv)
+  TyFn(ps, ret, _) -> collect_rowkind_args_te(ret, table, tparams, collect_rowkind_args_tes(ps, table, tparams, acc, hv), hv)
+  TyDim(base, _) -> collect_rowkind_args_te(base, table, tparams, acc, hv)
+  TyRefine(base, _) -> collect_rowkind_args_te(base, table, tparams, acc, hv)
   TyRow(_) -> acc
-  TySurface(ts) -> collect_rowkind_args_tes(tysurface_children(ts), table, tparams, acc)
+  TySurface(ts) -> collect_rowkind_args_tes(tysurface_children(ts), table, tparams, acc, hv)
 }
 
-fn collect_rowkind_args_tes(ts: [TypeExpr], table: [RowKindEntry], tparams: [String], acc: [String]) : [String] = match ts {
+fn collect_rowkind_args_tes(ts: [TypeExpr], table: [RowKindEntry], tparams: [String], acc: [String], hv: TyHomeView) : [String] = match ts {
   [] -> acc
-  [t, ...rest] -> collect_rowkind_args_tes(rest, table, tparams, collect_rowkind_args_te(t, table, tparams, acc))
+  [t, ...rest] -> collect_rowkind_args_tes(rest, table, tparams, collect_rowkind_args_te(t, table, tparams, acc, hv), hv)
 }
 
 # For each slot index in `idxs`, if that slot is a bare `TyName(n, [])`,
@@ -4277,7 +4282,7 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk: [
           # A name the view cannot settle stays empty, and
           # `tag_tycon_modules` stamps what is still bare post-typing.
           else { TyCon(tsh_slot(hv, name), name,
-                       resolve_tycon_args(tas, row_kind_slots_of(rk, name), 0, tpbinds, rbinds, rk, hv),
+                       resolve_tycon_args(tas, row_kind_slots_of(rk, name, hv), 0, tpbinds, rbinds, rk, hv),
                        tsh_sym(hv, name)) }
         }
       }
@@ -4486,7 +4491,7 @@ pub fn fn_scheme_of_decl(d: Decl, row_kind_table: [RowKindEntry],
       # call site fails to unify with `[Int], Int`. The implicit
       # set is appended to the declared one so explicit `[a]` still
       # wins on collisions; their ids form a contiguous block.
-      let rk_names = collect_rowkind_args_decl(d, row_kind_table)
+      let rk_names = collect_rowkind_args_decl(d, row_kind_table, hv)
       let names = list_append(collect_decl_rvars(d), rk_names)
       let rbinds = mk_rvbinds(names)
       let implicit = collect_implicit_tparams_in_decl(d, tparams)
@@ -5118,8 +5123,15 @@ type Subst = {
   # A var absent here is unconstrained. The abelian pivot consults
   # this before binding, so a habitant of one kind cannot bind a
   # tparam declared over another.
-  unit_var_kinds: [UVKind]
+  unit_var_kinds: [UVKind],
+  # the declared type parameters of the fn being typed: inside its body
+  # each is one unknown type, never bound to a concrete type or to
+  # another of them.
+  rigid: [RigidTv]
 }
+
+#[doc("infer: a declared type parameter's var id, its name and the fn declaring it, rigid inside that fn's body.")]
+pub type RigidTv = RigidTv(Int, String, String)
 
 #[doc("infer: a (unit-var id, kind name) constraint entry.")]
 pub type UVKind = UVK(Int, String)
@@ -5131,13 +5143,14 @@ fn subst_empty() : Subst = Subst {
   unit_slots: array_make(16, None),
   unit_fresh: 0,
   kind_theories: [],
-  unit_var_kinds: []
+  unit_var_kinds: [],
+  rigid: []
 }
 
 fn subst_seed_kind_theories(s: Subst, kts: [KindTheory]) : Subst = Subst {
   slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
   unit_slots: s.unit_slots, unit_fresh: s.unit_fresh, kind_theories: kts,
-  unit_var_kinds: s.unit_var_kinds
+  unit_var_kinds: s.unit_var_kinds, rigid: s.rigid
 }
 
 fn subst_unit_kind_lookup(s: Subst, v: Int) : Option[String] =
@@ -5156,7 +5169,7 @@ fn subst_add_unit_kind(s: Subst, v: Int, k: String) : Subst =
   else { Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
                  unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
                  kind_theories: s.kind_theories,
-                 unit_var_kinds: [UVK(v, k), ...s.unit_var_kinds] } }
+                 unit_var_kinds: [UVK(v, k), ...s.unit_var_kinds], rigid: s.rigid } }
 
 fn subst_add_unit_kinds(s: Subst, ids: [Int], kinds: [String]) : Subst {
   match ids {
@@ -5182,7 +5195,7 @@ fn subst_extend(s: Subst, v: Int, ty: Ty) : Subst / Mutable {
   let slots2 = array_set(slots1, v, Some(ty))
   Subst { slots: slots2, row_slots: s.row_slots, row_fresh: s.row_fresh,
           unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
-          kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds }
+          kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds, rigid: s.rigid }
 }
 
 # Row-var substitution (parallel to subst_lookup / subst_extend, but
@@ -5212,7 +5225,7 @@ fn subst_row_extend(s: Subst, v: Int, r: Row) : Subst / Mutable {
     let rs2 = array_set(rs1, v, Some(r))
     Subst { slots: s.slots, row_slots: rs2, row_fresh: s.row_fresh,
             unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
-            kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds }
+            kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds, rigid: s.rigid }
   }
 }
 
@@ -5224,7 +5237,7 @@ fn subst_fresh_row(s: Subst) : FreshRow {
   let id = s.row_fresh
   let s1 = Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: id + 1,
                    unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
-                   kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds }
+                   kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds, rigid: s.rigid }
   FreshRow { id: id, subst: s1 }
 }
 
@@ -5244,7 +5257,7 @@ fn subst_unit_extend(s: Subst, v: Int, u: UnitExprT) : Subst / Mutable {
   let us2 = array_set(us1, v, Some(u))
   Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
           unit_slots: us2, unit_fresh: s.unit_fresh,
-          kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds }
+          kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds, rigid: s.rigid }
 }
 
 type FreshUnit = { id: Int, subst: Subst }
@@ -5253,7 +5266,7 @@ fn subst_fresh_unit(s: Subst) : FreshUnit {
   let id = s.unit_fresh
   let s1 = Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
                    unit_slots: s.unit_slots, unit_fresh: id + 1,
-                   kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds }
+                   kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds, rigid: s.rigid }
   FreshUnit { id: id, subst: s1 }
 }
 
@@ -6733,11 +6746,15 @@ fn unify_env(env: TyEnv, t1: Ty, t2: Ty, s: Subst) : Option[Subst] / Mutable {
       TyAny -> Some(s)
       _ -> match a {
         TyVarT(n) -> match b {
-          TyVarT(m) -> if n == m { Some(s) } else { Some(subst_extend(s, n, b)) }
-          _ -> if occurs(n, b, s) { None } else { Some(subst_extend(s, n, b)) }
+          TyVarT(m) -> if n == m { Some(s) }
+                       else if subst_is_rigid(s, n) {
+                         if subst_is_rigid(s, m) { None } else { Some(subst_extend(s, m, a)) }
+                       }
+                       else { Some(subst_extend(s, n, b)) }
+          _ -> if subst_is_rigid(s, n) or occurs(n, b, s) { None } else { Some(subst_extend(s, n, b)) }
         }
         _ -> match b {
-          TyVarT(m) -> if occurs(m, a, s) { None } else { Some(subst_extend(s, m, a)) }
+          TyVarT(m) -> if subst_is_rigid(s, m) or occurs(m, a, s) { None } else { Some(subst_extend(s, m, a)) }
           # a shape application on the right is normalised to the left so
           # the single `TyShapeApp` arm in `unify_heads` handles both
           # directions symmetrically.
@@ -6748,6 +6765,45 @@ fn unify_env(env: TyEnv, t1: Ty, t2: Ty, s: Subst) : Option[Subst] / Mutable {
       }
     }
   }
+}
+
+# The declared type parameters among `binds`: a unit or shape parameter
+# ranges over its own kind and stays flexible.
+# An annotation written in a body: the enclosing fn's declared type
+# parameters name their own vars there, as they do in its signature.
+fn st_annot_ty(st: InferState, te: TypeExpr) : Ty = match st.sub.rigid {
+  [] -> inf_resolve_ty_rk(te, st.env.row_kind, st_home_view(st))
+  rs -> resolve_ty_with_binds(te, rigid_binds(rs), [], st.env.row_kind, st_home_view(st))
+}
+
+fn st_annot_labels(st: InferState, ls: [RowLabel]) : [Label] = match st.sub.rigid {
+  [] -> inf_row_labels_of_rls(ls, st_home_view(st))
+  rs -> row_labels_of_rls_with_binds(ls, rigid_binds(rs), [], st_home_view(st))
+}
+
+fn rigid_binds(rs: [RigidTv]) : [TPBind] = map(rs, (r) => match r { RigidTv(i, n, _) -> TPB(n, i) })
+
+fn rigid_tparams(binds: [TPBind], declared: [String], owner: String) : [RigidTv] =
+  rigid_first_each(binds, declared, owner, [])
+
+# A name bound twice keeps its first id, the one the body's lookups find.
+fn rigid_first_each(binds: [TPBind], declared: [String], owner: String, acc: [RigidTv]) : [RigidTv] = match binds {
+  [] -> list_reverse(acc)
+  [TPB(n, i), ...rest] ->
+    if list_has(declared, n) and not tp_kind_is_unit(n) and not tp_kind_is_shape(n)
+       and not any(acc, (r) => match r { RigidTv(_, m, _) -> m == tp_strip_kind(n) }) {
+      rigid_first_each(rest, declared, owner, [RigidTv(i, tp_strip_kind(n), owner), ...acc])
+    } else { rigid_first_each(rest, declared, owner, acc) }
+}
+
+fn subst_with_rigid(s: Subst, rs: [RigidTv]) : Subst =
+  Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: s.row_fresh,
+          unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
+          kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds, rigid: rs }
+
+fn subst_is_rigid(s: Subst, v: Int) : Bool = match s.rigid {
+  [] -> false
+  rs -> any(rs, (r) => match r { RigidTv(i, _, _) -> i == v })
 }
 
 # peel a stack of TyRefineT wrappers down to the base type.
@@ -7039,7 +7095,7 @@ fn mk_fresh_row_subst(rvars: [Int], s: Subst) : FreshRowSubst / Mutable {
                else { Subst { slots: s.slots, row_slots: s.row_slots,
                               row_fresh: need,
                               unit_slots: s.unit_slots, unit_fresh: s.unit_fresh,
-                              kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds } }
+                              kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds, rigid: s.rigid } }
   mk_fresh_row_subst_loop(rvars, subst_empty(), s_seed)
 }
 
@@ -7068,7 +7124,7 @@ fn mk_fresh_unit_subst(uvars: [Int], s: Subst) : FreshUnitSubst / Mutable {
                else { Subst { slots: s.slots, row_slots: s.row_slots,
                               row_fresh: s.row_fresh,
                               unit_slots: s.unit_slots, unit_fresh: need,
-                              kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds } }
+                              kind_theories: s.kind_theories, unit_var_kinds: s.unit_var_kinds, rigid: s.rigid } }
   mk_fresh_unit_subst_loop(uvars, subst_empty(), s_seed, [])
 }
 
@@ -7082,7 +7138,7 @@ fn advance_row_fresh(st: InferState, n: Int) : InferState {
     let s1 = Subst { slots: st.sub.slots, row_slots: st.sub.row_slots,
                      row_fresh: st.sub.row_fresh + n,
                      unit_slots: st.sub.unit_slots, unit_fresh: st.sub.unit_fresh,
-                     kind_theories: st.sub.kind_theories, unit_var_kinds: st.sub.unit_var_kinds }
+                     kind_theories: st.sub.kind_theories, unit_var_kinds: st.sub.unit_var_kinds, rigid: st.sub.rigid }
     st_set_sub(st, s1)
   }
 }
@@ -7095,7 +7151,7 @@ fn advance_unit_fresh(st: InferState, n: Int) : InferState {
     let s1 = Subst { slots: st.sub.slots, row_slots: st.sub.row_slots,
                      row_fresh: st.sub.row_fresh,
                      unit_slots: st.sub.unit_slots, unit_fresh: st.sub.unit_fresh + n,
-                     kind_theories: st.sub.kind_theories, unit_var_kinds: st.sub.unit_var_kinds }
+                     kind_theories: st.sub.kind_theories, unit_var_kinds: st.sub.unit_var_kinds, rigid: st.sub.rigid }
     st_set_sub(st, s1)
   }
 }
@@ -8104,16 +8160,56 @@ fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : I
       # accept it after the symmetric `unify` failed, with no
       # substitution side-effects: the runtime layout is identical.
       if union_upcast_ok(st.env, a1, b1) { st }
-      else {
+      else { match rigid_forced(st, a, b) {
+        Some(msg) -> {
+          let help = "bound the parameter with the protocol it needs, or make the parameter a concrete type"
+          diag_error(st.file, line, col, msg)
+          diag_help(help)
+          st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, line, col, msg, [ri_help(st.file, line, col, help)])))
+        }
+        None -> {
         let d = mk_diag(SevError, st.file, line, col, "type mismatch in #{what}", [])
         render_diag(d)
         emit_union_aware_notes(st.env, a1, b1)
         emit_type_hint(a1, b1)
         st_bump_err(st_push_diag(st, d))
-      }
+        }
+      } }
     }
   }
 }
+
+# Why `a` and `b` fail to unify when only a declared type parameter's
+# rigidity stops them: the parameter the unification would have bound,
+# and what to.
+fn rigid_forced(st: InferState, a: Ty, b: Ty) : Option[String] / Mutable = match st.sub.rigid {
+  [] -> None
+  rs -> match unify_env(st.env, a, b, subst_with_rigid(st.sub, [])) {
+    None     -> None
+    Some(s2) -> rigid_first_bound(st, rs, rs, s2)
+  }
+}
+
+fn rigid_first_bound(st: InferState, rs: [RigidTv], all: [RigidTv], s2: Subst) : Option[String] = match rs {
+  [] -> None
+  [RigidTv(i, n, owner), ...rest] -> match apply_ty(s2, TyVarT(i)) {
+    TyVarT(j) -> match rigid_named(all, j, i) {
+      Some(o) -> Some(rigid_text(n, owner, concat_all(["`", o, "`"])))
+      None    -> rigid_first_bound(st, rest, all, s2)
+    }
+    t -> Some(rigid_text(n, owner, concat_all(["`", inf_ty_to_string_ow(st.env.head_owners, t), "`"])))
+  }
+}
+
+# Another rigid parameter `j` resolves to, other than `self`.
+fn rigid_named(rs: [RigidTv], j: Int, self: Int) : Option[String] = match rs {
+  [] -> None
+  [RigidTv(i, n, _), ...rest] -> if i == j and i != self { Some(n) } else { rigid_named(rest, j, self) }
+}
+
+fn rigid_text(name: String, owner: String, what: String) : String =
+  concat_all(["type parameter `", name, "` of `", owner, "` is not ", what,
+              ": inside the body it stands for any type its callers choose"])
 
 # Template 1 — best-effort callee-name + argument-index
 # augmentation for `type mismatch in function call`. Called after the
@@ -8661,7 +8757,7 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
 
 fn param_ty_or_fresh(st: InferState, pm: Param) : TyRes {
   match pm.ptype {
-    Some(te) -> ty_res(st, inf_resolve_ty(te, st_home_view(st)))
+    Some(te) -> ty_res(st, st_annot_ty(st, te))
     None     -> st_fresh_ty(st)
   }
 }
@@ -9028,7 +9124,7 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
 fn synth_variants_of(st: InferState, ty_expr: TypeExpr, e: Expr) : Inferred / Console + File {
 
 
-  let ty = inf_resolve_ty(ty_expr, st_home_view(st))
+  let ty = st_annot_ty(st, ty_expr)
   match ty {
     TyCon(tm, name, _, tsym) -> {
       let vc = check_variants_nullary(st.env, name)
@@ -9132,7 +9228,7 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
           Some(t) -> [t]
           None    -> []
         }
-        _ -> inf_resolve_ty_list(eff_tyargs, st_home_view(st))
+        _ -> map(eff_tyargs, (t) => st_annot_ty(st, t))
       }
       # A `with Eff as a` binding makes `a` a first-class capability value of
       # type `Eff[ty_args]` so it can be passed as a call argument (§6 named
@@ -9477,7 +9573,7 @@ fn check_clause_param_annotation(st: InferState, p: Param,
     Some(te) ->
       if ty_is_generic_slot(declared) { st }
       else {
-        st_unify(st, inf_resolve_ty(te, st_home_view(st)), apply_ty(st.sub, declared),
+        st_unify(st, st_annot_ty(st, te), apply_ty(st.sub, declared),
                   "handler clause parameter annotation", p.pline, p.pcol)
       }
   }
@@ -14446,7 +14542,7 @@ fn synth_let_rhs_or_mint(st: InferState, rhs: Expr, te: TypeExpr,
 
 fn mint_let_textual(st: InferState, rhs: Expr, te: TypeExpr,
                     line: Int, col: Int) : Inferred / Console + File + Mutable {
-  let expected = apply_ty(st.sub, inf_resolve_ty_rk(te, st.env.row_kind, st_home_view(st)))
+  let expected = apply_ty(st.sub, st_annot_ty(st, te))
   match mint_literal(rhs, expected, mint_bigint_home(st.env)) {
     MintOk(e2) -> {
       let ty = match e2.ty { Some(t) -> t None -> expected }
@@ -14590,24 +14686,24 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
       let rr = match ann {
         Some(te) -> match sym_local_kind(rhs.kind) {
           EMatch(_, _) -> {
-            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, st_home_view(amb_st))
+            let exp_resolved = st_annot_ty(amb_st, te)
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           EIf(_, _, _) -> {
-            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, st_home_view(amb_st))
+            let exp_resolved = st_annot_ty(amb_st, te)
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           # Fix B: route EList through bidirectional check so element
           # literals can be retagged to Byte when expected is [Byte]
           # (and a Vec annotation mints the literal to a vec build).
           EList(_) -> {
-            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, st_home_view(amb_st))
+            let exp_resolved = st_annot_ty(amb_st, te)
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           # a Vec-annotated map-pipe chain collects into the vec
           # (pre-sized when the head is a pure range).
           EMapPipe(_, _) -> {
-            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, st_home_view(amb_st))
+            let exp_resolved = st_annot_ty(amb_st, te)
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           # route ECall/EVar with annotation
@@ -14615,11 +14711,11 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
           # qualified `<parent>::<cname>` matches the annotation
           # resolves to the qualified scheme.
           ECall(_, _) -> {
-            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, st_home_view(amb_st))
+            let exp_resolved = st_annot_ty(amb_st, te)
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           EVar(_) -> {
-            let exp_resolved = inf_resolve_ty_rk(te, amb_st.env.row_kind, st_home_view(amb_st))
+            let exp_resolved = st_annot_ty(amb_st, te)
             check_expr_against(amb_st, rhs, exp_resolved, ann_label, pat.line, pat.col)
           }
           # a bare numeric literal coins directly to the annotated carrier
@@ -14638,20 +14734,20 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
       let minted = match ann {
         None -> MintedExpr { st: rr.st, pair: ExprTy { expr: rr.expr, ty: rr.ty } }
         Some(te) -> maybe_mint_literal(rr.st, rr.expr, rr.ty,
-                                       apply_ty(rr.st.sub, inf_resolve_ty_rk(te, rr.st.env.row_kind, st_home_view(rr.st))),
+                                       apply_ty(rr.st.sub, st_annot_ty(rr.st, te)),
                                        pat.line, pat.col)
       }
       let lower_pair = minted.pair
       let binding_st = match ann {
         None -> minted.st
         Some(te) -> {
-          let declared = inf_resolve_ty_rk(te, minted.st.env.row_kind, st_home_view(minted.st))
+          let declared = st_annot_ty(minted.st, te)
           st_unify(minted.st, declared, lower_pair.ty, ann_label, pat.line, pat.col)
         }
       }
       let binding_ty0 = match ann {
         None -> lower_pair.ty
-        Some(te) -> inf_resolve_ty_rk(te, rr.st.env.row_kind, st_home_view(rr.st))
+        Some(te) -> st_annot_ty(rr.st, te)
       }
       # The fixed-width inline representation is an optimisation of a
       # LITERAL: a `let x : Vec[e]<n> = [ ... ]` binds a flat aggregate.
@@ -14868,7 +14964,7 @@ fn check_narrow_pattern(st: InferState, name: String, ty_expr: TypeExpr,
                          expected: Ty, line: Int, col: Int) : InferState / Console + File {
 
 
-  let narrow_ty = inf_resolve_ty(ty_expr, st_home_view(st))
+  let narrow_ty = st_annot_ty(st, ty_expr)
   let scrut_now = apply_ty(st.sub, expected)
   match scrut_now {
     TyUnion(parts) -> if ty_list_contains(parts, narrow_ty) {
@@ -17829,7 +17925,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # `from_list(...) : Stream[t, e]` case) so the body walk's rbinds
       # match the registered scheme's; consult `env.row_kind`.
       let rbinds = mk_rvbinds(list_append(collect_decl_rvars(d),
-                                          collect_rowkind_args_decl(d, env.row_kind)))
+                                          collect_rowkind_args_decl(d, env.row_kind, env_home_view(env, mo))))
       # pick up implicit lowercase tparams the
       # signature uses but did not declare in `[…]`, matching the
       # set fn_scheme_of_decl built into the registered scheme.
@@ -17892,7 +17988,8 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
         st_set_sub(st0b0, subst_add_unit_kinds(st0b0.sub,
           range_ids(0, unit_tpcount), tparam_unit_kinds(effective_tparams)))
       } else { st0b0 }
-      let added = add_infer_params_with_binds(st0b, ps, tpbinds, rbinds)
+      let st0r = st_set_sub(st0b, subst_with_rigid(st0b.sub, rigid_tparams(tpbinds, tparams, nm)))
+      let added = add_infer_params_with_binds(st0r, ps, tpbinds, rbinds)
       # when the user omits the return-type
       # annotation, infer it from the body's actual type. The
       # `fn x() = expr` form (and `fn x() { ... last_expr }`) signals
@@ -18162,9 +18259,9 @@ fn infer_const_body(file: String, env: TyEnv, core_len: Int,
   let st_init = st_set_sums(st_init1, sums)
   let rr = synth_let_rhs_or_mint(st_init, cbody, cte, line, col)
   let minted = maybe_mint_literal(rr.st, rr.expr, rr.ty,
-                                  apply_ty(rr.st.sub, inf_resolve_ty_rk(cte, rr.st.env.row_kind, st_home_view(rr.st))),
+                                  apply_ty(rr.st.sub, st_annot_ty(rr.st, cte)),
                                   line, col)
-  let declared = inf_resolve_ty_rk(cte, minted.st.env.row_kind, st_home_view(minted.st))
+  let declared = st_annot_ty(minted.st, cte)
   let st2c = st_unify(minted.st, declared, minted.pair.ty, "const annotation", line, col)
   let hd = drain_deferred_homs(st2c, list_reverse(st2c.deferred_homs), [])
   let st2 = hd.st
@@ -18554,7 +18651,7 @@ fn check_body_row(st: InferState, fname: String, declared: RowExpr,
       # The body-vs-declared subset check is still the primary check;
       # this added pass surfaces the unhandled top-level row.
       let st1 = check_body_row_label_loop(st, fname, st.row,
-                                            inf_row_labels_of_rls(lbs, st_home_view(st)),
+                                            st_annot_labels(st, lbs),
                                             line, col)
       if fname == "main" {
         check_main_row_handlable(st1, st.row, line, col, decls)
