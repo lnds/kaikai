@@ -53,6 +53,7 @@ import compiler.ast
 import compiler.effect_alias_scope
 import compiler.diag_file
 import compiler.native_prims
+import compiler.core_prims
 import compiler.modules
 import compiler.symtab
 import compiler.symtab_build
@@ -188,125 +189,21 @@ fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env / Console + File {
   env_mark_err(e)
 }
 
-# ---- core seeding (kept in sync with stage 0's PRELUDE) ----
+# ---- core seeding ----
 
 #[doc("Canonical list of built-in value names pre-bound in every program's outermost scope.")]
-pub fn core_names() : [String] {
-  let base = [
-    "print", "eprint", "write_stdout", "read_file", "write_file",
-    "file_exists", "file_delete", "file_rename",
-    # binary file IO.
-    "file_read_bytes", "file_write_bytes",
-    # fs/dir operations.
-    "dir_list_dir", "dir_create_dir", "dir_remove_dir", "dir_walk",
-    "read_line", "read_bytes", "args",
-    "program_name", "core_program_name", "stdlib_path", "abspath",
-    "exit", "panic",
-    "int_to_string", "real_to_string", "string_to_int", "string_to_real",
-    "int_to_real", "real_to_int",
-    # Byte nominal primitive surface.
-    "int_to_byte", "byte_to_int", "byte_add", "byte_sub", "byte_eq", "byte_lt", "byte_to_string",
-    # Fixed-width integer primitive surface (numeric lane A).
-    "int32_to_string", "uint32_to_string", "uint64_to_string", "int128_to_string",
-    "int_to_int32", "int_to_uint32", "int_to_uint64", "int_to_int128",
-    "int32_to_int", "uint32_to_int", "uint64_to_int", "int128_to_int",
-    # libm bindings
-    "real_sqrt", "real_cbrt", "real_exp", "real_log", "real_log2", "real_log10",
-    "real_sin", "real_cos", "real_tan",
-    "real_asin", "real_acos", "real_atan",
-    "real_sinh", "real_cosh", "real_tanh",
-    "real_signum", "real_is_nan", "real_is_inf",
-    "real_pow", "real_atan2", "real_rem",
-    "string_length", "string_concat", "string_concat_all", "string_join",
-    "string_split", "string_contains", "char_at",
-    "string_slice", "char_to_int", "int_to_char", "int_to_byte_string",
-    "string_byte_at_int", "string_cp_at", "string_cp_len", "string_reverse", "string_hash", "real_bits", "int_to_le4", "int_to_le8",
-    "bytes_blit", "bytes_put_le", "bytes_get_le", "bytes_put_string", "bytes_get_string",
-    "list_length", "list_append", "list_reverse",
-    "map", "filter", "reduce", "each",
-    "array_make", "array_empty", "array_length", "array_get", "array_set", "array_grow",
-    # Vec[T] pure value vector — flat buffer, uniqueness in-place / CoW.
-    "vec_make", "vec_empty", "vec_length", "vec_get", "vec_set", "vec_push",
-    # Vec slices + collection: `[h, ...t]` / `xs[a..b]` desugar to
-    # `vec_tail_from` / `vec_slice`; literal minting and pipeline
-    # collect build via `vec_reserve` / `vec_from_list`.
-    "vec_slice", "vec_tail_from", "vec_reserve", "vec_from_list",
-    # Borrow variants (issue #1120) — synthesised by the Perceus pass for
-    # read-only accesses; listed so the native emitter routes them to the
-    # `kaix_core_*_borrow` shim (never written by the user).
-    "array_length_borrow", "array_get_borrow",
-    "vec_length_borrow", "vec_get_borrow",
-    # bit operations on Int. Compiler intrinsics — each call lowers
-    # to the corresponding C operator (`<<`, `>>`, `&`, `|`, `^`, `~`)
-    # in `emit_call_value`, mirroring the `unit_name` / `__strip_unit`
-    # pattern. Listed here so the closure-capture analyser does not
-    # promote them to free vars when used inside a lambda body.
-    "bit_and", "bit_or", "bit_xor", "bit_not",
-    "bit_shl", "bit_shr", "bit_ushr",
-    "bit_count", "bit_test",
-    "bit_set", "bit_clear", "bit_toggle",
-    # mailbox runtime exposed as core functions; user-facing
-    # API lives in stdlib/actor.kai's `with_mailbox` helper.
-    # The bounded variant takes (cap: Int, overflow_code: Int).
-    "mailbox_alloc", "mailbox_alloc_bounded",
-    "mailbox_send", "mailbox_recv", "mailbox_recv_timeout", "mailbox_free",
-    # spawn_actor primitives — alloc-without-owner-stamp +
-    # owner reassignment so a parent fiber can hand a mailbox to
-    # the spawned fiber and have it observably owned by the child.
-    # The bounded variant serves spawn_actor_policy.
-    "mailbox_alloc_unowned", "mailbox_alloc_bounded_unowned",
-    "mailbox_assign_owner", "spawn_actor_fiber",
-    "Some", "None", "Ok", "Err",
-    # The dup the perceus pass synthesises after inference, listed so the
-    # closure-capture analyser does not treat it as a free var to capture
-    # inside a lambda body (which would emit an undeclared C symbol). The
-    # drop travels as a mark and no longer needs the entry, but the two
-    # share this literal.
-    "__perceus_dup", "__perceus_drop",
-    # Perceus reuse-in-place magic names. The recogniser
-    # `pcs_recognise_reuse_*` synthesises calls to these from
-    # constructor-after-deconsume patterns. The emitter lowers them to
-    # `kai_reuse_or_alloc_<shape>` runtime helpers that branch on the
-    # consumed cell's RC: in-place rewrite when unique, fall back to a
-    # fresh allocation when shared.
-    "__perceus_reuse_cons",
-    "__perceus_reuse_record",
-    "__perceus_reuse_variant",
-    # `unitless` is not in the user-visible core: implemented as an
-    # emit-time identity special case (no kai_core_unitless runtime
-    # fn), first-class use (`x |> unitless`, `let f = unitless`) crashed
-    # at C compile. The emit special cases were repurposed for
-    # `__strip_unit`, the typer-internal erasure intrinsic that the
-    # parametric `impl Show for Real[u: Measure]` body uses to feed
-    # `Real<u>` into `real_to_string : Real -> String`.
-    # `unit_name`: compile-time unit reflection; emitter lowers to a
-    # constant String literal.
-    "unit_name",
-    # typer-internal erasure of the unit annotation on a dimensioned
-    # Real. NOT for user code — the `__` prefix marks it as a
-    # compiler-generated name. Used by the parametric Show impl in
-    # stdlib/protocols.kai.
-    "__strip_unit",
-    # typer-internal unit tag/untag over any carrier, identity at
-    # runtime. `stdlib/money.kai` routes runtime Decimals in and out
-    # of `Decimal<c>` through these.
-    "__attach_unit",
-    "__detach_unit",
-    # typer-internal fixed-width `Vec[e]<n>` codegen intrinsics: the
-    # literal builds a flat inline aggregate; the static-index read is a
-    # bare struct field load with the bounds proved at compile time; the
-    # dynamic read is the same load behind a bounds check.
-    "__fixed_vec_lit",
-    "__fixed_vec_get",
-    "__fixed_vec_get_dyn"
-  ]
-  # Pre-bind the in-process libLLVM C-API prim names so the native
-  # backend can call them. Generated from `rcore_table` to
-  # stay in lockstep with the typer scheme + C forwarder. No user
-  # program names these, so this only widens the core for the
-  # compiler's own native-backend code.
-  list_append(base, native_prim_names())
-}
+pub fn core_names() : [String] =
+  list_append(core_builtin_names(), list_append(core_reserved_names(), native_prim_names()))
+
+# Names no program declares but every scope must know, so the closure-capture
+# analyser never takes one for a free variable: the core constructors and the
+# calls passes synthesise after inference.
+fn core_reserved_names() : [String] = [
+  "Some", "None", "Ok", "Err",
+  "__perceus_dup", "__perceus_drop",
+  "__perceus_reuse_cons", "__perceus_reuse_record", "__perceus_reuse_variant",
+  "__fixed_vec_lit", "__fixed_vec_get", "__fixed_vec_get_dyn"
+]
 
 #[doc("Add every name in `names` to the current (top) scope of `e`.")]
 pub fn add_all(e: Env, names: [String]) : Env =
