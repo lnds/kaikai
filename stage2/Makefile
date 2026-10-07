@@ -12111,8 +12111,8 @@ test-tco-param-shadow: $(TARGET) build
 	  || { echo "tco-param-shadow DIFF"; diff ../examples/tco/param_shadow_rebind.out.expected build/tco-param-shadow.out; exit 1; }
 
 # A fused group's member order is its tag order and names the fused
-# function, so each member's (fused function, tag) is pinned, and the
-# fused program still runs.
+# function, so each member's (fused function, tag) is pinned, as is one
+# fused entry's slots, and the fused program still runs.
 test-tco-fuse-order: $(TARGET) build
 	@set -e; \
 	for f in mutual_fuse_order_ring3 mutual_fuse_order_ring5 mutual_fuse_order_branches; do \
@@ -12123,13 +12123,21 @@ test-tco-fuse-order: $(TARGET) build
 	  ./build/tco-$$f > build/tco-$$f.out; \
 	  diff ../examples/tco/$$f.out.expected build/tco-$$f.out || { echo "tco-fuse-order DIFF ($$f output)"; exit 1; }; \
 	done; \
-	for f in mutual_module_homonym; do \
+	for f in mutual_module_homonym mutual_fuse_arg_order; do \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/tco/$$f.kai > build/tco-$$f.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-$$f.c -o build/tco-$$f $(LDLIBS_M) ; \
 	  ./build/tco-$$f > build/tco-$$f.out; \
 	  diff ../examples/tco/$$f.out.expected build/tco-$$f.out || { echo "tco-fuse-order DIFF ($$f output)"; exit 1; }; \
 	done; \
-	echo "tco-fuse-order OK (fused member order and output)"
+	for f in mutual_fuse_slot_layout; do \
+	  $(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/$$f.kai > build/tco-$$f.c; \
+	  grep -E '^(KAI_CONST )?static [^=]*kaiu___kai_fused_[A-Za-z0-9_]*\(.*\);$$' build/tco-$$f.c | grep -v '_thunk(' > build/tco-$$f.proto; \
+	  diff ../examples/tco/$$f.proto.expected build/tco-$$f.proto || { echo "tco-fuse-order DIFF ($$f slots)"; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-$$f.c -o build/tco-$$f $(LDLIBS_M) ; \
+	  ./build/tco-$$f > build/tco-$$f.out; \
+	  diff ../examples/tco/$$f.out.expected build/tco-$$f.out || { echo "tco-fuse-order DIFF ($$f output)"; exit 1; }; \
+	done; \
+	echo "tco-fuse-order OK (fused member order, slots and output)"
 
 # A string literal with 200K escapes compiles: decoding it must run in
 # constant stack on both backends.
