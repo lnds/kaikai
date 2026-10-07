@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install clang, and libLLVM when called with `llvm`, on a CI runner.
-# A runner image that already carries them skips apt entirely; otherwise
+# A runner image that already carries clang skips apt for the C-only case;
 # every apt call is bounded and retried, so a wedged mirror fails this step
 # by name in minutes instead of burning the job ceiling as `cancelled`.
 set -eu
@@ -12,20 +12,10 @@ find_llvm_config() {
   command -v llvm-config 2>/dev/null || ls /usr/bin/llvm-config-* 2>/dev/null | sort -V | tail -1
 }
 
-major() { sed -n 's/[^0-9]*\([0-9][0-9]*\)\..*/\1/p' | head -1; }
-
-# libLLVM must not be older than clang: it reads the bitcode clang emits.
-llvm_usable() {
-  lc=$(find_llvm_config) || return 1
-  [ -n "$lc" ] || return 1
-  [ -f "$("$lc" --includedir)/llvm-c/Core.h" ] || return 1
-  ls "$("$lc" --libdir)"/libLLVM*.so >/dev/null 2>&1 || return 1
-  [ "$("$lc" --version | major)" = "$(clang --version | major)" ]
-}
-
+# The native case always installs llvm-dev: the native gates depend on what
+# that package provides, and the LLVM the runner image carries fails them.
 have_toolchain() {
-  command -v clang >/dev/null 2>&1 || return 1
-  [ "$want_llvm" = 0 ] || llvm_usable
+  [ "$want_llvm" = 0 ] && command -v clang >/dev/null 2>&1
 }
 
 apt_retry() {
