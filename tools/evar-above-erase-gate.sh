@@ -29,11 +29,13 @@ SRC="$ROOT/stage2/compiler"
 #   surface_lower,
 #   modules, type_scope, effect_scope(_ids), const_pattern, refinements,
 #   refine_enforce, vec_surface, protos, json_derive, layout_derive,
-#   fmt_expr, tailfuse, tailsubst, pipe_fusion, resolve
+#   fmt_expr, tailfuse, pipe_fusion, resolve
 #   infer            — mints calls to runtime primitives (`array_get`,
 #                      `vec_slice`) that no user declaration backs.
 #   refine_coerce    — the binder a refinement check just bound, and
 #                      the `__strip_unit` primitive.
+#   tailids          — a fused member's read of the slot the fused entry
+#                      binds; no declaration backs it.
 #   index_coll       — the typer's placeholder for an indexed collection;
 #                      bound and spliced away before the typer returns.
 #   monomorph        — the callee of a specialisation it just created;
@@ -52,7 +54,7 @@ SRC="$ROOT/stage2/compiler"
 #   resolve_sym_test
 ALLOW='ast|parse|desugar|surface_lower|modules|type_scope|effect_scope|effect_scope_ids'
 ALLOW="$ALLOW|const_pattern|refinements|refine_enforce|vec_surface|protos"
-ALLOW="$ALLOW|json_derive|layout_derive|fmt_expr|tailfuse|tailsubst"
+ALLOW="$ALLOW|json_derive|layout_derive|fmt_expr|tailfuse|tailids"
 ALLOW="$ALLOW|pipe_fusion|resolve|infer|monomorph|fwd_inline"
 ALLOW="$ALLOW|closure_spec_ast|closure_spec_emit|sym_read"
 ALLOW="$ALLOW|emit_tcrec_live|cache_delta_test|resolve_sym_test"
