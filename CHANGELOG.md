@@ -84,6 +84,48 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.134.0 (2026-10-07)
+
+### BREAKING CHANGE
+
+- implicit narrowing of a refinement inside a generic type
+(`[Int]` to `[Pos]`, `Option[Int]` to `Option[Pos]`, ...) is a compile
+error, as is widening through an invariant type (`Array[Pos]` to
+`Array[Int]`) or passing a function whose parameter is narrower than the
+expected one.
+- a value stored into a refined record field, constructor
+payload, list element or var is now checked; a refuting literal fails to
+compile and any other unproven value panics at runtime.
+- a generic fn whose body only typechecked by fixing a
+declared type parameter to a concrete type is rejected. Bound the
+parameter with the protocol the body needs, or make it concrete.
+- `Numeric` no longer declares `add` or `mul`. An
+`impl Numeric for X` that defines them is rejected; move them to
+`impl Add for X` and `impl Mul for X`, and bound generic code that adds
+or multiplies with `+ Add` / `+ Mul` beside `Numeric`.
+
+### Fixed
+
+- **native**: declare every runtime entry with its C prototype (#2554)
+- **typer**: no implicit narrowing of a refinement inside a generic type (#2553)
+- **compiler**: keep lifted closures and fused stage calls distinct per site (#2549)
+- **perceus**: release a boxed binder whose last read copies its payload out (#2550)
+- **compiler**: decide every callee after the resolver by identity (#2548)
+- **compiler**: stop renaming a fused member's parameter where a local shadows it (#2547)
+- **compiler**: check a value wherever it flows into a refined type (#2546)
+- **typer**: keep a declared type parameter rigid inside its body (#2544)
+- **perceus**: release what a function owns when `!` returns early (#2543)
+- **compiler**: fuse a mutual tail-call group whose members take different parameters (#2541)
+- **protocols**: let a generic binop reach its operator protocol once its operand is concrete (#2537)
+- **stdlib**: declare a ring's `add` and `mul` once, in the operator protocols (#2534)
+
+### Changed
+
+- **compiler**: find an interpolation opener without allocating per byte (#2555)
+- **compiler**: look a function up by its C symbol through an index (#2552)
+- **perceus**: decide every binder's last-use move in one walk of the body (#2542)
+- **perceus**: answer per-name read questions from an index built once per function (#2535)
+
 ## v0.133.0 (2026-10-06)
 
 ### BREAKING CHANGE
