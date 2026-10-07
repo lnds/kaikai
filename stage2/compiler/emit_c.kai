@@ -13138,7 +13138,7 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap)
             let borrowed_ps = pcs_explicit_borrow_names(params)
             let skip_set = pcs_list_union(borrowed_ps,
                              tcrec_widen_skip_raw_reads(pnames, body,
-                               pcs_branch_aware_skip_params(pnames, body, bmap)))
+                               pcs_branch_aware_skip_params(pnames, body, bmap), bmap))
             # The base mask feeds the per-site table so the borrowed-arg
             # rule never re-adds a bit rules 1+2 already set.
             let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
@@ -13292,7 +13292,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
             let borrowed_ps = pcs_explicit_borrow_names(params)
             let skip_set = pcs_list_union(borrowed_ps,
                              tcrec_widen_skip_raw_reads(pnames, inner,
-                               pcs_branch_aware_skip_params(pnames, inner, bmap)))
+                               pcs_branch_aware_skip_params(pnames, inner, bmap), bmap))
             let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
             let dm_table = tcrec_collect_dm_table(inner, SelfRef(fsym, name), arity, params,
                                                    pnames, uses, [], [], [],
@@ -13546,167 +13546,186 @@ fn tcrec_all_reads_ps(ps: [XPos], p: String) : Int = match ps {
 # get the goto-block drop — the drop and the wrap must pair or RC
 # double-counts. Widening only (never removes a derived skip entry), so
 # a read this walker cannot see (interp strings) keeps today's mask.
-fn tcrec_widen_skip_raw_reads(pnames: [String], body: Expr, skip: [String]) : [String] {
+fn tcrec_widen_skip_raw_reads(pnames: [String], body: Expr, skip: [String], bm: BorrowMap) : [String] {
   match pnames {
     [] -> skip
     [h, ...rest] -> {
       let skip1 =
-        if not list_has(skip, h) and tcrec_expr_raw_read(body, h) { [h, ...skip] }
+        if not list_has(skip, h) and tcrec_expr_raw_read(body, h, bm) { [h, ...skip] }
         else { skip }
-      tcrec_widen_skip_raw_reads(rest, body, skip1)
+      tcrec_widen_skip_raw_reads(rest, body, skip1, bm)
     }
   }
 }
 
 # Lambda bodies are excluded: closure captures are RC'd separately, and
 # the dropmask's lambda story lives in the LUBlocked arm.
-fn tcrec_expr_raw_read(e: Expr, p: String) : Bool =
-  tcrec_kind_raw_read(e.kind, p)
+fn tcrec_expr_raw_read(e: Expr, p: String, bm: BorrowMap) : Bool =
+  tcrec_kind_raw_read(e.kind, p, bm)
 
-fn tcrec_kind_raw_read(k: ExprKind, p: String) : Bool {
+fn tcrec_kind_raw_read(k: ExprKind, p: String, bm: BorrowMap) : Bool {
   match k {
     EVar(nm) -> nm == p
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
-        if callee == "__perceus_dup" { tcrec_dup_arg_raw_read(xs, p) }
+        if callee == "__perceus_dup" { tcrec_dup_arg_raw_read(xs, p, bm) }
         else if callee == p { true }
-        else { tcrec_args_raw_read(xs, p) }
+        else { tcrec_args_raw_read(tcrec_owned_args(xs, tcrec_borrowed_slots(bm, f), 0), p, bm) }
       _ ->
-        if tcrec_expr_raw_read(f, p) { true } else { tcrec_args_raw_read(xs, p) }
+        if tcrec_expr_raw_read(f, p, bm) { true } else { tcrec_args_raw_read(xs, p, bm) }
     }
-    EIntrinsic(_, xs) -> tcrec_args_raw_read(xs, p)
-    ESurface(sf) -> tcrec_args_raw_read(surface_children(sf), p)
+    EIntrinsic(_, xs) -> tcrec_args_raw_read(xs, p, bm)
+    ESurface(sf) -> tcrec_args_raw_read(surface_children(sf), p, bm)
     EBinop(_, l, r) ->
-      if tcrec_expr_raw_read(l, p) { true } else { tcrec_expr_raw_read(r, p) }
-    EUnop(_, x) -> tcrec_expr_raw_read(x, p)
-    EField(x, _) -> tcrec_expr_raw_read(x, p)
+      if tcrec_expr_raw_read(l, p, bm) { true } else { tcrec_expr_raw_read(r, p, bm) }
+    EUnop(_, x) -> tcrec_expr_raw_read(x, p, bm)
+    EField(x, _) -> tcrec_expr_raw_read(x, p, bm)
     EIndex(x, i) ->
-      if tcrec_expr_raw_read(x, p) { true } else { tcrec_expr_raw_read(i, p) }
+      if tcrec_expr_raw_read(x, p, bm) { true } else { tcrec_expr_raw_read(i, p, bm) }
     EIf(c, t, opt_e) ->
-      if tcrec_expr_raw_read(c, p) { true }
-      else if tcrec_expr_raw_read(t, p) { true }
+      if tcrec_expr_raw_read(c, p, bm) { true }
+      else if tcrec_expr_raw_read(t, p, bm) { true }
       else { match opt_e {
         None -> false
-        Some(e2) -> tcrec_expr_raw_read(e2, p)
+        Some(e2) -> tcrec_expr_raw_read(e2, p, bm)
       } }
     EMatch(s, arms) ->
-      if tcrec_expr_raw_read(s, p) { true }
-      else { tcrec_arms_raw_read(arms, p) }
+      if tcrec_expr_raw_read(s, p, bm) { true }
+      else { tcrec_arms_raw_read(arms, p, bm) }
     EBlock(stmts, opt_tail) ->
-      if tcrec_stmts_raw_read(stmts, p) { true }
+      if tcrec_stmts_raw_read(stmts, p, bm) { true }
       else { match opt_tail {
         None -> false
-        Some(e) -> tcrec_expr_raw_read(e, p)
+        Some(e) -> tcrec_expr_raw_read(e, p, bm)
       } }
-    EList(elems) -> tcrec_elems_raw_read(elems, p)
+    EList(elems) -> tcrec_elems_raw_read(elems, p, bm)
     ERange(lo, hi, opt_by) ->
-      if tcrec_expr_raw_read(lo, p) { true }
-      else if tcrec_expr_raw_read(hi, p) { true }
+      if tcrec_expr_raw_read(lo, p, bm) { true }
+      else if tcrec_expr_raw_read(hi, p, bm) { true }
       else { match opt_by {
         None -> false
-        Some(e) -> tcrec_expr_raw_read(e, p)
+        Some(e) -> tcrec_expr_raw_read(e, p, bm)
       } }
-    ERecordLit(_, fis) -> tcrec_fields_raw_read(fis, p)
+    ERecordLit(_, fis) -> tcrec_fields_raw_read(fis, p, bm)
     EPipe(l, r) ->
-      if tcrec_expr_raw_read(l, p) { true } else { tcrec_expr_raw_read(r, p) }
+      if tcrec_expr_raw_read(l, p, bm) { true } else { tcrec_expr_raw_read(r, p, bm) }
     EMapPipe(l, r) ->
-      if tcrec_expr_raw_read(l, p) { true } else { tcrec_expr_raw_read(r, p) }
+      if tcrec_expr_raw_read(l, p, bm) { true } else { tcrec_expr_raw_read(r, p, bm) }
     EFlatMapPipe(l, r) ->
-      if tcrec_expr_raw_read(l, p) { true } else { tcrec_expr_raw_read(r, p) }
+      if tcrec_expr_raw_read(l, p, bm) { true } else { tcrec_expr_raw_read(r, p, bm) }
     EFilterPipe(l, r) ->
-      if tcrec_expr_raw_read(l, p) { true } else { tcrec_expr_raw_read(r, p) }
-    EBang(inner) -> tcrec_expr_raw_read(inner, p)
-    ELitUnit(inner, _) -> tcrec_expr_raw_read(inner, p)
+      if tcrec_expr_raw_read(l, p, bm) { true } else { tcrec_expr_raw_read(r, p, bm) }
+    EBang(inner) -> tcrec_expr_raw_read(inner, p, bm)
+    ELitUnit(inner, _) -> tcrec_expr_raw_read(inner, p, bm)
     _ -> false
   }
 }
 
+# Perceus has already renamed a borrowing prim to its `_borrow` variant,
+# which lends slot 0.
+fn tcrec_borrowed_slots(bm: BorrowMap, f: Expr) : [Int] = {
+  let key = pcs_callee_key(f)
+  if any(core_borrowing_prims(), (p) => cat2(p, "_borrow") == key) { [0] } else { pcs_borrow_lookup(bm, key) }
+}
+
+# A bare read in a borrowed slot lends, so it hands nothing on.
+fn tcrec_owned_args(xs: [Expr], borrowed: [Int], i: Int) : [Expr] = match xs {
+  []           -> []
+  [x, ...rest] -> {
+    let tl = tcrec_owned_args(rest, borrowed, i + 1)
+    match x.kind {
+      EVar(_) -> if pcs_has_int(borrowed, i) { tl } else { [x, ...tl] }
+      _       -> [x, ...tl]
+    }
+  }
+}
+
 # `__perceus_dup(x)` shields a bare-var read; a composite arg recurses.
-fn tcrec_dup_arg_raw_read(xs: [Expr], p: String) : Bool {
+fn tcrec_dup_arg_raw_read(xs: [Expr], p: String, bm: BorrowMap) : Bool {
   match xs {
     [a] -> match a.kind {
       EVar(_) -> false
       ESym(_, _, _) -> false
-      _       -> tcrec_expr_raw_read(a, p)
+      _       -> tcrec_expr_raw_read(a, p, bm)
     }
-    _ -> tcrec_args_raw_read(xs, p)
+    _ -> tcrec_args_raw_read(xs, p, bm)
   }
 }
 
-fn tcrec_args_raw_read(args: [Expr], p: String) : Bool {
+fn tcrec_args_raw_read(args: [Expr], p: String, bm: BorrowMap) : Bool {
   match args {
     [] -> false
     [h, ...rest] ->
-      if tcrec_expr_raw_read(h, p) { true }
-      else { tcrec_args_raw_read(rest, p) }
+      if tcrec_expr_raw_read(h, p, bm) { true }
+      else { tcrec_args_raw_read(rest, p, bm) }
   }
 }
 
-fn tcrec_arms_raw_read(arms: [Arm], p: String) : Bool {
+fn tcrec_arms_raw_read(arms: [Arm], p: String, bm: BorrowMap) : Bool {
   match arms {
     [] -> false
     [a, ...rest] -> match a {
       Arm(_, opt_g, body) -> {
         let g_hit = match opt_g {
           None -> false
-          Some(g) -> tcrec_expr_raw_read(g, p)
+          Some(g) -> tcrec_expr_raw_read(g, p, bm)
         }
         if g_hit { true }
-        else if tcrec_expr_raw_read(body, p) { true }
-        else { tcrec_arms_raw_read(rest, p) }
+        else if tcrec_expr_raw_read(body, p, bm) { true }
+        else { tcrec_arms_raw_read(rest, p, bm) }
       }
     }
   }
 }
 
-fn tcrec_stmts_raw_read(stmts: [Stmt], p: String) : Bool {
+fn tcrec_stmts_raw_read(stmts: [Stmt], p: String, bm: BorrowMap) : Bool {
   match stmts {
     [] -> false
     [s, ...rest] -> {
       let here = match s {
-        SLet(_, _, e) -> tcrec_expr_raw_read(e, p)
-        SVar(_, _, e, _, _) -> tcrec_expr_raw_read(e, p)
+        SLet(_, _, e) -> tcrec_expr_raw_read(e, p, bm)
+        SVar(_, _, e, _, _) -> tcrec_expr_raw_read(e, p, bm)
         SAssert(c, opt_m) ->
-          if tcrec_expr_raw_read(c, p) { true }
+          if tcrec_expr_raw_read(c, p, bm) { true }
           else { match opt_m {
             None -> false
-            Some(m) -> tcrec_expr_raw_read(m, p)
+            Some(m) -> tcrec_expr_raw_read(m, p, bm)
           } }
-        SExprStmt(e) -> tcrec_expr_raw_read(e, p)
+        SExprStmt(e) -> tcrec_expr_raw_read(e, p, bm)
         SIndexAssign(b, i, v, _, _) ->
-          if tcrec_expr_raw_read(b, p) { true }
-          else if tcrec_expr_raw_read(i, p) { true }
-          else { tcrec_expr_raw_read(v, p) }
+          if tcrec_expr_raw_read(b, p, bm) { true }
+          else if tcrec_expr_raw_read(i, p, bm) { true }
+          else { tcrec_expr_raw_read(v, p, bm) }
         SAssign(b, v, _, _) ->
-          if tcrec_expr_raw_read(b, p) { true }
-          else { tcrec_expr_raw_read(v, p) }
+          if tcrec_expr_raw_read(b, p, bm) { true }
+          else { tcrec_expr_raw_read(v, p, bm) }
         SUse(_, _, _) -> false
       }
-      if here { true } else { tcrec_stmts_raw_read(rest, p) }
+      if here { true } else { tcrec_stmts_raw_read(rest, p, bm) }
     }
   }
 }
 
-fn tcrec_elems_raw_read(elems: [ListElem], p: String) : Bool {
+fn tcrec_elems_raw_read(elems: [ListElem], p: String, bm: BorrowMap) : Bool {
   match elems {
     [] -> false
     [e, ...rest] -> {
       let here = match e {
-        ElPlain(x) -> tcrec_expr_raw_read(x, p)
-        ElSpread(x) -> tcrec_expr_raw_read(x, p)
+        ElPlain(x) -> tcrec_expr_raw_read(x, p, bm)
+        ElSpread(x) -> tcrec_expr_raw_read(x, p, bm)
       }
-      if here { true } else { tcrec_elems_raw_read(rest, p) }
+      if here { true } else { tcrec_elems_raw_read(rest, p, bm) }
     }
   }
 }
 
-fn tcrec_fields_raw_read(fis: [FieldInit], p: String) : Bool {
+fn tcrec_fields_raw_read(fis: [FieldInit], p: String, bm: BorrowMap) : Bool {
   match fis {
     [] -> false
     [h, ...rest] -> match h {
       FI(_, e) ->
-        if tcrec_expr_raw_read(e, p) { true }
-        else { tcrec_fields_raw_read(rest, p) }
+        if tcrec_expr_raw_read(e, p, bm) { true }
+        else { tcrec_fields_raw_read(rest, p, bm) }
     }
   }
 }
