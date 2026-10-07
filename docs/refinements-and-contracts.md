@@ -335,9 +335,42 @@ match n {
 form `p : Port` accepts the value as `Port` if the predicate
 holds at runtime.
 
-There is **no** implicit narrowing from base type to refined
-type; that would silently insert runtime checks at every
-boundary and defeat the auditability.
+A value flowing directly into a refined position (a binding, a
+parameter, a return, a field, a payload) is checked: at compile time
+when the value is a literal, at runtime otherwise.
+
+**Inside a generic type there is no implicit narrowing.** A
+`[Int]` does not become a `[Pos]`, nor an `Option[Int]` an
+`Option[Pos]` or a `Result[Int, E]` a `Result[Pos, E]`: no runtime
+check stands behind the elements, so the conversion is a compile
+error. The explicit path maps the value through a function that
+checks it and returns the refined type. A literal is the exception,
+since each part is checked as it is built:
+
+```kai
+let xs: [Pos] = [1, 2, 3]           # each element checked
+let ys: [Pos] = ints()              # error: [Int] does not narrow to [Pos]
+let zs: [Pos] = map(ints(), to_pos) # explicit, with to_pos : (Int) -> Pos
+```
+
+Widening follows variance, computed from the type's definition.
+Immutable containers (lists, `Option`, `Result`, records and sums
+with no mutable slot) are covariant: a `[Pos]` is an `[Int]`. A
+mutable container (`Array`, `HashMap`, anything holding one) is
+invariant: an `Array[Pos]` is not an `Array[Int]`, since a write
+through the wider view would break the narrower one. A function type
+is contravariant in its parameters and covariant in its result: a
+`(Int) -> Pos` stands in for a `(Pos) -> Int`, never the reverse.
+
+A generic call keeps the refinements its arguments bring: reversing
+a `[Pos]` gives a `[Pos]`. When one type variable is bound from
+two different refinements it takes their join, the predicates both
+share (usually the bare base type), and a later mismatch names the
+argument that widened it.
+
+Unification itself stays refinement-blind: these checks run at the
+same positions as every other refinement check, so inference keeps
+its decidability.
 
 ### 6. Composition with Units of Measure (m12.5)
 
@@ -715,10 +748,10 @@ both UoM and refinements together.
 > already carries the predicate (a `Pos` field or parameter flowing
 > into a `Pos` position).
 >
-> Not checked: a refined type inside a container that arrives with no
-> literal to look into (`let o: Option[Pos] = f()` where `f` returns
-> `Option[Real]`), since unification erases refinements under a type
-> argument.
+> Inside a generic type, a refinement is never narrowed implicitly
+> (see §5): `let o: Option[Pos] = f()` where `f` returns
+> `Option[Real]` is a compile error, while a literal (`[1, 2]`,
+> `Some(v)`) is still checked part by part.
 
 **Parser-side landed (sub-lanes a–e).** `BaseT where Pred`,
 `requires` / `ensures` clauses, the `result` binding, parse-time

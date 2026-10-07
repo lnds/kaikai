@@ -43,6 +43,7 @@ import compiler.native_prims
 import compiler.infer_index
 import compiler.refinements
 import compiler.refine_coerce
+import compiler.refine_variance
 import compiler.fmt
 import compiler.index_coll
 import compiler.variant_index
@@ -10211,10 +10212,10 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
             let st_unif = st_unify_call(st_fresh, callee, rc.ty, ra.tys, expected, line, col)
             let st2 = st_propagate_capability_labels(st_unif,
                         apply_ty(st_unif.sub, rc.ty), line, col)
-            let ty = apply_ty(st2.sub, rv.ty)
             let ca = coerce_lambda_args(coerce_ctor_args(st2, callee, ra.exprs, ra.tys, rc.ty), rc.ty)
-            let root = with_ty(mk_expr(ECall(rc.expr, ca.exprs), line, col), ty)
-            mk_inferred(ca.st, ty, root)
+            match refine_call(ca.st, rc.expr, rc.ty, ca.exprs, ca.tys, apply_ty(st2.sub, rv.ty)) {
+              RefCall(st3, ty) -> mk_inferred(st3, ty, with_ty(mk_expr(ECall(rc.expr, ca.exprs), line, col), ty))
+            }
             }
           }
           }
@@ -10401,8 +10402,9 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
                 let callee_kind = if inf_string_starts_with_q(nm, "__proto_") { ESym(sym_derive(NCFn, nm, pick.mod), spec_none(), nm) }
                                   else { EModCall(pick.mod, nm) }
                 let callee_node = with_ty(mk_expr(callee_kind, callee.line, callee.col), pick.inst_ty)
-                let root = with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty)
-                Some(mk_inferred(st2, ty, root))
+                match refine_call(st2, callee, pick.inst_ty, all_arg_exprs, all_arg_tys, ty) {
+                  RefCall(st3, ty3) -> Some(mk_inferred(st3, ty3, with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty3)))
+                }
               }
             }
             }
@@ -11080,10 +11082,10 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
               let st_unif = st_unify_call(st_fresh, synth_callee, inst_ty, all_arg_tys, expected, line, col)
               let st2 = st_propagate_capability_labels(st_unif,
                           apply_ty(st_unif.sub, inst_ty), line, col)
-              let ty = apply_ty(st2.sub, rv.ty)
               let callee_node = with_ty(synth_callee, inst_ty)
-              let root = with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty)
-              mk_inferred(st2, ty, root)
+              match refine_call(st2, synth_callee, inst_ty, all_arg_exprs, all_arg_tys, apply_ty(st2.sub, rv.ty)) {
+                RefCall(st3, ty) -> mk_inferred(st3, ty, with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty))
+              }
             }
           }
         }
@@ -12697,8 +12699,9 @@ fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) :
       let expected = TyFnT([rl.ty, ...ra.tys], rv.ty, expected_row)
       let st_unif = st_unify(st_fresh, rf.ty, expected, "pipe call", line, col)
       let st2 = st_propagate_capability_labels(st_unif, apply_ty(st_unif.sub, rf.ty), line, col)
-      let ty = apply_ty(st2.sub, rv.ty)
-      PipeRes { st: st2, ty: ty, call: mk_expr(ECall(rf.expr, [rl.expr, ...ra.exprs]), line, col) }
+      match refine_call(st2, rf.expr, rf.ty, [rl.expr, ...ra.exprs], [rl.ty, ...ra.tys], apply_ty(st2.sub, rv.ty)) {
+        RefCall(st3, ty) -> PipeRes { st: st3, ty: ty, call: mk_expr(ECall(rf.expr, [rl.expr, ...ra.exprs]), line, col) }
+      }
     }
     _ -> {
       let rf = synth(rl.st, rhs)
@@ -12709,8 +12712,9 @@ fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) :
       let expected = TyFnT([rl.ty], rv.ty, expected_row)
       let st_unif = st_unify(st_fresh, rf.ty, expected, "pipe call", line, col)
       let st2 = st_propagate_capability_labels(st_unif, apply_ty(st_unif.sub, rf.ty), line, col)
-      let ty = apply_ty(st2.sub, rv.ty)
-      PipeRes { st: st2, ty: ty, call: mk_expr(ECall(rf.expr, [rl.expr]), line, col) }
+      match refine_call(st2, rf.expr, rf.ty, [rl.expr], [rl.ty], apply_ty(st2.sub, rv.ty)) {
+        RefCall(st3, ty) -> PipeRes { st: st3, ty: ty, call: mk_expr(ECall(rf.expr, [rl.expr]), line, col) }
+      }
     }
   }
   mk_inferred(res.st, res.ty, with_ty(res.call, res.ty))
@@ -13214,9 +13218,12 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
             None ->
               st_unify_call(st_fresh, pipe_callee, rc.ty, [rl.ty, rf.ty], expected, line, col)
           }
-          let ty = apply_ty(st2.sub, rv.ty)
-          let fused = try_fuse_map_pipe(st2, cf, rc.expr, rl.expr, rf.expr, ty, line, col)
-          mk_inferred(fused.st, ty, fused.root)
+          match refine_call(st2, pipe_callee, rc.ty, [rl.expr, rf.expr], [rl.ty, rf.ty], apply_ty(st2.sub, rv.ty)) {
+            RefCall(st3, ty) -> {
+              let fused = try_fuse_map_pipe(st3, cf, rc.expr, rl.expr, rf.expr, ty, line, col)
+              mk_inferred(fused.st, ty, fused.root)
+            }
+          }
         }
       }
     }
@@ -14510,7 +14517,93 @@ fn maybe_mint_literal(st: InferState, value: Expr, value_ty: Ty, expected: Ty,
 # A value meeting a refined type: a refuting literal is an error, and
 # an unproven value is bound once and checked before it flows on.
 fn refine_coerce(m: MintedExpr, expected: Ty, what: String, line: Int, col: Int) : MintedExpr / Console + File + Mutable =
-  if not rc_may_owe(expected) { m } else { refine_coerce_applied(m, apply_ty(m.st.sub, expected), what, line, col) }
+  if not (rc_mentions(expected) or rc_mentions_in(m.st.sub, m.pair.ty)) { m } else {
+    let want = apply_ty(m.st.sub, expected)
+    let m1 = refine_flow(m, want, what, line, col)
+    if rc_may_owe(want) { refine_coerce_applied(m1, want, what, line, col) } else { m1 }
+  }
+
+# A literal list or constructor call is checked part by part as it is
+# built, and a lambda's result in its own body; anything else carries
+# its refinements inside generic types only where variance allows.
+fn refine_flow(m: MintedExpr, want: Ty, what: String, line: Int, col: Int) : MintedExpr / Console + File + Mutable = {
+  let e = m.pair.expr
+  let built = match e.kind {
+    EList(_)      -> true
+    ECall(c, _)   -> callee_ctor_name(c) != None
+    _             -> false
+  }
+  if built { m } else {
+    let have = apply_ty(m.st.sub, m.pair.ty)
+    let target = match e.kind {
+      ELambda(_, _) -> rf_keep_result(want, have)
+      _             -> want
+    }
+    match rv_flow(st_ty_defs(m.st), have, target) {
+      None       -> m
+      Some(miss) -> MintedExpr { st: refine_narrow_error(m.st, miss, have, target, what, line, col, call_widened_note(m.st, e)), pair: m.pair }
+    }
+  }
+}
+
+fn call_widened_note(st: InferState, e: Expr) : String = match e.kind {
+  ECall(c, args_) -> match c.ty {
+    Some(TyFnT(ps, _, _)) -> widened_note(args_, rv_call_binds(ps, map(args_, (a) => apply_ty(st.sub, typed_ty_or(a, TyAny)))))
+    _                     -> ""
+  }
+  _ -> ""
+}
+
+fn rf_keep_result(want: Ty, have: Ty) : Ty = match want {
+  TyFnT(ps, _, row) -> match have {
+    TyFnT(_, r, _) -> TyFnT(ps, r, row)
+    _              -> want
+  }
+  _ -> want
+}
+
+# Every type of `name` the program declares, with its parameters and
+# the types its values hold, so variance reads the definition.
+fn st_ty_defs(st: InferState) : (String) -> [TyDef] =
+  (name) => list_append(rec_defs_named(st.recs, name), sum_defs_named(st.sums, name))
+
+fn rec_defs_named(rs: [RecInfo], name: String) : [TyDef] = match rs {
+  [] -> []
+  [RI(n, tps, fs, _), ...rest] ->
+    if n == name { [TyDef(tps, map(fs, (f) => match f { FD(_, _, te, _) -> te })), ...rec_defs_named(rest, name)] }
+    else { rec_defs_named(rest, name) }
+}
+
+fn sum_defs_named(ss: [SumInfo], name: String) : [TyDef] = match ss {
+  [] -> []
+  [SI(n, tps, vs, _), ...rest] ->
+    if n == name { [TyDef(tps, flat_map(vs, (v) => match v { Var(_, args_) -> args_ })), ...sum_defs_named(rest, name)] }
+    else { sum_defs_named(rest, name) }
+}
+
+fn refine_narrow_error(st: InferState, miss: RvMiss, have: Ty, want: Ty, what: String, line: Int, col: Int, note: String) : InferState / Console + File = match miss {
+  RvMiss(pol, h, w, p) -> {
+    let pred = fmt_expr_text(p)
+    let why = if pol == 1 {
+      concat_all(["`", rv_text(have), "` does not narrow to `", rv_text(want), "`: inside a generic type nothing checks `", pred, "`; map the value through a function that checks it"])
+    } else if pol == 2 {
+      concat_all(["`", rv_text(have), "` does not fit `", rv_text(want), "`: a function taking `", rv_text(h), "` cannot stand in for one taking `", rv_text(w), "`"])
+    } else {
+      concat_all(["`", rv_text(have), "` does not fit `", rv_text(want), "`: a mutable type keeps its refinements exactly, and these differ in `", pred, "`"])
+    }
+    diag_error(st.file, line, col, concat_all([what, ": ", why, note]))
+    st_bump_err(st)
+  }
+}
+
+fn rv_text(t: Ty) : String = match t {
+  TyRefineT(b, p)       -> concat_all([rv_text(b), " where ", fmt_expr_text(p)])
+  TyListT(x)            -> concat_all(["[", rv_text(x), "]"])
+  TyCon(_, n, [], _)    -> n
+  TyCon(_, n, args_, _) -> concat_all([n, "[", string_join(map(args_, (a) => rv_text(a)), ", "), "]"])
+  TyFnT(ps, r, _)       -> concat_all(["(", string_join(map(ps, (a) => rv_text(a)), ", "), ") -> ", rv_text(r)])
+  _                     -> inf_ty_to_string(t)
+}
 
 fn refine_coerce_applied(m: MintedExpr, want: Ty, what: String, line: Int, col: Int) : MintedExpr / Console + File + Mutable {
   match want {
@@ -14549,6 +14642,98 @@ fn fn_param_tys(st: InferState, t: Ty) : [Ty] = match t {
     _               -> []
   }
   _ -> []
+}
+
+# A call's type variables keep the refinements its arguments bring,
+# joined where several meet, and each argument flows into its
+# parameter only where variance allows.
+type RefCall = RefCall(InferState, Ty)
+
+fn refine_call(st: InferState, callee: Expr, callee_ty: Ty, args_: [Expr], arg_tys: [Ty], ty: Ty) : RefCall / Console + File + Mutable = match callee_ty {
+  TyFnT(ps, ret, _) ->
+    if not (rc_mentions(ret) or rc_any_mentions_in(st.sub, arg_tys) or rc_any_mentions_in(st.sub, ps)) { RefCall(st, ty) }
+    else {
+      let have = zip_with(args_, arg_tys, (a, t) => lambda_have(st, a, apply_ty(st.sub, t)))
+      let binds = rv_call_binds(ps, have)
+      let wants = map(ps, (p) => apply_ty(st.sub, rc_subst(p, rv_pairs_of(binds))))
+      let st1 = refine_args_flow(st, args_, have, wants, binds, 1, callee_label(callee))
+      let refined = if binds == [] and not rc_mentions(ret) { ty } else { apply_ty(st1.sub, rc_subst(ret, rv_pairs_of(binds))) }
+      RefCall(st1, refined)
+    }
+  _ -> RefCall(st, ty)
+}
+
+# `rc_mentions` through the substitution, without applying it.
+fn rc_mentions_in(s: Subst, t: Ty) : Bool = match t {
+  TyRefineT(_, _)       -> true
+  TyVarT(v)             -> match subst_lookup(s, v) {
+    Some(b) -> rc_mentions_in(s, b)
+    None    -> false
+  }
+  TyListT(x)            -> rc_mentions_in(s, x)
+  TyCon(_, _, args_, _) -> rc_any_mentions_in(s, args_)
+  TyFnT(ps, r, _)       -> rc_mentions_in(s, r) or rc_any_mentions_in(s, ps)
+  _                     -> false
+}
+
+fn rc_any_mentions_in(s: Subst, ts: [Ty]) : Bool = match ts {
+  [] -> false
+  [t, ...rest] -> rc_mentions_in(s, t) or rc_any_mentions_in(s, rest)
+}
+
+fn refine_args_flow(st: InferState, args_: [Expr], have: [Ty], wants: [Ty], binds: [RvBind], i: Int, label: String) : InferState / Console + File = match args_ {
+  [a, ...arest] -> match have {
+    [h, ...hrest] -> match wants {
+      [w, ...wrest] -> {
+        let built = match a.kind {
+          EList(_)    -> true
+          ECall(c, _) -> callee_ctor_name(c) != None
+          _           -> false
+        }
+        let target = match a.kind {
+          ELambda(_, _) -> rf_keep_result(w, h)
+          _             -> w
+        }
+        let st1 = if built { st } else { match rv_flow(st_ty_defs(st), h, target) {
+          None       -> st
+          Some(miss) -> refine_narrow_error(st, miss, h, w, concat_all(["argument ", int_to_string(i), label]), a.line, a.col, widened_note(args_, binds))
+        } }
+        refine_args_flow(st1, arest, hrest, wrest, binds, i + 1, label)
+      }
+      [] -> st
+    }
+    [] -> st
+  }
+  [] -> st
+}
+
+# A lambda's own type has its result unified, refinements peeled; its
+# body's type still carries what the body returns.
+fn lambda_have(st: InferState, a: Expr, t: Ty) : Ty = match a.kind {
+  ELambda(_, body) -> match t {
+    TyFnT(ps, r, row) -> TyFnT(ps, apply_ty(st.sub, typed_ty_or(expr_tail(body), r)), row)
+    _                 -> t
+  }
+  _ -> t
+}
+
+fn expr_tail(e: Expr) : Expr = match e.kind {
+  EBlock(_, Some(t)) -> expr_tail(t)
+  _                  -> e
+}
+
+fn callee_label(c: Expr) : String = match c.kind {
+  EVar(n)        -> concat_all([" of `", n, "`"])
+  EModCall(_, n) -> concat_all([" of `", n, "`"])
+  ESym(_, _, n)  -> concat_all([" of `", n, "`"])
+  _              -> ""
+}
+
+# Where a join widened a type variable, so a later mismatch names it.
+fn widened_note(args_: [Expr], binds: [RvBind]) : String = match nth(args_, rv_widened_at(binds)) {
+  Some(a) -> concat_all(["; the type parameter lost that refinement where argument ", int_to_string(rv_widened_at(binds) + 1),
+                         " (line ", int_to_string(a.line), ", col ", int_to_string(a.col), ") brought a wider one"])
+  None    -> ""
 }
 
 # A constructor has no body to check its fields on entry, so its call
@@ -14770,7 +14955,7 @@ fn synth_field_inits(st: InferState, fis: [FieldInit], fields: [FTy], line: Int,
           Some(ft) -> maybe_mint_literal(r.st, r.expr, r.ty, apply_ty(r.st.sub, ft), line, col)
         }
         let coerced = match fty_find(fields, fnm) {
-          Some(ft) -> if rc_may_owe(ft) { refine_coerce(minted, ft, field_what(fnm), ex.line, ex.col) } else { minted }
+          Some(ft) -> if rc_mentions(ft) or rc_mentions_in(minted.st.sub, minted.pair.ty) { refine_coerce(minted, ft, field_what(fnm), ex.line, ex.col) } else { minted }
           None -> minted
         }
         let lower_pair = coerced.pair
@@ -14916,7 +15101,7 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
         None -> minted
         Some(te) -> {
           let declared = st_annot_ty(minted.st, te)
-          if not rc_may_owe(declared) { minted }
+          if not (rc_mentions(declared) or rc_mentions_in(minted.st.sub, minted.pair.ty)) { minted }
           else { refine_coerce(minted, declared, binding_what(pat, ann_label), pat.line, pat.col) }
         }
       }
@@ -16558,7 +16743,7 @@ fn check_elem_against(st: InferState, ex: Expr, elem_ty: Ty,
 fn elem_synth_unify(st: InferState, ex: Expr, elem_ty: Ty,
                     line: Int, col: Int) : Inferred / Console + File + Mutable {
   let r0 = synth(st, ex)
-  let r = if not rc_may_owe(elem_ty) { r0 } else {
+  let r = if not (rc_mentions(elem_ty) or rc_mentions_in(r0.st.sub, r0.ty)) { r0 } else {
     let m = refine_coerce(MintedExpr { st: r0.st, pair: ExprTy { expr: r0.expr, ty: r0.ty } }, elem_ty, "list element", ex.line, ex.col)
     mk_inferred(m.st, m.pair.ty, m.pair.expr)
   }
@@ -18210,7 +18395,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
         None      -> synth(st_ready, body)
       }
       let rb = match opt_declared {
-        Some(rty) -> if not rc_may_owe(rty) { rb } else { refine_coerce_tail(rb, rty, concat_all(["return of `", nm, "`"])) }
+        Some(rty) -> if not (rc_mentions(rty) or rc_mentions_in(rb.st.sub, rb.ty)) { rb } else { refine_coerce_tail(rb, rty, concat_all(["return of `", nm, "`"])) }
         None      -> rb
       }
       let declared_ret = match opt_declared {
@@ -18460,7 +18645,7 @@ fn infer_const_body(file: String, env: TyEnv, core_len: Int,
                                   apply_ty(rr.st.sub, st_annot_ty(rr.st, cte)),
                                   line, col)
   let declared = st_annot_ty(minted.st, cte)
-  let coerced = if not rc_may_owe(declared) { minted }
+  let coerced = if not (rc_mentions(declared) or rc_mentions_in(minted.st.sub, minted.pair.ty)) { minted }
                 else { refine_coerce(minted, declared, concat_all(["const `", cname, "`"]), cbody.line, cbody.col) }
   let st2c = st_unify(coerced.st, declared, coerced.pair.ty, "const annotation", line, col)
   let hd = drain_deferred_homs(st2c, list_reverse(st2c.deferred_homs), [])

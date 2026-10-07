@@ -1,0 +1,270 @@
+#[doc("""
+How a refinement inside a generic type may flow.
+
+A value whose type holds a refinement in a type argument flows only
+where variance allows: an immutable container is covariant, a mutable
+one invariant, a function contravariant in its parameters. Narrowing
+inside a container is never implicit, since no runtime check stands
+behind it. A type variable a call binds from several refinements takes
+their join, the predicates they share.
+
+Variances are bit masks: 0 unused, 1 covariant, 2 contravariant,
+3 invariant.
+""")]
+
+import compiler.ast
+import compiler.refinements
+import compiler.refine_coerce
+
+#[doc("A type's parameters and every type its values hold, as declared.")]
+pub type TyDef = TyDef([String], [TypeExpr])
+
+#[doc("A refinement a flow cannot carry: the polarity it met, the value's part, the expected part, and the predicate in question.")]
+pub type RvMiss = RvMiss(Int, Ty, Ty, Expr)
+
+#[doc("A call's binding of a type variable to a refined type, and the argument that widened it, or -1.")]
+pub type RvBind = RvBind(Int, Ty, Int)
+
+fn rv_flip(v: Int) : Int = match v {
+  1 -> 2
+  2 -> 1
+  _ -> v
+}
+
+fn rv_compose(outer: Int, inner: Int) : Int = match outer {
+  0 -> 0
+  1 -> inner
+  2 -> rv_flip(inner)
+  _ -> if inner == 0 { 0 } else { 3 }
+}
+
+fn rv_or(a: Int, b: Int) : Int =
+  if a == 3 or b == 3 or (a == 1 and b == 2) or (a == 2 and b == 1) { 3 } else if a == 0 { b } else { a }
+
+fn rv_last_seg(n: String) : String = rv_seg_from(n, string_length(n) - 1)
+
+fn rv_seg_from(n: String, i: Int) : String =
+  if i < 0 { n }
+  else if char_at(n, i) == Some('.') { string_slice(n, i + 1, string_length(n) - i - 1) }
+  else { rv_seg_from(n, i - 1) }
+
+#[doc("The variance of parameter `j` of the type `name`, from every definition `defs` gives under that name.")]
+pub fn rv_param(defs: (String) -> [TyDef], name: String, j: Int) : Int = rv_param_seen(defs, rv_last_seg(name), j, [])
+
+fn rv_param_seen(defs: (String) -> [TyDef], name: String, j: Int, seen: [String]) : Int =
+  if name == "Option" or name == "Result" { 1 }
+  else { match defs(name) {
+    [] -> 3
+    ds -> rv_defs(defs, ds, name, j, seen, 0)
+  } }
+
+fn rv_defs(defs: (String) -> [TyDef], ds: [TyDef], name: String, j: Int, seen: [String], acc: Int) : Int = match ds {
+  [] -> acc
+  [TyDef(tps, payloads), ...rest] -> match nth(tps, j) {
+    Some(tp) -> rv_defs(defs, rest, name, j, seen, rv_or(acc, rv_occ_all(defs, payloads, tp, 1, [name, ...seen])))
+    None     -> 3
+  }
+}
+
+fn rv_occ_all(defs: (String) -> [TyDef], ts: [TypeExpr], v: String, pol: Int, seen: [String]) : Int = match ts {
+  [] -> 0
+  [t, ...rest] -> rv_or(rv_occ(defs, t, v, pol, seen), rv_occ_all(defs, rest, v, pol, seen))
+}
+
+fn rv_occ(defs: (String) -> [TyDef], t: TypeExpr, v: String, pol: Int, seen: [String]) : Int = match t.tkind {
+  TyName(n, [])   -> if n == v { pol } else { 0 }
+  TyName(n, args) -> rv_occ_args(defs, rv_last_seg(n), args, 0, v, pol, seen)
+  TyList(x)       -> rv_occ(defs, x, v, pol, seen)
+  TyFn(ps, r, _)  -> rv_or(rv_occ_all(defs, ps, v, rv_flip(pol), seen), rv_occ(defs, r, v, pol, seen))
+  TyDim(b, _)     -> rv_occ(defs, b, v, pol, seen)
+  TyRefine(b, _)  -> rv_occ(defs, b, v, pol, seen)
+  _               -> 0
+}
+
+# A type reached again through its own definition is assumed to keep
+# the polarity it is met at; met under any other, it is invariant.
+fn rv_occ_args(defs: (String) -> [TyDef], n: String, args: [TypeExpr], j: Int, v: String, pol: Int, seen: [String]) : Int = match args {
+  [] -> 0
+  [a, ...rest] -> {
+    let m = rv_occ(defs, a, v, 1, seen)
+    let here = if m == 0 { 0 }
+               else if contains(seen, n) { rv_compose(pol, if pol == 1 { m } else { 3 }) }
+               else { rv_compose(pol, rv_compose(rv_param_seen(defs, n, j, seen), m)) }
+    rv_or(here, rv_occ_args(defs, n, rest, j + 1, v, pol, seen))
+  }
+}
+
+fn rv_peel(t: Ty) : Ty = match t {
+  TyRefineT(b, _) -> rv_peel(b)
+  _               -> t
+}
+
+fn rv_all_carried(need: [Expr], have: [Expr]) : Option[Expr] = match need {
+  [] -> None
+  [p, ...rest] -> if any(have, (q) => expr_struct_eq(p, q)) { rv_all_carried(rest, have) } else { Some(p) }
+}
+
+fn rv_preds_miss(h: Ty, w: Ty, pol: Int) : Option[RvMiss] = {
+  let co = if pol == 1 or pol == 3 { rv_all_carried(rc_preds(w), rc_preds(h)) } else { None }
+  match co {
+    Some(p) -> Some(RvMiss(pol, h, w, p))
+    None -> if pol == 2 or pol == 3 {
+      match rv_all_carried(rc_preds(h), rc_preds(w)) {
+        Some(p) -> Some(RvMiss(pol, h, w, p))
+        None    -> None
+      }
+    } else { None }
+  }
+}
+
+#[doc("The first refinement inside `want` that a value of type `have` cannot carry there, if any. The outermost level is the caller's: a value meeting a refined type is checked at runtime.")]
+pub fn rv_flow(defs: (String) -> [TyDef], have: Ty, want: Ty) : Option[RvMiss] = rv_inner(defs, rv_peel(have), rv_peel(want), 1)
+
+fn rv_walk(defs: (String) -> [TyDef], h: Ty, w: Ty, pol: Int) : Option[RvMiss] = match rv_preds_miss(h, w, pol) {
+  Some(m) -> Some(m)
+  None    -> rv_inner(defs, rv_peel(h), rv_peel(w), pol)
+}
+
+fn rv_inner(defs: (String) -> [TyDef], h: Ty, w: Ty, pol: Int) : Option[RvMiss] = match h {
+  TyListT(a) -> match w {
+    TyListT(b) -> rv_walk(defs, a, b, pol)
+    _          -> None
+  }
+  TyCon(_, n, as_, _) -> match w {
+    TyCon(_, _, bs, _) -> rv_args(defs, n, as_, bs, 0, pol)
+    _                  -> None
+  }
+  TyFnT(aps, ar, _) -> match w {
+    TyFnT(bps, br, _) -> match rv_pairs(defs, aps, bps, rv_flip(pol)) {
+      Some(m) -> Some(m)
+      None    -> rv_walk(defs, ar, br, pol)
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+fn rv_args(defs: (String) -> [TyDef], n: String, hs: [Ty], ws: [Ty], j: Int, pol: Int) : Option[RvMiss] = match hs {
+  [h, ...hrest] -> match ws {
+    [w, ...wrest] -> {
+      let here = if rc_mentions(h) or rc_mentions(w) { rv_walk(defs, h, w, rv_compose(pol, rv_param(defs, n, j))) } else { None }
+      match here {
+        Some(m) -> Some(m)
+        None    -> rv_args(defs, n, hrest, wrest, j + 1, pol)
+      }
+    }
+    [] -> None
+  }
+  [] -> None
+}
+
+fn rv_pairs(defs: (String) -> [TyDef], hs: [Ty], ws: [Ty], pol: Int) : Option[RvMiss] = match hs {
+  [h, ...hrest] -> match ws {
+    [w, ...wrest] -> match rv_walk(defs, h, w, pol) {
+      Some(m) -> Some(m)
+      None    -> rv_pairs(defs, hrest, wrest, pol)
+    }
+    [] -> None
+  }
+  [] -> None
+}
+
+#[doc("The widest type both `a` and `b` belong to: the predicates they share, at every level.")]
+pub fn rv_join(a: Ty, b: Ty) : Ty = rv_rewrap(rv_shared(rc_preds(a), rc_preds(b)), rv_join_bare(rv_peel(a), rv_peel(b)))
+
+fn rv_shared(ps: [Expr], qs: [Expr]) : [Expr] = filter(ps, (p) => any(qs, (q) => expr_struct_eq(p, q)))
+
+fn rv_rewrap(ps: [Expr], base: Ty) : Ty = match ps {
+  [] -> base
+  [p, ...rest] -> TyRefineT(rv_rewrap(rest, base), p)
+}
+
+fn rv_join_bare(a: Ty, b: Ty) : Ty = match a {
+  TyListT(x) -> match b {
+    TyListT(y) -> TyListT(rv_join(x, y))
+    _          -> a
+  }
+  TyCon(m, n, xs, s) -> match b {
+    TyCon(_, _, ys, _) -> TyCon(m, n, rv_join_list(xs, ys), s)
+    _                  -> a
+  }
+  TyFnT(xs, r, row) -> match b {
+    TyFnT(_, q, _) -> TyFnT(xs, rv_join(r, q), row)
+    _              -> a
+  }
+  _ -> a
+}
+
+fn rv_join_list(xs: [Ty], ys: [Ty]) : [Ty] = match xs {
+  [x, ...xrest] -> match ys {
+    [y, ...yrest] -> [rv_join(x, y), ...rv_join_list(xrest, yrest)]
+    []            -> xs
+  }
+  [] -> []
+}
+
+fn rv_same(a: Ty, b: Ty) : Bool = rv_none(rv_all_carried(rc_preds(a), rc_preds(b))) and rv_none(rv_all_carried(rc_preds(b), rc_preds(a)))
+
+fn rv_none(o: Option[Expr]) : Bool = match o {
+  Some(_) -> false
+  None    -> true
+}
+
+# Only covariant positions bind: a value of a type variable comes out
+# of a call only from where it went in as a value, never from a
+# function parameter that consumes one.
+#[doc("The refined types a call's arguments `args` give the type variables of its parameters `params`, joined where several meet.")]
+pub fn rv_call_binds(params: [Ty], args: [Ty]) : [RvBind] = rv_bind_args(params, args, 0, [])
+
+fn rv_bind_args(ps: [Ty], ts: [Ty], i: Int, acc: [RvBind]) : [RvBind] = match ps {
+  [p, ...prest] -> match ts {
+    [t, ...trest] -> rv_bind_args(prest, trest, i + 1, rv_bind(p, t, i, acc))
+    []            -> acc
+  }
+  [] -> acc
+}
+
+fn rv_bind(pat: Ty, t: Ty, i: Int, acc: [RvBind]) : [RvBind] = match pat {
+  TyVarT(v) -> rv_note(acc, v, t, i)
+  TyRefineT(b, _) -> rv_bind(b, t, i, acc)
+  TyListT(p) -> match rv_peel(t) {
+    TyListT(x) -> rv_bind(p, x, i, acc)
+    _          -> acc
+  }
+  TyCon(_, _, ps, _) -> match rv_peel(t) {
+    TyCon(_, _, ts, _) -> rv_bind_list(ps, ts, i, acc)
+    _                  -> acc
+  }
+  TyFnT(_, r, _) -> match rv_peel(t) {
+    TyFnT(_, q, _) -> rv_bind(r, q, i, acc)
+    _              -> acc
+  }
+  _ -> acc
+}
+
+fn rv_bind_list(ps: [Ty], ts: [Ty], i: Int, acc: [RvBind]) : [RvBind] = match ps {
+  [p, ...prest] -> match ts {
+    [t, ...trest] -> rv_bind_list(prest, trest, i, rv_bind(p, t, i, acc))
+    []            -> acc
+  }
+  [] -> acc
+}
+
+fn rv_note(acc: [RvBind], v: Int, t: Ty, i: Int) : [RvBind] = match acc {
+  [] -> [RvBind(v, t, -1)]
+  [RvBind(w, b, at), ...rest] ->
+    if w != v { [RvBind(w, b, at), ...rv_note(rest, v, t, i)] }
+    else {
+      let j = rv_join(b, t)
+      [RvBind(v, j, if at < 0 and not rv_same(j, b) { i } else { at }), ...rest]
+    }
+}
+
+#[doc("The bindings of `binds` as `rc_subst` reads them.")]
+pub fn rv_pairs_of(binds: [RvBind]) : [(Int, Ty)] = map(binds, (b) => match b { RvBind(v, t, _) -> (v, t) })
+
+#[doc("The first argument index that widened a binding, or -1.")]
+pub fn rv_widened_at(binds: [RvBind]) : Int = match binds {
+  [] -> -1
+  [RvBind(_, _, at), ...rest] -> if at >= 0 { at } else { rv_widened_at(rest) }
+}
