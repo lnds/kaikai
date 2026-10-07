@@ -1,0 +1,162 @@
+#[doc("""
+One step of the KIR linearity walk: a statement or a terminator applied to
+the path's ledger, with the violations it finds.
+""")]
+
+import compiler.kir
+import compiler.util
+import compiler.kir_lin_cfg
+import compiler.kir_lin_ops
+import compiler.kir_lin_state
+import compiler.kir_lin_owed
+import compiler.kir_lin_facts
+
+#[doc("Apply the statements `ss` to the ledger, gathering violations into `acc`.")]
+pub fn klin_stmts(kx: Kx, ss: [KStmt], st: LinSt, acc: [LinV]) : (LinSt, [LinV]) = match ss {
+  []           -> (st, acc)
+  [s, ...rest] -> {
+    let (st1, vs) = klin_stmt(kx, s, st)
+    klin_stmts(kx, rest, st1, list_append(vs, acc))
+  }
+}
+
+fn klin_stmt(kx: Kx, s: KStmt, st: LinSt) : (LinSt, [LinV]) = match s {
+  KLet(x, _, op, _)                -> klin_let(kx, x, op, st)
+  KDo(op, _)                       -> match op {
+    KLitOp(v) -> klin_take(kx, st, v, "do-discard")
+    _         -> klin_apply(kx, klo_fx(op, kx.fns), st)
+  }
+  KRC(rc, _)                       -> klin_rc(kx, rc, st)
+  KStore(t, v, _)                  -> klin_store(kx, t, v, st)
+  KInstall(_, _, Some(v), _, _)    -> klin_take(kx, st, v, "install-state")
+  _                                -> (st, [])
+}
+
+fn klin_let(kx: Kx, x: String, op: KOp, st: LinSt) : (LinSt, [LinV]) = {
+  let fx = klo_fx(op, kx.fns)
+  let (st1, vs) = klin_apply(kx, fx, st)
+  if not klf_boxed(kx, x) { (st1, vs) }
+  else { match fx {
+    LinFx(_, _, res) -> (klin_bind(kx, x, res, st1), vs)
+  } }
+}
+
+fn klin_bind(kx: Kx, x: String, res: LinRes, st: LinSt) : LinSt = match res {
+  LrOwn     -> kls_fresh(st, x, 1)
+  LrView    -> kls_fresh(st, x, 0)
+  LrImm     -> kls_fresh_imm(st, x)
+  LrAlias(n) -> if klf_boxed(kx, n) { kls_alias(st, x, n) } else { kls_fresh_imm(st, x) }
+}
+
+fn klin_apply(kx: Kx, fx: LinFx, st: LinSt) : (LinSt, [LinV]) = match fx {
+  LinFx(takes, untracks, _) -> {
+    let (st1, vs) = klin_takes(kx, takes, st, [])
+    (klin_untracks(kx, untracks, st1), vs)
+  }
+}
+
+fn klin_takes(kx: Kx, ts: [(KVal, String)], st: LinSt, acc: [LinV]) : (LinSt, [LinV]) = match ts {
+  []                  -> (st, acc)
+  [(v, w), ...rest]   -> {
+    let (st1, vs) = klin_take(kx, st, v, w)
+    klin_takes(kx, rest, st1, list_append(vs, acc))
+  }
+}
+
+fn klin_untracks(kx: Kx, vs: [KVal], st: LinSt) : LinSt = match vs {
+  []           -> st
+  [v, ...rest] -> klin_untracks(kx, rest, match v {
+    KVar(n) -> if klf_boxed(kx, n) { kls_untrack(st, n) } else { st }
+    _       -> st
+  })
+}
+
+fn klin_rc(kx: Kx, rc: KRCOp, st: LinSt) : (LinSt, [LinV]) = match rc {
+  KDup(v)                -> (klin_dup(kx, st, v), [])
+  KDrop(v)               -> klin_take(kx, st, v, "drop")
+  KFreeToken(v)          -> klin_take(kx, st, v, "free-token")
+  KIncrefIfShared(_, c)  -> (klin_dup(kx, st, c), [])
+  _                      -> (st, [])
+}
+
+fn klin_store(kx: Kx, t: String, v: KVal, st: LinSt) : (LinSt, [LinV]) = {
+  let st1 = kls_const(st, t, match v { KBoolV(b) -> Some(b)  _ -> None })
+  if not klf_boxed(kx, t) { (st1, []) }
+  else { kls_store(st1, t, match v {
+    KVar(n) -> if klf_boxed(kx, n) { Some(n) } else { None }
+    _       -> None
+  }) }
+}
+
+fn klin_take(kx: Kx, st: LinSt, v: KVal, what: String) : (LinSt, [LinV]) = match v {
+  KVar(n) -> if klf_boxed(kx, n) { kls_take(st, n, what) } else { (st, []) }
+  _       -> (st, [])
+}
+
+fn klin_dup(kx: Kx, st: LinSt, v: KVal) : LinSt = match v {
+  KVar(n) -> if klf_boxed(kx, n) { kls_dup(st, n) } else { st }
+  _       -> st
+}
+
+# --- terminators ---------------------------------------------------------
+
+#[doc("Apply the terminator `t`: the successors with their ledgers, and the violations at an exit.")]
+pub fn klin_term(kx: Kx, t: KTerm, st: LinSt) : ([(String, LinSt)], [LinV]) = match t {
+  KRet(v, _)                                   -> klin_exit(klin_take(kx, st, v, "ret"))
+  KCondBr(c, a, b, _)                          -> (klin_cond(kx, c, a, b, st), [])
+  KTcrecGoto(_, asg, dm, _)                    -> klin_exit(klin_goto(kx, asg, dm, st))
+  KTrmcStep(_, _, _, _, _, dm, hs, asg, _, _)  -> {
+    let (st1, v1) = klin_takes(kx, map(hs, (h) => (h, "trmc-head")), st, [])
+    let (out, v2) = klin_exit(klin_goto(kx, asg, dm, st1))
+    (out, list_append(v2, v1))
+  }
+  KTrmcApply(v, _)                             -> klin_exit(klin_take(kx, st, v, "trmc-apply"))
+  _                                            -> (map(klc_succ(t), (l) => (l, st)), [])
+}
+
+fn klin_exit(r: (LinSt, [LinV])) : ([(String, LinSt)], [LinV]) = match r {
+  (st, vs) -> ([], list_append(kls_leaks(st), vs))
+}
+
+# A setjmp's landing branch is the exceptional path; a branch on a known
+# constant takes one side.
+fn klin_cond(kx: Kx, c: KVal, a: String, b: String, st: LinSt) : [(String, LinSt)] = match c {
+  KVar(n) ->
+    if list_has(kx.setjmps, n) { [(b, st)] }
+    else { match kls_const_of(st, n) {
+      Some(true)  -> [(a, st)]
+      Some(false) -> [(b, st)]
+      None        -> {
+        let st1 = if klf_boxed(kx, n) { kls_untrack(st, n) } else { st }
+        [(a, st1), (b, st1)]
+      }
+    } }
+  _ -> [(a, st), (b, st)]
+}
+
+# A back-edge moves each assigned value into the param it rebinds, then
+# releases the params its drop mask names.
+fn klin_goto(kx: Kx, asg: [KAssign], dm: Int, st: LinSt) : (LinSt, [LinV]) = {
+  let moved = filter(asg, (a) => match a { KAsg(i, _) -> match klin_param(kx.f.params, i) {
+    Some(p) -> klo_param_owned(p)
+    None    -> true
+  } })
+  let (st1, v1) = klin_takes(kx, map(moved, (a) => (klc_asg_val(a), "goto-assign")), st, [])
+  let dropped = filter(asg, (a) => match a { KAsg(i, _) -> klin_bit(dm, i) })
+  klin_takes(kx, klin_param_vals(kx.f.params, dropped), st1, v1)
+}
+
+fn klin_param_vals(ps: [KParam], asg: [KAssign]) : [(KVal, String)] = match asg {
+  []                  -> []
+  [KAsg(i, _), ...rest] -> match klin_param(ps, i) {
+    Some(p) -> [(KVar(p.name), "goto-dropmask"), ...klin_param_vals(ps, rest)]
+    None    -> klin_param_vals(ps, rest)
+  }
+}
+
+fn klin_param(ps: [KParam], i: Int) : Option[KParam] = match ps {
+  []           -> None
+  [p, ...rest] -> if i == 0 { Some(p) } else { klin_param(rest, i - 1) }
+}
+
+fn klin_bit(m: Int, i: Int) : Bool = if i == 0 { m % 2 == 1 } else { klin_bit(m / 2, i - 1) }

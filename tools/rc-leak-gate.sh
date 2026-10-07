@@ -47,6 +47,11 @@
 # examples/effects is held to growth only: its fixtures print through
 # handlers, fibers and timers, so only the per-run retention is pinned, in
 # tools/baselines/rc-effects-growth/<name> (a `-` column skips the backend).
+#
+# On the native backend every build also runs the KIR linearity check, which
+# reports an owned reference not released exactly once on some path. Its
+# violation count is pinned exactly in tools/baselines/kir-lin/<corpus>-<name>;
+# a fixture with no file must have none.
 
 set -u
 
@@ -55,6 +60,7 @@ export ROOT="$(pwd)"
 export KAI="$ROOT/bin/kai"
 export WORK="$ROOT/stage2/build/rc-leak-gate"
 export BASELINE="$ROOT/tools/baselines/rc-leak"
+export LIN_BASELINE="$ROOT/tools/baselines/kir-lin"
 SKIPS="$ROOT/tools/rc-leak-skips.txt"
 export BACKEND="${KAI_LEAK_BACKEND:-c}"
 export RUN_TIMEOUT="${KAI_LEAK_TIMEOUT:-120}"
@@ -203,7 +209,10 @@ measure_one() {
   local corpus="${1%%/*}" name="${1#*/}"
   local bin="$WORK/$corpus-$name"
   if skipped "$corpus" "$name"; then echo "-:-" > "$bin.measured"; return; fi
-  if ! "$KAI" build --backend="$BACKEND" "$ROOT/examples/$1.kai" -o "$bin" >"$bin.build" 2>&1; then
+  # On native, kaic2 also runs the KIR linearity check over what it emits.
+  local verify=""
+  [ "$BACKEND" = native ] && verify="$bin.kv"
+  if ! KAI_KIR_VERIFY="$verify" "$KAI" build --backend="$BACKEND" "$ROOT/examples/$1.kai" -o "$bin" >"$bin.build" 2>&1; then
     echo "BUILD-FAIL:-" > "$bin.measured"; return
   fi
   local once twice growth=-
@@ -272,6 +281,17 @@ while IFS= read -r id; do
   [ -f "$WORK/$corpus-$name.aborted-fibers" ] && \
     echo "note $id — exit_code=abort with $(cat "$WORK/$corpus-$name.aborted-fibers") started fiber(s) alive; measured as before"
   [ "$measured" = BUILD-FAIL ] && tail -4 "$WORK/$corpus-$name.build" 2>/dev/null | sed 's/^/    /'
+  # The KIR linearity check's violations, pinned exactly per fixture.
+  if [ "$BACKEND" = native ] && [ "$measured" != BUILD-FAIL ]; then
+    lin="no report"
+    [ -f "$WORK/$corpus-$name.kv" ] && lin="$(grep -c . "$WORK/$corpus-$name.kv")"
+    lin_pin="$(head -1 "$LIN_BASELINE/$corpus-$name" 2>/dev/null)"
+    if [ "$lin" != "${lin_pin:-0}" ]; then
+      echo "FAIL $id — $lin KIR linearity violations, pinned ${lin_pin:-0}:"
+      sed 's/^/    /' "$WORK/$corpus-$name.kv"
+      fail=1
+    fi
+  fi
   # A run cannot free more than it allocated: negative growth means the
   # ledger missed allocations, never a fixed leak.
   case "$growth" in
@@ -295,6 +315,11 @@ orphans() {
   done
 }
 orphans perceus "$BASELINE"
+for pin in "$LIN_BASELINE"/*; do
+  [ -f "$pin" ] || continue
+  key="$(basename "$pin")"
+  grep -qx "${key%%-*}/${key#*-}" "$fixtures" || { echo "FAIL ${key%%-*}/${key#*-} — tools/baselines/kir-lin/$key has no fixture"; fail=1; }
+done
 for corpus in $CORPORA; do orphans "$corpus" "$(growth_dir "$corpus")"; done
 
 [ "$fail" -eq 0 ] || { echo "rc-leak-gate: FAIL"; exit 1; }

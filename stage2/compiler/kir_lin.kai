@@ -1,0 +1,108 @@
+#[doc("""
+The linearity check over KIR: every owned reference a function holds is
+released exactly once on every path.
+
+Each path is walked with a reference ledger (`compiler.kir_lin_state`),
+every op applying its take/borrow contract (`compiler.kir_lin_ops`). A
+consume of a reference the function does not hold, or an owned reference
+still held at a return, a loop back-edge or a block where nothing reads it
+any more, is reported. Functions that use the reuse protocol are skipped:
+it is not modelled.
+""")]
+
+import compiler.kir
+import compiler.util
+import compiler.kir_lin_cfg
+import compiler.kir_lin_ops
+import compiler.kir_lin_state
+import compiler.kir_lin_canon
+import compiler.kir_lin_facts
+import compiler.kir_lin_step
+import compiler.kir_dump
+import compiler.fnreg
+
+#[doc("Check `kp` and write one line per violation to `path` (function, kind, registers), and the KIR of each offending function to `path.kir`; nothing runs when `path` is empty.")]
+pub fn kir_lin_hook(kp: KProgram, path: String) : KProgram / File = {
+  if path == "" { kp } else {
+    let lines = kir_lin_report(kp)
+    let _w = write_file(path, string_join(map(lines, (l) => cat2(l, "\n")), ""))
+    let bad = filter(kp.fns, (f) => any(lines, (l) => string_starts_with_q(l, cat2(f.sym, "\t"))))
+    let _k = match bad { [] -> 0  _ -> { let _d = write_file(cat2(path, ".kir"), kir_dump_fns_pub(bad)); 0 } }
+    kp
+  }
+}
+
+#[doc("One line per violation in `kp`: function, kind and registers, tab-separated.")]
+pub fn kir_lin_report(kp: KProgram) : [String] = klin_fns(kp.fns, klo_index(kp.fns))
+
+fn klin_fns(fs: [KFn], fns: LinFns) : [String] = match fs {
+  []           -> []
+  [f, ...rest] -> list_append(klin_fn_lines(f, fns), klin_fns(rest, fns))
+}
+
+fn klin_fn_lines(f: KFn, fns: LinFns) : [String] = match f.kind {
+  KFnFfi(_, _, _) -> []
+  _               -> match f.blocks {
+    []         -> []
+    [b0, ..._] ->
+      if klf_uses_reuse(f.blocks) { [] }
+      else { map(klin_dedupe(klin_check(klf_cx(f, fns), b0.label), []), (v) => klin_line(f.sym, v)) }
+  }
+}
+
+fn klin_line(sym: String, v: LinV) : String = match v { LinV(k, r) -> concat_all([sym, "\t", k, "\t", r]) }
+
+# A path is cut once it revisits a block this often, and a function's walk
+# once it has taken this many steps.
+const LOOP_LIMIT : Int = 3
+const STEP_LIMIT : Int = 20000
+
+fn klin_check(kx: Kx, entry: String) : [LinV] =
+  klin_loop(kx, [(entry, klf_entry(kx), [entry])], [], 0, [])
+
+fn klin_loop(kx: Kx, work: [(String, LinSt, [String])], seen: [String], steps: Int, acc: [LinV]) : [LinV] = match work {
+  [] -> acc
+  [(b, st, path), ...rest] ->
+    if steps > STEP_LIMIT { [LinV("path-cap", "-"), ...acc] }
+    else if klin_count(path, b) > LOOP_LIMIT { klin_loop(kx, rest, seen, steps + 1, [LinV("loop-unbalanced", b), ...acc]) }
+    else { match klc_block(kx.cfg, b) {
+      None      -> klin_loop(kx, rest, seen, steps + 1, acc)
+      Some(blk) -> {
+        let (key, st1, dead) = klin_canon(kx, b, st)
+        if list_has(seen, key) { klin_loop(kx, rest, seen, steps + 1, list_append(dead, acc)) }
+        else {
+          let (st2, v1) = klin_stmts(kx, blk.stmts, st1, [])
+          let (next, v2) = klin_term(kx, blk.term, st2)
+          let more = map(next, (ns) => match ns { (l, s) -> (l, s, [l, ...path]) })
+          klin_loop(kx, list_append(more, rest), [key, ...seen], steps + 1, concat_lists([v2, v1, dead, acc]))
+        }
+      }
+    } }
+}
+
+fn klin_canon(kx: Kx, b: String, st: LinSt) : (String, LinSt, [LinV]) =
+  if klc_is_doomed(kx.cfg, b) { (cat2(b, "|unreachable"), st, []) }
+  else {
+    let (k, st1, dead) = klk_canon(st, klc_live_at(kx.cfg, b))
+    (concat_all([b, "|", k]), st1, dead)
+  }
+
+fn klin_count(xs: [String], x: String) : Int = match xs {
+  []           -> 0
+  [y, ...rest] -> (if y == x { 1 } else { 0 }) + klin_count(rest, x)
+}
+
+fn klin_dedupe(vs: [LinV], seen: [String]) : [LinV] = match vs {
+  []           -> []
+  [v, ...rest] -> match v {
+    LinV(k, r) -> {
+      let key = concat_all([k, "\t", r])
+      if list_has(seen, key) { klin_dedupe(rest, seen) } else { [v, ...klin_dedupe(rest, [key, ...seen])] }
+    }
+  }
+}
+
+fn concat_lists(xss: [[LinV]]) : [LinV] = match xss {
+  []            -> []
+  [xs, ...rest] -> list_append(xs, concat_lists(rest))
+}

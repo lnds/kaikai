@@ -1,0 +1,148 @@
+#[doc("""
+The take/borrow contract of each KIR op, for the linearity check.
+
+An op takes one owned reference from each atom it consumes, and its result
+is owned, a view into an operand, or a value with no count to track.
+""")]
+
+import compiler.kir
+import compiler.util
+import compiler.name_ix
+import compiler.fnreg
+import compiler.kir_lin_cfg
+
+#[doc("What an op's result holds: an owned reference, a borrowed view, an untracked value, or another register's object.")]
+pub type LinRes = LrOwn | LrView | LrImm | LrAlias(String)
+
+#[doc("An op's effect on its operands: the atoms it consumes (with what consumed them), the atoms whose count it stops tracking, and its result.")]
+pub type LinFx = LinFx([(KVal, String)], [KVal], LinRes)
+
+#[doc("The program's functions by symbol, for the callee side of a direct call's contract.")]
+pub type LinFns = NameIx[KFn]
+
+#[doc("Index `fs` by symbol.")]
+pub fn klo_index(fs: [KFn]) : LinFns = ni_wrap(klo_fill(fs, ni_buckets()))
+
+fn klo_fill(fs: [KFn], acc: Array[[KFn]]) : Array[[KFn]] / Mutable = match fs {
+  []           -> acc
+  [f, ...rest] -> klo_fill(rest, ni_add(acc, f.sym, f))
+}
+
+#[doc("The contract of `op`.")]
+pub fn klo_fx(op: KOp, fns: LinFns) : LinFx = match op {
+  KCall(sym, xs)             -> LinFx(klo_call_takes(sym, xs, 0, fns), [], if klo_borrow_call(sym) { LrImm } else { LrOwn })
+  KCallIndirect(f, xs)       -> LinFx([(f, "call_ind-closure"), ...klo_all(xs, "call_ind-arg")], [], LrOwn)
+  KCallIndirectBorrow(_, xs) -> LinFx(klo_all(xs, "call_ind-arg"), [], LrOwn)
+  KPrim(nm, xs)              -> LinFx(klo_prim_takes(nm, xs, 0), klo_prim_untracks(nm, xs), klo_prim_res(nm))
+  KCon(_, _, _, inits, _)    -> match inits {
+    [] -> LinFx([], [], LrImm)
+    _  -> LinFx(klo_all(map(inits, klc_init_val), "con"), [], LrOwn)
+  }
+  KRecord(fs, _)             -> LinFx(klo_all(map(fs, (fi) => match fi { KFI(_, v) -> v }), "record"), [], LrOwn)
+  KPerform(_, _, _, xs)      -> LinFx(klo_all(xs, "perform"), [], LrOwn)
+  KResumeOp(_, a)            -> LinFx([(a, "resume")], [], LrOwn)
+  KResume2Op(_, a, s)        -> LinFx([(a, "resume"), (s, "resume")], [], LrOwn)
+  KProjKind(_, _, k)         -> LinFx([], [], if k == 2 { LrOwn } else { LrImm })
+  KClosure(_, _, _)          -> LinFx([], [], LrOwn)
+  KProj(_, _)                -> LinFx([], [], LrView)
+  KProjBorrow(_, _)          -> LinFx([], [], LrView)
+  KLitOp(v)                  -> match v {
+    KVar(n) -> LinFx([], [], LrAlias(n))
+    _       -> LinFx([], [], LrImm)
+  }
+  _                          -> LinFx([], [], LrImm)
+}
+
+#[doc("True when `op` belongs to the reuse protocol, which the check does not model.")]
+pub fn klo_is_reuse(op: KOp) : Bool = match op {
+  KConReuse(_, _, _, _, _) -> true
+  KRecordReuse(_, _, _)    -> true
+  KTokenSteal(_, _)        -> true
+  KCall(sym, _)            -> sym == "kaix_incref_if_token_null"
+  _                        -> false
+}
+
+fn klo_all(xs: [KVal], what: String) : [(KVal, String)] = map(xs, (x) => (x, what))
+
+# --- direct calls --------------------------------------------------------
+
+fn klo_call_takes(sym: String, xs: [KVal], i: Int, fns: LinFns) : [(KVal, String)] = match xs {
+  []           -> []
+  [x, ...rest] -> {
+    let tl = klo_call_takes(sym, rest, i + 1, fns)
+    if klo_callee_consumes(sym, i, fns) { [(x, cat2("call:", sym)), ...tl] } else { tl }
+  }
+}
+
+fn klo_callee_consumes(sym: String, i: Int, fns: LinFns) : Bool = match klo_fn(ni_bucket(fns, sym), sym) {
+  Some(f) -> match klo_nth(f.params, i) {
+    Some(p) -> klo_param_owned(p)
+    None    -> true
+  }
+  None    -> if klo_ends(sym, "_borrow") { i > 0 } else { not klo_borrow_call(sym) }
+}
+
+#[doc("True when a callee's param takes ownership of its argument.")]
+pub fn klo_param_owned(p: KParam) : Bool = match p.mode {
+  KBorrow -> false
+  KOwn    -> match p.origin {
+    PDirect(_) -> true
+    _          -> false
+  }
+}
+
+fn klo_nth(ps: [KParam], i: Int) : Option[KParam] = match ps {
+  []           -> None
+  [p, ...rest] -> if i == 0 { Some(p) } else { klo_nth(rest, i - 1) }
+}
+
+fn klo_fn(fs: [KFn], sym: String) : Option[KFn] = match fs {
+  []           -> None
+  [f, ...rest] -> if f.sym == sym { Some(f) } else { klo_fn(rest, sym) }
+}
+
+fn klo_borrow_call(sym: String) : Bool =
+  sym == "kaix_check_unique" or sym == "kaix_incref_if_token_null" or sym == "kaix_truthy" or klo_ends(sym, "_b")
+
+# --- prims ---------------------------------------------------------------
+
+fn klo_prim_takes(nm: String, xs: [KVal], i: Int) : [(KVal, String)] = match xs {
+  []           -> []
+  [x, ...rest] -> {
+    let tl = klo_prim_takes(nm, rest, i + 1)
+    let takes = not klo_prim_borrows(nm) or (klo_ends(nm, "_borrow") and i > 0)
+    if takes { [(x, cat2("prim:", nm)), ...tl] } else { tl }
+  }
+}
+
+# Unboxing a scalar ends its count: the payload is all that is read on.
+fn klo_prim_untracks(nm: String, xs: [KVal]) : [KVal] =
+  if nm == "int.unbox" or nm == "bool.unbox" or nm == "char.unbox" or nm == "byte.unbox" {
+    match xs {
+      [x, ..._] -> [x]
+      []        -> []
+    }
+  } else { [] }
+
+fn klo_prim_borrows(nm: String) : Bool =
+  klo_ends(nm, "_borrow") or klo_ends(nm, "_b") or klo_ends(nm, ".unbox") or
+  nm == "kai_op_field" or nm == "kai_op_field_at" or nm == "kai_vec_get_field_borrow" or
+  nm == "kai_tag_eq" or nm == "kai_eq_raw" or
+  string_starts_with_q(nm, "__fixed_vec_get") or string_starts_with_q(nm, "kai_unw_") or string_starts_with_q(nm, "kai_pad_")
+
+fn klo_prim_res(nm: String) : LinRes =
+  if nm == "kai_op_field_borrow" { LrView }
+  else if klo_prim_imm(nm) { LrImm }
+  else { LrOwn }
+
+fn klo_prim_imm(nm: String) : Bool =
+  string_starts_with_q(nm, "kai_unw_") or string_starts_with_q(nm, "kai_pad_") or klo_ends(nm, "_b") or
+  (klo_ends(nm, ".box") and nm != "real.box") or string_starts_with_q(nm, "__fixed_vec_lit@") or
+  nm == "kai_nil" or nm == "==" or nm == "!=" or nm == "<" or nm == ">" or nm == "<=" or nm == ">=" or
+  nm == "not" or nm == "kai_eq_raw" or nm == "kai_tag_eq"
+
+fn klo_ends(s: String, suffix: String) : Bool = {
+  let sl = string_length(s)
+  let xl = string_length(suffix)
+  xl <= sl and string_slice(s, sl - xl, xl) == suffix
+}

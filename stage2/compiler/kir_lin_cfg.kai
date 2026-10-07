@@ -1,0 +1,191 @@
+#[doc("""
+The control-flow facts the KIR linearity check needs: each block's
+successors, the registers live into it, and the blocks every path out of
+which ends in `unreachable`.
+""")]
+
+import compiler.kir
+import compiler.util
+
+#[doc("The facts of one function's CFG, indexed by block label.")]
+pub type LinCfg = { blocks: [KBlock], live: [(String, [String])], doomed: [String] }
+
+#[doc("The CFG facts of `f`.")]
+pub fn klc_build(f: KFn) : LinCfg = {
+  let pnames = map(f.params, (p) => p.name)
+  let ud = map(f.blocks, (b) => (b.label, klc_uses_defs(b, pnames)))
+  LinCfg { blocks: f.blocks, live: klc_live(f.blocks, ud, map(f.blocks, (b) => (b.label, []))), doomed: klc_doomed(f.blocks, []) }
+}
+
+#[doc("The labels `t` can branch to.")]
+pub fn klc_succ(t: KTerm) : [String] = match t {
+  KBr(l, _)             -> [l]
+  KCondBr(_, a, b, _)   -> [a, b]
+  KSwitch(_, cs, d, _)  -> list_append(map(cs, (c) => match c { KC(_, l) -> l }), [d])
+  _                     -> []
+}
+
+#[doc("The block labelled `l`, if any.")]
+pub fn klc_block(cfg: LinCfg, l: String) : Option[KBlock] = klc_find(cfg.blocks, l)
+
+fn klc_find(bs: [KBlock], l: String) : Option[KBlock] = match bs {
+  []           -> None
+  [b, ...rest] -> if b.label == l { Some(b) } else { klc_find(rest, l) }
+}
+
+#[doc("The registers live on entry to block `l`.")]
+pub fn klc_live_at(cfg: LinCfg, l: String) : [String] = klc_lookup(cfg.live, l)
+
+#[doc("True when every path out of block `l` ends in `unreachable`.")]
+pub fn klc_is_doomed(cfg: LinCfg, l: String) : Bool = list_has(cfg.doomed, l)
+
+fn klc_lookup(xs: [(String, [String])], l: String) : [String] = match xs {
+  []                -> []
+  [(k, v), ...rest] -> if k == l { v } else { klc_lookup(rest, l) }
+}
+
+# --- uses and defs -------------------------------------------------------
+
+# Registers read before any def in the block, and the registers it defines.
+# A loop back-edge reads every param it does not rebind.
+fn klc_uses_defs(b: KBlock, pnames: [String]) : ([String], [String]) = {
+  let (uses, defs) = klc_stmts_ud(b.stmts, [], [])
+  let tu = filter(klc_term_reads(b.term, pnames), (n) => not list_has(defs, n))
+  (list_append(uses, tu), defs)
+}
+
+fn klc_stmts_ud(ss: [KStmt], uses: [String], defs: [String]) : ([String], [String]) = match ss {
+  []           -> (uses, defs)
+  [s, ...rest] -> {
+    let reads = filter(klc_stmt_reads(s), (n) => not list_has(defs, n))
+    klc_stmts_ud(rest, list_append(uses, reads), list_append(defs, klc_stmt_defs(s)))
+  }
+}
+
+fn klc_stmt_defs(s: KStmt) : [String] = match s {
+  KLet(x, _, _, _)   -> [x]
+  KStore(x, _, _)    -> [x]
+  _                  -> []
+}
+
+#[doc("The registers a statement reads.")]
+pub fn klc_stmt_reads(s: KStmt) : [String] = match s {
+  KLet(_, _, op, _)          -> klc_op_reads(op)
+  KDo(op, _)                 -> klc_op_reads(op)
+  KRC(rc, _)                 -> klc_rc_reads(rc)
+  KStore(_, v, _)            -> klc_vars([v])
+  KInstall(_, _, st, _, _)   -> match st { Some(v) -> klc_vars([v])  None -> [] }
+  _                          -> []
+}
+
+fn klc_rc_reads(rc: KRCOp) : [String] = match rc {
+  KDup(v)                -> klc_vars([v])
+  KDrop(v)               -> klc_vars([v])
+  KFreeToken(v)          -> klc_vars([v])
+  KIncrefIfShared(a, b)  -> klc_vars([a, b])
+  KArmTopReuse(v, _, _, _) -> klc_vars([v])
+  KArmTokenFree          -> []
+}
+
+#[doc("The registers an op reads.")]
+pub fn klc_op_reads(op: KOp) : [String] = klc_vars(klc_op_atoms(op))
+
+fn klc_op_atoms(op: KOp) : [KVal] = match op {
+  KCall(_, xs)                  -> xs
+  KCallIndirect(f, xs)          -> [f, ...xs]
+  KCallIndirectBorrow(f, xs)    -> [f, ...xs]
+  KPrim(_, xs)                  -> xs
+  KCon(_, _, _, inits, _)       -> map(inits, klc_init_val)
+  KRecord(fs, _)                -> map(fs, (fi) => match fi { KFI(_, v) -> v })
+  KConReuse(_, d, _, _, inits)  -> [d, ...map(inits, klc_init_val)]
+  KRecordReuse(d, fs, _)        -> [d, ...map(fs, (fi) => match fi { KFI(_, v) -> v })]
+  KTokenSteal(v, _)             -> [v]
+  KProj(v, _)                   -> [v]
+  KProjBorrow(v, _)             -> [v]
+  KProjKind(v, _, _)            -> [v]
+  KTagOf(v)                     -> [v]
+  KClosure(_, _, xs)            -> xs
+  KPerform(_, _, _, xs)         -> xs
+  KSetjmp(_, _)                 -> []
+  KResumeOp(k, a)               -> [k, a]
+  KResume2Op(k, a, s)           -> [k, a, s]
+  KLitOp(v)                     -> [v]
+}
+
+#[doc("The atom a constructor slot is initialised with.")]
+pub fn klc_init_val(i: KSlotInit) : KVal = match i {
+  SIBoxed(v) -> v
+  SIInt64(v) -> v
+  SIReal(v)  -> v
+  SIEnum(v)  -> v
+}
+
+fn klc_term_reads(t: KTerm, pnames: [String]) : [String] = match t {
+  KRet(v, _)                                -> klc_vars([v])
+  KCondBr(v, _, _, _)                       -> klc_vars([v])
+  KSwitch(v, _, _, _)                       -> klc_vars([v])
+  KTcrecGoto(_, asg, _, _)                  -> list_append(klc_vars(map(asg, klc_asg_val)), pnames)
+  KTrmcStep(_, _, _, _, _, _, hs, asg, _, _) -> list_append(klc_vars(list_append(hs, map(asg, klc_asg_val))), pnames)
+  KTrmcApply(v, _)                          -> klc_vars([v])
+  _                                         -> []
+}
+
+#[doc("The value a loop back-edge assigns.")]
+pub fn klc_asg_val(a: KAssign) : KVal = match a { KAsg(_, v) -> v }
+
+fn klc_vars(vs: [KVal]) : [String] = match vs {
+  []           -> []
+  [v, ...rest] -> match v {
+    KVar(n) -> [n, ...klc_vars(rest)]
+    _       -> klc_vars(rest)
+  }
+}
+
+# --- liveness and doomed blocks ------------------------------------------
+
+fn klc_live(bs: [KBlock], ud: [(String, ([String], [String]))], cur: [(String, [String])]) : [(String, [String])] = {
+  let next = map(bs, (b) => (b.label, klc_live_in(b, ud, cur)))
+  if klc_same(next, cur) { cur } else { klc_live(bs, ud, next) }
+}
+
+fn klc_live_in(b: KBlock, ud: [(String, ([String], [String]))], cur: [(String, [String])]) : [String] = {
+  let (uses, defs) = klc_ud_of(ud, b.label)
+  let out = klc_union_all(map(klc_succ(b.term), (s) => klc_lookup(cur, s)))
+  klc_union(uses, filter(out, (n) => not list_has(defs, n)))
+}
+
+fn klc_ud_of(ud: [(String, ([String], [String]))], l: String) : ([String], [String]) = match ud {
+  []                 -> ([], [])
+  [(k, v), ...rest]  -> if k == l { v } else { klc_ud_of(rest, l) }
+}
+
+fn klc_same(a: [(String, [String])], b: [(String, [String])]) : Bool = match a {
+  []                 -> true
+  [(k, v), ...rest]  -> list_length(v) == list_length(klc_lookup(b, k)) and klc_same(rest, b)
+}
+
+fn klc_union_all(xss: [[String]]) : [String] = match xss {
+  []            -> []
+  [xs, ...rest] -> klc_union(xs, klc_union_all(rest))
+}
+
+fn klc_union(xs: [String], ys: [String]) : [String] = match xs {
+  []           -> ys
+  [x, ...rest] -> if list_has(ys, x) { klc_union(rest, ys) } else { klc_union(rest, [x, ...ys]) }
+}
+
+fn klc_doomed(bs: [KBlock], acc: [String]) : [String] = {
+  let next = filter(map(bs, (b) => b.label), (l) => list_has(acc, l) or klc_dooms(bs, l, acc))
+  if list_length(next) == list_length(acc) { acc } else { klc_doomed(bs, next) }
+}
+
+fn klc_dooms(bs: [KBlock], l: String, acc: [String]) : Bool = match klc_find(bs, l) {
+  None    -> false
+  Some(b) -> match b.term {
+    KUnreachable(_) -> true
+    t               -> match klc_succ(t) {
+      []         -> false
+      ss         -> all(ss, (s) => list_has(acc, s))
+    }
+  }
+}

@@ -7,6 +7,7 @@ One file per key, so two changes to different keys never conflict. The file name
 | `rc-leak/` | `examples/perceus` fixture | `<c>:<native>` | `tools/rc-leak-gate.sh` |
 | `rc-growth/` | `examples/perceus` fixture | `<c>:<native>` | `tools/rc-leak-gate.sh` |
 | `rc-effects-growth/` | `examples/effects` fixture | `<c>:<native>` | `tools/rc-leak-gate.sh` |
+| `kir-lin/` | `<corpus>-<fixture>` | KIR linearity violations on native | `tools/rc-leak-gate.sh` |
 | `nscol/` | namespace-collision axis | allowed failure count | `tools/nscol-ratchet.sh`, `tests/namespace_matrix.sh` |
 
 A `-` in a backend column skips the fixture on that backend; the reason lives in `tools/rc-leak-skips.txt`.
@@ -24,6 +25,10 @@ Each count is `alloc_total - free_total` from the runtime ledger under `KAI_TRAC
 ## `rc-growth/` and `rc-effects-growth/` — memory retained per run
 
 Growth is `leaked(2 runs) - leaked(1 run)` under `KAI_TRACE_RC_RUNS`: what one run of `main` retains and never frees. A fixture with no file must grow by 0; a listed one must match its pin exactly. The lists only shrink, and a negative growth fails the gate because it means the ledger missed allocations. `examples/effects` is held to growth only.
+
+## `kir-lin/` — owned references a native build leaves unpaid
+
+The count is the number of distinct violations the KIR linearity check (`stage2/compiler/kir_lin.kai`) reports for the fixture's native build: an owned reference consumed without being held, or still held at a return, a loop back-edge or once nothing reads it. A missing file means 0. When a fix lowers a count, lower the pin; a violation the fix did not touch shows in the gate's output with its function.
 
 ## `nscol/` — failures allowed per namespace-collision axis
 
