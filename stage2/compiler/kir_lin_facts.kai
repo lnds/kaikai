@@ -1,0 +1,125 @@
+#[doc("""
+What the KIR linearity check knows about a function before walking it:
+which registers are boxed, which branches land from a `setjmp`, which
+params carry evidence, and the ledger its params start with.
+""")]
+
+import compiler.kir
+import compiler.util
+import compiler.kir_lin_cfg
+import compiler.kir_lin_ops
+import compiler.kir_lin_state
+
+#[doc("One function under check: its KIR, the program's functions, its CFG facts, which registers are boxed, and its `setjmp` registers.")]
+pub type Kx = { f: KFn, fns: LinFns, cfg: LinCfg, slots: [(String, Bool)], setjmps: [String] }
+
+#[doc("The facts of `f`.")]
+pub fn klf_cx(f: KFn, fns: LinFns) : Kx =
+  Kx { f: f, fns: fns, cfg: klc_build(f), slots: klin_slots(f), setjmps: klin_setjmps(f.blocks) }
+
+#[doc("The ledger the params of `kx` start with.")]
+pub fn klf_entry(kx: Kx) : LinSt = klin_entry(kx.f.params, klin_caps(kx.f.blocks), kls_empty())
+
+#[doc("True when register `n` holds a boxed value.")]
+pub fn klf_boxed(kx: Kx, n: String) : Bool = match klin_slot_of(kx.slots, n) {
+  Some(b) -> b
+  None    -> false
+}
+
+# A capability param carries evidence, not a counted value.
+fn klin_entry(ps: [KParam], caps: [String], st: LinSt) : LinSt = match ps {
+  []           -> st
+  [p, ...rest] -> klin_entry(rest, caps, match p.slot {
+    SBoxed -> match p.origin {
+      PResume -> st
+      _       -> if list_has(caps, p.name) { st } else { kls_fresh(st, p.name, if klin_param_held(p) { 1 } else { 0 }) }
+    }
+    _ -> st
+  })
+}
+
+# The capability params a perform names: `op#cap`.
+fn klin_caps(bs: [KBlock]) : [String] = match bs {
+  []           -> []
+  [b, ...rest] -> list_append(klin_stmt_caps(b.stmts), klin_caps(rest))
+}
+
+fn klin_stmt_caps(ss: [KStmt]) : [String] = match ss {
+  []           -> []
+  [s, ...rest] -> match s {
+    KLet(_, _, KPerform(_, _, op, _), _) -> list_append(klin_cap_of(op), klin_stmt_caps(rest))
+    KDo(KPerform(_, _, op, _), _)        -> list_append(klin_cap_of(op), klin_stmt_caps(rest))
+    _                                    -> klin_stmt_caps(rest)
+  }
+}
+
+fn klin_cap_of(op: String) : [String] = {
+  let i = string_index_of_char(op, '#')
+  if i < 0 { [] } else { [string_slice(op, i + 1, string_length(op) - i - 1)] }
+}
+
+# A param the function owns: not borrowed, passed directly or captured into
+# a handler's environment.
+fn klin_param_held(p: KParam) : Bool = match p.mode {
+  KBorrow -> false
+  KOwn    -> match p.origin {
+    PDirect(_)    -> true
+    PEnvCapture(_) -> true
+    _             -> false
+  }
+}
+
+
+# A register let-bound at two slot kinds counts as boxed.
+fn klin_slots(f: KFn) : [(String, Bool)] =
+  klin_let_slots(f.blocks, map(f.params, (p) => (p.name, klin_is_box(p.slot))))
+
+fn klin_let_slots(bs: [KBlock], acc: [(String, Bool)]) : [(String, Bool)] = match bs {
+  []           -> acc
+  [b, ...rest] -> klin_let_slots(rest, klin_stmt_slots(b.stmts, acc))
+}
+
+fn klin_stmt_slots(ss: [KStmt], acc: [(String, Bool)]) : [(String, Bool)] = match ss {
+  []           -> acc
+  [s, ...rest] -> klin_stmt_slots(rest, match s {
+    KLet(x, sl, _, _) -> match klin_slot_of(acc, x) {
+      None    -> [(x, klin_is_box(sl)), ...acc]
+      Some(b) -> if b == klin_is_box(sl) { acc } else { [(x, true), ...acc] }
+    }
+    _ -> acc
+  })
+}
+
+fn klin_slot_of(xs: [(String, Bool)], n: String) : Option[Bool] = match xs {
+  []                -> None
+  [(k, b), ...rest] -> if k == n { Some(b) } else { klin_slot_of(rest, n) }
+}
+
+fn klin_is_box(s: KSlot) : Bool = match s {
+  SBoxed -> true
+  _      -> false
+}
+
+fn klin_setjmps(bs: [KBlock]) : [String] = match bs {
+  []           -> []
+  [b, ...rest] -> list_append(klin_setjmp_regs(b.stmts), klin_setjmps(rest))
+}
+
+fn klin_setjmp_regs(ss: [KStmt]) : [String] = match ss {
+  []           -> []
+  [s, ...rest] -> match s {
+    KLet(x, _, KSetjmp(_, _), _) -> [x, ...klin_setjmp_regs(rest)]
+    _                            -> klin_setjmp_regs(rest)
+  }
+}
+
+#[doc("True when a block of `bs` uses the reuse protocol, which the check does not model.")]
+pub fn klf_uses_reuse(bs: [KBlock]) : Bool = any(bs, (b) => any(b.stmts, klin_stmt_reuse))
+
+fn klin_stmt_reuse(s: KStmt) : Bool = match s {
+  KLet(_, _, op, _)           -> klo_is_reuse(op)
+  KDo(op, _)                  -> klo_is_reuse(op)
+  KRC(KArmTopReuse(_, _, _, _), _) -> true
+  KRC(KArmTokenFree, _)       -> true
+  _                           -> false
+}

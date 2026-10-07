@@ -63,6 +63,7 @@ import compiler.qual_head
 import compiler.user_cache
 import compiler.typed_cut
 import compiler.test_plan
+import compiler.kir_lin
 import compiler.core_cache
 import compiler.loop_lower
 import compiler.desugar
@@ -1736,7 +1737,10 @@ pub type CliOptions = { mode: Mode, backend: Backend, path: Option[String], core
                     # one of a grouped build's test files; `--test-plan <file>`
                     # gets each one's test-block run order.
                     test_roots: [String],
-                    test_plan: String }
+                    test_plan: String,
+                    # `--kir-verify <file>` writes the KIR linearity check's
+                    # violations there; the check runs only when it is set.
+                    kir_verify: String }
 
 fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
   CliOptions { ...opts, mode: m }
@@ -1964,6 +1968,14 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
             cli_with_mode(opts, MUsageError)
           }
         }
+      } else if a == "--kir-verify" {
+        match more {
+          [f, ...rest2] -> parse_cli_loop(rest2, CliOptions { ...opts, kir_verify: f })
+          [] -> {
+            eprint("kaic2: --kir-verify requires a file argument")
+            cli_with_mode(opts, MUsageError)
+          }
+        }
       } else if a == "--native-obj-dir" {
         match more {
           [d, ...rest2] -> parse_cli_loop(rest2, cli_with_nmod_dir(opts, d))
@@ -2155,7 +2167,7 @@ pub fn parse_cli(argv: [String]) : CliOptions / Console {
                                     strict_holes: false, search_paths: [],
                                     package_name: "", unstable_optins: [],
                                     edition: "", user_cache: false, core_cache: cc_opt_off(),
-                                    test_roots: [], test_plan: "" })
+                                    test_roots: [], test_plan: "", kir_verify: "" })
 }
 
 fn usage() : Unit / Console {
@@ -4715,7 +4727,7 @@ fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl],
   }
 }
 
-fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, core_decls: [Decl], core_mods: [ModuleEntry], core_segs: [CoreSegment], package_name: String, unstable_optins: [String], edition: String, user_cache: Bool, batch_out: Option[String], core_cache: CoreCacheOpt, test_roots: [String], test_plan: String) : Int / Console + File {
+fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool, search_paths: [String], src: String, core_decls: [Decl], core_mods: [ModuleEntry], core_segs: [CoreSegment], package_name: String, unstable_optins: [String], edition: String, user_cache: Bool, batch_out: Option[String], core_cache: CoreCacheOpt, test_roots: [String], test_plan: String, kir_verify: String) : Int / Console + File {
 
   let tokens = tokenize(src)
   let lexed = lex_diags(path, src, tokens)
@@ -5817,8 +5829,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                         let nfns = register_fn_decls(perceus_decls)
                         let nvariants = register_variants(perceus_decls)
                         let ncore_names = core_mod_names(core_mods, [])
-                        let kp = ncore_prune_unreachable(kir_inline_program(lower_to_kir(perceus_decls, region_marks, nfns, nvariants, Some(target_mod_name), raw_arm_binders, true)),
-                                                         perceus_decls, nfns, bmode, ncore_names)
+                        let kp = kir_lin_hook(ncore_prune_unreachable(kir_inline_program(lower_to_kir(perceus_decls, region_marks, nfns, nvariants, Some(target_mod_name), raw_arm_binders, true)),
+                                                         perceus_decls, nfns, bmode, ncore_names), kir_verify)
                         let obj_path = native_object_path(path)
                         # Core-object split: with the shared core cache
                         # available (dir + toolchain id) and a backend tag
@@ -5848,8 +5860,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                         # one object path per line for the wrapper to link.
                         let nfns = register_fn_decls(perceus_decls)
                         let nvariants = register_variants(perceus_decls)
-                        let kp = ncore_prune_unreachable(kir_inline_program(lower_to_kir(perceus_decls, region_marks, nfns, nvariants, Some(target_mod_name), raw_arm_binders, true)),
-                                                         perceus_decls, nfns, bmode, core_mod_names(core_mods, []))
+                        let kp = kir_lin_hook(ncore_prune_unreachable(kir_inline_program(lower_to_kir(perceus_decls, region_marks, nfns, nvariants, Some(target_mod_name), raw_arm_binders, true)),
+                                                         perceus_decls, nfns, bmode, core_mod_names(core_mods, [])), kir_verify)
                         let obj_dir = if core_cache.nmod_dir == "" { dir_of(path) } else { core_cache.nmod_dir }
                         let objs = build_native_modular(kp, perceus_decls, nvariants, nfns, bmode,
                                                         dir_of(path), Some(obj_dir), path)
@@ -5950,7 +5962,7 @@ fn batch_compile_loop(entries: [BatchEntry], pds: [Decl], pmods: [ModuleEntry],
                                  opts.search_paths, src, pds, pmods, psegs,
                                  opts.package_name, opts.unstable_optins,
                                  opts.edition, opts.user_cache, Some(outp),
-                                 opts.core_cache, [], "")
+                                 opts.core_cache, [], "", "")
     }
     let nfail1 = if rc == 0 { nfail } else { nfail + 1 }
     batch_compile_loop(rest, pds, pmods, psegs, opts, nfail1)
@@ -6046,7 +6058,7 @@ pub fn run(opts: CliOptions) : Int / Console + File {
           None -> 1
           Some(pls) -> match pls {
             PLS(pds, pmods, psegs) -> match read_file(p) {
-              Ok(src) -> close_front(opts.mode, p, compile_source(p, opts.mode, opts.backend, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache, None, opts.core_cache, opts.test_roots, opts.test_plan))
+              Ok(src) -> close_front(opts.mode, p, compile_source(p, opts.mode, opts.backend, opts.strict_holes, opts.search_paths, src, pds, pmods, psegs, opts.package_name, opts.unstable_optins, opts.edition, opts.user_cache, None, opts.core_cache, opts.test_roots, opts.test_plan, opts.kir_verify))
               Err(msg) -> { eprint("kaic2: #{p}: #{msg}"); 1 }
             }
           }

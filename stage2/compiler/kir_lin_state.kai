@@ -1,0 +1,124 @@
+#[doc("""
+The reference ledger the KIR linearity check carries along one path.
+
+A boxed value is an object; registers are names bound to objects, so a
+copy aliases. Each object holds the number of owned references the
+function has on it. Consuming an object that holds none, or reaching an
+exit while one still holds some, is a violation.
+""")]
+
+import compiler.util
+
+#[doc("A violation: its kind and the registers naming the object.")]
+pub type LinV = LinV(String, String)
+
+#[doc("One path's ledger: register to object, object to owned count, the next object id, and the registers known to hold a constant Bool.")]
+pub type LinSt = { names: [(String, Int)], creds: [(Int, Int)], next: Int, consts: [(String, Bool)] }
+
+#[doc("The count of a value the check does not track: a static, immortal or unboxed value.")]
+pub const UNTRACKED : Int = 1000000
+
+#[doc("The empty ledger.")]
+pub fn kls_empty() : LinSt = LinSt { names: [], creds: [], next: 0, consts: [] }
+
+#[doc("Bind `n` to a fresh object holding `c` owned references.")]
+pub fn kls_fresh(st: LinSt, n: String, c: Int) : LinSt =
+  LinSt { ...st, names: kls_put(st.names, n, st.next), creds: [(st.next, c), ...st.creds], next: st.next + 1 }
+
+#[doc("Bind `n` to a fresh object whose count is not tracked.")]
+pub fn kls_fresh_imm(st: LinSt, n: String) : LinSt = kls_fresh(st, n, UNTRACKED)
+
+#[doc("Bind `n` to the object `src` names.")]
+pub fn kls_alias(st: LinSt, n: String, src: String) : LinSt = match kls_obj_of(st.names, src) {
+  Some(o) -> LinSt { ...st, names: kls_put(st.names, n, o) }
+  None    -> kls_fresh_imm(kls_fresh_imm(st, src), n)
+}
+
+#[doc("Take one owned reference from the object `n` names; a take from an object holding none is a violation.")]
+pub fn kls_take(st: LinSt, n: String, what: String) : (LinSt, [LinV]) = match kls_obj_of(st.names, n) {
+  None    -> (st, [])
+  Some(o) -> {
+    let c = kls_cred(st, o)
+    if c >= UNTRACKED { (st, []) }
+    else if c <= 0 { (st, [LinV(cat2("consume-unowned:", what), n)]) }
+    else { (kls_set(st, o, c - 1), []) }
+  }
+}
+
+#[doc("Add one owned reference to the object `n` names.")]
+pub fn kls_dup(st: LinSt, n: String) : LinSt = match kls_obj_of(st.names, n) {
+  None    -> st
+  Some(o) -> {
+    let c = kls_cred(st, o)
+    if c >= UNTRACKED { st } else { kls_set(st, o, c + 1) }
+  }
+}
+
+#[doc("Stop tracking the object `n` names.")]
+pub fn kls_untrack(st: LinSt, n: String) : LinSt = match kls_obj_of(st.names, n) {
+  None    -> st
+  Some(o) -> kls_set(st, o, UNTRACKED)
+}
+
+#[doc("A store of `src` into the join register `t`: the store moves one reference into a fresh object; overwriting the last name of an owned object is a violation.")]
+pub fn kls_store(st: LinSt, t: String, src: Option[String]) : (LinSt, [LinV]) =
+  (kls_move_into(st, t, match src { Some(s) -> kls_obj_of(st.names, s)  None -> None }), kls_overwrite(st, t))
+
+fn kls_overwrite(st: LinSt, t: String) : [LinV] = match kls_obj_of(st.names, t) {
+  None    -> []
+  Some(o) -> {
+    let c = kls_cred(st, o)
+    if c > 0 and c < UNTRACKED and not kls_shared(st.names, o, t) { [LinV("store-over-owned", t)] } else { [] }
+  }
+}
+
+fn kls_move_into(st: LinSt, t: String, src: Option[Int]) : LinSt = match src {
+  None    -> kls_fresh_imm(st, t)
+  Some(o) -> {
+    let c = kls_cred(st, o)
+    if c >= UNTRACKED { kls_fresh_imm(st, t) }
+    else if c > 0 { kls_fresh(kls_set(st, o, c - 1), t, 1) }
+    else { kls_fresh(st, t, 0) }
+  }
+}
+
+#[doc("Record that `n` holds the constant `b`, or forget it.")]
+pub fn kls_const(st: LinSt, n: String, b: Option[Bool]) : LinSt = {
+  let rest = filter(st.consts, (kv) => match kv { (k, _) -> k != n })
+  let cs = match b { Some(v) -> [(n, v), ...rest]  None -> rest }
+  LinSt { ...st, consts: cs }
+}
+
+#[doc("The constant `n` is known to hold, if any.")]
+pub fn kls_const_of(st: LinSt, n: String) : Option[Bool] = kls_const_in(st.consts, n)
+
+fn kls_const_in(cs: [(String, Bool)], n: String) : Option[Bool] = match cs {
+  []                -> None
+  [(k, v), ...rest] -> if k == n { Some(v) } else { kls_const_in(rest, n) }
+}
+
+# --- internals -----------------------------------------------------------
+
+fn kls_put(xs: [(String, Int)], n: String, o: Int) : [(String, Int)] =
+  [(n, o), ...filter(xs, (kv) => match kv { (k, _) -> k != n })]
+
+#[doc("The object `n` names, if bound.")]
+pub fn kls_obj_of(xs: [(String, Int)], n: String) : Option[Int] = match xs {
+  []                -> None
+  [(k, o), ...rest] -> if k == n { Some(o) } else { kls_obj_of(rest, n) }
+}
+
+#[doc("The owned count of object `o`.")]
+pub fn kls_cred(st: LinSt, o: Int) : Int = kls_cred_in(st.creds, o)
+
+fn kls_cred_in(cs: [(Int, Int)], o: Int) : Int = match cs {
+  []                -> UNTRACKED
+  [(k, c), ...rest] -> if k == o { c } else { kls_cred_in(rest, o) }
+}
+
+#[doc("Set object `o`'s owned count to `c`.")]
+pub fn kls_set(st: LinSt, o: Int, c: Int) : LinSt =
+  LinSt { ...st, creds: [(o, c), ...filter(st.creds, (kv) => match kv { (k, _) -> k != o })] }
+
+fn kls_shared(xs: [(String, Int)], o: Int, t: String) : Bool =
+  any(xs, (kv) => match kv { (k, oo) -> oo == o and k != t })
