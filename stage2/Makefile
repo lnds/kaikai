@@ -4970,7 +4970,11 @@ test-effects-array_mutable_required: $(TARGET) build core-cache-warm
 	         ../examples/effects/record_field_fn_row_extra.kai \
 	         ../examples/effects/record_row_param_undeclared.kai \
 	         ../examples/effects/record_row_param_invariant.kai \
-	         ../examples/effects/record_row_param_cap_escape.kai; do \
+	         ../examples/effects/record_row_param_cap_escape.kai \
+	         ../examples/effects/row_var_sum_unhandled.kai \
+	         ../examples/effects/row_var_record_unhandled.kai \
+	         ../examples/effects/row_var_lambda_unhandled.kai \
+	         ../examples/effects/open_row_extra_label.kai; do \
 	  name=$$(basename $$f .kai); \
 	  exp_err=$${f%.kai}.err.expected; \
 	  rc=0; $(KAIC2) $(TEST_CORE_CACHE) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
