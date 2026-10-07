@@ -334,4 +334,39 @@ printf '%s\n' "$out" | grep -qE '^perceus (twice|half) (twice|half)#[0-9]+ (twic
 printf '%s\n' "$out" | grep -qE '^perceus step step#[0-9]+ step@mb$' \
   && fail "mb.step's call to ma.step reached Perceus as a self-call"
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, a qualified call names the one its qualifier homes, and a constructor site, nested or not, names the home its type picked"
+# A capability annotated by an effect spelled like a core type names the
+# effect, from the declaring module and from one that imports it, cold
+# and warm: types and effects climb one ladder, nearest first.
+EFIX="$ROOT/examples/effects/capability_param_core_type_homonym.kai"
+ECACHE="$(mktemp -d)"
+EIMP="$(mktemp -d)"
+trap 'rm -rf "$CACHE" "$TWIN" "$CUTCACHE" "$CTORCACHE" "$QCACHE" "$ECACHE" "$EIMP"' EXIT
+cat > "$EIMP/tasks.kai" <<'KAI'
+pub effect Child {
+  get() : Int
+}
+
+pub fn twice(c: Child) : Int = c.get() + c.get()
+KAI
+cat > "$EIMP/main.kai" <<'KAI'
+import tasks
+
+fn main() : Unit / Stdout = handle {
+  Stdout.print(int_to_string(tasks.twice(k)))
+} with tasks.Child as k {
+  get(resume) -> resume(21)
+}
+KAI
+for pass in cold warm; do
+  out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --user-cache --user-cache-dir "$ECACHE" \
+          --core-cache-dir "$ECACHE" --dump-symids --path "$ROOT/stdlib" "$EFIX")
+  [ "$(printf '%s\n' "$out" | grep -cE '^perceus (send|add) Child\.(get|put|rec)#[a-z0-9]+#[0-9]+ Child@capability_param_core_type_homonym$')" = 5 ] \
+    || fail "a capability spelled like a core type did not name the file's effect ($pass)"
+  printf '%s\n' "$out" | grep -q 'Child@os' && fail "a capability op named the core type ($pass)"
+  out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --user-cache --user-cache-dir "$ECACHE" \
+          --core-cache-dir "$ECACHE" --dump-symids --path "$EIMP" --path "$ROOT/stdlib" "$EIMP/main.kai")
+  need '^perceus twice Child\.get#c#[0-9]+ Child@tasks$'
+  printf '%s\n' "$out" | grep -q 'Child@os' && fail "an imported capability op named the core type ($pass)"
+done
+
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, a qualified call names the one its qualifier homes, and a constructor site, nested or not, names the home its type picked, and a capability spelled like a core type names its effect"
