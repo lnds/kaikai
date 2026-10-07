@@ -374,4 +374,33 @@ done
 grep -nE 'EVar\(mangled\)|EModCall\([a-z]+, mangled\)' "$ROOT/stage2/compiler/monomorph.kai" \
   && fail "monomorph mints a spec callee from its mangled name"
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, a qualified call names the one its qualifier homes, a constructor site, nested or not, names the home its type picked, a capability spelled like a core type names its effect, and a specialised callee is always its spec's id"
+# A cell perform names the core `State`/`Reader`: the native backend finds
+# the op's handler by that id alone. The fixtures cover the cell shapes and
+# the cells stdlib keeps; the sweep covers every corpus file declaring one.
+cell_dump() {
+  "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
+    --path "$ROOT/stdlib" "$ROOT/examples/effects/$1.kai"
+}
+cell_core() {
+  printf '%s\n' "$out" | grep -E '^kperform [^ ]+ (State|Reader)\.' \
+    | grep -vqE ' (State|Reader)@concurrent$' && fail "a cell perform does not name the core effect ($1)"
+  return 0
+}
+out=$(cell_dump cell_perform_ids)
+need '^kperform _kaiu_stacked__clause_[0-9_]+_push State\.[a-z]+#[0-9]+ State@concurrent$'
+need '^kperform reads Reader\.ask@env#[0-9]+ Reader@concurrent$'
+need '^kperform _kaiu_lam_reads_[0-9_]+ Reader\.ask@env#[0-9]+ Reader@concurrent$'
+cell_core cell_perform_ids
+out=$(cell_dump cell_perform_ids_stdlib)
+need '^kperform _kaiu_lam_captured_[0-9_]+ State\.[a-z]+(@c)?#[0-9]+ State@concurrent$'
+need '^kperform stream__count State\.[a-z]+(@[a-z_]+)?#[0-9]+ State@concurrent$'
+need '^kperform math__bigint_limbs__mag_mul State\.[a-z]+(@[a-z_]+)?#[0-9]+ State@concurrent$'
+cell_core cell_perform_ids_stdlib
+out=$(grep -rlE '(^|[^a-z_])var |with (State|Reader)' "$ROOT/examples" --include='*.kai' \
+  | grep -v /negative/ \
+  | xargs -P 8 -n 1 sh -c '"$0" --edition "$1" --dump-symids --path "$(dirname "$3")" --path "$2" "$3" 2>/dev/null \
+      | grep -E "^kperform [^ ]+ [^ ]+#-1 " | sed "s|^|$3: |"; exit 0' \
+      "$ROOT/stage2/kaic2" "$(cat "$ROOT/EDITION")" "$ROOT/stdlib")
+[ -z "$out" ] || fail "a corpus perform reached KIR with no effect id"
+
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, a qualified call names the one its qualifier homes, a constructor site, nested or not, names the home its type picked, a capability spelled like a core type names its effect, a specialised callee is always its spec's id, and every cell perform names the core State or Reader"
