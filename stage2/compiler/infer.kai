@@ -8838,21 +8838,43 @@ fn rec_tpbinds_loop(tps: [String], start: Int, i: Int, acc: [TPBind]) : [TPBind]
   }
 }
 
-fn rec_field_tys(fs: [FieldDecl], binds: [TPBind], hv: TyHomeView) : [FTy] {
+fn rec_field_tys(fs: [FieldDecl], binds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry], hv: TyHomeView) : [FTy] {
   match fs {
     [] -> []
     [f, ...rest] -> match f {
-      FD(_, nm, te, _) -> [FT(nm, resolve_ty_with_tparams(te, binds, hv)), ...rec_field_tys(rest, binds, hv)]
+      FD(_, nm, te, _) -> [FT(nm, rec_field_ty(te, binds, rbinds, rk, hv)), ...rec_field_tys(rest, binds, rbinds, rk, hv)]
     }
   }
 }
 
-fn fresh_tv_range_loop(start: Int, n: Int, i: Int, acc: [Ty]) : [Ty] {
-  if i >= n { list_reverse(acc) }
-  else { fresh_tv_range_loop(start, n, i + 1, [TyVarT(start + i), ...acc]) }
+# A record without a row-kind tparam keeps every field row closed on its
+# declared labels.
+fn rec_field_ty(te: TypeExpr, binds: [TPBind], rbinds: [RVBind], rk: [RowKindEntry], hv: TyHomeView) : Ty =
+  match rbinds {
+    [] -> resolve_ty_with_tparams(te, binds, hv)
+    _  -> resolve_ty_with_binds(te, binds, rbinds, rk, hv)
+  }
+
+type RecRows = { binds: [RVBind], sub: Subst }
+
+# One fresh row var per row-kind tparam, per instantiation: a shared id
+# would let two instances' rows unify with each other.
+fn rec_row_binds(tps: [String], row_names: [String], s: Subst, acc: [RVBind]) : RecRows {
+  match tps {
+    [] -> RecRows { binds: list_reverse(acc), sub: s }
+    [n, ...rest] ->
+      if list_has(row_names, n) {
+        let fr = subst_fresh_row(s)
+        rec_row_binds(rest, row_names, fr.subst, [RVB(n, fr.id), ...acc])
+      } else { rec_row_binds(rest, row_names, s, acc) }
+  }
 }
 
-fn fresh_tv_range(start: Int, n: Int) : [Ty] = fresh_tv_range_loop(start, n, 0, [])
+fn rec_head_slots(tps: [String], binds: [TPBind], rbinds: [RVBind]) : [Ty] =
+  map(tps, (n) => match inf_rvbind_lookup(rbinds, n) {
+    Some(id) -> row_arg_carrier(row_with_tail(id))
+    None     -> tv(tpbind_id_of(binds, n))
+  })
 
 fn rec_instantiate(st: InferState, ri: RecInfo) : RecInst {
   match ri {
@@ -8866,11 +8888,11 @@ fn rec_instantiate(st: InferState, ri: RecInfo) : RecInst {
       let n = list_length(tps)
       let env2 = advance_fresh(st.env, n)
       let binds = rec_tpbinds_loop(tps, start, 0, [])
-      let flds = rec_field_tys(fs, binds, st_home_view(st))
-      let atys = fresh_tv_range(start, n)
+      let rows = rec_row_binds(tps, row_names_of_fields(fs, []), st.sub, [])
+      let flds = rec_field_tys(fs, binds, rows.binds, st.env.row_kind, st_home_view(st))
       RecInst {
-        st: st_set_env(st, env2),
-        result_ty: TyCon(mo, nm, atys, tsh_decl_sym(st.env.ty_homes, mo, nm)),
+        st: st_set_sub(st_set_env(st, env2), rows.sub),
+        result_ty: TyCon(mo, nm, rec_head_slots(tps, binds, rows.binds), tsh_decl_sym(st.env.ty_homes, mo, nm)),
         fields: flds
       }
     }
