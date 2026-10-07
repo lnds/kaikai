@@ -19,6 +19,7 @@ REQUIRED = {
     "in_scope",
     "scope_elided",
     "candidates",
+    "candidates_needing_effects",
 }
 
 VALID_KINDS = {"hole", "todo"}
@@ -52,7 +53,11 @@ def main() -> int:
         if row["kind"] == "todo" and not isinstance(row["message"], str):
             print(f"entry {i}: todo sites must have a string message", file=sys.stderr)
             return 1
-        for c in row["candidates"]:
+        for c in row["candidates_needing_effects"]:
+            if not c["effects"]:
+                print(f"entry {i}: candidate {c['expr']!r} needs no effect but is not in candidates", file=sys.stderr)
+                return 1
+        for c in row["candidates"] + row["candidates_needing_effects"]:
             if any(m in c["expr"] for m in INTERNAL_MARKS):
                 print(f"entry {i}: candidate {c['expr']!r} is not a source expression", file=sys.stderr)
                 return 1

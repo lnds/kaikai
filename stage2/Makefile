@@ -3520,10 +3520,15 @@ test-driver-holes: $(TARGET) bin-kai build
 	  $$KAI build --holes-json $$src > build/driver-$$name.json; \
 	  python3 ../scripts/validate_holes_json.py build/driver-$$name.json \
 	    || { echo "driver-holes FAIL $$name (schema / internal candidate)"; cat build/driver-$$name.json; exit 1; }; \
-	  python3 -c "import json,sys; [print('?%s: %s' % (r['name'], ', '.join(c['expr'] for c in r['candidates']))) for r in json.load(open(sys.argv[1]))]" \
+	  python3 -c "import json,sys; [print('?%s: %s' % (r['name'], ', '.join(c['expr'] for c in r['candidates'])) + ''.join('\n?%s needs %s: %s' % (r['name'], ' + '.join(c['effects']), c['expr']) for c in r['candidates_needing_effects'])) for r in json.load(open(sys.argv[1]))]" \
 	    build/driver-$$name.json > build/driver-$$name.got; \
 	  diff $${src%.kai}.out.expected build/driver-$$name.got \
 	    || { echo "driver-holes FAIL $$name (candidates drifted)"; exit 1; }; \
+	  if [ -f $${src%.kai}.holes.expected ]; then \
+	    $$KAI build --holes $$src | sed 's|^.*/typed_holes/||' | grep -v "more bindings in scope" > build/driver-$$name.holes; \
+	    diff $${src%.kai}.holes.expected build/driver-$$name.holes \
+	      || { echo "driver-holes FAIL $$name (--holes report drifted)"; exit 1; }; \
+	  fi; \
 	  echo "driver-holes OK $$name (candidate golden)"; \
 	done; \
 	echo "driver-holes OK"

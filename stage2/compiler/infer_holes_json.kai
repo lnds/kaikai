@@ -19,7 +19,7 @@ import compiler.hole_scope
 #
 # Emits a single JSON array, stable schema per docs/typed-holes.md.
 # Each element carries {file, line, col, name, expected_type, in_scope,
-# candidates, scope_elided}. By default `in_scope` lists the hole's
+# candidates, candidates_needing_effects, scope_elided}. By default `in_scope` lists the hole's
 # LOCAL bindings (params + lets) and `scope_elided` counts the
 # reachable bindings not listed; `--holes-json-scope` lists everything
 # (core included) with `scope_elided: 0`.
@@ -40,15 +40,23 @@ fn json_candidate(expr: String) : String =
 fn json_candidates(cs: [String]) : String =
   concat_all(["[", inf_join_with(map(cs, json_candidate), ", "), "]"])
 
-fn json_hole_report(file: String, doc_items: [DocItem], rh: ResolvedHole,
-                    toplevel_len: Int, hidden: [String], full: Bool) : String {
+fn json_eff_candidate(c: EffCand) : String =
+  concat_all(["{\"expr\": ", json_str(c.expr), ", \"kind\": \"synth\", \"effects\": [",
+              inf_join_with(map(c.effects, json_str), ", "), "]}"])
+
+fn json_eff_candidates(cs: [EffCand]) : String =
+  concat_all(["[", inf_join_with(map(cs, json_eff_candidate), ", "), "]"])
+
+fn json_hole_report(file: String, doc_items: [DocItem], rh: ResolvedHole, tp: TypedProgram,
+                    hidden: [String], full: Bool) : String {
   match rh {
-    RH(kind, line, col, ty, scope, env_fresh, owner) -> {
+    RH(kind, line, col, ty, scope, env_fresh, owner, hr) -> {
+      let toplevel_len = tp.toplevel_len
       let kj = hole_kind_json(kind)
       let visible = hole_visible_scope(scope, toplevel_len, hidden)
       let shown = if full { visible } else { hole_local_scope(scope, toplevel_len) }
       let elided = list_length(visible) - list_length(shown)
-      let cands = synth_candidates(visible, ty, env_fresh, owner)
+      let cands = synth_candidates(visible, ty, env_fresh, owner, hr, tp.decls)
       # the surrounding declaration's `#[doc(...)]` text,
       # resolved by source position against the root file's doc side
       # table. null when the surrounding decl is undocumented.
@@ -67,7 +75,8 @@ fn json_hole_report(file: String, doc_items: [DocItem], rh: ResolvedHole,
         ", \"expected_type\": ", json_str(inf_ty_to_string(ty)),
         ", \"in_scope\": ", json_scope_entries(shown),
         ", \"scope_elided\": ", int_to_string(elided),
-        ", \"candidates\": ", json_candidates(cands),
+        ", \"candidates\": ", json_candidates(cands.fit),
+        ", \"candidates_needing_effects\": ", json_eff_candidates(cands.needs),
         ", \"doc\": ", doc_field,
         "}"
       ])
@@ -96,7 +105,7 @@ fn hole_kind_json(k: HoleKind) : HoleKindJson {
 
 #[doc("infer: --holes-json structured typed-hole report over the build front-end's typed program. doc_items is the root file's doc side table; `hidden` names the top-level bindings the root file cannot reach; `full` lists every reachable binding instead of the hole's locals.")]
 pub fn dump_holes_json(file: String, tp: TypedProgram, doc_items: [DocItem], hidden: [String], full: Bool) : Int / Console + File {
-  let body = inf_join_with(map(tp.holes, (h) => json_hole_report(file, doc_items, h, tp.toplevel_len, hidden, full)), ", ")
+  let body = inf_join_with(map(tp.holes, (h) => json_hole_report(file, doc_items, h, tp, hidden, full)), ", ")
   print(concat_all(["[", body, "]"]))
   tp.errs
 }
@@ -190,7 +199,7 @@ fn strict_holes_report_loop(file: String, hs: [ResolvedHole]) : Unit / Console +
     [] -> ()
     [h, ...rest] -> {
       match h {
-        RH(kind, line, col, ty, _, _, _) -> {
+        RH(kind, line, col, ty, _, _, _, _) -> {
           let label = hole_kind_label(kind)
           diag_error(file, line, col, "unfilled hole #{label} : #{inf_ty_to_string(ty)}")
           diag_help("replace `#{label}` with an expression of type `#{inf_ty_to_string(ty)}`")

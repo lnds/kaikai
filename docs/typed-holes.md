@@ -59,6 +59,24 @@ foo.kai:4:3: type hole
   312 more bindings in scope (--holes-scope lists them)
 ```
 
+A candidate fits when its type unifies with the hole's AND the effects
+it performs are available at the hole: declared in the enclosing
+function's row, discharged by a `handle` around the hole, or — for a
+`main` without a declared row — default-handled. An open row (`/ e`)
+admits any effect. A candidate that type-checks but performs an effect
+the context lacks is listed under ``fits if you add `/ <Eff>` ``, one
+section per missing row. For `fn f(n: Int) : Int = ?`:
+
+```
+  candidates that fit:
+    n
+    range_length(n, n)
+    ...
+
+  fits if you add `/ Random`:
+    Random.int_range(n, n)
+```
+
 `kai build --holes-scope` prints the same report with every reachable
 binding listed instead of the count.
 
@@ -80,12 +98,18 @@ where each element describes one hole. Stable schema:
     ],
     "scope_elided": 312,
     "candidates": [
-      {"expr": "excited", "kind": "local"},
-      {"expr": "string_concat(name, excited)", "kind": "application"}
-    ]
+      {"expr": "excited", "kind": "synth"},
+      {"expr": "string_concat(name, excited)", "kind": "synth"}
+    ],
+    "candidates_needing_effects": []
   }
 ]
 ```
+
+`candidates` holds only the candidates that compile as written.
+`candidates_needing_effects` lists those that fit once the enclosing
+row adds `effects`, each as
+`{"expr": "Random.int_range(n, n)", "kind": "synth", "effects": ["Random"]}`.
 
 `in_scope` carries the local bindings; `scope_elided` counts the
 reachable bindings not listed. `kai build --holes-json-scope` lists
