@@ -2039,7 +2039,7 @@ test-issue-248-loop-sugars: $(TARGET) build
 # to the golden; the negative (`each` closure) must KEEP its clauses.
 test-issue-1179-var-slot-loop: $(TARGET) build
 	@set -e; \
-	for f in issue_1179_var_slot_loops issue_1179_each_closure_state issue_1179_cell_register; do \
+	for f in issue_1179_var_slot_loops issue_1179_each_closure_state issue_1179_cell_register var_interp_slot; do \
 	  src=../examples/sugars/loop/$$f.kai; \
 	  exp=../examples/sugars/loop/$$f.out.expected; \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/$$f.c \
@@ -2069,7 +2069,17 @@ test-issue-1179-var-slot-loop: $(TARGET) build
 	  || { echo "issue_1179 FAIL (kir dump)"; exit 1; }; \
 	grep -q "acc_int__slot: i64" build/issue_1179_cell_register.kir \
 	  || { echo "issue_1179 FAIL (acc_int not a raw i64 register in KIR)"; exit 1; }; \
-	echo "issue-1179-var-slot-loop OK (loops slot + inline, scalar cells raw, each keeps State)"
+	grep -q "__clause" build/var_interp_slot.c \
+	  && { echo "var_interp_slot FAIL (a var read through an interpolation kept its State handler)"; exit 1; } || true; \
+	for cell in total acc count; do \
+	  grep -q "kair_$${cell}__slot" build/var_interp_slot.c \
+	    || { echo "var_interp_slot FAIL ($$cell not a raw slot)"; exit 1; }; \
+	done; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir ../examples/sugars/loop/var_interp_slot.kai > build/var_interp_slot.kir \
+	  || { echo "var_interp_slot FAIL (kir dump)"; exit 1; }; \
+	grep -q "total__slot: i64" build/var_interp_slot.kir \
+	  || { echo "var_interp_slot FAIL (total not a raw i64 register in KIR)"; exit 1; }; \
+	echo "issue-1179-var-slot-loop OK (loops slot + inline, scalar cells raw, each keeps State, an interpolated var stays a slot)"
 
 # Issue #1214 — a non-literal PURE scalar var init (`var m := n`,
 # `var m := n*2+1`) promotes to a raw register just like a literal init,

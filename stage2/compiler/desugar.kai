@@ -1684,8 +1684,22 @@ fn lcr_block(stmts: [Stmt], tail: Option[Expr], caps: [String], reject_at: Bool,
       SLet(p, ann, rhs) -> {
         let r = lcr_expr(rhs, caps, reject_at, file, errs)
         let names = dsg_rename_pat_names(p, [])
-        let r2 = lcr_block(rest, tail, caps_minus_names(caps, names), reject_at, file, r.errs)
-        VLStmts { stmts: [SLet(p, ann, r.expr), ...r2.stmts], opt: r2.opt, errs: r2.errs }
+        match var_slot_of(p, rhs) {
+          Some(VarSlot(n, slot)) -> {
+            # A var lowered to a slot: a read of it surfacing only now, from
+            # an interpolation, lowers to `n.get()` and then to the slot.
+            let r2 = lcr_block(rest, tail, [n, ...caps_minus_names(caps, names)], reject_at, file, r.errs)
+            let body = specialise_body(n, slot, mk_expr(EBlock(r2.stmts, r2.opt), rhs.line, rhs.col))
+            match body.kind {
+              EBlock(ss, t) -> VLStmts { stmts: [SLet(p, ann, r.expr), ...ss], opt: t, errs: r2.errs }
+              _             -> VLStmts { stmts: [SLet(p, ann, r.expr), ...r2.stmts], opt: r2.opt, errs: r2.errs }
+            }
+          }
+          None -> {
+            let r2 = lcr_block(rest, tail, caps_minus_names(caps, names), reject_at, file, r.errs)
+            VLStmts { stmts: [SLet(p, ann, r.expr), ...r2.stmts], opt: r2.opt, errs: r2.errs }
+          }
+        }
       }
       SVar(n, ty, rhs, l, c) -> {
         # The init runs under the *outer* caps (`var n := n` self-shadows
@@ -2446,15 +2460,10 @@ fn body_escapes(name: String, e: Expr) : Bool {
     EFixed(_, _) -> false
     EBool(_) -> false
     EChar(_) -> false
-    # A naked `name` cell-read hidden inside a `#{...}` interpolation is
-    # invisible to the structural walk (the interp body is still a raw
-    # source span at this pre-resolve stage). Treating it as an escape
-    # forces the canonical `State[T] as name` handler, which keeps `name`
-    # in scope when `desugar_interp_decls` lifts the read and the
-    # post-interp cell-read lowering turns it into `name.get()`. The
-    # cheaper array-slot specialisation would have dropped the binder and
-    # the lifted `name.get()` would resolve to nothing.
-    EStr(span, is_triple) -> interp_span_reads_cap(span, is_triple, name)
+    # A read inside a `#{...}` interpolation is still a raw span here; it
+    # surfaces after the interpolation is lifted, and the cell-read
+    # relowering sends it to the slot (`var_slot_of`), so it is a read.
+    EStr(_, _) -> false
     EUnit -> false
     EUnder -> false
     EPlaceholder -> false
@@ -2729,6 +2738,24 @@ fn ret_opt_contains(name: String, opt: Option[HReturn]) : Bool {
 # `array_get(slot_var, 0)` and every `name.set(v)` to a unit-typed
 # block `{ let _ = array_set(slot_var, 0, v); () }`. The slot_var
 # name is `<name>__slot`. Other expressions pass through.
+type VarSlot = VarSlot(String, String)
+
+fn var_slot_name(name: String) : String = string_concat(name, "__slot")
+
+# The `let` a var's slot lowering mints: its var's name and the slot's.
+fn var_slot_of(p: Pattern, rhs: Expr) : Option[VarSlot] = match p.pkind {
+  PBind(s) -> match rhs.kind {
+    ECall(f, [_, _]) -> match f.kind {
+      EVar(fname) -> if fname == "array_make" and ends_with(s, "__slot") {
+        Some(VarSlot(string_slice(s, 0, string_length(s) - 6), s))
+      } else { None }
+      _ -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
 fn specialise_body(name: String, slot_name: String, e: Expr) : Expr {
   Expr { kind: specialise_kind(name, slot_name, e.kind, e.line, e.col),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode }
@@ -2821,7 +2848,7 @@ fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
         # When either fails, fall back to the canonical handler so
         # captures, escapes, and complex inits still work.
         if init_is_safe(init_d) and not body_escapes(name, inner_expr) {
-          let slot_name = string_concat(name, "__slot")
+          let slot_name = var_slot_name(name)
           let slot_init = mk_expr(
             ECall(mk_ref("array_make", line, col),
                   [mk_expr(mk_int_synth(1), line, col), init_d]),
