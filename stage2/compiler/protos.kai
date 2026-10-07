@@ -3661,8 +3661,8 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
         None     -> ECall(new_callee, new_args)
       }
     }
-    # `==` / `!=` / `<` / `>` / `<=` / `>=` are sugar for Eq.eq / Ord.cmp.
-    # The typer leaves them as the structural builtin EBinop; here, with
+    # Binops are sugar for Eq.eq / Ord.cmp / the operator protocols. In a
+    # generic body the typer leaves them as the builtin EBinop; here, with
     # concrete operand types (post-monomorph per spec), rewrite to the
     # custom impl when the left operand's type carries one. Fully
     # structural types (no custom impl — the common case, e.g. the
@@ -3676,11 +3676,11 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
   }
 }
 
-# Rewrite a comparison binop to a custom-impl call when the left
-# operand's type has one. `==`/`!=` → Eq.eq (`!=` wraps in `not`);
-# `<`/`>`/`<=`/`>=` → Ord.cmp reduced to Bool against 0. Any other op,
-# or an operand type with no custom impl, is left as the structural
-# builtin EBinop (which lowers to kai_op_eq_v / direct compare).
+# Rewrite a binop to a custom-impl call when the left operand's type has
+# one. `==`/`!=` → Eq.eq (`!=` wraps in `not`); `<`/`>`/`<=`/`>=` →
+# Ord.cmp reduced to Bool against 0; `+ - * / %` → the operator
+# protocol's op. An operand type with no custom impl keeps the builtin
+# EBinop (which lowers to kai_op_eq_v / direct compare / arithmetic).
 fn prc_op_impl(reg: ProtocolReg, bp: BinopProto, t: Option[Ty]) : Option[ProtoImplReg] =
   prc_cmp_impl(reg, op_proto_protocol(bp), op_proto_method(bp), t)
 
@@ -3711,8 +3711,49 @@ fn prc_rewrite_cmp_binop(op: String, l: Expr, r: Expr, reg: ProtocolReg) : ExprK
       }
     }
   } else {
-    EBinop(op, l, r)
+    match prc_arith_impl(reg, binop_proto(op), l.ty, r.ty) {
+      Some(p) -> ECall(mk_ref(pir_sym(p), l.line, l.col), [l, r])
+      None    -> EBinop(op, l, r)
+    }
   }
+}
+
+# The operator protocol's impl a generic arithmetic binop reaches once
+# monomorphisation made its operands concrete: both operands share a head
+# with a custom impl of the homogeneous protocol (`impl Add for T` or
+# `impl Add[T] for T`). A primitive operand has no head and keeps the
+# builtin; a mixed-type binop was already rewritten by the typer.
+fn prc_arith_impl(reg: ProtocolReg, bp: BinopProto, lt: Option[Ty], rt: Option[Ty]) : Option[ProtoImplReg] =
+  match bp {
+    BpEq   -> None
+    BpOrd  -> None
+    BpNone -> None
+    _ -> match prc_con_head(lt) {
+      None -> None
+      Some(DispHead(n, hs)) -> if prc_con_name(rt) != n { None } else {
+        let proto = op_proto_protocol(bp)
+        find(impl_pool(reg, proto, n), (p) => prc_homogeneous(p, proto, op_proto_method(bp), DispHead(n, hs)))
+      }
+    }
+  }
+
+fn prc_con_head(t: Option[Ty]) : Option[DispHead] = match t {
+  Some(TyCon(_, n, _, s)) -> Some(DispHead(n, s))
+  _                       -> None
+}
+
+fn prc_con_name(t: Option[Ty]) : String = match t {
+  Some(TyCon(_, n, _, _)) -> n
+  _                       -> ""
+}
+
+fn prc_homogeneous(p: ProtoImplReg, proto: String, opname: String, h: DispHead) : Bool = match p {
+  PIR(pn, _, op, _, args, _, _, _) ->
+    pn == proto and op == opname and pir_serves(p, h) and match args {
+      []  -> true
+      [a] -> a == dh_name(h)
+      _   -> false
+    }
 }
 
 # Build an Expr with an explicit type annotation. `mk_expr` defaults
