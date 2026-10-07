@@ -7376,12 +7376,12 @@ type CallSite = CS(String, Int, Int, [Int], [Int], Option[String])  # name, line
 
 # A typed hole site: the kind discriminator (splits `?` /
 # `?name` from `todo!(msg)`), source position, the fresh TyVarT id
-# that stands in for it during inference, and the env entries
-# visible at that point (snapshot of the locals stack). After
-# inference the fresh id runs through the final sub to recover the
-# expected type.
-type HoleSite = HS(HoleKind, Int, Int, Int, [TyEntry], Int)
-#                   kind     line col fresh scope      env_fresh
+# that stands in for it during inference, the env entries visible at
+# that point (snapshot of the locals stack), and the labels discharged
+# by the handlers enclosing it. After inference the fresh id runs
+# through the final sub to recover the expected type.
+type HoleSite = HS(HoleKind, Int, Int, Int, [TyEntry], Int, [Label])
+#                   kind     line col fresh scope      env_fresh handled
 
 # hole kinds.
 # - `HKHole(None)`     — anonymous `?`.
@@ -9252,7 +9252,10 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       }
       let prev_row = st_capbound.row
       let st_in = st_set_row(st_capbound, [])
-      let rb = synth(st_in, body)
+      let rb0 = synth(st_in, body)
+      let discharge_eff = label_eff_with_alias(eff_name, alias_opt)
+      let rb = Inferred { ...rb0, st: holes_under_handler(rb0.st, list_length(st_in.holes),
+                                     Label { eff: discharge_eff, ty_args: cap_tyargs, sym: hsym }) }
       # filter out *only* the labels whose ty_args unify with
       # the handler's instantiation. Labels with the same eff name but
       # non-unifiable ty_args remain and propagate to the outer row —
@@ -9268,7 +9271,6 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       # arity), not the full handler state type — a non-parametric `Cell` op
       # carries a `[]` label even when `with Cell(0)` infers an Int state, so
       # matching against `[Int]` would leave the label undischarged.
-      let discharge_eff = label_eff_with_alias(eff_name, alias_opt)
       let filt = filter_labels_matching_res(rb.st.row, discharge_eff, hsym,
                                               cap_tyargs, rb.st.sub)
       let body_row_minus = filt.kept
@@ -9301,6 +9303,19 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     _ -> mk_inferred(st, TyAny, with_ty(e, TyAny))
   }
 }
+
+# The holes a handle body registered (prepended past the `n_before`
+# already there) see the effect the handler discharges.
+fn holes_under_handler(st: InferState, n_before: Int, lab: Label) : InferState =
+  InferState { ...st, holes: tag_new_holes(st.holes, list_length(st.holes) - n_before, lab) }
+
+fn tag_new_holes(hs: [HoleSite], n_new: Int, lab: Label) : [HoleSite] =
+  if n_new <= 0 { hs }
+  else { match hs {
+    [] -> []
+    [HS(kind, line, col, fresh, scope, env_fresh, handled), ...rest] ->
+      [HS(kind, line, col, fresh, scope, env_fresh, [lab, ...handled]), ...tag_new_holes(rest, n_new - 1, lab)]
+  } }
 
 # thread an init's typed sub-expression and resolved
 # handler-state type alongside the inferred state.
@@ -10039,7 +10054,7 @@ fn bang_ret_mismatch_result(st: InferState, e_ty: Ty, t: Ty, ret_ty: Ty,
 fn register_fresh_hole(st: InferState, kind: HoleKind, e: Expr) : Inferred {
   let fresh_id = st.env.fresh
   let st1 = st_set_env(st, fresh_var(st.env))
-  let site = HS(kind, e.line, e.col, fresh_id, st1.env.entries, st1.env.fresh)
+  let site = HS(kind, e.line, e.col, fresh_id, st1.env.entries, st1.env.fresh, [])
   let st2 = st_push_hole(st1, site)
   inferred_leaf(st2, TyVarT(fresh_id), e)
 }
@@ -10048,7 +10063,7 @@ fn find_hole_by_name(holes: [HoleSite], target: String) : Option[Int] {
   match holes {
     [] -> None
     [h, ...rest] -> match h {
-      HS(kind, _, _, fresh, _, _) -> match kind {
+      HS(kind, _, _, fresh, _, _, _) -> match kind {
         HKHole(nm_opt) -> match nm_opt {
           Some(nm) -> if nm == target { Some(fresh) } else { find_hole_by_name(rest, target) }
           None     -> find_hole_by_name(rest, target)
@@ -15401,7 +15416,7 @@ fn register_fresh_pattern_hole(st: InferState, nm_opt: Option[String], expected:
 
   let fresh_id = st.env.fresh
   let st1 = st_set_env(st, fresh_var(st.env))
-  let site = HS(HKHole(nm_opt), line, col, fresh_id, st1.env.entries, st1.env.fresh)
+  let site = HS(HKHole(nm_opt), line, col, fresh_id, st1.env.entries, st1.env.fresh, [])
   let st2 = st_push_hole(st1, site)
   st_unify(st2, TyVarT(fresh_id), expected, "pattern hole", line, col)
 }
@@ -18068,9 +18083,13 @@ fn resolve_callsites(css: [CallSite], sub: Subst, mo: Option[String]) : [Resolve
 #[derive(BinSerialize)]
 pub type HoleOwner = HOwner(String, [String]) | HNoOwner
 
+#[doc("infer: the effects a hole's context makes available — any, under an open row; else the declared labels, the enclosing handlers' labels, and whether `main`'s default-handled effects are absorbed.")]
+#[derive(BinSerialize)]
+pub type HoleRow = HRowOpen | HRowLabels([Label], [Label], Bool)
+
 #[doc("infer: `ResolvedHole` — driver-facing type.")]
 #[derive(BinSerialize)]
-pub type ResolvedHole = RH(HoleKind, Int, Int, Ty, [TyEntry], Int, HoleOwner)
+pub type ResolvedHole = RH(HoleKind, Int, Int, Ty, [TyEntry], Int, HoleOwner, HoleRow)
 
 # a typed effect-hole resolution. Recorded
 # per occurrence of `?` or `?name` in row tail position; one instance
@@ -18231,15 +18250,29 @@ pub fn drop_last_entries(es: [TyEntry], n: Int) : [TyEntry] {
   if keep <= 0 { [] } else { take_entries(es, keep, []) }
 }
 
-fn resolve_holes(hs: [HoleSite], sub: Subst, owner: HoleOwner) : [ResolvedHole] {
+fn resolve_holes(hs: [HoleSite], sub: Subst, owner: HoleOwner, base: HoleRow) : [ResolvedHole] {
   match hs {
     [] -> []
     [h, ...rest] -> match h {
-      HS(kind, line, col, fresh, scope, env_fresh) ->
-        [RH(kind, line, col, apply_ty(sub, TyVarT(fresh)), scope, env_fresh, owner),
-         ...resolve_holes(rest, sub, owner)]
+      HS(kind, line, col, fresh, scope, env_fresh, handled) ->
+        [RH(kind, line, col, apply_ty(sub, TyVarT(fresh)), scope, env_fresh, owner,
+            hole_row_handling(base, apply_labels(sub, handled))),
+         ...resolve_holes(rest, sub, owner, base)]
     }
   }
+}
+
+fn hole_row_handling(base: HoleRow, handled: [Label]) : HoleRow = match base {
+  HRowOpen                   -> HRowOpen
+  HRowLabels(declared, _, a) -> HRowLabels(declared, handled, a)
+}
+
+# `main` without a row absorbs the default-handled effects, as
+# `check_body_row` does.
+fn fn_hole_row(st: InferState, nm: String, row: RowExpr) : HoleRow = match row {
+  REmpty       -> HRowLabels([], [], nm == "main")
+  RClosed(lbs) -> HRowLabels(apply_labels(st.sub, st_annot_labels(st, lbs)), [], false)
+  ROpen(_, _)  -> HRowOpen
 }
 
 # Decls after inference: type-annotated body (or original decl for
@@ -18454,7 +18487,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # instances authored in the user's root file from those that
       # come through core or other modules.
       let resolved0 = resolve_callsites(list_reverse(st2.insts), st2.sub, mo)
-      let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub, HOwner(nm, map(ps, (p) => p.pname)))
+      let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub, HOwner(nm, map(ps, (p) => p.pname)), fn_hole_row(st2, nm, row))
       # apply the final substitution to every
       # `Expr.ty` annotation in the body so the post-inference protocol-
       # call rewrite can read concrete head types from sites whose
@@ -18608,7 +18641,7 @@ fn infer_test_body(file: String, env: TyEnv, core_len: Int,
   let hd = drain_deferred_homs(st2pre, list_reverse(st2pre.deferred_homs), [])
   let st2 = hd.st
   let resolved = resolve_callsites(list_reverse(st2.insts), st2.sub, None)
-  let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub, HNoOwner)
+  let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub, HNoOwner, HRowLabels([], [], true))
   let final_body = hom_retarget(finalise_typed_expr(st2.sub, rb.expr), hd.picks)
   TypedDecl {
     decl: test_decl_with_body(d, final_body),
@@ -18656,7 +18689,7 @@ fn infer_const_body(file: String, env: TyEnv, core_len: Int,
     decl: DConst(is_pub, cname, cte, final_body, mo, line, col, csym),
     errs: st2.errs,
     insts: resolved,
-    holes: resolve_holes(list_reverse(st2.holes), st2.sub, HNoOwner),
+    holes: resolve_holes(list_reverse(st2.holes), st2.sub, HNoOwner, HRowLabels([], [], false)),
     row_holes: [],
     diags: finalize_diags(st2.diags),
     op_res: stamp_op_res_fname(list_reverse(st2.op_res), cname)
@@ -19248,16 +19281,30 @@ fn find_matching_declared(declared: [Label], target: Label,
                             st: InferState) : Option[InferState] / Console + File + Mutable {
 
 
-  match declared {
-    [] -> None
-    [d, ...rest] ->
-      if label_same(d, target) and labels_args_unify(d.ty_args, target.ty_args, st.sub) {
-        Some(unify_label_args_into(d.ty_args, target.ty_args, st))
-      } else {
-        find_matching_declared(rest, target, st)
-      }
+  match declared_label_for(declared, target, st.sub) {
+    Some(d) -> Some(unify_label_args_into(d.ty_args, target.ty_args, st))
+    None    -> None
   }
 }
+
+fn declared_label_for(declared: [Label], target: Label, sub: Subst) : Option[Label] = match declared {
+  [] -> None
+  [d, ...rest] ->
+    if label_same(d, target) and labels_args_unify(d.ty_args, target.ty_args, sub) { Some(d) }
+    else { declared_label_for(rest, target, sub) }
+}
+
+#[doc("infer: the labels of `performed` a hole's context neither declares, handles, nor absorbs — the row a candidate performing them needs added.")]
+pub fn hole_row_missing(hr: HoleRow, performed: [Label], decls: [Decl]) : [Label] = match hr {
+  HRowOpen -> []
+  HRowLabels(declared, handled, absorbs) ->
+    filter(performed, (lab) => not hole_row_covers(declared, handled, absorbs, lab, decls))
+}
+
+fn hole_row_covers(declared: [Label], handled: [Label], absorbs: Bool, lab: Label, decls: [Decl]) : Bool =
+  is_some(declared_label_for(declared, lab, subst_empty()))
+    or any(handled, (h) => label_same(h, lab) and label_args_dischargeable(lab.ty_args, h.ty_args, subst_empty()))
+    or (absorbs and label_absorbed(lab, decls))
 
 # Unify two ty_arg lists, propagating any new bindings into st.sub.
 # Mismatched length → no-op (caller already excluded that case via
@@ -20215,28 +20262,61 @@ fn synth_find_args(scope: [TyEntry], params: [Ty], fresh: Int, avoid: [String],
   }
 }
 
+# A candidate's rendered text and the labels evaluating it performs.
+type Synth = { expr: String, performs: [Label] }
+
 # Try entry `te` as a direct match or a 1-level application against
-# `expected`. Returns rendered candidate text or None.
-fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int, owner: HoleOwner) : Option[String] / Mutable {
-  let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
-  match unify(inst.ty, expected, subst_empty()) {
-    Some(_) -> Some(te.name)
+# `expected`.
+fn synth_try_entry(cx: SynthCtx, te: TyEntry) : Option[Synth] / Mutable {
+  let inst = instantiate(TyEnv { entries: [], fresh: cx.fresh, unions: [], constructors: [], head_owners: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
+  match unify(inst.ty, cx.expected, subst_empty()) {
+    Some(_) -> Some(Synth { expr: te.name, performs: [] })
     None    -> match inst.ty {
-      TyFnT(ps, r, _) -> {
+      TyFnT(ps, r, rw) -> {
         if synth_return_structural(te.scheme) {
-          match unify(r, expected, subst_empty()) {
+          match unify(r, cx.expected, subst_empty()) {
             None     -> None
-            Some(s0) -> match synth_find_args(all_scope, ps, inst.env.fresh, [te.name], s0, []) {
+            Some(s0) -> match synth_find_args(cx.all, ps, inst.env.fresh, [te.name], s0, []) {
               None    -> None
               Some(m) ->
-                if synth_reenters_owner(owner, te.name, m.names) { None }
-                else { Some(concat_all([te.name, "(", inf_join_with(m.names, ", "), ")"])) }
+                if synth_reenters_owner(cx.owner, te.name, m.names) { None }
+                else { Some(Synth { expr: concat_all([te.name, "(", inf_join_with(m.names, ", "), ")"]),
+                                    performs: label_concat(apply_labels(m.sub, rw.labels),
+                                                           synth_op_label(cx.decls, te.name, synth_inst_vars(te.scheme, inst, m.sub))) }) }
             }
           }
         } else { None }
       }
       _ -> None
     }
+  }
+}
+
+# The scheme's bound variables as instantiated, in quantification order.
+fn synth_inst_vars(sc: TyScheme, inst: Instantiated, sub: Subst) : [Ty] = match sc {
+  Scheme(vars, _, _, _, _) -> fresh_vars_from(inst.env.fresh - list_length(vars), inst.env.fresh, sub)
+}
+
+fn fresh_vars_from(i: Int, end: Int, sub: Subst) : [Ty] =
+  if i >= end { [] } else { [apply_ty(sub, TyVarT(i)), ...fresh_vars_from(i + 1, end, sub)] }
+
+# An effect op's scheme carries no row: calling `Eff.op` performs `Eff`,
+# whose type arguments lead the op's quantified variables.
+fn synth_op_label(decls: [Decl], name: String, vars: [Ty]) : [Label] =
+  if string_index_of_char(name, '.') < 0 { [] }
+  else { match effect_declaring_op(decls, dotted_prefix(name), dotted_suffix(name)) {
+    Some(DEffect(_, eff, tps, _, _, _, _, _, s)) ->
+      [Label { eff: eff, ty_args: take_first_tys(vars, list_length(tps)), sym: s }]
+    _ -> []
+  } }
+
+fn effect_declaring_op(decls: [Decl], eff: String, op: String) : Option[Decl] = match decls {
+  [] -> None
+  [d, ...rest] -> match d {
+    DEffect(_, nm, _, ops, _, _, _, _, _) ->
+      if nm == eff and any(ops, (o) => match o { EOp(on, _, _, _, _, _) -> on == op }) { Some(d) }
+      else { effect_declaring_op(rest, eff, op) }
+    _ -> effect_declaring_op(rest, eff, op)
   }
 }
 
@@ -20247,18 +20327,32 @@ fn synth_reenters_owner(owner: HoleOwner, head: String, args: [String]) : Bool =
   HNoOwner           -> false
 }
 
-fn synth_candidates_loop(all: [TyEntry], cur: [TyEntry], expected: Ty, fresh: Int,
-                         owner: HoleOwner, acc: [String], max: Int) : [String] {
-  if list_length(acc) >= max { list_reverse(acc) }
+#[doc("infer: a candidate that fits a hole once its row adds `effects`.")]
+pub type EffCand = { expr: String, effects: [String] }
+
+#[doc("infer: a hole's candidates — those that fit as written, and those that fit once the hole's row adds effects.")]
+pub type HoleCands = { fit: [String], needs: [EffCand] }
+
+type SynthCtx = { all: [TyEntry], expected: Ty, fresh: Int, owner: HoleOwner, row: HoleRow, decls: [Decl] }
+
+fn synth_candidates_loop(cx: SynthCtx, cur: [TyEntry], acc: HoleCands, max: Int) : HoleCands {
+  if list_length(acc.fit) >= max { HoleCands { fit: list_reverse(acc.fit), needs: list_reverse(acc.needs) } }
   else { match cur {
-    [] -> list_reverse(acc)
-    [te, ...rest] -> match synth_try_entry(all, te, expected, fresh, owner) {
-      Some(expr) -> synth_candidates_loop(all, rest, expected, fresh, owner, [expr, ...acc], max)
-      None       -> synth_candidates_loop(all, rest, expected, fresh, owner, acc, max)
+    [] -> HoleCands { fit: list_reverse(acc.fit), needs: list_reverse(acc.needs) }
+    [te, ...rest] -> match synth_try_entry(cx, te) {
+      Some(c) -> synth_candidates_loop(cx, rest, synth_classify(acc, c, hole_row_missing(cx.row, c.performs, cx.decls), max), max)
+      None    -> synth_candidates_loop(cx, rest, acc, max)
     }
   } }
 }
 
-#[doc("infer: names in scope whose type unifies with a hole's expected type.")]
-pub fn synth_candidates(scope: [TyEntry], expected: Ty, fresh: Int, owner: HoleOwner) : [String] =
-  synth_candidates_loop(scope, scope, expected, fresh, owner, [], 8)
+fn synth_classify(acc: HoleCands, c: Synth, missing: [Label], max: Int) : HoleCands = match missing {
+  [] -> HoleCands { ...acc, fit: [c.expr, ...acc.fit] }
+  _  -> if list_length(acc.needs) >= max { acc }
+        else { HoleCands { ...acc, needs: [EffCand { expr: c.expr, effects: map(missing, label_to_string) }, ...acc.needs] } }
+}
+
+#[doc("infer: names in scope whose type unifies with a hole's expected type, split by whether the effects they perform fit the hole's row `hr`; `decls` resolves the effects `main` absorbs.")]
+pub fn synth_candidates(scope: [TyEntry], expected: Ty, fresh: Int, owner: HoleOwner, hr: HoleRow, decls: [Decl]) : HoleCands =
+  synth_candidates_loop(SynthCtx { all: scope, expected: expected, fresh: fresh, owner: owner, row: hr, decls: decls },
+                        scope, HoleCands { fit: [], needs: [] }, 8)
