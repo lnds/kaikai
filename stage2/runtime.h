@@ -20258,8 +20258,11 @@ static const char *kai_llvm_pass_pipeline(void) {
     return "default<O2>";                         /* "2" and unknowns */
 }
 
-static int64_t kai_llvm_run_passes(LLVMModuleRef m, LLVMTargetMachineRef tm) {
-    const char *pipeline = kai_llvm_pass_pipeline();
+/* `prune` leads with globaldce: the merged runtime bodies are internal, so the
+ * ones the module never reaches go before the pipeline spends work on them. */
+static int64_t kai_llvm_run_passes(LLVMModuleRef m, LLVMTargetMachineRef tm, int prune) {
+    char pipeline[64];
+    snprintf(pipeline, sizeof pipeline, "%s%s", prune ? "globaldce," : "", kai_llvm_pass_pipeline());
     LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
     LLVMErrorRef e = LLVMRunPasses(m, pipeline, tm, opts);
     LLVMDisposePassBuilderOptions(opts);
@@ -20614,7 +20617,7 @@ static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runt
      * Default `default<O2>` for parity with the clang `-O2` the C/LLVM-
      * text paths get; `KAI_NATIVE_OPT=0` (bin/kai --debug) drops to O0.
      * A pass error aborts before EmitToFile (no half-optimised object). */
-    if (kai_llvm_run_passes((LLVMModuleRef) m, tm)) {
+    if (kai_llvm_run_passes((LLVMModuleRef) m, tm, link_runtime != 0)) {
         LLVMDisposeTargetMachine(tm);
         LLVMDisposeMessage(triple);
         return 1;
