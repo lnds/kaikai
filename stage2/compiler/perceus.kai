@@ -65,6 +65,7 @@ import compiler.symtab_build
 import compiler.perceus_raw_slot
 import compiler.perceus_reads
 import compiler.perceus_body_reads
+import compiler.perceus_move_sites
 import compiler.name_ix
 import compiler.interp_span
 import compiler.perceus_rethread
@@ -1039,91 +1040,14 @@ fn pcs_consuming_arms(nm: String, arms: [Arm], cmap: ConsumeIndex, bm: BorrowMap
   }
 }
 
-# Issue #817 — like `pcs_uses_only_consuming_slots`, but the slot-consume
-# constraint is applied ONLY to the read of `nm` at `(lu_line, lu_col)` —
-# its last use. Every other read of `nm` (e.g. an earlier `p(h)` whose
-# closure could retain `h`) is ignored (returns `true`), because those
-# reads keep their conservative dup; only the last read transfers
-# ownership raw. The walker structure mirrors `pcs_consuming_slots_kind`,
-# diverging at the `EVar` arg slot (the move point) where it gates on the
-# position match. Returns `true` iff the last read consumes (so moving it
-# is sound).
-fn pcs_last_use_consuming(nm: String, lu_line: Int, lu_col: Int, e: Expr, cmap: ConsumeIndex) : Bool =
-  pcs_lu_consuming_kind(nm, lu_line, lu_col, e.kind, cmap)
-
-fn pcs_lu_consuming_kind(nm: String, ll: Int, lc: Int, k: ExprKind, cmap: ConsumeIndex) : Bool = match k {
-  ECall(f, xs) ->
-    if pcs_any_arg_is_lambda(xs) and (pcs_name_in_exprs(nm, xs) or pcs_name_in_expr(nm, f)) {
-      # The last use sits in / under a higher-order combinator's lambda
-      # arg — not a modelled consuming slot; do not move.
-      false
-    } else {
-      let key = pcs_callee_key(f)
-      let consumed = cix_lookup(cmap, key)
-      let is_ctor = match sym_read_kind(f.kind) {
-        EVar(c)        -> pcs_name_is_ctor(c)
-        EModCall(_, c) -> pcs_name_is_ctor(c)
-        _              -> false
-      }
-      pcs_lu_consuming_kind(nm, ll, lc, f.kind, cmap) and
-        pcs_lu_consuming_args(nm, ll, lc, xs, consumed, is_ctor, 0, cmap)
-    }
-  EMatch(s, arms) -> pcs_lu_consuming_kind(nm, ll, lc, s.kind, cmap) and pcs_lu_consuming_arms(nm, ll, lc, arms, cmap)
-  # A last-use field/index read is paired by emit with a receiver decref
-  # (the perceus-move / emit pair): the projection's base position is a
-  # consuming read at the ABI level, so it stays unconstrained.
-  EField(_, _)        -> true
-  EIndex(_, _)        -> true
-  # Handler clauses reload captures through an env dup per invocation, so
-  # a clause read is balanced regardless of the move decision.
-  EHandle(_, _, _, _, _, _, _, _) -> true
-  # Intrinsics incref their args internally: a last use moved into one
-  # leaks the transferred ref.
-  EIntrinsic(_, xs)   -> not pcs_pos_in_exprs(ll, lc, xs)
-  ESurface(sf)        -> not pcs_pos_in_exprs(ll, lc, surface_children(sf))
-  # Everything else scans its positions: a last use under a lambda is
-  # never move-safe, one in an assert message runs only on the aborting
-  # path (blocks on position presence), and the rest apply the check.
-  _ -> pcs_lu_consuming_ps(nm, ll, lc, xp_positions_kind(k), cmap)
-}
-
-fn pcs_lu_consuming_ps(nm: String, ll: Int, lc: Int, ps: [XPos], cmap: ConsumeIndex) : Bool = match ps {
-  []                  -> true
-  [XP(r, c), ...rest] ->
-    (match r {
-      XLam -> false
-      XMsg -> not pcs_pos_in_expr(ll, lc, c)
-      _    -> pcs_last_use_consuming(nm, ll, lc, c, cmap)
-    }) and pcs_lu_consuming_ps(nm, ll, lc, rest, cmap)
-}
-
-fn pcs_lu_consuming_args(nm: String, ll: Int, lc: Int, xs: [Expr], consumed: [Int], is_ctor: Bool, i: Int, cmap: ConsumeIndex) : Bool = match xs {
-  []           -> true
-  [h, ...rest] -> {
-    let here = match sym_read_kind(h.kind) {
-      # The move point: a bare `nm` arg AT the last-use position must sit
-      # in a consuming slot. A bare `nm` arg elsewhere is some other (not
-      # last) read — it keeps its dup, so impose no constraint.
-      EVar(uname) -> if uname == nm {
-        if h.line == ll and h.col == lc { is_ctor or pcs_has_int(consumed, i) } else { true }
-      } else { true }
-      _ -> pcs_last_use_consuming(nm, ll, lc, h, cmap)
-    }
-    here and pcs_lu_consuming_args(nm, ll, lc, rest, consumed, is_ctor, i + 1, cmap)
-  }
-}
-
-fn pcs_lu_consuming_arms(nm: String, ll: Int, lc: Int, arms: [Arm], cmap: ConsumeIndex) : Bool = match arms {
-  []           -> true
-  [a, ...rest] -> match a {
-    # A guard can evaluate and its arm still not be chosen — the next arm
-    # re-reads the scrutinee's slots, so a last use consumed inside a
-    # guard is never move-safe, whatever slot it lands in.
-    Arm(_, opt_g, b) ->
-      (match opt_g { None -> true Some(g) -> not pcs_pos_in_expr(ll, lc, g) }) and
-      pcs_last_use_consuming(nm, ll, lc, b, cmap) and pcs_lu_consuming_arms(nm, ll, lc, rest, cmap)
-  }
-}
+# The callee's consuming slots and whether it builds a constructor, as the
+# last-use move check reads them.
+fn pcs_slot_consumers(cmap: ConsumeIndex) : (Expr) -> ([Int], Bool) =
+  (f) => (cix_lookup(cmap, pcs_callee_key(f)), match sym_read_kind(f.kind) {
+    EVar(c)        -> pcs_name_is_ctor(c)
+    EModCall(_, c) -> pcs_name_is_ctor(c)
+    _              -> false
+  })
 
 # Issue #817 — the arm-binders whose LAST use lands in a consuming slot,
 # safe to move-at-last-use (`pcs_is_non_last` consults this set). For each
@@ -1140,18 +1064,18 @@ fn pcs_strs_minus(xs: [String], ys: [String]) : [String] = match xs {
   [h, ...rest] -> if list_has(ys, h) { pcs_strs_minus(rest, ys) } else { [h, ...pcs_strs_minus(rest, ys)] }
 }
 
-fn pcs_collect_move_last_set(binders: [String], body: Expr, uses: UseIx, cmap: ConsumeIndex, acc: [String]) : [String] = match binders {
-  []           -> list_reverse(acc)
-  [nm, ...rest] -> {
-    let acc1 = match last_use_for(nm, uses) {
-      LUAt(_, ll, lc) ->
-        if pcs_read_count(nm, uses) >= 2 and pcs_last_use_consuming(nm, ll, lc, body, cmap) {
-          [nm, ...acc]
-        } else { acc }
-      _ -> acc
+fn pcs_collect_move_last_set(binders: [String], body: Expr, uses: UseIx, cmap: ConsumeIndex) : [String] =
+  match filter(binders, (nm) => pcs_read_count(nm, uses) >= 2) {
+    []    -> []
+    cands -> {
+      let sites = pms_move_sites(body, pcs_slot_consumers(cmap))
+      filter(cands, (nm) => pcs_last_read_moves(nm, uses, sites))
     }
-    pcs_collect_move_last_set(rest, body, uses, cmap, acc1)
   }
+
+fn pcs_last_read_moves(nm: String, uses: UseIx, sites: MoveSites) : Bool = match last_use_for(nm, uses) {
+  LUAt(_, ll, lc) -> pms_moves_at(sites, nm, ll, lc)
+  _               -> false
 }
 
 # Issue #1126 — a boxed param whose reads are a borrow
@@ -1678,7 +1602,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, op
         let move_last_set = pcs_strs_minus(
           pcs_list_union(
             pcs_strs_inter(
-              pcs_collect_move_last_set(pcs_all_arm_binders(body, []), body, uses, cmap, []),
+              pcs_collect_move_last_set(pcs_all_arm_binders(body, []), body, uses, cmap),
               safe_arm_binders),
             pcs_collect_move_last_lets(body, uses, cmap, skip_set)),
           pcs_list_union(skip_set, borrow_only))
@@ -4010,7 +3934,8 @@ fn pcs_collect_move_last_lets(body: Expr, uses: UseIx, cmap: ConsumeIndex,
   []    -> []
   cands -> {
     let roles = pbr_role_reads(body)
-    filter(cands, (nm) => pcs_mll_reached_once(nm, roles, uses, body, cmap))
+    let sites = pms_move_sites(body, pcs_slot_consumers(cmap))
+    filter(cands, (nm) => pcs_mll_reached_once(nm, roles, uses, sites))
   }
 }
 
@@ -4058,17 +3983,10 @@ fn pcs_mll_qualifies(nm: String, pat: Pattern, rhs: Expr, body: Expr,
   not list_has(skip, nm) and list_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm)
     and pcs_read_once(nm, uses)
 
-fn pcs_mll_reached_once(nm: String, roles: NameIx[RoleRead], uses: UseIx, body: Expr,
-                        cmap: ConsumeIndex) : Bool = match pbr_roles_of(roles, nm) {
-  (a, brc, blocked) ->
-    if a != 1 or brc != 0 or blocked { false }
-    else {
-      match last_use_for(nm, uses) {
-        LUAt(_, ll, lc) -> pcs_last_use_consuming(nm, ll, lc, body, cmap)
-        _               -> false
-      }
-    }
-}
+fn pcs_mll_reached_once(nm: String, roles: NameIx[RoleRead], uses: UseIx, sites: MoveSites) : Bool =
+  match pbr_roles_of(roles, nm) {
+    (a, brc, blocked) -> a == 1 and brc == 0 and not blocked and pcs_last_read_moves(nm, uses, sites)
+  }
 
 fn pcs_blb_payer_ok(nm: String, ot: Option[Expr], fn_name: SelfRef) : Bool = match ot {
   None    -> true
