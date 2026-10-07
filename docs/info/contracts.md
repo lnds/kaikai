@@ -63,6 +63,14 @@ A refinement is a subtype of its base: passing a `NonNeg` where an
 into a `NonNeg`) is a downcast — the predicate is checked, statically
 when provable, otherwise at runtime.
 
+Inside a generic type a downcast is a compile error: `[Int]` does not
+become `[NonNeg]`, nor `Option[Int]` an `Option[NonNeg]`; map through a
+function that checks each value. A literal (`[1, 2]`, `Some(3)`) is
+checked part by part. Lists, `Option`, `Result` and immutable records
+widen (`[NonNeg]` is an `[Int]`); `Array` and other mutable types keep
+their refinements exactly; a function type widens its result and
+narrows its parameters.
+
 ## Predicates are pure
 
 A predicate may not perform effects. This is rejected:
