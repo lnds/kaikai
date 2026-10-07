@@ -7401,16 +7401,16 @@ fn record_op_res(r: Inferred, key: String, alias_opt: Option[String],
 
 # mark that the current body has performed an op
 # of `eff` with the given type-arg instantiation. Labels with the same
-# `eff` but unifiable ty_args dedup; labels with the same `eff` but
-# non-unifiable ty_args are kept distinct so a body can perform e.g.
-# `Reader[Int]` and `Reader[String]` and have both flow through.
-fn st_add_label(st0: InferState, lab: Label, line: Int, col: Int) : InferState {
-  let st = st_set_row(st0, drop_phantom_twins(st0.row, lab))
-  if label_present_unifiable(st.row, lab, st.sub) { st_set_row(st, label_settle_in(st.row, lab, st.sub)) }
+# `eff` but non-unifiable ty_args are kept distinct so a body can perform
+# e.g. `Reader[Int]` and `Reader[String]` and have both flow through.
+fn st_add_label(st0: InferState, lab: Label, line: Int, col: Int) : InferState / Mutable {
+  let j = st_join_label(st0, lab)
+  let st = j.st
+  if not j.added { st }
   else {
     InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                  recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-                 row: [lab, ...st.row],
+                 row: st.row,
                  eff_uses: [EU(lab.eff, line, col), ...st.eff_uses],
                  aliases: st.aliases,
                  clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
@@ -7476,14 +7476,14 @@ fn st_unify_ty_args(st: InferState, a: [Ty], b: [Ty], line: Int, col: Int) : Inf
 # Fold `st_add_label` over a list of labels. Used by `synth_call` to
 # propagate every label the callee declared into the caller's row, so
 # `inferred_main_row` sees effects reached transitively via helpers.
-fn st_add_labels(st: InferState, labels: [Label], line: Int, col: Int) : InferState = match labels {
+fn st_add_labels(st: InferState, labels: [Label], line: Int, col: Int) : InferState / Mutable = match labels {
   []           -> st
   [h, ...rest] -> st_add_labels(st_add_label(st, h, line, col), rest, line, col)
 }
 
 # Every label of a callee's row flows into the caller's row.
 fn st_propagate_capability_labels(st: InferState, callee_ty: Ty,
-                                   line: Int, col: Int) : InferState {
+                                   line: Int, col: Int) : InferState / Mutable {
   match callee_ty {
     TyFnT(_, _, row) -> st_add_labels(st, capability_labels_only(row.labels), line, col)
     _ -> st
@@ -7494,23 +7494,6 @@ fn st_propagate_capability_labels(st: InferState, callee_ty: Ty,
 # label to the caller's row. No `Ffi`-only filter — honest
 # signatures, no hardcoded filters.
 fn capability_labels_only(labels: [Label]) : [Label] = labels
-
-# True iff `target.eff` matches some label in `row` AND the existing
-# label's ty_args unify with target.ty_args under the current sub.
-# Used as a syntactic-dedup guard; non-unifying same-name labels do not
-# match here (so the row keeps both, and the resolver / handler-filter
-# pass decides their fate).
-fn label_present_unifiable(row: [Label], target: Label, s: Subst) : Bool {
-  match row {
-    [] -> false
-    [h, ...rest] ->
-      if label_same(h, target) and labels_args_unify(h.ty_args, target.ty_args, s) {
-        true
-      } else {
-        label_present_unifiable(rest, target, s)
-      }
-  }
-}
 
 # Two labels name one effect: one spelling, and one declaration whenever
 # both know theirs. A label still unsettled matches by spelling alone.
@@ -8997,8 +8980,7 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
                                               cap_tyargs, rb.st.sub)
       let body_row_minus = filt.kept
       let rb_st1 = st_set_sub(rb.st, filt.sub)
-      let merged = merge_label_lists(prev_row, body_row_minus, rb_st1.sub)
-      let st_out0 = st_set_row(rb_st1, merged)
+      let st_out0 = st_merge_labels(st_set_row(rb_st1, prev_row), body_row_minus)
       let st_out1 = match alias_opt { Some(_) -> st_pop_alias(st_out0) None -> st_out0 }
       # verify `with <Eff>` names a known effect. When
       # `Eff` is unknown the body's labels still flow up via the
@@ -9619,24 +9601,33 @@ fn ty_list_dischargeable(a: [Ty], b: [Ty], s: Subst) : Bool {
 # Merge two label lists, deduplicating by (eff name + unifiable
 # ty_args). Used when synth_handle stitches the outer row back with
 # the body's residual labels.
-fn merge_label_lists(a0: [Label], b: [Label], sub: Subst) : [Label] {
-  match b {
-    [] -> a0
-    [h, ...rest] -> {
-      let a = drop_phantom_twins(a0, h)
-      if label_present_unifiable(a, h, sub) {
-        merge_label_lists(label_settle_in(a, h, sub), rest, sub)
-      } else {
-        merge_label_lists([h, ...a], rest, sub)
-      }
+fn st_merge_labels(st: InferState, b: [Label]) : InferState / Mutable = match b {
+  []           -> st
+  [h, ...rest] -> st_merge_labels(st_join_label(st, h).st, rest)
+}
+
+type LabelJoin = { st: InferState, added: Bool }
+
+# Join `lab` into the row. A label that can only be one sibling IS that
+# sibling: their arguments unify, so a type fixed later through either
+# reaches both. A dedup that merely dropped `lab` would leave its own
+# arguments unchecked against the row. Pinned instances that do not
+# unify, or a label that could be any of several, stay separate labels.
+fn st_join_label(st0: InferState, lab: Label) : LabelJoin / Mutable = {
+  let st = st_set_row(st0, drop_phantom_twins(st0.row, lab))
+  if label_is_phantom(lab) and any(st.row, (h) => label_same(h, lab)) { LabelJoin { st: st, added: false } }
+  else { match filter(st.row, (h) => label_same(h, lab) and labels_args_unify(h.ty_args, lab.ty_args, st.sub)) {
+    [twin] -> match unify_list(st.env, twin.ty_args, lab.ty_args, st.sub) {
+      Some(s2) -> LabelJoin { st: st_set_row(st_set_sub(st, s2), label_settle_in(st.row, lab, s2)), added: false }
+      None     -> LabelJoin { st: st_set_row(st, [lab, ...st.row]), added: true }
     }
-  }
+    _ -> LabelJoin { st: st_set_row(st, [lab, ...st.row]), added: true }
+  } }
 }
 
 # A phantom label (every argument `TyAny`) only demands some instance of
 # its effect. It must not stand in for a sibling that pins one, so a pinning
-# label replaces it; a phantom joining a row with a sibling is dropped by the
-# dedup, which treats `TyAny` as unifiable.
+# label replaces it, and a phantom joining a row with a sibling is dropped.
 fn drop_phantom_twins(row: [Label], lab: Label) : [Label] =
   if label_is_phantom(lab) { row }
   else { filter(row, (h) => not (label_same(h, lab) and label_is_phantom(h))) }
