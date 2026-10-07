@@ -42,7 +42,7 @@
 # Bundle order: ... unbox, perceus, protos, monomorph, **emit_shared**,
 # emit_llvm, emit_c, main. Imports compiler.ast (AST nodes + `mk_expr`),
 # compiler.util (string/list/char helpers incl. the relocated `join_with`),
-# compiler.fnreg (`EFn` + `efn_resolve` / the `scan_uses_*` / `iscan_*`
+# compiler.fnreg (`EFn` + the `scan_uses_*` / `iscan_*`
 # use-scan family), compiler.infer (`AliasBinding` / `IScan` / `IPart` /
 # `Use` + `unit_canon` / `label_to_string` / `lookup_alias`), compiler.parse
 # (`parse_interp_expr`), compiler.resolve (`core_names`), and
@@ -83,132 +83,6 @@ pub type BuildMode = BMBuild | BMTest | BMBench | BMCheck
 # type name that a homonym elsewhere could shadow.
 #[doc("Emit-side variant table entry: declaring module, constructor name, arity, payload slot kinds, head tag.")]
 pub type VariantEntry = EV(Option[String], String, Int, [Int], Int)
-
-#[doc("EFn-table filter/selector: prefer module.")]
-# Issue #748: when lowering the body of module `m`, rotate the EFn table
-# so `m`'s own entries come first AND prune any root-file entry whose
-# bare name `m` ALSO defines. The prune is the load-bearing half:
-# without it, `efn_resolve` -> `efn_pick_root` grabs the user's root
-# shadow (`kai_sum`) for a bare self-call inside `list.sum`, so the
-# stdlib body links against the user's 2-arg `fn sum` (`#748`). After the
-# prune, the only `sum` left visible to `list`'s body is `list`'s own, so
-# the recursive call mangles to `kai_list__sum`. The user's root `sum`
-# survives in every OTHER body's table (a root body's own rotation
-# returns `fns` untouched — the user shadow still wins there).
-#
-# A root-file EFn carries `mo = None` (its non-pub helpers, kept bare so
-# `kai_<name>` symbol gates keep working) OR `mo = Some(root_mod)` (its
-# `pub` decls, tagged by `tag_target_decl` for qualified-call and
-# cross-file mangling). Both spellings mean "this entry is the user's",
-# so the prune and the same-module rotation both key on
-# `efn_is_root(e, root_mod)`, not on `mo = None` alone — keying on
-# `None` only left `pub fn` root entries unpruned, letting a same-arity
-# stdlib fn of the same bare name win over the user's inside a core body
-# (#2023). If a future pass ever injects a program-level `mo = None` DFn
-# from somewhere OTHER than the root file, this invariant breaks and the
-# prune could hide a real dependency; such synthetics must carry a
-# module tag. This single rotation+prune fixes both backends at once —
-# every call site reads the rotated table — without threading a
-# `cur_mo` through the (44-constructor) LlvmEmit / EmitCtx records.
-pub fn fns_prefer_module(fns: [EFn], mo: Option[String], root_mod: Option[String]) : [EFn] = match mo {
-  None    -> fns
-  Some(m) -> {
-    # `same` holds one module's entries and `other` the rest of the
-    # table, so appending copies the short half — cheaper than reversing
-    # the concatenation of both.
-    let same = fns_filter_same_module(fns, m, root_mod, [])
-    let shadowed = ns_of_globals(efn_names_of(same, []))
-    list_append(same,
-                fns_filter_other_module_pruned(fns, m, root_mod, shadowed, []))
-  }
-}
-
-# The rotated table depends only on (fns, mo) and fns is invariant across
-# a whole emit run, so the per-body rotation is memoised by module origin:
-# one entry per distinct module (tens), not per fn body (thousands).
-pub type FnsByMod = { entries: [FnsByModEntry], base: [EFn] }
-pub type FnsByModEntry = { key: String, table: [EFn] }
-
-#[doc("An empty per-module rotated-EFn-table cache over the base table.")]
-pub fn fns_by_mod_new(fns: [EFn]) : FnsByMod = FnsByMod { entries: [], base: fns }
-
-fn fbm_lookup(entries: [FnsByModEntry], k: String) : Option[[EFn]] = match entries {
-  [] -> None
-  [e, ...rest] -> if e.key == k { Some(e.table) } else { fbm_lookup(rest, k) }
-}
-
-#[doc("The module-rotated EFn table for mo, computed once per module and reused. None keeps the base order.")]
-pub fn fns_prefer_module_cached(c: FnsByMod, mo: Option[String], root_mod: Option[String]) : FnsByModResult = match mo {
-  None    -> FnsByModResult { cache: c, table: c.base }
-  Some(m) -> match fbm_lookup(c.entries, m) {
-    Some(t) -> FnsByModResult { cache: c, table: t }
-    None    -> {
-      let t = fns_prefer_module(c.base, Some(m), root_mod)
-      FnsByModResult { cache: FnsByMod { entries: [FnsByModEntry { key: m, table: t }, ...c.entries], base: c.base }, table: t }
-    }
-  }
-}
-
-pub type FnsByModResult = { cache: FnsByMod, table: [EFn] }
-
-#[doc("A rotation cache already holding the table of every module in `mos`, for a `map` over bodies that cannot thread the cache.")]
-pub fn fns_by_mod_warm(fns: [EFn], mos: [Option[String]], root_mod: Option[String]) : FnsByMod =
-  fbm_warm(fns_by_mod_new(fns), mos, root_mod)
-
-fn fbm_warm(c: FnsByMod, mos: [Option[String]], root_mod: Option[String]) : FnsByMod = match mos {
-  [] -> c
-  [m, ...rest] -> fbm_warm(fns_prefer_module_cached(c, m, root_mod).cache, rest, root_mod)
-}
-
-#[doc("The module-rotated EFn table for mo read from a cache, rotating on a miss.")]
-pub fn fns_by_mod_table(c: FnsByMod, mo: Option[String], root_mod: Option[String]) : [EFn] =
-  fns_prefer_module_cached(c, mo, root_mod).table
-
-#[doc("Collect the bare names present in an EFn list. Order-free: the names feed a membership set.")]
-pub fn efn_names_of(fns: [EFn], acc: [String]) : [String] = match fns {
-  [] -> acc
-  [h, ...rest] -> match h { EFn(n, _, _, _, _) -> efn_names_of(rest, [n, ...acc]) }
-}
-
-#[doc("EFn-table filter/selector: filter same module. When m is the root, a bare mo=None entry counts too — see efn_is_root.")]
-pub fn fns_filter_same_module(fns: [EFn], m: String, root_mod: Option[String], acc: [EFn]) : [EFn] {
-  match fns {
-    [] -> list_reverse(acc)
-    [h, ...rest] -> {
-      let keep = match h {
-        EFn(_, _, Some(em), _, _) -> em == m
-        EFn(_, _, None, _, _)     -> match root_mod { Some(rm) -> rm == m  None -> false }
-      }
-      if keep { fns_filter_same_module(rest, m, root_mod, [h, ...acc]) }
-      else    { fns_filter_same_module(rest, m, root_mod, acc) }
-    }
-  }
-}
-
-#[doc("The entries of every module but `m`, dropping root-file entries (mo=None or mo=Some(root_mod)) whose name the body's own module redefines.")]
-pub fn fns_filter_other_module_pruned(fns: [EFn], m: String, root_mod: Option[String], shadowed: NameScope, acc: [EFn]) : [EFn] {
-  match fns {
-    [] -> list_reverse(acc)
-    [h, ...rest] -> match h {
-      EFn(n, _, _, _, _) ->
-        # Same module as the body: already emitted first by fns_filter_same_module.
-        if not efn_is_root(h, root_mod) and same_mo_as(h, m) {
-          fns_filter_other_module_pruned(rest, m, root_mod, shadowed, acc)
-        }
-        # Root-file entry: drop it when the body's module redefines the
-        # same bare name, so `efn_pick_root` cannot pick the user shadow
-        # for a bare self-call inside the module body. A root entry whose
-        # name the module does NOT redefine stays — the module body may
-        # legitimately reference it.
-        else if efn_is_root(h, root_mod) and ns_has(shadowed, n) {
-          fns_filter_other_module_pruned(rest, m, root_mod, shadowed, acc)
-        }
-        else { fns_filter_other_module_pruned(rest, m, root_mod, shadowed, [h, ...acc]) }
-    }
-  }
-}
-
-fn same_mo_as(e: EFn, m: String) : Bool = match e { EFn(_, _, Some(em), _, _) -> em == m  EFn(_, _, None, _, _) -> false }
 
 # m6.2 v2: produce the C-symbol suffix (everything after the `kai_`
 # prefix) for a named function. None → just the bare name; Some(m) →

@@ -19,12 +19,13 @@ import compiler.pipe_fusion
 import compiler.closure_spec_ast
 import compiler.closure_spec_emit
 import compiler.self_call
+import compiler.symtab_build
 
 #[doc("Specialise every higher-order call on a known env-empty closure; returns the decls with per-site specs appended and their call sites retargeted. Runs post-monomorphisation so each specialised callee is already concrete — the inlined loop body unboxes exactly like the hand-written recursion.")]
-pub fn closure_spec_pass(ds: [Decl]) : [Decl] = {
+pub fn closure_spec_pass(ds: [Decl], target: String) : [Decl] = {
   let hofns = collect_hofns(ds)
   if list_length(hofns) == 0 { ds }
-  else { cspec_fixpoint(ds, hofns, [], cspec_fuel()) }
+  else { cspec_fixpoint(ds, hofns, [], cspec_fuel(), target) }
 }
 
 # Specialisation propagates across fn boundaries: specialising `foldl`
@@ -40,17 +41,17 @@ fn cspec_fuel() : Int = 64
 # the raw `inner(..., L)` call whose request the next round must find;
 # rewriting inside the loop would retarget it away before it is seen,
 # stranding the transitive spec (`foldl → foldl_loop`).
-fn cspec_fixpoint(ds: [Decl], hofns: [Decl], emitted: [String], fuel: Int) : [Decl] =
-  if fuel <= 0 { rewrite_all(ds, ds, hofns) }
+fn cspec_fixpoint(ds: [Decl], hofns: [Decl], emitted: [String], fuel: Int, target: String) : [Decl] =
+  if fuel <= 0 { rewrite_all(ds, ds, hofns, target) }
   else {
     let reqs = dedup_reqs(cs_collect_decls(ds, ds, hofns), emitted, [])
-    if list_length(reqs) == 0 { rewrite_all(ds, ds, hofns) }
+    if list_length(reqs) == 0 { rewrite_all(ds, ds, hofns, target) }
     else {
-      let specs = map(reqs, (r) => emit_cspec(r, ds))
+      let specs = map(reqs, (r) => emit_cspec(r, ds, target))
       let ds1 = list_append(ds, specs)
       let hofns1 = list_append(hofns, filter_hofns(specs))
       let emitted1 = list_append(emitted, map(reqs, req_spec_name))
-      cspec_fixpoint(ds1, hofns1, emitted1, fuel - 1)
+      cspec_fixpoint(ds1, hofns1, emitted1, fuel - 1, target)
     }
   }
 
@@ -99,61 +100,19 @@ fn first_fn_param_idx(ps: [Param], i: Int) : Int =
     [p, ...rest] -> if is_fn_param(p) { i } else { first_fn_param_idx(rest, i + 1) }
   }
 
-# Find the higher-order fn a call resolves to. A qualified call
-# `mod.foldl` binds to the `foldl` DFn declared in `mod` — the same
-# name in another module (`vec.foldl` vs `list.foldl`) is a different
-# fn with its own functional-param index, so the module must match.
-fn lookup_hofn(hofns: [Decl], modn: Option[String], name: String) : Option[Decl] =
-  match modn {
-    Some(m) -> match lookup_hofn_in(hofns, m, name) {
-      Some(d) -> Some(d)
-      None    -> lookup_hofn_any(hofns, name)
-    }
-    None -> lookup_hofn_any(hofns, name)
-  }
-
-# The higher-order fn a call names. A resolved callee is the decl its id
-# names; a homonym in another module only shares the spelling. Where some
-# decl of that name carries no id, the miss proves nothing and the name
-# decides.
+# The higher-order fn a call names: the declaration its id names. A
+# specialisation is already specialised, and a bare spelling is a local or
+# a builtin, so neither names one.
 fn callee_hofn(hofns: [Decl], callee: Expr) : Option[Decl] = match callee.kind {
-  ESym(s, inst, n) ->
-    if sym_is_local(s) { None }
-    else if sym_raw(s) < 0 or inst != spec_none() { lookup_hofn(hofns, None, n) }
-    else { match lookup_hofn_sym(hofns, s) {
-      Some(d) -> Some(d)
-      None    -> if hofns_named_stamped(hofns, n) { None } else { lookup_hofn(hofns, None, n) }
-    } }
-  _ -> match callee_ref(callee) {
-    Some(CRef(modn, name)) -> lookup_hofn(hofns, modn, name)
-    None -> None
-  }
+  ESym(s, inst, _) -> if inst == spec_none() { lookup_hofn_sym(hofns, s) } else { None }
+  EModCall(m, n)   -> lookup_hofn_sym(hofns, sym_derive(NCFn, n, m))
+  _                -> None
 }
 
 fn lookup_hofn_sym(hofns: [Decl], s: SymId) : Option[Decl] = match hofns {
   [] -> None
-  [d, ...rest] -> if sym_raw(cs_decl_sym(d)) == sym_raw(s) { Some(d) } else { lookup_hofn_sym(rest, s) }
+  [d, ...rest] -> if sym_raw(s) >= 0 and sym_raw(cs_decl_sym(d)) == sym_raw(s) { Some(d) } else { lookup_hofn_sym(rest, s) }
 }
-
-fn hofns_named_stamped(hofns: [Decl], name: String) : Bool = match hofns {
-  [] -> true
-  [d, ...rest] -> if cs_decl_name(d) == name and sym_raw(cs_decl_sym(d)) < 0 { false }
-                  else { hofns_named_stamped(rest, name) }
-}
-
-fn lookup_hofn_in(hofns: [Decl], modn: String, name: String) : Option[Decl] =
-  match hofns {
-    [] -> None
-    [d, ...rest] ->
-      if cs_decl_name(d) == name and mo_is(cs_decl_mo(d), modn) { Some(d) }
-      else { lookup_hofn_in(rest, modn, name) }
-  }
-
-fn lookup_hofn_any(hofns: [Decl], name: String) : Option[Decl] =
-  match hofns {
-    [] -> None
-    [d, ...rest] -> if cs_decl_name(d) == name { Some(d) } else { lookup_hofn_any(rest, name) }
-  }
 
 # ---- request collection (read-only walk) ----
 
@@ -222,47 +181,47 @@ fn req_of(args_: [Expr], hd: Decl, host: String, all: [Decl]) : [CSpecReq] = {
 
 # ---- call-site rewrite (pure map) ----
 
-fn rewrite_all(ds: [Decl], all: [Decl], hofns: [Decl]) : [Decl] =
-  map(ds, (d) => rewrite_decl(d, all, hofns))
+fn rewrite_all(ds: [Decl], all: [Decl], hofns: [Decl], target: String) : [Decl] =
+  map(ds, (d) => rewrite_decl(d, all, hofns, target))
 
 # Retarget call sites only in the decls that seeded requests — root-file
 # decls and the generated specs (all `mo == None`). A stdlib/compiler
 # decl is left untouched: no spec was discovered for its internal calls.
-fn rewrite_decl(d: Decl, all: [Decl], hofns: [Decl]) : Decl =
+fn rewrite_decl(d: Decl, all: [Decl], hofns: [Decl], target: String) : Decl =
   match d {
     DFn(p, n, tp, ps, rt, row, body, l, c, mo, fsym) ->
       if cs_specialisable_host(d) {
-        DFn(p, n, tp, ps, rt, row, rewrite_expr(body, n, all, hofns), l, c, mo, fsym)
+        DFn(p, n, tp, ps, rt, row, rewrite_expr(body, n, all, hofns, target), l, c, mo, fsym)
       } else { d }
     _ -> d
   }
 
 # Rewrite bottom-up: children via the shared functor, then this node.
-fn rewrite_expr(e: Expr, host: String, all: [Decl], hofns: [Decl]) : Expr = {
-  let e1 = Expr { kind: map_expr_kind(e.kind, (k) => rewrite_expr(k, host, all, hofns)),
+fn rewrite_expr(e: Expr, host: String, all: [Decl], hofns: [Decl], target: String) : Expr = {
+  let e1 = Expr { kind: map_expr_kind(e.kind, (k) => rewrite_expr(k, host, all, hofns, target)),
                   line: e.line, col: e.col, ty: e.ty, mode: e.mode }
-  retarget_site(e1, host, all, hofns)
+  retarget_site(e1, host, all, hofns, target)
 }
 
 # A specialisable higher-order call `G(args)` becomes `G__cspec__<disc>(rest)`
 # with the functional argument dropped; other nodes pass through.
-fn retarget_site(e: Expr, host: String, all: [Decl], hofns: [Decl]) : Expr =
+fn retarget_site(e: Expr, host: String, all: [Decl], hofns: [Decl], target: String) : Expr =
   match e.kind {
     ECall(callee, args_) -> match callee_hofn(hofns, callee) {
-      Some(hd) -> retarget_call(e, callee, args_, hd, host, all)
+      Some(hd) -> retarget_call(e, callee, args_, hd, host, all, target)
       None     -> e
     }
     _ -> e
   }
 
-fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, host: String, all: [Decl]) : Expr = {
+fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, host: String, all: [Decl], target: String) : Expr = {
   let idx = first_fn_param_idx(decl_params(hd), 0)
   if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(hd, idx) { e }
   else {
     match classify_closure(elem_at(args_, idx), all) {
       Some(ca) -> {
         let nm = cspec_name(cs_decl_mo(hd), cs_decl_name(hd), closure_disc(host, ca))
-        Expr { kind: ECall(retarget_callee(callee, nm), drop_at(args_, idx)),
+        Expr { kind: ECall(retarget_callee(callee, nm, target), drop_at(args_, idx)),
                line: e.line, col: e.col, ty: e.ty, mode: e.mode }
       }
       None -> e

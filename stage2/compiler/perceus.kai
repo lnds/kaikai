@@ -144,8 +144,8 @@ fn prc_mangle_ty(t: Ty) : String {
 # true). Only these take the simplified empty-param-scope Perceus path;
 # a mixed signature (some boxed param) needs the full borrow/move/exit
 # discipline and falls through to the boxed branch.
-fn prc_is_all_raw_ufn_decl(fns: FnIndex, fid: FnId, name: String, mo: Option[String]) : Bool {
-  match fnx_decl_sig(fns, fid, name, mo) {
+fn prc_is_all_raw_ufn_decl(fns: FnIndex, fid: FnId) : Bool {
+  match fnx_decl_sig(fns, fid) {
     Some(US(_, _, mask)) -> prc_mask_all_true(mask)
     None                 -> false
   }
@@ -159,8 +159,8 @@ fn prc_mask_all_true(mask: [Bool]) : Bool = match mask {
 # The names of the RAW params of a (mixed-sig) fn — those whose mask bit
 # is true. They carry no rc, so they go in the Perceus skip-set and are
 # excluded from unused-param drops. Non-UFn fns return [] (no raw param).
-fn prc_raw_param_names(fns: FnIndex, fid: FnId, name: String, mo: Option[String], params: [Param]) : [String] {
-  match fnx_decl_sig(fns, fid, name, mo) {
+fn prc_raw_param_names(fns: FnIndex, fid: FnId, params: [Param]) : [String] {
+  match fnx_decl_sig(fns, fid) {
     Some(US(_, _, mask)) -> prc_raw_names_zip(params, mask)
     None                 -> []
   }
@@ -215,30 +215,26 @@ pub fn perceus_pass_in(decls: [Decl], tab: SymTab, views: FileViews,
   # positions, consumed by BOTH sides of the flip (callee wraps the
   # borrowed scrutinee in __perceus_borrow so emit_match skips its exit
   # decref; caller strips the __perceus_dup on args in borrowed slots).
-  # Each body reads the view of its own module, where a bare callee name
-  # means the declaration the emitter links it to.
   # Read-only prims (array_get/array_length) join the borrow map so the
   # caller strips the container dup and the path counter charges 0 —
-  # reusing the whole borrow pipeline. Seeded only where no user fn
-  # shadows the name; the same entry gates the callee rename.
-  let prim_bmap = pcs_seed_prim_borrows(pcs_user_fn_names(decls, []), [])
-  let bviews = pcs_build_borrow_views(decls, root, prim_bmap)
+  # reusing the whole borrow pipeline. A prim is keyed by name and a
+  # declaration by identity, so a user fn spelled like a prim never reads
+  # the prim's row; the same entry gates the callee rename.
+  let prim_bmap = pcs_seed_prim_borrows()
+  let bmap = pcs_build_borrow_map(decls, prim_bmap)
   # Consume-map (Koka Borrowed dual): per-fn CONSUMED param positions. A caller
   # may MOVE a binder into a consuming slot; a non-consuming slot (field-read
   # callee like regexp nb_add_transition) must keep the caller's ref.
-  let cmap = pcs_build_consume_map(decls, root, cix_empty())
+  let cmap = pcs_build_consume_map(decls, cix_empty())
   # Names of `extern "C" fn` shims whose return type is an opaque handle.
   # A `let h = f(...)` with such an `f` binds a handle box that must move
   # at its last consuming use (the shim there decrefs the box); otherwise
   # it is dup'd at every use and the birth ref never reaches zero.
   let opaque_names = pcs_collect_opaque_names(decls, [])
   let opaque_ret_fns = pcs_collect_opaque_ret_fns(decls, opaque_names, [])
-  # `fn_names` derives only from `fns`, fixed for the whole pass:
-  # rebuilding it per decl is quadratic in the fn count.
-  let fn_names = pcs_efn_names(fns)
   let caps = pcap_scope(decls, tab, views, root)
   let prim_bm = bm_of(prim_bmap)
-  map(decls, (d) => perceus_decl_b(d, fns, bv_for_decl(bviews, d), cmap, opaque_ret_fns, fn_names, prim_bm, caps))
+  map(decls, (d) => perceus_decl_b(d, fns, bmap, cmap, opaque_ret_fns, prim_bm, caps))
 }
 
 # `extern "C" fn` names whose return type is an opaque handle.
@@ -247,7 +243,7 @@ fn pcs_collect_opaque_ret_fns(decls: [Decl], opaque_names: [String], acc: [Strin
   [d, ...rest] -> match d {
     DFn(_, name, _, _, opt_ret, _, body, _, _, mo, fsym) ->
       if body_is_ffi_extern(body) and pcs_ret_is_opaque(opt_ret, opaque_names) {
-        pcs_collect_opaque_ret_fns(rest, opaque_names, [pcs_borrow_key(name, mo), name, ...acc])
+        pcs_collect_opaque_ret_fns(rest, opaque_names, [bv_fid_key(fsym), ...acc])
       } else { pcs_collect_opaque_ret_fns(rest, opaque_names, acc) }
     _ -> pcs_collect_opaque_ret_fns(rest, opaque_names, acc)
   }
@@ -276,13 +272,13 @@ fn pcs_is_ffi_opaque_record(fields: [FieldDecl]) : Bool = match fields {
   _ -> false
 }
 
-#[doc("Interprocedural borrow map, one view per calling module, inferred from the bodies.")]
-pub fn pcs_build_borrow_views(decls: [Decl], root: String, seed: [BorrowEntry]) : BorrowViews =
-  bv_build(pcs_borrow_decls(decls, false, []), root, seed)
+#[doc("Interprocedural borrow map inferred from the bodies, keyed by function identity.")]
+pub fn pcs_build_borrow_map(decls: [Decl], seed: [BorrowEntry]) : BorrowMap =
+  bv_build(pcs_borrow_decls(decls, false, []), seed)
 
 #[doc("The borrow map Perceus planned, read from the `pborrow` it stamped on post-Perceus decls.")]
-pub fn pcs_planned_borrow_views(decls: [Decl], root: String) : BorrowViews =
-  bv_build(pcs_borrow_decls(decls, true, []), root, [])
+pub fn pcs_planned_borrow_map(decls: [Decl]) : BorrowMap =
+  bv_build(pcs_borrow_decls(decls, true, []), [])
 
 fn pcs_borrow_decls(decls: [Decl], planned: Bool, acc: [BorrowDecl]) : [BorrowDecl] = match decls {
   []           -> list_reverse(acc)
@@ -290,35 +286,16 @@ fn pcs_borrow_decls(decls: [Decl], planned: Bool, acc: [BorrowDecl]) : [BorrowDe
     DFn(is_pub, name, _, params, _, _, body, _, _, mo, fsym) -> {
       let pos = if planned { pcs_borrow_positions(map(params, (p) => p.pname), pcs_explicit_borrow_names(params), 0) }
                 else { pcs_borrowed_positions(is_pub, SelfRef(fsym, name), params, body) }
-      pcs_borrow_decls(rest, planned, [BD(name, mo, pos), ...acc])
+      pcs_borrow_decls(rest, planned, [BD(fsym, pos), ...acc])
     }
     _ -> pcs_borrow_decls(rest, planned, acc)
   }
 }
 
-# Seed the borrow map with the read-only prims, EXCEPT any a user fn
-# shadows (a user `fn array_get(...)` owns its arg; borrowing it would
-# be a use-after-free in user code). The same non-shadowed predicate
-# then gates BOTH the caller-dup strip and the callee rename — driving
-# them from one map entry makes a strip-without-rename (double free) or
-# rename-without-strip (leak) impossible.
-fn pcs_seed_prim_borrows(user_fns: [String], acc: [BorrowEntry]) : [BorrowEntry] =
-  pcs_seed_prim(core_borrowing_prims(), user_fns, acc)
-
-fn pcs_seed_prim(prims: [String], user_fns: [String], acc: [BorrowEntry]) : [BorrowEntry] = match prims {
-  []           -> acc
-  [p, ...rest] ->
-    if list_has(user_fns, p) { pcs_seed_prim(rest, user_fns, acc) }
-    else { pcs_seed_prim(rest, user_fns, [BwE(p, [0]), ...acc]) }
-}
-
-fn pcs_user_fn_names(decls: [Decl], acc: [String]) : [String] = match decls {
-  []           -> acc
-  [d, ...rest] -> match d {
-    DFn(_, name, _, _, _, _, _, _, _, _, fsym) -> pcs_user_fn_names(rest, [name, ...acc])
-    _                                    -> pcs_user_fn_names(rest, acc)
-  }
-}
+# Seed the borrow map with the read-only prims. One map entry gates BOTH
+# the caller-dup strip and the callee rename, so a strip-without-rename
+# (double free) or rename-without-strip (leak) is impossible.
+fn pcs_seed_prim_borrows() : [BorrowEntry] = map(core_borrowing_prims(), (p) => BwE(p, [0]))
 
 # A container read ONLY through borrowed-prim slots (never consumed by a
 # later owning use) has no consumer to release its ref. Borrowing every one
@@ -393,11 +370,6 @@ fn pcs_borrowed_positions(is_pub: Bool, me: SelfRef, params: [Param], body: Expr
     let pnames = map(params, (p) => p.pname)
     pcs_borrow_positions(pnames, pcs_borrow_params_hybrid(is_pub, me, params, pnames, body), 0)
   }
-
-pub fn pcs_borrow_key(name: String, mo: Option[String]) : String = match mo {
-  None    -> name
-  Some(m) -> concat_all([m, ".", name])
-}
 
 # Hybrid borrow decision (issue #1127). A `pub` function's borrow-ness is
 # ABI: only the parameters explicitly marked `^` are borrowed, never
@@ -563,10 +535,10 @@ fn pcs_borrowed_closure_names(borrowed: [String], params: [Param]) : [String] =
 # does not touch.
 # Context for the caller-side borrow strip.
 #
-# `fn_names` (issue #1130 rule 1) — the known top-level fns. A bare fn name
-# in a borrowed slot materialises a fresh `kai_closure` the callee borrows
-# but no one drops; it is marked `__perceus_owned_borrow` here for the emit
-# to balance after the call.
+# `fns` — the function registry. A function passed by value in a borrowed
+# slot materialises a fresh `kai_closure` the callee borrows but no one
+# drops; it is marked `__perceus_owned_borrow` here for the emit to
+# balance after the call.
 #
 # `no_wrap` — names whose bare (un-dup'd) reads are NOT owned moves even
 # at their last-use position: borrowed params (borrow-through), raw
@@ -580,7 +552,7 @@ fn pcs_borrowed_closure_names(borrowed: [String], params: [Param]) : [String] =
 # stripped dups (net-zero), and per-read reclassification is unsound
 # where sugar clones share one source position.
 type StripCx = { bmap: BorrowMap, borrow_last: [String],
-                 fn_names: [String], no_wrap: [String], uses: UseIx, fns: FnIndex }
+                 no_wrap: [String], uses: UseIx, fns: FnIndex }
 
 fn pcs_strip_borrow_args_d(e: Expr, scx: StripCx) : Expr =
   Expr { kind: pcs_strip_borrow_kind(e.kind, scx),
@@ -654,12 +626,12 @@ fn pcs_boxed_borrow_slots(bmap: BorrowMap, fns: FnIndex, f: Expr) : [Int] = {
   filter(pcs_borrow_lookup(bmap, pcs_callee_key(f)), (i) => not pcs_has_int(raw, i))
 }
 
-#[doc("Call key for a callee expression: a resolved function's id, `mod.name` for a home-spelled call, else the bare name.")]
+#[doc("Call key for a callee expression: the identity of the function it names, or the name of the prim a bare spelling is.")]
 pub fn pcs_callee_key(callee: Expr) : String = match callee.kind {
-  ESym(s, inst, nm) -> if inst == spec_none() and sym_raw(s) >= 0 { bv_id_key(s) } else { nm }
-  EVar(nm)          -> nm
-  EModCall(m, nm)   -> concat_all([m, ".", nm])
-  _                 -> ""
+  ESym(s, inst, _) -> bv_fid_key(FnId(s, inst))
+  EVar(nm)         -> nm
+  EModCall(m, nm)  -> bv_fid_key(fnid_decl(sym_derive(NCFn, nm, m)))
+  _                -> ""
 }
 
 # For each arg: if its index is in `positions` (borrowed slot) and it is
@@ -680,7 +652,7 @@ fn pcs_strip_args_at_d(args_: [Expr], positions: [Int], i: Int, scx: StripCx) : 
     # its delegated release never happens in a borrowing callee.
     let a2 = if borrowed_slot {
                let s = pcs_strip_dup_wrap(a1)
-               if pcs_arg_is_fn_name(s, scx.fn_names) and pcs_arg_is_untracked(s, scx.uses) { prs_wrap_owned_borrow(s) }
+               if pcs_arg_is_fn_ref(s, scx.fns) and pcs_arg_is_untracked(s, scx.uses) { prs_wrap_owned_borrow(s) }
                else if pcs_arg_is_owned_move(a1, scx) { prs_wrap_owned_borrow(s) }
                else if pcs_arg_is_owned_rvalue(s) { prs_wrap_owned_borrow(s) }
                else { s }
@@ -743,18 +715,10 @@ fn pcs_ty_is_rc(ty: Option[Ty]) : Bool = match ty {
 # A bare top-level fn name passed by value (the emit materialises a fresh
 # `kai_closure`, like a lambda literal). A local/param is never marked —
 # it is borrow-through or tracked, and dropping it would over-free.
-fn pcs_arg_is_fn_name(a: Expr, fn_names: [String]) : Bool = match sym_read_kind(a.kind) {
-  EVar(nm) -> list_has(fn_names, nm)
-  _        -> false
-}
-
-# Names of the known top-level fns (an `EVar` naming one is materialised as
-# a fresh `kai_closure` when passed by value to a borrowed slot).
-fn pcs_efn_names(fns: FnIndex) : [String] = pcs_efn_names_loop(fnx_all(fns))
-
-fn pcs_efn_names_loop(fns: [EFn]) : [String] = match fns {
-  []           -> []
-  [f, ...rest] -> match f { EFn(nm, _, _, _, _) -> [nm, ...pcs_efn_names_loop(rest)] }
+fn pcs_arg_is_fn_ref(a: Expr, fns: FnIndex) : Bool = match a.kind {
+  ESym(s, inst, _) -> match fnx_of_sym(fns, FnId(s, inst)) { Some(_) -> true  None -> false }
+  EModCall(m, nm)  -> match fnx_qualified(fns, m, nm) { Some(_) -> true  None -> false }
+  _                -> false
 }
 
 #[doc("True when the int list contains `t`.")]
@@ -820,13 +784,13 @@ pub fn pcs_borrow_params(pnames: [String], body: Expr) : [String] = match pnames
 # caller's ref (dup), else the value's life after the call reads freed memory
 # (the regexp UAF). Keyed per fn (qualified + bare, like the borrow map).
 
-fn pcs_build_consume_map(decls: [Decl], root: String, acc: ConsumeIndex) : ConsumeIndex = match decls {
+fn pcs_build_consume_map(decls: [Decl], acc: ConsumeIndex) : ConsumeIndex = match decls {
   []           -> acc
-  [d, ...rest] -> pcs_build_consume_map(rest, root, pcs_consume_entry_of(d, root, acc))
+  [d, ...rest] -> pcs_build_consume_map(rest, pcs_consume_entry_of(d, acc))
 }
 
-fn pcs_consume_entry_of(d: Decl, root: String, acc: ConsumeIndex) : ConsumeIndex = match d {
-  DFn(_, name, _, params, _, _, body, _, _, mo, fsym) -> {
+fn pcs_consume_entry_of(d: Decl, acc: ConsumeIndex) : ConsumeIndex = match d {
+  DFn(_, _, _, params, _, _, body, _, _, _, fsym) -> {
     let pnames = map(params, (p) => p.pname)
     # An FFI shim's body is opaque to the consuming-use walk, so a normal
     # scan finds nothing consumed. The shim decrefs every boxed input, so
@@ -834,25 +798,9 @@ fn pcs_consume_entry_of(d: Decl, root: String, acc: ConsumeIndex) : ConsumeIndex
     # a value passed to two shim calls is double-freed.
     let positions = if body_is_ffi_extern(body) { pcs_ffi_consumed_positions(params, 0) }
                     else { pcs_consumed_positions(pnames, body, 0) }
-    let qual = CE(pcs_borrow_key(name, mo), positions)
-    let named = match mo {
-      None    -> cix_add(acc, qual)
-      Some(_) -> cix_add_newest_first(acc, [CE(name, positions), qual])
-    }
-    pcs_consume_id_entry(named, name, pcs_home_of(mo, root), positions)
+    cix_add(acc, CE(bv_fid_key(fsym), positions))
   }
   _ -> acc
-}
-
-# The declaration's id key. A specialisation spells a name of its own, so
-# its key never meets its template's.
-fn pcs_consume_id_entry(acc: ConsumeIndex, name: String, home: String,
-      positions: [Int]) : ConsumeIndex =
-  cix_add(acc, CE(bv_id_key(sym_derive(NCFn, name, home)), positions))
-
-fn pcs_home_of(mo: Option[String], root: String) : String = match mo {
-  Some(m) -> m
-  None    -> root
 }
 
 fn pcs_ffi_consumed_positions(params: [Param], i: Int) : [Int] = match params {
@@ -1245,12 +1193,8 @@ fn pcs_olb_arms(arms: [Arm], ofns: [String], acc: [String]) : [String] = match a
 }
 
 fn pcs_rhs_calls_opaque_fn(rhs: Expr, ofns: [String]) : Bool = match rhs.kind {
-  ECall(f, _) -> match sym_read_kind(f.kind) {
-    EVar(c)        -> list_has(ofns, c)
-    EModCall(_, c) -> list_has(ofns, c)
-    _              -> false
-  }
-  _ -> false
+  ECall(f, _) -> list_has(ofns, pcs_callee_key(f))
+  _           -> false
 }
 
 # Append a `__perceus_drop(h)` to the block scope of each `let h = ...`
@@ -1452,7 +1396,7 @@ fn pcs_inspected_elems(nm: String, els: [ListElem]) : Bool = match els {
 }
 
 fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, opaque_ret_fns: [String],
-                  fn_names: [String], prim_bmap: BorrowMap, caps: CapScope) : Decl / Console {
+                  prim_bmap: BorrowMap, caps: CapScope) : Decl / Console {
 
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo, fsym) -> {
@@ -1482,7 +1426,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, op
       # SLet bindings enter the scope during the walk and get their
       # dups + exit drops, while the raw params stay untouched and
       # take no param drops (no boxed params to reclaim).
-      else if prc_is_all_raw_ufn_decl(fns, fsym, name, mo) {
+      else if prc_is_all_raw_ufn_decl(fns, fsym) {
         # ALL-raw UFn: every param is a raw C scalar with no rc, so the
         # body rewrite runs with an EMPTY param scope (issue #703) — no
         # boxed param to dup/drop, no borrow, no arm-move analysis.
@@ -1496,7 +1440,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, op
         # every read of a multi-use local can land in a borrowed slot and
         # orphan the birth ref.
         let new_body = ptd_tail_exit_drops(new_body0, me, uses, [], branchy_lets,
-                                           pcs_borrow_lookup(bmap, pcs_borrow_key(name, mo)))
+                                           pcs_borrow_lookup(bmap, bv_fid_key(fsym)))
         let arm_dropped = pcs_arm_drop_pass(new_body, me, PcsArmCx { uses: uses, moved: [], boxed_bpos: [], borrow_only: [],
                                                                        borrowed: [], bmap: bm_empty(), forced: branchy_lets })
         let branch_paid = pbp_branch_drops(arm_dropped, map(params, (p) => p.pname), uses, [], [])
@@ -1507,7 +1451,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, op
         # borrowed/raw/skip sets and no `no_wrap` names.
         let borrow_last = pcs_collect_borrow_last_set(pcs_let_binder_names(body, []), body, prim_bmap)
         let scx = StripCx { bmap: bmap, borrow_last: borrow_last,
-                            fn_names: fn_names, no_wrap: [], uses: uses, fns: fns }
+                            no_wrap: [], uses: uses, fns: fns }
         let body_borrow = pcs_strip_borrow_args_d(reused_body, scx)
         DFn(is_pub, name, tparams, params, opt_ret, row, body_borrow, ln, cl, mo, fsym)
       }
@@ -1525,7 +1469,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, op
         # (no use is a dup/move candidate) AND into the raw set (no unused-
         # param drop) — the same no-rc treatment as an unboxed scalar.
         let cap_pnames = pcap_param_names(caps, mo, params)
-        let raw_pnames = pcs_list_union(prc_raw_param_names(fns, fsym, name, mo, params), cap_pnames)
+        let raw_pnames = pcs_list_union(prc_raw_param_names(fns, fsym, params), cap_pnames)
         let pnames = pcs_strs_minus(map(params, (p) => p.pname), cap_pnames)
         let uses = pcs_use_index(body, pnames)
         # Borrow inference (Koka). A borrowed param is inspect-only:
@@ -1648,7 +1592,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, op
         # exists). `ptd_tail_exit_drops` releases exactly those. The fn's own
         # borrowed positions gate the self-call arg hoist: a hoisted temp in
         # a borrowed slot would lose the argument's ownership marking.
-        let self_bpos = pcs_borrow_lookup(bmap, pcs_borrow_key(name, mo))
+        let self_bpos = pcs_borrow_lookup(bmap, bv_fid_key(fsym))
         let new_body = ptd_tail_exit_drops(new_body1, me, uses, move_last_set, branchy_lets, self_bpos)
         let boxed_bpos = pcs_boxed_positions(self_bpos, params, raw_pnames, 0)
         let arm_dropped = pcs_arm_drop_pass(new_body, me,
@@ -1698,7 +1642,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, op
         let no_wrap = pcs_list_union(pcs_list_union(pcs_list_union(rewrite_skip_set, opaque_lets), branchy_single),
                                      borrow_only)
         let scx = StripCx { bmap: bmap, borrow_last: borrow_last,
-                            fn_names: fn_names, no_wrap: no_wrap, uses: uses, fns: fns }
+                            no_wrap: no_wrap, uses: uses, fns: fns }
         let body_borrow = pcs_strip_borrow_args_d(body_borrow_call, scx)
         let self_bpos = pcs_borrow_positions(map(params, (p) => p.pname), pcs_strs_minus(borrowed, raw_pnames), 0)
         let body_lent = plt_lend_binders(body_borrow, me, self_bpos, borrowed,

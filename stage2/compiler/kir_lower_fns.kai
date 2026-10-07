@@ -52,12 +52,12 @@ pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
   # (`emit_reuse_donate`), keyed on the mangled symbol, so both backends
   # pick one capable set and the reuse ABI cannot diverge between them.
   let capable = rd_scan_capable(raw_decls)
-  let kfns    = lower_fns(raw_decls, st0, freg, fns_by_mod_new(fns), capable, [])
+  let kfns    = lower_fns(raw_decls, st0, freg, capable, [])
   # Each lifted lambda becomes a top-level `KFnLambda`, and each handler
   # clause a `KFnClause` (mirror of emit_c's `emit_lam_helpers` /
   # `emit_clause_bodies`), appended after the ordinary fns.
-  let lamfns  = lower_lam_fns(lc.lams, st0, fns_by_mod_new(fns), [])
-  let clsfns  = lower_clause_fns(lc.clauses, lc.clauses, st0, fns_by_mod_new(fns), [])
+  let lamfns  = lower_lam_fns(lc.lams, st0, [])
+  let clsfns  = lower_clause_fns(lc.clauses, lc.clauses, st0, [])
   # Each test / bench body becomes a runner `KFn` returning the block's
   # final boxed value (mirror of emit_c's `emit_test_fn` / `emit_bench_fn`,
   # minus the inline setjmp — the native runtime helper holds the landing
@@ -85,15 +85,13 @@ fn runner_home(mo: Option[String]) : String = match mo { Some(m) -> m None -> ""
 
 fn lower_runner_decls(decls: [Decl], target_origin: Option[String],
                       st0: LowerSt, freg: [ExternTypeReg]) : RunnerLower / Console = {
-  let body_fns = fns_prefer_module(st0.fns, target_origin, st0.root_mod)
-  lower_runner_loop(decls, st0, freg, body_fns, 0, 0, [], [])
+  lower_runner_loop(decls, st0, freg, st0.fns, 0, 0, [], [])
 }
 
 # Walk the decls accumulating one runner KFn + KRunner per test/bench
 # block. `ti`/`bi` are the per-kind counters. The runner sym is passed as
 # the fn name with `mo = None`, so `c_sym` keeps it literal
-# (`_kai_test_0`) and the native driver names the same symbol. The body's
-# own calls already resolve through the pre-rotated `body_fns`. A check
+# (`_kai_test_0`) and the native driver names the same symbol. A check
 # body takes its `with` params as fn params; Perceus already made the body
 # borrow them, so the runtime loop keeps ownership across iterations and
 # shrink attempts.
@@ -156,12 +154,7 @@ fn collect_lams(decls: [Decl], fns: [EFn], variants: [VariantEntry]) : LamCollec
 
 # --- Ordinary functions -------------------------------------------------
 
-# `fbm` memoises the per-module EFn-table rotation by module origin (one
-# entry per distinct module, not per fn body) — the `O(n²)` retention the
-# per-body rebuild caused on a self-compile. Threaded like the C emitter's
-# `fn_bodies_loop`: each body reads its rotated table from the cache and
-# passes the grown cache to the next decl.
-fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], fbm: FnsByMod, capable: [String], acc: [KFn]) : [KFn] / Console = match ds {
+fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], capable: [String], acc: [KFn]) : [KFn] / Console = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> match d {
     DFn(_, name, _, params, ret_ty, row, body, _, _, _, _) -> {
@@ -169,14 +162,13 @@ fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], fbm: FnsByMod, capa
       # KFn carries it so the native partitioner reads the partition off
       # the KFn instead of re-deriving it.
       let mo = home_tu(d)
-      let r = fns_prefer_module_cached(fbm, mo, st.root_mod)
       # `main` never takes the donor param: the runtime entry calls it
       # directly, outside the donor-aware call funnel.
       let dn = name != "main" and rd_is_capable(c_sym(name, mo), capable)
-      let kfn = lower_fn(name, params, ret_ty, Some(row), body, mo, r.table, st, freg, dn)
-      lower_fns(rest, st, freg, r.cache, capable, [kfn, ...acc])
+      let kfn = lower_fn(name, params, ret_ty, Some(row), body, mo, st.fns, st, freg, dn)
+      lower_fns(rest, st, freg, capable, [kfn, ...acc])
     }
-    _ -> lower_fns(rest, st, freg, fbm, capable, acc)
+    _ -> lower_fns(rest, st, freg, capable, acc)
   }
 }
 
@@ -371,13 +363,10 @@ fn proto_dispatch_arg_vals(params: [Param]) : [KVal] = match params {
 # nested lambda resolves to ITS LamInfo (mirror of emit_c's
 # `lam_symbol` enc_fn). Same body shape as a normal fn — only the
 # `kind` + param origins differ (asu review).
-fn lower_lam_fns(lams: [LamInfo], st0: LowerSt, fbm: FnsByMod, acc: [KFn]) : [KFn] / Console = match lams {
+fn lower_lam_fns(lams: [LamInfo], st0: LowerSt, acc: [KFn]) : [KFn] / Console = match lams {
   [] -> acc
   [l, ...rest] -> {
-    # Lifted from a side table, so no Decl carries `mo`: rotate to the
-    # lambda's module or its bare calls hit another module's homonym.
-    let r = fns_prefer_module_cached(fbm, lam_mo(l), st0.root_mod)
-    lower_lam_fns(rest, st0, r.cache, list_append(acc, [lower_lam_fn(l, st0, r.table)]))
+    lower_lam_fns(rest, st0, list_append(acc, [lower_lam_fn(l, st0, st0.fns)]))
   }
 }
 
@@ -499,12 +488,10 @@ fn param_local_names(params: [Param], acc: [String]) : [String] = match params {
 # lambdas and handles nested in it.
 # `all_cls` is the whole program's clause list (threaded so each clause
 # can resolve its handle's cross-clause capture union).
-fn lower_clause_fns(clauses: [ClauseInfo], all_cls: [ClauseInfo], st0: LowerSt, fbm: FnsByMod, acc: [KFn]) : [KFn] / Console = match clauses {
+fn lower_clause_fns(clauses: [ClauseInfo], all_cls: [ClauseInfo], st0: LowerSt, acc: [KFn]) : [KFn] / Console = match clauses {
   [] -> acc
   [c, ...rest] -> {
-    # Same side-table lift as a lambda: rotate to the clause's module.
-    let r = fns_prefer_module_cached(fbm, clause_mo(c), st0.root_mod)
-    lower_clause_fns(rest, all_cls, st0, r.cache, list_append(acc, [lower_clause_fn(c, all_cls, st0, r.table)]))
+    lower_clause_fns(rest, all_cls, st0, list_append(acc, [lower_clause_fn(c, all_cls, st0, st0.fns)]))
   }
 }
 
