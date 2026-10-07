@@ -33,7 +33,12 @@ fi
 
 rm -rf "$OUT"; mkdir -p "$OUT"
 
-# `name ret(params)` for each kaix_ define or declare.
+# `name ret(params)` for each kaix_ define or declare, in a form both sides
+# of the ABI agree on. clang lowers `__int128` per target: x86-64 SysV
+# splits a parameter into two i64 and returns it as `{ i64, i64 }`, arm64
+# keeps i128; the emitter declares i128 and LLVM lowers it the same way at
+# codegen. So an i128 parameter reads as `i64,i64` and an i128 or
+# `{ i64, i64 }` return reads as `i128`, on both sides.
 SIG_AWK='
 /^(define|declare) / && /@kaix_[A-Za-z0-9_]*\(/ {
   line = $0
@@ -41,17 +46,32 @@ SIG_AWK='
   name = line; sub(/^.*@/, "", name); sub(/\(.*$/, "", name)
   head = line; sub(/@kaix_.*$/, "", head); sub(/^(define|declare) /, "", head)
   gsub(/(dso_local|internal|local_unnamed_addr|noundef|zeroext|signext|nonnull|noalias|hidden|range\([^)]*\)) */, "", head)
-  gsub(/ +$/, "", head); n = split(head, w, " "); ret = w[n]
+  gsub(/ +$/, "", head)
+  if (head ~ /\{/) { ret = head; sub(/^[^{]*/, "", ret); gsub(/ /, "", ret) }
+  else { n = split(head, w, " "); ret = w[n] }
+  if (ret == "{i64,i64}") ret = "i128"
   args = line; sub(/^[^(]*\(/, "", args); sub(/\)[^)]*$/, "", args)
   np = split(args, ps, ","); out = ""
   for (i = 1; i <= np; i++) {
     p = ps[i]
     gsub(/(noundef|zeroext|signext|nonnull|noalias|nocapture|readonly|writeonly|captures\([^)]*\)|align [0-9]+|dereferenceable(_or_null)?\([0-9]+\)|%[A-Za-z0-9_.]+) */, "", p)
     gsub(/^ +| +$/, "", p)
+    if (p == "i128") p = "i64,i64"
     if (p != "") out = out (out == "" ? "" : ",") p
   }
   print name, ret "(" out ")"
 }'
+
+# Both lowerings of an i128 must read alike, or the gate fails on one host.
+self_test() {
+  local a b
+  a="$(printf '%s\n' 'define { i64, i64 } @kaix_t(ptr noundef %0) #1 {' 'define ptr @kaix_u(i64 noundef %0, i64 noundef %1) {' | awk "$SIG_AWK")"
+  b="$(printf '%s\n' 'declare i128 @kaix_t(ptr)' 'declare ptr @kaix_u(i128)' | awk "$SIG_AWK")"
+  [ "$a" = "$b" ] || { echo "native-runtime-decl-gate self-test FAIL:"; echo "$a"; echo "$b"; exit 1; }
+  a="$(printf '%s\n' 'define i128 @kaix_t(ptr noundef %0) {' 'define ptr @kaix_u(i128 noundef %0) {' | awk "$SIG_AWK")"
+  [ "$a" = "$b" ] || { echo "native-runtime-decl-gate self-test FAIL (arm64 form):"; echo "$a"; echo "$b"; exit 1; }
+}
+self_test
 
 "$CLANG" -std=c99 -w -O0 -S -emit-llvm -DKAI_SEPARATE_COMPILATION=1 \
   -I "$ROOT/stage2" -I "$ROOT/stage0" "$ROOT/stage0/runtime_llvm.c" -o "$OUT/runtime.ll"
