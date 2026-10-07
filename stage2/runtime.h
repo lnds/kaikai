@@ -19622,17 +19622,6 @@ static KaiValue *kai_llvm_add_uwtable(void *fn) {
  * when absent, so a miss adds the declaration with the given type. */
 static void *kai_llvm_get_or_declare_fn(void *m, KaiValue *name, void *fnty) {
     LLVMValueRef fn = LLVMGetNamedFunction((LLVMModuleRef) m, name->as.s.bytes);
-    /* LLVMGetNamedFunction consults the module's ValueSymbolTable, which on
-     * LLVM 22 does NOT reliably index functions created earlier in this same
-     * walk (it returned NULL for a function the GetFirst/GetNext iterator
-     * still found in the module — the VST lazily de-syncs after many adds).
-     * Fall back to a linear scan (the iterator IS authoritative) so a
-     * forward-declared fn is reused, not re-added under a `.N` suffix. */
-    if (fn == NULL) {
-        for (LLVMValueRef g = LLVMGetFirstFunction((LLVMModuleRef) m); g; g = LLVMGetNextFunction(g)) {
-            if (strcmp(LLVMGetValueName(g), name->as.s.bytes) == 0) { fn = g; break; }
-        }
-    }
     if (fn == NULL) fn = LLVMAddFunction((LLVMModuleRef) m, name->as.s.bytes, (LLVMTypeRef) fnty);
     if (name) kai_decref(name);
     return (void *) fn;

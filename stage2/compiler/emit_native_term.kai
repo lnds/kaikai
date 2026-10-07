@@ -22,6 +22,7 @@ import compiler.emit_native_fn
 import compiler.emit_native_pads
 import compiler.emit_native_slot
 import compiler.emit_native_ops
+import compiler.emit_native_fnix
 import compiler.emit_native_fixedvec
 import compiler.emit_native_ffi
 import compiler.emit_native_fx
@@ -37,11 +38,11 @@ import compiler.emit_native_trmc
 # threads the program's handler decls so a `KInstall`/`KPerform` resolves
 # its op→clause-thunk map (effects subset 2a). A `KFnClause` rides the
 # effects clause ABI `ptr (ptr self, <args>, ptr k)`.
-pub fn nemit_fn(ctx: Handle, f: KFn, handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = match f.kind {
-  KFnNormal -> nemit_fn_with(ctx, f, NFnNormal, handlers, fns)
-  KFnLambda -> nemit_fn_with(ctx, f, NFnLambda, handlers, fns)
-  KFnClause -> nemit_fn_with(ctx, f, NFnClause, handlers, fns)
-  KFnCleanup -> nemit_fn_with(ctx, f, NFnCleanup, handlers, fns)
+pub fn nemit_fn(ctx: Handle, f: KFn, handlers: [KHandlerDecl], fx: NFnIndex) : Unit / Console = match f.kind {
+  KFnNormal -> nemit_fn_with(ctx, f, NFnNormal, handlers, fx)
+  KFnLambda -> nemit_fn_with(ctx, f, NFnLambda, handlers, fx)
+  KFnClause -> nemit_fn_with(ctx, f, NFnClause, handlers, fx)
+  KFnCleanup -> nemit_fn_with(ctx, f, NFnCleanup, handlers, fx)
   # An `extern "C" fn` carries no lowered body — the shim is synthesised
   # here from the marshalling kinds the KIR classified (emit_native_ffi.kai).
   KFnFfi(csym, pks, rk) -> nemit_ffi_fn(ctx, f, csym, pks, rk)
@@ -89,7 +90,7 @@ fn nfn_mark_internal(fnval: Handle) : Unit = { let _il = llvm_set_internal_linka
 # lambda takes the thunk ABI `ptr (ptr self, ptr* args, i32 n)`; a clause
 # takes `ptr (ptr self, <args ptr>, ptr k)`. The block-building + alloca
 # prologue are identical; only the LLVM signature + the param seed differ.
-fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = {
+fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl], fx: NFnIndex) : Unit / Console = {
   let fnval = nemit_declare_for_abi(ctx, f, abi)
   nfn_internalize_private(f, abi, fnval)
   native_ctx_begin_fn(ctx, fnval)
@@ -120,7 +121,7 @@ fn nemit_fn_with(ctx: Handle, f: KFn, abi: NFnAbi, handlers: [KHandlerDecl], fns
   # P3: pass the fn's return slot so a `KRet` returns the raw scalar
   # matching the signature. Lambda / clause ABIs always carry `SBoxed`
   # ret, so they keep the boxed return.
-  nemit_fill_blocks(ctx, nfn_sym(f.sym), f.blocks, handlers, f.ret, fns)
+  nemit_fill_blocks(ctx, nfn_sym(f.sym), f.blocks, handlers, f.ret, fx)
   native_ctx_end_fn(ctx)
 }
 
@@ -312,28 +313,28 @@ fn nemit_make_blocks(ctx: Handle, fnval: Handle, bs: [KBlock]) : Unit = match bs
 
 # --- pass 2: fill each block's statements + terminator -----------------
 
-fn nemit_fill_blocks(ctx: Handle, cur_fn: String, bs: [KBlock], handlers: [KHandlerDecl], ret: KSlot, fns: [KFn]) : Unit / Console = match bs {
+fn nemit_fill_blocks(ctx: Handle, cur_fn: String, bs: [KBlock], handlers: [KHandlerDecl], ret: KSlot, fx: NFnIndex) : Unit / Console = match bs {
   [] -> ()
   [b, ...rest] -> {
     llvm_position_at_end(native_ctx_b(ctx), native_ctx_find_block(ctx, b.label))
-    nemit_stmts(ctx, cur_fn, b.stmts, handlers, fns)
+    nemit_stmts(ctx, cur_fn, b.stmts, handlers, fx)
     # DWARF (#500): attach the terminator's source line before emitting it,
     # so a `panic`/`?`/`KRet` carries the .kai:line the stack trace reads.
     ndi_set_pos(ctx, ndi_term_pos(b.term))
     nemit_term(ctx, b.term, ret)
-    nemit_fill_blocks(ctx, cur_fn, rest, handlers, ret, fns)
+    nemit_fill_blocks(ctx, cur_fn, rest, handlers, ret, fx)
   }
 }
 
 # Each statement sets its own source line before it lowers (#500), so an
 # instruction maps back to the kaikai line it came from; a `KNoPos`
 # (synthetic) clears the location so it inherits no stale line.
-fn nemit_stmts(ctx: Handle, cur_fn: String, ss: [KStmt], handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = match ss {
+fn nemit_stmts(ctx: Handle, cur_fn: String, ss: [KStmt], handlers: [KHandlerDecl], fx: NFnIndex) : Unit / Console = match ss {
   [] -> ()
   [s, ...rest] -> {
     ndi_set_pos(ctx, ndi_stmt_pos(s))
-    nemit_stmt(ctx, cur_fn, s, handlers, fns)
-    nemit_stmts(ctx, cur_fn, rest, handlers, fns)
+    nemit_stmt(ctx, cur_fn, s, handlers, fx)
+    nemit_stmts(ctx, cur_fn, rest, handlers, fx)
   }
 }
 
@@ -350,7 +351,7 @@ fn nemit_stmts(ctx: Handle, cur_fn: String, ss: [KStmt], handlers: [KHandlerDecl
 # use-after-free the LLVM verifier hits as a phantom-`phi` crash). The
 # `let h = ...` form rides the handle-binder exclusion (`pcs_rhs_is_handle`
 # in stage1), so `h` never enters Perceus and is never dropped.
-fn nemit_stmt(ctx: Handle, cur_fn: String, s: KStmt, handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = match s {
+fn nemit_stmt(ctx: Handle, cur_fn: String, s: KStmt, handlers: [KHandlerDecl], fx: NFnIndex) : Unit / Console = match s {
   # Capture the op/atom handle in a `let` (handle-binder exclusion) before
   # passing it on: a handle passed inline as a call ARGUMENT is RC-managed
   # by the type-blind kaic1, and a drop of an LLVM `Value*` clobbers its
@@ -368,8 +369,8 @@ fn nemit_stmt(ctx: Handle, cur_fn: String, s: KStmt, handlers: [KHandlerDecl], f
   # word never reaches a boxed-border read as a dereferenced pointer.
   KLet(n, slot, op, _) ->
     if npad_is_open(op) { nemit_pad_open(ctx, n, op) }
-    else { let h = nemit_op_fx_slot(ctx, cur_fn, op, slot, handlers, fns); nemit_store_reg_boxing(ctx, n, slot, h) }
-  KDo(op, _)        -> if npad_is_close(op) { nemit_pad_close(ctx, op) } else { nemit_do(ctx, cur_fn, op, handlers, fns) }
+    else { let h = nemit_op_fx_slot(ctx, cur_fn, op, slot, handlers, fx); nemit_store_reg_boxing(ctx, n, slot, h) }
+  KDo(op, _)        -> if npad_is_close(op) { nemit_pad_close(ctx, op) } else { nemit_do(ctx, cur_fn, op, handlers, fx) }
   KStore(n, v, _)   -> nemit_store_slot_aware(ctx, n, v)
   KRC(rc, _)        -> nemit_rc(ctx, rc)
   KInstall(eff, sym, init, alias, _) -> nemit_install(ctx, eff, sym, init, alias, handlers)
@@ -381,7 +382,7 @@ fn nemit_stmt(ctx: Handle, cur_fn: String, s: KStmt, handlers: [KHandlerDecl], f
   # the address source. The return clause is inlined into the enclosing fn,
   # so an alias name that fn already binds keeps the user's register.
   KBindEvState(_, sym, _) ->
-    nemit_bind_ev_state(ctx, live_state_aliases(true, kfn_user_binders(fns, cur_fn)),
+    nemit_bind_ev_state(ctx, live_state_aliases(true, kfn_user_binders(fx.all, cur_fn)),
                         native_ctx_find_reg(ctx, nfx_ev_reg(sym)))
   KSetCleanup(_, sym, thunk, _) -> nemit_set_cleanup(ctx, sym, thunk)
   KRunCleanup(_, sym, _) -> nemit_run_cleanup(ctx, sym)
@@ -399,8 +400,8 @@ fn nemit_stmt(ctx: Handle, cur_fn: String, s: KStmt, handlers: [KHandlerDecl], f
 # as a `ptr` is an over-drop (UAF) — both are excluded by the boxed-slot gate.
 # The value Handle is captured in a `let` before the drop so the type-blind
 # kaic1 Perceus never sees the raw LLVM `Value*` (the :289 handle-binder rule).
-fn nemit_do(ctx: Handle, cur_fn: String, op: KOp, handlers: [KHandlerDecl], fns: [KFn]) : Unit / Console = {
-  let h = nemit_op_fx(ctx, cur_fn, op, handlers, fns)
+fn nemit_do(ctx: Handle, cur_fn: String, op: KOp, handlers: [KHandlerDecl], fx: NFnIndex) : Unit / Console = {
+  let h = nemit_op_fx(ctx, cur_fn, op, handlers, fx)
   if ndo_discards_owned_box(ctx, op) {
     let _d = nemit_call1(ctx, "kaix_internal_drop", h); ()
   } else { () }
@@ -422,18 +423,18 @@ fn ndo_discards_owned_box(ctx: Handle, op: KOp) : Bool = match op {
 # emitter lives in `emit_native_fx2`, which `emit_native_ops` cannot import —
 # it would cycle, fx2 already imports ops — so the seam is here, the module
 # that imports both). Everything else delegates to the pure `nemit_op`.
-fn nemit_op_fx(ctx: Handle, cur_fn: String, op: KOp, handlers: [KHandlerDecl], fns: [KFn]) : Handle / Console = match op {
+fn nemit_op_fx(ctx: Handle, cur_fn: String, op: KOp, handlers: [KHandlerDecl], fx: NFnIndex) : Handle / Console = match op {
   # `nemit_perform` materialises its args as atoms (`nemit_atom`), never a
   # direct `KCall` (a call arg is lowered to a prior KLet, reaching here as
-  # a `KVar`), so it does not need the `fns` sig table.
+  # a `KVar`), so it does not need the `fx` sig table.
   KPerform(eff, esym, o, cargs) -> nemit_perform(ctx, cur_fn, eff, esym, o, cargs, handlers)
   KResumeOp(k, v)           -> nemit_resume(ctx, k, v)
   KResume2Op(k, v, ns)      -> nemit_resume2(ctx, k, v, ns)
   # Region arena bracket: `kaix_arena_push`/`kaix_arena_pop` take and return
   # `void`, so they cannot go through the ptr-returning `KCall` path. Only
   # ever a `KDo` (the discarded null result is fine).
-  KCall(sym, _) -> if nis_void_arena_op(sym) { nemit_void_call(ctx, sym) } else { nemit_op(ctx, op, fns) }
-  _                         -> nemit_op(ctx, op, fns)
+  KCall(sym, _) -> if nis_void_arena_op(sym) { nemit_void_call(ctx, sym) } else { nemit_op(ctx, op, fx) }
+  _                         -> nemit_op(ctx, op, fx)
 }
 
 fn nis_void_arena_op(sym: String) : Bool = sym == "kaix_arena_push" or sym == "kaix_arena_pop"
@@ -458,7 +459,7 @@ fn nemit_void_call(ctx: Handle, sym: String) : Handle / Console = {
 #     slot is the box decision, symmetric with the load side.
 # Every other shape delegates unchanged; the load/store side is already
 # slot-driven via `nslot_type_of_tag`.
-fn nemit_op_fx_slot(ctx: Handle, cur_fn: String, op: KOp, slot: KSlot, handlers: [KHandlerDecl], fns: [KFn]) : Handle / Console =
+fn nemit_op_fx_slot(ctx: Handle, cur_fn: String, op: KOp, slot: KSlot, handlers: [KHandlerDecl], fx: NFnIndex) : Handle / Console =
   match op {
     KLitOp(v)         -> nemit_atom_raw(ctx, v, slot)
     # A fixed-width `Vec[t]<n>` inline prim (`__fixed_vec_lit`/`_get`): a flat
@@ -466,8 +467,8 @@ fn nemit_op_fx_slot(ctx: Handle, cur_fn: String, op: KOp, slot: KSlot, handlers:
     KPrim(nm, cargs)  -> if nprim_is_fixed_vec(nm) { nemit_fixed_vec_prim(ctx, nm, cargs) }
                          else if nm == "kai_unw_push_state" { nemit_unw_push_state(ctx, cargs) }
                          else if nm == "kai_unw_push_reg" { nemit_unw_push_reg(ctx, cargs) }
-                         else { nemit_op(ctx, op, fns) }
-    KCall(sym, cargs) -> nemit_call_direct(ctx, sym, cargs, fns, slot)
+                         else { nemit_op(ctx, op, fx) }
+    KCall(sym, cargs) -> nemit_call_direct(ctx, sym, cargs, fx, slot)
     # A kind-1 Int slot binder (`SInt64`) reads the slot RAW via
     # `kaix_variant_arg_i64` (`.i64`), no box round-trip; the register holds the
     # raw `i64` and a boxed consumer re-boxes at its border (`nemit_load_reg_boxed`).
@@ -479,13 +480,13 @@ fn nemit_op_fx_slot(ctx: Handle, cur_fn: String, op: KOp, slot: KSlot, handlers:
     KProjKind(v, i, _) -> match slot {
       SInt64 -> nemit_proj_slot(ctx, v, i, slot)
       SReal  -> nemit_proj_slot(ctx, v, i, slot)
-      _      -> nemit_op(ctx, op, fns)
+      _      -> nemit_op(ctx, op, fx)
     }
     # A known-pointer slot: direct `.ptr` borrow, no mask branch. The slot is
     # always `SBoxed` (a `ptr` register) for a `KProjBorrow`, so it delegates
     # to the pure `nemit_op` arm — the borrow accessor is repr-independent.
-    KProjBorrow(_, _) -> nemit_op(ctx, op, fns)
-    _                 -> nemit_op_fx(ctx, cur_fn, op, handlers, fns)
+    KProjBorrow(_, _) -> nemit_op(ctx, op, fx)
+    _                 -> nemit_op_fx(ctx, cur_fn, op, handlers, fx)
   }
 
 # `KProj` at its typed binder slot: `SInt64` / `SReal` read the slot RAW inline
