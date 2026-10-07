@@ -447,6 +447,7 @@ KAIX_CORE_THUNK3(reduce)
 KAIX_CORE_THUNK2(each)
 KAIX_CORE_THUNK0(args)
 KAIX_CORE_THUNK0(program_name)
+KaiValue *kaix_core_program_name_thunk(KaiValue *s, KaiValue **a, int n) { (void)s; (void)a; (void)n; return kai_core_program_name(); }
 KAIX_CORE_THUNK0(stdlib_path)
 KAIX_CORE_THUNK1(abspath)
 KAIX_CORE_THUNK1(read_file)

@@ -37,9 +37,7 @@ KAI="$ROOT/bin/kai"
 DIR="$(mktemp -d "${TMPDIR:-/tmp}/kai-core-homonym.XXXXXX")"
 trap 'rm -rf "$DIR"' EXIT
 
-builtins=$(awk '/^pub fn core_names\(\)/ { on = 1 } on && /^  \]/ { exit } on' \
-             "$ROOT/stage2/compiler/resolve.kai" \
-           | grep -oE '"[a-z_0-9]+"' | tr -d '"' | grep -v '^__' | sort -u)
+builtins=$("$ROOT/stage2/kaic2" --builtin-names | grep -v '^__' | sort -u)
 [ -n "$builtins" ] || { echo "core-homonym-gate: no core names found"; exit 1; }
 # Every protocol operation as `name:arity`, the arity counted from the
 # parameters' colons.

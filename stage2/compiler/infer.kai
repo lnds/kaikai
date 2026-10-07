@@ -40,6 +40,8 @@ import compiler.loop_lower
 import compiler.tailslots
 import compiler.doc_attr
 import compiler.native_prims
+import compiler.builtin_types
+import compiler.builtins
 import compiler.infer_index
 import compiler.refinements
 import compiler.refine_coerce
@@ -2856,26 +2858,7 @@ fn tv(n: Int) : Ty = TyVarT(n)
 
 fn fn_ty(ps: [Ty], ret: Ty) : Ty = TyFnT(ps, ret, inf_row_empty())
 
-# Like `fn_ty` but stamps a closed effect row onto the function type, so a
-# core builtin carries its own effect in its scheme instead of having it
-# attributed by a name-keyed side table at the call site. The labels are
-# non-parametric builtin effects (Stdout, File, Mutable, …) — no ty_args, no
-# tail — so the standard call-inference path (`collect_call_labels` /
-# `st_propagate_capability_labels`) propagates them into the caller's row,
-# exactly as for a stdlib fn written `: T / Stdout`. Empty `effs` degrades to
-# `fn_ty`.
-fn fn_ty_eff(ps: [Ty], ret: Ty, effs: [String]) : Ty =
-  TyFnT(ps, ret, labels_to_closed_row(map(effs, (e) => Label { eff: e, ty_args: [], sym: core_effect_sym(e) })))
-
-# A builtin's effect is the core declaration, never a homonym in scope.
-fn core_effect_sym(e: String) : SymId =
-  sym_derive(NCEffect, e, if e == "Process" { "os" } else { "effects" })
-
-# open-tail Row for row-polymorphic
-# core signatures (each/map/filter/reduce). The row var id
-# `rid` matches the scheme's bound rvar; at instantiation time the
-# inferencer mints a fresh rvar so labels propagate from callee
-# into caller.
+# An empty row open on row variable `rid`.
 fn row_with_tail(rid: Int) : Row = Row {
   labels:        [],
   tail:          Some(rid),
@@ -2885,312 +2868,10 @@ fn row_with_tail(rid: Int) : Row = Row {
 fn list_ty(t: Ty) : Ty = TyListT(t)
 
 # ---- core signatures ----
-#
-# Kept in sync with stage 0's runtime and with stdlib/core/*.kai's
-# assumptions. Type variables inside a scheme are private to it.
 
 #[doc("infer: `add_core_sigs` — typer entry point invoked by the driver.")]
 pub fn add_core_sigs(env: TyEnv) : TyEnv {
-  let es = [
-    # IO
-    TyEntry { name: "print",          scheme: mono(fn_ty_eff([TyString], TyUnit, ["Stdout"])) },
-    TyEntry { name: "eprint",         scheme: mono(fn_ty_eff([TyString], TyUnit, ["Stderr"])) },
-    # (LSP framing): write_stdout writes a String to stdout
-    # verbatim with no trailing newline and flushes. Required by the
-    # LSP JSON-RPC framer where the body is exactly Content-Length bytes.
-    TyEntry { name: "write_stdout",   scheme: mono(fn_ty_eff([TyString], TyUnit, ["Stdout"])) },
-    # bare `args()` reads the process command-line snapshot;
-    # per docs/effects-stdlib.md §`Env` the op lives on `Env`. (program_name
-    # below is deliberately effect-free — argv[0] is routed through
-    # the kai_g_argv snapshot as a pure read of process-wide constant state.)
-    TyEntry { name: "args",           scheme: mono(fn_ty_eff([], list_ty(TyString), ["Env"])) },
-    # argv[0] as a flat core. Total — empty string
-    # when the runtime hasn't seen `kai_set_args` yet.
-    TyEntry { name: "program_name",   scheme: mono(fn_ty([], TyString)) },
-    TyEntry { name: "core_program_name", scheme: mono(fn_ty([], TyString)) },
-    TyEntry { name: "stdlib_path",    scheme: mono(fn_ty([], TyString)) },
-    TyEntry { name: "abspath",        scheme: mono(fn_ty([TyString], TyString)) },
-    TyEntry { name: "read_file",      scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyString, TyString], sym_none()), ["File"])) },
-    TyEntry { name: "write_file",     scheme: mono(fn_ty_eff([TyString, TyString], TyCon(None, "Result", [TyUnit, TyString], sym_none()), ["File"])) },
-    # fs/file expansion. `file_exists` returns Bool;
-    # `file_delete` / `file_rename` return Result[Unit, String] (Ok
-    # first). All three carry the `File` effect in their scheme row.
-    TyEntry { name: "file_exists",    scheme: mono(fn_ty_eff([TyString], TyBool, ["File"])) },
-    TyEntry { name: "file_delete",    scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyUnit, TyString], sym_none()), ["File"])) },
-    TyEntry { name: "file_rename",    scheme: mono(fn_ty_eff([TyString, TyString], TyCon(None, "Result", [TyUnit, TyString], sym_none()), ["File"])) },
-    # Binary file IO. Both ride the `File` effect in their scheme row.
-    # `file_read_bytes` returns Result[Array[Byte], String] so the
-    # buffer surface lines up with BinSerialize — cache
-    # layers and crypto consumers round-trip bytes (including 0x00)
-    # without paying a list-to-array conversion at the boundary.
-    # `file_write_bytes` is the symmetric write.
-    TyEntry { name: "file_read_bytes",  scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyCon(None, "Array", [TyByte], sym_none()), TyString], sym_none()), ["File"])) },
-    TyEntry { name: "file_write_bytes", scheme: mono(fn_ty_eff([TyString, TyCon(None, "Array", [TyByte], sym_none())], TyCon(None, "Result", [TyUnit, TyString], sym_none()), ["File"])) },
-    # fs/dir surface. list_dir / walk return [String]
-    # (cons-list); create_dir / remove_dir return Result[Unit, String]
-    # (Ok first). All four carry the `File` effect in their scheme row.
-    TyEntry { name: "dir_list_dir",   scheme: mono(fn_ty_eff([TyString], list_ty(TyString), ["File"])) },
-    TyEntry { name: "dir_create_dir", scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyUnit, TyString], sym_none()), ["File"])) },
-    TyEntry { name: "dir_remove_dir", scheme: mono(fn_ty_eff([TyString], TyCon(None, "Result", [TyUnit, TyString], sym_none()), ["File"])) },
-    TyEntry { name: "dir_walk",       scheme: mono(fn_ty_eff([TyString], list_ty(TyString), ["File"])) },
-    TyEntry { name: "read_line",      scheme: mono(fn_ty_eff([], TyCon(None, "Result", [TyString, TyString], sym_none()), ["Stdin"])) },
-    # byte-oriented stdin read. Returns a String of at
-    # most `n` bytes; on EOF the result is shorter (possibly empty).
-    # No Result wrapper — the LSP framing use case treats a short
-    # read as end-of-stream.
-    TyEntry { name: "read_bytes",     scheme: mono(fn_ty_eff([TyInt], TyString, ["Stdin"])) },
-    # `exit` and `panic` never return — give them a polymorphic result so
-    # they unify with any context. `exit` rides `Process`;
-    # `panic` is an audited runtime escape, not a Process op, so it stays
-    # effect-free in its scheme.
-    TyEntry { name: "exit",           scheme: scheme([0], fn_ty_eff([TyInt], tv(0), ["Process"])) },
-    TyEntry { name: "panic",          scheme: scheme([0], fn_ty([TyString], tv(0))) },
-
-    # Conversions
-    TyEntry { name: "int_to_string",  scheme: mono(fn_ty([TyInt],    TyString)) },
-    TyEntry { name: "real_to_string", scheme: mono(fn_ty([TyReal],   TyString)) },
-    TyEntry { name: "string_to_int",  scheme: mono(fn_ty([TyString], TyCon(None, "Option", [TyInt], sym_none()))) },
-    TyEntry { name: "string_to_real", scheme: mono(fn_ty([TyString], TyCon(None, "Option", [TyReal], sym_none()))) },
-    TyEntry { name: "char_to_int",    scheme: mono(fn_ty([TyChar],   TyInt)) },
-    TyEntry { name: "int_to_char",    scheme: mono(fn_ty([TyInt],    TyChar)) },
-    # 1-byte raw String constructor (cache codec primitive).
-    TyEntry { name: "int_to_byte_string", scheme: mono(fn_ty([TyInt], TyString)) },
-    # byte read from String (Int 0..255, -1 on OOB).
-    TyEntry { name: "string_byte_at_int", scheme: mono(fn_ty([TyString, TyInt], TyInt)) },
-    # UTF-8 codepoint decode. `string_cp_at(s, off)` is the
-    # codepoint at byte offset `off` (-1 on OOB); `string_cp_len(s, off)`
-    # is its byte width 1..4 (0 on OOB). `string.chars()` walks over them.
-    TyEntry { name: "string_cp_at",   scheme: mono(fn_ty([TyString, TyInt], TyInt)) },
-    TyEntry { name: "string_cp_len",  scheme: mono(fn_ty([TyString, TyInt], TyInt)) },
-    # Codepoint-wise reverse: one pass, one allocation, byte-exact for
-    # multibyte UTF-8. Backs `string.reverse`.
-    TyEntry { name: "string_reverse", scheme: mono(fn_ty([TyString], TyString)) },
-    # Hash protocol backends. `string_hash` is the full-width
-    # 64-bit FNV-1a over the bytes; `real_bits` reinterprets a double's
-    # IEEE-754 bits as an Int. Both may wrap negative — HashMap
-    # normalises to a bucket.
-    TyEntry { name: "string_hash", scheme: mono(fn_ty([TyString], TyInt)) },
-    TyEntry { name: "int_to_le4", scheme: mono(fn_ty([TyInt], TyString)) },
-    TyEntry { name: "int_to_le8", scheme: mono(fn_ty([TyInt], TyString)) },
-    # Array[Byte] block primitives. The writers mutate their first argument
-    # in place and return it; the readers are effect-free.
-    TyEntry { name: "bytes_blit",       scheme: mono(fn_ty_eff([TyCon(None, "Array", [TyByte], sym_none()), TyInt, TyCon(None, "Array", [TyByte], sym_none()), TyInt, TyInt], TyCon(None, "Array", [TyByte], sym_none()), ["Mutable"])) },
-    TyEntry { name: "bytes_put_le",     scheme: mono(fn_ty_eff([TyCon(None, "Array", [TyByte], sym_none()), TyInt, TyInt, TyInt], TyCon(None, "Array", [TyByte], sym_none()), ["Mutable"])) },
-    TyEntry { name: "bytes_get_le",     scheme: mono(fn_ty([TyCon(None, "Array", [TyByte], sym_none()), TyInt, TyInt], TyInt)) },
-    TyEntry { name: "bytes_put_string", scheme: mono(fn_ty_eff([TyCon(None, "Array", [TyByte], sym_none()), TyInt, TyString], TyCon(None, "Array", [TyByte], sym_none()), ["Mutable"])) },
-    TyEntry { name: "bytes_get_string", scheme: mono(fn_ty([TyCon(None, "Array", [TyByte], sym_none()), TyInt, TyInt], TyString)) },
-    TyEntry { name: "real_bits",   scheme: mono(fn_ty([TyReal],   TyInt)) },
-    # int_to_real: lossless cast (Int → Real). Used by stdlib/math/real.kai
-    # for floor/ceil/round/trunc, which need to round-trip through Int.
-    TyEntry { name: "int_to_real",    scheme: mono(fn_ty([TyInt],    TyReal)) },
-    # real_to_int: truncating cast toward zero (matches C `(int64_t) r`).
-    # NaN, Inf, and out-of-Int64-range values collapse to 0 — see
-    # `kai_core_real_to_int` in stage0/runtime.h for the guards.
-    TyEntry { name: "real_to_int",    scheme: mono(fn_ty([TyReal],   TyInt)) },
-
-    # Byte nominal primitive. `int_to_u8` range-checks
-    # 0..255 and returns `Result[u8, String]` (Ok first).
-    # `u8_to_int` is lossless widening. Arithmetic
-    # (`u8_add`, `u8_sub`) wraps mod 256 per the C `uint8_t` semantics
-    # — overflow is defined, not UB. Comparison ops mirror Int.
-    TyEntry { name: "int_to_byte",      scheme: mono(fn_ty([TyInt],            TyCon(None, "Result", [TyByte, TyString], sym_none()))) },
-    TyEntry { name: "byte_to_int",      scheme: mono(fn_ty([TyByte],             TyInt)) },
-    TyEntry { name: "byte_add",         scheme: mono(fn_ty([TyByte, TyByte],       TyByte)) },
-    TyEntry { name: "byte_sub",         scheme: mono(fn_ty([TyByte, TyByte],       TyByte)) },
-    TyEntry { name: "byte_eq",          scheme: mono(fn_ty([TyByte, TyByte],       TyBool)) },
-    TyEntry { name: "byte_lt",          scheme: mono(fn_ty([TyByte, TyByte],       TyBool)) },
-    TyEntry { name: "byte_to_string",   scheme: mono(fn_ty([TyByte],             TyString)) },
-
-    # Fixed-width integer prims (numeric lane A). `*_to_string` backs the
-    # Show impls; `int_to_*` / `*_to_int` are the explicit conversions
-    # (truncating into the width, widening back to Int). Arithmetic and
-    # comparison ride the `+`/`-`/`*`/`<`/`==` operators directly (the
-    # typer keeps fixed-width operands on the raw fast path), so no
-    # `*_add`/`*_eq` prims are needed.
-    TyEntry { name: "int32_to_string",  scheme: mono(fn_ty([TyInt32],  TyString)) },
-    TyEntry { name: "uint32_to_string", scheme: mono(fn_ty([TyUInt32], TyString)) },
-    TyEntry { name: "uint64_to_string", scheme: mono(fn_ty([TyUInt64], TyString)) },
-    TyEntry { name: "int128_to_string", scheme: mono(fn_ty([TyInt128], TyString)) },
-    TyEntry { name: "int_to_int32",     scheme: mono(fn_ty([TyInt], TyInt32)) },
-    TyEntry { name: "int_to_uint32",    scheme: mono(fn_ty([TyInt], TyUInt32)) },
-    TyEntry { name: "int_to_uint64",    scheme: mono(fn_ty([TyInt], TyUInt64)) },
-    TyEntry { name: "int_to_int128",    scheme: mono(fn_ty([TyInt], TyInt128)) },
-    TyEntry { name: "int32_to_int",     scheme: mono(fn_ty([TyInt32],  TyInt)) },
-    TyEntry { name: "uint32_to_int",    scheme: mono(fn_ty([TyUInt32], TyInt)) },
-    TyEntry { name: "uint64_to_int",    scheme: mono(fn_ty([TyUInt64], TyInt)) },
-    TyEntry { name: "int128_to_int",    scheme: mono(fn_ty([TyInt128], TyInt)) },
-
-    # libm bindings. IEEE-754 pass-through; inspect with
-    # `real_is_nan` / `real_is_inf`. See stage0/runtime.h for the
-    # `kai_core_real_*` family.
-    TyEntry { name: "real_sqrt",      scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_cbrt",      scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_exp",       scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_log",       scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_log2",      scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_log10",     scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_sin",       scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_cos",       scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_tan",       scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_asin",      scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_acos",      scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_atan",      scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_sinh",      scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_cosh",      scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_tanh",      scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_signum",    scheme: mono(fn_ty([TyReal],   TyReal)) },
-    TyEntry { name: "real_is_nan",    scheme: mono(fn_ty([TyReal],   TyBool)) },
-    TyEntry { name: "real_is_inf",    scheme: mono(fn_ty([TyReal],   TyBool)) },
-    TyEntry { name: "real_pow",       scheme: mono(fn_ty([TyReal, TyReal], TyReal)) },
-    TyEntry { name: "real_atan2",     scheme: mono(fn_ty([TyReal, TyReal], TyReal)) },
-    TyEntry { name: "real_rem",       scheme: mono(fn_ty([TyReal, TyReal], TyReal)) },
-
-    # Strings
-    TyEntry { name: "string_length",  scheme: mono(fn_ty([TyString],                TyInt)) },
-    TyEntry { name: "string_concat",  scheme: mono(fn_ty([TyString, TyString],      TyString)) },
-    TyEntry { name: "string_concat_all", scheme: mono(fn_ty([list_ty(TyString)],    TyString)) },
-    TyEntry { name: "string_join",    scheme: mono(fn_ty([list_ty(TyString), TyString], TyString)) },
-    TyEntry { name: "string_slice",   scheme: mono(fn_ty([TyString, TyInt, TyInt],  TyString)) },
-    TyEntry { name: "string_split",   scheme: mono(fn_ty([TyString, TyString],      list_ty(TyString))) },
-    TyEntry { name: "string_contains",scheme: mono(fn_ty([TyString, TyString],      TyBool)) },
-    TyEntry { name: "char_at",        scheme: mono(fn_ty([TyString, TyInt],         TyCon(None, "Option", [TyChar], sym_none()))) },
-
-    # Lists (monomorphic over element type `0`).
-    TyEntry { name: "list_length",    scheme: scheme([0], fn_ty([list_ty(tv(0))],                    TyInt)) },
-    TyEntry { name: "list_append",    scheme: scheme([0], fn_ty([list_ty(tv(0)), list_ty(tv(0))],    list_ty(tv(0)))) },
-    TyEntry { name: "list_reverse",   scheme: scheme([0], fn_ty([list_ty(tv(0))],                    list_ty(tv(0)))) },
-
-    # Higher-order (element `0`, result `1`).
-    # higher-order combinators are row-
-    # polymorphic in the callback. The callback's row tail equals
-    # the combinator's outer row tail, so a `each(xs, dump_fn)` where
-    # `dump_fn : Decl -> Unit / Console` propagates Console back to
-    # the calling fn through `each`'s outer row. Without this,
-    # row-bearing dump helpers can't be passed to each/map/filter
-    # at all.
-    TyEntry { name: "map",    scheme: scheme_full([0, 1], [0], TyFnT([list_ty(tv(0)), TyFnT([tv(0)], tv(1), row_with_tail(0))], list_ty(tv(1)), row_with_tail(0))) },
-    # `flat_map` pairs with the `||` flat-map-pipe operator.
-    # Canonical signature is `([a], (a) -> [b]) -> [b]`; the row-poly
-    # callback lets effects in the per-element function flow out
-    # through the outer row, mirroring `map`. The `synth_flat_map_pipe`
-    # dispatch validates this exact shape before rewriting the pipe.
-    TyEntry { name: "flat_map", scheme: scheme_full([0, 1], [0], TyFnT([list_ty(tv(0)), TyFnT([tv(0)], list_ty(tv(1)), row_with_tail(0))], list_ty(tv(1)), row_with_tail(0))) },
-    TyEntry { name: "filter", scheme: scheme_full([0],    [0], TyFnT([list_ty(tv(0)), TyFnT([tv(0)], TyBool, row_with_tail(0))], list_ty(tv(0)), row_with_tail(0))) },
-    TyEntry { name: "reduce", scheme: scheme_full([0, 1], [0], TyFnT([list_ty(tv(0)), tv(1), TyFnT([tv(1), tv(0)], tv(1), row_with_tail(0))], tv(1), row_with_tail(0))) },
-    TyEntry { name: "each",   scheme: scheme_full([0],    [0], TyFnT([list_ty(tv(0)), TyFnT([tv(0)], TyUnit, row_with_tail(0))], TyUnit, row_with_tail(0))) },
-
-    # Opaque mutable arrays.
-    TyEntry { name: "array_make",   scheme: scheme([0], fn_ty([TyInt, tv(0)],                                TyCon(None, "Array", [tv(0)], sym_none()))) },
-    # Length-0 array of any element type — the polymorphic empty no
-    # `array_make` can build, since `array_make` needs a reified `init`
-    # even for n=0. Effect-free (no slot is observably written).
-    TyEntry { name: "array_empty",  scheme: scheme([0], fn_ty([],                                            TyCon(None, "Array", [tv(0)], sym_none()))) },
-    TyEntry { name: "array_length", scheme: scheme([0], fn_ty([TyCon(None, "Array", [tv(0)], sym_none())],                      TyInt)) },
-    TyEntry { name: "array_get",    scheme: scheme([0], fn_ty([TyCon(None, "Array", [tv(0)], sym_none()), TyInt],               tv(0))) },
-    # bare `array_set` / `array_grow` (the desugar of `a[i] := v`)
-    # raise the `Mutable` demand on the caller's row via their scheme. The
-    # provenance-masking pass (`mask_local_mutable_demand`) still drops
-    # `Mutable` again when every demand targets a locally-constructed Array —
-    # it gates on the label being present and walks the AST by name, so it is
-    # agnostic to how the label entered the row. `array_make` / `array_length`
-    # / `array_get` stay effect-free (constructor and reads).
-    TyEntry { name: "array_set",    scheme: scheme([0], fn_ty_eff([TyCon(None, "Array", [tv(0)], sym_none()), TyInt, tv(0)], TyCon(None, "Array", [tv(0)], sym_none()), ["Mutable"])) },
-    TyEntry { name: "array_grow",   scheme: scheme([0], fn_ty_eff([TyCon(None, "Array", [tv(0)], sym_none()), TyInt, tv(0)], TyCon(None, "Array", [tv(0)], sym_none()), ["Mutable"])) },
-    # Vec[T] — the pure value vector. Every op is EFFECT-FREE: `vec_set` /
-    # `vec_push` return the result vector instead of mutating a reference,
-    # so no `Mutable` demand ever enters the row. The runtime mutates in
-    # place only behind the rc==1 uniqueness check, which no witness can
-    # observe; a shared vector copies on write.
-    TyEntry { name: "vec_make",   scheme: scheme([0], fn_ty([TyInt, tv(0)],                                  TyCon(None, "Vec", [tv(0)], sym_none()))) },
-    TyEntry { name: "vec_empty",  scheme: scheme([0], fn_ty([],                                              TyCon(None, "Vec", [tv(0)], sym_none()))) },
-    TyEntry { name: "vec_length", scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)], sym_none())],                          TyInt)) },
-    TyEntry { name: "vec_get",    scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)], sym_none()), TyInt],                   tv(0))) },
-    TyEntry { name: "vec_set",    scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)], sym_none()), TyInt, tv(0)],     TyCon(None, "Vec", [tv(0)], sym_none()))) },
-    TyEntry { name: "vec_push",   scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)], sym_none()), tv(0)],            TyCon(None, "Vec", [tv(0)], sym_none()))) },
-    TyEntry { name: "vec_slice",  scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)], sym_none()), TyInt, TyInt],     TyCon(None, "Vec", [tv(0)], sym_none()))) },
-    TyEntry { name: "vec_tail_from", scheme: scheme([0], fn_ty([TyCon(None, "Vec", [tv(0)], sym_none()), TyInt],         TyCon(None, "Vec", [tv(0)], sym_none()))) },
-    TyEntry { name: "vec_reserve", scheme: scheme([0], fn_ty([TyInt],                                        TyCon(None, "Vec", [tv(0)], sym_none()))) },
-    TyEntry { name: "vec_from_list", scheme: scheme([0], fn_ty([TyListT(tv(0))],                             TyCon(None, "Vec", [tv(0)], sym_none()))) },
-    # mailbox runtime — type-erased entries (Msg flows
-    # through TyAny). The polymorphic surface is in stdlib/actor.kai
-    # where `with_mailbox[Msg]` and `Actor[Msg]`'s clauses re-attach
-    # the right Msg to send/receive. mailbox_alloc returns a Pid
-    # whose Msg type is fresh at the call site (TyAny unifies with
-    # whatever the surrounding context expects).
-    TyEntry { name: "mailbox_alloc",         scheme: scheme([0], fn_ty([],                                       TyCon(None, "Pid", [tv(0)], sym_none()))) },
-    TyEntry { name: "mailbox_alloc_bounded", scheme: scheme([0], fn_ty([TyInt, TyInt],                            TyCon(None, "Pid", [tv(0)], sym_none()))) },
-    TyEntry { name: "mailbox_send",          scheme: scheme([0], fn_ty([TyCon(None, "Pid", [tv(0)], sym_none()), tv(0)],           TyUnit)) },
-    TyEntry { name: "mailbox_recv",          scheme: scheme([0], fn_ty([TyCon(None, "Pid", [tv(0)], sym_none())],                  tv(0))) },
-    TyEntry { name: "mailbox_recv_timeout",  scheme: scheme([0], fn_ty([TyCon(None, "Pid", [tv(0)], sym_none()), TyInt],          TyCon(None, "Option", [tv(0)], sym_none()))) },
-    TyEntry { name: "mailbox_free",          scheme: scheme([0], fn_ty([TyCon(None, "Pid", [tv(0)], sym_none())],                  TyUnit)) },
-    # Tier 2 spawn_actor — alloc-without-stamp + reassign owner.
-    # Used by stdlib/actor.kai's `spawn_actor` / `spawn_actor_policy`.
-    TyEntry { name: "mailbox_alloc_unowned", scheme: scheme([0],    fn_ty([],                                       TyCon(None, "Pid", [tv(0)], sym_none()))) },
-    TyEntry { name: "mailbox_alloc_bounded_unowned", scheme: scheme([0], fn_ty([TyInt, TyInt],                      TyCon(None, "Pid", [tv(0)], sym_none()))) },
-    TyEntry { name: "mailbox_assign_owner",  scheme: scheme([0, 1], fn_ty([TyCon(None, "Pid", [tv(0)], sym_none()), TyCon(None, "Fiber", [tv(1)], sym_none())], TyUnit)) },
-    TyEntry { name: "spawn_actor_fiber",      scheme: scheme([0, 1], fn_ty([TyCon(None, "Pid", [tv(0)], sym_none()), tv(1)], TyCon(None, "Fiber", [TyUnit], sym_none()))) },
-    # No `unitless` TyEntry: that escape leaked typer-internal erasure
-    # as a callable. The idiomatic equivalents are `print("#{x}")` for
-    # output and multiplication by a unit-bearing factor for conversions.
-    # `unit_name[u: Measure](x: Real<u>) : String`
-    # — compile-time reflection that returns the canonical unit
-    # symbol of the dimensioned argument as a String literal. The
-    # call lowers to a constant string at the C / LLVM emit step,
-    # extracted from the arg's `.ty`. Lets user code build
-    # "<value> <unit>" strings without per-unit-specialised protocol
-    # impls (which would require a structural change to the impl
-    # machinery). When the arg's unit is still a UVar
-    # (the protocol-impl-generic case), the empty string is emitted.
-    TyEntry { name: "unit_name",
-              scheme: scheme_uvars([], [], [0], [""],
-                fn_ty([TyDimT(TyReal, UVar(0))], TyString)) },
-    # typer-internal erasure of the unit annotation on
-    # a dimensioned Real. Polymorphic in the unit-var so the call site
-    # can pass `Real<USD>`, `Real<EUR>`, etc. and recover bare `Real`
-    # for use with `real_to_string`. Not part of the user-facing
-    # surface (the `__` prefix is the convention for compiler-internal
-    # names).
-    TyEntry { name: "__strip_unit",
-              scheme: scheme_uvars([], [], [0], [""],
-                fn_ty([TyDimT(TyReal, UVar(0))], TyReal)) },
-    # typer-internal unit tag/untag over any carrier, identity at
-    # runtime. The mint/erase door for non-literal dimensioned values
-    # (`money.of` / `money.amount` route a runtime Decimal in and out
-    # of `Decimal<c>`). Kind-agnostic: the unit var takes its kind
-    # from the context that binds it.
-    TyEntry { name: "__attach_unit",
-              scheme: scheme_uvars([0], [], [0], [""],
-                fn_ty([tv(0)], TyDimT(tv(0), UVar(0)))) },
-    TyEntry { name: "__detach_unit",
-              scheme: scheme_uvars([0], [], [0], [""],
-                fn_ty([TyDimT(tv(0), UVar(0))], tv(0))) },
-    # bit operations on Int as compiler intrinsics. The typer
-    # records the signatures here; `emit_call_value` lowers each call
-    # to the matching C operator (`<<`, `>>`, `&`, `|`, `^`, `~`)
-    # inline — there is no runtime helper. Schemes are monomorphic.
-    # `bit_shr` is arithmetic (sign-preserving) to match C's `>>` on
-    # signed types; `bit_ushr` casts through `uint64_t` for logical
-    # zero-fill. `bit_count` uses `__builtin_popcountll`. `bit_test`
-    # is the only op that returns Bool; the rest stay in Int.
-    TyEntry { name: "bit_and",    scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
-    TyEntry { name: "bit_or",     scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
-    TyEntry { name: "bit_xor",    scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
-    TyEntry { name: "bit_not",    scheme: mono(fn_ty([TyInt],        TyInt)) },
-    TyEntry { name: "bit_shl",    scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
-    TyEntry { name: "bit_shr",    scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
-    TyEntry { name: "bit_ushr",   scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
-    TyEntry { name: "bit_count",  scheme: mono(fn_ty([TyInt],        TyInt)) },
-    TyEntry { name: "bit_test",   scheme: mono(fn_ty([TyInt, TyInt], TyBool)) },
-    TyEntry { name: "bit_set",    scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
-    TyEntry { name: "bit_clear",  scheme: mono(fn_ty([TyInt, TyInt], TyInt)) },
-    TyEntry { name: "bit_toggle", scheme: mono(fn_ty([TyInt, TyInt], TyInt)) }
-  ]
-  # the in-process libLLVM C-API prims (TyHandle-bearing,
-  # native-backend only). Generated from `rcore_table` so the typer
-  # scheme cannot drift from the C forwarder + emit dispatch. Dead on
-  # any program that does not use the native backend.
-  let native_es = native_prim_ty_entries(rcore_table())
-  let batch = list_append(es, native_es)
+  let batch = list_append(builtin_ty_entries(builtin_table()), native_prim_ty_entries(rcore_table()))
   match ty_env_prepend_batch(batch, env.entries, env.index, env.vindex) {
     TEP(all_entries, idx, vidx) ->
       TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, row_kind: env.row_kind, ty_homes: env.ty_homes,
@@ -3198,9 +2879,14 @@ pub fn add_core_sigs(env: TyEnv) : TyEnv {
   }
 }
 
+fn builtin_ty_entries(table: [Builtin]) : [TyEntry] = match table {
+  [] -> []
+  [BF(name, _, BS(vs, rvs, uvs, ty)), ...rest] ->
+    [TyEntry { name: name, scheme: Scheme(vs, rvs, uvs, map(uvs, (_u) => ""), ty) }, ...builtin_ty_entries(rest)]
+}
+
 # Map each raw core prim to its typer entry: a monomorphic function
-# scheme over the prim's raw param/return types. The native backend's
-# C-API surface is thus typed straight from `rcore_table`.
+# scheme over the prim's raw param/return types.
 fn native_prim_ty_entries(table: [RCore]) : [TyEntry] = match table {
   [] -> []
   [RP(name, _, ptys, rty), ...rest] ->
@@ -10210,8 +9896,7 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
 
 
   # The bare core IO builtins (`print`, `read_file`, `array_set`, …)
-  # carry their effect in their own scheme row (`add_core_sigs` via
-  # `fn_ty_eff`), so the standard call-inference path below — the open-row
+  # carry their effect in their own scheme row (`builtin_table`), so the standard call-inference path below — the open-row
   # unification of the callee's `TyFnT` plus `st_propagate_capability_labels`
   # — raises the label on the caller's row, exactly as for an explicit
   # `Eff.op(...)` call or a stdlib fn written `: T / Stdout`. No name-keyed
@@ -13518,7 +13203,7 @@ fn synth_filter_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) 
 # Mutable provenance / masking pass.
 #
 # The bare `array_set` / `array_grow` builtins raise `Mutable` on the
-# caller's row through their scheme (`add_core_sigs` via `fn_ty_eff`)
+# caller's row through their scheme (`builtin_table`)
 # when the body calls them (the desugar of
 # `a[i] := v`). That over-approximates: a function that
 # constructs an Array locally, mutates it before returning, and
