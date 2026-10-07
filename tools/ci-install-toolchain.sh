@@ -24,6 +24,9 @@ apt_retry() {
       return 0
     fi
     echo "apt-get $1: attempt $attempt failed" >&2
+    # A timeout can kill dpkg mid-install; the next attempt refuses to run
+    # until the interrupted configuration is finished.
+    sudo timeout 180 dpkg --configure -a || true
     sleep 10
   done
   return 1
