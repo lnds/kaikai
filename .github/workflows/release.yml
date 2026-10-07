@@ -4,7 +4,8 @@ name: release
 # platform-specific tarballs as assets. Manual dispatch is also allowed
 # for re-running against an existing tag if a build needs to be redone,
 # or, with mirror_seed_only, for copying an already published seed tag to
-# the public mirror and nothing else.
+# the public mirror and nothing else, or, with seed_run_id, for publishing
+# the seed and the mirror from an earlier run's artifacts without rebuilding.
 on:
   push:
     tags:
@@ -20,9 +21,15 @@ on:
         required: false
         type: boolean
         default: false
+      seed_run_id:
+        description: "Publish the seed and the mirror from this earlier run's seed artifacts (no build, no release)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   build:
@@ -38,7 +45,7 @@ jobs:
             os_name: linux
             arch: x86_64
     runs-on: ${{ matrix.os }}
-    if: ${{ !inputs.mirror_seed_only }}
+    if: ${{ !inputs.mirror_seed_only && !inputs.seed_run_id }}
     # Static-libLLVM cold build (Lane 1.5 flip: the shipped kaic2 links
     # libLLVM IN so `kai build` runs the native default with no system
     # LLVM). On a cache HIT the vendored build/ is reused and the long
@@ -238,6 +245,7 @@ jobs:
   seed:
     name: Publish bootstrap seed
     needs: build
+    if: ${{ !cancelled() && !inputs.mirror_seed_only && (needs.build.result == 'success' || inputs.seed_run_id) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -260,6 +268,8 @@ jobs:
         with:
           pattern: bootstrap-seed-*
           path: seeds
+          run-id: ${{ inputs.seed_run_id || github.run_id }}
+          github-token: ${{ github.token }}
 
       - name: Require one seed across platforms
         run: |
@@ -278,10 +288,10 @@ jobs:
           [ -n "$first" ] || { echo "::error::no seed artifact"; exit 1; }
           echo "SEED_SRC=$first" >> "$GITHUB_ENV"
 
-      # The push is the only step that uses SEED_PUSH_TOKEN. A new tag is
-      # checked against the default branch, so once a workflow changes on
-      # main after the release, GITHUB_TOKEN (which can never carry the
-      # workflows permission) is refused the seed tag.
+      # GitHub checks a new tag's tree against the default branch, so once a
+      # workflow changes on main after the release, GITHUB_TOKEN (which can
+      # never carry the workflows permission) is refused the seed tag. Only
+      # that refusal falls back to SEED_PUSH_TOKEN.
       - name: Tag the seed
         env:
           SEED_PUSH_TOKEN: ${{ secrets.SEED_PUSH_TOKEN }}
@@ -318,14 +328,31 @@ jobs:
           sha256 bootstrap/runtime.h $h_sha
           EOF
           git tag -a "$seed" -m "Bootstrap rescue seed emitted by $tag" -m "sha256 bootstrap/stage2.c $c_sha"
-          if [ -z "${SEED_PUSH_TOKEN:-}" ]; then
-            echo "::error::secrets.SEED_PUSH_TOKEN is not set: pushing $seed needs a token with Contents and Workflows write on ${GITHUB_REPOSITORY} (docs/build-system.md, Publishing)"
+          if git push origin "refs/tags/$seed" 2> push.err; then
+            exit 0
+          fi
+          cat push.err
+          if ! grep -q "without .workflows. permission" push.err; then
             exit 1
           fi
-          # The checkout's GITHUB_TOKEN header would override the token in the
-          # URL; the empty value clears it for this push only.
-          git -c "http.https://github.com/.extraheader=" push \
-            "https://x-access-token:${SEED_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$seed"
+          token="$(printf '%s' "${SEED_PUSH_TOKEN:-}" | tr -d '[:space:]')"
+          if [ -z "$token" ]; then
+            echo "::error::a workflow changed on main after $tag, so GITHUB_TOKEN may not create $seed; secrets.SEED_PUSH_TOKEN (Contents and Workflows write on ${GITHUB_REPOSITORY}) is needed and not set"
+            exit 1
+          fi
+          # Never prints the token: only its shape and what the API answers.
+          case "$token" in github_pat_*) kind=fine-grained ;; ghp_*) kind=classic ;; *) kind=unrecognised ;; esac
+          stripped=$(( ${#SEED_PUSH_TOKEN} - ${#token} ))
+          user_status="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" https://api.github.com/user)"
+          repo_status="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "https://api.github.com/repos/${GITHUB_REPOSITORY}")"
+          echo "SEED_PUSH_TOKEN: $kind, ${#token} chars, $stripped whitespace chars stripped, GET /user $user_status, GET /repos/${GITHUB_REPOSITORY} $repo_status"
+          basic="$(printf 'x-access-token:%s' "$token" | base64 -w0)"
+          echo "::add-mask::$basic"
+          # An empty extraheader drops the checkout's GITHUB_TOKEN header
+          # before the token's own is added.
+          git -c "http.https://github.com/.extraheader=" \
+              -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $basic" \
+              push origin "refs/tags/$seed"
 
   update-tap:
     name: Update Homebrew tap formula
@@ -404,7 +431,7 @@ jobs:
   publish-source:
     name: Mirror filtered source to kaikailang-org/kaikai
     needs: [release, seed]
-    if: ${{ !cancelled() && (inputs.mirror_seed_only || (needs.release.result == 'success' && needs.seed.result == 'success')) }}
+    if: ${{ !cancelled() && (inputs.mirror_seed_only || (needs.seed.result == 'success' && (needs.release.result == 'success' || inputs.seed_run_id))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
