@@ -6456,17 +6456,21 @@ fn unify_env(env: TyEnv, t1: Ty, t2: Ty, s: Subst) : Option[Subst] / Mutable {
 # ranges over its own kind and stays flexible.
 # An annotation written in a body: the enclosing fn's declared type
 # parameters name their own vars there, as they do in its signature.
-fn st_annot_ty(st: InferState, te: TypeExpr) : Ty = match st.sub.rigid {
-  [] -> inf_resolve_ty_rk(te, st.env.row_kind, st_home_view(st))
-  rs -> resolve_ty_with_binds(te, rigid_binds(rs), [], st.env.row_kind, st_home_view(st))
+fn st_annot_ty(st: InferState, te: TypeExpr) : Ty = match rigid_binds(st.sub.rigid) {
+  []    -> inf_resolve_ty_rk(te, st.env.row_kind, st_home_view(st))
+  binds -> resolve_ty_with_binds(te, binds, [], st.env.row_kind, st_home_view(st))
 }
 
-fn st_annot_labels(st: InferState, ls: [RowLabel]) : [Label] = match st.sub.rigid {
-  [] -> inf_row_labels_of_rls(ls, st_home_view(st))
-  rs -> row_labels_of_rls_with_binds(ls, rigid_binds(rs), [], st_home_view(st))
+fn st_annot_labels(st: InferState, ls: [RowLabel]) : [Label] = match rigid_binds(st.sub.rigid) {
+  []    -> inf_row_labels_of_rls(ls, st_home_view(st))
+  binds -> row_labels_of_rls_with_binds(ls, binds, [], st_home_view(st))
 }
 
-fn rigid_binds(rs: [RigidTv]) : [TPBind] = map(rs, (r) => match r { RigidTv(i, n, _) -> TPB(n, i) })
+# An op's own type parameter is rigid in its clause but unnamed there.
+fn rigid_binds(rs: [RigidTv]) : [TPBind] = match rs {
+  [] -> []
+  [RigidTv(i, n, _), ...rest] -> if n == "" { rigid_binds(rest) } else { [TPB(n, i), ...rigid_binds(rest)] }
+}
 
 fn rigid_tparams(binds: [TPBind], declared: [String], owner: String) : [RigidTv] =
   rigid_first_each(binds, declared, owner, [])
@@ -7850,8 +7854,7 @@ fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : I
       # substitution side-effects: the runtime layout is identical.
       if union_upcast_ok(st.env, a1, b1) { st }
       else { match rigid_forced(st, a, b) {
-        Some(msg) -> {
-          let help = "bound the parameter with the protocol it needs, or make the parameter a concrete type"
+        Some(RigidWhy(msg, help)) -> {
           diag_error(st.file, line, col, msg)
           diag_help(help)
           st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, line, col, msg, [ri_help(st.file, line, col, help)])))
@@ -7871,7 +7874,9 @@ fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : I
 # Why `a` and `b` fail to unify when only a declared type parameter's
 # rigidity stops them: the parameter the unification would have bound,
 # and what to.
-fn rigid_forced(st: InferState, a: Ty, b: Ty) : Option[String] / Mutable = match st.sub.rigid {
+type RigidWhy = RigidWhy(String, String)
+
+fn rigid_forced(st: InferState, a: Ty, b: Ty) : Option[RigidWhy] / Mutable = match st.sub.rigid {
   [] -> None
   rs -> match unify_env(st.env, a, b, subst_with_rigid(st.sub, [])) {
     None     -> None
@@ -7879,11 +7884,12 @@ fn rigid_forced(st: InferState, a: Ty, b: Ty) : Option[String] / Mutable = match
   }
 }
 
-fn rigid_first_bound(st: InferState, rs: [RigidTv], all: [RigidTv], s2: Subst) : Option[String] = match rs {
+fn rigid_first_bound(st: InferState, rs: [RigidTv], all: [RigidTv], s2: Subst) : Option[RigidWhy] = match rs {
   [] -> None
   [RigidTv(i, n, owner), ...rest] -> match apply_ty(s2, TyVarT(i)) {
     TyVarT(j) -> match rigid_named(all, j, i) {
-      Some(o) -> Some(rigid_text(n, owner, concat_all(["`", o, "`"])))
+      Some("") -> Some(rigid_text(n, owner, "another type parameter"))
+      Some(o)  -> Some(rigid_text(n, owner, concat_all(["`", o, "`"])))
       None    -> rigid_first_bound(st, rest, all, s2)
     }
     t -> Some(rigid_text(n, owner, concat_all(["`", inf_ty_to_string_ow(st.env.head_owners, t), "`"])))
@@ -7896,9 +7902,16 @@ fn rigid_named(rs: [RigidTv], j: Int, self: Int) : Option[String] = match rs {
   [RigidTv(i, n, _), ...rest] -> if i == j and i != self { Some(n) } else { rigid_named(rest, j, self) }
 }
 
-fn rigid_text(name: String, owner: String, what: String) : String =
-  concat_all(["type parameter `", name, "` of `", owner, "` is not ", what,
-              ": inside the body it stands for any type its callers choose"])
+fn rigid_text(name: String, owner: String, what: String) : RigidWhy =
+  if name == "" {
+    RigidWhy(concat_all(["a type parameter of `", owner, "` is not ", what,
+                         ": inside its handler clause it stands for any type a perform chooses"]),
+             "keep the clause generic over it, or give the op parameter a concrete type")
+  } else {
+    RigidWhy(concat_all(["type parameter `", name, "` of `", owner, "` is not ", what,
+                         ": inside the body it stands for any type its callers choose"]),
+             "bound the parameter with the protocol it needs, or make the parameter a concrete type")
+  }
 
 # Template 1 — best-effort callee-name + argument-index
 # augmentation for `type mismatch in function call`. Called after the
@@ -9135,6 +9148,7 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
         # are typechecked precisely.
         let bind_res = bind_clause_env_typed(st_arity, eff_name, op_name, params,
                                               stateful, state_ty, eff_tyargs, result_ty)
+        let fresh_before = st_arity.env.fresh
         let sty = match state_ty { Some(t) -> t None -> TyAny }
         let env_bound = bind_res.st.env
         let env_with_sl = if stateful { add_state_aliases(env_bound, st.env, sty) } else { env_bound }
@@ -9160,8 +9174,11 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
         let st_clause_in = st_set_in_clause(st_disable_alias_tag(st_resume), clause_cont_of(params))
         let rb = synth(st_clause_in, body)
         let st_res = st_unify(rb.st, result_ty, rb.ty, "handler clause result", line, col)
-        let st_out0 = st_restore_entries(outer, st_res)
-        let st_out = st_set_clause_resume(st_out0, outer.clause_resume)
+        let st_esc = check_op_tparam_escape(st_res, bind_res.op_rigid, fresh_before,
+                                            state_ty, rb.ty, line, col)
+        let st_out0 = st_restore_entries(outer, st_esc)
+        let st_out = st_set_sub(st_set_clause_resume(st_out0, outer.clause_resume),
+                                subst_with_rigid(st_out0.sub, outer.sub.rigid))
         # keep the typed body so the
         # alias-aware op resolution that fired inside `synth` (e.g.
         # rewriting `Console.print(...)` to `EVar("Stdout.print")`)
@@ -9216,7 +9233,7 @@ fn check_finally_clause(st: InferState, name: String, params: [Param], body: Exp
 # unified with `eff_tyargs` (the handler's `with Eff[T1, T2]`
 # instantiation) so the answer type is concrete when the handler is
 # instantiated to concrete types.
-type ClauseBindRes = { st: InferState, answer_ty: Ty }
+type ClauseBindRes = { st: InferState, answer_ty: Ty, op_rigid: [Int] }
 
 fn bind_clause_env_typed(st: InferState, eff_name: String, op_name: String,
                           params: [Param], stateful: Bool,
@@ -9225,25 +9242,70 @@ fn bind_clause_env_typed(st: InferState, eff_name: String, op_name: String,
 
   let key = string_concat(eff_name, string_concat(".", op_name))
   match ty_env_lookup(st.env, key) {
-    None     -> ClauseBindRes { st: bind_params_lenient(st, params), answer_ty: TyAny }
+    None     -> ClauseBindRes { st: bind_params_lenient(st, params), answer_ty: TyAny, op_rigid: [] }
     Some(sc) -> {
       let inst = st_instantiate_report(st, sc)
       # unify the op-scheme's effect-tparam fresh tyvars
       # with the handler's instantiation. For State[Int], `get`'s
       # bound `?Tfresh` becomes `Int`, so the resume answer type is
       # `Int` rather than a free tyvar.
-      let st_unified = unify_eff_tparams(inst.st, inst.fresh, eff_tyargs,
+      let eff_arity = lookup_op_eff_arity(st.op_eff_arities, key)
+      let st_unified = unify_eff_tparams(inst.st, take(inst.fresh, eff_arity), eff_tyargs,
                                           op_name)
+      # The op's own type parameters are chosen per perform, so the
+      # clause must handle every choice: rigid for the clause body.
+      let op_rigid = drop(inst.fresh, eff_arity)
+      let st_rigid = st_set_sub(st_unified, subst_with_rigid(st_unified.sub,
+                       list_append(map(op_rigid, (i) => RigidTv(i, "", key)), st_unified.sub.rigid)))
       match inst.ty {
         TyFnT(arg_tys, ret_ty, _) -> {
-          let bound = bind_params_with_sig_typed(st_unified, params, arg_tys, ret_ty,
+          let bound = bind_params_with_sig_typed(st_rigid, params, arg_tys, ret_ty,
                                                    stateful, state_ty, result_ty)
-          ClauseBindRes { st: bound, answer_ty: ret_ty }
+          ClauseBindRes { st: bound, answer_ty: ret_ty, op_rigid: op_rigid }
         }
-        _ -> ClauseBindRes { st: bind_params_lenient(st_unified, params), answer_ty: TyAny }
+        _ -> ClauseBindRes { st: bind_params_lenient(st_rigid, params), answer_ty: TyAny, op_rigid: op_rigid }
       }
     }
   }
+}
+
+# The handler state, the clause's result, or a var that predates the
+# clause resolving to one of the op's own type parameters would carry
+# one perform's choice past the clause.
+fn check_op_tparam_escape(st: InferState, rigid: [Int], before: Int, state_ty: Option[Ty],
+                          body_ty: Ty, line: Int, col: Int) : InferState / Console + File =
+  match rigid {
+    [] -> st
+    _  -> match op_tparam_escape_site(st.sub, rigid, before, state_ty, body_ty) {
+      None      -> st
+      Some(via) -> {
+        let msg = concat_all(["a type parameter of `", rigid_owner(st.sub.rigid, rigid),
+                              "` escapes its handler clause through ", via])
+        let help = "the clause sees one perform's type; keep values of it inside the clause"
+        diag_error(st.file, line, col, msg)
+        diag_help(help)
+        st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, line, col, msg, [ri_help(st.file, line, col, help)])))
+      }
+    }
+  }
+
+fn op_tparam_escape_site(s: Subst, rigid: [Int], before: Int, state_ty: Option[Ty],
+                         body_ty: Ty) : Option[String] =
+  if (match state_ty { Some(t) -> mentions_any_var(s, rigid, t) None -> false }) { Some("the handler state") }
+  else if mentions_any_var(s, rigid, body_ty) { Some("its result") }
+  else if var_below_mentions(s, rigid, 0, before) { Some("a binding outside the clause") }
+  else { None }
+
+fn mentions_any_var(s: Subst, ids: [Int], t: Ty) : Bool = any(ids, (i) => occurs(i, t, s))
+
+fn var_below_mentions(s: Subst, ids: [Int], v: Int, hi: Int) : Bool =
+  if v >= hi { false }
+  else if mentions_any_var(s, ids, TyVarT(v)) { true }
+  else { var_below_mentions(s, ids, v + 1, hi) }
+
+fn rigid_owner(rs: [RigidTv], ids: [Int]) : String = match rs {
+  [] -> ""
+  [RigidTv(i, _, owner), ...rest] -> if list_has_int(ids, i) { owner } else { rigid_owner(rest, ids) }
 }
 
 # Unify each effect-tparam fresh tyvar (from the op's polymorphic
