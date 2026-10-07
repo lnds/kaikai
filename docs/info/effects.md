@@ -26,7 +26,9 @@ abandons the continuation (e.g. an op returning `Nothing`). Calling it more than
 is currently a runtime error.
 
 Abandoning the continuation skips the `return` clauses of the handlers
-it jumps over — those do not run. What DOES run on every such path is
+it jumps over — those do not run, and neither does the abandoning
+handler's own `return`: the clause's value is the handle's value as is,
+so it has the handle's type. What DOES run on every such path is
 a handler's `finally { }` clause (see *Cleanup* below), which is how a
 scope releases a non-memory resource it holds. Perceus frees memory
 regardless.
@@ -72,7 +74,10 @@ fn main() : Int / Stdout = {
 }
 ```
 
-- `return(x) -> ...` is optional. Default is identity.
+- `return(x) -> ...` is optional. Default is identity. It runs only when
+  the body completes.
+- Every op clause evaluates to the handle's type — what `return` yields,
+  or the body's type when there is no `return`.
 - Calling `resume(v)` continues the body with `v`.
 - Outside the `with { ... }`, `Greeter` is no longer in the row.
 

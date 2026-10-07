@@ -537,7 +537,8 @@ An op clause may simply not call `resume`. When that happens, the
 value the clause evaluates to becomes the value of the entire
 `handle`; the rest of `body` is abandoned, and the `return`
 clause (if any) is bypassed — `return` only runs on `body`'s
-normal completion path.
+normal completion path. The clause's value therefore already has the
+handle's type `S`; a clause of any other type is a type error.
 
 This is how `Fail` works:
 
