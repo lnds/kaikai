@@ -1,0 +1,95 @@
+#[doc("""
+Parameter renaming by binder identity, for tail-call fusion.
+
+The resolver gives every parameter a local id and stamps it on each read,
+and a local that reuses the name gets an id of its own. A member's body
+is renamed onto the fused entry's slots by those ids, so a shadowing
+local, a lambda's parameter or a handler clause's binder is never
+renamed, whatever its spelling.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.resolve
+import compiler.infer_index
+import compiler.tailslots
+
+#[doc("The resolver's parameter ids of the functions `wanted` names, indexed by function; a function recorded twice answers with its first record.")]
+pub fn tfid_index(table: [ParamIds], wanted: [SymId]) : NameIndex[ParamIds] =
+  tfid_index_into(list_reverse(table), tfid_set(wanted, idx_empty()), idx_empty())
+
+fn tfid_set(ss: [SymId], ix: NameIndex[SymId]) : NameIndex[SymId] = match ss {
+  []           -> ix
+  [s, ...rest] -> tfid_set(rest, idx_prepend_sym(ix, s, s))
+}
+
+fn tfid_index_into(table: [ParamIds], wanted: NameIndex[SymId], ix: NameIndex[ParamIds]) : NameIndex[ParamIds] = match table {
+  [] -> ix
+  [p, ...rest] -> match p {
+    ParamIds(s, _) -> tfid_index_into(rest, wanted, if tfid_wanted(wanted, s) { idx_prepend_sym(ix, s, p) } else { ix })
+  }
+}
+
+fn tfid_wanted(wanted: NameIndex[SymId], s: SymId) : Bool =
+  sym_raw(s) >= 0 and any(idx_chain_sym(wanted, s), (w) => sym_raw(w) == sym_raw(s))
+
+#[doc("The ids `fsym`'s parameters were bound to, or `None` when the resolver recorded none.")]
+pub fn tfid_lookup(ix: NameIndex[ParamIds], fsym: SymId) : Option[[SymId]] = tfid_first(idx_chain_sym(ix, fsym), fsym)
+
+fn tfid_first(chain: [ParamIds], fsym: SymId) : Option[[SymId]] = match chain {
+  [] -> None
+  [ParamIds(s, ids), ...rest] -> if sym_raw(s) == sym_raw(fsym) { Some(ids) } else { tfid_first(rest, fsym) }
+}
+
+#[doc("`body` with each read of the parameter bound to `ids[i]` naming `to[i]`.")]
+pub fn tfid_rename(body: Expr, ids: [SymId], to: [String]) : Expr =
+  Expr { ...body, kind: match body.kind {
+    ESym(s, _, _) -> match tfid_slot(ids, to, sym_raw(s)) {
+      Some(nm) -> EVar(nm)
+      None     -> body.kind
+    }
+    _ -> prc_map_expr_kind(body.kind, (e) => tfid_rename(e, ids, to))
+  } }
+
+fn tfid_slot(ids: [SymId], to: [String], id: Int) : Option[String] = match ids {
+  [] -> None
+  [i, ...irest] -> match to {
+    [] -> None
+    [nm, ...nrest] -> if sym_raw(i) == id { Some(nm) } else { tfid_slot(irest, nrest, id) }
+  }
+}
+
+#[doc("True when the resolver recorded every member's parameter ids; a group that fails stays unfused.")]
+pub fn tfid_all_renamable(ms: [Decl], pids: NameIndex[ParamIds]) : Bool = match ms {
+  [] -> true
+  [d, ...rest] -> tfid_member_renamable(d, pids) and tfid_all_renamable(rest, pids)
+}
+
+fn tfid_member_renamable(d: Decl, pids: NameIndex[ParamIds]) : Bool = match d {
+  DFn(_, _, _, ps, _, _, _, _, _, _, fsym) -> match tfid_lookup(pids, fnid_sym(fsym)) {
+    Some(ids) -> list_length(ids) == list_length(ps)
+    None      -> false
+  }
+  _ -> false
+}
+
+#[doc("Each member renamed onto the slots it occupies, `slot_name` naming a slot by its index.")]
+pub fn tfid_onto_slots(members: [Decl], slots: TfSlots, slot_name: (Int) -> String, pids: NameIndex[ParamIds]) : [Decl] = match slots {
+  TfSlots(_, layout) -> tfid_onto_layout(members, layout, slot_name, pids)
+}
+
+fn tfid_onto_layout(members: [Decl], layout: [[Int]], slot_name: (Int) -> String, pids: NameIndex[ParamIds]) : [Decl] = match members {
+  [] -> []
+  [d, ...rest] -> match layout {
+    [] -> members
+    [idxs, ...more] -> [tfid_rename_member(d, map(idxs, slot_name), pids), ...tfid_onto_layout(rest, more, slot_name, pids)]
+  }
+}
+
+fn tfid_rename_member(d: Decl, names: [String], pids: NameIndex[ParamIds]) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, ln, cl, mo, fsym) -> match tfid_lookup(pids, fnid_sym(fsym)) {
+    Some(ids) -> DFn(p, n, tps, ps, ret, row, tfid_rename(body, ids, names), ln, cl, mo, fsym)
+    None      -> d
+  }
+  _ -> d
+}

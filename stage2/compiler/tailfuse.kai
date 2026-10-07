@@ -35,7 +35,9 @@ import compiler.util
 import compiler.tailgraph
 import compiler.tailsig
 import compiler.tailslots
-import compiler.tailsubst
+import compiler.tailids
+import compiler.resolve
+import compiler.infer_index
 import compiler.symtab_build
 import compiler.home_tu
 
@@ -47,6 +49,9 @@ type TfCtx = TfCtx([String], TfFused, TfSlots, Option[String], [SymId])
 
 # The fused entry: its name and the id every call to it carries.
 type TfFused = TfFused(String, SymId)
+
+# The module a group is fused in and the parameter ids the resolver recorded.
+type TfIn = { target: String, pids: NameIndex[ParamIds] }
 
 fn tfctx_names(c: TfCtx) : [String] = match c { TfCtx(ns, _, _, _, _) -> ns }
 fn tfctx_lead(c: TfCtx) : TfFused = match c { TfCtx(_, l, _, _, _) -> l }
@@ -61,14 +66,16 @@ pub fn tailfuse_name(lead: String) : String = cat2("__kai_fused_", lead)
 pub fn tailfuse_tag_param() : String = "__kai_fuse_tag"
 
 #[doc("Fuse every mutually recursive tail-call group in `decls`, returning the rewritten program. A group that does not qualify for fusion is left untouched, so a program with no mutual tail recursion comes back unchanged.")]
-pub fn tailfuse_decls(decls: [Decl], target: String) : [Decl] {
+pub fn tailfuse_decls(decls: [Decl], target: String, pids: [ParamIds]) : [Decl] {
   let g = tailgraph_build(decls)
   match tailgraph_groups(g) {
     []     -> decls
     groups -> {
       let n = list_length(tailgraph_nodes(g))
       let fns = tf_fn_array(decls, n)
-      tf_emit(decls, tf_rewrites(groups, (i) => array_get(fns, i), n, target), 0, [])
+      let fn_at = (i) => array_get(fns, i)
+      let ix = tfid_index(pids, tf_group_syms(groups, fn_at))
+      tf_emit(decls, tf_rewrites(groups, fn_at, n, TfIn { target: target, pids: ix }), 0, [])
     }
   }
 }
@@ -88,19 +95,19 @@ fn tf_fn_fill(decls: [Decl], i: Int, fns: Array[Option[Decl]]) : Array[Option[De
 
 # What replaces each function: its wrapper, preceded by the fused entry
 # at the group's lead; `None` where the function is not fused.
-fn tf_rewrites(groups: [TgGroup], fn_at: (Int) -> Option[Decl], n: Int, target: String) : Array[Option[[Decl]]] =
-  tf_rewrite_groups(groups, fn_at, array_make(n, None), target)
+fn tf_rewrites(groups: [TgGroup], fn_at: (Int) -> Option[Decl], n: Int, inp: TfIn) : Array[Option[[Decl]]] =
+  tf_rewrite_groups(groups, fn_at, array_make(n, None), inp)
 
 fn tf_rewrite_groups(groups: [TgGroup], fn_at: (Int) -> Option[Decl],
-                     out: Array[Option[[Decl]]], target: String) : Array[Option[[Decl]]] / Mutable =
+                     out: Array[Option[[Decl]]], inp: TfIn) : Array[Option[[Decl]]] / Mutable =
   match groups {
     [] -> out
     [grp, ...rest] -> {
       let idxs = tggroup_members(grp)
       let members = tf_member_decls(idxs, fn_at)
-      if tf_group_ok(members, idxs) {
-        tf_rewrite_groups(rest, fn_at, tf_place_group(idxs, tf_fuse_group(members, target), out), target)
-      } else { tf_rewrite_groups(rest, fn_at, out, target) }
+      if tf_group_ok(members, idxs, inp.pids) {
+        tf_rewrite_groups(rest, fn_at, tf_place_group(idxs, tf_fuse_group(members, inp), out), inp)
+      } else { tf_rewrite_groups(rest, fn_at, out, inp) }
     }
   }
 
@@ -115,13 +122,13 @@ fn tf_place_group(idxs: [Int], outs: [[Decl]], out: Array[Option[[Decl]]]) : Arr
 
 # Per member, in member order: the lead's fused entry and wrapper, then
 # each other member's wrapper.
-fn tf_fuse_group(members: [Decl], target: String) : [[Decl]] = match members {
+fn tf_fuse_group(members: [Decl], inp: TfIn) : [[Decl]] = match members {
   [] -> []
   [lead, ..._] -> {
     let names = tf_member_names(members)
     let slots = tfslots_layout(members)
-    let fz = tf_fused_of(lead, target)
-    let fused = tf_make_fused(lead, members, names, slots, fz)
+    let fz = tf_fused_of(lead, inp.target)
+    let fused = tf_make_fused(lead, tfid_onto_slots(members, slots, tf_fresh_name, inp.pids), names, slots, fz)
     match map(members, (d) => tf_wrapper(d, names, tf_decl_name(d), slots, fz)) {
       [] -> []
       [w, ...ws] -> [[fused, w], ...map(ws, (x) => [x])]
@@ -158,11 +165,16 @@ fn tf_reverse_onto(xs: [Decl], acc: [Decl]) : [Decl] = match xs {
 
 # ---- eligibility ---------------------------------------------------
 
-fn tf_group_ok(members: [Decl], idxs: [Int]) : Bool =
+fn tf_group_syms(groups: [TgGroup], fn_at: (Int) -> Option[Decl]) : [SymId] = match groups {
+  []             -> []
+  [grp, ...rest] -> list_append(tf_member_syms(tf_member_decls(tggroup_members(grp), fn_at)), tf_group_syms(rest, fn_at))
+}
+
+fn tf_group_ok(members: [Decl], idxs: [Int], pids: NameIndex[ParamIds]) : Bool =
   if list_length(members) != list_length(idxs) { false }
   else { match members {
     []              -> false
-    [lead, ...rest] -> tfsig_members_match(rest, lead) and tfsubst_bodies_walkable(members)
+    [lead, ...rest] -> tfsig_members_match(rest, lead) and tfid_all_renamable(members, pids)
   } }
 
 fn tf_member_decls(idxs: [Int], fn_at: (Int) -> Option[Decl]) : [Decl] = match idxs {
@@ -194,7 +206,7 @@ fn tf_make_fused(lead: Decl, members: [Decl], names: [String], slots: TfSlots, f
           let fresh = tf_fresh_params(sps, 0)
           let ctx = TfCtx(names, fz, slots, mo, tf_member_syms(members))
           DFn(false, fname, tparams, [tf_tag_param(ln, cl), ...fresh],
-              opt_ret, row, tf_dispatch_body(members, layout, fresh, ctx, ln, cl),
+              opt_ret, row, tf_dispatch_body(members, layout, ctx, ln, cl),
               ln, cl, mo, fnid_decl(fsid))
         }
       }
@@ -223,10 +235,10 @@ fn tf_tag_param(ln: Int, cl: Int) : Param =
 fn tf_int_ty(ln: Int, cl: Int) : TypeExpr =
   TypeExpr { tkind: TyName("Int", []), line: ln, col: cl }
 
-fn tf_dispatch_body(members: [Decl], layout: [[Int]], fresh: [Param], ctx: TfCtx,
+fn tf_dispatch_body(members: [Decl], layout: [[Int]], ctx: TfCtx,
                     ln: Int, cl: Int) : Expr =
   mk_expr(EMatch(mk_ref(tailfuse_tag_param(), ln, cl),
-                 tf_dispatch_arms(members, layout, fresh, ctx, 0)), ln, cl)
+                 tf_dispatch_arms(members, layout, ctx, 0)), ln, cl)
 
 # The id of each member declaration, positionally aligned with `names`.
 fn tf_member_syms(ms: [Decl]) : [SymId] = match ms {
@@ -239,16 +251,14 @@ fn tf_decl_sym(d: Decl) : SymId = match d {
   _ -> sym_none()
 }
 
-fn tf_dispatch_arms(members: [Decl], layout: [[Int]], fresh: [Param], ctx: TfCtx,
-                    i: Int) : [Arm] {
+fn tf_dispatch_arms(members: [Decl], layout: [[Int]], ctx: TfCtx, i: Int) : [Arm] {
   match members {
     [] -> []
     [d, ...rest] -> match layout {
       [] -> []
-      [idxs, ...more] -> {
+      [_, ...more] -> {
         let last = list_is_empty(rest)
-        [tf_arm_for(d, tf_pick(fresh, idxs), ctx, i, last),
-         ...tf_dispatch_arms(rest, more, fresh, ctx, i + 1)]
+        [tf_arm_for(d, ctx, i, last), ...tf_dispatch_arms(rest, more, ctx, i + 1)]
       }
     }
   }
@@ -256,27 +266,12 @@ fn tf_dispatch_arms(members: [Decl], layout: [[Int]], fresh: [Param], ctx: TfCtx
 
 # The final arm is the catch-all so the match is total without relying
 # on the discriminant's range being known to the checker.
-fn tf_arm_for(d: Decl, mine: [Param], ctx: TfCtx, i: Int, last: Bool) : Arm {
+fn tf_arm_for(d: Decl, ctx: TfCtx, i: Int, last: Bool) : Arm {
   match d {
-    DFn(_, _, _, mparams, _, _, body, ln, cl, _, _) ->
-      Arm(tf_arm_pattern(i, last, ln, cl), None,
-          tf_retarget_in(tfsubst_rename_params(body, mparams, mine), ctx, []))
+    DFn(_, _, _, _, _, _, body, ln, cl, _, _) ->
+      Arm(tf_arm_pattern(i, last, ln, cl), None, tf_retarget_in(body, ctx, []))
     _ -> Arm(tf_arm_pattern(i, last, 0, 0), None, mk_expr(EUnit, 0, 0))
   }
-}
-
-# The slots at `idxs`, in parameter order.
-fn tf_pick(ps: [Param], idxs: [Int]) : [Param] = match idxs {
-  [] -> []
-  [i, ...rest] -> match tf_nth(ps, i) {
-    Some(p) -> [p, ...tf_pick(ps, rest)]
-    None    -> tf_pick(ps, rest)
-  }
-}
-
-fn tf_nth(ps: [Param], i: Int) : Option[Param] = match ps {
-  [] -> None
-  [p, ...rest] -> if i <= 0 { Some(p) } else { tf_nth(rest, i - 1) }
 }
 
 # A fused call's slot arguments: the member argument a slot holds, the
@@ -493,10 +488,4 @@ fn tf_name_index(names: [String], n: String, i: Int) : Option[Int] = match names
 fn tf_mod_is_own(callmod: String, mo: Option[String]) : Bool = match mo {
   None    -> false
   Some(m) -> m == callmod
-}
-
-fn tf_callee_name(fk: ExprKind) : Option[String] = match sym_read_kind(fk) {
-  EVar(n)          -> Some(n)
-  EModCall(_, n)   -> Some(n)
-  _                -> None
 }
