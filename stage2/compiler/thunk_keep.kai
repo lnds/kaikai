@@ -1,0 +1,93 @@
+#[doc("""
+Which functions keep a closure thunk.
+
+A thunk exists so a function can be taken as a value. Every `pub` function
+keeps one, since another module may take it; a synthesised `__` function
+keeps one too. A private function keeps it only when the decls handed in
+read it somewhere outside a call's callee position, lambda bodies
+included, by the id the resolver stamped on the read. A read with no id
+keeps every function its spelling could name. The answer depends only on
+those decls, so a module's thunks follow from its own source.
+""")]
+
+import compiler.ast
+import compiler.sym_read
+import compiler.expr_positions
+import compiler.infer_index
+import compiler.core_reach
+import compiler.fn_csym
+import compiler.fnreg
+import compiler.kir
+
+#[doc("The functions `decls` read outside a callee position: by id, and by spelling for a read the resolver stamped with none.")]
+pub type ThunkKeep = { ids: NameIndex[SymId], names: NameIndex[String] }
+
+#[doc("The functions `decls` read outside a callee position; a local's read is never one.")]
+pub fn thunk_keep(decls: [Decl]) : ThunkKeep = tk_decls(decls, ThunkKeep { ids: idx_empty(), names: idx_empty() })
+
+#[doc("True when `d` is a function whose thunk must be emitted under `keep`. A synthesised function, or one with no id of its own, is kept.")]
+pub fn thunk_kept(keep: ThunkKeep, d: Decl) : Bool = match d {
+  DFn(is_pub, name, _, _, _, _, _, _, _, _, fid) -> {
+    let s = fnid_sym(fid)
+    is_pub or string_starts_with_q(name, "__") or sym_raw(s) < 0 or tk_has_id(keep.ids, s) or tk_has_name(keep.names, name)
+  }
+  _ -> false
+}
+
+#[doc("The lowered functions of `fns` whose thunk the rule over `decls` keeps; one no decl names is kept.")]
+pub fn thunk_kept_fns(fns: [KFn], decls: [Decl]) : [KFn] = {
+  let dropped = thunk_dropped_syms(thunk_keep(decls), decls)
+  filter(fns, (f) => not tk_index_has(dropped, f.sym))
+}
+
+fn thunk_dropped_syms(keep: ThunkKeep, decls: [Decl]) : NameIndex[String] = match decls {
+  [] -> idx_empty()
+  [d, ...rest] -> match d {
+    DFn(_, name, _, _, _, _, _, _, _, mo, _) ->
+      if thunk_kept(keep, d) { thunk_dropped_syms(keep, rest) }
+      else { idx_prepend(thunk_dropped_syms(keep, rest), c_sym(name, mo), c_sym(name, mo)) }
+    _ -> thunk_dropped_syms(keep, rest)
+  }
+}
+
+fn tk_index_has(ix: NameIndex[String], k: String) : Bool = list_has(idx_chain(ix, k), k)
+
+fn tk_has_name(ix: NameIndex[String], n: String) : Bool = tk_index_has(ix, n)
+
+fn tk_has_id(ix: NameIndex[SymId], s: SymId) : Bool = any(idx_chain_sym(ix, s), (x) => sym_raw(x) == sym_raw(s))
+
+fn tk_decls(ds: [Decl], k: ThunkKeep) : ThunkKeep = match ds {
+  []           -> k
+  [d, ...rest] -> tk_decls(rest, tk_exprs(cr_decl_exprs(d), k))
+}
+
+fn tk_exprs(es: [Expr], k: ThunkKeep) : ThunkKeep = match es {
+  []           -> k
+  [e, ...rest] -> tk_exprs(rest, tk_expr(e, k))
+}
+
+# A bare callee is a direct call and needs no thunk; any other read of a
+# function may build a closure over it.
+fn tk_expr(e: Expr, k: ThunkKeep) : ThunkKeep = match e.kind {
+  ECall(f, xs)   -> tk_exprs(xs, if tk_is_name(f) { k } else { tk_expr(f, k) })
+  ESym(s, _, n)  -> if sym_is_local(s) { k } else if sym_raw(s) < 0 { tk_add_name(k, n) } else { tk_add_id(k, s) }
+  EVar(n)        -> tk_add_name(k, n)
+  EModCall(_, n) -> tk_add_name(k, n)
+  _              -> tk_positions(xp_positions(e), k)
+}
+
+fn tk_positions(ps: [XPos], k: ThunkKeep) : ThunkKeep = match ps {
+  []                  -> k
+  [XP(_, c), ...rest] -> tk_positions(rest, tk_expr(c, k))
+}
+
+fn tk_is_name(f: Expr) : Bool = match f.kind {
+  EModCall(_, _) -> true
+  _ -> match sym_read_kind(f.kind) { EVar(_) -> true  _ -> false }
+}
+
+fn tk_add_id(k: ThunkKeep, s: SymId) : ThunkKeep =
+  if tk_has_id(k.ids, s) { k } else { ThunkKeep { ...k, ids: idx_prepend_sym(k.ids, s, s) } }
+
+fn tk_add_name(k: ThunkKeep, n: String) : ThunkKeep =
+  if tk_has_name(k.names, n) { k } else { ThunkKeep { ...k, names: idx_prepend(k.names, n, n) } }
