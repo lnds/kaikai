@@ -696,19 +696,29 @@ both UoM and refinements together.
 
 ## Implementation status — 2026-04-27
 
-> **Enforcement status (2026-07-10, refs #1169):** refinement-type
-> predicates are now **enforced at the three downcast sites** —
-> annotated bindings (`let x: Refined = v`, `var`), refined
-> parameters, and refined returns. A closed value that refutes the
-> predicate is a **compile error** (mirror of the call-site literal
-> check); a dynamic value gets a runtime check that panics with the
-> structured diagnostic (`refinement violated in ... / predicate: ...
-> / declared at ...`, same shape as `requires`/`ensures`). Checks are
-> **omitted** where the predicate is proven — constant folding, or
-> entailment from the value's own refined binding — so proven happy
-> paths pay nothing. `var` cell *reassignment* is not re-checked
-> (only the initial value); that follow-up belongs to the typer-side
-> narrowing work.
+> **Enforcement status:** a value is checked wherever it flows into
+> a position whose type is refined and the type reaches the value:
+> annotated bindings (`let`, `var` and every write to a `var`),
+> parameters of fns and lambdas, returns, record fields (named,
+> positional and after a spread), constructor payloads, list
+> elements under a `[Refined]` annotation, `Some(v)` and other
+> generic payloads under an annotation that refines them, a lambda's
+> result where its expected type refines it, and consts. The typer
+> decides each of these sites in one place (`refine_coerce`); a
+> parameter is checked once, on entry to the fn or lambda. A closed
+> value that refutes the predicate is a **compile error**; any other
+> value gets a runtime check that panics with the structured
+> diagnostic (`refinement violated in ... / predicate: ... /
+> declared at ...`, same shape as `requires`/`ensures`), and is
+> evaluated once, in source order. No check is emitted where the
+> predicate is proven: constant folding, or a value whose own type
+> already carries the predicate (a `Pos` field or parameter flowing
+> into a `Pos` position).
+>
+> Not checked: a refined type inside a container that arrives with no
+> literal to look into (`let o: Option[Pos] = f()` where `f` returns
+> `Option[Real]`), since unification erases refinements under a type
+> argument.
 
 **Parser-side landed (sub-lanes a–e).** `BaseT where Pred`,
 `requires` / `ensures` clauses, the `result` binding, parse-time
@@ -750,10 +760,9 @@ What this means in practice for code today:
 
 What is **not** done yet (deferred from the original plan):
 
-- **Refinement-aware unify / `TyRefineT` semantic type.** The
-  semantic side still drops the predicate, so `Int where >= 0`
-  unifies as `Int` and the typer cannot reason about the
-  refinement. This blocks (a) static interval propagation
+- **Refinement-aware unify.** The typer keeps the predicate on
+  `TyRefineT`, but unification peels it on both sides, so
+  `Int where >= 0` unifies as `Int`. This blocks (a) static interval propagation
   through refined arguments, (b) implicit upcast `Int where >= 0`
   ⊑ `Int`, (c) match-arm narrowing `p : RefinedT`, and (d)
   composition with UoM at the semantic level.

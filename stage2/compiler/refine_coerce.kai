@@ -1,0 +1,161 @@
+#[doc("""
+What a value owes when it flows into a refined type.
+
+The typer calls this wherever a value meets the type its position
+expects. A predicate the value's own type already carries is owed
+nothing; a closed literal is decided now; anything else is checked at
+runtime, on the value bound once so it is evaluated exactly once.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.refinements
+import compiler.fmt
+import compiler.ast_map
+
+#[doc("The predicates a refined type demands, outermost first.")]
+pub fn rc_preds(t: Ty) : [Expr] = match t {
+  TyRefineT(base, p) -> [p, ...rc_preds(base)]
+  _ -> []
+}
+
+#[doc("Whether a refined type's base carries a unit, so its check compares the bare number.")]
+pub fn rc_is_dim(t: Ty) : Bool = match t {
+  TyRefineT(base, _) -> rc_is_dim(base)
+  TyDimT(_, _) -> true
+  _ -> false
+}
+
+#[doc("How a value discharges the predicates of the type it flows into.")]
+pub type RcVerdict = RcProven | RcRefuted(String) | RcCheck([Expr])
+
+#[doc("Decide the predicates of `want` for `value`, whose own type is `have`.")]
+pub fn rc_verdict(want: Ty, value: Expr, have: Ty) : RcVerdict {
+  let carried = rc_preds(have)
+  let owed = filter(rc_preds(want), (p) => not rc_carries(carried, p))
+  rc_classify(owed, value, rc_refs(value, carried), [])
+}
+
+fn rc_carries(carried: [Expr], p: Expr) : Bool = match carried {
+  [] -> false
+  [q, ...rest] -> expr_struct_eq(p, q) or rc_carries(rest, p)
+}
+
+fn rc_refs(value: Expr, carried: [Expr]) : [RefBinding] = match value.kind {
+  EVar(nm) -> map(carried, (q) => RBind(nm, subst_self(q, nm)))
+  _        -> []
+}
+
+fn rc_classify(owed: [Expr], value: Expr, refs: [RefBinding], acc: [Expr]) : RcVerdict = match owed {
+  [] -> if acc == [] { RcProven } else { RcCheck(list_reverse(acc)) }
+  [p, ...rest] -> match classify_arg_vs_pred(p, "self", value, refs) {
+    CSElided      -> rc_classify(rest, value, refs, acc)
+    CSLoose(why)  -> RcRefuted(why)
+    CSRuntime     -> rc_classify(rest, value, refs, [p, ...acc])
+  }
+}
+
+#[doc("The runtime check of `pred` on the value bound to `name`, panicking with the decl `ctx` names.")]
+pub fn rc_assert(name: String, pred: Expr, ctx: String, strip: Bool) : Stmt {
+  let v = mk_ref(name, pred.line, pred.col)
+  let self_e = if strip { mk_expr(ECall(mk_ref("__strip_unit", pred.line, pred.col), [v]), pred.line, pred.col) } else { v }
+  let msg = concat_all([
+    "\"refinement violated in `", escape_str_body_for_c(ctx), "`",
+    "\\npredicate: ", escape_str_body_for_c(fmt_expr_text(pred)),
+    "\\ndeclared at line ", int_to_string(pred.line),
+    ", col ", int_to_string(pred.col), "\""
+  ])
+  SAssert(subst_var(pred, "self", self_e), Some(mk_expr(EStr(msg, false), pred.line, pred.col)))
+}
+
+#[doc("The refined types `expected` gives the type variables of `pat`, where it gives any.")]
+pub fn rc_var_binds(pat: Ty, expected: Ty) : [(Int, Ty)] = rc_binds(pat, expected, [])
+
+fn rc_binds(pat: Ty, t: Ty, acc: [(Int, Ty)]) : [(Int, Ty)] = match pat {
+  TyVarT(i) -> if rc_preds(t) == [] { acc } else { [(i, t), ...acc] }
+  TyListT(p) -> match t {
+    TyListT(x) -> rc_binds(p, x, acc)
+    _          -> acc
+  }
+  TyCon(_, _, ps, _) -> match t {
+    TyCon(_, _, ts, _) -> rc_binds_all(ps, ts, acc)
+    _                  -> acc
+  }
+  _ -> acc
+}
+
+fn rc_binds_all(ps: [Ty], ts: [Ty], acc: [(Int, Ty)]) : [(Int, Ty)] = match ps {
+  [p, ...prest] -> match ts {
+    [t, ...trest] -> rc_binds_all(prest, trest, rc_binds(p, t, acc))
+    []            -> acc
+  }
+  [] -> acc
+}
+
+#[doc("`t` with every bound type variable replaced by its binding.")]
+pub fn rc_subst(t: Ty, binds: [(Int, Ty)]) : Ty = match t {
+  TyVarT(i) -> rc_bound(binds, i, t)
+  TyListT(x) -> TyListT(rc_subst(x, binds))
+  TyCon(m, n, args_, sym) -> TyCon(m, n, map(args_, (a) => rc_subst(a, binds)), sym)
+  _ -> t
+}
+
+fn rc_bound(binds: [(Int, Ty)], i: Int, fallback: Ty) : Ty = match binds {
+  [] -> fallback
+  [(j, t), ...rest] -> if i == j { t } else { rc_bound(rest, i, fallback) }
+}
+
+#[doc("A refined `var`'s writes bind the new value under the declared type, as its initial value is, so the typer checks each one.")]
+pub fn rc_check_var_writes(name: String, ann: Option[TypeExpr], body: Expr) : Expr = match ann {
+  Some(t) -> match t.tkind {
+    TyRefine(_, _) -> rc_pin_writes(name, t, body)
+    _              -> body
+  }
+  None -> body
+}
+
+fn rc_pin_writes(name: String, t: TypeExpr, e: Expr) : Expr = match rc_write_of(name, e) {
+  Some(v) -> match e.kind {
+    ECall(callee, _) -> {
+      let cell = string_concat(name, "__ann")
+      let pinned = mk_expr(EBlock([SLet(mk_pat(PBind(cell), v.line, v.col), Some(t), rc_pin_writes(name, t, v))],
+                                  Some(mk_ref(cell, v.line, v.col))), v.line, v.col)
+      Expr { ...e, kind: ECall(callee, [pinned]) }
+    }
+    _ -> e
+  }
+  None -> Expr { ...e, kind: prc_map_expr_kind(e.kind, (sub) => rc_pin_writes(name, t, sub)) }
+}
+
+fn rc_write_of(name: String, e: Expr) : Option[Expr] = match e.kind {
+  ECall(callee, [v]) -> match callee.kind {
+    EField(base, "set") -> match base.kind {
+      EVar(n) -> if n == name { Some(v) } else { None }
+      _       -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+# A type variable never owes one: unification binds it to a type with
+# its refinements peeled.
+#[doc("Whether a value flowing into `t` can owe a refinement: `t` is refined, or a function type whose result is.")]
+pub fn rc_may_owe(t: Ty) : Bool = match t {
+  TyRefineT(_, _) -> true
+  TyFnT(_, r, _)  -> rc_may_owe(r)
+  _               -> false
+}
+
+#[doc("Whether a refinement appears anywhere inside `t`.")]
+pub fn rc_mentions(t: Ty) : Bool = match t {
+  TyRefineT(_, _)     -> true
+  TyListT(x)          -> rc_mentions(x)
+  TyCon(_, _, args_, _) -> rc_any_mentions(args_)
+  _                   -> false
+}
+
+fn rc_any_mentions(ts: [Ty]) : Bool = match ts {
+  [] -> false
+  [t, ...rest] -> rc_mentions(t) or rc_any_mentions(rest)
+}

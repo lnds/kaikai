@@ -12993,6 +12993,9 @@ test-rc-trace-callsite: $(TARGET) build
 #                             exactly these bytes on stderr.
 #   <name>.out.expected     — compiles and runs cleanly with this
 #                             stdout (the happy-path companion).
+#   <name>.checks.expected  — with an .out.expected: each line `fn N`
+#                             is how many refinement checks the C
+#                             emitted for `fn` holds.
 # Keeps the violation message format pinned so a regression in the
 # panic builders trips a clear test rather than a downstream user
 # surprise. The native backend's parity is gated separately by the
@@ -13036,6 +13039,15 @@ test-violations: $(TARGET) build
 	    diff -q $$exp_out build/viol-$$name.out > /dev/null \
 	      && echo "violations OK $$name (C out match)" \
 	      || { echo "violations DIFF $$name (C out)"; diff $$exp_out build/viol-$$name.out; exit 1; }; \
+	    exp_checks=../examples/refinements/$$name.checks.expected; \
+	    if [ -f $$exp_checks ]; then \
+	      while read -r ctx want; do \
+	        got=$$(grep -c "refinement violated in \`$$ctx\`" build/viol-$$name.c || true); \
+	        [ "$$got" = "$$want" ] \
+	          || { echo "violations FAIL $$name ($$got checks in $$ctx, want $$want)"; exit 1; }; \
+	      done < $$exp_checks; \
+	      echo "violations OK $$name (emitted checks match)"; \
+	    fi; \
 	  else \
 	    echo "violations SKIP $$name (no golden)"; \
 	  fi; \
