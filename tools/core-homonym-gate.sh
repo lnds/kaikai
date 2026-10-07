@@ -205,7 +205,7 @@ for mode in ${*:-c native}; do
 done
 
 fixtures="proto_rung_own_import_core derive_minted_ref_private_home generic_homonyms_spec_by_identity
-tail_call_to_core_homonym fused_groups_homonym_leads core_local_named_like_root_fn"
+tail_call_to_core_homonym fused_groups_homonym_leads core_local_named_like_root_fn arity_skips_to_core_fn"
 for mode in ${*:-c native}; do
   case $mode in
     c)              env="KAI_BACKEND=c" ;;
@@ -294,5 +294,31 @@ json=$(cd "$DIR/skip" && "$KAI" typecheck --diags-json main.kai 2>/dev/null || t
 case $json in
   *'"severity": "warning"'*'"message": "call to `min` with 2 arguments skips'*) echo "core-homonym-gate OK (skip warning)" ;;
   *) echo "core-homonym-gate FAIL (skip warning missing from --diags-json)"; echo "$json" | head -c 600; fail=1 ;;
+esac
+
+# The skip warning names what the call reached: a declaration, a
+# protocol operation, a core function.
+SFX="$ROOT/examples/namespace-collisions/arity_skips_to_core_fn"
+"$ROOT/stage2/kaic2" --path "$SFX" --path "$ROOT/stdlib" "$SFX/main.kai" 2>&1 >/dev/null \
+  | grep '^warning: call to' > "$DIR/skips.got" || true
+if diff -u "$SFX/skips.expected" "$DIR/skips.got" > "$DIR/skips.diff"; then
+  echo "core-homonym-gate OK (skip warning text)"
+else
+  echo "core-homonym-gate FAIL (skip warning text)"; cat "$DIR/skips.diff"; fail=1
+fi
+
+# A call nothing fits gets the arity error alone, never a skip warning.
+mkdir -p "$DIR/skipnone"
+cat > "$DIR/skipnone/main.kai" <<'KAI'
+fn main() : Unit / Stdout = {
+  let f = (a: Int, b: Int) => a + b
+  Stdout.print(int_to_string(f(1, 2, 3)))
+}
+KAI
+errs=$("$ROOT/stage2/kaic2" --path "$DIR/skipnone" --path "$ROOT/stdlib" "$DIR/skipnone/main.kai" 2>&1 >/dev/null || true)
+case $errs in
+  *skips*) echo "core-homonym-gate FAIL (a call nothing fits earned a skip warning)"; echo "$errs" | head -8; fail=1 ;;
+  *'wrong number of arguments'*) echo "core-homonym-gate OK (no skip warning when nothing fits)" ;;
+  *) echo "core-homonym-gate FAIL (a call nothing fits compiled)"; echo "$errs" | head -8; fail=1 ;;
 esac
 exit $fail
