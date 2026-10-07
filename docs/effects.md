@@ -12,13 +12,13 @@ rows** (the math) and the **surface syntax** (effect
 declarations, function types with effects, `handle` / `resume`,
 and the call-site dispatch convention). Migration of the current
 kaikai codebase to effect types, and the implementation strategy
-(CPS transform, runtime, interaction with monomorphisation) live
-in `docs/effects-stdlib.md` and `docs/effects-impl.md` — not yet
-written.
+(op dispatch, runtime, interaction with monomorphisation) live
+in `docs/effects-stdlib.md` and `docs/effects-impl.md`.
 
 Scope of v1: everything needed to parse, type-check, and desugar
 a program that declares effects, calls their operations, and
-installs handlers. Runtime CPS and stdlib migration come after.
+installs handlers. The runtime and stdlib migration are in Doc B
+and Doc C.
 
 ## Context
 
@@ -507,6 +507,11 @@ lie on the same control-flow path; otherwise the runtime catches
 it on the second call. This is the zero-cost continuation regime;
 kaikai's principle #2 mandates it.
 
+A non-tail `resume` must lie in the clause itself: not inside a
+`handle` nested in the clause, a loop body, a match guard, or a
+string interpolation, and the code after it may not read a `var`
+of the clause. The compiler rejects those shapes with a span.
+
 > **v1 status (2026-10-05):** the one-shot continuation is called
 > in the clause body itself. A call of it from inside a lambda in
 > the clause (`pick(k) -> { let g = (v: Int) => k(v); g(10) }`) is
@@ -584,16 +589,19 @@ worth noting so the syntax is not mystery:
   fiber-local builtin (`Cancel`/`Link`/`Monitor`/`Spawn`/`Actor`)
   resolves through the runtime's per-fiber disposition; a frameless
   perform of a default-bearing builtin (e.g. in `main`) falls to the
-  installed default. The op clause runs with a reified continuation
-  and either resumes (normal path) or returns directly (discard path).
+  installed default. The op clause runs on the performing stack and
+  either resumes (normal path) or returns directly (discard path); a
+  non-tail `resume` defers the rest of the clause to the handle's
+  exit.
 - `with Eff as X { ... }` binds `X` as a first-class **capability
   value** of type `Eff` (§6 named instances). Inside the body
   `X.op(args)` performs against *that* instance; `X` may also be
   passed down as a call argument (`fn f(c: Eff)`), where it remains
   second-class — it cannot be returned, stored, or captured by a
   closure that outlives the `handle`.
-- One-shot `resume` is a direct tail call. Multi-shot requires
-  copying the fiber stack frames, hence the opt-in.
+- A tail `resume` returns into the op site at no cost; a non-tail
+  one costs one closure. Multi-shot requires copying the fiber
+  stack frames, hence the opt-in.
 
 Interaction with monomorphisation, fibers, and the module system
 is covered in the implementation doc.
@@ -917,7 +925,7 @@ they first need to be acted on.
   migration of the existing `print`/`read_file`/`array_*`
   builtins, Io default-handler implementation, interaction with
   the `bin/kai run` entry.
-- **Doc C** — `docs/effects-impl.md`: CPS transform in the
+- **Doc C** — `docs/effects-impl.md`: op dispatch in the
   stage-2 pipeline, changes to `TyFnT`, handler-stack runtime
   representation, interaction with monomorphisation and fibers
   (m8), diagnostic quality for row-mismatch errors.

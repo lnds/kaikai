@@ -1569,6 +1569,15 @@ void kaix_evidence_run_cleanup(KaiEvidence *node) {
     kai_evidence_run_cleanup(node);
 }
 
+/* Non-tail `resume`: a clause defers its tail; the handle runs it on exit. */
+KaiValue *kaix_resume_frame_push(KaiValue *clo) {
+    return kai_resume_frame_push(clo);
+}
+
+KaiValue *kaix_resume_frames_run(KaiEvidence *node, KaiValue *v) {
+    return kai_resume_frames_run(node, v);
+}
+
 /* Op-site discard test, mirroring the C branch condition
  * `_k.status == KAI_CONT_UNRESUMED && _node_op->handle_jmp != NULL`.
  * Returns 1 when the clause discarded `resume` AND a handle pad is in

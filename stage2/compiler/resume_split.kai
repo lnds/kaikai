@@ -1,0 +1,181 @@
+#[doc("""
+Split one op clause at a non-tail `resume`. What the clause evaluates
+after the continuation call returns becomes a lambda, bound once and
+pushed on the handler by `$resume_frame` right before the call, which is
+then in tail position; the handle applies it to its result on exit. A
+path that does not resume calls the lambda in place, so a join after a
+branch is shared, not copied.
+""")]
+
+import compiler.ast
+import compiler.modules
+import compiler.resume_scan
+import compiler.resume_anf
+
+#[doc("Where a value goes: out of the clause, or into the bound lambda that continues it.")]
+pub type Kont = KTail | KTo(String)
+
+#[doc("The continuation's name, where the value goes, and the clause `var`s in scope with the names that close over them.")]
+pub type Cx = { k: String, kn: Kont, tainted: [String] }
+
+#[doc("The fresh-name counter and the shapes found the split cannot express.")]
+pub type Ss = { n: Int, bad: [RsBad] }
+
+#[doc("A rewritten expression and the state after it.")]
+pub type Sp = { e: Expr, s: Ss }
+
+#[doc("Rewrite `e` so its value, once computed, goes where `cx.kn` says.")]
+pub fn sp_to(e: Expr, cx: Cx, s: Ss) : Sp =
+  if not rs_has_k(e, cx.k) { Sp { e: sp_apply(cx.kn, e), s: s } }
+  else if rs_is_k_call(e, cx.k) { sp_resume(e, cx, s) }
+  else { match e.kind {
+    EBlock(ss, tail) -> sp_block(e, BlockRest { ss: ss, tail: tail, acc: [] }, cx, s)
+    EIf(c, t, eo) ->
+      if rs_has_k(c, cx.k) { sp_operands(e, cx, s) } else { sp_if(e, c, t, eo, cx, s) }
+    EMatch(scr, arms) ->
+      if rs_has_k(scr, cx.k) { sp_operands(e, cx, s) } else { sp_arms(e, scr, arms, [], cx, s) }
+    EBinop(op, a, b) ->
+      if is_short_circuit(op) and not rs_has_k(a, cx.k) { sp_to(short_circuit_if(e, op, a, b), cx, s) }
+      else { sp_operands(e, cx, s) }
+    _ -> sp_operands(e, cx, s)
+  } }
+
+fn sp_apply(kn: Kont, e: Expr) : Expr = match kn {
+  KTail  -> e
+  KTo(j) -> mk_expr(ECall(mk_ref(j, e.line, e.col), [e]), e.line, e.col)
+}
+
+fn with_kn(cx: Cx, kn: Kont) : Cx = Cx { k: cx.k, kn: kn, tainted: cx.tainted }
+
+fn sp_bad(s: Ss, b: RsBad) : Ss = Ss { n: s.n, bad: [b, ...s.bad] }
+
+# The continuation call itself: its arguments must not resume again.
+fn sp_resume(e: Expr, cx: Cx, s: Ss) : Sp = match rs_find_k_in(rs_children(e), cx.k) {
+  Some(again) -> Sp { e: e, s: sp_bad(s, rs_twice(again)) }
+  None -> match cx.kn {
+    KTail  -> Sp { e: e, s: s }
+    KTo(j) -> {
+      let push = mk_expr(EIntrinsic("resume_frame", [mk_ref(j, e.line, e.col)]), e.line, e.col)
+      Sp { e: with_kind(e, EBlock([SExprStmt(push)], Some(e))), s: s }
+    }
+  }
+}
+
+fn sp_if(e: Expr, c: Expr, t: Expr, eo: Option[Expr], cx: Cx, s: Ss) : Sp = {
+  let rt = sp_to(t, cx, s)
+  match eo {
+    Some(el) -> {
+      let re = sp_to(el, cx, rt.s)
+      Sp { e: with_kind(e, EIf(c, rt.e, Some(re.e))), s: re.s }
+    }
+    None -> match cx.kn {
+      KTail  -> Sp { e: with_kind(e, EIf(c, rt.e, None)), s: rt.s }
+      KTo(_) -> Sp { e: with_kind(e, EIf(c, rt.e, Some(sp_apply(cx.kn, with_kind(e, EUnit))))), s: rt.s }
+    }
+  }
+}
+
+fn sp_arms(e: Expr, scr: Expr, arms: [Arm], acc: [Arm], cx: Cx, s: Ss) : Sp = match arms {
+  [] -> Sp { e: with_kind(e, EMatch(scr, list_reverse(acc))), s: s }
+  [Arm(p, g, b), ...rest] -> {
+    let rb = sp_to(b, cx, guard_check(g, cx.k, s))
+    sp_arms(e, scr, rest, [Arm(p, g, rb.e), ...acc], cx, rb.s)
+  }
+}
+
+fn guard_check(g: Option[Expr], k: String, s: Ss) : Ss = match g {
+  Some(gx) -> match rs_find_k(gx, k) {
+    Some(c) -> sp_bad(s, rs_in_guard(c))
+    None    -> s
+  }
+  None -> s
+}
+
+fn is_short_circuit(op: String) : Bool = op == "and" or op == "or"
+
+# `a and b` evaluates `b` only on one branch; as an `if`, that branch can resume.
+fn short_circuit_if(e: Expr, op: String, a: Expr, b: Expr) : Expr =
+  if op == "and" { with_kind(e, EIf(a, b, Some(with_kind(e, EBool(false))))) }
+  else { with_kind(e, EIf(a, with_kind(e, EBool(true)), Some(b))) }
+
+# --- blocks: the statement that resumes splits the block ---------------
+
+# The statements still to scan, the block's tail, and those kept before.
+type BlockRest = { ss: [Stmt], tail: Option[Expr], acc: [Stmt] }
+
+fn sp_block(e: Expr, br: BlockRest, cx: Cx, s: Ss) : Sp = match br.ss {
+  [] -> match br.tail {
+    Some(t) -> {
+      let r = sp_to(t, cx, s)
+      Sp { e: with_kind(e, EBlock(list_reverse(br.acc), Some(r.e))), s: r.s }
+    }
+    None -> Sp { e: sp_apply(cx.kn, with_kind(e, EBlock(list_reverse(br.acc), None))), s: s }
+  }
+  [st, ...rest] ->
+    if any(stmt_exprs(st), (x) => rs_has_k(x, cx.k)) {
+      sp_split_at(e, st, BlockRest { ss: rest, tail: br.tail, acc: br.acc }, cx, s)
+    } else {
+      let cx1 = Cx { k: cx.k, kn: cx.kn, tainted: stmt_taints(st, cx.tainted) }
+      sp_block(e, BlockRest { ss: rest, tail: br.tail, acc: [st, ...br.acc] }, cx1, s)
+    }
+}
+
+# A clause `var`, and every name bound to a closure over one, would
+# outlive the block the split leaves it in.
+fn stmt_taints(st: Stmt, tainted: [String]) : [String] = match st {
+  SVar(n, _, _, _, _) -> [n, ...tainted]
+  SLet(p, _, rhs) -> if rs_closes_over(rhs, tainted) { pat_binders(p, tainted) } else { tainted }
+  _ -> tainted
+}
+
+# `st` resumes: what follows it becomes the lambda its value flows into.
+fn sp_split_at(e: Expr, st: Stmt, br: BlockRest, cx: Cx, s: Ss) : Sp = {
+  let s1 = check_after(with_kind(e, EBlock(br.ss, br.tail)), cx, s)
+  let t = fresh("__resume_v", s1.n)
+  let j = fresh("__resume_k", s1.n)
+  let s2 = Ss { n: s1.n + 1, bad: s1.bad }
+  match stmt_resumer(st, mk_ref(t, e.line, e.col)) {
+    Some(sr) -> {
+      let after = sp_apply(cx.kn, with_kind(e, EBlock([...sr.binds, ...br.ss], br.tail)))
+      let lam = with_kind(e, ELambda([mk_param(t, e)], after))
+      let bind = SLet(Pattern { pkind: PBind(j), line: e.line, col: e.col }, None, lam)
+      let r = sp_to(sr.rhs, with_kn(cx, KTo(j)), s2)
+      Sp { e: with_kind(e, EBlock([...list_reverse(br.acc), bind], Some(r.e))), s: r.s }
+    }
+    None -> Sp { e: e, s: sp_bad(s2, rs_unsplittable_at(e)) }
+  }
+}
+
+fn fresh(prefix: String, n: Int) : String = string_concat(prefix, int_to_string(n))
+
+fn check_after(after: Expr, cx: Cx, s: Ss) : Ss = {
+  let s1 = match rs_find_k(after, cx.k) {
+    Some(c) -> sp_bad(s, rs_twice(c))
+    None    -> s
+  }
+  match rs_find_ref(after, cx.tainted) {
+    Some(v) -> sp_bad(s1, rs_var_after(v))
+    None    -> s1
+  }
+}
+
+# The expression a resuming statement evaluates, and the statements that
+# rebind its value (`t`) on the far side of the split.
+type StmtResumer = { rhs: Expr, binds: [Stmt] }
+
+fn stmt_resumer(st: Stmt, t: Expr) : Option[StmtResumer] = match st {
+  SLet(p, ann, rhs)      -> Some(StmtResumer { rhs: rhs, binds: [SLet(p, ann, t)] })
+  SVar(n, ty, rhs, l, c) -> Some(StmtResumer { rhs: rhs, binds: [SVar(n, ty, t, l, c)] })
+  SExprStmt(x)           -> Some(StmtResumer { rhs: x, binds: [] })
+  _                      -> None
+}
+
+fn mk_param(name: String, at: Expr) : Param =
+  Param { pname: name, ptype: None, pline: at.line, pcol: at.col, pborrow: false }
+
+# --- operands: evaluate up to the resuming one, then split there --------
+
+fn sp_operands(e: Expr, cx: Cx, s: Ss) : Sp = match anf_resuming_operand(e, cx.k, s.n) {
+  Some(a) -> sp_to(a.e, cx, Ss { n: a.n, bad: s.bad })
+  None    -> Sp { e: e, s: sp_bad(s, rs_unsplittable_at(e)) }
+}

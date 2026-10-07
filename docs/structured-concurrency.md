@@ -417,7 +417,7 @@ this doc's deliverables sit on top of both.
 Requires:
 
 - The effects + handlers machinery from m7a (row unification,
-  CPS transform, handler-stack runtime).
+  direct-style op dispatch, handler-stack runtime).
 - `Fiber[T]` as a region-branded handle; the region check is
   a small extension to the existing type checker, sharing the
   brand machinery with `Pid[Msg]` from `docs/actors.md`.

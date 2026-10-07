@@ -22,7 +22,7 @@ listed already exists; that drift was the trigger for #367.
 Pinned decisions come from the stdlib discussion of 2026-04-24.
 Doc A (`effects.md`), Doc B (`effects-stdlib.md`), and Doc C
 (`effects-impl.md`) remain the sources of truth for effect semantics,
-catalog, and CPS lowering respectively. This doc sits on top of B: B
+catalog, and lowering respectively. This doc sits on top of B: B
 lists the effects, this doc lists the modules that use them.
 
 ## Purpose

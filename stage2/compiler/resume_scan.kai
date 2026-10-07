@@ -1,0 +1,241 @@
+#[doc("""
+Where an op clause calls its continuation `k`, read on the surface AST
+before name resolution. A lambda is opaque here: a continuation called
+from one is the typer's to reject.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.expr_positions
+import compiler.interp_span
+import compiler.infer
+
+#[doc("The direct sub-expressions of `e`, in evaluation order.")]
+pub fn rs_children(e: Expr) : [Expr] = map(xp_positions(e), (p) => match p { XP(_, x) -> x })
+
+fn opt_list(o: Option[Expr]) : [Expr] = match o {
+  Some(e) -> [e]
+  None    -> []
+}
+
+fn clause_body(c: HClause) : Expr = match c { HC(_, _, b, _, _) -> b }
+
+fn ret_body(r: Option[HReturn]) : Option[Expr] = match r {
+  Some(HR(_, b, _, _)) -> Some(b)
+  None                 -> None
+}
+
+#[doc("Where a diagnostic about `e` points: a call's callee, else `e` itself.")]
+pub fn rs_at(e: Expr) : Expr = match e.kind {
+  ECall(f, _) -> f
+  _           -> e
+}
+
+#[doc("True when `e` is a call of the continuation `k`.")]
+pub fn rs_is_k_call(e: Expr, k: String) : Bool = match e.kind {
+  ECall(f, _) -> match f.kind { EVar(n) -> n == k  _ -> false }
+  _           -> false
+}
+
+#[doc("The first call of `k` evaluated by `e`, outside lambdas and nested handles.")]
+pub fn rs_find_k(e: Expr, k: String) : Option[Expr] =
+  if rs_is_k_call(e, k) { Some(e) }
+  else { match e.kind {
+    ELambda(_, _) -> None
+    EHandle(_, _, _, _, _, _, _, _) -> None
+    _ -> rs_find_k_in(rs_children(e), k)
+  } }
+
+#[doc("The first call of `k` among `es`.")]
+pub fn rs_find_k_in(es: [Expr], k: String) : Option[Expr] = match es {
+  [] -> None
+  [x, ...rest] -> match rs_find_k(x, k) {
+    Some(hit) -> Some(hit)
+    None      -> rs_find_k_in(rest, k)
+  }
+}
+
+#[doc("True when `e` calls `k`, outside lambdas and nested handles.")]
+pub fn rs_has_k(e: Expr, k: String) : Bool = match rs_find_k(e, k) {
+  Some(_) -> true
+  None    -> false
+}
+
+#[doc("True when a statement of `ss` calls `k`.")]
+pub fn rs_stmts_have_k(ss: [Stmt], k: String) : Bool =
+  any(ss, (s) => any(stmt_exprs(s), (x) => rs_has_k(x, k)))
+
+#[doc("True when a lambda in `e` reads one of `names`.")]
+pub fn rs_closes_over(e: Expr, names: [String]) : Bool = match e.kind {
+  ELambda(_, b) -> match rs_find_ref(b, names) {
+    Some(_) -> true
+    None    -> false
+  }
+  _ -> any(rs_children(e), (x) => rs_closes_over(x, names))
+}
+
+#[doc("A reference to one of `names` in `e`, at any depth.")]
+pub fn rs_find_ref(e: Expr, names: [String]) : Option[Expr] = match e.kind {
+  EVar(n) -> if list_has(names, n) { Some(e) } else { None }
+  _       -> rs_find_ref_in(rs_children(e), names)
+}
+
+fn rs_find_ref_in(es: [Expr], names: [String]) : Option[Expr] = match es {
+  [] -> None
+  [x, ...rest] -> match rs_find_ref(x, names) {
+    Some(hit) -> Some(hit)
+    None      -> rs_find_ref_in(rest, names)
+  }
+}
+
+#[doc("A shape the split cannot express: the error, a hint, and where.")]
+pub type RsBad = RsBad(String, String, Int, Int)
+
+#[doc("""
+The first call of `k` the split cannot express: one inside a `handle`
+nested in the clause (the resumed body would have to run under that
+handler), inside a loop body (it would run again on the next turn), or
+inside a string interpolation (parsed only after this pass).
+""")]
+pub fn rs_unsplittable(e: Expr, k: String) : Option[RsBad] = match e.kind {
+  EHandle(_, _, _, _, _, _, _, _) -> match rs_deep_k(e, k) {
+    Some(c) -> Some(RsBad("`resume` is called inside a `handle` nested in its clause",
+                          "the resumed body would have to run under the inner handler; call `resume` outside it", rs_at(c).line, rs_at(c).col))
+    None    -> None
+  }
+  EStr(span, tri) ->
+    if any(isp_parts(span, tri), (ip) => interp_calls(ip, k)) {
+      Some(RsBad("`resume` is called inside a string interpolation",
+                 "bind its result with `let` first", e.line, e.col))
+    } else { None }
+  ECall(f, xs) ->
+    if rs_is_loop_callee(f) {
+      match rs_deep_k_in(xs, k) {
+        Some(c) -> Some(RsBad("`resume` is called inside a loop",
+                              "the continuation is one-shot; compute the value in the loop and resume once after it", rs_at(c).line, rs_at(c).col))
+        None    -> None
+      }
+    } else { rs_unsplittable_in([f, ...xs], k) }
+  _ -> rs_unsplittable_in(rs_children(e), k)
+}
+
+fn rs_unsplittable_in(es: [Expr], k: String) : Option[RsBad] = match es {
+  [] -> None
+  [x, ...rest] -> match rs_unsplittable(x, k) {
+    Some(b) -> Some(b)
+    None    -> rs_unsplittable_in(rest, k)
+  }
+}
+
+fn interp_calls(ip: IPart, k: String) : Bool = match ip {
+  IpExp(src)   -> string_contains(src, string_concat(k, "("))
+  IpLit(_, _)  -> false
+}
+
+fn rs_is_loop_callee(f: Expr) : Bool = match f.kind {
+  EVar(n)        -> rs_is_loop_name(n)
+  EModCall(q, n) -> q == "loop" and rs_is_loop_name(n)
+  EField(b, n)   -> match b.kind { EVar(q) -> q == "loop" and rs_is_loop_name(n)  _ -> false }
+  _              -> false
+}
+
+fn rs_is_loop_name(n: String) : Bool = n == "while" or n == "until" or n == "repeat"
+
+# Unlike `rs_find_k`, sees through lambdas and nested handles, down to a
+# binder that rebinds `k`.
+fn rs_deep_k(e: Expr, k: String) : Option[Expr] =
+  if rs_is_k_call(e, k) { Some(e) }
+  else { match e.kind {
+    ELambda(ps, b) -> if any(ps, (p) => p.pname == k) { None } else { rs_deep_k(b, k) }
+    EHandle(body, _, _, _, init, _, cs, ret) ->
+      rs_deep_k_in([body, ...opt_list(init), ...rs_clauses_keeping(cs, k), ...opt_list(ret_body(ret))], k)
+    _ -> rs_deep_k_in(rs_children(e), k)
+  } }
+
+fn rs_clauses_keeping(cs: [HClause], k: String) : [Expr] = match cs {
+  [] -> []
+  [HC(_, ps, b, _, _), ...rest] ->
+    if any(ps, (p) => p.pname == k) { rs_clauses_keeping(rest, k) } else { [b, ...rs_clauses_keeping(rest, k)] }
+}
+
+fn rs_deep_k_in(es: [Expr], k: String) : Option[Expr] = match es {
+  [] -> None
+  [x, ...rest] -> match rs_deep_k(x, k) {
+    Some(hit) -> Some(hit)
+    None      -> rs_deep_k_in(rest, k)
+  }
+}
+
+#[doc("True when a clause of `cs` defers a tail with `$resume_frame`, so the handle must apply its frames on exit.")]
+pub fn rs_clauses_push_frames(cs: [HClause]) : Bool = any(cs, (c) => rs_pushes_frame(clause_body(c)))
+
+# A nested handle's frames are its own; a lambda never pushes one.
+fn rs_pushes_frame(e: Expr) : Bool = match e.kind {
+  EIntrinsic(n, xs) -> n == "resume_frame" or any(xs, rs_pushes_frame)
+  EHandle(_, _, _, _, _, _, _, _) -> false
+  ELambda(_, _) -> false
+  _ -> any(rs_children(e), rs_pushes_frame)
+}
+
+#[doc("True when every call of `k` in `e` is in tail position, so the clause needs no split.")]
+pub fn rs_all_tail(e: Expr, k: String) : Bool =
+  if not rs_has_k(e, k) { true }
+  else if rs_is_k_call(e, k) { not rs_has_k_in(rs_children(e), k) }
+  else { match e.kind {
+    EBlock(ss, tail) -> not rs_stmts_have_k(ss, k) and opt_all_tail(tail, k)
+    EIf(c, t, eo) -> not rs_has_k(c, k) and rs_all_tail(t, k) and opt_all_tail(eo, k)
+    EMatch(scr, arms) -> not rs_has_k(scr, k) and all(arms, (a) => arm_all_tail(a, k))
+    _ -> false
+  } }
+
+fn rs_has_k_in(es: [Expr], k: String) : Bool = match rs_find_k_in(es, k) {
+  Some(_) -> true
+  None    -> false
+}
+
+fn opt_all_tail(o: Option[Expr], k: String) : Bool = match o {
+  Some(x) -> rs_all_tail(x, k)
+  None    -> true
+}
+
+fn arm_all_tail(a: Arm, k: String) : Bool = match a {
+  Arm(_, Some(g), b) -> not rs_has_k(g, k) and rs_all_tail(b, k)
+  Arm(_, None, b)    -> rs_all_tail(b, k)
+}
+
+# --- diagnostics ----------------------------------------------------------
+
+#[doc("A second call of the continuation on one path.")]
+pub fn rs_twice(at: Expr) : RsBad =
+  RsBad("`resume` may be called twice on one path", "the continuation is one-shot", rs_at(at).line, rs_at(at).col)
+
+#[doc("A call of the continuation in a match guard.")]
+pub fn rs_in_guard(at: Expr) : RsBad =
+  RsBad("`resume` is called in a match guard", "resume in the arm's body instead", rs_at(at).line, rs_at(at).col)
+
+#[doc("A call of the continuation in a position the split cannot cut.")]
+pub fn rs_unsplittable_at(at: Expr) : RsBad =
+  RsBad("`resume` is called where the clause cannot be split", "bind its result with `let` first", rs_at(at).line, rs_at(at).col)
+
+#[doc("A clause `var` read after a non-tail `resume`.")]
+pub fn rs_var_after(v: Expr) : RsBad = {
+  let name = match v.kind {
+    EVar(n) -> string_concat(string_concat("`", n), "`")
+    _       -> "a name"
+  }
+  RsBad(string_concat(name, " is a `var` of the clause, read after a non-tail `resume`"),
+        "the code after `resume` runs when the handle exits, outside the var's block; read it into a `let` before resuming",
+        v.line, v.col)
+}
+
+#[doc("A non-tail `resume` in a `default { }` clause, at the clause.")]
+pub fn rs_default_nontail(l: Int, c: Int) : RsBad =
+  RsBad("a default handler's clause must call `resume` in tail position",
+        "a default handler has no `handle` exit to run the code after `resume` at", l, c)
+
+#[doc("The `$resume_bad(message, help)` marker the typer reports a shape by.")]
+pub fn rs_bad_marker(b: RsBad) : Expr = match b {
+  RsBad(msg, help, l, c) -> mk_expr(EIntrinsic("resume_bad", [rs_quoted(msg, l, c), rs_quoted(help, l, c)]), l, c)
+}
+
+fn rs_quoted(s: String, l: Int, c: Int) : Expr = mk_expr(EStr(string_concat(string_concat("\"", s), "\""), false), l, c)

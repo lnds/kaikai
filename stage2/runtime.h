@@ -3114,6 +3114,9 @@ typedef struct KaiFiber   KaiFiber;
 /* `n` consecutive slots a frame owns across a call that can unwind; a
  * non-local exit that skips the frame releases each non-NULL slot. */
 typedef struct { KaiValue **base; intptr_t n; } KaiUnwEntry;
+/* What an op clause runs after a non-tail `resume`, waiting for the exit
+ * of the handle whose node it names. */
+typedef struct { KaiEvidence *node; KaiValue *clo; } KaiResumeFrame;
 typedef struct KaiNursery KaiNursery;     /* issue #959 — defined below */
 
 /* One selector's membership in one candidate's select chain. A fiber in
@@ -3343,6 +3346,11 @@ struct KaiFiber {
     uint32_t        unw_cap;
     /* The trampoline's frame address: a trap's unwind stops there. */
     uintptr_t       unwind_frame;
+    /* Pending clause tails, in push order. A handle's own may sit below
+     * those of the handles around it, so removal is by node, not by height. */
+    KaiResumeFrame *rframe_buf;
+    uint32_t        rframe_top;
+    uint32_t        rframe_cap;
 };
 
 /* Issue #959 — one open structured-concurrency scope. Children spawned
@@ -3413,7 +3421,8 @@ struct KaiNursery {
     NULL,                /* tsan_fiber — bound on this thread's first switch */ \
     NULL,                /* exit_rec */                                  \
     NULL, 0, 0,          /* unw_buf, unw_top, unw_cap */                 \
-    0                    /* unwind_frame — main has no pad */            \
+    0,                   /* unwind_frame — main has no pad */            \
+    NULL, 0, 0           /* rframe_buf, rframe_top, rframe_cap */        \
 }
 /* `kai_active_fiber` cannot be statically initialised to `&kai_main_fiber`
  * now that both are `_Thread_local`: the address of a thread-local is not a
@@ -4968,6 +4977,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
                                v->as.fib->stack_size + kai_page_size());
                     }
                     free(v->as.fib->unw_buf);
+                    free(v->as.fib->rframe_buf);
                     free(v->as.fib);
                 }
             }
@@ -18508,10 +18518,14 @@ static inline KaiFiber *kai_unw_push_c(KaiFiber **cache, KaiValue **base, intptr
 
 static inline void kai_unw_pop(KaiFiber *f) { f->unw_top--; }
 
-/* Release every slot above `mark`, innermost frame first. */
+static void kai_resume_frames_drop(KaiFiber *f, KaiEvidence *node);
+
+/* Release every slot above `mark`, innermost frame first. An entry with
+ * `n < 0` is a handle draining its resume frames: `base` is its node. */
 static void kai_unw_release_to(KaiFiber *f, uint32_t mark) {
     while (f->unw_top > mark) {
         KaiUnwEntry e = f->unw_buf[--f->unw_top];
+        if (e.n < 0) kai_resume_frames_drop(f, (KaiEvidence *) e.base);
         for (intptr_t i = 0; i < e.n; i++) {
             if (e.base[i] != NULL) kai_decref(e.base[i]);
         }
@@ -18608,6 +18622,85 @@ static void kai_evidence_pop(void) {
     }
 }
 
+/* A non-tail `resume` defers the rest of its clause: the clause pushes it
+ * here, on the node whose clause is running, and the handle applies it to
+ * its result on exit. Takes the clause's reference to the closure. */
+static KaiValue *kai_resume_frame_push(KaiValue *clo) {
+    KaiFiber *f = kai_current_fiber();
+    KaiEvidence *node = f->in_dispatch_node;
+    if (node == NULL) {
+        fputs("kai: internal error: a resume frame pushed outside a handler clause\n", stderr);
+        kai_exit(1);
+    }
+    if (f->rframe_top == f->rframe_cap) {
+        uint32_t cap = f->rframe_cap ? f->rframe_cap * 2 : 16;
+        KaiResumeFrame *buf = (KaiResumeFrame *) realloc(f->rframe_buf, (size_t) cap * sizeof(KaiResumeFrame));
+        if (buf == NULL) {
+            fputs("kai: out of memory growing the resume frames\n", stderr);
+            kai_exit(1);
+        }
+        f->rframe_buf = buf;
+        f->rframe_cap = cap;
+    }
+    f->rframe_buf[f->rframe_top].node = node;
+    f->rframe_buf[f->rframe_top].clo  = clo;
+    f->rframe_top++;
+    return kai_unit();
+}
+
+/* Take `node`'s innermost frame off the fiber's stack, or NULL. */
+static KaiValue *kai_resume_frame_take(KaiFiber *f, KaiEvidence *node) {
+    for (uint32_t i = f->rframe_top; i > 0; i--) {
+        if (f->rframe_buf[i - 1].node != node) continue;
+        KaiValue *clo = f->rframe_buf[i - 1].clo;
+        memmove(&f->rframe_buf[i - 1], &f->rframe_buf[i],
+                (size_t) (f->rframe_top - i) * sizeof(KaiResumeFrame));
+        f->rframe_top--;
+        return clo;
+    }
+    return NULL;
+}
+
+static int kai_resume_frames_pending(KaiFiber *f, KaiEvidence *node) {
+    for (uint32_t i = f->rframe_top; i > 0; i--) {
+        if (f->rframe_buf[i - 1].node == node) return 1;
+    }
+    return 0;
+}
+
+/* Feed a handle's result through its pending frames, innermost first:
+ * each one's value is the next one's `resume` result. Runs after the
+ * node is popped, so a frame performing the handled effect reaches the
+ * handler outside. While it runs, the node is gone from the evidence
+ * chain, so an unwind entry stands in for it: an exit that jumps past
+ * releases the frames not yet run. Consumes `v`. */
+static KaiValue *kai_resume_frames_run(KaiEvidence *node, KaiValue *v) {
+    KaiFiber *f = kai_current_fiber();
+    if (!kai_resume_frames_pending(f, node)) return v;
+    KaiFiber *uf = kai_unw_push_on(f, (KaiValue **) node, -1);
+    for (;;) {
+        /* Re-read: a frame may park and resume on another thread. */
+        KaiValue *clo = kai_resume_frame_take(kai_current_fiber(), node);
+        if (clo == NULL) break;
+        /* Held across the call: a frame that exits past this handle must
+         * still release its own closure. */
+        KaiValue *held[1] = { clo };
+        KaiFiber *cf = kai_unw_push(held, 1);
+        KaiValue *argv[1] = { v };
+        v = kai_apply_borrow(clo, 1, argv);
+        kai_unw_pop(cf);
+        kai_decref(clo);
+    }
+    kai_unw_pop(uf);
+    return v;
+}
+
+/* Release `node`'s frames: an exit that skips its handle abandons them. */
+static void kai_resume_frames_drop(KaiFiber *f, KaiEvidence *node) {
+    KaiValue *clo;
+    while ((clo = kai_resume_frame_take(f, node)) != NULL) kai_decref(clo);
+}
+
 /* Unwind the evidence stack past `node` — the abandon path, where a
  * clause discarded `resume` and the op site longjmps to `node`'s handle.
  * That jump destroys every frame the handle body pushed, `node` included,
@@ -18628,6 +18721,8 @@ static void kai_evidence_unwind_to(KaiEvidence *node) {
     for (KaiEvidence *n = f->evidence_top; n != NULL && n != stop; n = n->parent) {
         kai_unw_release_to(f, n->unw_mark);
         kai_evidence_run_cleanup(n);
+        /* `node`'s own frames survive: its landing pad applies them. */
+        if (n != node) kai_resume_frames_drop(f, n);
     }
     f->evidence_top = stop;
 }
@@ -18639,6 +18734,7 @@ static void kai_evidence_unwind_all(void) {
     for (KaiEvidence *n = f->evidence_top; n != NULL; n = n->parent) {
         kai_unw_release_to(f, n->unw_mark);
         kai_evidence_run_cleanup(n);
+        kai_resume_frames_drop(f, n);
     }
     kai_unw_release_to(f, 0);
     f->evidence_top = NULL;
