@@ -20,7 +20,7 @@ ROOT="$(pwd)"
 KAIC2="$ROOT/stage2/kaic2"
 WORK="$ROOT/stage2/build/compile-alloc"
 MODS=40
-CEILING="${KAI_COMPILE_ALLOC_CEILING:-5700000}"
+CEILING="${KAI_COMPILE_ALLOC_CEILING:-5500000}"
 
 [ -x "$KAIC2" ] || { echo "compile-alloc: SKIP — no stage2/kaic2"; exit 0; }
 
