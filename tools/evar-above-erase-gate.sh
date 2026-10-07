@@ -32,6 +32,8 @@ SRC="$ROOT/stage2/compiler"
 #   fmt_expr, tailfuse, tailsubst, pipe_fusion, resolve
 #   infer            — mints calls to runtime primitives (`array_get`,
 #                      `vec_slice`) that no user declaration backs.
+#   refine_coerce    — the binder a refinement check just bound, and
+#                      the `__strip_unit` primitive.
 #   index_coll       — the typer's placeholder for an indexed collection;
 #                      bound and spliced away before the typer returns.
 #   monomorph        — the callee of a specialisation it just created;
@@ -56,7 +58,7 @@ ALLOW="$ALLOW|closure_spec_ast|closure_spec_emit|sym_read"
 ALLOW="$ALLOW|emit_tcrec_live|cache_delta_test|resolve_sym_test"
 ALLOW="$ALLOW|perceus|perceus_plant_drop|perceus_tail_drop|perceus_owned_pos"
 ALLOW="$ALLOW|perceus_payer|unbox|unbox_native_raw|cell_promote"
-ALLOW="$ALLOW|perceus_branch_plant|index_coll|range_patterns|bang_hoist"
+ALLOW="$ALLOW|perceus_branch_plant|index_coll|range_patterns|bang_hoist|refine_coerce"
 
 # Passes at or below the erasure. `EVar` is their correct form: the name
 # is a C symbol there, and `sym_erase` is what put it back.
