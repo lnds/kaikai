@@ -1287,7 +1287,7 @@ TIER1_ASAN_LEGS_A := \
 	test-log-asan \
 	test-trap-exit-cancel-asan \
 	test-monitor-ref-asan \
-	test-heap-int-asan \
+	test-perceus-asan \
 	test-process-basic-asan \
 	test-perceus-issue82-asan \
 	test-ffi-extern-c-asan \

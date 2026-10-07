@@ -102,6 +102,7 @@ import compiler.region
 import compiler.raw_border
 import compiler.evidence_shadow
 import compiler.unwind_pend
+import compiler.unwind_sites
 import compiler.unwind_effects
 import compiler.unwind_cx
 import compiler.emit_unwind_c
@@ -5165,15 +5166,18 @@ fn emit_match_default(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : Stri
   }
 }
 
-# True when any arm body can reach a tcrec/TRMC goto — the gate for
-# declaring this match's scrutinee-release alias.
-fn match_arms_have_sentinel(arms: [Arm]) : Bool = match arms {
+# True when any arm body can reach a tcrec/TRMC goto or an early return —
+# the gate for declaring this match's scrutinee-release alias.
+fn match_arms_have_sentinel(arms: [Arm], cx: EmitCtx) : Bool = match arms {
   [] -> false
   [a, ...rest] -> match a {
     Arm(_, _, body) ->
-      if tcrec_body_has_sentinel(body) { true } else { match_arms_have_sentinel(rest) }
+      if tcrec_body_has_sentinel(body) or emit_exits_in(body, cx) { true } else { match_arms_have_sentinel(rest, cx) }
   }
 }
+
+# Whether `body` holds a `!`; only a frame with an early return is scanned.
+fn emit_exits_in(body: Expr, cx: EmitCtx) : Bool = any(cx.unw.sites, (s) => unw_is_exit(s)) and tcl_has_bang(body)
 
 # This pattern's RC-carrying binders: every bound name except raw
 # kind-1 scalars and `_`-prefixed names (which bind no C local).
@@ -5193,7 +5197,7 @@ fn tcp_rc_binders_loop(all: [String], raw: [String]) : [String] = match all {
 # the ledger, so it is cleared to skip the branch-refinement scans.
 fn tcp_arm_body_cx(arm_cx: EmitCtx, scr_alias: Option[String], pat: Pattern,
                    body: Expr, cx: EmitCtx) : EmitCtx =
-  if tcrec_body_has_sentinel(body) {
+  if tcrec_body_has_sentinel(body) or emit_exits_in(body, cx) {
     let with_scr = match scr_alias {
       Some(a) -> list_append(arm_cx.tcpend, [tcl_scr_entry(a)])
       None    -> arm_cx.tcpend
@@ -5210,7 +5214,7 @@ fn tcp_scr_alias_decl(scr_alias: Option[String]) : String = match scr_alias {
 }
 
 fn tcp_new_scr_alias(arms: [Arm], cx: EmitCtx) : Option[String] =
-  if match_arms_have_sentinel(arms) {
+  if match_arms_have_sentinel(arms, cx) {
     Some(cat2("_kai_tcs", int_to_string(tcl_scr_count(cx.tcpend))))
   } else { None }
 
@@ -7184,7 +7188,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     # An extern-fn body is intercepted at the DFn level and replaced by
     # a shim; reaching it as an ordinary expression is a compiler bug.
     EExternBody(_) -> concat_all(["kai_core_panic(kai_str(\"extern body in expression position\"))"])
-    EBang(inner) -> emit_bang(src, inner, cx)
+    EBang(inner) -> emit_bang(src, x, inner, cx)
     EHandle(body, eff_name, _, _eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
       emit_handle(src, body, eff_name, init_opt, alias_opt, clauses, ret_opt, x.line, x.col, cx)
     # m12.5: codegen erasure — `1.0<USD>` emits the same C as `1.0`.
@@ -7481,14 +7485,19 @@ fn emit_variants_of_list(names: [String], variants: [VariantEntry]) : String {
 # stamped to `Option[_]` or `Result[_, _]` after substitution. Any
 # other shape here is a typer bug — we fall back to a panic stub
 # rather than emit silently-wrong C.
-fn emit_bang(src: String, inner: Expr, cx: EmitCtx) : String / Console {
+fn emit_bang(src: String, x: Expr, inner: Expr, cx: EmitCtx) : String / Console {
 
   let inner_c = emit_expr(src, inner, cx)
   let success = bang_success_variant(inner.ty)
+  let binders = match unw_exit_at(cx.unw.sites, x.line, x.col) {
+    Some(ns) -> concat_all(map(emit_unw_vars(ns, cx), (v) => concat_all(["kai_decref(", v, "); "])))
+    None     -> ""
+  }
+  let owed = cat2(binders, tcl_exit_drops(cx.tcpend))
   match success {
     Some(name) -> concat_all([
       "({ KaiValue *_b = ", inner_c, "; ",
-      "if (!(_b && ", emit_variant_tag_test("_b", None, name, cx.variants), ")) return _b; ",
+      "if (!(_b && ", emit_variant_tag_test("_b", None, name, cx.variants), ")) { ", owed, "return _b; } ",
       "KaiValue *_p = kai_incref(kai_var_slots(_b)[0].ptr); kai_decref(_b); _p; })"
     ])
     None -> concat_all([
