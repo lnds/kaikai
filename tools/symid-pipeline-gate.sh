@@ -369,4 +369,9 @@ for pass in cold warm; do
   printf '%s\n' "$out" | grep -q 'Child@os' && fail "an imported capability op named the core type ($pass)"
 done
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, a qualified call names the one its qualifier homes, and a constructor site, nested or not, names the home its type picked, and a capability spelled like a core type names its effect"
+# A specialised callee is named by its spec's identity; a callee minted
+# from the mangled spelling alone would reach every later pass with no id.
+grep -nE 'EVar\(mangled\)|EModCall\([a-z]+, mangled\)' "$ROOT/stage2/compiler/monomorph.kai" \
+  && fail "monomorph mints a spec callee from its mangled name"
+
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, a qualified call names the one its qualifier homes, a constructor site, nested or not, names the home its type picked, a capability spelled like a core type names its effect, and a specialised callee is always its spec's id"
