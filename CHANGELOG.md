@@ -84,6 +84,46 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.135.0 (2026-10-07)
+
+### BREAKING CHANGE
+
+- a function that applies a field of `Hook[E]` must now
+declare `E` in its row. `fn go(h: Hook[Stdout]) : Unit = h.run(1)`
+compiled before because the field looked pure; it now reports
+`effect not handled: Stdout`, as the sum-typed equivalent does.
+- an op clause's value is checked against the handle's
+type, so a clause that abandons with a value of another type no longer
+compiles; and the return clause no longer runs on a value a clause
+abandons with.
+- an imported module whose pub fn bounds a type parameter
+by a protocol it does not export now fails to compile; mark the protocol
+`pub`.
+
+### Fixed
+
+- **native**: keep a call that can unwind from reading a landing pad at its site (#2583)
+- **typer**: a record's function-typed field binds the record's row-kind parameter (#2579)
+- **typer**: an op clause yields the handle's type and an abandon bypasses return (#2577)
+- **perceus**: pay the last KIR linearity violations (#2566)
+- **cli**: decide file vs package by what a path is on disk (#2572)
+- **holes**: split hole candidates by the effect row available at the hole (#2569)
+- **lint**: count check, test and bench bodies as dead_code_unused_priv uses (#2568)
+- **compiler**: fuse a mutual tail-call group whatever forms its bodies hold (#2565)
+- **compiler**: reject a private protocol in an imported module's pub fn bound (#2556)
+- **compiler**: an effect spelled like a core type names the effect (#2562)
+- **perceus**: release a handle's return binder (#2561)
+
+### Changed
+
+- **compiler**: derive the core builtins from one table (#2580)
+- **native**: drop unreached runtime bodies before the O2 pipeline (#2582)
+- **native**: resolve a direct call's callee through a symbol index, not a list scan (#2581)
+- **compiler**: a cell perform carries the core State/Reader id (#2573)
+- **compiler**: a specialised callee is always its spec's identity (#2567)
+- **compiler**: a var read only through an interpolation stays a stack slot (#2560)
+- **perceus**: stop re-walking a call's arguments per call level (#2559)
+
 ## v0.134.0 (2026-10-07)
 
 ### BREAKING CHANGE
