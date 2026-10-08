@@ -1,0 +1,188 @@
+#[doc("""
+Spells every effect instance in its final form after monomorphisation, and
+finds the generics whose `handle` takes a type parameter as its instance.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.expr_exists
+import compiler.effect_instance
+
+#[doc("""
+Spell every instance in its final form. A `handle`'s type arguments name its
+instance: an `(init)` handler of a parametric effect gets them from the init's
+type, and one whose arguments name a type parameter of its function is left
+unpinned. An op the typer left unpinned (a phantom one) takes the instance of a
+function row that carries exactly one of its effect, unless a lambda or a
+`handle` of that effect stands between them.
+""")]
+pub fn canon_handle_instances(decls: [Decl]) : [Decl] = {
+  let arities = effect_arities(decls)
+  map(decls, (d) => canon_decl(d, arities))
+}
+
+type RowPin = RP(String, [TypeExpr])
+
+type CanonCx = { tps: [String], arities: [EffArity], pins: [RowPin] }
+
+fn canon_decl(d: Decl, arities: [EffArity]) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, mo, fsym) -> if not xp_exists(body, false, may_canon) { d } else {
+    let cx = CanonCx { tps: decl_tparams(d), arities: arities, pins: row_pins(row_labels_of(row), decl_tparams(d)) }
+    if xp_exists(body, false, (e) => needs_canon(e, cx)) { DFn(p, n, tps, ps, ret, row, canon_expr(body, cx), l, c, mo, fsym) }
+    else { d }
+  }
+  _ -> d
+}
+
+fn may_canon(e: Expr) : Bool = match e.kind {
+  EHandle(_, _, _, _, _, _, _, _) -> true
+  ECall(f, _) -> match f.ty {
+    Some(TyCon(_, _, args, _)) -> any(args, ty_unpinned)
+    _ -> false
+  }
+  _ -> false
+}
+
+# Conservative: a pinnable op under a lambda or a same-effect `handle` is
+# left as it is by `canon_expr`, at the cost of one rebuild.
+fn needs_canon(e: Expr, cx: CanonCx) : Bool = match e.kind {
+  EHandle(_, eff, _, args, init, _, _, _) -> handle_args(eff, args, init, cx) != args
+  ECall(f, _) -> match f.ty {
+    Some(TyCon(_, eff, args, _)) -> any(args, ty_unpinned) and any(cx.pins, (p) => match p { RP(n, _) -> n == eff })
+    _ -> false
+  }
+  _ -> false
+}
+
+fn canon_expr(e: Expr, cx: CanonCx) : Expr = {
+  let k1 = match e.kind {
+    # Clauses run outside their own `handle`, so only the body loses the pin.
+    EHandle(body, eff, hsym, args, init, alias, cls, ret) -> {
+      let outer = (sub) => canon_expr(sub, cx)
+      EHandle(canon_expr(body, CanonCx { ...cx, pins: filter(cx.pins, (p) => match p { RP(n, _) -> n != eff }) }),
+              eff, hsym, handle_args(eff, args, init, cx), prc_map_opt_expr(init, outer), alias,
+              map(cls, (c) => prc_map_clause_exprs(c, outer)), prc_map_opt_return_exprs(ret, outer))
+    }
+    ELambda(ps, body) -> ELambda(ps, canon_expr(body, CanonCx { ...cx, pins: [] }))
+    ECall(f, xs) -> ECall(pin_op(canon_expr(f, cx), cx.pins), map(xs, (x) => canon_expr(x, cx)))
+    k -> prc_map_expr_kind(k, (sub) => canon_expr(sub, cx))
+  }
+  Expr { kind: k1, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+}
+
+fn pin_op(f: Expr, pins: [RowPin]) : Expr = match f.ty {
+  Some(TyCon(m, eff, args, s)) ->
+    if any(args, ty_unpinned) { match filter(pins, (p) => match p { RP(n, _) -> n == eff }) {
+      [RP(_, tes)] -> Expr { kind: f.kind, line: f.line, col: f.col, ty: Some(TyCon(m, eff, map(tes, te_as_ty), s)), mode: f.mode }
+      _            -> f
+    } } else { f }
+  _ -> f
+}
+
+# The effects a row carries exactly once, at a pinned instance.
+fn row_pins(ls: [RowLabel], tps: [String]) : [RowPin] =
+  map(filter(ls, (l) => is_sole_pinned(ls, l, tps)), (l) => match l { RL(n, args, _) -> RP(n, args) })
+
+fn is_sole_pinned(ls: [RowLabel], l: RowLabel, tps: [String]) : Bool = match l {
+  RL(n, args, _) -> list_length(filter(ls, (o) => rl_name(o) == n)) == 1 and not any(args, (a) => is_unpinned(te_text(a, tps)))
+}
+
+fn row_labels_of(row: RowExpr) : [RowLabel] = match row {
+  REmpty       -> []
+  RClosed(ls)  -> ls
+  ROpen(_, ls) -> ls
+}
+
+fn handle_args(eff: String, args: [TypeExpr], init: Option[Expr], cx: CanonCx) : [TypeExpr] = match args {
+  [] -> match init {
+    Some(ie) -> if arity_of(cx.arities, eff) > 0 { init_args(ie) } else { [] }
+    None     -> []
+  }
+  _ -> if any(args, (a) => is_unpinned(te_text(a, cx.tps))) { [] } else { args }
+}
+
+fn init_args(ie: Expr) : [TypeExpr] = match ie.ty {
+  Some(t) -> if ty_unpinned(t) { [] } else { [ty_as_te(t)] }
+  None    -> []
+}
+
+# Only the shapes `ty_text` reads back: a pinned type has no other part.
+fn ty_as_te(t: Ty) : TypeExpr = mk_ty(match t {
+  TyListT(x)           -> TyList(ty_as_te(x))
+  TyFnT(ps, r, _)      -> TyFn(map(ps, ty_as_te), ty_as_te(r), REmpty)
+  TyCon(_, n, args, _) -> TyName(n, map(args, ty_as_te))
+  TyDimT(b, _)         -> ty_as_te(b).tkind
+  TyRefineT(b, _)      -> ty_as_te(b).tkind
+  _                    -> TyName(prim_text(t), [])
+}, 0, 0)
+
+# The inverse of `ty_as_te` over the pinned shapes a row label spells.
+fn te_as_ty(te: TypeExpr) : Ty = match te.tkind {
+  TyName(n, args) -> match args {
+    [] -> prim_ty(n)
+    _  -> TyCon(None, n, map(args, te_as_ty), sym_none())
+  }
+  TyList(inner)  -> TyListT(te_as_ty(inner))
+  TyFn(ps, r, _) -> TyFnT(map(ps, te_as_ty), te_as_ty(r), Row { labels: [], tail: None, display_alias: None })
+  TyDim(b, _)    -> te_as_ty(b)
+  TyRefine(b, _) -> te_as_ty(b)
+  _              -> TyAny
+}
+
+fn prim_ty(n: String) : Ty = match n {
+  "Int"    -> TyInt
+  "Real"   -> TyReal
+  "Bool"   -> TyBool
+  "String" -> TyString
+  "Char"   -> TyChar
+  "Unit"   -> TyUnit
+  "Byte"   -> TyByte
+  "Int32"  -> TyInt32
+  "UInt32" -> TyUInt32
+  "UInt64" -> TyUInt64
+  "Int128" -> TyInt128
+  "Handle" -> TyHandle
+  _        -> TyCon(None, n, [], sym_none())
+}
+
+#[doc("The type parameters of `d` that a `handle` in its body takes as instance arguments.")]
+pub fn handle_instance_tparams(d: Decl) : [String] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _, _) ->
+    if not xp_exists(body, false, has_handle_args) { [] }
+    else { filter(decl_tparams(d), (tp) => xp_exists(body, false, (e) => handle_names(e, tp))) }
+  _ -> []
+}
+
+fn has_handle_args(e: Expr) : Bool = match e.kind {
+  EHandle(_, _, _, args, _, _, _, _) -> args != []
+  _ -> false
+}
+
+fn handle_names(e: Expr, tp: String) : Bool = match e.kind {
+  EHandle(_, _, _, args, _, _, _, _) -> any(args, (a) => te_mentions(a, tp))
+  _ -> false
+}
+
+fn te_mentions(te: TypeExpr, tp: String) : Bool = match te.tkind {
+  TyName(n, args) -> n == tp or any(args, (a) => te_mentions(a, tp))
+  TyList(inner)   -> te_mentions(inner, tp)
+  TyFn(ps, r, _)  -> any(ps, (a) => te_mentions(a, tp)) or te_mentions(r, tp)
+  TyDim(b, _)     -> te_mentions(b, tp)
+  TyRefine(b, _)  -> te_mentions(b, tp)
+  _               -> false
+}
+
+type EffArity = EA(String, Int)
+
+fn effect_arities(decls: [Decl]) : [EffArity] = match decls {
+  []           -> []
+  [d, ...rest] -> match d {
+    DEffect(_, n, tps, _, _, _, _, _, _) -> [EA(n, list_length(tps)), ...effect_arities(rest)]
+    _ -> effect_arities(rest)
+  }
+}
+
+fn arity_of(arities: [EffArity], eff: String) : Int = match arities {
+  []                 -> 0
+  [EA(n, k), ...rest] -> if n == eff { k } else { arity_of(rest, eff) }
+}

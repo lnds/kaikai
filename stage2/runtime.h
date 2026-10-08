@@ -19517,6 +19517,17 @@ static void kai_check_cancel_yield_point(void) {
     /* Unreachable. */
 }
 
+/* An evidence label names an effect instance: `Eff` or `Eff[args]`. Two
+ * pinned instances match only when equal; a bare `Eff` (an instance the
+ * compiler could not pin) matches every instance of `Eff`. */
+static int kai_eff_label_match(const char *a, const char *b) {
+    if (*a != *b) return 0;
+    if (strcmp(a, b) == 0) return 1;
+    /* Libc only: the native backend links this runtime unoptimised. */
+    size_t n = strcspn(a, "[");
+    return strncmp(a, b, n) == 0 && (a[n] == '\0' ? b[n] == '[' : b[n] == '\0');
+}
+
 static void *kai_evidence_lookup(const char *eff_label) {
     kai_check_cancel_yield_point();
     /* Issue #103 — Cancel-on-linked-trap-exit'd-peer must bypass
@@ -19527,8 +19538,7 @@ static void *kai_evidence_lookup(const char *eff_label) {
     KaiFiber *f = kai_current_fiber();
     KaiEvidence *node = f->evidence_top;
     while (node != NULL) {
-        if (node->eff_label == eff_label
-            || strcmp(node->eff_label, eff_label) == 0) {
+        if (node->eff_label == eff_label || kai_eff_label_match(node->eff_label, eff_label)) {
             return node->handler;
         }
         node = node->parent;
@@ -19553,8 +19563,7 @@ static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
          * dispatched on *this* fiber, so a recursive op resolves to the
          * outer handler. Per-fiber state, not a flag on the node. */
         if (node != f->in_dispatch_node
-            && (node->eff_label == eff_label
-                || strcmp(node->eff_label, eff_label) == 0)) {
+            && (node->eff_label == eff_label || kai_eff_label_match(node->eff_label, eff_label))) {
             return node;
         }
         node = node->parent;
@@ -19843,6 +19852,8 @@ static int64_t kai_native_ctx_frame_slot_index(void *cv, KaiValue *symv, KaiValu
         if (strcmp(c->frames[i].sym, sym) == 0) {
             for (int j = 0; j < c->frames[i].nslots; j++)
                 if (strcmp(c->frames[i].slots[j], eff) == 0) { r = (int64_t) j; break; }
+            for (int j = 0; r < 0 && j < c->frames[i].nslots; j++)
+                if (kai_eff_label_match(c->frames[i].slots[j], eff)) r = (int64_t) j;
             break;
         }
     if (symv) kai_decref(symv);

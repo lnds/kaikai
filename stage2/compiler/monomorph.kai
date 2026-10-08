@@ -82,6 +82,7 @@ import compiler.inst_index
 import compiler.protos
 import compiler.proto_resolve
 import compiler.symtab_build
+import compiler.effect_instance_canon
 
 # ==================================================================
 # Leak-report value types (pub: main's `report_mono_leaks` reads them).
@@ -1316,14 +1317,19 @@ type PolyFn = PFn(String, Decl)
 # "which modules define this name" needs the target module to tell the root
 # file's decls from a foreign module's — so they travel together rather than
 # threading `target_mod` through ~115 call sites that never read it.
-type PolyIx = PIx([PolyFn], String)
+type PolyIx = PIx([PolyFn], String, [PolyFn])
 
-fn poly_ix_fns(px: PolyIx) : [PolyFn] = match px { PIx(fns, _) -> fns }
+fn poly_ix_fns(px: PolyIx) : [PolyFn] = match px { PIx(fns, _, _) -> fns }
 
-fn poly_ix_target(px: PolyIx) : String = match px { PIx(_, t) -> t }
+fn poly_ix_target(px: PolyIx) : String = match px { PIx(_, t, _) -> t }
 
-fn collect_poly_fns(ds: [Decl], target_mod: String) : PolyIx =
-  PIx(collect_poly_fns_loop(ds), target_mod)
+# The poly fns whose `handle` takes a type parameter as its instance.
+fn poly_ix_inst(px: PolyIx) : [PolyFn] = match px { PIx(_, _, ifs) -> ifs }
+
+fn collect_poly_fns(ds: [Decl], target_mod: String) : PolyIx = {
+  let fns = collect_poly_fns_loop(ds)
+  PIx(fns, target_mod, filter(fns, (p) => match p { PFn(_, d) -> handle_instance_tparams(d) != [] }))
+}
 
 fn collect_poly_fns_loop(ds: [Decl]) : [PolyFn] {
   match ds {
@@ -1707,10 +1713,11 @@ fn collect_distinct_loop(insts: [ResolvedCS], polys: PolyIx,
   match insts {
     [] -> list_reverse(acc)
     [cs, ...rest] -> match cs {
-      RCS(name, _, _, tys, units, _) -> {
+      RCS(name, _, _, tys0, units, _) -> {
         let is_poly = match lookup_poly_fn(polys, name) {
           Some(_) -> true None -> false
         }
+        let tys = inst_spec_tys(polys, name, tys0)
         let any_slot = list_length(tys) > 0 or list_length(units) > 0
         let concrete = any_slot and tuple_concrete(tys) and units_concrete(units)
         # The typer's RCS carries the *caller*'s module, not the callee's,
@@ -2636,7 +2643,15 @@ fn mono_insts_collide_rest(t0: [Ty], u0: [UnitExprT], rest: [MonoInstPair]) : Bo
 # so each site retargets its own spec.
 fn resolve_call_inst(insts: InstIndex, polys: PolyIx, name: String,
                       callee: Expr, args_: [Expr], ret_ty: Option[Ty],
-                      sm: SubstMap) : Option[MonoInstPair] {
+                      sm: SubstMap) : Option[MonoInstPair] =
+  match resolve_call_inst_raw(insts, polys, name, callee, args_, ret_ty, sm) {
+    Some(MIPair(tys, units)) -> Some(MIPair(inst_spec_tys(polys, name, tys), units))
+    None                     -> None
+  }
+
+fn resolve_call_inst_raw(insts: InstIndex, polys: PolyIx, name: String,
+                         callee: Expr, args_: [Expr], ret_ty: Option[Ty],
+                         sm: SubstMap) : Option[MonoInstPair] {
   let at_pos = find_mono_insts_at(insts, name, callee.line, callee.col)
   if mono_insts_collide(at_pos) {
     match synth_inst_pair(polys, name, callee, args_, ret_ty, sm) {
@@ -2790,15 +2805,30 @@ type SigSubst = SS(String, TypeExpr)
 # Pair the decl's type-kind tparams (unit-kind dropped, matching the
 # `tys` alignment) with their concrete TypeExprs. Declared ++ implicit
 # tparams, same ordering build_subst_map uses.
-fn build_sig_subst(d: Decl, tys: [Ty]) : [SigSubst] {
-  match d {
-    DFn(_, _, tparams, _, _, _, _, _, _, _, fsym) -> {
-      let implicit = collect_implicit_tparams_in_decl(d, tparams)
-      let effective = list_append(tparams, implicit)
-      let type_names = filter(effective, (n) => not tp_name_is_unit(n))
-      zip_sig_subst(type_names, tys)
-    }
-    _ -> []
+fn build_sig_subst(d: Decl, tys: [Ty]) : [SigSubst] = zip_sig_subst(sig_type_names(d), tys)
+
+fn sig_type_names(d: Decl) : [String] = match d {
+  DFn(_, _, tparams, _, _, _, _, _, _, _, _) ->
+    filter(list_append(tparams, collect_implicit_tparams_in_decl(d, tparams)), (n) => not tp_name_is_unit(n))
+  _ -> []
+}
+
+# A generic whose `handle` takes a type parameter as its instance is
+# specialised per instance even when another slot stays free: the handler's
+# evidence label is that instance. The free slots that are not instances
+# erase to `Any`.
+fn inst_spec_tys(polys: PolyIx, name: String, tys: [Ty]) : [Ty] =
+  if tuple_concrete(tys) { tys }
+  else { match filter(poly_ix_inst(polys), (p) => match p { PFn(n, _) -> n == name }) {
+    [PFn(_, d)] -> erase_free_slots(sig_type_names(d), tys, handle_instance_tparams(d))
+    _           -> tys
+  } }
+
+fn erase_free_slots(names: [String], tys: [Ty], inst: [String]) : [Ty] = match tys {
+  []           -> []
+  [t, ...rest] -> match names {
+    []            -> tys
+    [n, ...nrest] -> [if list_has(inst, n) or ty_concrete(t) { t } else { TyAny }, ...erase_free_slots(nrest, rest, inst)]
   }
 }
 
@@ -2864,10 +2894,35 @@ fn specialise_decl(d: Decl, tys: [Ty], units: [UnitExprT], inst: Int) : Decl {
         None -> None
         Some(te) -> Some(apply_sig_subst_te(te, subst))
       }
-      DFn(is_pub, mangled, [], params1, opt_ret1, row, body, ln, cl, mo, FnId(fnid_sym(fsym), inst))
+      let body1 = if handle_instance_tparams(d) == [] { body } else { subst_handle_sig(body, subst) }
+      DFn(is_pub, mangled, [], params1, opt_ret1, subst_row_sig(row, subst), body1,
+          ln, cl, mo, FnId(fnid_sym(fsym), inst))
     }
     _ -> d
   }
+}
+
+# A spec's row labels and `handle` type arguments name its instances, which
+# evidence selection keys on, so they read concrete too.
+fn subst_row_sig(r: RowExpr, subst: [SigSubst]) : RowExpr = match r {
+  REmpty       -> REmpty
+  RClosed([])  -> r
+  RClosed(ls)  -> RClosed(map(ls, (l) => subst_label_sig(l, subst)))
+  ROpen(t, ls) -> ROpen(t, map(ls, (l) => subst_label_sig(l, subst)))
+}
+
+fn subst_label_sig(l: RowLabel, subst: [SigSubst]) : RowLabel = match l {
+  RL(n, ts, s) -> RL(n, map(ts, (t) => apply_sig_subst_te(t, subst)), s)
+}
+
+fn subst_handle_sig(e: Expr, subst: [SigSubst]) : Expr = {
+  let k = mono_map_expr_kind(e.kind, (sub) => subst_handle_sig(sub, subst))
+  let k1 = match k {
+    EHandle(body, eff, hsym, tas, init, alias, cls, ret) ->
+      EHandle(body, eff, hsym, map(tas, (t) => apply_sig_subst_te(t, subst)), init, alias, cls, ret)
+    _ -> k
+  }
+  Expr { kind: k1, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
 }
 
 # ---- m4c Phase 2 — call-site rewrite ----

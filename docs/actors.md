@@ -95,7 +95,9 @@ what `self` names and `receive` returns. One `Actor[Msg]`
 instance corresponds to one mailbox for one message type. Two
 mailboxes with different message types are two different
 effects (`Actor[Request]` vs `Actor[Event]`); sending to either
-needs only its pid. A single actor that needs to mix message
+needs only its pid. With both in one row, a `receive` reads the
+mailbox of the instance it is typed at, whichever is installed
+innermost; a `receive` both could serve is rejected as ambiguous. A single actor that needs to mix message
 shapes in its own mailbox uses one sum type:
 
 ```kai

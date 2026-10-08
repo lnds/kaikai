@@ -580,7 +580,10 @@ worth noting so the syntax is not mystery:
 - `handle { body } with Eff { ... }` compiles `body` so each
   `Eff.op` call becomes a suspension point, and installs the
   handler record as the effect's evidence node.
-- `Eff.op(args)` resolves the handler by the effect's **class**
+- `Eff.op(args)` resolves the handler of the **instance** the typer
+  resolved it to (`Eff[args]`; two instances of one effect in a row are
+  two evidence keys, and an op both could take is rejected as ambiguous),
+  by the effect's **class**
   (`docs/dispatch-honesty-targets.md`): a user / value-transportable
   effect reads the evidence the caller supplied (a frame slot it
   filled, or the capability value of a named instance) — no walk,
