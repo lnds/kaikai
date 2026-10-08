@@ -1130,10 +1130,9 @@ fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState, tab: SymTab,
   let out = rds_decls(walked)
   let eff_names = collect_effect_names(decls)
   let arities = collect_effect_arities(decls)
-  let row_errs = check_row_labels(decls, df, eff_names, arities)
-  let tyvar_errs = check_unbound_tyvars(decls, df)
-  Resolution { errs: if e3.had_error or row_errs > 0 or tyvar_errs > 0 { 1 } else { 0 },
-               decls: out, tab: tab, diags: finalize_diags(e3.diags), params: e3.params }
+  let checks = list_append(check_row_labels(decls, df, eff_names, arities), check_unbound_tyvars(decls, df))
+  Resolution { errs: if e3.had_error or checks != [] { 1 } else { 0 },
+               decls: out, tab: tab, diags: list_append(finalize_diags(e3.diags), checks), params: e3.params }
 }
 
 #[doc("What a resolver run produced: the error count `check_program` reports, the declarations with every resolved name stamped, the table those ids index, and the diagnostics the walk collected. A consumer holding a stamped id resolves it here rather than deciding the name again.")]
@@ -1237,34 +1236,34 @@ fn effect_op_names(ops: [EffectOp]) : [String] {
 }
 
 fn check_row_labels(decls: [Decl], df: DiagFiles, eff_names: [String],
-                     arities: [EffArity]) : Int / Console + File {
+                     arities: [EffArity]) : [Diagnostic] / Console + File {
 
 
   match decls {
-    [] -> 0
+    [] -> []
     [d, ...rest] ->
-      check_decl_row_labels(d, decl_diag_file(d, df), eff_names, arities) +
-      check_row_labels(rest, df, eff_names, arities)
+      list_append(check_decl_row_labels(d, decl_diag_file(d, df), eff_names, arities),
+                  check_row_labels(rest, df, eff_names, arities))
   }
 }
 
 fn check_decl_row_labels(d: Decl, file: String, eff_names: [String],
-                          arities: [EffArity]) : Int / Console + File {
+                          arities: [EffArity]) : [Diagnostic] / Console + File {
 
 
   match d {
     DFn(_, _, _, _, _, rexpr, _, line, col, _, _) ->
       check_row_expr(rexpr, file, line, col, eff_names, arities)
-    _ -> 0
+    _ -> []
   }
 }
 
 fn check_row_expr(re: RowExpr, file: String, line: Int, col: Int,
-                   eff_names: [String], arities: [EffArity]) : Int / Console + File {
+                   eff_names: [String], arities: [EffArity]) : [Diagnostic] / Console + File {
 
 
   match re {
-    REmpty -> 0
+    REmpty -> []
     RClosed(labels) -> check_row_labels_loop(labels, file, line, col, eff_names, arities)
     # row variables in tail position carry the same labels;
     # apply the same name + arity check.
@@ -1275,44 +1274,39 @@ fn check_row_expr(re: RowExpr, file: String, line: Int, col: Int,
 # Per-label name + arity check. Unknown effect → "unknown effect: X".
 # Arity mismatch → "effect 'X' expects N type argument(s), got M".
 fn check_row_labels_loop(labels: [RowLabel], file: String, line: Int, col: Int,
-                          eff_names: [String], arities: [EffArity]) : Int / Console + File {
+                          eff_names: [String], arities: [EffArity]) : [Diagnostic] / Console + File {
 
 
   match labels {
-    [] -> 0
+    [] -> []
     [l, ...rest] -> match l {
       RL(name, ts, _) -> {
         let got = list_length(ts)
         let here =
           if not list_has(eff_names, name) {
-            let _ = diag_error(file, line, col,
-              string_concat("unknown effect: ", name))
-            let _ = diag_note("only declared `effect Foo { ... }` names and the catalog (Console, Stdin, Env, File, State, Reader, Writer, Mutable, Ffi) are valid in a row")
-            let _ = diag_help("declare `effect #{name} { ... }` first, or fix the spelling")
-            1
+            rs_report(mk_diag(SevError, file, line, col, "unknown effect: #{name}",
+              [ri_note(file, line, col, "only declared `effect Foo { ... }` names and the catalog (Console, Stdin, Env, File, State, Reader, Writer, Mutable, Ffi) are valid in a row"),
+               ri_help(file, line, col, "declare `effect #{name} { ... }` first, or fix the spelling")]))
           } else {
             match lookup_arity(arities, name) {
-              None -> 0     # declared without arity — should not happen given collect_effect_arities covers all
+              None -> []     # declared without arity — should not happen given collect_effect_arities covers all
               Some(want) ->
-                if want == got { 0 }
+                if want == got { [] }
                 else {
-                  let _ = diag_error(file, line, col,
-                    concat_all(["effect '", name, "' expects ",
-                                int_to_string(want),
-                                " type argument(s), got ",
-                                int_to_string(got)]))
-                  let _ = diag_note("the parametric label must match the effect's `[...]` declaration")
-                  let _ = diag_help(
-                    if got > want {
+                  let help = if got > want {
                       concat_all(["drop ", int_to_string(got - want), " type argument(s) from `", name, "[...]`"])
                     } else {
                       concat_all(["add ", int_to_string(want - got), " more type argument(s) to `", name, "[...]`"])
-                    })
-                  1
+                    }
+                  rs_report(mk_diag(SevError, file, line, col,
+                    concat_all(["effect '", name, "' expects ", int_to_string(want),
+                                " type argument(s), got ", int_to_string(got)]),
+                    [ri_note(file, line, col, "the parametric label must match the effect's `[...]` declaration"),
+                     ri_help(file, line, col, help)]))
                 }
             }
           }
-        here + check_row_labels_loop(rest, file, line, col, eff_names, arities)
+        list_append(here, check_row_labels_loop(rest, file, line, col, eff_names, arities))
       }
     }
   }
@@ -1413,11 +1407,11 @@ fn collect_tyvars_in_row(re: RowExpr, acc: [String]) : [String] {
   }
 }
 
-fn check_unbound_tyvars(decls: [Decl], df: DiagFiles) : Int / Console + File {
+fn check_unbound_tyvars(decls: [Decl], df: DiagFiles) : [Diagnostic] / Console + File {
   match decls {
-    [] -> 0
+    [] -> []
     [d, ...rest] ->
-      check_decl_unbound_tyvars(d, decl_diag_file(d, df)) + check_unbound_tyvars(rest, df)
+      list_append(check_decl_unbound_tyvars(d, decl_diag_file(d, df)), check_unbound_tyvars(rest, df))
   }
 }
 
@@ -1432,7 +1426,7 @@ fn is_compiler_synth_name(n: String) : Bool {
   } }
 }
 
-fn check_decl_unbound_tyvars(d: Decl, file: String) : Int / Console + File {
+fn check_decl_unbound_tyvars(d: Decl, file: String) : [Diagnostic] / Console + File {
   match d {
     DFn(_, fname, declared, params, opt_ret, rexpr, _, line, col, _, _) -> {
       # Synthetic compiler-generated fns (`__proto_*`, `__deriv_*`,
@@ -1440,7 +1434,7 @@ fn check_decl_unbound_tyvars(d: Decl, file: String) : Int / Console + File {
       # return-only position by construction (protocol `Self` lives
       # only on the right of `:`). Skip them; their soundness is the
       # desugar pass's responsibility.
-      if is_compiler_synth_name(fname) { 0 } else {
+      if is_compiler_synth_name(fname) { [] } else {
         let in_params = collect_tyvars_in_params(params, [])
         # Constructor-style fns with no value-level params (e.g.
         # `pub fn empty() : Map[k, v] = ...`) are caller-elects:
@@ -1448,56 +1442,53 @@ fn check_decl_unbound_tyvars(d: Decl, file: String) : Int / Console + File {
         # picks them at the use site. Only fns that already bind
         # *some* tyvar via a param can suffer the silent-shadow
         # shape.
-        if list_length(in_params) == 0 { 0 } else {
+        if list_length(in_params) == 0 { [] } else {
           let in_ret = match opt_ret {
             Some(rty) -> collect_tyvars_in_typeexpr(rty, [])
             None      -> []
           }
           let in_row = collect_tyvars_in_row(rexpr, [])
-          let ret_errs = report_unbound_tyvars_in_set(in_ret, declared, in_params, fname, file, line, col, 0)
-          let row_errs = report_unbound_tyvars_in_set(in_row, declared, in_params, fname, file, line, col, 0)
-          ret_errs + row_errs
+          let ret_errs = report_unbound_tyvars_in_set(in_ret, declared, in_params, fname, file, line, col, [])
+          let row_errs = report_unbound_tyvars_in_set(in_row, declared, in_params, fname, file, line, col, [])
+          list_append(ret_errs, row_errs)
         }
       }
     }
     DAxiom(_, _, fname, _, declared, params, ret, rexpr, line, col) -> {
-      if is_compiler_synth_name(fname) { 0 } else {
+      if is_compiler_synth_name(fname) { [] } else {
         let in_params = collect_tyvars_in_params(params, [])
-        if list_length(in_params) == 0 { 0 } else {
+        if list_length(in_params) == 0 { [] } else {
           let in_ret = collect_tyvars_in_typeexpr(ret, [])
           let in_row = collect_tyvars_in_row(rexpr, [])
-          let ret_errs = report_unbound_tyvars_in_set(in_ret, declared, in_params, fname, file, line, col, 0)
-          let row_errs = report_unbound_tyvars_in_set(in_row, declared, in_params, fname, file, line, col, 0)
-          ret_errs + row_errs
+          let ret_errs = report_unbound_tyvars_in_set(in_ret, declared, in_params, fname, file, line, col, [])
+          let row_errs = report_unbound_tyvars_in_set(in_row, declared, in_params, fname, file, line, col, [])
+          list_append(ret_errs, row_errs)
         }
       }
     }
-    _ -> 0
+    _ -> []
   }
 }
 
 fn report_unbound_tyvars_in_set(found: [String], declared: [String], in_params: [String],
                                  fname: String, file: String, line: Int, col: Int,
-                                 acc: Int) : Int / Console + File {
+                                 acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match found {
     [] -> acc
     [n, ...rest] -> {
       let bound = list_has(declared, n) or list_has(in_params, n)
-      let here = if bound { 0 } else {
-        let _ = diag_error(file, line, col,
-          string_concat_all(["unbound type variable: `", n, "`"]))
-        let _ = diag_note(string_concat_all([
-          "type variable `", n,
-          "` appears in the return type or effect row of `fn ",
-          fname, "` but not in any parameter"
-        ]))
-        let _ = diag_help(string_concat_all([
-          "introduce it as an explicit tparam (e.g. `fn ",
-          fname, "[", n, "](...) : ...`)"
-        ]))
-        1
+      let here = if bound { [] } else {
+        rs_report(mk_diag(SevError, file, line, col, "unbound type variable: `#{n}`",
+          [ri_note(file, line, col, "type variable `#{n}` appears in the return type or effect row of `fn #{fname}` but not in any parameter"),
+           ri_help(file, line, col, "introduce it as an explicit tparam (e.g. `fn #{fname}[#{n}](...) : ...`)")]))
       }
-      report_unbound_tyvars_in_set(rest, declared, in_params, fname, file, line, col, acc + here)
+      report_unbound_tyvars_in_set(rest, declared, in_params, fname, file, line, col, list_append(acc, here))
     }
   }
+}
+
+# Render a resolver-check diagnostic and return it as the check's verdict.
+fn rs_report(d: Diagnostic) : [Diagnostic] / Console + File = {
+  render_diag(d)
+  [d]
 }
