@@ -231,17 +231,18 @@ fi
   "$RUNTIME_C" -o "$BC_INLINE"
 
 # Soundness gate for the split: the hot bitcode must contain NO function that
-# reaches swapcontext. If clang compiled a suspend-point op into it, that op
-# would be miscompiled under work-stealing. A defined-or-referenced swapcontext
-# in the bitcode means a KAI_HOT_ONLY gate is missing — fail the build loudly
+# reaches swapcontext or the stack-segment switch. If clang compiled a
+# suspend-point op into it, that op would be miscompiled under work-stealing.
+# Either symbol defined or referenced in the bitcode means a KAI_HOT_ONLY gate
+# is missing — fail the build loudly
 # rather than ship an unsound runtime.
 if command -v llvm-nm >/dev/null 2>&1; then LLVM_NM=llvm-nm
 elif command -v llvm-nm-18 >/dev/null 2>&1; then LLVM_NM=llvm-nm-18
 else LLVM_NM=""; fi
 if [ -n "$LLVM_NM" ]; then
   for bc in "$BC_OUT" "$BC_INLINE"; do
-    if "$LLVM_NM" "$bc" 2>/dev/null | grep -q swapcontext; then
-      echo "gen-runtime-bc: FATAL — $bc references swapcontext; a KAI_HOT_ONLY gate is missing in runtime_llvm.c." >&2
+    if "$LLVM_NM" "$bc" 2>/dev/null | grep -qE 'swapcontext|kai_seg_switch'; then
+      echo "gen-runtime-bc: FATAL — $bc references a context switch; a KAI_HOT_ONLY gate is missing in runtime_llvm.c." >&2
       rm -f "$BC_OUT" "$BC_INLINE" "$STAMP"
       exit 3
     fi

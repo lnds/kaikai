@@ -382,6 +382,16 @@ talking to — only which label the lookup is parameterised by.
 ## Op calls and clauses
 <!-- coverage: skip --> design spec, internal lowering rule
 
+> **v1 status (2026-10-07):** no op call reifies a continuation. A
+> perform is a direct call to the clause on the performing stack, a
+> tail `resume` is a return, an abandon is a `longjmp` to the handle,
+> and a non-tail `resume` defers the rest of its clause to the
+> handle's exit. Stack segments — the runtime layer for real one-shot
+> continuations: an mmap'd stack per suspended computation, switched
+> by a register-saving primitive in `stage2/runtime.h` — are landing;
+> no compiled program runs on one until the compiler classifies which
+> handles need a captured continuation.
+
 No pass rewrites effectful functions into continuation-passing
 style, and no continuation is reified. An effectful function
 compiles in direct style exactly like a pure one; what an effect
@@ -417,6 +427,13 @@ price is one closure per perform of a clause that resumes in
 non-tail position.
 
 ## `resume` representation
+
+> **v1 status (2026-10-07):** every `resume` is the stack-allocated
+> `KaiCont` of §*One-shot case*: a status and an identity function,
+> never a captured stack. The segment-backed continuation — a
+> reference-counted object owning a suspended stack segment, one-shot
+> by its status, discontinued when its last reference drops — is
+> landing in the runtime and is not yet produced by the compiler.
 
 `resume` is a value of type `(T) -> S / ρ`. Doc A §*`resume`:
 one-shot, explicit* pinned its surface semantics; this section

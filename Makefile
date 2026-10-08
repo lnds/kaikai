@@ -1287,6 +1287,7 @@ test-editions: kaic2
 TIER1_ASAN_JOBS ?= 4
 TIER1_ASAN_LEGS_A := \
 	test-mn-sigaltstack-asan \
+	test-segment-switch-asan \
 	test-namespace-collisions-asan \
 	test-trace-asan \
 	test-runtime-shadow-asan \
