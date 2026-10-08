@@ -70,6 +70,7 @@ import compiler.core_cache
 import compiler.loop_lower
 import compiler.desugar
 import compiler.bang_hoist
+import compiler.guard_iface
 import compiler.deep_hoist
 import compiler.range_patterns
 import compiler.nest_limit
@@ -1662,6 +1663,7 @@ pub type Mode
   # per line, without loading the core or parsing; `kai` keys its memo of
   # a check on these.
   | MGuardInputs
+  | MGuardInterfaces
   # The same listing for the core modules alone, shared by every compile.
   | MGuardCoreInputs
   # Run the in-memory typed-codec + interface-hash gates
@@ -2083,6 +2085,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MBatchList))
       } else if a == "--guard-inputs" {
         parse_cli_loop(more, cli_with_mode(opts, MGuardInputs))
+      } else if a == "--guard-interfaces" {
+        parse_cli_loop(more, cli_with_mode(opts, MGuardInterfaces))
       } else if a == "--guard-core-inputs" {
         parse_cli_loop(more, cli_with_mode(opts, MGuardCoreInputs))
       } else if a == "--test" {
@@ -2205,6 +2209,7 @@ fn usage() : Unit / Console {
   eprint("  --infer            run HM inference over each fn body and dump the inferred type")
   eprint("  --check            typecheck only: full front-end, no codegen; report diagnostics and exit")
   eprint("  --guard-inputs     print the sources the import closure of the root and its --test-roots reads besides the root, then exit")
+  eprint("  --guard-interfaces as --guard-inputs, each module that parses followed by a tab and the digest of its interface")
   eprint("  --guard-core-inputs  print the core modules and their import closure, then exit")
   eprint("  --dump-typed       run HM inference and dump the typed AST with per-node Ty")
   eprint("  --dump-tycon-ids   print the declaration each nominal type in the root file's bodies denotes")
@@ -5992,6 +5997,38 @@ fn batch_compile_loop(entries: [BatchEntry], pds: [Decl], pmods: [ModuleEntry],
   }
 }
 
+# The sources the import closure of the root reads besides the root, one
+# per line; with `interfaces`, each followed by its interface digest.
+fn guard_listing(opts: CliOptions, interfaces: Bool) : Int / Console + File =
+  match opts.path {
+    None -> { usage(); 2 }
+    Some(p) -> match read_file(p) {
+      Ok(src) -> {
+        let memo = if opts.core_cache.proj_dir == "" { "" } else { cat2(opts.core_cache.proj_dir, "/imports") }
+        let _m = if memo == "" { () } else {
+          let _p = match dir_create_dir(opts.core_cache.proj_dir) { _ -> () }
+          match dir_create_dir(memo) { _ -> () }
+        }
+        let srcs = uc_input_files(p, src, opts.test_roots, opts.search_paths, memo)
+        print_lines(if interfaces { map(srcs, (x) => with_interface(memo, x)) } else { srcs })
+        0
+      }
+      Err(msg) -> { eprint("kaic2: #{p}: #{msg}"); 1 }
+    }
+  }
+
+# A listed source with the digest of its interface after a tab; a missing
+# source, or one that does not parse, as it was listed.
+fn with_interface(memo: String, line: String) : String / Console + File =
+  if string_starts_with_q(line, "-") { line }
+  else { match read_file(line) {
+    Ok(src) -> match gi_interface_memo(memo, line, src) {
+      Some(h) -> concat_all([line, "\t", h])
+      None    -> line
+    }
+    Err(_) -> line
+  } }
+
 #[doc("Run the compiler for the given CliOptions: load cores, dispatch the mode (build/test/check/fmt/library/dump), and return the process exit code. Driver entry point called by fn main().")]
 fn print_lines(xs: [String]) : Unit / Console = if xs != [] { print(string_join(xs, "\n")) }
 
@@ -6051,21 +6088,8 @@ pub fn run(opts: CliOptions) : Int / Console + File {
       }
       Some(p) -> emit_core_cache_for(p, opts.cache_sha)
     }
-    MGuardInputs -> match opts.path {
-      None -> { usage(); 2 }
-      Some(p) -> match read_file(p) {
-        Ok(src) -> {
-          let memo = if opts.core_cache.proj_dir == "" { "" } else { cat2(opts.core_cache.proj_dir, "/imports") }
-          let _m = if memo == "" { () } else {
-            let _p = match dir_create_dir(opts.core_cache.proj_dir) { _ -> () }
-            match dir_create_dir(memo) { _ -> () }
-          }
-          print_lines(uc_input_files(p, src, opts.test_roots, opts.search_paths, memo))
-          0
-        }
-        Err(msg) -> { eprint("kaic2: #{p}: #{msg}"); 1 }
-      }
-    }
+    MGuardInputs -> guard_listing(opts, false)
+    MGuardInterfaces -> guard_listing(opts, true)
     MGuardCoreInputs -> {
       print_lines(uc_core_input_files(core_module_paths(), opts.search_paths))
       0

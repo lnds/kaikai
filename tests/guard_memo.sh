@@ -31,7 +31,7 @@ log="$work/checks.log"
 cat > "$lay/stage2/kaic2" <<EOF
 #!/bin/sh
 case " \$* " in
-  *" --guard-inputs "*) ;;
+  *" --guard-inputs "*|*" --guard-interfaces "*) ;;
   *" --check "*) echo check >> "$log" ;;
 esac
 exec "$ROOT/stage2/kaic2" "\$@"
