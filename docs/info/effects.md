@@ -364,7 +364,33 @@ fn main() : Unit / Stdout =
 - A handle cannot return a value holding a continuation that performs
   the effect the handle discharges. A continuation that leaves its
   handlers some other way stops the program if resumed or dropped there.
-- A stateful handle (`with Eff(init)`) cannot keep its continuation.
+
+A stateful handle (`with Eff(init)`) keeps its continuation too. It is
+then a `Cont[(T, H), S, e]`, with `H` the state type, and `k(v, s)`
+resumes the body with `v` and the next state `s`, as `resume(v, s)`
+does. Inside the clause, `resume(v)` still means `resume(v, state)`.
+
+```kaikai
+effect Yield { yield(x: Int) : Unit }
+
+type Sums = Total(Int) | Next(Int, Cont[(Unit, Int), Sums])
+
+fn upto(n: Int, lim: Int) : Unit / Yield =
+  if n > lim { () } else { Yield.yield(n); upto(n + 1, lim) }
+
+fn sums(lim: Int) : Sums =
+  handle { upto(1, lim) } with Yield(0) {
+    yield(x, resume) -> Next(state + x, resume)    # the running sum so far
+    return(_u)       -> Total(state)
+  }
+
+fn drive(g: Sums) : Unit / Stdout = match g {
+  Total(t)   -> Stdout.print("total #{t}")         # total 10
+  Next(s, k) -> { Stdout.print("sum #{s}"); drive(k((), s)) }
+}
+
+fn main() : Unit / Stdout = drive(sums(4))
+```
 
 ## Build your own generator
 
