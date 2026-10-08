@@ -2959,7 +2959,7 @@ test-monitor-ref-asan: $(TARGET) build
 
 # Perceus fixtures whose bug is a use-after-free or double free that the
 # cell pool hides: run under ASAN with the pool off.
-PERCEUS_ASAN_FIXTURES := cspec_heap_int_copies bang_exit_releases_owed raw_read_releases_box handle_return_binder_paid tcrec_borrow_slot_read raw_border_lambda_result trmc_reuse_step_nested
+PERCEUS_ASAN_FIXTURES := cspec_heap_int_copies bang_exit_releases_owed raw_read_releases_box handle_return_binder_paid tcrec_borrow_slot_read raw_border_lambda_result trmc_reuse_step_nested arm_top_unbound_slots
 
 test-perceus-asan: $(TARGET) build
 	@set -e; \
