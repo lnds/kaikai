@@ -322,7 +322,7 @@ typedef enum {
                        * the element shape allows, boxed otherwise. Writes
                        * mutate in place when the buffer is uniquely owned
                        * (rc == 1) and copy-on-write when shared. */
-    KAI_RANGE         /* [a..b] / [a..b..s]: an Int cons-list stored as its
+    KAI_RANGE,        /* [a..b] / [a..b..s]: an Int cons-list stored as its
                        * generator {from, to, step} — a REPRESENTATION of
                        * `[Int]`, not a distinct type (same trick as KAI_VEC
                        * under the sequence type). Consumers either iterate
@@ -330,6 +330,9 @@ typedef enum {
                        * time via kai_seq_norm; a KAI_RANGE must never reach
                        * an `as.cons` access un-normalised. No interior
                        * pointers: dup/drop are plain. */
+    KAI_CONT          /* A one-shot continuation: names a suspended stack
+                       * segment until a resume or discontinue empties it.
+                       * Dropping a full box discontinues the segment. */
 } KaiTag;
 
 /* Head-type tags — single-dispatch protocol dispatch key.
@@ -547,6 +550,7 @@ static void kai_register_impls(const KaiImplEntry *entries, int32_t n) {
 }
 
 typedef struct KaiValue KaiValue;
+typedef struct KaiSegment KaiSegment;
 
 /* Dynamic-dispatch signature used for closures and higher-order calls. */
 typedef KaiValue *(*KaiFn)(KaiValue *self, KaiValue **args, int n_args);
@@ -736,6 +740,8 @@ struct KaiValue {
          * external memory — the box's RC frees only the KaiValue, never
          * `foreign_ptr` (the driver calls the C destructor itself). */
         void *foreign_ptr;
+        /* KAI_CONT: the suspended segment, NULL once resumed or discontinued. */
+        KaiSegment *seg;
     } as;
     /* Variant slots overlap the union `as` (a variant uses none of the
      * union's named members), so a node is `8 B header + n*8 slots` = 48 B
@@ -889,6 +895,7 @@ static inline int32_t kai_head_tag(KaiValue *v) {
         case KAI_FIBER:   return KAI_HEAD_FIBER;
         case KAI_PID:     return KAI_HEAD_PID;
         case KAI_FOREIGN: return KAI_HEAD_ANON;  /* opaque handle is not protocol-dispatchable (#417) */
+        case KAI_CONT:    return KAI_HEAD_ANON;
         case KAI_BYTE:    return KAI_HEAD_BYTE;
         /* Fixed-width integers dispatch protocols at compile time (the
          * typer resolves Show/Eq/Ord against the static type), so the
@@ -1247,6 +1254,7 @@ static const char *kai_rc_tag_name(int t) {
         case KAI_UINT64:    return "UInt64";
         case KAI_INT128:    return "Int128";
         case KAI_RANGE:     return "range";
+        case KAI_CONT:      return "continuation";
         default:          return "?";
     }
 }
@@ -3351,7 +3359,67 @@ struct KaiFiber {
     KaiResumeFrame *rframe_buf;
     uint32_t        rframe_top;
     uint32_t        rframe_cap;
+    /* The stack segment running on this fiber, NULL on the fiber's own stack. */
+    KaiSegment     *seg;
+    /* Nonzero while the fiber must not change OS thread. */
+    int             seg_pin;
 };
+
+/* The per-context half of a fiber's state. A segment switch exchanges it, so
+ * a segment keeps its own evidence above its base, unwind stack, pending
+ * clause tails and stack bounds, and the resumer's LIFO disciplines never
+ * interleave with the segment's. */
+typedef struct {
+    KaiEvidence    *evidence_top;
+    KaiEvidence    *in_dispatch_node;
+    KaiUnwEntry    *unw_buf;
+    uint32_t        unw_top;
+    uint32_t        unw_cap;
+    KaiResumeFrame *rframe_buf;
+    uint32_t        rframe_top;
+    uint32_t        rframe_cap;
+    void           *stack_base;
+    size_t          stack_size;
+    uintptr_t       unwind_frame;
+    void           *tsan_fiber;
+    KaiSegment     *seg;
+} KaiSegCtx;
+
+typedef enum {
+    KAI_SEG_RUNNING   = 0,
+    KAI_SEG_SUSPENDED = 1,
+    KAI_SEG_RETURNED  = 2,
+    KAI_SEG_UNWOUND   = 3,  /* discontinued, unwound to its entry */
+    KAI_SEG_ESCAPED   = 4   /* a non-local exit left through its entry */
+} KaiSegState;
+
+struct KaiSegment {
+    void        *sp;         /* the segment's stack pointer while switched out */
+    void        *outer_sp;   /* the resumer's, while the segment runs */
+    KaiSegCtx    own;        /* the segment's context while switched out */
+    KaiSegCtx    outer;      /* the resumer's, while the segment runs */
+    KaiEvidence *base;       /* the node the segment's evidence chain hangs from */
+    KaiFiber    *fiber;
+    KaiValue    *body;
+    KaiValue    *xfer;       /* the value a suspend, return or resume hands over */
+    KaiSegState  state;
+    int          discontinue;
+    int          trap;       /* an escape continues as a trap */
+    KaiEvidence *escape_to;  /* the handle an escape lands on; NULL: the cancel pad */
+    jmp_buf      pad;        /* in the segment's entry frame; _setjmp: no signal mask */
+    KaiValue    *spare;      /* a spent box kept for the next suspend */
+    void        *tsan_outer;
+    const void  *asan_outer_bottom;
+    size_t       asan_outer_size;
+    KaiSegment  *pool_next;
+};
+
+/* Leave the running segment by a non-local exit; its resumer continues it. */
+KAI_SCHED_FN void kai_seg_escape(KaiFiber *f, KaiEvidence *to, int trap) __attribute__((noreturn));
+/* The free arm of a KAI_CONT box. */
+KAI_SCHED_FN void kai_seg_cont_drop(KaiValue *box);
+/* Unmap this thread's pooled segments; a worker runs it before it exits. */
+KAI_SCHED_FN void kai_seg_pool_drain(void);
 
 /* Issue #959 — one open structured-concurrency scope. Children spawned
  * while this scope is the active fiber's `nursery_top` are pushed on
@@ -3422,7 +3490,8 @@ struct KaiNursery {
     NULL,                /* exit_rec */                                  \
     NULL, 0, 0,          /* unw_buf, unw_top, unw_cap */                 \
     0,                   /* unwind_frame — main has no pad */            \
-    NULL, 0, 0           /* rframe_buf, rframe_top, rframe_cap */        \
+    NULL, 0, 0,          /* rframe_buf, rframe_top, rframe_cap */        \
+    NULL, 0              /* seg, seg_pin */                              \
 }
 /* `kai_active_fiber` cannot be statically initialised to `&kai_main_fiber`
  * now that both are `_Thread_local`: the address of a thread-local is not a
@@ -3528,6 +3597,31 @@ static void kai_tsan_fiber_free(KaiFiber *f) {
 static inline void kai_tsan_fiber_free(KaiFiber *f) { (void) f; }
 #endif
 
+/* AddressSanitizer learns about a stack-segment switch from these; without
+ * them it misreads the stack bounds on a no-return path inside a segment. */
+#if defined(__SANITIZE_ADDRESS__)
+#  define KAI_ASAN_FIBERS 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define KAI_ASAN_FIBERS 1
+#  endif
+#endif
+#if defined(KAI_ASAN_FIBERS)
+void __sanitizer_start_switch_fiber(void **fake_stack_save, const void *bottom, size_t size);
+void __sanitizer_finish_switch_fiber(void *fake_stack_save, const void **bottom_old, size_t *size_old);
+#endif
+/* LeakSanitizer scans thread stacks, not a mapped segment stack: a value only
+ * a suspended segment's frames hold would read as leaked. */
+#if defined(KAI_ASAN_FIBERS) && defined(__linux__)
+void __lsan_register_root_region(const void *p, size_t size);
+void __lsan_unregister_root_region(const void *p, size_t size);
+#  define KAI_SEG_LSAN_ROOT(seg)   __lsan_register_root_region((seg)->own.stack_base, (seg)->own.stack_size + kai_page_size())
+#  define KAI_SEG_LSAN_UNROOT(seg) __lsan_unregister_root_region((seg)->own.stack_base, (seg)->own.stack_size + kai_page_size())
+#else
+#  define KAI_SEG_LSAN_ROOT(seg)   ((void) 0)
+#  define KAI_SEG_LSAN_UNROOT(seg) ((void) 0)
+#endif
+
 /* noinline is load-bearing: inlined into a fiber body, clang materialises
  * TP+offset and spills it across the park swapcontext, so a work-stolen
  * fiber would resume reading the creator thread's TLS. Out of line the
@@ -3623,8 +3717,16 @@ static void kai_trap_unwind(uintptr_t frame, void *stack_base, void (*land)(void
     __builtin_unreachable();
 }
 
+/* Every jump to the fiber's cancel pad goes through here: inside a segment
+ * it first leaves the segment, and the resumer continues the same exit. */
+__attribute__((noreturn))
+static void kai_fiber_pad_jump(KaiFiber *f, int trap) {
+    if (f->seg != NULL) kai_seg_escape(f, NULL, trap);
+    longjmp(f->cancel_pad, 1);
+}
+
 static void kai_trap_land_fiber(void *arg) {
-    longjmp(((KaiFiber *) arg)->cancel_pad, 1);
+    kai_fiber_pad_jump((KaiFiber *) arg, 1);
 }
 
 /* A recoverable runtime trap (index out of range, divide by zero,
@@ -4988,6 +5090,9 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
              * does not free the mailbox. */
             kai_fiber_exit_unref(v->as.pid.owner);
             break;
+        case KAI_CONT:
+            kai_seg_cont_drop(v);
+            break;
         case KAI_BYTE:
             /* Unreachable: every Byte is an immortal kai_byte_cache cell. */
             break;
@@ -6285,6 +6390,12 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
         case KAI_FOREIGN:
             return mode == KAI_COPY_REGION ? kai_incref(v)
                                            : kai_foreign(v->as.foreign_ptr);
+
+        /* A continuation is a stack of the fiber that captured it. */
+        case KAI_CONT:
+            if (mode == KAI_COPY_REGION) return kai_incref(v);
+            kai_trap_abort("a continuation cannot leave its fiber");
+            return v;
 
         /* A Ref is one mutable cell. The region border shares it — the block
          * must hand back the cell it wrote through. The thread border copies
@@ -7639,6 +7750,7 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
         case KAI_FIBER:   return a->as.fib == b->as.fib;  /* identity */
         case KAI_PID:     return a->as.mb  == b->as.mb;   /* identity */
         case KAI_FOREIGN: return a->as.foreign_ptr == b->as.foreign_ptr; /* identity (#417) */
+        case KAI_CONT:    return a == b;
         case KAI_BYTE:      return a->as.byte_val == b->as.byte_val;    /* Lane 4 (#473) */
         case KAI_INT32:     return a->as.i32 == b->as.i32;
         case KAI_UINT32:    return a->as.u32 == b->as.u32;
@@ -7780,6 +7892,7 @@ static KaiValue *kai_to_string(KaiValue *v) {
         case KAI_FIBER:   return kai_str("<fiber>");
         case KAI_PID:     return kai_str("<pid>");
         case KAI_FOREIGN: return kai_str("<foreign>");
+        case KAI_CONT:    return kai_str("<continuation>");
         case KAI_BYTE:                                       /* Lane 4 (#473) */
             snprintf(buf, sizeof(buf), "%u", (unsigned) v->as.byte_val);
             return kai_str_dyn(buf);
@@ -16500,12 +16613,19 @@ static inline void kai_fiber_slot_unlock_at(int home) {
  * one source of truth shared between the owner (both ends) and thieves
  * (head only), serialized by the slot lock. At N=1 it is the plain TLS
  * FIFO the pre-M:N runtime used — lock-free and byte-identical. */
+/* The thread a fiber must stay on, or -1 when it may migrate. */
+static int kai_fiber_pinned_to(KaiFiber *f) {
+    if (f->pinned_main) return 0;
+    return f->seg_pin ? f->home_thread : -1;
+}
+
 static void kai_sched_enqueue(KaiFiber *f) {
     if (kai_nthreads > 1) {
-        /* A main-pinned fiber goes on thread 0's deque wherever the enqueue
+        /* A pinned fiber goes on its thread's deque wherever the enqueue
          * runs from — routing it to the caller's slot would hand it to that
          * thread, which is exactly the migration the pin forbids. */
-        int owner = f->pinned_main ? 0 : kai_thread_id;
+        int pin = kai_fiber_pinned_to(f);
+        int owner = pin >= 0 ? pin : kai_thread_id;
         KaiSchedSlot *s = &kai_sched_slots[owner];
         pthread_mutex_lock(&s->mu);
         /* Publish ownership under the same lock that publishes the fiber
@@ -16568,12 +16688,11 @@ static KaiFiber *kai_sched_steal_from(int victim) {
     if (!s->live) return NULL;
     pthread_mutex_lock(&s->mu);
     KaiFiber *f = s->steal_head;
-    /* A main-pinned fiber is not stealable: taking it would run it here.
-     * Only the head is a steal candidate, so a pinned head just makes this
-     * victim unstealable for now — thread 0 dequeues it next. Thread 0
-     * never reaches this (it is never its own victim), so no thread-id
-     * test is needed: `pinned_main` implies victim 0. */
-    if (f && f->pinned_main) f = NULL;
+    /* A pinned fiber is not stealable: taking it would run it here. Only
+     * the head is a steal candidate, so a pinned head just makes this
+     * victim unstealable for now — its owner dequeues it next. A thief is
+     * never its own victim, so no thread-id test is needed. */
+    if (f && kai_fiber_pinned_to(f) >= 0) f = NULL;
     if (f) {
         s->steal_head = f->sched_next;
         if (!s->steal_head) s->steal_tail = NULL;
@@ -17546,6 +17665,7 @@ static void *kai_worker_thread_main(void *arg) {
     kai_sched_slots[kai_thread_id].live = 1;
     kai_rc_ledger_register();
     kai_worker_loop();
+    kai_seg_pool_drain();
     kai_rc_ledger_fold();
     return NULL;
 }
@@ -18258,7 +18378,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
         (void) kai_cancel_dispatch_user_handler();
         if (f->cancel_pad_set) {
             kai_evidence_unwind_all();
-            longjmp(f->cancel_pad, 1);
+            kai_fiber_pad_jump(f, 0);
             /* Unreachable. */
         }
         fputs("kai: nursery child cancelled; no survivors\n", stderr);
@@ -18284,7 +18404,7 @@ static KaiValue *kai_default_cancel_raise(void *self, KaiCont *k) {
     if (f->cancel_pad_set) {
         f->cancel_delivered = 1;
         kai_evidence_unwind_all();
-        longjmp(f->cancel_pad, 1);
+        kai_fiber_pad_jump(f, 0);
         /* Unreachable. */
     }
     fputs("kai: Cancel.raise: unhandled (fiber cancelled)\n", stderr);
@@ -18457,7 +18577,7 @@ static void kai_check_trap_exit_cancel_bypass(void) {
     if (!kai_fiber_has_trap_exit_link(f)) return;
     f->cancel_delivered = 1;
     kai_evidence_unwind_all();
-    longjmp(f->cancel_pad, 1);
+    kai_fiber_pad_jump(f, 0);
     /* Unreachable. */
 }
 
@@ -18853,6 +18973,14 @@ static void kai_resume_frames_drop(KaiFiber *f, KaiEvidence *node) {
  * handle, a lone pop leaves the dead node linked as top: the next handle
  * to reuse that stack storage links itself as its own parent, and every
  * later lookup walks the resulting cycle forever. */
+/* Whether `node` is on the running segment's own chain. */
+static int kai_seg_holds(KaiFiber *f, KaiEvidence *node) {
+    for (KaiEvidence *n = f->evidence_top; n != f->seg->base; n = n->parent) {
+        if (n == node) return 1;
+    }
+    return 0;
+}
+
 static void kai_evidence_unwind_to(KaiEvidence *node) {
     if (node == NULL) return;
     /* Run every `finally` between the jump site and the target, innermost
@@ -18861,6 +18989,7 @@ static void kai_evidence_unwind_to(KaiEvidence *node) {
      * Bounded by the same chain the truncation already walked implicitly;
      * a handler with no `finally` costs one NULL check. */
     KaiFiber *f = kai_current_fiber();
+    if (f->seg != NULL && !kai_seg_holds(f, node)) kai_seg_escape(f, node, 0);
     KaiEvidence *stop = node->parent;
     for (KaiEvidence *n = f->evidence_top; n != NULL && n != stop; n = n->parent) {
         kai_unw_release_to(f, n->unw_mark);
@@ -18875,14 +19004,407 @@ static void kai_evidence_unwind_to(KaiEvidence *node) {
  * target node, so it needs the whole remaining chain drained. */
 static void kai_evidence_unwind_all(void) {
     KaiFiber *f = kai_current_fiber();
-    for (KaiEvidence *n = f->evidence_top; n != NULL; n = n->parent) {
+    /* Inside a segment the chain below its base belongs to the resumer. */
+    KaiEvidence *stop = f->seg != NULL ? f->seg->base : NULL;
+    for (KaiEvidence *n = f->evidence_top; n != stop; n = n->parent) {
         kai_unw_release_to(f, n->unw_mark);
         kai_evidence_run_cleanup(n);
         kai_resume_frames_drop(f, n);
     }
     kai_unw_release_to(f, 0);
-    f->evidence_top = NULL;
+    f->evidence_top = stop;
 }
+
+/* =================================================================
+ * Stack segments
+ * =================================================================
+ *
+ * A segment runs a body closure on its own mmap'd stack inside the current
+ * fiber, sharing the fiber's heap. `kai_seg_suspend` switches back to
+ * whoever started or last resumed it and hands that side a one-shot
+ * continuation; `kai_seg_resume` switches in again from wherever it is
+ * called, re-parenting the segment's evidence chain onto the resumer's.
+ * A segment's stack never moves or grows: C frames hold interior pointers
+ * into it.
+ *
+ * Each switch exchanges the per-context half of the fiber (KaiSegCtx), so
+ * the segment keeps its own unwind stack, pending clause tails and stack
+ * bounds. A non-local exit that targets a frame outside the running segment
+ * — a cancellation, a trap, a handle further out — unwinds the segment to
+ * its entry and is continued by the resumer on its own stack: no `longjmp`
+ * crosses stacks.
+ *
+ * The continuation is a KAI_CONT box naming its suspended segment; a resume
+ * or a discontinue empties it, so a second use traps. Dropping a box that
+ * still names a segment discontinues it: the segment unwinds, running every
+ * `finally` and releasing through the unwind stack, and its stack goes back
+ * to the per-thread pool. */
+
+KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k);
+KAI_SCHED_FN KaiValue *kai_seg_suspend(KaiValue *v);
+KAI_SCHED_FN KaiValue *kai_seg_resume(KaiValue *k, KaiValue *v, KaiValue **k_out);
+KAI_SCHED_FN void      kai_seg_discontinue(KaiValue *k);
+
+#if !KAI_SCHED_DECL_ONLY && defined(KAI_SEG_SWITCH)
+
+#define KAI_SEG_POOL_MAX 16
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS KaiSegment *kai_seg_pool;
+extern KAI_TLS int         kai_seg_pool_n;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS KaiSegment *kai_seg_pool   = NULL;
+KAI_TLS int         kai_seg_pool_n = 0;
+#  endif
+#else
+static KAI_TLS KaiSegment *kai_seg_pool   = NULL;
+static KAI_TLS int         kai_seg_pool_n = 0;
+#endif
+
+static void kai_seg_ctx_save(KaiFiber *f, KaiSegCtx *c) {
+    c->evidence_top     = f->evidence_top;
+    c->in_dispatch_node = f->in_dispatch_node;
+    c->unw_buf          = f->unw_buf;
+    c->unw_top          = f->unw_top;
+    c->unw_cap          = f->unw_cap;
+    c->rframe_buf       = f->rframe_buf;
+    c->rframe_top       = f->rframe_top;
+    c->rframe_cap       = f->rframe_cap;
+    c->stack_base       = f->stack_base;
+    c->stack_size       = f->stack_size;
+    c->unwind_frame     = f->unwind_frame;
+    c->tsan_fiber       = f->tsan_fiber;
+    c->seg              = f->seg;
+}
+
+static void kai_seg_ctx_load(KaiFiber *f, const KaiSegCtx *c) {
+    f->evidence_top     = c->evidence_top;
+    f->in_dispatch_node = c->in_dispatch_node;
+    f->unw_buf          = c->unw_buf;
+    f->unw_top          = c->unw_top;
+    f->unw_cap          = c->unw_cap;
+    f->rframe_buf       = c->rframe_buf;
+    f->rframe_top       = c->rframe_top;
+    f->rframe_cap       = c->rframe_cap;
+    f->stack_base       = c->stack_base;
+    f->stack_size       = c->stack_size;
+    f->unwind_frame     = c->unwind_frame;
+    f->tsan_fiber       = c->tsan_fiber;
+    f->seg              = c->seg;
+}
+
+#if defined(KAI_ASAN_FIBERS)
+#  define KAI_SEG_ASAN_LEAVE(save, bottom, size) __sanitizer_start_switch_fiber((save), (bottom), (size))
+#  define KAI_SEG_ASAN_ARRIVE(save, bottom, size) __sanitizer_finish_switch_fiber((save), (bottom), (size))
+#else
+#  define KAI_SEG_ASAN_LEAVE(save, bottom, size)  ((void) 0)
+#  define KAI_SEG_ASAN_ARRIVE(save, bottom, size) ((void) 0)
+#endif
+
+/* Pool access stays inside these two activations, which never switch. */
+__attribute__((noinline))
+static KaiSegment *kai_seg_pool_take(void) {
+    KaiSegment *seg = kai_seg_pool;
+    if (seg != NULL) {
+        kai_seg_pool = seg->pool_next;
+        kai_seg_pool_n--;
+        return seg;
+    }
+    seg = (KaiSegment *) calloc(1, sizeof *seg);
+    if (seg == NULL) {
+        fputs("kai: out of memory allocating a stack segment\n", stderr);
+        kai_exit(1);
+    }
+    kai_install_fiber_sigsegv_handler();
+    seg->own.stack_size = kai_fiber_stack_size();
+    seg->own.stack_base = kai_stack_map(seg->own.stack_size);
+    return seg;
+}
+
+static void kai_seg_unmap(KaiSegment *seg) {
+    munmap(seg->own.stack_base, seg->own.stack_size + kai_page_size());
+    free(seg->own.unw_buf);
+    free(seg->own.rframe_buf);
+    free(seg);
+}
+
+__attribute__((noinline))
+static void kai_seg_pool_put(KaiSegment *seg) {
+    if (kai_seg_pool_n < KAI_SEG_POOL_MAX) {
+        seg->pool_next = kai_seg_pool;
+        kai_seg_pool = seg;
+        kai_seg_pool_n++;
+        return;
+    }
+    kai_seg_unmap(seg);
+}
+
+/* A segment released on another thread lands in that thread's pool, so a
+ * worker's pool can hold stacks it never mapped. */
+KAI_SCHED_FN void kai_seg_pool_drain(void) {
+    while (kai_seg_pool != NULL) {
+        KaiSegment *seg = kai_seg_pool;
+        kai_seg_pool = seg->pool_next;
+        kai_seg_unmap(seg);
+    }
+    kai_seg_pool_n = 0;
+}
+
+static void kai_seg_release(KaiSegment *seg) {
+    KaiValue *body = seg->body;
+    KaiValue *spare = seg->spare;
+    seg->body  = NULL;
+    seg->xfer  = NULL;
+    seg->spare = NULL;
+    if (spare != NULL) kai_decref(spare);
+    KAI_SEG_LSAN_UNROOT(seg);
+#if defined(KAI_TSAN_FIBERS)
+    /* A finished segment's entry frames never returned: start afresh. */
+    __tsan_destroy_fiber(seg->own.tsan_fiber);
+    seg->own.tsan_fiber = NULL;
+#endif
+    kai_seg_pool_put(seg);
+    kai_decref(body);
+}
+
+/* Hang the segment's evidence chain from `base`, the resumer's top. */
+static void kai_seg_rebase(KaiSegment *seg, KaiEvidence *base) {
+    if (seg->base == base) return;
+    KaiEvidence **link = &seg->own.evidence_top;
+    while (*link != seg->base) link = &(*link)->parent;
+    *link = base;
+    seg->base = base;
+}
+
+static void kai_seg_land(void *arg) {
+    _longjmp(((KaiSegment *) arg)->pad, 1);
+}
+
+/* Unwind the running segment to its entry, releasing what its frames own and
+ * running every `finally` on its chain. */
+__attribute__((noreturn))
+static void kai_seg_unwind(KaiFiber *f, KaiSegment *seg) {
+    kai_evidence_unwind_all();
+    seg->state = KAI_SEG_UNWOUND;
+    seg->xfer  = NULL;
+    kai_trap_unwind(f->unwind_frame, f->stack_base, kai_seg_land, seg);
+}
+
+/* Switch from the running segment back to its resumer for good. */
+__attribute__((noreturn))
+static void kai_seg_leave(KaiSegment *seg) {
+    KaiFiber *f = seg->fiber;
+    kai_seg_ctx_save(f, &seg->own);
+    kai_seg_ctx_load(f, &seg->outer);
+    KAI_SEG_ASAN_LEAVE(NULL, seg->asan_outer_bottom, seg->asan_outer_size);
+#if defined(KAI_TSAN_FIBERS)
+    __tsan_switch_to_fiber(seg->tsan_outer, 0);
+#endif
+    kai_seg_switch(&seg->sp, seg->outer_sp, NULL);
+    __builtin_unreachable();
+}
+
+static void kai_seg_entry(void *arg) {
+    KaiSegment *seg = (KaiSegment *) arg;
+    KAI_SEG_ASAN_ARRIVE(NULL, &seg->asan_outer_bottom, &seg->asan_outer_size);
+    seg->fiber->unwind_frame = (uintptr_t) __builtin_frame_address(0);
+    if (_setjmp(seg->pad) == 0) {
+        seg->xfer  = kai_apply_borrow(seg->body, 0, NULL);
+        seg->state = KAI_SEG_RETURNED;
+    }
+    kai_seg_leave(seg);
+}
+
+/* Continue on this side a non-local exit that left a segment. */
+__attribute__((noreturn))
+static void kai_seg_rethrow(KaiFiber *f, KaiEvidence *to, int trap) {
+    if (to != NULL) {
+        kai_evidence_unwind_to(to);
+        longjmp(*to->handle_jmp, 1);
+    }
+    kai_evidence_unwind_all();
+    if (trap) kai_trap_unwind(f->unwind_frame, f->stack_base, kai_trap_land_fiber, f);
+    kai_fiber_pad_jump(f, 0);
+}
+
+/* Switch into `seg` with `arg` and report how it came back. */
+static KaiValue *kai_seg_run(KaiFiber *f, KaiSegment *seg, void *arg, KaiValue **k) {
+    kai_seg_ctx_save(f, &seg->outer);
+    kai_seg_rebase(seg, f->evidence_top);
+    kai_seg_ctx_load(f, &seg->own);
+    /* Outside a clause of its own, the segment runs under the resumer's. */
+    if (f->in_dispatch_node == NULL) f->in_dispatch_node = seg->outer.in_dispatch_node;
+    seg->state = KAI_SEG_RUNNING;
+    void *outer_fake = NULL;
+    KAI_SEG_ASAN_LEAVE(&outer_fake, (char *) seg->own.stack_base + kai_page_size(), seg->own.stack_size);
+#if defined(KAI_TSAN_FIBERS)
+    seg->tsan_outer = __tsan_get_current_fiber();
+    __tsan_switch_to_fiber(seg->own.tsan_fiber, 0);
+#endif
+    kai_seg_switch(&seg->outer_sp, seg->sp, arg);
+    KAI_SEG_ASAN_ARRIVE(outer_fake, NULL, NULL);
+    switch (seg->state) {
+        case KAI_SEG_SUSPENDED: {
+            KaiValue *box = seg->spare;
+            if (box != NULL) seg->spare = NULL;
+            else box = kai_alloc(KAI_CONT);
+            box->as.seg = seg;
+            *k = box;
+            return seg->xfer;
+        }
+        case KAI_SEG_ESCAPED: {
+            KaiEvidence *to = seg->escape_to;
+            int trap = seg->trap;
+            kai_seg_release(seg);
+            kai_seg_rethrow(f, to, trap);
+        }
+        default: {
+            KaiValue *v = seg->xfer;
+            kai_seg_release(seg);
+            *k = NULL;
+            return v;
+        }
+    }
+}
+
+/* Empty a continuation box, consuming it, and return its segment. */
+static KaiSegment *kai_seg_take(KaiValue *k) {
+    if (k == NULL || k->tag != KAI_CONT) {
+        fputs("kai: internal error: resuming a value that is not a continuation\n", stderr);
+        kai_exit(1);
+    }
+    KaiSegment *seg = k->as.seg;
+    k->as.seg = NULL;
+    if (seg == NULL) {
+        kai_decref(k);
+        kai_trap_abort("continuation resumed twice");
+    }
+    /* A box only this call held cannot be seen again: keep it for reuse. */
+    if (kai_rc_load(k) == 1 && seg->spare == NULL) seg->spare = k;
+    else kai_decref(k);
+    if (seg->fiber != kai_current_fiber())
+        kai_trap_abort("continuation resumed outside the fiber that captured it");
+    return seg;
+}
+
+static void kai_seg_discontinue_seg(KaiSegment *seg) {
+    KaiValue *k = NULL;
+    seg->discontinue = 1;
+    (void) kai_seg_run(seg->fiber, seg, NULL, &k);
+}
+
+/* Run `body`, a nullary closure the segment takes over, on a fresh segment.
+ * Returns what the body returned with `*k` NULL, or the value it suspended
+ * with and `*k` the continuation. */
+KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k) {
+    KaiFiber *f = kai_current_fiber();
+    KaiSegment *seg = kai_seg_pool_take();
+    seg->fiber       = f;
+    seg->body        = body;
+    seg->xfer        = NULL;
+    seg->discontinue = 0;
+    seg->escape_to   = NULL;
+    seg->trap        = 0;
+    seg->base        = f->evidence_top;
+    seg->own.evidence_top     = f->evidence_top;
+    seg->own.in_dispatch_node = NULL;
+    seg->own.unw_top          = 0;
+    seg->own.rframe_top       = 0;
+    seg->own.seg              = seg;
+#if defined(KAI_TSAN_FIBERS)
+    seg->own.tsan_fiber       = __tsan_create_fiber(0);
+#endif
+    KAI_SEG_LSAN_ROOT(seg);
+    seg->sp = kai_seg_frame_init((char *) seg->own.stack_base + kai_page_size() + seg->own.stack_size,
+                                 kai_seg_entry);
+    return kai_seg_run(f, seg, seg, k);
+}
+
+/* From inside a segment: hand `v` to the resumer and wait to be resumed.
+ * Returns the value of the resume. */
+KAI_SCHED_FN KaiValue *kai_seg_suspend(KaiValue *v) {
+    KaiFiber *f = kai_current_fiber();
+    KaiSegment *seg = f->seg;
+    if (seg == NULL) {
+        fputs("kai: internal error: suspend outside a stack segment\n", stderr);
+        kai_exit(1);
+    }
+    if (seg->discontinue) kai_trap_abort("continuation suspended while being discontinued");
+    seg->xfer  = v;
+    seg->state = KAI_SEG_SUSPENDED;
+    kai_seg_ctx_save(f, &seg->own);
+    if (seg->own.in_dispatch_node == seg->outer.in_dispatch_node) seg->own.in_dispatch_node = NULL;
+    kai_seg_ctx_load(f, &seg->outer);
+    void *fake = NULL;
+    KAI_SEG_ASAN_LEAVE(&fake, seg->asan_outer_bottom, seg->asan_outer_size);
+#if defined(KAI_TSAN_FIBERS)
+    __tsan_switch_to_fiber(seg->tsan_outer, 0);
+#endif
+    void *r = kai_seg_switch(&seg->sp, seg->outer_sp, NULL);
+    KAI_SEG_ASAN_ARRIVE(fake, &seg->asan_outer_bottom, &seg->asan_outer_size);
+    if (seg->discontinue) kai_seg_unwind(seg->fiber, seg);
+    return (KaiValue *) r;
+}
+
+/* Resume `k` (consumed) with `v` (owned). Returns like kai_seg_start. */
+KAI_SCHED_FN KaiValue *kai_seg_resume(KaiValue *k, KaiValue *v, KaiValue **k_out) {
+    KaiSegment *seg = kai_seg_take(k);
+    return kai_seg_run(seg->fiber, seg, v, k_out);
+}
+
+/* Unwind the segment `k` (consumed) names and return its stack to the pool. */
+KAI_SCHED_FN void kai_seg_discontinue(KaiValue *k) {
+    kai_seg_discontinue_seg(kai_seg_take(k));
+}
+
+/* The last reference to an unresumed continuation went away. The free walk
+ * that got here holds thread-local addresses, so the fiber stays on this
+ * thread until the segment has unwound. */
+KAI_SCHED_FN void kai_seg_cont_drop(KaiValue *box) {
+    KaiSegment *seg = box->as.seg;
+    if (seg == NULL) return;
+    box->as.seg = NULL;
+    KaiFiber *f = seg->fiber;
+    if (f != kai_current_fiber()) kai_trap_abort("continuation dropped outside the fiber that captured it");
+    f->seg_pin++;
+    kai_seg_discontinue_seg(seg);
+    f->seg_pin--;
+}
+
+/* A non-local exit leaving the running segment: unwind it to its entry; the
+ * resumer continues the exit. `to` is the handle node the exit lands on, NULL
+ * for the fiber's cancel pad (whose callers have already unwound). */
+KAI_SCHED_FN void kai_seg_escape(KaiFiber *f, KaiEvidence *to, int trap) {
+    KaiSegment *seg = f->seg;
+    if (to != NULL) kai_evidence_unwind_all();
+    seg->state     = KAI_SEG_ESCAPED;
+    seg->escape_to = to;
+    seg->trap      = trap;
+    _longjmp(seg->pad, 1);
+}
+
+#elif !KAI_SCHED_DECL_ONLY
+
+/* No switch for this target: no segment ever runs, so no box or escape
+ * reaches the two hooks below. */
+__attribute__((noreturn)) static void kai_seg_unsupported(void) {
+    fputs("kai: stack segments are not supported on this target\n", stderr);
+    kai_exit(1);
+    __builtin_unreachable();
+}
+KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k) { (void) body; (void) k; kai_seg_unsupported(); }
+KAI_SCHED_FN KaiValue *kai_seg_suspend(KaiValue *v) { (void) v; kai_seg_unsupported(); }
+KAI_SCHED_FN KaiValue *kai_seg_resume(KaiValue *k, KaiValue *v, KaiValue **k_out) {
+    (void) k; (void) v; (void) k_out; kai_seg_unsupported();
+}
+KAI_SCHED_FN void kai_seg_discontinue(KaiValue *k) { (void) k; kai_seg_unsupported(); }
+KAI_SCHED_FN void kai_seg_cont_drop(KaiValue *box) { (void) box; }
+KAI_SCHED_FN void kai_seg_pool_drain(void) {}
+KAI_SCHED_FN void kai_seg_escape(KaiFiber *f, KaiEvidence *to, int trap) {
+    (void) f; (void) to; (void) trap; kai_seg_unsupported();
+}
+
+#endif
 
 /* Walk the current fiber's stack and return the innermost handler
  * for `eff_label`. Returns NULL if no matching handler is in
@@ -18986,7 +19508,7 @@ static void kai_check_cancel_yield_point(void) {
      * fall back to the pad — the trampoline's second return marks the
      * fiber CANCELLED and continues with the awaiter walk. */
     kai_evidence_unwind_all();
-    longjmp(f->cancel_pad, 1);
+    kai_fiber_pad_jump(f, 0);
     /* Unreachable. */
 }
 
