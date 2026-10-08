@@ -311,7 +311,7 @@ handle runs its body on a stack segment; `kai build --explain` notes
 each one and why. A dropped continuation discontinues its body: every
 `finally` on it runs.
 
-```kaikai
+```text
 effect Yield { yield(x: Int) : Unit }
 
 type Gen = Done | Next(Int, Cont[Unit, Gen])
