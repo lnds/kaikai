@@ -847,6 +847,28 @@ KaiValue *kaix_cons_reuse_move(KaiValue *scr, KaiValue *h, KaiValue *t) {
   return kai_incref(scr);
 }
 
+/* A reuse arm whose scrutinee is registered with the unwinder takes each
+ * child the rebuild embeds. A unique cell gives the slot up, so releasing
+ * the registered cell never reaches a child its binder now owns; a shared
+ * cell keeps the slot and the binder takes a reference of its own. */
+KaiValue *kaix_take_slot(KaiValue *cell, KaiValue *child) {
+  if (!kai_is_ptr(child)) return child;
+  if (!kai_check_unique(cell)) { kai_incref(child); return child; }
+  if (cell->tag == KAI_CONS) {
+    if (cell->as.cons.head == child) cell->as.cons.head = NULL;
+    else if (cell->as.cons.tail == child) cell->as.cons.tail = NULL;
+    return child;
+  }
+  uint32_t mask = kai_slot_mask_of(cell->variant_tag);
+  for (int i = 0; i < cell->var_n_args; ++i) {
+    if ((mask == 0 || kai_var_slot_kind(mask, i) == KAI_VAR_SLOT_PTR) && kai_var_slots(cell)[i].ptr == child) {
+      kai_var_slots(cell)[i].ptr = NULL;
+      break;
+    }
+  }
+  return child;
+}
+
 /* Boxed uniqueness test for the dual-branch condbr guard. KCondBr consumes a
  * boxed Bool; `kai_check_unique` returns a raw int. */
 KaiValue *kaix_check_unique(KaiValue *scr) {

@@ -110,6 +110,7 @@ import compiler.unwind_binders
 import compiler.unwind_sites
 import compiler.unwind_effects
 import compiler.unwind_cx
+import compiler.unwind_calls
 import compiler.emit_unwind_c
 import compiler.kir_pat_alias
 import compiler.resume_scan
@@ -317,13 +318,15 @@ fn emit_unw_own(names: [String], cx: EmitCtx) : EmitCtx =
 
 # The owned scrutinee slot of a match its arms can unwind out of: the push
 # after `_scr` is bound, the pop before its exit decref, and the arms'
-# ledger entry so a goto out of the match pops too.
+# ledger entry so a goto out of the match pops too. The arms keep `scr`
+# set: a reuse arm must not leave a moved child in the registered cell.
 type UnwScr = { push: String, pop: String, cx: EmitCtx }
 
 fn emit_unw_scr(want: Bool, cx: EmitCtx) : UnwScr =
   if want {
+    let held = emit_ctx_with_unw(cx, unw_with_scr(cx.unw, true))
     UnwScr { push: euw_slot_push("_uwm", "_scr"), pop: euw_pop("_uwm"),
-             cx: emit_ctx_with_tcpend(cx, list_append(cx.tcpend, [tcl_unw_entry("_uwm")])) }
+             cx: emit_ctx_with_tcpend(held, list_append(cx.tcpend, [tcl_unw_entry("_uwm")])) }
   } else { UnwScr { push: "", pop: "", cx: cx } }
 
 # A call that can unwind registers the frame's pending references for its
@@ -2078,15 +2081,38 @@ fn emit_owned_borrow_inner(a: Expr) : Expr = match a.kind {
 # is dropped — the birth ref the callee did not consume.
 fn emit_call_with_owned_borrow_drops(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
   let names = emit_ob_names(args_e, 0)
-  let cx2 = emit_ctx_with_lcs(cx, list_append(cx.lcs, names))
+  let hold = emit_ob_hold(f, args_e, emit_ctx_with_lcs(cx, list_append(cx.lcs, names)))
   let binds = emit_ob_binds(src, args_e, 0, cx)
   let call_args = emit_ob_rewrite_args(args_e, 0)
-  let call = match emit_ufn_boxed_call(src, f, call_args, cx2) {
+  let call = match emit_ufn_boxed_call(src, f, call_args, hold.cx) {
     Some(s) -> s
-    None    -> emit_call_expr_default(src, f, call_args, cx2)
+    None    -> emit_call_expr_default(src, f, call_args, hold.cx)
   }
   let drops = emit_ob_drops(args_e, 0)
-  concat_all(["({ ", binds, "KaiValue *_bcr = ", call, "; ", drops, "_bcr; })"])
+  concat_all(["({ ", binds, hold.push, "KaiValue *_bcr = ", call, "; ", hold.pop, drops, "_bcr; })"])
+}
+
+# An owned-borrow temp computed in place is held by no binder, so across a
+# call that can unwind it is registered for the call's extent; an early
+# return out of the call's operands pops it and releases the temps. A temp
+# that only renames a binder is not: the binder is registered already.
+type ObHold = { push: String, pop: String, cx: EmitCtx }
+
+fn emit_ob_hold(f: Expr, args_e: [Expr], cx: EmitCtx) : ObHold = match emit_ob_fresh(args_e, 0) {
+  [] -> ObHold { push: "", pop: "", cx: cx }
+  names -> if cx.unw.sites != [] and unw_call_unwinds(f, args_e, cx.unw.bound, cx.unw.ucx) {
+    let vars = map(names, c_local)
+    let pend = list_append(list_append(cx.tcpend, [tcl_unw_entry("_uwo")]), map(vars, tcl_scr_entry))
+    ObHold { push: euw_vars_push("_uwo", vars), pop: euw_pop("_uwo"), cx: emit_ctx_with_tcpend(cx, pend) }
+  } else { ObHold { push: "", pop: "", cx: cx } }
+}
+
+fn emit_ob_fresh(args_e: [Expr], i: Int) : [String] = match args_e {
+  []           -> []
+  [a, ...rest] -> {
+    let more = emit_ob_fresh(rest, i + 1)
+    if emit_is_owned_borrow(a) and not unw_bare_read(emit_owned_borrow_inner(a)) { [cat2("bc", int_to_string(i)), ...more] } else { more }
+  }
 }
 
 fn emit_ob_names(args_e: [Expr], i: Int) : [String] = match args_e {
@@ -3648,6 +3674,26 @@ fn try_reuse_cons_arm(pat: Pattern, body: Expr) : Option[ReuseConsArm] {
 
 type ReuseConsArm = ReuseConsArm(Pattern, String, Expr, Expr)
 
+# The binders a cons reuse arm owns in both branches: each direct slot the
+# rebuild takes, and a deconstructed head's sub-binders.
+fn cons_arm_owned(head_pat: Pattern, rest_name: String, taken: [String], cx: EmitCtx) : [String] = {
+  let direct = filter(cons_direct_binders(head_pat, rest_name), (n) => list_has(taken, n))
+  match head_pat.pkind {
+    PBind(_) -> direct
+    PWild    -> direct
+    _        -> list_append(tcp_rc_binders(head_pat, cx), direct)
+  }
+}
+
+# Register the rebuild temp `t` under the fiber local `f` while later operands run.
+fn reuse_hold(held: Bool, f: String, t: String) : String = if held { euw_slot_push(f, t) } else { "" }
+
+fn reuse_release(held: Bool, f: String) : String = if held { euw_pop(f) } else { "" }
+
+# `cx` for the operands after a held temp `t`: an early return pops its
+# registration and releases it.
+fn reuse_held_cx(cx: EmitCtx, f: String, t: String) : EmitCtx = emit_ctx_with_tcpend(cx, tcl_hold(cx.tcpend, f, t))
+
 # A deconstructed head binds its sub-binders owned in both branches.
 fn cons_slot_bind(src: String, head_pat: Pattern, slot: String, read: Bool, own: Bool, cx: EmitCtx) : String = match head_pat.pkind {
   PBind(hn) -> if read { reuse_slot_decl(hn, concat_all(["_scr->as.cons.", slot]), own) } else { "" }
@@ -3717,8 +3763,8 @@ fn emit_match_arm_reuse_cons(src: String, arm_lcs: [String], rca: ReuseConsArm,
       # kind-1 Int fields (the AST list-walk shape: `[Node(_, k, _), ...rest]`).
       # The head bind emits kair_ for those; the new-head/tail body must see
       # them in cx.kind1_raw.
-      let arm_cx = emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, arm_lcs),
-                                           list_append(cx.kind1_raw, pat_kind1_binders(head_pat, cx, [])))
+      let arm_cx0 = emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, arm_lcs),
+                                            list_append(cx.kind1_raw, pat_kind1_binders(head_pat, cx, [])))
       # A direct slot the rebuild does not take has no owner once overwritten:
       # the unique branch releases it and the shared branch does not incref
       # it. A slot read only by a lent read stays bound, as a borrow.
@@ -3727,18 +3773,27 @@ fn emit_match_arm_reuse_cons(src: String, arm_lcs: [String], rca: ReuseConsArm,
       let taken = reuse_taken_uses([h_new, t_new], direct)
       let head_read = match head_pat.pkind { PBind(hn) -> list_has(read, hn) _ -> false }
       let head_taken = match head_pat.pkind { PBind(hn) -> list_has(taken, hn) _ -> false }
+      let rest_taken = list_has(taken, rest_name)
       let head_borrow = cons_slot_bind(src, head_pat, "head", head_read, false, cx)
       let head_owned = cons_slot_bind(src, head_pat, "head", head_read, head_taken, cx)
       let tail_borrow = cons_rest_bind(rest_name, list_has(read, rest_name), false)
-      let tail_owned = cons_rest_bind(rest_name, list_has(read, rest_name), list_has(taken, rest_name))
-      let old_drops = cons_untaken_drops(head_taken, list_has(taken, rest_name))
+      let tail_owned = cons_rest_bind(rest_name, list_has(read, rest_name), rest_taken)
+      let old_drops = cons_untaken_drops(head_taken, rest_taken)
+      # With the scrutinee registered, an exit out of the rebuild releases
+      # the cell: each taken child belongs to its binder alone, and a head
+      # computed first is held across the tail.
+      let held = cx.unw.scr
+      let hold_h = held and not unw_bare_read(h_new)
+      let arm_cx = if held { emit_unw_own(cons_arm_owned(head_pat, rest_name, taken, cx), arm_cx0) } else { arm_cx0 }
+      let clears = if held { cons_taken_clears(head_taken, rest_taken) } else { "" }
       let h_new_c = emit_expr(src, h_new, arm_cx)
-      let t_new_c = emit_expr(src, t_new, arm_cx)
+      let t_new_c = emit_expr(src, t_new, if hold_h { reuse_held_cx(arm_cx, "_uwh", "_h_new") } else { arm_cx })
+      let h_tmp2 = if hold_h { "_h_new" } else { "_h_new2" }
       concat_all([
         "if (kai_check_unique(_scr)) { ",
-        head_borrow, tail_borrow,
-        "KaiValue *_h_new = ", h_new_c, "; ",
-        "KaiValue *_t_new = ", t_new_c, "; ",
+        head_borrow, tail_borrow, clears,
+        "KaiValue *_h_new = ", h_new_c, "; ", reuse_hold(hold_h, "_uwh", "_h_new"),
+        "KaiValue *_t_new = ", t_new_c, "; ", reuse_release(hold_h, "_uwh"),
         old_drops,
         "_scr->as.cons.head = _h_new; _scr->as.cons.tail = _t_new; ",
         "kai_rc_count_reuse(); ",
@@ -3747,9 +3802,9 @@ fn emit_match_arm_reuse_cons(src: String, arm_lcs: [String], rca: ReuseConsArm,
         "_r = _scr; _scr = NULL; ",
         "} else { ",
         head_owned, tail_owned,
-        "KaiValue *_h_new2 = ", h_new_c, "; ",
-        "KaiValue *_t_new2 = ", t_new_c, "; ",
-        "_r = kai_cons(_h_new2, _t_new2); ",
+        "KaiValue *", h_tmp2, " = ", h_new_c, "; ", reuse_hold(hold_h, "_uwh", h_tmp2),
+        "KaiValue *_t_new2 = ", t_new_c, "; ", reuse_release(hold_h, "_uwh"),
+        "_r = kai_cons(", h_tmp2, ", _t_new2); ",
         "}"
       ])
     }
@@ -4239,8 +4294,14 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # ctor's declared payload tys (rv subs are flat for this arm shape;
       # nested kind-1 binders are collected via rv_nested into kair_ too).
       let k1 = pat_kind1_binders_subs(subs, tys, 0, cx, [])
-      let arm_cx = emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, arm_lcs),
-                                           list_append(cx.kind1_raw, k1))
+      let arm_cx0 = emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, arm_lcs),
+                                            list_append(cx.kind1_raw, k1))
+      let taken = reuse_taken_uses(cargs, pat_binders_list_local(subs, []))
+      # With the scrutinee registered (a flat rebuild only), an exit out of
+      # the rebuild releases the cell: each taken child belongs to its binder
+      # alone, and each operand computed is held across the later ones.
+      let held = cx.unw.scr
+      let arm_cx = if held { emit_unw_own(rv_taken_binders(subs, tys, 0, taken), arm_cx0) } else { arm_cx0 }
       let n = list_length(subs)
       let mask = variant_slot_mask(tys)
       let tag_str = int_to_string(evar_find_tag_in(cx.variants, chome, cname))
@@ -4273,7 +4334,7 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # resolved a binder named like a stdlib fn (e.g. `tail`) to the
       # GLOBAL fn closure instead of the local bind — the latent
       # corruption the cell free-list surfaced.
-      let new_temps0   = rv_new_temps(src, cargs, tys, 0, arm_cx)
+      let new_temps0   = rv_new_temps(src, cargs, tys, 0, held, arm_cx)
       let overwrites   = rv_overwrites(cargs, tys, 0)
       let fresh_q      = emit_variant_slot_init_list(src, cargs, tys, arm_cx)
       let fresh_rhs    = seq_wrap(fresh_q, concat_all([
@@ -4291,7 +4352,6 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # must be decref'd before overwrite. Bijective: borrow-transfer, no drop,
       # except a flat slot the rebuild does not take: its old child has no
       # owner once overwritten.
-      let taken = reuse_taken_uses(cargs, pat_binders_list_local(subs, []))
       let old_drops = if nonbij and not borrow_pure { rv_old_slot_drops(subs, tys, 0) }
                       else { rv_untaken_slot_drops(subs, tys, 0, taken) }
       # Second reuse token (Koka ParcReuse 2-of-3 rotation reuse): the
@@ -4364,10 +4424,13 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # 0 unique, site 1 shared); it may not live inside the shared branch's
       # `(KaiVarSlot[]){...}` initializer where the rewrite lands.
       let uniq_tmp = if cx.rd_active and new_temps != new_temps1 { rd_tmp_decl(0) } else { "" }
-      let shared_tmp = if cx.rd_active and fresh_rhs_d != fresh_rhs { rd_tmp_decl(1) } else { "" }
+      let shared_temps = if held and cx.rd_active { rd_donate(new_temps1, evar_find_tag_arity(cx.variants, None, cname, n), cname, n, mask, 1) }
+                         else { new_temps1 }
+      let shared_tmp = if cx.rd_active and (fresh_rhs_d != fresh_rhs or shared_temps != new_temps1) { rd_tmp_decl(1) } else { "" }
       concat_all([
         "if (kai_check_unique(_scr)) { ", uniq_tmp,
-        borrow_binds, inner_decision, new_temps, old_drops, overwrites,
+        borrow_binds, if held { rv_taken_slot_clears(subs, tys, 0, taken) } else { "" },
+        inner_decision, new_temps, rv_temp_pops(cargs, tys, 0, held), old_drops, overwrites,
         "_scr->variant_tag = ", tag_str, "; ",
         "_scr->var_n_args = ", int_to_string(list_length(tys)), "; ",
         # No per-rebuild slotmask register: the rewritten tag's mask is
@@ -4392,7 +4455,8 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
         # grand-child binds are borrows off the still-live inner; dup each
         # kept boxed grand-child before the fresh rebuild embeds it.
         if has_inner { rv_shared_grand_dups(nested_sp, cx) } else { "" },
-        "_r = ", fresh_rhs_d, "; ",
+        if held { rv_fresh_from_temps(shared_temps, rv_temp_pops(cargs, tys, 0, held), tag_str, cname, tys) }
+        else { cat3("_r = ", fresh_rhs_d, "; ") },
         "}"
       ])
     }
@@ -4543,7 +4607,7 @@ fn rv_nested_dups_loop(isubs: [Pattern], itys: [Int], j: Int, cx: EmitCtx) : Str
 # Eval each new ctor arg into `_rv<i>` BEFORE any overwrite. Pointer
 # slots: boxed KaiValue*. Primitive slots: extract the raw scalar via
 # kai_take_int/kai_take_real (the arg is a boxed kai_int from the bind).
-fn rv_new_temps(src: String, cargs: [Expr], tys: [Int], i: Int, cx: EmitCtx) : String / Console {
+fn rv_new_temps(src: String, cargs: [Expr], tys: [Int], i: Int, held: Bool, cx: EmitCtx) : String / Console {
   match cargs {
     [] -> ""
     [e, ...rest] -> {
@@ -4574,7 +4638,10 @@ fn rv_new_temps(src: String, cargs: [Expr], tys: [Int], i: Int, cx: EmitCtx) : S
           }
         }
         else { concat_all(["KaiValue *_rv", int_to_string(i), " = ", emit_expr(src, e, cx), "; "]) }
-      cat2(here, rv_new_temps(src, rest, tys, i + 1, cx))
+      let tmp = cat2("_rv", int_to_string(i))
+      if rv_holds(held, e, k, rest) {
+        cat3(here, reuse_hold(true, rv_hold_reg(i), tmp), rv_new_temps(src, rest, tys, i + 1, held, reuse_held_cx(cx, rv_hold_reg(i), tmp)))
+      } else { cat2(here, rv_new_temps(src, rest, tys, i + 1, held, cx)) }
     }
   }
 }
@@ -4585,9 +4652,7 @@ fn rv_overwrites(cargs: [Expr], tys: [Int], i: Int) : String {
   match cargs {
     [] -> ""
     [_e, ...rest] -> {
-      let k = kind_at(tys, i)
-      let fld = if k == 1 { ".i64" } else if k == 2 { ".r" } else if k == 3 { ".i64" } else { ".ptr" }
-      cat2(concat_all(["kai_var_slots(_scr)[", int_to_string(i), "]", fld, " = _rv", int_to_string(i), "; "]),
+      cat2(concat_all(["kai_var_slots(_scr)[", int_to_string(i), "]", rv_slot_field(kind_at(tys, i)), " = _rv", int_to_string(i), "; "]),
            rv_overwrites(rest, tys, i + 1))
     }
   }
@@ -4780,8 +4845,20 @@ fn reuse_carg_reads(cargs: [Expr], nm: String) : Bool = match cargs {
 fn reuse_cons_arm_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseConsArm] =
   if cx.in_region { None } else { try_reuse_cons_arm(pat, body) }
 
+# Under a registered scrutinee only a flat rebuild keeps the dual layout: a
+# rotation moves grand-children out of an inner cell the registered one
+# still reaches, so it takes the owned path.
 fn reuse_variant_arm_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseVariantArm] =
-  if cx.in_region { None } else { try_reuse_variant_arm(pat, body, cx) }
+  if cx.in_region { None } else {
+    match try_reuse_variant_arm(pat, body, cx) {
+      Some(ReuseVariantArm(subs, h, c, cargs, tys)) ->
+        if cx.unw.scr and not rv_flat_arm(subs, cargs) { None } else { Some(ReuseVariantArm(subs, h, c, cargs, tys)) }
+      None -> None
+    }
+  }
+
+fn rv_flat_arm(subs: [Pattern], cargs: [Expr]) : Bool =
+  not rv_any_nested_ctor(cargs) and all(subs, (sp) => match sp.pkind { PBind(_) -> true PWild -> true _ -> false })
 
 fn arm_top_reuse_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReuse] =
   if cx.in_region { None } else { try_arm_top_reuse(pat, body, cx) }
@@ -6853,14 +6930,14 @@ fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option
         # `KaiValue *`, raw params pass scalars.
         Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) ->
           if ty_is_unboxable_t(rt) {
-            Some(emit_ufn_raw_call_go(src, c_sym(callee, mo), args_e, mask, rt, cx))
+            Some(emit_ufn_raw_call_go(src, f, c_sym(callee, mo), args_e, mask, rt, cx))
           } else { None }
         _ -> None
       } }
     EModCall(mod, fname) -> match fnx_ufn_sig_first(cx.fx, fname, Some(mod)) {
       Some(US(_, rt, mask)) ->
         if ty_is_unboxable_t(rt) {
-          Some(emit_ufn_raw_call_go(src, c_sym(fname, Some(mod)), args_e, mask, rt, cx))
+          Some(emit_ufn_raw_call_go(src, f, c_sym(fname, Some(mod)), args_e, mask, rt, cx))
         } else { None }
       None -> None
     }
@@ -6872,14 +6949,14 @@ fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option
 # `__perceus_owned_borrow` mark; else bind each marked arg to a temp,
 # call, and drop the temps after — the raw-context mirror of
 # emit_call_with_owned_borrow_drops.
-fn emit_ufn_raw_call_go(src: String, sym: String, args_e: [Expr], mask: [Bool], rt: Ty, cx: EmitCtx) : String / Console {
+fn emit_ufn_raw_call_go(src: String, f: Expr, sym: String, args_e: [Expr], mask: [Bool], rt: Ty, cx: EmitCtx) : String / Console {
   if emit_args_have_owned_borrow(args_e) {
     let names = emit_ob_names(args_e, 0)
-    let cx2 = emit_ctx_with_lcs(cx, list_append(cx.lcs, names))
+    let hold = emit_ob_hold(f, args_e, emit_ctx_with_lcs(cx, list_append(cx.lcs, names)))
     let binds = emit_ob_binds(src, args_e, 0, cx)
-    let raw_vals = emit_arg_vals_masked(src, emit_ob_rewrite_args(args_e, 0), mask, cx2)
+    let raw_vals = emit_arg_vals_masked(src, emit_ob_rewrite_args(args_e, 0), mask, hold.cx)
     let drops = emit_ob_drops(args_e, 0)
-    concat_all(["({ ", binds, raw_c_type(Some(rt)), " _bcr = ", emit_user_call_seq(sym, raw_vals, cx2), "; ", drops, "_bcr; })"])
+    concat_all(["({ ", binds, hold.push, raw_c_type(Some(rt)), " _bcr = ", emit_user_call_seq(sym, raw_vals, hold.cx), "; ", hold.pop, drops, "_bcr; })"])
   } else {
     emit_user_call_seq(sym, emit_arg_vals_masked(src, args_e, mask, cx), cx)
   }

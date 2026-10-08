@@ -9,6 +9,7 @@ releases it, the shared branch does not incref it.
 import compiler.ast
 import compiler.emit_shared
 import compiler.util
+import compiler.unwind_binders
 
 #[doc("The cons arm's direct binders: the head when it is a plain binder, then the rest.")]
 pub fn cons_direct_binders(head_pat: Pattern, rest_name: String) : [String] = match head_pat.pkind {
@@ -50,3 +51,61 @@ fn rv_untaken(sp: Pattern, taken: [String]) : Bool = match sp.pkind {
   PBind(nm) -> not list_has(taken, nm)
   _         -> false
 }
+
+#[doc("Clear, in the unique branch, each cons slot the rebuild takes: its binder alone owns the child.")]
+pub fn cons_taken_clears(head_taken: Bool, rest_taken: Bool) : String =
+  cat2(if head_taken { "_scr->as.cons.head = NULL; " } else { "" },
+       if rest_taken { "_scr->as.cons.tail = NULL; " } else { "" })
+
+#[doc("The pointer binders among `subs` the rebuild takes: the unique branch moves them, the shared one increfs them.")]
+pub fn rv_taken_binders(subs: [Pattern], ks: [Int], i: Int, taken: [String]) : [String] = match (subs, ks) {
+  ([sp, ...rest], [k, ...krest]) -> {
+    let tail = rv_taken_binders(rest, krest, i + 1, taken)
+    match sp.pkind {
+      PBind(nm) -> if k == 0 and list_has(taken, nm) { [nm, ...tail] } else { tail }
+      _         -> tail
+    }
+  }
+  _ -> []
+}
+
+#[doc("Clear, in the unique branch, each flat pointer slot of a variant the rebuild takes: its binder alone owns the child.")]
+pub fn rv_taken_slot_clears(subs: [Pattern], ks: [Int], i: Int, taken: [String]) : String = match (subs, ks) {
+  ([sp, ...rest], [k, ...krest]) -> {
+    let here = match sp.pkind {
+      PBind(nm) -> if k == 0 and list_has(taken, nm) { concat_all(["kai_var_slots(_scr)[", int_to_string(i), "].ptr = NULL; "]) } else { "" }
+      _         -> ""
+    }
+    cat2(here, rv_taken_slot_clears(rest, krest, i + 1, taken))
+  }
+  _ -> ""
+}
+
+#[doc("The fiber local holding the registration of rebuild temp `i`.")]
+pub fn rv_hold_reg(i: Int) : String = cat2("_uwt", int_to_string(i))
+
+#[doc("True when the rebuild temp of pointer operand `e` is held: a later operand runs, and no binder already holds the reference.")]
+pub fn rv_holds(held: Bool, e: Expr, k: Int, rest: [Expr]) : Bool = held and k == 0 and rest != [] and not unw_bare_read(e)
+
+#[doc("Pop the registration of each held rebuild temp.")]
+pub fn rv_temp_pops(cargs: [Expr], ks: [Int], i: Int, held: Bool) : String = match (cargs, ks) {
+  ([e, ...rest], [k, ...krest]) ->
+    cat2(if rv_holds(held, e, k, rest) { concat_all(["kai_unw_pop(", rv_hold_reg(i), "); "]) } else { "" },
+         rv_temp_pops(rest, krest, i + 1, held))
+  _ -> ""
+}
+
+#[doc("A fresh cell of `cname` built from the rebuild temps `temps` declare, once `pops` released their registrations.")]
+pub fn rv_fresh_from_temps(temps: String, pops: String, tag: String, cname: String, ks: [Int]) : String =
+  concat_all([temps, pops, "_r = kai_variant_u(", tag, ", \"", cname, "\", ", int_to_string(list_length(ks)), ", ",
+              int_to_string(variant_slot_mask(ks)), ", (KaiVarSlot[]){", rv_temp_slots(ks, 0), "}); "])
+
+fn rv_temp_slots(ks: [Int], i: Int) : String = match ks {
+  [] -> ""
+  [k, ...rest] -> {
+    concat_all([if i == 0 { "" } else { ", " }, "{", rv_slot_field(k), " = _rv", int_to_string(i), "}", rv_temp_slots(rest, i + 1)])
+  }
+}
+
+#[doc("The `KaiVarSlot` member a slot of kind `k` lives in.")]
+pub fn rv_slot_field(k: Int) : String = if k == 1 or k == 3 { ".i64" } else if k == 2 { ".r" } else { ".ptr" }
