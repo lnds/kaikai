@@ -1085,16 +1085,28 @@ KAI_RT_COUNTER(int64_t kai_rc_reuse_free_total, 0);
 KAI_RT_COUNTER(int64_t kai_rc_tok_unique, 0);
 KAI_RT_COUNTER(int64_t kai_rc_tok_null_shared, 0);
 KAI_RT_COUNTER(int64_t kai_rc_tok_null_mismatch, 0);
-/* Phase 1.B.1 — incref/decref call counters (the ones that actually
- * touch `rc`; pinned/INT32_MAX short-circuits are NOT counted). Lets a
- * borrow optimisation that elides incref/decref pairs show its effect
- * directly (alloc_total is unchanged by a borrow — the head is never
- * allocated, only refcounted). #812 — the increments are ALWAYS compiled
- * (parallel to kai_rc_alloc_total), gated only by the KAI_TRACE_RC env var
- * at report time; previously they sat behind -DKAI_TRACE_RC, so any binary
- * built without that define (every `kai build` output) reported 0. */
+/* incref/decref calls that touch `rc` (pinned/INT32_MAX short-circuits are
+ * not counted). Compiled into every binary, so a `kai build` output reports
+ * them, but counted only when KAI_TRACE_RC is set at startup: they are one
+ * process-wide atomic line, and counting every dup/drop serialises threads
+ * on it. */
 KAI_RT_ATOMIC_COUNTER(kai_rc_incref_total);
 KAI_RT_ATOMIC_COUNTER(kai_rc_decref_total);
+#if defined(KAI_SEPARATE_COMPILATION)
+extern int kai_rc_traffic_on;
+#  if defined(KAI_RUNTIME_OWNER)
+int kai_rc_traffic_on;
+#  endif
+#else
+static int kai_rc_traffic_on;
+#endif
+#if !defined(KAI_SEPARATE_COMPILATION) || defined(KAI_RUNTIME_OWNER)
+__attribute__((constructor)) static void kai_rc_traffic_init(void) {
+    kai_rc_traffic_on = getenv("KAI_TRACE_RC") != NULL;
+}
+#endif
+#define KAI_RC_TRAFFIC_INC(v) \
+    do { if (__builtin_expect(kai_rc_traffic_on, 0)) KAI_CTR_INC(v); } while (0)
 
 #ifdef KAI_TRACE_RC
 KAI_RT_COUNTER(int64_t kai_rc_free_by_tag[16], {0});
@@ -3063,7 +3075,7 @@ KAI_RT_SHARED __attribute__((noinline)) KaiValue *kai_incref_special(KaiValue *v
     if (atomic_fetch_add_explicit((_Atomic int32_t *) &v->rc, 1,
                                   memory_order_relaxed) >= INT32_MAX - 1)
         kai_rc_overflow(v);
-    KAI_CTR_INC(kai_rc_incref_total);
+    KAI_RC_TRAFFIC_INC(kai_rc_incref_total);
 #ifdef KAI_TRACE_RC
     kai_rc_history_log(v, /* op=incref */ 1, v->tag);
 #endif
@@ -3087,12 +3099,7 @@ KAI_RT_SHARED_INLINE KaiValue *kai_incref(KaiValue *v) {
         return v;
     }
     v->rc = r + 1;
-    /* #812 — counter ALWAYS compiled (parallels kai_rc_alloc_total),
-     * reported only under the KAI_TRACE_RC env var. Behind `#ifdef
-     * KAI_TRACE_RC` it stayed 0 in every `kai build` binary (the wrapper
-     * does not pass -DKAI_TRACE_RC), so each "RC balanced" gate that read
-     * incref_total passed vacuously on 0 == 0. */
-    KAI_CTR_INC(kai_rc_incref_total);
+    KAI_RC_TRAFFIC_INC(kai_rc_incref_total);
 #ifdef KAI_TRACE_RC
     kai_rc_history_log(v, /* op=incref */ 1, v->tag);
 #endif
@@ -4785,7 +4792,7 @@ static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
  * does not model a standalone fence, so its build folds both into the
  * fetch_sub. */
 KAI_RT_SHARED __attribute__((noinline)) int kai_drop_atomic_hits_zero(KaiValue *v) {
-    KAI_CTR_INC(kai_rc_decref_total);
+    KAI_RC_TRAFFIC_INC(kai_rc_decref_total);
 #ifdef KAI_TRACE_RC
     kai_rc_history_log(v, /* op=decref */ 2, v->tag);
 #endif
@@ -4810,7 +4817,7 @@ static inline int kai_drop_hits_zero(KaiValue *v) {
     if (kai_is_value(v) || !v) return 0;
     int32_t r = kai_rc_load(v);
     if (r >= KAI_RC_SPECIAL) return r != INT32_MAX && kai_drop_atomic_hits_zero(v);
-    KAI_CTR_INC(kai_rc_decref_total);
+    KAI_RC_TRAFFIC_INC(kai_rc_decref_total);
 #ifdef KAI_TRACE_RC
     kai_rc_history_log(v, /* op=decref */ 2, v->tag);
 #endif
