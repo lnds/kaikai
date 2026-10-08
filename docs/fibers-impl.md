@@ -197,21 +197,24 @@ chain enqueueing each awaiter back to READY.
 
 ### Dispatch loop
 
-The scheduler is not a separate thread or context — it lives on the
-**main fiber's stack** (the OS thread stack). Every fiber's
-`uc_link` points at `kai_main_fiber.ctx`, so when a fiber's body
-returns, control flows automatically to the dispatch loop.
+The scheduler is not a separate thread or context — it lives on each
+worker's **root fiber** (the OS thread stack). A worker (`KaiWorker`)
+holds that thread's scheduler state: the running fiber, the root, the
+ready queue and the stacks the root drains after a switch. Code reaches
+it through `kai_worker_here()`, the runtime's one read of the thread
+pointer, or, after a switch, through the running fiber's `worker`, which
+the dispatcher stores on every resume.
 
 ```c
-static void kai_sched_dispatch(void) {
-    while (kai_ready_head != NULL) {
-        KaiFiber *next = kai_sched_dequeue();
+static void kai_worker_loop(KaiWorker *w) {
+    while (!kai_sched_shutting_down) {
+        KaiFiber *next = kai_worker_find_work(w);
+        ...
         next->state = KAI_FIBER_RUNNING;
-        kai_active_fiber = next;
-        swapcontext(&kai_main_fiber.ctx, &next->ctx);
+        kai_worker_run(w, next);          /* next->worker = w; w->active = next */
+        swapcontext(&w->main_fiber.ctx, &next->ctx);
         /* control returns here when `next` yields, parks, or
-         * completes. `kai_active_fiber` is updated by the yield
-         * primitive; we re-read it before looping. */
+         * completes; a root never changes thread, so `w` stays valid. */
     }
 }
 ```
@@ -234,9 +237,9 @@ Three primitives in `stage0/runtime.h`:
   enqueued at the run queue tail. Caller stays RUNNING (does not
   yield); the unparked fiber runs whenever the scheduler reaches it.
 
-`kai_active_fiber` replaces `kai_main_fiber` as the value returned
-by `kai_current_fiber()`. The pointer is updated in
-`kai_sched_dispatch` before `swapcontext`. Per-fiber `evidence_top`
+The worker's `active` fiber is the value returned by
+`kai_current_fiber()`. The dispatcher updates it (`kai_worker_run`)
+before `swapcontext`. Per-fiber `evidence_top`
 is reached via `kai_current_fiber()->evidence_top`, so the evidence
 vector switches automatically with the active fiber (Doc C
 §*Per-fiber isolation* §"Decided" — the design pre-committed to this
@@ -275,8 +278,8 @@ the entry function, not the user's thunk directly. The trampoline:
 3. Sets `fiber->state = KAI_FIBER_DONE`.
 4. Walks `fiber->awaiters_head`, re-enqueueing each awaiter as
    READY (calling `kai_sched_unpark`).
-5. Returns. ucontext follows `uc_link` back to
-   `kai_main_fiber.ctx`, which is the dispatch loop.
+5. Hands control to the next ready fiber, or to the worker's root
+   fiber (`main_fiber.ctx`), which is the dispatch loop.
 
 The trampoline is **the only place** that flips a fiber's state to
 DONE; it is the only place that walks the awaiter list. Both

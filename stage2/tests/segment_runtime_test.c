@@ -349,7 +349,7 @@ static KaiValue *probe_body(KaiValue *self, KaiValue **args, int n) {
  * yield's enqueue routes it there: the resume runs on another worker. */
 static KaiValue *probe_fiber(KaiValue *self, KaiValue **args, int n) {
     (void) self; (void) args; (void) n;
-    probe_started_on = kai_thread_id;
+    probe_started_on = kai_current_fiber()->worker->id;
     KaiValue *k = NULL;
     kai_decref(kai_seg_start(mk_body(probe_body, NULL), &k));
     KaiFiber *f = kai_current_fiber();

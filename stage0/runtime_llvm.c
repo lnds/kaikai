@@ -59,8 +59,8 @@
  * it (in a callee-saved register, spilled) across any call — including
  * swapcontext. Under M:N work-stealing a fiber resumes on a DIFFERENT OS
  * thread, so a cached thread pointer then addresses the creator thread's
- * _Thread_local scheduler state (kai_active_fiber, kai_pending_free,
- * kai_main_fiber): two threads share one `active`, the scheduler
+ * _Thread_local scheduler state (the worker's active fiber, its pending
+ * frees, its root): two threads share one `active`, the scheduler
  * cross-wires, and a live fiber's stack is freed under it. gcc does not
  * hoist the thread pointer across swapcontext; the same header is sound
  * built with cc.
