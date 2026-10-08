@@ -48,17 +48,23 @@ load-tested and composes with fibers.
 
 ```kai
 effect Actor[Msg] {
-  self()                          : Pid[Msg]
-  send(pid: Pid[Msg], msg: Msg)   : Unit / Cancel
-  receive()                       : Msg / Cancel
-  receive_timeout(nanos: Int)     : Option[Msg]
+  self()                       : Pid[Msg]
+  send[T](pid: Pid[T], msg: T) : Unit
+  receive()                    : Msg
+  receive_timeout(nanos: Int)  : Option[Msg]
 }
 ```
 
 - `self()` — the pid of the current actor. Always available
   under an `Actor[Msg]` handler.
-- `send(pid, msg)` — enqueue `msg` in `pid`'s mailbox. May
-  block, drop a message, or complete immediately depending on
+- `send(pid, msg)` — enqueue `msg` in `pid`'s mailbox. Its
+  message type `T` is the destination's, chosen per call and
+  unrelated to the sender's own `Msg`: an actor whose mailbox is
+  `Actor[Reply]` sends a `Request` to a `Pid[Request]`, as
+  Erlang's `!` sends to any pid. A handler's `send` clause sees
+  `T` as rigid, so it may count, drop or forward the message but
+  not inspect it; the content is inspected on the receiving side.
+  May block, drop a message, or complete immediately depending on
   the receiving mailbox's overflow policy (see §*Mailbox
   policies* below). The blocking case (`BlockSender`) is a
   yield point for the sender, so a blocked sender can itself
@@ -70,9 +76,8 @@ effect Actor[Msg] {
   message is dropped.
 - `receive()` — remove and return the next message from the
   current actor's mailbox. Blocks the fiber until a message
-  arrives. Carries `Cancel` in its row because a blocked
-  `receive` is a yield point where the scheduler delivers
-  `Cancel.raise()` to a cancelled fiber.
+  arrives. A blocked `receive` is a yield point where the
+  scheduler delivers cancellation to a cancelled fiber.
 - `receive_timeout(nanos)` — like `receive()` but gives up
   after a relative nanosecond deadline, returning `Some(msg)`
   if a message arrives in time and `None` otherwise. The fiber
@@ -85,12 +90,13 @@ effect Actor[Msg] {
   surface callers use; it converts to nanoseconds and invokes
   this op.
 
-`Msg` is the concrete message type of the actor. One
-`Actor[Msg]` instance corresponds to one mailbox for one
-message type. Two actors with different message types are two
-different effects (`Actor[Request]` vs `Actor[Event]`). A
-single actor that needs to mix message shapes uses one sum
-type:
+`Msg` is the concrete message type of the actor's own mailbox:
+what `self` names and `receive` returns. One `Actor[Msg]`
+instance corresponds to one mailbox for one message type. Two
+mailboxes with different message types are two different
+effects (`Actor[Request]` vs `Actor[Event]`); sending to either
+needs only its pid. A single actor that needs to mix message
+shapes in its own mailbox uses one sum type:
 
 ```kai
 type ServerMsg =
@@ -130,50 +136,34 @@ monitoring, and message routing need it.
 
 An actor is spawned through `Spawn` just like any other fiber,
 with an `Actor[Msg]` handler wrapped around the body so
-`send` / `receive` / `self` are in scope. The stdlib exposes
-the capability to the body as an `as`-bound argument — the
-idiomatic name is `m` (for "mailbox"), the same way
-`nursery { n -> ... }` binds the `Spawn` capability as `n`.
+`send` / `receive` / `self` are in scope. The body reaches them
+through its row (`Actor.receive()`, `Actor.send(pid, msg)`,
+`Actor.self()`). A handler written by hand can also bind the
+capability as a named instance, `with Actor[Msg](...) as m`, and
+pass `m` down to a function taking `m: Actor[Msg]`, which then
+calls `m.receive()`, `m.send(pid, msg)`, `m.self()`.
 
-### `spawn_actor` — explicit mailbox policy
-
-```kai
-pub fn spawn_actor[Msg, R, e](
-  n:      Nursery,
-  policy: MailboxPolicy,
-  body:   (m: ActorCap[Msg]) -> R / Actor[Msg] + e
-) : Pid[Msg] / Spawn + e
-```
-
-The body receives the mailbox capability `m` as its argument
-and uses `m.receive()`, `m.send(pid, msg)`, `m.self()` to
-interact with the mailbox. `Actor.receive()` / `Actor.send(...)`
-— the default-capability form — remains legal but secondary;
-binding the cap as `m` is shorter and matches `nursery`'s
-shape.
-
-### `spawn_actor_default` — bounded / block-sender default
+### `spawn_actor` — a fiber with its own mailbox
 
 ```kai
-pub fn spawn_actor_default[Msg, R, e](
-  n:    Nursery,
-  body: (m: ActorCap[Msg]) -> R / Actor[Msg] + e
-) : Pid[Msg] / Spawn + e
+pub fn spawn_actor[Msg, e](body: () -> Unit / Actor[Msg] + e) : Pid[Msg] / Spawn
+
+pub fn spawn_actor_policy[Msg, e](policy: MailboxPolicy,
+                                   body: () -> Unit / Actor[Msg] + e) : Pid[Msg] / Spawn
 ```
 
-Calls `spawn_actor` with `policy = Bounded(1024, BlockSender)` —
-the 90th-percentile case. Requiring explicit policy on
-`spawn_actor` keeps unbounded-by-accident out of the language
-(see §*Open questions*); `spawn_actor_default` covers the
-common case without that ceremony.
+`spawn_actor` runs `body` on a new fiber under a fresh
+`Unbounded` mailbox and returns its pid without waiting for the
+child's first action. `spawn_actor_policy` takes the mailbox's
+`MailboxPolicy` explicitly (§*Mailbox policies*).
 
 ### `with_mailbox` — mailbox for the current fiber
 
 ```kai
-pub fn with_mailbox[Msg, R, e](
-  policy: MailboxPolicy,
-  body:   (m: ActorCap[Msg]) -> R / Actor[Msg] + e
-) : R / e
+pub fn with_mailbox[Msg, R, e](body: () -> R / Actor[Msg] + e) : R / e
+
+pub fn with_mailbox_policy[Msg, R, e](policy: MailboxPolicy,
+                                       body: () -> R / Actor[Msg] + e) : R / e
 ```
 
 Installs an `Actor[Msg]` handler in the current fiber without
@@ -182,45 +172,40 @@ needs to receive replies — `with_mailbox` gives it its own
 mailbox:
 
 ```kai
-with_mailbox { m ->
-  m.send(worker, Query(m.self()))
-  let answer = m.receive()
+with_mailbox {
+  Actor.send(worker, Query(Actor.self()))
+  let answer = Actor.receive()
   ...
 }
 ```
 
-A `with_mailbox` variant with the default policy
-(`Bounded(1024, BlockSender)`) may be added if the explicit
-form proves repetitive — deferred until usage data justifies
-it.
-
 ### Longhand
 
-`spawn_actor` is a thin wrapper over `Spawn.spawn` plus a
-`handle { ... } with Actor[Msg] ... as m { ... }` installation:
+`spawn_actor` is a thin wrapper over a fiber spawn plus a
+`handle { ... } with Actor[Msg](mailbox)` installation whose
+state is the mailbox's pid:
 
 ```kai
-pub fn spawn_actor[Msg, R, e](
-  n: Nursery, policy: MailboxPolicy,
-  body: (m: ActorCap[Msg]) -> R / Actor[Msg] + e
-) : Pid[Msg] / Spawn + e {
-  let (pid, mailbox) = runtime_alloc_mailbox(policy)
-  n.spawn(() => {
-    handle { body(cap) } with Actor[Msg](mailbox, pid) as cap {
-      self(resume)       -> resume(pid)
-      send(p, v, resume) -> { runtime_mailbox_push(p, v); resume(()) }
-      receive(resume)    -> resume(runtime_mailbox_pop(mailbox))
-      return(x)          -> x
+pub fn spawn_actor[Msg, e](body: () -> Unit / Actor[Msg] + e) : Pid[Msg] / Spawn = {
+  let mb = mailbox_alloc_unowned()
+  let f  = spawn_actor_fiber(mb, () => {
+    let _ = handle { body() } with Actor[Msg](mb) {
+      self(resume)                -> resume(state)
+      send(p, m, resume)          -> { mailbox_send(p, m); resume(()) }
+      receive(resume)             -> resume(mailbox_recv(state))
+      receive_timeout(ns, resume) -> resume(mailbox_recv_timeout(state, ns))
+      finally                     { mailbox_free(mb) }
+      return(x)                   -> x
     }
+    ()
   })
-  pid
+  let _ = f
+  mb
 }
 ```
 
-(Inside the handler, `cap` is a local name for the capability;
-the body receives it as the user-facing `m`.) The
-`runtime_*` helpers are `Ffi` primitives specified in Doc C.
-The runtime layout of mailboxes is a Doc C concern — this
+The `mailbox_*` helpers are runtime primitives specified in
+Doc C. The runtime layout of mailboxes is a Doc C concern — this
 document pins only that every mailbox is per-actor,
 heap-allocated, and drained when the actor returns or is
 cancelled.
@@ -310,13 +295,13 @@ v1 `receive()` is **first-in-first-out**. Callers that need
 explicitly:
 
 ```kai
-fn receive_matching[Msg](m: ActorCap[Msg], p: (Msg) -> Bool) : Msg / Actor[Msg] {
-  let msg = m.receive()
+fn receive_matching[Msg](p: (Msg) -> Bool) : Msg / Actor[Msg] = {
+  let msg = Actor.receive()
   if p(msg) { msg }
   else {
     # re-enqueue at the back and try again.
-    m.send(m.self(), msg)
-    receive_matching(m, p)
+    Actor.send(Actor.self(), msg)
+    receive_matching(p)
   }
 }
 ```
@@ -403,14 +388,10 @@ type SupervisorMsg =
   | Stop
   | Down(event: MonitorDown)            # supervision channel
 
-fn supervisor(m: ActorCap[SupervisorMsg]) : Unit / Actor[SupervisorMsg] + Monitor + Cancel {
-  forever {
-    match m.receive() {
-      Tick       -> ...
-      Stop       -> break
-      Down(ev)   -> handle_down(ev)
-    }
-  }
+fn supervisor() : Unit / Actor[SupervisorMsg] + Monitor = match Actor.receive() {
+  Tick     -> supervisor()
+  Stop     -> ()
+  Down(ev) -> { handle_down(ev); supervisor() }
 }
 ```
 
@@ -532,13 +513,12 @@ type SupervisorMsg =
   | Event(payload: DomainEvent)
 
 fn supervisor(
-  m:        ActorCap[SupervisorMsg],
   children: [ChildSpec]
 ) : Unit / Actor[SupervisorMsg] + Spawn + Monitor + Console + Cancel {
   let pids = children | (spec) => start_child(spec)
   pids |> each((p) => monitor(p))
   forever {
-    match m.receive() {
+    match Actor.receive() {
       Down(MonitorDown(ref, Crashed(msg))) -> {
         Console.eprint("child crashed: #{msg}")
         let fresh = restart_child(ref_to_spec(ref))
@@ -599,10 +579,28 @@ The common synchronous-over-async pattern: send a request with
 a reply-to pid, then wait for the response.
 
 ```kai
-type Request = Query(question: String, reply_to: Pid[Reply])
+type Request = Query(String, Pid[Reply])
 type Reply   = Answer(String)
 
-fn ask(m: ActorCap[Reply], server: Pid[Request], q: String) : String / Actor[Reply] + Cancel {
+fn ask(server: Pid[Request], q: String) : String / Actor[Reply] = {
+  Actor.send(server, Query(q, Actor.self()))
+  match Actor.receive() {
+    Answer(a) -> a
+  }
+}
+```
+
+`ask` needs only the caller's own `Reply` mailbox: the request
+goes out through the server's `Pid[Request]`. The caller must
+already be inside an `Actor[Reply]` scope, typically by being an
+actor itself, or by wrapping the call in
+`with_mailbox { ask(server, q) }` to open a short-lived mailbox
+just for the interaction. The same function over a named
+instance takes the capability as a parameter, and its row no
+longer mentions `Actor`:
+
+```kai
+fn ask_with(m: Actor[Reply], server: Pid[Request], q: String) : String = {
   m.send(server, Query(q, m.self()))
   match m.receive() {
     Answer(a) -> a
@@ -610,39 +608,29 @@ fn ask(m: ActorCap[Reply], server: Pid[Request], q: String) : String / Actor[Rep
 }
 ```
 
-`ask` takes the caller's mailbox capability explicitly — the
-caller must already be inside an `Actor[Reply]` scope, typically
-by being an actor itself, or by wrapping the call in
-`with_mailbox { m -> ask(m, server, q) }` to open a short-lived
-mailbox just for the interaction.
-
 ### Event bus
 
 An actor whose mailbox collects events from many producers and
-broadcasts them to subscribers:
+broadcasts them to subscribers. It owns a `BusMsg` mailbox only;
+delivering an `Event` needs no `Actor[Event]` of its own:
 
 ```kai
+type Event  = Delivered(String, String)
+type Sub    = { topic: String, pid: Pid[Event] }
 type BusMsg =
-  | Publish(topic: String, payload: String)
-  | Subscribe(topic: String, subscriber: Pid[Event])
-  | Unsubscribe(topic: String, subscriber: Pid[Event])
+  | Publish(String, String)
+  | Subscribe(String, Pid[Event])
+  | Unsubscribe(String, Pid[Event])
 
-type Sub = Sub(topic: String, pid: Pid[Event])
-
-fn event_bus(m: ActorCap[BusMsg]) : Unit / Actor[BusMsg] + Actor[Event] + Cancel {
-  var subscribers: [Sub] := []
-  forever {
-    match m.receive() {
-      Publish(topic, payload)  -> broadcast(m, subscribers, topic, payload)
-      Subscribe(topic, p)      -> subscribers := subscribers ++ [Sub(topic, p)]
-      Unsubscribe(topic, p)    -> subscribers := subscribers |> filter((s) => !(s.topic == topic && s.pid == p))
-    }
+fn event_bus(subs: [Sub]) : Unit / Actor[BusMsg] = match Actor.receive() {
+  Publish(topic, payload) -> {
+    foreach(subs, (s) => if s.topic == topic { Actor.send(s.pid, Delivered(topic, payload)) })
+    event_bus(subs)
   }
+  Subscribe(topic, p)   -> event_bus([Sub { topic: topic, pid: p }, ...subs])
+  Unsubscribe(topic, p) -> event_bus(filter(subs, (s) => not (s.topic == topic and s.pid == p)))
 }
 ```
-
-(`var subscribers` + `@` / `:=` are m7b sugars; see
-`docs/syntax-sugars.md`.)
 
 ### Actor pool
 
@@ -758,10 +746,10 @@ actor's mailbox — issue #763), `with_mailbox`, and
 `m8x_4_recv_blocking.kai`,
 `issue_763_spawn_actor_policy_block_sender.kai`, and
 `demos/ping_pong/` exercise the full mailbox + supervision
-surface. (`spawn_actor_default` and the nursery-parameter
-signature specified above remain open — today's stdlib shape is
-`spawn_actor[_policy]([policy,] body)` without the `n:`
-argument or the `ActorCap` as-binding.)
+surface. (`spawn_actor_default` and a nursery-parameter
+`spawn_actor`, which §*Actor pool* and §*Open questions* #1 still
+assume, remain open — today's stdlib shape is
+`spawn_actor[_policy]([policy,] body)`.)
 
 Open work after v1:
 
