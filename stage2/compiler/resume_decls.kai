@@ -1,0 +1,97 @@
+#[doc("""
+Program walk for the non-tail `resume` split: every op clause of every
+`handle` is split where it resumes in non-tail position. A clause the
+split cannot express is replaced by `$resume_bad` markers the typer
+reports with their span, so the walk is the only pass over the program.
+A default handler has no handle exit to apply a deferred tail at, so
+its clauses must resume in tail position.
+""")]
+
+import compiler.ast
+import compiler.handler_alias
+import compiler.emit_shared
+import compiler.resume_scan
+import compiler.resume_split
+import compiler.handle_presence
+
+#[doc("Split every op clause of `ds` that resumes in non-tail position.")]
+pub fn split_resume_decls(ds: [Decl]) : [Decl] = map(ds, rsd_decl)
+
+fn rsd_decl(d: Decl) : Decl = match d {
+  DFn(pub_, n, tps, ps, ret, row, body, l, c, mo, fsym) -> DFn(pub_, n, tps, ps, ret, row, rsd_body(body), l, c, mo, fsym)
+  DTest(desc, body, l, c, mo)      -> DTest(desc, rsd_body(body), l, c, mo)
+  DBench(desc, body, l, c, mo)     -> DBench(desc, rsd_body(body), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, rsd_body(body), l, c, mo)
+  DImpl(p, tas, tgt, inner, l, c, tps, isym) -> DImpl(p, tas, tgt, map(inner, rsd_decl), l, c, tps, isym)
+  DDerive(ns, inner, l, c)         -> DDerive(ns, rsd_decl(inner), l, c)
+  DUnstable(inner, l, c)           -> DUnstable(rsd_decl(inner), l, c)
+  DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, rsd_decl(inner), l, c, mo)
+  DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, rsd_decl(inner), l, c, mo)
+  DConstructor(inner, l, c)        -> DConstructor(rsd_decl(inner), l, c)
+  DDoc(a, b, inner, l, c)          -> DDoc(a, b, rsd_decl(inner), l, c)
+  DConst(pub_, n, ty, init, mo, l, c, csym) -> DConst(pub_, n, ty, rsd_body(init), mo, l, c, csym)
+  DEffect(pub_, n, tps, ops, dflt, l, c, mo, esym) -> DEffect(pub_, n, tps, ops, rsd_default(dflt), l, c, mo, esym)
+  _ -> d
+}
+
+fn rsd_default(dflt: Option[DefaultBlock]) : Option[DefaultBlock] = match dflt {
+  Some(DBlk(cs, ret, l, c)) -> Some(DBlk(map(cs, rsd_default_clause), map_opt_return_exprs(ret, rsd_expr), l, c))
+  None -> None
+}
+
+# A body that installs no handler is returned as is: the rebuild would cost
+# every program, and almost none has a clause to split.
+fn rsd_body(e: Expr) : Expr = if holds_handle(e) { rsd_expr(e) } else { e }
+
+fn rsd_expr(e: Expr) : Expr = Expr { kind: rsd_kind(e.kind), line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn rsd_kind(k: ExprKind) : ExprKind = match k {
+  EHandle(body, eff, hs, tys, init, alias, cs, ret) ->
+    EHandle(rsd_expr(body), eff, hs, tys, map_opt_expr(init, rsd_expr), alias,
+            map(cs, rsd_clause), map_opt_return_exprs(ret, rsd_expr))
+  _ -> map_expr_kind(k, rsd_expr)
+}
+
+# Handles nested in the clause are split first; to this clause they are opaque.
+fn rsd_clause(c: HClause) : HClause = match c {
+  HC(n, ps, body, l, col) -> HC(n, ps, split_clause_body(rsd_expr(body), ps), l, col)
+}
+
+fn split_clause_body(body: Expr, ps: [Param]) : Expr = match clause_continuation(ps) {
+  Some(k) -> match rs_unsplittable(body, k) {
+    Some(b) -> bad_body(body, [b])
+    None    -> if rs_all_tail(body, k) { body } else { split_or_bad(body, k) }
+  }
+  None -> body
+}
+
+fn split_or_bad(body: Expr, k: String) : Expr = {
+  let sp = sp_to(body, Cx { k: k, kn: KTail, tainted: [] }, Ss { n: 0, bad: [] })
+  match sp.s.bad {
+    []   -> sp.e
+    bads -> bad_body(body, list_reverse(bads))
+  }
+}
+
+# A default clause is never split (it must resume in tail position), but a
+# `handle` inside it is.
+fn rsd_default_clause(c: HClause) : HClause = match c {
+  HC(n, ps, body, l, col) -> {
+    let body1 = rsd_expr(body)
+    let tail_only = match clause_continuation(ps) {
+      Some(k) -> rs_all_tail(body1, k)
+      None    -> true
+    }
+    if tail_only { HC(n, ps, body1, l, col) }
+    else { HC(n, ps, bad_body(body1, [rs_default_nontail(l, col)]), l, col) }
+  }
+}
+
+# The clause the typer sees: one marker per shape it reports, the last as
+# the value so no type error joins them; the body that could not be split
+# would only add errors of its own.
+fn bad_body(at: Expr, bads: [RsBad]) : Expr = match list_reverse(bads) {
+  [last, ...before] ->
+    mk_expr(EBlock(map(list_reverse(before), (b) => SExprStmt(rs_bad_marker(b))), Some(rs_bad_marker(last))), at.line, at.col)
+  [] -> at
+}

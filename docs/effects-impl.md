@@ -67,6 +67,17 @@ sit in the literature, plus a hybrid worth naming explicitly:
    compilation) survives because the pass's radius is the
    effectful subset, not the whole program.
 
+> **What runs today.** The evidence half of régime C shipped:
+> handlers are evidence nodes on a per-fiber stack, reached by
+> capability passing (§*Surface-to-runtime mapping*). The CPS half
+> did not: no pass rewrites effectful functions and no
+> continuation is reified. An op call is a direct call to its
+> clause on the performing stack; a tail `resume` returns into it,
+> an abandon longjmps to the handle, and a non-tail `resume`
+> defers the rest of its clause to the handle's exit (§*Op calls
+> and clauses*). Items 1, 2 and 5 above describe the plan, not the
+> runtime.
+
 ### Risk of C
 
 No published compiler combines exactly these two choices. The
@@ -79,8 +90,8 @@ document pins that translation.
 ### What C rules out
 
 - **Direct inlining of handler clauses as in Effekt's fast path.**
-  The generalised CPS transform puts a function call between the
-  op call site and the clause body. An inliner can still fold the
+  Dispatch through the evidence node puts an indirect call
+  between the op call site and the clause body. An inliner can still fold the
   call after monomorphisation, but the default shape is indirect.
   The actual cost is unmeasured at design time; m7a includes a
   micro-benchmark against an Effekt-style direct baseline. If the
@@ -229,16 +240,13 @@ struct EvIo {
   `self.env`, and read per-handler state (for parameterised
   effects) through additional fields (see §*Parameterised
   effects* below).
-- Each op's compiled signature gains a final `Cont[Ret]`
-  parameter — the reified continuation the clause will either
-  call or discard (§*`resume` representation*).
-- Each op returns `Answer` — the final result type of the
-  enclosing `handle` (the type `S` in Doc A §*`resume`: one-shot,
-  explicit*). Per `handle`, `Answer` is instantiated to that
-  handle's `S`; clauses produce an `Answer` either by calling
-  `resume` (which threads through `body` and the `return` clause
-  to an `S`) or by returning a value of `S` directly when
-  discarding the continuation.
+- Each op's compiled signature gains a final `KaiCont *`
+  parameter — the one-shot status the clause flips by resuming
+  (§*`resume` representation*).
+- A clause that resumes in tail position returns the op's value;
+  one that does not resume returns a value of the handle's type
+  `S` (Doc A §*`resume`: one-shot, explicit*), which becomes the
+  handle's result. The op site tells the two apart by the status.
 - `handler_id` is a unique integer identifying the handler
   instance, used only for diagnostics that need to name the
   handler (e.g. *"continuation resumed twice in handler #4
@@ -306,8 +314,7 @@ distinct concept.
 
 Effects with multiple state parameters (none in the v1 stdlib;
 hypothetical `effect Reader2[A, B]`) gain one field per
-parameter, in declaration order. The CPS transform reads them
-positionally.
+parameter, in declaration order, read positionally.
 
 ### Calling a capability
 
@@ -321,8 +328,8 @@ positionally.
 
 The evidence vector itself is the per-fiber handler stack
 (§*Handler-stack runtime*); the "current" one is the snapshot
-visible at this lexical point in the program. §*The CPS
-transform* pins how it is threaded through call sites.
+visible at this lexical point in the program. §*Op calls and
+clauses* pins how an op call reaches it.
 
 ### Rebinding
 
@@ -372,102 +379,42 @@ across the two phases:
 The compiler does not pre-resolve which struct the call ends up
 talking to — only which label the lookup is parameterised by.
 
-## The CPS transform
+## Op calls and clauses
 <!-- coverage: skip --> design spec, internal lowering rule
 
-### What gets transformed
+No pass rewrites effectful functions into continuation-passing
+style, and no continuation is reified. An effectful function
+compiles in direct style exactly like a pure one; what an effect
+adds is the evidence its op calls dispatch through.
 
-A function is transformed iff its type row is non-empty. Pure
-functions are left in direct style and emit ordinary LLVM IR.
-The transform is therefore a pass over a subset of the program,
-not a global rewrite.
+- **Op call `Eff.op(args)`**: resolve the evidence node (frame
+  slot, capability value, or the bounded walk — §*Calling a
+  capability*), evaluate the args, mark the node in-dispatch on
+  the fiber, and call the clause through the node's `EvE` with a
+  `KaiCont` on the stack. The clause runs on the performing stack,
+  above the op site's frame.
+- **The clause's value** is the op's result when the clause
+  resumed. When it did not, the op site stores the value in the
+  handle's discard slot, unwinds the evidence chain to the
+  handle's node (running every `finally` on the way) and longjmps
+  to the handle's landing pad: the value is the handle's result as
+  is, and `return` does not run.
+- **`resume(v)` in tail position** is the whole one-shot cost:
+  `kai_cont_resume` checks and flips the status and returns `v`,
+  which the clause returns to the op site. No closure, no heap.
+- **`resume(v)` in non-tail position** cannot return into the
+  clause once the body finishes — the body runs below the clause
+  on the same stack. A pre-resolve pass (`resume_decls.kai`)
+  splits the clause at the call instead; the handle runs the rest
+  of the clause on exit (§*Non-tail `resume`*). The pass rewrites
+  only declarations that hold a `handle`, found by a walk that
+  allocates nothing, so a program without one pays no more than a
+  read of its nodes.
 
-Boundary rule: a pure function that *calls* an effectful function
-is itself effectful by inference — the callee's row contributes
-to the caller's row. The subset is therefore closed under
-inference: if `f` is pure, none of its callees can be effectful
-(otherwise inference would have widened `f`'s row); if any callee
-of `f` has a non-empty row, `f` was already inferred effectful
-and flagged for transformation in the same pass.
-
-### The transform, per construct
-
-Let `row(e)` denote the inferred row of expression `e` and `Ev(ρ)`
-the evidence vector for row `ρ`.
-
-- **Value `v`**: if pure, pass straight through; if reached via a
-  continuation, becomes `k(v)`.
-- **Let `let x = e1; e2`**: if both pure, unchanged. If `e1` is
-  pure and `e2` effectful, pass `e1`'s value into the transformed
-  `e2`. If `e1` is effectful, transform it with a continuation
-  that binds `x` and runs the transformed `e2`.
-- **`if cond { e1 } else { e2 }`**: if `cond` is pure, branch
-  inline and transform `e1` and `e2` separately (both arms
-  receive the same enclosing continuation). If `cond` is
-  effectful, transform `cond` with a continuation that, given
-  the boolean, dispatches into the transformed `e1` or `e2`.
-- **`match scrut { p1 -> e1 | ... | pn -> en }`**: if `scrut` is
-  pure, dispatch inline and transform each arm separately. If
-  `scrut` is effectful, transform it with a continuation that
-  receives the scrutinee, runs the pattern decision tree, and
-  enters the transformed arm. The decision tree itself is pure
-  IR — patterns cannot perform.
-- **Call `f(args)`** (pure f): direct LLVM call.
-- **Call `f(args)`** (effectful f): pass the current evidence
-  vector as the extra argument, and the current continuation as
-  the last argument. Both are compile-time known at the call
-  site.
-- **Op call `Eff.op(args)`**: look up `ev : *EvEff` in the
-  evidence vector; emit `ev.op(ev, args, current_continuation)`.
-  The leading `ev` is the `*Self` argument required by the
-  calling convention pinned in §*Surface-to-runtime mapping*.
-- **`handle { body } with Eff { ops }`**: allocate an `EvEff`
-  whose fields are the compiled op clauses; push it onto the
-  evidence vector; transform `body` with the extended vector;
-  pop on normal return; apply the `return` clause (if any) or
-  identity.
-- **`resume(v)` inside a clause**: direct call into the
-  continuation passed to the clause. The clause's code path is
-  CPS; `resume(v)` is one tail call.
-- **`resume_multishot(v)`**: same as `resume(v)` except the
-  continuation is RC-bumped before the call (§*Interaction with
-  Perceus*).
-
-The transform is syntax-directed and runs per function body
-after inference and before monomorphisation (§*Pipeline order*).
-It produces a typed-IR node called `EffFn` (effectful function)
-that monomorphisation knows how to specialise.
-
-### Continuation representation in source-to-IR
-
-A continuation in IR form is a closure over:
-- the frame of local bindings alive at the suspension point,
-- the remaining computation reified as a typed IR function,
-- the caller's continuation (the tail).
-
-This mirrors Xie 2020 §4. The closure representation is
-discussed in §*`resume` representation*.
-
-### Why not transform pure code
-
-Two reasons:
-
-1. Pure code outnumbers effectful code by a wide margin in every
-   real codebase. Transforming it would double the IR size for
-   no semantic benefit.
-2. The CPS representation is not free to read — it obscures data
-   flow and complicates Perceus reuse analysis. Keeping pure code
-   in direct style means Perceus only has to reason about CPS
-   continuation frames, not about every function body.
-
-The cost is that the boundary between pure and effectful code
-carries a small conversion — an effectful call from pure code
-reifies a trivial identity continuation. The compiler emits a
-single shared `id_cont` for this. Post-monomorphisation the
-inliner *may* fold it away when the call site is direct; in the
-worst case, one extra indirect call is paid per pure→effectful
-boundary crossing. The m7a régime-cost benchmark (§*What C rules
-out*) measures the actual cost.
+Direct style keeps pure and effectful code on one calling
+convention and keeps Perceus reasoning about ordinary frames; the
+price is one closure per perform of a clause that resumes in
+non-tail position.
 
 ## `resume` representation
 
@@ -477,47 +424,64 @@ pins its runtime shape.
 
 ### One-shot case (default)
 
-The continuation closure is **always allocated on the stack** at
-the `perform` site, immediately before the op call. The compiler
-does not predict at allocation time which clause will run or
-whether it will call `resume_multishot`; pessimism is on the
-stack side. If the clause does call `resume_multishot`, the
-closure is promoted to the heap at *that* call site
-(§*Multi-shot case*). The one-shot path therefore never touches
-the heap:
+The op site allocates a `KaiCont` on its stack and passes its
+address to the clause:
 
 ```
-frame on stack:
-  +-- locals of the caller of perform
-  +-- continuation closure:
-  |     - environment pointer (up to caller's frame)
-  |     - resume fn pointer
-  |     - status byte           ; the one-shot check
-  |     - handler_id             ; cosmetic, names the handler in panic text
-  +-- (clause runs here as a tail call)
+KaiCont:
+  - status        ; UNRESUMED / RESUMED — the one-shot check
+  - fn, env       ; the identity continuation: `resume(v)` is `v`
+  - handler_id    ; cosmetic, names the handler in panic text
 ```
 
-The closure carries `handler_id` as a copy of the `EvE`'s id at
-the time of `perform`. When the runtime panic for "continuation
-resumed twice" fires, it names the originating handler even if
-the corresponding `handle` block has already exited and its
-`EvE` is no longer on the evidence vector.
+`resume(v)` is `kai_cont_resume(k, v)`: check `status ==
+UNRESUMED` (else "continuation resumed twice"), flip it, return
+`v`. After the clause returns, the same status tells the op site
+whether the clause resumed or abandoned. Overhead over a direct
+call: one load and one branch, plus the status test at the op
+site.
 
-The clause receives a pointer to this closure. Calling `resume(v)`
-is:
+### Non-tail `resume`
 
-1. Check `status == Unresumed`; otherwise panic with
-   "continuation resumed twice".
-2. Flip `status = Resumed`.
-3. Tail-call into the resume fn pointer with `v` and the closed
-   environment.
+The split turns
 
-Overhead over a direct call: one load + one branch on `status`.
-LLVM *may* fold the check post-monomorphisation when the clause
-is trivially one-shot (no branch, no loop) and the inliner can
-see the path. In the worst case the check stays as a load +
-conditional branch per `resume`. The m7a régime-cost benchmark
-(§*What C rules out*) measures the total cost.
+```kai
+op(x, resume) -> { pre; let r = resume(v); post(r) }
+```
+
+into, in effect,
+
+```kai
+op(x, resume) -> { pre; let k = (r) => post(r); $resume_frame(k); resume(v) }
+```
+
+`$resume_frame` pushes `{node, closure}` on the fiber's frame
+buffer, where `node` is the evidence node whose clause is running
+(`in_dispatch_node`). The handle's exit runs
+`kai_resume_frames_run(node, result)`: it takes the node's frames
+innermost first, each one's value feeding the next, and the last
+value is the handle's. The order is a real one-shot
+continuation's:
+
+- normal exit: body → `finally` → pop → `return(x)` → frames;
+- abandon: `finally` (in the unwind) → landing pad → frames, fed
+  the abandoned value without `return`.
+
+The node is popped before the frames run, so a frame that
+performs the handled effect reaches the handler outside. A
+stateful clause's frame sees `state` as it was when the clause
+was entered. A path through the clause that does not resume calls
+the lambda in place, so code after a join is shared, not copied;
+operands evaluated before the resuming one are bound first, so
+evaluation order holds.
+
+Frames live in a per-fiber buffer, not in `KaiEvidence`: the
+node's size is fixed by the native backend's `[8 x ptr]` node
+allocas. An exit that skips a handle releases its frames — the
+unwind walk drops them with the node's `finally`, and while a
+handle is running its frames, its node already popped, an
+unwind-stack entry with `n < 0` stands in for it, so
+`kai_unw_release_to` drops what is left.
 
 ### Multi-shot case
 
@@ -539,15 +503,21 @@ v1* already accepts this cost.
 
 ### Static detection of illegal one-shot use
 
-The checker detects at type-checking time if a clause clearly
-calls `resume` twice on the same control path, or stores `resume`
-into a closure that escapes the clause. Such programs are
-rejected with "one-shot `resume` escapes its clause — use
-`resume_multishot` or rewrite".
+The split marks what it cannot express with a `$resume_bad` node in
+the clause, and the typer reports each one with a span:
 
-Control paths that genuinely cannot be statically decided (a
-loop containing a conditional `resume`) fall back to the runtime
-check described above.
+- a second `resume` on one path;
+- `resume` inside a `handle` nested in its clause — the resumed
+  body would have to run under the inner handler;
+- `resume` inside a loop body, a match guard, or a string
+  interpolation;
+- a clause `var` (or a closure over one) read after a non-tail
+  `resume` — that code runs once the var's block is gone;
+- a non-tail `resume` in a `default { }` clause — a default
+  handler has no handle exit to run the deferred code at.
+
+The typer rejects `resume` used as a value or called from inside
+a lambda. The runtime status check stays as the backstop.
 
 ### Interaction with `Nothing`-returning ops
 
@@ -572,74 +542,47 @@ out the call without special cases.
 
 ## `handle` lowering
 
-`handle { body } with E { ops }` lowers to the following LLVM IR
-sketch (pseudocode; actual IR pinned by the emitter):
+`handle { body } with E { ops }` lowers to (C backend; the native
+backend builds the same shape in KIR):
 
 ```
-; prologue: build the EvE struct
-%ev = alloca EvE
-store %ev.handler_id, fresh_id()
-store %ev.env,        %enclosing_frame_ptr
-store %ev.op_1,       &op_1_clause
-store %ev.op_2,       &op_2_clause
-; ... one store per op
-; ... plus per-handler state fields if E is parameterised
-;     (e.g. store %ev.state, %init_value for State[T])
-
-; prologue: push an Evidence node onto the per-fiber stack
-%node = alloca Evidence
-store %node.eff_label, EffSymbol_E
-store %node.handler,   %ev
-%old_top = load fiber.evidence_top
-store %node.parent,    %old_top
-store fiber.evidence_top, %node
-
-; body — transformed per §*CPS transform*; reads the updated
-; evidence vector implicitly via fiber.evidence_top, and takes
-; id_cont as the final continuation. When body completes the
-; normal way it tail-calls id_cont(value), which returns `value`
-; as the body's Answer. Early discard from a clause bypasses
-; id_cont and produces an Answer directly.
-%body_result = call transformed_body(id_cont)
-
-; epilogue
-store fiber.evidence_top, %old_top                 ; pop
-%final = call return_clause(%body_result)          ; identity if absent
+EvE _ev = { handler_id, op clause pointers, env, state };
+KaiEvidence _node; jmp_buf _jmp; KaiValue *volatile _discard;
+if (setjmp(_jmp) == 0) {
+  kai_evidence_push_with_jmp(&_node, "E", &_ev, &_jmp, &_discard);
+  _body_result = <body>;
+  <finally>; kai_evidence_pop();
+  _hr = <return clause over _body_result>;   // identity if absent
+} else {
+  _hr = _discard;                           // abandoned: no `return`
+}
+_hr = kai_resume_frames_run(&_node, _hr);   // only when a clause defers
 ```
 
 - `fiber.evidence_top` is a field of the current `Fiber` struct
-  (§*Handler-stack runtime*); it is loaded into a register on
-  entry to a function and written back on `handle` push/pop, so
-  the cost in the hot path is the same as a thread-local.
+  (§*Handler-stack runtime*).
 - Each op clause is compiled as an ordinary function with
-  signature `(self: *EvE, op_args..., k: Cont[Ret]) -> Answer`.
-  The `EvE` struct stores the function pointers and any
-  per-handler state; closure captures of the enclosing scope go
-  through `self.env`.
+  signature `(self: *EvE, op_args..., k: *KaiCont)`; closure
+  captures of the enclosing scope go through `self.env`.
 
 ### Early return / discard path
 
-If a clause does *not* call `resume`, it returns a value of the
-handle's result type `S` directly — `Answer` *is* `S` for this
-`handle`, so the value flows out as the handle's result and the
-remainder of `body` is dropped. No tagging or runtime dispatch
-is involved: the static decision (call `resume` vs not) determines
-the path. Doc A §*Discarding the continuation* is the semantics;
-the mechanism is just CPS return.
+A clause that does not resume returns a value of the handle's
+type `S` — the typer checks every clause body against `S`. The op
+site sees the status still UNRESUMED, stores the value in the
+discard slot, unwinds to the node and longjmps. The rest of the
+body is dropped and the `return` clause does not run.
 
 ### `return` clause
 
 The optional `return(x) -> expr` clause runs on the normal
-completion path of `body`. The compiler emits it as a function
-that takes the body's result and produces the handle's final
-value. If absent, the emitter inserts the identity. LLVM *may*
-fold the call post-monomorphisation; in the worst case, one
-trivial function call per handle exit.
+completion path of `body` only. If absent, the result passes
+through unchanged.
 
 ## Handler-stack runtime
 
-The *evidence vector* is the per-fiber data structure threaded
-through the CPS transform. Its concrete layout for v1:
+The *evidence vector* is the per-fiber data structure op calls
+dispatch through. Its concrete layout for v1:
 
 ```
 struct Fiber {
@@ -731,14 +674,12 @@ map(["a","b"], (s) => Io.print(s); s)    # e = {Io}
 map(lines, parse_int)                    # e = {Fail}
 ```
 
-emits three specialised copies. The copy for `e = {}` runs in
-direct style, without the CPS transform — pure code path. The
-copies for `e = {Io}` and `e = {Fail}` are CPS-transformed and
-read their handlers from `fiber.evidence_top` at op-call sites
-(§*Handler-stack runtime*). The row is *not* an extra function
-parameter; specialisation distinguishes the *shape of the body*
-(direct style vs CPS, which labels the lookup expects), not the
-calling convention. Two copies with different rows have the same
+emits three specialised copies, all in direct style. The copies
+for `e = {Io}` and `e = {Fail}` differ from the pure one in the
+evidence their op-call sites read (§*Handler-stack runtime*). The
+row is *not* an extra function parameter; specialisation
+distinguishes the *shape of the body* (which labels the lookup
+expects), not the calling convention. Two copies with different rows have the same
 ABI on their explicit arguments and differ only in their lowered
 IR.
 
@@ -769,10 +710,11 @@ exact ABI of that erased call (raw-byte layout + element size or
 a runtime witness) is pinned in §*Per-op type generics*.
 
 ## Interaction with Perceus
-<!-- coverage: skip --> design discussion, RC/CPS interplay rationale
+<!-- coverage: skip --> design discussion, RC/continuation interplay rationale
 
-Perceus reuse analysis treats the CPS continuation closure as a
-first-class allocation. Three cases:
+The one-shot `KaiCont` is a stack value the op site owns and holds
+no references; a deferred non-tail frame is an ordinary closure.
+Cases:
 
 ### Op arguments are owned by the handler
 
@@ -792,12 +734,12 @@ shape except a borrowed binder, which is duped into the slot.
 
 ### One-shot, unique (default)
 
-`resume` is called at most once; the continuation closure's RC
-is 1. The closure occupies a sub-region of the caller-of-perform's
-stack frame (§*`resume` representation*), not the whole frame.
-"Reuse" is the tail-call into the resume fn pointer with the
-closed environment — no extra allocation, no heap traffic. The
-closure is reclaimed implicitly when its enclosing frame returns.
+`resume` is called at most once. A tail `resume` allocates
+nothing: the `KaiCont` lives in the op site's frame. A non-tail
+`resume` allocates its deferred frame as an ordinary closure; the
+frame buffer holds one reference, `kai_resume_frames_run`
+consumes it through `kai_apply`, and an exit that skips the handle
+drops it (§*Non-tail `resume`*).
 
 ### Multi-shot, unique owner
 
@@ -836,7 +778,7 @@ the epilogue.
 The continuation closure is a separate matter: it *can* escape
 when `resume_multishot` promotes it to the heap. But the
 continuation captures values from the *perform site* (locals of
-the function that called `Eff.op`, plus the `id_cont` tail), not
+the function that called `Eff.op`), not
 the `handle`'s frame and not the `EvE`. While the continuation
 is callable, the `handle`'s frame is still alive — the
 continuation cannot outlive its handler because the type
@@ -859,7 +801,6 @@ pipeline*) now reads:
   → resolve
   → desugar-post-resolve  (NEW; sugars that need capability bindings)
   → infer                 (HM with rows)
-  → cps-transform         (NEW; effectful functions only)
   → monomorph             (type args + row)
   → perceus
   → lower                 (to LLVM IR or C)
@@ -950,10 +891,9 @@ replaced by:
 - `return(x) -> expr` → `expr` evaluated after the body,
   dropping the slot at the enclosing frame's end.
 
-No evidence struct, no CPS transform for this particular
-`State[T]`. The surrounding body's row still carries `State[T]`
-until the canonical handler is replaced — replacement happens
-in the CPS transform phase, when the handler's shape is known.
+No evidence struct for this particular `State[T]`. The
+surrounding body's row still carries `State[T]` until the
+canonical handler is replaced, once the handler's shape is known.
 
 ### Why the conditions
 
@@ -962,14 +902,11 @@ specialised. 2 is because multi-shot requires a heap-promoted
 closure, which incompatible with a stack slot. 3 is the same
 reason: a closure that outlives the `handle` would have to keep
 the slot alive. 4 is sanity: if `init` can `perform`, the slot's
-initialisation becomes a CPS suspension point, which defeats the
-point.
+initialisation becomes an op dispatch, which defeats the point.
 
 Specialisation is not a best-effort optimisation — the trigger
 conditions are the contract. When the specialisation doesn't fire,
-the canonical handler runs normally. The compiler emits a comment
-in `--dump=cps` diagnostics noting which specialisations fired
-and which didn't, for debugging the m7b ergonomy claim.
+the canonical handler runs normally.
 
 ### Known follow-ups after m7b #5b
 
@@ -1050,8 +987,8 @@ runtime argument (§*At the call site*).
 
 A call `Mutable.array_make[Int](10, 0)` compiles to:
 
-1. The CPS transform produces a monomorphic caller for `T = Int`.
-2. The caller packages `(10, 0, current_continuation)` using the
+1. Monomorphisation produces a caller for `T = Int`.
+2. The caller packages `(10, 0)` and its `KaiCont` using the
    concrete layout for `T = Int` and calls through the erased
    function pointer.
 
@@ -1280,7 +1217,7 @@ After #2b stabilises:
 
 Three new error classes from effect types. Each has a prescribed
 diagnostic shape; the emitter carries the required metadata
-through inference and CPS transform.
+through inference and lowering.
 
 ### Row mismatch
 
@@ -1559,8 +1496,8 @@ Console.print("hi") }` compiles and runs.
 2. **Row unification** — `unify_row` per Doc A §*Row unification*.
 3. **Evidence type generation** — per effect declaration, per
    §*Evidence types*.
-4. **CPS transform** — §*The CPS transform*; effectful functions
-   only.
+4. **Op calls and clauses** — §*Op calls and clauses*; direct
+   style, no CPS.
 5. **Handler-stack runtime** — §*Handler-stack runtime*.
 6. **`perform` / `handle` / `resume` lowering** — §*`handle`
    lowering* + §*`resume` representation*.

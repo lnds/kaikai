@@ -47,6 +47,7 @@ import compiler.emit_tcrec_live
 import compiler.raw_border
 import compiler.handler_alias
 import compiler.refinements
+import compiler.resume_scan
 
 # Lower a fixed-width vec intrinsic to its inline KIR form: a header-less
 # `[n x elem]` aggregate on the native side (no dynamic `Vec`). Returns
@@ -431,6 +432,7 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
     }
     else if is_cell_set(inm) { lower_cell_set(x, inm, iargs, st) }
     else if is_loop_intrinsic(inm) { lower_loop_intrinsic(x, inm, iargs, st) }
+    else if inm == "resume_frame" { lower_resume_frame(x, iargs, st) }
     else if tfslots_is_absent(inm) { LRes(KUnitV, st) }
     else { lower_unhandled(x, st) }
 
@@ -2736,7 +2738,8 @@ fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
       # evidence-frame storage is named per-SITE, not per-EFFECT: two nested
       # handlers of the same effect must NOT share a `__node_<eff>` alloca, or
       # the second push self-cycles the parent chain (refs #789).
-      lower_handle_fork(x, body, eff, sym, result, stateful, has_fin, ret_opt, list_append(hs.pops, ho.pops), st4)
+      let fork = HandleFork { stateful: stateful, has_fin: has_fin, frames: rs_clauses_push_frames(clauses) }
+      lower_handle_fork(x, body, eff, sym, result, fork, ret_opt, list_append(hs.pops, ho.pops), st4)
     } } }
 }
 
@@ -2777,14 +2780,18 @@ fn handle_has_finally(cs: [HClause]) : Bool = match cs {
 # stores the longjmp-returned value as is; both branch to Lret.
 # `stateful` (the handle carries `init` state) gates the return clause's
 # `state`/`log` bind — threaded from `lower_handle` where `init_opt` is known.
+# What shapes a handle's exits: its state, its `finally`, and whether a
+# clause defers resume frames to them.
+type HandleFork = { stateful: Bool, has_fin: Bool, frames: Bool }
+
 fn lower_handle_fork(x: Expr, body: Expr, eff: String, sym: String, result: String,
-                     stateful: Bool, has_fin: Bool, ret_opt: Option[HReturn], pops: [String], st: LowerSt) : LRes / Console =
+                     fork: HandleFork, ret_opt: Option[HReturn], pops: [String], st: LowerSt) : LRes / Console =
   match bind_op(st, KSetjmp(eff, sym), kpos_of(x)) { LRes(jmpv, st1) ->
     match three_labels(st1) { LSL3(ldisc, lbody, lret, st2) -> {
       let st3 = ls_seal(st2, KCondBr(jmpv, ldisc, lbody, kpos_of(x)), lbody)
-      let st4 = lower_handle_body(body, eff, sym, result, has_fin, stateful, ret_opt, lret, st3)
+      let st4 = lower_handle_body(body, eff, sym, result, fork.has_fin, fork.stateful, ret_opt, lret, st3)
       let st5 = lower_handle_discard(sym, result, lret, ldisc, st4)
-      lower_handle_ret(eff, sym, result, stateful, pops, lret, st5)
+      lower_handle_ret(eff, sym, result, fork, pops, lret, st5)
     } } }
 
 # Lbody: lower the body inline, pop the evidence, apply the return
@@ -2826,12 +2833,19 @@ fn lower_handle_discard(sym: String, result: String, lret: String, ldisc: String
   ls_seal(st1, KBr(lret, KNoPos), lret)
 }
 
-# Lret: `result` is the handle's value.
-fn lower_handle_ret(eff: String, sym: String, result: String, stateful: Bool,
-                    pops: [String], lret: String, st: LowerSt) : LRes / Console = {
-  let st1 = kir_unw_pops(pops, reopen(st, lret))
-  LRes(KVar(result), if stateful { lower_handle_release_state(eff, sym, st1) } else { st1 })
-}
+# Lret: `result`, through the clauses' deferred frames, is the handle's value.
+fn lower_handle_ret(eff: String, sym: String, result: String, fork: HandleFork,
+                    pops: [String], lret: String, st: LowerSt) : LRes / Console =
+  match lower_handle_frames(sym, result, fork.frames, reopen(st, lret)) {
+    LRes(v, st0) -> {
+      let st1 = kir_unw_pops(pops, st0)
+      LRes(v, if fork.stateful { lower_handle_release_state(eff, sym, st1) } else { st1 })
+    }
+  }
+
+fn lower_handle_frames(sym: String, result: String, frames: Bool, st: LowerSt) : LRes / Console =
+  if frames { bind_op(st, KPrim("kai_resume_frames_run", [KStrV(sym), KVar(result)]), KNoPos) }
+  else { LRes(KVar(result), st) }
 
 fn kir_unw_pops(pops: [String], st: LowerSt) : LowerSt / Console = match pops {
   [] -> st
@@ -3705,6 +3719,15 @@ fn lower_callee_dispatch(x: Expr, callee: String, csym: FnId, cargs: [Expr], st:
 # supplied by the clause's `ls_finish` close, exactly as the C-direct oracle
 # lets the C function's normal return sequence the resume call. The op result
 # is the resume value (usable by a deep handler's `let x = resume(v)`).
+# The clause's tail after a non-tail `resume`, deferred to the handle's
+# exit. The runtime takes the closure's reference.
+fn lower_resume_frame(x: Expr, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
+  [f] -> match lower_expr(f, st) {
+    LRes(fv, st1) -> bind_op(st1, KPrim("kai_resume_frame_push", [fv]), kpos_of(x))
+  }
+  _ -> lower_unhandled(x, st)
+}
+
 fn lower_resume(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
   [a] -> match lower_expr(a, st) { LRes(av, st1) ->
     bind_op(st1, KResumeOp(KVar(kir_resume_reg()), av), kpos_of(x)) }

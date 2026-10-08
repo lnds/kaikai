@@ -53,6 +53,8 @@ SRC="$ROOT/stage2/compiler"
 #   emit_tcrec_live  — the matches are prose inside a `#[doc]` block.
 #   cache_delta_test,— fixtures; they build the node they assert on.
 #   resolve_sym_test
+#   resume_split,    — run before resolve; mint the binders they just
+#   resume_anf         bound to carry a clause past a non-tail `resume`.
 ALLOW='ast|parse|desugar|surface_lower|modules|type_scope|effect_scope|effect_scope_ids'
 ALLOW="$ALLOW|const_pattern|refinements|refine_enforce|vec_surface|protos"
 ALLOW="$ALLOW|json_derive|layout_derive|fmt_expr|tailfuse|tailids"
@@ -62,6 +64,7 @@ ALLOW="$ALLOW|emit_tcrec_live|cache_delta_test|resolve_sym_test"
 ALLOW="$ALLOW|perceus|perceus_plant_drop|perceus_tail_drop|perceus_owned_pos"
 ALLOW="$ALLOW|perceus_payer|unbox|unbox_native_raw|cell_promote"
 ALLOW="$ALLOW|perceus_branch_plant|index_coll|range_patterns|bang_hoist|deep_hoist|refine_coerce"
+ALLOW="$ALLOW|resume_split|resume_anf"
 
 # Passes at or below the erasure. `EVar` is their correct form: the name
 # is a C symbol there, and `sym_erase` is what put it back.

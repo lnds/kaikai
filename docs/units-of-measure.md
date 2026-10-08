@@ -69,8 +69,8 @@ Unit inference is decidable and efficient. Kennedy 1996/2010
 shows the algorithm is polynomial. The extra cost in the typer
 is proportional to the subset of functions that use units —
 pure code (the majority) pays nothing. Same "transform only what
-is affected" model already used for effects (Doc C §*The CPS
-transform* §*What gets transformed*).
+is affected" model already used for effects (Doc C §*Op calls
+and clauses*).
 
 ### Tier 2 — Approachable core
 

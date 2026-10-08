@@ -8787,6 +8787,10 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
             inferred_leaf(st_bump_err(st), TyAny, e)
           }
         }
+      } else if nm == "resume_frame" {
+        synth_resume_frame(st, args_, e)
+      } else if nm == "resume_bad" {
+        report_resume_bad(st, args_, e)
       } else if tfslots_is_absent(nm) {
         let r = st_fresh_ty(st)
         inferred_leaf(r.st, r.ty, e)
@@ -10335,6 +10339,59 @@ fn synth_resume_call_stateless(st: InferState, name: String, args_: [Expr], call
   let resume_root = with_ty(mk_ref(canonical_continuation(), callee.line, callee.col), callee_ty)
   let root = with_ty(mk_expr(ECall(resume_root, ra.exprs), line, col), ty)
   mk_inferred(st_unif, ty, root)
+}
+
+# `$resume_frame(f)`, minted by the non-tail `resume` split: `f` takes
+# the handle's result and yields the next one, and it runs at the handle's
+# exit in the clause's own context, so its effects are the clause's.
+fn synth_resume_frame(st: InferState, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable = match args_ {
+  [f] -> {
+    let rf = synth(st, f)
+    let s_ty = clause_result_ty(rf.st)
+    let fr = subst_fresh_row(rf.st.sub)
+    let expected = TyFnT([s_ty], s_ty, Row { labels: [], tail: Some(fr.id), display_alias: None })
+    let st1 = st_unify(st_set_sub(rf.st, fr.subst), expected, rf.ty, "deferred clause tail", e.line, e.col)
+    let st2 = st_propagate_capability_labels(st1, apply_ty(st1.sub, rf.ty), e.line, e.col)
+    mk_inferred(st2, TyUnit, with_ty(mk_expr(EIntrinsic("resume_frame", [rf.expr]), e.line, e.col), TyUnit))
+  }
+  _ -> {
+    diag_error(st.file, e.line, e.col, "compiler intrinsic `$resume_frame` takes one argument")
+    inferred_leaf(st_bump_err(st), TyAny, e)
+  }
+}
+
+# `$resume_bad(message, help)`: a clause the non-tail `resume` split
+# could not express, reported at the offending call.
+fn report_resume_bad(st: InferState, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable = {
+  let (msg, help) = match args_ {
+    [m, h] -> (intrinsic_text(m), intrinsic_text(h))
+    _      -> ("malformed `$resume_bad`", "")
+  }
+  diag_error(st.file, e.line, e.col, msg)
+  diag_help(help)
+  let d = mk_diag(SevError, st.file, e.line, e.col, msg, [ri_help(st.file, e.line, e.col, help)])
+  let r = st_fresh_ty(st_bump_err(st_push_diag(st, d)))
+  inferred_leaf(r.st, r.ty, e)
+}
+
+fn intrinsic_text(x: Expr) : String = match x.kind {
+  EStr(span, _) -> strip_string_quotes(span)
+  _             -> ""
+}
+
+# The type of the handle whose clause is being checked: what `resume` returns.
+fn clause_result_ty(st: InferState) : Ty = match st.clause_resume {
+  Some(RB(_, _, s)) -> s
+  None -> match st.in_clause {
+    CcOwn(k) -> match ty_env_lookup(st.env, k) {
+      Some(Scheme(_, _, _, _, t)) -> match t {
+        TyFnT(_, s, _) -> s
+        _ -> TyAny
+      }
+      None -> TyAny
+    }
+    _ -> TyAny
+  }
 }
 
 # type-check `resume(v)` / `resume(v, ns)` inside a clause body.

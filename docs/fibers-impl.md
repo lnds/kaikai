@@ -3,7 +3,7 @@
 The runtime side of the fiber model. Pairs with
 `docs/structured-concurrency.md` (surface and lifetime rules),
 `docs/actors.md` (mailbox + supervision surface), and
-`docs/effects-impl.md` (CPS + handler-stack runtime — the "Doc C"
+`docs/effects-impl.md` (op dispatch + handler-stack runtime — the "Doc C"
 that this document extends with the m8.x scheduler).
 
 The m8 v1 runtime was inline-eager: `Spawn.spawn` ran the thunk
@@ -426,7 +426,7 @@ items* for the inventory.
 
 - `docs/structured-concurrency.md` — surface and lifetime rules.
 - `docs/actors.md` — mailbox + supervision surface.
-- `docs/effects-impl.md` — Doc C: CPS, handler-stack runtime, the
+- `docs/effects-impl.md` — Doc C: op dispatch, handler-stack runtime, the
   evidence vector that this scheduler threads through.
 - `docs/fibers-honesty-targets.md` — scope decision for which
   followups gate which honesty claim, plus the §*Residual m8.x

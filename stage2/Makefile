@@ -3630,7 +3630,6 @@ TEST_EFFECTS_CASES := \
 	test-effects-m7a_6b_handle_runs \
 	test-effects-m7a_6c_op_dispatch \
 	test-effects-m7a_6d_resume_check \
-	test-effects-m7a_6d_double_resume \
 	test-effects-m7a_6e_discard_resume \
 	test-effects-m7a_6f_clause_typed \
 	test-effects-m7a_7_default_console \
@@ -3857,22 +3856,6 @@ test-effects-m7a_6d_resume_check: $(TARGET) build core-cache-warm
 	  ./build/s2-$$name \
 	    && echo "effects OK $$name (one-shot resume runs through KaiCont)" \
 	    || { echo "effects FAIL $$name (binary asserts failed)"; exit 1; }; \
-	done
-
-test-effects-m7a_6d_double_resume: $(TARGET) build core-cache-warm
-	@set -e; \
-	for f in ../examples/effects/m7a_6d_double_resume.kai; do \
-	  name=$$(basename $$f .kai); \
-	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
-	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
-	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
-	  ./build/s2-$$name 2> build/s2-$$name.run.err > /dev/null \
-	    && { echo "effects FAIL $$name (binary should have aborted)"; exit 1; } \
-	    || true; \
-	  grep -q "continuation resumed twice (handler #" build/s2-$$name.run.err \
-	    && echo "effects OK $$name (double resume aborted with diagnostic)" \
-	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.run.err; exit 1; }; \
 	done
 
 test-effects-m7a_6e_discard_resume: $(TARGET) build core-cache-warm

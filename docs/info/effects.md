@@ -21,9 +21,10 @@ not ordered lists: `Stdout + File` ≡ `File + Stdout`. Duplicates are
 idempotent.
 
 Resume is ONE-SHOT and EXPLICIT: a clause receives `resume` as a
-callable; calling it continues the body with a value. Not calling it
-abandons the continuation (e.g. an op returning `Nothing`). Calling it more than once
-is currently a runtime error.
+callable; calling it continues the body with a value and evaluates to
+the handle's result. Not calling it abandons the continuation (e.g. an
+op returning `Nothing`). Calling it twice on one path is a compile
+error.
 
 Abandoning the continuation skips the `return` clauses of the handlers
 it jumps over — those do not run, and neither does the abandoning
@@ -78,7 +79,8 @@ fn main() : Int / Stdout = {
   the body completes.
 - Every op clause evaluates to the handle's type — what `return` yields,
   or the body's type when there is no `return`.
-- Calling `resume(v)` continues the body with `v`.
+- Calling `resume(v)` continues the body with `v`; its value is the
+  handle's result, so code after it runs once the body is done.
 - Outside the `with { ... }`, `Greeter` is no longer in the row.
 
 ## Cleanup — `initially` / `finally`

@@ -6,8 +6,8 @@ document (Doc B) pins *which* effects the stdlib ships, what their
 operations look like, which helpers live alongside them, how the
 current non-effect builtins migrate behind those capabilities, and
 what the runtime installs around `main`. Doc C
-(`docs/effects-impl.md`) will cover the CPS transform and the
-handler-stack runtime.
+(`docs/effects-impl.md`) covers op dispatch and the handler-stack
+runtime.
 
 Scope of v1: a fixed catalog of effects, with handlers either
 provided natively by the runtime or expressible in kaikai-minimal.
@@ -2423,7 +2423,7 @@ Ffi                                   (always innermost, compiler-synthesised)
 
 ## Next steps
 
-- **Doc C** — `docs/effects-impl.md`: the CPS transform in the
+- **Doc C** — `docs/effects-impl.md`: op dispatch in the
   stage-2 pipeline, `TyFnT` gaining an effect-row slot, the
   handler-stack runtime representation, per-op type generics
   implementation, interaction with monomorphisation and fibers
@@ -2448,7 +2448,7 @@ Milestone m7 splits into two sub-milestones to keep the blast
 radius tractable:
 
 - **m7a — mechanics**: row unification in the checker, `TyFnT`
-  with an effect-row slot, CPS transform of ops and handlers,
+  with an effect-row slot, lowering of ops and handlers,
   handler-stack runtime, default handlers for `Console`,
   `Stdin`, `Env`, `File`, `Mutable`, `Fail` (and `Ffi` as
   compiler-synthesised), basic diagnostics for row-mismatch and

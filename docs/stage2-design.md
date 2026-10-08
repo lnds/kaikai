@@ -74,7 +74,7 @@ The full design lives in three pinned docs:
   `handle`/`resume`, inference. The mental model.
 - `docs/effects-stdlib.md` (Doc B): catalog of stdlib effects,
   default handlers, the `Io` alias, m7a/m7b split.
-- `docs/effects-impl.md` (Doc C): CPS transform, handler-stack
+- `docs/effects-impl.md` (Doc C): op dispatch, handler-stack
   runtime, codemod.
 
 Stage 2 ships the implementation; this section summarises the
@@ -215,8 +215,8 @@ that lands with its message text, not a TODO.
   → infer      (HM-extended with effect rows, region branding)
   → monomorph  (instantiate generics, specialise drops)
   → perceus    (reuse analysis, insert incref/decref)
-  → lower      (typed IR → LLVM IR or C; CPS transform of effect ops
-                lives in this pass — see docs/effects-impl.md)
+  → lower      (typed IR → LLVM IR or C; effect ops lower to direct
+                clause calls — see docs/effects-impl.md)
   → link       (ld / clang wrapper)
 ```
 

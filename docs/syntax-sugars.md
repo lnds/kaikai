@@ -448,7 +448,7 @@ Specialisation applies when the cell does not escape its
 scope. If a closure capturing the cell escapes (passed to
 `Spawn.spawn`, returned out of the block, stored in a heap
 structure), the specialisation cannot fire and the handler
-falls back to the generic CPS-threaded desugar — still
+falls back to the generic handler desugar — still
 correct, no longer zero-overhead. Doc C pins the exact escape
 analysis.
 
