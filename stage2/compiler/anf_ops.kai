@@ -1,0 +1,125 @@
+#[doc("""
+The operands of an expression in evaluation order, and how to rebuild it
+from new ones: the shapes an A-normal-form pass can bind operands out of
+(`resume_anf`). A callee that is not a plain name is the first operand; a
+pipe's right side is a call shape the typer rewrites, so only its left
+operand is listed.
+""")]
+
+import compiler.ast
+
+#[doc("The operands of a node, in evaluation order, and how to rebuild the node's kind from them.")]
+pub type Ops = Ops([Expr], ([Expr]) -> ExprKind)
+
+#[doc("The operands of `e` in evaluation order, or `None` for a node whose operands this form does not list.")]
+pub fn anf_operands(e: Expr) : Option[[Expr]] = match anf_operands_of(e, no_pick) {
+  Some(Ops(xs, _)) -> Some(xs)
+  None             -> None
+}
+
+#[doc("`e` with its operands, as `anf_operands` lists them, replaced by `vs`.")]
+pub fn anf_rebuild(e: Expr, vs: [Expr]) : Expr = match anf_operands_of(e, no_pick) {
+  Some(Ops(_, rebuild)) -> with_kind(e, rebuild(vs))
+  None                  -> e
+}
+
+fn no_pick(x: Expr) : Bool = false
+
+#[doc("`e` with its kind replaced, keeping position, type and mode.")]
+pub fn with_kind(e: Expr, kind: ExprKind) : Expr = Expr { kind: kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+#[doc("True when `x` is a value read in place, with nothing to evaluate: it need not be bound to keep its order.")]
+pub fn anf_is_atom(x: Expr) : Bool = match x.kind {
+  EVar(_)        -> true
+  ESym(_, _, _)  -> true
+  EModCall(_, _) -> true
+  EInt(_, _)     -> true
+  EIntLit(_)     -> true
+  EBool(_)       -> true
+  EUnit          -> true
+  _              -> false
+}
+
+#[doc("The operands of `e` with how to rebuild it, or `None` for a shape whose operand `pick` holds cannot be split out.")]
+pub fn anf_operands_of(e: Expr, pick: (Expr) -> Bool) : Option[Ops] = match e.kind {
+  ECall(f, xs) -> callee_ops(f, xs, pick)
+  EPipe(a, b)        -> lhs_ops(a, b, pick, (x) => EPipe(x, b))
+  EMapPipe(a, b)     -> lhs_ops(a, b, pick, (x) => EMapPipe(x, b))
+  EFlatMapPipe(a, b) -> lhs_ops(a, b, pick, (x) => EFlatMapPipe(x, b))
+  EFilterPipe(a, b)  -> lhs_ops(a, b, pick, (x) => EFilterPipe(x, b))
+  kind -> unary_binary_ops(kind)
+}
+
+# A callee runs before its arguments: one that is not a plain name is an
+# operand too. A mark asks for a lowering, not for a call.
+fn callee_ops(f: Expr, xs: [Expr], pick: (Expr) -> Bool) : Option[Ops] = match f.kind {
+  EField(recv, m) -> Some(Ops([recv, ...xs], (vs) => ECall(with_kind(f, EField(head_of(vs, f), m)), tail_of(vs))))
+  EMark(_) -> None
+  _ ->
+    if anf_is_atom(f) { Some(Ops(xs, (vs) => ECall(f, vs))) }
+    else if pick(f) { None }
+    else { Some(Ops([f, ...xs], (vs) => ECall(head_of(vs, f), tail_of(vs)))) }
+}
+
+fn unary_binary_ops(kind: ExprKind) : Option[Ops] = match kind {
+  EBinop(op, a, b)  -> Some(Ops([a, b], (vs) => EBinop(op, head_of(vs, a), head_of(tail_of(vs), b))))
+  EUnop(op, x)      -> Some(Ops([x], (vs) => EUnop(op, head_of(vs, x))))
+  EField(b, n)      -> Some(Ops([b], (vs) => EField(head_of(vs, b), n)))
+  EIf(c, t, eo)     -> Some(Ops([c], (vs) => EIf(head_of(vs, c), t, eo)))
+  EMatch(scr, arms) -> Some(Ops([scr], (vs) => EMatch(head_of(vs, scr), arms)))
+  EBang(x)          -> Some(Ops([x], (vs) => EBang(head_of(vs, x))))
+  ELitUnit(x, u)    -> Some(Ops([x], (vs) => ELitUnit(head_of(vs, x), u)))
+  _                 -> collection_ops(kind)
+}
+
+fn collection_ops(kind: ExprKind) : Option[Ops] = match kind {
+  EIntrinsic(n, xs) -> Some(Ops(xs, (vs) => EIntrinsic(n, vs)))
+  ERecordLit(n, fs) -> Some(Ops(map(fs, field_value), (vs) => ERecordLit(n, refill_fields(fs, vs))))
+  EList(els)        -> Some(Ops(map(els, elem_value), (vs) => EList(refill_elems(els, vs))))
+  EIndex(a, b)      -> Some(Ops([a, b], (vs) => EIndex(head_of(vs, a), head_of(tail_of(vs), b))))
+  ERange(a, b, st)  -> Some(Ops([a, b, ...opt_exprs(st)], (vs) => ERange(head_of(vs, a), head_of(tail_of(vs), b), refill_opt(st, tail_of(tail_of(vs))))))
+  _                 -> None
+}
+
+fn opt_exprs(o: Option[Expr]) : [Expr] = match o {
+  Some(x) -> [x]
+  None    -> []
+}
+
+fn refill_opt(o: Option[Expr], vs: [Expr]) : Option[Expr] = match o {
+  Some(x) -> Some(head_of(vs, x))
+  None    -> None
+}
+
+# A pipe's right side is a call shape the typer rewrites; only its left
+# operand can be split out.
+fn lhs_ops(a: Expr, b: Expr, pick: (Expr) -> Bool, rebuild: (Expr) -> ExprKind) : Option[Ops] =
+  if pick(b) { None } else { Some(Ops([a], (vs) => rebuild(head_of(vs, a)))) }
+
+fn head_of(vs: [Expr], dflt: Expr) : Expr = match vs {
+  [v, ..._] -> v
+  []        -> dflt
+}
+
+fn tail_of(vs: [Expr]) : [Expr] = match vs {
+  [_, ...rest] -> rest
+  []           -> []
+}
+
+fn field_value(fi: FieldInit) : Expr = match fi { FI(_, v) -> v }
+
+fn refill_fields(fs: [FieldInit], vs: [Expr]) : [FieldInit] = match fs {
+  [FI(n, v), ...rest] -> [FI(n, head_of(vs, v)), ...refill_fields(rest, tail_of(vs))]
+  []                  -> []
+}
+
+fn elem_value(el: ListElem) : Expr = match el {
+  ElPlain(x)  -> x
+  ElSpread(x) -> x
+}
+
+fn refill_elems(els: [ListElem], vs: [Expr]) : [ListElem] = match els {
+  [ElPlain(x), ...rest]  -> [ElPlain(head_of(vs, x)), ...refill_elems(rest, tail_of(vs))]
+  [ElSpread(x), ...rest] -> [ElSpread(head_of(vs, x)), ...refill_elems(rest, tail_of(vs))]
+  []                     -> []
+}

@@ -1533,11 +1533,11 @@ fn lower_let_pbind(name: String, slot: KSlot, v: KVal, pat: Pattern, st: LowerSt
 
 fn lower_let_bind(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = match pat.pkind {
   PBind(name)          -> lower_let_pbind(name, SBoxed, v, pat, st)
-  PRecord(_)           -> bind_let_owned(pat, v, st)
-  PVariant(_, _, _)       -> bind_let_owned(pat, v, st)
-  PVariantRecord(_, _, _) -> bind_let_owned(pat, v, st)
-  PList(_, _)          -> bind_let_owned(pat, v, st)
-  PAs(_, _)            -> bind_let_owned(pat, v, st)
+  PRecord(_)           -> lower_let_owned(pat, v, st)
+  PVariant(_, _, _)       -> lower_let_owned(pat, v, st)
+  PVariantRecord(_, _, _) -> lower_let_owned(pat, v, st)
+  PList(_, _)          -> lower_let_owned(pat, v, st)
+  PAs(_, _)            -> lower_let_owned(pat, v, st)
   # A wildcard let discards its value: a `()` needs no `KDo` (nothing to
   # drop) — the shape every desugared cell write takes.
   _                    -> match v {
@@ -1545,6 +1545,29 @@ fn lower_let_bind(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = matc
     _      -> ls_emit(st, KDo(KLitOp(v), KAt(pat.line, pat.col)))
   }
 }
+
+fn lower_let_owned(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console =
+  ls_unw_owning(bind_let_owned(pat, v, st), list_append(rec_field_owned(pat), pat_alias_binders(pat, st.vs)))
+
+# A plain record field binder owns its `kai_op_field` read; one nested
+# under a field's sub-pattern may own nothing.
+fn rec_field_owned(p: Pattern) : [String] = match p.pkind {
+  PRecord(fs)              -> rfo_fields(fs)
+  PVariantRecord(_, _, fs) -> rfo_fields(fs)
+  PAs(_, inner)            -> rec_field_owned(inner)
+  _                        -> []
+}
+
+fn rfo_fields(fs: [PField]) : [String] = match fs {
+  [] -> []
+  [PField(_, sub, _), ...rest] -> match sub.pkind {
+    PBind(n) -> [n, ...rfo_fields(rest)]
+    _        -> rfo_fields(rest)
+  }
+}
+
+fn ls_unw_owning(st: LowerSt, names: [String]) : LowerSt =
+  if st.unw.arms == [] { st } else { ls_with_unw(st, unw_owning(st.unw, names)) }
 
 # --- if -----------------------------------------------------------------
 
@@ -1908,7 +1931,7 @@ fn tcp_seed_arm(owned: Bool, sd: String, binders: [String],
                 body: Expr, pend0: [String], st0: LowerSt) : LowerSt = {
   # The binders this arm dup'd hold their own reference: an unwind may
   # release them.
-  let st = if st0.unw.arms == [] { st0 } else { ls_with_unw(st0, unw_owning(st0.unw, binders)) }
+  let st = ls_unw_owning(st0, binders)
   if not tcl_has_exit(body) { ls_set_tcpend(st, []) }
   else {
     let with_scr = if owned and not arm_body_all_tail_self_tcrec(body) {
@@ -2228,7 +2251,8 @@ fn lower_record_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
       # Field binds arrive OWNED (`kai_op_field` increfs); only a whole-value
       # binder aliases the scrutinee (an unconsumed field binder on a goto
       # path stays a bounded leak).
-      let st_drop = whole_binder_rc(p, scrv, body, owned, sd, pend0, st_body)
+      let st_own = ls_unw_owning(st_body, rec_field_owned(p))
+      let st_drop = whole_binder_rc(p, scrv, body, owned, sd, pend0, st_own)
       let st_done = lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop))
       if rec_arm_is_catchall(p) { st_done }
       else { lower_record_arms(rest, scrv, join, lcont, owned, sd, pend0, reopen(st_done, fail_lbl)) }

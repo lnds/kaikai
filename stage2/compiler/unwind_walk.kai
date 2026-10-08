@@ -26,6 +26,7 @@ import compiler.unwind_binders
 import compiler.unwind_sites
 import compiler.unwind_reads
 import compiler.unwind_pads
+import compiler.sym_read
 
 # `banned` names a binder bound twice in the frame: a mention cannot say
 # which binding it reads, so neither is ever registered. `locals` are
@@ -91,12 +92,18 @@ fn uw_match(e: Expr, s: Expr, arms: [Arm], pend: [String], z: [String], fx: UwFx
 }
 
 # A call that can unwind registers what is live across it and not handed
-# to it; a site inside its operands leaves those names to this one.
+# to it, and the emitter adds the closure it calls through a local; a site
+# inside its operands leaves those names to this one.
 fn uw_site(e: Expr, f: Expr, xs: [Expr], pend: [String], z: [String], fx: UwFx, sites: [UnwSite]) : UwR = {
   let live = unw_minus(pend, z)
   let r = uw_nary(e, pend, z, fx, [])
   let held = unw_minus(unw_union(unw_inter(live, r.pend), unw_lent(f, xs, live)), fx.banned)
-  UwR { pend: r.pend, sites: unw_add(UnwCall(e.line, e.col, unw_callee_key(f), held), unw_merge(r.sites, held, sites)) }
+  UwR { pend: r.pend, sites: unw_add(UnwCall(e.line, e.col, unw_callee_key(f), held), unw_merge(r.sites, unw_union(held, uw_local_callee(f, fx)), sites)) }
+}
+
+fn uw_local_callee(f: Expr, fx: UwFx) : [String] = match sym_read_kind(f.kind) {
+  EVar(n) -> if list_has(fx.locals, n) { [n] } else { [] }
+  _       -> []
 }
 
 # An expression that can trap releases what is live across it through a
@@ -128,8 +135,9 @@ fn uw_all_pads(ss: [UnwSite]) : Bool = match ss {
   [s, ...rest] -> unw_is_pad(s) and uw_all_pads(rest)
 }
 
-# Children evaluated in unspecified order: each child is walked once, and
-# a site inside it then drops what its siblings might consume first. A
+# Children run left to right: each child is walked once, and a site
+# inside it then drops what an earlier sibling consumed. A sibling that
+# is a bare read hands its reference over only when the parent runs. A
 # child that is not run inline (a lambda, a clause) is judged by its reads.
 # Removing a name from a site set commutes with every step that builds it,
 # so dropping it afterwards is the same as never letting it in.
@@ -138,7 +146,7 @@ fn uw_nary(e: Expr, pend: [String], z: [String], fx: UwFx, sites: [UnwSite]) : U
   ps -> {
     let rs = uw_walk_children(ps, pend, z, fx)
     let eaten = map(rs, (r) => unw_minus(pend, r.pend))
-    UwR { pend: unw_minus(pend, unw_others(eaten, -1, 0)), sites: uw_join(rs, eaten, 0, sites) }
+    UwR { pend: unw_minus(pend, unw_others(eaten, -1, 0)), sites: uw_join(ps, rs, eaten, [], sites) }
   }
 }
 
@@ -153,9 +161,16 @@ fn uw_child(r: XRole, c: Expr, pend: [String], z: [String], fx: UwFx) : UwR = ma
   _    -> uw_expr(c, pend, z, fx, [])
 }
 
-fn uw_join(rs: [UwR], eaten: [[String]], i: Int, acc: [UnwSite]) : [UnwSite] = match rs {
-  [] -> acc
-  [r, ...rest] -> uw_join(rest, eaten, i + 1, unw_merge(r.sites, unw_others(eaten, i, 0), acc))
+# `gone` holds what the earlier siblings consumed.
+fn uw_join(ps: [XPos], rs: [UwR], eaten: [[String]], gone: [String], acc: [UnwSite]) : [UnwSite] = match (ps, rs, eaten) {
+  ([XP(_, c), ...ps2], [r, ...rs2], [e, ...es2]) ->
+    uw_join(ps2, rs2, es2, if uw_bare_read(c) { gone } else { unw_union(gone, e) }, unw_merge(r.sites, gone, acc))
+  _ -> acc
+}
+
+fn uw_bare_read(c: Expr) : Bool = match sym_read_kind(c.kind) {
+  EVar(_) -> true
+  _       -> false
 }
 
 fn uw_block(ss: [Stmt], ot: Option[Expr], pend: [String], z: [String], fx: UwFx, sites: [UnwSite]) : UwR = match ss {
@@ -197,17 +212,18 @@ fn uw_assert(s: Stmt, c: Expr, pend: [String], z: [String], fx: UwFx, sites: [Un
 fn uw_stmt_nary(ps: [XPos], pend: [String], z: [String], fx: UwFx, sites: [UnwSite], s: Stmt) : UwR = {
   let rs = uw_walk_children(ps, pend, z, fx)
   let eaten = map(rs, (r) => unw_minus(pend, r.pend))
-  UwR { pend: unw_minus(tcl_filter_stmts(pend, [s]), unw_others(eaten, -1, 0)), sites: uw_join(rs, eaten, 0, sites) }
+  UwR { pend: unw_minus(tcl_filter_stmts(pend, [s]), unw_others(eaten, -1, 0)), sites: uw_join(ps, rs, eaten, [], sites) }
 }
 
 # A boxed `let` binder holds its birth reference: every binding perceus
-# tracks has one, and a raw rhs keeps the binder out of its scope.
+# tracks has one, and a raw rhs keeps the binder out of its scope. A
+# destructuring one binds each name with a reference of its own.
 fn uw_owned_let(pat: Pattern, rhs: Expr, fx: UwFx) : [String] = match pat.pkind {
   PBind(n) -> match rhs.mode {
     MUnboxed -> []
     _        -> if n == "_" or list_has(fx.banned, n) { [] } else { [n] }
   }
-  _ -> []
+  _ -> unw_minus(unw_destructured(pat), fx.banned)
 }
 
 # An owned match's arm binders hold the reference the bind took for the

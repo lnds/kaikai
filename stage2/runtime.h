@@ -7448,11 +7448,7 @@ static KAI_RC_NOINLINE KaiValue *kai_closure(KaiFn fn, int arity, int n_captures
  * Post-fix the contract is symmetric with the rest of m5.x: every
  * KaiValue * passed to kai_apply is OWNED by the call. The dispatched
  * fn body cannot read `self` after its own return (it cannot — that
- * pointer is freed before the result hits the caller), and runtime
- * helpers (kai_core_map / _filter / _flat_map / _reduce / _each,
- * kai_fiber_trampoline) now incref the closure ahead of every loop
- * iteration so each kai_apply gets its own ref to consume; their
- * post-loop decref releases the original ref the helper was handed. */
+ * pointer is freed before the result hits the caller). */
 static KaiValue *kai_apply(KaiValue *clo, int argc, KaiValue **argv) {
     if (!clo || clo->tag != KAI_CLOSURE) {
         fprintf(stderr, "kai: attempted to call a non-callable value\n");
@@ -8653,13 +8649,11 @@ static KaiValue *kai_core_list_reverse(KaiValue *xs) {
  * cons-chain stays alive under `xs`'s single reference until the
  * helper exits, and we can decref `xs` once at the end.
  *
- * kai_apply contract under m5.x flip: every arg slot holds an OWNED
- * reference that the callee consumes (the closure body is perceus-
- * compiled and decrefs each arg through normal use). The helpers
- * `kai_incref(p->as.cons.head)` to give the closure its own
- * ownership of each element while the cons cell stays alive under
- * `xs`. `kai_apply` itself does NOT consume `f` — the helper does
- * that once, post-loop.
+ * Every arg slot holds an OWNED reference that the callee consumes
+ * (the closure body is perceus-compiled and decrefs each arg through
+ * normal use). The helpers give the closure its own reference of each
+ * element while the cons cell stays alive under `xs`, and lend it `f`,
+ * which they release once, post-loop.
  *
  * `_map` / `_filter` build their result reversed (each iteration
  * cons-prepends) and call `kai_core_list_reverse` once to
@@ -8668,16 +8662,24 @@ static KaiValue *kai_core_list_reverse(KaiValue *xs) {
  * produces the final list — no extra retention.
  */
 
+/* The callback may exit non-locally, past this frame: what the frame
+ * owns across it sits in `held`, registered on the unwind stack once per
+ * call, and the callback borrows `f`. A slot whose reference has moved
+ * on holds NULL. */
+static inline KaiFiber *kai_unw_push(KaiValue **base, intptr_t n);
+static inline void kai_unw_pop(KaiFiber *f);
+
 static KaiValue *kai_core_map(KaiValue *xs, KaiValue *f) {
-    KaiValue *acc = kai_nil();
+    KaiValue *held[3] = { xs, f, kai_nil() };
+    KaiFiber *uf = kai_unw_push(held, 3);
     KaiSeqIt it;
     kai_seq_it_init(&it, xs);
     for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it)) {
-        /* kai_apply consumes (#298): x is owned, f incref'd per iter. */
-        KaiValue *head = kai_apply(kai_incref(f), 1, &x);
-        acc = kai_cons(head, acc);
+        KaiValue *head = kai_apply_borrow(f, 1, &x);
+        held[2] = kai_cons(head, held[2]);
     }
-    KaiValue *result = kai_core_list_reverse(acc);  /* consumes acc */
+    kai_unw_pop(uf);
+    KaiValue *result = kai_core_list_reverse(held[2]);  /* consumes acc */
     if (xs) kai_decref(xs);
     if (f)  kai_decref(f);
     return result;
@@ -8691,42 +8693,47 @@ static KaiValue *kai_core_map(KaiValue *xs, KaiValue *f) {
  * the input shape. Empty pieces are a no-op for the inner loop.
  */
 static KaiValue *kai_core_flat_map(KaiValue *xs, KaiValue *f) {
-    KaiValue *acc = kai_nil();
+    KaiValue *held[3] = { xs, f, kai_nil() };
+    KaiFiber *uf = kai_unw_push(held, 3);
     KaiSeqIt it;
     kai_seq_it_init(&it, xs);
     for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it)) {
-        /* kai_apply consumes (#298): x is owned, f incref'd per iter. */
-        KaiValue *piece = kai_apply(kai_incref(f), 1, &x);
+        KaiValue *piece = kai_apply_borrow(f, 1, &x);
         /* Reverse `piece` into `acc` (which is in reverse order); the
          * final single reverse restores element order. `piece` may
          * itself be a range — the cursor covers it. */
         KaiSeqIt qi;
         kai_seq_it_init(&qi, piece);
         for (KaiValue *q = kai_seq_it_next(&qi); q; q = kai_seq_it_next(&qi))
-            acc = kai_cons(q, acc);
+            held[2] = kai_cons(q, held[2]);
         if (piece) kai_decref(piece);
     }
-    KaiValue *result = kai_core_list_reverse(acc);  /* consumes acc */
+    kai_unw_pop(uf);
+    KaiValue *result = kai_core_list_reverse(held[2]);  /* consumes acc */
     if (xs) kai_decref(xs);
     if (f)  kai_decref(f);
     return result;
 }
 
 static KaiValue *kai_core_filter(KaiValue *xs, KaiValue *pred) {
-    KaiValue *acc = kai_nil();
+    KaiValue *held[4] = { xs, pred, kai_nil(), NULL };
+    KaiFiber *uf = kai_unw_push(held, 4);
     KaiSeqIt it;
     kai_seq_it_init(&it, xs);
     for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it)) {
-        /* kai_apply consumes (#298): the predicate gets its own ref of
-         * x; the kept element reuses the cursor's owned ref. */
+        /* The predicate gets its own ref of x; the kept element reuses
+         * the cursor's owned ref. */
         KaiValue *arg0 = kai_incref(x);
-        KaiValue *keep = kai_apply(kai_incref(pred), 1, &arg0);
+        held[3] = x;
+        KaiValue *keep = kai_apply_borrow(pred, 1, &arg0);
+        held[3] = NULL;
         int yes = kai_op_truthy(keep);
         kai_decref(keep);
-        if (yes) acc = kai_cons(x, acc);
+        if (yes) held[2] = kai_cons(x, held[2]);
         else     kai_decref(x);
     }
-    KaiValue *result = kai_core_list_reverse(acc);  /* consumes acc */
+    kai_unw_pop(uf);
+    KaiValue *result = kai_core_list_reverse(held[2]);  /* consumes acc */
     if (xs)   kai_decref(xs);
     if (pred) kai_decref(pred);
     return result;
@@ -8739,29 +8746,33 @@ static KaiValue *kai_core_reduce(KaiValue *xs, KaiValue *init, KaiValue *f) {
      * return init unchanged — its single ref flows out to the
      * caller. A range input runs entirely through the cursor: no cons
      * cell is ever built. */
-    KaiValue *acc = init;
+    KaiValue *held[3] = { xs, f, init };
+    KaiFiber *uf = kai_unw_push(held, 3);
     KaiSeqIt it;
     kai_seq_it_init(&it, xs);
     for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it)) {
         KaiValue *args[2];
-        args[0] = acc;                              /* transfer to closure */
+        args[0] = held[2];                          /* transfer to closure */
         args[1] = x;                                /* closure consumes */
-        /* kai_apply consumes (#298): incref f for each iter. */
-        acc = kai_apply(kai_incref(f), 2, args);    /* closure produces fresh acc */
+        held[2] = NULL;
+        held[2] = kai_apply_borrow(f, 2, args);     /* closure produces fresh acc */
     }
+    kai_unw_pop(uf);
     if (xs) kai_decref(xs);
     if (f)  kai_decref(f);
-    return acc;
+    return held[2];
 }
 
 static KaiValue *kai_core_each(KaiValue *xs, KaiValue *f) {
+    KaiValue *held[2] = { xs, f };
+    KaiFiber *uf = kai_unw_push(held, 2);
     KaiSeqIt it;
     kai_seq_it_init(&it, xs);
     for (KaiValue *x = kai_seq_it_next(&it); x; x = kai_seq_it_next(&it)) {
-        /* kai_apply consumes (#298): x is owned, f incref'd per iter. */
-        KaiValue *r = kai_apply(kai_incref(f), 1, &x);
+        KaiValue *r = kai_apply_borrow(f, 1, &x);
         kai_decref(r);
     }
+    kai_unw_pop(uf);
     if (xs) kai_decref(xs);
     if (f)  kai_decref(f);
     return kai_unit();
