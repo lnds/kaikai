@@ -84,6 +84,37 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.136.0 (2026-10-08)
+
+### BREAKING CHANGE
+
+- code after a non-tail resume now runs once the handled
+body is done and sees the handle's result, so a clause that relied on
+resume returning its argument changes output; a second resume on one
+path, and the shapes above, are compile errors.
+- a function that applies a row-polymorphic function out
+of a sum or record must declare that row variable, and a function with
+a declared open row must also declare every concrete effect its body
+performs.
+- a handler clause that fixes an op's own type parameter
+or lets it escape, and a body performing ops of one effect instance at
+two different types, are now compile errors; a `send` clause sees the
+message as its own type parameter.
+
+### Added
+
+- **compiler**: declare a core builtin in core with extern "kai" (#2589)
+- **stdlib**: give Actor.send its own message type, closing three typer soundness holes on the way (#2585)
+
+### Fixed
+
+- **native**: end a body whose only exit is a self tail call in unreachable (#2592)
+- **compiler**: keep shadowed var cells and handler-clause cell reads on their own slots (#2591)
+- **emit**: emit a call's arguments once (#2590)
+- **effects**: run the rest of the body on a non-tail resume (#2586)
+- **typer**: a row variable the body performs must appear in the declared row (#2584)
+- **emit**: bound the C nesting of deep call, operator and pipe chains (#2587)
+
 ## v0.135.0 (2026-10-07)
 
 ### BREAKING CHANGE
