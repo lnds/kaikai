@@ -54,16 +54,9 @@
  *
  * HOT/OWNER SPLIT (KAI_HOT_ONLY). The native backend links a clang-O2
  * copy of this TU as bitcode and MERGES it into the program module so O2
- * inlines the hot value/RC/arithmetic ops. That is sound only for leaf
- * ops: clang -O2 treats the thread pointer as call-invariant and caches
- * it (in a callee-saved register, spilled) across any call — including
- * swapcontext. Under M:N work-stealing a fiber resumes on a DIFFERENT OS
- * thread, so a cached thread pointer then addresses the creator thread's
- * _Thread_local scheduler state (the worker's active fiber, its pending
- * frees, its root): two threads share one `active`, the scheduler
- * cross-wires, and a live fiber's stack is freed under it. gcc does not
- * hoist the thread pointer across swapcontext; the same header is sound
- * built with cc.
+ * inlines the hot value/RC/arithmetic ops into emitted frames. Those frames
+ * span parks, and a fiber can resume on another OS thread, so only leaf ops
+ * that never switch context may be merged.
  *
  * So the runtime splits in two, along one macro:
  *   - KAI_HOT_ONLY (this file, compiled to bitcode): ONLY the leaf ops —
@@ -71,11 +64,13 @@
  *     never reach swapcontext. Safe to inline via clang -O2.
  *   - the OWNER TU (this file, compiled by cc): the full runtime,
  *     including everything gated out below (effects, evidence,
- *     continuations, handlers, the scheduler, actors, `main`). cc keeps
- *     the thread pointer honest across every context switch.
+ *     continuations, handlers, the scheduler, actors, `main`). Its
+ *     functions reach scheduler state through kai_worker_here or the
+ *     running fiber, never through a thread-local held across a switch.
  * Both native link paths (whole-program and modular) merge the hot
- * bitcode and link the cc owner object. The invariant is mechanical:
- * `llvm-nm` on the hot bitcode must show NO reference to swapcontext.
+ * bitcode and link the cc owner object. The invariants are mechanical:
+ * `llvm-nm` on the hot bitcode must show NO reference to swapcontext, and
+ * `tools/tls-hoist-gate.sh` checks the thread-locals of both halves.
  * Over-gating an op is harmless (the owner TU still defines it; it just
  * is not inlined); under-gating a suspend-point op is unsound, which the
  * swapcontext check catches. */

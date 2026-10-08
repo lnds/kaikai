@@ -38,7 +38,7 @@ FIXTURE="examples/llvm/cancel_raise_in_fiber_under_mailbox.kai"
 # wording per thread count would make the gate a spelling test.
 BANNER="— deadlock"
 
-# `kai` builds the scheduler as a separate -O0 owner object; single-tu-O2 is
+# `kai` builds the scheduler as a separate owner object; single-tu-O2 is
 # the single-TU path the stage2 Makefile recipes take. The window this gate
 # watches opens differently under each, so both arms run.
 ARMS=("kai" "single-tu-O2")

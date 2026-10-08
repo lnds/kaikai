@@ -5774,12 +5774,12 @@ test-segment-switch-asan: build
 	  || { echo "segment-switch-asan FAIL"; exit 1; }
 
 # Stack segments driven from C, linked the way a program is: the test as an
-# -O2 program TU, the runtime owner at -O0 beside it. Runs at one thread and
+# -O2 program TU, the runtime owner beside it. Runs at one thread and
 # under work stealing, where a suspended segment must migrate with its fiber.
 COMMA := ,
 SEG_RT_WARN := -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -g
 define seg_rt_build
-	@$(CC) $(SEG_RT_WARN) -O0 $(2) $(CPPFLAGS_CORE) -DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 \
+	@$(CC) $(SEG_RT_WARN) -O2 $(2) $(CPPFLAGS_CORE) -DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 \
 	    -DKAI_PROGRAM_PROVIDES_MAIN=1 -I ../stage0 -c runtime_owner_c.c -o build/seg_rt_owner$(1).o
 	@$(CC) $(SEG_RT_WARN) -O2 $(2) $(CPPFLAGS_CORE) -DKAI_SEPARATE_COMPILATION=1 -I ../stage0 \
 	    -c tests/segment_runtime_test.c -o build/seg_rt_test$(1).o
@@ -5789,7 +5789,7 @@ endef
 
 test-segment-runtime: build
 	$(call seg_rt_build,,)
-	@for n in 1 4; do KAI_THREADS=$$n ./build/segment_runtime_test || { echo "segment-runtime FAIL (KAI_THREADS=$$n)"; exit 1; }; done
+	@for n in 1 4 8; do KAI_THREADS=$$n ./build/segment_runtime_test || { echo "segment-runtime FAIL (KAI_THREADS=$$n)"; exit 1; }; done
 	@echo "segment-runtime OK"
 
 # LeakSanitizer exists on Linux only.

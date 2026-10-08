@@ -5,7 +5,8 @@
 #   the function bodies that cite them are classified)
 #
 # Emits one `<symbol> <function> <accessor|exposed>` triple per
-# (thread-local, materialising function) pair.
+# (thread-local, materialising function) pair; under `-v detail=1`, one
+# `<symbol> <function> <inlinable> <leaks>` line (0/1 each) instead.
 #
 #   accessor  the function is `noinline` and keeps the address to itself, so
 #             the address is resolved inside a single activation — thread
@@ -89,6 +90,7 @@ END {
     for (key in ref) {
         split(key, part, SUBSEP)
         sym = part[1]; fn = part[2]
-        print sym, fn, ((inlinable[fn] || leaks[fn]) ? "exposed" : "accessor")
+        if (detail) print sym, fn, (inlinable[fn] ? 1 : 0), (leaks[fn] ? 1 : 0)
+        else        print sym, fn, ((inlinable[fn] || leaks[fn]) ? "exposed" : "accessor")
     }
 }

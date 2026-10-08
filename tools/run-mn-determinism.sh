@@ -19,9 +19,8 @@
 #     window: the same fixture that fails on a majority of runs redirected
 #     to a file is clean on every run through a pipe.
 #   * both build arms run. `bin/kai` compiles the scheduler into a separate
-#     -O0 owner object, which suppresses the races outright; the single-TU
-#     -O2 arm is the path the stage2 Makefile recipes take, and the one
-#     where they reproduce.
+#     owner object; the single-TU -O2 arm is the path the stage2 Makefile
+#     recipes take, and the one where these races have reproduced.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -131,7 +130,7 @@ same_output() {
   if is_multiset "$3"; then sort "$1" | cmp -s - "$2"; else cmp -s "$1" "$2"; fi
 }
 
-# kai: the shipped build path (separate -O0 scheduler owner).
+# kai: the shipped build path (separate scheduler owner).
 # single-tu-O2: emitted C as one TU, the stage2 Makefile's own path.
 ARMS=("kai" "single-tu-O2")
 

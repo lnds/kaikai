@@ -112,16 +112,19 @@ static void kai_exit(int code) {
  * Every global carrying KAI_TLS is classified `tls` in the audit gate
  * (tools/runtime-globals.allow).
  *
- * Under separate compilation (the -O0 owner split, #1238) these become `extern`
- * across objects, which defaults to the general-dynamic TLS model (resolved via
- * __tls_get_addr). Pin initial-exec: it resolves the address off the thread
- * pointer directly (like the single-TU `static` local-exec), which TSAN models
- * as thread-private — general-dynamic's opaque __tls_get_addr otherwise trips
+ * TRAP: the compiler treats a thread-local's address as constant for a whole
+ * function activation and may keep it across any call. A fiber can park on
+ * one thread and resume on another, so a function that materialises such an
+ * address must not be able to switch context. `tools/tls-hoist-gate.sh`
+ * checks this on the hot bitcode and on the optimised owner.
+ *
+ * Under separate compilation these become `extern` across objects, which
+ * defaults to the general-dynamic TLS model (resolved via __tls_get_addr).
+ * Pin initial-exec: it resolves the address off the thread pointer directly
+ * (like the single-TU `static` local-exec), which TSAN models as
+ * thread-private — general-dynamic's opaque __tls_get_addr otherwise trips
  * TSAN into a false cross-thread race on per-thread state. Sound because the
- * owner links statically (initial-exec forbids dlopen, not static link), and
- * orthogonal to the #1234 hoist (that cached the thread-pointer BASE across
- * swapcontext; this pins the resolution MODE, not the base — the -O0 owner
- * still closes the hoist). */
+ * owner links statically (initial-exec forbids dlopen, not static link). */
 #if defined(KAI_SEPARATE_COMPILATION) && (defined(__GNUC__) || defined(__clang__))
 #define KAI_TLS _Thread_local __attribute__((tls_model("initial-exec")))
 #else
@@ -134,16 +137,9 @@ static void kai_exit(int code) {
  * Stdin / Clock / Process / Signal). Default `static` keeps the single-TU C
  * path auto-contained and byte-identical (sound under gcc). Under separate
  * compilation these move to the owner object: the owner defines them with
- * external linkage, the program TU sees a prototype. Load-bearing for soundness
- * — the owner is pinned to -O0 (KAI_RUNTIME_OWNER_OPT), because clang -O1+
- * caches the thread pointer across swapcontext, and a fiber work-stolen onto
- * another OS thread would then read the creator thread's scheduler TLS. A
- * program TU compiled -O2 no longer holds these definitions — it references
- * them, so DCE drops the whole suspend-point closure they anchor (kai_sched_park,
- * the reactor, the trampoline), leaving nothing for the optimiser to mishoist.
- * The set is exactly the ops reachable from emitted code that transitively hit
- * swapcontext or the scheduler's thread-locals; a leaf op that slips in is
- * caught by a build-time `nm` assert.
+ * external linkage, the program TU sees a prototype, and DCE drops the
+ * suspend-point closure they anchor (kai_sched_park, the reactor, the
+ * trampoline) from the program object.
  * The axis is KAI_SEPARATE_COMPILATION (linkage), orthogonal to KAI_HOT_ONLY
  * (which governs the native bitcode's shim elision). */
 #if defined(KAI_SEPARATE_COMPILATION)
@@ -3368,6 +3364,9 @@ struct KaiFiber {
      * it: a worker pointer held from before the switch may name the thread
      * the fiber left. */
     struct KaiWorker *worker;
+    /* Cells pending reclamation in this fiber's free drain, allocated on
+     * its first drain. */
+    struct KaiFreeStack *free_stack;
 };
 
 /* The per-context half of a fiber's state. A segment switch exchanges it, so
@@ -3487,12 +3486,33 @@ struct KaiNursery {
     0,                   /* unwind_frame — main has no pad */            \
     NULL, 0, 0,          /* rframe_buf, rframe_top, rframe_cap */        \
     NULL, 0,             /* seg, seg_pin */                              \
-    NULL                 /* worker — bound by kai_worker_here */         \
+    NULL,                /* worker — bound by kai_worker_here */         \
+    NULL                 /* free_stack */                                \
 }
 /* The landing a fiber context falls off into runs only setcontext, so its
  * stack is small. A literal, not SIGSTKSZ: glibc defines that as a sysconf()
  * call, which would make the array below a VLA. */
 #define KAI_UC_LINK_STACK_SIZE 65536
+
+/* A free reclaims a cell's children by recursion up to KAI_FREE_DEPTH
+ * levels, as deep as a shallow structure ever needs, and below that drains
+ * the rest through this stack of pending cells instead of recursing: a
+ * structure of any depth takes bounded C stack. Never a local array: a free
+ * runs at the deepest point of whatever dropped the last reference, often on
+ * a 64 KiB fiber stack, and must not add to it. Past the inline buffer the
+ * pending cells spill to the heap until the drain finishes.
+ *
+ * The stack belongs to the draining fiber, not the thread: dropping a
+ * continuation discontinues its segment, which switches context, and the
+ * fiber can come back on another thread with the drain half done. A root
+ * fiber uses its worker's; any other allocates one on its first drain. */
+#define KAI_FREE_DEPTH 16
+#define KAI_FREE_STACK_LOCAL 64
+typedef struct KaiFreeStack {
+    KaiValue **items;
+    int n, cap, active;
+    KaiValue *local[KAI_FREE_STACK_LOCAL];
+} KaiFreeStack;
 
 /* One OS scheduler thread's own state: the fiber it is running, its root
  * fiber (the dispatch loop's context), the N=1 ready queue, and the stacks
@@ -3516,6 +3536,7 @@ typedef struct KaiWorker {
     int         sigalt_ready;
     int         uc_link_ready;
     KaiFiber    main_fiber;
+    KaiFreeStack free_stack;    /* the root fiber's */
     ucontext_t  uc_link_ctx;
     char        uc_link_stack[KAI_UC_LINK_STACK_SIZE];
 } KaiWorker;
@@ -3541,6 +3562,7 @@ KAI_SCHED_FN __attribute__((noinline)) KaiWorker *kai_worker_here(void)
     KaiWorker *w = &kai_worker;
     if (__builtin_expect(w->active == NULL, 0)) {
         w->main_fiber.worker = w;
+        w->main_fiber.free_stack = &w->free_stack;
         w->active = &w->main_fiber;
     }
     return w;
@@ -3740,7 +3762,10 @@ static void kai_trap_land_fiber(void *arg) {
  * like Cancel — the trampoline reports the fiber TRAPPED and a
  * supervisor contains the fault. With no pad (main_fiber, or before
  * runtime init) terminate the process, preserving the pre-existing
- * top-level behaviour. `msg` must be a static string. */
+ * top-level behaviour. `msg` must be a static string. Out of line: the
+ * unwind runs `finally` clauses that can switch context, and a caller
+ * inlining it would hold its own frame across that switch. */
+__attribute__((noinline, noreturn))
 static void kai_trap_abort(const char *msg) {
     KaiFiber *f = kai_current_fiber();
     if (f && f->cancel_pad_set) {
@@ -3974,6 +3999,7 @@ static void kai_drain_pending_free(KaiWorker *w) {
         munmap(f->stack_base, f->stack_size + kai_page_size());
     }
     kai_tsan_fiber_free(f);
+    free(f->free_stack);
     free(f);
 }
 
@@ -4777,32 +4803,6 @@ static inline int kai_drop_hits_zero(KaiValue *v) {
     return r == 1;
 }
 
-/* A free reclaims a cell's children by recursion up to KAI_FREE_DEPTH
- * levels, as deep as a shallow structure ever needs, and below that drains
- * the rest through this stack of pending cells instead of recursing: a
- * structure of any depth takes bounded C stack. Thread-local, never a local
- * array: a free runs at the deepest point of whatever dropped the last
- * reference, often on a 64 KiB fiber stack, and must not add to it. Past
- * the inline buffer the pending cells spill to the heap until the drain
- * finishes. A free never switches context, so the thread cannot change
- * under it. */
-#define KAI_FREE_DEPTH 16
-#define KAI_FREE_STACK_LOCAL 64
-typedef struct {
-    KaiValue **items;
-    int n, cap, active;
-    KaiValue *local[KAI_FREE_STACK_LOCAL];
-} KaiFreeStack;
-
-#if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS KaiFreeStack kai_free_stack;
-#  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS KaiFreeStack kai_free_stack;
-#  endif
-#else
-static KAI_TLS KaiFreeStack kai_free_stack;
-#endif
-
 static KAI_RC_NOINLINE void kai_free_stack_grow(KaiFreeStack *st) {
     int cap = st->cap * 2;
     KaiValue **grown = (KaiValue **) malloc(sizeof(KaiValue *) * (size_t) cap);
@@ -4986,6 +4986,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
                     }
                     free(v->as.fib->unw_buf);
                     free(v->as.fib->rframe_buf);
+                    free(v->as.fib->free_stack);
                     free(v->as.fib);
                 }
             }
@@ -5018,11 +5019,15 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
   }
 }
 
-/* noinline: the free stack's address stays inside this activation, which
- * never switches context, so it cannot be cached across a park. */
 __attribute__((noinline))
 static void kai_free_drain(KaiValue *v) {
-    KaiFreeStack *st = &kai_free_stack;
+    KaiFiber *f = kai_current_fiber();
+    KaiFreeStack *st = f->free_stack;
+    if (!st) {
+        st = (KaiFreeStack *) calloc(1, sizeof *st);
+        if (!st) { fprintf(stderr, "kai: out of memory\n"); kai_exit(1); }
+        f->free_stack = st;
+    }
     if (st->active) { kai_free_stack_push(st, v); return; }
     if (!st->items) { st->items = st->local; st->cap = KAI_FREE_STACK_LOCAL; }
     st->active = 1;
@@ -11059,6 +11064,7 @@ static void kai_test_pass(void) {
     fprintf(stderr, "  ok   %s\n", kai_test_current ? kai_test_current : "");
 }
 
+__attribute__((noinline))
 static void kai_test_fail(const char *desc, const char *msg) {
     if (kai_test_json_mode()) {
         kai_test_json_record("fail", msg ? msg : "assertion failed");
@@ -11684,12 +11690,22 @@ static void kai_check_fail_shrunk(int iter_at) {
    back to the test harness so the next test can run. Otherwise it
    aborts the process via kai_core_panic, matching stage 0's
    non-test-mode behaviour. */
+
+/* Whether this thread is inside a test block, and which. Out of line: an
+ * assert's decref can switch context before the check runs. */
+__attribute__((noinline))
+static int kai_test_running(const char **desc) {
+    *desc = kai_test_current;
+    return kai_test_in_progress;
+}
+
 static void kai_assert_check(KaiValue *cond, const char *msg) {
     int ok = kai_op_truthy(cond);
     kai_decref(cond);
     if (ok) return;
-    if (kai_test_in_progress) {
-        kai_test_fail(kai_test_current, msg ? msg : "assertion failed");
+    const char *test;
+    if (kai_test_running(&test)) {
+        kai_test_fail(test, msg ? msg : "assertion failed");
         kai_test_unwind();
     } else {
         kai_core_panic(kai_str(msg ? msg : "assertion failed"));
@@ -11725,8 +11741,9 @@ static void kai_assert_check_with_value(KaiValue *cond, const char *base_msg,
     KaiValue *m3   = kai_string_concat(m2, kai_str(" was: "));
     KaiValue *full = kai_string_concat(m3, vs);
     kai_decref(m0); kai_decref(m1); kai_decref(m2); kai_decref(m3); kai_decref(vs);
-    if (kai_test_in_progress) {
-        kai_test_fail(kai_test_current, full->as.s.bytes);
+    const char *test;
+    if (kai_test_running(&test)) {
+        kai_test_fail(test, full->as.s.bytes);
         kai_decref(full);
         kai_test_unwind();
     } else {
@@ -12360,6 +12377,9 @@ static KAI_TLS uint64_t _kai_pcg_inc    = 0xda3e39cb94b95bdbULL;
 static KAI_TLS int      _kai_pcg_seeded = 0;
 #endif
 
+/* The generator's state is thread-local: each step stays inside one
+ * activation that never switches context. */
+__attribute__((noinline))
 static uint32_t _kai_pcg32_next(void) {
     uint64_t old = _kai_pcg_state;
     _kai_pcg_state = old * 6364136223846793005ULL + (_kai_pcg_inc | 1ULL);
@@ -12368,6 +12388,7 @@ static uint32_t _kai_pcg32_next(void) {
     return (xorshifted >> rot) | (xorshifted << (((uint32_t)(-(int32_t)rot)) & 31u));
 }
 
+__attribute__((noinline))
 static void _kai_pcg32_seed(uint64_t initstate, uint64_t initseq) {
     _kai_pcg_state = 0u;
     _kai_pcg_inc   = (initseq << 1u) | 1u;
@@ -12376,6 +12397,7 @@ static void _kai_pcg32_seed(uint64_t initstate, uint64_t initseq) {
     (void) _kai_pcg32_next();
 }
 
+__attribute__((noinline))
 static void _kai_pcg32_ensure_seeded(void) {
     if (!_kai_pcg_seeded) {
         uint64_t t = (uint64_t) time(NULL);
@@ -14718,8 +14740,8 @@ static int kai_stack_map_flags(void) {
  *
  * Trap: no frame may keep a thread-local address across the call. The other
  * side can park the fiber, which may then resume on another OS thread. Only
- * the -O0 owner calls it; the nm gates keep the symbol out of -O2 objects and
- * the hot bitcode.
+ * the owner calls it; the owner gate checks its frames and an nm gate keeps
+ * the symbol out of the hot bitcode.
  *
  * The way back is an indirect jump, not a return: a return to the other
  * stack always misses the return-address predictor. On aarch64 the restores

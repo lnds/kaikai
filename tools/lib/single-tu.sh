@@ -4,16 +4,13 @@
 #   kai_build_single_tu <src.kai> <out-bin>
 #
 # Compiles kaic2-emitted C as ONE translation unit at -O2, with no separate
-# scheduler owner object. `bin/kai` routes every fiber suspend point into a
-# `-O0` owner object; that split suppresses the work-stealing races whose only
-# symptom is a rotated fiber identity, so a gate that builds solely through
-# `bin/kai` cannot observe them. The `stage2` Makefile recipes compile the
-# emitted C exactly the way this does, which is where those races surface.
+# scheduler owner object: the scheduler inlines into the program's own frames.
+# The `stage2` Makefile recipes compile the emitted C exactly the way this
+# does, and work-stealing races whose only symptom is a rotated fiber identity
+# have surfaced on this shape when `bin/kai`'s split builds did not show them.
 #
-# `-O2` is load-bearing, not a default: at `-O0` the compiler cannot hoist the
-# thread pointer across `swapcontext` and the window closes. Comparing two
-# already-mitigated builds is what made earlier lanes conclude the optimizer
-# was not a variable.
+# `-O2` is load-bearing, not a default: at `-O0` the compiler does not keep a
+# thread-local address across `swapcontext` and the window closes.
 #
 # CC picks the compiler; KAI_SINGLE_TU_CFLAGS overrides the flags (keep -O2).
 

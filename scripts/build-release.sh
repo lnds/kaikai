@@ -195,7 +195,7 @@ chmod +x               "$STAGE/libexec/kaikai/plugins/kai-upgrade"
 # installed: kai points both runtime include dirs at share/kaikai/include, and the shim's `#include <runtime.h>` binds here.
 cp stage2/runtime.h        "$STAGE/share/kaikai/include/runtime.h"
 cp stage0/runtime_llvm.c   "$STAGE/share/kaikai/include/runtime_llvm.c"
-# The minimal C-backend runtime owner (issue #1238): the C split's -O0 owner
+# The minimal C-backend runtime owner: the C split's owner
 # object, next to runtime.h so kai resolves it here in the installed layout. NOT runtime_llvm.c (the native owner) — see the file's note.
 cp stage2/runtime_owner_c.c "$STAGE/share/kaikai/include/runtime_owner_c.c"
 

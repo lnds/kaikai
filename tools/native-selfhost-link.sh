@@ -11,10 +11,7 @@
 # `kaix_core_native_ctx_*` / `kaix_core_native_di_*`), which live ONLY under
 # `-DKAI_LLVM` and so are carried by a dedicated shim TU. So the link is:
 #
-#   main.o + runtime_llvm.c[owner,-O0] + shim[-DKAI_LLVM] + libLLVM -> kaic2-native
-#
-# The owner is pinned to -O0 (issue #1234): clang -O1+ hoists the thread pointer
-# across swapcontext in the scheduler, and CC here is clang.
+#   main.o + runtime_llvm.c[owner] + shim[-DKAI_LLVM] + libLLVM -> kaic2-native
 #
 # Args: <main.o> <output-binary>. Env: LLVM_CONFIG (default llvm-config),
 # CC (default cc). Exits non-zero on any step failure; prints the failing
@@ -53,11 +50,10 @@ $CC -std=c99 -Wno-unused-function -O2 -DKAI_LLVM -DKAI_SEPARATE_COMPILATION=1 $C
 # Compile the runtime OWNER object: runtime_llvm.c with the state globals +
 # main + scheduler DEFINED (KAI_RUNTIME_OWNER), the counterpart to the leaf
 # bitcode merged into main.o. NO -DKAI_LLVM (the libLLVM prims are the shim's
-# job), and -O0 so the scheduler's swapcontext-crossing code is not
-# thread-pointer-hoisted under clang (issue #1234).
+# job).
 OWNER_O="$(dirname "$OUT")/native-selfhost-owner.o"
 # shellcheck disable=SC2086
-$CC -std=c99 -Wno-unused-function -O0 \
+$CC -std=c99 -Wno-unused-function -O2 \
     -DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 \
     -I "$ROOT/stage2" -I "$ROOT/stage0" -c "$ROOT/stage0/runtime_llvm.c" -o "$OWNER_O"
 
