@@ -3881,7 +3881,7 @@ test-effects-m7a_6e_discard_resume: $(TARGET) build core-cache-warm
 	  $(KAIC2) $(TEST_CORE_CACHE) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "kai_evidence_push_with_jmp" build/s2-$$name.c \
-	    && grep -q "if (setjmp(_jmp) == 0)" build/s2-$$name.c \
+	    && grep -q "if (_setjmp(_jmp) == 0)" build/s2-$$name.c \
 	    && grep -q "longjmp(\*_node_op->handle_jmp" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (discard wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
