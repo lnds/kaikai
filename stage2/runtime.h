@@ -12122,7 +12122,7 @@ static KaiValue *kai_default_env_get(void *self, KaiValue *name, KaiCont *k) {
     nbuf[nlen] = '\0';
     const char *got = getenv(nbuf);
     if (!got) return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));
-    KaiValue *s = kai_str(got);
+    KaiValue *s = kai_str_dyn(got);
     KaiValue *some = kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = s}});
     return kai_cont_resume(k, some);
 }
@@ -13202,7 +13202,7 @@ static int _kai_unix_listen_at(const char *path, mode_t mode, int *fd, struct st
 
 static KaiValue *_kai_unix_make_listener(int fd, const char *path, const struct stat *st) {
     KaiValue *fields[4] = {
-        kai_int((int64_t) fd), kai_str(path),
+        kai_int((int64_t) fd), kai_str_dyn(path),
         kai_int((int64_t) st->st_dev), kai_int((int64_t) st->st_ino)
     };
     static const char *names[4] = { "fd", "path", "dev", "ino" };
@@ -13412,7 +13412,7 @@ static KaiValue *_kai_net_make_udpsocket(int fd, int port) {
 }
 
 static KaiValue *_kai_net_make_sockaddr(const char *host, int port) {
-    KaiValue *host_kv = kai_str(host);
+    KaiValue *host_kv = kai_str_dyn(host);
     KaiValue *port_kv = kai_int((int64_t) port);
     KaiValue *fields[2] = { host_kv, port_kv };
     static const char *names[2] = { "host", "port" };
