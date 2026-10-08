@@ -10692,23 +10692,28 @@ static KaiValue *kai_core_real_bits(KaiValue *v) {
     return kai_int((int64_t) bits);
 }
 
-static KaiValue *kai_core_string_contains(KaiValue *s, KaiValue *sub) {
-    int yes = 0;
-    if (s && s->tag == KAI_STR && sub && sub->tag == KAI_STR) {
-        if (sub->as.s.len == 0) {
-            yes = 1;
-        } else if (sub->as.s.len <= s->as.s.len) {
-            for (size_t i = 0; i + sub->as.s.len <= s->as.s.len; ++i) {
-                if (memcmp(s->as.s.bytes + i, sub->as.s.bytes, sub->as.s.len) == 0) {
-                    yes = 1;
-                    break;
-                }
-            }
-        }
+/* Byte offset of the first `sub` in `s`, or -1; borrows both. */
+static int64_t kai_str_find(KaiValue *s, KaiValue *sub) {
+    if (!s || s->tag != KAI_STR || !sub || sub->tag != KAI_STR) return -1;
+    if (sub->as.s.len == 0) return 0;
+    for (size_t i = 0; i + sub->as.s.len <= s->as.s.len; ++i) {
+        if (memcmp(s->as.s.bytes + i, sub->as.s.bytes, sub->as.s.len) == 0) return (int64_t) i;
     }
+    return -1;
+}
+
+static KaiValue *kai_core_string_contains(KaiValue *s, KaiValue *sub) {
+    int yes = kai_str_find(s, sub) >= 0;
     if (s)   kai_decref(s);
     if (sub) kai_decref(sub);
     return kai_bool(yes);
+}
+
+static KaiValue *kai_core_string_find(KaiValue *s, KaiValue *sub) {
+    int64_t at = kai_str_find(s, sub);
+    if (s)   kai_decref(s);
+    if (sub) kai_decref(sub);
+    return kai_int(at);
 }
 
 /* ---------- core thunks for first-class function refs ---------- */
