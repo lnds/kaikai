@@ -277,6 +277,29 @@ actors/`Spawn`. Instances
 are monomorphic (`f(c: State[Int])`, not `f(c: State[T])`); `mask` is
 not provided — name the outer instance instead.
 
+## Two instances of one effect in a row
+
+A row may carry one parametric effect at two types (`Box[Int] +
+Box[String]`, `Actor[Request] + Actor[Reply]`). Each op reaches the
+handler of the instance it is typed at, wherever that handler sits on
+the stack. When nothing pins which instance an op means — its result
+and arguments fit both — the call is rejected as an `ambiguous effect
+instance`, never resolved by handler order.
+
+```kaikai
+effect Box[T] {
+  peek() : T
+}
+
+fn pair() : String / Box[Int] + Box[String] = {
+  let n: Int = Box.peek()                  # pinned by its type: Box[Int]
+  let s: String = Box.peek()               # Box[String]
+  "#{s}#{n}"
+}
+
+fn main() : Int = 0
+```
+
 ## Stdlib effects
 
 Stdin, Stdout, Stderr, File, Env, Console, Clock, Random,

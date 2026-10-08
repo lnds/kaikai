@@ -93,6 +93,7 @@ import compiler.reuse_uses
 import compiler.reuse_ctors
 import compiler.emit_reuse_slots
 import compiler.emit_seq
+import compiler.effect_instance
 import compiler.vec_raw
 import compiler.ffi_v2
 import compiler.emit_ffi_c
@@ -2571,13 +2572,11 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
         let eff_n = dotted_prefix(callee)
         # The Ev STRUCT type is module-qualified (`ev_name`) so two
         # same-name effects from different modules emit distinct C
-        # structs. The runtime IDENTITY label stays the bare effect
-        # name: the evidence stack is keyed by it, and the scheduler
-        # matches `node->eff_label` against fixed names (`"Cancel"`),
-        # so push and lookup must both use the bare name.
+        # structs. The runtime IDENTITY label is the instance key (`Eff` or
+        # `Eff[args]`): the evidence stack and the frame slots are keyed by it.
         let eff_evmo = eff_mo(cx.effs, eff_n)
         let eff_evn = ev_name(eff_n, eff_evmo)
-        let eff_idn = eff_n
+        let eff_idn = inst_key_of_callee(eff_n, f.ty)
         let op_n_tagged0 = dotted_suffix(callee)
         # §6 named instances: the typer tags a capability-parameter op call
         # `c.op` as `op#<recv>`. The evidence is the parameter `kaiv_<recv>`
@@ -2613,12 +2612,12 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
             # diagnostic instead of a `_node_op->handler` deref segfault.
             concat_all(["kai_evidence_require_reachable(kai_evidence_lookup_node_by_id(",
                         c_alias_id(alias_n), "), \"", alias_n, "\")"])
-          } else if effect_has_default_block(eff_idn, cx.effs) {
+          } else if effect_has_default_block(eff_n, cx.effs) {
             # No caller frame here (a direct perform in a frameless fn such as
             # `main`): a lexical handler on the stack wins, else the minted
             # default node — the default is no longer on the stack for the walk.
             concat_all(["kai_evidence_lookup_or_default(\"", eff_idn,
-                        "\", &_kai_default_node_", string_to_lower_ascii(eff_idn), ")"])
+                        "\", &_kai_default_node_", string_to_lower_ascii(eff_n), ")"])
           } else {
             # Bare walk: NULL when no handler is on this fiber's stack — a
             # fiber-local op (Actor/Cancel/…) performed in a spawned fiber whose
@@ -2818,11 +2817,7 @@ fn emit_evf_one_slot(eff: String, cx: EmitCtx) : String = {
 # effect (no longer pushed). A non-default effect stays on the plain walk, whose
 # NULL result (no handler on this fiber — the walk crossed a spawn) is reported
 # by `kai_evidence_require` instead of stored as a NULL slot the perform derefs.
-fn evf_terminal_slot(eff: String, cx: EmitCtx) : String =
-  if effect_has_default_block(eff, cx.effs) {
-    concat_all(["kai_evidence_lookup_or_default(\"", eff,
-                "\", &_kai_default_node_", string_to_lower_ascii(eff), ")"])
-  } else { evf_require_walk(eff) }
+fn evf_terminal_slot(key: String, cx: EmitCtx) : String = evf_thunk_slot(key, cx.effs)
 
 # Emit a direct user-fn call `kai_<csym>(<frame?><args>)`, prepending the
 # evidence frame when the callee carries one. The single funnel every
@@ -2876,11 +2871,13 @@ fn emit_evf_thunk_frame(slots: [String], effs: [Decl]) : String = match slots {
   _  -> concat_all(["(KaiEvidence *[]){", join_with(map(slots, (e) => evf_thunk_slot(e, effs)), ", "), "}"])
 }
 
-fn evf_thunk_slot(eff: String, effs: [Decl]) : String =
+fn evf_thunk_slot(key: String, effs: [Decl]) : String = {
+  let eff = inst_key_eff(key)
   if effect_has_default_block(eff, effs) {
-    concat_all(["kai_evidence_lookup_or_default(\"", eff,
+    concat_all(["kai_evidence_lookup_or_default(\"", key,
                 "\", &_kai_default_node_", string_to_lower_ascii(eff), ")"])
-  } else { evf_require_walk(eff) }
+  } else { evf_require_walk(key) }
+}
 
 # A non-default frame slot resolved by the dynamic walk: `kai_evidence_require`
 # turns a NULL result (no handler for `eff` on this fiber — a spawned fiber
@@ -7288,8 +7285,9 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     # a shim; reaching it as an ordinary expression is a compiler bug.
     EExternBody(_, _) -> concat_all(["kai_core_panic(kai_str(\"extern body in expression position\"))"])
     EBang(inner) -> emit_bang(src, x, inner, cx)
-    EHandle(body, eff_name, _, _eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      emit_handle(src, body, eff_name, init_opt, alias_opt, clauses, ret_opt, x.line, x.col, cx)
+    EHandle(body, eff_name, _, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      emit_handle(src, body, eff_name, inst_key_of_tes(eff_name, eff_tyargs), init_opt, alias_opt,
+                  clauses, ret_opt, x.line, x.col, cx)
     # m12.5: codegen erasure — `1.0<USD>` emits the same C as `1.0`.
     # Units are typer-only; the generated value carries no unit tag.
     ELitUnit(inner, _) -> emit_expr(src, inner, cx)
@@ -7620,13 +7618,13 @@ fn emit_bang(src: String, x: Expr, inner: Expr, cx: EmitCtx) : String / Console 
 # param or the stateful prologue's `kai_state`/`kai_log`) inside one block.
 fn alias_is_byid_cell(eff_name: String) : Bool = eff_name == "State" or eff_name == "Reader"
 
-fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr],
+fn emit_handle(src: String, body: Expr, eff_name: String, key: String, init_opt: Option[Expr],
                alias_opt: Option[String],
                clauses: [HClause],
                ret_opt: Option[HReturn], hline: Int, hcol: Int,
                cx: EmitCtx) : String / Console {
 
-  let body_c = emit_expr(src, body, emit_ctx_with_evf(cx, frame_shadow(cx.evf, cx.cur_enc_fn, eff_name)))
+  let body_c = emit_expr(src, body, emit_ctx_with_evf(cx, frame_shadow(cx.evf, cx.cur_enc_fn, key)))
   # The install site's own enclosing fn IS the handle's enc_fn — the
   # collector stamped `cur_enc_fn` on every clause it recorded here — so
   # the clause symbols resolve without a position lookup that would match
@@ -7735,7 +7733,7 @@ fn emit_handle(src: String, body: Expr, eff_name: String, init_opt: Option[Expr]
     exit.decl,
     alias_id_c,
     "if (_setjmp(_jmp) == 0) { ",
-      "kai_evidence_push_with_jmp(&_node, \"", eff_name, "\", &_ev, &_jmp, (KaiValue **) &_discard); ",
+      "kai_evidence_push_with_jmp(&_node, \"", key, "\", &_ev, &_jmp, (KaiValue **) &_discard); ",
       fin_c.arm,
       "_body_result = ", body_c, "; ",
       fin_c.run,
@@ -11855,7 +11853,7 @@ fn expand_ta_decl(d: Decl, table: [TAEntry], aliases: [AliasResult], fuel: Int) 
     DFn(p, n, tps, ps, ret_opt, row, body, l, c, mo, fsym) ->
       DFn(p, n, tps, expand_ta_params(ps, table, aliases, fuel),
           match ret_opt { None -> None Some(te) -> Some(expand_ta_te(te, table, aliases, fuel)) },
-          row,
+          expand_ta_row(row, table, aliases, fuel),
           expand_ta_expr(body, table, aliases, fuel), l, c, mo, fsym)
     DType(p, n, tps, body, l, c, mo, slots, tsym) ->
       # Skip rewriting the alias's own DType body: keeping the original

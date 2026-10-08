@@ -1,0 +1,148 @@
+#[doc("""
+Effect-instance keys: the identity a handler installs, a frame slot carries
+and a perform reaches.
+
+A key is `Eff` for an effect without type parameters, or `Eff[A,B]` once the
+instance is pinned to concrete types. An instance the compiler cannot pin (a
+polymorphic body, a phantom op) keys as the bare `Eff`, which matches every
+instance of `Eff`; two pinned keys match only when equal. Keys are read from
+monomorphised types, so a handler and a perform agree exactly when the typer
+resolved them to the same instance.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.infer
+
+#[doc("The instance key of `eff` applied to the type arguments `args`.")]
+pub fn inst_key_of_tes(eff: String, args: [TypeExpr]) : String =
+  key_of(eff, map(args, (a) => te_text(a, [])))
+
+#[doc("The instance key a typed perform reaches: its callee carries the resolved `Eff[args]` as its type.")]
+pub fn inst_key_of_callee(eff: String, callee_ty: Option[Ty]) : String = match callee_ty {
+  Some(TyCon(_, _, args, _)) -> key_of(eff, map(args, ty_text))
+  _                          -> eff
+}
+
+#[doc("The effect a key names.")]
+pub fn inst_key_eff(key: String) : String = {
+  let i = string_index_of_char(key, '[')
+  if i < 0 { key } else { string_slice(key, 0, i) }
+}
+
+#[doc("True when a site keyed `a` may resolve through evidence keyed `b`.")]
+pub fn inst_keys_match(a: String, b: String) : Bool = inst_key_index([b], a) >= 0
+
+#[doc("The index of the first key in `keys` that `key` matches, an exact match first; -1 when none does.")]
+pub fn inst_key_index(keys: [String], key: String) : Int = key_scan(keys, key, name_len(key, 0), 0, 0 - 1)
+
+# `n` is the length of `key`'s effect name, all of it when `key` is bare.
+fn key_scan(keys: [String], key: String, n: Int, i: Int, first: Int) : Int = match keys {
+  []           -> first
+  [k, ...rest] ->
+    if k == key { i }
+    else { key_scan(rest, key, n, i + 1, if first < 0 and pairs_bare(k, key, n) { i } else { first }) }
+}
+
+# One of `k` and `key` is the bare effect name the other pins. The length
+# and `[` tests reject almost every pair before a slice is taken.
+fn pairs_bare(k: String, key: String, n: Int) : Bool =
+  if n == string_length(key) { string_byte_at_int(k, n) == 91 and string_slice(k, 0, n) == key }
+  else { string_length(k) == n and string_slice(key, 0, n) == k }
+
+fn name_len(key: String, i: Int) : Int = {
+  let b = string_byte_at_int(key, i)
+  if b < 0 or b == 91 { i } else { name_len(key, i + 1) }
+}
+
+#[doc("The instance keys of the row labels `ls` written in `d`, whose type parameters leave an instance unpinned.")]
+pub fn row_label_keys(d: Decl, ls: [RowLabel]) : [String] = {
+  let tps = if any(ls, (l) => match l { RL(_, args, _) -> args != [] }) { decl_tparams(d) } else { [] }
+  map(ls, (l) => match l { RL(eff, args, _) -> key_of(eff, map(args, (a) => te_text(a, tps))) })
+}
+
+#[doc("The key of `eff` at the instance whose argument texts are `texts`; bare when one is unpinned.")]
+pub fn key_of(eff: String, texts: [String]) : String = match texts {
+  [] -> eff
+  _  -> if any(texts, is_unpinned) { eff } else { concat_all([eff, "[", join_with(texts, ","), "]"]) }
+}
+
+#[doc("True when a key text has a part no instance pins.")]
+pub fn is_unpinned(text: String) : Bool = string_index_of_char(text, '?') >= 0
+
+#[doc("A written type's key text, `?` where it names one of the type parameters `tps` or nothing concrete.")]
+pub fn te_text(te: TypeExpr, tps: [String]) : String = match te.tkind {
+  TyName(n, args) -> name_text(n, map(args, (a) => te_text(a, tps)), tps)
+  TyList(inner)   -> cat3("[", te_text(inner, tps), "]")
+  TyFn(ps, r, _)  -> fn_text(map(ps, (a) => te_text(a, tps)), te_text(r, tps))
+  TyDim(b, _)     -> te_text(b, tps)
+  TyRefine(b, _)  -> te_text(b, tps)
+  _               -> "?"
+}
+
+fn name_text(n: String, args: [String], tps: [String]) : String = {
+  let s = short_name(n)
+  if list_has(tps, s) or starts_lower(s) { "?" }
+  else if s == "List" { cat3("[", join_with(args, ","), "]") }
+  else { con_text(s, args) }
+}
+
+#[doc("A resolved type's key text, `?` where no instance pins it.")]
+pub fn ty_text(t: Ty) : String = match t {
+  TyListT(x)          -> cat3("[", ty_text(x), "]")
+  TyFnT(ps, r, _)     -> fn_text(map(ps, ty_text), ty_text(r))
+  TyCon(_, n, args, _) -> con_text(short_name(n), map(args, ty_text))
+  TyDimT(b, _)        -> ty_text(b)
+  TyRefineT(b, _)     -> ty_text(b)
+  _                   -> prim_text(t)
+}
+
+#[doc("True when a part of `t` is unpinned: the holes `ty_text` spells `?`.")]
+pub fn ty_unpinned(t: Ty) : Bool = match t {
+  TyListT(x)           -> ty_unpinned(x)
+  TyFnT(ps, r, _)      -> any(ps, ty_unpinned) or ty_unpinned(r)
+  TyCon(_, _, args, _) -> any(args, ty_unpinned)
+  TyDimT(b, _)         -> ty_unpinned(b)
+  TyRefineT(b, _)      -> ty_unpinned(b)
+  _                    -> prim_text(t) == "?"
+}
+
+#[doc("The name of a primitive type, or `?` for any other.")]
+pub fn prim_text(t: Ty) : String = match t {
+  TyInt    -> "Int"
+  TyReal   -> "Real"
+  TyBool   -> "Bool"
+  TyString -> "String"
+  TyChar   -> "Char"
+  TyUnit   -> "Unit"
+  TyByte   -> "Byte"
+  TyInt32  -> "Int32"
+  TyUInt32 -> "UInt32"
+  TyUInt64 -> "UInt64"
+  TyInt128 -> "Int128"
+  TyHandle -> "Handle"
+  _        -> "?"
+}
+
+fn con_text(n: String, args: [String]) : String = match args {
+  [] -> n
+  _  -> concat_all([n, "[", join_with(args, ","), "]"])
+}
+
+fn fn_text(ps: [String], r: String) : String = concat_all(["fn(", join_with(ps, ","), ")->", r])
+
+fn short_name(n: String) : String = {
+  let i = string_index_of_char(n, '.')
+  if i < 0 { n } else { short_name(string_slice(n, i + 1, string_length(n))) }
+}
+
+fn starts_lower(s: String) : Bool = match char_at(s, 0) {
+  Some(c) -> c >= 'a' and c <= 'z'
+  None    -> false
+}
+
+#[doc("The declared and implicit type parameters of a function.")]
+pub fn decl_tparams(d: Decl) : [String] = match d {
+  DFn(_, _, tps, _, _, _, _, _, _, _, _) -> list_append(tps, collect_implicit_tparams_in_decl(d, tps))
+  _ -> []
+}

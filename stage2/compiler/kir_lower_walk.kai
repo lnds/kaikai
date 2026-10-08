@@ -49,6 +49,7 @@ import compiler.raw_border
 import compiler.handler_alias
 import compiler.refinements
 import compiler.resume_scan
+import compiler.effect_instance
 
 # Lower a fixed-width vec intrinsic to its inline KIR form: a header-less
 # `[n x elem]` aggregate on the native side (no dynamic `Vec`). Returns
@@ -414,8 +415,8 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
   # (install + setjmp-split + inline body + return clause), the same
   # block-building discipline as if/match (asu review). The clause bodies
   # are separate `KFnClause`s generated in `lower_to_kir`.
-  EHandle(body, eff, _, _, init_opt, alias_opt, clauses, ret_opt) ->
-    lower_handle(x, body, eff, init_opt, alias_opt, clauses, ret_opt, st)
+  EHandle(body, eff, _, tas, init_opt, alias_opt, clauses, ret_opt) ->
+    lower_handle(x, body, inst_key_of_tes(eff, tas), init_opt, alias_opt, clauses, ret_opt, st)
 
   # Postfix `!` — Option/Result propagation. `expr!` unwraps the success
   # payload, or EARLY-RETURNS the whole `None`/`Err` from the enclosing fn
@@ -3076,20 +3077,30 @@ fn lower_named_call_kind(x: Expr, callee: String, csym: FnId, cargs: [Expr], st:
 # lookup + clause call) is the backend's; `KPerform` carries the effect,
 # the id the typer settled it to, op, and args, plus the non-local-discard
 # semantics (asu review).
-fn lower_perform(x: Expr, eff: String, esym: SymId, op: String, cargs: [Expr], st: LowerSt) : LRes / Console =
+fn lower_perform(x: Expr, eff: String, esym: SymId, op: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
+  let key = inst_key_of_callee(eff, perform_callee_ty(x))
   match lower_exprs(cargs, st, []) { LResMany(avs, st1) ->
-    bind_op(st1, KPerform(eff, esym, perform_op_tag(op, eff, st), avs), kpos_of(x)) }
+    bind_op(st1, KPerform(key, esym, perform_op_tag(op, key, st), avs), kpos_of(x)) }
+}
 
-# Inside a `handle` of `eff` in this fn, the op must reach that handler, not
-# the caller's frame slot: the `!` suffix makes the backend walk the stack.
-# An `@alias` / `#recv` op already names its evidence.
-fn perform_op_tag(op: String, eff: String, st: LowerSt) : String =
+fn perform_callee_ty(x: Expr) : Option[Ty] = match x.kind {
+  ECall(f, _) -> f.ty
+  _           -> None
+}
+
+# Inside a `handle` of the instance `key` in this fn, the op must reach that
+# handler, not the caller's frame slot: the `!` suffix makes the backend walk
+# the stack. An `@alias` / `#recv` op already names its evidence.
+fn perform_op_tag(op: String, key: String, st: LowerSt) : String =
   if string_index_of_char(op, '@') >= 0 or string_index_of_char(op, '#') >= 0 { op }
-  else if ls_is_local(st, handle_shadow_mark(eff)) { cat2(op, "!") }
+  else if any(st.locals, (n) => shadow_mark_covers(n, key)) { cat2(op, "!") }
   else { op }
 
 # Not an identifier, so it never collides with a bound name in `locals`.
-fn handle_shadow_mark(eff: String) : String = cat2("#handle:", eff)
+fn handle_shadow_mark(key: String) : String = cat2("#handle:", key)
+
+fn shadow_mark_covers(local: String, key: String) : Bool =
+  string_slice(local, 0, 8) == "#handle:" and inst_keys_match(string_slice(local, 8, string_length(local)), key)
 
 # --- Perceus RC marks → first-class KRC statements (§4.7) ---------------
 

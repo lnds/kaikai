@@ -19,8 +19,9 @@
 import compiler.ast
 import compiler.evidence
 import compiler.infer_index
+import compiler.effect_instance
 
-# The distinct USER-effect labels a function's row demands, in canonical
+# The distinct effect-instance keys a function's row demands, in canonical
 # (row, deduped) order — the slot layout caller and callee agree on. Keyed
 # by the function's emitted symbol so both the perform site (its own frame)
 # and the call site (the callee's frame) resolve the same layout.
@@ -38,7 +39,7 @@ fn build_frames_loop(all: [Decl], ds: [Decl], acc: [FnEvidenceFrame]) : [FnEvide
     # `main` wrapper installs (found via the live walk). So it never takes
     # a frame param — an empty slot list keeps its performs on the walk.
     DFn(_, fname, _, _, _, row, _, _, _, mo, _) -> {
-      let slots = if fname == "main" { [] } else { frame_carried_slots(all, row) }
+      let slots = if fname == "main" { [] } else { frame_carried_slots(all, d, row) }
       build_frames_loop(all, rest, [FEF(frame_c_sym(fname, mo), slots), ...acc])
     }
     _ -> build_frames_loop(all, rest, acc)
@@ -56,25 +57,20 @@ fn frame_c_sym(name: String, mo: Option[String]) : String = match mo {
 # The slot layout: distinct effect labels in the row, KEPT when the effect is
 # a declared effect (every one rides the frame; the supplier is decided per
 # call site, not whether it takes a slot).
-fn frame_carried_slots(decls: [Decl], row: RowExpr) : [String] =
-  frame_keep_carried(frame_row_labels(row), decls, [])
+fn frame_carried_slots(decls: [Decl], d: Decl, row: RowExpr) : [String] =
+  frame_keep_carried(row_label_keys(d, frame_row_labels(row)), decls, [])
 
-fn frame_row_labels(row: RowExpr) : [String] = match row {
+fn frame_row_labels(row: RowExpr) : [RowLabel] = match row {
   REmpty       -> []
-  RClosed(ls)  -> frame_label_names(ls)
-  ROpen(_, ls) -> frame_label_names(ls)
-}
-
-fn frame_label_names(ls: [RowLabel]) : [String] = match ls {
-  []           -> []
-  [l, ...rest] -> match l { RL(name, _, _) -> [name, ...frame_label_names(rest)] }
+  RClosed(ls)  -> ls
+  ROpen(_, ls) -> ls
 }
 
 fn frame_keep_carried(labels: [String], decls: [Decl], seen: [String]) : [String] = match labels {
   []           -> []
   [l, ...rest] ->
     if frame_has(seen, l) { frame_keep_carried(rest, decls, seen) }
-    else if frame_effect_is_carried(l, decls) { [l, ...frame_keep_carried(rest, decls, [l, ...seen])] }
+    else if frame_effect_is_carried(inst_key_eff(l), decls) { [l, ...frame_keep_carried(rest, decls, [l, ...seen])] }
     else { frame_keep_carried(rest, decls, [l, ...seen]) }
 }
 
@@ -115,10 +111,10 @@ fn frames_ix(rev: [FnEvidenceFrame], ix: NameIndex[FnEvidenceFrame]) : NameIndex
   [f, ...rest] -> match f { FEF(n, _) -> frames_ix(rest, idx_prepend(ix, n, f)) }
 }
 
-#[doc("evidence-frame: slot index of an effect in a function's frame, or -1 when the frame does not carry it (perform falls back to the walk).")]
-pub fn frame_slot_index(frames: EvFrames, fsym: String, eff: String) : Int =
+#[doc("evidence-frame: slot index of an effect instance in a function's frame, or -1 when the frame does not carry it (perform falls back to the walk).")]
+pub fn frame_slot_index(frames: EvFrames, fsym: String, key: String) : Int =
   match frame_lookup(frames, fsym) {
-    Some(slots) -> frame_index_of(slots, eff, 0)
+    Some(slots) -> inst_key_index(slots, key)
     None        -> 0 - 1
   }
 
@@ -136,11 +132,6 @@ fn frame_lookup(frames: EvFrames, fsym: String) : Option[[String]] = frame_chain
 fn frame_chain(chain: [FnEvidenceFrame], fsym: String) : Option[[String]] = match chain {
   []           -> None
   [f, ...rest] -> match f { FEF(n, slots) -> if n == fsym { Some(slots) } else { frame_chain(rest, fsym) } }
-}
-
-fn frame_index_of(slots: [String], eff: String, i: Int) : Int = match slots {
-  []           -> 0 - 1
-  [s, ...rest] -> if s == eff { i } else { frame_index_of(rest, eff, i + 1) }
 }
 
 fn frame_has(xs: [String], s: String) : Bool = match xs {
