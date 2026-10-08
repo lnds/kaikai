@@ -2176,10 +2176,14 @@ emitters:
   push precedes argument evaluation and one reference never sits in two
   live entries; that includes the closure a bracketed call goes through
   a local for. Other cases:
-  - An owned-borrow argument stays held across the call that borrows it.
+  - An owned-borrow argument is registered for the extent of a call
+    that can unwind: no binder holds it.
   - A match registers its owned scrutinee slot. Its arm binders count
-    once the arm has taken its own reference; a reuse arm never does. A
-    destructuring `let` takes one for each binder.
+    once the arm has taken its own reference. A reuse arm owns each
+    child its rebuild takes: on a unique cell the child leaves its slot,
+    on a shared one the binder takes a reference, so the registered cell
+    and the binder never both release it. A destructuring `let` takes
+    one for each binder.
   - A `handle` registers the outer binders that outlive it below its
     own mark, plus its state slot, since `resume(v, s)` replaces the
     state.
@@ -2191,7 +2195,10 @@ emitters:
   over the shapes in `anf_ops.kai`), and the walk then registers them as
   binders. An arm whose value rebuilds the shape it matched is left as
   written, because the reuse lowering evaluates the rebuild's operands
-  after it tests the matched cell.
+  after it tests the matched cell; under a registered scrutinee that
+  lowering registers each operand value for the extent of the operands
+  after it. A rebuild that reaches into a nested cell (a rotation) takes
+  the owned layout there instead of the in-place one.
 - **The runtime's higher-order functions** (`each`, `reduce`, `map`,
   `filter`, `flat_map` in `runtime.h`) lend the closure to each callback
   and register the list, the closure and the accumulator they hold once

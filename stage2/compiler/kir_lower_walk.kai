@@ -23,6 +23,8 @@ import compiler.region
 import compiler.kir
 import compiler.kir_lower
 import compiler.unwind_pend
+import compiler.kir_reuse_held
+import compiler.unwind_binders
 import compiler.unwind_pads
 import compiler.unwind_sites
 import compiler.kir_lower_pads
@@ -2171,8 +2173,9 @@ fn lower_list_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
         # differ per branch (borrow in unique, dup in shared). Emitting the
         # decon dups here (outside the fork) keeps the fork managing only the
         # direct slots.
-        let st_decon = lm_dup_alias_binders(pat_decon_alias_binders(p, st_body.vs), KAt(p.line, p.col), st_body)
-        set_reuse_gc_for_arm(p, body, st_decon)
+        let decon = pat_decon_alias_binders(p, st_body.vs)
+        let st_decon = lm_dup_alias_binders(decon, KAt(p.line, p.col), st_body)
+        set_reuse_gc_for_arm(p, body, if rh_held(st_decon) { rh_own(st_decon, decon) } else { st_decon })
       }
       let st_drop = if arm_reuses(body, st_dup) { tcp_seed_inherit(body, pend0, st_dup) }
                     else { tcp_seed_arm(owned, sd, pat_alias_binders(p, st_dup.vs), body, pend0, st_dup) }
@@ -3219,7 +3222,8 @@ fn with_ctor_ty(x: Expr, ctor: Expr) : Expr = match ctor.ty {
 # consumes — `KCon` fresh-allocs).
 fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
   let nested = reuse_kind_is_variant(rk) and reuse_has_nested_ctor(cargs)
-  if nested {
+  if nested and rh_held(st) { lower_reuse_nested_fresh(x, cn, cargs, st) }
+  else if nested {
     match st.rnested {
       RNI(oarity, nslot, n_inner, directs, grands) ->
         # In-place overwrite requires the donor and rebuilt ctor to share an
@@ -3269,8 +3273,10 @@ fn lower_reuse_flat_fork(x: Expr, donor: KVal, cn: String, cargs: [Expr], st: Lo
     # inner arm's slot 0 projected out of the outer donor — over-release).
     let plan = st0.rnested
     let uses = reuse_taken_uses(cargs, st0.reuse_gc)
-    let st_gc = emit_reuse_gc_increfs(donor, uses, pos, st0)
-    match lower_kinds_vals(cargs, ctor_slot_kinds_in(hm, cn, st_gc), 0, st_gc, []) { LResMany(avs, st1) -> {
+    let held = rh_held(st0)
+    let st_gc = if held { emit_reuse_gc_increfs(donor, rh_repeats(uses), pos, rh_own(rh_take_slots(donor, list_uniq(uses), pos, st0), list_uniq(uses))) }
+                else { emit_reuse_gc_increfs(donor, uses, pos, st0) }
+    match lower_kinds_held(cargs, ctor_slot_kinds_in(hm, cn, st_gc), 0, held, RhHolds { regs: [], st: st_gc }, [], pos) { LResMany(avs, st1) -> {
       let st_decl = ls_emit(st1, KLet(rjoin, SBoxed, KLitOp(KUnitV), pos))
       match bind_op(st_decl, KCall("kaix_check_unique", [donor]), pos) { LRes(uv, st_u) ->
         match three_labels(st_u) { LSL3(l_uniq, l_shared, l_join, st_l) -> {
@@ -3299,15 +3305,18 @@ fn lower_reuse_flat_fork(x: Expr, donor: KVal, cn: String, cargs: [Expr], st: Lo
 # embedded borrowed leaf; the match-exit `decref(donor)` reclaims
 # donor + inner + originals. The shared branch of the dual fork below, and
 # the whole rebuild for arms the slot plan does not cover.
-fn lower_reuse_nested_fresh(x: Expr, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console =
+fn lower_reuse_nested_fresh(x: Expr, cn: String, cargs: [Expr], st0: LowerSt) : LRes / Console = {
+  let leaves = reuse_gc_uses(cargs, st0.reuse_gc)
+  let st = if rh_held(st0) { rh_own(st0, list_uniq(leaves)) } else { st0 }
   # The first nested sub-ctor consumes the cross-call donor (inner stage
   # off — there is no stolen shell on the fresh path). The donor's
   # uniqueness is independent of this scrutinee's, so the shared branch
   # still absorbs the caller's shell — the C backend's shared-branch site.
   # The leaf dups precede the args: an arg call may consume a borrowed leaf.
   match lower_reuse_args_donate(cargs, ctor_slot_kinds_in(ctor_home_of_expr_ty(x), cn, st), "", 0, true, false,
-                                emit_reuse_leaf_dups(reuse_gc_uses(cargs, st.reuse_gc), kpos_of(x), st), []) { LResDon(avs, _, st1) ->
+                                emit_reuse_leaf_dups(leaves, kpos_of(x), st), []) { LResDon(avs, _, st1) ->
     bind_op(st1, reuse_fresh_op(RkVariant, ctor_home_of_expr_ty(x), cn, avs, st1), kpos_of(x)) }
+}
 
 # Rebuild args + the lowered atoms, plus whether the inner token was donated.
 type LResDon = LResDon([KVal], Bool, LowerSt)
@@ -3420,6 +3429,18 @@ fn lower_kinds_vals(es: [Expr], ks: [Int], i: Int, st: LowerSt, acc: [KVal]) : L
   }
 }
 
+# `lower_kinds_vals` that, under `held`, registers each operand value a
+# later operand could strand until the last one has run.
+fn lower_kinds_held(es: [Expr], ks: [Int], i: Int, held: Bool, h: RhHolds, acc: [KVal], pos: KPos) : LResMany / Console = match es {
+  [] -> LResMany(acc, rh_release(h, pos))
+  [e, ...rest] -> match lower_at_kind(e, kind_at(ks, i), h.st) {
+    LRes(v, st1) -> {
+      let h1 = RhHolds { regs: h.regs, st: st1 }
+      lower_kinds_held(rest, ks, i + 1, held, if held { rh_hold(e, v, kind_at(ks, i), rest != [], pos, h1) } else { h1 }, list_append(acc, [v]), pos)
+    }
+  }
+}
+
 fn lower_at_kind(e: Expr, k: Int, st: LowerSt) : LRes / Console =
   if k == 1 { lower_expr_raw_at(e, SInt64, st) } else { lower_expr(e, st) }
 
@@ -3479,12 +3500,15 @@ fn lower_reuse_dual(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Ex
     # A direct slot the rebuild does not take has no owner once overwritten:
     # the unique branch drops it, the shared branch does not dup it.
     let uses = reuse_taken_uses(cargs, st.reuse_gc)
+    let taken = list_uniq(reuse_taken_binders(st.reuse_gc, uses))
+    let held = rh_held(st)
     let st_decl = ls_emit(st0, KLet(rjoin, SBoxed, KLitOp(KUnitV), pos))
     match bind_op(st_decl, KCall("kaix_check_unique", [donor]), pos) { LRes(uv, st_u) ->
       match three_labels(st_u) { LSL3(l_uniq, l_shared, l_join, st_l) -> {
-        let st_fork = ls_seal(st_l, KCondBr(uv, l_uniq, l_shared, pos), l_uniq)
+        let st_fork0 = ls_seal(st_l, KCondBr(uv, l_uniq, l_shared, pos), l_uniq)
+        let st_fork = if held { rh_own(rh_take_slots(donor, taken, pos, st_fork0), taken) } else { st_fork0 }
         # UNIQUE: direct slots stay borrows (no dup); rebuild; reuse in place.
-        let st_ub = match lower_kinds_vals(cargs, ctor_slot_kinds_in(hm, cn, st_fork), 0, st_fork, []) { LResMany(avs_u, st_u0) -> {
+        let st_ub = match lower_kinds_held(cargs, ctor_slot_kinds_in(hm, cn, st_fork), 0, held, RhHolds { regs: [], st: st_fork }, [], pos) { LResMany(avs_u, st_u0) -> {
           let st_u1 = rn_flat_unique_drops(rn_directs(st.rnested), donor, uses, pos, st_u0)
           let tag_u = ls_variant_tag_in(st_u1, hm, cn)
           match bind_op(st_u1, KConReuse(rk, donor, cn, tag_u, typed_inits_in(avs_u, hm, cn, st_u1)), pos) { LRes(ru, st_u2) ->
@@ -3494,7 +3518,7 @@ fn lower_reuse_dual(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Ex
         # builtin list ctor, not a registered variant, so a `KCon` here would
         # build a variant-shaped cell whose `as.cons` reads are garbage.
         let st_sd = emit_direct_dups(reuse_taken_binders(st.reuse_gc, uses), pos, st_ub)
-        let st_sb = match lower_kinds_vals(cargs, ctor_slot_kinds_in(hm, cn, st_sd), 0, st_sd, []) { LResMany(avs_s, st_s1) ->
+        let st_sb = match lower_kinds_held(cargs, ctor_slot_kinds_in(hm, cn, st_sd), 0, held, RhHolds { regs: [], st: st_sd }, [], pos) { LResMany(avs_s, st_s1) ->
           match bind_op(st_s1, reuse_fresh_op(rk, hm, cn, avs_s, st_s1), pos) { LRes(rs, st_s2) ->
             ls_seal(ls_emit(st_s2, KStore(rjoin, rs, pos)), KBr(l_join, pos), l_join) } }
         LRes(KVar(rjoin), st_sb)
@@ -3678,9 +3702,41 @@ fn lower_enum_slot_arg(e: Expr, st: LowerSt) : LRes / Console = match e.kind {
 pub fn lower_direct_call(x: Expr, sym: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
   let sig = fnx_ufn_by_csym(st.fx, sym)
   match lower_tcrec_args(cargs, sig, st) { LResMany(avs0, st0) ->
-    match ob_pin_literals(cargs, avs0, st0, []) { LResMany(avs, st1) ->
-      ob_drop_after(bind_op_slot(st1, KCall(sym, avs), ret_slot_of_sig(sig), kpos_of(x)),
-                    cargs, avs, kpos_of(x)) } }
+    match ob_pin_literals(cargs, avs0, st0, []) { LResMany(avs, st1) -> {
+      let held = ob_held(x, cargs, avs, st1)
+      ob_drop_after(ob_release(held, bind_op_slot(held.st, KCall(sym, avs), ret_slot_of_sig(sig), kpos_of(x))),
+                    cargs, avs, kpos_of(x)) } } }
+}
+
+# An owned-borrow temp computed in place is held by no binder, so across a
+# call that can unwind it is registered for the call's extent; one that only
+# renames a binder is not, since the binder is registered already.
+type ObHeld = { reg: String, st: LowerSt }
+
+fn ob_held(x: Expr, cargs: [Expr], avs: [KVal], st: LowerSt) : ObHeld = match unw_call_of(st.unw, x) {
+  None -> ObHeld { reg: "", st: st }
+  Some(_) -> match ob_marked_vals(cargs, avs) {
+    [] -> ObHeld { reg: "", st: st }
+    vs -> match ls_fresh_reg(st) { LSReg(f, st0) ->
+      ObHeld { reg: f, st: ls_emit(st0, KLet(f, SBoxed, KPrim("kai_unw_push", [KVar(unw_fib(st0.unw)), ...vs]), kpos_of(x))) } }
+  }
+}
+
+fn ob_renames(c: Expr) : Bool = match c.kind {
+  ECall(_, [inner]) -> unw_bare_read(inner)
+  _                 -> false
+}
+
+fn ob_release(h: ObHeld, r: LRes) : LRes = match r {
+  LRes(v, st) -> if h.reg == "" { r } else { LRes(v, ls_emit(st, KDo(KPrim("kai_unw_pop", [KVar(h.reg)]), KNoPos))) }
+}
+
+fn ob_marked_vals(cargs: [Expr], avs: [KVal]) : [KVal] = match (cargs, avs) {
+  ([c, ...crest], [v, ...vrest]) -> {
+    let more = ob_marked_vals(crest, vrest)
+    match v { KVar(_) -> if ob_is_marked(c) and not ob_renames(c) { [v, ...more] } else { more } _ -> more }
+  }
+  _ -> []
 }
 
 # An owned value in a borrowed slot: the callee borrows it and no binder
