@@ -1244,8 +1244,10 @@ test-core-text: bin/kai
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/string_test.kai
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) tests/stdlib/string_boundaries_test.kai
 	# Rename the inline-test entry to avoid colliding with auto-loaded core.string.
+	# The copy is a user file: it calls core's declared builtins, never declares them.
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
-	cp stdlib/core/string.kai "$$tmp/string_subject.kai" && \
+	sed -e '/^#\[doc(".*")\]$$/{' -e 'N' -e '/\nextern "kai"/d' -e '}' stdlib/core/string.kai > "$$tmp/string_subject.kai" && \
+	! grep -q '^extern "kai"' "$$tmp/string_subject.kai" && \
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" test --backend=$(KAI_TEST_BACKEND) "$$tmp/string_subject.kai"
 	KAI_STDLIB="$(CURDIR)/stdlib" "$(KAI_TEST_DRIVER)" check --backend=c tests/stdlib/core_text_properties_test.kai
 
