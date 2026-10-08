@@ -68,6 +68,11 @@ exits 0:
 lean docs/formal/Perceus.lean
 ```
 
+A `.tla` model runs under TLC: Java 11 or later and `tla2tools.jar`
+from the [TLA+ releases](https://github.com/tlaplus/tlaplus/releases),
+nothing else. Each `.cfg` next to the model is one run; the model's
+section below gives the command and what each run should report.
+
 Install only if you are using one. There is no reason for this toolchain
 to be present on a machine that merely builds kaikai.
 
@@ -233,3 +238,129 @@ Mirrors `pcs_collect_arm_drops` (perceus.kai:5517), `pcs_arm_drop_arms`
 Out of scope: destructuring `SLet`, rest/`@`/narrowing binders, the tcrec
 goto ledger, handler-clause binders, and raw locals. The file lists these
 at the end.
+
+### `FiberWorker.tla`
+
+The scheduler state a fiber reaches after a switch, against `7799bf9b`.
+
+The runtime owner object is compiled at `-O0` because clang at `-O1`+
+treats the address of a `_Thread_local` as constant within a function and
+keeps it across `swapcontext`. A fiber that parks on one worker and is
+stolen by another then writes the first worker's scheduler state (#1234).
+This model asks whether reaching that state through the fiber instead, as
+Go reaches its `m`/`p` through the current `g`, closes the hole without
+`-O0`.
+
+**What is modelled.** N workers, each with a steal list and a root
+context that publishes a switched-out fiber only after its context is
+saved (the commit and requeue stacks). Fibers run, switch at a park or a
+yield, are re-enqueued, stolen from the head of another worker's list,
+and resumed on any worker. Four fibers exercise the paths: `R` receives
+two messages through `kai_mailbox_pop`; `S1` and `S2` send through
+`kai_mailbox_push_cross_thread`, whose unpark runs after the mailbox
+unlock; `S2` then parks in `kai_default_spawn_await` until `S1`'s
+terminate walk wakes it; `G` drives two stack segments and is the
+`Cancel` target. Every slot-lock or mailbox-lock critical section is one
+atomic step, and every unlock-then-unpark window is a separate one —
+those windows are where `wake_pending` matters.
+
+The compiler's freedom is the `Mode` constant. After every switch the
+resumed fiber first touches "its" worker's scheduler state (standing for
+`kai_set_active_fiber`, `kai_drain_pending_free` and the commit and
+requeue stacks):
+
+- `"tls"`: through the thread pointer it read before the switch, or a
+  fresh one. Both are legal compilations, so TLC tries both.
+- `"fiber"`: through `worker[self]`, which the scheduler stores on every
+  dispatch. Caching `self` across the switch is harmless (it is the same
+  fiber); the field is reloaded because the switch is an opaque call and
+  the fiber is reachable from the steal lists.
+
+**Segments.** `G` can start, suspend, resume, drop (discontinue, pinned
+with `seg_pin`), return from and abandon past segments, nest them, hold
+one segment's continuation in another's frames, and yield the fiber from
+inside a segment or from inside a discontinue's `finally`. A `Cancel`
+observed at a yield point inside a segment escapes it and is continued by
+the resumer (`kai_seg_escape` / `kai_seg_rethrow`).
+
+**Properties.** Safety: `TouchesOwnWorker` (a fiber on W touches only W's
+state), `ActiveCoherent`, `NoFiberOnTwoWorkers`, `NoLostNoDouble` (every
+live fiber is in exactly one place; a parked one is reachable by a waker),
+`ExactlyOnce` (each message is in flight or received, once),
+`PinHolds`, and for segments `SegStates` (each segment is running iff on
+the chain, suspended iff exactly one frame holds its box, otherwise none
+or dead), `CleanupOnce`, `StackOnOneWorker`, `ParentAcyclic`,
+`SegsDeadAtExit` (abandon and cancel leave nothing behind). Liveness
+under weak fairness: `RunnableRuns`, `ParkedWithMessageResumes`,
+`AwaiterResumes`, `AllDelivered`, `AllExit`.
+
+**Running.** From the repo root, with `tla2tools.jar` anywhere:
+
+```sh
+java -cp tla2tools.jar tlc2.TLC -workers 4 -noGenerateSpecTE \
+    -metadir /tmp/tlc-fw -config docs/formal/FiberWorker_tls.cfg \
+    docs/formal/FiberWorker.tla
+```
+
+Swap the `.cfg` for each run below. Last checked with TLC2 2026.10.06
+(rev `94d0c50`) on OpenJDK 17, arm64-darwin, 4 workers.
+
+| Config | Mode | Bounds | Checks | Result | Distinct states | Time |
+|---|---|---|---|---|---|---|
+| `tls` | tls | 2 workers, 3 fibers | safety | `TouchesOwnWorker` violated, 14-state trace | — | < 1 s |
+| `fiber3w` | fiber | 3 workers, 3 fibers | safety + liveness | pass | 99,241 | 13 s |
+| `segs` | fiber | 2 workers, 4 fibers, 2 segments | safety + liveness | pass | 2,011,773 | 7 min 16 s |
+| `segs3w` | fiber | 3 workers, 4 fibers, 2 segments | safety | pass | 24,257,713 | 3 min 17 s |
+
+`Budget` bounds `G`'s choices: 4 in `segs`, 2 in `segs3w`. At 3 workers
+with `Budget = 4` the safety search ran 15 minutes, 94,470,091 distinct
+states to depth 38 of 60, with no violation, and did not finish.
+
+**The #1234 counterexample** (`tls`, abridged):
+
+1. `w1` runs `R`; the mailbox is empty, so `R` links itself as a receive
+   waiter, reads its thread pointer (`w1`) and parks. `w1`'s root commits
+   the park.
+2. `w1` runs `S1`, which sends `m1`, takes `R` off the waiter list and
+   unparks it onto `w1`'s steal list, then yields.
+3. `w1` runs `S2`. `w2`, idle, steals `R` and resumes it.
+4. `R`, now on `w2`, finishes its switch through the `w1` thread pointer:
+   `w1`'s `kai_active_fiber` becomes `R` while `w1` is running `S2`.
+
+The same state also breaks `ActiveCoherent`. The fiber-pointer variant
+passes every property at the bounds above.
+
+**Teeth.** The search sees each fence fail when it is removed (`Ablate`),
+at the bounds of the run it belongs to:
+
+| Config | Fence removed | First violation | Trace |
+|---|---|---|---|
+| `update` | the `worker` store on dispatch | `TouchesOwnWorker` | 9 states |
+| `pin` | thieves skip a fiber with `seg_pin` | `PinHolds` | 25 states |
+| `permit` | the park commit honours `wake_pending` | `NoLostNoDouble` (`R` parked, no waker) | 8 states |
+| `dropheld` | a discontinue releases the boxes its frames own | `SegsDeadAtExit` | 22 states |
+
+`FiberWorker_witness.cfg` holds the segment bounds without invariants.
+Each `Witness*` operator in the model, checked as its only invariant,
+must be violated, showing the search reaches that shape: a stolen
+receiver resuming, a park committed over a pending permit, a segment
+resumed on another worker, two segments nested, a segment holding
+another's box, a fiber yielding while pinned, a cancel crossing a
+segment, and an abandon landing on a segment. All eight are reached.
+
+**Observation for the runtime change.** `HomeIsRunner` holds in every
+passing run: whenever a fiber runs on W, its `home_thread` is W, because
+enqueue and steal already stamp it under the slot lock. The pointer the
+fiber needs exists; what `-O2` needs is that code after a switch reads it
+instead of the thread pointer.
+
+**Out of scope.** The idle-worker park and permit protocol
+(`kai_worker_park`, spinning, `kai_sched_notify_work`): an idle worker
+here keeps searching, and the liveness results hold under that
+abstraction. Reactor parks (timer, socket, signal, file pool). Pinning to
+the main thread. Discontinue and escape unwind one context per atomic
+step, except the yield inside a discontinue's `finally`; a `Cancel` is
+not observed during a discontinue. A continuation resumed from another
+fiber is not modelled — `cont_crossing.kai` rejects it and
+`kai_seg_take` traps it. Segment pool access goes through `noinline`
+helpers in both modes, so it is not one of the cached touches.
