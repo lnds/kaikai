@@ -5787,10 +5787,13 @@ test-segment-runtime: build
 	@for n in 1 4; do KAI_THREADS=$$n ./build/segment_runtime_test || { echo "segment-runtime FAIL (KAI_THREADS=$$n)"; exit 1; }; done
 	@echo "segment-runtime OK"
 
+# LeakSanitizer exists on Linux only.
+SEG_RT_LEAKS := $(if $(filter Linux,$(UNAME_S)),1,0)
+
 test-segment-runtime-asan: build
 	$(call seg_rt_build,-asan,-fsanitize=address$(COMMA)undefined -fno-omit-frame-pointer)
 	@for n in 1 4; do \
-	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0" \
+	  ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=$(SEG_RT_LEAKS)" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" KAI_THREADS=$$n \
 	    ./build/segment_runtime_test-asan || { echo "segment-runtime-asan FAIL (KAI_THREADS=$$n)"; exit 1; }; \
 	done

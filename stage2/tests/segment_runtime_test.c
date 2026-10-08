@@ -235,21 +235,18 @@ static void test_double_resume_traps(const char *self_path) {
 #define MN_FIBERS 16
 #define MN_ROUNDS 400
 
-static _Atomic long mn_moves = 0;
 static _Atomic long mn_wrong = 0;
+static _Atomic int  probe_captured = 0;
+static _Atomic int  probe_moved = 0;
+static int          probe_started_on = -1;
 
 static KaiValue *tid_body(KaiValue *self, KaiValue **args, int n) {
     (void) self; (void) args; (void) n;
-    pthread_t last = pthread_self();
-    for (int64_t i = 0; i < MN_ROUNDS; i++) {
-        kai_decref(kai_seg_suspend(kai_int(i)));
-        pthread_t now = pthread_self();
-        if (!pthread_equal(now, last)) atomic_fetch_add(&mn_moves, 1);
-        last = now;
-    }
+    for (int64_t i = 0; i < MN_ROUNDS; i++) kai_decref(kai_seg_suspend(kai_int(i)));
     return kai_unit();
 }
 
+/* Suspends and resumes across yields while other fibers come and go. */
 static KaiValue *mn_fiber(KaiValue *self, KaiValue **args, int n) {
     (void) self; (void) args; (void) n;
     KaiValue *k = NULL;
@@ -267,18 +264,64 @@ static KaiValue *mn_fiber(KaiValue *self, KaiValue **args, int n) {
     return kai_unit();
 }
 
+/* glibc declares pthread_self `const`, so a direct call is folded across the
+ * suspend; a call through a volatile pointer is not. */
+static pthread_t (*volatile current_thread)(void) = pthread_self;
+
+static KaiValue *probe_body(KaiValue *self, KaiValue **args, int n) {
+    (void) self; (void) args; (void) n;
+    pthread_t before = current_thread();
+    kai_decref(kai_seg_suspend(kai_unit()));
+    if (!pthread_equal(before, current_thread())) atomic_store(&probe_moved, 1);
+    return kai_unit();
+}
+
+/* Captures on whichever worker stole it, then pins itself to thread 0 so the
+ * yield's enqueue routes it there: the resume runs on another worker. */
+static KaiValue *probe_fiber(KaiValue *self, KaiValue **args, int n) {
+    (void) self; (void) args; (void) n;
+    probe_started_on = kai_thread_id;
+    KaiValue *k = NULL;
+    kai_decref(kai_seg_start(mk_body(probe_body, NULL), &k));
+    KaiFiber *f = kai_current_fiber();
+    f->pinned_main = 1;
+    atomic_store(&probe_captured, 1);
+    KaiCont kc;
+    kai_cont_init_identity(&kc, 0);
+    kai_default_spawn_yield(NULL, &kc);
+    kai_decref(kai_seg_resume(k, kai_unit(), &k));
+    f->pinned_main = 0;
+    return kai_unit();
+}
+
+static KaiValue *mn_spawn(KaiFn fn) {
+    KaiCont kc;
+    kai_cont_init_identity(&kc, 0);
+    KaiValue *thunk = mk_body(fn, NULL);
+    KaiValue *fib = kai_default_spawn_spawn(NULL, thunk, &kc);
+    kai_decref(thunk);
+    return fib;
+}
+
+static void mn_await(KaiValue *fib) {
+    KaiCont kc;
+    kai_cont_init_identity(&kc, 0);
+    kai_decref(kai_default_spawn_await(NULL, fib, &kc));
+    kai_decref(fib);
+}
+
+static double now_ns(void);
+
 static KaiValue *mn_main(void) {
     KaiValue *fibs[MN_FIBERS];
-    for (int i = 0; i < MN_FIBERS; i++) {
-        KaiCont kc;
-        kai_cont_init_identity(&kc, 0);
-        fibs[i] = kai_default_spawn_spawn(NULL, mk_body(mn_fiber, NULL), &kc);
-    }
-    for (int i = 0; i < MN_FIBERS; i++) {
-        KaiCont kc;
-        kai_cont_init_identity(&kc, 0);
-        kai_decref(kai_default_spawn_await(NULL, fibs[i], &kc));
-        kai_decref(fibs[i]);
+    for (int i = 0; i < MN_FIBERS; i++) fibs[i] = mn_spawn(mn_fiber);
+    for (int i = 0; i < MN_FIBERS; i++) mn_await(fibs[i]);
+    if (kai_nthreads > 1) {
+        /* Hold thread 0 until another worker has stolen the probe and captured. */
+        KaiValue *probe = mn_spawn(probe_fiber);
+        double deadline = now_ns() + 10e9;
+        while (!atomic_load(&probe_captured) && now_ns() < deadline) {}
+        mn_await(probe);
     }
     return kai_unit();
 }
@@ -286,8 +329,10 @@ static KaiValue *mn_main(void) {
 static void test_migration(void) {
     kai_decref(kai_sched_bootstrap(mn_main));
     check("migrated segments resume in order", atomic_load(&mn_wrong) == 0);
-    if (kai_nthreads > 1)
-        check("a segment resumed on another worker", atomic_load(&mn_moves) > 0);
+    if (kai_nthreads > 1) {
+        check("another worker stole the probe", probe_started_on > 0);
+        check("a segment resumed on another worker", atomic_load(&probe_moved) == 1);
+    }
 }
 
 /* ---------- costs ---------- */
@@ -338,8 +383,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "segment_runtime_test: FAIL\n");
         return 1;
     }
-    printf("segment_runtime_test: OK (%d threads, %ld resumes on another worker)\n",
-           kai_nthreads, atomic_load(&mn_moves));
+    printf("segment_runtime_test: OK (%d threads)\n", kai_nthreads);
     return 0;
 }
 

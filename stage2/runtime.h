@@ -3608,6 +3608,17 @@ static inline void kai_tsan_fiber_free(KaiFiber *f) { (void) f; }
 void __sanitizer_start_switch_fiber(void **fake_stack_save, const void *bottom, size_t size);
 void __sanitizer_finish_switch_fiber(void *fake_stack_save, const void **bottom_old, size_t *size_old);
 #endif
+/* LeakSanitizer scans thread stacks, not a mapped segment stack: a value only
+ * a suspended segment's frames hold would read as leaked. */
+#if defined(KAI_ASAN_FIBERS) && defined(__linux__)
+void __lsan_register_root_region(const void *p, size_t size);
+void __lsan_unregister_root_region(const void *p, size_t size);
+#  define KAI_SEG_LSAN_ROOT(seg)   __lsan_register_root_region((seg)->own.stack_base, (seg)->own.stack_size + kai_page_size())
+#  define KAI_SEG_LSAN_UNROOT(seg) __lsan_unregister_root_region((seg)->own.stack_base, (seg)->own.stack_size + kai_page_size())
+#else
+#  define KAI_SEG_LSAN_ROOT(seg)   ((void) 0)
+#  define KAI_SEG_LSAN_UNROOT(seg) ((void) 0)
+#endif
 
 /* noinline is load-bearing: inlined into a fiber body, clang materialises
  * TP+offset and spills it across the park swapcontext, so a work-stolen
@@ -19117,6 +19128,7 @@ static void kai_seg_release(KaiSegment *seg) {
     seg->xfer  = NULL;
     seg->spare = NULL;
     if (spare != NULL) kai_decref(spare);
+    KAI_SEG_LSAN_UNROOT(seg);
 #if defined(KAI_TSAN_FIBERS)
     /* A finished segment's entry frames never returned: start afresh. */
     __tsan_destroy_fiber(seg->own.tsan_fiber);
@@ -19273,6 +19285,7 @@ KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k) {
 #if defined(KAI_TSAN_FIBERS)
     seg->own.tsan_fiber       = __tsan_create_fiber(0);
 #endif
+    KAI_SEG_LSAN_ROOT(seg);
     seg->sp = kai_seg_frame_init((char *) seg->own.stack_base + kai_page_size() + seg->own.stack_size,
                                  kai_seg_entry);
     return kai_seg_run(f, seg, seg, k);
