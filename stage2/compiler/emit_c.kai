@@ -4866,8 +4866,12 @@ fn reuse_variant_arm_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseV
 fn rv_flat_arm(subs: [Pattern], cargs: [Expr]) : Bool =
   not rv_any_nested_ctor(cargs) and all(subs, (sp) => match sp.pkind { PBind(_) -> true PWild -> true _ -> false })
 
+# An arm nested in an arm-top body leaves the enclosing token in place: its
+# steps rebuild into that cell.
 fn arm_top_reuse_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReuse] =
-  if cx.in_region { None } else { try_arm_top_reuse(pat, body, cx) }
+  if cx.in_region or arm_top_token_held(cx) { None } else { try_arm_top_reuse(pat, body, cx) }
+
+fn arm_top_token_held(cx: EmitCtx) : Bool = match cx.reuse_donor { Some(_) -> true  None -> false }
 
 fn emit_match_arm(src: String, a: Arm, scr_alias: Option[String], scr_ty: Option[Ty], cx: EmitCtx) : String / Console {
 
@@ -14118,7 +14122,12 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
           let sentinel = trmc_make_step_sentinel(c_sym_str, h, cname, dropmask, pnames)
           ECall(Expr { kind: EVar(sentinel), line: line, col: col, ty: f.ty, mode: f.mode }, xs)
         }
-        None -> {
+        None -> match trmc_reuse_variant_ctor(f, xs, me, arity) {
+          # A Perceus reuse rebuild of a modulo-cons ctor is that ctor's step:
+          # the arm-top token hands the step the scrutinee's cell as its hole.
+          Some(ctor) -> trmc_rewrite_kind(ctor.kind, ctor.line, ctor.col, me, arity,
+                                          c_sym_str, params, pnames, uses, dm_table, skip_set, scope, cons_ok)
+          None -> {
           # Reuse-cons leaf: `__perceus_reuse_cons(__pcs_scr, head, self)`.
           let reuse = match f.kind {
             EVar(callee) -> if cons_ok and not list_has(scope, self_ref_name(me)) { trmc_reuse_cons_modcons(callee, xs, me, arity) } else { None }
@@ -14129,12 +14138,34 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
                                                c_sym_str, params, pnames, uses, dm_table, skip_set)
             None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed })
           }
+          }
         }
       }
     }
     _ -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed })
   }
 }
+
+# The ctor a `__perceus_reuse_variant(scr, Ctor(..))` rebuilds, when one of
+# its slots is the self-call.
+fn trmc_reuse_variant_ctor(f: Expr, xs: [Expr], me: SelfRef, arity: Int) : Option[Expr] = match f.kind {
+  EVar(callee) -> if callee != "__perceus_reuse_variant" { None } else { match xs {
+    [_scr, ctor] -> match ctor.kind {
+      ECall(cf, cargs) -> if trmc_names_ctor(cf) and not trmc_slot_none(tcrec_ctor_modcons_slot(cargs, me, arity)) { Some(ctor) } else { None }
+      _                -> None
+    }
+    _ -> None
+  } }
+  _ -> None
+}
+
+fn trmc_names_ctor(cf: Expr) : Bool = match cf.kind {
+  EVar(c)        -> name_first_is_upper(c)
+  EModCall(_, c) -> name_first_is_upper(c)
+  _              -> false
+}
+
+fn trmc_slot_none(o: Option[Int]) : Bool = match o { Some(_) -> false  None -> true }
 
 fn trmc_wrap_apply(leaf: Expr) : ExprKind =
   ECall(Expr { kind: EMark(MkTrmcApply), line: leaf.line, col: leaf.col, ty: leaf.ty, mode: leaf.mode },
