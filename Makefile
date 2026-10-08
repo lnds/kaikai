@@ -1298,6 +1298,7 @@ TIER1_ASAN_JOBS ?= 4
 TIER1_ASAN_LEGS_A := \
 	test-mn-sigaltstack-asan \
 	test-segment-runtime-asan \
+	test-segment-handles-asan \
 	test-segment-switch-asan \
 	test-namespace-collisions-asan \
 	test-trace-asan \

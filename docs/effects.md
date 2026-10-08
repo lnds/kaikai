@@ -507,21 +507,23 @@ lie on the same control-flow path; otherwise the runtime catches
 it on the second call. This is the zero-cost continuation regime;
 kaikai's principle #2 mandates it.
 
-A non-tail `resume` must lie in the clause itself: not inside a
-`handle` nested in the clause, a loop body, a match guard, or a
-string interpolation, and the code after it may not read a `var`
-of the clause. The compiler rejects those shapes with a span.
+A clause may keep its continuation beyond a call in the clause
+itself: call it inside a `handle` nested in the clause, a loop body,
+a match guard, a string interpolation or a lambda, read a clause
+`var` after it, or store and return it. `resume` is then a value of
+type `Cont[T, S]` — `T` the op's result, `S` the handle's type — and
+`k(v) : S` resumes the body. The handle runs its body on a stack
+segment; dropping an unresumed continuation discontinues the body,
+running every `finally` on it. A continuation stays on its fiber: a
+thunk handed to `spawn`, a fiber's result, or an actor message holding
+one is a compile error.
 
-> **v1 status (2026-10-05):** the one-shot continuation is called
-> in the clause body itself. A call of it from inside a lambda in
-> the clause (`pick(k) -> { let g = (v: Int) => k(v); g(10) }`) is
-> rejected with "calling the continuation from inside a lambda is
-> not supported yet"; a lambda param of the same name shadows it and
-> is not affected. The limit is on the one-shot continuation only,
-> never on `resume_multishot`. Lifting it later, as second-class
-> continuations in the Effekt style (passed downward into a call,
-> never stored or returned), accepts strictly more programs, so it
-> is not a breaking change.
+> **v1 status (2026-10-08):** a continuation that can leave its
+> clause carries no effect row yet, so the body it resumes may perform
+> only the effect its handle discharges; effectful generator bodies
+> are coming. A stateful handle cannot keep its continuation; its
+> segment form is coming. The C backend runs segment handles; the
+> native backend reports them as unsupported until its lowering lands.
 
 For genuinely multi-shot or escaping continuations (backtracking
 search, generators), the programmer writes `resume_multishot(v)`

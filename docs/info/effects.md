@@ -24,7 +24,9 @@ Resume is ONE-SHOT and EXPLICIT: a clause receives `resume` as a
 callable; calling it continues the body with a value and evaluates to
 the handle's result. Not calling it abandons the continuation (e.g. an
 op returning `Nothing`). Calling it twice on one path is a compile
-error.
+error; a second call the compiler cannot see traps at run time.
+A clause may also keep `resume` as a value (see *Keeping the
+continuation* below).
 
 Abandoning the continuation skips the `return` clauses of the handlers
 it jumps over — those do not run, and neither does the abandoning
@@ -299,6 +301,40 @@ fn pair() : String / Box[Int] + Box[String] = {
 
 fn main() : Int = 0
 ```
+
+## Keeping the continuation — `Cont[T, S]`
+
+A clause may store `resume`, return it, or call it from a lambda or a
+loop. It is then a value of type `Cont[T, S]`: `T` is what the op
+returns, `S` the handle's type, and `k(v) : S` resumes the body. Such a
+handle runs its body on a stack segment; `kai build --explain` notes
+each one and why. A dropped continuation discontinues its body: every
+`finally` on it runs.
+
+```kaikai
+effect Yield { yield(x: Int) : Unit }
+
+type Gen = Done | Next(Int, Cont[Unit, Gen])
+
+fn upto(n: Int, lim: Int) : Unit / Yield =
+  if n > lim { () } else { Yield.yield(n); upto(n + 1, lim) }
+
+fn generate(lim: Int) : Gen =
+  handle { upto(1, lim); Done } with Yield { yield(x, resume) -> Next(x, resume) }
+
+fn sum_all(g: Gen, acc: Int) : Int = match g {
+  Done       -> acc
+  Next(x, k) -> sum_all(k(()), acc + x)
+}
+```
+
+- A continuation stays on the fiber that created it: a thunk handed to
+  `spawn`, a fiber's result, or an actor message cannot hold one.
+- When the continuation can leave its clause, the handled body may
+  perform only the effect its handle discharges.
+- A stateful handle (`with Eff(init)`) cannot keep its continuation.
+- The C backend runs these handles; the native backend reports them as
+  unsupported.
 
 ## Stdlib effects
 

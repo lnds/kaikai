@@ -30,6 +30,8 @@ import compiler.kind_semilattice
 import compiler.parse
 import compiler.resolve
 import compiler.handler_alias
+import compiler.expr_positions
+import compiler.cont_crossing
 import compiler.handler_cover
 import compiler.decl_names
 import compiler.symtab
@@ -8792,6 +8794,10 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
         synth_resume_frame(st, args_, e)
       } else if nm == "resume_bad" {
         report_resume_bad(st, args_, e)
+      } else if nm == "seg_handle" {
+        synth_seg_handle(st, args_, e)
+      } else if nm == "seg_request" {
+        synth_seg_request(st, args_, e)
       } else if tfslots_is_absent(nm) {
         let r = st_fresh_ty(st)
         inferred_leaf(r.st, r.ty, e)
@@ -10007,10 +10013,14 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
             Some(inf) -> inf
             None -> {
             let rc = synth(st_p, callee)
+            let callee_ty = apply_ty(rc.st.sub, rc.ty)
+            match callee_ty {
+              TyCon(_, "Cont", [a_ty, s_ty], _) -> synth_cont_call(rc, a_ty, s_ty, args_, line, col)
+              _ -> {
             # pair each arg with its declared param so a Vec-typed
             # param mints an EList / collects a map-pipe chain — the
             # argument-position face of the annotation-context rules.
-            let vparams = match apply_ty(rc.st.sub, rc.ty) {
+            let vparams = match callee_ty {
               TyFnT(ps, _, _) -> ps
               _               -> []
             }
@@ -10029,6 +10039,8 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
             match refine_call(ca.st, rc.expr, rc.ty, ca.exprs, ca.tys, apply_ty(st2.sub, rv.ty)) {
               RefCall(st3, ty) -> mk_inferred(st3, ty, with_ty(mk_expr(ECall(rc.expr, ca.exprs), line, col), ty))
             }
+              }
+            }
             }
           }
           }
@@ -10036,6 +10048,16 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
         }
       }
   }
+}
+
+# `k(v)` on a `Cont[T, S]`: resume with a `T`, get the handle's `S`.
+fn synth_cont_call(rc: Inferred, a_ty: Ty, s_ty: Ty, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable = {
+  let ra = synth_many(rc.st, args_)
+  let st1 = match ra.tys {
+    [t] -> st_unify(ra.st, a_ty, t, "continuation argument", line, col)
+    _ -> seg_error(ra.st, rc.expr, "a continuation takes exactly one argument", "call it as `k(v)`").st
+  }
+  mk_inferred(st1, s_ty, with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), s_ty))
 }
 
 # `#[constructor]` sugar: a call whose callee is a bare type name with
@@ -10357,6 +10379,118 @@ fn synth_resume_frame(st: InferState, args_: [Expr], e: Expr) : Inferred / Conso
     render_diag(perr)
     inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
   }
+}
+
+# `$seg_request(i, args...)`: a forwarding clause handing op `i` to its
+# segment handle; its value is what the continuation is called with.
+fn synth_seg_request(st: InferState, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable = match args_ {
+  [ix, ...xs] -> {
+    let ra = synth_many(st, xs)
+    let r = st_fresh_ty(ra.st)
+    mk_inferred(r.st, r.ty, with_ty(mk_expr(EIntrinsic("seg_request", [with_ty(ix, TyInt), ...ra.exprs]), e.line, e.col), r.ty))
+  }
+  [] -> seg_error(st, e, "compiler intrinsic `$seg_request` takes an op index", "")
+}
+
+# `$seg_handle(escapes, reason, body, return, clause...)`: the body thunk is
+# typed first; its forwarders' requests give each clause its parameter types
+# and its continuation `Cont[answer, S]`, where `S` is the handle's type.
+fn synth_seg_handle(st: InferState, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable = match args_ {
+  [esc, why, thunk, ret, ...cls] -> {
+    let rt = synth(st, thunk)
+    let body_ty = match apply_ty(rt.st.sub, rt.ty) { TyFnT(_, b, _) -> b  t -> t }
+    let rs = st_fresh_ty(rt.st)
+    let rr = seg_lambda(rs.st, ret, [body_ty], rs.ty)
+    let rc = seg_clauses(rr.st, cls, rt.expr, rs.ty, 0, [])
+    let st1 = seg_absorb(seg_absorb(rc.st, rt.ty, e), rr.ty, e)
+    let st2 = seg_check_escape(st1, esc, rt.ty, e)
+    let node = mk_expr(EIntrinsic("seg_handle", [esc, why, rt.expr, rr.expr, ...rc.exprs]), e.line, e.col)
+    mk_inferred(st2, rs.ty, with_ty(node, rs.ty))
+  }
+  _ -> seg_error(st, e, "compiler intrinsic `$seg_handle` has a malformed argument list", "")
+}
+
+type SegClauses = { st: InferState, exprs: [Expr] }
+
+fn seg_clauses(st: InferState, cls: [Expr], body: Expr, s_ty: Ty, i: Int, acc: [Expr]) : SegClauses / Console + File + Mutable =
+  match cls {
+    [] -> SegClauses { st: st, exprs: list_reverse(acc) }
+    [c, ...rest] -> {
+      let pins = match seg_request_at(body, i) {
+        Some(req) -> [...map(req.args, (a) => ty_of_expr(a)), TyCon(None, "Cont", [ty_of_expr(req.at), s_ty], sym_none())]
+        None -> []
+      }
+      let r = seg_lambda(st, c, pins, s_ty)
+      seg_clauses(seg_absorb(r.st, r.ty, c), rest, body, s_ty, i + 1, [r.expr, ...acc])
+    }
+  }
+
+# A clause or return lambda: parameters pinned, result the handle's type.
+# The `()` standing for a missing return clause passes the body's value on.
+fn seg_lambda(st: InferState, lam: Expr, pins: [Ty], s_ty: Ty) : Inferred / Console + File + Mutable = match lam.kind {
+  EUnit -> match pins {
+    [b] -> mk_inferred(st_unify(st, s_ty, b, "handle result", lam.line, lam.col), TyUnit, with_ty(lam, TyUnit))
+    _ -> synth(st, lam)
+  }
+  ELambda(ps, b) -> {
+    let r = synth_lambda_pinned(st, ps, b, pins, "handler clause", lam.line, lam.col)
+    let res = match apply_ty(r.st.sub, r.ty) { TyFnT(_, t, _) -> t  t -> t }
+    Inferred { ...r, st: st_unify(r.st, s_ty, res, "handler clause result", lam.line, lam.col) }
+  }
+  _ -> synth(st, lam)
+}
+
+# The handle calls each lambda: its effects are the caller's.
+fn seg_absorb(st: InferState, fn_ty: Ty, at: Expr) : InferState / Console + File + Mutable =
+  st_propagate_capability_labels(st, apply_ty(st.sub, fn_ty), at.line, at.col)
+
+type SegReq = { at: Expr, args: [Expr] }
+
+fn seg_request_at(e: Expr, i: Int) : Option[SegReq] = match e.kind {
+  EIntrinsic(nm, xs) -> if nm == "seg_request" { match xs {
+    [ix, ...args] -> match ix.kind {
+      EInt(n, _) -> if n == i { Some(SegReq { at: e, args: args }) } else { None }
+      _ -> None
+    }
+    [] -> None
+  } } else { seg_request_in(map(xp_positions(e), xpos_expr), i) }
+  _ -> seg_request_in(map(xp_positions(e), xpos_expr), i)
+}
+
+fn seg_request_in(es: [Expr], i: Int) : Option[SegReq] = match es {
+  [] -> None
+  [x, ...rest] -> match seg_request_at(x, i) {
+    Some(r) -> Some(r)
+    None    -> seg_request_in(rest, i)
+  }
+}
+
+fn xpos_expr(p: XPos) : Expr = match p { XP(_, x) -> x }
+
+fn ty_of_expr(e: Expr) : Ty = match e.ty { Some(t) -> t  None -> TyAny }
+
+# A continuation that may leave its clause carries no effect row yet, so the
+# body it resumes may perform only the effect its handle discharges.
+fn seg_check_escape(st: InferState, esc: Expr, thunk_ty: Ty, e: Expr) : InferState / Console + File + Mutable = {
+  let escapes = match esc.kind { EBool(b) -> b  _ -> false }
+  let labels = match apply_ty(st.sub, thunk_ty) { TyFnT(_, _, row) -> row.labels  _ -> [] }
+  match labels {
+    [] -> st
+    [l, ..._] -> if not escapes { st } else {
+      seg_error(st, e, "the continuation can leave its clause, but the handled body also performs `#{l.eff}`",
+                "a handle whose `resume` leaves its clause handles a body that performs no other effect; effectful generator bodies are coming").st
+    }
+  }
+}
+
+fn seg_error(st: InferState, at: Expr, header: String, help: String) : Inferred / Console + File + Mutable = {
+  diag_error(st.file, at.line, at.col, header)
+  let related = if help == "" { [] } else {
+    diag_help(help)
+    [ri_help(st.file, at.line, at.col, help)]
+  }
+  let d = mk_diag(SevError, st.file, at.line, at.col, header, related)
+  inferred_leaf(st_bump_err(st_push_diag(st, d)), TyAny, at)
 }
 
 # `$resume_bad(message, help)`: a clause the non-tail `resume` split
@@ -12382,21 +12516,20 @@ fn synth_lambda(st: InferState, ps: [Param], body: Expr, line: Int, col: Int) : 
 # dispatch (`__pl.length()`) cannot defer the way a bare field access
 # can, so the receiver must already be concrete when synth reaches it.
 fn synth_lambda_threaded(st: InferState, ps: [Param], body: Expr,
-                          expected_first: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable {
+                          expected_first: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match expected_first {
+    Some(et) -> synth_lambda_pinned(st, ps, body, [et], "point-free receiver", line, col)
+    None     -> synth_lambda_pinned(st, ps, body, [], "", line, col)
+  }
+
+# A lambda whose leading parameters take `pins` before its body is walked.
+fn synth_lambda_pinned(st: InferState, ps: [Param], body: Expr, pins: [Ty], why: String,
+                       line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
   let outer = st
   let added0 = add_infer_params(st, ps)
-  let added = match expected_first {
-    None -> added0
-    Some(et) -> match added0.tys {
-      [] -> added0
-      [t0, ...] ->
-        InferredParams { st: st_unify(added0.st, t0, et,
-                                       "point-free receiver", line, col),
-                          tys: added0.tys }
-    }
-  }
+  let added = InferredParams { st: pin_params(added0.st, added0.tys, pins, why, line, col), tys: added0.tys }
   # walk the body in an isolated row context. Effects
   # invoked inside the lambda body MUST NOT leak to the enclosing
   # function's row — they belong to the lambda type's own row.
@@ -12467,6 +12600,15 @@ fn synth_lambda_threaded(st: InferState, ps: [Param], body: Expr,
   let root = with_ty(mk_expr(ELambda(ps, rb.expr), line, col), lam_ty)
   mk_inferred(st3, lam_ty, root)
 }
+
+fn pin_params(st: InferState, tys: [Ty], pins: [Ty], why: String, line: Int, col: Int) : InferState / Console + File + Mutable =
+  match tys {
+    [t, ...rest] -> match pins {
+      [p, ...more] -> pin_params(st_unify(st, t, p, why, line, col), rest, more, why, line, col)
+      [] -> st
+    }
+    [] -> st
+  }
 
 # A signature row variable the lambda body performs is part of the
 # lambda's own row. An inference variable is not joined: it may still
@@ -18367,7 +18509,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # never escapes to a helper. Walks the typed body once via
       # `mask_local_mutable_demand` and is a no-op when `Mutable`
       # is not in the row to begin with.
-      let st1c = mask_local_mutable_demand(st1b, ps, rb.expr)
+      let st1c = check_cont_crossings(mask_local_mutable_demand(st1b, ps, rb.expr), rb.expr)
       let st2pre = check_body_row(st1c, nm, row, rbinds, line, col, all_decls)
       # drain the deferred field-access constraints now that
       # the body's tyvars have settled — `check_body_row` above unified
@@ -18771,6 +18913,37 @@ fn is_fiber_producer_helper(fname: String) : Bool =
 # Wrap(Fiber[Int])`). The `visited` set guards recursive sums
 # (`type Tree[T] = Leaf(T) | Node(Tree[T], Tree[T])`).
 type HandleBreach = HBDirect | HBSum(String, String)
+
+# A continuation stays on the fiber whose segment it suspended.
+fn check_cont_crossings(st: InferState, body: Expr) : InferState / Console + File =
+  foldl(cont_crossings(body, (t) => apply_ty(st.sub, t), (t) => ty_holds_cont(t, st.sums, st.recs, [])), st,
+        (acc, c) => match c {
+          Crossing(msg, l, col) -> {
+            let help = "a continuation can only be resumed by the fiber that created it"
+            diag_error(acc.file, l, col, msg)
+            diag_help(help)
+            st_bump_err(st_push_diag(acc, mk_diag(SevError, acc.file, l, col, msg, [ri_help(acc.file, l, col, help)])))
+          }
+        })
+
+# A value of `t` holds a continuation, directly or in a field of a type it names.
+fn ty_holds_cont(t: Ty, sums: [SumInfo], recs: [RecInfo], seen: [String]) : Bool = match t {
+  TyCon(_, n, args, _) ->
+    n == "Cont" or any(args, (a) => ty_holds_cont(a, sums, recs, seen)) or named_holds_cont(n, sums, recs, seen)
+  TyListT(x) -> ty_holds_cont(x, sums, recs, seen)
+  _ -> false
+}
+
+fn named_holds_cont(n: String, sums: [SumInfo], recs: [RecInfo], seen: [String]) : Bool =
+  if list_has(seen, n) { false }
+  else { match ty_expr_find_handle("Cont", TypeExpr { tkind: TyName(n, []), line: 0, col: 0 }, sums, seen) {
+    Some(_) -> true
+    None -> any(recs, (r) => match r {
+      RI(rn, _, fs, _) -> rn == n and any(fs, (f) => match f {
+        FD(_, _, te, _) -> match ty_expr_find_handle("Cont", te, sums, [n, ...seen]) { Some(_) -> true  None -> false }
+      })
+    })
+  } }
 
 fn ty_expr_find_handle(hname: String, t: TypeExpr,
                         sums: [SumInfo], visited: [String]) : Option[HandleBreach] {
