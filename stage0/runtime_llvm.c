@@ -670,7 +670,7 @@ int32_t kaix_variant_tag_of(KaiValue *v) {
 /* Int and Real slots may allocate a box; out of line, they keep
  * kaix_variant_arg cheap enough for the inliner to fold into every match arm. */
 __attribute__((noinline, cold))
-static KaiValue *kaix_variant_arg_scalar(KaiValue *v, int i) {
+KAI_RT_SHARED KaiValue *kaix_variant_arg_scalar(KaiValue *v, int i) {
     return kai_variant_slot_box(v, i);
 }
 
