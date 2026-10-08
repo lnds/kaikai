@@ -34,6 +34,7 @@ import compiler.marks
 import compiler.diag_file
 import compiler.home_dup
 import compiler.extern_fn_dup
+import compiler.kai_builtin_check
 import compiler.extern_fn_types
 import compiler.fn_bounds
 import compiler.call_site_check
@@ -352,8 +353,8 @@ fn dump_expr(e: Expr, depth: Int) : Unit / Console {
     }
     ETodo(msg) ->
       emit_line(depth, "todo \"#{msg}\" @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
-    EExternBody(over) ->
-      emit_line(depth, "extern-body \"#{over}\" @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EExternBody(abi, sym) ->
+      emit_line(depth, "extern-body #{extern_abi_literal(abi)} \"#{sym}\" @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
     EBang(inner) -> {
       emit_line(depth, "bang @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
       dump_expr(inner, depth + 1)
@@ -705,13 +706,13 @@ fn dump_decl(d: Decl, depth: Int) : Unit / Console {
       dump_row_expr(row, depth + 1)
       dump_expr(body, depth + 1)
     }
-    DAxiom(is_pub, extern_c, name, c_sym_over, tparams, params, ret_ty, row, line, col) -> {
+    DAxiom(is_pub, abi, name, sym, tparams, params, ret_ty, row, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
-      let ext_s = if extern_c {
-        if string_length(c_sym_over) > 0 {
-          string_concat("extern_c(\"", string_concat(c_sym_over, "\") "))
-        } else { "extern_c " }
-      } else { "" }
+      let ext_s = match abi {
+        Some(AbiKai) -> concat_all(["extern_kai(\"", sym, "\") "])
+        Some(AbiC)   -> if string_length(sym) > 0 { concat_all(["extern_c(\"", sym, "\") "]) } else { "extern_c " }
+        None         -> ""
+      }
       emit_line(depth, "axiom #{ext_s}#{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
       tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
       params |> each((pm) => dump_param(pm, depth + 1))
@@ -1677,6 +1678,8 @@ pub type Mode
   | MBuiltinTable
   # Print every core builtin name a bare use binds.
   | MBuiltinNames
+  # Print the manifest of the builtins the core modules declare.
+  | MKaiBuiltins
 
 #[doc("Parsed CLI configuration: mode, target path, cores, search paths, edition, and feature flags. Produced by parse_cli, consumed by run.")]
 # The codegen backend, ORTHOGONAL to `Mode`. `Mode` carries the
@@ -2069,6 +2072,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions / Console {
         parse_cli_loop(more, cli_with_mode(opts, MBuiltinNames))
       } else if a == "--builtin-table" {
         parse_cli_loop(more, cli_with_mode(opts, MBuiltinTable))
+      } else if a == "--kai-builtins" {
+        parse_cli_loop(more, cli_with_mode(opts, MKaiBuiltins))
       } else if a == "--resolve-sym-selftest" {
         parse_cli_loop(more, cli_with_mode(opts, MResolveSymSelftest))
       } else if a == "--emit-core-cache" {
@@ -2602,6 +2607,10 @@ fn core_module_paths_loop(rels: [String], root: String, acc: [String]) : [String
   [r, ...rest] -> core_module_paths_loop(rest, root,
                     [string_concat(root, string_concat("/", r)), ...acc])
 }
+
+# Decided by the resolved file, never by module name: any file can be
+# named like a core module.
+fn is_core_path(path: String) : Bool = list_has(map(core_module_paths(), abspath), abspath(path))
 
 # `--builtins-doc-json`. Dump the `#[doc(...)]` attributes of the
 # auto-loaded core module set as one JSON array,
@@ -3141,7 +3150,7 @@ fn find_enc_expr_kind(k: ExprKind, ql: Int, qc: Int, acc: Option[EncResult]) : O
     EPlaceholder    -> acc
     EHole(_)        -> acc
     ETodo(_)        -> acc
-    EExternBody(_)  -> acc
+    EExternBody(_, _)  -> acc
     EModCall(_, _)  -> acc
     ECall(f, call_args)  -> {
       let a1 = find_enc_expr(f, ql, qc, acc)
@@ -3502,7 +3511,7 @@ fn find_local_at_expr_kind(k: ExprKind, qname: String, ql: Int, qc: Int,
     EPlaceholder   -> acc
     EHole(_)       -> acc
     ETodo(_)       -> acc
-    EExternBody(_) -> acc
+    EExternBody(_, _) -> acc
     EModCall(_, _) -> acc
     ECall(f, call_args) -> {
       let a1 = find_local_at_expr(f, qname, ql, qc, scope, acc)
@@ -3741,7 +3750,7 @@ fn find_var_at_expr_kind(k: ExprKind, ql: Int, qc: Int, acc: Option[String]) : O
     EPlaceholder   -> acc
     EHole(_)       -> acc
     ETodo(_)       -> acc
-    EExternBody(_) -> acc
+    EExternBody(_, _) -> acc
     EModCall(_, _) -> acc
     ECall(f, call_args) -> find_var_at_exprs(call_args, ql, qc, find_var_at_expr(f, ql, qc, acc))
     EField(e1, _)  -> find_var_at_expr(e1, ql, qc, acc)
@@ -5102,6 +5111,14 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
               root_only_decls_raw, path)
             let axiom_name_coll_errs = validate_axiom_name_collisions_decls(
               root_only_decls, path)
+            # A core builtin is declared only by a core module, judged by
+            # the file each declaration was read from: the root by its own
+            # path, an import by its entry's, never through a module name a
+            # user file can share with a core module.
+            let import_files = diag_files(module_files(match expanded { EP_Mod(_, mt, _, _, _, _, _) -> mt }, []), path)
+            let kai_decl_vd = vd_render(list_append(
+              kai_builtin_decl_diags(qualified_core_mangled, diag_files(module_files(core_mods, []), path), is_core_path),
+              kai_builtin_decl_diags(qualified_decls, import_files, is_core_path)))
             # Synthesise `__ref_pred_X` fn for every
             # `type X = Base where pred` so match-arm narrowing
             # `p : X` resolves cleanly (parse_optional_arm_refine
@@ -5451,6 +5468,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             else if effect_name_coll_errs > 0 { effect_name_coll_errs }
             else if const_name_coll_errs > 0 { const_name_coll_errs }
             else if axiom_name_coll_errs > 0 { axiom_name_coll_errs }
+            else if vd_failed([kai_decl_vd]) { vd_exit(json, [kai_decl_vd]) }
             else {
             match mode {
               MAst -> { dump_program(surface_decls); 0 }
@@ -6004,6 +6022,10 @@ pub fn run(opts: CliOptions) : Int / Console + File {
       }
     }
     MBuiltinNames -> { write_stdout(builtin_names_report()); 0 }
+    MKaiBuiltins -> match load_core("", false) {
+      Some(PLS(ds, _, _)) -> { write_stdout(string_join(map(kai_builtin_manifest(ds), (l) => cat2(l, "\n")), "")); 0 }
+      None                -> 1
+    }
     MBuiltinTable -> {
       let r = builtin_table_report()
       match char_at(r, 0) {

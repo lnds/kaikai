@@ -3002,6 +3002,15 @@ test-perceus-asan-native: $(TARGET) bin-kai build
 	mv ../stage0/runtime_inline.bc.hidpa ../stage0/runtime_inline.bc 2>/dev/null || true; \
 	exit $$st
 
+# A declared core builtin takes its args owned and returns its result owned,
+# as a builtin_table row does; the fixture runs against both under ASAN.
+.PHONY: test-kai-builtins-asan test-kai-builtins-asan-native
+test-kai-builtins-asan: $(TARGET) build
+	@bash ../tools/kai-builtins-asan.sh c
+
+test-kai-builtins-asan-native: $(TARGET) bin-kai build
+	@bash ../tools/kai-builtins-asan.sh native
+
 # Native sibling. Both runtime bitcodes are hidden while it runs: they are
 # uninstrumented, and the inline one would splice its hot paths past ASAN.
 test-monitor-ref-asan-native: $(TARGET) bin-kai build
