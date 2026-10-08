@@ -845,8 +845,8 @@ fn inf_ty_eq(a: Ty, b: Ty) : Bool {
     # Used by the monomorphiser to key specialisations; without
     # this check, `tuple.Pair` and a user-defined `Pair` would
     # collapse to one mangled symbol.
-    TyCon(am, an, atas, _) -> match b {
-      TyCon(bm, bn, btas, _) -> module_slot_compat(am, bm) and an == bn and inf_ty_list_eq(atas, btas)
+    TyCon(am, an, atas, ta_sym) -> match b {
+      TyCon(bm, bn, btas, tb_sym) -> sym_compat(ta_sym, tb_sym) and module_slot_compat(am, bm) and an == bn and inf_ty_list_eq(atas, btas)
       _ -> false
     }
     TyDimT(ab, _) -> match b { TyDimT(bb, _) -> inf_ty_eq(ab, bb) _ -> false }
@@ -1469,34 +1469,20 @@ fn check_field_privacy_loop(df: DiagFiles, home: Option[String],
   }
 }
 
-# Look up a `(FieldDecl, declaring_module)` pair by record name across
-# `all_decls`. Returns the FieldDecl paired with the DType's own
-# module_origin so callers can compare against the access-site home —
-# the TyCon's `module_origin` is not always populated for user types
-# at this point, so the DType is the authoritative source.
-#
-# When two DTypes carry the same record name across modules (shadowing),
-# the first match wins — by Hanga Roa convention the root file's type
-# shadows imports, but at this point in the pipeline `all_decls` order
-# reflects that already (root file's decls come last after import
-# expansion's reverse-flatten, so the first match here is typically
-# the deepest dependency). Same-name collisions across modules are
-# rare enough that the caller will accept the first hit's verdict.
-
-fn lookup_record_field(all_decls: [Decl], rec_name: String, fname: String)
+fn lookup_record_field(all_decls: [Decl], rec_name: String, rec_sym: SymId, fname: String)
                          : Option[FieldDeclWithHome] = match all_decls {
   []           -> None
   [d, ...rest] -> match d {
-    DType(_, tn, _, TBRecord(fields), _, _, decl_mo, _, _) ->
-      if tn == rec_name {
+    DType(_, tn, _, TBRecord(fields), _, _, decl_mo, _, dsym) ->
+      if tn == rec_name and sym_compat(dsym, rec_sym) {
         match find_field_in_decls(fields, fname) {
           Some(fd) -> Some(FDH(fd, decl_mo))
-          None     -> lookup_record_field(rest, rec_name, fname)
+          None     -> lookup_record_field(rest, rec_name, rec_sym, fname)
         }
       } else {
-        lookup_record_field(rest, rec_name, fname)
+        lookup_record_field(rest, rec_name, rec_sym, fname)
       }
-    _ -> lookup_record_field(rest, rec_name, fname)
+    _ -> lookup_record_field(rest, rec_name, rec_sym, fname)
   }
 }
 
@@ -1514,15 +1500,15 @@ fn find_field_in_decls(fields: [FieldDecl], target: String) : Option[FieldDecl] 
 # record-shaped TyCon (free variable, primitive, list, fn) cannot
 # be classified at this point — return None and skip the check.
 
-fn record_carrier_of(ty: Option[Ty]) : Option[Pair[Option[String], String]] =
+fn record_carrier_of(ty: Option[Ty]) : Option[Pair[SymId, String]] =
   match ty {
     None     -> None
     Some(t)  -> record_carrier_t(t)
   }
 
 
-fn record_carrier_t(t: Ty) : Option[Pair[Option[String], String]] = match t {
-  TyCon(mo, name, _, _) -> Some(Pair { fst: mo, snd: name })
+fn record_carrier_t(t: Ty) : Option[Pair[SymId, String]] = match t {
+  TyCon(_, name, _, tsym) -> Some(Pair { fst: tsym, snd: name })
   TyRefineT(inner, _) -> record_carrier_t(inner)
   TyDimT(inner, _)    -> record_carrier_t(inner)
   _ -> None
@@ -1540,7 +1526,7 @@ fn walk_field_priv_expr(file: String, home: Option[String],
       None         -> []
       Some(carrier) -> {
         let rec_name = carrier.snd
-        match lookup_record_field(all_decls, rec_name, fname) {
+        match lookup_record_field(all_decls, rec_name, carrier.fst, fname) {
           None -> []
           Some(fdh) -> match fdh { FDH(fd, decl_mo) ->
             if inf_mo_eq(decl_mo, home) { [] }
@@ -1573,7 +1559,7 @@ fn walk_field_priv_expr(file: String, home: Option[String],
       None         -> []
       Some(carrier) -> {
         let rec_name = carrier.snd
-        walk_priv_field_inits(file, home, all_decls, rec_name,
+        walk_priv_field_inits(file, home, all_decls, rec_name, carrier.fst,
                                 fis, e.line, e.col, [])
       }
     }
@@ -1584,14 +1570,14 @@ fn walk_field_priv_expr(file: String, home: Option[String],
 
 
 fn walk_priv_field_inits(file: String, home: Option[String],
-                           all_decls: [Decl], rec_name: String,
+                           all_decls: [Decl], rec_name: String, rec_sym: SymId,
                            fis: [FieldInit], line: Int, col: Int,
                            acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match fis {
     []           -> acc
     [fi, ...rest] -> match fi {
       FI(fname, _) -> {
-        let n = match lookup_record_field(all_decls, rec_name, fname) {
+        let n = match lookup_record_field(all_decls, rec_name, rec_sym, fname) {
           None -> []
           Some(fdh) -> match fdh { FDH(fd, decl_mo) ->
             if inf_mo_eq(decl_mo, home) { [] }
@@ -1614,7 +1600,7 @@ fn walk_priv_field_inits(file: String, home: Option[String],
             } }
           }
         }
-        walk_priv_field_inits(file, home, all_decls, rec_name, rest,
+        walk_priv_field_inits(file, home, all_decls, rec_name, rec_sym, rest,
                                line, col, list_append(n, acc))
       }
     }
@@ -6591,9 +6577,9 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
     # name coincide. Same-name types from different modules are
     # distinct (the load-bearing rule for shadowing). Both `None`
     # — language-level builtins / root-file types — also coincide.
-    TyCon(am, an, aa, _) -> match b {
-      TyCon(bm, bn, ba, _) -> {
-        if module_slot_compat(am, bm) and an == bn { unify_list(env, aa, ba, s) }
+    TyCon(am, an, aa, ta_sym) -> match b {
+      TyCon(bm, bn, ba, tb_sym) -> {
+        if sym_compat(ta_sym, tb_sym) and module_slot_compat(am, bm) and an == bn { unify_list(env, aa, ba, s) }
         # implicit upcast inside structural
         # unification. When the two TyCons disagree, accept the
         # mismatch if `b` is a component of the union `a` per the env
@@ -6618,12 +6604,12 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
       # rules above. Only `Decimal` has a UoM-decorated form; the other
       # named records do not.
       TyDimT(bb, bu) -> match bb {
-        TyCon(_, bn, ba, _) ->
+        TyCon(_, bn, ba, tb_sym) ->
           # A fixed-width `Vec[t]<n>` has a distinct inline layout, so it
           # never collapses into a bare `Vec[t]` — even at `<1>`. The
           # numeric `Real ≡ Real<1>` collapse below is untouched.
           if bn == "Vec" { None }
-          else if an == bn { match unify_list(env, aa, ba, s) {
+          else if an == bn and sym_compat(ta_sym, tb_sym) { match unify_list(env, aa, ba, s) {
             None -> None
             Some(s1) -> unify_dim(UOne, bu, s1)
           } } else { None }
@@ -6646,12 +6632,12 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
       # mirroring the bare-numeric arms. Lets a `Decimal<USD>` value
       # flow into a fn expecting bare `Decimal` only when the units
       # cancel — anything else is a unit mismatch.
-      TyCon(_, bn, ba, _) -> match ab {
-        TyCon(_, an, aa, _) ->
+      TyCon(_, bn, ba, tb_sym) -> match ab {
+        TyCon(_, an, aa, ta_sym) ->
           # A fixed-width `Vec[t]<n>` never collapses into a bare `Vec[t]`
           # (distinct inline layout); the numeric collapse above stays.
           if an == "Vec" { None }
-          else if an == bn { match unify_list(env, aa, ba, s) {
+          else if an == bn and sym_compat(ta_sym, tb_sym) { match unify_list(env, aa, ba, s) {
             None -> None
             Some(s1) -> unify_dim(au, UOne, s1)
           } } else { None }
@@ -7633,8 +7619,8 @@ fn ty_eq_shape(a: Ty, b: Ty) : Bool {
       _ -> false
     }
     # Hanga Roa: shape equality respects module_origin too.
-    TyCon(am, an, atas, _) -> match bx {
-      TyCon(bm, bn, btas, _) -> module_slot_compat(am, bm) and an == bn and ty_list_eq_shape(atas, btas)
+    TyCon(am, an, atas, ta_sym) -> match bx {
+      TyCon(bm, bn, btas, tb_sym) -> sym_compat(ta_sym, tb_sym) and module_slot_compat(am, bm) and an == bn and ty_list_eq_shape(atas, btas)
       _ -> false
     }
     # shape-equality on unions is point-wise on
@@ -8241,8 +8227,8 @@ fn find_mismatched_tycons(expected: Ty, found: Ty) : Option[TyConPair] {
     # Hanga Roa: same-name TyCons from different modules are a real
     # mismatch — flag them so the diagnostic can render the modules
     # and show the user the actual confusion.
-    TyCon(em, en, eas, _) -> match found {
-      TyCon(fm, fname, fas, _) -> if option_str_eq(em, fm) and en == fname {
+    TyCon(em, en, eas, ta_sym) -> match found {
+      TyCon(fm, fname, fas, tb_sym) -> if option_str_eq(em, fm) and en == fname and sym_compat(ta_sym, tb_sym) {
         find_mismatch_in_list(eas, fas)
       } else {
         Some(TyConPair { exp: expected, fnd: found })
@@ -9619,9 +9605,9 @@ fn ty_dischargeable(a: Ty, b: Ty, s: Subst) : Bool {
       TyAny     -> true
       _ -> match ax {
         TyListT(ai) -> match bx { TyListT(bi) -> ty_dischargeable(ai, bi, s) _ -> false }
-        TyCon(am, an, aas, _) -> match bx {
-          TyCon(bm, bn, bas, _) ->
-            module_slot_compat(am, bm) and an == bn and ty_list_dischargeable(aas, bas, s)
+        TyCon(am, an, aas, ta_sym) -> match bx {
+          TyCon(bm, bn, bas, tb_sym) ->
+            sym_compat(ta_sym, tb_sym) and module_slot_compat(am, bm) and an == bn and ty_list_dischargeable(aas, bas, s)
           _ -> false
         }
         TyFnT(aps, ar, arow) -> match bx {
