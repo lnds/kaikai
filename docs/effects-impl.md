@@ -389,8 +389,7 @@ talking to — only which label the lookup is parameterised by.
 > **v1 status (2026-10-08):** a handle runs as described here unless
 > a clause keeps its continuation in a shape the split cannot express;
 > that handle runs its body on a stack segment (§*Handles on a
-> segment*). The C backend lowers segment handles; the native backend
-> reports them as unsupported.
+> segment*).
 
 No pass rewrites effectful functions into continuation-passing
 style, and no continuation is reified. An effectful function
@@ -564,7 +563,10 @@ types and its continuation `Cont[answer, S]`, where `S` is the
 handle's type. A `Cont` is called like a function; at run time it is a
 closure over the segment's box and the handler.
 
-`kai_seg_handle` starts the body on a segment. A finished body runs the
+Both backends lower the two intrinsics to runtime calls
+(`kai_seg_handle` / `kai_seg_request`; the native backend through
+`kaix_seg_handle` / `kaix_seg_request`). `kai_seg_handle` starts the
+body on a segment. A finished body runs the
 return clause; a request runs its clause with a fresh continuation.
 Calling the continuation resumes the segment and handles whatever the
 body does next. Perceus drops an unused
