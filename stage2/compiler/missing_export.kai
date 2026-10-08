@@ -1,0 +1,82 @@
+#[doc("""
+The qualified reads that name no export of their module.
+
+The qualified rewrite keeps `mod.fname` as `EModCall(mod, fname)` even
+when the imported `mod` does not export `fname`, so no later pass takes
+`mod` for an unbound value. This walk reports each such read once, as a
+diagnostic, before the typer runs. Each import segment is checked
+against the module table of the file it came from. A read keyed to the
+reader's own module is not one: a module reads its own private names.
+""")]
+
+import compiler.ast
+import compiler.diag
+import compiler.diag_file
+import compiler.expr_positions
+import compiler.module_table
+import compiler.modules
+import compiler.name_uses
+
+#[doc("One diagnostic per qualified read of a name its module does not export, over an import-segmented stream.")]
+pub fn mexp_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
+      global: [ModuleEntry], target_mod: String, df: DiagFiles) : [Diagnostic] = match segs {
+  [] -> mexp_decls(decls, ms_table(scopes, "", global), df, target_mod)
+  [ISeg(mod_name, n), ...rest] -> {
+    let home = if mod_name == "" { target_mod } else { mod_name }
+    list_append(mexp_decls(seg_take(decls, n), ms_table(scopes, home, global), df, target_mod),
+                mexp_segmented(rest, seg_drop(decls, n), scopes, global, target_mod, df))
+  }
+}
+
+#[doc("One diagnostic per qualified read of a name its module does not export, against one module table; `target` is the root module.")]
+pub fn mexp_decls(ds: [Decl], mt: [ModuleEntry], df: DiagFiles, target: String) : [Diagnostic] =
+  mexp_loop(ds, MexCx { mt: mt, file: "", home: target }, df, target)
+
+type MexCx = { mt: [ModuleEntry], file: String, home: String }
+
+fn mexp_loop(ds: [Decl], cx: MexCx, df: DiagFiles, target: String) : [Diagnostic] = match ds {
+  [] -> []
+  [d, ...rest] -> {
+    let cx1 = MexCx { mt: cx.mt, file: decl_diag_file(d, df), home: nu_reader_home(d, cx.home, target) }
+    list_append(mexp_decl(d, cx1), mexp_loop(rest, cx1, df, target))
+  }
+}
+
+fn mexp_decl(d: Decl, cx: MexCx) : [Diagnostic] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _, _) -> mexp_expr(body, cx)
+  DTest(_, body, _, _, _)                 -> mexp_expr(body, cx)
+  DBench(_, body, _, _, _)                -> mexp_expr(body, cx)
+  DCheck(_, _, body, _, _, _)             -> mexp_expr(body, cx)
+  DImpl(_, _, _, subs, _, _, _, _)        -> mexp_subs(subs, cx)
+  DDerive(_, inner, _, _)                 -> mexp_decl(inner, cx)
+  DUnstable(inner, _, _)                  -> mexp_decl(inner, cx)
+  DProtoLaws(_, inner, _, _, _)           -> mexp_decl(inner, cx)
+  DImplAxiom(_, inner, _, _, _)           -> mexp_decl(inner, cx)
+  DConstructor(inner, _, _)               -> mexp_decl(inner, cx)
+  _                                       -> []
+}
+
+fn mexp_subs(ds: [Decl], cx: MexCx) : [Diagnostic] = match ds {
+  [] -> []
+  [d, ...rest] -> list_append(mexp_decl(d, cx), mexp_subs(rest, cx))
+}
+
+fn mexp_expr(e: Expr, cx: MexCx) : [Diagnostic] = match e.kind {
+  EModCall(m, f) -> mexp_read(m, f, cx, e)
+  _              -> mexp_positions(xp_positions(e), cx)
+}
+
+fn mexp_positions(ps: [XPos], cx: MexCx) : [Diagnostic] = match ps {
+  [] -> []
+  [XP(_, e), ...rest] -> list_append(mexp_expr(e, cx), mexp_positions(rest, cx))
+}
+
+fn mexp_read(m: String, f: String, cx: MexCx, e: Expr) : [Diagnostic] =
+  if m == cx.home { [] } else { match mt_lookup_member(cx.mt, m, f) {
+    Some(me) -> if me_has_export(me, f) { [] } else {
+      [mk_diag(SevError, cx.file, e.line, e.col, missing_export_msg(m, f, me_exports(me)), [])]
+    }
+    None -> []
+  } }
+
+fn me_exports(me: ModuleEntry) : [String] = match me { ME(_, exs, _, _) -> exs }
