@@ -534,8 +534,12 @@ are not handled stops the program.
 A continuation stays on its fiber: a thunk handed to `spawn`, a
 fiber's result, or an actor message holding one is a compile error.
 
-> **v1 status (2026-10-08):** a stateful handle cannot keep its
-> continuation; its segment form is coming.
+A stateful handle keeps its continuation the same way. The state
+travels with it: the continuation is a `Cont[(T, H), S, e]`, with `H`
+the handler's state type, and `k(v, s)` resumes the body with `v` and
+the next state `s`, as `resume(v, s)` does; in the clause, `resume(v)`
+is still `resume(v, state)`. The body's handle holds the state between
+resumes, so a `finally` run on a drop sees the last state resumed with.
 
 For genuinely multi-shot or escaping continuations (backtracking
 search, generators), the programmer writes `resume_multishot(v)`

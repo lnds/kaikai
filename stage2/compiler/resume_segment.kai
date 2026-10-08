@@ -18,6 +18,7 @@ import compiler.resume_scan
 import compiler.resume_split
 import compiler.infer
 import compiler.anf_ops
+import compiler.resume_segment_state
 
 #[doc("What an op clause needs: its body, split where it resumes; a segment, why, and whether `resume` may leave the clause; or the shapes reported against it.")]
 pub type ClauseNeed = CnInPlace(Expr) | CnSeg(String, Bool) | CnBad([RsBad])
@@ -105,8 +106,6 @@ fn rs_mention_in(es: [Expr], k: String) : Option[Expr] = match es {
   }
 }
 
-fn binds(ps: [Param], k: String) : Bool = any(ps, (p) => p.pname == k)
-
 # A nested handle's parts that still see `k`: its clauses that rebind it are opaque.
 fn handle_parts(body: Expr, init: Option[Expr], cs: [HClause], ret: Option[HReturn], k: String) : [Expr] = {
   let tail = match ret {
@@ -133,10 +132,7 @@ pub type HandleParts = { body: Expr, eff: String, hsym: SymId, tys: [TypeExpr], 
 pub fn place_handle(h: HandleParts, at: Expr) : ExprKind = {
   let needs = map(h.clauses, clause_need_of)
   match first_seg(needs) {
-    Some(why) -> match h.init {
-      None    -> segment_handle(h, why, at)
-      Some(_) -> in_place(h, map(needs, stateful_need))
-    }
+    Some(why) -> segment_handle(h, why, at)
     None -> in_place(h, needs)
   }
 }
@@ -165,12 +161,6 @@ fn any_escapes(ns: [ClauseNeed]) : Bool = any(ns, (n) => match n {
   _ -> false
 })
 
-# A stateful handle does not run on a segment: what would send it there is reported.
-fn stateful_need(n: ClauseNeed) : ClauseNeed = match n {
-  CnSeg(r, _) -> CnBad([RsBad(r, "a stateful handle cannot keep its continuation yet; that form is coming", 0, 0)])
-  _ -> n
-}
-
 fn in_place(h: HandleParts, needs: [ClauseNeed]) : ExprKind =
   EHandle(h.body, h.eff, h.hsym, h.tys, h.init, h.alias, zip_needs(h.clauses, needs), h.ret)
 
@@ -196,11 +186,14 @@ fn at_clause(b: RsBad, l: Int, c: Int) : RsBad = match b {
 fn segment_handle(h: HandleParts, why: SegWhy, at: Expr) : ExprKind = {
   let ops = op_clauses(h.clauses)
   let fin = filter(h.clauses, is_lifecycle)
-  let fwd = forwarders(ops, 0)
-  let inner = with_kind(at, EHandle(h.body, h.eff, h.hsym, h.tys, None, h.alias, [...fwd, ...fin], None))
+  let stateful = match h.init { Some(_) -> true  None -> false }
+  let fwd = forwarders(ops, 0, stateful)
+  let inner_ret = if stateful { map_opt_return(h.ret, state_out) } else { None }
+  let inner = with_kind(at, EHandle(h.body, h.eff, h.hsym, h.tys, h.init, h.alias, [...fwd, ...fin], inner_ret))
   let thunk = with_kind(h.body, ELambda([], inner))
-  EIntrinsic("seg_handle", [with_kind(at, EBool(why.escapes)), quoted(why.reason, at), thunk,
-                            return_lambda(h.ret, at), ...map(ops, (c) => clause_lambda(c, at))])
+  let ret = if stateful { state_return_lambda(h.ret, at) } else { return_lambda(h.ret, at) }
+  let cls = if stateful { map(ops, state_clause_lambda) } else { map(ops, (c) => clause_lambda(c, at)) }
+  EIntrinsic("seg_handle", [with_kind(at, EBool(why.escapes)), quoted(why.reason, at), thunk, ret, ...cls])
 }
 
 fn is_lifecycle(c: HClause) : Bool = match c { HC(n, ps, _, _, _) -> is_lifecycle_clause(n, ps) }
@@ -208,23 +201,23 @@ fn is_lifecycle(c: HClause) : Bool = match c { HC(n, ps, _, _, _) -> is_lifecycl
 fn op_clauses(cs: [HClause]) : [HClause] = filter(cs, (c) => not is_lifecycle(c))
 
 # `op(a0, …, k) -> k($seg_request(i, a0, …))`: the op reaches the handle.
-fn forwarders(cs: [HClause], i: Int) : [HClause] = match cs {
+# Stateful, the request carries the state and comes back as `(v, s)`.
+fn forwarders(cs: [HClause], i: Int, stateful: Bool) : [HClause] = match cs {
   [] -> []
   [HC(n, ps, b, l, c), ...rest] -> {
     let args = fresh_params(list_length(ps) - 1, 0, b)
-    let k = param("__seg_k", b)
+    let k = mk_ref("__seg_k", l, c)
     let refs = map(args, (p) => mk_ref(p.pname, l, c))
-    let req = mk_expr(EIntrinsic("seg_request", [mk_expr(mk_int_synth(i), l, c), ...refs]), l, c)
-    let call = mk_expr(ECall(mk_ref(k.pname, l, c), [req]), l, c)
-    [HC(n, [...args, k], call, l, c), ...forwarders(rest, i + 1)]
+    let st = if stateful { [state_arg(l, c)] } else { [] }
+    let req = mk_expr(EIntrinsic("seg_request", [mk_expr(mk_int_synth(i), l, c), ...refs, ...st]), l, c)
+    let call = if stateful { state_resume(k, req) } else { mk_expr(ECall(k, [req]), l, c) }
+    [HC(n, [...args, param("__seg_k", b)], call, l, c), ...forwarders(rest, i + 1, stateful)]
   }
 }
 
 fn fresh_params(n: Int, i: Int, at: Expr) : [Param] =
   if i >= n { [] } else { [param("__seg_a#{i}", at), ...fresh_params(n, i + 1, at)] }
 
-fn param(name: String, at: Expr) : Param =
-  Param { pname: name, ptype: None, pline: at.line, pcol: at.col, pborrow: false }
 
 fn clause_lambda(c: HClause, at: Expr) : Expr = match c {
   HC(_, ps, b, l, col) -> mk_expr(ELambda(ps, b), l, col)
