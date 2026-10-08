@@ -14674,6 +14674,139 @@ static int kai_stack_map_flags(void) {
     return flags;
 }
 
+/* ---------- Stack-segment switch ----------
+ *
+ * `kai_seg_switch(save, to, arg)` pushes the callee-saved registers on the
+ * current stack, stores the stack pointer in `*save`, loads `to`, pops the
+ * registers saved there and returns `arg` on that stack. Not swapcontext: no
+ * signal-mask syscall, and to the optimiser an ordinary opaque call, so no
+ * returns_twice.
+ *
+ * Trap: no frame may keep a thread-local address across the call. The other
+ * side can park the fiber, which may then resume on another OS thread. Only
+ * the -O0 owner calls it; the nm gates keep the symbol out of -O2 objects and
+ * the hot bitcode.
+ *
+ * The way back is an indirect jump, not a return: a return to the other
+ * stack always misses the return-address predictor. On aarch64 the restores
+ * also read through the incoming pointer rather than through a freshly moved
+ * sp. Together they cut a round trip on an M4 from 21.8 ns to 4.9 ns.
+ *
+ * GCC gets `noipa`: its IPA register allocation would otherwise read the asm
+ * body as clobbering nothing and keep caller-saved values across the call. */
+#if defined(__x86_64__) || (defined(__aarch64__) && defined(__clang__))
+#  define KAI_SEG_SWITCH 1
+#  if defined(__clang__)
+#    define KAI_SEG_NAKED __attribute__((naked, noinline, unused))
+#  else
+#    define KAI_SEG_NAKED __attribute__((naked, noinline, noipa, unused))
+#  endif
+
+/* Under BTI an indirect branch may land only on a landing pad. */
+#  if defined(__ARM_FEATURE_BTI_DEFAULT)
+#    define KAI_SEG_A64_RETURN "ret\n\t"
+#  else
+#    define KAI_SEG_A64_RETURN "br x30\n\t"
+#  endif
+
+#  if defined(__x86_64__)
+KAI_SEG_NAKED
+static void *kai_seg_switch(void **save, void *to, void *arg) {
+    __asm__ volatile(
+        "pushq %rbp\n\t"
+        "pushq %rbx\n\t"
+        "pushq %r12\n\t"
+        "pushq %r13\n\t"
+        "pushq %r14\n\t"
+        "pushq %r15\n\t"
+        "movq %rsp, (%rdi)\n\t"
+        "movq %rsi, %rsp\n\t"
+        "popq %r15\n\t"
+        "popq %r14\n\t"
+        "popq %r13\n\t"
+        "popq %r12\n\t"
+        "popq %rbx\n\t"
+        "popq %rbp\n\t"
+        "movq %rdx, %rax\n\t"
+        "popq %rcx\n\t"
+        "jmpq *%rcx\n\t");
+}
+
+/* First return target of a fresh frame: `entry` waits in r12, `arg` arrives
+ * as the switch's return value. */
+KAI_SEG_NAKED
+static void kai_seg_boot(void) {
+    __asm__ volatile(
+        "movq %rax, %rdi\n\t"
+        "callq *%r12\n\t"
+        "ud2\n\t");
+}
+#  else
+KAI_SEG_NAKED
+static void *kai_seg_switch(void **save, void *to, void *arg) {
+    __asm__ volatile(
+        "sub sp, sp, #160\n\t"
+        "stp x19, x20, [sp, #0]\n\t"
+        "stp x21, x22, [sp, #16]\n\t"
+        "stp x23, x24, [sp, #32]\n\t"
+        "stp x25, x26, [sp, #48]\n\t"
+        "stp x27, x28, [sp, #64]\n\t"
+        "stp x29, x30, [sp, #80]\n\t"
+        "stp d8, d9, [sp, #96]\n\t"
+        "stp d10, d11, [sp, #112]\n\t"
+        "stp d12, d13, [sp, #128]\n\t"
+        "stp d14, d15, [sp, #144]\n\t"
+        "mov x9, sp\n\t"
+        "str x9, [x0]\n\t"
+        "ldp x19, x20, [x1, #0]\n\t"
+        "ldp x21, x22, [x1, #16]\n\t"
+        "ldp x23, x24, [x1, #32]\n\t"
+        "ldp x25, x26, [x1, #48]\n\t"
+        "ldp x27, x28, [x1, #64]\n\t"
+        "ldp x29, x30, [x1, #80]\n\t"
+        "ldp d8, d9, [x1, #96]\n\t"
+        "ldp d10, d11, [x1, #112]\n\t"
+        "ldp d12, d13, [x1, #128]\n\t"
+        "ldp d14, d15, [x1, #144]\n\t"
+        "add sp, x1, #160\n\t"
+        "mov x0, x2\n\t"
+        KAI_SEG_A64_RETURN);
+}
+
+/* `entry` waits in x19 and `arg` is already in x0. The undefined return
+ * address ends an unwinder's walk here. */
+KAI_SEG_NAKED
+static void kai_seg_boot(void) {
+    __asm__ volatile(
+        ".cfi_undefined x30\n\t"
+        "blr x19\n\t"
+        "brk #0\n\t");
+}
+#  endif
+
+/* Lay out a fresh frame below `top` so the first switch to the returned
+ * stack pointer runs `entry(arg)`. `entry` must never return. The zeroed
+ * words above the frame are a null return address and frame pointer, where
+ * stack walkers stop. */
+static void *kai_seg_frame_init(void *top, void (*entry)(void *)) {
+    uintptr_t t = ((uintptr_t) top & ~(uintptr_t) 15) - 16;
+    ((void **) t)[0] = NULL;
+    ((void **) t)[1] = NULL;
+#  if defined(__x86_64__)
+    void **sp = (void **) (t - 7 * sizeof(void *));
+    memset(sp, 0, 7 * sizeof(void *));
+    sp[3] = (void *) (uintptr_t) entry;              /* r12 */
+    sp[6] = (void *) (uintptr_t) &kai_seg_boot;      /* return address */
+#  else
+    void **sp = (void **) (t - 160);
+    memset(sp, 0, 160);
+    sp[0]  = (void *) (uintptr_t) entry;             /* x19 */
+    sp[11] = (void *) (uintptr_t) &kai_seg_boot;     /* x30 */
+#  endif
+    return sp;
+}
+#endif /* KAI_SEG_SWITCH */
+
 #if defined(KAI_MAIN_STACK_SIZE)
 /* Whether the host grants a stack reservation of `size` bytes plus guard. */
 static int kai_stack_fits(size_t size) {
