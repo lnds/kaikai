@@ -1406,25 +1406,25 @@ fn eff_already_in(acc: [Label], eff: String) : Bool = match acc {
 # builtins, so this function reads back the same labels it would
 # have read from an explicit annotation.
 
-fn check_default_coverage(df: DiagFiles, mod_decls: [Decl], all_decls: [Decl]) : Int / Console + File {
+fn check_default_coverage(df: DiagFiles, mod_decls: [Decl], all_decls: [Decl]) : [Diagnostic] / Console + File {
   # Precompute the `eff_name -> default ops` table once over `all_decls`,
   # then thread it through every per-DFn body walk so each `EHandle`
   # resolves its effect's default ops by assoc-list lookup instead of
   # re-scanning all declarations.
   let eff_map = build_effect_default_op_map(all_decls)
-  check_default_coverage_loop(df, all_decls, eff_map, mod_decls, 0)
+  list_reverse(check_default_coverage_loop(df, all_decls, eff_map, mod_decls, []))
 }
 
 
 fn check_default_coverage_loop(df: DiagFiles, all_decls: [Decl],
                                 eff_map: [EffDefaultOps], ds: [Decl],
-                                acc: Int) : Int / Console + File {
+                                acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
       DFn(_, fname, _, _, _, _, body, _, _, _, fsym) -> {
-        let n = walk_coverage_expr(decl_diag_file(d, df), all_decls, eff_map, fname, body, [], 0)
-        check_default_coverage_loop(df, all_decls, eff_map, rest, acc + n)
+        let acc1 = walk_coverage_expr(decl_diag_file(d, df), all_decls, eff_map, fname, body, [], acc)
+        check_default_coverage_loop(df, all_decls, eff_map, rest, acc1)
       }
       _ -> check_default_coverage_loop(df, all_decls, eff_map, rest, acc)
     }
@@ -1446,20 +1446,20 @@ fn check_default_coverage_loop(df: DiagFiles, all_decls: [Decl],
 
 fn check_field_privacy(df: DiagFiles, home: Option[String],
                         mod_decls: [Decl], all_decls: [Decl])
-                        : Int / Console + File {
-  check_field_privacy_loop(df, home, all_decls, mod_decls, 0)
+                        : [Diagnostic] / Console + File {
+  list_reverse(check_field_privacy_loop(df, home, all_decls, mod_decls, []))
 }
 
 
 fn check_field_privacy_loop(df: DiagFiles, home: Option[String],
                               all_decls: [Decl], ds: [Decl],
-                              acc: Int) : Int / Console + File {
+                              acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
       DFn(_, _, _, _, _, _, body, _, _, _, fsym) -> {
-        let n = walk_field_priv_expr(decl_diag_file(d, df), home, all_decls, body, 0)
-        check_field_privacy_loop(df, home, all_decls, rest, acc + n)
+        let acc1 = walk_field_priv_expr(decl_diag_file(d, df), home, all_decls, body, acc)
+        check_field_privacy_loop(df, home, all_decls, rest, acc1)
       }
       _ -> check_field_privacy_loop(df, home, all_decls, rest, acc)
     }
@@ -1528,33 +1528,34 @@ fn record_carrier_t(t: Ty) : Option[Pair[Option[String], String]] = match t {
 
 fn walk_field_priv_expr(file: String, home: Option[String],
                           all_decls: [Decl], e: Expr,
-                          acc: Int) : Int / Console + File {
+                          acc: [Diagnostic]) : [Diagnostic] / Console + File {
   let head_errs = match e.kind {
     # Cross-module read of a `priv` field. The record's declared
     # home is in `obj.ty`'s TyCon module_origin; the access site's
     # home is the walker-level `home` parameter (None = root file).
     EField(obj, fname) -> match record_carrier_of(obj.ty) {
-      None         -> 0
+      None         -> []
       Some(carrier) -> {
         let rec_name = carrier.snd
         match lookup_record_field(all_decls, rec_name, fname) {
-          None -> 0
+          None -> []
           Some(fdh) -> match fdh { FDH(fd, decl_mo) ->
-            if inf_mo_eq(decl_mo, home) { 0 }
+            if inf_mo_eq(decl_mo, home) { [] }
             else { match fd {
-              FD(true, _, _, _)  -> 0
+              FD(true, _, _, _)  -> []
               FD(false, _, _, _) -> {
                 let owner = match decl_mo {
                   Some(m) -> m
                   None    -> "<root>"
                 }
-                diag_error(file, e.line, e.col,
+                let d = mk_diag(SevError, file, e.line, e.col,
                   concat_all(["field `", fname,
                               "` of `", rec_name,
-                              "` is private to module `", owner, "`"]))
-                diag_help(concat_all(["the field is declared `priv` in module `",
-                                      owner, "`; only fns inside that module can read it"]))
-                1
+                              "` is private to module `", owner, "`"]),
+                  [ri_help(file, e.line, e.col, concat_all(["the field is declared `priv` in module `",
+                                      owner, "`; only fns inside that module can read it"]))])
+                render_diag(d)
+                [d]
               }
             } }
           }
@@ -1566,51 +1567,52 @@ fn walk_field_priv_expr(file: String, home: Option[String],
     # Any field init mentioning a priv field of another module is
     # an error — the constructor escapes the encapsulation boundary.
     ERecordLit(_, fis) -> match record_carrier_of(e.ty) {
-      None         -> 0
+      None         -> []
       Some(carrier) -> {
         let rec_name = carrier.snd
         walk_priv_field_inits(file, home, all_decls, rec_name,
-                                fis, e.line, e.col, 0)
+                                fis, e.line, e.col, [])
       }
     }
-    _ -> 0
+    _ -> []
   }
-  acc + head_errs + walk_field_priv_children(file, home, all_decls, e.kind, 0)
+  walk_field_priv_children(file, home, all_decls, e.kind, list_append(head_errs, acc))
 }
 
 
 fn walk_priv_field_inits(file: String, home: Option[String],
                            all_decls: [Decl], rec_name: String,
                            fis: [FieldInit], line: Int, col: Int,
-                           acc: Int) : Int / Console + File {
+                           acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match fis {
     []           -> acc
     [fi, ...rest] -> match fi {
       FI(fname, _) -> {
         let n = match lookup_record_field(all_decls, rec_name, fname) {
-          None -> 0
+          None -> []
           Some(fdh) -> match fdh { FDH(fd, decl_mo) ->
-            if inf_mo_eq(decl_mo, home) { 0 }
+            if inf_mo_eq(decl_mo, home) { [] }
             else { match fd {
-              FD(true, _, _, _)  -> 0
+              FD(true, _, _, _)  -> []
               FD(false, _, _, _) -> {
                 let owner = match decl_mo {
                   Some(m) -> m
                   None    -> "<root>"
                 }
-                diag_error(file, line, col,
+                let d = mk_diag(SevError, file, line, col,
                   concat_all(["cannot construct `", rec_name,
                               "` from outside module `", owner,
-                              "`: field `", fname, "` is private"]))
-                diag_help(concat_all(["the field is declared `priv` in module `",
-                                      owner, "`; ask that module for a constructor fn"]))
-                1
+                              "`: field `", fname, "` is private"]),
+                  [ri_help(file, line, col, concat_all(["the field is declared `priv` in module `",
+                                      owner, "`; ask that module for a constructor fn"]))])
+                render_diag(d)
+                [d]
               }
             } }
           }
         }
         walk_priv_field_inits(file, home, all_decls, rec_name, rest,
-                               line, col, acc + n)
+                               line, col, list_append(n, acc))
       }
     }
   }
@@ -1619,7 +1621,7 @@ fn walk_priv_field_inits(file: String, home: Option[String],
 
 fn walk_field_priv_children(file: String, home: Option[String],
                               all_decls: [Decl], k: ExprKind,
-                              acc: Int) : Int / Console + File = match k {
+                              acc: [Diagnostic]) : [Diagnostic] / Console + File = match k {
   EInt(_, _)           -> acc
   EReal(_, _)          -> acc
   EIntLit(_)           -> acc
@@ -1720,7 +1722,7 @@ fn walk_field_priv_children(file: String, home: Option[String],
 
 fn walk_field_priv_list(file: String, home: Option[String],
                           all_decls: [Decl], es: [Expr],
-                          acc: Int) : Int / Console + File = match es {
+                          acc: [Diagnostic]) : [Diagnostic] / Console + File = match es {
   [] -> acc
   [h, ...rest] -> {
     let a1 = walk_field_priv_expr(file, home, all_decls, h, acc)
@@ -1731,7 +1733,7 @@ fn walk_field_priv_list(file: String, home: Option[String],
 
 fn walk_field_priv_arms(file: String, home: Option[String],
                          all_decls: [Decl], arms: [Arm],
-                         acc: Int) : Int / Console + File = match arms {
+                         acc: [Diagnostic]) : [Diagnostic] / Console + File = match arms {
   [] -> acc
   [a, ...rest] -> match a {
     Arm(_, og, body) -> {
@@ -1748,7 +1750,7 @@ fn walk_field_priv_arms(file: String, home: Option[String],
 
 fn walk_field_priv_field_inits(file: String, home: Option[String],
                                  all_decls: [Decl], fis: [FieldInit],
-                                 acc: Int) : Int / Console + File = match fis {
+                                 acc: [Diagnostic]) : [Diagnostic] / Console + File = match fis {
   [] -> acc
   [fi, ...rest] -> match fi {
     FI(_, e) -> {
@@ -1761,7 +1763,7 @@ fn walk_field_priv_field_inits(file: String, home: Option[String],
 
 fn walk_field_priv_elems(file: String, home: Option[String],
                           all_decls: [Decl], els: [ListElem],
-                          acc: Int) : Int / Console + File = match els {
+                          acc: [Diagnostic]) : [Diagnostic] / Console + File = match els {
   [] -> acc
   [el, ...rest] -> match el {
     ElPlain(e)  -> {
@@ -1778,7 +1780,7 @@ fn walk_field_priv_elems(file: String, home: Option[String],
 
 fn walk_field_priv_stmts(file: String, home: Option[String],
                           all_decls: [Decl], ss: [Stmt],
-                          acc: Int) : Int / Console + File = match ss {
+                          acc: [Diagnostic]) : [Diagnostic] / Console + File = match ss {
   [] -> acc
   [s, ...rest] -> match s {
     SLet(_, _, e) -> {
@@ -1819,7 +1821,7 @@ fn walk_field_priv_stmts(file: String, home: Option[String],
 
 fn walk_field_priv_clauses(file: String, home: Option[String],
                              all_decls: [Decl], cs: [HClause],
-                             acc: Int) : Int / Console + File = match cs {
+                             acc: [Diagnostic]) : [Diagnostic] / Console + File = match cs {
   [] -> acc
   [c, ...rest] -> match c {
     HC(_, _, body, _, _) -> {
@@ -1925,7 +1927,7 @@ fn find_top_eff_frame(stack: [HandleFrame], eff_name: String, esym: SymId) : Opt
 
 fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
                        fname: String,
-                       e: Expr, stack: [HandleFrame], acc: Int) : Int / Console + File {
+                       e: Expr, stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match e.kind {
     EInt(_, _)           -> acc
     EReal(_, _)          -> acc
@@ -1958,9 +1960,9 @@ fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
       let head_errs = match sym_read_kind(callee.kind) {
         EVar(key) -> check_op_call_coverage(file, decls, eff_map, fname, key, csym,
                                               stack, e.line, e.col)
-        _ -> 0
+        _ -> []
       }
-      let acc1 = acc + head_errs
+      let acc1 = list_append(head_errs, acc)
       let acc2 = walk_coverage_expr(file, decls, eff_map, fname, callee, stack, acc1)
       walk_coverage_list(file, decls, eff_map, fname, args_, stack, acc2)
     }
@@ -2027,7 +2029,7 @@ fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
       let default_ops = effect_default_op_map_get(eff_map, hsym)
       let frame = HF(eff_name, hsym, clause_ops, default_ops, e.line, e.col)
       let missing = handler_missing_ops(effect_decl_of(hsym, decls), clause_ops, default_ops)
-      let a0 = acc + report_partial_handler(file, eff_name, missing, e.line, e.col)
+      let a0 = list_append(report_partial_handler(file, eff_name, missing, e.line, e.col), acc)
       let a1 = match init_opt {
         Some(i) -> walk_coverage_expr(file, decls, eff_map, fname, i, stack, a0)
         None    -> a0
@@ -2051,7 +2053,7 @@ fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
 
 fn walk_coverage_list(file: String, decls: [Decl], eff_map: [EffDefaultOps],
                        fname: String,
-                       es: [Expr], stack: [HandleFrame], acc: Int) : Int / Console + File {
+                       es: [Expr], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match es {
     []           -> acc
     [h, ...rest] -> {
@@ -2064,7 +2066,7 @@ fn walk_coverage_list(file: String, decls: [Decl], eff_map: [EffDefaultOps],
 
 fn walk_coverage_arms(file: String, decls: [Decl], eff_map: [EffDefaultOps],
                        fname: String,
-                       arms: [Arm], stack: [HandleFrame], acc: Int) : Int / Console + File {
+                       arms: [Arm], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match arms {
     []           -> acc
     [a, ...rest] -> match a {
@@ -2083,7 +2085,7 @@ fn walk_coverage_arms(file: String, decls: [Decl], eff_map: [EffDefaultOps],
 
 fn walk_coverage_fields(file: String, decls: [Decl], eff_map: [EffDefaultOps],
                          fname: String,
-                         fs: [FieldInit], stack: [HandleFrame], acc: Int) : Int / Console + File {
+                         fs: [FieldInit], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match fs {
     []           -> acc
     [f, ...rest] -> match f {
@@ -2098,7 +2100,7 @@ fn walk_coverage_fields(file: String, decls: [Decl], eff_map: [EffDefaultOps],
 
 fn walk_coverage_elems(file: String, decls: [Decl], eff_map: [EffDefaultOps],
                         fname: String,
-                        els: [ListElem], stack: [HandleFrame], acc: Int) : Int / Console + File {
+                        els: [ListElem], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match els {
     []            -> acc
     [el, ...rest] -> match el {
@@ -2117,7 +2119,7 @@ fn walk_coverage_elems(file: String, decls: [Decl], eff_map: [EffDefaultOps],
 
 fn walk_coverage_stmts(file: String, decls: [Decl], eff_map: [EffDefaultOps],
                         fname: String,
-                        ss: [Stmt], stack: [HandleFrame], acc: Int) : Int / Console + File {
+                        ss: [Stmt], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match ss {
     []           -> acc
     [s, ...rest] -> match s {
@@ -2160,7 +2162,7 @@ fn walk_coverage_stmts(file: String, decls: [Decl], eff_map: [EffDefaultOps],
 
 fn walk_coverage_clauses(file: String, decls: [Decl], eff_map: [EffDefaultOps],
                           fname: String,
-                          cs: [HClause], stack: [HandleFrame], acc: Int) : Int / Console + File {
+                          cs: [HClause], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match cs {
     []           -> acc
     [c, ...rest] -> match c {
@@ -2172,8 +2174,7 @@ fn walk_coverage_clauses(file: String, decls: [Decl], eff_map: [EffDefaultOps],
   }
 }
 
-# Op-call discharge: returns the number of new diagnostics emitted (0
-# or 1). `key` is the callee `EVar` payload — `Eff.op` for a regular
+# Op-call discharge: returns the diagnostic it emitted, if any. `key` is the callee `EVar` payload — `Eff.op` for a regular
 # op call, possibly `Eff.op@alias` if the alias-tagged dispatch path
 # fired. Returns 0 when the callee is not in `Eff.op` form (regular
 # function call, FFI shim, etc.).
@@ -2181,9 +2182,9 @@ fn walk_coverage_clauses(file: String, decls: [Decl], eff_map: [EffDefaultOps],
 fn check_op_call_coverage(file: String, decls: [Decl],
                            eff_map: [EffDefaultOps], fname: String,
                            key: String, esym: SymId, stack: [HandleFrame],
-                           line: Int, col: Int) : Int / Console + File {
+                           line: Int, col: Int) : [Diagnostic] / Console + File {
   let bare = strip_alias_suffix(key)
-  if not string_contains_dot(bare) { 0 }
+  if not string_contains_dot(bare) { [] }
   else {
     let eff_name = dotted_prefix(bare)
     let op_name  = dotted_suffix(bare)
@@ -2192,12 +2193,12 @@ fn check_op_call_coverage(file: String, decls: [Decl],
     # come through `effect E { ops }`. Builtins are injected as DEffect
     # by `inject_builtin_effects` before this check runs, so they all
     # show up via `is_effect_declared`.
-    if not is_effect_declared(eff_name, decls) { 0 }
+    if not is_effect_declared(eff_name, decls) { [] }
     else {
       match find_top_eff_frame(stack, eff_name, esym) {
         Some(frame) -> match frame {
           HF(_, _, clause_ops, _default_ops, _, _) ->
-            if list_has_string(clause_ops, op_name) { 0 }
+            if list_has_string(clause_ops, op_name) { [] }
             else {
               # Spec step 3 ("enclosing handle exists, op not in
               # clauses, default block covers op → clause-merge from
@@ -2211,9 +2212,8 @@ fn check_op_call_coverage(file: String, decls: [Decl],
               # default block and synthesize the missing clauses; at
               # that point this branch flips to check `_default_ops`
               # and discharges.
-              report_uncovered_op(file, fname, eff_name, op_name, esym, decls,
-                                   line, col, false)
-              1
+              [report_uncovered_op(file, fname, eff_name, op_name, esym, decls,
+                                   line, col, false)]
             }
         }
         None ->
@@ -2225,14 +2225,13 @@ fn check_op_call_coverage(file: String, decls: [Decl],
             # `$extern_handler` gets auto-installed at main. The
             # check is now uniform — no special builtin list.
             let default_ops = effect_default_op_map_get(eff_map, esym)
-            if list_has_string(default_ops, op_name) { 0 }
+            if list_has_string(default_ops, op_name) { [] }
             else {
-              report_uncovered_op(file, fname, eff_name, op_name, esym, decls,
-                                   line, col, true)
-              1
+              [report_uncovered_op(file, fname, eff_name, op_name, esym, decls,
+                                   line, col, true)]
             }
           }
-          else { 0 }
+          else { [] }
       }
     }
   }
@@ -2275,28 +2274,29 @@ fn is_effect_declared(eff_name: String, decls: [Decl]) : Bool {
 
 fn report_uncovered_op(file: String, fname: String, eff_raw: String,
                         op_name: String, esym: SymId, decls: [Decl],
-                        line: Int, col: Int, at_main: Bool) : Unit / Console + File {
+                        line: Int, col: Int, at_main: Bool) : Diagnostic / Console + File {
   # The row and the handler tables key the effect by its spelled name;
   # what the reader is told to write is the name their source spells.
   let eff_name = inf_tycon_display_ow(spelled_head_owners(decls, []), eff_raw)
   let qualified = concat_all([eff_name, ".", op_name])
   let header = concat_all(["effect not handled: ", qualified])
-  diag_error(file, line, col, header)
   let default_status = describe_default_status(eff_name, op_name, effect_decl_default(effect_decl_of(esym, decls)))
-  diag_note(default_status)
-  if at_main {
-    diag_help(concat_all(["wrap the call in `handle { ... } with ",
-                          eff_name, " { ", op_name,
-                          "(args, resume) -> ... }`, or add `",
-                          op_name, "(args, resume) -> ...` to `effect ",
-                          eff_name, "`'s `default { }` block"]))
+  let help = if at_main {
+    concat_all(["wrap the call in `handle { ... } with ",
+                eff_name, " { ", op_name,
+                "(args, resume) -> ... }`, or add `",
+                op_name, "(args, resume) -> ...` to `effect ",
+                eff_name, "`'s `default { }` block"])
   } else {
-    diag_help(concat_all(["add a `", op_name,
-                          "(args, resume) -> ...` clause to the enclosing `handle ... with ",
-                          eff_name, "`, or add `", op_name,
-                          "(args, resume) -> ...` to `effect ", eff_name,
-                          "`'s `default { }` block"]))
+    concat_all(["add a `", op_name,
+                "(args, resume) -> ...` clause to the enclosing `handle ... with ",
+                eff_name, "`, or add `", op_name,
+                "(args, resume) -> ...` to `effect ", eff_name,
+                "`'s `default { }` block"])
   }
+  let d = mk_diag(SevError, file, line, col, header, [ri_note(file, line, col, default_status), ri_help(file, line, col, help)])
+  render_diag(d)
+  d
 }
 
 
@@ -7824,8 +7824,9 @@ fn inferred_leaf(st: InferState, t: Ty, e: Expr) : Inferred =
 fn synth_byte_lit(st: InferState, n: Int, e: Expr) : Inferred / Console + File =
   if n >= 0 and n <= 255 { inferred_leaf(st, TyByte, e) }
   else {
-    diag_error(st.file, e.line, e.col, "Byte literal out of range 0..255")
-    inferred_leaf(st_bump_err(st), TyByte, e)
+    let perr = mk_diag(SevError, st.file, e.line, e.col, "Byte literal out of range 0..255", [])
+    render_diag(perr)
+    inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyByte, e)
   }
 
 fn st_fresh_ty(st: InferState) : TyRes {
@@ -8695,9 +8696,10 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     # `TyAny` fits every slot and lowers to zero — a wrong value that
     # looks valid for its type (`0`, `""`, a real row id), not garbage.
     EUnder         -> {
-      diag_error(st.file, e.line, e.col,
-        "`_` is not an expression; it is a pattern wildcard, or a `|>` argument placeholder")
-      inferred_leaf(st_bump_err(st), TyAny, e)
+      let perr = mk_diag(SevError, st.file, e.line, e.col,
+        "`_` is not an expression; it is a pattern wildcard, or a `|>` argument placeholder", [])
+      render_diag(perr)
+      inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
     }
     # a `.` placeholder that survives parsing in a
     # non-argument position is a hard error per
@@ -8707,9 +8709,10 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     # the typer ever sees it; reaching this arm means the user
     # wrote `.` outside that sugar.
     EPlaceholder   -> {
-      diag_error(st.file, e.line, e.col,
-        "`.` placeholder used outside lambda-expected position; use a named arrow `(x) => ...`")
-      inferred_leaf(st_bump_err(st), TyAny, e)
+      let perr = mk_diag(SevError, st.file, e.line, e.col,
+        "`.` placeholder used outside lambda-expected position; use a named arrow `(x) => ...`", [])
+      render_diag(perr)
+      inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
     }
     # `resume` reaching the value-position read arm (call-position
     # `resume(...)` is intercepted by `try_resume_call` upstream) means it
@@ -8777,9 +8780,10 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
             }
           }
           _ -> {
-            diag_error(st.file, e.line, e.col,
-              concat_all(["compiler intrinsic `$", nm, "` has a malformed argument list"]))
-            inferred_leaf(st_bump_err(st), TyAny, e)
+            let perr = mk_diag(SevError, st.file, e.line, e.col,
+              concat_all(["compiler intrinsic `$", nm, "` has a malformed argument list"]), [])
+            render_diag(perr)
+            inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
           }
         }
       } else if nm == "resume_frame" {
@@ -8790,10 +8794,11 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
         let r = st_fresh_ty(st)
         inferred_leaf(r.st, r.ty, e)
       } else {
-        diag_error(st.file, e.line, e.col,
+        let perr = mk_diag(SevError, st.file, e.line, e.col,
           concat_all(["compiler intrinsic `$", nm,
-                      "` is not valid in this position"]))
-        inferred_leaf(st_bump_err(st), TyAny, e)
+                      "` is not valid in this position"]), [])
+        render_diag(perr)
+        inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
       }
     # qualified call. rqc rewrites
     # `EField(EVar(mod), fname)` to `EModCall(mod, fname)` after
@@ -8829,10 +8834,11 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
           # the module's exports. If we land here, the table and the
           # decl stream got out of sync; surface as a diagnostic
           # rather than a panic so the user sees a concrete location.
-          diag_error(st.file, e.line, e.col,
+          let perr = mk_diag(SevError, st.file, e.line, e.col,
             concat_all(["module '", m, "' does not export '", fname,
-                        "' at the typer (rqc / TyEnv mismatch — internal)"]))
-          inferred_leaf(st_bump_err(st), TyAny, e)
+                        "' at the typer (rqc / TyEnv mismatch — internal)"]), [])
+          render_diag(perr)
+          inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
         }
       }
     }
@@ -8870,28 +8876,31 @@ fn synth_variants_of(st: InferState, ty_expr: TypeExpr, e: Expr) : Inferred / Co
           mk_inferred(st, result_ty, resolved)
         }
         VCNotSum -> {
-          diag_error(st.file, e.line, e.col,
-            "`variants[T]()` requires T to be a declared sum type")
+          let perr = mk_diag(SevError, st.file, e.line, e.col,
+            "`variants[T]()` requires T to be a declared sum type", [])
+          render_diag(perr)
           diag_note("type: #{inf_ty_to_string(ty)}")
           diag_help("declare T as `type T = A | B | ...` or use a different builtin")
-          inferred_leaf(st_bump_err(st), TyAny, e)
+          inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
         }
         VCHasPayload(bad) -> {
           let bad_list = inf_join_with(bad, ", ")
-          diag_error(st.file, e.line, e.col,
-            "`variants[T]()` requires every variant of T to be nullary")
+          let perr = mk_diag(SevError, st.file, e.line, e.col,
+            "`variants[T]()` requires every variant of T to be nullary", [])
+          render_diag(perr)
           diag_note("variants of `#{name}` with payload: #{bad_list}")
           diag_help("`variants[T]()` lists the inhabitants of a closed sum; this is ill-defined when a variant carries arguments")
-          inferred_leaf(st_bump_err(st), TyAny, e)
+          inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
         }
       }
     }
     _ -> {
-      diag_error(st.file, e.line, e.col,
-        "`variants[T]()` requires T to be a named user type")
+      let perr = mk_diag(SevError, st.file, e.line, e.col,
+        "`variants[T]()` requires T to be a named user type", [])
+      render_diag(perr)
       diag_note("type: #{inf_ty_to_string(ty)}")
       diag_help("T must be a `type T = A | B | ...` declaration; built-ins (Int, String, [a], etc.) are not supported")
-      inferred_leaf(st_bump_err(st), TyAny, e)
+      inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
     }
   }
 }
@@ -9195,10 +9204,11 @@ fn check_finally_clause(st: InferState, name: String, params: [Param], body: Exp
   let st_arity = match params {
     [] -> st
     _  -> {
-      diag_error(st.file, line, col,
-        string_concat("`", string_concat(name, " { }` takes no parameters")))
+      let perr = mk_diag(SevError, st.file, line, col,
+        string_concat("`", string_concat(name, " { }` takes no parameters")), [])
+      render_diag(perr)
       diag_note("`finally` runs for its effect only; use `return(x) -> ...` to transform the result")
-      st_bump_err(st)
+      st_bump_err(st_push_diag(st, perr))
     }
   }
   let outer = st_arity
@@ -9393,10 +9403,11 @@ fn check_handle_effect_known(st: InferState, eff: String,
   else {
     let header = string_concat("unknown effect in `with`: `",
       string_concat(eff, "`"))
-    diag_error(st.file, line, col, header)
+    let perr = mk_diag(SevError, st.file, line, col, header, [])
+    render_diag(perr)
     diag_note("`handle { ... } with #{eff} { ... }` references an undeclared effect")
     diag_help("either `effect #{eff} { ... }` it, or correct the name to a declared effect")
-    st_bump_err(st)
+    st_bump_err(st_push_diag(st, perr))
   }
 }
 
@@ -9415,14 +9426,15 @@ fn check_clause_names(st: InferState, eff: String, cs: [HClause],
         match ty_env_lookup(st.env, key) {
           Some(_) -> check_clause_names(st, eff, rest, line, col)
           None -> {
-            diag_error(st.file, cline, ccol,
+            let perr = mk_diag(SevError, st.file, cline, ccol,
               string_concat("unknown op `",
                 string_concat(name,
                   string_concat("` on effect `",
-                    string_concat(eff, "`")))))
+                    string_concat(eff, "`")))), [])
+            render_diag(perr)
             diag_note("handler clauses must match an op declared in `effect #{eff} { ... }`")
             diag_help("either remove this clause, or add `#{name}(...)` to the effect declaration")
-            check_clause_names(st_bump_err(st), eff, rest, line, col)
+            check_clause_names(st_bump_err(st_push_diag(st, perr)), eff, rest, line, col)
           }
         }
         }
@@ -9781,11 +9793,12 @@ fn bang_bad_operand(st: InferState, found: Ty, inner_typed: Expr,
                      line: Int, col: Int) : Inferred / Console + File {
 
 
-  diag_error(st.file, line, col,
-    "`!` requires an `Option[T]` or `Result[T, E]` operand")
+  let perr = mk_diag(SevError, st.file, line, col,
+    "`!` requires an `Option[T]` or `Result[T, E]` operand", [])
+  render_diag(perr)
   diag_note("operand type: #{inf_ty_to_string(found)}")
   diag_help("`!` is reserved for the two compiler-blessed propagation types; convert the value explicitly first")
-  let st1 = st_bump_err(st)
+  let st1 = st_bump_err(st_push_diag(st, perr))
   let stub = with_ty(mk_expr(EBang(inner_typed), line, col), TyAny)
   mk_inferred(st1, TyAny, stub)
 }
@@ -9794,11 +9807,12 @@ fn bang_no_enclosing_fn(st: InferState, fam: String, t: Ty, inner_typed: Expr,
                          line: Int, col: Int) : Inferred / Console + File {
 
 
-  diag_error(st.file, line, col,
-    "`!` is only valid inside a function body")
+  let perr = mk_diag(SevError, st.file, line, col,
+    "`!` is only valid inside a function body", [])
+  render_diag(perr)
   diag_note("operand type: #{fam}[#{inf_ty_to_string(t)}]")
   diag_help("`!` propagates from the enclosing function; it cannot appear inside a lambda or at top level")
-  let st1 = st_bump_err(st)
+  let st1 = st_bump_err(st_push_diag(st, perr))
   let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
   mk_inferred(st1, t, stub)
 }
@@ -9807,11 +9821,12 @@ fn bang_ret_mismatch(st: InferState, fam: String, t: Ty, ret_ty: Ty,
                       inner_typed: Expr, line: Int, col: Int) : Inferred / Console + File {
 
 
-  diag_error(st.file, line, col,
-    "`!` on `#{fam}[#{inf_ty_to_string(t)}]` requires the enclosing function to return `#{fam}[U]`")
+  let perr = mk_diag(SevError, st.file, line, col,
+    "`!` on `#{fam}[#{inf_ty_to_string(t)}]` requires the enclosing function to return `#{fam}[U]`", [])
+  render_diag(perr)
   diag_note("enclosing return type: #{inf_ty_to_string(ret_ty)}")
   diag_help("change the function's return type, or pattern-match the operand explicitly")
-  let st1 = st_bump_err(st)
+  let st1 = st_bump_err(st_push_diag(st, perr))
   let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
   mk_inferred(st1, t, stub)
 }
@@ -9820,11 +9835,12 @@ fn bang_ret_mismatch_result(st: InferState, e_ty: Ty, t: Ty, ret_ty: Ty,
                              inner_typed: Expr, line: Int, col: Int) : Inferred / Console + File {
 
 
-  diag_error(st.file, line, col,
-    "`!` on `Result[#{inf_ty_to_string(t)}, #{inf_ty_to_string(e_ty)}]` requires the enclosing function to return `Result[U, #{inf_ty_to_string(e_ty)}]`")
+  let perr = mk_diag(SevError, st.file, line, col,
+    "`!` on `Result[#{inf_ty_to_string(t)}, #{inf_ty_to_string(e_ty)}]` requires the enclosing function to return `Result[U, #{inf_ty_to_string(e_ty)}]`", [])
+  render_diag(perr)
   diag_note("enclosing return type: #{inf_ty_to_string(ret_ty)}")
   diag_help("kaikai does not implicitly convert error types (no `From`); convert the error explicitly or change the function's return type")
-  let st1 = st_bump_err(st)
+  let st1 = st_bump_err(st_push_diag(st, perr))
   let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
   mk_inferred(st1, t, stub)
 }
@@ -10332,8 +10348,9 @@ fn synth_resume_frame(st: InferState, args_: [Expr], e: Expr) : Inferred / Conso
     mk_inferred(st2, TyUnit, with_ty(mk_expr(EIntrinsic("resume_frame", [rf.expr]), e.line, e.col), TyUnit))
   }
   _ -> {
-    diag_error(st.file, e.line, e.col, "compiler intrinsic `$resume_frame` takes one argument")
-    inferred_leaf(st_bump_err(st), TyAny, e)
+    let perr = mk_diag(SevError, st.file, e.line, e.col, "compiler intrinsic `$resume_frame` takes one argument", [])
+    render_diag(perr)
+    inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
   }
 }
 
@@ -11047,12 +11064,13 @@ fn synth_op_call_unknown_op(st: InferState, eff_name: String, op_name: String,
                              line: Int, col: Int) : Inferred / Console + File {
 
 
-  diag_error(st.file, line, col,
+  let perr = mk_diag(SevError, st.file, line, col,
     string_concat("unknown op `", string_concat(op_name,
-      string_concat("` on effect `", string_concat(eff_name, "`")))))
+      string_concat("` on effect `", string_concat(eff_name, "`")))), [])
+  render_diag(perr)
   diag_note("`#{eff_name}.#{op_name}` is not declared in `effect #{eff_name} { ... }`")
   diag_help("declare `#{op_name}(...)` inside the effect, or call an existing op")
-  let st1 = st_bump_err(st)
+  let st1 = st_bump_err(st_push_diag(st, perr))
   mk_inferred(st1, TyAny, with_ty(mk_ref(eff_name, line, col), TyAny))
 }
 
@@ -11316,8 +11334,9 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
             mk_inferred(st1, ty, field_root(r.expr, fnm, line, col, ty))
           }
           None -> {
-            diag_error(st.file, line, col, "no field '#{fnm}' on #{cname}#{field_hint(inst.fields, fnm)}")
-            mk_inferred(st_bump_err(st1), TyAny, field_root(r.expr, fnm, line, col, TyAny))
+            let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' on #{cname}#{field_hint(inst.fields, fnm)}", [])
+            render_diag(perr)
+            mk_inferred(st_bump_err(st_push_diag(st1, perr)), TyAny, field_root(r.expr, fnm, line, col, TyAny))
           }
         }
       }
@@ -11465,26 +11484,30 @@ fn drain_one_deferred_field(st: InferState, recv: Ty, fnm: String,
         match fty_find(inst.fields, fnm) {
           Some(t) -> st_unify(st1, TyVarT(res_id), apply_ty(st1.sub, t), "deferred field access", line, col)
           None -> {
-            diag_error(st.file, line, col, "no field '#{fnm}' on #{cname}#{field_hint(inst.fields, fnm)}")
-            st_bump_err(st1)
+            let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' on #{cname}#{field_hint(inst.fields, fnm)}", [])
+            render_diag(perr)
+            st_bump_err(st_push_diag(st1, perr))
           }
         }
       }
       None -> {
-        diag_error(st.file, line, col, "no field '#{fnm}' on #{cname}")
-        st_bump_err(st)
+        let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' on #{cname}", [])
+        render_diag(perr)
+        st_bump_err(st_push_diag(st, perr))
       }
     }
     TyVarT(_) -> {
-      diag_error(st.file, line, col,
+      let perr = mk_diag(SevError, st.file, line, col,
         concat_all(["type annotation needed: the receiver of `.", fnm,
-                    "` is not resolved by the body — annotate it so the field can be checked"]))
-      st_bump_err(st)
+                    "` is not resolved by the body — annotate it so the field can be checked"]), [])
+      render_diag(perr)
+      st_bump_err(st_push_diag(st, perr))
     }
     _ -> {
-      diag_error(st.file, line, col,
-        concat_all(["`.", fnm, "` is a field access on a non-record value"]))
-      st_bump_err(st)
+      let perr = mk_diag(SevError, st.file, line, col,
+        concat_all(["`.", fnm, "` is a field access on a non-record value"]), [])
+      render_diag(perr)
+      st_bump_err(st_push_diag(st, perr))
     }
   }
 }
@@ -11506,11 +11529,12 @@ fn field_non_record_or_partial_app(st: InferState, obj_expr: Expr, fnm: String,
 
   match ty_env_lookup(st.env, fnm) {
     Some(_) -> {
-      diag_error(st.file, line, col,
+      let perr = mk_diag(SevError, st.file, line, col,
         concat_all(["`", fnm, "` is a function in scope, not a field. ",
                     "UFCS only fires at call sites — write `expr.", fnm, "(args)`, ",
-                    "not a bare `expr.", fnm, "`."]))
-      mk_inferred(st_bump_err(st), TyAny, field_root(obj_expr, fnm, line, col, TyAny))
+                    "not a bare `expr.", fnm, "`."]), [])
+      render_diag(perr)
+      mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, field_root(obj_expr, fnm, line, col, TyAny))
     }
     None -> mk_inferred(st, TyAny, field_root(obj_expr, fnm, line, col, TyAny))
   }
@@ -11629,9 +11653,10 @@ fn synth_fixed_vec_index(st: InferState, coll: Expr, ix: Expr, coll_ty: Ty,
       if k >= 0 and k < n {
         fixed_vec_index_node(st, coll, ix, "__fixed_vec_get", elem, line, col)
       } else {
-        diag_error(st.file, line, col,
-          concat_all(["index ", int_to_string(k), " is out of range for a fixed-width `Vec` of length ", int_to_string(n)]))
-        mk_inferred(st_bump_err(st), elem, with_ty(mk_expr(EIndex(coll, ix), line, col), elem))
+        let perr = mk_diag(SevError, st.file, line, col,
+          concat_all(["index ", int_to_string(k), " is out of range for a fixed-width `Vec` of length ", int_to_string(n)]), [])
+        render_diag(perr)
+        mk_inferred(st_bump_err(st_push_diag(st, perr)), elem, with_ty(mk_expr(EIndex(coll, ix), line, col), elem))
       }
     _ -> {
       let ir = check_expr_against(st, ix, TyInt, "index", ix.line, ix.col)
@@ -12132,11 +12157,12 @@ fn synth_dim_pow(st: InferState, lt: Ty, le: Expr,
   let s1 = match unify_env(st.env, rt_now, TyInt, st.sub) {
     Some(s2) -> st_set_sub(st, s2)
     None -> {
-      diag_error(st.file, line, col,
-        "exponent of `^` must be Int")
+      let perr = mk_diag(SevError, st.file, line, col,
+        "exponent of `^` must be Int", [])
+      render_diag(perr)
       diag_note(string_concat("found: ", inf_ty_to_string(rt_now)))
       diag_help("convert the exponent to Int (e.g. `real_to_int(x)`), or use a stdlib helper like `Numeric.pow_int(base, n)` if the integer exponent is available separately")
-      st_bump_err(st)
+      st_bump_err(st_push_diag(st, perr))
     }
   }
   let ls = ty_split_dim(apply_ty(s1.sub, lt), s1.sub)
@@ -12191,11 +12217,12 @@ fn st_check_arith_string(st: InferState, op: String, t: Ty,
   let split = ty_split_dim(t, st.sub)
   match split.base {
     TyString -> {
-      diag_error(st.file, line, col,
+      let perr = mk_diag(SevError, st.file, line, col,
         concat_all(["arithmetic operator `", op,
-                    "` requires a numeric operand, found `String`"]))
+                    "` requires a numeric operand, found `String`"]), [])
+      render_diag(perr)
       diag_help("string concatenation is `++`")
-      st_bump_err(st)
+      st_bump_err(st_push_diag(st, perr))
     }
     _ -> st
   }
@@ -12281,10 +12308,11 @@ fn synth_concat(st: InferState, lt: Ty, le: Expr, rt: Ty, re: Expr, line: Int, c
         TyString -> concat_finish(st, TyString, lt, le, rt, re, line, col)
         TyListT(elem) -> concat_finish(st, TyListT(elem), lt, le, rt, re, line, col)
         _ -> {
-          diag_error(st.file, line, col,
-            "operator `++` requires both operands to be `String` or both to be `[T]`")
+          let perr = mk_diag(SevError, st.file, line, col,
+            "operator `++` requires both operands to be `String` or both to be `[T]`", [])
+          render_diag(perr)
           diag_help("annotate one of the operands so the compiler can pick the right rule")
-          mk_inferred(st_bump_err(st), TyAny,
+          mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny,
             with_ty(mk_expr(EBinop("++", le, re), line, col), TyAny))
         }
       }
@@ -14320,8 +14348,9 @@ fn check_record_lit_fields(st: InferState, nm: String, fis: [FieldInit], fields:
                            line: Int, col: Int) : InferState / Console + File {
   let given = map(fis, (fi) => match fi { FI(fnm, _) -> fnm })
   foldl(record_lit_field_errors(nm, given, fty_names(fields)), st, (s, msg) => {
-    diag_error(s.file, line, col, msg)
-    st_bump_err(s)
+    let perr = mk_diag(SevError, s.file, line, col, msg, [])
+    render_diag(perr)
+    st_bump_err(st_push_diag(s, perr))
   })
 }
 
@@ -14375,8 +14404,9 @@ fn maybe_mint_literal(st: InferState, value: Expr, value_ty: Ty, expected: Ty,
       MintedExpr { st: st, pair: ExprTy { expr: e2, ty: new_ty } }
     }
     MintErr(msg) -> {
-      diag_error(st.file, line, col, msg)
-      MintedExpr { st: st_bump_err(st), pair: ExprTy { expr: value, ty: value_ty } }
+      let perr = mk_diag(SevError, st.file, line, col, msg, [])
+      render_diag(perr)
+      MintedExpr { st: st_bump_err(st_push_diag(st, perr)), pair: ExprTy { expr: value, ty: value_ty } }
     }
     MintNone -> MintedExpr { st: st, pair: maybe_lower_decimal_lit(value, value_ty, expected, mint_bigint_home(st.env)) }
   }
@@ -14459,8 +14489,9 @@ fn refine_narrow_error(st: InferState, miss: RvMiss, have: Ty, want: Ty, what: S
     } else {
       concat_all(["`", rv_text(have), "` does not fit `", rv_text(want), "`: a mutable type keeps its refinements exactly, and these differ in `", pred, "`"])
     }
-    diag_error(st.file, line, col, concat_all([what, ": ", why, note]))
-    st_bump_err(st)
+    let perr = mk_diag(SevError, st.file, line, col, concat_all([what, ": ", why, note]), [])
+    render_diag(perr)
+    st_bump_err(st_push_diag(st, perr))
   }
 }
 
@@ -14743,12 +14774,14 @@ fn synth_lit_mint_or_err(st: InferState, e: Expr, kind: ExprKind) : Inferred / C
   match kind {
     EDecimalLit(_) -> synth_mint_decimal(st, e)
     EIntLit(span)  -> {
-      diag_error(st.file, e.line, e.col, lit_mint_int_range_error(span))
-      mk_inferred(st_bump_err(st), TyInt, e)
+      let perr = mk_diag(SevError, st.file, e.line, e.col, lit_mint_int_range_error(span), [])
+      render_diag(perr)
+      mk_inferred(st_bump_err(st_push_diag(st, perr)), TyInt, e)
     }
     _ -> {
-      diag_error(st.file, e.line, e.col, "numeric literal has no concrete type in context")
-      mk_inferred(st_bump_err(st), TyInt, e)
+      let perr = mk_diag(SevError, st.file, e.line, e.col, "numeric literal has no concrete type in context", [])
+      render_diag(perr)
+      mk_inferred(st_bump_err(st_push_diag(st, perr)), TyInt, e)
     }
   }
 }
@@ -14776,8 +14809,9 @@ fn mint_let_textual(st: InferState, rhs: Expr, te: TypeExpr,
       mk_inferred(st, ty, e2)
     }
     MintErr(msg) -> {
-      diag_error(st.file, line, col, msg)
-      mk_inferred(st_bump_err(st), expected, rhs)
+      let perr = mk_diag(SevError, st.file, line, col, msg, [])
+      render_diag(perr)
+      mk_inferred(st_bump_err(st_push_diag(st, perr)), expected, rhs)
     }
     MintNone -> synth(st, rhs)
   }
@@ -14791,12 +14825,14 @@ fn synth_mint_decimal(st: InferState, e: Expr) : Inferred / Console + File + Mut
       mk_inferred(st, ty, e2)
     }
     MintErr(msg) -> {
-      diag_error(st.file, e.line, e.col, msg)
-      mk_inferred(st_bump_err(st), dec, e)
+      let perr = mk_diag(SevError, st.file, e.line, e.col, msg, [])
+      render_diag(perr)
+      mk_inferred(st_bump_err(st_push_diag(st, perr)), dec, e)
     }
     MintNone -> {
-      diag_error(st.file, e.line, e.col, "numeric literal has no concrete type in context")
-      mk_inferred(st_bump_err(st), dec, e)
+      let perr = mk_diag(SevError, st.file, e.line, e.col, "numeric literal has no concrete type in context", [])
+      render_diag(perr)
+      mk_inferred(st_bump_err(st_push_diag(st, perr)), dec, e)
     }
   }
 }
@@ -15028,10 +15064,11 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
         TyCon(_, "Map", _, _) -> {
           let ri = synth(probe.st, i)
           let rv = synth(ri.st, v)
-          diag_error(st.file, line, col,
-            "indexed write `m[k] := v` is not supported for `Map[K, V]` in v1")
+          let perr = mk_diag(SevError, st.file, line, col,
+            "indexed write `m[k] := v` is not supported for `Map[K, V]` in v1", [])
+          render_diag(perr)
           diag_help("use `map.put(m, k, v)` and rebind; the v2 design lands alongside the HAMT carrier")
-          OneStmt { st: st_bump_err(rv.st), stmt: SExprStmt(probe.expr) }
+          OneStmt { st: st_bump_err(st_push_diag(rv.st, perr)), stmt: SExprStmt(probe.expr) }
         }
         _ -> {
           let callee = mk_ref("array_set", line, col)
@@ -15123,10 +15160,11 @@ fn check_pattern_no_dup_binds(st: InferState, pat: Pattern) : InferState / Conso
   match pattern_first_duplicate(binds, []) {
     None -> st
     Some(nm) -> {
-      diag_error(st.file, pat.line, pat.col, "duplicate binding in pattern: `#{nm}`")
+      let perr = mk_diag(SevError, st.file, pat.line, pat.col, "duplicate binding in pattern: `#{nm}`", [])
+      render_diag(perr)
       diag_note("binding `#{nm}` already used elsewhere in this pattern")
       diag_help("use a different name, or extract the equality with a guard: `MkPair(x, y) if x == y -> ...`")
-      st_bump_err(st)
+      st_bump_err(st_push_diag(st, perr))
     }
   }
 }
@@ -15306,8 +15344,9 @@ fn check_variant_pattern(st: InferState, cname: String, subpats: [Pattern], expe
         Some(sug) -> " (did you mean `#{sug}`?)"
         None      -> ""
       }
-      diag_error(st.file, line, col, "unknown variant '#{cname}'#{hint}")
-      check_unknown_subpats(st_bump_err(st), subpats)
+      let perr = mk_diag(SevError, st.file, line, col, "unknown variant '#{cname}'#{hint}", [])
+      render_diag(perr)
+      check_unknown_subpats(st_bump_err(st_push_diag(st, perr)), subpats)
     }
     Some(sc) -> {
       let inst = st_instantiate(st, sc)
@@ -15323,8 +15362,9 @@ fn check_variant_pattern(st: InferState, cname: String, subpats: [Pattern], expe
           match subpats {
             [] -> s1
             _  -> {
-              diag_error(st.file, line, col, "variant '#{cname}' takes no args but pattern has #{int_to_string(list_length(subpats))}")
-              st_bump_err(s1)
+              let perr = mk_diag(SevError, st.file, line, col, "variant '#{cname}' takes no args but pattern has #{int_to_string(list_length(subpats))}", [])
+              render_diag(perr)
+              st_bump_err(st_push_diag(s1, perr))
             }
           }
         }
@@ -15356,18 +15396,20 @@ fn variant_arity_check(st: InferState, ps: [Pattern], tys: [Ty],
     [] -> match tys {
       [] -> st
       _  -> {
-        diag_error(st.file, line, col, "variant pattern has too few sub-patterns")
+        let perr = mk_diag(SevError, st.file, line, col, "variant pattern has too few sub-patterns", [])
+        render_diag(perr)
         diag_note("expected #{int_to_string(expected)}, found #{int_to_string(found)}")
         diag_help("add #{int_to_string(expected - found)} more sub-pattern(s), or use a wildcard `_` for each")
-        st_bump_err(st)
+        st_bump_err(st_push_diag(st, perr))
       }
     }
     [p, ...pr] -> match tys {
       [] -> {
-        diag_error(st.file, line, col, "variant pattern has too many sub-patterns")
+        let perr = mk_diag(SevError, st.file, line, col, "variant pattern has too many sub-patterns", [])
+        render_diag(perr)
         diag_note("expected #{int_to_string(expected)}, found #{int_to_string(found)}")
         diag_help("remove #{int_to_string(found - expected)} sub-pattern(s) so the count matches the variant's declared arity")
-        st_bump_err(st)
+        st_bump_err(st_push_diag(st, perr))
       }
       [t, ...tr] -> variant_arity_check(check_pattern(st, p, t), pr, tr, line, col, expected, found)
     }
@@ -15446,8 +15488,9 @@ fn check_pfield_list(st: InferState, pfs: [PField], fields: [FTy], line: Int, co
         let s1 = match fty_find(fields, fnm) {
           Some(ft) -> check_pattern(st, sub, ft)
           None -> {
-            diag_error(st.file, line, col, "no field '#{fnm}' in record pattern#{field_hint(fields, fnm)}")
-            check_pattern(st_bump_err(st), sub, TyAny)
+            let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' in record pattern#{field_hint(fields, fnm)}", [])
+            render_diag(perr)
+            check_pattern(st_bump_err(st_push_diag(st, perr)), sub, TyAny)
           }
         }
         check_pfield_list(s1, rest, fields, line, col)
@@ -15626,17 +15669,19 @@ fn check_arms_redundancy(st: InferState, arms: [Arm], seen: [ArmHead],
         let head = arm_head_of(pat)
         let unguarded = arm_is_unguarded(a)
         if saw_catch_all and unguarded {
-          diag_error(st.file, pat.line, pat.col,
-            "unreachable match arm: previous arm matched every value")
+          let perr = mk_diag(SevError, st.file, pat.line, pat.col,
+            "unreachable match arm: previous arm matched every value", [])
+          render_diag(perr)
           diag_note("an earlier unguarded `_` or bare binding already covers this case")
           diag_help("remove this arm, or move it before the catch-all")
-          let st1 = st_bump_err(st)
+          let st1 = st_bump_err(st_push_diag(st, perr))
           check_arms_redundancy(st1, rest, seen, saw_catch_all, match_line, match_col)
         } else if unguarded and arm_head_classified(head) and arm_head_in(seen, head) {
-          diag_error(st.file, pat.line, pat.col,
-            "duplicate match arm: #{arm_head_describe(head)} is already matched above")
+          let perr = mk_diag(SevError, st.file, pat.line, pat.col,
+            "duplicate match arm: #{arm_head_describe(head)} is already matched above", [])
+          render_diag(perr)
           diag_help("remove this arm, or distinguish it with a guard (`#{arm_head_describe(head)} if cond -> ...`)")
-          let st1 = st_bump_err(st)
+          let st1 = st_bump_err(st_push_diag(st, perr))
           check_arms_redundancy(st1, rest, seen, saw_catch_all, match_line, match_col)
         } else {
           let seen1 = if unguarded and arm_head_classified(head) {
@@ -15836,10 +15881,11 @@ fn vec_match_check_arms(st: InferState, arms: [Arm]) : VecMatchGate / Console + 
       let g1 = match guard {
         None -> VecMatchGate { st: st, ok: true }
         Some(gx) -> {
-          diag_error(st.file, gx.line, gx.col,
-            "guards are not supported on Vec match arms")
+          let perr = mk_diag(SevError, st.file, gx.line, gx.col,
+            "guards are not supported on Vec match arms", [])
+          render_diag(perr)
           diag_help("test the condition with `if` inside the arm body")
-          VecMatchGate { st: st_bump_err(st), ok: false }
+          VecMatchGate { st: st_bump_err(st_push_diag(st, perr)), ok: false }
         }
       }
       let g2 = match vec_arm_kind(p) {
@@ -16215,14 +16261,15 @@ fn report_ctor_ambiguity_if_any(st: InferState, cname: String,
             _ -> {
               let candidates_str = format_ctor_candidates(cname,
                                                             [bare_parent, ...user_parents])
-              diag_error(st.file, line, col,
+              let perr = mk_diag(SevError, st.file, line, col,
                 concat_all(["ambiguous constructor '", cname,
                             "' — matches both the core '",
                             bare_parent, ".", cname,
-                            "' and user-declared variant(s)"]))
+                            "' and user-declared variant(s)"]), [])
+              render_diag(perr)
               diag_note(concat_all(["candidates: ", candidates_str]))
               diag_help("annotate the binding with `let <name> : <Parent> = ...` to disambiguate")
-              st_bump_err(st)
+              st_bump_err(st_push_diag(st, perr))
             }
           }
         } else { report_ctor_parents_if_ambiguous(st, cname, line, col) }
@@ -16334,9 +16381,10 @@ fn ty_is_vec_head(t: Ty) : Bool =
 fn check_vec_lit_against(st: InferState, els: [ListElem], hargs: [Ty],
                          line: Int, col: Int) : Inferred / Console + File + Mutable {
   if vec_lit_has_spread(els) {
-    diag_error(st.file, line, col, "spread elements are not supported in a Vec literal")
+    let perr = mk_diag(SevError, st.file, line, col, "spread elements are not supported in a Vec literal", [])
+    render_diag(perr)
     diag_help("build the list first and convert it: `vec_from_list([...xs, y])`")
-    let r = synth(st_bump_err(st), mk_expr(EList(els), line, col))
+    let r = synth(st_bump_err(st_push_diag(st, perr)), mk_expr(EList(els), line, col))
     r
   } else {
     let elem_exp = match hargs { [t] -> apply_ty(st.sub, t)  _ -> TyAny }
@@ -16439,8 +16487,9 @@ fn check_vec_elems(st: InferState, els: [ListElem], elem_ty: Ty,
       ElPlain(ex) -> match mint_literal(ex, apply_ty(st.sub, elem_ty), mint_bigint_home(st.env)) {
         MintOk(m) -> check_vec_elems(st, rest, elem_ty, line, col, [m, ...acc])
         MintErr(msg) -> {
-          diag_error(st.file, ex.line, ex.col, msg)
-          check_vec_elems(st_bump_err(st), rest, elem_ty, line, col, [ex, ...acc])
+          let perr = mk_diag(SevError, st.file, ex.line, ex.col, msg, [])
+          render_diag(perr)
+          check_vec_elems(st_bump_err(st_push_diag(st, perr)), rest, elem_ty, line, col, [ex, ...acc])
         }
         MintNone -> {
           let r = check_elem_against(st, ex, apply_ty(st.sub, elem_ty), line, col)
@@ -16496,12 +16545,13 @@ fn check_map_pipe_fixed_collect(st: InferState, e: Expr, expected: Ty,
     Some(fc) -> match fixed_collect_unroll(fc, line, col) {
       Some(unrolled) -> check_expr_against(st, unrolled, expected, "fixed-width vector collect", line, col)
       None -> {
-        diag_error(st.file, line, col,
+        let perr = mk_diag(SevError, st.file, line, col,
           concat_all(["a `|` chain cannot collect into a fixed-width `Vec[t]<",
             int_to_string(fixed_vec_n(expected)),
-            ">`: its length is not known at compile time"]))
+            ">`: its length is not known at compile time"]), [])
+        render_diag(perr)
         diag_help("start the chain from a vector literal, or collect into a dynamic `Vec` first")
-        mk_inferred(st_bump_err(st), expected, with_ty(e, expected))
+        mk_inferred(st_bump_err(st_push_diag(st, perr)), expected, with_ty(e, expected))
       }
     }
   }
@@ -19090,12 +19140,13 @@ fn check_main_row_handlable(st: InferState, body_row: [Label],
             let header = string_concat("`main` declares effect `",
               string_concat(shown,
                 "` but no default handler is installed for it"))
-            diag_error(st.file, ln, cl, header)
+            let perr = mk_diag(SevError, st.file, ln, cl, header, [])
+            render_diag(perr)
             diag_note("only the canonical stdlib effects (Stdout, Stderr, Stdin, Env, File, Clock, Random, SecureRandom, NetTcp, Signal, Process, Log, Mutable, Cancel, Link, Monitor, Spawn) receive a default handler from the `main` wrapper")
             diag_note("`#{shown}` is either user-declared or a capability-only effect (e.g. `Ffi`); the runtime would have no evidence for it at the top level")
             diag_help("wrap the body in `handle { ... } with #{shown} { ... }` so the effect is closed before reaching `main`'s scope")
             diag_help("or remove `/ #{shown}` from `main`'s declared row if the call site is dead code")
-            st_bump_err(st)
+            st_bump_err(st_push_diag(st, perr))
           }
         }
       }
@@ -19659,8 +19710,8 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
                  all_decls_for_typer, kind_theories)
   # Stage B coverage check. Runs after row-level inference
   # is complete so the typed body carries the resolved `EVar("Eff.op")`
-  # callees the walker keys on. Adds its diagnostics directly to stderr
-  # and folds the count into TypedProgram.errs.
+  # callees the walker keys on. Its diagnostics are rendered as found and
+  # join TypedProgram.diags.
   #
   # Pass `all_decls_for_typer` (whole program) as the second list so
   # effect-existence and default-block lookups see DEffects that the
@@ -19668,21 +19719,21 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
   # performs the op. Without this, `is_effect_declared` returns false
   # for any user effect declared in the same file but partitioned away
   # from its `fn main()`, silencing the per-op coverage walker.
-  let cov_errs = check_default_coverage(df, tp.decls, all_decls_for_typer)
+  let cov_diags = check_default_coverage(df, tp.decls, all_decls_for_typer)
   # priv-fields lane: reject cross-module reads / constructions that
   # touch a `priv` record field. The record's declaring module lives
   # in the field's TyCon module_origin; this walker compares against
   # `mod.name` (the current module's home — None for the root file,
   # Some(m) for an imported module). Runs post-typing so `obj.ty` is
   # the resolved record type, not a free variable.
-  let priv_errs = check_field_privacy(df, mod.name, tp.decls, all_decls_for_typer)
+  let priv_diags = check_field_privacy(df, mod.name, tp.decls, all_decls_for_typer)
   let spawn_errs = check_spawn_rows(df, data.recs, tp.decls, all_decls_for_typer)
   let typed = TypedProgram {
-    decls: tp.decls, errs: tp.errs + cov_errs + priv_errs + spawn_errs,
+    decls: tp.decls, errs: tp.errs + list_length(cov_diags) + list_length(priv_diags) + spawn_errs,
     insts: tp.insts, holes: tp.holes, row_holes: tp.row_holes,
     core_len: tp.core_len, toplevel_len: tp.toplevel_len,
     module_doc: tp.module_doc,
-    diags: tp.diags, op_res: tp.op_res
+    diags: list_append(tp.diags, list_append(cov_diags, priv_diags)), op_res: tp.op_res
   }
   # the returned delta carries ONLY this module's
   # contribution (i.e. the slice of working-table state that
