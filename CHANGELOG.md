@@ -84,6 +84,35 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.138.0 (2026-10-08)
+
+### BREAKING CHANGE
+
+- a file that imports a module exporting `map`, `filter`,
+`each` or `reduce` and calls that name bare now calls the module's
+function. Write the pipe (`xs | f`) or the qualified call (`list.map`)
+to reach the list builtin. examples/stdlib/jwt_encoder.kai moves to
+pipes.
+
+### Added
+
+- **stdlib**: add gen, pull generators on the Yield effect (#2627)
+
+### Fixed
+
+- **resolve**: an imported function outranks a builtin of the same name (#2624)
+- **emit**: a specialised higher-order call keeps its callee's effects (#2622)
+- **resolve**: a selective import shadows a builtin of the same name (#2622)
+- **compiler**: report a qualified read of a missing export once, as a diagnostic (#2623)
+- **compiler**: report the typer's remaining printed errors and the op/name collision reports in --diags-json (#2621)
+- **compiler**: report module-loading errors as positioned diagnostics (#2619)
+- **perceus**: an arm-top reuse arm owns its nested binders on native (#2618)
+- **compiler**: report resolver, duplicate-decl and FFI-layout errors in --diags-json (#2617)
+
+### Changed
+
+- **compiler**: give TyName a home slot (#2626)
+
 ## v0.137.0 (2026-10-08)
 
 ### BREAKING CHANGE
