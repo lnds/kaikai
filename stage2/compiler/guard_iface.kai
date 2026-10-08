@@ -1,0 +1,223 @@
+#[doc("""
+The part of a module that another module's check can see, as a digest.
+
+A module that imports this one checks against its types, constructors,
+signatures, effects, protocols and impls, constants, units and imports,
+never against the body of a plain function: that body is checked where
+it lives. The digest covers the module's tokens with those bodies left
+out, so an edit inside one of them, or to a comment, keeps the digest.
+
+A generic function's body is instantiated by its callers, so it stays in,
+with the position of its declaration: a bound its caller breaks may be
+reported there. A body under `requires`/`ensures` stays in with every
+position, since a broken clause is reported at its own line. Positions
+of everything else stay out: a caller's diagnostic names only its own
+file otherwise.
+A module that does not parse has no digest, and its caller keys on the
+whole source instead.
+""")]
+
+import compiler.ast
+import compiler.lex
+import compiler.parse
+import compiler.user_cache
+import compiler.util
+
+#[doc("The interface digest of the module `src` read from `file`, as 16 hex chars; None when it does not parse.")]
+pub fn gi_interface_hex(file: String, src: String) : Option[String] / Console = {
+  let toks = tokenize(src)
+  match parse_program(file, src, toks).decls {
+    None     -> None
+    Some(ds) -> match gi_walk(src, toks, gi_sorted(gi_starts(ds, [])), GiSt([], GiOut, false, false)) {
+      Some(text) -> Some(uc_content_hex(text))
+      None       -> None
+    }
+  }
+}
+
+#[doc("`gi_interface_hex`, kept by source content under `memo_dir` (none when empty) so each source is parsed once.")]
+pub fn gi_interface_memo(memo_dir: String, file: String, src: String) : Option[String] / Console + File =
+  if memo_dir == "" { gi_interface_hex(file, src) }
+  else {
+    let entry = concat_all([memo_dir, "/", uc_content_hex(src), ".iface"])
+    match read_file(entry) {
+      Ok(h) if string_length(h) == 16 -> Some(h)
+      Ok(_)                           -> None
+      Err(_) -> {
+        let r = gi_interface_hex(file, src)
+        cache_publish(entry, match r { Some(h) -> h  None -> "-" })
+        r
+      }
+    }
+  }
+
+# ---- where bodies start ---------------------------------------------
+
+# A function body's first position, and how the digest takes it: left
+# out, kept as text after its declaration's position, or kept with the
+# position of every token.
+type GiStart = GiStart(Int, Int, GiKind)
+type GiKind = Strip | Content(Int, Int) | Placed
+
+fn gi_starts(ds: [Decl], acc: [GiStart]) : [GiStart] = match ds {
+  []           -> acc
+  [d, ...rest] -> gi_starts(rest, gi_decl(d, true, acc))
+}
+
+fn gi_decl(d: Decl, plain_impl: Bool, acc: [GiStart]) : [GiStart] = match d {
+  DFn(_, _, tps, _, _, _, body, l, c, _, _) -> [GiStart(body.line, body.col, gi_kind(plain_impl and list_is_empty(tps), body, l, c)), ...acc]
+  DImpl(_, _, _, ms, _, _, itps, _)         -> gi_methods(ms, list_is_empty(itps), acc)
+  DDerive(_, inner, _, _)                   -> gi_decl(inner, plain_impl, acc)
+  DUnstable(inner, _, _)                    -> gi_decl(inner, plain_impl, acc)
+  DConstructor(inner, _, _)                 -> gi_decl(inner, plain_impl, acc)
+  DDoc(_, _, inner, _, _)                   -> gi_decl(inner, plain_impl, acc)
+  DAttr(_, inner, _, _)                     -> gi_decl(inner, plain_impl, acc)
+  _                                         -> acc
+}
+
+fn gi_methods(ms: [Decl], plain: Bool, acc: [GiStart]) : [GiStart] = match ms {
+  []           -> acc
+  [m, ...rest] -> gi_methods(rest, plain, gi_decl(m, plain, acc))
+}
+
+fn gi_kind(plain: Bool, body: Expr, l: Int, c: Int) : GiKind = match body.kind {
+  ESurface(SfContract(_, _, _)) -> Placed
+  _                             -> if plain { Strip } else { Content(l, c) }
+}
+
+fn gi_sorted(xs: [GiStart]) : [GiStart] = sort_by(xs, (a, b) => gi_cmp(a, b))
+
+fn gi_cmp(a: GiStart, b: GiStart) : Int = match (a, b) {
+  (GiStart(la, ca, _), GiStart(lb, cb, _)) -> if la != lb { la - lb } else { ca - cb }
+}
+
+# ---- the walk -------------------------------------------------------
+
+# The digest text so far (reversed), the body state, whether the next
+# token starts a line, and whether the previous one was `=`.
+type GiSt = GiSt([String], GiMode, Bool, Bool)
+
+# Outside any body; inside a body left out or kept, with its bracket depth
+# and whether it is a `{ }` block.
+type GiMode = GiOut | GiIn(GiKind, Int, Bool)
+
+fn gi_walk(src: String, toks: [Token], starts: [GiStart], st: GiSt) : Option[String] = match toks {
+  [] -> gi_done(starts, st)
+  [t, ...rest] -> match st {
+    GiSt(out, mode, line_start, after_eq) -> match t.kind {
+      TkNewline -> gi_walk(src, rest, starts, GiSt(out, mode, true, after_eq))
+      TkEof     -> gi_done(starts, st)
+      _         -> match mode {
+        GiOut -> gi_outside(src, t, rest, starts, out, line_start, after_eq)
+        GiIn(k, depth, block) -> gi_inside(src, t, rest, starts, out, line_start, k, depth, block)
+      }
+    }
+  }
+}
+
+# A kept body whose start was never met would leave out what the digest needs.
+fn gi_done(starts: [GiStart], st: GiSt) : Option[String] =
+  if any(starts, (s) => gi_kept(s)) { None }
+  else { match st { GiSt(out, _, _, _) -> Some(string_join(list_reverse(out), "\n")) } }
+
+fn gi_outside(src: String, t: Token, rest: [Token], starts: [GiStart], out: [String],
+              line_start: Bool, after_eq: Bool) : Option[String] = match starts {
+  [GiStart(l, c, k), ...more] if l == t.line and c == t.col and (after_eq or gi_is_lbrace(t)) ->
+    gi_inside(src, t, rest, more, gi_enter(k, out), line_start, k, 0, gi_is_lbrace(t))
+  [GiStart(l, c, k), ...more] if l == t.line and c == t.col and gi_kept(GiStart(l, c, k)) ->
+    gi_inside(src, t, rest, more, gi_enter(k, out), line_start, k, 0, gi_is_lbrace(t))
+  [GiStart(l, c, Strip), ...more] if l == t.line and c == t.col ->
+    gi_walk(src, rest, more, GiSt([gi_text(src, t), ...out], GiOut, false, false))
+  _ -> gi_walk(src, rest, gi_skip_past(starts, t), GiSt([gi_text(src, t), ...out], GiOut, false, gi_is_eq(t)))
+}
+
+# Starts the walk has moved past without meeting stay pending only when
+# they are kept, so that `gi_done` refuses the digest.
+fn gi_skip_past(starts: [GiStart], t: Token) : [GiStart] = match starts {
+  [GiStart(l, c, Strip), ...more] if l < t.line or (l == t.line and c < t.col) -> gi_skip_past(more, t)
+  _ -> starts
+}
+
+fn gi_inside(src: String, t: Token, rest: [Token], starts: [GiStart], out: [String],
+             line_start: Bool, k: GiKind, depth: Int, block: Bool) : Option[String] =
+  if (not block) and depth == 0 and ((line_start and gi_opens_decl(src, t)) or gi_closes(t)) {
+    gi_outside(src, t, rest, starts, out, line_start, false)
+  } else {
+    let d1 = depth + gi_delta(t)
+    let out1 = match k {
+      Strip         -> out
+      Content(_, _) -> [gi_text(src, t), ...out]
+      Placed        -> [gi_placed(src, t), ...out]
+    }
+    let mode = if block and d1 == 0 { GiOut } else { GiIn(k, d1, block) }
+    gi_walk(src, rest, starts, GiSt(out1, mode, false, false))
+  }
+
+fn gi_kept(s: GiStart) : Bool = match s {
+  GiStart(_, _, Strip) -> false
+  _                    -> true
+}
+
+# Entering a generic body records its declaration's position once.
+fn gi_enter(k: GiKind, out: [String]) : [String] = match k {
+  Content(l, c) -> [concat_all(["@", int_to_string(l), ":", int_to_string(c)]), ...out]
+  _             -> out
+}
+
+fn gi_delta(t: Token) : Int = match t.kind {
+  TkLparen   -> 1
+  TkLbracket -> 1
+  TkLbrace   -> 1
+  TkHashOpen -> 1
+  TkRparen   -> -1
+  TkRbracket -> -1
+  TkRbrace   -> -1
+  _          -> 0
+}
+
+fn gi_closes(t: Token) : Bool = match t.kind {
+  TkRparen   -> true
+  TkRbracket -> true
+  TkRbrace   -> true
+  _          -> false
+}
+
+# A token that can only open a declaration when it starts a line.
+fn gi_opens_decl(src: String, t: Token) : Bool = match t.kind {
+  TkPub      -> true
+  TkPriv     -> true
+  TkFn       -> true
+  TkType     -> true
+  TkEffect   -> true
+  TkImpl     -> true
+  TkHashOpen -> true
+  _          -> gi_opens_decl_rest(src, t)
+}
+
+fn gi_opens_decl_rest(src: String, t: Token) : Bool = match t.kind {
+  TkImport   -> true
+  TkConst    -> true
+  TkProtocol -> true
+  TkTest     -> true
+  TkBench    -> true
+  TkCheck    -> true
+  TkExtern   -> true
+  _          -> gi_opens_decl_more(src, t)
+}
+
+fn gi_opens_decl_more(src: String, t: Token) : Bool = match t.kind {
+  TkAxiom  -> true
+  TkTheory -> true
+  TkUse    -> true
+  TkIdent  -> { let w = gi_text(src, t); w == "unit" or w == "kind" }
+  _        -> false
+}
+
+fn gi_is_lbrace(t: Token) : Bool = match t.kind { TkLbrace -> true  _ -> false }
+
+fn gi_is_eq(t: Token) : Bool = match t.kind { TkEq -> true  _ -> false }
+
+fn gi_text(src: String, t: Token) : String = string_slice(src, t.start, t.length)
+
+fn gi_placed(src: String, t: Token) : String =
+  concat_all([int_to_string(t.line), ":", int_to_string(t.col), ":", gi_text(src, t)])

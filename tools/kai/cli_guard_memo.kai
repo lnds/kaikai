@@ -2,10 +2,17 @@
 A package's per-file checks, memoised by everything they read.
 
 A check's diagnostics and status are a function of its inputs: the
-compiler binary, its arguments, the entry's source, every other source
-the compile reads (the import closure and the core modules, by path and
-content) and the `KAI` environment the compiler sees. A memo entry under
-the package's user cache replays them byte for byte.
+compiler binary, its arguments, the entry's source, the interface of
+every module the entry imports (`kaic2 --guard-interfaces`: the module
+without the bodies a caller cannot see), the core modules and the `KAI`
+environment the compiler sees. A memo entry under the package's user
+cache replays them byte for byte.
+
+An imported module's body is outside that key, so only a clean check
+that names no other source is kept under it. Any other check is kept
+under a key over the full source of every imported module, which the
+interface entry points to: a failure or a warning that came from an
+imported body never outlives the edit that changes it.
 
 `KAI_GUARD_MEMO=0` turns the memo off; `KAI_GUARD_MEMO=shadow` also runs
 the check on every hit and fails the run on any difference.
@@ -24,7 +31,7 @@ pub const TOOLCHAIN_ENV : String = "KAI_GUARD_TOOLCHAIN"
 #[doc("The variable a parent run sets to the digest of the core modules and their imports, which every check of the run reads alike.")]
 pub const CORE_ENV : String = "KAI_GUARD_CORE"
 
-const FORMAT : String = "kai-guard-memo 2"
+const FORMAT : String = "kai-guard-memo 3"
 
 #[doc("""
 Run the check `argv`, whose last element is the entry the user knows as
@@ -37,9 +44,9 @@ pub fn guarded(argv: [String], shown: String, err: String) : Int / Env + File + 
   if mode == "0" or dir == "" {
     fresh(argv, shown, err)
   } else {
-    match key_of(argv, shown, err) {
+    match keys_of(argv, shown, err) {
       None -> fresh(argv, shown, err)
-      Some(key) -> memoised(mode, "#{dir}/#{key}", argv, shown, err)
+      Some(keys) -> memoised(mode, ("#{dir}/#{keys.fst}", "#{dir}/#{keys.snd}"), argv, shown, err)
     }
   }
 }
@@ -64,20 +71,43 @@ pub fn core_digest(kaic2: String, scratch: String) : String / File + Ffi {
   cli_sys.sha_hex()
 }
 
-fn memoised(mode: String, entry: String, argv: [String], shown: String, err: String) : Int / Env + File + Ffi =
-  match load(entry) {
-    None -> {
-      let rc = fresh(argv, shown, err)
-      store(entry, rc, err)
-      rc
+# A memo entry: a check's status and stderr, a pointer to the entry under
+# the full-source key, or nothing usable.
+type Found = Found(Int, String) | Full | Missing
+
+# `entries` is the entry under the interface key and the one under the
+# full-source key.
+fn memoised(mode: String, entries: (String, String), argv: [String], shown: String, err: String) : Int / Env + File + Ffi =
+  match load(entries.fst) {
+    Found(rc, text) -> replay(mode, (rc, text), argv, shown, err)
+    Full -> match load(entries.snd) {
+      Found(rc, text) -> replay(mode, (rc, text), argv, shown, err)
+      _               -> record(entries, argv, shown, err)
     }
-    Some(hit) -> if mode == "shadow" {
-      shadow(hit, fresh(argv, shown, err), shown, err)
+    Missing -> record(entries, argv, shown, err)
+  }
+
+fn replay(mode: String, hit: (Int, String), argv: [String], shown: String, err: String) : Int / File + Ffi =
+  if mode == "shadow" {
+    shadow(hit, fresh(argv, shown, err), shown, err)
+  } else {
+    let _ = write_file(err, hit.snd)
+    hit.fst
+  }
+
+fn record(entries: (String, String), argv: [String], shown: String, err: String) : Int / File + Ffi {
+  let rc = fresh(argv, shown, err)
+  if cli_sys.pending_signal() == 0 {
+    let text = cli_fs.read_or_empty(err)
+    if rc == 0 and own_report(text, shown) {
+      store(entries.fst, "#{rc}\n#{string_length(text)}\n#{text}")
     } else {
-      let _ = write_file(err, hit.snd)
-      hit.fst
+      store(entries.snd, "#{rc}\n#{string_length(text)}\n#{text}")
+      store(entries.fst, "full\n")
     }
   }
+  rc
+}
 
 fn fresh(argv: [String], shown: String, err: String) : Int / File + Ffi {
   let rc = cli_proc.run(argv, cli_plan.kaic2_spawn([], "/dev/null", err))
@@ -101,40 +131,40 @@ fn memo_dir(argv: [String]) : String =
     d -> "#{d}/guards"
   }
 
-# A status from a signal (a crash, a kill under memory pressure) is not
-# the check's verdict, so it is never recorded.
-fn store(entry: String, rc: Int, err: String) : Unit / File + Ffi =
-  if rc >= 0 and rc < 128 and cli_sys.pending_signal() == 0 {
-    let _ = cli_fs.mkdir_p(cli_fs.dirname(entry))
-    let part = "#{entry}.#{cli_sys.getpid()}.part"
-    let text = cli_fs.read_or_empty(err)
-    match write_file(part, "#{FORMAT}\n#{rc}\n#{string_length(text)}\n#{text}") {
-      Ok(_) -> {
-        let _ = file_rename(part, entry)
-      }
-      Err(_) -> ()
+fn store(entry: String, body: String) : Unit / File + Ffi {
+  let _ = cli_fs.mkdir_p(cli_fs.dirname(entry))
+  let part = "#{entry}.#{cli_sys.getpid()}.part"
+  match write_file(part, "#{FORMAT}\n#{body}") {
+    Ok(_) -> {
+      let _ = file_rename(part, entry)
     }
+    Err(_) -> ()
   }
+}
+
+# Every line naming a `.kai` source names the entry the user knows as `shown`.
+fn own_report(text: String, shown: String) : Bool =
+  list.all(cli_memo_key.lines(text), l => string.index_of(l, ".kai:").is_none() or string.index_of(l, "#{shown}:").is_some())
 
 # An entry that does not parse, or whose stderr is not the length it
 # records, is a miss.
-fn load(entry: String) : Option[(Int, String)] / File =
+fn load(entry: String) : Found / File =
   match read_file(entry) {
-    Err(_) -> None
+    Err(_) -> Missing
     Ok(s) -> match line_off(s) {
-      Some(h) if h.fst == FORMAT -> status_and_text(h.snd)
-      _ -> None
+      Some(h) if h.fst == FORMAT -> if h.snd == "full\n" { Full } else { status_and_text(h.snd) }
+      _ -> Missing
     }
   }
 
-fn status_and_text(s: String) : Option[(Int, String)] =
+fn status_and_text(s: String) : Found =
   match line_off(s) {
-    None -> None
+    None -> Missing
     Some(r) -> match line_off(r.snd) {
-      None -> None
+      None -> Missing
       Some(n) -> match (string.to_int(r.fst), string.to_int(n.fst)) {
-        (Some(rc), Some(len)) if len == string_length(n.snd) -> Some((rc, n.snd))
-        _ -> None
+        (Some(rc), Some(len)) if len == string_length(n.snd) -> Found(rc, n.snd)
+        _ -> Missing
       }
     }
   }
@@ -143,11 +173,13 @@ fn status_and_text(s: String) : Option[(Int, String)] =
 fn line_off(s: String) : Option[(String, String)] =
   string.index_of(s, "\n").map(i => (string_slice(s, 0, i), string_slice(s, i + 1, string_length(s) - i - 1)))
 
-fn key_of(argv: [String], shown: String, err: String) : Option[String] / Env + File + Ffi {
+# The key over the interfaces of the entry's imports, and the one over
+# their full source.
+fn keys_of(argv: [String], shown: String, err: String) : Option[(String, String)] / Env + File + Ffi {
   let entry = list.last(argv).unwrap_or("")
   let flags = list.take(argv, list.length(argv) - 1)
   let listing = cli_proc.capture(
-    flags ++ ["--guard-inputs", entry],
+    flags ++ ["--guard-interfaces", entry],
     cli_plan.kaic2_spawn([], "", "/dev/null"),
     "#{err}.inputs"
   )
@@ -157,12 +189,17 @@ fn key_of(argv: [String], shown: String, err: String) : Option[String] / Env + F
     let kaic2 = list.head(argv).unwrap_or("")
     let tool = match env.get(TOOLCHAIN_ENV) { Some(d) -> d  None -> toolchain_digest(kaic2) }
     let core = match env.get(CORE_ENV) { Some(d) -> d  None -> core_digest(kaic2, cli_fs.dirname(err)) }
-    cli_sys.sha_reset()
-    cli_sys.sha_str("#{FORMAT}\n#{tool}\n#{core}\n")
-    argv |> foreach(a => cli_memo_key.field(if a == entry { shown } else { a }))
-    cli_memo_key.feed_file("<entry>", entry)
-    cli_memo_key.lines(listing.snd) |> foreach(l => cli_memo_key.feed_input(l))
-    cli_memo_key.kai_env() |> foreach(v => cli_memo_key.field(v))
-    Some(cli_sys.sha_hex())
+    let imports = cli_memo_key.lines(listing.snd)
+    let env_fields = cli_memo_key.kai_env()
+    let key = (full) => {
+      cli_sys.sha_reset()
+      cli_sys.sha_str("#{FORMAT}\n#{tool}\n#{core}\n")
+      argv |> foreach(a => cli_memo_key.field(if a == entry { shown } else { a }))
+      cli_memo_key.feed_file("<entry>", entry)
+      imports |> foreach(l => if full { cli_memo_key.feed_source(l) } else { cli_memo_key.feed_interface(l) })
+      env_fields |> foreach(v => cli_memo_key.field(v))
+      cli_sys.sha_hex()
+    }
+    Some((key(false), key(true)))
   }
 }
