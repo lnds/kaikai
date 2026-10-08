@@ -1613,6 +1613,17 @@ KaiValue *kaix_seg_start(KaiValue *body, KaiValue **k) {
     return kai_seg_start(body, k);
 }
 
+/* A handle on a segment. A return that is not a closure stands for a missing
+ * return clause. */
+KaiValue *kaix_seg_handle(KaiValue *body, KaiValue *ret, int32_t n, KaiValue **clauses) {
+    if (!kai_is_ptr(ret) || ret->tag != KAI_CLOSURE) { kai_decref(ret); ret = NULL; }
+    return kai_seg_handle(body, ret, n, clauses);
+}
+
+KaiValue *kaix_seg_request(int32_t op, int32_t n, KaiValue **args) {
+    return kai_seg_request(op, n, args);
+}
+
 KaiValue *kaix_seg_suspend(KaiValue *v) {
     return kai_seg_suspend(v);
 }

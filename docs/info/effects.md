@@ -311,7 +311,7 @@ handle runs its body on a stack segment; `kai build --explain` notes
 each one and why. A dropped continuation discontinues its body: every
 `finally` on it runs.
 
-```text
+```kaikai
 effect Yield { yield(x: Int) : Unit }
 
 type Gen = Done | Next(Int, Cont[Unit, Gen])
@@ -326,6 +326,8 @@ fn sum_all(g: Gen, acc: Int) : Int = match g {
   Done       -> acc
   Next(x, k) -> sum_all(k(()), acc + x)
 }
+
+fn main() : Unit / Stdout = Stdout.print("#{sum_all(generate(10), 0)}")   # 55
 ```
 
 - A continuation stays on the fiber that created it: a thunk handed to
@@ -333,8 +335,6 @@ fn sum_all(g: Gen, acc: Int) : Int = match g {
 - When the continuation can leave its clause, the handled body may
   perform only the effect its handle discharges.
 - A stateful handle (`with Eff(init)`) cannot keep its continuation.
-- The C backend runs these handles; the native backend reports them as
-  unsupported.
 
 ## Stdlib effects
 

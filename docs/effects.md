@@ -522,8 +522,7 @@ one is a compile error.
 > clause carries no effect row yet, so the body it resumes may perform
 > only the effect its handle discharges; effectful generator bodies
 > are coming. A stateful handle cannot keep its continuation; its
-> segment form is coming. The C backend runs segment handles; the
-> native backend reports them as unsupported until its lowering lands.
+> segment form is coming.
 
 For genuinely multi-shot or escaping continuations (backtracking
 search, generators), the programmer writes `resume_multishot(v)`

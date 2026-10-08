@@ -24,6 +24,7 @@
 # shard across runners. Each shard walks a disjoint subset; the union must
 # equal this default or the gate's coverage silently shrinks.
 KAI_CORPUS_DEFAULT_DIRS="examples/effects
+examples/segments
 examples/actors
 examples/spawn
 examples/perceus
