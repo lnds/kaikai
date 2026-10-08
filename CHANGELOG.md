@@ -84,6 +84,45 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.137.0 (2026-10-08)
+
+### BREAKING CHANGE
+
+- an op that two declared instances of one effect could both
+serve, with nothing pinning which, is now a compile error instead of
+dispatching to whichever handler is innermost.
+
+### Added
+
+- **effects**: lower segment handles on the native backend (#2616)
+- **effects**: run a handle that keeps its continuation on a stack segment (#2610)
+- **runtime**: add stack segments with one-shot continuations (#2595)
+- **runtime**: add the stack-segment switch primitive (#2593)
+
+### Fixed
+
+- **compiler**: report effect-alias and doc-strip errors in --diags-json (#2615)
+- **perceus**: a reuse rebuild in a TRMC fn is a cctx step (#2614)
+- **compiler**: collect derive and spawn-boundary errors as diagnostics (#2613)
+- **effects**: dispatch each op to the handler of the instance it was typed at (#2603)
+- **typer**: collect the typer's printed errors as diagnostics (#2612)
+- **runtime**: build data-derived strings without interning them (#2609)
+- **perceus**: release a region's value after copying it out (#2607)
+- **perceus**: keep a reuse arm's moved children out of its registered cell (#2602)
+- **native**: dispatch a protocol op without allocating its names (#2606)
+- **fmt**: keep layout search linear in nesting depth (#2604)
+- **emit**: bound the C nesting of nested matches, blocks, lists and tuples (#2598)
+- **native**: bind a raw block's value raw in a `let` (#2601)
+- **perceus**: release a builtin passed by value to a borrowed parameter (#2599)
+- **effects**: release operands and pattern binders an abandon jumps over (#2596)
+- **compiler**: loop a TRMC function's bare self-call instead of recursing (#2594)
+
+### Changed
+
+- **kai**: key kai test's per-file checks on imported modules' interfaces (#2608)
+- **runtime**: enter handles with _setjmp, not the mask-saving setjmp (#2600)
+- **stdlib**: search string.index_of through a core-declared builtin (#2597)
+
 ## v0.136.0 (2026-10-08)
 
 ### BREAKING CHANGE
