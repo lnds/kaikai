@@ -801,7 +801,13 @@ KaiValue *kaix_arena_variant_masked(int32_t tag, const char *name, int32_t n, Ka
     if (n <= 0) return kai_arena_variant(tag, name, 0, 0, NULL);
     return kai_arena_variant(tag, name, n, kai_slot_mask_of(tag), slots);
 }
-KaiValue *kaix_deep_copy_out(KaiValue *v)                                 { return kai_deep_copy_out(v); }
+/* The region exit's value is an owned call arg: copied out, then released
+ * (a no-op on an arena cell). */
+KaiValue *kaix_deep_copy_out(KaiValue *v) {
+    KaiValue *r = kai_deep_copy_out(v);
+    kai_decref(v);
+    return r;
+}
 
 /* ---------- M3e: lists + closures-with-captures ---------- */
 KaiValue *kaix_cons(KaiValue *h, KaiValue *t)            { return kai_cons(h, t); }
