@@ -258,6 +258,7 @@ run_positive "build_module_qualified" "build_module_qualified" "build_module_qua
 # the module's own fn, on both backends.
 run_positive "builtin_shadow"         "builtin_shadow"         "builtin_shadow/main.out.expected"
 run_positive "builtin_pick"           "builtin_pick"           "builtin_pick/main.out.expected"
+run_positive "builtin_import"         "builtin_import"         "builtin_import/main.out.expected"
 
 # git-source dep chains (rendered manifests): direct dep and a
 # transitive chain. SKIP when the manifest was not rendered, matching
@@ -326,6 +327,7 @@ run_parity  "parity-simple_dep"         "simple_dep"
 run_parity  "parity-transitive"         "transitive"
 run_parity  "parity-builtin_shadow"     "builtin_shadow"
 run_parity  "parity-builtin_pick"       "builtin_pick"
+run_parity  "parity-builtin_import"     "builtin_import"
 
 printf '== summary: %d ok, %d fail, %d skip ==\n' "$PASS" "$FAIL" "$SKIP"
 if [ "$FAIL" -gt 0 ]; then
