@@ -2627,7 +2627,7 @@ test-free-deep: $(TARGET) build
 # Operand chains and nested blocks, matches, conditionals, lists and tuples
 # as deep as the parser accepts: the emitted C stays within clang's 256 brackets.
 DEEP_CHAIN_FIXTURES := deep_chain_call deep_chain_binop deep_chain_pipe \
-	deep_value_let deep_value_match deep_value_if deep_value_list deep_value_tuple
+	deep_value_let deep_value_match deep_value_if deep_value_list deep_value_tuple nest_limit_256
 
 test-deep-chains: $(TARGET) build
 	@set -e; \
