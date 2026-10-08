@@ -198,13 +198,12 @@ if [ "$mode" != "--force" ] && [ -f "$BC_OUT" ] && [ -f "$BC_INLINE" ] && [ -f "
   exit 0    # fresh — nothing to do
 fi
 
-# HOT/OWNER SPLIT. Both bitcodes are compiled -DKAI_HOT_ONLY: clang -O2
-# hoists the thread pointer across swapcontext, which is unsound for a fiber
-# work-stolen onto another OS thread (see runtime_llvm.c's header note). Under
-# KAI_HOT_ONLY this TU exposes ONLY the leaf value/RC/arithmetic ops that never
-# reach swapcontext — safe to inline. The scheduler + everything that suspends
-# a fiber comes from the cc-compiled runtime OWNER object (gcc keeps the thread
-# pointer honest), linked by bin/kai on both native paths. Because main + the
+# HOT/OWNER SPLIT. Both bitcodes are compiled -DKAI_HOT_ONLY: they are merged
+# into emitted frames that span parks (see runtime_llvm.c's header note), so
+# under KAI_HOT_ONLY this TU exposes ONLY the leaf value/RC/arithmetic ops that
+# never reach swapcontext — safe to inline. The scheduler + everything that
+# suspends a fiber comes from the cc-compiled runtime OWNER object, linked by
+# bin/kai on both native paths. Because main + the
 # scheduler are now owner-only, the hot bitcode carries no internal runtime
 # state either, so both twins compile with KAI_SEPARATE_COMPILATION (state
 # `external`, owner-defined).

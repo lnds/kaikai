@@ -91,12 +91,11 @@ trap 'rm -rf "$WORK"' EXIT
 # object references main, the singletons, the scheduler, and every non-leaf
 # kaix_* as external — they come from the cc-compiled runtime OWNER object
 # (KAI_RUNTIME_OWNER), exactly as bin/kai's native link resolves them. Compile
-# it ONCE here (not per fixture). -O0 so the scheduler's swapcontext-crossing
-# code is not thread-pointer-hoisted under clang (issue #1234).
+# it ONCE here (not per fixture).
 OWNER_O=""
 if [ -n "$RUNTIME_LLVM_BC" ]; then
   OWNER_O="$WORK/native-parity-owner.o"
-  "$CC" -std=c99 -Wno-unused-function -O0 \
+  "$CC" -std=c99 -Wno-unused-function -O2 \
     -DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 \
     -I "$ROOT/stage2" -I "$ROOT/stage0" -c "$RUNTIME_LLVM_C" -o "$OWNER_O" \
     || { echo "test-native-parity FAIL — runtime owner object build failed"; exit 1; }

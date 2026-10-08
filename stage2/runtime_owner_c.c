@@ -1,13 +1,10 @@
-/* Runtime owner object for the C backend (issue #1238).
+/* Runtime owner object for the C backend.
  *
  * The default C backend emits a self-contained `.c` that #includes runtime.h
- * and calls the runtime's scheduler ops by name. Those ops must NOT compile
- * inline at -O2 into the program TU: clang -O1+ caches the thread pointer
- * across swapcontext, so a fiber work-stolen onto another OS thread reads the
- * creator thread's _Thread_local scheduler state (the C residual of #1234).
- * Instead the program references them external (KAI_SCHED_FN under separate
- * compilation) and this owner — compiled by cc at -O0 (KAI_RUNTIME_OWNER_OPT) —
- * provides them, where the thread pointer stays honest across every switch.
+ * and calls the runtime's scheduler ops by name. The program references them
+ * external (KAI_SCHED_FN under separate compilation) and this owner provides
+ * them, together with the scheduler's state and its one thread-local reader,
+ * kai_worker_here.
  *
  * This is deliberately NOT stage0/runtime_llvm.c (the NATIVE owner): that file
  * carries native-only baggage the C path does not want — the kaix_* ABI, an

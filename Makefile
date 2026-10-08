@@ -837,8 +837,11 @@ test-walker-catchall-audit:
 # proves no function IN the hot bitcode reaches swapcontext; this proves no
 # thread-local address is materialised by a function the optimiser can fold
 # into an emitted kaikai frame, whose activation does span a park and can
-# resume on another OS thread. `--self-test` is hermetic — hand-written IR, no
-# compiler — so the discriminator is gated on hosts where P2 is opted out too.
+# resume on another OS thread. `--owner` checks the runtime owner at its own
+# optimisation level: no function that materialises a thread-local can switch
+# context, and the scheduler's thread-local is read by kai_worker_here alone.
+# `--self-test` is hermetic — hand-written IR, no compiler — so both
+# discriminators are gated on hosts where P2 is opted out too.
 #
 # The generator runs in the middle deliberately. It is a no-op when the .bc is
 # fresh and a clean exit when there is no clang 18, but when the gate rejects
@@ -848,6 +851,7 @@ test-tls-hoist-gate:
 	@./tools/tls-hoist-gate.sh --self-test
 	@./tools/gen-runtime-bc.sh
 	@./tools/tls-hoist-gate.sh
+	@./tools/tls-hoist-gate.sh --owner
 
 # `kai fmt` fixture suite. Verifies that every fixture in
 # examples/fmt/ formats to its `.expected.kai` and is idempotent,

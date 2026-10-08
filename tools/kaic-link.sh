@@ -49,13 +49,11 @@ compile_tu() {
   echo "$src" >> compiled
 }
 
-# The owner holds the scheduler ops, which must not be optimised across a
-# context switch.
 if [ "${1:-}" = --tu ]; then
   cd "$KL_DIR"
   sep=-DKAI_SEPARATE_COMPILATION=1
   case "${2#./}" in
-    runtime_owner_c.c) compile_tu "${2#./}" -O0 "$sep" -DKAI_RUNTIME_OWNER=1 -DKAI_PROGRAM_PROVIDES_MAIN=1 ;;
+    runtime_owner_c.c) compile_tu "${2#./}" "$sep" -DKAI_RUNTIME_OWNER=1 -DKAI_PROGRAM_PROVIDES_MAIN=1 ;;
     *)                 compile_tu "${2#./}" "$sep" ;;
   esac
   exit

@@ -1,23 +1,22 @@
 #!/usr/bin/env bash
-# M:N C-backend soundness gate under clang (issue #1238, the C residual of
-# #1234). The work-stealing miscompile is a clang codegen bug: clang -O1+ caches
-# the thread pointer across swapcontext, so a fiber work-stolen onto another OS
-# thread reads the creator thread's _Thread_local scheduler state. The NATIVE
-# path (P2 bitcode) was closed by #1234; the C backend hits the SAME bug when
-# its runtime is compiled by clang -O2 — which the native gate never exercises
-# (it runs --backend=native only, and the default cc on CI/Docker is gcc, sound).
+# M:N C-backend soundness gate under clang. clang -O1+ treats a thread-local's
+# address as constant for a whole function activation and may keep it across
+# swapcontext, so a function that holds one across a park reads the wrong
+# thread's state once a work-stealer resumes its fiber elsewhere. The runtime
+# reaches scheduler state through kai_worker_here and the running fiber, never
+# through a thread-local held across a switch; this gate exercises that under
+# an optimised clang build of every shape the C backend links.
 #
-# This gate builds the cross-thread stress fixture on the C backend under clang
-# (the two `bin/kai` link shapes plus the raw single-TU one) and loops it at
-# KAI_THREADS=4/8. The fix compiles the scheduler as a separate -O0 owner
-# object; a regression (owner inlined at -O2, or a new parking op missing its
-# KAI_SCHED_FN gate) crashes within a few dozen runs.
+# It builds the cross-thread stress fixture on the C backend under clang (the
+# two `bin/kai` link shapes, each with the -O2 runtime owner, plus the raw
+# single-TU -O2 one) and loops it at KAI_THREADS=4/8. A function that keeps a
+# thread-local across a park crashes within a few dozen runs.
 #
 # Both observation conditions matter and neither is incidental: stdout is
 # redirected to a FILE (command substitution is a pipe, and pipe buffering
-# closes the race window outright), and the single-TU -O2 arm builds without
-# the owner split, which is the path the stage2 Makefile recipes take and the
-# only one where these races are reachable.
+# closes the race window outright), and the single-TU -O2 arm compiles the
+# scheduler into the program's own frames, the path the stage2 Makefile
+# recipes take.
 #
 # Needs a clang. Resolves one in PATH order; SKIPs cleanly if none is found (a
 # gcc-only host cannot reproduce the bug and has nothing to gate).
@@ -60,8 +59,8 @@ echo "run-mn-c-clang-soundness: using CC=$CLANG"
 fail=0
 
 # Build arms. The first two go through `bin/kai`, which routes the scheduler
-# into the -O0 owner object; the third compiles the emitted C as one TU at -O2
-# with no owner, which is what the stage2 Makefile recipes do.
+# into the runtime owner object; the third compiles the emitted C as one TU at
+# -O2 with no owner, which is what the stage2 Makefile recipes do.
 build_kai_single_tu() { CC="$CLANG" "$KAI" build --backend=c "$FIXTURE" -o "$1"; }
 build_kai_modular()   { CC="$CLANG" KAI_MODULAR=1 "$KAI" build --backend=c "$FIXTURE" -o "$1"; }
 build_raw_single_tu() { CC="$CLANG" kai_build_single_tu "$FIXTURE" "$1"; }
