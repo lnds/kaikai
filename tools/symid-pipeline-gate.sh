@@ -403,4 +403,29 @@ out=$(grep -rlE '(^|[^a-z_])var |with (State|Reader)' "$ROOT/examples" --include
       "$ROOT/stage2/kaic2" "$(cat "$ROOT/EDITION")" "$ROOT/stdlib")
 [ -z "$out" ] || fail "a corpus perform reached KIR with no effect id"
 
-echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, a qualified call names the one its qualifier homes, a constructor site, nested or not, names the home its type picked, a capability spelled like a core type names its effect, a specialised callee is always its spec's id, and every cell perform names the core State or Reader"
+# Every written type name the passes after the typer read carries the
+# declaration it denotes (`--check-type-ids` fails on one that does not),
+# over the compiler itself and every collision fixture, and a warm build
+# stamps exactly the identities a cold one does.
+out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --check-type-ids "$ROOT/stage2/main.kai" 2>&1 >/dev/null) \
+  || fail "the compiler's own written types reach the late passes without their declarations' ids"
+out=$(find "$ROOT/examples/namespace-collisions" -name main.kai | grep -v /neg | xargs -P 8 -n 1 sh -c \
+  '"$0" --edition "$1" --check-type-ids --path "$(dirname "$3")" --path "$2" "$3" 2>&1 >/dev/null | grep "^unstamped" | sed "s|^|$3: |"; exit 0' \
+  "$ROOT/stage2/kaic2" "$(cat "$ROOT/EDITION")" "$ROOT/stdlib")
+[ -z "$out" ] || fail "a collision fixture's written types reach the late passes without their declarations' ids"
+STAMPFIX="$ROOT/examples/namespace-collisions/green_type_homonym"
+STAMPCACHE="$(mktemp -d)"
+trap 'rm -rf "$CACHE" "$TWIN" "$CUTCACHE" "$STAMPCACHE"' EXIT
+stamp_ids() {
+  "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --user-cache --user-cache-dir "$STAMPCACHE" \
+    --core-cache-dir "$STAMPCACHE" --check-type-ids --path "$STAMPFIX" --path "$ROOT/stdlib" "$STAMPFIX/main.kai" 2>&1 >/dev/null
+  "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --user-cache --user-cache-dir "$STAMPCACHE" \
+    --core-cache-dir "$STAMPCACHE" --dump-tycon-ids --path "$STAMPFIX" --path "$ROOT/stdlib" "$STAMPFIX/main.kai"
+}
+stamp_cold=$(stamp_ids)
+stamp_warm=$(stamp_ids)
+out=$(printf 'cold:\n%s\nwarm:\n%s\n' "$stamp_cold" "$stamp_warm")
+printf '%s\n' "$stamp_cold$stamp_warm" | grep -q '^unstamped' && fail "a contested type reaches the late passes without its declaration's id"
+[ "$stamp_cold" = "$stamp_warm" ] || fail "a warm build stamps written types differently from a cold one"
+
+echo "symid-pipeline OK — unbox and perceus read the resolved ids, KPerform carries the effect's, two homonymous effects carry two ids, declarations keep their ids through a warm cache and across programs, every way of writing an op — row alias, effect, capability parameter, named instance — carries one id, root calls reach root declarations, each specialisation is its generic's id plus its own instance, a callee's signature class is its own declaration's, a UFCS callee names the declaration its receiver picked, a qualified call names the one its qualifier homes, a constructor site, nested or not, names the home its type picked, a capability spelled like a core type names its effect, a specialised callee is always its spec's id, and every cell perform names the core State or Reader, and every written type name the late passes read carries its declaration's id, cold and warm"
