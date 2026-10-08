@@ -505,14 +505,17 @@ test-dump-last-use: $(TARGET) build
 	  || { echo "dump-last-use DIFF last_use_loop_body"; diff ../examples/perceus/last_use_loop_body.out.expected build/last_use_loop_body.out; exit 1; }
 
 # Each nominal type names its own declaration: a root `Pair` and
-# `core.tuple.Pair` of the same arity print distinct identities.
+# `core.tuple.Pair` of the same arity print distinct identities, and tuple
+# sugar or a qualified `tuple.Pair` names the core one beside a root homonym.
 test-tycon-ids: $(TARGET) build
 	@set -e; \
-	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --dump-tycon-ids ../examples/type-identity/tycon_ids_pair.kai 2> build/tycon_ids_pair.err \
-	  > build/tycon_ids_pair.out || true; \
-	diff -q ../examples/type-identity/tycon_ids_pair.ids.expected build/tycon_ids_pair.out > /dev/null \
-	  && echo "tycon-ids OK tycon_ids_pair (each nominal type names its declaration)" \
-	  || { echo "tycon-ids DIFF tycon_ids_pair"; diff ../examples/type-identity/tycon_ids_pair.ids.expected build/tycon_ids_pair.out; exit 1; }
+	for f in tycon_ids_pair tycon_ids_tuple_homonym tycon_ids_tuple_record_homonym; do \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --dump-tycon-ids ../examples/type-identity/$$f.kai 2> build/$$f.err \
+	    > build/$$f.out || true; \
+	  diff -q ../examples/type-identity/$$f.ids.expected build/$$f.out > /dev/null \
+	    && echo "tycon-ids OK $$f (each nominal type names its declaration)" \
+	    || { echo "tycon-ids DIFF $$f"; diff ../examples/type-identity/$$f.ids.expected build/$$f.out; exit 1; }; \
+	done
 
 # Phase 1.B.1 — cons-head borrow-safe classifier (--dump-borrowsafe).
 # Pins the four discriminating shapes: sum_sq/bump raw (head only read
