@@ -42,6 +42,7 @@ SRC="$ROOT/stage2/compiler"
 #                      the declaration did not exist to be resolved.
 #   fwd_inline,      — mint a primitive or a binder they just bound.
 #   bang_hoist,
+#   deep_hoist,
 #   range_patterns,
 #   closure_spec_ast,
 #   closure_spec_emit
@@ -60,7 +61,7 @@ ALLOW="$ALLOW|closure_spec_ast|closure_spec_emit|sym_read"
 ALLOW="$ALLOW|emit_tcrec_live|cache_delta_test|resolve_sym_test"
 ALLOW="$ALLOW|perceus|perceus_plant_drop|perceus_tail_drop|perceus_owned_pos"
 ALLOW="$ALLOW|perceus_payer|unbox|unbox_native_raw|cell_promote"
-ALLOW="$ALLOW|perceus_branch_plant|index_coll|range_patterns|bang_hoist|refine_coerce"
+ALLOW="$ALLOW|perceus_branch_plant|index_coll|range_patterns|bang_hoist|deep_hoist|refine_coerce"
 
 # Passes at or below the erasure. `EVar` is their correct form: the name
 # is a C symbol there, and `sym_erase` is what put it back.
