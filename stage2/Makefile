@@ -1782,18 +1782,22 @@ test-modules-const-export-native: $(TARGET) build
 test-deep-chains-native: $(TARGET) build
 	@set -e; \
 	work=build/deep-chains-native; rm -rf $$work; mkdir -p $$work; \
+	gen=build/deep-gen; mkdir -p $$gen; \
+	sh ../tools/deep-match-fixture.sh 255 > $$gen/deep_value_match.kai; \
+	printf 'zero\ndeep\n' > $$gen/deep_value_match.out.expected; \
 	for name in $(DEEP_CHAIN_FIXTURES); do \
-	  cp ../examples/runtime/$$name.kai $$work/; \
+	  src=../examples/runtime; [ -f $$src/$$name.kai ] || src=$$gen; \
+	  cp $$src/$$name.kai $$work/; \
 	  $(KAIC2) --emit=native --path ../stdlib $$work/$$name.kai > /dev/null 2> $$work/$$name.err \
 	    || { echo "deep-chains-native FAIL ($$name: emit)"; cat $$work/$$name.err; exit 1; }; \
 	  $(CC) $(CFLAGS) $(LDFLAGS_STACK) $$work/$$name.o ../stage0/runtime_llvm.c -I ../stage2 -I ../stage0 \
 	    -o $$work/$$name $(LDLIBS_M) -ldl \
 	    || { echo "deep-chains-native FAIL ($$name: link)"; exit 1; }; \
 	  ./$$work/$$name > $$work/$$name.out; \
-	  diff -q ../examples/runtime/$$name.out.expected $$work/$$name.out > /dev/null \
-	    || { echo "deep-chains-native DIFF ($$name)"; diff ../examples/runtime/$$name.out.expected $$work/$$name.out; exit 1; }; \
+	  diff -q $$src/$$name.out.expected $$work/$$name.out > /dev/null \
+	    || { echo "deep-chains-native DIFF ($$name)"; diff $$src/$$name.out.expected $$work/$$name.out; exit 1; }; \
 	done; \
-	echo "deep-chains-native OK (call, operator and pipe chains 200 deep)"
+	echo "deep-chains-native OK (chains and nested values at the parser's depth)"
 else
 test-native-modular:
 	@echo "native-modular SKIP (C-only build; native backend not compiled)"
@@ -2620,21 +2624,26 @@ test-free-deep: $(TARGET) build
 	  echo "free-deep OK (KAI_THREADS=$$n: 1M-deep structure freed)"; \
 	done
 
-# Call, operator and pipe chains 200 deep: the emitted C stays within the
-# compiler's bracket limit (clang stops at 256 nested parentheses).
-DEEP_CHAIN_FIXTURES := deep_chain_call deep_chain_binop deep_chain_pipe
+# Operand chains and nested blocks, matches, conditionals, lists and tuples
+# as deep as the parser accepts: the emitted C stays within clang's 256 brackets.
+DEEP_CHAIN_FIXTURES := deep_chain_call deep_chain_binop deep_chain_pipe \
+	deep_value_let deep_value_match deep_value_if deep_value_list deep_value_tuple
 
 test-deep-chains: $(TARGET) build
 	@set -e; \
+	gen=build/deep-gen; mkdir -p $$gen; \
+	sh ../tools/deep-match-fixture.sh 255 > $$gen/deep_value_match.kai; \
+	printf 'zero\ndeep\n' > $$gen/deep_value_match.out.expected; \
 	for name in $(DEEP_CHAIN_FIXTURES); do \
-	  $(KAIC2) --path ../stdlib ../examples/runtime/$$name.kai > build/s2-$$name.c; \
+	  src=../examples/runtime; [ -f $$src/$$name.kai ] || src=$$gen; \
+	  $(KAIC2) --path ../stdlib $$src/$$name.kai > build/s2-$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M) \
 	    || { echo "deep-chains FAIL ($$name: C compile)"; exit 1; }; \
 	  ./build/s2-$$name > build/s2-$$name.out; \
-	  diff -q ../examples/runtime/$$name.out.expected build/s2-$$name.out > /dev/null \
-	    || { echo "deep-chains DIFF ($$name)"; diff ../examples/runtime/$$name.out.expected build/s2-$$name.out; exit 1; }; \
+	  diff -q $$src/$$name.out.expected build/s2-$$name.out > /dev/null \
+	    || { echo "deep-chains DIFF ($$name)"; diff $$src/$$name.out.expected build/s2-$$name.out; exit 1; }; \
 	done; \
-	echo "deep-chains OK (call, operator and pipe chains 200 deep compile and run)"
+	echo "deep-chains OK (chains and nested values at the parser's depth compile and run)"
 
 # Constructor values nested 24 deep. The compile is bounded: emitting a
 # constructor's arguments twice per level makes it exponential in the depth.

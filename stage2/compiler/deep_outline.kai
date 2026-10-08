@@ -1,0 +1,101 @@
+#[doc("""
+Estimates how deep the C backend nests an expression, and moves a branch
+that would nest too deep into a function of its own.
+
+A `match`, an `if` or a block spells its arms, branches and statements
+inside the C expression that holds it, so nested conditionals nest the
+output as deep as the source. No binding can lift a branch out without
+running it unconditionally; wrapping it in a closure applied on the spot
+keeps when it runs and starts the C nesting afresh in the closure's own
+function.
+""")]
+
+import compiler.ast
+import compiler.expr_exists
+import compiler.expr_positions
+
+#[doc("The estimated C nesting below which a branch stays where it is written.")]
+pub fn do_budget() : Int = 140
+
+#[doc("The estimated C nesting of `e`: brackets per level by form, a lambda body counted apart.")]
+pub fn do_depth(e: Expr) : Int = match e.kind {
+  ELambda(_, _)    -> 1
+  ECall(f, xs)     -> 1 + do_deeper(do_depth(f), do_deepest_of(xs, 0))
+  EBinop(_, a, b)  -> 3 + do_deeper(do_depth(a), do_depth(b))
+  EUnop(_, a)      -> 2 + do_depth(a)
+  EField(a, _)     -> 2 + do_depth(a)
+  _                -> do_depth_branching(e)
+}
+
+# The conditionals and blocks every body is made of, walked in place.
+fn do_depth_branching(e: Expr) : Int = match e.kind {
+  EMatch(s, arms)     -> 3 + do_deeper(do_depth(s), do_deepest_arm(arms, 0))
+  EIf(c, t, eo)       -> 1 + do_deeper(do_deeper(do_depth(c), do_depth(t)), do_depth_opt(eo))
+  EBlock(stmts, tail) -> 1 + do_deeper(do_deepest_at(stmts, 0), do_depth_opt(tail))
+  _                   -> 1 + do_deepest(xp_positions(e), 0)
+}
+
+fn do_depth_opt(eo: Option[Expr]) : Int = match eo {
+  Some(x) -> do_depth(x)
+  None    -> 0
+}
+
+fn do_deepest_arm(arms: [Arm], acc: Int) : Int = match arms {
+  []                      -> acc
+  [Arm(_, g, b), ...rest] -> do_deepest_arm(rest, do_deeper(do_deeper(do_depth_opt(g), do_depth(b)), acc))
+}
+
+fn do_deepest_at(stmts: [Stmt], acc: Int) : Int = match stmts {
+  []           -> acc
+  [s, ...rest] -> do_deepest_at(rest, do_deeper(do_stmt_depth(s), acc))
+}
+
+fn do_stmt_depth(s: Stmt) : Int = match s {
+  SLet(_, _, x)               -> do_depth(x)
+  SVar(_, _, x, _, _)         -> do_depth(x)
+  SExprStmt(x)                -> do_depth(x)
+  SAssert(c, om)              -> do_deeper(do_depth(c), do_depth_opt(om))
+  SIndexAssign(a, i, v, _, _) -> do_deeper(do_depth(a), do_deeper(do_depth(i), do_depth(v)))
+  SAssign(a, v, _, _)         -> do_deeper(do_depth(a), do_depth(v))
+  SUse(_, _, _)               -> 0
+}
+
+fn do_deeper(a: Int, b: Int) : Int = if a > b { a } else { b }
+
+fn do_deepest_of(xs: [Expr], acc: Int) : Int = match xs {
+  []           -> acc
+  [x, ...rest] -> do_deepest_of(rest, do_deeper(do_depth(x), acc))
+}
+
+fn do_deepest(ps: [XPos], acc: Int) : Int = match ps {
+  []                  -> acc
+  [XP(_, c), ...rest] -> do_deepest(rest, do_deeper(do_depth(c), acc))
+}
+
+#[doc("Whether any function in `body` may have a branch outlined: one holding a handler or a `var` keeps every branch in its own frame.")]
+pub fn do_outlines_in(body: Expr) : Bool = not xp_exists(body, false, do_is_handle)
+
+fn do_is_handle(e: Expr) : Bool = match e.kind {
+  EHandle(_, _, _, _, _, _, _, _) -> true
+  _                               -> false
+}
+
+#[doc("`branch` as an immediately applied closure when the node holding it, `weight` brackets deep, would push it past the budget; as written otherwise.")]
+pub fn do_branch(fname: String, weight: Int, branch: Expr) : Expr =
+  if weight + do_depth(branch) <= do_budget() or do_pinned(fname, branch) { branch }
+  else {
+    let thunk = mk_expr(ELambda([], branch), branch.line, branch.col)
+    mk_expr(ECall(thunk, []), branch.line, branch.col)
+  }
+
+# A branch that must run in the frame it is written in: an early return, a
+# `resume`, a call back into the enclosing function (a closure would turn its
+# tail call into a plain one), or a region or nursery boundary.
+fn do_pinned(fname: String, branch: Expr) : Bool = xp_exists(branch, false, (x) => do_pins(fname, x))
+
+fn do_pins(fname: String, x: Expr) : Bool = match x.kind {
+  EBang(_)        -> true
+  EVar(n)         -> n == fname or n == "resume" or n == "region" or n == "nursery"
+  ESym(_, _, n)   -> n == fname or n == "resume" or n == "region" or n == "nursery"
+  _               -> false
+}
