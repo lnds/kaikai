@@ -387,7 +387,7 @@ cell_core() {
   return 0
 }
 out=$(cell_dump cell_perform_ids)
-need '^kperform _kaiu_stacked__clause_[0-9_]+_push State\.[a-z]+#[0-9]+ State@concurrent$'
+need '^kperform _kaiu_stacked__clause_[0-9_]+_push State\.[a-z]+@xs#[0-9]+ State@concurrent$'
 need '^kperform reads Reader\.ask@env#[0-9]+ Reader@concurrent$'
 need '^kperform _kaiu_lam_reads_[0-9_]+ Reader\.ask@env#[0-9]+ Reader@concurrent$'
 cell_core cell_perform_ids

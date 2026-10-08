@@ -7634,11 +7634,7 @@ fn st_set_row(st: InferState, new_row: [Label]) : InferState =
                ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, refine_ctx: st.refine_ctx, home: st.home, row_tails: st.row_tails, sig_rows: st.sig_rows }
 
 # push/pop the alias stack as we enter/leave a handle's body.
-# a freshly-pushed alias starts taggable; descending into a
-# lambda body marks every alias visible at that point as
-# non-taggable so try_op_call's alias-fallback emits a bare
-# dispatch key (no `@<alias>` suffix) and codegen falls back to
-# the legacy name-keyed lookup.
+# A freshly-pushed alias starts taggable.
 fn st_push_alias(st: InferState, alias: String, eff: String, esym: SymId) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
@@ -7762,21 +7758,20 @@ fn lookup_alias_taggable(aliases: [AliasBinding], name: String) : Option[Bool] {
   }
 }
 
-# mark every alias currently in scope as non-taggable.
-# Called from synth_lambda before walking the body and reverted
-# afterwards via the standard `st_restore_entries` snapshot.
-fn aliases_disable_tag(aliases: [AliasBinding]) : [AliasBinding] {
+# A clause body is its own function: a cell alias's handler id rides the
+# handler env into it and keeps its tag; a capability alias drops it.
+fn aliases_clause_tags(aliases: [AliasBinding]) : [AliasBinding] {
   match aliases {
     [] -> []
-    [AB(a, e, _, s), ...rest] -> [AB(a, e, false, s), ...aliases_disable_tag(rest)]
+    [AB(a, e, t, s), ...rest] -> [AB(a, e, t and eff_is_cell_effect(e), s), ...aliases_clause_tags(rest)]
   }
 }
 
-fn st_disable_alias_tag(st: InferState) : InferState =
+fn st_clause_alias_tags(st: InferState) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses,
-               aliases: aliases_disable_tag(st.aliases),
+               aliases: aliases_clause_tags(st.aliases),
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
                ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, refine_ctx: st.refine_ctx, home: st.home, row_tails: st.row_tails, sig_rows: st.sig_rows }
 
@@ -9086,12 +9081,7 @@ fn check_return_clause_opt(st: InferState, ret_opt: Option[HReturn],
         let sty = match state_ty { Some(t) -> t None -> TyAny }
         let env2 = if stateful { add_state_aliases(env1, st.env, sty) } else { env1 }
         let st1 = st_set_env(st, env2)
-        # (Option A): same alias-tag boundary as the
-        # op clauses — the return clause also compiles to a
-        # separate C function with no access to outer
-        # `kai_alias_<a>_id` C locals.
-        let st1_no_tag = st_disable_alias_tag(st1)
-        let rr = synth(st1_no_tag, rexpr)
+        let rr = synth(st_clause_alias_tags(st1), rexpr)
         let st_out = st_restore_entries(outer, rr.st)
         let ty = apply_ty(st_out.sub, rr.ty)
         RetTyped { st: st_out, ty: ty, ret_opt: Some(HR(pname, rr.expr, line, col)) }
@@ -9166,17 +9156,7 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
             None -> st_env
           }
         } else { st_env }
-        # (Option A): a clause body compiles to a
-        # separate C function and `filter_clause_captures` strips
-        # the `__alias_id__<a>` sentinels that would otherwise
-        # thread an outer-bound capability's handler id into the
-        # clause env. Disable alias tagging across the clause
-        # body so op calls on those caps emit a bare dispatch key
-        # (legacy name-keyed lookup) instead of the tagged form
-        # that requires a `kai_alias_<a>_id` C local that is not
-        # in scope here. Same boundary the rewrite-pass enforces
-        # in `rewrite_alias_clause`.
-        let st_clause_in = st_set_in_clause(st_disable_alias_tag(st_resume), clause_cont_of(params))
+        let st_clause_in = st_set_in_clause(st_clause_alias_tags(st_resume), clause_cont_of(params))
         let rb = synth(st_clause_in, body)
         let st_res = st_unify(rb.st, result_ty, rb.ty, "handler clause result", line, col)
         let st_esc = check_op_tparam_escape(st_res, bind_res.op_rigid, fresh_before,
@@ -9224,10 +9204,7 @@ fn check_finally_clause(st: InferState, name: String, params: [Param], body: Exp
   let outer = st_arity
   let sty = match state_ty { Some(t) -> t None -> TyAny }
   let env1 = if stateful { add_state_aliases(outer.env, outer.env, sty) } else { outer.env }
-  # Same alias-tag boundary as the op and return clauses: the body
-  # compiles to its own C function with no access to outer
-  # `kai_alias_<a>_id` locals.
-  let rb = synth(st_disable_alias_tag(st_set_env(outer, env1)), body)
+  let rb = synth(st_clause_alias_tags(st_set_env(outer, env1)), body)
   let st_out = st_restore_entries(outer, rb.st)
   ClauseTyped1 { st: st_out, clause: HC(name, params, rb.expr, line, col) }
 }
