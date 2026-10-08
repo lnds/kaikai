@@ -84,6 +84,30 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.139.0 (2026-10-08)
+
+### BREAKING CHANGE
+
+- tuple sugar `(a, b)` and its patterns always mean the
+core tuple type; a file that declares its own `Pair` and passes it where
+tuple sugar is expected must annotate explicitly or drop its declaration.
+
+### Added
+
+- **effects**: stateful segment handles, k(v, s) (#2634)
+- **effects**: effectful segment bodies, Cont[T, S, e] (#2633)
+
+### Fixed
+
+- **runtime**: reach scheduler state through the running fiber's worker (#2631)
+- **compiler**: tuple sugar and a qualified type name the core declaration beside a root homonym (#2628)
+
+### Changed
+
+- **native**: resolve runtime helpers from the owner instead of re-codegenning them per partition (#2635)
+- **runtime**: compile the runtime owner at -O2, gated on its thread-locals (#2632)
+- **compiler**: decide TyCon readers by identity (#2630)
+
 ## v0.138.0 (2026-10-08)
 
 ### BREAKING CHANGE
