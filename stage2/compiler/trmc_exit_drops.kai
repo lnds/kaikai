@@ -7,8 +7,9 @@ that wrap to expose the modulo-cons ctor, so the drops move into each leaf of
 the rewritten INNER. Both backends evaluate a step's ctor heads, then the
 self-call's arguments, in order. A step binds the drops around the rightmost
 boxed operand at or after the last read of a dropped binder, or around the
-raw operand holding that read when no boxed one follows it. An apply leaf
-binds them around its whole value.
+raw operand holding that read when no boxed one follows it. A bare self-call
+that loops places them the same way among its args. An apply leaf binds them
+around its whole value.
 
 A binder passed bare into the self-call keeps its reference: that slot may
 only borrow it. A Perceus reuse rebuild keeps no drops, since the native
@@ -23,14 +24,13 @@ import compiler.perceus_plant_drop
 
 #[doc("The drops a Perceus arm-ret wrap runs after its value; `[]` when `e` is no such wrap or holds anything but drops.")]
 pub fn txd_wrap_drops(e: Expr) : [Stmt] = match e.kind {
-  EBlock(stmts, opt_tail) -> match opt_tail {
-    Some(t) -> match t.kind {
-      EVar(tn) -> if txd_is_ret_name(tn) { txd_only_drops(txd_after_let(stmts, tn)) } else { [] }
-      _        -> []
-    }
-    None -> []
-  }
-  _ -> []
+  EBlock(stmts, Some(t)) -> txd_ret_drops(stmts, t.kind)
+  _                      -> []
+}
+
+fn txd_ret_drops(stmts: [Stmt], k: ExprKind) : [Stmt] = match k {
+  EVar(tn) -> if txd_is_ret_name(tn) { txd_only_drops(txd_after_let(stmts, tn)) } else { [] }
+  _        -> []
 }
 
 fn txd_is_ret_name(tn: String) : Bool = tn == "__pcs_arm_ret" or tn == "__pcs_block_ret"
@@ -75,7 +75,7 @@ fn txd_kind(k: ExprKind, drops: [Stmt], steps: Bool) : ExprKind = match k {
     None    -> k
   }
   ECall(f, xs) -> match f.kind {
-    EVar(callee)       -> if steps and es_trmc_is_step_sentinel(callee) { ECall(f, txd_step_args(xs, txd_hole(callee), drops)) } else { k }
+    EVar(callee)       -> if steps { txd_sentinel(f, callee, xs, drops) } else { k }
     EMark(MkTrmcApply) -> ECall(f, map(xs, (leaf) => txd_apply_leaf(leaf, drops)))
     _                  -> k
   }
@@ -127,6 +127,21 @@ fn txd_plant_step(xs: [Expr], hole: Int, se: Expr, sf: Expr, sa: [Expr], kept: [
   else {
     let se2 = Expr { kind: ECall(sf, txd_map_nth(sa, j - nh, wrap)), line: se.line, col: se.col, ty: se.ty, mode: se.mode }
     txd_map_nth(xs, hole, (_a: Expr) => se2)
+  }
+}
+
+fn txd_sentinel(f: Expr, callee: String, xs: [Expr], drops: [Stmt]) : ExprKind =
+  if es_trmc_is_step_sentinel(callee) { ECall(f, txd_step_args(xs, txd_hole(callee), drops)) }
+  else if es_tcrec_is_sentinel(callee) { txd_goto(f, xs, filter(drops, (d) => not txd_passed(d, xs))) }
+  else { ECall(f, xs) }
+
+# A self-call that loops leaves no value to release after, so its drops run
+# among its args like a step's; with no args they run before the jump.
+fn txd_goto(f: Expr, xs: [Expr], kept: [Stmt]) : ExprKind = match kept {
+  [] -> ECall(f, xs)
+  _  -> match xs {
+    [] -> EBlock(kept, Some(Expr { kind: ECall(f, xs), line: f.line, col: f.col, ty: f.ty, mode: f.mode }))
+    _  -> ECall(f, txd_map_nth(xs, txd_pick(xs, map(kept, txd_drop_binder)), (a: Expr) => ppd_bind_then(a, kept)))
   }
 }
 

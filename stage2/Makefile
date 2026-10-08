@@ -2284,20 +2284,12 @@ test-issue-668: $(TARGET) build
 	  && echo "issue-668 OK (map/filter/flat_map over 40K in fiber, O(1) stack)" \
 	  || { echo "issue-668 DIFF"; diff ../examples/effects/issue_668_map_large_in_fiber.out.expected build/s2-$$name.out; exit 1; }
 
-# TRMC for the BUILTIN cons (`[h, ...recur(t)]`). Before the fix the TRMC
-# rewrite only recognised a USER ctor, so the idiomatic list-build loop
-# grew one C frame per element and overran an 8 MB stack under 100K
-# elements (Tier-1 mandatory-TCO violation). The fixture builds a 1M-deep
-# list two ways — `build` (raw EList) and `map_inc` (perceus reuse-cons) —
-# and must NOT overflow. We (1) assert the C-text emitter planted the cons
-# TRMC goto-loop (a regression that stops the rewrite firing fails here,
-# not silently), then (2) link with an EXPLICIT 8 MB main-thread stack
-# (Darwin: the linked size IS the stack; Linux: the STACK prefix's
-# `ulimit -s 8192` constrains it) and run — a regression to per-element
-# recursion crashes with exit 139. C-backend only: LLVM/native lack cons-
-# TRMC lowering and fall back to ordinary recursion (a follow-up), so this
-# fixture is on the backend-parity skip list and the small-list value
-# guard examples/perceus/trmc_modcons_llvm.kai carries C<->LLVM parity.
+# TRMC for the builtin cons (`[h, ...recur(t)]`): a 1M-deep list built two
+# ways — `build` (raw list literal) and `map_inc` (Perceus reuse-cons) — must
+# not overflow. The check asserts the C emitter planted the goto-loop, then
+# runs under an explicit 8 MB stack (Darwin: the linked size; Linux:
+# `ulimit -s 8192`), where a per-element recursion crashes with exit 139.
+# The native backend runs the fixture through the backend-parity corpus.
 test-trmc-list-build: $(TARGET) build
 	@set -e; \
 	f=../examples/perceus/trmc_list_build_large.kai; \
@@ -2317,9 +2309,10 @@ test-trmc-list-build: $(TARGET) build
 	  && echo "trmc-list-build OK (1M-deep [h, ...recur(t)] build + map, O(1) stack)" \
 	  || { echo "trmc-list-build DIFF"; diff ../examples/perceus/trmc_list_build_large.out.expected build/s2-$$name.out; exit 1; }
 
-# A modulo-cons rebuild beside a branch that drops a dead binder still lowers
-# to a step: 1M-deep inputs overflow an 8 MB stack if either rebuild recurses.
-TRMC_DEAD_DROP_FIXTURES := trmc_dead_drop_deep_cons trmc_dead_drop_deep_ctor
+# A modulo-cons rebuild beside a branch that drops a dead binder, or that
+# skips with a bare self-call, still runs as a loop: 1M-deep inputs overflow
+# an 8 MB stack if either branch recurses.
+TRMC_DEAD_DROP_FIXTURES := trmc_dead_drop_deep_cons trmc_dead_drop_deep_ctor trmc_skip_branch_deep
 
 test-trmc-dead-drop-deep: $(TARGET) build
 	@set -e; \
