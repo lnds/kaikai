@@ -66,6 +66,29 @@ for input in "$ROOT"/examples/fmt/*.input.kai "$ROOT"/examples/fmt/width/*.input
   pass=$((pass + 1))
 done
 
+# Layout search must stay linear in nesting depth: a match nested 255
+# deep in its arms, written on one line, formats inside the budget and
+# is a fixed point. A search that re-renders each level per probe never
+# finishes here.
+deep="$tmp/deep_match.kai"
+{
+  printf 'fn pick(k: Int) : String =\n  '
+  i=0; while [ "$i" -lt 255 ]; do printf 'match k { 0 -> "zero"  _ -> '; i=$((i + 1)); done
+  printf '"deep"'
+  i=0; while [ "$i" -lt 255 ]; do printf ' }'; i=$((i + 1)); done
+  printf '\n'
+} > "$deep"
+if "$ROOT/tools/lib/timeout.sh" 30 "$KAIC2" $EDITION_FLAG --fmt "$deep" > "$tmp/deep1.kai" 2> "$tmp/err" \
+   && "$ROOT/tools/lib/timeout.sh" 30 "$KAIC2" $EDITION_FLAG --fmt "$tmp/deep1.kai" > "$tmp/deep2.kai" 2>> "$tmp/err" \
+   && cmp -s "$tmp/deep1.kai" "$tmp/deep2.kai"; then
+  echo "  OK   deep-match-255 (linear layout search, idempotent)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL deep-match-255 — fmt timed out, errored, or is not idempotent:"
+  sed 's/^/      /' "$tmp/err"
+  fail=$((fail + 1))
+fi
+
 # Roundtrip on the examples/minimal/ corpus: every file the formatter
 # accepts must produce output that parses back without error. Catches
 # silent grammar-side regressions like the (1..100) round-trip break.
