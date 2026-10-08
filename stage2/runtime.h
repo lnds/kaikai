@@ -3418,6 +3418,8 @@ struct KaiSegment {
 KAI_SCHED_FN void kai_seg_escape(KaiFiber *f, KaiEvidence *to, int trap) __attribute__((noreturn));
 /* The free arm of a KAI_CONT box. */
 KAI_SCHED_FN void kai_seg_cont_drop(KaiValue *box);
+/* Unmap this thread's pooled segments; a worker runs it before it exits. */
+KAI_SCHED_FN void kai_seg_pool_drain(void);
 
 /* Issue #959 — one open structured-concurrency scope. Children spawned
  * while this scope is the active fiber's `nursery_top` are pushed on
@@ -17652,6 +17654,7 @@ static void *kai_worker_thread_main(void *arg) {
     kai_sched_slots[kai_thread_id].live = 1;
     kai_rc_ledger_register();
     kai_worker_loop();
+    kai_seg_pool_drain();
     kai_rc_ledger_fold();
     return NULL;
 }
@@ -19107,6 +19110,13 @@ static KaiSegment *kai_seg_pool_take(void) {
     return seg;
 }
 
+static void kai_seg_unmap(KaiSegment *seg) {
+    munmap(seg->own.stack_base, seg->own.stack_size + kai_page_size());
+    free(seg->own.unw_buf);
+    free(seg->own.rframe_buf);
+    free(seg);
+}
+
 __attribute__((noinline))
 static void kai_seg_pool_put(KaiSegment *seg) {
     if (kai_seg_pool_n < KAI_SEG_POOL_MAX) {
@@ -19115,10 +19125,18 @@ static void kai_seg_pool_put(KaiSegment *seg) {
         kai_seg_pool_n++;
         return;
     }
-    munmap(seg->own.stack_base, seg->own.stack_size + kai_page_size());
-    free(seg->own.unw_buf);
-    free(seg->own.rframe_buf);
-    free(seg);
+    kai_seg_unmap(seg);
+}
+
+/* A segment released on another thread lands in that thread's pool, so a
+ * worker's pool can hold stacks it never mapped. */
+KAI_SCHED_FN void kai_seg_pool_drain(void) {
+    while (kai_seg_pool != NULL) {
+        KaiSegment *seg = kai_seg_pool;
+        kai_seg_pool = seg->pool_next;
+        kai_seg_unmap(seg);
+    }
+    kai_seg_pool_n = 0;
 }
 
 static void kai_seg_release(KaiSegment *seg) {
@@ -19370,6 +19388,7 @@ KAI_SCHED_FN KaiValue *kai_seg_resume(KaiValue *k, KaiValue *v, KaiValue **k_out
 }
 KAI_SCHED_FN void kai_seg_discontinue(KaiValue *k) { (void) k; kai_seg_unsupported(); }
 KAI_SCHED_FN void kai_seg_cont_drop(KaiValue *box) { (void) box; }
+KAI_SCHED_FN void kai_seg_pool_drain(void) {}
 KAI_SCHED_FN void kai_seg_escape(KaiFiber *f, KaiEvidence *to, int trap) {
     (void) f; (void) to; (void) trap; kai_seg_unsupported();
 }
