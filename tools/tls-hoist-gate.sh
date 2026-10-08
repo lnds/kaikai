@@ -176,6 +176,30 @@ owner_gate() {
   "$clang" "${common[@]}" "$ROOT/stage0/runtime_llvm.c" -o "$WORK/owner-native.ll" \
     || { echo "tls-hoist-gate: compiling the native owner failed" >&2; return 2; }
   owner_check "$OWNER_ALLOW" "$WORK/owner-c.ll" "$WORK/owner-native.ll"
+  owner_exports_check
+}
+
+ext_defs() {
+  awk '/^define / && !/ (internal|private|available_externally|linkonce|linkonce_odr|weak|weak_odr) / {
+    if (match($0, /@[A-Za-z0-9_.$]+\(/)) print substr($0, RSTART + 1, RLENGTH - 2)
+  }' "$1" | sort -u
+}
+
+# A native partition keeps the hot bitcode's external bodies only as
+# available_externally, so a call left out-of-line links against the owner:
+# every one of them must be an owner export.
+owner_exports_check() {
+  local bc="$ROOT/stage0/runtime_inline.bc" dis missing
+  [ -f "$bc" ] || return 0
+  dis="$(resolve_llvm_dis || true)"
+  [ -n "$dis" ] || { echo "tls-hoist-gate: WARNING — llvm-dis not found; owner exports NOT checked." >&2; return 0; }
+  "$dis" "$bc" -o "$WORK/inline.ll"
+  missing="$(comm -23 <(ext_defs "$WORK/inline.ll") <(ext_defs "$WORK/owner-native.ll"))"
+  if [ -n "$missing" ]; then
+    echo "tls-hoist-gate: the hot bitcode defines external functions the native owner does not export:" >&2
+    echo "$missing" | sed 's/^/  /' >&2
+    return 1
+  fi
 }
 
 if [ "$MODE" = "--self-test" ]; then self_test && owner_self_test; exit; fi

@@ -166,6 +166,19 @@ static void kai_exit(int code) {
 #  define KAI_SCHED_DECL_ONLY 0
 #endif
 
+/* Runtime helpers the owner exports and the hot bitcode defines external, so a
+ * native partition holds them only as `available_externally` inlining
+ * candidates and calls the owner's copy otherwise. Their bodies must not
+ * depend on KAI_HOT_ONLY or KAI_RUNTIME_OWNER: an inlined copy and the
+ * owner's must be the same function. Elsewhere they stay `static`. */
+#if defined(KAI_SEPARATE_COMPILATION) && (defined(KAI_RUNTIME_OWNER) || defined(KAI_HOT_ONLY))
+#  define KAI_RT_SHARED
+#  define KAI_RT_SHARED_INLINE extern inline
+#else
+#  define KAI_RT_SHARED static
+#  define KAI_RT_SHARED_INLINE static inline
+#endif
+
 /* Number of OS scheduler threads (M:N). Read once from KAI_THREADS at
  * startup (kai_sched_bootstrap), immutable after — published before any
  * worker spawns, so no lock. Class B. Declared here, ahead of the
@@ -493,7 +506,7 @@ static inline uint32_t kai_impl_hash(int32_t proto_id, int32_t op_id, int32_t he
 
 /* Lookup. Returns NULL when no impl is registered for the key.
  * The dispatcher panics on NULL with a meaningful message. */
-static inline void *kai_lookup_impl(int32_t proto_id, int32_t op_id, int32_t head_tag) {
+KAI_RT_SHARED_INLINE void *kai_lookup_impl(int32_t proto_id, int32_t op_id, int32_t head_tag) {
     if (kai_impl_cap == 0) return NULL;
     uint32_t mask = (uint32_t) (kai_impl_cap - 1);
     uint32_t i    = kai_impl_hash(proto_id, op_id, head_tag) & mask;
@@ -863,7 +876,7 @@ static inline int kai_int_fits_immediate(int64_t n) {
 
 /* kai_head_tag — single-dispatch protocol dispatch key for any value.
  * See docs/variant-tags.md "Head-type tags". O(1), cache-warm hot path. */
-static inline int32_t kai_head_tag(KaiValue *v) {
+KAI_RT_SHARED_INLINE int32_t kai_head_tag(KaiValue *v) {
     if (kai_is_value(v)) return KAI_HEAD_INT;   /* immediate small Int */
     if (v == NULL) return KAI_HEAD_ANON;
     switch ((KaiTag) v->tag) {
@@ -1017,11 +1030,11 @@ static inline void kai_rc_hot_live_inc(KaiRcHot *h) {
     if (++h->live_now > h->live_peak) h->live_peak = h->live_now;
 }
 
-__attribute__((noinline)) static void kai_rc_tls_alloc(int tag) { kai_rc_hot_alloc(&kai_rc_hot, tag); }
-__attribute__((noinline)) static void kai_rc_tls_free(void) { kai_rc_hot.free_total++; kai_rc_hot.live_now--; }
+__attribute__((noinline)) KAI_RT_SHARED void kai_rc_tls_alloc(int tag) { kai_rc_hot_alloc(&kai_rc_hot, tag); }
+__attribute__((noinline)) KAI_RT_SHARED void kai_rc_tls_free(void) { kai_rc_hot.free_total++; kai_rc_hot.live_now--; }
 __attribute__((noinline)) static void kai_rc_tls_live_inc(void) { kai_rc_hot_live_inc(&kai_rc_hot); }
 __attribute__((noinline)) static void kai_rc_tls_live_sub(int64_t n) { kai_rc_hot.live_now -= n; }
-__attribute__((noinline)) static void kai_rc_tls_reuse(void) { kai_rc_hot.reuse_total++; }
+__attribute__((noinline)) KAI_RT_SHARED void kai_rc_tls_reuse(void) { kai_rc_hot.reuse_total++; }
 
 /* Called on the only running thread, before it starts a second one. */
 __attribute__((noinline)) static void kai_rc_go_mt(void) {
@@ -2302,7 +2315,7 @@ static size_t kai_heap_limit(void) {
  * address inside this activation stops the optimiser from carrying it across a
  * park into a work-stolen frame, which would charge the wrong thread's ledger. */
 __attribute__((noinline))
-static void kai_heap_charge(size_t sz) {
+KAI_RT_SHARED void kai_heap_charge(size_t sz) {
     size_t limit = kai_heap_limit();
     if (limit && kai_heap_committed + sz > limit) {
         fprintf(stderr,
@@ -2459,12 +2472,12 @@ static inline int kai_slot_pool_ensure(int n) {
  * on whatever thread now runs. Each returns/takes only the value, never a slot
  * address, so nothing escapes the frame. */
 __attribute__((noinline))
-static KaiValue *kai_cell_pool_pop(void) {
+KAI_RT_SHARED KaiValue *kai_cell_pool_pop(void) {
     if (kai_cell_pool_n > 0) return kai_cell_pool[--kai_cell_pool_n];
     return NULL;
 }
 __attribute__((noinline))
-static int kai_cell_pool_push(KaiValue *v) {
+KAI_RT_SHARED int kai_cell_pool_push(KaiValue *v) {
     if (kai_cell_pool_n < KAI_CELL_POOL_CAP && kai_cell_pool_ensure()) {
         kai_cell_pool[kai_cell_pool_n++] = v;
         return 1;
@@ -2472,14 +2485,14 @@ static int kai_cell_pool_push(KaiValue *v) {
     return 0;
 }
 __attribute__((noinline))
-static KaiValue *kai_var_block_pool_pop(int n) {
+KAI_RT_SHARED KaiValue *kai_var_block_pool_pop(int n) {
     if (n < 0 || n > KAI_VAR_BLOCK_POOL_MAXN) return NULL;
     KaiValue *v = kai_var_block_free_head[n];
     if (v) kai_var_block_free_head[n] = *(KaiValue **) v;
     return v;
 }
 __attribute__((noinline))
-static void kai_var_block_pool_push(KaiValue *v, int n) {
+KAI_RT_SHARED void kai_var_block_pool_push(KaiValue *v, int n) {
     *(KaiValue **) v = kai_var_block_free_head[n];
     kai_var_block_free_head[n] = v;
 }
@@ -2542,7 +2555,7 @@ static KAI_TLS int    kai_slab_atexit = 0;
  * into a park-spanning frame the optimiser could carry it across the swap and
  * bump-allocate into, or free, the parking thread's slabs after a work-steal. */
 __attribute__((noinline))
-static void kai_slab_teardown(void) {
+KAI_RT_SHARED void kai_slab_teardown(void) {
     for (int i = 0; i < kai_slab_count; ++i) free(kai_slab_list[i]);
     free(kai_slab_list);
     kai_slab_list = NULL; kai_slab_count = 0; kai_slab_cap = 0;
@@ -2550,7 +2563,7 @@ static void kai_slab_teardown(void) {
 }
 
 __attribute__((noinline))
-static void *kai_slab_alloc(size_t sz) {
+KAI_RT_SHARED void *kai_slab_alloc(size_t sz) {
     sz = (sz + 7u) & ~(size_t) 7u;            /* 8-byte align */
     if (sz > KAI_SLAB_SIZE) return kai_heap_malloc(sz); /* oversized: standalone (never freed individually either) */
     if (!kai_slab_cur || kai_slab_off + sz > KAI_SLAB_SIZE) {
@@ -2608,7 +2621,7 @@ static KaiVarSlot *kai_slots_alloc(int n) {
 static void kai_slots_free(KaiVarSlot *slots, int n) { (void) n; free(slots); }
 #endif
 
-static KaiValue *kai_alloc(KaiTag tag) {
+KAI_RT_SHARED KaiValue *kai_alloc(KaiTag tag) {
 #endif
     KAI_PROF_ENTER();
 #ifdef KAI_CELL_POOL_ACTIVE
@@ -3037,7 +3050,7 @@ static inline void kai_rc_make_atomic(KaiValue *v) {
                           memory_order_relaxed);
 }
 
-static __attribute__((noinline, cold)) void kai_rc_overflow(const KaiValue *v) {
+KAI_RT_SHARED __attribute__((noinline, cold)) void kai_rc_overflow(const KaiValue *v) {
     fprintf(stderr, "kai: reference count overflow on a %s cell\n",
             v->tag == KAI_FIBER ? "fiber" : "heap");
     abort();
@@ -3045,7 +3058,7 @@ static __attribute__((noinline, cold)) void kai_rc_overflow(const KaiValue *v) {
 
 /* An atomic cell's increment, and the trap for a plain count about to
  * reach KAI_RC_SPECIAL. */
-static __attribute__((noinline)) KaiValue *kai_incref_special(KaiValue *v, int32_t r) {
+KAI_RT_SHARED __attribute__((noinline)) KaiValue *kai_incref_special(KaiValue *v, int32_t r) {
     if (r < KAI_RC_SPECIAL) kai_rc_overflow(v);
     if (atomic_fetch_add_explicit((_Atomic int32_t *) &v->rc, 1,
                                   memory_order_relaxed) >= INT32_MAX - 1)
@@ -3063,7 +3076,7 @@ static __attribute__((noinline)) KaiValue *kai_incref_special(KaiValue *v, int32
  * the old non-inline kai_decref). KAI_PROF_ENTER/EXIT dropped: they
  * bracketed a single increment and blocked the inline. Under tracing the
  * counters still fire. Koka's kk_block_dup is likewise inline. */
-static inline KaiValue *kai_incref(KaiValue *v) {
+KAI_RT_SHARED_INLINE KaiValue *kai_incref(KaiValue *v) {
     if (kai_is_value(v) || !v) return v;
     int32_t r = kai_rc_load(v);
     if (r >= KAI_RC_SPECIAL - 1) {
@@ -3085,7 +3098,7 @@ static inline KaiValue *kai_incref(KaiValue *v) {
 #endif
     return v;
 }
-static void       kai_decref(KaiValue *v);
+KAI_RT_SHARED void       kai_decref(KaiValue *v);
 
 /* m8 #1/#3: KaiFiber definitions sit here (before kai_free_value)
  * because KAI_FIBER values own their KaiFiber struct and the free
@@ -3685,7 +3698,7 @@ static inline void kai_worker_run(KaiWorker *w, KaiFiber *f) {
     w->active = f;
 }
 
-static void kai_evidence_unwind_all(void);
+KAI_RT_SHARED void kai_evidence_unwind_all(void);
 
 /* A trap leaves through the unwinder rather than a bare longjmp, so the
  * landing pads of the frames it crosses release their references. The
@@ -3705,7 +3718,7 @@ typedef struct {
 #define KAI_TRAP_EXCEPTION_CLASS 0x4b41490054524150ULL /* "KAI\0TRAP" */
 #define KAI_TRAP_UNWIND_ROOM     (16 * 1024)
 
-static _Unwind_Reason_Code kai_trap_stop(int version, _Unwind_Action actions,
+KAI_RT_SHARED _Unwind_Reason_Code kai_trap_stop(int version, _Unwind_Action actions,
                                          _Unwind_Exception_Class cls,
                                          struct _Unwind_Exception *ex,
                                          struct _Unwind_Context *ctx, void *arg) {
@@ -3732,7 +3745,7 @@ static int kai_trap_unwind_room(void *base) {
 }
 
 __attribute__((noreturn, noinline))
-static void kai_trap_unwind(uintptr_t frame, void *stack_base, void (*land)(void *), void *arg) {
+KAI_RT_SHARED void kai_trap_unwind(uintptr_t frame, void *stack_base, void (*land)(void *), void *arg) {
     KaiTrapUnwind *u = (frame && kai_trap_unwind_room(stack_base))
                            ? (KaiTrapUnwind *) calloc(1, sizeof *u) : NULL;
     if (u) {
@@ -3750,12 +3763,12 @@ static void kai_trap_unwind(uintptr_t frame, void *stack_base, void (*land)(void
 /* Every jump to the fiber's cancel pad goes through here: inside a segment
  * it first leaves the segment, and the resumer continues the same exit. */
 __attribute__((noreturn))
-static void kai_fiber_pad_jump(KaiFiber *f, int trap) {
+KAI_RT_SHARED void kai_fiber_pad_jump(KaiFiber *f, int trap) {
     if (f->seg != NULL) kai_seg_escape(f, NULL, trap);
     longjmp(f->cancel_pad, 1);
 }
 
-static void kai_trap_land_fiber(void *arg) {
+KAI_RT_SHARED void kai_trap_land_fiber(void *arg) {
     kai_fiber_pad_jump((KaiFiber *) arg, 1);
 }
 
@@ -3768,7 +3781,7 @@ static void kai_trap_land_fiber(void *arg) {
  * unwind runs `finally` clauses that can switch context, and a caller
  * inlining it would hold its own frame across that switch. */
 __attribute__((noinline, noreturn))
-static void kai_trap_abort(const char *msg) {
+KAI_RT_SHARED void kai_trap_abort(const char *msg) {
     KaiFiber *f = kai_current_fiber();
     if (f && f->cancel_pad_set) {
         f->trapped  = 1;
@@ -4771,7 +4784,7 @@ static KAI_RC_NOINLINE KaiValue *kai_pid_value(KaiMailbox *mb) {
  * acquire makes every other owner's writes visible before the free. TSAN
  * does not model a standalone fence, so its build folds both into the
  * fetch_sub. */
-static __attribute__((noinline)) int kai_drop_atomic_hits_zero(KaiValue *v) {
+KAI_RT_SHARED __attribute__((noinline)) int kai_drop_atomic_hits_zero(KaiValue *v) {
     KAI_CTR_INC(kai_rc_decref_total);
 #ifdef KAI_TRACE_RC
     kai_rc_history_log(v, /* op=decref */ 2, v->tag);
@@ -4820,8 +4833,8 @@ static inline void kai_free_stack_push(KaiFreeStack *st, KaiValue *v) {
     st->items[st->n++] = v;
 }
 
-static void kai_free_rec(KaiValue *v, int depth);
-static void kai_free_drain(KaiValue *v);
+KAI_RT_SHARED void kai_free_rec(KaiValue *v, int depth);
+KAI_RT_SHARED void kai_free_drain(KaiValue *v);
 
 /* Reclaim a child that just reached rc 0: onto the stack while draining,
  * by recursion while the depth budget lasts, else through a fresh drain. */
@@ -4832,7 +4845,7 @@ void kai_free_child(KaiValue *c, int depth, KaiFreeStack *st) {
     else kai_free_drain(c);
 }
 
-static inline void kai_drop_child(KaiValue *c, int depth, KaiFreeStack *st) {
+KAI_RT_SHARED_INLINE void kai_drop_child(KaiValue *c, int depth, KaiFreeStack *st) {
     if (!kai_drop_hits_zero(c)) return;
 #ifdef KAI_PROFILE_RC
     kai_prof_decref_to_zero_n++;
@@ -5022,7 +5035,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
 }
 
 __attribute__((noinline))
-static void kai_free_drain(KaiValue *v) {
+KAI_RT_SHARED void kai_free_drain(KaiValue *v) {
     KaiFiber *f = kai_current_fiber();
     KaiFreeStack *st = f->free_stack;
     if (!st) {
@@ -5043,7 +5056,7 @@ static void kai_free_drain(KaiValue *v) {
     }
 }
 
-static void kai_free_rec(KaiValue *v, int depth) { kai_free_one(v, depth, NULL); }
+KAI_RT_SHARED void kai_free_rec(KaiValue *v, int depth) { kai_free_one(v, depth, NULL); }
 
 static void kai_free_value(KaiValue *v) { kai_free_rec(v, 0); }
 
@@ -5054,7 +5067,7 @@ static void kai_free_value(KaiValue *v) { kai_free_rec(v, 0); }
  * drop fast path is inline at the call site, the free is a cold helper.
  * kaikai keeps its own counters + kai_free_value walker, not kklib's
  * free-list shape — the split is the idea, the body stays ours. */
-static void kai_decref_free(KaiValue *v) {
+KAI_RT_SHARED void kai_decref_free(KaiValue *v) {
 #ifdef KAI_PROFILE_RC
     kai_prof_decref_to_zero_n++;
 #endif
@@ -5069,7 +5082,7 @@ static void kai_decref_free(KaiValue *v) {
  * every drop). Under tracing the counters still fire for full fidelity.
  * KAI_PROF_ENTER/EXIT dropped from the hot path: they bracket a cold
  * helper now, and the inline body must stay small to be inlined. */
-static inline void kai_decref(KaiValue *v) {
+KAI_RT_SHARED_INLINE void kai_decref(KaiValue *v) {
     if (kai_drop_hits_zero(v)) kai_decref_free(v);
 }
 
@@ -5450,7 +5463,7 @@ static KaiValue *kai_str_intern_insert(const char *cstr, size_t len) {
     return result ? result : kai_str_from_bytes(cstr, len);
 }
 
-static KAI_RC_NOINLINE KaiValue *kai_str(const char *cstr) {
+KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_str(const char *cstr) {
     size_t len = strlen(cstr);
     if (len > KAI_STR_INTERN_MAXLEN) return kai_str_from_bytes(cstr, len);
     size_t i = kai_str_intern_hash(cstr, len);
@@ -5578,7 +5591,7 @@ static void kai_seq_it_init(KaiSeqIt *it, KaiValue *v) {
     it->in_range = 0;
 }
 
-static KaiValue *kai_seq_it_next(KaiSeqIt *it) {
+KAI_RT_SHARED KaiValue *kai_seq_it_next(KaiSeqIt *it) {
     if (!it->in_range) {
         KaiValue *n = it->node;
         if (!kai_is_ptr(n)) return NULL;
@@ -5708,7 +5721,7 @@ static KaiValue *kai_enum_by_tag[KAI_ENUM_TAG_MAX] = {0};
  * insert-into-leaf mints two RBLeaf singletons through the hash probe
  * just to read back a pointer the seed already cached. Koka shape: a
  * nullary is kk_datatype_from_tag, an immediate, never a table lookup. */
-static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
+KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
                                                int n, uint32_t mask,
                                                KaiVarSlot *slots);
 static inline KaiValue *kai_nullary_fast(int32_t tag, const char *name) {
@@ -5925,7 +5938,7 @@ static int kai_immortal_slot_install(int32_t tag, const char *name, int n,
     return 0;
 }
 
-static KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
+KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_variant_u(int32_t tag, const char *name,
                                                int n, uint32_t mask,
                                                KaiVarSlot *slots) {
     KAI_VAR_NAME_ALLOC(name);
@@ -6821,7 +6834,7 @@ __attribute__((always_inline)) static inline KaiValue *kai_variant_reuse_at(KaiV
 
 /* Allocate an array of `len` slots, each initialised to `init`
    (incref'd once per slot). Caller owns the returned array. */
-static KAI_RC_NOINLINE KaiValue *kai_array_make(int64_t len, KaiValue *init) {
+KAI_RT_SHARED KAI_RC_NOINLINE KaiValue *kai_array_make(int64_t len, KaiValue *init) {
     if (len < 0) { fprintf(stderr, "kai: array_make: negative length\n"); kai_exit(1); }
     KaiValue *v = kai_alloc(KAI_ARRAY);
     v->as.arr.len = len;
@@ -7395,8 +7408,8 @@ static KaiValue *kai_vec_from_list_impl(KaiValue *xs) {
 /* Structural equality — Vec is a value, unlike identity-compared
  * Array. Raw scalars compare by payload (Reals via `==`, preserving
  * NaN/-0.0 semantics); boxed elements recurse through kai_op_eq. */
-static int kai_op_eq(KaiValue *a, KaiValue *b);
-static int kai_vec_eq(KaiValue *a, KaiValue *b) {
+KAI_RT_SHARED int kai_op_eq(KaiValue *a, KaiValue *b);
+KAI_RT_SHARED int kai_vec_eq(KaiValue *a, KaiValue *b) {
     int64_t len = a->as.vec.len;
     if (len != b->as.vec.len) return 0;
     if (len == 0) return 1;
@@ -7544,7 +7557,7 @@ static KaiValue *kai_op_field_borrow(KaiValue *rec, const char *name) {
 
 /* ---------- equality ---------- */
 
-static int kai_op_eq(KaiValue *a, KaiValue *b) {
+KAI_RT_SHARED int kai_op_eq(KaiValue *a, KaiValue *b) {
     if (a == b) return 1;   /* identical word — covers two equal immediates (Koka kk_box_eq) */
     /* Immediate Int: equal iff both are Ints with the same value. An
      * immediate vs a heap value of any other type is unequal. Done
@@ -7677,7 +7690,7 @@ static int kai_op_eq(KaiValue *a, KaiValue *b) {
 
 static KAI_RC_NOINLINE KaiValue *kai_string_concat(KaiValue *a, KaiValue *b);
 
-static KaiValue *kai_to_string(KaiValue *v);
+KAI_RT_SHARED KaiValue *kai_to_string(KaiValue *v);
 
 /* Encode scalar value `cp` into `out` (>= 4 bytes), the exact inverse of
  * the `string_cp_at` decode. Returns the byte width 1..4. A `Char` is
@@ -7707,7 +7720,7 @@ static int kai_utf8_encode(uint32_t cp, unsigned char *out) {
     return 4;
 }
 
-static KaiValue *kai_list_to_string(KaiValue *v) {
+KAI_RT_SHARED KaiValue *kai_list_to_string(KaiValue *v) {
     KaiValue *acc = kai_str("[");
     int first = 1;
     KaiSeqIt it;
@@ -7727,7 +7740,7 @@ static KaiValue *kai_list_to_string(KaiValue *v) {
     kai_decref(acc); return c;
 }
 
-static KaiValue *kai_to_string(KaiValue *v) {
+KAI_RT_SHARED KaiValue *kai_to_string(KaiValue *v) {
     if (!v) return kai_str("<null>");
     char buf[64];
     /* Koka tagged-Int: a small Int is an immediate, not a heap value —
@@ -8040,7 +8053,7 @@ static int kai_capture_frames(void **out, int max) {
 #endif
 }
 
-static void kai_panic_backtrace(void) {
+KAI_RT_SHARED void kai_panic_backtrace(void) {
     void *frames[64];
     int n = kai_capture_frames(frames, 64);
     if (n <= 0) return;
@@ -8095,7 +8108,7 @@ static void kai_panic_backtrace(void) {
     pclose(p);
 }
 
-static KaiValue *kai_core_panic(KaiValue *msg) {
+KAI_RT_SHARED KaiValue *kai_core_panic(KaiValue *msg) {
     KaiFiber *f = kai_current_fiber();
     if (f && f->cancel_pad_set) {
         static char buf[256];
@@ -8838,7 +8851,7 @@ static KaiValue *kai_core_each(KaiValue *xs, KaiValue *f) {
  * Returns NULL when the pair is not a matching fixed-width pair, so the
  * caller falls through to its Int/Real path. Byte also has a raw path;
  * this arm is its boxed border (a boxed operand keeps the binop boxed). */
-static KaiValue *kai_fixed_arith(KaiValue *a, KaiValue *b, char op) {
+KAI_RT_SHARED KaiValue *kai_fixed_arith(KaiValue *a, KaiValue *b, char op) {
     if (!kai_is_ptr(a) || !kai_is_ptr(b) || a->tag != b->tag) return NULL;
     switch ((KaiTag) a->tag) {
         case KAI_BYTE: { uint8_t x = a->as.byte_val, y = b->as.byte_val;
@@ -9019,7 +9032,7 @@ static int kai_fixed_gt(KaiValue *a, KaiValue *b, int *out) {
     }
 }
 
-static KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
+KAI_RT_SHARED KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
     KaiValue *r;
     int _flt;
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_bool(kai_intf(a) < kai_intf(b));
@@ -9051,7 +9064,7 @@ static KaiValue *kai_op_lt(KaiValue *a, KaiValue *b) {
     return r;
 }
 
-static KaiValue *kai_op_gt(KaiValue *a, KaiValue *b) {
+KAI_RT_SHARED KaiValue *kai_op_gt(KaiValue *a, KaiValue *b) {
     KaiValue *r;
     int _fgt;
     if (kai_is_int(a)  && kai_is_int(b))       r = kai_bool(kai_intf(a) > kai_intf(b));
@@ -11083,7 +11096,7 @@ static void kai_test_land(void *arg) {
     longjmp(kai_test_jmp, 1);
 }
 
-static void kai_unw_release_to(KaiFiber *f, uint32_t mark);
+KAI_RT_SHARED void kai_unw_release_to(KaiFiber *f, uint32_t mark);
 
 /* A failed assertion leaves the test body through the unwinder, releasing
  * the body's unwind entries first, while the frames they point into live. */
@@ -18689,7 +18702,7 @@ static void kai_resume_frames_drop(KaiFiber *f, KaiEvidence *node);
 
 /* Release every slot above `mark`, innermost frame first. An entry with
  * `n < 0` is a handle draining its resume frames: `base` is its node. */
-static void kai_unw_release_to(KaiFiber *f, uint32_t mark) {
+KAI_RT_SHARED void kai_unw_release_to(KaiFiber *f, uint32_t mark) {
     while (f->unw_top > mark) {
         KaiUnwEntry e = f->unw_buf[--f->unw_top];
         if (e.n < 0) kai_resume_frames_drop(f, (KaiEvidence *) e.base);
@@ -19051,7 +19064,7 @@ static void kai_evidence_unwind_to(KaiEvidence *node) {
 
 /* Cancellation longjmps straight to the fiber's `cancel_pad` without a
  * target node, so it needs the whole remaining chain drained. */
-static void kai_evidence_unwind_all(void) {
+KAI_RT_SHARED void kai_evidence_unwind_all(void) {
     KaiFiber *f = kai_current_fiber();
     /* Inside a segment the chain below its base belongs to the resumer. */
     KaiEvidence *stop = f->seg != NULL ? f->seg->base : NULL;
@@ -21354,15 +21367,12 @@ static int64_t kai_llvm_link_runtime_bc(void *m) {
  *
  * The whole-program path internalises everything-but-main, which would strip
  * the external linkage a cross-partition user call depends on. This path
- * instead internalises only the RUNTIME functions the merge brought in — a
- * function is "from the runtime" iff it was NOT defined in the partition
- * before the merge. Those runtime bodies go `internal` so O2 inlines + DCEs
- * them per partition; the user's own fns keep their linkage (external for the
- * cross-TU calls), and the runtime's state globals stay `external` references
- * resolved by the runtime owner. The result: the `kaix_*` ops inline into the
- * hot path, one runtime-state instance survives (identity across partitions is
- * preserved), and cross-partition symbols still link. Returns 0 on success or
- * no-op (bc path unset), non-zero only on a real parse/link failure. */
+ * relinks only the RUNTIME functions the merge brought in — a function is
+ * "from the runtime" iff it was NOT defined in the partition before the
+ * merge. The user's own fns keep their linkage, and the runtime's state
+ * globals stay `external` references resolved by the runtime owner, so one
+ * runtime-state instance survives. Returns 0 on success or no-op (bc path
+ * unset), non-zero only on a real parse/link failure. */
 static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
     const char *bc_path = getenv("KAI_NATIVE_RUNTIME_INLINE_BC");
     if (!bc_path || !bc_path[0]) return 0;             /* opt-out: runtime stays an owner-TU call */
@@ -21423,14 +21433,11 @@ static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
         return 1;
     }
 
-    /* Internalise every DEFINED function that was not in the pre-merge set —
-     * i.e. the runtime bodies just merged in, INCLUDING `main`. O2 then inlines
-     * the always_inline `kaix_*` ops and globalDCE drops the rest (a partition
-     * never calls the runtime's `main`, so it is dropped). Unlike the
-     * whole-program path, `main` is NOT kept external here: the ONE OS entry
-     * point comes from the runtime owner TU, so a partition exporting its own
-     * merged copy would collide with the owner's at link. User fns (in the pre
-     * set) and the runtime's external state globals are untouched. */
+    /* A merged runtime body the owner exports (external in the bitcode) becomes
+     * `available_externally`: O2 may still inline it, and a copy it does not
+     * consume is dropped before codegen, leaving a call the owner resolves.
+     * The bitcode's static helpers go internal. User fns (in the pre set) and
+     * the runtime's external state globals are untouched. */
     for (LLVMValueRef f = LLVMGetFirstFunction(mod); f; f = LLVMGetNextFunction(f)) {
         if (LLVMIsDeclaration(f)) continue;
         const char *nm = LLVMGetValueName(f);
@@ -21439,7 +21446,10 @@ static int64_t kai_llvm_link_runtime_bc_modular(void *m) {
         for (size_t i = 0; i < pre_n; i++) {
             if (strcmp(pre[i], nm) == 0) { was_user = 1; break; }
         }
-        if (!was_user) LLVMSetLinkage(f, LLVMInternalLinkage);
+        if (was_user) continue;
+        LLVMLinkage l = LLVMGetLinkage(f);
+        int exported = l == LLVMExternalLinkage || l == LLVMAvailableExternallyLinkage;
+        LLVMSetLinkage(f, exported ? LLVMAvailableExternallyLinkage : LLVMInternalLinkage);
     }
 
     for (size_t i = 0; i < pre_n; i++) free(pre[i]);
