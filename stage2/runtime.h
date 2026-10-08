@@ -19411,6 +19411,82 @@ KAI_SCHED_FN void kai_seg_escape(KaiFiber *f, KaiEvidence *to, int trap) {
 
 #endif
 
+/* ---------- Handles that run their body on a segment ----------
+ *
+ * A handle whose clauses keep `resume` beyond a tail call lowers to
+ * kai_seg_handle. The body runs on a segment under a forwarding handler
+ * whose clauses call kai_seg_request; each request runs the real clause
+ * here with a continuation closure. Calling that closure resumes the body
+ * and handles whatever it does next, so the handler stays deep wherever the
+ * continuation is called from. */
+
+KAI_SCHED_FN KaiValue *kai_seg_handle(KaiValue *body, KaiValue *ret, int n, KaiValue **clauses);
+KAI_SCHED_FN KaiValue *kai_seg_request(int op, int n, KaiValue **args);
+
+#if !KAI_SCHED_DECL_ONLY
+
+/* What a forwarding clause hands its handle. It lives on the suspended
+ * segment's stack; the handle takes the arguments before it resumes. */
+typedef struct { int op; int n; KaiValue **args; } KaiSegRequest;
+
+static KaiValue *kai_seg_handle_step(KaiValue *handler, KaiValue *v, KaiValue *k);
+
+/* The handler: the return clause (NULL passes the body's value on), then one
+ * clause per op. Never called. */
+static KaiValue *kai_seg_handler_fn(KaiValue *self, KaiValue **args, int n) {
+    (void) self; (void) args; (void) n;
+    fputs("kai: internal error: a segment handler called as a function\n", stderr);
+    kai_exit(1);
+}
+
+/* A continuation: the box of the suspended body and its handler. */
+static KaiValue *kai_seg_cont_call(KaiValue *self, KaiValue **args, int n) {
+    (void) n;
+    KaiValue *handler = self->as.clo.captures[1];
+    KaiValue *k = NULL;
+    KaiValue *v = kai_seg_resume(kai_incref(self->as.clo.captures[0]), args[0], &k);
+    return kai_seg_handle_step(handler, v, k);
+}
+
+/* A finished body runs the return clause; a request runs its clause with
+ * a continuation that owns the box. Consumes `v` and `k`. */
+static KaiValue *kai_seg_handle_step(KaiValue *handler, KaiValue *v, KaiValue *k) {
+    KaiValue **caps = handler->as.clo.captures;
+    if (k == NULL) return caps[0] ? kai_apply_borrow(caps[0], 1, &v) : v;
+    KaiSegRequest *req = (KaiSegRequest *) v;
+    KaiValue *held[2] = { k, handler };
+    KaiValue *cont = kai_closure(kai_seg_cont_call, 1, 2, held);
+    kai_decref(k);
+    KaiValue *argv[req->n + 1];
+    for (int i = 0; i < req->n; i++) argv[i] = req->args[i];
+    argv[req->n] = cont;
+    return kai_apply_borrow(caps[1 + req->op], req->n + 1, argv);
+}
+
+/* Run `body` under clauses that may keep their continuation. Consumes every
+ * argument. */
+KAI_SCHED_FN KaiValue *kai_seg_handle(KaiValue *body, KaiValue *ret, int n, KaiValue **clauses) {
+    KaiValue *caps[n + 1];
+    caps[0] = ret;
+    for (int i = 0; i < n; i++) caps[1 + i] = clauses[i];
+    KaiValue *handler = kai_closure(kai_seg_handler_fn, 0, n + 1, caps);
+    for (int i = 0; i <= n; i++) if (caps[i]) kai_decref(caps[i]);
+    KaiValue *k = NULL;
+    KaiValue *v = kai_seg_start(body, &k);
+    KaiValue *r = kai_seg_handle_step(handler, v, k);
+    kai_decref(handler);
+    return r;
+}
+
+/* A forwarding clause: hand op `op`'s `n` arguments (consumed) to the handle
+ * and return the value its continuation is called with. */
+KAI_SCHED_FN KaiValue *kai_seg_request(int op, int n, KaiValue **args) {
+    KaiSegRequest req = { op, n, args };
+    return kai_seg_suspend((KaiValue *) &req);
+}
+
+#endif
+
 /* Walk the current fiber's stack and return the innermost handler
  * for `eff_label`. Returns NULL if no matching handler is in
  * scope — which would indicate a compiler bug, since the type

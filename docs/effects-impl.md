@@ -386,14 +386,11 @@ talking to — only which label the lookup is parameterised by.
 ## Op calls and clauses
 <!-- coverage: skip --> design spec, internal lowering rule
 
-> **v1 status (2026-10-07):** no op call reifies a continuation. A
-> perform is a direct call to the clause on the performing stack, a
-> tail `resume` is a return, an abandon is a `longjmp` to the handle,
-> and a non-tail `resume` defers the rest of its clause to the
-> handle's exit. The runtime layer for real one-shot continuations,
-> stack segments (§*Stack segments*), is in place; no compiled program
-> runs on one until the compiler classifies which handles need a
-> captured continuation.
+> **v1 status (2026-10-08):** a handle runs as described here unless
+> a clause keeps its continuation in a shape the split cannot express;
+> that handle runs its body on a stack segment (§*Handles on a
+> segment*). The C backend lowers segment handles; the native backend
+> reports them as unsupported.
 
 No pass rewrites effectful functions into continuation-passing
 style, and no continuation is reified. An effectful function
@@ -431,11 +428,10 @@ non-tail position.
 
 ## `resume` representation
 
-> **v1 status (2026-10-07):** every `resume` is the stack-allocated
-> `KaiCont` of §*One-shot case*: a status and an identity function,
-> never a captured stack. The segment-backed continuation of
-> §*Stack segments* exists in the runtime and is not yet produced by
-> the compiler.
+> **v1 status (2026-10-08):** a `resume` is the stack-allocated
+> `KaiCont` of §*One-shot case* unless its handle runs on a segment,
+> where it is a `Cont[T, S]` closure over the segment's box
+> (§*Handles on a segment*). Multi-shot is not implemented.
 
 `resume` is a value of type `(T) -> S / ρ`. Doc A §*`resume`:
 one-shot, explicit* pinned its surface semantics; this section
@@ -545,6 +541,44 @@ out.
 While a discontinue driven by a drop runs, the fiber is pinned to its
 thread. The free walk that triggered it holds thread-local addresses.
 
+### Handles on a segment
+
+A pre-resolve pass (`resume_segment.kai`) decides where each `handle`
+runs. A stateless handle with a clause that keeps `resume` beyond what
+the split of §*Non-tail `resume`* expresses — as a value, from a
+lambda, inside a nested `handle`, a loop, a guard or an
+interpolation, or with a clause `var` read after it — becomes
+
+```
+$seg_handle(escapes, reason,
+            () => handle { body } with E { op_i(xs, k) -> k($seg_request(i, xs)) },
+            (r) => <return clause>,
+            (xs, resume) => <clause i>, ...)
+```
+
+The inner handle's clauses are tail-resuming forwarders, so it takes
+the direct path and lives on the segment: the handler is deep by
+construction. The typer types the thunk first; the arguments and
+result of each `$seg_request(i, …)` give clause `i` its parameter
+types and its continuation `Cont[answer, S]`, where `S` is the
+handle's type. A `Cont` is called like a function; at run time it is a
+closure over the segment's box and the handler.
+
+`kai_seg_handle` starts the body on a segment. A finished body runs the
+return clause; a request runs its clause with a fresh continuation.
+Calling the continuation resumes the segment and handles whatever the
+body does next. Perceus drops an unused
+continuation, which discontinues the body; a clause that returns
+without resuming is therefore an abandon.
+
+A continuation is bound to its fiber. A post-typing walk
+(`cont_crossing.kai`) rejects a thunk handed to a call yielding a
+`Fiber` or `Pid` that captures one, such a call's result holding one,
+and a call taking a `Pid` that passes one.
+
+`kai build --explain` prints a note for each segment handle of the
+root file, with the shape that sent it there.
+
 ### Multi-shot case
 
 `resume_multishot(v)` is the same operation except:
@@ -565,21 +599,17 @@ v1* already accepts this cost.
 
 ### Static detection of illegal one-shot use
 
-The split marks what it cannot express with a `$resume_bad` node in
-the clause, and the typer reports each one with a span:
+What the split cannot express sends a stateless handle to a segment
+(§*Handles on a segment*). The pass marks what no handle runs with a
+`$resume_bad` node in the clause, and the typer reports each one with
+a span:
 
 - a second `resume` on one path;
-- `resume` inside a `handle` nested in its clause — the resumed
-  body would have to run under the inner handler;
-- `resume` inside a loop body, a match guard, or a string
-  interpolation;
-- a clause `var` (or a closure over one) read after a non-tail
-  `resume` — that code runs once the var's block is gone;
 - a non-tail `resume` in a `default { }` clause — a default
-  handler has no handle exit to run the deferred code at.
+  handler has no handle exit to run the deferred code at;
+- in a stateful handle, any shape that would send it to a segment.
 
-The typer rejects `resume` used as a value or called from inside
-a lambda. The runtime status check stays as the backstop.
+The runtime status check stays as the backstop.
 
 ### Interaction with `Nothing`-returning ops
 

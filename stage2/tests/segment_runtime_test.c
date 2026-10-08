@@ -199,6 +199,75 @@ static void test_abandon_escapes(void) {
     check("abandon unwinds the evidence past the handle", f->evidence_top == top);
 }
 
+/* ---------- a handle that keeps its continuation ---------- */
+
+static KaiValue *gen_yield_body(KaiValue *self, KaiValue **args, int n) {
+    (void) args; (void) n;
+    int64_t count = cap_int(self);
+    KaiEvidence node;
+    int h = 0;
+    kai_evidence_push(&node, "Res", &h);
+    kai_evidence_set_cleanup(&node, count_cleanup, NULL);
+    for (int64_t i = 0; i < count; i++) {
+        KaiValue *a[1] = { kai_int(i) };
+        kai_decref(kai_seg_request(0, 1, a));
+    }
+    kai_evidence_run_cleanup(&node);
+    kai_evidence_pop();
+    return kai_int(-1);
+}
+
+/* yield(x, k) -> [x, k]: the continuation leaves its clause. */
+static KaiValue *keep_clause(KaiValue *self, KaiValue **args, int n) {
+    (void) self; (void) n;
+    KaiValue *pair = kai_array_make(2, kai_unit());
+    pair->as.arr.items[0] = args[0];
+    pair->as.arr.items[1] = args[1];
+    return pair;
+}
+
+static KaiValue *identity_clause(KaiValue *self, KaiValue **args, int n) {
+    (void) self; (void) n;
+    return args[0];
+}
+
+static KaiValue *gen_handle(int64_t count) {
+    KaiValue *cap = kai_int(count);
+    KaiValue *clauses[1] = { kai_closure(keep_clause, 2, 0, NULL) };
+    KaiValue *r = kai_seg_handle(mk_body(gen_yield_body, cap), kai_closure(identity_clause, 1, 0, NULL), 1, clauses);
+    kai_decref(cap);
+    return r;
+}
+
+/* Calls each kept continuation from outside the handle, `take` times. */
+static KaiValue *gen_take(KaiValue *r, int64_t take, int64_t *seen, int64_t *wrong) {
+    while (kai_is_ptr(r) && r->tag == KAI_ARRAY && *seen < take) {
+        if (kai_intf(r->as.arr.items[0]) != *seen) (*wrong)++;
+        (*seen)++;
+        KaiValue *k = kai_incref(r->as.arr.items[1]);
+        kai_decref(r);
+        KaiValue *argv[1] = { kai_unit() };
+        r = kai_apply(k, 1, argv);
+    }
+    return r;
+}
+
+static void test_handle_keeps_continuation(void) {
+    int64_t seen = 0, wrong = 0;
+    cleanups = 0;
+    KaiValue *r = gen_take(gen_handle(1000000), 1000000, &seen, &wrong);
+    check("a kept continuation yields every value in order", seen == 1000000 && wrong == 0);
+    check("the handle returns through its return clause", !kai_is_ptr(r) || r->tag != KAI_ARRAY);
+    check("the finished body ran its finally once", cleanups == 1);
+    kai_decref(r);
+
+    seen = 0; wrong = 0; cleanups = 0;
+    r = gen_take(gen_handle(1000000), 3, &seen, &wrong);
+    check("a dropped generator stopped where it was", seen == 3 && r->tag == KAI_ARRAY);
+    kai_decref(r);
+    check("dropping a kept continuation runs the finally once", cleanups == 1);
+}
+
 /* ---------- double resume ---------- */
 
 static KaiValue *once_body(KaiValue *self, KaiValue **args, int n) {
@@ -376,6 +445,7 @@ int main(int argc, char **argv) {
     test_reparent();
     test_inherits_dispatch();
     test_abandon_escapes();
+    test_handle_keeps_continuation();
     test_double_resume_traps(argv[0]);
     test_migration();
 

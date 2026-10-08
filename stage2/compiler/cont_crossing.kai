@@ -1,0 +1,214 @@
+#[doc("""
+A continuation belongs to the fiber whose stack segment it suspended. This
+walk over a typed body finds where one would reach another fiber: a thunk
+handed to a call that yields a `Fiber` or `Pid` capturing one, such a
+call's result holding one, or a call that takes a `Pid` passing one along.
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.modules
+
+#[doc("Where a continuation would reach another fiber, and how.")]
+pub type Crossing = Crossing(String, Int, Int)
+
+#[doc("Every crossing in `e`; `res` resolves a type and `holds` says whether a value of it holds a continuation.")]
+pub fn cont_crossings(e: Expr, res: (Ty) -> Ty, holds: (Ty) -> Bool) : [Crossing] =
+  list_reverse(cc(e, Cc { res: res, holds: holds }, []))
+
+type Cc = { res: (Ty) -> Ty, holds: (Ty) -> Bool }
+
+# Every typed body runs through this walk, so it reads each node once and
+# allocates only for a crossing it finds.
+fn cc(e: Expr, c: Cc, acc: [Crossing]) : [Crossing] = match e.kind {
+  ECall(f, xs)       -> cc_all(xs, c, cc(f, c, at_call(e, xs, c, acc)))
+  EField(b, _)       -> cc(b, c, acc)
+  EIndex(a, b)       -> cc(b, c, cc(a, c, acc))
+  EBinop(_, a, b)    -> cc(b, c, cc(a, c, acc))
+  EUnop(_, x)        -> cc(x, c, acc)
+  EIf(k, t, oe)      -> cc_opt(oe, c, cc(t, c, cc(k, c, acc)))
+  EMatch(s, arms)    -> cc_arms(arms, c, cc(s, c, acc))
+  ELambda(_, b)      -> cc(b, c, acc)
+  ERecordLit(_, fs)  -> cc_fields(fs, c, acc)
+  EList(els)         -> cc_elems(els, c, acc)
+  ERange(a, b, os)   -> cc_opt(os, c, cc(b, c, cc(a, c, acc)))
+  EBlock(ss, ot)     -> cc_opt(ot, c, cc_stmts(ss, c, acc))
+  EPipe(a, b)        -> cc(b, c, cc(a, c, acc))
+  EMapPipe(a, b)     -> cc(b, c, cc(a, c, acc))
+  EFlatMapPipe(a, b) -> cc(b, c, cc(a, c, acc))
+  EFilterPipe(a, b)  -> cc(b, c, cc(a, c, acc))
+  EBang(x)           -> cc(x, c, acc)
+  ELitUnit(x, _)     -> cc(x, c, acc)
+  EHandle(body, _, _, _, init, _, cls, ret) -> cc_ret(ret, c, cc_clauses(cls, c, cc_opt(init, c, cc(body, c, acc))))
+  EIntrinsic(_, xs)  -> cc_all(xs, c, acc)
+  ESurface(sf)       -> cc_all(surface_children(sf), c, acc)
+  EInt(_, _)         -> acc
+  EReal(_, _)        -> acc
+  EFixed(_, _)       -> acc
+  EIntLit(_)         -> acc
+  EDecimalLit(_)     -> acc
+  EBool(_)           -> acc
+  EChar(_)           -> acc
+  EStr(_, _)         -> acc
+  EUnit              -> acc
+  EVar(_)            -> acc
+  EMark(_)           -> acc
+  ESym(_, _, _)      -> acc
+  EUnder             -> acc
+  EPlaceholder       -> acc
+  EHole(_)           -> acc
+  ETodo(_)           -> acc
+  EExternBody(_, _)  -> acc
+  EVariantsOf(_, _)  -> acc
+  EModCall(_, _)     -> acc
+}
+
+fn cc_all(xs: [Expr], c: Cc, acc: [Crossing]) : [Crossing] = match xs {
+  []           -> acc
+  [x, ...rest] -> cc_all(rest, c, cc(x, c, acc))
+}
+
+fn cc_opt(o: Option[Expr], c: Cc, acc: [Crossing]) : [Crossing] = match o {
+  Some(x) -> cc(x, c, acc)
+  None    -> acc
+}
+
+fn cc_arms(arms: [Arm], c: Cc, acc: [Crossing]) : [Crossing] = match arms {
+  []                      -> acc
+  [Arm(_, g, b), ...rest] -> cc_arms(rest, c, cc(b, c, cc_opt(g, c, acc)))
+}
+
+fn cc_fields(fs: [FieldInit], c: Cc, acc: [Crossing]) : [Crossing] = match fs {
+  []                  -> acc
+  [FI(_, v), ...rest] -> cc_fields(rest, c, cc(v, c, acc))
+}
+
+fn cc_elems(els: [ListElem], c: Cc, acc: [Crossing]) : [Crossing] = match els {
+  []                     -> acc
+  [ElPlain(x), ...rest]  -> cc_elems(rest, c, cc(x, c, acc))
+  [ElSpread(x), ...rest] -> cc_elems(rest, c, cc(x, c, acc))
+}
+
+fn cc_stmts(ss: [Stmt], c: Cc, acc: [Crossing]) : [Crossing] = match ss {
+  [] -> acc
+  [s, ...rest] -> cc_stmts(rest, c, match s {
+    SLet(_, _, rhs)             -> cc(rhs, c, acc)
+    SAssert(k, m)               -> cc_opt(m, c, cc(k, c, acc))
+    SExprStmt(x)                -> cc(x, c, acc)
+    SIndexAssign(b, i, v, _, _) -> cc_all([b, i, v], c, acc)
+    SAssign(b, v, _, _)         -> cc(v, c, cc(b, c, acc))
+    SVar(_, _, rhs, _, _)       -> cc(rhs, c, acc)
+    SUse(_, _, _)               -> acc
+  })
+}
+
+fn cc_clauses(cls: [HClause], c: Cc, acc: [Crossing]) : [Crossing] = match cls {
+  []                            -> acc
+  [HC(_, _, b, _, _), ...rest] -> cc_clauses(rest, c, cc(b, c, acc))
+}
+
+fn cc_ret(r: Option[HReturn], c: Cc, acc: [Crossing]) : [Crossing] = match r {
+  Some(HR(_, b, _, _)) -> cc(b, c, acc)
+  None                 -> acc
+}
+
+# A node's type, resolved only when it is still a variable.
+fn peek(e: Expr, c: Cc) : Ty = match e.ty {
+  Some(t) -> match t {
+    TyVarT(_) -> c.res(t)
+    _         -> t
+  }
+  None -> TyAny
+}
+
+fn at_call(call: Expr, xs: [Expr], c: Cc, acc: [Crossing]) : [Crossing] = match peek(call, c) {
+  TyCon(_, n, targs, _) ->
+    if n == "Fiber" or n == "Pid" { [...fiber_call(call, n, targs, xs, c), ...acc] }
+    else { message_crossings(xs, c, acc) }
+  _ -> message_crossings(xs, c, acc)
+}
+
+fn fiber_call(call: Expr, n: String, targs: [Ty], xs: [Expr], c: Cc) : [Crossing] = {
+  let what = if n == "Fiber" { "a fiber's result" } else { "an actor's message" }
+  let result = if any(targs, (t) => c.holds(c.res(t))) {
+    [Crossing("#{what} cannot hold a continuation", call.line, call.col)]
+  } else { [] }
+  [...result, ...flat_map(xs, (x) => thunk_captures(x, c.res, c.holds))]
+}
+
+fn message_crossings(xs: [Expr], c: Cc, acc: [Crossing]) : [Crossing] =
+  if any(xs, (x) => is_pid(peek(x, c))) {
+    foldl(xs, acc, (a, x) => {
+      let t = c.res(ty_of(x))
+      if not is_pid(t) and c.holds(t) { [Crossing("a message cannot hold a continuation", x.line, x.col), ...a] } else { a }
+    })
+  } else { acc }
+
+fn is_pid(t: Ty) : Bool = match t {
+  TyCon(_, n, _, _) -> n == "Pid"
+  _ -> false
+}
+
+fn thunk_captures(x: Expr, res: (Ty) -> Ty, holds: (Ty) -> Bool) : [Crossing] = match x.kind {
+  ELambda(ps, b) -> match outer_ref(b, binders(b, map(ps, (p) => p.pname)), res, holds) {
+    Some(r) -> [Crossing("a thunk run on another fiber cannot capture a continuation", r.line, r.col)]
+    None    -> []
+  }
+  _ -> []
+}
+
+# A read of a name `e` does not bind itself, whose value holds a continuation.
+fn outer_ref(e: Expr, local: [String], res: (Ty) -> Ty, holds: (Ty) -> Bool) : Option[Expr] = {
+  let mine = match ref_name(e) {
+    Some(n) -> if not list_has(local, n) and holds(res(ty_of(e))) { Some(e) } else { None }
+    None    -> None
+  }
+  match mine {
+    Some(r) -> Some(r)
+    None    -> first_some(xp_positions(e), (p) => match p { XP(_, x) -> outer_ref(x, local, res, holds) })
+  }
+}
+
+fn ref_name(e: Expr) : Option[String] = match e.kind {
+  EVar(n)       -> Some(n)
+  ESym(_, _, n) -> Some(n)
+  _             -> None
+}
+
+# Every name bound anywhere inside `e`, after `acc`.
+fn binders(e: Expr, acc: [String]) : [String] = {
+  let here = match e.kind {
+    ELambda(ps, _)  -> [...map(ps, (p) => p.pname), ...acc]
+    EBlock(ss, _)   -> stmt_binders(ss, acc)
+    EMatch(_, arms) -> arm_binders(arms, acc)
+    _ -> acc
+  }
+  foldl(xp_positions(e), here, (a, p) => match p { XP(_, x) -> binders(x, a) })
+}
+
+fn stmt_binders(ss: [Stmt], acc: [String]) : [String] = match ss {
+  [] -> acc
+  [s, ...rest] -> match s {
+    SLet(p, _, _)       -> stmt_binders(rest, pat_binders(p, acc))
+    SVar(n, _, _, _, _) -> stmt_binders(rest, [n, ...acc])
+    _                   -> stmt_binders(rest, acc)
+  }
+}
+
+fn arm_binders(arms: [Arm], acc: [String]) : [String] = match arms {
+  [] -> acc
+  [Arm(p, _, _), ...rest] -> arm_binders(rest, pat_binders(p, acc))
+}
+
+fn ty_of(e: Expr) : Ty = match e.ty {
+  Some(t) -> t
+  None    -> TyAny
+}
+
+fn first_some(ps: [XPos], f: (XPos) -> Option[Expr]) : Option[Expr] = match ps {
+  [] -> None
+  [p, ...rest] -> match f(p) {
+    Some(x) -> Some(x)
+    None    -> first_some(rest, f)
+  }
+}
