@@ -29,7 +29,7 @@
  * (~880 bytes on darwin arm64). swapcontext then writes 880 bytes
  * into a 56-byte buffer, silently corrupting whatever sits next to
  * the embedded ucontext_t — exactly what bit Phase 2 once
- * (kai_main_fiber.evidence_top got clobbered to a saved register
+ * (the root fiber's evidence_top got clobbered to a saved register
  * value because the static evidence nodes were laid out adjacent).
  * Spec: docs/fibers-impl.md §*macOS deprecation handling*. */
 #define _XOPEN_SOURCE 600
@@ -3221,7 +3221,7 @@ struct KaiFiber {
      * `kai_decref`s `value`. Pairing the scheduler-side ref with the
      * caller-side ref makes `let _ = fiber_spawn(…)` (discarding the
      * Fiber value) safe: the wrapper stays alive while the struct is
-     * still referenced from the run queue. NULL on `kai_main_fiber`,
+     * still referenced from the run queue. NULL on a worker's root fiber,
      * which has no wrapper (it represents the OS thread). */
     KaiValue       *value;
     /* Tier 2 — trap-exit semantics. When 0 (default), a linked peer's
@@ -3274,7 +3274,7 @@ struct KaiFiber {
      * innermost open nursery on THIS fiber (a per-fiber stack so a
      * spawned child opening its own nursery does not collide with the
      * parent's; nesting composes Trio-style). `Spawn.spawn` registers
-     * the new child on `kai_active_fiber->nursery_top`'s children list
+     * the new child on the spawner's `nursery_top` children list
      * via `scope_sibling_next`. `nursery_exit` joins every child on
      * that list before returning, cancelling the rest and re-raising
      * on the first child that terminated CANCELLED. NULL when no
@@ -3315,7 +3315,7 @@ struct KaiFiber {
     /* F2 — dedicated reactor thread. A reactor park (sleep, socket, pid,
      * stdin, signal, file-pool) stamps the reason here on the fiber's own
      * stack, then yields to the scheduler root WITHOUT touching any shared
-     * reactor structure. The root, running on kai_main_fiber (never the
+     * reactor structure. The root, running on the worker's root fiber (never the
      * parked fiber's stack), links the fiber into the wheel/waiter list
      * from `kai_sched_commit_park` — so no thief or reactor drain can
      * observe the fiber on a reactor list until its exit swap has finished
@@ -3363,6 +3363,11 @@ struct KaiFiber {
     KaiSegment     *seg;
     /* Nonzero while the fiber must not change OS thread. */
     int             seg_pin;
+    /* The worker running this fiber, stored by the dispatcher on every
+     * resume. Code that crossed a switch reaches scheduler state through
+     * it: a worker pointer held from before the switch may name the thread
+     * the fiber left. */
+    struct KaiWorker *worker;
 };
 
 /* The per-context half of a fiber's state. A segment switch exchanges it, so
@@ -3419,7 +3424,7 @@ KAI_SCHED_FN void kai_seg_escape(KaiFiber *f, KaiEvidence *to, int trap) __attri
 /* The free arm of a KAI_CONT box. */
 KAI_SCHED_FN void kai_seg_cont_drop(KaiValue *box);
 /* Unmap this thread's pooled segments; a worker runs it before it exits. */
-KAI_SCHED_FN void kai_seg_pool_drain(void);
+KAI_SCHED_FN __attribute__((noinline)) void kai_seg_pool_drain(void);
 
 /* Issue #959 — one open structured-concurrency scope. Children spawned
  * while this scope is the active fiber's `nursery_top` are pushed on
@@ -3447,19 +3452,9 @@ struct KaiNursery {
     _Atomic(KaiFiber *) failed_child;
 };
 
-/* kai_main_fiber starts as the OS-thread context, representing the
+/* A worker's root fiber starts as the OS-thread context, representing the
  * dispatch loop. Its ctx is filled lazily on first yield (getcontext at
- * the moment we suspend the dispatch loop into a fiber). The active-fiber
- * pointer (kai_active_fiber) tracks whoever is currently executing;
- * kai_current_fiber returns it.
- *
- * Scheduler state is process-global: a fiber spawned by one TU is parked,
- * resumed, and freed by another, so under separate compilation there is
- * one shared scheduler (extern everywhere, owner defines) — a per-TU copy
- * would split the ready queue and the active-fiber pointer in two. The
- * active-fiber initializer takes kai_main_fiber's address, so both live in
- * the owner TU together; other TUs see the same address via extern.
- * Spec: docs/fibers-impl.md §*Dispatch loop*. */
+ * the moment we suspend the dispatch loop into a fiber). */
 #define KAI_MAIN_FIBER_INIT {                                            \
     NULL,                /* evidence_top */                              \
     0, 0,                /* cancel_requested, cancel_delivered */        \
@@ -3491,23 +3486,65 @@ struct KaiNursery {
     NULL, 0, 0,          /* unw_buf, unw_top, unw_cap */                 \
     0,                   /* unwind_frame — main has no pad */            \
     NULL, 0, 0,          /* rframe_buf, rframe_top, rframe_cap */        \
-    NULL, 0              /* seg, seg_pin */                              \
+    NULL, 0,             /* seg, seg_pin */                              \
+    NULL                 /* worker — bound by kai_worker_here */         \
 }
-/* `kai_active_fiber` cannot be statically initialised to `&kai_main_fiber`
- * now that both are `_Thread_local`: the address of a thread-local is not a
- * compile-time constant. It is anchored to each thread's own `kai_main_fiber`
- * on that thread's first entry (kai_active_fiber_anchor, run from
- * kai_set_args and lazily from kai_current_fiber for the pre-main path). */
+/* The landing a fiber context falls off into runs only setcontext, so its
+ * stack is small. A literal, not SIGSTKSZ: glibc defines that as a sysconf()
+ * call, which would make the array below a VLA. */
+#define KAI_UC_LINK_STACK_SIZE 65536
+
+/* One OS scheduler thread's own state: the fiber it is running, its root
+ * fiber (the dispatch loop's context), the N=1 ready queue, and the stacks
+ * the root drains after each switch. Only its own thread touches it.
+ *
+ * TRAP: a worker pointer is valid only until the next switch. A fiber that
+ * parks on one worker can be resumed by another, so code after a switch
+ * reads `fiber->worker`, never a worker pointer it held from before. The
+ * root's own pointer is the exception: a root never changes thread. */
+typedef struct KaiWorker {
+    KaiFiber   *active;
+    int         id;
+    int         parked_count;   /* N=1 deadlock detection */
+    KaiFiber   *ready_head;     /* N=1 ready queue; at N>1 it is the slot's */
+    KaiFiber   *ready_tail;
+    KaiFiber   *commit_stack_head;
+    KaiFiber   *requeue_stack_head;
+    KaiFiber   *pending_free;
+    KaiValue   *pending_sched_drop;
+    void       *sigalt_stack;
+    int         sigalt_ready;
+    int         uc_link_ready;
+    KaiFiber    main_fiber;
+    ucontext_t  uc_link_ctx;
+    char        uc_link_stack[KAI_UC_LINK_STACK_SIZE];
+} KaiWorker;
+
+/* The scheduler's only thread-local. Read nowhere but kai_worker_here. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS KaiFiber  kai_main_fiber;
-extern KAI_TLS KaiFiber *kai_active_fiber;
+extern KAI_TLS KaiWorker kai_worker;
 #  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS KaiFiber  kai_main_fiber   = KAI_MAIN_FIBER_INIT;
-KAI_TLS KaiFiber *kai_active_fiber = NULL;
+KAI_TLS KaiWorker kai_worker = { .main_fiber = KAI_MAIN_FIBER_INIT };
 #  endif
 #else
-static KAI_TLS KaiFiber  kai_main_fiber   = KAI_MAIN_FIBER_INIT;
-static KAI_TLS KaiFiber *kai_active_fiber = NULL;
+static KAI_TLS KaiWorker kai_worker = { .main_fiber = KAI_MAIN_FIBER_INIT };
+#endif
+
+/* This thread's worker, bound on the thread's first call. noinline and
+ * defined in the owner only: each call re-reads the thread pointer, so no
+ * caller can cache a thread-local address across a switch. */
+KAI_SCHED_FN __attribute__((noinline)) KaiWorker *kai_worker_here(void)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    KaiWorker *w = &kai_worker;
+    if (__builtin_expect(w->active == NULL, 0)) {
+        w->main_fiber.worker = w;
+        w->active = &w->main_fiber;
+    }
+    return w;
+}
 #endif
 
 /* ---------- ThreadSanitizer fiber annotations ----------
@@ -3555,20 +3592,11 @@ void  __tsan_switch_to_fiber(void *fiber, unsigned flags);
  * inside a fiber would alias the root's handle onto that fiber's state, and
  * every later "switch back to root" would then land on a fiber. Hence the
  * eager bind at the top of each scheduler loop rather than a lazy one at the
- * first switch. noinline for the same reason kai_current_fiber is: the
- * thread-local slot must be re-resolved on whatever thread runs this, never
- * spilled across a swap by a caller whose frame spans one (the trampoline's
- * does). */
-__attribute__((noinline))
-static void kai_tsan_bind_root(void) {
-    if (!kai_main_fiber.tsan_fiber) {
-        kai_main_fiber.tsan_fiber = __tsan_get_current_fiber();
+ * first switch. */
+static void kai_tsan_bind_root(KaiWorker *w) {
+    if (!w->main_fiber.tsan_fiber) {
+        w->main_fiber.tsan_fiber = __tsan_get_current_fiber();
     }
-}
-
-__attribute__((noinline))
-static void *kai_tsan_root_fiber(void) {
-    return kai_main_fiber.tsan_fiber;
 }
 
 /* A fiber's own state, created on first dispatch. */
@@ -3578,9 +3606,9 @@ static void *kai_tsan_fiber_of(KaiFiber *f) {
     return f->tsan_fiber;
 }
 
-#define KAI_TSAN_BIND_ROOT()      kai_tsan_bind_root()
-#define KAI_TSAN_SWITCH_TO(f)     __tsan_switch_to_fiber(kai_tsan_fiber_of(f), 0)
-#define KAI_TSAN_SWITCH_TO_ROOT() __tsan_switch_to_fiber(kai_tsan_root_fiber(), 0)
+#define KAI_TSAN_BIND_ROOT(w)      kai_tsan_bind_root(w)
+#define KAI_TSAN_SWITCH_TO(f)      __tsan_switch_to_fiber(kai_tsan_fiber_of(f), 0)
+#define KAI_TSAN_SWITCH_TO_ROOT(w) __tsan_switch_to_fiber((w)->main_fiber.tsan_fiber, 0)
 
 /* Release a finished fiber's TSAN state. Called from the deferred-free drain,
  * which runs on another context, so the state being dropped is never current. */
@@ -3591,9 +3619,9 @@ static void kai_tsan_fiber_free(KaiFiber *f) {
     }
 }
 #else
-#define KAI_TSAN_BIND_ROOT()      ((void) 0)
-#define KAI_TSAN_SWITCH_TO(f)     ((void) 0)
-#define KAI_TSAN_SWITCH_TO_ROOT() ((void) 0)
+#define KAI_TSAN_BIND_ROOT(w)      ((void) (w))
+#define KAI_TSAN_SWITCH_TO(f)      ((void) 0)
+#define KAI_TSAN_SWITCH_TO_ROOT(w) ((void) (w))
 static inline void kai_tsan_fiber_free(KaiFiber *f) { (void) f; }
 #endif
 
@@ -3622,37 +3650,15 @@ void __lsan_unregister_root_region(const void *p, size_t size);
 #  define KAI_SEG_LSAN_UNROOT(seg) ((void) 0)
 #endif
 
-/* noinline is load-bearing: inlined into a fiber body, clang materialises
- * TP+offset and spills it across the park swapcontext, so a work-stolen
- * fiber would resume reading the creator thread's TLS. Out of line the
- * thread pointer is re-read on every call, on whatever thread now runs. */
-__attribute__((noinline))
-static void kai_active_fiber_anchor(void) {
-    if (kai_active_fiber == NULL) kai_active_fiber = &kai_main_fiber;
+static inline KaiFiber *kai_current_fiber(void) {
+    return kai_worker_here()->active;
 }
 
-/* Every read of the active fiber goes through here, never through a bare
- * `kai_active_fiber`. A bare read inlined into a frame that spans a park lets
- * the compiler resolve the TLS slot address once and spill it across the swap;
- * a work-stolen fiber then resumes reading the parking thread's slot and gets
- * some other thread's active fiber. Out of line the slot is re-resolved on
- * whatever thread now runs. */
-__attribute__((noinline))
-static KaiFiber *kai_current_fiber(void) {
-    kai_active_fiber_anchor();
-    return kai_active_fiber;
-}
-
-/* Assign kai_active_fiber from OUT OF LINE. Load-bearing across a
- * swapcontext resume: an inline `kai_active_fiber = f` resolves the TLS slot
- * address once (a tlv_get_addr call on darwin) and, even at -O0, spills that
- * address to the stack across the swap. A fiber that parks on one thread and
- * resumes on another (work-stealing) would then store through the parking
- * thread's slot, rotating every thread's active pointer. Out of line the slot
- * is re-resolved on whatever thread now runs. Mirrors kai_active_fiber_anchor. */
-__attribute__((noinline))
-static void kai_set_active_fiber(KaiFiber *f) {
-    kai_active_fiber = f;
+/* Make `f` the fiber `w` runs. Every dispatch goes through here, so a
+ * running fiber's `worker` always names the thread it runs on. */
+static inline void kai_worker_run(KaiWorker *w, KaiFiber *f) {
+    f->worker = w;
+    w->active = f;
 }
 
 static void kai_evidence_unwind_all(void);
@@ -3750,25 +3756,6 @@ static void kai_trap_abort(const char *msg) {
     kai_exit(1);
 }
 
-/* Ready queue (intrusive singly-linked, head/tail). Fibers go on the queue
- * when spawned (NEW→READY) or unparked (PARKED→READY); off the queue when
- * dispatched (READY→RUNNING). The dispatch loop drains it; deadlock
- * detection panics when the queue is empty *and* parked fibers exist with
- * no wakeup path. Shared like the rest of the scheduler. */
-#if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS KaiFiber *kai_ready_head;
-extern KAI_TLS KaiFiber *kai_ready_tail;
-extern KAI_TLS int       kai_parked_count;
-#  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS KaiFiber *kai_ready_head = NULL;
-KAI_TLS KaiFiber *kai_ready_tail = NULL;
-KAI_TLS int       kai_parked_count = 0;
-#  endif
-#else
-static KAI_TLS KaiFiber *kai_ready_head = NULL;
-static KAI_TLS KaiFiber *kai_ready_tail = NULL;
-static KAI_TLS int       kai_parked_count = 0;  /* deadlock detection */
-#endif
 
 /* ==================================================================
  * M:N work-stealing scheduler — cross-thread infrastructure.
@@ -3777,17 +3764,6 @@ static KAI_TLS int       kai_parked_count = 0;  /* deadlock detection */
  * single-thread scheduler runs byte-identically to the pre-M:N runtime.
  * ================================================================== */
 
-/* This scheduler thread's id: 0 is the main thread, 1..N-1 the workers.
- * Class A (per-thread). A freshly spawned fiber inherits its spawner's
- * id as home_thread. */
-#if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS int kai_thread_id;
-#  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS int kai_thread_id = 0;
-#  endif
-#else
-static KAI_TLS int kai_thread_id = 0;
-#endif
 
 /* Per-thread scheduler slot: this thread's ready deque, the single
  * source of truth at N>1. The owner pushes/pops both ends and a thief
@@ -3862,7 +3838,7 @@ static _Atomic int kai_sched_shutting_down = 0;
  *                             worker at once, so without it the banner count
  *                             is a scheduling race.
  * The reactor's own idle state is kai_reactor_idle, beside the reactor
- * globals below. Untouched at N=1 (that path keeps the TLS kai_parked_count). */
+ * globals below. Untouched at N=1 (that path keeps the worker's parked_count). */
 #if defined(KAI_SEPARATE_COMPILATION)
 extern _Atomic int      kai_sched_idle_count;
 extern _Atomic unsigned kai_sched_idle_epoch;
@@ -3935,44 +3911,16 @@ static _Atomic unsigned  kai_park_trace_seq = 0;
  * the fiber's ctx, closing the steal-a-half-saved-context race at N>1. */
 #define KAI_PARK_SLOT          8
 
-/* F2 — per-thread head of the pending-commit stack (fibers that stamped a
- * reactor park and yielded, waiting for the root to link them). Drained by
- * `kai_drain_commit_stack` at the scheduler root after every dispatch swap.
- * Class A (per-thread): each scheduler thread commits only its own parks. */
-#if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS KaiFiber *kai_commit_stack_head;
-#  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS KaiFiber *kai_commit_stack_head = NULL;
-#  endif
-#else
-static KAI_TLS KaiFiber *kai_commit_stack_head = NULL;
-#endif
 
-/* F2 — per-thread head of the pending-requeue stack: fibers that yielded
- * and must be put back on the steal list, but only AFTER their exit swap
- * saved their ctx (publishing a fiber to the steal list before its ctx is
- * written lets a thief resume a half-saved context — a race invisible to
- * TSAN because swapcontext/ucontext_t is opaque). Like the commit stack it
- * is drained on the root post-swap; the two never hold the same fiber (a
- * yield and a reactor park are mutually exclusive), so both reuse the
- * fiber's `commit_next` link. */
-#if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS KaiFiber *kai_requeue_stack_head;
-#  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS KaiFiber *kai_requeue_stack_head = NULL;
-#  endif
-#else
-static KAI_TLS KaiFiber *kai_requeue_stack_head = NULL;
-#endif
 
 /* F2 forward decls — the dedicated-reactor-thread machinery. Bodies live
  * alongside the reactor implementation (commit_park, mark_ready) and the
  * scheduler primitives (drain_commit_stack). */
 static void kai_sched_commit_park(KaiFiber *f);
-static void kai_drain_commit_stack(void);
+static void kai_drain_commit_stack(KaiWorker *w);
 static inline int  kai_fiber_slot_lock(KaiFiber *f);
 static inline void kai_fiber_slot_unlock_at(int home);
-static void kai_drain_requeue_stack(void);
+static void kai_drain_requeue_stack(KaiWorker *w);
 static void kai_reactor_mark_ready(KaiFiber *f);
 static void kai_reactor_wake(void);
 
@@ -3985,59 +3933,14 @@ static void kai_sched_remote_unpark(KaiFiber *target);
 static int  kai_sched_wake_thread(int tid);
 static void kai_sched_notify_work(int slot);
 static void kai_sched_check_deadlock(void);
-/* Single-slot pending-free for fiber structs whose wrappers went to RC=0
- * while the fiber itself was still the current fiber (the trampoline tail's
- * kai_decref(self->value) is the producer). Drained at every entry point
- * that follows a context switch (top of trampoline, post-swapcontext in
- * yield/park) so the freed stack is never the one we are running on. */
-#if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS KaiFiber *kai_pending_free;
-#  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS KaiFiber *kai_pending_free = NULL;
-#  endif
-#else
-static KAI_TLS KaiFiber *kai_pending_free = NULL;
-#endif
-
-/* Single-slot deferred drop of the trampoline tail's own scheduler ref
- * (`self->value`) at N>1. The tail keeps running on its private stack after
- * dropping that ref (dequeue + setcontext below), so dropping it inline would
- * let a peer thread holding the last other ref (a discarded Fiber[T] handle)
- * take RC to 0 and munmap the stack out from under the still-running tail.
- * Stashing the ref keeps RC >= 1 across the tail; the next context drops it
- * once the setcontext has left the doomed stack. Same drain sites and
- * single-slot discipline as kai_pending_free (every consumer drains before the
- * next produce). N=1 has no peer thread and decrefs inline (byte-identical). */
-#if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS KaiValue *kai_pending_sched_drop;
-#  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS KaiValue *kai_pending_sched_drop = NULL;
-#  endif
-#else
-static KAI_TLS KaiValue *kai_pending_sched_drop = NULL;
-#endif
-
-/* The pending-free slots are thread-local. Routed through noinline accessors
- * so the slot address is materialised and consumed inside one activation:
- * inlined into an emitted frame that spans a park, the store could land in the
- * parking thread's slot after a work-steal, and a peer's drain would then
- * munmap a stack this thread still owns. Take/set exchange only the value. */
-__attribute__((noinline))
-static void kai_pending_free_set(KaiFiber *f) { kai_pending_free = f; }
-__attribute__((noinline))
-static KaiFiber *kai_pending_free_take(void) {
-    KaiFiber *f = kai_pending_free;
-    if (f) kai_pending_free = NULL;
-    return f;
-}
-__attribute__((noinline))
-static void kai_pending_sched_drop_set(KaiValue *v) { kai_pending_sched_drop = v; }
-__attribute__((noinline))
-static KaiValue *kai_pending_sched_drop_take(void) {
-    KaiValue *v = kai_pending_sched_drop;
-    if (v) kai_pending_sched_drop = NULL;
-    return v;
-}
+/* A fiber struct whose wrapper went to RC=0 while that fiber was still
+ * running (the trampoline tail's decref of `self->value`) waits in the
+ * worker's `pending_free`. At N>1 the tail's own scheduler ref waits in
+ * `pending_sched_drop` instead of being dropped: the tail keeps running on
+ * its stack, and a peer holding the last other ref could munmap it. The next
+ * context on the same worker drains both, once the switch has left that
+ * stack. Single-slot: every switch drains before the next produce. */
+static void kai_pending_free_set(KaiFiber *f) { kai_worker_here()->pending_free = f; }
 
 /* Forward decl — defined alongside the m8.x fiber stack allocator
  * later in the file, but used here by the free path (munmap needs the
@@ -4052,14 +3955,17 @@ static size_t kai_page_size(void);
 #  define MAP_ANON MAP_ANONYMOUS
 #endif
 
-static void kai_drain_pending_free(void) {
-    /* Drop a trampoline tail's deferred scheduler ref first: we are now on
-     * the next context's stack, so the doomed tail's stack is abandoned and
-     * this decref (which may take RC to 0 and munmap that stack) is safe. */
-    KaiValue *sv = kai_pending_sched_drop_take();
-    if (sv) kai_decref(sv);
-    KaiFiber *f = kai_pending_free_take();
+static void kai_drain_pending_free(KaiWorker *w) {
+    /* The scheduler ref first: its decref may take RC to 0 and munmap the
+     * doomed tail's stack, which this context has already left. */
+    KaiValue *sv = w->pending_sched_drop;
+    if (sv) {
+        w->pending_sched_drop = NULL;
+        kai_decref(sv);
+    }
+    KaiFiber *f = w->pending_free;
     if (!f) return;
+    w->pending_free = NULL;
     /* thunk / result / linked_head were handled at wrapper-free time;
      * only stack + struct remain. The stack is an mmap region of
      * size stack_size + one guard page; pair the call with munmap
@@ -9310,9 +9216,8 @@ static char       **kai_g_argv = NULL;
 #endif
 
 static void kai_set_args(int argc, char **argv) {
-    /* Anchor this thread's active fiber to its own root fiber before any
-     * fiber runs (the static initializer cannot, both being _Thread_local). */
-    kai_active_fiber_anchor();
+    /* Bind this thread's worker before any fiber runs. */
+    (void) kai_worker_here();
     kai_g_argc = argc;
     kai_g_argv = argv;
     /* Issue #678: libc defaults stdout to fully-buffered when the fd
@@ -11835,7 +11740,7 @@ static void kai_assert_check_with_value(KaiValue *cond, const char *base_msg,
  *
  * Per docs/effects-impl.md §*Handler-stack runtime*. Each fiber
  * owns a stack of Evidence nodes; m7a operates with a single
- * implicit fiber (kai_main_fiber), but the layout is per-fiber so
+ * implicit fiber (the root fiber), but the layout is per-fiber so
  * m8's real scheduler can introduce fibers without refactoring
  * this part of the runtime (Doc C OQ #3, decided).
  *
@@ -14737,7 +14642,7 @@ static KaiValue *kai_default_securerandom_bytes(void *self, KaiValue *n_v, KaiCo
  * Spec: docs/fibers-impl.md §*Scheduler* and §*Yield primitives*.
  *
  * Single-threaded cooperative scheduler. The OS thread starts in
- * kai_main_fiber (state=RUNNING); spawned fibers each get a private
+ * its worker's root fiber (state=RUNNING); spawned fibers each get a private
  * heap-allocated stack and a ucontext_t. Yield/park use swapcontext
  * to hand control between fibers. The dispatcher is implicit — there
  * is no separate scheduler context, just whoever was running before
@@ -14985,23 +14890,17 @@ static size_t kai_main_fiber_stack_size(void) {
  * would run on the stack that just overflowed, fault again, and the process
  * dies with no message. Every thread that can run a fiber installs its own. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS void *kai_sigalt_stack;
-extern KAI_TLS int   kai_sigalt_ready;
 extern int   kai_sigsegv_installed;
 #  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS void *kai_sigalt_stack = NULL;
-KAI_TLS int   kai_sigalt_ready = 0;
 int   kai_sigsegv_installed = 0;
 #  endif
 #else
-static KAI_TLS void *kai_sigalt_stack = NULL;
-static KAI_TLS int   kai_sigalt_ready = 0;
 static int   kai_sigsegv_installed = 0;
 #endif
 
 static void kai_fiber_sigsegv_handler(int sig, siginfo_t *info, void *ucp) {
     (void) ucp;
-    KaiFiber *f = kai_active_fiber;
+    KaiFiber *f = kai_worker_here()->active;
     if (f && f->stack_base && info && info->si_addr) {
         char *guard_lo = (char *) f->stack_base;
         char *guard_hi = guard_lo + kai_page_size();
@@ -15034,14 +14933,14 @@ static void kai_fiber_sigsegv_handler(int sig, siginfo_t *info, void *ucp) {
  * fails with EINVAL and is fatal under ASAN. Adopting costs nothing:
  * SA_ONSTACK only needs a stack that is not the one that overflowed.
  *
- * Idempotent; an allocation we make stays owned by the thread-local pointer
- * for the thread's life. */
-static void kai_install_thread_sigaltstack(void) {
-    if (kai_sigalt_ready) return;
+ * Idempotent; an allocation we make stays owned by the worker for the
+ * thread's life. */
+static void kai_install_thread_sigaltstack(KaiWorker *w) {
+    if (w->sigalt_ready) return;
 
     stack_t cur;
     if (sigaltstack(NULL, &cur) == 0 && cur.ss_sp && !(cur.ss_flags & SS_DISABLE)) {
-        kai_sigalt_ready = 1;
+        w->sigalt_ready = 1;
         return;
     }
 
@@ -15049,8 +14948,8 @@ static void kai_install_thread_sigaltstack(void) {
     if (altsize < 32 * 1024) altsize = 32 * 1024;
     void *sp = malloc(altsize);
     if (!sp) return;
-    kai_sigalt_stack = sp;
-    kai_sigalt_ready = 1;
+    w->sigalt_stack = sp;
+    w->sigalt_ready = 1;
 
     stack_t ss;
     ss.ss_sp    = sp;
@@ -15060,7 +14959,7 @@ static void kai_install_thread_sigaltstack(void) {
 }
 
 static void kai_install_fiber_sigsegv_handler(void) {
-    kai_install_thread_sigaltstack();
+    kai_install_thread_sigaltstack(kai_worker_here());
     if (kai_sigsegv_installed) return;
     kai_sigsegv_installed = 1;
 
@@ -15397,7 +15296,7 @@ static void kai_park_trace(const KaiFiber *f, const char *event) {
     KaiParkTraceEntry *e = &kai_park_trace_ring[slot];
     e->fiber         = f;
     e->event         = event;
-    e->thread        = kai_thread_id;
+    e->thread        = kai_worker_here()->id;
     e->state         = f ? f->state : -1;
     e->wake_pending  = f ? f->wake_pending : -1;
     e->reactor_fired = f ? f->reactor_fired : -1;
@@ -16459,7 +16358,7 @@ static void kai_reactor_wait(void) {
 
 /* F2 — link a reactor-parking fiber into the waiter structure its park site
  * stamped, and mark it PARKED, both under `kai_reactor_mu`. Runs on the
- * scheduler root (kai_main_fiber) via `kai_drain_commit_stack` AFTER the
+ * scheduler root via `kai_drain_commit_stack` AFTER the
  * fiber's exit swap finished writing its ctx — never on the fiber's own
  * stack — so the reactor drain can never resume a half-saved context. The
  * self-pipe poke re-arms a reactor already asleep in poll() with a stale
@@ -16570,22 +16469,17 @@ static void kai_sched_commit_park(KaiFiber *f) {
     kai_reactor_wake();
 }
 
-/* Drain this thread's pending-commit stack on the scheduler root. Called
- * right after each dispatch swap returns to kai_main_fiber, so every fiber
- * that reactor-parked this pass is linked before the loop looks for more
- * work. LIFO order is irrelevant — each fiber lands on its own waiter. */
-static void kai_drain_commit_stack(void) {
-    while (kai_commit_stack_head) {
-        KaiFiber *f = kai_commit_stack_head;
-        kai_commit_stack_head = f->commit_next;
+/* Drain the worker's pending-commit stack on its root. Called right after
+ * each dispatch swap returns to the root, so every fiber that parked this
+ * pass is linked before the loop looks for more work. LIFO order is
+ * irrelevant — each fiber lands on its own waiter. */
+static void kai_drain_commit_stack(KaiWorker *w) {
+    while (w->commit_stack_head) {
+        KaiFiber *f = w->commit_stack_head;
+        w->commit_stack_head = f->commit_next;
         f->commit_next = NULL;
         kai_sched_commit_park(f);
     }
-}
-
-/* This thread's scheduler slot. */
-static inline KaiSchedSlot *kai_sched_slot(void) {
-    return &kai_sched_slots[kai_thread_id];
 }
 
 /* Lock the slot that owns fiber `f` and return that slot's index. This
@@ -16625,12 +16519,13 @@ static int kai_fiber_pinned_to(KaiFiber *f) {
 }
 
 static void kai_sched_enqueue(KaiFiber *f) {
+    KaiWorker *w = kai_worker_here();
     if (kai_nthreads > 1) {
         /* A pinned fiber goes on its thread's deque wherever the enqueue
          * runs from — routing it to the caller's slot would hand it to that
          * thread, which is exactly the migration the pin forbids. */
         int pin = kai_fiber_pinned_to(f);
-        int owner = pin >= 0 ? pin : kai_thread_id;
+        int owner = pin >= 0 ? pin : w->id;
         KaiSchedSlot *s = &kai_sched_slots[owner];
         pthread_mutex_lock(&s->mu);
         /* Publish ownership under the same lock that publishes the fiber
@@ -16646,23 +16541,22 @@ static void kai_sched_enqueue(KaiFiber *f) {
         pthread_mutex_unlock(&s->mu);
         /* An owner at its root searches next and takes a lone fiber itself;
          * waking a peer to race it for that fiber is a wasted futex trip. */
-        if (!(was_empty && owner == kai_thread_id
-              && kai_active_fiber == &kai_main_fiber))
+        if (!(was_empty && owner == w->id && w->active == &w->main_fiber))
             kai_sched_notify_work(owner);
         return;
     }
     f->sched_next = NULL;
-    if (kai_ready_tail) {
-        kai_ready_tail->sched_next = f;
+    if (w->ready_tail) {
+        w->ready_tail->sched_next = f;
     } else {
-        kai_ready_head = f;
+        w->ready_head = f;
     }
-    kai_ready_tail = f;
+    w->ready_tail = f;
 }
 
-static KaiFiber *kai_sched_dequeue(void) {
+static KaiFiber *kai_sched_dequeue(KaiWorker *w) {
     if (kai_nthreads > 1) {
-        KaiSchedSlot *s = kai_sched_slot();
+        KaiSchedSlot *s = &kai_sched_slots[w->id];
         pthread_mutex_lock(&s->mu);
         KaiFiber *f = s->steal_head;
         if (f) {
@@ -16673,10 +16567,10 @@ static KaiFiber *kai_sched_dequeue(void) {
         pthread_mutex_unlock(&s->mu);
         return f;
     }
-    KaiFiber *f = kai_ready_head;
+    KaiFiber *f = w->ready_head;
     if (!f) return NULL;
-    kai_ready_head = f->sched_next;
-    if (!kai_ready_head) kai_ready_tail = NULL;
+    w->ready_head = f->sched_next;
+    if (!w->ready_head) w->ready_tail = NULL;
     f->sched_next = NULL;
     return f;
 }
@@ -16688,7 +16582,7 @@ static KaiFiber *kai_sched_dequeue(void) {
  * on the thief's thread, so its non-atomic-RC heap stays single-threaded.
  * A fiber only migrates while READY — never mid-run — so nothing on its
  * suspended stack references the victim thread's TLS. */
-static KaiFiber *kai_sched_steal_from(int victim) {
+static KaiFiber *kai_sched_steal_from(int victim, int thief) {
     KaiSchedSlot *s = &kai_sched_slots[victim];
     if (!s->live) return NULL;
     pthread_mutex_lock(&s->mu);
@@ -16704,7 +16598,7 @@ static KaiFiber *kai_sched_steal_from(int victim) {
         f->sched_next = NULL;
         /* Stamp the new owner under the victim's slot lock so a concurrent
          * remote_unpark that reads home_thread sees a coherent value. */
-        f->home_thread = kai_thread_id;
+        f->home_thread = thief;
     }
     pthread_mutex_unlock(&s->mu);
     return f;
@@ -16716,10 +16610,9 @@ static KaiFiber *kai_sched_steal_from(int victim) {
 static void kai_fiber_trampoline(void);
 
 /* Fall-off-the-end landing for a fiber context. `uc_link` cannot name a
- * scheduler root directly: `kai_main_fiber` is thread-local, so the address
- * baked at spawn belongs to the spawning thread and a stolen fiber would
- * resume a root another thread is running on. Resolve the executing
- * thread's root here instead. */
+ * scheduler root directly: the address baked at spawn belongs to the
+ * spawning worker, and a stolen fiber would resume a root another thread is
+ * running on. Resolve the executing thread's root here instead. */
 static void kai_fiber_uc_link_landing(void);
 static ucontext_t *kai_uc_link_target(void);
 
@@ -16823,12 +16716,12 @@ static void kai_fiber_init_ctx(KaiFiber *f) {
  * locality preserved by the FIFO order the owner maintains), then a
  * round-robin steal sweep over the other live threads. Returns NULL when
  * nothing is runnable anywhere this instant. */
-static KaiFiber *kai_worker_find_work(void) {
-    KaiFiber *f = kai_sched_dequeue();
+static KaiFiber *kai_worker_find_work(KaiWorker *w) {
+    KaiFiber *f = kai_sched_dequeue(w);
     if (f) return f;
     for (int i = 1; i < kai_nthreads; i++) {
-        int victim = (kai_thread_id + i) % kai_nthreads;
-        f = kai_sched_steal_from(victim);
+        int victim = (w->id + i) % kai_nthreads;
+        f = kai_sched_steal_from(victim, w->id);
         if (f) return f;
     }
     return NULL;
@@ -16854,11 +16747,12 @@ static int kai_sched_wake_thread(int tid) {
  * behind its current fiber. Nobody parked costs one load. */
 static void kai_sched_notify_work(int slot) {
     if (atomic_load(&kai_sched_sleepers) == 0) return;
-    if (slot != kai_thread_id && kai_sched_wake_thread(slot)) return;
+    int me = kai_worker_here()->id;
+    if (slot != me && kai_sched_wake_thread(slot)) return;
     if (atomic_load(&kai_sched_spinning) > 0) return;
     for (int i = 1; i <= kai_nthreads; i++) {
-        int t = (kai_thread_id + i) % kai_nthreads;
-        if (t == kai_thread_id || t == slot) continue;
+        int t = (me + i) % kai_nthreads;
+        if (t == me || t == slot) continue;
         if (kai_sched_wake_thread(t)) return;
     }
 }
@@ -17003,11 +16897,11 @@ static void kai_sched_check_deadlock(void) {
  * either seen by the recheck or its producer sees this worker parked and
  * delivers a permit. A permit is consumed by exchange, which acquires the
  * push of every waker that found it already pending. */
-static KaiFiber *kai_worker_park(void) {
-    KaiSchedSlot *s = kai_sched_slot();
+static KaiFiber *kai_worker_park(KaiWorker *w) {
+    KaiSchedSlot *s = &kai_sched_slots[w->id];
     atomic_store(&s->parked, 1);
     atomic_fetch_add(&kai_sched_sleepers, 1);
-    KaiFiber *f = kai_worker_find_work();
+    KaiFiber *f = kai_worker_find_work(w);
     if (!f) {
         /* Idle only once the recheck came up empty: a worker holding an
          * undispatched fiber must never count as idle to the deadlock check. */
@@ -17026,7 +16920,7 @@ static KaiFiber *kai_worker_park(void) {
     /* The recheck already found work, so a permit that raced it was meant
      * for a fiber still queued: pass it on rather than leave that fiber
      * waiting behind this one. */
-    if (f && woken) kai_sched_notify_work(kai_thread_id);
+    if (f && woken) kai_sched_notify_work(w->id);
     return f;
 }
 
@@ -17043,20 +16937,21 @@ static KaiFiber *kai_worker_park(void) {
  * recheck sees any skipped push; leaving with a fiber, it wakes a parked
  * peer if work is still queued. A push the scan below misses landed after
  * this spinner left the count, so its producer did not count on it. */
-static KaiFiber *kai_worker_spin(void) {
+static KaiFiber *kai_worker_spin(KaiWorker *w) {
     atomic_fetch_add(&kai_sched_spinning, 1);
     KaiFiber *f = NULL;
     for (int i = 0; i < KAI_SPIN_ROUNDS && !f && !kai_sched_shutting_down; i++) {
         sched_yield();
-        f = kai_worker_find_work();
+        f = kai_worker_find_work(w);
     }
     int last = atomic_fetch_sub(&kai_sched_spinning, 1) == 1;
-    if (f && last && !kai_all_deques_empty()) kai_sched_notify_work(kai_thread_id);
+    if (f && last && !kai_all_deques_empty()) kai_sched_notify_work(w->id);
     return f;
 }
 
-/* The per-thread scheduler loop, run ON this thread's kai_main_fiber
- * (the OS-thread context). A worker thread enters here after startup; the
+/* The per-thread scheduler loop, run ON the worker's root fiber
+ * (the OS-thread context). A root never changes thread, so it holds `w`
+ * across every switch. A worker thread enters here after startup; the
  * main thread enters it only implicitly (its main_fiber IS the program's
  * initial context, and park/trampoline swap back here when the local
  * queue drains). The loop: run everything runnable locally or stolen; when
@@ -17064,28 +16959,28 @@ static KaiFiber *kai_worker_spin(void) {
  * until a producer or shutdown wakes it. Exits when the program has terminated (shutdown
  * flag set) — only the workers exit here; the main thread's loop returns
  * control to `main` via the root fiber finishing. */
-static void kai_worker_loop(void) {
-    KaiFiber *self_root = &kai_main_fiber;
-    KAI_TSAN_BIND_ROOT();
+static void kai_worker_loop(KaiWorker *w) {
+    KaiFiber *root = &w->main_fiber;
+    KAI_TSAN_BIND_ROOT(w);
     while (!kai_sched_shutting_down) {
-        KaiFiber *next = kai_worker_find_work();
-        if (!next) next = kai_worker_spin();
-        if (!next) next = kai_worker_park();
+        KaiFiber *next = kai_worker_find_work(w);
+        if (!next) next = kai_worker_spin(w);
+        if (!next) next = kai_worker_park(w);
         if (!next) continue;
         next->state = KAI_FIBER_RUNNING;
-        kai_active_fiber = next;
+        kai_worker_run(w, next);
         KAI_TSAN_SWITCH_TO(next);
-        swapcontext(&self_root->ctx, &next->ctx);
-        kai_active_fiber = self_root;
-        kai_drain_pending_free();
-        /* F2 — from the root context (kai_main_fiber), after the exit
+        swapcontext(&root->ctx, &next->ctx);
+        w->active = root;
+        kai_drain_pending_free(w);
+        /* F2 — from the root context, after the exit
          * swap above saved the fiber's ctx: link any fiber that
          * reactor-parked into the wheel/waiter list, and requeue any
          * fiber that yielded onto the steal list. Both are unsafe to do
          * on the fiber's own stack (a thief/reactor could resume a
          * half-saved ctx), so they are deferred to here. */
-        kai_drain_commit_stack();
-        kai_drain_requeue_stack();
+        kai_drain_commit_stack(w);
+        kai_drain_requeue_stack(w);
     }
 }
 
@@ -17093,7 +16988,8 @@ static void kai_worker_loop(void) {
  * swaps to the head of the queue. No-op if the queue is empty (caller
  * is the only ready fiber, nothing to switch to). */
 static void kai_sched_yield(void) {
-    KaiFiber *current = kai_current_fiber();
+    KaiWorker *w = kai_worker_here();
+    KaiFiber *current = w->active;
 
     /* M:N: never enqueue `current` on the steal list before its ctx is
      * saved — a thief could resume a half-written context. Defer the
@@ -17104,39 +17000,35 @@ static void kai_sched_yield(void) {
      * is runnable this instant, the loop simply redispatches `current`. */
     if (kai_nthreads > 1) {
         current->state = KAI_FIBER_READY;
-        current->commit_next  = kai_requeue_stack_head;
-        kai_requeue_stack_head = current;
-        kai_active_fiber = &kai_main_fiber;
-        KAI_TSAN_SWITCH_TO_ROOT();
-        swapcontext(&current->ctx, &kai_main_fiber.ctx);
-        kai_set_active_fiber(current);
-        kai_drain_pending_free();
+        current->commit_next  = w->requeue_stack_head;
+        w->requeue_stack_head = current;
+        w->active = &w->main_fiber;
+        KAI_TSAN_SWITCH_TO_ROOT(w);
+        swapcontext(&current->ctx, &w->main_fiber.ctx);
+        kai_drain_pending_free(current->worker);
         return;
     }
 
-    KaiFiber *next = kai_sched_dequeue();
+    KaiFiber *next = kai_sched_dequeue(w);
     if (!next) return;  /* alone — nothing to yield to */
     current->state = KAI_FIBER_READY;
     kai_sched_enqueue(current);
     next->state = KAI_FIBER_RUNNING;
-    kai_active_fiber = next;
+    kai_worker_run(w, next);
     KAI_TSAN_SWITCH_TO(next);
     swapcontext(&current->ctx, &next->ctx);
-    /* Resumed: another fiber yielded/parked back to us; the swap
-     * source (current->ctx) holds the state that was just restored.
-     * R4 fix — if the fiber that swapped to us was the trampoline
-     * tail of a now-discarded fiber, `kai_pending_free` carries its
-     * deferred struct + stack. Reap before continuing. */
-    kai_drain_pending_free();
+    /* If the fiber that switched to us was the tail of a now-discarded
+     * fiber, its struct and stack wait in pending_free. */
+    kai_drain_pending_free(current->worker);
 }
 
-/* Drain this thread's pending-requeue stack on the scheduler root: each
- * yielded fiber's exit swap has completed, so it is now safe to publish it
- * to the steal list. */
-static void kai_drain_requeue_stack(void) {
-    while (kai_requeue_stack_head) {
-        KaiFiber *f = kai_requeue_stack_head;
-        kai_requeue_stack_head = f->commit_next;
+/* Drain the worker's pending-requeue stack on its root: each yielded
+ * fiber's exit swap has completed, so it is now safe to publish it to the
+ * steal list. */
+static void kai_drain_requeue_stack(KaiWorker *w) {
+    while (w->requeue_stack_head) {
+        KaiFiber *f = w->requeue_stack_head;
+        w->requeue_stack_head = f->commit_next;
         f->commit_next = NULL;
         kai_sched_enqueue(f);
     }
@@ -17154,7 +17046,8 @@ static void kai_drain_requeue_stack(void) {
  * `ready queue empty AND reactor empty` — only that combination
  * means no path to forward progress. */
 static void kai_sched_park(void) {
-    KaiFiber *current = kai_current_fiber();
+    KaiWorker *w = kai_worker_here();
+    KaiFiber *current = w->active;
     /* Any prior park's fired stamp is history; the sites read it only for
      * THIS park's resume. Safe here: the fiber is not linked into any
      * reactor structure a drain could fire from (N>1 links at commit;
@@ -17162,7 +17055,7 @@ static void kai_sched_park(void) {
     current->reactor_fired = 0;
 
     /* M:N path: a parking fiber returns to this thread's scheduler loop
-     * (kai_main_fiber) — never runs poll() or a condvar wait on its own
+     * — never runs poll() or a condvar wait on its own
      * stack (asu invariant: nothing that blocks the OS thread runs on a
      * user fiber's stack).
      *
@@ -17181,13 +17074,12 @@ static void kai_sched_park(void) {
         int was_reactor = (current->pending_park != KAI_PARK_NONE &&
                            current->pending_park != KAI_PARK_SLOT);
         if (!current->pending_park) current->pending_park = KAI_PARK_SLOT;
-        current->commit_next   = kai_commit_stack_head;
-        kai_commit_stack_head  = current;
-        kai_active_fiber = &kai_main_fiber;
-        KAI_TSAN_SWITCH_TO_ROOT();
-        swapcontext(&current->ctx, &kai_main_fiber.ctx);
-        kai_set_active_fiber(current);
-        kai_drain_pending_free();
+        current->commit_next = w->commit_stack_head;
+        w->commit_stack_head = current;
+        w->active = &w->main_fiber;
+        KAI_TSAN_SWITCH_TO_ROOT(w);
+        swapcontext(&current->ctx, &w->main_fiber.ctx);
+        kai_drain_pending_free(current->worker);
         /* A reactor park that resumes without the reactor's own splice
          * (a message wake off the recv chain, a consumed permit, or a
          * stale unpark) may still be linked into the wheel or a waiter
@@ -17208,18 +17100,18 @@ static void kai_sched_park(void) {
      * when state != PARKED, so a fiber whose state is still RUNNING
      * when its deadline fires would be lost. */
     current->state = KAI_FIBER_PARKED;
-    kai_parked_count++;
+    w->parked_count++;
 
-    KaiFiber *next = kai_sched_dequeue();
+    KaiFiber *next = kai_sched_dequeue(w);
     while (!next) {
         if (kai_reactor_parked_count > 0) {
             kai_reactor_wait();
-            next = kai_sched_dequeue();
+            next = kai_sched_dequeue(w);
             continue;
         }
         fprintf(stderr,
             "kai: deadlock — fiber parked with empty run queue (%d parked total)\n",
-            kai_parked_count);
+            w->parked_count);
         kai_exit(1);
     }
     if (next == current) {
@@ -17227,7 +17119,7 @@ static void kai_sched_park(void) {
          * Skip the swapcontext (we are still on our own stack) and
          * unwind the parked accounting we just bumped. */
         current->state = KAI_FIBER_RUNNING;
-        kai_parked_count--;
+        w->parked_count--;
         /* Issue #679: also observe a sibling-triggered cancel here.
          * The unpark path from `kai_default_spawn_cancel`'s reactor
          * detach lands here when the canceller is on the same OS
@@ -17236,11 +17128,10 @@ static void kai_sched_park(void) {
         return;
     }
     next->state = KAI_FIBER_RUNNING;
-    kai_active_fiber = next;
+    kai_worker_run(w, next);
     KAI_TSAN_SWITCH_TO(next);
     swapcontext(&current->ctx, &next->ctx);
-    /* R4 fix — see kai_sched_yield: drain pending free on resume. */
-    kai_drain_pending_free();
+    kai_drain_pending_free(current->worker);
     /* Issue #679: every reactor-driven park resumes here. If a
      * sibling fiber called Spawn.cancel(self) while we were parked,
      * the reactor detach + unpark wakes us and we must observe the
@@ -17267,7 +17158,7 @@ static void kai_sched_unpark(KaiFiber *target) {
     if (kai_nthreads > 1) { kai_sched_remote_unpark(target); return; }
     if (target->state != KAI_FIBER_PARKED) return;
     target->state = KAI_FIBER_READY;
-    kai_parked_count--;
+    kai_worker_here()->parked_count--;
     kai_sched_enqueue(target);
 }
 
@@ -17298,8 +17189,9 @@ static KaiExitFibers kai_rc_settle_exit_fibers(void) {
         }
         settled.started = atomic_load(&kai_blocked_fiber_count);
     } else {
-        queues[nq++] = kai_exit_queue_take(&kai_ready_head, &kai_ready_tail);
-        settled.started = kai_parked_count;
+        KaiWorker *w = kai_worker_here();
+        queues[nq++] = kai_exit_queue_take(&w->ready_head, &w->ready_tail);
+        settled.started = w->parked_count;
     }
     for (int q = 0; q < nq; q++) {
         for (KaiFiber *f = queues[q], *next; f; f = next) {
@@ -17315,8 +17207,8 @@ static KaiExitFibers kai_rc_settle_exit_fibers(void) {
 }
 
 /* Trampoline: the entry point makecontext installs on every spawned
- * fiber's stack. Reads kai_active_fiber to find itself (set by the
- * dispatcher who swapped in), runs the thunk, walks awaiters, and
+ * fiber's stack. Reads its worker's active fiber to find itself (set by
+ * the dispatcher who swapped in), runs the thunk, walks awaiters, and
  * hands control to the next ready fiber via setcontext.
  *
  * Phase 3 — Cancel landing: setjmp(cancel_pad) before the body runs.
@@ -17329,55 +17221,38 @@ static KaiExitFibers kai_rc_settle_exit_fibers(void) {
  * trampoline only borrows it. kai_free_value's KAI_FIBER branch decrefs
  * both thunk and result when f's RC drops. */
 static void kai_fiber_uc_link_landing(void) {
-    kai_active_fiber = &kai_main_fiber;
-    KAI_TSAN_SWITCH_TO_ROOT();
-    setcontext(&kai_main_fiber.ctx);
+    KaiWorker *w = kai_worker_here();
+    w->active = &w->main_fiber;
+    KAI_TSAN_SWITCH_TO_ROOT(w);
+    setcontext(&w->main_fiber.ctx);
     fprintf(stderr, "kai: fiber uc_link landing failed to reach the scheduler root\n");
     kai_exit(1);
 }
 
-/* Per-thread context whose entry point is the landing above. Every fiber
- * spawned on this thread links here, so a fall-off-the-end resolves the
- * root of whichever thread is executing rather than the spawner's.
- *
- * The stack size is a literal, not SIGSTKSZ: glibc defines that as a
- * sysconf() call, which makes a file-scope array a VLA and fails to
- * compile. The landing only runs setcontext, so this is generous. */
-#define KAI_UC_LINK_STACK_SIZE 65536
-#if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS ucontext_t kai_uc_link_ctx;
-extern KAI_TLS char kai_uc_link_stack[KAI_UC_LINK_STACK_SIZE];
-extern KAI_TLS int kai_uc_link_ready;
-#  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS ucontext_t kai_uc_link_ctx;
-KAI_TLS char kai_uc_link_stack[KAI_UC_LINK_STACK_SIZE];
-KAI_TLS int kai_uc_link_ready = 0;
-#  endif
-#else
-static KAI_TLS ucontext_t kai_uc_link_ctx;
-static KAI_TLS char kai_uc_link_stack[KAI_UC_LINK_STACK_SIZE];
-static KAI_TLS int kai_uc_link_ready = 0;
-#endif
-
+/* Per-worker context whose entry point is the landing above. Every fiber
+ * spawned on this worker links here, so a fall-off-the-end resolves the
+ * root of whichever thread is executing rather than the spawner's. */
 static ucontext_t *kai_uc_link_target(void) {
-    if (!kai_uc_link_ready) {
-        if (getcontext(&kai_uc_link_ctx) != 0) return &kai_main_fiber.ctx;
-        kai_uc_link_ctx.uc_stack.ss_sp   = kai_uc_link_stack;
-        kai_uc_link_ctx.uc_stack.ss_size = sizeof(kai_uc_link_stack);
-        kai_uc_link_ctx.uc_link          = NULL;
-        makecontext(&kai_uc_link_ctx, kai_fiber_uc_link_landing, 0);
-        kai_uc_link_ready = 1;
+    KaiWorker *w = kai_worker_here();
+    if (!w->uc_link_ready) {
+        if (getcontext(&w->uc_link_ctx) != 0) return &w->main_fiber.ctx;
+        w->uc_link_ctx.uc_stack.ss_sp   = w->uc_link_stack;
+        w->uc_link_ctx.uc_stack.ss_size = sizeof(w->uc_link_stack);
+        w->uc_link_ctx.uc_link          = NULL;
+        makecontext(&w->uc_link_ctx, kai_fiber_uc_link_landing, 0);
+        w->uc_link_ready = 1;
     }
-    return &kai_uc_link_ctx;
+    return &w->uc_link_ctx;
 }
 
 static void kai_fiber_trampoline(void) {
-    KaiFiber *self = kai_active_fiber;
+    KaiWorker *w = kai_worker_here();
+    KaiFiber *self = w->active;
     /* First entry follows a setcontext from another fiber's
      * trampoline tail or a swap from yield/park. Drain any pending
      * struct free left behind by the previous fiber's
      * `kai_decref(self->value)` before we touch our own state. */
-    kai_drain_pending_free();
+    kai_drain_pending_free(w);
     self->unwind_frame = (uintptr_t) __builtin_frame_address(0);
     if (setjmp(self->cancel_pad) == 0) {
         self->cancel_pad_set = 1;
@@ -17498,8 +17373,9 @@ static void kai_fiber_trampoline(void) {
      * kai_free_value defers the struct/stack free into kai_pending_free (we
      * are still on this stack) and the next drain reaps it; byte-identical to
      * the pre-M:N path. */
+    w = self->worker;
     if (self->value) {
-        if (kai_nthreads > 1) kai_pending_sched_drop_set(self->value);
+        if (kai_nthreads > 1) w->pending_sched_drop = self->value;
         else                  kai_decref(self->value);
     }
 
@@ -17511,43 +17387,40 @@ static void kai_fiber_trampoline(void) {
      * remain (timer wheel, pid map, file-pool list), block in
      * kai_reactor_wait until a wake event promotes someone before
      * declaring deadlock. */
-    /* M:N — a finished fiber with no local successor returns to this
-     * thread's scheduler loop (kai_main_fiber), which steals or idles.
-     * We setcontext explicitly so the loop resumes at its swap point
-     * rather than falling off the end into the uc_link landing.
-     *
-     * Both handoffs write kai_active_fiber out of line. This frame spans the
-     * fiber's whole body, so an inline store reuses the slot address resolved
-     * in the prologue — on the thread that first dispatched the fiber, not the
-     * one the tail runs on after a steal. */
+    /* M:N — a finished fiber with no local successor returns to its
+     * worker's scheduler loop, which steals or idles. We setcontext
+     * explicitly so the loop resumes at its swap point rather than falling
+     * off the end into the uc_link landing. This frame spans the fiber's
+     * whole body, so `w` was re-read from `self` above, not kept from the
+     * prologue: the fiber may have been stolen since. */
     if (kai_nthreads > 1) {
-        KaiFiber *next = kai_sched_dequeue();
+        KaiFiber *next = kai_sched_dequeue(w);
         if (next) {
             next->state = KAI_FIBER_RUNNING;
-            kai_set_active_fiber(next);
+            kai_worker_run(w, next);
             KAI_TSAN_SWITCH_TO(next);
             setcontext(&next->ctx);
         }
-        kai_set_active_fiber(&kai_main_fiber);
-        KAI_TSAN_SWITCH_TO_ROOT();
-        setcontext(&kai_main_fiber.ctx);
+        w->active = &w->main_fiber;
+        KAI_TSAN_SWITCH_TO_ROOT(w);
+        setcontext(&w->main_fiber.ctx);
         /* setcontext does not return. */
     }
 
-    KaiFiber *next = kai_sched_dequeue();
+    KaiFiber *next = kai_sched_dequeue(w);
     while (!next) {
         if (kai_reactor_parked_count > 0) {
             kai_reactor_wait();
-            next = kai_sched_dequeue();
+            next = kai_sched_dequeue(w);
             continue;
         }
         fprintf(stderr,
             "kai: fiber finished with empty run queue (%d parked) — deadlock\n",
-            kai_parked_count);
+            w->parked_count);
         kai_exit(1);
     }
     next->state = KAI_FIBER_RUNNING;
-    kai_active_fiber = next;
+    kai_worker_run(w, next);
     KAI_TSAN_SWITCH_TO(next);
     setcontext(&next->ctx);
     /* setcontext does not return. */
@@ -17593,8 +17466,9 @@ static int kai_read_rc_runs(void) {
  * publishes the result, flips the shutdown flag, and returns to thread 0's
  * scheduler loop. */
 static void kai_bootstrap_trampoline(void) {
-    KaiFiber *self = kai_active_fiber;
-    kai_drain_pending_free();
+    KaiWorker *w = kai_worker_here();
+    KaiFiber *self = w->active;
+    kai_drain_pending_free(w);
     self->state = KAI_FIBER_RUNNING;
     for (int run = kai_read_rc_runs(); run > 1; run--) kai_decref(kai_user_main_fn());
     kai_user_main_result = kai_user_main_fn();
@@ -17602,13 +17476,12 @@ static void kai_bootstrap_trampoline(void) {
     /* Program is over: flip the shutdown flag. kai_sched_bootstrap wakes
      * the parked workers and the reactor once thread 0's loop sees it. */
     kai_sched_shutting_down = 1;
-    /* Hand back to this thread's scheduler loop, which sees the shutdown
-     * flag and returns to kai_sched_bootstrap. Out of line: this frame spans
-     * the whole user main, so an inline store would reuse the slot address
-     * resolved before main ever parked. */
-    kai_set_active_fiber(&kai_main_fiber);
-    KAI_TSAN_SWITCH_TO_ROOT();
-    setcontext(&kai_main_fiber.ctx);
+    /* Hand back to the worker's scheduler loop, which sees the shutdown
+     * flag and returns to kai_sched_bootstrap. */
+    w = self->worker;
+    w->active = &w->main_fiber;
+    KAI_TSAN_SWITCH_TO_ROOT(w);
+    setcontext(&w->main_fiber.ctx);
 }
 
 #if defined(KAI_MAIN_STACK_SIZE)
@@ -17626,12 +17499,12 @@ static KaiValue *kai_run_main_on_sized_stack(KaiValue *(*user_main)(void)) {
     size_t ps = kai_page_size();
     if (size % ps != 0) size = ((size / ps) + 1) * ps;
     kai_install_fiber_sigsegv_handler();
-    kai_active_fiber_anchor();
+    KaiFiber *root = &kai_worker_here()->main_fiber;
     kai_user_main_fn = user_main;
     ucontext_t host, ctx;
     void *region = kai_stack_map(size);
-    kai_main_fiber.stack_base = region;
-    kai_main_fiber.stack_size = size;
+    root->stack_base = region;
+    root->stack_size = size;
     if (getcontext(&ctx) != 0) {
         fprintf(stderr, "kai: getcontext failed for main\n");
         kai_exit(1);
@@ -17640,8 +17513,8 @@ static KaiValue *kai_run_main_on_sized_stack(KaiValue *(*user_main)(void)) {
     ctx.uc_link = &host;
     makecontext(&ctx, kai_sized_main_trampoline, 0);
     swapcontext(&host, &ctx);
-    kai_main_fiber.stack_base = NULL;
-    kai_main_fiber.stack_size = 0;
+    root->stack_base = NULL;
+    root->stack_size = 0;
     munmap(region, size + ps);
     return kai_user_main_result;
 }
@@ -17662,14 +17535,14 @@ static pthread_t kai_worker_threads[KAI_MAX_THREADS];
 /* Worker thread entry: adopt an id, anchor this thread's root fiber,
  * mark the slot live, and run the scheduler loop until shutdown. */
 static void *kai_worker_thread_main(void *arg) {
-    kai_thread_id = (int) (intptr_t) arg;
+    KaiWorker *w = kai_worker_here();
+    w->id = (int) (intptr_t) arg;
     /* Per-thread: without it a fiber overflowing here dies undiagnosed. */
-    kai_install_thread_sigaltstack();
-    kai_active_fiber_anchor();
-    kai_main_fiber.home_thread = kai_thread_id;
-    kai_sched_slots[kai_thread_id].live = 1;
+    kai_install_thread_sigaltstack(w);
+    w->main_fiber.home_thread = w->id;
+    kai_sched_slots[w->id].live = 1;
     kai_rc_ledger_register();
-    kai_worker_loop();
+    kai_worker_loop(w);
     kai_seg_pool_drain();
     kai_rc_ledger_fold();
     return NULL;
@@ -17684,10 +17557,11 @@ static void *kai_worker_thread_main(void *arg) {
  * never-live slot index it never dispatches from. */
 static void *kai_reactor_thread_main(void *arg) {
     (void) arg;
-    kai_thread_id = kai_nthreads;
+    KaiWorker *w = kai_worker_here();
+    w->id = kai_nthreads;
     /* Never dispatches fibers, but keeps the scheduler threads uniform: a
      * fault here reaches the handler instead of compounding on this stack. */
-    kai_install_thread_sigaltstack();
+    kai_install_thread_sigaltstack(w);
     kai_rc_ledger_register();
     for (;;) {
         if (kai_sched_shutting_down) break;
@@ -17749,7 +17623,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     kai_nthreads = kai_read_nthreads();
     if (kai_nthreads <= 1) {
         kai_nthreads = 1;
-        KAI_TSAN_BIND_ROOT();
+        KAI_TSAN_BIND_ROOT(kai_worker_here());
 #if defined(KAI_MAIN_STACK_SIZE)
         return kai_run_main_on_sized_stack(user_main);
 #endif
@@ -17780,9 +17654,9 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
      * (kai_reactor_init is otherwise lazy, triggered by the first park). */
     pthread_mutex_init(&kai_reactor_mu, NULL);
     kai_reactor_init();
-    kai_thread_id = 0;
-    kai_active_fiber_anchor();
-    kai_main_fiber.home_thread = 0;
+    KaiWorker *w = kai_worker_here();
+    w->id = 0;
+    w->main_fiber.home_thread = 0;
     kai_sched_slots[0].live = 1;
 
     /* Spawn kai_main as a fiber on thread 0's deque. It gets a main-thread
@@ -17830,9 +17704,9 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     }
 
 
-    /* Thread 0 runs the scheduler loop (its kai_main_fiber is the loop
+    /* Thread 0 runs the scheduler loop (its root fiber is the loop
      * context) until the bootstrap trampoline flips the shutdown flag. */
-    kai_worker_loop();
+    kai_worker_loop(w);
 
     /* Shutdown: the bootstrap trampoline set kai_sched_shutting_down; wake
      * the parked workers and poke the reactor out of poll() so every thread
@@ -19678,8 +19552,8 @@ static void kai_evidence_diag(KaiEvidence *node, const char *eff_label) {
         "  evidence_top=%p in_dispatch=%p parent=%p\n"
         "  mailbox=%p mb_owner=%p mb_owner_is_self=%d\n",
         eff_label, (void *)node, node ? (void *)node->handler : NULL,
-        (void *)f, f == &kai_main_fiber, f ? (int)f->state : -1,
-        f ? (int)f->home_thread : -1, kai_thread_id, kai_nthreads,
+        (void *)f, f == &kai_worker_here()->main_fiber, f ? (int)f->state : -1,
+        f ? (int)f->home_thread : -1, kai_worker_here()->id, kai_nthreads,
         f ? (void *)f->evidence_top : NULL, f ? (void *)f->in_dispatch_node : NULL,
         f ? (void *)f->parent : NULL,
         (void *)mb, mb ? (void *)mb->owner_fiber : NULL,
