@@ -96,7 +96,7 @@ pub fn doc_text_normalize(s: String) : String {
 pub type DocItem = { kind: String, name: String, line: Int, is_pub: Bool, doc: Option[String], sig: Option[String] }
 
 # Result of the post-parse strip walk.
-pub type DocStrip = { decls: [Decl], module_doc: Option[String], items: [DocItem], errs: Int }
+pub type DocStrip = { decls: [Decl], module_doc: Option[String], items: [DocItem], errs: Int, diags: [Diagnostic] }
 
 #[doc("DocItem for a named declaration, seeing through DUnstable / DDerive / DDoc wrappers. None for unnamed decls (tests, imports...).")]
 pub fn doc_item_of(d: Decl, doc: Option[String]) : Option[DocItem] {
@@ -242,18 +242,18 @@ fn doc_label(l: RowLabel) : String =
 
 #[doc("Post-parse strip for the root file: unwrap DDoc into the side table, keep the first DModuleDoc decl in the stream for the typer.")]
 pub fn doc_strip_collect(file: String, src: String, decls: [Decl]) : DocStrip / Console =
-  dsc_loop(file, src, decls, true, [], [], None, 0)
+  dsc_loop(file, src, decls, true, [], [], None, [])
 
 #[doc("Post-parse strip for imported / core modules: same walk, but module docs are dropped from the stream too (Phase 2 will collect them).")]
 pub fn doc_strip_all(file: String, src: String, decls: [Decl]) : DocStrip / Console =
-  dsc_loop(file, src, decls, false, [], [], None, 0)
+  dsc_loop(file, src, decls, false, [], [], None, [])
 
 fn dsc_loop(file: String, src: String, ds: [Decl], keep_mod: Bool,
             acc: [Decl], items: [DocItem], module_doc: Option[String],
-            errs: Int) : DocStrip / Console {
+            errs: [Diagnostic]) : DocStrip / Console {
   match ds {
     [] -> DocStrip { decls: list_reverse(acc), module_doc: module_doc,
-                     items: list_reverse(items), errs: errs }
+                     items: list_reverse(items), errs: list_length(errs), diags: list_reverse(errs) }
     [d, ...rest] -> match d {
       DDoc(_, text, inner, _, _) -> {
         let bare = attr_dissolve(inner)
@@ -280,8 +280,8 @@ fn dsc_loop(file: String, src: String, ds: [Decl], keep_mod: Bool,
         if kind_catalog_file(file) {
           dsc_loop(file, src, rest, keep_mod, acc, items, module_doc, errs)
         } else {
-          diag_error_from_src(file, src, ln, col, theory_reject_msg(props))
-          dsc_loop(file, src, rest, keep_mod, acc, items, module_doc, errs + 1)
+          dsc_loop(file, src, rest, keep_mod, acc, items, module_doc,
+                   [dsc_error(file, src, ln, col, theory_reject_msg(props)), ...errs])
         }
       # `DKind` is kept past the doc strip: the kind-resolution pass
       # reads its introducer->kind map (over the merged stream) before
@@ -298,17 +298,22 @@ fn dsc_loop(file: String, src: String, ds: [Decl], keep_mod: Bool,
   }
 }
 
+fn dsc_error(file: String, src: String, line: Int, col: Int, msg: String) : Diagnostic / Console = {
+  diag_error_from_src(file, src, line, col, msg)
+  mk_diag(SevError, file, line, col, msg, [])
+}
+
 # The DKind arm of dsc_loop: a closed-kind violation drops the decl
 # with its diagnostic; a legal decl is kept for the kind-resolution
 # pass.
 fn dsc_kind_arm(file: String, src: String, d: Decl, kname: String,
                 kthy: String, kln: Int, kcol: Int, rest: [Decl],
                 keep_mod: Bool, acc: [Decl], items: [DocItem],
-                module_doc: Option[String], errs: Int) : DocStrip / Console {
+                module_doc: Option[String], errs: [Diagnostic]) : DocStrip / Console {
   match kind_closed_msg(file, kname, kthy) {
     Some(msg) -> {
-      diag_error_from_src(file, src, kln, kcol, msg)
-      dsc_loop(file, src, rest, keep_mod, acc, items, module_doc, errs + 1)
+      dsc_loop(file, src, rest, keep_mod, acc, items, module_doc,
+               [dsc_error(file, src, kln, kcol, msg), ...errs])
     }
     None ->
       dsc_loop(file, src, rest, keep_mod, [d, ...acc],
@@ -322,16 +327,16 @@ fn dsc_kind_arm(file: String, src: String, d: Decl, kname: String,
 fn dsc_module_arm(file: String, src: String, d: Decl, text: String,
                   ln: Int, col: Int, rest: [Decl], keep_mod: Bool,
                   acc: [Decl], items: [DocItem], module_doc: Option[String],
-                  errs: Int) : DocStrip / Console {
+                  errs: [Diagnostic]) : DocStrip / Console {
   match module_doc {
     None ->
       dsc_loop(file, src, rest, keep_mod,
                if keep_mod { [d, ...acc] } else { acc },
                items, Some(text), errs)
     Some(_) -> {
-      diag_error_from_src(file, src, ln, col,
+      let d = dsc_error(file, src, ln, col,
         "second module-level `#[doc(...)]` — a file has at most one module doc (a `#[doc(...)]` not directly above a declaration is the module doc)")
-      dsc_loop(file, src, rest, keep_mod, acc, items, module_doc, errs + 1)
+      dsc_loop(file, src, rest, keep_mod, acc, items, module_doc, [d, ...errs])
     }
   }
 }
