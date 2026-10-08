@@ -2417,37 +2417,35 @@ void kaix_panic_no_impl(const char *proto, const char *op, int32_t head) {
  * receiver `a0`, the impl resolves through the runtime table populated at
  * startup by `_kai_proto_init_llvm`, and a NULL lookup panics with the
  * SAME message the C-direct oracle emits (`emit_proto_dispatch_shim_c`).
- * `pid` / `op` / `pname` / `opname` arrive boxed (three Ints/Strings) so the
- * native lowering can pass them as ordinary boxed call args — no raw-arg
- * marshalling in the IR. The impl table keys on (proto_id, op_id, head_tag):
+ * `pid` / `op` arrive raw and `pname` / `opname` as C string constants the
+ * native lowering emits once per dispatcher: a dispatch allocates nothing,
+ * and the names are read only by the panic. The impl table keys on (proto_id, op_id, head_tag):
  * a multi-op protocol (Ord cmp/min/max) shares (proto_id, head_tag), so `op`
  * disambiguates. The cast-per-arity lives HERE, compiled and verified by the
  * C compiler, NOT reconstructed in the C-API builder: one source of truth
  * for the dispatch ABI, shared with the oracle. */
-static void *kaix_proto_resolve(KaiValue *pid, KaiValue *op, KaiValue *pname, KaiValue *opname, KaiValue *recv) {
-    int32_t proto_id = (int32_t) kai_intf(pid);
-    int32_t op_id = (int32_t) kai_intf(op);
+static void *kaix_proto_resolve(int64_t pid, int64_t op, const char *pname, const char *opname, KaiValue *recv) {
     int32_t head = kai_head_tag(recv);
-    void *fn = kai_lookup_impl(proto_id, op_id, head);
+    void *fn = kai_lookup_impl((int32_t) pid, (int32_t) op, head);
     if (fn == NULL) {
-        kaix_panic_no_impl(pname->as.s.bytes, opname->as.s.bytes, head);
+        kaix_panic_no_impl(pname, opname, head);
     }
     return fn;
 }
 
-KaiValue *kaix_proto_dispatch1(KaiValue *pid, KaiValue *op, KaiValue *pname, KaiValue *opname,
+KaiValue *kaix_proto_dispatch1(int64_t pid, int64_t op, const char *pname, const char *opname,
                                KaiValue *a0) {
     void *fn = kaix_proto_resolve(pid, op, pname, opname, a0);
     return ((KaiValue *(*)(KaiValue *)) fn)(a0);
 }
 
-KaiValue *kaix_proto_dispatch2(KaiValue *pid, KaiValue *op, KaiValue *pname, KaiValue *opname,
+KaiValue *kaix_proto_dispatch2(int64_t pid, int64_t op, const char *pname, const char *opname,
                                KaiValue *a0, KaiValue *a1) {
     void *fn = kaix_proto_resolve(pid, op, pname, opname, a0);
     return ((KaiValue *(*)(KaiValue *, KaiValue *)) fn)(a0, a1);
 }
 
-KaiValue *kaix_proto_dispatch3(KaiValue *pid, KaiValue *op, KaiValue *pname, KaiValue *opname,
+KaiValue *kaix_proto_dispatch3(int64_t pid, int64_t op, const char *pname, const char *opname,
                                KaiValue *a0, KaiValue *a1, KaiValue *a2) {
     void *fn = kaix_proto_resolve(pid, op, pname, opname, a0);
     return ((KaiValue *(*)(KaiValue *, KaiValue *, KaiValue *)) fn)(a0, a1, a2);
