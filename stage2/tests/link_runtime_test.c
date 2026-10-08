@@ -98,7 +98,7 @@ int main(void) {
     {
         KaiFiber owner = {0};
         owner.state = KAI_FIBER_RUNNING;
-        kai_active_fiber = &owner;
+        kai_worker_here()->active = &owner;
         KaiMailbox *mb = kai_mailbox_alloc();
         check("mailbox owner is current fiber", mb->owner_fiber == &owner);
         check("alloc stamps owner.mailbox",     owner.mailbox == mb);
@@ -108,7 +108,7 @@ int main(void) {
         check("nested close restores the outer", owner.mailbox == mb);
         kai_mailbox_close(mb);
         check("close clears owner.mailbox",     owner.mailbox == NULL);
-        kai_active_fiber = &kai_main_fiber;  /* restore */
+        kai_worker_here()->active = &kai_worker_here()->main_fiber;  /* restore */
     }
 
     /* Tier 2 trap-exit propagation. Two scenarios:
@@ -123,12 +123,12 @@ int main(void) {
         dying.state   = KAI_FIBER_RUNNING;
         watcher.state = KAI_FIBER_RUNNING;
 
-        kai_active_fiber = &watcher;
+        kai_worker_here()->active = &watcher;
         KaiMailbox *wmb = kai_mailbox_alloc();
         watcher.trap_exit = 1;
         check("watcher mailbox stamped", watcher.mailbox == wmb);
 
-        kai_active_fiber = &dying;
+        kai_worker_here()->active = &dying;
         kai_link_add_bidirectional(&dying, &watcher);
 
         /* Normal exit. */
@@ -164,7 +164,7 @@ int main(void) {
         }
 
         kai_mailbox_close(wmb);
-        kai_active_fiber = &kai_main_fiber;
+        kai_worker_here()->active = &kai_worker_here()->main_fiber;
     }
 
     /* Tier 2: peer with trap_exit=0 still gets cancel_requested. */

@@ -237,9 +237,9 @@ Three primitives in `stage0/runtime.h`:
   enqueued at the run queue tail. Caller stays RUNNING (does not
   yield); the unparked fiber runs whenever the scheduler reaches it.
 
-`kai_active_fiber` replaces `kai_main_fiber` as the value returned
-by `kai_current_fiber()`. The pointer is updated in
-`kai_sched_dispatch` before `swapcontext`. Per-fiber `evidence_top`
+The worker's `active` fiber is the value returned by
+`kai_current_fiber()`. The dispatcher updates it (`kai_worker_run`)
+before `swapcontext`. Per-fiber `evidence_top`
 is reached via `kai_current_fiber()->evidence_top`, so the evidence
 vector switches automatically with the active fiber (Doc C
 §*Per-fiber isolation* §"Decided" — the design pre-committed to this
@@ -278,8 +278,8 @@ the entry function, not the user's thunk directly. The trampoline:
 3. Sets `fiber->state = KAI_FIBER_DONE`.
 4. Walks `fiber->awaiters_head`, re-enqueueing each awaiter as
    READY (calling `kai_sched_unpark`).
-5. Returns. ucontext follows `uc_link` back to
-   `kai_main_fiber.ctx`, which is the dispatch loop.
+5. Hands control to the next ready fiber, or to the worker's root
+   fiber (`main_fiber.ctx`), which is the dispatch loop.
 
 The trampoline is **the only place** that flips a fiber's state to
 DONE; it is the only place that walks the awaiter list. Both
