@@ -61,6 +61,7 @@ so they dispatch through `|` / `||` / `|?`:
 ```text
 [T]                  element a            (core/list)
 Stream[t, e]         element t            (stream)
+Gen[t]               element t            (gen, pure stages)
 Map[k, v]            element Pair[k, v]   (collections/map)
 HashMap[k, v]        element Pair[k, v]   (collections/hashmap, / Mutable)
 Set[a]               element a            (collections/set)

@@ -420,6 +420,9 @@ fn main() : Unit / Stdout = {
 }
 ```
 
+The stdlib ships the same shape as `gen` (`kai doc gen`): `Yield[t]`,
+`Gen[t]`, `generate`, and stages that ride the pipes.
+
 ## Stdlib effects
 
 Stdin, Stdout, Stderr, File, Env, Console, Clock, Random,
