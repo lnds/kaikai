@@ -64,8 +64,15 @@ export LIN_BASELINE="$ROOT/tools/baselines/kir-lin"
 SKIPS="$ROOT/tools/rc-leak-skips.txt"
 export BACKEND="${KAI_LEAK_BACKEND:-c}"
 export RUN_TIMEOUT="${KAI_LEAK_TIMEOUT:-120}"
-export TIMEOUT_CMD="$(command -v timeout || command -v gtimeout || true)"
 CORPORA="perceus effects"
+
+# A fixture that never terminates must fail as TIMEOUT, not hang the gate:
+# the shim falls back to perl where timeout(1) and gtimeout are missing.
+. "$ROOT/tools/lib/timeout.sh"
+export KAI_TIMEOUT_KIND _KAI_TIMEOUT_PERL
+export -f kai_timeout
+[ "$KAI_TIMEOUT_KIND" != none ] \
+  || echo "rc-leak-gate: warning — no timeout, gtimeout or perl; fixture runs are unbounded" >&2
 
 rm -rf "$WORK"; mkdir -p "$WORK"
 
@@ -120,11 +127,7 @@ pinned_growth() {
 # A fixture that ignores SIGTERM is killed after a grace period.
 ledger_run() {
   local bin="$1" runs="$2" rc=0
-  if [ -n "$TIMEOUT_CMD" ]; then
-    "$TIMEOUT_CMD" -k 10 "$RUN_TIMEOUT" env KAI_THREADS=1 KAI_TRACE_RC=1 KAI_TRACE_RC_RUNS="$runs" "$bin" >"$bin.out" 2>"$bin.err" </dev/null || rc=$?
-  else
-    env KAI_THREADS=1 KAI_TRACE_RC=1 KAI_TRACE_RC_RUNS="$runs" "$bin" >"$bin.out" 2>"$bin.err" </dev/null || rc=$?
-  fi
+  kai_timeout "$RUN_TIMEOUT" env KAI_THREADS=1 KAI_TRACE_RC=1 KAI_TRACE_RC_RUNS="$runs" "$bin" >"$bin.out" 2>"$bin.err" </dev/null || rc=$?
   case "$rc" in 124|137) echo TIMEOUT; return ;; esac
   local leaked started
   started="$(sed -n 's/^\[KAI_TRACE_RC\] *fibers_started_at_exit=\([0-9]*\).*/\1/p' "$bin.err" | head -1)"
@@ -136,11 +139,12 @@ ledger_run() {
   echo "${leaked:-NO-LEDGER}"
 }
 
-# The exit-fiber verdicts on programs built here: an actor that never starts is
-# settled (growth 0), one parked in `receive` at a clean exit fails, and a
-# runtime abort with a fiber parked is measured and noted.
+# The verdicts on programs built here: an actor that never starts is settled
+# (growth 0), one parked in `receive` at a clean exit fails, a runtime abort
+# with a fiber parked is measured and noted, and a run that never ends is a
+# TIMEOUT.
 self_test() {
-  local dir="$WORK/self-test" once twice parked aborted
+  local dir="$WORK/self-test" once twice parked aborted spun
   mkdir -p "$dir"
   cat > "$dir/unstarted.kai" <<'EOF'
 import actor
@@ -181,7 +185,12 @@ fn main() : Int / Spawn = {
   0
 }
 EOF
-  for p in unstarted started aborted; do
+  cat > "$dir/spin.kai" <<'EOF'
+fn spin(n: Int) : Int = if n < 0 { n } else { spin((n + 1) % 1000) }
+
+fn main() = print(int_to_string(spin(0)))
+EOF
+  for p in unstarted started aborted spin; do
     "$KAI" build --backend="$BACKEND" "$dir/$p.kai" -o "$dir/$p" >"$dir/$p.build" 2>&1 \
       || { echo "rc-leak-gate self-test: FAIL — $p does not build"; sed 's/^/  /' "$dir/$p.build"; return 1; }
   done
@@ -200,6 +209,11 @@ EOF
   esac
   [ -f "$dir/aborted.aborted-fibers" ] \
     || { echo "rc-leak-gate self-test: FAIL — an abort with a parked fiber is not noted"; return 1; }
+  if [ "$KAI_TIMEOUT_KIND" != none ]; then
+    spun="$(RUN_TIMEOUT=2 ledger_run "$dir/spin" 1)"
+    [ "$spun" = TIMEOUT ] \
+      || { echo "rc-leak-gate self-test: FAIL — a run that never ends reads as $spun"; return 1; }
+  fi
   echo "rc-leak-gate self-test OK"
 }
 
