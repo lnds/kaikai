@@ -1,0 +1,217 @@
+#[doc("""
+Splits operand chains taller than `dh_max` into `let` statements.
+
+A chain of calls, operators or pipes nests its operands, and a backend
+that spells the chain as one expression nests its output as deep: C
+compilers stop at a few hundred brackets. Past `dh_max` levels the
+operand that reaches the bound is bound to a `let` ahead of the
+statement that holds it, and the chain reads it back, so every
+expression stays at most `dh_max` operands tall whatever the source
+depth.
+
+The bindings run in the order the operands would: every operand
+evaluated before the bound one is bound too, unless it is a name or a
+literal, which evaluates nothing. The bindings rise past operators,
+calls and pipes only; a branch, a lambda body or a short-circuit
+operand keeps its own in a block of its own. A function whose
+expressions all fit is returned untouched.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.expr_positions
+import compiler.util
+
+#[doc("The tallest operand chain an expression keeps before a `let` takes its bottom.")]
+pub fn dh_max() : Int = 32
+
+#[doc("Every declaration of `ds` with its operand chains bounded by `dh_max`.")]
+pub fn deep_hoist_decls(ds: [Decl]) : [Decl] = map(ds, (d) => dh_decl(d))
+
+fn dh_decl(d: Decl) : Decl = match d {
+  DFn(p, n, tp, ps, rt, row, body, l, c, mo, id) -> DFn(p, n, tp, ps, rt, row, dh_body(body), l, c, mo, id)
+  DTest(n, body, l, c, m)                       -> DTest(n, dh_body(body), l, c, m)
+  DBench(n, body, l, c, m)                      -> DBench(n, dh_body(body), l, c, m)
+  DCheck(n, ps, body, l, c, m)                  -> DCheck(n, ps, dh_body(body), l, c, m)
+  DImpl(a, b, tc, ds, l, c, m, x)               -> DImpl(a, b, tc, deep_hoist_decls(ds), l, c, m, x)
+  DDerive(ps, inner, l, c)                      -> DDerive(ps, dh_decl(inner), l, c)
+  DUnstable(inner, l, c)                        -> DUnstable(dh_decl(inner), l, c)
+  DConstructor(inner, l, c)                     -> DConstructor(dh_decl(inner), l, c)
+  DProtoLaws(pn, inner, l, c, m)                -> DProtoLaws(pn, dh_decl(inner), l, c, m)
+  DImplAxiom(pn, inner, l, c, m)                -> DImplAxiom(pn, dh_decl(inner), l, c, m)
+  DDoc(s, k, inner, l, c)                       -> DDoc(s, k, dh_decl(inner), l, c)
+  DAttr(a, inner, l, c)                         -> DAttr(a, dh_decl(inner), l, c)
+  _                                             -> d
+}
+
+# A past-i64 literal takes its type from the annotation around it, which a
+# `let` of its own would not carry, so a body holding one stays as written.
+fn dh_body(body: Expr) : Expr =
+  if dh_height(body) <= dh_max() or dh_has_wide_lit(body) { body } else { dh_top(body) }
+
+# ---- measuring -------------------------------------------------------
+
+# The operand height of `e`, or above `dh_max` when any chain inside is
+# taller. Runs over every body, so the operand forms are read in place.
+fn dh_height(e: Expr) : Int = match e.kind {
+  ECall(f, xs)     -> if dh_name(f) { 1 + dh_tallest(xs, 0) } else { dh_enclosed(e) }
+  EBinop(op, a, b) -> if op == "and" or op == "or" { dh_enclosed(e) } else { 1 + dh_hi(dh_height(a), dh_height(b)) }
+  EUnop(_, a)      -> 1 + dh_height(a)
+  EField(a, _)     -> 1 + dh_height(a)
+  EIndex(a, b)     -> 1 + dh_hi(dh_height(a), dh_height(b))
+  EPipe(a, f)      -> {
+    let rhs = dh_height(f)
+    if rhs > dh_max() { rhs } else { 1 + dh_height(a) }
+  }
+  _                -> dh_enclosed(e)
+}
+
+# A node that keeps its bindings: height 1, unless a chain inside is too tall.
+fn dh_enclosed(e: Expr) : Int = {
+  let inner = dh_tallest_at(xp_positions(e), 0)
+  if inner > dh_max() { inner } else { 1 }
+}
+
+fn dh_tallest(xs: [Expr], acc: Int) : Int = match xs {
+  []           -> acc
+  [x, ...rest] -> dh_tallest(rest, dh_hi(dh_height(x), acc))
+}
+
+fn dh_tallest_at(ps: [XPos], acc: Int) : Int = match ps {
+  []                  -> acc
+  [XP(_, c), ...rest] -> dh_tallest_at(rest, dh_hi(dh_height(c), acc))
+}
+
+fn dh_has_wide_lit(e: Expr) : Bool = match e.kind {
+  EIntLit(_) -> true
+  _          -> any(xp_positions(e), (p) => match p { XP(_, c) -> dh_has_wide_lit(c) })
+}
+
+# The operands a binding may rise past, in evaluation order; `None` for
+# a node that keeps its bindings to itself. A call's callee is a name,
+# so only its arguments can be bound ahead of it.
+fn dh_operands(e: Expr) : Option[[Expr]] = match e.kind {
+  ECall(f, xs)     -> if dh_name(f) { Some(xs) } else { None }
+  EBinop(op, a, b) -> if op == "and" or op == "or" { None } else { Some([a, b]) }
+  EUnop(_, a)      -> Some([a])
+  EField(a, _)     -> Some([a])
+  EIndex(a, b)     -> Some([a, b])
+  EPipe(a, _)      -> Some([a])
+  _                -> None
+}
+
+fn dh_name(f: Expr) : Bool = match f.kind {
+  EVar(_)          -> true
+  ESym(_, _, _)    -> true
+  EModCall(_, _)   -> true
+  EField(base, _)  -> dh_name(base)
+  _                -> false
+}
+
+# ---- rewriting -------------------------------------------------------
+
+# Bindings to run first, the expression reading them, and its operand height.
+type DhOut = DhOut([Stmt], Expr, Int)
+
+fn dh_top(e: Expr) : Expr = match dh(e) {
+  DhOut([], x, _)   -> x
+  DhOut(lets, x, _) -> mk_expr(EBlock(lets, Some(x)), e.line, e.col)
+}
+
+fn dh(e: Expr) : DhOut = match dh_operands(e) {
+  Some(xs) -> dh_chain(e, map(xs, (x) => dh(x)))
+  None     -> match e.kind {
+    EBlock(stmts, tail) -> DhOut([], dh_with(e, EBlock(dh_stmts(stmts), prc_map_opt_expr(tail, dh_top))), 1)
+    _                   -> DhOut([], dh_with(e, prc_map_expr_kind(e.kind, dh_top)), 1)
+  }
+}
+
+fn dh_with(e: Expr, k: ExprKind) : Expr = Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn dh_stmts(stmts: [Stmt]) : [Stmt] = match stmts {
+  []           -> []
+  [s, ...rest] -> dh_stmt(s) ++ dh_stmts(rest)
+}
+
+fn dh_stmt(s: Stmt) : [Stmt] = match s {
+  SLet(p, t, x)  -> match dh(x) { DhOut(lets, x1, _) -> lets ++ [SLet(p, t, x1)] }
+  SExprStmt(x)   -> match dh(x) { DhOut(lets, x1, _) -> lets ++ [SExprStmt(x1)] }
+  _              -> [prc_map_stmt_exprs(s, dh_top)]
+}
+
+# Operands up to the last one that is too tall or brings bindings of its
+# own are settled in order: the tall ones and the ones that evaluate
+# something are bound, so nothing runs ahead of an operand it followed.
+fn dh_chain(e: Expr, outs: [DhOut]) : DhOut = match dh_settle(outs, dh_last_live(outs, 0, -1), 0) {
+  DhSettle(lets, xs, h) -> DhOut(lets, dh_rebuild(e, xs), 1 + h)
+}
+
+# Bindings, the operands reading them back, and the tallest operand left.
+type DhSettle = DhSettle([Stmt], [Expr], Int)
+
+fn dh_settle(outs: [DhOut], last: Int, i: Int) : DhSettle = match outs {
+  [] -> DhSettle([], [], 0)
+  [DhOut(lets, x, h), ...rest] -> match dh_settle(rest, last, i + 1) {
+    DhSettle(more, ys, hr) ->
+      if dh_binds(i, last, x, h) { dh_bound(lets ++ [dh_let(x, h), ...more], dh_ref(x, h), ys, hr) }
+      else { DhSettle(lets ++ more, [x, ...ys], dh_hi(h, hr)) }
+  }
+}
+
+fn dh_binds(i: Int, last: Int, x: Expr, h: Int) : Bool =
+  i <= last and (h >= dh_max() or (i < last and not dh_inert(x)))
+
+fn dh_bound(lets: [Stmt], r: Expr, ys: [Expr], hr: Int) : DhSettle = DhSettle(lets, [r, ...ys], dh_hi(1, hr))
+
+fn dh_let(x: Expr, h: Int) : Stmt = SLet(mk_pat(PBind(dh_temp(x, h)), x.line, x.col), None, x)
+
+fn dh_ref(x: Expr, h: Int) : Expr = mk_ref(dh_temp(x, h), x.line, x.col)
+
+# Unique per operand: a nested binding sits at another position or height.
+fn dh_temp(x: Expr, h: Int) : String =
+  concat_all(["__dh_", int_to_string(x.line), "_", int_to_string(x.col), "_", int_to_string(h)])
+
+fn dh_last_live(outs: [DhOut], i: Int, acc: Int) : Int = match outs {
+  []                           -> acc
+  [DhOut(lets, _, h), ...rest] ->
+    dh_last_live(rest, i + 1, if h >= dh_max() or not list_is_empty(lets) { i } else { acc })
+}
+
+fn dh_hi(a: Int, b: Int) : Int = if a > b { a } else { b }
+
+fn dh_rebuild(e: Expr, xs: [Expr]) : Expr = dh_with(e, dh_kind(e.kind, xs))
+
+fn dh_kind(k: ExprKind, xs: [Expr]) : ExprKind {
+  case ECall(f, _), _             -> ECall(f, xs)
+  case EBinop(op, _, _), [a, b]   -> EBinop(op, a, b)
+  case EUnop(op, _), [a]          -> EUnop(op, a)
+  case EField(_, n), [a]          -> EField(a, n)
+  case EIndex(_, _), [a, b]       -> EIndex(a, b)
+  case EPipe(_, f), [a]           -> EPipe(a, dh_pipe_fn(f))
+  case _, _                       -> k
+}
+
+# A pipe's right side is a call shape, not a value: only its arguments are rewritten.
+fn dh_pipe_fn(f: Expr) : Expr = match f.kind {
+  ECall(g, xs) -> dh_with(f, ECall(g, map(xs, dh_top)))
+  _            -> f
+}
+
+# A name or a literal: it evaluates nothing, so it may stay behind a binding.
+fn dh_inert(x: Expr) : Bool = match x.kind {
+  EVar(_)        -> true
+  ESym(_, _, _)  -> true
+  EModCall(_, _) -> true
+  _              -> dh_literal(x)
+}
+
+fn dh_literal(x: Expr) : Bool = match x.kind {
+  EInt(_, _)     -> true
+  EReal(_, _)    -> true
+  EFixed(_, _)   -> true
+  EBool(_)       -> true
+  EChar(_)       -> true
+  EStr(_, _)     -> true
+  EUnit          -> true
+  _              -> false
+}
