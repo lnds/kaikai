@@ -61,7 +61,7 @@ fs/  file.kai dir.kai path.kai
 net/  tcp.kai http.kai
 os/  args.kai env.kai
 top-level: actor.kai array.kai date.kai decimal.kai effects.kai
-           log.kai loop.kai money.kai path.kai protocols.kai
+           gen.kai log.kai loop.kai money.kai path.kai protocols.kai
            random.kai random_secure.kai reader.kai regexp.kai
            spawn.kai time.kai trace.kai uuid.kai writer.kai
 ```
@@ -114,6 +114,7 @@ What landed since the previous snapshot (2026-05-02 → 2026-05-08):
 | `math/linalg` shape-indexed linear algebra | shipped (closes #1271): `stdlib/math/linalg.kai` — `Vec[Real]<n>` ops and `Matrix[t]<m, n>` over the `Dim` kind (`Int` value habitants, first-order equality on the HM core). Positional multi-habitant `<m, n>` slots, list-literal formation with compile-time length checking, shape rules in operation signatures (`of`, `rows`, `cols`, `at`, `dot`, `matmul`, `matvec`, `transpose`). The index is erased at runtime; the fixed-width inline representation for `Vec[t]<n>` (no heap, no bounds check on static access) is the codegen follow-up. Fixtures `examples/sugars/kinds_dim_*.kai` |
 | fusion terminal combinators (`core/list` + `protocols`) | shipped (closes #1143): `list.map_sum` / `list.map_product` (`[a, b : Numeric]`, pure stage — a row variable on the stage parameter defeats monomorph's grounding of `b` and traps the ring's `zero()`/`one()`), `protocols.range_map_sum` / `range_map_product` / `range_step_map_sum` / `range_step_map_product` (ring loops over range heads), `protocols.range_length` / `range_step_length` (counting targets for the `length` terminal). Emitted by the pipe-fusion terminal rewrite for pure `xs \| stage \|> sum` / `product` / `length` chains; also callable directly. |
 | name coherence (collections + core) | shipped (closes #1181): one canonical name per concept. Length splits by shape — `length` on the indexable/ordered types (`list`, `string`, `vec`, `string_builder`), `size` on the cardinality-of-ADT types (`map`, `set`, `hashmap`, `hashset`, `queue`, `stack`); `list.count(p)` (count-if) and `stream.count` (lazy drain) are distinct ops, untouched. Left fold is `foldl` everywhere (`stream.fold` / `map.fold` → `foldl`); `string_builder.len` → `length`. The old spellings stay as deprecated one-liner aliases through the tongariki edition and `kai migrate` rewrites call sites (rules in `compiler/migrate_rules.kai`), scheduled to drop at the Orongo pin. `reduce` (list-builtin sibling of `map`/`filter`/`each`) is a distinct layer and stays. |
+| `gen` pull generators | shipped via PR #2627: `stdlib/gen.kai` — `Yield[t]` effect, `Gen[t] = Done \| Next(t, Cont[Unit, Gen[t]])`, `generate` (a handle that keeps `resume`; the producer runs on a stack segment), pipe-canonical `map` / `flat_map` / `filter`, `zip_with`, `take_until`, `each_indexed`, `reduce : Option[t]`. Built only from what a user module can write: the same program written from scratch is the *Build your own generator* walkthrough in `kai info effects`. Stage functions are pure; a dropped `Gen` discontinues its producer. Fixtures `examples/segments/{build_your_own_generator,gen_pipeline}.kai` |
 
 What's still open (planned-but-not-shipped):
 

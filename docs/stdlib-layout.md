@@ -258,6 +258,7 @@ stdlib/
   decimal_big.kai pure, stage 2 (top-level module; BigInt carrier, no scale ceiling — shipped)
   rational.kai   pure, stage 2 (top-level module; exact num/den over BigInt, gcd-normalised — shipped)
   loop.kai       row-polymorphic, stage 2 (top-level module: while, until, repeat, forever — shipped)
+  gen.kai        effect: Yield[t] (top-level module: pull generators on a kept continuation — shipped via PR #2627)
   reader.kai     effect: Reader[T] (top-level module: with_reader — shipped)
   writer.kai     effect: Writer[W] (top-level module: with_writer — shipped)
   io.kai         (NOTE: lives in `stdlib/core/io.kai`, not at top level; effects: Console, Stdin)
@@ -415,6 +416,24 @@ with the Tier 2 principle "few visible concepts, layered" and
 with Doc CLAUDE.md's stance that ordinary stdlib functions are
 preferable to language-level control structures when the row
 machinery suffices.
+
+### gen (effect `Yield[t]`, stage 2)
+
+Pull generators built on the `Yield[t]` effect *(shipped via PR #2627)*.
+A producer is an ordinary function performing `Yield.yield(v)`;
+`generate` handles it by keeping the continuation, so each element
+comes out as `Next(v, k)` of `Gen[t] = Done | Next(t, Cont[Unit, Gen[t]])`
+and `k(())` runs the producer to its next element on its own stack
+segment. A dropped `Gen` discontinues its producer. The module uses
+nothing a user module cannot write (`kai info effects`, *Build your own
+generator*).
+
+- source: `generate`
+- stages: `map` / `flat_map` / `filter` (pipe-canonical: `|`, `||`, `|?`), `zip_with`, `take_until`
+- sinks: `each_indexed`, `reduce : Option[t]`
+
+The producer and the functions the stages run inside it are pure; the
+sinks run in the consumer and carry its row.
 
 ### io (`/ Console + Stdin`)
 
