@@ -176,7 +176,7 @@ static KaiValue *abandon_body(KaiValue *self, KaiValue **args, int n) {
     /* The op-site discard sequence the backends emit. */
     *abandon_target->discard_slot = kai_int(42);
     kai_evidence_unwind_to(abandon_target);
-    longjmp(*abandon_target->handle_jmp, 1);
+    _longjmp(*abandon_target->handle_jmp, 1);
 }
 
 static void test_abandon_escapes(void) {
@@ -187,7 +187,7 @@ static void test_abandon_escapes(void) {
     KaiValue *volatile discard = NULL;
     int h = 0;
     cleanups = 0;
-    if (setjmp(jb) == 0) {
+    if (_setjmp(jb) == 0) {
         kai_evidence_push_with_jmp(&node, "Abort", &h, &jb, (KaiValue **) &discard);
         abandon_target = &node;
         KaiValue *k = NULL;
