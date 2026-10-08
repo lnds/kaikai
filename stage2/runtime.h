@@ -19225,7 +19225,7 @@ __attribute__((noreturn))
 static void kai_seg_rethrow(KaiFiber *f, KaiEvidence *to, int trap) {
     if (to != NULL) {
         kai_evidence_unwind_to(to);
-        longjmp(*to->handle_jmp, 1);
+        _longjmp(*to->handle_jmp, 1);
     }
     kai_evidence_unwind_all();
     if (trap) kai_trap_unwind(f->unwind_frame, f->stack_base, kai_trap_land_fiber, f);
@@ -19478,7 +19478,7 @@ static int kai_cancel_dispatch_user_handler(void) {
     if (k.status == KAI_CONT_UNRESUMED && user_node->handle_jmp != NULL) {
         *user_node->discard_slot = op_r;
         kai_evidence_unwind_to(user_node);
-        longjmp(*user_node->handle_jmp, 1);
+        _longjmp(*user_node->handle_jmp, 1);
         /* Unreachable. */
     }
 

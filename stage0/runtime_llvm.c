@@ -1617,7 +1617,7 @@ void kaix_handle_discard_unwind(void *node_v, KaiValue *op_r) {
     KaiEvidence *node = (KaiEvidence *) node_v;
     *node->discard_slot = op_r;
     kai_evidence_unwind_to(node);
-    longjmp(*node->handle_jmp, 1);
+    _longjmp(*node->handle_jmp, 1);
 }
 
 /* Op-site finish, combining `kaix_op_discarded` + `kaix_handle_discard_unwind`
@@ -1634,7 +1634,7 @@ KaiValue *kaix_op_finish(void *node_v, void *k_v, KaiValue *op_r) {
         k->status == KAI_CONT_UNRESUMED && node->handle_jmp != NULL) {
         *node->discard_slot = op_r;
         kai_evidence_unwind_to(node);
-        longjmp(*node->handle_jmp, 1);
+        _longjmp(*node->handle_jmp, 1);
     }
     return op_r;
 }
