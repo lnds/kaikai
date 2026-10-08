@@ -284,9 +284,9 @@ Unlike the sources above, these surface in ordinary user programs:
   trap leaves through the unwinder, and on the native backend every frame it
   crosses has a landing pad that releases what the frame still owned. The C
   backend has no pads: each trap leaks what its frames held, a fixed amount
-  per trap. On either backend, the frames of C code a closure was called back
-  from (the runtime's own higher-order functions) release nothing on the way
-  out. `examples/perceus/trap_releases_pending` and
+  per trap. On either backend, the runtime's own higher-order functions
+  register the list, closure and accumulator they hold on the unwind stack,
+  which the trap releases first. `examples/perceus/trap_releases_pending` and
   `trap_through_runtime_callback` pin both bounds.
 - #2222 — native only: a binder bound under a record or tuple field's list,
   variant or `@` pattern owns no reference, so a release planned for it frees

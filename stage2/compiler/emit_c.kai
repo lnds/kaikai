@@ -106,6 +106,7 @@ import compiler.raw_border
 import compiler.int_cmp
 import compiler.evidence_shadow
 import compiler.unwind_pend
+import compiler.unwind_binders
 import compiler.unwind_sites
 import compiler.unwind_effects
 import compiler.unwind_cx
@@ -304,6 +305,15 @@ fn emit_unw_scr_off(cx: EmitCtx) : EmitCtx =
 # An arm that bound its pattern with increfs owns those binders.
 fn emit_unw_owning(pat: Pattern, cx: EmitCtx) : EmitCtx =
   if cx.unw.arms == [] { cx } else { emit_ctx_with_unw(cx, unw_owning(cx.unw, tcp_rc_binders(pat, cx))) }
+
+# A destructuring `let` increfs each binder it binds.
+fn emit_unw_let_owned(s: Stmt, cx: EmitCtx) : [String] = match s {
+  SLet(pat, _, _) -> if unw_destructured(pat) == [] { [] } else { tcp_rc_binders(pat, cx) }
+  _ -> []
+}
+
+fn emit_unw_own(names: [String], cx: EmitCtx) : EmitCtx =
+  if names == [] or cx.unw.arms == [] { cx } else { emit_ctx_with_unw(cx, unw_owning(cx.unw, names)) }
 
 # The owned scrutinee slot of a match its arms can unwind out of: the push
 # after `_scr` is bound, the pop before its exit decref, and the arms'
@@ -5407,7 +5417,7 @@ fn emit_match_default_owned(src: String, scrut: Expr, arms: [Arm], want: Bool, c
 fn emit_block_raw(src: String, stmts: [Stmt], tail: Expr, cx: EmitCtx) : String / Console {
   let drops = block_unused_lets(stmts, Some(tail))
   let stmt_acc = emit_block_stmts(src, stmts, drops, cx)
-  let stmt_out = match stmt_acc { EBSA(_, t, _) -> t }
+  let stmt_out = match stmt_acc { EBSA(_, t, _, _) -> t }
   let tail_c = emit_expr_raw(src, tail,
                              emit_ctx_tcpend_after_stmts(emit_ctx_after_block_stmts(cx, stmt_acc), stmts))
   cat4("({ ", stmt_out, tail_c, "; })")
@@ -7130,7 +7140,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
           # `EVar(name)` to the local read instead of a same-named
           # top-level fn.
           let stmt_acc = emit_block_stmts(src, stmts, drops, bcx)
-          let stmt_out = match stmt_acc { EBSA(_, t, _) -> t }
+          let stmt_out = match stmt_acc { EBSA(_, t, _, _) -> t }
           let block_cx = emit_ctx_after_block_stmts(cx, stmt_acc)
           if is_region {
             let final_in = match opt_final {
@@ -7445,7 +7455,7 @@ fn emit_block_discard(src: String, stmts: [Stmt], opt_final: Option[Expr], cx: E
     _ -> {
       let drops = block_unused_lets(stmts, opt_final)
       let stmt_acc = emit_block_stmts(src, stmts, drops, cx)
-      let stmt_out = match stmt_acc { EBSA(_, t, _) -> t }
+      let stmt_out = match stmt_acc { EBSA(_, t, _, _) -> t }
       let final_out = match opt_final {
         Some(fe) -> emit_stmt_discard_or_drop(src, fe,
                       emit_ctx_tcpend_after_stmts(emit_ctx_after_block_stmts(cx, stmt_acc), stmts))
@@ -7849,24 +7859,24 @@ fn emit_stmt(src: String, s: Stmt, cx: EmitCtx) : String / Console {
 # neutral. The accumulated `lcs` and the raw-declared subset are returned
 # alongside the concatenated C output so the caller can scope the final
 # expression with both.
-type EmitBlockStmtsAcc = EBSA([String], String, [String])
+type EmitBlockStmtsAcc = EBSA([String], String, [String], [String])
 
 # Re-scope `cx` to a finished block's statement scope: the locals it bound
 # AND the subset of them declared raw (`kair_`). The trailing expression of
 # a block reads both, so applying only `lcs` sends a raw binder's read to a
 # `kaiv_` that was never declared.
 fn emit_ctx_after_block_stmts(cx: EmitCtx, acc: EmitBlockStmtsAcc) : EmitCtx =
-  match acc { EBSA(l, _, k) -> emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, l), k) }
+  match acc { EBSA(l, _, k, own) -> emit_unw_own(own, emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, l), k)) }
 
 fn emit_block_stmts(src: String, stmts: [Stmt], drops: [String],
                     cx: EmitCtx) : EmitBlockStmtsAcc / Console =
-  emit_block_stmts_loop(src, stmts, drops, cx, "")
+  emit_block_stmts_loop(src, stmts, drops, cx, "", [])
 
 fn emit_block_stmts_loop(src: String, stmts: [Stmt], drops: [String],
                           cx: EmitCtx,
-                          acc: String) : EmitBlockStmtsAcc / Console = match stmts {
+                          acc: String, own: [String]) : EmitBlockStmtsAcc / Console = match stmts {
 
-  [] -> EBSA(cx.lcs, acc, cx.kind1_raw)
+  [] -> EBSA(cx.lcs, acc, cx.kind1_raw, own)
   [s, ...rest] -> {
     let out = emit_stmt_with_drops(src, s, drops, cx)
     let lcs1 = match s {
@@ -7874,9 +7884,9 @@ fn emit_block_stmts_loop(src: String, stmts: [Stmt], drops: [String],
       _ -> cx.lcs
     }
     let k1 = stmt_kind1_raw_after(s, cx.kind1_raw, cx)
-    emit_block_stmts_loop(src, rest, drops,
-                          emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, lcs1), k1),
-                          string_concat(acc, out))
+    let mine = emit_unw_let_owned(s, cx)
+    emit_block_stmts_loop(src, rest, drops, emit_unw_own(mine, emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, lcs1), k1)),
+                          string_concat(acc, out), list_append(mine, own))
   }
 }
 

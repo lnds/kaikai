@@ -2123,17 +2123,34 @@ emitters:
 - **What a site registers** (`unwind_walk.kai`). The pending set is the
   goto-tail ledger's (`emit_tcrec_live.kai`). A binder enters with its
   birth reference and leaves at the first mention that might consume
-  it, so an error can only under-release (a bounded leak). Siblings
-  evaluated in unspecified order exclude each other's consumptions. A
-  name an enclosing bracket already holds is excluded too, because the
+  it, so an error can only under-release (a bounded leak). Operands run
+  left to right, so a site excludes only what an earlier sibling
+  consumed; a sibling that is a bare read hands its reference over when
+  the construct runs, so it stays pending across the siblings after it.
+  A name an enclosing bracket already holds is excluded too, because the
   push precedes argument evaluation and one reference never sits in two
-  live entries. Other cases:
+  live entries; that includes the closure a bracketed call goes through
+  a local for. Other cases:
   - An owned-borrow argument stays held across the call that borrows it.
   - A match registers its owned scrutinee slot. Its arm binders count
-    once the arm has taken its own reference; a reuse arm never does.
+    once the arm has taken its own reference; a reuse arm never does. A
+    destructuring `let` takes one for each binder.
   - A `handle` registers the outer binders that outlive it below its
     own mark, plus its state slot, since `resume(v, s)` replaces the
     state.
+- **Operand temporaries** (`unwind_operands.kai`, before unboxing and
+  Perceus). A value an earlier operand computed is no binder, so the
+  walk cannot register it: `f(g(x), E.op())` would strand `g(x)`'s
+  result. A construct with an owned operand before the last one that can
+  unwind binds its operands up to that one in order (`resume_anf.kai`,
+  over the shapes in `anf_ops.kai`), and the walk then registers them as
+  binders. An arm whose value rebuilds the shape it matched is left as
+  written, because the reuse lowering evaluates the rebuild's operands
+  after it tests the matched cell.
+- **The runtime's higher-order functions** (`each`, `reduce`, `map`,
+  `filter`, `flat_map` in `runtime.h`) lend the closure to each callback
+  and register the list, the closure and the accumulator they hold once
+  per call.
 - **Brackets.** C emits
   `kai_unw_push_c(&_uwfb, (KaiValue *[]){…}, n)`, looking the fiber up
   once per C function. The native lowering emits the `kai_unw_fiber` /
@@ -2175,7 +2192,8 @@ call can unwind, and it then drops the pads there.
 
 The C backend has no pads: a trap leaks what its frames held. Frames of
 C code that a closure was called back from (the runtime's higher-order
-functions) have no pads on either backend.
+functions) have no pads on either backend; what they register on the
+unwind stack is released before the walk starts.
 
 ### Discarded continuations on both backends
 

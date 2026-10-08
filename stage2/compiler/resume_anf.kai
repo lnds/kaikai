@@ -1,137 +1,61 @@
 #[doc("""
-One level of A-normal form for the non-tail `resume` split: the operands
-evaluated before the one that resumes are bound first, in order; the
-resuming operand is bound last; the rest stay in place, evaluated after
-it. The split then cuts the resulting block at that last binding.
+One level of A-normal form around an operand: the operands evaluated
+before it are bound first, in order; it is bound last; the rest stay in
+place, evaluated after it. The non-tail `resume` split binds the
+resuming operand and cuts the block at that binding; the unwind naming
+binds the last operand that can unwind, so the values computed before it
+are named binders.
 """)]
 
 import compiler.ast
 import compiler.resume_scan
+import compiler.anf_ops
 
 #[doc("A node with its resuming operand bound in a block, and the next fresh-name counter.")]
 pub type Anf = { e: Expr, n: Int }
 
-type Ops = Ops([Expr], ([Expr]) -> ExprKind)
-
 #[doc("Bind the operands of `e` up to the one that calls `k`, or `None` for a shape whose resuming operand cannot be split out.")]
-pub fn anf_resuming_operand(e: Expr, k: String, n: Int) : Option[Anf] = match operands_of(e, k) {
+pub fn anf_resuming_operand(e: Expr, k: String, n: Int) : Option[Anf] = bind_picked(e, (x) => rs_has_k(x, k), false, "__resume_v", n)
+
+#[doc("Bind the operands of `e` up to the last one `pick` holds, naming the binders `prefix` and a counter from `n`; `None` for a shape whose operand cannot be split out.")]
+pub fn anf_bind_until(e: Expr, pick: (Expr) -> Bool, prefix: String, n: Int) : Option[Anf] = bind_picked(e, pick, true, prefix, n)
+
+fn bind_picked(e: Expr, pick: (Expr) -> Bool, last: Bool, prefix: String, n: Int) : Option[Anf] = match anf_operands_of(e, pick) {
   Some(Ops(xs, rebuild)) -> {
-    let h = hoist_until_k(xs, k, n, [], [])
+    let h = hoist_until(xs, picked_index(xs, pick, last, 0, 0 - 1), prefix, n, [], [])
     Some(Anf { e: with_kind(e, EBlock(h.lets, Some(with_kind(e, rebuild(h.vals))))), n: h.n })
   }
   None -> None
 }
 
-#[doc("`e` with its kind replaced, keeping position, type and mode.")]
-pub fn with_kind(e: Expr, kind: ExprKind) : Expr = Expr { kind: kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+#[doc("The index of the first (or, with `last`, the last) of `xs` that `pick` holds, counting from `i`; `found` when none does.")]
+pub fn picked_index(xs: [Expr], pick: (Expr) -> Bool, last: Bool, i: Int, found: Int) : Int = match xs {
+  [] -> found
+  [x, ...rest] ->
+    if not pick(x) { picked_index(rest, pick, last, i + 1, found) }
+    else if last { picked_index(rest, pick, last, i + 1, i) }
+    else { i }
+}
 
 type Hoisted = { lets: [Stmt], vals: [Expr], n: Int }
 
-# Operands before the resuming one are bound in order so they still run
-# first; the resuming one is bound last; the rest stay in place, after it.
-fn hoist_until_k(xs: [Expr], k: String, n: Int, lets: [Stmt], vals: [Expr]) : Hoisted = match xs {
+# Operands before the picked one, at `at`, are bound in order so they
+# still run first; the picked one is bound last; the rest stay in place.
+fn hoist_until(xs: [Expr], at: Int, prefix: String, n: Int, lets: [Stmt], vals: [Expr]) : Hoisted = match xs {
   [] -> Hoisted { lets: list_reverse(lets), vals: list_reverse(vals), n: n }
   [x, ...rest] ->
-    if rs_has_k(x, k) {
-      let v = string_concat("__resume_v", int_to_string(n))
+    if at == 0 {
+      let v = fresh(prefix, n)
       Hoisted { lets: list_reverse([let_of(v, x), ...lets]),
-                vals: list_append(list_reverse([mk_ref(v, x.line, x.col), ...vals]), rest), n: n + 1 }
-    } else if is_atom(x) { hoist_until_k(rest, k, n, lets, [x, ...vals]) }
-    else {
-      let v = string_concat("__resume_v", int_to_string(n))
-      hoist_until_k(rest, k, n + 1, [let_of(v, x), ...lets], [mk_ref(v, x.line, x.col), ...vals])
-    }
+                vals: list_append(list_reverse([ref_of(v, x), ...vals]), rest), n: n + 1 }
+    } else if anf_is_atom(x) { hoist_until(rest, at - 1, prefix, n, lets, [x, ...vals]) }
+    else { hoist_until(rest, at - 1, prefix, n + 1, [let_of(fresh(prefix, n), x), ...lets], [ref_of(fresh(prefix, n), x), ...vals]) }
 }
+
+fn fresh(prefix: String, n: Int) : String = string_concat(prefix, int_to_string(n))
 
 fn let_of(v: String, x: Expr) : Stmt = SLet(Pattern { pkind: PBind(v), line: x.line, col: x.col }, None, x)
 
-# A value read in place cannot observe the resumed body, so it need not
-# be bound before the split.
-fn is_atom(x: Expr) : Bool = match x.kind {
-  EVar(_)        -> true
-  EModCall(_, _) -> true
-  EInt(_, _)     -> true
-  EIntLit(_)     -> true
-  EBool(_)       -> true
-  EUnit          -> true
-  _              -> false
-}
+# The read keeps the operand's type, so a pass after the typer sees it typed.
+fn ref_of(v: String, x: Expr) : Expr = Expr { kind: EVar(v), line: x.line, col: x.col, ty: x.ty, mode: x.mode }
 
-# The operands of `e` in evaluation order, with how to rebuild it from
-# them; `None` for a shape whose resuming operand cannot be split out.
-fn operands_of(e: Expr, k: String) : Option[Ops] = match e.kind {
-  ECall(f, xs) ->
-    if not rs_has_k(f, k) { Some(Ops(xs, (vs) => ECall(f, vs))) }
-    else { match f.kind {
-      EField(recv, m) -> Some(Ops([recv, ...xs], (vs) => ECall(with_kind(f, EField(head_of(vs, f), m)), tail_of(vs))))
-      _ -> None
-    } }
-  EPipe(a, b)        -> lhs_ops(a, b, k, (x) => EPipe(x, b))
-  EMapPipe(a, b)     -> lhs_ops(a, b, k, (x) => EMapPipe(x, b))
-  EFlatMapPipe(a, b) -> lhs_ops(a, b, k, (x) => EFlatMapPipe(x, b))
-  EFilterPipe(a, b)  -> lhs_ops(a, b, k, (x) => EFilterPipe(x, b))
-  kind -> unary_binary_ops(kind)
-}
-
-fn unary_binary_ops(kind: ExprKind) : Option[Ops] = match kind {
-  EBinop(op, a, b)  -> Some(Ops([a, b], (vs) => EBinop(op, head_of(vs, a), head_of(tail_of(vs), b))))
-  EUnop(op, x)      -> Some(Ops([x], (vs) => EUnop(op, head_of(vs, x))))
-  EField(b, n)      -> Some(Ops([b], (vs) => EField(head_of(vs, b), n)))
-  EIf(c, t, eo)     -> Some(Ops([c], (vs) => EIf(head_of(vs, c), t, eo)))
-  EMatch(scr, arms) -> Some(Ops([scr], (vs) => EMatch(head_of(vs, scr), arms)))
-  EBang(x)          -> Some(Ops([x], (vs) => EBang(head_of(vs, x))))
-  ELitUnit(x, u)    -> Some(Ops([x], (vs) => ELitUnit(head_of(vs, x), u)))
-  _                 -> collection_ops(kind)
-}
-
-fn collection_ops(kind: ExprKind) : Option[Ops] = match kind {
-  EIntrinsic(n, xs) -> Some(Ops(xs, (vs) => EIntrinsic(n, vs)))
-  ERecordLit(n, fs) -> Some(Ops(map(fs, field_value), (vs) => ERecordLit(n, refill_fields(fs, vs))))
-  EList(els)        -> Some(Ops(map(els, elem_value), (vs) => EList(refill_elems(els, vs))))
-  EIndex(a, b)      -> Some(Ops([a, b], (vs) => EIndex(head_of(vs, a), head_of(tail_of(vs), b))))
-  ERange(a, b, st)  -> Some(Ops([a, b, ...opt_exprs(st)], (vs) => ERange(head_of(vs, a), head_of(tail_of(vs), b), refill_opt(st, tail_of(tail_of(vs))))))
-  _                 -> None
-}
-
-fn opt_exprs(o: Option[Expr]) : [Expr] = match o {
-  Some(x) -> [x]
-  None    -> []
-}
-
-fn refill_opt(o: Option[Expr], vs: [Expr]) : Option[Expr] = match o {
-  Some(x) -> Some(head_of(vs, x))
-  None    -> None
-}
-
-# A pipe's right side is a call shape the typer rewrites; only its left
-# operand can be split out.
-fn lhs_ops(a: Expr, b: Expr, k: String, rebuild: (Expr) -> ExprKind) : Option[Ops] =
-  if rs_has_k(b, k) { None } else { Some(Ops([a], (vs) => rebuild(head_of(vs, a)))) }
-
-fn head_of(vs: [Expr], dflt: Expr) : Expr = match vs {
-  [v, ..._] -> v
-  []        -> dflt
-}
-
-fn tail_of(vs: [Expr]) : [Expr] = match vs {
-  [_, ...rest] -> rest
-  []           -> []
-}
-
-fn field_value(fi: FieldInit) : Expr = match fi { FI(_, v) -> v }
-
-fn refill_fields(fs: [FieldInit], vs: [Expr]) : [FieldInit] = match fs {
-  [FI(n, v), ...rest] -> [FI(n, head_of(vs, v)), ...refill_fields(rest, tail_of(vs))]
-  []                  -> []
-}
-
-fn elem_value(el: ListElem) : Expr = match el {
-  ElPlain(x)  -> x
-  ElSpread(x) -> x
-}
-
-fn refill_elems(els: [ListElem], vs: [Expr]) : [ListElem] = match els {
-  [ElPlain(x), ...rest]  -> [ElPlain(head_of(vs, x)), ...refill_elems(rest, tail_of(vs))]
-  [ElSpread(x), ...rest] -> [ElSpread(head_of(vs, x)), ...refill_elems(rest, tail_of(vs))]
-  []                     -> []
-}
