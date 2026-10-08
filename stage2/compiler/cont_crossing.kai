@@ -1,22 +1,24 @@
 #[doc("""
-A continuation belongs to the fiber whose stack segment it suspended. This
-walk over a typed body finds where one would reach another fiber: a thunk
-handed to a call that yields a `Fiber` or `Pid` capturing one, such a
-call's result holding one, or a call that takes a `Pid` passing one along.
+A continuation belongs to the fiber whose stack segment it suspended, and
+needs the handlers of the effects its body performs. This walk over a typed
+body finds where one would reach another fiber: a thunk handed to a call that
+yields a `Fiber` or `Pid` capturing one, such a call's result holding one, or
+a call that takes a `Pid` passing one along. It also finds a handle whose
+value holds a continuation that performs the effect the handle discharges.
 """)]
 
 import compiler.ast
 import compiler.expr_positions
 import compiler.modules
 
-#[doc("Where a continuation would reach another fiber, and how.")]
-pub type Crossing = Crossing(String, Int, Int)
+#[doc("Where a continuation would leave its fiber or its handlers: message, help, position.")]
+pub type Crossing = Crossing(String, String, Int, Int)
 
-#[doc("Every crossing in `e`; `res` resolves a type and `holds` says whether a value of it holds a continuation.")]
-pub fn cont_crossings(e: Expr, res: (Ty) -> Ty, holds: (Ty) -> Bool) : [Crossing] =
-  list_reverse(cc(e, Cc { res: res, holds: holds }, []))
+#[doc("Every crossing in `e`; `res` resolves a type, `holds` says whether a value of it holds a continuation and `needs` whether it holds one performing the named effect.")]
+pub fn cont_crossings(e: Expr, res: (Ty) -> Ty, holds: (Ty) -> Bool, needs: (Ty, String, SymId) -> Bool) : [Crossing] =
+  list_reverse(cc(e, Cc { res: res, holds: holds, needs: needs }, []))
 
-type Cc = { res: (Ty) -> Ty, holds: (Ty) -> Bool }
+type Cc = { res: (Ty) -> Ty, holds: (Ty) -> Bool, needs: (Ty, String, SymId) -> Bool }
 
 # Every typed body runs through this walk, so it reads each node once and
 # allocates only for a crossing it finds.
@@ -39,7 +41,8 @@ fn cc(e: Expr, c: Cc, acc: [Crossing]) : [Crossing] = match e.kind {
   EFilterPipe(a, b)  -> cc(b, c, cc(a, c, acc))
   EBang(x)           -> cc(x, c, acc)
   ELitUnit(x, _)     -> cc(x, c, acc)
-  EHandle(body, _, _, _, init, _, cls, ret) -> cc_ret(ret, c, cc_clauses(cls, c, cc_opt(init, c, cc(body, c, acc))))
+  EHandle(body, eff, es, _, init, _, cls, ret) ->
+    cc_ret(ret, c, cc_clauses(cls, c, cc_opt(init, c, cc(body, c, at_handle(e, eff, es, c, acc)))))
   EIntrinsic(_, xs)  -> cc_all(xs, c, acc)
   ESurface(sf)       -> cc_all(surface_children(sf), c, acc)
   EInt(_, _)         -> acc
@@ -121,6 +124,12 @@ fn peek(e: Expr, c: Cc) : Ty = match e.ty {
   None -> TyAny
 }
 
+fn at_handle(h: Expr, eff: String, es: SymId, c: Cc, acc: [Crossing]) : [Crossing] =
+  if c.needs(c.res(ty_of(h)), eff, es) {
+    [Crossing("this handle's value holds a continuation that performs `#{eff}`, which the handle discharges",
+              "resume or drop the continuation inside the handle", h.line, h.col), ...acc]
+  } else { acc }
+
 fn at_call(call: Expr, xs: [Expr], c: Cc, acc: [Crossing]) : [Crossing] = match peek(call, c) {
   TyCon(_, n, targs, _) ->
     if n == "Fiber" or n == "Pid" { [...fiber_call(call, n, targs, xs, c), ...acc] }
@@ -131,7 +140,7 @@ fn at_call(call: Expr, xs: [Expr], c: Cc, acc: [Crossing]) : [Crossing] = match 
 fn fiber_call(call: Expr, n: String, targs: [Ty], xs: [Expr], c: Cc) : [Crossing] = {
   let what = if n == "Fiber" { "a fiber's result" } else { "an actor's message" }
   let result = if any(targs, (t) => c.holds(c.res(t))) {
-    [Crossing("#{what} cannot hold a continuation", call.line, call.col)]
+    [Crossing("#{what} cannot hold a continuation", fiber_help(), call.line, call.col)]
   } else { [] }
   [...result, ...flat_map(xs, (x) => thunk_captures(x, c.res, c.holds))]
 }
@@ -140,9 +149,11 @@ fn message_crossings(xs: [Expr], c: Cc, acc: [Crossing]) : [Crossing] =
   if any(xs, (x) => is_pid(peek(x, c))) {
     foldl(xs, acc, (a, x) => {
       let t = c.res(ty_of(x))
-      if not is_pid(t) and c.holds(t) { [Crossing("a message cannot hold a continuation", x.line, x.col), ...a] } else { a }
+      if not is_pid(t) and c.holds(t) { [Crossing("a message cannot hold a continuation", fiber_help(), x.line, x.col), ...a] } else { a }
     })
   } else { acc }
+
+fn fiber_help() : String = "a continuation can only be resumed by the fiber that created it"
 
 fn is_pid(t: Ty) : Bool = match t {
   TyCon(_, n, _, _) -> n == "Pid"
@@ -151,7 +162,7 @@ fn is_pid(t: Ty) : Bool = match t {
 
 fn thunk_captures(x: Expr, res: (Ty) -> Ty, holds: (Ty) -> Bool) : [Crossing] = match x.kind {
   ELambda(ps, b) -> match outer_ref(b, binders(b, map(ps, (p) => p.pname)), res, holds) {
-    Some(r) -> [Crossing("a thunk run on another fiber cannot capture a continuation", r.line, r.col)]
+    Some(r) -> [Crossing("a thunk run on another fiber cannot capture a continuation", fiber_help(), r.line, r.col)]
     None    -> []
   }
   _ -> []

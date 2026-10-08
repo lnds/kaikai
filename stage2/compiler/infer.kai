@@ -50,6 +50,7 @@ import compiler.refinements
 import compiler.refine_coerce
 import compiler.refine_variance
 import compiler.fmt
+import compiler.cont_type
 import compiler.index_coll
 import compiler.variant_index
 import compiler.lit_mint
@@ -627,6 +628,7 @@ fn inf_resolve_ty(t: TypeExpr, hv: TyHomeView) : Ty {
       # any expected type, which is sound only because the default
       # handler aborts before any consumer of that "value" runs.
       else if name == "Nothing" { TyAny }
+      else if is_cont_name(name) { tsh_tycon_at(hv, th, name, cont_full_args(name, inf_resolve_args_rk(targs, [2], 0, [], hv))) }
       else { tsh_tycon_at(hv, th, name, inf_resolve_ty_list(targs, hv)) }
     }
     TyList(inner) -> TyListT(inf_resolve_ty(inner, hv))
@@ -661,7 +663,7 @@ fn inf_resolve_ty_rk(t: TypeExpr, table: [RowKindEntry], hv: TyHomeView) : Ty {
     TyName(th, name, targs) ->
       match row_kind_slots_of(table, name, hv) {
         [] -> inf_resolve_ty(t, hv)
-        idxs -> tsh_tycon_at(hv, th, name, inf_resolve_args_rk(targs, idxs, 0, table, hv))
+        idxs -> tsh_tycon_at(hv, th, name, cont_full_args(name, inf_resolve_args_rk(targs, idxs, 0, table, hv)))
       }
     TyList(inner) -> TyListT(inf_resolve_ty_rk(inner, table, hv))
     _ -> inf_resolve_ty(t, hv)
@@ -982,6 +984,18 @@ fn inf_row_carrier_of(t: Ty) : Option[Row] = match t {
   _ -> None
 }
 
+# A pure body's `Cont[T, S, e]` shows as the `Cont[T, S]` it is written as.
+fn cont_shown_args(cname: String, tas: [Ty]) : [Ty] = match tas {
+  [a, s, r] -> if is_cont_name(cname) { match inf_row_carrier_of(r) {
+    Some(row) -> match row.tail {
+      None    -> if labels_empty(row.labels) { [a, s] } else { tas }
+      Some(_) -> tas
+    }
+    None -> tas
+  } } else { tas }
+  _ -> tas
+}
+
 fn inf_tycon_arg_to_string(t: Ty) : String = match inf_row_carrier_of(t) {
   Some(row) -> if labels_empty(row.labels) { "_" } else { inf_join_with(map(row.labels, label_to_string), " + ") }
   None      -> inf_ty_to_string(t)
@@ -1015,7 +1029,7 @@ pub fn inf_ty_to_string_ow(owners: [HeadOwnerEntry], t: Ty) : String {
       let shown = inf_tycon_display_ow(owners, cname)
       match tas {
         [] -> shown
-        _ -> concat_all([shown, "[", inf_join_with(map(tas, (a) => inf_tycon_arg_to_string_ow(owners, a)), ", "), "]"])
+        _ -> concat_all([shown, "[", inf_join_with(map(cont_shown_args(cname, tas), (a) => inf_tycon_arg_to_string_ow(owners, a)), ", "), "]"])
       }
     }
     TyVarT(n) -> cat2("?t", int_to_string(n))
@@ -1098,7 +1112,7 @@ pub fn inf_ty_to_string(t: Ty) : String {
     TyCon(_, cname, tas, _) -> {
       match tas {
         [] -> cname
-        _ -> concat_all([cname, "[", inf_join_with(map(tas, inf_tycon_arg_to_string), ", "), "]"])
+        _ -> concat_all([cname, "[", inf_join_with(map(cont_shown_args(cname, tas), inf_tycon_arg_to_string), ", "), "]"])
       }
     }
     TyVarT(n) -> cat2("?t", int_to_string(n))
@@ -3281,6 +3295,7 @@ pub fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind], hv: TyHomeView) : T
           # Without this case, Spawn.spawn(thunk: Nothing) refuses
           # any non-Nothing thunk argument.
           else if name == "Nothing" { TyAny }
+          else if is_cont_name(name) { tsh_tycon_at(hv, th, name, cont_full_args(name, resolve_cont_tas_with(tas, binds, hv))) }
           else { tsh_tycon_at(hv, th, name, resolve_tas_with(tas, binds, hv)) }
         }
       }
@@ -3315,6 +3330,17 @@ fn closed_row_with_tparams(re: RowExpr, binds: [TPBind], hv: TyHomeView) : Row =
 
 fn resolve_tas_with(tas: [TypeExpr], binds: [TPBind], hv: TyHomeView) : [Ty] =
   map(tas, (t) => resolve_ty_with_tparams(t, binds, hv))
+
+fn resolve_cont_tas_with(tas: [TypeExpr], binds: [TPBind], hv: TyHomeView) : [Ty] = match tas {
+  [a, s, e] -> [resolve_ty_with_tparams(a, binds, hv), resolve_ty_with_tparams(s, binds, hv), inf_resolve_row_arg(e, hv)]
+  _ -> resolve_tas_with(tas, binds, hv)
+}
+
+# `Cont[T, S]` is `Cont[T, S, e]` with `e` empty: the continuation of a pure body.
+fn cont_full_args(name: String, args: [Ty]) : [Ty] = match args {
+  [a, s] -> if is_cont_name(name) { [a, s, row_arg_carrier(inf_row_empty())] } else { args }
+  _ -> args
+}
 
 # Build the TPBind list for a decl's generic type parameters.
 # type-kind and unit-kind params allocate IDs from *separate*
@@ -3409,15 +3435,37 @@ fn row_names_of_typebody(b: TypeBody) : [String] = match b {
 fn row_names_of_variants(vs: [Variant], acc: [String]) : [String] = match vs {
   [] -> acc
   [v, ...rest] -> match v {
-    Var(_, vargs) -> row_names_of_variants(rest, collect_rvars_in_typeexprs(vargs, acc))
+    Var(_, vargs) -> row_names_of_variants(rest, cont_row_names_all(vargs, collect_rvars_in_typeexprs(vargs, acc)))
   }
 }
 
 fn row_names_of_fields(fs: [FieldDecl], acc: [String]) : [String] = match fs {
   [] -> acc
   [f, ...rest] -> match f {
-    FD(_, _, te, _) -> row_names_of_fields(rest, collect_rvars_in_typeexpr(te, acc))
+    FD(_, _, te, _) -> row_names_of_fields(rest, cont_row_names(te, collect_rvars_in_typeexpr(te, acc)))
   }
+}
+
+# Row variables a type passes as a continuation's row: `e` in `Cont[T, S, e]`.
+fn cont_row_names(t: TypeExpr, acc: [String]) : [String] = match t.tkind {
+  TyName(_, n, tas) -> cont_row_names_all(tas, match tas {
+    [_, _, r] -> if is_cont_name(n) { match r.tkind {
+      TyName(_, rn, []) -> if is_implicit_tparam_candidate(rn) and not list_has(acc, rn) { [rn, ...acc] } else { acc }
+      _ -> acc
+    } } else { acc }
+    _ -> acc
+  })
+  TyList(inner) -> cont_row_names(inner, acc)
+  TyFn(ps, ret, _) -> cont_row_names_all([ret, ...ps], acc)
+  TyDim(base, _) -> cont_row_names(base, acc)
+  TyRefine(base, _) -> cont_row_names(base, acc)
+  TyRow(_) -> acc
+  TySurface(ts) -> cont_row_names_all(tysurface_children(ts), acc)
+}
+
+fn cont_row_names_all(ts: [TypeExpr], acc: [String]) : [String] = match ts {
+  [] -> acc
+  [t, ...rest] -> cont_row_names_all(rest, cont_row_names(t, acc))
 }
 
 # The zero-based positions in `tparams` whose name appears in `row_names`.
@@ -3429,9 +3477,10 @@ fn row_kind_indices(tparams: [String], row_names: [String], i: Int) : [Int] = ma
 }
 
 # The row-kind slots of the type `name` reaches from `hv`, or [] if it
-# declares none: a homonym declared elsewhere has slots of its own.
+# declares none: a homonym declared elsewhere has slots of its own. The
+# builtin `Cont[T, S, e]` carries its body's row in slot 2.
 fn row_kind_slots_of(table: [RowKindEntry], name: String, hv: TyHomeView) : [Int] =
-  rk_slots_by(table, tsh_sym(hv, name))
+  if is_cont_name(name) { [2] } else { rk_slots_by(table, tsh_sym(hv, name)) }
 
 fn rk_slots_by(table: [RowKindEntry], s: SymId) : [Int] = match table {
   [] -> []
@@ -3491,7 +3540,7 @@ fn scheme_of_variant(type_name: String, tsym: SymId, tparams: [String], v: Varia
       # carrier). We split the declared tparams: those used in row
       # position become `rbinds` (resolved via `resolve_ty_with_binds`,
       # which preserves `TyFn` rows); the rest stay type-level `binds`.
-      let rvar_names = collect_rvars_in_typeexprs(vargs, [])
+      let rvar_names = cont_row_names_all(vargs, collect_rvars_in_typeexprs(vargs, []))
       let tvar_names = names_excluding(tparams, rvar_names)
       let binds = mk_tpbinds(tparams)
       # The row-var binds REUSE the ids `mk_tpbinds` already assigned to
@@ -3979,7 +4028,7 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk: [
           # A name the view cannot settle stays empty, and
           # `tag_tycon_modules` stamps what is still bare post-typing.
           else { tsh_tycon_at(hv, th, name,
-                              resolve_tycon_args(tas, row_kind_slots_of(rk, name, hv), 0, tpbinds, rbinds, rk, hv)) }
+                              cont_full_args(name, resolve_tycon_args(tas, row_kind_slots_of(rk, name, hv), 0, tpbinds, rbinds, rk, hv))) }
         }
       }
       }
@@ -9009,8 +9058,9 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
         None    -> st_aliased
       }
       let prev_row = st_capbound.row
-      let st_in = st_set_row(st_capbound, [])
-      let rb0 = synth(st_in, body)
+      let st_in = InferState { ...st_set_row(st_capbound, []), row_tails: [] }
+      let rb_raw = synth(st_in, body)
+      let rb0 = Inferred { ...rb_raw, st: st_scope_tails(rb_raw.st, st_capbound.row_tails) }
       let discharge_eff = label_eff_with_alias(eff_name, alias_opt)
       let rb = Inferred { ...rb0, st: holes_under_handler(rb0.st, list_length(st_in.holes),
                                      Label { eff: discharge_eff, ty_args: cap_tyargs, sym: hsym }) }
@@ -9059,6 +9109,21 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       mk_inferred(cs_typed.st, hty, new_e)
     }
     _ -> mk_inferred(st, TyAny, with_ty(e, TyAny))
+  }
+}
+
+# What a handle body performs through row variables is discharged too: their
+# bound labels join the body row, and only their open residues stay tails.
+fn st_scope_tails(st: InferState, outer: [TailUse]) : InferState / Mutable = {
+  let st1 = st_add_tail_labels(st, st.row_tails)
+  InferState { ...st1, row_tails: residual_tails(st1.sub, st1.row_tails, outer) }
+}
+
+fn residual_tails(s: Subst, us: [TailUse], acc: [TailUse]) : [TailUse] = match us {
+  [] -> acc
+  [TU(t, l, c), ...rest] -> {
+    let root = row_root(s, t)
+    residual_tails(s, rest, if root < 0 or tail_uses_have(acc, root) { acc } else { [TU(root, l, c), ...acc] })
   }
 }
 
@@ -10034,9 +10099,9 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
             None -> {
             let rc = synth(st_p, callee)
             let callee_ty = apply_ty(rc.st.sub, rc.ty)
-            match callee_ty {
-              TyCon(_, "Cont", [a_ty, s_ty], _) -> synth_cont_call(rc, a_ty, s_ty, args_, line, col)
-              _ -> {
+            match cont_parts(callee_ty) {
+              Some(cp) -> synth_cont_call(rc, cp, args_, line, col)
+              None -> {
             # pair each arg with its declared param so a Vec-typed
             # param mints an EList / collects a map-pipe chain — the
             # argument-position face of the annotation-context rules.
@@ -10070,14 +10135,16 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
   }
 }
 
-# `k(v)` on a `Cont[T, S]`: resume with a `T`, get the handle's `S`.
-fn synth_cont_call(rc: Inferred, a_ty: Ty, s_ty: Ty, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable = {
+# `k(v)` on a `Cont[T, S, e]`: resume with a `T`, get the handle's `S`; the
+# body runs on, so the caller performs `e`.
+fn synth_cont_call(rc: Inferred, cp: ContParts, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable = {
   let ra = synth_many(rc.st, args_)
   let st1 = match ra.tys {
-    [t] -> st_unify(ra.st, a_ty, t, "continuation argument", line, col)
+    [t] -> st_unify(ra.st, cp.arg, t, "continuation argument", line, col)
     _ -> seg_error(ra.st, rc.expr, "a continuation takes exactly one argument", "call it as `k(v)`").st
   }
-  mk_inferred(st1, s_ty, with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), s_ty))
+  let st2 = st_propagate_capability_labels(st1, apply_ty(st1.sub, cp.row), line, col)
+  mk_inferred(st2, cp.answer, with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), cp.answer))
 }
 
 # `#[constructor]` sugar: a call whose callee is a bare type name with
@@ -10415,34 +10482,37 @@ fn synth_seg_request(st: InferState, args_: [Expr], e: Expr) : Inferred / Consol
 
 # `$seg_handle(escapes, reason, body, return, clause...)`: the body thunk is
 # typed first; its forwarders' requests give each clause its parameter types
-# and its continuation `Cont[answer, S]`, where `S` is the handle's type.
+# and its continuation `Cont[answer, S, e]`, where `S` is the handle's type and
+# `e` the thunk's row: what the body performs besides the handled effect.
 fn synth_seg_handle(st: InferState, args_: [Expr], e: Expr) : Inferred / Console + File + Mutable = match args_ {
   [esc, why, thunk, ret, ...cls] -> {
     let rt = synth(st, thunk)
-    let body_ty = match apply_ty(rt.st.sub, rt.ty) { TyFnT(_, b, _) -> b  t -> t }
+    let (body_ty, e_ty) = match apply_ty(rt.st.sub, rt.ty) {
+      TyFnT(_, b, row) -> (b, row_arg_carrier(row))
+      t -> (t, row_arg_carrier(inf_row_empty()))
+    }
     let rs = st_fresh_ty(rt.st)
     let rr = seg_lambda(rs.st, ret, [body_ty], rs.ty)
-    let rc = seg_clauses(rr.st, cls, rt.expr, rs.ty, 0, [])
+    let rc = seg_clauses(rr.st, cls, rt.expr, rs.ty, e_ty, 0, [])
     let st1 = seg_absorb(seg_absorb(rc.st, rt.ty, e), rr.ty, e)
-    let st2 = seg_check_escape(st1, esc, rt.ty, e)
     let node = mk_expr(EIntrinsic("seg_handle", [esc, why, rt.expr, rr.expr, ...rc.exprs]), e.line, e.col)
-    mk_inferred(st2, rs.ty, with_ty(node, rs.ty))
+    mk_inferred(st1, rs.ty, with_ty(node, rs.ty))
   }
   _ -> seg_error(st, e, "compiler intrinsic `$seg_handle` has a malformed argument list", "")
 }
 
 type SegClauses = { st: InferState, exprs: [Expr] }
 
-fn seg_clauses(st: InferState, cls: [Expr], body: Expr, s_ty: Ty, i: Int, acc: [Expr]) : SegClauses / Console + File + Mutable =
+fn seg_clauses(st: InferState, cls: [Expr], body: Expr, s_ty: Ty, e_ty: Ty, i: Int, acc: [Expr]) : SegClauses / Console + File + Mutable =
   match cls {
     [] -> SegClauses { st: st, exprs: list_reverse(acc) }
     [c, ...rest] -> {
       let pins = match seg_request_at(body, i) {
-        Some(req) -> [...map(req.args, (a) => ty_of_expr(a)), TyCon(None, "Cont", [ty_of_expr(req.at), s_ty], sym_none())]
+        Some(req) -> [...map(req.args, (a) => ty_of_expr(a)), cont_ty(ty_of_expr(req.at), s_ty, e_ty)]
         None -> []
       }
       let r = seg_lambda(st, c, pins, s_ty)
-      seg_clauses(seg_absorb(r.st, r.ty, c), rest, body, s_ty, i + 1, [r.expr, ...acc])
+      seg_clauses(seg_absorb(r.st, r.ty, c), rest, body, s_ty, e_ty, i + 1, [r.expr, ...acc])
     }
   }
 
@@ -10489,20 +10559,6 @@ fn seg_request_in(es: [Expr], i: Int) : Option[SegReq] = match es {
 fn xpos_expr(p: XPos) : Expr = match p { XP(_, x) -> x }
 
 fn ty_of_expr(e: Expr) : Ty = match e.ty { Some(t) -> t  None -> TyAny }
-
-# A continuation that may leave its clause carries no effect row yet, so the
-# body it resumes may perform only the effect its handle discharges.
-fn seg_check_escape(st: InferState, esc: Expr, thunk_ty: Ty, e: Expr) : InferState / Console + File + Mutable = {
-  let escapes = match esc.kind { EBool(b) -> b  _ -> false }
-  let labels = match apply_ty(st.sub, thunk_ty) { TyFnT(_, _, row) -> row.labels  _ -> [] }
-  match labels {
-    [] -> st
-    [l, ..._] -> if not escapes { st } else {
-      seg_error(st, e, "the continuation can leave its clause, but the handled body also performs `#{l.eff}`",
-                "a handle whose `resume` leaves its clause handles a body that performs no other effect; effectful generator bodies are coming").st
-    }
-  }
-}
 
 fn seg_error(st: InferState, at: Expr, header: String, help: String) : Inferred / Console + File + Mutable = {
   diag_error(st.file, at.line, at.col, header)
@@ -18955,12 +19011,13 @@ fn is_fiber_producer_helper(fname: String) : Bool =
 # (`type Tree[T] = Leaf(T) | Node(Tree[T], Tree[T])`).
 type HandleBreach = HBDirect | HBSum(String, String)
 
-# A continuation stays on the fiber whose segment it suspended.
+# A continuation stays on the fiber whose segment it suspended, inside the
+# handlers of what its body performs.
 fn check_cont_crossings(st: InferState, body: Expr) : InferState / Console + File =
-  foldl(cont_crossings(body, (t) => apply_ty(st.sub, t), (t) => ty_holds_cont(t, st.sums, st.recs, [])), st,
+  foldl(cont_crossings(body, (t) => apply_ty(st.sub, t), (t) => ty_holds_cont(t, st.sums, st.recs, []),
+                       (t, eff, es) => ty_cont_needs(t, eff, es, st.sums, st.recs)), st,
         (acc, c) => match c {
-          Crossing(msg, l, col) -> {
-            let help = "a continuation can only be resumed by the fiber that created it"
+          Crossing(msg, help, l, col) -> {
             diag_error(acc.file, l, col, msg)
             diag_help(help)
             st_bump_err(st_push_diag(acc, mk_diag(SevError, acc.file, l, col, msg, [ri_help(acc.file, l, col, help)])))
@@ -18970,18 +19027,45 @@ fn check_cont_crossings(st: InferState, body: Expr) : InferState / Console + Fil
 # A value of `t` holds a continuation, directly or in a field of a type it names.
 fn ty_holds_cont(t: Ty, sums: [SumInfo], recs: [RecInfo], seen: [String]) : Bool = match t {
   TyCon(_, n, args, _) ->
-    n == "Cont" or any(args, (a) => ty_holds_cont(a, sums, recs, seen)) or named_holds_cont(n, sums, recs, seen)
+    is_cont_ty(t) or any(args, (a) => ty_holds_cont(a, sums, recs, seen)) or named_holds_cont(n, sums, recs, seen)
   TyListT(x) -> ty_holds_cont(x, sums, recs, seen)
+  _ -> false
+}
+
+# A value of `t` holds a continuation whose row names `eff`: a `Cont` with
+# `eff` in its row, or a type holding one that `t` instantiates with such a row.
+fn ty_cont_needs(t: Ty, eff: String, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool = match cont_parts(t) {
+  Some(cp) -> row_arg_names(cp.row, eff, es) or cont_needs_any([cp.arg, cp.answer], eff, es, sums, recs)
+  None -> ty_cont_needs_in(t, eff, es, sums, recs)
+}
+
+fn ty_cont_needs_in(t: Ty, eff: String, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool = match t {
+  TyCon(_, n, args, _) -> cont_named_needs(n, args, eff, es, sums, recs)
+  TyListT(x) -> ty_cont_needs(x, eff, es, sums, recs)
+  TyFnT(_, r, _) -> ty_cont_needs(r, eff, es, sums, recs)
+  _ -> false
+}
+
+fn cont_named_needs(n: String, args: [Ty], eff: String, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool =
+  cont_needs_any(args, eff, es, sums, recs)
+    or (any(args, (a) => row_arg_names(a, eff, es)) and named_holds_cont(n, sums, recs, []))
+
+fn cont_needs_any(ts: [Ty], eff: String, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool =
+  any(ts, (t) => ty_cont_needs(t, eff, es, sums, recs))
+
+# A row carrier naming `eff`.
+fn row_arg_names(t: Ty, eff: String, es: SymId) : Bool = match t {
+  TyFnT([], TyUnit, row) -> any(row.labels, (l) => label_same(l, Label { eff: eff, ty_args: [], sym: es }))
   _ -> false
 }
 
 fn named_holds_cont(n: String, sums: [SumInfo], recs: [RecInfo], seen: [String]) : Bool =
   if list_has(seen, n) { false }
-  else { match ty_expr_find_handle("Cont", TypeExpr { tkind: TyName(None, n, []), line: 0, col: 0 }, sums, seen) {
+  else { match ty_expr_find_handle(cont_name(), TypeExpr { tkind: TyName(None, n, []), line: 0, col: 0 }, sums, seen) {
     Some(_) -> true
     None -> any(recs, (r) => match r {
       RI(rn, _, fs, _) -> rn == n and any(fs, (f) => match f {
-        FD(_, _, te, _) -> match ty_expr_find_handle("Cont", te, sums, [n, ...seen]) { Some(_) -> true  None -> false }
+        FD(_, _, te, _) -> match ty_expr_find_handle(cont_name(), te, sums, [n, ...seen]) { Some(_) -> true  None -> false }
       })
     })
   } }

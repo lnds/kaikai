@@ -3394,7 +3394,8 @@ typedef enum {
     KAI_SEG_SUSPENDED = 1,
     KAI_SEG_RETURNED  = 2,
     KAI_SEG_UNWOUND   = 3,  /* discontinued, unwound to its entry */
-    KAI_SEG_ESCAPED   = 4   /* a non-local exit left through its entry */
+    KAI_SEG_ESCAPED   = 4,  /* a non-local exit left through its entry */
+    KAI_SEG_FORWARD   = 5   /* a request for a handle below the resumer */
 } KaiSegState;
 
 struct KaiSegment {
@@ -3416,6 +3417,7 @@ struct KaiSegment {
     const void  *asan_outer_bottom;
     size_t       asan_outer_size;
     KaiSegment  *pool_next;
+    struct KaiSegRelay *relays;  /* NULL label: a spare */
 };
 
 /* Leave the running segment by a non-local exit; its resumer continues it. */
@@ -18787,29 +18789,182 @@ static void kai_evidence_pop(void) {
     }
 }
 
+/* ---------- Evidence across stack segments ----------
+ *
+ * Code on a segment keeps evidence nodes in its frames across a suspension,
+ * and the segment may be resumed under other handlers. So a lookup on a
+ * segment that resolves below the segment's base returns a relay: a node the
+ * segment owns, standing for that handler. Every switch-in re-aims each relay
+ * from the new base, so a perform through one reaches the handler current at
+ * the resume, never one captured before. Relays are off every chain.
+ *
+ * A clause of a handler below the running segment runs in that handler's
+ * context: its lookups start under the handler, so it never reaches the
+ * segment's own handlers and cannot suspend the segment out from under the
+ * handler. */
+
+typedef struct KaiSegRelay {
+    KaiEvidence         node;     /* first: a relay is used as its node */
+    KaiEvidence        *target;   /* the chain node it stands for */
+    KaiEvidence        *def;      /* the default it falls back to, or NULL */
+    struct KaiSegRelay *next;
+} KaiSegRelay;
+
+static int kai_eff_label_match(const char *a, const char *b);
+
+/* A relay is on no chain: its parent slot holds this mark instead. */
+#define KAI_EV_RELAY ((KaiEvidence *) (uintptr_t) 1)
+
+/* The chain node `n` stands for. */
+static inline KaiEvidence *kai_ev_real(KaiEvidence *n) {
+    return n != NULL && n->parent == KAI_EV_RELAY ? ((KaiSegRelay *) n)->target : n;
+}
+
+/* The nearest node handling `eff_label` from `n` down to `stop`, `skip` aside. */
+static KaiEvidence *kai_ev_find(KaiEvidence *n, KaiEvidence *stop, const char *eff_label, KaiEvidence *skip) {
+    for (; n != stop; n = n->parent) {
+        if (n != skip && (n->eff_label == eff_label || kai_eff_label_match(n->eff_label, eff_label))) return n;
+    }
+    return NULL;
+}
+
+/* Whether `node` is on the chain a context with this top and segment owns;
+ * the fiber's own stack owns everything below. */
+static int kai_ctx_holds(KaiEvidence *top, KaiSegment *seg, KaiEvidence *node) {
+    if (seg == NULL) return 1;
+    for (KaiEvidence *n = top; n != seg->base; n = n->parent) {
+        if (n == node) return 1;
+    }
+    return 0;
+}
+
+/* Whether `node` is on the running segment's own chain. */
+static int kai_seg_holds(KaiFiber *f, KaiEvidence *node) {
+    return kai_ctx_holds(f->evidence_top, f->seg, node);
+}
+
+/* The context owning `node`: the running one (NULL) or a suspended resumer's. */
+static KaiSegCtx *kai_ctx_of(KaiFiber *f, KaiEvidence *node) {
+    if (kai_seg_holds(f, node)) return NULL;
+    KaiSegCtx *c = &f->seg->outer;
+    while (!kai_ctx_holds(c->evidence_top, c->seg, node)) c = &c->seg->outer;
+    return c;
+}
+
+/* Where a lookup in the running context starts and the node it skips. */
+static KaiEvidence *kai_ev_view(KaiFiber *f, KaiEvidence **skip) {
+    KaiEvidence *d = f->in_dispatch_node;
+    if (f->seg == NULL || d == NULL || kai_seg_holds(f, kai_ev_real(d))) {
+        *skip = kai_ev_real(d);
+        return f->evidence_top;
+    }
+    /* A default node is on no chain: its clause runs from the base. */
+    KaiEvidence *r = kai_ev_real(d);
+    *skip = NULL;
+    return r->parent != NULL ? r->parent : f->seg->base;
+}
+
+/* The node a lookup below `seg`'s base skips: the resumer's in-dispatch
+ * node, unless the segment hangs from that clause's handler context. */
+static KaiEvidence *kai_seg_skip(KaiSegment *seg) {
+    return seg->base == seg->outer.evidence_top ? kai_ev_real(seg->outer.in_dispatch_node) : NULL;
+}
+
+static void kai_seg_relay_aim(KaiSegRelay *r, KaiEvidence *to) {
+    r->target            = to;
+    r->node.handler      = to->handler;
+    r->node.handle_jmp   = to->handle_jmp;
+    r->node.discard_slot = to->discard_slot;
+}
+
+__attribute__((noreturn))
+static void kai_seg_unhandled(const char *eff_label) {
+    fprintf(stderr, "kai: a continuation was resumed or dropped where `%s` is not handled\n", eff_label);
+    kai_exit(1);
+    __builtin_unreachable();
+}
+
+/* `seg`'s relay for `eff_label`, made on first use; NULL when nothing below
+ * the segment handles it and there is no default. */
+static KaiEvidence *kai_seg_relay(KaiSegment *seg, const char *eff_label, KaiEvidence *def) {
+    KaiSegRelay *spare = NULL;
+    for (KaiSegRelay *r = seg->relays; r != NULL; r = r->next) {
+        if (r->node.eff_label == NULL) spare = r;
+        else if (r->node.eff_label == eff_label || strcmp(r->node.eff_label, eff_label) == 0) return &r->node;
+    }
+    KaiEvidence *to = kai_ev_find(seg->base, NULL, eff_label, kai_seg_skip(seg));
+    if (to == NULL) to = def;
+    if (to == NULL) return NULL;
+    KaiSegRelay *r = spare;
+    if (r == NULL) {
+        r = (KaiSegRelay *) calloc(1, sizeof *r);
+        if (r == NULL) {
+            fputs("kai: out of memory allocating an evidence relay\n", stderr);
+            kai_exit(1);
+        }
+        r->node.parent       = KAI_EV_RELAY;
+        r->node.cleanup_done = 1;
+        r->next = seg->relays;
+        seg->relays = r;
+    }
+    r->node.eff_label = eff_label;
+    r->def = def;
+    kai_seg_relay_aim(r, to);
+    return &r->node;
+}
+
+/* Re-aim `seg`'s relays from its base, just rebased. */
+static void kai_seg_reaim(KaiSegment *seg) {
+    for (KaiSegRelay *r = seg->relays; r != NULL; r = r->next) {
+        if (r->node.eff_label == NULL) continue;
+        KaiEvidence *to = kai_ev_find(seg->base, NULL, r->node.eff_label, kai_seg_skip(seg));
+        if (to == NULL) to = r->def;
+        if (to == NULL) kai_seg_unhandled(r->node.eff_label);
+        kai_seg_relay_aim(r, to);
+    }
+}
+
+/* A lookup on a segment: the running context's chain, then the relay of the
+ * segment whose base the walk leaves. */
+static KaiEvidence *kai_seg_lookup(KaiFiber *f, const char *eff_label, KaiEvidence *def) {
+    KaiEvidence *skip;
+    KaiEvidence *from = kai_ev_view(f, &skip);
+    KaiSegCtx *c = from == f->evidence_top ? NULL : kai_ctx_of(f, from);
+    KaiSegment *seg = c == NULL ? f->seg : c->seg;
+    KaiEvidence *n = kai_ev_find(from, seg != NULL ? seg->base : NULL, eff_label, skip);
+    if (n != NULL) return n;
+    if (seg == NULL) return def;
+    return kai_seg_relay(seg, eff_label, def);
+}
+
 /* A non-tail `resume` defers the rest of its clause: the clause pushes it
  * here, on the node whose clause is running, and the handle applies it to
- * its result on exit. Takes the clause's reference to the closure. */
+ * its result on exit. The frame goes to the context owning the node, whose
+ * handle reads it there. Takes the clause's reference to the closure. */
 static KaiValue *kai_resume_frame_push(KaiValue *clo) {
     KaiFiber *f = kai_current_fiber();
-    KaiEvidence *node = f->in_dispatch_node;
+    KaiEvidence *node = kai_ev_real(f->in_dispatch_node);
     if (node == NULL) {
         fputs("kai: internal error: a resume frame pushed outside a handler clause\n", stderr);
         kai_exit(1);
     }
-    if (f->rframe_top == f->rframe_cap) {
-        uint32_t cap = f->rframe_cap ? f->rframe_cap * 2 : 16;
-        KaiResumeFrame *buf = (KaiResumeFrame *) realloc(f->rframe_buf, (size_t) cap * sizeof(KaiResumeFrame));
+    KaiSegCtx *c = f->seg != NULL ? kai_ctx_of(f, node) : NULL;
+    KaiResumeFrame **buf_p = c ? &c->rframe_buf : &f->rframe_buf;
+    uint32_t *top_p = c ? &c->rframe_top : &f->rframe_top;
+    uint32_t *cap_p = c ? &c->rframe_cap : &f->rframe_cap;
+    if (*top_p == *cap_p) {
+        uint32_t cap = *cap_p ? *cap_p * 2 : 16;
+        KaiResumeFrame *buf = (KaiResumeFrame *) realloc(*buf_p, (size_t) cap * sizeof(KaiResumeFrame));
         if (buf == NULL) {
             fputs("kai: out of memory growing the resume frames\n", stderr);
             kai_exit(1);
         }
-        f->rframe_buf = buf;
-        f->rframe_cap = cap;
+        *buf_p = buf;
+        *cap_p = cap;
     }
-    f->rframe_buf[f->rframe_top].node = node;
-    f->rframe_buf[f->rframe_top].clo  = clo;
-    f->rframe_top++;
+    (*buf_p)[*top_p].node = node;
+    (*buf_p)[*top_p].clo  = clo;
+    (*top_p)++;
     return kai_unit();
 }
 
@@ -18874,15 +19029,8 @@ static void kai_resume_frames_drop(KaiFiber *f, KaiEvidence *node) {
  * handle, a lone pop leaves the dead node linked as top: the next handle
  * to reuse that stack storage links itself as its own parent, and every
  * later lookup walks the resulting cycle forever. */
-/* Whether `node` is on the running segment's own chain. */
-static int kai_seg_holds(KaiFiber *f, KaiEvidence *node) {
-    for (KaiEvidence *n = f->evidence_top; n != f->seg->base; n = n->parent) {
-        if (n == node) return 1;
-    }
-    return 0;
-}
-
 static void kai_evidence_unwind_to(KaiEvidence *node) {
+    node = kai_ev_real(node);
     if (node == NULL) return;
     /* Run every `finally` between the jump site and the target, innermost
      * first, before the chain is truncated. `node` itself is included:
@@ -18945,6 +19093,12 @@ KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k);
 KAI_SCHED_FN KaiValue *kai_seg_suspend(KaiValue *v);
 KAI_SCHED_FN KaiValue *kai_seg_resume(KaiValue *k, KaiValue *v, KaiValue **k_out);
 KAI_SCHED_FN void      kai_seg_discontinue(KaiValue *k);
+
+/* What a forwarding clause hands its handle: op `op`'s `n` arguments, and
+ * `to`, the node the clause was dispatched through (NULL: the running
+ * segment's own). It lives on the suspended segment's stack; the
+ * handle takes the arguments before it resumes. */
+typedef struct { int op; int n; KaiValue **args; KaiEvidence *to; } KaiSegRequest;
 
 #if !KAI_SCHED_DECL_ONLY && defined(KAI_SEG_SWITCH)
 
@@ -19023,6 +19177,11 @@ static KaiSegment *kai_seg_pool_take(void) {
 }
 
 static void kai_seg_unmap(KaiSegment *seg) {
+    while (seg->relays != NULL) {
+        KaiSegRelay *r = seg->relays;
+        seg->relays = r->next;
+        free(r);
+    }
     munmap(seg->own.stack_base, seg->own.stack_size + kai_page_size());
     free(seg->own.unw_buf);
     free(seg->own.rframe_buf);
@@ -19054,6 +19213,7 @@ KAI_SCHED_FN void kai_seg_pool_drain(void) {
 static void kai_seg_release(KaiSegment *seg) {
     KaiValue *body = seg->body;
     KaiValue *spare = seg->spare;
+    for (KaiSegRelay *r = seg->relays; r != NULL; r = r->next) r->node.eff_label = NULL;
     seg->body  = NULL;
     seg->xfer  = NULL;
     seg->spare = NULL;
@@ -19128,13 +19288,63 @@ static void kai_seg_rethrow(KaiFiber *f, KaiEvidence *to, int trap) {
     kai_fiber_pad_jump(f, 0);
 }
 
+/* The runtime owner is built unoptimised: the per-element switch path stays
+ * in one frame. */
+static inline __attribute__((always_inline)) KaiValue *kai_seg_suspend_on(KaiFiber *f, KaiValue *v, KaiSegState state) {
+    KaiSegment *seg = f->seg;
+    if (seg == NULL) {
+        fputs("kai: internal error: suspend outside a stack segment\n", stderr);
+        kai_exit(1);
+    }
+    if (seg->discontinue) kai_trap_abort("continuation suspended while being discontinued");
+    seg->xfer  = v;
+    seg->state = state;
+    kai_seg_ctx_save(f, &seg->own);
+    kai_seg_ctx_load(f, &seg->outer);
+    void *fake = NULL;
+    KAI_SEG_ASAN_LEAVE(&fake, seg->asan_outer_bottom, seg->asan_outer_size);
+#if defined(KAI_TSAN_FIBERS)
+    __tsan_switch_to_fiber(seg->tsan_outer, 0);
+#endif
+    void *r = kai_seg_switch(&seg->sp, seg->outer_sp, NULL);
+    KAI_SEG_ASAN_ARRIVE(fake, &seg->asan_outer_bottom, &seg->asan_outer_size);
+    if (seg->discontinue) kai_seg_unwind(seg->fiber, seg);
+    return (KaiValue *) r;
+}
+
+/* Suspend for a request: this context's segment when its chain holds the
+ * forwarding node, else hand the request on to the resumer, below. */
+static inline __attribute__((always_inline)) KaiValue *kai_seg_ask_on(KaiFiber *f, KaiSegRequest *req) {
+    KaiEvidence *to = req->to;
+    int own = to == NULL || to == f->evidence_top || f->seg == NULL || kai_seg_holds(f, kai_ev_real(to));
+    return kai_seg_suspend_on(f, (KaiValue *) req, own ? KAI_SEG_SUSPENDED : KAI_SEG_FORWARD);
+}
+
+/* Serve on this side a request `seg` forwarded, returning its answer. `seg`
+ * is held as a continuation meanwhile: an exit that skips this frame
+ * discontinues it. */
+__attribute__((noinline))
+static KaiValue *kai_seg_serve(KaiFiber *f, KaiSegment *seg) {
+    KaiValue *held[1] = { kai_alloc(KAI_CONT) };
+    held[0]->as.seg = seg;
+    KaiFiber *uf = kai_unw_push(held, 1);
+    KaiValue *v = kai_seg_ask_on(f, (KaiSegRequest *) seg->xfer);
+    kai_unw_pop(uf);
+    held[0]->as.seg = NULL;
+    kai_decref(held[0]);
+    return v;
+}
+
 /* Switch into `seg` with `arg` and report how it came back. */
 static KaiValue *kai_seg_run(KaiFiber *f, KaiSegment *seg, void *arg, KaiValue **k) {
+  for (;;) {
+    /* The runtime owner is unoptimised: keep the common switch-in inline. */
+    KaiEvidence *skip;
+    KaiEvidence *view = f->in_dispatch_node != NULL && f->seg != NULL ? kai_ev_view(f, &skip) : f->evidence_top;
     kai_seg_ctx_save(f, &seg->outer);
-    kai_seg_rebase(seg, f->evidence_top);
+    kai_seg_rebase(seg, view);
+    if (seg->relays != NULL) kai_seg_reaim(seg);
     kai_seg_ctx_load(f, &seg->own);
-    /* Outside a clause of its own, the segment runs under the resumer's. */
-    if (f->in_dispatch_node == NULL) f->in_dispatch_node = seg->outer.in_dispatch_node;
     seg->state = KAI_SEG_RUNNING;
     void *outer_fake = NULL;
     KAI_SEG_ASAN_LEAVE(&outer_fake, (char *) seg->own.stack_base + kai_page_size(), seg->own.stack_size);
@@ -19153,6 +19363,9 @@ static KaiValue *kai_seg_run(KaiFiber *f, KaiSegment *seg, void *arg, KaiValue *
             *k = box;
             return seg->xfer;
         }
+        case KAI_SEG_FORWARD:
+            arg = kai_seg_serve(f, seg);
+            continue;
         case KAI_SEG_ESCAPED: {
             KaiEvidence *to = seg->escape_to;
             int trap = seg->trap;
@@ -19166,6 +19379,7 @@ static KaiValue *kai_seg_run(KaiFiber *f, KaiSegment *seg, void *arg, KaiValue *
             return v;
         }
     }
+  }
 }
 
 /* Empty a continuation box, consuming it, and return its segment. */
@@ -19224,27 +19438,15 @@ KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k) {
 /* From inside a segment: hand `v` to the resumer and wait to be resumed.
  * Returns the value of the resume. */
 KAI_SCHED_FN KaiValue *kai_seg_suspend(KaiValue *v) {
+    return kai_seg_suspend_on(kai_current_fiber(), v, KAI_SEG_SUSPENDED);
+}
+
+/* A forwarding clause: hand op `op`'s `n` arguments (consumed) to the handle
+ * and return the value its continuation is called with. */
+KAI_SCHED_FN KaiValue *kai_seg_request(int op, int n, KaiValue **args) {
     KaiFiber *f = kai_current_fiber();
-    KaiSegment *seg = f->seg;
-    if (seg == NULL) {
-        fputs("kai: internal error: suspend outside a stack segment\n", stderr);
-        kai_exit(1);
-    }
-    if (seg->discontinue) kai_trap_abort("continuation suspended while being discontinued");
-    seg->xfer  = v;
-    seg->state = KAI_SEG_SUSPENDED;
-    kai_seg_ctx_save(f, &seg->own);
-    if (seg->own.in_dispatch_node == seg->outer.in_dispatch_node) seg->own.in_dispatch_node = NULL;
-    kai_seg_ctx_load(f, &seg->outer);
-    void *fake = NULL;
-    KAI_SEG_ASAN_LEAVE(&fake, seg->asan_outer_bottom, seg->asan_outer_size);
-#if defined(KAI_TSAN_FIBERS)
-    __tsan_switch_to_fiber(seg->tsan_outer, 0);
-#endif
-    void *r = kai_seg_switch(&seg->sp, seg->outer_sp, NULL);
-    KAI_SEG_ASAN_ARRIVE(fake, &seg->asan_outer_bottom, &seg->asan_outer_size);
-    if (seg->discontinue) kai_seg_unwind(seg->fiber, seg);
-    return (KaiValue *) r;
+    KaiSegRequest req = { op, n, args, f->in_dispatch_node };
+    return kai_seg_ask_on(f, &req);
 }
 
 /* Resume `k` (consumed) with `v` (owned). Returns like kai_seg_start. */
@@ -19299,6 +19501,9 @@ KAI_SCHED_FN KaiValue *kai_seg_resume(KaiValue *k, KaiValue *v, KaiValue **k_out
     (void) k; (void) v; (void) k_out; kai_seg_unsupported();
 }
 KAI_SCHED_FN void kai_seg_discontinue(KaiValue *k) { (void) k; kai_seg_unsupported(); }
+KAI_SCHED_FN KaiValue *kai_seg_request(int op, int n, KaiValue **args) {
+    (void) op; (void) n; (void) args; kai_seg_unsupported();
+}
 KAI_SCHED_FN void kai_seg_cont_drop(KaiValue *box) { (void) box; }
 KAI_SCHED_FN void kai_seg_pool_drain(void) {}
 KAI_SCHED_FN void kai_seg_escape(KaiFiber *f, KaiEvidence *to, int trap) {
@@ -19320,10 +19525,6 @@ KAI_SCHED_FN KaiValue *kai_seg_handle(KaiValue *body, KaiValue *ret, int n, KaiV
 KAI_SCHED_FN KaiValue *kai_seg_request(int op, int n, KaiValue **args);
 
 #if !KAI_SCHED_DECL_ONLY
-
-/* What a forwarding clause hands its handle. It lives on the suspended
- * segment's stack; the handle takes the arguments before it resumes. */
-typedef struct { int op; int n; KaiValue **args; } KaiSegRequest;
 
 static KaiValue *kai_seg_handle_step(KaiValue *handler, KaiValue *v, KaiValue *k);
 
@@ -19374,12 +19575,6 @@ KAI_SCHED_FN KaiValue *kai_seg_handle(KaiValue *body, KaiValue *ret, int n, KaiV
     return r;
 }
 
-/* A forwarding clause: hand op `op`'s `n` arguments (consumed) to the handle
- * and return the value its continuation is called with. */
-KAI_SCHED_FN KaiValue *kai_seg_request(int op, int n, KaiValue **args) {
-    KaiSegRequest req = { op, n, args };
-    return kai_seg_suspend((KaiValue *) &req);
-}
 
 #endif
 
@@ -19422,7 +19617,7 @@ static int kai_cancel_dispatch_user_handler(void) {
     KaiEvidence *node = f->evidence_top;
     KaiEvidence *user_node = NULL;
     while (node) {
-        if (node != f->in_dispatch_node
+        if (node != kai_ev_real(f->in_dispatch_node)
             && node->handle_jmp != NULL
             && node->eff_label
             && strcmp(node->eff_label, "Cancel") == 0) {
@@ -19518,9 +19713,10 @@ static void *kai_evidence_lookup(const char *eff_label) {
     return NULL;
 }
 
-/* m7a #6e: same lookup but returns the whole node so the op-call
- * site can reach the handle's jmp_buf if a discard happens. */
-static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
+/* The node a perform of `eff_label` dispatches to, `def` when none handles it.
+ * m8 bug #12: the walk skips the node whose clause is being dispatched on
+ * this fiber, so a recursive op resolves to the outer handler. */
+static KaiEvidence *kai_evidence_find_node(const char *eff_label, KaiEvidence *def) {
     kai_check_cancel_yield_point();
     /* Issue #103 — bypass user Cancel handlers when the current
      * fiber is linked to a trap-exit'd peer (see
@@ -19529,18 +19725,15 @@ static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
         kai_check_trap_exit_cancel_bypass();
     }
     KaiFiber *f = kai_current_fiber();
-    KaiEvidence *node = f->evidence_top;
-    while (node != NULL) {
-        /* m8 bug #12: skip a node whose clause body is currently being
-         * dispatched on *this* fiber, so a recursive op resolves to the
-         * outer handler. Per-fiber state, not a flag on the node. */
-        if (node != f->in_dispatch_node
-            && (node->eff_label == eff_label || kai_eff_label_match(node->eff_label, eff_label))) {
-            return node;
-        }
-        node = node->parent;
-    }
-    return NULL;
+    if (f->seg != NULL) return kai_seg_lookup(f, eff_label, def);
+    KaiEvidence *node = kai_ev_find(f->evidence_top, NULL, eff_label, f->in_dispatch_node);
+    return node != NULL ? node : def;
+}
+
+/* m7a #6e: same lookup but returns the whole node so the op-call
+ * site can reach the handle's jmp_buf if a discard happens. */
+static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
+    return kai_evidence_find_node(eff_label, NULL);
 }
 
 /* Resolve a default-bearing effect performed with no caller frame slot: a
@@ -19548,8 +19741,7 @@ static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
  * default node (no longer pushed). The bridge for a direct perform in a fn that
  * carries no frame (e.g. `main`), where the walk alone would miss the default. */
 static KaiEvidence *kai_evidence_lookup_or_default(const char *eff_label, KaiEvidence *def) {
-    KaiEvidence *node = kai_evidence_lookup_node(eff_label);
-    return node != NULL ? node : def;
+    return kai_evidence_find_node(eff_label, def);
 }
 
 /* A fiber-local effect resolved to no handler — the perform site walked an
@@ -19624,10 +19816,11 @@ static KaiEvidence *kai_evidence_require_reachable(KaiEvidence *node, const char
 static KaiEvidence *kai_evidence_lookup_node_by_id(KaiHandlerId id) {
     kai_check_cancel_yield_point();
     KaiFiber *f = kai_current_fiber();
-    KaiEvidence *node = f->evidence_top;
+    KaiEvidence *skip = f->in_dispatch_node;
+    KaiEvidence *node = f->seg != NULL ? kai_ev_view(f, &skip) : f->evidence_top;
     while (node != NULL) {
         /* m8 bug #12: same per-fiber skip rule as the by-name lookup. */
-        if (node == f->in_dispatch_node) { node = node->parent; continue; }
+        if (node == skip) { node = node->parent; continue; }
         KaiHandlerId nid = ((KaiHandlerId *) node->handler)[0];
         if (nid == id) {
             /* Issue #103 — same Cancel bypass as the by-name path:

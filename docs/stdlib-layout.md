@@ -422,9 +422,12 @@ machinery suffices.
 Pull generators built on the `Yield[t]` effect *(shipped via PR #2627)*.
 A producer is an ordinary function performing `Yield.yield(v)`;
 `generate` handles it by keeping the continuation, so each element
-comes out as `Next(v, k)` of `Gen[t] = Done | Next(t, Cont[Unit, Gen[t]])`
+comes out as `Next(v, k)` of `Gen[t, e] = Done | Next(t, Cont[Unit, Gen[t, e], e])`
 and `k(())` runs the producer to its next element on its own stack
-segment. A dropped `Gen` discontinues its producer. The module uses
+segment. The producer may perform other effects, `e`, served by the
+handlers wherever the generator is stepped *(shipped: effectful
+producers)*. A dropped `Gen` discontinues its producer, running its
+`finally` blocks where it is dropped. The module uses
 nothing a user module cannot write (`kai info effects`, *Build your own
 generator*).
 

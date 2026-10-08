@@ -511,18 +511,31 @@ A clause may keep its continuation beyond a call in the clause
 itself: call it inside a `handle` nested in the clause, a loop body,
 a match guard, a string interpolation or a lambda, read a clause
 `var` after it, or store and return it. `resume` is then a value of
-type `Cont[T, S]` — `T` the op's result, `S` the handle's type — and
-`k(v) : S` resumes the body. The handle runs its body on a stack
-segment; dropping an unresumed continuation discontinues the body,
-running every `finally` on it. A continuation stays on its fiber: a
-thunk handed to `spawn`, a fiber's result, or an actor message holding
-one is a compile error.
+type `Cont[T, S, e]` — `T` the op's result, `S` the handle's type, `e`
+the body's row without the handled effect — and `k(v) : S / e` resumes
+the body. `Cont[T, S]` is `Cont[T, S, e]` with `e` empty: the
+continuation of a pure body. The handle runs its body on a stack
+segment.
 
-> **v1 status (2026-10-08):** a continuation that can leave its
-> clause carries no effect row yet, so the body it resumes may perform
-> only the effect its handle discharges; effectful generator bodies
-> are coming. A stateful handle cannot keep its continuation; its
-> segment form is coming.
+What the body performs besides the handled effect reaches the handlers
+live where it is resumed, not those live when it suspended: a body
+suspended under one `Log` handler and resumed under another logs to
+the second. A handler's clause reached that way runs in its handler's
+context, outside the body's own handlers.
+
+Dropping an unresumed continuation discontinues the body: every
+`finally` on it runs, in the evidence context of the drop. So a drop
+needs `e` handled, as a call does. A handle whose value holds a
+continuation performing the effect the handle discharges is a compile
+error; a continuation that leaves its handlers another way (captured
+in a closure or a `var`) and is resumed or dropped where its effects
+are not handled stops the program.
+
+A continuation stays on its fiber: a thunk handed to `spawn`, a
+fiber's result, or an actor message holding one is a compile error.
+
+> **v1 status (2026-10-08):** a stateful handle cannot keep its
+> continuation; its segment form is coming.
 
 For genuinely multi-shot or escaping continuations (backtracking
 search, generators), the programmer writes `resume_multishot(v)`

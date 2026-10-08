@@ -429,7 +429,7 @@ non-tail position.
 
 > **v1 status (2026-10-08):** a `resume` is the stack-allocated
 > `KaiCont` of §*One-shot case* unless its handle runs on a segment,
-> where it is a `Cont[T, S]` closure over the segment's box
+> where it is a `Cont[T, S, e]` closure over the segment's box
 > (§*Handles on a segment*). Multi-shot is not implemented.
 
 `resume` is a value of type `(T) -> S / ρ`. Doc A §*`resume`:
@@ -514,8 +514,7 @@ pointer. It is not `swapcontext`: there is no signal-mask syscall.
 - `kai_seg_resume(k, v, &k2)` consumes `k` and continues the body
   with `v`. The segment's evidence chain is re-hung from the
   resumer's top, so the handlers in scope are the resumer's (deep
-  semantics). Outside a clause of its own, the segment runs under the
-  resumer's in-dispatch node.
+  semantics).
 - `kai_seg_discontinue(k)` unwinds the segment, and so does dropping
   the last reference to an unresumed box. Every `finally` on the
   segment's chain runs, its unwind stack is released, and native
@@ -540,6 +539,39 @@ out.
 While a discontinue driven by a drop runs, the fiber is pinned to its
 thread. The free walk that triggered it holds thread-local addresses.
 
+#### Evidence across a suspension
+
+Code on a segment keeps evidence nodes in its frames: a function's
+evidence frame is filled once, when it is called. Re-hanging the chain
+alone would leave those slots naming the handlers of the first run. So
+a lookup on a segment that resolves below the segment's base returns a
+*relay*: an evidence node the segment owns (`KaiSegRelay`), off every
+chain, standing for the handler found. Every switch-in (start, resume,
+discontinue) re-aims each relay from the new base, skipping the
+resumer's in-dispatch node; a frame slot holding a relay therefore
+reaches the handler current at the resume. A relay whose effect has no
+handler there and no default traps: the continuation was resumed or
+dropped outside its handlers. A pure body looks nothing up below its
+base and owns no relay.
+
+A clause reached through a relay runs on the segment, but in its
+handler's context: while the in-dispatch node lies below the running
+segment, lookups start under that handler, never at the segment's own
+top. Such a clause cannot reach the body's handlers, so it cannot
+suspend the segment out from under its own frames. An abandon through
+a relay unwinds to the handler it stands for, and a non-tail `resume`
+in that clause files its pending tail with the context that owns the
+handler, whose handle applies it on exit.
+
+A forwarding clause's request names its forwarding node. When that
+node belongs to a segment below the running one — a nested segment's
+body performing an outer segment's handled effect — the running
+segment suspends as `KAI_SEG_FORWARD`, the resumer re-issues the
+request from its own context (suspending its segment, or forwarding
+further), and resumes the nested segment with the answer. While it
+waits, the nested segment is held in an unwind-stack slot, so an exit
+past the resumer discontinues it.
+
 ### Handles on a segment
 
 A pre-resolve pass (`resume_segment.kai`) decides where each `handle`
@@ -559,9 +591,12 @@ The inner handle's clauses are tail-resuming forwarders, so it takes
 the direct path and lives on the segment: the handler is deep by
 construction. The typer types the thunk first; the arguments and
 result of each `$seg_request(i, …)` give clause `i` its parameter
-types and its continuation `Cont[answer, S]`, where `S` is the
-handle's type. A `Cont` is called like a function; at run time it is a
-closure over the segment's box and the handler.
+types and its continuation `Cont[answer, S, e]`, where `S` is the
+handle's type and `e` the thunk's row, the body's effects besides `E`.
+`Cont[T, S]` written in a type is `Cont[T, S, e]` with `e` empty.
+A `Cont` is called like a function, and `k(v)` adds `e` to the
+caller's row; at run time it is a closure over the segment's box and
+the handler.
 
 Both backends lower the two intrinsics to runtime calls
 (`kai_seg_handle` / `kai_seg_request`; the native backend through
@@ -576,7 +611,10 @@ without resuming is therefore an abandon.
 A continuation is bound to its fiber. A post-typing walk
 (`cont_crossing.kai`) rejects a thunk handed to a call yielding a
 `Fiber` or `Pid` that captures one, such a call's result holding one,
-and a call taking a `Pid` that passes one.
+and a call taking a `Pid` that passes one. The same walk rejects a
+`handle` whose value holds a continuation whose row names the effect
+the handle discharges: dropping it outside would run its `finally`
+without that handler.
 
 `kai build --explain` prints a note for each segment handle of the
 root file, with the shape that sent it there.

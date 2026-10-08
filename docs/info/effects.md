@@ -302,14 +302,16 @@ fn pair() : String / Box[Int] + Box[String] = {
 fn main() : Int = 0
 ```
 
-## Keeping the continuation — `Cont[T, S]`
+## Keeping the continuation — `Cont[T, S, e]`
 
 A clause may store `resume`, return it, or call it from a lambda or a
-loop. It is then a value of type `Cont[T, S]`: `T` is what the op
-returns, `S` the handle's type, and `k(v) : S` resumes the body. Such a
-handle runs its body on a stack segment; `kai build --explain` notes
-each one and why. A dropped continuation discontinues its body: every
-`finally` on it runs.
+loop. It is then a value of type `Cont[T, S, e]`: `T` is what the op
+returns, `S` the handle's type, `e` what the body performs besides the
+handled effect, and `k(v) : S / e` resumes the body. `Cont[T, S]` is
+the continuation of a pure body (`e` empty). Such a handle runs its
+body on a stack segment; `kai build --explain` notes each one and why.
+A dropped continuation discontinues its body: every `finally` on it
+runs.
 
 ```kaikai
 effect Yield { yield(x: Int) : Unit }
@@ -330,10 +332,38 @@ fn sum_all(g: Gen, acc: Int) : Int = match g {
 fn main() : Unit / Stdout = Stdout.print("#{sum_all(generate(10), 0)}")   # 55
 ```
 
+The body's other effects reach the handlers around wherever `k(v)` is
+called, not those around the first run, so `k(v)` needs `e` handled.
+Dropping the continuation runs its `finally` blocks where it is dropped,
+so a drop needs `e` handled too.
+
+```kaikai
+effect Yield { yield(x: Int) : Unit }
+effect Log { log(s: String) : Unit }
+
+type Gen[e] = Done | Next(Int, Cont[Unit, Gen[e], e])
+
+fn counted(n: Int) : Unit / Yield + Log =
+  if n == 0 { () } else { Log.log("at #{n}"); Yield.yield(n); counted(n - 1) }
+
+fn generate() : Gen[Log] / Log =
+  handle { counted(2); Done } with Yield { yield(x, resume) -> Next(x, resume) }
+
+fn sum_all(g: Gen[Log], acc: Int) : Int / Log = match g {
+  Done       -> acc
+  Next(x, k) -> sum_all(k(()), acc + x)
+}
+
+fn main() : Unit / Stdout =
+  handle { Stdout.print("#{sum_all(generate(), 0)}") }   # at 2, at 1, 3
+  with Log { log(s, resume) -> { Stdout.print(s); resume(()) } }
+```
+
 - A continuation stays on the fiber that created it: a thunk handed to
   `spawn`, a fiber's result, or an actor message cannot hold one.
-- When the continuation can leave its clause, the handled body may
-  perform only the effect its handle discharges.
+- A handle cannot return a value holding a continuation that performs
+  the effect the handle discharges. A continuation that leaves its
+  handlers some other way stops the program if resumed or dropped there.
 - A stateful handle (`with Eff(init)`) cannot keep its continuation.
 
 ## Build your own generator
@@ -421,7 +451,8 @@ fn main() : Unit / Stdout = {
 ```
 
 The stdlib ships the same shape as `gen` (`kai doc gen`): `Yield[t]`,
-`Gen[t]`, `generate`, and stages that ride the pipes.
+`Gen[t, e]`, `generate`, and stages that ride the pipes. There the
+producer may perform other effects too: they are the `e` of `Gen[t, e]`.
 
 ## Stdlib effects
 
