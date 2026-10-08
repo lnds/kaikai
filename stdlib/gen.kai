@@ -7,45 +7,48 @@ a time.
 comes out as `Next(v, k)`, and `k(())` runs the producer to its next
 element. The producer runs on its own stack segment, so it is an
 ordinary recursive function that may be infinite. A `Gen` the consumer
-drops discontinues its producer: the producer never runs again and its
+drops discontinues its producer: every `finally` on it runs and its
 segment is released.
+
+A producer may perform effects besides `Yield`: they are the `e` of
+`Gen[t, e]`, performed wherever the generator is stepped or dropped, so
+the handlers around the consumer serve them. A pure producer leaves `e`
+open, and it unifies with any row.
 
 The stages (`map`, `flat_map`, `filter`, `zip_with`, `take_until`) are
 generators themselves, each stepping its source from inside its own
-producer. `map` / `flat_map` / `filter` carry the canonical
-signatures, so `|`, `||`, `|?` dispatch on `Gen` (`kai info pipes`).
-
-A producer performs only `Yield`, and the functions the stages run
-inside it are pure. The sinks (`each_indexed`, `reduce`) run in the
-consumer and may perform any effect. `import gen`.
+producer, so the functions they run perform the same `e`. `map` /
+`flat_map` / `filter` carry the canonical signatures, so `|`, `||`,
+`|?` dispatch on `Gen` (`kai info pipes`). The sinks (`each_indexed`,
+`reduce`) run in the consumer. `import gen`.
 """)]
 
 #[doc("The effect a generator body performs to hand out each element.")]
 pub effect Yield[t] { yield(v: t) : Unit }
 
-#[doc("A generator of `t`: `Done`, or the next element and the continuation that produces the rest.")]
-pub type Gen[t] = Done | Next(t, Cont[Unit, Gen[t]])
+#[doc("A generator of `t` performing `e`: `Done`, or the next element and the continuation that produces the rest.")]
+pub type Gen[t, e] = Done | Next(t, Cont[Unit, Gen[t, e], e])
 
 #[doc("Runs `body` as a generator: each `Yield.yield(v)` becomes the next element.")]
-pub fn generate[t](body: () -> Unit / Yield[t]) : Gen[t] =
+pub fn generate[t, e](body: () -> Unit / Yield[t] + e) : Gen[t, e] / e =
   handle { body(); Done } with Yield[t] { yield(v, resume) -> Next(v, resume) }
 
-fn yield_mapped[a, b](g: Gen[a], f: (a) -> b) : Unit / Yield[b] = match g {
+fn yield_mapped[a, b, e](g: Gen[a, e], f: (a) -> b / e) : Unit / Yield[b] + e = match g {
   Done       -> ()
   Next(x, k) -> { Yield.yield(f(x)); yield_mapped(k(()), f) }
 }
 
-fn yield_all[t](g: Gen[t]) : Unit / Yield[t] = match g {
+fn yield_all[t, e](g: Gen[t, e]) : Unit / Yield[t] + e = match g {
   Done       -> ()
   Next(x, k) -> { Yield.yield(x); yield_all(k(())) }
 }
 
-fn yield_flat[a, b](g: Gen[a], f: (a) -> Gen[b]) : Unit / Yield[b] = match g {
+fn yield_flat[a, b, e](g: Gen[a, e], f: (a) -> Gen[b, e] / e) : Unit / Yield[b] + e = match g {
   Done       -> ()
   Next(x, k) -> { yield_all(f(x)); yield_flat(k(()), f) }
 }
 
-fn yield_kept[t](g: Gen[t], p: (t) -> Bool) : Unit / Yield[t] = match g {
+fn yield_kept[t, e](g: Gen[t, e], p: (t) -> Bool / e) : Unit / Yield[t] + e = match g {
   Done       -> ()
   Next(x, k) -> {
     if p(x) { Yield.yield(x) } else { () }
@@ -53,7 +56,7 @@ fn yield_kept[t](g: Gen[t], p: (t) -> Bool) : Unit / Yield[t] = match g {
   }
 }
 
-fn yield_zipped[a, b, c](ga: Gen[a], gb: Gen[b], f: (a, b) -> c) : Unit / Yield[c] = match ga {
+fn yield_zipped[a, b, c, e](ga: Gen[a, e], gb: Gen[b, e], f: (a, b) -> c / e) : Unit / Yield[c] + e = match ga {
   Done        -> ()
   Next(x, ka) -> match gb {
     Done        -> ()
@@ -61,7 +64,7 @@ fn yield_zipped[a, b, c](ga: Gen[a], gb: Gen[b], f: (a, b) -> c) : Unit / Yield[
   }
 }
 
-fn yield_until[t](g: Gen[t], p: (t) -> Bool) : Unit / Yield[t] = match g {
+fn yield_until[t, e](g: Gen[t, e], p: (t) -> Bool / e) : Unit / Yield[t] + e = match g {
   Done       -> ()
   Next(x, k) -> {
     Yield.yield(x)
@@ -70,36 +73,36 @@ fn yield_until[t](g: Gen[t], p: (t) -> Bool) : Unit / Yield[t] = match g {
 }
 
 #[doc("Maps `f` over every element, lazily. Canonical `map`: participates in the `|` pipe.")]
-pub fn map[a, b](g: Gen[a], f: (a) -> b) : Gen[b] = generate { yield_mapped(g, f) }
+pub fn map[a, b, e](g: Gen[a, e], f: (a) -> b / e) : Gen[b, e] / e = generate { yield_mapped(g, f) }
 
 #[doc("Maps `f` to a generator per element and yields each in turn. Canonical `flat_map`: participates in the `||` pipe.")]
-pub fn flat_map[a, b](g: Gen[a], f: (a) -> Gen[b]) : Gen[b] = generate { yield_flat(g, f) }
+pub fn flat_map[a, b, e](g: Gen[a, e], f: (a) -> Gen[b, e] / e) : Gen[b, e] / e = generate { yield_flat(g, f) }
 
 #[doc("Keeps the elements satisfying `p`, lazily. Canonical `filter`: participates in the `|?` pipe.")]
-pub fn filter[t](g: Gen[t], p: (t) -> Bool) : Gen[t] = generate { yield_kept(g, p) }
+pub fn filter[t, e](g: Gen[t, e], p: (t) -> Bool / e) : Gen[t, e] / e = generate { yield_kept(g, p) }
 
 #[doc("Pairs `ga` and `gb` element-wise through `f`, ending with the shorter one.")]
-pub fn zip_with[a, b, c](ga: Gen[a], gb: Gen[b], f: (a, b) -> c) : Gen[c] =
+pub fn zip_with[a, b, c, e](ga: Gen[a, e], gb: Gen[b, e], f: (a, b) -> c / e) : Gen[c, e] / e =
   generate { yield_zipped(ga, gb, f) }
 
 #[doc("Yields elements up to and including the first that satisfies `p`, then drops the source.")]
-pub fn take_until[t](g: Gen[t], p: (t) -> Bool) : Gen[t] = generate { yield_until(g, p) }
+pub fn take_until[t, e](g: Gen[t, e], p: (t) -> Bool / e) : Gen[t, e] / e = generate { yield_until(g, p) }
 
-fn each_from[t, e](g: Gen[t], i: Int, f: (Int, t) -> Unit / e) : Unit / e = match g {
+fn each_from[t, e](g: Gen[t, e], i: Int, f: (Int, t) -> Unit / e) : Unit / e = match g {
   Done       -> ()
   Next(x, k) -> { f(i, x); each_from(k(()), i + 1, f) }
 }
 
 #[doc("Runs `f` on every element with its zero-based index, forcing the generator.")]
-pub fn each_indexed[t, e](g: Gen[t], f: (Int, t) -> Unit / e) : Unit / e = each_from(g, 0, f)
+pub fn each_indexed[t, e](g: Gen[t, e], f: (Int, t) -> Unit / e) : Unit / e = each_from(g, 0, f)
 
-fn reduce_from[t, e](g: Gen[t], acc: t, f: (t, t) -> t / e) : t / e = match g {
+fn reduce_from[t, e](g: Gen[t, e], acc: t, f: (t, t) -> t / e) : t / e = match g {
   Done       -> acc
   Next(x, k) -> reduce_from(k(()), f(acc, x), f)
 }
 
 #[doc("Combines the elements left to right with `f`; `None` when the generator is empty.")]
-pub fn reduce[t, e](g: Gen[t], f: (t, t) -> t / e) : Option[t] / e = match g {
+pub fn reduce[t, e](g: Gen[t, e], f: (t, t) -> t / e) : Option[t] / e = match g {
   Done       -> None
   Next(x, k) -> Some(reduce_from(k(()), x, f))
 }
