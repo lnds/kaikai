@@ -12,11 +12,9 @@
 # Soundness rests on the same premise the desugar rewrite stands on: a
 # var cell is addressable only through its alias id (`op@a` + the
 # `__alias_id__a` register), never by an unaliased State perform from
-# user code. An unaliased State perform anywhere in the program (a
-# handler clause reading a var declared in the handler body) reaches the
-# nearest cell dynamically, from another fn, so the pass then rewrites
-# nothing. It also bails on a same-name sibling install and on any
-# non-get/set use of the alias.
+# user code; any unaliased State perform in the program disables the
+# pass. It also skips a same-name sibling install, a non-get/set use of
+# the alias, and an alias id a handler env carries into its clauses.
 
 import compiler.util
 import compiler.kir
@@ -33,7 +31,7 @@ pub fn kvs_program(kp: KProgram) : KProgram = {
   match canon {
     [] -> kp
     _  -> KProgram { types: kp.types,
-                     fns: kvs_fn_loop(kp.fns, canon, []),
+                     fns: kvs_fn_loop(kp.fns, canon, kvs_env_alias_caps(kp.handlers, []), []),
                      handlers: kp.handlers,
                      install_order: kp.install_order,
                      defaults: kp.defaults,
@@ -115,13 +113,13 @@ fn kvs_ret_is(t: KTerm, nm: String) : Bool = match t {
 
 # --- Per-fn rewrite -------------------------------------------------------
 
-fn kvs_fn_loop(fs: [KFn], canon: [String], acc: [KFn]) : [KFn] = match fs {
+fn kvs_fn_loop(fs: [KFn], canon: [String], captured: [String], acc: [KFn]) : [KFn] = match fs {
   []           -> list_reverse(acc)
-  [f, ...rest] -> kvs_fn_loop(rest, canon, [kvs_fn(f, canon), ...acc])
+  [f, ...rest] -> kvs_fn_loop(rest, canon, captured, [kvs_fn(f, canon, captured), ...acc])
 }
 
-fn kvs_fn(f: KFn, canon: [String]) : KFn = {
-  let cells = kvs_admissible_cells(f.blocks, canon)
+fn kvs_fn(f: KFn, canon: [String], captured: [String]) : KFn = {
+  let cells = kvs_admissible_cells(f.blocks, canon, captured)
   match cells {
     [] -> f
     _  -> KFn { sym: f.sym, kind: f.kind, params: f.params, ret: f.ret,
@@ -134,8 +132,8 @@ fn kvs_fn(f: KFn, canon: [String]) : KFn = {
 # among ALL of the fn's aliased installs, whose alias register is never
 # read as an atom, and whose `@alias` performs are all get/0 or set/1
 # shapes.
-fn kvs_admissible_cells(bs: [KBlock], canon: [String]) : [KvsCell] =
-  kvs_filter_cells(kvs_installs(bs, []), bs, canon, [])
+fn kvs_admissible_cells(bs: [KBlock], canon: [String], captured: [String]) : [KvsCell] =
+  kvs_filter_cells(kvs_installs(bs, []), bs, canon, captured, [])
 
 fn kvs_installs(bs: [KBlock], acc: [KvsCell]) : [KvsCell] = match bs {
   []           -> acc
@@ -150,16 +148,24 @@ fn kvs_installs_stmts(ss: [KStmt], acc: [KvsCell]) : [KvsCell] = match ss {
   })
 }
 
-fn kvs_filter_cells(installs: [KvsCell], bs: [KBlock], canon: [String], acc: [KvsCell]) : [KvsCell] = match installs {
+fn kvs_filter_cells(installs: [KvsCell], bs: [KBlock], canon: [String], captured: [String], acc: [KvsCell]) : [KvsCell] = match installs {
   [] -> acc
-  [KVC(site, a), ...rest] -> kvs_filter_cells(rest, bs, canon,
-    if kvs_cell_admissible(site, a, rest, acc, bs, canon) { [KVC(site, a), ...acc] } else { acc })
+  [KVC(site, a), ...rest] -> kvs_filter_cells(rest, bs, canon, captured,
+    if kvs_cell_admissible(site, a, rest, acc, bs, canon, captured) { [KVC(site, a), ...acc] } else { acc })
 }
 
-fn kvs_cell_admissible(site: String, a: String, rest: [KvsCell], acc: [KvsCell], bs: [KBlock], canon: [String]) : Bool = {
+fn kvs_cell_admissible(site: String, a: String, rest: [KvsCell], acc: [KvsCell], bs: [KBlock], canon: [String], captured: [String]) : Bool = {
   let unique = kvs_alias_count(rest, a) == 0 and kvs_alias_count(acc, a) == 0
-  let clean = not kvs_alias_reg_used(bs, cat2("__alias_id__", a))
+  let reg = cat2("__alias_id__", a)
+  let clean = not kvs_alias_reg_used(bs, reg) and not list_has(captured, reg)
   list_has(canon, site) and unique and clean and kvs_performs_ok(bs, a)
+}
+
+# Every name a handler env carries; an `__alias_id__<a>` among them is a
+# cell its clauses perform on by id from outside the installing fn.
+fn kvs_env_alias_caps(hs: [KHandlerDecl], acc: [String]) : [String] = match hs {
+  []           -> acc
+  [h, ...rest] -> kvs_env_alias_caps(rest, list_append(h.env_caps, acc))
 }
 
 fn kvs_alias_count(cells: [KvsCell], a: String) : Int = match cells {
