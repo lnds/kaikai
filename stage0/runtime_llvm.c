@@ -1578,6 +1578,24 @@ KaiValue *kaix_resume_frames_run(KaiEvidence *node, KaiValue *v) {
     return kai_resume_frames_run(node, v);
 }
 
+/* Stack segments: a body on its own stack, suspended and resumed through a
+ * one-shot continuation box. */
+KaiValue *kaix_seg_start(KaiValue *body, KaiValue **k) {
+    return kai_seg_start(body, k);
+}
+
+KaiValue *kaix_seg_suspend(KaiValue *v) {
+    return kai_seg_suspend(v);
+}
+
+KaiValue *kaix_seg_resume(KaiValue *k, KaiValue *v, KaiValue **k_out) {
+    return kai_seg_resume(k, v, k_out);
+}
+
+void kaix_seg_discontinue(KaiValue *k) {
+    kai_seg_discontinue(k);
+}
+
 /* Op-site discard test, mirroring the C branch condition
  * `_k.status == KAI_CONT_UNRESUMED && _node_op->handle_jmp != NULL`.
  * Returns 1 when the clause discarded `resume` AND a handle pad is in

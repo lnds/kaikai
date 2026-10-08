@@ -100,6 +100,10 @@ document pins that translation.
 - **Segmented stacks.** Régime B's continuations live in the
   heap, not in a separate stack segment. The scheduler is
   simpler; the stack looks like any other program's stack.
+
+> **v1 status (2026-10-08):** the runtime does carry stack segments
+> (§*Stack segments*), for continuations that must outlive their
+> clause. The direct-call path stays the default.
 - **First-class named handlers.** Shipped (§6 named instances,
   #820): a `with Eff as a` capability is a first-class value of type
   `Eff`, threadable into a call. It stays second-class — no return,
@@ -386,11 +390,10 @@ talking to — only which label the lookup is parameterised by.
 > perform is a direct call to the clause on the performing stack, a
 > tail `resume` is a return, an abandon is a `longjmp` to the handle,
 > and a non-tail `resume` defers the rest of its clause to the
-> handle's exit. Stack segments — the runtime layer for real one-shot
-> continuations: an mmap'd stack per suspended computation, switched
-> by a register-saving primitive in `stage2/runtime.h` — are landing;
-> no compiled program runs on one until the compiler classifies which
-> handles need a captured continuation.
+> handle's exit. The runtime layer for real one-shot continuations,
+> stack segments (§*Stack segments*), is in place; no compiled program
+> runs on one until the compiler classifies which handles need a
+> captured continuation.
 
 No pass rewrites effectful functions into continuation-passing
 style, and no continuation is reified. An effectful function
@@ -430,10 +433,9 @@ non-tail position.
 
 > **v1 status (2026-10-07):** every `resume` is the stack-allocated
 > `KaiCont` of §*One-shot case*: a status and an identity function,
-> never a captured stack. The segment-backed continuation — a
-> reference-counted object owning a suspended stack segment, one-shot
-> by its status, discontinued when its last reference drops — is
-> landing in the runtime and is not yet produced by the compiler.
+> never a captured stack. The segment-backed continuation of
+> §*Stack segments* exists in the runtime and is not yet produced by
+> the compiler.
 
 `resume` is a value of type `(T) -> S / ρ`. Doc A §*`resume`:
 one-shot, explicit* pinned its surface semantics; this section
@@ -499,6 +501,49 @@ unwind walk drops them with the node's `finally`, and while a
 handle is running its frames, its node already popped, an
 unwind-stack entry with `n < 0` stands in for it, so
 `kai_unw_release_to` drops what is left.
+
+### Stack segments
+
+The runtime layer for a captured one-shot continuation. A segment
+runs a body closure on its own stack inside the current fiber and
+shares the fiber's heap. The stack is mmap'd with a guard page and
+`MAP_NORESERVE`, and comes from a per-thread pool. It never moves,
+because C frames hold interior pointers into it. The switch,
+`kai_seg_switch`, saves the callee-saved registers and swaps the stack
+pointer. It is not `swapcontext`: there is no signal-mask syscall.
+
+- `kai_seg_start(body, &k)` runs the body until it returns, leaving
+  `k` NULL, or until it suspends, leaving `k` a `KAI_CONT` box.
+- `kai_seg_suspend(v)`, called inside the segment, hands `v` to
+  whoever started or last resumed it.
+- `kai_seg_resume(k, v, &k2)` consumes `k` and continues the body
+  with `v`. The segment's evidence chain is re-hung from the
+  resumer's top, so the handlers in scope are the resumer's (deep
+  semantics). Outside a clause of its own, the segment runs under the
+  resumer's in-dispatch node.
+- `kai_seg_discontinue(k)` unwinds the segment, and so does dropping
+  the last reference to an unresumed box. Every `finally` on the
+  segment's chain runs, its unwind stack is released, and native
+  landing pads run through the forced unwinder. The stack then
+  returns to the pool. A suspend during that unwind traps.
+- A box is spent by its first resume or discontinue, and a second
+  one traps. Resuming or dropping a box on a fiber other than the
+  one that captured it traps, and a box cannot cross a thread
+  border.
+
+A switch exchanges the per-context half of the fiber (`KaiSegCtx`):
+the evidence top, the in-dispatch node, the unwind stack, the pending
+clause tails and the stack bounds. Each segment therefore keeps its
+own LIFO disciplines.
+
+A non-local exit whose target lies outside the running segment
+unwinds the segment to its entry, and the resumer continues the same
+exit on its own stack, so no `longjmp` crosses stacks. That covers
+the fiber's cancel pad, a trap, and an abandon to a handle further
+out.
+
+While a discontinue driven by a drop runs, the fiber is pinned to its
+thread. The free walk that triggered it holds thread-local addresses.
 
 ### Multi-shot case
 
