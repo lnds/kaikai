@@ -21,23 +21,22 @@ import compiler.ast
 import compiler.diag
 import compiler.diag_file
 import compiler.spawn_capture
-import compiler.util
 
 #[doc("Reject a spawned thunk the child fiber cannot honour: an effect it cannot resolve, or a captured value it would mutate as a copy. Each diagnostic names the file declaring the decl it fires on.")]
 pub fn check_spawn_rows(df: DiagFiles, recs: [RecInfo], mod_decls: [Decl],
-                         all_decls: [Decl]) : Int / Console + File =
-  check_spawn_rows_loop(df, recs, all_decls, mod_decls, 0)
+                         all_decls: [Decl]) : [Diagnostic] / Console + File =
+  check_spawn_rows_loop(df, recs, all_decls, mod_decls, [])
 
 
 fn check_spawn_rows_loop(df: DiagFiles, recs: [RecInfo], all_decls: [Decl],
                           ds: [Decl],
-                          acc: Int) : Int / Console + File {
+                          acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
       DFn(_, _, _, _, _, _, body, _, _, _, _) -> {
-        let n = walk_spawn_rows_expr(decl_diag_file(d, df), recs, all_decls, body, 0)
-        check_spawn_rows_loop(df, recs, all_decls, rest, acc + n)
+        let acc1 = walk_spawn_rows_expr(decl_diag_file(d, df), recs, all_decls, body, acc)
+        check_spawn_rows_loop(df, recs, all_decls, rest, acc1)
       }
       _ -> check_spawn_rows_loop(df, recs, all_decls, rest, acc)
     }
@@ -46,43 +45,43 @@ fn check_spawn_rows_loop(df: DiagFiles, recs: [RecInfo], all_decls: [Decl],
 
 
 fn walk_spawn_rows_expr(file: String, recs: [RecInfo], decls: [Decl], e: Expr,
-                         acc: Int) : Int / Console + File {
+                         acc: [Diagnostic]) : [Diagnostic] / Console + File {
   let here = match e.kind {
     ECall(callee, args_) -> match callee.kind {
       EVar(key)   -> spawn_call_errs(file, recs, decls, key, args_)
       # A resolved stdlib export reaches the call site as a symbol,
       # not a bare name: the free `spawn` wrapper arrives here.
       ESym(_, _, nm) -> spawn_call_errs(file, recs, decls, nm, args_)
-      _           -> 0
+      _           -> []
     }
-    _ -> 0
+    _ -> []
   }
-  walk_spawn_rows_list(file, recs, decls, spawn_expr_children(e), acc + here)
+  walk_spawn_rows_list(file, recs, decls, spawn_expr_children(e), list_append(acc, here))
 }
 
 
 fn spawn_call_errs(file: String, recs: [RecInfo], decls: [Decl], key: String,
-                    args_: [Expr]) : Int / Console + File {
+                    args_: [Expr]) : [Diagnostic] / Console + File {
   if is_spawn_boundary_callee(key) {
     check_spawned_thunk(file, recs, decls, args_)
-  } else { 0 }
+  } else { [] }
 }
 
 
 # The two halves of the boundary: the row the child cannot resolve, and
 # the values it would mutate as a copy.
 fn check_spawned_thunk(file: String, recs: [RecInfo], decls: [Decl],
-                        args_: [Expr]) : Int / Console + File {
+                        args_: [Expr]) : [Diagnostic] / Console + File {
   let row_errs = check_spawned_thunk_row(file, decls, args_)
   match spawn_thunk_arg(args_) {
     None      -> row_errs
-    Some(thk) -> row_errs + check_thunk_captures(file, recs, thk)
+    Some(thk) -> list_append(row_errs, check_thunk_captures(file, recs, thk))
   }
 }
 
 
 fn walk_spawn_rows_list(file: String, recs: [RecInfo], decls: [Decl], es: [Expr],
-                         acc: Int) : Int / Console + File {
+                         acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match es {
     []           -> acc
     [h, ...rest] -> {
@@ -194,16 +193,16 @@ fn spawn_thunk_arg(args_: [Expr]) : Option[Expr] {
 }
 
 
-fn check_spawned_thunk_row(file: String, decls: [Decl],                             args_: [Expr]) : Int / Console + File {
+fn check_spawned_thunk_row(file: String, decls: [Decl],                             args_: [Expr]) : [Diagnostic] / Console + File {
   match spawn_thunk_arg(args_) {
-    None      -> 0
+    None      -> []
     Some(thk) -> match thk.ty {
-      None     -> 0
+      None     -> []
       Some(t)  -> match t {
         TyFnT(_, _, row) ->
           report_spawn_row_labels(file, decls, row.labels,
-                                   thk.line, thk.col, 0)
-        _ -> 0
+                                   thk.line, thk.col, [])
+        _ -> []
       }
     }
   }
@@ -291,25 +290,25 @@ fn eff_is_one_of(xs: [String], s: String) : Bool {
 
 
 fn report_spawn_row_labels(file: String, decls: [Decl],                             labels: [Label], line: Int, col: Int,
-                            acc: Int) : Int / Console + File {
+                            acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match labels {
     []           -> acc
     [l, ...rest] ->
       if effect_crosses_spawn(l.eff, decls) {
         report_spawn_row_labels(file, decls, rest, line, col, acc)
       } else {
-        report_spawn_escape(file, l.eff, line, col)
-        report_spawn_row_labels(file, decls, rest, line, col, acc + 1)
+        let d = report_spawn_escape(file, l.eff, line, col)
+        report_spawn_row_labels(file, decls, rest, line, col, list_append(acc, [d]))
       }
   }
 }
 
 
 fn report_spawn_escape(file: String, eff_name: String,
-                        line: Int, col: Int) : Unit / Console + File {
-  diag_error(file, line, col,
-             concat_all(["effect not handled in spawned fiber: ", eff_name]))
-  diag_note("a fiber does not inherit the parent's handlers")
-  diag_help(concat_all(["handle the effect inside the spawned body: `handle { ... } with ",
-                        eff_name, " { ... }`"]))
+                        line: Int, col: Int) : Diagnostic / Console + File {
+  let note = ri_note(file, line, col, "a fiber does not inherit the parent's handlers")
+  let help = ri_help(file, line, col, "handle the effect inside the spawned body: `handle { ... } with #{eff_name} { ... }`")
+  let d = mk_diag(SevError, file, line, col, "effect not handled in spawned fiber: #{eff_name}", [note, help])
+  render_diag(d)
+  d
 }
