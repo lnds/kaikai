@@ -68,7 +68,7 @@ ALLOW="$ALLOW|resume_split|resume_anf"
 
 # Passes at or below the erasure. `EVar` is their correct form: the name
 # is a C symbol there, and `sym_erase` is what put it back.
-BELOW='sym_erase|emit_c|emit_shared|kir_lower|kir_lower_walk|region|driver'
+BELOW='sym_erase|emit_c|emit_shared|kir_lower|kir_lower_walk|kir_lower_fns|region|driver'
 
 # Count constructions, not pattern matches. Two forms build one: the
 # `mk_ref` helper every pass should call, and a raw `EVar(...)` that is

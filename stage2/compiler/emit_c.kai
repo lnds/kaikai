@@ -64,6 +64,7 @@ import compiler.refinements
 import compiler.infer
 import compiler.fnreg
 import compiler.fn_index
+import compiler.kai_builtin
 import compiler.fn_csym
 import compiler.modules
 import compiler.module_table
@@ -765,7 +766,7 @@ fn walk_bare_callees(e: Expr, acc: [String]) : [String] = match e.kind {
   EPlaceholder        -> acc
   EHole(_)            -> acc
   ETodo(_)            -> acc
-  EExternBody(_)      -> acc
+  EExternBody(_, _)   -> acc
   EVariantsOf(_, _)   -> acc
   EModCall(_, _)      -> acc
   EIntrinsic(_, args_) -> walk_bare_callees_list(args_, acc)
@@ -1039,7 +1040,7 @@ fn report_unused_in_expr(file: String, e: Expr) : Unit / Console + File {
     EPlaceholder -> ()
     EHole(_) -> ()
     ETodo(_) -> ()
-    EExternBody(_) -> ()
+    EExternBody(_, _) -> ()
     EVariantsOf(_, _) -> ()
     EModCall(_, _) -> ()
     EIntrinsic(_, args_) -> report_unused_in_exprs(file, args_)
@@ -2682,7 +2683,10 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
         }
         None -> emit_variant_call(chome, fname, list_length(args_e), emit_slot_ops(src, args_e, cx), cx)
       } }
-      None    -> emit_user_call_seq(c_sym(fname, Some(mod)), emit_arg_vals(src, args_e, cx), cx)
+      None    -> match fnx_kai_qualified(cx.fx, mod, fname) {
+        Some(kb) -> emit_kai_call_seq(kb, emit_arg_vals(src, args_e, cx))
+        None     -> emit_user_call_seq(c_sym(fname, Some(mod)), emit_arg_vals(src, args_e, cx), cx)
+      }
     }
     _ -> emit_apply_seq("kai_apply(", emit_expr(src, f, cx), emit_arg_vals(src, args_e, cx))
   }
@@ -2714,7 +2718,7 @@ fn emit_named_call_lookup(src: String, callee: String, csym: FnId, args_e: [Expr
     # spelled like, which is what the typer and the native lowering
     # (`c_sym_of_callee_st`) already read off this same registry.
     None -> match ec_callee(cx, csym, callee) {
-      Some(EFn(_, _, mo, _, _)) -> emit_user_call_seq(c_sym(callee, mo), emit_arg_vals(src, args_e, cx), cx)
+      Some(EFn(_, _, mo, _, fid)) -> emit_fn_call_seq(fid, c_sym(callee, mo), emit_arg_vals(src, args_e, cx), cx)
       # A raw core prim is checked before the boxed `core_find`: its args
       # marshal raw per the prim's param types and its result is raw.
       None -> match rcore_find(cx.rcore, callee) {
@@ -2782,6 +2786,15 @@ fn evf_terminal_slot(eff: String, cx: EmitCtx) : String =
 # evidence frame when the callee carries one. The single funnel every
 # user-fn call site routes through, so the frame is filled consistently;
 # a frameless callee (`frame_slots_of` empty) reduces to the legacy form.
+# A declared core builtin is called as a `builtin_table` row is: its
+# runtime symbol, the args owned, no evidence frame and no donor token.
+fn emit_fn_call_seq(fid: FnId, csym: String, vals: [String], cx: EmitCtx) : String = match fnx_kai(cx.fx, fid) {
+  Some(kb) -> emit_kai_call_seq(kb, vals)
+  None     -> emit_user_call_seq(csym, vals, cx)
+}
+
+fn emit_kai_call_seq(kb: KaiBuiltin, vals: [String]) : String = seq_call(cat2(kai_builtin_csym(kb), "("), vals, ")")
+
 fn emit_user_call_seq(csym: String, vals: [String], cx: EmitCtx) : String {
   let q = seq_operands(vals)
   seq_wrap(q, emit_user_call(csym, seq_joined(q), cx))
@@ -7180,7 +7193,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     }
     # An extern-fn body is intercepted at the DFn level and replaced by
     # a shim; reaching it as an ordinary expression is a compiler bug.
-    EExternBody(_) -> concat_all(["kai_core_panic(kai_str(\"extern body in expression position\"))"])
+    EExternBody(_, _) -> concat_all(["kai_core_panic(kai_str(\"extern body in expression position\"))"])
     EBang(inner) -> emit_bang(src, x, inner, cx)
     EHandle(body, eff_name, _, _eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
       emit_handle(src, body, eff_name, init_opt, alias_opt, clauses, ret_opt, x.line, x.col, cx)
@@ -8281,7 +8294,9 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_sy
       # the matching C scalar, calls the extern symbol, and re-boxes
       # the return value. The shim does its own `extern` forward decl
       # inline so callers don't need a separate header pass.
-      if body_is_ffi_extern(body) {
+      if is_some(body_kai_builtin(body)) {
+        emit_kai_forwarder_body(sig, body, params)
+      } else if body_is_ffi_extern(body) {
         # Issue #261: the C-side symbol is either the override
         # baked into the body's tag or the kaikai identifier.
         # A signature mentioning a struct / opaque / fixed-width type
@@ -8528,6 +8543,12 @@ fn ffi_v1_v2_kind_error(name: String) : String =
 # time; reaching the panic at runtime means either (a) a user wrote a
 # polymorphic helper without the required `T : P` bound and the bound
 # was not enforced at instantiation, or (b) impl-table corruption.
+# The fn a declared core builtin's declaration emits, so the builtin is a
+# value through its thunk: it hands its owned args to the runtime symbol.
+fn emit_kai_forwarder_body(sig: String, body: Expr, params: [Param]) : String =
+  concat_all([sig, " {\n    return ", ffi_extern_symbol_of(body, ""), "(",
+              join_with(map(params, (p) => c_local(p.pname)), ", "), ");\n}\n\n"])
+
 fn emit_proto_dispatch_shim_c(sig: String, parts: ProtoDispatchParts,
                                 params: [Param],
                                 ret_ty_opt: Option[TypeExpr]) : String {
@@ -10559,7 +10580,7 @@ fn desugar_interp_kind(k: ExprKind, cx: InterpCtx,
     EPlaceholder   -> k
     EHole(_)       -> k
     ETodo(_)       -> k
-    EExternBody(_) -> k
+    EExternBody(_, _) -> k
     EVariantsOf(_, _) -> k
     EModCall(_, _) -> k
     EIntrinsic(name, args_) ->
@@ -10951,7 +10972,7 @@ pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl],
   # core sources; the cache directory is toolchain-scoped, so an emitter
   # change can never mix ABIs with cached entries.
   # `KAI_CONST` purity does not change the ABI and needs no such care.
-  let fx = fnx_build(fns)
+  let fx = fnx_build_decls(decls, fns)
   let rd_cap_set = rd_donatable_filter(rd_scan_capable(decls), decls, fx)
   let const_syms = purity_const_syms(purity_analyze(decls))
   let clause_fwd = emit_clause_forwards(clauses_info, effect_decls_only(decls))
@@ -11119,7 +11140,7 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # `double`/pointer). A reuse-variant-rotation fn is neither today, so the
   # filter is a soundness fence, not a live change. Computed once, threaded
   # to the forward decls and the emit context.
-  let fx = fnx_build(fns)
+  let fx = fnx_build_decls(decls, fns)
   let rd_cap_set = rd_donatable_filter(rd_scan_capable(decls), decls, fx)
   # Confirmed-purity symbols (#1139): the emitted `c_sym` of every fn
   # whose lowered body is memory-clean, so the signature helper prefixes
