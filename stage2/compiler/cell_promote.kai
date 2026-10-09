@@ -10,12 +10,12 @@
 # compile the enclosing loop over registers.
 #
 # The rewrite maps the slot triple onto three intrinsics the emitters
-# lower to a raw mutable local (the cell name rides mangled into the
-# intrinsic name, `__kai_tcrec|`-style, so the binder has zero
-# variable reads after the rewrite):
+# lower to a raw mutable local. A read or write carries the binder's own
+# reference as its first argument, so every pass that follows a binder
+# (a rename, a shadow) follows the cell with it:
 #   let x = array_make(1, lit)  →  let x = __cell_init(lit)
-#   array_get(x, 0)             →  __cell_get|x ()
-#   array_set(x, 0, v)          →  __cell_set|x (v)
+#   array_get(x, 0)             →  __cell_get(x)
+#   array_set(x, 0, v)          →  __cell_set(x, v)
 #
 # Runs post-monomorph / pre-unbox, on typed AST. Conditions:
 #   * the init is a pure scalar of type Int, Real or Bool — a literal, a
@@ -25,7 +25,7 @@
 #   * no use sits inside a `handle` body — a raw local written there does
 #     not survive the longjmp an abandoning clause takes.
 # The check is rewrite-then-verify: sanctioned uses are rewritten to
-# the name-mangled intrinsics (which carry no `EVar(x)`), and any
+# the cell intrinsics (whose binder argument is not a use), and any
 # `EVar(x)` left in the scope — an unsanctioned use, or a read of a
 # shadowing binder the rewriter refused to enter — reverts the slot to
 # its array form (correct, just unpromoted).
@@ -38,23 +38,26 @@ import compiler.desugar
 import compiler.loop_lower
 import compiler.cell_scan
 
-#[doc("Promote every non-escaping scalar var slot (`array_make(1, lit)` cell) in the program to a raw local cell (`__cell_init`/`__cell_get|`/`__cell_set|` intrinsics).")]
+#[doc("Promote every non-escaping scalar var slot (`array_make(1, lit)` cell) in the program to a raw local cell (`__cell_init`/`__cell_get`/`__cell_set` intrinsics).")]
 pub fn promote_scalar_cells(ds: [Decl]) : [Decl] = map(ds, cp_decl)
 
-#[doc("True for the cell intrinsics this pass mints (`__cell_init`, `__cell_get|x`, `__cell_set|x`).")]
+#[doc("True for the cell intrinsics this pass mints (`__cell_init`, `__cell_get`, `__cell_set`).")]
 pub fn is_cell_intrinsic(nm: String) : Bool =
   nm == "__cell_init" or is_cell_get(nm) or is_cell_set(nm)
 
-#[doc("True for a mangled cell read (`__cell_get|<name>`).")]
-pub fn is_cell_get(nm: String) : Bool = string_starts_with_q(nm, "__cell_get|")
+#[doc("True for a cell read (`__cell_get(x)`).")]
+pub fn is_cell_get(nm: String) : Bool = nm == "__cell_get"
 
-#[doc("True for a mangled cell write (`__cell_set|<name>`).")]
-pub fn is_cell_set(nm: String) : Bool = string_starts_with_q(nm, "__cell_set|")
+#[doc("True for a cell write (`__cell_set(x, v)`).")]
+pub fn is_cell_set(nm: String) : Bool = nm == "__cell_set"
 
-#[doc("The cell name carried by a mangled `__cell_get|`/`__cell_set|` intrinsic name.")]
-pub fn cell_intrinsic_name(nm: String) : String = {
-  let i = string_index_of_char(nm, '|')
-  string_slice(nm, i + 1, string_length(nm) - i - 1)
+#[doc("The cell a `__cell_get`/`__cell_set` reaches: its first argument, a read of the cell's binder.")]
+pub fn cell_ref_name(args: [Expr]) : String = match args {
+  [r, ..._] -> match sym_read_kind(r.kind) {
+    EVar(n) -> n
+    _       -> ""
+  }
+  [] -> ""
 }
 
 # --- decl walk -------------------------------------------------------
@@ -216,8 +219,8 @@ fn cp_rw(nm: String, e: Expr) : Expr =
 
 fn cp_rw_kind(nm: String, k: ExprKind, line: Int, col: Int) : ExprKind = match k {
   ECall(callee, args_) -> match cp_getset_hit(nm, callee, args_) {
-    CpGet -> EIntrinsic(cat2("__cell_get|", nm), [])
-    CpSet(v) -> EIntrinsic(cat2("__cell_set|", nm), [cp_rw(nm, v)])
+    CpGet(r) -> EIntrinsic("__cell_get", [cp_cell_ref(r)])
+    CpSet(r, v) -> EIntrinsic("__cell_set", [cp_cell_ref(r), cp_rw(nm, v)])
     CpMiss -> ECall(cp_rw(nm, callee), map(args_, (a) => cp_rw(nm, a)))
   }
   # FUNCTION-EMISSION BOUNDARIES. A promoted cell is a local of the
@@ -256,7 +259,11 @@ fn cp_rw_loop_arg(nm: String, a: Expr) : Expr = match a.kind {
   _ -> cp_rw(nm, a)
 }
 
-type CpHit = CpGet | CpSet(Expr) | CpMiss
+type CpHit = CpGet(Expr) | CpSet(Expr, Expr) | CpMiss
+
+# The binder read a cell intrinsic carries: a raw read, so no pass counts
+# it as a use of the slot it replaced.
+fn cp_cell_ref(r: Expr) : Expr = Expr { ...r, ty: None, mode: MUnboxed }
 
 fn cp_getset_hit(nm: String, callee: Expr, args_: [Expr]) : CpHit =
   if cp_is_var(callee, "array_get") { cp_get_hit(nm, args_) }
@@ -264,12 +271,12 @@ fn cp_getset_hit(nm: String, callee: Expr, args_: [Expr]) : CpHit =
   else { CpMiss }
 
 fn cp_get_hit(nm: String, args_: [Expr]) : CpHit = match args_ {
-  [a, i] -> if cp_cell_at_zero(nm, a, i) { CpGet } else { CpMiss }
+  [a, i] -> if cp_cell_at_zero(nm, a, i) { CpGet(a) } else { CpMiss }
   _      -> CpMiss
 }
 
 fn cp_set_hit(nm: String, args_: [Expr]) : CpHit = match args_ {
-  [a, i, v] -> if cp_cell_at_zero(nm, a, i) { CpSet(v) } else { CpMiss }
+  [a, i, v] -> if cp_cell_at_zero(nm, a, i) { CpSet(a, v) } else { CpMiss }
   _         -> CpMiss
 }
 
