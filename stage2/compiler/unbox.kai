@@ -50,6 +50,7 @@ import compiler.fnreg
 import compiler.native_prims
 import compiler.unbox_native_raw
 import compiler.fn_index
+import compiler.handler_alias
 
 #
 # Sits between monomorphisation and perceus_pass. Walks every
@@ -349,12 +350,23 @@ fn call_is_fixed_vec_get(callee: Expr) : Bool {
 # `LocBind` records the chosen mode for a local binding so EVar
 # references resolve to the binding's mode. Function parameters
 # and unknown names default to MBoxed (Phase 2 non-goal #1).
-type LocBind = LB(String, ValueMode)
+# `LBLent` is a boxed binder whose scalar payload a raw operator may read
+# without taking the box: a handler clause's op argument or state alias.
+type LocBind = LB(String, ValueMode) | LBLent(String)
 
 fn lb_lookup(env: [LocBind], nm: String) : ValueMode {
   match env {
     [] -> MBoxed
     [LB(n, m), ...rest] -> if n == nm { m } else { lb_lookup(rest, nm) }
+    [LBLent(n), ...rest] -> if n == nm { MBoxed } else { lb_lookup(rest, nm) }
+  }
+}
+
+fn lb_lent(env: [LocBind], nm: String) : Bool {
+  match env {
+    [] -> false
+    [LB(n, _), ...rest] -> if n == nm { false } else { lb_lent(rest, nm) }
+    [LBLent(n), ...rest] -> n == nm or lb_lent(rest, nm)
   }
 }
 
@@ -541,7 +553,7 @@ fn unbox_kind_aware(k: ExprKind, env: [LocBind], fns: FnIndex, cis: [CtorIntSlot
       # leak into the handler's continuation captures).
       EHandle(unbox_expr_aware(body, env, fns, cis, nat), eff_name, hsym, eff_tyargs,
               unbox_opt_aware(init_opt, env, fns, cis, nat), alias_opt,
-              map(clauses, (c) => unbox_clause_aware(c, env, fns, cis, nat)),
+              map(clauses, (c) => unbox_clause_aware(c, init_opt, env, fns, cis, nat)),
               unbox_opt_return_aware(ret_opt, env, fns, cis, nat))
     ELitUnit(inner, u)   -> ELitUnit(unbox_expr_aware(inner, env, fns, cis, nat), u)
     EBang(inner)         -> EBang(unbox_expr_aware(inner, env, fns, cis, nat))
@@ -602,7 +614,7 @@ fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: FnInd
         # Int128 `/`/`%` stay boxed: no i128 checked-div helper exists (the
         # 128-bit operand does not fit the i64/u64 helper), so they route
         # through `kai_fixed_div`/`kai_op_mod` which trap the zero divisor.
-        if op_is_raw_arith(op) and child_is_raw_operand(a, fns) and child_is_raw_operand(b, fns) {
+        if op_is_raw_arith(op) and child_is_raw_operand(a, env, fns) and child_is_raw_operand(b, env, fns) {
           if op == "%" and not ty_is_integral_raw(opt_ty) { MBoxed }
           else if (op == "/" or op == "%") and ty_is_int128_opt(opt_ty) { MBoxed }
           else { MUnboxed }
@@ -625,11 +637,11 @@ fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: FnInd
         # native C operators when both operands are raw. The result
         # is a raw `int` (0/1) which the boundary tactic re-boxes
         # via `kai_bool` if a consumer wants `KaiValue *`.
-        else if op_is_raw_cmp(op) and child_is_raw_operand(a, fns) and child_is_raw_operand(b, fns) { MUnboxed }
+        else if op_is_raw_cmp(op) and child_is_raw_operand(a, env, fns) and child_is_raw_operand(b, env, fns) { MUnboxed }
         else if op_is_raw_logical(op) and child_is_raw(a) and child_is_raw(b) and rhs_is_trap_free(b) { MUnboxed }
         else { MBoxed }
       EUnop(op, x) ->
-        if op == "-" and child_is_raw_operand(x, fns) { MUnboxed }
+        if op == "-" and child_is_raw_operand(x, env, fns) { MUnboxed }
         else if op == "not" and child_is_raw(x) { MUnboxed }
         else { MBoxed }
       # Phase 3 unboxing — `if cond { a } else { b }` lowers to a C
@@ -679,9 +691,14 @@ fn child_is_raw(e: Expr) : Bool {
 
 # A raw operator may also take a perform of a scalar op: its owned boxed
 # result crosses into the operator through the box->raw border, which
-# releases the box, so it need not force the operator boxed.
-fn child_is_raw_operand(e: Expr, fns: FnIndex) : Bool =
-  child_is_raw(e) or (ty_is_unboxable(e.ty) and expr_is_perform(e, fns))
+# releases the box. A lent binder's read borrows its payload.
+fn child_is_raw_operand(e: Expr, env: [LocBind], fns: FnIndex) : Bool =
+  child_is_raw(e) or (ty_is_unboxable(e.ty) and (expr_is_perform(e, fns) or expr_is_lent(e, env)))
+
+fn expr_is_lent(e: Expr, env: [LocBind]) : Bool = match sym_read_kind(e.kind) {
+  EVar(nm) -> lb_lent(env, nm)
+  _        -> false
+}
 
 fn expr_is_perform(e: Expr, fns: FnIndex) : Bool = match e.kind {
   ECall(callee, _) -> match callee.kind {
@@ -1009,12 +1026,13 @@ fn unbox_elem_aware(el: ListElem, env: [LocBind], fns: FnIndex, cis: [CtorIntSlo
   }
 }
 
-fn unbox_clause(c: HClause, env: [LocBind]) : HClause / Console = unbox_clause_aware(c, env, fnx_empty(), [], false)
-
-fn unbox_clause_aware(c: HClause, env: [LocBind], fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : HClause / Console {
+fn unbox_clause_aware(c: HClause, init_opt: Option[Expr], env: [LocBind], fns: FnIndex, cis: [CtorIntSlots], nat: Bool) : HClause / Console {
 
   match c {
-    HC(n, ps, b, l, co) -> HC(n, ps, unbox_expr_aware(b, env, fns, cis, nat), l, co)
+    HC(n, ps, b, l, co) -> {
+      let lent = list_append(map(clause_lent_names(ps, init_opt), (nm) => LBLent(nm)), env)
+      HC(n, ps, unbox_expr_aware(b, lent, fns, cis, nat), l, co)
+    }
   }
 }
 
