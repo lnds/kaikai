@@ -188,9 +188,13 @@ The runtime helper maps any value to its head tag:
 - **Variants** (`KAI_VARIANT`) — `kai_variant_to_head[v->as.var.variant_tag]`.
   One indirection into a static array emitted by the compiler. Zero
   memory cost in the variant payload itself.
-- **Records** (`KAI_RECORD`) — read the new `int32_t head_type_tag`
-  field on `as.rec`. Initialised by `kai_record(…)` from the value
-  passed at construction.
+- **Records** (`KAI_RECORD`) — read the `int32_t head_type_tag` field
+  on `as.rec`. `kai_record(…)` builds it as 0; the construction site of
+  a record type with a hand-written `impl Eq` (outside the core) wraps
+  it in `kai_rec_stamp(v, tag)` (`kaix_rec_stamp` on native), so a
+  structural `==` reaching that record dispatches to its impl. Every
+  other record keeps 0 and compares structurally. A reused cell is
+  reset to 0 before its site stamps it.
 - **Lists** — `KAI_NIL` and `KAI_CONS` both map to `HEAD_LIST = 7`.
 
 `kai_head_tag` is `static inline` in `runtime.h`; the cost is one
