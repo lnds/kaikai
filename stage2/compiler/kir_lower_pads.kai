@@ -18,6 +18,8 @@ import compiler.util
 import compiler.kir
 import compiler.kir_lower
 import compiler.unwind_pend
+import compiler.emit_shared
+import compiler.unwind_pads
 
 #[doc("The state a pad or bracket opened over, restored when it closes; `None` when nothing opened.")]
 pub type PadB = PadB(Option[UnwPadOpen], LowerSt)
@@ -25,7 +27,7 @@ pub type PadB = PadB(Option[UnwPadOpen], LowerSt)
 #[doc("Opens, before lowering `x`, a landing pad releasing the admitted binders among `names` not already released.")]
 pub fn lower_pad_begin(x: Expr, names: [String], st: LowerSt) : PadB = {
   let outer = st.unw.pad
-  let own = filter(map(unw_admit(st.unw, names), (n) => ls_reg_of(st, n)), (r) => not list_has(outer.regs, r))
+  let own = filter(lp_union(map(unw_admit(st.unw, names), (n) => ls_reg_of(st, n)), outer.flight), (r) => not list_has(outer.regs, r))
   match own {
     [] -> PadB(None, st)
     _  -> {
@@ -33,7 +35,7 @@ pub fn lower_pad_begin(x: Expr, names: [String], st: LowerSt) : PadB = {
       let regs = lp_union(outer.regs, own)
       match ls_fresh_reg(st) { LSReg(pr, st1) -> {
         let st2 = ls_emit(st1, KLet(pr, SBoxed, KPrim("kai_pad_open", map(regs, (r) => KVar(r))), kpos_of(x)))
-        PadB(Some(outer), ls_with_unw(st2, unw_with_pad(st2.unw, UnwPadOpen { reg: pr, regs: regs, pushed: outer.pushed })))
+        PadB(Some(outer), ls_with_unw(st2, unw_with_pad(st2.unw, UnwPadOpen { reg: pr, regs: regs, pushed: outer.pushed, flight: outer.flight })))
       } }
     }
   }
@@ -53,13 +55,120 @@ pub fn lower_pad_end(x: Expr, outer: Option[UnwPadOpen], st: LowerSt) : LowerSt 
 pub fn lower_bracket_begin(x: Expr, held: [String], st: LowerSt) : PadB = {
   let outer = st.unw.pad
   lp_disjoint(held, outer.regs, "a bracket holds a register a pad releases", x, st)
-  PadB(Some(outer), ls_with_unw(st, unw_with_pad(st.unw, UnwPadOpen { reg: outer.reg, regs: outer.regs, pushed: lp_union(outer.pushed, held) })))
+  PadB(Some(outer), ls_with_unw(st, unw_with_pad(st.unw, UnwPadOpen { reg: outer.reg, regs: outer.regs, pushed: lp_union(outer.pushed, held), flight: lp_minus(outer.flight, held) })))
 }
 
 #[doc("`st` with the bracket `lower_bracket_begin` pushed popped from the pad state.")]
 pub fn lower_bracket_end(outer: Option[UnwPadOpen], st: LowerSt) : LowerSt = match outer {
   None -> st
   Some(o) -> ls_with_unw(st, unw_with_pad(st.unw, o))
+}
+
+#[doc("`st` with `v`, the value the operand `x` computed, in flight until its parent takes it, when it holds a reference of its own.")]
+pub fn lower_flight_add(x: Expr, v: KVal, st: LowerSt) : LowerSt = match v {
+  KVar(r) -> if lp_owned_temp(x, st) { lp_with_flight(st, lp_union(st.unw.pad.flight, [r])) } else { st }
+  _ -> st
+}
+
+#[doc("`st` with `v` in flight while the operands after `x` run; the last operand runs with nothing after it.")]
+pub fn lower_flight_next(x: Expr, v: KVal, last: Bool, st: LowerSt) : LowerSt =
+  if last { st } else { lower_flight_add(x, v, st) }
+
+#[doc("The values in flight that neither an open pad nor a bracket already releases.")]
+pub fn lower_flight_free(st: LowerSt) : [String] = {
+  let p = st.unw.pad
+  lp_minus(lp_minus(p.flight, p.regs), p.pushed)
+}
+
+#[doc("Opens, before the operator `op` of `x` runs, a landing pad that also releases the operand references it consumes, when it compares values that are not scalars: the runtime holds them while the type's own implementation runs, and a trap there leaves through no pad of its own.")]
+pub fn lower_consumed_pad(x: Expr, op: String, operands: [(Expr, KVal)], st: LowerSt) : PadB = match lp_consumed(operands, st) {
+  [] -> PadB(None, st)
+  extra -> if lp_compares(op) and st.unw.traps and unw_op_traps(op, lp_first(operands, x)) {
+    let outer = st.unw.pad
+    match ls_fresh_reg(st) { LSReg(pr, st1) -> {
+      let regs = list_append(lp_union(outer.regs, lp_minus(outer.flight, outer.pushed)), extra)
+      let st2 = ls_emit(st1, KLet(pr, SBoxed, KPrim("kai_pad_open", map(regs, (r) => KVar(r))), kpos_of(x)))
+      PadB(Some(outer), ls_with_unw(st2, unw_with_pad(st2.unw, UnwPadOpen { reg: pr, regs: regs, pushed: outer.pushed, flight: outer.flight })))
+    } }
+  } else { PadB(None, st) }
+}
+
+fn lp_compares(op: String) : Bool =
+  op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">="
+
+fn lp_first(operands: [(Expr, KVal)], dflt: Expr) : Expr = match operands {
+  [(e, _), ..._] -> e
+  [] -> dflt
+}
+
+# The operand registers holding a reference of their own that the
+# operator takes: a dup of a binder, or a value an operand computed.
+fn lp_consumed(operands: [(Expr, KVal)], st: LowerSt) : [String] = match operands {
+  [] -> []
+  [(e, v), ...rest] -> match v {
+    KVar(r) -> if lp_is_dup(e) or lp_owned_temp(e, st) { [r, ...lp_consumed(rest, st)] } else { lp_consumed(rest, st) }
+    _ -> lp_consumed(rest, st)
+  }
+}
+
+fn lp_is_dup(e: Expr) : Bool = match e.kind {
+  ECall(f, [_]) -> match f.kind {
+    EVar(n) -> match classify_callee(n) { CkDup -> true  _ -> false }
+    _ -> false
+  }
+  _ -> false
+}
+
+#[doc("`st` with the register `r` in flight: a value the frame owns that no binder holds, until `lower_flight_land` takes it out.")]
+pub fn lower_flight_hold(r: String, st: LowerSt) : LowerSt = lp_with_flight(st, lp_union(st.unw.pad.flight, [r]))
+
+#[doc("`st` with the register `r` no longer in flight.")]
+pub fn lower_flight_land(r: String, st: LowerSt) : LowerSt = lp_with_flight(st, lp_minus(st.unw.pad.flight, [r]))
+
+#[doc("`st` with the values in flight back to those of `before`, once their parent has taken them.")]
+pub fn lower_flight_end(before: LowerSt, st: LowerSt) : LowerSt = lp_with_flight(st, before.unw.pad.flight)
+
+fn lp_with_flight(st: LowerSt, fl: [String]) : LowerSt = {
+  let p = st.unw.pad
+  ls_with_unw(st, unw_with_pad(st.unw, UnwPadOpen { reg: p.reg, regs: p.regs, pushed: p.pushed, flight: fl }))
+}
+
+# A fresh reference: a call's result or a value built in place. A bare
+# read hands over a binder the walk already tracks, a dup is that same
+# register, and a compiler form may lend.
+fn lp_owned_temp(x: Expr, st: LowerSt) : Bool = match x.mode {
+  MUnboxed -> false
+  _ -> match x.ty {
+    Some(t) -> if ty_is_scalar(t) { false } else { lp_fresh(x, st) }
+    None -> false
+  }
+}
+
+fn lp_fresh(x: Expr, st: LowerSt) : Bool = match x.kind {
+  ECall(f, xs)          -> lp_owning_call(f, xs, st)
+  EBinop(_, _, _)       -> true
+  ERecordLit(_, _, _)   -> not st.in_region
+  EList([_, ..._])      -> not st.in_region
+  _                     -> false
+}
+
+fn lp_owning_call(f: Expr, xs: [Expr], st: LowerSt) : Bool = match f.kind {
+  EVar(n)        -> lp_owning_kind(classify_callee(n))
+  ESym(_, _, _)  -> true
+  EModCall(_, _) -> true
+  EMark(MkOwnedBorrow) -> match xs {
+    [inner] -> lp_fresh(inner, st)
+    _       -> false
+  }
+  _              -> false
+}
+
+fn lp_owning_kind(k: CalleeKind) : Bool = match k {
+  CkDirect -> true
+  CkCtor   -> true
+  CkResume -> true
+  CkReuse  -> true
+  _        -> false
 }
 
 fn lp_disjoint(a: [String], b: [String], what: String, x: Expr, st: LowerSt) : Unit = match a {
@@ -69,7 +178,10 @@ fn lp_disjoint(a: [String], b: [String], what: String, x: Expr, st: LowerSt) : U
   } else { lp_disjoint(rest, b, what, x, st) }
 }
 
-fn lp_union(a: [String], b: [String]) : [String] = match b {
+fn lp_minus(a: [String], b: [String]) : [String] = filter(a, (r) => not list_has(b, r))
+
+#[doc("The registers of `a` and then those of `b` not in `a`.")]
+pub fn lp_union(a: [String], b: [String]) : [String] = match b {
   [] -> a
   [r, ...rest] -> lp_union(if list_has(a, r) { a } else { list_append(a, [r]) }, rest)
 }

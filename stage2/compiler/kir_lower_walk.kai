@@ -353,8 +353,14 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
     } else {
       let ra = lower_expr(a, st)
       match ra { LRes(av, st1) -> {
-        let rbv = lower_expr(b, st1)
-        match rbv { LRes(bv, st2) -> bind_op(st2, KPrim(binop_prim(op, a), [av, bv]), kpos_of(x)) }
+        let rbv = lower_expr(b, lower_flight_add(a, av, st1))
+        match rbv { LRes(bv, st2) -> {
+          let st3 = lower_flight_end(st1, st2)
+          match lower_consumed_pad(x, op, [(a, av), (b, bv)], st3) { PadB(outer, st4) ->
+            match bind_op(st4, KPrim(binop_prim(op, a), [av, bv]), kpos_of(x)) {
+              LRes(v, st5) -> LRes(v, lower_pad_end(x, outer, st5))
+            } }
+        } }
       } }
     }
   EUnop(op, a)       -> {
@@ -884,10 +890,15 @@ fn lower_var(name: String, fid: FnId, st: LowerSt) : LRes / Console =
   } }
 
 # Lower a list of expressions left-to-right (Risk 2a), collecting atoms.
-pub fn lower_exprs(xs: [Expr], st: LowerSt, acc: [KVal]) : LResMany / Console = match xs {
+pub fn lower_exprs(xs: [Expr], st: LowerSt, acc: [KVal]) : LResMany / Console = match lower_exprs_flying(xs, st, acc) {
+  LResMany(vs, st1) -> LResMany(vs, lower_flight_end(st, st1))
+}
+
+# Each value computed stays in flight while the later operands run.
+fn lower_exprs_flying(xs: [Expr], st: LowerSt, acc: [KVal]) : LResMany / Console = match xs {
   [] -> LResMany(acc, st)
   [e, ...rest] -> match lower_expr(e, st) {
-    LRes(v, st1) -> lower_exprs(rest, st1, list_append(acc, [v]))
+    LRes(v, st1) -> lower_exprs_flying(rest, lower_flight_next(e, v, rest == [], st1), list_append(acc, [v]))
   }
 }
 
@@ -909,7 +920,9 @@ pub fn lower_exprs(xs: [Expr], st: LowerSt, acc: [KVal]) : LResMany / Console = 
 # native returned 0 vs C's 5 on a `Char` param). Using the slot keeps the arg
 # repr in lockstep with the param the callee declares (`lower_params_sig`).
 fn lower_tcrec_args(xs: [Expr], sig: Option[UFnSig], st: LowerSt) : LResMany / Console =
-  lower_tcrec_args_idx(xs, tcrec_ptys_of(sig), tcrec_mask_of(sig), st, [])
+  match lower_tcrec_args_idx(xs, tcrec_ptys_of(sig), tcrec_mask_of(sig), st, []) {
+    LResMany(vs, st1) -> LResMany(vs, lower_flight_end(st, st1))
+  }
 
 fn lower_tcrec_args_idx(xs: [Expr], ptys: [Ty], mask: [Bool], st: LowerSt, acc: [KVal]) : LResMany / Console = match xs {
   [] -> LResMany(acc, st)
@@ -924,7 +937,7 @@ fn lower_tcrec_args_idx(xs: [Expr], ptys: [Ty], mask: [Bool], st: LowerSt, acc: 
       [] -> []
     }
     match lower_tcrec_arg(e, pslot, st) {
-      LRes(v, st1) -> lower_tcrec_args_idx(rest, trest, mrest, st1, list_append(acc, [v]))
+      LRes(v, st1) -> lower_tcrec_args_idx(rest, trest, mrest, lower_flight_next(e, v, rest == [], st1), list_append(acc, [v]))
     }
   }
 }
@@ -982,8 +995,8 @@ fn lower_list_last(el: ListElem, pos: KPos, st: LowerSt) : LRes / Console = matc
 # (`kai_cons` for a plain head, `kai_core_list_append` for a spread).
 fn lower_list_cons(x: Expr, rest: [ListElem], prim: String, pos: KPos, st: LowerSt) : LRes / Console =
   match lower_expr(x, st) { LRes(hdv, st1) ->
-    match lower_list(rest, pos, st1) { LRes(tlv, st2) ->
-      bind_op(st2, KPrim(prim, [hdv, tlv]), pos) } }
+    match lower_list(rest, pos, lower_flight_add(x, hdv, st1)) { LRes(tlv, st2) ->
+      bind_op(lower_flight_end(st, st2), KPrim(prim, [hdv, tlv]), pos) } }
 
 # --- Holes / todo! → panic stub -----------------------------------------
 
@@ -1027,10 +1040,14 @@ fn lower_record_lit(fis: [FieldInit], pos: KPos, st: LowerSt) : LRes / Console =
   match lower_field_inits(fis, st, []) { RecPlan(pairs, st1) ->
     bind_op(st1, KRecord(pairs, st1.in_region), pos) }
 
-fn lower_field_inits(fis: [FieldInit], st: LowerSt, acc: [KFieldInit]) : RecPlan / Console = match fis {
+fn lower_field_inits(fis: [FieldInit], st: LowerSt, acc: [KFieldInit]) : RecPlan / Console = match lower_field_inits_flying(fis, st, acc) {
+  RecPlan(pairs, st1) -> RecPlan(pairs, lower_flight_end(st, st1))
+}
+
+fn lower_field_inits_flying(fis: [FieldInit], st: LowerSt, acc: [KFieldInit]) : RecPlan / Console = match fis {
   [] -> RecPlan(acc, st)
   [FI(fname, fe), ...rest] -> match lower_expr(fe, st) { LRes(v, st1) ->
-    lower_field_inits(rest, st1, list_append(acc, [KFI(fname, v)])) }
+    lower_field_inits_flying(rest, lower_flight_next(fe, v, rest == [], st1), list_append(acc, [KFI(fname, v)])) }
 }
 
 # `lo..hi` / `lo..hi:step` → the runtime range builder prim.
@@ -1884,11 +1901,13 @@ fn match_finish(owned: Bool, sd: String, r: LRes) : LRes =
 # no-op (the token was the disposer).
 fn match_finish_tok(owned: Bool, sd: String, free_tok: Bool, r: LRes) : LRes =
   match kir_unw_scr_pop(sd, r) {
-    LRes(v0, st0) ->
+    LRes(v0, st_in) -> {
+      let st0 = lower_flight_land(sd, st_in)
       if owned {
         let st1 = if free_tok { ls_emit(st0, KRC(KArmTokenFree, KNoPos)) } else { st0 }
         LRes(v0, ls_emit(st1, KRC(KDrop(KVar(sd)), KNoPos)))
       } else { LRes(v0, st0) }
+    }
   }
 
 # The owned scrutinee slot of a match its arms can unwind out of: the
@@ -2131,8 +2150,12 @@ fn match_preamble(x: Expr, scrv: KVal, owned: Bool, st: LowerSt) : LSPre =
     let st_scr = if owned {
                    ls_emit(st_pub, KLet(sd, SBoxed, KLitOp(scrv), kpos_of(x)))
                  } else { st_pub }
-    let st_uw = kir_unw_scr_push(owned and unw_match_at(st.unw.sites, x.site), sd, x, st_scr)
-    LSPre(join, sd, ls_emit(st_uw, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x))))
+    let bracketed = unw_match_at(st.unw.sites, x.site)
+    let st_uw = kir_unw_scr_push(owned and bracketed, sd, x, st_scr)
+    # An owned scrutinee no bracket holds is released by the arms' pads; an
+    # arm that reuses its cell rebinds the register to unit first.
+    let st_fl = if owned and not bracketed { lower_flight_hold(sd, st_uw) } else { st_uw }
+    LSPre(join, sd, ls_emit(st_fl, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x))))
   } }
 
 # Lower each list arm in order. The arm's test seals the current block into
@@ -2962,7 +2985,7 @@ fn lower_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console =
     None -> lower_call_at(x, f, cargs, st)
     Some(names) -> {
       let clo = kir_unw_closure(f, st)
-      match kir_unw_held(unw_admit(st.unw, names), clo) {
+      match lp_union(map(kir_unw_held(unw_admit(st.unw, names), clo), (n) => ls_reg_of(st, n)), lower_flight_free(st)) {
         [] -> match clo {
           Some(UkDup(n)) -> lower_apply_borrow(x, [kir_unw_var(f, n), ...cargs], st)
           _              -> lower_call_at(x, f, cargs, st)
@@ -2972,11 +2995,12 @@ fn lower_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console =
     }
   }
 
-fn lower_call_bracketed(x: Expr, f: Expr, cargs: [Expr], clo: Option[UnwCallee], names: [String], st: LowerSt) : LRes / Console =
+# `regs` are the registers the bracket holds: the binders registered at
+# the call and the operand values in flight across it.
+fn lower_call_bracketed(x: Expr, f: Expr, cargs: [Expr], clo: Option[UnwCallee], regs: [String], st: LowerSt) : LRes / Console =
   match ls_fresh_reg(st) { LSReg(fr, st0) -> {
-      let held = map(names, (n) => KVar(ls_reg_of(st0, n)))
-      let st1 = ls_emit(st0, KLet(fr, SBoxed, KPrim("kai_unw_push", [KVar(unw_fib(st0.unw)), ...held]), kpos_of(x)))
-      let r = match lower_bracket_begin(x, map(names, (n) => ls_reg_of(st0, n)), st1) { PadB(outer, sb) ->
+      let st1 = ls_emit(st0, KLet(fr, SBoxed, KPrim("kai_unw_push", [KVar(unw_fib(st0.unw)), ...map(regs, (r) => KVar(r))]), kpos_of(x)))
+      let r = match lower_bracket_begin(x, regs, st1) { PadB(outer, sb) ->
         match lower_call_in_bracket(x, f, cargs, clo, sb) { LRes(v, se) -> LRes(v, lower_bracket_end(outer, se)) }
       }
       match r { LRes(v, st2) -> {
@@ -3650,7 +3674,7 @@ fn lower_ctor_call(x: Expr, home: Option[String], name: String, cargs: [Expr], s
   let ar = list_length(cargs)
   let ks = match evar_slot_kinds_arity(st.vs, home, name, ar) { Some(k) -> k None -> [] }
   match lower_ctor_args(cargs, home, name, ks, ar, st, []) { LCtorInits(inits, st1) ->
-    bind_op(st1, KCon(name, ls_variant_tag_arity(st1, home, name, ar),
+    bind_op(lower_flight_end(st, st1), KCon(name, ls_variant_tag_arity(st1, home, name, ar),
                       ls_ctor_mask_arity(st1, home, name, ar), inits, st1.in_region), kpos_of(x)) }
 }
 
@@ -3684,7 +3708,7 @@ fn lower_ctor_args(cargs: [Expr], home: Option[String], name: String, ks: [Int],
           lower_ctor_args(rest, home, name, trest, arity, st1, list_append(acc, [SIEnum(v)])) }
       } else {
         match lower_expr(e, st) { LRes(v, st1) ->
-          lower_ctor_args(rest, home, name, trest, arity, st1, list_append(acc, [SIBoxed(v)])) }
+          lower_ctor_args(rest, home, name, trest, arity, lower_flight_next(e, v, rest == [], st1), list_append(acc, [SIBoxed(v)])) }
       }
     }
   }
