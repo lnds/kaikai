@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.139.1 (2026-10-08)
+
+### Changed
+
+- **runtime**: count RC traffic only in a traced run (#2637)
+
 ## v0.139.0 (2026-10-08)
 
 ### BREAKING CHANGE
