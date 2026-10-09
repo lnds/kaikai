@@ -25,6 +25,7 @@ import compiler.core_prims
 import compiler.emit_shared
 import compiler.resolve
 import compiler.region
+import compiler.reuse_cells
 import compiler.kir
 import compiler.kir_lin_cfg
 import compiler.unwind_pend
@@ -49,6 +50,12 @@ pub type RNSlot = RNBind(Int, String) | RNDrop(Int)
 # `RNInone` = the arm is not a single-nested rotation shape (the rebuild
 # keeps the fresh-alloc path).
 pub type ReuseNested = RNInone | RNI(Int, Int, Int, [RNSlot], [RNSlot])
+
+# A reuse arm's slot plans: `rot` for a nested rebuild; `flat` (the direct
+# slots that are not inner cells) and `cells` for a flat one.
+pub type ReusePlan = { rot: ReuseNested, flat: [RNSlot], cells: [(Int, ReuseCell)] }
+
+pub fn reuse_plan_none() : ReusePlan = ReusePlan { rot: RNInone, flat: [], cells: [] }
 
 # reg + block-label counters, finished blocks (generation order), current
 # block label, current block's reversed statement list, the EFn symbol
@@ -125,13 +132,12 @@ pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
                      # would otherwise cascade-free. Set per reuse arm, restored
                      # around each match like `mscr`; "" / [] outside one.
                      reuse_gc: [String],
-                     # `rnested` is the pattern shape of the current variant
-                     # REUSE arm when it deconstructs one nested sub-ctor (the
-                     # rotation shape). Like `reuse_gc`, the rebuild site
+                     # `rnested` is the slot plan of the current variant REUSE
+                     # arm. Like `reuse_gc`, the rebuild site
                      # (`lower_reuse_con`) sits far from the arm pattern, so
-                     # the slot plan travels here. Set per reuse arm alongside
-                     # `reuse_gc`; `RNInone` everywhere else.
-                     rnested: ReuseNested,
+                     # the plan travels here. Set per reuse arm alongside
+                     # `reuse_gc`; `reuse_plan_none()` everywhere else.
+                     rnested: ReusePlan,
                      # `recs` is the program's record table. Record-literal and
                      # reuse-rebuild assembly index through `rec_field_index` to
                      # emit fields in DECLARATION order, the canonical layout the
@@ -202,7 +208,7 @@ pub type LResOpt = LResOpt(Option[KVal], LowerSt)
 pub fn ls_new(fns: [EFn], fx: FnIndex, variants: [VariantEntry], lams: [LamInfo], effs: [String],
               consts: [Decl], ffi: [String], recs: [RecInfo], regions: [RegionMark], raw_binders: [RawArmBinder], root_mod: Option[String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, fx: fx, vs: variants,
-            lams: lams, enc_fn: "", effs: effs, consts: consts, locals: [], ffi: ffi, renames: [], mscr: "", reuse_gc: [], rnested: RNInone, recs: recs, in_region: false, regions: regions, raw_binders: raw_binders, tcpend: [], unw: unw_frame_none(unw_cx_empty()), root_mod: root_mod, arm_tok: false }
+            lams: lams, enc_fn: "", effs: effs, consts: consts, locals: [], ffi: ffi, renames: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: recs, in_region: false, regions: regions, raw_binders: raw_binders, tcpend: [], unw: unw_frame_none(unw_cx_empty()), root_mod: root_mod, arm_tok: false }
 
 # Reset the per-function counters and block buffers, preserving the shared
 # tables. `enc_fn` is the fn/lambda symbol the body's nested lambdas are
@@ -215,14 +221,14 @@ pub fn ls_set_arm_tok(st: LowerSt, held: Bool) : LowerSt = LowerSt { ...st, arm_
 
 pub fn ls_enter_fn(st: LowerSt, enc_fn: String, locals: [String]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: st.fns, fx: st.fx, vs: st.vs,
-            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts, locals: locals, ffi: st.ffi, renames: [], mscr: "", reuse_gc: [], rnested: RNInone, recs: st.recs, in_region: false, regions: st.regions, raw_binders: st.raw_binders, tcpend: [], unw: unw_blank(st.unw), root_mod: st.root_mod, arm_tok: false }
+            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts, locals: locals, ffi: st.ffi, renames: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: st.recs, in_region: false, regions: st.regions, raw_binders: st.raw_binders, tcpend: [], unw: unw_blank(st.unw), root_mod: st.root_mod, arm_tok: false }
 
 # Enter the fn with `body_fns` as the EFn table.
 pub fn ls_enter_fn_with(st: LowerSt, enc_fn: String, locals: [String],
                         body_fns: [EFn]) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: body_fns, fx: st.fx,
             vs: st.vs, lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts,
-            locals: locals, ffi: st.ffi, renames: [], mscr: "", reuse_gc: [], rnested: RNInone, recs: st.recs, in_region: false, regions: st.regions, raw_binders: st.raw_binders, tcpend: [], unw: unw_blank(st.unw), root_mod: st.root_mod, arm_tok: false }
+            locals: locals, ffi: st.ffi, renames: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: st.recs, in_region: false, regions: st.regions, raw_binders: st.raw_binders, tcpend: [], unw: unw_blank(st.unw), root_mod: st.root_mod, arm_tok: false }
 
 #[doc("The state with `u` as the current frame's unwind sites.")]
 pub fn ls_with_unw(st: LowerSt, u: UnwFrame) : LowerSt =
@@ -276,9 +282,9 @@ pub fn ls_set_reuse_gc(st: LowerSt, gc: [String]) : LowerSt =
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
             consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: gc, rnested: st.rnested, recs: st.recs, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
 
-# Set the reuse arm's nested-rotation slot plan (see `ReuseNested`). Travels
+# Set the reuse arm's slot plan (see `ReusePlan`). Travels
 # with `reuse_gc` — same set/clear discipline, same arm scope.
-pub fn ls_set_rnested(st: LowerSt, rn: ReuseNested) : LowerSt =
+pub fn ls_set_rnested(st: LowerSt, rn: ReusePlan) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
             consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: rn, recs: st.recs, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
