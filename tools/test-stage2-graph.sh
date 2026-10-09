@@ -27,7 +27,7 @@ imports = {}
 dangling = []
 for mod, path in paths.items():
     with open(path) as fh:
-        names = re.findall(r'^\s*import\s+([A-Za-z_][\w.]*)', fh.read(), re.M)
+        names = re.findall(r'^\s*import\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)', fh.read(), re.M)
     imports[mod] = [n for n in names if n in paths]
     dangling += [(mod, n) for n in names if n not in paths]
 

@@ -36,15 +36,19 @@ import compiler.cache
 import compiler.infer
 import compiler.symtab
 import compiler.scope_file
+import compiler.scope_view
 import compiler.cache_iface_acc
 import compiler.cache_module
 import compiler.user_cache
 import compiler.modules
 import compiler.diag_file
 import compiler.tycon_scheme_home
+import compiler.diag
+import compiler.kind_theory
+import compiler.doc_attr
 
-#[doc("Per-module cut context: the cache directory (empty disables the cut) and the cross-module context hash folded into every module key.")]
-pub type TypedCutCtx = TCC(String, String)
+#[doc("Per-module cut context: the cache directory (empty disables the cut), the cross-module context hash folded into every module key, the scope view of each file, and the target module that owns untagged declarations.")]
+pub type TypedCutCtx = TCC(String, String, FileViews, String)
 
 #[doc("Resolve the directory the typed blobs live in: an explicit project directory when the caller supplies one, else the entry file's own. A caller that compiles a copy of the entry outside the project must supply it, or the blobs are published where the next build will not look.")]
 pub fn tcut_cache_dir(proj_dir: String, entry_path: String) : String =
@@ -52,10 +56,10 @@ pub fn tcut_cache_dir(proj_dir: String, entry_path: String) : String =
   else { concat_all([dir_of(entry_path), "/", uc_cache_dir_name()]) }
 
 #[doc("A disabled cut — every module is inferred and nothing is published.")]
-pub fn tcut_off() : TypedCutCtx = TCC("", "")
+pub fn tcut_off() : TypedCutCtx = TCC("", "", fv_empty(), "")
 
 #[doc("Whether the cut is live. A cut with no cache directory infers every module, which is the behaviour every non-build entry point wants.")]
-pub fn tcut_on(ctx: TypedCutCtx) : Bool = match ctx { TCC(dir, _) -> dir != "" }
+pub fn tcut_on(ctx: TypedCutCtx) : Bool = match ctx { TCC(dir, _, _, _) -> dir != "" }
 
 # ---- cross-module context hash ----------------------------------------
 #
@@ -105,32 +109,34 @@ fn kth_chunk(k: KindTheory) : String = match k {
   KTh(a, b) -> concat_all([tc_field(a), tc_field(b)])
 }
 
-#[doc("Build the cut context for one compile: the cache directory plus a hash over the cross-module inputs the typer reads around the fold — the protocol-impl, kind-theory and head-owner tables, the program-wide type/effect declarations, and the function names several modules declare. Pass an empty directory to disable the cut.")]
+#[doc("Build the cut context for one compile: the cache directory, the files' scope views, plus a hash over the cross-module inputs the typer reads around the fold — the protocol-impl, kind-theory and head-owner tables, the program-wide type/effect declarations, and the function names several modules declare. Pass an empty directory to disable the cut.")]
 pub fn tcut_ctx(cache_dir: String, all_program_decls: [Decl], target: String,
                  proto_impls: [ProtoImplReg], head_owners: [HeadOwnerEntry],
-                 kind_theories: [KindTheory]) : TypedCutCtx = {
+                 kind_theories: [KindTheory], views: FileViews) : TypedCutCtx = {
   let xhex = uc_content_hex(concat_all([tm_decls_hex(filter(all_program_decls, is_xdecl)), "|",
                                         concat_all(map(proto_impls, (p) => pir_chunk(p))), "|",
                                         concat_all(map(head_owners, (h) => hoe_chunk(h))), "|",
                                         concat_all(map(kind_theories, (k) => kth_chunk(k))), "|",
                                         tsh_fn_contests(all_program_decls, target)]))
-  TCC(cache_dir, xhex)
+  TCC(cache_dir, xhex, views, target)
 }
 
 # ---- key + lookup + publish -------------------------------------------
 
-#[doc("The typed-module cache key for one module folded against an inherited interface, under the given cut context.")]
-pub fn tcut_key(ctx: TypedCutCtx, mod_decls: [Decl],
-                 inherited: IfaceAcc) : String = match ctx {
-  TCC(_, xhex) -> tm_key_hex(tm_decls_hex(mod_decls),
-                              iface_acc_hash(inherited), xhex)
+#[doc("The typed-module cache key for one module folded against an inherited interface, under the given cut context. The module's own file view is part of it: an import changes what a bare name reaches without changing a declaration.")]
+pub fn tcut_key(ctx: TypedCutCtx, m: ModuleDecls, inherited: IfaceAcc) : String = match ctx {
+  TCC(_, xhex, views, target) -> {
+    let home = match m.name { Some(n) -> n  None -> target }
+    tm_key_hex(uc_content_hex(concat_all([tm_decls_hex(m.decls), "|", sv_key(fv_of(views, home))])),
+               iface_acc_hash(inherited), xhex)
+  }
 }
 
 #[doc("Look up a module's typed blob by key; `None` on a disabled cut, a missing blob, or any header/payload drift.")]
 pub fn tcut_lookup(ctx: TypedCutCtx,
                     key: String) : Option[TypecheckedModule] / Console + File =
   match ctx {
-    TCC(dir, _) -> if dir == "" { None }
+    TCC(dir, _, _, _) -> if dir == "" { None }
                    else { tcut_read(dir, key) }
   }
 
@@ -143,7 +149,7 @@ fn tcut_read(dir: String, key: String) : Option[TypecheckedModule] / Console + F
 #[doc("Publish a module's typed blob for its key. A write failure is swallowed — a cache that cannot be written is a performance loss, never a correctness one.")]
 pub fn tcut_publish(ctx: TypedCutCtx, key: String,
                      m: TypecheckedModule) : Unit / Console + File = match ctx {
-  TCC(dir, _) -> if dir == "" { () }
+  TCC(dir, _, _, _) -> if dir == "" { () }
                  else {
                    cache_publish_bytes(tm_blob_path(dir, key),
                                        cache_serialize_tcmodule(m, tm_header_sha(key)))
@@ -243,7 +249,7 @@ fn tcut_module(file: String, df: DiagFiles, m: ModuleDecls, inherited: ModuleEnv
     typecheck_module(file, df, m, inherited, all_program_decls, proto_impls,
                       head_owners, kind_theories, tab, sh, verbose)
   } else {
-    let key = tcut_key(ctx, m.decls, iface)
+    let key = tcut_key(ctx, m, iface)
     match tcut_lookup(ctx, key) {
       Some(hit) -> hit
       None -> tcut_infer_publish(file, df, m, inherited, all_program_decls, ctx, key,
@@ -282,7 +288,7 @@ pub fn tcut_infer_program(file: String, df: DiagFiles, decls: [Decl], cache_dir:
                                              head_owners, kind_theories, tab, views)
     _   -> {
       let ctx = tcut_ctx(cache_dir, flatten_module_decls(mods0, []), module_name_of_path(file),
-                          proto_impls, head_owners, kind_theories)
+                          proto_impls, head_owners, kind_theories, views)
       tcut_typecheck_program(file, df, mods0, ctx, proto_impls, head_owners,
                               kind_theories, tab, views, verbose)
     }

@@ -249,9 +249,11 @@ fn read() : Int / Clock = now()                  # `now`, not `Clock.now`
 fn main() : Int = 0
 ```
 
-`import` brings in a module (optionally aliased, or restricted to a
-selection); `use E` opens an effect's operations so they resolve by
-bare name, at file top or inside any block. `use` takes an effect
+`import` brings in a module for the file that writes it: `import loop`
+opens its public names bare, `import loop as lp` binds the qualifier
+`lp` alone, and `import loop.{while}` brings `while` alone. `use E`
+opens an effect's operations so they resolve by bare name, at file top
+or inside any block. `use` takes an effect
 (PascalCase) or a kind (`use kind Fiat`, see `kai info kinds`) —
 never a module. `import ?name` is the dependency hole: the resolver
 searches packages for a symbol named `name` (`kai info holes`); a
@@ -261,7 +263,9 @@ A bare name reaches the nearest binding of it, in this order: a local
 binder (`let`, a parameter, a pattern binder), the file's own
 declarations, its selective picks, its imported modules, a protocol
 operation (the file's own protocols first, then those of its imports
-and the core), a core module function, any other exporter. A call checks
+and the core), a core module function. A name only a module the file
+does not import declares is an error naming the import to add, even
+when another file of the program imports it. A call checks
 its arity on every rung — the piped value counts — and passes over a
 binding of another arity, with a warning when that binding is one you
 wrote:

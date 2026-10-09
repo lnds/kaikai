@@ -20,6 +20,8 @@ import compiler.emit_native_fn
 import compiler.emit_native_slot
 import compiler.emit_native_fnix
 import compiler.effect_instance
+import compiler.fnreg
+import compiler.emit_native_call
 
 # --- KPrim / KCall symbol resolution -----------------------------------
 
@@ -875,20 +877,6 @@ fn nemit_raw_box(ctx: Handle, sym: String, pty: Handle, cargs: [KVal]) : Handle 
   _   -> { nemit_unsupported(ctx, "raw box arity"); nemit_null(ctx) }
 }
 
-#[doc("The raw payload of a boxed handle at a raw `slot`, read through the per-type field shim with no decref; a boxed slot passes the handle through.")]
-pub fn nemit_unbox_field(ctx: Handle, boxed: Handle, slot: KSlot) : Handle = match slot {
-  SInt64  -> ncall_sig1(ctx, "kaix_int_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), boxed)
-  SReal   -> ncall_sig1(ctx, "kaix_real_field", native_ctx_f64t(ctx), native_ctx_ptrt(ctx), boxed)
-  SBool   -> ncall_sig1(ctx, "kaix_bool_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
-  SChar   -> ncall_sig1(ctx, "kaix_char_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
-  SByte   -> ncall_sig1(ctx, "kaix_byte_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
-  SInt32T -> ncall_sig1(ctx, "kaix_int32_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
-  SUInt32 -> ncall_sig1(ctx, "kaix_uint32_field", native_ctx_i32t(ctx), native_ctx_ptrt(ctx), boxed)
-  SUInt64 -> ncall_sig1(ctx, "kaix_uint64_field", native_ctx_i64t(ctx), native_ctx_ptrt(ctx), boxed)
-  SInt128 -> ncall_sig1(ctx, "kaix_int128_field", native_ctx_i128t(ctx), native_ctx_ptrt(ctx), boxed)
-  _       -> boxed
-}
-
 # The raw payload of an atom at `slot`: a register already at that slot loads
 # directly and a boxed one unbox-borrows its field (no decref). A raw register
 # never re-boxes for the read.
@@ -1151,56 +1139,6 @@ fn nemit_call_indirect_borrow(ctx: Handle, fv: KVal, cargs: [KVal]) : Handle / C
 
 # --- mixed-signature runtime calls -------------------------------------
 #
-# The constructor / closure / apply runtime entries take a mix of `i32`,
-# `i8*`, and `KaiValue**` — under opaque pointers `i8*` and `KaiValue**`
-# are both `ptr`. The signature param-types and the call args both go
-# through C buffers (NEVER a `[Handle]` list — handles in a kaikai list
-# are RC-tagged + corrupted; asu "risk #1"). The fixed-arity helpers
-# (`ncall_sig1`/`2`/...) build both buffers inline.
-
-# `sym : ret ()` over no args — a non-boxed return type (e.g. an `i64`
-# runtime entry like `kai_jmpbuf_size`) the all-boxed `nemit_call0` cannot
-# express.
-pub fn ncall_sig0(ctx: Handle, sym: String, ret: Handle) : Handle = {
-  let ptb = llvm_buf_new()
-  let ab  = llvm_buf_new()
-  ncall_finish(ctx, sym, ret, ptb, ab)
-}
-# `sym : ret (p0)` over one arg.
-pub fn ncall_sig1(ctx: Handle, sym: String, ret: Handle, p0: Handle, a0: Handle) : Handle = {
-  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p0)
-  let ab  = llvm_buf_new(); llvm_buf_push(ab, a0)
-  ncall_finish(ctx, sym, ret, ptb, ab)
-}
-# `sym : ret (p0, p1)` over two args.
-pub fn ncall_sig2(ctx: Handle, sym: String, ret: Handle, p0: Handle, p1: Handle, a0: Handle, a1: Handle) : Handle = {
-  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p0); llvm_buf_push(ptb, p1)
-  let ab  = llvm_buf_new(); llvm_buf_push(ab, a0); llvm_buf_push(ab, a1)
-  ncall_finish(ctx, sym, ret, ptb, ab)
-}
-# `sym : ret (p0, p1, p2)` over three args (e.g. the cctx shims
-# `kaix_cctx_extend`/`kaix_cctx_apply(res, hole, child)`).
-pub fn ncall_sig3(ctx: Handle, sym: String, ret: Handle, p0: Handle, p1: Handle, p2: Handle,
-                  a0: Handle, a1: Handle, a2: Handle) : Handle = {
-  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p0); llvm_buf_push(ptb, p1); llvm_buf_push(ptb, p2)
-  let ab  = llvm_buf_new(); llvm_buf_push(ab, a0); llvm_buf_push(ab, a1); llvm_buf_push(ab, a2)
-  ncall_finish(ctx, sym, ret, ptb, ab)
-}
-# `sym : ret (p0, p1, p2, p3)` over four args.
-pub fn ncall_sig4(ctx: Handle, sym: String, ret: Handle, p0: Handle, p1: Handle, p2: Handle, p3: Handle,
-                  a0: Handle, a1: Handle, a2: Handle, a3: Handle) : Handle = {
-  let ptb = llvm_buf_new(); llvm_buf_push(ptb, p0); llvm_buf_push(ptb, p1); llvm_buf_push(ptb, p2); llvm_buf_push(ptb, p3)
-  let ab  = llvm_buf_new(); llvm_buf_push(ab, a0); llvm_buf_push(ab, a1); llvm_buf_push(ab, a2); llvm_buf_push(ab, a3)
-  ncall_finish(ctx, sym, ret, ptb, ab)
-}
-# Build the fn type from `ptb`, declare `sym`, call over `ab`, free both.
-pub fn ncall_finish(ctx: Handle, sym: String, ret: Handle, ptb: Handle, ab: Handle) : Handle = {
-  let fnty = llvm_fn_type_n(ret, ptb)
-  let fnv = llvm_get_or_declare_fn(native_ctx_m(ctx), sym, fnty)
-  let r = native_build_call(ctx, fnv, fnty, ab)
-  llvm_buf_free(ptb); llvm_buf_free(ab); r
-}
-
 # A `KCon`, routed to the cheapest runtime entry:
 #   - nullary (no slots) → `kaix_nullary_fast`: an array load from the
 #     startup-seeded singleton table, skipping `kai_variant_u`'s NOINLINE call

@@ -90,10 +90,12 @@ name; a bare name exported by two imports is an error naming both.
 
 `#[derive(Json)]` binds a record to the JSON DOM: it generates
 `to_json(self) : JsonValue` and a `<lower(T)>_of_json(v, path) :
-Result[T, JsonError]` entry point.
+Result[T, JsonError]` entry point. The DOM and the readers the derived
+code calls live in `encoding.json_bind`, which the deriving file imports.
 
 ```kaikai
 import encoding.json.{json_decode, json_encode}
+import encoding.json_bind
 
 #[derive(Json)]
 type Person = { name: String, age: Int, nick: Option[String] }

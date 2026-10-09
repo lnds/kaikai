@@ -129,6 +129,14 @@ import compiler.lint
 import compiler.law_checks
 import compiler.core_reach
 import compiler.ncore_index
+import compiler.cache_ast
+import compiler.doc_attr
+import compiler.name_contest
+import compiler.decl_names
+import compiler.effect_alias
+import compiler.infer_json_base
+import compiler.kir_lower_fns
+import compiler.sym_read
 
 
 # ====================================================================
@@ -1007,10 +1015,22 @@ fn rs_bind_in(rs: ResolveState, owner: String, entry: ModuleEntry) : ResolveStat
   ResolveState { visited: rs.visited, in_progress: rs.in_progress, rev_decls: rs.rev_decls, rev_segs: rs.rev_segs, rev_modules: rs.rev_modules, scopes: scopes_bind(rs.scopes, owner, entry), rev_sels: rs.rev_sels, errs: rs.errs, diags: rs.diags, dep_memo: rs.dep_memo, imports: rs.imports }
 
 fn scopes_bind(scopes: [ModScope], owner: String, entry: ModuleEntry) : [ModScope] = match scopes {
-  [] -> [MScope(owner, [entry])]
-  [MScope(m, mt), ...rest] ->
-    if m == owner { [MScope(m, list_append(mt, [entry])), ...rest] }
-    else { [MScope(m, mt), ...scopes_bind(rest, owner, entry)] }
+  [] -> [MScope(owner, [entry], [])]
+  [MScope(m, mt, opens), ...rest] ->
+    if m == owner { [MScope(m, list_append(mt, [entry]), opens), ...rest] }
+    else { [MScope(m, mt, opens), ...scopes_bind(rest, owner, entry)] }
+}
+
+# Record that the file `owner` opens the module it binds as `written`:
+# a plain `import m` makes the module's names visible bare in that file.
+fn rs_open_in(rs: ResolveState, owner: String, written: String) : ResolveState =
+  ResolveState { ...rs, scopes: scopes_open(rs.scopes, owner, written) }
+
+fn scopes_open(scopes: [ModScope], owner: String, written: String) : [ModScope] = match scopes {
+  [] -> [MScope(owner, [], [written])]
+  [MScope(m, mt, opens), ...rest] ->
+    if m == owner { [MScope(m, mt, [written, ...opens]), ...rest] }
+    else { [MScope(m, mt, opens), ...scopes_open(rest, owner, written)] }
 }
 
 fn rs_prepend_rev(xs: [Decl], rev: [Decl]) : [Decl] = match xs {
@@ -1380,7 +1400,8 @@ fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], core
           rs_report(rs, [import_diag(importer_file(rs), line, col, import_chain_msg())])
         DImport(ik, il, ic) -> match ik {
           # surface name = last segment of dotted path.
-          IkPath(p)         -> resolve_module(base_dir, p, last_segment(p), il, ic, search_paths, cores, owner, cache_dir, rs)
+          IkPath(p)         -> resolve_module(base_dir, p, last_segment(p), il, ic, search_paths, cores, owner, cache_dir,
+                                              rs_open_in(rs, owner, last_segment(p)))
           # surface name = alias.
           IkAlias(p, alias) -> resolve_module(base_dir, p, alias, il, ic, search_paths, cores, owner, cache_dir, rs)
           # surface name = last segment (selective imports keep the
@@ -4988,7 +5009,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let mod_scopes = match expanded { EP_Mod(_, _, _, _, _, sc, _) -> sc }
             let seg_marks = match expanded { EP_Mod(_, _, _, _, sg, _, _) -> sg }
             let core_decls_l = surface_lower_decls(core_decls)
-            let sel_imports = match expanded { EP_Mod(_, _, _, _, _, _, si) -> si }
+            let sel_imports = sel_with_ctors(match expanded { EP_Mod(_, _, _, _, _, _, si) -> si },
+                                             mod_scopes, module_table, expanded_decls, target_mod_name)
             # The program's one symbol table. Later passes that mint
             # declarations extend it; ids are derived, so none moves. It
             # keys effects by their written name, so it can be built before

@@ -202,8 +202,8 @@ fi
 L="$ROOT/examples/lint/pkg_entry"
 expect "lint: a library lints every module it owns" 0 "$(cat "$L/lint.expected")" \
   sh -c 'cd "$1" && "$2" lint . 2>/dev/null | sed "s|^.*/pkg_entry/||"' _ "$L" "$KAI"
-# A package with an entry is one unit: a name a sibling's import made visible
-# resolves, and a non-entry file's own findings are still reported.
+# A package with an entry is one unit, and a non-entry file's own findings
+# are still reported.
 U="$ROOT/examples/lint/pkg_unit_scope"
 expect "lint: a package with an entry is linted as one unit" 0 "$(cat "$U/lint.expected")" \
   sh -c 'cd "$1" && "$2" lint . 2>/dev/null | sed "s|^.*/pkg_unit_scope/||"' _ "$U" "$KAI"

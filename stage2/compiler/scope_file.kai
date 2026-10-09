@@ -1,17 +1,11 @@
 #[doc("""
 The scope view one file resolves under, built from what the loader
-already knows: the modules the file imports, the names its selective
-imports pick, and the prelude cores.
-
-`ScopeView` models the rungs; nothing built one with those rungs
-filled. The resolver reached a name through its own home alone, so
-`SvPicks`, `SvImports` and `SvCores` admitted nobody and the ladder
-collapsed to `own -> any` — a bare name either was declared at home or
-was answered by any visible declaration, with the three rungs between
-them silent.
+already knows: the modules the file opens with a plain `import m`, the
+names its selective imports pick, and the prelude cores. An alias binds
+a qualifier and opens nothing.
 
 The loader's tables are the source: `[ModImports]` says which modules a
-file imports, `[SelImport]` which names it picks from which module, and
+file opens, `[SelImport]` which names it picks from which module, and
 the core list names the prelude. Each is a module *name*; the view
 holds ids, so every name is turned into its id once here rather than
 compared as a string at each rung.
@@ -36,7 +30,7 @@ pub type FvEntry = FvEntry(String, ScopeView)
 
 #[doc("""
 The per-file views for a program: for each file the loader recorded,
-the modules it imports, the names it picks, and the cores every file
+the modules it opens, the names it picks, and the cores every file
 sees without importing them.
 
 `root` is the target module's name — the home of every untagged
@@ -47,8 +41,26 @@ home the module's declarations carry.
 pub fn fv_build(imports: [ModImports], sels: [SelImport], scopes: [ModScope],
       global: [ModuleEntry], cores: [String], root: String) : FileViews {
   let core_ids = fv_ids(cores, [])
-  FileViews(fv_entries(imports, fv_tag_sels(sels, scopes, global), core_ids, root, []),
+  FileViews(fv_entries(imports, fv_tag_sels(sels, scopes, global), scopes, global, core_ids, root, []),
             fv_bare(core_ids, root))
+}
+
+#[doc("""
+Every selective import with the constructors of each sum type it picks
+added: `import m.{Shape}` lets the file write `Circle(1)`. The type and
+its variants are exported as one, and a constructor is read under its
+type. `decls` is the stream the picked modules' declarations are in.
+""")]
+pub fn sel_with_ctors(sels: [SelImport], scopes: [ModScope], global: [ModuleEntry],
+      decls: [Decl], root: String) : [SelImport] = match sels {
+  [] -> []
+  _  -> {
+    let sums = fv_sums(decls, root, [])
+    map(sels, (s) => match s {
+      SelImport(o, written, names) ->
+        SelImport(o, written, fv_with_ctors(names, sums, mt_tagged_name(ms_table(scopes, o, global), written), names))
+    })
+  }
 }
 
 #[doc("No file views: every home resolves seeing only its own declarations, the shape a caller with no loader tables gets.")]
@@ -77,21 +89,65 @@ fn fv_tag_sels(sels: [SelImport], scopes: [ModScope], global: [ModuleEntry]) : [
 fn fv_owner(owner: String, root: String) : String =
   if owner == "" { root } else { owner }
 
-fn fv_entries(imports: [ModImports], sels: [SelImport],
-      core_ids: [SymId], root: String, acc: [FvEntry]) : [FvEntry] =
+fn fv_entries(imports: [ModImports], sels: [SelImport], scopes: [ModScope],
+      global: [ModuleEntry], core_ids: [SymId], root: String, acc: [FvEntry]) : [FvEntry] =
   match imports {
     [] -> list_reverse(acc)
     [MImp(owner, names), ...rest] -> {
       let home = fv_owner(owner, root)
-      let e = FvEntry(home, fv_view(home, names, sels, core_ids, root))
-      fv_entries(rest, sels, core_ids, root, [e, ...acc])
+      let v = sv_with_quals(fv_view(home, names, sels, core_ids, root), fv_quals(scopes, owner, global))
+      fv_entries(rest, sels, scopes, global, core_ids, root, [FvEntry(home, v), ...acc])
     }
   }
+
+# The qualifiers the file `owner` wrote, each bound to the module it names.
+fn fv_quals(scopes: [ModScope], owner: String, global: [ModuleEntry]) : [SvPick] = match scopes {
+  [] -> []
+  [MScope(o, mes, _), ...rest] ->
+    if o == owner {
+      map(mes, (me) => match me {
+        ME(written, _, origin, _) -> SvPick(written, st_module_id(me_last_name_for_origin(global, origin, written)))
+      })
+    } else { fv_quals(rest, owner, global) }
+}
 
 fn fv_view(home: String, names: [String], sels: [SelImport],
       core_ids: [SymId], root: String) : ScopeView =
   sv_new(st_module_id(home), fv_picks(sels, home, root, []),
          fv_ids(names, []), core_ids)
+
+# A sum type a module declares: its name, its home, its constructors.
+type FvSum = FvSum(String, String, [String])
+
+fn fv_sums(ds: [Decl], root: String, acc: [FvSum]) : [FvSum] = match ds {
+  [] -> acc
+  [d, ...rest] -> fv_sums(rest, root, fv_sum(d, root, acc))
+}
+
+fn fv_sum(d: Decl, root: String, acc: [FvSum]) : [FvSum] = match d {
+  DType(_, name, _, TBSum(vs), _, _, mo, _, _) ->
+    [FvSum(name, fv_mo_home(mo, root), fv_variant_names(vs)), ...acc]
+  DDoc(_, _, inner, _, _) -> fv_sum(inner, root, acc)
+  DAttr(_, inner, _, _)   -> fv_sum(inner, root, acc)
+  _ -> acc
+}
+
+fn fv_mo_home(mo: Option[String], root: String) : String = match mo {
+  Some(m) -> m
+  None    -> root
+}
+
+fn fv_variant_names(vs: [Variant]) : [String] = map(vs, (v) => match v { Var(n, _) -> n })
+
+fn fv_with_ctors(ns: [String], sums: [FvSum], home: String, acc: [String]) : [String] = match ns {
+  [] -> acc
+  [n, ...rest] -> fv_with_ctors(rest, sums, home, list_append(acc, fv_ctors_of(sums, n, home)))
+}
+
+fn fv_ctors_of(sums: [FvSum], n: String, home: String) : [String] = match sums {
+  [] -> []
+  [FvSum(t, h, cs), ...rest] -> if t == n and h == home { cs } else { fv_ctors_of(rest, n, home) }
+}
 
 fn fv_bare(core_ids: [SymId], root: String) : ScopeView =
   sv_new(st_module_id(root), [], [], core_ids)
