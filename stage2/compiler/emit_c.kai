@@ -9788,14 +9788,11 @@ fn emit_impl_table_array_loop(rows: [PimplRow], decls: [Decl], acc: String) : St
   match rows {
     [] -> acc
     [pr, ...rest] -> match pr {
-      PR(csym, p, t, _, _, op, home) -> {
-        # Unboxed builtin impls (`Eq_Int_eq(int64_t,int64_t)`, …) cannot
-        # be cast to the dispatch shape `KaiValue*(KaiValue*,KaiValue*)`
-        # the runtime expects: the runtime would reinterpret boxed
-        # pointers as raw scalars and the raw return as a `KaiValue*`,
-        # dereferencing a small integer (SIGSEGV — issue fix-proto-eq-abi).
-        # Register the boxed shim instead; boxed impls register directly.
-        let fn_sym = if pimpl_row_is_unboxed(pr) {
+      PR(csym, p, t, _, _, op, home, _) -> {
+        # The runtime calls a table entry as `KaiValue*(KaiValue*, …)` and
+        # hands every argument owned. A raw-ABI impl, or one that borrows a
+        # param, would misread or leak them, so it registers its shim.
+        let fn_sym = if pimpl_row_needs_adapter(pr) {
           concat_all([c_user_sym(csym), "__boxed"])
         } else {
           concat_all([c_user_sym(csym)])
@@ -9866,7 +9863,7 @@ fn emit_pimpl_forwards(rows: [PimplRow], _seen: [String]) : String =
 fn emit_pimpl_forwards_loop(rows: [PimplRow], seen: [String]) : String {
   match rows {
     [] -> ""
-    [PR(csym, _, _, _, _, _, _), ...rest] ->
+    [PR(csym, _, _, _, _, _, _, _), ...rest] ->
       if list_has(seen, csym) {
         emit_pimpl_forwards_loop(rest, seen)
       } else {
@@ -9876,32 +9873,23 @@ fn emit_pimpl_forwards_loop(rows: [PimplRow], seen: [String]) : String {
   }
 }
 
-# Emit one boxed shim per unboxed builtin pimpl row registered in the
-# impl table. The shim has the dispatch shape
-# `KaiValue *kai_<csym>__boxed(KaiValue *a, KaiValue *b)` (or one arg for
-# arity-1 impls like Hash). It unpacks each boxed arg to its raw scalar,
-# decrefs it (consuming ownership exactly like the runtime's
-# `__pimpl_*_thunk` does — the dispatch sites incref a/b before calling
-# and require the impl to consume both), calls the raw pimpl, and boxes
-# the raw return: `kai_bool` for an Int-returning op (Eq), and the
-# return type's constructor (`kai_int` for cmp, `kai_real`/`kai_char`
-# for min/max) via `box_wrap`. Boxed pimpls have `None` here and emit
-# nothing — they are registered directly.
+# Emit one shim `KaiValue *kai_<csym>__boxed(KaiValue *a0, …)` per impl
+# row that needs an adapter. The dispatch sites incref the args and
+# require the entry to consume them: the shim unboxes and decrefs raw
+# args, boxes a raw return, and drops the args the impl borrows.
 fn emit_impl_shim_defs(rows: [PimplRow], seen: [String]) : String {
   match rows {
     [] -> ""
     [pr, ...rest] -> match pr {
-      PR(csym, _, _, _, sig, _, _) ->
-        if list_has(seen, csym) or not pimpl_row_is_unboxed(pr) {
+      PR(csym, _, _, arity, sig, _, _, lent) ->
+        if list_has(seen, csym) or not pimpl_row_needs_adapter(pr) {
           emit_impl_shim_defs(rest, seen)
         } else {
-          match sig {
-            Some(US(pts, rt, mask)) -> concat_all([
-              emit_one_impl_shim(csym, pts, rt, mask),
-              emit_impl_shim_defs(rest, [csym, ...seen])
-            ])
-            None -> emit_impl_shim_defs(rest, [csym, ...seen])
+          let shim = match sig {
+            Some(US(pts, rt, mask)) -> emit_one_impl_shim(csym, pts, rt, mask, lent)
+            None -> emit_impl_shim_body(csym, arity, "", concat_all([c_user_sym(csym), "(", shim_names("a", arity, 0), ")"]), lent)
           }
+          concat_all([shim, emit_impl_shim_defs(rest, [csym, ...seen])])
         }
     }
   }
@@ -9918,36 +9906,34 @@ fn emit_impl_shim_defs(rows: [PimplRow], seen: [String]) : String {
 # boxed-return mixed pimpl already yields a `KaiValue *`, so wrapping it
 # (e.g. with `kai_int`) would corrupt it — the `Complex add(self, rhs)`
 # case that produced `kai_int(<KaiValue*>)`.
-fn emit_one_impl_shim(csym: String, pts: [Ty], rt: Ty, mask: [Bool]) : String {
+fn emit_one_impl_shim(csym: String, pts: [Ty], rt: Ty, mask: [Bool], lent: [Int]) : String {
   let unbox  = emit_shim_unbox_args_masked(pts, mask, 0)
   let args   = emit_shim_arg_list_masked(pts, mask, 0)
   let call   = concat_all([c_user_sym(csym), "(", args, ")"])
   let ret    = if ty_is_unboxable_t(rt) { box_wrap(Some(rt), call) } else { call }
-  concat_all([
-    "static KaiValue *", c_user_sym(csym), "__boxed(", emit_shim_param_list(pts, 0), ") {\n",
-    unbox,
-    "    return ", ret, ";\n",
-    "}\n\n"
-  ])
+  emit_impl_shim_body(csym, list_length(pts), unbox, ret, lent)
 }
 
-# `KaiValue *a0, KaiValue *a1, …` — one boxed param per impl arg.
-# An empty list at the top (arity-0 impls like `Default`) emits `void`
-# so the shim's prototype is `KaiValue *kai_<csym>__boxed(void)`, which
-# matches the `KaiValue*(*)(void)` shape the dispatcher casts the slot
-# to. An empty `()` would be a K&R unspecified-args prototype, not a
-# zero-arg one. issue fix-default-shim.
-fn emit_shim_param_list(pts: [Ty], i: Int) : String {
-  match pts {
-    [] -> if i == 0 { "void" } else { "" }
-    [_, ...rest] -> {
-      let head = concat_all(["KaiValue *a", int_to_string(i)])
-      match rest {
-        [] -> head
-        _  -> concat_all([head, ", ", emit_shim_param_list(rest, i + 1)])
-      }
-    }
+# Arity 0 spells `(void)`: an empty `()` is a K&R unspecified-args
+# prototype, not the zero-arg shape the dispatcher casts the slot to.
+fn emit_impl_shim_body(csym: String, arity: Int, unbox: String, ret: String, lent: [Int]) : String {
+  let params = if arity == 0 { "void" } else { shim_names("KaiValue *a", arity, 0) }
+  let tail = match lent {
+    [] -> concat_all(["    return ", ret, ";\n"])
+    _  -> concat_all(["    KaiValue *_r = ", ret, ";\n", emit_shim_drops(lent), "    return _r;\n"])
   }
+  concat_all(["static KaiValue *", c_user_sym(csym), "__boxed(", params, ") {\n", unbox, tail, "}\n\n"])
+}
+
+# `<prefix>0, <prefix>1, …` up to `n`.
+fn shim_names(prefix: String, n: Int, i: Int) : String =
+  if i >= n { "" }
+  else if i == n - 1 { cat2(prefix, int_to_string(i)) }
+  else { concat_all([prefix, int_to_string(i), ", ", shim_names(prefix, n, i + 1)]) }
+
+fn emit_shim_drops(lent: [Int]) : String = match lent {
+  [] -> ""
+  [i, ...rest] -> concat_all(["    kai_decref(a", int_to_string(i), ");\n", emit_shim_drops(rest)])
 }
 
 # `<raw_ty> r0 = a0->as.X; kai_decref(a0); …` per param. Decref consumes
