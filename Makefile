@@ -744,6 +744,7 @@ test-kai-cli: kaic2
 	@tests/kai_test_jobs.sh
 	@tests/guard_memo.sh
 	@tests/guard_interfaces.sh
+	@tests/test_only_root.sh
 	@tests/bin_memo.sh
 	@tests/run_memo.sh
 	@tests/path_specs.sh
