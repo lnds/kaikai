@@ -2306,7 +2306,10 @@ expression with `kai_pad_open(regs…)` and closes it with
 `kai_pad_close`. Every call emitted while a pad is open becomes an
 `invoke` whose unwind edge enters a cleanup block. That block releases
 the pad's registers, including the enclosing pads' registers, and
-resumes the unwind (`emit_native_pads.kai`).
+resumes the unwind (`emit_native_pads.kai`). A pad also releases the
+values in flight across it: an operand already computed with a reference
+of its own (a call's result, a record, list or constructor built in
+place) whose parent call, operator or constructor has not taken it yet.
 
 A pad never encloses a bracket: an expression whose operands hold one
 gets no pad. So a reference is released by the unwinder or by the jump,
