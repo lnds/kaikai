@@ -42,6 +42,7 @@
 # compiler.fnreg, compiler.modules, compiler.unbox, compiler.perceus,
 # compiler.protos, and compiler.emit_shared (the backend-shared layer).
 
+import compiler.site_ids
 import compiler.ast
 import compiler.type_stamp
 import compiler.effect_default
@@ -300,7 +301,7 @@ fn emit_unw_boxed(names: [String], cx: EmitCtx) : [String] = match names {
 # The match at `x` registers its owned scrutinee when an arm holds a call
 # that can unwind.
 fn emit_unw_scr_at(x: Expr, cx: EmitCtx) : EmitCtx = {
-  let want = unw_match_at(cx.unw.sites, x.line, x.col)
+  let want = unw_match_at(cx.unw.sites, x.site)
   if want == cx.unw.scr { cx } else { emit_ctx_with_unw(cx, unw_with_scr(cx.unw, want)) }
 }
 
@@ -371,7 +372,7 @@ fn emit_unw_closure(f: Expr, cx: EmitCtx) : Option[UnwClosure] = match sym_read_
 fn emit_unw_local(f: Expr, n: String, cx: EmitCtx) : Bool =
   ec_local_callee(f, n, cx) and not emit_ctx_kind1_raw_has(cx, n)
 
-fn emit_unw_var(f: Expr, n: String) : Expr = Expr { kind: EVar(n), line: f.line, col: f.col, ty: f.ty, mode: f.mode }
+fn emit_unw_var(f: Expr, n: String) : Expr = Expr { kind: EVar(n), line: f.line, col: f.col, ty: f.ty, mode: f.mode,  site: f.site }
 
 fn emit_ctx_with_tcpend(cx: EmitCtx, l: [String]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
@@ -2168,7 +2169,7 @@ fn emit_ob_rewrite_args(args_e: [Expr], i: Int) : [Expr] = match args_e {
   [a, ...rest] -> {
     let a2 = if emit_is_owned_borrow(a) {
                Expr { kind: EVar(concat_all(["bc", int_to_string(i)])),
-                      line: a.line, col: a.col, ty: a.ty, mode: a.mode }
+                      line: a.line, col: a.col, ty: a.ty, mode: a.mode,  site: a.site }
              } else { a }
     [a2, ...emit_ob_rewrite_args(rest, i + 1)]
   }
@@ -7181,7 +7182,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     EBang(inner) -> emit_bang(src, x, inner, cx)
     EHandle(body, eff_name, _, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
       emit_handle(src, body, eff_name, inst_key_of_tes(eff_name, eff_tyargs), init_opt, alias_opt,
-                  clauses, ret_opt, x.line, x.col, cx)
+                  clauses, ret_opt, x.line, x.col, x.site, cx)
     # m12.5: codegen erasure — `1.0<USD>` emits the same C as `1.0`.
     # Units are typer-only; the generated value carries no unit tag.
     ELitUnit(inner, _) -> emit_expr(src, inner, cx)
@@ -7518,7 +7519,7 @@ fn emit_bang(src: String, x: Expr, inner: Expr, cx: EmitCtx) : String / Console 
 
   let inner_c = emit_expr(src, inner, cx)
   let success = bang_success_variant(inner.ty)
-  let binders = match unw_exit_at(cx.unw.sites, x.line, x.col) {
+  let binders = match unw_exit_at(cx.unw.sites, x.site) {
     Some(ns) -> concat_all(map(emit_unw_vars(ns, cx), (v) => concat_all(["kai_decref(", v, "); "])))
     None     -> ""
   }
@@ -7545,7 +7546,7 @@ fn alias_is_byid_cell(eff_name: String) : Bool = eff_name == "State" or eff_name
 fn emit_handle(src: String, body: Expr, eff_name: String, key: String, init_opt: Option[Expr],
                alias_opt: Option[String],
                clauses: [HClause],
-               ret_opt: Option[HReturn], hline: Int, hcol: Int,
+               ret_opt: Option[HReturn], hline: Int, hcol: Int, hsite: Int,
                cx: EmitCtx) : String / Console {
 
   let body_c = emit_expr(src, body, emit_ctx_with_evf(cx, frame_shadow(cx.evf, cx.cur_enc_fn, key)))
@@ -7608,7 +7609,7 @@ fn emit_handle(src: String, body: Expr, eff_name: String, key: String, init_opt:
   }
   # Below the landing pad's mark: the references that outlive the handle
   # and the state slot, released only by an exit that passes the handle.
-  let uw = emit_unw_handle(hline, hcol, stateful, cx)
+  let uw = emit_unw_handle(hsite, stateful, cx)
   # The Ev owns its final state; both exits (normal and discard) meet
   # here, after the return clause has read it.
   let frames_c = if rs_clauses_push_frames(clauses) { "_hr = kai_resume_frames_run(&_node, _hr); " } else { "" }
@@ -7679,8 +7680,8 @@ type HandleExit = { decl: String, normal: String, discard: String, merge: String
 
 type UnwHandleC = { vars: String, state: String, pop: String }
 
-fn emit_unw_handle(hline: Int, hcol: Int, stateful: Bool, cx: EmitCtx) : UnwHandleC =
-  match unw_handle_names(cx.unw.sites, hline, hcol) {
+fn emit_unw_handle(hsite: Int, stateful: Bool, cx: EmitCtx) : UnwHandleC =
+  match unw_handle_at(cx.unw.sites, hsite) {
     None -> UnwHandleC { vars: "", state: "", pop: "" }
     Some(names) -> {
       let vars = emit_unw_vars(names, cx)
@@ -10385,7 +10386,7 @@ fn desugar_op_calls_decl(d: Decl, effs: [String]) : Decl {
 
 fn desugar_op_calls_expr(e: Expr, effs: [String]) : Expr =
   Expr { kind: desugar_op_calls_kind(e.kind, effs),
-         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
 fn desugar_op_calls_callee(callee: Expr, effs: [String]) : Expr {
   match callee.kind {
@@ -10446,7 +10447,7 @@ fn desugar_index_decl(d: Decl) : Decl {
 
 fn desugar_index_expr(e: Expr) : Expr =
   Expr { kind: desugar_index_kind(e.kind, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
 fn desugar_index_opt(opt: Option[Expr]) : Option[Expr] {
   match opt {
@@ -10583,7 +10584,7 @@ fn desugar_interp_decl(d: Decl, cx: InterpCtx) : Decl / Console + File {
 fn desugar_interp_expr(e: Expr, cx: InterpCtx) : Expr / Console + File =
 
   Expr { kind: desugar_interp_kind(e.kind, cx, e.line, e.col),
-         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
 fn desugar_interp_kind(k: ExprKind, cx: InterpCtx,
                         line: Int, col: Int) : ExprKind / Console + File {
@@ -11903,7 +11904,7 @@ fn expand_ta_pops(ops: [ProtoOp], table: [TAEntry], aliases: [AliasResult], fuel
 
 fn expand_ta_expr(e: Expr, table: [TAEntry], aliases: [AliasResult], fuel: Int) : Expr =
   Expr { kind: expand_ta_expr_kind(e.kind, table, aliases, fuel),
-         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
 fn expand_ta_expr_kind(k: ExprKind, table: [TAEntry], aliases: [AliasResult], fuel: Int) : ExprKind {
   match k {
@@ -12440,7 +12441,7 @@ fn mangle_pops(ops: [ProtoOp], entries: [PrivTyEntry],
 
 fn mangle_expr(e: Expr, entries: [PrivTyEntry], home_mod: String) : Expr =
   Expr { kind: mangle_expr_kind(e.kind, entries, home_mod),
-         line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
 fn mangle_expr_kind(k: ExprKind, entries: [PrivTyEntry],
                        home_mod: String) : ExprKind {
@@ -13174,7 +13175,7 @@ fn tcrec_block_scope(stmts: [Stmt], scope: [String]) : [String] {
 # jumps past (`tcrec_compute_site_dropmask`); `p0..pN` are the params in
 # declaration order. Pipe cannot appear in a kaikai identifier.
 #[doc("Rewrite every self-tail-call into the goto sentinel the C and native emitters lower to a loop.")]
-pub fn tcrec_rewrite_decls(decls: [Decl], allow_trmc: Bool, cons_ok: Bool, root: String) : [Decl] / Console = {
+pub fn tcrec_rewrite_decls(decls: [Decl], allow_trmc: Bool, cons_ok: Bool, root: String) : [Decl] / Console + Mutable = {
   # The goto rebinds a parameter slot in place, so a read that hands the
   # value to a BORROWED callee slot leaves the old value unreleased: the
   # callee never took ownership. The borrow map is what separates that
@@ -13187,7 +13188,7 @@ pub fn tcrec_rewrite_decls(decls: [Decl], allow_trmc: Bool, cons_ok: Bool, root:
 # INNER), exit...], Some(EVar(__pcs_ret)))`; `tcrec_rewrite_pcs_ret_wrap`
 # rewrites INNER and rebuilds the wrap. The wrap-less and entry-only shapes
 # need no unwrap: the walker descends through `EBlock(_, Some(tail))`.
-fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap) : Decl / Console {
+fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap) : Decl / Console + Mutable {
 
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo, fsym) -> {
@@ -13202,7 +13203,7 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap)
         }
       } else {
         if not tcrec_has_tail_self_call(body, SelfRef(fsym, name), arity, cons_ok) { d }
-        else {
+        else { site_renumber_decl({
           let pnames = map(params, (p) => p.pname)
           let uses = pcs_use_index(body, pnames)
           {
@@ -13250,7 +13251,7 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap)
               }
             DFn(is_pub, name, tparams, params, opt_ret, row, new_body, ln, cl, mo, fsym)
           }
-        }
+        }) }
       }
     }
     _ -> d
@@ -13347,7 +13348,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
                               body: Expr, stmts: [Stmt],
                               ln: Int, cl: Int, mo: Option[String],
                               arity: Int, allow_trmc: Bool, cons_ok: Bool,
-                              bmap: BorrowMap) : Decl / Console {
+                              bmap: BorrowMap) : Decl / Console + Mutable {
 
   match tcrec_find_pcs_ret_let(stmts, []) {
     None -> d
@@ -13362,7 +13363,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
         let is_trmc_inner = allow_trmc and trmc_row_is_affine(row) and trmc_body_has_modcons(inner, SelfRef(fsym, name), arity, cons_ok)
         let has_direct = tcrec_has_tail_self_call(inner, SelfRef(fsym, name), arity, cons_ok)
         if not has_direct and not is_trmc_inner { d }
-        else {
+        else { site_renumber_decl({
           let pnames = map(params, (p) => p.pname)
           let uses = pcs_use_index(inner, pnames)
           {
@@ -13393,7 +13394,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
               }
             DFn(is_pub, name, tparams, params, opt_ret, row, new_body, ln, cl, mo, fsym)
           }
-        }
+        }) }
       }
     }
   }
@@ -13437,9 +13438,9 @@ fn tcrec_rebuild_pcs_ret_wrap(orig: Expr, before: [Stmt], new_inner: Expr,
   )
   let stmts = list_append(before, [ret_let, ...after])
   let tail = Expr { kind: EVar("__pcs_ret"), line: new_inner.line, col: new_inner.col,
-                    ty: new_inner.ty, mode: new_inner.mode }
+                    ty: new_inner.ty, mode: new_inner.mode,  site: new_inner.site }
   Expr { kind: EBlock(stmts, Some(tail)),
-         line: orig.line, col: orig.col, ty: orig.ty, mode: orig.mode }
+         line: orig.line, col: orig.col, ty: orig.ty, mode: orig.mode,  site: orig.site }
 }
 
 # Per-call-site dropmask: bit `i` is set iff param `i`'s payer is the exit
@@ -13901,7 +13902,7 @@ fn tcrec_rewrite_body(body: Expr, me: SelfRef, arity: Int, c_sym_str: String,
                       dm_table: [TcrDm], skip_set: [String], scope: [String]) : Expr =
   Expr { kind: tcrec_rewrite_kind(body.kind, body.line, body.col, me, arity,
                                    c_sym_str, params, pnames, uses, dm_table, skip_set, scope),
-         line: body.line, col: body.col, ty: body.ty, mode: body.mode }
+         line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
 
 fn trmc_expr_nth(xs: [Expr], i: Int) : Option[Expr] =
   if i < 0 { None }
@@ -13960,7 +13961,7 @@ fn trmc_rewrite_body(body0: Expr, me: SelfRef, arity: Int, c_sym_str: String,
   let body = trmc_unwrap_ret(body0)
   let out = Expr { kind: trmc_rewrite_kind(body.kind, body.line, body.col, me, arity,
                                   c_sym_str, params, pnames, uses, dm_table, skip_set, scope, cons_ok),
-         line: body.line, col: body.col, ty: body.ty, mode: body.mode }
+         line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
   txd_plant(out, txd_wrap_drops(body0))
 }
 
@@ -13980,7 +13981,7 @@ fn trmc_make_step_call(cname: String, args: [Expr], h: Int, line: Int, col: Int,
   }
   let dropmask = base_mask + site_mask
   let sentinel = trmc_make_step_sentinel(c_sym_str, h, cname, dropmask, pnames)
-  ECall(Expr { kind: EVar(sentinel), line: line, col: col, ty: None, mode: MBoxed }, args)
+  ECall(Expr { kind: EVar(sentinel), line: line, col: col, ty: None, mode: MBoxed , site: 0 }, args)
 }
 
 fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
@@ -14000,7 +14001,7 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
     EBlock(stmts, opt_tail) -> {
       let scope1 = tcrec_block_scope(stmts, scope)
       match opt_tail {
-        None -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed })
+        None -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
         Some(e) -> EBlock(stmts, Some(trmc_rewrite_body(e, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope1, cons_ok)))
       }
     }
@@ -14010,8 +14011,8 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
       if cons_ok { match trmc_list_cons_modcons(els, me, arity) {
         Some(cargs) -> trmc_make_step_call(trmc_cons_cname(), cargs, 1, line, col,
                                            c_sym_str, params, pnames, uses, dm_table, skip_set)
-        None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed })
-      } } else { trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed }) }
+        None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
+      } } else { trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 }) }
     # A bare self-call beside a modulo-cons step is a loop step that leaves
     # the accumulator open, never a call whose result plugs the hole.
     ECall(f, xs) -> if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
@@ -14042,7 +14043,7 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
           }
           let dropmask = base_mask + site_mask
           let sentinel = trmc_make_step_sentinel(c_sym_str, h, cname, dropmask, pnames)
-          ECall(Expr { kind: EVar(sentinel), line: line, col: col, ty: f.ty, mode: f.mode }, xs)
+          ECall(Expr { kind: EVar(sentinel), line: line, col: col, ty: f.ty, mode: f.mode , site: 0 }, xs)
         }
         None -> match trmc_reuse_variant_ctor(f, xs, me, arity) {
           # A Perceus reuse rebuild of a modulo-cons ctor is that ctor's step:
@@ -14058,13 +14059,13 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
           match reuse {
             Some(cargs) -> trmc_make_step_call(trmc_cons_scr_cname(), cargs, 1, line, col,
                                                c_sym_str, params, pnames, uses, dm_table, skip_set)
-            None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed })
+            None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
           }
           }
         }
       }
     }
-    _ -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed })
+    _ -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
   }
 }
 
@@ -14090,7 +14091,7 @@ fn trmc_names_ctor(cf: Expr) : Bool = match cf.kind {
 fn trmc_slot_none(o: Option[Int]) : Bool = match o { Some(_) -> false  None -> true }
 
 fn trmc_wrap_apply(leaf: Expr) : ExprKind =
-  ECall(Expr { kind: EMark(MkTrmcApply), line: leaf.line, col: leaf.col, ty: leaf.ty, mode: leaf.mode },
+  ECall(Expr { kind: EMark(MkTrmcApply), line: leaf.line, col: leaf.col, ty: leaf.ty, mode: leaf.mode,  site: leaf.site },
         [leaf])
 
 fn trmc_rewrite_arms(arms: [Arm], me: SelfRef, arity: Int, c_sym_str: String,
@@ -14164,7 +14165,7 @@ fn tcrec_make_step_site(f: Expr, xs: [Expr], params: [Param], pnames: [String],
   let sentinel = tcrec_make_sentinel(c_sym_str, dropmask, pnames)
   ECall(
     Expr { kind: EVar(sentinel), line: f.line, col: f.col,
-           ty: f.ty, mode: f.mode },
+           ty: f.ty, mode: f.mode,  site: f.site },
     xs)
 }
 

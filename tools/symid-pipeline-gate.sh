@@ -413,6 +413,17 @@ out=$(find "$ROOT/examples/namespace-collisions" -name main.kai | grep -v /neg |
   '"$0" --edition "$1" --check-type-ids --path "$(dirname "$3")" --path "$2" "$3" 2>&1 >/dev/null | grep "^unstamped" | sed "s|^|$3: |"; exit 0' \
   "$ROOT/stage2/kaic2" "$(cat "$ROOT/EDITION")" "$ROOT/stdlib")
 [ -z "$out" ] || fail "a collision fixture's written types reach the late passes without their declarations' ids"
+# Every node the unwinder keys carries a site id no other node of its
+# declaration shares (`--check-site-ids`), on the declarations the backends
+# lower: over the compiler, every collision fixture and the effects corpus.
+out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --check-site-ids "$ROOT/stage2/main.kai" 2>&1 >/dev/null) \
+  || fail "the compiler's own unwind sites share a site id"
+out=$({ find "$ROOT/examples/namespace-collisions" -name main.kai | grep -v /neg
+        find "$ROOT/examples/effects" -maxdepth 1 -name '*.kai'; } \
+  | xargs -P 8 -n 1 sh -c \
+  '"$0" --edition "$1" --check-site-ids --path "$(dirname "$3")" --path "$2" "$3" 2>&1 >/dev/null | grep "^site id" | sed "s|^|$3: |"; exit 0' \
+  "$ROOT/stage2/kaic2" "$(cat "$ROOT/EDITION")" "$ROOT/stdlib")
+[ -z "$out" ] || fail "an unwind site shares its site id with another node of its declaration"
 STAMPFIX="$ROOT/examples/namespace-collisions/green_type_homonym"
 STAMPCACHE="$(mktemp -d)"
 trap 'rm -rf "$CACHE" "$TWIN" "$CUTCACHE" "$STAMPCACHE"' EXIT
