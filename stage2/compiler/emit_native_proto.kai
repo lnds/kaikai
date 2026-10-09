@@ -157,8 +157,8 @@ fn nproto_register_reusable_tags(ctx: Handle, tags: [Int]) : Unit / Console = ma
   }
 }
 
-# Emit a boxed adapter for each raw impl (skip boxed impls, unknown-head
-# rows, and rows outside this TU's adapter share). Done before the init hook
+# Emit an adapter for each impl that needs one (skip unknown-head rows and
+# rows outside this TU's adapter share). Done before the init hook
 # opens, so each adapter owns the builder while it is filled.
 fn nproto_emit_adapters(ctx: Handle, rows: [PimplRow], decls: [Decl],
                         adapters: NAdapters) : Unit / Console =
@@ -166,9 +166,9 @@ fn nproto_emit_adapters(ctx: Handle, rows: [PimplRow], decls: [Decl],
     [] -> ()
     [pr, ...rest] -> {
       match pr {
-        PR(csym, _, t, arity, sig, _, home) ->
-          if stdlib_head_tag_int(home, t, decls) >= 0 and pimpl_row_is_unboxed(pr) and nadapt_allows(adapters, csym) {
-            nproto_emit_boxed_adapter(ctx, csym, sig, arity)
+        PR(csym, _, t, arity, sig, _, home, lent) ->
+          if stdlib_head_tag_int(home, t, decls) >= 0 and pimpl_row_needs_adapter(pr) and nadapt_allows(adapters, csym) {
+            nproto_emit_boxed_adapter(ctx, csym, sig, arity, lent)
           } else { () }
       }
       nproto_emit_adapters(ctx, rest, decls, adapters)
@@ -209,14 +209,14 @@ fn nproto_register_variants(ctx: Handle, v2h: [Int]) : Unit / Console =
 
 # One `kaix_register_one_impl(i32 proto_id, i32 op_id, i32 head_tag, ptr fn)`
 # per pimpl row. Skips rows whose head tag is -1 (genuinely unknown type names
-# the runtime hashmap would never match). A RAW impl (`pimpl_row_is_unboxed`)
-# registers a boxed adapter; a boxed impl registers its bare `c_sym` (= the
-# dispatch ABI). The whole `pr` flows through so the adapter reads the mask.
+# the runtime hashmap would never match). An impl that needs an adapter
+# (`pimpl_row_needs_adapter`) registers it; any other registers its bare
+# `c_sym` (= the dispatch ABI).
 fn nproto_register_impls(ctx: Handle, rows: [PimplRow], decls: [Decl]) : Unit / Console =
   match rows {
     [] -> ()
     [pr, ...rest] -> match pr {
-      PR(_, p, t, arity, _, op, home) -> {
+      PR(_, p, t, arity, _, op, home, _) -> {
         let head_int = stdlib_head_tag_int(home, t, decls)
         if head_int < 0 { nproto_register_impls(ctx, rest, decls) }
         else {
@@ -227,12 +227,7 @@ fn nproto_register_impls(ctx: Handle, rows: [PimplRow], decls: [Decl]) : Unit / 
     }
   }
 
-# Register one impl. A raw impl gets a `_kaiu_<csym>__boxed(ptr × arity)`
-# adapter emitted on the spot (unbox masked args, call the raw fn, re-box a
-# raw return) and registers THAT; a boxed impl registers `csym` verbatim
-# (its native signature already IS `ptr (ptr × arity)`). The registered
-# fn-ptr is consumed inside the register call in the same statement it is
-# declared (handle discipline, asu "risk #1").
+# Register one impl, through its adapter when it needs one.
 fn nproto_register_one(ctx: Handle, proto_id: Int, op_id: Int, head_int: Int,
                        pr: PimplRow, arity: Int) : Unit / Console = {
   let p = native_ctx_ptrt(ctx)
@@ -245,34 +240,53 @@ fn nproto_register_one(ctx: Handle, proto_id: Int, op_id: Int, head_int: Int,
   ()
 }
 
-# The fn-ptr to register: the boxed adapter (already emitted in the up-front
-# pass, referenced by its `_kaiu_<csym>__boxed` symbol) for a raw impl, else
+# The fn-ptr to register: the adapter emitted in the up-front pass, else
 # the bare `csym` at its boxed dispatch shape.
 fn nproto_impl_fnptr(ctx: Handle, pr: PimplRow, arity: Int) : Handle / Console = match pr {
-  PR(csym, _, _, _, _, _, _) -> {
-    let sym = if pimpl_row_is_unboxed(pr) { user_boxed_adapter_sym(csym) } else { csym }
+  PR(csym, _, _, _, _, _, _, _) -> {
+    let sym = if pimpl_row_needs_adapter(pr) { user_boxed_adapter_sym(csym) } else { csym }
     llvm_get_or_declare_fn(native_ctx_m(ctx), sym, llvm_fn_type_boxed(native_ctx_ptrt(ctx), arity))
   }
 }
 
-# Emit `ptr _kaiu_<csym>__boxed(ptr × arity)`: unbox each scalar-param arg
-# (per the sig's param types), call the raw impl `csym` at its raw LLVM type,
-# re-box a raw return. The dispatch ABI the runtime casts to
-# (`KaiValue*(KaiValue*,...)`). Emitted in the up-front pass (no shared
-# builder state to save), so it just appends + fills its own entry block.
-fn nproto_emit_boxed_adapter(ctx: Handle, csym: String, sig: Option[UFnSig], arity: Int) : Unit / Console = match sig {
-  None -> ()
-  Some(US(pts, rt, mask)) -> {
-    let p = native_ctx_ptrt(ctx)
-    let adapter = llvm_add_function(native_ctx_m(ctx), user_boxed_adapter_sym(csym), llvm_fn_type_boxed(p, arity))
-    let entry = llvm_append_block(native_ctx_m(ctx), adapter, "entry")
-    llvm_position_at_end(native_ctx_b(ctx), entry)
-    let abuf = llvm_buf_new()
-    let ptb = llvm_buf_new()
-    nproto_adapter_args(ctx, adapter, pts, mask, 0, ptb, abuf)
-    let r = ncall_finish(ctx, csym, nproto_raw_ret_ty(ctx, rt), ptb, abuf)
-    llvm_build_ret(native_ctx_b(ctx), nproto_box_ret(ctx, r, rt))
-    ()
+# Emit `ptr _kaiu_<csym>__boxed(ptr × arity)`, the dispatch ABI the runtime
+# casts to: unbox each scalar-param arg, call `csym` at its LLVM type, re-box
+# a raw return, then drop the args the impl borrows (the table hands every
+# argument owned). Fills its own entry block; no builder state to save.
+fn nproto_emit_boxed_adapter(ctx: Handle, csym: String, sig: Option[UFnSig], arity: Int, lent: [Int]) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let adapter = llvm_add_function(native_ctx_m(ctx), user_boxed_adapter_sym(csym), llvm_fn_type_boxed(p, arity))
+  let entry = llvm_append_block(native_ctx_m(ctx), adapter, "entry")
+  llvm_position_at_end(native_ctx_b(ctx), entry)
+  let abuf = llvm_buf_new()
+  let ptb = llvm_buf_new()
+  let r = match sig {
+    Some(US(pts, rt, mask)) -> {
+      nproto_adapter_args(ctx, adapter, pts, mask, 0, ptb, abuf)
+      nproto_box_ret(ctx, ncall_finish(ctx, csym, nproto_raw_ret_ty(ctx, rt), ptb, abuf), rt)
+    }
+    None -> {
+      nproto_boxed_args(adapter, p, arity, 0, ptb, abuf)
+      ncall_finish(ctx, csym, p, ptb, abuf)
+    }
+  }
+  nproto_drop_lent(ctx, adapter, lent)
+  llvm_build_ret(native_ctx_b(ctx), r)
+  ()
+}
+
+fn nproto_boxed_args(adapter: Handle, p: Handle, arity: Int, i: Int, ptb: Handle, abuf: Handle) : Unit =
+  if i >= arity { () } else {
+    llvm_buf_push(ptb, p)
+    llvm_buf_push(abuf, llvm_get_param(adapter, i))
+    nproto_boxed_args(adapter, p, arity, i + 1, ptb, abuf)
+  }
+
+fn nproto_drop_lent(ctx: Handle, adapter: Handle, lent: [Int]) : Unit / Console = match lent {
+  [] -> ()
+  [i, ...rest] -> {
+    let _r = ncall_sig1(ctx, "kaix_decref", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), llvm_get_param(adapter, i))
+    nproto_drop_lent(ctx, adapter, rest)
   }
 }
 

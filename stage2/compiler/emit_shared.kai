@@ -2019,11 +2019,11 @@ pub fn ffi_kind_of_ty(t: TypeExpr) : FfiRetKind {
 # register a boxed shim (`&kai_<csym>__boxed`) in the impl table instead
 # of the raw pimpl; the raw pimpl stays reachable for the monomorphic
 # fast path. `None` means the impl already has the boxed
-# `KaiValue*(...)` shape (String / Unit / List / Option / Result) and is
-# registered directly. See `emit_impl_shim_defs` (fix-proto-eq-abi).
-#[doc("Row for one `__pimpl_*` entry: the C symbol name, the proto name, the kaikai type name (head), the impl fn's arity, and its unboxed signature (Some when scalar, None when boxed). Heterogeneous- mangled impls…")]
-pub type PimplRow = PR(String, String, String, Int, Option[UFnSig], String, Option[String])
-#                  c_sym    proto   type_name arity      unboxed sig   op_name impl home
+# `KaiValue*(...)` shape (String / Unit / List / Option / Result); it is
+# registered directly unless it borrows a param. See `emit_impl_shim_defs`.
+#[doc("Row for one `__pimpl_*` entry: the C symbol name, the proto name, the kaikai type name (head), the impl fn's arity, its unboxed signature (Some when scalar, None when boxed), op name, impl home, and the param positions Perceus made borrowed.")]
+pub type PimplRow = PR(String, String, String, Int, Option[UFnSig], String, Option[String], [Int])
+#                  c_sym    proto   type_name arity      unboxed sig   op_name impl home      lent
 
 #[doc("AST collector walking pimpl rows. `fns` is the EFn registry, used to recover each pimpl's unboxed signature (the unbox pass stamps it there).")]
 pub fn collect_pimpl_rows(ds: [Decl], fns: [EFn], acc: [PimplRow]) : [PimplRow] = pimpl_rows(ds, fnx_build(fns), acc)
@@ -2039,7 +2039,7 @@ fn pimpl_rows(ds: [Decl], fx: FnIndex, acc: [PimplRow]) : [PimplRow] {
               let csym = c_sym(name, mo)
               let arity = list_length(params)
               let sig = fnx_ufn_sig_first(fx, name, mo)
-              pimpl_rows(rest, fx, [pr_with_csym(pr, csym, arity, sig, mo), ...acc])
+              pimpl_rows(rest, fx, [pr_with_csym(pr, csym, arity, sig, mo, pimpl_lent(params, pimpl_raw_flags(sig), 0)), ...acc])
             }
             None -> pimpl_rows(rest, fx, acc)
           }
@@ -2052,15 +2052,46 @@ fn pimpl_rows(ds: [Decl], fx: FnIndex, acc: [PimplRow]) : [PimplRow] {
   }
 }
 
-#[doc("Attach the minted C symbol, unboxed signature and impl home to a decoded protocol-impl row.")]
-pub fn pr_with_csym(pr: PimplRow, csym: String, arity: Int, sig: Option[UFnSig], home: Option[String]) : PimplRow {
-  match pr { PR(_, p, t, _, _, op, _) -> PR(csym, p, t, arity, sig, op, home) }
+#[doc("Attach the minted C symbol, unboxed signature, impl home and borrowed positions to a decoded protocol-impl row.")]
+pub fn pr_with_csym(pr: PimplRow, csym: String, arity: Int, sig: Option[UFnSig], home: Option[String], lent: [Int]) : PimplRow {
+  match pr { PR(_, p, t, _, _, op, _, _) -> PR(csym, p, t, arity, sig, op, home, lent) }
 }
+
+# Only boxed params: a raw one reaches the impl unboxed and the adapter
+# already consumed its box.
+fn pimpl_lent(params: [Param], raw: [Bool], i: Int) : [Int] = match params {
+  [] -> []
+  [p, ...rest] -> {
+    let here = match raw {
+      [r, ..._] -> r
+      [] -> false
+    }
+    let more = match raw {
+      [_, ...rs] -> rs
+      [] -> []
+    }
+    let lent = pimpl_lent(rest, more, i + 1)
+    if p.pborrow and not here { [i, ...lent] } else { lent }
+  }
+}
+
+# Per-param raw flags; an unboxed signature with no mask is raw where scalar.
+fn pimpl_raw_flags(sig: Option[UFnSig]) : [Bool] = match sig {
+  Some(US(pts, _, [])) -> map(pts, (t) => ty_is_scalar(t))
+  Some(US(_, _, mask)) -> mask
+  None -> []
+}
+
+#[doc("The param positions the impl borrows; the dispatch table hands every argument owned, so its adapter drops these after the call.")]
+pub fn pimpl_row_lent(pr: PimplRow) : [Int] = match pr { PR(_, _, _, _, _, _, _, lent) -> lent }
+
+#[doc("True when the impl cannot sit in the dispatch table as is: its ABI is raw, or it borrows a param the table hands over owned.")]
+pub fn pimpl_row_needs_adapter(pr: PimplRow) : Bool = pimpl_row_is_unboxed(pr) or pimpl_row_lent(pr) != []
 
 #[doc("True when this pimpl row has an unboxed (raw-scalar) C signature and so needs a boxed shim before it can be registered in the impl table. A row is unboxed when the unbox pass classified it (`Some(US ...)`) AND it touches a raw scalar at the ABI boundary — either a scalar PARAM or a scalar RETURN. The return-only branch covers arity-0 impls like `Default` (`Default_Int_default() : Int` is emitted `i64 ()*` but the impl table bitcasts the slot to `%KaiValue* ()*` — clang's LLVM verifier rejects the mismatch; the C backend gets an implicit cast and only the LLVM smoke test catches it). issue fix-default-shim.")]
 pub fn pimpl_row_is_unboxed(pr: PimplRow) : Bool {
   match pr {
-    PR(_, _, _, _, sig, _, _) -> match sig {
+    PR(_, _, _, _, sig, _, _, _) -> match sig {
       None -> false
       Some(US(pts, rt, _)) -> any_param_scalar(pts) or ty_is_scalar(rt)
     }
@@ -2118,7 +2149,7 @@ pub fn parse_pimpl_name(name: String) : Option[PimplRow] {
           else {
             let tname = string_slice(rest1, 0, last)
             let op = string_slice(rest1, last + 1, m - last - 1)
-            Some(PR("", p, tname, 0, None, op, None))
+            Some(PR("", p, tname, 0, None, op, None, []))
           }
         }
       }
