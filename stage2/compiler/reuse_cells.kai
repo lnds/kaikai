@@ -1,0 +1,71 @@
+#[doc("""
+The inner cells a variant reuse arm deconstructs, shared by both backends.
+
+A nested sub-pattern with a payload names an inner cell, at any depth. A
+reuse arm settles each one once: unique, the children its rebuild takes
+move to their binders, every other boxed child is released and the shell
+is freed; shared, each taken binder gains a reference and the cell loses
+the donor's.
+""")]
+
+import compiler.ast
+import compiler.emit_shared
+
+#[doc("A boxed child of an inner cell, by slot: a binder, a slot no binder names, or a deeper cell.")]
+pub type CellKid = KidBind(Int, String) | KidDrop(Int) | KidCell(Int, ReuseCell)
+
+#[doc("An inner cell: its arity and its boxed children in slot order.")]
+pub type ReuseCell = ReuseCell(Int, [CellKid])
+
+#[doc("True when sub-pattern `sp` over a slot of kind `k` deconstructs an inner cell.")]
+pub fn reuse_is_cell(sp: Pattern, k: Int) : Bool = k == 0 and match sp.pkind {
+  PVariant(_, _, isubs) -> isubs != []
+  _                     -> false
+}
+
+#[doc("The slot kinds of the ctor a sub-pattern names, [] when it is not registered.")]
+pub fn reuse_ctor_kinds(hm: Option[String], vname: String, isubs: [Pattern], vs: [VariantEntry]) : [Int] =
+  match evar_slot_kinds_arity(vs, hm, vname, list_length(isubs)) { Some(ks) -> ks None -> [] }
+
+#[doc("The inner cells the slots `subs` (of kinds `ks`) deconstruct, each with its slot index.")]
+pub fn reuse_slot_cells(subs: [Pattern], ks: [Int], vs: [VariantEntry]) : [(Int, ReuseCell)] =
+  rc_slots(subs, ks, 0, vs)
+
+#[doc("The inner cells a reuse arm's pattern deconstructs below its donor.")]
+pub fn reuse_pattern_cells(p: Pattern, vs: [VariantEntry]) : [(Int, ReuseCell)] = match p.pkind {
+  PVariant(hm, cname, subs) -> rc_slots(subs, reuse_ctor_kinds(hm, cname, subs, vs), 0, vs)
+  _                         -> []
+}
+
+fn rc_slots(subs: [Pattern], ks: [Int], i: Int, vs: [VariantEntry]) : [(Int, ReuseCell)] = match subs {
+  []            -> []
+  [sp, ...rest] -> {
+    let tl = rc_slots(rest, ks, i + 1, vs)
+    match rc_cell(sp, kind_at(ks, i), vs) { Some(c) -> [(i, c), ...tl] None -> tl }
+  }
+}
+
+fn rc_cell(sp: Pattern, k: Int, vs: [VariantEntry]) : Option[ReuseCell] =
+  if not reuse_is_cell(sp, k) { None }
+  else { match sp.pkind {
+    PVariant(hm, vname, isubs) ->
+      Some(ReuseCell(list_length(isubs), rc_kids(isubs, reuse_ctor_kinds(hm, vname, isubs, vs), 0, vs)))
+    _ -> None
+  } }
+
+# Only boxed slots carry a reference to settle.
+fn rc_kids(isubs: [Pattern], ks: [Int], j: Int, vs: [VariantEntry]) : [CellKid] = match isubs {
+  []            -> []
+  [sp, ...rest] -> {
+    let k = kind_at(ks, j)
+    let tl = rc_kids(rest, ks, j + 1, vs)
+    if k != 0 { tl }
+    else { match rc_cell(sp, k, vs) {
+      Some(c) -> [KidCell(j, c), ...tl]
+      None    -> match sp.pkind {
+        PBind(nm) -> [KidBind(j, nm), ...tl]
+        _         -> [KidDrop(j), ...tl]
+      }
+    } }
+  }
+}

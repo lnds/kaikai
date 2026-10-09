@@ -15,6 +15,7 @@ import compiler.emit_shared
 import compiler.kir
 import compiler.kir_lower
 import compiler.kir_pat_alias
+import compiler.reuse_cells
 
 # Result of scanning the direct slots for the single nested sub-ctor.
 type RNFind = RNFound(Int, String, [Pattern]) | RNMulti | RNNone
@@ -38,6 +39,22 @@ pub fn pat_reuse_nested(p: Pattern, vs: [VariantEntry]) : ReuseNested = match p.
   PVariant(hm, cname, subs) -> rn_plan_variant(hm, cname, subs, vs)
   PList(elems, opt_rest)    -> rn_plan_cons(elems, opt_rest)
   _                         -> RNInone
+}
+
+#[doc("A reuse arm's slot plans: the rotation plan, and the direct slots and inner cells a flat rebuild settles.")]
+pub fn pat_reuse_plan(p: Pattern, vs: [VariantEntry]) : ReusePlan = {
+  let rot = pat_reuse_nested(p, vs)
+  let cells = reuse_pattern_cells(p, vs)
+  ReusePlan { rot: rot, flat: rn_plan_flat_directs(p, cells, rot, vs), cells: cells }
+}
+
+fn rn_plan_flat_directs(p: Pattern, cells: [(Int, ReuseCell)], rot: ReuseNested, vs: [VariantEntry]) : [RNSlot] = match p.pkind {
+  PVariant(hm, cname, subs) ->
+    match rn_slots(subs, pa_kinds_at(vs, hm, cname, list_length(subs)), 0, map(cells, (ic) => match ic { (i, _) -> i }), RNOk([])) {
+      RNOk(directs) -> directs
+      RNBail        -> []
+    }
+  _ -> rn_directs(rot)
 }
 
 # Nested list patterns inside a variant slot are a native lowering gap, so
@@ -70,8 +87,8 @@ fn rn_plan_variant(hm: Option[String], cname: String, subs: [Pattern], vs: [Vari
 fn rn_plan_rotation(subs: [Pattern], ks: [Int], nslot: Int,
                     iname: String, isubs: [Pattern], vs: [VariantEntry]) : ReuseNested = {
   let iks = pa_kinds_at(vs, None, iname, list_length(isubs))
-  match rn_slots(subs, ks, 0, nslot, RNOk([])) {
-    RNOk(directs) -> match rn_slots(isubs, iks, 0, 0 - 1, RNOk([])) {
+  match rn_slots(subs, ks, 0, [nslot], RNOk([])) {
+    RNOk(directs) -> match rn_slots(isubs, iks, 0, [], RNOk([])) {
       RNOk(grands) -> RNI(rn_arity(subs, ks), nslot,
                           rn_arity(isubs, iks), directs, grands)
       RNBail       -> RNInone
@@ -82,7 +99,7 @@ fn rn_plan_rotation(subs: [Pattern], ks: [Int], nslot: Int,
 
 # The recolor-wrap shape: flat pattern, outer overwrite only.
 fn rn_plan_flat(subs: [Pattern], ks: [Int]) : ReuseNested =
-  match rn_slots(subs, ks, 0, 0 - 1, RNOk([])) {
+  match rn_slots(subs, ks, 0, [], RNOk([])) {
     RNOk(directs) -> RNI(rn_arity(subs, ks), 0 - 1, 0, directs, [])
     RNBail        -> RNInone
   }
@@ -107,24 +124,24 @@ fn rn_find_nested(subs: [Pattern], i: Int) : RNFind = match subs {
   }
 }
 
-# Classify each slot into the RC plan. `skip` is the nested slot (consumed
-# by the token steal), -1 to classify every slot (the inner level). Int
+# Classify each slot into the RC plan, but for the `skips` slots (inner
+# cells, settled on their own). Int
 # slots are tagged immediates (no RC); a live binder plans `RNBind`, any
 # binderless heap-box slot plans `RNDrop` (disposal by projection — a
 # nullary-singleton or immediate drop is a runtime no-op).
-fn rn_slots(subs: [Pattern], ks: [Int], i: Int, skip: Int, acc: RNPlan) : RNPlan = match acc {
+fn rn_slots(subs: [Pattern], ks: [Int], i: Int, skips: [Int], acc: RNPlan) : RNPlan = match acc {
   RNBail      -> RNBail
   RNOk(sofar) -> match subs {
     []            -> RNOk(sofar)
     [sp, ...rest] -> {
       let k = kind_at(ks, i)
-      rn_slots(rest, ks, i + 1, skip, rn_slot_add(sp, k, i, skip, sofar))
+      rn_slots(rest, ks, i + 1, skips, rn_slot_add(sp, k, i, skips, sofar))
     }
   }
 }
 
-fn rn_slot_add(sp: Pattern, k: Int, i: Int, skip: Int, sofar: [RNSlot]) : RNPlan =
-  if i == skip or k == 1 { RNOk(sofar) }
+fn rn_slot_add(sp: Pattern, k: Int, i: Int, skips: [Int], sofar: [RNSlot]) : RNPlan =
+  if k == 1 or contains(skips, i) { RNOk(sofar) }
   else { match sp.pkind {
     PBind(nm) -> if rn_name_unused(nm) { RNOk([RNDrop(i), ...sofar]) }
                  else { RNOk([RNBind(i, nm), ...sofar]) }

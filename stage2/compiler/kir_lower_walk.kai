@@ -31,6 +31,7 @@ import compiler.kir_lower_pads
 import compiler.fn_index
 import compiler.kir_pat_alias
 import compiler.kir_lower_reuse
+import compiler.kir_reuse_cells
 import compiler.reuse_uses
 import compiler.kir_lower_raw
 import compiler.cell_promote
@@ -2487,8 +2488,8 @@ fn dup_variant_arm_binders(p: Pattern, body: Expr, owned: Bool, st: LowerSt) : L
 fn set_reuse_gc_for_arm(p: Pattern, body: Expr, st: LowerSt) : LowerSt =
   if arm_reuses(body, st) {
     ls_set_rnested(ls_set_reuse_gc(st, reuse_scrutinee_binders(p, st.vs)),
-                   pat_reuse_nested(p, st.vs))
-  } else { ls_set_rnested(ls_set_reuse_gc(st, []), RNInone) }
+                   pat_reuse_plan(p, st.vs))
+  } else { ls_set_rnested(ls_set_reuse_gc(st, []), reuse_plan_none()) }
 
 # The scrutinee pointer-binders the `KConReuse` shared path protects, by
 # pattern shape. A `PList` cons arm keeps its DIRECT slots (head + tail) — the
@@ -3246,7 +3247,7 @@ fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Exp
   let nested = reuse_kind_is_variant(rk) and reuse_has_nested_ctor(cargs)
   if nested and rh_held(st) { lower_reuse_nested_fresh(x, cn, cargs, st) }
   else if nested {
-    match st.rnested {
+    match st.rnested.rot {
       RNI(oarity, nslot, n_inner, directs, grands) ->
         # In-place overwrite requires the donor and rebuilt ctor to share an
         # arity; a mismatch keeps the fresh path (the shared branch would be
@@ -3258,18 +3259,12 @@ fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Exp
       RNInone -> lower_reuse_nested_fresh(x, cn, cargs, st)
     }
   } else if reuse_kind_is_variant(rk) {
-    # A nested slot plan reaching a FLAT rebuild: the pattern deconstructed
-    # an inner cell the rebuild does not re-embed, and the move overwrite
-    # pays no old slot — the inner shell and its children would leak on
-    # every unique donation. No settlement is emitted (a projection drop
-    # against a mid-move donor is the over-release shape); the arm keeps
-    # the fresh-alloc path, where the match-exit cascade pays donor +
-    # inner + originals. A missed reuse, not a leak.
-    match st.rnested {
-      RNI(_oar, nslot, _nin, _directs, _grands) ->
-        if nslot >= 0 { lower_reuse_nested_fresh(x, cn, cargs, st) }
-        else { lower_reuse_flat_fork(x, donor, cn, cargs, st) }
-      RNInone -> lower_reuse_flat_fork(x, donor, cn, cargs, st)
+    # A held scrutinee's exit would release the inner cells the flat fork
+    # settles; that arm keeps the fresh path.
+    match st.rnested.cells {
+      [] -> lower_reuse_flat_fork(x, donor, cn, cargs, st)
+      _  -> if rh_held(st) { lower_reuse_nested_fresh(x, cn, cargs, st) }
+            else { lower_reuse_flat_fork(x, donor, cn, cargs, st) }
     }
   } else {
     lower_reuse_dual(x, rk, donor, cn, cargs, st)
@@ -3297,8 +3292,12 @@ fn lower_reuse_flat_fork(x: Expr, donor: KVal, cn: String, cargs: [Expr], st: Lo
     let uses = reuse_taken_uses(cargs, st0.reuse_gc)
     let held = rh_held(st0)
     let st_gc = if held { emit_reuse_gc_increfs(donor, rh_repeats(uses), pos, rh_own(rh_take_slots(donor, list_uniq(uses), pos, st0), list_uniq(uses))) }
-                else { emit_reuse_gc_increfs(donor, uses, pos, st0) }
-    match lower_kinds_held(cargs, ctor_slot_kinds_in(hm, cn, st_gc), 0, held, RhHolds { regs: [], st: st_gc }, [], pos) { LResMany(avs, st1) -> {
+                else { emit_reuse_gc_increfs(donor, kc_uses_outside_cells(uses, plan.cells), pos, st0) }
+    # The inner cells settle before the args: an arg may consume a taken
+    # binder beneath one, and lend an untaken one.
+    match kc_cells_own(plan.cells, donor, uses, pos, st_gc) { CellOwn(st_own, cell_drops) ->
+    match lower_kinds_held(cargs, ctor_slot_kinds_in(hm, cn, st_own), 0, held, RhHolds { regs: [], st: st_own }, [], pos) { LResMany(avs, st_args) -> {
+      let st1 = kc_drop_regs(cell_drops, pos, st_args)
       let st_decl = ls_emit(st1, KLet(rjoin, SBoxed, KLitOp(KUnitV), pos))
       match bind_op(st_decl, KCall("kaix_check_unique", [donor]), pos) { LRes(uv, st_u) ->
         match three_labels(st_u) { LSL3(l_uniq, l_shared, l_join, st_l) -> {
@@ -3306,21 +3305,15 @@ fn lower_reuse_flat_fork(x: Expr, donor: KVal, cn: String, cargs: [Expr], st: Lo
           # The move overwrite pays no old slot; a donor child the rebuild
           # does not re-embed (wildcard / unused binder) still carries the
           # donor's claim and must be dropped by projection before the
-          # overwrite. Only the FLAT slot plan settles here — the rotation
-          # plan's slots are the nested dual's business.
-          let st_paid = match plan {
-            RNI(_oar, nslot, _nin, directs, _grands) ->
-              if nslot == 0 - 1 { rn_flat_unique_drops(directs, donor, uses, pos, st_fork) }
-              else { st_fork }
-            RNInone -> st_fork
-          }
+          # overwrite.
+          let st_paid = rn_flat_unique_drops(plan.flat, donor, uses, pos, st_fork)
           let st_ub = match bind_op(st_paid, KConReuse(RkVariantMove, donor, cn, ls_variant_tag_in(st_paid, hm, cn), typed_inits_in(avs, hm, cn, st_paid)), pos) { LRes(ru, st_u2) ->
             ls_seal(ls_emit(reuse_neutralise_exit_drop(st_u2, pos), KStore(rjoin, ru, pos)), KBr(l_join, pos), l_shared) }
           let st_sb = match bind_op(st_ub, KCon(cn, ls_variant_tag_in(st_ub, hm, cn), ls_ctor_mask_in(st_ub, hm, cn), typed_inits_in(avs, hm, cn, st_ub), st_ub.in_region), pos) { LRes(rs, st_s2) ->
             ls_seal(ls_emit(st_s2, KStore(rjoin, rs, pos)), KBr(l_join, pos), l_join) }
           LRes(KVar(rjoin), st_sb)
         } } }
-    } }
+    } } }
   } }
 
 # The fresh-alloc nested rebuild: fresh outer + one unconditional dup per
@@ -3531,7 +3524,7 @@ fn lower_reuse_dual(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Ex
         let st_fork = if held { rh_own(rh_take_slots(donor, taken, pos, st_fork0), taken) } else { st_fork0 }
         # UNIQUE: direct slots stay borrows (no dup); rebuild; reuse in place.
         let st_ub = match lower_kinds_held(cargs, ctor_slot_kinds_in(hm, cn, st_fork), 0, held, RhHolds { regs: [], st: st_fork }, [], pos) { LResMany(avs_u, st_u0) -> {
-          let st_u1 = rn_flat_unique_drops(rn_directs(st.rnested), donor, uses, pos, st_u0)
+          let st_u1 = rn_flat_unique_drops(st.rnested.flat, donor, uses, pos, st_u0)
           let tag_u = ls_variant_tag_in(st_u1, hm, cn)
           match bind_op(st_u1, KConReuse(rk, donor, cn, tag_u, typed_inits_in(avs_u, hm, cn, st_u1)), pos) { LRes(ru, st_u2) ->
             ls_seal(ls_emit(st_u2, KStore(rjoin, ru, pos)), KBr(l_join, pos), l_shared) } } }

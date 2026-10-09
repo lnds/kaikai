@@ -8611,7 +8611,7 @@ endif
 # A variant reuse arm whose pattern deconstructs inner cells at any depth, in
 # any number of slots, binds every binder beneath them and settles each cell
 # once. rc-leak-gate pins the ledger; the ASAN run catches an over-release.
-REUSE_NESTED_REBUILD = reuse_nested_rebuild reuse_nested_rebuild_deep
+REUSE_NESTED_REBUILD = reuse_nested_rebuild reuse_nested_rebuild_deep reuse_flat_rebuild_cells
 
 test-perceus-reuse-nested-rebuild: $(TARGET) build
 	@set -e; \
@@ -12765,7 +12765,7 @@ test-perceus-nested-reuse-asan-native: $(TARGET) bin-kai build
 	@mv ../stage0/runtime_llvm.bc ../stage0/runtime_llvm.bc.hidnr 2>/dev/null || true; \
 	mv ../stage0/runtime_inline.bc ../stage0/runtime_inline.bc.hidnr 2>/dev/null || true; \
 	st=0; \
-	for name in $(PERCEUS_NESTED_REUSE_FIXTURES); do \
+	for name in $(PERCEUS_NESTED_REUSE_FIXTURES) $(REUSE_NESTED_REBUILD); do \
 	  CFLAGS="-std=c99 -O1 -g -fsanitize=address -fno-omit-frame-pointer -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable" \
 	    KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/$$name-asan-n 2> build/$$name-asan-n.err \
 	    || { echo "perceus-nested-reuse-asan-native FAIL $$name (native ASAN build errored)"; cat build/$$name-asan-n.err; st=1; break; }; \
