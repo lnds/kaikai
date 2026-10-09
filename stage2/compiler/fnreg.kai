@@ -147,21 +147,20 @@ pub fn efn_sym(e: EFn) : FnId = match e { EFn(_, _, _, _, s) -> s }
 # Phase 3 unboxing (issue #383): classify a top-level DFn as
 # unboxed-signature candidate. Returns `Some(US(param_tys, ret_ty))`
 # when every param + return is in {Int, Bool, Char, Real} concretely
-# (post-Dim / Refinement strip), with no parametric type variables,
-# no declared effect row, and no FFI-shim body. Otherwise returns
-# None — the callee keeps the classical `KaiValue *` calling
-# convention.
+# (post-Dim / Refinement strip), with no parametric type variables
+# and no FFI-shim body. Otherwise returns None — the callee keeps the
+# classical `KaiValue *` calling convention.
+#
+# An effect row does not exclude a fn: its evidence frame rides as the
+# first arg beside the raw params, and a perform boxes its args and
+# unboxes its result at the op boundary.
 #
 # Excluded:
 #   - Still-generic functions (`tparams != []`): a parametric T is
 #     not a concrete C scalar. Monomorphic specs arrive here with
 #     `tparams = []` and a concreted signature, so they classify.
 #   - Extern shims (`body_is_extern`): the shim signature is fixed.
-#   - Functions with non-empty effect row (e.g. `Console`, `Mutable`,
-#     `State[T]`): op call sites + handler clauses pass `KaiValue *`,
-#     and the kaic1-emitted closure thunk shape relies on boxed
-#     args. v1 keeps these boxed; the call-site cost there is
-#     amortised by the handler-dispatch path itself.
+#   - Bodies that install a handler (`body_is_effectful_s`).
 #   - Functions with closure-typed or non-primitive params /
 #     returns: not in the classify set; stays boxed.
 
@@ -180,7 +179,6 @@ pub fn classify_unbox_sig(name: String, mo: Option[String], tparams: [String], p
   # `kair_<p>` param the shim then passes to a boxed fn-pointer slot
   # (`cc: undeclared identifier 'kai_<p>'`). Keep these fully boxed.
   else if body_is_proto_dispatch_local(body) { None }
-  else if not row_is_empty(row_of_expr(row)) { None }
   else if body_is_effectful_s(body, name, mo) { None }
   # Lambda eligibility bound: a fn whose body contains a lambda is
   # disqualified from param unboxing. The unbox pass seeds raw params
@@ -335,14 +333,10 @@ pub fn any_param_unboxable(ps: [Param]) : Bool = match ps {
   [p, ...rest] -> if ty_is_unboxable_t(param_ty(p)) { true } else { any_param_unboxable(rest) }
 }
 
-# Phase 3 unboxing — recognise body shapes that pull in handler
-# evidence even when the user did not declare an effect row. v1
-# is conservative: any `EHandle`, `var` desugar (SVar), or
-# `Eff.op(...)` call (EModCall to a known effect, or EVar to a
-# qualified op name) disqualifies the fn. This catches the
-# `fn run(b: Bool) : Int { var inner = 100; ... }` shape where
-# the row is empty syntactically but the body installs a
-# `State[Int]` handler at run time.
+# Body shapes that keep a fn's signature boxed: an `EHandle` or a `var`
+# desugar (SVar) installs a handler whose clauses capture the fn's
+# locals through a boxed env, and `!` or a `Mutable` intrinsic. A
+# plain perform does not: it reaches its handler through the frame.
 
 pub fn body_is_effectful(e: Expr) : Bool = body_is_effectful_s(e, "", None)
 
@@ -362,7 +356,7 @@ pub fn body_kind_is_effectful_s(k: ExprKind, self_nm: String, self_mo: Option[St
   match sym_read_kind(k) {
     EHandle(_, _, _, _, _, _, _, _) -> true
     EBang(_) -> true
-    EVar(nm) -> string_contains_dot(nm) or is_mutable_intrinsic_name(nm)
+    EVar(nm) -> is_mutable_intrinsic_name(nm)
     ECall(callee, args_) -> {
       if body_is_effectful_s(callee, self_nm, self_mo) { true }
       else { any_arg_effectful_s(args_, self_nm, self_mo) }
@@ -393,9 +387,6 @@ pub fn body_kind_is_effectful_s(k: ExprKind, self_nm: String, self_mo: Option[St
     # constructor, lowercase head = effect op — except a qualified call
     # to the fn ITSELF, which is a plain self-call. Sound because the
     # two name classes never overlap (ops lowercase, ctors uppercase).
-    EModCall(m, name) ->
-      if name == self_nm and fnreg_modcall_is_self(m, self_mo) { false }
-      else { not fnreg_name_first_is_upper(name) }
     _ -> false
   }
 }
