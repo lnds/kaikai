@@ -1,37 +1,20 @@
-/* Native self-host shim: linkable forwarders for the in-process libLLVM
- * C-API prims (issue #1021 LINK+RUN).
+/* Linkable forwarders for the in-process libLLVM prims the native compiler
+ * calls as `kaix_core_llvm_*` / `kaix_core_native_*`. Their bodies are
+ * runtime.h's `static kai_<name>`, which no other translation unit can name.
+ * Without -DKAI_LLVM they forward to runtime.h's unavailable stubs, so the
+ * compiler package links on any toolchain and only gains a native backend
+ * when this TU is built against libLLVM. Kept in lockstep with
+ * native_prims.kai's rcore_table.
  *
- * The native backend calls the builder / context / DI prims as
- * `kaix_core_llvm_*`, `kaix_core_native_ctx_*`,
- * `kaix_core_native_di_*` (emit_native_ops `ncall_sym`). Their bodies
- * live in `runtime.h` as `static kai_<name>` — a `static` cannot be named
- * across translation units, so a SEPARATELY-compiled native object (the
- * compiler built with `--backend=native`) cannot bind them. These
- * non-static thunks are that linkable name, mirroring the
- * `kaix_core_print` etc. forwarders in `runtime_llvm.c`.
- *
- * WHY A SEPARATE TU (not folded into runtime_llvm.c): the native compiler
- * object is bitcode-self-contained (runtime_llvm.bc is linked in-process),
- * so it already defines `main` + every other `kaix_*`. It lacks ONLY these
- * libLLVM prims, because `runtime_llvm.bc` is generated WITHOUT `-DKAI_LLVM`
- * (gen-runtime-bc.sh). Compiling all of `runtime_llvm.c` here would
- * duplicate `main` + the whole runtime; this TU carries the missing
- * libLLVM-prim symbols alone.
- *
- * Only meaningful under `-DKAI_LLVM` (the whole `runtime.h` LLVM block is
- * `#ifdef KAI_LLVM`); without it this file is empty. Kept in lockstep with
- * `native_prims.kai`'s `rcore_table` and `runtime.h`'s `kai_<name>`.
- *
- * Angle-bracket include, like runtime_llvm.c: `<runtime.h>` obeys the `-I`
- * search order (stage2 ahead of stage0), binding to the Koka runtime.
- *
- * The runtime owner it links beside is compiled without the LLVM block, so
- * this TU defines the block's shared state.
- */
+ * Always a separately-compiled TU: the runtime owner holds the shared state.
+ * The owner is compiled without the LLVM block, so this TU owns that block's
+ * state. */
+#ifndef KAI_SEPARATE_COMPILATION
+#define KAI_SEPARATE_COMPILATION 1
+#endif
 #define KAI_LLVM_STATE_OWNER 1
 #include <runtime.h>
 
-#ifdef KAI_LLVM
 KaiValue * kaix_core_llvm_add_byval_call(void *m, void *call, int64_t param_ix, void *sty) { return kai_llvm_add_byval_call(m, call, param_ix, sty); }
 KaiValue * kaix_core_llvm_add_byval_decl(void *m, void *fn, int64_t param_ix, void *sty) { return kai_llvm_add_byval_decl(m, fn, param_ix, sty); }
 KaiValue * kaix_core_llvm_add_case(void *sw, void *onval, void *bb) { return kai_llvm_add_case(sw, onval, bb); }
@@ -148,4 +131,3 @@ KaiValue * kaix_core_native_di_set_loc(void *cv, int64_t line, int64_t col) { re
 KaiValue * kaix_core_native_di_subprogram(void *cv, void *fnval, KaiValue *namev, int64_t line) { return kai_native_di_subprogram(cv, fnval, namev, line); }
 int64_t kaix_core_native_target_abi(void) { return kai_native_target_abi(); }
 KaiValue * kaix_core_llvm_backend_tag(void) { return kai_llvm_backend_tag(); }
-#endif /* KAI_LLVM */
