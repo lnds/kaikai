@@ -1399,6 +1399,77 @@ void kaix_unw_pop(KaiFiber *f) { kai_unw_pop(f); }
 KaiFiber *kaix_unw_push_f(KaiFiber **cache, KaiValue **base, int64_t n) { return kai_unw_push_c(cache, base, (intptr_t) n); }
 KaiFiber *kaix_unw_push_ev_state_f(KaiFiber **cache, void *ev) { return kai_unw_push_c(cache, (KaiValue **)((char *) ev + 16), 1); }
 
+/* ---------- op dispatch fast path ----------
+ * The leaf steps of a perform, inlined into the perform site. The rare
+ * paths reach a context switch, so they stay in the owner: delivering a
+ * pending cancel (`kaix_cancel_deliver`) and unwinding to the handle a
+ * clause abandoned (`kaix_op_discard`). A frame never changes fiber, so
+ * the fiber read once serves the whole perform. */
+void kaix_cancel_deliver(KaiFiber *f);
+__attribute__((noreturn)) void kaix_op_discard(KaiEvidence *node, KaiValue *op_r);
+
+KaiFiber *kaix_dispatch_fiber(void) { return kai_current_fiber(); }
+
+void kaix_cancel_poll(KaiFiber *f) {
+    if (__builtin_expect(atomic_load_explicit(&f->cancel_requested, memory_order_relaxed), 0))
+        kaix_cancel_deliver(f);
+}
+
+void *kaix_evidence_node_handler(void *node_v) {
+    KaiEvidence *node = (KaiEvidence *) node_v;
+    return node == NULL ? NULL : node->handler;
+}
+
+/* Marks `node` in dispatch across the clause call, so a perform of the
+ * same effect inside the clause resolves past it; returns the previous
+ * mark for `kaix_disp_leave`. */
+void *kaix_disp_enter(KaiFiber *f, void *node_v) {
+    KaiEvidence *prev = f->in_dispatch_node;
+    f->in_dispatch_node = (KaiEvidence *) node_v;
+    return (void *) prev;
+}
+
+void kaix_disp_leave(KaiFiber *f, void *prev_v) { f->in_dispatch_node = (KaiEvidence *) prev_v; }
+
+void kaix_cont_init_identity(KaiCont *k, KaiHandlerId hid) { kai_cont_init_identity(k, hid); }
+
+KaiValue *kaix_cont_resume(KaiCont *k, KaiValue *v) { return kai_cont_resume(k, v); }
+
+/* An Ev blob starts with `handler_id`, `env`, `state`, then one op fn-ptr
+ * per op in declaration order: op `i` is field `3 + i`. */
+void *kaix_ev_op_at(void *ev, int64_t idx) { return ((void **) ev)[idx]; }
+
+KaiHandlerId kaix_ev_handler_id(void *ev) { return ((KaiHandlerId *) ev)[0]; }
+
+/* The op's value when its clause resumed; otherwise the clause's value
+ * leaves through the handle it abandoned. */
+KaiValue *kaix_op_finish(void *node_v, void *k_v, KaiValue *op_r) {
+    KaiEvidence *node = (KaiEvidence *) node_v;
+    KaiCont *k = (KaiCont *) k_v;
+    if (__builtin_expect(node != NULL && k != NULL && k->status == KAI_CONT_UNRESUMED &&
+                         node->handle_jmp != NULL, 0))
+        kaix_op_discard(node, op_r);
+    return op_r;
+}
+
+/* m7c-d — clause-body helper for the 2-arg `resume(v, ns)` form.
+ * Every Ev<Eff> struct begins with `KaiHandlerId` (8 bytes) +
+ * `void *env` (8 bytes), so `state` lives at byte offset 16. */
+void kaix_clause_state_set(void *self, KaiValue *v) {
+    *((KaiValue **)((char *) self + 16)) = v;
+}
+
+/* Stateful-clause prologue helper (native walk, subset 2b): read the
+ * `state` slot of the clause's `self` (the dispatched Ev blob) so the
+ * body's free `state` / `log` registers resolve. Same byte-16 offset as
+ * `kaix_clause_state_set` — the layout's KaiHandlerId(8) + void*env(8)
+ * prefix is invariant across every Ev<Eff>. The native backend binds the
+ * result under `state` (and the legacy alias `log`) in the entry block,
+ * mirroring emit_c's `clause_state_prologue`. */
+KaiValue *kaix_clause_state_get(void *self) {
+    return *((KaiValue **)((char *) self + 16));
+}
+
 /* m7c-c / m7c-d — kaix_* wrappers around the static runtime
  * helpers in runtime.h. The LLVM IR can only see externally-
  * linkable symbols, so these thin shims expose every helper the
@@ -1427,7 +1498,13 @@ KaiEvidence *kaix_evidence_lookup_or_default(const char *eff_label, KaiEvidence 
     return kai_evidence_lookup_or_default(eff_label, def);
 }
 
-void kaix_check_cancel_yield_point(void) { kai_check_cancel_yield_point(); }
+void kaix_cancel_deliver(KaiFiber *f) { kai_cancel_deliver(f); }
+
+void kaix_op_discard(KaiEvidence *node, KaiValue *op_r) {
+    *node->discard_slot = op_r;
+    kai_evidence_unwind_to(node);
+    _longjmp(*node->handle_jmp, 1);
+}
 
 void kaix_evidence_pop(void) { kai_evidence_pop(); }
 
@@ -1440,17 +1517,6 @@ void *kaix_evidence_lookup_handler(const char *eff_label) {
     return node->handler;
 }
 
-/* m8 bug #12 follow-up — LLVM mirror of the C emit's per-fiber
- * `in_dispatch_node` save/restore around an op call. The C path
- * captures the node from `kai_evidence_lookup_node(...)` and
- * pokes `current_fiber->in_dispatch_node` directly across the
- * indirect call (stage2/compiler.kai's `emit_call_expr`); the
- * LLVM path only had `kaix_evidence_lookup_handler`, so a
- * self-delegating handler under `--emit=llvm` would re-resolve to
- * the same node and infinite-loop just like bug #12 in the C
- * backend. The pair below (`kaix_in_dispatch_enter` /
- * `kaix_in_dispatch_leave`) lets the LLVM emit set the flag and
- * restore it without exposing the KaiFiber struct in IR. */
 void *kaix_evidence_lookup_node(const char *eff_label) {
     return (void *) kai_evidence_lookup_node(eff_label);
 }
@@ -1476,33 +1542,6 @@ void *kaix_evidence_lookup_node_by_id(KaiHandlerId id) {
     return (void *) kai_evidence_lookup_node_by_id(id);
 }
 
-void *kaix_evidence_node_handler(void *node_v) {
-    KaiEvidence *node = (KaiEvidence *) node_v;
-    if (node == NULL) { return NULL; }
-    return node->handler;
-}
-
-void *kaix_in_dispatch_enter(void *node_v) {
-    KaiEvidence *node = (KaiEvidence *) node_v;
-    KaiFiber *fib = kai_current_fiber();
-    KaiEvidence *prev = fib->in_dispatch_node;
-    fib->in_dispatch_node = node;
-    return (void *) prev;
-}
-
-void kaix_in_dispatch_leave(void *prev_v) {
-    KaiFiber *fib = kai_current_fiber();
-    fib->in_dispatch_node = (KaiEvidence *) prev_v;
-}
-
-void kaix_cont_init_identity(KaiCont *k, KaiHandlerId hid) {
-    kai_cont_init_identity(k, hid);
-}
-
-KaiValue *kaix_cont_resume(KaiCont *k, KaiValue *v) {
-    return kai_cont_resume(k, v);
-}
-
 /* ---------- Ev<Eff> struct field access (KIR native walk) ----------
  *
  * Every Ev<Eff> begins with a THREE-field header — `KaiHandlerId handler_id`
@@ -1519,22 +1558,10 @@ KaiValue *kaix_cont_resume(KaiCont *k, KaiValue *v) {
  * layout bits stay on the C side). The op at KIR index `i` lives at field
  * `3 + i`; the `state` slot stays NULL for stateless handlers. */
 
-/* Read the op fn-ptr at field index `idx` of the `*Ev<Eff>` blob the
- * dispatch resolved (`handler` = the looked-up node's `->handler`). */
-void *kaix_ev_op_at(void *ev, int64_t idx) {
-    return ((void **) ev)[idx];
-}
-
 /* Write the op fn-ptr at field index `idx` of an Ev blob under
  * construction (the install side stamps each clause-thunk address). */
 void kaix_ev_set_op(void *ev, int64_t idx, void *fn) {
     ((void **) ev)[idx] = fn;
-}
-
-/* Read the `handler_id` (field 0, an i64) of an Ev blob — the dispatch
- * passes it to `kaix_cont_init_identity`. */
-KaiHandlerId kaix_ev_handler_id(void *ev) {
-    return ((KaiHandlerId *) ev)[0];
 }
 
 /* Write the `handler_id` (field 0) when constructing an Ev blob. */
@@ -1654,42 +1681,6 @@ void kaix_handle_discard_unwind(void *node_v, KaiValue *op_r) {
     _longjmp(*node->handle_jmp, 1);
 }
 
-/* Op-site finish, combining `kaix_op_discarded` + `kaix_handle_discard_unwind`
- * into ONE straight-line call (KIR native walk). The C-direct emit and the
- * LLVM-text backend split this into an `if (...) { unwind } op_r;` with a
- * fresh basic block; the native walk keeps each KIR block 1:1 with an LLVM
- * block, so folding the test + the no-return unwind here lets `KPerform`
- * stay a flat sequence of calls. On the resume path it simply returns
- * `op_r`; on the discard path it longjmps (does not return). */
-KaiValue *kaix_op_finish(void *node_v, void *k_v, KaiValue *op_r) {
-    KaiEvidence *node = (KaiEvidence *) node_v;
-    KaiCont *k = (KaiCont *) k_v;
-    if (node != NULL && k != NULL &&
-        k->status == KAI_CONT_UNRESUMED && node->handle_jmp != NULL) {
-        *node->discard_slot = op_r;
-        kai_evidence_unwind_to(node);
-        _longjmp(*node->handle_jmp, 1);
-    }
-    return op_r;
-}
-
-/* m7c-d — clause-body helper for the 2-arg `resume(v, ns)` form.
- * Every Ev<Eff> struct begins with `KaiHandlerId` (8 bytes) +
- * `void *env` (8 bytes), so `state` lives at byte offset 16. */
-void kaix_clause_state_set(void *self, KaiValue *v) {
-    *((KaiValue **)((char *) self + 16)) = v;
-}
-
-/* Stateful-clause prologue helper (native walk, subset 2b): read the
- * `state` slot of the clause's `self` (the dispatched Ev blob) so the
- * body's free `state` / `log` registers resolve. Same byte-16 offset as
- * `kaix_clause_state_set` — the layout's KaiHandlerId(8) + void*env(8)
- * prefix is invariant across every Ev<Eff>. The native backend binds the
- * result under `state` (and the legacy alias `log`) in the entry block,
- * mirroring emit_c's `clause_state_prologue`. */
-KaiValue *kaix_clause_state_get(void *self) {
-    return *((KaiValue **)((char *) self + 16));
-}
 
 /* ---------- clause-capture env (native walk, clause-capture ABI) ----------
  *

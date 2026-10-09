@@ -248,7 +248,7 @@ fn nfx_op_recv(op: String) : Option[String] = {
 # (the call site filled it with the right instance's node) — the C-direct
 # `__evf[slot]` mirror. Else the ordinary by-name walk for a lexically-handled
 # effect the frame does not carry.
-fn nemit_perform_node(ctx: Handle, cur_fn: String, eff: String, alias: Option[String]) : Handle / Console = {
+fn nemit_perform_node(ctx: Handle, fib: Handle, cur_fn: String, eff: String, alias: Option[String]) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
   match alias {
     Some(a) -> {
@@ -265,8 +265,8 @@ fn nemit_perform_node(ctx: Handle, cur_fn: String, eff: String, alias: Option[St
       let slot = native_ctx_frame_slot_index(ctx, cur_fn, eff)
       if slot >= 0 {
         # A slot read skips the walk, where the cooperative-cancel yield-point
-        # hook lives; fire it explicitly so a Cancel is delivered at this op.
-        let _y = ncall_sig0(ctx, "kaix_check_cancel_yield_point", native_ctx_voidt(ctx))
+        # hook lives; poll it here so a Cancel is delivered at this op.
+        let _y = ncall_sig1(ctx, "kaix_cancel_poll", native_ctx_voidt(ctx), p, fib)
         nemit_evf_load_slot(ctx, cur_fn, slot)
       }
       else { nemit_perform_walk_node(ctx, eff) }
@@ -344,12 +344,14 @@ pub fn nemit_perform(ctx: Handle, cur_fn: String, eff: String, esym: SymId, op: 
 fn nemit_perform_with(ctx: Handle, cur_fn: String, eff: String, op: String, alias: Option[String], recv: Option[String], cargs: [KVal], h: KHandlerDecl) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
   let field = nfx_op_field(h.op_thunks, op, 0)
+  # The fiber is read once: a frame never changes fiber.
+  let fib = ncall_sig0(ctx, "kaix_dispatch_fiber", p)
   # 1. node = the capability register for a `#<recv>` op (read it directly), a
   # by-id lookup for an aliased op, the enclosing fn's frame slot when carried,
   # else the innermost-by-effect-name lookup; handler = node_handler(node).
   let node = match recv {
     Some(r) -> nemit_load_reg(ctx, r)
-    None    -> nemit_perform_node(ctx, cur_fn, eff, alias)
+    None    -> nemit_perform_node(ctx, fib, cur_fn, eff, alias)
   }
   let handler = nemit_call1(ctx, "kaix_evidence_node_handler", node)
   # 2. cont = the reserved KaiCont alloca; init identity with handler_id.
@@ -360,11 +362,11 @@ fn nemit_perform_with(ctx: Handle, cur_fn: String, eff: String, op: String, alia
   let _ci = ncall_sig2(ctx, "kaix_cont_init_identity", native_ctx_voidt(ctx), p, native_ctx_i64t(ctx), cont, hid)
   # 3. evaluate args BEFORE the in_dispatch flag (they may invoke the op).
   let argbuf = nemit_perform_argbuf(ctx, handler, cargs, cont)
-  # 4. in_dispatch_enter(node) -> prev; load the op fn-ptr; indirect call.
-  let prev = nemit_call1(ctx, "kaix_in_dispatch_enter", node)
+  # 4. mark node in dispatch -> prev; load the op fn-ptr; indirect call.
+  let prev = ncall_sig2(ctx, "kaix_disp_enter", p, p, p, fib, node)
   let opfn = ncall_sig2(ctx, "kaix_ev_op_at", p, p, native_ctx_i64t(ctx), handler, llvm_const_int(native_ctx_i64t(ctx), field))
   let r = nemit_perform_indirect(ctx, opfn, argbuf, list_length(cargs))
-  let _il = ncall_sig1(ctx, "kaix_in_dispatch_leave", native_ctx_voidt(ctx), native_ctx_ptrt(ctx), prev)
+  let _il = ncall_sig2(ctx, "kaix_disp_leave", native_ctx_voidt(ctx), p, p, fib, prev)
   # 5. op_finish(node, cont, r): on a discard it longjmps (no return);
   # otherwise yields `r`. Folds the C-direct discard test + unwind so the
   # KIR block stays 1:1 with an LLVM block (no fresh op.cont/op.discard).

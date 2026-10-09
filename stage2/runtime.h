@@ -11819,15 +11819,11 @@ static KaiHandlerId kai_fresh_handler_id(void) {
     return atomic_fetch_add(&kai_next_handler_id, 1);
 }
 
-/* m7a #6d: continuation closure, stack-allocated at every op call
- * site (Doc C §*resume representation* one-shot path). `status` is
- * the one-shot check: the first call to `resume` flips it from
- * UNRESUMED to RESUMED, the second call aborts with a runtime
- * diagnostic. `fn` + `env` together name the rest of the
- * computation; m7a #6d ships only the identity continuation
- * (kai_cont_identity), so resume is effectively a tail return of
- * its argument. The full CPS reification (the rest of the caller's
- * body as a separately emitted function) is a later milestone. */
+/* The one-shot continuation an op call site passes its clause, on the
+ * call site's stack. The clause runs above the op site, so resuming is
+ * returning the value: `status` alone carries the one-shot check, and
+ * after the clause returns it tells the op site whether the clause
+ * resumed or abandoned. */
 typedef enum {
     KAI_CONT_UNRESUMED = 0,
     KAI_CONT_RESUMED   = 1
@@ -11836,38 +11832,26 @@ typedef enum {
 typedef struct KaiCont KaiCont;
 struct KaiCont {
     KaiContStatus  status;
-    void          *env;
-    KaiValue     *(*fn)(void *env, KaiValue *v);
     KaiHandlerId   handler_id;
 };
 
-/* Identity continuation: returns its argument unchanged. Until the
- * CPS transform reifies the rest of the caller's body, every op
- * call site uses this as the resume target — so the one-shot check
- * is observable but the continuation is functionally a no-op. */
-static KaiValue *kai_cont_identity(void *env, KaiValue *v) {
-    (void) env;
-    return v;
-}
-
-static void kai_cont_init_identity(KaiCont *k, KaiHandlerId hid) {
+static inline void kai_cont_init_identity(KaiCont *k, KaiHandlerId hid) {
     k->status     = KAI_CONT_UNRESUMED;
-    k->env        = NULL;
-    k->fn         = &kai_cont_identity;
     k->handler_id = hid;
 }
 
-/* Surface `resume(v)` lowers to this. The check + flip + tail call
- * all happen here; the clause body sees a single function call. */
-static KaiValue *kai_cont_resume(KaiCont *k, KaiValue *v) {
-    if (k->status != KAI_CONT_UNRESUMED) {
-        fprintf(stderr,
-            "kai: continuation resumed twice (handler #%llu)\n",
-            (unsigned long long) k->handler_id);
-        kai_exit(1);
-    }
+__attribute__((noinline, cold, noreturn)) static void kai_cont_resumed_twice(const KaiCont *k) {
+    fprintf(stderr,
+        "kai: continuation resumed twice (handler #%llu)\n",
+        (unsigned long long) k->handler_id);
+    kai_exit(1);
+}
+
+/* Surface `resume(v)` lowers to this. */
+static inline KaiValue *kai_cont_resume(KaiCont *k, KaiValue *v) {
+    if (__builtin_expect(k->status != KAI_CONT_UNRESUMED, 0)) kai_cont_resumed_twice(k);
     k->status = KAI_CONT_RESUMED;
-    return k->fn(k->env, v);
+    return v;
 }
 
 /* m12.8 Phase 4b: split Console into atomic Stdout (print) and
@@ -19681,8 +19665,7 @@ static int kai_cancel_dispatch_user_handler(void) {
  * outside trampoline scope) the check falls through and dispatch
  * proceeds normally; a later `Cancel.raise()` still reaches the default
  * handler. */
-static void kai_check_cancel_yield_point(void) {
-    KaiFiber *f = kai_current_fiber();
+static __attribute__((noinline)) void kai_cancel_deliver(KaiFiber *f) {
     if (!(f->cancel_requested && !f->cancel_delivered && f->cancel_pad_set)) {
         return;
     }
@@ -19703,6 +19686,14 @@ static void kai_check_cancel_yield_point(void) {
     kai_fiber_pad_jump(f, 0);
     /* Unreachable. */
 }
+
+/* A yield point on the fiber `f` the caller already holds. */
+static inline void kai_cancel_poll(KaiFiber *f) {
+    if (__builtin_expect(atomic_load_explicit(&f->cancel_requested, memory_order_relaxed), 0))
+        kai_cancel_deliver(f);
+}
+
+static void kai_check_cancel_yield_point(void) { kai_cancel_poll(kai_current_fiber()); }
 
 /* An evidence label names an effect instance: `Eff` or `Eff[args]`. Two
  * pinned instances match only when equal; a bare `Eff` (an instance the
