@@ -31,7 +31,7 @@ command -v "$LLVM_CONFIG" >/dev/null 2>&1 || {
   exit 1
 }
 
-SHIM_C="$ROOT/stage0/runtime_llvm_native_shim.c"
+SHIM_C="$ROOT/stage2/runtime_llvm_native_shim.c"
 [ -f "$SHIM_C" ] || { echo "native-selfhost-link: missing $SHIM_C" >&2; exit 1; }
 [ -f "$OBJ" ] || { echo "native-selfhost-link: missing object $OBJ" >&2; exit 1; }
 
