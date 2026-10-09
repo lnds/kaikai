@@ -10,6 +10,7 @@
 # The HM engine (`apply_ty`, `unify`, `instantiate`, `synth`,
 # `InferState`, `Subst`, `TyEnv`, `HoleKind`) is PRIVATE to this module.
 
+import compiler.core_shadow_diag
 import compiler.util
 import compiler.chars
 import compiler.diag
@@ -2965,10 +2966,10 @@ fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
   # so `ctor_needs_qualification` and `check_expr_against`'s ECall
   # path can route `Result.Ok(x)` and `Response.Ok(x)` to distinct
   # schemes without flipping the bare slot's protection.
-  let some_sc = scheme([0],    fn_ty([tv(0)], TyCon(None, "Option", [tv(0)], sym_none())))
-  let none_sc = scheme([0],    TyCon(None, "Option", [tv(0)], sym_none()))
-  let ok_sc   = scheme([0, 1], fn_ty([tv(0)], TyCon(None, "Result", [tv(0), tv(1)], sym_none())))
-  let err_sc  = scheme([0, 1], fn_ty([tv(1)], TyCon(None, "Result", [tv(0), tv(1)], sym_none())))
+  let some_sc = scheme([0],    fn_ty([tv(0)], TyCon(None, "Option", [tv(0)], core_ty_sym(CtOption))))
+  let none_sc = scheme([0],    TyCon(None, "Option", [tv(0)], core_ty_sym(CtOption)))
+  let ok_sc   = scheme([0, 1], fn_ty([tv(0)], TyCon(None, "Result", [tv(0), tv(1)], core_ty_sym(CtResult))))
+  let err_sc  = scheme([0, 1], fn_ty([tv(1)], TyCon(None, "Result", [tv(0), tv(1)], core_ty_sym(CtResult))))
   let es = [
     # Bare entries — the load-bearing keys that bare core code uses.
     TyEntry { name: "Some", scheme: some_sc },
@@ -6768,7 +6769,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
 # `TyCon(None,"List",[])`; `reapply` maps that head back to `TyListT`.
 #[doc("The nullary constructor witness a `Shape` variable binds to when applied against a saturated arity-1 type.")]
 pub fn shape_witness_of(t: Ty) : Option[Ty] = match t {
-  TyListT(_) -> Some(TyCon(None, "List", [], sym_none()))
+  TyListT(_) -> Some(TyCon(None, "List", [], core_ty_sym(CtList)))
   TyCon(m, n, targs, sid) -> match targs { [_one] -> Some(TyCon(m, n, [], sid)) _ -> None }
   _ -> None
 }
@@ -8290,7 +8291,7 @@ fn emit_union_aware_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console 
   # divergence is a leaf-vs-leaf union upcast that almost-but-didn't
   # land.
   match find_mismatched_tycons(expected, found) {
-    Some(pair) -> emit_union_focus_notes(env, pair.exp, pair.fnd)
+    Some(pair) -> if core_shadow_notes(env.ty_homes, pair.exp, pair.fnd) { () } else { emit_union_focus_notes(env, pair.exp, pair.fnd) }
     None       -> ()
   }
 }
@@ -8456,8 +8457,8 @@ fn emit_type_hint(expected: Ty, found: Ty) : Unit / Console {
       TyInt -> diag_help("convert with `int_to_char(n)`")
       _     -> ()
     }
-    TyCon(_, nm, _, _) -> {
-      if nm == "Option" {
+    TyCon(_, nm, _, tcs) -> {
+      if tycon_is(nm, tcs, CtOption) {
         diag_help("wrap the value with `Some(...)`, or use `None` if absent")
       } else { () }
     }
@@ -9836,8 +9837,8 @@ fn synth_bang(st: InferState, inner: Expr, line: Int, col: Int) : Inferred / Con
   let it_now = apply_ty(ri.st.sub, ri.ty)
   let inner_typed = with_ty(ri.expr, it_now)
   match it_now {
-    TyCon(_, name, args_, _) ->
-      if name == "Option" {
+    TyCon(_, name, args_, tcs) ->
+      if tycon_is(name, tcs, CtOption) {
         match args_ {
           [t] -> bang_finish_option(ri.st, inner_typed, t, line, col)
           _   -> bang_bad_operand(ri.st, it_now, inner_typed, line, col)
@@ -9866,8 +9867,8 @@ fn bang_finish_option(st: InferState, inner_typed: Expr, t: Ty,
     Some(rt) -> {
       let rt_now = apply_ty(st.sub, rt)
       match rt_now {
-        TyCon(_, rname, rargs, _) ->
-          if rname == "Option" {
+        TyCon(_, rname, rargs, tcs) ->
+          if tycon_is(rname, tcs, CtOption) {
             match rargs {
               [_] ->
                 mk_inferred(st, t, with_ty(mk_expr(EBang(inner_typed), line, col), t))
@@ -9894,8 +9895,8 @@ fn bang_finish_result(st: InferState, inner_typed: Expr, e_ty: Ty, t: Ty,
     Some(rt) -> {
       let rt_now = apply_ty(st.sub, rt)
       match rt_now {
-        TyCon(_, rname, rargs, _) ->
-          if rname == "Result" {
+        TyCon(_, rname, rargs, tcs) ->
+          if tycon_is(rname, tcs, CtResult) {
             match rargs {
               [_, ret_e_ty] -> {
                 # pass the enclosing function's
@@ -10918,8 +10919,8 @@ fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String,
 
 
   match obj_ty {
-    TyCon(_, name, _, _) ->
-      if name == "Ref" {
+    TyCon(_, name, _, tcs) ->
+      if tycon_is(name, tcs, CtRef) {
         let key_opt =
           if ident == "get" { Some("Mutable.ref_get") }
           else if ident == "set" { Some("Mutable.ref_set") }
@@ -11830,15 +11831,15 @@ fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Infe
   let coll_ty = apply_ty(probe.st.sub, probe.ty)
   let ph = ixc_ref(coll)
   match coll_ty {
-    TyCon(_, cname, _, _) ->
-      if cname == "Vec" { synth_vec_index(probe, coll_ty, ph, ix, line, col) }
+    TyCon(_, cname, _, tcs) ->
+      if tycon_is(cname, tcs, CtVec) { synth_vec_index(probe, coll_ty, ph, ix, line, col) }
       else { synth_on_coll(probe, coll_ty, ECall(index_getter(coll_ty, probe.st.env.ty_homes, line, col), [ph, ix]), line, col) }
     # A fixed-width vec (`Vec[T]<n>`) reads inline: a static literal index
     # is a bare struct field load with the bound proved at compile time
     # (no runtime check). A dynamic index is declined in v1.
     TyDimT(inner, _) -> match inner {
-      TyCon(_, cname, _, _) ->
-        if cname == "Vec" {
+      TyCon(_, cname, _, tcs) ->
+        if tycon_is(cname, tcs, CtVec) {
           if ty_is_fixed_vec(coll_ty) { synth_fixed_vec_index(probe.st, probe.expr, ix, coll_ty, line, col) }
           else {
             let bare = mk_expr(ECall(mk_ref("__detach_unit", line, col), [ph]), line, col)
@@ -16070,7 +16071,7 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
 # an if-chain over `vec_length` / `vec_get` / `vec_tail_from`.
 fn vec_match_route(scr_ty: Ty, arms: [Arm]) : Bool =
   match scr_ty {
-    TyCon(_, name, _, _) -> name == "Vec" and vec_match_has_list_arm(arms)
+    TyCon(_, name, _, tcs) -> tycon_is(name, tcs, CtVec) and vec_match_has_list_arm(arms)
     _                 -> false
   }
 
@@ -16323,14 +16324,14 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
       # literal builds a pre-sized vec instead of a cons list. A BARE
       # literal keeps denoting the cons list — only annotation /
       # argument context reaches here.
-      TyCon(_, hname, hargs, _) ->
-        if hname == "Vec" { check_vec_lit_against(st, els, hargs, e.line, e.col) }
+      TyCon(_, hname, hargs, tcs) ->
+        if tycon_is(hname, tcs, CtVec) { check_vec_lit_against(st, els, hargs, e.line, e.col) }
         else { synth(st, e) }
       # Fixed-width Vec context: `Vec[T]<k>` fixes the literal's
       # length by its habitant.
       TyDimT(inner, u) -> match inner {
-        TyCon(_, hname, hargs, _) ->
-          if hname == "Vec" { check_fixed_vec_lit(st, els, hargs, u, e.line, e.col) }
+        TyCon(_, hname, hargs, tcs) ->
+          if tycon_is(hname, tcs, CtVec) { check_fixed_vec_lit(st, els, hargs, u, e.line, e.col) }
           else { synth(st, e) }
         _ -> synth(st, e)
       }
@@ -16635,7 +16636,7 @@ fn ctor_needs_qualification(env: TyEnv, cname: String, parent: String) : Bool {
 # the kai_byte(...) lowering.
 fn ty_is_vec_head(t: Ty) : Bool =
   match t {
-    TyCon(_, name, _, _) -> name == "Vec"
+    TyCon(_, name, _, tcs) -> tycon_is(name, tcs, CtVec)
     _                 -> false
   }
 
@@ -16656,7 +16657,7 @@ fn check_vec_lit_against(st: InferState, els: [ListElem], hargs: [Ty],
   } else {
     let elem_exp = match hargs { [t] -> apply_ty(st.sub, t)  _ -> TyAny }
     let checked = check_vec_elems(st, els, elem_exp, line, col, [])
-    let vty = TyCon(None, "Vec", [apply_ty(checked.st.sub, elem_exp)], sym_none())
+    let vty = TyCon(None, "Vec", [apply_ty(checked.st.sub, elem_exp)], core_ty_sym(CtVec))
     mk_inferred(checked.st, vty, vec_lit_build(list_reverse(checked.elems), vty, line, col))
   }
 }
@@ -16941,7 +16942,7 @@ fn elem_synth_unify(st: InferState, ex: Expr, elem_ty: Ty,
 #[doc("True when a type is `Vec`-headed, seeing through any `Dim` brand — the fixed-width representation reads this to keep a `Vec<1>` distinct from the dynamic `Vec`.")]
 pub fn ty_vec_headed(t: Ty) : Bool = match t {
   TyDimT(inner, _) -> ty_vec_headed(inner)
-  TyCon(_, name, _, _) -> name == "Vec"
+  TyCon(_, name, _, tcs) -> tycon_is(name, tcs, CtVec)
   _ -> false
 }
 
