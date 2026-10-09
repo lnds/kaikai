@@ -14,6 +14,7 @@ import compiler.util
 import compiler.chars
 import compiler.diag
 import compiler.ast
+import compiler.type_stamp
 import compiler.core_refs
 import compiler.exhaust
 import compiler.effect_default
@@ -60,6 +61,7 @@ import compiler.fixed_vec_match
 import compiler.home_spell
 import compiler.infer_unit_alias
 import compiler.tycon_scheme_home
+import compiler.tycon_ref
 import compiler.scope_file
 import compiler.homonym
 import compiler.record_fields
@@ -6938,8 +6940,8 @@ fn advance_unit_fresh(st: InferState, n: Int) : InferState {
 # `rec_find_in_scope`.
 # The record a use names: the one its fixed home declares, else the name
 # lookups (a field probe picks among same-name records, `arity < 0` takes any).
-fn rec_pick(rs: [RecInfo], home: Option[String], target: String, arity: Int, probe: String) : Option[RecInfo] =
-  match rec_find_home(rs, target, home) {
+fn rec_pick(rs: [RecInfo], decl: SymId, target: String, arity: Int, probe: String) : Option[RecInfo] =
+  match rec_find_decl(rs, target, decl) {
     Some(r) -> Some(r)
     None    -> if probe != "" { rec_find_with_field(rs, target, arity, probe) }
                else if arity < 0 { rec_find(rs, target) }
@@ -6977,7 +6979,7 @@ fn rerank_recs_loop(rs: [RecInfo], hm: Option[String], root_mod: String,
     [] -> list_append(list_reverse(home),
             list_append(list_reverse(other_mods), list_reverse(root)))
     [r, ...rs2] -> match r {
-      RI(_, _, _, mo) -> {
+      RI(_, _, _, mo, _) -> {
         let is_root_rec = match mo {
           None     -> false
           Some(rm) -> rm == root_mod
@@ -8652,7 +8654,7 @@ fn rec_instantiate(st: InferState, ri: RecInfo) : RecInst {
     # `tuple.Pair` (mo = Some("tuple")) from a user `type Pair`
     # in the root (mo = None). Without this both literals
     # would emit TyCon(None, "Pair", _) and unify spuriously.
-    RI(nm, tps, fs, mo) -> {
+    RI(nm, tps, fs, mo, _) -> {
       let start = st.env.fresh
       let n = list_length(tps)
       let env2 = advance_fresh(st.env, n)
@@ -9102,7 +9104,7 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
                                           resolved_eff_tyargs, r_typed.ty)
       let hty = apply_ty(cs_typed.st.sub, r_typed.ty)
       let new_e = with_ty(
-        mk_expr(EHandle(rb.expr, eff_name, hsym, eff_tyargs, init_typed_st.init_opt,
+        mk_expr(EHandle(rb.expr, eff_name, hsym, stamp_tes(eff_tyargs, resolved_eff_tyargs, (te: TypeExpr) => st_annot_ty(st, te)), init_typed_st.init_opt,
                          alias_opt, cs_typed.clauses, r_typed.ret_opt),
                 e.line, e.col),
         hty)
@@ -10227,7 +10229,7 @@ fn try_record_type_call(st: InferState, callee: Expr, args_: [Expr],
       Some(_) -> None
       None -> match rec_find(st.recs, nm) {
         Some(r) -> match r {
-          RI(rnm, _, fs, _) -> {
+          RI(rnm, _, fs, _, _) -> {
             let perr = mk_diag(SevError, st.file, line, col,
               concat_all(["record type `", rnm, "` cannot be called with positional arguments"]), [])
             render_diag(perr)
@@ -10913,7 +10915,7 @@ fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String,
 # field-wins-on-ties precedence rule before attempting UFCS lookup.
 fn record_has_field(st: InferState, obj_ty: Ty, ident: String) : Bool {
   match obj_ty {
-    TyCon(slot, cname, cargs, _) -> match rec_pick(st.recs, slot, cname, list_length(cargs), ident) {
+    TyCon(_, cname, cargs, tsym) -> match rec_pick(st.recs, tsym, cname, list_length(cargs), ident) {
       None -> false
       Some(ri) -> {
         let inst = rec_instantiate(st, ri)
@@ -11550,7 +11552,7 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
   let r = synth(st, obj)
   let applied = apply_ty(r.st.sub, r.ty)
   match applied {
-    TyCon(slot, cname, cargs, _) -> match rec_pick(r.st.recs, slot, cname, list_length(cargs), fnm) {
+    TyCon(_, cname, cargs, tsym) -> match rec_pick(r.st.recs, tsym, cname, list_length(cargs), fnm) {
       None -> field_non_record_or_partial_app(r.st, r.expr, fnm, line, col)
       Some(ri) -> {
         let inst = rec_instantiate(r.st, ri)
@@ -11704,7 +11706,7 @@ fn decl_row_concrete_labels(row: RowExpr, hv: TyHomeView) : [Label] {
 fn drain_one_deferred_field(st: InferState, recv: Ty, fnm: String,
                              res_id: Int, line: Int, col: Int) : InferState / Console + File + Mutable {
   match recv {
-    TyCon(slot, cname, cargs, _) -> match rec_pick(st.recs, slot, cname, list_length(cargs), fnm) {
+    TyCon(_, cname, cargs, tsym) -> match rec_pick(st.recs, tsym, cname, list_length(cargs), fnm) {
       Some(ri) -> {
         let inst = rec_instantiate(st, ri)
         let st1 = st_unify(inst.st, inst.result_ty, recv, "deferred field access", line, col)
@@ -14545,7 +14547,7 @@ fn all_demands_local_in_list_elems(els: [ListElem], locals: [String],
   }
 }
 
-fn synth_record_lit(st: InferState, rh: Option[String], nm: String, fis: [FieldInit], line: Int, col: Int) : Inferred / Console + File + Mutable {
+fn synth_record_lit(st: InferState, rh: TyRef, nm: String, fis: [FieldInit], line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
   # disambiguate same-(name, arity) record collisions by
@@ -14563,7 +14565,7 @@ fn synth_record_lit(st: InferState, rh: Option[String], nm: String, fis: [FieldI
     [] -> ""
     [fi, ..._] -> match fi { FI(fnm, _) -> fnm }
   }
-  let lookup = rec_pick(st.recs, rh, nm, -1, probe_field)
+  let lookup = rec_pick(st.recs, tsh_ref_sym(st_home_view(st), rh, nm), nm, -1, probe_field)
   match lookup {
     None -> {
       let r = synth_field_inits(st, fis, [], line, col)
@@ -14705,7 +14707,7 @@ fn st_ty_defs(st: InferState) : (String) -> [TyDef] =
 
 fn rec_defs_named(rs: [RecInfo], name: String) : [TyDef] = match rs {
   [] -> []
-  [RI(n, tps, fs, _), ...rest] ->
+  [RI(n, tps, fs, _, _), ...rest] ->
     if n == name { [TyDef(tps, map(fs, (f) => match f { FD(_, _, te, _) -> te })), ...rec_defs_named(rest, name)] }
     else { rec_defs_named(rest, name) }
 }
@@ -15660,10 +15662,10 @@ fn pfield_list_probe(pfs: [PField]) : String = match pfs {
   [pf, ..._] -> match pf { PField(nm, _, _) -> nm }
 }
 
-fn check_variant_record_pattern(st: InferState, home: Option[String], cname: String, pfs: [PField], expected: Ty, line: Int, col: Int) : InferState / Console + File + Mutable {
+fn check_variant_record_pattern(st: InferState, home: TyRef, cname: String, pfs: [PField], expected: Ty, line: Int, col: Int) : InferState / Console + File + Mutable {
 
 
-  let lookup = rec_pick(st.recs, home, cname, -1, pfield_list_probe(pfs))
+  let lookup = rec_pick(st.recs, tsh_ref_sym(st_home_view(st), home, cname), cname, -1, pfield_list_probe(pfs))
   match lookup {
     None -> check_unknown_pfields(st, pfs)
     Some(ri) -> {
@@ -15680,8 +15682,8 @@ fn check_record_pattern(st: InferState, pfs: [PField], expected: Ty, line: Int, 
 
   let applied = apply_ty(st.sub, expected)
   match applied {
-    TyCon(slot, nm, nargs, _) -> {
-      let lookup = rec_pick(st.recs, slot, nm, list_length(nargs), pfield_list_probe(pfs))
+    TyCon(_, nm, nargs, tsym) -> {
+      let lookup = rec_pick(st.recs, tsym, nm, list_length(nargs), pfield_list_probe(pfs))
       match lookup {
         None -> check_unknown_pfields(st, pfs)
         Some(ri) -> {
@@ -18703,8 +18705,10 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
         _      -> row
       }
       let row_holes = extract_row_holes(d, rbinds, st2.sub, st2.row)
+      let stamp = (te: TypeExpr) => resolve_ty_with_binds(te, tpbinds, rbinds, env.row_kind, env_home_view(env, mo))
       TypedDecl {
-        decl: DFn(is_pub, nm, tparams, ps, opt_ret, final_row, final_body, line, col, mo, fsym),
+        decl: DFn(is_pub, nm, tparams, ps, opt_ret, stamp_row_with(final_row, stamp),
+                  final_body, line, col, mo, fsym),
         errs: st2.errs,
         insts: resolved,
         holes: hole_reports,
@@ -19068,10 +19072,10 @@ fn row_arg_names(t: Ty, eff: String, es: SymId) : Bool = match t {
 
 fn named_holds_cont(n: String, sums: [SumInfo], recs: [RecInfo], seen: [String]) : Bool =
   if list_has(seen, n) { false }
-  else { match ty_expr_find_handle(cont_name(), TypeExpr { tkind: TyName(None, n, []), line: 0, col: 0 }, sums, seen) {
+  else { match ty_expr_find_handle(cont_name(), TypeExpr { tkind: TyName(ty_ref_none(), n, []), line: 0, col: 0 }, sums, seen) {
     Some(_) -> true
     None -> any(recs, (r) => match r {
-      RI(rn, _, fs, _) -> rn == n and any(fs, (f) => match f {
+      RI(rn, _, fs, _, _) -> rn == n and any(fs, (f) => match f {
         FD(_, _, te, _) -> match ty_expr_find_handle(cont_name(), te, sums, [n, ...seen]) { Some(_) -> true  None -> false }
       })
     })

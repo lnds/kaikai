@@ -204,7 +204,8 @@ done
 
 fixtures="proto_rung_own_import_core derive_minted_ref_private_home generic_homonyms_spec_by_identity
 tail_call_to_core_homonym fused_groups_homonym_leads core_local_named_like_root_fn arity_skips_to_core_fn
-tuple_types_beside_root_homonyms tuple_sugar_beside_root_record_pair"
+tuple_types_beside_root_homonyms tuple_sugar_beside_root_record_pair
+tuple_sugar_beside_import_alias_tuple"
 for mode in ${*:-c native}; do
   case $mode in
     c)              env="KAI_BACKEND=c" ;;

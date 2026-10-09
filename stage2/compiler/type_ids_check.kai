@@ -1,0 +1,83 @@
+#[doc("""
+`--check-type-ids`: every written type name the passes after the typer
+read must carry the declaration it denotes.
+
+The typer stamps signatures, effect rows and handler instances with the
+identity it resolved (`type_stamp`). A written name that still carries no
+identity while a declaration of that name exists is a producer that forgot
+to stamp: downstream would decide by its spelling. A type parameter and a
+builtin type with no declaration are not reported.
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.effect_instance
+import compiler.util
+
+#[doc("Report each unstamped written name of a declared type; the exit status is the number found.")]
+pub fn check_type_ids(decls: [Decl]) : Int / Console = {
+  let declared = tic_declared(decls, [])
+  let found = tic_decls(decls, declared)
+  each(found, (m) => eprint(m))
+  list_length(found)
+}
+
+fn tic_declared(ds: [Decl], acc: [String]) : [String] = match ds {
+  [] -> acc
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> tic_declared([inner, ...rest], acc)
+    None -> match d {
+      DType(_, nm, _, body, _, _, _, _, _) -> match body {
+        TBAlias(_)       -> tic_declared(rest, acc)
+        TBEffectAlias(_) -> tic_declared(rest, acc)
+        _                -> tic_declared(rest, [nm, ...acc])
+      }
+      _ -> tic_declared(rest, acc)
+    }
+  }
+}
+
+fn tic_decls(ds: [Decl], declared: [String]) : [String] = match ds {
+  [] -> []
+  [d, ...rest] -> list_append(tic_decl(d, declared), tic_decls(rest, declared))
+}
+
+fn tic_decl(d: Decl, declared: [String]) : [String] = match d {
+  DFn(_, nm, _, _, _, row, body, _, _, _, _) -> {
+    let cx = TicCx { fname: nm, declared: declared, tparams: decl_tparams(d) }
+    list_append(tic_row(row, cx), tic_expr(body, cx))
+  }
+  _ -> []
+}
+
+type TicCx = { fname: String, declared: [String], tparams: [String] }
+
+fn tic_row(row: RowExpr, cx: TicCx) : [String] = match row {
+  REmpty       -> []
+  RClosed(ls)  -> flat_map(ls, (l) => tic_label(l, cx))
+  ROpen(_, ls) -> flat_map(ls, (l) => tic_label(l, cx))
+}
+
+fn tic_label(l: RowLabel, cx: TicCx) : [String] = match l {
+  RL(_, args, _) -> flat_map(args, (a) => tic_te(a, cx))
+}
+
+fn tic_te(te: TypeExpr, cx: TicCx) : [String] = match te.tkind {
+  TyName(r, n, args) -> list_append(tic_name(r, n, te, cx), flat_map(args, (a) => tic_te(a, cx)))
+  TyList(inner)      -> tic_te(inner, cx)
+  TyFn(ps, ret, row) -> list_append(flat_map(ps, (p) => tic_te(p, cx)), list_append(tic_te(ret, cx), tic_row(row, cx)))
+  TyDim(b, _)        -> tic_te(b, cx)
+  _                  -> []
+}
+
+fn tic_name(r: TyRef, n: String, te: TypeExpr, cx: TicCx) : [String] =
+  if sym_raw(ty_ref_sym(r)) >= 0 or not list_has(cx.declared, n) or list_has(cx.tparams, n) { [] }
+  else { [concat_all(["unstamped type ", n, " in ", cx.fname, " at line ", int_to_string(te.line)])] }
+
+fn tic_expr(e: Expr, cx: TicCx) : [String] = {
+  let own = match e.kind {
+    EHandle(_, _, _, tas, _, _, _, _) -> flat_map(tas, (a) => tic_te(a, cx))
+    _ -> []
+  }
+  list_append(own, flat_map(xp_positions(e), (p) => match p { XP(_, c) -> tic_expr(c, cx) }))
+}

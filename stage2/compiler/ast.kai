@@ -127,11 +127,45 @@ pub type RawArmBinder = RAB(String, Int, Int)
 #[derive(BinSerialize)]
 pub type SymId = SymId(Int)
 
+#[doc("What a written type or record name refers to: the qualifier text the source wrote, if any, and the declaration it resolves to (`sym_none()` until the typer stamps it).")]
+#[derive(BinSerialize)]
+pub type TyRef = TyRef(Option[String], SymId)
+
 #[doc("The integer behind a `SymId`. Only the symbol table indexes with it.")]
 pub fn sym_raw(s: SymId) : Int = match s { SymId(i) -> i }
 
 #[doc("The id a symbol owned by nothing reports: a module owns no symbol, so its owner slot points at itself being unowned.")]
 pub fn sym_none() : SymId = SymId(0 - 1)
+
+# The class word fences the length-prefixed home from the name: no
+# class word holds a ':', so no two keys spell alike. Folding the sign
+# keeps ids non-negative, so a negative raw value means "none" or "local".
+#[doc("The id the symbol table gives the declaration of `name` homed at `home`, whose class reads as `word`.")]
+pub fn sym_derive_word(word: String, name: String, home: String) : SymId {
+  let h = string_hash(string_concat(string_concat(string_concat(int_to_string(string_length(home)), ":"), string_concat(home, word)), string_concat(":", name)))
+  SymId(if h >= 0 { h } else { 0 - (h + 1) })
+}
+
+#[doc("A written name the source left unqualified and nothing has resolved yet.")]
+pub fn ty_ref_none() : TyRef = TyRef(None, sym_none())
+
+#[doc("A written name the source qualified with `q`, not resolved yet.")]
+pub fn ty_ref_qualified(q: String) : TyRef = TyRef(Some(q), sym_none())
+
+#[doc("A name already known to denote the declaration `s`.")]
+pub fn ty_ref_decl(s: SymId) : TyRef = TyRef(None, s)
+
+#[doc("The qualifier text a reference was written with.")]
+pub fn ty_ref_qual(r: TyRef) : Option[String] = match r { TyRef(q, _) -> q }
+
+#[doc("The declaration a reference resolves to, `sym_none()` while unresolved.")]
+pub fn ty_ref_sym(r: TyRef) : SymId = match r { TyRef(_, s) -> s }
+
+#[doc("True when the reference is already resolved or carries the qualifier it was written with.")]
+pub fn ty_ref_written(r: TyRef) : Bool = match r { TyRef(Some(_), _) -> true  TyRef(None, s) -> sym_raw(s) >= 0 }
+
+#[doc("`r` resolved to the declaration `s`, keeping the text it was written with.")]
+pub fn ty_ref_stamp(r: TyRef, s: SymId) : TyRef = match r { TyRef(q, _) -> TyRef(q, s) }
 
 #[doc("True when `s` names a local binder: local ids count down from `-2`, below `sym_none()`, and never index the symbol table.")]
 pub fn sym_is_local(s: SymId) : Bool = sym_raw(s) < 0 - 1
@@ -231,7 +265,7 @@ pub type ExprKind
   | EIf(Expr, Expr, Option[Expr])
   | EMatch(Expr, [Arm])
   | ELambda([Param], Expr)
-  | ERecordLit(Option[String], String, [FieldInit])
+  | ERecordLit(TyRef, String, [FieldInit])
   | EList([ListElem])
   | ERange(Expr, Expr, Option[Expr])
   | EBlock([Stmt], Option[Expr])
@@ -663,7 +697,7 @@ pub type PatKind
   # written bare. Kept through every pass so a written qualifier is
   # never dissolved before it can be validated.
   | PVariant(Option[String], String, [Pattern])
-  | PVariantRecord(Option[String], String, [PField])
+  | PVariantRecord(TyRef, String, [PField])
   | PRecord([PField])
   | PHole(Option[String])                   # `?` or `?name` in pattern position
   # m7d §14: `name @ pattern` — bind the whole scrutinee to `name`
@@ -694,7 +728,7 @@ pub type TypeExpr = { tkind: TyKind, line: Int, col: Int }
 
 #[derive(BinSerialize)]
 pub type TyKind
-  = TyName(Option[String], String, [TypeExpr])              # Name or Name[T1, T2, ...]
+  = TyName(TyRef, String, [TypeExpr])              # Name or Name[T1, T2, ...]
   | TyList(TypeExpr)
   | TyFn([TypeExpr], TypeExpr, RowExpr)
   # m12.5: dimensioned numeric type, e.g. `Real<USD>` or `Int<m/sec>`.
@@ -1387,9 +1421,9 @@ pub fn is_pos_field_marker(s: String) : Bool {
 # arity-only rec_find_arity wrapper stay in main.kai.
 # ====================================================================
 
-#[doc("Record-table entry: type name, type params, field decls, module origin. Built by collect_records, consumed by the positional-record desugar (compiler.desugar) and the typer; an AST-adjacent shared type.")]
+#[doc("Record-table entry: type name, type params, field decls, module origin, declaration id. Built by collect_records, consumed by the positional-record desugar (compiler.desugar) and the typer; an AST-adjacent shared type.")]
 #[derive(BinSerialize)]
-pub type RecInfo = RI(String, [String], [FieldDecl], Option[String])
+pub type RecInfo = RI(String, [String], [FieldDecl], Option[String], SymId)
 
 # Issue #648 — arity-aware record lookup. Two layers, mirroring the
 # variant-side `variants_of_type_loop_arity` (issue #643):
@@ -1421,7 +1455,7 @@ pub fn rec_find_arity_loop(rs: [RecInfo], target: String, arity: Int,
   match rs {
     [] -> fallback
     [r, ...rest] -> match r {
-      RI(nm, tps, _, _) ->
+      RI(nm, tps, _, _, _) ->
         if nm == target {
           if arity < 0 {
             Some(r)
@@ -1447,19 +1481,14 @@ pub fn rec_find_loop(rs: [RecInfo], target: String) : Option[RecInfo] =
 #[doc("Bare-name record lookup (no arity discrimination); newest-first so a later same-name record shadows an earlier one.")]
 pub fn rec_find(rs: [RecInfo], target: String) : Option[RecInfo] = rec_find_loop(rs, target)
 
-fn rec_same_home(a: Option[String], b: Option[String]) : Bool = match a {
-  Some(x) -> match b { Some(y) -> x == y  None -> false }
-  None    -> false
-}
+#[doc("The record `target` whose declaration is `s`; `None` when `s` is unresolved, leaving the choice to the name lookups.")]
+pub fn rec_find_decl(rs: [RecInfo], target: String, s: SymId) : Option[RecInfo] =
+  if sym_raw(s) < 0 { None } else { rec_find_decl_loop(rs, target, sym_raw(s)) }
 
-#[doc("The record `target` that the module `home` declares, when the source fixed the home; `None` leaves the choice to the name lookups.")]
-pub fn rec_find_home(rs: [RecInfo], target: String, home: Option[String]) : Option[RecInfo] = match home {
-  None    -> None
-  Some(_) -> match rs {
-    [] -> None
-    [r, ...rest] -> match r {
-      RI(nm, _, _, mo) -> if nm == target and rec_same_home(mo, home) { Some(r) } else { rec_find_home(rest, target, home) }
-    }
+fn rec_find_decl_loop(rs: [RecInfo], target: String, id: Int) : Option[RecInfo] = match rs {
+  [] -> None
+  [r, ...rest] -> match r {
+    RI(nm, _, _, _, ds) -> if sym_raw(ds) == id and nm == target { Some(r) } else { rec_find_decl_loop(rest, target, id) }
   }
 }
 
@@ -1487,7 +1516,7 @@ pub fn rec_find_with_field_loop(rs: [RecInfo], target: String, arity: Int,
       None    -> by_arity
     }
     [r, ...rest] -> match r {
-      RI(nm, tps, fs, _) ->
+      RI(nm, tps, fs, _, _) ->
         if nm == target {
           let arity_ok = arity < 0 or list_length(tps) == arity
           if arity_ok {
@@ -1565,7 +1594,7 @@ pub fn rec_field_index(rs: [RecInfo], target: String, arity: Int,
   match rec_find_with_field(rs, target, arity, field) {
     None     -> None
     Some(ri) -> match ri {
-      RI(_, _, fs, _) -> match field_decl_index(fs, field) {
+      RI(_, _, fs, _, _) -> match field_decl_index(fs, field) {
         -1 -> None
         n  -> Some(n)
       }
@@ -1613,8 +1642,8 @@ pub fn collect_records_loop(ds: [Decl], acc: [RecInfo]) : [RecInfo] {
     [d, ...rest] -> match decl_transparent_inner(d) {
       Some(inner) -> collect_records_loop([inner, ...rest], acc)
       None -> match d {
-        DType(_, nm, tps, body, _, _, mo, _, _) -> match body {
-          TBRecord(fs) -> collect_records_loop(rest, [RI(nm, tps, fs, mo), ...acc])
+        DType(_, nm, tps, body, _, _, mo, _, dsym) -> match body {
+          TBRecord(fs) -> collect_records_loop(rest, [RI(nm, tps, fs, mo, dsym), ...acc])
           _ -> collect_records_loop(rest, acc)
         }
         _ -> collect_records_loop(rest, acc)
