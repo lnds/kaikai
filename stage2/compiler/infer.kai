@@ -66,6 +66,7 @@ import compiler.tycon_ref
 import compiler.scope_file
 import compiler.homonym
 import compiler.record_fields
+import compiler.field_privacy
 import compiler.effect_alias
 
 # ====================================================================
@@ -508,15 +509,6 @@ fn inf_map_stmt_exprs(s: Stmt, f: (Expr) -> Expr) : Stmt {
 }
 
 
-fn inf_mo_eq(a: Option[String], b: Option[String]) : Bool {
-  match a {
-    None -> match b { None -> true _ -> false }
-    Some(x) -> match b {
-      Some(y) -> x == y
-      None    -> false
-    }
-  }
-}
 
 
 fn inf_ops_to_eff_pairs(eff_name: String, ops: [EffectOp]) : [OpToEff] {
@@ -1216,8 +1208,8 @@ pub type HandleFrame = HF(String, SymId, [String], [String], Int, Int)
 # source file — so a single-list lookup misses the DEffect and the
 # walker exits silently on every cross-pass op call.
 
-#[doc("infer: `FieldDeclWithHome` — typer/effect support type.")]
-pub type FieldDeclWithHome = FDH(FieldDecl, Option[String])
+#[doc("infer: a record field's declaration, the module declaring its record, and the record's identity.")]
+pub type FieldDeclWithHome = FDH(FieldDecl, Option[String], SymId)
 
 
 #[doc("infer: `Use` — typer/effect support type.")]
@@ -1451,20 +1443,12 @@ fn check_default_coverage_loop(df: DiagFiles, all_decls: [Decl],
   }
 }
 
-# Field-privacy walker (priv-fields lane). For every `EField(obj, fname)`
-# and every `ERecordLit { fname: val, ... }` in this module's typed
-# bodies, when `obj.ty` is `TyCon(Some(decl_mod), rec_name, _)` and
-# `decl_mod` is some other module, look up the field in `all_decls`
-# and reject the read/write when the field is `priv`. Records declared
-# in the same module pass freely (their internal fns are the
-# expected consumers).
-#
-# Runs post-typing so `Expr.ty` is the resolved record type, not a
-# free type variable. Mirrors `check_default_coverage`'s pre-conditions
-# (post-typing, has `tp.decls` for iteration, has `all_decls_for_typer`
-# for lookup of the declaring module's record shape).
+# Field-privacy walker: every `.f` read and record literal in this
+# module's typed bodies, judged by `field_hidden` once `Expr.ty` is the
+# resolved record type. Record patterns are judged where the typer
+# resolves their fields (`check_pfield_list`).
 
-fn check_field_privacy(df: DiagFiles, home: Option[String],
+fn check_field_privacy(df: DiagFiles, home: TyHomeView,
                         mod_decls: [Decl], recs: FieldRecs)
                         : [Diagnostic] / Console + File {
   list_reverse(check_field_privacy_loop(df, home, recs, mod_decls, []))
@@ -1488,7 +1472,7 @@ fn field_recs(rev_decls: [Decl], ix: FieldRecs) : FieldRecs = match rev_decls {
 }
 
 
-fn check_field_privacy_loop(df: DiagFiles, home: Option[String],
+fn check_field_privacy_loop(df: DiagFiles, home: TyHomeView,
                               all_decls: FieldRecs, ds: [Decl],
                               acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match ds {
@@ -1513,7 +1497,7 @@ fn field_in_recs(rs: [FieldRec], rec_name: String, rec_sym: SymId, fname: String
   [FRec(tn, fields, decl_mo, dsym), ...rest] ->
     if tn == rec_name and sym_compat(dsym, rec_sym) {
       match find_field_in_decls(fields, fname) {
-        Some(fd) -> Some(FDH(fd, decl_mo))
+        Some(fd) -> Some(FDH(fd, decl_mo, dsym))
         None     -> field_in_recs(rest, rec_name, rec_sym, fname)
       }
     } else { field_in_recs(rest, rec_name, rec_sym, fname) }
@@ -1548,53 +1532,27 @@ fn record_carrier_t(t: Ty) : Option[Pair[SymId, String]] = match t {
 }
 
 
-fn walk_field_priv_expr(file: String, home: Option[String],
+fn walk_field_priv_expr(file: String, home: TyHomeView,
                           all_decls: FieldRecs, e: Expr,
                           acc: [Diagnostic]) : [Diagnostic] / Console + File {
   let head_errs = match e.kind {
-    # Cross-module read of a `priv` field. The record's declared
-    # home is in `obj.ty`'s TyCon module_origin; the access site's
-    # home is the walker-level `home` parameter (None = root file).
     EField(obj, fname) -> match record_carrier_of(obj.ty) {
       None         -> []
-      Some(carrier) -> {
-        let rec_name = carrier.snd
-        match lookup_record_field(all_decls, rec_name, carrier.fst, fname) {
-          None -> []
-          Some(fdh) -> match fdh { FDH(fd, decl_mo) ->
-            if inf_mo_eq(decl_mo, home) { [] }
-            else { match fd {
-              FD(true, _, _, _)  -> []
-              FD(false, _, _, _) -> {
-                let owner = match decl_mo {
-                  Some(m) -> m
-                  None    -> "<root>"
-                }
-                let d = mk_diag(SevError, file, e.line, e.col,
-                  concat_all(["field `", fname,
-                              "` of `", rec_name,
-                              "` is private to module `", owner, "`"]),
-                  [ri_help(file, e.line, e.col, concat_all(["the field is declared `priv` in module `",
-                                      owner, "`; only fns inside that module can read it"]))])
-                render_diag(d)
-                [d]
-              }
-            } }
-          }
-        }
+      Some(carrier) -> match lookup_record_field(all_decls, carrier.snd, carrier.fst, fname) {
+        None -> []
+        Some(FDH(fd, decl_mo, dsym)) ->
+          if field_hidden(home, carrier.snd, dsym, fd) {
+            let d = priv_read_diag(file, e.line, e.col, fname, carrier.snd, decl_mo)
+            render_diag(d)
+            [d]
+          } else { [] }
       }
     }
-    # Cross-module construction touching a `priv` field. RecordLit
-    # carries the carrier in its ty (set by `synth_record_lit`).
-    # Any field init mentioning a priv field of another module is
-    # an error — the constructor escapes the encapsulation boundary.
     ERecordLit(_, _, fis) -> match record_carrier_of(e.ty) {
       None         -> []
-      Some(carrier) -> {
-        let rec_name = carrier.snd
-        walk_priv_field_inits(file, home, all_decls, rec_name, carrier.fst,
+      Some(carrier) ->
+        walk_priv_field_inits(file, home, all_decls, carrier.snd, carrier.fst,
                                 fis, e.line, e.col, [])
-      }
     }
     _ -> []
   }
@@ -1602,46 +1560,30 @@ fn walk_field_priv_expr(file: String, home: Option[String],
 }
 
 
-fn walk_priv_field_inits(file: String, home: Option[String],
+fn walk_priv_field_inits(file: String, home: TyHomeView,
                            all_decls: FieldRecs, rec_name: String, rec_sym: SymId,
                            fis: [FieldInit], line: Int, col: Int,
                            acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match fis {
     []           -> acc
-    [fi, ...rest] -> match fi {
-      FI(fname, _) -> {
-        let n = match lookup_record_field(all_decls, rec_name, rec_sym, fname) {
-          None -> []
-          Some(fdh) -> match fdh { FDH(fd, decl_mo) ->
-            if inf_mo_eq(decl_mo, home) { [] }
-            else { match fd {
-              FD(true, _, _, _)  -> []
-              FD(false, _, _, _) -> {
-                let owner = match decl_mo {
-                  Some(m) -> m
-                  None    -> "<root>"
-                }
-                let d = mk_diag(SevError, file, line, col,
-                  concat_all(["cannot construct `", rec_name,
-                              "` from outside module `", owner,
-                              "`: field `", fname, "` is private"]),
-                  [ri_help(file, line, col, concat_all(["the field is declared `priv` in module `",
-                                      owner, "`; ask that module for a constructor fn"]))])
-                render_diag(d)
-                [d]
-              }
-            } }
-          }
-        }
-        walk_priv_field_inits(file, home, all_decls, rec_name, rec_sym, rest,
-                               line, col, list_append(n, acc))
+    [FI(fname, _), ...rest] -> {
+      let n = match lookup_record_field(all_decls, rec_name, rec_sym, fname) {
+        None -> []
+        Some(FDH(fd, decl_mo, dsym)) ->
+          if field_hidden(home, rec_name, dsym, fd) {
+            let d = priv_construct_diag(file, line, col, fname, rec_name, decl_mo)
+            render_diag(d)
+            [d]
+          } else { [] }
       }
+      walk_priv_field_inits(file, home, all_decls, rec_name, rec_sym, rest,
+                             line, col, list_append(n, acc))
     }
   }
 }
 
 
-fn walk_field_priv_children(file: String, home: Option[String],
+fn walk_field_priv_children(file: String, home: TyHomeView,
                               all_decls: FieldRecs, k: ExprKind,
                               acc: [Diagnostic]) : [Diagnostic] / Console + File = match k {
   EInt(_, _)           -> acc
@@ -1742,7 +1684,7 @@ fn walk_field_priv_children(file: String, home: Option[String],
 }
 
 
-fn walk_field_priv_list(file: String, home: Option[String],
+fn walk_field_priv_list(file: String, home: TyHomeView,
                           all_decls: FieldRecs, es: [Expr],
                           acc: [Diagnostic]) : [Diagnostic] / Console + File = match es {
   [] -> acc
@@ -1753,7 +1695,7 @@ fn walk_field_priv_list(file: String, home: Option[String],
 }
 
 
-fn walk_field_priv_arms(file: String, home: Option[String],
+fn walk_field_priv_arms(file: String, home: TyHomeView,
                          all_decls: FieldRecs, arms: [Arm],
                          acc: [Diagnostic]) : [Diagnostic] / Console + File = match arms {
   [] -> acc
@@ -1770,7 +1712,7 @@ fn walk_field_priv_arms(file: String, home: Option[String],
 }
 
 
-fn walk_field_priv_field_inits(file: String, home: Option[String],
+fn walk_field_priv_field_inits(file: String, home: TyHomeView,
                                  all_decls: FieldRecs, fis: [FieldInit],
                                  acc: [Diagnostic]) : [Diagnostic] / Console + File = match fis {
   [] -> acc
@@ -1783,7 +1725,7 @@ fn walk_field_priv_field_inits(file: String, home: Option[String],
 }
 
 
-fn walk_field_priv_elems(file: String, home: Option[String],
+fn walk_field_priv_elems(file: String, home: TyHomeView,
                           all_decls: FieldRecs, els: [ListElem],
                           acc: [Diagnostic]) : [Diagnostic] / Console + File = match els {
   [] -> acc
@@ -1800,7 +1742,7 @@ fn walk_field_priv_elems(file: String, home: Option[String],
 }
 
 
-fn walk_field_priv_stmts(file: String, home: Option[String],
+fn walk_field_priv_stmts(file: String, home: TyHomeView,
                           all_decls: FieldRecs, ss: [Stmt],
                           acc: [Diagnostic]) : [Diagnostic] / Console + File = match ss {
   [] -> acc
@@ -1841,7 +1783,7 @@ fn walk_field_priv_stmts(file: String, home: Option[String],
 }
 
 
-fn walk_field_priv_clauses(file: String, home: Option[String],
+fn walk_field_priv_clauses(file: String, home: TyHomeView,
                              all_decls: FieldRecs, cs: [HClause],
                              acc: [Diagnostic]) : [Diagnostic] / Console + File = match cs {
   [] -> acc
@@ -7333,7 +7275,7 @@ pub type OpEffArity = OEA(String, Int)
 # the field-vs-UFCS decision out of the effect-row inference entirely;
 # the bug was a timing problem, not an effect-propagation one.
 #[doc("infer: `DeferredField` — a field access on a not-yet-resolved receiver.")]
-pub type DeferredField = DFd(Int, String, Int, Int, Int)  # recv tyvar id, field name, result tyvar id, line, col
+pub type DeferredField = DFd(Int, String, Int, Int, Int, Bool)  # recv tyvar id, field name, result tyvar id, line, col, named by a pattern
 
 # a parametric effect op call's row identity: the effect
 # name (with the `@cell` suffix if any) and the LIVE tyvar ids of its
@@ -11618,7 +11560,7 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
     TyVarT(recv_id) -> {
       let fr = st_fresh_ty(r.st)
       let res_id = ty_var_id(fr.ty)
-      let st1 = st_push_deferred_field(fr.st, DFd(recv_id, fnm, res_id, line, col))
+      let st1 = st_push_deferred_field(fr.st, DFd(recv_id, fnm, res_id, line, col, false))
       mk_inferred(st1, fr.ty, field_root(r.expr, fnm, line, col, fr.ty))
     }
     _ -> field_non_record_or_partial_app(r.st, r.expr, fnm, line, col)
@@ -11650,7 +11592,7 @@ fn drain_deferred_fields(st: InferState, dfs: [DeferredField],
   match dfs {
     [] -> st
     [df, ...rest] -> match df {
-      DFd(recv_id, fnm, res_id, line, col) -> {
+      DFd(recv_id, fnm, res_id, line, col, in_pat) -> {
         # a receiver still free here had its only carrier
         # (`Repo.find`'s `Repo[?a, Int]` label) dropped by `st_add_label`
         # dedup against a sibling op's concrete label. Pin it from the
@@ -11662,7 +11604,7 @@ fn drain_deferred_fields(st: InferState, dfs: [DeferredField],
         # perturb the row-mismatch diagnostic (m7b_11).
         let stp = pin_free_receiver_from_decl(st, recv_id, declared)
         let recv = apply_ty(stp.sub, TyVarT(recv_id))
-        let st1 = drain_one_deferred_field(stp, recv, fnm, res_id, line, col)
+        let st1 = drain_one_deferred_field(stp, recv, fnm, res_id, line, col, in_pat)
         drain_deferred_fields(st1, rest, declared)
       }
     }
@@ -11738,12 +11680,13 @@ fn decl_row_concrete_labels(row: RowExpr, hv: TyHomeView) : [Label] {
 }
 
 fn drain_one_deferred_field(st: InferState, recv: Ty, fnm: String,
-                             res_id: Int, line: Int, col: Int) : InferState / Console + File + Mutable {
+                             res_id: Int, line: Int, col: Int, in_pat: Bool) : InferState / Console + File + Mutable {
   match recv {
     TyCon(_, cname, cargs, tsym) -> match rec_pick(st.recs, tsym, cname, list_length(cargs), fnm) {
       Some(ri) -> {
         let inst = rec_instantiate(st, ri)
-        let st1 = st_unify(inst.st, inst.result_ty, recv, "deferred field access", line, col)
+        let st0 = st_unify(inst.st, inst.result_ty, recv, "deferred field access", line, col)
+        let st1 = if in_pat { check_pfield_visible(st0, ri, fnm, line, col) } else { st0 }
         match fty_find(inst.fields, fnm) {
           Some(t) -> st_unify(st1, TyVarT(res_id), apply_ty(st1.sub, t), "deferred field access", line, col)
           None -> {
@@ -15706,7 +15649,7 @@ fn check_variant_record_pattern(st: InferState, home: TyRef, cname: String, pfs:
       let inst = rec_instantiate(st, ri)
       let what = string_concat("record pattern '", string_concat(cname, "'"))
       let s1 = st_unify(inst.st, expected, inst.result_ty, what, line, col)
-      check_pfield_list(s1, pfs, inst.fields, line, col)
+      check_pfield_list(s1, pfs, ri, inst.fields, line, col)
     }
   }
 }
@@ -15723,13 +15666,26 @@ fn check_record_pattern(st: InferState, pfs: [PField], expected: Ty, line: Int, 
         Some(ri) -> {
           let inst = rec_instantiate(st, ri)
           let s1 = st_unify(inst.st, expected, inst.result_ty, "record pattern", line, col)
-          check_pfield_list(s1, pfs, inst.fields, line, col)
+          check_pfield_list(s1, pfs, ri, inst.fields, line, col)
         }
       }
     }
+    TyVarT(recv_id) -> check_deferred_pfields(st, pfs, recv_id, line, col)
     _ -> check_unknown_pfields(st, pfs)
   }
 }
+
+# The record type is not known yet: each field is resolved, and its
+# visibility judged, once the body settles the scrutinee.
+fn check_deferred_pfields(st: InferState, pfs: [PField], recv_id: Int, line: Int, col: Int) : InferState / Console + File + Mutable =
+  match pfs {
+    [] -> st
+    [PField(fnm, sub, _), ...rest] -> {
+      let fr = st_fresh_ty(st)
+      let s1 = st_push_deferred_field(fr.st, DFd(recv_id, fnm, ty_var_id(fr.ty), line, col, true))
+      check_deferred_pfields(check_pattern(s1, sub, fr.ty), rest, recv_id, line, col)
+    }
+  }
 
 fn check_unknown_pfields(st: InferState, pfs: [PField]) : InferState / Console + File + Mutable {
 
@@ -15742,7 +15698,7 @@ fn check_unknown_pfields(st: InferState, pfs: [PField]) : InferState / Console +
   }
 }
 
-fn check_pfield_list(st: InferState, pfs: [PField], fields: [FTy], line: Int, col: Int) : InferState / Console + File + Mutable {
+fn check_pfield_list(st: InferState, pfs: [PField], ri: RecInfo, fields: [FTy], line: Int, col: Int) : InferState / Console + File + Mutable {
 
 
   match pfs {
@@ -15750,18 +15706,32 @@ fn check_pfield_list(st: InferState, pfs: [PField], fields: [FTy], line: Int, co
     [pf, ...rest] -> match pf {
       PField(fnm, sub, _) -> {
         let s1 = match fty_find(fields, fnm) {
-          Some(ft) -> check_pattern(st, sub, ft)
+          Some(ft) -> check_pattern(check_pfield_visible(st, ri, fnm, line, col), sub, ft)
           None -> {
             let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' in record pattern#{field_hint(fields, fnm)}", [])
             render_diag(perr)
             check_pattern(st_bump_err(st_push_diag(st, perr)), sub, TyAny)
           }
         }
-        check_pfield_list(s1, rest, fields, line, col)
+        check_pfield_list(s1, rest, ri, fields, line, col)
       }
     }
   }
 }
+
+# Naming a field in a pattern reads it, whatever the sub-pattern is.
+fn check_pfield_visible(st: InferState, ri: RecInfo, fnm: String, line: Int, col: Int) : InferState / Console + File =
+  match ri {
+    RI(rn, _, fds, mo, rsym) -> match find_field_in_decls(fds, fnm) {
+      Some(fd) ->
+        if field_hidden(st_home_view(st), rn, rsym, fd) {
+          let d = priv_read_diag(st.file, line, col, fnm, rn, mo)
+          render_diag(d)
+          st_bump_err(st_push_diag(st, d))
+        } else { st }
+      None -> st
+    }
+  }
 
 # ---- match ----
 
@@ -20122,13 +20092,7 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
   # for any user effect declared in the same file but partitioned away
   # from its `fn main()`, silencing the per-op coverage walker.
   let cov_diags = check_default_coverage(df, tp.decls, all_decls_for_typer)
-  # priv-fields lane: reject cross-module reads / constructions that
-  # touch a `priv` record field. The record's declaring module lives
-  # in the field's TyCon module_origin; this walker compares against
-  # `mod.name` (the current module's home — None for the root file,
-  # Some(m) for an imported module). Runs post-typing so `obj.ty` is
-  # the resolved record type, not a free variable.
-  let priv_diags = check_field_privacy(df, mod.name, tp.decls,
+  let priv_diags = check_field_privacy(df, tsh_view(sh.homes, mod.name), tp.decls,
     if list_length(all_program_decls) > 0 { sh.field_recs } else { field_recs_of(data.decls_a) })
   let spawn_diags = check_spawn_rows(df, data.recs, tp.decls, all_decls_for_typer)
   let typed = TypedProgram {
