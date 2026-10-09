@@ -30,16 +30,18 @@ pub fn pcs_use_index(body: Expr, scope: [String]) : UseIx / Console = pcs_use_in
 
 #[doc("`pcs_use_index`, flagging the raw reads of the `boxed` names: an operand of a raw operator or an argument in a slot `slots` names raw.")]
 pub fn pcs_use_index_in(body: Expr, scope: [String], boxed: [String], slots: (Expr) -> [Int]) : UseIx / Console =
-  ni_wrap(prt_expr(body, scope, Prt { capt: [], in_lam: false, slots: slots, boxed: boxed }, ni_buckets()))
+  ni_wrap(prt_expr(body, scope, Prt { capt: [], in_lam: false, slots: slots, boxed: boxed, lent: [] }, ni_buckets()))
 
 fn prt_no_slots(f: Expr) : [Int] = []
 
 # `capt` holds the names a handler clause reads from outside it: a clause
 # borrows what it captures from the handle's env, as a lambda does from
-# its closure, so those reads are captures.
-type Prt = { capt: [String], in_lam: Bool, slots: (Expr) -> [Int], boxed: [String] }
+# its closure, so those reads are captures. `lent` names are boxed too, but
+# only an operand of an operator lowered raw reads them raw: a boxed Int
+# comparison borrows its operands on C and consumes them on native.
+type Prt = { capt: [String], in_lam: Bool, slots: (Expr) -> [Int], boxed: [String], lent: [String] }
 
-fn prt_lam(cx: Prt) : Prt = Prt { capt: cx.capt, in_lam: true, slots: cx.slots, boxed: cx.boxed }
+fn prt_lam(cx: Prt) : Prt = Prt { capt: cx.capt, in_lam: true, slots: cx.slots, boxed: cx.boxed, lent: cx.lent }
 
 fn prt_expr(e: Expr, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match sym_read_kind(e.kind) {
   EVar(nm) -> prt_read(e, nm, prt_is_raw(e), scope, cx, acc)
@@ -50,7 +52,7 @@ fn prt_expr(e: Expr, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect =
   EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
     let a1 = prt_opt(init_opt, scope, cx, prt_expr(body, scope, cx, acc))
     let aliases = handle_live_aliases(init_opt, scope)
-    let a2 = prt_clauses(clauses, scope, cx, aliases, a1)
+    let a2 = prt_clauses(clauses, scope, cx, aliases, init_opt, a1)
     match ret_opt {
       None -> a2
       Some(HR(pname, body2, _, _)) -> prt_expr(body2, [pname, ...aliases, ...scope], prt_boxed(cx, pname), a2)
@@ -64,9 +66,10 @@ fn prt_expr(e: Expr, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect =
 # The forms whose operands may be read raw.
 fn prt_reader(e: Expr, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match e.kind {
   EBinop(op, x, y) ->
-    if prt_is_raw(e) or int_cmp_raw(op, x, y) { prt_operand(y, scope, cx, prt_operand(x, scope, cx, acc)) }
+    if prt_is_raw(e) { prt_raw_operand(y, scope, cx, prt_raw_operand(x, scope, cx, acc)) }
+    else if int_cmp_raw(op, x, y) { prt_operand(y, scope, cx, prt_operand(x, scope, cx, acc)) }
     else { prt_ps(xp_positions(e), scope, cx, acc) }
-  EUnop(_, x)  -> if prt_is_raw(e) { prt_operand(x, scope, cx, acc) } else { prt_ps(xp_positions(e), scope, cx, acc) }
+  EUnop(_, x)  -> if prt_is_raw(e) { prt_raw_operand(x, scope, cx, acc) } else { prt_ps(xp_positions(e), scope, cx, acc) }
   ECall(f, xs) -> {
     let raws = if any(xs, (x) => prt_boxed_var(x, cx.boxed)) { cx.slots(f) } else { [] }
     prt_args(xs, raws, 0, scope, cx, prt_expr(f, scope, cx, acc))
@@ -86,6 +89,11 @@ fn prt_read(e: Expr, nm: String, raw: Bool, scope: [String], cx: Prt, acc: UseAc
 # An operand read raw copies the payload out whatever its own mode.
 fn prt_operand(x: Expr, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match sym_read_kind(x.kind) {
   EVar(nm) -> prt_read(x, nm, true, scope, cx, acc)
+  _        -> prt_expr(x, scope, cx, acc)
+}
+
+fn prt_raw_operand(x: Expr, scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Collect = match sym_read_kind(x.kind) {
+  EVar(nm) -> prt_read(x, nm, true, scope, if list_has(cx.lent, nm) { prt_boxed(cx, nm) } else { cx }, acc)
   _        -> prt_expr(x, scope, cx, acc)
 }
 
@@ -117,11 +125,11 @@ fn prt_arms(arms: [Arm], scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Colle
 # A list cell holds each element boxed, so an element a list pattern binds
 # directly has a box; a variant slot may be bound raw.
 # A `return(x)` binder holds the handled result boxed.
-fn prt_boxed(cx: Prt, nm: String) : Prt = Prt { capt: cx.capt, in_lam: cx.in_lam, slots: cx.slots, boxed: [nm, ...cx.boxed] }
+fn prt_boxed(cx: Prt, nm: String) : Prt = Prt { capt: cx.capt, in_lam: cx.in_lam, slots: cx.slots, boxed: [nm, ...cx.boxed], lent: cx.lent }
 
 fn prt_arm_cx(p: Pattern, cx: Prt) : Prt = match p.pkind {
-  PList(_, _)       -> Prt { capt: cx.capt, in_lam: cx.in_lam, slots: cx.slots, boxed: prt_list_elems(p, cx.boxed) }
-  PVariant(_, _, _) -> Prt { capt: cx.capt, in_lam: cx.in_lam, slots: cx.slots, boxed: prt_list_elems(p, cx.boxed) }
+  PList(_, _)       -> Prt { capt: cx.capt, in_lam: cx.in_lam, slots: cx.slots, boxed: prt_list_elems(p, cx.boxed), lent: cx.lent }
+  PVariant(_, _, _) -> Prt { capt: cx.capt, in_lam: cx.in_lam, slots: cx.slots, boxed: prt_list_elems(p, cx.boxed), lent: cx.lent }
   _                 -> cx
 }
 
@@ -159,12 +167,13 @@ fn prt_exprs(es: [Expr], scope: [String], cx: Prt, acc: UseAcc) : UseAcc / Colle
   [e, ...rest] -> prt_exprs(rest, scope, cx, prt_expr(e, scope, cx, acc))
 }
 
-fn prt_clauses(cs: [HClause], scope: [String], cx: Prt, aliases: [String], acc: UseAcc) : UseAcc / Collect = match cs {
+fn prt_clauses(cs: [HClause], scope: [String], cx: Prt, aliases: [String], init_opt: Option[Expr], acc: UseAcc) : UseAcc / Collect = match cs {
   [] -> acc
   [HC(_, params, body, _, _), ...rest] -> {
     let inner = list_append(scope, list_append(aliases, pcs_filter_non_resume(params)))
     let in_lam = pcs_clause_in_lam(cx.in_lam, params, body)
-    prt_clauses(rest, scope, cx, aliases, prt_expr(body, inner, Prt { capt: scope, in_lam: in_lam, slots: cx.slots, boxed: cx.boxed }, acc))
+    let lent = list_append(clause_lent_names(params, init_opt), cx.lent)
+    prt_clauses(rest, scope, cx, aliases, init_opt, prt_expr(body, inner, Prt { capt: scope, in_lam: in_lam, slots: cx.slots, boxed: cx.boxed, lent: lent }, acc))
   }
 }
 
