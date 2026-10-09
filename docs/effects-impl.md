@@ -423,7 +423,12 @@ adds is the evidence its op calls dispatch through.
 Direct style keeps pure and effectful code on one calling
 convention and keeps Perceus reasoning about ordinary frames; the
 price is one closure per perform of a clause that resumes in
-non-tail position.
+non-tail position. An effectful function gets raw scalar
+parameters and arithmetic like a pure one: its evidence frame is
+one more argument, and a perform boxes its arguments and unboxes a
+scalar result at the op boundary. A body that installs a handler
+(`handle`, `var`) keeps the boxed signature, because its clauses
+capture locals through a boxed env.
 
 ## `resume` representation
 

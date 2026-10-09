@@ -1463,10 +1463,10 @@ fn emit_apply_seq(apply: String, fc: String, args: [String]) : String {
 # normal boxed `KaiValue *` path, with Perceus's dup/drop intact). The
 # mask comes from the callee's UFnSig; args past the mask (defensive)
 # default to raw, matching the all-raw signature shape.
-fn emit_arg_vals_masked(src: String, args_e: [Expr], mask: [Bool], cx: EmitCtx) : [String] / Console =
-  emit_call_args_masked_each(src, args_e, mask, cx, [])
+fn emit_arg_vals_masked(src: String, args_e: [Expr], mask: [Bool], ptys: [Ty], cx: EmitCtx) : [String] / Console =
+  emit_call_args_masked_each(src, args_e, mask, ptys, cx, [])
 
-fn emit_call_args_masked_each(src: String, args_e: [Expr], mask: [Bool], cx: EmitCtx, acc: [String]) : [String] / Console {
+fn emit_call_args_masked_each(src: String, args_e: [Expr], mask: [Bool], ptys: [Ty], cx: EmitCtx, acc: [String]) : [String] / Console {
   match args_e {
     [] -> list_reverse(acc)
     [a, ...rest] -> {
@@ -1479,11 +1479,27 @@ fn emit_call_args_masked_each(src: String, args_e: [Expr], mask: [Bool], cx: Emi
         [] -> []
       }
       let entry =
-        if is_raw { emit_expr_raw(src, a, cx) }
+        if is_raw { emit_expr_raw(src, arg_typed_by_param(a, ptys), cx) }
         else { emit_expr(src, a, cx) }
-      emit_call_args_masked_each(src, rest, mrest, cx, [entry, ...acc])
+      emit_call_args_masked_each(src, rest, mrest, list_tail_or_nil(ptys), cx, [entry, ...acc])
     }
   }
+}
+
+# An arg whose type is not a concrete scalar (a capture read in a
+# specialised lambda keeps its type variable) crosses into a raw param at
+# the param's type, never a guessed one.
+fn arg_typed_by_param(a: Expr, ptys: [Ty]) : Expr = match ptys {
+  [t, ..._] -> match a.ty {
+    Some(at) -> if ty_is_unboxable_t(at) { a } else { Expr { ...a, ty: Some(t) } }
+    None     -> Expr { ...a, ty: Some(t) }
+  }
+  []        -> a
+}
+
+fn list_tail_or_nil(ts: [Ty]) : [Ty] = match ts {
+  [_, ...r] -> r
+  []        -> []
 }
 
 # Wrap a UFn call result only when the return is raw; a boxed-return
@@ -1505,7 +1521,7 @@ fn rp_arg_mask(ptys: [Ty]) : [Bool] = match ptys {
 # Emit a raw-core call: `cname(<marshalled args>)`. The result is a
 # raw scalar consumed in MUnboxed context (no `box_wrap`).
 fn emit_rcore_call(src: String, cname: String, ptys: [Ty], args_e: [Expr], cx: EmitCtx) : String / Console =
-  seq_call(cat2(cname, "("), emit_arg_vals_masked(src, args_e, rp_arg_mask(ptys), cx), ")")
+  seq_call(cat2(cname, "("), emit_arg_vals_masked(src, args_e, rp_arg_mask(ptys), ptys, cx), ")")
 
 
 # m8.x bug #12: emit `KaiValue *_op_arg_<i> = <expr>; ` for each
@@ -2180,15 +2196,15 @@ fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Opti
     EVar(callee) ->
       if ec_local_callee(f, callee, cx) { None }
       else { match ec_callee(cx, ec_callee_sym(f), callee) {
-        Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) -> {
-          let raw_call = emit_user_call_seq(c_sym(callee, mo), emit_arg_vals_masked(src, args_e, mask, cx), cx)
+        Some(EFn(_, _, mo, Some(US(ptys, rt, mask)), _)) -> {
+          let raw_call = emit_user_call_seq(c_sym(callee, mo), emit_arg_vals_masked(src, args_e, mask, ptys, cx), cx)
           Some(ufn_call_result(rt, raw_call))
         }
         _ -> None
       } }
     EModCall(mod, fname) -> match fnx_ufn_sig_first(cx.fx, fname, Some(mod)) {
-      Some(US(_, rt, mask)) -> {
-        let raw_call = emit_user_call_seq(c_sym(fname, Some(mod)), emit_arg_vals_masked(src, args_e, mask, cx), cx)
+      Some(US(ptys, rt, mask)) -> {
+        let raw_call = emit_user_call_seq(c_sym(fname, Some(mod)), emit_arg_vals_masked(src, args_e, mask, ptys, cx), cx)
         Some(ufn_call_result(rt, raw_call))
       }
       None -> None
@@ -6935,16 +6951,16 @@ fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option
         # RETURNS raw (a raw context cannot consume a boxed result).
         # Args are still marshalled per the mask — boxed params pass
         # `KaiValue *`, raw params pass scalars.
-        Some(EFn(_, _, mo, Some(US(_, rt, mask)), _)) ->
+        Some(EFn(_, _, mo, Some(US(ptys, rt, mask)), _)) ->
           if ty_is_unboxable_t(rt) {
-            Some(emit_ufn_raw_call_go(src, f, c_sym(callee, mo), args_e, mask, rt, cx))
+            Some(emit_ufn_raw_call_go(src, f, c_sym(callee, mo), args_e, mask, ptys, rt, cx))
           } else { None }
         _ -> None
       } }
     EModCall(mod, fname) -> match fnx_ufn_sig_first(cx.fx, fname, Some(mod)) {
-      Some(US(_, rt, mask)) ->
+      Some(US(ptys, rt, mask)) ->
         if ty_is_unboxable_t(rt) {
-          Some(emit_ufn_raw_call_go(src, f, c_sym(fname, Some(mod)), args_e, mask, rt, cx))
+          Some(emit_ufn_raw_call_go(src, f, c_sym(fname, Some(mod)), args_e, mask, ptys, rt, cx))
         } else { None }
       None -> None
     }
@@ -6956,16 +6972,16 @@ fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option
 # `__perceus_owned_borrow` mark; else bind each marked arg to a temp,
 # call, and drop the temps after — the raw-context mirror of
 # emit_call_with_owned_borrow_drops.
-fn emit_ufn_raw_call_go(src: String, f: Expr, sym: String, args_e: [Expr], mask: [Bool], rt: Ty, cx: EmitCtx) : String / Console {
+fn emit_ufn_raw_call_go(src: String, f: Expr, sym: String, args_e: [Expr], mask: [Bool], ptys: [Ty], rt: Ty, cx: EmitCtx) : String / Console {
   if emit_args_have_owned_borrow(args_e) {
     let names = emit_ob_names(args_e, 0)
     let hold = emit_ob_hold(f, args_e, emit_ctx_with_lcs(cx, list_append(cx.lcs, names)))
     let binds = emit_ob_binds(src, args_e, 0, cx)
-    let raw_vals = emit_arg_vals_masked(src, emit_ob_rewrite_args(args_e, 0), mask, hold.cx)
+    let raw_vals = emit_arg_vals_masked(src, emit_ob_rewrite_args(args_e, 0), mask, ptys, hold.cx)
     let drops = emit_ob_drops(args_e, 0)
     concat_all(["({ ", binds, hold.push, raw_c_type(Some(rt)), " _bcr = ", emit_user_call_seq(sym, raw_vals, hold.cx), "; ", hold.pop, drops, "_bcr; })"])
   } else {
-    emit_user_call_seq(sym, emit_arg_vals_masked(src, args_e, mask, cx), cx)
+    emit_user_call_seq(sym, emit_arg_vals_masked(src, args_e, mask, ptys, cx), cx)
   }
 }
 
