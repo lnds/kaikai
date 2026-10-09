@@ -84,6 +84,27 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.139.2 (2026-10-09)
+
+### Fixed
+
+- **native**: bind each handler-state alias to its own register (#2652)
+- **build**: declare the compiler's libLLVM shim in its [native] table (#2650)
+- **compiler**: import holes find a pub fn under any attribute wrapper (#2648)
+- **perceus**: settle the inner cells a native flat reuse rebuild drops (#2645)
+- **emit**: bind and settle every inner cell a C variant reuse arm deconstructs (#2644)
+- **effects**: key an effect instance by the declarations its type arguments name (#2639)
+- **compiler**: written type names carry the declaration they denote (#2636)
+
+### Changed
+
+- **typer**: index records and type homes by name (#2649)
+- **compiler**: one shared Decl mapper through the annotation wrappers (#2647)
+- **effects**: read a clause's scalar arguments and state raw in its arithmetic (#2643)
+- **effects**: dispatch a perform on one fiber read, inline on native (#2642)
+- **unbox**: give effectful functions raw scalar signatures (#2638)
+- **compiler**: a promoted var cell's intrinsic carries its binder, not its name (#2640)
+
 ## v0.139.1 (2026-10-08)
 
 ### Changed
