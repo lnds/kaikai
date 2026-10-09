@@ -1375,6 +1375,7 @@ TIER1_ASAN_LEGS_B := \
 	test-perceus-trmc-step-ledger-asan \
 	test-perceus-borrow-own-asan \
 	test-perceus-spread-consumes-asan \
+	test-perceus-reuse-nested-rebuild-asan \
 	test-perceus-reuse-untaken-slot-asan \
 	test-perceus-branch-param-selftail-asan \
 	test-perceus-trmc-raw-operand-drop-asan \
