@@ -449,7 +449,6 @@ address to the clause:
 ```
 KaiCont:
   - status        ; UNRESUMED / RESUMED — the one-shot check
-  - fn, env       ; the identity continuation: `resume(v)` is `v`
   - handler_id    ; cosmetic, names the handler in panic text
 ```
 
