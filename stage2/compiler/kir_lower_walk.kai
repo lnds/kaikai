@@ -1079,12 +1079,11 @@ fn lower_lambda_ref(x: Expr, st: LowerSt) : LRes / Console =
               LRes(KUnitV, st) }
   }
 
-# Lower each capture NAME to an atom (a read of that binder). Captures are
-# surface identifiers free in the lambda body — `KVar` reads in the
+# Lower each capture NAME to a read of the binder it reaches in the
 # enclosing scope.
 fn lower_capture_atoms(caps: [String], st: LowerSt, acc: [KVal]) : LResMany / Console = match caps {
   [] -> LResMany(acc, st)
-  [c, ...rest] -> lower_capture_atoms(rest, st, list_append(acc, [KVar(c)]))
+  [c, ...rest] -> lower_capture_atoms(rest, st, list_append(acc, [KVar(ls_reg_of(st, c))]))
 }
 
 # --- Blocks -------------------------------------------------------------
@@ -2911,15 +2910,39 @@ fn kir_unw_pops(pops: [String], st: LowerSt) : LowerSt / Console = match pops {
 # The Ev owns its final state: both exits (normal and discard) meet in
 # Lret, so it is released there, after the return clause has read it.
 fn lower_handle_release_state(eff: String, sym: String, st: LowerSt) : LowerSt / Console =
-  ls_emit(ls_emit(st, KBindEvState(eff, sym, KNoPos)), KRC(KDrop(KVar(var_cell_alias())), KNoPos))
+  match ls_fresh_reg(st) { LSReg(r, st1) ->
+    ls_emit(ls_emit(st1, KBindEvState(eff, sym, [r], KNoPos)), KRC(KDrop(KVar(r)), KNoPos)) }
 
-# The return clause over the body's value. A STATEFUL handle's clause may
-# read `state`/`log`, so `KBindEvState` comes first to resolve them.
+# The return clause over the body's value. A stateful handle's clause sees
+# the state aliases the handle site leaves unbound, each in a register of
+# its own: a later binder of the same name is a different binder.
 fn lower_handle_ret_value(eff: String, sym: String, bv: KVal, stateful: Bool,
                           r: HReturn, st: LowerSt) : LRes / Console = match r {
   HR(pname, rexpr, _, _) -> {
-    let st1 = if stateful { ls_emit(st, KBindEvState(eff, sym, KNoPos)) } else { st }
-    lower_expr(rexpr, ls_emit(st1, KLet(pname, SBoxed, KLitOp(bv), KNoPos)))
+    let st1 = if stateful { bind_ret_state(eff, sym, st) } else { st }
+    match lower_expr(rexpr, ls_emit(st1, KLet(pname, SBoxed, KLitOp(bv), KNoPos))) {
+      LRes(v, st2) -> LRes(v, ls_set_renames(ls_set_locals(st2, st.locals), st.renames))
+    }
+  }
+}
+
+fn bind_ret_state(eff: String, sym: String, st: LowerSt) : LowerSt / Console =
+  match alias_regs(live_state_aliases(true, st.locals), st, []) {
+    AliasRegs(regs, st1) -> ls_emit(st1, KBindEvState(eff, sym, regs, KNoPos))
+  }
+
+#[doc("Bind a stateful clause's state aliases, those its params and captures leave unbound, each to a register of its own.")]
+pub fn bind_self_state(st: LowerSt) : LowerSt / Console =
+  match alias_regs(live_state_aliases(true, st.locals), st, []) {
+    AliasRegs(regs, st1) -> ls_emit(st1, KBindSelfState(regs, KNoPos))
+  }
+
+type AliasRegs = AliasRegs([String], LowerSt)
+
+fn alias_regs(names: [String], st: LowerSt, regs: [String]) : AliasRegs = match names {
+  [] -> AliasRegs(list_reverse(regs), st)
+  [nm, ...rest] -> match ls_fresh_reg(st) {
+    LSReg(r, st1) -> alias_regs(rest, ls_push_rename(ls_bind_local(st1, nm), nm, r), [r, ...regs])
   }
 }
 

@@ -164,14 +164,10 @@ fn nemit_seed_for_abi(ctx: Handle, f: KFn, abi: NFnAbi, fnval: Handle) : Unit / 
     if f.donor { nemit_store_reg(ctx, ndonor_reg(), llvm_get_param(fnval, evf_off + list_length(f.params))) } else { () }
   }
   NFnLambda -> nemit_seed_thunk_params(ctx, f.params, fnval)
-  NFnClause -> nemit_seed_clause_params(ctx, f.params, f.stateful, fnval)
-  # The cleanup takes only `self` (the Ev). Bind `state`/`log` from it when
-  # the handler is stateful, and read any captures out of its env array —
-  # the same two sources a clause prologue uses, minus args and `k`.
-  # The cleanup takes only `self` (the Ev): no direct args, no `k`. Binding
-  # `__self` + `state`/`log` + the env captures reuses the clause seeding
-  # unchanged, since `PEnvCapture` is the only param origin it carries.
-  NFnCleanup -> nemit_seed_clause_params(ctx, f.params, f.stateful, fnval)
+  NFnClause -> nemit_seed_clause_params(ctx, f.params, fnval)
+  # The cleanup takes only `self` (the Ev): no direct args, no `k`, so the
+  # clause seeding applies unchanged.
+  NFnCleanup -> nemit_seed_clause_params(ctx, f.params, fnval)
 }
 
 # A clause `ptr (ptr self, <PDirect args ptr>, ptr k)`: self + one ptr per
@@ -203,31 +199,19 @@ fn nclause_direct_count(ps: [KParam], acc: Int) : Int = match ps {
 # register is what lets the clause body's `resume(...)` resolve. The
 # matching alloca is reserved in the entry head by `nfx_reserve_k` (called
 # from `nemit_fx_allocas` for a clause fn).
-fn nemit_seed_clause_params(ctx: Handle, ps: [KParam], stateful: Bool, fnval: Handle) : Unit / Console = {
+fn nemit_seed_clause_params(ctx: Handle, ps: [KParam], fnval: Handle) : Unit / Console = {
   let d = nclause_direct_count(ps, 0)
-  # `self` (LLVM param 0) is the dispatched Ev blob. Register it under the
-  # fixed name `__self` so `KResume2Op` can write the state slot; a stateful
-  # clause also reads the slot into `state` / `log` (the C-direct
-  # `clause_state_prologue` shape) so the body's free `state` resolves.
-  let self_v = llvm_get_param(fnval, 0)
-  nemit_store_reg(ctx, "__self", self_v)
-  nemit_seed_clause_state(ctx, stateful, ps, self_v)
+  # `self` (LLVM param 0) is the dispatched Ev blob, kept under `__self` for
+  # `KResume2Op`'s state write and `KBindSelfState`.
+  nemit_store_reg(ctx, "__self", llvm_get_param(fnval, 0))
   nemit_seed_clause_loop(ctx, ps, fnval, d)
 }
-
-# Read `self->state` once and bind it under the live state aliases —
-# identical to emit_c's `clause_state_prologue`. An alias whose name a
-# clause param or env capture already claims keeps that binding: the
-# register is one per name, so binding both would overwrite the user's.
-fn nemit_seed_clause_state(ctx: Handle, stateful: Bool, ps: [KParam], self_v: Handle) : Unit / Console =
-  nemit_bind_ev_state(ctx, live_state_aliases(stateful, map(ps, (p) => p.name)), self_v)
 
 # Bind the handler's state slot into each register in `names` from an
 # Ev ADDRESS (`ev_addr` — a clause's `self` param, or a handle frame's
 # `__ev_<eff>` alloca). `kaix_clause_state_get` reads the state at the Ev's
 # fixed byte-16 offset (header = handler_id + env), invariant across every
-# Ev<Eff>. The single source the clause prologue AND the stateful return
-# clause (`KBindEvState`) share, so the two paths can never bind differently.
+# Ev<Eff>.
 pub fn nemit_bind_ev_state(ctx: Handle, names: [String], ev_addr: Handle) : Unit / Console =
   match names {
     [] -> ()
@@ -375,15 +359,9 @@ fn nemit_stmt(ctx: Handle, cur_fn: String, s: KStmt, handlers: [KHandlerDecl], f
   KRC(rc, _)        -> nemit_rc(ctx, rc)
   KInstall(eff, sym, init, alias, _) -> nemit_install(ctx, eff, sym, init, alias, handlers)
   KPop(_, _, _)     -> nemit_pop(ctx)
-  # Bind the live state aliases from the handle frame's installed Ev (its
-  # `__ev_<eff>` alloca, a slot-(-1) blob whose ADDRESS is the Ev pointer) —
-  # the stateful return clause's `list_length(log)` reads them. Shares
-  # `nemit_bind_ev_state` with the clause prologue; the only difference is
-  # the address source. The return clause is inlined into the enclosing fn,
-  # so an alias name that fn already binds keeps the user's register.
-  KBindEvState(_, sym, _) ->
-    nemit_bind_ev_state(ctx, live_state_aliases(true, kfn_user_binders(fx.all, cur_fn)),
-                        native_ctx_find_reg(ctx, nfx_ev_reg(sym)))
+  # The handle frame's `__ev_<sym>` alloca is a blob whose ADDRESS is the Ev.
+  KBindEvState(_, sym, regs, _) -> nemit_bind_ev_state(ctx, regs, native_ctx_find_reg(ctx, nfx_ev_reg(sym)))
+  KBindSelfState(regs, _) -> { let self_v = nemit_load_reg(ctx, "__self"); nemit_bind_ev_state(ctx, regs, self_v) }
   KSetCleanup(_, sym, thunk, _) -> nemit_set_cleanup(ctx, sym, thunk)
   KRunCleanup(_, sym, _) -> nemit_run_cleanup(ctx, sym)
 }
