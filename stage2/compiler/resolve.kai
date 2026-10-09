@@ -58,11 +58,15 @@ import compiler.modules
 import compiler.symtab
 import compiler.symtab_build
 import compiler.resolve_state
+import compiler.name_hidden
 import compiler.scope_file
 import compiler.scope_chain
 import compiler.handler_alias
 import compiler.resolve_callee
 import compiler.kai_builtin
+import compiler.decl_names
+import compiler.resolve_use
+import compiler.scope_view
 
 # ====================================================================
 # checker: name resolution
@@ -416,11 +420,32 @@ fn chk_var(e: Env, name: String, x: Expr) : RKind / Console + File =
 fn chk_name(e: Env, name: String, x: Expr) : RKind / Console + File {
   if env_has(e, name) {
     match env_lookup(e, name) {
-      Some(s) -> RKind(e, ESym(s, spec_none(), name))
-      None    -> RKind(e, x.kind)
+      Some(s) -> RKind(chk_hidden(e, name, x, s), ESym(s, spec_none(), name))
+      None    -> RKind(chk_hidden(e, name, x, sym_none()), x.kind)
     }
   } else { RKind(chk_unbound(e, name, x), x.kind) }
 }
+
+# Every file's declarations are registered for the whole unit, so a name
+# another file's import loaded is bound here too; the file's own view
+# says whether it may be written bare. A builtin answers before any
+# hidden declaration, and a minted `__` name is no user's to import.
+# `reached` is what resolution settled on: on one of the file's rungs,
+# nothing is hidden, and the homonyms need not be gathered again.
+fn chk_hidden(e: Env, name: String, x: Expr, reached: SymId) : Env / Console + File =
+  if not rs_recording(e.rs) or rs_in_core(e.rs) or env_shadowed(e, name) or starts_with(name, "__")
+     or reached_in_view(e.rs, reached, name) or list_has(e.rs.prelude, name) { e }
+  else { match sv_hidden(e.rs.tab, e.rs.view, ru_value_classes(), name) {
+    [] -> e
+    ss -> {
+      let d = nh_diag(e.rs.tab, e.rs.view, ss, e.file, x.line, x.col, name)
+      render_diag(d)
+      env_mark_err(env_push_diag(e, d))
+    }
+  } }
+
+fn reached_in_view(rs: ResState, s: SymId, name: String) : Bool =
+  sym_raw(s) >= 0 and sv_reaches(rs.view, sym_owner(rs.tab, s), name)
 
 # The qualifier already names the home, so the function it reaches is
 # one declaration. A constructor, a constant, or a name the table does
@@ -545,9 +570,9 @@ fn chk_callee(e: Env, name: String, x: Expr, n: Int) : RExpr / Console + File = 
   }
   match h {
     Hit(RLocal(s), _) -> RExpr(e1, sym_ref(s, name, x))
-    Hit(RDecl(s), _)  -> RExpr(e1, sym_ref(s, name, x))
+    Hit(RDecl(s), _)  -> RExpr(chk_hidden(e1, name, x, s), sym_ref(s, name, x))
     Hit(RProto(d), _) -> RExpr(e1, at(disp_ref(e1, d), x))
-    Hit(RBare, _)     -> RExpr(e1, x)
+    Hit(RBare, _)     -> RExpr(chk_hidden(e1, name, x, sym_none()), x)
     Hit(RNone, _)     -> chk_expr_named(e1, name, x)
   }
 }
@@ -1008,7 +1033,7 @@ fn env_at_decl(e: Env, d: Decl, target: String) : Env =
 fn register_one(e: Env, d: Decl) : Env {
   match d {
     DFn(_, name, _, _, _, _, _, _, _, _, _) ->
-      if string_starts_with_q(name, "__proto_") { env_add_untyped(e, name) }
+      if starts_with(name, "__proto_") { env_add_untyped(e, name) }
       else { env_add(e, name, NCFn) }
     DType(_, name, _, body, _, _, _, _, _) -> {
       let e1 = env_add(e, name, NCType)

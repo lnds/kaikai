@@ -41,12 +41,20 @@ Generalised over every class of name, with the module dimension included:
 2. **Explicit qualification** — `m.f`, `m.T`, `m.Ctor`, `Currency.USD`.
 3. **Explicit opening** — `use E`, `use kind Currency`; and the current
    module's own declarations.
-4. **Unique symbol** — exactly one candidate across imports.
+4. **Unique symbol** — exactly one candidate across the file's imports.
 5. **Otherwise: a compile error demanding disambiguation.**
 
+Imports are per file; declarations are per unit. `import m` opens `m`'s
+public names in the file that writes it, `import m.{x}` brings `x` alone
+(a picked sum type brings its constructors), and `import m as mm` binds
+the qualifier and opens nothing. Loading stays unit-wide, but a name some
+other file's import loaded is not in scope here: a bare use of it is
+reported as not imported, never resolved.
+
 The auto-loaded core modules sit on a rung of their own, below what the
-file imports: a bare name an import declares settles to the import, and
-the core declaration stays reachable qualified (`effects.Log`). Effect
+file imports: a bare name an import declares settles to the import in
+that file only, and the core declaration stays reachable qualified
+(`effects.Log`). Effect
 names follow the same ladder as every other class, so a bare `Log` means
 the same declaration in a row, a `handle` head and a perform.
 

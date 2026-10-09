@@ -23,31 +23,57 @@ reproducing.
 
 import compiler.ast
 import compiler.symtab
+import compiler.decl_names
 
-#[doc("The modules one file can see: its own home, the names its selective imports pick, the modules it imports, and the prelude cores.")]
-pub type ScopeView = { home: SymId, picks: [SvPick], imports: [SymId], cores: [SymId] }
+#[doc("The modules one file can see: its own home, the names its selective imports pick, the modules its plain imports open, and the prelude cores. `quals` are the qualifiers the file binds, each to its module; they open nothing.")]
+pub type ScopeView = { home: SymId, picks: [SvPick], imports: [SymId], cores: [SymId], quals: [SvPick] }
 
 #[doc("One name a selective import picks, bound to the module that exports it.")]
 pub type SvPick = SvPick(String, SymId)
 
 #[doc("A view that sees nothing but its own home. The root file before any import is resolved.")]
 pub fn sv_of_home(home: SymId) : ScopeView =
-  ScopeView { home: home, picks: [], imports: [], cores: [] }
+  ScopeView { home: home, picks: [], imports: [], cores: [], quals: [] }
 
 #[doc("The view of a file homed at `home`, picking `picks`, importing `imports`, over the prelude `cores`.")]
 pub fn sv_new(home: SymId, picks: [SvPick], imports: [SymId],
       cores: [SymId]) : ScopeView =
-  ScopeView { home: home, picks: picks, imports: imports, cores: cores }
+  ScopeView { home: home, picks: picks, imports: imports, cores: cores, quals: [] }
 
 #[doc("The same view seen from `home`, keeping the file's imports and picks. The walk enters a new module without rebuilding what its file sees.")]
 pub fn sv_at_home(v: ScopeView, home: SymId) : ScopeView =
-  ScopeView { home: home, picks: v.picks, imports: v.imports, cores: v.cores }
+  ScopeView { ...v, home: home }
+
+#[doc("The same view with the file's qualifier bindings.")]
+pub fn sv_with_quals(v: ScopeView, quals: [SvPick]) : ScopeView = ScopeView { ...v, quals: quals }
+
+#[doc("The qualifier the file binds module `m` under, if it binds one.")]
+pub fn sv_qualifier(v: ScopeView, m: SymId) : Option[String] = sv_qual_of(v.quals, m)
+
+fn sv_qual_of(qs: [SvPick], m: SymId) : Option[String] = match qs {
+  [] -> None
+  [SvPick(q, o), ...rest] -> if sym_raw(o) == sym_raw(m) { Some(q) } else { sv_qual_of(rest, m) }
+}
+
+#[doc("Every rung of the view rendered as text: two views that resolve some name differently render differently. A cache key folds it in.")]
+pub fn sv_key(v: ScopeView) : String =
+  string_concat_all([int_to_string(sym_raw(v.home)), "|", sv_picks_key(v.picks), "|", sv_ids_key(v.imports),
+              "|", sv_ids_key(v.cores), "|", sv_picks_key(v.quals)])
+
+fn sv_ids_key(ms: [SymId]) : String = string_join(map(ms, (m) => int_to_string(sym_raw(m))), ",")
+
+fn sv_picks_key(ps: [SvPick]) : String =
+  string_join(map(ps, (p) => match p { SvPick(n, m) -> string_concat_all([n, "@", int_to_string(sym_raw(m))]) }), ",")
 
 #[doc("True when `m` is one of the prelude cores. A core's declarations keep the spelling the runtime is keyed by.")]
 pub fn sv_is_core(v: ScopeView, m: SymId) : Bool = sv_has(v.cores, m)
 
 #[doc("True when the file imports the module `m` or sees it as a core.")]
 pub fn sv_sees(v: ScopeView, m: SymId) : Bool = sv_has(v.imports, m) or sv_has(v.cores, m)
+
+#[doc("True when a bare `name` the module `m` declares sits on one of the file's rungs: its own home, a pick of that name, an opened import, or a core.")]
+pub fn sv_reaches(v: ScopeView, m: SymId, name: String) : Bool =
+  sym_raw(m) == sym_raw(v.home) or sv_sees(v, m) or sv_has(sv_pick_homes(v.picks, name, []), m)
 
 fn sv_has(ms: [SymId], m: SymId) : Bool = match ms {
   [] -> false
@@ -64,7 +90,7 @@ fn sv_pick_homes(ps: [SvPick], name: String, acc: [SymId]) : [SymId] = match ps 
     else { sv_pick_homes(rest, name, acc) }
 }
 
-#[doc("The rungs a bare `name` climbs, outermost last. `SvAny` closes the ladder: a visible declaration in a module the file never imported still answers, so an unimportable name reports as private rather than unknown.")]
+#[doc("The rungs a bare `name` climbs, outermost last. `SvAny` closes the ladder: a declaration in a module the file never opened still answers, so the use can be reported as not imported or private rather than unknown.")]
 pub type SvRung = SvOwn | SvPicks | SvImports | SvCores | SvAny
 
 #[doc("The ladder every name class climbs, in order.")]
@@ -94,6 +120,38 @@ each class apart and choosing between the answers cannot express.
 """)]
 pub fn sv_resolve_any(t: SymTab, v: ScopeView, cs: [NCls], name: String) : SvRes =
   sv_climb(t, v, sv_rungs(), sv_cands_of(t, cs, name))
+
+#[doc("""
+The exported declarations a bare `name` across `cs` would reach only
+through modules this file does not import: no candidate is the file's
+own, picked, opened or a core. Empty when a rung answers, or nothing
+hidden competes.
+
+A core is compiled against the other cores alone, so nothing is hidden
+from it.
+""")]
+pub fn sv_hidden(t: SymTab, v: ScopeView, cs: [NCls], name: String) : [SymId] =
+  if sv_is_core(v, v.home) { [] }
+  else { match sv_cands_of(t, cs, name) {
+    [] -> []
+    cands -> if sv_any_visible(t, v, cands, name) { [] } else { list_reverse(sv_exported(t, cands, [])) }
+  } }
+
+fn sv_any_visible(t: SymTab, v: ScopeView, cands: [SymId], name: String) : Bool = match cands {
+  [] -> false
+  [s, ...rest] -> {
+    let o = sym_owner(t, s)
+    sym_raw(o) == sym_raw(v.home) or sym_exported(t, s) and sv_reaches(v, o, name)
+      or sv_any_visible(t, v, rest, name)
+  }
+}
+
+fn sv_exported(t: SymTab, cands: [SymId], acc: [SymId]) : [SymId] = match cands {
+  [] -> acc
+  [s, ...rest] ->
+    if sym_exported(t, s) and not sv_owner_seen(t, acc, sym_owner(t, s)) { sv_exported(t, rest, [s, ...acc]) }
+    else { sv_exported(t, rest, acc) }
+}
 
 #[doc("The symbol `name` reaches on the rungs nearer than the cores, across the classes `cs`: what the reader's module declares, picks or imports.")]
 pub fn sv_resolve_near(t: SymTab, v: ScopeView, cs: [NCls], name: String) : SvRes =

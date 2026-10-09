@@ -138,11 +138,18 @@ kai migrate --from hanga-roa --to orongo src/main.kai
 ## Imports
 
 ```text
-import mathlib                    # whole package
+import mathlib                    # whole package: its pub names, bare
 import mathlib.vec                # specific module
-import mathlib as m               # rename
+import mathlib as m               # rename: `m.add` only, nothing bare
 import mathlib.{add, mul}         # selective: only `add` and `mul`
 ```
+
+An import makes names visible only in the file that writes it. A name
+another file imports, or one a module you import imports in turn, is
+not in scope here: a bare use is an error (`` `add` is not imported in
+this file ``) whose help names the import to add. A module's names
+shadow a core name of the same spelling only in the files that import
+it.
 
 Imports are RESOLVED through `kai.toml` — the name on the right of
 `import` must appear as a dep (or be a stdlib name).
@@ -152,13 +159,14 @@ nor through any name it exports — is a warning (`unused import \`m\``);
 it becomes an error at the Orongo edition. An import that only brings
 impls into scope is not reported.
 
-Files merge into one unit, so an import also makes its module's names
-visible to the other files. When another file uses a module that enters
-the unit only through an import its own file never uses, that import is
-not reported as unused: the warning names the file that needs the
-module (`import \`m\` is not used in this file, but \`other.kai\` needs
-it loaded`), and the import belongs there. Removing every import
-reported as unused, all at once, keeps the program building.
+Files load into one unit, so a module one file imports is loaded for
+all of them, and another file can name it qualified (`m.f`) without
+importing it. When such a file uses a module that enters the unit only
+through an import its own file never uses, that import is not reported
+as unused: the warning names the file that needs the module (`import
+\`m\` is not used in this file, but \`other.kai\` needs it loaded`), and
+the import belongs there. Removing every import reported as unused, all
+at once, keeps the program building.
 
 ## Visibility
 
