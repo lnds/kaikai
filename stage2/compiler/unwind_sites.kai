@@ -1,89 +1,88 @@
 #[doc("The positions a frame's emitters bracket, keyed by source position, and their lookups.")]
 
 import compiler.ast
-import compiler.util
-import compiler.marks
 import compiler.unwind_binders
 
-#[doc("A position the emitter brackets: a call that can unwind (keyed also by its callee's spelling) with the binders it registers, a `match` whose arms hold such a call, a `handle` with the outer binders that survive it, a native landing pad (an expression that can trap, keyed like a call, with the binders its pad releases), or a `!` with the binders its early return releases.")]
-pub type UnwSite = UnwCall(Int, Int, String, [String]) | UnwMatch(Int, Int) | UnwHandle(Int, Int, [String]) | UnwPad(Int, Int, String, [String]) | UnwExit(Int, Int, [String])
+#[doc("A node the emitter brackets, keyed by its site id: a call that can unwind with the binders it registers, a `match` whose arms hold such a call, a `handle` with the outer binders that survive it, a native landing pad (an expression that can trap) or the pad around an `assert` (keyed by its condition) with the binders the pad releases, or a `!` with the binders its early return releases.")]
+pub type UnwSite = UnwCall(Int, [String]) | UnwMatch(Int) | UnwHandle(Int, [String]) | UnwPad(Int, [String]) | UnwAssert(Int, [String]) | UnwExit(Int, [String])
 
-#[doc("True when the `match` at `(line, col)` has an arm holding a call that can unwind.")]
-pub fn unw_match_at(sites: [UnwSite], line: Int, col: Int) : Bool = match sites {
+#[doc("True when the `match` with site id `site` has an arm holding a call that can unwind.")]
+pub fn unw_match_at(sites: [UnwSite], site: Int) : Bool = match sites {
   [] -> false
   [s, ...rest] -> match s {
-    UnwMatch(l, c) -> (l == line and c == col) or unw_match_at(rest, line, col)
-    _ -> unw_match_at(rest, line, col)
+    UnwMatch(k) -> k == site or unw_match_at(rest, site)
+    _ -> unw_match_at(rest, site)
   }
 }
 
-#[doc("The spelling a call site is keyed by.")]
-pub fn unw_callee_key(f: Expr) : String = match f.kind {
-  EVar(n)        -> n
-  ESym(_, _, n)  -> n
-  EModCall(m, n) -> concat_all([m, ".", n])
-  EMark(m)       -> mark_name(m)
-  _              -> ""
+#[doc("`sites` with `s`. A node is one site: the walk registering the same node twice must register the same binders, or the emitters would release one set where the other is pending.")]
+pub fn unw_add(s: UnwSite, sites: [UnwSite]) : [UnwSite] = match unw_same(sites, s) {
+  None     -> [s, ...sites]
+  Some(ps) -> if unw_same_names(us_names(s), ps) { sites }
+              else { panic(concat_all(["unwind site ", int_to_string(us_site(s)), " registered twice with different binders"])) }
 }
 
-#[doc("`sites` with `s`; a site already at its position keeps the names both share.")]
-pub fn unw_add(s: UnwSite, sites: [UnwSite]) : [UnwSite] = match s {
-  UnwCall(l, c, k, ns) -> match unw_call_at(sites, l, c, k) {
-    None     -> [s, ...sites]
-    Some(ps) -> [UnwCall(l, c, k, unw_inter(ns, ps)), ...sites]
-  }
-  UnwHandle(l, c, ns) -> match unw_handle_names(sites, l, c) {
-    None     -> [s, ...sites]
-    Some(ps) -> [UnwHandle(l, c, unw_inter(ns, ps)), ...sites]
-  }
-  UnwPad(l, c, k, ns) -> match unw_pad_at(sites, l, c, k) {
-    None     -> [s, ...sites]
-    Some(ps) -> [UnwPad(l, c, k, unw_inter(ns, ps)), ...sites]
-  }
-  UnwMatch(_, _) -> [s, ...sites]
-  UnwExit(l, c, ns) -> match unw_exit_at(sites, l, c) {
-    None     -> [s, ...sites]
-    Some(ps) -> [UnwExit(l, c, unw_inter(ns, ps)), ...sites]
-  }
-}
+fn unw_same_names(a: [String], b: [String]) : Bool =
+  list_length(a) == list_length(b) and list_length(unw_inter(a, b)) == list_length(a)
 
-#[doc("The names the early return of the `!` at `(line, col)` releases, if there is one.")]
-pub fn unw_exit_at(sites: [UnwSite], line: Int, col: Int) : Option[[String]] = match sites {
+# The names the site of the same kind and node as `s` already holds.
+fn unw_same(sites: [UnwSite], s: UnwSite) : Option[[String]] = match sites {
   [] -> None
-  [s, ...rest] -> match s {
-    UnwExit(l, c, ns) -> if l == line and c == col { Some(ns) } else { unw_exit_at(rest, line, col) }
-    _ -> unw_exit_at(rest, line, col)
-  }
+  [x, ...rest] -> if us_kind(x) == us_kind(s) and us_site(x) == us_site(s) { Some(us_names(x)) } else { unw_same(rest, s) }
 }
 
-#[doc("The names registered at the call site keyed `(line, col, key)`, if there is one.")]
-pub fn unw_call_at(sites: [UnwSite], line: Int, col: Int, key: String) : Option[[String]] = match sites {
-  [] -> None
-  [s, ...rest] -> match s {
-    UnwCall(l, c, k, ns) -> if l == line and c == col and k == key { Some(ns) } else { unw_call_at(rest, line, col, key) }
-    _ -> unw_call_at(rest, line, col, key)
-  }
+fn us_kind(s: UnwSite) : Int = match s {
+  UnwCall(_, _) -> 0  UnwMatch(_) -> 1  UnwHandle(_, _) -> 2  UnwPad(_, _) -> 3  UnwAssert(_, _) -> 4  UnwExit(_, _) -> 5
 }
 
-#[doc("The names the landing pad keyed `(line, col, key)` releases, if there is one.")]
-pub fn unw_pad_at(sites: [UnwSite], line: Int, col: Int, key: String) : Option[[String]] = match sites {
-  [] -> None
-  [s, ...rest] -> match s {
-    UnwPad(l, c, k, ns) -> if l == line and c == col and k == key { Some(ns) } else { unw_pad_at(rest, line, col, key) }
-    _ -> unw_pad_at(rest, line, col, key)
-  }
+fn us_site(s: UnwSite) : Int = match s {
+  UnwCall(k, _) -> k  UnwMatch(k) -> k  UnwHandle(k, _) -> k  UnwPad(k, _) -> k  UnwAssert(k, _) -> k  UnwExit(k, _) -> k
 }
+
+fn us_names(s: UnwSite) : [String] = match s {
+  UnwCall(_, ns) -> ns  UnwMatch(_) -> []  UnwHandle(_, ns) -> ns  UnwPad(_, ns) -> ns  UnwAssert(_, ns) -> ns  UnwExit(_, ns) -> ns
+}
+
+fn us_with(s: UnwSite, ns: [String]) : UnwSite = match s {
+  UnwCall(k, _)   -> UnwCall(k, ns)
+  UnwMatch(_)     -> s
+  UnwHandle(k, _) -> UnwHandle(k, ns)
+  UnwPad(k, _)    -> UnwPad(k, ns)
+  UnwAssert(k, _) -> UnwAssert(k, ns)
+  UnwExit(k, _)   -> UnwExit(k, ns)
+}
+
+fn unw_names_of(sites: [UnwSite], kind: Int, site: Int) : Option[[String]] = match sites {
+  [] -> None
+  [s, ...rest] -> if us_kind(s) == kind and us_site(s) == site { Some(us_names(s)) } else { unw_names_of(rest, kind, site) }
+}
+
+#[doc("The names the early return of the `!` with site id `site` releases, if there is one.")]
+pub fn unw_exit_at(sites: [UnwSite], site: Int) : Option[[String]] = unw_names_of(sites, 5, site)
+
+#[doc("The names registered at the call with site id `site`, if there is one.")]
+pub fn unw_call_at(sites: [UnwSite], site: Int) : Option[[String]] = unw_names_of(sites, 0, site)
+
+#[doc("The names the landing pad of the node with site id `site` releases, if there is one.")]
+pub fn unw_pad_at(sites: [UnwSite], site: Int) : Option[[String]] = unw_names_of(sites, 3, site)
+
+#[doc("The names the landing pad around the `assert` whose condition has site id `site` releases, if there is one.")]
+pub fn unw_assert_at(sites: [UnwSite], site: Int) : Option[[String]] = unw_names_of(sites, 4, site)
+
+#[doc("The names pending at the `handle` with site id `site` that outlive it, if it is a site.")]
+pub fn unw_handle_at(sites: [UnwSite], site: Int) : Option[[String]] = unw_names_of(sites, 2, site)
 
 #[doc("True when `s` releases on a path of its own (a landing pad or an early return) rather than bracketing.")]
 pub fn unw_is_pad(s: UnwSite) : Bool = match s {
-  UnwPad(_, _, _, _) -> true
-  UnwExit(_, _, _)   -> true
+  UnwPad(_, _)    -> true
+  UnwAssert(_, _) -> true
+  UnwExit(_, _)   -> true
   _ -> false
 }
 
 #[doc("True when `s` is the early return of a `!`.")]
 pub fn unw_is_exit(s: UnwSite) : Bool = match s {
-  UnwExit(_, _, _) -> true
+  UnwExit(_, _) -> true
   _ -> false
 }
 
@@ -95,11 +94,5 @@ pub fn unw_merge(new: [UnwSite], drop: [String], acc: [UnwSite]) : [UnwSite] = m
 
 fn us_minus(s: UnwSite, drop: [String]) : UnwSite = match drop {
   [] -> s
-  _  -> match s {
-    UnwCall(l, c, k, ns) -> UnwCall(l, c, k, unw_minus(ns, drop))
-    UnwHandle(l, c, ns)  -> UnwHandle(l, c, unw_minus(ns, drop))
-    UnwPad(l, c, k, ns)  -> UnwPad(l, c, k, unw_minus(ns, drop))
-    UnwMatch(_, _)       -> s
-    UnwExit(l, c, ns)    -> UnwExit(l, c, unw_minus(ns, drop))
-  }
+  _  -> us_with(s, unw_minus(us_names(s), drop))
 }
