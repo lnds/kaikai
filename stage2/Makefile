@@ -825,7 +825,7 @@ test-modules-uom-privacy: $(TARGET) build
 # in all of them, and the tyvars directory asserts a habitant named
 # like a signature-bound type variable never captures its references.
 # Same harness contract as test-modules-uom-privacy.
-PRIVM_POS_DIRS := privacy_matrix_positive privacy_matrix_tyvars
+PRIVM_POS_DIRS := privacy_matrix_positive privacy_matrix_tyvars priv_field_destructure_owner
 PRIVM_NEG_DIRS := privacy_matrix_values privacy_matrix_const privacy_matrix_types privacy_matrix_effects privacy_matrix_protocols privacy_matrix_leak
 test-modules-privacy-matrix: $(TARGET) build
 	@set -e; \

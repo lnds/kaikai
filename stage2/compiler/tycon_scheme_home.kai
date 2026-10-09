@@ -28,8 +28,8 @@ import compiler.symtab_build
 import compiler.name_contest
 import compiler.infer_index
 
-#[doc("One nominal type declaration: the name it spells, the module declaring it, and its identity.")]
-pub type TyHomeEntry = THE(String, Option[String], SymId)
+#[doc("One nominal type declaration: the name it spells, the module declaring it, its identity, and the module symbol owning it (`sym_none()` when the table does not hold it).")]
+pub type TyHomeEntry = THE(String, Option[String], SymId, SymId)
 
 #[doc("What a contested type name denotes from one reading module: the reader's home, the name, and the declaration the scope chain picks there (`sym_none()` when it picks none).")]
 pub type TyRes = TyRes(String, String, SymId)
@@ -39,7 +39,7 @@ pub type TyHomes = TyHomes(NameIndex[TyHomeEntry], [TyRes], String, NameIndex[NE
 
 #[doc("The declaring module and identity of every nominal type in `ds`, with each contested name resolved from every module of `ds` under `views`. Aliases are absent: they are expanded before a slot could be read.")]
 pub fn tsh_homes(ds: [Decl], tab: SymTab, views: FileViews, target: String) : TyHomes =
-  match tsh_loop(ds, THAcc([], [])) {
+  match tsh_loop(ds, tab, THAcc([], [])) {
     THAcc(es, contested) ->
       TyHomes(tsh_type_index(list_reverse(es), idx_empty()),
               tsh_settle(tab, views, tsh_readers(ds, target, [target]), contested, []), target,
@@ -51,7 +51,7 @@ pub fn tsh_none() : TyHomes = TyHomes(idx_empty(), [], "", idx_empty(), fv_empty
 
 fn tsh_type_index(es: [TyHomeEntry], ix: NameIndex[TyHomeEntry]) : NameIndex[TyHomeEntry] = match es {
   []           -> ix
-  [e, ...rest] -> match e { THE(n, _, _) -> tsh_type_index(rest, idx_prepend(ix, n, e)) }
+  [e, ...rest] -> match e { THE(n, _, _, _) -> tsh_type_index(rest, idx_prepend(ix, n, e)) }
 }
 
 fn tsh_fn_index(es: [NEnt], ix: NameIndex[NEnt]) : NameIndex[NEnt] = match es {
@@ -78,21 +78,21 @@ fn tsh_contest_text(es: [NEnt], fx: NameIndex[NEnt], acc: [String]) : String = m
 # The entries so far and the names more than one module declares.
 type THAcc = THAcc([TyHomeEntry], [String])
 
-fn tsh_loop(ds: [Decl], acc: THAcc) : THAcc = match ds {
+fn tsh_loop(ds: [Decl], tab: SymTab, acc: THAcc) : THAcc = match ds {
   [] -> acc
   [d, ...rest] -> match decl_transparent_inner(d) {
-    Some(inner) -> tsh_loop([inner, ...rest], acc)
+    Some(inner) -> tsh_loop([inner, ...rest], tab, acc)
     None -> match d {
       DType(_, nm, _, body, _, _, mo, _, s) -> match body {
-        TBAlias(_)       -> tsh_loop(rest, acc)
-        TBEffectAlias(_) -> tsh_loop(rest, acc)
-        _                -> tsh_loop(rest, tsh_record(acc, nm, mo, s))
+        TBAlias(_)       -> tsh_loop(rest, tab, acc)
+        TBEffectAlias(_) -> tsh_loop(rest, tab, acc)
+        _                -> tsh_loop(rest, tab, tsh_record(acc, nm, mo, s, sym_owner(tab, s)))
       }
       # An effect names a type where a capability is passed as a value
       # (`fn f(e: Emit)`), so its declaration has to be reachable here or
       # that `TyCon` carries no identity and the op dispatches by name.
-      DEffect(_, nm, _, _, _, _, _, mo, s) -> tsh_loop(rest, tsh_record(acc, nm, mo, s))
-      _ -> tsh_loop(rest, acc)
+      DEffect(_, nm, _, _, _, _, _, mo, s) -> tsh_loop(rest, tab, tsh_record(acc, nm, mo, s, sym_owner(tab, s)))
+      _ -> tsh_loop(rest, tab, acc)
     }
   }
 }
@@ -100,10 +100,10 @@ fn tsh_loop(ds: [Decl], acc: THAcc) : THAcc = match ds {
 # A core segment is re-injected alongside its own declaration, so the
 # same pair arrives twice; recording it once keeps the uniqueness test
 # in `tsh_home_of` meaningful.
-fn tsh_record(acc: THAcc, nm: String, mo: Option[String], s: SymId) : THAcc = match acc {
+fn tsh_record(acc: THAcc, nm: String, mo: Option[String], s: SymId, owner: SymId) : THAcc = match acc {
   THAcc(es, cs) -> match tsh_find(es, nm, mo) {
     Some(_) -> acc
-    None    -> THAcc([THE(nm, mo, s), ...es], tsh_note_contest(es, cs, nm))
+    None    -> THAcc([THE(nm, mo, s, owner), ...es], tsh_note_contest(es, cs, nm))
   }
 }
 
@@ -119,7 +119,7 @@ fn tsh_note_contest(es: [TyHomeEntry], cs: [String], nm: String) : [String] =
 
 fn tsh_find(hs: [TyHomeEntry], nm: String, mo: Option[String]) : Option[SymId] = match hs {
   [] -> None
-  [THE(n, m, s), ...rest] ->
+  [THE(n, m, s, _), ...rest] ->
     if n == nm and tsh_same(m, mo) { Some(s) } else { tsh_find(rest, nm, mo) }
 }
 
@@ -130,7 +130,7 @@ fn tsh_same(a: Option[String], b: Option[String]) : Bool = match a {
 
 fn tsh_named(hs: [TyHomeEntry], nm: String, acc: [SymId]) : [SymId] = match hs {
   [] -> acc
-  [THE(n, _, s), ...rest] ->
+  [THE(n, _, s, _), ...rest] ->
     if n == nm { tsh_named(rest, nm, [s, ...acc]) } else { tsh_named(rest, nm, acc) }
 }
 
@@ -259,9 +259,26 @@ pub fn tsh_type_home(hs: TyHomes, t: Ty, nm: String) : Option[String] = match hs
   }
 }
 
+#[doc("True unless the table holds the declaration `s` of the type `nm` and a module other than the reading module of `v` owns it.")]
+pub fn tsh_reader_owns(v: TyHomeView, nm: String, s: SymId) : Bool = match v {
+  THV(TyHomes(es, _, target, _, _), cur) -> match tsh_owner_by_sym(idx_chain(es, nm), s) {
+    Some(o) -> sym_raw(o) == sym_raw(st_module_id(tsh_reader(cur, target)))
+    None    -> true
+  }
+}
+
+# A declaration the symbol table does not hold has no owner to judge.
+fn tsh_owner_by_sym(hs: [TyHomeEntry], s: SymId) : Option[SymId] = match hs {
+  [] -> None
+  [THE(_, _, hs2, o), ...rest] ->
+    if sym_raw(hs2) != sym_raw(s) { tsh_owner_by_sym(rest, s) }
+    else if sym_raw(o) < 0 { None }
+    else { Some(o) }
+}
+
 fn tsh_home_by_sym(hs: [TyHomeEntry], s: SymId) : Option[String] = match hs {
   [] -> None
-  [THE(_, hm, hs2), ...rest] -> if sym_raw(hs2) == sym_raw(s) { hm } else { tsh_home_by_sym(rest, s) }
+  [THE(_, hm, hs2, _), ...rest] -> if sym_raw(hs2) == sym_raw(s) { hm } else { tsh_home_by_sym(rest, s) }
 }
 
 #[doc("The module declaring `nm`, or nothing when the decl stream does not settle it on the name alone.")]
@@ -275,7 +292,7 @@ fn tsh_scan(hs: [TyHomeEntry], nm: String,
             found: Option[String], n: Int) : Option[String] =
   match hs {
     [] -> if n == 1 { found } else { None }
-    [THE(hn, hm, _), ...rest] ->
+    [THE(hn, hm, _, _), ...rest] ->
       if hn != nm { tsh_scan(rest, nm, found, n) }
       else if n >= 1 { None }
       else { tsh_scan(rest, nm, hm, n + 1) }
