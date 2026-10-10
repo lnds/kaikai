@@ -62,6 +62,7 @@ import compiler.fmt
 import compiler.cont_type
 import compiler.index_coll
 import compiler.variant_index
+import compiler.union_table
 import compiler.lit_mint
 import compiler.pipe_fusion
 import compiler.vec_surface
@@ -793,12 +794,10 @@ fn inf_ty_eq(a: Ty, b: Ty) : Bool {
       TyFnT(bps, br, _) -> inf_ty_list_eq(aps, bps) and inf_ty_eq(ar, br)
       _ -> false
     }
-    # Hanga Roa: structural equality respects module_origin too.
-    # Used by the monomorphiser to key specialisations; without
-    # this check, `tuple.Pair` and a user-defined `Pair` would
-    # collapse to one mangled symbol.
-    TyCon(am, an, atas, ta_sym) -> match b {
-      TyCon(bm, bn, btas, tb_sym) -> sym_compat(ta_sym, tb_sym) and module_slot_compat(am, bm) and an == bn and inf_ty_list_eq(atas, btas)
+    # A nominal type is its declaration: `tuple.Pair` and a user
+    # `Pair` share a spelling and nothing else.
+    TyCon(_, _, atas, ta_sym) -> match b {
+      TyCon(_, _, btas, tb_sym) -> sym_same(ta_sym, tb_sym) and inf_ty_list_eq(atas, btas)
       _ -> false
     }
     TyDimT(ab, _) -> match b { TyDimT(bb, _) -> inf_ty_eq(ab, bb) _ -> false }
@@ -2307,21 +2306,16 @@ pub type TyScheme = Scheme([Int], [Int], [Int], [String], Ty)
 #[derive(BinSerialize)]
 pub type TyEntry = { name: String, scheme: TyScheme }
 
-# a per-decl summary of `type T = A | B` declarations.
-# The summary lives on `TyEnv.unions`
-# and acts as the canonical "components of T" map for the typer:
-# `variants_of_type` falls back to it (the shadow case where
-# the component is a pre-declared top-level type) and
-# `union_upcast_ok` consults it to validate D3 upcasts.
-# Components are stored in their post-`normalize_union` canonical
-# form; `parent` is the declared type name; `line`/`col` point at
-# the declaration's token for diagnostic anchoring.
+# A per-decl summary of `type T = A | B` declarations, as a module's
+# delta carries it. The typer reads the same rows keyed by the union's
+# declaration (`union_table`); `parent` is the declared type name, and
+# `line`/`col` point at the declaration's token.
 #[doc("infer: `UnionInfo` — driver-facing type.")]
 #[derive(BinSerialize)]
 pub type UnionInfo = UI(String, [Ty], Int, Int)
 
-# `unions` carries the per-decl union summary harvested
-# at env-build time. It coexists with the variant-table dual rep:
+# `unions` carries the union rows harvested at env-build time, keyed by
+# each union's declaration. It coexists with the variant-table dual rep:
 # the table drives runtime ctor lookup, while `unions` is the
 # typer-side authority for "which types compose this union?".
 # per-compile cache `head_owners` records the (head_type
@@ -2346,7 +2340,7 @@ pub type UnionInfo = UI(String, [Ty], Int, Int)
 pub type CtorEntry = CtorE(String, String, String)
 
 #[doc("infer: `TyEnv` — driver-facing type.")]
-pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
+pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: UnionTable,
                # `#[constructor]` bindings: `type_name -> (home, fn)`.
                constructors: [CtorEntry],
                head_owners: [HeadOwnerEntry],
@@ -2367,10 +2361,9 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: [UnionInfo],
                # `ty_env_lookup` / `ty_env_collect_candidates` answer
                # per-name queries without walking the full assoc list.
                index: NameIndex[TyEntry],
-               # return-tycon index over the same entries. `index`
-               # buckets by constructor name; this one buckets by the
-               # type each entry constructs, which is what the
-               # exhaustiveness walker queries.
+               # the constructors among the same entries, keyed by the
+               # declaration of the sum each builds and by their own:
+               # what exhaustiveness and constructor disambiguation query.
                vindex: VariantIndex[TyEntry],
                # the same entries keyed by the id of the declaration each
                # came from. A name bucket holds every homonym and leaves
@@ -2392,7 +2385,7 @@ pub type SymEntry = SymE(TyScheme, Int)
 pub type HeadOwnerEntry = HOE(String, [String])
 
 #[doc("infer: the empty typing environment.")]
-pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: [], constructors: [], head_owners: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }
+pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: ut_empty(), constructors: [], head_owners: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }
 
 # What a bare type name in the program being typed denotes.
 fn env_home_view(env: TyEnv, mo: Option[String]) : TyHomeView = tsh_view(env.ty_homes, mo)
@@ -2413,7 +2406,7 @@ fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv {
   TyEnv { entries: [e, ...env.entries],
           fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, row_kind: env.row_kind, ty_homes: env.ty_homes,
           index: idx_prepend(env.index, k, e),
-          vindex: vix_prepend(env.vindex, ty_variant_key(e), e), sindex: env.sindex }
+          vindex: ty_vix_add(env.vindex, env.ty_homes, e), sindex: env.sindex }
 }
 
 # Register `sc` under the declaration `s` as well as under its name.
@@ -2598,14 +2591,16 @@ fn ty_last_sep(name: String, from: Int) : Int {
 #[doc("infer: the entries and the name and variant indexes of a typing env, kept in step.")]
 pub type TyEnvParts = TEP([TyEntry], NameIndex[TyEntry], VariantIndex[TyEntry])
 
-fn ty_env_prepend_batch(batch: [TyEntry], entries: [TyEntry], ix: NameIndex[TyEntry], vx: VariantIndex[TyEntry]) : TyEnvParts =
-  ty_env_prepend_batch_loop(list_reverse(batch), entries, ix, vx)
+fn ty_env_prepend_batch(batch: [TyEntry], entries: [TyEntry], ix: NameIndex[TyEntry], vx: VariantIndex[TyEntry],
+                        homes: TyHomes) : TyEnvParts =
+  ty_env_prepend_batch_loop(list_reverse(batch), entries, ix, vx, homes)
 
-fn ty_env_prepend_batch_loop(batch: [TyEntry], entries: [TyEntry], ix: NameIndex[TyEntry], vx: VariantIndex[TyEntry]) : TyEnvParts = match batch {
+fn ty_env_prepend_batch_loop(batch: [TyEntry], entries: [TyEntry], ix: NameIndex[TyEntry], vx: VariantIndex[TyEntry],
+                             homes: TyHomes) : TyEnvParts = match batch {
   [] -> TEP(entries, ix, vx)
   [e, ...rest] -> {
     let k = ty_bucket_key(e.name)
-    ty_env_prepend_batch_loop(rest, [e, ...entries], idx_prepend(ix, k, e), vix_prepend(vx, ty_variant_key(e), e))
+    ty_env_prepend_batch_loop(rest, [e, ...entries], idx_prepend(ix, k, e), ty_vix_add(vx, homes, e), homes)
   }
 }
 
@@ -2647,28 +2642,6 @@ fn modules_exporting_loop(es: [TyEntry], fname: String, acc: [String]) : [String
         None    -> modules_exporting_loop(rest, fname, acc)
       }
     }
-  }
-}
-
-# returns `Some(bare)` when `key` has the form
-# `<target>::<bare>` (i.e. the qualified key whose left side is
-# `target`). Used by `variants_of_type_loop_arity` to surface user
-# variants registered only under the qualified key (because a core
-# builtin already occupies the bare slot) as variants of `target`,
-# yielding the bare ctor name pattern arms / exhaustiveness reports
-# expect.
-fn ty_env_strip_qualified_prefix(key: String, target: String) : Option[String] =
-  ty_env_strip_prefix(key, string_concat(target, "::"))
-
-# `prefix` is `<target>::`, hoisted by callers that strip the same
-# target across a whole walk.
-fn ty_env_strip_prefix(key: String, prefix: String) : Option[String] {
-  let pn = string_length(prefix)
-  let kn = string_length(key)
-  if kn <= pn { None }
-  else {
-    let head = string_slice(key, 0, pn)
-    if head == prefix { Some(string_slice(key, pn, kn - pn)) } else { None }
   }
 }
 
@@ -2820,7 +2793,7 @@ fn list_ty(t: Ty) : Ty = TyListT(t)
 #[doc("infer: `add_core_sigs` — typer entry point invoked by the driver.")]
 pub fn add_core_sigs(env: TyEnv) : TyEnv {
   let batch = list_append(builtin_ty_entries(builtin_table()), native_prim_ty_entries(rcore_table()))
-  match ty_env_prepend_batch(batch, env.entries, env.index, env.vindex) {
+  match ty_env_prepend_batch(batch, env.entries, env.index, env.vindex, env.ty_homes) {
     TEP(all_entries, idx, vidx) ->
       TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, row_kind: env.row_kind, ty_homes: env.ty_homes,
               index: idx, vindex: vidx, sindex: env.sindex }
@@ -2850,9 +2823,9 @@ fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
   # core variant by qualifier when a user type collides with the
   # bare ctor name. Core code itself does not consult these (it
   # uses bare names exclusively); the qualified entries exist only
-  # so `ctor_needs_qualification` and `check_expr_against`'s ECall
-  # path can route `Result.Ok(x)` and `Response.Ok(x)` to distinct
-  # schemes without flipping the bare slot's protection.
+  # so `check_expr_against`'s ECall path can route `Result.Ok(x)` and
+  # `Response.Ok(x)` to distinct schemes without flipping the bare
+  # slot's protection.
   let some_sc = scheme([0],    fn_ty([tv(0)], core_ty_con(CtOption, [tv(0)])))
   let none_sc = scheme([0],    core_ty_con(CtOption, [tv(0)]))
   let ok_sc   = scheme([0, 1], fn_ty([tv(0)], core_ty_con(CtResult, [tv(0), tv(1)])))
@@ -2869,7 +2842,7 @@ fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: ty_mod_key("Result", "Ok"),   scheme: ok_sc   },
     TyEntry { name: ty_mod_key("Result", "Err"),  scheme: err_sc  }
   ]
-  match ty_env_prepend_batch(es, env.entries, env.index, env.vindex) {
+  match ty_env_prepend_batch(es, env.entries, env.index, env.vindex, env.ty_homes) {
     TEP(all_entries, idx, vidx) ->
       TyEnv { entries: all_entries, fresh: env.fresh, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, row_kind: env.row_kind, ty_homes: env.ty_homes,
               index: idx, vindex: vidx, sindex: env.sindex }
@@ -3588,17 +3561,13 @@ fn add_variants_loop(env: TyEnv, home: Option[String],
 # whether registering a user variant under bare `cname` would clobber a
 # core entry — in which case we keep the core bare entry and rely
 # on qualified-key resolution for the user variant. The check looks at
-# the scheme's return tycon name: only Result / Option builtin schemes
-# are protected.
-fn bare_is_core_builtin_variant(env: TyEnv, cname: String) : Bool {
+# the type the scheme builds: only the runtime's Result / Option are
+# protected.
+fn bare_is_core_builtin_variant(env: TyEnv, cname: String) : Bool =
   match ty_env_lookup(env, cname) {
-    None -> false
-    Some(sc) -> match extract_return_tycon(sc) {
-      Some(t) -> t == "Result" or t == "Option"
-      None -> false
-    }
+    None     -> false
+    Some(sc) -> sym_is_core_sum(scheme_ret_sym(sc))
   }
-}
 
 # === TyUnion construction + D2 collision check ===
 #
@@ -3616,12 +3585,11 @@ fn bare_is_core_builtin_variant(env: TyEnv, cname: String) : Bool {
 # is the runtime value, and the `TyCon(_, name, [])` form is the
 # type-level handle.
 
-# `UnionInfo` is declared near `TyEnv`. The helpers below populate and
-# consume it.
+# `UnionInfo` is declared near `TyEnv`: the form a delta stores. The
+# typer reads `UnionRow`s, which carry the union's declaration.
 
-# Each component's module slot comes from the same view the constructor
-# schemes are stamped from; built without one, the two sides of the
-# same type would meet only by the permissive slot rule.
+# Each component's module slot and identity come from the same view the
+# constructor schemes are stamped from.
 fn collect_unions(ds: [Decl], hv: TyHomeView) : [UnionInfo] =
   collect_unions_loop(ds, [], hv)
 
@@ -3644,6 +3612,31 @@ fn collect_unions_loop(ds: [Decl], acc: [UnionInfo], hv: TyHomeView) : [UnionInf
   }
 }
 
+# The same summary, one row per union in the same order, each carrying
+# the type its declaration introduces.
+fn collect_union_rows(ds: [Decl], hv: TyHomeView) : [UnionRow] =
+  collect_union_rows_loop(ds, [], hv)
+
+fn collect_union_rows_loop(ds: [Decl], acc: [UnionRow], hv: TyHomeView) : [UnionRow] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match decl_transparent_inner(d) {
+      Some(inner) -> collect_union_rows_loop([inner, ...rest], acc, hv)
+      None -> match d {
+        DType(_, name, _, body, line, col, mo, _, tsym) -> match body {
+          TBSum(vs) -> {
+            let dv = tsh_at(hv, mo)
+            let row = UnionRow(TyCon(tsh_slot(dv, name), name, [], tsym), variants_to_component_tys(vs, dv), line, col)
+            collect_union_rows_loop(rest, [row, ...acc], hv)
+          }
+          _ -> collect_union_rows_loop(rest, acc, hv)
+        }
+        _ -> collect_union_rows_loop(rest, acc, hv)
+      }
+    }
+  }
+}
+
 # Each `Var(cname, _)` becomes the type `TyCon(_, cname, [])` — a
 # nominal handle for the component. The variant payload is erased at
 # the type level: the parent's TyCon-result is what makes
@@ -3659,20 +3652,8 @@ fn variants_to_component_tys(vs: [Variant], hv: TyHomeView) : [Ty] {
   }
 }
 
-# Lift a `UnionInfo` into the canonical `Ty` shape.
-# `normalize_union` flattens, sorts, and dedups, so two source
-# declarations with reordered or duplicated components yield equal
-# `Ty` values — D6 algebraic laws.
-fn union_info_to_ty(u: UnionInfo) : Ty {
-  match u { UI(_, comps, _, _) -> normalize_union(comps) }
-}
-
-# Component names listed in declaration order, dropping payload.
-# Returned as plain strings so callers can `list_has` directly.
-fn union_info_component_names(u: UnionInfo) : [String] {
-  match u { UI(_, comps, _, _) -> ty_names(comps) }
-}
-
+# The spellings of the nominal types in `ts`, in order: what a pattern
+# arm or a diagnostic names a component by.
 fn ty_names(ts: [Ty]) : [String] {
   match ts {
     [] -> []
@@ -3683,37 +3664,9 @@ fn ty_names(ts: [Ty]) : [String] {
   }
 }
 
-# Look up the components of a union by parent name.
-fn union_components_of(unions: [UnionInfo], parent: String) : [String] {
-  match unions {
-    [] -> []
-    [u, ...rest] -> match u {
-      UI(name, _, _, _) -> if name == parent {
-        union_info_component_names(u)
-      } else {
-        union_components_of(rest, parent)
-      }
-    }
-  }
-}
-
-# Reverse lookup: which parent unions list `child` as a component?
-# Identifies a found type's component-of-origin.
-fn union_parents_of(unions: [UnionInfo], child: String) : [String] =
-  union_parents_of_loop(unions, child, [])
-
-fn union_parents_of_loop(unions: [UnionInfo], child: String, acc: [String]) : [String] {
-  match unions {
-    [] -> list_reverse(acc)
-    [u, ...rest] -> match u {
-      UI(name, _, _, _) -> if list_has(union_info_component_names(u), child) {
-        union_parents_of_loop(rest, child, [name, ...acc])
-      } else {
-        union_parents_of_loop(rest, child, acc)
-      }
-    }
-  }
-}
+# The spellings of the components the union `parent` declares.
+fn union_component_names(unions: UnionTable, parent: SymId) : [String] =
+  ty_names(ut_components(unions, parent))
 
 # Names of every top-level `DType` in the program. Record /
 # alias / effect-alias names count: pre-declaring `type Foo = { ... }`
@@ -4336,24 +4289,8 @@ fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl],
           }
           None     -> EnvWithArities { env: env, arities: ar_acc }
         }
-        # prepend a boundary sentinel
-        # `<tname>::__type_decl_arity_<N>__` BEFORE registering
-        # the variants. Since `ty_env_add` cons-prepends, the
-        # sentinel ends up after this DType's variants in head-
-        # first order: walking newest-first, the typer's
-        # `variants_of_type_loop_arity` accepts variants until
-        # it hits the sentinel (the boundary between this
-        # DType's variants and any earlier declaration's). The
-        # arity filter alone discriminates `Tree[k, v]` (arity
-        # 2) from `Tree` (arity 0); the sentinel closes the
-        # same-arity case (e.g. private `type SplitN = SplitOk
-        # | SplitShort` in `stdlib/crypto/hash.kai` vs. a user
-        # redeclaration of `type SplitN = ...`).
-        DType(_, dt_name, dt_tparams, _, _, _, _, _, _) -> {
-          let env1 = ty_env_add_decl_marker(env, dt_name, list_length(dt_tparams))
-          let env2 = add_variants_of_decl(env1, d, top_names, tab, target, homes)
-          EnvWithArities { env: env2, arities: ar_acc }
-        }
+        DType(_, _, _, _, _, _, _, _, _) ->
+          EnvWithArities { env: add_variants_of_decl(env, d, top_names, tab, target, homes), arities: ar_acc }
         DEffect(_, eff_name, tparams, ops, _, _, _, emo, esym) -> {
           # A contested effect is spelled per home, which the table does
           # not hold: the declaration's own id is the one to register.
@@ -4627,7 +4564,7 @@ fn build_ty_env_seed() : BuiltEnv {
              op_eff_arities: [] }
 }
 
-fn build_ty_env_module(seed: BuiltEnv, decls: [Decl], unions: [UnionInfo],
+fn build_ty_env_module(seed: BuiltEnv, decls: [Decl], unions: UnionTable,
                         top_names: [String], homes: TyHomes) : BuiltEnv {
   let rk_table = compute_row_kind_slots(decls)
   let env_with_unions = TyEnv {
@@ -4649,7 +4586,7 @@ fn build_ty_env_module(seed: BuiltEnv, decls: [Decl], unions: [UnionInfo],
 # decl stream, so a `T[..., e]` annotation resolves the row slot of a
 # type declared in another module.
 fn build_ty_env_inherited(seed: BuiltEnv, inh: TyEnvParts, inherited: ModuleEnvDelta,
-                            decls: [Decl], unions: [UnionInfo],
+                            decls: [Decl], unions: UnionTable,
                             top_names: [String], rk_table: [RowKindEntry],
                             tab: SymTab, target: String,
                             homes: TyHomes) : BuiltEnv {
@@ -4680,7 +4617,7 @@ pub fn build_ty_env(decls: [Decl]) : BuiltEnv {
   # env so every downstream typer query (`variants_of_type`,
   # `union_upcast_ok`, the collision diagnostic) sees the same data.
   let homes = tsh_homes(decls, st_empty(), fv_empty(), "")
-  let unions = collect_unions(decls, tsh_view(homes, None))
+  let unions = ut_add(ut_empty(), collect_union_rows(decls, tsh_view(homes, None)))
   # pre-compute top-level type names so variant
   # registration can skip ctor entries whose name shadows.
   let top_names = collect_top_type_names(decls)
@@ -6532,14 +6469,12 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
       }
       _ -> None
     }
-    # Hanga Roa: TyCon identity is (module_origin, name, args). Two
-    # TyCons unify only when BOTH the module origin and the bare
-    # name coincide. Same-name types from different modules are
-    # distinct (the load-bearing rule for shadowing). Both `None`
-    # — language-level builtins / root-file types — also coincide.
-    TyCon(am, an, aa, ta_sym) -> match b {
-      TyCon(bm, bn, ba, tb_sym) -> {
-        if sym_compat(ta_sym, tb_sym) and module_slot_compat(am, bm) and an == bn { unify_list(env, aa, ba, s) }
+    # Two nominal types unify only when they name one declaration:
+    # same-name types from different modules are distinct (the
+    # load-bearing rule for shadowing).
+    TyCon(_, _, aa, ta_sym) -> match b {
+      TyCon(_, _, ba, tb_sym) -> {
+        if sym_same(ta_sym, tb_sym) { unify_list(env, aa, ba, s) }
         # implicit upcast inside structural
         # unification. When the two TyCons disagree, accept the
         # mismatch if `b` is a component of the union `a` per the env
@@ -6555,7 +6490,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
         # the union's home and its component's are unrelated. Membership
         # in the parent's component list is what authorises the lift,
         # and that list already names one declaration each.
-        else if list_length(aa) == 0 and list_length(ba) == 0 and list_has(variants_of_type(env, an), bn) { Some(s) }
+        else if list_length(aa) == 0 and list_length(ba) == 0 and ut_lists(env.unions, ta_sym, tb_sym) { Some(s) }
         else { None }
       }
       # a bare named record on the LHS unifies with the
@@ -6564,12 +6499,12 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
       # rules above. Only `Decimal` has a UoM-decorated form; the other
       # named records do not.
       TyDimT(bb, bu) -> match bb {
-        TyCon(_, bn, ba, tb_sym) ->
+        TyCon(_, _, ba, tb_sym) ->
           # A fixed-width `Vec[t]<n>` has a distinct inline layout, so it
           # never collapses into a bare `Vec[t]` — even at `<1>`. The
           # numeric `Real ≡ Real<1>` collapse below is untouched.
           if core_ty_is(tb_sym, CtVec) { None }
-          else if an == bn and sym_compat(ta_sym, tb_sym) { match unify_list(env, aa, ba, s) {
+          else if sym_same(ta_sym, tb_sym) { match unify_list(env, aa, ba, s) {
             None -> None
             Some(s1) -> unify_dim(UOne, bu, s1)
           } } else { None }
@@ -6592,12 +6527,12 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
       # mirroring the bare-numeric arms. Lets a `Decimal<USD>` value
       # flow into a fn expecting bare `Decimal` only when the units
       # cancel — anything else is a unit mismatch.
-      TyCon(_, bn, ba, tb_sym) -> match ab {
-        TyCon(_, an, aa, ta_sym) ->
+      TyCon(_, _, ba, tb_sym) -> match ab {
+        TyCon(_, _, aa, ta_sym) ->
           # A fixed-width `Vec[t]<n>` never collapses into a bare `Vec[t]`
           # (distinct inline layout); the numeric collapse above stays.
           if core_ty_is(ta_sym, CtVec) { None }
-          else if an == bn and sym_compat(ta_sym, tb_sym) { match unify_list(env, aa, ba, s) {
+          else if sym_same(ta_sym, tb_sym) { match unify_list(env, aa, ba, s) {
             None -> None
             Some(s1) -> unify_dim(au, UOne, s1)
           } } else { None }
@@ -6907,32 +6842,6 @@ fn rerank_recs_loop(rs: [RecInfo], hm: Option[String], root_mod: String,
 fn option_str_eq(a: Option[String], b: Option[String]) : Bool = match a {
   None    -> match b { None -> true Some(_) -> false }
   Some(x) -> match b { None -> false Some(y) -> x == y }
-}
-
-# Hanga Roa: module-slot compatibility for TyCon unification.
-# Two TyCons unify when their module slots are equal OR at least
-# one slot is `None`. `None` is the placeholder produced by
-# `resolve_ty_with_binds` when it walks a signature TypeExpr
-# without access to the recs/sums tables; the modular typecheck
-# partition (`partition_decls_by_home`) already prevents a user
-# `type Pair = ...` and `tuple.Pair[a, b]` from sharing the same
-# bucket's typer state, so a `None` slot in a signature is no
-# longer destructive — it cannot accidentally pair-up a user-side
-# `Pair` against the stdlib's `Pair`.
-#
-# Returning to strict slot equality fails inside `tuple.kai`'s own
-# bodies: `pub fn swap(p: Pair[a, b])` resolves `p`'s type via
-# `resolve_ty_with_binds` to `TyCon(None, "Pair", [a, b])`, but
-# the `Pair { ... }` literal in the body goes through
-# `rec_instantiate` which stamps `Some("tuple")`. The permissive
-# rule lets those unify; the partition keeps it safe.
-#[doc("infer: `module_slot_compat` — typer entry point invoked by the driver.")]
-pub fn module_slot_compat(am: Option[String], bm: Option[String]) : Bool = match am {
-  None    -> true
-  Some(_) -> match bm {
-    None    -> true
-    Some(_) -> option_str_eq(am, bm)
-  }
 }
 
 fn field_init_list_has(fs: [FieldInit], target: String) : Bool {
@@ -7585,9 +7494,8 @@ fn ty_eq_shape(a: Ty, b: Ty) : Bool {
           and (rows_label_free(arow, brow) or row_shape_compatible(arow, brow, subst_empty()))
       _ -> false
     }
-    # Hanga Roa: shape equality respects module_origin too.
-    TyCon(am, an, atas, ta_sym) -> match bx {
-      TyCon(bm, bn, btas, tb_sym) -> sym_compat(ta_sym, tb_sym) and module_slot_compat(am, bm) and an == bn and ty_list_eq_shape(atas, btas)
+    TyCon(_, _, atas, ta_sym) -> match bx {
+      TyCon(_, _, btas, tb_sym) -> sym_same(ta_sym, tb_sym) and ty_list_eq_shape(atas, btas)
       _ -> false
     }
     # shape-equality on unions is point-wise on
@@ -8188,11 +8096,11 @@ fn find_mismatched_tycons(expected: Ty, found: Ty) : Option[TyConPair] {
       }
       _ -> tycon_pair_or_none(expected, found)
     }
-    # Hanga Roa: same-name TyCons from different modules are a real
-    # mismatch — flag them so the diagnostic can render the modules
-    # and show the user the actual confusion.
-    TyCon(em, en, eas, ta_sym) -> match found {
-      TyCon(fm, fname, fas, tb_sym) -> if option_str_eq(em, fm) and en == fname and sym_compat(ta_sym, tb_sym) {
+    # Same-name types from different modules are a real mismatch —
+    # flag them so the diagnostic can render the modules and show the
+    # user the actual confusion.
+    TyCon(_, _, eas, ta_sym) -> match found {
+      TyCon(_, _, fas, tb_sym) -> if sym_same(ta_sym, tb_sym) {
         find_mismatch_in_list(eas, fas)
       } else {
         Some(TyConPair { exp: expected, fnd: found })
@@ -8233,13 +8141,14 @@ fn tycon_pair_or_none(expected: Ty, found: Ty) : Option[TyConPair] {
 fn emit_union_focus_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console {
   let exp_name = tycon_name_or_empty(expected)
   let fnd_name = tycon_name_or_empty(found)
+  let exp_sym = ut_ty_sym(expected)
   # The head carries the home a contested declaration was keyed by;
   # what the reader is shown is the name their source spells.
   let exp_shown = inf_tycon_display_ow(env.head_owners, exp_name)
   let fnd_shown = inf_tycon_display_ow(env.head_owners, fnd_name)
-  let exp_comps = if exp_name == "" { [] } else { variants_of_type(env, exp_name) }
-  let fnd_comps = if fnd_name == "" { [] } else { variants_of_type(env, fnd_name) }
-  let fnd_parents = if fnd_name == "" { [] } else { union_parents_of(env.unions, fnd_name) }
+  let exp_comps = variants_of_type(env, exp_sym)
+  let fnd_comps = variants_of_type(env, ut_ty_sym(found))
+  let fnd_parents = ut_parents(env.unions, ut_ty_sym(found))
   match exp_comps {
     [] -> ()
     _  -> diag_note("union: `#{exp_shown}` = #{inf_join_with(exp_comps, " | ")}")
@@ -8247,7 +8156,7 @@ fn emit_union_focus_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console 
   match fnd_comps {
     [] -> match fnd_parents {
       [] -> ()
-      [p, ..._rest] -> diag_note("`#{fnd_shown}` is a component of `#{inf_tycon_display_ow(env.head_owners, p)}`")
+      [p, ..._rest] -> diag_note("`#{fnd_shown}` is a component of `#{inf_tycon_display_ow(env.head_owners, tycon_name_or_empty(ut_row_ty(p)))}`")
     }
     _ -> diag_note("union: `#{fnd_shown}` = #{inf_join_with(fnd_comps, " | ")}")
   }
@@ -8255,14 +8164,14 @@ fn emit_union_focus_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console 
     [] -> ()
     _ -> match fnd_parents {
       [p, ..._rest] -> {
-        if list_has(exp_comps, p) {
+        let ps = inf_tycon_display_ow(env.head_owners, tycon_name_or_empty(ut_row_ty(p)))
+        if ut_lists(env.unions, exp_sym, ut_row_sym(p)) {
           # The expected union already lists the found's parent — so
           # the failure is the no-chains rule (D3 does not transit
           # through intermediate unions). Tell the user how to bridge.
-          let ps = inf_tycon_display_ow(env.head_owners, p)
           diag_help("the D3 upcast does not chain; lift through `#{ps}` first (e.g. `let x: #{ps} = ...`)")
         } else {
-          diag_help("extend `#{exp_shown}` to include `#{fnd_shown}` (or its parent `#{inf_tycon_display_ow(env.head_owners, p)}`), or narrow via `match` before the call")
+          diag_help("extend `#{exp_shown}` to include `#{fnd_shown}` (or its parent `#{ps}`), or narrow via `match` before the call")
         }
       }
       # Found is itself a union (or a free TyCon with no parent).
@@ -8287,22 +8196,21 @@ fn tycon_name_or_empty(t: Ty) : String {
 # zero-arg variants of `U`, so a value of type `A` lifts to `U`.
 fn union_upcast_ok(env: TyEnv, expected: Ty, found: Ty) : Bool {
   match expected {
-    TyCon(_, u_name, u_args, _) -> match found {
-      TyCon(_, t_name, t_args, _) -> {
+    TyCon(_, _, u_args, u_sym) -> match found {
+      TyCon(_, _, t_args, t_sym) -> {
         # An upcast lifts a component into a DIFFERENT parent, between
-        # bare nominal heads only. Without the self-name guard, a sum
-        # type whose variant repeats the type's name upcasts to itself
-        # and swallows an argument mismatch (`Box[String]` vs `Box[Int]`).
+        # bare nominal heads only. Without the self guard, a sum type
+        # whose variant names the type itself upcasts to itself and
+        # swallows an argument mismatch (`Box[String]` vs `Box[Int]`).
         #
         # The two homes are deliberately not compared: a union lists
         # components another module declares (`type Both = ua.Cfg |
         # ub.Cfg`), so the parent's home and the component's are
         # unrelated. Membership in the parent's component list is what
-        # authorises the lift, and that list already names one
-        # declaration each.
-        if t_name == u_name { false }
+        # authorises the lift, and that list names one declaration each.
+        if sym_raw(t_sym) == sym_raw(u_sym) { false }
         else if list_length(u_args) > 0 or list_length(t_args) > 0 { false }
-        else { list_has(variants_of_type(env, u_name), t_name) }
+        else { ut_lists(env.unions, u_sym, t_sym) }
       }
       _ -> false
     }
@@ -8810,15 +8718,7 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
         }
       }
       match scheme_opt {
-        Some(sc) -> {
-          let r = st_instantiate_report(st, sc)
-          let st2 = if r.fresh == [] and r.unit_fresh == [] {
-            r.st
-          } else {
-            st_push_inst(r.st, CS(fname, e.line, e.col, r.fresh, r.unit_fresh, None))
-          }
-          inferred_leaf(st2, r.ty, e)
-        }
+        Some(sc) -> synth_scheme_read(st, sc, fname, e)
         None -> {
           # Should not happen — rqc only rewrites when fname is in
           # the module's exports. If we land here, the table and the
@@ -8848,20 +8748,15 @@ fn synth_variants_of(st: InferState, ty_expr: TypeExpr, e: Expr) : Inferred / Co
   let ty = st_annot_ty(st, ty_expr)
   match ty {
     TyCon(tm, name, _, tsym) -> {
-      let vc = check_variants_nullary(st.env, name)
+      let vc = check_variants_nullary(st.env, tsym)
       match vc {
         VCOk(names) -> {
           # Re-stamp the AST node with the resolved names so codegen
           # has them without re-walking the env. Result type is
           # `[T]` (TyListT of TyCon).
-          # walker may visit both qualified
-          # `<target>::<cname>` and bare `<cname>` entries that both
-          # collapse to the same bare ctor name. Dedup before
-          # emitting so `variants[Suit]()` returns each tag once.
-          let names_dedup = union_merge_unique([], names)
           let result_ty = TyListT(TyCon(tm, name, [], tsym))
           let resolved = with_ty(
-            mk_expr(EVariantsOf(ty_expr, names_dedup), e.line, e.col),
+            mk_expr(EVariantsOf(ty_expr, union_merge_unique([], names)), e.line, e.col),
             result_ty)
           mk_inferred(st, result_ty, resolved)
         }
@@ -9583,9 +9478,8 @@ fn ty_dischargeable(a: Ty, b: Ty, s: Subst) : Bool {
       TyAny     -> true
       _ -> match ax {
         TyListT(ai) -> match bx { TyListT(bi) -> ty_dischargeable(ai, bi, s) _ -> false }
-        TyCon(am, an, aas, ta_sym) -> match bx {
-          TyCon(bm, bn, bas, tb_sym) ->
-            sym_compat(ta_sym, tb_sym) and module_slot_compat(am, bm) and an == bn and ty_list_dischargeable(aas, bas, s)
+        TyCon(_, _, aas, ta_sym) -> match bx {
+          TyCon(_, _, bas, tb_sym) -> sym_same(ta_sym, tb_sym) and ty_list_dischargeable(aas, bas, s)
           _ -> false
         }
         TyFnT(aps, ar, arow) -> match bx {
@@ -12028,14 +11922,26 @@ fn ty_is_real_head(t: Ty) : Bool {
   }
 }
 
-fn ty_same_head(a: Ty, b: Ty) : Bool {
-  match inf_ty_head_name(a) {
-    None -> false
-    Some(an) -> match inf_ty_head_name(b) {
-      None -> false
-      Some(bn) -> an == bn
+# Two operands share a head when they are the same scalar or name one
+# declaration, units and refinements aside. A type with no head (a
+# variable, a function, a union) shares none.
+fn ty_same_head(a: Ty, b: Ty) : Bool = {
+  let ha = ty_dispatch_head(a)
+  let hb = ty_dispatch_head(b)
+  match ha {
+    TyCon(_, _, _, sa) -> sym_raw(sa) >= 0 and sym_same(sa, ty_head_sym(hb))
+    TyListT(_)         -> sym_same(core_ty_sym(CtList), ty_head_sym(hb))
+    _ -> match scalar_ty_name(ha) {
+      Some(_) -> inf_ty_eq(ha, hb)
+      None    -> false
     }
   }
+}
+
+fn ty_dispatch_head(t: Ty) : Ty = match t {
+  TyDimT(base, _)    -> ty_dispatch_head(base)
+  TyRefineT(base, _) -> ty_dispatch_head(base)
+  _                  -> t
 }
 
 # predicate gating the operator → protocol-method
@@ -15426,13 +15332,8 @@ fn check_narrow_pattern(st: InferState, name: String, ty_expr: TypeExpr,
       let env2 = ty_env_add(st.env, name, mono(narrow_ty))
       st_bump_err(st_set_env(st, env2))
     }
-    TyCon(_, u_name, _, _) -> {
-      let narrow_name = match narrow_ty {
-        TyCon(_, n, _, _) -> n
-        _           -> ""
-      }
-      let comps = if narrow_name == "" { [] } else { variants_of_type(st.env, u_name) }
-      if narrow_name != "" and list_has(comps, narrow_name) {
+    TyCon(_, _, _, u_sym) -> {
+      if ut_lists(st.env.unions, u_sym, ut_ty_sym(narrow_ty)) {
         let env2 = ty_env_add(st.env, name, mono(narrow_ty))
         st_set_env(st, env2)
       } else {
@@ -15499,19 +15400,13 @@ fn check_list_subpats(st: InferState, ps: [Pattern], elem: Ty) : InferState / Co
 fn check_variant_pattern(st: InferState, cname: String, subpats: [Pattern], expected: Ty, line: Int, col: Int) : InferState / Console + File + Mutable {
 
 
-  # scrutinee-driven ctor disambiguation. When the
-  # expected type resolves to a `TyCon(_, parent, _)`, prefer the qualified
-  # `parent::cname` scheme if it exists; this is how a user variant
-  # `Response.Ok` shadows the core `Result.Ok` in patterns matching a
-  # `Response` scrutinee. Fall back to bare lookup so core variants
-  # and non-shadowing user variants keep working.
-  let applied = apply_ty(st.sub, expected)
-  let sc_opt = match applied {
-    TyCon(_, parent, _, _) -> match ty_env_lookup_qualified(st.env, parent, cname) {
-      Some(sc) -> Some(sc)
-      None     -> ty_env_lookup(st.env, cname)
-    }
-    _ -> ty_env_lookup(st.env, cname)
+  # The scrutinee's type decides the constructor: this is how a user
+  # variant `Response.Ok` shadows the core `Result.Ok` in patterns
+  # matching a `Response`. A scrutinee whose type declares no such
+  # constructor leaves the bare name to answer.
+  let sc_opt = match ctor_pick(st, expected, cname) {
+    Some(CtorPick(_, entry)) -> Some(entry.scheme)
+    None                     -> ty_env_lookup(st.env, cname)
   }
   match sc_opt {
     None -> {
@@ -16305,108 +16200,75 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
   }
 }
 
-# Helper: rewrite a bare-ctor call `EVar(cname)(args)`
-# to `EModCall(parent, cname)(args)` whenever a qualified `parent::cname`
-# entry exists. The rewrite is unconditional within annotation context —
-# `parent` IS the expected type, so the qualified scheme is the correct
-# one and the rewrite ALSO bypasses the bare-unannotated ambiguity
-# diagnostic in `synth_call` (which would otherwise fire whenever a
-# user variant shadows `Result.Ok` / `Option.Some`). Falls through to
-# `synth` when no qualified entry exists.
+# The constructor a pattern or a site spelled `cname` names, decided by
+# the type `t` it builds.
+fn ctor_pick(st: InferState, t: Ty, cname: String) : Option[CtorPick] =
+  sum_ctor(st.env, ut_ty_sym(apply_ty(st.sub, t)), cname)
+
+# The type-qualified form a decided constructor site is rewritten to,
+# spelled from the key its entry was registered under.
+fn ctor_site_kind(e: TyEntry) : ExprKind = match vix_ctor_key(e.name) {
+  Some(CtorKey(parent, cname)) -> EModCall(parent, cname)
+  None                         -> EVar(e.name)
+}
+
+# A bare constructor call under an expected type that declares the
+# constructor is rewritten to `EModCall(parent, cname)(args)`: the
+# expected type names the sum, so the bare-name table never wins and the
+# bare-unannotated ambiguity diagnostic of `synth_call` does not fire
+# (a user variant may shadow `Result.Ok` / `Option.Some`).
 fn ctor_check_or_synth(st: InferState, e: Expr, callee: Expr, args_: [Expr],
-                          expected: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable {
-
+                          expected: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable =
   match callee.kind {
-    EVar(cname) -> {
-      let applied = apply_ty(st.sub, expected)
-      match applied {
-        TyCon(_, parent, _, _) -> match ty_env_lookup_qualified(st.env, parent, cname) {
-          Some(_) -> {
-            let qcallee = mk_expr(EModCall(parent, cname), callee.line, callee.col)
-            let rewritten = mk_expr(ECall(qcallee, args_), line, col)
-            synth(st, rewritten)
-          }
-          None -> synth(st, e)
-        }
-        _ -> synth(st, e)
-      }
+    EVar(cname) -> match ctor_pick(st, expected, cname) {
+      Some(CtorPick(_, entry)) ->
+        synth(st, mk_expr(ECall(mk_expr(ctor_site_kind(entry), callee.line, callee.col), args_), line, col))
+      None -> synth(st, e)
     }
     _ -> synth(st, e)
   }
-}
 
-# Helper: a bare nullary ctor `EVar(cname)` in
-# annotation context whose qualified `parent::cname` exists picks the
-# qualified scheme.
-fn nullary_ctor_check_or_synth(st: InferState, e: Expr, expected: Ty) : Inferred / Console + File + Mutable {
-
+# A bare nullary constructor under an expected type that declares it
+# reads that declaration's scheme.
+fn nullary_ctor_check_or_synth(st: InferState, e: Expr, expected: Ty) : Inferred / Console + File + Mutable =
   match e.kind {
-    EVar(cname) -> {
-      let applied = apply_ty(st.sub, expected)
-      match applied {
-        TyCon(_, parent, _, _) -> match ty_env_lookup_qualified(st.env, parent, cname) {
-          Some(_) -> {
-            let qe = mk_expr(EModCall(parent, cname), e.line, e.col)
-            synth(st, qe)
-          }
-          None -> synth(st, e)
-        }
-        _ -> synth(st, e)
-      }
+    EVar(cname) -> match ctor_pick(st, expected, cname) {
+      Some(CtorPick(_, entry)) ->
+        synth_scheme_read(st, entry.scheme, cname, mk_expr(ctor_site_kind(entry), e.line, e.col))
+      None -> synth(st, e)
     }
     _ -> synth(st, e)
   }
+
+# A read of the declaration whose scheme is `sc`, spelled `nm` at `e`.
+fn synth_scheme_read(st: InferState, sc: TyScheme, nm: String, e: Expr) : Inferred / Console + File + Mutable = {
+  let r = st_instantiate_report(st, sc)
+  let st2 = if r.fresh == [] and r.unit_fresh == [] { r.st }
+            else { st_push_inst(r.st, CS(nm, e.line, e.col, r.fresh, r.unit_fresh, None)) }
+  inferred_leaf(st2, r.ty, e)
 }
 
-# collect the qualified parents of `cname` —
-# every `<X>::<cname>` key in the env where `X` looks like a sum type
-# (starts uppercase, contains no `::` itself). Used by the bare-
-# unannotated ambiguity diagnostic to list candidates the user must
-# disambiguate among.
-# `<X>::<cname>` buckets under `cname` in the name index, the same key
-# this query uses, so the bucket chain holds every candidate.
-fn ty_env_qualified_parents(env: TyEnv, cname: String) : [String] =
-  ty_env_qualified_parents_loop(idx_chain(env.index, cname), cname, [])
+# The sums a bare `cname` could mean, each as the entry its constructor
+# was registered with: every `<X>::<cname>` key buckets under `cname` in
+# the name index. One candidate per spelling of `X`, newest first: a
+# newer type spelled like an older one hides it from a bare name.
+fn ty_env_qualified_parents(env: TyEnv, cname: String) : [TyEntry] =
+  ctor_parents_loop(idx_chain(env.index, cname), cname, [], [])
 
-fn ty_env_qualified_parents_loop(es: [TyEntry], cname: String, acc: [String]) : [String] =
-  ty_env_qualified_parents_marked(es, cname, string_concat("::", cname), acc)
-
-# `suffix` depends only on `cname`; building it per entry rebuilt a
-# string for every entry of a table holding tens of thousands.
-fn ty_env_qualified_parents_marked(es: [TyEntry], cname: String, suffix: String, acc: [String]) : [String] {
-  match es {
-    [] -> list_reverse(acc)
-    [e, ...rest] -> {
-      let kn = string_length(e.name)
-      let sn = string_length(suffix)
-      if kn <= sn {
-        ty_env_qualified_parents_marked(rest, cname, suffix, acc)
-      } else {
-        let tail = string_slice(e.name, kn - sn, sn)
-        if tail == suffix {
-          let parent = string_slice(e.name, 0, kn - sn)
-          # Skip sentinel keys (`<tname>::__type_decl_arity_<N>__`) —
-          # their `cname` is `__type_decl_arity_<N>__`, never a real
-          # ctor name; but defend by checking the parent starts
-          # uppercase (sentinels and real sum types both do, so the
-          # length / suffix shape carries the discriminator). The
-          # uppercase guard also filters effect-op qualified keys
-          # (`Eff.op` was stored under a `.` separator pre-`::`).
-          let parent_upper = match char_at(parent, 0) {
-            Some(c) -> c >= 'A' and c <= 'Z'
-            None    -> false
-          }
-          if parent_upper and not list_has(acc, parent) {
-            ty_env_qualified_parents_marked(rest, cname, suffix, [parent, ...acc])
-          } else {
-            ty_env_qualified_parents_marked(rest, cname, suffix, acc)
-          }
-        } else {
-          ty_env_qualified_parents_marked(rest, cname, suffix, acc)
-        }
-      }
-    }
+fn ctor_parents_loop(es: [TyEntry], cname: String, seen: [String], acc: [TyEntry]) : [TyEntry] = match es {
+  [] -> list_reverse(acc)
+  [e, ...rest] -> match vix_ctor_key(e.name) {
+    Some(CtorKey(parent, c)) ->
+      if c == cname and not list_has(seen, parent) { ctor_parents_loop(rest, cname, [parent, ...seen], [e, ...acc]) }
+      else { ctor_parents_loop(rest, cname, seen, acc) }
+    None -> ctor_parents_loop(rest, cname, seen, acc)
   }
+}
+
+# The spelling of the sum a constructor entry was registered under.
+fn ctor_parent_name(e: TyEntry) : String = match vix_ctor_key(e.name) {
+  Some(CtorKey(parent, _)) -> parent
+  None                     -> e.name
 }
 
 # The scheme of a constructor `cname` declared by module `home`, on any
@@ -16445,29 +16307,25 @@ fn report_ctor_ambiguity_if_any(st: InferState, cname: String,
 
   match ty_env_lookup(st.env, cname) {
     None -> st
-    Some(bare_sc) -> match extract_return_tycon(bare_sc) {
-      None -> st
-      Some(bare_parent) ->
-        if bare_parent == "Result" or bare_parent == "Option" {
-          let user_parents = ty_env_qualified_parents_excluding_builtin(st.env, cname)
-          match user_parents {
-            [] -> st
-            _ -> {
-              let candidates_str = format_ctor_candidates(cname,
-                                                            [bare_parent, ...user_parents])
-              let perr = mk_diag(SevError, st.file, line, col,
-                concat_all(["ambiguous constructor '", cname,
-                            "' — matches both the core '",
-                            bare_parent, ".", cname,
-                            "' and user-declared variant(s)"]), [])
-              render_diag(perr)
-              diag_note(concat_all(["candidates: ", candidates_str]))
-              diag_help("annotate the binding with `let <name> : <Parent> = ...` to disambiguate")
-              st_bump_err(st_push_diag(st, perr))
-            }
+    Some(bare_sc) ->
+      if not scheme_builds_nominal(bare_sc) { st }
+      else if sym_is_core_sum(scheme_ret_sym(bare_sc)) {
+        let bare_parent = core_sum_name(scheme_ret_sym(bare_sc))
+        match map(ty_env_qualified_parents_excluding_builtin(st.env, cname), ctor_parent_name) {
+          [] -> st
+          user_parents -> {
+            let perr = mk_diag(SevError, st.file, line, col,
+              concat_all(["ambiguous constructor '", cname,
+                          "' — matches both the core '",
+                          bare_parent, ".", cname,
+                          "' and user-declared variant(s)"]), [])
+            render_diag(perr)
+            diag_note(concat_all(["candidates: ", format_ctor_candidates(cname, [bare_parent, ...user_parents])]))
+            diag_help("annotate the binding with `let <name> : <Parent> = ...` to disambiguate")
+            st_bump_err(st_push_diag(st, perr))
           }
-        } else { report_ctor_parents_if_ambiguous(st, cname, line, col) }
-    }
+        }
+      } else { report_ctor_parents_if_ambiguous(st, cname, line, col) }
   }
 }
 
@@ -16481,7 +16339,7 @@ fn report_ctor_ambiguity_if_any(st: InferState, cname: String,
 # rather than the types.
 fn report_ctor_parents_if_ambiguous(st: InferState, cname: String,
                                     line: Int, col: Int) : InferState / Console + File {
-  let parents = ty_env_qualified_parents_excluding_builtin(st.env, cname)
+  let parents = map(ty_env_qualified_parents_excluding_builtin(st.env, cname), ctor_parent_name)
   if list_length(parents) <= 1 or is_none(st.home) { st }
   else {
     let perr = mk_diag(SevError, st.file, line, col,
@@ -16500,22 +16358,16 @@ fn ctor_first_parent(parents: [String]) : String = match parents {
   [p, ..._] -> p
 }
 
-# Helper: list the qualified parents of `cname` registered in `env`
-# that are NOT the Result/Option core. Each parent appears at most
-# once; order mirrors the env's newest-first registration order.
-fn ty_env_qualified_parents_excluding_builtin(env: TyEnv, cname: String) : [String] =
-  filter_builtin_parents(ty_env_qualified_parents(env, cname), [])
+# The sums that declare `cname`, the runtime's `Result` and `Option`
+# left out.
+fn ty_env_qualified_parents_excluding_builtin(env: TyEnv, cname: String) : [TyEntry] =
+  filter(ty_env_qualified_parents(env, cname), (e) => not sym_is_core_sum(scheme_ret_sym(e.scheme)))
 
-fn filter_builtin_parents(parents: [String], acc: [String]) : [String] {
-  match parents {
-    [] -> list_reverse(acc)
-    [p, ...rest] -> if p == "Result" or p == "Option" {
-      filter_builtin_parents(rest, acc)
-    } else {
-      filter_builtin_parents(rest, [p, ...acc])
-    }
-  }
-}
+# The two sums whose constructors the runtime builds.
+fn sym_is_core_sum(s: SymId) : Bool = core_ty_is(s, CtResult) or core_ty_is(s, CtOption)
+
+fn core_sum_name(s: SymId) : String =
+  if core_ty_is(s, CtResult) { core_ty_name(CtResult) } else { core_ty_name(CtOption) }
 
 # Helper: render `Result.Ok, Response.Ok` for the ambiguity note.
 fn format_ctor_candidates(cname: String, parents: [String]) : String =
@@ -16528,31 +16380,6 @@ fn format_ctor_candidates_loop(cname: String, parents: [String], acc: String) : 
       let one = concat_all([p, ".", cname])
       let sep = if string_length(acc) == 0 { "" } else { ", " }
       format_ctor_candidates_loop(cname, rest, concat_all([acc, sep, one]))
-    }
-  }
-}
-
-# Predicate: is there a genuine ctor ambiguity for
-# `cname` between the bare slot and a qualified `<parent>::<cname>`
-# entry? Returns true only when:
-#   - a qualified `<parent>::<cname>` entry exists, AND
-#   - the bare `cname` entry exists, AND
-#   - the bare entry's return tycon name differs from `parent`.
-# In that case the bare lookup would silently pick the wrong scheme
-# (the core builtin or an earlier-declared user variant) and we
-# must rewrite the callee to `EModCall(parent, cname)` so resolution
-# pins the user variant. When no bare entry exists or bare already
-# returns `parent`, the synth path resolves correctly without
-# rewriting.
-fn ctor_needs_qualification(env: TyEnv, cname: String, parent: String) : Bool {
-  match ty_env_lookup_qualified(env, parent, cname) {
-    None -> false
-    Some(_) -> match ty_env_lookup(env, cname) {
-      None -> false
-      Some(bare_sc) -> match extract_return_tycon(bare_sc) {
-        Some(bare_parent) -> bare_parent != parent
-        None -> false
-      }
     }
   }
 }
@@ -17035,7 +16862,7 @@ fn expand_narrow_arms(arms: [Arm], env: TyEnv, mo: Option[String]) : [Arm] {
             TyCon(_, n, _, _) -> n
             _           -> ""
           }
-          let inner_vs = if tycon_name == "" { [] } else { variants_of_type(env, tycon_name) }
+          let inner_vs = variants_of_type(env, ut_ty_sym(narrow_ty))
           # Cover both the dual-rep ctor name (matches values built
           # via the parent union's own variant ctor) and each inner
           # variant (matches values built via the component type's
@@ -17124,327 +16951,91 @@ fn arms_cover_variant(arms: [Arm], target: String) : Bool {
   }
 }
 
-# Bucket key for the variant index: the type an entry constructs. The
-# arity sentinels carry no return tycon, but the walker reads them as a
-# declaration boundary, so they key under the type they close.
-fn ty_variant_key(e: TyEntry) : Option[String] =
-  match vix_marker_target(e.name) {
-    Some(t) -> Some(t)
-    None    -> extract_return_tycon(e.scheme)
-  }
-
-fn extract_return_tycon(sc: TyScheme) : Option[String] {
-  match sc {
-    Scheme(_, _, _, _, ty) -> match ty {
-      TyFnT(_, ret, _) -> match ret {
-        TyCon(_, nm, _, _) -> Some(nm)
-        _            -> None
-      }
-      TyCon(_, nm, _, _) -> Some(nm)
-      _            -> None
+# Register `e` in the sum table when it is a constructor's
+# type-qualified entry. The environment stores entries by name and a
+# module's delta serialises them so: this is the one place that key is
+# read back into the declarations it was registered for.
+fn ty_vix_add(vx: VariantIndex[TyEntry], homes: TyHomes, e: TyEntry) : VariantIndex[TyEntry] =
+  match vix_ctor_key(e.name) {
+    None -> vx
+    Some(CtorKey(_, cname)) -> {
+      let tsym = scheme_ret_sym(e.scheme)
+      if sym_raw(tsym) < 0 { vx } else { vix_prepend(vx, tsym, ty_ctor_sym(homes, tsym, cname), e) }
     }
   }
+
+# The declaration of the constructor spelled `cname` of the sum `tsym`
+# declares: the symbol table homes a constructor at its type's module,
+# and the runtime's own at the reserved core home. Absent when the
+# type-home table does not hold the sum.
+fn ty_ctor_sym(homes: TyHomes, tsym: SymId, cname: String) : SymId =
+  if core_ty_is(tsym, CtOption) or core_ty_is(tsym, CtResult) { sym_derive(NCCtor, cname, core_type_home()) }
+  else { match tsh_decl_home(homes, tsym) {
+    Some(h) -> sym_derive(NCCtor, cname, h)
+    None    -> sym_none()
+  } }
+
+# The declaration of the nominal type a scheme builds, as a function's
+# result or as the type itself; absent when it builds none.
+fn scheme_ret_sym(sc: TyScheme) : SymId = match sc {
+  Scheme(_, _, _, _, TyFnT(_, ret, _)) -> ut_ty_sym(ret)
+  Scheme(_, _, _, _, ty)               -> ut_ty_sym(ty)
 }
 
-fn variants_of_type_loop(es: [TyEntry], target: String, acc: [String]) : [String] =
-  variants_of_type_loop_arity(es, target, -1, acc)
+# The constructor part of a constructor's type-qualified entry.
+fn ty_ctor_name(e: TyEntry) : String = match vix_ctor_key(e.name) {
+  Some(CtorKey(_, c)) -> c
+  None                -> e.name
+}
 
-# The sentinel name depends only on (target, pin), and `pin` moves at
-# most once per walk (from the -1 sentinel to the arity the first
-# accepted variant fixes). Recomputing it per entry rebuilt a 4-element
-# concat list on every entry of a table that holds tens of thousands.
-fn variants_marker_for(target: String, pin: Int) : String =
-  if pin >= 0 { ty_env_decl_marker_name(target, pin) } else { "" }
+# The constructors of the sum `tsym` declares, as an arm spells them,
+# newest first.
+fn sum_ctor_names(env: TyEnv, tsym: SymId) : [String] =
+  union_merge_unique([], map(vix_chain(env.vindex, tsym), ty_ctor_name))
 
-# arity-aware entry point. Callers that know the
-# scrutinee's `TyCon(_, name, args)` shape pass `list_length(args)` so
-# the walker picks variants whose return tycon has the SAME arity.
-# This discriminates `Tree` (arity 0, user redeclaration) from
-# `Tree[k, v]` (arity 2, private `stdlib/collections/map.kai`).
-# Callers that don't know the arity pass `variants_of_type_loop`'s
-# legacy entry point and accept the "pin to first variant seen"
-# behaviour.
-fn variants_of_type_loop_with_arity(es: [TyEntry], target: String,
-                                       arity: Int, acc: [String]) : [String] =
-  variants_of_type_loop_arity(es, target, arity, acc)
+# A constructor as the sum table answers for it: its declaration, and
+# the entry it was registered with.
+type CtorPick = CtorPick(SymId, TyEntry)
 
-# walk newest-first; track the arity (number of type
-# arguments on the return tycon) of the first variant we accept and
-# skip any subsequent variant of the same `target` name whose return
-# tycon has a DIFFERENT arity. The arity discriminates `Tree`
-# (user, arity 0) from `Tree[k, v]` (core `stdlib/collections/
-# map.kai`, arity 2) when both register variants under the shared
-# bare-name table. Without this filter, a non-`pub` core type's
-# variants leaked into the user-scope match-exhaustiveness check
-# any time the user redeclared the same type name.
-#
-# `pin = -1` is the "not yet seen" sentinel — the first matching
-# variant pins the canonical arity for this walk. A subsequent
-# variant with a different arity belongs to an unrelated (shadowed
-# or unrelated-but-same-name) declaration and is ignored.
-#
-# When the user's redeclaration has the same arity as the core
-# type, this filter alone is not sufficient — but that case is
-# already caught by `validate_type_name_collisions_decls` for `pub`
-# cores, and the `top_names` shadow guard in `add_variants_loop`
-# strips zero-arg ctors that collide with another top-level type.
-# Private same-arity collisions in distinct stdlib modules are
-# rare; we currently leave them for a follow-up if they surface.
-fn variants_of_type_loop_arity(es: [TyEntry], target: String,
-                                  pin: Int, acc: [String]) : [String] =
-  variants_of_type_loop_marked(es, target, pin,
-                               variants_marker_for(target, pin),
-                               string_concat(target, "::"), acc)
-
-fn variants_of_type_loop_marked(es: [TyEntry], target: String,
-                                   pin: Int, marker: String,
-                                   prefix: String,
-                                   acc: [String]) : [String] {
-  match es {
-    [] -> list_reverse(acc)
-    [e, ...rest] -> {
-      # sentinel boundary check. The marker name has
-      # the form `<target>::__type_decl_arity_<N>__`. If we have
-      # already pinned an arity and we cross a marker for the same
-      # target whose arity equals our pin, we have left the
-      # newest declaration's variant region and entered an earlier
-      # (shadowed) one — stop.
-      if pin >= 0 and e.name == marker {
-        # Same-(target, arity) marker reached after we already
-        # collected at least one variant (or pinned). Either way,
-        # the variants we have are the canonical set.
-        list_reverse(acc)
-      } else {
-      # Effect ops are registered as `Eff.op` — those
-      # names also start uppercase but are not sum-type constructors,
-      # so the exhaustiveness check would otherwise treat them as
-      # missing variants of any matching return type.
-      let first_upper = match char_at(e.name, 0) {
-        Some(c) -> c >= 'A' and c <= 'Z'
-        None    -> false
-      }
-      # user variants registered under the
-      # qualified `<target>::<cname>` key (because a core builtin
-      # occupied the bare slot) must still surface as variants of
-      # `target`. Strip the `<target>::` prefix and recurse with the
-      # bare name as the candidate variant. Other qualified entries
-      # (`<other>::<cname>`, sentinels, effect ops) remain filtered.
-      # `Mod::fn` under an uppercase module is not a constructor.
-      let plain = not string_contains_dot(e.name) and not string_contains(e.name, "::")
-      let qual_strip = ty_env_strip_prefix(e.name, prefix)
-      match qual_strip {
-        Some(bare) -> {
-          # bare must itself be uppercase (sum-ctor convention) and
-          # not contain `.` (effect-op `Eff.op` was registered under a
-          # dotted name pre-`::` keying and must still be excluded).
-          let bare_upper = match char_at(bare, 0) {
-            Some(c) -> c >= 'A' and c <= 'Z'
-            None    -> false
-          }
-          if bare_upper and not string_contains_dot(bare) {
-            match extract_return_tycon_arity(e.scheme) {
-              Some(ta) -> match ta {
-                TCA(tn, ar) -> if tn == target {
-                  if pin < 0 {
-                    variants_of_type_loop_marked(rest, target, ar, variants_marker_for(target, ar), prefix, [bare, ...acc])
-                  } else if ar == pin {
-                    variants_of_type_loop_marked(rest, target, pin, marker, prefix, [bare, ...acc])
-                  } else {
-                    variants_of_type_loop_marked(rest, target, pin, marker, prefix, acc)
-                  }
-                } else {
-                  variants_of_type_loop_marked(rest, target, pin, marker, prefix, acc)
-                }
-              }
-              None -> variants_of_type_loop_marked(rest, target, pin, marker, prefix, acc)
-            }
-          } else {
-            variants_of_type_loop_marked(rest, target, pin, marker, prefix, acc)
-          }
-        }
-        None ->
-          if first_upper and plain {
-            match extract_return_tycon_arity(e.scheme) {
-              Some(ta) -> match ta {
-                TCA(tn, ar) -> if tn == target {
-                  if pin < 0 {
-                    variants_of_type_loop_marked(rest, target, ar, variants_marker_for(target, ar), prefix, [e.name, ...acc])
-                  } else if ar == pin {
-                    variants_of_type_loop_marked(rest, target, pin, marker, prefix, [e.name, ...acc])
-                  } else {
-                    variants_of_type_loop_marked(rest, target, pin, marker, prefix, acc)
-                  }
-                } else {
-                  variants_of_type_loop_marked(rest, target, pin, marker, prefix, acc)
-                }
-              }
-              None -> variants_of_type_loop_marked(rest, target, pin, marker, prefix, acc)
-            }
-          } else {
-            variants_of_type_loop_marked(rest, target, pin, marker, prefix, acc)
-          }
-      }
-      }
+# The constructor spelled `cname` of the sum `tsym` declares: a written
+# name is turned into the declaration it would be at the sum's home, and
+# the table answers by that id. Two sums of one module may declare the
+# name, so the sum is checked too.
+fn sum_ctor(env: TyEnv, tsym: SymId, cname: String) : Option[CtorPick] =
+  if sym_raw(tsym) < 0 { None }
+  else {
+    let csym = ty_ctor_sym(env.ty_homes, tsym, cname)
+    match find(vix_of_ctor(env.vindex, csym), (e) => sym_same(scheme_ret_sym(e.scheme), tsym)) {
+      Some(e) -> Some(CtorPick(csym, e))
+      None    -> None
     }
   }
-}
 
-# return tycon paired with the arity of its type-arg
-# list. `TCA(name, arity)` lets `variants_of_type_loop_arity`
-# distinguish `Tree` (arity 0) from `Tree[k, v]` (arity 2).
-type TyConArity = TCA(String, Int)
-
-# sentinel marker name. Inserted into `env.entries`
-# right after a `DType`'s variants are registered, with format
-# `<tname>::__type_decl_arity_<N>__`. The walker that enumerates
-# a tycon's variants stops at the first matching sentinel after
-# accepting at least one variant, which closes the boundary of an
-# earlier same-name same-arity declaration (e.g. a private core
-# `type SplitN = SplitOk | SplitShort` shadowed by a user
-# redeclaration of the same name and arity).
-#
-# The format keeps the sentinel filtered out by the existing
-# uppercase-name walkers (`__` does not start with `A`..`Z`) and
-# by the `::<fname>` qualified-key suffix scan (the sentinel ends
-# with `__type_decl_arity_<N>__`, not `::<user_target>`).
-fn ty_env_decl_marker_name(tname: String, arity: Int) : String = vix_marker_name(tname, arity)
-
-fn ty_env_add_decl_marker(env: TyEnv, tname: String, arity: Int) : TyEnv = {
-  # The sentinel's scheme is a closed `Scheme([], [], [], [], TyAny)`
-  # so any accidental read returns `None` from
-  # `extract_return_tycon_arity`. The walker keys on the name
-  # alone and never dereferences the scheme.
-  let dummy = mono(TyAny)
-  ty_env_add(env, ty_env_decl_marker_name(tname, arity), dummy)
-}
-
-fn extract_return_tycon_arity(sc: TyScheme) : Option[TyConArity] {
-  # NOTE: name the slot `tas` (not `args`); `args` shadows the
-  # core's CLI-args fn and the codegen wires the call to the
-  # closure instead of the local binding (see CLAUDE.md / global
-  # feedback memo on the `args` shadow).
-  match sc {
-    Scheme(_, _, _, _, ty) -> match ty {
-      TyFnT(_, ret, _) -> match ret {
-        TyCon(_, nm, tas, _) -> Some(TCA(nm, list_length(tas)))
-        _              -> None
-      }
-      TyCon(_, nm, tas, _) -> Some(TCA(nm, list_length(tas)))
-      _              -> None
-    }
+fn sum_ctor_scheme(env: TyEnv, tsym: SymId, cname: String) : Option[TyScheme] =
+  match sum_ctor(env, tsym, cname) {
+    Some(CtorPick(_, e)) -> Some(e.scheme)
+    None                 -> None
   }
-}
 
-# components recorded in `env.unions` (the per-decl
-# summary) are merged with the env-entry walk so shadow components
-# (a variant whose name matches an existing top-level type
-# and is therefore not registered as a zero-arg ctor) still surface
-# as components. Names from the variant table win when both lists
-# would otherwise duplicate; the merge preserves the entry-side
-# order to avoid spurious selfhost output diffs.
-fn variants_of_type(env: TyEnv, tycon: String) : [String] = {
-  let from_entries = variants_of_type_loop(vix_chain(env.vindex, tycon), tycon, [])
-  let from_summary = union_components_of(env.unions, tycon)
-  # the entry walker emits one variant name per
-  # matching entry, and the ctor-overloading walker registers both bare (`Ok`) and qualified
-  # (`Result::Ok`) keys for core builtins (and qualified-only for
-  # user variants that collide with bare). Dedup the entry list before
-  # merging so exhaustiveness does not see double-counted variants.
-  let entries_dedup = union_merge_unique([], from_entries)
-  union_merge_unique(entries_dedup, from_summary)
-}
-
-# arity-aware variant of `variants_of_type`. Callers
-# that have the scrutinee's full `TyCon(_, name, args)` use this to
-# select variants whose return tycon has the matching arity, so a
-# private core `Tree[k, v]` (arity 2) does not leak its variants
-# into the exhaustiveness check of a user-declared `Tree` (arity 0)
-# and vice-versa. Falls back to the bare-name walk when no entry
-# matches the arity (legacy single-arity types stay byte-identical).
-fn variants_of_type_arity(env: TyEnv, tycon: String, arity: Int) : [String] = {
-  # dedup the entry walker's output before any
-  # downstream merge. Bare (`Ok`) and qualified (`Result::Ok`) entries
-  # both produce the same bare ctor name; without dedup exhaustiveness
-  # double-counts and reports phantom missing variants.
-  let raw_entries = variants_of_type_loop_with_arity(vix_chain(env.vindex, tycon), tycon, arity, [])
-  let from_entries = union_merge_unique([], raw_entries)
-  match from_entries {
-    [] -> {
-      # No arity-matched entries — fall back to the bare-name walk
-      # so records / opaque tycons whose schemes the variant table
-      # does not register still surface their union components.
-      # The fallback consults `env.unions` (the shadow path) and is
-      # non-arity-aware; this is acceptable
-      # because the fallback only fires when the variant entries
-      # produced no arity match — i.e. no genuine ambiguity exists.
-      let raw_fallback = variants_of_type_loop(vix_chain(env.vindex, tycon), tycon, [])
-      let fallback = union_merge_unique([], raw_fallback)
-      union_merge_unique(fallback, union_components_of(env.unions, tycon))
-    }
-    # Arity-matched entries from the variant table are the
-    # canonical view; `env.unions` is non-arity-aware and would
-    # re-introduce the other arity's components if merged in
-    # blindly. Filter the summary against the matched entries'
-    # parent declaration by keeping only summary entries that
-    # also surface (or are already in) the entry-list.
-    _ -> union_merge_with_summary_filtered(from_entries,
-                                              env.unions, tycon, arity)
+#[doc("infer: the scheme of the constructor the declaration `csym` names, or None when the sum table holds none.")]
+pub fn ty_env_lookup_ctor_sym(env: TyEnv, csym: SymId) : Option[TyScheme] =
+  match vix_of_ctor(env.vindex, csym) {
+    [e, ..._] -> Some(e.scheme)
+    []        -> None
   }
-}
 
-# merge `from_entries` (already arity-matched) with the
-# subset of `env.unions` components that *also* belong to the same
-# (name, arity) declaration. A `UnionInfo` does not carry arity
-# directly, so we infer it from any entry whose return tycon
-# matches `(tycon, arity)` — `UnionInfo`'s `parent` field. If a
-# `UnionInfo` for `tycon` exists whose listed components include at
-# least one of the variants we already pulled from entries, we
-# merge in its full component list; otherwise we ignore it (the
-# other-arity union is structurally unrelated).
-fn union_merge_with_summary_filtered(from_entries: [String],
-                                        unions: [UnionInfo], tycon: String,
-                                        arity: Int) : [String] {
-  match unions {
-    [] -> from_entries
-    [u, ...rest] -> match u {
-      UI(parent, comps, _, _) ->
-        if parent == tycon {
-          let cnames = ty_component_names(comps, [])
-          if any_str_in(cnames, from_entries) {
-            union_merge_unique(from_entries,
-              union_merge_with_summary_filtered_collect(cnames, []))
-          } else {
-            union_merge_with_summary_filtered(from_entries, rest, tycon, arity)
-          }
-        } else {
-          union_merge_with_summary_filtered(from_entries, rest, tycon, arity)
-        }
-    }
-  }
-}
+# What a match on the type `tsym` declares must cover: its
+# constructors, then the components no constructor stands for (a
+# variant naming a declared type registers none).
+fn variants_of_type(env: TyEnv, tsym: SymId) : [String] =
+  union_merge_unique(sum_ctor_names(env, tsym), union_component_names(env.unions, tsym))
 
-fn union_merge_with_summary_filtered_collect(xs: [String], acc: [String]) : [String] {
-  match xs {
-    [] -> list_reverse(acc)
-    [h, ...rest] -> union_merge_with_summary_filtered_collect(rest, [h, ...acc])
-  }
-}
-
-fn ty_component_names(ts: [Ty], acc: [String]) : [String] {
-  match ts {
-    [] -> list_reverse(acc)
-    [t, ...rest] -> match t {
-      TyCon(_, nm, _, _) -> ty_component_names(rest, [nm, ...acc])
-      _ -> ty_component_names(rest, acc)
-    }
-  }
-}
-
-fn any_str_in(xs: [String], ys: [String]) : Bool {
-  match xs {
-    [] -> false
-    [h, ...rest] -> if list_has(ys, h) { true } else { any_str_in(rest, ys) }
-  }
+# True when a scheme builds a nominal type, whether or not that type
+# carries an identity.
+fn scheme_builds_nominal(sc: TyScheme) : Bool = match sc {
+  Scheme(_, _, _, _, TyFnT(_, TyCon(_, _, _, _), _)) -> true
+  Scheme(_, _, _, _, TyCon(_, _, _, _))              -> true
+  _                                                   -> false
 }
 
 fn union_merge_unique(a: [String], b: [String]) : [String] {
@@ -17455,93 +17046,29 @@ fn union_merge_unique(a: [String], b: [String]) : [String] {
   }
 }
 
-# classify a type's variants for `variants[T]()`. The
-# builtin restricts T to *nullary-only* sum types: once a variant
-# takes arguments, "list all inhabitants" is ill-defined. This walker
-# partitions
-# the env entries that mention `target` as their return tycon
-# into nullary names and payload-bearing names; it also reports
-# the "no such sum type" case (no entry matches at all).
+# Classify a sum's constructors for `variants[T]()`, which lists the
+# inhabitants of a nullary-only sum: its nullary constructors, the ones
+# that take arguments, or no constructor at all.
 type VariantsCheck = VCOk([String]) | VCNotSum | VCHasPayload([String])
 
-fn check_variants_nullary(env: TyEnv, target: String) : VariantsCheck {
-  check_variants_nullary_marked(vix_chain(env.vindex, target), target,
-                                string_concat(target, "::"), [], [])
-}
+fn check_variants_nullary(env: TyEnv, tsym: SymId) : VariantsCheck =
+  check_variants_nullary_rows(vix_chain(env.vindex, tsym), [], [])
 
-fn check_variants_nullary_marked(es: [TyEntry], target: String, prefix: String,
-                                ok_acc: [String], err_acc: [String]) : VariantsCheck {
-  match es {
-    # NOTE on order: the chain is most-recent-first (ty_env_add
-    # prepends). For sum-type variants registered via
-    # `add_variants_loop`, that means the head of `entries` is the
-    # *last*-declared variant. Walking head-to-tail and prepending to
-    # `acc` therefore double-inverts back to declaration order, so
-    # the accumulators here are returned **without** a final reverse.
-    # `variants[T]()`'s spec guarantees declaration order; relying on
-    # this ordering is intentional. (variants_of_type_loop does the
-    # opposite — it list_reverses — but its caller, exhaustiveness,
-    # is order-insensitive, so the bug never surfaced there.)
-    [] -> {
-      let ok_empty  = match ok_acc  { [] -> true _ -> false }
-      let err_empty = match err_acc { [] -> true _ -> false }
-      if ok_empty and err_empty { VCNotSum }
-      else if err_empty { VCOk(ok_acc) }
-      else { VCHasPayload(err_acc) }
-    }
-    [e, ...rest] -> {
-      # qualified entries `<target>::<cname>` are
-      # registered alongside bare entries for variants whose bare
-      # slot would shadow a core builtin (Ok/Err/Some/None). The
-      # variants walker must use the BARE name (the variant tag
-      # runtime keys on), and bare AND qualified entries collapse to
-      # the same tag — emit the bare form, and dedup via the caller.
-      # Other qualified entries (e.g. `Eff.op` under a `.` separator)
-      # were already filtered by the `string_contains_dot` check.
-      let visible_name = match ty_env_strip_prefix(e.name, prefix) {
-        Some(bare) -> bare
-        None       -> e.name
-      }
-      let first_upper = match char_at(visible_name, 0) {
-        Some(c) -> c >= 'A' and c <= 'Z'
-        None    -> false
-      }
-      let plain = not string_contains_dot(visible_name) and not string_contains(visible_name, "::")
-      if first_upper and plain {
-        match e.scheme {
-          Scheme(_, _, _, _, ty) -> match ty {
-            # Zero-arg variant: scheme is the bare TyCon (e.g. `Hearts`
-            # for `type Suit = Hearts | ...`).
-            TyCon(_, nm, _, _) ->
-              if nm == target {
-                check_variants_nullary_marked(rest, target, prefix, [visible_name, ...ok_acc], err_acc)
-              } else {
-                check_variants_nullary_marked(rest, target, prefix, ok_acc, err_acc)
-              }
-            # N-ary variant: scheme is a TyFnT returning the target.
-            # Empty args list means nullary; non-empty means payload.
-            TyFnT(pargs, ret, _) -> match ret {
-              TyCon(_, nm, _, _) ->
-                if nm == target {
-                  let args_empty = match pargs { [] -> true _ -> false }
-                  if args_empty {
-                    check_variants_nullary_marked(rest, target, prefix, [visible_name, ...ok_acc], err_acc)
-                  } else {
-                    check_variants_nullary_marked(rest, target, prefix, ok_acc, [visible_name, ...err_acc])
-                  }
-                } else {
-                  check_variants_nullary_marked(rest, target, prefix, ok_acc, err_acc)
-                }
-              _ -> check_variants_nullary_marked(rest, target, prefix, ok_acc, err_acc)
-            }
-            _ -> check_variants_nullary_marked(rest, target, prefix, ok_acc, err_acc)
-          }
-        }
-      } else {
-        check_variants_nullary_marked(rest, target, prefix, ok_acc, err_acc)
-      }
-    }
+# The chain is newest first, so prepending restores declaration order,
+# which `variants[T]()` guarantees.
+fn check_variants_nullary_rows(rows: [TyEntry], ok_acc: [String], err_acc: [String]) : VariantsCheck =
+  match rows {
+    [] -> if list_is_empty(ok_acc) and list_is_empty(err_acc) { VCNotSum }
+          else if list_is_empty(err_acc) { VCOk(ok_acc) }
+          else { VCHasPayload(err_acc) }
+    [e, ...rest] ->
+      if scheme_takes_args(e.scheme) { check_variants_nullary_rows(rest, ok_acc, [ty_ctor_name(e), ...err_acc]) }
+      else { check_variants_nullary_rows(rest, [ty_ctor_name(e), ...ok_acc], err_acc) }
   }
+
+fn scheme_takes_args(sc: TyScheme) : Bool = match sc {
+  Scheme(_, _, _, _, TyFnT(pargs, _, _)) -> not list_is_empty(pargs)
+  _                                      -> false
 }
 
 fn find_missing_variants(needed: [String], arms: [Arm], acc: [String]) : [String] {
@@ -17663,10 +17190,7 @@ fn x_ctor_entry(st: InferState, cn: String, scr_ty: Ty) : Option[[XSib]] =
   }
 
 fn x_ctor_scheme(env: TyEnv, cn: String, scr_ty: Ty) : Option[TyScheme] = {
-  let own = match scr_ty {
-    TyCon(_, parent, _, _) -> ty_env_lookup_qualified(env, parent, cn)
-    _                      -> None
-  }
+  let own = sum_ctor_scheme(env, ut_ty_sym(scr_ty), cn)
   match own {
     Some(sc) -> Some(sc)
     None     -> if x_ctor_ambiguous(env, cn) { None } else { ty_env_lookup(env, cn) }
@@ -17675,68 +17199,37 @@ fn x_ctor_scheme(env: TyEnv, cn: String, scr_ty: Ty) : Option[TyScheme] = {
 
 fn x_ctor_ambiguous(env: TyEnv, cn: String) : Bool = match ty_env_lookup(env, cn) {
   None -> false
-  Some(sc) -> match extract_return_tycon(sc) {
-    Some(parent) ->
-      if parent == "Result" or parent == "Option" { not list_is_empty(ty_env_qualified_parents_excluding_builtin(env, cn)) }
-      else { list_length(ty_env_qualified_parents(env, cn)) > 1 }
-    None -> true
-  }
+  Some(sc) ->
+    if not scheme_builds_nominal(sc) { true }
+    else if sym_is_core_sum(scheme_ret_sym(sc)) { not list_is_empty(ty_env_qualified_parents_excluding_builtin(env, cn)) }
+    else { list_length(ty_env_qualified_parents(env, cn)) > 1 }
 }
 
 # A type with no variant list has the one constructor.
-fn x_ctor_siblings(env: TyEnv, cn: String, sc: TyScheme) : [XSib] = match x_scheme_ret(sc) {
-  Some((tycon, ar)) -> match variants_of_type_arity(env, tycon, ar) {
+fn x_ctor_siblings(env: TyEnv, cn: String, sc: TyScheme) : [XSib] = {
+  let tsym = scheme_ret_sym(sc)
+  match variants_of_type(env, tsym) {
     []   -> [XSib(cn, cn)]
-    sibs -> map(sibs, (s) => XSib(s, x_ctor_spelling(env, s, tycon)))
+    sibs -> map(sibs, (s) => XSib(s, x_ctor_spelling(env, s, tsym)))
   }
-  None -> [XSib(cn, cn)]
 }
 
-fn x_ctor_spelling(env: TyEnv, cn: String, tycon: String) : String =
-  match ty_env_lookup_qualified(env, tycon, cn) {
+fn x_ctor_spelling(env: TyEnv, cn: String, tsym: SymId) : String =
+  match sum_ctor_scheme(env, tsym, cn) {
     Some(Scheme(_, _, _, _, TyFnT(params, _, _))) ->
       if list_is_empty(params) { cn } else { concat_all([cn, "(", inf_join_with(map(params, (p) => "_"), ", "), ")"]) }
     _ -> cn
   }
-
-# The variants of the sum the scrutinee's type denotes: none when the
-# sum spelled `tycon` is another declaration (a record of the same name).
-fn x_variants_of(env: TyEnv, tycon: String, arity: Int, scr_sym: SymId) : [String] =
-  match variants_of_type_arity(env, tycon, arity) {
-    [] -> []
-    vs -> if sym_compat(x_sum_sym(env, tycon, vs), scr_sym) { vs } else { [] }
-  }
-
-fn x_sum_sym(env: TyEnv, tycon: String, vs: [String]) : SymId = match vs {
-  [] -> sym_none()
-  [cn, ..._] -> match ty_env_lookup_qualified(env, tycon, cn) {
-    Some(Scheme(_, _, _, _, TyFnT(_, TyCon(_, _, _, s), _))) -> s
-    Some(Scheme(_, _, _, _, TyCon(_, _, _, s)))              -> s
-    _                                                        -> sym_none()
-  }
-}
-
-fn x_scheme_ret(sc: TyScheme) : Option[(String, Int)] = match sc {
-  Scheme(_, _, _, _, ty) -> match ty {
-    TyFnT(_, TyCon(_, nm, tas, _), _) -> Some((nm, list_length(tas)))
-    TyCon(_, nm, tas, _)              -> Some((nm, list_length(tas)))
-    _                                 -> None
-  }
-}
 
 fn check_exhaustive_ctors(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState / Console + File {
 
   if has_catch_all(arms) { st }
   else {
     match scr_ty {
-      TyCon(_, tycon, scr_tas, scr_sym) -> {
-        # thread the scrutinee's tycon arity so private
-        # core types of the same bare name but different arity
-        # (e.g. `Tree[k, v]` in `stdlib/collections/map.kai`) do not
-        # leak their variants into the user's exhaustiveness check.
-        # The slot is named `scr_tas` (not `args`) to avoid the
-        # `args`-core shadow that bites the stage 0/1 resolver.
-        let needed = x_variants_of(st.env, tycon, list_length(scr_tas), scr_sym)
+      TyCon(_, tycon, _, scr_sym) -> {
+        # The declaration decides: a type spelled alike elsewhere, of
+        # any arity, has its own constructors.
+        let needed = variants_of_type(st.env, scr_sym)
         match needed {
           [] -> st                     # unknown sum (e.g. Int, lists): skip
           _  -> {
@@ -17766,8 +17259,8 @@ fn check_exhaustive_ctors(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, co
             # collides with another type's variant) are NOT in
             # `env.unions`, so this trigger preserves the existing
             # flat behavior for those.
-            if any_arm_is_narrow(arms) or is_union_of_types(st.env, tycon) {
-              check_union_components_under_tycon(st, arms, tycon, needed, line, col)
+            if any_arm_is_narrow(arms) or is_union_of_types(st.env, scr_sym) {
+              check_union_components_under_tycon(st, arms, tycon, scr_sym, needed, line, col)
             } else {
               let missing = find_missing_variants(needed, arms, [])
               match missing {
@@ -17821,12 +17314,10 @@ fn check_union_component(st: InferState, arms: [Arm], comp: Ty,
 
 
   match comp {
-    TyCon(_, tycon, comp_tas, _) -> {
-      if arms_cover_narrow(arms, tycon) { st }
+    TyCon(_, tycon, _, csym) -> {
+      if arms_cover_narrow(st, arms, csym) { st }
       else {
-        # arity-aware variant lookup; see `check_exhaustive`.
-        # Use `comp_tas` (not `args`) to avoid the core-`args` shadow.
-        let needed = variants_of_type_arity(st.env, tycon, list_length(comp_tas))
+        let needed = variants_of_type(st.env, csym)
         match needed {
           [] -> st       # not a sum component (record / primitive); skip
           _  -> {
@@ -17875,17 +17366,17 @@ fn check_union_component(st: InferState, arms: [Arm], comp: Ty,
 # not themselves declared types. Requiring EVERY component to be
 # a declared sum/union type isolates true unions-of-types from
 # regular sum types and from union collision shapes.
-fn is_union_of_types(env: TyEnv, tycon: String) : Bool {
-  match union_components_of(env.unions, tycon) {
+fn is_union_of_types(env: TyEnv, tycon: SymId) : Bool {
+  match ut_components(env.unions, tycon) {
     [] -> false
     comps -> all_components_are_declared_types(env, comps)
   }
 }
 
-fn all_components_are_declared_types(env: TyEnv, comps: [String]) : Bool {
+fn all_components_are_declared_types(env: TyEnv, comps: [Ty]) : Bool {
   match comps {
     [] -> true
-    [c, ...rest] -> match union_components_of(env.unions, c) {
+    [c, ...rest] -> match ut_components(env.unions, ut_ty_sym(c)) {
       [] -> false
       _  -> all_components_are_declared_types(env, rest)
     }
@@ -17914,29 +17405,30 @@ fn any_arm_is_narrow(arms: [Arm]) : Bool {
 # so, treat it as a component — covered iff a PNarrow arm targets
 # it OR all of its sub-variants are covered. Otherwise it's an
 # atomic variant and we check direct arm coverage.
-fn check_union_components_under_tycon(st: InferState, arms: [Arm], parent: String,
+fn check_union_components_under_tycon(st: InferState, arms: [Arm], parent: String, psym: SymId,
                                         comps: [String], line: Int, col: Int) : InferState / Console + File {
 
 
   match comps {
     [] -> st
     [c, ...rest] -> {
-      let st1 = check_one_union_comp(st, arms, parent, c, line, col)
-      check_union_components_under_tycon(st1, arms, parent, rest, line, col)
+      let st1 = check_one_union_comp(st, arms, parent, psym, c, line, col)
+      check_union_components_under_tycon(st1, arms, parent, psym, rest, line, col)
     }
   }
 }
 
-fn check_one_union_comp(st: InferState, arms: [Arm], parent: String, comp: String,
+fn check_one_union_comp(st: InferState, arms: [Arm], parent: String, psym: SymId, comp: String,
                           line: Int, col: Int) : InferState / Console + File {
 
 
-  if arms_cover_narrow(arms, comp) { st }
+  let csym = ut_component_named(st.env.unions, psym, comp)
+  if arms_cover_narrow(st, arms, csym) { st }
   else {
     # If `comp` is itself a declared type with its own variants,
     # this is a component of a union-of-types decl. Walk its
     # variants and require each to be covered.
-    let sub_variants = variants_of_type(st.env, comp)
+    let sub_variants = variants_of_type(st.env, csym)
     match sub_variants {
       [] -> {
         # Atomic variant of `parent` — direct coverage required.
@@ -17989,23 +17481,16 @@ fn check_one_union_comp(st: InferState, arms: [Arm], parent: String, comp: Strin
   }
 }
 
-fn arms_cover_narrow(arms: [Arm], tycon: String) : Bool {
-  match arms {
-    [] -> false
-    [a, ...rest] -> match a {
-      Arm(pat, guard, _) -> {
-        let unguarded = match guard { None -> true Some(_) -> false }
-        let hit = match pat.pkind {
-          PNarrow(_, ty) -> match ty.tkind {
-            TyName(_, nm, _) -> nm == tycon
-            _             -> false
-          }
-          _ -> false
-        }
-        if hit and unguarded { true } else { arms_cover_narrow(rest, tycon) }
-      }
-    }
+# An unguarded `name : T` arm covers the whole component `T` names.
+fn arms_cover_narrow(st: InferState, arms: [Arm], comp: SymId) : Bool =
+  sym_raw(comp) >= 0 and any(arms, (a) => arm_narrows_to(st, a, comp))
+
+fn arm_narrows_to(st: InferState, a: Arm, comp: SymId) : Bool = match a {
+  Arm(pat, None, _) -> match pat.pkind {
+    PNarrow(_, ty) -> sym_raw(ut_ty_sym(st_annot_ty(st, ty))) == sym_raw(comp)
+    _              -> false
   }
+  _ -> false
 }
 
 
@@ -19900,14 +19385,17 @@ type ProgramData = {
   homes:      TyHomes
 }
 
-#[doc("infer: the tables every module's typecheck reads, built once over the full program decl stream: the built-in seed, the env entries and indexes of every module typed so far, the row-kind slots, the type homes and the effect-alias resolution.")]
+#[doc("infer: the tables every module's typecheck reads, built once over the full program decl stream: the built-in seed, the env entries and indexes of every module typed so far, the row-kind slots, the type homes, the effect-alias resolution, the unions of the modules typed so far and the union rows of those still to come.")]
 pub type TcShared = {
   seed:      BuiltEnv,
   inh:       TyEnvParts,
   rk_table:  [RowKindEntry],
   homes:     TyHomes,
   alias_res: AliasResolution,
-  field_recs: FieldRecs
+  field_recs: FieldRecs,
+  unions:    UnionTable,
+  # In stream order, which is the order the modules are typed in.
+  unions_ahead: [UnionRow]
 }
 
 #[doc("infer: build the `TcShared` tables once over the whole program, so a module's typecheck neither rebuilds the seed nor rescans the program for homes and aliases.")]
@@ -19916,26 +19404,47 @@ pub fn tc_shared(file: String, df: DiagFiles, all_program_decls: [Decl],
   let alias_cands = collect_alias_cands(all_program_decls, df)
   let eff_names = collect_effect_names(all_program_decls)
   let seed = build_ty_env_seed()
+  let homes = tsh_homes(all_program_decls, tab, views, module_name_of_path(file))
   TcShared {
     seed: seed,
     inh: TEP(seed.env.entries, seed.env.index, seed.env.vindex),
     rk_table: compute_row_kind_slots(all_program_decls),
-    homes: tsh_homes(all_program_decls, tab, views, module_name_of_path(file)),
+    homes: homes,
     alias_res: resolve_alias_cands(alias_cands, eff_names, file),
-    field_recs: field_recs_of(all_program_decls)
+    field_recs: field_recs_of(all_program_decls),
+    unions: ut_empty(),
+    unions_ahead: collect_union_rows(all_program_decls, tsh_view(homes, None))
   }
 }
 
 #[doc("infer: fold a typed module's env entries into the shared tables, so the next module starts from the entries and indexes of everything typed before it.")]
 pub fn tc_shared_extend(sh: TcShared, delta: ModuleEnvDelta) : TcShared =
   match sh.inh {
-    TEP(es, ix, vx) -> TcShared {
-      seed: sh.seed,
-      inh: ty_env_prepend_batch(delta.ty_entries, es, ix, vx),
-      rk_table: sh.rk_table, homes: sh.homes, alias_res: sh.alias_res,
-      field_recs: sh.field_recs
+    TEP(es, ix, vx) -> match union_rows_split(sh.unions_ahead, delta.unions, []) {
+      URSplit(block, ahead) -> TcShared {
+        seed: sh.seed,
+        inh: ty_env_prepend_batch(delta.ty_entries, es, ix, vx, sh.homes),
+        rk_table: sh.rk_table, homes: sh.homes, alias_res: sh.alias_res,
+        field_recs: sh.field_recs,
+        unions: ut_add(sh.unions, block), unions_ahead: ahead
+      }
     }
   }
+
+# The rows of the module a delta came from, and the rows still ahead.
+type URSplit = URSplit([UnionRow], [UnionRow])
+
+# A delta lists one union per row of its module, in the same order, so
+# the module's rows are the next ones ahead.
+fn union_rows_split(ahead: [UnionRow], us: [UnionInfo], acc: [UnionRow]) : URSplit = match us {
+  [] -> URSplit(list_reverse(acc), ahead)
+  [UI(un, _, ul, uc), ...urest] -> match ahead {
+    [UnionRow(t, comps, l, c), ...rest] ->
+      if l == ul and c == uc { union_rows_split(rest, urest, [UnionRow(t, comps, l, c), ...acc]) }
+      else { panic("union rows out of step with the module deltas: #{un}") }
+    [] -> panic("union rows out of step with the module deltas: #{un}")
+  }
+}
 
 # Working tables for one module, seeded from the inherited
 # `ModuleEnvDelta` and the program-wide `TcShared`. Cons-front, so this
@@ -19956,8 +19465,7 @@ fn collect_program_data_inherited(file: String, decls: [Decl],
   let aliases_all = unit_alias_compose(aliases_here, inherited.unit_aliases)
   let decls_a = expand_unit_aliases_decls(decls, aliases_all)
   let hview = tsh_view(sh.homes, None)
-  let unions_here = collect_unions(decls_a, hview)
-  let unions_all = list_append(unions_here, inherited.unions)
+  let unions_all = ut_add(sh.unions, collect_union_rows(decls_a, hview))
   let top_names = collect_top_type_names(decls_a)
   let built = build_ty_env_inherited(sh.seed, sh.inh, inherited, decls_a,
                                        unions_all, top_names, sh.rk_table, tab,
@@ -20561,7 +20069,7 @@ fn synth_find_arg(scope: [TyEntry], want: Ty, fresh: Int, avoid: [String], sub: 
       if list_has_string(avoid, te.name) or (not synth_return_structural(te.scheme)) {
         synth_find_arg(rest, want, fresh, avoid, sub)
       } else {
-        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: [], constructors: [], head_owners: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
+        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: ut_empty(), constructors: [], head_owners: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
         match unify(inst.ty, want, sub) {
           Some(sub1) -> Some(ArgMatch { name: te.name, sub: sub1, fresh: inst.env.fresh })
           None       -> synth_find_arg(rest, want, fresh, avoid, sub)
@@ -20593,7 +20101,7 @@ type Synth = { expr: String, performs: [Label] }
 # Try entry `te` as a direct match or a 1-level application against
 # `expected`.
 fn synth_try_entry(cx: SynthCtx, te: TyEntry) : Option[Synth] / Mutable {
-  let inst = instantiate(TyEnv { entries: [], fresh: cx.fresh, unions: [], constructors: [], head_owners: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
+  let inst = instantiate(TyEnv { entries: [], fresh: cx.fresh, unions: ut_empty(), constructors: [], head_owners: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
   match unify(inst.ty, cx.expected, subst_empty()) {
     Some(_) -> Some(Synth { expr: te.name, performs: [] })
     None    -> match inst.ty {
