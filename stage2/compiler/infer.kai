@@ -10534,34 +10534,11 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
                         line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
-  # The receiver's type picks among the modules declaring `ident`; a
-  # name none of them answers reads the root file's function, else the
-  # builtin.
-  let candidates = st_visible_candidates(st, ident)
-  let picked = match pick_by_first_arg(st, candidates, obj_ty) {
-    Some(p) -> Some(p)
-    None -> match ufcs_bare_sym(st.env, ident) {
-      None -> None
-      Some(s) -> match env_sym(st.env, s) {
-        None -> None
-        Some(sc) -> {
-          let inst = st_instantiate_report(st, sc)
-          Some(PickResult { st: inst.st, inst_ty: inst.ty,
-                            fresh: inst.fresh, unit_fresh: inst.unit_fresh, sym: s })
-        }
-      }
-    }
-  }
-  match picked {
+  match ufcs_target(st, ident, obj_ty, line, col) {
     None -> ufcs_method_not_found(st, ident, obj_expr, obj_ty, args_, line, col)
-    Some(pick) -> {
-      let inst_st = pick.st
-      let inst_ty = pick.inst_ty
-      let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
-        inst_st
-      } else {
-        st_push_inst(inst_st, CS(pick.sym, line, col, pick.fresh, pick.unit_fresh, None))
-      }
+    Some(target) -> {
+      let st_inst = target.st
+      let inst_ty = target.inst_ty
       match inst_ty {
         TyFnT(params, _, _) -> match params {
           [] -> ufcs_method_not_found(st_inst, ident, obj_expr, obj_ty, args_, line, col)
@@ -10585,7 +10562,7 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
               let st_fresh = st_set_sub(rv.st, fr.subst)
               let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
               let expected = TyFnT(all_arg_tys, rv.ty, expected_row)
-              let synth_callee = mk_sym(pick.sym, line, col)
+              let synth_callee = target.callee
               # propagate capability-only labels through UFCS.
               let st_unif = st_unify_call(st_fresh, synth_callee, inst_ty, all_arg_tys, expected, line, col)
               let st2 = st_propagate_capability_labels(st_unif,
@@ -10615,14 +10592,63 @@ fn env_home_fn(env: TyEnv, home: String, name: String) : Option[SymId] = match s
   }
 }
 
-# What a method name no visible module answers reads: the root file's
-# function, else the builtin.
+# What a method name no visible module answers and no binder in scope
+# spells reads: the root file's function, else the builtin.
 fn ufcs_bare_sym(env: TyEnv, ident: String) : Option[SymId] =
   match env_home_fn(env, tsh_target(env.ty_homes), ident) {
     Some(s) -> Some(s)
     None    -> match env_sym(env, builtin_sym(ident)) {
       Some(_) -> Some(builtin_sym(ident))
       None    -> None
+    }
+  }
+
+# The innermost binder in scope the source wrote as `name`. Binders are
+# bound after every declaration, so they are the prefix of the entries.
+fn env_local_written(es: [TyEntry], name: String) : Option[Binder] = match es {
+  [] -> None
+  [e, ...rest] -> match e.key {
+    KLocal(b) -> if written_text(b.name) == name { Some(b) } else { env_local_written(rest, name) }
+    _         -> None
+  }
+}
+
+# The callee of a UFCS call, instantiated, with the state past it.
+type UfcsTarget = { st: InferState, inst_ty: Ty, callee: Expr }
+
+fn ufcs_sym_target(st: InferState, s: SymId, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
+                   line: Int, col: Int) : UfcsTarget {
+  let st_inst = if fresh == [] and unit_fresh == [] { st }
+                else { st_push_inst(st, CS(s, line, col, fresh, unit_fresh, None)) }
+  UfcsTarget { st: st_inst, inst_ty: inst_ty, callee: mk_sym(s, line, col) }
+}
+
+# What `obj.ident(…)` calls. The receiver's type picks among the modules
+# declaring `ident`; a name none of them answers reads as the bare name
+# does: the innermost binder spelled so, else the root file's function,
+# else the builtin.
+fn ufcs_target(st: InferState, ident: String, obj_ty: Ty,
+               line: Int, col: Int) : Option[UfcsTarget] / Mutable =
+  match pick_by_first_arg(st, st_visible_candidates(st, ident), obj_ty) {
+    Some(p) -> Some(ufcs_sym_target(p.st, p.sym, p.inst_ty, p.fresh, p.unit_fresh, line, col))
+    None -> match env_local_written(st.env.entries, ident) {
+      Some(b) -> match env_local(st.env, b.id) {
+        None -> None
+        Some(sc) -> {
+          let inst = st_instantiate_report(st, sc)
+          Some(UfcsTarget { st: inst.st, inst_ty: inst.ty, callee: mk_local(b.id, line, col) })
+        }
+      }
+      None -> match ufcs_bare_sym(st.env, ident) {
+        None -> None
+        Some(s) -> match env_sym(st.env, s) {
+          None -> None
+          Some(sc) -> {
+            let inst = st_instantiate_report(st, sc)
+            Some(ufcs_sym_target(inst.st, s, inst.ty, inst.fresh, inst.unit_fresh, line, col))
+          }
+        }
+      }
     }
   }
 
@@ -11120,23 +11146,26 @@ fn field_non_record_or_partial_app(st: InferState, obj_expr: Expr, fnm: String,
                                      line: Int, col: Int) : Inferred / Console + File {
 
 
-  match ufcs_fn_named(st, fnm) {
-    Some(_) -> {
-      let perr = mk_diag(SevError, st.file, line, col,
-        concat_all(["`", fnm, "` is a function in scope, not a field. ",
-                    "UFCS only fires at call sites — write `expr.", fnm, "(args)`, ",
-                    "not a bare `expr.", fnm, "`."]), [])
-      render_diag(perr)
-      mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, field_root(obj_expr, fnm, line, col, TyAny))
-    }
-    None -> mk_inferred(st, TyAny, field_root(obj_expr, fnm, line, col, TyAny))
-  }
+  if ufcs_reaches(st, fnm) {
+    let perr = mk_diag(SevError, st.file, line, col,
+      concat_all(["`", fnm, "` is a function in scope, not a field. ",
+                  "UFCS only fires at call sites — write `expr.", fnm, "(args)`, ",
+                  "not a bare `expr.", fnm, "`."]), [])
+    render_diag(perr)
+    mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, field_root(obj_expr, fnm, line, col, TyAny))
+  } else { mk_inferred(st, TyAny, field_root(obj_expr, fnm, line, col, TyAny)) }
 }
 
-# A function a UFCS call could reach under `ident`.
-fn ufcs_fn_named(st: InferState, ident: String) : Option[SymId] = match st_visible_candidates(st, ident) {
-  [c, ..._] -> Some(c.sym)
-  []        -> ufcs_bare_sym(st.env, ident)
+# Whether a UFCS call could reach something under `ident`.
+fn ufcs_reaches(st: InferState, ident: String) : Bool = match st_visible_candidates(st, ident) {
+  [_, ..._] -> true
+  []        -> match env_local_written(st.env.entries, ident) {
+    Some(_) -> true
+    None    -> match ufcs_bare_sym(st.env, ident) {
+      Some(_) -> true
+      None    -> false
+    }
+  }
 }
 
 # `e1[e2]` dispatches on the container's inferred
