@@ -31,6 +31,11 @@
 # It is metadata threaded alongside, never a node in the ~28-node match.
 
 import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.spec_names
+import compiler.decl_text
+import compiler.effect_instance
 
 # --- Position metadata (Risk 7) ----------------------------------------
 
@@ -220,13 +225,7 @@ pub type KOp
   | KProjKind(KVal, Int, Int)                   # read typed slot i at its static kind (native fast path)
   | KTagOf(KVal)                                # read the variant tag (scrutinee for KSwitch)
   | KClosure(String, Int, [KVal])               # thunk sym + arity + precomputed captures (what fv_* resolves today)
-  # The `SymId` after the effect name is the declaration the perform
-  # reaches. The name alone cannot say WHICH `Emit` is performed when
-  # two modules declare one, and this is the boundary where that was
-  # lost: everything downstream of KIR — both emitters, the handler
-  # lookup, the evidence frame — had only the string.
-  # `sym_none()` when the lowering had no id to carry.
-  | KPerform(String, SymId, String, [KVal])     # effect, effect id, op, args (raises to handler)
+  | KPerform(SymId, [Ty], String, KVia, [KVal])  # effect, the instance's type arguments, op label, evidence route, args (raises to handler)
   | KSetjmp(String, String)                     # set a handler landing pad: effect, install-site sym; yields i32 (0 = body path, !=0 = longjmp return)
   # `resume(v)` is an EXPRESSION-call (`kai_cont_resume(k, v)`), NOT a block
   # terminator — the exact shape the C-direct oracle emits (emit_c.kai). The
@@ -240,6 +239,15 @@ pub type KOp
   | KResumeOp(KVal, KVal)                       # cont, arg — one-shot resume as a call (= kai_cont_resume)
   | KResume2Op(KVal, KVal, KVal)                # cont, arg, new_state — 2-arg stateful resume as a call
   | KLitOp(KVal)                                 # a bare atom as an op RHS (e.g. `let t = 3`)
+
+#[doc("Which evidence a perform dispatches through: the enclosing fn's frame slot or the innermost handler; the innermost handler alone, for a perform under a `handle` of its instance in the same fn; the cell an alias names, by the alias's written name; or the node a register holds.")]
+pub type KVia = KvAmbient | KvLexical | KvAlias(String) | KvRecv(String)
+
+#[doc("The name the runtime labels the effect `s` with.")]
+pub fn kir_eff_name(tab: SymTab, s: SymId) : String = written_text(decl_name(tab, s))
+
+#[doc("The instance key of the effect `s` at the type arguments `targs`: what a frame slot and an evidence lookup are keyed by.")]
+pub fn kir_eff_key(tab: SymTab, s: SymId, targs: [Ty]) : String = key_of(kir_eff_name(tab, s), map(targs, ty_text))
 
 # --- Perceus RC ops (design §4.7) — first-class, NOT annotations --------
 
@@ -487,12 +495,14 @@ pub type KRegion = KRgn(Int, String)   # region id, descriptive name
 # blocks have no row and may perform any default-handled effect.
 # `entry` is the declaration the program starts at, for the tables a
 # backend still builds from the declarations.
+# `tab` is the symbol table the program's ids index: a dump or an emitter
+# spells a declaration's name from it.
 pub type KProgram = { types: [KTypeDecl], fns: [KFn],
                       handlers: [KHandlerDecl], install_order: [String],
                       defaults: [KDefault], runner_defaults: [KDefault],
                       synth_defaults: [KDefault],
                       regions: [KRegion], runners: [KRunner],
-                      entry: SymId }
+                      entry: SymId, tab: SymTab, specs: SpecNames, reuse_tags: [Int] }
 
 # One test / bench / check block lowered as a runner. `sym` names the
 # emitted body fn (a `KFn` in `KProgram.fns` returning the block's final
@@ -507,12 +517,12 @@ pub type KProgram = { types: [KTypeDecl], fns: [KFn],
 pub type KRunnerKind = KRTest | KRBench | KRCheck([String])
 pub type KRunner = { sym: String, desc: String, kind: KRunnerKind, line: Int, home: String }
 
-# One installable default handler: the effect name and its ops in
+# One installable default handler: the effect and its ops in
 # declaration order (field index = `nfx_op_base` + position). Each op
 # carries the runtime forwarder symbol the install stores into the Ev
 # blob (the `kaix_default_<eff>_<op>` mirror of the `$extern_handler`
 # C symbol; see `lvm_kaix_symbol`).
-pub type KDefault = KDef(String, SymId, [KDefOp])
+pub type KDefault = KDef(SymId, [KDefOp])
 pub type KDefOp = KDOp(String, String, Int)   # op name → runtime forwarder sym, its param count
 
 # A handler declaration: the effect it handles, its clause-body thunk
@@ -522,11 +532,22 @@ pub type KDefOp = KDOp(String, String, Int)   # op name → runtime forwarder sy
 # install (which fills the Ev `env` array) and the clause prologue (which
 # indexes it via `PEnvCapture`) must agree on. Computed once at lowering
 # so neither backend re-derives it (§5). Empty when no clause captures.
-pub type KHandlerDecl = { eff: String, eff_sym: SymId, sym: String,
+pub type KHandlerDecl = { eff_sym: SymId, sym: String,
                           op_thunks: [KOpThunk], ret_thunk: Option[String],
                           env_caps: [String] }
 
 pub type KOpThunk = KOT(String, String, Int)   # op name → thunk sym, its param count (0: defined in this module)
+
+#[doc("The op of a perform as a dump prints it: the label, then `@alias`, `#receiver`, or `!` for a handler of this fn.")]
+pub fn kir_op_text(op: String, via: KVia) : String = match via {
+  KvAmbient  -> op
+  KvLexical  -> string_concat(op, "!")
+  KvAlias(a) -> string_concat(op, string_concat("@", a))
+  KvRecv(r)  -> string_concat(op, string_concat("#", r))
+}
+
+#[doc("Register an aliased install stashes its handler id under; an aliased perform, and a closure capturing the alias, read it back.")]
+pub fn kir_alias_id_reg(a: String) : String = string_concat("__alias_id__", a)
 
 #[doc("Register a clause body reads its continuation from — kept outside the user identifier space so a clause-register alloca can never be clobbered by a user binder (e.g. a match payload `Dot(k)`).")]
 pub fn kir_resume_reg() : String = "__k"

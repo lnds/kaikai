@@ -39,7 +39,7 @@ pub fn kvs_program(kp: KProgram) : KProgram = {
                      runner_defaults: kp.runner_defaults,
                      synth_defaults: kp.synth_defaults,
                      regions: kp.regions,
-                     runners: kp.runners, entry: kp.entry }
+                     runners: kp.runners, entry: kp.entry, tab: kp.tab, specs: kp.specs, reuse_tags: kp.reuse_tags }
   }
 }
 
@@ -196,15 +196,18 @@ fn kvs_has_unaliased_state(bs: [KBlock]) : Bool = match bs {
 fn kvs_unaliased_stmts(ss: [KStmt]) : Bool = match ss {
   []           -> false
   [s, ...rest] -> match s {
-    KLet(_, _, KPerform(_, es, op, _), _) -> (effect_is(es, CeState) and not kvs_op_aliased(op)) or kvs_unaliased_stmts(rest)
-    KDo(KPerform(_, es, op, _), _)        -> (effect_is(es, CeState) and not kvs_op_aliased(op)) or kvs_unaliased_stmts(rest)
-    _                                   -> kvs_unaliased_stmts(rest)
+    KLet(_, _, KPerform(es, _, _, via, _), _) -> (effect_is(es, CeState) and not kvs_aliased(via)) or kvs_unaliased_stmts(rest)
+    KDo(KPerform(es, _, _, via, _), _)        -> (effect_is(es, CeState) and not kvs_aliased(via)) or kvs_unaliased_stmts(rest)
+    _                                         -> kvs_unaliased_stmts(rest)
   }
 }
 
-fn kvs_op_aliased(op: String) : Bool = string_index_of_char(op, '@') >= 0
+fn kvs_aliased(via: KVia) : Bool = match via {
+  KvAlias(_) -> true
+  _          -> false
+}
 
-# Every `@a` perform must be the exact get/set cell protocol; any other
+# Every perform through the alias must be the exact get/set cell protocol; any other
 # op or arity means the alias reaches something this rewrite does not
 # model.
 fn kvs_performs_ok(bs: [KBlock], a: String) : Bool = match bs {
@@ -218,20 +221,20 @@ fn kvs_performs_ok_stmts(ss: [KStmt], a: String) : Bool = match ss {
 }
 
 fn kvs_perform_ok(s: KStmt, a: String) : Bool = match s {
-  KLet(_, _, KPerform(_, es, op, vargs), _) -> kvs_cell_op_ok(es, op, vargs, a)
-  KDo(KPerform(_, es, op, vargs), _)        -> kvs_cell_op_ok(es, op, vargs, a)
-  _                                       -> true
+  KLet(_, _, KPerform(es, _, op, via, vargs), _) -> kvs_cell_op_ok(es, op, via, vargs, a)
+  KDo(KPerform(es, _, op, via, vargs), _)        -> kvs_cell_op_ok(es, op, via, vargs, a)
+  _                                              -> true
 }
 
-fn kvs_cell_op_ok(es: SymId, op: String, vargs: [KVal], a: String) : Bool =
-  if op == cat2("get@", a) { effect_is(es, CeState) and list_length(vargs) == 0 }
-  else if op == cat2("set@", a) { effect_is(es, CeState) and list_length(vargs) == 1 }
-  else { not kvs_op_is_alias_of(op, a) }
+fn kvs_cell_op_ok(es: SymId, op: String, via: KVia, vargs: [KVal], a: String) : Bool =
+  if not kvs_via_alias(via, a) { true }
+  else if op == "get" { effect_is(es, CeState) and list_length(vargs) == 0 }
+  else if op == "set" { effect_is(es, CeState) and list_length(vargs) == 1 }
+  else { false }
 
-fn kvs_op_is_alias_of(op: String, a: String) : Bool = {
-  let i = string_index_of_char(op, '@')
-  if i < 0 { false }
-  else { string_slice(op, i + 1, string_length(op) - i - 1) == a }
+fn kvs_via_alias(via: KVia, a: String) : Bool = match via {
+  KvAlias(b) -> a == b
+  _          -> false
 }
 
 # Any atom read of the alias-id register (a closure capture, a call
@@ -331,12 +334,12 @@ fn kvs_rewrite_stmts(ss: [KStmt], cells: [KvsCell], sjregs: [String], acc: [KStm
       Some(_) -> acc
       None    -> [s, ...acc]
     }
-    KLet(x, slot, KPerform(_, _, op, vargs), p) -> match kvs_perform_rewrite(cells, op, vargs) {
+    KLet(x, slot, KPerform(_, _, op, via, vargs), p) -> match kvs_perform_rewrite(cells, op, via, vargs) {
       KvsGet(cell) -> [KLet(x, slot, KLitOp(KVar(cell)), p), KRC(KDup(KVar(cell)), p), ...acc]
       KvsSet(cell, v) -> [KLet(x, slot, KLitOp(KUnitV), p), KStore(cell, v, p), KRC(KDrop(KVar(cell)), p), ...acc]
       KvsNoCell -> [s, ...acc]
     }
-    KDo(KPerform(_, _, op, vargs), p) -> match kvs_perform_rewrite(cells, op, vargs) {
+    KDo(KPerform(_, _, op, via, vargs), p) -> match kvs_perform_rewrite(cells, op, via, vargs) {
       KvsGet(_) -> acc
       KvsSet(cell, v) -> [KStore(cell, v, p), KRC(KDrop(KVar(cell)), p), ...acc]
       KvsNoCell -> [s, ...acc]
@@ -352,19 +355,15 @@ fn kvs_site_rewritten(cells: [KvsCell], site: String) : Bool = match kvs_cell_of
 
 type KvsHit = KvsGet(String) | KvsSet(String, KVal) | KvsNoCell
 
-fn kvs_perform_rewrite(cells: [KvsCell], op: String, vargs: [KVal]) : KvsHit = {
-  let i = string_index_of_char(op, '@')
-  if i < 0 { KvsNoCell }
-  else {
-    let a = string_slice(op, i + 1, string_length(op) - i - 1)
-    match kvs_cell_of_alias(cells, a) {
-      None -> KvsNoCell
-      Some(KVC(site, _)) ->
-        if string_slice(op, 0, i) == "get" { KvsGet(kvs_cell_reg(site)) }
-        else { match vargs {
-          [v] -> KvsSet(kvs_cell_reg(site), v)
-          _   -> KvsNoCell
-        } }
-    }
+fn kvs_perform_rewrite(cells: [KvsCell], op: String, via: KVia, vargs: [KVal]) : KvsHit = match via {
+  KvAlias(a) -> match kvs_cell_of_alias(cells, a) {
+    None -> KvsNoCell
+    Some(KVC(site, _)) ->
+      if op == "get" { KvsGet(kvs_cell_reg(site)) }
+      else { match vargs {
+        [v] -> KvsSet(kvs_cell_reg(site), v)
+        _   -> KvsNoCell
+      } }
   }
+  _ -> KvsNoCell
 }

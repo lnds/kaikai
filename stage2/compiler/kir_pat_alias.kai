@@ -18,6 +18,7 @@
 
 import compiler.ast
 import compiler.emit_shared
+import compiler.ctor_ix
 
 # Pointer/scalar split of a variant slot kind: 0 = pointer, 1 = Int,
 # 2 = Real. `pa_slot_needs_dup` maps kind to whether the native binder is a
@@ -27,12 +28,11 @@ import compiler.emit_shared
 # as the C oracle's alias-shaped enum bind.
 fn pa_slot_kind(k: Int) : Int = if k == 3 { 0 } else { k }
 
-#[doc("A ctor's pointer/scalar slot kinds narrowed by `home` and `arity`, or [] if unknown.")]
-pub fn pa_kinds_at(vs: [VariantEntry], home: Option[String], target: String, arity: Int) : [Int] =
-  match evar_slot_kinds_arity(vs, home, target, arity) {
-    Some(ks) -> map(ks, pa_slot_kind)
-    None     -> []
-  }
+#[doc("The pointer/scalar slot kinds of the constructor a pattern references, or [] when it references none.")]
+pub fn pa_kinds(ix: CtorIx, r: DeclRef) : [Int] = match ctor_ix_row(ix, ref_sym(r)) {
+  Some(EV(_, _, _, ks, _)) -> map(ks, pa_slot_kind)
+  None                     -> []
+}
 
 #[doc("""
 Every binder a match arm reaches over a heap-box BORROW path — the set the
@@ -47,34 +47,34 @@ owned box), and PAs (name + inner, inner always alias). Record and
 variant-record fields are NOT descended: the field bind dups its own cell
 binders and releases the field read (`bind_field_owned`), so they arrive owned.
 """)]
-pub fn pat_alias_binders(p: Pattern, vs: [VariantEntry]) : [String] = pab_pat(p, vs, [])
+pub fn pat_alias_binders(p: Pattern, ix: CtorIx) : [LocalId] = pab_pat(p, ix, [])
 
-fn pab_pat(p: Pattern, vs: [VariantEntry], acc: [String]) : [String] = match p.pkind {
-  PBind(name)     -> [name, ...acc]
-  PNarrow(name, _) -> [name, ...acc]
-  PAs(name, inner) -> pab_pat(inner, vs, [name, ...acc])
+fn pab_pat(p: Pattern, ix: CtorIx, acc: [LocalId]) : [LocalId] = match p.pkind {
+  PBind(b)      -> [b.id, ...acc]
+  PNarrow(b, _) -> [b.id, ...acc]
+  PAs(b, inner) -> pab_pat(inner, ix, [b.id, ...acc])
   PList(pats, opt_rest) -> {
     let a1 = match opt_rest {
-      None -> acc
-      Some(name) -> [name, ...acc]
+      None    -> acc
+      Some(b) -> [b.id, ...acc]
     }
-    pab_pats(pats, vs, a1)
+    pab_pats(pats, ix, a1)
   }
-  PVariant(hm, cname, subs) -> pab_variant_slots(subs, pa_kinds_at(vs, hm, cname, list_length(subs)), 0, vs, acc)
+  PVariant(r, subs) -> pab_variant_slots(subs, pa_kinds(ix, r), 0, ix, acc)
   _ -> acc
 }
 
-fn pab_pats(pats: [Pattern], vs: [VariantEntry], acc: [String]) : [String] = match pats {
+fn pab_pats(pats: [Pattern], ix: CtorIx, acc: [LocalId]) : [LocalId] = match pats {
   []           -> acc
-  [hp, ...rest] -> pab_pats(rest, vs, pab_pat(hp, vs, acc))
+  [hp, ...rest] -> pab_pats(rest, ix, pab_pat(hp, ix, acc))
 }
 
-fn pab_variant_slots(subs: [Pattern], ks: [Int], idx: Int, vs: [VariantEntry], acc: [String]) : [String] = match subs {
+fn pab_variant_slots(subs: [Pattern], ks: [Int], idx: Int, ix: CtorIx, acc: [LocalId]) : [LocalId] = match subs {
   []            -> acc
   [sp, ...rest] -> {
     let k = kind_at(ks, idx)
-    let acc1 = if pa_slot_needs_dup(k) { pab_pat(sp, vs, acc) } else { acc }
-    pab_variant_slots(rest, ks, idx + 1, vs, acc1)
+    let acc1 = if pa_slot_needs_dup(k) { pab_pat(sp, ix, acc) } else { acc }
+    pab_variant_slots(rest, ks, idx + 1, ix, acc1)
   }
 }
 
@@ -93,32 +93,32 @@ pointer slot. These are the slots a dual-branch reuse binds per-branch (a
 borrow in the unique branch, a dup in the shared branch); everything else in
 the alias set is deconstructed and dup'd unconditionally outside the fork.
 """)]
-pub fn pat_direct_alias_slots(p: Pattern, vs: [VariantEntry]) : [String] = match p.pkind {
+pub fn pat_direct_alias_slots(p: Pattern, ix: CtorIx) : [LocalId] = match p.pkind {
   PList(pats, opt_rest) -> {
     let heads = pa_list_direct_heads(pats, [])
-    match opt_rest { None -> heads Some(name) -> [name, ...heads] }
+    match opt_rest { None -> heads Some(b) -> [b.id, ...heads] }
   }
-  PVariant(hm, cname, subs) -> pa_variant_direct_slots(subs, pa_kinds_at(vs, hm, cname, list_length(subs)), 0, [])
-  PBind(name)  -> [name]
-  PAs(name, _) -> [name]
-  _            -> []
+  PVariant(r, subs) -> pa_variant_direct_slots(subs, pa_kinds(ix, r), 0, [])
+  PBind(b)  -> [b.id]
+  PAs(b, _) -> [b.id]
+  _         -> []
 }
 
-fn pa_list_direct_heads(pats: [Pattern], acc: [String]) : [String] = match pats {
+fn pa_list_direct_heads(pats: [Pattern], acc: [LocalId]) : [LocalId] = match pats {
   []            -> acc
   [hp, ...rest] -> match hp.pkind {
-    PBind(name) -> pa_list_direct_heads(rest, [name, ...acc])
-    _           -> pa_list_direct_heads(rest, acc)
+    PBind(b) -> pa_list_direct_heads(rest, [b.id, ...acc])
+    _        -> pa_list_direct_heads(rest, acc)
   }
 }
 
-fn pa_variant_direct_slots(subs: [Pattern], ks: [Int], idx: Int, acc: [String]) : [String] = match subs {
+fn pa_variant_direct_slots(subs: [Pattern], ks: [Int], idx: Int, acc: [LocalId]) : [LocalId] = match subs {
   []            -> acc
   [sp, ...rest] -> {
     let k = kind_at(ks, idx)
     let acc1 = match sp.pkind {
-      PBind(name) -> if k == 0 { [name, ...acc] } else { acc }
-      _           -> acc
+      PBind(b) -> if k == 0 { [b.id, ...acc] } else { acc }
+      _        -> acc
     }
     pa_variant_direct_slots(rest, ks, idx + 1, acc1)
   }
@@ -130,17 +130,17 @@ direct slots. In a dual-branch cons reuse these sub-binders are incref'd
 UNCONDITIONALLY (in both branches, per the oracle's is_alias path), so they
 leave the condbr; only the direct slots differ per branch.
 """)]
-pub fn pat_decon_alias_binders(p: Pattern, vs: [VariantEntry]) : [String] =
-  names_minus(pat_alias_binders(p, vs), pat_direct_alias_slots(p, vs))
+pub fn pat_decon_alias_binders(p: Pattern, ix: CtorIx) : [LocalId] =
+  binders_minus(pat_alias_binders(p, ix), pat_direct_alias_slots(p, ix))
 
-fn names_minus(all: [String], drop: [String]) : [String] = match all {
+fn binders_minus(all: [LocalId], drop: [LocalId]) : [LocalId] = match all {
   []           -> []
-  [n, ...rest] -> if name_in_names(drop, n) { names_minus(rest, drop) } else { [n, ...names_minus(rest, drop)] }
+  [n, ...rest] -> if binder_among(drop, n) { binders_minus(rest, drop) } else { [n, ...binders_minus(rest, drop)] }
 }
 
-fn name_in_names(xs: [String], n: String) : Bool = match xs {
+fn binder_among(xs: [LocalId], n: LocalId) : Bool = match xs {
   []           -> false
-  [h, ...rest] -> if h == n { true } else { name_in_names(rest, n) }
+  [h, ...rest] -> if local_eq(h, n) { true } else { binder_among(rest, n) }
 }
 
 #[doc("""
@@ -150,10 +150,10 @@ A `PBind` slot moves into its binder; any other pointer sub-pattern (`_`, a
 nested pattern) leaves its child in the shell. Enum and scalar slots hold no
 reference.
 """)]
-pub fn pat_unbound_ptr_slots(p: Pattern, vs: [VariantEntry]) : [Int] = match p.pkind {
-  PVariant(hm, cname, subs) -> match evar_slot_kinds_arity(vs, hm, cname, list_length(subs)) {
-    Some(ks) -> pa_unbound_slots(subs, ks, 0)
-    None     -> []
+pub fn pat_unbound_ptr_slots(p: Pattern, ix: CtorIx) : [Int] = match p.pkind {
+  PVariant(r, subs) -> match ctor_ix_row(ix, ref_sym(r)) {
+    Some(EV(_, _, _, ks, _)) -> pa_unbound_slots(subs, ks, 0)
+    None                     -> []
   }
   _ -> []
 }

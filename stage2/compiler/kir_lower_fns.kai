@@ -10,7 +10,13 @@
 # layer around it).
 
 import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+import compiler.spec_names
+import compiler.local_names
 import compiler.entry
+import compiler.reuse_ctors
 import compiler.home_tu
 import compiler.util
 import compiler.fnreg
@@ -20,7 +26,6 @@ import compiler.fn_csym
 import compiler.emit_shared
 import compiler.emit_reuse_donate
 import compiler.ffi_v2
-import compiler.resolve
 import compiler.region
 import compiler.kir
 import compiler.kir_lower
@@ -28,7 +33,6 @@ import compiler.ctor_ix
 import compiler.unwind_pend
 import compiler.unwind_effects
 import compiler.unwind_cx
-import compiler.modules
 import compiler.kir_lower_walk
 import compiler.rec_stamp
 import compiler.infer.{is_lifecycle_clause}
@@ -39,25 +43,27 @@ import compiler.infer.{is_lifecycle_clause}
 # post-tcrec `[Decl]`; `regions` the region-mark metadata. Produces a
 # `KProgram` with everything resolved, so the translators resolve nothing
 # (design §5).
-pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
+pub fn lower_to_kir(raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, regions: [RegionMark],
                     fns: [EFn], variants: [VariantEntry], target_origin: Option[String], raw_binders: [RawArmBinder],
                     traps: Bool, stamp_ids: [SymId], entry: SymId) : KProgram / Console {
-  let types = lower_types(raw_decls, variants, [])
+  let ctors = ctor_ix_build(variants, raw_decls, tab, target_origin)
+  let types = lower_types(raw_decls, tab, ctors, [])
   # The lifted-lambda table is the SAME analysis the emitters run
   # (`collect_decls` over the global-name set) — reused, not re-derived.
-  let lc      = collect_lams(raw_decls, fns, variants)
-  let st0     = ls_with_unw(ls_new(fns, fnx_build_decls(raw_decls, fns), variants, ctor_ix_build(variants, raw_decls, target_origin), lc.lams, collect_effect_names(raw_decls),
-                                   kir_const_decls(raw_decls, []), ffi_extern_names(raw_decls, []),
-                                   collect_records(raw_decls), rec_stamps(raw_decls, stamp_ids), regions, raw_binders, target_origin),
+  let lc      = collect_decls(raw_decls, lc_new(tab, specs))
+  let st0     = ls_with_unw(ls_new(fns, fnx_build_decls(raw_decls, fns), variants, ctors, lc.lams,
+                                   kir_const_decls(raw_decls, []), ffi_extern_syms(raw_decls, []),
+                                   collect_records(raw_decls), rec_stamps(raw_decls, stamp_ids), regions, raw_binders, target_origin,
+                                   tab, specs),
                             kir_unw_root(unw_cx(raw_decls, lc.clauses), traps))
   # The extern-type registry classifies struct / opaque FFI types for
   # the native shim. Threaded explicitly to the FFI-fn lowering
   # (narrower than a LowerSt field).
-  let freg    = collect_extern_types(raw_decls)
+  let freg    = collect_extern_types(raw_decls, tab)
   # Donation-capable fns — the SAME structural scan the C backend runs
   # (`emit_reuse_donate`), keyed on the mangled symbol, so both backends
   # pick one capable set and the reuse ABI cannot diverge between them.
-  let capable = rd_scan_capable(raw_decls)
+  let capable = rd_scan_capable(raw_decls, tab, specs)
   let kfns    = lower_fns(raw_decls, st0, freg, capable, entry, [])
   # Each lifted lambda becomes a top-level `KFnLambda`, and each handler
   # clause a `KFnClause` (mirror of emit_c's `emit_lam_helpers` /
@@ -74,11 +80,12 @@ pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
   KProgram { types: types,
              fns: list_append(kfns, list_append(lamfns, list_append(clsfns, rs.fns))),
              handlers: canon_handler_op_order(lower_handler_decls(lc.clauses, lc.clauses, []), raw_decls),
-             install_order: kir_install_order(raw_decls, entry),
-             defaults: kir_default_handlers(raw_decls, entry),
-             runner_defaults: kir_runner_default_handlers(raw_decls),
-             synth_defaults: kir_synth_handler_effects(raw_decls),
-             regions: lower_regions(regions, []), runners: rs.runners, entry: entry }
+             install_order: kir_install_order(raw_decls, tab, entry),
+             defaults: kir_default_handlers(raw_decls, tab, entry),
+             runner_defaults: kir_runner_default_handlers(raw_decls, tab),
+             synth_defaults: kir_synth_handler_effects(raw_decls, tab),
+             regions: lower_regions(regions, []), runners: rs.runners, entry: entry, tab: tab, specs: specs,
+             reuse_tags: reusable_tags(raw_decls, ids, ctors, entry) }
 }
 
 # The runner KFns + the KRunner index, built together so the emitted
@@ -111,20 +118,20 @@ fn lower_runner_loop(decls: [Decl], st: LowerSt, freg: [ExternTypeReg],
       # body's lambdas, so `find_lam` resolves a lambda inside the test
       # body (a bare `_kai_test_<i>` sym would leave it "non-callable").
       let sym = runner_enc_fn("test", mo, line, col)
-      let kfn = lower_fn(sym, [], None, None, body, None, body_fns, st, freg, false, false)
+      let kfn = lower_fn(FnHead { name: sym, usig: None, locals: ln_of_decl(d) }, [], None, None, body, None, body_fns, st, freg, false, false)
       let r = KRunner { sym: sym, desc: desc, kind: KRTest, line: line, home: runner_home(mo) }
       lower_runner_loop(rest, st, freg, body_fns, ti + 1, bi, [kfn, ...fns_acc], [r, ...run_acc])
     }
     DBench(desc, body, line, col, mo) -> {
       let sym = runner_enc_fn("bench", mo, line, col)
-      let kfn = lower_fn(sym, [], None, None, body, None, body_fns, st, freg, false, false)
+      let kfn = lower_fn(FnHead { name: sym, usig: None, locals: ln_of_decl(d) }, [], None, None, body, None, body_fns, st, freg, false, false)
       let r = KRunner { sym: sym, desc: desc, kind: KRBench, line: line, home: runner_home(mo) }
       lower_runner_loop(rest, st, freg, body_fns, ti, bi + 1, [kfn, ...fns_acc], [r, ...run_acc])
     }
     DCheck(desc, ps, body, line, col, mo) -> {
       let sym = runner_enc_fn("check", mo, line, col)
-      let kfn = lower_fn(sym, ps, None, None, body, None, body_fns, st, freg, false, false)
-      let r = KRunner { sym: sym, desc: desc, kind: KRCheck(check_param_specs(ps)), line: line, home: runner_home(mo) }
+      let kfn = lower_fn(FnHead { name: sym, usig: None, locals: ln_of_decl(d) }, ps, None, None, body, None, body_fns, st, freg, false, false)
+      let r = KRunner { sym: sym, desc: desc, kind: KRCheck(check_param_specs(st.tab, ps)), line: line, home: runner_home(mo) }
       lower_runner_loop(rest, st, freg, body_fns, ti, bi, [kfn, ...fns_acc], [r, ...run_acc])
     }
     _ -> lower_runner_loop(rest, st, freg, body_fns, ti, bi, fns_acc, run_acc)
@@ -133,29 +140,26 @@ fn lower_runner_loop(decls: [Decl], st: LowerSt, freg: [ExternTypeReg],
 
 # `name:Type` per check param. The type label is the one the C oracle's
 # generator panic names, so both backends reject an unsupported type alike.
-fn check_param_specs(ps: [Param]) : [String] = match ps {
+fn check_param_specs(tab: SymTab, ps: [Param]) : [String] = match ps {
   [] -> []
-  [p, ...rest] -> [concat_all([p.pname, ":", check_type_label(p.ptype)]), ...check_param_specs(rest)]
+  [p, ...rest] -> [concat_all([written_text(p.binder.name), ":", check_type_label(tab, p.ptype)]), ...check_param_specs(tab, rest)]
 }
 
-fn check_type_label(t: Option[TypeExpr]) : String = match t {
+fn check_type_label(tab: SymTab, t: Option[TypeExpr]) : String = match t {
   None -> "<missing>"
   Some(ty) -> match ty.tkind {
-    TyName(_, name, _) -> name
+    TyName(r, _) -> type_ref_label(tab, r)
     TyList(inner) -> match inner.tkind {
-      TyName(_, iname, _) -> concat_all(["[", iname, "]"])
+      TyName(r, _) -> concat_all(["[", type_ref_label(tab, r), "]"])
       _ -> "[<complex>]"
     }
     _ -> "<complex>"
   }
 }
 
-# Run the shared lambda-collection pass (`collect_decls`) — the SAME
-# analysis the emitters run — to build the lifted-lambda + clause tables.
-# Mirror of the emitters' preamble: build the global-name set, walk decls.
-fn collect_lams(decls: [Decl], fns: [EFn], variants: [VariantEntry]) : LamCollect / Console {
-  let globals = build_globals(fns, variants, collect_effect_names(decls), collect_op_qualified_names(decls), const_names(decls))
-  collect_decls(decls, lc_new(globals))
+fn type_ref_label(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)        -> written_text(decl_name(tab, s))
+  DrWritten(_, n) -> written_text(n)
 }
 
 # --- Ordinary functions -------------------------------------------------
@@ -163,35 +167,39 @@ fn collect_lams(decls: [Decl], fns: [EFn], variants: [VariantEntry]) : LamCollec
 fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], capable: [String], entry: SymId, acc: [KFn]) : [KFn] / Console = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> match d {
-    DFn(_, name, _, params, ret_ty, row, body, _, _, _, fid) -> {
+    DFn(_, fid, _, params, ret_ty, row, body, _, _, _) -> {
       # `home_tu(d)` is the fn's home TU (== its `mo` for a DFn); the
       # KFn carries it so the native partitioner reads the partition off
       # the KFn instead of re-deriving it.
       let mo = home_tu(d)
+      let name = ls_fn_name(st, fid)
       # The entry point never takes the donor param: the runtime calls it
       # directly, outside the donor-aware call funnel.
       let ent = is_entry(entry, fid)
       let dn = not ent and rd_is_capable(c_sym(name, mo), capable)
-      let kfn = lower_fn(name, params, ret_ty, Some(row), body, mo, st.fns, st, freg, dn, ent)
+      let head = FnHead { name: name, usig: fnx_ufn_sig_first(st.fx, fid), locals: ln_of_decl(d) }
+      let kfn = lower_fn(head, params, ret_ty, Some(row), body, mo, st.fns, st, freg, dn, ent)
       lower_fns(rest, st, freg, capable, entry, [kfn, ...acc])
     }
     _ -> lower_fns(rest, st, freg, capable, entry, acc)
   }
 }
 
+# What `lower_fn` is told about the fn it lowers: the name it is emitted
+# under, its unboxed signature, and its binders.
+type FnHead = { name: String, usig: Option[UFnSig], locals: LocalNames }
+
 # Lower one function to a KFn. Counters reset (Risk 2b); the enclosing-fn
 # key is the fn's own symbol so nested lambdas resolve to their LamInfo.
 # The body lowers into the entry block and whatever blocks the control
 # flow forks off; the final value seals the last block with `KRet`.
-fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr], row: Option[RowExpr],
+fn lower_fn(head: FnHead, params: [Param], ret_ty: Option[TypeExpr], row: Option[RowExpr],
             body: Expr, mo: Option[String], body_fns: [EFn], st0: LowerSt, freg: [ExternTypeReg], dn: Bool, ent: Bool) : KFn / Console {
+  let name = head.name
   let sym = c_sym(name, mo)
   # Enter WITH the EFn table already rotated to prefer `mo` (this fn's
-  # module) by the cached `lower_fns` loop, so a bare call inside the body
-  # resolves to a same-module definition over an imported homonym — the C /
-  # LLVM emitters do the same. (`hashset.from_list`'s `empty()` resolved to
-  # the imported `hashmap.empty` without this — `no such field`.)
-  let st1 = ls_enter_fn_with(st0, sym, param_local_names(params, []), body_fns)
+  # module) by the cached `lower_fns` loop.
+  let st1 = ls_enter_fn_with(st0, sym, param_regs(params, []), head.locals, body_fns)
   # P3 raw scalar params: resolve this fn's UFnSig (the classifier already
   # applied the no-tparams / no-FFI / no-effect-row gates and computed the
   # per-param `raw_mask`). A `Some(US(...))` lowers each raw param to its
@@ -200,9 +208,9 @@ fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr], row: Option
   # proto dispatchers, effectful / generic fns) keeps the all-boxed shape.
   # The unbox pass reads the SAME mask (`ufn_param_env`), so the body's raw
   # param reads and these slots can never disagree.
-  let usig = fnx_ufn_sig_first(st1.fx, name, mo)
-  let st = kir_unw_enter(ls_with_unw(st1, unw_fn_frame(st1.unw, sym, row, unw_param_seeds(params, usig, st1.unw.ucx),
-                                                        fn_param_names(params), body)))
+  let usig = head.usig
+  let st = kir_unw_enter(ls_with_unw(st1, unw_fn_frame(st1.unw, st1.locals, sym, row, unw_param_seeds(params, usig, st1.unw.ucx),
+                                                        param_ids(params), body)))
   let kparams = lower_params_sig(params, usig)
   # An `extern "C" fn` (issue #260) lowers to a DFn whose body is the magic
   # `ETodo("__kai_ffi__"[:override])` tag. C / LLVM-text intercept it in
@@ -223,7 +231,7 @@ fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr], row: Option
     # they never clashed — this mangling brings the FFI wrapper into line
     # WITHOUT prefixing the whole native backend (a separate concern).
     let c_symbol = ffi_extern_symbol_of(body, name)
-    KFn { sym: ffi_wrapper_sym(name, mo), kind: KFnFfi(c_symbol, ffi_param_kinds(params, freg), kffi_kind_of_ret(ret_ty, freg)),
+    KFn { sym: ffi_wrapper_sym(name, mo), kind: KFnFfi(c_symbol, ffi_param_kinds(params, freg, st.tab), kffi_kind_of_ret(ret_ty, freg, st.tab)),
           params: kparams, ret: slot_of_ty(ret_ty), blocks: [],
           region_id: None, stateful: false, mo: mo, donor: false, entry: false }
   } else {
@@ -263,32 +271,32 @@ fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr], row: Option
 # value through its thunk: it hands its owned params to the native entry.
 fn lower_kai_forwarder(body: Expr, name: String, params: [Param], st: LowerSt) : LRes / Console =
   lower_direct_call(body, core_native_call_sym(name),
-                    map(params, (p) => mk_expr(EName(p.pname), body.line, body.col)), st)
+                    map(params, (p) => mk_local(p.binder.id, body.line, body.col)), st)
 
 # The KIR FFI marshalling kind of each `extern "C" fn` param, in
 # declaration order — the unbox direction the native shim applies before
 # the raw call. Reuses emit_shared's type→`FfiRetKind` classifier (the
 # typer's supported-FFI-type gate) and translates into the KIR's own
 # `KFfiKind`, so kir.kai stays free of an emit_shared dependency (Lane 0).
-fn ffi_param_kinds(params: [Param], freg: [ExternTypeReg]) : [KFfiKind] = match params {
+fn ffi_param_kinds(params: [Param], freg: [ExternTypeReg], tab: SymTab) : [KFfiKind] = match params {
   []           -> []
-  [p, ...rest] -> [kffi_kind_of_param(p, freg), ...ffi_param_kinds(rest, freg)]
+  [p, ...rest] -> [kffi_kind_of_param(p, freg, tab), ...ffi_param_kinds(rest, freg, tab)]
 }
 
-fn kffi_kind_of_param(p: Param, freg: [ExternTypeReg]) : KFfiKind = match p.ptype {
+fn kffi_kind_of_param(p: Param, freg: [ExternTypeReg], tab: SymTab) : KFfiKind = match p.ptype {
   None    -> KFfiUnknown("missing")
-  Some(t) -> kffi_of_ret_kind(ffi_kind_of_ty_reg(t, freg), freg)
+  Some(t) -> kffi_of_ret_kind(ffi_kind_of_ty_reg(t, freg, tab), freg, tab)
 }
 
-fn kffi_kind_of_ret(ret_ty: Option[TypeExpr], freg: [ExternTypeReg]) : KFfiKind =
-  kffi_of_ret_kind(ffi_ret_kind_of_reg(ret_ty, freg), freg)
+fn kffi_kind_of_ret(ret_ty: Option[TypeExpr], freg: [ExternTypeReg], tab: SymTab) : KFfiKind =
+  kffi_of_ret_kind(ffi_ret_kind_of_reg(ret_ty, freg, tab), freg, tab)
 
 # Translate emit_shared's `FfiRetKind` to the KIR-local `KFfiKind`. An
 # opaque handle becomes `KFfiForeign`; a fixed-width annotation becomes
 # `KFfiFixed(bits, signed, is_float)`; a struct resolves its fields from
 # the registry into `KFfiStruct`. The native backend marshals all of
 # them directly.
-fn kffi_of_ret_kind(k: FfiRetKind, freg: [ExternTypeReg]) : KFfiKind = match k {
+fn kffi_of_ret_kind(k: FfiRetKind, freg: [ExternTypeReg], tab: SymTab) : KFfiKind = match k {
   FfiRetUnit       -> KFfiUnit
   FfiRetInt        -> KFfiInt
   FfiRetReal       -> KFfiReal
@@ -298,7 +306,7 @@ fn kffi_of_ret_kind(k: FfiRetKind, freg: [ExternTypeReg]) : KFfiKind = match k {
   FfiRetForeign(_) -> KFfiForeign
   FfiRetFixed(fx)  -> KFfiFixed(ffi_fixed_bits(fx), ffi_fixed_is_signed(fx), ffi_fixed_is_float(fx))
   FfiRetFixedVal(t) -> kffi_of_fixed_val(t)
-  FfiRetStruct(n)  -> KFfiStruct(kffi_struct_fields(extern_struct_fields(freg, n), freg))
+  FfiRetStruct(n)  -> KFfiStruct(kffi_struct_fields(extern_struct_fields(freg, n), freg, tab))
   FfiRetUnknown(t) -> KFfiUnknown(t)
 }
 
@@ -315,26 +323,25 @@ fn kffi_of_fixed_val(t: Ty) : KFfiKind = match t {
 
 # Resolve each declared struct field into a `KFfiField` carrying its
 # marshalling kind (recursively, for nested structs).
-fn kffi_struct_fields(fields: [FieldDecl], freg: [ExternTypeReg]) : [KFfiField] = match fields {
+fn kffi_struct_fields(fields: [FieldDecl], freg: [ExternTypeReg], tab: SymTab) : [KFfiField] = match fields {
   []            -> []
   [fd, ...rest] -> match fd {
     FD(_, fname, fty, _) ->
-      [KFF(fname, kffi_of_ret_kind(ffi_kind_of_ty_reg(fty, freg), freg)),
-       ...kffi_struct_fields(rest, freg)]
+      [KFF(fname, kffi_of_ret_kind(ffi_kind_of_ty_reg(fty, freg, tab), freg, tab)),
+       ...kffi_struct_fields(rest, freg, tab)]
   }
 }
 
-# Collect the bare kaikai names of every `extern "C" fn` (DFn whose body is
-# the magic FFI tag). Seeds `LowerSt.ffi`, the set a call site consults to
-# decide whether to mangle the callee. Names (not c_syms) — the call site
-# sees the surface identifier before mangling.
-pub fn ffi_extern_names(ds: [Decl], acc: [String]) : [String] = match ds {
+# Every `extern "C" fn` declaration (a DFn whose body is the magic FFI
+# tag). Seeds `LowerSt.ffi`, the set a call site consults to decide whether
+# to mangle the callee.
+pub fn ffi_extern_syms(ds: [Decl], acc: [SymId]) : [SymId] = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> match d {
-    DFn(_, name, _, _, _, _, body, _, _, _, _) ->
-      if body_is_ffi_extern(body) { ffi_extern_names(rest, [name, ...acc]) }
-      else { ffi_extern_names(rest, acc) }
-    _ -> ffi_extern_names(rest, acc)
+    DFn(_, fid, _, _, _, _, body, _, _, _) ->
+      if body_is_ffi_extern(body) { ffi_extern_syms(rest, [fnid_sym(fid), ...acc]) }
+      else { ffi_extern_syms(rest, acc) }
+    _ -> ffi_extern_syms(rest, acc)
   }
 }
 
@@ -366,7 +373,7 @@ fn lower_proto_dispatch(parts: ProtoDispatchParts, params: [Param],
 # receiver first), the boxed args the shim forwards to the resolved impl.
 fn proto_dispatch_arg_vals(params: [Param]) : [KVal] = match params {
   []           -> []
-  [p, ...rest] -> [KVar(p.pname), ...proto_dispatch_arg_vals(rest)]
+  [p, ...rest] -> [KVar(written_text(p.binder.name)), ...proto_dispatch_arg_vals(rest)]
 }
 
 # --- Lambdas: lifted bodies as top-level `KFnLambda`s -------------------
@@ -387,13 +394,14 @@ fn lower_lam_fns(lams: [LamInfo], st0: LowerSt, acc: [KFn]) : [KFn] / Console = 
 fn lower_lam_fn(l: LamInfo, st0: LowerSt, body_fns: [EFn]) : KFn / Console = match l {
   LamInfo(_, _, _, _, params, caps, body, _) -> {
     let sym = lam_symbol(l)
-    let pnames = fn_param_names(params)
-    let st = kir_unw_enter(ls_with_unw(ls_enter_fn_with(st0, sym, param_local_names(params, caps), body_fns),
-                                       unw_frame(st0.unw, pnames, pnames, body)))
-    let kparams = list_append(lower_params(params, []), lower_captures(caps, 0, []))
+    let locals = kir_body_locals(lam_locals(l))
+    let pids = param_ids(params)
+    let st = kir_unw_enter(ls_with_unw(ls_enter_fn_with(st0, sym, param_regs(params, capture_names(caps, locals)), locals, body_fns),
+                                       unw_frame(st0.unw, locals, pids, pids, body)))
+    let kparams = list_append(lower_params(params, []), lower_captures(caps, locals, 0, []))
     match lower_expr(body, st) { LRes(val, st1) -> {
       # Each param is owned per-invocation yet the closure body only DUPs
-      # its reads (`in_lam` forces a dup on every EVar), so the birth ref
+      # its reads (`in_lam` forces a dup on every read), so the birth ref
       # is never consumed and leaks one box per call. Drop it after the
       # body computes `val`. Captures are NOT dropped: the closure owns
       # them (released in its destructor); a per-call drop would UAF after
@@ -407,25 +415,26 @@ fn lower_lam_fn(l: LamInfo, st0: LowerSt, body_fns: [EFn]) : KFn / Console = mat
 
 fn lam_drop_params(params: [Param], st: LowerSt) : LowerSt / Console = match params {
   []           -> st
-  [p, ...rest] -> lam_drop_params(rest, ls_emit(st, KRC(KDrop(KVar(p.pname)), KNoPos)))
+  [p, ...rest] -> lam_drop_params(rest, ls_emit(st, KRC(KDrop(KVar(written_text(p.binder.name))), KNoPos)))
 }
 
-# Each capture name becomes a `PCapture(j)` param read from `self->as.clo`
+# Each capture becomes a `PCapture(j)` param read from `self->as.clo`
 # at the matching index (the order the collector recorded in the lambda's
 # own caps list). Lambda-only — a clause uses `lower_env_captures`.
-fn lower_captures(caps: [String], j: Int, acc: [KParam]) : [KParam] = match caps {
+fn lower_captures(caps: [Capture], locals: LocalNames, j: Int, acc: [KParam]) : [KParam] = match caps {
   [] -> acc
-  [c, ...rest] -> lower_captures(rest, j + 1, list_append(acc, [capture_param(c, j)]))
+  [c, ...rest] -> lower_captures(rest, locals, j + 1, list_append(acc, [capture_param(kir_capture_name(locals, c), j)]))
 }
+
+# The registers a lambda or clause reads its captures from, in capture order.
+fn capture_names(caps: [Capture], locals: LocalNames) : [String] = map(caps, (c) => kir_capture_name(locals, c))
 
 # A clause's captures become `PEnvCapture(j)` params, where `j` is the
 # capture's index in the HANDLE's cross-clause union (`env_caps`), NOT in
 # the clause's own caps list. The Ev `env` array the install fills is
 # laid out in union order, shared by every clause of the handle, so a
-# clause that captures a subset must still index by the union position
-# (mirror of emit_c, which keys env-struct fields by surface NAME — the
-# union order is that name's fixed slot). `caps` is the clause's own
-# capture list (preserved for the binder NAME); `env_caps` the handle
+# clause that captures a subset must still index by the union position.
+# `caps` are the clause's own capture registers; `env_caps` the handle
 # union (resolved for the INDEX).
 fn lower_env_captures(caps: [String], env_caps: [String], acc: [KParam]) : [KParam] / Console = match caps {
   [] -> acc
@@ -465,7 +474,7 @@ fn kir_handle_captures_at(cls: [ClauseInfo], enc: String, hline: Int, hcol: Int)
   [c, ...rest] -> match c {
     CI(line, col, _, _, _, _, _, enc_fn, caps, _, _) ->
       if line == hline and col == hcol and enc_fn == enc {
-        kir_merge_str_set(caps, kir_handle_captures_at(rest, enc, hline, hcol))
+        kir_merge_str_set(capture_names(caps, kir_body_locals(clause_locals(c))), kir_handle_captures_at(rest, enc, hline, hcol))
       } else {
         kir_handle_captures_at(rest, enc, hline, hcol)
       }
@@ -482,15 +491,15 @@ fn kir_merge_str_set(a: [String], b: [String]) : [String] = match a {
     else { [h, ...kir_merge_str_set(rest, b)] }
 }
 
-# The bound names a fn/lambda/clause introduces at entry — its params plus
-# its captures. Seeded into `LowerSt.locals` so the body's `lower_var`
-# reads them as locals (shadowing a same-name top-level fn), not as a
-# closure over a stdlib thunk. Match binders / `let`s extend this set
-# further as the body lowers; the params/captures are the entry seed.
-fn param_local_names(params: [Param], acc: [String]) : [String] = match params {
+# The registers a fn/lambda/clause binds at entry — its params' on top of
+# its captures'. Seeded into `LowerSt.regs`; match binders / `let`s extend
+# the set further as the body lowers.
+fn param_regs(params: [Param], acc: [String]) : [String] = match params {
   [] -> acc
-  [p, ...rest] -> param_local_names(rest, [p.pname, ...acc])
+  [p, ...rest] -> param_regs(rest, [written_text(p.binder.name), ...acc])
 }
+
+fn param_ids(params: [Param]) : [LocalId] = map(params, (p) => p.binder.id)
 
 # --- Clauses: lifted bodies as top-level `KFnClause`s -------------------
 
@@ -513,14 +522,16 @@ fn lower_clause_fn(c: ClauseInfo, all_cls: [ClauseInfo], st0: LowerSt, body_fns:
   CI(line, col, _, head, params, body, stateful, enc_fn, caps, _, _) -> {
     let is_fin = is_lifecycle_clause(head)
     let sym = clause_sym(c)
+    let locals = kir_body_locals(clause_locals(c))
+    let cnames = capture_names(caps, locals)
     let owned = if is_fin { [] } else { unw_clause_seeds(c) }
-    let st = kir_unw_enter(ls_with_unw(ls_enter_fn_with(st0, sym, param_local_names(params, caps), body_fns),
-                                       unw_frame(st0.unw, owned, owned, body)))
+    let st = kir_unw_enter(ls_with_unw(ls_enter_fn_with(st0, sym, param_regs(params, cnames), locals, body_fns),
+                                       unw_frame(st0.unw, locals, owned, owned, body)))
     # `PEnvCapture(j)` indexes the handle UNION, not the clause's own caps.
     let env_caps = kir_handle_captures_at(all_cls, enc_fn, line, col)
     # A `finally` has no surface params and never resumes: captures only.
     let own_params = if is_fin { [] } else { lower_clause_params(params) }
-    let kparams = list_append(own_params, lower_env_captures(caps, env_caps, []))
+    let kparams = list_append(own_params, lower_env_captures(cnames, env_caps, []))
     match lower_expr(body, if stateful { bind_self_state(st) } else { st }) { LRes(val, st1) -> {
       let blocks = ls_finish(st1, KRet(val, kpos_of(body)))
       check_resume_one_shot(sym, blocks)
@@ -542,7 +553,7 @@ fn lower_clause_params_idx(params: [Param], i: Int, n: Int, acc: [KParam]) : [KP
   [] -> acc
   [p, ...rest] -> {
     let origin = if i == n - 1 { PResume } else { PDirect(i) }
-    lower_clause_params_idx(rest, i + 1, n, list_append(acc, [KParam { name: p.pname, slot: SBoxed, mode: kparam_mode(p), origin: origin }]))
+    lower_clause_params_idx(rest, i + 1, n, list_append(acc, [KParam { name: written_text(p.binder.name), slot: SBoxed, mode: kparam_mode(p), origin: origin }]))
   }
 }
 
@@ -567,7 +578,7 @@ fn canon_one_handler(h: KHandlerDecl, decls: [Decl]) : KHandlerDecl =
   match kir_default_of_decl(h.eff_sym, decls) {
     None     -> canon_decl_order(h, decls)
     Some(kd) -> match kd {
-      KDef(_, _, defops) ->
+      KDef(_, defops) ->
         if op_thunks_covered_by(h.op_thunks, defops) {
           KHandlerDecl { ...h, op_thunks: reorder_op_thunks(defops, h.op_thunks) }
         } else { canon_decl_order(h, decls) }
@@ -590,7 +601,7 @@ fn canon_decl_order(h: KHandlerDecl, decls: [Decl]) : KHandlerDecl =
 fn find_effect_ops(h: KHandlerDecl, decls: [Decl]) : Option[[KDefOp]] = match decls {
   [] -> None
   [d, ...rest] -> match d {
-    DEffect(_, _, _, ops, _, _, _, _, esym) ->
+    DEffect(_, esym, _, ops, _, _, _, _) ->
       if effect_decl_matches(h, esym) { Some(decl_op_names(ops)) }
       else { find_effect_ops(h, rest) }
     _ -> find_effect_ops(h, rest)
@@ -656,7 +667,7 @@ fn find_op_thunk(thunks: [KOpThunk], op: String) : Option[KOpThunk] = match thun
 # (the union must see every clause of the handle, not just the head).
 fn lower_handler_decls(clauses: [ClauseInfo], all_cls: [ClauseInfo], acc: [KHandlerDecl]) : [KHandlerDecl] = match clauses {
   [] -> acc
-  [CI(line, col, eff, head, _, _, _, enc_fn, _, _, esym), ...rest] ->
+  [CI(line, col, _, head, _, _, _, enc_fn, _, _, esym), ...rest] ->
     # `finally` carries no Ev field — it is armed on the evidence node, not
     # stored as an op thunk — so it never joins `op_thunks`.
     if is_lifecycle_clause(head) {
@@ -666,18 +677,18 @@ fn lower_handler_decls(clauses: [ClauseInfo], all_cls: [ClauseInfo], acc: [KHand
       let sym = user_handler_sym(enc_fn, line, col)
       let ot  = KOT(op, user_clause_sym(enc_fn, line, col, op), 0)
       let ecaps = kir_handle_captures_at(all_cls, enc_fn, line, col)
-      lower_handler_decls(rest, all_cls, hdecl_add(acc, eff, esym, sym, ot, ecaps))
+      lower_handler_decls(rest, all_cls, hdecl_add(acc, esym, sym, ot, ecaps))
     }
 }
 
 # Add an op-thunk to the matching handler decl, or create the decl. The
 # `env_caps` of the first clause that opens the decl wins (all clauses of
 # one handle resolve the same union, so later ops carry the same list).
-fn hdecl_add(acc: [KHandlerDecl], eff: String, esym: SymId, sym: String, ot: KOpThunk, ecaps: [String]) : [KHandlerDecl] = match acc {
-  [] -> [KHandlerDecl { eff: eff, eff_sym: esym, sym: sym, op_thunks: [ot], ret_thunk: None, env_caps: ecaps }]
+fn hdecl_add(acc: [KHandlerDecl], esym: SymId, sym: String, ot: KOpThunk, ecaps: [String]) : [KHandlerDecl] = match acc {
+  [] -> [KHandlerDecl { eff_sym: esym, sym: sym, op_thunks: [ot], ret_thunk: None, env_caps: ecaps }]
   [h, ...rest] ->
     if h.sym == sym { [KHandlerDecl { ...h, op_thunks: list_append(h.op_thunks, [ot]) }, ...rest] }
-    else { [h, ...hdecl_add(rest, eff, esym, sym, ot, ecaps)] }
+    else { [h, ...hdecl_add(rest, esym, sym, ot, ecaps)] }
 }
 
 
