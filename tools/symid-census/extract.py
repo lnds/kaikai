@@ -5,7 +5,7 @@ Families:
   arm     a pattern binds (or tests a literal against) the name slot of an identity node
   mint    an identity node is constructed with a literal name, or `mk_ref` is given one
   acc     a name accessor is called (rl_name, ty_ref_qual, hs_display, .eff, ...)
-  lit     a string literal that looks like a declaration name or a `__` marker is compared
+  lit     a string literal is compared (`==`, `!=`) or matched as an arm; the node column gives its shape
 Output: TSV  file  line  fn  family  node  text
 """
 import os, re, sys, json
@@ -60,6 +60,12 @@ def balanced(s, i):
             if d == 0: return j
     return -1
 
+def lit_shape(t):
+    if t == "": return "empty"
+    if re.fullmatch(r'[a-z_][A-Za-z0-9_]*', t): return "lower"
+    if re.fullmatch(r'[^A-Za-z0-9_]+', t): return "symbol"
+    return "other"
+
 FN = re.compile(r'^\s*(?:pub\s+)?fn\s+([a-z_][A-Za-z0-9_]*)')
 IDENT = re.compile(r'^[a-z_][A-Za-z0-9_]*$')
 LIT = re.compile(r'^"[^"]*"$')
@@ -105,6 +111,12 @@ for fname in sorted(os.listdir(SRC)):
             rows.append((fname, ln, cur_fn, "lit", "==", code.strip()[:200]))
         elif re.search(r'string_starts_with\([^)]*"__', code):
             rows.append((fname, ln, cur_fn, "lit", "__prefix", code.strip()[:200]))
+        else:
+            m = re.search(r'(?:==|!=)\s*"([^"]*)"|"([^"]*)"\s*(?:==|!=)', code)
+            if m:
+                rows.append((fname, ln, cur_fn, "lit", "==" + lit_shape(m.group(1) if m.group(1) is not None else m.group(2)), code.strip()[:200]))
+            elif re.match(r'\s*"[^"]*"\s*->', code):
+                rows.append((fname, ln, cur_fn, "lit", "match", code.strip()[:200]))
 
 w = sys.stdout
 for r in rows:
