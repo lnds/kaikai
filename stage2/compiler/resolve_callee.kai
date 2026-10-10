@@ -46,7 +46,7 @@ fn ct_arities(ds: [Decl], home: String, target: String, ix: NameIndex[Int]) : Na
   }
 
 fn ct_note(ix: NameIndex[Int], d: Decl, home: String) : NameIndex[Int] = match d {
-  DFn(_, n, _, ps, _, _, _, _, _, _, _) -> idx_prepend_sym(ix, sym_derive(NCFn, n, home), list_length(ps))
+  DFn(_, fid, _, ps, _, _, _, _, _, _) -> idx_prepend_sym(ix, fnid_sym(fid), list_length(ps))
   DConstructor(inner, _, _) -> ct_note(ix, inner, home)
   DDoc(_, _, inner, _, _)   -> ct_note(ix, inner, home)
   DAttr(_, inner, _, _)     -> ct_note(ix, inner, home)
@@ -65,8 +65,8 @@ pub fn ct_fits(ct: CalleeTab, s: SymId, n: Int) : Bool = match ct_arity(ct, s) {
   None    -> true
 }
 
-#[doc("A protocol operation's dispatcher: its identity, or `None` when protocols of several homes declare the operation and the type settles which, and its name.")]
-pub type Disp = Disp(Option[SymId], String)
+#[doc("A protocol operation's dispatcher: the declaration the table holds, or the name the dispatchers are written with when protocols of several homes declare the operation and the type settles which.")]
+pub type Disp = DispSym(SymId) | DispWritten(String)
 
 #[doc("""
 The dispatcher a use of `name` reaches on the protocol rung, read from
@@ -81,7 +81,7 @@ pub fn ct_proto(ct: CalleeTab, name: String, n: Option[Int], rs: ResState) : Opt
   let seen = filter(ct.ops, (r) => rung_fits(r, name, n) and rung_seen(r, rs_home_name(rs), ct.target))
   let own = filter(seen, (r) => rung_home(r, ct.target) == rs_home_name(rs))
   let near = filter(seen, (r) => rs_sees_home(rs, rung_home(r, ct.target)))
-  rung_disp(first_nonempty([own, near, seen]), ct.target)
+  rung_disp(first_nonempty([own, near, seen]), ct.target, rs)
 }
 
 fn first_nonempty(tiers: [[ProtoRung]]) : [ProtoRung] = match tiers {
@@ -89,12 +89,15 @@ fn first_nonempty(tiers: [[ProtoRung]]) : [ProtoRung] = match tiers {
   [t, ...rest] -> if list_is_empty(t) { first_nonempty(rest) } else { t }
 }
 
-fn rung_disp(rungs: [ProtoRung], target: String) : Option[Disp] = match rungs {
+# A dispatcher carries its identity: two modules may each declare a
+# protocol with an operation of one name.
+fn rung_disp(rungs: [ProtoRung], target: String, rs: ResState) : Option[Disp] = match rungs {
   [] -> None
   [r, ...rest] -> {
     let h = rung_home(r, target)
-    let id = if all(rest, (o) => rung_home(o, target) == h) { Some(sym_derive(NCFn, rung_name(r), h)) } else { None }
-    Some(Disp(id, rung_name(r)))
+    let s = sym_derive(NCFn, rung_name(r), h)
+    let one = all(rest, (o) => rung_home(o, target) == h)
+    Some(if one and rs_recording(rs) and st_valid(rs.tab, s) { DispSym(s) } else { DispWritten(rung_name(r)) })
   }
 }
 
@@ -121,13 +124,13 @@ fn ct_arity_ok(n: Option[Int], a: Int) : Bool = match n {
 }
 
 #[doc("A local binder whose definition fixes its arity: a lambda, or a function-typed annotation.")]
-pub type LocalArity = LocalArity(SymId, Int)
+pub type LocalArity = LocalArity(LocalId, Int)
 
 #[doc("What the climb reads: the scopes in force, the resolution state, the table, and the local arities.")]
 pub type CallCx = CallCx(ScopeChain, ResState, CalleeTab, [LocalArity])
 
 #[doc("What a bare use reached: a binder, a declaration, a name left as written (a constructor, a contest the type settles), a protocol operation's dispatcher, nothing that fits, or the core rung's builtin.")]
-pub type Reach = RLocal(SymId) | RDecl(SymId) | RBare | RProto(Disp) | RNone | RCore
+pub type Reach = RLocal(LocalId) | RDecl(SymId) | RBare | RProto(Disp) | RNone | RCore
 
 #[doc("The nearer binding a call passed over because its arity did not fit: a local of that arity, or a declaration.")]
 pub type Skip = SkNone | SkLocal(Int) | SkDecl(SymId)
@@ -165,7 +168,7 @@ pub fn call_hit(cx: CallCx, name: String, n: Int) : Hit = match cx {
 
 # Only the innermost binder of a name competes: a `let` hides every
 # outer binder of its name, whatever the arities.
-fn la_first_fit(las: [LocalArity], ls: [SymId], n: Int) : Option[SymId] = match ls {
+fn la_first_fit(las: [LocalArity], ls: [LocalId], n: Int) : Option[LocalId] = match ls {
   [] -> None
   [s, ..._] -> match la_of(las, s) {
     Some(a) -> if a == n { Some(s) } else { None }
@@ -173,14 +176,14 @@ fn la_first_fit(las: [LocalArity], ls: [SymId], n: Int) : Option[SymId] = match 
   }
 }
 
-fn la_skip(las: [LocalArity], ls: [SymId]) : Skip = match ls {
+fn la_skip(las: [LocalArity], ls: [LocalId]) : Skip = match ls {
   [s, ..._] -> match la_of(las, s) { Some(a) -> SkLocal(a)  None -> SkNone }
   []        -> SkNone
 }
 
-fn la_of(las: [LocalArity], s: SymId) : Option[Int] = match las {
+fn la_of(las: [LocalArity], s: LocalId) : Option[Int] = match las {
   [] -> None
-  [LocalArity(t, a), ...rest] -> if sym_raw(t) == sym_raw(s) { Some(a) } else { la_of(rest, s) }
+  [LocalArity(t, a), ...rest] -> if local_eq(t, s) { Some(a) } else { la_of(rest, s) }
 }
 
 fn decl_hit(cx: CallCx, name: String, n: Int, sk0: Skip) : Hit = match cx {

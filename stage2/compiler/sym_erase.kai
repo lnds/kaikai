@@ -1,129 +1,27 @@
 #[doc("""
-Erases resolved identity back to a spelling, at the one boundary where
-a name stops being a reference and becomes a C symbol — except where the
-backend still decides by it.
+Numbers the nodes of every declaration below the monomorphiser.
 
-Identity is what the resolver decided and what the typer and the
-monomorphiser consume. Below them most passes no longer ask *which*
-declaration a name means; they spell an identifier for the backend, and
-an `ESym` there would give every spelling site a second shape for no
-decision it makes. The backend does still decide which function a call
-names and which effect a perform reaches, so those references keep
-their id, and a pass reading them by name normalises with `sym_read`.
-
-A bare spelling only carries the decision where the name answers to one
-declaration. Where several modules declare it and none of them is the
-reader's own, the erasure spells the home the resolver chose — the
-qualified form the backend already resolves by (name, home) — so the
-settled question is not re-asked by name below.
-
-The two halves run apart. The ownership passes read identity, so the
-qualification runs before them and leaves every other reference an
-`ESym`; the erasure proper runs after them. An effect, function,
-builtin or constructor reference keeps its id through both: the backend
-dispatches a perform on the first, resolves a call by the second and
-finds a builtin's row by the third and a constructor's by the fourth.
+A reference is its identity from the resolver down to the emitters, so
+nothing is respelled here. What is left of the boundary this module was
+is the site id it gives each node of a declaration's bodies, which the
+unwinder keys its brackets by: the ownership passes run between the two
+entry points, and each rebuilds the bodies it is handed.
 """)]
 
 import compiler.ast
 import compiler.site_ids
-import compiler.ast_map
 import compiler.symtab
-import compiler.decl_names
-import compiler.home_tu
-import compiler.decl_map
-import compiler.written
 
-#[doc("The erasure's view of the program: the symbol table the resolver stamped from, and the module whose file is being built.")]
+#[doc("The view the two entry points take: the symbol table the program's ids index, and the module whose file is being built.")]
 pub type SymErase = SymErase(SymTab, String)
 
-# The table, the root module, and whether a reference keeps its id (the
-# qualification) or is spelled for the backends (the erasure).
-type SeCx = SeCx(SymTab, String, Bool)
+#[doc("The same declarations with every node of their bodies given a site id of its own, unique within its declaration.")]
+pub fn sym_erase_decls_in(se: SymErase, ds: [Decl]) : [Decl] / Mutable = se_decls(ds)
 
-#[doc("The same declarations with every resolved reference spelled as the backend reads it, except an effect, builtin or constructor reference, which keeps its id.")]
-pub fn sym_erase_decls_in(se: SymErase, ds: [Decl]) : [Decl] / Mutable = se_decls(se_cx(se, false), ds)
+#[doc("The same declarations with every node of their bodies given a site id of its own, unique within its declaration.")]
+pub fn sym_qualify_decls_in(se: SymErase, ds: [Decl]) : [Decl] / Mutable = se_decls(ds)
 
-#[doc("The same declarations with each local binder read by its spelling and every reference to a declaration still carrying its id.")]
-pub fn sym_qualify_decls_in(se: SymErase, ds: [Decl]) : [Decl] / Mutable = se_decls(se_cx(se, true), ds)
-
-fn se_cx(se: SymErase, keep: Bool) : SeCx = match se { SymErase(tab, target) -> SeCx(tab, target, keep) }
-
-fn se_decls(cx: SeCx, ds: [Decl]) : [Decl] / Mutable = match ds {
+fn se_decls(ds: [Decl]) : [Decl] / Mutable = match ds {
   []           -> []
-  [d, ...rest] -> {
-    let at = SeAt(se_decl_home(cx, d))
-    let sites = array_make(1, 0)
-    [decl_map_bodies(d, (b) => se_expr_at(cx, at, sites, b)), ...se_decls(cx, rest)]
-  }
-}
-
-# Where a body sits: its home.
-type SeAt = SeAt(String)
-
-# The home a declaration's body sits in: the module whose other entries a
-# bare name inside it reaches without qualification.
-fn se_decl_home(cx: SeCx, d: Decl) : String = match cx {
-  SeCx(_, target, _) -> match home_tu(d) {
-    Some(m) -> m
-    None    -> target
-  }
-}
-
-# Every node of a declaration's bodies takes a site id of its own, unique
-# within the declaration: nothing after this rebuild clones a node.
-fn se_expr_at(cx: SeCx, at: SeAt, sites: Array[Int], e: Expr) : Expr / Mutable = {
-  let k = se_kind_at(cx, at, sites, e.kind)
-  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode, site: site_next(sites) }
-}
-
-# A local binder is read by spelling below here: the passes that follow
-# track binders by scope, and no declaration is reached through one.
-fn se_kind_at(cx: SeCx, at: SeAt, sites: Array[Int], k: ExprKind) : ExprKind / Mutable = match k {
-  ESym(s, inst, n) -> if sym_is_local(s) { EName(n) } else { sym_erase_ref(cx, at, s, inst, n) }
-  _                -> prc_map_expr_kind(k, (sub) => se_expr_at(cx, at, sites, sub))
-}
-
-# A reference spells its home only where the bare name would leave the
-# decision open, or would be taken for a self-call. A specialisation was
-# placed by the monomorphiser, so there is nothing left to contest.
-fn sym_erase_ref(cx: SeCx, at: SeAt, s: SymId, inst: Int, n: String) : ExprKind = match cx {
-  SeCx(tab, target, keep) -> match sym_class(tab, s) {
-    NCEffect -> ESym(s, inst, n)
-    NCBuiltin -> ESym(s, inst, n)
-    NCCtor   -> ESym(s, inst, n)
-    NCFn     -> if not keep and inst == spec_none() and se_spellable(tab, target, at, n) { se_home_call(tab, s, n) } else { ESym(s, inst, n) }
-    _        -> se_bare(keep, s, inst, n)
-  }
-}
-
-# A reference the table does not hold has no home to spell and keeps its id.
-fn se_home_call(tab: SymTab, s: SymId, n: String) : ExprKind = {
-  let owner = sym_owner(tab, s)
-  if st_valid(tab, owner) { EModCall(written_text(sym_name(tab, owner)), n) } else { ESym(s, spec_none(), n) }
-}
-
-fn se_bare(keep: Bool, s: SymId, inst: Int, n: String) : ExprKind = if keep { ESym(s, inst, n) } else { EName(n) }
-
-# Contested, and no candidate is one the bare name already answers (a
-# root-file entry wins every bare call in the registry, and the body's own
-# module answers one before any import does).
-fn se_spellable(tab: SymTab, target: String, at: SeAt, n: String) : Bool = match at {
-  SeAt(h) -> {
-    let cands = st_candidates(tab, NCFn, n)
-    se_many(cands) and se_open(tab, cands, target, h)
-  }
-}
-
-fn se_open(tab: SymTab, cands: [SymId], target: String, h: String) : Bool =
-  not se_any_home(tab, cands, target) and not se_any_home(tab, cands, h)
-
-fn se_any_home(tab: SymTab, cands: [SymId], home: String) : Bool = match cands {
-  []           -> false
-  [c, ...rest] -> if written_text(sym_home(tab, c)) == home { true } else { se_any_home(tab, rest, home) }
-}
-
-fn se_many(cands: [SymId]) : Bool = match cands {
-  [_, _, ..._] -> true
-  _            -> false
+  [d, ...rest] -> [site_renumber_decl(d), ...se_decls(rest)]
 }

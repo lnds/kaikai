@@ -1,99 +1,41 @@
 #[doc("""
-The line above which a core builtin a pass named by spelling gets its row.
+The line below which a core builtin is always its row.
 
-The resolver stamps the builtins a source file names. A pass above the
-ownership passes that synthesises a call to one (the index and slice
-sugars, a unit coercion) still mints a bare name, so here that name is
-given the builtin's row too: below this line a builtin is always an id,
-and a bare name is a local. A name some binder of the same body spells
-is left alone. This module goes when every such pass mints the id.
+The resolver writes the builtins a source file names as their rows, and
+a pass that synthesises a call to one mints the row itself. A name that
+still reaches here written, and spells a core builtin, is given the
+builtin's row: a local is never a written name, so no binder can be
+taken for one. This module goes when nothing above it leaves such a
+name.
 """)]
 
 import compiler.ast
 import compiler.ast_map
 import compiler.decl_map
-import compiler.expr_positions
 import compiler.expr_exists
 import compiler.symtab
 import compiler.core_syms
-import compiler.modules
-import compiler.util
+import compiler.written
 
-#[doc("`ds` with every bare name that reaches a core builtin carrying the builtin's row.")]
-pub fn core_stamp_decls(tab: SymTab, ds: [Decl]) : [Decl] = map(ds, (d) => decl_map_inner(d, (x) => cst_leaf(tab, x)))
+#[doc("`ds` with every written name that spells a core builtin replaced by the builtin's row.")]
+pub fn core_stamp_decls(tab: SymTab, ds: [Decl]) : [Decl] = map(ds, (d) => decl_map_bodies(d, (b) => cst_body(tab, b)))
 
-fn cst_leaf(tab: SymTab, d: Decl) : Decl = match d {
-  DFn(p, n, tp, ps, rt, row, body, l, c, mo, id) -> DFn(p, n, tp, ps, rt, row, cst_body(tab, ps, body), l, c, mo, id)
-  DTest(desc, body, l, c, mo)                     -> DTest(desc, cst_body(tab, [], body), l, c, mo)
-  DBench(desc, body, l, c, mo)                    -> DBench(desc, cst_body(tab, [], body), l, c, mo)
-  DCheck(desc, ps, body, l, c, mo)                -> DCheck(desc, ps, cst_body(tab, ps, body), l, c, mo)
-  DConst(p, n, ta, body, mo, l, c, id)            -> DConst(p, n, ta, cst_body(tab, [], body), mo, l, c, id)
-  DImpl(pn, tas, tgt, subs, l, c, tps, id)        -> DImpl(pn, tas, tgt, map(subs, (s) => decl_map_inner(s, (x) => cst_leaf(tab, x))), l, c, tps, id)
-  _                                               -> d
+# Most bodies leave no builtin written, and are returned as they are.
+fn cst_body(tab: SymTab, body: Expr) : Expr =
+  if xp_exists(body, false, (x) => cst_is_written_builtin(tab, x)) { cst_expr(tab, body) } else { body }
+
+fn cst_is_written_builtin(tab: SymTab, e: Expr) : Bool = match e.kind {
+  EName(n) -> sym_is_builtin(tab, builtin_sym(written_text(n)))
+  _        -> false
 }
 
-# Most bodies name no builtin by spelling, and are returned as they are.
-fn cst_body(tab: SymTab, ps: [Param], body: Expr) : Expr = {
-  let locals = cst_binders(body, map(ps, (p) => p.pname))
-  if xp_exists(body, false, (x) => cst_is_bare_builtin(tab, locals, x)) { cst_expr(tab, locals, body) } else { body }
-}
+fn cst_expr(tab: SymTab, e: Expr) : Expr =
+  Expr { kind: cst_kind(tab, e.kind), line: e.line, col: e.col, ty: e.ty, mode: e.mode, site: e.site }
 
-fn cst_is_bare_builtin(tab: SymTab, locals: [String], e: Expr) : Bool = match e.kind {
-  EName(n) -> not list_has(locals, n) and sym_is_builtin(tab, builtin_sym(n))
-  _       -> false
-}
-
-fn cst_expr(tab: SymTab, locals: [String], e: Expr) : Expr =
-  Expr { kind: cst_kind(tab, locals, e.kind), line: e.line, col: e.col, ty: e.ty, mode: e.mode, site: e.site }
-
-fn cst_kind(tab: SymTab, locals: [String], k: ExprKind) : ExprKind = match k {
-  EName(n) -> if list_has(locals, n) { k } else { cst_ref(tab, n, k) }
-  _       -> prc_map_expr_kind(k, (sub) => cst_expr(tab, locals, sub))
-}
-
-fn cst_ref(tab: SymTab, n: String, k: ExprKind) : ExprKind = {
-  let s = builtin_sym(n)
-  if sym_is_builtin(tab, s) { ESym(s, spec_none(), n) } else { k }
-}
-
-# Every name a binding site of the body spells.
-fn cst_binders(e: Expr, acc: [String]) : [String] = {
-  let here = match e.kind {
-    ELambda(ps, _)  -> list_append(map(ps, (p) => p.pname), acc)
-    EBlock(ss, _)   -> cst_stmt_binders(ss, acc)
-    EMatch(_, arms) -> cst_arm_binders(arms, acc)
-    EHandle(_, _, _, _, _, alias, cls, oret) -> cst_handle_binders(alias, cls, oret, acc)
-    _ -> acc
+fn cst_kind(tab: SymTab, k: ExprKind) : ExprKind = match k {
+  EName(n) -> {
+    let s = builtin_sym(written_text(n))
+    if sym_is_builtin(tab, s) { ESym(s, spec_none()) } else { k }
   }
-  cst_binders_ps(xp_positions(e), here)
-}
-
-fn cst_binders_ps(ps: [XPos], acc: [String]) : [String] = match ps {
-  []                  -> acc
-  [XP(_, c), ...rest] -> cst_binders_ps(rest, cst_binders(c, acc))
-}
-
-fn cst_stmt_binders(ss: [Stmt], acc: [String]) : [String] = match ss {
-  []           -> acc
-  [s, ...rest] -> cst_stmt_binders(rest, match s {
-    SLet(p, _, _)        -> pat_binders(p, acc)
-    SVar(nm, _, _, _, _) -> [nm, ...acc]
-    _                    -> acc
-  })
-}
-
-fn cst_arm_binders(arms: [Arm], acc: [String]) : [String] = match arms {
-  []                      -> acc
-  [Arm(p, _, _), ...rest] -> cst_arm_binders(rest, pat_binders(p, acc))
-}
-
-fn cst_handle_binders(alias: Option[String], cls: [HClause], oret: Option[HReturn], acc: [String]) : [String] = {
-  let a1 = match alias { Some(nm) -> [nm, ...acc] None -> acc }
-  let a2 = match oret { Some(HR(nm, _, _, _)) -> [nm, ...a1] None -> a1 }
-  cst_clause_binders(cls, a2)
-}
-
-fn cst_clause_binders(cls: [HClause], acc: [String]) : [String] = match cls {
-  []                            -> acc
-  [HC(_, ps, _, _, _), ...rest] -> cst_clause_binders(rest, list_append(map(ps, (p) => p.pname), acc))
+  _ -> prc_map_expr_kind(k, (sub) => cst_expr(tab, sub))
 }
