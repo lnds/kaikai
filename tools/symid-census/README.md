@@ -1,17 +1,26 @@
-# Name reads in identity data
+# Names stay out of identity
 
-`census-main-1b21b356.tsv` lists every place the stage-2 compiler read a
-name out of identity-bearing data at `1b21b356`, found by `extract.py`
-(pattern arms on the name slot, literal-name mints, name accessors,
-literal-name and `__`-prefix compares) and classified by hand.
+The ledgers behind `tools/symid-names-gate.sh`. After the resolver a
+declaration, a type, an effect, a constructor or a local is its id; text
+is read only where a name is resolved, shown, or spelled into output.
 
-| cat | meaning | stays? |
-|-----|---------|--------|
-| R | resolver: written text turned into an id | yes |
-| D | diagnostic, dump, JSON, docs, test assertion | yes |
-| S | surface tooling: parse, fmt, migrate, lsp, surface lowering | yes |
-| L | local binder compared against local binders | yes |
-| E | text spelled into a C/LLVM symbol or runtime string, never compared | yes |
-| P | node rebuilt with the name copied, nothing decided | disappears with the slot |
-| X | identity decided by a name | no |
-| M | compiler marker spelled as a string | no, becomes a typed node |
+| file | holds |
+|------|-------|
+| `gate.py` | the source checks; its header documents every ledger |
+| `extract.py` | finds each string literal that name text is tested against |
+| `sources.py` | the sources as both read them: comments gone, literals masked |
+| `dual-slots.txt` | types with a text slot beside an id slot, and what the text is |
+| `written-readers.txt` | functions calling `written_text`, with a reason per call |
+| `allow.tsv` | literal tests on name text, with a reason per literal |
+| `written-mints.txt` | where a reference by text may be built |
+| `written-eq.txt` | functions that may compare a value holding a written name |
+| `pending-written.txt` | sites that still decide by text after the resolver |
+| `probe/main.kai` | what `--check-written-eq` must report, and must not |
+
+Reasons: `R` resolution, `D` diagnostic or dump, `E` emitted text,
+`L` an operation or field label inside a declaration known by its id.
+
+When the gate fails on new code, convert the site to an id. If the text
+is legitimate (a diagnostic, a spelled symbol, a pass before the
+resolver), add or adjust its row with the reason. A site that decides by
+text after the resolver goes in no ledger but `pending-written.txt`.
