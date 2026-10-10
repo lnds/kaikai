@@ -620,7 +620,7 @@ test-modules: $(TARGET) build
 # rqc has an empty module table and every EField stays as a
 # record-field projection (M6.1 + record-projection legacy
 # behaviour preserved).
-QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection qualified_type_in_signature qualified_constructor_disambig alias_consumer_clash alias_consumer_clash_renamed private_type_alias_scope protocol_home_scope protocol_dispatch_home pub_unit_scope const_home_scope interp_const_scope qualified_record_variant_pattern
+QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection qualified_type_in_signature qualified_constructor_disambig alias_consumer_clash alias_consumer_clash_renamed private_type_alias_scope protocol_home_scope protocol_dispatch_home pub_unit_scope const_home_scope interp_const_scope qualified_record_variant_pattern const_interp_homonyms
 QUALIFIED_NEG_DIRS := unknown_export qualified_type_negative protocol_private_foreign protocol_dispatch_private pub_unit_bare_ambiguous pub_unit_cross_module qualified_record_variant_unknown
 
 test-modules-qualified: $(TARGET) build
@@ -7031,8 +7031,11 @@ test-perceus-1135-vec-raw-native: $(TARGET) bin-kai build
 # the golden and the KAI_TRACE_RC counters must be exactly those. The first
 # two write a uniquely owned vector in place whether the read sits in the
 # write's arguments or in an earlier `let`, on a param or on a local. The
-# third reads after the write, so each of its writes must copy.
-PERCEUS_VEC_LEND_FIXTURES := vec_lend_then_write:600:0 vec_lend_then_write_local:4:0 vec_read_after_write:0:4
+# third reads after the write, so each of its writes must copy. The last two
+# write a vector its holder hands over first: a `var` slot refilled by the
+# write, and a constructor cell the match releases as the arm starts.
+PERCEUS_VEC_LEND_FIXTURES := vec_lend_then_write:600:0 vec_lend_then_write_local:4:0 vec_read_after_write:0:4 \
+  vec_var_loop_write:470:0 vec_in_ctor_write:400:0
 
 test-perceus-vec-lend-write: $(TARGET) build
 	@set -e; \

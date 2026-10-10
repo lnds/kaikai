@@ -77,6 +77,7 @@ import compiler.ast
 import compiler.written
 import compiler.symtab
 import compiler.decl_text
+import compiler.rt_name
 import compiler.operators
 import compiler.core_refs
 import compiler.core_protos
@@ -342,19 +343,21 @@ pub fn proto_type_ref(te: TypeExpr) : DeclRef {
   }
 }
 
-#[doc("The single-dispatch head name of a `TypeExpr`: the piece an impl symbol spells and a diagnostic shows.")]
+#[doc("The single-dispatch head name of a `TypeExpr`, as a diagnostic shows it.")]
 pub fn proto_type_name(tab: SymTab, te: TypeExpr) : String = ref_text(tab, proto_type_ref(te))
 
-# A reference's name: the declaration's once resolved, the written one until then.
+# A reference's name as a diagnostic shows it: the declaration's once
+# resolved, the written one until then.
 fn ref_text(tab: SymTab, r: DeclRef) : String = match r {
   DrSym(s)        -> written_text(decl_name(tab, s))
   DrWritten(_, n) -> written_text(n)
 }
 
-# One declaration when both are resolved, one spelling while either is still written.
+# One declaration when both are resolved, one emitted name while either is
+# still written: a homonym another module declares is never spelled bare.
 fn refs_same(tab: SymTab, a: DeclRef, b: DeclRef) : Bool =
   if ref_resolved(a) and ref_resolved(b) { sym_raw(ref_sym(a)) == sym_raw(ref_sym(b)) }
-  else { ref_text(tab, a) == ref_text(tab, b) }
+  else { rt_ref_name(tab, a) == rt_ref_name(tab, b) }
 
 # The bare name an unqualified reference still spells: where `Self` and
 # a type parameter, which no declaration stands behind, are recognised.
@@ -594,8 +597,8 @@ fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
         # home leads the key: two modules implementing their own `P`
         # for same-named types are not duplicates.
         let arg_names = match proto_args {
-          [] -> [tname]
-          _  -> map(proto_args, (a) => proto_type_name(tab, a))
+          [] -> [head_spell(HeadScope(ps, from), target)]
+          _  -> map(proto_args, (a) => head_spell(HeadScope(ps, from), a))
         }
         let mo_key = match res {
           PkHome(Some(m)) -> m
@@ -1139,8 +1142,8 @@ fn lower_impls_loop(ds: [Decl], ps: PScope, acc: LowerImplsRes) : LowerImplsRes 
         let psym = proto_ref_sym(ps, pref, from)
         # No protocol argument is the legacy form, `Ai = Self`.
         let head = ImplHead { key: proto_key_of(acc.reg.dkeys, pname, psym), proto: psym,
-                              tname: proto_type_name(tab, target), target: proto_type_ref(target),
-                              arg_names: map(proto_args, (a) => proto_type_name(tab, a)),
+                              tname: head_spell(HeadScope(ps, from), target), target: proto_type_ref(target),
+                              arg_names: map(proto_args, (a) => head_spell(HeadScope(ps, from), a)),
                               args: map(proto_args, proto_type_ref), home: from }
         lower_impls_loop(rest, ps, lower_impl_methods(tab, ps_root(ps), head, methods, acc))
       }
@@ -1655,14 +1658,18 @@ fn strip_protocols_loop(ds: [Decl], acc: [Decl]) : [Decl] {
 # `tsym` is the type, which a derived declaration refers to by id.
 # `ids` and `homed` say how a derived body names a protocol operation:
 # its dispatcher, through its home unless a core module derives.
-# `home` is the module the derived functions are declared in, and `tab`
-# names the type and its constructors.
+# `home` is the module the derived functions are declared in, `tab`
+# names the type and its constructors, and `heads` spells a field's type.
 type DerivedType = { tsym: SymId, tps: [String], body: TypeBody, writers: [String],
-                     ids: ProtoIds, homed: Bool, home: String, tab: SymTab }
+                     ids: ProtoIds, homed: Bool, home: String, tab: SymTab, heads: HeadScope }
 
-# The name the user wrote: what a derived `show` prints, and the type
-# piece of an impl symbol and of a synthesised shim's name.
+# The name the user wrote: what a derived `show` and a runtime message
+# print, and what names the shim.
 fn dt_name(dt: DerivedType) : String = ref_text(dt.tab, DrSym(dt.tsym))
+
+# The name the type is emitted under: the type piece of an impl symbol
+# and of its writer.
+fn dt_rt_name(dt: DerivedType) : String = rt_name(dt.tab, dt.tsym)
 
 fn derive_impls_for(dx: DeriveCx, names: [String], dt: Decl, home: Option[String], writers: [String]) : Derived {
   match dt {
@@ -1672,7 +1679,8 @@ fn derive_impls_for(dx: DeriveCx, names: [String], dt: Decl, home: Option[String
                         DerivedType { tsym: tsym, tps: tps,
                                       body: body, writers: writers, ids: dx.ids,
                                       homed: derive_homed(dx.cores, home),
-                                      home: proto_home_name(home, ps_root(dx.ps)), tab: tab },
+                                      home: proto_home_name(home, ps_root(dx.ps)), tab: tab,
+                                      heads: HeadScope(dx.ps, home) },
                         line, col, derived_none())
     }
     _ -> derived_none()
@@ -1755,7 +1763,7 @@ fn derive_impl_for_protocol(g: CoreProto, dt: DerivedType, line: Int, col: Int) 
       Derived { decls: m.decls, rows: m.rows }
     }
     CpJson         -> {
-      let m = derive_json_impl(dt.tab, dt.tsym, dt.body, line, col)
+      let m = derive_json_impl(dt.tab, dt.tsym, dt.body, (r) => head_ref_spell(dt.heads, r), line, col)
       Derived { decls: m.decls, rows: m.rows }
     }
     _              -> derived_none()
@@ -2367,13 +2375,13 @@ fn make_derived_impl(g: CoreProto, dt: DerivedType, opname: String,
 fn derive_binserialize_impl(dt: DerivedType, line: Int, col: Int) : Derived {
   match dt.body {
     TBRecord(fields) -> {
-      let put = derive_binser_put_record(dt.tab, mk_name("buf", line, col), fields, 0, dt.writers, line, col)
-      let from_b = derive_binser_record_from_bytes(dt.tab, dt.tsym, fields, line, col)
+      let put = derive_binser_put_record(dt.heads, mk_name("buf", line, col), fields, 0, dt.writers, line, col)
+      let from_b = derive_binser_record_from_bytes(dt.heads, dt.tsym, fields, line, col)
       derive_binser_decls(dt, put, from_b, line, col)
     }
     TBSum(variants) -> {
-      let put = derive_binser_put_sum(dt.tab, variants, dt.writers, line, col)
-      let from_b = derive_binser_sum_from_bytes(dt.tab, dt_name(dt), variants, line, col)
+      let put = derive_binser_put_sum(dt.heads, variants, dt.writers, line, col)
+      let from_b = derive_binser_sum_from_bytes(dt.heads, dt_name(dt), variants, line, col)
       derive_binser_decls(dt, put, from_b, line, col)
     }
     _ -> derived_none()
@@ -2382,11 +2390,11 @@ fn derive_binserialize_impl(dt: DerivedType, line: Int, col: Int) : Derived {
 
 fn derive_binser_decls(dt: DerivedType, put: Expr, from_b: Expr,
                         line: Int, col: Int) : Derived =
-  Derived { decls: [make_binser_impl(dt, derive_binser_to_bytes(dt_name(dt), line, col), from_b, line, col),
+  Derived { decls: [make_binser_impl(dt, derive_binser_to_bytes(dt_rt_name(dt), line, col), from_b, line, col),
                     derive_binser_put_fn(dt, put, line, col),
                     derive_binser_shim(dt, line, col)],
             rows: list_append(derived_method_rows(dt, CpBinSerialize, ["to_bytes", "from_bytes"]),
-                              [NEnt(NCFn, binser_put_name(dt_name(dt)), dt.home, false),
+                              [NEnt(NCFn, binser_put_name(dt_rt_name(dt)), dt.home, false),
                                NEnt(NCFn, binser_shim_name(dt_name(dt)), dt.home, true)]) }
 
 # `bin_buf_bytes(<writer>(bin_buf_new(), self))`: the writer over a fresh
@@ -2406,7 +2414,7 @@ fn derive_binser_put_fn(dt: DerivedType, body: Expr, line: Int, col: Int) : Decl
   let self_ty = derived_self_ty(dt, line, col)
   let params = [Param { binder: binder_written("buf"), ptype: Some(buf_ty), pline: line, pcol: col, pborrow: false },
                 Param { binder: binder_written("self"), ptype: Some(self_ty), pline: line, pcol: col, pborrow: false }]
-  DFn(false, fnid_decl(sym_derive(NCFn, binser_put_name(dt_name(dt)), dt.home)), [], params, Some(buf_ty),
+  DFn(false, fnid_decl(sym_derive(NCFn, binser_put_name(dt_rt_name(dt)), dt.home)), [], params, Some(buf_ty),
       RClosed([core_effect_row_label(CeMutable)]), body, line, col, None)
 }
 
@@ -2462,7 +2470,7 @@ fn derive_binser_shim(dt: DerivedType, line: Int, col: Int) : Decl {
                          pline: line, pcol: col, pborrow: false },
                 Param { binder: binder_written("pos"), ptype: Some(int_ty),
                          pline: line, pcol: col, pborrow: false }]
-  let mangled = proto_mangled_fn("BinSerialize", dt_name(dt), "from_bytes")
+  let mangled = proto_mangled_fn("BinSerialize", dt_rt_name(dt), "from_bytes")
   let body = mk_expr(ECall(mk_name(mangled, line, col),
                             [mk_name("buf", line, col),
                              mk_name("pos", line, col)]),
@@ -2509,17 +2517,17 @@ fn string_to_lower_ascii_loop(s: String, i: Int, n: Int, acc: String) : String =
 # only has the type's position, so every synthesised lambda gets its own
 # column: 16 per field (callers), 8 per nesting depth, and offsets 1 / 5
 # for writer / decoder lambdas.
-fn derive_binser_put(tab: SymTab, acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
+fn derive_binser_put(hs: HeadScope, acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
                       line: Int, col: Int) : Expr =
-  derive_binser_put_at(tab, acc, v, ftype, writers, line, col, 0)
+  derive_binser_put_at(hs, acc, v, ftype, writers, line, col, 0)
 
-fn derive_binser_put_at(tab: SymTab, acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
+fn derive_binser_put_at(hs: HeadScope, acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
                          line: Int, col: Int, depth: Int) : Expr {
   match ftype.tkind {
-    TyList(elem) -> derive_binser_put_via(tab, "bin_buf_put_list", acc, v, elem, writers, line, col, depth)
+    TyList(elem) -> derive_binser_put_via(hs, "bin_buf_put_list", acc, v, elem, writers, line, col, depth)
     _ -> match binser_option_elem(ftype) {
-      Some(elem) -> derive_binser_put_via(tab, "bin_buf_put_option", acc, v, elem, writers, line, col, depth)
-      None       -> derive_binser_put_leaf(tab, acc, v, ftype, writers, line, col)
+      Some(elem) -> derive_binser_put_via(hs, "bin_buf_put_option", acc, v, elem, writers, line, col, depth)
+      None       -> derive_binser_put_leaf(hs, acc, v, ftype, writers, line, col)
     }
   }
 }
@@ -2541,12 +2549,12 @@ fn binser_leaf_ty(t: Ty) : Ty = match t {
 }
 
 # `<comb>(acc, v, (__bw, __bx) => <write __bx of type elem into __bw>)`.
-fn derive_binser_put_via(tab: SymTab, comb: String, acc: Expr, v: Expr, elem: TypeExpr, writers: [String],
+fn derive_binser_put_via(hs: HeadScope, comb: String, acc: Expr, v: Expr, elem: TypeExpr, writers: [String],
                           line: Int, col: Int, depth: Int) : Expr {
   let lcol = col + depth * 8 + 1
   let bw = Param { binder: binder_written("__bw"), ptype: None, pline: line, pcol: lcol, pborrow: false }
   let bx = Param { binder: binder_written("__bx"), ptype: None, pline: line, pcol: lcol, pborrow: false }
-  let body = derive_binser_put_at(tab, mk_name("__bw", line, lcol), mk_name("__bx", line, lcol),
+  let body = derive_binser_put_at(hs, mk_name("__bw", line, lcol), mk_name("__bx", line, lcol),
                                   elem, writers, line, col, depth + 1)
   binser_lib(comb, [acc, v, mk_expr(ELambda([bw, bx], body), line, lcol)], line, col)
 }
@@ -2555,9 +2563,9 @@ fn derive_binser_put_via(tab: SymTab, comb: String, acc: Expr, v: Expr, elem: Ty
 # appends its mangled per-type encoder, not the `to_bytes` dispatcher:
 # inside a combinator's lambda the monomorpher does not carry the
 # instantiated type to the dispatcher call.
-fn derive_binser_put_leaf(tab: SymTab, acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
+fn derive_binser_put_leaf(hs: HeadScope, acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
                            line: Int, col: Int) : Expr {
-  let head = proto_type_name(tab, ftype)
+  let head = head_spell(hs, ftype)
   if list_has(writers, head) {
     binser_call(binser_put_name(head), [acc, v], line, col)
   } else {
@@ -2580,11 +2588,11 @@ fn binser_prim_writer(leaf: Ty) : Option[String] = match leaf {
   _        -> None
 }
 
-fn derive_binser_decode_call(tab: SymTab, buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
+fn derive_binser_decode_call(hs: HeadScope, buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
                                line: Int, col: Int) : Expr =
-  derive_binser_decode_call_at(tab, buf_e, pos_e, ftype, line, col, 0)
+  derive_binser_decode_call_at(hs, buf_e, pos_e, ftype, line, col, 0)
 
-fn derive_binser_decode_call_at(tab: SymTab, buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
+fn derive_binser_decode_call_at(hs: HeadScope, buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
                                   line: Int, col: Int, depth: Int) : Expr {
   match ftype.tkind {
     TyList(elem) -> {
@@ -2593,7 +2601,7 @@ fn derive_binser_decode_call_at(tab: SymTab, buf_e: Expr, pos_e: Expr, ftype: Ty
       let pparam = Param { binder: binder_written("__bp"), ptype: None, pline: line, pcol: lcol, pborrow: false }
       let bvar = mk_name("__bb", line, lcol)
       let pvar = mk_name("__bp", line, lcol)
-      let body = derive_binser_decode_call_at(tab, bvar, pvar, elem, line, col,
+      let body = derive_binser_decode_call_at(hs, bvar, pvar, elem, line, col,
                                                 depth + 1)
       let dec_lam = mk_expr(ELambda([bparam, pparam], body), line, lcol)
       mk_expr(ECall(derive_lib_ref(CmProtocols, "bin_list_from_bytes", line, col),
@@ -2606,7 +2614,7 @@ fn derive_binser_decode_call_at(tab: SymTab, buf_e: Expr, pos_e: Expr, ftype: Ty
         let pparam = Param { binder: binder_written("__bp"), ptype: None, pline: line, pcol: lcol, pborrow: false }
         let bvar = mk_name("__bb", line, lcol)
         let pvar = mk_name("__bp", line, lcol)
-        let body = derive_binser_decode_call_at(tab, bvar, pvar, elem, line, col,
+        let body = derive_binser_decode_call_at(hs, bvar, pvar, elem, line, col,
                                                   depth + 1)
         let dec_lam = mk_expr(ELambda([bparam, pparam], body), line, lcol)
         mk_expr(ECall(derive_lib_ref(CmProtocols, "bin_option_from_bytes", line, col),
@@ -2615,24 +2623,24 @@ fn derive_binser_decode_call_at(tab: SymTab, buf_e: Expr, pos_e: Expr, ftype: Ty
       None -> match resolve_ty(ftype) {
         TyChar -> mk_expr(ECall(derive_lib_ref(CmProtocols, "bin_char_from_bytes", line, col),
                                 [buf_e, pos_e]), line, col)
-        _      -> derive_binser_decode_mangled(tab, buf_e, pos_e, ftype, line, col)
+        _      -> derive_binser_decode_mangled(hs, buf_e, pos_e, ftype, line, col)
       }
     }
-    _ -> derive_binser_decode_mangled(tab, buf_e, pos_e, ftype, line, col)
+    _ -> derive_binser_decode_mangled(hs, buf_e, pos_e, ftype, line, col)
   }
 }
 
-fn derive_binser_decode_mangled(tab: SymTab, buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
+fn derive_binser_decode_mangled(hs: HeadScope, buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
                                   line: Int, col: Int) : Expr {
   let mangled = proto_mangled_fn("BinSerialize",
-                                   proto_type_name(tab, ftype), "from_bytes")
+                                   head_spell(hs, ftype), "from_bytes")
   mk_expr(ECall(mk_name(mangled, line, col), [buf_e, pos_e]), line, col)
 }
 
 # --- record writer --------------------------------------------------
 #
 # Each field's writer receives the buffer the previous field's returned.
-fn derive_binser_put_record(tab: SymTab, acc: Expr, fields: [FieldDecl], idx: Int, writers: [String],
+fn derive_binser_put_record(hs: HeadScope, acc: Expr, fields: [FieldDecl], idx: Int, writers: [String],
                              line: Int, col: Int) : Expr {
   match fields {
     [] -> acc
@@ -2640,7 +2648,7 @@ fn derive_binser_put_record(tab: SymTab, acc: Expr, fields: [FieldDecl], idx: In
       FD(_, name, ftype, _) -> {
         let fcol = col + idx * 16
         let v = mk_expr(EField(mk_name("self", line, fcol), name), line, fcol)
-        derive_binser_put_record(tab, derive_binser_put(tab, acc, v, ftype, writers, line, fcol),
+        derive_binser_put_record(hs, derive_binser_put(hs, acc, v, ftype, writers, line, fcol),
                                  rest, idx + 1, writers, line, col)
       }
     }
@@ -2653,7 +2661,7 @@ fn derive_binser_put_record(tab: SymTab, acc: Expr, fields: [FieldDecl], idx: In
 # `let eK = bin_<t>_end(buf, posK)` and read in place by `bin_<t>_at`
 # when the value is built, or any other type, matched out of
 # `__pimpl_BinSerialize_<Tk>_from_bytes(buf, posK)` into `pK`.
-fn derive_binser_field_guard(tab: SymTab, ftype: TypeExpr, idx: Int, pos_e: Expr, then_e: Expr,
+fn derive_binser_field_guard(hs: HeadScope, ftype: TypeExpr, idx: Int, pos_e: Expr, then_e: Expr,
                                line: Int, fcol: Int, col: Int) : Expr {
   let buf_e = mk_name("buf", line, fcol)
   match binser_prim_reader(ftype) {
@@ -2665,7 +2673,7 @@ fn derive_binser_field_guard(tab: SymTab, ftype: TypeExpr, idx: Int, pos_e: Expr
       let bind = SLet(mk_pat(PBind(binder_written(evar)), line, col), None, end_e)
       mk_expr(EBlock([bind], Some(mk_expr(EIf(bad, err, Some(then_e)), line, col))), line, col)
     }
-    None -> derive_binser_match_result(derive_binser_decode_call(tab, buf_e, pos_e, ftype, line, fcol),
+    None -> derive_binser_match_result(derive_binser_decode_call(hs, buf_e, pos_e, ftype, line, fcol),
                                        binser_cursor_var(idx), then_e, line, col)
   }
 }
@@ -2736,12 +2744,12 @@ fn binser_prim_at(r: BinPrim) : String = concat_all(["bin_", binser_prim_word(r)
 #
 # Empty record short-circuits to `Ok((T {}, pos))` so the empty-fields
 # case still emits a valid impl.
-fn derive_binser_record_from_bytes(tab: SymTab, tsym: SymId, fields: [FieldDecl],
+fn derive_binser_record_from_bytes(hs: HeadScope, tsym: SymId, fields: [FieldDecl],
                                      line: Int, col: Int) : Expr {
   let pos0 = mk_name("pos", line, col)
   match fields {
     [] -> derive_binser_record_ok_value(tsym, [], pos0, line, col)
-    _  -> derive_binser_record_decode_chain(tab, tsym, fields, fields, 0, pos0,
+    _  -> derive_binser_record_decode_chain(hs, tsym, fields, fields, 0, pos0,
                                               line, col)
   }
 }
@@ -2749,19 +2757,19 @@ fn derive_binser_record_from_bytes(tab: SymTab, tsym: SymId, fields: [FieldDecl]
 # `remaining` walks left-to-right; `all_fields` is captured so the
 # final `Ok` builder can construct the record literal in declaration
 # order. `pos_e` is the cursor of the field at `idx`.
-fn derive_binser_record_decode_chain(tab: SymTab, tsym: SymId, remaining: [FieldDecl],
+fn derive_binser_record_decode_chain(hs: HeadScope, tsym: SymId, remaining: [FieldDecl],
                                        all_fields: [FieldDecl], idx: Int,
                                        pos_e: Expr, line: Int, col: Int) : Expr {
   match remaining {
     [] -> derive_binser_record_ok_value(tsym, all_fields, pos_e, line, col)
     [fd, ...rest] -> match fd {
       FD(_, _, ftype, _) -> {
-        let then_e = derive_binser_record_decode_chain(tab, tsym, rest, all_fields, idx + 1,
+        let then_e = derive_binser_record_decode_chain(hs, tsym, rest, all_fields, idx + 1,
                                                         derive_binser_field_next(ftype, idx, line, col),
                                                         line, col)
         # One column inside the field's writer slot, so writer and
         # decoder lambdas of one field stay distinct.
-        derive_binser_field_guard(tab, ftype, idx, pos_e, then_e, line, col + idx * 16 + 1, col)
+        derive_binser_field_guard(hs, ftype, idx, pos_e, then_e, line, col + idx * 16 + 1, col)
       }
     }
   }
@@ -2811,27 +2819,27 @@ fn derive_binser_match_result(call: Expr, pvar: String, then_e: Expr,
 #
 # `match self { Vk(p0, ..) -> <payload written after bin_buf_byte(buf, k)> }`:
 # the variant's declaration index as a one-byte tag, then its payload.
-fn derive_binser_put_sum(tab: SymTab, variants: [Variant], writers: [String], line: Int, col: Int) : Expr {
+fn derive_binser_put_sum(hs: HeadScope, variants: [Variant], writers: [String], line: Int, col: Int) : Expr {
   match variants {
     [] -> mk_name("buf", line, col)
     _  -> mk_expr(EMatch(mk_name("self", line, col),
-                         derive_binser_put_arms(tab, variants, 0, writers, line, col)), line, col)
+                         derive_binser_put_arms(hs, variants, 0, writers, line, col)), line, col)
   }
 }
 
-fn derive_binser_put_arms(tab: SymTab, variants: [Variant], idx: Int, writers: [String],
+fn derive_binser_put_arms(hs: HeadScope, variants: [Variant], idx: Int, writers: [String],
                            line: Int, col: Int) : [Arm] {
   match variants {
     [] -> []
     [v, ...rest] ->
-      [derive_binser_put_arm(tab, v, idx, writers, line, col),
-       ...derive_binser_put_arms(tab, rest, idx + 1, writers, line, col)]
+      [derive_binser_put_arm(hs, v, idx, writers, line, col),
+       ...derive_binser_put_arms(hs, rest, idx + 1, writers, line, col)]
   }
 }
 
 # Each variant takes a 256-column window so lambdas in different
 # variants land at distinct positions.
-fn derive_binser_put_arm(tab: SymTab, v: Variant, idx: Int, writers: [String],
+fn derive_binser_put_arm(hs: HeadScope, v: Variant, idx: Int, writers: [String],
                           line: Int, col: Int) : Arm {
   match v {
     Var(vsym, vargs) -> {
@@ -2839,7 +2847,7 @@ fn derive_binser_put_arm(tab: SymTab, v: Variant, idx: Int, writers: [String],
                        line, col)
       let tag = binser_lib("bin_buf_byte", [mk_name("buf", line, col),
                                              mk_expr(mk_int_synth(idx), line, col)], line, col)
-      Arm(pat, None, derive_binser_put_payload(tab, tag, vargs, 0, writers, line, col + idx * 256))
+      Arm(pat, None, derive_binser_put_payload(hs, tag, vargs, 0, writers, line, col + idx * 256))
     }
   }
 }
@@ -2854,14 +2862,14 @@ fn derive_binser_sum_pat_subs(vargs: [TypeExpr], prefix: String, i: Int,
   }
 }
 
-fn derive_binser_put_payload(tab: SymTab, acc: Expr, vargs: [TypeExpr], i: Int, writers: [String],
+fn derive_binser_put_payload(hs: HeadScope, acc: Expr, vargs: [TypeExpr], i: Int, writers: [String],
                               line: Int, col: Int) : Expr {
   match vargs {
     [] -> acc
     [vt, ...rest] -> {
       let fcol = col + i * 16
       let v = mk_name(concat_all(["p", int_to_string(i)]), line, fcol)
-      derive_binser_put_payload(tab, derive_binser_put(tab, acc, v, vt, writers, line, fcol),
+      derive_binser_put_payload(hs, derive_binser_put(hs, acc, v, vt, writers, line, fcol),
                                 rest, i + 1, writers, line, col)
     }
   }
@@ -2877,13 +2885,13 @@ fn derive_binser_put_payload(tab: SymTab, acc: Expr, vargs: [TypeExpr], i: Int, 
 #
 # Each per-variant payload chain is the record-field chain, ending in
 # the variant's constructor call.
-fn derive_binser_sum_from_bytes(tab: SymTab, tname: String, variants: [Variant],
+fn derive_binser_sum_from_bytes(hs: HeadScope, tname: String, variants: [Variant],
                                   line: Int, col: Int) : Expr {
   let tag_e = binser_lib("bin_tag_at", [mk_name("buf", line, col), mk_name("pos", line, col)], line, col)
   let inner_pos = mk_expr(EBinop(BoAdd, mk_name("pos", line, col),
                                        mk_expr(mk_int_synth(1), line, col)),
                            line, col)
-  let chain = derive_binser_sum_tag_chain(tab, tname, variants, 0, inner_pos,
+  let chain = derive_binser_sum_tag_chain(hs, tname, variants, 0, inner_pos,
                                             line, col)
   let bad = mk_expr(EBinop(BoLt, mk_name("__tag", line, col), mk_expr(mk_int_synth(0), line, col)), line, col)
   let err = binser_call("Err", [binser_lib("bin_end_error", [mk_name("__tag", line, col)], line, col)], line, col)
@@ -2891,7 +2899,7 @@ fn derive_binser_sum_from_bytes(tab: SymTab, tname: String, variants: [Variant],
   mk_expr(EBlock([bind], Some(mk_expr(EIf(bad, err, Some(chain)), line, col))), line, col)
 }
 
-fn derive_binser_sum_tag_chain(tab: SymTab, tname: String, variants: [Variant], idx: Int,
+fn derive_binser_sum_tag_chain(hs: HeadScope, tname: String, variants: [Variant], idx: Int,
                                   start_pos: Expr, line: Int, col: Int) : Expr {
   match variants {
     [] -> mk_expr(ECall(mk_name("Err", line, col),
@@ -2906,8 +2914,8 @@ fn derive_binser_sum_tag_chain(tab: SymTab, tname: String, variants: [Variant], 
       # The variant's writer window, shifted by half so writer and
       # decoder lambdas of one variant stay distinct.
       let vcol = col + idx * 256 + 128
-      let then_e = derive_binser_sum_payload_decode(tab, v, start_pos, line, vcol)
-      let else_e = derive_binser_sum_tag_chain(tab, tname, rest, idx + 1,
+      let then_e = derive_binser_sum_payload_decode(hs, v, start_pos, line, vcol)
+      let else_e = derive_binser_sum_tag_chain(hs, tname, rest, idx + 1,
                                                   start_pos, line, col)
       mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
     }
@@ -2916,18 +2924,18 @@ fn derive_binser_sum_tag_chain(tab: SymTab, tname: String, variants: [Variant], 
 
 # Same shape as record-decode chain, but the final `Ok` builds a
 # constructor call instead of a record literal.
-fn derive_binser_sum_payload_decode(tab: SymTab, v: Variant,
+fn derive_binser_sum_payload_decode(hs: HeadScope, v: Variant,
                                       start_pos: Expr, line: Int, col: Int) : Expr {
   match v {
     Var(vsym, vargs) -> match vargs {
       [] -> binser_ok_cursor(mk_sym(vsym, line, col), start_pos, line, col)
-      _  -> derive_binser_sum_decode_chain(tab, vsym, vargs, vargs, 0, start_pos, start_pos,
+      _  -> derive_binser_sum_decode_chain(hs, vsym, vargs, vargs, 0, start_pos, start_pos,
                                              line, col)
     }
   }
 }
 
-fn derive_binser_sum_decode_chain(tab: SymTab, vsym: SymId, remaining: [TypeExpr],
+fn derive_binser_sum_decode_chain(hs: HeadScope, vsym: SymId, remaining: [TypeExpr],
                                     all_vargs: [TypeExpr], idx: Int, start_pos: Expr,
                                     pos_e: Expr, line: Int, col: Int) : Expr {
   match remaining {
@@ -2936,10 +2944,10 @@ fn derive_binser_sum_decode_chain(tab: SymTab, vsym: SymId, remaining: [TypeExpr
       binser_ok_cursor(mk_expr(ECall(mk_sym(vsym, line, col), args), line, col), pos_e, line, col)
     }
     [vt, ...rest] -> {
-      let then_e = derive_binser_sum_decode_chain(tab, vsym, rest, all_vargs, idx + 1, start_pos,
+      let then_e = derive_binser_sum_decode_chain(hs, vsym, rest, all_vargs, idx + 1, start_pos,
                                                    derive_binser_field_next(vt, idx, line, col),
                                                    line, col)
-      derive_binser_field_guard(tab, vt, idx, pos_e, then_e, line, col + idx * 16 + 1, col)
+      derive_binser_field_guard(hs, vt, idx, pos_e, then_e, line, col + idx * 16 + 1, col)
     }
   }
 }
@@ -2971,6 +2979,22 @@ fn vdv_settle(ps: PScope, r: DeclRef, from: Option[String]) : DeclRef = match r 
   }
 }
 
+# Where a type head is read from: the scope, and the home of the file
+# that wrote it.
+type HeadScope = HeadScope(PScope, Option[String])
+
+# A type head as a generated symbol spells it. The head is settled from
+# the file that wrote it first, so the piece is its declaration's emitted
+# name whether or not a scope pass had settled the reference: the symbol
+# an impl is declared under and the one a derived body calls agree.
+fn head_spell(hs: HeadScope, te: TypeExpr) : String = match hs {
+  HeadScope(ps, from) -> rt_ref_name(ps_tab(ps), vdv_head(ps, te, from))
+}
+
+fn head_ref_spell(hs: HeadScope, r: DeclRef) : String = match hs {
+  HeadScope(ps, from) -> rt_ref_name(ps_tab(ps), vdv_settle(ps, r, from))
+}
+
 # The single-dispatch head of a type written in the file homed at `from`.
 fn vdv_head(ps: PScope, te: TypeExpr, from: Option[String]) : DeclRef = match te.tkind {
   TyName(r, _)      -> vdv_settle(ps, r, from)
@@ -2998,10 +3022,10 @@ fn validate_derive_binserialize(ps: PScope, decls: [Decl], df: DiagFiles) : [Dia
   list_reverse(validate_derive_binser_loop(ps, decls, df, providers, []))
 }
 
-# The names of the types deriving BinSerialize, plus with `impls` those
-# with a hand-written impl.
+# The emitted names of the types deriving BinSerialize, plus with `impls`
+# those with a hand-written impl.
 fn collect_binser_types(ps: PScope, decls: [Decl], impls: Bool, acc: [String]) : [String] =
-  list_append(map(binser_type_refs(ps, decls, impls, []), (r) => ref_text(ps_tab(ps), r)), acc)
+  list_append(map(binser_type_refs(ps, decls, impls, []), (r) => rt_ref_name(ps_tab(ps), r)), acc)
 
 # Types deriving BinSerialize, plus with `impls` the targets of a
 # hand-written impl.
@@ -3851,6 +3875,8 @@ pub fn resolve_protocol_calls_decl(d: Decl, reg: ProtocolReg) : Decl {
       DBench(desc, resolve_protocol_calls_expr(body, reg, None), l, c, mo)
     DCheck(desc, ps, body, l, c, mo) ->
       DCheck(desc, ps, resolve_protocol_calls_expr(body, reg, None), l, c, mo)
+    DConst(pub_, s, ty, body, mo, l, c) ->
+      DConst(pub_, s, ty, resolve_protocol_calls_expr(body, reg, mo), mo, l, c)
     _ -> d
   }
 }

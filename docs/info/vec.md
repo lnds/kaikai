@@ -164,6 +164,9 @@ fn main() : Unit / Stdout = {
 - Reading the vector to compute what it writes stays in place:
   `vec_set(v, i, vec_get(v, i) + 1)` copies nothing. A read that runs
   after the write sees the old vector, so that write copies.
+- A `var` updated from its own value in a loop (`v := vec_set(v, i, x)`)
+  stays in place, and so does a vector bound from a constructor field
+  (`Box(v, n) -> Box(vec_set(v, i, x), n + 1)`).
 - Equality (`==`) is structural, element by element.
 
 ## See also
