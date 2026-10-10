@@ -7031,8 +7031,11 @@ test-perceus-1135-vec-raw-native: $(TARGET) bin-kai build
 # the golden and the KAI_TRACE_RC counters must be exactly those. The first
 # two write a uniquely owned vector in place whether the read sits in the
 # write's arguments or in an earlier `let`, on a param or on a local. The
-# third reads after the write, so each of its writes must copy.
-PERCEUS_VEC_LEND_FIXTURES := vec_lend_then_write:600:0 vec_lend_then_write_local:4:0 vec_read_after_write:0:4
+# third reads after the write, so each of its writes must copy. The last two
+# write a vector its holder hands over first: a `var` slot refilled by the
+# write, and a constructor cell the match releases as the arm starts.
+PERCEUS_VEC_LEND_FIXTURES := vec_lend_then_write:600:0 vec_lend_then_write_local:4:0 vec_read_after_write:0:4 \
+  vec_var_loop_write:470:0 vec_in_ctor_write:400:0
 
 test-perceus-vec-lend-write: $(TARGET) build
 	@set -e; \

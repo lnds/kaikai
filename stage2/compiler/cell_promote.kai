@@ -38,8 +38,8 @@ import compiler.desugar
 import compiler.loop_lower
 import compiler.cell_scan
 
-#[doc("Promote every non-escaping scalar var slot (`array_make(1, lit)` cell) in the program to a raw local cell (`__cell_init`/`__cell_get`/`__cell_set` intrinsics).")]
-pub fn promote_scalar_cells(ds: [Decl]) : [Decl] = map(ds, cp_decl)
+#[doc("Promote every non-escaping scalar var slot (`array_make(1, lit)` cell) in the program to a raw local cell (`__cell_init`/`__cell_get`/`__cell_set` intrinsics). `then` runs on each body once promoted.")]
+pub fn promote_scalar_cells(ds: [Decl], then: (Expr) -> Expr) : [Decl] = map(ds, (d) => cp_decl(d, then))
 
 #[doc("True for the cell intrinsics this pass mints (`__cell_init`, `__cell_get`, `__cell_set`).")]
 pub fn is_cell_intrinsic(nm: String) : Bool =
@@ -62,20 +62,20 @@ pub fn cell_ref_name(args: [Expr]) : String = match args {
 
 # --- decl walk -------------------------------------------------------
 
-fn cp_decl(d: Decl) : Decl = match d {
+fn cp_decl(d: Decl, then: (Expr) -> Expr) : Decl = match d {
   DFn(pub_, n, tps, ps, ret, row, body, l, c, mo, fsym) ->
-    DFn(pub_, n, tps, ps, ret, row, cp_expr(body), l, c, mo, fsym)
-  DTest(desc, body, l, c, mo)         -> DTest(desc, cp_expr(body), l, c, mo)
-  DBench(desc, body, l, c, mo)        -> DBench(desc, cp_expr(body), l, c, mo)
-  DCheck(desc, ps, body, l, c, mo)    -> DCheck(desc, ps, cp_expr(body), l, c, mo)
-  DImpl(p, tas, tgt, inner, l, c, tps, isym) -> DImpl(p, tas, tgt, map(inner, cp_decl), l, c, tps, isym)
-  DDerive(ns, inner, l, c)        -> DDerive(ns, cp_decl(inner), l, c)
-  DUnstable(inner, l, c)          -> DUnstable(cp_decl(inner), l, c)
-  DProtoLaws(thy, inner, l, c, mo)    -> DProtoLaws(thy, cp_decl(inner), l, c, mo)
-  DImplAxiom(thy, inner, l, c, mo)    -> DImplAxiom(thy, cp_decl(inner), l, c, mo)
-  DConstructor(inner, l, c)       -> DConstructor(cp_decl(inner), l, c)
-  DDoc(a, b, inner, l, c)         -> DDoc(a, b, cp_decl(inner), l, c)
-  DConst(pub_, n, ty, init, mo, l, c, csym) -> DConst(pub_, n, ty, cp_expr(init), mo, l, c, csym)
+    DFn(pub_, n, tps, ps, ret, row, then(cp_expr(body)), l, c, mo, fsym)
+  DTest(desc, body, l, c, mo)         -> DTest(desc, then(cp_expr(body)), l, c, mo)
+  DBench(desc, body, l, c, mo)        -> DBench(desc, then(cp_expr(body)), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo)    -> DCheck(desc, ps, then(cp_expr(body)), l, c, mo)
+  DImpl(p, tas, tgt, inner, l, c, tps, isym) -> DImpl(p, tas, tgt, map(inner, (x) => cp_decl(x, then)), l, c, tps, isym)
+  DDerive(ns, inner, l, c)        -> DDerive(ns, cp_decl(inner, then), l, c)
+  DUnstable(inner, l, c)          -> DUnstable(cp_decl(inner, then), l, c)
+  DProtoLaws(thy, inner, l, c, mo)    -> DProtoLaws(thy, cp_decl(inner, then), l, c, mo)
+  DImplAxiom(thy, inner, l, c, mo)    -> DImplAxiom(thy, cp_decl(inner, then), l, c, mo)
+  DConstructor(inner, l, c)       -> DConstructor(cp_decl(inner, then), l, c)
+  DDoc(a, b, inner, l, c)         -> DDoc(a, b, cp_decl(inner, then), l, c)
+  DConst(pub_, n, ty, init, mo, l, c, csym) -> DConst(pub_, n, ty, then(cp_expr(init)), mo, l, c, csym)
   _ -> d
 }
 
@@ -155,17 +155,26 @@ fn cp_slot_decl(s: Stmt) : Option[CpSlot] = match s {
 }
 
 # The pure-scalar init of an `array_make(1, init)` rhs, or None.
-fn cp_one_cell_init(rhs: Expr) : Option[Expr] = match rhs.kind {
+fn cp_one_cell_init(rhs: Expr) : Option[Expr] = match cp_one_cell(rhs) {
+  Some(init) -> if cp_init_is_pure_scalar(init) { Some(init) } else { None }
+  None       -> None
+}
+
+#[doc("The init of an `array_make(1, init)` call, or None for any other expression.")]
+pub fn cp_one_cell(rhs: Expr) : Option[Expr] = match rhs.kind {
   ECall(callee, args_) ->
     if cp_is_var(callee, "array_make") { cp_one_cell_args(args_) } else { None }
   _ -> None
 }
 
 fn cp_one_cell_args(args_: [Expr]) : Option[Expr] = match args_ {
-  [n, init] ->
-    if cp_is_lit_one(n) and cp_init_is_pure_scalar(init) { Some(init) } else { None }
+  [n, init] -> if cp_is_lit_one(n) { Some(init) } else { None }
   _ -> None
 }
+
+#[doc("True when every mention of the slot binder `nm` in its scope is a whole-cell read or write in the declaring frame, none of them inside a `handle` body.")]
+pub fn cp_slot_private(nm: String, stmts: [Stmt], tail: Option[Expr]) : Bool =
+  not cp_stmts_use(nm, map(stmts, (st) => cp_rw_stmt(nm, st))) and not cp_opt_uses(nm, cp_rw_opt(nm, tail))
 
 fn cp_is_lit_one(e: Expr) : Bool = match e.kind {
   EInt(1, _) -> true
@@ -194,9 +203,8 @@ fn cp_init_is_pure_scalar(e: Expr) : Bool =
 fn cp_is_arith_op(op: String) : Bool =
   op == "+" or op == "-" or op == "*" or op == "/" or op == "%"
 
-# Int / Real / Bool only: the exact scalars both backends hold in raw
-# registers (`int64_t`/`double`/`int`, `SInt64`/`SReal`/`SBool`).
-fn cp_ty_is_cell_scalar(opt_t: Option[Ty]) : Bool = match opt_t {
+#[doc("True for `Int`, `Real` and `Bool`: the scalars both backends hold in raw registers.")]
+pub fn cp_ty_is_cell_scalar(opt_t: Option[Ty]) : Bool = match opt_t {
   Some(t) -> match t {
     TyInt  -> true
     TyReal -> true
@@ -259,13 +267,15 @@ fn cp_rw_loop_arg(nm: String, a: Expr) : Expr = match a.kind {
   _ -> cp_rw(nm, a)
 }
 
-type CpHit = CpGet(Expr) | CpSet(Expr, Expr) | CpMiss
+#[doc("What a call is to a slot: a whole-cell read of the binder read it carries, a whole-cell write of a value through one, or neither.")]
+pub type CpHit = CpGet(Expr) | CpSet(Expr, Expr) | CpMiss
 
 # The binder read a cell intrinsic carries: a raw read, so no pass counts
 # it as a use of the slot it replaced.
 fn cp_cell_ref(r: Expr) : Expr = Expr { ...r, ty: None, mode: MUnboxed }
 
-fn cp_getset_hit(nm: String, callee: Expr, args_: [Expr]) : CpHit =
+#[doc("The whole-cell access of the slot `nm` that the call of `callee` on `args_` makes, if it is one.")]
+pub fn cp_getset_hit(nm: String, callee: Expr, args_: [Expr]) : CpHit =
   if cp_is_var(callee, "array_get") { cp_get_hit(nm, args_) }
   else if cp_is_var(callee, "array_set") { cp_set_hit(nm, args_) }
   else { CpMiss }

@@ -144,11 +144,26 @@ its sibling arguments were evaluated; a read that runs after the
 hand-over keeps the dup, and that write copies. A `let` read on several
 exclusive paths, once on each, moves on every one, as a param does.
 
-> **Current state (2026-10-10):** a `var` reassigned in a `while` body
-> (`v := vec_set(v, i, x)`) copies on every write on both backends,
-> with or without a read: the slot keeps its reference while the
-> right-hand side runs. So does a vector held in a constructor field
-> and rebuilt from the arm that binds it.
+**A holder releases its reference before the write that replaces it.**
+A `var` reassigned from its own value (`v := vec_set(v, i, x)`, with or
+without a read of `v` in the right-hand side) writes in place: when the
+slot is private to its frame, the last read the right-hand side makes
+takes the slot's reference, and the assignment refills the slot. A
+vector bound from a constructor field writes in place too
+(`Box(v, n) -> Box(vec_set(v, i, x), n + 1)`, or the arm returning the
+written vector): an owned match releases its scrutinee as an arm over a
+flat constructor pattern starts, once each binder holds its own
+reference, unless the arm rebuilds into the cell.
+
+> **Current state (2026-10-10):** four shapes still copy on every write.
+> A `let` bound inside a loop or closure body and then written: every
+> read inside such a body takes a reference. An arm binder read and then
+> written (`Box(v, n) -> Box(vec_set(v, i, vec_get(v, i) + 1), n)`): the
+> lend rule above covers params and `let`s only. A vector reached through
+> a record field (`vec_set(s.buf, i, x)`): the field read takes a
+> reference while the record keeps its own. On the C backend only, an arm
+> that rebuilds an `Option` or `Result` in place around the written
+> vector (`Some(v) -> Some(vec_set(v, i, x))`).
 
 ### User-parameter borrow (#1127)
 
