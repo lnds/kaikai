@@ -6029,6 +6029,9 @@ fn emit_fixed_vec_get(src: String, coll: Expr, ix: Expr, cx: EmitCtx) : String /
 fn emit_fixed_vec_get_dyn(src: String, coll: Expr, ix: Expr, cx: EmitCtx) : String / Console =
   emit_fixed_vec_read(src, coll, fixed_vec_dyn_idx_c(coll, ix, src, cx), cx)
 
+fn fixed_vec_arity_mismatch(m: Mark) : String =
+  concat_all(["0 /* ", mark_name(m), ": arity mismatch */"])
+
 # A boxed fixed vec is a heap `Vec` the read consumes, like `vec_get`.
 fn emit_fixed_vec_read(src: String, coll: Expr, ixc: String, cx: EmitCtx) : String / Console =
   match coll.mode {
@@ -6647,28 +6650,26 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
     # form when the surrounding fn is UFn. Other callees fall back
     # to the boxed-then-unbox boundary form.
     ECall(callee_e, args_e) -> match callee_e.kind {
+      # A fixed-width `Vec[e]<n>` literal: a flat by-value C aggregate
+      # `(<cname>){ .a = { e0, e1, ... } }`, no heap block, no header.
+      EMark(MkFixedVecLit) ->
+        seq_call(concat_all(["(", raw_c_type(x.ty), "){ .a = { "]),
+                 map(args_e, (e) => emit_expr_raw(src, e, cx)), " } }")
+      # Static-index read into a fixed vec. The index is a compile-time
+      # literal and the bound was proved by the typer, so neither form
+      # emits a runtime check.
+      EMark(MkFixedVecGet) -> match args_e {
+        [coll, ix] -> emit_fixed_vec_get(src, coll, ix, cx)
+        _ -> fixed_vec_arity_mismatch(MkFixedVecGet)
+      }
+      # Dynamic-index read: the same read, the subscript gated by
+      # `kai_fixed_vec_idx` against the static length.
+      EMark(MkFixedVecGetDyn) -> match args_e {
+        [coll, ix] -> emit_fixed_vec_get_dyn(src, coll, ix, cx)
+        _ -> fixed_vec_arity_mismatch(MkFixedVecGetDyn)
+      }
       EVar(callee) ->
-        if callee == "__fixed_vec_lit" {
-          # A fixed-width `Vec[e]<n>` literal: a flat by-value C aggregate
-          # `(<cname>){ .a = { e0, e1, ... } }`, no heap block, no header.
-          seq_call(concat_all(["(", raw_c_type(x.ty), "){ .a = { "]),
-                   map(args_e, (e) => emit_expr_raw(src, e, cx)), " } }")
-        } else if callee == "__fixed_vec_get" {
-          # Static-index read into a fixed vec. The index is a compile-time
-          # literal and the bound was proved by the typer, so neither form
-          # emits a runtime check.
-          match args_e {
-            [coll, ix] -> emit_fixed_vec_get(src, coll, ix, cx)
-            _ -> "0 /* __fixed_vec_get: arity mismatch */"
-          }
-        } else if callee == "__fixed_vec_get_dyn" {
-          # Dynamic-index read: the same read, the subscript gated by
-          # `kai_fixed_vec_idx` against the static length.
-          match args_e {
-            [coll, ix] -> emit_fixed_vec_get_dyn(src, coll, ix, cx)
-            _ -> "0 /* __fixed_vec_get_dyn: arity mismatch */"
-          }
-        } else if tcrec_is_sentinel(callee) {
+        if tcrec_is_sentinel(callee) {
           let parts = tcrec_split_pipe(callee)
           match parts {
             [_, sym, dropmask_str, ...pnames] -> {
