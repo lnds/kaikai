@@ -10,25 +10,38 @@ declares it.
 """)]
 
 import compiler.ast
+import compiler.written
+import compiler.symtab
 
 # A record or sum declaration seen by the walk: its head tag and home.
 type HeadCand = HeadCand(Int, Option[String])
 
 #[doc("Head tag of the record or sum `tname` as an impl homed in `home` names it, or -1 when no declaration spells it.")]
-pub fn impl_target_head_tag(home: Option[String], tname: String, decls: [Decl]) : Int =
-  match htd_cands(decls, tname, 0, []) {
-    [] -> htd_respelled_root(home, tname, decls)
+pub fn impl_target_head_tag(home: Option[String], tname: String, decls: [Decl], tab: SymTab) : Int =
+  match htd_cands(decls, tab, tname, 0, []) {
+    [] -> htd_respelled_root(home, tname, decls, tab)
     cs -> htd_pick(cs, home)
   }
 
 #[doc("Head tag of the sum that module `home` declares with constructor `ctor`, or -1 when none does. A `None` home takes the first declarer.")]
-pub fn ctor_owner_head_tag(home: Option[String], ctor: String, decls: [Decl]) : Int =
-  htd_ctor_loop(decls, home, ctor, 0)
+pub fn ctor_owner_head_tag(home: Option[String], ctor: String, decls: [Decl], tab: SymTab) : Int =
+  htd_ctor_loop(decls, tab, home, ctor, 0)
 
-# Only the root file and the core share bare type names: every other
-# module's types are respelled. The root file's declarations follow
-# everything it imports, so of two spellings the root's is the last. An
-# impl the root file declares carries no home.
+#[doc("Head tag of the record or sum the declaration `s` is, or -1 when `decls` holds no such declaration.")]
+pub fn decl_head_tag(s: SymId, decls: [Decl]) : Int =
+  if sym_raw(s) < 0 { 0 - 1 } else { htd_sym_loop(decls, s, 0) }
+
+fn htd_sym_loop(ds: [Decl], s: SymId, idx: Int) : Int = match ds {
+  [] -> 0 - 1
+  [d, ...rest] -> match htd_nominal(d) {
+    Some(t) -> if sym_same(t, s) { 20 + idx } else { htd_sym_loop(rest, s, idx + 1) }
+    None    -> htd_sym_loop(rest, s, idx)
+  }
+}
+
+# The root file's declarations follow everything it imports, so of
+# several spellings the root's is the last. An impl the root file
+# declares carries no home.
 fn htd_pick(cs: [HeadCand], home: Option[String]) : Int = match home {
   None    -> htd_last(cs, 0 - 1)
   Some(_) -> match htd_homed(cs, home) {
@@ -39,23 +52,23 @@ fn htd_pick(cs: [HeadCand], home: Option[String]) : Int = match home {
 
 # A root impl whose symbol a core impl also mints is respelled
 # `<type>__<root module>`; its target is the root type before the `__`.
-fn htd_respelled_root(home: Option[String], tname: String, decls: [Decl]) : Int = match home {
+fn htd_respelled_root(home: Option[String], tname: String, decls: [Decl], tab: SymTab) : Int = match home {
   Some(_) -> 0 - 1
   None -> {
     let cut = htd_find(tname, "__", 0)
     if cut >= string_length(tname) { 0 - 1 }
-    else { htd_last(htd_cands(decls, string_slice(tname, 0, cut), 0, []), 0 - 1) }
+    else { htd_last(htd_cands(decls, tab, string_slice(tname, 0, cut), 0, []), 0 - 1) }
   }
 }
 
 # Candidates in declaration order.
-fn htd_cands(ds: [Decl], tname: String, idx: Int, acc: [HeadCand]) : [HeadCand] = match ds {
+fn htd_cands(ds: [Decl], tab: SymTab, tname: String, idx: Int, acc: [HeadCand]) : [HeadCand] = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> match htd_nominal(d) {
-    Some(dn) ->
-      if dn == tname { htd_cands(rest, tname, idx + 1, [HeadCand(20 + idx, htd_home(d)), ...acc]) }
-      else { htd_cands(rest, tname, idx + 1, acc) }
-    None -> htd_cands(rest, tname, idx, acc)
+    Some(s) ->
+      if written_text(sym_name(tab, s)) == tname { htd_cands(rest, tab, tname, idx + 1, [HeadCand(20 + idx, htd_home(d)), ...acc]) }
+      else { htd_cands(rest, tab, tname, idx + 1, acc) }
+    None -> htd_cands(rest, tab, tname, idx, acc)
   }
 }
 
@@ -79,13 +92,13 @@ fn htd_last(cs: [HeadCand], acc: Int) : Int = match cs {
   [HeadCand(t, _), ...rest] -> htd_last(rest, t)
 }
 
-fn htd_ctor_loop(ds: [Decl], home: Option[String], ctor: String, idx: Int) : Int = match ds {
+fn htd_ctor_loop(ds: [Decl], tab: SymTab, home: Option[String], ctor: String, idx: Int) : Int = match ds {
   [] -> 0 - 1
   [d, ...rest] -> match htd_nominal(d) {
     Some(_) ->
-      if htd_declares_ctor(d, ctor) and ctor_home_matches(htd_home(d), home) { 20 + idx }
-      else { htd_ctor_loop(rest, home, ctor, idx + 1) }
-    None -> htd_ctor_loop(rest, home, ctor, idx)
+      if htd_declares_ctor(d, tab, ctor) and ctor_home_matches(htd_home(d), home) { 20 + idx }
+      else { htd_ctor_loop(rest, tab, home, ctor, idx + 1) }
+    None -> htd_ctor_loop(rest, tab, home, ctor, idx)
   }
 }
 
@@ -95,29 +108,29 @@ pub fn decl_takes_head_tag(d: Decl) : Bool = match htd_nominal(d) {
   None    -> false
 }
 
-# The name of a record or sum declaration; the only decls that take a tag.
-fn htd_nominal(d: Decl) : Option[String] = match d {
-  DType(_, dn, _, body, _, _, _, _, _) -> match body {
-    TBRecord(_) -> Some(dn)
-    TBSum(_)    -> Some(dn)
+# The id of a record or sum declaration; the only decls that take a tag.
+fn htd_nominal(d: Decl) : Option[SymId] = match d {
+  DType(_, s, _, body, _, _, _, _) -> match body {
+    TBRecord(_) -> Some(s)
+    TBSum(_)    -> Some(s)
     _           -> None
   }
   _ -> None
 }
 
 fn htd_home(d: Decl) : Option[String] = match d {
-  DType(_, _, _, _, _, _, mo, _, _) -> mo
+  DType(_, _, _, _, _, _, mo, _) -> mo
   _ -> None
 }
 
-fn htd_declares_ctor(d: Decl, ctor: String) : Bool = match d {
-  DType(_, _, _, TBSum(vs), _, _, _, _, _) -> htd_has_ctor(vs, ctor)
+fn htd_declares_ctor(d: Decl, tab: SymTab, ctor: String) : Bool = match d {
+  DType(_, _, _, TBSum(vs), _, _, _, _) -> htd_has_ctor(vs, tab, ctor)
   _ -> false
 }
 
-fn htd_has_ctor(vs: [Variant], ctor: String) : Bool = match vs {
+fn htd_has_ctor(vs: [Variant], tab: SymTab, ctor: String) : Bool = match vs {
   [] -> false
-  [Var(cname, _), ...rest] -> if cname == ctor { true } else { htd_has_ctor(rest, ctor) }
+  [Var(c, _), ...rest] -> if written_text(sym_name(tab, c)) == ctor { true } else { htd_has_ctor(rest, tab, ctor) }
 }
 
 # Index of the first `needle` in `hay` at or after `from`, or length(hay).

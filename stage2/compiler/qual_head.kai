@@ -2,12 +2,13 @@
 Qualified habitant names in head position: `with m.E`, `impl m.P`,
 `#[derive(m.P)]`.
 
-The parser folds the qualifier into the spelling (`"m.E"`) exactly as
-it does for `mod.Type`. This pass validates the qualifier against the
-file's import table. A handler head is rewritten back to the bare name.
-A protocol head keeps its qualifier, canonicalised from the written
-alias to the module's tagged name (`alias.P` -> `home.P`), so the
-protocol lowering resolves the impl against exactly that module.
+The parser keeps the qualifier in the head's reference; a `#[derive]`
+entry spells it into the name (`"m.P"`). This pass validates the
+qualifier against the file's import table. A handler head is rewritten
+back to the bare name. A protocol head keeps its qualifier,
+canonicalised from the written alias to the module's tagged name
+(`alias.P` -> `home.P`), so the protocol lowering resolves the impl
+against exactly that module.
 
 The rewrite is pure and total — a bad qualifier still yields the bare
 name — and the counting pass is what reports it and fails the build.
@@ -25,6 +26,7 @@ import compiler.expr_positions
 import compiler.modules
 import compiler.module_table
 import compiler.util
+import compiler.written
 
 #[doc("Strip a validated module qualifier from every habitant head in these decls.")]
 pub fn qh_decls(decls: [Decl], mt: [ModuleEntry]) : [Decl] = match decls {
@@ -68,19 +70,23 @@ type QhRes = QhOk(String) | QhBad(String, String, Bool, [String])
 
 fn qh_resolve(name: String, mt: [ModuleEntry]) : QhRes = match split_dotted_qualifier(name) {
   None -> QhOk(name)
-  Some(QSplit(mod, bare)) -> match mt_lookup_member(mt, mod, bare) {
-    None -> QhBad(mod, bare, false, [])
-    Some(me) ->
-      if me_has_export(me, bare) { QhOk(bare) }
-      else { QhBad(mod, bare, true, me_exports(me)) }
-  }
+  Some(QSplit(mod, bare)) -> qh_resolve_in(mod, bare, mt)
+}
+
+fn qh_resolve_in(mod: String, bare: String, mt: [ModuleEntry]) : QhRes = match mt_lookup_member(mt, mod, bare) {
+  None -> QhBad(mod, bare, false, [])
+  Some(me) ->
+    if me_has_export(me, bare) { QhOk(bare) }
+    else { QhBad(mod, bare, true, me_exports(me)) }
 }
 
 fn me_exports(me: ModuleEntry) : [String] = match me { ME(_, exs, _, _) -> exs }
 
-fn qh_name(name: String, mt: [ModuleEntry]) : String = match qh_resolve(name, mt) {
-  QhOk(bare) -> bare
-  QhBad(_, bare, _, _) -> bare
+# A handler head or a row label loses its qualifier, valid or not; a
+# settled one has none.
+fn qh_ref(r: DeclRef) : DeclRef = match r {
+  DrWritten(Some(_), n) -> DrWritten(None, n)
+  _                     -> r
 }
 
 # A protocol head keeps a valid qualifier, spelled with the tagged
@@ -95,8 +101,26 @@ fn qh_proto_name(name: String, mt: [ModuleEntry]) : String = match split_dotted_
   }
 }
 
+fn qh_proto_ref(r: DeclRef, mt: [ModuleEntry]) : DeclRef = match r {
+  DrWritten(Some(q), n) -> match qh_resolve_in(written_text(q), written_text(n), mt) {
+    QhOk(_)           -> DrWritten(Some(written(mt_tagged_name(mt, written_text(q)))), n)
+    QhBad(_, _, _, _) -> DrWritten(None, n)
+  }
+  _ -> r
+}
+
 fn qh_report(name: String, kind: String, mt: [ModuleEntry], file: String,
-             line: Int, col: Int) : Int / Console + File = match qh_resolve(name, mt) {
+             line: Int, col: Int) : Int / Console + File =
+  qh_report_res(qh_resolve(name, mt), kind, file, line, col)
+
+fn qh_report_ref(r: DeclRef, kind: String, mt: [ModuleEntry], file: String,
+                 line: Int, col: Int) : Int / Console + File = match r {
+  DrWritten(Some(q), n) -> qh_report_res(qh_resolve_in(written_text(q), written_text(n), mt), kind, file, line, col)
+  _                     -> 0
+}
+
+fn qh_report_res(res: QhRes, kind: String, file: String,
+                 line: Int, col: Int) : Int / Console + File = match res {
   QhOk(_) -> 0
   QhBad(mod, bare, known, exports) -> {
     if known {
@@ -119,26 +143,26 @@ fn qh_join(xs: [String]) : String = match xs {
 }
 
 fn qh_decl(d: Decl, mt: [ModuleEntry]) : Decl = match d {
-  DFn(is_pub, name, tps, ps, ret, row, body, l, c, mo, fsym) ->
-    DFn(is_pub, name, tps, qh_params(ps, mt), qh_ty_opt(ret, mt), qh_row(row, mt), qh_expr(body, mt), l, c, mo, fsym)
-  DImpl(pname, pargs, target, methods, l, c, itps, isym) ->
-    DImpl(qh_proto_name(pname, mt), qh_tys(pargs, mt), qh_ty(target, mt), qh_sub_decls(methods, mt), l, c, itps, isym)
+  DFn(is_pub, fid, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(is_pub, fid, tps, qh_params(ps, mt), qh_ty_opt(ret, mt), qh_row(row, mt), qh_expr(body, mt), l, c, mo)
+  DImpl(proto, pargs, target, methods, l, c, itps, isym) ->
+    DImpl(qh_proto_ref(proto, mt), qh_tys(pargs, mt), qh_ty(target, mt), qh_sub_decls(methods, mt), l, c, itps, isym)
   DTest(desc, body, l, c, mo) -> DTest(desc, qh_expr(body, mt), l, c, mo)
   DBench(desc, body, l, c, mo) -> DBench(desc, qh_expr(body, mt), l, c, mo)
   DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, qh_params(ps, mt), qh_expr(body, mt), l, c, mo)
-  DConst(p, n, ty, body, mo, l, c, csym) -> DConst(p, n, qh_ty(ty, mt), qh_expr(body, mt), mo, l, c, csym)
+  DConst(p, n, ty, body, mo, l, c) -> DConst(p, n, qh_ty(ty, mt), qh_expr(body, mt), mo, l, c)
   DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
     DAxiom(p, sm, n, cso, tps, qh_params(ps, mt), qh_ty(ret, mt), qh_row(row, mt), l, c)
-  DProtocol(p, n, tps, ops, l, c, mo, psym) -> DProtocol(p, n, tps, qh_pops(ops, mt), l, c, mo, psym)
-  DEffect(p, n, tps, ops, dblk, l, c, mo, esym) -> DEffect(p, n, tps, qh_eops(ops, mt), dblk, l, c, mo, esym)
-  DType(p, n, tps, body, l, c, mo, slots, tsym) -> DType(p, n, tps, qh_tbody(body, mt), l, c, mo, slots, tsym)
+  DProtocol(p, n, tps, ops, l, c, mo) -> DProtocol(p, n, tps, qh_pops(ops, mt), l, c, mo)
+  DEffect(p, n, tps, ops, dblk, l, c, mo) -> DEffect(p, n, tps, qh_eops(ops, mt), dblk, l, c, mo)
+  DType(p, n, tps, body, l, c, mo, slots) -> DType(p, n, tps, qh_tbody(body, mt), l, c, mo, slots)
   DDerive(protos, inner, l, c) ->
     DDerive(map(protos, (n) => qh_proto_name(n, mt)), qh_decl(inner, mt), l, c)
   _ -> d
 }
 
 # Row labels resolve like heads: `m.E` strips to the exported `E`
-# (contested names were already home-spelled by the effect-scope pass).
+# (the effect-scope pass already settled the labels it could).
 fn qh_row(r: RowExpr, mt: [ModuleEntry]) : RowExpr = match r {
   REmpty -> REmpty
   RClosed(ls) -> RClosed(map(ls, (l) => qh_label(l, mt)))
@@ -146,7 +170,7 @@ fn qh_row(r: RowExpr, mt: [ModuleEntry]) : RowExpr = match r {
 }
 
 fn qh_label(l: RowLabel, mt: [ModuleEntry]) : RowLabel = match l {
-  RL(n, ts, s) -> RL(qh_name(n, mt), qh_tys(ts, mt), s)
+  RL(r, ts) -> RL(qh_ref(r), qh_tys(ts, mt))
 }
 
 fn qh_tys(ts: [TypeExpr], mt: [ModuleEntry]) : [TypeExpr] = map(ts, (t) => qh_ty(t, mt))
@@ -158,7 +182,7 @@ fn qh_ty_opt(o: Option[TypeExpr], mt: [ModuleEntry]) : Option[TypeExpr] = match 
 
 fn qh_ty(t: TypeExpr, mt: [ModuleEntry]) : TypeExpr = {
   let k = match t.tkind {
-    TyName(th, n, ts) -> TyName(th, n, qh_tys(ts, mt))
+    TyName(r, ts) -> TyName(r, qh_tys(ts, mt))
     TyList(x) -> TyList(qh_ty(x, mt))
     TyFn(ps, r, row) -> TyFn(qh_tys(ps, mt), qh_ty(r, mt), qh_row(row, mt))
     TyRow(row) -> TyRow(qh_row(row, mt))
@@ -170,7 +194,7 @@ fn qh_ty(t: TypeExpr, mt: [ModuleEntry]) : TypeExpr = {
 }
 
 fn qh_params(ps: [Param], mt: [ModuleEntry]) : [Param] =
-  map(ps, (p) => Param { pname: p.pname, ptype: qh_ty_opt(p.ptype, mt),
+  map(ps, (p) => Param { binder: p.binder, ptype: qh_ty_opt(p.ptype, mt),
                          pline: p.pline, pcol: p.pcol, pborrow: p.pborrow })
 
 fn qh_pops(ops: [ProtoOp], mt: [ModuleEntry]) : [ProtoOp] =
@@ -191,7 +215,7 @@ fn qh_tbody(b: TypeBody, mt: [ModuleEntry]) : TypeBody = match b {
   TBSum(vs) -> TBSum(map(vs, (v) => match v {
     Var(n, ts) -> Var(n, qh_tys(ts, mt))
   }))
-  TBEffectAlias(ls) -> TBEffectAlias(map(ls, (l) => match l { RL(n, ts, s) -> RL(qh_name(n, mt), ts, s) }))
+  TBEffectAlias(ls) -> TBEffectAlias(map(ls, (l) => match l { RL(r, ts) -> RL(qh_ref(r), ts) }))
 }
 
 fn qh_sub_decls(ds: [Decl], mt: [ModuleEntry]) : [Decl] = match ds {
@@ -201,8 +225,8 @@ fn qh_sub_decls(ds: [Decl], mt: [ModuleEntry]) : [Decl] = match ds {
 
 #[doc("Strip a validated module qualifier from every habitant head inside one expression; for callers that hold a sub-tree rather than a decl.")]
 pub fn qh_expr(e: Expr, mt: [ModuleEntry]) : Expr = match e.kind {
-  EHandle(body, eff, hs, tyargs, init, alias, clauses, ret) -> {
-    let head = EHandle(body, qh_name(eff, mt), hs, tyargs, init, alias, clauses, ret)
+  EHandle(body, eff, tyargs, init, alias, clauses, ret) -> {
+    let head = EHandle(body, qh_ref(eff), tyargs, init, alias, clauses, ret)
     Expr { kind: prc_map_expr_kind(head, (x) => qh_expr(x, mt)),
            line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
   }
@@ -211,24 +235,24 @@ pub fn qh_expr(e: Expr, mt: [ModuleEntry]) : Expr = match e.kind {
 }
 
 fn qhchk_decl(d: Decl, mt: [ModuleEntry], file: String) : Int / Console + File = match d {
-  DFn(_, _, _, ps, ret, row, body, l, c, _, _) ->
+  DFn(_, _, _, ps, ret, row, body, l, c, _) ->
     qhchk_params(ps, mt, file, l, c) + qhchk_ty_opt(ret, mt, file, l, c) +
     qhchk_row(row, mt, file, l, c) + qhchk_expr(body, mt, file)
-  DImpl(pname, pargs, target, methods, l, c, _, _) ->
-    qh_report(pname, "protocol", mt, file, l, c) + qhchk_tys(pargs, mt, file, l, c) +
+  DImpl(proto, pargs, target, methods, l, c, _, _) ->
+    qh_report_ref(proto, "protocol", mt, file, l, c) + qhchk_tys(pargs, mt, file, l, c) +
     qhchk_ty(target, mt, file, l, c) + qhchk_sub_decls(methods, mt, file)
   DTest(_, body, _, _, _) -> qhchk_expr(body, mt, file)
   DBench(_, body, _, _, _) -> qhchk_expr(body, mt, file)
   DCheck(_, ps, body, l, c, _) ->
     qhchk_params(ps, mt, file, l, c) + qhchk_expr(body, mt, file)
-  DConst(_, _, ty, body, _, l, c, _) ->
+  DConst(_, _, ty, body, _, l, c) ->
     qhchk_ty(ty, mt, file, l, c) + qhchk_expr(body, mt, file)
   DAxiom(_, _, _, _, _, ps, ret, row, l, c) ->
     qhchk_params(ps, mt, file, l, c) + qhchk_ty(ret, mt, file, l, c) +
     qhchk_row(row, mt, file, l, c)
-  DProtocol(_, _, _, ops, l, c, _, _) -> qhchk_pops(ops, mt, file, l, c)
-  DEffect(_, _, _, ops, _, l, c, _, _) -> qhchk_eops(ops, mt, file, l, c)
-  DType(_, _, _, body, l, c, _, _, _) -> qhchk_tbody(body, mt, file, l, c)
+  DProtocol(_, _, _, ops, l, c, _) -> qhchk_pops(ops, mt, file, l, c)
+  DEffect(_, _, _, ops, _, l, c, _) -> qhchk_eops(ops, mt, file, l, c)
+  DType(_, _, _, body, l, c, _, _) -> qhchk_tbody(body, mt, file, l, c)
   DDerive(protos, inner, l, c) ->
     qhchk_names(protos, mt, file, l, c) + qhchk_decl(inner, mt, file)
   _ -> 0
@@ -243,8 +267,8 @@ fn qhchk_row(r: RowExpr, mt: [ModuleEntry], file: String, l: Int, c: Int) : Int 
 
 fn qhchk_labels(ls: [RowLabel], mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match ls {
   [] -> 0
-  [RL(n, ts, _), ...rest] ->
-    qh_report(n, "effect", mt, file, l, c) + qhchk_tys(ts, mt, file, l, c) +
+  [RL(r, ts), ...rest] ->
+    qh_report_ref(r, "effect", mt, file, l, c) + qhchk_tys(ts, mt, file, l, c) +
     qhchk_labels(rest, mt, file, l, c)
 }
 
@@ -259,7 +283,7 @@ fn qhchk_ty_opt(o: Option[TypeExpr], mt: [ModuleEntry], file: String, l: Int, c:
 }
 
 fn qhchk_ty(t: TypeExpr, mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match t.tkind {
-  TyName(_, _, ts) -> qhchk_tys(ts, mt, file, l, c)
+  TyName(_, ts) -> qhchk_tys(ts, mt, file, l, c)
   TyList(x) -> qhchk_ty(x, mt, file, l, c)
   TyFn(ps, r, row) ->
     qhchk_tys(ps, mt, file, l, c) + qhchk_ty(r, mt, file, l, c) + qhchk_row(row, mt, file, l, c)
@@ -290,7 +314,7 @@ fn qhchk_tbody(b: TypeBody, mt: [ModuleEntry], file: String, l: Int, c: Int) : I
   TBAlias(t) -> qhchk_ty(t, mt, file, l, c)
   TBRecord(fs) -> qhchk_fields(fs, mt, file, l, c)
   TBSum(vs) -> qhchk_variants(vs, mt, file, l, c)
-  TBEffectAlias(ls) -> qhchk_eff_alias(rl_names(ls), mt, file, l, c)
+  TBEffectAlias(ls) -> qhchk_eff_alias(ls, mt, file, l, c)
 }
 
 fn qhchk_fields(fs: [FieldDecl], mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match fs {
@@ -303,9 +327,9 @@ fn qhchk_variants(vs: [Variant], mt: [ModuleEntry], file: String, l: Int, c: Int
   [Var(_, ts), ...rest] -> qhchk_tys(ts, mt, file, l, c) + qhchk_variants(rest, mt, file, l, c)
 }
 
-fn qhchk_eff_alias(ls: [String], mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match ls {
+fn qhchk_eff_alias(ls: [RowLabel], mt: [ModuleEntry], file: String, l: Int, c: Int) : Int / Console + File = match ls {
   [] -> 0
-  [n, ...rest] -> qh_report(n, "effect", mt, file, l, c) + qhchk_eff_alias(rest, mt, file, l, c)
+  [RL(r, _), ...rest] -> qh_report_ref(r, "effect", mt, file, l, c) + qhchk_eff_alias(rest, mt, file, l, c)
 }
 
 fn qhchk_names(names: [String], mt: [ModuleEntry], file: String,
@@ -323,8 +347,8 @@ fn qhchk_sub_decls(ds: [Decl], mt: [ModuleEntry], file: String) : Int / Console 
 }
 
 fn qhchk_expr(e: Expr, mt: [ModuleEntry], file: String) : Int / Console + File = match e.kind {
-  EHandle(_, eff, _, _, _, _, _, _) -> {
-    let here = qh_report(eff, "effect", mt, file, e.line, e.col)
+  EHandle(_, eff, _, _, _, _, _) -> {
+    let here = qh_report_ref(eff, "effect", mt, file, e.line, e.col)
     here + qhchk_positions(xp_positions(e), mt, file)
   }
   _ -> qhchk_positions(xp_positions(e), mt, file)

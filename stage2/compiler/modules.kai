@@ -40,8 +40,8 @@
 #   attribute a decl's surface module.
 #
 # Two AST-generic helpers ride along because the rewriters use them but
-# they are NOT module-system concepts: `pat_binders` (pattern binder
-# names) and `fn_param_names` (parameter names). The typer/desugar in
+# they are NOT module-system concepts: `pat_binders` (pattern binders)
+# and `fn_param_names` (parameter names). The typer/desugar in
 # main.kai also call them, so they are `pub`.
 #
 # `CoreSegment` is the per-core-file `(mod_name, decls)` split that
@@ -59,6 +59,10 @@ import compiler.expr_positions
 import compiler.lex
 import compiler.parse
 import compiler.chars
+import compiler.written
+import compiler.decl_names
+import compiler.symtab
+import compiler.symtab_build
 
 # ====================================================================
 # Local mirrors of two trivial main.kai helpers (downward-glue rule)
@@ -319,56 +323,56 @@ fn scope_tagged_names(mes: [ModuleEntry], opens: [String], global: [ModuleEntry]
     } else { scope_tagged_names(rest, opens, global) }
 }
 
-# Collect the bindings introduced by a pattern. Used by SLet,
+# Collect the binders introduced by a pattern. Used by SLet,
 # match-arm patterns, and variant-record / record patterns.
-pub fn pat_binders(pat: Pattern, acc: [String]) : [String] = match pat.pkind {
+pub fn pat_binders(pat: Pattern, acc: [Binder]) : [Binder] = match pat.pkind {
   PWild           -> acc
   PLit(_)         -> acc
   PRange(_, _)    -> acc
-  PBind(name)     -> [name, ...acc]
+  PBind(b)        -> [b, ...acc]
   PList(subs, opt_rest) -> {
     let acc1 = pat_binders_list(subs, acc)
-    match opt_rest { Some(n) -> [n, ...acc1] None -> acc1 }
+    match opt_rest { Some(b) -> [b, ...acc1] None -> acc1 }
   }
-  PVariant(_, _, subs)     -> pat_binders_list(subs, acc)
-  PVariantRecord(_, _, fs) -> pat_binders_pfields(fs, acc)
+  PVariant(_, subs)        -> pat_binders_list(subs, acc)
+  PVariantRecord(_, fs)    -> pat_binders_pfields(fs, acc)
   PRecord(fs)              -> pat_binders_pfields(fs, acc)
   PHole(_)                 -> acc
-  PAs(name, inner)         -> pat_binders(inner, [name, ...acc])
-  PNarrow(name, _)         -> [name, ...acc]
+  PAs(b, inner)            -> pat_binders(inner, [b, ...acc])
+  PNarrow(b, _)            -> [b, ...acc]
   PSurface(sp)             -> pat_binders_list(patsurface_children(sp), acc)
 }
 
-fn pat_binders_list(ps: [Pattern], acc: [String]) : [String] = match ps {
+fn pat_binders_list(ps: [Pattern], acc: [Binder]) : [Binder] = match ps {
   [] -> acc
   [p, ...rest] -> pat_binders_list(rest, pat_binders(p, acc))
 }
 
-fn pat_binders_pfields(fs: [PField], acc: [String]) : [String] = match fs {
+fn pat_binders_pfields(fs: [PField], acc: [Binder]) : [Binder] = match fs {
   [] -> acc
   [f, ...rest] -> match f {
     PField(_, sub, _) -> pat_binders_pfields(rest, pat_binders(sub, acc))
   }
 }
 
+#[doc("The names the binders of a pattern were written with, ahead of `acc`: what a pass that runs before the resolver tracks its scope by.")]
+pub fn pat_binder_names(pat: Pattern, acc: [String]) : [String] =
+  list_append(map(pat_binders(pat, []), (b) => written_text(b.name)), acc)
+
 pub fn fn_param_names(params: [Param]) : [String] = match params {
   [] -> []
-  [p, ...rest] -> [p.pname, ...fn_param_names(rest)]
+  [p, ...rest] -> [written_text(p.binder.name), ...fn_param_names(rest)]
 }
 
 # ====================================================================
 # qualified type rewriter
 # ====================================================================
 #
-# The parser turns `mod.Type[args?]` in type position into a single
-# `TyName("mod.Type", args)` with the qualifier folded into the name
-# string. This pass walks every TypeExpr reachable from a Decl,
-# detects the dotted form, validates that `mod` is in the module
-# table and exports `Type`, and rewrites the node back to the bare
-# `TyName("Type", args)`. After rewrite, every downstream walker
-# (resolve_ty, mangle, codegen) sees the same shape produced by an
-# unqualified annotation, so the qualified surface is purely a
-# parse-time disambiguator.
+# The parser keeps the qualifier of `mod.Type[args?]` in the type's
+# reference. This pass walks every TypeExpr reachable from a Decl,
+# validates that `mod` is in the module table and exports `Type`, and
+# re-qualifies the reference with the name the module's decls are
+# tagged with, so a per-file alias never reaches a later pass.
 #
 # Validation diagnostics: an unknown `mod` reports
 # `unknown module qualifier`; a known `mod` that does not export
@@ -417,26 +421,28 @@ fn qualtype_unresolvable() : String = "__qualtype_bad__"
 
 fn qualtype_te(te: TypeExpr, mt: [ModuleEntry], file: String) : TypeExpr / Console + File = match te.tkind {
 
-  TyName(th, name, targs) -> {
+  TyName(r, targs) -> {
     let targs1 = qualtype_te_list(targs, mt, file)
-    match split_dotted_qualifier(name) {
-      None -> TypeExpr { tkind: TyName(th, name, targs1), line: te.line, col: te.col }
-      Some(parts) -> match parts {
-        QSplit(mod, ty) -> match mt_lookup_member_at(mt, mod, ty, file, te.line, te.col) {
+    match r {
+      DrWritten(Some(q), n) -> {
+        let mod = written_text(q)
+        let ty = written_text(n)
+        match mt_lookup_member_at(mt, mod, ty, file, te.line, te.col) {
           None -> {
             let _ = qt_diag_unknown_mod(mod, ty, file, te.line, te.col)
-            TypeExpr { tkind: TyName(th, qualtype_unresolvable(), []), line: te.line, col: te.col }
+            TypeExpr { tkind: TyName(ref_written(qualtype_unresolvable()), []), line: te.line, col: te.col }
           }
           Some(me) ->
             if me_has_export(me, ty) {
-              TypeExpr { tkind: TyName(ty_ref_qualified(mt_member_home(mt, mod, ty)), ty, targs1), line: te.line, col: te.col }
+              TypeExpr { tkind: TyName(ref_qualified(mt_member_home(mt, mod, ty), ty), targs1), line: te.line, col: te.col }
             } else {
               let exports = match me { ME(_, exs, _, _) -> exs }
               let _ = qt_diag_missing_type(mod, ty, exports, file, te.line, te.col)
-              TypeExpr { tkind: TyName(ty_ref_none(), qualtype_unresolvable(), []), line: te.line, col: te.col }
+              TypeExpr { tkind: TyName(ref_written(qualtype_unresolvable()), []), line: te.line, col: te.col }
             }
         }
       }
+      _ -> TypeExpr { tkind: TyName(r, targs1), line: te.line, col: te.col }
     }
   }
   TyList(inner) ->
@@ -478,13 +484,13 @@ fn qualtype_rls(ls: [RowLabel], mt: [ModuleEntry], file: String) : [RowLabel] / 
 
   [] -> []
   [rl, ...rest] -> match rl {
-    RL(name, ts, s) -> [RL(name, qualtype_te_list(ts, mt, file), s), ...qualtype_rls(rest, mt, file)]
+    RL(r, ts) -> [RL(r, qualtype_te_list(ts, mt, file)), ...qualtype_rls(rest, mt, file)]
   }
 }
 
 fn qualtype_param(pm: Param, mt: [ModuleEntry], file: String) : Param / Console + File =
 
-  Param { pname: pm.pname,
+  Param { binder: pm.binder,
           ptype: match pm.ptype {
             None -> None
             Some(te) -> Some(qualtype_te(te, mt, file))
@@ -497,36 +503,69 @@ fn qualtype_params(ps: [Param], mt: [ModuleEntry], file: String) : [Param] / Con
   [p, ...rest] -> [qualtype_param(p, mt, file), ...qualtype_params(rest, mt, file)]
 }
 
-fn qualtype_variants(vs: [Variant], mt: [ModuleEntry], file: String, line: Int, col: Int) : [Variant] / Console + File = match vs {
+fn qualtype_variants(vs: [Variant], tab: SymTab, mt: [ModuleEntry], file: String, line: Int, col: Int) : [Variant] / Console + File = match vs {
 
   [] -> []
   [v, ...rest] -> match v {
-    Var(cname, vargs) -> [Var(qualtype_member(cname, mt, file, line, col), qualtype_te_list(vargs, mt, file)),
-                           ...qualtype_variants(rest, mt, file, line, col)]
+    Var(c, vargs) -> [Var(qualtype_member(c, tab, mt, file, line, col), qualtype_te_list(vargs, mt, file)),
+                       ...qualtype_variants(rest, tab, mt, file, line, col)]
   }
 }
 
-# A qualified union member validates and strips like a type head; a
-# bare one is a constructor and passes through untouched.
-fn qualtype_member(name: String, mt: [ModuleEntry], file: String, line: Int, col: Int) : String / Console + File =
-  match split_dotted_qualifier(name) {
-    None -> name
+# A qualified union member has no reference to hold its qualifier: its
+# constructor is declared under the dotted spelling. It validates like a
+# type head, and the variant is re-pointed to the constructor the bare
+# member declares. A bare one is a constructor and passes through
+# untouched.
+fn qualtype_member(c: SymId, tab: SymTab, mt: [ModuleEntry], file: String, line: Int, col: Int) : SymId / Console + File =
+  match split_dotted_qualifier(written_text(sym_name(tab, c))) {
+    None -> c
     Some(parts) -> match parts {
-      QSplit(mod, ty) -> match mt_lookup_member_at(mt, mod, ty, file, line, col) {
-        None -> {
-          let _ = qt_diag_unknown_mod(mod, ty, file, line, col)
-          qualtype_unresolvable()
+      QSplit(mod, ty) -> {
+        match mt_lookup_member_at(mt, mod, ty, file, line, col) {
+          None -> qt_diag_unknown_mod(mod, ty, file, line, col)
+          Some(me) ->
+            if me_has_export(me, ty) { () }
+            else {
+              let exports = match me { ME(_, exs, _, _) -> exs }
+              qt_diag_missing_type(mod, ty, exports, file, line, col)
+            }
         }
-        Some(me) ->
-          if me_has_export(me, ty) { ty }
-          else {
-            let exports = match me { ME(_, exs, _, _) -> exs }
-            let _ = qt_diag_missing_type(mod, ty, exports, file, line, col)
-            qualtype_unresolvable()
-          }
+        match qualtype_member_row(mod, ty, c, tab, mt) {
+          NEnt(cls, name, home, _) -> sym_derive(cls, name, home)
+        }
       }
     }
   }
+
+# The row of the constructor the union member `mod.ty` is re-pointed to:
+# the bare member in the union's own module, under the unresolvable name
+# when `mod` does not export it.
+fn qualtype_member_row(mod: String, ty: String, c: SymId, tab: SymTab, mt: [ModuleEntry]) : NEnt = {
+  let name = if qtchk_qualified(mod, ty, mt) == 0 { ty } else { qualtype_unresolvable() }
+  NEnt(NCCtor, name, written_text(sym_home(tab, c)), sym_exported(tab, c))
+}
+
+fn qualtype_rows(ds: [Decl], tab: SymTab, mt: [ModuleEntry], acc: [NEnt]) : [NEnt] = match ds {
+  [] -> acc
+  [d, ...rest] -> qualtype_rows(rest, tab, mt, qualtype_decl_rows(d, tab, mt, acc))
+}
+
+fn qualtype_decl_rows(d: Decl, tab: SymTab, mt: [ModuleEntry], acc: [NEnt]) : [NEnt] = match decl_transparent_inner(d) {
+  Some(inner) -> qualtype_decl_rows(inner, tab, mt, acc)
+  None -> match d {
+    DType(_, _, _, TBSum(vs), _, _, _, _) -> qualtype_variant_rows(vs, tab, mt, acc)
+    _ -> acc
+  }
+}
+
+fn qualtype_variant_rows(vs: [Variant], tab: SymTab, mt: [ModuleEntry], acc: [NEnt]) : [NEnt] = match vs {
+  [] -> acc
+  [Var(c, _), ...rest] -> match split_dotted_qualifier(written_text(sym_name(tab, c))) {
+    Some(QSplit(mod, ty)) -> qualtype_variant_rows(rest, tab, mt, [qualtype_member_row(mod, ty, c, tab, mt), ...acc])
+    None                  -> qualtype_variant_rows(rest, tab, mt, acc)
+  }
+}
 
 fn qualtype_fields(fs: [FieldDecl], mt: [ModuleEntry], file: String) : [FieldDecl] / Console + File = match fs {
 
@@ -536,11 +575,11 @@ fn qualtype_fields(fs: [FieldDecl], mt: [ModuleEntry], file: String) : [FieldDec
   }
 }
 
-fn qualtype_body(tb: TypeBody, mt: [ModuleEntry], file: String, line: Int, col: Int) : TypeBody / Console + File = match tb {
+fn qualtype_body(tb: TypeBody, tab: SymTab, mt: [ModuleEntry], file: String, line: Int, col: Int) : TypeBody / Console + File = match tb {
 
   TBAlias(te) -> TBAlias(qualtype_te(te, mt, file))
   TBRecord(fs) -> TBRecord(qualtype_fields(fs, mt, file))
-  TBSum(vs) -> TBSum(qualtype_variants(vs, mt, file, line, col))
+  TBSum(vs) -> TBSum(qualtype_variants(vs, tab, mt, file, line, col))
   TBEffectAlias(ls) -> TBEffectAlias(ls)
 }
 
@@ -572,31 +611,33 @@ fn qualtype_expr(e: Expr, mt: [ModuleEntry], file: String) : Expr / Console + Fi
          line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
 # Qualtype rewrite at the kind level needs source position
-# for module-export diagnostics on `ERecordLit("mod.Type", _)`. Routes
+# for module-export diagnostics on a qualified `ERecordLit`. Routes
 # through here so the wrapping `Expr` can supply line/col; all other
 # arms forward to `qualtype_expr_kind` unchanged.
 fn qualtype_expr_kind_at(k: ExprKind, mt: [ModuleEntry], file: String, line: Int, col: Int) : ExprKind / Console + File = match k {
 
-  ERecordLit(rh, name, fs) -> {
+  ERecordLit(r, fs) -> {
     let fs1 = qualtype_fields_init(fs, mt, file)
-    match split_dotted_qualifier(name) {
-      None -> ERecordLit(rh, name, fs1)
-      Some(parts) -> match parts {
-        QSplit(mod, ty) -> match mt_lookup_member_at(mt, mod, ty, file, line, col) {
+    match r {
+      DrWritten(Some(q), n) -> {
+        let mod = written_text(q)
+        let ty = written_text(n)
+        match mt_lookup_member_at(mt, mod, ty, file, line, col) {
           None -> {
             let _ = qt_diag_unknown_mod(mod, ty, file, line, col)
-            ERecordLit(rh, qualtype_unresolvable(), fs1)
+            ERecordLit(ref_written(qualtype_unresolvable()), fs1)
           }
           Some(me) ->
             if me_has_export(me, ty) {
-              ERecordLit(ty_ref_qualified(mt_member_home(mt, mod, ty)), ty, fs1)
+              ERecordLit(ref_qualified(mt_member_home(mt, mod, ty), ty), fs1)
             } else {
               let exports = match me { ME(_, exs, _, _) -> exs }
               let _ = qt_diag_missing_type(mod, ty, exports, file, line, col)
-              ERecordLit(ty_ref_none(), qualtype_unresolvable(), fs1)
+              ERecordLit(ref_written(qualtype_unresolvable()), fs1)
             }
         }
       }
+      _ -> ERecordLit(r, fs1)
     }
   }
   _ -> qualtype_expr_kind(k, mt, file)
@@ -616,8 +657,8 @@ fn qualtype_expr_kind(k: ExprKind, mt: [ModuleEntry], file: String) : ExprKind /
     EVariantsOf(qualtype_te(te, mt, file), [])
   ELambda(ps, body) ->
     ELambda(qualtype_params(ps, mt, file), qualtype_expr(body, mt, file))
-  EHandle(body, eff, hsym, ty_args, init_opt, alias_opt, clauses, ret_opt) ->
-    EHandle(qualtype_expr(body, mt, file), eff, hsym,
+  EHandle(body, eff, ty_args, init_opt, alias_opt, clauses, ret_opt) ->
+    EHandle(qualtype_expr(body, mt, file), eff,
              qualtype_ty_list_opt(ty_args, mt, file),
              match init_opt { None -> None Some(ie) -> Some(qualtype_expr(ie, mt, file)) },
              alias_opt,
@@ -638,7 +679,9 @@ fn qualtype_expr_kind(k: ExprKind, mt: [ModuleEntry], file: String) : ExprKind /
   EUnit          -> k
   EName(_)        -> k
   EMark(_)        -> k
-  ESym(_, _, _)        -> k
+  ESym(_, _)      -> k
+  ELocal(_)       -> k
+  EOp(_)          -> k
   EUnder         -> k
   EPlaceholder   -> k
   EHole(_)       -> k
@@ -663,7 +706,7 @@ fn qualtype_expr_kind(k: ExprKind, mt: [ModuleEntry], file: String) : ExprKind /
   EIf(c, t_, eo)       -> EIf(qualtype_expr(c, mt, file),
                                 qualtype_expr(t_, mt, file),
                                 qualtype_expr_opt(eo, mt, file))
-  ERecordLit(rh, name, fs) -> ERecordLit(rh, name, qualtype_fields_init(fs, mt, file))
+  ERecordLit(r, fs)    -> ERecordLit(r, qualtype_fields_init(fs, mt, file))
   EList(els)           -> EList(qualtype_list_elems(els, mt, file))
   ERange(a, b, opt_step) -> ERange(qualtype_expr(a, mt, file),
                                      qualtype_expr(b, mt, file),
@@ -738,11 +781,11 @@ fn qualtype_pat(pat: Pattern, mt: [ModuleEntry], file: String) : Pattern / Conso
 
   PNarrow(name, te) ->
     Pattern { pkind: PNarrow(name, qualtype_te(te, mt, file)), line: pat.line, col: pat.col }
-  PVariant(home, name, subs) ->
-    Pattern { pkind: PVariant(home, name, qualtype_pat_list(subs, mt, file)),
+  PVariant(r, subs) ->
+    Pattern { pkind: PVariant(r, qualtype_pat_list(subs, mt, file)),
                line: pat.line, col: pat.col }
-  PVariantRecord(home, name, fs) ->
-    Pattern { pkind: PVariantRecord(home, name, qualtype_pfields(fs, mt, file)),
+  PVariantRecord(r, fs) ->
+    Pattern { pkind: PVariantRecord(r, qualtype_pfields(fs, mt, file)),
                line: pat.line, col: pat.col }
   PRecord(fs) ->
     Pattern { pkind: PRecord(qualtype_pfields(fs, mt, file)),
@@ -821,33 +864,33 @@ fn qualtype_hreturn(r: HReturn, mt: [ModuleEntry], file: String) : HReturn / Con
   HR(name, body, l, c) -> HR(name, qualtype_expr(body, mt, file), l, c)
 }
 
-fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + File = match d {
+fn qualtype_decl(d: Decl, tab: SymTab, mt: [ModuleEntry], file: String) : Decl / Console + File = match d {
 
-  DFn(p, n, tps, ps, ret_opt, row, body, l, c, mo, fsym) ->
+  DFn(p, n, tps, ps, ret_opt, row, body, l, c, mo) ->
     DFn(p, n, tps, qualtype_params(ps, mt, file),
         match ret_opt { None -> None Some(te) -> Some(qualtype_te(te, mt, file)) },
         qualtype_row(row, mt, file),
-        qualtype_expr(body, mt, file), l, c, mo, fsym)
-  DType(p, n, tps, body, l, c, mo, slots, tsym) ->
-    DType(p, n, tps, qualtype_body(body, mt, file, l, c), l, c, mo, slots, tsym)
-  DEffect(p, n, tps, ops, defblk, l, c, mo, esym) ->
-    DEffect(p, n, tps, qualtype_eops(ops, mt, file), defblk, l, c, mo, esym)
-  DProtocol(p, n, tps, ops, l, c, mo, psym) ->
-    DProtocol(p, n, tps, qualtype_pops(ops, mt, file), l, c, mo, psym)
+        qualtype_expr(body, mt, file), l, c, mo)
+  DType(p, n, tps, body, l, c, mo, slots) ->
+    DType(p, n, tps, qualtype_body(body, tab, mt, file, l, c), l, c, mo, slots)
+  DEffect(p, n, tps, ops, defblk, l, c, mo) ->
+    DEffect(p, n, tps, qualtype_eops(ops, mt, file), defblk, l, c, mo)
+  DProtocol(p, n, tps, ops, l, c, mo) ->
+    DProtocol(p, n, tps, qualtype_pops(ops, mt, file), l, c, mo)
   DImpl(name, proto_args, ty, sub_decls, l, c, tps, isym) ->
     DImpl(name, map(proto_args, (te) => qualtype_te(te, mt, file)),
           qualtype_te(ty, mt, file),
-          qualtype_sub_decls(sub_decls, mt, file), l, c, tps, isym)
+          qualtype_sub_decls(sub_decls, tab, mt, file), l, c, tps, isym)
   DDerive(ps, inner, l, c) ->
-    DDerive(ps, qualtype_decl(inner, mt, file), l, c)
+    DDerive(ps, qualtype_decl(inner, tab, mt, file), l, c)
   DUnstable(inner, l, c) ->
-    DUnstable(qualtype_decl(inner, mt, file), l, c)
+    DUnstable(qualtype_decl(inner, tab, mt, file), l, c)
   DProtoLaws(thy, inner, l, c, mo) ->
-    DProtoLaws(thy, qualtype_decl(inner, mt, file), l, c, mo)
+    DProtoLaws(thy, qualtype_decl(inner, tab, mt, file), l, c, mo)
   DImplAxiom(thy, inner, l, c, mo) ->
-    DImplAxiom(thy, qualtype_decl(inner, mt, file), l, c, mo)
+    DImplAxiom(thy, qualtype_decl(inner, tab, mt, file), l, c, mo)
   DConstructor(inner, l, c) ->
-    DConstructor(qualtype_decl(inner, mt, file), l, c)
+    DConstructor(qualtype_decl(inner, tab, mt, file), l, c)
   DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
     DAxiom(p, sm, n, cso, tps, qualtype_params(ps, mt, file),
             qualtype_te(ret, mt, file), qualtype_row(row, mt, file), l, c)
@@ -856,9 +899,9 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + Fi
   # the arm exists for completeness so any pre-lowering caller (e.g.
   # `--ast` of a future entry point) does not blow up. Mirrors what
   # the DFn arm above does for the body + return type.
-  DConst(p, n, ty, body, mo, l, c, csym) ->
+  DConst(p, n, ty, body, mo, l, c) ->
     DConst(p, n, qualtype_te(ty, mt, file),
-            qualtype_expr(body, mt, file), mo, l, c, csym)
+            qualtype_expr(body, mt, file), mo, l, c)
   DTest(n, body, l, c, mo) -> DTest(n, qualtype_expr(body, mt, file), l, c, mo)
   DBench(n, body, l, c, mo) -> DBench(n, qualtype_expr(body, mt, file), l, c, mo)
   DCheck(n, ps, body, l, c, mo) ->
@@ -870,8 +913,8 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + Fi
   # The root file's module-doc carrier rides the stream
   # until the typer lifts it into TypedProgram.module_doc; it has no
   # types to qualify.
-  DDoc(raw, text, inner, l, c) -> DDoc(raw, text, qualtype_decl(inner, mt, file), l, c)
-  DAttr(raw, inner, l, c) -> DAttr(raw, qualtype_decl(inner, mt, file), l, c)
+  DDoc(raw, text, inner, l, c) -> DDoc(raw, text, qualtype_decl(inner, tab, mt, file), l, c)
+  DAttr(raw, inner, l, c) -> DAttr(raw, qualtype_decl(inner, tab, mt, file), l, c)
   DModuleDoc(raw, text, l, c) -> DModuleDoc(raw, text, l, c)
   # FFI v2: a foreign type's fields are fixed-width / nested foreign
   # names that resolve nominally — nothing to qualify.
@@ -881,17 +924,24 @@ fn qualtype_decl(d: Decl, mt: [ModuleEntry], file: String) : Decl / Console + Fi
   DKind(p, n, th, ov, intro, l, c, mo) -> DKind(p, n, th, ov, intro, l, c, mo)
 }
 
-pub fn qualtype_decls(decls: [Decl], mt: [ModuleEntry], df: DiagFiles) : [Decl] / Console + File = match decls {
+#[doc("A decl stream with its qualified type heads validated and re-qualified, and the symbol-table rows of the constructors its qualified union members were re-pointed to.")]
+pub type QualTyped = { decls: [Decl], rows: [NEnt] }
+
+#[doc("Validate and re-qualify every qualified type head of `decls` against `mt`. `tab` holds the rows of `decls`; the caller extends it with the rows returned.")]
+pub fn qualtype_decls(decls: [Decl], tab: SymTab, mt: [ModuleEntry], df: DiagFiles) : QualTyped / Console + File =
+  QualTyped { decls: qualtype_top_decls(decls, tab, mt, df), rows: qualtype_rows(decls, tab, mt, []) }
+
+fn qualtype_top_decls(decls: [Decl], tab: SymTab, mt: [ModuleEntry], df: DiagFiles) : [Decl] / Console + File = match decls {
 
   [] -> []
-  [d, ...rest] -> [qualtype_decl(d, mt, decl_diag_file(d, df)), ...qualtype_decls(rest, mt, df)]
+  [d, ...rest] -> [qualtype_decl(d, tab, mt, decl_diag_file(d, df)), ...qualtype_top_decls(rest, tab, mt, df)]
 }
 
 # The `DImpl` arm re-enters the walk for the methods, which already
 # resolved their file from the enclosing decl.
-fn qualtype_sub_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] / Console + File = match decls {
+fn qualtype_sub_decls(decls: [Decl], tab: SymTab, mt: [ModuleEntry], file: String) : [Decl] / Console + File = match decls {
   [] -> []
-  [d, ...rest] -> [qualtype_decl(d, mt, file), ...qualtype_sub_decls(rest, mt, file)]
+  [d, ...rest] -> [qualtype_decl(d, tab, mt, file), ...qualtype_sub_decls(rest, tab, mt, file)]
 }
 
 # Validation pass: counts how many qualified type heads
@@ -900,16 +950,11 @@ fn qualtype_sub_decls(decls: [Decl], mt: [ModuleEntry], file: String) : [Decl] /
 # pass mirrors the same traversal so the caller can fold the count
 # into the program's exit status.
 fn qtchk_te(te: TypeExpr, mt: [ModuleEntry]) : Int = match te.tkind {
-  TyName(_, name, targs) -> {
+  TyName(r, targs) -> {
     let inner = qtchk_te_list(targs, mt)
-    match split_dotted_qualifier(name) {
-      None -> inner
-      Some(parts) -> match parts {
-        QSplit(mod, ty) -> match mt_lookup_member(mt, mod, ty) {
-          None -> inner + 1
-          Some(me) -> if me_has_export(me, ty) { inner } else { inner + 1 }
-        }
-      }
+    match r {
+      DrWritten(Some(q), n) -> inner + qtchk_qualified(written_text(q), written_text(n), mt)
+      _                     -> inner
     }
   }
   TyList(inner) -> qtchk_te(inner, mt)
@@ -937,7 +982,7 @@ fn qtchk_row(re: RowExpr, mt: [ModuleEntry]) : Int = match re {
 fn qtchk_rls(ls: [RowLabel], mt: [ModuleEntry]) : Int = match ls {
   [] -> 0
   [rl, ...rest] -> match rl {
-    RL(_, ts, _) -> qtchk_te_list(ts, mt) + qtchk_rls(rest, mt)
+    RL(_, ts) -> qtchk_te_list(ts, mt) + qtchk_rls(rest, mt)
   }
 }
 
@@ -949,21 +994,24 @@ fn qtchk_params(ps: [Param], mt: [ModuleEntry]) : Int = match ps {
   }
 }
 
-fn qtchk_variants(vs: [Variant], mt: [ModuleEntry]) : Int = match vs {
+fn qtchk_variants(vs: [Variant], tab: SymTab, mt: [ModuleEntry]) : Int = match vs {
   [] -> 0
   [v, ...rest] -> match v {
-    Var(cname, vargs) -> qtchk_member(cname, mt) + qtchk_te_list(vargs, mt) + qtchk_variants(rest, mt)
+    Var(c, vargs) -> qtchk_member(c, tab, mt) + qtchk_te_list(vargs, mt) + qtchk_variants(rest, tab, mt)
   }
 }
 
-fn qtchk_member(name: String, mt: [ModuleEntry]) : Int = match split_dotted_qualifier(name) {
+fn qtchk_member(c: SymId, tab: SymTab, mt: [ModuleEntry]) : Int = match split_dotted_qualifier(written_text(sym_name(tab, c))) {
   None -> 0
   Some(parts) -> match parts {
-    QSplit(mod, ty) -> match mt_lookup_member(mt, mod, ty) {
-      None -> 1
-      Some(me) -> if me_has_export(me, ty) { 0 } else { 1 }
-    }
+    QSplit(mod, ty) -> qtchk_qualified(mod, ty, mt)
   }
+}
+
+# 1 when `mod` is not imported or does not export `ty`, else 0.
+fn qtchk_qualified(mod: String, ty: String, mt: [ModuleEntry]) : Int = match mt_lookup_member(mt, mod, ty) {
+  None -> 1
+  Some(me) -> if me_has_export(me, ty) { 0 } else { 1 }
 }
 
 fn qtchk_fields(fs: [FieldDecl], mt: [ModuleEntry]) : Int = match fs {
@@ -973,10 +1021,10 @@ fn qtchk_fields(fs: [FieldDecl], mt: [ModuleEntry]) : Int = match fs {
   }
 }
 
-fn qtchk_body(tb: TypeBody, mt: [ModuleEntry]) : Int = match tb {
+fn qtchk_body(tb: TypeBody, tab: SymTab, mt: [ModuleEntry]) : Int = match tb {
   TBAlias(te) -> qtchk_te(te, mt)
   TBRecord(fs) -> qtchk_fields(fs, mt)
-  TBSum(vs) -> qtchk_variants(vs, mt)
+  TBSum(vs) -> qtchk_variants(vs, tab, mt)
   TBEffectAlias(_) -> 0
 }
 
@@ -1001,43 +1049,43 @@ fn qtchk_pops(ops: [ProtoOp], mt: [ModuleEntry]) : Int = match ops {
 # bad qualifiers with the bare-name fallback so cascade-typer noise
 # stays bounded; the counter only needs to detect ONE bad use to
 # fail the build.
-fn qtchk_decl(d: Decl, mt: [ModuleEntry]) : Int = match d {
-  DFn(_, _, _, ps, ret_opt, row, _, _, _, _, _) ->
+fn qtchk_decl(d: Decl, tab: SymTab, mt: [ModuleEntry]) : Int = match d {
+  DFn(_, _, _, ps, ret_opt, row, _, _, _, _) ->
     qtchk_params(ps, mt) +
     (match ret_opt { None -> 0 Some(te) -> qtchk_te(te, mt) }) +
     qtchk_row(row, mt)
-  DType(_, _, _, body, _, _, _, _, _) -> qtchk_body(body, mt)
-  DEffect(_, _, _, ops, _, _, _, _, _) -> qtchk_eops(ops, mt)
-  DProtocol(_, _, _, ops, _, _, _, _) -> qtchk_pops(ops, mt)
+  DType(_, _, _, body, _, _, _, _) -> qtchk_body(body, tab, mt)
+  DEffect(_, _, _, ops, _, _, _, _) -> qtchk_eops(ops, mt)
+  DProtocol(_, _, _, ops, _, _, _) -> qtchk_pops(ops, mt)
   DImpl(_, proto_args, ty, sub_decls, _, _, _, _) ->
     qtchk_te_list(proto_args, mt) +
-    qtchk_te(ty, mt) + qtchk_decls(sub_decls, mt)
-  DDerive(_, inner, _, _) -> qtchk_decl(inner, mt)
-  DUnstable(inner, _, _) -> qtchk_decl(inner, mt)
-  DProtoLaws(_, inner, _, _, _) -> qtchk_decl(inner, mt)
-  DImplAxiom(_, inner, _, _, _) -> qtchk_decl(inner, mt)
-  DConstructor(inner, _, _) -> qtchk_decl(inner, mt)
+    qtchk_te(ty, mt) + qtchk_decls(sub_decls, tab, mt)
+  DDerive(_, inner, _, _) -> qtchk_decl(inner, tab, mt)
+  DUnstable(inner, _, _) -> qtchk_decl(inner, tab, mt)
+  DProtoLaws(_, inner, _, _, _) -> qtchk_decl(inner, tab, mt)
+  DImplAxiom(_, inner, _, _, _) -> qtchk_decl(inner, tab, mt)
+  DConstructor(inner, _, _) -> qtchk_decl(inner, tab, mt)
   DAxiom(_, _, _, _, _, ps, ret, row, _, _) ->
     qtchk_params(ps, mt) + qtchk_te(ret, mt) + qtchk_row(row, mt)
   DCheck(_, ps, _, _, _, _) -> qtchk_params(ps, mt)
   _ -> 0
 }
 
-pub fn qtchk_decls(ds: [Decl], mt: [ModuleEntry]) : Int = match ds {
+pub fn qtchk_decls(ds: [Decl], tab: SymTab, mt: [ModuleEntry]) : Int = match ds {
   [] -> 0
-  [d, ...rest] -> qtchk_decl(d, mt) + qtchk_decls(rest, mt)
+  [d, ...rest] -> qtchk_decl(d, tab, mt) + qtchk_decls(rest, tab, mt)
 }
 
 #[doc("One effect and its op names, as the `rqc` walk sees them.")]
 pub type RqcFx = RqcFx(String, [String])
 
 #[doc("The (effect, ops) table of a decl stream: what `Eff.op` can still mean when the module table loses the qualifier.")]
-pub fn rqc_collect_fx(decls: [Decl]) : [RqcFx] = match decls {
+pub fn rqc_collect_fx(decls: [Decl], tab: SymTab) : [RqcFx] = match decls {
   [] -> []
   [d, ...rest] -> match d {
-    DEffect(_, name, _, ops, _, _, _, _, _) ->
-      [RqcFx(name, rqc_fx_op_names(ops, [])), ...rqc_collect_fx(rest)]
-    _ -> rqc_collect_fx(rest)
+    DEffect(_, s, _, ops, _, _, _, _) ->
+      [RqcFx(written_text(sym_name(tab, s)), rqc_fx_op_names(ops, [])), ...rqc_collect_fx(rest, tab)]
+    _ -> rqc_collect_fx(rest, tab)
   }
 }
 
@@ -1109,7 +1157,7 @@ fn unstable_check_sub_decls(ds: [Decl], mt: [ModuleEntry], pkg: String,
 
 fn unstable_check_decl(d: Decl, mt: [ModuleEntry], pkg: String,
                          optins: [String], file: String) : Unit / Console + File = match d {
-  DFn(_, _, _, _, _, _, body, _, _, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
+  DFn(_, _, _, _, _, _, body, _, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
   DTest(_, body, _, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
   DBench(_, body, _, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
   DCheck(_, _, body, _, _, _) -> unstable_check_expr(body, mt, pkg, optins, file)
@@ -1124,7 +1172,9 @@ fn unstable_check_decl(d: Decl, mt: [ModuleEntry], pkg: String,
 
 fn unstable_check_expr(e: Expr, mt: [ModuleEntry], pkg: String,
                          optins: [String], file: String) : Unit / Console + File = match e.kind {
-  EModCall(mod, fname) -> {
+  EModCall(m, f) -> {
+    let mod = written_text(m)
+    let fname = written_text(f)
     if mod == pkg { () }
     else if list_has(optins, mod) { () }
     else {
@@ -1155,7 +1205,7 @@ fn unstable_check_expr(e: Expr, mt: [ModuleEntry], pkg: String,
     unstable_check_expr(t_, mt, pkg, optins, file)
     unstable_check_expr_opt(eo, mt, pkg, optins, file)
   }
-  ERecordLit(_, _, fs) -> unstable_check_fields_init(fs, mt, pkg, optins, file)
+  ERecordLit(_, fs) -> unstable_check_fields_init(fs, mt, pkg, optins, file)
   EList(els) -> unstable_check_list_elems(els, mt, pkg, optins, file)
   ERange(a, b, opt_step) -> {
     unstable_check_expr(a, mt, pkg, optins, file)
@@ -1173,7 +1223,7 @@ fn unstable_check_expr(e: Expr, mt: [ModuleEntry], pkg: String,
     unstable_check_expr(scrut, mt, pkg, optins, file)
     unstable_check_arms(arms, mt, pkg, optins, file)
   }
-  EHandle(body, _, _, _, init_opt, _, cs, ret_opt) -> {
+  EHandle(body, _, _, init_opt, _, cs, ret_opt) -> {
     unstable_check_expr(body, mt, pkg, optins, file)
     unstable_check_expr_opt(init_opt, mt, pkg, optins, file)
     unstable_check_hclauses(cs, mt, pkg, optins, file)
@@ -1287,9 +1337,9 @@ fn unstable_check_stmt(s: Stmt, mt: [ModuleEntry], pkg: String,
 
 fn rqc_decl(d: Decl, mt: [ModuleEntry], fx: [RqcFx], file: String) : Decl / Console + File = match d {
 
-  DFn(p, n, tp, params, ret, row, body, l, c, mo, fsym) ->
+  DFn(p, n, tp, params, ret, row, body, l, c, mo) ->
     DFn(p, n, tp, params, ret, row,
-        rqc_expr(body, fn_param_names(params), mt, fx, file), l, c, mo, fsym)
+        rqc_expr(body, fn_param_names(params), mt, fx, file), l, c, mo)
   DTest(n, body, l, c, mo) ->
     DTest(n, rqc_expr(body, [], mt, fx, file), l, c, mo)
   DBench(n, body, l, c, mo) ->
@@ -1337,13 +1387,15 @@ pub fn missing_export_msg(mod: String, fname: String, exports: [String]) : Strin
 # qualifier's only job was to say whose effect was meant.
 fn rqc_habitant_qualifier(inner: Expr, mid: String, locals: [String],
                           mt: [ModuleEntry]) : Option[String] = match inner.kind {
-  EName(mod) ->
+  EName(w) -> {
+    let mod = written_text(w)
     if list_has(locals, mod) { None }
     else if not name_starts_upper(mid) { None }
     else { match mt_lookup_member(mt, mod, mid) {
       Some(me) -> if me_has_export(me, mid) { Some(mid) } else { None }
       None -> None
     } }
+  }
   _ -> None
 }
 
@@ -1352,7 +1404,8 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
   # The rewrite rule itself: only `EField(EName(mod), fn)` is a
   # candidate. Every other shape just recurses with the same scope.
   EField(base, fname) -> match base.kind {
-    EName(name) ->
+    EName(w) -> {
+      let name = written_text(w)
       if list_has(locals, name) {
         # Rule B: local in scope. Treat as record projection.
         EField(rqc_expr(base, locals, mt, fx, file), fname)
@@ -1369,7 +1422,7 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
         # `bit_<op>` intrinsic (`bit` ++ `_and` = `bit_and`). An
         # unknown `bit_X` surfaces as an unbound identifier, the right
         # diagnostic for a typo like `bit._adn`.
-        EName(string_concat("bit", fname))
+        EName(written(string_concat("bit", fname)))
       } else {
         match mt_lookup_member_at(mt, name, fname, file, e.line, e.col) {
           Some(me) ->
@@ -1381,9 +1434,9 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
             # becomes `EModCall(mod, Ctor)`, never a bare `EVar`, so
             # the qualifier the user wrote survives to the typer.
             if name_starts_upper(fname) and me_has_export(me, fname) {
-              EModCall(me_emit_name(mt, me, name), fname)
+              EModCall(written(me_emit_name(mt, me, name)), written(fname))
              } else { match me_lookup_export(me, fname) {
-               Some(actual) -> EModCall(me_emit_name(mt, me, name), actual)
+               Some(actual) -> EModCall(written(me_emit_name(mt, me, name)), written(actual))
                None -> {
                  # The module table is consulted first. When it loses
                  # but an effect of the same name owns the op, the
@@ -1394,13 +1447,14 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
                  } else {
                    # Kept qualified so no pass reads `mod` as a value;
                    # `missing_export` reports it.
-                   EModCall(name, fname)
+                   EModCall(w, written(fname))
                  }
                }
              } }
            None -> EField(rqc_expr(base, locals, mt, fx, file), fname)
          }
        }
+    }
     # `m.E.op` — a module-qualified effect operation. The qualifier
     # names the effect's home; the operation itself dispatches on the
     # bare effect, so the rewrite drops the module and leaves the
@@ -1408,7 +1462,7 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
     # receiver never reaches here (Rule B rewrote the inner node),
     # which is what keeps `user.address.city` a projection.
     EField(inner, mid) -> match rqc_habitant_qualifier(inner, mid, locals, mt) {
-      Some(hab) -> EField(mk_ref(hab, base.line, base.col), fname)
+      Some(hab) -> EField(mk_name(hab, base.line, base.col), fname)
       None -> EField(rqc_expr(base, locals, mt, fx, file), fname)
     }
     _ -> EField(rqc_expr(base, locals, mt, fx, file), fname)
@@ -1420,7 +1474,7 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
   EMatch(scrut, arms) ->
     EMatch(rqc_expr(scrut, locals, mt, fx, file),
            rqc_arms(arms, locals, mt, fx, file))
-  EHandle(body, eff, hsym, ty_args, init_opt, alias_opt, clauses, ret_opt) -> {
+  EHandle(body, eff, ty_args, init_opt, alias_opt, clauses, ret_opt) -> {
     let body1 = rqc_expr(body, locals, mt, fx, file)
     let init_opt1 = match init_opt {
       Some(ie) -> Some(rqc_expr(ie, locals, mt, fx, file))
@@ -1430,13 +1484,13 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
     # name` introduce a binding visible only inside the clauses
     # and the return clause, not the body. The body sees the
     # original locals.
-    let inner = match alias_opt { Some(a) -> [a, ...locals] None -> locals }
+    let inner = match alias_opt { Some(a) -> [written_text(a.name), ...locals] None -> locals }
     let clauses1 = rqc_hclauses(clauses, inner, mt, fx, file)
     let ret_opt1 = match ret_opt {
       Some(r) -> Some(rqc_hreturn(r, inner, mt, fx, file))
       None -> None
     }
-    EHandle(body1, eff, hsym, ty_args, init_opt1, alias_opt, clauses1, ret_opt1)
+    EHandle(body1, eff, ty_args, init_opt1, alias_opt, clauses1, ret_opt1)
   }
   EBlock(stmts, opt_final) -> {
     # Scope grows monotonically through the block. Each SLet /
@@ -1465,7 +1519,9 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
   EUnit          -> e.kind
   EName(_)        -> e.kind
   EMark(_)        -> e.kind
-  ESym(_, _, _)        -> e.kind
+  ESym(_, _)      -> e.kind
+  ELocal(_)       -> e.kind
+  EOp(_)          -> e.kind
   EUnder         -> e.kind
   EPlaceholder   -> e.kind
   EHole(_)       -> e.kind
@@ -1488,7 +1544,7 @@ fn rqc_kind(e: Expr, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
   EIf(c, t_, eo)       -> EIf(rqc_expr(c, locals, mt, fx, file),
                                 rqc_expr(t_, locals, mt, fx, file),
                                 rqc_expr_opt(eo, locals, mt, fx, file))
-  ERecordLit(rh, name, fs) -> ERecordLit(rh, name, rqc_fields_init(fs, locals, mt, fx, file))
+  ERecordLit(r, fs)    -> ERecordLit(r, rqc_fields_init(fs, locals, mt, fx, file))
   EList(els)           -> EList(rqc_list_elems(els, locals, mt, fx, file))
   ERange(a, b, opt_step) -> ERange(rqc_expr(a, locals, mt, fx, file),
                                      rqc_expr(b, locals, mt, fx, file),
@@ -1543,7 +1599,7 @@ fn rqc_arms(arms: [Arm], locals: [String], mt: [ModuleEntry], fx: [RqcFx], file:
 fn rqc_arm(a: Arm, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: String) : Arm / Console + File = match a {
 
   Arm(pat, opt_guard, body) -> {
-    let inner = pat_binders(pat, locals)
+    let inner = pat_binder_names(pat, locals)
     let guard1 = match opt_guard {
       Some(g) -> Some(rqc_expr(g, inner, mt, fx, file))
       None -> None
@@ -1554,24 +1610,18 @@ fn rqc_arm(a: Arm, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Strin
 
 # A qualified variant pattern is validated like a qualified ctor
 # expression: the module must be imported and must export the ctor.
-# The home slot is rewritten to the module's tagged name so it keys
+# The qualifier is rewritten to the module's tagged name so it keys
 # the same way `EModCall` does.
 fn rqc_pat(pat: Pattern, mt: [ModuleEntry], file: String) : Pattern / Console + File = match pat.pkind {
 
-  PVariant(home, name, subs) -> {
-    let home1 = match home {
-      Some(q) -> rqc_pat_qualifier(q, name, mt, file, pat.line, pat.col)
-      None -> None
-    }
-    Pattern { pkind: PVariant(home1, name, rqc_pat_list(subs, mt, file)),
+  PVariant(r, subs) -> {
+    let r1 = rqc_pat_ref(r, mt, file, pat.line, pat.col)
+    Pattern { pkind: PVariant(r1, rqc_pat_list(subs, mt, file)),
               line: pat.line, col: pat.col }
   }
-  PVariantRecord(home, name, fs) -> {
-    let home1 = match ty_ref_qual(home) {
-      Some(q) -> DrWritten(rqc_pat_qualifier(q, name, mt, file, pat.line, pat.col), name)
-      None -> home
-    }
-    Pattern { pkind: PVariantRecord(home1, name, rqc_pfields(fs, mt, file)),
+  PVariantRecord(r, fs) -> {
+    let r1 = rqc_pat_ref(r, mt, file, pat.line, pat.col)
+    Pattern { pkind: PVariantRecord(r1, rqc_pfields(fs, mt, file)),
               line: pat.line, col: pat.col }
   }
   PRecord(fs) ->
@@ -1587,6 +1637,14 @@ fn rqc_pat(pat: Pattern, mt: [ModuleEntry], file: String) : Pattern / Console + 
 fn pat_qualifier_ok(q: String, ctor: String, mt: [ModuleEntry]) : Bool = match mt_lookup_member(mt, q, ctor) {
   Some(me) -> me_has_export(me, ctor)
   None -> false
+}
+
+fn rqc_pat_ref(r: DeclRef, mt: [ModuleEntry], file: String, line: Int, col: Int) : DeclRef / Console + File = match r {
+  DrWritten(Some(q), n) -> match rqc_pat_qualifier(written_text(q), written_text(n), mt, file, line, col) {
+    Some(q1) -> DrWritten(Some(written(q1)), n)
+    None     -> DrWritten(None, n)
+  }
+  _ -> r
 }
 
 fn rqc_pat_qualifier(q: String, ctor: String, mt: [ModuleEntry], file: String, line: Int, col: Int) : Option[String] / Console + File =
@@ -1637,8 +1695,8 @@ fn rqc_hclause(c: HClause, locals: [String], mt: [ModuleEntry], fx: [RqcFx], fil
 
 fn rqc_hreturn(r: HReturn, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: String) : HReturn / Console + File = match r {
 
-  HR(pname, body, l, c) ->
-    HR(pname, rqc_expr(body, [pname, ...locals], mt, fx, file), l, c)
+  HR(b, body, l, c) ->
+    HR(b, rqc_expr(body, [written_text(b.name), ...locals], mt, fx, file), l, c)
 }
 
 # Stmt-walker: threads the scope through a block's statement list.
@@ -1664,7 +1722,7 @@ fn rqc_stmt(s: Stmt, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
     # The RHS evaluates under the *outer* scope; bindings from `pat`
     # only become visible to subsequent stmts.
     let e1 = rqc_expr(e, locals, mt, fx, file)
-    let inner = pat_binders(pat, locals)
+    let inner = pat_binder_names(pat, locals)
     RqcStmtR { s: SLet(rqc_pat(pat, mt, file), ty_opt, e1), bound: inner }
   }
   SAssert(e, opt_msg) -> {
@@ -1688,12 +1746,12 @@ fn rqc_stmt(s: Stmt, locals: [String], mt: [ModuleEntry], fx: [RqcFx], file: Str
     let v1 = rqc_expr(v, locals, mt, fx, file)
     RqcStmtR { s: SAssign(t1, v1, l, c), bound: locals }
   }
-  SVar(name, ty_opt, init, l, c) -> {
+  SVar(b, ty_opt, init, l, c) -> {
     # SVar should not survive the desugar pass that runs before
     # rqc, but we handle it defensively just in case rqc lands
     # earlier in the pipeline some day.
     let init1 = rqc_expr(init, locals, mt, fx, file)
-    RqcStmtR { s: SVar(name, ty_opt, init1, l, c), bound: [name, ...locals] }
+    RqcStmtR { s: SVar(b, ty_opt, init1, l, c), bound: [written_text(b.name), ...locals] }
   }
   # SUse introduces no value bindings; leaves locals untouched.
   SUse(eff, l, c) ->
@@ -1734,28 +1792,29 @@ fn import_hole_pub_fns(base_dir: String, mod_path: String,
 
   let cf = find_module_file(base_dir, mod_path, search_paths)
   match cf {
-    CF(_, opt_src) -> match opt_src {
+    CF(path, opt_src) -> match opt_src {
       None      -> []
       Some(src) -> {
         let toks = tokenize(src)
-        let parsed = parse_program(mod_path, src, toks)
+        let parsed = parse_program(mod_path, src, toks, module_name_of_path(path))
         match parsed.decls {
           None -> []
-          Some(decls) -> import_hole_collect_pub_fns(decls, [])
+          Some(decls) -> import_hole_collect_pub_fns(decls, st_of_entries(parsed.names), [])
         }
       }
     }
   }
 }
 
-fn import_hole_collect_pub_fns(ds: [Decl], acc: [String]) : [String] {
+fn import_hole_collect_pub_fns(ds: [Decl], tab: SymTab, acc: [String]) : [String] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match decl_transparent_inner(d) {
-      Some(inner) -> import_hole_collect_pub_fns([inner, ...rest], acc)
+      Some(inner) -> import_hole_collect_pub_fns([inner, ...rest], tab, acc)
       None -> match d {
-        DFn(true, name, _, _, _, _, _, _, _, _, _) -> import_hole_collect_pub_fns(rest, [name, ...acc])
-        _ -> import_hole_collect_pub_fns(rest, acc)
+        DFn(true, fid, _, _, _, _, _, _, _, _) ->
+          import_hole_collect_pub_fns(rest, tab, [written_text(sym_name(tab, fnid_sym(fid))), ...acc])
+        _ -> import_hole_collect_pub_fns(rest, tab, acc)
       }
     }
   }
@@ -1927,14 +1986,15 @@ pub fn rqc_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
   }
 }
 
-pub fn qualtype_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
+pub fn qualtype_segmented(segs: [ImportSeg], decls: [Decl], tab: SymTab, scopes: [ModScope],
       global: [ModuleEntry], df: DiagFiles)
-      : [Decl] / Console + File = match segs {
-  [] -> qualtype_decls(decls, ms_table(scopes, "", global), df)
+      : QualTyped / Console + File = match segs {
+  [] -> qualtype_decls(decls, tab, ms_table(scopes, "", global), df)
   [ISeg(home, n), ...rest] -> {
     let mt = ms_table(scopes, home, global)
-    list_append(qualtype_decls(seg_take(decls, n), mt, df),
-                qualtype_segmented(rest, seg_drop(decls, n), scopes, global, df))
+    let here = qualtype_decls(seg_take(decls, n), tab, mt, df)
+    let more = qualtype_segmented(rest, seg_drop(decls, n), tab, scopes, global, df)
+    QualTyped { decls: list_append(here.decls, more.decls), rows: list_append(here.rows, more.rows) }
   }
 }
 
@@ -1947,7 +2007,7 @@ pub fn pqchk_decls(ds: [Decl], mt: [ModuleEntry]) : Int = match ds {
 }
 
 fn pqchk_decl(d: Decl, mt: [ModuleEntry]) : Int = match d {
-  DFn(_, _, _, _, _, _, body, _, _, _, _) -> pqchk_expr(body, mt)
+  DFn(_, _, _, _, _, _, body, _, _, _) -> pqchk_expr(body, mt)
   DTest(_, body, _, _, _)              -> pqchk_expr(body, mt)
   DBench(_, body, _, _, _)             -> pqchk_expr(body, mt)
   DCheck(_, _, body, _, _, _)          -> pqchk_expr(body, mt)
@@ -1986,24 +2046,17 @@ fn pqchk_stmts(stmts: [Stmt], mt: [ModuleEntry]) : Int = match stmts {
 }
 
 fn pqchk_pat(pat: Pattern, mt: [ModuleEntry]) : Int = match pat.pkind {
-  PVariant(home, name, subs) -> {
-    let bad = match home {
-      Some(q) -> if pat_qualifier_ok(q, name, mt) { 0 } else { 1 }
-      None -> 0
-    }
-    bad + pqchk_pats(subs, mt)
-  }
-  PVariantRecord(home, name, fs) -> {
-    let bad = match ty_ref_qual(home) {
-      Some(q) -> if pat_qualifier_ok(q, name, mt) { 0 } else { 1 }
-      None -> 0
-    }
-    bad + pqchk_pfields(fs, mt)
-  }
+  PVariant(r, subs)     -> pqchk_ref(r, mt) + pqchk_pats(subs, mt)
+  PVariantRecord(r, fs) -> pqchk_ref(r, mt) + pqchk_pfields(fs, mt)
   PRecord(fs)           -> pqchk_pfields(fs, mt)
   PList(subs, _)        -> pqchk_pats(subs, mt)
   PAs(_, inner)         -> pqchk_pat(inner, mt)
   _ -> 0
+}
+
+fn pqchk_ref(r: DeclRef, mt: [ModuleEntry]) : Int = match r {
+  DrWritten(Some(q), n) -> if pat_qualifier_ok(written_text(q), written_text(n), mt) { 0 } else { 1 }
+  _                     -> 0
 }
 
 fn pqchk_pats(ps: [Pattern], mt: [ModuleEntry]) : Int = match ps {
@@ -2027,13 +2080,13 @@ pub fn pqchk_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
   }
 }
 
-pub fn qtchk_segmented(segs: [ImportSeg], decls: [Decl], scopes: [ModScope],
+pub fn qtchk_segmented(segs: [ImportSeg], decls: [Decl], tab: SymTab, scopes: [ModScope],
       global: [ModuleEntry]) : Int = match segs {
-  [] -> qtchk_decls(decls, ms_table(scopes, "", global))
+  [] -> qtchk_decls(decls, tab, ms_table(scopes, "", global))
   [ISeg(home, n), ...rest] -> {
     let mt = ms_table(scopes, home, global)
-    qtchk_decls(seg_take(decls, n), mt) +
-      qtchk_segmented(rest, seg_drop(decls, n), scopes, global)
+    qtchk_decls(seg_take(decls, n), tab, mt) +
+      qtchk_segmented(rest, seg_drop(decls, n), tab, scopes, global)
   }
 }
 
@@ -2060,7 +2113,7 @@ pub fn seg_drop(ds: [Decl], n: Int) : [Decl] =
 # the present untagged DFn marks the start of the root file.
 pub fn decl_home_hint_reset(d: Decl, cur_mod: String, target_mod: String) : String =
   match d {
-    DFn(_, _, _, _, _, _, _, _, _, mo, _) -> match mo {
+    DFn(_, _, _, _, _, _, _, _, _, mo) -> match mo {
       Some(m) -> m
       None    -> target_mod
     }
@@ -2075,7 +2128,7 @@ pub fn decl_home_hint_reset(d: Decl, cur_mod: String, target_mod: String) : Stri
     DAxiom(_, _, _, _, _, _, _, _, _, _) -> target_mod
     # A protocol carries its own stamp, like DFn: `None` marks a
     # root-file declaration, resetting the running home.
-    DProtocol(_, _, _, _, _, _, mo, _) -> match mo {
+    DProtocol(_, _, _, _, _, _, mo) -> match mo {
       Some(m) -> m
       None    -> target_mod
     }
@@ -2084,11 +2137,11 @@ pub fn decl_home_hint_reset(d: Decl, cur_mod: String, target_mod: String) : Stri
     # case here silently inherited the PREVIOUS decl's home, which is
     # only ever right by accident (`decl_names.kai`'s `nt_home` reads
     # every one of these slots; this walker owes the same reads).
-    DType(_, _, _, _, _, _, mo, _, _)   -> match mo { Some(m) -> m  None -> target_mod }
-    DEffect(_, _, _, _, _, _, _, mo, _) -> match mo { Some(m) -> m  None -> target_mod }
+    DType(_, _, _, _, _, _, mo, _)   -> match mo { Some(m) -> m  None -> target_mod }
+    DEffect(_, _, _, _, _, _, _, mo) -> match mo { Some(m) -> m  None -> target_mod }
     DKind(_, _, _, _, _, _, _, mo)   -> match mo { Some(m) -> m  None -> target_mod }
     DUnit(_, _, _, _, _, _, mo)      -> match mo { Some(m) -> m  None -> target_mod }
-    DConst(_, _, _, _, mo, _, _, _)     -> match mo { Some(m) -> m  None -> target_mod }
+    DConst(_, _, _, _, mo, _, _)     -> match mo { Some(m) -> m  None -> target_mod }
     DExternType(_, _, _, _, mo)      -> match mo { Some(m) -> m  None -> target_mod }
     DTest(_, _, _, _, mo)            -> match mo { Some(m) -> m  None -> target_mod }
     DBench(_, _, _, _, mo)           -> match mo { Some(m) -> m  None -> target_mod }
@@ -2106,7 +2159,7 @@ fn impl_home_hint_reset(ms: [Decl], cur_mod: String, target_mod: String) : Strin
   match ms {
     [] -> cur_mod
     [m, ...rest] -> match m {
-      DFn(_, _, _, _, _, _, _, _, _, mo, _) -> match mo {
+      DFn(_, _, _, _, _, _, _, _, _, mo) -> match mo {
         Some(mm) -> mm
         None     -> target_mod
       }
@@ -2180,14 +2233,14 @@ pub fn imports_home_anchors(ds: [Decl], target_mod: String, cur_mod: String,
 pub fn ha_home(h: HomeAnchor) : String = match h { HA(m, _) -> m }
 
 fn decl_explicit_home(d: Decl) : Option[String] = match d {
-  DFn(_, _, _, _, _, _, _, _, _, mo, _) -> mo
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
   # Root-file DTypes also carry `module_origin = Some(_)`
   # after `tag_target_decl`, so use them as home anchors too — a
   # leading DType in the root file does not have a DFn ahead of it
   # to seed the propagate_home_back walk, and the home should not
   # leak in from the last imported core segment.
-  DType(_, _, _, _, _, _, mo, _, _) -> mo
-  DProtocol(_, _, _, _, _, _, mo, _) -> mo
+  DType(_, _, _, _, _, _, mo, _) -> mo
+  DProtocol(_, _, _, _, _, _, mo) -> mo
   DDerive(_, inner, _, _)         -> decl_explicit_home(inner)
   DUnstable(inner, _, _)          -> decl_explicit_home(inner)
   DProtoLaws(_, inner, _, _, _)      -> decl_explicit_home(inner)
@@ -2200,7 +2253,7 @@ fn decl_explicit_home(d: Decl) : Option[String] = match d {
 pub fn impl_first_fn_home(ms: [Decl]) : Option[String] = match ms {
   [] -> None
   [m, ...rest] -> match m {
-    DFn(_, _, _, _, _, _, _, _, _, mo, _) -> mo
+    DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
     _ -> impl_first_fn_home(rest)
   }
 }
