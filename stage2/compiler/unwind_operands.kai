@@ -13,16 +13,14 @@ reference stays as written.
 """)]
 
 import compiler.ast
-import compiler.sym_read
-import compiler.chars
 import compiler.emit_shared
+import compiler.ctor_ix
 import compiler.expr_exists
 import compiler.anf_ops
 import compiler.resume_anf
 import compiler.unwind_cx
 import compiler.unwind_calls
 import compiler.unwind_effects
-import compiler.fnreg
 import compiler.symtab
 import compiler.symtab_build
 import compiler.decl_names
@@ -31,8 +29,8 @@ import compiler.core_builtin_sets
 #[doc("Bind, in every body of `ds`, the owned operands evaluated before a sibling that can unwind.")]
 pub fn unw_name_operands(ds: [Decl], tab: SymTab) : [Decl] = {
   let ucx = unw_cx_decls(ds)
-  let shared = uo_shared_ctors(tab)
-  map(ds, (d) => uo_decl(d, ucx, shared))
+  let top = uo_frame(ucx, uo_shared_ctors(tab), tab)
+  map(ds, (d) => uo_decl(d, top))
 }
 
 # The declared constructors whose name a second constructor shares.
@@ -46,38 +44,33 @@ fn uo_ctor_shared(tab: SymTab, core: SymId, s: SymId) : Bool = match sym_class(t
   _      -> false
 }
 
-#[doc("True when `s` binds an operand this pass named.")]
-pub fn unw_is_named_operand(s: Stmt) : Bool = match s {
-  SLet(p, _, _) -> match p.pkind {
-    PBind(n) -> string_starts_with_q(n, uo_prefix())
-    _        -> false
-  }
-  _ -> false
-}
-
 fn uo_prefix() : String = "__unw_v"
 
-fn uo_decl(d: Decl, ucx: UnwCx, shared: SymSet) : Decl = match d {
-  DFn(pub_, n, tps, ps, ret, row, body, l, c, mo, fsym) -> DFn(pub_, n, tps, ps, ret, row, uo_body(body, uo_fn_cx(row, body, ucx, shared)), l, c, mo, fsym)
-  DTest(desc, body, l, c, mo)      -> DTest(desc, uo_body(body, uo_frame(ucx, shared)), l, c, mo)
-  DBench(desc, body, l, c, mo)     -> DBench(desc, uo_body(body, uo_frame(ucx, shared)), l, c, mo)
-  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, uo_body(body, uo_frame(ucx, shared)), l, c, mo)
-  DImpl(p, tas, tgt, inner, l, c, tps, isym) -> DImpl(p, tas, tgt, map(inner, (i) => uo_decl(i, ucx, shared)), l, c, tps, isym)
+# `top` is the context of a frame that is no declared fn.
+fn uo_decl(d: Decl, top: UoCx) : Decl = match d {
+  DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) -> DFn(pub_, fid, tps, ps, ret, row, uo_body(body, uo_fn_cx(row, body, top)), l, c, mo)
+  DTest(desc, body, l, c, mo)      -> DTest(desc, uo_body(body, top), l, c, mo)
+  DBench(desc, body, l, c, mo)     -> DBench(desc, uo_body(body, top), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, uo_body(body, top), l, c, mo)
+  DImpl(p, tas, tgt, inner, l, c, tps, isym) -> DImpl(p, tas, tgt, map(inner, (i) => uo_decl(i, top)), l, c, tps, isym)
   _ -> d
 }
 
 # `exits_only` marks a fn whose declared row cannot unwind and that
 # installs no handler: only its `!` leaves early (`unw_fn_frame`).
 # `shared` holds the constructors whose name a second one shares.
-type UoCx = { ucx: UnwCx, exits_only: Bool, shared: SymSet }
+type UoCx = { ucx: UnwCx, exits_only: Bool, shared: SymSet, tab: SymTab }
 
-fn uo_frame(ucx: UnwCx, shared: SymSet) : UoCx = UoCx { ucx: ucx, exits_only: false, shared: shared }
+fn uo_frame(ucx: UnwCx, shared: SymSet, tab: SymTab) : UoCx = UoCx { ucx: ucx, exits_only: false, shared: shared, tab: tab }
 
-fn uo_fn_cx(row: RowExpr, body: Expr, ucx: UnwCx, shared: SymSet) : UoCx =
-  UoCx { ucx: ucx, exits_only: unw_row_class(row, ucx) == 0 and not xp_exists(body, false, uo_is_handle), shared: shared }
+# The context of a frame nested in `cx`'s: a lambda or clause body.
+fn uo_nested(cx: UoCx) : UoCx = UoCx { ...cx, exits_only: false }
+
+fn uo_fn_cx(row: RowExpr, body: Expr, top: UoCx) : UoCx =
+  UoCx { ...top, exits_only: unw_row_class(row, top.ucx) == 0 and not xp_exists(body, false, uo_is_handle) }
 
 fn uo_is_handle(e: Expr) : Bool = match e.kind {
-  EHandle(_, _, _, _, _, _, _, _) -> true
+  EHandle(_, _, _, _, _, _, _) -> true
   _ -> false
 }
 
@@ -107,15 +100,15 @@ fn uo_expr(e: Expr, cx: UoCx, n: Int) : Anf = match e.kind {
     Anf { e: with_kind(e, EMatch(rs.e, ra.arms)), n: ra.n }
   }
   ELambda(ps, b) -> {
-    let r = uo_expr(b, uo_frame(cx.ucx, cx.shared), n)
+    let r = uo_expr(b, uo_nested(cx), n)
     Anf { e: with_kind(e, ELambda(ps, r.e)), n: r.n }
   }
-  EHandle(body, eff, hs, tys, init, alias, cls, ret) -> {
+  EHandle(body, eff, tys, init, alias, cls, ret) -> {
     let ri = uo_opt(init, cx, n)
     let rb = uo_expr(body, cx, ri.n)
-    let rc = uo_clauses(cls, uo_frame(cx.ucx, cx.shared), rb.n, [])
-    let rr = uo_ret(ret, uo_frame(cx.ucx, cx.shared), rc.n)
-    Anf { e: with_kind(e, EHandle(rb.e, eff, hs, tys, ri.o, alias, rc.cls, rr.o)), n: rr.n }
+    let rc = uo_clauses(cls, uo_nested(cx), rb.n, [])
+    let rr = uo_ret(ret, uo_nested(cx), rc.n)
+    Anf { e: with_kind(e, EHandle(rb.e, eff, tys, ri.o, alias, rc.cls, rr.o)), n: rr.n }
   }
   _ -> uo_pipe_or_ops(e, cx, n)
 }
@@ -157,8 +150,7 @@ fn uo_strands(xs: [Expr], i: Int, k: Int, shared: SymSet) : Bool = match xs {
 # the operands after it are bound it is read only when the construct runs.
 # A constructor whose name a second one shares is not counted.
 fn uo_owned(x: Expr, shared: SymSet) : Bool = match x.kind {
-  EModCall(_, _) -> false
-  ESym(s, _, _)  -> not sym_set_has(shared, s) and uo_typed_owned(x)
+  ESym(s, _)     -> not sym_set_has(shared, s) and uo_typed_owned(x)
   EInt(_, _)     -> false
   EIntLit(_)     -> false
   EBool(_)       -> false
@@ -225,7 +217,7 @@ fn uo_arms(arms: [Arm], cx: UoCx, n: Int, acc: [Arm]) : UoArms = match arms {
   [] -> UoArms { arms: list_reverse(acc), n: n }
   [Arm(p, g, b), ...rest] -> {
     let rg = uo_opt(g, cx, n)
-    let rb = if uo_rebuilds(p, g, b) { uo_operands_only(b, cx, rg.n) } else { uo_expr(b, cx, rg.n) }
+    let rb = if uo_rebuilds(p, g, b, cx.tab) { uo_operands_only(b, cx, rg.n) } else { uo_expr(b, cx, rg.n) }
     uo_arms(rest, cx, rb.n, [Arm(p, rg.o, rb.e), ...acc])
   }
 }
@@ -233,37 +225,31 @@ fn uo_arms(arms: [Arm], cx: UoCx, n: Int, acc: [Arm]) : UoArms = match arms {
 # An arm whose value rebuilds the shape it matched may reuse the matched
 # cell in place, and that lowering evaluates the rebuild's operands after
 # it tests the cell: they stay in it.
-fn uo_rebuilds(p: Pattern, g: Option[Expr], b: Expr) : Bool = match g {
+fn uo_rebuilds(p: Pattern, g: Option[Expr], b: Expr, tab: SymTab) : Bool = match g {
   Some(_) -> false
-  None    -> uo_rebuilds_shape(p, b)
+  None    -> uo_rebuilds_shape(p, b, tab)
 }
 
-fn uo_rebuilds_shape(p: Pattern, b: Expr) : Bool = match p.pkind {
+fn uo_rebuilds_shape(p: Pattern, b: Expr, tab: SymTab) : Bool = match p.pkind {
   PList([_], Some(_)) -> match b.kind {
     EList([ElPlain(_), ElSpread(_)]) -> true
     _ -> false
   }
-  PVariant(_, _, _)       -> uo_is_ctor_call(b)
-  PVariantRecord(_, _, _) -> uo_is_ctor_call(b)
+  PVariant(_, _)       -> uo_is_ctor_call(b, tab)
+  PVariantRecord(_, _) -> uo_is_ctor_call(b, tab)
   PRecord(_) -> match b.kind {
-    ERecordLit(_, _, _) -> true
+    ERecordLit(_, _) -> true
     _ -> false
   }
   _ -> false
 }
 
-fn uo_is_ctor_call(b: Expr) : Bool = match b.kind {
-  ECall(f, _) -> match sym_read_kind(f.kind) {
-    EName(c)        -> uo_upper(c)
-    EModCall(_, c) -> uo_upper(c)
-    _ -> false
+fn uo_is_ctor_call(b: Expr, tab: SymTab) : Bool = match b.kind {
+  ECall(f, _) -> match f.kind {
+    ESym(s, _) -> sym_is_ctor(tab, s)
+    _          -> false
   }
   _ -> false
-}
-
-fn uo_upper(c: String) : Bool = match char_at(c, 0) {
-  Some(ch) -> ch_is_upper(ch)
-  None     -> false
 }
 
 fn uo_operands_only(e: Expr, cx: UoCx, n: Int) : Anf = match anf_operands(e) {

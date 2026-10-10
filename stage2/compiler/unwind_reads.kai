@@ -6,54 +6,68 @@ call, or mention it only inside a `handle`. Every test errs toward
 
 import compiler.ast
 import compiler.util
+import compiler.local_names
 import compiler.expr_positions
 import compiler.emit_tcrec_live
-import compiler.sym_read
 import compiler.unwind_binders
 
 #[doc("The binders among `live` passed to `f` as owned-borrow arguments of `xs`: released only after the call returns, so held across it.")]
-pub fn unw_lent(f: Expr, xs: [Expr], live: [String]) : [String] = uw_lent_at(f, xs, xs, 0, live)
+pub fn unw_lent(ns: LocalNames, f: Expr, xs: [Expr], live: [LocalId]) : [LocalId] = uw_lent_at(ns, f, xs, xs, 0, live)
 
-fn uw_lent_at(f: Expr, all: [Expr], xs: [Expr], i: Int, live: [String]) : [String] = match xs {
+fn uw_lent_at(ns: LocalNames, f: Expr, all: [Expr], xs: [Expr], i: Int, live: [LocalId]) : [LocalId] = match xs {
   [] -> []
   [a, ...rest] -> {
-    let more = uw_lent_at(f, all, rest, i + 1, live)
+    let more = uw_lent_at(ns, f, all, rest, i + 1, live)
     match uw_owned_borrow_var(a) {
       Some(n) ->
-        if list_has(live, n) and not tcl_consumes(f, n) and not uw_consumed_besides(all, i, 0, n) { [n, ...more] }
+        if unw_has(live, n) and not tcl_consumes(ns, f, n) and not uw_consumed_besides(ns, all, i, 0, n) { [n, ...more] }
         else { more }
       None -> more
     }
   }
 }
 
-fn uw_owned_borrow_var(a: Expr) : Option[String] = match a.kind {
+fn uw_owned_borrow_var(a: Expr) : Option[LocalId] = match a.kind {
   ECall(g, [y]) -> match g.kind {
-    EMark(MkOwnedBorrow) -> match sym_read_kind(y.kind) {
-      EName(n) -> Some(n)
-      _       -> None
+    EMark(MkOwnedBorrow) -> match y.kind {
+      ELocal(l) -> Some(l)
+      _         -> None
     }
     _ -> None
   }
   _ -> None
 }
 
-fn uw_consumed_besides(xs: [Expr], skip: Int, i: Int, n: String) : Bool = match xs {
+fn uw_consumed_besides(ns: LocalNames, xs: [Expr], skip: Int, i: Int, n: LocalId) : Bool = match xs {
   [] -> false
-  [x, ...rest] -> (i != skip and tcl_consumes(x, n)) or uw_consumed_besides(rest, skip, i + 1, n)
+  [x, ...rest] -> (i != skip and tcl_consumes(ns, x, n)) or uw_consumed_besides(ns, rest, skip, i + 1, n)
 }
 
-#[doc("`tcl_filter` that returns `pend` itself when `e` consumes none of it.")]
-pub fn unw_filter(pend: [String], e: Expr) : [String] =
-  if uw_any_consumed(pend, e) { tcl_filter(pend, e) } else { pend }
+#[doc("`pend` without the binders `e` consumes or might consume: `pend` itself when it consumes none.")]
+pub fn unw_filter(ns: LocalNames, pend: [LocalId], e: Expr) : [LocalId] =
+  if uw_any_consumed(ns, pend, e) { uw_unconsumed(ns, pend, e) } else { pend }
 
-fn uw_any_consumed(pend: [String], e: Expr) : Bool = match pend {
+fn uw_any_consumed(ns: LocalNames, pend: [LocalId], e: Expr) : Bool = match pend {
   [] -> false
-  [p, ...rest] -> tcl_consumes(e, p) or uw_any_consumed(rest, e)
+  [p, ...rest] -> tcl_consumes(ns, e, p) or uw_any_consumed(ns, rest, e)
+}
+
+fn uw_unconsumed(ns: LocalNames, pend: [LocalId], e: Expr) : [LocalId] = match pend {
+  [] -> []
+  [p, ...rest] -> if tcl_consumes(ns, e, p) { uw_unconsumed(ns, rest, e) } else { [p, ...uw_unconsumed(ns, rest, e)] }
+}
+
+#[doc("`pend` without the binders statement `s` consumes, might consume or rebinds.")]
+pub fn unw_filter_stmt(ns: LocalNames, pend: [LocalId], s: Stmt) : [LocalId] =
+  unw_minus(uw_filter_each(ns, pend, stmt_exprs(s)), unw_stmt_binders(s))
+
+fn uw_filter_each(ns: LocalNames, pend: [LocalId], es: [Expr]) : [LocalId] = match es {
+  [] -> pend
+  [e, ...rest] -> uw_filter_each(ns, unw_filter(ns, pend, e), rest)
 }
 
 #[doc("The union of every list in `eaten` except the `i`-th.")]
-pub fn unw_others(eaten: [[String]], i: Int, j: Int) : [String] = match eaten {
+pub fn unw_others(eaten: [[LocalId]], i: Int, j: Int) : [LocalId] = match eaten {
   [] -> []
   [e, ...rest] -> if i == j { unw_others(rest, i, j + 1) } else { unw_union(e, unw_others(rest, i, j + 1)) }
 }
@@ -64,31 +78,31 @@ pub fn unw_inline(ps: [XPos]) : [Expr] = match ps {
   [XP(r, c), ...rest] -> if xrole_inline(r) { [c, ...unw_inline(rest)] } else { unw_inline(rest) }
 }
 
-#[doc("The names of `xs` mentioned only in `h`'s inline code: never in its clauses, never elsewhere in `body`, never one of `jumps`.")]
-pub fn unw_confined(xs: [String], h: Expr, jumps: [String], body: Expr) : [String] = match xs {
+#[doc("The binders of `xs` mentioned only in `h`'s inline code: never in its clauses, never elsewhere in `body`, never one of `jumps`.")]
+pub fn unw_confined(ns: LocalNames, xs: [LocalId], h: Expr, jumps: [LocalId], body: Expr) : [LocalId] = match xs {
   [] -> []
   [x, ...rest] -> {
-    let tail = unw_confined(rest, h, jumps, body)
-    let inside = uw_count(x, h, true)
-    if not list_has(jumps, x) and inside == uw_count(x, h, false) and inside == uw_count(x, body, false) {
+    let tail = unw_confined(ns, rest, h, jumps, body)
+    let inside = uw_count(ns, x, h, true)
+    if not unw_has(jumps, x) and inside == uw_count(ns, x, h, false) and inside == uw_count(ns, x, body, false) {
       [x, ...tail]
     } else { tail }
   }
 }
 
 # Mentions of `x` in `e`: reads, and interpolation spans that might read
-# it. `inline_only` skips lambda and clause bodies.
-fn uw_count(x: String, e: Expr, inline_only: Bool) : Int = match sym_read_kind(e.kind) {
-  EName(n) -> if n == x { 1 } else { 0 }
-  EStr(span, _) -> if has_interp(span, 0, string_length(span)) and tcl_span_mentions(span, x) { 1 } else { 0 }
-  _ -> uw_count_ps(x, xp_positions(e), inline_only)
+# it, which name it by its text. `inline_only` skips lambda and clause bodies.
+fn uw_count(ns: LocalNames, x: LocalId, e: Expr, inline_only: Bool) : Int = match e.kind {
+  ELocal(l) -> if local_eq(l, x) { 1 } else { 0 }
+  EStr(span, _) -> if has_interp(span, 0, string_length(span)) and tcl_span_mentions(span, ln_text(ns, x)) { 1 } else { 0 }
+  _ -> uw_count_ps(ns, x, xp_positions(e), inline_only)
 }
 
-fn uw_count_ps(x: String, ps: [XPos], inline_only: Bool) : Int = match ps {
+fn uw_count_ps(ns: LocalNames, x: LocalId, ps: [XPos], inline_only: Bool) : Int = match ps {
   [] -> 0
   [XP(r, c), ...rest] ->
-    (if inline_only and not xrole_inline(r) { 0 } else { uw_count(x, c, inline_only) })
-      + uw_count_ps(x, rest, inline_only)
+    (if inline_only and not xrole_inline(r) { 0 } else { uw_count(ns, x, c, inline_only) })
+      + uw_count_ps(ns, x, rest, inline_only)
 }
 
 #[doc("True when a call of `f` reads its operand without taking it: a dup, a borrow, a guard-fail drop.")]
