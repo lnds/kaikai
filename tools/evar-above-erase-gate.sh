@@ -49,6 +49,8 @@ SRC="$ROOT/stage2/compiler"
 #   perceus*,        — mint a binder they just bound, an RC marker
 #   unbox*,            (`__perceus_dup`, `__pcs_ret`), or a runtime
 #   cell_promote       primitive's borrow variant; never a declaration.
+#   slot_take        — the runtime primitive that moves a value out of a
+#                      private slot (`array_take`); no declaration backs it.
 #   sym_read         — the ESym→EVar reader itself.
 #   core_unstamp     — hands a core builtin to the passes that still read
 #                      it by name.
@@ -68,7 +70,7 @@ ALLOW="$ALLOW|emit_tcrec_live|cache_delta_test|resolve_sym_test"
 ALLOW="$ALLOW|perceus|perceus_plant_drop|perceus_tail_drop|perceus_owned_pos"
 ALLOW="$ALLOW|perceus_payer|unbox|unbox_native_raw|cell_promote"
 ALLOW="$ALLOW|perceus_branch_plant|index_coll|range_patterns|bang_hoist|deep_hoist|refine_coerce"
-ALLOW="$ALLOW|resume_split|resume_anf|resume_segment|resume_segment_state"
+ALLOW="$ALLOW|resume_split|resume_anf|resume_segment|resume_segment_state|slot_take"
 
 # Passes at or below the erasure. `EVar` is their correct form: the name
 # is a C symbol there, and `sym_erase` is what put it back.

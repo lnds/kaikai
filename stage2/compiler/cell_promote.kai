@@ -36,8 +36,9 @@ import compiler.desugar
 import compiler.loop_lower
 import compiler.cell_scan
 import compiler.core_builtins
+import compiler.slot_take
 
-#[doc("Promote every non-escaping scalar var slot (`array_make(1, lit)` cell) in the program to a raw local cell (`__cell_init`/`__cell_get`/`__cell_set` intrinsics).")]
+#[doc("Promote every non-escaping scalar var slot (`array_make(1, lit)` cell) in the program to a raw local cell (`__cell_init`/`__cell_get`/`__cell_set` intrinsics). A private slot that holds a reference keeps its array and hands its value to the write that refills it (`compiler.slot_take`).")]
 pub fn promote_scalar_cells(ds: [Decl]) : [Decl] = map(ds, cp_decl)
 
 #[doc("True for the cell intrinsics this pass mints (`__cell_init`, `__cell_get`, `__cell_set`).")]
@@ -100,7 +101,10 @@ fn cp_block(stmts: [Stmt], tail: Option[Expr], acc: [Stmt]) : ExprKind = match s
   [] -> EBlock(list_reverse(acc), cp_opt(tail))
   [s, ...rest] -> match cp_slot_decl(s) {
     Some(hit) -> cp_block_slot(hit, s, rest, tail, acc)
-    None      -> cp_block(rest, tail, [cp_stmt(s), ...acc])
+    None      -> match cp_boxed_slot(s, rest, tail) {
+      Some(SlotScope(rest2, tail2)) -> cp_block(rest2, tail2, [cp_stmt(s), ...acc])
+      None                          -> cp_block(rest, tail, [cp_stmt(s), ...acc])
+    }
   }
 }
 
@@ -152,17 +156,48 @@ fn cp_slot_decl(s: Stmt) : Option[CpSlot] = match s {
 }
 
 # The pure-scalar init of an `array_make(1, init)` rhs, or None.
-fn cp_one_cell_init(rhs: Expr) : Option[Expr] = match rhs.kind {
+fn cp_one_cell_init(rhs: Expr) : Option[Expr] = match cp_one_cell(rhs) {
+  Some(init) -> if cp_init_is_pure_scalar(init) { Some(init) } else { None }
+  None       -> None
+}
+
+# The init of an `array_make(1, init)` rhs, or None.
+fn cp_one_cell(rhs: Expr) : Option[Expr] = match rhs.kind {
   ECall(callee, args_) ->
     if is_builtin_ref(callee, CbArrayMake) { cp_one_cell_args(args_) } else { None }
   _ -> None
 }
 
 fn cp_one_cell_args(args_: [Expr]) : Option[Expr] = match args_ {
-  [n, init] ->
-    if cp_is_lit_one(n) and cp_init_is_pure_scalar(init) { Some(init) } else { None }
+  [n, init] -> if cp_is_lit_one(n) { Some(init) } else { None }
   _ -> None
 }
+
+# A slot that holds a reference and that nothing but whole-cell reads and
+# writes in the declaring frame can reach, none of them inside a `handle`
+# body: its scope with each write's last reads taking the slot's value.
+fn cp_boxed_slot(s: Stmt, rest: [Stmt], tail: Option[Expr]) : Option[SlotScope] = match cp_boxed_decl(s) {
+  Some(slot) -> if cp_slot_private(slot, rest, tail) { Some(take_slot_reads(slot, rest, tail)) } else { None }
+  None       -> None
+}
+
+fn cp_boxed_decl(s: Stmt) : Option[Binder] = match s {
+  SLet(pat, _, rhs) -> cp_boxed_binder(pat, cp_one_cell(rhs))
+  _                 -> None
+}
+
+fn cp_boxed_binder(pat: Pattern, init: Option[Expr]) : Option[Binder] = match init {
+  Some(i) -> if cp_ty_is_cell_scalar(i.ty) { None } else { cp_bound(pat) }
+  None    -> None
+}
+
+fn cp_bound(pat: Pattern) : Option[Binder] = match pat.pkind {
+  PBind(b) -> Some(b)
+  _        -> None
+}
+
+fn cp_slot_private(slot: Binder, stmts: [Stmt], tail: Option[Expr]) : Bool =
+  not cp_stmts_use(slot, map(stmts, (st) => cp_rw_stmt(slot, st))) and not cp_opt_uses(slot, cp_rw_opt(slot, tail))
 
 fn cp_is_lit_one(e: Expr) : Bool = match e.kind {
   EInt(1, _) -> true
@@ -252,45 +287,13 @@ fn cp_rw_loop_arg(slot: Binder, a: Expr) : Expr = match a.kind {
   _ -> cp_rw(slot, a)
 }
 
-type CpHit = CpGet(Expr) | CpSet(Expr, Expr) | CpMiss
-
 # The binder read a cell intrinsic carries: a raw read, so no pass counts
 # it as a use of the slot it replaced.
 fn cp_cell_ref(r: Expr) : Expr = Expr { ...r, ty: None, mode: MUnboxed }
 
-fn cp_getset_hit(slot: Binder, callee: Expr, args_: [Expr]) : CpHit =
-  match builtin_ref(callee) {
-    Some(CbArrayGet) -> cp_get_hit(slot, args_)
-    Some(CbArraySet) -> cp_set_hit(slot, args_)
-    _                -> CpMiss
-  }
-
-fn cp_get_hit(slot: Binder, args_: [Expr]) : CpHit = match args_ {
-  [a, i] -> if cp_cell_at_zero(slot, a, i) { CpGet(a) } else { CpMiss }
-  _      -> CpMiss
-}
-
-fn cp_set_hit(slot: Binder, args_: [Expr]) : CpHit = match args_ {
-  [a, i, v] -> if cp_cell_at_zero(slot, a, i) { CpSet(a, v) } else { CpMiss }
-  _         -> CpMiss
-}
-
-fn cp_cell_at_zero(slot: Binder, a: Expr, i: Expr) : Bool =
-  cp_is_var(a, slot) and cp_is_zero(i)
-
-fn cp_is_var(e: Expr, slot: Binder) : Bool = match e.kind {
-  ELocal(l) -> local_eq(l, slot.id)
-  _ -> false
-}
-
 fn cp_binds(bs: [Binder], slot: Binder) : Bool = match bs {
   []           -> false
   [b, ...rest] -> local_eq(b.id, slot.id) or cp_binds(rest, slot)
-}
-
-fn cp_is_zero(e: Expr) : Bool = match e.kind {
-  EInt(0, _) -> true
-  _ -> false
 }
 
 fn cp_params_bind(ps: [Param], slot: Binder) : Bool = match ps {
