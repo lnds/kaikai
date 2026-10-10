@@ -26,8 +26,7 @@
 # alias-expansion / index- and interp-desugar passes
 # (`expand_aliases_in_decls`, `expand_ta_decls`, `desugar_index_decls`,
 # `desugar_interp_decls`, `resolve_alias_cands`, the `collect_*` alias
-# scanners), the ambiguous-EFn reporter (`find_ambig_efns` /
-# `report_ambig_efns`), `report_unused_in_decls`, and
+# scanners), `report_unused_in_decls`, and
 # `mangle_core_segments`. `BuildMode` (build/test/bench/check wrapper
 # selection) moves here `pub` — `emit_program` matches on it and the
 # driver constructs it; it travels with its primary consumer.
@@ -138,6 +137,10 @@ import compiler.expr_positions
 import compiler.scope_file
 import compiler.self_call
 import compiler.symtab
+import compiler.written
+import compiler.decl_text
+import compiler.local_names
+import compiler.spec_names
 import compiler.ast_map
 import compiler.handler_alias
 
@@ -150,7 +153,7 @@ import compiler.handler_alias
 
 # Lane linus-a (Lane A of docs/stage2-quality-km-audit-2026-05-29.md):
 # the emit walker used to thread five companion arguments through every
-# recursive call — `lcs` (lexical-scope names), `fns` (the EFn registry),
+# recursive call — `lcs` (the binders in lexical scope), `fns` (the EFn registry),
 # `variants` (the EVar registry), `lams` (collected lambdas) and `cls`
 # (collected clause-infos). That data clump appeared in ~74 signatures
 # and ~250 call-sites; adding any sixth piece of emit context meant
@@ -178,8 +181,8 @@ import compiler.handler_alias
 # match (balance_left/right's rotations), which clang cannot CSE across
 # branches. Empty outside a hoisting match. See emit_hoist_subderefs.
 # `reuse_donor` carries, while emitting an arm-top-reuse body, the donor
-# cell's ctor name and its positional sub-pattern binder names (`""` for a
-# slot with no usable PBind). A TRMC step that rebuilds the SAME ctor into
+# cell's constructor and its positional sub-pattern binders (`local_none()`
+# for a slot with no usable PBind). A TRMC step that rebuilds the SAME ctor into
 # `_arm_ru` (the donated scrutinee shell) can then SKIP the store of slot i
 # when its rebuild arg is exactly the binder bound off slot i of the donor:
 # the value is already in the cell (kai_drop_reuse_token hands back the
@@ -187,27 +190,27 @@ import compiler.handler_alias
 # permuted/transformed slot) — Koka's `_con->field = ...` single-store
 # shape. None outside an arm-top-reuse body → every slot is written, the
 # prior behaviour.
-type ReuseDonor = ReuseDonor(String, [String])
+type ReuseDonor = ReuseDonor(SymId, [LocalId])
 
-# `kind1_raw` — i64-inline (Lane B): the set of binder names currently in
+# `kind1_raw` — i64-inline (Lane B): the set of binders currently in
 # scope that are bound to a kind-1 Int slot and emitted as the raw
-# `int64_t kair_<nm>` (the bind is uniform across all routes). An EVar in
-# this set reads `kair_<nm>` when MUnboxed and `kai_int(kair_<nm>)` when
+# `int64_t kair_<nm>` (the bind is uniform across all routes). A read of a
+# binder in this set is `kair_<nm>` when MUnboxed and `kai_int(kair_<nm>)` when
 # MBoxed; a store of such a binder into a kind-1 slot is the raw
 # `kair_<nm>` directly (no kai_take_int round-trip). Scoped per arm: each
 # match arm body sees its own binders; the set is set entering the body
 # and not inherited by sibling arms.
-type EmitCtx = { lcs: [String], fns: [EFn], fx: FnIndex, variants: [VariantEntry], lams: [LamInfo], cls: [ClauseInfo],
-                 regions: [RegionMark], in_region: Bool, borrowed: [String],
-                 hoisted: [Int], reuse_donor: Option[ReuseDonor], kind1_raw: [String],
+type EmitCtx = { lcs: [LocalId], fns: [EFn], fx: FnIndex, variants: [VariantEntry], lams: [LamInfo], cls: [ClauseInfo],
+                 regions: [RegionMark], in_region: Bool, borrowed: [LocalId],
+                 hoisted: [Int], reuse_donor: Option[ReuseDonor], kind1_raw: [LocalId],
                  # A const is a literal with a name. The emit catalogue
-                 # carries every top-level const so `emit_ident_value`
-                 # materialises a const read as its literal body inline —
+                 # carries every top-level const so a const read
+                 # materialises as its literal body inline —
                  # no global, no boxing, no call. Same role `fns` /
                  # `variants` play for their idents.
                  consts: [Decl],
                  # Every effect decl, so a perform / handle / default-install
-                 # site can resolve an effect name to its `module_origin` and
+                 # site can read an effect's `module_origin` and
                  # mint the module-qualified evidence name (`ev_name`). Two
                  # same-name effects from different modules thus emit and
                  # reference distinct `Ev` structs.
@@ -258,13 +261,17 @@ type EmitCtx = { lcs: [String], fns: [EFn], fx: FnIndex, variants: [VariantEntry
                  # Pending releases the tcrec goto-tail path must emit before
                  # jumping: enclosing owned match scrutinee aliases plus
                  # not-yet-consumed arm-binder increfs (emit_tcrec_live ledger).
-                 tcpend: [String],
+                 tcpend: [TclEntry],
                  # The current frame's unwind sites (unwind_pend.kai).
                  unw: UnwFrame,
                  # The program's root file basename, as tag_target_decl stamps
                  # it on the root's own `pub` decls: a root EFn carries either
                  # spelling (mo=None for non-pub, mo=Some(root_mod) for pub).
-                 root_mod: Option[String] }
+                 root_mod: Option[String],
+                 # Where a name is spelled from: a declaration's in the symbol
+                 # table, a specialisation's in the monomorphiser's table, a
+                 # local's among the binders of the declaration being emitted.
+                 tab: SymTab, specs: SpecNames, locals: LocalNames }
 
 # Install a module-rotated EFn table for a body emitted from a side
 # table (a lifted lambda, a handler clause), where there is no Decl for
@@ -274,17 +281,21 @@ type EmitCtx = { lcs: [String], fns: [EFn], fx: FnIndex, variants: [VariantEntry
 fn emit_ctx_with_fns(cx: EmitCtx, f: [EFn]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: f, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
 
-fn emit_ctx_with_lcs(cx: EmitCtx, l: [String]) : EmitCtx =
+fn emit_ctx_with_lcs(cx: EmitCtx, l: [LocalId]) : EmitCtx =
   EmitCtx { lcs: l, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
+
+# Enter a declaration: its binders spell the locals of everything emitted
+# under it.
+fn emit_ctx_with_locals(cx: EmitCtx, ns: LocalNames) : EmitCtx = EmitCtx { ...cx, locals: ns }
 
 fn emit_ctx_with_evf(cx: EmitCtx, evf: EvFrames) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
 
 # Set the enclosing-fn key (entering a fn or lambda body). `find_lam`
 # keys on this + (line, col) so a nested ELambda resolves to its own
@@ -292,34 +303,34 @@ fn emit_ctx_with_evf(cx: EmitCtx, evf: EvFrames) : EmitCtx =
 fn emit_ctx_with_enc_fn(cx: EmitCtx, ef: String) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: ef, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: ef, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
 
 # Set/clear the arena-routing flag for a region body.
 fn emit_ctx_with_in_region(cx: EmitCtx, b: Bool) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: b, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
 
 # Set the borrowed-binder set for an arm-top reuse body.
-fn emit_ctx_with_borrowed(cx: EmitCtx, b: [String]) : EmitCtx =
+fn emit_ctx_with_borrowed(cx: EmitCtx, b: [LocalId]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: b,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
 
 # Replace the tcrec pending-release ledger (entering a match arm body /
 # refining across a branch point).
 fn emit_ctx_with_unw(cx: EmitCtx, u: UnwFrame) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: u, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: u, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
 
 # The C locals among `names` that hold a boxed reference here.
-fn emit_unw_vars(names: [String], cx: EmitCtx) : [String] = emit_unw_boxed(unw_admit(cx.unw, names), cx)
+fn emit_unw_vars(names: [LocalId], cx: EmitCtx) : [String] = emit_unw_boxed(unw_admit(cx.unw, names), cx)
 
-fn emit_unw_boxed(names: [String], cx: EmitCtx) : [String] = match names {
+fn emit_unw_boxed(names: [LocalId], cx: EmitCtx) : [String] = match names {
   [] -> []
   [n, ...rest] ->
-    if list_has(cx.lcs, n) and not emit_ctx_kind1_raw_has(cx, n) { [c_local(n), ...emit_unw_boxed(rest, cx)] }
+    if locals_have(cx.lcs, n) and not emit_ctx_kind1_raw_has(cx, n) { [c_local(emit_local_text(cx, n)), ...emit_unw_boxed(rest, cx)] }
     else { emit_unw_boxed(rest, cx) }
 }
 
@@ -338,12 +349,12 @@ fn emit_unw_owning(pat: Pattern, cx: EmitCtx) : EmitCtx =
   if cx.unw.arms == [] { cx } else { emit_ctx_with_unw(cx, unw_owning(cx.unw, tcp_rc_binders(pat, cx))) }
 
 # A destructuring `let` increfs each binder it binds.
-fn emit_unw_let_owned(s: Stmt, cx: EmitCtx) : [String] = match s {
+fn emit_unw_let_owned(s: Stmt, cx: EmitCtx) : [LocalId] = match s {
   SLet(pat, _, _) -> if unw_destructured(pat) == [] { [] } else { tcp_rc_binders(pat, cx) }
   _ -> []
 }
 
-fn emit_unw_own(names: [String], cx: EmitCtx) : EmitCtx =
+fn emit_unw_own(names: [LocalId], cx: EmitCtx) : EmitCtx =
   if names == [] or cx.unw.arms == [] { cx } else { emit_ctx_with_unw(cx, unw_owning(cx.unw, names)) }
 
 # The owned scrutinee slot of a match its arms can unwind out of: the push
@@ -370,21 +381,21 @@ fn emit_unw_call(src: String, x: Expr, f: Expr, args_e: [Expr], cx: EmitCtx) : S
       let vars = emit_unw_vars(names, cx)
       match emit_unw_closure(f, cx) {
         Some(UcTransfer(n)) ->
-          euw_call_drop(emit_mark_call(src, MkApplyBorrow, [emit_unw_var(f, n), ...args_e], cx), vars, c_local(n))
+          euw_call_drop(emit_mark_call(src, MkApplyBorrow, [emit_unw_var(f, n), ...args_e], cx), vars, c_local(emit_local_text(cx, n)))
         Some(UcDup(n)) -> euw_call(emit_mark_call(src, MkApplyBorrow, [emit_unw_var(f, n), ...args_e], cx), vars)
         None -> euw_call(emit_call_expr(src, f, args_e, cx), vars)
       }
     }
   }
 
-type UnwClosure = UcTransfer(String) | UcDup(String)
+type UnwClosure = UcTransfer(LocalId) | UcDup(LocalId)
 
-fn emit_unw_closure(f: Expr, cx: EmitCtx) : Option[UnwClosure] = match sym_read_kind(f.kind) {
-  EName(n) -> if emit_unw_local(f, n, cx) { Some(UcTransfer(n)) } else { None }
+fn emit_unw_closure(f: Expr, cx: EmitCtx) : Option[UnwClosure] = match f.kind {
+  ELocal(n) -> if emit_unw_local(n, cx) { Some(UcTransfer(n)) } else { None }
   ECall(g, xs) -> match g.kind {
     EMark(MkDup) -> match xs {
-      [inner] -> match sym_read_kind(inner.kind) {
-        EName(n) -> if emit_unw_local(inner, n, cx) { Some(UcDup(n)) } else { None }
+      [inner] -> match inner.kind {
+        ELocal(n) -> if emit_unw_local(n, cx) { Some(UcDup(n)) } else { None }
         _ -> None
       }
       _ -> None
@@ -394,154 +405,96 @@ fn emit_unw_closure(f: Expr, cx: EmitCtx) : Option[UnwClosure] = match sym_read_
   _ -> None
 }
 
-fn emit_unw_local(f: Expr, n: String, cx: EmitCtx) : Bool =
-  ec_local_callee(f, n, cx) and not emit_ctx_kind1_raw_has(cx, n)
+fn emit_unw_local(n: LocalId, cx: EmitCtx) : Bool =
+  locals_have(cx.lcs, n) and not emit_ctx_kind1_raw_has(cx, n)
 
-fn emit_unw_var(f: Expr, n: String) : Expr = Expr { kind: EName(n), line: f.line, col: f.col, ty: f.ty, mode: f.mode,  site: f.site }
+fn emit_unw_var(f: Expr, n: LocalId) : Expr = Expr { kind: ELocal(n), line: f.line, col: f.col, ty: f.ty, mode: f.mode,  site: f.site }
 
-fn emit_ctx_with_tcpend(cx: EmitCtx, l: [String]) : EmitCtx =
+fn emit_ctx_with_tcpend(cx: EmitCtx, l: [TclEntry]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: l, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: l, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
 
 # Refine the ledger across an already-evaluated expression — a no-op
 # (and no scan) when the ledger is empty, the overwhelmingly common case.
 fn emit_ctx_tcpend_after(cx: EmitCtx, e: Expr) : EmitCtx = match cx.tcpend {
   [] -> cx
-  _  -> emit_ctx_with_tcpend(cx, tcl_filter(cx.tcpend, e))
+  _  -> emit_ctx_with_tcpend(cx, tcl_filter(cx.locals, cx.tcpend, e))
 }
 
 fn emit_ctx_tcpend_after_stmts(cx: EmitCtx, ss: [Stmt]) : EmitCtx = match cx.tcpend {
   [] -> cx
-  _  -> emit_ctx_with_tcpend(cx, tcl_filter_stmts(cx.tcpend, ss))
+  _  -> emit_ctx_with_tcpend(cx, tcl_filter_stmts(cx.locals, cx.tcpend, ss))
 }
 
 # Set/clear the hoisted-slot set (entering/leaving a match that hoists).
 fn emit_ctx_with_hoisted(cx: EmitCtx, h: [Int]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: h, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: h, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
 
 # Set the donation-active flag (entering/leaving a `_donor`-taking body).
 fn emit_ctx_with_rd_active(cx: EmitCtx, a: Bool) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: a, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: a, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
 
 # Set/clear the reuse-donor (entering/leaving an arm-top-reuse body).
 fn emit_ctx_with_reuse_donor(cx: EmitCtx, d: Option[ReuseDonor]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: d, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: d, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
 
-# i64-inline (Lane B): set the kind-1 raw-bound binder name set for an arm
+# i64-inline (Lane B): set the kind-1 raw-bound binder set for an arm
 # body. Entering a match arm whose pattern binds kind-1 Int slots, the
-# bind adds those names so EVar reads + slot stores in the body pick the
+# bind adds those binders so local reads + slot stores in the body pick the
 # raw `kair_<nm>` form. Replaced (not extended) per arm so sibling arms
 # and outer scopes do not see this arm's binders.
-fn emit_ctx_with_kind1_raw(cx: EmitCtx, ks: [String]) : EmitCtx =
+fn emit_ctx_with_kind1_raw(cx: EmitCtx, ks: [LocalId]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: ks, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: ks, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
 
-# True when `nm` is a kind-1 raw-bound binder in the current arm scope.
-fn emit_ctx_kind1_raw_has(cx: EmitCtx, nm: String) : Bool = list_has(cx.kind1_raw, nm)
+# True when `l` is a kind-1 raw-bound binder in the current arm scope.
+fn emit_ctx_kind1_raw_has(cx: EmitCtx, l: LocalId) : Bool = locals_have(cx.kind1_raw, l)
 
 # The top-level consts of a program, kept for `EmitCtx.consts` so a
 # const read materialises as its literal body inline.
 fn const_decls_only(decls: [Decl]) : [Decl] = match decls {
   [] -> []
   [d, ...rest] -> match d {
-    DConst(_, _, _, _, _, _, _, _) -> [d, ...const_decls_only(rest)]
+    DConst(_, _, _, _, _, _, _) -> [d, ...const_decls_only(rest)]
     _ -> const_decls_only(rest)
   }
 }
 
 # The effect decls only, for the EmitCtx `effs` catalogue an evidence-
-# naming site consults to resolve an effect's `module_origin`.
+# naming site consults to read an effect's `module_origin`.
 fn effect_decls_only(decls: [Decl]) : [Decl] = match decls {
   [] -> []
   [d, ...rest] -> match d {
-    DEffect(_, _, _, _, _, _, _, _, _) -> [d, ...effect_decls_only(rest)]
+    DEffect(_, _, _, _, _, _, _, _) -> [d, ...effect_decls_only(rest)]
     _ -> effect_decls_only(rest)
   }
 }
 
-# Resolve an effect name to its module-qualified evidence name. Prefers
-# a root-origin (None) decl on a name clash, so a local `effect Fail`
-# wins over a same-name stdlib one — the shadow the resolver already
-# chose for the row.
-fn eff_mo(effs: [Decl], name: String) : Option[String] = match effs {
+# The module that declares the effect `s`, which qualifies the name of its
+# evidence struct; None for the root's and for an effect no decl declares.
+fn eff_mo(effs: [Decl], s: SymId) : Option[String] = match effect_decl_of(s, effs) {
+  Some(DEffect(_, _, _, _, _, _, _, mo)) -> mo
+  _ -> None
+}
+
+# The literal body of the const `s` in the emit catalogue; None when `s`
+# is no top-level const.
+fn const_body_of(consts: [Decl], s: SymId) : Option[Expr] = match consts {
   [] -> None
   [d, ...rest] -> match d {
-    DEffect(_, n, _, _, _, _, _, mo, _) ->
-      if n == name {
-        match mo { None -> None  Some(_) -> eff_mo_fallback(rest, name, mo) }
-      } else { eff_mo(rest, name) }
-    _ -> eff_mo(rest, name)
+    DConst(_, cs, _, body, _, _, _) ->
+      if sym_raw(s) >= 0 and sym_same(cs, s) { Some(body) } else { const_body_of(rest, s) }
+    _ -> const_body_of(rest, s)
   }
 }
-
-# A name matched a module-qualified effect; keep scanning for a
-# root-origin (None) one, which shadows it. Falls back to the first
-# match if none is root-origin.
-fn eff_mo_fallback(effs: [Decl], name: String, found: Option[String]) : Option[String] = match effs {
-  [] -> found
-  [d, ...rest] -> match d {
-    DEffect(_, n, _, _, _, _, _, mo, _) ->
-      if n == name { match mo { None -> None  Some(_) -> eff_mo_fallback(rest, name, found) } }
-      else { eff_mo_fallback(rest, name, found) }
-    _ -> eff_mo_fallback(rest, name, found)
-  }
-}
-
-# Find a const decl's literal body by name in the emit catalogue.
-# None when `name` is not a top-level const (then it is a fn /
-# variant / local and `emit_ident_value` falls through as before).
-# A root const (no module_origin) wins over a same-named module
-# const: a bare read reaching emit belongs to the root — module
-# reads of a colliding name arrive as `EModCall` (the name_uses keying).
-fn const_body_of(consts: [Decl], name: String) : Option[Expr] =
-  match const_body_of_root(consts, name) {
-    Some(b) -> Some(b)
-    None    -> const_body_of_first(consts, name)
-  }
-
-fn const_body_of_root(consts: [Decl], name: String) : Option[Expr] = match consts {
-  [] -> None
-  [d, ...rest] -> match d {
-    DConst(_, cn, _, body, mo, _, _, _) -> match mo {
-      None -> if cn == name { Some(body) } else { const_body_of_root(rest, name) }
-      Some(_) -> const_body_of_root(rest, name)
-    }
-    _ -> const_body_of_root(rest, name)
-  }
-}
-
-fn const_body_of_first(consts: [Decl], name: String) : Option[Expr] = match consts {
-  [] -> None
-  [d, ...rest] -> match d {
-    DConst(_, cn, _, body, _, _, _, _) ->
-      if cn == name { Some(body) } else { const_body_of_first(rest, name) }
-    _ -> const_body_of_first(rest, name)
-  }
-}
-
-# The body of `<mod>`'s own const `name`; None when that module
-# declares no such const (then the qualified read falls back to the
-# name-only pick).
-fn const_body_of_home(consts: [Decl], mod: String, name: String) : Option[Expr] =
-  match consts {
-    [] -> None
-    [d, ...rest] -> match d {
-      DConst(_, cn, _, body, mo, _, _, _) -> match mo {
-        Some(m) -> if cn == name and m == mod { Some(body) }
-                   else { const_body_of_home(rest, mod, name) }
-        None -> const_body_of_home(rest, mod, name)
-      }
-      _ -> const_body_of_home(rest, mod, name)
-    }
-  }
 
 # True when a block at (line, col) is a recorded `region { }`.
 fn emit_block_is_region(cx: EmitCtx, line: Int, col: Int) : Bool =
@@ -567,7 +520,7 @@ fn emit_region_marks_has(ms: [RegionMark], line: Int, col: Int) : Bool {
 # fall back to the RC ctor when `kai_arena_current()` is NULL.
 fn ty_has_region_brand(ty: Ty) : Bool = match ty {
   TyDimT(base, _) -> match base {
-    TyCon(_, _, _, s) -> not ty_is_numeric_carrier(s)
+    TyCon(s, _) -> not ty_is_numeric_carrier(s)
     TyListT(_)        -> true
     _                 -> false
   }
@@ -639,283 +592,13 @@ fn ctor_int_slots_of(ks: [Int]) : [Bool] = map(ks, (k) => k == 1)
 # either. Aligning it here keeps the one source of truth and matches
 # `slot_kind_of`'s sentinel (a builtin-tag binder stays boxed regardless), so a
 # permit can never mark raw a slot the ctor writes boxed.
-pub fn build_ctor_int_slots(decls: [Decl]) : [CtorIntSlots] = {
-  let vs = register_variants(decls)
+pub fn build_ctor_int_slots(decls: [Decl], tab: SymTab) : [CtorIntSlots] = {
+  let vs = register_variants(decls, tab)
   map(vs, (ev) => match ev {
     EV(hm, n, _, ks, tag) ->
       if tag < user_variant_tag_base() { CIS(hm, n, map(ks, (_k) => false)) }
       else { CIS(hm, n, ctor_int_slots_of(ks)) }
   })
-}
-
-#[doc("An ambiguous EFn-resolution entry: the callee name plus the candidate module origins that conflict.")]
-pub type AmbigEntry = AmbE(String, [String])
-
-# m6.2 v2: return one AmbigEntry per name N that is exported by two
-# or more modules and has no root-file definition. Only such names
-# are ambiguous at a bare-name call site — when a root entry exists,
-# the locals-shadow-imports rule (efn_pick_root) picks the root
-# silently; when only one module exports the name, the resolution
-# is unique. Iteration is O(|fns|^2) — fine, |fns| stays in the
-# low thousands even with the full core chain loaded.
-
-# m6.2 v2: return one AmbigEntry per name N that is exported by two
-# or more modules and has no root-file definition. Only such names
-# are ambiguous at a bare-name call site — when a root entry exists,
-# the locals-shadow-imports rule (efn_pick_root) picks the root
-# silently; when only one module exports the name, the resolution
-# is unique. Iteration is O(|fns|^2) — fine, |fns| stays in the
-# low thousands even with the full core chain loaded.
-#[doc("return one AmbigEntry per name N that is exported by two or more modules and has no root-file definition. Only such names are ambiguous at a bare-name call site — when a root…")]
-pub fn find_ambig_efns(fns: [EFn], target_origin: Option[String], ids: ProtoIds) : [AmbigEntry] =
-  find_ambig_loop(fns, target_origin, ids, [], [])
-
-fn find_ambig_loop(fns: [EFn], target_origin: Option[String], ids: ProtoIds, seen: [String], acc: [AmbigEntry]) : [AmbigEntry] {
-  match fns {
-    [] -> list_reverse(acc)
-    [h, ...rest] -> match h {
-      EFn(n, _, _, _, fid) ->
-        # Protocol dispatchers are one per (op, home) by construction;
-        # the receiver picks among them, so they are never a bare-name
-        # ambiguity.
-        if list_has(seen, n) or pid_is_disp(ids, fnid_sym(fid)) {
-          find_ambig_loop(rest, target_origin, ids, seen, acc)
-        } else {
-          let cands = efn_collect_matching(fns, n, [])
-          let count = list_length(cands)
-          if count <= 1 { find_ambig_loop(rest, target_origin, ids, [n, ...seen], acc) }
-          else {
-            match efn_pick_root(cands, target_origin) {
-              Some(_) -> find_ambig_loop(rest, target_origin, ids, [n, ...seen], acc)
-              None    -> {
-                let mods = ambig_mods_of(cands, [])
-                # Issue #335: if the calling file (the target) exports
-                # this name itself, the file-local rule resolves the
-                # ambiguity inside that file's bodies — no warning.
-                if mods_contain_target(mods, target_origin) {
-                  find_ambig_loop(rest, target_origin, ids, [n, ...seen], acc)
-                } else {
-                  let entry = AmbE(n, mods)
-                  find_ambig_loop(rest, target_origin, ids, [n, ...seen], [entry, ...acc])
-                }
-              }
-            }
-          }
-        }
-    }
-  }
-}
-
-fn mods_contain_target(mods: [String], target_origin: Option[String]) : Bool =
-  match target_origin {
-    None    -> false
-    Some(m) -> list_has(mods, m)
-  }
-
-fn ambig_mods_of(cands: [EFn], acc: [String]) : [String] {
-  match cands {
-    [] -> list_reverse(acc)
-    [h, ...rest] -> match h {
-      EFn(_, _, None, _, _)    -> ambig_mods_of(rest, acc)
-      EFn(_, _, Some(m), _, _) ->
-        if list_has(acc, m) { ambig_mods_of(rest, acc) }
-        else                { ambig_mods_of(rest, [m, ...acc]) }
-    }
-  }
-}
-
-# issue #243: emit a stderr warning for each ambiguous bare-name
-# that the user's root file ACTUALLY calls without a qualifier. The
-# m6.2 v2 design fired one warning per ambiguous export regardless
-# of usage; that produced 9 spurious warnings on hello-world after
-# the core grew to two modules exporting `map`/`repeat`/etc.
-# (PR #241 retired the colliding aliases, but two-module overlaps
-# remain by design — `option.map` and `result.map` are intentionally
-# both exported). The body walk we now perform is bounded by the
-# root file's AST, not the core, so it stays cheap.
-
-# issue #243: emit a stderr warning for each ambiguous bare-name
-# that the user's root file ACTUALLY calls without a qualifier. The
-# m6.2 v2 design fired one warning per ambiguous export regardless
-# of usage; that produced 9 spurious warnings on hello-world after
-# the core grew to two modules exporting `map`/`repeat`/etc.
-# (PR #241 retired the colliding aliases, but two-module overlaps
-# remain by design — `option.map` and `result.map` are intentionally
-# both exported). The body walk we now perform is bounded by the
-# root file's AST, not the core, so it stays cheap.
-#[doc("issue #243: emit a stderr warning for each ambiguous bare-name that the user's root file ACTUALLY calls without a qualifier. The m6.2 v2 design fired one warning per ambiguous…")]
-pub fn report_ambig_efns(amb: [AmbigEntry], used: [String]) : Unit / Console = match amb {
-  [] -> ()
-  [a, ...rest] -> match a {
-    AmbE(name, mods) -> {
-      if list_has(used, name) {
-        eprint(concat_all([
-          "warning: bare name '", name,
-          "' is exported by multiple modules with no root-file shadow: ",
-          join_with(mods, ", "),
-          "; use a qualified call (e.g. ", list_head_or(mods, "<mod>"),
-          ".", name, "(...)) to disambiguate"
-        ]))
-      } else { () }
-      report_ambig_efns(rest, used)
-    }
-  }
-}
-
-# issue #243: collect the set of bare-name callees used in the root
-# file's decls. A "bare-name callee" is `ECall(callee, _)` where the
-# callee node is `EName(name)` — i.e. an unqualified function call.
-# Qualified calls (`m.f(...)`) parse as `ECall(EField(EName(m), f), _)`
-# or are rewritten to `EModCall` post-resolution; both are skipped.
-# Module-origin filtering happens at the caller (only root decls are
-# walked), so this returns the nameset for the active root file alone.
-
-# issue #243: collect the set of bare-name callees used in the root
-# file's decls. A "bare-name callee" is `ECall(callee, _)` where the
-# callee node is `EName(name)` — i.e. an unqualified function call.
-# Qualified calls (`m.f(...)`) parse as `ECall(EField(EName(m), f), _)`
-# or are rewritten to `EModCall` post-resolution; both are skipped.
-# Module-origin filtering happens at the caller (only root decls are
-# walked), so this returns the nameset for the active root file alone.
-#[doc("issue #243: collect the set of bare-name callees used in the root file's decls. A 'bare-name callee' is `ECall(callee, _)` where the callee node is `EName(name)` — i.e. an…")]
-pub fn collect_root_bare_callees(decls: [Decl], acc: [String]) : [String] = match decls {
-  []           -> acc
-  [d, ...rest] -> collect_root_bare_callees(rest, collect_root_bare_callees_decl(d, acc))
-}
-
-fn collect_root_bare_callees_decl(d: Decl, acc: [String]) : [String] = match d {
-  DFn(_, _, _, _, _, _, body, _, _, mo, fsym) -> match mo {
-    None    -> walk_bare_callees(body, acc)
-    Some(_) -> acc
-  }
-  DTest(_, body, _, _, _)        -> walk_bare_callees(body, acc)
-  DBench(_, body, _, _, _)       -> walk_bare_callees(body, acc)
-  DCheck(_, _, body, _, _, _)    -> walk_bare_callees(body, acc)
-  _ -> acc
-}
-
-fn walk_bare_callees(e: Expr, acc: [String]) : [String] = match e.kind {
-  EInt(_, _)             -> acc
-  EReal(_, _)            -> acc
-  EIntLit(_)            -> acc
-  EDecimalLit(_)        -> acc
-  EFixed(_, _)          -> acc
-  EBool(_)            -> acc
-  EChar(_)            -> acc
-  EStr(_, _)          -> acc
-  EUnit               -> acc
-  EName(_)             -> acc
-  EMark(_)             -> acc
-  ESym(_, _, _)             -> acc
-  EUnder              -> acc
-  EPlaceholder        -> acc
-  EHole(_)            -> acc
-  ETodo(_)            -> acc
-  EExternBody(_, _)   -> acc
-  EVariantsOf(_, _)   -> acc
-  EModCall(_, _)      -> acc
-  EIntrinsic(_, args_) -> walk_bare_callees_list(args_, acc)
-  ESurface(sf) -> walk_bare_callees_list(surface_children(sf), acc)
-  ECall(callee, args_) -> {
-    let acc1 = match sym_read_kind(callee.kind) {
-      EName(name) -> if list_has(acc, name) { acc } else { [name, ...acc] }
-      _          -> walk_bare_callees(callee, acc)
-    }
-    walk_bare_callees_list(args_, acc1)
-  }
-  EField(base, _)     -> walk_bare_callees(base, acc)
-  EIndex(a, b)        -> walk_bare_callees(b, walk_bare_callees(a, acc))
-  EBinop(_, a, b)     -> walk_bare_callees(b, walk_bare_callees(a, acc))
-  EUnop(_, x)         -> walk_bare_callees(x, acc)
-  EIf(c, t, eo)       -> {
-    let a1 = walk_bare_callees(t, walk_bare_callees(c, acc))
-    match eo { Some(b) -> walk_bare_callees(b, a1) None -> a1 }
-  }
-  EMatch(scr, arms)   -> walk_bare_callees_arms(arms, walk_bare_callees(scr, acc))
-  ELambda(_, body)    -> walk_bare_callees(body, acc)
-  ERecordLit(_, _, fs)   -> walk_bare_callees_fields(fs, acc)
-  EList(els)          -> walk_bare_callees_elems(els, acc)
-  ERange(a, b, opt)   -> {
-    let a1 = walk_bare_callees(b, walk_bare_callees(a, acc))
-    match opt { Some(s) -> walk_bare_callees(s, a1) None -> a1 }
-  }
-  EBlock(stmts, tail) -> {
-    let a1 = walk_bare_callees_stmts(stmts, acc)
-    match tail { Some(t) -> walk_bare_callees(t, a1) None -> a1 }
-  }
-  EPipe(a, b)         -> walk_bare_callees(b, walk_bare_callees(a, acc))
-  EMapPipe(a, b)      -> walk_bare_callees(b, walk_bare_callees(a, acc))
-  EFlatMapPipe(a, b)  -> walk_bare_callees(b, walk_bare_callees(a, acc))
-  EFilterPipe(a, b)   -> walk_bare_callees(b, walk_bare_callees(a, acc))
-  EBang(inner)        -> walk_bare_callees(inner, acc)
-  ELitUnit(inner, _)  -> walk_bare_callees(inner, acc)
-  EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
-    let a1 = walk_bare_callees(body, acc)
-    let a2 = match init_opt { Some(i) -> walk_bare_callees(i, a1) None -> a1 }
-    let a3 = walk_bare_callees_clauses(clauses, a2)
-    match ret_opt {
-      Some(r) -> match r { HR(_, b, _, _) -> walk_bare_callees(b, a3) }
-      None    -> a3
-    }
-  }
-}
-
-fn walk_bare_callees_list(es: [Expr], acc: [String]) : [String] = match es {
-  []           -> acc
-  [h, ...rest] -> walk_bare_callees_list(rest, walk_bare_callees(h, acc))
-}
-
-fn walk_bare_callees_arms(arms: [Arm], acc: [String]) : [String] = match arms {
-  []           -> acc
-  [a, ...rest] -> match a {
-    Arm(_, opt_guard, body) -> {
-      let a1 = match opt_guard { Some(g) -> walk_bare_callees(g, acc) None -> acc }
-      walk_bare_callees_arms(rest, walk_bare_callees(body, a1))
-    }
-  }
-}
-
-fn walk_bare_callees_fields(fs: [FieldInit], acc: [String]) : [String] = match fs {
-  []           -> acc
-  [f, ...rest] -> match f {
-    FI(_, e) -> walk_bare_callees_fields(rest, walk_bare_callees(e, acc))
-  }
-}
-
-fn walk_bare_callees_elems(els: [ListElem], acc: [String]) : [String] = match els {
-  []           -> acc
-  [el, ...rest] -> match el {
-    ElPlain(e)  -> walk_bare_callees_elems(rest, walk_bare_callees(e, acc))
-    ElSpread(e) -> walk_bare_callees_elems(rest, walk_bare_callees(e, acc))
-  }
-}
-
-fn walk_bare_callees_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
-  []           -> acc
-  [s, ...rest] -> match s {
-    SLet(_, _, e)        -> walk_bare_callees_stmts(rest, walk_bare_callees(e, acc))
-    SVar(_, _, e, _, _)  -> walk_bare_callees_stmts(rest, walk_bare_callees(e, acc))
-    SAssert(e, og)       -> {
-      let a1 = walk_bare_callees(e, acc)
-      let a2 = match og { Some(g) -> walk_bare_callees(g, a1) None -> a1 }
-      walk_bare_callees_stmts(rest, a2)
-    }
-    SExprStmt(e)         -> walk_bare_callees_stmts(rest, walk_bare_callees(e, acc))
-    SIndexAssign(a, b, c, _, _) -> {
-      let a1 = walk_bare_callees(c, walk_bare_callees(b, walk_bare_callees(a, acc)))
-      walk_bare_callees_stmts(rest, a1)
-    }
-    SAssign(a, c, _, _) ->
-      walk_bare_callees_stmts(rest, walk_bare_callees(c, walk_bare_callees(a, acc)))
-    SUse(_, _, _)        -> walk_bare_callees_stmts(rest, acc)
-  }
-}
-
-fn walk_bare_callees_clauses(cs: [HClause], acc: [String]) : [String] = match cs {
-  []           -> acc
-  [c, ...rest] -> match c {
-    HC(_, _, body, _, _) -> walk_bare_callees_clauses(rest, walk_bare_callees(body, acc))
-  }
 }
 
 # issue #381: warn on unused local `let` and pattern bindings.
@@ -931,18 +614,13 @@ fn walk_bare_callees_clauses(cs: [HClause], acc: [String]) : [String] = match cs
 #     The silence covers `__`-prefixed names because every desugar
 #     that synthesises locals uses that namespace.
 #
-# The walker runs post-typer / pre-monomorphise (alongside
-# `report_ambig_efns`). Running pre-mono avoids duplicate diagnostics
+# The walker runs post-typer / pre-monomorphise. Running pre-mono avoids duplicate diagnostics
 # from per-spec body copies; running post-typer means the AST has
 # already been resolved (no spurious "use" via alias names).
 #
-# Reference detection uses `fv_expr` with empty `own` and `globals`,
-# which yields the set of every free `EName(name)` reachable from the
-# sub-AST modulo scope rules already encoded in `fv_stmts_scoped`
-# (so a re-binding of `name` inside the rest correctly shadows our
-# binder for refs after the shadow). This is over-approximating in
-# the conservative direction — when in doubt we mark the binding
-# *used*, not unused.
+# Reference detection uses `fv_expr` with empty `own`, which yields every
+# local read reachable from the sub-AST: a read carries its binder's id, so
+# a re-binding of the name never takes over another binder's reads.
 
 fn name_is_silenced(name: String) : Bool {
   match char_at(name, 0) {
@@ -962,7 +640,7 @@ fn name_is_silenced(name: String) : Bool {
 # patterns (`(x, y)`, `Some(v)`) all sub-binders share the outer
 # pattern's location, which is the closest stable anchor stage 1
 # preserves.
-type UBind = UB(String, Int, Int)
+type UBind = UB(Binder, Int, Int)
 
 fn pat_ubinds(pat: Pattern, acc: [UBind]) : [UBind] {
   let line = pat.line
@@ -971,20 +649,20 @@ fn pat_ubinds(pat: Pattern, acc: [UBind]) : [UBind] {
     PWild -> acc
     PLit(_) -> acc
     PRange(_, _) -> acc
-    PBind(name) -> [UB(name, line, col), ...acc]
+    PBind(b) -> [UB(b, line, col), ...acc]
     PList(pats, opt_rest) -> {
       let acc1 = pat_ubinds_loop(pats, acc)
       match opt_rest {
-        Some(rname) -> [UB(rname, line, col), ...acc1]
+        Some(rb) -> [UB(rb, line, col), ...acc1]
         None -> acc1
       }
     }
-    PVariant(_, _, subs) -> pat_ubinds_loop(subs, acc)
-    PVariantRecord(_, _, fields) -> pfield_ubinds_loop(fields, acc)
+    PVariant(_, subs) -> pat_ubinds_loop(subs, acc)
+    PVariantRecord(_, fields) -> pfield_ubinds_loop(fields, acc)
     PRecord(fields) -> pfield_ubinds_loop(fields, acc)
     PHole(_) -> acc
-    PAs(name, sub) -> pat_ubinds(sub, [UB(name, line, col), ...acc])
-    PNarrow(name, _) -> [UB(name, line, col), ...acc]
+    PAs(b, sub) -> pat_ubinds(sub, [UB(b, line, col), ...acc])
+    PNarrow(b, _) -> [UB(b, line, col), ...acc]
     PSurface(sp) -> pat_ubinds_loop(patsurface_children(sp), acc)
   }
 }
@@ -1005,25 +683,25 @@ fn pfield_ubinds_loop(fs: [PField], acc: [UBind]) : [UBind] {
   }
 }
 
-# The binders under test enclose the code that reads them, so a handler
-# clause's alias of the same name does not take over their reads.
-fn ubind_scope(ubs: [UBind]) : NameScope = ns_shadow(ns_empty(), map(ubs, ubind_name))
+# The binders under test enclose the code that reads them: an
+# interpolation span reads one by its spelling.
+fn ubind_scope(ubs: [UBind]) : FvOuter = fv_outer_of(map(ubs, ubind_binder))
 
-fn ubind_name(u: UBind) : String = match u {
-  UB(name, _, _) -> name
+fn ubind_binder(u: UBind) : Binder = match u {
+  UB(b, _, _) -> b
 }
 
-fn report_unused_ubinds(file: String, ubs: [UBind], refs: [String]) : Unit / Console + File {
+fn report_unused_ubinds(file: String, ubs: [UBind], refs: [LocalId]) : Unit / Console + File {
 
   match ubs {
     [] -> ()
     [u, ...rest] -> match u {
-      UB(name, line, col) -> {
-        if name_is_silenced(name) { () }
-        else if list_has(refs, name) { () }
+      UB(b, line, col) -> {
+        if name_is_silenced(written_text(b.name)) { () }
+        else if locals_have(refs, b.id) { () }
         else {
           diag_warning(file, line, col,
-            concat_all(["unused binding `", name, "`"]))
+            concat_all(["unused binding `", written_text(b.name), "`"]))
           diag_help("prefix with `_` to mark as intentionally unused")
         }
         report_unused_ubinds(file, rest, refs)
@@ -1055,7 +733,7 @@ fn block_file(file: String, mods: [ModuleEntry], mo: Option[String]) : String = 
 fn report_unused_in_decl(file: String, mods: [ModuleEntry], d: Decl) : Unit / Console + File {
 
   match d {
-    DFn(_, _, _, _, _, _, body, _, _, mo, fsym) -> match mo {
+    DFn(_, _, _, _, _, _, body, _, _, mo) -> match mo {
       None    -> report_unused_in_expr(file, body)
       Some(_) -> ()
     }
@@ -1080,7 +758,9 @@ fn report_unused_in_expr(file: String, e: Expr) : Unit / Console + File {
     EUnit -> ()
     EName(_) -> ()
     EMark(_) -> ()
-    ESym(_, _, _) -> ()
+    ESym(_, _) -> ()
+    ELocal(_) -> ()
+    EOp(_) -> ()
     EUnder -> ()
     EPlaceholder -> ()
     EHole(_) -> ()
@@ -1114,7 +794,7 @@ fn report_unused_in_expr(file: String, e: Expr) : Unit / Console + File {
       report_unused_in_arms(file, arms)
     }
     ELambda(_, body) -> report_unused_in_expr(file, body)
-    ERecordLit(_, _, fs) -> report_unused_in_field_inits(file, fs)
+    ERecordLit(_, fs) -> report_unused_in_field_inits(file, fs)
     EList(els) -> report_unused_in_list_elems(file, els)
     ERange(a, b, opt) -> {
       report_unused_in_expr(file, a)
@@ -1140,7 +820,7 @@ fn report_unused_in_expr(file: String, e: Expr) : Unit / Console + File {
     }
     EBang(inner) -> report_unused_in_expr(file, inner)
     ELitUnit(inner, _) -> report_unused_in_expr(file, inner)
-    EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
       report_unused_in_expr(file, body)
       match init_opt { Some(i) -> report_unused_in_expr(file, i) None -> () }
       report_unused_in_hclauses(file, clauses)
@@ -1178,7 +858,7 @@ fn report_unused_in_arms(file: String, arms: [Arm]) : Unit / Console + File {
           Some(g) -> fv_expr(g, [], scope, [])
           None    -> []
         }
-        let refs = fv_expr(body, [], scope, refs0)
+        let refs = capture_locals(fv_expr(body, [], scope, refs0))
         report_unused_ubinds(file, ubs, refs)
         match opt_g { Some(g) -> report_unused_in_expr(file, g) None -> () }
         report_unused_in_expr(file, body)
@@ -1231,76 +911,81 @@ fn report_unused_in_hclauses(file: String, cs: [HClause]) : Unit / Console + Fil
 # Walk a block in source order. For each `SLet(pat, _, rhs)`:
 #   1. Recurse into `rhs` (its body cannot reference the pattern's
 #      binders — they aren't in scope yet).
-#   2. Compute the set of free names referenced in the rest of the
-#      block (subsequent stmts + optional tail). `fv_stmts_scoped`
-#      respects shadowing — a later `SLet` of the same name kicks
-#      that name out of `acc` for refs after the shadow point.
-#   3. Warn on any pat-binder absent from that ref set.
-
-# Walk a block in source order. For each `SLet(pat, _, rhs)`:
-#   1. Recurse into `rhs` (its body cannot reference the pattern's
-#      binders — they aren't in scope yet).
-#   2. Compute the set of free names referenced in the rest of the
-#      block (subsequent stmts + optional tail). `fv_stmts_scoped`
-#      respects shadowing — a later `SLet` of the same name kicks
-#      that name out of `acc` for refs after the shadow point.
-#   3. Warn on any pat-binder absent from that ref set.
+#   2. Compute the locals read in the rest of the block (subsequent
+#      stmts + optional tail).
+#   3. Warn on any pat-binder absent from that read set.
 fn report_unused_in_block(file: String, stmts: [Stmt], tail: Option[Expr]) : Unit / Console + File {
-  # The block's binders count as local, so a handler clause's read of a
-  # state alias one of them names is a read of that binder.
-  let scope = ns_shadow(ns_empty(), ru_binders(stmts, []))
+  let bound = ru_binders(stmts, [])
   let tail_reads = match tail {
-    Some(t) -> ru_mark(idx_empty(), fv_expr(t, [], scope, []), true)
+    Some(t) -> ru_mark(idx_empty(), capture_locals(fv_expr(t, [], fv_outer_of(bound), [])))
     None    -> idx_empty()
   }
-  ru_walk(file, stmts, ru_live_after(list_reverse(stmts), scope, idx_empty(), []), tail_reads, tail)
+  ru_walk(file, stmts, ru_live_after(list_reverse(stmts), bound, idx_empty(), []), tail_reads, tail)
 }
 
-fn ru_binders(stmts: [Stmt], acc: [String]) : [String] = match stmts {
+# The block's binders, the latest statement's first.
+fn ru_binders(stmts: [Stmt], acc: [Binder]) : [Binder] = match stmts {
   [] -> acc
   [SLet(pat, _, _), ...rest] -> ru_binders(rest, pat_bindings(pat, acc))
-  [SVar(name, _, _, _, _), ...rest] -> ru_binders(rest, [name, ...acc])
+  [SVar(b, _, _, _, _), ...rest] -> ru_binders(rest, [b, ...acc])
   [_, ...rest] -> ru_binders(rest, acc)
 }
 
-# Whether a name is read after a statement: the newest entry for it wins,
-# so a later binding of the name hides the reads beyond it.
-type RuLive = RuRead(String, Bool)
+# `bound` holds the binders of `s` and of the statements before it: those
+# before it are what `s` itself can read.
+fn ru_bound_before(s: Stmt, bound: [Binder]) : [Binder] = match s {
+  SLet(pat, _, _)     -> ru_drop(bound, list_length(pat_bindings(pat, [])))
+  SVar(_, _, _, _, _) -> ru_drop(bound, 1)
+  _                   -> bound
+}
+
+fn ru_drop(bs: [Binder], n: Int) : [Binder] =
+  if n <= 0 { bs } else { match bs {
+    []           -> []
+    [_, ...rest] -> ru_drop(rest, n - 1)
+  } }
+
+# A binder read after a statement.
+type RuLive = RuRead(LocalId)
 
 # The reads after each statement, in block order. Walking from the end,
 # the reads after a statement are its own reads plus those after the next
-# one that its binders do not hide, so the block is scanned once.
-fn ru_live_after(rev: [Stmt], scope: NameScope, live: NameIndex[RuLive],
+# one, so the block is scanned once. An interpolation span reads a binder
+# by its spelling, among the ones in scope where the span sits.
+fn ru_live_after(rev: [Stmt], bound: [Binder], live: NameIndex[RuLive],
                  acc: [NameIndex[RuLive]]) : [NameIndex[RuLive]] / Console =
   match rev {
     [] -> acc
-    [s, ...earlier] -> ru_live_after(earlier, scope, ru_step(live, scope, s), [live, ...acc])
+    [s, ...earlier] -> {
+      let before = ru_bound_before(s, bound)
+      ru_live_after(earlier, before, ru_step(live, fv_outer_of(before), s), [live, ...acc])
+    }
   }
 
-fn ru_step(live: NameIndex[RuLive], scope: NameScope, s: Stmt) : NameIndex[RuLive] / Console = match s {
-  SLet(pat, _, rhs) -> ru_mark(ru_mark(live, pat_bindings(pat, []), false), fv_expr(rhs, [], scope, []), true)
-  SVar(name, _, rhs, _, _) -> ru_mark(ru_mark(live, [name], false), fv_expr(rhs, [], scope, []), true)
-  _ -> ru_mark(live, fv_stmt(s, [], scope, []), true)
+fn ru_step(live: NameIndex[RuLive], scope: FvOuter, s: Stmt) : NameIndex[RuLive] / Console = match s {
+  SLet(_, _, rhs) -> ru_mark(live, capture_locals(fv_expr(rhs, [], scope, [])))
+  SVar(_, _, rhs, _, _) -> ru_mark(live, capture_locals(fv_expr(rhs, [], scope, [])))
+  _ -> ru_mark(live, capture_locals(fv_stmt(s, [], scope, [])))
 }
 
-fn ru_mark(live: NameIndex[RuLive], names: [String], read: Bool) : NameIndex[RuLive] = match names {
+fn ru_mark(live: NameIndex[RuLive], ls: [LocalId]) : NameIndex[RuLive] = match ls {
   [] -> live
-  [n, ...rest] -> ru_mark(idx_prepend(live, n, RuRead(n, read)), rest, read)
+  [l, ...rest] -> ru_mark(idx_prepend_local(live, l, RuRead(l)), rest)
 }
 
-# A bucket also holds the names that hash alike, so the entry is matched by name.
-fn ru_read(chain: [RuLive], nm: String) : Bool = match chain {
+# A bucket also holds the binders that hash alike, so the entry is matched by id.
+fn ru_read(chain: [RuLive], l: LocalId) : Bool = match chain {
   [] -> false
-  [RuRead(n, read), ...rest] -> if n == nm { read } else { ru_read(rest, nm) }
+  [RuRead(n), ...rest] -> local_eq(n, l) or ru_read(rest, l)
 }
 
 # The tail is checked without the block's later bindings in scope, so its
 # reads count for every binder of the block.
-fn ru_used(ubs: [UBind], live: NameIndex[RuLive], tail_reads: NameIndex[RuLive]) : [String] = match ubs {
+fn ru_used(ubs: [UBind], live: NameIndex[RuLive], tail_reads: NameIndex[RuLive]) : [LocalId] = match ubs {
   [] -> []
-  [UB(nm, _, _), ...rest] ->
-    if ru_read(idx_chain(live, nm), nm) or ru_read(idx_chain(tail_reads, nm), nm) {
-      [nm, ...ru_used(rest, live, tail_reads)]
+  [UB(b, _, _), ...rest] ->
+    if ru_read(idx_chain_local(live, b.id), b.id) or ru_read(idx_chain_local(tail_reads, b.id), b.id) {
+      [b.id, ...ru_used(rest, live, tail_reads)]
     } else {
       ru_used(rest, live, tail_reads)
     }
@@ -1347,44 +1032,19 @@ fn ru_stmt(file: String, s: Stmt, live: NameIndex[RuLive], tail_reads: NameIndex
     SUse(_, _, _) -> ()
   }
 
-fn list_head_or(xs: [String], fallback: String) : String = match xs {
-  [] -> fallback
-  [h, ..._rest] -> h
-}
-
 # ---- expression emission ----
 
-# Emit an ident used as a value (not a call target).
-#
-# `lcs` is the lexical scope at this site — the list of local
-# names currently bound by an enclosing fn param, lambda param,
-# `let` / `var`, match-arm pattern, `use` desugar, or handle
-# alias. Locals always win over a same-named top-level fn or
-# core builtin: the user wrote `let drop = 5; drop` and the
-# typer accepted it as a local read, so emit `kaiv_drop` (the C
-# variable holding the local) rather than the top-level `drop`
-# fn's closure thunk. Without this guard, `efn_find` matches the
-# top-level fn and the local read silently hands back the wrong
-# value (a closure pointer where the user expected an Int). The
-# LLVM backend has had this guard since m3d (`llvm_local_find`
-# in `llvm_emit_expr`); the C backend was missing it until m14
-# v1.x.
+# The written name of the local `l`, for the C identifiers spelled from it.
+fn emit_local_text(cx: EmitCtx, l: LocalId) : String = written_text(ln_text(cx.locals, l))
 
-# Emit an ident used as a value (not a call target).
-#
-# `lcs` is the lexical scope at this site — the list of local
-# names currently bound by an enclosing fn param, lambda param,
-# `let` / `var`, match-arm pattern, `use` desugar, or handle
-# alias. Locals always win over a same-named top-level fn or
-# core builtin: the user wrote `let drop = 5; drop` and the
-# typer accepted it as a local read, so emit `kaiv_drop` (the C
-# variable holding the local) rather than the top-level `drop`
-# fn's closure thunk. Without this guard, `efn_find` matches the
-# top-level fn and the local read silently hands back the wrong
-# value (a closure pointer where the user expected an Int). The
-# LLVM backend has had this guard since m3d (`llvm_local_find`
-# in `llvm_emit_expr`); the C backend was missing it until m14
-# v1.x.
+# The C identifier of the local `l`.
+fn c_local_of(cx: EmitCtx, l: LocalId) : String = c_local(emit_local_text(cx, l))
+
+# The name a binder is spelled with where it is declared.
+fn binder_text(b: Binder) : String = written_text(b.name)
+
+fn binder_ids(bs: [Binder]) : [LocalId] = map(bs, (b) => b.id)
+
 # A region's value leaves as a deep copy; the block still owns the value
 # itself, released after the copy (a no-op on an arena cell, which the pop
 # frees with the rest).
@@ -1396,38 +1056,17 @@ fn emit_nullary_read(row: VariantEntry) : String = match row {
   EV(_, name, _, _, tag) -> concat_all(["kai_nullary_fast(", int_to_string(tag), ", \"", name, "\")"])
 }
 
-# The arity of the constructor a bare name spells: a site no id was settled
-# for. A reference names what its id says, never a constructor of its
-# spelling.
-fn spelled_ctor_arity(variants: [VariantEntry], fid: FnId, name: String) : Option[Int] =
-  if sym_raw(fnid_sym(fid)) < 0 { evar_find(variants, name) } else { None }
-
-fn emit_ident_value(name: String, fid: FnId, fx: FnIndex, lcs: [String], fns: [EFn], variants: [VariantEntry], core_ix: CoreIx, root_mod: Option[String]) : String {
-  if sym_raw(fnid_sym(fid)) < 0 and list_has(lcs, name) { c_local(name) }
-  else { match spelled_ctor_arity(variants, fid, name) {
-    # A bare nullary ctor ident (RBLeaf, None, ...) — read the seeded
-    # singleton from kai_enum_by_tag via kai_nullary_fast (array load)
-    # instead of kai_variant_u's NOINLINE call + nullary-cache probe.
-    # This is the RBLeaf-as-RBNode-arg site: insert-into-leaf builds two
-    # per insert (13M instructions on the bench via the slow path).
-    Some(_) -> concat_all([
-      "kai_nullary_fast(", int_to_string(evar_find_tag(variants, name)),
-      ", \"", name, "\")"
-    ])
-    # A reference reaches the `fn` it resolved to, or the builtin whose
-    # row it carries: the id decides, never the spelling.
-    None -> match fnx_callee(fx, fid) {
-      Some(EFn(_, ar, mo, _, _)) ->
-        cat5("kai_closure(&", c_user_thunk_sym(c_sym(name, mo)), ", ", int_to_string(ar), ", 0, NULL)")
-      None -> match core_ix_boxed(core_ix, fnid_sym(fid)) {
-        Some(ep) -> match ep {
-          EP(_, cname, ar) ->
-            cat5("kai_closure(&_", cname, "_thunk, ", int_to_string(ar), ", 0, NULL)")
-        }
-        None -> c_local(name)
-      }
+# A function or a builtin in value position: the closure of its thunk.
+fn emit_ident_value(fid: FnId, cx: EmitCtx) : String = match fnx_callee(cx.fx, fid) {
+  Some(EFn(n, ar, mo, _, _)) ->
+    cat5("kai_closure(&", c_user_thunk_sym(c_sym(written_text(n), mo)), ", ", int_to_string(ar), ", 0, NULL)")
+  None -> match core_ix_boxed(cx.core_ix, fnid_sym(fid)) {
+    Some(ep) -> match ep {
+      EP(_, cname, ar) ->
+        cat5("kai_closure(&_", cname, "_thunk, ", int_to_string(ar), ", 0, NULL)")
     }
-  } }
+    None -> c_local(emit_fn_text(cx.tab, cx.specs, fid))
+  }
 }
 
 # Emit a raw string literal's *body* as a C string literal. For now this
@@ -1626,17 +1265,9 @@ fn emit_slot_ops(src: String, args_e: [Expr], cx: EmitCtx) : SeqOps / Console =
 fn arg_str_as_slot(arg_str: String) : String =
   string_concat("{.ptr = ", string_concat(arg_str, "}"))
 
-# The home a constructor QUALIFIER denotes, or None when it denotes no
-# module. `m.Ctor` names a module, and the pattern form carries the same
-# spelling, so both sides of a match agree. The typer also rewrites an
-# ambiguous bare ctor to `EModCall(<type>, Ctor)`; that names the type,
-# has no pattern counterpart, and so denotes no home.
-fn ctor_qual_home(cx: EmitCtx, qual: String, ctor: String) : Option[String] =
-  evar_qual_home(cx.variants, qual, ctor)
-
-fn emit_variant_call(home: Option[String], name: String, n_args: Int,
+fn emit_variant_call(tag: Int, name: String, n_args: Int,
                         slots: SeqOps, cx: EmitCtx) : String {
-  let tag_str = int_to_string(evar_find_tag_arity(cx.variants, home, name, n_args))
+  let tag_str = int_to_string(tag)
   if n_args == 0 {
     concat_all(["kai_variant_u(", tag_str, ", \"", name, "\", 0, 0, NULL)"])
   } else {
@@ -1711,30 +1342,30 @@ fn mono_ctor_fields(ks: [Int], i: Int) : String = match ks {
 # Emit one constructor struct: the base prefix followed by flat fields.
 # Nullary constructors get no struct (they are immediate enum tags,
 # like Koka's `kk_datatype_from_tag`); only payload-carrying ctors do.
-fn mono_ctor_struct(tyname: String, mo: Option[String], v: Variant, vs: [VariantEntry]) : String = match v {
-  Var(cname, tys) ->
+fn mono_ctor_struct(tyname: String, v: Variant, tab: SymTab, ctors: CtorIx) : String = match v {
+  Var(c, tys) ->
     if list_length(tys) == 0 { "" }
     else { concat_all([
-      "struct kaiu_ty_", tyname, "__", cname, " {\n",
+      "struct kaiu_ty_", tyname, "__", written_text(decl_name(tab, c)), " {\n",
       "  struct kaiu_ty_", tyname, " _base;\n",
-      mono_ctor_fields(mono_ctor_kinds(vs, mo, cname, tys), 0),
+      mono_ctor_fields(mono_ctor_kinds(ctors, c, tys), 0),
       "};\n"
     ]) }
 }
 
-# A ctor the variant table does not hold under this home (a name a
+# A ctor the variant table lays out no row of this arity for (a name a
 # builtin claims) lays every field as a pointer.
-fn mono_ctor_kinds(vs: [VariantEntry], mo: Option[String], cname: String, tys: [TypeExpr]) : [Int] =
-  match evar_slot_kinds_arity(vs, mo, cname, list_length(tys)) {
-    Some(ks) -> ks
-    None     -> map(tys, (_t) => 0)
+fn mono_ctor_kinds(ctors: CtorIx, c: SymId, tys: [TypeExpr]) : [Int] =
+  match ctor_ix_row(ctors, c) {
+    Some(EV(_, _, ar, ks, _)) -> if ar == list_length(tys) { ks } else { map(tys, (_t) => 0) }
+    None                      -> map(tys, (_t) => 0)
   }
 
-fn mono_ctor_structs(tyname: String, mo: Option[String], ctors: [Variant], vs: [VariantEntry]) : String = match ctors {
+fn mono_ctor_structs(tyname: String, vs: [Variant], tab: SymTab, ctors: CtorIx) : String = match vs {
   [] -> ""
   [v, ...rest] -> concat_all([
-    mono_ctor_struct(tyname, mo, v, vs),
-    mono_ctor_structs(tyname, mo, rest, vs)
+    mono_ctor_struct(tyname, v, tab, ctors),
+    mono_ctor_structs(tyname, rest, tab, ctors)
   ])
 }
 
@@ -1746,11 +1377,11 @@ fn mono_ctor_structs(tyname: String, mo: Option[String], ctors: [Variant], vs: [
 # colliding on `struct kaiu_ty_NB_FragR` (a clang redefinition).
 # `srcname` is the unqualified name, used only in the diff comment so
 # it still reads as `type NB_FragR`.
-fn mono_sum_decl(tyname: String, srcname: String, mo: Option[String], ctors: [Variant], vs: [VariantEntry]) : String =
+fn mono_sum_decl(tyname: String, srcname: String, vs: [Variant], tab: SymTab, ctors: CtorIx) : String =
   concat_all([
     "/* monomorphic node repr for `type ", srcname, "` (Koka mould) */\n",
     "struct kaiu_ty_", tyname, " { int32_t rc; int32_t tag; };\n",
-    mono_ctor_structs(tyname, mo, ctors, vs)
+    mono_ctor_structs(tyname, vs, tab, ctors)
   ])
 
 # Walk all decls and emit the flat struct declarations for every
@@ -1760,17 +1391,20 @@ fn mono_sum_decl(tyname: String, srcname: String, mo: Option[String], ctors: [Va
 # `c_sym(name, mo)` — the same module-qualifier the function symbols
 # use (`kai_regexp__rx_ok`) — so homonymous types from different
 # modules never collide on the same C struct name.
-pub fn mono_sum_decls(decls: [Decl], vs: [VariantEntry]) : String = match decls {
+pub fn mono_sum_decls(decls: [Decl], tab: SymTab, ctors: CtorIx) : String = match decls {
   [] -> ""
   [d, ...rest] -> {
     let here = match d {
-      DType(_, name, _, body, _, _, mo, _, _) -> match body {
-        TBSum(ctors) -> mono_sum_decl(c_sym(name, mo), name, mo, ctors, vs)
+      DType(_, ts, _, body, _, _, mo, _) -> match body {
+        TBSum(vs) -> {
+          let name = written_text(decl_name(tab, ts))
+          mono_sum_decl(c_sym(name, mo), name, vs, tab, ctors)
+        }
         _ -> ""
       }
       _ -> ""
     }
-    concat_all([here, mono_sum_decls(rest, vs)])
+    concat_all([here, mono_sum_decls(rest, tab, ctors)])
   }
 }
 
@@ -1793,9 +1427,7 @@ pub fn mono_sum_decls(decls: [Decl], vs: [VariantEntry]) : String = match decls 
 # Ints survive the decref because their rc is pinned at INT32_MAX.
 # If `e` is a nullary-constructor literal (`Red`, `Black`, …), return its
 # immediate variant tag. A nullary ctor surfaces either as a reference
-# or as a zero-arg call of one. A reference by id answers from its row; a
-# bare name resolves through `evar_find_tag_opt`, which returns None for
-# anything that is not a known ctor name.
+# or as a zero-arg call of one, and answers from its row.
 fn nullary_ctor_tag(e: Expr, cx: EmitCtx) : Option[Int] = match e.kind {
   ECall(callee, args_) -> match args_ {
     [] -> ctor_ref_tag(callee, cx)
@@ -1804,13 +1436,9 @@ fn nullary_ctor_tag(e: Expr, cx: EmitCtx) : Option[Int] = match e.kind {
   _ -> ctor_ref_tag(e, cx)
 }
 
-fn ctor_ref_tag(e: Expr, cx: EmitCtx) : Option[Int] = match e.kind {
-  ESym(s, _, _) -> match ctor_ix_row(cx.ctor_ix, s) {
-    Some(row) -> Some(ctor_row_tag(row))
-    None      -> None
-  }
-  EName(nm) -> evar_find_tag_opt(cx.variants, nm)
-  _        -> None
+fn ctor_ref_tag(e: Expr, cx: EmitCtx) : Option[Int] = match ctor_ix_site(cx.ctor_ix, e) {
+  Some(row) -> Some(ctor_row_tag(row))
+  None      -> None
 }
 
 # i64-inline (Lane B): emit the RAW int64 form to store into a kind-1 Int
@@ -1825,8 +1453,8 @@ fn ctor_ref_tag(e: Expr, cx: EmitCtx) : Option[Int] = match e.kind {
 # it desugars it correctly — no tagged value ever lands raw in `.i64`.
 fn store_raw_int(src: String, e: Expr, cx: EmitCtx) : String / Console {
   match e.kind {
-    EName(nm) ->
-      if emit_ctx_kind1_raw_has(cx, nm) { concat_all(["kair_", nm]) }
+    ELocal(l) ->
+      if emit_ctx_kind1_raw_has(cx, l) { concat_all(["kair_", emit_local_text(cx, l)]) }
       else { match e.mode { MUnboxed -> emit_expr_raw(src, e, cx) _ -> concat_all(["kai_take_int(", emit_expr(src, e, cx), ")"]) } }
     _ -> match e.mode { MUnboxed -> emit_expr_raw(src, e, cx) _ -> concat_all(["kai_take_int(", emit_expr(src, e, cx), ")"]) }
   }
@@ -1911,13 +1539,13 @@ fn variant_slot_inits(refs: [String], fields: [String]) : [String] = match refs 
 # at least one primitive payload slot, emit `kai_variant_u` with a
 # typed slot literal and a populated mask. Otherwise return None so
 # the caller falls back to the legacy `kai_variant` path.
-fn emit_variant_call_typed(home: Option[String], name: String, args_e: [Expr],
+fn emit_variant_call_typed(tag: Int, name: String, args_e: [Expr],
                            tys: [Int], src: String, cx: EmitCtx) : Option[String] / Console {
   if variant_has_primitive_slot(tys) {
     let n = list_length(args_e)
     let mask = variant_slot_mask(tys)
     let slots = emit_variant_slot_init_list(src, args_e, tys, cx)
-    let tag_str = int_to_string(evar_find_tag_arity(cx.variants, home, name, n))
+    let tag_str = int_to_string(tag)
     # Outside a region, a primitive-slot ctor goes through the inlined
     # `kai_variant_u_fast(tag, n, slots)`: alloc + slot stores only. Its
     # tag→name/mask is registered once at startup (kai_register_payload_
@@ -1942,8 +1570,8 @@ fn emit_variant_call_typed(home: Option[String], name: String, args_e: [Expr],
   }
 }
 
-# Lower a reuse-variant rebuild given the constructor's home and name +
-# arg expressions; a spelled callee names no home. Typed-payload ctors
+# Lower a reuse-variant rebuild given the constructor's row + arg
+# expressions. Typed-payload ctors
 # (issue #440) still route to the
 # alloc-fresh `kai_variant_u`: `kai_reuse_or_alloc_variant` writes
 # `slots[i].ptr` and assumes `slot_mask == 0`, which would mismatch
@@ -1953,10 +1581,10 @@ fn emit_variant_call_typed(home: Option[String], name: String, args_e: [Expr],
 # fresh cell in the current arena. Mirrors the two `emit_variant_call_typed`
 # shapes — typed slots + mask when the variant has a primitive payload,
 # boxed slots otherwise — but always `kai_arena_variant`.
-fn emit_arena_variant_rebuild(src: String, home: Option[String], cname: String, cargs: [Expr], n: Int,
+fn emit_arena_variant_rebuild(src: String, tag: Int, cname: String, cargs: [Expr], n: Int,
                               tys_opt: Option[[Int]], has_prim: Bool,
                               cx: EmitCtx) : String / Console {
-  let tag_str = int_to_string(evar_find_tag_arity(cx.variants, home, cname, n))
+  let tag_str = int_to_string(tag)
   if has_prim {
     match tys_opt {
       Some(ts) -> {
@@ -1978,10 +1606,11 @@ fn emit_arena_variant_rebuild(src: String, home: Option[String], cname: String, 
   }
 }
 
-fn emit_reuse_variant_body(src: String, home: Option[String], cname: String, cargs: [Expr],
-                           cx: EmitCtx) : String / Console {
+fn emit_reuse_variant_body(src: String, row: VariantEntry, cargs: [Expr],
+                           cx: EmitCtx) : String / Console { match row { EV(_, cname, ar, ks, tag) -> {
   let n = list_length(cargs)
-  let tys_opt = evar_slot_kinds_arity(cx.variants, home, cname, n)
+  let tys_opt = if ar == n { Some(ks) } else { None }
+  let tag_str = int_to_string(tag)
   let has_prim = match tys_opt {
     Some(ts) -> variant_has_primitive_slot(ts)
     None     -> false
@@ -1993,13 +1622,12 @@ fn emit_reuse_variant_body(src: String, home: Option[String], cname: String, car
   # `kai_variant_reuse_at` / `kai_reuse_or_alloc_variant`, both of which
   # target the RC heap.
   if cx.in_region {
-    emit_arena_variant_rebuild(src, home, cname, cargs, n, tys_opt, has_prim, cx)
+    emit_arena_variant_rebuild(src, tag, cname, cargs, n, tys_opt, has_prim, cx)
   } else if has_prim {
     match tys_opt {
       Some(ts) -> {
         let mask = variant_slot_mask(ts)
         let slots = emit_variant_slot_init_list(src, cargs, ts, cx)
-        let tag_str = int_to_string(evar_find_tag_arity(cx.variants, home, cname, n))
         # Koka reuse-in-place for typed cells too (the rb-tree's RBNode
         # carries Int slots). kai_variant_reuse_at donates the consumed
         # match scrutinee `_scr` when unique (move semantics), else
@@ -2015,21 +1643,19 @@ fn emit_reuse_variant_body(src: String, home: Option[String], cname: String, car
       None -> emit_mark_bad(MkReuseVariant, "typed lookup vanished")
     }
   } else if n == 0 {
-    let tag_str = int_to_string(evar_find_tag_arity(cx.variants, home, cname, n))
     concat_all([
       "kai_reuse_or_alloc_variant(_scr, ", tag_str, ", \"", cname,
       "\", 0, 0, NULL)"
     ])
   } else {
     let slots = emit_slot_ops(src, cargs, cx)
-    let tag_str = int_to_string(evar_find_tag_arity(cx.variants, home, cname, n))
     seq_wrap(slots, concat_all([
       "kai_reuse_or_alloc_variant(_scr, ", tag_str, ", \"", cname,
       "\", ", int_to_string(n),
       ", 0, (KaiVarSlot[]){", seq_joined(slots), "})"
     ]))
   }
-}
+} } }
 
 fn emit_call_expr(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console =
   match f.kind {
@@ -2119,7 +1745,7 @@ fn emit_reuse_cons_call(src: String, m: Mark, args_e: [Expr], cx: EmitCtx) : Str
 fn emit_reuse_record_call(src: String, m: Mark, args_e: [Expr], cx: EmitCtx) : String / Console =
   match args_e {
     [_scr, lit] -> match lit.kind {
-      ERecordLit(_, _rec_name, fis) -> {
+      ERecordLit(_, fis) -> {
         let n = list_length(fis)
         let vals  = seq_operands(map(fis, (fi) => emit_field_init_val(src, fi, cx)))
         let names = join_with(map(fis, emit_field_init_name), ", ")
@@ -2136,22 +1762,13 @@ fn emit_reuse_record_call(src: String, m: Mark, args_e: [Expr], cx: EmitCtx) : S
   }
 
 # Reuse-in-place for a variant cell: `(scr, Ctor(args...))` where the
-# second arg is a constructor call of the same arity. The ctor arrives by
-# id, or spelled where no id was settled: bare, or as
-# `EModCall(tycon, cname)`. All lower through `emit_reuse_variant_body`.
+# second arg is a constructor call of the same arity.
 fn emit_reuse_variant_call(src: String, m: Mark, args_e: [Expr], cx: EmitCtx) : String / Console =
   match args_e {
     [_scr, ctor] -> match ctor.kind {
-      ECall(cf, cargs) -> match cf.kind {
-        ESym(s, _, _) -> match ctor_ix_row(cx.ctor_ix, s) {
-          Some(EV(home, cname, _, _, _)) -> emit_reuse_variant_body(src, home, cname, cargs, cx)
-          None -> emit_mark_bad(m, "2nd arg must be a variant constructor call")
-        }
-        EName(cname) ->
-          emit_reuse_variant_body(src, None, cname, cargs, cx)
-        EModCall(_mod, cname) ->
-          emit_reuse_variant_body(src, None, cname, cargs, cx)
-        _ -> emit_mark_bad(m, "2nd arg must be a variant constructor call")
+      ECall(cf, cargs) -> match ctor_ix_site(cx.ctor_ix, cf) {
+        Some(row) -> emit_reuse_variant_body(src, row, cargs, cx)
+        None      -> emit_mark_bad(m, "2nd arg must be a variant constructor call")
       }
       _ -> emit_mark_bad(m, "2nd arg must be a variant constructor call")
     }
@@ -2177,9 +1794,8 @@ fn emit_call_expr_named(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Str
   # so the boxed-context caller still sees a `KaiValue *`. This
   # short-circuits the regular dispatch chain (variant / core /
   # closure-thunk fallback) because UFns are exclusively
-  # user-declared top-level fns and cannot be overridden by an
-  # `lcs` shadow with the same name (a let-bound closure shadowing
-  # a UFn keeps the boxed call site — `lcs.has(name)` test wins).
+  # user-declared top-level fns: a let-bound closure is a local
+  # read, whatever it is named, and keeps the boxed call site.
   # Vec raw fuse: `vec_push(v, Rec{..})` / `vec_set(v, i, Rec{..})` on
   # an inline-record carrier move the unpacked scalar fields straight
   # into the buffer — the record is never allocated. The uniqueness
@@ -2216,12 +1832,11 @@ fn emit_owned_borrow_inner(a: Expr) : Expr = match a.kind {
 
 # `({ KaiValue *kaiv_bcN = <clo>; ...; KaiValue *_bcr = <call with kaiv_bcN>;
 #     kai_decref(kaiv_bcN); ...; _bcr; })`. Each `__perceus_owned_borrow` arg
-# is materialised into a temp `bcN` (added to `lcs` so its `EVar` re-emits
-# as the raw `kaiv_bcN` local), the call runs borrowing them, then each temp
-# is dropped — the birth ref the callee did not consume.
+# is materialised into a temp `bcN` (a binder minted under that key, so its
+# read re-emits as the `kaiv_bcN` local), the call runs borrowing them, then
+# each temp is dropped — the birth ref the callee did not consume.
 fn emit_call_with_owned_borrow_drops(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
-  let names = emit_ob_names(args_e, 0)
-  let hold = emit_ob_hold(f, args_e, emit_ctx_with_lcs(cx, list_append(cx.lcs, names)))
+  let hold = emit_ob_hold(f, args_e, emit_ctx_declaring(cx, emit_ob_names(args_e, 0)))
   let binds = emit_ob_binds(src, args_e, 0, cx)
   let call_args = emit_ob_rewrite_args(args_e, 0)
   let call = match emit_ufn_boxed_call(src, f, call_args, hold.cx) {
@@ -2274,14 +1889,13 @@ fn emit_ob_binds(src: String, args_e: [Expr], i: Int, cx: EmitCtx) : String / Co
   }
 }
 
-# Replace each `__perceus_owned_borrow(g)` arg with a bare `EName("bcN")`
-# referencing its temp; leave the rest untouched. (`bcN` is in `lcs` for the
-# re-emit, so it prints as `kaiv_bcN`.)
+# Replace each `__perceus_owned_borrow(g)` arg with a read of its temp
+# `bcN`; leave the rest untouched.
 fn emit_ob_rewrite_args(args_e: [Expr], i: Int) : [Expr] = match args_e {
   []           -> []
   [a, ...rest] -> {
     let a2 = if emit_is_owned_borrow(a) {
-               Expr { kind: EName(concat_all(["bc", int_to_string(i)])),
+               Expr { kind: ELocal(local_minted(concat_all(["bc", int_to_string(i)]))),
                       line: a.line, col: a.col, ty: a.ty, mode: a.mode,  site: a.site }
              } else { a }
     [a2, ...emit_ob_rewrite_args(rest, i + 1)]
@@ -2307,33 +1921,16 @@ fn emit_ob_drops(args_e: [Expr], i: Int) : String = match args_e {
 # (`kai_<T>(callee(raw_args))`). Returns None when the callee
 # does not resolve to a UFn; the caller falls back to the
 # original boxed-only dispatch.
-fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option[String] / Console {
-
-  match sym_read_kind(f.kind) {
-    EName(callee) ->
-      if ec_local_callee(f, callee, cx) { None }
-      else { match ec_callee(cx, ec_callee_sym(f), callee) {
-        Some(EFn(_, _, mo, Some(US(ptys, rt, mask)), _)) -> {
-          let raw_call = emit_user_call_seq(c_sym(callee, mo), emit_arg_vals_masked(src, args_e, mask, ptys, cx), cx)
-          Some(ufn_call_result(rt, raw_call))
-        }
-        _ -> None
-      } }
-    EModCall(mod, fname) -> match fnx_ufn_sig_first(cx.fx, fname, Some(mod)) {
-      Some(US(ptys, rt, mask)) -> {
-        let raw_call = emit_user_call_seq(c_sym(fname, Some(mod)), emit_arg_vals_masked(src, args_e, mask, ptys, cx), cx)
-        Some(ufn_call_result(rt, raw_call))
-      }
-      None -> None
+fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option[String] / Console =
+  match fnx_callee(cx.fx, ec_callee_sym(f)) {
+    Some(EFn(n, _, mo, Some(US(ptys, rt, mask)), _)) -> {
+      let raw_call = emit_user_call_seq(c_sym(written_text(n), mo), emit_arg_vals_masked(src, args_e, mask, ptys, cx), cx)
+      Some(ufn_call_result(rt, raw_call))
     }
     _ -> None
   }
-}
 
 
-# The identity a callee carries, or none when the reference was never
-# stamped. Read before the kind is normalised to a spelling, so the
-# lookup can answer by declaration rather than by name.
 # A raw-core C-API call yields a raw scalar (a `void *` handle, `int64_t`
 # or unit), so it is emitted inline with per-param-marshalled args, never
 # a boxed round-trip that would read a `void *` as an Int.
@@ -2342,9 +1939,6 @@ fn emit_raw_rcore(src: String, callee_e: Expr, args_e: [Expr], cx: EmitCtx) : Op
     Some(RP(_, cname, ptys, _)) -> Some(emit_rcore_call(src, cname, ptys, args_e, cx))
     None                        -> None
   }
-
-# The fn a call reaches; a bare name reaches none.
-fn ec_callee(cx: EmitCtx, fid: FnId, name: String) : Option[EFn] = fnx_callee(cx.fx, fid)
 
 fn ec_unit_coercion(f: Expr) : Bool = match builtin_ref(f) {
   Some(b) -> builtin_is_unit_coercion(b)
@@ -2356,69 +1950,92 @@ fn ec_declared(cx: EmitCtx, f: Expr) : Bool = match fnx_of_sym(cx.fx, ec_callee_
   None    -> false
 }
 
-# A resolved callee names a declaration, never a binder, even where a
-# binder in scope shares its spelling.
-fn ec_local_callee(f: Expr, callee: String, cx: EmitCtx) : Bool =
-  sym_raw(fnid_sym(ec_callee_sym(f))) < 0 and list_has(cx.lcs, callee)
-
+# The function a callee references, none for any other callee.
 fn ec_callee_sym(f: Expr) : FnId = match f.kind {
-  ESym(s, inst, _) -> FnId(s, inst)
-  _                -> fnid_none()
+  ESym(s, inst) -> FnId(s, inst)
+  _             -> fnid_none()
 }
-
-# The slot kinds of the constructor a bare callee spells, for a site no
-# id was settled for.
-fn spelled_ctor_kinds(cx: EmitCtx, f: Expr, callee: String, arity: Int) : Option[[Int]] =
-  if sym_raw(fnid_sym(ec_callee_sym(f))) < 0 { evar_slot_kinds_arity(cx.variants, None, callee, arity) } else { None }
 
 # A callee that references a constructor builds the cell its row lays out.
 fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console =
   match ctor_ix_site(cx.ctor_ix, f) {
     Some(row) -> emit_ctor_call(src, row, args_e, cx)
-    None      -> emit_call_expr_spelled(src, f, args_e, cx)
+    None      -> emit_callee_call(src, f, args_e, cx)
   }
 
 # Typed slots where the row has a primitive one, boxed slots otherwise.
 fn emit_ctor_call(src: String, row: VariantEntry, args_e: [Expr], cx: EmitCtx) : String / Console = match row {
-  EV(home, name, _, tys, _) -> match emit_variant_call_typed(home, name, args_e, tys, src, cx) {
+  EV(_, name, _, tys, tag) -> match emit_variant_call_typed(tag, name, args_e, tys, src, cx) {
     Some(s) -> s
-    None    -> emit_variant_call(home, name, list_length(args_e), emit_slot_ops(src, args_e, cx), cx)
+    None    -> emit_variant_call(tag, name, list_length(args_e), emit_slot_ops(src, args_e, cx), cx)
   }
 }
 
-fn emit_call_expr_spelled(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
+# m7a #6d: `resume(v)` lowers to a runtime call that performs
+# the one-shot status check, flips the status, and tail-calls
+# the continuation's `fn` (currently kai_cont_identity, until
+# the full CPS transform reifies the rest of the caller's
+# body). Doc C §*resume representation*.
+fn emit_resume_call(src: String, args_e: [Expr], cx: EmitCtx) : String / Console =
+  match args_e {
+    [a] -> concat_all([
+      "kai_cont_resume(k, ", emit_expr(src, a, cx), ")"
+    ])
+    # 2-arg resume `resume(v, new_state)`: the Ev owns its state, so
+    # the new state replaces the old one, which is released only
+    # after `ns` is evaluated (it may be built from `state`).
+    [a, ns] -> concat_all([
+      "({ KaiValue *_rv = ", emit_expr(src, a, cx),
+      "; KaiValue *_os = self->state; self->state = ", emit_expr(src, ns, cx),
+      "; kai_decref(_os); kai_cont_resume(k, _rv); })"
+    ])
+    _   -> "kai_unit() /* resume: arity mismatch (expected 1 or 2 args) */"
+  }
+
+# A local in callee position holds a closure, or is the clause's
+# continuation.
+fn emit_local_call(src: String, l: LocalId, args_e: [Expr], cx: EmitCtx) : String / Console =
+  if local_eq(l, local_minted(canonical_continuation())) { emit_resume_call(src, args_e, cx) }
+  else { emit_apply_seq("kai_apply(", c_local_of(cx, l), emit_arg_vals(src, args_e, cx)) }
+
+# A callee no pass resolved: only an interpolation fragment parsed at emit
+# time spells one. It names the binder in scope of that spelling, else the
+# continuation, else a constructor, else the C local of the name. This is
+# the one place a callee is looked up by name.
+fn emit_spelled_call(src: String, callee: String, args_e: [Expr], cx: EmitCtx) : String / Console =
+  match emit_scope_spelled(cx, callee) {
+    Some(l) -> emit_local_call(src, l, args_e, cx)
+    None ->
+      if callee == canonical_continuation() { emit_resume_call(src, args_e, cx) }
+      else { match evar_find(cx.variants, callee) {
+        Some(_) -> emit_spelled_ctor_call(src, callee, args_e, cx)
+        None    -> emit_apply_seq("kai_apply(", c_local(callee), emit_arg_vals(src, args_e, cx))
+      } }
+  }
+
+fn emit_spelled_ctor_call(src: String, name: String, args_e: [Expr], cx: EmitCtx) : String / Console = {
+  let n = list_length(args_e)
+  let tag = evar_find_tag_arity(cx.variants, None, name, n)
+  let typed = match evar_slot_kinds_arity(cx.variants, None, name, n) {
+    Some(tys) -> emit_variant_call_typed(tag, name, args_e, tys, src, cx)
+    None      -> None
+  }
+  match typed {
+    Some(s) -> s
+    None    -> emit_variant_call(tag, name, n, emit_slot_ops(src, args_e, cx), cx)
+  }
+}
+
+fn emit_callee_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
   # Each branch emits the arguments it needs itself: emitting them up front
   # for a branch that spells them its own way emits every nested argument
   # twice per level, which is exponential in the nesting depth.
-  # The emitter spells a C identifier from the name, and a resolved
-  # reference carries the same one, so the two shapes share this whole
-  # dispatch rather than duplicating it.
-  match sym_read_kind(f.kind) {
-    EName(callee) -> {
-      # m7a #6d: `resume(v)` lowers to a runtime call that performs
-      # the one-shot status check, flips the status, and tail-calls
-      # the continuation's `fn` (currently kai_cont_identity, until
-      # the full CPS transform reifies the rest of the caller's
-      # body). Doc C §*resume representation*.
-      # A reference stamped to a declared fn calls it, whatever builtin
-      # or intrinsic shares its name.
+  match f.kind {
+    ESym(s, inst) -> {
+      # A reference to a declared fn calls it, whatever builtin
+      # or intrinsic shares its row.
       if ec_declared(cx, f) {
-        emit_named_call_lookup(src, callee, ec_callee_sym(f), args_e, cx)
-      } else if callee == canonical_continuation() {
-        match args_e {
-          [a] -> concat_all([
-            "kai_cont_resume(k, ", emit_expr(src, a, cx), ")"
-          ])
-          # 2-arg resume `resume(v, new_state)`: the Ev owns its state, so
-          # the new state replaces the old one, which is released only
-          # after `ns` is evaluated (it may be built from `state`).
-          [a, ns] -> concat_all([
-            "({ KaiValue *_rv = ", emit_expr(src, a, cx),
-            "; KaiValue *_os = self->state; self->state = ", emit_expr(src, ns, cx),
-            "; kai_decref(_os); kai_cont_resume(k, _rv); })"
-          ])
-          _   -> "kai_unit() /* resume: arity mismatch (expected 1 or 2 args) */"
-        }
+        emit_sym_call(src, FnId(s, inst), args_e, cx)
       } else if ec_unit_coercion(f) {
         # typer-internal unit erasure/tagging (`Real<u>` -> `Real`,
         # `Decimal` <-> `Decimal<c>`). At runtime all three are
@@ -2583,7 +2200,11 @@ fn emit_call_expr_spelled(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _ -> "kai_unit() /* bit_toggle: expected 2 args */"
         }
-      } else if string_contains_dot(callee) {
+      } else {
+        emit_sym_call(src, FnId(s, inst), args_e, cx)
+      }
+    }
+    EOp(r) -> {
         # m7a #6c/#6d/#6e: op call `Eff.op(args)`. Look up the
         # innermost EvEff node, allocate a KaiCont on the stack
         # (identity continuation for one-shot resume), and indirect-
@@ -2593,32 +2214,22 @@ fn emit_call_expr_spelled(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
         # — Doc A §*Discarding the continuation*. The default
         # handlers (m7a #7) always resume, so the longjmp branch is
         # a no-op for them; the node's handle_jmp is NULL there.
-        let eff_n = dotted_prefix(callee)
+        let eff_n = written_text(decl_name(cx.tab, r.eff))
         # The Ev STRUCT type is module-qualified (`ev_name`) so two
         # same-name effects from different modules emit distinct C
         # structs. The runtime IDENTITY label is the instance key (`Eff` or
         # `Eff[args]`): the evidence stack and the frame slots are keyed by it.
-        let eff_evmo = eff_mo(cx.effs, eff_n)
-        let eff_evn = ev_name(eff_n, eff_evmo)
+        let eff_evn = ev_name_of(cx.tab, cx.effs, r.eff)
         let eff_idn = inst_key_of_callee(eff_n, f.ty)
-        let op_n_tagged0 = dotted_suffix(callee)
-        # §6 named instances: the typer tags a capability-parameter op call
-        # `c.op` as `op#<recv>`. The evidence is the parameter `kaiv_<recv>`
+        let op_n = written_text(r.op)
+        # §6 named instances: a capability-parameter op call `c.op` goes
+        # through `ViaRecv`. The evidence is the parameter `kaiv_<recv>`
         # itself (a `KaiEvidence *`), not a by-name walk — distinct capability
-        # params resolve to distinct nodes by parameter position. Split the
-        # receiver off first; the bare op name then flows through the normal path.
-        let hash_pos = string_index_of_char(op_n_tagged0, '#')
-        let cap_recv = if hash_pos >= 0 { string_slice(op_n_tagged0, hash_pos + 1, string_length(op_n_tagged0)) } else { "" }
-        let op_n_tagged = if hash_pos >= 0 { string_slice(op_n_tagged0, 0, hash_pos) } else { op_n_tagged0 }
-        # m7b #15 (compiler integration, scope-limited): the alias
-        # rewrite tags op names with `@<alias>` when the original
-        # callee was an `as`-bound capability. Split here: when
-        # tagged, dispatch via the handle's local
-        # `kaiv_alias_<alias>_id` (kai_evidence_lookup_node_by_id);
+        # params resolve to distinct nodes by parameter position.
+        # m7b #15 (compiler integration, scope-limited): a perform on an
+        # `as`-bound cell goes through `ViaAlias`: dispatch via the handle's
+        # local `kaiv_alias_<alias>_id` (kai_evidence_lookup_node_by_id);
         # otherwise the standard innermost-by-name lookup.
-        let at_pos = string_index_of_at(op_n_tagged)
-        let op_n = if at_pos >= 0 { string_slice(op_n_tagged, 0, at_pos) } else { op_n_tagged }
-        let alias_n = if at_pos >= 0 { string_slice(op_n_tagged, at_pos + 1, string_length(op_n_tagged)) } else { "" }
         # Capability-passing dispatch. When the enclosing fn's
         # evidence frame carries this effect (a transported user effect),
         # read the slot directly: the call site filled it with the right
@@ -2628,15 +2239,17 @@ fn emit_call_expr_spelled(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
         # fallback is compiled out so a frame-carried effect MUST resolve
         # through its slot — the oracle that falsifies a wrong transport.
         let evf_slot = frame_slot_here(cx.evf, cx.cur_enc_fn, eff_idn)
-        let walk_c =
-          if at_pos >= 0 {
+        let walk_c = match r.via {
+          ViaAlias(a) -> {
             # By-id resolves an aliased cell/capability. NULL means it was
             # performed on a child fiber that does not carry the alias (a
             # `var` cell does not cross a spawn). Guard the NULL into a clean
             # diagnostic instead of a `_node_op->handler` deref segfault.
+            let alias_n = emit_local_text(cx, a)
             concat_all(["kai_evidence_require_reachable(kai_evidence_lookup_node_by_id(",
                         c_alias_id(alias_n), "), \"", alias_n, "\")"])
-          } else if effect_has_default_block(eff_n, cx.effs) {
+          }
+          _ -> if effect_declares_default(cx.effs, r.eff) {
             # No caller frame here (a direct perform in a frameless fn such as
             # `main`): a lexical handler on the stack wins, else the minted
             # default node — the default is no longer on the stack for the walk.
@@ -2651,15 +2264,14 @@ fn emit_call_expr_spelled(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
             concat_all(["kai_evidence_require(kai_evidence_lookup_node(\"", eff_idn,
                         "\"), \"", eff_idn, "\")"])
           }
-        let lookup_c =
-          if cap_recv != "" {
-            # Capability value: the evidence is the node bound to this name —
-            # a `KaiEvidence *` param or the `&_node` an alias prologue binds.
-            # The param ABI carries it as a `KaiValue *` scalar, so cast back.
-            concat_all(["((KaiEvidence *) ", c_local(cap_recv), ")"])
-          } else if evf_slot >= 0 {
-            concat_all(["__evf[", int_to_string(evf_slot), "]"])
-          } else { walk_c }
+        }
+        let lookup_c = match r.via {
+          # Capability value: the evidence is the node this local holds —
+          # a `KaiEvidence *` param or the `&_node` an alias prologue binds.
+          # The param ABI carries it as a `KaiValue *` scalar, so cast back.
+          ViaRecv(x) -> concat_all(["((KaiEvidence *) ", c_local_of(cx, x), ")"])
+          _ -> if evf_slot >= 0 { concat_all(["__evf[", int_to_string(evf_slot), "]"]) } else { walk_c }
+        }
         # m8.x bug #12: mark the handler's evidence node as
         # in-dispatch across the clause invocation. The
         # `kai_evidence_lookup_node` walk skips flagged nodes, so
@@ -2706,56 +2318,9 @@ fn emit_call_expr_spelled(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           "} ",
           "_op_r; })"
         ])
-      } else {
-        # Issue #440 Phase 2 — when the callee is a variant ctor with
-        # at least one primitive payload slot, emit the typed
-        # `kai_variant_u` path. Falls back to the legacy boxed
-        # `emit_named_call_lookup` shape otherwise.
-        match spelled_ctor_kinds(cx, f, callee, list_length(args_e)) {
-          Some(tys) -> match emit_variant_call_typed(None, callee, args_e, tys, src, cx) {
-            Some(s) -> s
-            None    -> emit_named_call_lookup(src, callee, ec_callee_sym(f), args_e, cx)
-          }
-          None -> emit_named_call_lookup(src, callee, ec_callee_sym(f), args_e, cx)
-        }
-      }
     }
-    # m6.2 Phase 3 / v2: qualified call `mod.fname(args)`. v2 mints
-    # `kai_<mod>__<fname>` directly from the EModCall payload — the
-    # resolver already verified `fname` is exported by `mod`, so we
-    # do not need to round-trip through emit_named_call_lookup (which
-    # would lose the qualified context and pick the wrong entry when
-    # two modules export the same bare name).
-    #
-    # Issue #644 — Plan B: the typer rewrites `Response.Ok(x)` (or a
-    # bare `Ok(x)` disambiguated to `Response.Ok` by annotation) to
-    # `EModCall("Response", "Ok")`. The emitter must lower it as a
-    # variant ctor (`kai_variant(0, "Ok", ...)`), not as a module fn
-    # call, because variant tag matching keys on the bare ctor name
-    # at runtime. Detect by membership in `variants`; fall through to
-    # the module-fn path otherwise.
-    #
-    # Phase 2 unboxing parity: if the variant has typed payload slots
-    # (`emit_variant_call_typed` returns Some), use that path so the
-    # ctor emits `kai_variant_u` matching what the bare EVar ctor
-    # path uses elsewhere — otherwise nested unboxed sub-ctors and
-    # the outer boxed ctor would disagree on slot layout and reads
-    # like `slots[0].i64` would return garbage from a boxed pointer.
-    EModCall(mod, fname) -> match evar_find_qual(cx.variants, mod, fname) {
-      Some(_) -> {
-        let chome = ctor_qual_home(cx, mod, fname)
-        match evar_slot_kinds_in(cx.variants, chome, fname) {
-        Some(tys) -> match emit_variant_call_typed(chome, fname, args_e, tys, src, cx) {
-          Some(s) -> s
-          None    -> emit_variant_call(chome, fname, list_length(args_e), emit_slot_ops(src, args_e, cx), cx)
-        }
-        None -> emit_variant_call(chome, fname, list_length(args_e), emit_slot_ops(src, args_e, cx), cx)
-      } }
-      None    -> match fnx_kai_qualified(cx.fx, mod, fname) {
-        Some(kb) -> emit_kai_call_seq(kb, emit_arg_vals(src, args_e, cx))
-        None     -> emit_user_call_seq(c_sym(fname, Some(mod)), emit_arg_vals(src, args_e, cx), cx)
-      }
-    }
+    ELocal(l) -> emit_local_call(src, l, args_e, cx)
+    EName(w)  -> emit_spelled_call(src, written_text(w), args_e, cx)
     # A modulo-cons site: `args_e` are the original ctor args, the one at
     # the step's hole being the self-call. Builds the cell with an open
     # hole, extends the cctx, rebinds the params and jumps.
@@ -2767,47 +2332,29 @@ fn emit_call_expr_spelled(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
   }
 }
 
-# A `__perceus_*` marker reaching the closure-apply fallback is an RC
-# intrinsic that leaked past every consumer; the apply would mint an
-# undeclared C identifier and hand cc broken code. Abort instead.
-fn emit_guard_no_intrinsic_mint(callee: String) : Unit =
-  if string_starts_with_q(callee, "__perceus_") {
-    panic(cat2("emit_c: perceus intrinsic leaked to closure apply: ", callee))
-  } else { () }
-
-# Shared by emit_call_expr's EVar non-special branch and its
-# EModCall branch. Picks variant / core / user-fn / closure-thunk
-# emission from the same lookup chain. A local closure (`lcs`) shadows a
-# same-named top-level fn: `let take = ...; take(xs, 1)` calls the local.
-fn emit_named_call_lookup(src: String, callee: String, csym: FnId, args_e: [Expr], cx: EmitCtx) : String / Console =
-  if sym_raw(fnid_sym(csym)) < 0 and list_has(cx.lcs, callee) {
-    emit_apply_seq("kai_apply(", c_local(callee), emit_arg_vals(src, args_e, cx))
-  } else { match spelled_ctor_arity(cx.variants, csym, callee) {
-    # Variant ctor with boxed slots; the typed-slot path is taken earlier,
-    # in `emit_call_expr_spelled`.
-    Some(_) -> emit_variant_call(None, callee, list_length(args_e),
-                                 emit_slot_ops(src, args_e, cx),
-                                 cx)
-    # A reference reaches the `fn` it resolved to, or the builtin whose
-    # row it carries: the id decides, never the spelling.
-    None -> match ec_callee(cx, csym, callee) {
-      Some(EFn(_, _, mo, _, fid)) -> emit_fn_call_seq(fid, c_sym(callee, mo), emit_arg_vals(src, args_e, cx), cx)
-      # A raw core prim is checked before the boxed row: its args
-      # marshal raw per the prim's param types and its result is raw.
-      None -> match core_ix_raw(cx.core_ix, fnid_sym(csym)) {
-        Some(RP(_, cname, ptys, _)) -> emit_rcore_call(src, cname, ptys, args_e, cx)
-        None -> match core_ix_boxed(cx.core_ix, fnid_sym(csym)) {
-          Some(ep) -> match ep {
-            EP(_, cname, _) -> seq_call(cat2(cname, "("), emit_arg_vals(src, args_e, cx), ")")
-          }
-          None -> {
-            emit_guard_no_intrinsic_mint(callee)
-            emit_apply_seq("kai_apply(", c_local(callee), emit_arg_vals(src, args_e, cx))
-          }
+# A reference reaches the `fn` it resolved to, or the builtin whose row it
+# carries: the id decides, never a spelling.
+fn emit_sym_call(src: String, fid: FnId, args_e: [Expr], cx: EmitCtx) : String / Console =
+  match fnx_callee(cx.fx, fid) {
+    Some(EFn(n, _, mo, _, efid)) -> emit_fn_call_seq(efid, c_sym(written_text(n), mo), emit_arg_vals(src, args_e, cx), cx)
+    # A raw core prim is checked before the boxed row: its args
+    # marshal raw per the prim's param types and its result is raw.
+    None -> match core_ix_raw(cx.core_ix, fnid_sym(fid)) {
+      Some(RP(_, cname, ptys, _)) -> emit_rcore_call(src, cname, ptys, args_e, cx)
+      None -> match core_ix_boxed(cx.core_ix, fnid_sym(fid)) {
+        Some(ep) -> match ep {
+          EP(_, cname, _) -> seq_call(cat2(cname, "("), emit_arg_vals(src, args_e, cx), ")")
         }
+        None -> emit_apply_seq("kai_apply(", c_local(emit_fn_text(cx.tab, cx.specs, fid)), emit_arg_vals(src, args_e, cx))
       }
     }
-  } }
+  }
+
+# True when the effect `s` declares a `default { }` block.
+fn effect_declares_default(effs: [Decl], s: SymId) : Bool = match effect_decl_default(effect_decl_of(s, effs)) {
+  Some(_) -> true
+  None    -> false
+}
 
 # Fill the callee's evidence frame at the call site and prepend
 # it to the user args. For each of the callee's slots, the value is what
@@ -3021,11 +2568,11 @@ fn emit_vec_get_field_fused(src: String, base: Expr, fname: String, cx: EmitCtx)
 # Field order is the desugar-canonicalised declaration order — the
 # same layout bet the constant-index record read makes.
 fn emit_vec_write_rec_fused(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option[String] / Console = match f.kind {
-  ESym(_, _, _) -> {
+  ESym(_, _) -> {
     if is_builtin_ref(f, CbVecPush) and not cx.in_region {
       match args_e {
         [v, lit] -> match lit.kind {
-          ERecordLit(_, _, fis) ->
+          ERecordLit(_, fis) ->
             if vec_elem_is_rec_carrier(cx.recs, lit.ty) {
               let q = seq_operands([emit_expr(src, v, cx), ...map(fis, (fi) => emit_field_init_val(src, fi, cx))])
               let names = join_with(map(fis, emit_field_init_name), ", ")
@@ -3044,7 +2591,7 @@ fn emit_vec_write_rec_fused(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) :
     } else if is_builtin_ref(f, CbVecSet) and not cx.in_region {
       match args_e {
         [v, i, lit] -> match lit.kind {
-          ERecordLit(_, _, fis) ->
+          ERecordLit(_, fis) ->
             if vec_elem_is_rec_carrier(cx.recs, lit.ty) {
               let q = seq_operands([emit_expr(src, v, cx), emit_expr(src, i, cx),
                                     ...map(fis, (fi) => emit_field_init_val(src, fi, cx))])
@@ -3095,8 +2642,8 @@ fn emit_pat_test(src: String, pat: Pattern, scr: String, root: Bool, cx: EmitCtx
     PRange(_, _) -> "1"
     PLit(e) -> emit_pat_test_lit(src, e, scr, cx)
     PList(pats, opt_rest) -> emit_pat_test_list(src, pats, opt_rest, scr, cx)
-    PVariant(hm, name, subs) -> emit_pat_test_variant(src, hm, name, subs, scr, root, cx)
-    PVariantRecord(hm, name, fields) -> emit_pat_test_variant_record(src, ty_ref_qual(hm), name, fields, scr, cx)
+    PVariant(r, subs) -> emit_pat_test_variant(src, r, subs, scr, root, cx)
+    PVariantRecord(r, fields) -> emit_pat_test_variant_record(src, r, fields, scr, cx)
     PRecord(fields) -> emit_pat_test_record(src, fields, scr, cx)
     PHole(_) -> "1"
     # m7d §14: `name @ sub` matches iff `sub` matches; the binding
@@ -3125,7 +2672,7 @@ fn emit_pat_test_boxed_lit(src: String, e: Expr, scr: String, cx: EmitCtx) : Str
   concat_all(["({ KaiValue *_pl = ", emit_expr(src, e, cx), "; int _pe = kai_op_eq(", scr,
               ", _pl); kai_decref(_pl); _pe; })"])
 
-fn emit_pat_test_list(src: String, pats: [Pattern], opt_rest: Option[String],
+fn emit_pat_test_list(src: String, pats: [Pattern], opt_rest: Option[Binder],
                       scr: String, cx: EmitCtx) : String / Console {
 
   let n_fixed = list_length(pats)
@@ -3195,10 +2742,27 @@ fn emit_tag_test_at(scr: String, name: String, tag: Int, known: Option[Int]) : S
     ])
   }
 
-fn emit_variant_tag_test_arity(scr: String, home: Option[String], name: String,
-                                  arity: Int, variants: [VariantEntry]) : String =
-  emit_tag_test_at(scr, name, evar_find_tag_arity(variants, home, name, arity),
-                      evar_find_tag_opt_arity(variants, home, name, arity))
+# The row of the constructor a pattern names.
+fn pat_ctor_row(cx: EmitCtx, r: DeclRef) : Option[VariantEntry] = ctor_ix_row(cx.ctor_ix, ref_sym(r))
+
+# The slot kinds of the constructor a pattern destructures with `arity`
+# sub-patterns: they decide each slot's read kind, so they come from the
+# row of the constructor the pattern names and from no homonym's.
+fn pat_ctor_kinds(cx: EmitCtx, r: DeclRef, arity: Int) : Option[[Int]] = match pat_ctor_row(cx, r) {
+  Some(EV(_, _, ar, ks, _)) -> if ar == arity { Some(ks) } else { None }
+  None                      -> None
+}
+
+fn pat_ctor_tag(cx: EmitCtx, r: DeclRef) : Int = match pat_ctor_row(cx, r) {
+  Some(row) -> ctor_row_tag(row)
+  None      -> 0
+}
+
+# The tag test of the constructor a pattern names.
+fn emit_ctor_tag_test(scr: String, r: DeclRef, cx: EmitCtx) : String = match pat_ctor_row(cx, r) {
+  Some(EV(_, name, _, _, tag)) -> emit_tag_test_at(scr, name, tag, Some(tag))
+  None                         -> emit_tag_test_at(scr, decl_ref_text(cx.tab, r), 0, None)
+}
 
 fn emit_variant_tag_test(scr: String, home: Option[String], name: String,
                             variants: [VariantEntry]) : String {
@@ -3214,15 +2778,11 @@ fn emit_variant_tag_test(scr: String, home: Option[String], name: String,
   }
 }
 
-fn emit_pat_test_variant(src: String, home: Option[String], name: String,
+fn emit_pat_test_variant(src: String, r: DeclRef,
                          subs: [Pattern], scr: String, root: Bool, cx: EmitCtx) : String / Console {
 
-  let base = concat_all(["(", scr, " && ",
-                         emit_variant_tag_test_arity(scr, home, name, list_length(subs), cx.variants)])
-  # The payload types decide each slot's read kind, so they must come
-  # from the ctor the pattern actually names: a homonym in another
-  # module can declare a pointer where this one declares an Int.
-  let tys = match evar_slot_kinds_arity(cx.variants, home, name, list_length(subs)) {
+  let base = concat_all(["(", scr, " && ", emit_ctor_tag_test(scr, r, cx)])
+  let tys = match pat_ctor_kinds(cx, r, list_length(subs)) {
     Some(ts) -> ts
     None     -> []
   }
@@ -3250,9 +2810,9 @@ fn slot_read_for_test(scr: String, i: Int, tys: [Int]) : String {
 # pattern over an enum slot is impossible (the type is nullary-only).
 fn emit_enum_slot_test(scr: String, i: Int, sp: Pattern, cx: EmitCtx) : String =
   match sp.pkind {
-    PVariant(hm, cname, _) ->
+    PVariant(r, _) ->
       concat_all(["kai_var_slots(", scr, ")[", int_to_string(i), "].i64 == ",
-                  int_to_string(evar_find_tag_arity(cx.variants, hm, cname, 0))])
+                  int_to_string(pat_ctor_tag(cx, r))])
     PWild -> "1"
     PBind(_) -> "1"
     PAs(_, sub) -> emit_enum_slot_test(scr, i, sub, cx)
@@ -3347,15 +2907,15 @@ fn emit_pat_test_record_fields(src: String, fields: [PField], scr: String,
   }
 }
 
-fn emit_pat_test_variant_record(src: String, home: Option[String], name: String,
+fn emit_pat_test_variant_record(src: String, r: DeclRef,
                                  fields: [PField], scr: String,
                                  cx: EmitCtx) : String / Console {
 
   # Variant with record destructuring: first check the variant tag,
   # then read record fields via kai_op_field on the scrutinee itself
   # because the emit side stores records directly in variants.
-  # Issue #688 — atom-style global tag dispatch via emit_variant_tag_test.
-  let base = concat_all(["(", scr, " && ", emit_variant_tag_test(scr, home, name, cx.variants)])
+  # Issue #688 — atom-style global tag dispatch.
+  let base = concat_all(["(", scr, " && ", emit_ctor_tag_test(scr, r, cx)])
   cat3(base, emit_pat_test_record_fields(src, fields, scr, cx), ")")
 }
 
@@ -3389,23 +2949,18 @@ fn emit_pat_binds(src: String, pat: Pattern, scr: String, root: Bool, is_alias: 
       else { concat_all(["kai_decref(", scr, "); "]) }
     PLit(_) -> ""
     PRange(_, _) -> ""
-    PBind(name) ->
-      if is_alias {
-        concat_all(["KaiValue *", c_local(name), " = kai_incref(", scr, "); "])
-      } else {
-        concat_all(["KaiValue *", c_local(name), " = ", scr, "; "])
-      }
+    PBind(b) -> emit_binder_bind(b, scr, is_alias)
     PList(pats, opt_rest) -> emit_pat_binds_list(src, pats, opt_rest, scr, 0, cx)
-    # Issue #440 Phase 2 — pipe the ctor name through so the variant
-    # bind helper can read each slot with the right kind.
-    PVariant(hm, vname, subs) -> {
-      let tys = match evar_slot_kinds_arity(cx.variants, hm, vname, list_length(subs)) {
+    # Issue #440 Phase 2 — the variant bind helper reads each slot with
+    # the kind the constructor's row gives it.
+    PVariant(r, subs) -> {
+      let tys = match pat_ctor_kinds(cx, r, list_length(subs)) {
         Some(ts) -> ts
         None     -> []
       }
       emit_pat_binds_variant(src, subs, tys, scr, root, 0, cx)
     }
-    PVariantRecord(_, _, fields) -> emit_pat_binds_record(src, fields, scr, cx)
+    PVariantRecord(_, fields) -> emit_pat_binds_record(src, fields, scr, cx)
     PRecord(fields) -> emit_pat_binds_record(src, fields, scr, cx)
     PHole(_) -> ""
     # m7d §14: bind the as-name to the whole scrutinee, then descend
@@ -3413,32 +2968,26 @@ fn emit_pat_binds(src: String, pat: Pattern, scr: String, root: Bool, is_alias: 
     # bound name follows the outer is_alias; the sub-pattern always
     # treats scr as alias because the as-bound name is now sharing
     # storage with the sub-bindings even when scr was originally owned.
-    PAs(name, sub) -> {
-      let head_bind = if is_alias {
-        concat_all(["KaiValue *", c_local(name), " = kai_incref(", scr, "); "])
-      } else {
-        concat_all(["KaiValue *", c_local(name), " = ", scr, "; "])
-      }
-      cat2(head_bind, emit_pat_binds(src, sub, scr, root, true, cx))
-    }
+    PAs(b, sub) -> cat2(emit_binder_bind(b, scr, is_alias), emit_pat_binds(src, sub, scr, root, true, cx))
     # issue #187 phase 3: defensive arm; PNarrow is rewritten to
     # PAs+PVariant before codegen. If reached, bind the name like
     # PBind so the body sees the scrutinee under its narrow name.
-    PNarrow(name, _) ->
-      if is_alias {
-        concat_all(["KaiValue *", c_local(name), " = kai_incref(", scr, "); "])
-      } else {
-        concat_all(["KaiValue *", c_local(name), " = ", scr, "; "])
-      }
+    PNarrow(b, _) -> emit_binder_bind(b, scr, is_alias)
     PSurface(_) -> panic("emit_pat_binds: surface pattern not lowered")
   }
 }
 
-fn emit_pat_binds_list(src: String, pats: [Pattern], opt_rest: Option[String],
+# The C local of a binder, bound to `scr`: with its own reference when
+# `scr` shares storage with its producer.
+fn emit_binder_bind(b: Binder, scr: String, is_alias: Bool) : String =
+  if is_alias { concat_all(["KaiValue *", c_local(binder_text(b)), " = kai_incref(", scr, "); "]) }
+  else { concat_all(["KaiValue *", c_local(binder_text(b)), " = ", scr, "; "]) }
+
+fn emit_pat_binds_list(src: String, pats: [Pattern], opt_rest: Option[Binder],
                        cur: String, i: Int, cx: EmitCtx) : String {
   match pats {
     [] -> match opt_rest {
-      Some(name) -> concat_all(["KaiValue *", c_local(name), " = kai_incref(", cur, "); "])
+      Some(b) -> emit_binder_bind(b, cur, true)
       None -> ""
     }
     [p, ...rest] -> {
@@ -3451,15 +3000,15 @@ fn emit_pat_binds_list(src: String, pats: [Pattern], opt_rest: Option[String],
   }
 }
 
-# i64-inline (Lane B): collect the binder names that a pattern binds onto
+# i64-inline (Lane B): collect the binders that a pattern binds onto
 # kind-1 Int slots — the SAME set the bind routes emit as `kair_<nm>` and
-# the body's EVar reads + slot stores must look up in cx.kind1_raw. Built
+# the body's local reads + slot stores must look up in cx.kind1_raw. Built
 # off the pattern + the ctor registry, so the arm body and the bind agree
 # by construction (one collector, no per-route rescan). Recurses into
 # nested PVariant sub-patterns (rb-tree balance rotation shape).
-fn pat_kind1_binders(pat: Pattern, cx: EmitCtx, acc: [String]) : [String] = match pat.pkind {
-  PVariant(hm, ctor, subs) -> {
-    let tys = match evar_slot_kinds_arity(cx.variants, hm, ctor, list_length(subs)) { Some(t) -> t None -> [] }
+fn pat_kind1_binders(pat: Pattern, cx: EmitCtx, acc: [LocalId]) : [LocalId] = match pat.pkind {
+  PVariant(r, subs) -> {
+    let tys = match pat_ctor_kinds(cx, r, list_length(subs)) { Some(t) -> t None -> [] }
     pat_kind1_binders_subs(subs, tys, 0, cx, acc)
   }
   # A list pattern's fixed sub-patterns can themselves be PVariants with
@@ -3475,47 +3024,47 @@ fn pat_kind1_binders(pat: Pattern, cx: EmitCtx, acc: [String]) : [String] = matc
   # each field's sub-pattern; a direct PBind field stays boxed (the `_ ->`
   # arm ignores it), exactly matching the field bind route.
   PRecord(fields)            -> pat_kind1_binders_fields(fields, cx, acc)
-  PVariantRecord(_, _, fields) -> pat_kind1_binders_fields(fields, cx, acc)
+  PVariantRecord(_, fields) -> pat_kind1_binders_fields(fields, cx, acc)
   # `name @ pat` and `name : T` narrowings: recurse into the inner pat.
   PAs(_, inner)  -> pat_kind1_binders(inner, cx, acc)
   _ -> acc
 }
 
-fn pat_kind1_binders_list(subs: [Pattern], cx: EmitCtx, acc: [String]) : [String] = match subs {
+fn pat_kind1_binders_list(subs: [Pattern], cx: EmitCtx, acc: [LocalId]) : [LocalId] = match subs {
   [] -> acc
   [sp, ...rest] -> pat_kind1_binders_list(rest, cx, pat_kind1_binders(sp, cx, acc))
 }
 
-fn pat_kind1_binders_fields(fields: [PField], cx: EmitCtx, acc: [String]) : [String] = match fields {
+fn pat_kind1_binders_fields(fields: [PField], cx: EmitCtx, acc: [LocalId]) : [LocalId] = match fields {
   [] -> acc
   [pf, ...rest] -> match pf {
     PField(_, sub, _) -> pat_kind1_binders_fields(rest, cx, pat_kind1_binders(sub, cx, acc))
   }
 }
 
-fn pat_kind1_binders_subs(subs: [Pattern], tys: [Int], i: Int, cx: EmitCtx, acc: [String]) : [String] =
+fn pat_kind1_binders_subs(subs: [Pattern], tys: [Int], i: Int, cx: EmitCtx, acc: [LocalId]) : [LocalId] =
   match subs {
     [] -> acc
     [sp, ...rest] -> {
-      let acc1 = if kind_at(tys, i) == 1 { list_append(kind1_slot_binders(sp), acc) }
+      let acc1 = if kind_at(tys, i) == 1 { list_append(binder_ids(kind1_slot_binders(sp)), acc) }
                  else { pat_kind1_binders(sp, cx, acc) }
       pat_kind1_binders_subs(rest, tys, i + 1, cx, acc1)
     }
   }
 
-# The names a sub-pattern binds on a kind-1 Int slot, each declared as the
+# The binders of a sub-pattern on a kind-1 Int slot, each declared as the
 # raw `kair_<nm>`. The single decision both the bind route and the scope
 # collector read; a literal or wildcard binds nothing.
-fn kind1_slot_binders(sp: Pattern) : [String] = match sp.pkind {
-  PBind(nm)       -> [nm]
-  PAs(nm, inner)  -> [nm, ...kind1_slot_binders(inner)]
+fn kind1_slot_binders(sp: Pattern) : [Binder] = match sp.pkind {
+  PBind(b)       -> [b]
+  PAs(b, inner)  -> [b, ...kind1_slot_binders(inner)]
   _ -> []
 }
 
-fn kind1_slot_decls(names: [String], scr: String, i: Int) : String = match names {
+fn kind1_slot_decls(bs: [Binder], scr: String, i: Int) : String = match bs {
   [] -> ""
-  [nm, ...rest] -> concat_all(["int64_t kair_", nm, " = kai_var_slots(", scr, ")[", int_to_string(i),
-                               "].i64; (void) kair_", nm, "; ", kind1_slot_decls(rest, scr, i)])
+  [b, ...rest] -> concat_all(["int64_t kair_", binder_text(b), " = kai_var_slots(", scr, ")[", int_to_string(i),
+                              "].i64; (void) kair_", binder_text(b), "; ", kind1_slot_decls(rest, scr, i)])
 }
 
 fn emit_pat_binds_variant(src: String, subs: [Pattern], tys: [Int], scr: String, root: Bool, i: Int,
@@ -3556,10 +3105,10 @@ fn emit_pat_binds_variant(src: String, subs: [Pattern], tys: [Int], scr: String,
         emit_pat_binds_variant(src, rest, tys, scr, root, i + 1, cx)
       } else if k == 1 {
         # The raw read takes no ref: a kind-1 slot carries no RC.
-        let names = kind1_slot_binders(sp)
-        cat2(kind1_slot_decls(names, scr, i),
+        let bs = kind1_slot_binders(sp)
+        cat2(kind1_slot_decls(bs, scr, i),
              emit_pat_binds_variant(src, rest, tys, scr, root, i + 1,
-                                    emit_ctx_with_kind1_raw(cx, list_append(names, cx.kind1_raw))))
+                                    emit_ctx_with_kind1_raw(cx, list_append(binder_ids(bs), cx.kind1_raw))))
       } else {
         let sub_scr = concat_all(["kai_real(", "kai_var_slots(", scr, ")[", int_to_string(i), "].r)"])
         # The primitive slot read allocates a fresh boxed temp; the
@@ -3620,8 +3169,8 @@ fn pat_is_destructuring(p: Pattern) : Bool {
     PLit(_) -> false
     PRange(_, _) -> false
     PRecord(_) -> true
-    PVariant(_, _, _) -> true
-    PVariantRecord(_, _, _) -> true
+    PVariant(_, _) -> true
+    PVariantRecord(_, _) -> true
     PList(_, _) -> true
     PNarrow(_, _) -> false
     PAs(_, sub) -> pat_is_destructuring(sub)
@@ -3642,11 +3191,11 @@ fn emit_match_arms(src: String, arms: [Arm], scr_alias: Option[String], scr_ty: 
 # skips is `(void)`-silenced.
 fn pbind_raw_alias(pat: Pattern, scr: String, scr_ty: Option[Ty]) : String =
   match pat.pkind {
-    PBind(name) ->
+    PBind(b) ->
       if not scr_ty_raw_scalar(scr_ty) { "" }
       else {
-        concat_all([raw_c_type(scr_ty), " kair_", name, " = ",
-                    unbox_boxed_scalar(scr, scr_ty), "; (void) kair_", name, "; "])
+        concat_all([raw_c_type(scr_ty), " kair_", binder_text(b), " = ",
+                    unbox_boxed_scalar(scr, scr_ty), "; (void) kair_", binder_text(b), "; "])
       }
     _ -> ""
   }
@@ -3681,11 +3230,11 @@ fn scr_ty_raw_scalar_t(t: Ty) : Bool = match t {
 fn try_reuse_cons_arm(pat: Pattern, body: Expr) : Option[ReuseConsArm] {
   match pat.pkind {
     PList(pats, opt_rest) -> match opt_rest {
-      Some(rest_name) -> match pats {
+      Some(rest_b) -> match pats {
         [head_pat] -> match body.kind {
           ECall(callee, call_args) -> match callee.kind {
             EMark(MkReuseCons) -> match call_args {
-              [_scr_arg, h_new, t_new] -> Some(ReuseConsArm(head_pat, rest_name, h_new, t_new))
+              [_scr_arg, h_new, t_new] -> Some(ReuseConsArm(head_pat, rest_b, h_new, t_new))
               _ -> None
             }
             _ -> None
@@ -3700,12 +3249,12 @@ fn try_reuse_cons_arm(pat: Pattern, body: Expr) : Option[ReuseConsArm] {
   }
 }
 
-type ReuseConsArm = ReuseConsArm(Pattern, String, Expr, Expr)
+type ReuseConsArm = ReuseConsArm(Pattern, Binder, Expr, Expr)
 
 # The binders a cons reuse arm owns in both branches: each direct slot the
 # rebuild takes, and a deconstructed head's sub-binders.
-fn cons_arm_owned(head_pat: Pattern, rest_name: String, taken: [String], cx: EmitCtx) : [String] = {
-  let direct = filter(cons_direct_binders(head_pat, rest_name), (n) => list_has(taken, n))
+fn cons_arm_owned(head_pat: Pattern, rest: LocalId, taken: [LocalId], cx: EmitCtx) : [LocalId] = {
+  let direct = filter(cons_direct_binders(head_pat, rest), (n) => locals_have(taken, n))
   match head_pat.pkind {
     PBind(_) -> direct
     PWild    -> direct
@@ -3724,7 +3273,7 @@ fn reuse_held_cx(cx: EmitCtx, f: String, t: String) : EmitCtx = emit_ctx_with_tc
 
 # A deconstructed head binds its sub-binders owned in both branches.
 fn cons_slot_bind(src: String, head_pat: Pattern, slot: String, read: Bool, own: Bool, cx: EmitCtx) : String = match head_pat.pkind {
-  PBind(hn) -> if read { reuse_slot_decl(hn, concat_all(["_scr->as.cons.", slot]), own) } else { "" }
+  PBind(hb) -> if read { reuse_slot_decl(binder_text(hb), concat_all(["_scr->as.cons.", slot]), own) } else { "" }
   PWild     -> ""
   _         -> emit_pat_binds(src, head_pat, concat_all(["_scr->as.cons.", slot]), false, true, cx)
 }
@@ -3778,15 +3327,16 @@ fn cons_slot_bind(src: String, head_pat: Pattern, slot: String, read: Bool, own:
 #     `kai_cons`. The original `_scr` and its children remain intact;
 #     match exit's `kai_decref(_scr)` reclaims them normally.
 #
-# The body's `h_new` / `t_new` are emitted under bindings keyed on the
-# pattern names (head_pat's PBind, rest_name); each branch issues its
+# The body's `h_new` / `t_new` are emitted under bindings of the
+# pattern's binders (head_pat's PBind, the rest); each branch issues its
 # own bindings before the same body emit, so the body code is
 # duplicated textually but evaluated exactly once at runtime.
-fn emit_match_arm_reuse_cons(src: String, arm_lcs: [String], rca: ReuseConsArm,
+fn emit_match_arm_reuse_cons(src: String, arm_lcs: [LocalId], rca: ReuseConsArm,
                              cx: EmitCtx) : String / Console {
 
   match rca {
-    ReuseConsArm(head_pat, rest_name, h_new, t_new) -> {
+    ReuseConsArm(head_pat, rest_b, h_new, t_new) -> {
+      let rest_name = binder_text(rest_b)
       # i64-inline (Lane B): a cons head pattern can be a PVariant with
       # kind-1 Int fields (the AST list-walk shape: `[Node(_, k, _), ...rest]`).
       # The head bind emits kair_ for those; the new-head/tail body must see
@@ -3796,23 +3346,23 @@ fn emit_match_arm_reuse_cons(src: String, arm_lcs: [String], rca: ReuseConsArm,
       # A direct slot the rebuild does not take has no owner once overwritten:
       # the unique branch releases it and the shared branch does not incref
       # it. A slot read only by a lent read stays bound, as a borrow.
-      let direct = cons_direct_binders(head_pat, rest_name)
-      let read = reuse_gc_uses([h_new, t_new], direct)
-      let taken = reuse_taken_uses([h_new, t_new], direct)
-      let head_read = match head_pat.pkind { PBind(hn) -> list_has(read, hn) _ -> false }
-      let head_taken = match head_pat.pkind { PBind(hn) -> list_has(taken, hn) _ -> false }
-      let rest_taken = list_has(taken, rest_name)
+      let direct = cons_direct_binders(head_pat, rest_b.id)
+      let read = reuse_gc_uses(cx.locals, [h_new, t_new], direct)
+      let taken = reuse_taken_uses(cx.locals, [h_new, t_new], direct)
+      let head_read = match head_pat.pkind { PBind(hb) -> locals_have(read, hb.id) _ -> false }
+      let head_taken = match head_pat.pkind { PBind(hb) -> locals_have(taken, hb.id) _ -> false }
+      let rest_taken = locals_have(taken, rest_b.id)
       let head_borrow = cons_slot_bind(src, head_pat, "head", head_read, false, cx)
       let head_owned = cons_slot_bind(src, head_pat, "head", head_read, head_taken, cx)
-      let tail_borrow = cons_rest_bind(rest_name, list_has(read, rest_name), false)
-      let tail_owned = cons_rest_bind(rest_name, list_has(read, rest_name), rest_taken)
+      let tail_borrow = cons_rest_bind(rest_name, locals_have(read, rest_b.id), false)
+      let tail_owned = cons_rest_bind(rest_name, locals_have(read, rest_b.id), rest_taken)
       let old_drops = cons_untaken_drops(head_taken, rest_taken)
       # With the scrutinee registered, an exit out of the rebuild releases
       # the cell: each taken child belongs to its binder alone, and a head
       # computed first is held across the tail.
       let held = cx.unw.scr
       let hold_h = held and not unw_bare_read(h_new)
-      let arm_cx = if held { emit_unw_own(cons_arm_owned(head_pat, rest_name, taken, cx), arm_cx0) } else { arm_cx0 }
+      let arm_cx = if held { emit_unw_own(cons_arm_owned(head_pat, rest_b.id, taken, cx), arm_cx0) } else { arm_cx0 }
       let clears = if held { cons_taken_clears(head_taken, rest_taken) } else { "" }
       let h_new_c = emit_expr(src, h_new, arm_cx)
       let t_new_c = emit_expr(src, t_new, if hold_h { reuse_held_cx(arm_cx, "_uwh", "_h_new") } else { arm_cx })
@@ -3867,13 +3417,13 @@ fn emit_match_arm_reuse_cons(src: String, arm_lcs: [String], rca: ReuseConsArm,
 # A pattern slot is a pointer child (needs dup in the shared branch) iff its
 # slot kind is boxed (0) and it has a live binder.
 # pub: shared with the LLVM backend's arm-top reuse (llvm-c-parity lane).
-pub fn arm_ptr_binders(subs: [Pattern], tys: [Int], i: Int) : [String] =
+pub fn arm_ptr_binders(subs: [Pattern], tys: [Int], i: Int) : [Binder] =
   match subs {
     [] -> []
     [sp, ...rest] -> {
       let k = kind_at(tys, i)
       let here = match sp.pkind {
-        PBind(nm) -> if k == 0 { [nm] } else { [] }
+        PBind(b) -> if k == 0 { [b] } else { [] }
         _         -> []
       }
       list_append(here, arm_ptr_binders(rest, tys, i + 1))
@@ -3883,27 +3433,27 @@ pub fn arm_ptr_binders(subs: [Pattern], tys: [Int], i: Int) : [String] =
 # Emit the kai_incref calls for the shared branch: dup each kept pointer
 # child so it has an owning ref independent of the (about-to-be-decref'd)
 # shell. Koka's `else { dup(l); dup(r); ...; decref(t); }`.
-fn arm_shared_dups(binders: [String]) : String =
+fn arm_shared_dups(binders: [Binder]) : String =
   match binders {
     [] -> ""
-    [nm, ...rest] -> concat_all(["kai_incref(", c_local(nm), "); ", arm_shared_dups(rest)])
+    [b, ...rest] -> concat_all(["kai_incref(", c_local(binder_text(b)), "); ", arm_shared_dups(rest)])
   }
 
 # True iff `e` is a bare read of a borrowed binder (cx.borrowed). Used to
 # turn a `__perceus_dup` over such a binder into a move.
-fn expr_is_borrowed_binder(e: Expr, borrowed: [String]) : Bool =
+fn expr_is_borrowed_binder(e: Expr, borrowed: [LocalId]) : Bool =
   match e.kind {
-    EName(nm) -> list_has(borrowed, nm)
-    _        -> false
+    ELocal(l) -> locals_have(borrowed, l)
+    _         -> false
   }
 
-# Arm-top reuse plan: the consumed PVariant's ctor name, its payload tys,
+# Arm-top reuse plan: the consumed PVariant's constructor, its payload tys,
 # the pointer-slot binders (dup in shared branch), and the scrutinee arity.
-type ArmTopReuse = ArmTopReuse(String, [Pattern], [Int], [String], Int, [Int])
+type ArmTopReuse = ArmTopReuse(SymId, [Pattern], [Int], [Binder], Int, [Int])
 
 # Detect a match arm eligible for the coupled arm-top reuse: a PVariant the
 # arm consumes, whose body contains a TRMC step (the hot insert_loop shape).
-# The pattern's typed payload is resolved from the EVar registry so the
+# The pattern's typed payload is read from its constructor's row so the
 # borrow binds and the shared-branch dups know each slot's kind. We require
 # at least one pointer binder (otherwise there is nothing to keep alive and
 # the owned path is fine).
@@ -3927,7 +3477,7 @@ fn arm_tail_consumes_kind(k: ExprKind, ctors: CtorIx) : Bool = match k {
   # A tail ECall is acceptable ONLY if it is a TRMC step or a TRMC
   # apply of a constructor rebuild (the token is consumed building the node).
   # Any other call (balance_left, …) does NOT consume the token → reject.
-  ECall(f, xs) -> match sym_read_kind(f.kind) {
+  ECall(f, xs) -> match f.kind {
     EMark(MkTrmcStep(_)) -> true
     EMark(MkTrmcApply) -> arm_apply_is_ctor(xs, ctors)
     _ -> false
@@ -3944,19 +3494,10 @@ fn arm_tail_consumes_arms(arms: [Arm], ctors: CtorIx) : Bool = match arms {
 # node is rebuilt with kai_variant_at(_arm_ru, ...)).
 fn arm_apply_is_ctor(xs: [Expr], ctors: CtorIx) : Bool = match xs {
   [leaf] -> match leaf.kind {
-    ECall(cf, _) -> callee_names_ctor(ctors, cf)
+    ECall(cf, _) -> ctor_ix_names(ctors, cf)
     _ -> false
   }
   _ -> false
-}
-
-# A callee names a constructor by the id it carries; a spelling, which no
-# id was settled for, by its capital.
-fn callee_names_ctor(ctors: CtorIx, f: Expr) : Bool = match f.kind {
-  ESym(_, _, _)  -> ctor_ix_names(ctors, f)
-  EName(c)        -> name_first_is_upper(c)
-  EModCall(_, c) -> name_first_is_upper(c)
-  _              -> false
 }
 
 fn try_arm_top_reuse(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReuse] {
@@ -3977,14 +3518,14 @@ fn try_arm_top_reuse(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReuse
   if not trmc_body_has_step(body) { None }
   else {
     match pat.pkind {
-      PVariant(hm, cname, subs) -> match evar_slot_kinds_arity(cx.variants, hm, cname, list_length(subs)) {
+      PVariant(r, subs) -> match pat_ctor_kinds(cx, r, list_length(subs)) {
         Some(tys) ->
           if list_length(tys) == list_length(subs) {
             let ptr_binders = arm_ptr_binders(subs, tys, 0)
             match ptr_binders {
               [] -> None
-              _  -> Some(ArmTopReuse(cname, subs, tys, ptr_binders, list_length(subs),
-                                     pat_unbound_ptr_slots(pat, cx.variants)))
+              _  -> Some(ArmTopReuse(ref_sym(r), subs, tys, ptr_binders, list_length(subs),
+                                     pat_unbound_ptr_slots(pat, cx.ctor_ix)))
             }
           } else { None }
         None -> None
@@ -3995,7 +3536,7 @@ fn try_arm_top_reuse(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReuse
 }
 
 # Read perceus's signature directly from the AST: a ptr binder that
-# perceus MOVED appears in the body as a bare `EName(nm)` in a transfer
+# perceus MOVED appears in the body as a bare read in a transfer
 # position (NOT wrapped in `__perceus_dup`). Those are exactly the binders
 # the arm-top must dup in the shared branch (so the move has an owning ref
 # when the shell is shared). A binder still wrapped in `__perceus_dup`
@@ -4003,79 +3544,79 @@ fn try_arm_top_reuse(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReuse
 # "perceus signs, emit transcribes" — we never recompute the branch-aware
 # analysis (which would diverge on the post-dup AST and OOM); we read the
 # decision perceus already baked into the tree.
-fn arm_binder_is_moved(nm: String, body: Expr) : Bool =
-  arm_binder_has_bare_use(nm, body) and not arm_binder_only_dup_wrapped(nm, body)
+fn arm_binder_is_moved(l: LocalId, body: Expr) : Bool =
+  arm_binder_has_bare_use(l, body) and not arm_binder_only_dup_wrapped(l, body)
 
-# True if `nm` appears as a bare EVar somewhere a value is transferred
+# True if `l` is read bare somewhere a value is transferred
 # (ctor slot / call arg) — i.e. perceus did not wrap that use in a dup.
-fn arm_binder_has_bare_use(nm: String, e: Expr) : Bool =
-  arm_bare_use_kind(nm, e.kind)
+fn arm_binder_has_bare_use(l: LocalId, e: Expr) : Bool =
+  arm_bare_use_kind(l, e.kind)
 
-fn arm_bare_use_kind(nm: String, k: ExprKind) : Bool = match k {
-  EName(uname)        -> uname == nm
-  ECall(f, xs)       -> arm_call_bare_use(nm, f, xs)
-  EIf(c, t, opt_e)   -> arm_binder_has_bare_use(nm, c) or arm_binder_has_bare_use(nm, t) or
-                         (match opt_e { None -> false Some(e2) -> arm_binder_has_bare_use(nm, e2) })
-  EMatch(s, arms)    -> arm_binder_has_bare_use(nm, s) or arm_bare_use_arms(nm, arms)
-  EBlock(stmts, tl)  -> arm_bare_use_stmts(nm, stmts) or (match tl { None -> false Some(e) -> arm_binder_has_bare_use(nm, e) })
-  EBinop(_, a, b)    -> arm_binder_has_bare_use(nm, a) or arm_binder_has_bare_use(nm, b)
-  EUnop(_, x)        -> arm_binder_has_bare_use(nm, x)
-  EField(x, _)       -> arm_binder_has_bare_use(nm, x)
-  EIndex(a, b)       -> arm_binder_has_bare_use(nm, a) or arm_binder_has_bare_use(nm, b)
-  ERecordLit(_, _, fis) -> arm_bare_use_fields(nm, fis)
-  EList(els)         -> arm_bare_use_elems(nm, els)
+fn arm_bare_use_kind(l: LocalId, k: ExprKind) : Bool = match k {
+  ELocal(u)          -> local_eq(u, l)
+  ECall(f, xs)       -> arm_call_bare_use(l, f, xs)
+  EIf(c, t, opt_e)   -> arm_binder_has_bare_use(l, c) or arm_binder_has_bare_use(l, t) or
+                         (match opt_e { None -> false Some(e2) -> arm_binder_has_bare_use(l, e2) })
+  EMatch(s, arms)    -> arm_binder_has_bare_use(l, s) or arm_bare_use_arms(l, arms)
+  EBlock(stmts, tl)  -> arm_bare_use_stmts(l, stmts) or (match tl { None -> false Some(e) -> arm_binder_has_bare_use(l, e) })
+  EBinop(_, a, b)    -> arm_binder_has_bare_use(l, a) or arm_binder_has_bare_use(l, b)
+  EUnop(_, x)        -> arm_binder_has_bare_use(l, x)
+  EField(x, _)       -> arm_binder_has_bare_use(l, x)
+  EIndex(a, b)       -> arm_binder_has_bare_use(l, a) or arm_binder_has_bare_use(l, b)
+  ERecordLit(_, fis) -> arm_bare_use_fields(l, fis)
+  EList(els)         -> arm_bare_use_elems(l, els)
   _                  -> false
 }
 
-# In a call, a bare `EName(nm)` directly as an arg is a moved use UNLESS
-# the call is a dup of `nm` (that arg is a dup, not a move).
-fn arm_call_bare_use(nm: String, f: Expr, xs: [Expr]) : Bool = match f.kind {
+# In a call, a bare read of `l` directly as an arg is a moved use UNLESS
+# the call is a dup of `l` (that arg is a dup, not a move).
+fn arm_call_bare_use(l: LocalId, f: Expr, xs: [Expr]) : Bool = match f.kind {
   EMark(MkDup) -> false
-  _ -> arm_binder_has_bare_use(nm, f) or arm_bare_use_seq(nm, xs)
+  _ -> arm_binder_has_bare_use(l, f) or arm_bare_use_seq(l, xs)
 }
 
-fn arm_bare_use_seq(nm: String, es: [Expr]) : Bool = match es {
+fn arm_bare_use_seq(l: LocalId, es: [Expr]) : Bool = match es {
   []           -> false
-  [h, ...rest] -> arm_binder_has_bare_use(nm, h) or arm_bare_use_seq(nm, rest)
+  [h, ...rest] -> arm_binder_has_bare_use(l, h) or arm_bare_use_seq(l, rest)
 }
-fn arm_bare_use_arms(nm: String, arms: [Arm]) : Bool = match arms {
+fn arm_bare_use_arms(l: LocalId, arms: [Arm]) : Bool = match arms {
   []           -> false
-  [a, ...rest] -> match a { Arm(_, _, b) -> arm_binder_has_bare_use(nm, b) or arm_bare_use_arms(nm, rest) }
+  [a, ...rest] -> match a { Arm(_, _, b) -> arm_binder_has_bare_use(l, b) or arm_bare_use_arms(l, rest) }
 }
-fn arm_bare_use_stmts(nm: String, stmts: [Stmt]) : Bool = match stmts {
+fn arm_bare_use_stmts(l: LocalId, stmts: [Stmt]) : Bool = match stmts {
   []           -> false
-  [s, ...rest] -> arm_bare_use_stmt(nm, s) or arm_bare_use_stmts(nm, rest)
+  [s, ...rest] -> arm_bare_use_stmt(l, s) or arm_bare_use_stmts(l, rest)
 }
-fn arm_bare_use_stmt(nm: String, s: Stmt) : Bool = match s {
-  SLet(_, _, e)        -> arm_binder_has_bare_use(nm, e)
-  SVar(_, _, e, _, _)  -> arm_binder_has_bare_use(nm, e)
-  SExprStmt(e)         -> arm_binder_has_bare_use(nm, e)
+fn arm_bare_use_stmt(l: LocalId, s: Stmt) : Bool = match s {
+  SLet(_, _, e)        -> arm_binder_has_bare_use(l, e)
+  SVar(_, _, e, _, _)  -> arm_binder_has_bare_use(l, e)
+  SExprStmt(e)         -> arm_binder_has_bare_use(l, e)
   _                    -> false
 }
-fn arm_bare_use_fields(nm: String, fis: [FieldInit]) : Bool = match fis {
+fn arm_bare_use_fields(l: LocalId, fis: [FieldInit]) : Bool = match fis {
   []           -> false
-  [fi, ...rest] -> match fi { FI(_, v) -> arm_binder_has_bare_use(nm, v) or arm_bare_use_fields(nm, rest) }
+  [fi, ...rest] -> match fi { FI(_, v) -> arm_binder_has_bare_use(l, v) or arm_bare_use_fields(l, rest) }
 }
-fn arm_bare_use_elems(nm: String, els: [ListElem]) : Bool = match els {
+fn arm_bare_use_elems(l: LocalId, els: [ListElem]) : Bool = match els {
   []           -> false
-  [el, ...rest] -> arm_bare_use_elem(nm, el) or arm_bare_use_elems(nm, rest)
+  [el, ...rest] -> arm_bare_use_elem(l, el) or arm_bare_use_elems(l, rest)
 }
-fn arm_bare_use_elem(nm: String, el: ListElem) : Bool = match el {
-  ElPlain(e)  -> arm_binder_has_bare_use(nm, e)
-  ElSpread(e) -> arm_binder_has_bare_use(nm, e)
+fn arm_bare_use_elem(l: LocalId, el: ListElem) : Bool = match el {
+  ElPlain(e)  -> arm_binder_has_bare_use(l, e)
+  ElSpread(e) -> arm_binder_has_bare_use(l, e)
 }
 
 # Conservative stub: we only need the bare-use signal; the AND with this
 # is satisfied by the bare-use walk skipping dup-wrapped occurrences.
-fn arm_binder_only_dup_wrapped(_nm: String, _body: Expr) : Bool = false
+fn arm_binder_only_dup_wrapped(_l: LocalId, _body: Expr) : Bool = false
 
 # Filter ptr_binders to those perceus moved (have a bare use in the body).
 # pub: shared with the LLVM backend's arm-top reuse (llvm-c-parity lane) so
 # the move/dup decision is read off perceus's AST signature, not recomputed.
-pub fn arm_moved_binders(binders: [String], body: Expr) : [String] = match binders {
+pub fn arm_moved_binders(binders: [Binder], body: Expr) : [Binder] = match binders {
   []           -> []
   [h, ...rest] ->
-    if arm_binder_is_moved(h, body) { [h, ...arm_moved_binders(rest, body)] }
+    if arm_binder_is_moved(h.id, body) { [h, ...arm_moved_binders(rest, body)] }
     else { arm_moved_binders(rest, body) }
 }
 
@@ -4094,7 +3635,7 @@ pub fn arm_moved_binders(binders: [String], body: Expr) : [String] = match binde
 fn emit_arm_top_reuse(src: String, atr: ArmTopReuse, body: Expr,
                       arm_cx: EmitCtx, cx: EmitCtx) : String / Console {
   match atr {
-    ArmTopReuse(atr_cname, subs, tys, ptr_binders, n, unbound) -> {
+    ArmTopReuse(atr_ctor, subs, tys, ptr_binders, n, unbound) -> {
       # Transcribe perceus's signature: dup in the shared branch EXACTLY the
       # ptr binders perceus MOVED (bare use in the body, no __perceus_dup).
       # Reading the decision off the AST (not recomputing the branch-aware
@@ -4103,14 +3644,14 @@ fn emit_arm_top_reuse(src: String, atr: ArmTopReuse, body: Expr,
       let borrow_binds = emit_arm_borrow_binds(src, subs, tys, 0, cx)
       let shared_dups  = arm_shared_dups(moved)
       # Single-store TRMC reuse: record the donor cell's ctor + positional
-      # binder names so a TRMC step rebuilding the SAME ctor into `_arm_ru`
+      # binders so a TRMC step rebuilding the SAME ctor into `_arm_ru`
       # can skip the store of a slot whose value is already in the donated
       # shell (Koka's `_con->field = ...` single-store). The donor IS `_scr`
       # (kai_drop_reuse_token hands back the shell intact when unique), so a
       # slot bound off `_scr[i]` and re-placed at position i in the rebuild
       # needs no write. Set only for the body emission of THIS arm.
       let tok_cx = emit_ctx_with_tcpend(arm_cx, list_append(arm_cx.tcpend, [tcl_tok_entry()]))
-      let donor_cx = emit_ctx_with_reuse_donor(tok_cx, Some(ReuseDonor(atr_cname, arm_donor_binders(subs, 0))))
+      let donor_cx = emit_ctx_with_reuse_donor(tok_cx, Some(ReuseDonor(atr_ctor, arm_donor_binders(subs, 0))))
       let body_c = emit_expr(src, body, donor_cx)
       # Linear reuse-token disposal (Koka ParcReuse): the token captured
       # at the arm top is consumed by a `kai_variant_at(_arm_ru, ...)`
@@ -4146,15 +3687,15 @@ fn emit_arm_top_reuse(src: String, atr: ArmTopReuse, body: Expr,
   }
 }
 
-# The positional binder name of each donor sub-pattern: a PBind's name
-# (the C local `kaiv_<nm>` it binds off slot i), or `""` for any other
-# sub-pattern (PWild, nested PVariant, literal) — those have no plain
-# binder a rebuild arg could name, so their slot is never skipped. Used by
+# The positional binder of each donor sub-pattern: a PBind's
+# (the C local `kaiv_<nm>` it binds off slot i), or `local_none()` for any
+# other sub-pattern (PWild, nested PVariant, literal) — those have no plain
+# binder a rebuild arg could read, so their slot is never skipped. Used by
 # the single-store TRMC reuse to recognise `arg i == binder i`.
-fn arm_donor_binders(subs: [Pattern], i: Int) : [String] = match subs {
+fn arm_donor_binders(subs: [Pattern], i: Int) : [LocalId] = match subs {
   []            -> []
   [sp, ...rest] -> {
-    let here = match sp.pkind { PBind(nm) -> nm _ -> "" }
+    let here = match sp.pkind { PBind(b) -> b.id _ -> local_none() }
     [here, ...arm_donor_binders(rest, i + 1)]
   }
 }
@@ -4172,11 +3713,13 @@ fn emit_arm_borrow_binds(src: String, subs: [Pattern], tys: [Int], i: Int,
       let k = kind_at(tys, i)
       let slot = concat_all(["kai_var_slots(_scr)[", int_to_string(i), "]"])
       let here = match sp.pkind {
-        PBind(nm) ->
+        PBind(b) -> {
+          let nm = binder_text(b)
           if k == 1 { concat_all(["int64_t kair_", nm, " = ", slot, ".i64; (void) kair_", nm, "; "]) }
           else if k == 2 { concat_all(["KaiValue *", c_local(nm), " = kai_real(", slot, ".r); "]) }
           else if k == 3 { concat_all(["KaiValue *", c_local(nm), " = kai_enum_slot_box(", slot, ".i64); "]) }
           else { concat_all(["KaiValue *", c_local(nm), " = ", slot, ".ptr; "]) }
+        }
         _ -> if k == 0 { emit_pat_binds(src, sp, concat_all([slot, ".ptr"]), false, true, cx) } else { "" }
       }
       cat2(here, emit_arm_borrow_binds(src, rest, tys, i + 1, cx))
@@ -4191,30 +3734,33 @@ fn arm_unbound_slot_drop(i: Int) : String =
   concat_all(["if (_arm_ru != kai_reuse_null) { kai_decref(kai_var_slots(_arm_ru)[",
               int_to_string(i), "].ptr); } "])
 
-type ReuseVariantArm = ReuseVariantArm([Pattern], Option[String], String, [Expr], [Int])
+# The sub-patterns, the constructor's row, the rebuild's args and the slot kinds.
+type ReuseVariantArm = ReuseVariantArm([Pattern], VariantEntry, [Expr], [Int])
 
 # Detect a 1:1 variant reuse arm. The arm body, post-perceus, is the
 # sentinel `__perceus_reuse_variant(_scr, C(args))`. We match the
-# pattern ctor against the rebuilt ctor (same name + arity) and pull the
-# payload types from the EVar registry. Mirrors the working extractor in
+# pattern ctor against the rebuilt ctor (same constructor + arity) and pull
+# the payload types from its row. Mirrors the working extractor in
 # emit_call_value (the `__perceus_reuse_variant` branch) exactly — the
 # body IS the sentinel ECall here (the recogniser wraps the arm-tail
 # directly, and emit_match_arm receives that tail as `body`).
 fn try_reuse_variant_arm(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseVariantArm] {
   match pat.pkind {
-    PVariant(phome, pcname, subs) -> match body.kind {
+    PVariant(pr, subs) -> match body.kind {
       ECall(scallee, sargs) -> match scallee.kind {
         EMark(MkReuseVariant) -> match sargs {
-          [_scr_arg, ctor] -> match reuse_ctor_home_name(cx.ctor_ix, ctor) {
+          [_scr_arg, ctor] -> match reuse_ctor_id(cx.ctor_ix, ctor) {
             Some(bctor) -> match ctor.kind {
               ECall(_cf, cargs) ->
-                if reuse_same_ctor(phome, pcname, bctor) and
+                if reuse_same_ctor(pr, bctor) and
                    list_length(subs) == list_length(cargs) {
-                  match evar_slot_kinds_in(cx.variants, phome, pcname) {
-                    Some(tys) ->
-                      if list_length(tys) == list_length(subs) {
-                        Some(ReuseVariantArm(subs, phome, pcname, cargs, tys))
-                      } else { None }
+                  match ctor_ix_row(cx.ctor_ix, bctor) {
+                    Some(row) -> match row {
+                      EV(_, _, _, tys, _) ->
+                        if list_length(tys) == list_length(subs) {
+                          Some(ReuseVariantArm(subs, row, cargs, tys))
+                        } else { None }
+                    }
                     None -> None
                   }
                 } else { None }
@@ -4241,70 +3787,68 @@ fn try_reuse_variant_arm(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseVa
 # the outer + inner cells move with zero RC traffic — Koka's borrow model.
 # A non-linear arm falls back to the incref-then-old-drop path (correct,
 # just an incref/decref pair per kept child).
-fn rv_arm_is_linear(subs: [Pattern], cargs: [Expr]) : Bool = {
-  let binders = pat_binders_list_local(subs, [])
-  rv_all_used_once(binders, cargs)
-}
+fn rv_arm_is_linear(subs: [Pattern], cargs: [Expr]) : Bool =
+  rv_all_used_once(binder_ids(pat_binders_list_local(subs, [])), cargs)
 
-fn pat_binders_list_local(ps: [Pattern], acc: [String]) : [String] = match ps {
+fn pat_binders_list_local(ps: [Pattern], acc: [Binder]) : [Binder] = match ps {
   [] -> acc
   [p, ...rest] -> pat_binders_list_local(rest, pat_binders(p, acc))
 }
 
-fn rv_all_used_once(binders: [String], cargs: [Expr]) : Bool = match binders {
+fn rv_all_used_once(binders: [LocalId], cargs: [Expr]) : Bool = match binders {
   [] -> true
-  [nm, ...rest] ->
-    if rv_count_uses_args(nm, cargs, 0) == 1 { rv_all_used_once(rest, cargs) }
+  [l, ...rest] ->
+    if rv_count_uses_args(l, cargs, 0) == 1 { rv_all_used_once(rest, cargs) }
     else { false }
 }
 
-# Count bare `EName(nm)` uses of `nm` across a list of expressions.
-fn rv_count_uses_args(nm: String, es: [Expr], acc: Int) : Int = match es {
+# Count bare reads of `l` across a list of expressions.
+fn rv_count_uses_args(l: LocalId, es: [Expr], acc: Int) : Int = match es {
   []          -> acc
-  [e, ...rest] -> rv_count_uses_args(nm, rest, acc + rv_count_uses(nm, e))
+  [e, ...rest] -> rv_count_uses_args(l, rest, acc + rv_count_uses(l, e))
 }
 
-fn rv_count_uses(nm: String, e: Expr) : Int = match e.kind {
-  EName(u)            -> if u == nm { 1 } else { 0 }
-  ECall(f, xs)       -> rv_count_uses(nm, f) + rv_count_uses_args(nm, xs, 0)
-  EIf(c, t, oe)      -> rv_count_uses(nm, c) + rv_count_uses(nm, t) +
-                        (match oe { None -> 0 Some(x) -> rv_count_uses(nm, x) })
-  EMatch(s, arms)    -> rv_count_uses(nm, s) + rv_count_uses_arms(nm, arms, 0)
-  EBlock(stmts, tl)  -> rv_count_uses_stmts(nm, stmts, 0) +
-                        (match tl { None -> 0 Some(x) -> rv_count_uses(nm, x) })
-  EBinop(_, a, b)    -> rv_count_uses(nm, a) + rv_count_uses(nm, b)
-  EUnop(_, x)        -> rv_count_uses(nm, x)
-  EField(x, _)       -> rv_count_uses(nm, x)
-  EIndex(a, b)       -> rv_count_uses(nm, a) + rv_count_uses(nm, b)
-  ERecordLit(_, _, fis) -> rv_count_uses_fields(nm, fis, 0)
-  EList(els)         -> rv_count_uses_elems(nm, els, 0)
+fn rv_count_uses(l: LocalId, e: Expr) : Int = match e.kind {
+  ELocal(u)          -> if local_eq(u, l) { 1 } else { 0 }
+  ECall(f, xs)       -> rv_count_uses(l, f) + rv_count_uses_args(l, xs, 0)
+  EIf(c, t, oe)      -> rv_count_uses(l, c) + rv_count_uses(l, t) +
+                        (match oe { None -> 0 Some(x) -> rv_count_uses(l, x) })
+  EMatch(s, arms)    -> rv_count_uses(l, s) + rv_count_uses_arms(l, arms, 0)
+  EBlock(stmts, tl)  -> rv_count_uses_stmts(l, stmts, 0) +
+                        (match tl { None -> 0 Some(x) -> rv_count_uses(l, x) })
+  EBinop(_, a, b)    -> rv_count_uses(l, a) + rv_count_uses(l, b)
+  EUnop(_, x)        -> rv_count_uses(l, x)
+  EField(x, _)       -> rv_count_uses(l, x)
+  EIndex(a, b)       -> rv_count_uses(l, a) + rv_count_uses(l, b)
+  ERecordLit(_, fis) -> rv_count_uses_fields(l, fis, 0)
+  EList(els)         -> rv_count_uses_elems(l, els, 0)
   _                  -> 0
 }
-fn rv_count_uses_arms(nm: String, arms: [Arm], acc: Int) : Int = match arms {
+fn rv_count_uses_arms(l: LocalId, arms: [Arm], acc: Int) : Int = match arms {
   []          -> acc
-  [a, ...rest] -> match a { Arm(_, _, b) -> rv_count_uses_arms(nm, rest, acc + rv_count_uses(nm, b)) }
+  [a, ...rest] -> match a { Arm(_, _, b) -> rv_count_uses_arms(l, rest, acc + rv_count_uses(l, b)) }
 }
-fn rv_count_uses_stmts(nm: String, ss: [Stmt], acc: Int) : Int = match ss {
+fn rv_count_uses_stmts(l: LocalId, ss: [Stmt], acc: Int) : Int = match ss {
   []          -> acc
-  [s, ...rest] -> rv_count_uses_stmts(nm, rest, acc + rv_count_uses_stmt(nm, s))
+  [s, ...rest] -> rv_count_uses_stmts(l, rest, acc + rv_count_uses_stmt(l, s))
 }
-fn rv_count_uses_stmt(nm: String, s: Stmt) : Int = match s {
-  SLet(_, _, e)       -> rv_count_uses(nm, e)
-  SVar(_, _, e, _, _) -> rv_count_uses(nm, e)
-  SExprStmt(e)        -> rv_count_uses(nm, e)
+fn rv_count_uses_stmt(l: LocalId, s: Stmt) : Int = match s {
+  SLet(_, _, e)       -> rv_count_uses(l, e)
+  SVar(_, _, e, _, _) -> rv_count_uses(l, e)
+  SExprStmt(e)        -> rv_count_uses(l, e)
   _                   -> 0
 }
-fn rv_count_uses_fields(nm: String, fis: [FieldInit], acc: Int) : Int = match fis {
+fn rv_count_uses_fields(l: LocalId, fis: [FieldInit], acc: Int) : Int = match fis {
   []          -> acc
-  [fi, ...rest] -> match fi { FI(_, v) -> rv_count_uses_fields(nm, rest, acc + rv_count_uses(nm, v)) }
+  [fi, ...rest] -> match fi { FI(_, v) -> rv_count_uses_fields(l, rest, acc + rv_count_uses(l, v)) }
 }
-fn rv_count_uses_elems(nm: String, els: [ListElem], acc: Int) : Int = match els {
+fn rv_count_uses_elems(l: LocalId, els: [ListElem], acc: Int) : Int = match els {
   []          -> acc
-  [el, ...rest] -> rv_count_uses_elems(nm, rest, acc + rv_count_uses_elem(nm, el))
+  [el, ...rest] -> rv_count_uses_elems(l, rest, acc + rv_count_uses_elem(l, el))
 }
-fn rv_count_uses_elem(nm: String, el: ListElem) : Int = match el {
-  ElPlain(e)  -> rv_count_uses(nm, e)
-  ElSpread(e) -> rv_count_uses(nm, e)
+fn rv_count_uses_elem(l: LocalId, el: ListElem) : Int = match el {
+  ElPlain(e)  -> rv_count_uses(l, e)
+  ElSpread(e) -> rv_count_uses(l, e)
 }
 
 # Emit the 1:1 variant reuse arm, mirroring emit_match_arm_reuse_cons.
@@ -4312,16 +3856,16 @@ fn rv_count_uses_elem(nm: String, el: ListElem) : Int = match el {
 # copy), eval the new ctor args (which consume the borrowed binds via the
 # perceus-inserted dup/drop), overwrite slots in place WITHOUT decref-ing
 # the old pointer slots (transferred). Fallback: owned binds + fresh ctor.
-fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVariantArm,
+fn emit_match_arm_reuse_variant(src: String, arm_lcs: [LocalId], rva: ReuseVariantArm,
                                 cx: EmitCtx) : String / Console {
   match rva {
-    ReuseVariantArm(subs, chome, cname, cargs, tys) -> {
+    ReuseVariantArm(subs, EV(_, cname, _, _, tag), cargs, tys) -> {
       # The reuse binds emit kind-1 Int slots, at any depth, as raw
       # `kair_<nm>`; the rebuild must see those names in cx.kind1_raw.
       let k1 = pat_kind1_binders_subs(subs, tys, 0, cx, [])
       let arm_cx0 = emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, arm_lcs),
                                             list_append(cx.kind1_raw, k1))
-      let taken = reuse_taken_uses(cargs, pat_binders_list_local(subs, []))
+      let taken = reuse_taken_uses(cx.locals, cargs, binder_ids(pat_binders_list_local(subs, [])))
       # With the scrutinee registered (a flat rebuild only), an exit out of
       # the rebuild releases the cell: each taken child belongs to its binder
       # alone, and each operand computed is held across the later ones.
@@ -4329,7 +3873,7 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       let arm_cx = if held { emit_unw_own(rv_taken_binders(subs, tys, 0, taken), arm_cx0) } else { arm_cx0 }
       let n = list_length(subs)
       let mask = variant_slot_mask(tys)
-      let tag_str = int_to_string(evar_find_tag_in(cx.variants, chome, cname))
+      let tag_str = int_to_string(tag)
       # Non-bijective rebuild: a new ctor slot is a NESTED ctor that embeds a
       # pointer child of `_scr` (the rb-tree rotation / gap3 shape:
       # `Node(Node(lll,...), lk, Node(lr,...))`). Borrow-binding such children
@@ -4387,7 +3931,7 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # its taken binders are dup'd and it is decref'd.
       let nslot = if nonbij { rv_first_nested_slot(subs, tys, 0) } else { 0 - 1 }
       let has_inner = nslot >= 0
-      let settles = rv_slot_settles(subs, tys, nslot, taken, cx.variants)
+      let settles = rv_slot_settles(cx.locals, subs, tys, nslot, taken, cx.ctor_ix)
       # Donate the captured inner token to the first same-arity sub-ctor of
       # the body. `new_temps` references `kai_variant_u(tag,"C",n,` for the
       # nested rebuild slots; rewrite the first such occurrence to consume
@@ -4423,14 +3967,14 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # left after the inner-token donation) consumes `_donor` instead of
       # allocating — the parent shell the caller donated across the call
       # boundary (emit_reuse_donate.kai). site 0 = unique branch.
-      let new_temps = if cx.rd_active { rd_donate(new_temps1, evar_find_tag_arity(cx.variants, None, cname, n), cname, n, mask, 0) }
+      let new_temps = if cx.rd_active { rd_donate(new_temps1, tag, cname, n, mask, 0) }
                       else { new_temps1 }
       # Shared branch (`_scr` not unique) still holds the parent `_donor`
       # (its uniqueness is independent of the child), so its nested fresh
       # alloc consumes it too — else a balance call on a shared child leaves
       # the donor unconsumed (measured 1.79 freed/insert without this).
       # site 1 = shared branch; distinct temp so no lvalue aliases.
-      let fresh_rhs_d = if cx.rd_active { rd_donate(fresh_rhs, evar_find_tag_arity(cx.variants, None, cname, n), cname, n, mask, 1) }
+      let fresh_rhs_d = if cx.rd_active { rd_donate(fresh_rhs, tag, cname, n, mask, 1) }
                         else { fresh_rhs }
       # If the inner token was captured but no sub-ctor consumed it (the
       # rebuild had no same-arity nested ctor), free the cell so it does
@@ -4443,7 +3987,7 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
       # 0 unique, site 1 shared); it may not live inside the shared branch's
       # `(KaiVarSlot[]){...}` initializer where the rewrite lands.
       let uniq_tmp = if cx.rd_active and new_temps != new_temps1 { rd_tmp_decl(0) } else { "" }
-      let shared_temps = if held and cx.rd_active { rd_donate(new_temps1, evar_find_tag_arity(cx.variants, None, cname, n), cname, n, mask, 1) }
+      let shared_temps = if held and cx.rd_active { rd_donate(new_temps1, tag, cname, n, mask, 1) }
                          else { new_temps1 }
       let shared_tmp = if cx.rd_active and (fresh_rhs_d != fresh_rhs or shared_temps != new_temps1) { rd_tmp_decl(1) } else { "" }
       concat_all([
@@ -4473,7 +4017,7 @@ fn emit_match_arm_reuse_variant(src: String, arm_lcs: [String], rva: ReuseVarian
         # here over-releases: use-after-free once the donor dies). The
         # grand-child binds are borrows off the still-live inner; dup each
         # kept boxed grand-child before the fresh rebuild embeds it.
-        rv_slot_leaf_dups(subs, tys, taken, cx.variants),
+        rv_slot_leaf_dups(cx.locals, subs, tys, taken, cx.ctor_ix),
         if held { rv_fresh_from_temps(shared_temps, rv_temp_pops(cargs, tys, 0, held), tag_str, cname, tys) }
         else { cat3("_r = ", fresh_rhs_d, "; ") },
         "}"
@@ -4492,10 +4036,10 @@ fn rv_slot_binds(src: String, subs: [Pattern], tys: [Int], i: Int, borrow: Bool,
       let slot = concat_all(["kai_var_slots(_scr)[", int_to_string(i), "]"])
       let here = match sp.pkind {
         PWild -> ""
-        PBind(nm) ->
-          if k == 0 and not borrow { concat_all(["KaiValue *", c_local(nm), " = kai_incref(", slot, ".ptr); "]) }
-          else { rv_bind(nm, k, slot) }
-        _ -> if reuse_is_cell(sp, k) { rv_cell_binds(sp, sub_scr_expr("_scr", true, i, cx), cx.variants) } else { "" }
+        PBind(b) ->
+          if k == 0 and not borrow { concat_all(["KaiValue *", c_local(binder_text(b)), " = kai_incref(", slot, ".ptr); "]) }
+          else { rv_bind(binder_text(b), k, slot) }
+        _ -> if reuse_is_cell(sp, k) { rv_cell_binds(sp, sub_scr_expr("_scr", true, i, cx), cx.ctor_ix) } else { "" }
       }
       cat2(here, rv_slot_binds(src, rest, tys, i + 1, borrow, cx))
     }
@@ -4517,7 +4061,7 @@ fn rv_new_temps(src: String, cargs: [Expr], tys: [Int], i: Int, held: Bool, cx: 
           # `kair_<nm>` directly — no kai_take_int(kai_int(kair)) round-trip.
           # This is the rb-tree balance/insert hot path: ky/vy/kx/vx/k/v
           # field re-stores. Gated on membership, not mode (the ctor-arg
-          # context leaves the EVar MBoxed). Other sources keep kai_take_int.
+          # context leaves the read MBoxed). Other sources keep kai_take_int.
           concat_all(["int64_t _rv", int_to_string(i), " = ", store_raw_int(src, e, cx), "; "])
         }
         else if k == 2 { concat_all(["double _rv", int_to_string(i), " = kai_take_real(", emit_expr(src, e, cx), "); "]) }
@@ -4562,7 +4106,7 @@ fn rv_any_nested_ctor(cargs: [Expr], ctors: CtorIx) : Bool = match cargs {
   []           -> false
   [e, ...rest] -> {
     let here = match e.kind {
-      ECall(f, xs) -> callee_names_ctor(ctors, f) and rv_nonempty(xs)
+      ECall(f, xs) -> ctor_ix_names(ctors, f) and rv_nonempty(xs)
       _ -> false
     }
     here or rv_any_nested_ctor(rest, ctors)
@@ -4626,13 +4170,13 @@ fn rv_old_slot_drops(subs: [Pattern], tys: [Int], i: Int) : String = match tys {
 fn reuse_kept_pay(pat: Pattern, body: Expr, cx: EmitCtx) : String =
   if cx.in_region { "" }
   else { match pat.pkind {
-    PVariant(phome, pcname, subs) -> match body.kind {
+    PVariant(pr, subs) -> match body.kind {
       ECall(scallee, sargs) -> match scallee.kind {
         EMark(MkReuseVariant) -> match sargs {
-          [_scr_arg, ctor] -> match reuse_ctor_home_name(cx.ctor_ix, ctor) {
+          [_scr_arg, ctor] -> match reuse_ctor_id(cx.ctor_ix, ctor) {
             Some(bctor) -> match ctor.kind {
-              ECall(_cf, cargs) -> match evar_slot_kinds_in(cx.variants, phome, pcname) {
-                Some(ptys) ->
+              ECall(_cf, cargs) -> match pat_ctor_row(cx, pr) {
+                Some(EV(_, _, _, ptys, _)) ->
                   if reuse_fire_iff_unique(bctor, ptys, cx) {
                     reuse_kept_drops(subs, cargs, ptys, 0, cx)
                   } else { "" }
@@ -4658,20 +4202,10 @@ fn reuse_kept_pay(pat: Pattern, body: Expr, cx: EmitCtx) : String =
 # (`kai_reuse_or_alloc_variant`) additionally requires the DONOR's slot
 # mask to be 0 — a primitive-slotted donor never fires there, so nothing
 # needs paying.
-# The rebuild's qualifier is a module when the user wrote `m.Ctor` and the
-# declaring TYPE when the typer disambiguated a bare ctor, so it resolves
-# through the same tolerant path a construction site uses. Demanding it as
-# a home drops the payload for the type-qualified spelling, and with it
-# the kept-child payment the rebuild owes.
-fn rcn_payload_tys(b: ReuseCtorName, cx: EmitCtx) : Option[[Int]] = match b {
-  RCN(None, bname)       -> evar_slot_kinds(cx.variants, bname)
-  RCN(Some(q), bname)    -> evar_slot_kinds_in(cx.variants, ctor_qual_home(cx, q, bname), bname)
-}
-
-fn reuse_fire_iff_unique(bctor: ReuseCtorName, ptys: [Int], cx: EmitCtx) : Bool = {
-  let has_prim = match rcn_payload_tys(bctor, cx) {
-    Some(bts) -> variant_has_primitive_slot(bts)
-    None      -> false
+fn reuse_fire_iff_unique(bctor: SymId, ptys: [Int], cx: EmitCtx) : Bool = {
+  let has_prim = match ctor_ix_row(cx.ctor_ix, bctor) {
+    Some(EV(_, _, _, bts, _)) -> variant_has_primitive_slot(bts)
+    None                      -> false
   }
   if has_prim { true } else { variant_slot_mask(ptys) == 0 }
 }
@@ -4690,9 +4224,9 @@ fn reuse_kept_drops(subs: [Pattern], cargs: [Expr], ptys: [Int], i: Int,
     }
     let k = kind_at(ptys, i)
     let here = match sp.pkind {
-      PBind(nm) ->
-        if k == 0 and reuse_carg_reads(cargs, nm) {
-          concat_all(["kai_decref(", c_local(nm), "); "])
+      PBind(b) ->
+        if k == 0 and reuse_carg_reads(cargs, b.id) {
+          concat_all(["kai_decref(", c_local(binder_text(b)), "); "])
         } else { "" }
       _ -> ""
     }
@@ -4700,13 +4234,13 @@ fn reuse_kept_drops(subs: [Pattern], cargs: [Expr], ptys: [Int], i: Int,
   }
 }
 
-# The head of `cargs` is a bare `EName(nm)` or a dup wrap of it.
-fn reuse_carg_reads(cargs: [Expr], nm: String) : Bool = match cargs {
+# The head of `cargs` is a bare read of `l` or a dup wrap of it.
+fn reuse_carg_reads(cargs: [Expr], l: LocalId) : Bool = match cargs {
   [c, ..._] -> match c.kind {
-    EName(u) -> u == nm
+    ELocal(u) -> local_eq(u, l)
     ECall(df, dargs) -> match df.kind {
       EMark(MkDup) ->
-        match dargs { [inner] -> match inner.kind { EName(u) -> u == nm _ -> false } _ -> false }
+        match dargs { [inner] -> match inner.kind { ELocal(u) -> local_eq(u, l) _ -> false } _ -> false }
       _ -> false
     }
     _ -> false
@@ -4728,8 +4262,8 @@ fn reuse_cons_arm_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseCons
 fn reuse_variant_arm_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseVariantArm] =
   if cx.in_region { None } else {
     match try_reuse_variant_arm(pat, body, cx) {
-      Some(ReuseVariantArm(subs, h, c, cargs, tys)) ->
-        if cx.unw.scr and not rv_flat_arm(subs, cargs, cx.ctor_ix) { None } else { Some(ReuseVariantArm(subs, h, c, cargs, tys)) }
+      Some(ReuseVariantArm(subs, row, cargs, tys)) ->
+        if cx.unw.scr and not rv_flat_arm(subs, cargs, cx.ctor_ix) { None } else { Some(ReuseVariantArm(subs, row, cargs, tys)) }
       None -> None
     }
   }
@@ -4749,15 +4283,11 @@ fn emit_match_arm(src: String, a: Arm, scr_alias: Option[String], scr_ty: Option
   match a {
     Arm(pat, opt_guard, body) -> {
       let pt = emit_pat_test(src, pat, "_scr", true, cx)
-      # The arm's guard and body see this pattern's bound names as
-      # locals, so an `EName(p)` with `p` matching a pattern binder
-      # (e.g. `match xs { [drop, ...rest] -> drop }` where `drop` is
-      # also a top-level fn name) emits a local read instead of a
-      # closure-thunk reference.
-      let arm_lcs = list_append(cx.lcs, pat_binders(pat, []))
+      # The arm's guard and body see this pattern's binders as locals.
+      let arm_lcs = list_append(cx.lcs, pat_local_ids(pat))
       # i64-inline (Lane B): the arm body sees this pattern's kind-1 Int
       # binders as raw `kair_<nm>` locals. Add them to cx.kind1_raw so the
-      # body's EVar reads + slot stores pick the raw form. Replaced per arm
+      # body's local reads + slot stores pick the raw form. Replaced per arm
       # (not inherited by siblings) — `emit_ctx_with_kind1_raw` overwrites.
       let arm_cx = emit_ctx_with_kind1_raw(emit_ctx_with_lcs(cx, arm_lcs),
                                            list_append(cx.kind1_raw, pat_kind1_binders(pat, cx, [])))
@@ -4870,8 +4400,8 @@ fn emit_switch_arms(src: String, arms: [Arm], scr_cty: String, scr_ty: Option[Ty
     [a, ...rest] -> match a {
       Arm(p, _, body) -> {
         # Each arm's body sees the scrutinee binding as a local
-        # name when the pattern is `PBind(name)`.
-        let arm_lcs = list_append(cx.lcs, pat_binders(p, []))
+        # when the pattern is a `PBind`.
+        let arm_lcs = list_append(cx.lcs, pat_local_ids(p))
         let body_c = emit_expr(src, body, emit_ctx_with_lcs(cx, arm_lcs))
         match p.pkind {
           PWild -> {
@@ -4880,7 +4410,7 @@ fn emit_switch_arms(src: String, arms: [Arm], scr_cty: String, scr_ty: Option[Ty
           }
           # Issue #91 — `PBind(name)` catch-all binds the raw
           # scalar `_scr` as `kair_<name>` for the body. Body
-          # EVar reads of `name` resolve raw via the env extension
+          # reads of `name` resolve raw via the env extension
           # in `unbox_arm_with_scr`.
           #
           # BUT the unbox pass declines to mark `name` MUnboxed when it
@@ -4893,7 +4423,8 @@ fn emit_switch_arms(src: String, arms: [Arm], scr_cty: String, scr_ty: Option[Ty
           # box is owned locally and dropped at block exit; the raw needs
           # no drop. `(void)` casts silence unused-var warnings when the
           # body happens to use only one form.
-          PBind(name) -> {
+          PBind(b) -> {
+            let name = binder_text(b)
             # Declare the raw binder AND a boxed alias. The body resolves
             # `name` to `kair_<name>` (raw) for unboxed uses and to
             # `kaiv_<name>` (boxed) for uses the unbox pass kept boxed —
