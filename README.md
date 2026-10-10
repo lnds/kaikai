@@ -89,6 +89,11 @@ than touching the Cellar.
 > Homebrew formula is macOS-only. On any other platform (macOS Intel,
 > Linux arm64) the installer reports the gap rather than failing on a
 > 404 — build the compiler from source there (path **B**).
+>
+> **Windows:** there is no native build. Use
+> [WSL2](https://learn.microsoft.com/windows/wsl/install) with an
+> x86-64 Linux distribution and run the curl installer above inside it;
+> the linux-x86_64 release works there unchanged.
 
 ## Quickstart
 
