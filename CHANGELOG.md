@@ -84,6 +84,8 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.139.5 (2026-10-09)
+
 ## v0.139.4 (2026-10-09)
 
 ### Fixed
