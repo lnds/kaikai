@@ -9,6 +9,9 @@ is released.
 """)]
 
 import compiler.ast
+import compiler.written
+import compiler.local_names
+import compiler.ctor_ix
 import compiler.emit_shared
 import compiler.reuse_cells
 import compiler.util
@@ -19,36 +22,36 @@ pub fn rv_first_nested_slot(subs: [Pattern], ks: [Int], i: Int) : Int = match su
   [sp, ...rest] -> if reuse_is_cell(sp, kind_at(ks, i)) { i } else { rv_first_nested_slot(rest, ks, i + 1) }
 }
 
-#[doc("Settle each inner cell the donor's slots deconstruct; slot `token` keeps its unique shell as `_ru_inner`.")]
-pub fn rv_slot_settles(subs: [Pattern], ks: [Int], token: Int, taken: [String], vs: [VariantEntry]) : String =
-  concat_all(map(reuse_slot_cells(subs, ks, vs), (ic) => match ic {
-    (i, c) -> rv_cell_settle(c, rv_donor_slot(i), i == token, taken)
+#[doc("Settle each inner cell the donor's slots deconstruct; slot `token` keeps its unique shell as `_ru_inner`. `ns` names the binders `taken` holds.")]
+pub fn rv_slot_settles(ns: LocalNames, subs: [Pattern], ks: [Int], token: Int, taken: [LocalId], ctors: CtorIx) : String =
+  concat_all(map(reuse_slot_cells(subs, ks, ctors), (ic) => match ic {
+    (i, c) -> rv_cell_settle(ns, c, rv_donor_slot(i), i == token, taken)
   }))
 
 #[doc("Incref each taken boxed binder beneath the donor's inner cells, for a donor that stays live.")]
-pub fn rv_slot_leaf_dups(subs: [Pattern], ks: [Int], taken: [String], vs: [VariantEntry]) : String =
-  concat_all(map(reuse_slot_cells(subs, ks, vs), (ic) => match ic {
-    (_, c) -> rv_cell_leaf_dups(c, taken)
+pub fn rv_slot_leaf_dups(ns: LocalNames, subs: [Pattern], ks: [Int], taken: [LocalId], ctors: CtorIx) : String =
+  concat_all(map(reuse_slot_cells(subs, ks, ctors), (ic) => match ic {
+    (_, c) -> rv_cell_leaf_dups(ns, c, taken)
   }))
 
 fn rv_donor_slot(i: Int) : String = concat_all(["kai_var_slots(_scr)[", int_to_string(i), "].ptr"])
 
 #[doc("Borrow-bind every binder beneath the inner cell `cell` that `sp` deconstructs.")]
-pub fn rv_cell_binds(sp: Pattern, cell: String, vs: [VariantEntry]) : String = match sp.pkind {
-  PVariant(hm, vname, isubs) -> rv_cell_binds_loop(isubs, reuse_ctor_kinds(hm, vname, isubs, vs), cell, 0, vs)
-  _                          -> ""
+pub fn rv_cell_binds(sp: Pattern, cell: String, ctors: CtorIx) : String = match sp.pkind {
+  PVariant(r, isubs) -> rv_cell_binds_loop(isubs, reuse_ctor_kinds(ctors, r, isubs), cell, 0, ctors)
+  _                  -> ""
 }
 
-fn rv_cell_binds_loop(isubs: [Pattern], ks: [Int], cell: String, j: Int, vs: [VariantEntry]) : String = match isubs {
+fn rv_cell_binds_loop(isubs: [Pattern], ks: [Int], cell: String, j: Int, ctors: CtorIx) : String = match isubs {
   []            -> ""
   [sp, ...rest] -> {
     let k = kind_at(ks, j)
     let slot = rv_cell_slot(cell, j)
     let here = match sp.pkind {
-      PBind(nm) -> rv_bind(nm, k, slot)
-      _         -> if reuse_is_cell(sp, k) { rv_cell_binds(sp, cat2(slot, ".ptr"), vs) } else { "" }
+      PBind(b) -> rv_bind(written_text(b.name), k, slot)
+      _        -> if reuse_is_cell(sp, k) { rv_cell_binds(sp, cat2(slot, ".ptr"), ctors) } else { "" }
     }
-    cat2(here, rv_cell_binds_loop(rest, ks, cell, j + 1, vs))
+    cat2(here, rv_cell_binds_loop(rest, ks, cell, j + 1, ctors))
   }
 }
 
@@ -61,14 +64,14 @@ pub fn rv_bind(nm: String, k: Int, slot: String) : String =
 
 # Runs after the cell's binders are bound. `token` keeps a unique shell in
 # `_ru_inner` (declared here) instead of freeing it.
-fn rv_cell_settle(c: ReuseCell, cell: String, token: Bool, taken: [String]) : String = match c {
+fn rv_cell_settle(ns: LocalNames, c: ReuseCell, cell: String, token: Bool, taken: [LocalId]) : String = match c {
   ReuseCell(_, kids) -> {
     let shell = if token { concat_all(["_ru_inner = kai_ptr_reuse(", cell, "); "]) }
                 else { concat_all(["kai_reuse_free(kai_ptr_reuse(", cell, ")); "]) }
     concat_all([
       if token { "KaiReuse _ru_inner; KaiReuse _ru_tmp; (void) _ru_tmp; " } else { "" },
-      "if (kai_check_unique(", cell, ")) { ", rv_unique_kids(kids, cell, taken), shell, "} ",
-      "else { ", rv_cell_leaf_dups(c, taken), "kai_decref(", cell, "); ",
+      "if (kai_check_unique(", cell, ")) { ", rv_unique_kids(ns, kids, cell, taken), shell, "} ",
+      "else { ", rv_cell_leaf_dups(ns, c, taken), "kai_decref(", cell, "); ",
       if token { "_ru_inner = kai_reuse_null; " } else { "" }, "} "
     ])
   }
@@ -76,19 +79,19 @@ fn rv_cell_settle(c: ReuseCell, cell: String, token: Bool, taken: [String]) : St
 
 # A unique cell's children belong to the arm: a taken binder moves, a nested
 # cell settles in turn, and any other boxed child is released.
-fn rv_unique_kids(kids: [CellKid], cell: String, taken: [String]) : String =
+fn rv_unique_kids(ns: LocalNames, kids: [CellKid], cell: String, taken: [LocalId]) : String =
   concat_all(map(kids, (kid) => match kid {
-    KidCell(j, c)  -> rv_cell_settle(c, rv_cell_ptr(cell, j), false, taken)
-    KidBind(j, nm) -> if list_has(taken, nm) { "" } else { rv_slot_decref(cell, j) }
-    KidDrop(j)     -> rv_slot_decref(cell, j)
+    KidCell(j, c) -> rv_cell_settle(ns, c, rv_cell_ptr(cell, j), false, taken)
+    KidBind(j, l) -> if local_among(taken, l) { "" } else { rv_slot_decref(cell, j) }
+    KidDrop(j)    -> rv_slot_decref(cell, j)
   }))
 
 fn rv_slot_decref(cell: String, j: Int) : String = concat_all(["kai_decref(", rv_cell_ptr(cell, j), "); "])
 
-fn rv_cell_leaf_dups(c: ReuseCell, taken: [String]) : String = match c {
+fn rv_cell_leaf_dups(ns: LocalNames, c: ReuseCell, taken: [LocalId]) : String = match c {
   ReuseCell(_, kids) -> concat_all(map(kids, (kid) => match kid {
-    KidCell(_, c2) -> rv_cell_leaf_dups(c2, taken)
-    KidBind(_, nm) -> if list_has(taken, nm) { concat_all(["kai_incref(", c_local(nm), "); "]) } else { "" }
+    KidCell(_, c2) -> rv_cell_leaf_dups(ns, c2, taken)
+    KidBind(_, l)  -> if local_among(taken, l) { concat_all(["kai_incref(", c_local(written_text(ln_text(ns, l))), "); "]) } else { "" }
     KidDrop(_)     -> ""
   }))
 }
