@@ -10,6 +10,7 @@ import compiler.emit_shared
 import compiler.closure_spec_ast
 import compiler.self_call
 import compiler.closure_spec_share
+import compiler.closure_spec_capture
 import compiler.fnreg
 
 type StAcc = StAcc([Stmt], [String], [Expr])
@@ -201,16 +202,10 @@ fn closure_literal(ca: ClosureArg, site: Expr) : Expr =
     CaNamedFn(d)    -> remap(site, ESym(cs_decl_sym(d), spec_none(), cs_decl_name(d)))
   }
 
-# Beta-reduce one application of the closure to `args`. A parameter read
-# MORE THAN ONCE whose value CARRIES RC (a boxed record/list/variant/String)
-# must NOT be substituted directly: duplicating the argument into every
-# occurrence makes perceus emit one `drop` per read, and the second read
-# then hits freed memory (`p => R { a: p.a, b: p.b }`). Such a parameter is
-# bound to a fresh `let` and the body reads that binder — restoring the
-# linear-occurrence shape perceus assumes and evaluating the argument once.
-# A parameter read at most once, or one whose value is a raw scalar (no RC),
-# substitutes directly: a raw scalar duplicated is harmless, and direct
-# substitution is what lets the collect's `k` stay unboxed.
+# Beta-reduce one application of the closure to `args`. A parameter the
+# plan binds reads a fresh `let` holding its argument, evaluated once and
+# outside the body; the rest substitute directly, which is what lets a
+# collect's `k` stay unboxed.
 fn inline_apply(ca: ClosureArg, args_: [Expr]) : Expr =
   match ca {
     CaLambda(ps, b) -> bind_once_apply(b, cs_param_names(ps), args_)
@@ -248,17 +243,18 @@ fn plan_binds(body: Expr, names: [String], args_: [Expr], line: Int, col: Int) :
     }
   }
 
-# Bind-once is needed iff the param is read more than once AND either its
-# value carries RC or the argument is not a single variable. Reads are
-# counted syntactically over `EVar(param)`, rounding up (both `if` arms
-# count; an occurrence under a nested lambda counts) — over-counting only
-# adds a redundant `let`, never a UAF. A scalar type does not make a copy
-# free: a boxed Int outside the immediate range lives on the heap, and the
-# copies of a compound argument would share the positions Perceus keys its
-# reads by. A variable argument substitutes at each read's own position.
+# An argument that runs something is bound once: substituted, it would run
+# once per read, so never for a param the body ignores. A variable is bound
+# when several reads would copy a value that carries RC (a boxed Int outside
+# the immediate range lives on the heap), or when a binder of the body could
+# rebind it at the read. Reads are counted syntactically and round up, which
+# only adds a redundant `let`.
 fn bind_once_needed(body: Expr, name: String, arg: Expr) : Bool = {
   let occ = count_param_reads(body, name)
-  occ.n > 1 and (not opt_ty_unboxable(occ.ty) or not arg_is_var(arg))
+  if arg_is_literal(arg) { occ.n > 1 }
+  else if not arg_is_var(arg) { true }
+  else if occ.n > 1 and not opt_ty_unboxable(occ.ty) { true }
+  else { occ.n > 0 and body_binds(body) }
 }
 
 fn arg_is_var(a: Expr) : Bool = match sym_local_kind(a.kind) {
@@ -293,8 +289,8 @@ fn count_reads_kids(es: [Expr], name: String, acc: ReadCount) : ReadCount =
 
 # Substitute each closure parameter name by its argument expression,
 # respecting shadowing: a binder inside the body that re-binds a param
-# name stops substitution for that name within its scope. The bodies
-# are pure and env-empty, so no capture can occur.
+# name stops substitution for that name within its scope. Only a literal
+# is pasted under a binder of the body, so nothing rebinds an argument.
 fn subst_scoped(e: Expr, names: [String], args_: [Expr]) : Expr =
   match sym_local_kind(e.kind) {
     EVar(n) -> match index_of(names, n, 0) {
