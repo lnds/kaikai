@@ -46,7 +46,7 @@ import compiler.sym_read
 import compiler.refinements
 import compiler.infer
 import compiler.fnreg
-import compiler.native_prims
+import compiler.core_builtins
 import compiler.unbox_native_raw
 import compiler.fn_index
 import compiler.handler_alias
@@ -76,7 +76,7 @@ import compiler.kinds
 # Subsequent milestones extend the analysis to comparisons, EIf
 # cond, and match scrutinees.
 pub fn unbox_pass(decls: [Decl], cis: [CtorIntSlots], nat: Bool, entry: SymId) : [Decl] / Console = {
-  let fns = fnx_with_effects(fnx_build(register_fn_decls(decls, entry)), decls)
+  let fns = fnx_with_raw_prims(fnx_with_effects(fnx_build(register_fn_decls(decls, entry)), decls))
   map(decls, (d) => unbox_decl(d, fns, cis, nat))
 }
 
@@ -165,7 +165,7 @@ fn ufn_promote_calls(e: Expr, fns: FnIndex) : Expr {
   # post-perceus shape for raw-only bodies).
   let mode1 = match kind1 {
     ECall(callee, _) -> {
-      if (call_resolves_to_ufn(callee, fns) or call_is_raw_core(callee)) and ty_is_unboxable(e.ty) { MUnboxed }
+      if (call_resolves_to_ufn(callee, fns) or call_is_raw_core(callee, fns)) and ty_is_unboxable(e.ty) { MUnboxed }
       else { e.mode }
     }
     EIf(cnd, ath, Some(eth)) -> {
@@ -218,9 +218,12 @@ fn arms_all_raw(arms: [Arm]) : Bool = match arms {
 # `_r` assignment. Conservative: only the bare divergent-core call
 # (or its block-tail) qualifies; anything else must be raw.
 pub fn arm_body_diverges(e: Expr) : Bool = match e.kind {
-  ECall(callee, _) -> match sym_read_kind(callee.kind) {
-    EVar(nm) -> nm == "panic" or nm == "exit"
-    _        -> false
+  # The emitter asks again below the erasure, where the builtin is a bare
+  # name: both spellings must answer alike.
+  ECall(callee, _) -> match callee.kind {
+    ESym(s, _, _) -> match builtin_of(s) { Some(b) -> builtin_never_returns(b) None -> false }
+    EVar(nm)      -> nm == "panic" or nm == "exit"
+    _             -> false
   }
   EBlock(_, Some(tail)) -> arm_body_diverges(tail)
   _ -> false
@@ -331,11 +334,9 @@ fn call_resolves_to_ufn(callee: Expr, fns: FnIndex) : Bool = match fnx_callee_si
 # is a raw `void *` / `int64_t` and the next prim receives it raw —
 # never via `(...)->as.i` over a boxed cell (which would corrupt the
 # pointer). Dead on any program that names no C-API prim.
-fn call_is_raw_core(callee: Expr) : Bool {
-  match sym_read_kind(callee.kind) {
-    EVar(name) -> rcore_is_prim(name)
-    _ -> false
-  }
+fn call_is_raw_core(callee: Expr, fns: FnIndex) : Bool = match callee.kind {
+  ESym(s, _, _) -> fnx_is_raw_prim(fns, s)
+  _             -> false
 }
 
 # The `__fixed_vec_get` intrinsics read one element out of a fixed vec as
@@ -593,7 +594,7 @@ fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: FnInd
       # promotion the call would round-trip through `kai_<T>`
       # boxing.
       ECall(callee, _) ->
-        if call_resolves_to_ufn(callee, fns) or call_is_raw_core(callee) or call_is_fixed_vec_get(callee) { MUnboxed }
+        if call_resolves_to_ufn(callee, fns) or call_is_raw_core(callee, fns) or call_is_fixed_vec_get(callee) { MUnboxed }
         else { MBoxed }
       # Conservative: only mark composite raw when both operands are
       # already raw. Mixing a boxed operand into a raw arithmetic

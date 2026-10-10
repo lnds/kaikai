@@ -43,7 +43,6 @@ import compiler.marks
 import compiler.ret_slots
 import compiler.sym_read
 import compiler.util
-import compiler.core_prims
 import compiler.parse
 import compiler.infer
 import compiler.fnreg
@@ -67,6 +66,8 @@ import compiler.decl_names
 import compiler.entry
 import compiler.symtab_build
 import compiler.core_syms
+import compiler.core_builtins
+import compiler.core_builtin_sets
 import compiler.perceus_raw_slot
 import compiler.perceus_reads
 import compiler.perceus_read_walk
@@ -227,9 +228,9 @@ pub fn perceus_pass_in(decls: [Decl], tab: SymTab, views: FileViews,
   # decref; caller strips the __perceus_dup on args in borrowed slots).
   # Read-only prims (array_get/array_length) join the borrow map so the
   # caller strips the container dup and the path counter charges 0 —
-  # reusing the whole borrow pipeline. A prim is keyed by name and a
-  # declaration by identity, so a user fn spelled like a prim never reads
-  # the prim's row; the same entry gates the callee rename.
+  # reusing the whole borrow pipeline. A prim is keyed by its row's
+  # identity like any declaration, so a user fn spelled like a prim never
+  # reads the prim's row; the same entry gates the callee rename.
   let prim_bmap = pcs_seed_prim_borrows()
   let bmap = pcs_build_borrow_map(decls, prim_bmap)
   # Consume-map (Koka Borrowed dual): per-fn CONSUMED param positions. A caller
@@ -244,7 +245,7 @@ pub fn perceus_pass_in(decls: [Decl], tab: SymTab, views: FileViews,
   let opaque_ret_fns = pcs_collect_opaque_ret_fns(decls, opaque_names, [])
   let caps = pcap_scope(decls, tab, views, root)
   let prim_bm = bm_of(prim_bmap)
-  let cores = core_builtin_names()
+  let cores = bound_builtin_syms()
   map(decls, (d) => perceus_decl_b(d, fns, bmap, cmap, opaque_ret_fns, prim_bm, caps, cores))
 }
 
@@ -306,7 +307,7 @@ fn pcs_borrow_decls(decls: [Decl], planned: Bool, acc: [BorrowDecl]) : [BorrowDe
 # Seed the borrow map with the read-only prims. One map entry gates BOTH
 # the caller-dup strip and the callee rename, so a strip-without-rename
 # (double free) or rename-without-strip (leak) is impossible.
-fn pcs_seed_prim_borrows() : [BorrowEntry] = map(core_borrowing_prims(), (p) => BwE(p, [0]))
+fn pcs_seed_prim_borrows() : [BorrowEntry] = map(lending_builtins(), (b) => BwE(bv_fid_key(fnid_decl(builtin_id(b))), [0]))
 
 # A container read ONLY through borrowed-prim slots (never consumed by a
 # later owning use) has no consumer to release its ref. Borrowing every one
@@ -568,7 +569,7 @@ fn pcs_borrowed_closure_names(borrowed: [String], params: [Param]) : [String] =
 # stripped dups (net-zero), and per-read reclassification is unsound
 # where sugar clones share one source position.
 type StripCx = { bmap: BorrowMap, borrow_last: [String],
-                 no_wrap: [String], uses: UseIx, fns: FnIndex, cores: [String] }
+                 no_wrap: [String], uses: UseIx, fns: FnIndex, cores: SymSet }
 
 fn pcs_strip_borrow_args_d(e: Expr, scx: StripCx) : Expr =
   Expr { kind: pcs_strip_borrow_kind(e.kind, scx),
@@ -588,12 +589,12 @@ fn pcs_strip_borrow_kind(k: ExprKind, scx: StripCx) : ExprKind = match k {
     # consuming: suppress the dup strip and the rename so the runtime
     # decref reclaims the container. Earlier borrowed reads are rewritten.
     let keep_consuming = pcs_arg0_is_borrow_last(args_, scx.borrow_last) and
-                         (match core_borrow_variant(key) { Some(_) -> true None -> false })
+                         (match pcs_lending_form(callee) { Some(_) -> true None -> false })
     let positions = if keep_consuming { [] } else { pcs_borrow_lookup(scx.bmap, key) }
     let args2 = prs_mark_raw_moves(pcs_strip_args_at_d(args_, positions, 0, scx),
                                    prs_raw_arg_positions(callee, scx.fns), scx.no_wrap, scx.uses)
     let callee2 = if keep_consuming { callee }
-                  else { pcs_maybe_rename_borrow_prim(callee, key, positions) }
+                  else { pcs_maybe_rename_borrow_prim(callee, positions) }
     ECall(pcs_strip_borrow_args_d(callee2, scx), args2)
     }
   }
@@ -621,14 +622,19 @@ fn pcs_arg0_is_borrow_last(args_: [Expr], borrow_last: [String]) : Bool = match 
   None     -> false
 }
 
-fn pcs_maybe_rename_borrow_prim(callee: Expr, key: String, positions: [Int]) : Expr =
+fn pcs_maybe_rename_borrow_prim(callee: Expr, positions: [Int]) : Expr =
   if pcs_has_int(positions, 0) {
-    match core_borrow_variant(key) {
-      Some(v) -> Expr { kind: EVar(v), line: callee.line, col: callee.col,
-                        ty: callee.ty, mode: callee.mode,  site: callee.site }
+    match pcs_lending_form(callee) {
+      Some(b) -> builtin_ref_at(b, callee)
       None    -> callee
     }
   } else { callee }
+
+# The lending sibling of the builtin a callee names.
+fn pcs_lending_form(callee: Expr) : Option[CoreBuiltin] = match builtin_ref(callee) {
+  Some(b) -> builtin_lending_form(b)
+  None    -> None
+}
 
 # A mark whose slot 0 holds a value it invokes rather than consumes.
 fn pcs_callee_borrows_slot0(callee: Expr) : Bool = match callee.kind {
@@ -642,7 +648,7 @@ fn pcs_boxed_borrow_slots(bmap: BorrowMap, fns: FnIndex, f: Expr) : [Int] = {
   filter(pcs_borrow_slots(bmap, f), (i) => not pcs_has_int(raw, i))
 }
 
-#[doc("Call key for a callee expression: the identity of the function it names, or the name of the prim a bare spelling is.")]
+#[doc("Call key for a callee expression: the identity of the declaration it names, or the spelling of a bare name.")]
 pub fn pcs_callee_key(callee: Expr) : String = match callee.kind {
   ESym(s, inst, _) -> bv_fid_key(FnId(s, inst))
   EVar(nm)         -> nm
@@ -714,13 +720,19 @@ fn pcs_arg_is_owned_rvalue(a: Expr) : Bool = match a.kind {
   ELambda(_, _) -> true
   ECall(callee, _) -> {
     let key = pcs_callee_key(callee)
-    if key == "" or string_starts_with_q(key, "__") { false } else { pcs_ty_is_rc(a.ty) }
+    if key == "" or string_starts_with_q(key, "__") or pcs_is_unit_coercion(callee) { false } else { pcs_ty_is_rc(a.ty) }
   }
   EField(_, _)     -> pcs_ty_is_rc(a.ty)
   EStr(_, _)       -> pcs_ty_is_rc(a.ty)
   ERecordLit(_, _, _) -> pcs_ty_is_rc(a.ty)
   EList(els)       -> pcs_ty_is_rc(a.ty) and not any(els, (el) => match el { ElSpread(_) -> true  ElPlain(_) -> false })
   _ -> false
+}
+
+# A unit coercion hands its argument through: its result is no fresh value.
+fn pcs_is_unit_coercion(callee: Expr) : Bool = match builtin_ref(callee) {
+  Some(b) -> builtin_is_unit_coercion(b)
+  None    -> false
 }
 
 fn pcs_ty_is_rc(ty: Option[Ty]) : Bool = match ty {
@@ -732,12 +744,11 @@ fn pcs_ty_is_rc(ty: Option[Ty]) : Bool = match ty {
 # materialises a fresh `kai_closure`, like a lambda literal). A local/param
 # is never marked — it is borrow-through or tracked, and dropping it would
 # over-free.
-fn pcs_arg_is_fn_ref(a: Expr, fns: FnIndex, cores: [String]) : Bool = match a.kind {
-  ESym(s, inst, nm) -> match fnx_of_sym(fns, FnId(s, inst)) {
+fn pcs_arg_is_fn_ref(a: Expr, fns: FnIndex, cores: SymSet) : Bool = match a.kind {
+  ESym(s, inst, _) -> match fnx_of_sym(fns, FnId(s, inst)) {
     Some(_) -> true
-    None    -> not sym_is_local(s) and list_has(cores, nm)
+    None    -> sym_set_has(cores, s)
   }
-  EVar(nm)         -> list_has(cores, nm)
   EModCall(m, nm)  -> match fnx_qualified(fns, m, nm) { Some(_) -> true  None -> false }
   _                -> false
 }
@@ -1413,7 +1424,7 @@ fn pcs_inspected_elems(nm: String, els: [ListElem]) : Bool = match els {
 }
 
 fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, opaque_ret_fns: [String],
-                  prim_bmap: BorrowMap, caps: CapScope, cores: [String]) : Decl / Console {
+                  prim_bmap: BorrowMap, caps: CapScope, cores: SymSet) : Decl / Console {
 
   match d {
     DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo, fsym) -> {
@@ -4088,7 +4099,7 @@ type PcsArmCx = { uses: UseIx, moved: [String], boxed_bpos: [Int], borrow_only: 
 # A user fn's borrowed positions; a borrowing prim keeps its own
 # consuming-last-use rule, so it lends no slot here.
 fn pcs_user_borrow_slots(bmap: BorrowMap, callee: Expr) : [Int] = match sym_read_name(callee.kind) {
-  Some(c) -> match core_borrow_variant(c) {
+  Some(_) -> match pcs_lending_form(callee) {
     Some(_) -> []
     None    -> pcs_borrow_lookup(bmap, pcs_callee_key(callee))
   }

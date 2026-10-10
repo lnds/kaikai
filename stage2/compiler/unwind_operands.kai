@@ -23,11 +23,15 @@ import compiler.unwind_cx
 import compiler.unwind_calls
 import compiler.unwind_effects
 import compiler.fnreg
+import compiler.symtab
+import compiler.core_unstamp
+import compiler.core_builtin_sets
 
 #[doc("Bind, in every body of `ds`, the owned operands evaluated before a sibling that can unwind.")]
-pub fn unw_name_operands(ds: [Decl]) : [Decl] = {
+pub fn unw_name_operands(ds: [Decl], tab: SymTab) : [Decl] = {
   let ucx = unw_cx_decls(ds)
-  map(ds, (d) => uo_decl(d, ucx))
+  let quals = ctors_read_qualified(tab)
+  map(ds, (d) => uo_decl(d, ucx, quals))
 }
 
 #[doc("True when `s` binds an operand this pass named.")]
@@ -41,23 +45,24 @@ pub fn unw_is_named_operand(s: Stmt) : Bool = match s {
 
 fn uo_prefix() : String = "__unw_v"
 
-fn uo_decl(d: Decl, ucx: UnwCx) : Decl = match d {
-  DFn(pub_, n, tps, ps, ret, row, body, l, c, mo, fsym) -> DFn(pub_, n, tps, ps, ret, row, uo_body(body, uo_fn_cx(row, body, ucx)), l, c, mo, fsym)
-  DTest(desc, body, l, c, mo)      -> DTest(desc, uo_body(body, uo_frame(ucx)), l, c, mo)
-  DBench(desc, body, l, c, mo)     -> DBench(desc, uo_body(body, uo_frame(ucx)), l, c, mo)
-  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, uo_body(body, uo_frame(ucx)), l, c, mo)
-  DImpl(p, tas, tgt, inner, l, c, tps, isym) -> DImpl(p, tas, tgt, map(inner, (i) => uo_decl(i, ucx)), l, c, tps, isym)
+fn uo_decl(d: Decl, ucx: UnwCx, quals: SymSet) : Decl = match d {
+  DFn(pub_, n, tps, ps, ret, row, body, l, c, mo, fsym) -> DFn(pub_, n, tps, ps, ret, row, uo_body(body, uo_fn_cx(row, body, ucx, quals)), l, c, mo, fsym)
+  DTest(desc, body, l, c, mo)      -> DTest(desc, uo_body(body, uo_frame(ucx, quals)), l, c, mo)
+  DBench(desc, body, l, c, mo)     -> DBench(desc, uo_body(body, uo_frame(ucx, quals)), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, uo_body(body, uo_frame(ucx, quals)), l, c, mo)
+  DImpl(p, tas, tgt, inner, l, c, tps, isym) -> DImpl(p, tas, tgt, map(inner, (i) => uo_decl(i, ucx, quals)), l, c, tps, isym)
   _ -> d
 }
 
 # `exits_only` marks a fn whose declared row cannot unwind and that
 # installs no handler: only its `!` leaves early (`unw_fn_frame`).
-type UoCx = { ucx: UnwCx, exits_only: Bool }
+# `quals` holds the constructors the passes below read qualified.
+type UoCx = { ucx: UnwCx, exits_only: Bool, quals: SymSet }
 
-fn uo_frame(ucx: UnwCx) : UoCx = UoCx { ucx: ucx, exits_only: false }
+fn uo_frame(ucx: UnwCx, quals: SymSet) : UoCx = UoCx { ucx: ucx, exits_only: false, quals: quals }
 
-fn uo_fn_cx(row: RowExpr, body: Expr, ucx: UnwCx) : UoCx =
-  UoCx { ucx: ucx, exits_only: unw_row_class(row, ucx) == 0 and not xp_exists(body, false, uo_is_handle) }
+fn uo_fn_cx(row: RowExpr, body: Expr, ucx: UnwCx, quals: SymSet) : UoCx =
+  UoCx { ucx: ucx, exits_only: unw_row_class(row, ucx) == 0 and not xp_exists(body, false, uo_is_handle), quals: quals }
 
 fn uo_is_handle(e: Expr) : Bool = match e.kind {
   EHandle(_, _, _, _, _, _, _, _) -> true
@@ -90,14 +95,14 @@ fn uo_expr(e: Expr, cx: UoCx, n: Int) : Anf = match e.kind {
     Anf { e: with_kind(e, EMatch(rs.e, ra.arms)), n: ra.n }
   }
   ELambda(ps, b) -> {
-    let r = uo_expr(b, uo_frame(cx.ucx), n)
+    let r = uo_expr(b, uo_frame(cx.ucx, cx.quals), n)
     Anf { e: with_kind(e, ELambda(ps, r.e)), n: r.n }
   }
   EHandle(body, eff, hs, tys, init, alias, cls, ret) -> {
     let ri = uo_opt(init, cx, n)
     let rb = uo_expr(body, cx, ri.n)
-    let rc = uo_clauses(cls, uo_frame(cx.ucx), rb.n, [])
-    let rr = uo_ret(ret, uo_frame(cx.ucx), rc.n)
+    let rc = uo_clauses(cls, uo_frame(cx.ucx, cx.quals), rb.n, [])
+    let rr = uo_ret(ret, uo_frame(cx.ucx, cx.quals), rc.n)
     Anf { e: with_kind(e, EHandle(rb.e, eff, hs, tys, ri.o, alias, rc.cls, rr.o)), n: rr.n }
   }
   _ -> uo_pipe_or_ops(e, cx, n)
@@ -122,7 +127,7 @@ fn uo_pipe_or_ops(e: Expr, cx: UoCx, n: Int) : Anf = match e.kind {
 fn uo_name(e: Expr, xs: [Expr], cx: UoCx, n: Int) : Anf = match e.kind {
   EIntrinsic(_, _) -> Anf { e: e, n: n }
   _ ->
-    if uo_strands(xs, 0, picked_index(xs, (x) => uo_leaves(x, cx), true, 0, 0 - 1)) {
+    if uo_strands(xs, 0, picked_index(xs, (x) => uo_leaves(x, cx), true, 0, 0 - 1), cx.quals) {
       match anf_bind_until(e, (x) => uo_leaves(x, cx), uo_prefix(), n) {
         Some(a) -> a
         None    -> Anf { e: e, n: n }
@@ -131,24 +136,28 @@ fn uo_name(e: Expr, xs: [Expr], cx: UoCx, n: Int) : Anf = match e.kind {
 }
 
 # An operand before the one at `k` holds a reference of its own.
-fn uo_strands(xs: [Expr], i: Int, k: Int) : Bool = match xs {
+fn uo_strands(xs: [Expr], i: Int, k: Int, quals: SymSet) : Bool = match xs {
   [] -> false
-  [x, ...rest] -> i < k and (uo_owned(x) or uo_strands(rest, i + 1, k))
+  [x, ...rest] -> i < k and (uo_owned(x, quals) or uo_strands(rest, i + 1, k, quals))
 }
 
 # A boxed read counts: the ownership passes may dup it in place, and once
 # the operands after it are bound it is read only when the construct runs.
-fn uo_owned(x: Expr) : Bool = match x.kind {
+# A reference the passes below read qualified by its home holds nothing.
+fn uo_owned(x: Expr, quals: SymSet) : Bool = match x.kind {
   EModCall(_, _) -> false
+  ESym(s, _, _)  -> not sym_set_has(quals, s) and uo_typed_owned(x)
   EInt(_, _)     -> false
   EIntLit(_)     -> false
   EBool(_)       -> false
   EUnit          -> false
-  _ -> match x.ty {
-    Some(TyUnit) -> false
-    Some(t)      -> not ty_is_scalar(t)
-    None         -> true
-  }
+  _              -> uo_typed_owned(x)
+}
+
+fn uo_typed_owned(x: Expr) : Bool = match x.ty {
+  Some(TyUnit) -> false
+  Some(t)      -> not ty_is_scalar(t)
+  None         -> true
 }
 
 fn uo_pair(e: Expr, a: Expr, b: Expr, cx: UoCx, n: Int, k: (Expr, Expr) -> ExprKind) : Anf = {
