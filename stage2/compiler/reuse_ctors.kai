@@ -11,39 +11,59 @@ of the intern table.
 import compiler.ast
 import compiler.expr_positions
 import compiler.emit_shared
+import compiler.ctor_ix
+import compiler.sym_read
 import compiler.live_fns
 
 #[doc("A rebuild's constructor: the module that declares it, if known, and its name.")]
 pub type ReuseCtorName = RCN(Option[String], String)
 
+# The variant table and its rows by constructor id. The callers hold no
+# root name, so the index is built without one: a constructor it does not
+# answer is the root's.
+type RtCx = { variants: [VariantEntry], ctors: CtorIx }
+
 #[doc("The tags of every constructor a `__perceus_reuse_variant` rebuild names in a function of the post-Perceus `decls` that can run. Functions that never run are left out, so the table does not depend on how much of the core a build lowered. `entry` is the program's entry point.")]
 pub fn reusable_tags(decls: [Decl], variants: [VariantEntry], entry: SymId) : [Int] =
-  reuse_ctor_tags(collect_reuse_ctors(live_decls(decls, entry), []), variants, [])
+  list_reverse(collect_reuse_tags(live_decls(decls, entry), RtCx { variants: variants, ctors: ctor_ix_build(variants, decls, None) }, []))
 
-fn reuse_ctor_tags(names: [ReuseCtorName], variants: [VariantEntry], acc: [Int]) : [Int] = match names {
-  []           -> acc
-  [RCN(h, n), ...rest] -> match evar_find_tag_opt_in(variants, h, n) {
-    Some(t) -> reuse_ctor_tags(rest, variants, [t, ...acc])
-    None    -> reuse_ctor_tags(rest, variants, acc)
+# A rebuild resolved by id answers from its row. Any other is keyed by the
+# module that declares it: its type's home, else the qualifier it was
+# written with.
+fn reuse_site_tag(cx: RtCx, ctor: Expr) : Option[Int] = match reuse_site_row(cx.ctors, ctor) {
+  Some(row) -> Some(ctor_row_tag(row))
+  None      -> match reuse_ctor_spelled(ctor) {
+    Some(RCN(q, cname)) -> match ctor.ty {
+      Some(TyCon(Some(m), _, _, _)) -> evar_find_tag_opt_in(cx.variants, Some(m), cname)
+      _                             -> evar_find_tag_opt_in(cx.variants, q, cname)
+    }
+    None -> None
   }
 }
 
-#[doc("The rebuild's ctor keyed by the module that declares it: its type's home, else the qualifier it was written with.")]
-pub fn reuse_ctor_ref(ctor: Expr) : Option[ReuseCtorName] = match reuse_ctor_home_name(ctor) {
-  Some(RCN(q, cname)) -> match ctor.ty {
-    Some(TyCon(Some(m), _, _, _)) -> Some(RCN(Some(m), cname))
-    _                             -> Some(RCN(q, cname))
+fn reuse_site_row(ctors: CtorIx, ctor: Expr) : Option[VariantEntry] = match ctor.kind {
+  ECall(cf, _) -> ctor_ix_site(ctors, cf)
+  _            -> None
+}
+
+# The rebuild's ctor as its callee spells it. A reference reads as the
+# bare name it carries.
+fn reuse_ctor_spelled(ctor: Expr) : Option[ReuseCtorName] = match ctor.kind {
+  ECall(cf, _) -> match sym_read_kind(cf.kind) {
+    EVar(cname)          -> Some(RCN(None, cname))
+    EModCall(m, cname)   -> Some(RCN(Some(m), cname))
+    _                    -> None
   }
-  None -> None
+  _ -> None
 }
 
-fn rcn_eq(a: ReuseCtorName, b: ReuseCtorName) : Bool = match a {
-  RCN(ha, na) -> match b { RCN(hb, nb) -> na == nb and ctor_home_matches(ha, hb) and ctor_home_matches(hb, ha) }
-}
-
-#[doc("The ctor a rebuild call names, with the qualifier it was written with. The qualifier may name the type rather than the module.")]
-pub fn reuse_ctor_home_name(ctor: Expr) : Option[ReuseCtorName] = match ctor.kind {
+#[doc("The ctor a rebuild call names: the home and name of its row when the callee carries its id, else the qualifier it was written with, which may name the type rather than the module.")]
+pub fn reuse_ctor_home_name(ctors: CtorIx, ctor: Expr) : Option[ReuseCtorName] = match ctor.kind {
   ECall(cf, _) -> match cf.kind {
+    ESym(_, _, _) -> match ctor_ix_site(ctors, cf) {
+      Some(EV(home, cname, _, _, _)) -> Some(RCN(home, cname))
+      None                           -> None
+    }
     EVar(cname)          -> Some(RCN(None, cname))
     EModCall(m, cname)   -> Some(RCN(Some(m), cname))
     _                    -> None
@@ -58,32 +78,33 @@ pub fn reuse_same_ctor(phome: Option[String], pname: String, b: ReuseCtorName) :
       bname == pname and (ctor_home_matches(bhome, phome) or ctor_home_matches(phome, bhome))
   }
 
-fn collect_reuse_ctors(decls: [Decl], acc: [ReuseCtorName]) : [ReuseCtorName] = match decls {
+# Newest first, each tag once.
+fn collect_reuse_tags(decls: [Decl], cx: RtCx, acc: [Int]) : [Int] = match decls {
   []           -> acc
-  [d, ...rest] -> collect_reuse_ctors(rest, collect_reuse_ctors_decl(d, acc))
+  [d, ...rest] -> collect_reuse_tags(rest, cx, collect_reuse_tags_decl(d, cx, acc))
 }
 
-fn collect_reuse_ctors_decl(d: Decl, acc: [ReuseCtorName]) : [ReuseCtorName] = match d {
-  DFn(_, _, _, _, _, _, body, _, _, _, _) -> walk_reuse_ctors(body, acc)
-  DTest(_, body, _, _, _)     -> walk_reuse_ctors(body, acc)
-  DBench(_, body, _, _, _)    -> walk_reuse_ctors(body, acc)
-  DCheck(_, _, body, _, _, _) -> walk_reuse_ctors(body, acc)
+fn collect_reuse_tags_decl(d: Decl, cx: RtCx, acc: [Int]) : [Int] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _, _) -> walk_reuse_tags(body, cx, acc)
+  DTest(_, body, _, _, _)     -> walk_reuse_tags(body, cx, acc)
+  DBench(_, body, _, _, _)    -> walk_reuse_tags(body, cx, acc)
+  DCheck(_, _, body, _, _, _) -> walk_reuse_tags(body, cx, acc)
   _ -> acc
 }
 
-fn walk_reuse_ctors(e: Expr, acc: [ReuseCtorName]) : [ReuseCtorName] =
-  walk_reuse_ctors_positions(xp_positions(e), add_reuse_ctor(e.kind, acc))
+fn walk_reuse_tags(e: Expr, cx: RtCx, acc: [Int]) : [Int] =
+  walk_reuse_tags_positions(xp_positions(e), cx, add_reuse_tag(e.kind, cx, acc))
 
-fn walk_reuse_ctors_positions(ps: [XPos], acc: [ReuseCtorName]) : [ReuseCtorName] = match ps {
+fn walk_reuse_tags_positions(ps: [XPos], cx: RtCx, acc: [Int]) : [Int] = match ps {
   []                 -> acc
-  [XP(_, x), ...rest] -> walk_reuse_ctors_positions(rest, walk_reuse_ctors(x, acc))
+  [XP(_, x), ...rest] -> walk_reuse_tags_positions(rest, cx, walk_reuse_tags(x, cx, acc))
 }
 
-fn add_reuse_ctor(k: ExprKind, acc: [ReuseCtorName]) : [ReuseCtorName] = match k {
+fn add_reuse_tag(k: ExprKind, cx: RtCx, acc: [Int]) : [Int] = match k {
   ECall(callee, [_scr, ctor]) ->
     if is_reuse_variant_callee(callee) {
-      match reuse_ctor_ref(ctor) {
-        Some(r) -> if any(acc, (x) => rcn_eq(x, r)) { acc } else { [r, ...acc] }
+      match reuse_site_tag(cx, ctor) {
+        Some(t) -> if any(acc, (x) => x == t) { acc } else { [t, ...acc] }
         None    -> acc
       }
     } else { acc }
