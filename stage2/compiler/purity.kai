@@ -44,6 +44,7 @@ import compiler.entry
 import compiler.sym_read
 import compiler.util
 import compiler.fnreg
+import compiler.core_builtins
 
 #[doc("Confirmed purity level of a function's lowered body. `PImpure` is the bottom: it allocates, touches RC, performs an effect, mutates, reads through a pointer, or calls something not confirmed `PConst`. `PConst` reads no memory at all — its result depends only on its raw scalar arguments, so it maps to LLVM `memory(none)` / C `__attribute__((const))`.")]
 pub type Purity = PImpure | PConst
@@ -180,7 +181,7 @@ fn pty_scan_kind(k: ExprKind) : Local {
     EBool(_) -> LConst([])
     EChar(_) -> LConst([])
     EUnit    -> LConst([])
-    EVar(nm) -> if pty_var_is_impure(nm) { LImpure } else { LConst([]) }
+    EVar(_) -> if pty_ref_is_impure(k) { LImpure } else { LConst([]) }
     EBinop(op, a, b) -> if pty_binop_reads_memory(op) { LImpure } else { pty_merge2(pty_scan_body(a), pty_scan_body(b)) }
     EUnop(_, x) -> pty_scan_body(x)
     ECall(callee, cargs) -> pty_scan_call(callee, cargs)
@@ -201,12 +202,20 @@ fn pty_scan_kind(k: ExprKind) : Local {
   }
 }
 
-# A bare `EVar` callee/reference is impure when it names a Mutable-slot
-# intrinsic (`array_*` / `ref_*`, including the borrow variants). Every
-# other bare name is a value read, which is pure. An RC or reuse mark is
-# not a name: it takes the scan's conservative default.
-fn pty_var_is_impure(nm: String) : Bool =
-  pty_is_perceus_rc_name(nm) or is_mutable_intrinsic_name(nm)
+# A callee/reference is impure when it is a Mutable-slot builtin (`array_*`,
+# the lending forms included). Every other name is a value read, which is
+# pure. An RC or reuse mark is not a name: it takes the scan's
+# conservative default.
+fn pty_ref_is_impure(k: ExprKind) : Bool = match k {
+  ESym(s, _, nm) -> pty_is_perceus_rc_name(nm) or pty_is_mutable_builtin(s)
+  EVar(nm)       -> pty_is_perceus_rc_name(nm)
+  _              -> false
+}
+
+fn pty_is_mutable_builtin(s: SymId) : Bool = match builtin_of(s) {
+  Some(b) -> builtin_is_mutable_intrinsic(b)
+  None    -> false
+}
 
 fn pty_is_perceus_rc_name(nm: String) : Bool = pty_name_in(["__perceus_drop"], nm)
 
@@ -236,7 +245,7 @@ fn pty_scan_call(callee: Expr, args: [Expr]) : Local =
 fn pty_call_head(callee: Expr) : Local {
   match sym_read_kind(callee.kind) {
     EVar(nm) ->
-      if pty_is_perceus_rc_name(nm) or is_mutable_intrinsic_name(nm) { LImpure }
+      if pty_ref_is_impure(callee.kind) { LImpure }
       else if pty_name_is_ctor(nm) { LImpure }
       else if pty_is_pure_builtin(nm) { LConst([]) }
       else { LConst([nm]) }

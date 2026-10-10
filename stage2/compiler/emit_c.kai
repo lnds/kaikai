@@ -85,6 +85,8 @@ import compiler.effect_scope_table
 import compiler.effect_scope
 import compiler.core_prims
 import compiler.native_prims
+import compiler.core_builtins
+import compiler.core_prim_ix
 import compiler.unbox
 import compiler.perceus
 import compiler.borrow_map
@@ -225,12 +227,10 @@ type EmitCtx = { lcs: [String], fns: [EFn], fx: FnIndex, variants: [VariantEntry
                  recs: [RecInfo],
                  # Head tags of the stamped record types (`rec_stamp`).
                  stamps: [RecStamp],
-                 # The core lookup tables, built once at emit entry. A call
-                 # resolves its callee against these by walking them borrowed —
-                 # without them the per-call-site `core_table()` /
-                 # `rcore_table()` rebuild materialised the whole table for
-                 # every emitted ident and held it live to end of run.
-                 core: [ECore], rcore: [RCore],
+                 # The core builtins' rows keyed by id, built once at emit
+                 # entry: a call finds the row of the builtin its callee
+                 # names without rebuilding or walking a table.
+                 core_ix: CoreIx,
                  # The per-function evidence-frame ABI: each
                  # function's USER-effect slot layout, keyed by emitted
                  # symbol. The perform site reads its own frame's slot for
@@ -267,17 +267,17 @@ type EmitCtx = { lcs: [String], fns: [EFn], fx: FnIndex, variants: [VariantEntry
 fn emit_ctx_with_fns(cx: EmitCtx, f: [EFn]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: f, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
 
 fn emit_ctx_with_lcs(cx: EmitCtx, l: [String]) : EmitCtx =
   EmitCtx { lcs: l, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
 
 fn emit_ctx_with_evf(cx: EmitCtx, evf: EvFrames) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
 
 # Set the enclosing-fn key (entering a fn or lambda body). `find_lam`
 # keys on this + (line, col) so a nested ELambda resolves to its own
@@ -285,26 +285,26 @@ fn emit_ctx_with_evf(cx: EmitCtx, evf: EvFrames) : EmitCtx =
 fn emit_ctx_with_enc_fn(cx: EmitCtx, ef: String) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: ef, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: ef, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
 
 # Set/clear the arena-routing flag for a region body.
 fn emit_ctx_with_in_region(cx: EmitCtx, b: Bool) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: b, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
 
 # Set the borrowed-binder set for an arm-top reuse body.
 fn emit_ctx_with_borrowed(cx: EmitCtx, b: [String]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: b,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
 
 # Replace the tcrec pending-release ledger (entering a match arm body /
 # refining across a branch point).
 fn emit_ctx_with_unw(cx: EmitCtx, u: UnwFrame) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: u, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: u, root_mod: cx.root_mod }
 
 # The C locals among `names` that hold a boxed reference here.
 fn emit_unw_vars(names: [String], cx: EmitCtx) : [String] = emit_unw_boxed(unw_admit(cx.unw, names), cx)
@@ -395,7 +395,7 @@ fn emit_unw_var(f: Expr, n: String) : Expr = Expr { kind: EVar(n), line: f.line,
 fn emit_ctx_with_tcpend(cx: EmitCtx, l: [String]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: l, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: l, unw: cx.unw, root_mod: cx.root_mod }
 
 # Refine the ledger across an already-evaluated expression — a no-op
 # (and no scan) when the ledger is empty, the overwhelmingly common case.
@@ -413,19 +413,19 @@ fn emit_ctx_tcpend_after_stmts(cx: EmitCtx, ss: [Stmt]) : EmitCtx = match cx.tcp
 fn emit_ctx_with_hoisted(cx: EmitCtx, h: [Int]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: h, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: h, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
 
 # Set the donation-active flag (entering/leaving a `_donor`-taking body).
 fn emit_ctx_with_rd_active(cx: EmitCtx, a: Bool) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: a, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: a, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
 
 # Set/clear the reuse-donor (entering/leaving an arm-top-reuse body).
 fn emit_ctx_with_reuse_donor(cx: EmitCtx, d: Option[ReuseDonor]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: d, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: d, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
 
 # i64-inline (Lane B): set the kind-1 raw-bound binder name set for an arm
 # body. Entering a match arm whose pattern binds kind-1 Int slots, the
@@ -435,7 +435,7 @@ fn emit_ctx_with_reuse_donor(cx: EmitCtx, d: Option[ReuseDonor]) : EmitCtx =
 fn emit_ctx_with_kind1_raw(cx: EmitCtx, ks: [String]) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
-            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: ks, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+            hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: ks, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
 
 # True when `nm` is a kind-1 raw-bound binder in the current arm scope.
 fn emit_ctx_kind1_raw_has(cx: EmitCtx, nm: String) : Bool = list_has(cx.kind1_raw, nm)
@@ -1384,7 +1384,7 @@ fn list_head_or(xs: [String], fallback: String) : String = match xs {
 fn region_copy_out(value_c: String) : String =
   concat_all(["KaiValue *__rin = ", value_c, "; KaiValue *__rout = kai_deep_copy_out(__rin); kai_decref(__rin);"])
 
-fn emit_ident_value(name: String, fid: FnId, fx: FnIndex, lcs: [String], fns: [EFn], variants: [VariantEntry], core: [ECore], root_mod: Option[String]) : String {
+fn emit_ident_value(name: String, fid: FnId, fx: FnIndex, lcs: [String], fns: [EFn], variants: [VariantEntry], core_ix: CoreIx, root_mod: Option[String]) : String {
   if sym_raw(fnid_sym(fid)) < 0 and list_has(lcs, name) { c_local(name) }
   else { match evar_find(variants, name) {
     # A bare nullary ctor ident (RBLeaf, None, ...) — read the seeded
@@ -1396,14 +1396,12 @@ fn emit_ident_value(name: String, fid: FnId, fx: FnIndex, lcs: [String], fns: [E
       "kai_nullary_fast(", int_to_string(evar_find_tag(variants, name)),
       ", \"", name, "\")"
     ])
-    # A top-level `fn` the program declares under this name answers
-    # before the core table: a declaration shadows the builtin it is
-    # spelled like, which is what the typer and the native lowering
-    # (`c_sym_of_callee`) already read off this same registry.
+    # A reference reaches the `fn` it resolved to, or the builtin whose
+    # row it carries: the id decides, never the spelling.
     None -> match fnx_callee(fx, fid) {
       Some(EFn(_, ar, mo, _, _)) ->
         cat5("kai_closure(&", c_user_thunk_sym(c_sym(name, mo)), ", ", int_to_string(ar), ", 0, NULL)")
-      None -> match core_find(core, name) {
+      None -> match core_ix_boxed(core_ix, fnid_sym(fid)) {
         Some(ep) -> match ep {
           EP(_, cname, ar) ->
             cat5("kai_closure(&_", cname, "_thunk, ", int_to_string(ar), ", 0, NULL)")
@@ -2312,27 +2310,18 @@ fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Opti
 # lookup can answer by declaration rather than by name.
 # A raw-core C-API call yields a raw scalar (a `void *` handle, `int64_t`
 # or unit), so it is emitted inline with per-param-marshalled args, never
-# a boxed round-trip that would read a `void *` as an Int. A top-level fn
-# declared under the prim's name shadows it.
-fn emit_raw_rcore(src: String, callee_e: Expr, callee: String, args_e: [Expr], cx: EmitCtx) : Option[String] / Console =
-  match ec_callee(cx, ec_callee_sym(callee_e), callee) {
-    Some(_) -> None
-    None    -> match rcore_find(cx.rcore, callee) {
-      Some(RP(_, cname, ptys, _)) -> Some(emit_rcore_call(src, cname, ptys, args_e, cx))
-      None                        -> None
-    }
+# a boxed round-trip that would read a `void *` as an Int.
+fn emit_raw_rcore(src: String, callee_e: Expr, args_e: [Expr], cx: EmitCtx) : Option[String] / Console =
+  match core_ix_raw(cx.core_ix, fnid_sym(ec_callee_sym(callee_e))) {
+    Some(RP(_, cname, ptys, _)) -> Some(emit_rcore_call(src, cname, ptys, args_e, cx))
+    None                        -> None
   }
 
 # The fn a call reaches; a bare name reaches none.
 fn ec_callee(cx: EmitCtx, fid: FnId, name: String) : Option[EFn] = fnx_callee(cx.fx, fid)
 
-fn ec_in_core(core: [ECore], n: String) : Bool = match core_find(core, n) {
-  Some(_) -> true
-  None    -> false
-}
-
-fn ec_in_rcore(rcore: [RCore], n: String) : Bool = match rcore_find(rcore, n) {
-  Some(_) -> true
+fn ec_unit_coercion(f: Expr) : Bool = match builtin_ref(f) {
+  Some(b) -> builtin_is_unit_coercion(b)
   None    -> false
 }
 
@@ -2384,7 +2373,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _   -> "kai_unit() /* resume: arity mismatch (expected 1 or 2 args) */"
         }
-      } else if callee == "__strip_unit" or callee == "__attach_unit" or callee == "__detach_unit" {
+      } else if ec_unit_coercion(f) {
         # typer-internal unit erasure/tagging (`Real<u>` -> `Real`,
         # `Decimal` <-> `Decimal<c>`). At runtime all three are
         # identity — units carry no representation, so the lowered
@@ -2395,7 +2384,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           [a] -> emit_expr(src, a, cx)
           _   -> "kai_unit() /* unit tag intrinsic: expected 1 arg */"
         }
-      } else if callee == "unit_name" {
+      } else if is_builtin_ref(f, CbUnitName) {
         # m12.8.x phase 2 (Gap 1, partial): compile-time reflection
         # on the dimensioned argument. Inlines the canonical unit
         # symbol as a String literal. Reads the arg's `.ty` (which
@@ -2412,7 +2401,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           }
           _ -> "kai_unit() /* unit_name: expected 1 arg */"
         }
-      } else if callee == "bit_and" {
+      } else if is_builtin_ref(f, CbBitAnd) {
         # m13: bit ops are compiler intrinsics — each lowers inline to
         # the matching C operator. The shape is consistent across the
         # binary ops: read both KaiInts, apply the operator on `as.i`,
@@ -2428,7 +2417,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _ -> "kai_unit() /* bit_and: expected 2 args */"
         }
-      } else if callee == "bit_or" {
+      } else if is_builtin_ref(f, CbBitOr) {
         match args_e {
           [a, b] -> concat_all([
             "({ KaiValue *_a = ", emit_expr(src, a, cx),
@@ -2438,7 +2427,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _ -> "kai_unit() /* bit_or: expected 2 args */"
         }
-      } else if callee == "bit_xor" {
+      } else if is_builtin_ref(f, CbBitXor) {
         match args_e {
           [a, b] -> concat_all([
             "({ KaiValue *_a = ", emit_expr(src, a, cx),
@@ -2448,7 +2437,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _ -> "kai_unit() /* bit_xor: expected 2 args */"
         }
-      } else if callee == "bit_not" {
+      } else if is_builtin_ref(f, CbBitNot) {
         # Unary: a single `~`. Refcount matches `bit_count`.
         match args_e {
           [a] -> concat_all([
@@ -2458,7 +2447,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _ -> "kai_unit() /* bit_not: expected 1 arg */"
         }
-      } else if callee == "bit_shl" {
+      } else if is_builtin_ref(f, CbBitShl) {
         # Shifted-out bits wrap (`Int` wrapping discipline, computed in
         # `uint64_t`); the count is masked to `& 63` so every shift is
         # defined C. Same discipline across the shift family below.
@@ -2471,7 +2460,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _ -> "kai_unit() /* bit_shl: expected 2 args */"
         }
-      } else if callee == "bit_shr" {
+      } else if is_builtin_ref(f, CbBitShr) {
         # Arithmetic shift: signed `>>` preserves the sign bit. The
         # contrast with `bit_ushr` rests on `kai_intf(_a)` staying
         # `int64_t`.
@@ -2484,7 +2473,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _ -> "kai_unit() /* bit_shr: expected 2 args */"
         }
-      } else if callee == "bit_ushr" {
+      } else if is_builtin_ref(f, CbBitUshr) {
         # Logical shift: cast through `uint64_t` to zero-fill, then
         # back to `int64_t` so the result fits the KaiInt slot.
         match args_e {
@@ -2496,7 +2485,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _ -> "kai_unit() /* bit_ushr: expected 2 args */"
         }
-      } else if callee == "bit_count" {
+      } else if is_builtin_ref(f, CbBitCount) {
         # `__builtin_popcountll` is GCC/Clang. Cast through `uint64_t`
         # so the count semantics don't depend on signed-bit handling.
         match args_e {
@@ -2507,7 +2496,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _ -> "kai_unit() /* bit_count: expected 1 arg */"
         }
-      } else if callee == "bit_test" {
+      } else if is_builtin_ref(f, CbBitTest) {
         # Returns Bool — boxed via `kai_bool`.
         match args_e {
           [a, b] -> concat_all([
@@ -2518,7 +2507,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _ -> "kai_unit() /* bit_test: expected 2 args */"
         }
-      } else if callee == "bit_set" {
+      } else if is_builtin_ref(f, CbBitSet) {
         match args_e {
           [a, b] -> concat_all([
             "({ KaiValue *_a = ", emit_expr(src, a, cx),
@@ -2528,7 +2517,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _ -> "kai_unit() /* bit_set: expected 2 args */"
         }
-      } else if callee == "bit_clear" {
+      } else if is_builtin_ref(f, CbBitClear) {
         match args_e {
           [a, b] -> concat_all([
             "({ KaiValue *_a = ", emit_expr(src, a, cx),
@@ -2538,7 +2527,7 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _ -> "kai_unit() /* bit_clear: expected 2 args */"
         }
-      } else if callee == "bit_toggle" {
+      } else if is_builtin_ref(f, CbBitToggle) {
         match args_e {
           [a, b] -> concat_all([
             "({ KaiValue *_a = ", emit_expr(src, a, cx),
@@ -2753,17 +2742,15 @@ fn emit_named_call_lookup(src: String, callee: String, csym: FnId, args_e: [Expr
     Some(_) -> emit_variant_call(None, callee, list_length(args_e),
                                  emit_slot_ops(src, args_e, cx),
                                  cx)
-    # A top-level `fn` the program declares under this name answers
-    # before either core table: a declaration shadows the builtin it is
-    # spelled like, which is what the typer and the native lowering
-    # (`c_sym_of_callee_st`) already read off this same registry.
+    # A reference reaches the `fn` it resolved to, or the builtin whose
+    # row it carries: the id decides, never the spelling.
     None -> match ec_callee(cx, csym, callee) {
       Some(EFn(_, _, mo, _, fid)) -> emit_fn_call_seq(fid, c_sym(callee, mo), emit_arg_vals(src, args_e, cx), cx)
-      # A raw core prim is checked before the boxed `core_find`: its args
+      # A raw core prim is checked before the boxed row: its args
       # marshal raw per the prim's param types and its result is raw.
-      None -> match rcore_find(cx.rcore, callee) {
+      None -> match core_ix_raw(cx.core_ix, fnid_sym(csym)) {
         Some(RP(_, cname, ptys, _)) -> emit_rcore_call(src, cname, ptys, args_e, cx)
-        None -> match core_find(cx.core, callee) {
+        None -> match core_ix_boxed(cx.core_ix, fnid_sym(csym)) {
           Some(ep) -> match ep {
             EP(_, cname, _) -> seq_call(cat2(cname, "("), emit_arg_vals(src, args_e, cx), ")")
           }
@@ -2970,27 +2957,31 @@ fn emit_field_init_name(fi: FieldInit) : String {
 # on (v, i) matches the vec_get variant it replaces; no record, no
 # base drop.
 fn emit_vec_get_field_fused(src: String, base: Expr, fname: String, cx: EmitCtx) : Option[String] / Console = match base.kind {
-  ECall(f, args_e) -> match sym_read_kind(f.kind) {
-    EVar(callee) ->
-      if (callee == "vec_get" or callee == "vec_get_borrow") and not cx.in_region {
+  ECall(f, args_e) -> match vec_get_field_helper(f) {
+    Some(helper) ->
+      if not cx.in_region {
         match vec_rec_field_slot(cx.recs, base.ty, fname) {
           Some(fidx) -> match args_e {
-            [v, i] -> {
-              let helper = if callee == "vec_get_borrow" { "kai_vec_get_field_borrow(" }
-                           else { "kai_vec_get_field(" }
-              Some(concat_all([
-                helper, emit_expr(src, v, cx), ", ", emit_expr(src, i, cx),
-                ", ", int_to_string(fidx), ")"
-              ]))
-            }
+            [v, i] -> Some(concat_all([
+              helper, emit_expr(src, v, cx), ", ", emit_expr(src, i, cx),
+              ", ", int_to_string(fidx), ")"
+            ]))
             _ -> None
           }
           None -> None
         }
       } else { None }
-    _ -> None
+    None -> None
   }
   _ -> None
+}
+
+# The runtime helper reading one field of the element `f` fetches, when
+# `f` is a `vec_get` form.
+fn vec_get_field_helper(f: Expr) : Option[String] = match builtin_ref(f) {
+  Some(CbVecGet)       -> Some("kai_vec_get_field(")
+  Some(CbVecGetBorrow) -> Some("kai_vec_get_field_borrow(")
+  _                    -> None
 }
 
 # `vec_push(v, Rec{..})` / `vec_set(v, i, Rec{..})` on a REC carrier →
@@ -2998,9 +2989,9 @@ fn emit_vec_get_field_fused(src: String, base: Expr, fname: String, cx: EmitCtx)
 # field values (compound literals, the __perceus_reuse_record idiom).
 # Field order is the desugar-canonicalised declaration order — the
 # same layout bet the constant-index record read makes.
-fn emit_vec_write_rec_fused(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option[String] / Console = match sym_read_kind(f.kind) {
-  EVar(callee) -> {
-    if callee == "vec_push" and not cx.in_region {
+fn emit_vec_write_rec_fused(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option[String] / Console = match f.kind {
+  ESym(_, _, _) -> {
+    if is_builtin_ref(f, CbVecPush) and not cx.in_region {
       match args_e {
         [v, lit] -> match lit.kind {
           ERecordLit(_, _, fis) ->
@@ -3019,7 +3010,7 @@ fn emit_vec_write_rec_fused(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) :
         }
         _ -> None
       }
-    } else if callee == "vec_set" and not cx.in_region {
+    } else if is_builtin_ref(f, CbVecSet) and not cx.in_region {
       match args_e {
         [v, i, lit] -> match lit.kind {
           ERecordLit(_, _, fis) ->
@@ -5667,12 +5658,12 @@ fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
   }
 }
 
-fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], fx: FnIndex, variants: [VariantEntry], cls: [ClauseInfo], consts: [Decl], effs: [Decl], recs: [RecInfo], stamps: [RecStamp], core: [ECore], rcore: [RCore], evf: EvFrames, root_mod: Option[String], ucx: UnwCx) : String / Console = {
+fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], fx: FnIndex, variants: [VariantEntry], cls: [ClauseInfo], consts: [Decl], effs: [Decl], recs: [RecInfo], stamps: [RecStamp], core_ix: CoreIx, evf: EvFrames, root_mod: Option[String], ucx: UnwCx) : String / Console = {
   # Lambda/closure bodies carry the evidence-frame table so a call site
   # inside one fills a frame-carrying callee's evidence (the by-name walk
   # stays the fallback for any effect the frame does not carry).
   concat_all(map(lams, (l) => emit_lam_helper(src, l, EmitCtx { lcs: [], fns: fns, fx: fx, variants: variants, lams: lams, cls: cls,
-                                                                regions: [], in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: consts, effs: effs, ffi_reg: [], cur_enc_fn: "", recs: recs, stamps: stamps, core: core, rcore: rcore, evf: evf, rd_active: false, rd_capable: [], tcpend: [], unw: unw_frame_none(ucx), root_mod: root_mod })))
+                                                                regions: [], in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: consts, effs: effs, ffi_reg: [], cur_enc_fn: "", recs: recs, stamps: stamps, core_ix: core_ix, evf: evf, rd_active: false, rd_capable: [], tcpend: [], unw: unw_frame_none(ucx), root_mod: root_mod })))
 }
 
 fn emit_one_lam_forward(l: LamInfo) : String =
@@ -6662,8 +6653,8 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         _ -> fixed_vec_arity_mismatch(MkFixedVecGetDyn)
       }
       EMark(MkTcrecStep(s)) -> tcrec_emit_goto(src, s.sym, s.dropmask, s.params, args_e, cx)
-      EVar(callee) ->
-        match emit_raw_rcore(src, callee_e, callee, args_e, cx) {
+      ESym(_, _, _) ->
+        match emit_raw_rcore(src, callee_e, args_e, cx) {
           Some(s) -> s
           None -> match emit_ufn_raw_call_at(src, x, callee_e, args_e, cx) {
           Some(s) -> s
@@ -6842,7 +6833,7 @@ fn emit_expr(src: String, x: Expr, cx: EmitCtx) : String / Console {
 fn emit_decl_value(src: String, name: String, fid: FnId, cx: EmitCtx) : String / Console =
   match const_body_of(cx.consts, name) {
     Some(body) -> emit_expr(src, body, cx)
-    None       -> emit_ident_value(name, fid, cx.fx, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
+    None       -> emit_ident_value(name, fid, cx.fx, cx.lcs, cx.fns, cx.variants, cx.core_ix, cx.root_mod)
   }
 
 fn emit_var_value(src: String, name: String, fid: FnId, ty: Option[Ty], cx: EmitCtx) : String / Console =
@@ -6860,10 +6851,10 @@ fn emit_var_value(src: String, name: String, fid: FnId, ty: Option[Ty], cx: Emit
   else if not list_has(cx.lcs, name) {
     match const_body_of(cx.consts, name) {
       Some(body) -> emit_expr(src, body, cx)
-      None       -> emit_ident_value(name, fid, cx.fx, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
+      None       -> emit_ident_value(name, fid, cx.fx, cx.lcs, cx.fns, cx.variants, cx.core_ix, cx.root_mod)
     }
   }
-  else { emit_ident_value(name, fid, cx.fx, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod) }
+  else { emit_ident_value(name, fid, cx.fx, cx.lcs, cx.fns, cx.variants, cx.core_ix, cx.root_mod) }
 
 fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
 
@@ -6872,8 +6863,8 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
   # on what the normaliser can still produce, so removing it is a
   # compile error rather than dead-code cleanup.
   match sym_read_kind(x.kind) {
-    ESym(s, inst, name) -> emit_ident_value(name, FnId(s, inst), cx.fx, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
-    EMark(m) -> emit_ident_value(mark_name(m), fnid_none(), cx.fx, cx.lcs, cx.fns, cx.variants, cx.core, cx.root_mod)
+    ESym(s, inst, name) -> emit_ident_value(name, FnId(s, inst), cx.fx, cx.lcs, cx.fns, cx.variants, cx.core_ix, cx.root_mod)
+    EMark(m) -> emit_ident_value(mark_name(m), fnid_none(), cx.fx, cx.lcs, cx.fns, cx.variants, cx.core_ix, cx.root_mod)
     # Fix B (bidirectional list literals): when an Int literal is
     # checked against a Byte-context (e.g. inside `let bs: [Byte] = [65, 66]`),
     # the typer rewrites the node's ty to TyByte. Emit a Byte
@@ -8351,7 +8342,7 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_sy
         let body_in_region = cx.in_region or fn_has_region_brand(params, ret_ty_opt)
         let frame = unw_fn_frame(cx.unw, c_sym(name, mo), Some(row), unw_param_seeds(params, opt_sig, cx.unw.ucx), fn_param_names(params), body)
         let body_cx = EmitCtx { lcs: body_lcs, fns: body_fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                                regions: cx.regions, in_region: body_in_region, borrowed: cx.borrowed, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: c_sym(name, mo), recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: rd_cap, rd_capable: cx.rd_capable, tcpend: [], unw: frame, root_mod: cx.root_mod }
+                                regions: cx.regions, in_region: body_in_region, borrowed: cx.borrowed, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: c_sym(name, mo), recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: rd_cap, rd_capable: cx.rd_capable, tcpend: [], unw: frame, root_mod: cx.root_mod }
         # Phase 3 unboxing — UFn body emits a raw return expression
         # whose value is the raw scalar matching `ret_ty`. The
         # body's `mode` is set by `unbox_pass`/`ufn_promote_calls`;
@@ -9058,7 +9049,7 @@ fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr, line: Int,
   # lambdas, so `find_lam` resolves them (a test body's lambda otherwise
   # looked up under the wrong enc_fn → "non-callable").
   let body_cx = EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: test_enc, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: test_enc, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_test_", int_to_string(id), "(void) {\n",
@@ -9152,7 +9143,7 @@ fn emit_bench_fn(src: String, id: Int, desc_span: String, body: Expr,
                  cx: EmitCtx, bench_enc: String) : String / Console {
 
   let body_cx = EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: bench_enc, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: bench_enc, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
     "static void _kai_bench_", int_to_string(id), "(void) {\n",
@@ -9497,7 +9488,7 @@ fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body:
 
   let lcs2 = list_append(check_param_names(params), cx.lcs)
   let body_cx = EmitCtx { lcs: lcs2, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
-                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: check_enc, recs: cx.recs, stamps: cx.stamps, core: cx.core, rcore: cx.rcore, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
+                          regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed, hoisted: [], reuse_donor: None, kind1_raw: [], consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: check_enc, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod }
   let body_c = emit_expr(src, body, body_cx)
   # Issue #438: hoist param locals to function scope so the post-loop
   # shrink section can keep mutating them. The per-iter loop now
@@ -10975,19 +10966,18 @@ pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl],
   ])
 
   # ---- per-module .c translation units ------------------------------
-  let core_tbl = core_table()
-  let rcore_tbl = rcore_table()
+  let core_ix = core_ix_build()
   # The cx carries the same capable set as the shared forward decls above;
   # every TU (root and module) emits defs, thunks, and call sites keyed on
   # it, which is what keeps the `_donor` ABI link-consistent across `.o`s.
   let cx = EmitCtx { lcs: [], fns: fns, fx: fx, variants: variants, lams: lams, cls: clauses_info,
-                     regions: regions, in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls), cur_enc_fn: "", recs: collect_records(decls), stamps: rec_stamps(decls, stamp_ids), core: core_tbl, rcore: rcore_tbl, evf: frames_index(build_evidence_frames(decls, entry)), rd_active: false, rd_capable: rd_cap_set, tcpend: [], unw: unw_frame_none(unw_cx(decls, clauses_info)), root_mod: target_origin }
+                     regions: regions, in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls), cur_enc_fn: "", recs: collect_records(decls), stamps: rec_stamps(decls, stamp_ids), core_ix: core_ix, evf: frames_index(build_evidence_frames(decls, entry)), rd_active: false, rd_capable: rd_cap_set, tcpend: [], unw: unw_frame_none(unw_cx(decls, clauses_info)), root_mod: target_origin }
   # Root TU: root-file fn bodies + ALL lambdas/clauses + tests/benches/
   # checks + the main wrapper. Lambdas and clauses have no mo, so they
   # ride root — link-safe and complete.
   let root_decls = decls_of_origin(decls, None)
   let root_bodies = fn_bodies(src, root_decls, cx, const_syms)
-  let lam_bodies = emit_lam_helpers(src, lams, fns, cx.fx, variants, clauses_info, const_decls_only(decls), effect_decls_only(decls), collect_records(decls), cx.stamps, core_tbl, rcore_tbl, cx.evf, cx.root_mod, cx.unw.ucx)
+  let lam_bodies = emit_lam_helpers(src, lams, fns, cx.fx, variants, clauses_info, const_decls_only(decls), effect_decls_only(decls), collect_records(decls), cx.stamps, core_ix, cx.evf, cx.root_mod, cx.unw.ucx)
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
   let tests = emit_all_tests(src, decls, cx, target_origin)
   let benches = emit_all_benches(src, decls, cx, target_origin)
@@ -11151,12 +11141,11 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # and bundled with an empty top-level lexical scope. Each fn / lambda /
   # clause / test body seeds its own scope from its params before
   # recursing, so the entry `lcs` is `[]`.
-  let core_tbl = core_table()
-  let rcore_tbl = rcore_table()
+  let core_ix = core_ix_build()
   let cx = EmitCtx { lcs: [], fns: fns, fx: fx, variants: variants, lams: lams, cls: cls,
-                     regions: regions, in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls), cur_enc_fn: "", recs: collect_records(decls), stamps: rec_stamps(decls, stamp_ids), core: core_tbl, rcore: rcore_tbl, evf: frames_index(build_evidence_frames(decls, entry)), rd_active: false, rd_capable: rd_cap_set, tcpend: [], unw: unw_frame_none(unw_cx(decls, clauses_info)), root_mod: target_origin }
+                     regions: regions, in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls), cur_enc_fn: "", recs: collect_records(decls), stamps: rec_stamps(decls, stamp_ids), core_ix: core_ix, evf: frames_index(build_evidence_frames(decls, entry)), rd_active: false, rd_capable: rd_cap_set, tcpend: [], unw: unw_frame_none(unw_cx(decls, clauses_info)), root_mod: target_origin }
   let bodies = fn_bodies(src, decls, cx, const_syms)
-  let lam_bodies = emit_lam_helpers(src, lams, fns, cx.fx, variants, cls, const_decls_only(decls), effect_decls_only(decls), collect_records(decls), cx.stamps, core_tbl, rcore_tbl, cx.evf, cx.root_mod, cx.unw.ucx)
+  let lam_bodies = emit_lam_helpers(src, lams, fns, cx.fx, variants, cls, const_decls_only(decls), effect_decls_only(decls), collect_records(decls), cx.stamps, core_ix, cx.evf, cx.root_mod, cx.unw.ucx)
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
   let tests = emit_all_tests(src, decls, cx, target_origin)
   let benches = emit_all_benches(src, decls, cx, target_origin)
@@ -13643,9 +13632,12 @@ fn tcrec_is_dup_callee(f: Expr) : Bool = match f.kind {
 
 # Perceus has already renamed a borrowing prim to its `_borrow` variant,
 # which lends slot 0.
-fn tcrec_borrowed_slots(bm: BorrowMap, f: Expr) : [Int] = {
-  let key = pcs_callee_key(f)
-  if any(core_borrowing_prims(), (p) => cat2(p, "_borrow") == key) { [0] } else { pcs_borrow_lookup(bm, key) }
+fn tcrec_borrowed_slots(bm: BorrowMap, f: Expr) : [Int] =
+  if tcrec_is_lending_form(f) { [0] } else { pcs_borrow_lookup(bm, pcs_callee_key(f)) }
+
+fn tcrec_is_lending_form(f: Expr) : Bool = match builtin_ref(f) {
+  Some(b) -> builtin_is_lending_form(b)
+  None    -> false
 }
 
 # A bare read in a borrowed slot lends, so it hands nothing on.

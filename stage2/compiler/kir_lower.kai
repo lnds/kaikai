@@ -22,6 +22,8 @@ import compiler.fn_index
 import compiler.kai_builtin
 import compiler.fn_csym
 import compiler.core_prims
+import compiler.core_builtins
+import compiler.core_prim_ix
 import compiler.emit_shared
 import compiler.resolve
 import compiler.region
@@ -61,10 +63,11 @@ pub fn reuse_plan_none() : ReusePlan = ReusePlan { rot: RNInone, flat: [], cells
 
 # reg + block-label counters, finished blocks (generation order), current
 # block label, current block's reversed statement list, the EFn symbol
-# table, the variant→tag table, the lifted-lambda table (`find_lam`), and
-# the enclosing-fn key the lambda lookup is scoped by.
+# table, the core builtins' rows keyed by id, the variant→tag table, the
+# lifted-lambda table (`find_lam`), and the enclosing-fn key the lambda
+# lookup is scoped by.
 pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
-                     fns: [EFn], fx: FnIndex, vs: [VariantEntry], lams: [LamInfo], enc_fn: String,
+                     fns: [EFn], fx: FnIndex, core_ix: CoreIx, vs: [VariantEntry], lams: [LamInfo], enc_fn: String,
                      effs: [String], consts: [Decl],
                      # `locals` is the set of names BOUND in the current fn
                      # body (params + captures + every `let`/match binder).
@@ -211,7 +214,7 @@ pub type LResOpt = LResOpt(Option[KVal], LowerSt)
 
 pub fn ls_new(fns: [EFn], fx: FnIndex, variants: [VariantEntry], lams: [LamInfo], effs: [String],
               consts: [Decl], ffi: [String], recs: [RecInfo], stamps: [RecStamp], regions: [RegionMark], raw_binders: [RawArmBinder], root_mod: Option[String]) : LowerSt =
-  LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, fx: fx, vs: variants,
+  LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, fx: fx, core_ix: core_ix_build(), vs: variants,
             lams: lams, enc_fn: "", effs: effs, consts: consts, locals: [], ffi: ffi, renames: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: recs, stamps: stamps, in_region: false, regions: regions, raw_binders: raw_binders, tcpend: [], unw: unw_frame_none(unw_cx_empty()), root_mod: root_mod, arm_tok: false }
 
 # Reset the per-function counters and block buffers, preserving the shared
@@ -224,19 +227,19 @@ pub fn ls_new(fns: [EFn], fx: FnIndex, variants: [VariantEntry], lams: [LamInfo]
 pub fn ls_set_arm_tok(st: LowerSt, held: Bool) : LowerSt = LowerSt { ...st, arm_tok: held }
 
 pub fn ls_enter_fn(st: LowerSt, enc_fn: String, locals: [String]) : LowerSt =
-  LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: st.fns, fx: st.fx, vs: st.vs,
+  LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: st.fns, fx: st.fx, core_ix: st.core_ix, vs: st.vs,
             lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts, locals: locals, ffi: st.ffi, renames: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: st.recs, stamps: st.stamps, in_region: false, regions: st.regions, raw_binders: st.raw_binders, tcpend: [], unw: unw_blank(st.unw), root_mod: st.root_mod, arm_tok: false }
 
 # Enter the fn with `body_fns` as the EFn table.
 pub fn ls_enter_fn_with(st: LowerSt, enc_fn: String, locals: [String],
                         body_fns: [EFn]) : LowerSt =
-  LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: body_fns, fx: st.fx,
+  LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: body_fns, fx: st.fx, core_ix: st.core_ix,
             vs: st.vs, lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts,
             locals: locals, ffi: st.ffi, renames: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: st.recs, stamps: st.stamps, in_region: false, regions: st.regions, raw_binders: st.raw_binders, tcpend: [], unw: unw_blank(st.unw), root_mod: st.root_mod, arm_tok: false }
 
 #[doc("The state with `u` as the current frame's unwind sites.")]
 pub fn ls_with_unw(st: LowerSt, u: UnwFrame) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx,
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, core_ix: st.core_ix,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
             consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: u, root_mod: st.root_mod, arm_tok: st.arm_tok }
 
@@ -246,7 +249,7 @@ pub fn ls_with_unw(st: LowerSt, u: UnwFrame) : LowerSt =
 # for the shadow test — the name is already known-local).
 pub fn ls_bind_local(st: LowerSt, name: String) : LowerSt =
   if ls_is_local(st, name) { st }
-  else { LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx,
+  else { LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, core_ix: st.core_ix,
                    vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
                    consts: st.consts, locals: [name, ...st.locals], ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok } }
 
@@ -267,14 +270,14 @@ pub fn ls_is_local(st: LowerSt, name: String) : Bool = name_in_list(st.locals, n
 # TRMC cons-modulo step lowered inside this match drops the right register. Saved
 # (read `st.mscr`) and restored around each match, like the `renames` snapshot.
 pub fn ls_set_mscr(st: LowerSt, sd: String) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx,
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, core_ix: st.core_ix,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
             consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: sd, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
 
 # Replace the tcrec goto-tail pending-release ledger (entering an arm body /
 # refining across a branch point). Restored around each match like `mscr`.
 pub fn ls_set_tcpend(st: LowerSt, l: [String]) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx,
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, core_ix: st.core_ix,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
             consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: l, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
 
@@ -282,19 +285,19 @@ pub fn ls_set_tcpend(st: LowerSt, l: [String]) : LowerSt =
 # inside this arm's body emits the shared-donor incref. Saved (read
 # `st.reuse_gc`) and restored around each match like `mscr`.
 pub fn ls_set_reuse_gc(st: LowerSt, gc: [String]) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx,
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, core_ix: st.core_ix,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
             consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
 
 # Set the reuse arm's slot plan (see `ReusePlan`). Travels
 # with `reuse_gc` — same set/clear discipline, same arm scope.
 pub fn ls_set_rnested(st: LowerSt, rn: ReusePlan) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx,
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, core_ix: st.core_ix,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
             consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: rn, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
 
 pub fn ls_push_rename(st: LowerSt, name: String, reg: String) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx,
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, core_ix: st.core_ix,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
             consts: st.consts, locals: st.locals, ffi: st.ffi,
             renames: [Rn(name, reg), ...st.renames], mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
@@ -320,7 +323,7 @@ pub fn ls_reg_of(st: LowerSt, name: String) : String = match ls_lookup_rename(st
 # counter) is intentionally NOT restored — it stays monotone so sibling
 # blocks that shadow the same name receive distinct `.tN` registers.
 pub fn ls_set_renames(st: LowerSt, snap: [Rename]) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx,
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, core_ix: st.core_ix,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
             consts: st.consts, locals: st.locals, ffi: st.ffi, renames: snap, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
 
@@ -329,7 +332,7 @@ pub fn ls_set_renames(st: LowerSt, snap: [Rename]) : LowerSt =
 # `rc` counter is not touched (monotone). Paired with `ls_set_renames` in
 # `lower_block`.
 pub fn ls_set_locals(st: LowerSt, snap: [String]) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx,
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, core_ix: st.core_ix,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
             consts: st.consts, locals: snap, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
 
@@ -337,7 +340,7 @@ pub fn ls_set_locals(st: LowerSt, snap: [String]) : LowerSt =
 # `lower_block` sets it for a lexical `region { }` extent and restores the
 # prior value at the block's exit.
 pub fn ls_set_in_region(st: LowerSt, b: Bool) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx,
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, core_ix: st.core_ix,
             vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
             consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: b, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
 
@@ -365,9 +368,9 @@ pub fn ls_fresh_label(st: LowerSt) : LSLabel =
 # --- Field updaters (record copy-with) ----------------------------------
 
 fn ls_with_rc(st: LowerSt, rc: Int) : LowerSt =
-  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
+  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, core_ix: st.core_ix, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
 fn ls_with_bc(st: LowerSt, bc: Int) : LowerSt =
-  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
+  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, fx: st.fx, core_ix: st.core_ix, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
 
 # --- Block accumulation -------------------------------------------------
 
@@ -388,14 +391,14 @@ fn ls_bind_local_of(st: LowerSt, s: KStmt) : LowerSt = match s {
 }
 
 fn ls_emit_raw(st: LowerSt, s: KStmt) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, fx: st.fx, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, fx: st.fx, core_ix: st.core_ix, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
 
 # Seal the current block with a terminator and start a fresh block under
 # `next_label`. The sealed block joins `blocks` in generation order.
 pub fn ls_seal(st: LowerSt, term: KTerm, next_label: String) : LowerSt =
   LowerSt { rc: st.rc, bc: st.bc,
             bs: list_append(st.bs, [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }]),
-            cl: next_label, ss: [], fns: st.fns, fx: st.fx, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
+            cl: next_label, ss: [], fns: st.fns, fx: st.fx, core_ix: st.core_ix, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
 
 # Seal the final block without opening a successor (function exit). When
 # the body ends in a tail terminator, the final block is the dead successor
@@ -431,8 +434,8 @@ pub fn ls_variant_tag_in(st: LowerSt, home: Option[String], name: String) : Int 
 pub fn ls_variant_tag_arity(st: LowerSt, home: Option[String], name: String, arity: Int) : Int =
   evar_find_tag_arity(st.vs, home, name, arity)
 
-# Resolve a bare callee name to its mangled symbol via the EFn table; an
-# unresolved name (builtin / prim) keeps its bare name for the translator.
+# Resolve a callee to its mangled symbol via the EFn table; a builtin to
+# the native entry of its row.
 # An `extern "C" fn` callee resolves to its `kai_<c_sym>` wrapper (NOT the
 # bare extern symbol) — see `LowerSt.ffi`. The EFn table carries the callee's
 # resolved module, so the wrapper name matches the def minted in `lower_fn`.
@@ -443,7 +446,7 @@ pub fn c_sym_of_callee_st(st: LowerSt, fid: FnId, name: String) : String =
   if name_in_list(st.ffi, name) { ffi_wrapper_sym(name, efn_module_of(st, fid, name)) }
   else { match ls_callee(st, fid, name) {
     Some(EFn(_, _, mo, _, efid)) -> ls_fn_call_sym(st, efid, c_sym(name, mo))
-    None                         -> core_call_sym(name)
+    None                         -> core_call_sym(st, fid, name)
   } }
 
 # A declared core builtin is called as a `builtin_table` row is, through
@@ -460,11 +463,13 @@ pub fn ls_qualified_call_sym(st: LowerSt, home: String, name: String) : String =
   None     -> c_sym(name, Some(home))
 }
 
-# A callee no fn declares is a core builtin, named by its runtime symbol so
-# a user fn spelled like a builtin can never be mistaken for it. `encode`
-# and `decode` are typer builtins rewritten before lowering, with no shim.
-fn core_call_sym(name: String) : String =
-  if name == "encode" or name == "decode" { name } else { core_native_call_sym(name) }
+# A callee no fn declares is a core builtin, named by the runtime symbol
+# of its row so a user fn spelled like a builtin can never be mistaken
+# for it.
+fn core_call_sym(st: LowerSt, fid: FnId, name: String) : String = match core_ix_name(st.core_ix, fnid_sym(fid)) {
+  Some(n) -> core_native_call_sym(n)
+  None    -> name
+}
 
 # The resolved module of a callee name via the EFn table (None when the name
 # is root-level or unresolved). Used to mint the FFI wrapper symbol so the
@@ -493,23 +498,23 @@ pub fn ffi_wrapper_sym(name: String, mo: Option[String]) : String =
 
 # A first-class function value: a reference to a top-level fn lowers to a
 # closure over the fn's thunk symbol. Returns the closure descriptor
-# (thunk-with-`@`, arity), or the core builtin's for a bare spelling.
+# (thunk-with-`@`, arity), or the core builtin's for a reference to one.
 pub type FnValue = FV(String, Int)
 
 pub fn ls_fn_value(st: LowerSt, fid: FnId, nm: String) : Option[FnValue] = match ls_callee(st, fid, nm) {
   Some(EFn(_, arity, mo, _, _)) -> Some(FV(c_user_thunk_sym(c_sym(nm, mo)), arity))
-  None                       -> kir_core_fn_value(nm)
+  None                       -> kir_core_fn_value(st, fid)
 }
 
 # A PRELUDE builtin used as a first-class value (`map(xs, int_to_string)`,
 # `bytes(s) | byte_to_int`): the closure rides the runtime's pre-defined
 # `kaix_<name>_thunk` (`stage0/runtime_llvm.c`). The arity comes from the
-# shared `core_table()` the C backend also reads, so a builtin is a value
-# on both backends or on neither. A name outside the table falls through
+# shared `core_table()` row the C backend also reads, so a builtin is a
+# value on both backends or on neither. A reference to no row falls through
 # to a local-binder `KVar` (the genuine-local case `lower_var` ends on).
-fn kir_core_fn_value(nm: String) : Option[FnValue] = match core_find(core_table(), nm) {
-  Some(EP(_, _, arity)) -> Some(FV(core_native_thunk_sym(nm), arity))
-  None                  -> None
+fn kir_core_fn_value(st: LowerSt, fid: FnId) : Option[FnValue] = match core_ix_boxed(st.core_ix, fnid_sym(fid)) {
+  Some(EP(name, _, arity)) -> Some(FV(core_native_thunk_sym(name), arity))
+  None                     -> None
 }
 
 # A qualified reference (`mod.fn`) as a fn-value: a closure over the
@@ -519,13 +524,15 @@ pub fn ls_fn_value_qualified(st: LowerSt, modn: String, name: String) : FnValue 
   None                      -> FV(c_user_thunk_sym(c_sym(name, Some(modn))), 0)
 }
 
-# A bare-name call is DIRECT when the callee is a known top-level fn or a
-# core builtin; otherwise it is a local binder holding a function
-# value (called indirectly). `core_names()` (resolve, target-neutral)
-# is the shared core list — no backend table is consulted here.
+# A call is DIRECT when the callee is a known top-level fn or a core
+# builtin; otherwise it is a local binder holding a function value
+# (called indirectly).
 pub fn callee_is_direct(st: LowerSt, fid: FnId, callee: String) : Bool = match ls_callee(st, fid, callee) {
   Some(_) -> true
-  None    -> name_in_list(core_names(), callee)
+  None    -> match core_ix_name(st.core_ix, fnid_sym(fid)) {
+    Some(_) -> true
+    None    -> false
+  }
 }
 
 pub fn name_in_list(xs: [String], target: String) : Bool = match xs {
@@ -742,7 +749,7 @@ pub fn two_labels(st: LowerSt) : LSL2 = match ls_fresh_label(st) {
 # Reopen a previously-named label as the current block (it must already be
 # sealed); sets the cursor for the next statements.
 pub fn reopen(st: LowerSt, label: String) : LowerSt =
-  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, fx: st.fx, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, fx: st.fx, core_ix: st.core_ix, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals, ffi: st.ffi, renames: st.renames, mscr: st.mscr, reuse_gc: st.reuse_gc, rnested: st.rnested, recs: st.recs, stamps: st.stamps, in_region: st.in_region, regions: st.regions, raw_binders: st.raw_binders, tcpend: st.tcpend, unw: st.unw, root_mod: st.root_mod, arm_tok: st.arm_tok }
 
 # --- Type declarations --------------------------------------------------
 
@@ -928,14 +935,20 @@ pub type CalleeKind
   | CkCtor | CkDirect
 
 # Classify a bare callee name. Pure (no re-entry into `lower_expr`), so it
-# lives in the base. Checked in order: resume, the unit forms, then the
-# uppercase-initial constructor heuristic, then an ordinary direct call.
+# lives in the base. Checked in order: resume, the uppercase-initial
+# constructor heuristic, then an ordinary direct call.
 pub fn classify_callee(callee: String) : CalleeKind =
   if callee == canonical_continuation() { CkResume }
-  else if core_is_unit_coercion(callee) { CkStripUnit }
-  else if callee == "unit_name" { CkUnitName }
   else if kir_name_is_ctor(callee) { CkCtor }
   else { CkDirect }
+
+#[doc("How a call to the builtin `b` lowers: a unit form in place, any other as a direct call.")]
+pub fn classify_builtin(b: CoreBuiltin) : CalleeKind =
+  if builtin_is_unit_coercion(b) { CkStripUnit }
+  else { match b {
+    CbUnitName -> CkUnitName
+    _          -> CkDirect
+  } }
 
 # An effect op call `Eff.op` (the flat `EVar("Eff.op")` the op-call
 # desugar produces). Splits to (eff, op) iff the prefix before the first

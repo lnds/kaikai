@@ -13,7 +13,6 @@
 
 import compiler.ast
 import compiler.marks
-import compiler.sym_read
 import compiler.util
 import compiler.kinds
 import compiler.fnreg
@@ -23,6 +22,7 @@ import compiler.infer
 import compiler.region
 import compiler.kir
 import compiler.kir_lower
+import compiler.core_builtins
 import compiler.unwind_pend
 import compiler.kir_reuse_held
 import compiler.unwind_binders
@@ -1289,29 +1289,33 @@ fn lower_field_read(st: LowerSt, op: KOp, base: KVal, pos: KPos) : LRes / Consol
 # (v, i) matches the vec_get variant it replaces; no record is built,
 # so there is no base to drop.
 fn lower_vec_get_field_fused(x: Expr, base: Expr, fname: String, st: LowerSt) : Option[LRes] / Console = match base.kind {
-  ECall(f, cargs) -> match sym_read_kind(f.kind) {
-    EVar(callee) ->
-      if callee == "vec_get" or callee == "vec_get_borrow" {
-        match vec_rec_field_slot(st.recs, base.ty, fname) {
-          Some(fidx) -> match cargs {
-            [v, i] -> {
-              let prim = if callee == "vec_get_borrow" { KpVecGetFieldBorrow }
-                         else { KpVecGetField }
-              let rv = lower_expr(v, st)
-              match rv { LRes(vv, st1) -> {
-                let ri = lower_expr(i, st1)
-                match ri { LRes(iv, st2) ->
-                  Some(bind_op(st2, KPrim(prim, [vv, iv, KIntV(fidx)]), kpos_of(x))) }
-              } }
-            }
-            _ -> None
+  ECall(f, cargs) -> match vec_get_field_prim(f) {
+    Some(prim) ->
+      match vec_rec_field_slot(st.recs, base.ty, fname) {
+        Some(fidx) -> match cargs {
+          [v, i] -> {
+            let rv = lower_expr(v, st)
+            match rv { LRes(vv, st1) -> {
+              let ri = lower_expr(i, st1)
+              match ri { LRes(iv, st2) ->
+                Some(bind_op(st2, KPrim(prim, [vv, iv, KIntV(fidx)]), kpos_of(x))) }
+            } }
           }
-          None -> None
+          _ -> None
         }
-      } else { None }
-    _ -> None
+        None -> None
+      }
+    None -> None
   }
   _ -> None
+}
+
+# The prim reading one field of the element `f` fetches, when `f` is a
+# `vec_get` form.
+fn vec_get_field_prim(f: Expr) : Option[PrimOp] = match builtin_ref(f) {
+  Some(CbVecGet)       -> Some(KpVecGetField)
+  Some(CbVecGetBorrow) -> Some(KpVecGetFieldBorrow)
+  _                    -> None
 }
 
 # `vec_push(v, Rec{..})` / `vec_set(v, i, Rec{..})` on a REC carrier →
@@ -1320,9 +1324,9 @@ fn lower_vec_get_field_fused(x: Expr, base: Expr, fname: String, st: LowerSt) : 
 # decision stays inside the runtime helper. Push carries (value, name)
 # pairs after the arity (the PENDING classify needs the names); set
 # writes an already-classified slot and carries values only.
-fn lower_vec_write_rec_fused(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console = match sym_read_kind(f.kind) {
-  EVar(callee) ->
-    if callee == "vec_push" {
+fn lower_vec_write_rec_fused(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Option[LRes] / Console = match f.kind {
+  ESym(_, _, _) ->
+    if is_builtin_ref(f, CbVecPush) {
       match cargs {
         [v, lit] -> match lit.kind {
           ERecordLit(_, _, fis) ->
@@ -1340,7 +1344,7 @@ fn lower_vec_write_rec_fused(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Opt
         }
         _ -> None
       }
-    } else if callee == "vec_set" {
+    } else if is_builtin_ref(f, CbVecSet) {
       match cargs {
         [v, i, lit] -> match lit.kind {
           ERecordLit(_, _, fis) ->
@@ -3098,7 +3102,10 @@ fn lower_mark_call(x: Expr, m: Mark, cargs: [Expr], st: LowerSt) : LRes / Consol
 # intrinsic shares its name.
 fn ls_classify(st: LowerSt, csym: FnId, callee: String) : CalleeKind = match fnx_of_sym(st.fx, csym) {
   Some(_) -> CkDirect
-  None    -> classify_callee(callee)
+  None    -> match builtin_of(fnid_sym(csym)) {
+    Some(b) -> classify_builtin(b)
+    None    -> classify_callee(callee)
+  }
 }
 
 # Dispatch a non-effect-op bare call by its `CalleeKind`.
