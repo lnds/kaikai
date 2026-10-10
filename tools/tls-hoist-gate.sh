@@ -70,15 +70,10 @@ BITCODE=("$ROOT/stage0/runtime_llvm.bc" "$ROOT/stage0/runtime_inline.bc")
 MODE="${1:-}"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 
-# llvm-dis must match the clang that wrote the bitcode (writer <= reader), so
-# look next to the resolved clang 18 first. Both distributions gen-runtime-bc.sh
-# names — brew llvm@18, apt llvm-18 — ship it in the same bin directory.
+# llvm-dis must be the version of the clang that wrote the bitcode.
 resolve_llvm_dis() {
-  local clang bindir="" c
-  clang="$(CLANG18="${CLANG18:-}" "$ROOT/tools/gen-runtime-bc.sh" --clang || true)"
-  # Resolve through PATH first: gen-runtime-bc.sh may hand back a bare name.
-  [ -n "$clang" ] && bindir="$(dirname "$(command -v "$clang" || echo "$clang")")"
-  for c in ${LLVM_DIS:-} ${bindir:+"$bindir/llvm-dis"} llvm-dis llvm-dis-18; do
+  local c
+  for c in ${LLVM_DIS:-} "$(CLANG18="${CLANG18:-}" "$ROOT/tools/gen-runtime-bc.sh" --tool llvm-dis || true)"; do
     c="$(command -v "$c" || true)"
     [ -n "$c" ] && { echo "$c"; return 0; }
   done
@@ -207,7 +202,7 @@ if [ "$MODE" = "--owner" ]; then owner_gate; exit; fi
 
 present=$(ls "${BITCODE[@]}" 2>/dev/null || true)
 if [ -z "$present" ]; then
-  # P2 is optional by design: no clang 18 means no hot bitcode, which means the
+  # P2 is optional by design: no matching clang means no hot bitcode, which means the
   # runtime never inlines into a fiber frame and there is nothing to gate.
   echo "tls-hoist-gate: no hot bitcode (P2 opted out) — nothing to gate."
   exit 0
@@ -215,7 +210,7 @@ fi
 
 DIS="$(resolve_llvm_dis || true)"
 if [ -z "$DIS" ]; then
-  echo "tls-hoist-gate: WARNING — llvm-dis not found next to clang 18 nor on PATH; the hot bitcode is NOT gated for thread-local hoists." >&2
+  echo "tls-hoist-gate: WARNING — no llvm-dis matching the bitcode's clang; the hot bitcode is NOT gated for thread-local hoists." >&2
   echo "tls-hoist-gate:   set LLVM_DIS=/path/to/llvm-dis to restore the gate." >&2
   exit 0
 fi

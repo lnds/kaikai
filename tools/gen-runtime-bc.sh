@@ -33,6 +33,7 @@
 #   tools/gen-runtime-bc.sh --status        # machine state (see below); exit 0
 #   tools/gen-runtime-bc.sh --status-line   # same state as one human line + remedy
 #   tools/gen-runtime-bc.sh --clang         # the resolved clang; exit 1 if none
+#   tools/gen-runtime-bc.sh --tool llvm-nm  # that clang's llvm-* binary; exit 1 if none
 #   CLANG18=/path/to/clang tools/gen-runtime-bc.sh   # explicit override
 #
 # THREE STATES, NOT TWO. "optout" alone hides whether the host CAN run P2:
@@ -146,6 +147,19 @@ resolve_clang() {
   return 1
 }
 
+# The llvm-* binary of the writer's version: a reader older than the writer
+# cannot parse its bitcode. The version-suffixed name goes first, because
+# next to a `clang-N` on PATH sits the distribution's default, not N's.
+resolve_llvm_tool() {
+  _rt_clang="$(resolve_clang)" || return 1
+  _rt_major="$(clang_major "$_rt_clang")"
+  _rt_bindir="$(dirname "$(command -v "$_rt_clang")")"
+  for t in "$1-$_rt_major" "$_rt_bindir/$1" "$1"; do
+    if command -v "$t" >/dev/null 2>&1; then command -v "$t"; return 0; fi
+  done
+  return 1
+}
+
 # "active" requires BOTH bitcodes: the whole-program bc AND the
 # separate-compilation twin the native-modular path merges per partition.
 # A tree with only the former would report active yet build user code
@@ -180,6 +194,7 @@ case "$mode" in
   # (bitcode readers are version-locked to their writer). Empty + exit 1 when
   # there is none, so a caller can tell "no matching clang" from a resolution.
   --clang)       resolve_clang || exit 1; exit 0 ;;
+  --tool)        resolve_llvm_tool "${2:?--tool needs a name}" || exit 1; exit 0 ;;
 esac
 
 CLANG="$(resolve_clang || true)"
@@ -235,9 +250,7 @@ fi
 # Either symbol defined or referenced in the bitcode means a KAI_HOT_ONLY gate
 # is missing — fail the build loudly
 # rather than ship an unsound runtime.
-if command -v llvm-nm >/dev/null 2>&1; then LLVM_NM=llvm-nm
-elif command -v llvm-nm-18 >/dev/null 2>&1; then LLVM_NM=llvm-nm-18
-else LLVM_NM=""; fi
+LLVM_NM="$(resolve_llvm_tool llvm-nm || true)"
 if [ -n "$LLVM_NM" ]; then
   for bc in "$BC_OUT" "$BC_INLINE"; do
     if "$LLVM_NM" "$bc" 2>/dev/null | grep -qE 'swapcontext|kai_seg_switch'; then

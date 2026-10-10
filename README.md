@@ -127,8 +127,8 @@ machinery below is needed to *use* the language; it is the toolchain for
 ## Prerequisites (for building from source only)
 
 - **C compiler** (cc/gcc/clang)
-- **LLVM** development headers and libraries (CI builds against
-  LLVM 18; the build is version-agnostic via `llvm-config`):
+- **LLVM** development headers and libraries (CI and the released
+  binaries use LLVM 22; the build is version-agnostic via `llvm-config`):
   ```sh
   sudo apt install llvm-dev libzstd-dev
   ```

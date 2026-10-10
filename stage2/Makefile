@@ -96,7 +96,7 @@ KAI_LLVM_AUTO := 1
 endif
 ifeq ($(KAI_LLVM),1)
 ifeq ($(LLVM_CONFIG_RESOLVED),)
-$(error KAI_LLVM=1 but '$(LLVM_CONFIG)' was not found. Put llvm-config on PATH or pass LLVM_CONFIG=/path/to/llvm-config (Homebrew keg-only: LLVM_CONFIG=$$(brew --prefix llvm@18)/bin/llvm-config))
+$(error KAI_LLVM=1 but '$(LLVM_CONFIG)' was not found. Put llvm-config on PATH or pass LLVM_CONFIG=/path/to/llvm-config (Homebrew keg-only: LLVM_CONFIG=$$(brew --prefix llvm@22)/bin/llvm-config))
 endif
 LLVM_CPPFLAGS := $(shell $(LLVM_CONFIG) --cflags) -DKAI_LLVM
 # Component set is `nativecodegen` (NOT `native`): the backend EMITS code,
@@ -251,8 +251,8 @@ else
 endif
 	@# P2 (docs/native-codegen-perf-plan.md §P2): generate the native-runtime
 	@# bitcode the in-process backend links before O2. Build-time + gated to
-	@# clang 18 (writer <= the libLLVM-18 reader); a clang-18-less host opts
-	@# out cleanly (native falls back to linking runtime_llvm.c with cc). The
+	@# a clang of the linked libLLVM's major; a host without one opts out
+	@# cleanly (native falls back to linking runtime_llvm.c with cc). The
 	@# script is idempotent — a no-op when the .bc is fresh.
 	@../tools/gen-runtime-bc.sh || true
 	@# Terminal banner, deliberately the last line of the build: the P2
@@ -11271,7 +11271,7 @@ test-native-static-slot-read: $(TARGET) bin-kai build
 # carries `memory(none)` in the native IR (and NEVER `willreturn`); an
 # allocating fn carries only `nounwind`. Binary acceptance: `opt -O2`
 # CSEs two identical pure calls to one. Native-gated: a C-only kaic2
-# cannot dump the native IR. Requires `opt` (LLVM 18).
+# cannot dump the native IR. Requires the `opt` of the linked libLLVM.
 # KAI_NATIVE_MODULAR=0: the purity attributes are a property of the emitter,
 # identical on both native paths, but this gate INSPECTS the dumped IR for the
 # user fns `@heavy`/`@noisy` — which the native-modular default splits across
@@ -11294,7 +11294,7 @@ test-native-purity-attrs: $(TARGET) bin-kai build
 	  || { echo "native-purity FAIL (noisy $$ngrp should be nounwind only)"; grep "^attributes" build/s2-purity.ll; exit 1; }; \
 	if grep -q 'willreturn' build/s2-purity.ll; then echo "native-purity FAIL (willreturn stamped)"; exit 1; fi; \
 	printf 'declare i64 @h(i64) #0\ndefine i64 @t(i64 %%a) {\n  %%x = call i64 @h(i64 %%a)\n  %%y = call i64 @h(i64 %%a)\n  %%r = add i64 %%x, %%y\n  ret i64 %%r\n}\nattributes #0 = { nounwind memory(none) }\n' > build/s2-purity-cse.ll; \
-	ncalls=$$(opt -O2 -S build/s2-purity-cse.ll 2>/dev/null | grep -c 'call i64 @h'); \
+	ncalls=$$("$$($(LLVM_CONFIG) --bindir)/opt" -O2 -S build/s2-purity-cse.ll 2>/dev/null | grep -c 'call i64 @h'); \
 	[ "$$ncalls" = "1" ] \
 	  && echo "native-purity OK (heavy=memory(none), noisy=nounwind, no willreturn, duplicate pure call CSE'd to $$ncalls)" \
 	  || { echo "native-purity FAIL (pure call NOT CSE'd: $$ncalls calls)"; exit 1; }

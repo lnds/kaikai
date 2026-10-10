@@ -85,6 +85,8 @@ EOF
   done
 }
 
+# An inherited LLVM_CONFIG would name the host's reader over the sandbox's.
+unset LLVM_CONFIG
 status() { PATH="$1/bin:$PATH" "$1/tools/gen-runtime-bc.sh" "${2:-}"; }
 
 echo "== test-p2-status =="
