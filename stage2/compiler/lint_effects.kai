@@ -4,6 +4,7 @@ import compiler.ast
 import compiler.expr_positions
 import compiler.lint_idiom
 import compiler.util
+import compiler.core_effects
 
 # `LintFinding` is defined in `compiler.lint_idiom` and shared by every
 # lint module.
@@ -49,23 +50,23 @@ fn fx_is_root_origin(mo: Option[String], root_mod: String) : Bool {
 # Each declared label absent from the used-set is over-declared. `Ffi`
 # carries its own lint id and message; every other effect is
 # effect_over_declared.
-fn fx_labels(labels: [String], fn_name: String, line: Int, col: Int, used: [String], acc: [LintFinding]) : [LintFinding] {
+fn fx_labels(labels: [RowLabel], fn_name: String, line: Int, col: Int, used: [SymId], acc: [LintFinding]) : [LintFinding] {
   match labels {
-    []             -> acc
-    [eff, ...rest] -> {
-      let a1 = if mem_str(eff, used) { acc } else { [fx_finding(eff, fn_name, line, col), ...acc] }
+    []           -> acc
+    [l, ...rest] -> {
+      let a1 = if mem_sym(rl_sym(l), used) { acc } else { [fx_finding(l, fn_name, line, col), ...acc] }
       fx_labels(rest, fn_name, line, col, used, a1)
     }
   }
 }
 
-fn fx_finding(eff: String, fn_name: String, line: Int, col: Int) : LintFinding {
-  if eff == "Ffi" {
+fn fx_finding(l: RowLabel, fn_name: String, line: Int, col: Int) : LintFinding {
+  if effect_is(rl_sym(l), CeFfi) {
     LF("effect_ffi_without_extern", line, col,
        concat_all(["pub fn `", fn_name, "` declares `/ Ffi` but its body calls no extern function"]))
   } else {
     LF("effect_over_declared", line, col,
-       concat_all(["pub fn `", fn_name, "` declares effect `", eff, "` its body never uses"]))
+       concat_all(["pub fn `", fn_name, "` declares effect `", rl_name(l), "` its body never uses"]))
   }
 }
 
@@ -75,18 +76,11 @@ fn fx_finding(eff: String, fn_name: String, line: Int, col: Int) : LintFinding {
 # polymorphic promise the body may satisfy elsewhere, so it is skipped
 # entirely (conservative: no labels => no findings).
 
-fn declared_closed_labels(row: RowExpr) : [String] {
+fn declared_closed_labels(row: RowExpr) : [RowLabel] {
   match row {
-    RClosed(ls) -> row_label_names(ls)
+    RClosed(ls) -> ls
     REmpty      -> []
     ROpen(_, _) -> []
-  }
-}
-
-fn row_label_names(ls: [RowLabel]) : [String] {
-  match ls {
-    []                    -> []
-    [RL(n, _, _), ...rest]   -> [n, ...row_label_names(rest)]
   }
 }
 
@@ -95,90 +89,58 @@ fn row_label_names(ls: [RowLabel]) : [String] {
 # An effect is demanded when the body references one of its ops, calls a
 # function whose resolved type carries it in its row, or installs a
 # handler for it. Mirrors `lint.kai`'s purity sources, but collects the
-# effect NAMES rather than a yes/no.
+# effect declarations rather than a yes/no.
 
-fn effects_in_expr(e: Expr, acc: [String]) : [String] {
+fn effects_in_expr(e: Expr, acc: [SymId]) : [SymId] {
   let a1 = effects_here(e, acc)
   effects_in_positions(xp_positions(e), a1)
 }
 
 # An `EExternBody` is the body of an `extern "C" fn`: it IS the foreign
 # call, so it demands `Ffi` even though there is no `ECall` node.
-fn effects_here(e: Expr, acc: [String]) : [String] {
+# A flattened `Eff.op` reference carries its effect's id; any other
+# reference carries an id no row label has.
+fn effects_here(e: Expr, acc: [SymId]) : [SymId] {
   match e.kind {
-    EVar(name)       -> add_op_effect(name, acc)
-    ESym(_, _, name)    -> add_op_effect(name, acc)
+    ESym(s, _, _)    -> [s, ...acc]
     ECall(callee, _) -> add_callee_effects(callee, acc)
-    EHandle(_, eff, _, _, _, _, _, _) -> [eff, ...acc]
-    EExternBody(AbiC, _) -> ["Ffi", ...acc]
+    EHandle(_, _, hsym, _, _, _, _, _) -> [hsym, ...acc]
+    EExternBody(AbiC, _) -> [core_effect_id(CeFfi), ...acc]
     _                -> acc
   }
 }
 
-# A flattened `Eff.op` reference: the effect is the dotted prefix when it
-# starts with an uppercase letter (effects are PascalCase). `Ffi` ops are
-# also extern-call markers, so this is the same source the Ffi lint reads.
-fn add_op_effect(name: String, acc: [String]) : [String] {
-  let pre = upper_dotted_prefix(name)
-  if pre == "" { acc } else { [pre, ...acc] }
-}
-
-fn upper_dotted_prefix(name: String) : String {
-  let n = string_length(name)
-  if n == 0 { "" }
-  else if first_upper(name) { take_to_dot(name, 0, n) } else { "" }
-}
-
-fn first_upper(name: String) : Bool {
-  match char_at(name, 0) {
-    Some(c) -> c >= 'A' and c <= 'Z'
-    None    -> false
-  }
-}
-
-fn take_to_dot(name: String, i: Int, n: Int) : String {
-  if i >= n { "" }
-  else {
-    match char_at(name, i) {
-      Some('.') -> string_slice(name, 0, i)
-      Some(_)   -> take_to_dot(name, i + 1, n)
-      None      -> ""
-    }
-  }
-}
-
 # A call demands every effect on its callee's resolved function row.
-fn add_callee_effects(callee: Expr, acc: [String]) : [String] {
+fn add_callee_effects(callee: Expr, acc: [SymId]) : [SymId] {
   match callee.ty {
     Some(TyFnT(_, _, row)) -> add_row_effects(row, acc)
     _                      -> acc
   }
 }
 
-fn add_row_effects(row: Row, acc: [String]) : [String] =
+fn add_row_effects(row: Row, acc: [SymId]) : [SymId] =
   add_label_effects(row.labels, acc)
 
-fn add_label_effects(ls: [Label], acc: [String]) : [String] {
+fn add_label_effects(ls: [Label], acc: [SymId]) : [SymId] {
   match ls {
     []           -> acc
-    [l, ...rest] -> add_label_effects(rest, [label_eff(l), ...acc])
+    [l, ...rest] -> add_label_effects(rest, [l.sym, ...acc])
   }
 }
 
-fn label_eff(l: Label) : String = l.eff
-
 # ---- small helpers ---------------------------------------------------
 
-fn effects_in_positions(xs: [XPos], acc: [String]) : [String] {
+fn effects_in_positions(xs: [XPos], acc: [SymId]) : [SymId] {
   match xs {
     []                  -> acc
     [XP(_, x), ...rest] -> effects_in_positions(rest, effects_in_expr(x, acc))
   }
 }
 
-fn mem_str(name: String, xs: [String]) : Bool {
+# An unresolved id is no declaration, so it is in no set.
+fn mem_sym(s: SymId, xs: [SymId]) : Bool {
   match xs {
     []           -> false
-    [x, ...rest] -> if x == name { true } else { mem_str(name, rest) }
+    [x, ...rest] -> if sym_raw(s) >= 0 and sym_raw(x) == sym_raw(s) { true } else { mem_sym(s, rest) }
   }
 }

@@ -18,6 +18,7 @@ import compiler.kind_theory
 import compiler.modules
 import compiler.scope_file
 import compiler.symtab
+import compiler.decl_names
 
 # `LintFinding` is defined in `compiler.lint_idiom` and re-exported via
 # import; both modules build the same finding shape.
@@ -26,10 +27,10 @@ import compiler.symtab
 
 #[doc("Run every lint over the decls a unit owns; returns each finding paired with the file that declares it. `src` is the pre-lowering AST, which the dead-code lint reads to tell a user-declared fn from a synthesised one.")]
 pub fn lint_program(df: DiagFiles, owned_mods: [String], decls: [Decl],
-                    src: [Decl]) : [FileFinding] {
+                    src: [Decl], tab: SymTab) : [FileFinding] {
   let root_mod = module_name_of_path(df_root(df))
   let owned = lint_owned(decls, root_mod, owned_mods, [])
-  list_append(lint_walk_decls(owned, df, []),
+  list_append(lint_walk_decls(owned, tab, df, []),
               lint_program_wide(owned, decls, df, src, root_mod))
 }
 
@@ -75,17 +76,17 @@ fn lint_effects_per_file(ds: [Decl], df: DiagFiles, acc: [FileFinding]) : [FileF
     }
   }
 
-fn lint_walk_decls(decls: [Decl], df: DiagFiles, acc: [FileFinding]) : [FileFinding] {
+fn lint_walk_decls(decls: [Decl], tab: SymTab, df: DiagFiles, acc: [FileFinding]) : [FileFinding] {
   match decls {
     [] -> list_reverse(acc)
-    [d, ...rest] -> lint_walk_decls(rest, df, lint_decl(d, df, acc))
+    [d, ...rest] -> lint_walk_decls(rest, tab, df, lint_decl(d, tab, df, acc))
   }
 }
 
-fn lint_decl(d: Decl, df: DiagFiles, acc: [FileFinding]) : [FileFinding] {
+fn lint_decl(d: Decl, tab: SymTab, df: DiagFiles, acc: [FileFinding]) : [FileFinding] {
   match d {
     DFn(_, _, _, _, _, _, body, _, _, _, _) ->
-      prepend_tagged(lint_expr(body, []), decl_diag_file(d, df), acc)
+      prepend_tagged(lint_expr(body, tab, []), decl_diag_file(d, df), acc)
     _ -> acc
   }
 }
@@ -104,14 +105,14 @@ fn prepend_tagged_loop(xs: [LintFinding], file: String,
 # Recursion into sub-expressions is what reaches blocks nested inside
 # lambda bodies, match arms, and if branches. Idiom nudges are judged at
 # this node before descending; the discard scan lives in the block arm.
-fn lint_expr(e: Expr, acc: [LintFinding]) : [LintFinding] {
+fn lint_expr(e: Expr, tab: SymTab, acc: [LintFinding]) : [LintFinding] {
   let here = list_append(idiom_findings(e),
                          list_append(redundant_findings(e),
                                      list_append(combinator_findings(e), spread_findings(e))))
   let a1 = prepend_all(here, acc)
   match e.kind {
-    EBlock(stmts, tail) -> lint_block(stmts, tail, a1)
-    _ -> lint_children(e, a1)
+    EBlock(stmts, tail) -> lint_block(stmts, tail, tab, a1)
+    _ -> lint_children(e, tab, a1)
   }
 }
 
@@ -124,27 +125,27 @@ fn prepend_all(xs: [LintFinding], acc: [LintFinding]) : [LintFinding] {
 
 # The tail (or its absence) is the block's own value, never a discard;
 # every other statement sits in non-tail position.
-fn lint_block(stmts: [Stmt], tail: Option[Expr], acc: [LintFinding]) : [LintFinding] {
-  let a1 = lint_stmts(stmts, acc)
+fn lint_block(stmts: [Stmt], tail: Option[Expr], tab: SymTab, acc: [LintFinding]) : [LintFinding] {
+  let a1 = lint_stmts(stmts, tab, acc)
   match tail {
-    Some(t) -> lint_expr(t, a1)
+    Some(t) -> lint_expr(t, tab, a1)
     None    -> a1
   }
 }
 
-fn lint_stmts(ss: [Stmt], acc: [LintFinding]) : [LintFinding] {
+fn lint_stmts(ss: [Stmt], tab: SymTab, acc: [LintFinding]) : [LintFinding] {
   match ss {
     [] -> acc
-    [s, ...rest] -> lint_stmts(rest, lint_stmt(s, acc))
+    [s, ...rest] -> lint_stmts(rest, tab, lint_stmt(s, tab, acc))
   }
 }
 
 # Recurse into every sub-expression (to reach nested blocks), then add
 # the discard finding when this statement drops a pure non-Unit value.
-fn lint_stmt(s: Stmt, acc: [LintFinding]) : [LintFinding] {
-  let inner = lint_exprs(stmt_expr_list(s), acc)
+fn lint_stmt(s: Stmt, tab: SymTab, acc: [LintFinding]) : [LintFinding] {
+  let inner = lint_exprs(stmt_expr_list(s), tab, acc)
   match s {
-    SExprStmt(x) -> if discard_is_smell(x) { [discard_finding(x), ...inner] } else { inner }
+    SExprStmt(x) -> if discard_is_smell(x, tab) { [discard_finding(x), ...inner] } else { inner }
     _            -> inner
   }
 }
@@ -169,8 +170,8 @@ fn discard_message(x: Expr) : String =
 
 # A non-Unit pure value dropped in statement position is dead code; an
 # effectful discard is legitimate because the effect row tracks it.
-fn discard_is_smell(x: Expr) : Bool =
-  not ty_is_unit(x.ty) and expr_is_pure(x)
+fn discard_is_smell(x: Expr, tab: SymTab) : Bool =
+  not ty_is_unit(x.ty) and expr_is_pure(x, tab)
 
 # None ("unknown") is not Unit; expr_is_pure keeps such nodes silent.
 fn ty_is_unit(t: Option[Ty]) : Bool {
@@ -189,63 +190,45 @@ fn ty_is_unit(t: Option[Ty]) : Bool {
 # that cannot be proven pure (a `?` op with no inferred type, an open
 # row tail, an untyped node) reads as impure and stays silent.
 
-fn expr_is_pure(e: Expr) : Bool =
-  not expr_has_effect(e)
+fn expr_is_pure(e: Expr, tab: SymTab) : Bool =
+  not expr_has_effect(e, tab)
 
-fn expr_has_effect(e: Expr) : Bool =
-  expr_introduces_effect(e) or children_have_effect(e)
+fn expr_has_effect(e: Expr, tab: SymTab) : Bool =
+  expr_introduces_effect(e, tab) or children_have_effect(e, tab)
 
 # Judged at this node only; children are covered by expr_has_effect.
-fn expr_introduces_effect(e: Expr) : Bool {
+fn expr_introduces_effect(e: Expr, tab: SymTab) : Bool {
   match e.kind {
     EHandle(_, _, _, _, _, _, _, _) -> true
-    EVar(name)                   -> is_effect_op(name)
-    ESym(_, _, name)                -> is_effect_op(name)
-    ECall(callee, _)             -> callee_is_effectful(callee)
+    ESym(s, _, _)                -> is_effect_ref(tab, s)
+    ECall(callee, _)             -> callee_is_effectful(callee, tab)
     _                            -> false
   }
 }
 
-# A flattened `Eff.op` reference carries no inferred type, so it is
-# recognised by name with the same uppercase-prefix rule --effects-json
-# uses: a `.` whose prefix starts with an uppercase letter (effects are
-# PascalCase, so this skips record/field paths like `list.length`).
-fn is_effect_op(name: String) : Bool =
-  qualified_upper_prefix(name, 0, string_length(name))
-
-fn qualified_upper_prefix(name: String, i: Int, n: Int) : Bool {
-  if i >= n { false }
-  else {
-    match char_at(name, i) {
-      Some('.') -> first_is_upper(name)
-      Some(_)   -> qualified_upper_prefix(name, i + 1, n)
-      None      -> false
-    }
+# A flattened `Eff.op` reference carries no inferred type; it carries the
+# id of its effect's declaration.
+fn is_effect_ref(tab: SymTab, s: SymId) : Bool =
+  st_valid(tab, s) and match sym_class(tab, s) {
+    NCEffect -> true
+    _        -> false
   }
-}
-
-fn first_is_upper(name: String) : Bool {
-  match char_at(name, 0) {
-    Some(c) -> c >= 'A' and c <= 'Z'
-    None    -> false
-  }
-}
 
 # A call is effectful when its callee's function type carries a non-empty
 # row. An unresolved callee type reads as effectful unless it is a bare
 # binding (then the call's purity rides on its arguments alone).
-fn callee_is_effectful(callee: Expr) : Bool {
+fn callee_is_effectful(callee: Expr, tab: SymTab) : Bool {
   match callee.ty {
     Some(TyFnT(_, _, row)) -> not row_is_pure(row)
     Some(_)                -> false
-    None                   -> not is_known_pure_var(callee)
+    None                   -> not is_known_pure_var(callee, tab)
   }
 }
 
-fn is_known_pure_var(callee: Expr) : Bool {
+fn is_known_pure_var(callee: Expr, tab: SymTab) : Bool {
   match callee.kind {
-    EVar(name) -> not is_effect_op(name)
-    ESym(_, _, name) -> not is_effect_op(name)
+    EVar(_)    -> true
+    ESym(s, _, _) -> not is_effect_ref(tab, s)
     EMark(m)   -> mark_is_prim(m)
     _          -> false
   }
@@ -265,11 +248,11 @@ fn row_is_pure(row: Row) : Bool =
 # Both the effect scan and the finding walk descend through
 # xp_positions, the exhaustive enumeration of expression positions.
 
-fn children_have_effect(e: Expr) : Bool =
-  any_position_effect(xp_positions(e))
+fn children_have_effect(e: Expr, tab: SymTab) : Bool =
+  any_position_effect(xp_positions(e), tab)
 
-fn lint_children(e: Expr, acc: [LintFinding]) : [LintFinding] =
-  lint_positions(xp_positions(e), acc)
+fn lint_children(e: Expr, tab: SymTab, acc: [LintFinding]) : [LintFinding] =
+  lint_positions(xp_positions(e), tab, acc)
 
 fn opt_list(o: Option[Expr]) : [Expr] {
   match o {
@@ -290,24 +273,24 @@ fn stmt_expr_list(s: Stmt) : [Expr] {
   }
 }
 
-fn any_position_effect(xs: [XPos]) : Bool {
+fn any_position_effect(xs: [XPos], tab: SymTab) : Bool {
   match xs {
     []                  -> false
-    [XP(_, x), ...rest] -> if expr_has_effect(x) { true } else { any_position_effect(rest) }
+    [XP(_, x), ...rest] -> if expr_has_effect(x, tab) { true } else { any_position_effect(rest, tab) }
   }
 }
 
-fn lint_positions(xs: [XPos], acc: [LintFinding]) : [LintFinding] {
+fn lint_positions(xs: [XPos], tab: SymTab, acc: [LintFinding]) : [LintFinding] {
   match xs {
     []                  -> acc
-    [XP(_, x), ...rest] -> lint_positions(rest, lint_expr(x, acc))
+    [XP(_, x), ...rest] -> lint_positions(rest, tab, lint_expr(x, tab, acc))
   }
 }
 
-fn lint_exprs(xs: [Expr], acc: [LintFinding]) : [LintFinding] {
+fn lint_exprs(xs: [Expr], tab: SymTab, acc: [LintFinding]) : [LintFinding] {
   match xs {
     []          -> acc
-    [x, ...rest] -> lint_exprs(rest, lint_expr(x, acc))
+    [x, ...rest] -> lint_exprs(rest, tab, lint_expr(x, tab, acc))
   }
 }
 
@@ -324,19 +307,22 @@ fn lint_ty_name(e: Expr) : String {
 
 # Lints type the program themselves, so they need the driver's
 # head-owner cache to dispatch `|`, `||` and `|?` exactly as a build
-# does — without it every pipe is rejected as an unknown head.
-fn lint_infer(file: String, decls: [Decl],
-               head_owners: [HeadOwnerEntry]) : TypedProgram / Console + File =
+# does — without it every pipe is rejected as an unknown head — and its
+# symbol table and scope views to settle a name to the declaration a
+# build settles it to.
+fn lint_infer(file: String, decls: [Decl], head_owners: [HeadOwnerEntry],
+               tab: SymTab, views: FileViews) : TypedProgram / Console + File =
   infer_program_with_protos_cached(file, diag_files_flat(file), decls, false, [], head_owners,
-                                   atomic_kind_theories(decls), st_empty(), fv_empty())
+                                   atomic_kind_theories(decls), tab, views)
 
 #[doc("Run lints over a typed program and print human-readable findings; returns 0 (lints never block a build) unless a call statically violates a contract. `src` is the AST before protocol lowering.")]
 pub fn run_lint(file: String, df: DiagFiles, owned_mods: [String], decls: [Decl],
-                 src: [Decl], head_owners: [HeadOwnerEntry]) : Int / Console + File {
-  let r = lint_infer(file, decls, head_owners)
+                 src: [Decl], head_owners: [HeadOwnerEntry],
+                 tab: SymTab, views: FileViews) : Int / Console + File {
+  let r = lint_infer(file, decls, head_owners, tab, views)
   let contract_errs = check_call_site_refinements(file, r.decls)
   if contract_errs != 0 { contract_errs }
-  else { lint_report_text(lint_program(df, owned_mods, sym_locals_read_decls(r.decls), src)); 0 }
+  else { lint_report_text(lint_program(df, owned_mods, sym_locals_read_decls(r.decls), src, tab)); 0 }
 }
 
 fn lint_report_text(findings: [FileFinding]) : Unit / Console {
@@ -359,11 +345,12 @@ fn lint_finding_text(file: String, f: LintFinding) : String {
 #[doc("Run lints over a typed program and print findings as a JSON array; returns 0 (lints never block a build) unless a call statically violates a contract. `src` is the AST before protocol lowering.")]
 pub fn run_lint_json(file: String, df: DiagFiles, owned_mods: [String],
                       decls: [Decl], src: [Decl],
-                      head_owners: [HeadOwnerEntry]) : Int / Console + File {
-  let r = lint_infer(file, decls, head_owners)
+                      head_owners: [HeadOwnerEntry],
+                      tab: SymTab, views: FileViews) : Int / Console + File {
+  let r = lint_infer(file, decls, head_owners, tab, views)
   let contract_errs = check_call_site_refinements(file, r.decls)
   if contract_errs != 0 { contract_errs }
-  else { print(concat_all(["[", lint_json_body(lint_program(df, owned_mods, sym_locals_read_decls(r.decls), src)), "]"])); 0 }
+  else { print(concat_all(["[", lint_json_body(lint_program(df, owned_mods, sym_locals_read_decls(r.decls), src, tab)), "]"])); 0 }
 }
 
 fn lint_json_body(findings: [FileFinding]) : String =
