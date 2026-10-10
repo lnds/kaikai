@@ -54,9 +54,9 @@ A record LITERAL in expression position needs the type prefix
 (`Point { x: 3, y: 4 }`). Only patterns and `let`-destructure allow
 the prefix-less form.
 
-A string pattern is a plain literal: `#{...}` inside one is a compile
-error. To match computed text, bind the value and compare it in a guard
-(`s if s == "id-#{n}" -> ...`).
+A string pattern interpolates like any other string: `"id-#{n}"` matches
+the value the interpolation builds, and may read a binder of its own
+pattern (`Pair(k, "v#{k}")`).
 
 ## Examples
 
