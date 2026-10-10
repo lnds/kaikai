@@ -369,13 +369,13 @@ type UnwClosure = UcTransfer(String) | UcDup(String)
 fn emit_unw_closure(f: Expr, cx: EmitCtx) : Option[UnwClosure] = match sym_read_kind(f.kind) {
   EVar(n) -> if emit_unw_local(f, n, cx) { Some(UcTransfer(n)) } else { None }
   ECall(g, xs) -> match g.kind {
-    EVar(d) -> if d == "__perceus_dup" { match xs {
+    EMark(MkDup) -> match xs {
       [inner] -> match sym_read_kind(inner.kind) {
         EVar(n) -> if emit_unw_local(inner, n, cx) { Some(UcDup(n)) } else { None }
         _ -> None
       }
       _ -> None
-    } } else { None }
+    }
     _ -> None
   }
   _ -> None
@@ -1912,7 +1912,7 @@ fn emit_variant_call_typed(home: Option[String], name: String, args_e: [Expr],
   }
 }
 
-# issue #118 — lower a `__perceus_reuse_variant` rebuild given the
+# Lower a reuse-variant rebuild given the
 # constructor name + arg expressions. Shared by the `EVar` and
 # `EModCall` callee shapes (the resolver qualifies user ctors to the
 # latter). Typed-payload ctors (issue #440) still route to the
@@ -1983,7 +1983,7 @@ fn emit_reuse_variant_body(src: String, cname: String, cargs: [Expr],
           ", (KaiVarSlot[]){", seq_joined(slots), "})"
         ]))
       }
-      None -> "kai_unit() /* __perceus_reuse_variant: typed lookup vanished */"
+      None -> emit_mark_bad(MkReuseVariant, "typed lookup vanished")
     }
   } else if n == 0 {
     let tag_str = int_to_string(evar_find_tag_arity(cx.variants, None, cname, n))
@@ -2054,7 +2054,73 @@ fn emit_mark_call(src: String, m: Mark, args_e: [Expr], cx: EmitCtx) : String / 
       [g] -> emit_expr(src, g, cx)
       _   -> "kai_unit() /* owned borrow: arity mismatch */"
     }
+    # A dup lowers to the runtime incref, which hands its operand back.
+    MkDup -> match args_e {
+      [a] -> concat_all(["kai_internal_dup(", emit_expr(src, a, cx), ")"])
+      _   -> emit_mark_bad(m, "arity mismatch")
+    }
+    MkReuseCons    -> emit_reuse_cons_call(src, m, args_e, cx)
+    MkReuseRecord  -> emit_reuse_record_call(src, m, args_e, cx)
+    MkReuseVariant -> emit_reuse_variant_call(src, m, args_e, cx)
     _ -> concat_all(["kai_unit() /* no lowering for mark ", mark_name(m), " */"])
+  }
+
+# A mark call the emitter cannot lower, named in the C it leaves behind.
+fn emit_mark_bad(m: Mark, why: String) : String =
+  concat_all(["kai_unit() /* ", mark_name(m), ": ", why, " */"])
+
+# Reuse-in-place for a cons cell: `(scr, head, tail)` inside a
+# `match SCRUT { [h, ...t] -> ... }` arm body. The scrutinee mark lowers
+# to the match emitter's local `_scr`. The runtime helper reads
+# `_scr->rc`: when unique it rewrites the cell in place and increfs it so
+# it survives the `kai_decref(_scr)` at match exit; otherwise it falls
+# back to `kai_cons` and leaves `_scr` for the match exit to reclaim.
+fn emit_reuse_cons_call(src: String, m: Mark, args_e: [Expr], cx: EmitCtx) : String / Console =
+  match args_e {
+    [_scr, h, t] -> seq_call("kai_reuse_or_alloc_cons(_scr, ",
+                             [emit_expr(src, h, cx), emit_expr(src, t, cx)], ")")
+    _ -> emit_mark_bad(m, "arity mismatch (expected 3 args)")
+  }
+
+# Reuse-in-place for a record cell: `(scr, {field: val, ...})` where the
+# literal is a same-arity rebuild. Its field exprs and names are forwarded
+# in the shape `kai_record` expects.
+fn emit_reuse_record_call(src: String, m: Mark, args_e: [Expr], cx: EmitCtx) : String / Console =
+  match args_e {
+    [_scr, lit] -> match lit.kind {
+      ERecordLit(_, _rec_name, fis) -> {
+        let n = list_length(fis)
+        let vals  = seq_operands(map(fis, (fi) => emit_field_init_val(src, fi, cx)))
+        let names = join_with(map(fis, emit_field_init_name), ", ")
+        emit_rec_stamp(seq_wrap(vals, concat_all([
+          "kai_reuse_or_alloc_record(_scr, ",
+          int_to_string(n),
+          ", (KaiValue *[]){", seq_joined(vals), "}, (const char *[]){", names, "}, ",
+          int_to_string(record_kept_mask(fis, 0, 0)), "ULL)"
+        ])), rec_stamp_of(cx.stamps, lit.ty))
+      }
+      _ -> emit_mark_bad(m, "2nd arg must be a record literal")
+    }
+    _ -> emit_mark_bad(m, "arity mismatch (expected 2 args)")
+  }
+
+# Reuse-in-place for a variant cell: `(scr, Ctor(args...))` where the
+# second arg is a constructor call of the same arity. The ctor arrives
+# bare or, once the resolver qualified it, as `EModCall(tycon, cname)`;
+# both lower through `emit_reuse_variant_body`.
+fn emit_reuse_variant_call(src: String, m: Mark, args_e: [Expr], cx: EmitCtx) : String / Console =
+  match args_e {
+    [_scr, ctor] -> match ctor.kind {
+      ECall(cf, cargs) -> match cf.kind {
+        EVar(cname) ->
+          emit_reuse_variant_body(src, cname, cargs, cx)
+        EModCall(_mod, cname) ->
+          emit_reuse_variant_body(src, cname, cargs, cx)
+        _ -> emit_mark_bad(m, "2nd arg must be a variant constructor call")
+      }
+      _ -> emit_mark_bad(m, "2nd arg must be a variant constructor call")
+    }
+    _ -> emit_mark_bad(m, "arity mismatch (expected 2 args)")
   }
 
 fn emit_call_expr_named(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
@@ -2336,23 +2402,6 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
           ])
           _   -> "kai_unit() /* resume: arity mismatch (expected 1 or 2 args) */"
         }
-      } else if callee == "__perceus_dup" {
-        # m5 #4 — AST-level dup, lowered to runtime `kai_incref`.
-        # Inserted by `perceus_pass` around every non-last EVar read of
-        # a binding that lives long enough to need an extra reference.
-        #
-        # Coupled arm-top reuse: when the dup'd value is a BORROW binder of
-        # the enclosing reuse arm (cx.borrowed), lower to a MOVE — emit the
-        # bare value, no kai_internal_dup. perceus inserted the dup assuming
-        # an owned bind; the arm-top instead took the shell and the children
-        # move into the rebuild. The redundant incref is exactly what kept
-        # the descent tree shared (rc>=2) and the reuse inert.
-        match args_e {
-          [a] -> concat_all([
-            "kai_internal_dup(", emit_expr(src, a, cx), ")"
-          ])
-          _   -> "kai_unit() /* __perceus_dup: arity mismatch */"
-        }
       } else if callee == "__strip_unit" or callee == "__attach_unit" or callee == "__detach_unit" {
         # typer-internal unit erasure/tagging (`Real<u>` -> `Real`,
         # `Decimal` <-> `Decimal<c>`). At runtime all three are
@@ -2380,80 +2429,6 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
             concat_all(["kai_str(\"", nm, "\")"])
           }
           _ -> "kai_unit() /* unit_name: expected 1 arg */"
-        }
-      } else if callee == "__perceus_reuse_cons" {
-        # issue #118 — reuse-in-place for cons cells. The recogniser
-        # synthesises calls of the form
-        #   `__perceus_reuse_cons(__pcs_scr, head, tail)`
-        # inside a `match SCRUT { [h, ...t] -> ... }` arm body.
-        # `__pcs_scr` is a synthetic identifier that lowers to the
-        # match emitter's local `_scr` — sidestepping the need to
-        # teach `emit_match_default` about reuse-aware decref. The
-        # runtime helper reads `_scr->rc`: when unique, it rewrites
-        # the cell in place + `kai_incref`s the cell so it survives
-        # the `kai_decref(_scr)` at match exit; otherwise it falls
-        # back to `kai_cons` and leaves `_scr` intact for the match
-        # exit to reclaim.
-        match args_e {
-          [_scr, h, t] -> seq_call("kai_reuse_or_alloc_cons(_scr, ",
-                                   [emit_expr(src, h, cx), emit_expr(src, t, cx)], ")")
-          _ -> "kai_unit() /* __perceus_reuse_cons: arity mismatch (expected 3 args) */"
-        }
-      } else if callee == "__perceus_reuse_record" {
-        # issue #118 — reuse-in-place for record cells. The recogniser
-        # synthesises `__perceus_reuse_record(__pcs_scr, {field: val, ...})`
-        # where the literal record arg is a same-arity rebuild. We
-        # extract its field exprs + names from the ERecordLit and
-        # forward them in the same shape `kai_record` expects.
-        match args_e {
-          [_scr, lit] -> match lit.kind {
-            ERecordLit(_, _rec_name, fis) -> {
-              let n = list_length(fis)
-              let vals  = seq_operands(map(fis, (fi) => emit_field_init_val(src, fi, cx)))
-              let names = join_with(map(fis, emit_field_init_name), ", ")
-              emit_rec_stamp(seq_wrap(vals, concat_all([
-                "kai_reuse_or_alloc_record(_scr, ",
-                int_to_string(n),
-                ", (KaiValue *[]){", seq_joined(vals), "}, (const char *[]){", names, "}, ",
-                int_to_string(record_kept_mask(fis, 0, 0)), "ULL)"
-              ])), rec_stamp_of(cx.stamps, lit.ty))
-            }
-            _ -> "kai_unit() /* __perceus_reuse_record: 2nd arg must be a record literal */"
-          }
-          _ -> "kai_unit() /* __perceus_reuse_record: arity mismatch (expected 2 args) */"
-        }
-      } else if callee == "__perceus_reuse_variant" {
-        # issue #118 — reuse-in-place for variant cells. Recogniser
-        # synthesises `__perceus_reuse_variant(__pcs_scr, Ctor(args...))`
-        # where the second arg is a variant constructor call of the
-        # same arity. We unpack the constructor's name + args and
-        # lower to `kai_reuse_or_alloc_variant`.
-        #
-        # Issue #440 Phase 2 — when the ctor has primitive payload
-        # slots (typed), the reuse-in-place fast path is disabled:
-        # `kai_reuse_or_alloc_variant` writes its replacement args
-        # into `slots[i].ptr` and assumes `slot_mask == 0`, which
-        # would mismatch the emit-side typed extract (`slots[i].i64`).
-        # Routing the rebuild through `kai_variant_u` keeps the
-        # cell coherent with the match read; the reuse-for-typed-
-        # cells extension is a follow-up lane.
-        match args_e {
-          [_scr, ctor] -> match ctor.kind {
-            # The recogniser may hand the ctor either as a bare
-            # `EVar(cname)` (pre-resolution shape) or — the common
-            # case after the resolver qualifies user constructors —
-            # as `EModCall(tycon, cname)`. Both lower identically;
-            # `emit_reuse_variant_body` shares the slot logic.
-            ECall(cf, cargs) -> match cf.kind {
-              EVar(cname) ->
-                emit_reuse_variant_body(src, cname, cargs, cx)
-              EModCall(_mod, cname) ->
-                emit_reuse_variant_body(src, cname, cargs, cx)
-              _ -> "kai_unit() /* __perceus_reuse_variant: 2nd arg must be a variant constructor call */"
-            }
-            _ -> "kai_unit() /* __perceus_reuse_variant: 2nd arg must be a variant constructor call */"
-          }
-          _ -> "kai_unit() /* __perceus_reuse_variant: arity mismatch (expected 2 args) */"
         }
       } else if callee == "bit_and" {
         # m13: bit ops are compiler intrinsics — each lowers inline to
@@ -3695,14 +3670,11 @@ fn try_reuse_cons_arm(pat: Pattern, body: Expr) : Option[ReuseConsArm] {
     PList(pats, opt_rest) -> match opt_rest {
       Some(rest_name) -> match pats {
         [head_pat] -> match body.kind {
-          ECall(callee, call_args) -> match sym_read_kind(callee.kind) {
-            EVar(callee_name) ->
-              if callee_name == "__perceus_reuse_cons" {
-                match call_args {
-                  [_scr_arg, h_new, t_new] -> Some(ReuseConsArm(head_pat, rest_name, h_new, t_new))
-                  _ -> None
-                }
-              } else { None }
+          ECall(callee, call_args) -> match callee.kind {
+            EMark(MkReuseCons) -> match call_args {
+              [_scr_arg, h_new, t_new] -> Some(ReuseConsArm(head_pat, rest_name, h_new, t_new))
+              _ -> None
+            }
             _ -> None
           }
           _ -> None
@@ -4038,10 +4010,9 @@ fn arm_bare_use_kind(nm: String, k: ExprKind) : Bool = match k {
 }
 
 # In a call, a bare `EVar(nm)` directly as an arg is a moved use UNLESS
-# the call is `__perceus_dup(nm)` (that arg is a dup, not a move).
-fn arm_call_bare_use(nm: String, f: Expr, xs: [Expr]) : Bool = match sym_read_kind(f.kind) {
-  EVar(callee) -> if callee == "__perceus_dup" { false }
-                  else { arm_binder_has_bare_use(nm, f) or arm_bare_use_seq(nm, xs) }
+# the call is a dup of `nm` (that arg is a dup, not a move).
+fn arm_call_bare_use(nm: String, f: Expr, xs: [Expr]) : Bool = match f.kind {
+  EMark(MkDup) -> false
   _ -> arm_binder_has_bare_use(nm, f) or arm_bare_use_seq(nm, xs)
 }
 
@@ -4215,29 +4186,26 @@ fn try_reuse_variant_arm(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ReuseVa
   match pat.pkind {
     PVariant(phome, pcname, subs) -> match body.kind {
       ECall(scallee, sargs) -> match scallee.kind {
-        EVar(sname) ->
-          if sname == "__perceus_reuse_variant" {
-            match sargs {
-              [_scr_arg, ctor] -> match reuse_ctor_home_name(ctor) {
-                Some(bctor) -> match ctor.kind {
-                  ECall(_cf, cargs) ->
-                    if reuse_same_ctor(phome, pcname, bctor) and
-                       list_length(subs) == list_length(cargs) {
-                      match evar_slot_kinds_in(cx.variants, phome, pcname) {
-                        Some(tys) ->
-                          if list_length(tys) == list_length(subs) {
-                            Some(ReuseVariantArm(subs, phome, pcname, cargs, tys))
-                          } else { None }
-                        None -> None
-                      }
-                    } else { None }
-                  _ -> None
-                }
-                None -> None
-              }
+        EMark(MkReuseVariant) -> match sargs {
+          [_scr_arg, ctor] -> match reuse_ctor_home_name(ctor) {
+            Some(bctor) -> match ctor.kind {
+              ECall(_cf, cargs) ->
+                if reuse_same_ctor(phome, pcname, bctor) and
+                   list_length(subs) == list_length(cargs) {
+                  match evar_slot_kinds_in(cx.variants, phome, pcname) {
+                    Some(tys) ->
+                      if list_length(tys) == list_length(subs) {
+                        Some(ReuseVariantArm(subs, phome, pcname, cargs, tys))
+                      } else { None }
+                    None -> None
+                  }
+                } else { None }
               _ -> None
             }
-          } else { None }
+            None -> None
+          }
+          _ -> None
+        }
         _ -> None
       }
       _ -> None
@@ -4646,25 +4614,22 @@ fn reuse_kept_pay(pat: Pattern, body: Expr, cx: EmitCtx) : String =
   else { match pat.pkind {
     PVariant(phome, pcname, subs) -> match body.kind {
       ECall(scallee, sargs) -> match scallee.kind {
-        EVar(sname) ->
-          if sname == "__perceus_reuse_variant" {
-            match sargs {
-              [_scr_arg, ctor] -> match reuse_ctor_home_name(ctor) {
-                Some(bctor) -> match ctor.kind {
-                  ECall(_cf, cargs) -> match evar_slot_kinds_in(cx.variants, phome, pcname) {
-                    Some(ptys) ->
-                      if reuse_fire_iff_unique(bctor, ptys, cx) {
-                        reuse_kept_drops(subs, cargs, ptys, 0, cx)
-                      } else { "" }
-                    None -> ""
-                  }
-                  _ -> ""
-                }
+        EMark(MkReuseVariant) -> match sargs {
+          [_scr_arg, ctor] -> match reuse_ctor_home_name(ctor) {
+            Some(bctor) -> match ctor.kind {
+              ECall(_cf, cargs) -> match evar_slot_kinds_in(cx.variants, phome, pcname) {
+                Some(ptys) ->
+                  if reuse_fire_iff_unique(bctor, ptys, cx) {
+                    reuse_kept_drops(subs, cargs, ptys, 0, cx)
+                  } else { "" }
                 None -> ""
               }
               _ -> ""
             }
-          } else { "" }
+            None -> ""
+          }
+          _ -> ""
+        }
         _ -> ""
       }
       _ -> ""
@@ -4721,15 +4686,13 @@ fn reuse_kept_drops(subs: [Pattern], cargs: [Expr], ptys: [Int], i: Int,
   }
 }
 
-# The head of `cargs` is a bare `EVar(nm)` or a `__perceus_dup(nm)` wrap.
+# The head of `cargs` is a bare `EVar(nm)` or a dup wrap of it.
 fn reuse_carg_reads(cargs: [Expr], nm: String) : Bool = match cargs {
   [c, ..._] -> match c.kind {
     EVar(u) -> u == nm
     ECall(df, dargs) -> match df.kind {
-      EVar(dn) ->
-        if dn == "__perceus_dup" {
-          match dargs { [inner] -> match inner.kind { EVar(u) -> u == nm _ -> false } _ -> false }
-        } else { false }
+      EMark(MkDup) ->
+        match dargs { [inner] -> match inner.kind { EVar(u) -> u == nm _ -> false } _ -> false }
       _ -> false
     }
     _ -> false
@@ -13061,20 +13024,25 @@ fn trmc_list_cons_modcons(els: [ListElem], me: SelfRef, arity: Int) : Option[[Ex
     _ -> None
   }
 
-# Shape 2 — the perceus reuse-cons rewrite of a cons arm:
-# `__perceus_reuse_cons(__pcs_scr, head, self_call)`. The first arg is the
-# scrutinee handle that lowers to the match emitter's `_scr`; the step
-# decref's it so the consumed input spine is freed level by level. Returns
-# the cons args `[head, self_call]` under the clean-single-site discipline.
-fn trmc_reuse_cons_modcons(callee: String, xs: [Expr], me: SelfRef, arity: Int) : Option[[Expr]] =
-  if callee != "__perceus_reuse_cons" { None }
-  else { match xs {
+# Shape 2 — the perceus reuse-cons rewrite of a cons arm, its args
+# `(scr, head, self_call)`. The first arg is the scrutinee handle that
+# lowers to the match emitter's `_scr`; the step decref's it so the
+# consumed input spine is freed level by level. Returns the cons args
+# `[head, self_call]` under the clean-single-site discipline.
+fn trmc_reuse_cons_modcons(xs: [Expr], me: SelfRef, arity: Int) : Option[[Expr]] =
+  match xs {
     [_scr, head, tail] -> {
       let clean = tcrec_is_direct_self_call(tail, me, arity) and not tcrec_expr_has_self_call(head, me, arity)
       if clean { Some([head, tail]) } else { None }
     }
     _ -> None
-  } }
+  }
+
+# True when a reuse-cons call over `xs` is a modulo-cons tail: the builtin
+# cons shapes are enabled and no binder in scope shadows the self name.
+fn trmc_reuse_cons_tail(xs: [Expr], me: SelfRef, arity: Int, scope: [String], cons_ok: Bool) : Bool =
+  cons_ok and not list_has(scope, self_ref_name(me)) and
+  (match trmc_reuse_cons_modcons(xs, me, arity) { Some(_) -> true None -> false })
 
 
 fn tcrec_walk_tail(k: ExprKind, me: SelfRef, arity: Int, scope: [String], cons_ok: Bool) : Bool {
@@ -13087,10 +13055,9 @@ fn tcrec_walk_tail(k: ExprKind, me: SelfRef, arity: Int, scope: [String], cons_o
           # TRMC: a constructor application in tail position with a
           # self-call in exactly one slot is modulo-cons-eligible.
           match tcrec_ctor_modcons_slot(xs, me, arity) { Some(_) -> true None -> false }
-        } else if cons_ok and not list_has(scope, self_ref_name(me)) {
-          # Builtin cons via perceus's reuse-cons rewrite.
-          match trmc_reuse_cons_modcons(callee, xs, me, arity) { Some(_) -> true None -> false }
         } else { false }
+      # Builtin cons via perceus's reuse-cons rewrite.
+      EMark(MkReuseCons) -> trmc_reuse_cons_tail(xs, me, arity, scope, cons_ok)
       # The monomorphiser retargets a bare call to a module-shared poly
       # name as `EModCall(host, nm)` — a qualified call to the enclosing
       # module IS a direct self-call.
@@ -13292,9 +13259,8 @@ fn trmc_walk_modcons(k: ExprKind, me: SelfRef, arity: Int, scope: [String], cons
       EVar(callee) ->
         if name_first_is_upper(callee) and not list_has(scope, self_ref_name(me)) {
           match tcrec_ctor_modcons_slot(xs, me, arity) { Some(_) -> true None -> false }
-        } else if cons_ok and not list_has(scope, self_ref_name(me)) {
-          match trmc_reuse_cons_modcons(callee, xs, me, arity) { Some(_) -> true None -> false }
         } else { false }
+      EMark(MkReuseCons) -> trmc_reuse_cons_tail(xs, me, arity, scope, cons_ok)
       EModCall(_, callee) ->
         if name_first_is_upper(callee) and not list_has(scope, self_ref_name(me)) {
           match tcrec_ctor_modcons_slot(xs, me, arity) { Some(_) -> true None -> false }
@@ -13708,8 +13674,8 @@ fn tcrec_kind_raw_read(k: ExprKind, p: String, bm: BorrowMap) : Bool {
 }
 
 fn tcrec_is_dup_callee(f: Expr) : Bool = match f.kind {
-  EVar(c) -> c == "__perceus_dup"
-  _       -> false
+  EMark(MkDup) -> true
+  _            -> false
 }
 
 # Perceus has already renamed a borrowing prim to its `_borrow` variant,
@@ -14059,10 +14025,10 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
           Some(ctor) -> trmc_rewrite_kind(ctor.kind, ctor.line, ctor.col, me, arity,
                                           c_sym_str, params, pnames, uses, dm_table, skip_set, scope, cons_ok)
           None -> {
-          # Reuse-cons leaf: `__perceus_reuse_cons(__pcs_scr, head, self)`.
+          # Reuse-cons leaf: the mark over `(scr, head, self)`.
           let reuse = match f.kind {
-            EVar(callee) -> if cons_ok and not list_has(scope, self_ref_name(me)) { trmc_reuse_cons_modcons(callee, xs, me, arity) } else { None }
-            _            -> None
+            EMark(MkReuseCons) -> if cons_ok and not list_has(scope, self_ref_name(me)) { trmc_reuse_cons_modcons(xs, me, arity) } else { None }
+            _                  -> None
           }
           match reuse {
             Some(cargs) -> trmc_make_step_call(trmc_cons_scr_cname(), cargs, 1, line, col,
@@ -14077,16 +14043,16 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
   }
 }
 
-# The ctor a `__perceus_reuse_variant(scr, Ctor(..))` rebuilds, when one of
-# its slots is the self-call.
+# The ctor a reuse-variant mark over `(scr, Ctor(..))` rebuilds, when one
+# of its slots is the self-call.
 fn trmc_reuse_variant_ctor(f: Expr, xs: [Expr], me: SelfRef, arity: Int) : Option[Expr] = match f.kind {
-  EVar(callee) -> if callee != "__perceus_reuse_variant" { None } else { match xs {
+  EMark(MkReuseVariant) -> match xs {
     [_scr, ctor] -> match ctor.kind {
       ECall(cf, cargs) -> if trmc_names_ctor(cf) and not trmc_slot_none(tcrec_ctor_modcons_slot(cargs, me, arity)) { Some(ctor) } else { None }
       _                -> None
     }
     _ -> None
-  } }
+  }
   _ -> None
 }
 

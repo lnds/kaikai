@@ -3031,13 +3031,13 @@ fn kir_unw_held(names: [String], clo: Option[UnwCallee]) : [String] = match clo 
 fn kir_unw_closure(f: Expr, st: LowerSt) : Option[UnwCallee] = match f.kind {
   EVar(n) -> if ls_binder_read(st, fnid_none(), n) { Some(UkTransfer(n)) } else { None }
   ECall(g, xs) -> match g.kind {
-    EVar(d) -> if d == "__perceus_dup" { match xs {
+    EMark(MkDup) -> match xs {
       [inner] -> match inner.kind {
         EVar(n) -> if ls_binder_read(st, fnid_none(), n) { Some(UkDup(n)) } else { None }
         _ -> None
       }
       _ -> None
-    } } else { None }
+    }
     _ -> None
   }
   _ -> None
@@ -3067,8 +3067,8 @@ fn lower_call_at(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console 
   }
 }
 
-# The dense dispatch: perceus marks → KRC; sentinels → terminators;
-# resume → resume terminator; constructor / ordinary call otherwise. The
+# The dense dispatch: sentinels → terminators; resume → resume
+# terminator; constructor / ordinary call otherwise. The
 # string-matching lives in the pure `classify_callee` (base); the walk
 # only routes the resulting `CalleeKind` to its lowering.
 fn lower_named_call(x: Expr, callee: String, csym: FnId, cargs: [Expr], st: LowerSt) : LRes / Console =
@@ -3093,6 +3093,10 @@ fn lower_mark_call(x: Expr, m: Mark, cargs: [Expr], st: LowerSt) : LRes / Consol
   else { match m {
     MkApplyBorrow -> lower_apply_borrow(x, cargs, st)
     MkTrmcApply   -> lower_trmc_apply(x, cargs, st)
+    MkDup         -> lower_rc_unary(cargs, KDupMk, st)
+    MkReuseCons    -> lower_reuse(x, m, cargs, st)
+    MkReuseVariant -> lower_reuse(x, m, cargs, st)
+    MkReuseRecord  -> lower_reuse(x, m, cargs, st)
     _ -> {
       eprint(concat_all(["kir: mark ", mark_name(m), " has no lowering"]))
       LRes(KUnitV, st)
@@ -3109,8 +3113,6 @@ fn ls_classify(st: LowerSt, csym: FnId, callee: String) : CalleeKind = match fnx
 # Dispatch a non-effect-op bare call by its `CalleeKind`.
 fn lower_named_call_kind(x: Expr, callee: String, csym: FnId, cargs: [Expr], st: LowerSt) : LRes / Console =
   match ls_classify(st, csym, callee) {
-    CkDup       -> lower_rc_unary(cargs, KDupMk, st)
-    CkReuse     -> lower_reuse(x, callee, cargs, st)
     CkTrmcStep  -> lower_trmc_step(x, callee, cargs, st)
     CkTcrec     -> lower_tcrec(x, callee, cargs, st)
     CkResume    -> lower_resume(x, cargs, st)
@@ -3171,7 +3173,7 @@ fn lower_rc_unary(cargs: [Expr], kind: RCKind, st: LowerSt) : LRes / Console = m
   [a] -> match lower_expr(a, st) { LRes(v, st1) -> {
     let op = match kind { KDupMk -> KDup(v) KDropMk -> KDrop(v) }
     let st2 = ls_emit(st1, KRC(op, kpos_of(a)))
-    # `__perceus_dup(x)` evaluates to `x`; drop evaluates to unit.
+    # A dup evaluates to its operand; a drop evaluates to unit.
     match kind { KDupMk -> LRes(v, st2) KDropMk -> LRes(KUnitV, st2) }
   } }
   _ -> LRes(KUnitV, st)
@@ -3204,14 +3206,13 @@ fn lower_unit_name(cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
   _   -> LRes(KUnitV, st)
 }
 
-# `__perceus_reuse_*(scr, rbld...)`: donor scrutinee + rebuild. The `callee`
-# (`__perceus_reuse_{variant,cons,record}`) is the authoritative reuse-kind
-# tag — perceus stamped it from the pattern shape — so each reuse routes to
-# its own move-semantics runtime helper. The record form needs its rebuild's
-# field NAMES, so it decodes the `ERecordLit` into a `KRecordReuse`; the
-# variant/cons forms share the slot-init `KConReuse`. (The original native
-# bug routed every reuse — record included — through the variant helper.)
-fn lower_reuse(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
+# A reuse mark over (scr, rbld...): donor scrutinee + rebuild. The mark is
+# the authoritative reuse-kind tag — perceus stamped it from the pattern
+# shape — so each reuse routes to its own move-semantics runtime helper.
+# The record form needs its rebuild's field NAMES, so it decodes the
+# `ERecordLit` into a `KRecordReuse`; the variant/cons forms share the
+# slot-init `KConReuse`.
+fn lower_reuse(x: Expr, m: Mark, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
   [scr, ...rbld] ->
     # Under a live region the donor is never reused in place: the rebuild
     # bump-allocates a fresh cell in the arena (`KCon` carries `in_region`),
@@ -3221,13 +3222,17 @@ fn lower_reuse(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Con
     # (a no-op on the arena's immortal-rc cells).
     if st.in_region { lower_reuse_fresh(x, rbld, st) }
     else { match lower_expr(scr, st) { LRes(donor, st1) ->
-      if callee == "__perceus_reuse_record" { lower_reuse_record(x, donor, rbld, st1) }
-      else { lower_reuse_rebuild(x, reuse_kind_of(callee), donor, rbld, st1) } } }
+      match m {
+        MkReuseRecord -> lower_reuse_record(x, donor, rbld, st1)
+        _             -> lower_reuse_rebuild(x, reuse_kind_of(m), donor, rbld, st1)
+      } } }
   _ -> LRes(KUnitV, st)
 }
 
-fn reuse_kind_of(callee: String) : KReuseKind =
-  if callee == "__perceus_reuse_cons" { RkCons } else { RkVariant }
+fn reuse_kind_of(m: Mark) : KReuseKind = match m {
+  MkReuseCons -> RkCons
+  _           -> RkVariant
+}
 
 # The region rebuild: lower the reconstruction expression as an ordinary ctor.
 # `st.in_region` is live, so the `KCon`/cons/record it emits routes to the
@@ -4033,10 +4038,10 @@ fn lower_trmc_apply(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = matc
 }
 
 # True iff the trmc-apply leaf is a variant con-reuse of the match scrutinee
-# (`__perceus_reuse_variant(scr, ..)`) — the shape that increfs the donor and so
-# needs the exit drop the terminal RET skips.
+# — the shape that increfs the donor and so needs the exit drop the terminal
+# RET skips.
 fn trmc_apply_leaf_reuses_scr(leaf: Expr) : Bool = match leaf.kind {
-  ECall(cf, _) -> match cf.kind { EVar(nm) -> nm == "__perceus_reuse_variant" _ -> false }
+  ECall(cf, _) -> match cf.kind { EMark(MkReuseVariant) -> true _ -> false }
   _            -> false
 }
 

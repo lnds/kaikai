@@ -39,6 +39,7 @@
 # from this module ⇒ mirror, not sink).
 
 import compiler.ast
+import compiler.marks
 import compiler.sym_read
 import compiler.util
 import compiler.core_prims
@@ -597,8 +598,8 @@ fn pcs_strip_borrow_kind(k: ExprKind, scx: StripCx) : ExprKind = match k {
   _ -> prc_map_expr_kind(k, (sub) => pcs_strip_borrow_args_d(sub, scx))
 }
 
-# The arg0 var name, seeing through a `__perceus_dup(x)` wrap the rewrite
-# may have placed. `None` if arg0 is not a (possibly dup-wrapped) bare var.
+# The arg0 var name, seeing through a dup wrap the rewrite may have
+# placed. `None` if arg0 is not a (possibly dup-wrapped) bare var.
 fn pcs_arg0_var_name(args_: [Expr]) : Option[String] = match args_ {
   []          -> None
   [h, ...___] -> pcs_unwrap_dup_var(h)
@@ -606,9 +607,9 @@ fn pcs_arg0_var_name(args_: [Expr]) : Option[String] = match args_ {
 
 fn pcs_unwrap_dup_var(e: Expr) : Option[String] = match sym_read_kind(prc_peel_unit(e).kind) {
   EVar(nm)        -> Some(nm)
-  ECall(f, inner) -> match sym_read_kind(f.kind) {
-    EVar(fn_) -> if fn_ == "__perceus_dup" { match inner { [x] -> pcs_unwrap_dup_var(x) _ -> None } } else { None }
-    _         -> None
+  ECall(f, inner) -> match f.kind {
+    EMark(MkDup) -> match inner { [x] -> pcs_unwrap_dup_var(x) _ -> None }
+    _            -> None
   }
   _ -> None
 }
@@ -1815,9 +1816,9 @@ fn pcs_mk_scr(line: Int, col: Int) : Expr =
   Expr { kind: EMark(MkScrutinee), line: line, col: col,
          ty: None, mode: MUnknown , site: 0 }
 
-fn pcs_mk_call(name: String, args: [Expr], line: Int, col: Int) : Expr =
+fn pcs_mk_call(m: Mark, args: [Expr], line: Int, col: Int) : Expr =
   Expr { kind: ECall(
-            Expr { kind: EVar(name), line: line, col: col,
+            Expr { kind: EMark(m), line: line, col: col,
                    ty: None, mode: MUnknown , site: 0 },
             args),
          line: line, col: col, ty: None, mode: MUnknown , site: 0 }
@@ -1906,7 +1907,7 @@ fn pcs_try_reuse_cons(body: Expr) : Expr {
       [e1, e2] -> match e1 {
         ElPlain(h_new) -> match e2 {
           ElSpread(t_new) ->
-            pcs_mk_call("__perceus_reuse_cons",
+            pcs_mk_call(MkReuseCons,
                         [pcs_mk_scr(body.line, body.col), h_new, t_new],
                         body.line, body.col)
           _ -> body
@@ -1930,7 +1931,7 @@ fn pcs_try_reuse_variant(body: Expr, expected_arity: Int, binders: [String]) : E
         # The lexical uppercase check filters out non-ctor callees;
         # combined with the typer-aware shape match it is sound.
         if list_length(cargs) == expected_arity and pcs_name_is_ctor(cname) {
-          pcs_mk_call("__perceus_reuse_variant",
+          pcs_mk_call(MkReuseVariant,
                       [pcs_mk_scr(body.line, body.col),
                        pcs_reuse_rebuild(body, callee, pcs_reuse_strip_dups(cargs, binders))],
                       body.line, body.col)
@@ -1944,7 +1945,7 @@ fn pcs_try_reuse_variant(body: Expr, expected_arity: Int, binders: [String]) : E
       # check still guards against a same-typed function call.
       EModCall(_mod, cname) ->
         if list_length(cargs) == expected_arity and pcs_name_is_ctor(cname) {
-          pcs_mk_call("__perceus_reuse_variant",
+          pcs_mk_call(MkReuseVariant,
                       [pcs_mk_scr(body.line, body.col),
                        pcs_reuse_rebuild(body, callee, pcs_reuse_strip_dups(cargs, binders))],
                       body.line, body.col)
@@ -1994,7 +1995,7 @@ fn pcs_try_reuse_record(body: Expr, expected_n: Int, binders: [String]) : Expr {
       if list_length(fis) == expected_n {
         let body2 = Expr { kind: ERecordLit(rh, rec_name, pcs_strip_dup_fields(fis, binders)),
                            line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
-        pcs_mk_call("__perceus_reuse_record",
+        pcs_mk_call(MkReuseRecord,
                     [pcs_mk_scr(body.line, body.col), body2],
                     body.line, body.col)
       } else { body }
@@ -2032,11 +2033,9 @@ fn pcs_top_dup_count(es: [Expr], b: String) : Int = match es {
 }
 
 fn pcs_is_dup_read(e: Expr, b: String) : Bool = match e.kind {
-  ECall(f, xs) -> match sym_read_kind(f.kind) {
-    EVar(fname) ->
-      if fname == "__perceus_dup" {
-        match xs { [inner] -> match sym_read_kind(inner.kind) { EVar(u) -> u == b _ -> false } _ -> false }
-      } else { false }
+  ECall(f, xs) -> match f.kind {
+    EMark(MkDup) ->
+      match xs { [inner] -> match sym_read_kind(inner.kind) { EVar(u) -> u == b _ -> false } _ -> false }
     _ -> false
   }
   _ -> false
@@ -2055,6 +2054,7 @@ fn pcs_occurs_outside_top_dups(es: [Expr], b: String) : Bool = match es {
 # verdict only forfeits the unwrap.
 fn pcs_var_occurs(e: Expr, b: String) : Bool = match sym_read_kind(e.kind) {
   EVar(u)            -> u == b
+  EMark(MkDup)       -> false
   EStr(span, _)      -> string_contains(span, b)
   ECall(f, xs)       -> pcs_var_occurs(f, b) or pcs_var_occurs_list(xs, b)
   EIntrinsic(_, xs)  -> pcs_var_occurs_list(xs, b)
@@ -2145,7 +2145,7 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     EVar(nm) -> {
       if list_has(scope, nm) and pcs_is_non_last(nm, line, col, uses, in_lam, skip_set, force_set, bmap, move_last_set) {
         ECall(
-          Expr { kind: EVar("__perceus_dup"), line: line, col: col,
+          Expr { kind: EMark(MkDup), line: line, col: col,
                  ty: None, mode: MUnknown , site: 0 },
           [Expr { kind: EVar(nm), line: line, col: col,
                   ty: None, mode: MUnknown , site: 0 }]
@@ -2163,7 +2163,7 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [String],
     # Re-tokenise + re-parse each `#{...}` body, run pcs_rewrite_expr on
     # the parsed Expr, then surgically rewrite the source by replacing
     # the wrapped ident tokens with `__perceus_dup(NAME)`. Result rounds
-    # back through the parser at emit time as a normal ECall(__perceus_dup).
+    # back through the parser at emit time, which reads the dup mark back.
     EStr(span, is_triple) -> EStr(pcs_rewrite_estr_span(span, is_triple, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set), is_triple)
     # Scope-aware kinds: ELambda extends scope with params and flips
     # in_lam; EBlock threads scope through SLet/SVar bindings; EMatch
@@ -3207,7 +3207,8 @@ fn pcs_slot_simple(e: Expr) : Bool = match e.kind {
   ECall(f, xs)   -> match sym_read_kind(f.kind) {
     # A dup of a binder is flat. A NULLARY ctor (Red/Black/Leaf, no slots) is
     # flat. A ctor WITH slots embeds children → non-bijective → NOT simple.
-    EVar(c)        -> if c == "__perceus_dup" { true } else { pcs_name_is_ctor(c) and pcs_all_slots_simple(xs) }
+    EMark(MkDup)   -> true
+    EVar(c)        -> pcs_name_is_ctor(c) and pcs_all_slots_simple(xs)
     EModCall(_, c) -> pcs_name_is_ctor(c) and pcs_all_slots_simple(xs)
     _              -> false
   }
@@ -3352,10 +3353,9 @@ fn pcs_consumers_linear_ps(nm: String, ps: [XPos]) : Bool = match ps {
 
 # Check whether a call expression `f(xs...)` with `nm` possibly
 # appearing as an arg is linear-safe. Rules:
-#   - If callee `f` is `EVar(fn_name)`:
-#       - If fn_name starts with `__perceus_` → non-linear (these are
-#         RC primitives that should never see a skipped read).
-#       - Otherwise treat as user-defined linear fn.
+#   - If callee `f` is an RC mark → non-linear (an RC primitive should
+#     never see a skipped read).
+#   - If callee `f` is a bare name, treat as user-defined linear fn.
 #   - If callee is anything else (EField on capability, intrinsic,
 #     apply on closure value), assume non-linear unless `nm` does
 #     not appear in args.
@@ -3363,8 +3363,9 @@ fn pcs_consumers_linear_ps(nm: String, ps: [XPos]) : Bool = match ps {
 # never reads `nm` is linear for it by construction, so the arg walk
 # alone answers. That pre-pass re-walked every arg at every call level.
 fn pcs_call_consumers_linear(nm: String, f: Expr, xs: [Expr]) : Bool = match sym_read_kind(f.kind) {
-  EVar(fn_name)  -> if pcs_is_runtime_primitive(fn_name) { not pcs_any_arg_mentions(nm, xs) }
-                    else { pcs_all_args_consumers_linear(nm, xs) }
+  EVar(_)        -> pcs_all_args_consumers_linear(nm, xs)
+  EMark(m)       -> if pcs_is_rc_primitive(m) { not pcs_any_arg_mentions(nm, xs) }
+                    else { pcs_call_consumers_linear_via(nm, f, xs) }
   EModCall(_, _) -> pcs_all_args_consumers_linear(nm, xs)
   _              -> pcs_call_consumers_linear_via(nm, f, xs)
 }
@@ -3375,27 +3376,17 @@ fn pcs_call_consumers_linear_via(nm: String, f: Expr, xs: [Expr]) : Bool = {
     # `nm` only appears inside the callee expression (rare); recurse.
     pcs_all_consumers_linear(nm, f)
   } else {
-    # Issue #680: when this predicate runs on a post-perceus body, the
-    # callee may be wrapped in `__perceus_dup(...)` (e.g.
-    # `step(initial, ev1)` becomes `(__perceus_dup(step))(initial,
-    # ev1)`). Look through the dup wrap so the linearity analysis
-    # matches the pre-perceus body. Without this, the same param
-    # qualifies for skip_set when `pcs_pass` analyses the body but
-    # NOT when `tcrec_rewrite_decl` re-analyses the post-perceus
-    # `inner` — and the resulting misalignment plants a goto-block
-    # drop without the matching `pcs_pass` dup, double-decrefing the
-    # original ref.
+    # On a post-perceus body the callee may be wrapped in a dup
+    # (`step(initial, ev1)` becomes `(dup(step))(initial, ev1)`). Look
+    # through the wrap so the linearity analysis matches the pre-perceus
+    # body: a param that qualifies for the skip set in one view and not
+    # the other gets a goto-block drop without the matching dup.
     let effective_f = pcs_strip_dup_wrap(f)
     match sym_read_kind(effective_f.kind) {
-      EVar(fn_name) -> {
-        # User-defined fn call — linear by pcs_pass construction —
-        # UNLESS the fn name is a builtin synthetic.
-        if pcs_is_runtime_primitive(fn_name) { false }
-        # Even for user fns, check that `nm` does not also appear in
-        # the callee (would mean f is computed from nm, unusual).
-        else { pcs_all_consumers_linear(nm, effective_f) and
-                pcs_all_args_consumers_linear(nm, xs) }
-      }
+      # User-defined fn call — linear by construction. `nm` must not
+      # also appear in the callee (f computed from nm, unusual).
+      EVar(_) -> pcs_all_consumers_linear(nm, effective_f) and
+                 pcs_all_args_consumers_linear(nm, xs)
       # An `EModCall` exists only after the qualified-call rewrite proved
       # the module is in the table and the name is in its export list —
       # the callee is a resolved user/stdlib fn or ctor, never a
@@ -3412,20 +3403,15 @@ fn pcs_call_consumers_linear_via(nm: String, f: Expr, xs: [Expr]) : Bool = {
   }
 }
 
-# Issue #680: strip an outer `__perceus_dup(x)` wrap to expose the
-# underlying expression. Used by the linearity analysis so a post-
-# perceus body whose call callee is `__perceus_dup(EVar(name))` is
-# treated the same as the pre-perceus `EVar(name)` callee. Returns
-# the original expression unchanged when no wrap is present.
+# Strip an outer dup wrap to expose the underlying expression, so a
+# post-perceus callee `dup(name)` reads as the pre-perceus `name`.
+# Returns the original expression unchanged when no wrap is present.
 fn pcs_strip_dup_wrap(e: Expr) : Expr = match e.kind {
-  ECall(callee, args_) -> match sym_read_kind(callee.kind) {
-    EVar(nm) ->
-      if nm == "__perceus_dup" {
-        match args_ {
-          [inner] -> inner
-          _       -> e
-        }
-      } else { e }
+  ECall(callee, args_) -> match callee.kind {
+    EMark(MkDup) -> match args_ {
+      [inner] -> inner
+      _       -> e
+    }
     _ -> e
   }
   _ -> e
@@ -3438,15 +3424,10 @@ fn pcs_all_args_consumers_linear(nm: String, xs: [Expr]) : Bool = match xs {
                    pcs_all_args_consumers_linear(nm, rest)
 }
 
-# Known runtime primitives / synthetic names that the compiler should
-# treat as non-linear consumers. Builtin from the runtime's borrow
-# discipline.
-fn pcs_is_runtime_primitive(nm: String) : Bool = {
-  nm == "__perceus_dup" or
-  nm == "__perceus_drop" or
-  nm == "__perceus_reuse_cons" or
-  nm == "__perceus_reuse_record" or
-  nm == "__perceus_reuse_variant"
+# The RC marks the linearity analysis treats as non-linear consumers.
+fn pcs_is_rc_primitive(m: Mark) : Bool = match m {
+  MkDup -> true
+  _     -> mark_is_reuse(m)
 }
 
 fn pcs_consumers_linear_arms(nm: String, arms: [Arm]) : Bool = match arms {
@@ -3545,7 +3526,7 @@ fn pcs_consumed_b_arms(nm: String, arms: [Arm], bmap: BorrowMap) : Bool = match 
 # The span is opaque source text, so the rewrite parses each body, runs
 # `pcs_rewrite_expr` over it with the outer scope and table, and respells
 # every read it wrapped as `__perceus_dup(NAME)` in the text. Emit re-parses
-# the body and sees an ordinary `__perceus_dup` call.
+# the body and the parse boundary reads that spelling back as the dup mark.
 
 fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [String],
                           uses: UseIx, in_lam: Bool, skip_set: [String], force_set: [String], bmap: BorrowMap, move_last_set: [String]) : String / Console =
@@ -3574,11 +3555,9 @@ fn pcs_rewrite_iparts(parts: [IPart], scope: [String], uses: UseIx,
 # Each read the rewrite wrapped in `__perceus_dup`, as a respelling of its token.
 fn pcs_dup_edits(e: Expr, acc: [IdentEdit]) : [IdentEdit] = {
   let acc1 = match e.kind {
-    ECall(f, [arg]) -> match sym_read_kind(f.kind) {
-      EVar(c) -> match sym_read_kind(arg.kind) {
-        EVar(nm) ->
-          if c == "__perceus_dup" { [IdentEdit(arg.line, arg.col, concat_all(["__perceus_dup(", nm, ")"])), ...acc] }
-          else { acc }
+    ECall(f, [arg]) -> match f.kind {
+      EMark(MkDup) -> match sym_read_kind(arg.kind) {
+        EVar(nm) -> [IdentEdit(arg.line, arg.col, concat_all([mark_name(MkDup), "(", nm, ")"])), ...acc]
         _ -> acc
       }
       _ -> acc
@@ -4283,9 +4262,8 @@ fn pcs_collect_arm_tail_drops(bound: [String], ln: Int, cl: Int, body: Expr,
 fn pcs_has_bare_read(nm: String, e: Expr) : Bool = match sym_read_kind(e.kind) {
   EVar(uname)           -> uname == nm
   ECall(f, xs)          -> match sym_read_kind(f.kind) {
-    EVar(c) ->
-      if c == "__perceus_dup" { false }
-      else { c == nm or pcs_hbr_list(nm, xs) }
+    EMark(MkDup) -> false
+    EVar(c) -> c == nm or pcs_hbr_list(nm, xs)
     _ -> pcs_has_bare_read(nm, f) or pcs_hbr_list(nm, xs)
   }
   ELambda(_, body)      -> pcs_name_in_expr(nm, body)
