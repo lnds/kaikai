@@ -6,67 +6,83 @@ A container impl that bounds a type argument by the protocol
 field of type `[(Int, String)]` needs `Eq` on `List` and on `Pair`. The
 walk follows exactly the arguments each impl bounds, and names the first
 head it cannot reach together with the heads above it.
+
+A head is the reference its file settled: the declaration of a declared
+type, what the source wrote for a scalar and for a type parameter. An
+impl is filed under the protocol it implements, by id. Which protocols
+answer a derive, and when two heads are one type, is the caller's to say.
 """)]
 
-import compiler.modules
+import compiler.ast
 import compiler.util
+import compiler.scalar_ty
 import compiler.tparam_bounds
 
-#[doc("A type expression as protocol dispatch sees it: each node's head name and its type arguments.")]
-pub type HeadTree = HT(String, [HeadTree])
+#[doc("A type expression as protocol dispatch sees it: each node's head and its type arguments.")]
+pub type HeadTree = HT(DeclRef, [HeadTree])
 
-#[doc("An impl of a protocol for a head, keyed `P/Head`, with the positions of the head's type arguments the impl bounds by that protocol.")]
-pub type ImplReach = IR(String, [Int])
+#[doc("An impl of a protocol for a head, with the positions of the head's type arguments the impl bounds by that protocol.")]
+pub type ImplReach = IR(SymId, DeclRef, [Int])
 
-#[doc("The key naming protocol `pname`'s impl for `head`.")]
-pub fn reach_key(pname: String, head: String) : String = concat_all([pname, "/", head])
+#[doc("What a walk reads the impls with: `serves` says an impl of that protocol answers the derive, `same` that two heads are one type, `builtin` that a head needs no impl.")]
+pub type ReachCx = { impls: [ImplReach], serves: (SymId) -> Bool,
+                   same: (DeclRef, DeclRef) -> Bool, builtin: (DeclRef) -> Bool }
 
-#[doc("The reach of `impl[tps] pname for target`: the target arguments that are type parameters bounded by `pname`.")]
-pub fn impl_reach(pname: String, target: HeadTree, tps: [String]) : ImplReach = match target {
-  HT(head, args) -> IR(reach_key(pname, head), bounded_positions(args, bounded_names(tps, pname, []), 0))
-}
+#[doc("The names of the stored type parameters `tps`, without kind or bounds.")]
+pub fn reach_params(tps: [String]) : [String] = map(tps, tp_name)
 
-#[doc("The reach of a derived `pname` on a type with parameters `tps`: the derive bounds every plain parameter.")]
-pub fn derived_reach(pname: String, tname: String, tps: [String]) : ImplReach =
-  IR(reach_key(pname, tname), plain_positions(tps, 0))
-
-#[doc("The heads from `t` down to the first one with no impl of `pname`; empty when every head the impls reach has one.")]
-pub fn missing_path(pname: String, t: HeadTree, reach: [ImplReach], builtin: (String) -> Bool) : [String] =
-  match t {
-    HT(head, args) ->
-      if builtin(head) { [] }
-      else { match find_reach(reach, reach_key(pname, head)) {
-        None     -> [head]
-        Some(ps) -> match first_missing(pname, args, ps, 0, reach, builtin) {
-          []    -> []
-          below -> [head, ...below]
-        }
-      } }
+#[doc("The reach of `impl[tps] proto for target`: the target arguments that are type parameters bounded by the impl's own protocol. `bounds_proto` says a written bound names it.")]
+pub fn impl_reach(proto: SymId, target: HeadTree, tps: [String], bounds_proto: (String) -> Bool) : ImplReach =
+  match target {
+    HT(head, args) -> IR(proto, head, bounded_positions(args, bounded_names(tps, bounds_proto, []), 0))
   }
 
-#[doc("A missing path spelled as the type it walks: `[List, Pair]` is `List[Pair]`.")]
+#[doc("The reach of a derived `proto` on the type `t` with parameters `tps`: the derive bounds every plain parameter.")]
+pub fn derived_reach(proto: SymId, t: SymId, tps: [String]) : ImplReach =
+  IR(proto, DrSym(t), plain_positions(tps, 0))
+
+#[doc("The reach a derive of `proto` gives the type parameter `tp` it bounds: a field typed by it is covered.")]
+pub fn param_reach(proto: SymId, tp: String) : ImplReach = IR(proto, ref_written(tp), [])
+
+#[doc("The heads from `t` down to the first one with no impl that serves; empty when every head the impls reach has one.")]
+pub fn missing_path(r: ReachCx, t: HeadTree) : [DeclRef] = match t {
+  HT(head, args) -> {
+    let builtin = r.builtin
+    if builtin(head) { [] }
+    else { match find_reach(r, r.impls, head) {
+      None     -> [head]
+      Some(ps) -> match first_missing(r, args, ps, 0) {
+        []    -> []
+        below -> [head, ...below]
+      }
+    } }
+  }
+}
+
+#[doc("A missing path, each head by the name a diagnostic shows, spelled as the type it walks: `[List, Pair]` is `List[Pair]`.")]
 pub fn path_type(path: [String]) : String = match path {
   []           -> ""
   [h]          -> h
   [h, ...rest] -> concat_all([h, "[", path_type(rest), "]"])
 }
 
-fn first_missing(pname: String, args: [HeadTree], ps: [Int], i: Int,
-                 reach: [ImplReach], builtin: (String) -> Bool) : [String] = match args {
+fn first_missing(r: ReachCx, args: [HeadTree], ps: [Int], i: Int) : [DeclRef] = match args {
   []           -> []
   [a, ...rest] -> {
-    let here = if list_has_int(ps, i) { missing_path(pname, a, reach, builtin) } else { [] }
+    let here = if list_has_int(ps, i) { missing_path(r, a) } else { [] }
     match here {
-      [] -> first_missing(pname, rest, ps, i + 1, reach, builtin)
+      [] -> first_missing(r, rest, ps, i + 1)
       _  -> here
     }
   }
 }
 
-fn find_reach(reach: [ImplReach], key: String) : Option[[Int]] = match reach {
-  []           -> None
-  [r, ...rest] -> match r {
-    IR(k, ps) -> if k == key { Some(ps) } else { find_reach(rest, key) }
+fn find_reach(r: ReachCx, impls: [ImplReach], head: DeclRef) : Option[[Int]] = match impls {
+  [] -> None
+  [IR(p, h, ps), ...rest] -> {
+    let serves = r.serves
+    let same = r.same
+    if serves(p) and same(h, head) { Some(ps) } else { find_reach(r, rest, head) }
   }
 }
 
@@ -75,19 +91,25 @@ fn bounded_positions(args: [HeadTree], names: [String], i: Int) : [Int] = match 
   [a, ...rest] -> {
     let tail = bounded_positions(rest, names, i + 1)
     match a {
-      HT(n, []) -> if list_has(names, n) { [i, ...tail] } else { tail }
+      HT(h, []) -> if names_param(h, names) { [i, ...tail] } else { tail }
       _         -> tail
     }
   }
 }
 
+# A type parameter has no declaration: its bare name is the parameter.
+fn names_param(h: DeclRef, names: [String]) : Bool = match h {
+  DrWritten(None, _) -> list_has(names, ref_spelled(h))
+  _                  -> false
+}
+
 # A stored type parameter is its name, then an optional `#`-introduced
 # kind and `#b:`-introduced bound list.
-fn bounded_names(tps: [String], pname: String, acc: [String]) : [String] = match tps {
+fn bounded_names(tps: [String], bounds_proto: (String) -> Bool, acc: [String]) : [String] = match tps {
   []            -> acc
   [tp, ...rest] ->
-    if list_has(map(tp_bounds_of(tp), dotted_bare), pname) { bounded_names(rest, pname, [tp_name(tp), ...acc]) }
-    else { bounded_names(rest, pname, acc) }
+    if any(tp_bounds_of(tp), bounds_proto) { bounded_names(rest, bounds_proto, [tp_name(tp), ...acc]) }
+    else { bounded_names(rest, bounds_proto, acc) }
 }
 
 # Only a plain parameter takes the derive's bound; a kinded one is not a
