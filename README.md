@@ -55,7 +55,8 @@ rebuilding the compiler — an installed `kai` needs none of it.
 
 # A. Install — to use kaikai
 
-Get a prebuilt `kai` on **macOS arm64** (Apple Silicon). The binary is
+Get a prebuilt `kai` on **macOS arm64** (Apple Silicon) or **Linux x86-64**
+(and on Windows through WSL2, see below). The binary is
 **self-contained**: libLLVM is linked in, so there is **no system LLVM,
 no `make`, and no toolchain to install**. This is the path for everyone
 who is not changing the compiler.
