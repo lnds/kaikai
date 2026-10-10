@@ -70,10 +70,9 @@ import compiler.type_text
 import compiler.call_site_target
 import compiler.written
 import compiler.symtab
-import compiler.symtab_build
 import compiler.decl_text
 import compiler.spec_names
-import compiler.home_spell
+import compiler.rt_name
 import compiler.kinds
 import compiler.fn_bounds
 import compiler.util
@@ -225,32 +224,10 @@ fn mono_map_return_exprs(r: HReturn, f: (Expr) -> Expr) : HReturn {
   }
 }
 
-# What the mangler spells a type with: the table, the root module and the
-# core modules.
-type MangleCx = { tab: SymTab, root: SymId, cores: [SymId] }
-
-fn mangle_cx(tab: SymTab, target_mod: String, cores: [String]) : MangleCx =
-  MangleCx { tab: tab, root: st_module_id(target_mod), cores: map(cores, st_module_id) }
-
-# A type two modules declare is spelled with its home, unless the root or
-# a core module declares it: two specs must not share a symbol.
-fn mono_tycon_text(mx: MangleCx, s: SymId) : String = {
-  let n = written_text(decl_name(mx.tab, s))
-  if mono_home_spelled(mx, s) { hs_spell(n, written_text(sym_home(mx.tab, s))) } else { n }
-}
-
-fn mono_home_spelled(mx: MangleCx, s: SymId) : Bool =
-  st_valid(mx.tab, s) and not mono_sym_among([mx.root, ...mx.cores], sym_owner(mx.tab, s)) and sym_contested(mx.tab, s)
-
-fn mono_sym_among(ss: [SymId], s: SymId) : Bool = match ss {
-  []          -> false
-  [h, ...rest] -> sym_raw(h) == sym_raw(s) or mono_sym_among(rest, s)
-}
-
-fn mono_mangle_name(mx: MangleCx, name: String, tys: [Ty], units: [UnitExprT]) : String {
+fn mono_mangle_name(tab: SymTab, name: String, tys: [Ty], units: [UnitExprT]) : String {
   let ty_part = match tys {
     [] -> ""
-    [_h, ..._rest] -> concat_all(["__mono__", mono_join_with(map(tys, (t) => mono_mangle_ty(mx, t)), "__")])
+    [_h, ..._rest] -> concat_all(["__mono__", mono_join_with(map(tys, (t) => mono_mangle_ty(tab, t)), "__")])
   }
   # m4c Phase 3: encode the unit-tparam tuple after the type-tparam
   # tuple. Empty units means no per-unit specialisation (the common
@@ -270,7 +247,7 @@ fn mono_mangle_name(mx: MangleCx, name: String, tys: [Ty], units: [UnitExprT]) :
   }
 }
 
-fn mono_mangle_ty(mx: MangleCx, t: Ty) : String {
+fn mono_mangle_ty(tab: SymTab, t: Ty) : String {
   match t {
     TyInt    -> "Int"
     TyReal   -> "Real"
@@ -284,16 +261,16 @@ fn mono_mangle_ty(mx: MangleCx, t: Ty) : String {
     TyUInt64   -> "UInt64"
     TyInt128   -> "Int128"
     TyHandle   -> "Handle"
-    TyListT(inner) -> concat_all(["L_", mono_mangle_ty(mx, inner), "_E"])
+    TyListT(inner) -> concat_all(["L_", mono_mangle_ty(tab, inner), "_E"])
     TyFnT(ps, ret, _) -> concat_all([
-      "F_", mono_join_with(map(ps, (p) => mono_mangle_ty(mx, p)), "_"),
-      "_R_", mono_mangle_ty(mx, ret), "_E"
+      "F_", mono_join_with(map(ps, (p) => mono_mangle_ty(tab, p)), "_"),
+      "_R_", mono_mangle_ty(tab, ret), "_E"
     ])
     TyCon(s, tas) -> {
       match tas {
-        [] -> mono_tycon_text(mx, s)
-        [_h, ..._rest] -> concat_all([mono_tycon_text(mx, s), "_O_",
-                                    mono_join_with(map(tas, (a) => mono_mangle_ty(mx, a)), "_"),
+        [] -> rt_name(tab, s)
+        [_h, ..._rest] -> concat_all([rt_name(tab, s), "_O_",
+                                    mono_join_with(map(tas, (a) => mono_mangle_ty(tab, a)), "_"),
                                     "_C"])
       }
     }
@@ -301,7 +278,7 @@ fn mono_mangle_ty(mx: MangleCx, t: Ty) : String {
     # a resolved shape app never reaches the mangler (apply/subst erase
     # it to the concrete constructor); an unresolved one in a key is a
     # bug, flagged like `TVAR`.
-    TyShapeApp(_, arg) -> concat_all(["SVAR_", mono_mangle_ty(mx, arg)])
+    TyShapeApp(_, arg) -> concat_all(["SVAR_", mono_mangle_ty(tab, arg)])
     TyAny     -> "Any"
     # m12.5: units are erased at codegen time. The mangled name for a
     # dimensioned type is the same as its base type's mangle — so a
@@ -312,12 +289,12 @@ fn mono_mangle_ty(mx: MangleCx, t: Ty) : String {
     # (lockstep with `mangle_ty` in emit_c) that splits its spec from
     # the dynamic `Vec` and from every other length.
     TyDimT(base, u) -> if ty_is_fixed_vec(t) {
-      concat_all([mono_mangle_ty(mx, base), "_D", int_to_string(fixed_vec_n(t))])
-    } else { mono_mangle_ty(mx, base) }
+      concat_all([mono_mangle_ty(tab, base), "_D", int_to_string(fixed_vec_n(t))])
+    } else { mono_mangle_ty(tab, base) }
     # m12.6.x #1: refinements erase like units. `Int where >= 0` and
     # `Int` mangle the same — they share monomorphisations and
     # protocol-impl dispatch entries.
-    TyRefineT(base, _) -> mono_mangle_ty(mx, base)
+    TyRefineT(base, _) -> mono_mangle_ty(tab, base)
     # issue #187 phase 1: mangle a union as `U_<part1>_<part2>_..._E`
     # using the canonical component order. The leading `U_` and
     # trailing `_E` bracket the spec the same way `L_..._E` brackets
@@ -329,7 +306,7 @@ fn mono_mangle_ty(mx: MangleCx, t: Ty) : String {
     # to keep the walker exhaustive without `_` fallbacks that would
     # mask future bugs.
     TyUnion(parts) -> concat_all(["U_",
-                                  mono_join_with(map(parts, (p) => mono_mangle_ty(mx, p)), "_"),
+                                  mono_join_with(map(parts, (p) => mono_mangle_ty(tab, p)), "_"),
                                   "_E"])
   }
 }
@@ -928,7 +905,6 @@ pub type MonoOutput = MonoOut([Decl], SpecNames, [MLeakRecord], [BoundViolation]
 #[doc("Specialise every generic decl against the concrete instantiations the typer resolved (tp.insts), one spec per (declaration, tys, units) tuple: a spec is `FnId(<the generic's id>, <instance>)`, and the name it is emitted under rides in the returned table. Also returns the leak records and the fn-bound violations at concrete instantiations. The table of `ps` holds the row of every generic. With `check_only` the non-spec decls come back unrewritten: only a verdict is wanted.")]
 pub fn monomorphise(tp: TypedProgram, reg: ProtocolReg, fn_bounds: [SymBounds],
                   ps: PScope, target_mod: String, check_only: Bool) : MonoOutput {
-  let mx = mangle_cx(ps_tab(ps), target_mod, reg.cores)
   let polys = collect_poly_fns(tp.decls, target_mod)
   # `resolve_protocol_calls` retargets a dispatcher call to its impl
   # function AFTER `infer_program` has populated tp.insts, so no inst
@@ -951,7 +927,7 @@ pub fn monomorphise(tp: TypedProgram, reg: ProtocolReg, fn_bounds: [SymBounds],
   # concrete tuples (the spec of `f` at `Int` calls `g(x : Int)`);
   # those new tuples enter the worklist and produce additional specs.
   # Each spec also accumulates a per-spec leak record.
-  let r = generate_specs_iter(mx, polys, initial_tuples, insts_ix, [], initial_ts, [], reg)
+  let r = generate_specs_iter(ps_tab(ps), polys, initial_tuples, insts_ix, [], initial_ts, [], reg)
   match r {
     GenSpecsOut(specs, all_items, leaks) -> {
       # Every concrete instantiation (direct + transitive) surfaces as a
@@ -1819,7 +1795,7 @@ fn subst_decl(d: Decl, sm: SubstMap) : Decl {
 # alongside the list of newly-discovered tuples.
 type SpecEmitOut = SEO(Spec, [MonoTuple], [MLeakRecord])
 
-fn emit_spec(mx: MangleCx, d: Decl, mt: MonoTuple, insts: InstIndex, polys: PolyIx,
+fn emit_spec(tab: SymTab, d: Decl, mt: MonoTuple, insts: InstIndex, polys: PolyIx,
               all_tuples: TupleSet, reg: ProtocolReg) : SpecEmitOut {
   match mt { MT(_, tys, units) -> {
     let sm = build_subst_map(d, tys, units)
@@ -1842,7 +1818,7 @@ fn emit_spec(mx: MangleCx, d: Decl, mt: MonoTuple, insts: InstIndex, polys: Poly
     # generic, TCO never fires on the spec (the loop lives in the
     # generic) and every recursion bounces spec -> generic.
     let spec3 = retarget_self_calls_decl(spec2)
-    let name = mono_mangle_name(mx, written_text(decl_name(mx.tab, poly_decl_sym(d))), tys, units)
+    let name = mono_mangle_name(tab, written_text(decl_name(tab, poly_decl_sym(d))), tys, units)
     # Invariant: no TyVarT/UVar of `sm`'s domain survives in the spec
     # body. Out-of-domain ids belong to unrelated free typer tyvars.
     let atv = subst_map_tvar_ids(sm)
@@ -1851,7 +1827,7 @@ fn emit_spec(mx: MangleCx, d: Decl, mt: MonoTuple, insts: InstIndex, polys: Poly
       DFn(_, _, _, _, _, _, sbody, _, _, _) ->
         match first_spec_leak(sbody, atv, auv) {
           Some(LeakTy(line, col, t)) ->
-            [MLeakRec(name, count_spec_leaks(sbody, atv, auv), Some(MLeakAt(line, col, mono_ty_to_string(mx.tab, t))))]
+            [MLeakRec(name, count_spec_leaks(sbody, atv, auv), Some(MLeakAt(line, col, mono_ty_to_string(tab, t))))]
           None -> []
         }
       _ -> []
@@ -2322,7 +2298,7 @@ fn synth_inst_pair(d: Decl, callee: Expr,
 # Iterate spec emission to fixpoint. `worklist` holds tuples not yet
 # emitted; `all_tuples` is the running set used by per-spec rewrite to
 # know which retargets are reachable.
-fn generate_specs_iter(mx: MangleCx, polys: PolyIx, worklist: [MonoTuple],
+fn generate_specs_iter(tab: SymTab, polys: PolyIx, worklist: [MonoTuple],
                         insts: InstIndex, specs_acc: [Spec],
                         all_tuples: TupleSet,
                         leaks_acc: [MLeakRecord],
@@ -2330,15 +2306,15 @@ fn generate_specs_iter(mx: MangleCx, polys: PolyIx, worklist: [MonoTuple],
   match worklist {
     [] -> GenSpecsOut(list_reverse(specs_acc), all_tuples.items, list_reverse(leaks_acc))
     [t, ...rest] -> match lookup_poly_fn_sym(poly_ix_fns(polys), mt_sym(t)) {
-      None -> generate_specs_iter(mx, polys, rest, insts, specs_acc, all_tuples, leaks_acc, reg)
+      None -> generate_specs_iter(tab, polys, rest, insts, specs_acc, all_tuples, leaks_acc, reg)
       Some(d) -> {
-        let r = emit_spec(mx, d, t, insts, polys, all_tuples, reg)
+        let r = emit_spec(tab, d, t, insts, polys, all_tuples, reg)
         match r {
           SEO(spec, new_ts, new_leaks) -> {
             let next_worklist = list_append(rest, new_ts)
             let next_all = ts_add_all(all_tuples, new_ts)
             let next_leaks = prepend_leaks(new_leaks, leaks_acc)
-            generate_specs_iter(mx, polys, next_worklist, insts,
+            generate_specs_iter(tab, polys, next_worklist, insts,
                                  [spec, ...specs_acc], next_all, next_leaks, reg)
           }
         }
