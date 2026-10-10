@@ -13,6 +13,7 @@ lambda whose last parameter is the continuation, a `Cont[T, S, e]` value.
 """)]
 
 import compiler.ast
+import compiler.written
 import compiler.handler_alias
 import compiler.resume_scan
 import compiler.resume_split
@@ -63,7 +64,7 @@ pub fn rs_bad_body(at: Expr, bads: [RsBad]) : Expr = match list_reverse(bads) {
 
 #[doc("The first place `e` lets `k` out: a read that is not a call of it, or any mention inside a lambda.")]
 pub fn rs_escape(e: Expr, k: String) : Option[Expr] = match e.kind {
-  EName(n) -> if n == k { Some(e) } else { None }
+  EName(n) -> if written_text(n) == k { Some(e) } else { None }
   ECall(f, xs) ->
     if rs_is_k_call(e, k) { rs_escape_in(xs, k) }
     else if rs_is_loop_callee(f) { rs_escape_in(map(xs, inline_body), k) }
@@ -72,7 +73,7 @@ pub fn rs_escape(e: Expr, k: String) : Option[Expr] = match e.kind {
     Some(_) -> Some(e)
     None    -> None
   } }
-  EHandle(body, _, _, _, init, _, cs, ret) -> rs_escape_in(handle_parts(body, init, cs, ret, k), k)
+  EHandle(body, _, _, init, _, cs, ret) -> rs_escape_in(handle_parts(body, init, cs, ret, k), k)
   _ -> rs_escape_in(rs_children(e), k)
 }
 
@@ -92,9 +93,9 @@ fn rs_escape_in(es: [Expr], k: String) : Option[Expr] = match es {
 
 # Any read of `k`, down to a binder that rebinds it.
 fn rs_mention(e: Expr, k: String) : Option[Expr] = match e.kind {
-  EName(n) -> if n == k { Some(e) } else { None }
+  EName(n) -> if written_text(n) == k { Some(e) } else { None }
   ELambda(ps, b) -> if binds(ps, k) { None } else { rs_mention(b, k) }
-  EHandle(body, _, _, _, init, _, cs, ret) -> rs_mention_in(handle_parts(body, init, cs, ret, k), k)
+  EHandle(body, _, _, init, _, cs, ret) -> rs_mention_in(handle_parts(body, init, cs, ret, k), k)
   _ -> rs_mention_in(rs_children(e), k)
 }
 
@@ -109,7 +110,7 @@ fn rs_mention_in(es: [Expr], k: String) : Option[Expr] = match es {
 # A nested handle's parts that still see `k`: its clauses that rebind it are opaque.
 fn handle_parts(body: Expr, init: Option[Expr], cs: [HClause], ret: Option[HReturn], k: String) : [Expr] = {
   let tail = match ret {
-    Some(HR(p, b, _, _)) -> if p == k { [] } else { [b] }
+    Some(HR(p, b, _, _)) -> if written_text(p.name) == k { [] } else { [b] }
     None -> []
   }
   let head = match init { Some(i) -> [body, i] None -> [body] }
@@ -125,8 +126,8 @@ fn clause_bodies_seeing(cs: [HClause], k: String) : [Expr] = match cs {
 # --- the handle ------------------------------------------------------------
 
 #[doc("The pieces of a `handle` whose nested handles are already rewritten.")]
-pub type HandleParts = { body: Expr, eff: String, hsym: SymId, tys: [TypeExpr], init: Option[Expr],
-                         alias: Option[String], clauses: [HClause], ret: Option[HReturn] }
+pub type HandleParts = { body: Expr, eff: DeclRef, tys: [TypeExpr], init: Option[Expr],
+                         alias: Option[Binder], clauses: [HClause], ret: Option[HReturn] }
 
 #[doc("A `handle` rewritten for where it runs.")]
 pub fn place_handle(h: HandleParts, at: Expr) : ExprKind = {
@@ -141,7 +142,7 @@ fn clause_need_of(c: HClause) : ClauseNeed = match c {
   HC(n, ps, body, _, _) ->
     if is_lifecycle_clause(n) { CnInPlace(body) }
     else { match clause_continuation(ps) {
-      Some(k) -> clause_need(body, k)
+      Some(k) -> clause_need(body, written_text(k.name))
       None    -> CnInPlace(body)
     } }
 }
@@ -162,7 +163,7 @@ fn any_escapes(ns: [ClauseNeed]) : Bool = any(ns, (n) => match n {
 })
 
 fn in_place(h: HandleParts, needs: [ClauseNeed]) : ExprKind =
-  EHandle(h.body, h.eff, h.hsym, h.tys, h.init, h.alias, zip_needs(h.clauses, needs), h.ret)
+  EHandle(h.body, h.eff, h.tys, h.init, h.alias, zip_needs(h.clauses, needs), h.ret)
 
 fn zip_needs(cs: [HClause], ns: [ClauseNeed]) : [HClause] = match cs {
   [] -> []
@@ -189,7 +190,7 @@ fn segment_handle(h: HandleParts, why: SegWhy, at: Expr) : ExprKind = {
   let stateful = match h.init { Some(_) -> true  None -> false }
   let fwd = forwarders(ops, 0, stateful)
   let inner_ret = if stateful { map_opt_return(h.ret, state_out) } else { None }
-  let inner = with_kind(at, EHandle(h.body, h.eff, h.hsym, h.tys, h.init, h.alias, [...fwd, ...fin], inner_ret))
+  let inner = with_kind(at, EHandle(h.body, h.eff, h.tys, h.init, h.alias, [...fwd, ...fin], inner_ret))
   let thunk = with_kind(h.body, ELambda([], inner))
   let ret = if stateful { state_return_lambda(h.ret, at) } else { return_lambda(h.ret, at) }
   let cls = if stateful { map(ops, state_clause_lambda) } else { map(ops, (c) => clause_lambda(c, at)) }
@@ -206,8 +207,8 @@ fn forwarders(cs: [HClause], i: Int, stateful: Bool) : [HClause] = match cs {
   [] -> []
   [HC(n, ps, b, l, c), ...rest] -> {
     let args = fresh_params(list_length(ps) - 1, 0, b)
-    let k = mk_ref("__seg_k", l, c)
-    let refs = map(args, (p) => mk_ref(p.pname, l, c))
+    let k = mk_name("__seg_k", l, c)
+    let refs = map(args, (p) => mk_expr(EName(p.binder.name), l, c))
     let st = if stateful { [state_arg(l, c)] } else { [] }
     let req = mk_expr(EIntrinsic(InSegRequest, [mk_expr(mk_int_synth(i), l, c), ...refs, ...st]), l, c)
     let call = if stateful { state_resume(k, req) } else { mk_expr(ECall(k, [req]), l, c) }
@@ -225,7 +226,7 @@ fn clause_lambda(c: HClause, at: Expr) : Expr = match c {
 
 # Without a return clause the handle's value is the body's: `()` stands for it.
 fn return_lambda(ret: Option[HReturn], at: Expr) : Expr = match ret {
-  Some(HR(p, b, l, c)) -> mk_expr(ELambda([param(p, b)], b), l, c)
+  Some(HR(p, b, l, c)) -> mk_expr(ELambda([param_of(p, b)], b), l, c)
   None -> with_kind(at, EUnit)
 }
 
