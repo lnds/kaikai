@@ -22,6 +22,7 @@ import compiler.infer
 import compiler.region
 import compiler.kir
 import compiler.kir_lower
+import compiler.ctor_ix
 import compiler.core_builtins
 import compiler.unwind_pend
 import compiler.kir_reuse_held
@@ -870,8 +871,15 @@ fn lower_raw_binop(x: Expr, prim: PrimOp, slot: KSlot, a: Expr, b: Expr, st: Low
 #      read (the conservative fall-through).
 # Before this, a const / core-value `EVar` fell through to a bare
 # `KVar` the native walk aborted on as `unbound register`.
-fn lower_var(name: String, fid: FnId, st: LowerSt) : LRes / Console =
-  if kir_name_is_ctor(name) and ls_variant_tag(st, name) > 0 {
+fn lower_var(name: String, fid: FnId, st: LowerSt) : LRes / Console = match ctor_ix_row(st.ctor_ix, fnid_sym(fid)) {
+  Some(row) -> bind_op(st, KCon(evar_name(row), ctor_row_tag(row), 0, [], false), KNoPos)
+  None      -> lower_var_spelled(name, fid, st)
+}
+
+# A bare name spelled like a registered constructor is one: a site no id
+# was settled for.
+fn lower_var_spelled(name: String, fid: FnId, st: LowerSt) : LRes / Console =
+  if sym_raw(fnid_sym(fid)) < 0 and kir_name_is_ctor(name) and ls_variant_tag(st, name) > 0 {
     bind_op(st, KCon(name, ls_variant_tag(st, name), 0, [], false), KNoPos)
   } else if ls_binder_read(st, fid, name) {
     # #846 — a read inside a block that shadowed `name` resolves to the
@@ -3096,7 +3104,10 @@ fn kir_unw_var(f: Expr, n: String) : Expr = Expr { kind: EVar(n), line: f.line, 
 
 fn lower_call_at(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match f.kind {
   EVar(callee) -> lower_named_call(x, callee, fnid_none(), cargs, st)
-  ESym(s, inst, callee) -> lower_named_call(x, callee, FnId(s, inst), cargs, st)
+  ESym(s, inst, callee) -> match ctor_ix_row(st.ctor_ix, s) {
+    Some(EV(home, name, _, _, _)) -> lower_ctor_call(x, home, name, cargs, st)
+    None                          -> lower_named_call(x, callee, FnId(s, inst), cargs, st)
+  }
   # A mark in callee position asks for a lowering, not for a call: the
   # mark decides which, so there is no name to split for an effect op.
   EMark(m)     -> lower_mark_call(x, m, cargs, st)
@@ -3295,22 +3306,34 @@ fn lower_reuse_fresh(x: Expr, rbld: [Expr], st: LowerSt) : LRes / Console = matc
   _     -> LRes(KUnitV, st)
 }
 
-# A single-element rebuild whose head is an `EVar`/`EModCall` constructor is
-# a variant reuse; otherwise it is a cons reuse (`reuse_cons` passes
-# head+tail directly). The `"Cons"` fallback only fires for the cons shape —
-# perceus never emits a reuse over a non-ctor `ECall`, so the fallback's tag
-# is correct for cons and unreachable for anything else (Linus review nit).
+# A single-element rebuild whose head is a constructor is a variant reuse;
+# otherwise it is a cons reuse (`reuse_cons` passes head+tail directly).
+# The constructor is the one its callee's id names, or, for a spelled
+# callee, the one of that name the rebuilt type declares. The `"Cons"`
+# fallback only fires for the cons shape — perceus never emits a reuse over
+# a non-ctor `ECall`, so the fallback's tag is correct for cons and
+# unreachable for anything else (Linus review nit).
 fn lower_reuse_rebuild(x: Expr, rk: KReuseKind, donor: KVal, rbld: [Expr], st: LowerSt) : LRes / Console = match rbld {
   [one] -> match one.kind {
     ECall(cf, cas) -> match cf.kind {
-      EVar(cn)         -> lower_reuse_con(with_ctor_ty(x, one), rk, donor, cn, cas, st)
-      EModCall(_m, cn) -> lower_reuse_con(with_ctor_ty(x, one), rk, donor, cn, cas, st)
-      _ -> lower_reuse_con(x, rk, donor, "Cons", rbld, st)
+      ESym(s, _, _)    -> match ctor_ix_row(st.ctor_ix, s) {
+        Some(EV(hm, cn, _, _, _)) -> lower_reuse_con(with_ctor_ty(x, one), rk, donor, hm, cn, cas, st)
+        None                      -> lower_reuse_cons(x, rk, donor, rbld, st)
+      }
+      EVar(cn)         -> lower_reuse_spelled(with_ctor_ty(x, one), rk, donor, cn, cas, st)
+      EModCall(_m, cn) -> lower_reuse_spelled(with_ctor_ty(x, one), rk, donor, cn, cas, st)
+      _ -> lower_reuse_cons(x, rk, donor, rbld, st)
     }
-    _ -> lower_reuse_con(x, rk, donor, "Cons", rbld, st)
+    _ -> lower_reuse_cons(x, rk, donor, rbld, st)
   }
-  _ -> lower_reuse_con(x, rk, donor, "Cons", rbld, st)
+  _ -> lower_reuse_cons(x, rk, donor, rbld, st)
 }
+
+fn lower_reuse_cons(x: Expr, rk: KReuseKind, donor: KVal, rbld: [Expr], st: LowerSt) : LRes / Console =
+  lower_reuse_con(x, rk, donor, ctor_home_of_expr_ty(x), "Cons", rbld, st)
+
+fn lower_reuse_spelled(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cas: [Expr], st: LowerSt) : LRes / Console =
+  lower_reuse_con(x, rk, donor, ctor_home_of_expr_ty(x), cn, cas, st)
 
 # The reuse wrapper typed as its rebuild ctor, whose type names the ctor's home.
 fn with_ctor_ty(x: Expr, ctor: Expr) : Expr = match ctor.ty {
@@ -3349,9 +3372,9 @@ fn with_ctor_ty(x: Expr, ctor: Expr) : Expr = match ctor.ty {
 # children embedded by reference, not children threaded through a call. The
 # nested-rotation path keeps its own ordering (the dup precedes nothing it
 # consumes — `KCon` fresh-allocs).
-fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
-  let nested = reuse_kind_is_variant(rk) and reuse_has_nested_ctor(cargs)
-  if nested and rh_held(st) { lower_reuse_nested_fresh(x, cn, cargs, st) }
+fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, hm: Option[String], cn: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
+  let nested = reuse_kind_is_variant(rk) and reuse_has_nested_ctor(cargs, st)
+  if nested and rh_held(st) { lower_reuse_nested_fresh(x, hm, cn, cargs, st) }
   else if nested {
     match st.rnested.rot {
       RNI(oarity, nslot, n_inner, directs, grands) ->
@@ -3360,20 +3383,20 @@ fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Exp
         # taken inside `kaix_variant_reuse_at` anyway, but the inner steal
         # must not run against a donor the rebuild cannot absorb).
         if list_length(cargs) == oarity {
-          lower_reuse_nested_dual(x, donor, cn, cargs, nslot, n_inner, directs, grands, st)
-        } else { lower_reuse_nested_fresh(x, cn, cargs, st) }
-      RNInone -> lower_reuse_nested_fresh(x, cn, cargs, st)
+          lower_reuse_nested_dual(x, donor, hm, cn, cargs, nslot, n_inner, directs, grands, st)
+        } else { lower_reuse_nested_fresh(x, hm, cn, cargs, st) }
+      RNInone -> lower_reuse_nested_fresh(x, hm, cn, cargs, st)
     }
   } else if reuse_kind_is_variant(rk) {
     # A held scrutinee's exit would release the inner cells the flat fork
     # settles; that arm keeps the fresh path.
     match st.rnested.cells {
-      [] -> lower_reuse_flat_fork(x, donor, cn, cargs, st)
-      _  -> if rh_held(st) { lower_reuse_nested_fresh(x, cn, cargs, st) }
-            else { lower_reuse_flat_fork(x, donor, cn, cargs, st) }
+      [] -> lower_reuse_flat_fork(x, donor, hm, cn, cargs, st)
+      _  -> if rh_held(st) { lower_reuse_nested_fresh(x, hm, cn, cargs, st) }
+            else { lower_reuse_flat_fork(x, donor, hm, cn, cargs, st) }
     }
   } else {
-    lower_reuse_dual(x, rk, donor, cn, cargs, st)
+    lower_reuse_dual(x, rk, donor, hm, cn, cargs, st)
   }
 }
 
@@ -3385,10 +3408,9 @@ fn lower_reuse_con(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Exp
 # survive-the-drop incref — the C oracle's `_r = _scr; _scr = NULL`); the
 # SHARED branch fresh-allocs and leaves the donor for the match-exit
 # cascade, exactly the old single-body shim's else path.
-fn lower_reuse_flat_fork(x: Expr, donor: KVal, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console =
+fn lower_reuse_flat_fork(x: Expr, donor: KVal, hm: Option[String], cn: String, cargs: [Expr], st: LowerSt) : LRes / Console =
   match ls_fresh_reg(st) { LSReg(rjoin, st0) -> {
     let pos = kpos_of(x)
-    let hm = ctor_home_of_expr_ty(x)
     # Capture the arm's slot plan and uses BEFORE the args lower: a nested
     # match inside a rebuild arg re-sets `rnested`/`reuse_gc` per inner arm
     # and nothing restores them for the rest of this arm, so reading them
@@ -3426,7 +3448,7 @@ fn lower_reuse_flat_fork(x: Expr, donor: KVal, cn: String, cargs: [Expr], st: Lo
 # embedded borrowed leaf; the match-exit `decref(donor)` reclaims
 # donor + inner + originals. The shared branch of the dual fork below, and
 # the whole rebuild for arms the slot plan does not cover.
-fn lower_reuse_nested_fresh(x: Expr, cn: String, cargs: [Expr], st0: LowerSt) : LRes / Console = {
+fn lower_reuse_nested_fresh(x: Expr, hm: Option[String], cn: String, cargs: [Expr], st0: LowerSt) : LRes / Console = {
   let leaves = reuse_gc_uses(cargs, st0.reuse_gc)
   let st = if rh_held(st0) { rh_own(st0, list_uniq(leaves)) } else { st0 }
   # The first nested sub-ctor consumes the cross-call donor (inner stage
@@ -3434,9 +3456,9 @@ fn lower_reuse_nested_fresh(x: Expr, cn: String, cargs: [Expr], st0: LowerSt) : 
   # uniqueness is independent of this scrutinee's, so the shared branch
   # still absorbs the caller's shell — the C backend's shared-branch site.
   # The leaf dups precede the args: an arg call may consume a borrowed leaf.
-  match lower_reuse_args_donate(cargs, ctor_slot_kinds_in(ctor_home_of_expr_ty(x), cn, st), "", 0, true, false,
+  match lower_reuse_args_donate(cargs, ctor_slot_kinds_in(hm, cn, st), "", 0, true, false,
                                 emit_reuse_leaf_dups(leaves, kpos_of(x), st), []) { LResDon(avs, _, st1) ->
-    bind_op(st1, reuse_fresh_op(RkVariant, ctor_home_of_expr_ty(x), cn, avs, st1), kpos_of(x)) }
+    bind_op(st1, reuse_fresh_op(RkVariant, hm, cn, avs, st1), kpos_of(x)) }
 }
 
 # Rebuild args + the lowered atoms, plus whether the inner token was donated.
@@ -3458,12 +3480,11 @@ type LResDon = LResDon([KVal], Bool, LowerSt)
 # The SHARED branch is the fresh path. Args are lowered TWICE (textual
 # duplication, evaluated once — the branches are mutually exclusive),
 # exactly like `lower_reuse_dual` below.
-fn lower_reuse_nested_dual(x: Expr, donor: KVal, cn: String, cargs: [Expr],
+fn lower_reuse_nested_dual(x: Expr, donor: KVal, hm: Option[String], cn: String, cargs: [Expr],
                            nslot: Int, n_inner: Int, directs: [RNSlot], grands: [RNSlot],
                            st: LowerSt) : LRes / Console =
   match ls_fresh_reg(st) { LSReg(rjoin, st0) -> {
     let pos = kpos_of(x)
-    let hm = ctor_home_of_expr_ty(x)
     let uses = reuse_gc_uses(cargs, st0.reuse_gc)
     let st_decl = ls_emit(st0, KLet(rjoin, SBoxed, KLitOp(KUnitV), pos))
     match bind_op(st_decl, KCall("kaix_check_unique", [donor]), pos) { LRes(uv, st_u) ->
@@ -3496,7 +3517,7 @@ fn lower_reuse_nested_dual(x: Expr, donor: KVal, cn: String, cargs: [Expr],
             } }
         } } } }
         # SHARED: the fresh path, joined into `rjoin`.
-        let st_sb = match lower_reuse_nested_fresh(x, cn, cargs, st_ub) { LRes(rs, st_s) ->
+        let st_sb = match lower_reuse_nested_fresh(x, hm, cn, cargs, st_ub) { LRes(rs, st_s) ->
           ls_seal(ls_emit(st_s, KStore(rjoin, rs, pos)), KBr(l_join, pos), l_join) }
         LRes(KVar(rjoin), st_sb)
       } } }
@@ -3514,21 +3535,21 @@ fn lower_reuse_nested_dual(x: Expr, donor: KVal, cn: String, cargs: [Expr],
 fn lower_reuse_args_donate(es: [Expr], ks: [Int], tokreg: String, n_inner: Int, donated: Bool,
                            ddone: Bool, st: LowerSt, acc: [KVal]) : LResDon / Console = match es {
   [] -> LResDon(acc, donated, st)
-  [e, ...rest] -> match donate_ctor_name(e, n_inner, donated) {
-    Some(cn2) -> match e.kind {
-      ECall(_, cas) -> match lower_kinds_vals(cas, ctor_slot_kinds_in(ctor_home_of_expr_ty(e), cn2, st), 0, st, []) { LResMany(avs, st1) -> {
+  [e, ...rest] -> match donate_ctor(e, n_inner, donated, st) {
+    Some(CtorAt(hm2, cn2)) -> match e.kind {
+      ECall(_, cas) -> match lower_kinds_vals(cas, ctor_slot_kinds_in(hm2, cn2, st), 0, st, []) { LResMany(avs, st1) -> {
         let tokv = KVar(tokreg)
-        match bind_op(st1, KConReuse(RkTokenVariant, tokv, cn2, ls_variant_tag_in(st1, ctor_home_of_expr_ty(e), cn2), typed_inits_in(avs, ctor_home_of_expr_ty(e), cn2, st1)), kpos_of(e)) { LRes(v, st2) ->
+        match bind_op(st1, KConReuse(RkTokenVariant, tokv, cn2, ls_variant_tag_in(st1, hm2, cn2), typed_inits_in(avs, hm2, cn2, st1)), kpos_of(e)) { LRes(v, st2) ->
           lower_reuse_args_donate(rest, ks, tokreg, n_inner, true, ddone, st2, list_append(acc, [v])) }
       } }
-      # Unreachable (donate_ctor_name proved ECall); lower normally.
+      # Unreachable (donate_ctor proved ECall); lower normally.
       _ -> match lower_at_kind(e, kind_at(ks, list_length(acc)), st) { LRes(v, st1) ->
         lower_reuse_args_donate(rest, ks, tokreg, n_inner, donated, ddone, st1, list_append(acc, [v])) }
     }
-    None -> match donor_ctor_name(e, donated and not ddone) {
-      Some(cn3) -> match e.kind {
-        ECall(_, cas) -> match lower_kinds_vals(cas, ctor_slot_kinds_in(ctor_home_of_expr_ty(e), cn3, st), 0, st, []) { LResMany(avs, st1) ->
-          match bind_op(st1, KConReuse(RkDonorVariant, KUnitV, cn3, ls_variant_tag_in(st1, ctor_home_of_expr_ty(e), cn3), typed_inits_in(avs, ctor_home_of_expr_ty(e), cn3, st1)), kpos_of(e)) { LRes(v, st2) ->
+    None -> match donor_ctor(e, donated and not ddone, st) {
+      Some(CtorAt(hm3, cn3)) -> match e.kind {
+        ECall(_, cas) -> match lower_kinds_vals(cas, ctor_slot_kinds_in(hm3, cn3, st), 0, st, []) { LResMany(avs, st1) ->
+          match bind_op(st1, KConReuse(RkDonorVariant, KUnitV, cn3, ls_variant_tag_in(st1, hm3, cn3), typed_inits_in(avs, hm3, cn3, st1)), kpos_of(e)) { LRes(v, st2) ->
             lower_reuse_args_donate(rest, ks, tokreg, n_inner, donated, true, st2, list_append(acc, [v])) } }
         _ -> match lower_at_kind(e, kind_at(ks, list_length(acc)), st) { LRes(v, st1) ->
           lower_reuse_args_donate(rest, ks, tokreg, n_inner, donated, ddone, st1, list_append(acc, [v])) }
@@ -3565,39 +3586,45 @@ fn lower_kinds_held(es: [Expr], ks: [Int], i: Int, held: Bool, h: RhHolds, acc: 
 fn lower_at_kind(e: Expr, k: Int, st: LowerSt) : LRes / Console =
   if k == 1 { lower_expr_raw_at(e, SInt64, st) } else { lower_expr(e, st) }
 
-# The ctor name of a rebuild arg that can absorb the CROSS-CALL donor: any
+# A constructor as a lowering reads it: the module that declares it and
+# its name.
+type CtorAt = CtorAt(Option[String], String)
+
+# The constructor the call `e` builds. A callee that carries its id answers
+# from its row. A spelled one, which no id was settled for, is a
+# constructor by its capital, declared by the type the call builds.
+fn ctor_of_call(e: Expr, st: LowerSt) : Option[CtorAt] = match e.kind {
+  ECall(cf, _) -> match cf.kind {
+    ESym(s, _, _)  -> match ctor_ix_row(st.ctor_ix, s) {
+      Some(EV(hm, c, _, _, _)) -> Some(CtorAt(hm, c))
+      None                     -> None
+    }
+    EVar(c)        -> if kir_name_is_ctor(c) { Some(CtorAt(ctor_home_of_expr_ty(e), c)) } else { None }
+    EModCall(_, c) -> if kir_name_is_ctor(c) { Some(CtorAt(ctor_home_of_expr_ty(e), c)) } else { None }
+    _              -> None
+  }
+  _ -> None
+}
+
+# The ctor of a rebuild arg that can absorb the CROSS-CALL donor: any
 # nested sub-ctor call, once the inner token has been placed (`ready`) and
 # while the donor is unconsumed. No arity filter — the donor's arity is the
 # caller's, checked at runtime by `kai_variant_at` (fresh alloc on
 # mismatch), exactly the C backend's rewrite of the first remaining fresh
 # cell.
-fn donor_ctor_name(e: Expr, ready: Bool) : Option[String] =
+fn donor_ctor(e: Expr, ready: Bool, st: LowerSt) : Option[CtorAt] =
   if not ready { None }
   else { match e.kind {
-    ECall(cf, cas) ->
-      if list_length(cas) > 0 {
-        match cf.kind {
-          EVar(c)        -> if kir_name_is_ctor(c) { Some(c) } else { None }
-          EModCall(_, c) -> if kir_name_is_ctor(c) { Some(c) } else { None }
-          _              -> None
-        }
-      } else { None }
+    ECall(_, cas) -> if list_length(cas) > 0 { ctor_of_call(e, st) } else { None }
     _ -> None
   } }
 
-# The ctor name of a rebuild arg that can absorb the inner token: a direct
+# The ctor of a rebuild arg that can absorb the inner token: a direct
 # ctor call of the stolen shell's arity, while the token is still available.
-fn donate_ctor_name(e: Expr, n_inner: Int, donated: Bool) : Option[String] =
+fn donate_ctor(e: Expr, n_inner: Int, donated: Bool, st: LowerSt) : Option[CtorAt] =
   if donated { None }
   else { match e.kind {
-    ECall(cf, cas) ->
-      if list_length(cas) == n_inner {
-        match cf.kind {
-          EVar(c)        -> if kir_name_is_ctor(c) { Some(c) } else { None }
-          EModCall(_, c) -> if kir_name_is_ctor(c) { Some(c) } else { None }
-          _              -> None
-        }
-      } else { None }
+    ECall(_, cas) -> if list_length(cas) == n_inner { ctor_of_call(e, st) } else { None }
     _ -> None
   } }
 
@@ -3614,10 +3641,9 @@ fn donate_ctor_name(e: Expr, n_inner: Int, donated: Bool) : Option[String] =
 # fork manages only the direct slots (`st.reuse_gc`). The body's rebuild args
 # are lowered TWICE (textual duplication, evaluated once — the branches are
 # mutually exclusive), exactly as C interpolates h_new_c/t_new_c in both arms.
-fn lower_reuse_dual(x: Expr, rk: KReuseKind, donor: KVal, cn: String, cargs: [Expr], st: LowerSt) : LRes / Console =
+fn lower_reuse_dual(x: Expr, rk: KReuseKind, donor: KVal, hm: Option[String], cn: String, cargs: [Expr], st: LowerSt) : LRes / Console =
   match ls_fresh_reg(st) { LSReg(rjoin, st0) -> {
     let pos = kpos_of(x)
-    let hm = ctor_home_of_expr_ty(x)
     # A direct slot the rebuild does not take has no owner once overwritten:
     # the unique branch drops it, the shared branch does not dup it.
     let uses = reuse_taken_uses(cargs, st.reuse_gc)
@@ -3673,18 +3699,14 @@ fn reuse_kind_is_variant(rk: KReuseKind) : Bool = match rk { RkVariant -> true R
 
 # True iff any rebuild arg is a nested ctor call (the non-bijective rotation
 # shape). Such a rebuild embeds grand-children of a deconstructed inner cell.
-fn reuse_has_nested_ctor(cargs: [Expr]) : Bool = match cargs {
+fn reuse_has_nested_ctor(cargs: [Expr], st: LowerSt) : Bool = match cargs {
   []           -> false
-  [e, ...rest] -> if expr_is_ctor_call(e) { true } else { reuse_has_nested_ctor(rest) }
+  [e, ...rest] -> if expr_is_ctor_call(e, st) { true } else { reuse_has_nested_ctor(rest, st) }
 }
 
-fn expr_is_ctor_call(e: Expr) : Bool = match e.kind {
-  ECall(cf, _) -> match cf.kind {
-    EVar(c)        -> kir_name_is_ctor(c)
-    EModCall(_, c) -> kir_name_is_ctor(c)
-    _              -> false
-  }
-  _ -> false
+fn expr_is_ctor_call(e: Expr, st: LowerSt) : Bool = match ctor_of_call(e, st) {
+  Some(_) -> true
+  None    -> false
 }
 
 # Emit one `KIncrefIfShared(donor, KVar(name))` per name in `uses` (a multiset:
@@ -3779,10 +3801,17 @@ fn lower_ctor_slot_kind(st: LowerSt, home: Option[String], name: String, ks: [In
   if evar_find_tag_arity(st.vs, home, name, arity) < user_variant_tag_base() { 0 }
   else { kind_at(ks, 0) }
 
-# An enum-slot ctor arg. A bare `EVar` naming a NULLARY user ctor (not
-# shadowed by a local) lowers to its tag immediate (`KIntV`); everything else
-# lowers boxed (the emitter's `kaix_take_enum` reads whatever tag it carries).
+# An enum-slot ctor arg. A NULLARY user ctor, referenced by id or as a bare
+# name no local shadows, lowers to its tag immediate (`KIntV`); everything
+# else lowers boxed (the emitter's `kaix_take_enum` reads whatever tag it
+# carries).
 fn lower_enum_slot_arg(e: Expr, st: LowerSt) : LRes / Console = match e.kind {
+  ESym(s, _, _) -> match ctor_ix_row(st.ctor_ix, s) {
+    Some(EV(_, _, ar, _, tag)) ->
+      if ar == 0 and tag >= user_variant_tag_base() { LRes(KIntV(tag), st) }
+      else { lower_expr(e, st) }
+    None -> lower_expr(e, st)
+  }
   EVar(nm) ->
     if not ls_is_local(st, nm) and kir_name_is_ctor(nm) {
       match evar_find(st.vs, nm) {

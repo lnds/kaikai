@@ -24,14 +24,26 @@ import compiler.unwind_calls
 import compiler.unwind_effects
 import compiler.fnreg
 import compiler.symtab
-import compiler.core_unstamp
+import compiler.symtab_build
+import compiler.decl_names
 import compiler.core_builtin_sets
 
 #[doc("Bind, in every body of `ds`, the owned operands evaluated before a sibling that can unwind.")]
 pub fn unw_name_operands(ds: [Decl], tab: SymTab) : [Decl] = {
   let ucx = unw_cx_decls(ds)
-  let quals = ctors_read_qualified(tab)
-  map(ds, (d) => uo_decl(d, ucx, quals))
+  let shared = uo_shared_ctors(tab)
+  map(ds, (d) => uo_decl(d, ucx, shared))
+}
+
+# The declared constructors whose name a second constructor shares.
+fn uo_shared_ctors(tab: SymTab) : SymSet = {
+  let core = st_module_id(core_type_home())
+  sym_set_of(filter(st_ids(tab), (s) => uo_ctor_shared(tab, core, s)))
+}
+
+fn uo_ctor_shared(tab: SymTab, core: SymId, s: SymId) : Bool = match sym_class(tab, s) {
+  NCCtor -> not sym_owned_by(tab, s, core) and sym_contested(tab, s)
+  _      -> false
 }
 
 #[doc("True when `s` binds an operand this pass named.")]
@@ -45,24 +57,24 @@ pub fn unw_is_named_operand(s: Stmt) : Bool = match s {
 
 fn uo_prefix() : String = "__unw_v"
 
-fn uo_decl(d: Decl, ucx: UnwCx, quals: SymSet) : Decl = match d {
-  DFn(pub_, n, tps, ps, ret, row, body, l, c, mo, fsym) -> DFn(pub_, n, tps, ps, ret, row, uo_body(body, uo_fn_cx(row, body, ucx, quals)), l, c, mo, fsym)
-  DTest(desc, body, l, c, mo)      -> DTest(desc, uo_body(body, uo_frame(ucx, quals)), l, c, mo)
-  DBench(desc, body, l, c, mo)     -> DBench(desc, uo_body(body, uo_frame(ucx, quals)), l, c, mo)
-  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, uo_body(body, uo_frame(ucx, quals)), l, c, mo)
-  DImpl(p, tas, tgt, inner, l, c, tps, isym) -> DImpl(p, tas, tgt, map(inner, (i) => uo_decl(i, ucx, quals)), l, c, tps, isym)
+fn uo_decl(d: Decl, ucx: UnwCx, shared: SymSet) : Decl = match d {
+  DFn(pub_, n, tps, ps, ret, row, body, l, c, mo, fsym) -> DFn(pub_, n, tps, ps, ret, row, uo_body(body, uo_fn_cx(row, body, ucx, shared)), l, c, mo, fsym)
+  DTest(desc, body, l, c, mo)      -> DTest(desc, uo_body(body, uo_frame(ucx, shared)), l, c, mo)
+  DBench(desc, body, l, c, mo)     -> DBench(desc, uo_body(body, uo_frame(ucx, shared)), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, uo_body(body, uo_frame(ucx, shared)), l, c, mo)
+  DImpl(p, tas, tgt, inner, l, c, tps, isym) -> DImpl(p, tas, tgt, map(inner, (i) => uo_decl(i, ucx, shared)), l, c, tps, isym)
   _ -> d
 }
 
 # `exits_only` marks a fn whose declared row cannot unwind and that
 # installs no handler: only its `!` leaves early (`unw_fn_frame`).
-# `quals` holds the constructors the passes below read qualified.
-type UoCx = { ucx: UnwCx, exits_only: Bool, quals: SymSet }
+# `shared` holds the constructors whose name a second one shares.
+type UoCx = { ucx: UnwCx, exits_only: Bool, shared: SymSet }
 
-fn uo_frame(ucx: UnwCx, quals: SymSet) : UoCx = UoCx { ucx: ucx, exits_only: false, quals: quals }
+fn uo_frame(ucx: UnwCx, shared: SymSet) : UoCx = UoCx { ucx: ucx, exits_only: false, shared: shared }
 
-fn uo_fn_cx(row: RowExpr, body: Expr, ucx: UnwCx, quals: SymSet) : UoCx =
-  UoCx { ucx: ucx, exits_only: unw_row_class(row, ucx) == 0 and not xp_exists(body, false, uo_is_handle), quals: quals }
+fn uo_fn_cx(row: RowExpr, body: Expr, ucx: UnwCx, shared: SymSet) : UoCx =
+  UoCx { ucx: ucx, exits_only: unw_row_class(row, ucx) == 0 and not xp_exists(body, false, uo_is_handle), shared: shared }
 
 fn uo_is_handle(e: Expr) : Bool = match e.kind {
   EHandle(_, _, _, _, _, _, _, _) -> true
@@ -95,14 +107,14 @@ fn uo_expr(e: Expr, cx: UoCx, n: Int) : Anf = match e.kind {
     Anf { e: with_kind(e, EMatch(rs.e, ra.arms)), n: ra.n }
   }
   ELambda(ps, b) -> {
-    let r = uo_expr(b, uo_frame(cx.ucx, cx.quals), n)
+    let r = uo_expr(b, uo_frame(cx.ucx, cx.shared), n)
     Anf { e: with_kind(e, ELambda(ps, r.e)), n: r.n }
   }
   EHandle(body, eff, hs, tys, init, alias, cls, ret) -> {
     let ri = uo_opt(init, cx, n)
     let rb = uo_expr(body, cx, ri.n)
-    let rc = uo_clauses(cls, uo_frame(cx.ucx, cx.quals), rb.n, [])
-    let rr = uo_ret(ret, uo_frame(cx.ucx, cx.quals), rc.n)
+    let rc = uo_clauses(cls, uo_frame(cx.ucx, cx.shared), rb.n, [])
+    let rr = uo_ret(ret, uo_frame(cx.ucx, cx.shared), rc.n)
     Anf { e: with_kind(e, EHandle(rb.e, eff, hs, tys, ri.o, alias, rc.cls, rr.o)), n: rr.n }
   }
   _ -> uo_pipe_or_ops(e, cx, n)
@@ -127,7 +139,7 @@ fn uo_pipe_or_ops(e: Expr, cx: UoCx, n: Int) : Anf = match e.kind {
 fn uo_name(e: Expr, xs: [Expr], cx: UoCx, n: Int) : Anf = match e.kind {
   EIntrinsic(_, _) -> Anf { e: e, n: n }
   _ ->
-    if uo_strands(xs, 0, picked_index(xs, (x) => uo_leaves(x, cx), true, 0, 0 - 1), cx.quals) {
+    if uo_strands(xs, 0, picked_index(xs, (x) => uo_leaves(x, cx), true, 0, 0 - 1), cx.shared) {
       match anf_bind_until(e, (x) => uo_leaves(x, cx), uo_prefix(), n) {
         Some(a) -> a
         None    -> Anf { e: e, n: n }
@@ -136,17 +148,17 @@ fn uo_name(e: Expr, xs: [Expr], cx: UoCx, n: Int) : Anf = match e.kind {
 }
 
 # An operand before the one at `k` holds a reference of its own.
-fn uo_strands(xs: [Expr], i: Int, k: Int, quals: SymSet) : Bool = match xs {
+fn uo_strands(xs: [Expr], i: Int, k: Int, shared: SymSet) : Bool = match xs {
   [] -> false
-  [x, ...rest] -> i < k and (uo_owned(x, quals) or uo_strands(rest, i + 1, k, quals))
+  [x, ...rest] -> i < k and (uo_owned(x, shared) or uo_strands(rest, i + 1, k, shared))
 }
 
 # A boxed read counts: the ownership passes may dup it in place, and once
 # the operands after it are bound it is read only when the construct runs.
-# A reference the passes below read qualified by its home holds nothing.
-fn uo_owned(x: Expr, quals: SymSet) : Bool = match x.kind {
+# A constructor whose name a second one shares is not counted.
+fn uo_owned(x: Expr, shared: SymSet) : Bool = match x.kind {
   EModCall(_, _) -> false
-  ESym(s, _, _)  -> not sym_set_has(quals, s) and uo_typed_owned(x)
+  ESym(s, _, _)  -> not sym_set_has(shared, s) and uo_typed_owned(x)
   EInt(_, _)     -> false
   EIntLit(_)     -> false
   EBool(_)       -> false
