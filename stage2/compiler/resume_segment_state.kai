@@ -6,6 +6,7 @@ and a clause's `k(v)` is `k(v, state)`.
 """)]
 
 import compiler.ast
+import compiler.written
 import compiler.handler_alias
 import compiler.resume_scan
 import compiler.anf_ops
@@ -13,19 +14,22 @@ import compiler.emit_shared
 import compiler.parse
 
 #[doc("A synthetic parameter named `name`, at `at`.")]
-pub fn param(name: String, at: Expr) : Param =
-  Param { pname: name, ptype: None, pline: at.line, pcol: at.col, pborrow: false }
+pub fn param(name: String, at: Expr) : Param = param_of(binder_written(name), at)
 
-#[doc("Whether `ps` binds `k`.")]
-pub fn binds(ps: [Param], k: String) : Bool = any(ps, (p) => p.pname == k)
+#[doc("A synthetic parameter declaring `b`, at `at`.")]
+pub fn param_of(b: Binder, at: Expr) : Param =
+  Param { binder: b, ptype: None, pline: at.line, pcol: at.col, pborrow: false }
+
+#[doc("Whether `ps` binds the written name `k`.")]
+pub fn binds(ps: [Param], k: String) : Bool = any(ps, (p) => written_text(p.binder.name) == k)
 
 #[doc("The state a stateful forwarder hands its request.")]
-pub fn state_arg(l: Int, c: Int) : Expr = mk_ref(var_cell_alias(), l, c)
+pub fn state_arg(l: Int, c: Int) : Expr = mk_name(var_cell_alias(), l, c)
 
 #[doc("`{ let (v, s) = req; k(v, s) }`: a stateful forwarder resumes with the pair its request comes back as.")]
 pub fn state_resume(k: Expr, req: Expr) : Expr = {
-  let pat = tuple_pat([mk_pat(PBind("__seg_v"), req.line, req.col), mk_pat(PBind("__seg_s"), req.line, req.col)], req)
-  let call = with_kind(req, ECall(k, [mk_ref("__seg_v", req.line, req.col), mk_ref("__seg_s", req.line, req.col)]))
+  let pat = tuple_pat([mk_pat(PBind(binder_written("__seg_v")), req.line, req.col), mk_pat(PBind(binder_written("__seg_s")), req.line, req.col)], req)
+  let call = with_kind(req, ECall(k, [mk_name("__seg_v", req.line, req.col), mk_name("__seg_s", req.line, req.col)]))
   with_kind(req, EBlock([SLet(pat, None, req)], Some(call)))
 }
 
@@ -41,14 +45,14 @@ pub fn map_opt_return(r: Option[HReturn], f: (HReturn) -> HReturn) : Option[HRet
 
 #[doc("The forwarding handle's return clause `return(x) -> (x, state)`: the body's value leaves the segment with the state.")]
 pub fn state_out(r: HReturn) : HReturn = match r {
-  HR(_, b, l, c) -> HR("__seg_x", tuple_lit([mk_ref("__seg_x", l, c), mk_ref(var_cell_alias(), l, c)], b), l, c)
+  HR(_, b, l, c) -> HR(binder_written("__seg_x"), tuple_lit([mk_name("__seg_x", l, c), mk_name(var_cell_alias(), l, c)], b), l, c)
 }
 
 #[doc("The handle's return clause as `(r) => { let (x, s) = r; $seg_state(s, body) }`, over the pair the segment finished with.")]
 pub fn state_return_lambda(ret: Option[HReturn], at: Expr) : Expr = match ret {
   Some(HR(p, b, l, c)) -> {
-    let x = if p == "_" { mk_pat(PWild, l, c) } else { mk_pat(PBind(p), l, c) }
-    let unpack = SLet(tuple_pat([x, mk_pat(PBind("__seg_st"), l, c)], b), None, mk_ref("__seg_r", l, c))
+    let x = if written_text(p.name) == "_" { mk_pat(PWild, l, c) } else { mk_pat(PBind(p), l, c) }
+    let unpack = SLet(tuple_pat([x, mk_pat(PBind(binder_written("__seg_st")), l, c)], b), None, mk_name("__seg_r", l, c))
     let body = with_kind(b, EBlock([unpack], Some(with_state(b))))
     mk_expr(ELambda([param("__seg_r", b)], body), l, c)
   }
@@ -58,20 +62,20 @@ pub fn state_return_lambda(ret: Option[HReturn], at: Expr) : Expr = match ret {
 #[doc("An op clause as `(a0, …, s, k) => $seg_state(s, body)`, where the clause's `k(v)` is `k(v, s)`.")]
 pub fn state_clause_lambda(cl: HClause) : Expr = match cl {
   HC(_, ps, b, l, c) -> {
-    let k = match clause_continuation(ps) { Some(n) -> n  None -> "" }
-    mk_expr(ELambda([...clause_op_args(ps), param("__seg_st", b), param(k, b)], with_state(keep_state(b, k))), l, c)
+    let k = match clause_continuation(ps) { Some(n) -> n  None -> binder_written("") }
+    mk_expr(ELambda([...clause_op_args(ps), param("__seg_st", b), param_of(k, b)], with_state(keep_state(b, written_text(k.name)))), l, c)
   }
 }
 
-fn with_state(b: Expr) : Expr = with_kind(b, EIntrinsic(InSegState, [mk_ref("__seg_st", b.line, b.col), b]))
+fn with_state(b: Expr) : Expr = with_kind(b, EIntrinsic(InSegState, [mk_name("__seg_st", b.line, b.col), b]))
 
 fn keep_state(e: Expr, k: String) : Expr = match e.kind {
   ECall(f, [v]) -> if rs_is_k_call(e, k) {
-    with_kind(e, ECall(f, [keep_state(v, k), mk_ref("__seg_st", e.line, e.col)]))
+    with_kind(e, ECall(f, [keep_state(v, k), mk_name("__seg_st", e.line, e.col)]))
   } else { with_kind(e, map_expr_kind(e.kind, (x) => keep_state(x, k))) }
   ELambda(ps, _) -> if binds(ps, k) { e } else { with_kind(e, map_expr_kind(e.kind, (x) => keep_state(x, k))) }
-  EHandle(body, n, hs, tys, init, alias, cs, ret) ->
-    with_kind(e, EHandle(keep_state(body, k), n, hs, tys, map_opt_expr(init, (x) => keep_state(x, k)), alias,
+  EHandle(body, n, tys, init, alias, cs, ret) ->
+    with_kind(e, EHandle(keep_state(body, k), n, tys, map_opt_expr(init, (x) => keep_state(x, k)), alias,
                          map(cs, (cl) => keep_state_clause(cl, k)), map_opt_return(ret, (r) => keep_state_return(r, k))))
   _ -> with_kind(e, map_expr_kind(e.kind, (x) => keep_state(x, k)))
 }
@@ -81,6 +85,6 @@ fn keep_state_clause(cl: HClause, k: String) : HClause = match cl {
 }
 
 fn keep_state_return(r: HReturn, k: String) : HReturn = match r {
-  HR(p, b, l, c) -> if p == k { r } else { HR(p, keep_state(b, k), l, c) }
+  HR(p, b, l, c) -> if written_text(p.name) == k { r } else { HR(p, keep_state(b, k), l, c) }
 }
 
