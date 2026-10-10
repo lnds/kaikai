@@ -80,11 +80,11 @@ pub fn reuse_plan_none() : ReusePlan = ReusePlan { rot: RNInone, flat: [], cells
 pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
                      fns: [EFn], fx: FnIndex, core_ix: CoreIx, ctor_ix: CtorIx, vs: [VariantEntry], lams: [LamInfo], enc_fn: EncFn,
                      consts: [Decl],
-                     # `regs` is the set of register names bound in the
+                     # `regs` is the names of the registers live in the
                      # current lexical scope: params, captures, and every
-                     # `KLet` / `KStore` destination. A binder whose written
-                     # name is already in it shadows an outer one and takes a
-                     # fresh register (see `renames`). Seeded at fn entry,
+                     # `KLet` / `KStore` destination. Registers are
+                     # name-keyed allocas, so a binder whose name is taken
+                     # binds a fresh one (`ls_bind`). Seeded at fn entry,
                      # extended at each binding statement, restored at a
                      # block's exit.
                      regs: [String],
@@ -95,14 +95,10 @@ pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
                      # in the same module. Both the wrapper def and EVERY
                      # call site must mint the same mangled name.
                      ffi: [SymId],
-                     # `renames` maps a binder to the fresh `.tN` register it
-                     # took because its written name was already a register
-                     # in scope: registers are name-keyed allocas, so a second
-                     # `KLet` under the same name would clobber the outer one.
-                     # `ls_reg_of` consults it; a block restores it on exit,
-                     # so sibling blocks shadowing one name get distinct `.tN`
-                     # (`rc` is monotone).
-                     renames: [Rename],
+                     # `scope` maps each local in scope to the register it
+                     # was bound to, innermost first: every read of a local
+                     # goes through it. A block restores it on exit.
+                     scope: [Rename],
                      # `mscr` is the FRESH owned-scrutinee exit-drop binder
                      # (`<join>$sd`) of the match CURRENTLY being lowered, or ""
                      # outside any owned match. The TRMC cons-modulo step
@@ -146,7 +142,7 @@ pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
                      # (`fn_has_region_brand` on its signature) sets it for the
                      # whole body, a lexical `region { }` block sets it for the
                      # block's extent (saved/restored around the block like
-                     # `renames`). Each `KCon`/`KRecord` reads it, so the native
+                     # `scope`). Each `KCon`/`KRecord` reads it, so the native
                      # emitter routes the ctor to `kaix_arena_*`. The C oracle
                      # reads the same predicate via `EmitCtx.in_region`.
                      in_region: Bool,
@@ -190,7 +186,7 @@ pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
                      # a local's register.
                      tab: SymTab, specs: SpecNames, locals: LocalNames }
 
-# A shadowing binder paired with the fresh register it took.
+# A local in scope paired with the register it is read from.
 pub type Rename = Rn(LocalId, String)
 
 # Result of lowering one expression: its value atom + threaded state.
@@ -215,7 +211,7 @@ pub fn ls_new(fns: [EFn], fx: FnIndex, variants: [VariantEntry], ctors: CtorIx, 
               consts: [Decl], ffi: [SymId], recs: [RecInfo], stamps: [RecStamp], regions: [RegionMark], raw_binders: [RawArmBinder], root_mod: Option[String],
               tab: SymTab, specs: SpecNames) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, fx: fx, core_ix: core_ix_build(), ctor_ix: ctors, vs: variants,
-            lams: lams, enc_fn: enc_none(), consts: consts, regs: [], ffi: ffi, renames: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: recs, stamps: stamps, in_region: false, regions: regions, raw_binders: raw_binders, tcpend: [], unw: unw_frame_none(unw_cx_empty()), root_mod: root_mod, arm_tok: false, handles: [],
+            lams: lams, enc_fn: enc_none(), consts: consts, regs: [], ffi: ffi, scope: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: recs, stamps: stamps, in_region: false, regions: regions, raw_binders: raw_binders, tcpend: [], unw: unw_frame_none(unw_cx_empty()), root_mod: root_mod, arm_tok: false, handles: [],
             tab: tab, specs: specs, locals: ln_empty() }
 
 #[doc("`st` with the arm-top token marked held (or released).")]
@@ -223,15 +219,41 @@ pub fn ls_set_arm_tok(st: LowerSt, held: Bool) : LowerSt = LowerSt { ...st, arm_
 
 # Reset the per-function counters and block buffers, preserving the shared
 # tables. `enc_fn` is the fn / lambda / clause / runner the body's nested
-# lambdas are scoped by (`find_lam` keys on it); `regs` the registers its
-# params and captures take; `locals` the binders of the declaration it
-# belongs to; `body_fns` the EFn table. Called at the head of every KFn
+# lambdas are scoped by (`find_lam` keys on it); `entry` the registers its
+# params and captures are read from; `locals` the binders of the declaration
+# it belongs to; `body_fns` the EFn table. Called at the head of every KFn
 # lowering.
-pub fn ls_enter_fn_with(st: LowerSt, enc_fn: EncFn, regs: [String], locals: LocalNames,
+pub fn ls_enter_fn_with(st: LowerSt, enc_fn: EncFn, entry: EntryRegs, locals: LocalNames,
                         body_fns: [EFn]) : LowerSt =
   LowerSt { ...st, rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: body_fns, enc_fn: enc_fn,
-            regs: regs, renames: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), in_region: false,
+            regs: entry.regs, scope: list_append(entry.scope, implicit_scope()), mscr: "", reuse_gc: [], rnested: reuse_plan_none(), in_region: false,
             tcpend: [], unw: unw_blank(st.unw), arm_tok: false, handles: [], locals: kir_body_locals(locals) }
+
+#[doc("What a body starts with: the register each param and capture is read from, and the names of the registers they take.")]
+pub type EntryRegs = { scope: [Rename], regs: [String] }
+
+#[doc("The entry registers of a parameter list on top of `captured`: each param is read from the register its name spells.")]
+pub fn entry_params(params: [Param], captured: EntryRegs) : EntryRegs = match params {
+  [] -> captured
+  [p, ...rest] -> {
+    let reg = written_text(p.binder.name)
+    entry_params(rest, EntryRegs { scope: [Rn(p.binder.id, reg), ...captured.scope], regs: [reg, ...captured.regs] })
+  }
+}
+
+#[doc("The entry registers of a lambda's or clause's captures: a captured binder is read from the register its name spells, an alias is known by its name and takes the register holding its handler id.")]
+pub fn entry_captures(caps: [Capture], locals: LocalNames) : EntryRegs =
+  EntryRegs { scope: map(caps, (c) => Rn(capture_local(c), written_text(ln_text(locals, capture_local(c))))),
+              regs: map(caps, (c) => kir_capture_name(locals, c)) }
+
+fn capture_local(c: Capture) : LocalId = match c {
+  CapLocal(l) -> l
+  CapAlias(a) -> a
+}
+
+# The continuation every clause body reads is declared by no node: it is
+# read from the register its key spells.
+fn implicit_scope() : [Rename] = [Rn(local_minted(canonical_continuation()), canonical_continuation())]
 
 #[doc("`ns` with the binders a body reads and no node declares: the handler-state aliases and the continuation, each minted under its key.")]
 pub fn kir_body_locals(ns: LocalNames) : LocalNames =
@@ -259,13 +281,12 @@ pub fn ls_with_unw(st: LowerSt, u: UnwFrame) : LowerSt = LowerSt { ...st, unw: u
 pub fn ls_bind_reg(st: LowerSt, reg: String) : LowerSt =
   if ls_reg_bound(st, reg) { st } else { LowerSt { ...st, regs: [reg, ...st.regs] } }
 
-# Is `reg` a register bound in the current scope? A binder spelled `reg`
-# must then take a fresh one.
+# Is `reg` the name of a register live in the current scope?
 pub fn ls_reg_bound(st: LowerSt, reg: String) : Bool = name_in_list(st.regs, reg)
 
 # Set the current match's owned-scrutinee exit-drop binder (`<join>$sd`), so a
 # TRMC cons-modulo step lowered inside this match drops the right register. Saved
-# (read `st.mscr`) and restored around each match, like the `renames` snapshot.
+# (read `st.mscr`) and restored around each match, like the `scope` snapshot.
 pub fn ls_set_mscr(st: LowerSt, sd: String) : LowerSt = LowerSt { ...st, mscr: sd }
 
 # Replace the tcrec goto-tail pending-release ledger (entering an arm body /
@@ -281,28 +302,40 @@ pub fn ls_set_reuse_gc(st: LowerSt, gc: [LocalId]) : LowerSt = LowerSt { ...st, 
 # with `reuse_gc` — same set/clear discipline, same arm scope.
 pub fn ls_set_rnested(st: LowerSt, rn: ReusePlan) : LowerSt = LowerSt { ...st, rnested: rn }
 
-# --- Shadow alpha-renaming -----------------------------------------------
+# --- The register scope ----------------------------------------------------
 
-# Record `l -> reg`: reads of the binder `l` resolve to the fresh register
-# `reg` rather than the register its written name spells. A block restores
-# the prior list on exit, so the mapping is block-scoped.
-pub fn ls_push_rename(st: LowerSt, l: LocalId, reg: String) : LowerSt =
-  LowerSt { ...st, renames: [Rn(l, reg), ...st.renames] }
-
-# The fresh register a binder took, if it shadowed one. First match
-# (innermost) wins.
-pub fn ls_lookup_rename(st: LowerSt, l: LocalId) : Option[String] =
-  ls_lookup_rename_loop(st.renames, l)
-
-fn ls_lookup_rename_loop(rs: [Rename], l: LocalId) : Option[String] = match rs {
-  []                -> None
-  [Rn(n, r), ...rest] -> if local_eq(n, l) { Some(r) } else { ls_lookup_rename_loop(rest, l) }
+#[doc("Bind `b` to its register, chosen once: the one its name spells, or a fresh one when a live register already has that name. The caller emits the statement that defines it.")]
+pub fn ls_bind(st: LowerSt, b: Binder) : LSReg = {
+  let name = written_text(b.name)
+  if ls_reg_bound(st, name) {
+    match ls_fresh_reg(st) { LSReg(reg, st1) -> LSReg(reg, ls_scope_put(st1, b.id, reg)) }
+  } else { LSReg(name, ls_scope_put(ls_bind_reg(st, name), b.id, name)) }
 }
 
-#[doc("The register the local `l` is read from: the fresh one it took when it shadowed another, else the one its written name spells.")]
-pub fn ls_reg_of(st: LowerSt, l: LocalId) : String = match ls_lookup_rename(st, l) {
+#[doc("Bind `b` to its register and define it as `op` at `slot`.")]
+pub fn ls_let(st: LowerSt, b: Binder, slot: KSlot, op: KOp, pos: KPos) : LowerSt =
+  match ls_bind(st, b) { LSReg(reg, st1) -> ls_emit(st1, KLet(reg, slot, op, pos)) }
+
+#[doc("`st` with the local `l` read from `reg`. A block restores the prior scope on exit.")]
+pub fn ls_scope_put(st: LowerSt, l: LocalId, reg: String) : LowerSt =
+  LowerSt { ...st, scope: [Rn(l, reg), ...st.scope] }
+
+# The innermost binding wins.
+fn ls_scope_find(rs: [Rename], l: LocalId) : Option[String] = match rs {
+  []                -> None
+  [Rn(n, r), ...rest] -> if local_eq(n, l) { Some(r) } else { ls_scope_find(rest, l) }
+}
+
+#[doc("True when the local `l` is bound to a register in the current scope.")]
+pub fn ls_local_bound(st: LowerSt, l: LocalId) : Bool = match ls_scope_find(st.scope, l) {
+  Some(_) -> true
+  None    -> false
+}
+
+#[doc("The register the local `l` was bound to.")]
+pub fn ls_reg_of(st: LowerSt, l: LocalId) : String = match ls_scope_find(st.scope, l) {
   Some(reg) -> reg
-  None      -> ls_local_name(st, l)
+  None      -> panic(concat_all(["identity: local ", int_to_string(local_raw(l)), " (", written_text(ln_text(st.locals, l)), ") of ", st.enc_fn.sym, " is read outside its scope"]))
 }
 
 #[doc("The name the local `l` was written with.")]
@@ -331,14 +364,14 @@ fn lid_uniq_go(xs: [LocalId], seen: [LocalId]) : [LocalId] = match xs {
   [x, ...rest] -> if lid_has(seen, x) { lid_uniq_go(rest, seen) } else { [x, ...lid_uniq_go(rest, [x, ...seen])] }
 }
 
-# Restore `renames` to a snapshot taken at block entry. `rc` (the fresh-reg
+# Restore `scope` to a snapshot taken at block entry. `rc` (the fresh-reg
 # counter) is intentionally NOT restored — it stays monotone so sibling
 # blocks that shadow the same name receive distinct `.tN` registers.
-pub fn ls_set_renames(st: LowerSt, snap: [Rename]) : LowerSt = LowerSt { ...st, renames: snap }
+pub fn ls_set_scope(st: LowerSt, snap: [Rename]) : LowerSt = LowerSt { ...st, scope: snap }
 
-# Restore the bound-register set to a block-entry snapshot, so registers
+# Restore the live-register names to a block-entry snapshot, so registers
 # defined inside the block leave scope at its exit. Paired with
-# `ls_set_renames` in `lower_block`.
+# `ls_set_scope` in `lower_block`.
 pub fn ls_set_regs(st: LowerSt, snap: [String]) : LowerSt = LowerSt { ...st, regs: snap }
 
 # Set the arena-routing flag. `lower_fn` seeds it from the signature brand;
