@@ -56,6 +56,7 @@
 # union member (a Bool through `kaix_real_field`), which LLVM rejects.
 
 import compiler.ast
+import compiler.operators
 import compiler.kir
 import compiler.util
 
@@ -238,7 +239,7 @@ fn kir_kind_is_raw(x: Expr) : Bool = match x.kind {
   EVar(_)     -> kir_ty_is_real(x.ty) or kir_ty_is_int(x.ty) or kir_ty_is_char(x.ty) or kir_ty_is_byte(x.ty) or kir_ty_is_fixed_raw(x.ty)
   ESym(_, _, _)     -> kir_ty_is_real(x.ty) or kir_ty_is_int(x.ty) or kir_ty_is_char(x.ty) or kir_ty_is_byte(x.ty) or kir_ty_is_fixed_raw(x.ty)
   ELitUnit(inner, _) -> kir_node_is_raw(inner)
-  # Arith routes by RESULT type, not op string: `+ - *` overlap the Real
+  # Arith routes by RESULT type, not by operator: `+ - *` overlap the Real
   # (`f`) and Int (`i`) families, so a type-blind `if op_is_freal { real }`
   # would reject every Int `+`/`-`/`*` (its result is Int, not Real) before
   # the Int branch ran. Gate on the type first: a Real-typed freal-arith is
@@ -258,10 +259,10 @@ fn kir_kind_is_raw(x: Expr) : Bool = match x.kind {
     }
     else if kir_op_is_raw_logical(op) { kir_node_is_raw(a) and kir_node_is_raw(b) }
     else { false }
-  EUnop(op, a) ->
-    if op == "-" { kir_ty_is_real(x.ty) }
-    else if op == "not" { kir_node_is_raw(a) }
-    else { false }
+  EUnop(op, a) -> match op {
+    UoNeg -> kir_ty_is_real(x.ty)
+    UoNot -> kir_node_is_raw(a)
+  }
   # A promoted var cell (`cell_promote`): the init is a raw literal and a
   # read is a raw register load, both at the cell's scalar slot. A fused
   # call's absent value is a raw zero.
@@ -291,70 +292,80 @@ pub fn kir_raw_box_prim(opt_t: Option[Ty]) : String =
 # runtime `kai_llvm_build_fbinop` switch: 0=fadd 1=fsub 2=fmul 3=fdiv).
 # `%` has no `double` form (the unbox pass keeps Real `%` boxed), so it
 # never reaches here.
-pub fn kir_fbinop_op(op: String) : Int =
-  if op == "+" { 0 }
-  else if op == "-" { 1 }
-  else if op == "*" { 2 }
-  else { 3 }
+pub fn kir_fbinop_op(op: BinOp) : Int = match op {
+  BoAdd -> 0
+  BoSub -> 1
+  BoMul -> 2
+  _     -> 3
+}
 
 # Is `op` a raw-Real arithmetic operator (one `fbinop` lowers)? `/` is
 # included (native `fdiv`); `%` is excluded (boxed `kaix_mod`).
-pub fn kir_op_is_raw_freal_arith(op: String) : Bool =
-  op == "+" or op == "-" or op == "*" or op == "/"
+pub fn kir_op_is_raw_freal_arith(op: BinOp) : Bool = match op {
+  BoAdd -> true
+  BoSub -> true
+  BoMul -> true
+  BoDiv -> true
+  _     -> false
+}
 
 # The `ibinop` opcode for a raw-Int arithmetic operator: 0=add 1=sub 2=mul
 # (all WRAPPING, no nsw/nuw), 3=div 4=mod. The native emitter turns opcodes
 # 3/4 into a call to the checked helper (`kai_idiv_chk`/`kai_imod_chk`), not a
 # bare `sdiv`/`srem`, so div-by-zero and INT64_MIN/-1 trap.
-pub fn kir_ibinop_op(op: String) : Int =
-  if op == "+" { 0 }
-  else if op == "-" { 1 }
-  else if op == "*" { 2 }
-  else if op == "/" { 3 }
-  else { 4 }
+pub fn kir_ibinop_op(op: BinOp) : Int = match op {
+  BoAdd -> 0
+  BoSub -> 1
+  BoMul -> 2
+  BoDiv -> 3
+  _     -> 4
+}
 
 # Is `op` a raw-Int arithmetic operator (one `ibinop` lowers)? `+ - * / %`.
 # `/` and `%` lower to the checked helper on both backends (C emits
 # `kai_idiv_chk`/`kai_imod_chk`, native calls the shim), so div-by-zero and
 # INT64_MIN/-1 trap identically instead of diverging. Bit-ops stay boxed.
-pub fn kir_op_is_raw_iint_arith(op: String) : Bool =
-  op == "+" or op == "-" or op == "*" or op == "/" or op == "%"
+pub fn kir_op_is_raw_iint_arith(op: BinOp) : Bool = binop_is_arith(op)
 
 # The `fcmp` predicate code for a raw-Real comparison (matches the runtime
 # `kai_llvm_build_fcmp` switch: 0=< 1=> 2=<= 3=>= 4=== 5=!=, all ordered).
-pub fn kir_fcmp_pred(op: String) : Int =
-  if op == "<" { 0 }
-  else if op == ">" { 1 }
-  else if op == "<=" { 2 }
-  else if op == ">=" { 3 }
-  else if op == "==" { 4 }
-  else { 5 }
+pub fn kir_fcmp_pred(op: BinOp) : Int = match op {
+  BoLt -> 0
+  BoGt -> 1
+  BoLe -> 2
+  BoGe -> 3
+  BoEq -> 4
+  _    -> 5
+}
 
 # The `icmp` predicate code for a raw-Int comparison (matches the runtime
 # `kai_llvm_build_icmp` switch: 0=< 1=> 2=<= 3=>= 4=== 5=!=, all SIGNED).
-pub fn kir_icmp_pred(op: String) : Int =
-  if op == "<" { 0 }
-  else if op == ">" { 1 }
-  else if op == "<=" { 2 }
-  else if op == ">=" { 3 }
-  else if op == "==" { 4 }
-  else { 5 }
+pub fn kir_icmp_pred(op: BinOp) : Int = match op {
+  BoLt -> 0
+  BoGt -> 1
+  BoLe -> 2
+  BoGe -> 3
+  BoEq -> 4
+  _    -> 5
+}
 
 # Is `op` a comparison (one `fcmp`/`icmp`+widen lowers)? The SAME operator
 # set for Real and Int operands; `kir_kind_is_raw` routes to the f- or
 # i-family by operand type.
-pub fn kir_op_is_raw_cmp(op: String) : Bool =
-  op == "<" or op == ">" or op == "<=" or op == ">=" or op == "==" or op == "!="
+pub fn kir_op_is_raw_cmp(op: BinOp) : Bool = binop_is_comparison(op)
 
 # Is `op` a short-circuit boolean (`and`/`or` over two raw i1 bools)? The
 # unbox pass already evaluated both operands (it marks the whole node
 # MUnboxed only when both children are raw), so a strict raw `and`/`or` is
 # sound — same as the C oracle's `&&`/`||` on two raw `int` operands.
-pub fn kir_op_is_raw_logical(op: String) : Bool = op == "and" or op == "or"
+pub fn kir_op_is_raw_logical(op: BinOp) : Bool = binop_is_logical(op)
 
 # The native i1 boolean opcode for `and`/`or` (1=and, 0=or; the emitter
 # maps to `LLVMBuildAnd`/`LLVMBuildOr`).
-pub fn kir_logical_op(op: String) : Int = if op == "and" { 1 } else { 0 }
+pub fn kir_logical_op(op: BinOp) : Int = match op {
+  BoAnd -> 1
+  _     -> 0
+}
 
 # The KIR prim NAME carrying a raw binary op. The native emitter
 # (`nemit_prim`) dispatches these to `llvm_build_fbinop` / `llvm_build_fcmp`
@@ -363,26 +374,26 @@ pub fn kir_logical_op(op: String) : Int = if op == "and" { 1 } else { 0 }
 # `i` the raw-Int family; both keep them distinct from the boxed `+`/`<`
 # strings so a translator never confuses the two; logical `and`/`or` get a
 # `b` prefix (i1 domain).
-pub fn kir_raw_arith_prim(op: String) : String = cat2("f", op)
-pub fn kir_raw_cmp_prim(op: String) : String = cat2("f", op)
-pub fn kir_raw_logical_prim(op: String) : String = cat2("b", op)
-pub fn kir_raw_iarith_prim(op: String) : String = cat2("i", op)
-pub fn kir_raw_icmp_prim(op: String) : String = cat2("i", op)
+pub fn kir_raw_arith_prim(op: BinOp) : String = cat2("f", binop_text(op))
+pub fn kir_raw_cmp_prim(op: BinOp) : String = cat2("f", binop_text(op))
+pub fn kir_raw_logical_prim(op: BinOp) : String = cat2("b", binop_text(op))
+pub fn kir_raw_iarith_prim(op: BinOp) : String = cat2("i", binop_text(op))
+pub fn kir_raw_icmp_prim(op: BinOp) : String = cat2("i", binop_text(op))
 # The `u8` family: same operator set as the i-family, per-op 8-bit
 # masking (`+ - *` mask after the op; `/`/`%` widen into the checked i64
 # helper and truncate; cmp is an i32 `icmp` over the masked values).
-pub fn kir_raw_u8arith_prim(op: String) : String = cat2("u8", op)
-pub fn kir_raw_u8cmp_prim(op: String) : String = cat2("u8", op)
+pub fn kir_raw_u8arith_prim(op: BinOp) : String = cat2("u8", binop_text(op))
+pub fn kir_raw_u8cmp_prim(op: BinOp) : String = cat2("u8", binop_text(op))
 # Bool and Char comparisons: both operands live in an i32 register, so the
 # compare is an `icmp` like the Byte family — never the f-family, whose
 # operands load through `kaix_real_field`. The prefixes stay clear of the
 # `b`-prefixed logicals (`band`/`bor`/`bnot`).
-pub fn kir_raw_boolcmp_prim(op: String) : String = cat2("b1", op)
-pub fn kir_raw_charcmp_prim(op: String) : String = cat2("ch", op)
+pub fn kir_raw_boolcmp_prim(op: BinOp) : String = cat2("b1", binop_text(op))
+pub fn kir_raw_charcmp_prim(op: BinOp) : String = cat2("ch", binop_text(op))
 # The fixed-width families (`i32`/`u32`/`u64`): the same operator set as
 # the i-family with the prefix carrying the type. `+ - *` are one wrapping
 # `ibinop` at the register width (no mask — the width IS the register);
 # `/`/`%` widen into the checked helper (signed `kai_idiv_chk`, unsigned
 # `kai_udiv_chk`) and truncate; cmp is a signed/unsigned `icmp` per prefix.
-pub fn kir_raw_fixed_arith_prim(opt_t: Option[Ty], op: String) : String = cat2(kir_fixed_prim_prefix(opt_t), op)
-pub fn kir_raw_fixed_cmp_prim(opt_t: Option[Ty], op: String) : String = cat2(kir_fixed_prim_prefix(opt_t), op)
+pub fn kir_raw_fixed_arith_prim(opt_t: Option[Ty], op: BinOp) : String = cat2(kir_fixed_prim_prefix(opt_t), binop_text(op))
+pub fn kir_raw_fixed_cmp_prim(opt_t: Option[Ty], op: BinOp) : String = cat2(kir_fixed_prim_prefix(opt_t), binop_text(op))

@@ -41,6 +41,7 @@
 # `try_eval_int` (the `^` raw-inline exponent gate).
 
 import compiler.ast
+import compiler.operators
 import compiler.sym_read
 import compiler.refinements
 import compiler.infer
@@ -411,24 +412,17 @@ fn ty_is_integral_raw_t(t: Ty) : Bool {
 # for now and routes through `kai_op_pow_int` (M3 v1 conservative;
 # follow-up if hot). Integer division on `Int / Int` lowers to native
 # C `/` directly (issue #315 retired the dedicated `//` operator).
-pub fn op_is_raw_arith(op: String) : Bool {
-  op == "+" or op == "-" or op == "*" or op == "/" or op == "%"
-}
+pub fn op_is_raw_arith(op: BinOp) : Bool = binop_is_arith(op)
 
 # Tier 2.5 M4 — comparison operators that produce a raw `int`
 # (0 or 1) from two raw operands. Equality / inequality on raw
 # `int64_t` reduce to native C `==` / `!=`.
-pub fn op_is_raw_cmp(op: String) : Bool {
-  op == "<" or op == ">" or op == "<=" or op == ">=" or
-  op == "==" or op == "!="
-}
+pub fn op_is_raw_cmp(op: BinOp) : Bool = binop_is_comparison(op)
 
 # Tier 2.5 M4 — short-circuiting boolean operators. `and` / `or`
 # in kaikai mirror C `&&` / `||` (short-circuit, evaluate left
 # first).
-pub fn op_is_raw_logical(op: String) : Bool {
-  op == "and" or op == "or"
-}
+pub fn op_is_raw_logical(op: BinOp) : Bool = binop_is_logical(op)
 
 # Can the RHS of an `and`/`or` be evaluated unconditionally? Marking the
 # node raw materialises BOTH operands: the C backend still emits `&&`, but
@@ -449,7 +443,7 @@ fn rhs_is_trap_free(x: Expr) : Bool = match x.kind {
   # literal; the other raw binops over raw operands are total.
   EBinop(op, a, b)   ->
     rhs_is_trap_free(a) and rhs_is_trap_free(b) and
-    (if op == "/" or op == "%" { is_nonzero_literal(b) } else { true })
+    (if binop_is_division(op) { is_nonzero_literal(b) } else { true })
   EUnop(_, a)        -> rhs_is_trap_free(a)
   _                  -> false
 }
@@ -460,10 +454,10 @@ fn is_nonzero_literal(x: Expr) : Bool = match x.kind {
   _           -> false
 }
 
-pub fn raw_op_str(op: String) : String {
-  if op == "and" { "&&" }
-  else if op == "or" { "||" }
-  else { op }
+pub fn raw_op_str(op: BinOp) : String = match op {
+  BoAnd -> "&&"
+  BoOr  -> "||"
+  _     -> binop_text(op)
 }
 
 # Walk an Expr tree assigning each node its representation mode.
@@ -615,8 +609,8 @@ fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: FnInd
         # 128-bit operand does not fit the i64/u64 helper), so they route
         # through `kai_fixed_div`/`kai_op_mod` which trap the zero divisor.
         if op_is_raw_arith(op) and child_is_raw_operand(a, env, fns) and child_is_raw_operand(b, env, fns) {
-          if op == "%" and not ty_is_integral_raw(opt_ty) { MBoxed }
-          else if (op == "/" or op == "%") and ty_is_int128_opt(opt_ty) { MBoxed }
+          if binop_eq(op, BoMod) and not ty_is_integral_raw(opt_ty) { MBoxed }
+          else if binop_is_division(op) and ty_is_int128_opt(opt_ty) { MBoxed }
           else { MUnboxed }
         }
         # Issue #90 — `^` (integer power) was previously routed
@@ -632,7 +626,7 @@ fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: FnInd
         # handled by the `op_is_raw_arith` arm above.)
         # `^` unrolls to bare multiplications with no per-op masking, so a
         # fixed-width `^` must stay boxed — the unroll would skip its width wrap.
-        else if op == "^" and child_is_raw(a) and child_is_raw(b) and ty_is_integral_raw(opt_ty) and not ty_is_fixed_width_opt(opt_ty) and pow_exp_is_inlinable(b) { MUnboxed }
+        else if binop_eq(op, BoPow) and child_is_raw(a) and child_is_raw(b) and ty_is_integral_raw(opt_ty) and not ty_is_fixed_width_opt(opt_ty) and pow_exp_is_inlinable(b) { MUnboxed }
         # M4 — comparisons and short-circuiting booleans collapse to
         # native C operators when both operands are raw. The result
         # is a raw `int` (0/1) which the boundary tactic re-boxes
@@ -640,10 +634,10 @@ fn decide_mode_aware(k: ExprKind, opt_ty: Option[Ty], env: [LocBind], fns: FnInd
         else if op_is_raw_cmp(op) and child_is_raw_operand(a, env, fns) and child_is_raw_operand(b, env, fns) { MUnboxed }
         else if op_is_raw_logical(op) and child_is_raw(a) and child_is_raw(b) and rhs_is_trap_free(b) { MUnboxed }
         else { MBoxed }
-      EUnop(op, x) ->
-        if op == "-" and child_is_raw_operand(x, env, fns) { MUnboxed }
-        else if op == "not" and child_is_raw(x) { MUnboxed }
-        else { MBoxed }
+      EUnop(op, x) -> match op {
+        UoNeg -> if child_is_raw_operand(x, env, fns) { MUnboxed } else { MBoxed }
+        UoNot -> if child_is_raw(x) { MUnboxed } else { MBoxed }
+      }
       # Phase 3 unboxing — `if cond { a } else { b }` lowers to a C
       # ternary when every operand is raw. The cond must be a raw
       # bool; both arms must be raw scalars of the result ty.

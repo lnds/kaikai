@@ -45,6 +45,7 @@
 import compiler.site_ids
 import compiler.ast
 import compiler.core_protos
+import compiler.operators
 import compiler.type_stamp
 import compiler.effect_default
 import compiler.type_text
@@ -1440,26 +1441,27 @@ fn concat_helper_of(opt_ty: Option[Ty]) : String {
   }
 }
 
-fn binop_cname(op: String) : Option[String] {
-  if op == "+" { Some("kai_op_add") }
-  else if op == "-" { Some("kai_op_sub") }
-  else if op == "*" { Some("kai_op_mul") }
-  else if op == "/" { Some("kai_op_div") }
-  else if op == "%" { Some("kai_op_mod") }
-  else if op == "^" { Some("kai_op_pow_int") }
-  else if op == "<" { Some("kai_op_lt") }
-  else if op == ">" { Some("kai_op_gt") }
-  else if op == "<=" { Some("kai_op_le") }
-  else if op == ">=" { Some("kai_op_ge") }
-  else if op == "==" { Some("kai_op_eq_v") }
-  else if op == "!=" { Some("kai_op_ne_v") }
-  else { None }
+fn binop_cname(op: BinOp) : Option[String] = match op {
+  BoAdd    -> Some("kai_op_add")
+  BoSub    -> Some("kai_op_sub")
+  BoMul    -> Some("kai_op_mul")
+  BoDiv    -> Some("kai_op_div")
+  BoMod    -> Some("kai_op_mod")
+  BoPow    -> Some("kai_op_pow_int")
+  BoLt     -> Some("kai_op_lt")
+  BoGt     -> Some("kai_op_gt")
+  BoLe     -> Some("kai_op_le")
+  BoGe     -> Some("kai_op_ge")
+  BoEq     -> Some("kai_op_eq_v")
+  BoNe     -> Some("kai_op_ne_v")
+  BoConcat -> None
+  BoAnd    -> None
+  BoOr     -> None
 }
 
-fn unop_cname(op: String) : Option[String] {
-  if op == "-" { Some("kai_op_neg") }
-  else if op == "not" { Some("kai_op_boolnot") }
-  else { None }
+fn unop_cname(op: UnOp) : String = match op {
+  UoNeg -> "kai_op_neg"
+  UoNot -> "kai_op_boolnot"
 }
 
 fn emit_arg_vals(src: String, args_e: [Expr], cx: EmitCtx) : [String] / Console =
@@ -6283,8 +6285,13 @@ fn ty_opt_is_fixed_width(opt_ty: Option[Ty]) : Bool = match opt_ty {
   None -> false
 }
 
-fn raw_arith_is_wrapping_int(op: String, opt_ty: Option[Ty]) : Bool {
-  let is_wrap_op = op == "+" or op == "-" or op == "*"
+fn raw_arith_is_wrapping_int(op: BinOp, opt_ty: Option[Ty]) : Bool {
+  let is_wrap_op = match op {
+    BoAdd -> true
+    BoSub -> true
+    BoMul -> true
+    _     -> false
+  }
   is_wrap_op and (ty_opt_is_int(opt_ty) or ty_opt_is_fixed_width(opt_ty))
 }
 
@@ -6294,8 +6301,8 @@ fn raw_arith_is_wrapping_int(op: String, opt_ty: Option[Ty]) : Bool {
 # `kai_udiv_chk`/`kai_umod_chk` pair (`ty_opt_is_checked_unsigned`); the
 # signed ones use `kai_idiv_chk`/`kai_imod_chk`. Int128 div stays boxed
 # (`kai_fixed_div`).
-fn raw_int_divmod_is_checked(op: String, opt_ty: Option[Ty]) : Bool {
-  (op == "/" or op == "%") and
+fn raw_int_divmod_is_checked(op: BinOp, opt_ty: Option[Ty]) : Bool {
+  binop_is_division(op) and
   (ty_opt_is_int(opt_ty) or ty_opt_is_byte(opt_ty) or
    ty_opt_is_int32(opt_ty) or ty_opt_is_checked_unsigned(opt_ty))
 }
@@ -6383,19 +6390,19 @@ fn fixed_box_c_lit(span: String, ty: Ty) : String = match ty {
 # the boxed kai_op dispatch (type-test + boxed-bool + truthy + decref).
 # `==`/`!=` are included: structural equality over two statically-Int
 # operands IS the numeric comparison, so no Eq dispatch is lost.
-fn int_cmp_c_op(op: String) : Option[String] {
-  if op == "<"       { Some("<") }
-  else if op == ">"  { Some(">") }
-  else if op == "<=" { Some("<=") }
-  else if op == ">=" { Some(">=") }
-  else if op == "==" { Some("==") }
-  else if op == "!=" { Some("!=") }
-  else { None }
+fn int_cmp_c_op(op: BinOp) : Option[String] = match op {
+  BoLt -> Some("<")
+  BoGt -> Some(">")
+  BoLe -> Some("<=")
+  BoGe -> Some(">=")
+  BoEq -> Some("==")
+  BoNe -> Some("!=")
+  _    -> None
 }
 
 # Gate for the direct-Int-comparison fast path: an order comparison whose
 # both operands are statically Int.
-fn is_int_order_cmp(op: String, a: Expr, b: Expr) : Bool = int_cmp_raw(op, a, b)
+fn is_int_order_cmp(op: BinOp, a: Expr, b: Expr) : Bool = int_cmp_raw(op, a, b)
 
 # Is `e` itself a direct Int order-comparison (`k < kx`, …)? Used by the
 # `if`/match-guard lowering to emit a RAW C bool predicate and use the C
@@ -6584,15 +6591,15 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         # widths (UInt32/UInt64) into the u64 one — the operand promotes
         # (sext/zext) at the call and the result truncates back at its slot.
         let checked = if ty_opt_is_checked_unsigned(x.ty) {
-          if op == "/" { "kai_udiv_chk(" } else { "kai_umod_chk(" }
+          if binop_eq(op, BoDiv) { "kai_udiv_chk(" } else { "kai_umod_chk(" }
         } else {
-          if op == "/" { "kai_idiv_chk(" } else { "kai_imod_chk(" }
+          if binop_eq(op, BoDiv) { "kai_idiv_chk(" } else { "kai_imod_chk(" }
         }
         seq_call(checked, [emit_expr_raw(src, a, cx), emit_expr_raw(src, b, cx)], ")")
       } else if op_is_raw_arith(op) or op_is_raw_cmp(op) or op_is_raw_logical(op) {
         # Only the left operand is ever hoisted, so `&&`/`||` keep short-circuiting.
         seq_infix(emit_expr_raw(src, a, cx), raw_op_str(op), emit_expr_raw(src, b, cx))
-      } else if op == "^" {
+      } else if binop_eq(op, BoPow) {
         # Issue #90 — integer power, exponent is a compile-time
         # literal in `[0, 64]` (gated by `pow_exp_is_inlinable`).
         # Unroll into repeated multiplications. Base is pure raw
@@ -6605,11 +6612,11 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         let boxed = emit_expr_boxed(src, x, cx)
         unbox_border(boxed, x, x.ty)
       }
-    EUnop(op, inner) ->
-      if op == "-" {
-        # Integer negation wraps (`-Int.MIN` is `Int.MIN`): compute in
-        # the unsigned width and cast back, like the wrapping binops.
-        # Real keeps the plain form.
+    EUnop(op, inner) -> match op {
+      # Integer negation wraps (`-Int.MIN` is `Int.MIN`): compute in
+      # the unsigned width and cast back, like the wrapping binops.
+      # Real keeps the plain form.
+      UoNeg ->
         if ty_opt_is_int(x.ty) or ty_opt_is_fixed_width(x.ty) {
           let st = raw_signed_c_type(x.ty)
           let ut = raw_unsigned_c_type(x.ty)
@@ -6618,12 +6625,8 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         } else {
           cat3("(-", emit_expr_raw(src, inner, cx), ")")
         }
-      } else if op == "not" {
-        cat3("(!", emit_expr_raw(src, inner, cx), ")")
-      } else {
-        let boxed = emit_expr_boxed(src, x, cx)
-        unbox_border(boxed, x, x.ty)
-      }
+      UoNot -> cat3("(!", emit_expr_raw(src, inner, cx), ")")
+    }
     # Phase 3 unboxing — when the callee resolves to a UFn, emit
     # the raw call inline (`<callee>(<raw args>)`) so the result
     # stays a raw scalar without a kai_int wrap-and-unwrap. The
@@ -6922,7 +6925,7 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     }
     EIndex(_, _) -> "kai_unit() /* index: not used by bootstrap examples */"
     EBinop(op, a, b) -> {
-      if op == "and" {
+      if binop_eq(op, BoAnd) {
         # m5.x flip Phase 3 closeout: `_a` is freshly allocated in
         # most call sites; under the runtime flip it would otherwise
         # leak — `kai_op_truthy` is non-consuming (the LLVM short-
@@ -6935,12 +6938,12 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
           "; KaiValue *_r = kai_op_truthy(_a) ? ", emit_expr(src, b, cx),
           " : kai_bool(0); kai_decref(_a); _r; })"
         ])
-      } else if op == "or" {
+      } else if binop_eq(op, BoOr) {
         concat_all([
           "({ KaiValue *_a = ", emit_expr(src, a, cx),
           "; KaiValue *_r = kai_op_truthy(_a) ? kai_bool(1) : ", emit_expr(src, b, cx), "; kai_decref(_a); _r; })"
         ])
-      } else if op == "++" {
+      } else if binop_eq(op, BoConcat) {
         # m7d §23: lower `a ++ b` to either `string_concat(a, b)` or
         # `list_append(a, b)` depending on the binop's typed result.
         # The typer pins `x.ty` to `String` or `[T]` before we get
@@ -6970,16 +6973,11 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
       } else {
         match binop_cname(op) {
           Some(cn) -> seq_call(cat2(cn, "("), [emit_expr(src, a, cx), emit_expr(src, b, cx)], ")")
-          None -> cat3("kai_unit() /* unknown binop: ", op, " */")
+          None -> cat3("kai_unit() /* unknown binop: ", binop_text(op), " */")
         }
       }
     }
-    EUnop(op, inner) -> {
-      match unop_cname(op) {
-        Some(cn) -> concat_all([cn, "(", emit_expr(src, inner, cx), ")"])
-        None -> cat3("kai_unit() /* unknown unop: ", op, " */")
-      }
-    }
+    EUnop(op, inner) -> concat_all([unop_cname(op), "(", emit_expr(src, inner, cx), ")"])
     EIf(c, a, opt_b) -> {
       # Tier 2.5 M4 — if the condition is already raw bool, skip
       # the `kai_op_truthy` wrapper and use the C ternary directly.

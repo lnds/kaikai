@@ -15,6 +15,7 @@ import compiler.util
 import compiler.chars
 import compiler.diag
 import compiler.ast
+import compiler.operators
 import compiler.type_stamp
 import compiler.core_refs
 import compiler.core_protos
@@ -11838,7 +11839,7 @@ fn synth_vec_index(probe: Inferred, t: Ty, coll: Expr, ix: Expr,
 # bound ahead of it to keep the source's evaluation order.
 fn vec_slice_block(coll: Expr, a: Expr, b: Expr, line: Int, col: Int) : ExprKind {
   let lo = mk_ref("__slice_lo", a.line, a.col)
-  let slen = mk_expr(EBinop("+", mk_expr(EBinop("-", b, lo), line, col),
+  let slen = mk_expr(EBinop(BoAdd, mk_expr(EBinop(BoSub, b, lo), line, col),
                             mk_expr(mk_int_synth(1), line, col)),
                      line, col)
   let call = mk_expr(ECall(mk_ref("vec_slice", line, col), [mk_ref("__slice_coll", line, col), lo, slen]), line, col)
@@ -11888,7 +11889,7 @@ fn fixed_vec_index_node(st: InferState, coll: Expr, ix: Expr, prim: Mark, elem: 
 # both sides to `Bool`; `%` pins operands to `Int`. There is no
 # dedicated `//` operator — `Int / Int` already truncates via the
 # `Div[Int]` impl.
-fn binop_root(op: String, l_expr: Expr, r_expr: Expr, line: Int, col: Int, ty: Ty) : Expr =
+fn binop_root(op: BinOp, l_expr: Expr, r_expr: Expr, line: Int, col: Int, ty: Ty) : Expr =
   with_ty(mk_expr(EBinop(op, l_expr, r_expr), line, col), ty)
 
 # `%` result type: a same-width fixed integer on both sides keeps that
@@ -11907,18 +11908,18 @@ fn fixed_mod_result(lt: Ty, rt: Ty) : Ty = match lt {
   _        -> TyInt
 }
 
-fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+fn synth_binop(st: InferState, op: BinOp, l: Expr, r: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
   let rl = synth(st, l)
   let rr = synth(rl.st, r)
-  if op == "++" {
+  if binop_eq(op, BoConcat) {
     synth_concat(rr.st, rl.ty, rl.expr, rr.ty, rr.expr, line, col)
-  } else if op == "and" or op == "or" {
+  } else if binop_is_logical(op) {
     let s1 = st_unify(rr.st, rl.ty, TyBool, "boolean operator", line, col)
     let s2 = st_unify(s1, rr.ty, TyBool, "boolean operator", line, col)
     mk_inferred(s2, TyBool, binop_root(op, rl.expr, rr.expr, line, col, TyBool))
-  } else if op == "==" or op == "!=" {
+  } else if binop_is_equality(op) {
     # `==` / `!=` are sugar for Eq.eq. The typer keeps the existing
     # structural builtin form (`binop_root`, lowered to `kai_op_eq_v`);
     # the structural-vs-custom-impl decision is made later, per spec,
@@ -11929,14 +11930,14 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     # `TyVarT` and only monomorphisation makes it concrete.
     let s1 = st_unify(rr.st, rl.ty, rr.ty, "comparison", line, col)
     mk_inferred(s1, TyBool, binop_root(op, rl.expr, rr.expr, line, col, TyBool))
-  } else if op == "<" or op == ">" or op == "<=" or op == ">=" {
+  } else if binop_is_ordering(op) {
     # `<` / `>` / `<=` / `>=` are sugar for Ord.cmp. Same as `==`: the
     # typer keeps the structural builtin form and the per-spec protocol
     # resolver rewrites to `__pimpl_Ord_<T>_cmp` (reduced to Bool against
     # 0) when the concrete type has a custom `impl Ord`.
     let s1 = st_unify(rr.st, rl.ty, rr.ty, "comparison", line, col)
     mk_inferred(s1, TyBool, binop_root(op, rl.expr, rr.expr, line, col, TyBool))
-  } else if op == "%" {
+  } else if binop_eq(op, BoMod) {
     # modulo over a `Rem` protocol. Primitive `Int % Int`
     # keeps the unify-and-emit fast path; concrete non-primitive
     # operands desugar to a `Rem.rem` protocol-method call so user
@@ -11967,7 +11968,7 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
       let s2 = st_unify(s1, rr.ty, modt, "integer arithmetic", line, col)
       mk_inferred(s2, modt, binop_root(op, rl.expr, rr.expr, line, col, modt))
     }
-  } else if op == "*" or op == "/" {
+  } else if binop_eq(op, BoMul) or binop_eq(op, BoDiv) {
     # when neither operand is primitive numeric (Int/Real,
     # optionally dim-wrapped) but both have concrete head TyCon (e.g.
     # Complex), desugar to a Mul/Div protocol-method call so the
@@ -11998,7 +11999,7 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
       # / Int*Int) — we delegate that to synth_dim_mul_div.
       synth_dim_mul_div(rr.st, op, rl.ty, rl.expr, rr.ty, rr.expr, line, col)
     }
-  } else if op == "^" {
+  } else if binop_eq(op, BoPow) {
     # Integer-exponent power. Mirrors `*`/`/`'s UoM behaviour with one
     # twist: the result unit is `u^n`, which only resolves when `n`
     # is a literal Int known at compile time. If the exponent is not
@@ -12019,7 +12020,7 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
       # `-` demand unit equality. The impl signature is the bare
       # carrier and would silently swallow a unit mismatch.
       let st_d = if binop_same_head_dimmed(lty_now, rty_now) {
-        let what = string_concat("arithmetic operator '", string_concat(op, "'"))
+        let what = string_concat("arithmetic operator '", string_concat(binop_text(op), "'"))
         st_unify(rr.st, rl.ty, rr.ty, what, line, col)
       } else { rr.st }
       synth_binop_proto(st_d, op, rl.expr, lty_now, rr.expr, rty_now, line, col)
@@ -12029,7 +12030,7 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
     } else {
       # `+` / `-` keep the unify-both-sides rule. The dim-aware unifier
       # checks the unit equality automatically.
-      let what = string_concat("arithmetic operator '", string_concat(op, "'"))
+      let what = string_concat("arithmetic operator '", string_concat(binop_text(op), "'"))
       let s1 = st_unify(rr.st, rl.ty, rr.ty, what, line, col)
       let s2 = st_check_arith_string(s1, op, rl.ty, line, col)
       let ty = apply_ty(s2.sub, rl.ty)
@@ -12043,7 +12044,7 @@ fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int
 # `impl P[A] for T` is registered in `st.proto_impls`. Same-prim pairs
 # (`Int + Int`, `Real + Real`) and same-nonprim pairs already
 # captured by `binop_should_dispatch_proto` are NOT matched here.
-fn binop_dispatch_proto_heterogeneous(st: InferState, op: String,
+fn binop_dispatch_proto_heterogeneous(st: InferState, op: BinOp,
                                         lt: Ty, rt: Ty) : Bool {
   let l_prim = ty_is_concrete_prim(lt)
   let r_prim = ty_is_concrete_prim(rt)
@@ -12203,7 +12204,7 @@ fn ty_is_concrete_nonprim(t: Ty) : Bool {
 # generated the dispatcher fn under that name (when the matching
 # protocol is declared); the post-inference rewrite then redirects to
 # `__pimpl_<P>_<T>_<op>`.
-fn synth_binop_proto(st: InferState, op: String, le: Expr, lt: Ty,
+fn synth_binop_proto(st: InferState, op: BinOp, le: Expr, lt: Ty,
                       re: Expr, rt: Ty,
                       line: Int, col: Int) : Inferred / Console + File + Mutable {
 
@@ -12220,7 +12221,7 @@ fn synth_binop_proto(st: InferState, op: String, le: Expr, lt: Ty,
 # selected impl's own concrete signature — the check a direct call to
 # that fn would get. Dispatch stays keyed on head names (O(1)); only the
 # winner is re-checked.
-fn binop_check_against_impl(st: InferState, op: String, lt0: Ty, rt0: Ty,
+fn binop_check_against_impl(st: InferState, op: BinOp, lt0: Ty, rt0: Ty,
                             line: Int, col: Int) : InferState / Console + File + Mutable {
   let bp = binop_proto(op)
   let method = op_proto_method(bp)
@@ -12238,7 +12239,7 @@ fn binop_check_against_impl(st: InferState, op: String, lt0: Ty, rt0: Ty,
         let inst = st_instantiate(st, sc)
         # The notes cite the operator the user wrote, not the impl's
         # mangled symbol, which is never spelled in source.
-        let callee = mk_ref(op, line, col)
+        let callee = mk_ref(binop_text(op), line, col)
         let rv = st_fresh_ty(inst.st)
         let fr = subst_fresh_row(rv.st.sub)
         let st2 = st_set_sub(rv.st, fr.subst)
@@ -12317,12 +12318,12 @@ fn ty_is_dimmed(t: Ty) : Bool = match t {
 # stamp the combined unit back onto the impl's result. `USD·USD` dies
 # in the guard; `Decimal<USD> · Decimal` keeps the habitant; a full
 # cancellation (`USD/USD`) yields the bare carrier.
-fn synth_binop_proto_dim_mul(st: InferState, op: String,
+fn synth_binop_proto_dim_mul(st: InferState, op: BinOp,
                              le: Expr, lt: Ty, re: Expr, rt: Ty,
                              line: Int, col: Int) : Inferred / Console + File + Mutable {
   let ls = ty_split_dim(lt, st.sub)
   let rs = ty_split_dim(rt, st.sub)
-  let combined = if op == "*" { UMul(ls.dim, rs.dim) }
+  let combined = if binop_eq(op, BoMul) { UMul(ls.dim, rs.dim) }
                  else { UMul(ls.dim, UInv(rs.dim)) }
   let s1 = st_check_atomic_unit(st, op, combined, line, col)
   # The units are the combined-unit rule's business, already checked
@@ -12335,21 +12336,18 @@ fn synth_binop_proto_dim_mul(st: InferState, op: String,
 
 # Try to extract a compile-time integer literal from an expression.
 # Recognises plain `mk_int_synth(n)` and the unary-minus form
-# `EUnop("-", mk_int_synth(n))` produced by the parser for negative literals
+# `EUnop(UoNeg, mk_int_synth(n))` produced by the parser for negative literals
 # (the parser does not fold `-3` into `EInt(-3)`). Anything else —
-# including `EBinop("-", EInt(0), EInt(3))` and bound names — returns
+# including `EBinop(BoSub, EInt(0), EInt(3))` and bound names — returns
 # `None`; the typer then refuses to lift a non-trivial unit through
 # `^`.
 fn try_int_literal(e: Expr) : Option[Int] {
   match e.kind {
     EInt(n, _) -> Some(n)
-    EUnop(uop, inner) ->
-      if uop == "-" {
-        match inner.kind {
-          EInt(n, _) -> Some(0 - n)
-          _ -> None
-        }
-      } else { None }
+    EUnop(UoNeg, inner) -> match inner.kind {
+      EInt(n, _) -> Some(0 - n)
+      _ -> None
+    }
     _ -> None
   }
 }
@@ -12384,9 +12382,9 @@ fn synth_dim_pow(st: InferState, lt: Ty, le: Expr,
       # Literal exponent: lift the unit. `unit_canon` simplifies
       # `m^0` → 1 and `m^1` → m so trivial cases collapse cleanly.
       let new_unit = unit_canon(UPow(ls.dim, n))
-      let s2 = st_check_atomic_unit(s1, "^", new_unit, line, col)
+      let s2 = st_check_atomic_unit(s1, BoPow, new_unit, line, col)
       let ty = dim_collapse(apply_ty(s2.sub, ls.base), new_unit)
-      mk_inferred(s2, ty, binop_root("^", le, re, line, col, ty))
+      mk_inferred(s2, ty, binop_root(BoPow, le, re, line, col, ty))
     }
     None -> {
       # Non-literal exponent. Only safe when the base has a trivial
@@ -12398,11 +12396,11 @@ fn synth_dim_pow(st: InferState, lt: Ty, le: Expr,
         render_diag(perr)
         diag_help("annotate the exponent as a literal (e.g. `r ^ 3`) or strip the unit on the base before the call")
         let ty = apply_ty(s1.sub, ls.base)
-        mk_inferred(st_bump_err(st_push_diag(s1, perr)), ty, binop_root("^", le, re, line, col, ty))
+        mk_inferred(st_bump_err(st_push_diag(s1, perr)), ty, binop_root(BoPow, le, re, line, col, ty))
       } else {
         # Bare numeric base: result keeps the base type.
         let ty = apply_ty(s1.sub, ls.base)
-        mk_inferred(s1, ty, binop_root("^", le, re, line, col, ty))
+        mk_inferred(s1, ty, binop_root(BoPow, le, re, line, col, ty))
       }
     }
   }
@@ -12425,13 +12423,13 @@ fn ty_split_dim(t: Ty, s: Subst) : DimSplit {
 # add/sub/mul/div traps on non-numeric payloads), so reject it at the
 # operator. The dim wrapper is stripped first, so a String-carrier
 # monetary value hits this exactly like a bare String.
-fn st_check_arith_string(st: InferState, op: String, t: Ty,
+fn st_check_arith_string(st: InferState, op: BinOp, t: Ty,
                          line: Int, col: Int) : InferState / Console + File + Mutable {
   let split = ty_split_dim(t, st.sub)
   match split.base {
     TyString -> {
       let perr = mk_diag(SevError, st.file, line, col,
-        concat_all(["arithmetic operator `", op,
+        concat_all(["arithmetic operator `", binop_text(op),
                     "` requires a numeric operand, found `String`"]), [])
       render_diag(perr)
       diag_help("string concatenation is `++`")
@@ -12441,16 +12439,16 @@ fn st_check_arith_string(st: InferState, op: String, t: Ty,
   }
 }
 
-fn synth_dim_mul_div(st: InferState, op: String, lt: Ty, le: Expr,
+fn synth_dim_mul_div(st: InferState, op: BinOp, lt: Ty, le: Expr,
                      rt: Ty, re: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
   let ls = ty_split_dim(lt, st.sub)
   let rs = ty_split_dim(rt, st.sub)
-  let what = string_concat("arithmetic operator '", string_concat(op, "'"))
+  let what = string_concat("arithmetic operator '", string_concat(binop_text(op), "'"))
   let s0 = st_check_arith_string(st, op, lt, line, col)
   let s1 = st_unify(s0, ls.base, rs.base, what, line, col)
-  let combined = if op == "*" {
+  let combined = if binop_eq(op, BoMul) {
     UMul(ls.dim, rs.dim)
   } else {
     UMul(ls.dim, UInv(rs.dim))
@@ -12467,7 +12465,7 @@ fn synth_dim_mul_div(st: InferState, op: String, lt: Ty, le: Expr,
 # cancellation is fine: `USD/USD` is a scalar ratio). Reports against
 # the operator's source position; a no-op when no such kind is
 # declared.
-fn st_check_atomic_unit(st: InferState, op: String, u: UnitExprT,
+fn st_check_atomic_unit(st: InferState, op: BinOp, u: UnitExprT,
                         line: Int, col: Int) : InferState / Console + File + Mutable {
   match st.sub.kind_theories {
     [] -> st
@@ -12487,7 +12485,7 @@ fn st_check_atomic_unit(st: InferState, op: String, u: UnitExprT,
                 "` habitants stand alone: a quantity is either scalar or carries exactly one habitant with exponent 1 — habitant products and powers are not expressible"])
             }
           let d = mk_diag(SevError, st.file, line, col,
-            concat_all(["operator `", op, "` cannot combine `", kind,
+            concat_all(["operator `", binop_text(op), "` cannot combine `", kind,
                         "` quantities: the result unit `",
                         unit_text(utable_to_tree(t)),
                         "` does not exist"]),
@@ -12526,7 +12524,7 @@ fn synth_concat(st: InferState, lt: Ty, le: Expr, rt: Ty, re: Expr, line: Int, c
           render_diag(perr)
           diag_help("annotate one of the operands so the compiler can pick the right rule")
           mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny,
-            with_ty(mk_expr(EBinop("++", le, re), line, col), TyAny))
+            with_ty(mk_expr(EBinop(BoConcat, le, re), line, col), TyAny))
         }
       }
     }
@@ -12539,21 +12537,24 @@ fn concat_finish(st: InferState, target: Ty, lt: Ty, le: Expr, rt: Ty, re: Expr,
   let s1 = st_unify(st, lt, target, "concat operator", line, col)
   let s2 = st_unify(s1, rt, target, "concat operator", line, col)
   let result_ty = apply_ty(s2.sub, target)
-  let root = with_ty(mk_expr(EBinop("++", le, re), line, col), result_ty)
+  let root = with_ty(mk_expr(EBinop(BoConcat, le, re), line, col), result_ty)
   mk_inferred(s2, result_ty, root)
 }
 
-fn synth_unop(st: InferState, op: String, x: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
+fn synth_unop(st: InferState, op: UnOp, x: Expr, line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
   let r = synth(st, x)
-  if op == "not" {
-    let s1 = st_unify(r.st, r.ty, TyBool, "logical 'not'", line, col)
-    let root = with_ty(mk_expr(EUnop(op, r.expr), line, col), TyBool)
-    mk_inferred(s1, TyBool, root)
-  } else {
-    let root = with_ty(mk_expr(EUnop(op, r.expr), line, col), r.ty)
-    mk_inferred(r.st, r.ty, root)
+  match op {
+    UoNot -> {
+      let s1 = st_unify(r.st, r.ty, TyBool, "logical 'not'", line, col)
+      let root = with_ty(mk_expr(EUnop(op, r.expr), line, col), TyBool)
+      mk_inferred(s1, TyBool, root)
+    }
+    UoNeg -> {
+      let root = with_ty(mk_expr(EUnop(op, r.expr), line, col), r.ty)
+      mk_inferred(r.st, r.ty, root)
+    }
   }
 }
 

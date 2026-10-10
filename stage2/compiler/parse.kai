@@ -57,6 +57,7 @@ import compiler.lex
 import compiler.ast
 import compiler.intrinsics
 import compiler.marks
+import compiler.operators
 import compiler.kinds
 import compiler.refinements
 import compiler.doc_attr
@@ -1079,19 +1080,19 @@ fn bin_leads_line(k: TokKind) : Bool =
 # The operator after an operand, at a level in [lo, hi]: on the same line,
 # or leading the next non-blank one. Newlines that lead to anything else
 # belong to the enclosing statement, so the caller keeps its own parser.
-type BinOp = { p: Parser, tok: Token, level: Int }
+type BinOpAt = { p: Parser, tok: Token, level: Int }
 
-fn bin_op_at(p: Parser, lo: Int, hi: Int) : Option[BinOp] = {
+fn bin_op_at(p: Parser, lo: Int, hi: Int) : Option[BinOpAt] = {
   let t = p_peek(p)
   let lv = bin_level(t.kind)
   if lv > 0 {
-    if lv >= lo and lv <= hi { Some(BinOp { p: p, tok: t, level: lv }) } else { None }
+    if lv >= lo and lv <= hi { Some(BinOpAt { p: p, tok: t, level: lv }) } else { None }
   } else {
     let p_look = p_skip_newlines(p)
     let t1 = p_peek(p_look)
     let l1 = bin_level(t1.kind)
     if l1 > 0 and l1 >= lo and l1 <= hi and bin_leads_line(t1.kind) {
-      Some(BinOp { p: p_look, tok: t1, level: l1 })
+      Some(BinOpAt { p: p_look, tok: t1, level: l1 })
     } else { None }
   }
 }
@@ -1100,7 +1101,7 @@ fn bin_op_at(p: Parser, lo: Int, hi: Int) : Option[BinOp] = {
 # level again for a left-associative one, strictly looser after a
 # comparison (no chaining) or after `++`, whose right operand already took
 # the rest of its chain.
-fn bin_ceiling(op: BinOp) : Int =
+fn bin_ceiling(op: BinOpAt) : Int =
   if op.level == bin_cmp() or op.level == bin_concat() { op.level - 1 } else { op.level }
 
 fn parse_bin(p: Parser, lo: Int) : PExpr / Console {
@@ -1123,7 +1124,7 @@ fn parse_bin_rest(p: Parser, lhs: Expr, lo: Int, hi: Int) : PExpr / Console =
     }
   }
 
-fn parse_bin_step(op: BinOp, lhs: Expr) : PExpr / Console = {
+fn parse_bin_step(op: BinOpAt, lhs: Expr) : PExpr / Console = {
   let t = op.tok
   let rhs_lo = if op.level == bin_concat() { op.level } else { op.level + 1 }
   let r = parse_bin(p_skip_newlines(p_advance(op.p)), rhs_lo)
@@ -1132,9 +1133,15 @@ fn parse_bin_step(op: BinOp, lhs: Expr) : PExpr / Console = {
     Some(rhs) ->
       if op.level == bin_pipe() { bin_pipe_node(r.p, t, lhs, rhs) }
       else if op.level == bin_cmp() { bin_cmp_node(r.p, t, lhs, rhs) }
-      else { ok_e(r.p, mk_expr(EBinop(op_of_tok(t.kind), lhs, rhs), t.line, t.col)) }
+      else { bin_node(r.p, t, lhs, rhs) }
   }
 }
+
+fn bin_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console =
+  match binop_of_text(op_of_tok(t.kind)) {
+    Some(o) -> ok_e(p, mk_expr(EBinop(o, lhs, rhs), t.line, t.col))
+    None    -> err_e(p_error(p, t, "expected a binary operator"))
+  }
 
 # `|>` (apply), `|` (map), `||` (flat-map) and `|?` (filter). The typer
 # rewrites the map-like three against the head type of the left side.
@@ -1165,7 +1172,7 @@ fn bin_cmp_node(p: Parser, t: Token, lhs: Expr, rhs: Expr) : PExpr / Console = {
     let hint = "comparison is non-associative; write `... and ... #{op_of_tok(after.kind)} ...` instead"
     err_e(p_error(p, after, hint))
   } else {
-    ok_e(p, mk_expr(EBinop(op_of_tok(t.kind), lhs, rhs), t.line, t.col))
+    bin_node(p, t, lhs, rhs)
   }
 }
 
@@ -1208,13 +1215,13 @@ fn parse_unary_in(p: Parser) : PExpr / Console {
     let r = parse_unary_nested(p_advance(p))
     match r.r {
       None -> err_e(r.p)
-      Some(e) -> ok_e(r.p, mk_expr(EUnop("-", e), t.line, t.col))
+      Some(e) -> ok_e(r.p, mk_expr(EUnop(UoNeg, e), t.line, t.col))
     }
   } else if tk_is(t.kind, TkNot) {
     let r = parse_unary_nested(p_advance(p))
     match r.r {
       None -> err_e(r.p)
-      Some(e) -> ok_e(r.p, mk_expr(EUnop("not", e), t.line, t.col))
+      Some(e) -> ok_e(r.p, mk_expr(EUnop(UoNot, e), t.line, t.col))
     }
   } else if tk_is(t.kind, TkAmp) {
     # `&x` takes a reference: `Mutable.ref_make(x)`. The sigil mirrors
@@ -1255,7 +1262,7 @@ fn parse_unary_in(p: Parser) : PExpr / Console {
 # `2 ^ (3 ^ 2)` = `2 ^ 9` = 512. The LHS is `parse_postfix` so calls
 # and field accesses bind tighter than `^`; the RHS calls back into
 # `parse_unary` so a leading sign on the exponent (`r ^ -2`) lexes
-# as `EUnop("-", EInt(2))`. The typer treats `^` specially: when the
+# as `EUnop(UoNeg, EInt(2))`. The typer treats `^` specially: when the
 # base has a non-trivial unit, the exponent must be a literal Int
 # (or `-Int`) so the result unit `u^n` resolves at compile time.
 fn parse_pow(p: Parser) : PExpr / Console {
@@ -1274,7 +1281,7 @@ fn parse_pow_rest(p: Parser, lhs: Expr) : PExpr / Console {
     let rr = parse_unary_nested(p_skip_newlines(p_advance(p)))
     match rr.r {
       None -> err_e(rr.p)
-      Some(rhs) -> ok_e(rr.p, mk_expr(EBinop("^", lhs, rhs), t.line, t.col))
+      Some(rhs) -> ok_e(rr.p, mk_expr(EBinop(BoPow, lhs, rhs), t.line, t.col))
     }
   } else {
     let p_look = p_skip_newlines(p)
@@ -1283,7 +1290,7 @@ fn parse_pow_rest(p: Parser, lhs: Expr) : PExpr / Console {
       let rr = parse_unary_nested(p_skip_newlines(p_advance(p_look)))
       match rr.r {
         None -> err_e(rr.p)
-        Some(rhs) -> ok_e(rr.p, mk_expr(EBinop("^", lhs, rhs), t.line, t.col))
+        Some(rhs) -> ok_e(rr.p, mk_expr(EBinop(BoPow, lhs, rhs), t.line, t.col))
       }
     } else { ok_e(p, lhs) }
   }
@@ -4628,26 +4635,26 @@ fn refinement_matches_sugar_at(p: Parser) : Bool {
 fn parse_refinement_cmp_with(p: Parser, lhs: Expr, line: Int, col: Int) : PExpr / Console {
 
   let op_tok = p_peek(p)
-  let op_name = cmp_op_name(op_tok.kind)
+  let op = cmp_op_of_tok(op_tok.kind)
   let p1 = p_advance(p)
   let rhs = parse_expr(p1)
   match rhs.r {
     None -> rhs
     Some(rv) -> {
-      let cmp = mk_expr(EBinop(op_name, lhs, rv), line, col)
+      let cmp = mk_expr(EBinop(op, lhs, rv), line, col)
       PExpr { p: rhs.p, r: Some(cmp) }
     }
   }
 }
 
-fn cmp_op_name(k: TokKind) : String {
-  if tk_is(k, TkLt) { "<" }
-  else if tk_is(k, TkLe) { "<=" }
-  else if tk_is(k, TkEqEq) { "==" }
-  else if tk_is(k, TkNeq) { "!=" }
-  else if tk_is(k, TkGt) { ">" }
-  else if tk_is(k, TkGe) { ">=" }
-  else { "==" }
+fn cmp_op_of_tok(k: TokKind) : BinOp {
+  if tk_is(k, TkLt) { BoLt }
+  else if tk_is(k, TkLe) { BoLe }
+  else if tk_is(k, TkEqEq) { BoEq }
+  else if tk_is(k, TkNeq) { BoNe }
+  else if tk_is(k, TkGt) { BoGt }
+  else if tk_is(k, TkGe) { BoGe }
+  else { BoEq }
 }
 
 # A type head may carry a `<habitant>` annotation when it is a numeric

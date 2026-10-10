@@ -50,6 +50,7 @@
 import compiler.util
 import compiler.chars
 import compiler.ast
+import compiler.operators
 import compiler.marks
 import compiler.intervals
 import compiler.refine_help
@@ -691,13 +692,13 @@ fn pred_canon(e: Expr) : Expr = match e.kind {
   EBinop(op, a, b) -> {
     let ca = pred_canon(a)
     let cb = pred_canon(b)
-    if op == "<" { mk_expr(EBinop(">", cb, ca), e.line, e.col) }
-    else if op == "<=" { mk_expr(EBinop(">=", cb, ca), e.line, e.col) }
-    else if op == "==" or op == "!=" {
+    if binop_eq(op, BoLt) { mk_expr(EBinop(BoGt, cb, ca), e.line, e.col) }
+    else if binop_eq(op, BoLe) { mk_expr(EBinop(BoGe, cb, ca), e.line, e.col) }
+    else if binop_is_equality(op) {
       if cmp_lt(ca, cb) { mk_expr(EBinop(op, ca, cb), e.line, e.col) }
       else { mk_expr(EBinop(op, cb, ca), e.line, e.col) }
     }
-    else if op == "and" or op == "or" {
+    else if binop_is_logical(op) {
       mk_expr(EBinop(op, ca, cb), e.line, e.col)
     }
     else { mk_expr(EBinop(op, ca, cb), e.line, e.col) }
@@ -761,13 +762,13 @@ fn interval_of_pred(e: Expr, pname: String) : Option[Interval] = match e.kind {
 # Turn `x OP k` into the tightest Int interval that satisfies it.
 # `!=` is not expressible as a single closed interval; we return
 # `None` so the caller defers to structural / call-site checks.
-fn interval_from_cmp(op: String, k: Int) : Option[Interval] {
-  if op == ">"  { Some(Ival(k + 1, ival_int_max_const())) }
-  else if op == ">=" { Some(Ival(k, ival_int_max_const())) }
-  else if op == "<"  { Some(Ival(ival_int_min_const(), k - 1)) }
-  else if op == "<=" { Some(Ival(ival_int_min_const(), k)) }
-  else if op == "==" { Some(Ival(k, k)) }
-  else { None }
+fn interval_from_cmp(op: BinOp, k: Int) : Option[Interval] = match op {
+  BoGt -> Some(Ival(k + 1, ival_int_max_const()))
+  BoGe -> Some(Ival(k, ival_int_max_const()))
+  BoLt -> Some(Ival(ival_int_min_const(), k - 1))
+  BoLe -> Some(Ival(ival_int_min_const(), k))
+  BoEq -> Some(Ival(k, k))
+  _    -> None
 }
 
 # Saturating sentinels for the interval lattice. The lattice does
@@ -790,13 +791,15 @@ fn check_pred_with_interval(req: Expr, pname: String, iv: Interval) : Option[Boo
         None -> None
         Some(k) -> {
           let kiv = Ival(k, k)
-          if op == ">"  { ival_gt(iv, kiv) }
-          else if op == ">=" { ival_ge(iv, kiv) }
-          else if op == "<"  { ival_lt(iv, kiv) }
-          else if op == "<=" { ival_le(iv, kiv) }
-          else if op == "==" { ival_eq(iv, kiv) }
-          else if op == "!=" { ival_ne(iv, kiv) }
-          else { None }
+          match op {
+            BoGt -> ival_gt(iv, kiv)
+            BoGe -> ival_ge(iv, kiv)
+            BoLt -> ival_lt(iv, kiv)
+            BoLe -> ival_le(iv, kiv)
+            BoEq -> ival_eq(iv, kiv)
+            BoNe -> ival_ne(iv, kiv)
+            _    -> None
+          }
         }
       }
     } else { None }
@@ -824,11 +827,11 @@ pub fn expr_struct_eq(a: Expr, b: Expr) : Bool {
     EVar(an) -> match b.kind { EVar(bn) -> an == bn _ -> false }
     EMark(am) -> match b.kind { EMark(bm) -> mark_eq(am, bm) _ -> false }
     EBinop(aop, al, ar) -> match b.kind {
-      EBinop(bop, bl, br) -> aop == bop and expr_struct_eq(al, bl) and expr_struct_eq(ar, br)
+      EBinop(bop, bl, br) -> binop_eq(aop, bop) and expr_struct_eq(al, bl) and expr_struct_eq(ar, br)
       _ -> false
     }
     EUnop(aop, ai) -> match b.kind {
-      EUnop(bop, bi) -> aop == bop and expr_struct_eq(ai, bi)
+      EUnop(bop, bi) -> unop_eq(aop, bop) and expr_struct_eq(ai, bi)
       _ -> false
     }
     EField(ab, an) -> match b.kind {
@@ -863,26 +866,25 @@ fn expr_list_struct_eq(a: [Expr], b: [Expr]) : Bool {
 pub fn try_eval_pred(e: Expr) : Option[Bool] {
   match e.kind {
     EBool(b) -> Some(b)
-    EUnop(op, x) -> if op == "not" {
-      match try_eval_pred(x) {
+    EUnop(op, x) -> match op {
+      UoNot -> match try_eval_pred(x) {
         Some(b) -> Some(not b)
         None    -> None
       }
-    } else { None }
-    EBinop(op, a, b) -> {
-      if op == "and" {
-        match try_eval_pred(a) {
-          Some(false) -> Some(false)
-          Some(true)  -> try_eval_pred(b)
-          None        -> None
-        }
-      } else if op == "or" {
-        match try_eval_pred(a) {
-          Some(true)  -> Some(true)
-          Some(false) -> try_eval_pred(b)
-          None        -> None
-        }
-      } else if op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=" {
+      UoNeg -> None
+    }
+    EBinop(op, a, b) -> match op {
+      BoAnd -> match try_eval_pred(a) {
+        Some(false) -> Some(false)
+        Some(true)  -> try_eval_pred(b)
+        None        -> None
+      }
+      BoOr -> match try_eval_pred(a) {
+        Some(true)  -> Some(true)
+        Some(false) -> try_eval_pred(b)
+        None        -> None
+      }
+      _ -> if binop_is_comparison(op) {
         match try_eval_int(a) {
           None    -> try_eval_real_cmp(op, a, b)
           Some(ai) -> match try_eval_int(b) {
@@ -901,12 +903,13 @@ pub fn try_eval_pred(e: Expr) : Option[Bool] {
 pub fn try_eval_int(e: Expr) : Option[Int] {
   match e.kind {
     EInt(n, _) -> Some(n)
-    EUnop(op, x) -> if op == "-" {
-      match try_eval_int(x) {
+    EUnop(op, x) -> match op {
+      UoNeg -> match try_eval_int(x) {
         Some(v) -> Some(0 - v)
         None    -> None
       }
-    } else { None }
+      UoNot -> None
+    }
     EBinop(op, a, b) -> match try_eval_int(a) {
       None    -> None
       Some(av) -> match try_eval_int(b) {
@@ -918,29 +921,29 @@ pub fn try_eval_int(e: Expr) : Option[Int] {
   }
 }
 
-fn eval_int_op(op: String, a: Int, b: Int) : Option[Int] {
-  if op == "+" { Some(a + b) }
-  else if op == "-" { Some(a - b) }
-  else if op == "*" { Some(a * b) }
-  else if op == "/" { if b == 0 { None } else { Some(a / b) } }
-  else if op == "%" { if b == 0 { None } else { Some(a % b) } }
-  else { None }
+fn eval_int_op(op: BinOp, a: Int, b: Int) : Option[Int] = match op {
+  BoAdd -> Some(a + b)
+  BoSub -> Some(a - b)
+  BoMul -> Some(a * b)
+  BoDiv -> if b == 0 { None } else { Some(a / b) }
+  BoMod -> if b == 0 { None } else { Some(a % b) }
+  _     -> None
 }
 
-fn eval_int_cmp(op: String, a: Int, b: Int) : Bool {
-  if op == "==" { a == b }
-  else if op == "!=" { a != b }
-  else if op == "<" { a < b }
-  else if op == "<=" { a <= b }
-  else if op == ">" { a > b }
-  else if op == ">=" { a >= b }
-  else { false }
+fn eval_int_cmp(op: BinOp, a: Int, b: Int) : Bool = match op {
+  BoEq -> a == b
+  BoNe -> a != b
+  BoLt -> a < b
+  BoLe -> a <= b
+  BoGt -> a > b
+  BoGe -> a >= b
+  _    -> false
 }
 
 # Real fallback for the comparison arms of `try_eval_pred`. Fires only
 # when at least one side is a genuine Real literal — an all-Int
 # comparison already folded exactly via `try_eval_int`.
-fn try_eval_real_cmp(op: String, a: Expr, b: Expr) : Option[Bool] {
+fn try_eval_real_cmp(op: BinOp, a: Expr, b: Expr) : Option[Bool] {
   match try_eval_real(a) {
     None -> None
     Some(ar) -> match try_eval_real(b) {
@@ -955,12 +958,13 @@ pub fn try_eval_real(e: Expr) : Option[Real] {
   match e.kind {
     EReal(r, _) -> Some(r)
     EInt(n, _) -> Some(int_to_real(n))
-    EUnop(op, x) -> if op == "-" {
-      match try_eval_real(x) {
+    EUnop(op, x) -> match op {
+      UoNeg -> match try_eval_real(x) {
         Some(v) -> Some(0.0 - v)
         None    -> None
       }
-    } else { None }
+      UoNot -> None
+    }
     EBinop(op, a, b) -> match try_eval_real(a) {
       None    -> None
       Some(av) -> match try_eval_real(b) {
@@ -972,21 +976,21 @@ pub fn try_eval_real(e: Expr) : Option[Real] {
   }
 }
 
-fn eval_real_op(op: String, a: Real, b: Real) : Option[Real] {
-  if op == "+" { Some(a + b) }
-  else if op == "-" { Some(a - b) }
-  else if op == "*" { Some(a * b) }
-  else { None }
+fn eval_real_op(op: BinOp, a: Real, b: Real) : Option[Real] = match op {
+  BoAdd -> Some(a + b)
+  BoSub -> Some(a - b)
+  BoMul -> Some(a * b)
+  _     -> None
 }
 
-fn eval_real_cmp(op: String, a: Real, b: Real) : Bool {
-  if op == "==" { a == b }
-  else if op == "!=" { a != b }
-  else if op == "<" { a < b }
-  else if op == "<=" { a <= b }
-  else if op == ">" { a > b }
-  else if op == ">=" { a >= b }
-  else { false }
+fn eval_real_cmp(op: BinOp, a: Real, b: Real) : Bool = match op {
+  BoEq -> a == b
+  BoNe -> a != b
+  BoLt -> a < b
+  BoLe -> a <= b
+  BoGt -> a > b
+  BoGe -> a >= b
+  _    -> false
 }
 
 
@@ -1135,7 +1139,7 @@ pub fn contract_single_ident(pred: Expr) : Option[String] =
 # contract-violation panic.
 pub fn contract_single_ident_node(pred: Expr) : Option[ContractIdent] = match pred.kind {
   EBinop(op, a, b) ->
-    if pred_op_is_cmp(op) {
+    if binop_is_comparison(op) {
       match expr_pred_ident_node(a) {
         Some(na) -> if expr_pred_is_scalar_lit(b) { Some(CtrId(ci_name(na), na, b)) } else { None }
         None -> match expr_pred_ident_node(b) {
@@ -1210,9 +1214,6 @@ fn assert_span_prefix_loop(s: String, prefix: String, i: Int) : Bool {
     }
   } }
 }
-
-fn pred_op_is_cmp(op: String) : Bool =
-  op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">="
 
 # Recover the bare ident node behind a predicate operand. By emit time
 # the Perceus pass may have wrapped a non-last read in a dup; unwrap
