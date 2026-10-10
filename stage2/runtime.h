@@ -5623,7 +5623,7 @@ static KAI_RC_NOINLINE KaiValue *kai_record(int n, KaiValue **fields, const char
     v->as.rec.n_fields = n;
     v->as.rec.fields = (KaiValue **) malloc(n * sizeof(KaiValue *));
     v->as.rec.names  = (const char **) malloc(n * sizeof(const char *));
-    v->as.rec.head_type_tag = 0;  /* anonymous; kai_record_h sets it nominally */
+    v->as.rec.head_type_tag = 0;  /* anonymous; kai_rec_stamp sets it nominally */
     for (int i = 0; i < n; ++i) {
         v->as.rec.fields[i] = fields[i];
         v->as.rec.names[i]  = names[i];
@@ -5631,11 +5631,10 @@ static KAI_RC_NOINLINE KaiValue *kai_record(int n, KaiValue **fields, const char
     return v;
 }
 
-/* Nominal-record constructor — same as kai_record but stamps the
- * head-type tag for protocol dispatch. See docs/variant-tags.md
+/* Stamp a freshly built (or reused) record with its nominal head tag, so
+ * runtime protocol dispatch finds its impls. See docs/variant-tags.md
  * "Head-type tags". */
-static KAI_RC_NOINLINE KaiValue *kai_record_h(int n, KaiValue **fields, const char **names, int32_t head_tag) {
-    KaiValue *v = kai_record(n, fields, names);
+static inline KaiValue *kai_rec_stamp(KaiValue *v, int32_t head_tag) {
     v->as.rec.head_type_tag = head_tag;
     return v;
 }
@@ -6530,23 +6529,15 @@ static KaiValue *kai_reuse_or_alloc_record(KaiValue *_scr,
                 kai_decref(old_f);
             }
         }
+        /* The donor may be another record type: the rebuild is untagged
+         * unless its own site stamps it. */
+        _scr->as.rec.head_type_tag = 0;
         kai_rc_count_reuse();
         return kai_incref(_scr);
     }
     return kai_record(n, fields, names);
 }
 
-/* Same as kai_reuse_or_alloc_record but stamps head_type_tag — used by
- * codegen when the record's nominal head is known at compile time. */
-static KaiValue *kai_reuse_or_alloc_record_h(KaiValue *_scr,
-                                             int n, KaiValue **fields,
-                                             const char **names,
-                                             uint64_t kept_mask,
-                                             int32_t head_tag) {
-    KaiValue *v = kai_reuse_or_alloc_record(_scr, n, fields, names, kept_mask);
-    v->as.rec.head_type_tag = head_tag;
-    return v;
-}
 
 static KaiValue *kai_reuse_or_alloc_variant(KaiValue *_scr,
                                             int32_t tag, const char *name,

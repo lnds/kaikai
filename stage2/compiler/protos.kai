@@ -1466,31 +1466,32 @@ fn report_derive_missing(pname: String, tname: String, what: String, path: [Stri
 # DType followed by one synthetic DImpl per derived protocol.
 # DProtocol and ordinary DImpl decls pass through unchanged so the
 # next pass can collect them.
-fn expand_derives(ds: [Decl], target_mod: String) : [Decl] =
-  expand_derives_loop(ds, target_mod, collect_binser_types(ds, false, []), [])
+# The decl stream with every `#[derive]` expanded, and the impls the
+# derives minted on their own.
+type Expanded = Expanded([Decl], [Decl])
+
+fn expand_derives(ds: [Decl], target_mod: String) : Expanded =
+  expand_derives_loop(ds, target_mod, collect_binser_types(ds, false, []), [], [])
 
 # `writers` names every type deriving BinSerialize: a field of one of
 # them is encoded by its writer instead of a fresh `to_bytes` array.
-fn expand_derives_loop(ds: [Decl], target_mod: String, writers: [String], acc: [Decl]) : [Decl] {
+fn expand_derives_loop(ds: [Decl], target_mod: String, writers: [String], acc: [Decl], minted: [Decl]) : Expanded {
   match ds {
-    [] -> list_reverse(acc)
+    [] -> Expanded(list_reverse(acc), minted)
     [d, ...rest] -> match d {
       DDerive(names, inner, l, c) -> {
         let home = decl_type_home(inner, target_mod)
         let derived = map(derive_impls_for(names, inner, home, writers),
                           (dd) => stamp_derived_home(dd, home, l, c))
         expand_derives_loop(rest, target_mod, writers,
-                            list_append([inner, ...list_reverse(derived)], acc))
+                            list_append([inner, ...list_reverse(derived)], acc),
+                            list_append(derived, minted))
       }
       DUnstable(inner, _, _) ->
-        expand_derives_loop([inner, ...rest], target_mod, writers, acc)
-      # Preserve the wrapper: the `#[constructor]` registry is collected
-      # in the typer, so unwrapping here (as DUnstable does) would lose
-      # it. The inner is a plain fn — no derives to expand.
-      DProtoLaws(_, _, _, _, _) -> expand_derives_loop(rest, target_mod, writers, [d, ...acc])
-      DImplAxiom(_, _, _, _, _) -> expand_derives_loop(rest, target_mod, writers, [d, ...acc])
-      DConstructor(_, _, _) -> expand_derives_loop(rest, target_mod, writers, [d, ...acc])
-      _ -> expand_derives_loop(rest, target_mod, writers, [d, ...acc])
+        expand_derives_loop([inner, ...rest], target_mod, writers, acc, minted)
+      # Every other wrapper stays: the `#[constructor]` registry is
+      # collected in the typer, so unwrapping it would lose it.
+      _ -> expand_derives_loop(rest, target_mod, writers, [d, ...acc], minted)
     }
   }
 }
@@ -3355,8 +3356,8 @@ fn validate_derive_ord_one(file: String, tname: String, fname: String,
 # Top-level entry point. Hands the post-desugar decl stream back
 # with protocols / impls lowered into ordinary fn decls, plus a
 # threaded ProtocolReg the post-inference rewrite consumes.
-#[doc("Result of pass A: the decl stream with impls lowered, the threaded ProtocolReg, and an error count.")]
-pub type LoweredProtocols = { decls: [Decl], reg: ProtocolReg, errs: Int, diags: [Diagnostic] }
+#[doc("Result of pass A: the decl stream with impls lowered, the threaded ProtocolReg, an error count, and the symbols of the impls `#[derive]` minted.")]
+pub type LoweredProtocols = { decls: [Decl], reg: ProtocolReg, errs: Int, diags: [Diagnostic], derived: [String] }
 
 #[doc("Pass A: expand #[derive], validate coherence, lower impls + emit dispatchers, strip protocol decls. `cores` names the stdlib core modules, whose protocols keep their bare dispatch identity; `imports` is each file's direct import list, the scope a bare protocol head resolves through.")]
 pub fn lower_protocols(decls: [Decl], df: DiagFiles,
@@ -3384,7 +3385,8 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
                                  validate_derive_json(decls, df))))
   # Step 1 — expand `#derive(...)` annotations into synthetic DImpl
   # decls so subsequent steps see all impls uniformly.
-  let expanded = expand_derives(decls, target_mod)
+  let exp = expand_derives(decls, target_mod)
+  let expanded = match exp { Expanded(ds, _) -> ds }
   # Step 2 — collect every protocol op into the registry, each entry
   # tagged with its declaring module's home. The same home-anchor
   # stream also scopes the impl validations below, so it is computed
@@ -3421,8 +3423,21 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # Index the now-final impl table once; the post-inference rewrite's
   # per-spec scans consult it instead of walking `reg.impls` linearly.
   let indexed_reg = reg_with_impl_index(reg_with_renames(lower_res.reg, renames))
-  LoweredProtocols { decls: final_decls, reg: indexed_reg, errs: errs, diags: diags }
+  let derived = match exp { Expanded(_, ds) -> derived_impl_syms(ds, reg0, ps, renames) }
+  LoweredProtocols { decls: final_decls, reg: indexed_reg, errs: errs, diags: diags, derived: derived }
 }
+
+# The symbols the derived impls mint, spelled as the final registry spells them.
+fn derived_impl_syms(minted: [Decl], reg0: ProtocolReg, ps: PScope, renames: [ImplRename]) : [String] = match minted {
+  [] -> []
+  _  -> map((lower_impls(minted, reg_without_impls(reg0), ps, [])).reg.impls, (p) => impl_renamed(renames, pir_sym(p)))
+}
+
+fn reg_without_impls(reg: ProtocolReg) : ProtocolReg =
+  ProtocolReg { ops: reg.ops, impls: [], op_names: reg.op_names,
+                tparams: reg.tparams, origins: reg.origins, dkeys: reg.dkeys,
+                impl_index: reg.impl_index, cores: reg.cores,
+                imports: reg.imports, root: reg.root }
 
 # Attach a freshly-built `ImplIndex` to a finalised registry. The impl
 # table is immutable past this point, so the index built here serves
