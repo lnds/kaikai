@@ -4,13 +4,13 @@ functions carry into unbox and into Perceus, and each one a `KPerform`
 carries out of the KIR lowering, decoded against the symbol table. Core
 modules are left out.
 
-A line is `<stage> <fn> <written>#<id> <decl>@<home>`, the written name
-carrying `/<k>` when it names the k-th specialisation. The written name
-is what the tree spells; the declaration and home are what the id
-decodes to, so an id that survives but names another declaration shows
-up as a mismatch instead of passing silently.
+A line is `<stage> <fn> <spelled>#<id> <decl>@<home>`, the spelled name
+carrying `/<k>` when it names the k-th specialisation. The spelled name
+is what the reference is emitted as: a function's emitted name, an
+effect's run-time label; the declaration and home are what the id
+decodes to in the table.
 
-An `efn` line is one registry entry, `efn <written>#<id> <decl>@<home>
+An `efn` line is one registry entry, `efn <spelled>#<id> <decl>@<home>
 <class>`, its signature class read back through the id alone —
 so a specialisation that shared its template's identity would report
 the template's class.
@@ -19,27 +19,35 @@ the template's class.
 import compiler.ast
 import compiler.expr_positions
 import compiler.symtab
+import compiler.decl_text
+import compiler.spec_names
+import compiler.local_names
 import compiler.kir
 import compiler.fnreg
 import compiler.fn_index
-import compiler.effect_instance
 import compiler.util
 import compiler.written
 
-type SdRef = SdRef(SymId, Int, String)
+# What a body refers to: a function instance or other declaration, the
+# effect a `handle` names, the operation a perform reaches.
+type SdRef = SdDecl(FnId) | SdHandle(DeclRef) | SdOp(OpRef)
 
 #[doc("One line per resolved reference in the bodies of the functions outside the `core` modules, tagged with `stage`.")]
-pub fn symid_decl_lines(stage: String, tab: SymTab, core: [String], ds: [Decl]) : [String] = match ds {
+pub fn symid_decl_lines(stage: String, tab: SymTab, specs: SpecNames, core: [String], ds: [Decl]) : [String] = match ds {
   []           -> []
-  [d, ...rest] -> sd_decl(stage, tab, core, d) ++ symid_decl_lines(stage, tab, core, rest)
+  [d, ...rest] -> sd_decl(stage, tab, specs, core, d) ++ symid_decl_lines(stage, tab, specs, core, rest)
 }
 
 #[doc("One line per `KPerform` in the functions outside the `core` modules, with the effect id it carries.")]
 pub fn symid_kir_lines(tab: SymTab, core: [String], kp: KProgram) : [String] = sd_kfns(tab, core, kp.fns)
 
-fn sd_decl(stage: String, tab: SymTab, core: [String], d: Decl) : [String] = match d {
-  DFn(_, n, _, _, _, _, body, _, _, mo, _) ->
-    if sd_is_user(mo, core) { map(list_reverse(sd_refs(body, [])), (r) => sd_ref_line(stage, n, tab, r)) } else { [] }
+fn sd_decl(stage: String, tab: SymTab, specs: SpecNames, core: [String], d: Decl) : [String] = match d {
+  DFn(_, f, _, _, _, _, body, _, _, mo) ->
+    if sd_is_user(mo, core) {
+      let ns = ln_of_decl(d)
+      let fname = sd_fn(tab, specs, f)
+      map(list_reverse(sd_refs(body, [])), (r) => sd_ref_line(stage, fname, tab, specs, ns, r))
+    } else { [] }
   _ -> []
 }
 
@@ -54,10 +62,10 @@ fn sd_has(xs: [String], x: String) : Bool = match xs {
 }
 
 fn sd_refs(e: Expr, acc: [SdRef]) : [SdRef] = match e.kind {
-  ESym(s, inst, n) -> if sym_is_local(s) { acc } else { [SdRef(s, inst, n), ...acc] }
-  EHandle(_, en, hs, _, _, _, _, _) ->
-    sd_refs_ps(xp_positions(e), [SdRef(hs, spec_none(), string_concat("with ", en)), ...acc])
-  _          -> sd_refs_ps(xp_positions(e), acc)
+  ESym(s, inst) -> [SdDecl(FnId(s, inst)), ...acc]
+  EOp(r)        -> [SdOp(r), ...acc]
+  EHandle(_, r, _, _, _, _, _) -> sd_refs_ps(xp_positions(e), [SdHandle(r), ...acc])
+  _             -> sd_refs_ps(xp_positions(e), acc)
 }
 
 fn sd_refs_ps(ps: [XPos], acc: [SdRef]) : [SdRef] = match ps {
@@ -65,35 +73,52 @@ fn sd_refs_ps(ps: [XPos], acc: [SdRef]) : [SdRef] = match ps {
   [XP(_, c), ...rest] -> sd_refs_ps(rest, sd_refs(c, acc))
 }
 
-fn sd_ref_line(stage: String, fname: String, tab: SymTab, r: SdRef) : String = match r {
-  SdRef(s, inst, n) -> sd_line(stage, fname, sd_written(n, inst), tab, s)
+fn sd_ref_line(stage: String, fname: String, tab: SymTab, specs: SpecNames, ns: LocalNames, r: SdRef) : String = match r {
+  SdDecl(f)   -> sd_line(stage, fname, sd_instance(sd_fn(tab, specs, f), fnid_inst(f)), tab, fnid_sym(f))
+  SdHandle(h) -> sd_line(stage, fname, string_concat("with ", sd_head(tab, h)), tab, ref_sym(h))
+  SdOp(o)     -> sd_line(stage, fname, concat_all([kir_eff_name(tab, o.eff), ".", written_text(o.op), sd_via(ns, o.via)]), tab, o.eff)
+}
+
+# The name a function is emitted under.
+fn sd_fn(tab: SymTab, specs: SpecNames, f: FnId) : String = "#{fn_emit_name(tab, specs, f)}"
+
+fn sd_head(tab: SymTab, h: DeclRef) : String = match h {
+  DrSym(s)        -> kir_eff_name(tab, s)
+  DrWritten(_, n) -> written_text(n)
+}
+
+# The instance a perform goes through, as its key spelled it.
+fn sd_via(ns: LocalNames, v: OpVia) : String = match v {
+  ViaAmbient  -> ""
+  ViaAlias(a) -> string_concat("@", written_text(ln_text(ns, a)))
+  ViaRecv(x)  -> string_concat("#", written_text(ln_text(ns, x)))
 }
 
 # A specialisation decodes to its template, so the line names which instance.
-fn sd_written(n: String, inst: Int) : String =
+fn sd_instance(n: String, inst: Int) : String =
   if inst == spec_none() { n } else { concat_all([n, "/", int_to_string(inst)]) }
 
-fn sd_line(stage: String, fname: String, written: String, tab: SymTab, s: SymId) : String =
-  concat_all([stage, " ", fname, " ", sd_ref(written, tab, s)])
+fn sd_line(stage: String, fname: String, spelled: String, tab: SymTab, s: SymId) : String =
+  concat_all([stage, " ", fname, " ", sd_ref(spelled, tab, s)])
 
-fn sd_ref(written: String, tab: SymTab, s: SymId) : String =
-  concat_all([written, "#", int_to_string(sym_raw(s)), " ", written_text(sym_name(tab, s)), "@", written_text(sym_home(tab, s))])
+fn sd_ref(spelled: String, tab: SymTab, s: SymId) : String =
+  concat_all([spelled, "#", int_to_string(sym_raw(s)), " ", written_text(sym_name(tab, s)), "@", written_text(sym_home(tab, s))])
 
 #[doc("One line per function, type, effect and protocol outside the `core` modules, with the identity its own declaration carries: `own <kind> <name>#<id> <decl>@<home>`. This is what the KIR lowering reads off the declaration stream, so a declaration stripped of its id on the way shows as `#-1`.")]
-pub fn symid_own_lines(tab: SymTab, core: [String], ds: [Decl]) : [String] = match ds {
+pub fn symid_own_lines(tab: SymTab, specs: SpecNames, core: [String], ds: [Decl]) : [String] = match ds {
   []           -> []
-  [d, ...rest] -> sd_own(tab, core, d) ++ symid_own_lines(tab, core, rest)
+  [d, ...rest] -> sd_own(tab, specs, core, d) ++ symid_own_lines(tab, specs, core, rest)
 }
 
-fn sd_own(tab: SymTab, core: [String], d: Decl) : [String] = match d {
-  DFn(_, n, _, _, _, _, _, _, _, mo, fid) ->
-    if sd_is_user(mo, core) { [sd_line("own", "fn", n, tab, fnid_sym(fid))] } else { [] }
-  DType(_, n, _, _, _, _, mo, _, s) ->
-    if sd_is_user(mo, core) { [sd_line("own", "type", n, tab, s)] } else { [] }
-  DEffect(_, n, _, _, _, _, _, mo, s) ->
-    if sd_is_user(mo, core) { [sd_line("own", "effect", n, tab, s)] } else { [] }
-  DProtocol(_, n, _, _, _, _, mo, s) ->
-    if sd_is_user(mo, core) { [sd_line("own", "protocol", n, tab, s)] } else { [] }
+fn sd_own(tab: SymTab, specs: SpecNames, core: [String], d: Decl) : [String] = match d {
+  DFn(_, f, _, _, _, _, _, _, _, mo) ->
+    if sd_is_user(mo, core) { [sd_line("own", "fn", sd_fn(tab, specs, f), tab, fnid_sym(f))] } else { [] }
+  DType(_, s, _, _, _, _, mo, _) ->
+    if sd_is_user(mo, core) { [sd_line("own", "type", written_text(decl_name(tab, s)), tab, s)] } else { [] }
+  DEffect(_, s, _, _, _, _, _, mo) ->
+    if sd_is_user(mo, core) { [sd_line("own", "effect", kir_eff_name(tab, s), tab, s)] } else { [] }
+  DProtocol(_, s, _, _, _, _, mo) ->
+    if sd_is_user(mo, core) { [sd_line("own", "protocol", written_text(decl_name(tab, s)), tab, s)] } else { [] }
   _ -> []
 }
 
@@ -108,7 +133,7 @@ fn sd_efns(tab: SymTab, core: [String], fx: FnIndex, fns: [EFn]) : [String] = ma
 fn sd_efn(tab: SymTab, core: [String], fx: FnIndex, e: EFn) : [String] = match e {
   EFn(n, _, mo, _, fid) ->
     if sd_is_user(mo, core) and sym_raw(fnid_sym(fid)) >= 0 {
-      [concat_all(["efn ", sd_ref(sd_written(n, fnid_inst(fid)), tab, fnid_sym(fid)), " ", sd_class(fnx_ufn_sig_sym(fx, fid))])]
+      [concat_all(["efn ", sd_ref(sd_instance("#{n}", fnid_inst(fid)), tab, fnid_sym(fid)), " ", sd_class(fnx_ufn_sig_sym(fx, fid))])]
     } else { [] }
 }
 
@@ -146,6 +171,13 @@ fn sd_stmt(tab: SymTab, fname: String, s: KStmt) : [String] = match s {
 }
 
 fn sd_op(tab: SymTab, fname: String, op: KOp) : [String] = match op {
-  KPerform(eff, s, o, _) -> [sd_line("kperform", fname, concat_all([inst_key_eff(eff), ".", o]), tab, s)]
-  _                      -> []
+  KPerform(s, _, o, via, _) -> [sd_line("kperform", fname, concat_all([kir_eff_name(tab, s), ".", o, sd_kvia(via)]), tab, s)]
+  _                         -> []
+}
+
+fn sd_kvia(v: KVia) : String = match v {
+  KvAmbient  -> ""
+  KvLexical  -> "!"
+  KvAlias(a) -> string_concat("@", a)
+  KvRecv(r)  -> string_concat("#", r)
 }

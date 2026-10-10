@@ -38,6 +38,7 @@
 
 import compiler.ast
 import compiler.cache_ast
+import compiler.decl_names
 import compiler.lex
 import compiler.modules
 import compiler.cache.{cache_fnv_bytes}
@@ -315,19 +316,20 @@ fn uc_pair_hexes(pairs: [UcDepPair], acc: [String]) : [String] = match pairs {
 
 # ---- lookup + atomic write -------------------------------------------
 
-#[doc("Result of a cache lookup: a hit carries the deserialised decls; a miss carries the composite key (content_hex, dep_hex) so the caller can write the blob after parsing.")]
+#[doc("Result of a cache lookup: a hit carries the deserialised decls and their table rows; a miss carries the composite key (content_hex, dep_hex) so the caller can write the blob after parsing.")]
 pub type UcLookup
-  = UcHit([Decl])
+  = UcHit([Decl], [NEnt])
   | UcMiss(String, String)   # content_hex, dep_hex
 
 #[doc("A lookup result paired with the memo the dependency walk grew, to thread into the next lookup of the same compile.")]
 pub type UcLookupMemo = UcLM(UcLookup, UcDepMemo)
 
-#[doc("Look up the cache for a file from its source and token stream. Computes the composite key (content over src, dep over the imports the tokens name), reads the matching blob from `cache_dir`, and returns UcHit(decls) on a present header-valid entry or UcMiss(key) otherwise (absent, version or format drift, or corruption). Tokenizes but never parses, so a hit skips the parse the cache exists to amortise. The memo carries dependency closures across the compile; pass uc_memo_empty() for the first file and thread the returned one onward.")]
-pub fn uc_lookup(cache_dir: String, root_path: String, src: String, toks: [Token],
+#[doc("Look up the cache for a file from its source and token stream. Computes the composite key (content over `home` and src, dep over the imports the tokens name), reads the matching blob from `cache_dir`, and returns UcHit(decls, rows) on a present header-valid entry or UcMiss(key) otherwise (absent, version or format drift, or corruption). Tokenizes but never parses, so a hit skips the parse the cache exists to amortise. The memo carries dependency closures across the compile; pass uc_memo_empty() for the first file and thread the returned one onward.")]
+pub fn uc_lookup(cache_dir: String, root_path: String, home: String, src: String, toks: [Token],
                  search_paths: [String], memo: UcDepMemo)
                  : UcLookupMemo / Console + File = {
-  let content_hex = uc_content_hex(src)
+  # The blob holds ids derived from the home the file was parsed under.
+  let content_hex = uc_content_hex(concat_all([home, "\n", src]))
   match uc_dep_hex_memo(root_path, src, toks, search_paths, memo) {
     UDHex(dep_hex, memo1) -> {
       let blob_path = uc_blob_path(cache_dir, content_hex, dep_hex)
@@ -335,7 +337,7 @@ pub fn uc_lookup(cache_dir: String, root_path: String, src: String, toks: [Token
         Err(_) -> UcMiss(content_hex, dep_hex)
         Ok(blob) -> match cache_deserialize_module(blob) {
           None -> UcMiss(content_hex, dep_hex)
-          Some(cds) -> match cds { CDs(decls, _) -> UcHit(decls) }
+          Some(cds) -> match cds { CDs(decls, rows, _) -> UcHit(decls, rows) }
         }
       }, memo1)
     }
@@ -372,8 +374,8 @@ fn cache_commit(written: Result[Unit, String], tmp: String,
 
 #[doc("Write decls to the cache for the given composite key: serialise via the reused KAB2 codec and publish the blob atomically to its content-addressed path in `cache_dir`, which must already exist (bin/kai creates it before invoking kaic2). Any IO failure is swallowed - a cache that cannot be written is a performance loss, never a correctness one.")]
 pub fn uc_write(cache_dir: String, content_hex: String, dep_hex: String,
-                decls: [Decl]) : Unit / Console + File = {
-  let blob = cache_serialize_module(decls, uc_header_sha(content_hex, dep_hex))
+                decls: [Decl], rows: [NEnt]) : Unit / Console + File = {
+  let blob = cache_serialize_module(decls, rows, uc_header_sha(content_hex, dep_hex))
   cache_publish_bytes(uc_blob_path(cache_dir, content_hex, dep_hex), blob)
 }
 
