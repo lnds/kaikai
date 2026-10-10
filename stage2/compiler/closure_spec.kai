@@ -26,12 +26,13 @@ import compiler.emit_shared
 import compiler.fnreg
 import compiler.symtab
 import compiler.core_syms
+import compiler.proto_ids
 
 #[doc("Specialise every higher-order call on a known env-empty closure; returns the decls with per-site specs appended and their call sites retargeted. Runs post-monomorphisation so each specialised callee is already concrete — the inlined loop body unboxes exactly like the hand-written recursion.")]
-pub fn closure_spec_pass(ds: [Decl], target: String, tab: SymTab) : [Decl] = {
+pub fn closure_spec_pass(ds: [Decl], target: String, tab: SymTab, ids: ProtoIds) : [Decl] = {
   let hofns = collect_hofns(ds)
   if list_length(hofns) == 0 { ds }
-  else { cspec_fixpoint(ds, hofns, [], cspec_fuel(), target, tab) }
+  else { cspec_fixpoint(ds, hofns, [], cspec_fuel(), target, tab, ids) }
 }
 
 # Specialisation propagates across fn boundaries: specialising `foldl`
@@ -47,17 +48,17 @@ fn cspec_fuel() : Int = 64
 # the raw `inner(..., L)` call whose request the next round must find;
 # rewriting inside the loop would retarget it away before it is seen,
 # stranding the transitive spec (`foldl → foldl_loop`).
-fn cspec_fixpoint(ds: [Decl], hofns: [Decl], emitted: [String], fuel: Int, target: String, tab: SymTab) : [Decl] =
-  if fuel <= 0 { rewrite_all(ds, ds, tab, hofns, target) }
+fn cspec_fixpoint(ds: [Decl], hofns: [Decl], emitted: [String], fuel: Int, target: String, tab: SymTab, ids: ProtoIds) : [Decl] =
+  if fuel <= 0 { rewrite_all(ds, ds, tab, ids, hofns, target) }
   else {
-    let reqs = dedup_reqs(cs_collect_decls(ds, ds, tab, hofns), emitted, [])
-    if list_length(reqs) == 0 { rewrite_all(ds, ds, tab, hofns, target) }
+    let reqs = dedup_reqs(cs_collect_decls(ds, ds, tab, ids, hofns), emitted, [])
+    if list_length(reqs) == 0 { rewrite_all(ds, ds, tab, ids, hofns, target) }
     else {
       let specs = map(reqs, (r) => emit_cspec(r, ds, target))
       let ds1 = list_append(ds, specs)
       let hofns1 = list_append(hofns, filter_hofns(specs))
       let emitted1 = list_append(emitted, map(reqs, req_spec_name))
-      cspec_fixpoint(ds1, hofns1, emitted1, fuel - 1, target, tab)
+      cspec_fixpoint(ds1, hofns1, emitted1, fuel - 1, target, tab, ids)
     }
   }
 
@@ -127,12 +128,12 @@ fn lookup_hofn_sym(hofns: [Decl], s: SymId) : Option[Decl] = match hofns {
 # carry elaborate types whose specs miscompile, and the user's win comes
 # entirely from root call sites. A generated spec is itself `mo == None`,
 # so the transitive chain (a fold's spec calling its loop) is still walked.
-fn cs_collect_decls(ds: [Decl], all: [Decl], tab: SymTab, hofns: [Decl]) : [CSpecReq] =
+fn cs_collect_decls(ds: [Decl], all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl]) : [CSpecReq] =
   match ds {
     [] -> []
     [d, ...rest] -> {
-      let here = if cs_specialisable_host(d) { cs_collect_expr(decl_body(d), cs_decl_name(d), all, tab, hofns) } else { [] }
-      list_append(here, cs_collect_decls(rest, all, tab, hofns))
+      let here = if cs_specialisable_host(d) { cs_collect_expr(decl_body(d), cs_decl_name(d), all, tab, ids, hofns) } else { [] }
+      list_append(here, cs_collect_decls(rest, all, tab, ids, hofns))
     }
   }
 
@@ -152,31 +153,31 @@ fn cs_decl_is_derived(d: Decl) : Bool = match d {
 
 # Bottom-up read walk: a request per specialisable `G(args)`. Children
 # first so nested folds are discovered too.
-fn cs_collect_expr(e: Expr, host: String, all: [Decl], tab: SymTab, hofns: [Decl]) : [CSpecReq] = {
-  let kid_reqs = collect_kids(cspec_kids(e), host, all, tab, hofns)
-  list_append(kid_reqs, site_req(e, host, all, tab, hofns))
+fn cs_collect_expr(e: Expr, host: String, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl]) : [CSpecReq] = {
+  let kid_reqs = collect_kids(cspec_kids(e), host, all, tab, ids, hofns)
+  list_append(kid_reqs, site_req(e, host, all, tab, ids, hofns))
 }
 
-fn collect_kids(es: [Expr], host: String, all: [Decl], tab: SymTab, hofns: [Decl]) : [CSpecReq] =
+fn collect_kids(es: [Expr], host: String, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl]) : [CSpecReq] =
   match es {
     [] -> []
-    [k, ...rest] -> list_append(cs_collect_expr(k, host, all, tab, hofns), collect_kids(rest, host, all, tab, hofns))
+    [k, ...rest] -> list_append(cs_collect_expr(k, host, all, tab, ids, hofns), collect_kids(rest, host, all, tab, ids, hofns))
   }
 
 # A specialisation request for this node when it is a higher-order call
 # on an env-empty closure; empty otherwise.
-fn site_req(e: Expr, host: String, all: [Decl], tab: SymTab, hofns: [Decl]) : [CSpecReq] =
+fn site_req(e: Expr, host: String, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl]) : [CSpecReq] =
   match e.kind {
     ECall(callee, args_) -> match callee_hofn(hofns, callee) {
-      Some(hd) -> req_of(args_, hd, host, all, tab)
+      Some(hd) -> req_of(args_, hd, host, all, tab, ids)
       None     -> []
     }
     _ -> []
   }
 
-fn req_of(args_: [Expr], hd: Decl, host: String, all: [Decl], tab: SymTab) : [CSpecReq] = {
+fn req_of(args_: [Expr], hd: Decl, host: String, all: [Decl], tab: SymTab, ids: ProtoIds) : [CSpecReq] = {
   let idx = first_fn_param_idx(decl_params(hd), 0)
-  if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(hd, idx) { [] }
+  if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(ids, hd, idx) { [] }
   else {
     match classify_closure(elem_at(args_, idx), all, tab) {
       Some(ca) -> [CSReq(hd, idx, ca, closure_disc(host, ca))]
@@ -187,42 +188,42 @@ fn req_of(args_: [Expr], hd: Decl, host: String, all: [Decl], tab: SymTab) : [CS
 
 # ---- call-site rewrite (pure map) ----
 
-fn rewrite_all(ds: [Decl], all: [Decl], tab: SymTab, hofns: [Decl], target: String) : [Decl] =
-  map(ds, (d) => rewrite_decl(d, all, tab, hofns, target))
+fn rewrite_all(ds: [Decl], all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], target: String) : [Decl] =
+  map(ds, (d) => rewrite_decl(d, all, tab, ids, hofns, target))
 
 # Retarget call sites only in the decls that seeded requests — root-file
 # decls and the generated specs (all `mo == None`). A stdlib/compiler
 # decl is left untouched: no spec was discovered for its internal calls.
-fn rewrite_decl(d: Decl, all: [Decl], tab: SymTab, hofns: [Decl], target: String) : Decl =
+fn rewrite_decl(d: Decl, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], target: String) : Decl =
   match d {
     DFn(p, n, tp, ps, rt, row, body, l, c, mo, fsym) ->
       if cs_specialisable_host(d) {
-        DFn(p, n, tp, ps, rt, row, rewrite_expr(body, n, all, tab, hofns, target), l, c, mo, fsym)
+        DFn(p, n, tp, ps, rt, row, rewrite_expr(body, n, all, tab, ids, hofns, target), l, c, mo, fsym)
       } else { d }
     _ -> d
   }
 
 # Rewrite bottom-up: children via the shared functor, then this node.
-fn rewrite_expr(e: Expr, host: String, all: [Decl], tab: SymTab, hofns: [Decl], target: String) : Expr = {
-  let e1 = Expr { kind: map_expr_kind(e.kind, (k) => rewrite_expr(k, host, all, tab, hofns, target)),
+fn rewrite_expr(e: Expr, host: String, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], target: String) : Expr = {
+  let e1 = Expr { kind: map_expr_kind(e.kind, (k) => rewrite_expr(k, host, all, tab, ids, hofns, target)),
                   line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
-  retarget_site(e1, host, all, tab, hofns, target)
+  retarget_site(e1, host, all, tab, ids, hofns, target)
 }
 
 # A specialisable higher-order call `G(args)` becomes `G__cspec__<disc>(rest)`
 # with the functional argument dropped; other nodes pass through.
-fn retarget_site(e: Expr, host: String, all: [Decl], tab: SymTab, hofns: [Decl], target: String) : Expr =
+fn retarget_site(e: Expr, host: String, all: [Decl], tab: SymTab, ids: ProtoIds, hofns: [Decl], target: String) : Expr =
   match e.kind {
     ECall(callee, args_) -> match callee_hofn(hofns, callee) {
-      Some(hd) -> retarget_call(e, callee, args_, hd, host, all, tab, target)
+      Some(hd) -> retarget_call(e, callee, args_, hd, host, all, tab, ids, target)
       None     -> e
     }
     _ -> e
   }
 
-fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, host: String, all: [Decl], tab: SymTab, target: String) : Expr = {
+fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, host: String, all: [Decl], tab: SymTab, ids: ProtoIds, target: String) : Expr = {
   let idx = first_fn_param_idx(decl_params(hd), 0)
-  if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(hd, idx) { e }
+  if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(ids, hd, idx) { e }
   else {
     match classify_closure(elem_at(args_, idx), all, tab) {
       Some(ca) -> {
@@ -246,7 +247,7 @@ fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, host: String, a
 # lowercase-initial names (declared `[a, b]` OR implicit); concrete types
 # (`Int`, `Vec`) are capital and never match. The effect row is exempt —
 # it lives in the row, not a `TyName`, and the spec closes it.
-fn hofn_specialisable(hd: Decl, idx: Int) : Bool =
+fn hofn_specialisable(ids: ProtoIds, hd: Decl, idx: Int) : Bool =
   match hd {
     DFn(_, n, _, ps, rt, _, body, _, _, _, fsym) -> {
       # A return-only tparam alone is fine — mono grounds it from the call
@@ -256,7 +257,7 @@ fn hofn_specialisable(hd: Decl, idx: Int) : Bool =
       # result type IS that tparam and so cannot be pinned from any datum.
       # A collect uses `vec_push`/`vec_reserve` (parametric, element opaque)
       # and specialises; `map_sum`'s `zero()` still declines.
-      let unsound_ret = any_return_only(drop_param_at(ps, idx), rt) and body_has_arity0_proto_op(body)
+      let unsound_ret = any_return_only(drop_param_at(ps, idx), rt) and body_has_arity0_proto_op(ids, body)
       let flow_ok = functional_param_safe(body, param_name_at(ps, idx), SelfRef(fsym, n))
       not unsound_ret and flow_ok
     }
@@ -264,32 +265,30 @@ fn hofn_specialisable(hd: Decl, idx: Int) : Bool =
   }
 
 # True when the body applies an arity-0 protocol op — a bare op reference
-# reified to a `__proto_*` dispatcher, called with no arguments. Such an
+# reified to a dispatcher, called with no arguments. Such an
 # op's result type is the protocol's own tparam, unpinnable from any datum,
 # so inlining a callee that resolves one through a return-only tparam
 # leaves the op's runtime dispatch stranded (`no impl of … for runtime
 # head`). `zero()`/`one()` are the ring cases.
-fn body_has_arity0_proto_op(e: Expr) : Bool =
+fn body_has_arity0_proto_op(ids: ProtoIds, e: Expr) : Bool =
   match e.kind {
-    ECall(callee, args_) -> arity0_proto_call(callee, args_) or body_has_arity0_proto_op(callee) or kids_have_arity0_proto_op(args_)
-    _ -> kids_have_arity0_proto_op(cspec_kids(e))
+    ECall(callee, args_) -> arity0_proto_call(ids, callee, args_) or body_has_arity0_proto_op(ids, callee) or kids_have_arity0_proto_op(ids, args_)
+    _ -> kids_have_arity0_proto_op(ids, cspec_kids(e))
   }
 
-fn arity0_proto_call(callee: Expr, args_: [Expr]) : Bool =
-  list_length(args_) == 0 and callee_is_proto_op(callee)
+fn arity0_proto_call(ids: ProtoIds, callee: Expr, args_: [Expr]) : Bool =
+  list_length(args_) == 0 and callee_is_proto_op(ids, callee)
 
-fn kids_have_arity0_proto_op(es: [Expr]) : Bool =
+fn kids_have_arity0_proto_op(ids: ProtoIds, es: [Expr]) : Bool =
   match es {
     [] -> false
-    [k, ...rest] -> body_has_arity0_proto_op(k) or kids_have_arity0_proto_op(rest)
+    [k, ...rest] -> body_has_arity0_proto_op(ids, k) or kids_have_arity0_proto_op(ids, rest)
   }
 
-fn callee_is_proto_op(callee: Expr) : Bool =
-  match sym_read_kind(callee.kind) {
-    EVar(n)        -> string_starts_with_q(n, "__proto_")
-    EModCall(_, n) -> string_starts_with_q(n, "__proto_")
-    _              -> false
-  }
+fn callee_is_proto_op(ids: ProtoIds, callee: Expr) : Bool = match pid_ref_disp(ids, callee) {
+  Some(_) -> true
+  None    -> false
+}
 
 # The functional parameter's flow must not fork across a function
 # boundary. Within one callee body, if the param is BOTH applied

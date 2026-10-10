@@ -96,6 +96,7 @@ import compiler.perceus_arg_reads
 import compiler.perceus_reads
 import compiler.perceus_read_walk
 import compiler.protos
+import compiler.proto_ids
 import compiler.emit_shared
 import compiler.rec_stamp
 import compiler.head_tag_decl
@@ -666,36 +667,36 @@ pub type AmbigEntry = AmbE(String, [String])
 # is unique. Iteration is O(|fns|^2) — fine, |fns| stays in the
 # low thousands even with the full core chain loaded.
 #[doc("return one AmbigEntry per name N that is exported by two or more modules and has no root-file definition. Only such names are ambiguous at a bare-name call site — when a root…")]
-pub fn find_ambig_efns(fns: [EFn], target_origin: Option[String]) : [AmbigEntry] =
-  find_ambig_loop(fns, target_origin, [], [])
+pub fn find_ambig_efns(fns: [EFn], target_origin: Option[String], ids: ProtoIds) : [AmbigEntry] =
+  find_ambig_loop(fns, target_origin, ids, [], [])
 
-fn find_ambig_loop(fns: [EFn], target_origin: Option[String], seen: [String], acc: [AmbigEntry]) : [AmbigEntry] {
+fn find_ambig_loop(fns: [EFn], target_origin: Option[String], ids: ProtoIds, seen: [String], acc: [AmbigEntry]) : [AmbigEntry] {
   match fns {
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
-      EFn(n, _, _, _, _) ->
+      EFn(n, _, _, _, fid) ->
         # Protocol dispatchers are one per (op, home) by construction;
         # the receiver picks among them, so they are never a bare-name
         # ambiguity.
-        if list_has(seen, n) or is_proto_dispatcher_name(n) {
-          find_ambig_loop(rest, target_origin, seen, acc)
+        if list_has(seen, n) or pid_is_disp(ids, fnid_sym(fid)) {
+          find_ambig_loop(rest, target_origin, ids, seen, acc)
         } else {
           let cands = efn_collect_matching(fns, n, [])
           let count = list_length(cands)
-          if count <= 1 { find_ambig_loop(rest, target_origin, [n, ...seen], acc) }
+          if count <= 1 { find_ambig_loop(rest, target_origin, ids, [n, ...seen], acc) }
           else {
             match efn_pick_root(cands, target_origin) {
-              Some(_) -> find_ambig_loop(rest, target_origin, [n, ...seen], acc)
+              Some(_) -> find_ambig_loop(rest, target_origin, ids, [n, ...seen], acc)
               None    -> {
                 let mods = ambig_mods_of(cands, [])
                 # Issue #335: if the calling file (the target) exports
                 # this name itself, the file-local rule resolves the
                 # ambiguity inside that file's bodies — no warning.
                 if mods_contain_target(mods, target_origin) {
-                  find_ambig_loop(rest, target_origin, [n, ...seen], acc)
+                  find_ambig_loop(rest, target_origin, ids, [n, ...seen], acc)
                 } else {
                   let entry = AmbE(n, mods)
-                  find_ambig_loop(rest, target_origin, [n, ...seen], [entry, ...acc])
+                  find_ambig_loop(rest, target_origin, ids, [n, ...seen], [entry, ...acc])
                 }
               }
             }
@@ -10481,27 +10482,27 @@ fn mk_proto_dispatch_body(pname: String, opname: String, line: Int, col: Int) : 
 # qualified-call resolver reads `pa.Node` against the module table and
 # a local `pa` that shadows module `pa` loses its projection.
 type InterpCtx = { op_names: [String],
-                   file: String, cs: CSCtx, show_home: Option[String],
+                   file: String, cs: CSCtx, show: Option[ExprKind],
                    ts: Option[TSCtx], es: Option[ESCtx], locals: [String] }
 
-#[doc("Emit-layer entry point desugar_interp_decls. `show_home` is the core module whose `Show` every user-side `#{...}` binds to (`None` leaves the op bare); `cores` names the core modules, whose own interpolations stay bare — they are typed before that module's dispatchers exist. `ts_coll`/`es_coll` are the contested type/effect tables the freshly-parsed interp fragments respell against.")]
+#[doc("Emit-layer entry point desugar_interp_decls. `show` names the dispatcher of the core `Show` every `#{...}` calls: user code reaches it through its home, so only that home's protocols answer; `None` leaves the op a bare name. `cores` names the core modules, whose own interpolations reach it bare — they are typed before that module's dispatchers exist. `ts_coll`/`es_coll` are the contested type/effect tables the freshly-parsed interp fragments respell against.")]
 pub fn desugar_interp_decls(ds: [Decl], op_names: [String],
       global_mt: [ModuleEntry], scopes: [ModScope], coll: [NEnt],
       ts_coll: [TSEntry], es_coll: [ESEntry], tab: SymTab, views: FileViews,
-      target: String, file: String, show_home: Option[String],
+      target: String, file: String, show: Option[ShowRef],
       cores: [String]) : [Decl] / Console + File {
 
   if not list_has(op_names, "show") { ds }
   else { desugar_interp_decls_loop(ds, op_names, global_mt, scopes,
                                     coll, ts_coll, es_coll, tab, views,
                                     scope_imports(scopes, global_mt),
-                                    target, file, show_home, cores, target, []) }
+                                    target, file, show, cores, target, []) }
 }
 
 fn desugar_interp_decls_loop(ds: [Decl], op_names: [String],
       global_mt: [ModuleEntry], scopes: [ModScope], coll: [NEnt],
       ts_coll: [TSEntry], es_coll: [ESEntry], tab: SymTab, views: FileViews, imps: [ModImports],
-      target: String, file: String, show_home: Option[String], cores: [String],
+      target: String, file: String, show: Option[ShowRef], cores: [String],
       cur: String, acc: [Decl]) : [Decl] / Console + File {
 
   match ds {
@@ -10513,7 +10514,7 @@ fn desugar_interp_decls_loop(ds: [Decl], op_names: [String],
                            cs: CSCtx { coll: coll, home: home, target: target,
                                        free: false,
                                        mt: ms_table(scopes, seg, global_mt) },
-                           show_home: if list_has(cores, home) { None } else { show_home },
+                           show: interp_show_from(show, list_has(cores, home)),
                            ts: if list_length(ts_coll) == 0 { None }
                                else { Some(ts_ctx(ts_coll, home, target, cores, scopes, global_mt, imps, [])) },
                            es: if list_length(es_coll) == 0 { None }
@@ -10521,7 +10522,7 @@ fn desugar_interp_decls_loop(ds: [Decl], op_names: [String],
                            locals: [] }
       desugar_interp_decls_loop(rest, op_names, global_mt, scopes,
                                 coll, ts_coll, es_coll, tab, views, imps,
-                                target, file, show_home, cores, home,
+                                target, file, show, cores, home,
                                 [desugar_interp_decl(d, cx), ...acc])
     }
   }
@@ -10530,7 +10531,7 @@ fn desugar_interp_decls_loop(ds: [Decl], op_names: [String],
 # `cx` with `names` added to the lexical scope the spans below sit in.
 fn interp_bind(cx: InterpCtx, names: [String]) : InterpCtx =
   InterpCtx { op_names: cx.op_names, file: cx.file,
-              cs: cx.cs, show_home: cx.show_home, ts: cx.ts, es: cx.es,
+              cs: cx.cs, show: cx.show, ts: cx.ts, es: cx.es,
               locals: list_append(names, cx.locals) }
 
 fn desugar_interp_decl(d: Decl, cx: InterpCtx) : Decl / Console + File {
@@ -10824,17 +10825,27 @@ fn interp_part_to_expr(p: IPart, pos: InterpPos, cx: InterpCtx,
                      cx)
         None    -> mk_expr(EStr("\"\"", false), line, col)
       }
-      # The dispatcher name is what the post-inference rewrite
-      # recognises. Homed at the core `Show`: a user protocol with a
-      # `show` op must not capture the interpolation inside its own module.
-      let disp = proto_dispatcher_name("show")
-      let callee = match cx.show_home {
-        Some(h) -> EModCall(h, disp)
-        None    -> EVar(disp)
-      }
-      mk_expr(ECall(mk_expr(callee, line, col), [inner]), line, col)
+      mk_expr(ECall(mk_expr(interp_show_callee(cx), line, col), [inner]), line, col)
     }
   }
+}
+
+# The dispatcher a `#{...}` calls. User code names it through its home:
+# a qualified reference dispatches among that home's protocols only, so a
+# user protocol with a `show` op never captures the interpolation, not
+# even inside its own module. A bare reference to the same dispatcher
+# would dispatch among every protocol declaring `show`, which is what a
+# core module's own interpolation means.
+fn interp_show_from(show: Option[ShowRef], in_core: Bool) : Option[ExprKind] = match show {
+  Some(ShowRef(homed, bare)) -> Some(if in_core { bare } else { homed })
+  None                       -> None
+}
+
+# With no core `Show` the op stays the name any protocol declaring `show`
+# answers to.
+fn interp_show_callee(cx: InterpCtx) : ExprKind = match cx.show {
+  Some(k) -> k
+  None    -> EVar(proto_dispatcher_name("show"))
 }
 
 # ====================================================================

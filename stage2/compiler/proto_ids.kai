@@ -1,0 +1,192 @@
+#[doc("""
+The functions the protocol lowering generates, by id.
+
+A protocol operation lowers to a dispatcher and an impl method to a
+function of its own. Both are ordinary function declarations, so each
+has the id the symbol table derives for its name and home. The lowering
+records those ids as it mints the names, and a pass holding a callee
+asks this table what it is: the answer is never read back out of a
+spelling.
+
+A dispatcher stands for an operation, not for one protocol: every
+protocol of its home that declares the operation shares it, and all of
+them declare it at the dispatcher's arity. Which protocols a call may
+reach is the caller's question; the table only says which operation, of
+which home.
+
+What the table knows of a dispatcher is filed under its id and holds
+none: a reader that has the description came through the id.
+
+A reference the resolver left to the type carries no id. `pid_bare_disp`
+serves that one case too: it finds a dispatcher the bare name can
+denote, the way a scope lookup finds candidates, and reads nothing from
+the name's shape.
+
+The table holds no array, so it rides in the typer's state without
+making that state a carrier of mutation.
+""")]
+
+import compiler.ast
+import compiler.decl_names
+import compiler.symtab_build
+
+#[doc("The table that holds no generated function.")]
+pub fn pid_empty() : ProtoIds = ProtoIds { disps: IdLeaf, named: [], shared: [], impls: IdLeaf }
+
+#[doc("The id of the generated function `name` homed at `home` (`None` for the root file, whose module is `root`).")]
+pub fn pid_fn_id(name: String, home: Option[String], root: String) : SymId =
+  sym_derive(NCFn, name, match home { Some(m) -> m  None -> root })
+
+#[doc("`ids` with the dispatcher `name` recorded for the operation `op` of arity `arity` that the protocol `proto` of `home` declares. A dispatcher another protocol of that home already generated gains `proto` as one more protocol sharing it.")]
+pub fn pid_note_disp(ids: ProtoIds, name: String, op: String, home: Option[String], arity: Int,
+                     proto: SymId, root: String) : ProtoIds = {
+  let s = pid_fn_id(name, home, root)
+  let shared = [ProtoDisp(proto, s), ...ids.shared]
+  if pid_is_disp(ids, s) { ProtoIds { disps: ids.disps, named: ids.named, shared: shared, impls: ids.impls } }
+  else {
+    let d = DispInfo(name, op, home, arity)
+    ProtoIds { disps: idt_put(ids.disps, sym_raw(s), d), named: [d, ...ids.named], shared: shared, impls: ids.impls }
+  }
+}
+
+#[doc("`ids` over the impl entries `impls`: the table of a registry whose entries were lowered, renamed or rebuilt. `root` is the module of the root file.")]
+pub fn pid_with_impls(ids: ProtoIds, impls: [ProtoImplReg], root: String) : ProtoIds =
+  ProtoIds { disps: ids.disps, named: ids.named, shared: ids.shared, impls: pid_index_impls(impls, root, IdLeaf) }
+
+fn pid_index_impls(impls: [ProtoImplReg], root: String, t: IdTree[ProtoImplReg]) : IdTree[ProtoImplReg] = match impls {
+  [] -> t
+  [p, ...rest] -> match p {
+    PIR(_, _, _, name, _, _, home, _, _) ->
+      pid_index_impls(rest, root, idt_put(t, sym_raw(pid_fn_id(name, home, root)), p))
+  }
+}
+
+# The first row put under a key keeps it.
+fn idt_put(t: IdTree[a], k: Int, v: a) : IdTree[a] = match t {
+  IdLeaf -> IdNode(IdLeaf, k, v, IdLeaf)
+  IdNode(l, nk, nv, r) ->
+    if k < nk { IdNode(idt_put(l, k, v), nk, nv, r) }
+    else if k > nk { IdNode(l, nk, nv, idt_put(r, k, v)) }
+    else { t }
+}
+
+fn idt_get(t: IdTree[a], k: Int) : Option[a] = match t {
+  IdLeaf -> None
+  IdNode(l, nk, nv, r) ->
+    if k < nk { idt_get(l, k) }
+    else if k > nk { idt_get(r, k) }
+    else { Some(nv) }
+}
+
+#[doc("The name a dispatcher is declared with: emission text, and what a reference to it is written as.")]
+pub fn disp_name(d: DispInfo) : String = match d { DispInfo(n, _, _, _) -> n }
+
+#[doc("The operation a dispatcher stands for.")]
+pub fn disp_op(d: DispInfo) : String = match d { DispInfo(_, op, _, _) -> op }
+
+#[doc("The home of a dispatcher and of the protocols that share it; `None` for the root file.")]
+pub fn disp_home(d: DispInfo) : Option[String] = match d { DispInfo(_, _, h, _) -> h }
+
+#[doc("The arity of the operation a dispatcher stands for.")]
+pub fn disp_arity(d: DispInfo) : Int = match d { DispInfo(_, _, _, a) -> a }
+
+#[doc("What the lowering recorded of the dispatcher whose id is `s`, or `None` when `s` is any other symbol.")]
+pub fn pid_disp(ids: ProtoIds, s: SymId) : Option[DispInfo] =
+  if sym_raw(s) < 0 { None } else { idt_get(ids.disps, sym_raw(s)) }
+
+#[doc("The registry entry of the impl method whose id is `s`, or `None` when `s` is any other symbol.")]
+pub fn pid_impl(ids: ProtoIds, s: SymId) : Option[ProtoImplReg] =
+  if sym_raw(s) < 0 { None } else { idt_get(ids.impls, sym_raw(s)) }
+
+#[doc("True when `s` is the id of a dispatcher.")]
+pub fn pid_is_disp(ids: ProtoIds, s: SymId) : Bool = match pid_disp(ids, s) {
+  Some(_) -> true
+  None    -> false
+}
+
+#[doc("True when `s` is the id of an impl method.")]
+pub fn pid_is_impl(ids: ProtoIds, s: SymId) : Bool = match pid_impl(ids, s) {
+  Some(_) -> true
+  None    -> false
+}
+
+fn pid_no_disp(ids: ProtoIds) : Bool = match ids.disps {
+  IdLeaf -> true
+  _      -> false
+}
+
+#[doc("The dispatcher the qualified reference `m.name` names, or `None`: the function of that name the module `m` declares, when it is one.")]
+pub fn pid_qualified_disp(ids: ProtoIds, m: String, name: String) : Option[DispInfo] =
+  if pid_no_disp(ids) { None } else { pid_disp(ids, sym_derive(NCFn, name, m)) }
+
+#[doc("True when the qualified reference `m.name` names a dispatcher.")]
+pub fn pid_qualified_is_disp(ids: ProtoIds, m: String, name: String) : Bool = match pid_qualified_disp(ids, m, name) {
+  Some(_) -> true
+  None    -> false
+}
+
+#[doc("The dispatcher a bare reference names: by its id, or, for a name the resolver left to the type because protocols of several homes declare its operation, a dispatcher that name can denote. Every candidate stands for that one operation.")]
+pub fn pid_bare_disp(ids: ProtoIds, f: Expr) : Option[DispInfo] = match f.kind {
+  ESym(s, _, _) -> pid_disp(ids, s)
+  EVar(name)    -> pid_named_disp(ids, name)
+  _             -> None
+}
+
+#[doc("A dispatcher the unresolved name `name` can denote, or `None`.")]
+pub fn pid_named_disp(ids: ProtoIds, name: String) : Option[DispInfo] = pid_named_in(ids.named, name)
+
+#[doc("The dispatcher a reference names, bare or qualified; `None` for anything else.")]
+pub fn pid_ref_disp(ids: ProtoIds, f: Expr) : Option[DispInfo] = match f.kind {
+  EModCall(m, n) -> pid_qualified_disp(ids, m, n)
+  _              -> pid_bare_disp(ids, f)
+}
+
+fn pid_named_in(ds: [DispInfo], name: String) : Option[DispInfo] = match ds {
+  [] -> None
+  [d, ...rest] -> if disp_name(d) == name { Some(d) } else { pid_named_in(rest, name) }
+}
+
+#[doc("The id of the dispatcher of the operation `op` the protocol `proto` declares, or `None` when it declares none.")]
+pub fn pid_op_disp(ids: ProtoIds, proto: SymId, op: String) : Option[SymId] =
+  if sym_raw(proto) < 0 { None } else { pid_op_in(ids, ids.shared, proto, op) }
+
+fn pid_op_in(ids: ProtoIds, ps: [ProtoDisp], proto: SymId, op: String) : Option[SymId] = match ps {
+  [] -> None
+  [ProtoDisp(p, s), ...rest] ->
+    if sym_raw(p) == sym_raw(proto) and pid_stands_for(ids, s, op) { Some(s) } else { pid_op_in(ids, rest, proto, op) }
+}
+
+fn pid_stands_for(ids: ProtoIds, s: SymId, op: String) : Bool = match pid_disp(ids, s) {
+  Some(d) -> disp_op(d) == op
+  None    -> false
+}
+
+#[doc("A bare reference to the dispatcher `s`, born with its id; `None` when `s` is no dispatcher.")]
+pub fn pid_disp_ref(ids: ProtoIds, s: SymId) : Option[ExprKind] = match pid_disp(ids, s) {
+  Some(d) -> Some(ESym(s, spec_none(), disp_name(d)))
+  None    -> None
+}
+
+#[doc("A reference to the dispatcher `s` through its home, which only that home's protocols answer; the bare reference for a dispatcher of the root file, which has no qualifier. `None` when `s` is no dispatcher.")]
+pub fn pid_disp_homed_ref(ids: ProtoIds, s: SymId) : Option[ExprKind] = match pid_disp(ids, s) {
+  Some(d) -> match disp_home(d) {
+    Some(h) -> Some(EModCall(h, disp_name(d)))
+    None    -> Some(ESym(s, spec_none(), disp_name(d)))
+  }
+  None -> None
+}
+
+#[doc("A bare reference to the dispatcher of the operation `op` the protocol `proto` declares, or `None` when it declares none.")]
+pub fn pid_op_ref(ids: ProtoIds, proto: SymId, op: String) : Option[ExprKind] = match pid_op_disp(ids, proto, op) {
+  Some(s) -> pid_disp_ref(ids, s)
+  None    -> None
+}
+
+#[doc("What the typer reads of the protocol registry: the impl entries, and the generated functions by id.")]
+pub type ProtoView = { impls: [ProtoImplReg], ids: ProtoIds }
+
+#[doc("The view of a program with no protocol.")]
+pub fn pv_empty() : ProtoView = ProtoView { impls: [], ids: pid_empty() }
+
+#[doc("The typer's view of the registry `reg`.")]
+pub fn pv_of(reg: ProtocolReg) : ProtoView = ProtoView { impls: reg.impls, ids: reg.ids }

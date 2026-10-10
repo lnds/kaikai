@@ -93,6 +93,7 @@ import compiler.util
 import compiler.fnreg
 import compiler.impl_index
 import compiler.impl_identity
+import compiler.proto_ids
 import compiler.scope_view
 import compiler.modules
 import compiler.proto_key
@@ -316,7 +317,8 @@ fn proto_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
 
 fn proto_reg_empty() : ProtocolReg =
   ProtocolReg { ops: [], impls: [], op_names: [], tparams: [], origins: [],
-                dkeys: [], impl_index: impl_index_empty(), cores: [], imports: [], root: "" }
+                dkeys: [], impl_index: impl_index_empty(), cores: [], imports: [], root: "",
+                ids: pid_empty() }
 
 # m12.8: the type-mangling used in the impl-fn name. Walks a
 # TypeExpr, collapsing it down to the head TyName (so `Money[u]`,
@@ -384,10 +386,6 @@ fn arg_names_mangle(args: [String]) : String = match args {
 #[doc("kaikai name of the polymorphic dispatcher DFn for protocol op `op` (`__proto_<op>`).")]
 pub fn proto_dispatcher_name(op: String) : String = concat_all(["__proto_", op])
 
-#[doc("True when `name` is a synthesised protocol dispatcher (`__proto_<op>`).")]
-pub fn is_proto_dispatcher_name(name: String) : Bool =
-  strip_proto_dispatcher_prefix(name) != name
-
 # A decl's home canonicalised the way the registry stores it: the
 # root file's module name becomes `None`, matching the rest of the
 # root file's untagged decls.
@@ -411,7 +409,7 @@ fn collect_proto_decls(ds: [Decl], reg: ProtocolReg, ps: PScope) : ProtocolReg {
           origins: [PrOR(name, mo, is_pub, psym), ...reg.origins],
           dkeys: reg.dkeys,
           impl_index: reg.impl_index,
-          cores: reg.cores, imports: reg.imports, root: reg.root
+          cores: reg.cores, imports: reg.imports, root: reg.root, ids: reg.ids
         }
         collect_proto_decls(rest, register_proto_ops(reg1, name, mo, psym, ops), ps)
       }
@@ -450,7 +448,7 @@ fn register_proto_ops(reg: ProtocolReg, proto: String, mo: Option[String],
           origins: reg.origins,
           dkeys: reg.dkeys,
           impl_index: reg.impl_index,
-          cores: reg.cores, imports: reg.imports, root: reg.root
+          cores: reg.cores, imports: reg.imports, root: reg.root, ids: reg.ids
         }
         register_proto_ops(reg1, proto, mo, psym, rest)
       }
@@ -485,18 +483,21 @@ fn proto_op_lookup_loop(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] 
 fn proto_ops_lookup_all(reg: ProtocolReg, name: String) : [ProtoOpReg] =
   proto_ops_lookup_all_loop(reg.ops, name)
 
-#[doc("The core module declaring a protocol with op `opname`, or `None`. The interpolation sugar binds `#{...}` to that `Show`, never to a user protocol that happens to declare `show`.")]
-pub fn proto_core_op_home(reg: ProtocolReg, opname: String,
-                          cores: [String]) : Option[String] =
-  pcoh_loop(proto_ops_lookup_all(reg, opname), cores)
+#[doc("How a `#{...}` names the dispatcher of the core `Show`: through its home, as user code does, and bare, as a core module does.")]
+pub type ShowRef = ShowRef(ExprKind, ExprKind)
 
-fn pcoh_loop(ops: [ProtoOpReg], cores: [String]) : Option[String] = match ops {
-  [] -> None
-  [POR(_, _, _, _, _, _, mo, _), ...rest] -> match mo {
-    Some(m) -> if list_has(cores, m) { mo } else { pcoh_loop(rest, cores) }
-    None    -> pcoh_loop(rest, cores)
+#[doc("The references to the dispatcher of the core `Show`'s `show`, or `None` when no core module declares that protocol. The interpolation sugar binds `#{...}` to it, never to a user protocol that happens to declare `show`.")]
+pub fn proto_core_show(reg: ProtocolReg, cores: [String]) : Option[ShowRef] =
+  match pid_op_disp(reg.ids, core_proto_id(CpShow), "show") {
+    None    -> None
+    Some(s) -> match pid_disp(reg.ids, s) {
+      None    -> None
+      Some(d) -> match disp_home(d) {
+        Some(h) -> if list_has(cores, h) { Some(ShowRef(EModCall(h, disp_name(d)), ESym(s, spec_none(), disp_name(d)))) } else { None }
+        None    -> None
+      }
+    }
   }
-}
 
 fn proto_ops_lookup_all_loop(ops: [ProtoOpReg], target: String) : [ProtoOpReg] {
   match ops {
@@ -1146,7 +1147,7 @@ fn lower_impl_methods(pkey: String, psym: SymId, tname: String, arg_names: [Stri
           origins: reg.origins,
           dkeys: reg.dkeys,
           impl_index: reg.impl_index,
-          cores: reg.cores, imports: reg.imports, root: reg.root
+          cores: reg.cores, imports: reg.imports, root: reg.root, ids: reg.ids
         }
         lower_impl_methods(pkey, psym, tname, arg_names, home, rest, reg1, [new_fn, ...acc_fns])
       }
@@ -1167,25 +1168,30 @@ fn lower_impl_methods(pkey: String, psym: SymId, tname: String, arg_names: [Stri
 # `stdlib/protocols.kai`) now produce dispatchers tagged with the
 # core's basename so a cache loader can partition post-cascade
 # decls back into their original core/user segments.
-fn generate_dispatchers(reg: ProtocolReg) : [Decl] =
-  generate_dispatchers_loop(reg.ops, op_arities_from_ops(reg.ops), [])
+fn generate_dispatchers(reg: ProtocolReg) : DispGen =
+  generate_dispatchers_loop(reg.ops, op_arities_from_ops(reg.ops), reg.root, DispGen { decls: [], ids: pid_empty() })
 
-fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr],
-                                acc: [Decl]) : [Decl] {
+# The dispatchers, and the id table that records each one as it is minted.
+type DispGen = { decls: [Decl], ids: ProtoIds }
+
+fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr], root: String,
+                                acc: DispGen) : DispGen {
   match ops {
     [] -> acc
     [op, ...rest] -> match op {
-      POR(pname, opname, params, ret, line, col, mo, _) -> {
+      POR(pname, opname, params, ret, line, col, mo, psym) -> {
         # Dedup by the arity-resolved dispatcher NAME, not the bare op
         # name: an arity-ambiguous op (`f/1` + `f/2`) yields two
         # distinct dispatcher names, so both survive; same-arity
-        # collisions still collapse to one shared dispatcher.
+        # collisions still collapse to one shared dispatcher, which
+        # every protocol declaring the op then shares.
         let disp = proto_dispatcher_name_at(arities, opname, list_length(params))
-        let already = dispatcher_named_in_acc(acc, disp, mo)
-        if already { generate_dispatchers_loop(rest, arities, acc) }
+        let already = dispatcher_named_in_acc(acc.decls, disp, mo)
+        let ids = pid_note_disp(acc.ids, disp, opname, mo, list_length(params), psym, root)
+        if already { generate_dispatchers_loop(rest, arities, root, DispGen { decls: acc.decls, ids: ids }) }
         else {
           let stub = make_dispatcher_fn(pname, opname, disp, params, ret, line, col, mo)
-          generate_dispatchers_loop(rest, arities, [stub, ...acc])
+          generate_dispatchers_loop(rest, arities, root, DispGen { decls: [stub, ...acc.decls], ids: ids })
         }
       }
     }
@@ -3470,7 +3476,8 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # typer can resolve the call as ordinary polymorphic dispatch; the
   # post-inference rewrite redirects each reachable call to the
   # matching `__pimpl_*` direct call.
-  let dispatchers = generate_dispatchers(lower_res.reg)
+  let disp_gen = generate_dispatchers(lower_res.reg)
+  let dispatchers = disp_gen.decls
   # Step 6 — drop DProtocol / DImpl / DDerive from the decl stream.
   let stripped = strip_protocols(expanded)
   # Two homonymous types' impls mint one symbol; the root entry's is
@@ -3479,7 +3486,7 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   let final_decls = decls_with_renames(list_append(stripped, list_append(lower_res.fns, dispatchers)), renames)
   # Index the now-final impl table once; the post-inference rewrite's
   # per-spec scans consult it instead of walking `reg.impls` linearly.
-  let indexed_reg = reg_with_impl_index(reg_with_renames(lower_res.reg, renames))
+  let indexed_reg = reg_with_ids(reg_with_impl_index(reg_with_renames(lower_res.reg, renames)), disp_gen.ids)
   let derived = match exp { Expanded(_, ds) -> derived_impl_syms(ds, reg0, ps, renames) }
   LoweredProtocols { decls: final_decls, reg: indexed_reg, errs: errs, diags: diags, derived: derived }
 }
@@ -3494,7 +3501,7 @@ fn reg_without_impls(reg: ProtocolReg) : ProtocolReg =
   ProtocolReg { ops: reg.ops, impls: [], op_names: reg.op_names,
                 tparams: reg.tparams, origins: reg.origins, dkeys: reg.dkeys,
                 impl_index: reg.impl_index, cores: reg.cores,
-                imports: reg.imports, root: reg.root }
+                imports: reg.imports, root: reg.root, ids: reg.ids }
 
 # Attach a freshly-built `ImplIndex` to a finalised registry. The impl
 # table is immutable past this point, so the index built here serves
@@ -3504,7 +3511,12 @@ fn reg_with_impl_index(reg: ProtocolReg) : ProtocolReg =
                 tparams: reg.tparams, origins: reg.origins,
                 dkeys: reg.dkeys,
                 impl_index: build_impl_index(reg.impls), cores: reg.cores,
-                imports: reg.imports, root: reg.root }
+                imports: reg.imports, root: reg.root, ids: reg.ids }
+
+# The id of every function the lowering generated: the dispatchers as
+# they were minted, the impl methods under their final symbols.
+fn reg_with_ids(reg: ProtocolReg, disps: ProtoIds) : ProtocolReg =
+  ProtocolReg { ...reg, ids: pid_with_impls(disps, reg.impls, reg.root) }
 
 # Dispatch identity comes from the symbol table: the protocols the
 # stream declares, keyed by whether the table holds a second home for
@@ -3514,7 +3526,8 @@ fn reg_with_scope(reg: ProtocolReg, cores: [String],
   ProtocolReg { ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
                 tparams: reg.tparams, origins: reg.origins,
                 dkeys: pk_table(ps_tab(ps), ps_view(ps, None), ps_root(ps)),
-                impl_index: reg.impl_index, cores: cores, imports: imports, root: ps_root(ps) }
+                impl_index: reg.impl_index, cores: cores, imports: imports, root: ps_root(ps),
+                ids: reg.ids }
 
 #[doc("A protocol operation's (name, arity): what names its dispatcher.")]
 pub type OpAr = OpAr(String, Int)
@@ -3675,23 +3688,10 @@ fn proto_rewrite_corrected_ty(kind: ExprKind, cur_ty: Option[Ty], reg: ProtocolR
   }
 }
 
-# The impl a callee names by its symbol, unique per impl.
+# The impl a callee names: the entry its id was generated from.
 fn prc_callee_impl(callee: Expr, reg: ProtocolReg) : Option[ProtoImplReg] = match callee.kind {
-  EVar(sym)       -> prc_impl_named(reg, sym)
-  ESym(s, _, sym) -> if sym_is_local(s) { None } else { prc_impl_named(reg, sym) }
-  _               -> None
-}
-
-fn prc_impl_named(reg: ProtocolReg, sym: String) : Option[ProtoImplReg] =
-  pir_by_sym(if ii_built(reg.impl_index) { ii_sym_bucket(reg.impl_index, sym) } else { reg.impls }, sym)
-
-# The registered impl whose fn symbol is `sym`; none when `sym` is not
-# an impl symbol. Impl symbols are unique, so the first hit is the one.
-fn pir_by_sym(impls: [ProtoImplReg], sym: String) : Option[ProtoImplReg] {
-  match impls {
-    [] -> None
-    [it, ...rest] -> if pir_sym(it) == sym { Some(it) } else { pir_by_sym(rest, sym) }
-  }
+  ESym(s, _, _) -> pid_impl(reg.ids, s)
+  _             -> None
 }
 
 fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
@@ -4100,36 +4100,31 @@ fn validate_proto_call_at(e: Expr, reg: ProtocolReg, cm: Option[String], file: S
 
 
   match e.kind {
-    ECall(callee, args_) -> match validate_dispatcher_callee(callee) {
-      Some(name) -> {
-        let opname = strip_proto_dispatcher_prefix(name)
-        # Only inspect calls that survived the rewrite as
-        # `__proto_<op>(...)` (the prefix-strip yields a different
-        # name) AND whose op is one of our registered protocol ops.
-        if name == opname { errs }
-        else if not list_has(reg.op_names, opname) { errs }
-        else {
-          match args_ {
-            [] -> errs
-            [self_arg, ..._rest_args] -> match self_arg.ty {
+    # Only a call that survived the rewrite as a dispatcher call is
+    # inspected.
+    ECall(callee, args_) -> match pid_ref_disp(reg.ids, callee) {
+      Some(row) -> {
+        let opname = disp_op(row)
+        match args_ {
+          [] -> errs
+          [self_arg, ..._rest_args] -> match self_arg.ty {
+            None -> errs
+            Some(ty) -> match ty_disp_head(ty) {
               None -> errs
-              Some(ty) -> match ty_disp_head(ty) {
-                None -> errs
-                # Collision-aware: an impl under ANY protocol declaring
-                # `opname` clears the call (the bare name carries no
-                # protocol, so `Ring.add` and `Add.add` are both valid
-                # targets for `add`).
-                Some(h) -> match find_impl_any_proto(reg, opname, h, cm) {
-                  Some(_) -> validate_dispatch_unique(e, args_, reg, cm, opname, file, errs)
-                  None -> {
-                    let pname = first_proto_of_op(reg, opname)
-                    let d = mk_diag(SevError, file, e.line, e.col,
-                      concat_all(["no impl of `", pname,
-                                  "` for type `", dh_name(h),
-                                  "` (operation `", opname, "`)"]), [])
-                    render_diag(d)
-                    push_diag(errs, d)
-                  }
+              # Collision-aware: an impl under ANY protocol declaring
+              # `opname` clears the call (the bare name carries no
+              # protocol, so `Ring.add` and `Add.add` are both valid
+              # targets for `add`).
+              Some(h) -> match find_impl_any_proto(reg, opname, h, cm) {
+                Some(_) -> validate_dispatch_unique(e, args_, reg, cm, opname, file, errs)
+                None -> {
+                  let pname = first_proto_of_op(reg, opname)
+                  let d = mk_diag(SevError, file, e.line, e.col,
+                    concat_all(["no impl of `", pname,
+                                "` for type `", dh_name(h),
+                                "` (operation `", opname, "`)"]), [])
+                  render_diag(d)
+                  push_diag(errs, d)
                 }
               }
             }
@@ -4155,14 +4150,6 @@ fn validate_dispatch_unique(e: Expr, args_: [Expr], reg: ProtocolReg, cm: Option
   } else { errs }
 }
 
-# A residual dispatcher call names its dispatcher bare or, when the
-# typer picked among same-named dispatchers, module-qualified.
-fn validate_dispatcher_callee(callee: Expr) : Option[String] = match callee.kind {
-  EVar(name)        -> Some(name)
-  ESym(_, _, name)     -> Some(name)
-  EModCall(_, name) -> Some(name)
-  _                 -> None
-}
 
 # ====================================================================
 # m12.8.x post-Core REOPEN — Eric level 2: rep invariant verifiers
@@ -4199,12 +4186,12 @@ fn validate_dispatcher_callee(callee: Expr) : Option[String] = match callee.kind
 # before perceus / monomorph / emit.
 
 #[doc("Pass C: Eric level-2 rep-invariant verifier over the typed program.")]
-pub fn validate_typer_invariants(typed: TypedProgram, file: String) : Int / Console + File =
+pub fn validate_typer_invariants(typed: TypedProgram, ids: ProtoIds, file: String) : Int / Console + File =
 
 
-  validate_inv_decls(typed.decls, file, 0)
+  validate_inv_decls(typed.decls, ids, file, 0)
 
-fn validate_inv_decls(ds: [Decl], file: String, errs: Int) : Int / Console + File {
+fn validate_inv_decls(ds: [Decl], ids: ProtoIds, file: String, errs: Int) : Int / Console + File {
 
 
   match ds {
@@ -4213,19 +4200,19 @@ fn validate_inv_decls(ds: [Decl], file: String, errs: Int) : Int / Console + Fil
       let e1 = match d {
         DFn(_, _, _, ps, _, _, body, _, _, _, fsym) -> {
           let bound0 = inv_param_names(ps, [])
-          validate_inv_expr(body, file, bound0, errs)
+          validate_inv_expr(body, ids, file, bound0, errs)
         }
         DTest(_, body, _, _, _) ->
-          validate_inv_expr(body, file, [], errs)
+          validate_inv_expr(body, ids, file, [], errs)
         DBench(_, body, _, _, _) ->
-          validate_inv_expr(body, file, [], errs)
+          validate_inv_expr(body, ids, file, [], errs)
         DCheck(_, ps, body, _, _, _) -> {
           let bound0 = inv_param_names(ps, [])
-          validate_inv_expr(body, file, bound0, errs)
+          validate_inv_expr(body, ids, file, bound0, errs)
         }
         _ -> errs
       }
-      validate_inv_decls(rest, file, e1)
+      validate_inv_decls(rest, ids, file, e1)
     }
   }
 }
@@ -4275,7 +4262,7 @@ fn inv_pfields_names(fs: [PField], acc: [String]) : [String] {
   }
 }
 
-fn validate_inv_expr(e: Expr, file: String, bound: [String], errs: Int) : Int / Console + File {
+fn validate_inv_expr(e: Expr, ids: ProtoIds, file: String, bound: [String], errs: Int) : Int / Console + File {
 
 
   # Invariant (a) — "every Expr has Some(ty) post-finalise" — was
@@ -4288,31 +4275,28 @@ fn validate_inv_expr(e: Expr, file: String, bound: [String], errs: Int) : Int / 
   # exist. Deferred until that tracker is justified — the original
   # bug class (`10a1e7b`, discarded typed clause body) is already
   # covered by the audit done in `7bd5a68`.
-  let e_bc = validate_inv_kind(e.kind, e.ty, file, e.line, e.col, bound, errs)
-  validate_inv_subexprs(e.kind, file, bound, e_bc)
+  let e_bc = validate_inv_kind(e.kind, e.ty, ids, file, e.line, e.col, bound, errs)
+  validate_inv_subexprs(e.kind, ids, file, bound, e_bc)
 }
 
-fn validate_inv_kind(k: ExprKind, ty: Option[Ty], file: String,
+fn validate_inv_kind(k: ExprKind, ty: Option[Ty], ids: ProtoIds, file: String,
                       line: Int, col: Int, bound: [String], errs: Int) : Int / Console + File {
 
 
   match k {
-    EVar(name) -> {
-      let opname = strip_proto_dispatcher_prefix(name)
-      # Invariant (b): every `EVar(__proto_X)` reference has `X`
-      # outside every enclosing binder. Catches the scope-blind
-      # `rename_proto_calls` pattern (`257b247`).
-      # Only check references that are dispatcher-shaped
-      # (`__proto_X`); a bare user identifier whose name happens to
-      # match a binder is fine.
-      if name == opname { errs }
-      else if list_has(bound, opname) {
-        diag_error(file, line, col,
-          concat_all(["rep invariant (b): protocol-dispatcher reference `",
-                      name, "` shadows local binder `", opname,
-                      "` in scope (rename pass missed scope tracking)"]))
-        errs + 1
-      } else { errs }
+    # Invariant (b): a dispatcher reference the resolver left bare has
+    # its operation outside every enclosing binder. A bare user
+    # identifier whose name happens to match a binder is fine.
+    EVar(name) -> match pid_named_disp(ids, name) {
+      None -> errs
+      Some(row) ->
+        if list_has(bound, disp_op(row)) {
+          diag_error(file, line, col,
+            concat_all(["rep invariant (b): protocol-dispatcher reference `",
+                        name, "` shadows local binder `", disp_op(row),
+                        "` in scope (rename pass missed scope tracking)"]))
+          errs + 1
+        } else { errs }
     }
     # Invariant (c) — "every `synth_lambda`-produced TyFnT has open
     # row tail" — was attempted as a post-finalise check on
@@ -4330,93 +4314,93 @@ fn validate_inv_kind(k: ExprKind, ty: Option[Ty], file: String,
   }
 }
 
-fn validate_inv_subexprs(k: ExprKind, file: String, bound: [String], errs: Int) : Int / Console + File {
+fn validate_inv_subexprs(k: ExprKind, ids: ProtoIds, file: String, bound: [String], errs: Int) : Int / Console + File {
 
 
   match k {
     ECall(c, xs) -> {
-      let e1 = validate_inv_expr(c, file, bound, errs)
-      validate_inv_exprs(xs, file, bound, e1)
+      let e1 = validate_inv_expr(c, ids, file, bound, errs)
+      validate_inv_exprs(xs, ids, file, bound, e1)
     }
-    EField(b, _) -> validate_inv_expr(b, file, bound, errs)
+    EField(b, _) -> validate_inv_expr(b, ids, file, bound, errs)
     EIndex(a, b) -> {
-      let e1 = validate_inv_expr(a, file, bound, errs)
-      validate_inv_expr(b, file, bound, e1)
+      let e1 = validate_inv_expr(a, ids, file, bound, errs)
+      validate_inv_expr(b, ids, file, bound, e1)
     }
     EBinop(_, a, b) -> {
-      let e1 = validate_inv_expr(a, file, bound, errs)
-      validate_inv_expr(b, file, bound, e1)
+      let e1 = validate_inv_expr(a, ids, file, bound, errs)
+      validate_inv_expr(b, ids, file, bound, e1)
     }
-    EUnop(_, x) -> validate_inv_expr(x, file, bound, errs)
+    EUnop(_, x) -> validate_inv_expr(x, ids, file, bound, errs)
     EIf(c, t_, eo) -> {
-      let e1 = validate_inv_expr(c, file, bound, errs)
-      let e2 = validate_inv_expr(t_, file, bound, e1)
-      match eo { Some(b) -> validate_inv_expr(b, file, bound, e2) None -> e2 }
+      let e1 = validate_inv_expr(c, ids, file, bound, errs)
+      let e2 = validate_inv_expr(t_, ids, file, bound, e1)
+      match eo { Some(b) -> validate_inv_expr(b, ids, file, bound, e2) None -> e2 }
     }
     EMatch(scr, arms) -> {
-      let e1 = validate_inv_expr(scr, file, bound, errs)
-      validate_inv_arms(arms, file, bound, e1)
+      let e1 = validate_inv_expr(scr, ids, file, bound, errs)
+      validate_inv_arms(arms, ids, file, bound, e1)
     }
     ELambda(ps, body) -> {
       let bound1 = inv_param_names(ps, bound)
-      validate_inv_expr(body, file, bound1, errs)
+      validate_inv_expr(body, ids, file, bound1, errs)
     }
-    ERecordLit(_, _, fis) -> validate_inv_fields(fis, file, bound, errs)
-    EList(els) -> validate_inv_list_elems(els, file, bound, errs)
+    ERecordLit(_, _, fis) -> validate_inv_fields(fis, ids, file, bound, errs)
+    EList(els) -> validate_inv_list_elems(els, ids, file, bound, errs)
     ERange(a, b, sopt) -> {
-      let e1 = validate_inv_expr(a, file, bound, errs)
-      let e2 = validate_inv_expr(b, file, bound, e1)
-      match sopt { Some(s) -> validate_inv_expr(s, file, bound, e2) None -> e2 }
+      let e1 = validate_inv_expr(a, ids, file, bound, errs)
+      let e2 = validate_inv_expr(b, ids, file, bound, e1)
+      match sopt { Some(s) -> validate_inv_expr(s, ids, file, bound, e2) None -> e2 }
     }
     EBlock(stmts, tail) -> {
-      let r = validate_inv_block(stmts, file, bound, errs)
-      match tail { Some(t) -> validate_inv_expr(t, file, r.bound, r.errs) None -> r.errs }
+      let r = validate_inv_block(stmts, ids, file, bound, errs)
+      match tail { Some(t) -> validate_inv_expr(t, ids, file, r.bound, r.errs) None -> r.errs }
     }
     EPipe(a, b) -> {
-      let e1 = validate_inv_expr(a, file, bound, errs)
-      validate_inv_expr(b, file, bound, e1)
+      let e1 = validate_inv_expr(a, ids, file, bound, errs)
+      validate_inv_expr(b, ids, file, bound, e1)
     }
     EMapPipe(a, b) -> {
-      let e1 = validate_inv_expr(a, file, bound, errs)
-      validate_inv_expr(b, file, bound, e1)
+      let e1 = validate_inv_expr(a, ids, file, bound, errs)
+      validate_inv_expr(b, ids, file, bound, e1)
     }
     EFlatMapPipe(a, b) -> {
-      let e1 = validate_inv_expr(a, file, bound, errs)
-      validate_inv_expr(b, file, bound, e1)
+      let e1 = validate_inv_expr(a, ids, file, bound, errs)
+      validate_inv_expr(b, ids, file, bound, e1)
     }
     EFilterPipe(a, b) -> {
-      let e1 = validate_inv_expr(a, file, bound, errs)
-      validate_inv_expr(b, file, bound, e1)
+      let e1 = validate_inv_expr(a, ids, file, bound, errs)
+      validate_inv_expr(b, ids, file, bound, e1)
     }
     EHandle(body, _, _, _, init_opt, alias_opt, clauses, ret_opt) -> {
-      let e0 = match init_opt { Some(ie) -> validate_inv_expr(ie, file, bound, errs) None -> errs }
+      let e0 = match init_opt { Some(ie) -> validate_inv_expr(ie, ids, file, bound, errs) None -> errs }
       let bound_body = match alias_opt { Some(a) -> [a, ...bound] None -> bound }
-      let e1 = validate_inv_expr(body, file, bound_body, e0)
-      let e2 = validate_inv_clauses(clauses, file, bound, e1)
+      let e1 = validate_inv_expr(body, ids, file, bound_body, e0)
+      let e2 = validate_inv_clauses(clauses, ids, file, bound, e1)
       match ret_opt {
         Some(r) -> match r {
-          HR(p, b, _, _) -> validate_inv_expr(b, file, [p, ...bound], e2)
+          HR(p, b, _, _) -> validate_inv_expr(b, ids, file, [p, ...bound], e2)
         }
         None -> e2
       }
     }
-    EBang(inner) -> validate_inv_expr(inner, file, bound, errs)
-    ELitUnit(inner, _) -> validate_inv_expr(inner, file, bound, errs)
+    EBang(inner) -> validate_inv_expr(inner, ids, file, bound, errs)
+    ELitUnit(inner, _) -> validate_inv_expr(inner, ids, file, bound, errs)
     _ -> errs
   }
 }
 
-fn validate_inv_exprs(xs: [Expr], file: String, bound: [String], errs: Int) : Int / Console + File {
+fn validate_inv_exprs(xs: [Expr], ids: ProtoIds, file: String, bound: [String], errs: Int) : Int / Console + File {
 
 
   match xs {
     [] -> errs
-    [h, ...rest] -> validate_inv_exprs(rest, file, bound,
-                                          validate_inv_expr(h, file, bound, errs))
+    [h, ...rest] -> validate_inv_exprs(rest, ids, file, bound,
+                                          validate_inv_expr(h, ids, file, bound, errs))
   }
 }
 
-fn validate_inv_arms(arms: [Arm], file: String, bound: [String], errs: Int) : Int / Console + File {
+fn validate_inv_arms(arms: [Arm], ids: ProtoIds, file: String, bound: [String], errs: Int) : Int / Console + File {
 
 
   match arms {
@@ -4424,27 +4408,27 @@ fn validate_inv_arms(arms: [Arm], file: String, bound: [String], errs: Int) : In
     [a, ...rest] -> match a {
       Arm(p, g, b) -> {
         let bound1 = inv_pat_names(p, bound)
-        let e1 = match g { Some(gx) -> validate_inv_expr(gx, file, bound1, errs) None -> errs }
-        let e2 = validate_inv_expr(b, file, bound1, e1)
-        validate_inv_arms(rest, file, bound, e2)
+        let e1 = match g { Some(gx) -> validate_inv_expr(gx, ids, file, bound1, errs) None -> errs }
+        let e2 = validate_inv_expr(b, ids, file, bound1, e1)
+        validate_inv_arms(rest, ids, file, bound, e2)
       }
     }
   }
 }
 
-fn validate_inv_fields(fs: [FieldInit], file: String, bound: [String], errs: Int) : Int / Console + File {
+fn validate_inv_fields(fs: [FieldInit], ids: ProtoIds, file: String, bound: [String], errs: Int) : Int / Console + File {
 
 
   match fs {
     [] -> errs
     [f, ...rest] -> match f {
-      FI(_, v) -> validate_inv_fields(rest, file, bound,
-                                          validate_inv_expr(v, file, bound, errs))
+      FI(_, v) -> validate_inv_fields(rest, ids, file, bound,
+                                          validate_inv_expr(v, ids, file, bound, errs))
     }
   }
 }
 
-fn validate_inv_list_elems(els: [ListElem], file: String, bound: [String],
+fn validate_inv_list_elems(els: [ListElem], ids: ProtoIds, file: String, bound: [String],
                               errs: Int) : Int / Console + File {
 
 
@@ -4452,17 +4436,17 @@ fn validate_inv_list_elems(els: [ListElem], file: String, bound: [String],
     [] -> errs
     [el, ...rest] -> {
       let e1 = match el {
-        ElPlain(x)  -> validate_inv_expr(x, file, bound, errs)
-        ElSpread(x) -> validate_inv_expr(x, file, bound, errs)
+        ElPlain(x)  -> validate_inv_expr(x, ids, file, bound, errs)
+        ElSpread(x) -> validate_inv_expr(x, ids, file, bound, errs)
       }
-      validate_inv_list_elems(rest, file, bound, e1)
+      validate_inv_list_elems(rest, ids, file, bound, e1)
     }
   }
 }
 
 type InvBlockRes = { errs: Int, bound: [String] }
 
-fn validate_inv_block(stmts: [Stmt], file: String, bound: [String],
+fn validate_inv_block(stmts: [Stmt], ids: ProtoIds, file: String, bound: [String],
                          errs: Int) : InvBlockRes / Console + File {
 
 
@@ -4470,41 +4454,41 @@ fn validate_inv_block(stmts: [Stmt], file: String, bound: [String],
     [] -> InvBlockRes { errs: errs, bound: bound }
     [s, ...rest] -> match s {
       SLet(p, _, rhs) -> {
-        let e1 = validate_inv_expr(rhs, file, bound, errs)
+        let e1 = validate_inv_expr(rhs, ids, file, bound, errs)
         let bound1 = inv_pat_names(p, bound)
-        validate_inv_block(rest, file, bound1, e1)
+        validate_inv_block(rest, ids, file, bound1, e1)
       }
       SVar(name, _, rhs, _, _) -> {
-        let e1 = validate_inv_expr(rhs, file, bound, errs)
-        validate_inv_block(rest, file, [name, ...bound], e1)
+        let e1 = validate_inv_expr(rhs, ids, file, bound, errs)
+        validate_inv_block(rest, ids, file, [name, ...bound], e1)
       }
       SAssert(c, m) -> {
-        let e1 = validate_inv_expr(c, file, bound, errs)
-        let e2 = match m { Some(mx) -> validate_inv_expr(mx, file, bound, e1) None -> e1 }
-        validate_inv_block(rest, file, bound, e2)
+        let e1 = validate_inv_expr(c, ids, file, bound, errs)
+        let e2 = match m { Some(mx) -> validate_inv_expr(mx, ids, file, bound, e1) None -> e1 }
+        validate_inv_block(rest, ids, file, bound, e2)
       }
       SExprStmt(x) -> {
-        let e1 = validate_inv_expr(x, file, bound, errs)
-        validate_inv_block(rest, file, bound, e1)
+        let e1 = validate_inv_expr(x, ids, file, bound, errs)
+        validate_inv_block(rest, ids, file, bound, e1)
       }
       SAssign(b, v, _, _) -> {
-        let e1 = validate_inv_expr(b, file, bound, errs)
-        let e3 = validate_inv_expr(v, file, bound, e1)
-        validate_inv_block(rest, file, bound, e3)
+        let e1 = validate_inv_expr(b, ids, file, bound, errs)
+        let e3 = validate_inv_expr(v, ids, file, bound, e1)
+        validate_inv_block(rest, ids, file, bound, e3)
       }
       SIndexAssign(b, i, v, _, _) -> {
-        let e1 = validate_inv_expr(b, file, bound, errs)
-        let e2 = validate_inv_expr(i, file, bound, e1)
-        let e3 = validate_inv_expr(v, file, bound, e2)
-        validate_inv_block(rest, file, bound, e3)
+        let e1 = validate_inv_expr(b, ids, file, bound, errs)
+        let e2 = validate_inv_expr(i, ids, file, bound, e1)
+        let e3 = validate_inv_expr(v, ids, file, bound, e2)
+        validate_inv_block(rest, ids, file, bound, e3)
       }
       # m7e §25: SUse has no expression and binds nothing.
-      SUse(_, _, _) -> validate_inv_block(rest, file, bound, errs)
+      SUse(_, _, _) -> validate_inv_block(rest, ids, file, bound, errs)
     }
   }
 }
 
-fn validate_inv_clauses(cs: [HClause], file: String, bound: [String],
+fn validate_inv_clauses(cs: [HClause], ids: ProtoIds, file: String, bound: [String],
                           errs: Int) : Int / Console + File {
 
 
@@ -4513,8 +4497,8 @@ fn validate_inv_clauses(cs: [HClause], file: String, bound: [String],
     [c, ...rest] -> match c {
       HC(_, ps, b, _, _) -> {
         let bound1 = inv_param_names(ps, bound)
-        let e1 = validate_inv_expr(b, file, bound1, errs)
-        validate_inv_clauses(rest, file, bound, e1)
+        let e1 = validate_inv_expr(b, ids, file, bound1, errs)
+        validate_inv_clauses(rest, ids, file, bound, e1)
       }
     }
   }
@@ -4656,25 +4640,22 @@ fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
       # Last-ditch: recover Self from the return type's Self position.
       match ret_ty {
         None -> None
-        Some(ty) -> match proto_callee_kind(callee.kind) {
-          EVar(name) -> {
-            let opname = strip_proto_dispatcher_prefix(name)
-            if name == opname or not list_has(reg.op_names, opname) { None }
-            else {
-              # Issue #546: a return-typed op (`from(x) : Self`) may
-              # also be declared by more than one protocol. Try each
-              # candidate against its own return-derived Self type.
-              # Decline while any argument's type is still unresolved
-              # (no head) — dispatching then would be premature.
-              match args_disp_heads(args_) {
-                None -> None
-                Some(_) ->
-                  try_rewrite_ret_candidates(proto_cands_own_first(proto_ops_lookup_all(reg, opname), cm),
-                                             callee, args_, reg, cm, opname, ty)
-              }
+        Some(ty) -> match pid_bare_disp(reg.ids, callee) {
+          Some(row) -> {
+            let opname = disp_op(row)
+            # Issue #546: a return-typed op (`from(x) : Self`) may
+            # also be declared by more than one protocol. Try each
+            # candidate against its own return-derived Self type.
+            # Decline while any argument's type is still unresolved
+            # (no head) — dispatching then would be premature.
+            match args_disp_heads(args_) {
+              None -> None
+              Some(_) ->
+                try_rewrite_ret_candidates(proto_cands_own_first(proto_ops_lookup_all(reg, opname), cm),
+                                           callee, args_, reg, cm, opname, ty)
             }
           }
-          _ -> None
+          None -> None
         }
       }
     }
@@ -4739,46 +4720,37 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
 # Only a dispatcher is dispatched: the resolver turned every use that
 # reaches a protocol operation into one, so a local or a declaration
 # that shares an operation's spelling never reaches the impl table.
-fn proto_callee_kind(k: ExprKind) : ExprKind = match k {
-  ESym(s, _, n) -> if sym_is_local(s) { k } else { EVar(n) }
-  _             -> k
-}
-
 fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
                             reg: ProtocolReg,
                             cm: Option[String]) : Option[ExprKind] {
-  match proto_callee_kind(callee.kind) {
-    EVar(name) -> {
-      let opname = strip_proto_dispatcher_prefix(name)
-      if name == opname or not list_has(reg.op_names, opname) { None }
-      else {
-        # Issue #180: with heterogeneous P[A] dispatch, the receiver
-        # is no longer always args[0]. We need to consider every
-        # argument as a candidate Self and find the impl whose
-        # arg-name list matches the OTHER arguments.
-        #
-        # Issue #546: when two protocols declare an op with the same
-        # name, the bare-name call site carries no protocol — only the
-        # receiver type disambiguates. Iterate every protocol declaring
-        # this op and pick the first that has an impl for the receiver.
-        # The caller's own protocol ranks first: with a contested name,
-        # a module's bare call binds its own declaration, exactly as
-        # The scope chain resolves the name for impl validation.
-        try_rewrite_proto_candidates(proto_cands_own_first(proto_ops_lookup_all(reg, opname), cm),
-                                     callee, args_, reg, cm, opname)
-      }
+  match callee.kind {
+    # A qualified dispatcher: the interpolation sugar's `show`, homed at
+    # the core protocol. The qualifier selects the protocols its home
+    # declares.
+    EModCall(m, name) -> match pid_qualified_disp(reg.ids, m, name) {
+      Some(row) ->
+        try_rewrite_proto_candidates(pcof_matching(proto_ops_lookup_all(reg, disp_op(row)), disp_home(row)),
+                                     callee, args_, reg, cm, disp_op(row))
+      None -> None
     }
-    # `m.__proto_op`: the interpolation sugar's `show`, homed at the core
-    # protocol. The qualifier selects the protocols declared by `m`.
-    EModCall(m, name) -> {
-      let opname = strip_proto_dispatcher_prefix(name)
-      if name == opname or not list_has(reg.op_names, opname) { None }
-      else {
-        try_rewrite_proto_candidates(pcof_matching(proto_ops_lookup_all(reg, opname), Some(m)),
-                                     callee, args_, reg, cm, opname)
-      }
+    _ -> match pid_bare_disp(reg.ids, callee) {
+      # Issue #180: with heterogeneous P[A] dispatch, the receiver
+      # is no longer always args[0]. We need to consider every
+      # argument as a candidate Self and find the impl whose
+      # arg-name list matches the OTHER arguments.
+      #
+      # Issue #546: when two protocols declare an op with the same
+      # name, the bare-name call site carries no protocol — only the
+      # receiver type disambiguates. Iterate every protocol declaring
+      # this op and pick the first that has an impl for the receiver.
+      # The caller's own protocol ranks first: with a contested name,
+      # a module's bare call binds its own declaration, exactly as
+      # The scope chain resolves the name for impl validation.
+      Some(row) ->
+        try_rewrite_proto_candidates(proto_cands_own_first(proto_ops_lookup_all(reg, disp_op(row)), cm),
+                                     callee, args_, reg, cm, disp_op(row))
+      None -> None
     }
-    _ -> None
   }
 }
 
@@ -5092,9 +5064,6 @@ fn find_impl_by_recv(impls: [ProtoImplReg], pname: SymId, opname: String,
   }
 }
 
-# Strip the `__proto_` dispatcher prefix the rename pass attaches.
-# Names without the prefix pass through unchanged (so tests that
-# bypass renaming still resolve).
 # Stable partition: candidates homed in the calling module first,
 # everyone else in their existing order. Only reorders when the
 # caller's module itself declares the op's protocol.
@@ -5124,44 +5093,6 @@ fn pcof_rest(cands: [ProtoOpReg], cm: Option[String]) : [ProtoOpReg] =
         else { [po, ...pcof_rest(rest, cm)] }
     }
   }
-
-fn strip_proto_dispatcher_prefix(name: String) : String {
-  let pfx = "__proto_"
-  let n_pfx = string_length(pfx)
-  if string_length(name) <= n_pfx { name }
-  else if string_slice(name, 0, n_pfx) == pfx {
-    strip_arity_suffix(string_slice(name, n_pfx, string_length(name) - n_pfx))
-  }
-  else { name }
-}
-
-# Drop the `__a<N>` arity suffix an arity-ambiguous dispatcher carries
-# (`f__a1` -> `f`). Scans the trailing digit run, then checks the `__a`
-# marker right before it. Names without the shape pass through, so an
-# op literally named `x__a` (no digits) is untouched.
-fn strip_arity_suffix(name: String) : String {
-  let n = string_length(name)
-  let digit_start = scan_trailing_digits(name, n)
-  let marker = "__a"
-  let m = string_length(marker)
-  if digit_start < n and digit_start >= m and
-     string_slice(name, digit_start - m, m) == marker {
-    string_slice(name, 0, digit_start - m)
-  } else { name }
-}
-
-# Index of the first char of the trailing digit run (== `n` when the
-# last char is not a digit). Walks backward from `n`.
-fn scan_trailing_digits(s: String, n: Int) : Int {
-  if n <= 0 { 0 }
-  else {
-    match char_at(s, n - 1) {
-      Some(c) -> if c >= '0' and c <= '9' { scan_trailing_digits(s, n - 1) }
-                 else { n }
-      None -> n
-    }
-  }
-}
 
 # Map an inferred Ty back to its canonical "head-constructor" name —
 # the same mangling proto_type_name applies on the impl side. Lists,
