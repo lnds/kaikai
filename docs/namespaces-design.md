@@ -58,6 +58,18 @@ that file only, and the core declaration stays reachable qualified
 names follow the same ladder as every other class, so a bare `Log` means
 the same declaration in a row, a `handle` head and a perform.
 
+Inside the core rung alone, order is part of the language. The core set
+is a fixed, ordered list of modules, and a later one may restate a
+function an earlier one declares over the same parameter
+(`char_unicode.is_upper` over `char.is_upper`). A call whose argument
+fits several core declarations of one name takes the declaration of the
+module the core set lists last. That order belongs to the toolchain, the
+same for every file, and applies between core modules only: no import and
+no declaration of a program takes part in it, so step 5 still governs
+everything a program writes. It settles calls and nothing else — read as
+a value, with no argument to fit, such a name is still an ambiguity
+error.
+
 Step 5 is the whole point. Never first-wins, never last-wins, never
 import-order, never declaration-order. The kind-system doc already
 justifies this — *"order-of-declaration must NOT change a program's
