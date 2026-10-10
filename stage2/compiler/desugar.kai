@@ -27,6 +27,11 @@
 # - C. `use Effect` desugar: strip file-level `use` decls and rewrite
 #   bare op references in their scope to qualified `Eff.op` calls.
 #   Entry: `desugar_use_decls`.
+#
+# Every pass here runs before the resolver: a local is the name its
+# binder wrote, so the scope walks key on that text. A name that denotes
+# a declaration (a record literal's head, a narrow's type, a `use`) is
+# settled to its id through the symbol table and the file's scope view.
 # - D. Cap-binding nursery rewrite: `nursery { n -> body }` strips the
 #   cap param and rewrites `n.<op>` to `Spawn.<op>`, minting a fresh
 #   BrandId per scope. Entry: `rewrite_nursery_caps_decls`; produces
@@ -45,7 +50,7 @@
 #
 # Shared types live in compiler.ast: `RecInfo` (the record table
 # entry, ctor `RI`) plus its pure lookups (`rec_find` /
-# `rec_find_with_field` / `collect_records`), the only home both this
+# `collect_records`), the only home both this
 # pass and the typer can import without a lateral arrow.
 #
 # Local mirrors (downward-glue rule): the passes call AST-generic
@@ -75,6 +80,11 @@ import compiler.core_effects
 import compiler.core_builtins
 import compiler.decl_names
 import compiler.symtab_build
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+import compiler.scope_view
+import compiler.scope_file
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule)
@@ -102,19 +112,15 @@ pub fn dsg_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EUnit          -> k
     EName(_)        -> k
     EMark(_)        -> k
-    ESym(_, _, _)        -> k
+    ESym(_, _)        -> k
+    ELocal(_)       -> k
+    EOp(_)          -> k
     EUnder         -> k
     EPlaceholder   -> k
     EHole(_)       -> k
     ETodo(_)       -> k
     EExternBody(_, _) -> k
-    # `EVariantsOf(TypeExpr, [String])` carries no sub-Expr (only a
-    # TypeExpr and a resolved-names list, neither of which the
-    # visitor traverses). Same shape as EHole/ETodo for the
-    # purposes of the structural recursion.
     EVariantsOf(_, _) -> k
-    # Qualified module call carries no sub-Exprs (both fields are
-    # plain Strings), so `f` has nothing to apply.
     EModCall(_, _) -> k
     # Intrinsic args ARE sub-Exprs, so the visitor recurs.
     EIntrinsic(name, args_) -> EIntrinsic(name, map(args_, f))
@@ -128,7 +134,7 @@ pub fn dsg_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EIf(c, t_, eo)       -> EIf(f(c), f(t_), dsg_map_opt_expr(eo, f))
     EMatch(scr, arms)    -> EMatch(f(scr), map(arms, (a) => dsg_map_arm_exprs(a, f)))
     ELambda(ps, b)       -> ELambda(ps, f(b))
-    ERecordLit(rh, name, fs) -> ERecordLit(rh, name, map(fs, (fi) => dsg_map_field_exprs(fi, f)))
+    ERecordLit(rh, fs)   -> ERecordLit(rh, map(fs, (fi) => dsg_map_field_exprs(fi, f)))
     EList(els)           -> EList(map(els, (el) => dsg_map_elem_exprs(el, f)))
     ERange(a, b, opt_step) -> ERange(f(a), f(b), dsg_map_opt_expr(opt_step, f))
     EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => dsg_map_stmt_exprs(s, f)),
@@ -137,8 +143,8 @@ pub fn dsg_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EMapPipe(a, b)       -> EMapPipe(f(a), f(b))
     EFlatMapPipe(a, b)   -> EFlatMapPipe(f(a), f(b))
     EFilterPipe(a, b)    -> EFilterPipe(f(a), f(b))
-    EHandle(body, eff_name, hsym, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(f(body), eff_name, hsym, eff_tyargs,
+    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(f(body), eff, eff_tyargs,
               dsg_map_opt_expr(init_opt, f), alias_opt,
               map(clauses, (c) => dsg_map_clause_exprs(c, f)),
               dsg_map_opt_return_exprs(ret_opt, f))
@@ -210,20 +216,20 @@ fn dsg_pat_bindings(pat: Pattern, acc: [String]) : [String] {
     PWild -> acc
     PLit(_) -> acc
     PRange(_, _) -> acc
-    PBind(name) -> [name, ...acc]
+    PBind(b) -> [written_text(b.name), ...acc]
     PList(pats, opt_rest) -> {
       let acc1 = dsg_pat_bindings_loop(pats, acc)
       match opt_rest {
-        Some(rname) -> [rname, ...acc1]
+        Some(r) -> [written_text(r.name), ...acc1]
         None -> acc1
       }
     }
-    PVariant(_, _, subs) -> dsg_pat_bindings_loop(subs, acc)
-    PVariantRecord(_, _, fields) -> dsg_pfield_bindings_loop(fields, acc)
+    PVariant(_, subs) -> dsg_pat_bindings_loop(subs, acc)
+    PVariantRecord(_, fields) -> dsg_pfield_bindings_loop(fields, acc)
     PRecord(fields) -> dsg_pfield_bindings_loop(fields, acc)
     PHole(_) -> acc
-    PAs(name, sub) -> dsg_pat_bindings(sub, [name, ...acc])
-    PNarrow(name, _) -> [name, ...acc]
+    PAs(b, sub) -> dsg_pat_bindings(sub, [written_text(b.name), ...acc])
+    PNarrow(b, _) -> [written_text(b.name), ...acc]
     PSurface(sp) -> dsg_pat_bindings_loop(patsurface_children(sp), acc)
   }
 }
@@ -253,7 +259,7 @@ fn dsg_pfield_bindings_loop(fs: [PField], acc: [String]) : [String] {
 fn dsg_rename_param_names(ps: [Param], acc: [String]) : [String] {
   match ps {
     [] -> acc
-    [p, ...rest] -> dsg_rename_param_names(rest, [p.pname, ...acc])
+    [p, ...rest] -> dsg_rename_param_names(rest, [written_text(p.binder.name), ...acc])
   }
 }
 
@@ -265,17 +271,17 @@ fn dsg_rename_pat_names(p: Pattern, acc: [String]) : [String] {
     PWild         -> acc
     PLit(_)       -> acc
     PRange(_, _)  -> acc
-    PBind(name)   -> [name, ...acc]
+    PBind(b)      -> [written_text(b.name), ...acc]
     PList(pats, opt_rest) -> {
       let a = dsg_rename_pats_names(pats, acc)
-      match opt_rest { Some(r) -> [r, ...a] None -> a }
+      match opt_rest { Some(r) -> [written_text(r.name), ...a] None -> a }
     }
-    PVariant(_, _, subs)     -> dsg_rename_pats_names(subs, acc)
-    PVariantRecord(_, _, fs) -> dsg_rename_pfields_names(fs, acc)
+    PVariant(_, subs)     -> dsg_rename_pats_names(subs, acc)
+    PVariantRecord(_, fs) -> dsg_rename_pfields_names(fs, acc)
     PRecord(fs)              -> dsg_rename_pfields_names(fs, acc)
     PHole(_)                 -> acc
-    PAs(name, sub)           -> dsg_rename_pat_names(sub, [name, ...acc])
-    PNarrow(name, _)         -> [name, ...acc]
+    PAs(b, sub)              -> dsg_rename_pat_names(sub, [written_text(b.name), ...acc])
+    PNarrow(b, _)            -> [written_text(b.name), ...acc]
     PSurface(sp)             -> dsg_rename_pats_names(patsurface_children(sp), acc)
   }
 }
@@ -295,6 +301,40 @@ fn dsg_rename_pfields_names(fs: [PField], acc: [String]) : [String] {
     }
   }
 }
+
+# What a name written before the resolver is settled against: the symbol
+# table and the view of the file the name sits in, the one homed at `home`.
+type DsgScope = { tab: SymTab, views: FileViews, home: String }
+
+# The scope of the file `d` sits in; a declaration with no module origin
+# is the root's.
+fn dsg_scope_of(d: Decl, tab: SymTab, views: FileViews, root: String) : DsgScope =
+  DsgScope { tab: tab, views: views, home: decl_home_hint_reset(d, root, root) }
+
+# The declaration of class `cls` a written `name` denotes: the only one
+# of that name, else the one the scope ladder settles; `sym_none()` when
+# neither answers.
+fn dsg_written_sym(sc: DsgScope, cls: NCls, name: String) : SymId = match st_candidates(sc.tab, cls, name) {
+  []  -> sym_none()
+  [s] -> s
+  _   -> match sv_resolve(sc.tab, fv_of(sc.views, st_module_id(sc.home)), cls, name) {
+    SvSym(s) -> s
+    _        -> sym_none()
+  }
+}
+
+# The type a reference denotes: its declaration once resolved, else what
+# its written name settles to. A written qualifier is not consulted.
+fn dsg_type_sym(sc: DsgScope, r: DeclRef) : SymId = match r {
+  DrSym(s)        -> s
+  DrWritten(_, n) -> dsg_written_sym(sc, NCType, written_text(n))
+}
+
+fn dsg_sym_in(xs: [SymId], s: SymId) : Bool =
+  sym_raw(s) >= 0 and any(xs, (x) => sym_raw(x) == sym_raw(s))
+
+#[doc("A lowered stream and the table rows of the declarations the lowering minted.")]
+pub type DsgMinted = { decls: [Decl], rows: [NEnt] }
 
 # ====================================================================
 # Desugar passes (sub-sections A-E)
@@ -319,32 +359,44 @@ fn dsg_rename_pfields_names(fs: [PField], acc: [String]) : [String] {
 #[doc("Result of the positional-record desugar over a decl stream: the rewritten decls plus an error count.")]
 pub type DPRDecls = { decls: [Decl], errs: Int }
 
-#[doc("Positional-record sugar: rewrite `Foo(a, b)` calls to `Foo { f1: a, f2: b }` record literals using the record table; the entry point the driver invokes.")]
-pub fn desugar_pos_records_decls(ds: [Decl], df: DiagFiles) : DPRDecls / Console + File {
+#[doc("Positional-record sugar: rewrite `Foo(a, b)` calls to `Foo { f1: a, f2: b }` record literals using the record table; the entry point the driver invokes. A literal's written head is settled against `tab` under the view of its file; `root` is the target module.")]
+pub fn desugar_pos_records_decls(ds: [Decl], tab: SymTab, views: FileViews, root: String, df: DiagFiles) : DPRDecls / Console + File {
 
   let recs = collect_records(ds)
-  desugar_pos_records_loop(ds, recs, df, [], 0)
+  desugar_pos_records_loop(ds, (d) => RecScope { recs: recs, sc: dsg_scope_of(d, tab, views, root) }, df, [], 0)
 }
 
-fn desugar_pos_records_loop(ds: [Decl], recs: [RecInfo], df: DiagFiles, acc: [Decl], errs: Int) : DPRDecls / Console + File {
+# The record table and the scope a literal's head is settled in.
+type RecScope = { recs: [RecInfo], sc: DsgScope }
+
+# The record a literal's head names, if it names one.
+fn rec_of_head(rs: RecScope, rh: DeclRef) : Option[RecInfo] = rec_find(rs.recs, dsg_type_sym(rs.sc, rh))
+
+# A literal's head as a diagnostic spells it.
+fn rec_head_text(rs: RecScope, rh: DeclRef) : String = match rh {
+  DrWritten(_, n) -> written_text(n)
+  DrSym(s)        -> written_text(decl_name(rs.sc.tab, s))
+}
+
+fn desugar_pos_records_loop(ds: [Decl], scope_of: (Decl) -> RecScope, df: DiagFiles, acc: [Decl], errs: Int) : DPRDecls / Console + File {
 
   match ds {
     [] -> DPRDecls { decls: list_reverse(acc), errs: errs }
     [d, ...rest] -> {
-      let r = desugar_pos_records_decl(d, recs, decl_diag_file(d, df), errs)
-      desugar_pos_records_loop(rest, recs, df, [r.decl, ...acc], r.errs)
+      let r = desugar_pos_records_decl(d, scope_of(d), decl_diag_file(d, df), errs)
+      desugar_pos_records_loop(rest, scope_of, df, [r.decl, ...acc], r.errs)
     }
   }
 }
 
 type DPRDecl = { decl: Decl, errs: Int }
 
-fn desugar_pos_records_decl(d: Decl, recs: [RecInfo], file: String, errs: Int) : DPRDecl / Console + File {
+fn desugar_pos_records_decl(d: Decl, recs: RecScope, file: String, errs: Int) : DPRDecl / Console + File {
 
   match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo, fsym) -> {
+    DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) -> {
       let r = dpr_expr(body, recs, file, errs)
-      DPRDecl { decl: DFn(pub_, n, tps, ps, ret, row, r.expr, l, c, mo, fsym), errs: r.errs }
+      DPRDecl { decl: DFn(pub_, fid, tps, ps, ret, row, r.expr, l, c, mo), errs: r.errs }
     }
     DTest(desc, body, l, c, mo) -> {
       let r = dpr_expr(body, recs, file, errs)
@@ -371,14 +423,14 @@ type DPRFields = { fields: [FieldInit], errs: Int }
 type DPRArm = { arm: Arm, errs: Int }
 type DPRArms = { arms: [Arm], errs: Int }
 
-fn dpr_expr(e: Expr, recs: [RecInfo], file: String, errs: Int) : DPRExpr / Console + File {
+fn dpr_expr(e: Expr, recs: RecScope, file: String, errs: Int) : DPRExpr / Console + File {
 
   let kr = dpr_kind(e.kind, e.line, e.col, recs, file, errs)
   DPRExpr { expr: Expr { kind: kr.expr.kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site },
             errs: kr.errs }
 }
 
-fn dpr_opt(o: Option[Expr], recs: [RecInfo], file: String, errs: Int) : DPROpt / Console + File {
+fn dpr_opt(o: Option[Expr], recs: RecScope, file: String, errs: Int) : DPROpt / Console + File {
 
   match o {
     Some(e) -> {
@@ -389,7 +441,7 @@ fn dpr_opt(o: Option[Expr], recs: [RecInfo], file: String, errs: Int) : DPROpt /
   }
 }
 
-fn dpr_exprs(es: [Expr], recs: [RecInfo], file: String, errs: Int) : DPRExprs / Console + File {
+fn dpr_exprs(es: [Expr], recs: RecScope, file: String, errs: Int) : DPRExprs / Console + File {
 
   match es {
     [] -> DPRExprs { exprs: [], errs: errs }
@@ -401,7 +453,7 @@ fn dpr_exprs(es: [Expr], recs: [RecInfo], file: String, errs: Int) : DPRExprs / 
   }
 }
 
-fn dpr_fields(fs: [FieldInit], recs: [RecInfo], file: String, errs: Int) : DPRFields / Console + File {
+fn dpr_fields(fs: [FieldInit], recs: RecScope, file: String, errs: Int) : DPRFields / Console + File {
 
   match fs {
     [] -> DPRFields { fields: [], errs: errs }
@@ -415,7 +467,7 @@ fn dpr_fields(fs: [FieldInit], recs: [RecInfo], file: String, errs: Int) : DPRFi
   }
 }
 
-fn dpr_stmts(ss: [Stmt], recs: [RecInfo], file: String, errs: Int) : DPRStmts / Console + File {
+fn dpr_stmts(ss: [Stmt], recs: RecScope, file: String, errs: Int) : DPRStmts / Console + File {
 
   match ss {
     [] -> DPRStmts { stmts: [], errs: errs }
@@ -427,7 +479,7 @@ fn dpr_stmts(ss: [Stmt], recs: [RecInfo], file: String, errs: Int) : DPRStmts / 
   }
 }
 
-fn dpr_stmt(s: Stmt, recs: [RecInfo], file: String, errs: Int) : DPRStmt / Console + File {
+fn dpr_stmt(s: Stmt, recs: RecScope, file: String, errs: Int) : DPRStmt / Console + File {
 
   match s {
     SLet(p, ann, rhs) -> {
@@ -462,7 +514,7 @@ fn dpr_stmt(s: Stmt, recs: [RecInfo], file: String, errs: Int) : DPRStmt / Conso
   }
 }
 
-fn dpr_arm(a: Arm, recs: [RecInfo], file: String, errs: Int) : DPRArm / Console + File {
+fn dpr_arm(a: Arm, recs: RecScope, file: String, errs: Int) : DPRArm / Console + File {
 
   match a {
     Arm(p, g, b) -> {
@@ -473,7 +525,7 @@ fn dpr_arm(a: Arm, recs: [RecInfo], file: String, errs: Int) : DPRArm / Console 
   }
 }
 
-fn dpr_arms(arms: [Arm], recs: [RecInfo], file: String, errs: Int) : DPRArms / Console + File {
+fn dpr_arms(arms: [Arm], recs: RecScope, file: String, errs: Int) : DPRArms / Console + File {
 
   match arms {
     [] -> DPRArms { arms: [], errs: errs }
@@ -489,7 +541,7 @@ fn dpr_arms(arms: [Arm], recs: [RecInfo], file: String, errs: Int) : DPRArms / C
 # count without using `dsg_map_expr_kind` (which has no error channel).
 type DPRKind = { expr: Expr, errs: Int }
 
-fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: [RecInfo], file: String, errs: Int) : DPRKind / Console + File {
+fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: RecScope, file: String, errs: Int) : DPRKind / Console + File {
 
   match k {
     # The interesting case: rewrite positional record literals using
@@ -497,7 +549,7 @@ fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: [RecInfo], file: String, err
     # the `...src, x: 10, ...` spread sugar here — a spread literal
     # is rewritten into `{ let s = src; T { f1: s.f1, ..., x: 10, ... } }`
     # so the expanded record-lit lands in the existing emit path.
-    ERecordLit(rh, name, fis) -> {
+    ERecordLit(rh, fis) -> {
       # Recurse into sub-exprs FIRST so nested positional records
       # already have real field names by the time we look at this
       # node's own arity.
@@ -507,17 +559,17 @@ fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: [RecInfo], file: String, err
         [f0, ..._rest_] -> match f0 { FI(_, v0) -> field_is_spread(v0) }
       }
       if is_spread {
-        let r = dpr_record_spread(rh, name, rfis.fields, line, col, recs, file, rfis.errs)
+        let r = dpr_record_spread(rh, rfis.fields, line, col, recs, file, rfis.errs)
         DPRKind { expr: r.expr, errs: r.errs }
       } else {
-        let renamed = dpr_record_lit(name, rfis.fields, line, col, recs, file, rfis.errs)
+        let renamed = dpr_record_lit(rh, rfis.fields, line, col, recs, file, rfis.errs)
         # Canonicalise the field order to the record's declaration order so
         # the runtime layout is a global property of the type, not of how
         # each literal was written. A literal already in declaration order
         # passes through unchanged; an out-of-order one becomes a let-block
         # that evaluates fields in SOURCE order then assembles in
         # DECLARATION order (preserving observable effect order).
-        DPRKind { expr: dpr_record_canon(rh, name, renamed.fields, line, col, recs), errs: renamed.errs }
+        DPRKind { expr: dpr_record_canon(rh, renamed.fields, line, col, recs), errs: renamed.errs }
       }
     }
     EBlock(stmts, tail) -> {
@@ -601,13 +653,13 @@ fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: [RecInfo], file: String, err
       let r = dpr_expr(inner, recs, file, errs)
       DPRKind { expr: mk_expr(EBang(r.expr), line, col), errs: r.errs }
     }
-    EHandle(body, eff_name, hsym, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
+    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
       let rb = dpr_expr(body, recs, file, errs)
       let ri = dpr_opt(init_opt, recs, file, rb.errs)
       let rc = dpr_clauses(clauses, recs, file, ri.errs)
       let rr = dpr_opt_ret(ret_opt, recs, file, rc.errs)
       DPRKind {
-        expr: mk_expr(EHandle(rb.expr, eff_name, hsym, eff_tyargs, ri.opt, alias_opt, rc.clauses, rr.ret), line, col),
+        expr: mk_expr(EHandle(rb.expr, eff, eff_tyargs, ri.opt, alias_opt, rc.clauses, rr.ret), line, col),
         errs: rr.errs
       }
     }
@@ -617,7 +669,7 @@ fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: [RecInfo], file: String, err
 
 type DPRElems = { elems: [ListElem], errs: Int }
 
-fn dpr_list_elems(els: [ListElem], recs: [RecInfo], file: String, errs: Int) : DPRElems / Console + File {
+fn dpr_list_elems(els: [ListElem], recs: RecScope, file: String, errs: Int) : DPRElems / Console + File {
 
   match els {
     [] -> DPRElems { elems: [], errs: errs }
@@ -640,7 +692,7 @@ fn dpr_list_elems(els: [ListElem], recs: [RecInfo], file: String, errs: Int) : D
 
 type DPRClauses = { clauses: [HClause], errs: Int }
 
-fn dpr_clauses(cs: [HClause], recs: [RecInfo], file: String, errs: Int) : DPRClauses / Console + File {
+fn dpr_clauses(cs: [HClause], recs: RecScope, file: String, errs: Int) : DPRClauses / Console + File {
 
   match cs {
     [] -> DPRClauses { clauses: [], errs: errs }
@@ -656,7 +708,7 @@ fn dpr_clauses(cs: [HClause], recs: [RecInfo], file: String, errs: Int) : DPRCla
 
 type DPROptRet = { ret: Option[HReturn], errs: Int }
 
-fn dpr_opt_ret(or_: Option[HReturn], recs: [RecInfo], file: String, errs: Int) : DPROptRet / Console + File {
+fn dpr_opt_ret(or_: Option[HReturn], recs: RecScope, file: String, errs: Int) : DPROptRet / Console + File {
 
   match or_ {
     Some(r) -> match r {
@@ -672,7 +724,7 @@ fn dpr_opt_ret(or_: Option[HReturn], recs: [RecInfo], file: String, errs: Int) :
 # Rewrite positional fields `[e0, ...]` into named `[FI(field0, e0), ...]`
 # using the record's declared field order. Reports diagnostics for
 # unknown record names and arity mismatches.
-fn dpr_record_lit(name: String, fis: [FieldInit], line: Int, col: Int, recs: [RecInfo], file: String, errs: Int) : DPRFields / Console + File {
+fn dpr_record_lit(rh: DeclRef, fis: [FieldInit], line: Int, col: Int, recs: RecScope, file: String, errs: Int) : DPRFields / Console + File {
 
   let is_pos = match fis {
     [] -> false
@@ -681,26 +733,21 @@ fn dpr_record_lit(name: String, fis: [FieldInit], line: Int, col: Int, recs: [Re
   if not is_pos {
     DPRFields { fields: fis, errs: errs }
   } else {
-    # Positional record-lit: every field is nameless
-    # at this point, so probing by field name does not disambiguate
-    # same-(name, arity) collisions. Fall back to the bare-name
-    # lookup; the field-set tie-breaker activates downstream in
-    # `synth_record_lit` after positional → named rewriting.
-    match rec_find(recs, name) {
+    match rec_of_head(recs, rh) {
       None -> {
         diag_error(file, line, col,
           string_concat("unknown record type `",
-            string_concat(name,
+            string_concat(rec_head_text(recs, rh),
               "` for positional construction; declare the type or use named-field form")))
         DPRFields { fields: fis, errs: errs + 1 }
       }
       Some(ri) -> match ri {
-        RI(_, _, fds, _, _) -> {
+        RI(_, _, fds, _) -> {
           let n_pos = list_length(fis)
           let n_decl = list_length(fds)
           if n_pos != n_decl {
             diag_error(file, line, col,
-              concat_all([ "`", name, "` expects ", int_to_string(n_decl),
+              concat_all([ "`", rec_head_text(recs, rh), "` expects ", int_to_string(n_decl),
                            " positional fields, got ", int_to_string(n_pos) ]))
             DPRFields { fields: fis, errs: errs + 1 }
           } else {
@@ -735,37 +782,22 @@ fn rename_pos_fields(fis: [FieldInit], fds: [FieldDecl]) : [FieldInit] {
 # property of the type — the invariant the constant-index field read relies
 # on. An unknown record type, or a field set that is not exactly the
 # declared one, passes through untouched so the typer reports it.
-fn dpr_record_canon(rh: DeclRef, name: String, fis: [FieldInit], line: Int, col: Int,
-                    recs: [RecInfo]) : Expr {
-  match rec_find_canon_target(recs, rh, name, fis) {
-    None -> mk_expr(ERecordLit(rh, name, fis), line, col)
+fn dpr_record_canon(rh: DeclRef, fis: [FieldInit], line: Int, col: Int,
+                    recs: RecScope) : Expr {
+  match rec_of_head(recs, rh) {
+    None -> mk_expr(ERecordLit(rh, fis), line, col)
     Some(ri) -> match ri {
-      RI(_, _, fds, _, _) ->
+      RI(_, _, fds, _) ->
         if not is_field_permutation(fis, fds) or fields_in_decl_order(fis, fds) {
-          mk_expr(ERecordLit(rh, name, fis), line, col)
+          mk_expr(ERecordLit(rh, fis), line, col)
         } else {
           let binds = canon_field_binds(fis, line, col, 0, [])
           let assembled = canon_assemble(fds, fis, line, col, 0, [])
-          mk_expr(EBlock(binds, Some(mk_expr(ERecordLit(rh, name, assembled), line, col))), line, col)
+          mk_expr(EBlock(binds, Some(mk_expr(ERecordLit(rh, assembled), line, col))), line, col)
         }
     }
   }
 }
-
-# Resolve the literal's `RecInfo` from its type name + first field, the
-# field-set tie-break `synth_record_lit` uses for same-(name, arity)
-# collisions. Arity `-1`: the literal carries no type args.
-fn rec_find_canon_target(recs: [RecInfo], rh: DeclRef, name: String, fis: [FieldInit]) : Option[RecInfo] =
-  match rec_find_decl(recs, name, ty_ref_sym(rh)) {
-    Some(r) -> Some(r)
-    None    -> rec_find_canon_by_name(recs, name, fis)
-  }
-
-fn rec_find_canon_by_name(recs: [RecInfo], name: String, fis: [FieldInit]) : Option[RecInfo] =
-  match fis {
-    []               -> rec_find(recs, name)
-    [FI(f0, _), ..._] -> rec_find_with_field(recs, name, -1, f0)
-  }
 
 # Same length and every declared field named: each declared field exactly once.
 fn is_field_permutation(fis: [FieldInit], fds: [FieldDecl]) : Bool =
@@ -786,7 +818,7 @@ fn fields_in_decl_order(fis: [FieldInit], fds: [FieldDecl]) : Bool = match fis {
 fn canon_field_binds(fis: [FieldInit], line: Int, col: Int, i: Int, acc: [Stmt]) : [Stmt] = match fis {
   [] -> list_reverse(acc)
   [FI(_, val), ...rest] -> {
-    let pat = mk_pat(PBind(canon_temp_name(line, col, i)), line, col)
+    let pat = mk_pat(PBind(binder_written(canon_temp_name(line, col, i))), line, col)
     canon_field_binds(rest, line, col, i + 1, [SLet(pat, None, val), ...acc])
   }
 }
@@ -798,7 +830,7 @@ fn canon_assemble(fds: [FieldDecl], fis: [FieldInit], line: Int, col: Int,
   [] -> list_reverse(acc)
   [FD(_, dnm, _, _), ...drest] -> {
     let si = field_init_index(fis, dnm, 0)
-    let ref = mk_ref(canon_temp_name(line, col, si), line, col)
+    let ref = mk_name(canon_temp_name(line, col, si), line, col)
     canon_assemble(drest, fis, line, col, _i + 1, [FI(dnm, ref), ...acc])
   }
 }
@@ -828,11 +860,10 @@ fn canon_temp_name(line: Int, col: Int, i: Int) : String =
 
 fn dpr_record_spread(
   rh: DeclRef,
-  name: String,
   fis: [FieldInit],
   line: Int,
   col: Int,
-  recs: [RecInfo],
+  recs: RecScope,
   file: String,
   errs: Int
 ) : DPRSpread / Console + File {
@@ -842,42 +873,29 @@ fn dpr_record_spread(
   # second-spread, so each FI here pairs a real field name with an
   # already-recursed expression).
   match fis {
-    [] -> DPRSpread { expr: mk_expr(ERecordLit(rh, name, fis), line, col), errs: errs }
+    [] -> DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs }
     [head, ...overrides] -> match head {
       FI(_, marked) -> {
         let src = field_written(marked)
-        # Probe by the first override's field name to disambiguate
-        # same-(name, arity) record collisions. Falls
-        # back to bare lookup when no overrides accompany the spread
-        # (rare).
-        let probe = match overrides {
-          [] -> ""
-          [ov, ..._] -> match ov { FI(fnm, _) -> fnm }
-        }
-        let lookup = if probe == "" {
-          rec_find(recs, name)
-        } else {
-          rec_find_with_field(recs, name, -1, probe)
-        }
-        match lookup {
+        match rec_of_head(recs, rh) {
           None -> {
             diag_error(file, line, col,
-              concat_all(["unknown record type `", name,
+              concat_all(["unknown record type `", rec_head_text(recs, rh),
                           "` in `...` spread; declare the type before constructing it"]))
-            DPRSpread { expr: mk_expr(ERecordLit(rh, name, fis), line, col), errs: errs + 1 }
+            DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs + 1 }
           }
           Some(ri) -> match ri {
-            RI(_, tparams, fds, _, _) -> {
+            RI(_, tparams, fds, _) -> {
               # Diagnose duplicate overrides (same field listed twice).
               let dup_errs = check_spread_dup_overrides(overrides, [], file, line, col, 0)
               # Diagnose overrides naming a field not declared on `T`.
-              let bad_errs = check_spread_unknown_overrides(overrides, fds, name, file, line, col, 0)
+              let bad_errs = check_spread_unknown_overrides(overrides, fds, rec_head_text(recs, rh), file, line, col, 0)
               let errs1 = errs + dup_errs + bad_errs
               if dup_errs + bad_errs > 0 {
-                DPRSpread { expr: mk_expr(ERecordLit(rh, name, fis), line, col), errs: errs1 }
+                DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs1 }
               } else {
                 let var_name = spread_src_var_name(line, col)
-                let bind_pat = mk_pat(PBind(var_name), line, col)
+                let bind_pat = mk_pat(PBind(binder_written(var_name)), line, col)
                 # Annotate the let with `T` for non-generic records so
                 # the existing nominal let-annotation check fires when
                 # `src : Q` with `Q != T` — spec's "spread source must
@@ -887,13 +905,13 @@ fn dpr_record_spread(
                 # tuple, so we let the typer infer and rely on its
                 # field-by-field check instead.
                 let ann_opt = match tparams {
-                  []           -> Some(mk_ty(TyName(ty_ref_none(), name, []), line, col))
+                  []           -> Some(mk_ty(TyName(rh, []), line, col))
                   [_, ..._rest] -> None
                 }
                 let bind_stmt = SLet(bind_pat, ann_opt, src)
-                let var_ref = mk_ref(var_name, line, col)
+                let var_ref = mk_name(var_name, line, col)
                 let expanded = expand_spread_fields(fds, overrides, var_ref, line, col)
-                let lit = mk_expr(ERecordLit(rh, name, expanded), line, col)
+                let lit = mk_expr(ERecordLit(rh, expanded), line, col)
                 DPRSpread { expr: mk_expr(EBlock([bind_stmt], Some(lit)), line, col), errs: errs1 }
               }
             }
@@ -1049,8 +1067,8 @@ fn str_in_list(s: String, xs: [String]) : Bool {
 # `kai_core_panic`, so calling an unbound axiom at runtime aborts.
 # The typer / monomorphiser / emitter therefore see only ordinary fns
 # and need no DAxiom-specific handling.
-#[doc("Rewrite every `DAxiom` decl into the equivalent `DFn` so the rest of the pipeline sees a plain function.")]
-pub fn lower_axioms(ds: [Decl]) : [Decl] = map(ds, lower_axiom_one)
+#[doc("Rewrite every `DAxiom` decl into the equivalent `DFn` so the rest of the pipeline sees a plain function. `home` is the module the stream's axioms are declared in.")]
+pub fn lower_axioms(ds: [Decl], home: String) : [Decl] = map(ds, (d) => lower_axiom_one(d, home))
 
 # Lower an `extern "C" opaque T` to a one-phantom-field nominal record
 # so Perceus reference-counts the handle box (dup before
@@ -1063,28 +1081,25 @@ pub fn lower_axioms(ds: [Decl]) : [Decl] = map(ds, lower_axiom_one)
 # record shape is a pure typer/RC fiction that never has to match the
 # box. An `extern "C" type` STRUCT is left untouched: it already works
 # as an ordinary structural record (constructed + field-accessed).
-#[doc("Lower every `extern \"C\" opaque` to a one-field nominal record so Perceus RC-tracks the handle box.")]
-pub fn lower_extern_opaques(ds: [Decl]) : [Decl] = map(ds, lower_extern_opaque_one)
+#[doc("Lower every `extern \"C\" opaque` to a one-field nominal record so Perceus RC-tracks the handle box. The record is a type of its module (the `root` when it carries no origin), returned with its table row.")]
+pub fn lower_extern_opaques(ds: [Decl], root: String) : DsgMinted = lower_extern_opaques_loop(ds, root, [], [])
 
-fn lower_extern_opaque_one(d: Decl) : Decl = match d {
-  DExternType(name, ETOpaque, l, c, mo) ->
-    DType(false, name, [],
-          TBRecord([FD(false, "__ffi_handle", mk_ty(TyName(ty_ref_none(), "Int", []), l, c), [])]), l, c, mo, [], sym_none())
-  _ -> d
+fn lower_extern_opaques_loop(ds: [Decl], root: String, acc: [Decl], rows: [NEnt]) : DsgMinted = match ds {
+  [] -> DsgMinted { decls: list_reverse(acc), rows: list_reverse(rows) }
+  [d, ...rest] -> match d {
+    DExternType(name, ETOpaque, l, c, mo) -> {
+      let home = match mo { Some(m) -> m  None -> root }
+      let body = TBRecord([FD(false, "__ffi_handle", mk_ty(TyName(ref_written("Int"), []), l, c), [])])
+      lower_extern_opaques_loop(rest, root,
+        [DType(false, sym_derive(NCType, name, home), [], body, l, c, mo, []), ...acc],
+        [NEnt(NCType, name, home, false), ...rows])
+    }
+    _ -> lower_extern_opaques_loop(rest, root, [d, ...acc], rows)
+  }
 }
 
-# The record/sum-type body an `extern "C" type`/`opaque` presents to
-# the typer's nominal-type machinery. A struct surfaces its
-# fields verbatim (so a kaikai value can be constructed and its fields
-# read); an opaque is an empty record (a declared abstract type with no
-# constructor the kaikai side ever builds — at the boundary the value
-# is a `KAI_FOREIGN` box, so the empty-record shape is a pure typer
-# fiction, never matched or built). The typer's `DType` registration
-# passes reuse this so foreign types ride the existing record-field /
-# type-name tables with no parallel machinery; the FFI shim emitters
-# key off the surviving `DExternType` decls (the registry), not this.
-
-pub fn lower_axiom_one(d: Decl) : Decl {
+#[doc("The `DFn` a `DAxiom` lowers to, declared in the module `home`; any other declaration unchanged.")]
+pub fn lower_axiom_one(d: Decl, home: String) : Decl {
   match d {
     DAxiom(is_pub, abi, name, sym, tparams, params, ret_ty, row, l, c) -> {
       # An extern fn lowers to a DFn whose body is an `EExternBody`
@@ -1094,7 +1109,7 @@ pub fn lower_axiom_one(d: Decl) : Decl {
         Some(a) -> mk_expr(EExternBody(a, sym), l, c)
         None    -> mk_expr(ETodo(string_concat("axiom ", string_concat(name, " not bound"))), l, c)
       }
-      DFn(is_pub, name, tparams, params, Some(ret_ty), row, body, l, c, None, fnid_none())
+      DFn(is_pub, fnid_decl(sym_derive(NCFn, name, home)), tparams, params, Some(ret_ty), row, body, l, c, None)
     }
     _ -> d
   }
@@ -1102,93 +1117,76 @@ pub fn lower_axiom_one(d: Decl) : Decl {
 
 
 # Synthesise a refinement-predicate fn for every `type X = Base where
-# pred` alias. The fn is named `__ref_pred_X(self: Base) : Bool` and
-# carries the same predicate expression the user wrote. It has an
-# empty effect row, so a contract predicate may call it.
-# parse_optional_arm_refine
-# references this name when it sees `match { p : X -> ... }`; the
-# resolver later binds the call to this synthesised fn.
+# pred` alias. The fn is named `__ref_pred_X(self: Base) : Bool`, is
+# declared in the alias's own module, and carries the same predicate
+# expression the user wrote. It has an empty effect row, so a contract
+# predicate may call it.
 #
-# Boundary tagging: thread `target_mod` so each synthesised
-# `__ref_pred_X` inherits the home module of the originating `DType`.
-# `DType` carries no `module_origin` field of its own, so the home is
-# recovered by streaming through `decl_home_hint_reset` (same algorithm
-# `validate_pub_access` uses for non-DFn decls). A refinement alias
-# declared in `stdlib/foo.kai` produces `__ref_pred_X` tagged with
-# `mo = Some("foo")` instead of mixing into the root file's untagged
-# decl set; root-file refinements produce `mo = None`.
-#[doc("Synthesise the predicate fn backing each `type T = base where pred` refinement alias.")]
-pub fn synthesize_refine_pred_fns(decls: [Decl], target_mod: String) : [Decl] =
-  synth_refine_loop(decls, target_mod, target_mod, [])
+# `target_mod` is threaded so each synthesised fn takes the module
+# origin of the originating `DType`: `mo = Some("foo")` for an alias of
+# `stdlib/foo.kai`, `mo = None` for a root-file one.
+#[doc("Synthesise the predicate fn backing each `type T = base where pred` refinement alias; returns the stream with them and their table rows.")]
+pub fn synthesize_refine_pred_fns(decls: [Decl], tab: SymTab, target_mod: String) : DsgMinted =
+  synth_refine_loop(decls, tab, target_mod, target_mod, [], [])
 
 #[doc("The identity of each predicate fn `synthesize_refine_pred_fns` mints for `decls`.")]
-pub fn refine_pred_fn_syms(decls: [Decl], target_mod: String) : [SymId] =
-  refine_pred_syms_loop(decls, target_mod, target_mod, [])
+pub fn refine_pred_fn_syms(decls: [Decl], tab: SymTab) : [SymId] =
+  map(collect_refine_alias_ids(decls), (t) => refine_pred_sym(tab, t))
 
-fn refine_pred_syms_loop(decls: [Decl], target_mod: String, cur_mod: String,
-                         acc: [SymId]) : [SymId] = match decls {
-  [] -> acc
-  [d, ...rest] -> {
-    let next_mod = decl_home_hint_reset(d, cur_mod, target_mod)
-    let minted = map(synth_refine_for_decl(d, None), (f) => fn_decl_sym(f, next_mod))
-    refine_pred_syms_loop(rest, target_mod, next_mod, list_append(minted, acc))
-  }
-}
+# The predicate fn of the refinement alias `t`: `__ref_pred_<T>` in the
+# module that declares `t`.
+fn refine_pred_sym(tab: SymTab, t: SymId) : SymId =
+  sym_derive(NCFn, refine_pred_name(tab, t), written_text(decl_home(tab, t)))
 
-#[doc("The identity of the fn `d` declares, homed at its own module or at `root` when it carries none; `sym_none()` for any other declaration.")]
-pub fn fn_decl_sym(d: Decl, root: String) : SymId = match d {
-  DFn(_, n, _, _, _, _, _, _, _, mo, _) -> match mo {
-    Some(m) -> sym_derive(NCFn, n, m)
-    None    -> sym_derive(NCFn, n, root)
-  }
-  _ -> sym_none()
-}
+fn refine_pred_name(tab: SymTab, t: SymId) : String =
+  synth_refine_pred_fn_name(written_text(decl_name(tab, t)))
 
-fn synth_refine_loop(decls: [Decl], target_mod: String, cur_mod: String,
-                       acc: [Decl]) : [Decl] {
+fn synth_refine_loop(decls: [Decl], tab: SymTab, target_mod: String, cur_mod: String,
+                       acc: [Decl], rows: [NEnt]) : DsgMinted {
   match decls {
-    [] -> list_reverse(acc)
+    [] -> DsgMinted { decls: list_reverse(acc), rows: list_reverse(rows) }
     [d, ...rest] -> {
       let next_mod = decl_home_hint_reset(d, cur_mod, target_mod)
       let parent_mo =
         if next_mod == target_mod { None } else { Some(next_mod) }
-      let extra = synth_refine_for_decl(d, parent_mo)
-      let acc1 = list_append(extra, [d, ...acc])
-      synth_refine_loop(rest, target_mod, next_mod, acc1)
+      let extra = synth_refine_for_decl(d, tab, parent_mo)
+      synth_refine_loop(rest, tab, target_mod, next_mod,
+                        list_append(extra.decls, [d, ...acc]), list_append(extra.rows, rows))
     }
   }
 }
 
-fn synth_refine_for_decl(d: Decl, parent_mo: Option[String]) : [Decl] {
+fn synth_refine_for_decl(d: Decl, tab: SymTab, parent_mo: Option[String]) : DsgMinted {
   # A refinement alias under a transparent wrapper still needs its
   # `__ref_pred_X` fn, else the narrow guard references a fn that was
   # never emitted.
   match decl_transparent_inner(d) {
-    Some(inner) -> synth_refine_for_decl(inner, parent_mo)
+    Some(inner) -> synth_refine_for_decl(inner, tab, parent_mo)
     None -> match d {
-      DType(_, name, _, body, l, c, _, _, _) -> match body {
-        TBAlias(t) -> match t.tkind {
-          TyRefine(base, pred) ->
-            [build_refine_pred_fn(name, base, pred, l, c, parent_mo)]
-          _ -> []
+      DType(_, t, _, body, l, c, _, _) -> match body {
+        TBAlias(te) -> match te.tkind {
+          TyRefine(base, pred) -> build_refine_pred_fn(tab, t, base, pred, l, c, parent_mo)
+          _ -> DsgMinted { decls: [], rows: [] }
         }
-        _ -> []
+        _ -> DsgMinted { decls: [], rows: [] }
       }
-      _ -> []
+      _ -> DsgMinted { decls: [], rows: [] }
     }
   }
 }
 
-fn build_refine_pred_fn(tyname: String, base: TypeExpr, pred: Expr,
-                          l: Int, c: Int, mo: Option[String]) : Decl {
-  let fn_name = synth_refine_pred_fn_name(tyname)
-  let self_param = Param { pname: "self", ptype: Some(base),
+fn build_refine_pred_fn(tab: SymTab, t: SymId, base: TypeExpr, pred: Expr,
+                          l: Int, c: Int, mo: Option[String]) : DsgMinted {
+  let self_param = Param { binder: binder_written("self"), ptype: Some(base),
                             pline: l, pcol: c, pborrow: false }
-  let ret_ty = mk_ty(TyName(ty_ref_none(), "Bool", []), l, c)
+  let ret_ty = mk_ty(TyName(ref_written("Bool"), []), l, c)
   # Empty effect row marks the synthesised predicate fn as pure, so a
   # refinement-alias narrow used in a contract resolves as effect-pure.
-  DFn(false, fn_name, [], [self_param], Some(ret_ty),
-       REmpty, pred, l, c, mo, fnid_none())
+  DsgMinted {
+    decls: [DFn(false, fnid_decl(refine_pred_sym(tab, t)), [], [self_param], Some(ret_ty),
+                REmpty, pred, l, c, mo)],
+    rows: [NEnt(NCFn, refine_pred_name(tab, t), written_text(decl_home(tab, t)), false)]
+  }
 }
 
 # Lower `PNarrow(name, TyName(t, []))` whose `t` is a refinement-type
@@ -1199,19 +1197,19 @@ fn build_refine_pred_fn(tyname: String, base: TypeExpr, pred: Expr,
 # this pass disambiguates after `synthesize_refine_pred_fns` has
 # populated the alias namespace. Non-refinement narrowings stay as
 # `PNarrow` for the typer's union-component check.
-#[doc("Collect refinement-alias type names so the pattern-narrow lowering knows which `PNarrow` heads are refinement checks.")]
-pub fn collect_refine_alias_names(decls: [Decl]) : [String] =
+#[doc("Collect the refinement-alias types so the pattern-narrow lowering knows which `PNarrow` heads are refinement checks.")]
+pub fn collect_refine_alias_ids(decls: [Decl]) : [SymId] =
   collect_refine_alias_loop(decls, [])
 
-fn collect_refine_alias_loop(decls: [Decl], acc: [String]) : [String] {
+fn collect_refine_alias_loop(decls: [Decl], acc: [SymId]) : [SymId] {
   match decls {
     [] -> list_reverse(acc)
     [d, ...rest] -> match decl_transparent_inner(d) {
       Some(inner) -> collect_refine_alias_loop([inner, ...rest], acc)
       None -> match d {
-        DType(_, name, _, body, _, _, _, _, _) -> match body {
-          TBAlias(t) -> match t.tkind {
-            TyRefine(_, _) -> collect_refine_alias_loop(rest, [name, ...acc])
+        DType(_, t, _, body, _, _, _, _) -> match body {
+          TBAlias(te) -> match te.tkind {
+            TyRefine(_, _) -> collect_refine_alias_loop(rest, [t, ...acc])
             _ -> collect_refine_alias_loop(rest, acc)
           }
           _ -> collect_refine_alias_loop(rest, acc)
@@ -1222,68 +1220,83 @@ fn collect_refine_alias_loop(decls: [Decl], acc: [String]) : [String] {
   }
 }
 
-#[doc("Lower `PNarrow(name, alias)` patterns into a binder plus a predicate guard against the alias's synthesised pred fn.")]
-pub fn lower_pattern_narrow_decls(decls: [Decl], aliases: [String]) : [Decl] =
-  map(decls, (d) => lower_narrow_decl(d, aliases))
+# ---- TEMPORARY: names other files still call. Delete with their calls.
 
-fn lower_narrow_decl(d: Decl, aliases: [String]) : Decl {
+#[doc("TEMPORARY. Rewrite the call as `collect_refine_alias_ids`.")]
+pub fn collect_refine_alias_names(decls: [Decl]) : [SymId] = collect_refine_alias_ids(decls)
+
+#[doc("TEMPORARY. A `DFn` carries its own id: read `fnid_sym` of it.")]
+pub fn fn_decl_sym(d: Decl, _root: String) : SymId = match d {
+  DFn(_, fid, _, _, _, _, _, _, _, _) -> fnid_sym(fid)
+  _ -> sym_none()
+}
+
+#[doc("Lower `PNarrow(name, alias)` patterns into a binder plus a predicate guard against the alias's synthesised pred fn. A written narrow head is settled against `tab` under the view of its file; `root` is the target module.")]
+pub fn lower_pattern_narrow_decls(decls: [Decl], tab: SymTab, views: FileViews, root: String, aliases: [SymId]) : [Decl] =
+  map(decls, (d) => lower_narrow_decl(d, NarrowScope { sc: dsg_scope_of(d, tab, views, root), aliases: aliases }))
+
+# The refinement aliases and the scope a narrow's head is settled in.
+type NarrowScope = { sc: DsgScope, aliases: [SymId] }
+
+fn lower_narrow_decl(d: Decl, ns: NarrowScope) : Decl {
   match d {
-    DFn(p, n, tps, ps, ret, row, body, l, c, mo, fsym) ->
-      DFn(p, n, tps, ps, ret, row, lower_narrow_expr(body, aliases), l, c, mo, fsym)
-    DTest(desc, body, l, c, mo) -> DTest(desc, lower_narrow_expr(body, aliases), l, c, mo)
-    DBench(desc, body, l, c, mo) -> DBench(desc, lower_narrow_expr(body, aliases), l, c, mo)
-    DCheck(desc, params, body, l, c, mo) -> DCheck(desc, params, lower_narrow_expr(body, aliases), l, c, mo)
+    DFn(p, fid, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(p, fid, tps, ps, ret, row, lower_narrow_expr(body, ns), l, c, mo)
+    DTest(desc, body, l, c, mo) -> DTest(desc, lower_narrow_expr(body, ns), l, c, mo)
+    DBench(desc, body, l, c, mo) -> DBench(desc, lower_narrow_expr(body, ns), l, c, mo)
+    DCheck(desc, params, body, l, c, mo) -> DCheck(desc, params, lower_narrow_expr(body, ns), l, c, mo)
     # See through the transparent `#[unstable]` wrapper so a
     # `p : RefineAlias` narrow inside an unstable fn body still lowers to
     # a binder + predicate guard instead of reaching the typer as a raw
     # `PNarrow` ("requires a union scrutinee").
-    DUnstable(inner, l, c) -> DUnstable(lower_narrow_decl(inner, aliases), l, c)
-    DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, lower_narrow_decl(inner, aliases), l, c, mo)
-    DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, lower_narrow_decl(inner, aliases), l, c, mo)
-    DConstructor(inner, l, c) -> DConstructor(lower_narrow_decl(inner, aliases), l, c)
+    DUnstable(inner, l, c) -> DUnstable(lower_narrow_decl(inner, ns), l, c)
+    DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, lower_narrow_decl(inner, ns), l, c, mo)
+    DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, lower_narrow_decl(inner, ns), l, c, mo)
+    DConstructor(inner, l, c) -> DConstructor(lower_narrow_decl(inner, ns), l, c)
     _ -> d
   }
 }
 
-fn lower_narrow_expr(e: Expr, aliases: [String]) : Expr {
+fn lower_narrow_expr(e: Expr, ns: NarrowScope) : Expr {
   match e.kind {
     EMatch(scr, arms) -> {
-      let scr2 = lower_narrow_expr(scr, aliases)
-      let arms2 = map(arms, (a) => lower_narrow_arm(a, aliases))
+      let scr2 = lower_narrow_expr(scr, ns)
+      let arms2 = map(arms, (a) => lower_narrow_arm(a, ns))
       mk_expr(EMatch(scr2, arms2), e.line, e.col)
     }
     _ -> {
-      let new_kind = dsg_map_expr_kind(e.kind, (sub) => lower_narrow_expr(sub, aliases))
+      let new_kind = dsg_map_expr_kind(e.kind, (sub) => lower_narrow_expr(sub, ns))
       mk_expr(new_kind, e.line, e.col)
     }
   }
 }
 
-fn lower_narrow_arm(a: Arm, aliases: [String]) : Arm {
+fn lower_narrow_arm(a: Arm, ns: NarrowScope) : Arm {
   match a {
     Arm(pat, guard, body) -> {
-      let body1 = lower_narrow_expr(body, aliases)
+      let body1 = lower_narrow_expr(body, ns)
       let guard1 = match guard {
         None -> None
-        Some(g) -> Some(lower_narrow_expr(g, aliases))
+        Some(g) -> Some(lower_narrow_expr(g, ns))
       }
       match pat.pkind {
-        PNarrow(name, ty) -> match ty.tkind {
-          TyName(_, tyname, []) ->
-            if list_has(aliases, tyname) {
+        PNarrow(b, ty) -> match ty.tkind {
+          TyName(r, []) -> {
+            let t = dsg_type_sym(ns.sc, r)
+            if dsg_sym_in(ns.aliases, t) {
               # Restore the bind + synthesised pred call shape.
-              let var_e = mk_ref(name, pat.line, pat.col)
-              let pred_fn = mk_ref(synth_refine_pred_fn_name(tyname),
-                                     pat.line, pat.col)
+              let var_e = mk_expr(EName(b.name), pat.line, pat.col)
+              let pred_fn = mk_sym(refine_pred_sym(ns.sc.tab, t), pat.line, pat.col)
               let call = mk_expr(ECall(pred_fn, [var_e]), pat.line, pat.col)
               let new_guard = match guard1 {
                 None -> Some(call)
                 Some(g) -> Some(mk_expr(EBinop(BoAnd, call, g), call.line, call.col))
               }
-              Arm(mk_pat(PBind(name), pat.line, pat.col), new_guard, body1)
+              Arm(mk_pat(PBind(b), pat.line, pat.col), new_guard, body1)
             } else {
               Arm(pat, guard1, body1)
             }
+          }
           _ -> Arm(pat, guard1, body1)
         }
         _ -> Arm(pat, guard1, body1)
@@ -1297,8 +1310,8 @@ pub fn desugar_var_decls(ds: [Decl]) : [Decl] = map(ds, desugar_var_decl)
 
 fn desugar_var_decl(d: Decl) : Decl {
   match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo, fsym) ->
-      DFn(pub_, n, tps, ps, ret, row, desugar_var_expr(body), l, c, mo, fsym)
+    DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, fid, tps, ps, ret, row, desugar_var_expr(body), l, c, mo)
     DTest(desc, body, l, c, mo) -> DTest(desc, desugar_var_expr(body), l, c, mo)
     DBench(desc, body, l, c, mo) -> DBench(desc, desugar_var_expr(body), l, c, mo)
     DCheck(desc, params, body, l, c, mo) -> DCheck(desc, params, desugar_var_expr(body), l, c, mo)
@@ -1371,10 +1384,10 @@ type VLDecl = { decl: Decl, errs: Int }
 fn lcr_decl(d: Decl, reject_at: Bool, file: String, errs: Int) : VLDecl / Console + File {
 
   match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo, fsym) -> {
+    DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) -> {
       let pnames = dsg_rename_param_names(ps, [])
       let r = lcr_expr(body, caps_minus_names([], pnames), reject_at, file, errs)
-      VLDecl { decl: DFn(pub_, n, tps, ps, ret, row, r.expr, l, c, mo, fsym), errs: r.errs }
+      VLDecl { decl: DFn(pub_, fid, tps, ps, ret, row, r.expr, l, c, mo), errs: r.errs }
     }
     DTest(desc, body, l, c, mo) -> {
       let r = lcr_expr(body, [], reject_at, file, errs)
@@ -1520,7 +1533,7 @@ fn lcr_clauses(cs: [HClause], caps: [String], reject_at: Bool, file: String, err
 # Lower the naked cell read `EName(name)` to `name.get()` (a `State.get`
 # call the alias rewrite later maps to `Reader.ask` for Reader cells).
 fn mk_cell_get(n: String, line: Int, col: Int) : ExprKind {
-  let cap = mk_ref(n, line, col)
+  let cap = mk_name(n, line, col)
   let getter = mk_expr(EField(cap, "get"), line, col)
   ECall(getter, [])
 }
@@ -1530,7 +1543,8 @@ fn mk_cell_get(n: String, line: Int, col: Int) : ExprKind {
 # `Mutable.ref_get(n)`. A `var`/`State`/`Reader` cell reads naked and is
 # not a `Ref`, so `@` on one is rejected and the node stays as written.
 fn lcr_deref(callee: Expr, x: Expr, caps: [String], reject_at: Bool, line: Int, col: Int, file: String, errs: Int) : VLExpr / Console + File = match x.kind {
-  EName(n) ->
+  EName(w) -> {
+    let n = written_text(w)
     if list_has(caps, n) {
       diag_error(file, line, col, concat_all([
         "`@", n, "` is not how a `var` cell is read — read it naked, as `", n, "`"
@@ -1540,9 +1554,10 @@ fn lcr_deref(callee: Expr, x: Expr, caps: [String], reject_at: Bool, line: Int, 
       ]))
       VLExpr { expr: mk_expr(ECall(callee, [x]), line, col), errs: errs + 1 }
     } else {
-      let getter = mk_expr(EField(mk_ref(n, x.line, x.col), "get"), line, col)
+      let getter = mk_expr(EField(mk_name(n, x.line, x.col), "get"), line, col)
       VLExpr { expr: mk_expr(ECall(getter, []), line, col), errs: errs }
     }
+  }
   _ -> {
     let r = lcr_expr(x, caps, reject_at, file, errs)
     VLExpr { expr: mk_expr(ECall(callee, [r.expr]), line, col), errs: r.errs }
@@ -1552,13 +1567,15 @@ fn lcr_deref(callee: Expr, x: Expr, caps: [String], reject_at: Bool, line: Int, 
 fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, file: String, errs: Int) : VLExpr / Console + File {
 
   match k {
-    EName(n) ->
+    EName(w) -> {
+      let n = written_text(w)
       if list_has(caps, n) {
         VLExpr { expr: mk_expr(mk_cell_get(n, line, col), line, col), errs: errs }
-      } else { VLExpr { expr: mk_ref(n, line, col), errs: errs } }
+      } else { VLExpr { expr: mk_name(n, line, col), errs: errs } }
+    }
     # `caps` are capability binders, so a resolved reference is never
     # one and needs no cell read.
-    ESym(i, inst, n) -> VLExpr { expr: mk_expr(ESym(i, inst, n), line, col), errs: errs }
+    ESym(_, _) -> VLExpr { expr: mk_expr(k, line, col), errs: errs }
     ECall(callee, args_) -> match callee.kind {
       EMark(MkDeref) -> match args_ {
         [x] -> lcr_deref(callee, x, caps, reject_at, line, col, file, errs)
@@ -1571,8 +1588,8 @@ fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, f
         VLExpr { expr: mk_expr(var_slot_call(k, ra.exprs), line, col), errs: ra.errs }
       }
       EField(base, fname) -> match base.kind {
-        EName(n) ->
-          if list_has(caps, n) and (fname == "get" or fname == "set") {
+        EName(w) ->
+          if list_has(caps, written_text(w)) and (fname == "get" or fname == "set") {
             # A real State op on the cell: `n.get()` (also what a naked
             # read lowers to) or `n.set(v)` (also what `n := v` lowers
             # to). Legal — recurse into the args only, NOT the callee,
@@ -1611,12 +1628,12 @@ fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, f
       let ra = lcr_arms(arms, caps, reject_at, file, rs.errs)
       VLExpr { expr: mk_expr(EMatch(rs.expr, ra.arms), line, col), errs: ra.errs }
     }
-    EHandle(body, eff, hsym, tys, init_opt, alias_opt, clauses, ret_opt) -> {
+    EHandle(body, eff, tys, init_opt, alias_opt, clauses, ret_opt) -> {
       let ri = lcr_opt(init_opt, caps, reject_at, file, errs)
       let body_caps = match alias_opt {
         Some(a) ->
-          if eff_is_cell(hsym) { [a, ...caps_remove_name(caps, a)] }
-          else { caps_remove_name(caps, a) }
+          if eff_is_cell(ref_sym(eff)) { [written_text(a.name), ...caps_remove_name(caps, written_text(a.name))] }
+          else { caps_remove_name(caps, written_text(a.name)) }
         None -> caps
       }
       let rb = lcr_expr(body, body_caps, reject_at, file, ri.errs)
@@ -1625,13 +1642,13 @@ fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, f
       # node is torn down at the closing brace. The same positional escape check
       # (a closure that captures `a` and survives the block) applies to both.
       let esc = match alias_opt {
-        Some(a) -> lcr_escape_in_value(rb.expr, a, file)
+        Some(a) -> lcr_escape_in_value(rb.expr, written_text(a.name), file)
         None -> 0
       }
       let rc = lcr_clauses(clauses, caps, reject_at, file, rb.errs + esc)
       let rr = match ret_opt {
         Some(HR(p, rbody, hl, hc)) -> {
-          let r = lcr_expr(rbody, caps_remove_name(caps, p), reject_at, file, rc.errs)
+          let r = lcr_expr(rbody, caps_remove_name(caps, written_text(p.name)), reject_at, file, rc.errs)
           VLExpr { expr: r.expr, errs: r.errs }
         }
         None -> VLExpr { expr: mk_expr(EUnit, line, col), errs: rc.errs }
@@ -1640,7 +1657,7 @@ fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, f
         Some(HR(p, _, hl, hc)) -> Some(HR(p, rr.expr, hl, hc))
         None -> None
       }
-      VLExpr { expr: mk_expr(EHandle(rb.expr, eff, hsym, tys, ri.opt, alias_opt, rc.clauses, ret_opt1), line, col), errs: rr.errs }
+      VLExpr { expr: mk_expr(EHandle(rb.expr, eff, tys, ri.opt, alias_opt, rc.clauses, ret_opt1), line, col), errs: rr.errs }
     }
     EField(base, nm) -> {
       let r = lcr_expr(base, caps, reject_at, file, errs)
@@ -1696,9 +1713,9 @@ fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, f
       let r3 = lcr_opt(opt_step, caps, reject_at, file, r2.errs)
       VLExpr { expr: mk_expr(ERange(r1.expr, r2.expr, r3.opt), line, col), errs: r3.errs }
     }
-    ERecordLit(rh, nm, fields) -> {
+    ERecordLit(rh, fields) -> {
       let r = lcr_fields(fields, caps, reject_at, file, errs)
-      VLExpr { expr: mk_expr(ERecordLit(rh, nm, r.fields), line, col), errs: r.errs }
+      VLExpr { expr: mk_expr(ERecordLit(rh, r.fields), line, col), errs: r.errs }
     }
     EBang(inner) -> {
       let r = lcr_expr(inner, caps, reject_at, file, errs)
@@ -1745,7 +1762,8 @@ fn lcr_block(stmts: [Stmt], tail: Option[Expr], caps: [String], reject_at: Bool,
           }
         }
       }
-      SVar(n, ty, rhs, l, c) -> {
+      SVar(b, ty, rhs, l, c) -> {
+        let n = written_text(b.name)
         # The init runs under the *outer* caps (`var n := n` self-shadows
         # only after the binder, F# / Rust convention).
         let r = lcr_expr(rhs, caps, reject_at, file, errs)
@@ -1756,7 +1774,7 @@ fn lcr_block(stmts: [Stmt], tail: Option[Expr], caps: [String], reject_at: Bool,
         # value reaches the block's exit (tail / returned / stored) — the
         # handler is gone by the time such a closure could run.
         let esc = lcr_escape_check(r2.stmts, r2.opt, n, file)
-        VLStmts { stmts: [SVar(n, ty, r.expr, l, c), ...r2.stmts], opt: r2.opt, errs: r2.errs + esc }
+        VLStmts { stmts: [SVar(b, ty, r.expr, l, c), ...r2.stmts], opt: r2.opt, errs: r2.errs + esc }
       }
       SExprStmt(x) -> {
         let r = lcr_expr(x, caps, reject_at, file, errs)
@@ -1805,7 +1823,7 @@ fn lcr_escape_check(stmts: [Stmt], tail: Option[Expr], n: String, file: String) 
   # (escape vector 3). A capability may only appear as a call argument or an op
   # receiver, never as a return value — reject it directly.
   let direct = match tail {
-    Some(t) -> match t.kind { EName(v) -> if v == n { report_cap_return(n, t.line, t.col, file) } else { 0 } _ -> 0 }
+    Some(t) -> match t.kind { EName(v) -> if written_text(v) == n { report_cap_return(n, t.line, t.col, file) } else { 0 } _ -> 0 }
     None    -> 0
   }
   # A `spawn(task)` anywhere in the block defers `task` to another fiber
@@ -1866,7 +1884,7 @@ fn lcr_taint_stmts(stmts: [Stmt], n: String, tainted: [String]) : [String] {
     [s, ...rest] -> match s {
       SLet(p, _, rhs) -> {
         let t1 = match p.pkind {
-          PBind(f) -> match escaping_closure_pos(rhs, n, tainted) { Some(_) -> [f, ...tainted]  None -> tainted }
+          PBind(f) -> match escaping_closure_pos(rhs, n, tainted) { Some(_) -> [written_text(f.name), ...tainted]  None -> tainted }
           _ -> tainted
         }
         lcr_taint_stmts(rest, n, t1)
@@ -1889,12 +1907,12 @@ fn escaping_closure_pos(e: Expr, n: String, tainted: [String]) : Option[CellPos]
 
   match e.kind {
     ELambda(_, body) -> if contains_cell_access(body, n) { Some(CellPos { line: e.line, col: e.col }) } else { None }
-    EName(f) -> if list_has(tainted, f) { Some(CellPos { line: e.line, col: e.col }) } else { None }
+    EName(f) -> if list_has(tainted, written_text(f)) { Some(CellPos { line: e.line, col: e.col }) } else { None }
     ECall(callee, _) -> match callee.kind {
       # `f(...)` / `(\...)(...)` — applying consumes the closure; the
       # value is the call result, never the closure itself.
       EName(_) -> None
-      ESym(_, _, _) -> None
+      ESym(_, _) -> None
       ELambda(_, _) -> None
       # Any other callee (a field access, a nested call) might itself
       # carry the closure; the arguments do not.
@@ -1908,7 +1926,7 @@ fn escaping_closure_pos(e: Expr, n: String, tainted: [String]) : Option[CellPos]
       escaping_closure_opt(t, n, inner)
     }
     EList(elems) -> elems_escaping_pos(elems, n, tainted)
-    ERecordLit(_, _, fields) -> fields_escaping_pos(fields, n, tainted)
+    ERecordLit(_, fields) -> fields_escaping_pos(fields, n, tainted)
     EField(base, _) -> escaping_closure_pos(base, n, tainted)
     EBang(inner) -> escaping_closure_pos(inner, n, tainted)
     ELitUnit(inner, _) -> escaping_closure_pos(inner, n, tainted)
@@ -1952,7 +1970,7 @@ fn spawn_stmts_escape_pos(stmts: [Stmt], n: String, tainted: [String]) : Option[
 # `s` introduces a fresh binder named `n`, shadowing the cell from here on.
 fn stmt_rebinds_cell(s: Stmt, n: String) : Bool =
   match s {
-    SVar(m, _, _, _, _) -> m == n
+    SVar(m, _, _, _, _) -> written_text(m.name) == n
     SLet(p, _, _) -> list_has(dsg_rename_pat_names(p, []), n)
     _ -> false
   }
@@ -2043,7 +2061,7 @@ fn spawn_arg_escape_pos(e: Expr, n: String, tainted: [String]) : Option[CellPos]
       if list_has(dsg_rename_param_names(ps, []), n) { None }
       else if task_touches_cell(body, n, tainted) { Some(CellPos { line: e.line, col: e.col }) }
       else { None }
-    EName(f) -> if list_has(tainted, f) { Some(CellPos { line: e.line, col: e.col }) } else { None }
+    EName(f) -> if list_has(tainted, written_text(f)) { Some(CellPos { line: e.line, col: e.col }) } else { None }
     _ -> None
   }
 
@@ -2055,12 +2073,12 @@ fn task_touches_cell(e: Expr, n: String, tainted: [String]) : Bool =
     ECall(callee, args_) -> {
       let direct = match callee.kind {
         EField(base, fname) -> match base.kind {
-          EName(m) -> m == n and (fname == "get" or fname == "set")
+          EName(m) -> written_text(m) == n and (fname == "get" or fname == "set")
           _ -> false
         }
         _ -> false
       }
-      let applied = match callee.kind { EName(f) -> list_has(tainted, f)  _ -> false }
+      let applied = match callee.kind { EName(f) -> list_has(tainted, written_text(f))  _ -> false }
       direct or applied or task_touches_cell(callee, n, tainted) or task_args_touch_cell(args_, n, tainted)
     }
     ELambda(ps, body) ->
@@ -2178,7 +2196,7 @@ fn contains_cell_access(e: Expr, n: String) : Bool {
     ECall(callee, args_) -> {
       let here = match callee.kind {
         EField(base, fname) -> match base.kind {
-          EName(m) -> m == n and (fname == "get" or fname == "set")
+          EName(m) -> written_text(m) == n and (fname == "get" or fname == "set")
           _ -> false
         }
         _ -> false
@@ -2196,7 +2214,7 @@ fn contains_cell_access(e: Expr, n: String) : Bool {
       (match t { Some(x) -> contains_cell_access(x, n)  None -> false })
     EMatch(scr, arms) -> contains_cell_access(scr, n) or arms_contain_cell_access(arms, n)
     EList(elems) -> elems_contain_cell_access(elems, n)
-    ERecordLit(_, _, fields) -> fields_contain_cell_access(fields, n)
+    ERecordLit(_, fields) -> fields_contain_cell_access(fields, n)
     ERange(a, b, os) -> contains_cell_access(a, n) or contains_cell_access(b, n) or
       (match os { Some(x) -> contains_cell_access(x, n)  None -> false })
     EPipe(a, b) -> contains_cell_access(a, n) or contains_cell_access(b, n)
@@ -2306,12 +2324,12 @@ fn desugar_var_stmt(s: Stmt) : Stmt {
 # resume in `get`. `set`'s `resume(unit, v)` stores `v` into the slot,
 # which then owns it.
 fn var_canonical_clauses(line: Int, col: Int) : [HClause] {
-  let p_resume = Param { pname: "resume", ptype: None, pline: line, pcol: col, pborrow: false }
-  let p_v      = Param { pname: "v",      ptype: None, pline: line, pcol: col, pborrow: false }
-  let resume_e = mk_ref("resume", line, col)
-  let cell_e   = mk_ref(var_cell_alias(), line, col)
+  let p_resume = Param { binder: binder_written("resume"), ptype: None, pline: line, pcol: col, pborrow: false }
+  let p_v      = Param { binder: binder_written("v"),      ptype: None, pline: line, pcol: col, pborrow: false }
+  let resume_e = mk_name("resume", line, col)
+  let cell_e   = mk_name(var_cell_alias(), line, col)
   let unit_e   = mk_expr(EUnit,           line, col)
-  let v_e      = mk_ref("v",       line, col)
+  let v_e      = mk_name("v",       line, col)
   let get_body = mk_expr(ECall(resume_e, [cell_e]), line, col)
   let set_body = mk_expr(ECall(resume_e, [unit_e, v_e]), line, col)
   [
@@ -2321,7 +2339,7 @@ fn var_canonical_clauses(line: Int, col: Int) : [HClause] {
 }
 
 fn var_canonical_return(line: Int, col: Int) : HReturn {
-  HR("x", mk_ref("x", line, col), line, col)
+  HR(binder_written("x"), mk_name("x", line, col), line, col)
 }
 
 # Variable specialisation: a `var x := init; x; x := v` block compiles
@@ -2340,8 +2358,8 @@ fn var_canonical_return(line: Int, col: Int) : HReturn {
 # conservative checks for 3 and 4 plus the rewrite.
 
 # Trigger 4: init is a normal expression. Conservative subset:
-# literals, EVar (refers to a local or global value), core
-# arithmetic / unary, calls whose callee is a non-effect EVar.
+# literals, a reference (to a local or global value), core
+# arithmetic / unary, calls whose callee is such a reference.
 # Anything else (op call, lambda, handle, match, if, block, list,
 # record, etc.) is rejected so the canonical handler runs instead.
 fn init_is_safe(e: Expr) : Bool {
@@ -2356,13 +2374,15 @@ fn init_is_safe(e: Expr) : Bool {
     EStr(_, _) -> true
     EUnit -> true
     EName(_) -> true
-    ESym(_, _, _) -> true
+    ESym(_, _) -> true
+    ELocal(_) -> true
     EBinop(_, a, b) -> init_is_safe(a) and init_is_safe(b)
     EUnop(_, x) -> init_is_safe(x)
     ECall(callee, args_) -> {
       let callee_ok = match callee.kind {
         EName(_) -> true
-        ESym(_, _, _) -> true
+        ESym(_, _) -> true
+        ELocal(_) -> true
         _ -> false
       }
       callee_ok and init_args_safe(args_)
@@ -2514,17 +2534,19 @@ fn body_escapes(name: String, e: Expr) : Bool {
     EHole(_) -> false
     ETodo(_) -> false
     EExternBody(_, _) -> false
-    EName(n) -> n == name
+    EName(n) -> written_text(n) == name
     # Same reason as the cell scan: an `ESym` is a declaration, and
-    # the binder whose escapes this measures is a local.
-    ESym(_, _, _) -> false
+    # the binder whose escapes this measures is a local the source wrote.
+    ESym(_, _) -> false
+    ELocal(_) -> false
+    EOp(_) -> false
     # A mark is planted after this pass; nothing it stands for can escape.
     EMark(_) -> false
     ECall(callee, args_) -> {
       let callee_is_get_set = match callee.kind {
         EField(base, fname) -> match base.kind {
           EName(n) ->
-            if n == name and (fname == "get" or fname == "set") { true }
+            if written_text(n) == name and (fname == "get" or fname == "set") { true }
             else { false }
           _ -> false
         }
@@ -2548,15 +2570,15 @@ fn body_escapes(name: String, e: Expr) : Bool {
     ELambda(_, _) -> contains_var(name, e)
     EList(elems) -> elems_escape(name, elems)
     ERange(a, b, opt_step) -> body_escapes(name, a) or body_escapes(name, b) or opt_escapes(name, opt_step)
-    ERecordLit(_, _, fields) -> fields_escape(name, fields)
-    EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> body_escapes(name, body) or opt_escapes(name, init_opt) or clauses_escape(name, clauses) or ret_opt_escapes(name, ret_opt)
+    ERecordLit(_, fields) -> fields_escape(name, fields)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> body_escapes(name, body) or opt_escapes(name, init_opt) or clauses_escape(name, clauses) or ret_opt_escapes(name, ret_opt)
     EBang(inner) -> body_escapes(name, inner)
     ELitUnit(inner, _) -> body_escapes(name, inner)
     # `variants[T]()` has no value-level sub-expressions —
     # nothing can mention `name` inside it.
     EVariantsOf(_, _) -> false
-    # Qualified module call mentions a module name and a function name
-    # as plain strings, never the local `name`.
+    # A qualified module call names a module and a function, never the
+    # local `name`.
     EModCall(_, _) -> false
     # A loop intrinsic's lambda args are applied in place (the C emitter
     # pastes their bodies into an inline loop in the enclosing frame), so
@@ -2673,7 +2695,7 @@ fn ret_opt_escapes(name: String, opt: Option[HReturn]) : Bool {
 # the handle). Returns true if `name` appears anywhere in `e`.
 fn contains_var(name: String, e: Expr) : Bool {
   match e.kind {
-    EName(n) -> n == name
+    EName(n) -> written_text(n) == name
     ECall(c, args_) -> contains_var(name, c) or any_contains(name, args_)
     EField(b, _) -> contains_var(name, b)
     EIndex(a, b) -> contains_var(name, a) or contains_var(name, b)
@@ -2686,12 +2708,12 @@ fn contains_var(name: String, e: Expr) : Bool {
     EList(elems) -> elems_contain(name, elems)
     ERange(a, b, opt_step) ->
       contains_var(name, a) or contains_var(name, b) or opt_contains(name, opt_step)
-    ERecordLit(_, _, fields) -> fields_contain(name, fields)
+    ERecordLit(_, fields) -> fields_contain(name, fields)
     EPipe(a, b) -> contains_var(name, a) or contains_var(name, b)
     EMapPipe(a, b) -> contains_var(name, a) or contains_var(name, b)
     EFlatMapPipe(a, b) -> contains_var(name, a) or contains_var(name, b)
     EFilterPipe(a, b) -> contains_var(name, a) or contains_var(name, b)
-    EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> contains_var(name, body) or opt_contains(name, init_opt) or clauses_contain(name, clauses) or ret_opt_contains(name, ret_opt)
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> contains_var(name, body) or opt_contains(name, init_opt) or clauses_contain(name, clauses) or ret_opt_contains(name, ret_opt)
     EBang(inner) -> contains_var(name, inner)
     # A naked `name` read inside a `#{...}` interpolation counts as a
     # mention for the conservative lambda-capture check, the same as it
@@ -2795,7 +2817,7 @@ fn var_slot_name(name: String) : String = string_concat(name, "__slot")
 fn var_slot_of(p: Pattern, rhs: Expr) : Option[VarSlot] = match p.pkind {
   PBind(s) -> match rhs.kind {
     ECall(f, _) -> match f.kind {
-      EMark(MkVarSlot(n)) -> Some(VarSlot(n, s))
+      EMark(MkVarSlot(n)) -> Some(VarSlot(n, written_text(s.name)))
       _ -> None
     }
     _ -> None
@@ -2825,8 +2847,8 @@ fn specialise_kind(name: String, slot_name: String, k: ExprKind, line: Int, col:
       let getset = match callee.kind {
         EField(base, fname) -> match base.kind {
           EName(n) ->
-            if n == name and fname == "get" { Some(VsGet) }
-            else if n == name and fname == "set" { Some(VsSet) }
+            if written_text(n) == name and fname == "get" { Some(VsGet) }
+            else if written_text(n) == name and fname == "set" { Some(VsSet) }
             else { None }
           _ -> None
         }
@@ -2834,7 +2856,7 @@ fn specialise_kind(name: String, slot_name: String, k: ExprKind, line: Int, col:
       }
       match getset {
         Some(op) -> {
-          let slot_e = mk_ref(slot_name, line, col)
+          let slot_e = mk_name(slot_name, line, col)
           let zero = mk_expr(mk_int_synth(0), line, col)
           match op {
             VsGet -> ECall(builtin_mk(CbArrayGet, line, col), [slot_e, zero])
@@ -2873,7 +2895,8 @@ fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
   match stmts {
     [] -> EBlock([], desugar_var_opt(tail))
     [s, ...rest] -> match s {
-      SVar(name, ty, init, line, col) -> {
+      SVar(b, ty, init, line, col) -> {
+        let name = written_text(b.name)
         let init_d0 = desugar_var_expr(init)
         # A declared `: T` binds the cell, so it must be checked against
         # the initialiser. Neither lowering below carries the annotation
@@ -2883,16 +2906,16 @@ fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
         let ann_pre = match ty {
           Some(t) -> {
             let ann_name = string_concat(name, "__ann")
-            [SLet(mk_pat(PBind(ann_name), line, col), Some(t), init_d0)]
+            [SLet(mk_pat(PBind(binder_written(ann_name)), line, col), Some(t), init_d0)]
           }
           None -> []
         }
         let init_d = match ty {
-          Some(_) -> mk_ref(string_concat(name, "__ann"), line, col)
+          Some(_) -> mk_name(string_concat(name, "__ann"), line, col)
           None -> init_d0
         }
         let inner_kind = desugar_var_block(rest, tail)
-        let inner_expr = rc_check_var_writes(name, ty, mk_expr(inner_kind, line, col))
+        let inner_expr = rc_check_var_writes(b.name, ty, mk_expr(inner_kind, line, col))
         # Try variable specialisation first. When all
         # trigger conditions hold, lower the var to a 1-element
         # array slot (core `array_*`, no `Mutable` row) instead
@@ -2909,7 +2932,7 @@ fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
                   [builtin_mk(CbArrayMake, line, col),
                    mk_expr(mk_int_synth(1), line, col), init_d]),
             line, col)
-          let let_pat = mk_pat(PBind(slot_name), line, col)
+          let let_pat = mk_pat(PBind(binder_written(slot_name)), line, col)
           let let_stmt = SLet(let_pat, None, slot_init)
           let body_spec = specialise_body(name, slot_name, inner_expr)
           EBlock(list_append(ann_pre, [let_stmt]), Some(body_spec))
@@ -2917,8 +2940,8 @@ fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
           let tyargs = match ty { Some(t) -> [t] None -> [] }
           let clauses = var_canonical_clauses(line, col)
           let ret = var_canonical_return(line, col)
-          let handle_kind = EHandle(inner_expr, core_effect_name(CeState), core_effect_id(CeState), tyargs,
-                                     Some(init_d), Some(name),
+          let handle_kind = EHandle(inner_expr, DrSym(core_effect_id(CeState)), tyargs,
+                                     Some(init_d), Some(b),
                                      clauses, Some(ret))
           EBlock(ann_pre, Some(mk_expr(handle_kind, line, col)))
         }
@@ -2954,8 +2977,8 @@ fn desugar_var_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
 # `use Effect` opens an effect's ops for bare-name resolution. After
 # this pass every `EName(op_name)` that resolves unambiguously to an
 # op of an effect open in scope is rewritten into the qualified
-# form `EField(EName(eff_name), op_name)`. Downstream the existing
-# `desugar_op_calls` pass turns it into `EName("eff_name.op_name")`.
+# form `EField(ESym(effect), op_name)`: the op, on the declaration of
+# the effect that owns it.
 #
 # Scopes (innermost wins, search outward):
 #   * Block-level: an `SUse(name, _, _)` mid-block opens the effect
@@ -2976,14 +2999,28 @@ fn desugar_var_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
 # rewrite a name that is locally bound.
 
 # Per-effect op table built once per program.
-type EffOps = EffOps(String, [String])
+type EffOps = EffOps(SymId, [String])
+
+# The op table, and the scope a `use` name is settled in: the root
+# file's, whose bodies are the only ones rewritten.
+type UseScope = { ops: [EffOps], sc: DsgScope }
+
+# The effect a `use` names; `sym_none()` when it names none.
+fn use_effect(ux: UseScope, name: String) : SymId = dsg_written_sym(ux.sc, NCEffect, name)
+
+# `opens` with the effect a block-level `use` names; a name that settles
+# to no effect opens nothing.
+fn use_open(ux: UseScope, name: String, opens: [SymId]) : [SymId] = {
+  let eff = use_effect(ux, name)
+  if sym_raw(eff) >= 0 { [eff, ...opens] } else { opens }
+}
 
 fn use_collect_eff_ops(decls: [Decl]) : [EffOps] {
   match decls {
     [] -> []
     [d, ...rest] -> match d {
-      DEffect(_, name, _, ops, _, _, _, _, _) ->
-        [EffOps(name, use_op_names(ops, [])), ...use_collect_eff_ops(rest)]
+      DEffect(_, eff, _, ops, _, _, _, _) ->
+        [EffOps(eff, use_op_names(ops, [])), ...use_collect_eff_ops(rest)]
       _ -> use_collect_eff_ops(rest)
     }
   }
@@ -2998,14 +3035,13 @@ fn use_op_names(ops: [EffectOp], acc: [String]) : [String] {
   }
 }
 
-# Look up the effect names that own a given op name within the
-# active opens. Returns the list of effect names; callers handle
-# zero-/one-/many-result cases.
-fn use_owners_of(table: [EffOps], opens: [String], op_name: String) : [String] =
+# Look up the effects that own a given op name within the active
+# opens. Callers handle zero-/one-/many-result cases.
+fn use_owners_of(table: [EffOps], opens: [SymId], op_name: String) : [SymId] =
   use_owners_of_loop(table, opens, op_name, [])
 
-fn use_owners_of_loop(table: [EffOps], opens: [String], op_name: String,
-                        acc: [String]) : [String] {
+fn use_owners_of_loop(table: [EffOps], opens: [SymId], op_name: String,
+                        acc: [SymId]) : [SymId] {
   match opens {
     [] -> list_reverse(acc)
     [eff, ...rest] -> {
@@ -3019,11 +3055,11 @@ fn use_owners_of_loop(table: [EffOps], opens: [String], op_name: String,
   }
 }
 
-fn use_eff_lookup(table: [EffOps], target: String) : Option[[String]] {
+fn use_eff_lookup(table: [EffOps], target: SymId) : Option[[String]] {
   match table {
     [] -> None
     [h, ...rest] -> match h {
-      EffOps(n, ops) -> if n == target { Some(ops) } else { use_eff_lookup(rest, target) }
+      EffOps(n, ops) -> if sym_raw(n) == sym_raw(target) { Some(ops) } else { use_eff_lookup(rest, target) }
     }
   }
 }
@@ -3042,49 +3078,51 @@ fn use_split_decls(decls: [Decl], opens: [String], acc: [Decl]) : UseSplit {
   }
 }
 
-# Per-Expr rewrite. `opens` is the effective list of effect names
-# active at this point (file-level + outer block-level + fn-level
-# + this block's prior SUse declarations). `bound` is the list of
-# locally-bound names that shadow opens. `table` and `file` are
-# threaded through for diagnostics. `errs_ref` is captured by mutable
-# state via a record return.
+# Per-Expr rewrite. `opens` is the effective list of effects active
+# at this point (file-level + outer block-level + fn-level + this
+# block's prior SUse declarations). `bound` is the list of
+# locally-bound names that shadow opens. The error count is threaded
+# through a record return.
 type UseRw = { expr: Expr, errs: Int }
 
-fn use_rewrite_expr(e: Expr, table: [EffOps], opens: [String],
+fn use_rewrite_expr(e: Expr, ux: UseScope, opens: [SymId],
                       bound: [String], file: String, errs: Int) : UseRw / Console + File {
 
 
-  let r = use_rewrite_kind(e.kind, table, opens, bound, file, errs,
+  let r = use_rewrite_kind(e.kind, ux, opens, bound, file, errs,
                             e.line, e.col)
   UseRw { expr: Expr { kind: r.expr.kind, line: e.line, col: e.col,
                        ty: e.ty, mode: e.mode,  site: e.site },
           errs: r.errs }
 }
 
-fn use_rewrite_kind(k: ExprKind, table: [EffOps], opens: [String],
+fn use_rewrite_kind(k: ExprKind, ux: UseScope, opens: [SymId],
                       bound: [String], file: String, errs: Int,
                       line: Int, col: Int) : UseRw / Console + File {
 
 
   match k {
-    EName(name) -> {
+    EName(w) -> {
+      let name = written_text(w)
       if list_has(bound, name) {
-        UseRw { expr: mk_ref(name, line, col), errs: errs }
+        UseRw { expr: mk_name(name, line, col), errs: errs }
       } else {
-        let owners = use_owners_of(table, opens, name)
+        let owners = use_owners_of(ux.ops, opens, name)
         match owners {
-          []        -> UseRw { expr: mk_ref(name, line, col), errs: errs }
+          []        -> UseRw { expr: mk_name(name, line, col), errs: errs }
           [eff]     -> {
-            # Rewrite to `EField(EName(eff), name)`; desugar_op_calls
-            # later flattens it to `EName("eff.name")`.
-            let base = mk_ref(eff, line, col)
+            # The op of the one effect that owns it: `Eff.name`, on
+            # that effect's declaration.
+            let base = mk_sym(eff, line, col)
             UseRw { expr: mk_expr(EField(base, name), line, col), errs: errs }
           }
-          [eff1, eff2, ...___] -> {
+          [e1, e2, ...___] -> {
+            let eff1 = decl_name(ux.sc.tab, e1)
+            let eff2 = decl_name(ux.sc.tab, e2)
             diag_error(file, line, col,
               "ambiguous bare name `#{name}`: opened by both `#{eff1}` and `#{eff2}`")
             diag_help("qualify explicitly (e.g. `#{eff1}.#{name}` or `#{eff2}.#{name}`) or remove one of the `use` declarations")
-            UseRw { expr: mk_ref(name, line, col), errs: errs + 1 }
+            UseRw { expr: mk_name(name, line, col), errs: errs + 1 }
           }
         }
       }
@@ -3092,31 +3130,31 @@ fn use_rewrite_kind(k: ExprKind, table: [EffOps], opens: [String],
     ELambda(ps, body) -> {
       let pn = use_param_names(ps, [])
       let body_bound = list_append(bound, pn)
-      let rb = use_rewrite_expr(body, table, opens, body_bound, file, errs)
+      let rb = use_rewrite_expr(body, ux, opens, body_bound, file, errs)
       UseRw { expr: mk_expr(ELambda(ps, rb.expr), line, col), errs: rb.errs }
     }
     EBlock(stmts, tail) -> {
-      let r = use_rewrite_block(stmts, tail, table, opens, bound, file, errs,
+      let r = use_rewrite_block(stmts, tail, ux, opens, bound, file, errs,
                                   [], opens)
       UseRw { expr: mk_expr(EBlock(r.stmts, r.tail), line, col), errs: r.errs }
     }
     EMatch(scr, arms) -> {
-      let rs = use_rewrite_expr(scr, table, opens, bound, file, errs)
-      let ra = use_rewrite_arms(arms, table, opens, bound, file, rs.errs)
+      let rs = use_rewrite_expr(scr, ux, opens, bound, file, errs)
+      let ra = use_rewrite_arms(arms, ux, opens, bound, file, rs.errs)
       UseRw { expr: mk_expr(EMatch(rs.expr, ra.arms), line, col), errs: ra.errs }
     }
-    EHandle(body, eff_name, hsym, eff_tas, init_opt, alias, clauses, ret_opt) -> {
-      let rb = use_rewrite_expr(body, table, opens,
+    EHandle(body, eff, eff_tas, init_opt, alias, clauses, ret_opt) -> {
+      let rb = use_rewrite_expr(body, ux, opens,
                                  use_alias_bound(alias, bound), file, errs)
       let ri = match init_opt {
         None    -> UseRw { expr: mk_expr(EUnit, line, col), errs: rb.errs }
-        Some(e) -> use_rewrite_expr(e, table, opens, bound, file, rb.errs)
+        Some(e) -> use_rewrite_expr(e, ux, opens, bound, file, rb.errs)
       }
       let init_out = match init_opt { None -> None Some(_) -> Some(ri.expr) }
-      let rc = use_rewrite_clauses(clauses, table, opens, bound, file, ri.errs)
-      let rr = use_rewrite_opt_return(ret_opt, table, opens, bound, file, rc.errs)
+      let rc = use_rewrite_clauses(clauses, ux, opens, bound, file, ri.errs)
+      let rr = use_rewrite_opt_return(ret_opt, ux, opens, bound, file, rc.errs)
       UseRw {
-        expr: mk_expr(EHandle(rb.expr, eff_name, hsym, eff_tas, init_out, alias,
+        expr: mk_expr(EHandle(rb.expr, eff, eff_tas, init_out, alias,
                                 rc.clauses, rr.ret),
                        line, col),
         errs: rr.errs
@@ -3126,7 +3164,7 @@ fn use_rewrite_kind(k: ExprKind, table: [EffOps], opens: [String],
       let _st = UseRw { expr: mk_expr(k, line, col), errs: errs }
       let rk = dsg_map_expr_kind(k, (sub) => sub)   # placeholder to avoid recursion
       let _ = rk
-      let mapped = use_rewrite_kind_default(k, table, opens, bound, file,
+      let mapped = use_rewrite_kind_default(k, ux, opens, bound, file,
                                               errs, line, col)
       mapped
     }
@@ -3138,7 +3176,7 @@ fn use_rewrite_kind(k: ExprKind, table: [EffOps], opens: [String],
 # count.
 type UseRwAcc = { errs: Int }
 
-fn use_rewrite_kind_default(k: ExprKind, table: [EffOps], opens: [String],
+fn use_rewrite_kind_default(k: ExprKind, ux: UseScope, opens: [SymId],
                               bound: [String], file: String, errs: Int,
                               line: Int, col: Int) : UseRw / Console + File {
 
@@ -3147,7 +3185,7 @@ fn use_rewrite_kind_default(k: ExprKind, table: [EffOps], opens: [String],
   # functions. `acc_ref` is updated in-place by hooking through the
   # recursion.
   let acc0 = UseRwAcc { errs: errs }
-  let pair = use_rewrite_recurse(k, table, opens, bound, file, acc0)
+  let pair = use_rewrite_recurse(k, ux, opens, bound, file, acc0)
   UseRw { expr: mk_expr(pair.kind, line, col), errs: pair.acc.errs }
 }
 
@@ -3157,7 +3195,7 @@ fn use_rewrite_kind_default(k: ExprKind, table: [EffOps], opens: [String],
 # breaks here at the same single match site.
 type UseKindAcc = { kind: ExprKind, acc: UseRwAcc }
 
-fn use_rewrite_recurse(k: ExprKind, table: [EffOps], opens: [String],
+fn use_rewrite_recurse(k: ExprKind, ux: UseScope, opens: [SymId],
                          bound: [String], file: String,
                          acc: UseRwAcc) : UseKindAcc / Console + File {
 
@@ -3174,7 +3212,9 @@ fn use_rewrite_recurse(k: ExprKind, table: [EffOps], opens: [String],
     EUnit          -> UseKindAcc { kind: k, acc: acc }
     EName(_)        -> UseKindAcc { kind: k, acc: acc }
     EMark(_)        -> UseKindAcc { kind: k, acc: acc }
-    ESym(_, _, _)        -> UseKindAcc { kind: k, acc: acc }
+    ESym(_, _)        -> UseKindAcc { kind: k, acc: acc }
+    ELocal(_)       -> UseKindAcc { kind: k, acc: acc }
+    EOp(_)          -> UseKindAcc { kind: k, acc: acc }
     EUnder         -> UseKindAcc { kind: k, acc: acc }
     EPlaceholder   -> UseKindAcc { kind: k, acc: acc }
     EHole(_)       -> UseKindAcc { kind: k, acc: acc }
@@ -3185,101 +3225,101 @@ fn use_rewrite_recurse(k: ExprKind, table: [EffOps], opens: [String],
     # no names — pass through unchanged.
     EModCall(_, _) -> UseKindAcc { kind: k, acc: acc }
     EIntrinsic(name, args_) -> {
-      let ra = use_rewrite_exprs(args_, table, opens, bound, file, acc.errs, [])
+      let ra = use_rewrite_exprs(args_, ux, opens, bound, file, acc.errs, [])
       UseKindAcc { kind: EIntrinsic(name, ra.exprs), acc: UseRwAcc { errs: ra.errs } }
     }
     ESurface(sf) -> {
-      let ra = use_rewrite_exprs(surface_children(sf), table, opens, bound, file, acc.errs, [])
+      let ra = use_rewrite_exprs(surface_children(sf), ux, opens, bound, file, acc.errs, [])
       UseKindAcc { kind: ESurface(surface_rebuild(sf, ra.exprs)), acc: UseRwAcc { errs: ra.errs } }
     }
     ECall(callee, args_) -> {
-      let rc = use_rewrite_expr(callee, table, opens, bound, file, acc.errs)
-      let ra = use_rewrite_exprs(args_, table, opens, bound, file, rc.errs, [])
+      let rc = use_rewrite_expr(callee, ux, opens, bound, file, acc.errs)
+      let ra = use_rewrite_exprs(args_, ux, opens, bound, file, rc.errs, [])
       UseKindAcc { kind: ECall(rc.expr, ra.exprs), acc: UseRwAcc { errs: ra.errs } }
     }
     EField(base, name) -> {
-      let rb = use_rewrite_expr(base, table, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(base, ux, opens, bound, file, acc.errs)
       UseKindAcc { kind: EField(rb.expr, name), acc: UseRwAcc { errs: rb.errs } }
     }
     EIndex(a, b) -> {
-      let ra = use_rewrite_expr(a, table, opens, bound, file, acc.errs)
-      let rb = use_rewrite_expr(b, table, opens, bound, file, ra.errs)
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
       UseKindAcc { kind: EIndex(ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
     }
     EBinop(op, a, b) -> {
-      let ra = use_rewrite_expr(a, table, opens, bound, file, acc.errs)
-      let rb = use_rewrite_expr(b, table, opens, bound, file, ra.errs)
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
       UseKindAcc { kind: EBinop(op, ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
     }
     EUnop(op, x) -> {
-      let r = use_rewrite_expr(x, table, opens, bound, file, acc.errs)
+      let r = use_rewrite_expr(x, ux, opens, bound, file, acc.errs)
       UseKindAcc { kind: EUnop(op, r.expr), acc: UseRwAcc { errs: r.errs } }
     }
     EIf(c, t_, eo) -> {
-      let rc = use_rewrite_expr(c, table, opens, bound, file, acc.errs)
-      let rt = use_rewrite_expr(t_, table, opens, bound, file, rc.errs)
-      let re = use_rewrite_opt(eo, table, opens, bound, file, rt.errs)
+      let rc = use_rewrite_expr(c, ux, opens, bound, file, acc.errs)
+      let rt = use_rewrite_expr(t_, ux, opens, bound, file, rc.errs)
+      let re = use_rewrite_opt(eo, ux, opens, bound, file, rt.errs)
       UseKindAcc { kind: EIf(rc.expr, rt.expr, re.expr), acc: UseRwAcc { errs: re.errs } }
     }
     EList(els) -> {
-      let r = use_rewrite_elems(els, table, opens, bound, file, acc.errs, [])
+      let r = use_rewrite_elems(els, ux, opens, bound, file, acc.errs, [])
       UseKindAcc { kind: EList(r.elems), acc: UseRwAcc { errs: r.errs } }
     }
-    ERecordLit(rh, name, fis) -> {
-      let r = use_rewrite_fields(fis, table, opens, bound, file, acc.errs, [])
-      UseKindAcc { kind: ERecordLit(rh, name, r.fields), acc: UseRwAcc { errs: r.errs } }
+    ERecordLit(rh, fis) -> {
+      let r = use_rewrite_fields(fis, ux, opens, bound, file, acc.errs, [])
+      UseKindAcc { kind: ERecordLit(rh, r.fields), acc: UseRwAcc { errs: r.errs } }
     }
     ERange(a, b, opt_step) -> {
-      let ra = use_rewrite_expr(a, table, opens, bound, file, acc.errs)
-      let rb = use_rewrite_expr(b, table, opens, bound, file, ra.errs)
-      let rs = use_rewrite_opt(opt_step, table, opens, bound, file, rb.errs)
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
+      let rs = use_rewrite_opt(opt_step, ux, opens, bound, file, rb.errs)
       UseKindAcc { kind: ERange(ra.expr, rb.expr, rs.expr), acc: UseRwAcc { errs: rs.errs } }
     }
     EPipe(a, b) -> {
-      let ra = use_rewrite_expr(a, table, opens, bound, file, acc.errs)
-      let rb = use_rewrite_expr(b, table, opens, bound, file, ra.errs)
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
       UseKindAcc { kind: EPipe(ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
     }
     EMapPipe(a, b) -> {
-      let ra = use_rewrite_expr(a, table, opens, bound, file, acc.errs)
-      let rb = use_rewrite_expr(b, table, opens, bound, file, ra.errs)
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
       UseKindAcc { kind: EMapPipe(ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
     }
     EFlatMapPipe(a, b) -> {
-      let ra = use_rewrite_expr(a, table, opens, bound, file, acc.errs)
-      let rb = use_rewrite_expr(b, table, opens, bound, file, ra.errs)
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
       UseKindAcc { kind: EFlatMapPipe(ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
     }
     EFilterPipe(a, b) -> {
-      let ra = use_rewrite_expr(a, table, opens, bound, file, acc.errs)
-      let rb = use_rewrite_expr(b, table, opens, bound, file, ra.errs)
+      let ra = use_rewrite_expr(a, ux, opens, bound, file, acc.errs)
+      let rb = use_rewrite_expr(b, ux, opens, bound, file, ra.errs)
       UseKindAcc { kind: EFilterPipe(ra.expr, rb.expr), acc: UseRwAcc { errs: rb.errs } }
     }
     ELitUnit(inner, u) -> {
-      let r = use_rewrite_expr(inner, table, opens, bound, file, acc.errs)
+      let r = use_rewrite_expr(inner, ux, opens, bound, file, acc.errs)
       UseKindAcc { kind: ELitUnit(r.expr, u), acc: UseRwAcc { errs: r.errs } }
     }
     EBang(inner) -> {
-      let r = use_rewrite_expr(inner, table, opens, bound, file, acc.errs)
+      let r = use_rewrite_expr(inner, ux, opens, bound, file, acc.errs)
       UseKindAcc { kind: EBang(r.expr), acc: UseRwAcc { errs: r.errs } }
     }
     ELambda(_, _) -> UseKindAcc { kind: k, acc: acc }   # handled outer
     EBlock(_, _)  -> UseKindAcc { kind: k, acc: acc }   # handled outer
     EMatch(_, _)  -> UseKindAcc { kind: k, acc: acc }   # handled outer
-    EHandle(_, _, _, _, _, _, _, _) -> UseKindAcc { kind: k, acc: acc }   # handled outer
+    EHandle(_, _, _, _, _, _, _) -> UseKindAcc { kind: k, acc: acc }   # handled outer
   }
 }
 
 type UseRwOpt = { expr: Option[Expr], errs: Int }
 
-fn use_rewrite_opt(o: Option[Expr], table: [EffOps], opens: [String],
+fn use_rewrite_opt(o: Option[Expr], ux: UseScope, opens: [SymId],
                      bound: [String], file: String, errs: Int) : UseRwOpt / Console + File {
 
 
   match o {
     None -> UseRwOpt { expr: None, errs: errs }
     Some(e) -> {
-      let r = use_rewrite_expr(e, table, opens, bound, file, errs)
+      let r = use_rewrite_expr(e, ux, opens, bound, file, errs)
       UseRwOpt { expr: Some(r.expr), errs: r.errs }
     }
   }
@@ -3287,7 +3327,7 @@ fn use_rewrite_opt(o: Option[Expr], table: [EffOps], opens: [String],
 
 type UseRwExprs = { exprs: [Expr], errs: Int }
 
-fn use_rewrite_exprs(es: [Expr], table: [EffOps], opens: [String],
+fn use_rewrite_exprs(es: [Expr], ux: UseScope, opens: [SymId],
                        bound: [String], file: String, errs: Int,
                        acc: [Expr]) : UseRwExprs / Console + File {
 
@@ -3295,15 +3335,15 @@ fn use_rewrite_exprs(es: [Expr], table: [EffOps], opens: [String],
   match es {
     [] -> UseRwExprs { exprs: list_reverse(acc), errs: errs }
     [h, ...rest] -> {
-      let r = use_rewrite_expr(h, table, opens, bound, file, errs)
-      use_rewrite_exprs(rest, table, opens, bound, file, r.errs, [r.expr, ...acc])
+      let r = use_rewrite_expr(h, ux, opens, bound, file, errs)
+      use_rewrite_exprs(rest, ux, opens, bound, file, r.errs, [r.expr, ...acc])
     }
   }
 }
 
 type UseRwElems = { elems: [ListElem], errs: Int }
 
-fn use_rewrite_elems(els: [ListElem], table: [EffOps], opens: [String],
+fn use_rewrite_elems(els: [ListElem], ux: UseScope, opens: [SymId],
                        bound: [String], file: String, errs: Int,
                        acc: [ListElem]) : UseRwElems / Console + File {
 
@@ -3313,23 +3353,23 @@ fn use_rewrite_elems(els: [ListElem], table: [EffOps], opens: [String],
     [el, ...rest] -> {
       let r1 = match el {
         ElPlain(x)  -> {
-          let r = use_rewrite_expr(x, table, opens, bound, file, errs)
+          let r = use_rewrite_expr(x, ux, opens, bound, file, errs)
           UseRwElems { elems: [ElPlain(r.expr)], errs: r.errs }
         }
         ElSpread(x) -> {
-          let r = use_rewrite_expr(x, table, opens, bound, file, errs)
+          let r = use_rewrite_expr(x, ux, opens, bound, file, errs)
           UseRwElems { elems: [ElSpread(r.expr)], errs: r.errs }
         }
       }
       let head = match r1.elems { [h, ..._t] -> h _ -> ElPlain(mk_expr(EUnit, 0, 0)) }
-      use_rewrite_elems(rest, table, opens, bound, file, r1.errs, [head, ...acc])
+      use_rewrite_elems(rest, ux, opens, bound, file, r1.errs, [head, ...acc])
     }
   }
 }
 
 type UseRwFields = { fields: [FieldInit], errs: Int }
 
-fn use_rewrite_fields(fs: [FieldInit], table: [EffOps], opens: [String],
+fn use_rewrite_fields(fs: [FieldInit], ux: UseScope, opens: [SymId],
                         bound: [String], file: String, errs: Int,
                         acc: [FieldInit]) : UseRwFields / Console + File {
 
@@ -3338,8 +3378,8 @@ fn use_rewrite_fields(fs: [FieldInit], table: [EffOps], opens: [String],
     [] -> UseRwFields { fields: list_reverse(acc), errs: errs }
     [fi, ...rest] -> match fi {
       FI(n, v) -> {
-        let r = use_rewrite_expr(v, table, opens, bound, file, errs)
-        use_rewrite_fields(rest, table, opens, bound, file, r.errs, [FI(n, r.expr), ...acc])
+        let r = use_rewrite_expr(v, ux, opens, bound, file, errs)
+        use_rewrite_fields(rest, ux, opens, bound, file, r.errs, [FI(n, r.expr), ...acc])
       }
     }
   }
@@ -3347,14 +3387,14 @@ fn use_rewrite_fields(fs: [FieldInit], table: [EffOps], opens: [String],
 
 type UseRwArms = { arms: [Arm], errs: Int }
 
-fn use_rewrite_arms(arms: [Arm], table: [EffOps], opens: [String],
+fn use_rewrite_arms(arms: [Arm], ux: UseScope, opens: [SymId],
                       bound: [String], file: String, errs: Int) : UseRwArms / Console + File {
 
 
-  use_rewrite_arms_loop(arms, table, opens, bound, file, errs, [])
+  use_rewrite_arms_loop(arms, ux, opens, bound, file, errs, [])
 }
 
-fn use_rewrite_arms_loop(arms: [Arm], table: [EffOps], opens: [String],
+fn use_rewrite_arms_loop(arms: [Arm], ux: UseScope, opens: [SymId],
                            bound: [String], file: String, errs: Int,
                            acc: [Arm]) : UseRwArms / Console + File {
 
@@ -3364,9 +3404,9 @@ fn use_rewrite_arms_loop(arms: [Arm], table: [EffOps], opens: [String],
     [a, ...rest] -> match a {
       Arm(p, g, b) -> {
         let arm_bound = list_append(bound, dsg_pat_bindings(p, []))
-        let rg = use_rewrite_opt(g, table, opens, arm_bound, file, errs)
-        let rb = use_rewrite_expr(b, table, opens, arm_bound, file, rg.errs)
-        use_rewrite_arms_loop(rest, table, opens, bound, file, rb.errs,
+        let rg = use_rewrite_opt(g, ux, opens, arm_bound, file, errs)
+        let rb = use_rewrite_expr(b, ux, opens, arm_bound, file, rg.errs)
+        use_rewrite_arms_loop(rest, ux, opens, bound, file, rb.errs,
                                 [Arm(p, rg.expr, rb.expr), ...acc])
       }
     }
@@ -3375,14 +3415,14 @@ fn use_rewrite_arms_loop(arms: [Arm], table: [EffOps], opens: [String],
 
 type UseRwClauses = { clauses: [HClause], errs: Int }
 
-fn use_rewrite_clauses(cs: [HClause], table: [EffOps], opens: [String],
+fn use_rewrite_clauses(cs: [HClause], ux: UseScope, opens: [SymId],
                          bound: [String], file: String, errs: Int) : UseRwClauses / Console + File {
 
 
-  use_rewrite_clauses_loop(cs, table, opens, bound, file, errs, [])
+  use_rewrite_clauses_loop(cs, ux, opens, bound, file, errs, [])
 }
 
-fn use_rewrite_clauses_loop(cs: [HClause], table: [EffOps], opens: [String],
+fn use_rewrite_clauses_loop(cs: [HClause], ux: UseScope, opens: [SymId],
                               bound: [String], file: String, errs: Int,
                               acc: [HClause]) : UseRwClauses / Console + File {
 
@@ -3392,8 +3432,8 @@ fn use_rewrite_clauses_loop(cs: [HClause], table: [EffOps], opens: [String],
     [c, ...rest] -> match c {
       HC(n, ps, b, l, co) -> {
         let body_bound = list_append(bound, use_param_names(ps, []))
-        let r = use_rewrite_expr(b, table, opens, body_bound, file, errs)
-        use_rewrite_clauses_loop(rest, table, opens, bound, file, r.errs,
+        let r = use_rewrite_expr(b, ux, opens, body_bound, file, errs)
+        use_rewrite_clauses_loop(rest, ux, opens, bound, file, r.errs,
                                    [HC(n, ps, r.expr, l, co), ...acc])
       }
     }
@@ -3402,8 +3442,8 @@ fn use_rewrite_clauses_loop(cs: [HClause], table: [EffOps], opens: [String],
 
 type UseRwRet = { ret: Option[HReturn], errs: Int }
 
-fn use_rewrite_opt_return(ret_opt: Option[HReturn], table: [EffOps],
-                            opens: [String], bound: [String],
+fn use_rewrite_opt_return(ret_opt: Option[HReturn], ux: UseScope,
+                            opens: [SymId], bound: [String],
                             file: String, errs: Int) : UseRwRet / Console + File {
 
 
@@ -3411,8 +3451,8 @@ fn use_rewrite_opt_return(ret_opt: Option[HReturn], table: [EffOps],
     None -> UseRwRet { ret: None, errs: errs }
     Some(r) -> match r {
       HR(p, b, l, c) -> {
-        let body_bound = [p, ...bound]
-        let rb = use_rewrite_expr(b, table, opens, body_bound, file, errs)
+        let body_bound = [written_text(p.name), ...bound]
+        let rb = use_rewrite_expr(b, ux, opens, body_bound, file, errs)
         UseRwRet { ret: Some(HR(p, rb.expr, l, c)), errs: rb.errs }
       }
     }
@@ -3424,64 +3464,64 @@ fn use_rewrite_opt_return(ret_opt: Option[HReturn], table: [EffOps],
 # extends it and the extension lives only for the rest of the block.
 type UseRwBlock = { stmts: [Stmt], tail: Option[Expr], errs: Int }
 
-fn use_rewrite_block(stmts: [Stmt], tail: Option[Expr], table: [EffOps],
-                       outer_opens: [String], bound: [String],
+fn use_rewrite_block(stmts: [Stmt], tail: Option[Expr], ux: UseScope,
+                       outer_opens: [SymId], bound: [String],
                        file: String, errs: Int,
-                       acc: [Stmt], opens: [String]) : UseRwBlock / Console + File {
+                       acc: [Stmt], opens: [SymId]) : UseRwBlock / Console + File {
 
 
   match stmts {
     [] -> {
-      let rt = use_rewrite_opt(tail, table, opens, bound, file, errs)
+      let rt = use_rewrite_opt(tail, ux, opens, bound, file, errs)
       UseRwBlock { stmts: list_reverse(acc), tail: rt.expr, errs: rt.errs }
     }
     [s, ...rest] -> match s {
       SUse(name, _, _) -> {
         # Extend opens for the rest of the block. The SUse itself
         # is stripped from the output.
-        use_rewrite_block(rest, tail, table, outer_opens, bound,
-                            file, errs, acc, [name, ...opens])
+        use_rewrite_block(rest, tail, ux, outer_opens, bound,
+                            file, errs, acc, use_open(ux, name, opens))
       }
       SLet(p, ann, rhs) -> {
-        let rr = use_rewrite_expr(rhs, table, opens, bound, file, errs)
+        let rr = use_rewrite_expr(rhs, ux, opens, bound, file, errs)
         let bound1 = list_append(bound, dsg_pat_bindings(p, []))
-        use_rewrite_block(rest, tail, table, outer_opens, bound1,
+        use_rewrite_block(rest, tail, ux, outer_opens, bound1,
                             file, rr.errs,
                             [SLet(p, ann, rr.expr), ...acc], opens)
       }
       SVar(n, ty, rhs, l, c) -> {
-        let rr = use_rewrite_expr(rhs, table, opens, bound, file, errs)
-        let bound1 = [n, ...bound]
-        use_rewrite_block(rest, tail, table, outer_opens, bound1,
+        let rr = use_rewrite_expr(rhs, ux, opens, bound, file, errs)
+        let bound1 = [written_text(n.name), ...bound]
+        use_rewrite_block(rest, tail, ux, outer_opens, bound1,
                             file, rr.errs,
                             [SVar(n, ty, rr.expr, l, c), ...acc], opens)
       }
       SAssert(c, m) -> {
-        let rc = use_rewrite_expr(c, table, opens, bound, file, errs)
-        let rm = use_rewrite_opt(m, table, opens, bound, file, rc.errs)
-        use_rewrite_block(rest, tail, table, outer_opens, bound,
+        let rc = use_rewrite_expr(c, ux, opens, bound, file, errs)
+        let rm = use_rewrite_opt(m, ux, opens, bound, file, rc.errs)
+        use_rewrite_block(rest, tail, ux, outer_opens, bound,
                             file, rm.errs,
                             [SAssert(rc.expr, rm.expr), ...acc], opens)
       }
       SExprStmt(x) -> {
-        let r = use_rewrite_expr(x, table, opens, bound, file, errs)
-        use_rewrite_block(rest, tail, table, outer_opens, bound,
+        let r = use_rewrite_expr(x, ux, opens, bound, file, errs)
+        use_rewrite_block(rest, tail, ux, outer_opens, bound,
                             file, r.errs,
                             [SExprStmt(r.expr), ...acc], opens)
       }
       SIndexAssign(b, i, v, l, c) -> {
-        let rb = use_rewrite_expr(b, table, opens, bound, file, errs)
-        let ri = use_rewrite_expr(i, table, opens, bound, file, rb.errs)
-        let rv = use_rewrite_expr(v, table, opens, bound, file, ri.errs)
-        use_rewrite_block(rest, tail, table, outer_opens, bound,
+        let rb = use_rewrite_expr(b, ux, opens, bound, file, errs)
+        let ri = use_rewrite_expr(i, ux, opens, bound, file, rb.errs)
+        let rv = use_rewrite_expr(v, ux, opens, bound, file, ri.errs)
+        use_rewrite_block(rest, tail, ux, outer_opens, bound,
                             file, rv.errs,
                             [SIndexAssign(rb.expr, ri.expr, rv.expr, l, c),
                              ...acc], opens)
       }
       SAssign(b, v, l, c) -> {
-        let rb = use_rewrite_expr(b, table, opens, bound, file, errs)
-        let rv = use_rewrite_expr(v, table, opens, bound, file, rb.errs)
-        use_rewrite_block(rest, tail, table, outer_opens, bound,
+        let rb = use_rewrite_expr(b, ux, opens, bound, file, errs)
+        let rv = use_rewrite_expr(v, ux, opens, bound, file, rb.errs)
+        use_rewrite_block(rest, tail, ux, outer_opens, bound,
                             file, rv.errs,
                             [SAssign(rb.expr, rv.expr, l, c),
                              ...acc], opens)
@@ -3493,45 +3533,49 @@ fn use_rewrite_block(stmts: [Stmt], tail: Option[Expr], table: [EffOps],
 fn use_param_names(ps: [Param], acc: [String]) : [String] {
   match ps {
     [] -> list_reverse(acc)
-    [p, ...rest] -> use_param_names(rest, [p.pname, ...acc])
+    [p, ...rest] -> use_param_names(rest, [written_text(p.binder.name), ...acc])
   }
 }
 
-fn use_alias_bound(alias: Option[String], bound: [String]) : [String] {
+fn use_alias_bound(alias: Option[Binder], bound: [String]) : [String] {
   match alias {
     None    -> bound
-    Some(a) -> [a, ...bound]
+    Some(a) -> [written_text(a.name), ...bound]
   }
 }
 
-# Top-level entry — runs after inject_builtin_effects so the builtin
-# effect names are in the table.
 #[doc("Result of the `use Effect` desugar: the rewritten decls plus an error count.")]
 pub type UseRwProgram = { decls: [Decl], errs: Int }
 
-#[doc("Strip file-level `use Effect` decls and rewrite bare op references inside their scope to qualified `Eff.op` calls.")]
-pub fn desugar_use_decls(decls: [Decl], file: String) : UseRwProgram / Console + File {
+#[doc("Strip file-level `use Effect` decls and rewrite bare op references inside their scope to `Eff.op` on the effect's declaration. A `use` name is settled against `tab` under the view of the `root` file.")]
+pub fn desugar_use_decls(decls: [Decl], tab: SymTab, views: FileViews, root: String, file: String) : UseRwProgram / Console + File {
 
 
   let split = use_split_decls(decls, [], [])
-  let table = use_collect_eff_ops(split.decls)
-  # Validate file_opens reference declared effects.
-  let errs0 = use_validate_opens(split.file_opens, table, file, 0)
-  use_rewrite_program(split.decls, table, split.file_opens, file, errs0, [])
+  let ux = UseScope { ops: use_collect_eff_ops(split.decls), sc: DsgScope { tab: tab, views: views, home: root } }
+  let opened = use_file_opens(split.file_opens, ux, file, [], 0)
+  use_rewrite_program(split.decls, ux, opened.opens, file, opened.errs, [])
 }
 
-fn use_validate_opens(opens: [String], table: [EffOps], file: String,
-                        errs: Int) : Int / Console + File {
+type UseOpens = { opens: [SymId], errs: Int }
+
+# The effects the file-level `use` names open, in order; a name that
+# settles to no declared effect is reported and opens nothing.
+fn use_file_opens(names: [String], ux: UseScope, file: String,
+                    acc: [SymId], errs: Int) : UseOpens / Console + File {
 
 
-  match opens {
-    [] -> errs
-    [name, ...rest] -> match use_eff_lookup(table, name) {
-      Some(_) -> use_validate_opens(rest, table, file, errs)
-      None    -> {
-        diag_error(file, 0, 0, "`use #{name}`: no effect named `#{name}` is in scope")
-        diag_help("declare the effect (`effect #{name} { ... }`) or import the module that declares it")
-        use_validate_opens(rest, table, file, errs + 1)
+  match names {
+    [] -> UseOpens { opens: list_reverse(acc), errs: errs }
+    [name, ...rest] -> {
+      let eff = use_effect(ux, name)
+      match use_eff_lookup(ux.ops, eff) {
+        Some(_) -> use_file_opens(rest, ux, file, [eff, ...acc], errs)
+        None    -> {
+          diag_error(file, 0, 0, "`use #{name}`: no effect named `#{name}` is in scope")
+          diag_help("declare the effect (`effect #{name} { ... }`) or import the module that declares it")
+          use_file_opens(rest, ux, file, acc, errs + 1)
+        }
       }
     }
   }
@@ -3544,7 +3588,7 @@ fn use_validate_opens(opens: [String], table: [EffOps], file: String,
 # untouched; rewriting it would re-point its bare `print` at the user's
 # opened op. Only root-origin (`None`) decls are rewritten.
 fn use_decl_is_root(d: Decl) : Bool = match d {
-  DFn(_, _, _, _, _, _, _, _, _, mo, fsym)    -> mo_is_none(mo)
+  DFn(_, _, _, _, _, _, _, _, _, mo)    -> mo_is_none(mo)
   DTest(_, _, _, _, _)                     -> true
   DBench(_, _, _, _, _)                    -> true
   DCheck(_, _, _, _, _, _)                 -> true
@@ -3560,7 +3604,7 @@ fn use_decl_is_root(d: Decl) : Bool = match d {
 
 fn mo_is_none(mo: Option[String]) : Bool = match mo { None -> true  Some(_) -> false }
 
-fn use_rewrite_program(decls: [Decl], table: [EffOps], file_opens: [String],
+fn use_rewrite_program(decls: [Decl], ux: UseScope, file_opens: [SymId],
                          file: String, errs: Int, acc: [Decl]) : UseRwProgram / Console + File {
 
 
@@ -3568,78 +3612,78 @@ fn use_rewrite_program(decls: [Decl], table: [EffOps], file_opens: [String],
     [] -> UseRwProgram { decls: list_reverse(acc), errs: errs }
     [d, ...rest] -> {
       let r = if use_decl_is_root(d) {
-        use_rewrite_decl(d, table, file_opens, file, errs)
+        use_rewrite_decl(d, ux, file_opens, file, errs)
       } else {
         UseRwDecl { decl: d, errs: errs }
       }
-      use_rewrite_program(rest, table, file_opens, file, r.errs, [r.decl, ...acc])
+      use_rewrite_program(rest, ux, file_opens, file, r.errs, [r.decl, ...acc])
     }
   }
 }
 
 type UseRwDecl = { decl: Decl, errs: Int }
 
-fn use_rewrite_decl(d: Decl, table: [EffOps], file_opens: [String],
+fn use_rewrite_decl(d: Decl, ux: UseScope, file_opens: [SymId],
                       file: String, errs: Int) : UseRwDecl / Console + File {
 
 
   match d {
-    DFn(p, n, tps, ps, ret, row, body, l, c, mo, fsym) -> {
+    DFn(p, fid, tps, ps, ret, row, body, l, c, mo) -> {
       let bound = use_param_names(ps, [])
-      let r = use_rewrite_expr(body, table, file_opens, bound, file, errs)
-      UseRwDecl { decl: DFn(p, n, tps, ps, ret, row, r.expr, l, c, mo, fsym),
+      let r = use_rewrite_expr(body, ux, file_opens, bound, file, errs)
+      UseRwDecl { decl: DFn(p, fid, tps, ps, ret, row, r.expr, l, c, mo),
                   errs: r.errs }
     }
     DTest(desc, body, l, c, mo) -> {
-      let r = use_rewrite_expr(body, table, file_opens, [], file, errs)
+      let r = use_rewrite_expr(body, ux, file_opens, [], file, errs)
       UseRwDecl { decl: DTest(desc, r.expr, l, c, mo), errs: r.errs }
     }
     DBench(desc, body, l, c, mo) -> {
-      let r = use_rewrite_expr(body, table, file_opens, [], file, errs)
+      let r = use_rewrite_expr(body, ux, file_opens, [], file, errs)
       UseRwDecl { decl: DBench(desc, r.expr, l, c, mo), errs: r.errs }
     }
     DCheck(desc, ps, body, l, c, mo) -> {
-      let r = use_rewrite_expr(body, table, file_opens, [], file, errs)
+      let r = use_rewrite_expr(body, ux, file_opens, [], file, errs)
       UseRwDecl { decl: DCheck(desc, ps, r.expr, l, c, mo), errs: r.errs }
     }
     DImpl(pname, proto_args, target, ms, l, c, tps, isym) -> {
-      let rms = use_rewrite_decls(ms, table, file_opens, file, errs, [])
+      let rms = use_rewrite_decls(ms, ux, file_opens, file, errs, [])
       UseRwDecl { decl: DImpl(pname, proto_args, target, rms.decls, l, c, tps, isym),
                   errs: rms.errs }
     }
     DDerive(names, inner, l, c) -> {
-      let r = use_rewrite_decl(inner, table, file_opens, file, errs)
+      let r = use_rewrite_decl(inner, ux, file_opens, file, errs)
       UseRwDecl { decl: DDerive(names, r.decl, l, c), errs: r.errs }
     }
     DUnstable(inner, l, c) -> {
-      let r = use_rewrite_decl(inner, table, file_opens, file, errs)
+      let r = use_rewrite_decl(inner, ux, file_opens, file, errs)
       UseRwDecl { decl: DUnstable(r.decl, l, c), errs: r.errs }
     }
     DProtoLaws(thy, inner, l, c, mo) -> {
-      let r = use_rewrite_decl(inner, table, file_opens, file, errs)
+      let r = use_rewrite_decl(inner, ux, file_opens, file, errs)
       UseRwDecl { decl: DProtoLaws(thy, r.decl, l, c, mo), errs: r.errs }
     }
     DImplAxiom(thy, inner, l, c, mo) -> {
-      let r = use_rewrite_decl(inner, table, file_opens, file, errs)
+      let r = use_rewrite_decl(inner, ux, file_opens, file, errs)
       UseRwDecl { decl: DImplAxiom(thy, r.decl, l, c, mo), errs: r.errs }
     }
     DConstructor(inner, l, c) -> {
-      let r = use_rewrite_decl(inner, table, file_opens, file, errs)
+      let r = use_rewrite_decl(inner, ux, file_opens, file, errs)
       UseRwDecl { decl: DConstructor(r.decl, l, c), errs: r.errs }
     }
     _ -> UseRwDecl { decl: d, errs: errs }
   }
 }
 
-fn use_rewrite_decls(decls: [Decl], table: [EffOps], file_opens: [String],
+fn use_rewrite_decls(decls: [Decl], ux: UseScope, file_opens: [SymId],
                        file: String, errs: Int, acc: [Decl]) : UseRwProgram / Console + File {
 
 
   match decls {
     [] -> UseRwProgram { decls: list_reverse(acc), errs: errs }
     [d, ...rest] -> {
-      let r = use_rewrite_decl(d, table, file_opens, file, errs)
-      use_rewrite_decls(rest, table, file_opens, file, r.errs, [r.decl, ...acc])
+      let r = use_rewrite_decl(d, ux, file_opens, file, errs)
+      use_rewrite_decls(rest, ux, file_opens, file, r.errs, [r.decl, ...acc])
     }
   }
 }
@@ -3704,7 +3748,7 @@ fn is_nursery_cap_op(name: String) : Bool =
 
 # The effect a rewritten cap call performs on: the core `Spawn`, already settled.
 fn spawn_ref(line: Int, col: Int) : Expr =
-  mk_expr(ESym(core_effect_id(CeSpawn), spec_none(), core_effect_name(CeSpawn)), line, col)
+  mk_sym(core_effect_id(CeSpawn), line, col)
 
 # Stack of active cap binders. Innermost first.
 type NCapStack = NCS([NCapBinding])
@@ -3826,9 +3870,9 @@ type NurseryRwDecl = { decl: Decl, bw: BrandWalk }
 
 fn rewrite_nursery_caps_decl(d: Decl, file: String, bw: BrandWalk) : NurseryRwDecl {
   match d {
-    DFn(p_, n, tps, ps, ret, row, body, l, c, mo, fsym) -> {
+    DFn(p_, fid, tps, ps, ret, row, body, l, c, mo) -> {
       let r = rewrite_nursery_caps_expr(body, ncs_empty(), file, bw)
-      NurseryRwDecl { decl: DFn(p_, n, tps, ps, ret, row, r.expr, l, c, mo, fsym),
+      NurseryRwDecl { decl: DFn(p_, fid, tps, ps, ret, row, r.expr, l, c, mo),
                        bw: r.bw }
     }
     DTest(desc, body, l, c, mo) -> {
@@ -3903,7 +3947,7 @@ fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
       #   (c) anything else — recurse structurally.
       match callee.kind {
         EName(callee_name) ->
-          if callee_name == "nursery" {
+          if written_text(callee_name) == "nursery" {
             rewrite_nursery_call(callee, args_, s, file, bw, line, col)
           } else {
             let cr = rewrite_nursery_caps_expr(callee, s, file, bw)
@@ -3913,7 +3957,7 @@ fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
         EField(base, op_name) -> match base.kind {
           EName(name) -> {
             if is_nursery_cap_op(op_name) {
-              match ncs_lookup(s, name) {
+              match ncs_lookup(s, written_text(name)) {
                 Some(bid) -> {
                   # Record this call site's brand attribution.
                   let bw1 = bw_record_call(bw, file, line, col, bid, op_name)
@@ -3956,7 +4000,7 @@ fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
       match base.kind {
         EName(name) -> {
           if is_nursery_cap_op(op_name) {
-            match ncs_lookup(s, name) {
+            match ncs_lookup(s, written_text(name)) {
               Some(_) ->
                 NurseryRwKind {
                   kind: EField(spawn_ref(base.line, base.col), op_name),
@@ -3979,7 +4023,7 @@ fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
     }
     ELambda(ps, body) -> {
       # Lambda params shadow outer caps with the same name.
-      let pnames = map(ps, (p) => p.pname)
+      let pnames = map(ps, (p) => written_text(p.binder.name))
       let s1 = ncs_remove_all(s, pnames)
       let r = rewrite_nursery_caps_expr(body, s1, file, bw)
       NurseryRwKind { kind: ELambda(ps, r.expr), bw: r.bw }
@@ -3994,12 +4038,12 @@ fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
       let ar = rewrite_nursery_caps_arms(arms, s, file, sr.bw, [])
       NurseryRwKind { kind: EMatch(sr.expr, ar.arms), bw: ar.bw }
     }
-    EHandle(body, eff_name, hsym, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
+    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
       let br = rewrite_nursery_caps_expr(body, s, file, bw)
       let ir = rewrite_nursery_caps_opt(init_opt, s, file, br.bw)
       let cr = rewrite_nursery_caps_clauses(clauses, s, file, ir.bw, [])
       let rr = rewrite_nursery_caps_opt_return(ret_opt, s, file, cr.bw)
-      NurseryRwKind { kind: EHandle(br.expr, eff_name, hsym, eff_tyargs,
+      NurseryRwKind { kind: EHandle(br.expr, eff, eff_tyargs,
                                       ir.expr, alias_opt, cr.clauses, rr.ret),
                        bw: rr.bw }
     }
@@ -4048,9 +4092,9 @@ fn rewrite_nursery_caps_kind(k: ExprKind, s: NCapStack, file: String,
       let br = rewrite_nursery_caps_expr(b, s, file, ar.bw)
       NurseryRwKind { kind: EFilterPipe(ar.expr, br.expr), bw: br.bw }
     }
-    ERecordLit(rh, name, fs) -> {
+    ERecordLit(rh, fs) -> {
       let r = rewrite_nursery_caps_fields(fs, s, file, bw, [])
-      NurseryRwKind { kind: ERecordLit(rh, name, r.fields), bw: r.bw }
+      NurseryRwKind { kind: ERecordLit(rh, r.fields), bw: r.bw }
     }
     EList(els) -> {
       let r = rewrite_nursery_caps_elems(els, s, file, bw, [])
@@ -4120,7 +4164,7 @@ fn rewrite_nursery_caps_stmts(ss: [Stmt], s: NCapStack, file: String,
       }
       SVar(n, ty, rhs, l, c) -> {
         let r = rewrite_nursery_caps_expr(rhs, s, file, bw)
-        let s1 = ncs_remove(s, n)
+        let s1 = ncs_remove(s, written_text(n.name))
         rewrite_nursery_caps_stmts(rest, s1, file, r.bw, [SVar(n, ty, r.expr, l, c), ...acc])
       }
       SAssert(c, m) -> {
@@ -4172,7 +4216,7 @@ fn rewrite_nursery_caps_clauses(cs: [HClause], s: NCapStack, file: String,
     [] -> NurseryRwClauses { clauses: list_reverse(acc), bw: bw }
     [c, ...rest] -> match c {
       HC(n, ps, b, l, co) -> {
-        let pnames = map(ps, (pm) => pm.pname)
+        let pnames = map(ps, (pm) => written_text(pm.binder.name))
         let s1 = ncs_remove_all(s, pnames)
         let r = rewrite_nursery_caps_expr(b, s1, file, bw)
         rewrite_nursery_caps_clauses(rest, s, file, r.bw, [HC(n, ps, r.expr, l, co), ...acc])
@@ -4187,7 +4231,7 @@ fn rewrite_nursery_caps_opt_return(opt: Option[HReturn], s: NCapStack,
     None -> NurseryRwRet { ret: None, bw: bw }
     Some(r) -> match r {
       HR(p, b, l, c) -> {
-        let s1 = ncs_remove(s, p)
+        let s1 = ncs_remove(s, written_text(p.name))
         let br = rewrite_nursery_caps_expr(b, s1, file, bw)
         NurseryRwRet { ret: Some(HR(p, br.expr, l, c)), bw: br.bw }
       }
@@ -4244,7 +4288,7 @@ fn rewrite_nursery_call(callee: Expr, args_: [Expr], s: NCapStack,
     HasLast(prefix, last) -> match last.kind {
       ELambda(ps, body) -> match ps {
         [p0] -> {
-          let p_name = p0.pname
+          let p_name = written_text(p0.binder.name)
           let alloc = bw_alloc(bw, p_name, file, last.line, last.col)
           let s1 = ncs_push(s, p_name, alloc.bid)
           let pr = rewrite_nursery_caps_exprs(prefix, s, file, alloc.bw, [])
@@ -4414,10 +4458,10 @@ fn benv_lookup_loop(xs: [BrandBinding], name: String) : Option[Int] {
 # by index, a record field) is treated as unbranded.
 fn expr_brand(e: Expr, env: BrandEnv, calls: [BrandCall]) : Option[Int] {
   match e.kind {
-    EName(name) -> benv_lookup(env, name)
+    EName(name) -> benv_lookup(env, written_text(name))
     ECall(callee, args_) -> match callee.kind {
       EField(base, op_name) -> match base.kind {
-        ESym(eff_sym, _, _) ->
+        ESym(eff_sym, _) ->
           if effect_is(eff_sym, CeSpawn) and op_name == "spawn" {
             match brand_call_lookup(calls, "", e.line, e.col) {
               Some(BC(_, _, _, bid, _)) -> Some(bid)
@@ -4431,7 +4475,7 @@ fn expr_brand(e: Expr, env: BrandEnv, calls: [BrandCall]) : Option[Int] {
       }
       # A call to a brand-transparent helper carries the brand of the
       # argument it returns, so `let g = id(f)` keeps `f`'s brand.
-      EName(fname) -> transp_call_brand(fname, args_, env, calls)
+      EName(fname) -> transp_call_brand(written_text(fname), args_, env, calls)
       _ -> None
     }
     _ -> None
@@ -4497,13 +4541,13 @@ fn emit_brand_mismatch(file: String, line: Int, col: Int,
 }
 
 # Top-level entry — one error count for the whole program.
-#[doc("Brand-mismatch validator over the post-rewrite AST; rejects sibling-nursery cap confusion at consume sites. Depends on the brand registry produced by rewrite_nursery_caps_decls.")]
-pub fn check_nursery_brand_mismatch_decls(ds: [Decl], df: DiagFiles,
+#[doc("Brand-mismatch validator over the post-rewrite AST; rejects sibling-nursery cap confusion at consume sites. Depends on the brand registry produced by rewrite_nursery_caps_decls. `tab` names every function of `ds`.")]
+pub fn check_nursery_brand_mismatch_decls(ds: [Decl], tab: SymTab, df: DiagFiles,
                                         calls: [BrandCall],
                                         brs: [BrandRec]) : Int / Console + File {
 
   check_brand_decls_loop(ds, df, calls, brs, 0,
-                           benv_with_transp(brand_transp_index(brand_transp_decls(ds))))
+                           benv_with_transp(brand_transp_index(brand_transp_decls(ds, tab))))
 }
 
 # `--dump-brands`: print the brand registry plus per-call
@@ -4582,7 +4626,7 @@ fn check_brand_decl(d: Decl, file: String, calls: [BrandCall],
                       seed: BrandEnv) : Int / Console + File {
 
   match d {
-    DFn(_, _, _, _, _, _, body, _, _, _, fsym) ->
+    DFn(_, _, _, _, _, _, body, _, _, _) ->
       check_brand_expr(body, seed, file, calls, brs, errs)
     DTest(_, body, _, _, _) ->
       check_brand_expr(body, seed, file, calls, brs, errs)
@@ -4698,17 +4742,17 @@ fn check_brand_kind(k: ExprKind, env: BrandEnv, file: String,
       check_brand_expr(b, env, file, calls, brs, e1)
     }
     ELambda(ps, body) -> {
-      let pnames = map(ps, (p) => p.pname)
+      let pnames = map(ps, (p) => written_text(p.binder.name))
       check_brand_expr(body, benv_remove_all(env, pnames), file, calls, brs, errs)
     }
-    ERecordLit(_, _, fs) -> check_brand_fields(fs, env, file, calls, brs, errs)
+    ERecordLit(_, fs) -> check_brand_fields(fs, env, file, calls, brs, errs)
     EList(els) -> check_brand_elems(els, env, file, calls, brs, errs)
     ERange(a, b, opt_step) -> {
       let e1 = check_brand_expr(a, env, file, calls, brs, errs)
       let e2 = check_brand_expr(b, env, file, calls, brs, e1)
       check_brand_opt(opt_step, env, file, calls, brs, e2)
     }
-    EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) -> {
+    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
       let e1 = check_brand_expr(body, env, file, calls, brs, errs)
       let e2 = check_brand_opt(init_opt, env, file, calls, brs, e1)
       let e3 = check_brand_clauses(clauses, env, file, calls, brs, e2)
@@ -4730,9 +4774,9 @@ fn warn_brand_opaque_call(callee: Expr, args_: [Expr], env: BrandEnv,
                             brs: [BrandRec]) : Unit / Console + File {
 
   match callee.kind {
-    EName(fname) -> match brand_transp_lookup(benv_transp(env), fname) {
+    EName(fname) -> match brand_transp_lookup(benv_transp(env), written_text(fname)) {
       Some(BTParam(_)) -> ()
-      _ -> warn_branded_args(fname, args_, env, file, calls, brs)
+      _ -> warn_branded_args(written_text(fname), args_, env, file, calls, brs)
     }
     _ -> ()
   }
@@ -4871,7 +4915,7 @@ fn check_brand_stmts(ss: [Stmt], env: BrandEnv, file: String,
       }
       SVar(n, _, rhs, _, _) -> {
         let e1 = check_brand_expr(rhs, env, file, calls, brs, errs)
-        let env1 = benv_remove(env, n)
+        let env1 = benv_remove(env, written_text(n.name))
         check_brand_stmts(rest, env1, file, calls, brs, e1)
       }
       SAssert(c, m) -> {
@@ -4908,7 +4952,7 @@ fn bind_brand_pat(pat: Pattern, rhs: Expr, env: BrandEnv,
   let env1 = benv_remove_all(env, names)
   match pat.pkind {
     PBind(n) -> match expr_brand(rhs, env, calls) {
-      Some(bid) -> benv_push(env1, n, bid)
+      Some(bid) -> benv_push(env1, written_text(n.name), bid)
       None -> env1
     }
     _ -> env1
@@ -4940,7 +4984,7 @@ fn check_brand_clauses(cs: [HClause], env: BrandEnv, file: String,
     [] -> errs
     [c, ...rest] -> match c {
       HC(_, ps, b, _, _) -> {
-        let pnames = map(ps, (pm) => pm.pname)
+        let pnames = map(ps, (pm) => written_text(pm.binder.name))
         let env1 = benv_remove_all(env, pnames)
         let e1 = check_brand_expr(b, env1, file, calls, brs, errs)
         check_brand_clauses(rest, env, file, calls, brs, e1)
@@ -4957,7 +5001,7 @@ fn check_brand_opt_return(opt: Option[HReturn], env: BrandEnv, file: String,
     None -> errs
     Some(r) -> match r {
       HR(p, b, _, _) -> {
-        let env1 = benv_remove(env, p)
+        let env1 = benv_remove(env, written_text(p.name))
         check_brand_expr(b, env1, file, calls, brs, errs)
       }
     }
