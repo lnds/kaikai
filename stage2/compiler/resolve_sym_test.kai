@@ -1,14 +1,14 @@
 #[doc("""
-Gates on what the resolver stamps into the tree.
+Gates on what the resolver writes into the tree.
 
 The subject is the rewritten declaration stream, not a side table: a
-resolved reference is an `ESym` carrying the id, and that is what every
-pass downstream reads. Asserting against anything else would test a
-transport the compiler no longer has.
+resolved reference is an `ESym` carrying the declaration's id or an
+`ELocal` carrying the binder's, and that is what every pass downstream
+reads.
 
 Each property is the negation of a defect the string-keyed resolver
 kept reproducing: a call reaches its declaration, a binder shadows one,
-a local is never stamped as a declaration, two homes declaring one name
+a local is never read as a declaration, two homes declaring one name
 reach two different ids, and a root-file body walked after a module's
 declarations resolves from the root, not from that module.
 """)]
@@ -17,43 +17,62 @@ import compiler.ast
 import compiler.diag_file
 import compiler.resolve
 import compiler.symtab
+import compiler.symtab_build
+import compiler.decl_names
+import compiler.core_syms
 import compiler.scope_chain_test
 import compiler.written
 
+# A function a gate declares: its name, its home (`None` for the root
+# file), its parameters and its body.
+type RstFn = RstFn(String, Option[String], [String], Expr)
+
 # `pub fn <n>() = <body>`, homed in `mo`.
-fn rst_fn(n: String, mo: Option[String], body: Expr) : Decl =
-  DFn(true, n, [], [], None, REmpty, body, 0, 0, mo, fnid_none())
+fn rst_fn(n: String, mo: Option[String], body: Expr) : RstFn = RstFn(n, mo, [], body)
 
 # `fn <n>(<p>) = <body>` — the parameter is what shadows.
-fn rst_fn1(n: String, p: String, body: Expr) : Decl =
-  DFn(true, n, [], [rst_param(p)], None, REmpty, body, 0, 0, None, fnid_none())
+fn rst_fn1(n: String, p: String, body: Expr) : RstFn = RstFn(n, None, [p], body)
+
+fn rst_home(mo: Option[String]) : String = match mo {
+  Some(m) -> m
+  None    -> "root"
+}
+
+fn rst_id(n: String, mo: Option[String]) : SymId = sym_derive(NCFn, n, rst_home(mo))
+
+fn rst_decl(f: RstFn) : Decl = match f {
+  RstFn(n, mo, ps, body) ->
+    DFn(true, fnid_decl(rst_id(n, mo)), [], map(ps, rst_param), None, REmpty, body, 0, 0, mo)
+}
+
+fn rst_row(f: RstFn) : NEnt = match f { RstFn(n, mo, _, _) -> NEnt(NCFn, n, rst_home(mo), true) }
 
 fn rst_param(p: String) : Param =
-  Param { pname: p, ptype: None, pline: 0, pcol: 0, pborrow: false }
+  Param { binder: binder_written(p), ptype: None, pline: 0, pcol: 0, pborrow: false }
 
-fn rst_var(n: String) : Expr = mk_ref(n, 0, 0)
+fn rst_var(n: String) : Expr = mk_name(n, 0, 0)
 
-# The resolution of a decl list whose untagged decls are homed in `root`.
-fn rst_run(ds: [Decl]) : Resolution / Console + File =
-  resolve_program(diag_files_flat("t.kai"), ds, "root")
+# The resolution of the functions `fs`, the untagged ones homed in `root`.
+fn rst_run(fs: [RstFn]) : Resolution / Console + File =
+  resolve_program_with(diag_files_flat("t.kai"), map(fs, rst_decl), st_program(map(fs, rst_row)), "root")
 
-fn rst_resolve(ds: [Decl]) : [Decl] / Console + File = rst_run(ds).decls
+fn rst_resolve(fs: [RstFn]) : [Decl] / Console + File = rst_run(fs).decls
 
-# The body of the declaration named `n`.
-fn rst_body_of(ds: [Decl], n: String) : Option[Expr] = match ds {
+# The body of the function `s` declares.
+fn rst_body_of(ds: [Decl], s: SymId) : Option[Expr] = match ds {
   [] -> None
   [d, ...rest] -> match d {
-    DFn(_, dn, _, _, _, _, body, _, _, _, fsym) ->
-      if dn == n { Some(body) } else { rst_body_of(rest, n) }
-    _ -> rst_body_of(rest, n)
+    DFn(_, fid, _, _, _, _, body, _, _, _) ->
+      if sym_raw(fnid_sym(fid)) == sym_raw(s) { Some(body) } else { rst_body_of(rest, s) }
+    _ -> rst_body_of(rest, s)
   }
 }
 
-# The id a body's reference carries, or `None` when it stayed a spelling.
-fn rst_sym_in(ds: [Decl], caller: String) : Option[SymId] =
+# The declaration a body's reference names, or `None` when it names none.
+fn rst_sym_in(ds: [Decl], caller: SymId) : Option[SymId] =
   match rst_body_of(ds, caller) {
     None    -> None
-    Some(b) -> match b.kind { ESym(s, _, _) -> Some(s)  _ -> None }
+    Some(b) -> match b.kind { ESym(s, _) -> Some(s)  _ -> None }
   }
 
 fn rst_is_sym(o: Option[SymId]) : Bool = match o {
@@ -65,16 +84,16 @@ fn rst_is_sym(o: Option[SymId]) : Bool = match o {
 fn rst_call_reaches_decl() : Bool / Console + File {
   let ds = rst_resolve([rst_fn("helper", None, mk_expr(EUnit, 0, 0)),
                         rst_fn("caller", None, rst_var("helper"))])
-  rst_is_sym(rst_sym_in(ds, "caller"))
+  rst_is_sym(rst_sym_in(ds, rst_id("caller", None)))
 }
 
-# A parameter shadows a declaration of the same name: the use carries the
-# binder's local id, never the declaration's.
+# A parameter shadows a declaration of the same name: the use is a read
+# of the binder, never a reference to the declaration.
 fn rst_binder_shadows_decl() : Bool / Console + File {
   let ds = rst_resolve([rst_fn("x", None, mk_expr(EUnit, 0, 0)),
                         rst_fn1("caller", "x", rst_var("x"))])
-  match rst_sym_in(ds, "caller") {
-    Some(s) -> sym_is_local(s)
+  match rst_body_of(ds, rst_id("caller", None)) {
+    Some(b) -> match b.kind { ELocal(_) -> true  _ -> false }
     None    -> false
   }
 }
@@ -87,7 +106,7 @@ fn rst_home_decides() : Bool / Console + File {
                         rst_fn("ua", Some("alpha"), rst_var("dup")),
                         rst_fn("dup", Some("beta"), mk_expr(EUnit, 0, 0)),
                         rst_fn("ub", Some("beta"), rst_var("dup"))])
-  rst_ids_differ(rst_sym_in(ds, "ua"), rst_sym_in(ds, "ub"))
+  rst_ids_differ(rst_sym_in(ds, rst_id("ua", Some("alpha"))), rst_sym_in(ds, rst_id("ub", Some("beta"))))
 }
 
 fn rst_ids_differ(a: Option[SymId], b: Option[SymId]) : Bool = match a {
@@ -98,10 +117,10 @@ fn rst_ids_differ(a: Option[SymId], b: Option[SymId]) : Bool = match a {
   }
 }
 
-# The home `caller`'s reference reaches, or `""` when it stayed a spelling.
-fn rst_home_in(ds: [Decl], caller: String) : String / Console + File {
-  let r = rst_run(ds)
-  match rst_sym_in(r.decls, caller) {
+# The home the root function `caller`'s reference reaches, or `""` when it names no declaration.
+fn rst_home_in(fs: [RstFn], caller: String) : String / Console + File {
+  let r = rst_run(fs)
+  match rst_sym_in(r.decls, rst_id(caller, None)) {
     Some(s) -> written_text(sym_home(r.tab, s))
     None    -> ""
   }
@@ -119,19 +138,19 @@ fn rst_root_reaches_module() : Bool / Console + File =
   rst_home_in([rst_fn("conj", Some("complex"), mk_expr(EUnit, 0, 0)),
                rst_fn("caller", None, rst_var("conj"))], "caller") == "complex"
 
-# The walk must stamp something: a stream whose every reference stayed a
-# spelling is the state the pipeline was in before it was wired.
+# The walk must resolve something: a stream whose every reference stayed
+# written is the state the pipeline was in before it was wired.
 fn rst_walk_stamps() : Bool / Console + File {
   let ds = rst_resolve([rst_fn("helper", None, mk_expr(EUnit, 0, 0)),
                         rst_fn("caller", None, rst_var("helper"))])
-  rst_is_sym(rst_sym_in(ds, "caller"))
+  rst_is_sym(rst_sym_in(ds, rst_id("caller", None)))
 }
 
 #[doc("Runs every resolver stamping gate. Returns a line starting `OK` on success, `FAIL:` otherwise.")]
 pub fn resolve_sym_selftest() : String / Console + File =
   if scope_chain_selftest() != "" { "FAIL: " ++ scope_chain_selftest() }
-  else if rst_walk_stamps() == false { "FAIL: the resolver stamped no reference" }
-  else if rst_call_reaches_decl() == false { "FAIL: a call to a declaration was not stamped" }
+  else if rst_walk_stamps() == false { "FAIL: the resolver resolved no reference" }
+  else if rst_call_reaches_decl() == false { "FAIL: a call to a declaration does not carry its id" }
   else if rst_binder_shadows_decl() == false { "FAIL: a parameter did not shadow the declaration" }
   else if rst_home_decides() == false { "FAIL: two homes resolved one name to one symbol" }
   else if rst_root_shadows_module() == false { "FAIL: a root call reached a module homonym, not the root declaration" }
