@@ -17,6 +17,8 @@ import compiler.diag
 import compiler.ast
 import compiler.type_stamp
 import compiler.core_refs
+import compiler.core_protos
+import compiler.impl_identity
 import compiler.exhaust
 import compiler.effect_default
 import compiler.type_text
@@ -12052,9 +12054,10 @@ fn binop_dispatch_proto_heterogeneous(st: InferState, op: String,
   if not (pair_prim_user or pair_user_user_diff) { false }
   else {
     let bp = binop_proto(op)
-    let proto = op_proto_protocol(bp)
-    let picked = if proto == "" { None }
-                 else { binop_pick_proto_dispatch(st.proto_impls, proto, op_proto_method(bp), lt, rt, st.sub) }
+    let picked = match op_proto_core(bp) {
+      None     -> None
+      Some(cp) -> binop_pick_proto_dispatch(st.proto_impls, core_proto_id(cp), op_proto_method(bp), lt, rt, st.sub)
+    }
     match picked { Some(_) -> true  None -> false }
   }
 }
@@ -12117,7 +12120,7 @@ fn binop_should_dispatch_proto(lt: Ty, rt: Ty) : Bool =
 type BinopProtoChoice = BPC(String, [String])
 #                          recv     proto_args (head names)
 
-fn binop_pick_proto_dispatch(impls: [ProtoImplReg], proto: String, op: String,
+fn binop_pick_proto_dispatch(impls: [ProtoImplReg], proto: SymId, op: String,
                               lt: Ty, rt: Ty, sub: Subst) : Option[BinopProtoChoice] {
   let l = apply_ty(sub, lt)
   let r = apply_ty(sub, rt)
@@ -12142,13 +12145,13 @@ fn binop_pick_proto_dispatch(impls: [ProtoImplReg], proto: String, op: String,
   }
 }
 
-fn impl_pair_exists(impls: [ProtoImplReg], proto: String, op: String,
+fn impl_pair_exists(impls: [ProtoImplReg], proto: SymId, op: String,
                      recv: String, args: [String]) : Bool {
   match impls {
     [] -> false
     [it, ...rest] -> match it {
-      PIR(p, t, o, _, ans, _, _, _) ->
-        if p == proto and t == recv and o == op and arg_names_match(ans, recv, args) {
+      PIR(_, t, o, _, ans, _, _, _, _) ->
+        if pir_of_proto(it, proto) and t == recv and o == op and arg_names_match(ans, recv, args) {
           true
         } else {
           impl_pair_exists(rest, proto, op, recv, args)
@@ -12220,11 +12223,14 @@ fn synth_binop_proto(st: InferState, op: String, le: Expr, lt: Ty,
 fn binop_check_against_impl(st: InferState, op: String, lt0: Ty, rt0: Ty,
                             line: Int, col: Int) : InferState / Console + File + Mutable {
   let bp = binop_proto(op)
-  let proto = op_proto_protocol(bp)
   let method = op_proto_method(bp)
   let lt = apply_ty(st.sub, lt0)
   let rt = apply_ty(st.sub, rt0)
-  match binop_impl_sym(st.proto_impls, proto, method, lt, rt, st.sub) {
+  let impl_sym = match op_proto_core(bp) {
+    None     -> None
+    Some(cp) -> binop_impl_sym(st.proto_impls, core_proto_id(cp), method, lt, rt, st.sub)
+  }
+  match impl_sym {
     None -> st
     Some(sym) -> match ty_env_lookup(st.env, sym) {
       None -> st
@@ -12272,20 +12278,20 @@ fn binop_arg_for_param(param: Ty, arg: Ty, s: Subst) : Ty =
 
 # The mangled symbol of the impl the operator dispatches to, matching
 # `binop_pick_proto_dispatch`'s receiver/mirror order.
-fn binop_impl_sym(impls: [ProtoImplReg], proto: String, method: String,
+fn binop_impl_sym(impls: [ProtoImplReg], proto: SymId, method: String,
                   lt: Ty, rt: Ty, sub: Subst) : Option[String] =
   match binop_pick_proto_dispatch(impls, proto, method, lt, rt, sub) {
     None -> None
     Some(BPC(recv, want)) -> impl_sym_for(impls, proto, method, recv, want)
   }
 
-fn impl_sym_for(impls: [ProtoImplReg], proto: String, op: String,
+fn impl_sym_for(impls: [ProtoImplReg], proto: SymId, op: String,
                 recv: String, want: [String]) : Option[String] =
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, t, o, sym, ans, _, _, _) ->
-        if p == proto and t == recv and o == op and arg_names_match(ans, recv, want) {
+      PIR(_, t, o, sym, ans, _, _, _, _) ->
+        if pir_of_proto(it, proto) and t == recv and o == op and arg_names_match(ans, recv, want) {
           Some(sym)
         } else {
           impl_sym_for(rest, proto, op, recv, want)
@@ -13146,7 +13152,7 @@ fn pipe_rejection_reason(head: String, op: String) : Option[String] {
 # so a pipe over that head routes through the protocol.
 fn pipe_op_has_impl(impls: [ProtoImplReg], head: String, op: String) : Bool = match impls {
   [] -> false
-  [PIR(_, t, o, _, _, _, _, _), ...rest] ->
+  [PIR(_, t, o, _, _, _, _, _, _), ...rest] ->
     if t == head and o == op { true } else { pipe_op_has_impl(rest, head, op) }
 }
 

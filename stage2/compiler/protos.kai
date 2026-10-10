@@ -82,6 +82,7 @@
 
 import compiler.ast
 import compiler.core_refs
+import compiler.core_protos
 import compiler.type_text
 import compiler.diag_file
 import compiler.home_dup
@@ -395,43 +396,46 @@ fn proto_mo_of(home: String, target_mod: String) : Option[String] =
 # really need protocol dispatch". Each entry carries its declaring
 # module's `module_origin` stamp so two same-named protocols never
 # share one identity.
-fn collect_proto_decls(ds: [Decl], reg: ProtocolReg) : ProtocolReg {
+fn collect_proto_decls(ds: [Decl], reg: ProtocolReg, ps: PScope) : ProtocolReg {
   match ds {
     [] -> reg
     [d, ...rest] -> match d {
       DProtocol(is_pub, name, tparams, ops, _, _, mo, _) -> {
+        let psym = ps_decl_sym(ps, name, mo)
         let reg1 = ProtocolReg {
           ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
-          tparams: [PTPR(name, tparams, mo), ...reg.tparams],
-          origins: [PrOR(name, mo, is_pub), ...reg.origins],
+          tparams: [PTPR(name, tparams, mo, psym), ...reg.tparams],
+          origins: [PrOR(name, mo, is_pub, psym), ...reg.origins],
           dkeys: reg.dkeys,
           impl_index: reg.impl_index,
           cores: reg.cores, imports: reg.imports, root: reg.root
         }
-        collect_proto_decls(rest, register_proto_ops(reg1, name, mo, ops))
+        collect_proto_decls(rest, register_proto_ops(reg1, name, mo, psym, ops), ps)
       }
       DDerive(_, inner, _, _) ->
-        collect_proto_decls([inner, ...rest], reg)
+        collect_proto_decls([inner, ...rest], reg, ps)
       DUnstable(inner, _, _) ->
-        collect_proto_decls([inner, ...rest], reg)
+        collect_proto_decls([inner, ...rest], reg, ps)
       DProtoLaws(_, inner, _, _, _) ->
-        collect_proto_decls([inner, ...rest], reg)
+        collect_proto_decls([inner, ...rest], reg, ps)
       DImplAxiom(_, inner, _, _, _) ->
-        collect_proto_decls([inner, ...rest], reg)
+        collect_proto_decls([inner, ...rest], reg, ps)
       DConstructor(inner, _, _) ->
-        collect_proto_decls([inner, ...rest], reg)
-      _ -> collect_proto_decls(rest, reg)
+        collect_proto_decls([inner, ...rest], reg, ps)
+      _ -> collect_proto_decls(rest, reg, ps)
     }
   }
 }
 
+# `psym` is the protocol's own identity, read from the table the scope
+# resolves against: an impl's written protocol name resolves to the same id.
 fn register_proto_ops(reg: ProtocolReg, proto: String, mo: Option[String],
-                      ops: [ProtoOp]) : ProtocolReg {
+                      psym: SymId, ops: [ProtoOp]) : ProtocolReg {
   match ops {
     [] -> reg
     [op, ...rest] -> match op {
       POp(opname, _, params, ret, line, col) -> {
-        let entry = POR(proto, opname, params, ret, line, col, mo)
+        let entry = POR(proto, opname, params, ret, line, col, mo, psym)
         let names1 =
           if list_has(reg.op_names, opname) { reg.op_names }
           else { [opname, ...reg.op_names] }
@@ -445,7 +449,7 @@ fn register_proto_ops(reg: ProtocolReg, proto: String, mo: Option[String],
           impl_index: reg.impl_index,
           cores: reg.cores, imports: reg.imports, root: reg.root
         }
-        register_proto_ops(reg1, proto, mo, rest)
+        register_proto_ops(reg1, proto, mo, psym, rest)
       }
     }
   }
@@ -459,7 +463,7 @@ fn proto_op_lookup_loop(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] 
   match ops {
     [] -> None
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _, _) ->
+      POR(_, name, _, _, _, _, _, _) ->
         if name == target { Some(op) } else { proto_op_lookup_loop(rest, target) }
     }
   }
@@ -485,7 +489,7 @@ pub fn proto_core_op_home(reg: ProtocolReg, opname: String,
 
 fn pcoh_loop(ops: [ProtoOpReg], cores: [String]) : Option[String] = match ops {
   [] -> None
-  [POR(_, _, _, _, _, _, mo), ...rest] -> match mo {
+  [POR(_, _, _, _, _, _, mo, _), ...rest] -> match mo {
     Some(m) -> if list_has(cores, m) { mo } else { pcoh_loop(rest, cores) }
     None    -> pcoh_loop(rest, cores)
   }
@@ -495,7 +499,7 @@ fn proto_ops_lookup_all_loop(ops: [ProtoOpReg], target: String) : [ProtoOpReg] {
   match ops {
     [] -> []
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _, _) ->
+      POR(_, name, _, _, _, _, _, _) ->
         if name == target { [op, ...proto_ops_lookup_all_loop(rest, target)] }
         else { proto_ops_lookup_all_loop(rest, target) }
     }
@@ -649,11 +653,8 @@ fn validate_impl_methods_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
         # module. Unresolved names were already reported by
         # `validate_impls`; skip them here.
         let from = proto_mo_of(ha_home(h), target_mod)
-        let res = ps_resolve(ps, pspell, from)
-        let proto_ops = match res {
-          PkHome(ph) -> proto_scope_ops(reg.ops, pname, ph)
-          _ -> []
-        }
+        let psym = ps_proto_sym(ps, pspell, from)
+        let proto_ops = proto_scope_ops(reg.ops, psym)
         if proto_ops == [] {
           validate_impl_methods_loop(rest, hrest, df, reg, target_mod, ps, acc)
         } else {
@@ -662,11 +663,7 @@ fn validate_impl_methods_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
           # treated as the homogeneous default: every protocol tparam
           # collapses to the target head. Heterogeneous
           # `impl P[Real, Int] for T` aligns positionally.
-          let ph = match res {
-            PkHome(p) -> p
-            _ -> None
-          }
-          let proto_tps = proto_scope_tparams(reg.tparams, pname, ph)
+          let proto_tps = proto_scope_tparams(reg.tparams, psym)
           let arg_heads = match proto_args {
             [] -> []
             _  -> map(proto_args, proto_type_name)
@@ -700,7 +697,7 @@ fn proto_op_names(ops: [ProtoOpReg], acc: [String]) : [String] {
   match ops {
     [] -> acc
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _, _) -> proto_op_names(rest, [name, ...acc])
+      POR(_, name, _, _, _, _, _, _) -> proto_op_names(rest, [name, ...acc])
     }
   }
 }
@@ -714,7 +711,7 @@ fn check_missing_methods(proto_ops: [ProtoOpReg], methods: [Decl],
   match proto_ops {
     [] -> acc
     [op, ...rest] -> match op {
-      POR(_, opname, _, _, _, _, _) -> {
+      POR(_, opname, _, _, _, _, _, _) -> {
         let acc1 =
           if impl_has_method(methods, opname) { acc }
           else {
@@ -761,7 +758,7 @@ fn check_impl_methods(methods: [Decl], proto_ops: [ProtoOpReg],
                            "` declares method `", op_name,
                            "` which is not an operation of protocol `", pname, "`"])), ...acc]
           Some(op) -> match op {
-            POR(_, _, proto_params, proto_ret, _, _, _) -> {
+            POR(_, _, proto_params, proto_ret, _, _, _, _) -> {
               let pa = list_length(params)
               let pp = list_length(proto_params)
               let e_ar =
@@ -794,7 +791,7 @@ fn find_proto_op(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] {
   match ops {
     [] -> None
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _, _) ->
+      POR(_, name, _, _, _, _, _, _) ->
         if name == target { Some(op) } else { find_proto_op(rest, target) }
     }
   }
@@ -1081,11 +1078,9 @@ fn lower_impls(ds: [Decl], reg: ProtocolReg, ps: PScope, acc_fns: [Decl]) : Lowe
         # module, then spell it. Unresolved protocols keep the bare
         # name — `validate_impls` has already reported them.
         let from = impl_home_of(methods)
-        let key = match ps_resolve(ps, pspell, from) {
-          PkHome(ph) -> proto_key_of(reg.dkeys, pname, ph)
-          _ -> pname
-        }
-        let r = lower_impl_methods(key, tname, arg_names, from, methods, reg, acc_fns)
+        let psym = ps_proto_sym(ps, pspell, from)
+        let key = proto_key_of(reg.dkeys, pname, psym)
+        let r = lower_impl_methods(key, psym, tname, arg_names, from, methods, reg, acc_fns)
         lower_impls(rest, r.reg, ps, r.fns)
       }
       DDerive(_, inner, _, _) -> lower_impls([inner, ...rest], reg, ps, acc_fns)
@@ -1123,8 +1118,9 @@ type LowerImplsRes = { reg: ProtocolReg, fns: [Decl] }
 
 # `acc_fns` accumulates in reverse; the caller list_reverses on
 # return. `pkey` is the impl's protocol dispatch key, not necessarily
-# the surface name — mangling and the PIR entry both carry it.
-fn lower_impl_methods(pkey: String, tname: String, arg_names: [String],
+# the surface name — mangling and the PIR entry both carry it. `psym`
+# is that protocol's identity, which decides whose impl the entry is.
+fn lower_impl_methods(pkey: String, psym: SymId, tname: String, arg_names: [String],
                       home: Option[String], methods: [Decl],
                       reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
   match methods {
@@ -1138,7 +1134,7 @@ fn lower_impl_methods(pkey: String, tname: String, arg_names: [String],
         let mangled = proto_impl_mangled_with_args(pkey, tname, op_name, arg_names)
         let new_fn = DFn(false, mangled, tparams, params, ret, row, body, line, col, mo, fnid_none())
         let ret_head = match ret { Some(rte) -> proto_type_name(rte)  None -> tname }
-        let entry = PIR(pkey, tname, op_name, mangled, arg_names, ret_head, home, sym_none())
+        let entry = PIR(pkey, tname, op_name, mangled, arg_names, ret_head, home, sym_none(), psym)
         let reg1 = ProtocolReg {
           ops: reg.ops,
           impls: [entry, ...reg.impls],
@@ -1149,9 +1145,9 @@ fn lower_impl_methods(pkey: String, tname: String, arg_names: [String],
           impl_index: reg.impl_index,
           cores: reg.cores, imports: reg.imports, root: reg.root
         }
-        lower_impl_methods(pkey, tname, arg_names, home, rest, reg1, [new_fn, ...acc_fns])
+        lower_impl_methods(pkey, psym, tname, arg_names, home, rest, reg1, [new_fn, ...acc_fns])
       }
-      _ -> lower_impl_methods(pkey, tname, arg_names, home, rest, reg, acc_fns)
+      _ -> lower_impl_methods(pkey, psym, tname, arg_names, home, rest, reg, acc_fns)
     }
   }
 }
@@ -1176,7 +1172,7 @@ fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr],
   match ops {
     [] -> acc
     [op, ...rest] -> match op {
-      POR(pname, opname, params, ret, line, col, mo) -> {
+      POR(pname, opname, params, ret, line, col, mo, _) -> {
         # Dedup by the arity-resolved dispatcher NAME, not the bare op
         # name: an arity-ambiguous op (`f/1` + `f/2`) yields two
         # distinct dispatcher names, so both survive; same-arity
@@ -1324,17 +1320,45 @@ fn te_type_args(te: TypeExpr) : [TypeExpr] = match te.tkind {
 # sync with stdlib/protocols.kai. The validator treats these as
 # always available so users do not have to redeclare `impl Eq for
 # Int` in every fixture that derives Eq on a sum carrying Ints.
-#[doc("True iff kaikai bundles a structural builtin impl of `pname` for primitive head `tname` (Eq/Show/Ord/Hash over Int/Real/String/... and fixed-width ints).")]
-pub fn derive_builtin_impl(pname: String, tname: String) : Bool {
-  if pname == "Eq" {
+#[doc("True iff kaikai bundles a structural builtin impl of the core protocol `p` for primitive head `tname` (Eq/Show/Ord/Hash over Int/Real/String/... and fixed-width ints).")]
+pub fn derive_builtin_impl(p: CoreProto, tname: String) : Bool = match p {
+  CpEq ->
     list_has(["Int", "Real", "Bool", "String", "Char", "Unit"], tname) or is_fixed_width_name(tname)
-  } else if pname == "Hash" {
+  CpHash ->
     list_has(["Int", "Real", "String", "Bool", "Char"], tname) or is_fixed_width_name(tname)
-  } else if pname == "Show" {
+  CpShow ->
     list_has(["Int", "Real", "Bool", "String", "Unit", "Char"], tname) or is_fixed_width_name(tname)
-  } else if pname == "Ord" {
-    is_fixed_width_name(tname)
-  } else { false }
+  CpOrd -> is_fixed_width_name(tname)
+  _     -> false
+}
+
+# A `#[derive]` entry read once: the bare name it prints as and the
+# generator that name picks. The bare name alone picks it, whatever
+# protocol the entry resolves to: the impl a generator builds keeps the
+# entry as written and resolves like a hand-written one.
+type DeriveGen = DeriveGen(String, CoreProto)
+
+fn derive_gen(pspell: String) : Option[CoreProto] = core_proto_named(dotted_bare(pspell))
+
+fn derive_gens(names: [String]) : [DeriveGen] = match names {
+  []           -> []
+  [n, ...rest] -> match derive_gen(n) {
+    Some(g) -> [DeriveGen(dotted_bare(n), g), ...derive_gens(rest)]
+    None    -> derive_gens(rest)
+  }
+}
+
+# True when the written protocol name `pspell` picks the generator `g`.
+# A derive checks its fields against impls the same way: an impl
+# provides for a generator when its written protocol name spells it.
+fn spells_gen(pspell: String, g: CoreProto) : Bool = match derive_gen(pspell) {
+  Some(p) -> core_proto_same(p, g)
+  None    -> false
+}
+
+fn derives_gen(names: [String], g: CoreProto) : Bool = match names {
+  []           -> false
+  [n, ...rest] -> spells_gen(n, g) or derives_gen(rest, g)
 }
 
 fn validate_derives_loop(ds: [Decl], df: DiagFiles, reach: [ImplReach], errs: [Diagnostic]) : [Diagnostic] / Console {
@@ -1367,14 +1391,20 @@ fn validate_derive_decl(names: [String], inner: Decl, file: String, reach: [Impl
   DType(_, tname, tps, body, _, _, _, _, _) -> {
     let fields = derive_field_types(body)
     let own = list_append(map(names, (n) => derived_reach(n, tname, tps)), param_reach(names, tps))
-    validate_derive_protos(filter(names, derive_reach_checked), tname, fields,
+    validate_derive_protos(filter(derive_gens(names), derive_reach_checked), tname, fields,
                            list_append(own, reach), DS(file, dline, dcol), errs)
   }
   _ -> errs
 }
 
-fn derive_reach_checked(pname: String) : Bool =
-  pname == "Eq" or pname == "Hash" or pname == "Show"
+fn derive_reach_checked(d: DeriveGen) : Bool = match d {
+  DeriveGen(_, g) -> match g {
+    CpEq   -> true
+    CpHash -> true
+    CpShow -> true
+    _      -> false
+  }
+}
 
 # A field typed by a parameter the derive bounds is covered by that bound.
 fn param_reach(names: [String], tps: [String]) : [ImplReach] = match names {
@@ -1410,28 +1440,28 @@ fn record_field(f: FieldDecl) : DeriveField = match f {
   FD(_, fname, te, _) -> DFld(concat_all(["field `", fname, "`"]), te)
 }
 
-fn validate_derive_protos(names: [String], tname: String, fields: [DeriveField],
-                          reach: [ImplReach], site: DeriveSite, errs: [Diagnostic]) : [Diagnostic] / Console = match names {
-  []               -> errs
-  [pname, ...rest] ->
+fn validate_derive_protos(gens: [DeriveGen], tname: String, fields: [DeriveField],
+                          reach: [ImplReach], site: DeriveSite, errs: [Diagnostic]) : [Diagnostic] / Console = match gens {
+  []           -> errs
+  [d, ...rest] ->
     validate_derive_protos(rest, tname, fields, reach, site,
-                           validate_derive_fields(pname, tname, fields, reach, site, errs))
+                           validate_derive_fields(d, tname, fields, reach, site, errs))
 }
 
-fn validate_derive_fields(pname: String, tname: String, fields: [DeriveField],
+fn validate_derive_fields(d: DeriveGen, tname: String, fields: [DeriveField],
                           reach: [ImplReach], site: DeriveSite, errs: [Diagnostic]) : [Diagnostic] / Console = match fields {
   []           -> errs
   [f, ...rest] -> match f {
-    DFld(what, te) -> {
-      let path = missing_path(pname, head_tree(te), reach, (h) => derive_builtin_impl(pname, h))
+    DFld(what, te) -> match d { DeriveGen(pname, g) -> {
+      let path = missing_path(pname, head_tree(te), reach, (h) => derive_builtin_impl(g, h))
       let errs1 = match path {
         [] -> errs
         _  -> {
           [report_derive_missing(pname, tname, what, path, site), ...errs]
         }
       }
-      validate_derive_fields(pname, tname, rest, reach, site, errs1)
-    }
+      validate_derive_fields(d, tname, rest, reach, site, errs1)
+    } }
   }
 }
 
@@ -1539,7 +1569,11 @@ fn derive_impls_loop(names: [String], dt: DerivedType, line: Int, col: Int, acc:
   match names {
     [] -> list_reverse(acc)
     [pspell, ...rest] -> {
-      let ds = map(derive_impl_for_protocol(dotted_bare(pspell), dt, line, col),
+      let generated = match derive_gen(pspell) {
+        Some(g) -> derive_impl_for_protocol(g, dt, line, col)
+        None    -> []
+      }
+      let ds = map(generated,
                    (dd) => derive_generalize(impl_with_pname(dd, pspell), pspell, dt.tname, dt.tps))
       derive_impls_loop(rest, dt, line, col, list_append(list_reverse(ds), acc))
     }
@@ -1582,26 +1616,19 @@ fn decl_type_home(d: Decl, target_mod: String) : Option[String] = match d {
 # v1 single-dispatch cannot route a return-type-only call (issue
 # #459 §"Two design routes" + the `Serialize` prologue in
 # `stdlib/protocols.kai`).
-fn derive_impl_for_protocol(pname: String, dt: DerivedType, line: Int, col: Int) : [Decl] {
+fn derive_impl_for_protocol(g: CoreProto, dt: DerivedType, line: Int, col: Int) : [Decl] {
   let tname = dt.tname
   let shown = dt.shown
   let body = dt.body
-  if pname == "Show" {
-    option_to_list(derive_show_impl(tname, shown, body, line, col))
-  } else if pname == "Eq" {
-    option_to_list(derive_eq_impl(tname, body, line, col))
-  } else if pname == "Hash" {
-    option_to_list(derive_hash_impl(tname, body, line, col))
-  } else if pname == "Ord" {
-    option_to_list(derive_ord_impl(tname, body, line, col))
-  } else if pname == "BinSerialize" {
-    derive_binserialize_impl(tname, shown, body, dt.writers, line, col)
-  } else if pname == "Layout" {
-    derive_layout_impl(tname, shown, body, line, col)
-  } else if pname == "Json" {
-    derive_json_impl(tname, shown, body, line, col)
-  } else {
-    []
+  match g {
+    CpShow         -> option_to_list(derive_show_impl(tname, shown, body, line, col))
+    CpEq           -> option_to_list(derive_eq_impl(tname, body, line, col))
+    CpHash         -> option_to_list(derive_hash_impl(tname, body, line, col))
+    CpOrd          -> option_to_list(derive_ord_impl(tname, body, line, col))
+    CpBinSerialize -> derive_binserialize_impl(tname, shown, body, dt.writers, line, col)
+    CpLayout       -> derive_layout_impl(tname, shown, body, line, col)
+    CpJson         -> derive_json_impl(tname, shown, body, line, col)
+    _              -> []
   }
 }
 
@@ -2765,14 +2792,14 @@ fn collect_binser_types(decls: [Decl], impls: Bool, acc: [String]) : [String] {
     [] -> acc
     [d, ...rest] -> match d {
       DImpl(pname, _, target, _, _, _, _, isym) ->
-        if impls and dotted_bare(pname) == "BinSerialize" {
+        if impls and spells_gen(pname, CpBinSerialize) {
           collect_binser_types(rest, impls, [proto_type_name(target), ...acc])
         } else {
           collect_binser_types(rest, impls, acc)
         }
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, _, _, _, _, _, _) ->
-          if list_has(map(names, dotted_bare), "BinSerialize") {
+          if derives_gen(names, CpBinSerialize) {
             collect_binser_types(rest, impls, [tname, ...acc])
           } else {
             collect_binser_types(rest, impls, acc)
@@ -2800,7 +2827,7 @@ fn validate_derive_binser_loop(decls: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, body, line, col, _, _, _) ->
-          if list_has(map(names, dotted_bare), "BinSerialize") {
+          if derives_gen(names, CpBinSerialize) {
             let file = decl_diag_file(d, df)
             let errs1 = validate_derive_binser_body(file, tname, body,
                                                      providers, line, col, errs)
@@ -2931,7 +2958,7 @@ fn validate_derive_layout_loop(decls: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, body, line, col, _, _, _) ->
-          if list_has(map(names, dotted_bare), "Layout") {
+          if derives_gen(names, CpLayout) {
             let file = decl_diag_file(d, df)
             let errs1 = validate_derive_layout_body(file, tname, body,
                                                      line, col, errs)
@@ -3014,7 +3041,7 @@ fn validate_derive_json_loop(decls: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, body, line, col, _, _, _) ->
-          if list_has(map(names, dotted_bare), "Json") {
+          if derives_gen(names, CpJson) {
             let file = decl_diag_file(d, df)
             let errs1 = validate_derive_json_body(file, tname, body, line, col, errs)
             validate_derive_json_loop(rest, df, errs1)
@@ -3212,14 +3239,14 @@ fn collect_ord_providers(decls: [Decl], acc: [String]) : [String] {
     [] -> acc
     [d, ...rest] -> match d {
       DImpl(pname, _, target, _, _, _, _, isym) ->
-        if dotted_bare(pname) == "Ord" {
+        if spells_gen(pname, CpOrd) {
           collect_ord_providers(rest, [proto_type_name(target), ...acc])
         } else {
           collect_ord_providers(rest, acc)
         }
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, _, _, _, _, _, _, _) ->
-          if list_has(map(names, dotted_bare), "Ord") {
+          if derives_gen(names, CpOrd) {
             collect_ord_providers(rest, [tname, ...acc])
           } else {
             collect_ord_providers(rest, acc)
@@ -3247,7 +3274,7 @@ fn validate_derive_ord_loop(decls: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tname, tps, body, line, col, _, _, _) ->
-          if list_has(map(names, dotted_bare), "Ord") {
+          if derives_gen(names, CpOrd) {
             let file = decl_diag_file(d, df)
             let own = list_append(derive_bound_params(tps), providers)
             let errs1 = validate_derive_ord_body(file, tname, body, own,
@@ -3392,7 +3419,7 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # stream also scopes the impl validations below, so it is computed
   # once here.
   let homes = imports_home_anchors(expanded, target_mod, target_mod, [])
-  let reg0 = reg_with_scope(collect_proto_decls(expanded, proto_reg_empty()), cores, imports, ps)
+  let reg0 = reg_with_scope(collect_proto_decls(expanded, proto_reg_empty(), ps), cores, imports, ps)
   # Step 3 — coherence: orphan + duplicate-impl + protocol-visibility
   # validation. Needs `reg0.origins` to resolve each impl's protocol
   # name from its own module.
@@ -3466,9 +3493,9 @@ pub type OpAr = OpAr(String, Int)
 pub fn proto_rungs(reg: ProtocolReg) : [ProtoRung] = {
   let ars = op_arities_from_ops(reg.ops)
   map(reg.ops, (op) => match op {
-    POR(proto, name, params, _, _, _, mo) -> {
+    POR(_, name, params, _, _, _, mo, psym) -> {
       let n = list_length(params)
-      ProtoRung(name, n, proto_dispatcher_name_at(ars, name, n), mo, psc_is_pub(reg.origins, proto, mo))
+      ProtoRung(name, n, proto_dispatcher_name_at(ars, name, n), mo, psc_is_pub(reg.origins, psym))
     }
   })
 }
@@ -3478,7 +3505,7 @@ pub fn op_arities_from_ops(ops: [ProtoOpReg]) : [OpAr] {
   match ops {
     [] -> []
     [op, ...rest] -> match op {
-      POR(_, name, params, _, _, _, _) ->
+      POR(_, name, params, _, _, _, _, _) ->
         [OpAr(name, list_length(params)), ...op_arities_from_ops(rest)]
     }
   }
@@ -3682,7 +3709,10 @@ fn resolve_protocol_calls_kind(k: ExprKind, reg: ProtocolReg,
 # protocol's op. An operand type with no custom impl keeps the builtin
 # EBinop (which lowers to kai_op_eq_v / direct compare / arithmetic).
 fn prc_op_impl(reg: ProtocolReg, bp: BinopProto, t: Option[Ty]) : Option[ProtoImplReg] =
-  prc_cmp_impl(reg, op_proto_protocol(bp), op_proto_method(bp), t)
+  match op_proto_core(bp) {
+    Some(cp) -> prc_cmp_impl(reg, cp, op_proto_method(bp), t)
+    None     -> None
+  }
 
 fn prc_rewrite_cmp_binop(op: String, l: Expr, r: Expr, reg: ProtocolReg) : ExprKind {
   if op == "==" or op == "!=" {
@@ -3722,10 +3752,13 @@ fn prc_arith_impl(reg: ProtocolReg, bp: BinopProto, lt: Option[Ty], rt: Option[T
     BpNone -> None
     _ -> match prc_con_head(lt) {
       None -> None
-      Some(DispHead(n, hs)) -> if not prc_same_head(rt, n, hs) { None } else {
-        let proto = op_proto_protocol(bp)
-        find(impl_pool(reg, proto, n), (p) => prc_homogeneous(p, proto, op_proto_method(bp), DispHead(n, hs)))
-      }
+      Some(DispHead(n, hs)) -> if not prc_same_head(rt, n, hs) { None } else { match op_proto_core(bp) {
+        None     -> None
+        Some(cp) -> {
+          let proto = core_proto_id(cp)
+          find(impl_pool(reg, proto, n), (p) => prc_homogeneous(p, proto, op_proto_method(bp), DispHead(n, hs)))
+        }
+      } }
     }
   }
 
@@ -3739,9 +3772,9 @@ fn prc_same_head(t: Option[Ty], n: String, s: SymId) : Bool = match t {
   _                         -> false
 }
 
-fn prc_homogeneous(p: ProtoImplReg, proto: String, opname: String, h: DispHead) : Bool = match p {
-  PIR(pn, _, op, _, args, _, _, _) ->
-    pn == proto and op == opname and pir_serves(p, h) and match args {
+fn prc_homogeneous(p: ProtoImplReg, proto: SymId, opname: String, h: DispHead) : Bool = match p {
+  PIR(_, _, op, _, args, _, _, _, _) ->
+    pir_of_proto(p, proto) and op == opname and pir_serves(p, h) and match args {
       []  -> true
       [a] -> a == dh_name(h)
       _   -> false
@@ -3760,12 +3793,14 @@ fn prc_mk_ty(k: ExprKind, line: Int, col: Int, ty: Option[Ty]) : Expr =
 # contained field with a custom impl is a documented follow-up (the
 # compiler's own comparisons are all fully structural, so root-only
 # suffices for self-host correctness).
-fn prc_cmp_impl(reg: ProtocolReg, proto: String, opname: String,
+fn prc_cmp_impl(reg: ProtocolReg, cp: CoreProto, opname: String,
                 ty: Option[Ty]) : Option[ProtoImplReg] = match ty {
   None -> None
   Some(t) -> match t {
-    TyCon(_, name, _, s) ->
+    TyCon(_, name, _, s) -> {
+      let proto = core_proto_id(cp)
       find_impl_for(impl_pool(reg, proto, name), proto, DispHead(name, s), opname)
+    }
     _ -> None
   }
 }
@@ -3775,17 +3810,15 @@ fn prc_cmp_impl(reg: ProtocolReg, proto: String, opname: String,
 # predicate then runs over that short list (or the full table when the
 # index is the unbuilt placeholder), so the answer is unchanged.
 #[doc("True iff `reg` holds an `impl proto` entry for the receiver `h` (user or derive-synthesised); O(1) via the impl index when built.")]
-pub fn prc_reg_has_impl(reg: ProtocolReg, proto: String, h: DispHead) : Bool =
+pub fn prc_reg_has_impl(reg: ProtocolReg, proto: SymId, h: DispHead) : Bool =
   prc_impls_has(impl_pool(reg, proto, dh_name(h)), proto, h)
 
-fn prc_impls_has(impls: [ProtoImplReg], proto: String, h: DispHead) : Bool {
+fn prc_impls_has(impls: [ProtoImplReg], proto: SymId, h: DispHead) : Bool {
   match impls {
     [] -> false
-    [pir, ...rest] -> match pir {
-      PIR(p, _, _, _, _, _, _, _) ->
-        if p == proto and pir_serves(pir, h) { true }
-        else { prc_impls_has(rest, proto, h) }
-    }
+    [pir, ...rest] ->
+      if pir_of_proto(pir, proto) and pir_serves(pir, h) { true }
+      else { prc_impls_has(rest, proto, h) }
   }
 }
 
@@ -4633,7 +4666,7 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
   match cands {
     [] -> None
     [po, ...rest] -> match po {
-      POR(pname, _, params, ret_te, _, _, pmo) ->
+      POR(_, _, params, ret_te, _, _, pmo, pkey) ->
         # Arity guard: skip a candidate whose arity differs from the
         # call (an arity-ambiguous name reaches both protocols' POR).
         if list_length(params) != list_length(args_) {
@@ -4641,7 +4674,7 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
         }
         # A protocol the calling module cannot see is not a dispatch
         # candidate for its bare calls.
-        else if not proto_visible_from(reg.origins, pname, pmo, cm) {
+        else if not proto_visible_from(reg.origins, pkey, pmo, cm) {
           try_rewrite_ret_candidates(rest, callee, args_, reg, cm, opname, ret_ty)
         }
         # Only ops whose Self is informed SOLELY by the return position
@@ -4652,10 +4685,9 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
         # with no `impl Show`) onto an unrelated impl whose head happens
         # to equal the concrete return head (`String`).
         else if not proto_op_self_only_in_return(params, ret_te,
-                       proto_shape_carriers_at(reg.tparams, pname, pmo)) {
+                       proto_shape_carriers_at(reg.tparams, pkey)) {
           try_rewrite_ret_candidates(rest, callee, args_, reg, cm, opname, ret_ty)
         } else {
-          let pkey = proto_key_of(reg.dkeys, pname, pmo)
           match self_head_in_ret(ret_te, ret_ty) {
             None -> try_rewrite_ret_candidates(rest, callee, args_, reg, cm,
                                                opname, ret_ty)
@@ -4744,7 +4776,7 @@ fn try_rewrite_proto_candidates(cands: [ProtoOpReg], callee: Expr,
 
 # The impl function a dispatched call reaches, by its identity.
 fn pimpl_ref(reg: ProtocolReg, p: ProtoImplReg, at: Expr) : Expr = {
-  let home = match p { PIR(_, _, _, _, _, _, mo, _) -> match mo { Some(m) -> m  None -> reg.root } }
+  let home = match p { PIR(_, _, _, _, _, _, mo, _, _) -> match mo { Some(m) -> m  None -> reg.root } }
   mk_expr(ESym(sym_derive(NCFn, pir_sym(p), home), spec_none(), pir_sym(p)), at.line, at.col)
 }
 
@@ -4759,14 +4791,13 @@ fn proto_matches_for(cands: [ProtoOpReg], args_: [Expr], reg: ProtocolReg,
 
 fn proto_serves(po: ProtoOpReg, args_: [Expr], reg: ProtocolReg,
                 cm: Option[String], opname: String) : Option[ProtoImplReg] = match po {
-  POR(pname, _, params, ret, _, _, pmo) -> {
+  POR(_, _, params, ret, _, _, pmo, psym) -> {
     let skip = list_length(params) != list_length(args_) or
-               not proto_visible_from(reg.origins, pname, pmo, cm) or
+               not proto_visible_from(reg.origins, psym, pmo, cm) or
                proto_op_self_only_in_return(params, ret,
-                 proto_shape_carriers_at(reg.tparams, pname, pmo))
+                 proto_shape_carriers_at(reg.tparams, psym))
     if skip { None }
-    else { find_proto_impl_for_args(reg, proto_key_of(reg.dkeys, pname, pmo),
-                                    pname, pmo, opname, args_) }
+    else { find_proto_impl_for_args(reg, psym, opname, args_) }
   }
 }
 
@@ -4787,22 +4818,19 @@ fn proto_op_self_only_in_return(params: [Param], ret: TypeExpr,
 # The surface names of a protocol's `Shape`-kind tparams — the dispatch
 # carriers whose applied form `s[A]` a call resolves against, mirroring
 # how `Self` informs an ordinary protocol's dispatch.
-# Home-exact by design: two same-named protocols may declare
-# different tparam lists, so a dispatch candidate reads its own,
-# never the first-registered homonym's.
-fn proto_shape_carriers_at(tps: [ProtoTPReg], pname: String,
-                           pmo: Option[String]) : [String] =
-  shape_carrier_names(proto_scope_tparams(tps, pname, pmo), [])
+# Two same-named protocols may declare different tparam lists, so a
+# dispatch candidate reads its own, never the first-registered
+# homonym's.
+fn proto_shape_carriers_at(tps: [ProtoTPReg], psym: SymId) : [String] =
+  shape_carrier_names(proto_scope_tparams(tps, psym), [])
 
 # True when a protocol quantifies over a `Shape` carrier — dispatch is
 # single on the container, so a two-arg op is not heterogeneous.
-fn proto_is_shape_carrier_at(tps: [ProtoTPReg], pname: String,
-                             pmo: Option[String]) : Bool =
-  match proto_shape_carriers_at(tps, pname, pmo) { [] -> false _ -> true }
+fn proto_is_shape_carrier_at(tps: [ProtoTPReg], psym: SymId) : Bool =
+  match proto_shape_carriers_at(tps, psym) { [] -> false _ -> true }
 
-fn proto_has_tparams_at(tps: [ProtoTPReg], pname: String,
-                        pmo: Option[String]) : Bool =
-  match proto_scope_tparams(tps, pname, pmo) { [] -> false _ -> true }
+fn proto_has_tparams_at(tps: [ProtoTPReg], psym: SymId) : Bool =
+  match proto_scope_tparams(tps, psym) { [] -> false _ -> true }
 
 fn shape_carrier_names(names: [String], acc: [String]) : [String] = match names {
   [] -> list_reverse(acc)
@@ -4880,21 +4908,21 @@ fn te_list_mentions_self(tes: [TypeExpr]) : Bool = match tes {
 # `(proto, recv)` bucket when the index is built, else the whole table.
 # Every `find_impl_*` filter keys on `t == recv`, so the bucket holds
 # exactly the entries the linear scan would not skip, in the same order.
-fn impl_pool(reg: ProtocolReg, pname: String, recv: String) : [ProtoImplReg] =
-  if ii_built(reg.impl_index) { ii_key_bucket(reg.impl_index, pname, recv) }
+fn impl_pool(reg: ProtocolReg, proto: SymId, recv: String) : [ProtoImplReg] =
+  if ii_built(reg.impl_index) { ii_key_bucket(reg.impl_index, proto, recv) }
   else { reg.impls }
 
-# `pkey` keys the impl table; `(pname, pmo)` identify the protocol's
-# own tparam list — a contested name must not read a homonym's.
-fn find_proto_impl_for_args(reg: ProtocolReg, pkey: String, pname: String,
-                             pmo: Option[String], opname: String,
+# `pkey` is the protocol's identity: it keys the impl table and the
+# protocol's own tparam list — a contested name must not read a
+# homonym's.
+fn find_proto_impl_for_args(reg: ProtocolReg, pkey: SymId, opname: String,
                              args_: [Expr]) : Option[ProtoImplReg] {
   # A `Shape`-carrier protocol dispatches single, on the container arg;
   # its ops carry ordinary function parameters (`map(xs, f)`) whose types
   # have no dispatch head. Read the head from the first container-typed
   # argument and ignore the rest, so a function arg does not veto the
   # lookup the way `args_disp_heads` (all-or-nothing) would.
-  if proto_is_shape_carrier_at(reg.tparams, pname, pmo) {
+  if proto_is_shape_carrier_at(reg.tparams, pkey) {
     match first_container_head(args_) {
       None -> None
       Some(a) -> find_impl_homogeneous(impl_pool(reg, pkey, dh_name(a)), pkey, opname, a)
@@ -4910,8 +4938,8 @@ fn find_proto_impl_for_args(reg: ProtocolReg, pkey: String, pname: String,
         # heterogeneous proto-arg — its ops (`map(xs, f)`) take an
         # ordinary function as the second parameter, so dispatch stays
         # single on the container `a`.
-        let proto_takes_args = proto_has_tparams_at(reg.tparams, pname, pmo) and
-                               not proto_is_shape_carrier_at(reg.tparams, pname, pmo)
+        let proto_takes_args = proto_has_tparams_at(reg.tparams, pkey) and
+                               not proto_is_shape_carrier_at(reg.tparams, pkey)
         if not proto_takes_args {
           # Single-dispatch op whose second parameter is part of the
           # op shape (`Numeric.pow_int(Self, Int)` etc.). Only the
@@ -4959,13 +4987,13 @@ fn first_container_head(args_: [Expr]) : Option[DispHead] = match args_ {
 # Find the impl entry whose `arg_names` is empty (legacy default) or
 # is exactly `[recv]` (homogeneous parametrised form). Heterogeneous
 # entries are skipped.
-fn find_impl_homogeneous(impls: [ProtoImplReg], pname: String,
+fn find_impl_homogeneous(impls: [ProtoImplReg], pname: SymId,
                           opname: String, recv: DispHead) : Option[ProtoImplReg] {
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, _, o, _, ans, _, _, _) ->
-        if p == pname and o == opname and pir_serves(it, recv) and
+      PIR(_, _, o, _, ans, _, _, _, _) ->
+        if pir_of_proto(it, pname) and o == opname and pir_serves(it, recv) and
            is_homogeneous_args(ans, dh_name(recv)) {
           Some(it)
         } else {
@@ -4998,13 +5026,13 @@ fn args_disp_heads(args_: [Expr]) : Option[[DispHead]] = match args_ {
 
 # The receiver's identity decides the impl; the proto-args still match
 # by head name.
-fn find_impl_with_args(impls: [ProtoImplReg], pname: String, opname: String,
+fn find_impl_with_args(impls: [ProtoImplReg], pname: SymId, opname: String,
                         recv: DispHead, args: [DispHead]) : Option[ProtoImplReg] {
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, _, o, _, ans, _, _, _) ->
-        if p == pname and o == opname and pir_serves(it, recv) and
+      PIR(_, _, o, _, ans, _, _, _, _) ->
+        if pir_of_proto(it, pname) and o == opname and pir_serves(it, recv) and
            arg_names_match(ans, dh_name(recv), dh_names(args)) {
           Some(it)
         } else {
@@ -5022,13 +5050,13 @@ fn find_impl_with_args(impls: [ProtoImplReg], pname: String, opname: String,
 # holds). The op's params are genuine non-Self arguments already
 # unified by the typer; single-dispatch v1 keys each impl uniquely on
 # `(protocol, op, Self-type)`, so matching on those three is sound.
-fn find_impl_by_recv(impls: [ProtoImplReg], pname: String, opname: String,
+fn find_impl_by_recv(impls: [ProtoImplReg], pname: SymId, opname: String,
                       recv: DispHead) : Option[ProtoImplReg] {
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, _, o, _, _, _, _, _) ->
-        if p == pname and o == opname and pir_serves(it, recv) { Some(it) }
+      PIR(_, _, o, _, _, _, _, _, _) ->
+        if pir_of_proto(it, pname) and o == opname and pir_serves(it, recv) { Some(it) }
         else { find_impl_by_recv(rest, pname, opname, recv) }
     }
   }
@@ -5051,7 +5079,7 @@ fn pcof_matching(cands: [ProtoOpReg], cm: Option[String]) : [ProtoOpReg] =
   match cands {
     [] -> []
     [po, ...rest] -> match po {
-      POR(_, _, _, _, _, _, pmo) ->
+      POR(_, _, _, _, _, _, pmo, _) ->
         if mo_eq(pmo, cm) { [po, ...pcof_matching(rest, cm)] }
         else { pcof_matching(rest, cm) }
     }
@@ -5061,7 +5089,7 @@ fn pcof_rest(cands: [ProtoOpReg], cm: Option[String]) : [ProtoOpReg] =
   match cands {
     [] -> []
     [po, ...rest] -> match po {
-      POR(_, _, _, _, _, _, pmo) ->
+      POR(_, _, _, _, _, _, pmo, _) ->
         if mo_eq(pmo, cm) { pcof_rest(rest, cm) }
         else { [po, ...pcof_rest(rest, cm)] }
     }
@@ -5173,11 +5201,10 @@ fn find_impl_any_proto_loop(cands: [ProtoOpReg], reg: ProtocolReg,
   match cands {
     [] -> None
     [po, ...rest] -> match po {
-      POR(pname, _, _, _, _, _, pmo) -> {
-        if not proto_visible_from(reg.origins, pname, pmo, cm) {
+      POR(pname, _, _, _, _, _, pmo, pkey) -> {
+        if not proto_visible_from(reg.origins, pkey, pmo, cm) {
           find_impl_any_proto_loop(rest, reg, opname, recv, cm)
         } else {
-          let pkey = proto_key_of(reg.dkeys, pname, pmo)
           match find_impl_for(impl_pool(reg, pkey, dh_name(recv)), pkey, recv, opname) {
             Some(p) -> Some(ImplHit(pname, pir_sym(p)))
             None -> find_impl_any_proto_loop(rest, reg, opname, recv, cm)
@@ -5192,17 +5219,17 @@ fn find_impl_any_proto_loop(cands: [ProtoOpReg], reg: ProtocolReg,
 fn first_proto_of_op(reg: ProtocolReg, opname: String) : String {
   match proto_ops_lookup_all(reg, opname) {
     [] -> "?"
-    [po, ..._rest] -> match po { POR(pn, _, _, _, _, _, _) -> pn }
+    [po, ..._rest] -> match po { POR(pn, _, _, _, _, _, _, _) -> pn }
   }
 }
 
-fn find_impl_for(impls: [ProtoImplReg], pname: String, recv: DispHead,
+fn find_impl_for(impls: [ProtoImplReg], pname: SymId, recv: DispHead,
                   opname: String) : Option[ProtoImplReg] {
   match impls {
     [] -> None
     [it, ...rest] -> match it {
-      PIR(p, _, op, _, _, _, _, _) ->
-        if p == pname and op == opname and pir_serves(it, recv) { Some(it) }
+      PIR(_, _, op, _, _, _, _, _, _) ->
+        if pir_of_proto(it, pname) and op == opname and pir_serves(it, recv) { Some(it) }
         else { find_impl_for(rest, pname, recv, opname) }
     }
   }
@@ -5210,60 +5237,59 @@ fn find_impl_for(impls: [ProtoImplReg], pname: String, recv: DispHead,
 
 # Which protocol a call may dispatch against, and what the registry
 # holds for the one it picked. These read the registry's own tables by
-# `(name, home)`; the home itself was decided by the scope chain.
+# the protocol's identity, which the scope chain decided. An absent
+# identity is no protocol and matches no row.
 
-#[doc("The ops of the protocol named `pname` whose home is exactly `home`, in declaration order.")]
-pub fn proto_scope_ops(ops: [ProtoOpReg], pname: String,
-                       home: Option[String]) : [ProtoOpReg] =
-  psc_ops_loop(ops, pname, home, [])
+fn psc_same(a: SymId, b: SymId) : Bool = sym_raw(a) >= 0 and sym_raw(a) == sym_raw(b)
 
-fn psc_ops_loop(ops: [ProtoOpReg], pname: String, home: Option[String],
+#[doc("The ops of the protocol `psym`, in declaration order.")]
+pub fn proto_scope_ops(ops: [ProtoOpReg], psym: SymId) : [ProtoOpReg] =
+  psc_ops_loop(ops, psym, [])
+
+fn psc_ops_loop(ops: [ProtoOpReg], psym: SymId,
                 acc: [ProtoOpReg]) : [ProtoOpReg] = match ops {
   [] -> acc
   [op, ...rest] -> match op {
-    POR(p, _, _, _, _, _, mo) ->
-      if p == pname and mo_eq(mo, home) {
-        psc_ops_loop(rest, pname, home, [op, ...acc])
-      } else { psc_ops_loop(rest, pname, home, acc) }
+    POR(_, _, _, _, _, _, _, s) ->
+      if psc_same(s, psym) {
+        psc_ops_loop(rest, psym, [op, ...acc])
+      } else { psc_ops_loop(rest, psym, acc) }
   }
 }
 
-#[doc("The tparam names of the protocol named `pname` whose home is exactly `home`; `[]` for monomorphic protocols.")]
-pub fn proto_scope_tparams(tps: [ProtoTPReg], pname: String,
-                           home: Option[String]) : [String] = match tps {
+#[doc("The tparam names of the protocol `psym`; `[]` for monomorphic protocols.")]
+pub fn proto_scope_tparams(tps: [ProtoTPReg], psym: SymId) : [String] = match tps {
   [] -> []
-  [PTPR(p, names, mo), ...rest] ->
-    if p == pname and mo_eq(mo, home) { names }
-    else { proto_scope_tparams(rest, pname, home) }
+  [PTPR(_, names, _, s), ...rest] ->
+    if psc_same(s, psym) { names }
+    else { proto_scope_tparams(rest, psym) }
 }
 
-#[doc("The dispatch key of the protocol named `pname` homed at `home`; the bare name when the pair is unregistered.")]
-pub fn proto_key_of(dkeys: [ProtoKey], pname: String,
-                    home: Option[String]) : String = match dkeys {
+#[doc("The dispatch key the protocol `psym` spells its impl symbols with; `pname` when no protocol answers to `psym`.")]
+pub fn proto_key_of(dkeys: [ProtoKey], pname: String, psym: SymId) : String = match dkeys {
   [] -> pname
-  [PKey(n, mo, k), ...rest] ->
-    if n == pname and mo_eq(mo, home) { k }
-    else { proto_key_of(rest, pname, home) }
+  [PKey(_, _, k, s), ...rest] ->
+    if psc_same(s, psym) { k }
+    else { proto_key_of(rest, pname, psym) }
 }
 
 # A module sees its own protocols, root-file ones, and exported foreign
 # ones. The root file sees every protocol.
-#[doc("True when the protocol `(pname, home)` is a legal dispatch candidate for a call inside module `cm` (`None` = root file).")]
-pub fn proto_visible_from(origins: [ProtoOriginReg], pname: String,
+#[doc("True when the protocol `psym`, declared by `home`, is a legal dispatch candidate for a call inside module `cm` (`None` = root file).")]
+pub fn proto_visible_from(origins: [ProtoOriginReg], psym: SymId,
                           home: Option[String],
                           cm: Option[String]) : Bool = match cm {
   None -> true
   Some(_) -> match home {
     None -> true
     Some(_) ->
-      if mo_eq(home, cm) { true } else { psc_is_pub(origins, pname, home) }
+      if mo_eq(home, cm) { true } else { psc_is_pub(origins, psym) }
   }
 }
 
-fn psc_is_pub(origins: [ProtoOriginReg], pname: String,
-              home: Option[String]) : Bool = match origins {
+fn psc_is_pub(origins: [ProtoOriginReg], psym: SymId) : Bool = match origins {
   [] -> false
-  [PrOR(n, mo, p), ...rest] ->
-    if n == pname and mo_eq(mo, home) { p }
-    else { psc_is_pub(rest, pname, home) }
+  [PrOR(_, _, p, s), ...rest] ->
+    if psc_same(s, psym) { p }
+    else { psc_is_pub(rest, psym) }
 }
