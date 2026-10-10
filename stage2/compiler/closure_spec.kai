@@ -18,6 +18,8 @@ import compiler.util
 import compiler.pipe_fusion
 import compiler.closure_spec_ast
 import compiler.closure_spec_emit
+import compiler.closure_spec_capture
+import compiler.symtab
 import compiler.self_call
 import compiler.symtab_build
 import compiler.decl_names
@@ -25,11 +27,18 @@ import compiler.emit_shared
 import compiler.fnreg
 
 #[doc("Specialise every higher-order call on a known env-empty closure; returns the decls with per-site specs appended and their call sites retargeted. Runs post-monomorphisation so each specialised callee is already concrete — the inlined loop body unboxes exactly like the hand-written recursion.")]
-pub fn closure_spec_pass(ds: [Decl], target: String) : [Decl] = {
+pub fn closure_spec_pass(ds: [Decl], target: String, tab: SymTab) : [Decl] = {
   let hofns = collect_hofns(ds)
   if list_length(hofns) == 0 { ds }
-  else { cspec_fixpoint(ds, hofns, [], cspec_fuel(), target) }
+  else { cspec_fixpoint(ds, hofns, [], cspec_fuel(), CsAt(target, tab)) }
 }
+
+# Where the specs are homed, and the table the program's references resolve in.
+type CsAt = CsAt(String, SymTab)
+
+fn cs_prog(ds: [Decl], at: CsAt) : CsProg = match at { CsAt(_, tab) -> CsProg(ds, tab) }
+
+fn cs_target(at: CsAt) : String = match at { CsAt(target, _) -> target }
 
 # Specialisation propagates across fn boundaries: specialising `foldl`
 # on lambda L rewrites its body's `foldl_loop(..., f)` — where `f` is
@@ -44,17 +53,17 @@ fn cspec_fuel() : Int = 64
 # the raw `inner(..., L)` call whose request the next round must find;
 # rewriting inside the loop would retarget it away before it is seen,
 # stranding the transitive spec (`foldl → foldl_loop`).
-fn cspec_fixpoint(ds: [Decl], hofns: [Decl], emitted: [String], fuel: Int, target: String) : [Decl] =
-  if fuel <= 0 { rewrite_all(ds, ds, hofns, target) }
+fn cspec_fixpoint(ds: [Decl], hofns: [Decl], emitted: [String], fuel: Int, at: CsAt) : [Decl] =
+  if fuel <= 0 { rewrite_all(ds, cs_prog(ds, at), hofns, cs_target(at)) }
   else {
-    let reqs = dedup_reqs(cs_collect_decls(ds, ds, hofns), emitted, [])
-    if list_length(reqs) == 0 { rewrite_all(ds, ds, hofns, target) }
+    let reqs = dedup_reqs(cs_collect_decls(ds, cs_prog(ds, at), hofns), emitted, [])
+    if list_length(reqs) == 0 { rewrite_all(ds, cs_prog(ds, at), hofns, cs_target(at)) }
     else {
-      let specs = map(reqs, (r) => emit_cspec(r, ds, target))
+      let specs = map(reqs, (r) => emit_cspec(r, ds, cs_target(at)))
       let ds1 = list_append(ds, specs)
       let hofns1 = list_append(hofns, filter_hofns(specs))
       let emitted1 = list_append(emitted, map(reqs, req_spec_name))
-      cspec_fixpoint(ds1, hofns1, emitted1, fuel - 1, target)
+      cspec_fixpoint(ds1, hofns1, emitted1, fuel - 1, at)
     }
   }
 
@@ -124,7 +133,7 @@ fn lookup_hofn_sym(hofns: [Decl], s: SymId) : Option[Decl] = match hofns {
 # carry elaborate types whose specs miscompile, and the user's win comes
 # entirely from root call sites. A generated spec is itself `mo == None`,
 # so the transitive chain (a fold's spec calling its loop) is still walked.
-fn cs_collect_decls(ds: [Decl], all: [Decl], hofns: [Decl]) : [CSpecReq] =
+fn cs_collect_decls(ds: [Decl], all: CsProg, hofns: [Decl]) : [CSpecReq] =
   match ds {
     [] -> []
     [d, ...rest] -> {
@@ -149,12 +158,12 @@ fn cs_decl_is_derived(d: Decl) : Bool = match d {
 
 # Bottom-up read walk: a request per specialisable `G(args)`. Children
 # first so nested folds are discovered too.
-fn cs_collect_expr(e: Expr, host: String, all: [Decl], hofns: [Decl]) : [CSpecReq] = {
+fn cs_collect_expr(e: Expr, host: String, all: CsProg, hofns: [Decl]) : [CSpecReq] = {
   let kid_reqs = collect_kids(cspec_kids(e), host, all, hofns)
   list_append(kid_reqs, site_req(e, host, all, hofns))
 }
 
-fn collect_kids(es: [Expr], host: String, all: [Decl], hofns: [Decl]) : [CSpecReq] =
+fn collect_kids(es: [Expr], host: String, all: CsProg, hofns: [Decl]) : [CSpecReq] =
   match es {
     [] -> []
     [k, ...rest] -> list_append(cs_collect_expr(k, host, all, hofns), collect_kids(rest, host, all, hofns))
@@ -162,7 +171,7 @@ fn collect_kids(es: [Expr], host: String, all: [Decl], hofns: [Decl]) : [CSpecRe
 
 # A specialisation request for this node when it is a higher-order call
 # on an env-empty closure; empty otherwise.
-fn site_req(e: Expr, host: String, all: [Decl], hofns: [Decl]) : [CSpecReq] =
+fn site_req(e: Expr, host: String, all: CsProg, hofns: [Decl]) : [CSpecReq] =
   match e.kind {
     ECall(callee, args_) -> match callee_hofn(hofns, callee) {
       Some(hd) -> req_of(args_, hd, host, all)
@@ -171,7 +180,7 @@ fn site_req(e: Expr, host: String, all: [Decl], hofns: [Decl]) : [CSpecReq] =
     _ -> []
   }
 
-fn req_of(args_: [Expr], hd: Decl, host: String, all: [Decl]) : [CSpecReq] = {
+fn req_of(args_: [Expr], hd: Decl, host: String, all: CsProg) : [CSpecReq] = {
   let idx = first_fn_param_idx(decl_params(hd), 0)
   if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(hd, idx) { [] }
   else {
@@ -184,13 +193,13 @@ fn req_of(args_: [Expr], hd: Decl, host: String, all: [Decl]) : [CSpecReq] = {
 
 # ---- call-site rewrite (pure map) ----
 
-fn rewrite_all(ds: [Decl], all: [Decl], hofns: [Decl], target: String) : [Decl] =
+fn rewrite_all(ds: [Decl], all: CsProg, hofns: [Decl], target: String) : [Decl] =
   map(ds, (d) => rewrite_decl(d, all, hofns, target))
 
 # Retarget call sites only in the decls that seeded requests — root-file
 # decls and the generated specs (all `mo == None`). A stdlib/compiler
 # decl is left untouched: no spec was discovered for its internal calls.
-fn rewrite_decl(d: Decl, all: [Decl], hofns: [Decl], target: String) : Decl =
+fn rewrite_decl(d: Decl, all: CsProg, hofns: [Decl], target: String) : Decl =
   match d {
     DFn(p, n, tp, ps, rt, row, body, l, c, mo, fsym) ->
       if cs_specialisable_host(d) {
@@ -200,7 +209,7 @@ fn rewrite_decl(d: Decl, all: [Decl], hofns: [Decl], target: String) : Decl =
   }
 
 # Rewrite bottom-up: children via the shared functor, then this node.
-fn rewrite_expr(e: Expr, host: String, all: [Decl], hofns: [Decl], target: String) : Expr = {
+fn rewrite_expr(e: Expr, host: String, all: CsProg, hofns: [Decl], target: String) : Expr = {
   let e1 = Expr { kind: map_expr_kind(e.kind, (k) => rewrite_expr(k, host, all, hofns, target)),
                   line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
   retarget_site(e1, host, all, hofns, target)
@@ -208,7 +217,7 @@ fn rewrite_expr(e: Expr, host: String, all: [Decl], hofns: [Decl], target: Strin
 
 # A specialisable higher-order call `G(args)` becomes `G__cspec__<disc>(rest)`
 # with the functional argument dropped; other nodes pass through.
-fn retarget_site(e: Expr, host: String, all: [Decl], hofns: [Decl], target: String) : Expr =
+fn retarget_site(e: Expr, host: String, all: CsProg, hofns: [Decl], target: String) : Expr =
   match e.kind {
     ECall(callee, args_) -> match callee_hofn(hofns, callee) {
       Some(hd) -> retarget_call(e, callee, args_, hd, host, all, target)
@@ -217,7 +226,7 @@ fn retarget_site(e: Expr, host: String, all: [Decl], hofns: [Decl], target: Stri
     _ -> e
   }
 
-fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, host: String, all: [Decl], target: String) : Expr = {
+fn retarget_call(e: Expr, callee: Expr, args_: [Expr], hd: Decl, host: String, all: CsProg, target: String) : Expr = {
   let idx = first_fn_param_idx(decl_params(hd), 0)
   if idx < 0 or idx >= list_length(args_) or not hofn_specialisable(hd, idx) { e }
   else {
@@ -374,8 +383,16 @@ fn is_tyvar_name(n: String) : Bool = not name_is_global(n)
 # local binder, never a top-level fn. An effectful closure is
 # left alone: a `map`/pipe over it observes per-element effect ordering
 # that inlining the stage into the loop would reorder (soundness, the
-# same gate pipe fusion applies).
-fn classify_closure(a: Expr, all: [Decl]) : Option[ClosureArg] =
+# same gate pipe fusion applies). A closure reading a declaration a
+# callee binder could hide is left alone too.
+fn classify_closure(a: Expr, all: CsProg) : Option[ClosureArg] = match all {
+  CsProg(ds, tab) -> match closure_shape(a, ds) {
+    Some(ca) -> if closure_reads_hideable(tab, ca) { None } else { Some(ca) }
+    None     -> None
+  }
+}
+
+fn closure_shape(a: Expr, all: [Decl]) : Option[ClosureArg] =
   if not fn_ty_pure(a.ty) { None }
   else {
     match a.kind {
