@@ -47,6 +47,19 @@ fn main() : Unit / Stdout = {
 }
 ```
 
+A postfix never continues from the next line: a call `(`, an index
+`[`, a field or method `.`, `!` and a trailing-lambda `{` apply only
+on the line of the expression they follow. A form that ends in a block
+— `if` with or without `else`, `match`, `handle`, `{ }` — is complete
+at its `}`, so the next line starts a new statement or match arm:
+
+```kaikai
+fn main() : Unit / Stdout = {
+  if true { Stdout.print("a") }                # complete at `}`
+  [3, 4] |> each((x) => Stdout.print("#{x}"))  # a list, not an index
+}
+```
+
 Inside parens a leading `-` / `%` is rejected with a diagnostic
 pointing at the newline that ended the expression:
 
@@ -536,6 +549,18 @@ Point-free sections work as the function of `|`, `||`, `|?` and as a
 combinator argument (`.map`, `.and_then`, `.filter`). A point-free
 section is unary; to drop a positional argument, use the `|>`
 placeholder `_` instead — the two do not mix in one section.
+
+A `.f()` on its own line is a section too, never a call on the line
+above. Left as a statement whose value is dropped it is a compile
+error:
+
+```kaikai-neg
+fn main() : Unit / Stdout = {
+  let n = 3
+  .to_string()                                 # error: a section whose
+  Stdout.print("#{n}")                         #   value is discarded
+}
+```
 
 ## Effects
 
