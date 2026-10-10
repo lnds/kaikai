@@ -14,12 +14,10 @@ import compiler.lint_spread
 import compiler.lint_deadcode
 import compiler.lint_effects
 import compiler.call_site_check
-import compiler.sym_read
 import compiler.kind_theory
 import compiler.modules
 import compiler.scope_file
 import compiler.symtab
-import compiler.decl_names
 
 # `LintFinding` is defined in `compiler.lint_idiom` and re-exported via
 # import; both modules build the same finding shape.
@@ -32,7 +30,7 @@ pub fn lint_program(df: DiagFiles, owned_mods: [String], decls: [Decl],
   let root_mod = module_name_of_path(df_root(df))
   let owned = lint_owned(decls, root_mod, owned_mods, [])
   list_append(lint_walk_decls(owned, tab, df, []),
-              lint_program_wide(owned, decls, df, src, root_mod))
+              lint_program_wide(owned, decls, tab, df, src, root_mod))
 }
 
 # A unit merges every imported module into one decl stream, so linting it
@@ -60,20 +58,20 @@ fn decl_is_owned(d: Decl, root_mod: String, owned_mods: [String]) : Bool =
 # Reachability is judged against the whole unit while the report covers
 # only what the package owns: a private fn called from anywhere in the
 # unit is alive, and a stdlib decl is never reported on.
-fn lint_program_wide(owned: [Decl], all: [Decl], df: DiagFiles,
+fn lint_program_wide(owned: [Decl], all: [Decl], tab: SymTab, df: DiagFiles,
                      src: [Decl], root: String) : [FileFinding] {
-  let dead = deadcode_file_findings(owned, all, deadcode_declared_fns(src), df, root)
-  list_append(dead, lint_effects_per_file(owned, df, []))
+  let dead = deadcode_file_findings(owned, all, tab, deadcode_declared_fns(src), df, root)
+  list_append(dead, lint_effects_per_file(owned, tab, df, []))
 }
 
 # The effect-row lint reads the root module name, which differs per file.
-fn lint_effects_per_file(ds: [Decl], df: DiagFiles, acc: [FileFinding]) : [FileFinding] =
+fn lint_effects_per_file(ds: [Decl], tab: SymTab, df: DiagFiles, acc: [FileFinding]) : [FileFinding] =
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> {
       let f = decl_diag_file(d, df)
-      lint_effects_per_file(rest, df,
-        prepend_tagged(effect_findings([d], module_name_of_path(f)), f, acc))
+      lint_effects_per_file(rest, tab, df,
+        prepend_tagged(effect_findings([d], tab, module_name_of_path(f)), f, acc))
     }
   }
 
@@ -86,7 +84,7 @@ fn lint_walk_decls(decls: [Decl], tab: SymTab, df: DiagFiles, acc: [FileFinding]
 
 fn lint_decl(d: Decl, tab: SymTab, df: DiagFiles, acc: [FileFinding]) : [FileFinding] {
   match d {
-    DFn(_, _, _, _, _, _, body, _, _, _, _) ->
+    DFn(_, _, _, _, _, _, body, _, _, _) ->
       prepend_tagged(lint_expr(body, tab, []), decl_diag_file(d, df), acc)
     _ -> acc
   }
@@ -107,7 +105,7 @@ fn prepend_tagged_loop(xs: [LintFinding], file: String,
 # lambda bodies, match arms, and if branches. Idiom nudges are judged at
 # this node before descending; the discard scan lives in the block arm.
 fn lint_expr(e: Expr, tab: SymTab, acc: [LintFinding]) : [LintFinding] {
-  let here = list_append(idiom_findings(e),
+  let here = list_append(idiom_findings(e, tab),
                          list_append(redundant_findings(e),
                                      list_append(combinator_findings(e), spread_findings(e))))
   let a1 = prepend_all(here, acc)
@@ -146,7 +144,7 @@ fn lint_stmts(ss: [Stmt], tab: SymTab, acc: [LintFinding]) : [LintFinding] {
 fn lint_stmt(s: Stmt, tab: SymTab, acc: [LintFinding]) : [LintFinding] {
   let inner = lint_exprs(stmt_expr_list(s), tab, acc)
   match s {
-    SExprStmt(x) -> if discard_is_smell(x, tab) { [discard_finding(x), ...inner] } else { inner }
+    SExprStmt(x) -> if discard_is_smell(x) { [discard_finding(x, tab), ...inner] } else { inner }
     _            -> inner
   }
 }
@@ -154,9 +152,9 @@ fn lint_stmt(s: Stmt, tab: SymTab, acc: [LintFinding]) : [LintFinding] {
 # Point at the start of the discarded expression. An ECall's own
 # line/col mark its argument parens, so prefer the callee's position;
 # every other node already carries its leftmost span.
-fn discard_finding(x: Expr) : LintFinding {
+fn discard_finding(x: Expr, tab: SymTab) : LintFinding {
   let pos = discard_pos(x)
-  LF("discard_pure_value", pos.line, pos.col, discard_message(x))
+  LF("discard_pure_value", pos.line, pos.col, discard_message(x, tab))
 }
 
 fn discard_pos(x: Expr) : Expr {
@@ -166,13 +164,13 @@ fn discard_pos(x: Expr) : Expr {
   }
 }
 
-fn discard_message(x: Expr) : String =
-  concat_all(["pure value of type ", lint_ty_name(x), " discarded; bind it or drop the statement"])
+fn discard_message(x: Expr, tab: SymTab) : String =
+  concat_all(["pure value of type ", lint_ty_name(x, tab), " discarded; bind it or drop the statement"])
 
 # A non-Unit pure value dropped in statement position is dead code; an
 # effectful discard is legitimate because the effect row tracks it.
-fn discard_is_smell(x: Expr, tab: SymTab) : Bool =
-  not ty_is_unit(x.ty) and expr_is_pure(x, tab)
+fn discard_is_smell(x: Expr) : Bool =
+  not ty_is_unit(x.ty) and expr_is_pure(x)
 
 # None ("unknown") is not Unit; expr_is_pure keeps such nodes silent.
 fn ty_is_unit(t: Option[Ty]) : Bool {
@@ -185,51 +183,44 @@ fn ty_is_unit(t: Option[Ty]) : Bool {
 # ---- purity ----------------------------------------------------------
 #
 # "Provably pure": the bias is false-negatives over false-positives.
-# The only effect introducers are an effect-op reference, a handler,
+# The only effect introducers are an effect operation, a handler,
 # and an application of a function whose type carries a non-empty row;
 # every other node only propagates the purity of its children. Any case
 # that cannot be proven pure (a `?` op with no inferred type, an open
 # row tail, an untyped node) reads as impure and stays silent.
 
-fn expr_is_pure(e: Expr, tab: SymTab) : Bool =
-  not expr_has_effect(e, tab)
+fn expr_is_pure(e: Expr) : Bool =
+  not expr_has_effect(e)
 
-fn expr_has_effect(e: Expr, tab: SymTab) : Bool =
-  expr_introduces_effect(e, tab) or children_have_effect(e, tab)
+fn expr_has_effect(e: Expr) : Bool =
+  expr_introduces_effect(e) or children_have_effect(e)
 
-# Judged at this node only; children are covered by expr_has_effect.
-fn expr_introduces_effect(e: Expr, tab: SymTab) : Bool {
+# Judged at this node only; children are covered by expr_has_effect. An
+# effect operation carries no function type, so it is judged by its kind.
+fn expr_introduces_effect(e: Expr) : Bool {
   match e.kind {
-    EHandle(_, _, _, _, _, _, _, _) -> true
-    ESym(s, _, _)                -> is_effect_ref(tab, s)
-    ECall(callee, _)             -> callee_is_effectful(callee, tab)
+    EHandle(_, _, _, _, _, _, _) -> true
+    EOp(_)                       -> true
+    ECall(callee, _)             -> callee_is_effectful(callee)
     _                            -> false
   }
 }
 
-# A flattened `Eff.op` reference carries no inferred type; it carries the
-# id of its effect's declaration.
-fn is_effect_ref(tab: SymTab, s: SymId) : Bool =
-  st_valid(tab, s) and match sym_class(tab, s) {
-    NCEffect -> true
-    _        -> false
-  }
-
 # A call is effectful when its callee's function type carries a non-empty
 # row. An unresolved callee type reads as effectful unless it is a bare
 # binding (then the call's purity rides on its arguments alone).
-fn callee_is_effectful(callee: Expr, tab: SymTab) : Bool {
+fn callee_is_effectful(callee: Expr) : Bool {
   match callee.ty {
     Some(TyFnT(_, _, row)) -> not row_is_pure(row)
     Some(_)                -> false
-    None                   -> not is_known_pure_var(callee, tab)
+    None                   -> not is_known_pure_var(callee)
   }
 }
 
-fn is_known_pure_var(callee: Expr, tab: SymTab) : Bool {
+fn is_known_pure_var(callee: Expr) : Bool {
   match callee.kind {
-    EName(_)    -> true
-    ESym(s, _, _) -> not is_effect_ref(tab, s)
+    ELocal(_)  -> true
+    ESym(_, _) -> true
     EMark(m)   -> mark_is_prim(m)
     _          -> false
   }
@@ -249,8 +240,8 @@ fn row_is_pure(row: Row) : Bool =
 # Both the effect scan and the finding walk descend through
 # xp_positions, the exhaustive enumeration of expression positions.
 
-fn children_have_effect(e: Expr, tab: SymTab) : Bool =
-  any_position_effect(xp_positions(e), tab)
+fn children_have_effect(e: Expr) : Bool =
+  any_position_effect(xp_positions(e))
 
 fn lint_children(e: Expr, tab: SymTab, acc: [LintFinding]) : [LintFinding] =
   lint_positions(xp_positions(e), tab, acc)
@@ -274,10 +265,10 @@ fn stmt_expr_list(s: Stmt) : [Expr] {
   }
 }
 
-fn any_position_effect(xs: [XPos], tab: SymTab) : Bool {
+fn any_position_effect(xs: [XPos]) : Bool {
   match xs {
     []                  -> false
-    [XP(_, x), ...rest] -> if expr_has_effect(x, tab) { true } else { any_position_effect(rest, tab) }
+    [XP(_, x), ...rest] -> if expr_has_effect(x) { true } else { any_position_effect(rest) }
   }
 }
 
@@ -297,9 +288,9 @@ fn lint_exprs(xs: [Expr], tab: SymTab, acc: [LintFinding]) : [LintFinding] {
 
 # ---- type display ----------------------------------------------------
 
-fn lint_ty_name(e: Expr) : String {
+fn lint_ty_name(e: Expr, tab: SymTab) : String {
   match e.ty {
-    Some(t) -> inf_ty_to_string(t)
+    Some(t) -> inf_ty_to_string(tab, t)
     None    -> "?"
   }
 }
@@ -321,9 +312,9 @@ pub fn run_lint(file: String, df: DiagFiles, owned_mods: [String], decls: [Decl]
                  src: [Decl], head_owners: [HeadOwnerEntry],
                  tab: SymTab, views: FileViews) : Int / Console + File {
   let r = lint_infer(file, decls, head_owners, tab, views)
-  let contract_errs = check_call_site_refinements(file, r.decls)
+  let contract_errs = check_call_site_refinements(file, r.decls, tab)
   if contract_errs != 0 { contract_errs }
-  else { lint_report_text(lint_program(df, owned_mods, sym_locals_read_decls(r.decls), src, tab)); 0 }
+  else { lint_report_text(lint_program(df, owned_mods, r.decls, src, tab)); 0 }
 }
 
 fn lint_report_text(findings: [FileFinding]) : Unit / Console {
@@ -349,9 +340,9 @@ pub fn run_lint_json(file: String, df: DiagFiles, owned_mods: [String],
                       head_owners: [HeadOwnerEntry],
                       tab: SymTab, views: FileViews) : Int / Console + File {
   let r = lint_infer(file, decls, head_owners, tab, views)
-  let contract_errs = check_call_site_refinements(file, r.decls)
+  let contract_errs = check_call_site_refinements(file, r.decls, tab)
   if contract_errs != 0 { contract_errs }
-  else { print(concat_all(["[", lint_json_body(lint_program(df, owned_mods, sym_locals_read_decls(r.decls), src, tab)), "]"])); 0 }
+  else { print(concat_all(["[", lint_json_body(lint_program(df, owned_mods, r.decls, src, tab)), "]"])); 0 }
 }
 
 fn lint_json_body(findings: [FileFinding]) : String =

@@ -13,24 +13,31 @@ the function body, and a static function captures nothing.
 import compiler.ast
 import compiler.expr_positions
 import compiler.modules
-import compiler.util
 
-#[doc("Every name `body` binds to a closure it cannot see into, the parameters included.")]
-pub fn opaque_binders(params: [Param], body: Expr) : [String] =
-  ob_expr(body, param_names(params, []))
+#[doc("Every binder `body` binds to a closure it cannot see into, the parameters included.")]
+pub fn opaque_binders(params: [Param], body: Expr) : [LocalId] =
+  ob_expr(body, param_ids(params, []))
 
 #[doc("True iff calling `callee` runs a closure whose captures the caller cannot see.")]
-pub fn callee_is_opaque(callee: Expr, opaque: [String]) : Bool = match callee.kind {
-  EName(n)        -> list_has(opaque, n)
-  # A declaration is static whatever binder shares its spelling.
-  ESym(s, _, n)  -> sym_is_local(s) and list_has(opaque, n)
+pub fn callee_is_opaque(callee: Expr, opaque: [LocalId]) : Bool = match callee.kind {
+  ELocal(l)      -> ob_has(opaque, l)
+  # A declaration is static, and so are an operation and a name the
+  # typer has still to settle: neither is a binder.
+  ESym(_, _)     -> false
+  EOp(_)         -> false
+  EName(_)       -> false
   EModCall(_, _) -> false
   ELambda(_, _)  -> false
   _              -> true
 }
 
+fn ob_has(ls: [LocalId], l: LocalId) : Bool = match ls {
+  []           -> false
+  [h, ...rest] -> local_eq(h, l) or ob_has(rest, l)
+}
+
 #[doc("True iff `e` is a function value the caller sees into or that captures nothing, so passing it cannot hand over a cell.")]
-pub fn fn_value_is_transparent(e: Expr, opaque: [String]) : Bool = match e.ty {
+pub fn fn_value_is_transparent(e: Expr, opaque: [LocalId]) : Bool = match e.ty {
   Some(t) -> match t {
     TyFnT(_, _, _) -> not callee_is_opaque(e, opaque)
     _              -> false
@@ -62,15 +69,17 @@ fn fill_under(es: [Expr], lhs: Expr) : [Expr] = match es {
   }
 }
 
-fn param_names(ps: [Param], acc: [String]) : [String] = match ps {
+fn param_ids(ps: [Param], acc: [LocalId]) : [LocalId] = match ps {
   []           -> acc
-  [p, ...rest] -> param_names(rest, [p.pname, ...acc])
+  [p, ...rest] -> param_ids(rest, [p.binder.id, ...acc])
 }
 
-fn ob_expr(e: Expr, acc: [String]) : [String] =
+fn pat_ids(pat: Pattern, acc: [LocalId]) : [LocalId] = foldl(pat_binders(pat, []), acc, (a, b) => [b.id, ...a])
+
+fn ob_expr(e: Expr, acc: [LocalId]) : [LocalId] =
   ob_positions(xp_positions(e), ob_node(e.kind, acc))
 
-fn ob_positions(ps: [XPos], acc: [String]) : [String] = match ps {
+fn ob_positions(ps: [XPos], acc: [LocalId]) : [LocalId] = match ps {
   []           -> acc
   [p, ...rest] -> match p {
     XP(_, c) -> ob_positions(rest, ob_expr(c, acc))
@@ -78,42 +87,42 @@ fn ob_positions(ps: [XPos], acc: [String]) : [String] = match ps {
 }
 
 # The binders a node introduces; `ob_expr` walks its sub-expressions.
-fn ob_node(k: ExprKind, acc: [String]) : [String] = match k {
-  EBlock(stmts, _)                    -> ob_stmts(stmts, acc)
-  EMatch(_, arms)                     -> ob_arms(arms, acc)
-  ELambda(ps, _)                      -> param_names(ps, acc)
-  EHandle(_, _, _, _, _, _, cls, ret) -> ob_return(ret, ob_clauses(cls, acc))
-  _                                   -> acc
+fn ob_node(k: ExprKind, acc: [LocalId]) : [LocalId] = match k {
+  EBlock(stmts, _)                 -> ob_stmts(stmts, acc)
+  EMatch(_, arms)                  -> ob_arms(arms, acc)
+  ELambda(ps, _)                   -> param_ids(ps, acc)
+  EHandle(_, _, _, _, _, cls, ret) -> ob_return(ret, ob_clauses(cls, acc))
+  _                                -> acc
 }
 
-fn ob_stmts(ss: [Stmt], acc: [String]) : [String] = match ss {
+fn ob_stmts(ss: [Stmt], acc: [LocalId]) : [LocalId] = match ss {
   []           -> acc
   [s, ...rest] -> ob_stmts(rest, ob_stmt(s, acc))
 }
 
 # A `let` naming a lambda literal or a static function stays transparent;
 # one aliasing an opaque binder, or holding any other value, does not.
-fn ob_stmt(s: Stmt, acc: [String]) : [String] = match s {
-  SLet(pat, _, rhs)      -> if callee_is_opaque(rhs, acc) { pat_binders(pat, acc) } else { acc }
-  SVar(name, _, _, _, _) -> [name, ...acc]
-  _                      -> acc
+fn ob_stmt(s: Stmt, acc: [LocalId]) : [LocalId] = match s {
+  SLet(pat, _, rhs)   -> if callee_is_opaque(rhs, acc) { pat_ids(pat, acc) } else { acc }
+  SVar(b, _, _, _, _) -> [b.id, ...acc]
+  _                   -> acc
 }
 
-fn ob_arms(arms: [Arm], acc: [String]) : [String] = match arms {
+fn ob_arms(arms: [Arm], acc: [LocalId]) : [LocalId] = match arms {
   []           -> acc
   [a, ...rest] -> match a {
-    Arm(pat, _, _) -> ob_arms(rest, pat_binders(pat, acc))
+    Arm(pat, _, _) -> ob_arms(rest, pat_ids(pat, acc))
   }
 }
 
-fn ob_clauses(cls: [HClause], acc: [String]) : [String] = match cls {
+fn ob_clauses(cls: [HClause], acc: [LocalId]) : [LocalId] = match cls {
   []           -> acc
   [c, ...rest] -> match c {
-    HC(_, ps, _, _, _) -> ob_clauses(rest, param_names(ps, acc))
+    HC(_, ps, _, _, _) -> ob_clauses(rest, param_ids(ps, acc))
   }
 }
 
-fn ob_return(ret: Option[HReturn], acc: [String]) : [String] = match ret {
-  Some(HR(name, _, _, _)) -> [name, ...acc]
-  None                    -> acc
+fn ob_return(ret: Option[HReturn], acc: [LocalId]) : [LocalId] = match ret {
+  Some(HR(b, _, _, _)) -> [b.id, ...acc]
+  None                 -> acc
 }

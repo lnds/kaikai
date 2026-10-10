@@ -17,6 +17,11 @@ keeps the check from rejecting correct code.
 """)]
 
 import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+import compiler.local_names
+import compiler.handler_alias
 import compiler.closure_spec_ast
 import compiler.diag
 import compiler.mutation_carriers
@@ -25,77 +30,60 @@ import compiler.core_effects
 import compiler.core_builtins
 import compiler.core_fns
 
-fn is_spawn_boundary_callee(key: String) : Bool =
-  name_in(spawn_boundary_callees(), strip_dispatch_tag(key))
-
-
-# `Spawn.spawn` is the op both `n.spawn` (rewritten by the nursery cap
-# pass) and the free `spawn` wrapper reach; `spawn_actor_fiber` is the
-# actor surface's own runtime entry, which does not route through the op.
-fn spawn_boundary_callees() : [String] =
-  ["Spawn.spawn", "spawn_actor_fiber",
-   "spawn", "spawn.spawn",
-   "spawn_actor", "spawn.spawn_actor",
-   "spawn_actor_policy", "spawn.spawn_actor_policy",
-   "actor.spawn_actor", "actor.spawn_actor_policy"]
-
-
-fn name_in(xs: [String], s: String) : Bool {
-  match xs {
-    []           -> false
-    [h, ...rest] -> if h == s { true } else { name_in(rest, s) }
-  }
-}
-
-
-# `@alias` / `#cap` suffixes are codegen-only dispatch tags.
-fn strip_dispatch_tag(key: String) : String =
-  strip_dispatch_tag_loop(key, 0, string_length(key))
-
-
-fn strip_dispatch_tag_loop(key: String, i: Int, n: Int) : String {
-  if i >= n { key }
-  else {
-    let b = string_byte_at_int(key, i)
-    if b == char_to_int('@') or b == char_to_int('#') { string_slice(key, 0, i) }
-    else { strip_dispatch_tag_loop(key, i + 1, n) }
-  }
-}
-
+#[doc("Where a spawn sits: the file a diagnostic names, the table that names a declaration, and the declaration whose binders its thunk can capture.")]
+pub type SpawnSite = { file: String, tab: SymTab, owner: Decl }
 
 #[doc("Reject a spawned thunk capturing a mutation carrier from the enclosing fiber. Returns the diagnostics it rendered.")]
-pub fn check_thunk_captures(file: String, recs: [RecInfo],
+pub fn check_thunk_captures(site: SpawnSite, recs: [RecInfo],
                             thunk: Expr) : [Diagnostic] / Console + File {
   match thunk.kind {
     ELambda(ps, body) -> {
       let dmut = mutating_record_type_names(recs)
-      let bound = param_names(ps, [])
-      map(free_carriers(body, bound, dmut, []), (c) => report_capture(file, c))
+      let bound = param_ids(ps, [])
+      map(free_carriers(body, bound, dmut, []), (c) => report_capture(site, c))
     }
     _ -> []
   }
 }
 
 
-fn param_names(ps: [Param], acc: [String]) : [String] = match ps {
+fn param_ids(ps: [Param], acc: [LocalId]) : [LocalId] = match ps {
   []           -> acc
-  [p, ...rest] -> param_names(rest, [p.pname, ...acc])
+  [p, ...rest] -> param_ids(rest, [p.binder.id, ...acc])
 }
 
 
-# A capture: name, its type as written for the diagnostic, and where it
-# is read. The first read of a name is the one reported.
-type Capture = Cap(String, String, Int, Int)
+# What a thunk holds from outside itself: a binder of the enclosing
+# fiber, or a declaration.
+type Held = HeldLocal(LocalId) | HeldDecl(SymId)
+
+fn held_same(a: Held, b: Held) : Bool = match a {
+  HeldLocal(x) -> match b { HeldLocal(y) -> local_eq(x, y)  HeldDecl(_) -> false }
+  HeldDecl(x)  -> match b { HeldDecl(y) -> sym_raw(x) == sym_raw(y)  HeldLocal(_) -> false }
+}
+
+# The enclosing declaration's binders, and the handler-state aliases no
+# node declares.
+fn held_name(site: SpawnSite, h: Held) : Written = match h {
+  HeldDecl(s)  -> decl_name(site.tab, s)
+  HeldLocal(l) -> ln_text(foldl(user_state_aliases(), ln_of_decl(site.owner),
+                                (ns, k) => ln_with_binder(ns, binder_minted(k))), l)
+}
+
+# A capture: what is held, its type for the diagnostic, and where it
+# is read. The first read is the one reported.
+type Carried = Cap(Held, Ty, Int, Int)
 
 
 # The row check's help ("handle it inside") is wrong here: when the
 # point IS to share, moving the state inside gives each child its own
 # copy. Actors are the supported route.
-fn report_capture(file: String, c: Capture) : Diagnostic / Console + File = match c {
-  Cap(name, tyname, line, col) -> {
+fn report_capture(site: SpawnSite, c: Carried) : Diagnostic / Console + File = match c {
+  Cap(held, ty, line, col) -> {
+    let file = site.file
     let d = mk_diag(SevError, file, line, col,
-                    concat_all(["a spawned fiber cannot capture `", tyname, "`"]),
-                    [ri_note(file, line, col, concat_all(["`", name, "` is owned by the parent fiber"])),
+                    concat_all(["a spawned fiber cannot capture `", carrier_display(site.tab, ty), "`"]),
+                    [ri_note(file, line, col, concat_all(["`", written_text(held_name(site, held)), "` is owned by the parent fiber"])),
                      ri_note(file, line, col, "fibers have private heaps; the child would mutate a copy"),
                      ri_help(file, line, col, "let one fiber own the state and message it (`kai info actors`)")])
     render_diag(d)
@@ -104,14 +92,15 @@ fn report_capture(file: String, c: Capture) : Diagnostic / Console + File = matc
 }
 
 
-# Free names of carrier type, in source order, one entry per name.
-fn free_carriers(e: Expr, bound: [String], dmut: [String],
-                 acc: [Capture]) : [Capture] {
+# Free reads of carrier type, in source order, one entry per binder or
+# declaration.
+fn free_carriers(e: Expr, bound: [LocalId], dmut: [SymId],
+                 acc: [Carried]) : [Carried] {
   match e.kind {
-    EName(n)    -> add_carrier(e, n, bound, dmut, acc)
-    ESym(_, _, n) -> add_carrier(e, n, bound, dmut, acc)
+    ELocal(l)  -> add_carrier(e, HeldLocal(l), bound, dmut, acc)
+    ESym(s, _) -> add_carrier(e, HeldDecl(s), bound, dmut, acc)
     ELambda(ps, body) ->
-      free_carriers(body, param_names(ps, bound), dmut, acc)
+      free_carriers(body, param_ids(ps, bound), dmut, acc)
     EBlock(stmts, tail) -> {
       let st = free_in_stmts(stmts, bound, dmut, acc)
       match st {
@@ -136,85 +125,93 @@ fn free_carriers(e: Expr, bound: [String], dmut: [String],
 }
 
 
-#[doc("True iff `callee` hands a thunk to a fresh fiber. A resolved callee is judged by its declaration; a spelling nothing resolved, by its name.")]
+#[doc("True iff `callee` hands a thunk to a fresh fiber: a function that starts one, the actor surface's runtime entry, or the `spawn` operation of `Spawn`.")]
 pub fn callee_is_spawn(callee: Expr) : Bool = match callee.kind {
-  EName(key)      -> is_spawn_boundary_callee(key)
-  ESym(s, _, nm) -> sym_is_spawn_boundary(s, nm)
-  _              -> false
+  ESym(s, _) -> sym_is_spawn_boundary(s)
+  # The op both `n.spawn` (rewritten by the nursery cap pass) and the free
+  # `spawn` wrapper reach.
+  EOp(r)     -> effect_is(r.eff, CeSpawn) and written_text(r.op) == "spawn"
+  _          -> false
 }
 
-# An op callee carries its effect's id and spells `Eff.op`, with the
-# dispatch tag of a named instance after it.
-fn sym_is_spawn_boundary(s: SymId, nm: String) : Bool = match known_fn_of(s) {
+# `spawn_actor_fiber` is the actor surface's own runtime entry, which
+# does not route through the op.
+fn sym_is_spawn_boundary(s: SymId) : Bool = match known_fn_of(s) {
   Some(f) -> known_fn_starts_fiber(f)
   None    -> match builtin_of(s) {
     Some(CbSpawnActorFiber) -> true
-    _                       -> strip_dispatch_tag(nm) == "Spawn.spawn" and effect_is(s, CeSpawn)
+    _                       -> false
   }
 }
 
 
-fn add_carrier(e: Expr, n: String, bound: [String], dmut: [String],
-               acc: [Capture]) : [Capture] {
-  if list_has(bound, n) { acc }
-  else if has_capture(acc, n) { acc }
+fn add_carrier(e: Expr, h: Held, bound: [LocalId], dmut: [SymId],
+               acc: [Carried]) : [Carried] {
+  if held_bound(h, bound) { acc }
+  else if has_capture(acc, h) { acc }
   else { match e.ty {
     Some(t) -> if ty_carries_mutation(t, dmut) {
-                 [Cap(n, carrier_display(t), e.line, e.col), ...acc]
+                 [Cap(h, t, e.line, e.col), ...acc]
                } else { acc }
     None    -> acc
   } }
 }
 
 
-fn has_capture(cs: [Capture], n: String) : Bool = match cs {
+fn held_bound(h: Held, bound: [LocalId]) : Bool = match h {
+  HeldLocal(l) -> any(bound, (b) => local_eq(b, l))
+  HeldDecl(_)  -> false
+}
+
+
+fn has_capture(cs: [Carried], h: Held) : Bool = match cs {
   []           -> false
   [c, ...rest] -> match c {
-    Cap(name, _, _, _) -> if name == n { true } else { has_capture(rest, n) }
+    Cap(held, _, _, _) -> if held_same(held, h) { true } else { has_capture(rest, h) }
   }
 }
 
 
 # Carrier types only, so the head plus its arguments is the whole
 # rendering; anything else is not reported and never reaches here.
-fn carrier_display(t: Ty) : String = match t {
-  TyCon(_, name, targs, _) -> match targs {
-    [] -> name
-    _  -> concat_all([name, "[", join_with(display_args(targs), ", "), "]"])
-  }
+fn carrier_display(tab: SymTab, t: Ty) : String = match t {
+  TyCon(s, targs) -> carrier_head(tab, s, targs)
   _ -> "a mutable value"
 }
 
 
-fn display_args(ts: [Ty]) : [String] = match ts {
-  []           -> []
-  [t, ...rest] -> [carrier_display_arg(t), ...display_args(rest)]
+fn carrier_head(tab: SymTab, s: SymId, targs: [Ty]) : String = match targs {
+  [] -> written_text(decl_name(tab, s))
+  _  -> concat_all([written_text(decl_name(tab, s)), "[", join_with(display_args(tab, targs), ", "), "]"])
 }
 
 
-fn carrier_display_arg(t: Ty) : String = match t {
+fn display_args(tab: SymTab, ts: [Ty]) : [String] = match ts {
+  []           -> []
+  [t, ...rest] -> [carrier_display_arg(tab, t), ...display_args(tab, rest)]
+}
+
+
+fn carrier_display_arg(tab: SymTab, t: Ty) : String = match t {
   TyInt    -> "Int"
   TyReal   -> "Real"
   TyBool   -> "Bool"
   TyString -> "String"
   TyChar   -> "Char"
   TyUnit   -> "Unit"
-  TyListT(inner) -> concat_all(["[", carrier_display_arg(inner), "]"])
-  TyCon(_, name, targs, _) -> match targs {
-    [] -> name
-    _  -> concat_all([name, "[", join_with(display_args(targs), ", "), "]"])
-  }
+  TyListT(inner) -> concat_all(["[", carrier_display_arg(tab, inner), "]"])
+  TyCon(s, targs) -> carrier_head(tab, s, targs)
   _ -> "_"
 }
 
 
 # A block binds as it goes: a name bound by an earlier `let` is not
 # free in the statements that follow it.
-type ScanState = Scan([String], [Capture])
+type ScanState = Scan([LocalId], [Carried])
 
 
-fn free_in_stmts(ss: [Stmt], bound: [String], dmut: [String],
-                 acc: [Capture]) : ScanState {
+fn free_in_stmts(ss: [Stmt], bound: [LocalId], dmut: [SymId],
+                 acc: [Carried]) : ScanState {
   match ss {
     []           -> Scan(bound, acc)
     [s, ...rest] -> match stmt_scan(s, bound, dmut, acc) {
@@ -224,13 +221,13 @@ fn free_in_stmts(ss: [Stmt], bound: [String], dmut: [String],
 }
 
 
-fn stmt_scan(s: Stmt, bound: [String], dmut: [String],
-             acc: [Capture]) : ScanState {
+fn stmt_scan(s: Stmt, bound: [LocalId], dmut: [SymId],
+             acc: [Carried]) : ScanState {
   match s {
     SLet(pat, _, rhs) ->
       Scan(cs_pat_binders(pat, bound), free_carriers(rhs, bound, dmut, acc))
-    SVar(n, _, rhs, _, _) ->
-      Scan([n, ...bound], free_carriers(rhs, bound, dmut, acc))
+    SVar(b, _, rhs, _, _) ->
+      Scan([b.id, ...bound], free_carriers(rhs, bound, dmut, acc))
     SExprStmt(e) -> Scan(bound, free_carriers(e, bound, dmut, acc))
     SAssert(e, og) -> {
       let a1 = free_carriers(e, bound, dmut, acc)
@@ -241,8 +238,8 @@ fn stmt_scan(s: Stmt, bound: [String], dmut: [String],
 }
 
 
-fn free_in_arms(arms: [Arm], bound: [String], dmut: [String],
-                acc: [Capture]) : [Capture] {
+fn free_in_arms(arms: [Arm], bound: [LocalId], dmut: [SymId],
+                acc: [Carried]) : [Carried] {
   match arms {
     []           -> acc
     [a, ...rest] -> match a {
@@ -257,15 +254,15 @@ fn free_in_arms(arms: [Arm], bound: [String], dmut: [String],
 }
 
 
-fn free_in_opt(o: Option[Expr], bound: [String], dmut: [String],
-               acc: [Capture]) : [Capture] = match o {
+fn free_in_opt(o: Option[Expr], bound: [LocalId], dmut: [SymId],
+               acc: [Carried]) : [Carried] = match o {
   Some(e) -> free_carriers(e, bound, dmut, acc)
   None    -> acc
 }
 
 
-fn free_in_list(es: [Expr], bound: [String], dmut: [String],
-                acc: [Capture]) : [Capture] {
+fn free_in_list(es: [Expr], bound: [LocalId], dmut: [SymId],
+                acc: [Carried]) : [Carried] {
   match es {
     []           -> acc
     [h, ...rest] ->
@@ -290,7 +287,7 @@ fn capture_kids(e: Expr) : [Expr] {
     EFilterPipe(a, b)    -> [a, b]
     EIntrinsic(_, args_) -> args_
     EList(els)           -> capture_list_elems(els)
-    ERecordLit(_, _, fs)    -> capture_field_inits(fs)
+    ERecordLit(_, fs)    -> capture_field_inits(fs)
     EIf(c, t, eo)        -> [c, t, ...capture_opt(eo)]
     ERange(a, b, os)     -> [a, b, ...capture_opt(os)]
     _ -> []

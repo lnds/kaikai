@@ -1,6 +1,11 @@
 #[doc("Idiom-nudge lints: point_free_nudge and and_then_to_map_nudge. Each fires only when the suggested form is provably equivalent and exists in the language; bias is false-negatives over noisy false-positives.")]
 
 import compiler.ast
+import compiler.written
+import compiler.decl_names
+import compiler.symtab
+import compiler.symtab_build
+import compiler.decl_text
 import compiler.expr_positions
 
 # A single lint hit, addressed by source position. The first field
@@ -10,17 +15,16 @@ pub type LintFinding = LF(String, Int, Int, String)
 #[doc("A lint finding paired with the source file that declares it.")]
 pub type FileFinding = FF(String, LintFinding)
 
-# A point-free section desugars to a lambda over this synthetic param,
-# so a lambda binding it is ALREADY point-free and must never be nudged.
-fn pf_param() : String = point_free_binder()
+#[doc("The id of the constructor `name` the runtime builds (`Some`, `None`, `Ok`, `Err`), which no declaration spells.")]
+pub fn lint_core_ctor(name: String) : SymId = sym_derive(NCCtor, name, core_type_home())
 
-#[doc("Idiom-nudge findings rooted at this node (point-free, and_then→map); children are visited by the caller's walk.")]
-pub fn idiom_findings(e: Expr) : [LintFinding] {
+#[doc("Idiom-nudge findings rooted at this node (point-free, and_then→map); children are visited by the caller's walk. `tab` names the function a call reaches.")]
+pub fn idiom_findings(e: Expr, tab: SymTab) : [LintFinding] {
   match e.kind {
     EMapPipe(_, f)      -> pf_nudge(f)
     EFlatMapPipe(_, f)  -> pf_nudge(f)
     EFilterPipe(_, f)   -> pf_nudge(f)
-    ECall(callee, cargs) -> call_nudges(e, callee, cargs)
+    ECall(callee, cargs) -> call_nudges(e, callee, cargs, tab)
     _                   -> []
   }
 }
@@ -29,12 +33,12 @@ pub fn idiom_findings(e: Expr) : [LintFinding] {
 # point-free candidate, and an `and_then` whose lambda always wraps in
 # `Some` is a `map` in disguise. The function is the call's last
 # argument (`map(o, f)` after inference, `o.map(f)` before it).
-fn call_nudges(e: Expr, callee: Expr, cargs: [Expr]) : [LintFinding] {
+fn call_nudges(e: Expr, callee: Expr, cargs: [Expr], tab: SymTab) : [LintFinding] {
   match fn_arg_of(cargs) {
     None    -> []
     Some(f) -> {
-      let pf = if callee_is_combinator(callee) { pf_nudge(f) } else { [] }
-      let am = if callee_named(callee, "and_then") { at_map_nudge(e, f) } else { [] }
+      let pf = if callee_is_combinator(callee, tab) { pf_nudge(f) } else { [] }
+      let am = if callee_named(callee, tab, "and_then") { at_map_nudge(e, f) } else { [] }
       list_append(pf, am)
     }
   }
@@ -44,8 +48,7 @@ fn call_nudges(e: Expr, callee: Expr, cargs: [Expr]) : [LintFinding] {
 
 # A lambda whose whole body is a field/method chain over its single
 # parameter reads cleaner as a leading-dot section (`.name`,
-# `.length()`, `.addr.city`). The `__pl` guard skips a lambda the parser
-# already synthesised from a point-free section.
+# `.length()`, `.addr.city`).
 fn pf_nudge(f: Expr) : [LintFinding] {
   match f.kind {
     ELambda(ps, body) -> pf_lambda(f, ps, body)
@@ -53,28 +56,19 @@ fn pf_nudge(f: Expr) : [LintFinding] {
   }
 }
 
-# A unary lambda whose param is user-written (not the `__pl` synthetic)
-# and whose body is a point-free chain over that param.
+# A unary lambda whose param is user-written and whose body is a
+# point-free chain over that param. A point-free section desugars to a
+# lambda over the parser's own binder, so a lambda binding it is ALREADY
+# point-free and must never be nudged.
 fn pf_lambda(f: Expr, ps: [Param], body: Expr) : [LintFinding] {
-  let pn = unary_param_name(ps)
-  if pn == "" { [] }
-  else if pn == pf_param() { [] }
-  else if pf_chain(body, pn) {
-    [LF("point_free_nudge", f.line, f.col,
-        "lambda is a field/method access on its argument; a point-free section reads cleaner")]
-  } else { [] }
-}
-
-# The sole parameter's name for a unary lambda, or "" for any other
-# arity. "" cannot collide with a real binder, so it doubles as the
-# "not a unary lambda" sentinel.
-fn unary_param_name(ps: [Param]) : String {
   match ps {
-    []           -> ""
-    [p, ...rest] -> match rest {
-      [] -> p.pname
-      _  -> ""
-    }
+    [p] ->
+      if params_point_free(ps) { [] }
+      else if pf_chain(body, p.binder.id) {
+        [LF("point_free_nudge", f.line, f.col,
+            "lambda is a field/method access on its argument; a point-free section reads cleaner")]
+      } else { [] }
+    _ -> []
   }
 }
 
@@ -88,7 +82,7 @@ fn is_unary(ps: [Param]) : Bool {
 # A point-free chain is a postfix chain rooted exactly at the parameter,
 # with at least one field or method link, and no link's arguments
 # mentioning the parameter (the section supplies the receiver only).
-fn pf_chain(body: Expr, pn: String) : Bool {
+fn pf_chain(body: Expr, pn: LocalId) : Bool {
   match body.kind {
     EField(base, _)  -> pf_receiver(base, pn)
     ECall(c, cargs)  -> pf_method(c, cargs, pn)
@@ -97,16 +91,14 @@ fn pf_chain(body: Expr, pn: String) : Bool {
 }
 
 # A method link `recv.m(margs)`. UFCS rewrites `recv.m(a)` to a call on
-# the picked declaration (`ESym`, or `EModCall(mod, m)` where several
-# modules declare `m`) with the receiver as the first argument, so the
-# chain continues through the head of the call's arguments and the
+# the picked declaration (`ESym`) with the receiver as the first argument,
+# so the chain continues through the head of the call's arguments and the
 # remaining (written) arguments must not depend on the parameter. The
 # pre-rewrite `EField(recv, m)` form is handled too so the lint does not
 # hinge on how far the typer has rewritten the body.
-fn pf_method(c: Expr, cargs: [Expr], pn: String) : Bool {
+fn pf_method(c: Expr, cargs: [Expr], pn: LocalId) : Bool {
   match c.kind {
-    EModCall(_, _)  -> pf_modcall_method(cargs, pn)
-    ESym(_, _, _)   -> pf_written_as_method(c, cargs) and pf_modcall_method(cargs, pn)
+    ESym(_, _)      -> pf_written_as_method(c, cargs) and pf_modcall_method(cargs, pn)
     EField(base, _) -> pf_receiver(base, pn) and not any_mentions(cargs, pn)
     _               -> false
   }
@@ -122,7 +114,7 @@ fn pf_written_as_method(c: Expr, cargs: [Expr]) : Bool {
   }
 }
 
-fn pf_modcall_method(cargs: [Expr], pn: String) : Bool {
+fn pf_modcall_method(cargs: [Expr], pn: LocalId) : Bool {
   match cargs {
     []           -> false
     [recv, ...margs] -> pf_receiver(recv, pn) and not any_mentions(margs, pn)
@@ -131,11 +123,10 @@ fn pf_modcall_method(cargs: [Expr], pn: String) : Bool {
 
 # The receiver is either the bare parameter (chain root) or a further
 # field/method link over it.
-fn pf_receiver(base: Expr, pn: String) : Bool {
+fn pf_receiver(base: Expr, pn: LocalId) : Bool {
   match base.kind {
-    EName(n) -> n == pn
-    ESym(_, _, n) -> n == pn
-    _       -> pf_chain(base, pn)
+    ELocal(l) -> local_eq(l, pn)
+    _         -> pf_chain(base, pn)
   }
 }
 
@@ -170,9 +161,8 @@ fn always_some(body: Expr) : Bool {
 
 fn is_some_ctor(c: Expr, cargs: [Expr]) : Bool {
   match c.kind {
-    EName(n) -> n == "Some" and arity_one(cargs)
-    ESym(_, _, n) -> n == "Some" and arity_one(cargs)
-    _       -> false
+    ESym(s, _) -> sym_same(s, lint_core_ctor("Some")) and arity_one(cargs)
+    _          -> false
   }
 }
 
@@ -198,21 +188,20 @@ fn arm_body(a: Arm) : Expr {
 
 # ---- callee recognition ----------------------------------------------
 #
-# After inference a combinator call reads as `EModCall(mod, name)`; the
-# pre-rewrite forms `EName(name)` and `EField(_, name)` are matched too so
+# A combinator is any function DECLARED under the name, in any module, a
+# user's own included: after inference the call reads as a reference to
+# that declaration. The pre-rewrite `EField(_, name)` is matched too so
 # the lint is independent of how far the typer has rewritten the call.
 
-fn callee_is_combinator(callee: Expr) : Bool {
-  callee_named(callee, "map") or callee_named(callee, "filter") or callee_named(callee, "and_then") or callee_named(callee, "flat_map")
+fn callee_is_combinator(callee: Expr, tab: SymTab) : Bool {
+  callee_named(callee, tab, "map") or callee_named(callee, tab, "filter") or callee_named(callee, tab, "and_then") or callee_named(callee, tab, "flat_map")
 }
 
-fn callee_named(callee: Expr, name: String) : Bool {
+fn callee_named(callee: Expr, tab: SymTab, name: String) : Bool {
   match callee.kind {
-    EModCall(_, n) -> n == name
-    EField(_, n)   -> n == name
-    EName(n)        -> n == name
-    ESym(_, _, n)     -> n == name
-    _              -> false
+    EField(_, n) -> n == name
+    ESym(s, _)   -> written_text(decl_name(tab, s)) == name
+    _            -> false
   }
 }
 
@@ -231,7 +220,7 @@ fn fn_arg_of(cargs: [Expr]) : Option[Expr] {
   }
 }
 
-fn any_mentions(xs: [Expr], pn: String) : Bool {
+fn any_mentions(xs: [Expr], pn: LocalId) : Bool {
   match xs {
     []           -> false
     [x, ...rest] -> if mentions(x, pn) { true } else { any_mentions(rest, pn) }
@@ -242,14 +231,24 @@ fn any_mentions(xs: [Expr], pn: String) : Bool {
 # but the only callers pass method-argument expressions, where a shadow
 # binding of the chain's own parameter would be a different variable; a
 # conservative structural scan is enough to keep the nudge sound.
-fn mentions(e: Expr, pn: String) : Bool {
+fn mentions(e: Expr, pn: LocalId) : Bool {
   match e.kind {
-    EName(n) -> n == pn
-    _       -> any_position_mentions(xp_positions(e), pn)
+    ELocal(l) -> local_eq(l, pn)
+    EOp(r)    -> op_reads(r.via, pn)
+    _         -> any_position_mentions(xp_positions(e), pn)
   }
 }
 
-fn any_position_mentions(xs: [XPos], pn: String) : Bool {
+# An operation performed through a local reads it.
+fn op_reads(via: OpVia, pn: LocalId) : Bool {
+  match via {
+    ViaAmbient  -> false
+    ViaAlias(a) -> local_eq(a, pn)
+    ViaRecv(x)  -> local_eq(x, pn)
+  }
+}
+
+fn any_position_mentions(xs: [XPos], pn: LocalId) : Bool {
   match xs {
     []                  -> false
     [XP(_, x), ...rest] -> if mentions(x, pn) { true } else { any_position_mentions(rest, pn) }
