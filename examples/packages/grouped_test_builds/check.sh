@@ -6,8 +6,9 @@
 # failure that only the shared build hits fails the run before any test runs.
 # Also: a block's unused binding is reported in the file that declares it,
 # a module that does not parse fails the build even when nothing uses it, and
-# a block reaches its own file's functions whatever else the build holds, and
-# a type named like a core effect is one type across the build.
+# a block reaches its own file's functions whatever else the build holds,
+# a type named like a core effect is one type across the build, and a test
+# file may declare its own `main`.
 
 set -eu
 
@@ -115,5 +116,18 @@ run homonym
 [ "$(cat "$TMP/rc")" -eq 0 ] || { cat "$TMP/err"; fail "a package type named like a core effect was two types"; }
 grep -q "ok   field" "$TMP/err" || fail "the record field test did not run"
 grep -q "ok   annotation" "$TMP/err" || fail "the annotation test did not run"
+
+# 9 — a test file's own `main` is the entry point of that file built alone;
+# the shared build's entry point is its runner, so the file's blocks run
+# there whatever its `main` performs.
+mk_pkg entry
+printf 'fn main() {\n  print("a alone")\n}\n\ntest "a" {\n  assert 1 + 1 == 2\n}\n' > "$TMP/entry/tests/a_test.kai"
+printf 'pub fn main() : Int = 0\n\ntest "b" {\n  assert 2 + 2 == 4\n}\n' > "$TMP/entry/tests/b_test.kai"
+printf 'fn main() {\n  print("c alone")\n}\n\ntest "c" {\n  assert 3 + 3 == 6\n}\n' > "$TMP/entry/tests/c_test.kai"
+run entry
+[ "$(cat "$TMP/rc")" -eq 0 ] || { cat "$TMP/err"; fail "test files that declare their own main did not build together"; }
+for t in a b c; do
+  grep -q "ok   $t" "$TMP/err" || fail "test $t did not run beside a file's own main"
+done
 
 echo "grouped_test_builds: OK"
