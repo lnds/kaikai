@@ -24,6 +24,7 @@ import compiler.region
 import compiler.kir
 import compiler.kir_lower
 import compiler.unwind_pend
+import compiler.arm_release
 import compiler.kir_reuse_held
 import compiler.unwind_binders
 import compiler.unwind_sites
@@ -2050,6 +2051,14 @@ fn match_selftail_scr_drop(owned: Bool, sd: String, body: Expr, st: LowerSt) : L
     if unw_mreg(st1.unw, sd) == "" { st1 } else { ls_emit(st1, KStore(sd, KUnitV, kpos_of(body))) }
   } else { st }
 
+# An arm that never needs the scrutinee's cell releases it once its binders
+# hold their own references, so a write through a binder sees it unique.
+# The exit drop still runs on this path: it finds unit.
+fn match_arm_scr_drop(owned: Bool, sd: String, p: Pattern, body: Expr, st: LowerSt) : LowerSt =
+  if owned and arm_frees_scrutinee(p, body) {
+    ls_emit(ls_emit(st, KRC(KDrop(KVar(sd)), kpos_of(body))), KStore(sd, KUnitV, kpos_of(body)))
+  } else { match_selftail_scr_drop(owned, sd, body, st) }
+
 # True iff EVERY tail leaf of `body` is a pure self-tail-call sentinel
 # (`__kai_tcrec|`, the C oracle's `tcrec_tail_always_sentinel`). A
 # `__kai_trmc|` step is NOT a leaf here, so a cons-modulo arm never
@@ -2089,7 +2098,7 @@ fn tcp_seed_after_arm_rc(owned: Bool, sd: String, p: Pattern, body: Expr,
   } else if arm_reuses(body, st) {
     tcp_seed_inherit(body, pend0, st)
   } else {
-    tcp_seed_arm(owned, sd, pat_alias_binders(p, st.vs), body, pend0, st)
+    tcp_seed_arm(owned and not arm_frees_scrutinee(p, body), sd, pat_alias_binders(p, st.vs), body, pend0, st)
   }
 
 # Refine the ledger across an already-evaluated expression / statement
@@ -2435,7 +2444,7 @@ fn lower_default_arm(arms: [Arm], scrv: KVal, join: String, lcont: String,
       # oracle's structural pointer-slot incref so the owned exit drop balances.
       let st_rc = lower_arm_rc(p, body, sd, owned, st_def)
       let st_drop = tcp_seed_after_arm_rc(owned, sd, p, body, pend0, st_rc)
-      ls_set_arm_tok(lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop)), st_def.arm_tok)
+      ls_set_arm_tok(lower_branch_into(body, join, lcont, match_arm_scr_drop(owned, sd, p, body, st_drop)), st_def.arm_tok)
     }
     None -> seal_match_miss(reopen(st, ldef), lcont)
   }
@@ -2659,7 +2668,7 @@ fn lower_one_group(group: [Arm], scrv: KVal, join: String, lcont: String,
       let st_bound = bind_pattern_fields(p, scrv, body, st_arm)
       let st_rc = lower_arm_rc(p, body, sd, owned, st_bound)
       let st_drop = tcp_seed_after_arm_rc(owned, sd, p, body, pend0, st_rc)
-      ls_set_arm_tok(lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_drop)), st_bound.arm_tok)
+      ls_set_arm_tok(lower_branch_into(body, join, lcont, match_arm_scr_drop(owned, sd, p, body, st_drop)), st_bound.arm_tok)
     } else { lower_group_chain([Arm(p, g, body)], scrv, join, lcont, lbl, ldef, owned, sd, mscr0, pend0, reopen(st, lbl)) }
   _ -> lower_group_chain(group, scrv, join, lcont, lbl, ldef, owned, sd, mscr0, pend0, reopen(st, lbl))
 }
@@ -2680,13 +2689,13 @@ fn lower_group_chain(group: [Arm], scrv: KVal, join: String, lcont: String,
       let st3 = bind_pattern_fields(p, scrv, body, reopen(st2, body_lbl))
       let st3d = lower_arm_rc(p, body, sd, owned, st3)
       let st3dd = tcp_seed_after_arm_rc(owned, sd, p, body, pend0, st3d)
-      ls_set_arm_tok(lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st3dd)), st3.arm_tok)
+      ls_set_arm_tok(lower_branch_into(body, join, lcont, match_arm_scr_drop(owned, sd, p, body, st3dd)), st3.arm_tok)
     } else {
       match ls_fresh_label(st1) { LSLabel(next_fail, st2) -> {
         let st4 = emit_arm_subtests_and_binds(p, scrv, body, body_lbl, next_fail, st2)
         let st4d = lower_arm_rc(p, body, sd, owned, st4)
         let st4dd = tcp_seed_after_arm_rc(owned, sd, p, body, pend0, st4d)
-        let st5 = ls_set_arm_tok(lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st4dd)), st4.arm_tok)
+        let st5 = ls_set_arm_tok(lower_branch_into(body, join, lcont, match_arm_scr_drop(owned, sd, p, body, st4dd)), st4.arm_tok)
         lower_group_chain(rest, scrv, join, lcont, next_fail, ldef, owned, sd, mscr0, pend0, st5)
       } }
     } }
@@ -2752,7 +2761,7 @@ fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
         let st_rc = lower_arm_rc(p, body, sd, owned, st_alias)
         let st_bound = tcp_seed_after_arm_rc(owned, sd, p, body, pend0, st_rc)
         let st_done = ls_set_arm_tok(match opt_guard {
-          None -> lower_branch_into(body, join, lcont, match_selftail_scr_drop(owned, sd, body, st_bound))
+          None -> lower_branch_into(body, join, lcont, match_arm_scr_drop(owned, sd, p, body, st_bound))
           Some(g) -> match ls_fresh_label(st_bound) { LSLabel(run_lbl, stg) ->
             match lower_expr(g, stg) { LRes(gv, stg1) -> {
               # Guard truthy → run the body; falsy → `next_fail` (next arm).
@@ -2761,7 +2770,7 @@ fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
               # The guard's reads refine the ledger before the body lowers.
               let st_fork = ls_seal(stg1, KCondBr(gv, run_lbl, next_fail, kpos_of(g)), run_lbl)
               lower_branch_into(body, join, lcont,
-                                match_selftail_scr_drop(owned, sd, body, tcp_after(reopen(st_fork, run_lbl), g)))
+                                match_arm_scr_drop(owned, sd, p, body, tcp_after(reopen(st_fork, run_lbl), g)))
             } } }
         }, st_alias.arm_tok)
         # The next arm continues at `next_fail`. If this arm always matched

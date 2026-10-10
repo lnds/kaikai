@@ -8697,6 +8697,17 @@ static KaiValue *kai_core_array_get_borrow(KaiValue *a, KaiValue *i) {
     return kai_array_get_impl(a, idx);
 }
 
+/* The element leaves with the slot's own reference and the slot holds
+ * unit until the write the compiler pairs this read with. */
+static KaiValue *kai_core_array_take(KaiValue *a, KaiValue *i) {
+    int64_t idx = kai_intf(i);
+    KaiValue *r = a->as.arr.items[idx];
+    a->as.arr.items[idx] = kai_unit();
+    kai_decref(a);
+    kai_decref(i);
+    return r;
+}
+
 static KaiValue *kai_core_array_set(KaiValue *a, KaiValue *i, KaiValue *v) {
     int64_t idx = (kai_is_int(i)) ? kai_intf(i) : 0;
     if (kai_is_ptr(a) && a->tag == KAI_ARRAY) kai_index_check_owned(a->as.arr.len, idx, a, v);
@@ -11027,6 +11038,7 @@ static KaiValue *_kai_core_array_make_thunk(KaiValue *s, KaiValue **a, int n)   
 static KaiValue *_kai_core_array_empty_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) a; (void) n; return kai_core_array_empty(); }
 static KaiValue *_kai_core_array_length_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_array_length(a[0]); }
 static KaiValue *_kai_core_array_get_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_array_get(a[0], a[1]); }
+static KaiValue *_kai_core_array_take_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_array_take(a[0], a[1]); }
 static KaiValue *_kai_core_array_set_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_array_set(a[0], a[1], a[2]); }
 static KaiValue *_kai_core_array_grow_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_array_grow(a[0], a[1], a[2]); }
 static KaiValue *_kai_core_ref_make_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_ref_make(a[0]); }

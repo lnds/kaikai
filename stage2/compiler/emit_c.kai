@@ -82,6 +82,7 @@ import compiler.core_prims
 import compiler.native_prims
 import compiler.unbox
 import compiler.perceus
+import compiler.arm_release
 import compiler.borrow_map
 import compiler.perceus_payer
 import compiler.perceus_arg_reads
@@ -3632,9 +3633,9 @@ fn pat_is_destructuring(p: Pattern) : Bool {
   }
 }
 
-fn emit_match_arms(src: String, arms: [Arm], scr_alias: Option[String], scr_ty: Option[Ty], cx: EmitCtx) : String / Console =
+fn emit_match_arms(src: String, arms: [Arm], owned: Bool, scr_alias: Option[String], scr_ty: Option[Ty], cx: EmitCtx) : String / Console =
 
-  concat_all(map(arms, (a) => emit_match_arm(src, a, scr_alias, scr_ty, cx)))
+  concat_all(map(arms, (a) => emit_match_arm(src, a, owned, scr_alias, scr_ty, cx)))
 
 # A catch-all body over a raw-scalar scrutinee may read the binder in
 # either form: perceus-dup'd reads resolve boxed (`kaiv_`), bare
@@ -4757,7 +4758,11 @@ fn arm_top_reuse_here(pat: Pattern, body: Expr, cx: EmitCtx) : Option[ArmTopReus
 
 fn arm_top_token_held(cx: EmitCtx) : Bool = match cx.reuse_donor { Some(_) -> true  None -> false }
 
-fn emit_match_arm(src: String, a: Arm, scr_alias: Option[String], scr_ty: Option[Ty], cx: EmitCtx) : String / Console {
+# The start of an arm's result assignment. An arm that releases its scrutinee
+# first leaves the slot empty for the exit decref of the match.
+fn arm_result_open(early: Bool) : String = if early { "kai_decref(_scr); _scr = NULL; _r = " } else { "_r = " }
+
+fn emit_match_arm(src: String, a: Arm, owned: Bool, scr_alias: Option[String], scr_ty: Option[Ty], cx: EmitCtx) : String / Console {
 
   match a {
     Arm(pat, opt_guard, body) -> {
@@ -4806,7 +4811,10 @@ fn emit_match_arm(src: String, a: Arm, scr_alias: Option[String], scr_ty: Option
             # `kai_decref(_scr)` releases and this arm's bind-increfs.
             # The ledger carries them down to the goto site, which
             # emits the skipped releases just before the jump.
-            let body_c = emit_expr(src, body, tcp_arm_body_cx(emit_unw_owning(pat, arm_cx), scr_alias, pat, body, cx))
+            # Once released the scrutinee leaves the ledger: no goto owes it.
+            let early = owned and arm_frees_scrutinee(pat, body)
+            let body_c = emit_expr(src, body, tcp_arm_body_cx(emit_unw_owning(pat, arm_cx),
+                                                               if early { None } else { scr_alias }, pat, body, cx))
             # A reuse-variant rebuild that keeps a child in its own slot
             # (`MErr(e, ys) -> MVal(e + 1, ys)`) leaves the donor's claim
             # on that child unpaid when the reuse fires: the binder was
@@ -4817,7 +4825,7 @@ fn emit_match_arm(src: String, a: Arm, scr_alias: Option[String], scr_ty: Option
             # match-exit cascade pays the donor's claims there).
             let pay = reuse_kept_pay(pat, body, cx)
             if pay == "" {
-              concat_all(["    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"])
+              concat_all(["    if (", pt, ") { ", binds, arm_result_open(early), body_c, "; break; }\n"])
             } else {
               concat_all(["    if (", pt, ") { ", binds,
                           "int _rq = kai_check_unique(_scr); _r = ", body_c,
@@ -4830,12 +4838,14 @@ fn emit_match_arm(src: String, a: Arm, scr_alias: Option[String], scr_ty: Option
         Some(g) -> {
           let binds = cat2(emit_pat_binds(src, pat, "_scr", true, cx),
                            pbind_raw_alias(pat, "_scr", scr_ty))
-          let bcx = emit_ctx_tcpend_after(tcp_arm_body_cx(emit_unw_owning(pat, arm_cx), scr_alias, pat, body, cx), g)
+          let early = owned and arm_frees_scrutinee(pat, body)
+          let bcx = emit_ctx_tcpend_after(tcp_arm_body_cx(emit_unw_owning(pat, arm_cx),
+                                                          if early { None } else { scr_alias }, pat, body, cx), g)
           let body_c = emit_expr(src, body, bcx)
           let gc = emit_expr(src, g, arm_cx)
           concat_all([
             "    if (", pt, ") { ", binds,
-            "if (kai_op_truthy(", gc, ")) { _r = ", body_c, "; break; } }\n"
+            "if (kai_op_truthy(", gc, ")) { ", arm_result_open(early), body_c, "; break; } }\n"
           ])
         }
       }
@@ -5153,7 +5163,7 @@ fn emit_match_default(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : Stri
       concat_all([
         "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
         emit_hoist_decls(hs, arms, cx1),
-        emit_match_arms(src, arms, None, inner.ty, arm_cx),
+        emit_match_arms(src, arms, false, None, inner.ty, arm_cx),
         match_tail_panic(arms),
         "} while (0); _r; })"   # NO kai_decref(_scr) — borrowed
       ])
@@ -5364,7 +5374,7 @@ fn emit_match_default_owned(src: String, scrut: Expr, arms: [Arm], want: Bool, c
     "({ KaiValue *_scr = ", sc, "; ", us.push, tcp_scr_alias_decl(scr_alias),
     "KaiValue *_r = kai_unit(); do {\n",
     emit_hoist_decls(hs, arms, cx1),
-    emit_match_arms(src, arms, scr_alias, scrut.ty, us.cx),
+    emit_match_arms(src, arms, true, scr_alias, scrut.ty, us.cx),
     match_tail_panic(arms),
     "} while (0); ", us.pop, "kai_decref(_scr); _r; })"
   ])
@@ -13703,7 +13713,7 @@ fn tcrec_is_dup_callee(f: Expr) : Bool = match f.kind {
 # which lends slot 0.
 fn tcrec_borrowed_slots(bm: BorrowMap, f: Expr) : [Int] = {
   let key = pcs_callee_key(f)
-  if any(core_borrowing_prims(), (p) => cat2(p, "_borrow") == key) { [0] } else { pcs_borrow_lookup(bm, key) }
+  if core_is_borrow_sibling(key) { [0] } else { pcs_borrow_lookup(bm, key) }
 }
 
 # A bare read in a borrowed slot lends, so it hands nothing on.
