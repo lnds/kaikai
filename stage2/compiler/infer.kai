@@ -15186,37 +15186,37 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
 # / PAs name, and report duplicates before typing the pattern.
 # Wildcards never collide; `_` is not a binding. Pattern holes
 # (`?` / `?name`) bind no value either and so are skipped here.
-fn pattern_collect_binds(pat: Pattern, acc: [String]) : [String] {
+fn pattern_collect_binds(pat: Pattern, acc: [Binder]) : [Binder] {
   match pat.pkind {
     PWild      -> acc
     PHole(_)   -> acc
     PLit(_)    -> acc
     PRange(_, _) -> acc
-    PBind(nm)  -> [nm, ...acc]
-    PNarrow(nm, _) -> [nm, ...acc]
-    PAs(nm, sub) -> pattern_collect_binds(sub, [nm, ...acc])
+    PBind(b)   -> [b, ...acc]
+    PNarrow(b, _) -> [b, ...acc]
+    PAs(b, sub) -> pattern_collect_binds(sub, [b, ...acc])
     PList(subs, rest_opt) -> {
       let acc1 = pattern_collect_binds_list(subs, acc)
       match rest_opt {
-        None      -> acc1
-        Some(rnm) -> [rnm, ...acc1]
+        None     -> acc1
+        Some(rb) -> [rb, ...acc1]
       }
     }
-    PVariant(_, _, subs) -> pattern_collect_binds_list(subs, acc)
-    PVariantRecord(_, _, pfs) -> pattern_collect_binds_pfields(pfs, acc)
+    PVariant(_, subs) -> pattern_collect_binds_list(subs, acc)
+    PVariantRecord(_, pfs) -> pattern_collect_binds_pfields(pfs, acc)
     PRecord(pfs) -> pattern_collect_binds_pfields(pfs, acc)
     PSurface(ps) -> pattern_collect_binds_list(patsurface_children(ps), acc)
   }
 }
 
-fn pattern_collect_binds_list(ps: [Pattern], acc: [String]) : [String] {
+fn pattern_collect_binds_list(ps: [Pattern], acc: [Binder]) : [Binder] {
   match ps {
     [] -> acc
     [p, ...rest] -> pattern_collect_binds_list(rest, pattern_collect_binds(p, acc))
   }
 }
 
-fn pattern_collect_binds_pfields(pfs: [PField], acc: [String]) : [String] {
+fn pattern_collect_binds_pfields(pfs: [PField], acc: [Binder]) : [Binder] {
   match pfs {
     [] -> acc
     [pf, ...rest] -> match pf {
@@ -15225,13 +15225,15 @@ fn pattern_collect_binds_pfields(pfs: [PField], acc: [String]) : [String] {
   }
 }
 
-fn pattern_first_duplicate(names: [String], seen: [String]) : Option[String] {
-  match names {
+# The resolver numbers every binder apart, so a repeat is a name the
+# pattern spells twice.
+fn pattern_first_duplicate(bs: [Binder], seen: [String]) : Option[Binder] {
+  match bs {
     [] -> None
-    [n, ...rest] -> if list_has(seen, n) {
-      Some(n)
+    [b, ...rest] -> if list_has(seen, written_text(b.name)) {
+      Some(b)
     } else {
-      pattern_first_duplicate(rest, [n, ...seen])
+      pattern_first_duplicate(rest, [written_text(b.name), ...seen])
     }
   }
 }
@@ -15240,58 +15242,74 @@ fn check_pattern_no_dup_binds(st: InferState, pat: Pattern) : InferState / Conso
   let binds = pattern_collect_binds(pat, [])
   match pattern_first_duplicate(binds, []) {
     None -> st
-    Some(nm) -> {
-      let perr = mk_diag(SevError, st.file, pat.line, pat.col, "duplicate binding in pattern: `#{nm}`", [])
+    Some(b) -> {
+      let perr = mk_diag(SevError, st.file, pat.line, pat.col, "duplicate binding in pattern: `#{b.name}`", [])
       render_diag(perr)
-      diag_note("binding `#{nm}` already used elsewhere in this pattern")
+      diag_note("binding `#{b.name}` already used elsewhere in this pattern")
       diag_help("use a different name, or extract the equality with a guard: `MkPair(x, y) if x == y -> ...`")
       st_bump_err(st_push_diag(st, perr))
     }
   }
 }
 
-fn check_pattern(st: InferState, pat: Pattern, expected: Ty) : InferState / Console + File + Mutable {
+# A pattern as the typer leaves it: its binders bound in `st`, and each
+# constructor it names settled to that constructor's id.
+type PatChecked = { st: InferState, pat: Pattern }
+
+type PatsChecked = { st: InferState, pats: [Pattern] }
+
+type PFieldsChecked = { st: InferState, fields: [PField] }
+
+fn check_pattern(st: InferState, pat: Pattern, expected: Ty) : InferState / Console + File + Mutable =
+  check_pattern_stamped(st, pat, expected).st
+
+fn check_pattern_stamped(st: InferState, pat: Pattern, expected: Ty) : PatChecked / Console + File + Mutable {
 
 
   match pat.pkind {
-    PWild      -> st
-    PBind(nm)  -> {
-      let env2 = ty_env_add(st.env, nm, mono(apply_ty(st.sub, expected)))
-      st_set_env(st, env2)
+    PWild      -> PatChecked { st: st, pat: pat }
+    PBind(b)   -> {
+      let env2 = env_bind_local(st.env, b, mono(apply_ty(st.sub, expected)))
+      PatChecked { st: st_set_env(st, env2), pat: pat }
     }
     PLit(lit)  -> {
       let r = synth(st, lit)
-      st_unify(r.st, expected, r.ty, "literal pattern", pat.line, pat.col)
+      PatChecked { st: st_unify(r.st, expected, r.ty, "literal pattern", pat.line, pat.col), pat: pat }
     }
     # `PRange` is desugared to a binder + comparison guard before the
     # typer runs, so it never reaches here.
-    PRange(_, _) -> st
+    PRange(_, _) -> PatChecked { st: st, pat: pat }
     PList(subpats, rest_opt) -> {
       let rv = st_fresh_ty(st)
       let s1 = st_unify(rv.st, expected, TyListT(rv.ty), "list pattern", pat.line, pat.col)
-      let s2 = check_list_subpats(s1, subpats, rv.ty)
-      match rest_opt {
+      let subs = check_list_subpats(s1, subpats, rv.ty)
+      let s2 = subs.st
+      let s3 = match rest_opt {
         None -> s2
-        Some(rnm) -> {
-          let env2 = ty_env_add(s2.env, rnm, mono(TyListT(apply_ty(s2.sub, rv.ty))))
+        Some(rb) -> {
+          let env2 = env_bind_local(s2.env, rb, mono(TyListT(apply_ty(s2.sub, rv.ty))))
           st_set_env(s2, env2)
         }
       }
+      PatChecked { st: s3, pat: mk_pat(PList(subs.pats, rest_opt), pat.line, pat.col) }
     }
-    PVariant(_, cname, sub_pats) ->
-      check_variant_pattern(st, cname, sub_pats, expected, pat.line, pat.col)
-    PVariantRecord(home, cname, pfs) ->
-      check_variant_record_pattern(st, home, cname, pfs, expected, pat.line, pat.col)
-    PRecord(pfs) ->
-      check_record_pattern(st, pfs, expected, pat.line, pat.col)
-    PHole(nm_opt) -> check_hole_pattern(st, nm_opt, expected, pat.line, pat.col)
+    PVariant(r, sub_pats) ->
+      check_variant_pattern(st, r, sub_pats, expected, pat.line, pat.col)
+    PVariantRecord(r, pfs) ->
+      check_variant_record_pattern(st, r, pfs, expected, pat.line, pat.col)
+    PRecord(pfs) -> {
+      let fs = check_record_pattern(st, pfs, expected, pat.line, pat.col)
+      PatChecked { st: fs.st, pat: mk_pat(PRecord(fs.fields), pat.line, pat.col) }
+    }
+    PHole(nm_opt) -> PatChecked { st: check_hole_pattern(st, nm_opt, expected, pat.line, pat.col), pat: pat }
     # bind the as-name to the scrutinee at the *expected*
     # type, then continue typing the inner pattern at the same type.
     # The inner pattern owns its own bindings; the as-binding adds
     # one more name that aliases the whole scrutinee.
-    PAs(nm, sub) -> {
-      let env2 = ty_env_add(st.env, nm, mono(apply_ty(st.sub, expected)))
-      check_pattern(st_set_env(st, env2), sub, expected)
+    PAs(b, sub) -> {
+      let env2 = env_bind_local(st.env, b, mono(apply_ty(st.sub, expected)))
+      let inner = check_pattern_stamped(st_set_env(st, env2), sub, expected)
+      PatChecked { st: inner.st, pat: mk_pat(PAs(b, inner.pat), pat.line, pat.col) }
     }
     # type-narrowing pattern. The scrutinee must
     # be a `TyUnion` containing the narrow type as a component; bind
@@ -15301,7 +15319,7 @@ fn check_pattern(st: InferState, pat: Pattern, expected: Ty) : InferState / Cons
     # `check_exhaustive`). Codegen never sees `PNarrow` — it is
     # rewritten to a sequence of `PAs(name, PVariant(Vi, []))` arms
     # in `expand_narrow_arms` after typing.
-    PNarrow(name, ty_expr) -> check_narrow_pattern(st, name, ty_expr, expected, pat.line, pat.col)
+    PNarrow(b, ty_expr) -> PatChecked { st: check_narrow_pattern(st, b, ty_expr, expected, pat.line, pat.col), pat: pat }
     PSurface(_) -> panic("check_pattern: surface pattern not lowered")
   }
 }
@@ -15310,12 +15328,11 @@ fn check_pattern(st: InferState, pat: Pattern, expected: Ty) : InferState / Cons
 # Two scrutinee shapes are accepted:
 #   - `TyUnion(parts)` (first-class union form, not currently produced
 #     anywhere in stage 2 but kept symmetric for forward compat).
-#   - `TyCon(_, u, [])` whose env-recorded variants include the narrow
-#     type's tycon name as a "component" (the dual-representation
-#     path: `type T = A | B` registers `A` and `B` as zero-arg
-#     variants of `T`, their names validated against pre-declared
-#     types by `validate_union_collisions`).
-fn check_narrow_pattern(st: InferState, name: String, ty_expr: TypeExpr,
+#   - a `TyCon` whose union row lists the narrow type as a component
+#     (the dual-representation path: `type T = A | B` registers `A`
+#     and `B` as zero-arg variants of `T`, their names validated
+#     against pre-declared types by `validate_union_collisions`).
+fn check_narrow_pattern(st: InferState, name: Binder, ty_expr: TypeExpr,
                          expected: Ty, line: Int, col: Int) : InferState / Console + File {
 
 
@@ -15323,31 +15340,31 @@ fn check_narrow_pattern(st: InferState, name: String, ty_expr: TypeExpr,
   let scrut_now = apply_ty(st.sub, expected)
   match scrut_now {
     TyUnion(parts) -> if ty_list_contains(parts, narrow_ty) {
-      let env2 = ty_env_add(st.env, name, mono(narrow_ty))
+      let env2 = env_bind_local(st.env, name, mono(narrow_ty))
       st_set_env(st, env2)
     } else {
       diag_error(st.file, line, col,
-        "type-narrowing pattern targets `#{inf_ty_to_string(narrow_ty)}`, which is not a component of `#{inf_ty_to_string(scrut_now)}`")
+        "type-narrowing pattern targets `#{inf_ty_to_string(st.env.tab, narrow_ty)}`, which is not a component of `#{inf_ty_to_string(st.env.tab, scrut_now)}`")
       diag_help("the narrow type must appear as one of the union's components, declared via `type T = A | B`")
-      let env2 = ty_env_add(st.env, name, mono(narrow_ty))
+      let env2 = env_bind_local(st.env, name, mono(narrow_ty))
       st_bump_err(st_set_env(st, env2))
     }
-    TyCon(_, _, _, u_sym) -> {
+    TyCon(u_sym, _) -> {
       if ut_lists(st.env.unions, u_sym, ut_ty_sym(narrow_ty)) {
-        let env2 = ty_env_add(st.env, name, mono(narrow_ty))
+        let env2 = env_bind_local(st.env, name, mono(narrow_ty))
         st_set_env(st, env2)
       } else {
         diag_error(st.file, line, col,
-          "type-narrowing pattern targets `#{inf_ty_to_string(narrow_ty)}`, which is not a component of `#{inf_ty_to_string(scrut_now)}`")
+          "type-narrowing pattern targets `#{inf_ty_to_string(st.env.tab, narrow_ty)}`, which is not a component of `#{inf_ty_to_string(st.env.tab, scrut_now)}`")
         diag_help("the narrow type must appear as one of the union's components, declared via `type T = A | B`")
-        let env2 = ty_env_add(st.env, name, mono(narrow_ty))
+        let env2 = env_bind_local(st.env, name, mono(narrow_ty))
         st_bump_err(st_set_env(st, env2))
       }
     }
     _ -> {
       diag_error(st.file, line, col,
-        "type-narrowing pattern `#{name} : #{inf_ty_to_string(narrow_ty)}` requires a union scrutinee, found `#{inf_ty_to_string(scrut_now)}`")
-      let env2 = ty_env_add(st.env, name, mono(narrow_ty))
+        "type-narrowing pattern `#{name.name} : #{inf_ty_to_string(st.env.tab, narrow_ty)}` requires a union scrutinee, found `#{inf_ty_to_string(st.env.tab, scrut_now)}`")
+      let env2 = env_bind_local(st.env, name, mono(narrow_ty))
       st_bump_err(st_set_env(st, env2))
     }
   }
@@ -15388,53 +15405,77 @@ fn register_fresh_pattern_hole(st: InferState, nm_opt: Option[String], expected:
   st_unify(st2, TyVarT(fresh_id), expected, "pattern hole", line, col)
 }
 
-fn check_list_subpats(st: InferState, ps: [Pattern], elem: Ty) : InferState / Console + File + Mutable {
+fn check_list_subpats(st: InferState, ps: [Pattern], elem: Ty) : PatsChecked / Console + File + Mutable {
 
 
   match ps {
-    [] -> st
-    [p, ...rest] -> check_list_subpats(check_pattern(st, p, elem), rest, elem)
+    [] -> PatsChecked { st: st, pats: [] }
+    [p, ...rest] -> {
+      let h = check_pattern_stamped(st, p, elem)
+      let t = check_list_subpats(h.st, rest, elem)
+      PatsChecked { st: t.st, pats: [h.pat, ...t.pats] }
+    }
   }
 }
 
-fn check_variant_pattern(st: InferState, cname: String, subpats: [Pattern], expected: Ty, line: Int, col: Int) : InferState / Console + File + Mutable {
-
-
-  # The scrutinee's type decides the constructor: this is how a user
-  # variant `Response.Ok` shadows the core `Result.Ok` in patterns
-  # matching a `Response`. A scrutinee whose type declares no such
-  # constructor leaves the bare name to answer.
-  let sc_opt = match ctor_pick(st, expected, cname) {
-    Some(CtorPick(_, entry)) -> Some(entry.scheme)
-    None                     -> ty_env_lookup(st.env, cname)
+# The constructor a variant pattern names. A reference born settled is
+# that constructor. A written one is decided by the scrutinee's type:
+# this is how a user variant `Response.Ok` shadows the core `Result.Ok`
+# in patterns matching a `Response`. A scrutinee whose type declares no
+# such constructor leaves the name to answer, in the module that
+# qualifies it when one does.
+fn pattern_ctor(st: InferState, r: DeclRef, expected: Ty) : Option[CtorPick] = match r {
+  DrSym(c)        -> ctor_entry(st.env, c)
+  DrWritten(q, w) -> match ctor_pick(st, expected, written_text(w)) {
+    Some(p) -> Some(p)
+    None    -> match pattern_name_sym(st, q, written_text(w)) {
+      Some(c) -> ctor_entry(st.env, c)
+      None    -> None
+    }
   }
-  match sc_opt {
+}
+
+fn pattern_name_sym(st: InferState, q: Option[Written], cname: String) : Option[SymId] = match q {
+  Some(m) -> match modcall_sym(st, written_text(m), cname) {
+    Some(c) -> Some(c)
+    None    -> name_read_sym(st, cname)
+  }
+  None -> name_read_sym(st, cname)
+}
+
+fn check_variant_pattern(st: InferState, r: DeclRef, subpats: [Pattern], expected: Ty, line: Int, col: Int) : PatChecked / Console + File + Mutable {
+
+
+  let cname = ref_text(st.env.tab, r)
+  match pattern_ctor(st, r, expected) {
     None -> {
-      let hint = match closest_name(cname, ty_env_uppercase_names(st.env)) {
+      let hint = match closest_name(cname, env_ctor_names(st.env)) {
         Some(sug) -> " (did you mean `#{sug}`?)"
         None      -> ""
       }
       let perr = mk_diag(SevError, st.file, line, col, "unknown variant '#{cname}'#{hint}", [])
       render_diag(perr)
-      check_unknown_subpats(st_bump_err(st_push_diag(st, perr)), subpats)
+      let subs = check_unknown_subpats(st_bump_err(st_push_diag(st, perr)), subpats)
+      PatChecked { st: subs.st, pat: mk_pat(PVariant(r, subs.pats), line, col) }
     }
-    Some(sc) -> {
-      let inst = st_instantiate(st, sc)
+    Some(CtorPick(c, entry)) -> {
+      let inst = st_instantiate(st, entry.scheme)
       match inst.ty {
         TyFnT(aps, ret, _) -> {
           let what = string_concat("variant pattern '", string_concat(cname, "'"))
           let s1 = st_unify(inst.st, expected, ret, what, line, col)
-          check_subpat_list(s1, subpats, aps, line, col)
+          let subs = check_subpat_list(s1, subpats, aps, line, col)
+          PatChecked { st: subs.st, pat: mk_pat(PVariant(DrSym(c), subs.pats), line, col) }
         }
         _ -> {
           let what = string_concat("variant pattern '", string_concat(cname, "'"))
           let s1 = st_unify(inst.st, expected, inst.ty, what, line, col)
           match subpats {
-            [] -> s1
+            [] -> PatChecked { st: s1, pat: mk_pat(PVariant(DrSym(c), []), line, col) }
             _  -> {
               let perr = mk_diag(SevError, st.file, line, col, "variant '#{cname}' takes no args but pattern has #{int_to_string(list_length(subpats))}", [])
               render_diag(perr)
-              st_bump_err(st_push_diag(s1, perr))
+              PatChecked { st: st_bump_err(st_push_diag(s1, perr)), pat: mk_pat(PVariant(DrSym(c), subpats), line, col) }
             }
           }
         }
@@ -15443,34 +15484,38 @@ fn check_variant_pattern(st: InferState, cname: String, subpats: [Pattern], expe
   }
 }
 
-fn check_unknown_subpats(st: InferState, ps: [Pattern]) : InferState / Console + File + Mutable {
+fn check_unknown_subpats(st: InferState, ps: [Pattern]) : PatsChecked / Console + File + Mutable {
 
 
   match ps {
-    [] -> st
-    [p, ...rest] -> check_unknown_subpats(check_pattern(st, p, TyAny), rest)
+    [] -> PatsChecked { st: st, pats: [] }
+    [p, ...rest] -> {
+      let h = check_pattern_stamped(st, p, TyAny)
+      let t = check_unknown_subpats(h.st, rest)
+      PatsChecked { st: t.st, pats: [h.pat, ...t.pats] }
+    }
   }
 }
 
-fn check_subpat_list(st: InferState, ps: [Pattern], tys: [Ty], line: Int, col: Int) : InferState / Console + File + Mutable {
+fn check_subpat_list(st: InferState, ps: [Pattern], tys: [Ty], line: Int, col: Int) : PatsChecked / Console + File + Mutable {
 
 
   variant_arity_check(st, ps, tys, line, col, list_length(tys), list_length(ps))
 }
 
 fn variant_arity_check(st: InferState, ps: [Pattern], tys: [Ty],
-                        line: Int, col: Int, expected: Int, found: Int) : InferState / Console + File + Mutable {
+                        line: Int, col: Int, expected: Int, found: Int) : PatsChecked / Console + File + Mutable {
 
 
   match ps {
     [] -> match tys {
-      [] -> st
+      [] -> PatsChecked { st: st, pats: [] }
       _  -> {
         let perr = mk_diag(SevError, st.file, line, col, "variant pattern has too few sub-patterns", [])
         render_diag(perr)
         diag_note("expected #{int_to_string(expected)}, found #{int_to_string(found)}")
         diag_help("add #{int_to_string(expected - found)} more sub-pattern(s), or use a wildcard `_` for each")
-        st_bump_err(st_push_diag(st, perr))
+        PatsChecked { st: st_bump_err(st_push_diag(st, perr)), pats: [] }
       }
     }
     [p, ...pr] -> match tys {
@@ -15479,40 +15524,48 @@ fn variant_arity_check(st: InferState, ps: [Pattern], tys: [Ty],
         render_diag(perr)
         diag_note("expected #{int_to_string(expected)}, found #{int_to_string(found)}")
         diag_help("remove #{int_to_string(found - expected)} sub-pattern(s) so the count matches the variant's declared arity")
-        st_bump_err(st_push_diag(st, perr))
+        PatsChecked { st: st_bump_err(st_push_diag(st, perr)), pats: ps }
       }
-      [t, ...tr] -> variant_arity_check(check_pattern(st, p, t), pr, tr, line, col, expected, found)
+      [t, ...tr] -> {
+        let h = check_pattern_stamped(st, p, t)
+        let r = variant_arity_check(h.st, pr, tr, line, col, expected, found)
+        PatsChecked { st: r.st, pats: [h.pat, ...r.pats] }
+      }
     }
   }
 }
 
-fn pfield_list_probe(pfs: [PField]) : String = match pfs {
-  [] -> ""
-  [pf, ..._] -> match pf { PField(nm, _, _) -> nm }
-}
+# The type a reference names to the reader `hv`; a written qualifier's
+# module decides when there is one.
+fn ref_ty_sym(hv: TyHomeView, r: DeclRef) : SymId = ut_ty_sym(tsh_tycon_at(hv, r, []))
 
-fn check_variant_record_pattern(st: InferState, home: DeclRef, cname: String, pfs: [PField], expected: Ty, line: Int, col: Int) : InferState / Console + File + Mutable {
+# `Name { fields }` names a record type; the typed pattern holds its id.
+fn check_variant_record_pattern(st: InferState, r: DeclRef, pfs: [PField], expected: Ty, line: Int, col: Int) : PatChecked / Console + File + Mutable {
 
 
-  let lookup = rec_pick(st.recs, tsh_ref_sym(st_home_view(st), home, cname), cname, -1, pfield_list_probe(pfs))
-  match lookup {
-    None -> check_unknown_pfields(st, pfs)
+  let rsym = ref_ty_sym(st_home_view(st), r)
+  match rec_pick(st.recs, rsym) {
+    None -> {
+      let fs = check_unknown_pfields(st, pfs)
+      PatChecked { st: fs.st, pat: mk_pat(PVariantRecord(r, fs.fields), line, col) }
+    }
     Some(ri) -> {
       let inst = rec_instantiate(st, ri)
-      let what = string_concat("record pattern '", string_concat(cname, "'"))
+      let what = string_concat("record pattern '", string_concat(ref_text(st.env.tab, r), "'"))
       let s1 = st_unify(inst.st, expected, inst.result_ty, what, line, col)
-      check_pfield_list(s1, pfs, ri, inst.fields, line, col)
+      let fs = check_pfield_list(s1, pfs, ri, inst.fields, line, col)
+      PatChecked { st: fs.st, pat: mk_pat(PVariantRecord(DrSym(rsym), fs.fields), line, col) }
     }
   }
 }
 
-fn check_record_pattern(st: InferState, pfs: [PField], expected: Ty, line: Int, col: Int) : InferState / Console + File + Mutable {
+fn check_record_pattern(st: InferState, pfs: [PField], expected: Ty, line: Int, col: Int) : PFieldsChecked / Console + File + Mutable {
 
 
   let applied = apply_ty(st.sub, expected)
   match applied {
-    TyCon(_, nm, nargs, tsym) -> {
-      let lookup = rec_pick(st.recs, tsym, nm, list_length(nargs), pfield_list_probe(pfs))
+    TyCon(tsym, _) -> {
+      let lookup = rec_pick(st.recs, tsym)
       match lookup {
         None -> check_unknown_pfields(st, pfs)
         Some(ri) -> {
@@ -15529,43 +15582,50 @@ fn check_record_pattern(st: InferState, pfs: [PField], expected: Ty, line: Int, 
 
 # The record type is not known yet: each field is resolved, and its
 # visibility judged, once the body settles the scrutinee.
-fn check_deferred_pfields(st: InferState, pfs: [PField], recv_id: Int, line: Int, col: Int) : InferState / Console + File + Mutable =
+fn check_deferred_pfields(st: InferState, pfs: [PField], recv_id: Int, line: Int, col: Int) : PFieldsChecked / Console + File + Mutable =
   match pfs {
-    [] -> st
-    [PField(fnm, sub, _), ...rest] -> {
+    [] -> PFieldsChecked { st: st, fields: [] }
+    [PField(fnm, sub, sh), ...rest] -> {
       let fr = st_fresh_ty(st)
       let s1 = st_push_deferred_field(fr.st, DFd(recv_id, fnm, ty_var_id(fr.ty), line, col, true))
-      check_deferred_pfields(check_pattern(s1, sub, fr.ty), rest, recv_id, line, col)
+      let h = check_pattern_stamped(s1, sub, fr.ty)
+      let t = check_deferred_pfields(h.st, rest, recv_id, line, col)
+      PFieldsChecked { st: t.st, fields: [PField(fnm, h.pat, sh), ...t.fields] }
     }
   }
 
-fn check_unknown_pfields(st: InferState, pfs: [PField]) : InferState / Console + File + Mutable {
+fn check_unknown_pfields(st: InferState, pfs: [PField]) : PFieldsChecked / Console + File + Mutable {
 
 
   match pfs {
-    [] -> st
+    [] -> PFieldsChecked { st: st, fields: [] }
     [pf, ...rest] -> match pf {
-      PField(_, sub, _) -> check_unknown_pfields(check_pattern(st, sub, TyAny), rest)
+      PField(fnm, sub, sh) -> {
+        let h = check_pattern_stamped(st, sub, TyAny)
+        let t = check_unknown_pfields(h.st, rest)
+        PFieldsChecked { st: t.st, fields: [PField(fnm, h.pat, sh), ...t.fields] }
+      }
     }
   }
 }
 
-fn check_pfield_list(st: InferState, pfs: [PField], ri: RecInfo, fields: [FTy], line: Int, col: Int) : InferState / Console + File + Mutable {
+fn check_pfield_list(st: InferState, pfs: [PField], ri: RecInfo, fields: [FTy], line: Int, col: Int) : PFieldsChecked / Console + File + Mutable {
 
 
   match pfs {
-    [] -> st
+    [] -> PFieldsChecked { st: st, fields: [] }
     [pf, ...rest] -> match pf {
-      PField(fnm, sub, _) -> {
-        let s1 = match fty_find(fields, fnm) {
-          Some(ft) -> check_pattern(check_pfield_visible(st, ri, fnm, line, col), sub, ft)
+      PField(fnm, sub, sh) -> {
+        let h = match fty_find(fields, fnm) {
+          Some(ft) -> check_pattern_stamped(check_pfield_visible(st, ri, fnm, line, col), sub, ft)
           None -> {
             let perr = mk_diag(SevError, st.file, line, col, "no field '#{fnm}' in record pattern#{field_hint(fields, fnm)}", [])
             render_diag(perr)
-            check_pattern(st_bump_err(st_push_diag(st, perr)), sub, TyAny)
+            check_pattern_stamped(st_bump_err(st_push_diag(st, perr)), sub, TyAny)
           }
         }
-        check_pfield_list(s1, rest, ri, fields, line, col)
+        let t = check_pfield_list(h.st, rest, ri, fields, line, col)
+        PFieldsChecked { st: t.st, fields: [PField(fnm, h.pat, sh), ...t.fields] }
       }
     }
   }
@@ -15574,13 +15634,15 @@ fn check_pfield_list(st: InferState, pfs: [PField], ri: RecInfo, fields: [FTy], 
 # Naming a field in a pattern reads it, whatever the sub-pattern is.
 fn check_pfield_visible(st: InferState, ri: RecInfo, fnm: String, line: Int, col: Int) : InferState / Console + File =
   match ri {
-    RI(rn, _, fds, mo, rsym) -> match find_field_in_decls(fds, fnm) {
-      Some(fd) ->
+    RI(rsym, _, fds, mo) -> match find_field_in_decls(fds, fnm) {
+      Some(fd) -> {
+        let rn = written_text(decl_name(st.env.tab, rsym))
         if field_hidden(st_home_view(st), rn, rsym, fd) {
           let d = priv_read_diag(st.file, line, col, fnm, rn, mo)
           render_diag(d)
           st_bump_err(st_push_diag(st, d))
         } else { st }
+      }
       None -> st
     }
   }
@@ -15592,17 +15654,17 @@ fn check_pfield_visible(st: InferState, ri: RecInfo, fnm: String, line: Int, col
 # shape (both unguarded) make the second arm dead code. Today
 # the language accepts; the user's intent (compute via the
 # second arm) is silently dropped. We fingerprint each arm's
-# head: variant ctor name, literal value, or catch-all marker.
+# head: literal value, or catch-all marker.
 # Two arms with the same fingerprint, both unguarded, is a hard
 # error. A catch-all (`_`, bare binding) unguarded arm makes any
 # later arm unreachable; we flag the first such later arm. We
 # stay deliberately syntactic: nothing here recurses into
 # variant payloads (`Some(x)` vs `Some(y)` is shape 2; `Some(x)`
 # vs `Some(Just z)` is NOT). The shape matches what real ML/HM
-# frontends report.
+# frontends report. Two arms of one constructor are told apart by its
+# id, which an arm holds once it is typed: `check_arms_ctor_repeats`.
 type ArmHead
   = AhCatchAll                          # PWild / PBind / PAs over wild — covers everything
-  | AhVariant(String)                   # PVariant(_, nm, []) or all-catch-all subpats — totally open shape
   | AhLitInt(Int)
   | AhLitBool(Bool)
   | AhLitChar(Char)
@@ -15611,8 +15673,8 @@ type ArmHead
 
 # Returns true when a sub-pattern carries no discriminating
 # information — it matches every value at its type. We use this
-# to decide if a `PVariant(nm, subs)` arm is "totally open"; two
-# such arms with the same ctor name overlap completely and the
+# to decide if a `PVariant(c, subs)` arm is "totally open"; two
+# such arms of the same constructor overlap completely and the
 # second is dead code. A variant arm with a literal payload like
 # `Some(true)` is NOT totally open — `Some(true)` and `Some(false)`
 # are legitimately distinct arms.
@@ -15648,8 +15710,8 @@ fn arm_head_of(pat: Pattern) : ArmHead {
     PBind(_)    -> AhCatchAll
     PHole(_)    -> AhCatchAll
     PAs(_, sub) -> arm_head_of(sub)
-    PVariant(_, nm, subs) -> if all_subpats_catch_all(subs) { AhVariant(nm) } else { AhUnclassified }
-    PVariantRecord(_, nm, pfs) -> if all_pfields_catch_all(pfs) { AhVariant(nm) } else { AhUnclassified }
+    PVariant(_, _) -> AhUnclassified
+    PVariantRecord(_, _) -> AhUnclassified
     PLit(lit_expr) -> match lit_expr.kind {
       EInt(n, _) -> AhLitInt(n)
       EBool(b)    -> AhLitBool(b)
@@ -15668,10 +15730,6 @@ fn arm_head_of(pat: Pattern) : ArmHead {
 fn arm_head_eq(a: ArmHead, b: ArmHead) : Bool {
   match a {
     AhCatchAll -> match b { AhCatchAll -> true _ -> false }
-    AhVariant(na) -> match b {
-      AhVariant(nb) -> na == nb
-      _ -> false
-    }
     AhLitInt(va) -> match b {
       AhLitInt(vb) -> va == vb
       _ -> false
@@ -15695,7 +15753,6 @@ fn arm_head_eq(a: ArmHead, b: ArmHead) : Bool {
 fn arm_head_describe(h: ArmHead) : String {
   match h {
     AhCatchAll       -> "catch-all"
-    AhVariant(nm)    -> "variant `#{nm}`"
     AhLitInt(n)      -> "literal `#{int_to_string(n)}`"
     AhLitBool(b)     -> if b { "literal `true`" } else { "literal `false`" }
     AhLitChar(_)     -> "this character literal"
@@ -15783,6 +15840,53 @@ fn check_arms_redundancy(st: InferState, arms: [Arm], seen: [ArmHead],
   }
 }
 
+# The constructor an arm tests over a totally open payload, once the
+# typer settled it.
+fn arm_open_ctor(pat: Pattern) : Option[SymId] = match pat.pkind {
+  PAs(_, sub)                  -> arm_open_ctor(sub)
+  PVariant(DrSym(c), subs)     -> if all_subpats_catch_all(subs) { Some(c) } else { None }
+  PVariantRecord(DrSym(c), fs) -> if all_pfields_catch_all(fs) { Some(c) } else { None }
+  _                            -> None
+}
+
+# The constructor half of `check_arms_redundancy`, over typed arms: a
+# second unguarded arm of one constructor is dead. `dead` follows the
+# catch-all the first pass already reported the arms after.
+fn check_arms_ctor_repeats(st: InferState, arms: [Arm], seen: [SymId], dead: Bool,
+                           match_line: Int, match_col: Int) : InferState / Console + File {
+  match arms {
+    [] -> st
+    [a, ...rest] ->
+      if arm_is_synthetic_fallthrough(a, match_line, match_col) {
+        check_arms_ctor_repeats(st, rest, seen, dead, match_line, match_col)
+      } else {
+        let pat = arm_pat_of(a)
+        let unguarded = arm_is_unguarded(a)
+        match arm_open_ctor(pat) {
+          None -> check_arms_ctor_repeats(st, rest, seen,
+                    dead or (unguarded and arm_head_is_catch_all(arm_head_of(pat))), match_line, match_col)
+          Some(c) ->
+            if dead and unguarded { check_arms_ctor_repeats(st, rest, seen, dead, match_line, match_col) }
+            else if unguarded and sym_list_has(seen, c) {
+              let shown = "variant `#{decl_name(st.env.tab, c)}`"
+              let perr = mk_diag(SevError, st.file, pat.line, pat.col,
+                "duplicate match arm: #{shown} is already matched above", [])
+              render_diag(perr)
+              diag_help("remove this arm, or distinguish it with a guard (`#{shown} if cond -> ...`)")
+              check_arms_ctor_repeats(st_bump_err(st_push_diag(st, perr)), rest, seen, dead, match_line, match_col)
+            } else {
+              check_arms_ctor_repeats(st, rest, if unguarded { [c, ...seen] } else { seen }, dead, match_line, match_col)
+            }
+        }
+      }
+  }
+}
+
+fn sym_list_has(xs: [SymId], s: SymId) : Bool = match xs {
+  []           -> false
+  [x, ...rest] -> sym_same(x, s) or sym_list_has(rest, s)
+}
+
 fn arm_head_classified(h: ArmHead) : Bool {
   match h {
     AhUnclassified -> false
@@ -15820,7 +15924,8 @@ fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : In
   let ra = synth_arms(rv.st, arms, rs_.ty, rv.ty, line, col)
   let ty = apply_ty(ra.st.sub, rv.ty)
   let scr_final = apply_ty(ra.st.sub, rs_.ty)
-  let st_post = check_exhaustive(ra.st, ra.arms, scr_final, line, col)
+  let st_rep = check_arms_ctor_repeats(ra.st, ra.arms, [], false, line, col)
+  let st_post = check_exhaustive(st_rep, ra.arms, scr_final, line, col)
   # expand `PNarrow(name, T)` arms into one
   # `PAs(name, PVariant(Vi, []))` arm per variant of T so codegen
   # never sees `PNarrow`. Variants come from the post-resolve env
@@ -15828,8 +15933,8 @@ fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : In
   # structural — `name`'s narrow type was bound during typing in
   # `check_narrow_pattern`, so the body's typed AST is already
   # consistent.
-  let arms_narrowed = expand_narrow_arms(ra.arms, st_post.env, st_mo(st_post))
-  # the parser emits `PVariantRecord(home, name, fields)` for
+  let arms_narrowed = expand_narrow_arms(ra.arms, st_post, scr_final)
+  # the parser emits `PVariantRecord(name, fields)` for
   # any `Name { ... }` pattern, even when `Name` is a record alias
   # (`type P = { x: Int, y: Int }`) rather than a sum-type ctor with
   # named fields. The typer accepts both shapes via
@@ -15879,8 +15984,9 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
   let ra = check_arms(rs_.st, arms, rs_.ty, expected, line, col)
   let ty = apply_ty(ra.st.sub, expected)
   let scr_final = apply_ty(ra.st.sub, rs_.ty)
-  let st_post = check_exhaustive(ra.st, ra.arms, scr_final, line, col)
-  let arms_narrowed = expand_narrow_arms(ra.arms, st_post.env, st_mo(st_post))
+  let st_rep = check_arms_ctor_repeats(ra.st, ra.arms, [], false, line, col)
+  let st_post = check_exhaustive(st_rep, ra.arms, scr_final, line, col)
+  let arms_narrowed = expand_narrow_arms(ra.arms, st_post, scr_final)
   let arms_codegen  = rewrite_record_alias_arms(arms_narrowed, st_post.recs)
   let root = with_ty(mk_expr(EMatch(rs_.expr, arms_codegen), line, col), ty)
   mk_inferred(st_post, ty, root)
@@ -15893,8 +15999,8 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
 # an if-chain over `vec_length` / `vec_get` / `vec_tail_from`.
 fn vec_match_route(scr_ty: Ty, arms: [Arm]) : Bool =
   match scr_ty {
-    TyCon(_, _, _, tcs) -> core_ty_is(tcs, CtVec) and vec_match_has_list_arm(arms)
-    _                 -> false
+    TyCon(tcs, _) -> core_ty_is(tcs, CtVec) and vec_match_has_list_arm(arms)
+    _             -> false
   }
 
 # A fixed-width `Vec[T]<n>` scrutinee routes to the static rewrite: the
@@ -16031,7 +16137,8 @@ fn check_arms(st: InferState, arms: [Arm], scrut_ty: Ty, expected: Ty,
       Arm(pat, guard, body) -> {
         let outer = st
         let st_dup = check_pattern_no_dup_binds(st, pat)
-        let s_p = check_pattern(st_dup, pat, scrut_ty)
+        let pc = check_pattern_stamped(st_dup, pat, scrut_ty)
+        let s_p = pc.st
         let guard_res = match guard {
           None -> InferredOptExpr { st: s_p, expr: None }
           Some(gx) -> {
@@ -16044,7 +16151,7 @@ fn check_arms(st: InferState, arms: [Arm], scrut_ty: Ty, expected: Ty,
         let s_b = st_unify(rb.st, expected, rb.ty, "match arm", body.line, body.col)
         let s_scoped = st_restore_entries(outer, s_b)
         let rr = check_arms(s_scoped, rest, scrut_ty, expected, line, col)
-        InferredArms { st: rr.st, arms: [Arm(pat, guard_res.expr, rb.expr), ...rr.arms] }
+        InferredArms { st: rr.st, arms: [Arm(pc.pat, guard_res.expr, rb.expr), ...rr.arms] }
       }
     }
   }
@@ -16070,7 +16177,7 @@ fn check_if(st: InferState, c: Expr, t_: Expr, eo: Option[Expr],
   let s1 = st_unify(rc.st, rc.ty, TyBool, "if condition", line, col)
   # thread `expected` into the then-branch ONLY
   # when it is shaped like a bare ctor expression (`EBlock` whose tail
-  # is a ctor / nullary ctor, ECall(EVar, _), or EVar) so a user
+  # is a ctor / nullary ctor, a call of a name, or a name) so a user
   # `Response.Ok` shadowing the core `Result.Ok` can be picked by
   # annotation context. Other branch shapes stay on synth to avoid
   # regressions in non-ctor expression types.
@@ -16100,20 +16207,20 @@ fn check_branch_for_ctor(st: InferState, br: Expr, expected: Ty) : Inferred / Co
   match br.kind {
     ECall(c, _) -> match c.kind {
       EName(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
-      ESym(_, _, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
+      ESym(_, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
       _ -> synth(st, br)
     }
     EName(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
-    ESym(_, _, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
+    ESym(_, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
     EBlock(_, tail) -> match tail {
       Some(te) -> match te.kind {
         ECall(c, _) -> match c.kind {
           EName(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
-          ESym(_, _, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
+          ESym(_, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
           _ -> synth(st, br)
         }
         EName(_) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
-        ESym(_, _, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
+        ESym(_, _) -> check_expr_against(st, br, expected, "if branch", br.line, br.col)
         _ -> synth(st, br)
       }
       None -> synth(st, br)
@@ -16146,13 +16253,13 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
       # literal builds a pre-sized vec instead of a cons list. A BARE
       # literal keeps denoting the cons list — only annotation /
       # argument context reaches here.
-      TyCon(_, _, hargs, tcs) ->
+      TyCon(tcs, hargs) ->
         if core_ty_is(tcs, CtVec) { check_vec_lit_against(st, els, hargs, e.line, e.col) }
         else { synth(st, e) }
       # Fixed-width Vec context: `Vec[T]<k>` fixes the literal's
       # length by its habitant.
       TyDimT(inner, u) -> match inner {
-        TyCon(_, _, hargs, tcs) ->
+        TyCon(tcs, hargs) ->
           if core_ty_is(tcs, CtVec) { check_fixed_vec_lit(st, els, hargs, u, e.line, e.col) }
           else { synth(st, e) }
         _ -> synth(st, e)
@@ -16170,17 +16277,17 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
       else { synth(st, e) }
     }
     # annotation-driven ctor disambiguation. When
-    # the expected type is `TyCon(_, parent, _)` and the callee is a bare
-    # `EName(cname)` whose qualified `parent::cname` scheme exists,
-    # rewrite the callee to `EModCall(parent, cname)` so the core's
-    # bare-name table never wins. Falls through to synth otherwise.
+    # the expected type is a sum and the callee is a bare
+    # `EName(cname)` that names one of its constructors,
+    # rewrite the callee to that constructor so the core's
+    # same-named one never wins. Falls through to synth otherwise.
     ECall(callee, args_) ->
       ctor_coerce_expected(ctor_check_or_synth(st, e, callee, args_, expected, line, col), expected)
     # nullary ctor disambiguation. A bare
-    # `EName(cname)` (e.g. `NotFound`) in annotation context whose
-    # qualified `parent::cname` exists picks the qualified scheme.
+    # `EName(cname)` (e.g. `NotFound`) in annotation context that
+    # names a constructor of the expected sum picks its scheme.
     EName(_) -> nullary_ctor_check_or_synth(st, e, expected)
-    ESym(_, _, _) -> nullary_ctor_check_or_synth(st, e, expected)
+    ESym(_, _) -> nullary_ctor_check_or_synth(st, e, expected)
     # thread expected into block tails so a
     # `{ ...stmts...; ctor(args) }` body benefits from the same
     # annotation-driven disambiguation as a bare ctor expression.
@@ -16205,24 +16312,17 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
 fn ctor_pick(st: InferState, t: Ty, cname: String) : Option[CtorPick] =
   sum_ctor(st.env, ut_ty_sym(apply_ty(st.sub, t)), cname)
 
-# The type-qualified form a decided constructor site is rewritten to,
-# spelled from the key its entry was registered under.
-fn ctor_site_kind(e: TyEntry) : ExprKind = match vix_ctor_key(e.name) {
-  Some(CtorKey(parent, cname)) -> EModCall(parent, cname)
-  None                         -> EName(e.name)
-}
-
 # A bare constructor call under an expected type that declares the
-# constructor is rewritten to `EModCall(parent, cname)(args)`: the
-# expected type names the sum, so the bare-name table never wins and the
+# constructor is rewritten to a call of that constructor: the
+# expected type names the sum, so a same-named one never wins and the
 # bare-unannotated ambiguity diagnostic of `synth_call` does not fire
 # (a user variant may shadow `Result.Ok` / `Option.Some`).
 fn ctor_check_or_synth(st: InferState, e: Expr, callee: Expr, args_: [Expr],
                           expected: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable =
   match callee.kind {
-    EName(cname) -> match ctor_pick(st, expected, cname) {
-      Some(CtorPick(_, entry)) ->
-        synth(st, mk_expr(ECall(mk_expr(ctor_site_kind(entry), callee.line, callee.col), args_), line, col))
+    EName(cname) -> match ctor_pick(st, expected, written_text(cname)) {
+      Some(CtorPick(c, _)) ->
+        synth(st, mk_expr(ECall(mk_sym(c, callee.line, callee.col), args_), line, col))
       None -> synth(st, e)
     }
     _ -> synth(st, e)
@@ -16232,69 +16332,44 @@ fn ctor_check_or_synth(st: InferState, e: Expr, callee: Expr, args_: [Expr],
 # reads that declaration's scheme.
 fn nullary_ctor_check_or_synth(st: InferState, e: Expr, expected: Ty) : Inferred / Console + File + Mutable =
   match e.kind {
-    EName(cname) -> match ctor_pick(st, expected, cname) {
-      Some(CtorPick(_, entry)) ->
-        synth_scheme_read(st, entry.scheme, cname, mk_expr(ctor_site_kind(entry), e.line, e.col))
+    EName(cname) -> match ctor_pick(st, expected, written_text(cname)) {
+      Some(CtorPick(c, entry)) ->
+        synth_scheme_read(st, entry.scheme, c, mk_sym(c, e.line, e.col))
       None -> synth(st, e)
     }
     _ -> synth(st, e)
   }
 
-# A read of the declaration whose scheme is `sc`, spelled `nm` at `e`.
-fn synth_scheme_read(st: InferState, sc: TyScheme, nm: String, e: Expr) : Inferred / Console + File + Mutable = {
+# A read of the declaration `s`, whose scheme is `sc`, at `e`.
+fn synth_scheme_read(st: InferState, sc: TyScheme, s: SymId, e: Expr) : Inferred / Console + File + Mutable = {
   let r = st_instantiate_report(st, sc)
   let st2 = if r.fresh == [] and r.unit_fresh == [] { r.st }
-            else { st_push_inst(r.st, CS(nm, e.line, e.col, r.fresh, r.unit_fresh, None)) }
+            else { st_push_inst(r.st, CS(s, e.line, e.col, r.fresh, r.unit_fresh, None)) }
   inferred_leaf(st2, r.ty, e)
 }
 
-# The sums a bare `cname` could mean, each as the entry its constructor
-# was registered with: every `<X>::<cname>` key buckets under `cname` in
-# the name index. One candidate per spelling of `X`, newest first: a
-# newer type spelled like an older one hides it from a bare name.
-fn ty_env_qualified_parents(env: TyEnv, cname: String) : [TyEntry] =
-  ctor_parents_loop(idx_chain(env.index, cname), cname, [], [])
+# The sums that declare a constructor spelled `cname`, the runtime's
+# `Result` and `Option` left out, newest declaration first.
+fn user_sums_declaring(env: TyEnv, cname: String) : [SymId] =
+  sums_of_ctors(env, list_reverse(st_candidates(env.tab, NCCtor, cname)), [])
 
-fn ctor_parents_loop(es: [TyEntry], cname: String, seen: [String], acc: [TyEntry]) : [TyEntry] = match es {
+fn sums_of_ctors(env: TyEnv, cs: [SymId], acc: [SymId]) : [SymId] = match cs {
   [] -> list_reverse(acc)
-  [e, ...rest] -> match vix_ctor_key(e.name) {
-    Some(CtorKey(parent, c)) ->
-      if c == cname and not list_has(seen, parent) { ctor_parents_loop(rest, cname, [parent, ...seen], [e, ...acc]) }
-      else { ctor_parents_loop(rest, cname, seen, acc) }
-    None -> ctor_parents_loop(rest, cname, seen, acc)
-  }
-}
-
-# The spelling of the sum a constructor entry was registered under.
-fn ctor_parent_name(e: TyEntry) : String = match vix_ctor_key(e.name) {
-  Some(CtorKey(parent, _)) -> parent
-  None                     -> e.name
-}
-
-# The scheme of a constructor `cname` declared by module `home`, on any
-# of that module's types. A qualified use names the module, not the
-# type, so the type is what this scans over.
-fn ty_env_lookup_ctor_in_home(env: TyEnv, home: String, cname: String) : Option[TyScheme] =
-  ty_env_lookup_ctor_in_home_loop(idx_chain(env.index, ty_bucket_key(cname)),
-                                     string_concat("::", cname),
-                                     string_concat(home, "::"))
-
-fn ty_env_lookup_ctor_in_home_loop(es: [TyEntry], suffix: String,
-                                      home_prefix: String) : Option[TyScheme] {
-  match es {
-    [] -> None
-    [e, ...rest] -> match ty_entry_extract_mod(e.name, suffix) {
-      None -> ty_env_lookup_ctor_in_home_loop(rest, suffix, home_prefix)
-      Some(qual) -> if inf_string_starts_with_q(qual, home_prefix) { Some(e.scheme) }
-                    else { ty_env_lookup_ctor_in_home_loop(rest, suffix, home_prefix) }
+  [c, ...rest] -> match ctor_entry(env, c) {
+    Some(CtorPick(_, e)) -> {
+      let t = scheme_ret_sym(e.scheme)
+      if sym_is_core_sum(t) or sym_list_has(acc, t) { sums_of_ctors(env, rest, acc) }
+      else { sums_of_ctors(env, rest, [t, ...acc]) }
     }
+    None -> sums_of_ctors(env, rest, acc)
   }
 }
+
+fn sym_names(tab: SymTab, ss: [SymId]) : [String] = map(ss, (s) => written_text(decl_name(tab, s)))
 
 # emit a diagnostic when a bare ctor name is
-# genuinely ambiguous (its bare slot is occupied by a core builtin
-# Result/Option ctor AND at least one user type registers a qualified
-# `<X>::<cname>` entry whose parent is NOT Result/Option). Returns
+# genuinely ambiguous (the core declares a Result/Option ctor of that
+# name AND at least one user type declares one too). Returns
 # the input state bumped by one error if the diagnostic fires;
 # otherwise the input state unchanged. Idempotent — the predicate is
 # pure and the diagnostic carries the call site.
@@ -16302,30 +16377,28 @@ fn ty_env_lookup_ctor_in_home_loop(es: [TyEntry], suffix: String,
 # The cross-module shape (two foreign homes exporting the name) is the
 # unified resolver's alone: it warns under hanga-roa and errors from
 # orongo.
-fn report_ctor_ambiguity_if_any(st: InferState, cname: String,
+fn report_ctor_ambiguity_if_any(st: InferState, cname: Written,
                                    line: Int, col: Int) : InferState / Console + File {
 
-  match ty_env_lookup(st.env, cname) {
-    None -> st
-    Some(bare_sc) ->
-      if not scheme_builds_nominal(bare_sc) { st }
-      else if sym_is_core_sum(scheme_ret_sym(bare_sc)) {
-        let bare_parent = core_sum_name(scheme_ret_sym(bare_sc))
-        match map(ty_env_qualified_parents_excluding_builtin(st.env, cname), ctor_parent_name) {
-          [] -> st
-          user_parents -> {
-            let perr = mk_diag(SevError, st.file, line, col,
-              concat_all(["ambiguous constructor '", cname,
-                          "' — matches both the core '",
-                          bare_parent, ".", cname,
-                          "' and user-declared variant(s)"]), [])
-            render_diag(perr)
-            diag_note(concat_all(["candidates: ", format_ctor_candidates(cname, [bare_parent, ...user_parents])]))
-            diag_help("annotate the binding with `let <name> : <Parent> = ...` to disambiguate")
-            st_bump_err(st_push_diag(st, perr))
-          }
-        }
-      } else { report_ctor_parents_if_ambiguous(st, cname, line, col) }
+  let nm = written_text(cname)
+  let users = user_sums_declaring(st.env, nm)
+  match ctor_entry(st.env, core_ctor_sym(nm)) {
+    Some(CtorPick(_, core)) -> match sym_names(st.env.tab, users) {
+      [] -> st
+      user_parents -> {
+        let bare_parent = core_sum_name(scheme_ret_sym(core.scheme))
+        let perr = mk_diag(SevError, st.file, line, col,
+          concat_all(["ambiguous constructor '", nm,
+                      "' — matches both the core '",
+                      bare_parent, ".", nm,
+                      "' and user-declared variant(s)"]), [])
+        render_diag(perr)
+        diag_note(concat_all(["candidates: ", format_ctor_candidates(nm, [bare_parent, ...user_parents])]))
+        diag_help("annotate the binding with `let <name> : <Parent> = ...` to disambiguate")
+        st_bump_err(st_push_diag(st, perr))
+      }
+    }
+    None -> report_ctor_parents_if_ambiguous(st, nm, sym_names(st.env.tab, users), line, col)
   }
 }
 
@@ -16337,9 +16410,8 @@ fn report_ctor_ambiguity_if_any(st: InferState, cname: String,
 # Only a module's own body reports here: a root-file reference is the
 # whole-program name report's, which names the contesting modules
 # rather than the types.
-fn report_ctor_parents_if_ambiguous(st: InferState, cname: String,
+fn report_ctor_parents_if_ambiguous(st: InferState, cname: String, parents: [String],
                                     line: Int, col: Int) : InferState / Console + File {
-  let parents = map(ty_env_qualified_parents_excluding_builtin(st.env, cname), ctor_parent_name)
   if list_length(parents) <= 1 or is_none(st.home) { st }
   else {
     let perr = mk_diag(SevError, st.file, line, col,
@@ -16357,11 +16429,6 @@ fn ctor_first_parent(parents: [String]) : String = match parents {
   []        -> "<Type>"
   [p, ..._] -> p
 }
-
-# The sums that declare `cname`, the runtime's `Result` and `Option`
-# left out.
-fn ty_env_qualified_parents_excluding_builtin(env: TyEnv, cname: String) : [TyEntry] =
-  filter(ty_env_qualified_parents(env, cname), (e) => not sym_is_core_sum(scheme_ret_sym(e.scheme)))
 
 # The two sums whose constructors the runtime builds.
 fn sym_is_core_sum(s: SymId) : Bool = core_ty_is(s, CtResult) or core_ty_is(s, CtOption)
@@ -16390,8 +16457,8 @@ fn format_ctor_candidates_loop(cname: String, parents: [String], acc: String) : 
 # the kai_byte(...) lowering.
 fn ty_is_vec_head(t: Ty) : Bool =
   match t {
-    TyCon(_, _, _, tcs) -> core_ty_is(tcs, CtVec)
-    _                 -> false
+    TyCon(tcs, _) -> core_ty_is(tcs, CtVec)
+    _             -> false
   }
 
 # `[e1, ..., en]` under a `Vec[T]` expectation: coin numeric elements
@@ -16471,8 +16538,8 @@ fn unboxed_expr(e: Expr) : Expr =
 # a dynamic heap vec at runtime, so its binder de-brands.
 fn is_fixed_vec_lit(e: Expr) : Bool = match e.kind {
   ECall(callee, _) -> match callee.kind { EMark(MkFixedVecLit) -> true  _ -> false }
-  EName(_) -> match e.ty { Some(t) -> ty_is_fixed_vec(t)  None -> false }
-  ESym(_, _, _) -> match e.ty { Some(t) -> ty_is_fixed_vec(t)  None -> false }
+  ELocal(_) -> match e.ty { Some(t) -> ty_is_fixed_vec(t)  None -> false }
+  ESym(_, _) -> match e.ty { Some(t) -> ty_is_fixed_vec(t)  None -> false }
   _ -> false
 }
 
@@ -16696,7 +16763,7 @@ fn elem_synth_unify(st: InferState, ex: Expr, elem_ty: Ty,
 #[doc("True when a type is `Vec`-headed, seeing through any `Dim` brand — the fixed-width representation reads this to keep a `Vec<1>` distinct from the dynamic `Vec`.")]
 pub fn ty_vec_headed(t: Ty) : Bool = match t {
   TyDimT(inner, _) -> ty_vec_headed(inner)
-  TyCon(_, _, _, tcs) -> core_ty_is(tcs, CtVec)
+  TyCon(tcs, _) -> core_ty_is(tcs, CtVec)
   _ -> false
 }
 
@@ -16725,7 +16792,7 @@ fn check_body_against_ret(st: InferState, body: Expr, expected: Ty,
     EIf(c, t_, eo)    -> check_if(st, c, t_, eo, expected, body.line, body.col)
     ELitUnit(_, _)    -> check_literal_against(st, body, expected, line, col)
     EBlock(stmts, tail) -> match tail {
-      Some(te) -> match sym_local_kind(te.kind) {
+      Some(te) -> match te.kind {
         EMatch(scr, arms) -> {
           let outer = st
           let is_ = synth_stmts(st, stmts)
@@ -16745,9 +16812,9 @@ fn check_body_against_ret(st: InferState, body: Expr, expected: Ty,
           mk_inferred(st2, ty, root)
         }
         # thread `expected` into the block tail
-        # when the tail is a bare ctor reference (`ECall(EVar, _)` or
-        # `EVar`), so annotation-driven disambiguation can pick a
-        # qualified user variant over the core builtin. Other
+        # when the tail is a bare ctor reference (a call, or a name
+        # the resolver left written), so annotation-driven
+        # disambiguation can pick a user variant over the core builtin. Other
         # tail shapes keep synthing the whole body as before to avoid
         # regressions in non-ctor expression types.
         ECall(_, _) -> {
@@ -16778,12 +16845,12 @@ fn check_body_against_ret(st: InferState, body: Expr, expected: Ty,
     # avoid regressing existing inference paths.
     ECall(_, _) -> check_expr_against(st, body, expected, what, body.line, body.col)
     EName(_) -> check_expr_against(st, body, expected, what, body.line, body.col)
-    ESym(_, _, _) -> check_expr_against(st, body, expected, what, body.line, body.col)
+    ESym(_, _) -> check_expr_against(st, body, expected, what, body.line, body.col)
     _ -> synth(st, body)
   }
 }
 
-# walk arms and rewrite `PVariantRecord(home, name, fields)` to
+# walk arms and rewrite `PVariantRecord(name, fields)` to
 # `PRecord(fields)` whenever `name` is a record-alias declaration
 # (registered in `recs` via `collect_records`). Recurses into nested
 # patterns so a `PVariantRecord` buried inside `PAs` / `PList` /
@@ -16801,18 +16868,18 @@ fn rewrite_record_alias_arms(arms: [Arm], recs: [RecInfo]) : [Arm] {
 
 fn rewrite_record_alias_pat(pat: Pattern, recs: [RecInfo]) : Pattern {
   match pat.pkind {
-    PVariantRecord(home, name, fs) -> {
+    PVariantRecord(r, fs) -> {
       let fs_r = rewrite_record_alias_pfields(fs, recs)
-      match rec_find(recs, name) {
+      match rec_find(recs, ref_sym(r)) {
         Some(_) -> Pattern { pkind: PRecord(fs_r), line: pat.line, col: pat.col }
-        None    -> Pattern { pkind: PVariantRecord(home, name, fs_r), line: pat.line, col: pat.col }
+        None    -> Pattern { pkind: PVariantRecord(r, fs_r), line: pat.line, col: pat.col }
       }
     }
     PRecord(fs) ->
       Pattern { pkind: PRecord(rewrite_record_alias_pfields(fs, recs)),
                 line: pat.line, col: pat.col }
-    PVariant(home, name, subs) ->
-      Pattern { pkind: PVariant(home, name, rewrite_record_alias_pat_list(subs, recs)),
+    PVariant(r, subs) ->
+      Pattern { pkind: PVariant(r, rewrite_record_alias_pat_list(subs, recs)),
                 line: pat.line, col: pat.col }
     PList(subs, rest) ->
       Pattern { pkind: PList(rewrite_record_alias_pat_list(subs, recs), rest),
@@ -16844,45 +16911,42 @@ fn rewrite_record_alias_pfields(fs: [PField], recs: [RecInfo]) : [PField] {
 
 # rewrite every `PNarrow(name, T)` arm into a
 # sequence of `PAs(name, PVariant(Vi, []))` arms — one per variant
-# of T plus one for the component's own dual-rep ctor name. Under
+# of T plus one for the variant of the scrutinee's type that stands
+# for T. Under
 # the dual representation the parent `type U = A | B`
 # decl registers `A` and `B` as zero-arg ctors of `U`, so a value
 # may carry either the parent's variant tag (`A`) OR an inner-type
 # variant tag (any variant of `A`'s own decl). Dispatching on both
 # keeps narrowing observably correct under whichever runtime layout
 # the user constructed the value with.
-fn expand_narrow_arms(arms: [Arm], env: TyEnv, mo: Option[String]) : [Arm] {
+fn expand_narrow_arms(arms: [Arm], st: InferState, scr_ty: Ty) : [Arm] {
   match arms {
     [] -> []
     [a, ...rest] -> match a {
       Arm(pat, guard, body) -> match pat.pkind {
         PNarrow(name, ty_expr) -> {
-          let narrow_ty = inf_resolve_ty(ty_expr, env_home_view(env, mo))
-          let tycon_name = match narrow_ty {
-            TyCon(_, n, _, _) -> n
-            _           -> ""
-          }
-          let inner_vs = variants_of_type(env, ut_ty_sym(narrow_ty))
-          # Cover both the dual-rep ctor name (matches values built
-          # via the parent union's own variant ctor) and each inner
-          # variant (matches values built via the component type's
-          # own ctors).
-          let all_vs = if tycon_name == "" { inner_vs } else { [tycon_name, ...inner_vs] }
+          let tsym = ut_ty_sym(inf_resolve_ty(ty_expr, st_home_view(st)))
+          # Cover both the parent's own variant for the component
+          # (matches values built via the parent union's variant
+          # ctor) and each inner variant (matches values built via
+          # the component type's own ctors).
+          let own = filter(sum_vars(st, ut_ty_sym(scr_ty)), (v) => sum_var_names(v, tsym))
+          let all_vs = map(list_append(own, match_needs(st, tsym)), sum_var_ctor)
           let expanded = expand_narrow_one(all_vs, name, guard, body, pat.line, pat.col)
-          list_append(expanded, expand_narrow_arms(rest, env, mo))
+          list_append(expanded, expand_narrow_arms(rest, st, scr_ty))
         }
-        _ -> [a, ...expand_narrow_arms(rest, env, mo)]
+        _ -> [a, ...expand_narrow_arms(rest, st, scr_ty)]
       }
     }
   }
 }
 
-fn expand_narrow_one(vs: [String], name: String, guard: Option[Expr],
+fn expand_narrow_one(vs: [SymId], name: Binder, guard: Option[Expr],
                       body: Expr, line: Int, col: Int) : [Arm] {
   match vs {
     [] -> []
     [v, ...rest] -> {
-      let inner = mk_pat(PVariant(None, v, []), line, col)
+      let inner = mk_pat(PVariant(DrSym(v), []), line, col)
       let pas = mk_pat(PAs(name, inner), line, col)
       [Arm(pas, guard, body), ...expand_narrow_one(rest, name, guard, body, line, col)]
     }
@@ -16892,11 +16956,9 @@ fn expand_narrow_one(vs: [String], name: String, guard: Option[Expr],
 # ---- exhaustiveness checking ----
 #
 # Flag match expressions that miss a constructor of a known sum
-# type. Scope: built-in Option / Result and any user sum whose
-# TyCon name appears in the env. "Known variants" is derived by
-# walking the env and collecting uppercase-lead entries whose
-# return type is that TyCon — cheap since errors are the only
-# callers.
+# type. Scope: built-in Option / Result and any user sum the env
+# binds constructors for. Arms and variants meet by constructor id:
+# the check reads the arms the typer has stamped.
 
 fn is_catch_all_pat(pat: Pattern) : Bool {
   match pat.pkind {
@@ -16924,56 +16986,25 @@ fn has_catch_all(arms: [Arm]) : Bool {
   }
 }
 
-fn variant_name_of_arm(a: Arm) : Option[String] {
-  match a {
-    Arm(pat, _, _) -> variant_name_of_pat(pat)
-  }
-}
-
-# drill through `name @ inner` so `Some(x) @ pat` and
-# similar shapes still report their variant for exhaustiveness.
-fn variant_name_of_pat(pat: Pattern) : Option[String] {
+# The declaration an arm's head names: a constructor, or the record
+# type of a record pattern. Drills through `name @ inner` so
+# `Some(x) @ pat` and similar shapes still report their variant.
+fn arm_head_sym(pat: Pattern) : SymId {
   match pat.pkind {
-    PVariant(_, nm, _)       -> Some(nm)
-    PVariantRecord(_, nm, _) -> Some(nm)
-    PAs(_, sub)           -> variant_name_of_pat(sub)
-    _                     -> None
+    PVariant(r, _)       -> ref_sym(r)
+    PVariantRecord(r, _) -> ref_sym(r)
+    PAs(_, sub)          -> arm_head_sym(sub)
+    _                    -> sym_none()
   }
 }
 
-fn arms_cover_variant(arms: [Arm], target: String) : Bool {
+fn arms_head(arms: [Arm], target: SymId) : Bool {
   match arms {
     [] -> false
-    [a, ...rest] -> match variant_name_of_arm(a) {
-      Some(nm) -> if nm == target { true } else { arms_cover_variant(rest, target) }
-      None     -> arms_cover_variant(rest, target)
-    }
+    [Arm(pat, _, _), ...rest] ->
+      if sym_raw(target) >= 0 and sym_same(arm_head_sym(pat), target) { true } else { arms_head(rest, target) }
   }
 }
-
-# Register `e` in the sum table when it is a constructor's
-# type-qualified entry. The environment stores entries by name and a
-# module's delta serialises them so: this is the one place that key is
-# read back into the declarations it was registered for.
-fn ty_vix_add(vx: VariantIndex[TyEntry], homes: TyHomes, e: TyEntry) : VariantIndex[TyEntry] =
-  match vix_ctor_key(e.name) {
-    None -> vx
-    Some(CtorKey(_, cname)) -> {
-      let tsym = scheme_ret_sym(e.scheme)
-      if sym_raw(tsym) < 0 { vx } else { vix_prepend(vx, tsym, ty_ctor_sym(homes, tsym, cname), e) }
-    }
-  }
-
-# The declaration of the constructor spelled `cname` of the sum `tsym`
-# declares: the symbol table homes a constructor at its type's module,
-# and the runtime's own at the reserved core home. Absent when the
-# type-home table does not hold the sum.
-fn ty_ctor_sym(homes: TyHomes, tsym: SymId, cname: String) : SymId =
-  if core_ty_is(tsym, CtOption) or core_ty_is(tsym, CtResult) { sym_derive(NCCtor, cname, core_type_home()) }
-  else { match tsh_decl_home(homes, tsym) {
-    Some(h) -> sym_derive(NCCtor, cname, h)
-    None    -> sym_none()
-  } }
 
 # The declaration of the nominal type a scheme builds, as a function's
 # result or as the type itself; absent when it builds none.
@@ -16982,60 +17013,113 @@ fn scheme_ret_sym(sc: TyScheme) : SymId = match sc {
   Scheme(_, _, _, _, ty)               -> ut_ty_sym(ty)
 }
 
-# The constructor part of a constructor's type-qualified entry.
-fn ty_ctor_name(e: TyEntry) : String = match vix_ctor_key(e.name) {
-  Some(CtorKey(_, c)) -> c
-  None                -> e.name
+# The ids of the constructors the environment binds for the sum `tsym`,
+# newest first.
+fn sum_ctor_ids(env: TyEnv, tsym: SymId) : [SymId] =
+  sym_list_unique(map(env_ctors(env, tsym), (e) => env_key_sym(e.key)), [])
+
+fn sym_list_unique(xs: [SymId], acc: [SymId]) : [SymId] = match xs {
+  []           -> list_reverse(acc)
+  [x, ...rest] -> sym_list_unique(rest, if sym_list_has(acc, x) { acc } else { [x, ...acc] })
 }
 
 # The constructors of the sum `tsym` declares, as an arm spells them,
 # newest first.
 fn sum_ctor_names(env: TyEnv, tsym: SymId) : [String] =
-  union_merge_unique([], map(vix_chain(env.vindex, tsym), ty_ctor_name))
+  union_merge_unique([], sym_names(env.tab, sum_ctor_ids(env, tsym)))
 
 # A constructor as the sum table answers for it: its declaration, and
 # the entry it was registered with.
 type CtorPick = CtorPick(SymId, TyEntry)
 
+# The constructor `c` as the environment binds it.
+fn ctor_entry(env: TyEnv, c: SymId) : Option[CtorPick] = match vix_of_ctor(env.vindex, c) {
+  [e, ..._] -> Some(CtorPick(c, e))
+  []        -> None
+}
+
 # The constructor spelled `cname` of the sum `tsym` declares: a written
-# name is turned into the declaration it would be at the sum's home, and
-# the table answers by that id. Two sums of one module may declare the
-# name, so the sum is checked too.
+# name is turned into the declarations that spell it, and the sum table
+# answers for the one `tsym` declares. The runtime's own are no module's
+# and are derived from the name.
 fn sum_ctor(env: TyEnv, tsym: SymId, cname: String) : Option[CtorPick] =
   if sym_raw(tsym) < 0 { None }
-  else {
-    let csym = ty_ctor_sym(env.ty_homes, tsym, cname)
-    match find(vix_of_ctor(env.vindex, csym), (e) => sym_same(scheme_ret_sym(e.scheme), tsym)) {
-      Some(e) -> Some(CtorPick(csym, e))
-      None    -> None
-    }
-  }
+  else if sym_is_core_sum(tsym) { sum_ctor_among(env, tsym, [core_ctor_sym(cname)]) }
+  else { sum_ctor_among(env, tsym, st_candidates(env.tab, NCCtor, cname)) }
 
-fn sum_ctor_scheme(env: TyEnv, tsym: SymId, cname: String) : Option[TyScheme] =
-  match sum_ctor(env, tsym, cname) {
-    Some(CtorPick(_, e)) -> Some(e.scheme)
-    None                 -> None
+fn sum_ctor_among(env: TyEnv, tsym: SymId, cs: [SymId]) : Option[CtorPick] = match cs {
+  [] -> None
+  [c, ...rest] -> match find(vix_of_ctor(env.vindex, c), (e) => sym_same(scheme_ret_sym(e.scheme), tsym)) {
+    Some(e) -> Some(CtorPick(c, e))
+    None    -> sum_ctor_among(env, tsym, rest)
   }
+}
 
-#[doc("infer: the scheme of the constructor the declaration `csym` names, or None when the sum table holds none.")]
-pub fn ty_env_lookup_ctor_sym(env: TyEnv, csym: SymId) : Option[TyScheme] =
-  match vix_of_ctor(env.vindex, csym) {
-    [e, ..._] -> Some(e.scheme)
-    []        -> None
-  }
-
-# What a match on the type `tsym` declares must cover: its
+# The names a diagnostic lists for the type `tsym` declares: its
 # constructors, then the components no constructor stands for (a
 # variant naming a declared type registers none).
 fn variants_of_type(env: TyEnv, tsym: SymId) : [String] =
-  union_merge_unique(sum_ctor_names(env, tsym), union_component_names(env.unions, tsym))
+  union_merge_unique(sum_ctor_names(env, tsym), union_component_names(env.tab, env.unions, tsym))
 
-# True when a scheme builds a nominal type, whether or not that type
-# carries an identity.
-fn scheme_builds_nominal(sc: TyScheme) : Bool = match sc {
-  Scheme(_, _, _, _, TyFnT(_, TyCon(_, _, _, _), _)) -> true
-  Scheme(_, _, _, _, TyCon(_, _, _, _))              -> true
-  _                                                   -> false
+# One variant of a sum as a match reads it: its constructor, and the
+# type its name denotes — a declared type of that name, else the
+# constructor itself.
+type SumVar = SumVar(SymId, SymId)
+
+fn sum_var_ctor(v: SumVar) : SymId = match v { SumVar(c, _) -> c }
+
+fn sum_var_names(v: SumVar, t: SymId) : Bool = match v {
+  SumVar(_, comp) -> sym_raw(t) >= 0 and sym_same(comp, t)
+}
+
+# The variants of the sum `tsym` declares, in declaration order. A union
+# row lists one component per variant, in the same order.
+fn sum_vars(st: InferState, tsym: SymId) : [SumVar] = match sum_find(st.sums, tsym) {
+  Some(SI(_, _, vs, _)) -> sum_vars_zip(vs, ut_components(st.env.unions, tsym))
+  None                  -> []
+}
+
+fn sum_vars_zip(vs: [Variant], comps: [Ty]) : [SumVar] = match vs {
+  [] -> []
+  [Var(c, _), ...rest] -> match comps {
+    [t, ...more] -> [SumVar(c, ut_ty_sym(t)), ...sum_vars_zip(rest, more)]
+    []           -> [SumVar(c, sym_none()), ...sum_vars_zip(rest, [])]
+  }
+}
+
+fn sum_var_of(vars: [SumVar], c: SymId) : SumVar = match find(vars, (v) => sym_same(sum_var_ctor(v), c)) {
+  Some(v) -> v
+  None    -> SumVar(c, sym_none())
+}
+
+# What a match on the type `tsym` declares must cover: its
+# constructors, newest first, then the variants no constructor is bound
+# for (a variant naming a declared type registers none).
+fn match_needs(st: InferState, tsym: SymId) : [SumVar] =
+  if sym_raw(tsym) < 0 { [] }
+  else {
+    let vars = sum_vars(st, tsym)
+    let bound = sum_ctor_ids(st.env, tsym)
+    list_append(map(bound, (c) => sum_var_of(vars, c)),
+                filter(vars, (v) => match v { SumVar(c, t) -> sym_raw(t) >= 0 and not sym_list_has(bound, c) }))
+  }
+
+# The name a diagnostic lists a variant by.
+fn need_names(tab: SymTab, vs: [SumVar]) : [String] = sym_names(tab, map(vs, sum_var_ctor))
+
+# An arm of its constructor covers a variant. A variant no constructor
+# is bound for stands for a declared type: a record pattern of that
+# type covers it, and so do arms of every constructor the type declares.
+fn need_covered(st: InferState, arms: [Arm], v: SumVar) : Bool = match v {
+  SumVar(c, t) -> match ctor_entry(st.env, c) {
+    Some(_) -> arms_head(arms, c)
+    None    -> arms_head(arms, t) or sum_ctors_headed(st.env, arms, t)
+  }
+}
+
+fn sum_ctors_headed(env: TyEnv, arms: [Arm], t: SymId) : Bool = match sum_ctor_ids(env, t) {
+  [] -> false
+  cs -> all(cs, (x) => arms_head(arms, x))
 }
 
 fn union_merge_unique(a: [String], b: [String]) : [String] {
@@ -17049,21 +17133,21 @@ fn union_merge_unique(a: [String], b: [String]) : [String] {
 # Classify a sum's constructors for `variants[T]()`, which lists the
 # inhabitants of a nullary-only sum: its nullary constructors, the ones
 # that take arguments, or no constructor at all.
-type VariantsCheck = VCOk([String]) | VCNotSum | VCHasPayload([String])
+type VariantsCheck = VCOk([SymId]) | VCNotSum | VCHasPayload([SymId])
 
 fn check_variants_nullary(env: TyEnv, tsym: SymId) : VariantsCheck =
-  check_variants_nullary_rows(vix_chain(env.vindex, tsym), [], [])
+  check_variants_nullary_rows(env_ctors(env, tsym), [], [])
 
 # The chain is newest first, so prepending restores declaration order,
 # which `variants[T]()` guarantees.
-fn check_variants_nullary_rows(rows: [TyEntry], ok_acc: [String], err_acc: [String]) : VariantsCheck =
+fn check_variants_nullary_rows(rows: [TyEntry], ok_acc: [SymId], err_acc: [SymId]) : VariantsCheck =
   match rows {
     [] -> if list_is_empty(ok_acc) and list_is_empty(err_acc) { VCNotSum }
           else if list_is_empty(err_acc) { VCOk(ok_acc) }
           else { VCHasPayload(err_acc) }
     [e, ...rest] ->
-      if scheme_takes_args(e.scheme) { check_variants_nullary_rows(rest, ok_acc, [ty_ctor_name(e), ...err_acc]) }
-      else { check_variants_nullary_rows(rest, [ty_ctor_name(e), ...ok_acc], err_acc) }
+      if scheme_takes_args(e.scheme) { check_variants_nullary_rows(rest, ok_acc, [env_key_sym(e.key), ...err_acc]) }
+      else { check_variants_nullary_rows(rest, [env_key_sym(e.key), ...ok_acc], err_acc) }
   }
 
 fn scheme_takes_args(sc: TyScheme) : Bool = match sc {
@@ -17071,14 +17155,14 @@ fn scheme_takes_args(sc: TyScheme) : Bool = match sc {
   _                                      -> false
 }
 
-fn find_missing_variants(needed: [String], arms: [Arm], acc: [String]) : [String] {
+fn find_missing_variants(st: InferState, needed: [SumVar], arms: [Arm], acc: [SumVar]) : [SumVar] {
   match needed {
     [] -> list_reverse(acc)
     [v, ...rest] -> {
-      if arms_cover_variant(arms, v) {
-        find_missing_variants(rest, arms, acc)
+      if need_covered(st, arms, v) {
+        find_missing_variants(st, rest, arms, acc)
       } else {
-        find_missing_variants(rest, arms, [v, ...acc])
+        find_missing_variants(st, rest, arms, [v, ...acc])
       }
     }
   }
@@ -17087,14 +17171,14 @@ fn find_missing_variants(needed: [String], arms: [Arm], acc: [String]) : [String
 # Inverse of find_missing_variants — used by the match diagnostics to print
 # the "covered:" note alongside "missing:". Walking the needed list
 # again is cheaper than caching given the small variant counts.
-fn find_covered_variants(needed: [String], arms: [Arm], acc: [String]) : [String] {
+fn find_covered_variants(st: InferState, needed: [SumVar], arms: [Arm], acc: [SumVar]) : [SumVar] {
   match needed {
     [] -> list_reverse(acc)
     [v, ...rest] -> {
-      if arms_cover_variant(arms, v) {
-        find_covered_variants(rest, arms, [v, ...acc])
+      if need_covered(st, arms, v) {
+        find_covered_variants(st, rest, arms, [v, ...acc])
       } else {
-        find_covered_variants(rest, arms, acc)
+        find_covered_variants(st, rest, arms, acc)
       }
     }
   }
@@ -17163,7 +17247,7 @@ fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int
 # Arms naming every constructor can still miss a value: a guard, a literal
 # or a nested pattern narrows what an arm covers.
 fn check_exhaustive_matrix(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState / Console + File =
-  match x_match_verdict(arms, XCtors((cn) => x_ctor_entry(st, cn, scr_ty))) {
+  match x_match_verdict(arms, XCtors((c) => x_ctor_entry(st, c, scr_ty))) {
     XMissing([w, ..._]) -> report_uncovered(st, w, line, col)
     _                   -> st
   }
@@ -17177,59 +17261,65 @@ fn report_uncovered(st: InferState, w: String, line: Int, col: Int) : InferState
   st_bump_err(st_push_diag(st, mk_diag(SevError, st.file, line, col, header, [ri_help(st.file, line, col, help_msg)])))
 }
 
-# A constructor's siblings. A name the scrutinee's type does not declare is
-# looked up bare, and left unplaced when more than one type declares it:
-# the check then answers unknown rather than read the wrong type.
-fn x_ctor_entry(st: InferState, cn: String, scr_ty: Ty) : Option[[XSib]] =
-  match x_ctor_scheme(st.env, cn, scr_ty) {
-    Some(sc) -> Some(x_ctor_siblings(st.env, cn, sc))
-    None     -> match rec_find(st.recs, cn) {
-      Some(_) -> Some([XSib(cn, cn)])
+# A constructor's siblings. One the scrutinee's type does not declare is
+# left unplaced when more than one type declares its name: the check
+# then answers unknown rather than read the wrong type.
+fn x_ctor_entry(st: InferState, c: SymId, scr_ty: Ty) : Option[[XSib]] =
+  match x_ctor_scheme(st.env, c, scr_ty) {
+    Some(sc) -> Some(x_ctor_siblings(st, c, sc))
+    None     -> match rec_find(st.recs, c) {
+      Some(_) -> Some([XSib(c, written_text(decl_name(st.env.tab, c)))])
       None    -> None
     }
   }
 
-fn x_ctor_scheme(env: TyEnv, cn: String, scr_ty: Ty) : Option[TyScheme] = {
-  let own = sum_ctor_scheme(env, ut_ty_sym(scr_ty), cn)
-  match own {
-    Some(sc) -> Some(sc)
-    None     -> if x_ctor_ambiguous(env, cn) { None } else { ty_env_lookup(env, cn) }
+fn x_ctor_scheme(env: TyEnv, c: SymId, scr_ty: Ty) : Option[TyScheme] = match ctor_entry(env, c) {
+  None -> None
+  Some(CtorPick(_, e)) ->
+    if sym_same(scheme_ret_sym(e.scheme), ut_ty_sym(scr_ty)) and sym_raw(ut_ty_sym(scr_ty)) >= 0 { Some(e.scheme) }
+    else if x_ctor_ambiguous(env, written_text(decl_name(env.tab, c))) { None }
+    else { Some(e.scheme) }
+}
+
+fn x_ctor_ambiguous(env: TyEnv, cn: String) : Bool = {
+  let users = user_sums_declaring(env, cn)
+  match ctor_entry(env, core_ctor_sym(cn)) {
+    Some(_) -> not list_is_empty(users)
+    None    -> list_length(users) > 1
   }
 }
 
-fn x_ctor_ambiguous(env: TyEnv, cn: String) : Bool = match ty_env_lookup(env, cn) {
-  None -> false
-  Some(sc) ->
-    if not scheme_builds_nominal(sc) { true }
-    else if sym_is_core_sum(scheme_ret_sym(sc)) { not list_is_empty(ty_env_qualified_parents_excluding_builtin(env, cn)) }
-    else { list_length(ty_env_qualified_parents(env, cn)) > 1 }
-}
-
-# A type with no variant list has the one constructor.
-fn x_ctor_siblings(env: TyEnv, cn: String, sc: TyScheme) : [XSib] = {
+# A type with no variant list has the one constructor. A variant no
+# constructor is bound for is headed by a record pattern of its type.
+fn x_ctor_siblings(st: InferState, c: SymId, sc: TyScheme) : [XSib] = {
   let tsym = scheme_ret_sym(sc)
-  match variants_of_type(env, tsym) {
-    []   -> [XSib(cn, cn)]
-    sibs -> map(sibs, (s) => XSib(s, x_ctor_spelling(env, s, tsym)))
+  let tab = st.env.tab
+  match match_needs(st, tsym) {
+    []   -> [XSib(c, written_text(decl_name(tab, c)))]
+    sibs -> map(sibs, (v) => match v {
+      SumVar(s, t) -> match ctor_entry(st.env, s) {
+        Some(CtorPick(_, e)) -> XSib(s, x_ctor_spelling(written_text(decl_name(tab, s)), e.scheme))
+        None                 -> XSib(t, written_text(decl_name(tab, s)))
+      }
+    })
   }
 }
 
-fn x_ctor_spelling(env: TyEnv, cn: String, tsym: SymId) : String =
-  match sum_ctor_scheme(env, tsym, cn) {
-    Some(Scheme(_, _, _, _, TyFnT(params, _, _))) ->
-      if list_is_empty(params) { cn } else { concat_all([cn, "(", inf_join_with(map(params, (p) => "_"), ", "), ")"]) }
-    _ -> cn
-  }
+fn x_ctor_spelling(cn: String, sc: TyScheme) : String = match sc {
+  Scheme(_, _, _, _, TyFnT(params, _, _)) ->
+    if list_is_empty(params) { cn } else { concat_all([cn, "(", inf_join_with(map(params, (p) => "_"), ", "), ")"]) }
+  _ -> cn
+}
 
 fn check_exhaustive_ctors(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int) : InferState / Console + File {
 
   if has_catch_all(arms) { st }
   else {
     match scr_ty {
-      TyCon(_, tycon, _, scr_sym) -> {
+      TyCon(scr_sym, _) -> {
         # The declaration decides: a type spelled alike elsewhere, of
         # any arity, has its own constructors.
-        let needed = variants_of_type(st.env, scr_sym)
+        let needed = match_needs(st, scr_sym)
         match needed {
           [] -> st                     # unknown sum (e.g. Int, lists): skip
           _  -> {
@@ -17260,15 +17350,15 @@ fn check_exhaustive_ctors(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, co
             # `env.unions`, so this trigger preserves the existing
             # flat behavior for those.
             if any_arm_is_narrow(arms) or is_union_of_types(st.env, scr_sym) {
-              check_union_components_under_tycon(st, arms, tycon, scr_sym, needed, line, col)
+              check_union_components_under_tycon(st, arms, scr_sym, needed, line, col)
             } else {
-              let missing = find_missing_variants(needed, arms, [])
+              let missing = need_names(st.env.tab, find_missing_variants(st, needed, arms, []))
               match missing {
                 [] -> st
                 _  -> {
-                  let header = "non-exhaustive match on #{tycon}: missing #{inf_join_with(missing, ", ")}"
+                  let header = "non-exhaustive match on #{decl_name(st.env.tab, scr_sym)}: missing #{inf_join_with(missing, ", ")}"
                   diag_error(st.file, line, col, header)
-                  let covered = find_covered_variants(needed, arms, [])
+                  let covered = need_names(st.env.tab, find_covered_variants(st, needed, arms, []))
                   emit_nonexhaustive_notes(missing, covered)
                   # T2 collected diagnostic.
                   let d = build_nonexhaustive_diag(st.file, line, col, header, missing, covered)
@@ -17314,20 +17404,21 @@ fn check_union_component(st: InferState, arms: [Arm], comp: Ty,
 
 
   match comp {
-    TyCon(_, tycon, _, csym) -> {
+    TyCon(csym, _) -> {
       if arms_cover_narrow(st, arms, csym) { st }
       else {
-        let needed = variants_of_type(st.env, csym)
+        let needed = match_needs(st, csym)
         match needed {
           [] -> st       # not a sum component (record / primitive); skip
           _  -> {
-            let missing = find_missing_variants(needed, arms, [])
+            let missing = need_names(st.env.tab, find_missing_variants(st, needed, arms, []))
             match missing {
               [] -> st
               _  -> {
+                let tycon = written_text(decl_name(st.env.tab, csym))
                 let header = "non-exhaustive match: missing #{inf_join_with(missing, ", ")} (component of #{tycon})"
                 diag_error(st.file, line, col, header)
-                let covered = find_covered_variants(needed, arms, [])
+                let covered = need_names(st.env.tab, find_covered_variants(st, needed, arms, []))
                 emit_missing_notes(missing)
                 match covered {
                   [] -> ()
@@ -17400,40 +17491,42 @@ fn any_arm_is_narrow(arms: [Arm]) : Bool {
 }
 
 # walk the variants of a top-level TyCon. For
-# each variant name `c` we ask: is `c` itself a declared type with
+# each variant we ask: does it stand for a declared type with
 # its own sub-variants (a component of a union-of-types parent)? If
 # so, treat it as a component — covered iff a PNarrow arm targets
 # it OR all of its sub-variants are covered. Otherwise it's an
 # atomic variant and we check direct arm coverage.
-fn check_union_components_under_tycon(st: InferState, arms: [Arm], parent: String, psym: SymId,
-                                        comps: [String], line: Int, col: Int) : InferState / Console + File {
+fn check_union_components_under_tycon(st: InferState, arms: [Arm], psym: SymId,
+                                        comps: [SumVar], line: Int, col: Int) : InferState / Console + File {
 
 
   match comps {
     [] -> st
     [c, ...rest] -> {
-      let st1 = check_one_union_comp(st, arms, parent, psym, c, line, col)
-      check_union_components_under_tycon(st1, arms, parent, psym, rest, line, col)
+      let st1 = check_one_union_comp(st, arms, psym, c, line, col)
+      check_union_components_under_tycon(st1, arms, psym, rest, line, col)
     }
   }
 }
 
-fn check_one_union_comp(st: InferState, arms: [Arm], parent: String, psym: SymId, comp: String,
+fn check_one_union_comp(st: InferState, arms: [Arm], psym: SymId, v: SumVar,
                           line: Int, col: Int) : InferState / Console + File {
 
 
-  let csym = ut_component_named(st.env.unions, psym, comp)
+  let csym = match v { SumVar(_, t) -> t }
+  let comp = written_text(decl_name(st.env.tab, sum_var_ctor(v)))
   if arms_cover_narrow(st, arms, csym) { st }
   else {
-    # If `comp` is itself a declared type with its own variants,
+    # If the variant stands for a declared type with its own variants,
     # this is a component of a union-of-types decl. Walk its
     # variants and require each to be covered.
-    let sub_variants = variants_of_type(st.env, csym)
+    let sub_variants = match_needs(st, csym)
     match sub_variants {
       [] -> {
         # Atomic variant of `parent` — direct coverage required.
-        if arms_cover_variant(arms, comp) { st }
+        if arms_head(arms, sum_var_ctor(v)) or arms_head(arms, csym) { st }
         else {
+          let parent = written_text(decl_name(st.env.tab, psym))
           let header = "non-exhaustive match on #{parent}: missing #{comp}"
           diag_error(st.file, line, col, header)
           diag_note("missing variant: `#{comp}`")
@@ -17449,13 +17542,13 @@ fn check_one_union_comp(st: InferState, arms: [Arm], parent: String, psym: SymId
         }
       }
       _ -> {
-        let missing = find_missing_variants(sub_variants, arms, [])
+        let missing = need_names(st.env.tab, find_missing_variants(st, sub_variants, arms, []))
         match missing {
           [] -> st
           _  -> {
             let header = "non-exhaustive match: missing #{inf_join_with(missing, ", ")} (component of #{comp})"
             diag_error(st.file, line, col, header)
-            let covered = find_covered_variants(sub_variants, arms, [])
+            let covered = need_names(st.env.tab, find_covered_variants(st, sub_variants, arms, []))
             emit_missing_notes(missing)
             match covered {
               [] -> ()
@@ -17582,7 +17675,8 @@ fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int,
       Arm(pat, guard, body) -> {
         let outer = st
         let st_dup = check_pattern_no_dup_binds(st, pat)
-        let s_p = check_pattern(st_dup, pat, scrut_ty)
+        let pc = check_pattern_stamped(st_dup, pat, scrut_ty)
+        let s_p = pc.st
         let guard_res = match guard {
           None -> InferredOptExpr { st: s_p, expr: None }
           Some(gx) -> {
@@ -17595,7 +17689,7 @@ fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int,
         let s_b = st_unify(rb.st, body_ty, rb.ty, "match arm", body.line, body.col)
         let s_scoped = st_restore_entries(outer, s_b)
         let rr = synth_arms(s_scoped, rest, scrut_ty, body_ty, line, col)
-        InferredArms { st: rr.st, arms: [Arm(pat, guard_res.expr, rb.expr), ...rr.arms] }
+        InferredArms { st: rr.st, arms: [Arm(pc.pat, guard_res.expr, rb.expr), ...rr.arms] }
       }
     }
   }
@@ -17604,11 +17698,11 @@ fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int,
 # ---- per-decl entry + dumper ----
 
 # One `row <fn> <eff>#<id>` line per label the body's row carries.
-fn print_sig_ids(nm: String, ls: [RowLabel]) : Unit / Console = match ls {
+fn print_sig_ids(tab: SymTab, nm: String, ls: [RowLabel]) : Unit / Console = match ls {
   [] -> ()
-  [RL(n, _, s), ...rest] -> {
-    print("sig #{nm} #{n}##{int_to_string(sym_raw(s))}")
-    print_sig_ids(nm, rest)
+  [RL(r, _), ...rest] -> {
+    print("sig #{nm} #{ref_text(tab, r)}##{int_to_string(sym_raw(ref_sym(r)))}")
+    print_sig_ids(tab, nm, rest)
   }
 }
 
@@ -17618,17 +17712,17 @@ fn row_expr_labels(r: RowExpr) : [RowLabel] = match r {
   ROpen(_, ls) -> ls
 }
 
-fn print_row_ids(nm: String, row: [Label]) : Unit / Console = match row {
+fn print_row_ids(tab: SymTab, nm: String, row: [Label]) : Unit / Console = match row {
   [] -> ()
   [l, ...rest] -> {
-    print("row #{nm} #{l.eff}##{int_to_string(sym_raw(l.sym))}")
-    print_row_ids(nm, rest)
+    print("row #{nm} #{decl_name(tab, l.sym)}##{int_to_string(sym_raw(l.sym))}")
+    print_row_ids(tab, nm, rest)
   }
 }
 
-fn print_inferred_fn(nm: String, final_ret: Ty, param_tys: [Ty], line: Int, col: Int) : Unit / Console {
+fn print_inferred_fn(tab: SymTab, nm: String, final_ret: Ty, param_tys: [Ty], line: Int, col: Int) : Unit / Console {
   let fn_t = fn_ty(param_tys, final_ret)
-  print("fn #{nm} : #{inf_ty_to_string(fn_t)} @#{int_to_string(line)}:#{int_to_string(col)}")
+  print("fn #{nm} : #{inf_ty_to_string(tab, fn_t)} @#{int_to_string(line)}:#{int_to_string(col)}")
 }
 
 # A CallSite whose fresh var ids have been resolved via the final
@@ -17642,7 +17736,7 @@ fn print_inferred_fn(nm: String, final_ret: Ty, param_tys: [Ty], line: Int, col:
 # Hanga Roa note for why downstream consumers need it.
 #[doc("infer: a resolved call-site instantiation consumed by monomorphisation.")]
 #[derive(BinSerialize)]
-pub type ResolvedCS = RCS(String, Int, Int, [Ty], [UnitExprT], Option[String])  # name, line, col, concrete tys, concrete units, module_origin
+pub type ResolvedCS = RCS(SymId, Int, Int, [Ty], [UnitExprT], Option[String])  # declaration, line, col, concrete tys, concrete units, module_origin
 
 fn resolve_callsite_tys(ids: [Int], sub: Subst) : [Ty] {
   match ids {
@@ -17667,8 +17761,8 @@ fn resolve_callsites(css: [CallSite], sub: Subst, mo: Option[String]) : [Resolve
       # tagging them with the enclosing DFn's `module_origin` is
       # correct and avoids threading home_mod through every
       # InferState constructor (28 of them).
-      CS(nm, line, col, ids, uids, _) ->
-        [RCS(nm, line, col, resolve_callsite_tys(ids, sub),
+      CS(s, line, col, ids, uids, _) ->
+        [RCS(s, line, col, resolve_callsite_tys(ids, sub),
              resolve_callsite_units(uids, sub), mo), ...resolve_callsites(rest, sub, mo)]
     }
   }
@@ -17679,9 +17773,9 @@ fn resolve_callsites(css: [CallSite], sub: Subst, mo: Option[String]) : [Resolve
 # type from context but can remain a TyVarT if the hole sits in a
 # position that doesn't constrain (e.g. the whole body of a fn with
 # no declared return).
-#[doc("infer: the function a hole sits in and its parameter names, or none for a hole outside a function.")]
+#[doc("infer: the function a hole sits in and its parameters' binders, or none for a hole outside a function.")]
 #[derive(BinSerialize)]
-pub type HoleOwner = HOwner(String, [String]) | HNoOwner
+pub type HoleOwner = HOwner(SymId, [LocalId]) | HNoOwner
 
 #[doc("infer: the effects a hole's context makes available — any, under an open row; else the declared labels, the enclosing handlers' labels, and whether `main`'s default-handled effects are absorbed.")]
 #[derive(BinSerialize)]
@@ -17700,9 +17794,9 @@ pub type ResolvedHole = RH(HoleKind, Int, Int, Ty, [TyEntry], Int, HoleOwner, Ho
 # Fields:
 #   - source name (`Some("e")` for `?e`, `None` for bare `?`)
 #   - source line/col (location of the `?` token in the input file)
-#   - enclosing fn name
+#   - enclosing fn
 #   - resolved Row (apply_row of the row-var the hole was bound to)
-#   - body_row: labels actually performed by the fn's body. Useful
+#   - body_row: effects actually performed by the fn's body. Useful
 #     because `check_body_row` skips unification when the declared
 #     row is `ROpen` (a hole IS an open row), so `resolved` is often
 #     just the unbound tail variable. Consumers (LLMs) want to know
@@ -17710,7 +17804,7 @@ pub type ResolvedHole = RH(HoleKind, Int, Int, Ty, [TyEntry], Int, HoleOwner, Ho
 #     the order labels were first encountered during inference.
 #[doc("infer: `ResolvedRowHole` — driver-facing type.")]
 #[derive(BinSerialize)]
-pub type ResolvedRowHole = RRH(Option[String], Int, Int, String, Row, [String])
+pub type ResolvedRowHole = RRH(Option[String], Int, Int, SymId, Row, [SymId])
 
 # Parse an internal row-hole placeholder name back into its
 # components. Mirrors the format minted by parse_row_labels:
@@ -17800,18 +17894,18 @@ fn parse_decimal_loop(s: String, i: Int, n: Int, acc: Int, any: Bool) : Option[I
 # typed-hole resolutions and belong to a different reporter.
 fn extract_row_holes(d: Decl, rbinds: [RVBind], sub: Subst, body_row: [Label]) : [ResolvedRowHole] {
   match d {
-    DFn(_, fn_name, _, _, _, _, _, _, _, _, fsym) -> {
+    DFn(_, fid, _, _, _, _, _, _, _, _) -> {
       let names = collect_decl_rvars(d)
-      let body_labels = map(apply_labels(sub, body_row), (l) => l.eff)
-      extract_row_holes_loop(names, fn_name, rbinds, sub, body_labels, [])
+      let body_labels = map(apply_labels(sub, body_row), (l) => l.sym)
+      extract_row_holes_loop(names, fnid_sym(fid), rbinds, sub, body_labels, [])
     }
     _ -> []
   }
 }
 
-fn extract_row_holes_loop(names: [String], fn_name: String,
+fn extract_row_holes_loop(names: [String], fn_name: SymId,
                            rbinds: [RVBind], sub: Subst,
-                           body_labels: [String],
+                           body_labels: [SymId],
                            acc: [ResolvedRowHole]) : [ResolvedRowHole] {
   match names {
     [] -> list_reverse(acc)
@@ -17916,7 +18010,8 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
 
 
   match d {
-    DFn(is_pub, nm, tparams, ps, opt_ret, row, body, line, col, mo, fsym) -> {
+    DFn(is_pub, fid, tparams, ps, opt_ret, row, body, line, col, mo) -> {
+      let nm = written_text(decl_name(env.tab, fnid_sym(fid)))
       # row-variable binding context for this decl. The
       # bound ids match those produced by fn_scheme_of_decl so the
       # body's params and any internal references to row-poly user
@@ -17960,7 +18055,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # Without this advance, the inferencer's first fresh row var
       # would alias `phantom_id = len(rbinds)`, which the scheme
       # already quantifies over.
-      let entry = decl_is_entry(env.ty_homes, mo, fsym)
+      let entry = decl_is_entry(env.ty_homes, mo, fid)
       let phantom_extra = if elaborate_phantom_row(row, entry) { 1 } else { 0 }
       let st0 = advance_row_fresh(InferState { ...st_init, sig_rows: rbinds }, list_length(rbinds) + phantom_extra)
       # mk_tpbinds allocates ids 0..n-1 for the fn-level tparams, but
@@ -18051,7 +18146,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # the type-annotation line. Internal stdlib helpers
       # (spawn.spawn, etc.) are exempt by file-path because they are
       # the legitimate constructors of Fiber[T] values.
-      let st1b = check_no_fiber_escape(st1, file, nm, opt_ret, sums, line, col)
+      let st1b = check_no_fiber_escape(st1, file, fnid_sym(fid), nm, opt_ret, sums, line, col)
       # Mutable masking. Drop `Mutable` from the
       # inferred row when every `array_set` / `array_grow` demand
       # the body raised targets a locally-constructed Array that
@@ -18079,9 +18174,9 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       let hd = drain_deferred_homs(st2f, list_reverse(st2f.deferred_homs), [])
       let st2 = hd.st
       let _ = if verbose {
-        print_inferred_fn(nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
-        print_row_ids(nm, st2.row)
-        print_sig_ids(nm, row_expr_labels(row))
+        print_inferred_fn(env.tab, nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
+        print_row_ids(env.tab, nm, st2.row)
+        print_sig_ids(env.tab, nm, row_expr_labels(row))
       } else { () }
       # Hanga Roa: tag every call-site instance with the enclosing
       # DFn's module_origin so downstream consumers (`--dump-mono`,
@@ -18089,7 +18184,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # instances authored in the user's root file from those that
       # come through core or other modules.
       let resolved0 = resolve_callsites(list_reverse(st2.insts), st2.sub, mo)
-      let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub, HOwner(nm, map(ps, (p) => p.pname)), fn_hole_row(st2, entry, row))
+      let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub, HOwner(fnid_sym(fid), map(ps, (p) => p.binder.id)), fn_hole_row(st2, entry, row))
       # apply the final substitution to every
       # `Expr.ty` annotation in the body so the post-inference protocol-
       # call rewrite can read concrete head types from sites whose
@@ -18152,14 +18247,14 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       let row_holes = extract_row_holes(d, rbinds, st2.sub, st2.row)
       let stamp = (te: TypeExpr) => resolve_ty_with_binds(te, tpbinds, rbinds, env.row_kind, env_home_view(env, mo))
       TypedDecl {
-        decl: DFn(is_pub, nm, tparams, stamp_params(ps, stamp), stamp_opt(opt_ret, stamp), stamp_row_with(final_row, stamp),
-                  final_body, line, col, mo, fsym),
+        decl: DFn(is_pub, fid, tparams, stamp_params(ps, stamp), stamp_opt(opt_ret, stamp), stamp_row_with(final_row, stamp),
+                  final_body, line, col, mo),
         errs: st2.errs,
         insts: resolved,
         holes: hole_reports,
         row_holes: row_holes,
         diags: finalize_diags(st2.diags),
-        op_res: stamp_op_res_fname(list_reverse(st2.op_res), nm)
+        op_res: stamp_op_res_fn(list_reverse(st2.op_res), fid)
       }
     }
     # `test` / `bench` / `check` bodies were previously
@@ -18169,7 +18264,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
     # cross-module name (`repeat("x", 3)` with both `string.repeat` and
     # `list.repeat` in scope) then resolved to the wrong candidate. Run
     # the same body walk a paramless `fn` gets so the typed AST carries
-    # resolved `EModCall` callees. `check` blocks bind their `with`
+    # resolved callees. `check` blocks bind their `with`
     # params first. The body is run like `main`'s REmpty row (the test
     # harness installs the identical builtin default handlers), so
     # `print`/`assert` and effecting helpers type without a declared row.
@@ -18182,10 +18277,10 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
     DCheck(_, ps, body, line, col, _) -> infer_test_body(file, env, core_len, recs,
       op_eff_arities, type_aliases, op_to_eff, sums, protos, all_decls,
       kind_theories, ps, body, d, line, col)
-    DConst(is_pub, cname, cte, cbody, mo, line, col, csym) ->
+    DConst(is_pub, csym, cte, cbody, mo, line, col) ->
       infer_const_body(file, env, core_len, recs, op_eff_arities, type_aliases,
                        op_to_eff, sums, protos, kind_theories,
-                       is_pub, cname, cte, cbody, mo, line, col, csym)
+                       is_pub, csym, cte, cbody, mo, line, col)
     # `#[constructor]` wrapper: type-check the inner fn and unwrap it —
     # the marker has done its job (the registry was built in
     # `add_decls_loop`), so the emitter sees a plain `DFn`.
@@ -18206,7 +18301,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
 }
 
 # type-check a `test` / `bench` / `check` body so the typed
-# AST it produces carries resolved callees (`EModCall`) for downstream
+# AST it produces carries resolved callees for downstream
 # passes. Mirrors the paramless-`fn` slice of `infer_decl`'s DFn arm:
 # install the proto-impl + sum registries, add any `check` params to
 # scope, `synth` the body, then absorb the body's builtin effects the
@@ -18254,7 +18349,7 @@ fn infer_test_body(file: String, env: TyEnv, core_len: Int,
     holes: hole_reports,
     row_holes: [],
     diags: finalize_diags(st2.diags),
-    op_res: stamp_op_res_fname(list_reverse(st2.op_res), "main")
+    op_res: stamp_op_res_fn(list_reverse(st2.op_res), fnid_decl(entry_id(tsh_target(env.ty_homes))))
   }
 }
 
@@ -18263,15 +18358,16 @@ fn infer_test_body(file: String, env: TyEnv, core_len: Int,
 # literal coins against the resolved annotation first, then the
 # synthesised type is unified with the declared one so a mismatch is an
 # error rather than a value reaching codegen at a type it does not have.
-# The body is returned typed — emit and KIR inline it by name.
+# The body is returned typed — emit and KIR inline it.
 fn infer_const_body(file: String, env: TyEnv, core_len: Int,
                     recs: [RecInfo], op_eff_arities: [OpEffArity],
                     type_aliases: [AliasResult], op_to_eff: [OpToEff],
                     sums: [SumInfo], protos: ProtoView,
                     kind_theories: [KindTheory],
-                    is_pub: Bool, cname: String, cte: TypeExpr, cbody: Expr,
+                    is_pub: Bool, csym: SymId, cte: TypeExpr, cbody: Expr,
                     mo: Option[String], line: Int,
-                    col: Int, csym: SymId) : TypedDecl / Console + File + Mutable {
+                    col: Int) : TypedDecl / Console + File + Mutable {
+  let cname = written_text(decl_name(env.tab, csym))
   let st_init0 = infer_state_new_full_aliases(file, env, core_len, recs,
                                                 op_eff_arities, type_aliases, op_to_eff,
                                                 kind_theories)
@@ -18290,13 +18386,13 @@ fn infer_const_body(file: String, env: TyEnv, core_len: Int,
   let resolved = resolve_callsites(list_reverse(st2.insts), st2.sub, None)
   let final_body = hom_retarget(finalise_typed_expr(st2.sub, coerced.pair.expr), hd.picks)
   TypedDecl {
-    decl: DConst(is_pub, cname, cte, final_body, mo, line, col, csym),
+    decl: DConst(is_pub, csym, cte, final_body, mo, line, col),
     errs: st2.errs,
     insts: resolved,
     holes: resolve_holes(list_reverse(st2.holes), st2.sub, HNoOwner, HRowLabels([], [], false)),
     row_holes: [],
     diags: finalize_diags(st2.diags),
-    op_res: stamp_op_res_fname(list_reverse(st2.op_res), cname)
+    op_res: stamp_op_res_fn(list_reverse(st2.op_res), fnid_decl(csym))
   }
 }
 
@@ -18352,7 +18448,7 @@ fn finalise_typed_kind(s: Subst, k: ExprKind) : ExprKind =
 # into user-defined sum-type constructor payloads via the
 # `[SumInfo]` registry collected in `infer_program`. A
 # `type Boxed = Wrap(Fiber[Int])` return value used to escape the
-# shallow walker — its surface TypeExpr is `TyName("Boxed", [])`
+# shallow walker — its surface TypeExpr names `Boxed` alone
 # and the Fiber lives in the variant payload, not in the TypeExpr
 # the walker saw. The deep walker substitutes the type's tparams
 # into each variant's payload TypeExprs and recurses, with a
@@ -18369,17 +18465,18 @@ fn finalise_typed_kind(s: Subst, k: ExprKind) : ExprKind =
 # with no `n` parameter, so sibling-nursery brand mismatch is
 # unwritable in user code. Until the cap binding lands, the
 # brand-mismatch detection has no surface to attach to.
-fn check_no_fiber_escape(st: InferState, file: String, fname: String,
+fn check_no_fiber_escape(st: InferState, file: String, f: SymId, fname: String,
                           opt_ret: Option[TypeExpr], sums: [SumInfo],
                           line: Int, col: Int) : InferState / Console + File {
 
 
-  if is_fiber_producer_helper(fname) { st }
+  let hv = st_home_view(st)
+  if is_fiber_producer_helper(f) { st }
   else {
     match opt_ret {
       None -> st
       Some(rty) -> {
-        match ty_expr_find_handle("Fiber", rty, sums, []) {
+        match ty_expr_find_handle(hv, core_ty_sym(CtFiber), rty, sums, []) {
           Some(breach) -> {
             let lline = if rty.line > 0 { rty.line } else { line }
             let lcol  = if rty.col  > 0 { rty.col  } else { col  }
@@ -18389,11 +18486,11 @@ fn check_no_fiber_escape(st: InferState, file: String, fname: String,
             render_diag(perr)
             diag_note("a `Fiber[T]` handle is bound to the nursery that created it")
             diag_note("returning one from a function lets it outlive that scope")
-            emit_handle_breach_note("Fiber", breach)
+            emit_handle_breach_note(st.env.tab, "Fiber", breach)
             diag_help("process the fiber inside the nursery (e.g. with `spawn.await`), or pass a thunk in and a value out instead")
             st_bump_err(st_push_diag(st, perr))
           }
-          None -> match ty_expr_find_handle("Pid", rty, sums, []) {
+          None -> match ty_expr_find_handle(hv, core_ty_sym(CtPid), rty, sums, []) {
             Some(breach) -> {
               let lline = if rty.line > 0 { rty.line } else { line }
               let lcol  = if rty.col  > 0 { rty.col  } else { col  }
@@ -18403,7 +18500,7 @@ fn check_no_fiber_escape(st: InferState, file: String, fname: String,
               render_diag(perr)
               diag_note("a `Pid[Msg]` handle is bound to the actor scope that created it")
               diag_note("returning one from a function lets it outlive that scope")
-              emit_handle_breach_note("Pid", breach)
+              emit_handle_breach_note(st.env.tab, "Pid", breach)
               diag_help("process the pid inside the scope (e.g. with `Actor.send`), or pass a thunk in and a value out instead")
               st_bump_err(st_push_diag(st, perr))
             }
@@ -18420,14 +18517,14 @@ fn check_no_fiber_escape(st: InferState, file: String, fname: String,
 # see exactly which carrier smuggled the handle out. Direct
 # breaches (Fiber/Pid as a top-level type-arg or return type)
 # emit no extra note — the existing Fiber/Pid pointer is enough.
-fn emit_handle_breach_note(hname: String, breach: HandleBreach) : Unit / Console {
+fn emit_handle_breach_note(tab: SymTab, hname: String, breach: HandleBreach) : Unit / Console {
 
   match breach {
     HBDirect -> ()
-    HBSum(tname, cname) ->
+    HBSum(tsym, csym) ->
       diag_note(concat_all(["`", hname,
-                            "` is wrapped by constructor `", cname,
-                            "` of sum type `", tname, "`"]))
+                            "` is wrapped by constructor `", written_text(decl_name(tab, csym)),
+                            "` of sum type `", written_text(decl_name(tab, tsym)), "`"]))
   }
 }
 
@@ -18443,35 +18540,30 @@ fn emit_handle_breach_note(hname: String, breach: HandleBreach) : Unit / Console
 # The Pid producers `alloc_for_policy` and `spawn_actor` are also on
 # the list; both shape a Pid as part of the `with_mailbox`/`spawn_actor`
 # structured-concurrency surface.
-fn fiber_producer_helpers() : [String] =
-  ["spawn.spawn",
-   # qualified-call canonical names for
-   # stdlib/spawn.kai. `spawn` is the bare export reached via
-   # `spawn.spawn(f)`; `spawn.spawn` stays as the legacy alias.
-   "spawn",
-   # Tier 2 Pid surface helpers (stdlib/actor.kai).
-   "alloc_for_policy", "spawn_actor",
-   # explicit-policy spawn surface (stdlib/actor.kai).
-   "alloc_unowned_for_policy", "spawn_actor_policy"]
+fn is_fiber_producer_helper(f: SymId) : Bool = match known_fn_of(f) {
+  Some(_) -> true
+  None    -> sym_list_has(mailbox_alloc_helpers(), f)
+}
 
-fn is_fiber_producer_helper(fname: String) : Bool =
-  list_has(fiber_producer_helpers(), fname)
+# stdlib/actor.kai's private mailbox allocators.
+fn mailbox_alloc_helpers() : [SymId] =
+  [sym_derive(NCFn, "alloc_for_policy", "actor"), sym_derive(NCFn, "alloc_unowned_for_policy", "actor")]
 
 # (option (a)): a single deep walker
-# parameterised by the handle name (`Fiber` or `Pid`). Returns
+# parameterised by the handle type (`Fiber` or `Pid`). Returns
 # `Some(HBDirect)` for a top-level/recursive-shallow occurrence
 # (Fiber[Int], Result[_, Fiber[Int]], Option[Pid[Msg]], …) and
-# `Some(HBSum(tname, cname))` when the handle is hidden inside a
+# `Some(HBSum(type, constructor))` when the handle is hidden inside a
 # user-defined sum's variant payload (`type Boxed =
 # Wrap(Fiber[Int])`). The `visited` set guards recursive sums
 # (`type Tree[T] = Leaf(T) | Node(Tree[T], Tree[T])`).
-type HandleBreach = HBDirect | HBSum(String, String)
+type HandleBreach = HBDirect | HBSum(SymId, SymId)
 
 # A continuation stays on the fiber whose segment it suspended, inside the
 # handlers of what its body performs.
 fn check_cont_crossings(st: InferState, body: Expr) : InferState / Console + File =
-  foldl(cont_crossings(body, (t) => apply_ty(st.sub, t), (t) => ty_holds_cont(t, st.sums, st.recs, []),
-                       (t, es) => ty_cont_needs(t, es, st.sums, st.recs)), st,
+  foldl(cont_crossings(body, (t) => apply_ty(st.sub, t), (t) => ty_holds_cont(st_home_view(st), t, st.sums, st.recs, []),
+                       (t, es) => ty_cont_needs(st_home_view(st), t, es, st.sums, st.recs)), st,
         (acc, c) => match c {
           Crossing(msg, help, l, col) -> {
             diag_error(acc.file, l, col, msg)
@@ -18481,70 +18573,72 @@ fn check_cont_crossings(st: InferState, body: Expr) : InferState / Console + Fil
         })
 
 # A value of `t` holds a continuation, directly or in a field of a type it names.
-fn ty_holds_cont(t: Ty, sums: [SumInfo], recs: [RecInfo], seen: [String]) : Bool = match t {
-  TyCon(_, n, args, _) ->
-    is_cont_ty(t) or any(args, (a) => ty_holds_cont(a, sums, recs, seen)) or named_holds_cont(n, sums, recs, seen)
-  TyListT(x) -> ty_holds_cont(x, sums, recs, seen)
+fn ty_holds_cont(hv: TyHomeView, t: Ty, sums: [SumInfo], recs: [RecInfo], seen: [SymId]) : Bool = match t {
+  TyCon(s, args) ->
+    is_cont_ty(t) or any(args, (a) => ty_holds_cont(hv, a, sums, recs, seen)) or named_holds_cont(hv, s, sums, recs, seen)
+  TyListT(x) -> ty_holds_cont(hv, x, sums, recs, seen)
   _ -> false
 }
 
 # A value of `t` holds a continuation whose row names the effect `es`: a
 # `Cont` with it in its row, or a type holding one that `t` instantiates
 # with such a row.
-fn ty_cont_needs(t: Ty, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool = match cont_parts(t) {
-  Some(cp) -> row_arg_names(cp.row, es) or cont_needs_any([cp.arg, cp.answer], es, sums, recs)
-  None -> ty_cont_needs_in(t, es, sums, recs)
+fn ty_cont_needs(hv: TyHomeView, t: Ty, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool = match cont_parts(t) {
+  Some(cp) -> row_arg_names(cp.row, es) or cont_needs_any(hv, [cp.arg, cp.answer], es, sums, recs)
+  None -> ty_cont_needs_in(hv, t, es, sums, recs)
 }
 
-fn ty_cont_needs_in(t: Ty, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool = match t {
-  TyCon(_, n, args, _) -> cont_named_needs(n, args, es, sums, recs)
-  TyListT(x) -> ty_cont_needs(x, es, sums, recs)
-  TyFnT(_, r, _) -> ty_cont_needs(r, es, sums, recs)
+fn ty_cont_needs_in(hv: TyHomeView, t: Ty, es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool = match t {
+  TyCon(s, args) -> cont_named_needs(hv, s, args, es, sums, recs)
+  TyListT(x) -> ty_cont_needs(hv, x, es, sums, recs)
+  TyFnT(_, r, _) -> ty_cont_needs(hv, r, es, sums, recs)
   _ -> false
 }
 
-fn cont_named_needs(n: String, args: [Ty], es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool =
-  cont_needs_any(args, es, sums, recs)
-    or (any(args, (a) => row_arg_names(a, es)) and named_holds_cont(n, sums, recs, []))
+fn cont_named_needs(hv: TyHomeView, s: SymId, args: [Ty], es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool =
+  cont_needs_any(hv, args, es, sums, recs)
+    or (any(args, (a) => row_arg_names(a, es)) and named_holds_cont(hv, s, sums, recs, []))
 
-fn cont_needs_any(ts: [Ty], es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool =
-  any(ts, (t) => ty_cont_needs(t, es, sums, recs))
+fn cont_needs_any(hv: TyHomeView, ts: [Ty], es: SymId, sums: [SumInfo], recs: [RecInfo]) : Bool =
+  any(ts, (t) => ty_cont_needs(hv, t, es, sums, recs))
 
 # A row carrier naming the effect `es`, bare of any cell.
 fn row_arg_names(t: Ty, es: SymId) : Bool = match t {
-  TyFnT([], TyUnit, row) -> any(row.labels, (l) => sym_raw(es) >= 0 and sym_raw(l.sym) == sym_raw(es) and not label_is_aliased_cell(l.eff))
+  TyFnT([], TyUnit, row) -> any(row.labels, (l) => sym_raw(es) >= 0 and sym_raw(l.sym) == sym_raw(es) and not label_is_aliased_cell(l))
   _ -> false
 }
 
-fn named_holds_cont(n: String, sums: [SumInfo], recs: [RecInfo], seen: [String]) : Bool =
-  if list_has(seen, n) { false }
-  else { match ty_expr_find_handle(cont_name(), TypeExpr { tkind: TyName(ty_ref_none(), n, []), line: 0, col: 0 }, sums, seen) {
+fn named_holds_cont(hv: TyHomeView, s: SymId, sums: [SumInfo], recs: [RecInfo], seen: [SymId]) : Bool =
+  if sym_list_has(seen, s) { false }
+  else { match ty_expr_find_handle(hv, core_ty_sym(CtCont), TypeExpr { tkind: TyName(DrSym(s), []), line: 0, col: 0 }, sums, seen) {
     Some(_) -> true
     None -> any(recs, (r) => match r {
-      RI(rn, _, fs, _, _) -> rn == n and any(fs, (f) => match f {
-        FD(_, _, te, _) -> match ty_expr_find_handle(cont_name(), te, sums, [n, ...seen]) { Some(_) -> true  None -> false }
+      RI(rs, _, fs, rmo) -> sym_same(rs, s) and any(fs, (f) => match f {
+        FD(_, _, te, _) -> match ty_expr_find_handle(tsh_at(hv, rmo), core_ty_sym(CtCont), te, sums, [s, ...seen]) { Some(_) -> true  None -> false }
       })
     })
   } }
 
-fn ty_expr_find_handle(hname: String, t: TypeExpr,
-                        sums: [SumInfo], visited: [String]) : Option[HandleBreach] {
+# `hv` reads the type names `t` writes: the module that wrote `t`.
+fn ty_expr_find_handle(hv: TyHomeView, hsym: SymId, t: TypeExpr,
+                        sums: [SumInfo], visited: [SymId]) : Option[HandleBreach] {
   match t.tkind {
-    TyName(_, name, tas) -> {
-      if name == hname { Some(HBDirect) }
+    TyName(r, tas) -> {
+      let s = ref_ty_sym(hv, r)
+      if sym_raw(s) >= 0 and sym_same(s, hsym) { Some(HBDirect) }
       else {
-        match ty_expr_list_find_handle(hname, tas, sums, visited) {
+        match ty_expr_list_find_handle(hv, hsym, tas, sums, visited) {
           Some(b) -> Some(b)
           None -> {
-            if list_has(visited, name) { None }
+            if sym_raw(s) < 0 or sym_list_has(visited, s) { None }
             else {
-              match sum_find(sums, name) {
+              match sum_find(sums, s) {
                 None -> None
                 Some(si) -> match si {
-                  SI(sname, tps, vs, _) -> {
+                  SI(ssym, tps, vs, smo) -> {
                     let mapping = build_tparam_mapping(tps, tas)
-                    variants_find_handle(hname, vs, mapping, sums,
-                                          [sname, ...visited], sname)
+                    variants_find_handle(tsh_at(hv, smo), hsym, vs, mapping, sums,
+                                          [ssym, ...visited], ssym)
                   }
                 }
               }
@@ -18553,60 +18647,60 @@ fn ty_expr_find_handle(hname: String, t: TypeExpr,
         }
       }
     }
-    TyList(inner) -> ty_expr_find_handle(hname, inner, sums, visited)
+    TyList(inner) -> ty_expr_find_handle(hv, hsym, inner, sums, visited)
     TyFn(ps, ret, _) -> {
-      match ty_expr_list_find_handle(hname, ps, sums, visited) {
+      match ty_expr_list_find_handle(hv, hsym, ps, sums, visited) {
         Some(b) -> Some(b)
-        None -> ty_expr_find_handle(hname, ret, sums, visited)
+        None -> ty_expr_find_handle(hv, hsym, ret, sums, visited)
       }
     }
     # dimensioned types never carry a Fiber/Pid — recurse into base.
-    TyDim(base, _) -> ty_expr_find_handle(hname, base, sums, visited)
+    TyDim(base, _) -> ty_expr_find_handle(hv, hsym, base, sums, visited)
     # refinement predicates cannot mention Fiber/Pid (predicate
     # subset is data-only); only the base type matters.
-    TyRefine(base, _) -> ty_expr_find_handle(hname, base, sums, visited)
+    TyRefine(base, _) -> ty_expr_find_handle(hv, hsym, base, sums, visited)
     # a compound row carries effect labels, never a
     # Fiber/Pid handle type — no breach to find.
     TyRow(_) -> None
-    TySurface(ts) -> ty_expr_list_find_handle(hname, tysurface_children(ts), sums, visited)
+    TySurface(ts) -> ty_expr_list_find_handle(hv, hsym, tysurface_children(ts), sums, visited)
   }
 }
 
-fn ty_expr_list_find_handle(hname: String, ts: [TypeExpr],
-                              sums: [SumInfo], visited: [String]) : Option[HandleBreach] {
+fn ty_expr_list_find_handle(hv: TyHomeView, hsym: SymId, ts: [TypeExpr],
+                              sums: [SumInfo], visited: [SymId]) : Option[HandleBreach] {
   match ts {
     [] -> None
-    [t, ...rest] -> match ty_expr_find_handle(hname, t, sums, visited) {
+    [t, ...rest] -> match ty_expr_find_handle(hv, hsym, t, sums, visited) {
       Some(b) -> Some(b)
-      None    -> ty_expr_list_find_handle(hname, rest, sums, visited)
+      None    -> ty_expr_list_find_handle(hv, hsym, rest, sums, visited)
     }
   }
 }
 
-fn variants_find_handle(hname: String, vs: [Variant],
+fn variants_find_handle(hv: TyHomeView, hsym: SymId, vs: [Variant],
                           mapping: [TParamMapEntry], sums: [SumInfo],
-                          visited: [String], sname: String) : Option[HandleBreach] {
+                          visited: [SymId], ssym: SymId) : Option[HandleBreach] {
   match vs {
     [] -> None
     [v, ...rest] -> match v {
-      Var(cname, payload) -> match payload_find_handle(hname, payload, mapping, sums, visited) {
-        Some(_) -> Some(HBSum(sname, cname))
-        None    -> variants_find_handle(hname, rest, mapping, sums, visited, sname)
+      Var(csym, payload) -> match payload_find_handle(hv, hsym, payload, mapping, sums, visited) {
+        Some(_) -> Some(HBSum(ssym, csym))
+        None    -> variants_find_handle(hv, hsym, rest, mapping, sums, visited, ssym)
       }
     }
   }
 }
 
-fn payload_find_handle(hname: String, payload: [TypeExpr],
+fn payload_find_handle(hv: TyHomeView, hsym: SymId, payload: [TypeExpr],
                          mapping: [TParamMapEntry], sums: [SumInfo],
-                         visited: [String]) : Option[HandleBreach] {
+                         visited: [SymId]) : Option[HandleBreach] {
   match payload {
     [] -> None
     [te, ...rest] -> {
       let te_subst = subst_tparams_te(te, mapping)
-      match ty_expr_find_handle(hname, te_subst, sums, visited) {
+      match ty_expr_find_handle(hv, hsym, te_subst, sums, visited) {
         Some(b) -> Some(b)
-        None    -> payload_find_handle(hname, rest, mapping, sums, visited)
+        None    -> payload_find_handle(hv, hsym, rest, mapping, sums, visited)
       }
     }
   }
@@ -18639,20 +18733,20 @@ fn tparam_lookup(mapping: [TParamMapEntry], name: String) : Option[TypeExpr] {
 }
 
 # substitute tparam references in a payload TypeExpr
-# with their concrete TypeExpr at the use site. Only `TyName(n, [])`
-# entries are candidates for substitution — a higher-arity name is
-# a real type constructor, not a tparam reference. The substitution
+# with their concrete TypeExpr at the use site. Only a written name
+# with no arguments is a candidate for substitution — a higher-arity
+# name is a real type constructor, not a tparam reference. The substitution
 # is purely structural; positions are preserved.
 fn subst_tparams_te(t: TypeExpr, mapping: [TParamMapEntry]) : TypeExpr {
   match t.tkind {
-    TyName(th, n, tas) -> {
+    TyName(th, tas) -> {
       if list_length(tas) == 0 {
-        match tparam_lookup(mapping, n) {
+        match tparam_lookup(mapping, ref_name(th)) {
           Some(replacement) -> replacement
           None              -> t
         }
       } else {
-        mk_ty(TyName(th, n, subst_tparams_tes(tas, mapping)), t.line, t.col)
+        mk_ty(TyName(th, subst_tparams_tes(tas, mapping)), t.line, t.col)
       }
     }
     TyList(inner) ->
@@ -18777,7 +18871,7 @@ fn report_row_var_unhandled(st: InferState, fname: String, n: String, line: Int,
 
 fn check_body_labels(st: InferState, fname: String, entry: Bool, declared: RowExpr,
                      line: Int, col: Int, decls: [Decl]) : InferState / Console + File + Mutable {
-  # every body label must match a declared label by eff name AND
+  # every body label must match a declared label by effect AND
   # unifiable ty_args. An open declared row's tail is the caller's row
   # variable: it absorbs no label the body performs.
   match declared {
@@ -18898,7 +18992,7 @@ fn check_main_row_handlable(st: InferState, body_row: [Label],
           EU(_, uline, ucol) -> {
             let ln = if uline >= 0 { uline } else { line }
             let cl = if ucol  >= 0 { ucol  } else { col  }
-            let shown = inf_tycon_display_ow(st.env.head_owners, h.eff)
+            let shown = inf_tycon_display_ow(st.env.tab, st.env.head_owners, h.sym)
             let header = string_concat("`main` declares effect `",
               string_concat(shown,
                 "` but no default handler is installed for it"))
@@ -18944,7 +19038,7 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
               let line = if uline >= 0 { uline } else { fline }
               let col  = if ucol  >= 0 { ucol  } else { fcol  }
               let applied = apply_label_args(st.sub, lab)
-              let lab_str = label_display(st.env.head_owners, label_diag_string(st.sub, applied))
+              let lab_str = label_diag_display(st, applied)
               # Template 5 — missing effect. Header keeps the
               # legacy "effect not handled: <label>" wording so all
               # prior fixtures still match; the shape notes
@@ -18955,7 +19049,7 @@ fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
               diag_error(st.file, line, col, header)
               let n1 = "`#{fname}`'s declared row does not include `#{lab_str}`"
               let n2 = "missing effect: `#{lab_str}`"
-              let n3 = "enclosing row: #{render_declared_row(declared)}"
+              let n3 = "enclosing row: #{render_declared_row(st.env.tab, declared)}"
               let helps = if any(applied.ty_args, (t) => ty_is_free_var(st.sub, t)) {
                 ["replace each `_` in `#{lab_str}` with the instance `#{fname}` runs under, a concrete type or one of its type parameters, and declare it in `#{fname}`'s row"]
               } else {
@@ -19003,8 +19097,8 @@ fn reject_predicate_effect(st: InferState, kind: String, performed: [Label], con
       let line = if uline >= 0 { uline } else { cond.line }
       let col  = if ucol  >= 0 { ucol  } else { cond.col }
       let what = match callee_at(cond, line, col) {
-        Some(f) -> "calls effectful function `#{fmt_expr_text(f)}`"
-        None    -> "performs `#{label_display(st.env.head_owners, label_to_string(apply_label_args(st.sub, lab)))}`"
+        Some(f) -> "calls effectful function `#{fmt_expr_text(f, st.env.tab, st_local_names(st, f))}`"
+        None    -> "performs `#{label_display(st.env.tab, st.env.head_owners, apply_label_args(st.sub, lab))}`"
       }
       let header = concat_all(["`", kind, "` predicate ", what, ". Refinement / contract predicates may only ",
                                "call effect-pure functions (those with an empty effect row)."])
@@ -19016,14 +19110,14 @@ fn reject_predicate_effect(st: InferState, kind: String, performed: [Label], con
 
 # Template 5 — render the declared row labels for the
 # `note: enclosing row` line. Empty declared list → "(empty)".
-fn render_declared_row(declared: [Label]) : String {
+fn render_declared_row(tab: SymTab, declared: [Label]) : String {
   match declared {
     [] -> "(empty)"
-    _  -> inf_join_with(map(declared, label_to_string), " + ")
+    _  -> inf_join_with(map(declared, (l) => label_to_string(tab, l)), " + ")
   }
 }
 
-# find a declared label whose eff name and ty_args unify
+# find a declared label whose effect and ty_args unify
 # with the body's label. Side effect: if a match is found, the unifier
 # may bind tyvars on the body label's ty_args to concrete declared
 # types. Returns the post-unification InferState, or None on no match.
@@ -19074,9 +19168,9 @@ fn report_ambiguous_instance(st: InferState, target: Label, cands: [Label]) : In
   let at = lookup_eff_use(st.eff_uses, target)
   let line = match at { EU(_, l, _) -> l }
   let col = match at { EU(_, _, c) -> c }
-  let shown = label_display(st.env.head_owners, label_diag_string(st.sub, apply_label_args(st.sub, target)))
+  let shown = label_diag_display(st, apply_label_args(st.sub, target))
   let header = "ambiguous effect instance: `#{shown}`"
-  let n1 = "it fits #{join_with(map(cands, (c) => label_display(st.env.head_owners, label_diag_string(st.sub, apply_label_args(st.sub, c)))), " and ")}"
+  let n1 = "it fits #{join_with(map(cands, (c) => label_diag_display(st, apply_label_args(st.sub, c))), " and ")}"
   let h1 = "pin the instance with a type the op's result or arguments must have, or call a helper whose row names one instance"
   diag_error(st.file, line, col, header)
   diag_note(n1)
@@ -19126,21 +19220,19 @@ fn unify_label_args_into(a: [Ty], b: [Ty], st: InferState) : InferState / Consol
 # as the eff name; parameterised labels render as `Eff[T1, T2]` with
 # each ty_arg passed through `inf_ty_to_string` so unbound TyVars show as
 # `?tN`.
-#[doc("An effect label as the reader wrote it: the head un-spelled to `mod.Eff` when it was keyed by a home, its type arguments untouched.")]
-pub fn label_display(owners: [HeadOwnerEntry], lab: String) : String = {
-  let i = string_index_of_char(lab, '[')
-  if i < 0 { inf_tycon_display_ow(owners, lab) }
-  else { string_concat(inf_tycon_display_ow(owners, string_slice(lab, 0, i)),
-                       string_slice(lab, i, string_length(lab) - i)) }
+#[doc("An effect label as the reader wrote it: the head shown as `mod.Eff` when its name is contested, its type arguments untouched.")]
+pub fn label_display(tab: SymTab, owners: [HeadOwnerEntry], l: Label) : String =
+  label_with_args(inf_tycon_display_ow(tab, owners, l.sym), map(l.ty_args, (t) => inf_ty_to_string(tab, t)))
+
+fn label_with_args(head: String, args: [String]) : String = match args {
+  [] -> head
+  _  -> concat_all([head, "[", inf_join_with(args, ", "), "]"])
 }
 
 # A type argument no use fixed shows as `_`: any instance serves the call.
-fn label_diag_string(s: Subst, l: Label) : String = match l.ty_args {
-  []   -> label_to_string(l)
-  args -> concat_all([strip_label_alias(l.eff), "[",
-                      inf_join_with(map(args, (t) => if ty_is_free_var(s, t) { "_" } else { inf_ty_to_string(t) }), ", "),
-                      "]"])
-}
+fn label_diag_display(st: InferState, l: Label) : String =
+  label_with_args(inf_tycon_display_ow(st.env.tab, st.env.head_owners, l.sym),
+                  map(l.ty_args, (t) => if ty_is_free_var(st.sub, t) { "_" } else { inf_ty_to_string(st.env.tab, t) }))
 
 fn ty_is_free_var(s: Subst, t: Ty) : Bool = match t {
   TyVarT(v) -> not subst_is_rigid(s, v)
@@ -19148,18 +19240,9 @@ fn ty_is_free_var(s: Subst, t: Ty) : Bool = match t {
   _         -> false
 }
 
-#[doc("infer: `label_to_string` — driver-facing type.")]
-pub fn label_to_string(l: Label) : String {
-  # strip the internal `@<cell>` identity suffix so a
-  # `State@i` label renders as `State` in diagnostics.
-  let eff = strip_label_alias(l.eff)
-  match l.ty_args {
-    [] -> eff
-    _ -> concat_all([
-      eff, "[", inf_join_with(map(l.ty_args, inf_ty_to_string), ", "), "]"
-    ])
-  }
-}
+#[doc("infer: an effect label as a diagnostic names it: the effect's declared name and its type arguments.")]
+pub fn label_to_string(tab: SymTab, l: Label) : String =
+  label_with_args(written_text(decl_name(tab, l.sym)), map(l.ty_args, (t) => inf_ty_to_string(tab, t)))
 
 #[doc("infer: the result of inference — typed decls, errors, instantiations, holes.")]
 #[derive(BinSerialize)]
@@ -19204,7 +19287,7 @@ fn infer_all_loop(df: DiagFiles, env: TyEnv, core_len: Int, recs: [RecInfo],
                    sums: [SumInfo],
                    protos: ProtoView,
                    all_decls: [Decl],
-                   kind_theories: [KindTheory]) : TypedProgram / Console + File {
+                   kind_theories: [KindTheory]) : TypedProgram / Console + File + Mutable {
 
 
   match ds {
@@ -19261,12 +19344,12 @@ pub fn prepend_reverse_op_res(xs: [OpResolution], acc: [OpResolution]) : [OpReso
   }
 }
 
-# stamp the enclosing function name onto every resolution captured while
-# walking that function's body — the attribution the #820 dump uses
+# stamp the enclosing function onto every resolution captured while
+# walking that function's body — the attribution the evidence dump uses
 # instead of source lines (an interpolation re-parse rewrites lines).
-fn stamp_op_res_fname(xs: [OpResolution], fname: String) : [OpResolution] =
+fn stamp_op_res_fn(xs: [OpResolution], f: FnId) : [OpResolution] =
   map(xs, (o) => match o {
-    OPR(_, op, cands, chosen, alias, tagged, line, col) -> OPR(fname, op, cands, chosen, alias, tagged, line, col)
+    OPR(_, op, cands, chosen, alias, tagged, line, col) -> OPR(f, op, cands, chosen, alias, tagged, line, col)
   })
 
 # Prepend `xs` onto `acc` in reverse order so `list_reverse(acc)` at
@@ -19363,10 +19446,10 @@ pub fn merge_env_deltas(parent: ModuleEnvDelta, child: ModuleEnvDelta) : ModuleE
 pub type ModuleDecls = { name: Option[String], decls: [Decl] }
 
 #[doc("infer: run HM + bidirectional inference over a program, returning the TypedProgram.")]
-pub fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram / Console + File =
+pub fn infer_program(file: String, decls: [Decl], tab: SymTab, verbose: Bool) : TypedProgram / Console + File + Mutable =
 
 
-  infer_program_with_protos(file, decls, verbose, pv_empty())
+  infer_program_with_protos(file, decls, tab, verbose, pv_empty())
 
 # pre-typer data tables collected once over the full
 # decl stream. `infer_program_with_protos` (and the per-module fold
@@ -19401,8 +19484,8 @@ pub type TcShared = {
 #[doc("infer: build the `TcShared` tables once over the whole program, so a module's typecheck neither rebuilds the seed nor rescans the program for homes and aliases.")]
 pub fn tc_shared(file: String, df: DiagFiles, all_program_decls: [Decl],
                  tab: SymTab, views: FileViews) : TcShared / Console + File {
-  let alias_cands = collect_alias_cands(all_program_decls, df)
-  let eff_names = collect_effect_names(all_program_decls)
+  let alias_cands = collect_alias_cands(all_program_decls, tab, df)
+  let eff_names = sym_names(tab, collect_effect_ids(all_program_decls))
   let seed = build_ty_env_seed()
   let homes = tsh_homes(all_program_decls, tab, views, module_name_of_path(file))
   TcShared {
@@ -19413,7 +19496,7 @@ pub fn tc_shared(file: String, df: DiagFiles, all_program_decls: [Decl],
     alias_res: resolve_alias_cands(alias_cands, eff_names, file),
     field_recs: field_recs_of(all_program_decls),
     unions: ut_empty(),
-    unions_ahead: collect_union_rows(all_program_decls, tsh_view(homes, None))
+    unions_ahead: collect_union_rows(all_program_decls, tab, tsh_view(homes, None))
   }
 }
 
@@ -19423,7 +19506,7 @@ pub fn tc_shared_extend(sh: TcShared, delta: ModuleEnvDelta) : TcShared =
     TEP(es, ix, vx) -> match union_rows_split(sh.unions_ahead, delta.unions, []) {
       URSplit(block, ahead) -> TcShared {
         seed: sh.seed,
-        inh: ty_env_prepend_batch(delta.ty_entries, es, ix, vx, sh.homes),
+        inh: ty_env_prepend_batch(delta.ty_entries, es, ix, vx),
         rk_table: sh.rk_table, homes: sh.homes, alias_res: sh.alias_res,
         field_recs: sh.field_recs,
         unions: ut_add(sh.unions, block), unions_ahead: ahead
@@ -19441,8 +19524,8 @@ fn union_rows_split(ahead: [UnionRow], us: [UnionInfo], acc: [UnionRow]) : URSpl
   [UI(un, _, ul, uc), ...urest] -> match ahead {
     [UnionRow(t, comps, l, c), ...rest] ->
       if l == ul and c == uc { union_rows_split(rest, urest, [UnionRow(t, comps, l, c), ...acc]) }
-      else { panic("union rows out of step with the module deltas: #{un}") }
-    [] -> panic("union rows out of step with the module deltas: #{un}")
+      else { panic("union rows out of step with the module deltas: #{int_to_string(sym_raw(un))}") }
+    [] -> panic("union rows out of step with the module deltas: #{int_to_string(sym_raw(un))}")
   }
 }
 
@@ -19465,11 +19548,11 @@ fn collect_program_data_inherited(file: String, decls: [Decl],
   let aliases_all = unit_alias_compose(aliases_here, inherited.unit_aliases)
   let decls_a = expand_unit_aliases_decls(decls, aliases_all)
   let hview = tsh_view(sh.homes, None)
-  let unions_all = ut_add(sh.unions, collect_union_rows(decls_a, hview))
-  let top_names = collect_top_type_names(decls_a)
+  let unions_all = ut_add(sh.unions, collect_union_rows(decls_a, tab, hview))
+  let top_names = collect_top_type_names(decls_a, tab)
   let built = build_ty_env_inherited(sh.seed, sh.inh, inherited, decls_a,
                                        unions_all, top_names, sh.rk_table, tab,
-                                       module_name_of_path(file), sh.homes)
+                                       sh.homes)
   let recs_here = collect_records(decls_a)
   let recs_all = list_append(recs_here, inherited.recs)
   let op_to_eff_here = inf_collect_op_to_eff(decls_a)
@@ -19515,7 +19598,7 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
                      head_owners: [HeadOwnerEntry],
                      kind_theories: [KindTheory],
                      tab: SymTab, sh: TcShared,
-                     verbose: Bool) : TypecheckedModule / Console + File {
+                     verbose: Bool) : TypecheckedModule / Console + File + Mutable {
 
   let data0 = collect_program_data_inherited(file, mod.decls, inherited, sh, tab)
   # attach the per-compile head-owner cache to the env
@@ -19545,7 +19628,7 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
                  data.alias_res.aliases, data.op_to_eff, data.sums, protos,
                  all_decls_for_typer, kind_theories)
   # Stage B coverage check. Runs after row-level inference
-  # is complete so the typed body carries the resolved `EName("Eff.op")`
+  # is complete so the typed body carries the resolved effect-op
   # callees the walker keys on. Its diagnostics are rendered as found and
   # join TypedProgram.diags.
   #
@@ -19555,8 +19638,8 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
   # performs the op. Without this, `is_effect_declared` returns false
   # for any user effect declared in the same file but partitioned away
   # from its `fn main()`, silencing the per-op coverage walker.
-  let cov_diags = check_default_coverage(df, tp.decls, all_decls_for_typer, sh.homes)
-  let priv_diags = check_field_privacy(df, tsh_view(sh.homes, mod.name), tp.decls,
+  let cov_diags = check_default_coverage(df, tab, tp.decls, all_decls_for_typer, sh.homes)
+  let priv_diags = check_field_privacy(df, tab, tsh_view(sh.homes, mod.name), tp.decls,
     if list_length(all_program_decls) > 0 { sh.field_recs } else { field_recs_of(data.decls_a) })
   let spawn_diags = check_spawn_rows(df, data.recs, tp.decls, all_decls_for_typer)
   let typed = TypedProgram {
@@ -19591,13 +19674,13 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
   let delta = ModuleEnvDelta {
     name:           mod.name,
     ty_entries:     new_entries,
-    unions:         collect_unions(data.decls_a, tsh_view(data.homes, None)),
+    unions:         collect_unions(data.decls_a, tab, tsh_view(data.homes, None)),
     op_eff_arities: new_arities,
     recs:           collect_records(data.decls_a),
     sums:           collect_sums(data.decls_a),
     op_to_eff:      inf_collect_op_to_eff(data.decls_a),
     unit_aliases:   collect_unit_alias_table(mod.decls),
-    constructors:   collect_constructors(data.decls_a, [])
+    constructors:   collect_constructors(data.decls_a, sh.homes, [])
   }
   TypecheckedModule { typed: typed, delta: delta }
 }
@@ -19625,10 +19708,10 @@ fn take_op_eff_arities(xs: [OpEffArity], n: Int,
 # callers (the stdlib cache loader, core/user split) drive
 # real fold dynamics — see `typecheck_program_loop`.
 fn typecheck_program(file: String, df: DiagFiles, modules: [ModuleDecls],
-                      protos: ProtoView,
-                      verbose: Bool) : TypedProgram / Console + File =
+                      tab: SymTab, protos: ProtoView,
+                      verbose: Bool) : TypedProgram / Console + File + Mutable =
   typecheck_program_with_head_owners(file, df, modules, protos,
-                                     head_owner_seed(), [], st_empty(), fv_empty(), verbose)
+                                     head_owner_seed(), [], tab, fv_empty(), verbose)
 
 # variant accepting the per-compile head-owner cache. The
 # cache is built once by `compile_source` after `expand_imports`
@@ -19640,7 +19723,7 @@ fn typecheck_program_with_head_owners(file: String, df: DiagFiles, modules: [Mod
                                        head_owners: [HeadOwnerEntry],
                                        kind_theories: [KindTheory],
                                        tab: SymTab, views: FileViews,
-                                       verbose: Bool) : TypedProgram / Console + File {
+                                       verbose: Bool) : TypedProgram / Console + File + Mutable {
 
 
   # Flatten every bucket's decls in the order they appear in
@@ -19699,7 +19782,7 @@ fn typecheck_program_loop(file: String, df: DiagFiles, modules: [ModuleDecls],
                             # last module's top-level env length. The
                             # target file is typed last, so this is the
                             # boundary its holes' locals sit above.
-                            toplevel_len_acc: Int) : TypedProgram / Console + File {
+                            toplevel_len_acc: Int) : TypedProgram / Console + File + Mutable {
 
   match modules {
     [] -> TypedProgram {
@@ -19842,11 +19925,11 @@ fn decide_partition_home(d: Decl, target_mod: String,
 
 # Wrappers delegate to the decl they wrap; an impl to its first method.
 fn decl_explicit_module_origin(d: Decl) : Option[String] = match d {
-  DFn(_, _, _, _, _, _, _, _, _, mo, _)   -> mo
-  DType(_, _, _, _, _, _, mo, _, _)       -> mo
-  DEffect(_, _, _, _, _, _, _, mo, _)     -> mo
-  DProtocol(_, _, _, _, _, _, mo, _)      -> mo
-  DConst(_, _, _, _, mo, _, _, _)         -> mo
+  DFn(_, _, _, _, _, _, _, _, _, mo)      -> mo
+  DType(_, _, _, _, _, _, mo, _)          -> mo
+  DEffect(_, _, _, _, _, _, _, mo)        -> mo
+  DProtocol(_, _, _, _, _, _, mo)         -> mo
+  DConst(_, _, _, _, mo, _, _)            -> mo
   DExternType(_, _, _, _, mo)             -> mo
   DKind(_, _, _, _, _, _, _, mo)          -> mo
   DTheory(_, _, _, _, mo)                 -> mo
@@ -19893,8 +19976,8 @@ fn opt_str_is_some(o: Option[String]) : Bool = match o {
 # decl; DImpl peeks at its first method (the post-`lower_protocols`
 # stream never contains DImpl, but we cover it defensively).
 fn partition_home_for(d: Decl, target_mod: String) : String = match d {
-  DFn(_, _, _, _, _, _, _, _, _, mo, fsym) -> home_or_target(mo, target_mod)
-  DType(_, _, _, _, _, _, mo, _, _)        -> home_or_target(mo, target_mod)
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> home_or_target(mo, target_mod)
+  DType(_, _, _, _, _, _, mo, _)     -> home_or_target(mo, target_mod)
   DDerive(_, inner, _, _)         -> partition_home_for(inner, target_mod)
   DUnstable(inner, _, _)          -> partition_home_for(inner, target_mod)
   DProtoLaws(_, inner, _, _, _)      -> partition_home_for(inner, target_mod)
@@ -19967,11 +20050,11 @@ fn buckets_finish(acc: [HomeBucket], out: [ModuleDecls]) : [ModuleDecls] =
 # entry points get the theory dispatch too; the driver's main path
 # passes its pre-strip capture through the cached variant instead
 # (kind decls are stripped before the typer there).
-fn infer_program_with_protos(file: String, decls: [Decl], verbose: Bool,
-                               protos: ProtoView) : TypedProgram / Console + File =
+fn infer_program_with_protos(file: String, decls: [Decl], tab: SymTab, verbose: Bool,
+                               protos: ProtoView) : TypedProgram / Console + File + Mutable =
   infer_program_with_protos_cached(file, diag_files_flat(file), decls, verbose,
                                    protos, head_owner_seed(),
-                                   atomic_kind_theories(decls), st_empty(), fv_empty())
+                                   atomic_kind_theories(decls), tab, fv_empty())
 
 # variant accepting the per-compile head-owner cache. The
 # `compile_source` driver builds the cache from the post-`expand_imports`
@@ -19983,7 +20066,7 @@ pub fn infer_program_with_protos_cached(file: String, df: DiagFiles, decls: [Dec
                                        protos: ProtoView,
                                        head_owners: [HeadOwnerEntry],
                                        kind_theories: [KindTheory],
-                                       tab: SymTab, views: FileViews) : TypedProgram / Console + File {
+                                       tab: SymTab, views: FileViews) : TypedProgram / Console + File + Mutable {
 
 
   # Hanga Roa modular typecheck: partition the post-cascade decl
@@ -20057,21 +20140,24 @@ fn list_has_string(xs: [String], s: String) : Bool {
 }
 
 # Walk scope looking for the first entry whose instantiated type
-# unifies with `want`. Returns the name on hit, None otherwise.
+# unifies with `want`. Returns the entry's key on hit, None otherwise.
 # `avoid` prevents obvious circular fills like `f(f)` when f itself
 # is the candidate head.
-type ArgMatch = { name: String, sub: Subst, fresh: Int }
+type ArgMatch = { key: EnvKey, sub: Subst, fresh: Int }
 
-fn synth_find_arg(scope: [TyEntry], want: Ty, fresh: Int, avoid: [String], sub: Subst) : Option[ArgMatch] / Mutable {
+# Two keys bind the same thing.
+fn env_key_same(a: EnvKey, b: EnvKey) : Bool = env_key_ord(a) == env_key_ord(b)
+
+fn synth_find_arg(scope: [TyEntry], want: Ty, fresh: Int, avoid: [EnvKey], sub: Subst) : Option[ArgMatch] / Mutable {
   match scope {
     [] -> None
     [te, ...rest] -> {
-      if list_has_string(avoid, te.name) or (not synth_return_structural(te.scheme)) {
+      if any(avoid, (k) => env_key_same(k, te.key)) or (not synth_return_structural(te.scheme)) {
         synth_find_arg(rest, want, fresh, avoid, sub)
       } else {
-        let inst = instantiate(TyEnv { entries: [], fresh: fresh, unions: ut_empty(), constructors: [], head_owners: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
+        let inst = instantiate(TyEnv { ...ty_env_empty(), fresh: fresh }, te.scheme)
         match unify(inst.ty, want, sub) {
-          Some(sub1) -> Some(ArgMatch { name: te.name, sub: sub1, fresh: inst.env.fresh })
+          Some(sub1) -> Some(ArgMatch { key: te.key, sub: sub1, fresh: inst.env.fresh })
           None       -> synth_find_arg(rest, want, fresh, avoid, sub)
         }
       }
@@ -20079,43 +20165,49 @@ fn synth_find_arg(scope: [TyEntry], want: Ty, fresh: Int, avoid: [String], sub: 
   }
 }
 
-type ArgsMatch = { names: [String], sub: Subst, fresh: Int }
+type ArgsMatch = { keys: [EnvKey], sub: Subst, fresh: Int }
 
-fn synth_find_args(scope: [TyEntry], params: [Ty], fresh: Int, avoid: [String],
-                   sub: Subst, acc: [String]) : Option[ArgsMatch] / Mutable {
+fn synth_find_args(scope: [TyEntry], params: [Ty], fresh: Int, avoid: [EnvKey],
+                   sub: Subst, acc: [EnvKey]) : Option[ArgsMatch] / Mutable {
   match params {
-    [] -> Some(ArgsMatch { names: list_reverse(acc), sub: sub, fresh: fresh })
+    [] -> Some(ArgsMatch { keys: list_reverse(acc), sub: sub, fresh: fresh })
     [p, ...rest] -> {
       let p_now = apply_ty(sub, p)
       match synth_find_arg(scope, p_now, fresh, avoid, sub) {
-        Some(am) -> synth_find_args(scope, rest, am.fresh, avoid, am.sub, [am.name, ...acc])
+        Some(am) -> synth_find_args(scope, rest, am.fresh, avoid, am.sub, [am.key, ...acc])
         None     -> None
       }
     }
   }
 }
 
-# A candidate's rendered text and the labels evaluating it performs.
-type Synth = { expr: String, performs: [Label] }
+# A candidate: the entry it reads, the entries it applies it to when it
+# is a call, and the labels evaluating it performs.
+type Synth = { head: EnvKey, args: Option[[EnvKey]], performs: [Label] }
+
+fn synth_text(tab: SymTab, c: Synth) : String = match c.args {
+  None     -> env_key_text(tab, c.head)
+  Some(ks) -> concat_all([env_key_text(tab, c.head), "(", inf_join_with(map(ks, (k) => env_key_text(tab, k)), ", "), ")"])
+}
 
 # Try entry `te` as a direct match or a 1-level application against
 # `expected`.
 fn synth_try_entry(cx: SynthCtx, te: TyEntry) : Option[Synth] / Mutable {
-  let inst = instantiate(TyEnv { entries: [], fresh: cx.fresh, unions: ut_empty(), constructors: [], head_owners: [], row_kind: [], ty_homes: tsh_none(), index: idx_empty(), vindex: vix_empty(), sindex: idx_empty() }, te.scheme)
+  let inst = instantiate(TyEnv { ...ty_env_empty(), fresh: cx.fresh }, te.scheme)
   match unify(inst.ty, cx.expected, subst_empty()) {
-    Some(_) -> Some(Synth { expr: te.name, performs: [] })
+    Some(_) -> Some(Synth { head: te.key, args: None, performs: [] })
     None    -> match inst.ty {
       TyFnT(ps, r, rw) -> {
         if synth_return_structural(te.scheme) {
           match unify(r, cx.expected, subst_empty()) {
             None     -> None
-            Some(s0) -> match synth_find_args(cx.all, ps, inst.env.fresh, [te.name], s0, []) {
+            Some(s0) -> match synth_find_args(cx.all, ps, inst.env.fresh, [te.key], s0, []) {
               None    -> None
               Some(m) ->
-                if synth_reenters_owner(cx.owner, te.name, m.names) { None }
-                else { Some(Synth { expr: concat_all([te.name, "(", inf_join_with(m.names, ", "), ")"]),
+                if synth_reenters_owner(cx.owner, te.key, m.keys) { None }
+                else { Some(Synth { head: te.key, args: Some(m.keys),
                                     performs: label_concat(apply_labels(m.sub, rw.labels),
-                                                           synth_op_label(cx.decls, te.name, synth_inst_vars(te.scheme, inst, m.sub))) }) }
+                                                           synth_op_label(cx.decls, te.key, synth_inst_vars(te.scheme, inst, m.sub))) }) }
             }
           }
         } else { None }
@@ -20135,29 +20227,31 @@ fn fresh_vars_from(i: Int, end: Int, sub: Subst) : [Ty] =
 
 # An effect op's scheme carries no row: calling `Eff.op` performs `Eff`,
 # whose type arguments lead the op's quantified variables.
-fn synth_op_label(decls: [Decl], name: String, vars: [Ty]) : [Label] =
-  if string_index_of_char(name, '.') < 0 { [] }
-  else { match effect_declaring_op(decls, dotted_prefix(name), dotted_suffix(name)) {
-    Some(DEffect(_, eff, tps, _, _, _, _, _, s)) ->
-      [Label { eff: eff, ty_args: take_first_tys(vars, list_length(tps)), sym: s }]
+fn synth_op_label(decls: [Decl], key: EnvKey, vars: [Ty]) : [Label] = match key {
+  KOp(eff, _) -> match effect_decl_of(eff, decls) {
+    Some(DEffect(_, s, tps, _, _, _, _, _)) -> [row_label(s, take_first_tys(vars, list_length(tps)))]
     _ -> []
-  } }
-
-fn effect_declaring_op(decls: [Decl], eff: String, op: String) : Option[Decl] = match decls {
-  [] -> None
-  [d, ...rest] -> match d {
-    DEffect(_, nm, _, ops, _, _, _, _, _) ->
-      if nm == eff and any(ops, (o) => match o { EOp(on, _, _, _, _, _) -> on == op }) { Some(d) }
-      else { effect_declaring_op(rest, eff, op) }
-    _ -> effect_declaring_op(rest, eff, op)
   }
+  _ -> []
 }
 
 # The function a hole sits in, applied to its own parameters unchanged,
 # type-checks as a filler for its body and never terminates.
-fn synth_reenters_owner(owner: HoleOwner, head: String, args: [String]) : Bool = match owner {
-  HOwner(nm, params) -> nm == head and args == params
-  HNoOwner           -> false
+fn synth_reenters_owner(owner: HoleOwner, head: EnvKey, args: [EnvKey]) : Bool = match owner {
+  HOwner(f, params) -> match head {
+    KSym(s) -> sym_same(s, f) and keys_are_locals(args, params)
+    _       -> false
+  }
+  HNoOwner -> false
+}
+
+fn keys_are_locals(ks: [EnvKey], ls: [LocalId]) : Bool = match ks {
+  [] -> list_is_empty(ls)
+  [KLocal(b), ...rest] -> match ls {
+    [l, ...more] -> local_eq(b.id, l) and keys_are_locals(rest, more)
+    []           -> false
+  }
+  _ -> false
 }
 
 #[doc("infer: a candidate that fits a hole once its row adds `effects`.")]
@@ -20168,24 +20262,24 @@ pub type HoleCands = { fit: [String], needs: [EffCand] }
 
 type SynthCtx = { all: [TyEntry], expected: Ty, fresh: Int, owner: HoleOwner, row: HoleRow, decls: [Decl] }
 
-fn synth_candidates_loop(cx: SynthCtx, cur: [TyEntry], acc: HoleCands, max: Int) : HoleCands {
+fn synth_candidates_loop(tab: SymTab, cx: SynthCtx, cur: [TyEntry], acc: HoleCands, max: Int) : HoleCands {
   if list_length(acc.fit) >= max { HoleCands { fit: list_reverse(acc.fit), needs: list_reverse(acc.needs) } }
   else { match cur {
     [] -> HoleCands { fit: list_reverse(acc.fit), needs: list_reverse(acc.needs) }
     [te, ...rest] -> match synth_try_entry(cx, te) {
-      Some(c) -> synth_candidates_loop(cx, rest, synth_classify(acc, c, hole_row_missing(cx.row, c.performs, cx.decls), max), max)
-      None    -> synth_candidates_loop(cx, rest, acc, max)
+      Some(c) -> synth_candidates_loop(tab, cx, rest, synth_classify(tab, acc, c, hole_row_missing(cx.row, c.performs, cx.decls), max), max)
+      None    -> synth_candidates_loop(tab, cx, rest, acc, max)
     }
   } }
 }
 
-fn synth_classify(acc: HoleCands, c: Synth, missing: [Label], max: Int) : HoleCands = match missing {
-  [] -> HoleCands { ...acc, fit: [c.expr, ...acc.fit] }
+fn synth_classify(tab: SymTab, acc: HoleCands, c: Synth, missing: [Label], max: Int) : HoleCands = match missing {
+  [] -> HoleCands { ...acc, fit: [synth_text(tab, c), ...acc.fit] }
   _  -> if list_length(acc.needs) >= max { acc }
-        else { HoleCands { ...acc, needs: [EffCand { expr: c.expr, effects: map(missing, label_to_string) }, ...acc.needs] } }
+        else { HoleCands { ...acc, needs: [EffCand { expr: synth_text(tab, c), effects: map(missing, (l) => label_to_string(tab, l)) }, ...acc.needs] } }
 }
 
 #[doc("infer: names in scope whose type unifies with a hole's expected type, split by whether the effects they perform fit the hole's row `hr`; `decls` resolves the effects `main` absorbs.")]
-pub fn synth_candidates(scope: [TyEntry], expected: Ty, fresh: Int, owner: HoleOwner, hr: HoleRow, decls: [Decl]) : HoleCands =
-  synth_candidates_loop(SynthCtx { all: scope, expected: expected, fresh: fresh, owner: owner, row: hr, decls: decls },
+pub fn synth_candidates(tab: SymTab, scope: [TyEntry], expected: Ty, fresh: Int, owner: HoleOwner, hr: HoleRow, decls: [Decl]) : HoleCands =
+  synth_candidates_loop(tab, SynthCtx { all: scope, expected: expected, fresh: fresh, owner: owner, row: hr, decls: decls },
                         scope, HoleCands { fit: [], needs: [] }, 8)
