@@ -208,10 +208,12 @@ $1
 #     parse time and embeds the predicate's source position in it;
 #   * `__<tag>_LINE_COL_N__` — several desugars mint binder names from
 #     the construct's position (`__rf_…` for record literals,
-#     `__spread_src_…` for record spread).
+#     `__spread_src_…` for record spread);
+#   * `local N` — a read of such a binder carries the id minted from
+#     that same name.
 #
-# The last two legitimately change when a file is reformatted: the
-# construct moved, so a position-derived name moves with it. Both are
+# The last three legitimately change when a file is reformatted: the
+# construct moved, so a position-derived name moves with it. All are
 # normalised rather than reported as meaning changes. Note this makes
 # the check blind to a genuine RENUMBERING of such a binder, which is
 # accepted: the alternative is ~20 files of permanent false positives.
@@ -220,7 +222,8 @@ strip_pos() {
       -e 's/declared at line [0-9][0-9]*, col [0-9][0-9]*/declared at line L, col C/g' \
       -e 's/__\([a-z_]*\)_[0-9][0-9]*_[0-9][0-9]*__/__\1_L_C__/g' \
       -e 's/__\([a-z_]*\)_[0-9][0-9]*_[0-9][0-9]*_\([0-9][0-9]*\)__/__\1_L_C_\2__/g' \
-      -e 's/__rowhole_\([A-Za-z_]*\)_[0-9][0-9]*_[0-9][0-9]*/__rowhole_\1_L_C/g' "$1"
+      -e 's/__rowhole_\([A-Za-z_]*\)_[0-9][0-9]*_[0-9][0-9]*/__rowhole_\1_L_C/g' \
+      -e 's/^\([[:space:]]*local\) -\{0,1\}[0-9][0-9]*$/\1 N/' "$1"
 }
 
 # Nearest directory at or above $1 carrying a manifest (template
