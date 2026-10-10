@@ -10872,7 +10872,10 @@ test-shape-laws-1200: $(TARGET) build
 	run shape_kind_laws_axiom; \
 	grep -q '0/0 checks passed' build/s2-shape_kind_laws_axiom.out \
 	  || { echo "shape-laws-1200 FAIL (axiom: expected 0/0 escape hatch)"; cat build/s2-shape_kind_laws_axiom.out; exit 1; }; \
-	echo "shape-laws-1200 OK (lawful 6/6, violation caught, axiom exempts)"
+	run shape_kind_laws_list_homonym; \
+	grep -q '2/2 checks passed' build/s2-shape_kind_laws_list_homonym.out \
+	  || { echo "shape-laws-1200 FAIL (a user type named List: expected 2/2 passed)"; cat build/s2-shape_kind_laws_list_homonym.out; exit 1; }; \
+	echo "shape-laws-1200 OK (lawful 6/6, violation caught, axiom exempts, List homonym 2/2)"
 
 # Issue #1156 — widened-register escape gate. Two sibling arms bind the
 # same name on kind-1 Int slots with opposite rawness verdicts (raw
