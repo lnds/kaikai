@@ -1,0 +1,118 @@
+#[doc("""
+`--check-written-eq`: no comparison decides on a written name.
+
+A `Written` is text the source spelled. Two of them being equal says
+nothing about which declarations they name, so `==` or `!=` over a value
+that holds one would bring identity by name back. Each such comparison in
+the monomorphised program is reported with the function it sits in, so
+generic code is judged at the types it is instantiated with, and a type
+that only contains a `Written` counts as holding one.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.expr_positions
+import compiler.operators
+import compiler.decl_names
+import compiler.symtab_build
+
+#[doc("Report each `==` or `!=` whose operand holds a `Written`; the exit status is the number found.")]
+pub fn check_written_eq(decls: [Decl]) : Int / Console = {
+  let held = wec_close(decls, [WecTy(sym_raw(wec_written()), "Written")])
+  let found = flat_map(decls, (d) => wec_decl(d, held))
+  each(found, (m) => eprint(m))
+  list_length(found)
+}
+
+# The opaque type's own declaration.
+fn wec_written() : SymId = sym_derive(NCType, "Written", "compiler__written")
+
+# A type that holds a `Written`: its id, and its name for a field whose
+# written type carries no id.
+type WecTy = WecTy(Int, String)
+
+# Every declared type reaching `Written` through its fields or payloads.
+fn wec_close(decls: [Decl], held: [WecTy]) : [WecTy] = {
+  let more = wec_grow(decls, held, held)
+  if list_length(more) == list_length(held) { held } else { wec_close(decls, more) }
+}
+
+fn wec_grow(ds: [Decl], held: [WecTy], acc: [WecTy]) : [WecTy] = match ds {
+  [] -> acc
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> wec_grow([inner, ...rest], held, acc)
+    None -> match d {
+      DType(_, n, _, body, _, _, _, _, s) ->
+        if wec_has(acc, sym_raw(s), n) or not any(wec_body_types(body), (t) => wec_te_holds(t, held)) { wec_grow(rest, held, acc) }
+        else { wec_grow(rest, held, [WecTy(sym_raw(s), n), ...acc]) }
+      _ -> wec_grow(rest, held, acc)
+    }
+  }
+}
+
+fn wec_body_types(b: TypeBody) : [TypeExpr] = match b {
+  TBAlias(t)   -> [t]
+  TBRecord(fs) -> map(fs, (f) => match f { FD(_, _, t, _) -> t })
+  TBSum(vs)    -> flat_map(vs, (v) => match v { Var(_, ts) -> ts })
+  _            -> []
+}
+
+fn wec_has(held: [WecTy], id: Int, n: String) : Bool = match held {
+  [] -> false
+  [WecTy(i, m), ...rest] -> (if id >= 0 { i == id } else { m == n }) or wec_has(rest, id, n)
+}
+
+fn wec_te_holds(t: TypeExpr, held: [WecTy]) : Bool = match t.tkind {
+  TyName(r, n, args) -> wec_has(held, sym_raw(ty_ref_sym(r)), n) or any(args, (a) => wec_te_holds(a, held))
+  TyList(x)          -> wec_te_holds(x, held)
+  TyDim(x, _)        -> wec_te_holds(x, held)
+  TyRefine(x, _)     -> wec_te_holds(x, held)
+  _                  -> false
+}
+
+fn wec_ty_holds(t: Ty, held: [WecTy]) : Bool = match t {
+  TyCon(_, n, args, s) -> wec_has(held, sym_raw(s), n) or any(args, (a) => wec_ty_holds(a, held))
+  TyListT(x)           -> wec_ty_holds(x, held)
+  TyDimT(x, _)         -> wec_ty_holds(x, held)
+  TyRefineT(x, _)      -> wec_ty_holds(x, held)
+  TyUnion(parts)       -> any(parts, (p) => wec_ty_holds(p, held))
+  _                    -> false
+}
+
+fn wec_decl(d: Decl, held: [WecTy]) : [String] = match decl_transparent_inner(d) {
+  Some(inner) -> wec_decl(inner, held)
+  None -> match d {
+    DFn(_, n, _, _, _, _, body, _, _, mo, _) -> wec_expr([body], wec_label(n, mo), held, [])
+    DConst(_, n, _, body, mo, _, _, _)       -> wec_expr([body], wec_label(n, mo), held, [])
+    DTest(n, body, _, _, mo)                 -> wec_expr([body], wec_label(n, mo), held, [])
+    DImpl(_, _, _, subs, _, _, _, _)         -> flat_map(subs, (s) => wec_decl(s, held))
+    _ -> []
+  }
+}
+
+fn wec_label(n: String, mo: Option[String]) : String = match mo {
+  Some(m) -> concat_all([m, ".", n])
+  None    -> n
+}
+
+fn wec_expr(es: [Expr], at: String, held: [WecTy], acc: [String]) : [String] = match es {
+  [] -> acc
+  [e, ...rest] -> {
+    let next = list_append(map(xp_positions(e), (p) => match p { XP(_, c) -> c }), rest)
+    if wec_compares(e, held) { wec_expr(next, at, held, [wec_msg(at, e), ...acc]) }
+    else { wec_expr(next, at, held, acc) }
+  }
+}
+
+fn wec_compares(e: Expr, held: [WecTy]) : Bool = match e.kind {
+  EBinop(op, a, b) -> binop_is_equality(op) and (wec_opt_holds(a.ty, held) or wec_opt_holds(b.ty, held))
+  _                -> false
+}
+
+fn wec_opt_holds(t: Option[Ty], held: [WecTy]) : Bool = match t {
+  Some(x) -> wec_ty_holds(x, held)
+  None    -> false
+}
+
+fn wec_msg(at: String, e: Expr) : String =
+  concat_all(["written-eq ", at, " ", int_to_string(e.line), ":", int_to_string(e.col)])
