@@ -1,0 +1,106 @@
+#[doc("""
+The backends' rows for the constructors, keyed by the constructor's id.
+
+A constructor site carries the id of the constructor its type declares,
+and a backend finds that constructor's tag, arity and slot layout by the
+id: two modules may declare one name, and a name never says which. An
+emitter builds the index once, beside the variant table it reads.
+
+A declaration is homed at its module, and one written in the root file
+at the root. A row with no home is the root's, and the core's when the
+runtime builds it. A declaration the table gave no row of its own was
+absorbed by the core constructor of its name, and answers with that row.
+
+A reader that still takes a home and a name is handed the row's own: the
+table answers that pair with the row and no other.
+""")]
+
+import compiler.ast
+import compiler.decl_names
+import compiler.symtab
+import compiler.symtab_build
+import compiler.infer_index
+import compiler.emit_shared
+
+#[doc("The variant table's rows, each keyed by the id of the constructor it lays out.")]
+pub type CtorIx = { rows: NameIndex[VariantEntry] }
+
+#[doc("The index over `variants`, the table registered from `decls`. `root` is the root module; without it a row with no home is keyed for the core alone.")]
+pub fn ctor_ix_build(variants: [VariantEntry], decls: [Decl], root: Option[String]) : CtorIx =
+  CtorIx { rows: cix_absorbed(decls, root, cix_core(builtin_variants(), cix_rows(variants, root, idx_empty()))) }
+
+#[doc("The row of the constructor `s`, or None when `s` is the id of no constructor the table lays out.")]
+pub fn ctor_ix_row(ix: CtorIx, s: SymId) : Option[VariantEntry] =
+  if sym_raw(s) < 0 { None }
+  else { match idx_chain_sym(ix.rows, s) {
+    [row, ..._] -> Some(row)
+    []          -> None
+  } }
+
+#[doc("The row of the constructor `e` references by id, or None when `e` is any other expression.")]
+pub fn ctor_ix_site(ix: CtorIx, e: Expr) : Option[VariantEntry] = match e.kind {
+  ESym(s, _, _) -> ctor_ix_row(ix, s)
+  _             -> None
+}
+
+#[doc("True when `e` references a constructor by id.")]
+pub fn ctor_ix_names(ix: CtorIx, e: Expr) : Bool = match ctor_ix_site(ix, e) {
+  Some(_) -> true
+  None    -> false
+}
+
+#[doc("True when `s` is a constructor's row in the symbol table `t`.")]
+pub fn sym_is_ctor(t: SymTab, s: SymId) : Bool = match sym_class(t, s) {
+  NCCtor -> st_valid(t, s)
+  _      -> false
+}
+
+#[doc("The head tag of the row's constructor.")]
+pub fn ctor_row_tag(v: VariantEntry) : Int = match v { EV(_, _, _, _, t) -> t }
+
+fn cix_id(name: String, home: String) : SymId = sym_derive(NCCtor, name, home)
+
+fn cix_rows(vs: [VariantEntry], root: Option[String], ix: NameIndex[VariantEntry]) : NameIndex[VariantEntry] = match vs {
+  []          -> ix
+  [v, ...rest] -> match v {
+    EV(hm, n, _, _, _) -> match cix_home(hm, root) {
+      Some(h) -> cix_rows(rest, root, idx_prepend_sym(ix, cix_id(n, h), v))
+      None    -> cix_rows(rest, root, ix)
+    }
+  }
+}
+
+fn cix_home(hm: Option[String], root: Option[String]) : Option[String] = match hm {
+  Some(_) -> hm
+  None    -> root
+}
+
+# The constructors the runtime builds have no declaration: their rows are
+# the homeless ones the table is seeded with.
+fn cix_core(seed: [VariantEntry], ix: NameIndex[VariantEntry]) : NameIndex[VariantEntry] = match seed {
+  []          -> ix
+  [v, ...rest] -> match v {
+    EV(None, n, _, _, _) -> cix_core(rest, idx_prepend_sym(ix, cix_id(n, core_type_home()), v))
+    _                    -> cix_core(rest, ix)
+  }
+}
+
+fn cix_absorbed(ds: [Decl], root: Option[String], ix: NameIndex[VariantEntry]) : NameIndex[VariantEntry] = match ds {
+  [] -> ix
+  [DType(_, _, _, TBSum(vs), _, _, mo, _, _), ...rest] -> match cix_home(mo, root) {
+    Some(h) -> cix_absorbed(rest, root, cix_absorbed_vs(vs, h, ix))
+    None    -> cix_absorbed(rest, root, ix)
+  }
+  [_, ...rest] -> cix_absorbed(rest, root, ix)
+}
+
+fn cix_absorbed_vs(vs: [Variant], home: String, ix: NameIndex[VariantEntry]) : NameIndex[VariantEntry] = match vs {
+  [] -> ix
+  [Var(n, _), ...rest] -> match idx_chain_sym(ix, cix_id(n, home)) {
+    [_, ..._] -> cix_absorbed_vs(rest, home, ix)
+    []        -> match idx_chain_sym(ix, cix_id(n, core_type_home())) {
+      [row, ..._] -> cix_absorbed_vs(rest, home, idx_prepend_sym(ix, cix_id(n, home), row))
+      []          -> cix_absorbed_vs(rest, home, ix)
+    }
+  }
+}
