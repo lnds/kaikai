@@ -14,9 +14,9 @@
 # monomorph, on both backends. Soundness fences:
 #   - the forwarder body is exactly `prim(p1, …, pn)`: its own params,
 #     in order, each exactly once, no borrowed (`^`) param;
-#   - the callee is a runtime primitive — a name no DFn in the program
-#     declares (a module-local helper would not resolve in the
-#     caller's namespace) and no constructor;
+#   - the callee is a runtime primitive — a core builtin's row, or a bare
+#     name no DFn in the program declares (a module-local helper would
+#     not resolve in the caller's namespace) and no constructor;
 #   - the forwarder declares no effect row;
 #   - only saturated `ECall` sites rewrite — a forwarder passed as a
 #     value keeps the wrapper fn.
@@ -28,13 +28,16 @@ import compiler.decl_names
 import compiler.symtab_build
 import compiler.sym_read
 import compiler.util
+import compiler.symtab
+import compiler.core_syms
 
-# One inlinable forwarder: qualified key "mod.fn", its id, primitive, arity.
-type FwdEntry = FW(String, SymId, String, Int)
+# One inlinable forwarder: qualified key "mod.fn", its id, the primitive's
+# callee as its body spells it, arity.
+type FwdEntry = FW(String, SymId, ExprKind, Int)
 
 #[doc("Rewrites every saturated qualified call to a trivial forwarder (a pub module fn whose body just forwards its params, in order, to a runtime primitive) into the direct primitive call, so the module surface hits the same fused/raw paths as the builtin spelling.")]
-pub fn inline_trivial_forwarders(typed: TypedProgram) : TypedProgram = {
-  let fwds = fwd_collect(typed.decls, fwd_fn_names(typed.decls, []), [])
+pub fn inline_trivial_forwarders(typed: TypedProgram, tab: SymTab) : TypedProgram = {
+  let fwds = fwd_collect(typed.decls, tab, fwd_fn_names(typed.decls, []), [])
   match fwds {
     [] -> typed
     _  -> TypedProgram {
@@ -60,16 +63,16 @@ fn fwd_fn_names(decls: [Decl], acc: [String]) : [String] = match decls {
   }
 }
 
-fn fwd_collect(decls: [Decl], fn_names: [String], acc: [FwdEntry]) : [FwdEntry] = match decls {
+fn fwd_collect(decls: [Decl], tab: SymTab, fn_names: [String], acc: [FwdEntry]) : [FwdEntry] = match decls {
   []           -> acc
-  [d, ...rest] -> fwd_collect(rest, fn_names, fwd_add(d, fn_names, acc))
+  [d, ...rest] -> fwd_collect(rest, tab, fn_names, fwd_add(d, tab, fn_names, acc))
 }
 
-fn fwd_add(d: Decl, fn_names: [String], acc: [FwdEntry]) : [FwdEntry] = match d {
+fn fwd_add(d: Decl, tab: SymTab, fn_names: [String], acc: [FwdEntry]) : [FwdEntry] = match d {
   DFn(is_pub, name, _, params, _, row, body, _, _, mo, _) -> match mo {
     Some(m) ->
       if is_pub and fwd_row_is_empty(row) {
-        match fwd_prim_of(params, body, fn_names) {
+        match fwd_prim_of(tab, params, body, fn_names) {
           Some(prim) -> [FW(concat_all([m, ".", name]), sym_derive(NCFn, name, m), prim, list_length(params)), ...acc]
           None       -> acc
         }
@@ -84,16 +87,21 @@ fn fwd_row_is_empty(row: RowExpr) : Bool = match row {
   _      -> false
 }
 
-# The primitive name when `body` is exactly `prim(p1, …, pn)` over
-# `params` in declaration order, `prim` resolving to no program fn.
-fn fwd_prim_of(params: [Param], body: Expr, fn_names: [String]) : Option[String] = match body.kind {
-  ECall(callee, args_) -> match callee.kind {
-    EVar(prim) ->
-      if fwd_prim_name_ok(prim, fn_names) and fwd_args_are_params(params, args_) { Some(prim) }
-      else { None }
-    _ -> None
-  }
+# The primitive's callee when `body` is exactly `prim(p1, …, pn)` over
+# `params` in declaration order: a core builtin's row, or a bare name
+# resolving to no program fn.
+fn fwd_prim_of(tab: SymTab, params: [Param], body: Expr, fn_names: [String]) : Option[ExprKind] = match body.kind {
+  ECall(callee, args_) ->
+    if fwd_is_prim(tab, callee.kind, fn_names) and fwd_args_are_params(params, args_) { Some(callee.kind) }
+    else { None }
   _ -> None
+}
+
+fn fwd_is_prim(tab: SymTab, k: ExprKind, fn_names: [String]) : Bool = match k {
+  # A unit coercion is no call at run time: nothing to forward to.
+  ESym(s, _, _) -> sym_is_builtin(tab, s) and not sym_is_unit_coercion(s)
+  EVar(prim)    -> fwd_prim_name_ok(prim, fn_names)
+  _             -> false
 }
 
 # Lowercase, not underscore-prefixed (synthetics), declared by no DFn:
@@ -136,7 +144,7 @@ fn fwd_rw_expr(e: Expr, fwds: [FwdEntry]) : Expr = {
 fn fwd_try_call(k: ExprKind, fwds: [FwdEntry]) : Option[ExprKind] = match k {
   ECall(callee, args_) -> match fwd_callee_prim(callee.kind, fwds, list_length(args_)) {
     Some(prim) -> Some(ECall(
-      Expr { kind: EVar(prim), line: callee.line, col: callee.col,
+      Expr { kind: prim, line: callee.line, col: callee.col,
              ty: callee.ty, mode: callee.mode,  site: callee.site },
       map(args_, (a) => fwd_rw_expr(a, fwds))))
     None -> None
@@ -144,20 +152,20 @@ fn fwd_try_call(k: ExprKind, fwds: [FwdEntry]) : Option[ExprKind] = match k {
   _ -> None
 }
 
-fn fwd_callee_prim(k: ExprKind, fwds: [FwdEntry], arity: Int) : Option[String] = match k {
+fn fwd_callee_prim(k: ExprKind, fwds: [FwdEntry], arity: Int) : Option[ExprKind] = match k {
   ESym(s, inst, _) -> if inst == spec_none() { fwd_lookup_sym(fwds, s, arity) } else { None }
   EModCall(m, f)   -> fwd_lookup(fwds, concat_all([m, ".", f]), arity)
   _                -> None
 }
 
-fn fwd_lookup(fwds: [FwdEntry], key: String, arity: Int) : Option[String] = match fwds {
+fn fwd_lookup(fwds: [FwdEntry], key: String, arity: Int) : Option[ExprKind] = match fwds {
   []           -> None
   [e, ...rest] -> match e {
     FW(k, _, prim, a) -> if k == key and a == arity { Some(prim) } else { fwd_lookup(rest, key, arity) }
   }
 }
 
-fn fwd_lookup_sym(fwds: [FwdEntry], s: SymId, arity: Int) : Option[String] = match fwds {
+fn fwd_lookup_sym(fwds: [FwdEntry], s: SymId, arity: Int) : Option[ExprKind] = match fwds {
   []           -> None
   [e, ...rest] -> match e {
     FW(_, id, prim, a) ->
