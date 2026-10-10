@@ -130,6 +130,18 @@ for t in a b c; do
 done
 got="$(grep 'main ran$' "$TMP/out" | tr '\n' '|')"
 [ "$got" = "a main ran|c main ran|" ] || fail "the files' mains printed '$got'; want each once, in file order"
+# Each file run alone reports and prints what its share of the shared run does.
+grep -E '^  (ok|FAIL)' "$TMP/err" > "$TMP/shared.ok"
+cp "$TMP/out" "$TMP/shared.out"
+: > "$TMP/alone.ok"
+: > "$TMP/alone.out"
+for t in a b c; do
+  (cd "$TMP/entry" && "$KAI" test "tests/${t}_test.kai" > "$TMP/out" 2> "$TMP/err") || { cat "$TMP/err"; fail "${t}_test, which calls its own main, failed alone"; }
+  grep -E '^  (ok|FAIL)' "$TMP/err" >> "$TMP/alone.ok"
+  cat "$TMP/out" >> "$TMP/alone.out"
+done
+cmp -s "$TMP/alone.ok" "$TMP/shared.ok" || fail "the files alone reported other results than the shared run"
+cmp -s "$TMP/alone.out" "$TMP/shared.out" || fail "the files alone printed other output than the shared run"
 
 # 10 — a test file that imports another builds alone with that file as a
 # module, where a `main` that leaves its row out is an ordinary function:

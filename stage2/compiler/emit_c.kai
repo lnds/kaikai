@@ -43,6 +43,7 @@
 
 import compiler.site_ids
 import compiler.ast
+import compiler.decl_map
 import compiler.entry
 import compiler.core_protos
 import compiler.core_types
@@ -419,12 +420,12 @@ fn emit_ctx_with_tcpend(cx: EmitCtx, l: [TclEntry]) : EmitCtx =
 # (and no scan) when the ledger is empty, the overwhelmingly common case.
 fn emit_ctx_tcpend_after(cx: EmitCtx, e: Expr) : EmitCtx = match cx.tcpend {
   [] -> cx
-  _  -> emit_ctx_with_tcpend(cx, tcl_filter(cx.locals, cx.tcpend, e))
+  _  -> emit_ctx_with_tcpend(cx, tcl_filter(cx.tcpend, e))
 }
 
 fn emit_ctx_tcpend_after_stmts(cx: EmitCtx, ss: [Stmt]) : EmitCtx = match cx.tcpend {
   [] -> cx
-  _  -> emit_ctx_with_tcpend(cx, tcl_filter_stmts(cx.locals, cx.tcpend, ss))
+  _  -> emit_ctx_with_tcpend(cx, tcl_filter_stmts(cx.tcpend, ss))
 }
 
 # Set/clear the hoisted-slot set (entering/leaving a match that hoists).
@@ -657,8 +658,7 @@ fn pfield_ubinds_loop(fs: [PField], acc: [UBind]) : [UBind] {
   }
 }
 
-# The binders under test enclose the code that reads them: an
-# interpolation span reads one by its spelling.
+# The binders under test enclose the code that reads them.
 fn ubind_scope(ubs: [UBind]) : FvOuter = fv_outer_of(map(ubs, ubind_binder))
 
 fn ubind_binder(u: UBind) : Binder = match u {
@@ -924,8 +924,7 @@ type RuLive = RuRead(LocalId)
 
 # The reads after each statement, in block order. Walking from the end,
 # the reads after a statement are its own reads plus those after the next
-# one, so the block is scanned once. An interpolation span reads a binder
-# by its spelling, among the ones in scope where the span sits.
+# one, so the block is scanned once.
 fn ru_live_after(rev: [Stmt], bound: [Binder], live: NameIndex[RuLive],
                  acc: [NameIndex[RuLive]]) : [NameIndex[RuLive]] / Console =
   match rev {
@@ -1975,34 +1974,6 @@ fn emit_local_call(src: String, l: LocalId, args_e: [Expr], cx: EmitCtx) : Strin
   if local_eq(l, local_minted(canonical_continuation())) { emit_resume_call(src, args_e, cx) }
   else { emit_apply_seq("kai_apply(", c_local_of(cx, l), emit_arg_vals(src, args_e, cx)) }
 
-# A callee no pass resolved: only an interpolation fragment parsed at emit
-# time spells one. It names the binder in scope of that spelling, else the
-# continuation, else a constructor, else the C local of the name. This is
-# the one place a callee is looked up by name.
-fn emit_spelled_call(src: String, callee: String, args_e: [Expr], cx: EmitCtx) : String / Console =
-  match emit_scope_spelled(cx, callee) {
-    Some(l) -> emit_local_call(src, l, args_e, cx)
-    None ->
-      if callee == canonical_continuation() { emit_resume_call(src, args_e, cx) }
-      else { match evar_find(cx.variants, callee) {
-        Some(_) -> emit_spelled_ctor_call(src, callee, args_e, cx)
-        None    -> emit_apply_seq("kai_apply(", c_local(callee), emit_arg_vals(src, args_e, cx))
-      } }
-  }
-
-fn emit_spelled_ctor_call(src: String, name: String, args_e: [Expr], cx: EmitCtx) : String / Console = {
-  let n = list_length(args_e)
-  let tag = evar_find_tag_arity(cx.variants, None, name, n)
-  let typed = match evar_slot_kinds_arity(cx.variants, None, name, n) {
-    Some(tys) -> emit_variant_call_typed(tag, name, args_e, tys, src, cx)
-    None      -> None
-  }
-  match typed {
-    Some(s) -> s
-    None    -> emit_variant_call(tag, name, n, emit_slot_ops(src, args_e, cx), cx)
-  }
-}
-
 fn emit_callee_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
   # Each branch emits the arguments it needs itself: emitting them up front
   # for a branch that spells them its own way emits every nested argument
@@ -2298,7 +2269,6 @@ fn emit_callee_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String 
         ])
     }
     ELocal(l) -> emit_local_call(src, l, args_e, cx)
-    EName(w)  -> emit_spelled_call(src, written_text(w), args_e, cx)
     # A modulo-cons site: `args_e` are the original ctor args, the one at
     # the step's hole being the self-call. Builds the cell with an open
     # hole, extends the cctx, rebinds the params and jumps.
@@ -4676,8 +4646,7 @@ fn pat_local_ids(pat: Pattern) : [LocalId] = map(pat_binders(pat, []), (b) => b.
 fn param_local_ids(params: [Param]) : [LocalId] = map(params, (p) => p.binder.id)
 
 # The innermost binder in scope emitted under `name`. Two binders spelled
-# alike are one C variable, and a fragment parsed at emit time names a
-# binder by its text.
+# alike are one C variable.
 fn emit_scope_spelled(cx: EmitCtx, name: String) : Option[LocalId] = scope_spelled_loop(cx, cx.lcs, name, None)
 
 fn scope_spelled_loop(cx: EmitCtx, ls: [LocalId], name: String, found: Option[LocalId]) : Option[LocalId] = match ls {
@@ -4980,59 +4949,6 @@ fn emit_block_raw(src: String, stmts: [Stmt], tail: Expr, cx: EmitCtx) : String 
   cat4("({ ", stmt_out, tail_c, "; })")
 }
 
-# ---- string interpolation ----
-#
-# The raw span includes quotes: either 1 quote on each side for single-
-# or 3 quotes for triple. We walk the body (between the quotes) and
-# split into literal / expression parts at each `#{...}` boundary, then
-# chain them via kai_string_concat wrapping each expression in
-# kai_to_string.
-
-fn interp_is_triple(span: String) : Bool {
-  let n = string_length(span)
-  if n < 6 { false }
-  else {
-    match char_at(span, 0) {
-      Some(c) -> c == '"' and match char_at(span, 1) {
-        Some(c2) -> c2 == '"' and match char_at(span, 2) {
-          Some(c3) -> c3 == '"'
-          None -> false
-        }
-        None -> false
-      }
-      None -> false
-    }
-  }
-}
-
-fn emit_interp_parts(src: String, parts: [IPart], cx: EmitCtx) : String / Console {
-
-  match parts {
-    [] -> "kai_str(\"\")"
-    [p] -> emit_interp_part(src, p, cx)
-    [p, ...rest] -> concat_all([
-      "kai_string_concat(",
-      emit_interp_part(src, p, cx),
-      ", ",
-      emit_interp_parts(src, rest, cx),
-      ")"
-    ])
-  }
-}
-
-fn emit_interp_part(src: String, p: IPart, cx: EmitCtx) : String / Console {
-
-  match p {
-    IpLit(_, raw) -> emit_decoded_str_lit(raw, 1, string_length(raw) - 1)
-    IpExp(expr_src) -> {
-      match parse_interp_expr(expr_src) {
-        Some(e) -> cat3("kai_to_string(", emit_expr(src, surface_lower_expr(e), cx), ")")
-        None -> "kai_str(\"\")"
-      }
-    }
-  }
-}
-
 # escape_str_body_for_c / esc_body_loop moved to compiler/util.kai
 # (issue #677 phase 1h H1a). Per issue #311, triple-quote string spans
 # carry unescaped chars (newline, tab, `"`) the C preprocessor can't
@@ -5051,21 +4967,12 @@ fn emit_decoded_str_lit(span: String, body_start: Int, body_end: Int) : String {
   }
 }
 
-fn emit_string_expr(src: String, span: String, is_triple: Bool, cx: EmitCtx) : String / Console {
-
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  # Fast path: if no `#{` appears, emit as a plain C literal.
-  if not has_interp(span, body_start, body_end) {
-    emit_decoded_str_lit(span, body_start, body_end)
-  } else {
-    let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
-    emit_interp_parts(src, parts, emit_ctx_with_unw(cx, unw_frame_none(cx.unw.ucx)))
-  }
+# A string is a literal by the time it is emitted: the lift turned every
+# interpolation into calls before name resolution.
+fn emit_string_lit(span: String, is_triple: Bool) : String = {
+  let q = if is_triple { 3 } else { 1 }
+  emit_decoded_str_lit(span, q, string_length(span) - q)
 }
-
-# has_interp moved to compiler/util.kai (issue #677 phase 1h H2 pre-move).
 
 # ---- lambda collection + emission ----
 #
@@ -5220,7 +5127,7 @@ fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
       # an ELambda nested inside this body resolves to its own LamInfo.
       let pnames = param_local_ids(params)
       let body_lcs = list_append(list_append(cx.lcs, pnames), capture_locals(caps))
-      let frame = unw_frame(cx.unw, cx.locals, pnames, pnames, body)
+      let frame = unw_frame(cx.unw, pnames, pnames, body)
       let lam_cx = emit_ctx_with_unw(emit_ctx_with_lcs(cx, body_lcs), frame)
       let body_c = emit_expr(src, body, emit_ctx_with_enc_fn(lam_cx, lam_unit(l)))
       let tail = match params {
@@ -5357,15 +5264,20 @@ fn emit_handle_env_typedef_fields(ns: LocalNames, caps: [Capture]) : String {
 # emitted unchanged: any `state` / `log` reference falls through the
 # normal ident lookup and resolves to the local C alias.
 
-# m7b #11: stateful-clause prologue. `state` and `log` are aliases of
-# `self->state`. Both names read the same field — the spec uses
-# `state` for `State[T]` and `log` for `Writer[W]`. An alias the
-# enclosing scope already binds arrives through the captures instead and
-# is declared by the env prologue, so emitting it here too would
-# redeclare the C local and shadow the capture. `cap_names` spells them.
-fn clause_state_prologue(stateful: Bool, cap_names: [String]) : String =
-  concat_all(map(clause_live_aliases(stateful, (key) => list_has(cap_names, key)),
+# Stateful-clause prologue. `state` and `log` are aliases of
+# `self->state`: the spec uses `state` for `State[T]` and `log` for
+# `Writer[W]`.
+fn clause_state_prologue(stateful: Bool) : String =
+  concat_all(map(clause_live_aliases(stateful, (key) => false),
                  (nm) => "    KaiValue *#{c_local(nm)} = self->state;\n"))
+
+# The captures and the body of a stateful clause sit in a C block of
+# their own. A capture is a binding around the handler: where one is
+# spelled like a state alias, the body reads the capture, which that
+# block declares over the alias.
+fn clause_env_scope(stateful: Bool, env_prologue: String, ret: String) : String =
+  if stateful and env_prologue != "" { concat_all(["    {\n", env_prologue, ret, "    }\n"]) }
+  else { concat_all([env_prologue, ret]) }
 
 # Signature of the `finally` thunk. Emitted `static`; modular linkage
 # strips the keyword from definition and prototype alike. Returns the
@@ -5381,9 +5293,7 @@ fn emit_cleanup_thunk(src: String, c: ClauseInfo, cx: EmitCtx) : String / Consol
 
   let k = clause_parts(c)
   let ns = emit_body_locals(clause_locals(c))
-  let cap_names = map(k.caps, (cap) => capture_text(ns, cap))
-  let scx = emit_ctx_declaring(EmitCtx { ...cx, locals: ns },
-                               clause_live_aliases(k.stateful, (key) => list_has(cap_names, key)))
+  let scx = emit_ctx_declaring(EmitCtx { ...cx, locals: ns }, clause_live_aliases(k.stateful, (key) => false))
   let body_c = emit_expr(src, k.body, emit_ctx_with_lcs(scx, list_append(scx.lcs, capture_locals(k.caps))))
   let evn = ev_name_of(cx.tab, cx.effs, k.eff)
   let self_bind = concat_all([
@@ -5392,9 +5302,9 @@ fn emit_cleanup_thunk(src: String, c: ClauseInfo, cx: EmitCtx) : String / Consol
   concat_all([
     emit_cleanup_sig(k.enc_fn.sym, k.line, k.col), " {\n",
     self_bind,
-    clause_state_prologue(k.stateful, cap_names),
-    emit_clause_env_prologue(ns, k.enc_fn.sym, k.line, k.col, k.caps),
-    "    return ", body_c, ";\n",
+    clause_state_prologue(k.stateful),
+    clause_env_scope(k.stateful, emit_clause_env_prologue(ns, k.enc_fn.sym, k.line, k.col, k.caps),
+                     concat_all(["    return ", body_c, ";\n"])),
     "}\n\n"
   ])
 }
@@ -5409,24 +5319,21 @@ fn emit_op_clause_body(src: String, c: ClauseInfo, cx: EmitCtx) : String / Conso
 
   let k = clause_parts(c)
   let ns = emit_body_locals(clause_locals(c))
-  let cap_names = map(k.caps, (cap) => capture_text(ns, cap))
-  # Clause body sees `self` and `k` (always), the live state
-  # aliases, the clause's params (params come into scope through
-  # the surrounding handle's lcs), and — R9 — every capture that
-  # travels through `self->env`.
+  # Clause body sees `self` and `k` (always), the state aliases, the
+  # clause's params (params come into scope through the surrounding
+  # handle's lcs), and every capture that travels through `self->env`.
   let scx = emit_ctx_declaring(EmitCtx { ...cx, locals: ns },
-                               list_append(["self", "k"], clause_live_aliases(k.stateful, (key) => list_has(cap_names, key))))
+                               list_append(["self", "k"], clause_live_aliases(k.stateful, (key) => false)))
   let owned = unw_clause_seeds(c)
-  let frame = unw_frame(cx.unw, scx.locals, owned, owned, k.body)
+  let frame = unw_frame(cx.unw, owned, owned, k.body)
   let body_cx = emit_ctx_with_unw(emit_ctx_with_lcs(scx, list_append(scx.lcs, capture_locals(k.caps))), frame)
   let body_c = emit_expr_in_clause(src, k.body, body_cx, k.stateful)
   let env_prologue = emit_clause_env_prologue(ns, k.enc_fn.sym, k.line, k.col, k.caps)
   concat_all([
     emit_clause_sig(c, cx.effs, cx.tab), " {\n",
     euw_with_fiber(frame.sites != [], "    (void) self; (void) k;\n    "),
-    clause_state_prologue(k.stateful, cap_names),
-    env_prologue,
-    "    return ", body_c, ";\n",
+    clause_state_prologue(k.stateful),
+    clause_env_scope(k.stateful, env_prologue, concat_all(["    return ", body_c, ";\n"])),
     "}\n\n"
   ])
 }
@@ -6422,15 +6329,6 @@ fn emit_local_value(l: LocalId, ty: Option[Ty], cx: EmitCtx) : String = {
   } else { c_local(name) }
 }
 
-# A name no pass resolved: only a fragment parsed at emit time spells one.
-# It reads the binder in scope of that spelling, else the C local of the
-# name.
-fn emit_spelled_value(w: Written, ty: Option[Ty], cx: EmitCtx) : String =
-  match emit_scope_spelled(cx, written_text(w)) {
-    Some(l) -> emit_local_value(l, ty, cx)
-    None    -> c_local(written_text(w))
-  }
-
 fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
 
   match x.kind {
@@ -6456,9 +6354,9 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     EDecimalLit(_) -> panic("emit_expr_boxed: EDecimalLit must be minted before emit")
     EBool(b)     -> if b { "kai_bool(1)" } else { "kai_bool(0)" }
     EChar(c)     -> cat3("kai_char(", int_to_string(char_to_int(c)), ")")
-    EStr(span, is_triple) -> emit_string_expr(src, span, is_triple, cx)
+    EStr(span, is_triple) -> emit_string_lit(span, is_triple)
     EUnit        -> "kai_unit()"
-    EName(w)     -> emit_spelled_value(w, x.ty, cx)
+    EName(_)     -> panic("emit_expr_boxed: EName must be resolved before emit")
     EUnder       -> "kai_unit() /* _ */"
     EPlaceholder -> "kai_unit() /* placeholder */"
     ECall(f, args_e) -> emit_unw_call(src, x, f, args_e, emit_ctx_route_brand(cx, x.ty))
@@ -7883,7 +7781,7 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_fn
         # unit normaliser on every ctor), so every ctor in the body routes.
         let body_in_region = cx.in_region or fn_has_region_brand(params, ret_ty_opt)
         let enc = enc_of_fn(fid, c_sym(name, mo))
-        let frame = unw_fn_frame(cx.unw, locals, enc.unit, Some(row), unw_param_seeds(params, opt_sig, cx.unw.ucx), pids, body)
+        let frame = unw_fn_frame(cx.unw, enc.unit, Some(row), unw_param_seeds(params, opt_sig, cx.unw.ucx), pids, body)
         let body_cx = EmitCtx { ...cx, locals: locals, lcs: body_lcs, fns: body_fns, in_region: body_in_region,
                                 hoisted: [], reuse_donor: None, kind1_raw: [], cur_enc_fn: enc,
                                 rd_active: rd_cap, tcpend: [], unw: frame }
@@ -9121,14 +9019,11 @@ fn check_call_list(n: Int, i: Int) : String {
   }
 }
 
-fn has_main_decl(decls: [Decl], entry: SymId) : Bool {
-  match decls {
-    [] -> false
-    [d, ...rest] -> match d {
-      DFn(_, fid, _, _, _, _, _, _, _, _) -> if is_entry(entry, fid) { true } else { has_main_decl(rest, entry) }
-      _ -> has_main_decl(rest, entry)
-    }
-  }
+# The C symbol key of the function the binary starts, when a function is.
+fn entry_csym(fns: [EFn], entry: SymId) : Option[String] = match fns {
+  [] -> None
+  [EFn(n, _, mo, _, f), ...rest] ->
+    if is_entry(entry, f) { Some(c_sym(written_text(n), mo)) } else { entry_csym(rest, entry) }
 }
 
 # Option C runtime infrastructure — emit the impl-table + variant->head
@@ -9186,7 +9081,7 @@ fn emit_payload_ctor_rows(variants: [VariantEntry]) : String = match variants {
 # `kai_variant_to_head` is registered as flattened (tag, head) pairs —
 # tags are sparse (name-keyed), so the runtime builds the dense lookup.
 fn emit_proto_runtime_tables(decls: [Decl], tab: SymTab, specs: SpecNames, variants: [VariantEntry], fns: [EFn], ids: ProtoIds, ctors: CtorIx, entry: SymId) : String {
-  let impl_rows = collect_pimpl_rows(decls, fns, tab, specs, [])
+  let impl_rows = collect_pimpl_rows(decls, fns, tab, ids, [])
   let v2h       = collect_variant_to_head(variants, decls, tab)
   let n_impl    = list_length(impl_rows)
   let n_v2h     = list_length(v2h)
@@ -9538,12 +9433,13 @@ fn emit_main_wrapper(decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds
     BMTest  -> emit_runner_main(decls, tab, proto_tables, proto_init, test_register_list(decls), "kai_test_summary")
     BMBench -> emit_runner_main(decls, tab, proto_tables, proto_init, bench_call_list(bench_count(decls), 0), "kai_bench_summary")
     BMCheck -> emit_runner_main(decls, tab, proto_tables, proto_init, check_call_list(check_count(decls), 0), "kai_check_summary")
-    BMBuild -> {
-      if has_main_decl(decls, entry) {
-        # m7a #7: install default handlers around `kai_main` only for
-        # the builtin effects that appear in `main`'s row. The push/pop
+    BMBuild -> match entry_csym(fns, entry) {
+      None -> ""
+      Some(start) -> {
+        # m7a #7: install default handlers around the entry point only for
+        # the builtin effects that appear in its row. The push/pop
         # pair is syntactically balanced (Doc C §*Per-fiber isolation*);
-        # pop runs even if `kai_main` returns. Pops are emitted in
+        # pop runs even if the entry point returns. Pops are emitted in
         # reverse-push order so the evidence stack stays LIFO-balanced.
         #
         # Issue #115: the shim block below is emitted at file scope,
@@ -9582,14 +9478,12 @@ fn emit_main_wrapper(decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds
           "    kai_set_args(argc, argv);\n",
           proto_init,
           setup,
-          "    KaiValue *_result = kai_sched_bootstrap(kai_main);\n",
+          "    KaiValue *_result = kai_sched_bootstrap(", c_user_sym(start), ");\n",
           "    int _status = kai_main_exit_status(_result);\n",
           "    kai_decref(_result);\n",
           "    return _status;\n",
           "}\n"
         ])
-      } else {
-        ""
       }
     }
   }
@@ -9900,25 +9794,21 @@ fn mk_proto_dispatch_body(pname: String, opname: String, line: Int, col: Int) : 
 # fragment is parsed with no surrounding scope, so without it the
 # qualified-call resolver reads `pa.Node` against the module table and
 # a local `pa` that shadows module `pa` loses its projection.
-type InterpCtx = { op_names: [String],
-                   file: String, cs: CSCtx, show: Option[ExprKind],
+type InterpCtx = { file: String, cs: CSCtx, show: Option[ExprKind],
                    ts: Option[TSCtx], es: Option[ESCtx], locals: [String] }
 
 #[doc("Emit-layer entry point desugar_interp_decls. `show` names the dispatcher of the core `Show` every `#{...}` calls: user code reaches it through its home, so only that home's protocols answer; `None` leaves the op a bare name. `cores` names the core modules, whose own interpolations reach it bare — they are typed before that module's dispatchers exist. `ts_coll`/`es_coll` are the contested type/effect tables the freshly-parsed interp fragments respell against.")]
-pub fn desugar_interp_decls(ds: [Decl], op_names: [String],
+pub fn desugar_interp_decls(ds: [Decl],
       global_mt: [ModuleEntry], scopes: [ModScope], coll: [NEnt],
       ts_coll: [TSEntry], es_coll: [ESEntry], tab: SymTab, views: FileViews,
       target: String, file: String, show: Option[ShowRef],
-      cores: [String]) : [Decl] / Console + File {
+      cores: [String]) : [Decl] / Console + File =
+  desugar_interp_decls_loop(ds, global_mt, scopes,
+                            coll, ts_coll, es_coll, tab, views,
+                            scope_imports(scopes, global_mt),
+                            target, file, show, cores, target, [])
 
-  if not list_has(op_names, "show") { ds }
-  else { desugar_interp_decls_loop(ds, op_names, global_mt, scopes,
-                                    coll, ts_coll, es_coll, tab, views,
-                                    scope_imports(scopes, global_mt),
-                                    target, file, show, cores, target, []) }
-}
-
-fn desugar_interp_decls_loop(ds: [Decl], op_names: [String],
+fn desugar_interp_decls_loop(ds: [Decl],
       global_mt: [ModuleEntry], scopes: [ModScope], coll: [NEnt],
       ts_coll: [TSEntry], es_coll: [ESEntry], tab: SymTab, views: FileViews, imps: [ModImports],
       target: String, file: String, show: Option[ShowRef], cores: [String],
@@ -9929,7 +9819,7 @@ fn desugar_interp_decls_loop(ds: [Decl], op_names: [String],
     [d, ...rest] -> {
       let home = nu_reader_home(d, cur, target)
       let seg = if home == target { "" } else { home }
-      let cx = InterpCtx { op_names: op_names, file: file,
+      let cx = InterpCtx { file: file,
                            cs: CSCtx { coll: coll, home: home, target: target,
                                        free: false,
                                        mt: ms_table(scopes, seg, global_mt) },
@@ -9939,7 +9829,7 @@ fn desugar_interp_decls_loop(ds: [Decl], op_names: [String],
                            es: if list_length(es_coll) == 0 { None }
                                else { Some(es_ctx(home, target, scopes, global_mt, tab, views)) },
                            locals: [] }
-      desugar_interp_decls_loop(rest, op_names, global_mt, scopes,
+      desugar_interp_decls_loop(rest, global_mt, scopes,
                                 coll, ts_coll, es_coll, tab, views, imps,
                                 target, file, show, cores, home,
                                 [desugar_interp_decl(d, cx), ...acc])
@@ -9949,7 +9839,7 @@ fn desugar_interp_decls_loop(ds: [Decl], op_names: [String],
 
 # `cx` with `names` added to the lexical scope the spans below sit in.
 fn interp_bind(cx: InterpCtx, names: [String]) : InterpCtx =
-  InterpCtx { op_names: cx.op_names, file: cx.file,
+  InterpCtx { file: cx.file,
               cs: cx.cs, show: cx.show, ts: cx.ts, es: cx.es,
               locals: list_append(names, cx.locals) }
 
@@ -9959,9 +9849,16 @@ fn interp_param_names(ps: [Param]) : [String] = map(ps, (p) => written_text(p.bi
 
 fn interp_pat_names(pat: Pattern) : [String] = map(pat_bindings(pat, []), (b) => written_text(b.name))
 
-fn desugar_interp_decl(d: Decl, cx: InterpCtx) : Decl / Console + File {
+# Every declaration form the resolver walks is lifted, so no span
+# reaches it as text.
+fn desugar_interp_decl(d: Decl, cx: InterpCtx) : Decl / Console + File =
+  decl_map_inner(d, (x) => desugar_interp_leaf(x, cx))
+
+fn desugar_interp_leaf(d: Decl, cx: InterpCtx) : Decl / Console + File {
 
   match d {
+    DConst(p, s, ty, body, mo, l, c) ->
+      DConst(p, s, ty, desugar_interp_expr(body, cx), mo, l, c)
     DFn(p, fid, tps, ps, ret, row, body, l, c, mo) ->
       DFn(p, fid, tps, ps, ret, row,
           desugar_interp_expr(body, interp_bind(cx, interp_param_names(ps))), l, c, mo)
@@ -10371,8 +10268,8 @@ fn dots_to_underscores_loop(s: String, i: Int, n: Int, acc: String) : String =
 type CModuleTU = { stem: String, body: String }
 
 #[doc("Issue #748 — separate-compilation entry point. Emits the program as N per-module translation units plus two shared headers, joined into one marker-delimited String the `bin/kai` wrapper splits into files. Reuses every `emit_program` section emitter; the only new work is partitioning `decls` by module-origin.")]
-pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], stamp_ids: [SymId]) : String / Console + Mutable =
-  match emit_program_modular_cached(file, src, raw_decls, tab, specs, ids, bmode, target_origin, regions, [], [], stamp_ids) {
+pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], entry: SymId, regions: [RegionMark], stamp_ids: [SymId]) : String / Console + Mutable =
+  match emit_program_modular_cached(file, src, raw_decls, tab, specs, ids, bmode, target_origin, entry, regions, [], [], stamp_ids) {
     EMO(stream, _) -> stream
   }
 
@@ -10380,9 +10277,8 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], tab: S
 pub type EmitModularOut = EMO(String, [CTU])
 
 #[doc("As `emit_program_modular`, with the core emit cache threaded through: TUs whose stem appears in `cached` splice the cached body instead of emitting; freshly emitted TUs whose module origin appears in `cacheable` are returned for the caller to persist.")]
-pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], cached: [CTU], cacheable: [String], stamp_ids: [SymId]) : EmitModularOut / Console + Mutable {
+pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], entry: SymId, regions: [RegionMark], cached: [CTU], cacheable: [String], stamp_ids: [SymId]) : EmitModularOut / Console + Mutable {
 
-  let entry = entry_of_root(target_origin)
   let alias_resolved = rewrite_alias_decls(raw_decls)
   let decls = desugar_op_calls_decls(alias_resolved, collect_effect_ids(alias_resolved))
   let fns = register_fn_decls(decls, tab, specs, entry)
@@ -10537,11 +10433,10 @@ fn assemble_modular_output(nonce: String, sliced: [SlicedHeaders], tus: [CModule
 }
 
 #[doc("Emit-layer entry point emit_program")]
-pub fn emit_program(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], stamp_ids: [SymId]) : String / Console + Mutable {
+pub fn emit_program(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], entry: SymId, regions: [RegionMark], stamp_ids: [SymId]) : String / Console + Mutable {
 
   # A callee still spelled `Eff.op` becomes the perform the emitter
   # dispatches through the evidence.
-  let entry = entry_of_root(target_origin)
   let alias_resolved = rewrite_alias_decls(raw_decls)
   let decls = desugar_op_calls_decls(alias_resolved, collect_effect_ids(alias_resolved))
   let fns = register_fn_decls(decls, tab, specs, entry)
@@ -12333,24 +12228,22 @@ fn tcrec_has_tail_self_call(body: Expr, me: SelfRef, arity: Int, cons_ok: Bool, 
 # upper`), so neither fired and these loops grew the C stack per element
 # (Tier-1 TCO violation). These helpers recognise the two shapes and
 # return the cons args `[head, self_call]`; the hole is always the tail
-# (slot 1), so the recursion plugs into the open cdr. The marker
-# `trmc_cons_cname` flows through the step sentinel so the lowering
-# builds a `kai_cons` cell (not a `kai_variant_u`) — see `emit_trmc_step`.
+# (slot 1), so the recursion plugs into the open cdr. The step carries a
+# cons spine so the lowering builds a `kai_cons` cell (not a
+# `kai_variant_u`) — see `emit_trmc_step`.
 #
 # Reuse-in-place (the variant path's `_arm_ru` donation) is NOT applied
 # here: `try_arm_top_reuse` only captures a token for PVariant arms, so a
 # cons step always FRESH-allocs the new cell. Correctness of the consumed
 # input is the step's job (NOT the match exit, which the goto skips):
 #   - raw EList (`build`, no scrutinee): nothing to free, the cons cells
-#     it builds are owned by the result; marker `__kai_cons`.
+#     it builds are owned by the result; spine `TsCons`.
 #   - reuse-cons arm (`map_inc`): the consumed scrutinee cons `_scr` would
 #     leak because the goto jumps over the arm's exit `kai_decref(_scr)`,
-#     so the step decref's `_scr` itself before looping; marker
-#     `__kai_cons_s` (s = has a scrutinee to drop).
+#     so the step decref's `_scr` itself before looping; spine
+#     `TsConsScr`.
 # Donating the cons cell to the step (reuse-in-place, zero alloc per level)
 # is a follow-up perf lane, not a correctness gap.
-fn trmc_cons_cname() : String = "__kai_cons"
-fn trmc_cons_scr_cname() : String = "__kai_cons_s"
 
 # Shape 1 — a raw cons literal `[head, ...self_call]` in tail position.
 # Returns the cons args `[head, self_call]` when the spread cdr is a clean
@@ -12766,7 +12659,7 @@ fn tcrec_collect_dm_kind(k: ExprKind, me: SelfRef, arity: Int,
     }
     EMatch(_, arms) -> tcrec_collect_dm_arms(arms, me, arity, params, pnames, uses, hoisted, acc, bmap, base_mask)
     EBlock(stmts, opt_tail) -> {
-      let hoisted1 = tcrec_hoisted_arg_rhs(stmts, hoisted)
+      let hoisted1 = tcrec_hoisted_arg_rhs(stmts, 0, hoisted)
       match opt_tail {
         None -> acc
         Some(e) -> tcrec_collect_dm_table(e, me, arity, params, pnames, uses, hoisted1, acc, bmap, base_mask)
@@ -12776,17 +12669,15 @@ fn tcrec_collect_dm_kind(k: ExprKind, me: SelfRef, arity: Int,
   }
 }
 
-fn tcrec_hoisted_arg_rhs(stmts: [Stmt], acc: [Expr]) : [Expr] {
+# `next` is the hoisted argument the block binds next.
+fn tcrec_hoisted_arg_rhs(stmts: [Stmt], next: Int, acc: [Expr]) : [Expr] {
   match stmts {
     [] -> acc
     [s, ...rest] -> match s {
-      SLet(pat, _, rhs) -> match pat.pkind {
-        PBind(b) ->
-          if ret_slot_binds_tail_arg(b) { tcrec_hoisted_arg_rhs(rest, [rhs, ...acc]) }
-          else { tcrec_hoisted_arg_rhs(rest, acc) }
-        _ -> tcrec_hoisted_arg_rhs(rest, acc)
-      }
-      _ -> tcrec_hoisted_arg_rhs(rest, acc)
+      SLet(pat, _, rhs) ->
+        if ret_slot_binds_tail_arg(pat, next) { tcrec_hoisted_arg_rhs(rest, next + 1, [rhs, ...acc]) }
+        else { tcrec_hoisted_arg_rhs(rest, next, acc) }
+      _ -> tcrec_hoisted_arg_rhs(rest, next, acc)
     }
   }
 }
@@ -13187,9 +13078,8 @@ fn trmc_rewrite_body(body0: Expr, me: SelfRef, arity: Int, self_fn: FnId,
 # per-site dropmask (base + side table), make the step callee, and apply
 # it to the ctor args (`args` carries the self-call at slot `h`). Shared
 # by the user-ctor, builtin-cons-literal, and reuse-cons leaves so the
-# dropmask discipline stays single-sourced. `ctor` is the constructor of
-# the cell, absent on a builtin cons.
-fn trmc_make_step_call(cname: String, ctor: SymId, args: [Expr], h: Int, line: Int, col: Int,
+# dropmask discipline stays single-sourced.
+fn trmc_make_step_call(spine: TrmcSpine, args: [Expr], h: Int, line: Int, col: Int,
                        self_fn: FnId, params: [Param], pnames: [String],
                        uses: UseIx, dm_table: [TcrDm], skip_set: [Binder]) : ExprKind {
   let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
@@ -13199,7 +13089,7 @@ fn trmc_make_step_call(cname: String, ctor: SymId, args: [Expr], h: Int, line: I
     None     -> 0
   }
   let dropmask = base_mask + site_mask
-  let step = MkTrmcStep(TrmcStep { fid: self_fn, hole: h, cname: cname, ctor: ctor, dropmask: dropmask, params: pnames })
+  let step = MkTrmcStep(TrmcStep { fid: self_fn, hole: h, spine: spine, dropmask: dropmask, params: pnames })
   ECall(Expr { kind: EMark(step), line: line, col: col, ty: None, mode: MBoxed , site: 0 }, args)
 }
 
@@ -13227,7 +13117,7 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
     # cons args are `[head, self_call]`; the hole is the cdr (slot 1).
     EList(els) ->
       if cons_ok { match trmc_list_cons_modcons(els, me, arity) {
-        Some(cargs) -> trmc_make_step_call(trmc_cons_cname(), sym_none(), cargs, 1, line, col,
+        Some(cargs) -> trmc_make_step_call(TsCons, cargs, 1, line, col,
                                            self_fn, params, pnames, uses, dm_table, skip_set)
         None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
       } } else { trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 }) }
@@ -13238,17 +13128,15 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
     } else {
       # Tail-position ctor application: is it modulo-cons (user ctor or,
       # via perceus's reuse-cons rewrite, the builtin cons)?
-      let ctor = tcrec_ctor_callee(tab, f)
-      let modslot = match ctor {
-        Some(_) -> tcrec_ctor_modcons_slot(xs, me, arity)
-        None    -> None
+      let modslot = match tcrec_ctor_callee(tab, f) {
+        Some(c2) -> match tcrec_ctor_modcons_slot(xs, me, arity) {
+          Some(slot) -> Some((c2, slot))
+          None       -> None
+        }
+        None -> None
       }
       match modslot {
-        Some(h) -> {
-          let csym = match ctor {
-            Some(c2) -> c2
-            None     -> sym_none()
-          }
+        Some((csym, h)) -> {
           # Dropmask for the rebind of the loop params from the
           # self-call's args. Same per-site computation as ordinary
           # tcrec; the self-call sits at slot `h`.
@@ -13259,7 +13147,7 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
             None     -> 0
           }
           let dropmask = base_mask + site_mask
-          let step = MkTrmcStep(TrmcStep { fid: self_fn, hole: h, cname: written_text(decl_name(tab, csym)), ctor: csym, dropmask: dropmask, params: pnames })
+          let step = MkTrmcStep(TrmcStep { fid: self_fn, hole: h, spine: TsCtor(csym), dropmask: dropmask, params: pnames })
           ECall(Expr { kind: EMark(step), line: line, col: col, ty: f.ty, mode: f.mode , site: 0 }, xs)
         }
         None -> match trmc_reuse_variant_ctor(f, xs, me, arity, tab) {
@@ -13274,7 +13162,7 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
             _                  -> None
           }
           match reuse {
-            Some(cargs) -> trmc_make_step_call(trmc_cons_scr_cname(), sym_none(), cargs, 1, line, col,
+            Some(cargs) -> trmc_make_step_call(TsConsScr, cargs, 1, line, col,
                                                self_fn, params, pnames, uses, dm_table, skip_set)
             None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
           }
@@ -13592,11 +13480,12 @@ fn tcrec_scan_stmts(stmts: [Stmt]) : Bool {
 # rebind from `self_args` using the same dropmask machinery as
 # tcrec_emit_goto (reconciling the exit-drops the goto skips).
 fn emit_trmc_step(src: String, s: TrmcStep, args_e: [Expr], cx: EmitCtx) : String / Console {
-  # Builtin cons modulo-cons step — the markers `__kai_cons` / `__kai_cons_s`
-  # mean the node is a `kai_cons` cell, not a registered variant, so it takes
+  # A cons spine is a `kai_cons` cell, not a registered variant, so it takes
   # the cons-specific build path (hole at the cdr).
-  if s.cname == trmc_cons_cname() or s.cname == trmc_cons_scr_cname() { emit_trmc_cons_step(src, s.fid, s.dropmask, s.params, args_e, cx) }
-  else { emit_trmc_variant_step(src, s, args_e, cx) }
+  match trmc_spine_ctor(s.spine) {
+    Some(ctor) -> emit_trmc_variant_step(src, s, ctor, args_e, cx)
+    None       -> emit_trmc_cons_step(src, s.fid, s.dropmask, s.params, args_e, cx)
+  }
 }
 
 # Cons modulo-cons loop step (`[head, ...self(t)]`). The cons args are
@@ -13663,16 +13552,16 @@ fn trmc_row_kinds(row: Option[VariantEntry], n: Int) : Option[[Int]] = match row
   None    -> None
 }
 
-fn emit_trmc_variant_step(src: String, s: TrmcStep, args_e: [Expr],
+fn emit_trmc_variant_step(src: String, s: TrmcStep, ctor: SymId, args_e: [Expr],
                   cx: EmitCtx) : String / Console {
   let fid = s.fid
   let sym = emit_fn_c_sym(cx, fid)
   let holeslot = s.hole
-  let cname = s.cname
+  let cname = written_text(decl_name(cx.tab, ctor))
   let dropmask = s.dropmask
   let pnames = s.params
   let n = list_length(args_e)
-  let row = ctor_ix_row(cx.ctor_ix, s.ctor)
+  let row = ctor_ix_row(cx.ctor_ix, ctor)
   let tag_str = int_to_string(match row { Some(v) -> ctor_row_tag(v)  None -> 0 })
   let tys_opt = trmc_row_kinds(row, n)
   let mask = match tys_opt { Some(ts) -> variant_slot_mask(ts) None -> 0 }
@@ -13704,7 +13593,7 @@ fn emit_trmc_variant_step(src: String, s: TrmcStep, args_e: [Expr],
   }
   let rebinds  = tcrec_emit_rebinds(pnames, 0)
   let live     = tcl_goto_drops(cx.locals, tcl_without_tok(cx.tcpend), args_e)
-  let slot_stores = emit_trmc_slot_stores(src, "_trmc_node", s.ctor, args_e, tys_opt, holeslot, 0, cx)
+  let slot_stores = emit_trmc_slot_stores(src, "_trmc_node", ctor, args_e, tys_opt, holeslot, 0, cx)
   concat_all([
     # Build the spine node REUSING `_arm_ru` (the token the arm-top
     # captured from the consumed scrutinee when it was unique) — Koka

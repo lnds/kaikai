@@ -9,11 +9,14 @@ runtime, on the value bound once so it is evaluated exactly once.
 
 import compiler.util
 import compiler.ast
+import compiler.handler_alias
 import compiler.written
 import compiler.core_builtins
 import compiler.refinements
 import compiler.refine_help
 import compiler.ast_map
+import compiler.symtab
+import compiler.local_names
 
 #[doc("The predicates a refined type demands, outermost first.")]
 pub fn rc_preds(t: Ty) : [Expr] = match t {
@@ -62,18 +65,23 @@ fn rc_classify(owed: [Expr], value: Expr, refs: [RefBinding], acc: [Expr]) : RcV
 fn rc_read(b: Binder, line: Int, col: Int) : Expr =
   if local_raw(b.id) == local_raw(local_none()) { mk_expr(EName(b.name), line, col) } else { mk_local(b.id, line, col) }
 
-#[doc("The runtime check of `pred` on the value bound to `b`, panicking with the decl `ctx` names.")]
-pub fn rc_assert(b: Binder, pred: Expr, ctx: String, strip: Bool) : Stmt {
+#[doc("The runtime check of `pred` on the value bound to `b`, panicking with the decl `ctx` names. `tab` and `locals` name what the predicate refers to in that message.")]
+pub fn rc_assert(b: Binder, pred: Expr, ctx: String, strip: Bool, tab: SymTab, locals: LocalNames) : Stmt {
   let v = rc_read(b, pred.line, pred.col)
   let self_e = if strip { mk_expr(ECall(builtin_mk(CbStripUnit, pred.line, pred.col), [v]), pred.line, pred.col) } else { v }
   let msg = concat_all([
     "\"refinement violated in `", escape_str_body_for_c(ctx), "`",
-    "\\npredicate: ", escape_str_body_for_c(pred_text(pred)),
+    "\\npredicate: ", escape_str_body_for_c(refine_pred_text(pred, tab, locals)),
     "\\ndeclared at line ", int_to_string(pred.line),
     ", col ", int_to_string(pred.col), "\""
   ])
-  SAssert(subst_self_with(pred, self_e), Some(mk_expr(EStr(msg, false), pred.line, pred.col)))
+  SAssert(rc_on(b, pred, self_e), Some(mk_expr(EStr(msg, false), pred.line, pred.col)))
 }
+
+# The predicate over the value: before the resolver has numbered `b`, a
+# predicate written in place still spells its `self`.
+fn rc_on(b: Binder, pred: Expr, self_e: Expr) : Expr =
+  if local_raw(b.id) == local_raw(local_none()) { subst_self_unresolved(pred, self_e) } else { subst_self_with(pred, self_e) }
 
 #[doc("The refined types `expected` gives the type variables of `pat`, where it gives any.")]
 pub fn rc_var_binds(pat: Ty, expected: Ty) : [(Int, Ty)] = rc_binds(pat, expected, [])
@@ -125,9 +133,9 @@ pub fn rc_check_var_writes(name: Written, ann: Option[TypeExpr], body: Expr) : E
 fn rc_pin_writes(name: Written, t: TypeExpr, e: Expr) : Expr = match rc_write_of(name, e) {
   Some(v) -> match e.kind {
     ECall(callee, _) -> {
-      let cell = string_concat(written_text(name), "__ann")
-      let pinned = mk_expr(EBlock([SLet(mk_pat(PBind(binder_written(cell)), v.line, v.col), Some(t), rc_pin_writes(name, t, v))],
-                                  Some(mk_name(cell, v.line, v.col))), v.line, v.col)
+      let ann = var_ann_binder(written_text(name), v.line, v.col)
+      let pinned = mk_expr(EBlock([SLet(mk_pat(PBind(ann), v.line, v.col), Some(t), rc_pin_writes(name, t, v))],
+                                  Some(mk_expr(EName(ann.name), v.line, v.col))), v.line, v.col)
       Expr { ...e, kind: ECall(callee, [pinned]) }
     }
     _ -> e

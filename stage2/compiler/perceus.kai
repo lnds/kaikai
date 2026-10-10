@@ -28,19 +28,14 @@
 #
 # Bundle order: ... infer, fnreg, unbox, perceus, main. Imports
 # compiler.ast for the AST nodes, compiler.diag for diagnostics,
-# compiler.util for `concat_all` / `has_interp` / `list_has`,
-# compiler.fnreg for the EFn registry (`register_fn_decls`) + the interp scanner
-# (`iscan_collect` / `body_is_ffi_extern`), compiler.infer for the
-# `Use` / `LU` / `IPart` / `IScan` types, compiler.lex for `tokenize`,
-# and compiler.parse for `parse_interp_expr`. The shape comparison
-# (`prc_same_ty`) and the UFn predicates are downward glue with the
-# `prc_` prefix.
+# compiler.fnreg for the EFn registry (`register_fn_decls`) and
+# `body_is_ffi_extern`, compiler.infer for the `Use` / `LU` types. The
+# shape comparison (`prc_same_ty`) and the UFn predicates are downward
+# glue with the `prc_` prefix.
 
 import compiler.ast
 import compiler.marks
 import compiler.ret_slots
-import compiler.util
-import compiler.parse
 import compiler.infer
 import compiler.fnreg
 import compiler.ast_map
@@ -70,7 +65,6 @@ import compiler.perceus_body_reads
 import compiler.perceus_move_sites
 import compiler.perceus_seg_request
 import compiler.name_ix
-import compiler.interp_span
 import compiler.perceus_rethread
 import compiler.perceus_cap
 import compiler.scope_file
@@ -78,10 +72,7 @@ import compiler.self_call
 import compiler.symtab
 import compiler.handler_alias
 import compiler.kinds
-import compiler.lex
-import compiler.decl_text
 import compiler.ctor_ix
-import compiler.perceus_span
 import compiler.spec_names
 
 # ==================================================================
@@ -199,11 +190,11 @@ fn prc_raw_names_zip(params: [Param], mask: [Bool]) : [Binder] = match params {
 # hands on are planted where `compiler.perceus_payer` names the payer.
 
 
-#[doc("Entry point: scope-aware Perceus RC pass over the post-mono [Decl] (dup at non-last uses, drop unused params at entry). Pipeline position monomorphise -> unbox -> perceus_pass_in -> tco -> emit. `tab` is the program's symbol table, so registry identities match the ones the resolver stamped on call sites; `specs` names the specialisations; `views` are the per-file scope views the resolver climbed; `root` names the root file's module.")]
+#[doc("Entry point: scope-aware Perceus RC pass over the post-mono [Decl] (dup at non-last uses, drop unused params at entry). Pipeline position monomorphise -> unbox -> perceus_pass_in -> tco -> emit. `tab` is the program's symbol table, so registry identities match the ones the resolver stamped on call sites; `specs` names the specialisations; `views` are the per-file scope views the resolver climbed; `root` names the root file's module; `entry` is what the binary starts.")]
 pub fn perceus_pass_in(decls: [Decl], tab: SymTab, specs: SpecNames, views: FileViews,
-      root: String) : [Decl] / Console {
+      root: String, entry: SymId) : [Decl] / Console {
 
-  let fns = fnx_build(register_fn_decls(decls, tab, specs, entry_id(root)))
+  let fns = fnx_build(register_fn_decls(decls, tab, specs, entry))
   # Borrow inference pre-pass (Koka pre-Parc): per-fn borrowed param
   # positions, consumed by BOTH sides of the flip (callee wraps the
   # borrowed scrutinee in __perceus_borrow so emit_match skips its exit
@@ -969,9 +960,6 @@ fn pcs_consuming_slots_kind(nm: Binder, k: ExprKind, cmap: ConsumeIndex, bm: Bor
   EField(x, _)    -> if pcs_is_leaf_ref(x) { not pcs_is_bare(nm.id, x) } else { pcs_uses_only_consuming_slots(nm, x, cmap, bm, tab) }
   EIndex(a, b)    -> (if pcs_is_leaf_ref(a) { not pcs_is_bare(nm.id, a) } else { pcs_uses_only_consuming_slots(nm, a, cmap, bm, tab) }) and
                       pcs_uses_only_consuming_slots(nm, b, cmap, bm, tab)
-  # Interp reads take a dup and never a consuming slot; lexical presence
-  # is the pure stand-in for the collector's parsed view.
-  EStr(span, is_triple) -> pcs_interp_ident_count(nm, span, is_triple) == 0
   # Intrinsics incref their args internally — no arg slot ever consumes.
   EIntrinsic(_, xs)   -> not pcs_name_in_exprs(nm, xs)
   ESurface(sf)        -> not pcs_name_in_exprs(nm, surface_children(sf))
@@ -1342,7 +1330,7 @@ fn pcs_inspected_kind(nm: Binder, k: ExprKind) : Bool = match k {
   EBlock(stmts, tail) -> pcs_inspected_block(nm, stmts, tail)
   ELambda(_, b)       -> pcs_name_absent(nm, b)   # capture = owned
   EList(els)          -> pcs_inspected_elems(nm, els)
-  EStr(_, _)          -> false   # interpolation reads are owned (conservative)
+  EStr(_, _)          -> false   # conservative
   EHandle(_, _, _, _, _, _, _) -> false   # conservative: handlers are owned
   _ -> pcs_inspected_ps(nm, xp_positions_kind(k))
 }
@@ -2047,15 +2035,14 @@ fn pcs_occurs_outside_top_dups(es: [Expr], b: Binder) : Bool = match es {
     else { pcs_occurs_outside_top_dups(rest, b) }
 }
 
-# Any appearance of `b`: reads at any depth, shadowed rebinds included,
-# interpolation spans by substring. Over-approximates on purpose — a true
-# verdict only forfeits the unwrap.
+# Any appearance of `b`: reads at any depth, shadowed rebinds included.
+# Over-approximates on purpose — a true verdict only forfeits the unwrap.
 fn pcs_var_occurs(e: Expr, b: Binder) : Bool = match e.kind {
   ELocal(u)          -> local_eq(u, b.id)
   ESym(_, _)         -> false
   EOp(_)             -> false
   EMark(MkDup)       -> false
-  EStr(span, _)      -> pcs_span_spells(b, span)
+  EStr(_, _)         -> false
   ECall(f, xs)       -> pcs_var_occurs(f, b) or pcs_var_occurs_list(xs, b)
   EIntrinsic(_, xs)  -> pcs_var_occurs_list(xs, b)
   EField(x, _)       -> pcs_var_occurs(x, b)
@@ -2155,20 +2142,13 @@ fn pcs_rewrite_kind(k: ExprKind, line: Int, col: Int, scope: [Binder],
     }
     # RC tracks local bindings, and `scope` holds exactly those. A
     # reference to a declaration or to an effect operation owns nothing
-    # to dup. A name is one an interpolation body spells that no binder
-    # in scope answers to.
+    # to dup.
     ESym(_, _) -> k
     EOp(_)     -> k
     EName(_)   -> k
     # A mark holds no reference, so RC has nothing to dup on it.
     EMark(m) -> EMark(m)
-    # §4b — interpolated strings carry their interp expressions as raw
-    # source spans; the structural visitor cannot reach the inner reads.
-    # Re-tokenise + re-parse each `#{...}` body, run pcs_rewrite_expr on
-    # the parsed Expr, then surgically rewrite the source by replacing
-    # the wrapped ident tokens with `__perceus_dup(NAME)`. Result rounds
-    # back through the parser at emit time, which reads the dup mark back.
-    EStr(span, is_triple) -> EStr(pcs_rewrite_estr_span(span, is_triple, scope, uses, in_lam, skip_set, force_set, bmap, move_last_set), is_triple)
+    EStr(_, _) -> k
     # Scope-aware kinds: ELambda extends scope with params and flips
     # in_lam; EBlock threads scope through SLet/SVar bindings; EMatch
     # delegates to pcs_rewrite_arms which adds pattern bindings to the
@@ -2469,11 +2449,6 @@ fn pcs_max_paths_b_expr(nm: Binder, e: Expr, bmap: BorrowMap) : Int =
 
 fn pcs_max_paths_b_kind(nm: Binder, k: ExprKind, bmap: BorrowMap) : Int = match k {
   ELocal(u)           -> if local_eq(u, nm.id) { 1 } else { 0 }
-  # The use collector parses `#{...}` bodies and sees their reads; this
-  # counter must never see fewer. The lexical count over-approximates
-  # (field names, lambda params count too) — over-counting only makes
-  # callers more conservative, under-counting un-guards a move.
-  EStr(span, is_triple) -> pcs_interp_ident_count(nm, span, is_triple)
   ECall(f, xs)        -> {
     # Discount args that land in a borrowed slot of the callee: those uses
     # of `nm` are borrows, not consumers, and do not count. The slots are
@@ -3322,7 +3297,7 @@ fn pcs_consumers_linear_kind(nm: Binder, k: ExprKind) : Bool = match k {
                                  # transfer, linear), or recursed into
                                  # from an arg/field that already classified
                                  # the call/ctor as linear or not.
-  EStr(_, _)          -> true   # interpolated reads handled by §4b
+  EStr(_, _)          -> true
   ECall(f, xs)        -> pcs_call_consumers_linear(nm, f, xs)
   EIntrinsic(_, xs)   -> {
     # Intrinsics are runtime primitives — non-linear if `nm` appears
@@ -3526,84 +3501,6 @@ fn pcs_consumed_b_arms(nm: Binder, arms: [Arm], bmap: BorrowMap) : Bool = match 
   }
 }
 
-# ---- dup wraps inside `#{...}` bodies ----
-#
-# The span is opaque source text, so the rewrite parses each body, reads
-# its names as the binders in scope spell them (`compiler.perceus_span`),
-# runs `pcs_rewrite_expr` over it with the outer scope and table, and
-# respells every read it wrapped as `__perceus_dup(NAME)` in the text. Emit
-# re-parses the body and the parse boundary reads that spelling back as the
-# dup mark.
-
-fn pcs_rewrite_estr_span(span: String, is_triple: Bool, scope: [Binder],
-                          uses: UseIx, in_lam: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap, move_last_set: [Binder]) : String / Console =
-  match isp_parts(span, is_triple) {
-    []    -> span
-    parts -> isp_rebuild(is_triple, pcs_rewrite_iparts(parts, scope, uses, in_lam, skip_set, force_set, bmap))
-  }
-
-fn pcs_rewrite_iparts(parts: [IPart], scope: [Binder], uses: UseIx,
-                       in_lam: Bool, skip_set: [Binder], force_set: [Binder], bmap: BorrowMap) : [IPart] / Console =
-  match parts {
-    [] -> []
-    [p, ...rest] -> {
-      let p1 = match p {
-        IpLit(_, _) -> p
-        IpExp(esrc) -> match parse_interp_expr(esrc) {
-          None -> p
-          Some(parsed) -> IpExp(isp_render(esrc, pcs_dup_edits(esrc, pcs_dup_sites(
-            pcs_rewrite_expr(pcs_span_expr(parsed, scope), scope, uses, in_lam, skip_set, force_set, bmap, []), []))))
-        }
-      }
-      [p1, ...pcs_rewrite_iparts(rest, scope, uses, in_lam, skip_set, force_set, bmap)]
-    }
-  }
-
-# The position of each local read the rewrite wrapped in `__perceus_dup`.
-fn pcs_dup_sites(e: Expr, acc: [(Int, Int)]) : [(Int, Int)] = {
-  let acc1 = match e.kind {
-    ECall(f, [arg]) -> match f.kind {
-      EMark(MkDup) -> match arg.kind {
-        ELocal(_) -> [(arg.line, arg.col), ...acc]
-        _         -> acc
-      }
-      _ -> acc
-    }
-    _ -> acc
-  }
-  pcs_dup_sites_ps(xp_positions(e), acc1)
-}
-
-fn pcs_dup_sites_ps(ps: [XPos], acc: [(Int, Int)]) : [(Int, Int)] = match ps {
-  []                  -> acc
-  [XP(_, c), ...rest] -> pcs_dup_sites_ps(rest, pcs_dup_sites(c, acc))
-}
-
-# Each wrapped read as a respelling of the identifier token at its
-# position: the name wrapped is the one the body's own text spells there.
-fn pcs_dup_edits(esrc: String, sites: [(Int, Int)]) : [IdentEdit] = match sites {
-  []         -> []
-  [_, ...__] -> pcs_dup_edit_toks(esrc, tokenize(esrc), sites)
-}
-
-fn pcs_dup_edit_toks(esrc: String, toks: [Token], sites: [(Int, Int)]) : [IdentEdit] = match toks {
-  []           -> []
-  [t, ...rest] -> {
-    let tl = pcs_dup_edit_toks(esrc, rest, sites)
-    match t.kind {
-      TkIdent -> if pcs_site_at(sites, t.line, t.col) {
-                   [IdentEdit(t.line, t.col, concat_all([mark_name(MkDup), "(", string_slice(esrc, t.start, t.length), ")"])), ...tl]
-                 } else { tl }
-      _       -> tl
-    }
-  }
-}
-
-fn pcs_site_at(sites: [(Int, Int)], line: Int, col: Int) : Bool = match sites {
-  []                -> false
-  [(l, c), ...rest] -> (l == line and c == col) or pcs_site_at(rest, line, col)
-}
-
 # A single-use owned param whose only read sits on some-but-not-all
 # execution paths would transfer raw at the read with no exit drop —
 # every path that skips the read leaks the birth ref. Select such
@@ -3619,22 +3516,18 @@ fn pcs_branchy_single_use_params(fn_name: SelfRef, fid: FnId, pnames: [Binder],
   if pcs_body_has_tail_self_call(fn_name, body) or
      pcs_arm_self_modulo_cons(fn_name, body, tab) or
      pcs_body_has_cons_self_tail(fn_name, body) or
-     pcs_fn_named_in(fid, tab, body) { [] }
+     pcs_fn_named_in(fid, body) { [] }
   else { pcs_branchy_single_loop(pnames, body, uses, skip) }
 
-# A reference to the fn `fid` outside lambdas: by identity, or spelled in
-# an interpolation, which is source text and names a declaration as it was
-# written. A specialisation is spelled by no source text.
-fn pcs_fn_named_in(fid: FnId, tab: SymTab, e: Expr) : Bool = match e.kind {
-  ESym(s, inst)  -> fnid_eq(FnId(s, inst), fid)
-  EStr(span, t3) -> fnid_inst(fid) == spec_none() and
-                    pcs_interp_spelled_count(decl_name(tab, fnid_sym(fid)), span, t3) > 0
-  _              -> pcs_fn_named_ps(fid, tab, xp_positions_kind(e.kind))
+# A reference to the fn `fid` outside lambdas.
+fn pcs_fn_named_in(fid: FnId, e: Expr) : Bool = match e.kind {
+  ESym(s, inst) -> fnid_eq(FnId(s, inst), fid)
+  _             -> pcs_fn_named_ps(fid, xp_positions_kind(e.kind))
 }
 
-fn pcs_fn_named_ps(fid: FnId, tab: SymTab, ps: [XPos]) : Bool = match ps {
+fn pcs_fn_named_ps(fid: FnId, ps: [XPos]) : Bool = match ps {
   []                  -> false
-  [XP(r, c), ...rest] -> (match r { XLam -> false  _ -> pcs_fn_named_in(fid, tab, c) }) or pcs_fn_named_ps(fid, tab, rest)
+  [XP(r, c), ...rest] -> (match r { XLam -> false  _ -> pcs_fn_named_in(fid, c) }) or pcs_fn_named_ps(fid, rest)
 }
 
 # The builtin-cons TRMC tail (`[h, ...self(t)]`): a tail-position list
@@ -3698,7 +3591,7 @@ fn pcs_branchy_single_loop(pnames: [Binder], body: Expr, uses: UseIx,
 # edge (an `and`/`or` RHS, an assert message — skippable with no
 # covering alternative) land in the second, and the flag marks reads
 # the walk cannot attribute to a path at all (deferred `XLam`/`XCl`
-# bodies, interpolation spans).
+# bodies).
 type PcsRR = PRR(Int, Int, Bool)
 
 fn pcs_rr_merge(a: PcsRR, b: PcsRR) : PcsRR = match a {
@@ -3709,8 +3602,6 @@ fn pcs_read_roles(nm: Binder, e: Expr, in_sc: Bool) : PcsRR = match e.kind {
   ELocal(u) -> if local_eq(u, nm.id) {
                  if in_sc { PRR(0, 1, false) } else { PRR(1, 0, false) }
                } else { PRR(0, 0, false) }
-  EStr(span, t3) -> if pcs_interp_ident_count(nm, span, t3) > 0 { PRR(0, 0, true) }
-                    else { PRR(0, 0, false) }
   _ -> pcs_read_roles_ps(nm, xp_positions(e), in_sc)
 }
 
@@ -4299,8 +4190,8 @@ fn pcs_collect_arm_tail_drops(bound: [Binder], ln: Int, cl: Int, body: Expr,
   }
 
 # A read of `nm` not wrapped in `__perceus_dup` — the post-rewrite spelling
-# of a move. Lambda bodies and interpolation spans count conservatively:
-# their reads cannot be attributed, so the binder is left alone. The
+# of a move. Lambda bodies count conservatively: their reads cannot be
+# attributed, so the binder is left alone. The
 # descend rides `xp_positions`; only the payment-relevant forms are
 # special-cased here.
 fn pcs_has_bare_read(nm: Binder, e: Expr) : Bool = match e.kind {
@@ -4310,7 +4201,6 @@ fn pcs_has_bare_read(nm: Binder, e: Expr) : Bool = match e.kind {
     _ -> pcs_has_bare_read(nm, f) or pcs_hbr_list(nm, xs)
   }
   ELambda(_, body)      -> pcs_name_in_expr(nm, body)
-  EStr(span, is_triple) -> pcs_interp_ident_count(nm, span, is_triple) > 0
   _                     -> pcs_hbr_ps(nm, xp_positions(e))
 }
 

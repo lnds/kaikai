@@ -620,7 +620,7 @@ test-modules: $(TARGET) build
 # rqc has an empty module table and every EField stays as a
 # record-field projection (M6.1 + record-projection legacy
 # behaviour preserved).
-QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection qualified_type_in_signature qualified_constructor_disambig alias_consumer_clash alias_consumer_clash_renamed private_type_alias_scope protocol_home_scope protocol_dispatch_home pub_unit_scope const_home_scope interp_const_scope qualified_record_variant_pattern
+QUALIFIED_DIRS := basic alias selective local_shadow two_modules two_modules_same_name record_projection qualified_type_in_signature qualified_constructor_disambig alias_consumer_clash alias_consumer_clash_renamed private_type_alias_scope protocol_home_scope protocol_dispatch_home pub_unit_scope const_home_scope interp_const_scope qualified_record_variant_pattern const_interp_homonyms
 QUALIFIED_NEG_DIRS := unknown_export qualified_type_negative protocol_private_foreign protocol_dispatch_private pub_unit_bare_ambiguous pub_unit_cross_module qualified_record_variant_unknown
 
 test-modules-qualified: $(TARGET) build
@@ -11843,6 +11843,36 @@ test-issue-2022-test-body-builtin-effects-native:
 	@echo "issue-2022 native: SKIP (KAI_LLVM != 1)"
 endif
 
+# A block calls its own file's `main`. The runner starts a test binary, so
+# that `main` is a function like any other and runs when called, on both
+# backends.
+RUNNER_OWN_MAIN_FIXTURES := own_main own_main_pub_row
+
+define runner_own_main_run
+	@set -e; \
+	for n in $(RUNNER_OWN_MAIN_FIXTURES); do \
+	  f=../examples/test-runner/$$n; out=build/runner-own-main-$(1)-$$n; \
+	  ../bin/kai test --backend=$(1) $$f.kai > $$out.stdout 2> $$out.raw \
+	    || { echo "runner-own-main FAIL ($(1) $$n: kai test exited non-zero)"; cat $$out.stdout $$out.raw; exit 1; }; \
+	  grep -v '^kai: note' $$out.raw > $$out.stderr || true; \
+	  cat $$out.stdout $$out.stderr > $$out.out; \
+	  diff -q $$f.test.expected $$out.out > /dev/null \
+	    || { echo "runner-own-main DIFF ($(1) $$n)"; diff $$f.test.expected $$out.out; exit 1; }; \
+	done; \
+	echo "runner-own-main OK ($(1): a block calls its file's main)"
+endef
+
+test-runner-own-main: $(TARGET) bin-kai build
+	$(call runner_own_main_run,c)
+
+ifeq ($(KAI_LLVM),1)
+test-runner-own-main-native: $(TARGET) bin-kai build
+	$(call runner_own_main_run,native)
+else
+test-runner-own-main-native:
+	@echo "runner-own-main native: SKIP (KAI_LLVM != 1)"
+endif
+
 # An actor that sends to a mailbox whose scope already ended must not take
 # the test binary down with it: the following test still runs and the
 # runner reports the whole suite, on both backends.
@@ -13676,7 +13706,7 @@ test-home-tu-partition: $(TARGET) build
 	  echo "home-tu OK: $$1 -> $$3"; }; \
 	assert_tu "root pub fn"        "kaiu_main__badge"             "main.c"; \
 	assert_tu "root private fn"    "kaiu_helper"                  "__root__.c"; \
-	assert_tu "fn main"            "kai_main.void. .$$"          "__root__.c"; \
+	assert_tu "fn main"            "kaiu_main.void. .$$"         "__root__.c"; \
 	assert_tu "root lambda"        "_kaiu_lam_main_19_14"         "__root__.c"; \
 	assert_tu "imported pub fn"    "kaiu_lib__widget__label"           "lib__widget.c"; \
 	assert_tu "cross-module spec"  "kaiu_lib__widget__wrap__mono__Int" "__root__.c"; \

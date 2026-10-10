@@ -17,7 +17,6 @@ both, and the brackets are the ones the walk finds without `traps`.
 """)]
 
 import compiler.ast
-import compiler.local_names
 import compiler.expr_positions
 import compiler.emit_tcrec_live
 import compiler.unwind_cx
@@ -32,14 +31,13 @@ import compiler.modules
 # which binding it reads, so neither is ever registered. `locals` are
 # every binder of the frame, the test for a call through a local closure.
 # `jumps` are the params a tail-call goto may release without naming them.
-# `ns` names the binders, for the interpolation spans that read them by text.
-type UwFx = { ucx: UnwCx, ns: LocalNames, banned: [LocalId], locals: [LocalId], body: Expr, jumps: [LocalId], traps: Bool }
+type UwFx = { ucx: UnwCx, banned: [LocalId], locals: [LocalId], body: Expr, jumps: [LocalId], traps: Bool }
 
 type UwR = { pend: [LocalId], sites: [UnwSite] }
 
-#[doc("The sites of the frame `body`: `pend` its owned entry binders, `bound` every binder it introduces, `banned` those bound twice, `ns` their names; `traps` adds the native landing pads.")]
-pub fn unw_walk(ucx: UnwCx, ns: LocalNames, pend: [LocalId], bound: [LocalId], banned: [LocalId], params: [LocalId], body: Expr, traps: Bool) : [UnwSite] = {
-  let fx = UwFx { ucx: ucx, ns: ns, banned: banned, locals: bound, body: body,
+#[doc("The sites of the frame `body`: `pend` its owned entry binders, `bound` every binder it introduces, `banned` those bound twice; `traps` adds the native landing pads.")]
+pub fn unw_walk(ucx: UnwCx, pend: [LocalId], bound: [LocalId], banned: [LocalId], params: [LocalId], body: Expr, traps: Bool) : [UnwSite] = {
+  let fx = UwFx { ucx: ucx, banned: banned, locals: bound, body: body,
                   jumps: if tcl_has_goto(body) { params } else { [] }, traps: traps }
   uw_expr(body, pend, [], fx, []).sites
 }
@@ -56,7 +54,7 @@ fn uw_expr(e: Expr, pend: [LocalId], z: [LocalId], fx: UwFx, sites: [UnwSite]) :
     else { uw_nary(e, pend, z, fx, sites) }
   ECall(f, xs) ->
     if unw_call_unwinds(f, xs, fx.locals, fx.ucx) { uw_site(e, f, xs, pend, z, fx, sites) }
-    else if unw_lending(f) { UwR { pend: unw_filter(fx.ns, pend, e), sites: uw_nary(e, pend, z, fx, sites).sites } }
+    else if unw_lending(f) { UwR { pend: unw_filter(pend, e), sites: uw_nary(e, pend, z, fx, sites).sites } }
     else if fx.traps and unw_call_traps(f) { uw_pad_op(e, Some(UwLends(f, xs)), pend, z, fx, sites) }
     else { uw_merged(uw_args(e, f, xs, pend, z, fx), sites) }
   _ -> uw_leaf(e, pend, z, fx, sites)
@@ -110,7 +108,7 @@ fn uw_match(e: Expr, s: Expr, arms: [Arm], pend: [LocalId], z: [LocalId], fx: Uw
 fn uw_site(e: Expr, f: Expr, xs: [Expr], pend: [LocalId], z: [LocalId], fx: UwFx, sites: [UnwSite]) : UwR = {
   let live = unw_minus(pend, z)
   let r = uw_args(e, f, xs, pend, z, fx)
-  let held = unw_minus(unw_union(unw_inter(live, r.pend), unw_lent(fx.ns, f, xs, live)), fx.banned)
+  let held = unw_minus(unw_union(unw_inter(live, r.pend), unw_lent(f, xs, live)), fx.banned)
   UwR { pend: r.pend, sites: unw_add(UnwCall(e.site, held), unw_merge(r.sites, unw_union(held, uw_local_callee(f, fx)), sites)) }
 }
 
@@ -129,7 +127,7 @@ fn uw_pad_op(e: Expr, lends: Option[UwLends], pend: [LocalId], z: [LocalId], fx:
     None -> uw_nary(e, pend, z, fx, [])
   }
   if uw_all_pads(r.sites) {
-    let lent = match lends { Some(UwLends(f, xs)) -> unw_lent(fx.ns, f, xs, live) None -> [] }
+    let lent = match lends { Some(UwLends(f, xs)) -> unw_lent(f, xs, live) None -> [] }
     let held = unw_minus(unw_union(unw_inter(live, r.pend), lent), fx.banned)
     UwR { pend: r.pend, sites: unw_add(UnwPad(e.site, held), unw_merge(r.sites, held, sites)) }
   } else { UwR { pend: r.pend, sites: unw_merge(r.sites, [], sites) } }
@@ -158,7 +156,7 @@ fn uw_all_pads(ss: [UnwSite]) : Bool = match ss {
 # Removing a name from a site set commutes with every step that builds it,
 # so dropping it afterwards is the same as never letting it in.
 fn uw_nary(e: Expr, pend: [LocalId], z: [LocalId], fx: UwFx, sites: [UnwSite]) : UwR = match xp_positions(e) {
-  [] -> UwR { pend: unw_filter(fx.ns, pend, e), sites: sites }
+  [] -> UwR { pend: unw_filter(pend, e), sites: sites }
   ps -> {
     let rs = uw_walk_children(ps, pend, z, fx)
     let eaten = map(rs, (r) => unw_minus(pend, r.pend))
@@ -173,7 +171,7 @@ fn uw_walk_children(ps: [XPos], pend: [LocalId], z: [LocalId], fx: UwFx) : [UwR]
 
 fn uw_child(r: XRole, c: Expr, pend: [LocalId], z: [LocalId], fx: UwFx) : UwR = match r {
   XLam -> UwR { pend: pend, sites: [] }
-  XCl  -> UwR { pend: unw_filter(fx.ns, pend, c), sites: [] }
+  XCl  -> UwR { pend: unw_filter(pend, c), sites: [] }
   _    -> uw_expr(c, pend, z, fx, [])
 }
 
@@ -224,7 +222,7 @@ fn uw_assert(s: Stmt, c: Expr, pend: [LocalId], z: [LocalId], fx: UwFx, sites: [
 fn uw_stmt_nary(ps: [XPos], pend: [LocalId], z: [LocalId], fx: UwFx, sites: [UnwSite], s: Stmt) : UwR = {
   let rs = uw_walk_children(ps, pend, z, fx)
   let eaten = map(rs, (r) => unw_minus(pend, r.pend))
-  UwR { pend: unw_minus(unw_filter_stmt(fx.ns, pend, s), unw_others(eaten, -1, 0)), sites: uw_join(ps, rs, eaten, [], sites) }
+  UwR { pend: unw_minus(unw_filter_stmt(pend, s), unw_others(eaten, -1, 0)), sites: uw_join(ps, rs, eaten, [], sites) }
 }
 
 # A boxed `let` binder holds its birth reference: every binding perceus
@@ -268,8 +266,8 @@ type UwArms = { pend: Option[[LocalId]], sites: [UnwSite] }
 fn uw_handle(e: Expr, body: Expr, oi: Option[Expr], oret: Option[HReturn],
              pend: [LocalId], z: [LocalId], fx: UwFx, sites: [UnwSite]) : UwR = {
   let live = unw_minus(pend, z)
-  let survive = unw_minus(unw_filter(fx.ns, live, e), fx.banned)
-  let inner = unw_confined(fx.ns, unw_minus(live, survive), e, fx.jumps, fx.body)
+  let survive = unw_minus(unw_filter(live, e), fx.banned)
+  let inner = unw_confined(unw_minus(live, survive), e, fx.jumps, fx.body)
   let zh = unw_union(z, survive)
   let ri = match oi {
     None    -> UwR { pend: inner, sites: sites }
@@ -280,7 +278,7 @@ fn uw_handle(e: Expr, body: Expr, oi: Option[Expr], oret: Option[HReturn],
     None                 -> rb
     Some(HR(_, b, _, _)) -> uw_expr(b, rb.pend, zh, fx, rb.sites)
   }
-  UwR { pend: unw_filter(fx.ns, pend, e), sites: unw_add(UnwHandle(e.site, survive), rr.sites) }
+  UwR { pend: unw_filter(pend, e), sites: unw_add(UnwHandle(e.site, survive), rr.sites) }
 }
 
 # A match scope is a site only when an arm holds a call that can unwind:
@@ -299,7 +297,7 @@ fn uw_brackets(ss: [UnwSite]) : Int = match ss {
 # loop consumes anywhere may already be gone, and one bound inside lives
 # for one iteration.
 fn uw_loop(e: Expr, xs: [Expr], pend: [LocalId], z: [LocalId], fx: UwFx, sites: [UnwSite]) : UwR = {
-  let kept = unw_filter(fx.ns, pend, e)
+  let kept = unw_filter(pend, e)
   UwR { pend: kept, sites: uw_loop_parts(xs, kept, z, fx, sites) }
 }
 

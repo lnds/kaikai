@@ -27,7 +27,7 @@
 #   - Alias rewriting: `rewrite_alias_*` / `alias_map_*` + `AliasMap` /
 #     `StmtsRewrite`.
 #   - Protocol-dispatch decoding: `proto_dispatch_*` / `pimpl_*` +
-#     `ProtoDispatchParts` / `PimplRow` / `PR2`.
+#     `ProtoDispatchParts` / `PimplRow`.
 #   - The AST collector/functor glue both backends walk (`collect_*`,
 #     `map_*_exprs`, `map_expr_kind`, `pat_bindings`).
 #   - The lifted-clause/lambda descriptors `VariantEntry` / `ClauseInfo`
@@ -42,11 +42,10 @@
 # Bundle order: ... unbox, perceus, protos, monomorph, **emit_shared**,
 # emit_llvm, emit_c, main. Imports compiler.ast (AST nodes + `mk_expr`),
 # compiler.util (string/list/char helpers incl. the relocated `join_with`),
-# compiler.fnreg (`EFn` + the `scan_uses_*` / `iscan_*`
-# use-scan family), compiler.infer (`AliasBinding` / `IScan` / `IPart` /
-# `Use` + `unit_canon` / `label_to_string` / `lookup_alias`), compiler.parse
-# (`parse_interp_expr`), compiler.resolve (`core_names`), and
-# compiler.unbox (`expr_has_interp_use` / `uses_have_in_lam`).
+# compiler.fnreg (`EFn` + the `scan_uses_*` use-scan family),
+# compiler.infer (`AliasBinding` / `Use` + `unit_canon` /
+# `label_to_string` / `lookup_alias`), compiler.resolve (`core_names`),
+# and compiler.unbox (`uses_have_in_lam`).
 
 import compiler.ast
 import compiler.written
@@ -70,9 +69,9 @@ import compiler.fn_index
 import compiler.fn_csym
 import compiler.enc_unit
 import compiler.infer
-import compiler.parse
 import compiler.resolve
 import compiler.handler_alias
+import compiler.proto_ids
 import compiler.unbox
 import compiler.evidence_scan
 import compiler.perceus_payer
@@ -120,13 +119,10 @@ pub fn fn_enc(tab: SymTab, specs: SpecNames, fid: FnId, mo: Option[String]) : En
 # named after any runtime helper without redeclaring it. `c_sym` stays the
 # unprefixed key every internal table is keyed by (purity, reuse-donation,
 # evidence frames) and the symbol the native backend emits verbatim; the
-# prefix belongs to the C emission border alone.
-#
-# `main` is the one exception: the runtime's `int main` calls `kai_main` by
-# that literal name, so it must not move.
+# prefix belongs to the C emission border alone. The entry point is no
+# exception: the emitted `int main` names it by this symbol.
 #[doc("Prefix a user function's `c_sym` for C emission, keeping user symbols out of the runtime's `kai_` namespace.")]
-pub fn c_user_sym(csym: String) : String =
-  if csym == "main" { "kai_main" } else { string_concat("kaiu_", csym) }
+pub fn c_user_sym(csym: String) : String = string_concat("kaiu_", csym)
 
 # The runtime defines `_kai_<prim>_thunk` for its core prims, so a user
 # thunk needs the `kaiu` namespace too.
@@ -712,19 +708,17 @@ pub fn arms_all_literal_or_wild_loop(arms: [Arm]) : Bool {
 }
 
 # The fast path binds a `PBind` catch-all raw. A read of the binder
-# from inside a `#{...}` slot or a lambda body expects the boxed
-# binding, so such a match routes through the boxed path. Mirrors the
-# interp / lambda-capture guards of the unbox pass's `let`.
-#[doc("True when no `PBind` catch-all arm's body reads its binder from an interpolation slot or a lambda body, the reads the fast match path's raw binding cannot serve.")]
-pub fn arms_pbind_safe_for_fast_path(arms: [Arm]) : Bool / Console {
+# from inside a lambda body expects the boxed binding, so such a match
+# routes through the boxed path. Mirrors the lambda-capture guard of the
+# unbox pass's `let`.
+#[doc("True when no `PBind` catch-all arm's body reads its binder from a lambda body, the read the fast match path's raw binding cannot serve.")]
+pub fn arms_pbind_safe_for_fast_path(arms: [Arm]) : Bool {
 
   match arms {
     [] -> true
     [Arm(p, _, b), ...rest] -> {
       let ok = match p.pkind {
-        PBind(bd) ->
-          not expr_has_interp_use(b, bd) and
-          not uses_have_in_lam(scan_uses_expr(ln_with_binder(ln_empty(), bd), b, false), bd.id)
+        PBind(bd) -> not uses_have_in_lam(scan_uses_expr(b, false), bd.id)
         _ -> true
       }
       if ok { arms_pbind_safe_for_fast_path(rest) } else { false }
@@ -850,7 +844,7 @@ pub fn find_lam(lams: [LamInfo], enc_fn: EncFn, line: Int, col: Int) : Option[La
   }
 }
 
-#[doc("What surrounds a walked body: the binders in scope around it, innermost first, and the handler aliases among them. The binders are read only to resolve the name an interpolation fragment spells; an alias is reached through its handler, never captured as a value.")]
+#[doc("What surrounds a walked body: the binders in scope around it, innermost first, and the handler aliases among them. The binders say whether an enclosing clause already binds a state alias; an alias is reached through its handler, never captured as a value.")]
 pub type FvOuter = { binders: [Binder], aliases: [LocalId] }
 
 #[doc("A body with nothing in scope around it.")]
@@ -876,18 +870,6 @@ pub fn local_among(ls: [LocalId], l: LocalId) : Bool = match ls {
   [x, ...rest] -> local_eq(x, l) or local_among(rest, l)
 }
 
-# The innermost binder of `bs` a name is spelled like. Only an
-# interpolation fragment asks: it is source text until emit, so its
-# names were never resolved, and a state alias is bound by its spelling.
-fn fv_spelled(bs: [Binder], name: String) : Option[Binder] = match bs {
-  []           -> None
-  [b, ...rest] -> if written_text(b.name) == name { Some(b) } else { fv_spelled(rest, name) }
-}
-
-fn fv_spells(bs: [Binder], name: String) : Bool = match fv_spelled(bs, name) {
-  Some(_) -> true
-  None    -> false
-}
 
 fn fv_cap_same(a: Capture, b: Capture) : Bool = match a {
   CapLocal(x) -> match b {
@@ -912,16 +894,6 @@ fn fv_local(l: LocalId, own: [Binder], outer: FvOuter, acc: [Capture]) : [Captur
   if fv_is_wrap_slot(l) or fv_binds(own, l) or local_among(outer.aliases, l) { acc }
   else { fv_add(CapLocal(l), acc) }
 
-# A name an interpolation fragment spells: the innermost binder spelled
-# so is the one it reads, and a name no binder spells is a global.
-fn fv_name(name: String, own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] = match fv_spelled(own, name) {
-  Some(_) -> acc
-  None    -> match fv_spelled(outer.binders, name) {
-    Some(b) -> fv_local(b.id, own, outer, acc)
-    None    -> acc
-  }
-}
-
 # A perform through a cell alias dispatches by the alias's handler id,
 # which the lifted body captures; through a receiver it reads that local.
 fn fv_op(r: OpRef, own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] = match r.via {
@@ -943,12 +915,12 @@ fn fv_is_wrap_slot(l: LocalId) : Bool =
 fn fv_clause_own(params: [Param], aliases: [Binder]) : [Binder] =
   list_append(params_binders(params), [binder_minted(canonical_continuation()), ...aliases])
 
-# The state aliases a clause binds: an alias a binder around the clause is
-# spelled like stays that binder's.
+# The state aliases a clause binds: an alias an enclosing clause already
+# binds stays that clause's.
 fn fv_clause_aliases(own: [Binder], outer: FvOuter) : [Binder] =
-  map(clause_state_aliases((key) => fv_spells(own, key) or fv_spells(outer.binders, key)), binder_minted)
+  map(clause_state_aliases((key) => fv_binds(own, local_minted(key)) or fv_binds(outer.binders, local_minted(key))), binder_minted)
 
-#[doc("The captures of an expression: every local it reads that `own`, the binders bound inside the walked body, does not bind. A nested lambda's captures are the enclosing body's too; an interpolation span is re-parsed and its names resolved against `own`, then `outer`.")]
+#[doc("The captures of an expression: every local it reads that `own`, the binders bound inside the walked body, does not bind. A nested lambda's captures are the enclosing body's too.")]
 pub fn fv_expr(x: Expr, own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
 
   match x.kind {
@@ -959,9 +931,9 @@ pub fn fv_expr(x: Expr, own: [Binder], outer: FvOuter, acc: [Capture]) : [Captur
     EFixed(_, _) -> acc
     EBool(_) -> acc
     EChar(_) -> acc
-    EStr(span, is_triple) -> fv_interp(span, is_triple, own, outer, acc)
+    EStr(_, _) -> acc
     EUnit -> acc
-    EName(name) -> fv_name(written_text(name), own, outer, acc)
+    EName(_) -> acc
     EMark(_) -> acc
     # A lambda captures locals, never a top-level declaration.
     ESym(_, _) -> acc
@@ -1183,34 +1155,6 @@ pub fn fv_stmt(s: Stmt, own: [Binder], outer: FvOuter, acc: [Capture]) : [Captur
   }
 }
 
-#[doc("Free-variable collector over interp.")]
-pub fn fv_interp(span: String, is_triple: Bool, own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
-
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
-  fv_interp_parts(parts, own, outer, acc)
-}
-
-#[doc("Free-variable collector over interp parts.")]
-pub fn fv_interp_parts(parts: [IPart], own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
-
-  match parts {
-    [] -> acc
-    [p, ...rest] -> match p {
-      IpLit(_, _) -> fv_interp_parts(rest, own, outer, acc)
-      IpExp(esrc) -> {
-        let acc1 = match parse_interp_expr(esrc) {
-          Some(e) -> fv_expr(e, own, outer, acc)
-          None -> acc
-        }
-        fv_interp_parts(rest, own, outer, acc1)
-      }
-    }
-  }
-}
-
 # ---- lambda collection pass ----
 
 # `cur_enc_fn` is the fn / lambda / clause / runner the walker is inside:
@@ -1253,7 +1197,7 @@ pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
     EFixed(_, _) -> st
     EBool(_) -> st
     EChar(_) -> st
-    EStr(span, is_triple) -> collect_interp(span, is_triple, st)
+    EStr(_, _) -> st
     EUnit -> st
     EName(_) -> st
     EMark(_) -> st
@@ -1496,31 +1440,6 @@ pub fn collect_stmt(s: Stmt, st: LamCollect) : LamCollect / Console {
   }
 }
 
-#[doc("AST collector walking interp.")]
-pub fn collect_interp(span: String, is_triple: Bool, st: LamCollect) : LamCollect / Console {
-
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
-  collect_interp_parts(parts, st)
-}
-
-#[doc("AST collector walking interp parts.")]
-pub fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect / Console {
-
-  match parts {
-    [] -> st
-    [p, ...rest] -> match p {
-      IpLit(_, _) -> collect_interp_parts(rest, st)
-      IpExp(esrc) -> {
-        let st1 = match parse_interp_expr(esrc) { Some(e) -> collect_expr(e, st) None -> st }
-        collect_interp_parts(rest, st1)
-      }
-    }
-  }
-}
-
 # The walker swaps the enclosing unit on the way in and restores the
 # parent's on the way out, so siblings stamp their own clauses against
 # the right scope.
@@ -1647,31 +1566,17 @@ pub fn bang_success_variant(opt_ty: Option[Ty]) : Option[String] {
 # `log` aliases of `self->state`.
 
 #[doc("The block `let`s the emitter releases inline: a single `PBind` never read in the rest of the block whose rhs `pcs_let_paid_inline` accepts. A drop perceus planted counts as a read, so a binder perceus pays is never paid here too.")]
-pub fn block_unused_lets(stmts: [Stmt], opt_final: Option[Expr]) : [LocalId] / Console {
-  let ns = bul_let_names(stmts, ln_empty())
+pub fn block_unused_lets(stmts: [Stmt], opt_final: Option[Expr]) : [LocalId] {
   let final_reads = match opt_final {
     None -> []
-    Some(e) -> bul_add_reads([], scan_uses_expr(ns, e, false))
+    Some(e) -> bul_add_reads([], scan_uses_expr(e, false))
   }
-  bul_from_end(ns, list_reverse(stmts), final_reads, [])
-}
-
-# Only a `let` binder is released here, so only those need a name for the
-# interpolation spans that read them.
-fn bul_let_names(stmts: [Stmt], ns: LocalNames) : LocalNames = match stmts {
-  [] -> ns
-  [s, ...rest] -> bul_let_names(rest, match s {
-    SLet(pat, _, _) -> match pat.pkind {
-      PBind(b) -> ln_with_binder(ns, b)
-      _        -> ns
-    }
-    _ -> ns
-  })
+  bul_from_end(list_reverse(stmts), final_reads, [])
 }
 
 # Walks the block from its end, carrying every read after the statement
 # at hand, so each statement is scanned once.
-fn bul_from_end(ns: LocalNames, rev: [Stmt], later: [LocalId], acc: [LocalId]) : [LocalId] / Console =
+fn bul_from_end(rev: [Stmt], later: [LocalId], acc: [LocalId]) : [LocalId] =
   match rev {
     [] -> acc
     [s, ...earlier] -> {
@@ -1682,7 +1587,7 @@ fn bul_from_end(ns: LocalNames, rev: [Stmt], later: [LocalId], acc: [LocalId]) :
         }
         _ -> acc
       }
-      bul_from_end(ns, earlier, bul_add_reads(later, scan_uses_in_stmts(ns, [s], false)), acc1)
+      bul_from_end(earlier, bul_add_reads(later, scan_uses_in_stmts([s], false)), acc1)
     }
   }
 
@@ -1841,9 +1746,9 @@ pub fn ffi_kind_of_ty(t: TypeExpr, tab: SymTab) : FfiRetKind {
   }
 }
 
-# Row for one `__pimpl_*` entry: the C symbol name, the core protocol,
-# the kaikai type name (head), and the impl fn's arity. Heterogeneous-
-# mangled impls (`__pimpl_<P>_<T>_<op>__a_<args>`) collapse to the same
+# Row for one impl method of a core protocol: the C symbol name, the
+# protocol, the name of the type the impl is for (its head), and the impl
+# fn's arity. Heterogeneous impls of one type collapse to the same
 # `(P, T)` dispatch key — the typer's compile-time rewrite already
 # routes the right arg-shape; the runtime only needs the head match.
 # The arity is needed by the LLVM emit to synthesise the bitcast
@@ -1863,43 +1768,48 @@ pub fn ffi_kind_of_ty(t: TypeExpr, tab: SymTab) : FfiRetKind {
 # fast path. `None` means the impl already has the boxed
 # `KaiValue*(...)` shape (String / Unit / List / Option / Result); it is
 # registered directly unless it borrows a param. See `emit_impl_shim_defs`.
-#[doc("Row for one `__pimpl_*` entry: the C symbol name, the core protocol, the kaikai type name (head), the impl fn's arity, its unboxed signature (Some when scalar, None when boxed), op name, impl home, and the param positions Perceus made borrowed.")]
+#[doc("Row for one impl method of a core protocol: the C symbol name, the protocol, the name of the impl's target type (head), the impl fn's arity, its unboxed signature (Some when scalar, None when boxed), op name, impl home, and the param positions Perceus made borrowed.")]
 pub type PimplRow = PR(String, CoreProto, String, Int, Option[UFnSig], String, Option[String], [Int])
 #                  c_sym    proto   type_name arity      unboxed sig   op_name impl home      lent
 
-#[doc("AST collector walking pimpl rows. `fns` is the EFn registry, holding each fn's unboxed signature (the unbox pass stamps it there); `tab` and `specs` spell the name each fn is emitted under.")]
-pub fn collect_pimpl_rows(ds: [Decl], fns: [EFn], tab: SymTab, specs: SpecNames, acc: [PimplRow]) : [PimplRow] =
-  pimpl_rows(ds, fnx_build(fns), tab, specs, acc)
+#[doc("The rows of the impl methods among `ds`. `ids` says which functions are impl methods, of which protocol, type and operation; `fns` is the EFn registry, holding each fn's unboxed signature (the unbox pass stamps it there); `tab` spells the name each fn is emitted under.")]
+pub fn collect_pimpl_rows(ds: [Decl], fns: [EFn], tab: SymTab, ids: ProtoIds, acc: [PimplRow]) : [PimplRow] =
+  pimpl_rows(ds, fnx_build(fns), tab, ids, acc)
 
-fn pimpl_rows(ds: [Decl], fx: FnIndex, tab: SymTab, specs: SpecNames, acc: [PimplRow]) : [PimplRow] {
+fn pimpl_rows(ds: [Decl], fx: FnIndex, tab: SymTab, ids: ProtoIds, acc: [PimplRow]) : [PimplRow] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
       DFn(_, fid, _, params, _, _, _, _, _, mo) ->
-        match pimpl_row_of(fx, fid, written_text(fn_emit_name(tab, specs, fid)), params, mo) {
-          Some(row) -> pimpl_rows(rest, fx, tab, specs, [row, ...acc])
-          None      -> pimpl_rows(rest, fx, tab, specs, acc)
+        match pimpl_row_of(fx, fid, tab, ids, params, mo) {
+          Some(row) -> pimpl_rows(rest, fx, tab, ids, [row, ...acc])
+          None      -> pimpl_rows(rest, fx, tab, ids, acc)
         }
-      _ -> pimpl_rows(rest, fx, tab, specs, acc)
+      _ -> pimpl_rows(rest, fx, tab, ids, acc)
     }
   }
 }
 
-# The row of the fn `fid` when `name`, the name it is emitted under,
-# spells a protocol impl.
-fn pimpl_row_of(fx: FnIndex, fid: FnId, name: String, params: [Param], mo: Option[String]) : Option[PimplRow] =
-  if not string_starts_with_q(name, "__pimpl_") { None }
-  else { match parse_pimpl_name(name) {
-    Some(pr) -> {
-      let sig = fnx_ufn_sig_first(fx, fid)
-      Some(pr_with_csym(pr, c_sym(name, mo), list_length(params), sig, mo, pimpl_lent(params, pimpl_raw_flags(sig), 0)))
+# The row of the fn `fid` when it is an impl method of a core protocol.
+# The table dispatches to the impl itself, never to a specialisation.
+fn pimpl_row_of(fx: FnIndex, fid: FnId, tab: SymTab, ids: ProtoIds, params: [Param], mo: Option[String]) : Option[PimplRow] =
+  if fnid_inst(fid) != spec_none() { None }
+  else { match pid_impl(ids, fnid_sym(fid)) {
+    Some(PIR(proto, target, op, _, _, _, _)) -> match core_proto_of(proto) {
+      Some(cp) -> {
+        let sig = fnx_ufn_sig_first(fx, fid)
+        Some(PR(c_sym(written_text(decl_name(tab, fnid_sym(fid))), mo), cp, pimpl_target_text(tab, target),
+                list_length(params), sig, written_text(op), mo, pimpl_lent(params, pimpl_raw_flags(sig), 0)))
+      }
+      None -> None
     }
     None -> None
   } }
 
-#[doc("Attach the minted C symbol, unboxed signature, impl home and borrowed positions to a decoded protocol-impl row.")]
-pub fn pr_with_csym(pr: PimplRow, csym: String, arity: Int, sig: Option[UFnSig], home: Option[String], lent: [Int]) : PimplRow {
-  match pr { PR(_, p, t, _, _, op, _, _) -> PR(csym, p, t, arity, sig, op, home, lent) }
+# The name the runtime head of an impl's target is looked up under.
+fn pimpl_target_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)        -> written_text(decl_name(tab, s))
+  DrWritten(_, n) -> written_text(n)
 }
 
 # Only boxed params: a raw one reaches the impl unboxed and the adapter
@@ -1966,93 +1876,6 @@ pub fn ty_is_scalar(t: Ty) : Bool {
     TyDimT(inner, _)    -> ty_is_scalar(inner)
     TyRefineT(inner, _) -> ty_is_scalar(inner)
     _ -> false
-  }
-}
-
-#[doc("Parse `__pimpl_<P>_<T>_<op>` or `__pimpl_<P>_<T>_<op>__a_<args>` back into (proto, type_name). The proto is the core protocol whose name the symbol spells; any other protocol returns None to skip.")]
-pub fn parse_pimpl_name(name: String) : Option[PimplRow] {
-  # name = "__pimpl_" ++ <rest>; cut prefix.
-  let prefix_len = 8
-  let n = string_length(name)
-  if n <= prefix_len { None }
-  else {
-    let rest = string_slice(name, prefix_len, n - prefix_len)
-    # split off the trailing "__a_..." suffix if present.
-    let base = pimpl_strip_arg_suffix(rest)
-    # `base` is now `<P>_<T>_<op>`. Take P as the core protocol the
-    # symbol leads with; everything between `<P>_` and the final
-    # `_<op>` is the type name.
-    match pimpl_split_proto(base) {
-      None -> None
-      Some(p_rest) -> match p_rest {
-        PR2(p, rest1) -> {
-          # rest1 = "<T>_<op>". Strip the trailing `_<op>` by finding
-          # the last underscore.
-          let m = string_length(rest1)
-          let last = find_last_underscore_proto(rest1, m - 1)
-          if last <= 0 { None }
-          else {
-            let tname = string_slice(rest1, 0, last)
-            let op = string_slice(rest1, last + 1, m - last - 1)
-            Some(PR("", p, tname, 0, None, op, None, []))
-          }
-        }
-      }
-    }
-  }
-}
-
-#[doc("Two-field protocol-impl name split (proto, rest).")]
-pub type PR2 = PR2(CoreProto, String)
-
-# Strip a `__a_…` suffix off a `__pimpl_*` symbol's payload string.
-
-# Strip a `__a_…` suffix off a `__pimpl_*` symbol's payload string.
-#[doc("Strip a `__a_…` suffix off a `__pimpl_*` symbol's payload string.")]
-pub fn pimpl_strip_arg_suffix(s: String) : String {
-  let marker = "__a_"
-  let idx = find_substring(s, marker, 0)
-  let n = string_length(s)
-  if idx >= n { s }
-  else { string_slice(s, 0, idx) }
-}
-
-# No core protocol's name holds a `_`, so at most one leads `s`.
-#[doc("The core protocol whose name `s` starts with, and the remainder after the trailing `_`. None when no core protocol leads `s`.")]
-pub fn pimpl_split_proto(s: String) : Option[PR2] {
-  let try_one = (cp: CoreProto) => {
-    let p = core_proto_name(cp)
-    let plen = string_length(p)
-    let n = string_length(s)
-    if n > plen and substring_eq(s, 0, p) {
-      let after = char_at_or_zero(s, plen)
-      if after == '_' {
-        Some(PR2(cp, string_slice(s, plen + 1, n - plen - 1)))
-      } else { None }
-    } else { None }
-  }
-  pimpl_first_match(core_protos(), try_one)
-}
-
-#[doc("Protocol-impl name decoder: first match.")]
-pub fn pimpl_first_match(opts: [CoreProto], f: (CoreProto) -> Option[PR2]) : Option[PR2] {
-  match opts {
-    [] -> None
-    [o, ...rest] -> match f(o) {
-      Some(r) -> Some(r)
-      None    -> pimpl_first_match(rest, f)
-    }
-  }
-}
-
-#[doc("Find the last underscore boundary in a protocol-impl name for splitting.")]
-pub fn find_last_underscore_proto(s: String, from: Int) : Int {
-  if from < 0 { -1 }
-  else {
-    match char_at(s, from) {
-      Some('_') -> from
-      _         -> find_last_underscore_proto(s, from - 1)
-    }
   }
 }
 

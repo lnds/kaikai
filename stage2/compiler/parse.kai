@@ -26,9 +26,8 @@
 # Public surface (4 pub fns + 2 pub types)
 #
 # - parse_program — the driver entry point: file + src + tokens -> AST.
-# - parse_interp_expr — re-parse a single `#{...}` interpolation body;
-#   used by the emitter / typer / codegen (and the Perceus interp
-#   rewriter, which re-tokenises separately for span mapping).
+# - parse_interp_expr — parse a single `#{...}` interpolation body;
+#   used by the lift and the checks that run before it.
 # - tp_bounds_of / tp_has_bounds / tp_strip_bounds — type-param bounds
 #   decoders, read by the typer's bound renderer.
 # - PParser — parse_program's result record. Parser is pub only
@@ -58,7 +57,6 @@ import compiler.ast
 import compiler.written
 import compiler.decl_names
 import compiler.intrinsics
-import compiler.marks
 import compiler.operators
 import compiler.kinds
 import compiler.refinements
@@ -345,9 +343,9 @@ fn p_skip_newlines_and_semis(p: Parser) : Parser {
 fn p_error(p: Parser, t: Token, msg: String) : Parser / Console {
 
   if p_failed(p) { p }
-  # An interpolation fragment is re-parsed by several consumers, and
-  # its span names no file the user wrote. `check_interp_parses`
-  # reports the failure once, against the real position.
+  # An interpolation fragment is parsed apart from its file, and its
+  # span names no file the user wrote. `check_interp_parses` reports
+  # the failure against the real position.
   else if p.file == interp_parse_file() { p_mark_err(p, mk_diag(SevError, p.file, t.line, t.col, msg, [])) }
   else { p_fail_at(p, t.line, t.col, msg) }
 }
@@ -697,7 +695,7 @@ fn ok_dn(p: Parser, x: Decl, names: [NEnt]) : PDecl = PDecl { p: p, r: Some(x), 
 # A wrapper around the declaration `inner` parsed declares what `inner` does.
 fn ok_d_wrap(inner: PDecl, x: Decl) : PDecl = PDecl { p: inner.p, r: Some(x), bounds: [], names: inner.names }
 # The entry of a declaration of the file being parsed, and the id it derives.
-fn p_ent(p: Parser, cls: NCls, name: String, is_pub: Bool) : NEnt = NEnt(cls, name, p.home, is_pub)
+fn p_ent(p: Parser, cls: NCls, name: String, is_pub: Bool) : NEnt = NEnt(cls, name, p.home, is_pub, NmSource)
 fn p_sym(p: Parser, cls: NCls, name: String) : SymId = sym_derive_word(ncls_word(cls), name, p.home)
 # `parse_fn_decl` variant carrying the fn's declared protocol bounds
 # alongside the (already stripped) DFn. `parse_program_loop` seeds the
@@ -729,19 +727,12 @@ fn parse_expr(p: Parser) : PExpr / Console {
 }
 
 # Parse a single expression from raw source — the shape every
-# string-interpolation `#{...}` body takes. Tokenises, parses, and
-# returns just the AST, hiding the PExpr workspace type from the
-# emitter / typer / codegen callers. This is the only parse entry
-# point besides parse_program that downstream phases reach for.
-# A hole is the one place a mark arrives spelled, so it is read back
-# here and no caller compares the spelling.
+# string-interpolation `#{...}` body takes. Only passes that run before
+# the resolver call it: from the lift on, a body is a tree.
 pub fn parse_interp_expr(src: String) : Option[Expr] / Console {
   let toks = tokenize(src)
   let prs = parser_new(interp_parse_file(), src, toks, "")
-  match parse_expr(prs).r {
-    Some(e) -> Some(marks_read_spelled(src, e))
-    None    -> None
-  }
+  parse_expr(prs).r
 }
 
 # The pseudo-file every interpolation sub-parse runs under. Diagnostics
@@ -4128,7 +4119,11 @@ fn parse_pattern_rest(p: Parser, t: Token) : PPat / Console {
     ok_p(p_advance(p), mk_pat(PLit(fixed_lit(p.src, t, 4, TyInt128)), t.line, t.col))
   } else if tk_is(t.kind, TkString) {
     let span = tok_source(p.src, t)
-    ok_p(p_advance(p), mk_pat(PLit(mk_expr(EStr(span, false), t.line, t.col)), t.line, t.col))
+    if has_interp(span, 0, string_length(span)) {
+      err_p(p_error(p, t, "a string pattern must be a plain string literal (no interpolation)"))
+    } else {
+      ok_p(p_advance(p), mk_pat(PLit(mk_expr(EStr(span, false), t.line, t.col)), t.line, t.col))
+    }
   } else if tk_is(t.kind, TkMinus) {
     let nxt = p_peek1(p)
     if tk_is(nxt.kind, TkInt) {
@@ -6958,7 +6953,7 @@ fn parse_impl_methods(p: Parser, scope: String, acc: [Decl], racc: [NEnt]) : PIm
       match dr.r {
         None -> PImplMethods { p: dr.p, r: None, names: [] }
         Some(d) -> match dr.names {
-          [NEnt(_, op, _, _)] ->
+          [NEnt(_, op, _, _, _)] ->
             parse_impl_methods(dr.p, scope, [impl_method(d, op, scope), ...acc], [method_ent(op, scope), ...racc])
           _ -> panic("parse: an impl method without its entry")
         }
@@ -8152,7 +8147,7 @@ fn fn_bounds_seed(d: Decl, bs: [FnTPBound], names: [NEnt], bacc: [FnBoundsRec]) 
     [] -> bacc
     _  -> match d {
       DFn(_, _, _, _, _, _, _, _, _, mo) -> match names {
-        [NEnt(_, name, _, _), ..._] -> [FBR(name, mo, bs), ...bacc]
+        [NEnt(_, name, _, _, _), ..._] -> [FBR(name, mo, bs), ...bacc]
         []                          -> bacc
       }
       _ -> bacc
