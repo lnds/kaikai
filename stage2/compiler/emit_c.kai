@@ -10024,13 +10024,15 @@ fn emit_nullary_enum_seed(variants: [VariantEntry]) : String = match variants {
     } else { emit_nullary_enum_seed(rest) }
 }
 
-fn emit_main_wrapper(decls: [Decl], bmode: BuildMode, variants: [VariantEntry], fns: [EFn], entry: SymId) : String {
-  let proto_tables = emit_proto_runtime_tables(decls, variants, fns, entry)
+# `lab` spells an effect's run-time name (`eff_rt_name`).
+fn emit_main_wrapper(decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, ctors: CtorIx,
+                     lab: (SymId) -> String, bmode: BuildMode, variants: [VariantEntry], fns: [EFn], entry: SymId) : String {
+  let proto_tables = emit_proto_runtime_tables(decls, tab, specs, variants, fns, ids, ctors, entry)
   let proto_init   = concat_all(["    _kai_register_proto_tables();\n", emit_nullary_enum_seed(variants)])
   match bmode {
-    BMTest  -> emit_runner_main(decls, proto_tables, proto_init, test_register_list(decls), "kai_test_summary")
-    BMBench -> emit_runner_main(decls, proto_tables, proto_init, bench_call_list(bench_count(decls), 0), "kai_bench_summary")
-    BMCheck -> emit_runner_main(decls, proto_tables, proto_init, check_call_list(check_count(decls), 0), "kai_check_summary")
+    BMTest  -> emit_runner_main(decls, lab, proto_tables, proto_init, test_register_list(decls), "kai_test_summary")
+    BMBench -> emit_runner_main(decls, lab, proto_tables, proto_init, bench_call_list(bench_count(decls), 0), "kai_bench_summary")
+    BMCheck -> emit_runner_main(decls, lab, proto_tables, proto_init, check_call_list(check_count(decls), 0), "kai_check_summary")
     BMBuild -> {
       if has_main_decl(decls, entry) {
         # m7a #7: install default handlers around `kai_main` only for
@@ -10066,8 +10068,8 @@ fn emit_main_wrapper(decls: [Decl], bmode: BuildMode, variants: [VariantEntry], 
           add_missing_effects(
             default_effects_absorbed_by_handler(decls),
             cmt_row_effects_without_default_handler(main_row_labels(decls, entry), decls)))
-        let shims    = default_shims_for(main_row, decls)
-        let setup    = default_setups_for(main_row, decls)
+        let shims    = default_shims_for(main_row, decls, lab)
+        let setup    = default_setups_for(main_row, decls, lab)
         concat_all([
           shims,
           proto_tables,
@@ -10091,28 +10093,63 @@ fn emit_main_wrapper(decls: [Decl], bmode: BuildMode, variants: [VariantEntry], 
 # A runner entry calls each block directly, outside `kai_main`, so it
 # stamps the same default nodes a program entry would for every effect a
 # block may perform.
-fn emit_runner_main(decls: [Decl], proto_tables: String, proto_init: String,
+fn emit_runner_main(decls: [Decl], lab: (SymId) -> String, proto_tables: String, proto_init: String,
                     calls: String, summary: String) : String = {
   let row = runner_entry_row(decls)
   concat_all([
-    default_shims_for(row, decls),
+    default_shims_for(row, decls, lab),
     proto_tables,
     "int main(int argc, char **argv) {\n",
     "    kai_set_args(argc, argv);\n",
     proto_init,
-    default_setups_for(row, decls),
+    default_setups_for(row, decls, lab),
     calls,
     "    return ", summary, "();\n",
     "}\n"
   ])
 }
 
-fn default_shims_from_block(eff_name: String, decls: [Decl]) : String =
-  match find_effect_default_block(eff_name, decls) {
+#[doc("The run-time name of the effect `s`: its declared name, home-spelled when another module declares an effect of that name and neither a core module nor, with no core homonym, the root declares this one. The evidence struct, the runtime label and the default-node globals are all spelled from it.")]
+pub fn eff_rt_name(tab: SymTab, root: Option[String], s: SymId) : String = {
+  let name = written_text(decl_name(tab, s))
+  if eff_rt_bare(tab, root, s, st_candidates(tab, NCEffect, name)) { name }
+  else { hs_spell(name, written_text(decl_home(tab, s))) }
+}
+
+# The runtime binds the bare spelling to the core declaration, so a root
+# homonym of a core effect is the one that takes its home's spelling.
+fn eff_rt_bare(tab: SymTab, root: Option[String], s: SymId, homonyms: [SymId]) : Bool = match homonyms {
+  [_, _, ..._] -> {
+    let home = sym_owner(tab, s)
+    if eff_home_is_core(tab, home) { true }
+    else { eff_home_is_root(tab, root, home) and not any(homonyms, (h) => eff_home_is_core(tab, sym_owner(tab, h))) }
+  }
+  _ -> true
+}
+
+# A core module is known here by what it declares: each of the three that
+# declare effects declares one the compiler names.
+fn eff_home_is_core(tab: SymTab, m: SymId) : Bool =
+  any([CeMutable, CeSpawn, CeProcess], (c) => sym_owned_by(tab, core_effect_id(c), m))
+
+fn eff_home_is_root(tab: SymTab, root: Option[String], m: SymId) : Bool = match root {
+  Some(r) -> match st_module(tab, r) {
+    Some(rm) -> sym_same(rm, m)
+    None     -> false
+  }
+  None -> false
+}
+
+# The run-time name of `s` as the emit context spells it.
+fn eff_label(cx: EmitCtx, s: SymId) : String = eff_rt_name(cx.tab, cx.root_mod, s)
+
+fn default_shims_from_block(eff: SymId, decls: [Decl], lab: (SymId) -> String) : String =
+  match find_effect_default_block(eff, decls) {
     None         -> ""
     Some(defblk) -> match defblk {
       DBlk(clauses, _, _, _) -> {
-        let evn = ev_name(eff_name, default_block_owner_mo(eff_name, decls))
+        let eff_name = lab(eff)
+        let evn = ev_name(eff_name, default_block_owner_mo(eff, decls))
         concat_all(map(clauses, (c) => default_shim_from_clause(eff_name, evn, c)))
       }
     }
@@ -10124,11 +10161,12 @@ fn default_shims_from_block(eff_name: String, decls: [Decl]) : String =
 # call site can address them; this only stamps the handler_id and op fn-ptrs
 # at startup. No `kai_evidence_push` — the walk still resolves a lexical handler
 # pushed above, but the default itself rides the frame.
-fn default_setups_from_block(eff_name: String, decls: [Decl]) : String =
-  match find_effect_default_block(eff_name, decls) {
+fn default_setups_from_block(eff: SymId, decls: [Decl], lab: (SymId) -> String) : String =
+  match find_effect_default_block(eff, decls) {
     None         -> ""
     Some(defblk) -> match defblk {
       DBlk(clauses, _, _, _) -> {
+        let eff_name = lab(eff)
         let eff_lc = string_to_lower_ascii(eff_name)
         concat_all([
           "    _kai_default_ev_", eff_lc, ".handler_id = kai_fresh_handler_id();\n",
@@ -10146,18 +10184,19 @@ fn default_setups_from_block(eff_name: String, decls: [Decl]) : String =
 # External linkage (one definition in the root TU, `extern` in the shared
 # header) so a call site in any module TU addresses the same node. Zero-init;
 # the per-program setup stamps handler_id + op fn-ptrs only for installed effects.
-fn emit_default_node_globals(decls: [Decl]) : String =
-  concat_all(map(decls, (d) => default_node_global_for(d, decls, false)))
+fn emit_default_node_globals(decls: [Decl], lab: (SymId) -> String) : String =
+  concat_all(map(decls, (d) => default_node_global_for(d, decls, false, lab)))
 
 # The `extern` declarations of the same globals, for the shared decls header.
-fn emit_default_node_extern_decls(decls: [Decl]) : String =
-  concat_all(map(decls, (d) => default_node_global_for(d, decls, true)))
+fn emit_default_node_extern_decls(decls: [Decl], lab: (SymId) -> String) : String =
+  concat_all(map(decls, (d) => default_node_global_for(d, decls, true, lab)))
 
-fn default_node_global_for(d: Decl, decls: [Decl], ext: Bool) : String = match d {
-  DEffect(_, eff_name, _, _, defblk, _, _, _, _) -> match defblk {
+fn default_node_global_for(d: Decl, decls: [Decl], ext: Bool, lab: (SymId) -> String) : String = match d {
+  DEffect(_, esym, _, _, defblk, _, _, _) -> match defblk {
     Some(_) -> {
+      let eff_name = lab(esym)
       let eff_lc = string_to_lower_ascii(eff_name)
-      let mo = default_block_owner_mo(eff_name, decls)
+      let mo = default_block_owner_mo(esym, decls)
       let kw = if ext { "extern " } else { "" }
       concat_all([
         kw, ev_name(eff_name, mo), " _kai_default_ev_", eff_lc, ";\n",
@@ -10169,11 +10208,11 @@ fn default_node_global_for(d: Decl, decls: [Decl], ext: Bool) : String = match d
   _ -> ""
 }
 
-fn effect_has_default_block(eff_name: String, decls: [Decl]) : Bool =
-  match find_effect_default_block(eff_name, decls) {
-    None    -> false
-    Some(_) -> true
-  }
+# `rt` is an effect's run-time name, as an evidence-frame slot key holds
+# it; `lab` spells one (`eff_rt_name`).
+fn effect_has_default_block(rt: String, decls: [Decl], lab: (SymId) -> String) : Bool =
+  any(collect_effect_ids(decls), (s) => lab(s) == rt and
+    (match find_effect_default_block(s, decls) { None -> false  Some(_) -> true }))
 
 # The bridge to a runtime C handler. An op argument reaches the handler as an
 # OWNED reference (the call site hands one over per op arg), and the shim is
@@ -10188,9 +10227,9 @@ fn default_shim_from_clause(eff_name: String, ev_n: String, c: HClause) : String
         None        -> ""
         Some(csym_name) -> {
           let visible = op_args_only(params)
-          let arg_decls = concat_all(map(visible, (p) => concat_all([", KaiValue *", c_local(p.pname)])))
-          let arg_pass  = concat_all(map(visible, (p) => cat2(", ", c_local(p.pname))))
-          let releases  = concat_all(map(visible, (p) => concat_all(["    kai_decref(", c_local(p.pname), ");\n"])))
+          let arg_decls = concat_all(map(visible, (p) => concat_all([", KaiValue *", c_local(written_text(p.binder.name))])))
+          let arg_pass  = concat_all(map(visible, (p) => cat2(", ", c_local(written_text(p.binder.name)))))
+          let releases  = concat_all(map(visible, (p) => concat_all(["    kai_decref(", c_local(written_text(p.binder.name)), ");\n"])))
           concat_all([
             "static KaiValue *_kai_default_", string_to_lower_ascii(eff_name),
               "_", op_name, "_shim(", ev_n, " *self",
@@ -10227,33 +10266,28 @@ fn default_setup_assign_from_clause(eff_name: String, c: HClause) : String =
     }
   }
 
-fn default_setups_for(main_row: [String], decls: [Decl]) : String = {
-  # Issue #558: every builtin (and any user-declared effect) whose
-  # decl carries a `default { }` block bridged via `$extern_handler`
-  # rides the AST-derived `default_setups_from_block`. The hardcoded
-  # `default_<eff>_setup()` family was deleted alongside this
-  # migration — the source-level `default { }` is the only path.
-  # The list below preserves the historic push order for the builtins
-  # so the corresponding pop order in `default_pops_for` stays
-  # consistent; any user-declared effects in `main_row` push after
-  # the builtins in their declaration order.
-  let order = list_append(builtin_default_install_order(),
-                            user_effects_in_row(main_row))
-  emit_default_setups_in_order(order, main_row, decls)
+# Every effect of `main_row` whose declaration carries a `default { }`
+# block bridged through `$extern_handler` is set up from that block.
+fn default_setups_for(main_row: [SymId], decls: [Decl], lab: (SymId) -> String) : String =
+  concat_all(map(default_install_order(main_row, lab), (eff) => default_setups_from_block(eff, decls, lab)))
+
+# The effects of `main_row` in install order: the builtin defaults in the
+# runtime's order, then the others in row order. It orders emitted text,
+# so it reads each effect's run-time name.
+fn default_install_order(main_row: [SymId], lab: (SymId) -> String) : [SymId] = {
+  let builtins = builtin_default_install_order()
+  list_append(default_builtins_in(builtins, main_row, lab),
+              filter(main_row, (s) => not list_has(builtins, lab(s))))
 }
 
-fn emit_default_setups_in_order(order: [String], main_row: [String],
-                                 decls: [Decl]) : String {
-  match order {
-    [] -> ""
-    [eff, ...rest] ->
-      if list_has(main_row, eff) {
-        let derived = default_setups_from_block(eff, decls)
-        concat_all([derived, emit_default_setups_in_order(rest, main_row, decls)])
-      } else {
-        emit_default_setups_in_order(rest, main_row, decls)
-      }
-  }
+fn default_builtins_in(order: [String], main_row: [SymId], lab: (SymId) -> String) : [SymId] = match order {
+  [] -> []
+  [name, ...rest] -> list_append(default_row_named(main_row, name, lab), default_builtins_in(rest, main_row, lab))
+}
+
+fn default_row_named(main_row: [SymId], name: String, lab: (SymId) -> String) : [SymId] = match main_row {
+  [] -> []
+  [s, ...rest] -> if lab(s) == name { [s] } else { default_row_named(rest, name, lab) }
 }
 
 # Push order for default handlers — mirrors the historic hardcoded
@@ -10270,26 +10304,6 @@ fn builtin_default_install_order() : [String] =
    "Random", "SecureRandom", "NetTcp", "NetDns", "Signal", "Process", "Log",
    "Mutable", "Cancel", "Link", "Monitor", "Spawn"]
 
-# Labels in `main_row` that are NOT canonical builtin defaults. They
-# go at the end of the install order, after the builtins, so the pop
-# order can mirror reverse-declaration.
-
-# Labels in `main_row` that are NOT canonical builtin defaults. They
-# go at the end of the install order, after the builtins, so the pop
-# order can mirror reverse-declaration.
-fn user_effects_in_row(main_row: [String]) : [String] {
-  let builtins = builtin_default_install_order()
-  match main_row {
-    [] -> []
-    [x, ...rest] ->
-      if list_has(builtins, x) {
-        user_effects_in_row(rest)
-      } else {
-        [x, ...user_effects_in_row(rest)]
-      }
-  }
-}
-
 # Issue #115: aggregate the typed shim definitions for every
 # default handler that `default_setups_for` will install. Emitted
 # at file scope before `int main()` so the shim addresses are in
@@ -10309,41 +10323,17 @@ fn user_effects_in_row(main_row: [String]) : [String] {
 # every effect in `main_row`, and a missing shim shows up as a
 # C compile error before the binary is produced (and well before
 # UBSan would otherwise catch the type mismatch at runtime).
-fn default_shims_for(main_row: [String], decls: [Decl]) : String = {
-  # Issue #558: every shim is derived from the effect's `default { }`
-  # block; the hardcoded `default_<eff>_shims()` family was deleted
-  # alongside this migration. Iteration order matches
-  # `default_setups_for` (push order) so the shim definitions appear
-  # ahead of the setup block that references them. User-declared
-  # effects with `default { }` blocks emit their shims after the
-  # builtin shims.
-  let order = list_append(builtin_default_install_order(),
-                            user_effects_in_row(main_row))
-  emit_default_shims_in_order(order, main_row, decls)
-}
-
-fn emit_default_shims_in_order(order: [String], main_row: [String],
-                                decls: [Decl]) : String {
-  match order {
-    [] -> ""
-    [eff, ...rest] ->
-      if list_has(main_row, eff) {
-        let derived = default_shims_from_block(eff, decls)
-        concat_all([derived, emit_default_shims_in_order(rest, main_row, decls)])
-      } else {
-        emit_default_shims_in_order(rest, main_row, decls)
-      }
-  }
-}
+fn default_shims_for(main_row: [SymId], decls: [Decl], lab: (SymId) -> String) : String =
+  concat_all(map(default_install_order(main_row, lab), (eff) => default_shims_from_block(eff, decls, lab)))
 
 
-fn desugar_op_calls_decls(ds: [Decl], effs: [String]) : [Decl] =
+fn desugar_op_calls_decls(ds: [Decl], effs: [SymId]) : [Decl] =
   map(ds, (d) => desugar_op_calls_decl(d, effs))
 
-fn desugar_op_calls_decl(d: Decl, effs: [String]) : Decl {
+fn desugar_op_calls_decl(d: Decl, effs: [SymId]) : Decl {
   match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo, fsym) ->
-      DFn(pub_, n, tps, ps, ret, row, desugar_op_calls_expr(body, effs), l, c, mo, fsym)
+    DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, fid, tps, ps, ret, row, desugar_op_calls_expr(body, effs), l, c, mo)
     DTest(desc, body, l, c, mo) ->
       DTest(desc, desugar_op_calls_expr(body, effs), l, c, mo)
     DBench(desc, body, l, c, mo) ->
@@ -10354,17 +10344,16 @@ fn desugar_op_calls_decl(d: Decl, effs: [String]) : Decl {
   }
 }
 
-fn desugar_op_calls_expr(e: Expr, effs: [String]) : Expr =
+fn desugar_op_calls_expr(e: Expr, effs: [SymId]) : Expr =
   Expr { kind: desugar_op_calls_kind(e.kind, effs),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
-fn desugar_op_calls_callee(callee: Expr, effs: [String]) : Expr {
+fn desugar_op_calls_callee(callee: Expr, effs: [SymId]) : Expr {
   match callee.kind {
-    EField(base, op_name) -> match sym_read_kind(base.kind) {
-      EName(name) ->
-        if list_has(effs, name) {
-          mk_ref(string_concat(name, string_concat(".", op_name)),
-                  callee.line, callee.col)
+    EField(base, op_name) -> match base.kind {
+      ESym(s, _) ->
+        if any(effs, (e) => sym_same(e, s)) {
+          mk_expr(EOp(OpRef { eff: s, op: written(op_name), via: ViaAmbient }), callee.line, callee.col)
         } else { desugar_op_calls_expr(callee, effs) }
       _ -> desugar_op_calls_expr(callee, effs)
     }
@@ -10372,13 +10361,11 @@ fn desugar_op_calls_callee(callee: Expr, effs: [String]) : Expr {
   }
 }
 
-fn desugar_op_calls_kind(k: ExprKind, effs: [String]) : ExprKind {
+fn desugar_op_calls_kind(k: ExprKind, effs: [SymId]) : ExprKind {
   match k {
-    # The only kind that needs special handling: rewrite a
-    # `EField(EName(eff), op)` callee into the flat `EName("eff.op")`
-    # form so emit_call_expr can dispatch through kai_evidence_lookup.
-    # All sub-expressions (args + non-EField callee) recurse via the
-    # shared visitor.
+    # The only kind that needs special handling: a callee still spelled
+    # `Eff.op` on an effect's own id becomes the ambient perform of
+    # that operation. Everything else recurses via the shared visitor.
     ECall(callee, args_) ->
       ECall(desugar_op_calls_callee(callee, effs),
             map(args_, (a) => desugar_op_calls_expr(a, effs)))
@@ -10406,8 +10393,8 @@ pub fn desugar_index_decls(ds: [Decl]) : [Decl] = map(ds, desugar_index_decl)
 
 fn desugar_index_decl(d: Decl) : Decl {
   match d {
-    DFn(pub_, n, tps, ps, ret, row, body, l, c, mo, fsym) ->
-      DFn(pub_, n, tps, ps, ret, row, desugar_index_expr(body), l, c, mo, fsym)
+    DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(pub_, fid, tps, ps, ret, row, desugar_index_expr(body), l, c, mo)
     DTest(desc, body, l, c, mo) -> DTest(desc, desugar_index_expr(body), l, c, mo)
     DBench(desc, body, l, c, mo) -> DBench(desc, desugar_index_expr(body), l, c, mo)
     DCheck(desc, params, body, l, c, mo) -> DCheck(desc, params, desugar_index_expr(body), l, c, mo)
@@ -10534,19 +10521,25 @@ fn interp_bind(cx: InterpCtx, names: [String]) : InterpCtx =
               cs: cx.cs, show: cx.show, ts: cx.ts, es: cx.es,
               locals: list_append(names, cx.locals) }
 
+# The lift runs on parser output, where a binder is the name it was
+# written with.
+fn interp_param_names(ps: [Param]) : [String] = map(ps, (p) => written_text(p.binder.name))
+
+fn interp_pat_names(pat: Pattern) : [String] = map(pat_bindings(pat, []), (b) => written_text(b.name))
+
 fn desugar_interp_decl(d: Decl, cx: InterpCtx) : Decl / Console + File {
 
   match d {
-    DFn(p, n, tps, ps, ret, row, body, l, c, mo, fsym) ->
-      DFn(p, n, tps, ps, ret, row,
-          desugar_interp_expr(body, interp_bind(cx, fn_param_names(ps))), l, c, mo, fsym)
+    DFn(p, fid, tps, ps, ret, row, body, l, c, mo) ->
+      DFn(p, fid, tps, ps, ret, row,
+          desugar_interp_expr(body, interp_bind(cx, interp_param_names(ps))), l, c, mo)
     DTest(desc, body, l, c, mo) ->
       DTest(desc, desugar_interp_expr(body, cx), l, c, mo)
     DBench(desc, body, l, c, mo) ->
       DBench(desc, desugar_interp_expr(body, cx), l, c, mo)
     DCheck(desc, ps, body, l, c, mo) ->
       DCheck(desc, ps,
-             desugar_interp_expr(body, interp_bind(cx, fn_param_names(ps))), l, c, mo)
+             desugar_interp_expr(body, interp_bind(cx, interp_param_names(ps))), l, c, mo)
     _ -> d
   }
 }
@@ -10586,7 +10579,9 @@ fn desugar_interp_kind(k: ExprKind, cx: InterpCtx,
     EUnit          -> k
     EName(_)        -> k
     EMark(_)        -> k
-    ESym(_, _, _)        -> k
+    ESym(_, _)      -> k
+    ELocal(_)       -> k
+    EOp(_)          -> k
     EUnder         -> k
     EPlaceholder   -> k
     EHole(_)       -> k
@@ -10609,8 +10604,8 @@ fn desugar_interp_kind(k: ExprKind, cx: InterpCtx,
                                   desugar_interp_expr_opt(eo, cx))
     EMatch(scr, arms)    -> EMatch(desugar_interp_expr(scr, cx),
                                      desugar_interp_arms(arms, cx))
-    ELambda(ps, b)       -> ELambda(ps, desugar_interp_expr(b, interp_bind(cx, fn_param_names(ps))))
-    ERecordLit(rh, name, fs) -> ERecordLit(rh, name, desugar_interp_fields_init(fs, cx))
+    ELambda(ps, b)       -> ELambda(ps, desugar_interp_expr(b, interp_bind(cx, interp_param_names(ps))))
+    ERecordLit(rh, fs)   -> ERecordLit(rh, desugar_interp_fields_init(fs, cx))
     EList(els)           -> EList(desugar_interp_list_elems(els, cx))
     ERange(a, b, opt_step) -> ERange(desugar_interp_expr(a, cx),
                                        desugar_interp_expr(b, cx),
@@ -10626,8 +10621,8 @@ fn desugar_interp_kind(k: ExprKind, cx: InterpCtx,
                                             desugar_interp_expr(b, cx))
     EFilterPipe(a, b)    -> EFilterPipe(desugar_interp_expr(a, cx),
                                            desugar_interp_expr(b, cx))
-    EHandle(body, eff_name, hsym, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(desugar_interp_expr(body, cx), eff_name, hsym, eff_tyargs,
+    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(desugar_interp_expr(body, cx), eff, eff_tyargs,
               desugar_interp_expr_opt(init_opt, cx), alias_opt,
               desugar_interp_hclauses(clauses, cx),
               desugar_interp_hreturn_opt(ret_opt, cx))
@@ -10651,7 +10646,7 @@ fn desugar_interp_arms(arms: [Arm], cx: InterpCtx) : [Arm] / Console + File = ma
 
 fn desugar_interp_arm(a: Arm, cx: InterpCtx) : Arm / Console + File = match a {
   Arm(pat, guard_opt, body) -> {
-    let cxa = interp_bind(cx, pat_binders(pat, []))
+    let cxa = interp_bind(cx, interp_pat_names(pat))
     Arm(pat,
         desugar_interp_expr_opt(guard_opt, cxa),
         desugar_interp_expr(body, cxa))
@@ -10690,8 +10685,8 @@ fn desugar_interp_block(ss: [Stmt], cx: InterpCtx, acc: [Stmt]) : IBlk / Console
 }
 
 fn interp_stmt_binds(s: Stmt, cx: InterpCtx) : InterpCtx = match s {
-  SLet(p, _, _)       -> interp_bind(cx, pat_binders(p, []))
-  SVar(name, _, _, _, _) -> interp_bind(cx, [name])
+  SLet(p, _, _)       -> interp_bind(cx, interp_pat_names(p))
+  SVar(b, _, _, _, _) -> interp_bind(cx, [written_text(b.name)])
   _ -> cx
 }
 
@@ -10719,7 +10714,7 @@ fn desugar_interp_hclauses(cs: [HClause], cx: InterpCtx) : [HClause] / Console +
 
 fn desugar_interp_hclause(c: HClause, cx: InterpCtx) : HClause / Console + File = match c {
   HC(op_name, ps, body, ln, cl) ->
-    HC(op_name, ps, desugar_interp_expr(body, interp_bind(cx, fn_param_names(ps))), ln, cl)
+    HC(op_name, ps, desugar_interp_expr(body, interp_bind(cx, interp_param_names(ps))), ln, cl)
 }
 
 fn desugar_interp_hreturn_opt(opt: Option[HReturn], cx: InterpCtx) : Option[HReturn] / Console + File = match opt {
@@ -10728,7 +10723,7 @@ fn desugar_interp_hreturn_opt(opt: Option[HReturn], cx: InterpCtx) : Option[HRet
 }
 
 fn desugar_interp_hreturn(r: HReturn, cx: InterpCtx) : HReturn / Console + File = match r {
-  HR(name, body, ln, cl) -> HR(name, desugar_interp_expr(body, interp_bind(cx, [name])), ln, cl)
+  HR(b, body, ln, cl) -> HR(b, desugar_interp_expr(body, interp_bind(cx, [written_text(b.name)])), ln, cl)
 }
 
 fn lift_interp_string(span: String, body_start: Int, body_end: Int,
@@ -10739,7 +10734,7 @@ fn lift_interp_string(span: String, body_start: Int, body_end: Int,
   # `body_start` chars of the literal's opening delimiter sit before the body.
   let part_exprs = interp_parts_to_exprs(parts, InterpPos { line: line, col: col + body_start },
                                           cx, line, col)
-  ECall(mk_ref("string_concat_all", line, col),
+  ECall(mk_name("string_concat_all", line, col),
         [mk_expr(EList(map(part_exprs, (e: Expr) => ElPlain(e))), line, col)])
 }
 
@@ -10845,7 +10840,7 @@ fn interp_show_from(show: Option[ShowRef], in_core: Bool) : Option[ExprKind] = m
 # answers to.
 fn interp_show_callee(cx: InterpCtx) : ExprKind = match cx.show {
   Some(k) -> k
-  None    -> EName(proto_dispatcher_name("show"))
+  None    -> EName(written(proto_dispatcher_name("show")))
 }
 
 # ====================================================================
@@ -10913,11 +10908,10 @@ fn decls_of_origin_loop(decls: [Decl], mo: Option[String], acc: [Decl]) : [Decl]
 # instances exist follows the whole program's call sites, so module TUs
 # carrying them would be program-dependent — unsound for a core-TU cache
 # keyed on core sources alone. Instances emit in the root TU; module TUs
-# see their prototypes through the identifier-keyed decls slices. One
-# `mono__` scan covers both mangles (`__mono__` / `__umono__`).
+# see their prototypes through the identifier-keyed decls slices.
 fn modular_home(d: Decl) : Option[String] = match d {
-  DFn(_, n, _, _, _, _, _, _, _, _, fsym) ->
-    if string_contains(n, "mono__") { None } else { home_tu(d) }
+  DFn(_, fid, _, _, _, _, _, _, _, _) ->
+    if fnid_inst(fid) != spec_none() { None } else { home_tu(d) }
   _ -> home_tu(d)
 }
 
@@ -10945,8 +10939,8 @@ fn dots_to_underscores_loop(s: String, i: Int, n: Int, acc: String) : String =
 type CModuleTU = { stem: String, body: String }
 
 #[doc("Issue #748 — separate-compilation entry point. Emits the program as N per-module translation units plus two shared headers, joined into one marker-delimited String the `bin/kai` wrapper splits into files. Reuses every `emit_program` section emitter; the only new work is partitioning `decls` by module-origin.")]
-pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], stamp_ids: [SymId]) : String / Console + Mutable =
-  match emit_program_modular_cached(file, src, raw_decls, bmode, target_origin, regions, [], [], stamp_ids) {
+pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], stamp_ids: [SymId]) : String / Console + Mutable =
+  match emit_program_modular_cached(file, src, raw_decls, tab, specs, ids, bmode, target_origin, regions, [], [], stamp_ids) {
     EMO(stream, _) -> stream
   }
 
@@ -10954,28 +10948,26 @@ pub fn emit_program_modular(file: String, src: String, raw_decls: [Decl], bmode:
 pub type EmitModularOut = EMO(String, [CTU])
 
 #[doc("As `emit_program_modular`, with the core emit cache threaded through: TUs whose stem appears in `cached` splice the cached body instead of emitting; freshly emitted TUs whose module origin appears in `cacheable` are returned for the caller to persist.")]
-pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], cached: [CTU], cacheable: [String], stamp_ids: [SymId]) : EmitModularOut / Console + Mutable {
+pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], cached: [CTU], cacheable: [String], stamp_ids: [SymId]) : EmitModularOut / Console + Mutable {
 
   let entry = entry_of_root(target_origin)
   let alias_resolved = rewrite_alias_decls(raw_decls)
-  let eff_names = collect_effect_names(alias_resolved)
-  let decls = desugar_op_calls_decls(alias_resolved, eff_names)
-  let fns = register_fn_decls(decls, entry)
-  let variants = register_variants(decls)
-  let op_quals = collect_op_qualified_names(decls)
-  let globals = build_globals(fns, variants, eff_names, op_quals, const_names(decls))
-  let st0 = lc_new(globals)
-  let st = collect_decls(decls, st0)
+  let decls = desugar_op_calls_decls(alias_resolved, collect_effect_ids(alias_resolved))
+  let fns = register_fn_decls(decls, tab, specs, entry)
+  let variants = register_variants(decls, tab)
+  let st = collect_decls(decls, lc_new(tab, specs))
   let lams = st.lams
   let clauses_info = st.clauses
+  let ctor_ix = ctor_ix_build(variants, decls, tab, target_origin)
+  let lab = (s: SymId) => eff_rt_name(tab, target_origin, s)
 
   # ---- kai_types.h : runtime + every struct/typedef (shared) --------
-  let mono_structs = mono_sum_decls(decls, variants)
-  let eff_structs = effect_struct_decls(decls)
+  let mono_structs = mono_sum_decls(decls, tab, ctor_ix)
+  let eff_structs = effect_struct_decls(decls, tab)
   let env_structs = emit_handle_env_typedefs(clauses_info)
   # C struct typedefs for every `extern "C" type`, so a struct-by-value
   # shim can name `struct __kai_ffi_<Name>`.
-  let ffi_structs = emit_ffi_struct_typedefs(collect_extern_types(decls))
+  let ffi_structs = emit_ffi_struct_typedefs(collect_extern_types(decls, tab))
   let fixed_vec_tds = collect_fixed_vec_typedefs(decls)
   let types_h = concat_all([
     "/* generated by kaikai stage 2 — shared types header */\n",
@@ -10995,13 +10987,13 @@ pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl],
   # change can never mix ABIs with cached entries.
   # `KAI_CONST` purity does not change the ABI and needs no such care.
   let fx = fnx_build_decls(decls, fns)
-  let rd_cap_set = rd_donatable_filter(rd_scan_capable(decls), decls, fx)
-  let const_syms = purity_const_syms(purity_analyze(decls, entry))
-  let clause_fwd = emit_clause_forwards(clauses_info, effect_decls_only(decls))
-  let fwd = fn_forward_decls(decls, fx, rd_cap_set, const_syms, entry)
-  let thunk_fwd = thunk_forward_decls(decls)
+  let rd_cap_set = rd_donatable_filter(rd_scan_capable(decls, tab, specs), decls, tab, specs, fx)
+  let const_syms = purity_const_syms(purity_analyze(decls, entry), tab, specs)
+  let clause_fwd = emit_clause_forwards(clauses_info, effect_decls_only(decls), tab)
+  let fwd = fn_forward_decls(decls, tab, specs, fx, rd_cap_set, const_syms, entry)
+  let thunk_fwd = thunk_forward_decls(decls, tab, specs)
   let lam_fwd = emit_lam_forward_decls(lams)
-  let default_ev_extern = emit_default_node_extern_decls(effect_decls_only(decls))
+  let default_ev_extern = emit_default_node_extern_decls(effect_decls_only(decls), lab)
   let decls_h = concat_all([
     "/* generated by kaikai stage 2 — shared declarations header */\n",
     "#ifndef KAI_DECLS_H\n#define KAI_DECLS_H\n",
@@ -11016,21 +11008,21 @@ pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl],
   # every TU (root and module) emits defs, thunks, and call sites keyed on
   # it, which is what keeps the `_donor` ABI link-consistent across `.o`s.
   let cx = EmitCtx { lcs: [], fns: fns, fx: fx, variants: variants, lams: lams, cls: clauses_info,
-                     regions: regions, in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls), cur_enc_fn: "", recs: collect_records(decls), stamps: rec_stamps(decls, stamp_ids), core_ix: core_ix, ctor_ix: ctor_ix_build(variants, decls, target_origin), evf: frames_index(build_evidence_frames(decls, entry)), rd_active: false, rd_capable: rd_cap_set, tcpend: [], unw: unw_frame_none(unw_cx(decls, clauses_info)), root_mod: target_origin }
+                     regions: regions, in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls, tab), cur_enc_fn: "", recs: collect_records(decls), stamps: rec_stamps(decls, stamp_ids), core_ix: core_ix, ctor_ix: ctor_ix, evf: frames_index(build_evidence_frames(decls, tab, specs, entry)), rd_active: false, rd_capable: rd_cap_set, tcpend: [], unw: unw_frame_none(unw_cx(decls, clauses_info)), root_mod: target_origin, tab: tab, specs: specs, locals: ln_empty() }
   # Root TU: root-file fn bodies + ALL lambdas/clauses + tests/benches/
   # checks + the main wrapper. Lambdas and clauses have no mo, so they
   # ride root — link-safe and complete.
   let root_decls = decls_of_origin(decls, None)
   let root_bodies = fn_bodies(src, root_decls, cx, const_syms)
-  let lam_bodies = emit_lam_helpers(src, lams, fns, cx.fx, variants, clauses_info, const_decls_only(decls), effect_decls_only(decls), collect_records(decls), cx.stamps, core_ix, cx.ctor_ix, cx.evf, cx.root_mod, cx.unw.ucx)
+  let lam_bodies = emit_lam_helpers(src, lams, tab, specs, fns, cx.fx, variants, clauses_info, const_decls_only(decls), effect_decls_only(decls), collect_records(decls), cx.stamps, core_ix, cx.ctor_ix, cx.evf, cx.root_mod, cx.unw.ucx)
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
   let tests = emit_all_tests(src, decls, cx, target_origin)
   let benches = emit_all_benches(src, decls, cx, target_origin)
   let checks = emit_all_checks(src, decls, cx, target_origin)
-  let main_wr = emit_main_wrapper(decls, bmode, variants, fns, entry)
+  let main_wr = emit_main_wrapper(decls, tab, specs, ids, ctor_ix, lab, bmode, variants, fns, entry)
   # One definition of each default-block effect's evidence globals, in the root
   # TU; module TUs see them via the `extern` decls in the shared header.
-  let default_ev_defs = emit_default_node_globals(effect_decls_only(decls))
+  let default_ev_defs = emit_default_node_globals(effect_decls_only(decls), lab)
   let root_tu = CModuleTU { stem: "__root__",
     body: concat_all([default_ev_defs, root_bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr]) }
   # Module TUs: one per distinct module-origin, carrying only that
@@ -11114,36 +11106,29 @@ fn assemble_modular_output(nonce: String, sliced: [SlicedHeaders], tus: [CModule
 }
 
 #[doc("Emit-layer entry point emit_program")]
-pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], stamp_ids: [SymId]) : String / Console + Mutable {
+pub fn emit_program(file: String, src: String, raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: ProtoIds, bmode: BuildMode, target_origin: Option[String], regions: [RegionMark], stamp_ids: [SymId]) : String / Console + Mutable {
 
-  # m7a #6c: rewrite `Eff.op(args)` callees from `EField(EName(Eff), op)`
-  # to `EName("Eff.op")` before code emission. The typer (synth_op_call_with_scheme)
-  # produces this form internally, but inference is a diagnostic-only
-  # pass here — it does not propagate the rewritten AST back to all_decls.
-  # This standalone walker closes the gap; the next pipeline iteration
-  # (Doc C §*Pipeline order and desugaring*) will fold it into a proper
-  # post-resolve desugar pass.
+  # A callee still spelled `Eff.op` becomes the perform the emitter
+  # dispatches through the evidence.
   let entry = entry_of_root(target_origin)
   let alias_resolved = rewrite_alias_decls(raw_decls)
-  let eff_names = collect_effect_names(alias_resolved)
-  let decls = desugar_op_calls_decls(alias_resolved, eff_names)
-  let fns = register_fn_decls(decls, entry)
-  let variants = register_variants(decls)
-  let op_quals = collect_op_qualified_names(decls)
-  let globals = build_globals(fns, variants, eff_names, op_quals, const_names(decls))
-  let st0 = lc_new(globals)
-  let st = collect_decls(decls, st0)
+  let decls = desugar_op_calls_decls(alias_resolved, collect_effect_ids(alias_resolved))
+  let fns = register_fn_decls(decls, tab, specs, entry)
+  let variants = register_variants(decls, tab)
+  let st = collect_decls(decls, lc_new(tab, specs))
   let lams = st.lams
   let clauses_info = st.clauses
-  let extern_types = collect_extern_types(decls)
+  let ctor_ix = ctor_ix_build(variants, decls, tab, target_origin)
+  let lab = (s: SymId) => eff_rt_name(tab, target_origin, s)
+  let extern_types = collect_extern_types(decls, tab)
   let ffi_header_inc = if has_ffi_struct(extern_types) { string_concat("#include \"", string_concat(ffi_header_name(), "\"\n\n")) } else { "" }
   let header = concat_all(["/* generated by kaikai stage 2 */\n#include \"runtime.h\"\n", ffi_header_inc, "\n"])
   # Monomorphic node representation (Koka mould): flat struct per sum
   # ctor. v1 additive — emitted but not yet constructed/matched against,
   # so this is layout-visible (diffable vs Koka's C) with zero behaviour
   # change until the consumers switch over.
-  let mono_structs = mono_sum_decls(decls, variants)
-  let eff_structs = effect_struct_decls(decls)
+  let mono_structs = mono_sum_decls(decls, tab, ctor_ix)
+  let eff_structs = effect_struct_decls(decls, tab)
   # R9: env typedefs come after the EvE structs (no dependency between
   # them — env structs are pure plain-old-data, EvE has the void *env)
   # but before the clause forwards (whose bodies cast `self->env` to
@@ -11163,16 +11148,16 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # filter is a soundness fence, not a live change. Computed once, threaded
   # to the forward decls and the emit context.
   let fx = fnx_build_decls(decls, fns)
-  let rd_cap_set = rd_donatable_filter(rd_scan_capable(decls), decls, fx)
+  let rd_cap_set = rd_donatable_filter(rd_scan_capable(decls, tab, specs), decls, tab, specs, fx)
   # Confirmed-purity symbols (#1139): the emitted `c_sym` of every fn
   # whose lowered body is memory-clean, so the signature helper prefixes
   # `KAI_CONST`. Computed once over the same decls the native backend
   # sees; empty under separate compilation is fine (a cross-TU caller
   # keeps the barrier). Same set drives the forward decl and the body.
-  let const_syms = purity_const_syms(purity_analyze(decls, entry))
-  let clause_fwd = emit_clause_forwards(clauses_info, effect_decls_only(decls))
-  let fwd = fn_forward_decls(decls, fx, rd_cap_set, const_syms, entry)
-  let thunk_fwd = thunk_forward_decls(decls)
+  let const_syms = purity_const_syms(purity_analyze(decls, entry), tab, specs)
+  let clause_fwd = emit_clause_forwards(clauses_info, effect_decls_only(decls), tab)
+  let fwd = fn_forward_decls(decls, tab, specs, fx, rd_cap_set, const_syms, entry)
+  let thunk_fwd = thunk_forward_decls(decls, tab, specs)
   let lam_fwd = emit_lam_forward_decls(lams)
   # Top-level emission runs with an empty lexical scope; each fn /
   # lambda / clause / test body seeds its own scope from the params
@@ -11188,14 +11173,14 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # recursing, so the entry `lcs` is `[]`.
   let core_ix = core_ix_build()
   let cx = EmitCtx { lcs: [], fns: fns, fx: fx, variants: variants, lams: lams, cls: cls,
-                     regions: regions, in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls), cur_enc_fn: "", recs: collect_records(decls), stamps: rec_stamps(decls, stamp_ids), core_ix: core_ix, ctor_ix: ctor_ix_build(variants, decls, target_origin), evf: frames_index(build_evidence_frames(decls, entry)), rd_active: false, rd_capable: rd_cap_set, tcpend: [], unw: unw_frame_none(unw_cx(decls, clauses_info)), root_mod: target_origin }
+                     regions: regions, in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls, tab), cur_enc_fn: "", recs: collect_records(decls), stamps: rec_stamps(decls, stamp_ids), core_ix: core_ix, ctor_ix: ctor_ix, evf: frames_index(build_evidence_frames(decls, tab, specs, entry)), rd_active: false, rd_capable: rd_cap_set, tcpend: [], unw: unw_frame_none(unw_cx(decls, clauses_info)), root_mod: target_origin, tab: tab, specs: specs, locals: ln_empty() }
   let bodies = fn_bodies(src, decls, cx, const_syms)
-  let lam_bodies = emit_lam_helpers(src, lams, fns, cx.fx, variants, cls, const_decls_only(decls), effect_decls_only(decls), collect_records(decls), cx.stamps, core_ix, cx.ctor_ix, cx.evf, cx.root_mod, cx.unw.ucx)
+  let lam_bodies = emit_lam_helpers(src, lams, tab, specs, fns, cx.fx, variants, cls, const_decls_only(decls), effect_decls_only(decls), collect_records(decls), cx.stamps, core_ix, cx.ctor_ix, cx.evf, cx.root_mod, cx.unw.ucx)
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
   let tests = emit_all_tests(src, decls, cx, target_origin)
   let benches = emit_all_benches(src, decls, cx, target_origin)
   let checks = emit_all_checks(src, decls, cx, target_origin)
-  let main_wr = emit_main_wrapper(decls, bmode, variants, fns, entry)
+  let main_wr = emit_main_wrapper(decls, tab, specs, ids, ctor_ix, lab, bmode, variants, fns, entry)
   # The FFI `typedef`s live in `out.c` only when there is no extern struct
   # (then `ffi_structs` is "" and this is byte-identical to before); with a
   # struct they ride the shared `kai_ffi.h` instead, so `out.c` here omits
@@ -11204,7 +11189,7 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], bmode: BuildMo
   # Default-block evidence globals are defined ahead of the fn bodies so a
   # call site supplying a default-bearing slot addresses an already-declared
   # symbol (single-TU: one definition, file scope).
-  let default_ev_defs = emit_default_node_globals(effect_decls_only(decls))
+  let default_ev_defs = emit_default_node_globals(effect_decls_only(decls), lab)
   let fixed_vec_tds = collect_fixed_vec_typedefs(decls)
   let out_c = concat_all([header, mono_structs, eff_structs, env_structs, fixed_vec_tds, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", default_ev_defs, "\n", bodies, lam_bodies, clause_bodies, tests, benches, checks, main_wr])
   if has_ffi_struct(extern_types) { emit_ffi_header_stream(src, ffi_structs, out_c) }
@@ -11240,11 +11225,11 @@ fn emit_ffi_header_stream(src: String, ffi_structs: String, out_c: String) : Str
   ])
 }
 
-fn expand_aliases_in_row(re: RowExpr, aliases: [AliasResult]) : RowExpr {
+fn expand_aliases_in_row(re: RowExpr, tab: SymTab, aliases: [AliasResult]) : RowExpr {
   match re {
     REmpty -> REmpty
-    RClosed(labels) -> RClosed(dedup_row_labels(expand_row_labels(labels, aliases)))
-    ROpen(rv, labels) -> ROpen(rv, dedup_row_labels(expand_row_labels(labels, aliases)))
+    RClosed(labels) -> RClosed(dedup_row_labels(tab, expand_row_labels(labels, aliases)))
+    ROpen(rv, labels) -> ROpen(rv, dedup_row_labels(tab, expand_row_labels(labels, aliases)))
   }
 }
 
@@ -11265,61 +11250,69 @@ fn expand_row_labels(ls: [RowLabel], aliases: [AliasResult]) : [RowLabel] {
   match ls {
     [] -> []
     [l, ...rest] -> match l {
-      RL(name, [], _) -> {
-        let here = match find_alias(aliases, name) {
+      # An alias is named by what the label writes.
+      RL(DrWritten(None, name), []) -> {
+        let here = match find_alias(aliases, written_text(name)) {
           Some(expanded) -> expanded
           None -> [l]
         }
         list_append(here, expand_row_labels(rest, aliases))
       }
-      # Parameterised label: pass through unchanged (no alias is
-      # registered with type args today).
+      # A settled label is an effect, and no alias is registered with
+      # type args: both pass through unchanged.
       _ -> [l, ...expand_row_labels(rest, aliases)]
     }
   }
 }
 
-fn row_arg_key(te: TypeExpr) : String =
-  concat_all([type_key(te), "@", join_with(map(te_decl_ids(te), int_to_string), ",")])
+fn row_arg_key(tab: SymTab, te: TypeExpr) : String =
+  concat_all([type_key(tab, te), "@", join_with(map(te_decl_ids(te), int_to_string), ",")])
 
-fn dedup_row_labels(ls: [RowLabel]) : [RowLabel] {
-  dedup_row_labels_loop(ls, [], [])
+fn dedup_row_labels(tab: SymTab, ls: [RowLabel]) : [RowLabel] {
+  dedup_row_labels_loop(tab, ls, [], [])
 }
 
-fn dedup_row_labels_loop(ls: [RowLabel], seen: [String], acc: [RowLabel]) : [RowLabel] {
+# What a label still written spells; nothing once it is settled.
+fn row_label_spelled(r: DeclRef) : String = match r {
+  DrSym(_)              -> ""
+  DrWritten(None, n)    -> written_text(n)
+  DrWritten(Some(q), n) -> concat_all([written_text(q), ".", written_text(n)])
+}
+
+fn dedup_row_labels_loop(tab: SymTab, ls: [RowLabel], seen: [String], acc: [RowLabel]) : [RowLabel] {
   match ls {
     [] -> list_reverse(acc)
     [h, ...rest] -> match h {
-      RL(n, targs, ls) -> {
+      RL(r, targs) -> {
         # Key by declaration and args, each arg with the declarations it
         # names: two homonymous effects, `Actor[Request]` and
         # `Actor[Reply]`, or two types spelled alike, all survive. A label
         # nothing settled keys by its spelling.
-        let key = concat_all([if sym_raw(ls) >= 0 { "" } else { n }, "#", int_to_string(sym_raw(ls)), "[", join_with(map(targs, row_arg_key), ","), "]"])
+        let key = concat_all([row_label_spelled(r), "#", int_to_string(sym_raw(ref_sym(r))), "[", join_with(map(targs, (t) => row_arg_key(tab, t)), ","), "]"])
         if list_has(seen, key) {
-          dedup_row_labels_loop(rest, seen, acc)
+          dedup_row_labels_loop(tab, rest, seen, acc)
         } else {
-          dedup_row_labels_loop(rest, [key, ...seen], [h, ...acc])
+          dedup_row_labels_loop(tab, rest, [key, ...seen], [h, ...acc])
         }
       }
     }
   }
 }
 
-fn expand_aliases_in_decl(d: Decl, aliases: [AliasResult]) : Decl {
+fn expand_aliases_in_decl(d: Decl, tab: SymTab, aliases: [AliasResult]) : Decl {
   match d {
-    DFn(p, n, tps, params, ret, rexpr, body, l, c, mo, fsym) ->
-      DFn(p, n, tps, params, ret, expand_aliases_in_row(rexpr, aliases), body, l, c, mo, fsym)
+    DFn(p, fid, tps, params, ret, rexpr, body, l, c, mo) ->
+      DFn(p, fid, tps, params, ret, expand_aliases_in_row(rexpr, tab, aliases), body, l, c, mo)
     _ -> d
   }
 }
 
 #[doc("Emit-layer entry point expand_aliases_in_decls")]
-pub fn expand_aliases_in_decls(decls: [Decl], aliases: [AliasResult]) : [Decl] {
+pub fn expand_aliases_in_decls(decls: [Decl], tab: SymTab, aliases: [AliasResult]) : [Decl] {
   match decls {
     [] -> []
-    [d, ...rest] -> [expand_aliases_in_decl(d, aliases),
-                     ...expand_aliases_in_decls(rest, aliases)]
+    [d, ...rest] -> [expand_aliases_in_decl(d, tab, aliases),
+                     ...expand_aliases_in_decls(rest, tab, aliases)]
   }
 }
 
@@ -11355,65 +11348,56 @@ pub fn expand_aliases_in_decls(decls: [Decl], aliases: [AliasResult]) : [Decl] {
 # work under cycles; cycle errors are reported by the caller via the
 # `infer_program` cascade if any TyCon survives.
 
-# `TAEntry` records one transparent alias.
-#   name     — the alias type name (e.g. "Age")
-#   tparams  — declared type parameter names (e.g. ["T"] for
-#              `type Predicate[T] = (T) -> Bool`); empty for
-#              `type Age = Int`
-#   body     — the right-hand TypeExpr
-#   home     — the owning module's surface name, "" for the root file
-#   is_pub   — whether the alias is exported
-#
-# An alias name is not package-global: `type_scope` home-spells every
-# user alias at birth, so this table is already unique per home and
-# expansion (expand_ta_decls) needs no per-module filter.
-#[doc("A transparent type-alias entry: alias name, type params, the right-hand TypeExpr it expands to, its home module, and whether it is `pub`.")]
-pub type TAEntry = TAE(String, [String], TypeExpr, String, Bool)
+# The type scope pass settles a reference to an alias of any module
+# but the root and the cores to the alias's id. A reference it leaves
+# written can therefore only name a root or a core alias, which is what
+# keeps a module's alias from expanding a homonym another file writes.
+#[doc("A transparent type alias: its declaration, its type parameters, the type it expands to, and whether a reference still written can name it (the root's and a core's can; any other is reached by its id alone).")]
+pub type TAEntry = TAE(SymId, [String], TypeExpr, Bool)
 
-#[doc("Emit-layer entry point collect_transparent_aliases")]
-pub fn collect_transparent_aliases(decls: [Decl], eff_names: [String]) : [TAEntry] =
-  collect_transparent_aliases_loop(decls, eff_names, [])
+# The entries and the table their names are read from.
+type TAScope = { tab: SymTab, entries: [TAEntry] }
 
-fn collect_transparent_aliases_loop(decls: [Decl], eff_names: [String],
-                                     acc: [TAEntry]) : [TAEntry] {
+#[doc("The transparent aliases `decls` declares. `eff_names` are the written names of the effects, `target` the root's home and `cores` the core modules' homes.")]
+pub fn collect_transparent_aliases(decls: [Decl], tab: SymTab, eff_names: [String],
+                                    target: String, cores: [String]) : [TAEntry] =
+  collect_transparent_aliases_loop(decls, tab, eff_names, ta_modules(tab, [target, ...cores]), [])
+
+fn ta_modules(tab: SymTab, homes: [String]) : [SymId] = match homes {
+  [] -> []
+  [h, ...rest] -> match st_module(tab, h) {
+    Some(m) -> [m, ...ta_modules(tab, rest)]
+    None    -> ta_modules(tab, rest)
+  }
+}
+
+fn collect_transparent_aliases_loop(decls: [Decl], tab: SymTab, eff_names: [String],
+                                     bare: [SymId], acc: [TAEntry]) : [TAEntry] {
   match decls {
     [] -> list_reverse(acc)
     [d, ...rest] -> {
-      let here = transparent_alias_of_decl(d, eff_names)
+      let here = transparent_alias_of_decl(d, tab, eff_names, bare)
       let acc1 = match here {
         Some(e) -> [e, ...acc]
         None -> acc
       }
-      collect_transparent_aliases_loop(rest, eff_names, acc1)
+      collect_transparent_aliases_loop(rest, tab, eff_names, bare, acc1)
     }
   }
 }
 
-fn ta_home_of(mo: Option[String]) : String = match mo {
-  Some(m) -> m
-  None    -> ""
-}
-
-fn transparent_alias_of_decl(d: Decl, eff_names: [String]) : Option[TAEntry] {
+fn transparent_alias_of_decl(d: Decl, tab: SymTab, eff_names: [String], bare: [SymId]) : Option[TAEntry] {
   match decl_transparent_inner(d) {
-    Some(inner) -> transparent_alias_of_decl(inner, eff_names)
+    Some(inner) -> transparent_alias_of_decl(inner, tab, eff_names, bare)
     None -> match d {
-      DType(is_pub, name, tparams, body, _, _, mo, _, _) -> match body {
-        TBAlias(t) -> match t.tkind {
-          # Single-name body that resolves to an effect: skip. Effect
-          # aliasing is the legacy semantics of TBAlias single-name
-          # form, threaded by `resolve_alias_cands` + the row pass.
-          TyName(_, n, []) -> if list_has(eff_names, n) { None }
-                           else { Some(TAE(name, tparams, t, ta_home_of(mo), is_pub)) }
-          # Refinement aliases (`type Pos = Int where p`) expand to
-          # their inline form `TyRefine(Int, p)` at every use site.
-          # `synthesize_refine_pred_fns` + `lower_pattern_narrow_decls`
-          # have already run by the time expansion fires, so the
-          # synthesised `__ref_pred_X` fn survives and the per-pattern
-          # narrow lowering has resolved the alias name against the
-          # raw decl list.
-          _ -> Some(TAE(name, tparams, t, ta_home_of(mo), is_pub))
-        }
+      DType(_, tsym, tparams, body, _, _, _, _) -> match body {
+        # A refinement alias (`type Pos = Int where p`) expands to its
+        # inline `TyRefine(Int, p)` at every use site: the predicate fn
+        # and the pattern-narrow lowering have already run on the raw
+        # declarations.
+        TBAlias(t) ->
+          if ta_names_effect(tab, t, eff_names) { None }
+          else { Some(TAE(tsym, tparams, t, any(bare, (m) => sym_owned_by(tab, tsym, m)))) }
         _ -> None
       }
       _ -> None
@@ -11421,17 +11405,37 @@ fn transparent_alias_of_decl(d: Decl, eff_names: [String]) : Option[TAEntry] {
   }
 }
 
+# A single-name body naming an effect is an effect alias, which the
+# row pass expands.
+fn ta_names_effect(tab: SymTab, t: TypeExpr, eff_names: [String]) : Bool = match t.tkind {
+  TyName(DrSym(s), []) -> match sym_class(tab, s) {
+    NCEffect -> st_valid(tab, s)
+    _        -> false
+  }
+  TyName(DrWritten(None, n), []) -> list_has(eff_names, written_text(n))
+  _ -> false
+}
+
 # An entry only answers a use site of the same arity: `type Box = Int`
 # must not capture the core's `Option[Int]`, and `type Money[t]` must
 # not capture a bare `Money`. A mismatched expansion would substitute a
 # wrong-length argument list into the body.
-fn ta_lookup(table: [TAEntry], name: String, nargs: Int) : Option[TAEntry] {
-  match table {
+fn ta_lookup(table: TAScope, r: DeclRef, nargs: Int) : Option[TAEntry] = match r {
+  DrSym(s)              -> ta_lookup_in(table.entries, [s], nargs, false)
+  DrWritten(None, n)    -> ta_lookup_in(table.entries, st_candidates(table.tab, NCType, written_text(n)), nargs, true)
+  DrWritten(Some(_), _) -> None
+}
+
+# The first entry of arity `nargs` one of `ids` declares. `spelled`: the
+# reference is still written, and reaches only an entry a name can.
+fn ta_lookup_in(es: [TAEntry], ids: [SymId], nargs: Int, spelled: Bool) : Option[TAEntry] = match ids {
+  [] -> None
+  _  -> match es {
     [] -> None
     [e, ...rest] -> match e {
-      TAE(n, tps, _, _, _) ->
-        if n == name and list_length(tps) == nargs { Some(e) }
-        else { ta_lookup(rest, name, nargs) }
+      TAE(s, tps, _, bare) ->
+        if list_length(tps) == nargs and (bare or not spelled) and any(ids, (c) => sym_same(c, s)) { Some(e) }
+        else { ta_lookup_in(rest, ids, nargs, spelled) }
     }
   }
 }
@@ -11464,11 +11468,18 @@ fn tp_subst_lookup(subst: [TPSubst], name: String) : Option[TypeExpr] {
   }
 }
 
+# A type parameter has no declaration: a reference names one by what it
+# writes.
+fn tp_subst_ref(subst: [TPSubst], r: DeclRef) : Option[TypeExpr] = match r {
+  DrWritten(None, n) -> tp_subst_lookup(subst, written_text(n))
+  _                  -> None
+}
+
 fn apply_tp_subst_te(te: TypeExpr, subst: [TPSubst]) : TypeExpr {
   match te.tkind {
-    TyName(th, name, targs) -> {
+    TyName(r, targs) -> {
       let targs1 = apply_tp_subst_te_list(targs, subst)
-      match tp_subst_lookup(subst, name) {
+      match tp_subst_ref(subst, r) {
         Some(rep) -> if targs1 == [] { rep }
                      else {
                        # `Predicate[T] = (T) -> Bool` instantiated with
@@ -11476,9 +11487,9 @@ fn apply_tp_subst_te(te: TypeExpr, subst: [TPSubst]) : TypeExpr {
                        # `T` itself, not a TyName-with-args. Higher-kinded
                        # aliases are out of scope; the type-args-on-tparam
                        # case is not supported and falls through.
-                       TypeExpr { tkind: TyName(th, name, targs1), line: te.line, col: te.col }
+                       TypeExpr { tkind: TyName(r, targs1), line: te.line, col: te.col }
                      }
-        None -> TypeExpr { tkind: TyName(th, name, targs1), line: te.line, col: te.col }
+        None -> TypeExpr { tkind: TyName(r, targs1), line: te.line, col: te.col }
       }
     }
     TyList(inner) ->
@@ -11542,7 +11553,7 @@ fn tp_subst_unit_lookup(subst: [TPSubst], sym: String) : Option[UnitExprT] {
       TPS(stored, te) ->
         if tp_kind_is_unit(stored) and tp_strip_kind(stored) == sym {
           match te.tkind {
-            TyName(_, arg, []) -> Some(USym(arg))
+            TyName(DrWritten(None, arg), []) -> Some(USym(written_text(arg)))
             _ -> None
           }
         } else { tp_subst_unit_lookup(rest, sym) }
@@ -11595,12 +11606,16 @@ fn apply_tp_subst_row(r: RowExpr, subst: [TPSubst]) : RowExpr {
       match tp_subst_lookup(subst, rv) {
         None -> ROpen(rv, labels1)
         Some(rep) -> match rep.tkind {
-          TyName(_, nm, []) -> {
-            if name_first_is_upper(nm) {
-              RClosed(label_concat_rls(labels1, [RL(nm, [], sym_none())]))
-            } else {
-              ROpen(nm, labels1)
-            }
+          # A row variable is written lowercase; anything else names an
+          # effect.
+          TyName(r, []) -> match r {
+            DrWritten(None, nm) ->
+              if name_first_is_upper(written_text(nm)) {
+                RClosed(label_concat_rls(labels1, [RL(r, [])]))
+              } else {
+                ROpen(written_text(nm), labels1)
+              }
+            _ -> RClosed(label_concat_rls(labels1, [RL(r, [])]))
           }
           # issue #772: a compound row argument (`Stdout + Fail`,
           # `Stdout + f`) arrives as a `TyRow` carrier; fold its labels
@@ -11618,8 +11633,8 @@ fn apply_tp_subst_rls(ls: [RowLabel], subst: [TPSubst]) : [RowLabel] {
   match ls {
     [] -> []
     [rl, ...rest] -> match rl {
-      RL(name, ts, s) -> [
-        RL(name, apply_tp_subst_te_list(ts, subst), s),
+      RL(r, ts) -> [
+        RL(r, apply_tp_subst_te_list(ts, subst)),
         ...apply_tp_subst_rls(rest, subst)
       ]
     }
@@ -11645,13 +11660,13 @@ fn name_first_is_upper(s: String) : Bool {
 
 # Single-step expansion of a TypeExpr against the alias table. Returns
 # the rewritten TypeExpr. Recursion bound by `fuel` caps cycles.
-fn expand_ta_te(te: TypeExpr, table: [TAEntry], aliases: [AliasResult], fuel: Int) : TypeExpr {
+fn expand_ta_te(te: TypeExpr, table: TAScope, aliases: [AliasResult], fuel: Int) : TypeExpr {
   if fuel <= 0 { te }
   else { match te.tkind {
-    TyName(th, name, targs) -> {
+    TyName(r, targs) -> {
       let targs1 = expand_ta_te_list(targs, table, aliases, fuel)
-      match ta_lookup(table, name, list_length(targs)) {
-        Some(TAE(_, tparams, body, _, _)) -> {
+      match ta_lookup(table, r, list_length(targs)) {
+        Some(TAE(_, tparams, body, _)) -> {
           let subst = build_tp_subst(tparams, targs1)
           let inst = apply_tp_subst_te(body, subst)
           # Re-walk the instantiated body so a chain `type A = B; type B = Int`
@@ -11667,7 +11682,7 @@ fn expand_ta_te(te: TypeExpr, table: [TAEntry], aliases: [AliasResult], fuel: In
           # pass suffices; the helper does not re-enter `expand_ta_te`.
           expand_row_aliases_in_te(expanded, aliases)
         }
-        None -> TypeExpr { tkind: TyName(th, name, targs1), line: te.line, col: te.col }
+        None -> TypeExpr { tkind: TyName(r, targs1), line: te.line, col: te.col }
       }
     }
     TyList(inner) ->
@@ -11696,7 +11711,7 @@ fn expand_ta_te(te: TypeExpr, table: [TAEntry], aliases: [AliasResult], fuel: In
   } }
 }
 
-fn expand_ta_te_list(tes: [TypeExpr], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [TypeExpr] {
+fn expand_ta_te_list(tes: [TypeExpr], table: TAScope, aliases: [AliasResult], fuel: Int) : [TypeExpr] {
   match tes {
     [] -> []
     [t, ...rest] -> [expand_ta_te(t, table, aliases, fuel),
@@ -11713,7 +11728,7 @@ fn expand_ta_te_list(tes: [TypeExpr], table: [TAEntry], aliases: [AliasResult], 
 # The row tail is a name — not a TypeExpr — so no alias substitution
 # happens there. Label ty_args (`Reader[Int]`) carry TypeExprs that
 # may mention aliases.
-fn expand_ta_row(r: RowExpr, table: [TAEntry], aliases: [AliasResult], fuel: Int) : RowExpr {
+fn expand_ta_row(r: RowExpr, table: TAScope, aliases: [AliasResult], fuel: Int) : RowExpr {
   match r {
     REmpty -> REmpty
     RClosed(labels) -> RClosed(expand_ta_rls(labels, table, aliases, fuel))
@@ -11721,12 +11736,12 @@ fn expand_ta_row(r: RowExpr, table: [TAEntry], aliases: [AliasResult], fuel: Int
   }
 }
 
-fn expand_ta_rls(ls: [RowLabel], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [RowLabel] {
+fn expand_ta_rls(ls: [RowLabel], table: TAScope, aliases: [AliasResult], fuel: Int) : [RowLabel] {
   match ls {
     [] -> []
     [rl, ...rest] -> match rl {
-      RL(name, ts, s) -> [
-        RL(name, expand_ta_te_list(ts, table, aliases, fuel), s),
+      RL(r, ts) -> [
+        RL(r, expand_ta_te_list(ts, table, aliases, fuel)),
         ...expand_ta_rls(rest, table, aliases, fuel)
       ]
     }
@@ -11741,16 +11756,16 @@ fn expand_ta_rls(ls: [RowLabel], table: [TAEntry], aliases: [AliasResult], fuel:
 # Mirrors qualtype_decl shape but rewrites TypeExprs only — no Console
 # diagnostics (all errors deferred to downstream typer cascade).
 #[doc("Walk every Decl, expanding transparent aliases in every TypeExpr. Mirrors qualtype_decl shape but rewrites TypeExprs only — no Console diagnostics (all errors deferred to…")]
-pub fn expand_ta_decls(decls: [Decl], table: [TAEntry], aliases: [AliasResult]) : [Decl] {
+pub fn expand_ta_decls(decls: [Decl], tab: SymTab, table: [TAEntry], aliases: [AliasResult]) : [Decl] {
   let fuel = list_length(table) + 1
-  expand_ta_decls_loop(decls, table, aliases, fuel)
+  expand_ta_decls_loop(decls, TAScope { tab: tab, entries: table }, aliases, fuel)
 }
 
 #[doc("Expand transparent aliases in one decl against an already module-scoped table.")]
-pub fn ta_expand_one(d: Decl, table: [TAEntry], aliases: [AliasResult],
-      fuel: Int) : Decl = expand_ta_decl(d, table, aliases, fuel)
+pub fn ta_expand_one(d: Decl, tab: SymTab, table: [TAEntry], aliases: [AliasResult],
+      fuel: Int) : Decl = expand_ta_decl(d, TAScope { tab: tab, entries: table }, aliases, fuel)
 
-fn expand_ta_decls_loop(decls: [Decl], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [Decl] {
+fn expand_ta_decls_loop(decls: [Decl], table: TAScope, aliases: [AliasResult], fuel: Int) : [Decl] {
   match decls {
     [] -> []
     [d, ...rest] -> [expand_ta_decl(d, table, aliases, fuel),
@@ -11758,14 +11773,14 @@ fn expand_ta_decls_loop(decls: [Decl], table: [TAEntry], aliases: [AliasResult],
   }
 }
 
-fn expand_ta_decl(d: Decl, table: [TAEntry], aliases: [AliasResult], fuel: Int) : Decl {
+fn expand_ta_decl(d: Decl, table: TAScope, aliases: [AliasResult], fuel: Int) : Decl {
   match d {
-    DFn(p, n, tps, ps, ret_opt, row, body, l, c, mo, fsym) ->
-      DFn(p, n, tps, expand_ta_params(ps, table, aliases, fuel),
+    DFn(p, fid, tps, ps, ret_opt, row, body, l, c, mo) ->
+      DFn(p, fid, tps, expand_ta_params(ps, table, aliases, fuel),
           match ret_opt { None -> None Some(te) -> Some(expand_ta_te(te, table, aliases, fuel)) },
           expand_ta_row(row, table, aliases, fuel),
-          expand_ta_expr(body, table, aliases, fuel), l, c, mo, fsym)
-    DType(p, n, tps, body, l, c, mo, slots, tsym) ->
+          expand_ta_expr(body, table, aliases, fuel), l, c, mo)
+    DType(p, tsym, tps, body, l, c, mo, slots) ->
       # Skip rewriting the alias's own DType body: keeping the original
       # decl preserves the alias name in `--ast` output and lets later
       # passes that consult it (refinement synth, dump) see the surface
@@ -11775,14 +11790,14 @@ fn expand_ta_decl(d: Decl, table: [TAEntry], aliases: [AliasResult], fuel: Int) 
         TBAlias(_) -> d
         TBEffectAlias(_) -> d
         TBRecord(fs) ->
-          DType(p, n, tps, TBRecord(expand_ta_fields(fs, table, aliases, fuel)), l, c, mo, slots, tsym)
+          DType(p, tsym, tps, TBRecord(expand_ta_fields(fs, table, aliases, fuel)), l, c, mo, slots)
         TBSum(vs) ->
-          DType(p, n, tps, TBSum(expand_ta_variants(vs, table, aliases, fuel)), l, c, mo, slots, tsym)
+          DType(p, tsym, tps, TBSum(expand_ta_variants(vs, table, aliases, fuel)), l, c, mo, slots)
       }
-    DEffect(p, n, tps, ops, defblk, l, c, mo, esym) ->
-      DEffect(p, n, tps, expand_ta_eops(ops, table, aliases, fuel), defblk, l, c, mo, esym)
-    DProtocol(p, n, tps, ops, l, c, mo, psym) ->
-      DProtocol(p, n, tps, expand_ta_pops(ops, table, aliases, fuel), l, c, mo, psym)
+    DEffect(p, esym, tps, ops, defblk, l, c, mo) ->
+      DEffect(p, esym, tps, expand_ta_eops(ops, table, aliases, fuel), defblk, l, c, mo)
+    DProtocol(p, psym, tps, ops, l, c, mo) ->
+      DProtocol(p, psym, tps, expand_ta_pops(ops, table, aliases, fuel), l, c, mo)
     DImpl(name, proto_args, ty, sub_decls, l, c, tps, isym) ->
       DImpl(name, expand_ta_te_list(proto_args, table, aliases, fuel),
             expand_ta_te(ty, table, aliases, fuel),
@@ -11800,9 +11815,9 @@ fn expand_ta_decl(d: Decl, table: [TAEntry], aliases: [AliasResult], fuel: Int) 
     DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
       DAxiom(p, sm, n, cso, tps, expand_ta_params(ps, table, aliases, fuel),
              expand_ta_te(ret, table, aliases, fuel), row, l, c)
-    DConst(p, n, ty, body, mo, l, c, csym) ->
-      DConst(p, n, expand_ta_te(ty, table, aliases, fuel),
-              expand_ta_expr(body, table, aliases, fuel), mo, l, c, csym)
+    DConst(p, csym, ty, body, mo, l, c) ->
+      DConst(p, csym, expand_ta_te(ty, table, aliases, fuel),
+              expand_ta_expr(body, table, aliases, fuel), mo, l, c)
     DTest(n, body, l, c, mo) -> DTest(n, expand_ta_expr(body, table, aliases, fuel), l, c, mo)
     DBench(n, body, l, c, mo) -> DBench(n, expand_ta_expr(body, table, aliases, fuel), l, c, mo)
     DCheck(n, ps, body, l, c, mo) ->
@@ -11823,7 +11838,7 @@ fn expand_ta_decl(d: Decl, table: [TAEntry], aliases: [AliasResult], fuel: Int) 
   }
 }
 
-fn expand_ta_params(ps: [Param], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [Param] {
+fn expand_ta_params(ps: [Param], table: TAScope, aliases: [AliasResult], fuel: Int) : [Param] {
   match ps {
     [] -> []
     [p, ...rest] -> [expand_ta_param(p, table, aliases, fuel),
@@ -11831,15 +11846,15 @@ fn expand_ta_params(ps: [Param], table: [TAEntry], aliases: [AliasResult], fuel:
   }
 }
 
-fn expand_ta_param(pm: Param, table: [TAEntry], aliases: [AliasResult], fuel: Int) : Param =
-  Param { pname: pm.pname,
+fn expand_ta_param(pm: Param, table: TAScope, aliases: [AliasResult], fuel: Int) : Param =
+  Param { binder: pm.binder,
           ptype: match pm.ptype {
             None -> None
             Some(te) -> Some(expand_ta_te(te, table, aliases, fuel))
           },
           pline: pm.pline, pcol: pm.pcol, pborrow: pm.pborrow }
 
-fn expand_ta_fields(fs: [FieldDecl], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [FieldDecl] {
+fn expand_ta_fields(fs: [FieldDecl], table: TAScope, aliases: [AliasResult], fuel: Int) : [FieldDecl] {
   match fs {
     [] -> []
     [f, ...rest] -> match f {
@@ -11849,7 +11864,7 @@ fn expand_ta_fields(fs: [FieldDecl], table: [TAEntry], aliases: [AliasResult], f
   }
 }
 
-fn expand_ta_variants(vs: [Variant], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [Variant] {
+fn expand_ta_variants(vs: [Variant], table: TAScope, aliases: [AliasResult], fuel: Int) : [Variant] {
   match vs {
     [] -> []
     [v, ...rest] -> match v {
@@ -11859,7 +11874,7 @@ fn expand_ta_variants(vs: [Variant], table: [TAEntry], aliases: [AliasResult], f
   }
 }
 
-fn expand_ta_eops(ops: [EffectOp], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [EffectOp] {
+fn expand_ta_eops(ops: [EffectOp], table: TAScope, aliases: [AliasResult], fuel: Int) : [EffectOp] {
   match ops {
     [] -> []
     [op, ...rest] -> match op {
@@ -11871,7 +11886,7 @@ fn expand_ta_eops(ops: [EffectOp], table: [TAEntry], aliases: [AliasResult], fue
   }
 }
 
-fn expand_ta_pops(ops: [ProtoOp], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [ProtoOp] {
+fn expand_ta_pops(ops: [ProtoOp], table: TAScope, aliases: [AliasResult], fuel: Int) : [ProtoOp] {
   match ops {
     [] -> []
     [op, ...rest] -> match op {
@@ -11883,11 +11898,11 @@ fn expand_ta_pops(ops: [ProtoOp], table: [TAEntry], aliases: [AliasResult], fuel
   }
 }
 
-fn expand_ta_expr(e: Expr, table: [TAEntry], aliases: [AliasResult], fuel: Int) : Expr =
+fn expand_ta_expr(e: Expr, table: TAScope, aliases: [AliasResult], fuel: Int) : Expr =
   Expr { kind: expand_ta_expr_kind(e.kind, table, aliases, fuel),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
-fn expand_ta_expr_kind(k: ExprKind, table: [TAEntry], aliases: [AliasResult], fuel: Int) : ExprKind {
+fn expand_ta_expr_kind(k: ExprKind, table: TAScope, aliases: [AliasResult], fuel: Int) : ExprKind {
   match k {
     EBlock(stmts, opt_final) ->
       EBlock(expand_ta_stmts(stmts, table, aliases, fuel),
@@ -11903,8 +11918,8 @@ fn expand_ta_expr_kind(k: ExprKind, table: [TAEntry], aliases: [AliasResult], fu
     ELambda(ps, body) ->
       ELambda(expand_ta_params(ps, table, aliases, fuel),
               expand_ta_expr(body, table, aliases, fuel))
-    EHandle(body, eff, hsym, ty_args, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(expand_ta_expr(body, table, aliases, fuel), eff, hsym,
+    EHandle(body, eff, ty_args, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(expand_ta_expr(body, table, aliases, fuel), eff,
               expand_ta_te_list(ty_args, table, aliases, fuel),
               match init_opt { None -> None Some(ie) -> Some(expand_ta_expr(ie, table, aliases, fuel)) },
               alias_opt,
@@ -11917,7 +11932,7 @@ fn expand_ta_expr_kind(k: ExprKind, table: [TAEntry], aliases: [AliasResult], fu
   }
 }
 
-fn expand_ta_arms(arms: [Arm], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [Arm] {
+fn expand_ta_arms(arms: [Arm], table: TAScope, aliases: [AliasResult], fuel: Int) : [Arm] {
   match arms {
     [] -> []
     [a, ...rest] -> [expand_ta_arm(a, table, aliases, fuel),
@@ -11925,7 +11940,7 @@ fn expand_ta_arms(arms: [Arm], table: [TAEntry], aliases: [AliasResult], fuel: I
   }
 }
 
-fn expand_ta_arm(a: Arm, table: [TAEntry], aliases: [AliasResult], fuel: Int) : Arm {
+fn expand_ta_arm(a: Arm, table: TAScope, aliases: [AliasResult], fuel: Int) : Arm {
   match a {
     Arm(pat, opt_guard, body) ->
       Arm(expand_ta_pat(pat, table, aliases, fuel),
@@ -11937,16 +11952,16 @@ fn expand_ta_arm(a: Arm, table: [TAEntry], aliases: [AliasResult], fuel: Int) : 
   }
 }
 
-fn expand_ta_pat(pat: Pattern, table: [TAEntry], aliases: [AliasResult], fuel: Int) : Pattern {
+fn expand_ta_pat(pat: Pattern, table: TAScope, aliases: [AliasResult], fuel: Int) : Pattern {
   match pat.pkind {
     PNarrow(name, te) ->
       Pattern { pkind: PNarrow(name, expand_ta_te(te, table, aliases, fuel)),
                  line: pat.line, col: pat.col }
-    PVariant(home, name, subs) ->
-      Pattern { pkind: PVariant(home, name, expand_ta_pat_list(subs, table, aliases, fuel)),
+    PVariant(r, subs) ->
+      Pattern { pkind: PVariant(r, expand_ta_pat_list(subs, table, aliases, fuel)),
                  line: pat.line, col: pat.col }
-    PVariantRecord(home, name, fs) ->
-      Pattern { pkind: PVariantRecord(home, name, expand_ta_pfields(fs, table, aliases, fuel)),
+    PVariantRecord(r, fs) ->
+      Pattern { pkind: PVariantRecord(r, expand_ta_pfields(fs, table, aliases, fuel)),
                  line: pat.line, col: pat.col }
     PRecord(fs) ->
       Pattern { pkind: PRecord(expand_ta_pfields(fs, table, aliases, fuel)),
@@ -11961,7 +11976,7 @@ fn expand_ta_pat(pat: Pattern, table: [TAEntry], aliases: [AliasResult], fuel: I
   }
 }
 
-fn expand_ta_pat_list(ps: [Pattern], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [Pattern] {
+fn expand_ta_pat_list(ps: [Pattern], table: TAScope, aliases: [AliasResult], fuel: Int) : [Pattern] {
   match ps {
     [] -> []
     [p, ...rest] -> [expand_ta_pat(p, table, aliases, fuel),
@@ -11969,7 +11984,7 @@ fn expand_ta_pat_list(ps: [Pattern], table: [TAEntry], aliases: [AliasResult], f
   }
 }
 
-fn expand_ta_pfields(fs: [PField], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [PField] {
+fn expand_ta_pfields(fs: [PField], table: TAScope, aliases: [AliasResult], fuel: Int) : [PField] {
   match fs {
     [] -> []
     [f, ...rest] -> match f {
@@ -11979,7 +11994,7 @@ fn expand_ta_pfields(fs: [PField], table: [TAEntry], aliases: [AliasResult], fue
   }
 }
 
-fn expand_ta_stmts(ss: [Stmt], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [Stmt] {
+fn expand_ta_stmts(ss: [Stmt], table: TAScope, aliases: [AliasResult], fuel: Int) : [Stmt] {
   match ss {
     [] -> []
     [s, ...rest] -> [expand_ta_stmt(s, table, aliases, fuel),
@@ -11987,7 +12002,7 @@ fn expand_ta_stmts(ss: [Stmt], table: [TAEntry], aliases: [AliasResult], fuel: I
   }
 }
 
-fn expand_ta_stmt(s: Stmt, table: [TAEntry], aliases: [AliasResult], fuel: Int) : Stmt {
+fn expand_ta_stmt(s: Stmt, table: TAScope, aliases: [AliasResult], fuel: Int) : Stmt {
   match s {
     SLet(pat, ty_opt, e) ->
       SLet(expand_ta_pat(pat, table, aliases, fuel),
@@ -12018,7 +12033,7 @@ fn expand_ta_stmt(s: Stmt, table: [TAEntry], aliases: [AliasResult], fuel: Int) 
   }
 }
 
-fn expand_ta_hclauses(cs: [HClause], table: [TAEntry], aliases: [AliasResult], fuel: Int) : [HClause] {
+fn expand_ta_hclauses(cs: [HClause], table: TAScope, aliases: [AliasResult], fuel: Int) : [HClause] {
   match cs {
     [] -> []
     [c, ...rest] -> match c {
@@ -12030,169 +12045,63 @@ fn expand_ta_hclauses(cs: [HClause], table: [TAEntry], aliases: [AliasResult], f
   }
 }
 
-fn expand_ta_hreturn(r: HReturn, table: [TAEntry], aliases: [AliasResult], fuel: Int) : HReturn {
+fn expand_ta_hreturn(r: HReturn, table: TAScope, aliases: [AliasResult], fuel: Int) : HReturn {
   match r {
     HR(name, body, l, c) -> HR(name, expand_ta_expr(body, table, aliases, fuel), l, c)
   }
 }
 
-# === issue #647: mangle private core types so same-arity
-# collisions with user-side redeclarations no longer leak into
-# the core's own exhaustiveness checks. =====================
-#
-# Setup. Issue #643 / PR #646 made the variant table arity-aware
-# (`Tree[k, v]` vs. `Tree`). That fix is sufficient when arities
-# differ. When two same-arity sum types share a name across
-# modules — concretely `stdlib/crypto/hash.kai`'s private
-# `type SplitN = SplitOk | SplitShort` and a user redeclaration
-# `type SplitN = LocalA | LocalB` — the arity discriminator no
-# longer separates them. Pre-#647, the user's match was clean
-# (sentinel marker) but the core code (`sha_take_n_loop`'s
-# match on `SplitOk` / `SplitShort`) saw the user's `LocalA` /
-# `LocalB` and failed exhaustiveness.
-#
-# Fix (issue #647, Option 1 — mangle in the declaring module).
-# Every non-`pub` `DType T` whose home module is NOT the root
-# file is renamed to `<module>::T` at the AST level, and every
-# `TyName(T, args)` inside a decl whose home module is the SAME
-# module is rewritten to `TyName(<module>::T, args)`. Decls of
-# other modules and the root file never reference `T` (private
-# types are not exported), so they remain untouched. The variant
-# table lookup, the union summary, and the codegen ctor path all
-# see the mangled return tycon for core variants and the bare
-# name for user variants — distinct buckets, no leak in either
-# direction.
-#
-# Why "Option 1" of the issue body and not Option 2 (per-module
-# name scopes) — Option 2 would touch every TyEnv builder + every
-# lookup site; Option 1 reuses the same TypeExpr-rewriter shape
-# as `expand_ta_decls` and confines the change to a single
-# pre-typer pass. The audit script's two skip-list entries
-# (`SplitN`, `NB_FragR`) come off; future same-arity collisions
-# between any two non-`pub` core types are also handled by
-# construction (different modules → different mangled names).
-#
-# Pipeline placement. Runs AFTER `expand_ta_decls` (so transparent
-# aliases have already been substituted; the mangler doesn't need
-# to recurse into alias bodies) and BEFORE `infer_program` (so
-# the typer sees the mangled names directly). Module home is
-# recovered via the same `decl_home_hint_reset` algorithm
-# `synth_refine_loop` uses, since `DType` carries no
-# `module_origin` field of its own.
+# A core module's private sum type and a user type may share a name.
+# Inside the core segment that declares one, every written reference to
+# it is settled to its declaration here, before the typer, so the core's
+# own matches never see the user's constructors and the user's never see
+# the core's. Only sum types are settled; a segment cannot name another
+# segment's private type, and the root's declarations are left alone.
 
-type PrivTyEntry = PTE(String, String, String)   # mod, bare, mangled
+# A core segment's private sum types, and the table that names them.
+type PrivTys = { tab: SymTab, types: [SymId] }
 
-fn mangled_private_type_name(mod_name: String, bare: String) : String =
-  concat_all([mod_name, "::", bare])
-
-# Walk one core segment (a contiguous block of decls all
-# belonging to module `mod_name`) and collect every non-`pub`
-# DType into a PTE entry. Refinement aliases (TBAlias with
-# TyRefine) are skipped because they cannot collide on the
-# variant-table path (they expand to a `__ref_pred_X` fn and a
-# scalar base type) — including them would risk renaming the
-# synth fn target. Effect-alias bodies (TBEffectAlias) are
-# similarly skipped: their names live in the effect namespace,
-# not the type namespace the variant walker consumes.
-
-# Walk one core segment (a contiguous block of decls all
-# belonging to module `mod_name`) and collect every non-`pub`
-# DType into a PTE entry. Refinement aliases (TBAlias with
-# TyRefine) are skipped because they cannot collide on the
-# variant-table path (they expand to a `__ref_pred_X` fn and a
-# scalar base type) — including them would risk renaming the
-# synth fn target. Effect-alias bodies (TBEffectAlias) are
-# similarly skipped: their names live in the effect namespace,
-# not the type namespace the variant walker consumes.
-fn collect_private_segment_types(decls: [Decl], mod_name: String,
-                                    acc: [PrivTyEntry]) : [PrivTyEntry] {
+fn collect_private_segment_types(decls: [Decl], acc: [SymId]) : [SymId] {
   match decls {
     [] -> acc
-    [d, ...rest] -> {
-      let acc1 = private_type_entry_of(d, mod_name, acc)
-      collect_private_segment_types(rest, mod_name, acc1)
-    }
+    [d, ...rest] -> collect_private_segment_types(rest, private_type_entry_of(d, acc))
   }
 }
 
-fn private_type_entry_of(d: Decl, home_mod: String,
-                            acc: [PrivTyEntry]) : [PrivTyEntry] {
+fn private_type_entry_of(d: Decl, acc: [SymId]) : [SymId] {
   match d {
-    DType(is_pub, name, _, body, _, _, _, _, _) ->
+    DType(is_pub, tsym, _, body, _, _, _, _) ->
       if is_pub { acc }
       else { match body {
-        # Only sum types are mangled today. Records ride the
-        # `rec_find` path which is bare-name-keyed and would need
-        # a parallel rewrite — issue #643 retro item 2 already
-        # tracks the record-side leak as a separate lane.
-        # Mangling TBRecord here would rename the record's
-        # nominal handle (e.g. `RxRangeParse`) without touching
-        # the `rec_find` lookup, breaking field projection
-        # (`res_first.st`) inside the same module.
-        TBSum(_)    -> [PTE(home_mod, name,
-                            mangled_private_type_name(home_mod, name)),
-                        ...acc]
+        TBSum(_) -> [tsym, ...acc]
         _ -> acc
       } }
     _ -> acc
   }
 }
 
-fn priv_ty_lookup(entries: [PrivTyEntry], mod_name: String,
-                     bare: String) : Option[String] {
-  match entries {
-    [] -> None
-    [e, ...rest] -> match e {
-      PTE(m, b, mangled) ->
-        if m == mod_name and b == bare { Some(mangled) }
-        else { priv_ty_lookup(rest, mod_name, bare) }
-    }
-  }
+# The private type a written reference names in its own segment.
+fn priv_ty_lookup(entries: PrivTys, r: DeclRef) : Option[SymId] = match r {
+  DrWritten(None, n) -> priv_ty_among(entries.types, st_candidates(entries.tab, NCType, written_text(n)))
+  _                  -> None
 }
 
-# Process the core as a per-segment list. Each segment is a
-# `(mod_name, decls)` pair coming from `load_cores`'s
-# `CoreSegment` accumulator, so the home module of every decl
-# in the segment is unambiguous (no `decl_home_hint_reset`
-# heuristic needed — that one fails to reset for a DType at the
-# head of the root file because DType carries no `mo`).
-#
-# Per segment: collect the private-type entries, then rewrite
-# every TypeExpr in every decl of THAT segment so internal
-# references resolve to the mangled name. Decls of OTHER core
-# segments stay intact (they cannot reference each other's
-# private types — non-`pub` types are not exported). The root
-# file's decls are not touched: they cannot reference a mangled
-# core private type (those names are not exported), and the
-# user is free to redeclare the same bare name as their own type
-# without conflict.
+fn priv_ty_among(types: [SymId], named: [SymId]) : Option[SymId] = match named {
+  [] -> None
+  [s, ...rest] ->
+    if any(types, (t) => sym_same(t, s)) { Some(s) } else { priv_ty_among(types, rest) }
+}
 
-# Process the core as a per-segment list. Each segment is a
-# `(mod_name, decls)` pair coming from `load_cores`'s
-# `CoreSegment` accumulator, so the home module of every decl
-# in the segment is unambiguous (no `decl_home_hint_reset`
-# heuristic needed — that one fails to reset for a DType at the
-# head of the root file because DType carries no `mo`).
-#
-# Per segment: collect the private-type entries, then rewrite
-# every TypeExpr in every decl of THAT segment so internal
-# references resolve to the mangled name. Decls of OTHER core
-# segments stay intact (they cannot reference each other's
-# private types — non-`pub` types are not exported). The root
-# file's decls are not touched: they cannot reference a mangled
-# core private type (those names are not exported), and the
-# user is free to redeclare the same bare name as their own type
-# without conflict.
-#[doc("Process the core as a per-segment list. Each segment is a `(mod_name, decls)` pair coming from `load_cores`'s `CoreSegment` accumulator, so the home module of every…")]
-pub fn mangle_core_segments(decls: [Decl], segs: [CoreSegment],
+#[doc("Settle, inside each core segment, the written references to that segment's own private sum types. `segs` gives each core file's module and length, `n_core` how many of `decls` are core; `tab` names the types.")]
+pub fn mangle_core_segments(decls: [Decl], tab: SymTab, segs: [CoreSegment],
                               n_core: Int) : [Decl] {
   let core_part = pae_take(decls, n_core)
   let root_part = pae_drop(decls, n_core)
-  let mangled_core = mangle_core_segments_loop(core_part, segs, [])
+  let mangled_core = mangle_core_segments_loop(core_part, tab, segs, [])
   list_append(mangled_core, root_part)
 }
 
-fn mangle_core_segments_loop(core_decls: [Decl],
+fn mangle_core_segments_loop(core_decls: [Decl], tab: SymTab,
                                    segs: [CoreSegment],
                                    acc: [Decl]) : [Decl] {
   match segs {
@@ -12202,18 +12111,18 @@ fn mangle_core_segments_loop(core_decls: [Decl],
         let n_seg = list_length(seg_template)
         let this_seg = pae_take(core_decls, n_seg)
         let remaining = pae_drop(core_decls, n_seg)
-        let seg_entries = collect_private_segment_types(this_seg, mod_name, [])
+        let seg_types = collect_private_segment_types(this_seg, [])
         let mangled_seg =
-          if seg_entries == [] { this_seg }
-          else { mangle_one_segment(this_seg, seg_entries, mod_name, []) }
-        mangle_core_segments_loop(remaining, rest,
+          if seg_types == [] { this_seg }
+          else { mangle_one_segment(this_seg, PrivTys { tab: tab, types: seg_types }, mod_name, []) }
+        mangle_core_segments_loop(remaining, tab, rest,
                                         list_append(acc, mangled_seg))
       }
     }
   }
 }
 
-fn mangle_one_segment(decls: [Decl], entries: [PrivTyEntry],
+fn mangle_one_segment(decls: [Decl], entries: PrivTys,
                         mod_name: String, acc: [Decl]) : [Decl] {
   match decls {
     [] -> list_reverse(acc)
@@ -12224,35 +12133,27 @@ fn mangle_one_segment(decls: [Decl], entries: [PrivTyEntry],
   }
 }
 
-fn mangle_one_decl(d: Decl, entries: [PrivTyEntry], home_mod: String) : Decl {
+fn mangle_one_decl(d: Decl, entries: PrivTys, home_mod: String) : Decl {
   match d {
-    # The home survives the rename: the variant table keys on it, so
-    # dropping it here would give this module's constructors the tag and
-    # payload layout of whichever module declares the name first.
-    DType(is_pub, name, tps, body, l, c, mo, slots, tsym) -> {
-      let name1 = match priv_ty_lookup(entries, home_mod, name) {
-        Some(m) -> m
-        None    -> name
-      }
-      DType(is_pub, name1, tps,
-            mangle_typebody(body, entries, home_mod), l, c, mo, slots, tsym)
-    }
-    DFn(p, n, tps, ps, ret_opt, row, body, l, c, mo, fsym) ->
-      DFn(p, n, tps, mangle_params(ps, entries, home_mod),
+    DType(is_pub, tsym, tps, body, l, c, mo, slots) ->
+      DType(is_pub, tsym, tps,
+            mangle_typebody(body, entries, home_mod), l, c, mo, slots)
+    DFn(p, fid, tps, ps, ret_opt, row, body, l, c, mo) ->
+      DFn(p, fid, tps, mangle_params(ps, entries, home_mod),
           match ret_opt { None -> None
                           Some(te) -> Some(mangle_te(te, entries, home_mod)) },
           row,
-          mangle_expr(body, entries, home_mod), l, c, mo, fsym)
+          mangle_expr(body, entries, home_mod), l, c, mo)
     DAxiom(p, sm, n, cso, tps, ps, ret, row, l, c) ->
       DAxiom(p, sm, n, cso, tps, mangle_params(ps, entries, home_mod),
              mangle_te(ret, entries, home_mod), row, l, c)
-    DConst(p, n, ty, body, mo, l, c, csym) ->
-      DConst(p, n, mangle_te(ty, entries, home_mod),
-              mangle_expr(body, entries, home_mod), mo, l, c, csym)
-    DEffect(p, n, tps, ops, defblk, l, c, _, esym) ->
-      DEffect(p, n, tps, mangle_eops(ops, entries, home_mod), defblk, l, c, None, esym)
-    DProtocol(p, n, tps, ops, l, c, mo, psym) ->
-      DProtocol(p, n, tps, mangle_pops(ops, entries, home_mod), l, c, mo, psym)
+    DConst(p, csym, ty, body, mo, l, c) ->
+      DConst(p, csym, mangle_te(ty, entries, home_mod),
+              mangle_expr(body, entries, home_mod), mo, l, c)
+    DEffect(p, esym, tps, ops, defblk, l, c, _) ->
+      DEffect(p, esym, tps, mangle_eops(ops, entries, home_mod), defblk, l, c, None)
+    DProtocol(p, psym, tps, ops, l, c, mo) ->
+      DProtocol(p, psym, tps, mangle_pops(ops, entries, home_mod), l, c, mo)
     DImpl(name, proto_args, ty, sub_decls, l, c, tps, isym) ->
       DImpl(name, mangle_te_list(proto_args, entries, home_mod),
             mangle_te(ty, entries, home_mod),
@@ -12279,15 +12180,15 @@ fn mangle_one_decl(d: Decl, entries: [PrivTyEntry], home_mod: String) : Decl {
   }
 }
 
-fn mangle_te(te: TypeExpr, entries: [PrivTyEntry], home_mod: String) : TypeExpr {
+fn mangle_te(te: TypeExpr, entries: PrivTys, home_mod: String) : TypeExpr {
   match te.tkind {
-    TyName(th, name, targs) -> {
+    TyName(r, targs) -> {
       let targs1 = mangle_te_list(targs, entries, home_mod)
-      let name1 = match priv_ty_lookup(entries, home_mod, name) {
-        Some(m) -> m
-        None    -> name
+      let r1 = match priv_ty_lookup(entries, r) {
+        Some(s) -> DrSym(s)
+        None    -> r
       }
-      TypeExpr { tkind: TyName(th, name1, targs1), line: te.line, col: te.col }
+      TypeExpr { tkind: TyName(r1, targs1), line: te.line, col: te.col }
     }
     TyList(inner) ->
       TypeExpr { tkind: TyList(mangle_te(inner, entries, home_mod)),
@@ -12315,7 +12216,7 @@ fn mangle_te(te: TypeExpr, entries: [PrivTyEntry], home_mod: String) : TypeExpr 
   }
 }
 
-fn mangle_te_list(tes: [TypeExpr], entries: [PrivTyEntry],
+fn mangle_te_list(tes: [TypeExpr], entries: PrivTys,
                     home_mod: String) : [TypeExpr] {
   match tes {
     [] -> []
@@ -12324,7 +12225,7 @@ fn mangle_te_list(tes: [TypeExpr], entries: [PrivTyEntry],
   }
 }
 
-fn mangle_row(r: RowExpr, entries: [PrivTyEntry],
+fn mangle_row(r: RowExpr, entries: PrivTys,
                 home_mod: String) : RowExpr {
   match r {
     REmpty -> REmpty
@@ -12333,18 +12234,18 @@ fn mangle_row(r: RowExpr, entries: [PrivTyEntry],
   }
 }
 
-fn mangle_rls(ls: [RowLabel], entries: [PrivTyEntry],
+fn mangle_rls(ls: [RowLabel], entries: PrivTys,
                 home_mod: String) : [RowLabel] {
   match ls {
     [] -> []
     [rl, ...rest] -> match rl {
-      RL(name, ts, s) -> [RL(name, mangle_te_list(ts, entries, home_mod), s),
+      RL(r, ts) -> [RL(r, mangle_te_list(ts, entries, home_mod)),
                         ...mangle_rls(rest, entries, home_mod)]
     }
   }
 }
 
-fn mangle_params(ps: [Param], entries: [PrivTyEntry],
+fn mangle_params(ps: [Param], entries: PrivTys,
                    home_mod: String) : [Param] {
   match ps {
     [] -> []
@@ -12353,16 +12254,16 @@ fn mangle_params(ps: [Param], entries: [PrivTyEntry],
   }
 }
 
-fn mangle_param(pm: Param, entries: [PrivTyEntry],
+fn mangle_param(pm: Param, entries: PrivTys,
                   home_mod: String) : Param =
-  Param { pname: pm.pname,
+  Param { binder: pm.binder,
           ptype: match pm.ptype {
             None -> None
             Some(te) -> Some(mangle_te(te, entries, home_mod))
           },
           pline: pm.pline, pcol: pm.pcol, pborrow: pm.pborrow }
 
-fn mangle_typebody(b: TypeBody, entries: [PrivTyEntry],
+fn mangle_typebody(b: TypeBody, entries: PrivTys,
                      home_mod: String) : TypeBody {
   match b {
     TBAlias(t) -> TBAlias(mangle_te(t, entries, home_mod))
@@ -12372,7 +12273,7 @@ fn mangle_typebody(b: TypeBody, entries: [PrivTyEntry],
   }
 }
 
-fn mangle_fields(fs: [FieldDecl], entries: [PrivTyEntry],
+fn mangle_fields(fs: [FieldDecl], entries: PrivTys,
                    home_mod: String) : [FieldDecl] {
   match fs {
     [] -> []
@@ -12383,7 +12284,7 @@ fn mangle_fields(fs: [FieldDecl], entries: [PrivTyEntry],
   }
 }
 
-fn mangle_variants(vs: [Variant], entries: [PrivTyEntry],
+fn mangle_variants(vs: [Variant], entries: PrivTys,
                      home_mod: String) : [Variant] {
   match vs {
     [] -> []
@@ -12394,7 +12295,7 @@ fn mangle_variants(vs: [Variant], entries: [PrivTyEntry],
   }
 }
 
-fn mangle_eops(ops: [EffectOp], entries: [PrivTyEntry],
+fn mangle_eops(ops: [EffectOp], entries: PrivTys,
                  home_mod: String) : [EffectOp] {
   match ops {
     [] -> []
@@ -12407,7 +12308,7 @@ fn mangle_eops(ops: [EffectOp], entries: [PrivTyEntry],
   }
 }
 
-fn mangle_pops(ops: [ProtoOp], entries: [PrivTyEntry],
+fn mangle_pops(ops: [ProtoOp], entries: PrivTys,
                  home_mod: String) : [ProtoOp] {
   match ops {
     [] -> []
@@ -12420,11 +12321,11 @@ fn mangle_pops(ops: [ProtoOp], entries: [PrivTyEntry],
   }
 }
 
-fn mangle_expr(e: Expr, entries: [PrivTyEntry], home_mod: String) : Expr =
+fn mangle_expr(e: Expr, entries: PrivTys, home_mod: String) : Expr =
   Expr { kind: mangle_expr_kind(e.kind, entries, home_mod),
          line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
 
-fn mangle_expr_kind(k: ExprKind, entries: [PrivTyEntry],
+fn mangle_expr_kind(k: ExprKind, entries: PrivTys,
                        home_mod: String) : ExprKind {
   match k {
     EBlock(stmts, opt_final) ->
@@ -12441,8 +12342,8 @@ fn mangle_expr_kind(k: ExprKind, entries: [PrivTyEntry],
     ELambda(ps, body) ->
       ELambda(mangle_params(ps, entries, home_mod),
               mangle_expr(body, entries, home_mod))
-    EHandle(body, eff, hsym, ty_args, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(mangle_expr(body, entries, home_mod), eff, hsym,
+    EHandle(body, eff, ty_args, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(mangle_expr(body, entries, home_mod), eff,
               mangle_te_list(ty_args, entries, home_mod),
               match init_opt {
                 None -> None
@@ -12458,7 +12359,7 @@ fn mangle_expr_kind(k: ExprKind, entries: [PrivTyEntry],
   }
 }
 
-fn mangle_arms(arms: [Arm], entries: [PrivTyEntry],
+fn mangle_arms(arms: [Arm], entries: PrivTys,
                  home_mod: String) : [Arm] {
   match arms {
     [] -> []
@@ -12467,7 +12368,7 @@ fn mangle_arms(arms: [Arm], entries: [PrivTyEntry],
   }
 }
 
-fn mangle_arm(a: Arm, entries: [PrivTyEntry], home_mod: String) : Arm {
+fn mangle_arm(a: Arm, entries: PrivTys, home_mod: String) : Arm {
   match a {
     Arm(pat, opt_guard, body) ->
       Arm(mangle_pat(pat, entries, home_mod),
@@ -12479,17 +12380,17 @@ fn mangle_arm(a: Arm, entries: [PrivTyEntry], home_mod: String) : Arm {
   }
 }
 
-fn mangle_pat(pat: Pattern, entries: [PrivTyEntry],
+fn mangle_pat(pat: Pattern, entries: PrivTys,
                 home_mod: String) : Pattern {
   match pat.pkind {
     PNarrow(name, te) ->
       Pattern { pkind: PNarrow(name, mangle_te(te, entries, home_mod)),
                  line: pat.line, col: pat.col }
-    PVariant(home, name, subs) ->
-      Pattern { pkind: PVariant(home, name, mangle_pat_list(subs, entries, home_mod)),
+    PVariant(r, subs) ->
+      Pattern { pkind: PVariant(r, mangle_pat_list(subs, entries, home_mod)),
                  line: pat.line, col: pat.col }
-    PVariantRecord(home, name, fs) ->
-      Pattern { pkind: PVariantRecord(home, name, mangle_pfields(fs, entries, home_mod)),
+    PVariantRecord(r, fs) ->
+      Pattern { pkind: PVariantRecord(r, mangle_pfields(fs, entries, home_mod)),
                  line: pat.line, col: pat.col }
     PRecord(fs) ->
       Pattern { pkind: PRecord(mangle_pfields(fs, entries, home_mod)),
@@ -12504,7 +12405,7 @@ fn mangle_pat(pat: Pattern, entries: [PrivTyEntry],
   }
 }
 
-fn mangle_pat_list(ps: [Pattern], entries: [PrivTyEntry],
+fn mangle_pat_list(ps: [Pattern], entries: PrivTys,
                      home_mod: String) : [Pattern] {
   match ps {
     [] -> []
@@ -12513,7 +12414,7 @@ fn mangle_pat_list(ps: [Pattern], entries: [PrivTyEntry],
   }
 }
 
-fn mangle_pfields(fs: [PField], entries: [PrivTyEntry],
+fn mangle_pfields(fs: [PField], entries: PrivTys,
                     home_mod: String) : [PField] {
   match fs {
     [] -> []
@@ -12524,7 +12425,7 @@ fn mangle_pfields(fs: [PField], entries: [PrivTyEntry],
   }
 }
 
-fn mangle_stmts(ss: [Stmt], entries: [PrivTyEntry],
+fn mangle_stmts(ss: [Stmt], entries: PrivTys,
                   home_mod: String) : [Stmt] {
   match ss {
     [] -> []
@@ -12533,7 +12434,7 @@ fn mangle_stmts(ss: [Stmt], entries: [PrivTyEntry],
   }
 }
 
-fn mangle_stmt(s: Stmt, entries: [PrivTyEntry], home_mod: String) : Stmt {
+fn mangle_stmt(s: Stmt, entries: PrivTys, home_mod: String) : Stmt {
   match s {
     SLet(pat, ty_opt, e) ->
       SLet(mangle_pat(pat, entries, home_mod),
@@ -12567,7 +12468,7 @@ fn mangle_stmt(s: Stmt, entries: [PrivTyEntry], home_mod: String) : Stmt {
   }
 }
 
-fn mangle_hclauses(cs: [HClause], entries: [PrivTyEntry],
+fn mangle_hclauses(cs: [HClause], entries: PrivTys,
                      home_mod: String) : [HClause] {
   match cs {
     [] -> []
@@ -12580,7 +12481,7 @@ fn mangle_hclauses(cs: [HClause], entries: [PrivTyEntry],
   }
 }
 
-fn mangle_hreturn(r: HReturn, entries: [PrivTyEntry],
+fn mangle_hreturn(r: HReturn, entries: PrivTys,
                     home_mod: String) : HReturn {
   match r {
     HR(name, body, l, c) -> HR(name, mangle_expr(body, entries, home_mod), l, c)
@@ -12603,7 +12504,7 @@ fn mangle_hreturn(r: HReturn, entries: [PrivTyEntry],
 
 fn sig_of_decl(d: Decl) : Option[Ty] {
   match d {
-    DFn(_, _, _, params, opt_ret, rexpr, _, _, _, _, fsym) -> {
+    DFn(_, _, _, params, opt_ret, rexpr, _, _, _, _) -> {
       let pts = map(params, param_ty)
       let ret = match opt_ret {
         Some(rty) -> resolve_ty(rty)
@@ -12623,7 +12524,13 @@ fn sig_of_decl(d: Decl) : Option[Ty] {
   }
 }
 
-fn mangle_ty(t: Ty) : String {
+# The mangle of a type that names no declaration: a scalar, or a shape
+# over scalars and core types.
+fn mangle_ty(t: Ty) : String = mangle_ty_in(st_empty(), t)
+
+# A nominal head is spelled as `tab` declares it: two homonymous types of
+# two modules mangle alike here.
+fn mangle_ty_in(tab: SymTab, t: Ty) : String {
   match t {
     TyInt    -> "Int"
     TyReal   -> "Real"
@@ -12637,23 +12544,24 @@ fn mangle_ty(t: Ty) : String {
     TyUInt64   -> "UInt64"
     TyInt128   -> "Int128"
     TyHandle   -> "Handle"
-    TyListT(inner) -> concat_all(["L_", mangle_ty(inner), "_E"])
+    TyListT(inner) -> concat_all(["L_", mangle_ty_in(tab, inner), "_E"])
     TyFnT(ps, ret, _) -> concat_all([
-      "F_", join_with(map(ps, mangle_ty), "_"),
-      "_R_", mangle_ty(ret), "_E"
+      "F_", join_with(map(ps, (p) => mangle_ty_in(tab, p)), "_"),
+      "_R_", mangle_ty_in(tab, ret), "_E"
     ])
-    TyCon(_, cname, tas, _) -> {
+    TyCon(s, tas) -> {
+      let cname = written_text(decl_name(tab, s))
       match tas {
         [] -> cname
         [_h, ..._rest] -> concat_all([cname, "_O_",
-                                    join_with(map(tas, mangle_ty), "_"),
+                                    join_with(map(tas, (a) => mangle_ty_in(tab, a)), "_"),
                                     "_C"])
       }
     }
     TyVarT(_) -> "TVAR"
     # a resolved shape app is erased to its constructor before codegen;
     # an unresolved one is a bug, flagged like `TVAR`.
-    TyShapeApp(_, arg) -> concat_all(["SVAR_", mangle_ty(arg)])
+    TyShapeApp(_, arg) -> concat_all(["SVAR_", mangle_ty_in(tab, arg)])
     TyAny     -> "Any"
     # m12.5: units are erased at codegen time. The mangled name for a
     # dimensioned type is the same as its base type's mangle — so a
@@ -12664,12 +12572,12 @@ fn mangle_ty(t: Ty) : String {
     # that splits its specialisation from the dynamic `Vec` and from
     # every other length.
     TyDimT(base, u) -> if ty_is_fixed_vec(t) {
-      concat_all([mangle_ty(base), "_D", int_to_string(fixed_vec_n(t))])
-    } else { mangle_ty(base) }
+      concat_all([mangle_ty_in(tab, base), "_D", int_to_string(fixed_vec_n(t))])
+    } else { mangle_ty_in(tab, base) }
     # m12.6.x #1: refinements erase like units. `Int where >= 0` and
     # `Int` mangle the same — they share monomorphisations and
     # protocol-impl dispatch entries.
-    TyRefineT(base, _) -> mangle_ty(base)
+    TyRefineT(base, _) -> mangle_ty_in(tab, base)
     # issue #187 phase 1: mangle a union as `U_<part1>_<part2>_..._E`
     # using the canonical component order. The leading `U_` and
     # trailing `_E` bracket the spec the same way `L_..._E` brackets
@@ -12681,15 +12589,15 @@ fn mangle_ty(t: Ty) : String {
     # to keep the walker exhaustive without `_` fallbacks that would
     # mask future bugs.
     TyUnion(parts) -> concat_all(["U_",
-                                  join_with(map(parts, mangle_ty), "_"),
+                                  join_with(map(parts, (p) => mangle_ty_in(tab, p)), "_"),
                                   "_E"])
   }
 }
 
-fn mangle_name(name: String, tys: [Ty], units: [UnitExprT]) : String {
+fn mangle_name(tab: SymTab, name: String, tys: [Ty], units: [UnitExprT]) : String {
   let ty_part = match tys {
     [] -> ""
-    [_h, ..._rest] -> concat_all(["__mono__", join_with(map(tys, mangle_ty), "__")])
+    [_h, ..._rest] -> concat_all(["__mono__", join_with(map(tys, (t) => mangle_ty_in(tab, t)), "__")])
   }
   # m4c Phase 3: encode the unit-tparam tuple after the type-tparam
   # tuple. Empty units means no per-unit specialisation (the common
@@ -12761,22 +12669,22 @@ fn mangle_unit_ident_loop(s: String, i: Int, n: Int, acc: [String]) : String {
   }
 }
 
-fn dump_decl_type(d: Decl) : Unit / Console {
+fn dump_decl_type(d: Decl, tab: SymTab) : Unit / Console {
   match d {
-    DFn(is_pub, name, _, _, _, _, _, line, col, _, fsym) -> {
+    DFn(is_pub, fid, _, _, _, _, _, line, col, _) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       match sig_of_decl(d) {
-        Some(ty) -> print("#{pub_s}fn #{name} : #{ty_to_string(ty)} @#{int_to_string(line)}:#{int_to_string(col)}")
+        Some(ty) -> print("#{pub_s}fn #{written_text(decl_name(tab, fnid_sym(fid)))} : #{ty_to_string(tab, ty)} @#{int_to_string(line)}:#{int_to_string(col)}")
         None -> ()
       }
     }
-    DType(is_pub, name, tparams, _, line, col, _, _, _) -> {
+    DType(is_pub, tsym, tparams, _, line, col, _, _) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       let tps = match tparams {
         [] -> ""
         _ -> concat_all(["[", join_with(tparams, ", "), "]"])
       }
-      print("#{pub_s}type #{name}#{tps} @#{int_to_string(line)}:#{int_to_string(col)}")
+      print("#{pub_s}type #{written_text(decl_name(tab, tsym))}#{tps} @#{int_to_string(line)}:#{int_to_string(col)}")
     }
     DTest(desc, _, line, col, _) ->
       print("test #{desc} @#{int_to_string(line)}:#{int_to_string(col)}")
@@ -12792,21 +12700,21 @@ fn dump_decl_type(d: Decl) : Unit / Console {
         IkHole(name) -> print("import ?#{name} @#{int_to_string(line)}:#{int_to_string(col)}")
       }
     }
-    DEffect(is_pub, name, _, _, _, line, col, _, _) -> {
+    DEffect(is_pub, esym, _, _, _, line, col, _) -> {
       let pub_s = if is_pub { "pub " } else { "" }
-      print("#{pub_s}effect #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+      print("#{pub_s}effect #{written_text(decl_name(tab, esym))} @#{int_to_string(line)}:#{int_to_string(col)}")
     }
-    DProtocol(is_pub, name, _, _, line, col, _, _) -> {
+    DProtocol(is_pub, psym, _, _, line, col, _) -> {
       let pub_s = if is_pub { "pub " } else { "" }
-      print("#{pub_s}protocol #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+      print("#{pub_s}protocol #{written_text(decl_name(tab, psym))} @#{int_to_string(line)}:#{int_to_string(col)}")
     }
-    DImpl(pname, _, _, _, line, col, _, _) ->
-      print("impl #{pname} @#{int_to_string(line)}:#{int_to_string(col)}")
-    DDerive(_, inner, _, _) -> dump_decl_type(inner)
-    DUnstable(inner, _, _) -> dump_decl_type(inner)
-    DProtoLaws(_, inner, _, _, _) -> dump_decl_type(inner)
-    DImplAxiom(_, inner, _, _, _) -> dump_decl_type(inner)
-    DConstructor(inner, _, _) -> dump_decl_type(inner)
+    DImpl(pref, _, _, _, line, col, _, _) ->
+      print("impl #{decl_ref_text(tab, pref)} @#{int_to_string(line)}:#{int_to_string(col)}")
+    DDerive(_, inner, _, _) -> dump_decl_type(inner, tab)
+    DUnstable(inner, _, _) -> dump_decl_type(inner, tab)
+    DProtoLaws(_, inner, _, _, _) -> dump_decl_type(inner, tab)
+    DImplAxiom(_, inner, _, _, _) -> dump_decl_type(inner, tab)
+    DConstructor(inner, _, _) -> dump_decl_type(inner, tab)
     DUnit(is_pub, name, body, _, line, col, _) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       let body_s = match body {
@@ -12823,18 +12731,18 @@ fn dump_decl_type(d: Decl) : Unit / Console {
     DAxiom(is_pub, _, name, _, _, _, _, _, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
       match sig_of_decl(d) {
-        Some(ty) -> print("#{pub_s}axiom #{name} : #{ty_to_string(ty)} @#{int_to_string(line)}:#{int_to_string(col)}")
+        Some(ty) -> print("#{pub_s}axiom #{name} : #{ty_to_string(tab, ty)} @#{int_to_string(line)}:#{int_to_string(col)}")
         None -> print("#{pub_s}axiom #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
       }
     }
-    DConst(is_pub, name, ty, _, _, line, col, _) -> {        # issue #269
+    DConst(is_pub, csym, ty, _, _, line, col) -> {
       let pub_s = if is_pub { "pub " } else { "" }
-      print("#{pub_s}const #{name} : #{ty_to_string(resolve_ty(ty))} @#{int_to_string(line)}:#{int_to_string(col)}")
+      print("#{pub_s}const #{written_text(decl_name(tab, csym))} : #{ty_to_string(tab, resolve_ty(ty))} @#{int_to_string(line)}:#{int_to_string(col)}")
     }
-    # Issue #681: see through the item wrapper; the module-doc
-    # carrier declares no signature.
-    DDoc(_, _, inner, _, _) -> dump_decl_type(inner)
-    DAttr(_, inner, _, _) -> dump_decl_type(inner)
+    # See through the item wrapper; the module-doc carrier declares no
+    # signature.
+    DDoc(_, _, inner, _, _) -> dump_decl_type(inner, tab)
+    DAttr(_, inner, _, _) -> dump_decl_type(inner, tab)
     DModuleDoc(_, _, _, _) -> ()
     DExternType(name, _, line, col, _) ->
       print("extern type #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
@@ -12848,12 +12756,12 @@ fn dump_decl_type(d: Decl) : Unit / Console {
 }
 
 #[doc("Emit-layer entry point dump_types")]
-pub fn dump_types(decls: [Decl]) : Unit / Console = dump_types_loop(decls)
+pub fn dump_types(decls: [Decl], tab: SymTab) : Unit / Console = dump_types_loop(decls, tab)
 
-fn dump_types_loop(ds: [Decl]) : Unit / Console {
+fn dump_types_loop(ds: [Decl], tab: SymTab) : Unit / Console {
   match ds {
     [] -> ()
-    [d, ...rest] -> { dump_decl_type(d) dump_types_loop(rest) }
+    [d, ...rest] -> { dump_decl_type(d, tab) dump_types_loop(rest, tab) }
   }
 }
 
@@ -12869,11 +12777,11 @@ fn dump_types_loop(ds: [Decl]) : Unit / Console {
 # Monomorphisation (M4c) will de-duplicate these tuples per callee
 # and emit one specialised function body per unique instantiation.
 
-fn dump_mono_line(cs: ResolvedCS) : Unit / Console {
+fn dump_mono_line(tab: SymTab, cs: ResolvedCS) : Unit / Console {
   match cs {
-    RCS(nm, line, col, tys, _, _) -> {
-      let tys_str = join_with(ty_string_list(tys), ", ")
-      print("#{nm}@#{int_to_string(line)}:#{int_to_string(col)}  [#{tys_str}]")
+    RCS(s, line, col, tys, _, _) -> {
+      let tys_str = join_with(ty_string_list(tab, tys), ", ")
+      print("#{written_text(decl_name(tab, s))}@#{int_to_string(line)}:#{int_to_string(col)}  [#{tys_str}]")
     }
   }
 }
@@ -12900,11 +12808,11 @@ fn root_only_insts(insts: [ResolvedCS]) : [ResolvedCS] = match insts {
 }
 
 #[doc("Emit-layer entry point dump_mono")]
-pub fn dump_mono(file: String, decls: [Decl]) : Int / Console + File {
+pub fn dump_mono(file: String, decls: [Decl], tab: SymTab) : Int / Console + File {
 
 
-  let r = infer_program(file, decls, false)
-  root_only_insts(r.insts) |> each(dump_mono_line)
+  let r = infer_program(file, decls, tab, false)
+  root_only_insts(r.insts) |> each((cs: ResolvedCS) => dump_mono_line(tab, cs))
   r.errs
 }
 
@@ -12916,22 +12824,23 @@ pub fn dump_mono(file: String, decls: [Decl]) : Int / Console + File {
 # specialised decls. Lines look like:
 #   foo@line:col  [Int, Bool]  ->  foo__mono__Int__Bool
 
-fn dump_mono_out_line(cs: ResolvedCS) : Unit / Console {
+fn dump_mono_out_line(tab: SymTab, cs: ResolvedCS) : Unit / Console {
   match cs {
-    RCS(nm, line, col, tys, units, _) -> {
-      let tys_str = join_with(ty_string_list(tys), ", ")
-      let mname = mangle_name(nm, tys, units)
+    RCS(s, line, col, tys, units, _) -> {
+      let nm = written_text(decl_name(tab, s))
+      let tys_str = join_with(ty_string_list(tab, tys), ", ")
+      let mname = mangle_name(tab, nm, tys, units)
       print("#{nm}@#{int_to_string(line)}:#{int_to_string(col)}  [#{tys_str}]  ->  #{mname}")
     }
   }
 }
 
 #[doc("Emit-layer entry point dump_mono_out")]
-pub fn dump_mono_out(file: String, decls: [Decl]) : Int / Console + File {
+pub fn dump_mono_out(file: String, decls: [Decl], tab: SymTab) : Int / Console + File {
 
 
-  let r = infer_program(file, decls, false)
-  root_only_insts(r.insts) |> each(dump_mono_out_line)
+  let r = infer_program(file, decls, tab, false)
+  root_only_insts(r.insts) |> each((cs: ResolvedCS) => dump_mono_out_line(tab, cs))
   r.errs
 }
 
@@ -12958,9 +12867,6 @@ pub fn dump_mono_out(file: String, decls: [Decl]) : Int / Console + File {
 #   - ELambda body (different fn — never tail of the enclosing fn)
 #   - EPipe / EHandle (conservative; could be relaxed later)
 #
-# A locally-bound `let`/`var` shadowing `nm` disables the match
-# inside its scope.
-#
 # M1 lands the walker only; no caller wires it into the pipeline,
 # so selfhost stays byte-identical until M3 flips emission.
 
@@ -12986,13 +12892,10 @@ pub fn dump_mono_out(file: String, decls: [Decl]) : Int / Console + File {
 #   - ELambda body (different fn — never tail of the enclosing fn)
 #   - EPipe / EHandle (conservative; could be relaxed later)
 #
-# A locally-bound `let`/`var` shadowing `nm` disables the match
-# inside its scope.
-#
 # M1 lands the walker only; no caller wires it into the pipeline,
 # so selfhost stays byte-identical until M3 flips emission.
 fn tcrec_has_tail_self_call(body: Expr, me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool =
-  tcrec_walk_tail(body.kind, me, arity, [], cons_ok, tab)
+  tcrec_walk_tail(body.kind, me, arity, cons_ok, tab)
 
 # ---- TRMC for the BUILTIN cons (`[h, ...self(t)]`) ------------------
 #
@@ -13049,55 +12952,43 @@ fn trmc_reuse_cons_modcons(xs: [Expr], me: SelfRef, arity: Int) : Option[[Expr]]
     _ -> None
   }
 
-# True when a reuse-cons call over `xs` is a modulo-cons tail: the builtin
-# cons shapes are enabled and no binder in scope shadows the self name.
-fn trmc_reuse_cons_tail(xs: [Expr], me: SelfRef, arity: Int, scope: [String], cons_ok: Bool) : Bool =
-  cons_ok and not list_has(scope, self_ref_name(me)) and
+# True when a reuse-cons call over `xs` is a modulo-cons tail and the
+# builtin cons shapes are enabled.
+fn trmc_reuse_cons_tail(xs: [Expr], me: SelfRef, arity: Int, cons_ok: Bool) : Bool =
+  cons_ok and
   (match trmc_reuse_cons_modcons(xs, me, arity) { Some(_) -> true None -> false })
 
 
-fn tcrec_walk_tail(k: ExprKind, me: SelfRef, arity: Int, scope: [String], cons_ok: Bool, tab: SymTab) : Bool {
+fn tcrec_walk_tail(k: ExprKind, me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool {
   match k {
-    ECall(f, xs) -> match sym_read_kind(f.kind) {
-      EName(callee) ->
+    ECall(f, xs) -> match f.kind {
+      # Builtin cons via perceus's reuse-cons rewrite.
+      EMark(MkReuseCons) -> trmc_reuse_cons_tail(xs, me, arity, cons_ok)
+      _ ->
         if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
           true
-        } else if tcrec_names_ctor(tab, f) and not list_has(scope, self_ref_name(me)) {
+        } else if tcrec_names_ctor(tab, f) {
           # TRMC: a constructor application in tail position with a
           # self-call in exactly one slot is modulo-cons-eligible.
           match tcrec_ctor_modcons_slot(xs, me, arity) { Some(_) -> true None -> false }
         } else { false }
-      # Builtin cons via perceus's reuse-cons rewrite.
-      EMark(MkReuseCons) -> trmc_reuse_cons_tail(xs, me, arity, scope, cons_ok)
-      # The monomorphiser retargets a bare call to a module-shared poly
-      # name as `EModCall(host, nm)` — a qualified call to the enclosing
-      # module IS a direct self-call.
-      EModCall(callmod, callee) ->
-        if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
-          true
-        } else if tcrec_names_ctor(tab, f) and not list_has(scope, self_ref_name(me)) {
-          # A constructor the typer chose by its type is spelled EModCall(tycon, Ctor).
-          match tcrec_ctor_modcons_slot(xs, me, arity) { Some(_) -> true None -> false }
-        } else { false }
-      _ -> false
     }
     EList(els) ->
       if cons_ok { match trmc_list_cons_modcons(els, me, arity) { Some(_) -> true None -> false } }
       else { false }
     EIf(_, t, opt_e) -> {
-      if tcrec_walk_tail(t.kind, me, arity, scope, cons_ok, tab) { true }
+      if tcrec_walk_tail(t.kind, me, arity, cons_ok, tab) { true }
       else { match opt_e {
         None -> false
-        Some(e2) -> tcrec_walk_tail(e2.kind, me, arity, scope, cons_ok, tab)
+        Some(e2) -> tcrec_walk_tail(e2.kind, me, arity, cons_ok, tab)
       } }
     }
-    EMatch(_, arms) -> tcrec_walk_arms(arms, me, arity, scope, cons_ok, tab)
+    EMatch(_, arms) -> tcrec_walk_arms(arms, me, arity, cons_ok, tab)
     EBlock(stmts, opt_tail) -> {
-      let scope1 = tcrec_block_scope(stmts, scope)
       match opt_tail {
         None -> false
         # Perceus wraps an arm/block tail as `EBlock([..SLet(__pcs_arm_ret,
-        # INNER)..], Some(EName(__pcs_arm_ret)))`. The tail `EVar` carries no
+        # INNER)..], Some(ELocal(__pcs_arm_ret)))`. The tail read carries no
         # self-call shape, so the naive descent reports `false` and the TRMC
         # rewrite is skipped — exactly the mixed-signature regression where
         # the unbox/perceus passes introduce this wrap and the gate then
@@ -13106,14 +12997,14 @@ fn tcrec_walk_tail(k: ExprKind, me: SelfRef, arity: Int, scope: [String], cons_o
         # recogniser agree, keeping TRMC (and its fused reuse-in-place)
         # alive through mixed-signature unboxing.
         Some(e) -> match e.kind {
-          EName(tn) ->
-            if ret_slot_is_scope(tn) {
-              match trmc_find_ret_let_rhs(stmts, tn) {
-                Some(inner) -> tcrec_walk_tail(inner.kind, me, arity, scope1, cons_ok, tab)
+          ELocal(tl) ->
+            if ret_slot_id_is_scope(tl) {
+              match trmc_find_ret_let_rhs(stmts, tl) {
+                Some(inner) -> tcrec_walk_tail(inner.kind, me, arity, cons_ok, tab)
                 None        -> false
               }
             } else { false }
-          _ -> tcrec_walk_tail(e.kind, me, arity, scope1, cons_ok, tab)
+          _ -> tcrec_walk_tail(e.kind, me, arity, cons_ok, tab)
         }
       }
     }
@@ -13121,29 +13012,14 @@ fn tcrec_walk_tail(k: ExprKind, me: SelfRef, arity: Int, scope: [String], cons_o
   }
 }
 
-fn tcrec_walk_arms(arms: [Arm], me: SelfRef, arity: Int, scope: [String], cons_ok: Bool, tab: SymTab) : Bool {
+fn tcrec_walk_arms(arms: [Arm], me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool {
   match arms {
     [] -> false
     [a, ...rest] -> match a {
-      Arm(pat, _, body) -> {
-        let scope1 = pat_bindings(pat, scope)
-        if tcrec_walk_tail(body.kind, me, arity, scope1, cons_ok, tab) { true }
-        else { tcrec_walk_arms(rest, me, arity, scope, cons_ok, tab) }
+      Arm(_, _, body) -> {
+        if tcrec_walk_tail(body.kind, me, arity, cons_ok, tab) { true }
+        else { tcrec_walk_arms(rest, me, arity, cons_ok, tab) }
       }
-    }
-  }
-}
-
-fn tcrec_block_scope(stmts: [Stmt], scope: [String]) : [String] {
-  match stmts {
-    [] -> scope
-    [s, ...rest] -> {
-      let scope1 = match s {
-        SLet(pat, _, _) -> pat_bindings(pat, scope)
-        SVar(name, _, _, _, _) -> [name, ...scope]
-        _ -> scope
-      }
-      tcrec_block_scope(rest, scope1)
     }
   }
 }
@@ -13157,39 +13033,40 @@ fn tcrec_block_scope(stmts: [Stmt], scope: [String]) : [String] {
 # (`tcrec_compute_site_dropmask`); `params` are the params in declaration
 # order.
 #[doc("Rewrite every self-tail-call into the goto sentinel the C and native emitters lower to a loop.")]
-pub fn tcrec_rewrite_decls(decls: [Decl], allow_trmc: Bool, cons_ok: Bool, root: String, tab: SymTab) : [Decl] / Console + Mutable = {
+pub fn tcrec_rewrite_decls(decls: [Decl], allow_trmc: Bool, cons_ok: Bool, root: String, tab: SymTab, specs: SpecNames) : [Decl] / Console + Mutable = {
   # The goto rebinds a parameter slot in place, so a read that hands the
   # value to a BORROWED callee slot leaves the old value unreleased: the
   # callee never took ownership. The borrow map is what separates that
   # from an owned pass, which releases through the callee.
   let bmap = pcs_planned_borrow_map(decls)
-  map(decls, (d) => tcrec_rewrite_decl(d, allow_trmc, cons_ok, bmap, tab))
+  map(decls, (d) => tcrec_rewrite_decl(d, allow_trmc, cons_ok, bmap, tab, specs))
 }
 
 # The body may arrive wrapped by perceus as `EBlock([entry..., SLet(__pcs_ret,
-# INNER), exit...], Some(EName(__pcs_ret)))`; `tcrec_rewrite_pcs_ret_wrap`
+# INNER), exit...], Some(ELocal(__pcs_ret)))`; `tcrec_rewrite_pcs_ret_wrap`
 # rewrites INNER and rebuilds the wrap. The wrap-less and entry-only shapes
 # need no unwrap: the walker descends through `EBlock(_, Some(tail))`.
-fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap, tab: SymTab) : Decl / Console + Mutable {
+fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap, tab: SymTab, specs: SpecNames) : Decl / Console + Mutable {
 
   match d {
-    DFn(is_pub, name, tparams, params, opt_ret, row, body, ln, cl, mo, fsym) -> {
+    DFn(is_pub, fid, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
       let arity = list_length(params)
       if tcrec_is_pcs_ret_wrap(body) {
         match body.kind {
           EBlock(stmts, _) ->
-            tcrec_rewrite_pcs_ret_wrap(d, is_pub, name, tparams, params,
+            tcrec_rewrite_pcs_ret_wrap(d, is_pub, fid, tparams, params,
                                         opt_ret, row, body, stmts, ln, cl, mo,
-                                        arity, allow_trmc, cons_ok, bmap, tab)
+                                        arity, allow_trmc, cons_ok, bmap, tab, specs)
           _ -> d
         }
       } else {
-        if not tcrec_has_tail_self_call(body, SelfRef(fsym, name), arity, cons_ok, tab) { d }
+        if not tcrec_has_tail_self_call(body, SelfRef(fid), arity, cons_ok, tab) { d }
         else { site_renumber_decl({
-          let pnames = map(params, (p) => p.pname)
-          let uses = pcs_use_index(body, pnames)
+          let pbs = map(params, (p) => p.binder)
+          let pnames = map(params, (p) => written_text(p.binder.name))
+          let uses = pcs_use_index(body, pbs)
           {
-            let c_sym_str = c_sym(name, mo)
+            let c_sym_str = c_sym(written_text(fn_emit_name(tab, specs, fid)), mo)
             # Skip-set aligned with pcs_pass's wrap-skip decisions: the
             # derived set under-approximates on a rewritten body (the
             # reuse recogniser replaces the cons the classifier judged
@@ -13202,13 +13079,13 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap,
             # never a re-derivation of it, so the two cannot disagree.
             let borrowed_ps = pcs_explicit_borrow_names(params)
             let skip_set = pcs_list_union(borrowed_ps,
-                             tcrec_widen_skip_raw_reads(pnames, body,
-                               pcs_branch_aware_skip_params(pnames, body, bmap), bmap))
+                             tcrec_widen_skip_raw_reads(pbs, body,
+                               pcs_branch_aware_skip_params(pbs, body, bmap), bmap))
             # The base mask feeds the per-site table so the borrowed-arg
             # rule never re-adds a bit rules 1+2 already set.
             let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
-            let dm_table = tcrec_collect_dm_table(body, SelfRef(fsym, name), arity, params,
-                                                   pnames, uses, [], [], [],
+            let dm_table = tcrec_collect_dm_table(body, SelfRef(fid), arity, params,
+                                                   pnames, uses, [], [],
                                                    bmap, base_mask)
             # TRMC: when the fn is modulo-cons-eligible (a constructor
             # in tail position with a self-call slot) AND its effect row
@@ -13224,14 +13101,14 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap,
             # the fn falls back to ordinary recursion (correct, just
             # without the modulo-cons reuse-in-place the C backend gets).
             let new_body =
-              if allow_trmc and trmc_row_is_affine(row) and trmc_body_has_modcons(body, SelfRef(fsym, name), arity, cons_ok, tab) {
-                trmc_rewrite_body(body, SelfRef(fsym, name), arity, c_sym_str,
-                                  params, pnames, uses, dm_table, skip_set, [], cons_ok, tab)
+              if allow_trmc and trmc_row_is_affine(row) and trmc_body_has_modcons(body, SelfRef(fid), arity, cons_ok, tab) {
+                trmc_rewrite_body(body, SelfRef(fid), arity, c_sym_str,
+                                  params, pnames, uses, dm_table, skip_set, cons_ok, tab, ln_of_decl(d))
               } else {
-                tcrec_rewrite_body(body, SelfRef(fsym, name), arity, c_sym_str,
-                                   params, pnames, uses, dm_table, skip_set, [])
+                tcrec_rewrite_body(body, SelfRef(fid), arity, c_sym_str,
+                                   params, pnames, uses, dm_table, skip_set)
               }
-            DFn(is_pub, name, tparams, params, opt_ret, row, new_body, ln, cl, mo, fsym)
+            DFn(is_pub, fid, tparams, params, opt_ret, row, new_body, ln, cl, mo)
           }
         }) }
       }
@@ -13259,14 +13136,14 @@ fn trmc_row_is_affine(row: RowExpr) : Bool = match row {
 # and has no cons cell path yet (those fns fall back to ordinary recursion
 # there — correct, just stack-growing; native cons-TRMC is a follow-up).
 fn trmc_body_has_modcons(body: Expr, me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool =
-  trmc_walk_modcons((trmc_unwrap_ret(body)).kind, me, arity, [], cons_ok, tab)
+  trmc_walk_modcons((trmc_unwrap_ret(body)).kind, me, arity, cons_ok, tab)
 
-fn trmc_walk_modcons(k: ExprKind, me: SelfRef, arity: Int, scope: [String], cons_ok: Bool, tab: SymTab) : Bool {
+fn trmc_walk_modcons(k: ExprKind, me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool {
   match k {
     ECall(f, xs) -> match f.kind {
-      EMark(MkReuseCons) -> trmc_reuse_cons_tail(xs, me, arity, scope, cons_ok)
+      EMark(MkReuseCons) -> trmc_reuse_cons_tail(xs, me, arity, cons_ok)
       _ ->
-        if tcrec_names_ctor(tab, f) and not list_has(scope, self_ref_name(me)) {
+        if tcrec_names_ctor(tab, f) {
           match tcrec_ctor_modcons_slot(xs, me, arity) { Some(_) -> true None -> false }
         } else { false }
     }
@@ -13274,24 +13151,21 @@ fn trmc_walk_modcons(k: ExprKind, me: SelfRef, arity: Int, scope: [String], cons
       if cons_ok { match trmc_list_cons_modcons(els, me, arity) { Some(_) -> true None -> false } }
       else { false }
     EIf(_, t, opt_e) ->
-      if trmc_walk_modcons((trmc_unwrap_ret(t)).kind, me, arity, scope, cons_ok, tab) { true }
-      else { match opt_e { None -> false Some(e2) -> trmc_walk_modcons((trmc_unwrap_ret(e2)).kind, me, arity, scope, cons_ok, tab) } }
-    EMatch(_, arms) -> trmc_walk_modcons_arms(arms, me, arity, scope, cons_ok, tab)
-    EBlock(stmts, opt_tail) -> {
-      let scope1 = tcrec_block_scope(stmts, scope)
-      match opt_tail { None -> false Some(e) -> trmc_walk_modcons((trmc_unwrap_ret(e)).kind, me, arity, scope1, cons_ok, tab) }
-    }
+      if trmc_walk_modcons((trmc_unwrap_ret(t)).kind, me, arity, cons_ok, tab) { true }
+      else { match opt_e { None -> false Some(e2) -> trmc_walk_modcons((trmc_unwrap_ret(e2)).kind, me, arity, cons_ok, tab) } }
+    EMatch(_, arms) -> trmc_walk_modcons_arms(arms, me, arity, cons_ok, tab)
+    EBlock(_, opt_tail) ->
+      match opt_tail { None -> false Some(e) -> trmc_walk_modcons((trmc_unwrap_ret(e)).kind, me, arity, cons_ok, tab) }
     _ -> false
   }
 }
 
-fn trmc_walk_modcons_arms(arms: [Arm], me: SelfRef, arity: Int, scope: [String], cons_ok: Bool, tab: SymTab) : Bool {
+fn trmc_walk_modcons_arms(arms: [Arm], me: SelfRef, arity: Int, cons_ok: Bool, tab: SymTab) : Bool {
   match arms {
     [] -> false
-    [Arm(pat, _, body), ...rest] -> {
-      let scope1 = pat_bindings(pat, scope)
-      if trmc_walk_modcons((trmc_unwrap_ret(body)).kind, me, arity, scope1, cons_ok, tab) { true }
-      else { trmc_walk_modcons_arms(rest, me, arity, scope, cons_ok, tab) }
+    [Arm(_, _, body), ...rest] -> {
+      if trmc_walk_modcons((trmc_unwrap_ret(body)).kind, me, arity, cons_ok, tab) { true }
+      else { trmc_walk_modcons_arms(rest, me, arity, cons_ok, tab) }
     }
   }
 }
@@ -13304,7 +13178,7 @@ fn tcrec_is_pcs_ret_wrap(body: Expr) : Bool {
   match body.kind {
     EBlock(_, opt_tail) -> match opt_tail {
       Some(t) -> match t.kind {
-        EName(nm) -> ret_slot_is_fn(nm)
+        ELocal(l) -> ret_slot_id_is_fn(l)
         _ -> false
       }
       None -> false
@@ -13313,57 +13187,58 @@ fn tcrec_is_pcs_ret_wrap(body: Expr) : Bool {
   }
 }
 
-fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
+fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, fid: FnId,
                               tparams: [String], params: [Param],
                               opt_ret: Option[TypeExpr], row: RowExpr,
                               body: Expr, stmts: [Stmt],
                               ln: Int, cl: Int, mo: Option[String],
                               arity: Int, allow_trmc: Bool, cons_ok: Bool,
-                              bmap: BorrowMap, tab: SymTab) : Decl / Console + Mutable {
+                              bmap: BorrowMap, tab: SymTab, specs: SpecNames) : Decl / Console + Mutable {
 
   match tcrec_find_pcs_ret_let(stmts, []) {
     None -> d
     Some(triple) -> match triple {
       TcrecPcsTriple(before, inner, after) -> {
-        let fsym = match d { DFn(_, _, _, _, _, _, _, _, _, _, s) -> s  _ -> fnid_none() }
         # TRMC eligibility (modulo-cons through arm-wraps) OR an ordinary
         # direct tail self-call qualifies the inner for rewrite.
         # `allow_trmc` is false on the LLVM backend (it cannot lower the
         # `__kai_trmc|` cctx sentinel — see the direct-branch note); a
         # TRMC-only inner then falls back to ordinary recursion.
-        let is_trmc_inner = allow_trmc and trmc_row_is_affine(row) and trmc_body_has_modcons(inner, SelfRef(fsym, name), arity, cons_ok, tab)
-        let has_direct = tcrec_has_tail_self_call(inner, SelfRef(fsym, name), arity, cons_ok, tab)
+        let is_trmc_inner = allow_trmc and trmc_row_is_affine(row) and trmc_body_has_modcons(inner, SelfRef(fid), arity, cons_ok, tab)
+        let has_direct = tcrec_has_tail_self_call(inner, SelfRef(fid), arity, cons_ok, tab)
         if not has_direct and not is_trmc_inner { d }
         else { site_renumber_decl({
-          let pnames = map(params, (p) => p.pname)
-          let uses = pcs_use_index(inner, pnames)
+          let pbs = map(params, (p) => p.binder)
+          let pnames = map(params, (p) => written_text(p.binder.name))
+          let uses = pcs_use_index(inner, pbs)
           {
-            let c_sym_str = c_sym(name, mo)
+            let c_sym_str = c_sym(written_text(fn_emit_name(tab, specs, fid)), mo)
             # Skip-set aligned with pcs_pass's wrap-skip decisions —
             # widened with the params the rewriter left bare (raw
             # transfer), same as the non-wrap branch. Plus the planned
             # borrow set (a borrow-through param is never TCO-dropped).
             let borrowed_ps = pcs_explicit_borrow_names(params)
             let skip_set = pcs_list_union(borrowed_ps,
-                             tcrec_widen_skip_raw_reads(pnames, inner,
-                               pcs_branch_aware_skip_params(pnames, inner, bmap), bmap))
+                             tcrec_widen_skip_raw_reads(pbs, inner,
+                               pcs_branch_aware_skip_params(pbs, inner, bmap), bmap))
             let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
-            let dm_table = tcrec_collect_dm_table(inner, SelfRef(fsym, name), arity, params,
-                                                   pnames, uses, [], [], [],
+            let dm_table = tcrec_collect_dm_table(inner, SelfRef(fid), arity, params,
+                                                   pnames, uses, [], [],
                                                    bmap, base_mask)
             # TRMC: a modulo-cons step `goto`s past the exit wrap and pays
             # its params through the dropmask; the wrap's exit drops move
             # into the apply leaves, the only exits that return.
             let new_body =
               if is_trmc_inner {
-                txd_plant_exit(trmc_rewrite_body(inner, SelfRef(fsym, name), arity, c_sym_str,
-                                                 params, pnames, uses, dm_table, skip_set, [], cons_ok, tab), after)
+                let ns = ln_of_decl(d)
+                txd_plant_exit(ns, trmc_rewrite_body(inner, SelfRef(fid), arity, c_sym_str,
+                                                     params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns), after)
               } else {
-                let new_inner = tcrec_rewrite_body(inner, SelfRef(fsym, name), arity, c_sym_str,
-                                                    params, pnames, uses, dm_table, skip_set, [])
+                let new_inner = tcrec_rewrite_body(inner, SelfRef(fid), arity, c_sym_str,
+                                                    params, pnames, uses, dm_table, skip_set)
                 tcrec_rebuild_pcs_ret_wrap(body, before, new_inner, after)
               }
-            DFn(is_pub, name, tparams, params, opt_ret, row, new_body, ln, cl, mo, fsym)
+            DFn(is_pub, fid, tparams, params, opt_ret, row, new_body, ln, cl, mo)
           }
         }) }
       }
@@ -13381,8 +13256,8 @@ fn tcrec_find_pcs_ret_let(stmts: [Stmt], before_acc: [Stmt]) : Option[TcrecPcsTr
     [] -> None
     [s, ...rest] -> match s {
       SLet(pat, _, rhs) -> match pat.pkind {
-        PBind(nm) ->
-          if ret_slot_is_fn(nm) {
+        PBind(b) ->
+          if ret_slot_id_is_fn(b.id) {
             Some(TcrecPcsTriple(list_reverse(before_acc), rhs, rest))
           } else {
             tcrec_find_pcs_ret_let(rest, [s, ...before_acc])
@@ -13397,12 +13272,12 @@ fn tcrec_find_pcs_ret_let(stmts: [Stmt], before_acc: [Stmt]) : Option[TcrecPcsTr
 fn tcrec_rebuild_pcs_ret_wrap(orig: Expr, before: [Stmt], new_inner: Expr,
                               after: [Stmt]) : Expr {
   let ret_let = SLet(
-    Pattern { pkind: PBind(ret_slot_name(RsFn)), line: new_inner.line, col: new_inner.col },
+    Pattern { pkind: PBind(ret_slot_binder(RsFn)), line: new_inner.line, col: new_inner.col },
     None,
     new_inner
   )
   let stmts = list_append(before, [ret_let, ...after])
-  let tail = Expr { kind: EName(ret_slot_name(RsFn)), line: new_inner.line, col: new_inner.col,
+  let tail = Expr { kind: ELocal(ret_slot_local(RsFn)), line: new_inner.line, col: new_inner.col,
                     ty: new_inner.ty, mode: new_inner.mode,  site: new_inner.site }
   Expr { kind: EBlock(stmts, Some(tail)),
          line: orig.line, col: orig.col, ty: orig.ty, mode: orig.mode,  site: orig.site }
@@ -13411,13 +13286,13 @@ fn tcrec_rebuild_pcs_ret_wrap(orig: Expr, before: [Stmt], new_inner: Expr,
 # Per-call-site dropmask: bit `i` is set iff param `i`'s payer is the exit
 # drop, which the goto jumps past. A never-read param is owned and paid by
 # the entry drop, which the goto re-runs.
-fn tcrec_compute_site_dropmask(params: [Param], uses: UseIx, skip_set: [String],
+fn tcrec_compute_site_dropmask(params: [Param], uses: UseIx, skip_set: [Binder],
                                 i: Int, acc: Int) : Int {
   match params {
     [] -> acc
     [p, ...rest] -> {
       let sets = PcsParamSets { moved: skip_set, forced: [] }
-      let acc1 = if pcs_pays(pcs_param_payer(p.pname, uses, sets), PyExit) { acc + tcrec_pow2(i) } else { acc }
+      let acc1 = if pcs_pays(pcs_param_payer(p.binder.id, uses, sets), PyExit) { acc + tcrec_pow2(i) } else { acc }
       tcrec_compute_site_dropmask(rest, uses, skip_set, i + 1, acc1)
     }
   }
@@ -13440,9 +13315,9 @@ type TcrDm = TcrDm(Int, Int, Int)   # call-site line, col, drop mask
 fn tcrec_collect_dm_table(body: Expr, me: SelfRef, arity: Int,
                           params: [Param], pnames: [String],
                           uses: UseIx,
-                          scope: [String], hoisted: [Expr], acc: [TcrDm],
+                          hoisted: [Expr], acc: [TcrDm],
                           bmap: BorrowMap, base_mask: Int) : [TcrDm] =
-  tcrec_collect_dm_kind(body.kind, me, arity, params, pnames, uses, scope, hoisted, acc, bmap, base_mask)
+  tcrec_collect_dm_kind(body.kind, me, arity, params, pnames, uses, hoisted, acc, bmap, base_mask)
 
 # `hoisted` carries the RHS of the `__pcs_ta*` arg-hoist lets the perceus
 # tail-drop pass placed above a self-call. The mask must see those exprs as
@@ -13450,37 +13325,27 @@ fn tcrec_collect_dm_table(body: Expr, me: SelfRef, arity: Int,
 # it flips at hoisted sites.
 fn tcrec_collect_dm_kind(k: ExprKind, me: SelfRef, arity: Int,
                          params: [Param], pnames: [String], uses: UseIx,
-                         scope: [String], hoisted: [Expr],
+                         hoisted: [Expr],
                          acc: [TcrDm], bmap: BorrowMap, base_mask: Int) : [TcrDm] {
   match k {
-    ECall(f, xs) -> match sym_read_kind(f.kind) {
-      EName(callee) ->
-        if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
-          let mask = tcrec_site_drop_mask(params, list_append(xs, hoisted), bmap, base_mask, 0, 0)
-          [TcrDm(f.line, f.col, mask), ...acc]
-        } else { acc }
-      # Same-module qualified self-call: same mask as the bare shape.
-      EModCall(callmod, callee) ->
-        if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
-          let mask = tcrec_site_drop_mask(params, list_append(xs, hoisted), bmap, base_mask, 0, 0)
-          [TcrDm(f.line, f.col, mask), ...acc]
-        } else { acc }
-      _ -> acc
-    }
+    ECall(f, xs) ->
+      if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
+        let mask = tcrec_site_drop_mask(params, list_append(xs, hoisted), bmap, base_mask, 0, 0)
+        [TcrDm(f.line, f.col, mask), ...acc]
+      } else { acc }
     EIf(_, t, opt_e) -> {
-      let a1 = tcrec_collect_dm_table(t, me, arity, params, pnames, uses, scope, hoisted, acc, bmap, base_mask)
+      let a1 = tcrec_collect_dm_table(t, me, arity, params, pnames, uses, hoisted, acc, bmap, base_mask)
       match opt_e {
         None -> a1
-        Some(e2) -> tcrec_collect_dm_table(e2, me, arity, params, pnames, uses, scope, hoisted, a1, bmap, base_mask)
+        Some(e2) -> tcrec_collect_dm_table(e2, me, arity, params, pnames, uses, hoisted, a1, bmap, base_mask)
       }
     }
-    EMatch(_, arms) -> tcrec_collect_dm_arms(arms, me, arity, params, pnames, uses, scope, hoisted, acc, bmap, base_mask)
+    EMatch(_, arms) -> tcrec_collect_dm_arms(arms, me, arity, params, pnames, uses, hoisted, acc, bmap, base_mask)
     EBlock(stmts, opt_tail) -> {
-      let scope1 = tcrec_block_scope(stmts, scope)
       let hoisted1 = tcrec_hoisted_arg_rhs(stmts, hoisted)
       match opt_tail {
         None -> acc
-        Some(e) -> tcrec_collect_dm_table(e, me, arity, params, pnames, uses, scope1, hoisted1, acc, bmap, base_mask)
+        Some(e) -> tcrec_collect_dm_table(e, me, arity, params, pnames, uses, hoisted1, acc, bmap, base_mask)
       }
     }
     _ -> acc
@@ -13492,8 +13357,8 @@ fn tcrec_hoisted_arg_rhs(stmts: [Stmt], acc: [Expr]) : [Expr] {
     [] -> acc
     [s, ...rest] -> match s {
       SLet(pat, _, rhs) -> match pat.pkind {
-        PBind(bn) ->
-          if ret_slot_is_tail_arg(bn) { tcrec_hoisted_arg_rhs(rest, [rhs, ...acc]) }
+        PBind(b) ->
+          if ret_slot_binds_tail_arg(b) { tcrec_hoisted_arg_rhs(rest, [rhs, ...acc]) }
           else { tcrec_hoisted_arg_rhs(rest, acc) }
         _ -> tcrec_hoisted_arg_rhs(rest, acc)
       }
@@ -13504,15 +13369,14 @@ fn tcrec_hoisted_arg_rhs(stmts: [Stmt], acc: [Expr]) : [Expr] {
 
 fn tcrec_collect_dm_arms(arms: [Arm], me: SelfRef, arity: Int, params: [Param],
                          pnames: [String], uses: UseIx,
-                         scope: [String], hoisted: [Expr], acc: [TcrDm],
+                         hoisted: [Expr], acc: [TcrDm],
                          bmap: BorrowMap, base_mask: Int) : [TcrDm] {
   match arms {
     [] -> acc
     [a, ...rest] -> match a {
-      Arm(pat, _, body) -> {
-        let scope1 = pat_bindings(pat, scope)
-        let a1 = tcrec_collect_dm_table(body, me, arity, params, pnames, uses, scope1, hoisted, acc, bmap, base_mask)
-        tcrec_collect_dm_arms(rest, me, arity, params, pnames, uses, scope, hoisted, a1, bmap, base_mask)
+      Arm(_, _, body) -> {
+        let a1 = tcrec_collect_dm_table(body, me, arity, params, pnames, uses, hoisted, acc, bmap, base_mask)
+        tcrec_collect_dm_arms(rest, me, arity, params, pnames, uses, hoisted, a1, bmap, base_mask)
       }
     }
   }
@@ -13524,7 +13388,7 @@ fn tcrec_site_drop_mask(params: [Param], args: [Expr], bmap: BorrowMap, base_mas
                         i: Int, acc: Int) : Int = match params {
   [] -> acc
   [p, ...rest] -> {
-    let fire = not tcrec_bit_is_set(base_mask, i) and tcrec_args_borrow_only(args, p.pname, bmap)
+    let fire = not tcrec_bit_is_set(base_mask, i) and tcrec_args_borrow_only(args, p.binder.id, bmap)
     let acc1 = if fire { acc + tcrec_pow2(i) } else { acc }
     tcrec_site_drop_mask(rest, args, bmap, base_mask, i + 1, acc1)
   }
@@ -13536,19 +13400,19 @@ fn tcrec_bit_is_set(mask: Int, i: Int) : Bool = (mask / tcrec_pow2(i)) % 2 == 1
 # borrowed parameter slot of the call it sits in. One occurrence anywhere
 # else — an owned slot, a field read, a constructor slot — means some
 # consumer on this path already releases `p`, and the goto must not drop.
-fn tcrec_args_borrow_only(args: [Expr], p: String, bmap: BorrowMap) : Bool = {
+fn tcrec_args_borrow_only(args: [Expr], p: LocalId, bmap: BorrowMap) : Bool = {
   let seen = tcrec_borrow_reads(args, p, bmap)
   let total = tcrec_all_reads(args, p)
   seen > 0 and seen == total
 }
 
 # Reads of `p` sitting bare in a borrowed slot.
-fn tcrec_borrow_reads(args: [Expr], p: String, bmap: BorrowMap) : Int = match args {
+fn tcrec_borrow_reads(args: [Expr], p: LocalId, bmap: BorrowMap) : Int = match args {
   []           -> 0
   [a, ...rest] -> tcrec_borrow_reads_e(a, p, bmap) + tcrec_borrow_reads(rest, p, bmap)
 }
 
-fn tcrec_borrow_reads_e(e: Expr, p: String, bmap: BorrowMap) : Int = match e.kind {
+fn tcrec_borrow_reads_e(e: Expr, p: LocalId, bmap: BorrowMap) : Int = match e.kind {
   ECall(f, xs) -> {
     let positions = pcs_borrow_lookup(bmap, pcs_callee_key(f))
     tcrec_borrow_reads_e(f, p, bmap) + tcrec_borrow_reads_args(xs, p, positions, 0, bmap)
@@ -13556,34 +13420,34 @@ fn tcrec_borrow_reads_e(e: Expr, p: String, bmap: BorrowMap) : Int = match e.kin
   _ -> tcrec_borrow_reads_ps(xp_positions(e), p, bmap)
 }
 
-fn tcrec_borrow_reads_args(xs: [Expr], p: String, positions: [Int], i: Int,
+fn tcrec_borrow_reads_args(xs: [Expr], p: LocalId, positions: [Int], i: Int,
                            bmap: BorrowMap) : Int = match xs {
   []           -> 0
   [a, ...rest] -> {
     let here = if pcs_has_int(positions, i) {
-      match a.kind { EName(u) -> if u == p { 1 } else { 0 }  _ -> tcrec_borrow_reads_e(a, p, bmap) }
+      match a.kind { ELocal(u) -> if local_eq(u, p) { 1 } else { 0 }  _ -> tcrec_borrow_reads_e(a, p, bmap) }
     } else { tcrec_borrow_reads_e(a, p, bmap) }
     here + tcrec_borrow_reads_args(rest, p, positions, i + 1, bmap)
   }
 }
 
-fn tcrec_borrow_reads_ps(ps: [XPos], p: String, bmap: BorrowMap) : Int = match ps {
+fn tcrec_borrow_reads_ps(ps: [XPos], p: LocalId, bmap: BorrowMap) : Int = match ps {
   []                  -> 0
   [XP(_, c), ...rest] -> tcrec_borrow_reads_e(c, p, bmap) + tcrec_borrow_reads_ps(rest, p, bmap)
 }
 
 # Every read of `p` in `args`, borrowed slot or not.
-fn tcrec_all_reads(args: [Expr], p: String) : Int = match args {
+fn tcrec_all_reads(args: [Expr], p: LocalId) : Int = match args {
   []           -> 0
   [a, ...rest] -> tcrec_all_reads_e(a, p) + tcrec_all_reads(rest, p)
 }
 
-fn tcrec_all_reads_e(e: Expr, p: String) : Int = match e.kind {
-  EName(u) -> if u == p { 1 } else { 0 }
+fn tcrec_all_reads_e(e: Expr, p: LocalId) : Int = match e.kind {
+  ELocal(u) -> if local_eq(u, p) { 1 } else { 0 }
   _       -> tcrec_all_reads_ps(xp_positions(e), p)
 }
 
-fn tcrec_all_reads_ps(ps: [XPos], p: String) : Int = match ps {
+fn tcrec_all_reads_ps(ps: [XPos], p: LocalId) : Int = match ps {
   []                  -> 0
   [XP(_, c), ...rest] -> tcrec_all_reads_e(c, p) + tcrec_all_reads_ps(rest, p)
 }
@@ -13594,12 +13458,12 @@ fn tcrec_all_reads_ps(ps: [XPos], p: String) : Int = match ps {
 # get the goto-block drop — the drop and the wrap must pair or RC
 # double-counts. Widening only (never removes a derived skip entry), so
 # a read this walker cannot see (interp strings) keeps today's mask.
-fn tcrec_widen_skip_raw_reads(pnames: [String], body: Expr, skip: [String], bm: BorrowMap) : [String] {
-  match pnames {
+fn tcrec_widen_skip_raw_reads(pbs: [Binder], body: Expr, skip: [Binder], bm: BorrowMap) : [Binder] {
+  match pbs {
     [] -> skip
     [h, ...rest] -> {
       let skip1 =
-        if not list_has(skip, h) and tcrec_expr_raw_read(body, h, bm) { [h, ...skip] }
+        if not pcs_has(skip, h.id) and tcrec_expr_raw_read(body, h.id, bm) { [h, ...skip] }
         else { skip }
       tcrec_widen_skip_raw_reads(rest, body, skip1, bm)
     }
@@ -13608,12 +13472,12 @@ fn tcrec_widen_skip_raw_reads(pnames: [String], body: Expr, skip: [String], bm: 
 
 # Lambda bodies are excluded: closure captures are RC'd separately, and
 # the dropmask's lambda story lives in the LUBlocked arm.
-fn tcrec_expr_raw_read(e: Expr, p: String, bm: BorrowMap) : Bool =
+fn tcrec_expr_raw_read(e: Expr, p: LocalId, bm: BorrowMap) : Bool =
   tcrec_kind_raw_read(e.kind, p, bm)
 
-fn tcrec_kind_raw_read(k: ExprKind, p: String, bm: BorrowMap) : Bool {
+fn tcrec_kind_raw_read(k: ExprKind, p: LocalId, bm: BorrowMap) : Bool {
   match k {
-    EName(nm) -> nm == p
+    ELocal(l) -> local_eq(l, p)
     ECall(f, xs) ->
       if tcrec_is_dup_callee(f) { tcrec_dup_arg_raw_read(xs, p, bm) }
       else if tcrec_expr_raw_read(f, p, bm) { true }
@@ -13651,7 +13515,7 @@ fn tcrec_kind_raw_read(k: ExprKind, p: String, bm: BorrowMap) : Bool {
         None -> false
         Some(e) -> tcrec_expr_raw_read(e, p, bm)
       } }
-    ERecordLit(_, _, fis) -> tcrec_fields_raw_read(fis, p, bm)
+    ERecordLit(_, fis) -> tcrec_fields_raw_read(fis, p, bm)
     EPipe(l, r) ->
       if tcrec_expr_raw_read(l, p, bm) { true } else { tcrec_expr_raw_read(r, p, bm) }
     EMapPipe(l, r) ->
@@ -13687,25 +13551,25 @@ fn tcrec_owned_args(xs: [Expr], borrowed: [Int], i: Int) : [Expr] = match xs {
   [x, ...rest] -> {
     let tl = tcrec_owned_args(rest, borrowed, i + 1)
     match x.kind {
-      EName(_) -> if pcs_has_int(borrowed, i) { tl } else { [x, ...tl] }
-      _       -> [x, ...tl]
+      ELocal(_) -> if pcs_has_int(borrowed, i) { tl } else { [x, ...tl] }
+      _         -> [x, ...tl]
     }
   }
 }
 
 # `__perceus_dup(x)` shields a bare-var read; a composite arg recurses.
-fn tcrec_dup_arg_raw_read(xs: [Expr], p: String, bm: BorrowMap) : Bool {
+fn tcrec_dup_arg_raw_read(xs: [Expr], p: LocalId, bm: BorrowMap) : Bool {
   match xs {
     [a] -> match a.kind {
-      EName(_) -> false
-      ESym(_, _, _) -> false
-      _       -> tcrec_expr_raw_read(a, p, bm)
+      ELocal(_)  -> false
+      ESym(_, _) -> false
+      _          -> tcrec_expr_raw_read(a, p, bm)
     }
     _ -> tcrec_args_raw_read(xs, p, bm)
   }
 }
 
-fn tcrec_args_raw_read(args: [Expr], p: String, bm: BorrowMap) : Bool {
+fn tcrec_args_raw_read(args: [Expr], p: LocalId, bm: BorrowMap) : Bool {
   match args {
     [] -> false
     [h, ...rest] ->
@@ -13714,7 +13578,7 @@ fn tcrec_args_raw_read(args: [Expr], p: String, bm: BorrowMap) : Bool {
   }
 }
 
-fn tcrec_arms_raw_read(arms: [Arm], p: String, bm: BorrowMap) : Bool {
+fn tcrec_arms_raw_read(arms: [Arm], p: LocalId, bm: BorrowMap) : Bool {
   match arms {
     [] -> false
     [a, ...rest] -> match a {
@@ -13731,7 +13595,7 @@ fn tcrec_arms_raw_read(arms: [Arm], p: String, bm: BorrowMap) : Bool {
   }
 }
 
-fn tcrec_stmts_raw_read(stmts: [Stmt], p: String, bm: BorrowMap) : Bool {
+fn tcrec_stmts_raw_read(stmts: [Stmt], p: LocalId, bm: BorrowMap) : Bool {
   match stmts {
     [] -> false
     [s, ...rest] -> {
@@ -13759,7 +13623,7 @@ fn tcrec_stmts_raw_read(stmts: [Stmt], p: String, bm: BorrowMap) : Bool {
   }
 }
 
-fn tcrec_elems_raw_read(elems: [ListElem], p: String, bm: BorrowMap) : Bool {
+fn tcrec_elems_raw_read(elems: [ListElem], p: LocalId, bm: BorrowMap) : Bool {
   match elems {
     [] -> false
     [e, ...rest] -> {
@@ -13772,7 +13636,7 @@ fn tcrec_elems_raw_read(elems: [ListElem], p: String, bm: BorrowMap) : Bool {
   }
 }
 
-fn tcrec_fields_raw_read(fis: [FieldInit], p: String, bm: BorrowMap) : Bool {
+fn tcrec_fields_raw_read(fis: [FieldInit], p: LocalId, bm: BorrowMap) : Bool {
   match fis {
     [] -> false
     [h, ...rest] -> match h {
@@ -13802,7 +13666,7 @@ fn tcrec_lookup_dm(table: [TcrDm], line: Int, col: Int) : Int {
 # A modulo-cons tail leaf is rewritten to
 #   ECall(EMark(MkTrmcStep(..)), ctor_args)
 # where `ctor_args` are the ORIGINAL constructor arguments (the one at
-# the step's `hole` is the self-call `ECall(EName(nm), self_args)`).
+# the step's `hole` is the self-call `ECall(<the fn>, self_args)`).
 # The emitter (`emit_trmc_step`) builds the node with a NULL hole there,
 # extends the cctx to point at it, rebinds the loop params from the
 # self-call's args (with `dropmask` reconciling Perceus's exit-drops,
@@ -13829,9 +13693,9 @@ fn tcrec_lookup_dm(table: [TcrDm], line: Int, col: Int) : Int {
 # them normally on emit.
 fn tcrec_rewrite_body(body: Expr, me: SelfRef, arity: Int, c_sym_str: String,
                       params: [Param], pnames: [String], uses: UseIx,
-                      dm_table: [TcrDm], skip_set: [String], scope: [String]) : Expr =
+                      dm_table: [TcrDm], skip_set: [Binder]) : Expr =
   Expr { kind: tcrec_rewrite_kind(body.kind, body.line, body.col, me, arity,
-                                   c_sym_str, params, pnames, uses, dm_table, skip_set, scope),
+                                   c_sym_str, params, pnames, uses, dm_table, skip_set),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
 
 fn trmc_expr_nth(xs: [Expr], i: Int) : Option[Expr] =
@@ -13847,9 +13711,9 @@ fn trmc_unwrap_ret(e: Expr) : Expr {
   match e.kind {
     EBlock(stmts, opt_tail) -> match opt_tail {
       Some(t) -> match t.kind {
-        EName(tn) ->
-          if ret_slot_is_scope(tn) {
-            match trmc_find_ret_let_rhs(stmts, tn) {
+        ELocal(tl) ->
+          if ret_slot_id_is_scope(tl) {
+            match trmc_find_ret_let_rhs(stmts, tl) {
               Some(inner) -> inner
               None        -> e
             }
@@ -13862,15 +13726,15 @@ fn trmc_unwrap_ret(e: Expr) : Expr {
   }
 }
 
-fn trmc_find_ret_let_rhs(stmts: [Stmt], ret_name: String) : Option[Expr] {
+fn trmc_find_ret_let_rhs(stmts: [Stmt], ret: LocalId) : Option[Expr] {
   match stmts {
     [] -> None
     [s, ...rest] -> match s {
       SLet(pat, _, rhs) -> match pat.pkind {
-        PBind(nm) -> if nm == ret_name { Some(rhs) } else { trmc_find_ret_let_rhs(rest, ret_name) }
-        _ -> trmc_find_ret_let_rhs(rest, ret_name)
+        PBind(b) -> if local_eq(b.id, ret) { Some(rhs) } else { trmc_find_ret_let_rhs(rest, ret) }
+        _ -> trmc_find_ret_let_rhs(rest, ret)
       }
-      _ -> trmc_find_ret_let_rhs(rest, ret_name)
+      _ -> trmc_find_ret_let_rhs(rest, ret)
     }
   }
 }
@@ -13887,22 +13751,23 @@ fn trmc_find_ret_let_rhs(stmts: [Stmt], ret_name: String) : Option[Expr] {
 # Perceus's exit-drops that the goto skips.
 fn trmc_rewrite_body(body0: Expr, me: SelfRef, arity: Int, c_sym_str: String,
                      params: [Param], pnames: [String], uses: UseIx,
-                     dm_table: [TcrDm], skip_set: [String], scope: [String], cons_ok: Bool, tab: SymTab) : Expr {
+                     dm_table: [TcrDm], skip_set: [Binder], cons_ok: Bool, tab: SymTab, ns: LocalNames) : Expr {
   let body = trmc_unwrap_ret(body0)
   let out = Expr { kind: trmc_rewrite_kind(body.kind, body.line, body.col, me, arity,
-                                  c_sym_str, params, pnames, uses, dm_table, skip_set, scope, cons_ok, tab),
+                                  c_sym_str, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
-  txd_plant(out, txd_wrap_drops(body0))
+  txd_plant(ns, out, txd_wrap_drops(body0))
 }
 
 # Build the step `ECall` for a modulo-cons leaf: compute the
 # per-site dropmask (base + side table), make the step callee, and apply
 # it to the ctor args (`args` carries the self-call at slot `h`). Shared
 # by the user-ctor, builtin-cons-literal, and reuse-cons leaves so the
-# dropmask discipline stays single-sourced.
-fn trmc_make_step_call(cname: String, args: [Expr], h: Int, line: Int, col: Int,
+# dropmask discipline stays single-sourced. `ctor` is the constructor of
+# the cell, absent on a builtin cons.
+fn trmc_make_step_call(cname: String, ctor: SymId, args: [Expr], h: Int, line: Int, col: Int,
                        c_sym_str: String, params: [Param], pnames: [String],
-                       uses: UseIx, dm_table: [TcrDm], skip_set: [String]) : ExprKind {
+                       uses: UseIx, dm_table: [TcrDm], skip_set: [Binder]) : ExprKind {
   let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
   let self_e = trmc_expr_nth(args, h)
   let site_mask = match self_e {
@@ -13910,36 +13775,35 @@ fn trmc_make_step_call(cname: String, args: [Expr], h: Int, line: Int, col: Int,
     None     -> 0
   }
   let dropmask = base_mask + site_mask
-  let step = MkTrmcStep(TrmcStep { sym: c_sym_str, hole: h, cname: cname, dropmask: dropmask, params: pnames })
+  let step = MkTrmcStep(TrmcStep { sym: c_sym_str, hole: h, cname: cname, ctor: ctor, dropmask: dropmask, params: pnames })
   ECall(Expr { kind: EMark(step), line: line, col: col, ty: None, mode: MBoxed , site: 0 }, args)
 }
 
 fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
                      c_sym_str: String, params: [Param], pnames: [String],
-                     uses: UseIx, dm_table: [TcrDm], skip_set: [String], scope: [String], cons_ok: Bool, tab: SymTab) : ExprKind {
+                     uses: UseIx, dm_table: [TcrDm], skip_set: [Binder], cons_ok: Bool, tab: SymTab, ns: LocalNames) : ExprKind {
   match k {
     EIf(c, t, opt_e) -> {
-      let t1 = trmc_rewrite_body(t, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, cons_ok, tab)
+      let t1 = trmc_rewrite_body(t, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)
       let opt_e1 = match opt_e {
         None -> None
-        Some(e2) -> Some(trmc_rewrite_body(e2, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, cons_ok, tab))
+        Some(e2) -> Some(trmc_rewrite_body(e2, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns))
       }
       EIf(c, t1, opt_e1)
     }
     EMatch(s, arms) ->
-      EMatch(s, trmc_rewrite_arms(arms, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, [], cons_ok, tab))
+      EMatch(s, trmc_rewrite_arms(arms, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, [], cons_ok, tab, ns))
     EBlock(stmts, opt_tail) -> {
-      let scope1 = tcrec_block_scope(stmts, scope)
       match opt_tail {
         None -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
-        Some(e) -> EBlock(stmts, Some(trmc_rewrite_body(e, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope1, cons_ok, tab)))
+        Some(e) -> EBlock(stmts, Some(trmc_rewrite_body(e, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)))
       }
     }
     # Builtin cons literal `[head, ...self(t)]` in tail position. The
     # cons args are `[head, self_call]`; the hole is the cdr (slot 1).
     EList(els) ->
       if cons_ok { match trmc_list_cons_modcons(els, me, arity) {
-        Some(cargs) -> trmc_make_step_call(trmc_cons_cname(), cargs, 1, line, col,
+        Some(cargs) -> trmc_make_step_call(trmc_cons_cname(), sym_none(), cargs, 1, line, col,
                                            c_sym_str, params, pnames, uses, dm_table, skip_set)
         None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
       } } else { trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 }) }
@@ -13952,14 +13816,14 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
       # via perceus's reuse-cons rewrite, the builtin cons)?
       let ctor = tcrec_ctor_callee(tab, f)
       let modslot = match ctor {
-        Some(_) -> if not list_has(scope, self_ref_name(me)) { tcrec_ctor_modcons_slot(xs, me, arity) } else { None }
+        Some(_) -> tcrec_ctor_modcons_slot(xs, me, arity)
         None    -> None
       }
       match modslot {
         Some(h) -> {
-          let cname = match ctor {
+          let csym = match ctor {
             Some(c2) -> c2
-            None     -> ""
+            None     -> sym_none()
           }
           # Dropmask for the rebind of the loop params from the
           # self-call's args. Same per-site computation as ordinary
@@ -13971,22 +13835,22 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
             None     -> 0
           }
           let dropmask = base_mask + site_mask
-          let step = MkTrmcStep(TrmcStep { sym: c_sym_str, hole: h, cname: cname, dropmask: dropmask, params: pnames })
+          let step = MkTrmcStep(TrmcStep { sym: c_sym_str, hole: h, cname: written_text(decl_name(tab, csym)), ctor: csym, dropmask: dropmask, params: pnames })
           ECall(Expr { kind: EMark(step), line: line, col: col, ty: f.ty, mode: f.mode , site: 0 }, xs)
         }
         None -> match trmc_reuse_variant_ctor(f, xs, me, arity, tab) {
           # A Perceus reuse rebuild of a modulo-cons ctor is that ctor's step:
           # the arm-top token hands the step the scrutinee's cell as its hole.
           Some(ctor) -> trmc_rewrite_kind(ctor.kind, ctor.line, ctor.col, me, arity,
-                                          c_sym_str, params, pnames, uses, dm_table, skip_set, scope, cons_ok, tab)
+                                          c_sym_str, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)
           None -> {
           # Reuse-cons leaf: the mark over `(scr, head, self)`.
           let reuse = match f.kind {
-            EMark(MkReuseCons) -> if cons_ok and not list_has(scope, self_ref_name(me)) { trmc_reuse_cons_modcons(xs, me, arity) } else { None }
+            EMark(MkReuseCons) -> if cons_ok { trmc_reuse_cons_modcons(xs, me, arity) } else { None }
             _                  -> None
           }
           match reuse {
-            Some(cargs) -> trmc_make_step_call(trmc_cons_scr_cname(), cargs, 1, line, col,
+            Some(cargs) -> trmc_make_step_call(trmc_cons_scr_cname(), sym_none(), cargs, 1, line, col,
                                                c_sym_str, params, pnames, uses, dm_table, skip_set)
             None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
           }
@@ -14011,14 +13875,10 @@ fn trmc_reuse_variant_ctor(f: Expr, xs: [Expr], me: SelfRef, arity: Int, tab: Sy
   _ -> None
 }
 
-# The constructor a callee names, as the step spells it: a reference by
-# the class of its id, and a spelling, which no id was settled for, by its
-# capital.
-fn tcrec_ctor_callee(tab: SymTab, f: Expr) : Option[String] = match f.kind {
-  ESym(s, _, c)  -> if sym_is_ctor(tab, s) { Some(c) } else { None }
-  EName(c)        -> if name_first_is_upper(c) { Some(c) } else { None }
-  EModCall(_, c) -> if name_first_is_upper(c) { Some(c) } else { None }
-  _              -> None
+# The constructor a callee names: a reference whose id is a constructor's.
+fn tcrec_ctor_callee(tab: SymTab, f: Expr) : Option[SymId] = match f.kind {
+  ESym(s, _) -> if sym_is_ctor(tab, s) { Some(s) } else { None }
+  _          -> None
 }
 
 fn tcrec_names_ctor(tab: SymTab, f: Expr) : Bool = match tcrec_ctor_callee(tab, f) {
@@ -14034,14 +13894,13 @@ fn trmc_wrap_apply(leaf: Expr) : ExprKind =
 
 fn trmc_rewrite_arms(arms: [Arm], me: SelfRef, arity: Int, c_sym_str: String,
                      params: [Param], pnames: [String], uses: UseIx,
-                     dm_table: [TcrDm], skip_set: [String], scope: [String], acc: [Arm], cons_ok: Bool, tab: SymTab) : [Arm] {
+                     dm_table: [TcrDm], skip_set: [Binder], acc: [Arm], cons_ok: Bool, tab: SymTab, ns: LocalNames) : [Arm] {
   match arms {
     [] -> list_reverse(acc)
     [a, ...rest] -> match a {
       Arm(pat, opt_g, body) -> {
-        let scope1 = pat_bindings(pat, scope)
-        let new_body = trmc_rewrite_body(body, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope1, cons_ok, tab)
-        trmc_rewrite_arms(rest, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope, [Arm(pat, opt_g, new_body), ...acc], cons_ok, tab)
+        let new_body = trmc_rewrite_body(body, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)
+        trmc_rewrite_arms(rest, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, [Arm(pat, opt_g, new_body), ...acc], cons_ok, tab, ns)
       }
     }
   }
@@ -14049,53 +13908,41 @@ fn trmc_rewrite_arms(arms: [Arm], me: SelfRef, arity: Int, c_sym_str: String,
 
 fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
                       c_sym_str: String, params: [Param], pnames: [String],
-                      uses: UseIx, dm_table: [TcrDm], skip_set: [String], scope: [String]) : ExprKind {
+                      uses: UseIx, dm_table: [TcrDm], skip_set: [Binder]) : ExprKind {
   match k {
-    ECall(f, xs) -> match sym_read_kind(f.kind) {
-      EName(callee) ->
-        if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
-          # The base mask is per-fn; the side-table mask is per-site and
-          # never re-adds a base bit, so OR == ADD.
-          tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, c_sym_str)
-        } else { k }
-      # A qualified call to the enclosing module with the fn's own name
-      # is the same self-call (the monomorphiser's module-shared
-      # retarget); the step mark replaces the callee wholesale.
-      EModCall(callmod, callee) ->
-        if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
-          tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, c_sym_str)
-        } else { k }
-      _ -> k
-    }
+    ECall(f, xs) ->
+      if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
+        # The base mask is per-fn; the side-table mask is per-site and
+        # never re-adds a base bit, so OR == ADD.
+        tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, c_sym_str)
+      } else { k }
     EIf(c, t, opt_e) -> {
-      let t1 = tcrec_rewrite_body(t, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, scope)
+      let t1 = tcrec_rewrite_body(t, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set)
       let opt_e1 = match opt_e {
         None -> None
         Some(e2) -> Some(tcrec_rewrite_body(e2, me, arity, c_sym_str, params,
-                                            pnames, uses, dm_table, skip_set, scope))
+                                            pnames, uses, dm_table, skip_set))
       }
       EIf(c, t1, opt_e1)
     }
     EMatch(s, arms) ->
       EMatch(s, tcrec_rewrite_arms(arms, me, arity, c_sym_str, params, pnames,
-                                    uses, dm_table, skip_set, scope, []))
+                                    uses, dm_table, skip_set, []))
     EBlock(stmts, opt_tail) -> {
-      let scope1 = tcrec_block_scope(stmts, scope)
       match opt_tail {
         None -> k
         Some(e) ->
           EBlock(stmts, Some(tcrec_rewrite_body(e, me, arity, c_sym_str, params,
-                                                 pnames, uses, dm_table, skip_set, scope1)))
+                                                 pnames, uses, dm_table, skip_set)))
       }
     }
     _ -> k
   }
 }
 
-# Plant the goto step for one recognised self-call site (shared by
-# the bare-EVar and qualified-EModCall shapes).
+# Plant the goto step for one recognised self-call site.
 fn tcrec_make_step_site(f: Expr, xs: [Expr], params: [Param], pnames: [String],
-                        uses: UseIx, dm_table: [TcrDm], skip_set: [String],
+                        uses: UseIx, dm_table: [TcrDm], skip_set: [Binder],
                         c_sym_str: String) : ExprKind {
   let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
   let site_mask = tcrec_lookup_dm(dm_table, f.line, f.col)
@@ -14109,16 +13956,15 @@ fn tcrec_make_step_site(f: Expr, xs: [Expr], params: [Param], pnames: [String],
 
 fn tcrec_rewrite_arms(arms: [Arm], me: SelfRef, arity: Int, c_sym_str: String,
                       params: [Param], pnames: [String], uses: UseIx,
-                      dm_table: [TcrDm], skip_set: [String], scope: [String], acc: [Arm]) : [Arm] {
+                      dm_table: [TcrDm], skip_set: [Binder], acc: [Arm]) : [Arm] {
   match arms {
     [] -> list_reverse(acc)
     [a, ...rest] -> match a {
       Arm(pat, opt_g, body) -> {
-        let scope1 = pat_bindings(pat, scope)
         let new_body = tcrec_rewrite_body(body, me, arity, c_sym_str, params,
-                                          pnames, uses, dm_table, skip_set, scope1)
+                                          pnames, uses, dm_table, skip_set)
         tcrec_rewrite_arms(rest, me, arity, c_sym_str, params, pnames, uses,
-                           dm_table, skip_set, scope, [Arm(pat, opt_g, new_body), ...acc])
+                           dm_table, skip_set, [Arm(pat, opt_g, new_body), ...acc])
       }
     }
   }
@@ -14317,18 +14163,16 @@ fn tcrec_scan_stmts(stmts: [Stmt]) : Bool {
 # next increment once leaked==0 is confirmed on the fresh-alloc path.
 #
 # `args_e` are the original ctor args; args_e[holeslot] is the
-# self-call `ECall(EName(nm), self_args)`. The non-hole slots emit with
+# self-call. The non-hole slots emit with
 # their Perceus-planted dups; the hole slot emits NULL. The loop params
 # rebind from `self_args` using the same dropmask machinery as
 # tcrec_emit_goto (reconciling the exit-drops the goto skips).
-fn emit_trmc_step(src: String, sym: String, holeslot: Int, cname: String,
-                  dropmask: Int, pnames: [String], args_e: [Expr],
-                  cx: EmitCtx) : String / Console {
+fn emit_trmc_step(src: String, s: TrmcStep, args_e: [Expr], cx: EmitCtx) : String / Console {
   # Builtin cons modulo-cons step — the markers `__kai_cons` / `__kai_cons_s`
   # mean the node is a `kai_cons` cell, not a registered variant, so it takes
   # the cons-specific build path (hole at the cdr).
-  if cname == trmc_cons_cname() or cname == trmc_cons_scr_cname() { emit_trmc_cons_step(src, sym, dropmask, pnames, args_e, cx) }
-  else { emit_trmc_variant_step(src, sym, holeslot, cname, dropmask, pnames, args_e, cx) }
+  if s.cname == trmc_cons_cname() or s.cname == trmc_cons_scr_cname() { emit_trmc_cons_step(src, s.sym, s.dropmask, s.params, args_e, cx) }
+  else { emit_trmc_variant_step(src, s, args_e, cx) }
 }
 
 # Cons modulo-cons loop step (`[head, ...self(t)]`). The cons args are
@@ -14359,7 +14203,7 @@ fn emit_trmc_cons_step(src: String, sym: String, dropmask: Int, pnames: [String]
     None                  -> tcrec_emit_drops(pnames, dropmask, 0)
   }
   let rebinds  = tcrec_emit_rebinds(pnames, 0)
-  let live     = tcl_goto_drops(tcl_without_tok(cx.tcpend), args_e)
+  let live     = tcl_goto_drops(cx.locals, tcl_without_tok(cx.tcpend), args_e)
   let cons_c = emit_cons_ctor(cx)
   concat_all([
     # A cons spine never hosts the arm-top token; it is freed, not dropped.
@@ -14387,12 +14231,24 @@ fn trmc_fresh_alloc(cname: String, tag_str: String, n: Int, mask: Int, cx: EmitC
     concat_all(["kai_variant_u_fast(", tag_str, ", ", int_to_string(n), ", _trmc_sl)"])
   }
 
-fn emit_trmc_variant_step(src: String, sym: String, holeslot: Int, cname: String,
-                  dropmask: Int, pnames: [String], args_e: [Expr],
+# The slot kinds of the step's constructor when its layout has `n` slots:
+# a list of another length would be walked off its end.
+fn trmc_row_kinds(row: Option[VariantEntry], n: Int) : Option[[Int]] = match row {
+  Some(v) -> if list_length(evar_kinds(v)) == n { Some(evar_kinds(v)) } else { None }
+  None    -> None
+}
+
+fn emit_trmc_variant_step(src: String, s: TrmcStep, args_e: [Expr],
                   cx: EmitCtx) : String / Console {
+  let sym = s.sym
+  let holeslot = s.hole
+  let cname = s.cname
+  let dropmask = s.dropmask
+  let pnames = s.params
   let n = list_length(args_e)
-  let tag_str = int_to_string(evar_find_tag_arity(cx.variants, None, cname, n))
-  let tys_opt = evar_slot_kinds_arity(cx.variants, None, cname, n)
+  let row = ctor_ix_row(cx.ctor_ix, s.ctor)
+  let tag_str = int_to_string(match row { Some(v) -> ctor_row_tag(v)  None -> 0 })
+  let tys_opt = trmc_row_kinds(row, n)
   let mask = match tys_opt { Some(ts) -> variant_slot_mask(ts) None -> 0 }
   # Build the slot initialiser list: every slot from args_e except the
   # hole slot (NULL); typed Int/Real slots emit `.i64`/`.r`.
@@ -14421,8 +14277,8 @@ fn emit_trmc_variant_step(src: String, sym: String, holeslot: Int, cname: String
     None                  -> tcrec_emit_drops(pnames, dropmask, 0)
   }
   let rebinds  = tcrec_emit_rebinds(pnames, 0)
-  let live     = tcl_goto_drops(tcl_without_tok(cx.tcpend), args_e)
-  let slot_stores = emit_trmc_slot_stores(src, "_trmc_node", cname, args_e, tys_opt, holeslot, 0, cx)
+  let live     = tcl_goto_drops(cx.locals, tcl_without_tok(cx.tcpend), args_e)
+  let slot_stores = emit_trmc_slot_stores(src, "_trmc_node", s.ctor, args_e, tys_opt, holeslot, 0, cx)
   concat_all([
     # Build the spine node REUSING `_arm_ru` (the token the arm-top
     # captured from the consumed scrutinee when it was unique) — Koka
@@ -14527,7 +14383,7 @@ fn emit_trmc_slot_vals(src: String, args_e: [Expr], tys_opt: Option[[Int]],
 # stack `KaiVarSlot[]` and having kai_variant_at copy it (the array build
 # + copy was ~10 stores per descent level; direct stores are ~5). The
 # hole slot is zeroed (the cctx fills it next).
-fn emit_trmc_slot_stores(src: String, node: String, cname: String, args_e: [Expr],
+fn emit_trmc_slot_stores(src: String, node: String, ctor: SymId, args_e: [Expr],
                          tys_opt: Option[[Int]],
                          holeslot: Int, i: Int, cx: EmitCtx) : String / Console {
   match args_e {
@@ -14540,7 +14396,7 @@ fn emit_trmc_slot_stores(src: String, node: String, cname: String, args_e: [Expr
       let head =
         if i == holeslot {
           concat_all(["kai_var_slots(", node, ")[", int_to_string(i), "].ptr = (KaiValue *)0; "])
-        } else if trmc_slot_is_donor_identity(cname, a, i, cx) {
+        } else if trmc_slot_is_donor_identity(ctor, a, i, cx) {
           # Single-store reuse: this slot's value is already in the donated
           # shell (`_arm_ru` IS the consumed `_scr`, handed back intact), and
           # the rebuild re-places the same binder at the same position of the
@@ -14555,7 +14411,7 @@ fn emit_trmc_slot_stores(src: String, node: String, cname: String, args_e: [Expr
           # without an incref, Int binders bind raw, enum binders are
           # immortal singletons — none owes a release. Eliding the store
           # without this decref orphans one Real per rebuilt spine node.
-          if kind == 2 { trmc_elided_real_release(a) } else { "" }
+          if kind == 2 { trmc_elided_real_release(a, cx) } else { "" }
         } else {
           let slotpfx = concat_all(["kai_var_slots(", node, ")[", int_to_string(i), "]"])
           if kind == 1 {
@@ -14576,17 +14432,17 @@ fn emit_trmc_slot_stores(src: String, node: String, cname: String, args_e: [Expr
             concat_all([slotpfx, ".ptr = ", emit_expr(src, av, cx), "; "])
           }
         }
-      concat_all([head, emit_trmc_slot_stores(src, node, cname, rest, tys_opt, holeslot, i + 1, cx)])
+      concat_all([head, emit_trmc_slot_stores(src, node, ctor, rest, tys_opt, holeslot, i + 1, cx)])
     }
   }
 }
 
 # Release the boxed Real a donor-identity slot elision leaves unconsumed:
-# `nm`'s arm bind allocated the box and the elided store was its only consumer.
-fn trmc_elided_real_release(a: Expr) : String =
+# the binder's arm bind allocated the box and the elided store was its only consumer.
+fn trmc_elided_real_release(a: Expr, cx: EmitCtx) : String =
   match a.kind {
-    EName(nm) -> concat_all(["kai_decref(", c_local(nm), "); "])
-    _        -> ""
+    ELocal(l) -> concat_all(["kai_decref(", c_local_of(cx, l), "); "])
+    _         -> ""
   }
 
 # True when slot i of the rebuild can skip its store because the value is
@@ -14594,30 +14450,28 @@ fn trmc_elided_real_release(a: Expr) : String =
 # arm-top-reuse body whose donor is the cell being rebuilt (`reuse_donor`
 # set), (2) the rebuilt ctor is the SAME as the donor's (so slot layouts
 # coincide — the cell keeps its ctor), and (3) the rebuild arg is a bare
-# `EName(nm)` where `nm` is the donor's positional binder for slot i (same
+# read of the donor's positional binder for slot i (same
 # value, same position — not permuted, not transformed). The binder was bound
 # borrow off `_scr[i]` at the arm top; `kai_drop_reuse_token` returned the
 # shell with slot i untouched, so the value is already there. A dup'd read
 # leaves the binder its own reference for its exit drop, so the store stays.
-fn trmc_slot_is_donor_identity(cname: String, a: Expr, i: Int, cx: EmitCtx) : Bool =
+fn trmc_slot_is_donor_identity(ctor: SymId, a: Expr, i: Int, cx: EmitCtx) : Bool =
   match cx.reuse_donor {
     None -> false
-    Some(ReuseDonor(dcname, binders)) ->
-      if dcname != cname { false }
-      else {
-        let bn = trmc_donor_binder_nth(binders, i)
-        if bn == "" { false }
-        else { match a.kind {
-          EName(nm) -> nm == bn
-          _        -> false
-        } }
-      }
+    Some(ReuseDonor(dctor, binders)) ->
+      if sym_raw(ctor) < 0 or not sym_same(dctor, ctor) { false }
+      else { match a.kind {
+        ELocal(l) -> local_eq(l, trmc_donor_binder_nth(binders, i))
+        _         -> false
+      } }
   }
 
-fn trmc_donor_binder_nth(binders: [String], i: Int) : String =
-  if i < 0 { "" }
+# The donor's binder for slot `i`; the absent id, which no read matches,
+# when the slot has none.
+fn trmc_donor_binder_nth(binders: [LocalId], i: Int) : LocalId =
+  if i < 0 { local_none() }
   else { match binders {
-    []           -> ""
+    []           -> local_none()
     [b, ...rest] -> if i == 0 { b } else { trmc_donor_binder_nth(rest, i - 1) }
   } }
 
@@ -14650,7 +14504,7 @@ fn tcrec_emit_goto(src: String, sym: String, dropmask: Int, pnames: [String],
       # Releases the goto skips: enclosing owned-scrutinee refs + this
       # path's unconsumed bind-increfs. After arg_lets (args may still
       # dup-read the binders), before the rebinds.
-      let live     = tcl_goto_drops(cx.tcpend, args_e)
+      let live     = tcl_goto_drops(cx.locals, cx.tcpend, args_e)
       let drops    = tcrec_emit_drops_masked(pnames, mask, dropmask, 0)
       let rebinds  = tcrec_emit_rebinds(pnames, 0)
       # The statement-expression's value type must match the enclosing
@@ -14665,7 +14519,7 @@ fn tcrec_emit_goto(src: String, sym: String, dropmask: Int, pnames: [String],
     }
     None -> {
       let arg_lets = tcrec_emit_arg_lets(src, args_e, 0, cx)
-      let live     = tcl_goto_drops(cx.tcpend, args_e)
+      let live     = tcl_goto_drops(cx.locals, cx.tcpend, args_e)
       let drops    = tcrec_emit_drops(pnames, dropmask, 0)
       let rebinds  = tcrec_emit_rebinds(pnames, 0)
       concat_all([
@@ -14739,7 +14593,7 @@ fn tcrec_emit_param_ptrs(params: [Param], i: Int) : String {
     [] -> ""
     [p, ...rest] -> {
       let head = concat_all([
-        "KaiValue **_kai_tcrp", int_to_string(i), " = &", c_local(p.pname), "; "
+        "KaiValue **_kai_tcrp", int_to_string(i), " = &", c_local(written_text(p.binder.name)), "; "
       ])
       string_concat(head, tcrec_emit_param_ptrs(rest, i + 1))
     }
@@ -14777,10 +14631,10 @@ fn tcrec_emit_param_ptrs_masked_loop(params: [Param], pts: [Ty], mask: [Bool], i
       let head =
         if is_raw {
           concat_all([raw_c_type(pty), " *_kai_tcrp", int_to_string(i),
-                      " = &kair_", p.pname, "; "])
+                      " = &kair_", written_text(p.binder.name), "; "])
         } else {
           concat_all(["KaiValue **_kai_tcrp", int_to_string(i),
-                      " = &", c_local(p.pname), "; "])
+                      " = &", c_local(written_text(p.binder.name)), "; "])
         }
       string_concat(head, tcrec_emit_param_ptrs_masked_loop(rest, trest, mrest, i + 1))
     }
@@ -14912,8 +14766,8 @@ fn tcrec_emit_drops_masked(pnames: [String], mask: [Bool], dropmask: Int, i: Int
 # that need to distinguish instantiations work on the full label list.
 
 #[doc("Mirror of main head's row_effects_without_default_handler (downward glue, phase 1r); reconcile in the driver lane.")]
-fn cmt_row_effects_without_default_handler(main_row: [String],
-                                        decls: [Decl]) : [String] {
+fn cmt_row_effects_without_default_handler(main_row: [SymId],
+                                        decls: [Decl]) : [SymId] {
   match main_row {
     [] -> []
     [x, ...rest] ->
