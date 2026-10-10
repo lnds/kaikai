@@ -418,12 +418,12 @@ fn emit_ctx_with_tcpend(cx: EmitCtx, l: [TclEntry]) : EmitCtx =
 # (and no scan) when the ledger is empty, the overwhelmingly common case.
 fn emit_ctx_tcpend_after(cx: EmitCtx, e: Expr) : EmitCtx = match cx.tcpend {
   [] -> cx
-  _  -> emit_ctx_with_tcpend(cx, tcl_filter(cx.locals, cx.tcpend, e))
+  _  -> emit_ctx_with_tcpend(cx, tcl_filter(cx.tcpend, e))
 }
 
 fn emit_ctx_tcpend_after_stmts(cx: EmitCtx, ss: [Stmt]) : EmitCtx = match cx.tcpend {
   [] -> cx
-  _  -> emit_ctx_with_tcpend(cx, tcl_filter_stmts(cx.locals, cx.tcpend, ss))
+  _  -> emit_ctx_with_tcpend(cx, tcl_filter_stmts(cx.tcpend, ss))
 }
 
 # Set/clear the hoisted-slot set (entering/leaving a match that hoists).
@@ -656,8 +656,7 @@ fn pfield_ubinds_loop(fs: [PField], acc: [UBind]) : [UBind] {
   }
 }
 
-# The binders under test enclose the code that reads them: an
-# interpolation span reads one by its spelling.
+# The binders under test enclose the code that reads them.
 fn ubind_scope(ubs: [UBind]) : FvOuter = fv_outer_of(map(ubs, ubind_binder))
 
 fn ubind_binder(u: UBind) : Binder = match u {
@@ -923,8 +922,7 @@ type RuLive = RuRead(LocalId)
 
 # The reads after each statement, in block order. Walking from the end,
 # the reads after a statement are its own reads plus those after the next
-# one, so the block is scanned once. An interpolation span reads a binder
-# by its spelling, among the ones in scope where the span sits.
+# one, so the block is scanned once.
 fn ru_live_after(rev: [Stmt], bound: [Binder], live: NameIndex[RuLive],
                  acc: [NameIndex[RuLive]]) : [NameIndex[RuLive]] / Console =
   match rev {
@@ -1971,34 +1969,6 @@ fn emit_local_call(src: String, l: LocalId, args_e: [Expr], cx: EmitCtx) : Strin
   if local_eq(l, local_minted(canonical_continuation())) { emit_resume_call(src, args_e, cx) }
   else { emit_apply_seq("kai_apply(", c_local_of(cx, l), emit_arg_vals(src, args_e, cx)) }
 
-# A callee no pass resolved: only an interpolation fragment parsed at emit
-# time spells one. It names the binder in scope of that spelling, else the
-# continuation, else a constructor, else the C local of the name. This is
-# the one place a callee is looked up by name.
-fn emit_spelled_call(src: String, callee: String, args_e: [Expr], cx: EmitCtx) : String / Console =
-  match emit_scope_spelled(cx, callee) {
-    Some(l) -> emit_local_call(src, l, args_e, cx)
-    None ->
-      if callee == canonical_continuation() { emit_resume_call(src, args_e, cx) }
-      else { match evar_find(cx.variants, callee) {
-        Some(_) -> emit_spelled_ctor_call(src, callee, args_e, cx)
-        None    -> emit_apply_seq("kai_apply(", c_local(callee), emit_arg_vals(src, args_e, cx))
-      } }
-  }
-
-fn emit_spelled_ctor_call(src: String, name: String, args_e: [Expr], cx: EmitCtx) : String / Console = {
-  let n = list_length(args_e)
-  let tag = evar_find_tag_arity(cx.variants, None, name, n)
-  let typed = match evar_slot_kinds_arity(cx.variants, None, name, n) {
-    Some(tys) -> emit_variant_call_typed(tag, name, args_e, tys, src, cx)
-    None      -> None
-  }
-  match typed {
-    Some(s) -> s
-    None    -> emit_variant_call(tag, name, n, emit_slot_ops(src, args_e, cx), cx)
-  }
-}
-
 fn emit_callee_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console {
   # Each branch emits the arguments it needs itself: emitting them up front
   # for a branch that spells them its own way emits every nested argument
@@ -2293,7 +2263,6 @@ fn emit_callee_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String 
         ])
     }
     ELocal(l) -> emit_local_call(src, l, args_e, cx)
-    EName(w)  -> emit_spelled_call(src, written_text(w), args_e, cx)
     # A modulo-cons site: `args_e` are the original ctor args, the one at
     # the step's hole being the self-call. Builds the cell with an open
     # hole, extends the cctx, rebinds the params and jumps.
@@ -4632,8 +4601,7 @@ fn pat_local_ids(pat: Pattern) : [LocalId] = map(pat_binders(pat, []), (b) => b.
 fn param_local_ids(params: [Param]) : [LocalId] = map(params, (p) => p.binder.id)
 
 # The innermost binder in scope emitted under `name`. Two binders spelled
-# alike are one C variable, and a fragment parsed at emit time names a
-# binder by its text.
+# alike are one C variable.
 fn emit_scope_spelled(cx: EmitCtx, name: String) : Option[LocalId] = scope_spelled_loop(cx, cx.lcs, name, None)
 
 fn scope_spelled_loop(cx: EmitCtx, ls: [LocalId], name: String, found: Option[LocalId]) : Option[LocalId] = match ls {
@@ -4929,59 +4897,6 @@ fn emit_block_raw(src: String, stmts: [Stmt], tail: Expr, cx: EmitCtx) : String 
   cat4("({ ", stmt_out, tail_c, "; })")
 }
 
-# ---- string interpolation ----
-#
-# The raw span includes quotes: either 1 quote on each side for single-
-# or 3 quotes for triple. We walk the body (between the quotes) and
-# split into literal / expression parts at each `#{...}` boundary, then
-# chain them via kai_string_concat wrapping each expression in
-# kai_to_string.
-
-fn interp_is_triple(span: String) : Bool {
-  let n = string_length(span)
-  if n < 6 { false }
-  else {
-    match char_at(span, 0) {
-      Some(c) -> c == '"' and match char_at(span, 1) {
-        Some(c2) -> c2 == '"' and match char_at(span, 2) {
-          Some(c3) -> c3 == '"'
-          None -> false
-        }
-        None -> false
-      }
-      None -> false
-    }
-  }
-}
-
-fn emit_interp_parts(src: String, parts: [IPart], cx: EmitCtx) : String / Console {
-
-  match parts {
-    [] -> "kai_str(\"\")"
-    [p] -> emit_interp_part(src, p, cx)
-    [p, ...rest] -> concat_all([
-      "kai_string_concat(",
-      emit_interp_part(src, p, cx),
-      ", ",
-      emit_interp_parts(src, rest, cx),
-      ")"
-    ])
-  }
-}
-
-fn emit_interp_part(src: String, p: IPart, cx: EmitCtx) : String / Console {
-
-  match p {
-    IpLit(_, raw) -> emit_decoded_str_lit(raw, 1, string_length(raw) - 1)
-    IpExp(expr_src) -> {
-      match parse_interp_expr(expr_src) {
-        Some(e) -> cat3("kai_to_string(", emit_expr(src, surface_lower_expr(e), cx), ")")
-        None -> "kai_str(\"\")"
-      }
-    }
-  }
-}
-
 # escape_str_body_for_c / esc_body_loop moved to compiler/util.kai
 # (issue #677 phase 1h H1a). Per issue #311, triple-quote string spans
 # carry unescaped chars (newline, tab, `"`) the C preprocessor can't
@@ -5000,21 +4915,12 @@ fn emit_decoded_str_lit(span: String, body_start: Int, body_end: Int) : String {
   }
 }
 
-fn emit_string_expr(src: String, span: String, is_triple: Bool, cx: EmitCtx) : String / Console {
-
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  # Fast path: if no `#{` appears, emit as a plain C literal.
-  if not has_interp(span, body_start, body_end) {
-    emit_decoded_str_lit(span, body_start, body_end)
-  } else {
-    let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
-    emit_interp_parts(src, parts, emit_ctx_with_unw(cx, unw_frame_none(cx.unw.ucx)))
-  }
+# A string is a literal by the time it is emitted: the lift turned every
+# interpolation into calls before name resolution.
+fn emit_string_lit(span: String, is_triple: Bool) : String = {
+  let q = if is_triple { 3 } else { 1 }
+  emit_decoded_str_lit(span, q, string_length(span) - q)
 }
-
-# has_interp moved to compiler/util.kai (issue #677 phase 1h H2 pre-move).
 
 # ---- lambda collection + emission ----
 #
@@ -5169,7 +5075,7 @@ fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
       # an ELambda nested inside this body resolves to its own LamInfo.
       let pnames = param_local_ids(params)
       let body_lcs = list_append(list_append(cx.lcs, pnames), capture_locals(caps))
-      let frame = unw_frame(cx.unw, cx.locals, pnames, pnames, body)
+      let frame = unw_frame(cx.unw, pnames, pnames, body)
       let lam_cx = emit_ctx_with_unw(emit_ctx_with_lcs(cx, body_lcs), frame)
       let body_c = emit_expr(src, body, emit_ctx_with_enc_fn(lam_cx, lam_symbol(l)))
       let tail = match params {
@@ -5366,7 +5272,7 @@ fn emit_op_clause_body(src: String, c: ClauseInfo, cx: EmitCtx) : String / Conso
   let scx = emit_ctx_declaring(EmitCtx { ...cx, locals: ns },
                                list_append(["self", "k"], clause_live_aliases(k.stateful, (key) => list_has(cap_names, key))))
   let owned = unw_clause_seeds(c)
-  let frame = unw_frame(cx.unw, scx.locals, owned, owned, k.body)
+  let frame = unw_frame(cx.unw, owned, owned, k.body)
   let body_cx = emit_ctx_with_unw(emit_ctx_with_lcs(scx, list_append(scx.lcs, capture_locals(k.caps))), frame)
   let body_c = emit_expr_in_clause(src, k.body, body_cx, k.stateful)
   let env_prologue = emit_clause_env_prologue(ns, k.enc_fn, k.line, k.col, k.caps)
@@ -6368,15 +6274,6 @@ fn emit_local_value(l: LocalId, ty: Option[Ty], cx: EmitCtx) : String = {
   } else { c_local(name) }
 }
 
-# A name no pass resolved: only a fragment parsed at emit time spells one.
-# It reads the binder in scope of that spelling, else the C local of the
-# name.
-fn emit_spelled_value(w: Written, ty: Option[Ty], cx: EmitCtx) : String =
-  match emit_scope_spelled(cx, written_text(w)) {
-    Some(l) -> emit_local_value(l, ty, cx)
-    None    -> c_local(written_text(w))
-  }
-
 fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
 
   match x.kind {
@@ -6402,9 +6299,9 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     EDecimalLit(_) -> panic("emit_expr_boxed: EDecimalLit must be minted before emit")
     EBool(b)     -> if b { "kai_bool(1)" } else { "kai_bool(0)" }
     EChar(c)     -> cat3("kai_char(", int_to_string(char_to_int(c)), ")")
-    EStr(span, is_triple) -> emit_string_expr(src, span, is_triple, cx)
+    EStr(span, is_triple) -> emit_string_lit(span, is_triple)
     EUnit        -> "kai_unit()"
-    EName(w)     -> emit_spelled_value(w, x.ty, cx)
+    EName(_)     -> panic("emit_expr_boxed: EName must be resolved before emit")
     EUnder       -> "kai_unit() /* _ */"
     EPlaceholder -> "kai_unit() /* placeholder */"
     ECall(f, args_e) -> emit_unw_call(src, x, f, args_e, emit_ctx_route_brand(cx, x.ty))
@@ -7827,7 +7724,7 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_sy
         # mono) nor the per-ctor `.ty` (the brand does not survive the
         # unit normaliser on every ctor), so every ctor in the body routes.
         let body_in_region = cx.in_region or fn_has_region_brand(params, ret_ty_opt)
-        let frame = unw_fn_frame(cx.unw, locals, c_sym(name, mo), Some(row), unw_param_seeds(params, opt_sig, cx.unw.ucx), pids, body)
+        let frame = unw_fn_frame(cx.unw, c_sym(name, mo), Some(row), unw_param_seeds(params, opt_sig, cx.unw.ucx), pids, body)
         let body_cx = EmitCtx { ...cx, locals: locals, lcs: body_lcs, fns: body_fns, in_region: body_in_region,
                                 hoisted: [], reuse_donor: None, kind1_raw: [], cur_enc_fn: c_sym(name, mo),
                                 rd_active: rd_cap, tcpend: [], unw: frame }

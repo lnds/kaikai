@@ -42,11 +42,10 @@
 # Bundle order: ... unbox, perceus, protos, monomorph, **emit_shared**,
 # emit_llvm, emit_c, main. Imports compiler.ast (AST nodes + `mk_expr`),
 # compiler.util (string/list/char helpers incl. the relocated `join_with`),
-# compiler.fnreg (`EFn` + the `scan_uses_*` / `iscan_*`
-# use-scan family), compiler.infer (`AliasBinding` / `IScan` / `IPart` /
-# `Use` + `unit_canon` / `label_to_string` / `lookup_alias`), compiler.parse
-# (`parse_interp_expr`), compiler.resolve (`core_names`), and
-# compiler.unbox (`expr_has_interp_use` / `uses_have_in_lam`).
+# compiler.fnreg (`EFn` + the `scan_uses_*` use-scan family),
+# compiler.infer (`AliasBinding` / `Use` + `unit_canon` /
+# `label_to_string` / `lookup_alias`), compiler.resolve (`core_names`),
+# and compiler.unbox (`uses_have_in_lam`).
 
 import compiler.ast
 import compiler.written
@@ -69,7 +68,6 @@ import compiler.fnreg
 import compiler.fn_index
 import compiler.fn_csym
 import compiler.infer
-import compiler.parse
 import compiler.resolve
 import compiler.handler_alias
 import compiler.unbox
@@ -701,19 +699,17 @@ pub fn arms_all_literal_or_wild_loop(arms: [Arm]) : Bool {
 }
 
 # The fast path binds a `PBind` catch-all raw. A read of the binder
-# from inside a `#{...}` slot or a lambda body expects the boxed
-# binding, so such a match routes through the boxed path. Mirrors the
-# interp / lambda-capture guards of the unbox pass's `let`.
-#[doc("True when no `PBind` catch-all arm's body reads its binder from an interpolation slot or a lambda body, the reads the fast match path's raw binding cannot serve.")]
-pub fn arms_pbind_safe_for_fast_path(arms: [Arm]) : Bool / Console {
+# from inside a lambda body expects the boxed binding, so such a match
+# routes through the boxed path. Mirrors the lambda-capture guard of the
+# unbox pass's `let`.
+#[doc("True when no `PBind` catch-all arm's body reads its binder from a lambda body, the read the fast match path's raw binding cannot serve.")]
+pub fn arms_pbind_safe_for_fast_path(arms: [Arm]) : Bool {
 
   match arms {
     [] -> true
     [Arm(p, _, b), ...rest] -> {
       let ok = match p.pkind {
-        PBind(bd) ->
-          not expr_has_interp_use(b, bd) and
-          not uses_have_in_lam(scan_uses_expr(ln_with_binder(ln_empty(), bd), b, false), bd.id)
+        PBind(bd) -> not uses_have_in_lam(scan_uses_expr(b, false), bd.id)
         _ -> true
       }
       if ok { arms_pbind_safe_for_fast_path(rest) } else { false }
@@ -820,7 +816,7 @@ pub fn find_lam(lams: [LamInfo], enc_fn: String, line: Int, col: Int) : Option[L
   }
 }
 
-#[doc("What surrounds a walked body: the binders in scope around it, innermost first, and the handler aliases among them. The binders are read only to resolve the name an interpolation fragment spells; an alias is reached through its handler, never captured as a value.")]
+#[doc("What surrounds a walked body: the binders in scope around it, innermost first, and the handler aliases among them. The binders say whether an enclosing clause already binds a state alias; an alias is reached through its handler, never captured as a value.")]
 pub type FvOuter = { binders: [Binder], aliases: [LocalId] }
 
 #[doc("A body with nothing in scope around it.")]
@@ -846,18 +842,6 @@ pub fn local_among(ls: [LocalId], l: LocalId) : Bool = match ls {
   [x, ...rest] -> local_eq(x, l) or local_among(rest, l)
 }
 
-# The innermost binder of `bs` a name is spelled like. Only an
-# interpolation fragment asks: it is source text until emit, so its
-# names were never resolved, and a state alias is bound by its spelling.
-fn fv_spelled(bs: [Binder], name: String) : Option[Binder] = match bs {
-  []           -> None
-  [b, ...rest] -> if written_text(b.name) == name { Some(b) } else { fv_spelled(rest, name) }
-}
-
-fn fv_spells(bs: [Binder], name: String) : Bool = match fv_spelled(bs, name) {
-  Some(_) -> true
-  None    -> false
-}
 
 fn fv_cap_same(a: Capture, b: Capture) : Bool = match a {
   CapLocal(x) -> match b {
@@ -882,16 +866,6 @@ fn fv_local(l: LocalId, own: [Binder], outer: FvOuter, acc: [Capture]) : [Captur
   if fv_is_wrap_slot(l) or fv_binds(own, l) or local_among(outer.aliases, l) { acc }
   else { fv_add(CapLocal(l), acc) }
 
-# A name an interpolation fragment spells: the innermost binder spelled
-# so is the one it reads, and a name no binder spells is a global.
-fn fv_name(name: String, own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] = match fv_spelled(own, name) {
-  Some(_) -> acc
-  None    -> match fv_spelled(outer.binders, name) {
-    Some(b) -> fv_local(b.id, own, outer, acc)
-    None    -> acc
-  }
-}
-
 # A perform through a cell alias dispatches by the alias's handler id,
 # which the lifted body captures; through a receiver it reads that local.
 fn fv_op(r: OpRef, own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] = match r.via {
@@ -913,12 +887,12 @@ fn fv_is_wrap_slot(l: LocalId) : Bool =
 fn fv_clause_own(params: [Param], aliases: [Binder]) : [Binder] =
   list_append(params_binders(params), [binder_minted(canonical_continuation()), ...aliases])
 
-# The state aliases a clause binds: an alias a binder around the clause is
-# spelled like stays that binder's.
+# The state aliases a clause binds: an alias an enclosing clause already
+# binds stays that clause's.
 fn fv_clause_aliases(own: [Binder], outer: FvOuter) : [Binder] =
-  map(clause_state_aliases((key) => fv_spells(own, key) or fv_spells(outer.binders, key)), binder_minted)
+  map(clause_state_aliases((key) => fv_binds(own, local_minted(key)) or fv_binds(outer.binders, local_minted(key))), binder_minted)
 
-#[doc("The captures of an expression: every local it reads that `own`, the binders bound inside the walked body, does not bind. A nested lambda's captures are the enclosing body's too; an interpolation span is re-parsed and its names resolved against `own`, then `outer`.")]
+#[doc("The captures of an expression: every local it reads that `own`, the binders bound inside the walked body, does not bind. A nested lambda's captures are the enclosing body's too.")]
 pub fn fv_expr(x: Expr, own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
 
   match x.kind {
@@ -929,9 +903,9 @@ pub fn fv_expr(x: Expr, own: [Binder], outer: FvOuter, acc: [Capture]) : [Captur
     EFixed(_, _) -> acc
     EBool(_) -> acc
     EChar(_) -> acc
-    EStr(span, is_triple) -> fv_interp(span, is_triple, own, outer, acc)
+    EStr(_, _) -> acc
     EUnit -> acc
-    EName(name) -> fv_name(written_text(name), own, outer, acc)
+    EName(_) -> acc
     EMark(_) -> acc
     # A lambda captures locals, never a top-level declaration.
     ESym(_, _) -> acc
@@ -1153,34 +1127,6 @@ pub fn fv_stmt(s: Stmt, own: [Binder], outer: FvOuter, acc: [Capture]) : [Captur
   }
 }
 
-#[doc("Free-variable collector over interp.")]
-pub fn fv_interp(span: String, is_triple: Bool, own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
-
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
-  fv_interp_parts(parts, own, outer, acc)
-}
-
-#[doc("Free-variable collector over interp parts.")]
-pub fn fv_interp_parts(parts: [IPart], own: [Binder], outer: FvOuter, acc: [Capture]) : [Capture] / Console {
-
-  match parts {
-    [] -> acc
-    [p, ...rest] -> match p {
-      IpLit(_, _) -> fv_interp_parts(rest, own, outer, acc)
-      IpExp(esrc) -> {
-        let acc1 = match parse_interp_expr(esrc) {
-          Some(e) -> fv_expr(e, own, outer, acc)
-          None -> acc
-        }
-        fv_interp_parts(rest, own, outer, acc1)
-      }
-    }
-  }
-}
-
 # ---- lambda collection pass ----
 
 # `cur_enc_fn` is the emitted symbol of the fn / lambda / clause / runner
@@ -1223,7 +1169,7 @@ pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
     EFixed(_, _) -> st
     EBool(_) -> st
     EChar(_) -> st
-    EStr(span, is_triple) -> collect_interp(span, is_triple, st)
+    EStr(_, _) -> st
     EUnit -> st
     EName(_) -> st
     EMark(_) -> st
@@ -1466,31 +1412,6 @@ pub fn collect_stmt(s: Stmt, st: LamCollect) : LamCollect / Console {
   }
 }
 
-#[doc("AST collector walking interp.")]
-pub fn collect_interp(span: String, is_triple: Bool, st: LamCollect) : LamCollect / Console {
-
-  let n = string_length(span)
-  let body_start = if is_triple { 3 } else { 1 }
-  let body_end = if is_triple { n - 3 } else { n - 1 }
-  let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
-  collect_interp_parts(parts, st)
-}
-
-#[doc("AST collector walking interp parts.")]
-pub fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect / Console {
-
-  match parts {
-    [] -> st
-    [p, ...rest] -> match p {
-      IpLit(_, _) -> collect_interp_parts(rest, st)
-      IpExp(esrc) -> {
-        let st1 = match parse_interp_expr(esrc) { Some(e) -> collect_expr(e, st) None -> st }
-        collect_interp_parts(rest, st1)
-      }
-    }
-  }
-}
-
 # The walker swaps the enclosing fn's symbol on the way in and restores
 # the parent's on the way out, so siblings stamp their own clauses
 # against the right scope.
@@ -1617,31 +1538,17 @@ pub fn bang_success_variant(opt_ty: Option[Ty]) : Option[String] {
 # `log` aliases of `self->state`.
 
 #[doc("The block `let`s the emitter releases inline: a single `PBind` never read in the rest of the block whose rhs `pcs_let_paid_inline` accepts. A drop perceus planted counts as a read, so a binder perceus pays is never paid here too.")]
-pub fn block_unused_lets(stmts: [Stmt], opt_final: Option[Expr]) : [LocalId] / Console {
-  let ns = bul_let_names(stmts, ln_empty())
+pub fn block_unused_lets(stmts: [Stmt], opt_final: Option[Expr]) : [LocalId] {
   let final_reads = match opt_final {
     None -> []
-    Some(e) -> bul_add_reads([], scan_uses_expr(ns, e, false))
+    Some(e) -> bul_add_reads([], scan_uses_expr(e, false))
   }
-  bul_from_end(ns, list_reverse(stmts), final_reads, [])
-}
-
-# Only a `let` binder is released here, so only those need a name for the
-# interpolation spans that read them.
-fn bul_let_names(stmts: [Stmt], ns: LocalNames) : LocalNames = match stmts {
-  [] -> ns
-  [s, ...rest] -> bul_let_names(rest, match s {
-    SLet(pat, _, _) -> match pat.pkind {
-      PBind(b) -> ln_with_binder(ns, b)
-      _        -> ns
-    }
-    _ -> ns
-  })
+  bul_from_end(list_reverse(stmts), final_reads, [])
 }
 
 # Walks the block from its end, carrying every read after the statement
 # at hand, so each statement is scanned once.
-fn bul_from_end(ns: LocalNames, rev: [Stmt], later: [LocalId], acc: [LocalId]) : [LocalId] / Console =
+fn bul_from_end(rev: [Stmt], later: [LocalId], acc: [LocalId]) : [LocalId] =
   match rev {
     [] -> acc
     [s, ...earlier] -> {
@@ -1652,7 +1559,7 @@ fn bul_from_end(ns: LocalNames, rev: [Stmt], later: [LocalId], acc: [LocalId]) :
         }
         _ -> acc
       }
-      bul_from_end(ns, earlier, bul_add_reads(later, scan_uses_in_stmts(ns, [s], false)), acc1)
+      bul_from_end(earlier, bul_add_reads(later, scan_uses_in_stmts([s], false)), acc1)
     }
   }
 

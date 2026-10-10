@@ -20,11 +20,9 @@
 #     `unbox_kind` / `decide_mode`) and run the `ufn_promote_calls`
 #     post-pass that widens MBoxed->MUnboxed at unbox-aware UFn call
 #     sites (issue #383 Phase 3).
-#   - The boxing-boundary guards: `name_captured_in_block` (a binding
-#     read from inside a captured lambda stays boxed) and
-#     `name_in_interp_in_block` / `expr_has_interp_use` (a binding read
-#     only via a `#{...}` interp slot stays boxed, issue #94 / R8) —
-#     both consult the use scanner in compiler.fnreg.
+#   - The boxing-boundary guard `name_captured_in_block` (a binding
+#     read from inside a captured lambda stays boxed), which consults
+#     the use scanner in compiler.fnreg.
 #   - The raw-op classifiers `op_is_raw_arith` / `op_is_raw_cmp` /
 #     `op_is_raw_logical` / `raw_op_str` / `ty_is_integral_raw` and
 #     `uses_have_in_lam` are `pub` because the C/LLVM emitters in main
@@ -36,14 +34,13 @@
 # Bundle order: ... infer, fnreg, unbox, main. Imports compiler.ast for
 # the AST nodes + ValueMode, compiler.fnreg for the EFn registry
 # (register_fn_decls / ty_is_unboxable_t)
-# + the use scanner (scan_uses_expr / scan_uses_in_interp),
+# + the use scanner (scan_uses_expr),
 # compiler.infer for the `Use` type, and compiler.refinements for
 # `try_eval_int` (the `^` raw-inline exponent gate).
 
 import compiler.ast
 import compiler.symtab
 import compiler.spec_names
-import compiler.local_names
 import compiler.operators
 import compiler.refinements
 import compiler.infer
@@ -811,7 +808,7 @@ fn unbox_arm_with_scr_aware(a: Arm, env: [LocBind], raw_scr: Bool, fns: FnIndex,
     Arm(p, g, b) -> {
       let env_b = match p.pkind {
         PBind(nm) -> {
-          if raw_scr and not binder_read_boxed(b, nm) {
+          if raw_scr and not expr_captures(b, nm) {
             [LB(nm.id, MUnboxed), ...env]
           } else { env }
         }
@@ -859,7 +856,7 @@ fn seed_variant_int_loop(subs: [Pattern], flags: [Bool], i: Int, body: Expr,
           # `bind_slot_kslot` reads that mode for the KSlot, so mode and KSlot
           # can never diverge (#1110).
           {
-            let boxed_free = slot_is_int and not binder_read_boxed(body, nm)
+            let boxed_free = slot_is_int and not expr_captures(body, nm)
             let native_ok = not nat or native_arm_binder_raw_safe(nm.id, body, cis, fns)
             if boxed_free and native_ok { [LB(nm.id, MUnboxed), ...env] } else { env }
           }
@@ -985,7 +982,7 @@ fn nrab_slot_loop(subs: [Pattern], flags: [Bool], i: Int, body: Expr, cis: [Ctor
     let slot_is_int = match list_nth_bool(flags, i) { Some(b) -> b None -> false }
     let acc1 = match sp.pkind {
       PBind(nm) -> {
-        let boxed_free = slot_is_int and not binder_read_boxed(body, nm)
+        let boxed_free = slot_is_int and not expr_captures(body, nm)
         if boxed_free and native_arm_binder_raw_safe(nm.id, body, cis, fns) { [RAB(nm.id, sp.line, sp.col), ...acc] } else { acc }
       }
       PVariant(inner_ctor, inner_subs) -> nrab_variant(inner_ctor, inner_subs, body, cis, fns, acc)
@@ -1104,17 +1101,7 @@ fn unbox_stmt_aware(s: Stmt, rest: [Stmt], tail: Option[Expr], env: [LocBind], f
               let rhs_box = expr_to_boxed(rhs1)
               UbStmt(SLet(pat, ann, rhs_box), env)
             }
-            # Issue #94 / R8: emit re-parses `#{...}` interp segments at
-            # codegen time without consulting this pass's alias map, so
-            # a read of `nm` inside an interp slot would resolve via
-            # `emit_ident_value` to `kai_<nm>` — the boxed alias the
-            # MUnboxed branch never produces (it produces `kair_<nm>`
-            # instead). Demote the binding to MBoxed so the read site
-            # finds an actual `KaiValue *kai_<nm>` in scope.
-            else if name_in_interp_in_block(rest, tail, nm) {
-              let rhs_box = expr_to_boxed(rhs1)
-              UbStmt(SLet(pat, ann, rhs_box), env)
-            } else {
+            else {
               UbStmt(SLet(pat, ann, rhs1), [LB(nm.id, MUnboxed), ...env])
             }
           }
@@ -1146,17 +1133,10 @@ fn stmt_rhs_is_cell_init(e: Expr) : Bool = match e.kind {
 fn expr_to_boxed(e: Expr) : Expr =
   Expr { kind: e.kind, line: e.line, col: e.col, ty: e.ty, mode: MBoxed,  site: e.site }
 
-# The names map holding `b` alone. An interpolation span reads a binder by
-# its text, so the use scanner needs the name to find such a read of `b`.
-fn binder_names(b: Binder) : LocalNames = ln_with_binder(ln_empty(), b)
-
-# True if `e` reads `b` where only its boxed form is in scope: in an
-# interpolation slot or from inside a lambda body.
-fn binder_read_boxed(e: Expr, b: Binder) : Bool / Console =
-  expr_has_interp_use(e, b) or expr_captures(e, b)
-
-fn expr_captures(e: Expr, b: Binder) : Bool / Console =
-  uses_have_in_lam(scan_uses_expr(binder_names(b), e, false), b.id)
+# True if `e` reads `b` from inside a lambda body, where only its boxed
+# form is in scope.
+fn expr_captures(e: Expr, b: Binder) : Bool =
+  uses_have_in_lam(scan_uses_expr(e, false), b.id)
 
 # True if `nm` is referenced from within any ELambda body in the
 # remainder of the block (subsequent stmts and the trailing
@@ -1214,189 +1194,3 @@ pub fn uses_have_in_lam(uses: [Use], nm: LocalId) : Bool {
   }
 }
 
-# Issue #94 / R8 — true if `nm` appears as a free-var reference inside
-# any `#{...}` interpolation slot reachable from the remainder of the
-# block. The unbox_stmt SLet branch consults this to keep let-bindings
-# boxed when their only escape route lands in an EStr interp segment;
-# `emit_string_expr` re-parses those segments at codegen time and has
-# no awareness of this pass's alias map (`kair_<nm>` for MUnboxed,
-# `kai_<nm>` for MBoxed), so a raw read would surface as undeclared
-# `kai_<nm>` in the generated C.
-fn name_in_interp_in_block(rest: [Stmt], opt_tail: Option[Expr],
-                            nm: Binder) : Bool / Console {
-
-  if any_stmt_has_interp_use(rest, nm) { true }
-  else { match opt_tail {
-    None -> false
-    Some(e) -> expr_has_interp_use(e, nm)
-  } }
-}
-
-fn any_stmt_has_interp_use(stmts: [Stmt], nm: Binder) : Bool / Console {
-
-  match stmts {
-    [] -> false
-    [s, ...rest] -> if stmt_has_interp_use(s, nm) { true }
-                    else { any_stmt_has_interp_use(rest, nm) }
-  }
-}
-
-fn stmt_has_interp_use(s: Stmt, nm: Binder) : Bool / Console {
-
-  match s {
-    SLet(_, _, rhs)        -> expr_has_interp_use(rhs, nm)
-    SVar(_, _, rhs, _, _)  -> expr_has_interp_use(rhs, nm)
-    SAssert(c, opt_m)      -> {
-      if expr_has_interp_use(c, nm) { true }
-      else { match opt_m {
-        None -> false
-        Some(m) -> expr_has_interp_use(m, nm)
-      } }
-    }
-    SExprStmt(e)           -> expr_has_interp_use(e, nm)
-    SIndexAssign(b, i, v, _, _) ->
-      expr_has_interp_use(b, nm) or
-      expr_has_interp_use(i, nm) or
-      expr_has_interp_use(v, nm)
-    SAssign(b, v, _, _) ->
-      expr_has_interp_use(b, nm) or
-      expr_has_interp_use(v, nm)
-    SUse(_, _, _)          -> false
-  }
-}
-
-pub fn expr_has_interp_use(e: Expr, nm: Binder) : Bool / Console =
-
-  kind_has_interp_use(e.kind, nm)
-
-fn opt_expr_has_interp_use(opt: Option[Expr], nm: Binder) : Bool / Console {
-
-  match opt {
-    None -> false
-    Some(e) -> expr_has_interp_use(e, nm)
-  }
-}
-
-fn kind_has_interp_use(k: ExprKind, nm: Binder) : Bool / Console {
-
-  match k {
-    EStr(span, is_triple) ->
-      uses_have_name(scan_uses_in_interp(binder_names(nm), span, is_triple, false), nm.id)
-    ECall(f, xs) -> {
-      if expr_has_interp_use(f, nm) { true }
-      else { exprs_have_interp_use(xs, nm) }
-    }
-    EField(x, _)     -> expr_has_interp_use(x, nm)
-    EIndex(x, i)     -> expr_has_interp_use(x, nm) or expr_has_interp_use(i, nm)
-    EBinop(_, l, r)  -> expr_has_interp_use(l, nm) or expr_has_interp_use(r, nm)
-    EUnop(_, x)      -> expr_has_interp_use(x, nm)
-    EIf(c, t, opt_e) ->
-      expr_has_interp_use(c, nm) or
-      expr_has_interp_use(t, nm) or
-      opt_expr_has_interp_use(opt_e, nm)
-    EMatch(s, arms)  ->
-      expr_has_interp_use(s, nm) or arms_have_interp_use(arms, nm)
-    ELambda(_, body) -> expr_has_interp_use(body, nm)
-    ERecordLit(_, fis) -> field_inits_have_interp_use(fis, nm)
-    EList(elems)     -> list_elems_have_interp_use(elems, nm)
-    ERange(lo, hi, opt_by) ->
-      expr_has_interp_use(lo, nm) or
-      expr_has_interp_use(hi, nm) or
-      opt_expr_has_interp_use(opt_by, nm)
-    EBlock(stmts, opt_tail) ->
-      any_stmt_has_interp_use(stmts, nm) or
-      opt_expr_has_interp_use(opt_tail, nm)
-    EPipe(l, r)      -> expr_has_interp_use(l, nm) or expr_has_interp_use(r, nm)
-    EMapPipe(l, r)   -> expr_has_interp_use(l, nm) or expr_has_interp_use(r, nm)
-    EFlatMapPipe(l, r) -> expr_has_interp_use(l, nm) or expr_has_interp_use(r, nm)
-    EFilterPipe(l, r) -> expr_has_interp_use(l, nm) or expr_has_interp_use(r, nm)
-    EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
-      if expr_has_interp_use(body, nm) { true }
-      else if opt_expr_has_interp_use(init_opt, nm) { true }
-      else if clauses_have_interp_use(clauses, nm) { true }
-      else { match ret_opt {
-        None -> false
-        Some(hr) -> match hr {
-          HR(_, body2, _, _) -> expr_has_interp_use(body2, nm)
-        }
-      } }
-    }
-    ELitUnit(inner, _) -> expr_has_interp_use(inner, nm)
-    EBang(inner)       -> expr_has_interp_use(inner, nm)
-    _ -> false
-  }
-}
-
-fn exprs_have_interp_use(es: [Expr], nm: Binder) : Bool / Console {
-
-  match es {
-    [] -> false
-    [h, ...rest] -> if expr_has_interp_use(h, nm) { true }
-                    else { exprs_have_interp_use(rest, nm) }
-  }
-}
-
-fn arms_have_interp_use(arms: [Arm], nm: Binder) : Bool / Console {
-
-  match arms {
-    [] -> false
-    [h, ...rest] -> match h {
-      Arm(_, opt_g, body) -> {
-        let g_hit = match opt_g {
-          None -> false
-          Some(g) -> expr_has_interp_use(g, nm)
-        }
-        if g_hit { true }
-        else if expr_has_interp_use(body, nm) { true }
-        else { arms_have_interp_use(rest, nm) }
-      }
-    }
-  }
-}
-
-fn field_inits_have_interp_use(fis: [FieldInit], nm: Binder) : Bool / Console {
-
-  match fis {
-    [] -> false
-    [h, ...rest] -> match h {
-      FI(_, e) -> if expr_has_interp_use(e, nm) { true }
-                  else { field_inits_have_interp_use(rest, nm) }
-    }
-  }
-}
-
-fn list_elems_have_interp_use(es: [ListElem], nm: Binder) : Bool / Console {
-
-  match es {
-    [] -> false
-    [el, ...rest] -> {
-      let hit = match el {
-        ElPlain(x)  -> expr_has_interp_use(x, nm)
-        ElSpread(x) -> expr_has_interp_use(x, nm)
-      }
-      if hit { true } else { list_elems_have_interp_use(rest, nm) }
-    }
-  }
-}
-
-fn clauses_have_interp_use(cs: [HClause], nm: Binder) : Bool / Console {
-
-  match cs {
-    [] -> false
-    [h, ...rest] -> match h {
-      HC(_, _, body, _, _) ->
-        if expr_has_interp_use(body, nm) { true }
-        else { clauses_have_interp_use(rest, nm) }
-    }
-  }
-}
-
-fn uses_have_name(uses: [Use], nm: LocalId) : Bool {
-  match uses {
-    [] -> false
-    [u, ...rest] -> match u {
-      U(n, _, _, _) ->
-        if local_eq(n, nm) { true } else { uses_have_name(rest, nm) }
-    }
-  }
-}
