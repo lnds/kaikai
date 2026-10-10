@@ -76,23 +76,22 @@ mkdir -p "$STAGE/bin" \
 # is the DEFAULT `kai build` destination, so the shipped kaic2 MUST carry
 # it). The release links libLLVM STATICALLY (Rust/Zig/Julia model) — the
 # distributed binary runs `kai build` out-of-the-box with no system LLVM
-# and the brew formula needs no `depends_on llvm`. The vendored build is
-# produced on-demand by the top-level Makefile (`make llvm-build`:
-# download + cmake MinSizeRel + compile the narrow X86+AArch64 static
-# archive set, gitignored under stage0/third_party/llvm). It is
-# idempotent — a populated build/ is a no-op, so a cached tree (the CI
-# llvm cache, see release.yml) skips the long cold compile.
+# and the brew formula needs no `depends_on llvm`. `make llvm-prebuilt`
+# fetches the archives published for this host and configuration (the
+# narrow X86+AArch64 MinSizeRel set, gitignored under
+# stage0/third_party/llvm) and compiles them from source only where none
+# is published.
 #
 # LLVM_CONFIG points at the vendored STATIC llvm-config so the stage2
-# link resolves --link-static --libs against the archives we built, not a
+# link resolves --link-static --libs against those archives, not a
 # system/Homebrew dynamic libLLVM. The stage2 Makefile already picks
 # -lc++ (macOS) vs -lstdc++ (Linux) per UNAME_S and threads --link-static
 # through; this just aims it at the vendored prefix.
-echo "==> building vendored static libLLVM (idempotent; cached build/ is a no-op)"
-make llvm-build >&2
+echo "==> vendored static libLLVM (prebuilt asset, else source build)"
+make llvm-prebuilt >&2
 LLVM_CONFIG="$ROOT/stage0/third_party/llvm/build/bin/llvm-config"
 if [ ! -x "$LLVM_CONFIG" ]; then
-  echo "build-release.sh: vendored llvm-config missing at $LLVM_CONFIG after make llvm-build" >&2
+  echo "build-release.sh: vendored llvm-config missing at $LLVM_CONFIG after make llvm-prebuilt" >&2
   exit 2
 fi
 export LLVM_CONFIG
@@ -261,7 +260,7 @@ rm -f "$DIST/.cap.kai" "$DIST/.cap.o" 2>/dev/null || true
 if printf '%s' "$CAP_OUT" | grep -q "not built into this compiler"; then
   echo "build-release.sh: staged kaic2 is C-only — static libLLVM did NOT link in." >&2
   echo "  The release must ship a native-capable kaic2 (native is the default backend)." >&2
-  echo "  Check 'make llvm-build' produced the vendored archives and KAI_LLVM=1 was honoured." >&2
+  echo "  Check 'make llvm-prebuilt' produced the vendored archives and KAI_LLVM=1 was honoured." >&2
   exit 2
 fi
 echo "    staged kaic2: native backend present"

@@ -46,20 +46,13 @@ jobs:
             arch: x86_64
     runs-on: ${{ matrix.os }}
     if: ${{ !inputs.mirror_seed_only && !inputs.seed_run_id }}
-    # Static-libLLVM cold build (Lane 1.5 flip: the shipped kaic2 links
-    # libLLVM IN so `kai build` runs the native default with no system
-    # LLVM). On a cache HIT the vendored build/ is reused and the long
-    # cmake step is a no-op; on a MISS (first release after an LLVM bump
-    # or a Makefile edit to the LLVM targets) the cold build dominates.
-    # The cache is keyed per runner.os, so each platform pays its own
-    # cold build once. 90 min leaves headroom on the slowest runner.
+    # The shipped kaic2 links libLLVM IN so `kai build` runs the native
+    # default with no system LLVM. The archives normally arrive prebuilt;
+    # 90 min leaves headroom for the source build a configuration with no
+    # published asset falls back to.
     timeout-minutes: 90
     outputs:
       version: ${{ steps.meta.outputs.version }}
-    env:
-      # Single source of truth for the cache key; must match the
-      # LLVM_VERSION default in the top-level Makefile (LLVM static prep).
-      LLVM_VERSION: 18.1.8
     steps:
       - name: Resolve tag
         id: tag
@@ -87,12 +80,32 @@ jobs:
             exit 1
           fi
 
-      # cmake + ninja drive the vendored static-libLLVM build
-      # (Makefile: llvm-configure / llvm-build). They are NOT stage 0
-      # deps — the bootstrap stays cc-only; these are release-host tools
-      # for assembling libLLVM only.
-      - name: Install cmake + ninja (static-libLLVM build deps) [macOS]
-        if: runner.os == 'macOS'
+      # The vendored static libLLVM comes prebuilt, per platform, from the
+      # llvm-static-* release that llvm-prebuilt.yml publishes. Exit 3 means
+      # nothing is published for this configuration: the archives are then
+      # compiled here, which is the only case that needs cmake + ninja.
+      # Neither is a stage 0 dep — the bootstrap stays cc-only.
+      #
+      # The tree is the tag's, not this workflow's. A tag without the script
+      # has a build-release.sh that compiles libLLVM itself, so it takes the
+      # source-build path too.
+      - name: Fetch prebuilt static libLLVM
+        id: llvm
+        run: |
+          rc=3
+          if [ -x scripts/llvm-prebuilt.sh ]; then
+            rc=0
+            ./scripts/llvm-prebuilt.sh fetch || rc=$?
+          fi
+          case "$rc" in
+            0) echo "source_build=false" >> "$GITHUB_OUTPUT" ;;
+            3) echo "::warning::no prebuilt static libLLVM for this configuration; compiling it from source"
+               echo "source_build=true" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$rc" ;;
+          esac
+
+      - name: Install cmake + ninja (libLLVM source build) [macOS]
+        if: steps.llvm.outputs.source_build == 'true' && runner.os == 'macOS'
         run: |
           if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
             brew install cmake ninja
@@ -100,8 +113,8 @@ jobs:
           cmake --version
           ninja --version
 
-      - name: Install cmake + ninja (static-libLLVM build deps) [Linux]
-        if: runner.os == 'Linux'
+      - name: Install cmake + ninja (libLLVM source build) [Linux]
+        if: steps.llvm.outputs.source_build == 'true' && runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build
@@ -131,26 +144,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang-18 llvm-18-tools
           clang-18 --version
-
-      # Cache the vendored static-libLLVM tree so only the first release
-      # after an LLVM change pays the cold build. The key hashes mk/llvm.mk
-      # (the file that owns the version, target list, and cmake flags), NOT
-      # the whole Makefile — a test-target edit must not invalidate this.
-      # restore-keys falls back to the newest build of the same LLVM version
-      # (the archives are immutable per version), so an unrelated mk/llvm.mk
-      # edit degrades to a warm reuse, never a cold build. `make llvm-build`
-      # is idempotent, so a restored build/ short-circuits build-release.sh.
-      - name: Cache vendored static libLLVM
-        uses: actions/cache@v4
-        with:
-          path: |
-            stage0/third_party/llvm
-            stage0/third_party/cmake
-            stage0/third_party/llvm-${{ env.LLVM_VERSION }}.src.tar.xz
-            stage0/third_party/cmake-${{ env.LLVM_VERSION }}.src.tar.xz
-          key: llvm-static-${{ runner.os }}-${{ env.LLVM_VERSION }}-${{ hashFiles('mk/llvm.mk') }}
-          restore-keys: |
-            llvm-static-${{ runner.os }}-${{ env.LLVM_VERSION }}-
 
       - name: Build release tarball
         run: ./scripts/build-release.sh
