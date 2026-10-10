@@ -12,69 +12,28 @@ with the slot's reference, and the store fills the slot again. An earlier
 read keeps its own reference, which its consumer releases before the
 write runs.
 
-A scalar slot has no reference to hand over and is left alone. So is a
-write whose argument writes the slot itself, or reads it in a loop body,
-where a read may run after the take.
+A write whose argument writes the slot itself, or reads it in a loop body,
+where a read may run after the take, is left alone. `compiler.cell_promote`
+finds the slots: it leaves a scalar one, which has no reference to hand
+over, to its own promotion.
 """)]
 
 import compiler.ast
 import compiler.ast_map
-import compiler.cell_promote
+import compiler.cell_scan
 import compiler.expr_exists
 import compiler.expr_positions
 
-#[doc("The body `e` with, in each private slot it declares, the reads the slot's own writes make turned into takes of the slot. A body that declares no slot is returned as it is, not rebuilt.")]
-pub fn take_slot_reads(e: Expr) : Expr = if xp_exists(e, false, skt_declares) { skt_expr(e) } else { e }
+#[doc("The statements and tail of a slot's scope.")]
+pub type SlotScope = SlotScope([Stmt], Option[Expr])
 
-fn skt_declares(e: Expr) : Bool = match e.kind {
-  EBlock(stmts, _) -> skt_any_cell(stmts)
-  _                -> false
-}
+#[doc("The scope of the private slot `nm` with, in each of its writes, the reads no other read can follow turned into takes of the slot.")]
+pub fn take_slot_reads(nm: String, stmts: [Stmt], tail: Option[Expr]) : SlotScope =
+  SlotScope(map(stmts, (st) => prc_map_stmt_exprs(st, (x) => skt_in(nm, x))), skt_opt(nm, tail))
 
-fn skt_any_cell(stmts: [Stmt]) : Bool = match stmts {
-  []           -> false
-  [s, ...rest] -> skt_one_cell(s) or skt_any_cell(rest)
-}
-
-fn skt_one_cell(s: Stmt) : Bool = match s {
-  SLet(_, _, rhs) -> match cp_one_cell(rhs) {
-    Some(init) -> not cp_ty_is_cell_scalar(init.ty)
-    None       -> false
-  }
-  _ -> false
-}
-
-fn skt_expr(e: Expr) : Expr = Expr { ...e, kind: skt_kind(e.kind) }
-
-fn skt_kind(k: ExprKind) : ExprKind = match k {
-  EBlock(stmts, tail) -> skt_block(stmts, tail, [])
-  _                   -> prc_map_expr_kind(k, skt_expr)
-}
-
-# A slot's scope is the rest of its block.
-fn skt_block(stmts: [Stmt], tail: Option[Expr], acc: [Stmt]) : ExprKind = match stmts {
-  []           -> EBlock(list_reverse(acc), skt_opt(tail, skt_expr))
-  [s, ...rest] -> match skt_slot(s, rest, tail) {
-    Some(nm) -> skt_block(map(rest, (st) => prc_map_stmt_exprs(st, (x) => skt_in(nm, x))),
-                          skt_opt(tail, (x) => skt_in(nm, x)), [skt_stmt(s), ...acc])
-    None     -> skt_block(rest, tail, [skt_stmt(s), ...acc])
-  }
-}
-
-fn skt_stmt(s: Stmt) : Stmt = prc_map_stmt_exprs(s, skt_expr)
-
-fn skt_opt(o: Option[Expr], f: (Expr) -> Expr) : Option[Expr] = match o {
-  Some(e) -> Some(f(e))
+fn skt_opt(nm: String, o: Option[Expr]) : Option[Expr] = match o {
+  Some(e) -> Some(skt_in(nm, e))
   None    -> None
-}
-
-fn skt_slot(s: Stmt, rest: [Stmt], tail: Option[Expr]) : Option[String] = match s {
-  SLet(pat, _, rhs) -> match (pat.pkind, cp_one_cell(rhs)) {
-    (PBind(nm), Some(init)) ->
-      if not cp_ty_is_cell_scalar(init.ty) and cp_slot_private(nm, rest, tail) { Some(nm) } else { None }
-    _ -> None
-  }
-  _ -> None
 }
 
 # Every write of the slot `nm` at or under `e`.
@@ -90,12 +49,12 @@ fn skt_under(nm: String, e: Expr) : Expr = Expr { ...e, kind: prc_map_expr_kind(
 
 # Every read must run in place, once, and the argument must not write the
 # slot: a hit that fails either test is not flagged.
-fn skt_write(nm: String, e: Expr, v: Expr) : Expr = {
-  let hits = skt_hits(nm, v, true, [])
-  let last = skt_final(nm, v)
-  if last != [] and skt_in_place(hits) and skt_told_apart(last, hits) { skt_store(e, skt_swap(nm, last, v)) }
-  else { skt_under(nm, e) }
+fn skt_write(nm: String, e: Expr, v: Expr) : Expr = match skt_final(nm, v) {
+  []   -> skt_under(nm, e)
+  last -> if skt_safe(last, skt_hits(nm, v, true, [])) { skt_store(e, skt_swap(nm, last, v)) } else { skt_under(nm, e) }
 }
+
+fn skt_safe(last: [Expr], hits: [SktHit]) : Bool = skt_in_place(hits) and skt_told_apart(last, hits)
 
 fn skt_store(e: Expr, v: Expr) : Expr = match e.kind {
   ECall(callee, [s, i, _]) -> Expr { ...e, kind: ECall(callee, [s, i, v]) }
