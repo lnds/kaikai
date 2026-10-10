@@ -1,0 +1,191 @@
+#[doc("""
+Whether every path hands a binder over once, after every lend of it ended.
+
+A bare read in a borrowed callee slot lends the binder: the callee takes no
+reference and what it returns owns its own. A lend that ends before the one
+owning read leaves the count alone, so that read can hand the birth
+reference on and its consumer still sees a unique value. A read after the
+hand-over would see a value its consumer may have freed or written in place.
+
+A bare argument is handed over when its call runs, after every sibling
+argument was evaluated; any other owning read hands over where it stands.
+""")]
+
+import compiler.ast
+import compiler.sym_read
+import compiler.expr_positions
+import compiler.perceus_reads
+import compiler.util
+
+# No path has handed the binder over, every path has, only some have, or
+# some path reads it after the hand-over.
+type Lo = LoHeld | LoGone | LoSome | LoLate
+
+type PloCx = { uses: UseIx, skip: [String], moves: (String, Expr) -> Bool }
+
+#[doc("True when every path through `e` hands `nm` over at one owning read and reads it nowhere after; `lent` gives a callee's borrowed slots.")]
+pub fn plo_moves_after_lends(nm: String, e: Expr, lent: (Expr) -> [Int]) : Bool = match plo_expr(nm, e, lent) {
+  LoGone -> true
+  _      -> false
+}
+
+#[doc("The block `let` binders read more than once, none of the reads a capture, whose scope `moves` hands over. `skip` names the binders already decided.")]
+pub fn plo_lend_move_lets(body: Expr, uses: UseIx, skip: [String], moves: (String, Expr) -> Bool) : [String] =
+  plo_lets(body, PloCx { uses: uses, skip: skip, moves: moves }, [])
+
+fn plo_expr(nm: String, e: Expr, lent: (Expr) -> [Int]) : Lo = match sym_read_name(e.kind) {
+  Some(u) -> if u == nm { LoGone } else { LoHeld }
+  None    -> plo_inner(nm, e, lent)
+}
+
+fn plo_inner(nm: String, e: Expr, lent: (Expr) -> [Int]) : Lo = match e.kind {
+  EStr(span, t3)  -> if pcs_interp_ident_count(nm, span, t3) > 0 { LoLate } else { LoHeld }
+  ECall(f, xs)    -> plo_call(nm, f, xs, lent, plo_args(nm, xs, lent, plo_expr(nm, f, lent)))
+  EIf(c, t, oe)   -> plo_if(nm, t, oe, lent, plo_expr(nm, c, lent))
+  EMatch(s, arms) -> plo_arms(nm, arms, lent, plo_expr(nm, s, lent))
+  _               -> plo_ps(nm, xp_positions(e), lent, LoHeld)
+}
+
+# `before` is the state once the callee and the compound arguments ran. The
+# callee's slots are looked up only for a call that takes `nm` bare.
+fn plo_call(nm: String, f: Expr, xs: [Expr], lent: (Expr) -> [Int], before: Lo) : Lo = {
+  if plo_takes_bare(nm, xs) { plo_handed(nm, xs, lent(f), before) } else { before }
+}
+
+fn plo_takes_bare(nm: String, xs: [Expr]) : Bool = match xs {
+  []           -> false
+  [x, ...rest] -> plo_is_bare(nm, x) or plo_takes_bare(nm, rest)
+}
+
+# A call that takes `nm` bare after it was handed over reads it late; so does
+# one that both owns and borrows it, or owns it twice.
+fn plo_handed(nm: String, xs: [Expr], slots: [Int], before: Lo) : Lo = match before {
+  LoHeld -> match plo_bare(nm, xs, slots, 0, false) {
+    0 -> LoHeld
+    1 -> if plo_bare(nm, xs, slots, 0, true) == 0 { LoGone } else { LoLate }
+    _ -> LoLate
+  }
+  _ -> LoLate
+}
+
+fn plo_args(nm: String, xs: [Expr], lent: (Expr) -> [Int], st: Lo) : Lo = match xs {
+  []           -> st
+  [x, ...rest] -> plo_args(nm, rest, lent, if plo_is_bare(nm, x) { st } else { plo_then(st, nm, x, lent) })
+}
+
+# The bare reads of `nm` among `xs` that sit in a borrowed slot (`want`) or outside one.
+fn plo_bare(nm: String, xs: [Expr], slots: [Int], i: Int, want: Bool) : Int = match xs {
+  []           -> 0
+  [x, ...rest] ->
+    (if plo_is_bare(nm, x) and contains(slots, i) == want { 1 } else { 0 }) + plo_bare(nm, rest, slots, i + 1, want)
+}
+
+# A unit coercion is identity at runtime, so the callee takes the binder itself.
+fn plo_is_bare(nm: String, x: Expr) : Bool = match sym_read_name(prc_peel_unit(x).kind) {
+  Some(u) -> u == nm
+  None    -> false
+}
+
+fn plo_then(st: Lo, nm: String, c: Expr, lent: (Expr) -> [Int]) : Lo = match st {
+  LoHeld -> plo_expr(nm, c, lent)
+  LoLate -> LoLate
+  _      -> if pcs_mentions(nm, c) { LoLate } else { st }
+}
+
+fn plo_join(a: Lo, b: Lo) : Lo = match a {
+  LoLate -> LoLate
+  LoHeld -> match b {
+    LoHeld -> LoHeld
+    LoLate -> LoLate
+    _      -> LoSome
+  }
+  LoGone -> match b {
+    LoGone -> LoGone
+    LoLate -> LoLate
+    _      -> LoSome
+  }
+  LoSome -> match b {
+    LoLate -> LoLate
+    _      -> LoSome
+  }
+}
+
+# A missing `else` is a path that reads nothing.
+fn plo_if(nm: String, t: Expr, oe: Option[Expr], lent: (Expr) -> [Int], pre: Lo) : Lo =
+  plo_join(plo_then(pre, nm, t, lent), match oe {
+    Some(e) -> plo_then(pre, nm, e, lent)
+    None    -> pre
+  })
+
+# A position some path skips with no alternative covering it joins with the
+# state it started from; a deferred body runs at a time this walk cannot place.
+fn plo_ps(nm: String, ps: [XPos], lent: (Expr) -> [Int], st: Lo) : Lo = match ps {
+  []                  -> st
+  [XP(r, c), ...rest] -> plo_ps(nm, rest, lent, match r {
+    XAll -> plo_then(st, nm, c, lent)
+    XLam -> plo_deferred(st, nm, c)
+    XCl  -> plo_deferred(st, nm, c)
+    _    -> plo_join(st, plo_then(st, nm, c, lent))
+  })
+}
+
+fn plo_deferred(st: Lo, nm: String, c: Expr) : Lo = if pcs_mentions(nm, c) { LoLate } else { st }
+
+fn plo_arms(nm: String, arms: [Arm], lent: (Expr) -> [Int], pre: Lo) : Lo = match arms {
+  []                       -> pre
+  [Arm(_, og, b)]          -> plo_then(plo_guard(pre, nm, og, lent), nm, b, lent)
+  [Arm(_, og, b), ...rest] ->
+    plo_join(plo_then(plo_guard(pre, nm, og, lent), nm, b, lent), plo_arms(nm, rest, lent, pre))
+}
+
+# A guard that fails falls through to the later arms, so it may only lend.
+fn plo_guard(pre: Lo, nm: String, og: Option[Expr], lent: (Expr) -> [Int]) : Lo = match og {
+  None    -> pre
+  Some(g) -> match pre {
+    LoHeld -> match plo_expr(nm, g, lent) {
+      LoHeld -> LoHeld
+      _      -> LoLate
+    }
+    _ -> plo_then(pre, nm, g, lent)
+  }
+}
+
+# Blocks reached through statements, branches and arms; a block nested in
+# any other position keeps its `let`s as they were.
+fn plo_lets(e: Expr, cx: PloCx, acc: [String]) : [String] = match e.kind {
+  EBlock(ss, ot)  -> plo_scan(ss, ot, cx, acc)
+  EIf(c, t, oe)   -> plo_lets_opt(oe, cx, plo_lets(t, cx, plo_lets(c, cx, acc)))
+  EMatch(s, arms) -> plo_lets_arms(arms, cx, plo_lets(s, cx, acc))
+  _               -> acc
+}
+
+fn plo_lets_opt(oe: Option[Expr], cx: PloCx, acc: [String]) : [String] = match oe {
+  Some(e) -> plo_lets(e, cx, acc)
+  None    -> acc
+}
+
+fn plo_lets_arms(arms: [Arm], cx: PloCx, acc: [String]) : [String] = match arms {
+  []                      -> acc
+  [Arm(_, _, b), ...rest] -> plo_lets_arms(rest, cx, plo_lets(b, cx, acc))
+}
+
+fn plo_scan(ss: [Stmt], ot: Option[Expr], cx: PloCx, acc: [String]) : [String] = match ss {
+  []           -> plo_lets_opt(ot, cx, acc)
+  [s, ...rest] -> plo_scan(rest, ot, cx, match s {
+    SLet(pat, _, rhs) -> plo_let(pat, rhs, rest, ot, cx, plo_lets(rhs, cx, acc))
+    _                 -> acc
+  })
+}
+
+# The scope is built only for a binder the read table leaves in question.
+fn plo_let(pat: Pattern, rhs: Expr, rest: [Stmt], ot: Option[Expr], cx: PloCx, acc: [String]) : [String] = match pat.pkind {
+  PBind(nm) ->
+    if plo_candidate(nm, pat, rhs, cx) and cx.moves(nm, mk_expr(EBlock(rest, ot), pat.line, pat.col)) { [nm, ...acc] }
+    else { acc }
+  _ -> acc
+}
+
+# A raw `let` carries no reference to hand over.
+fn plo_candidate(nm: String, pat: Pattern, rhs: Expr, cx: PloCx) : Bool =
+  pcs_read_count(nm, cx.uses) >= 2 and not pcs_uses_have_in_lam(cx.uses, nm) and
+  not list_has(cx.skip, nm) and list_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm)
