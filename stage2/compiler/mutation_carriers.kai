@@ -19,13 +19,16 @@ import compiler.symtab
 import compiler.decl_text
 import compiler.core_syms
 import compiler.core_effects
+import compiler.tycon_scheme_home
+import compiler.tycon_ref
+import compiler.util
 
-#[doc("A nominal type with the type expressions its values store: a record's field types, or every payload of a sum's variants.")]
-pub type CarrierShape = CS(SymId, [TypeExpr])
+#[doc("A nominal type, the declarations the types its values store name (a record's field types, every payload of a sum's variants, through type arguments and list elements), and whether one of them is a closure whose row carries `Mutable`.")]
+pub type CarrierShape = CS(SymId, [SymId], Bool)
 
-#[doc("The record types whose mutation is observable to anyone sharing the value — every record with a transitive `Array`/`Ref` field. `Array`/`Ref` seed the set.")]
-pub fn mutating_record_type_names(recs: [RecInfo]) : [SymId] =
-  shape_fixpoint(map(recs, record_shape), carrier_seeds(), false, 0)
+#[doc("The record types whose mutation is observable to anyone sharing the value — every record with a transitive `Array`/`Ref` field. `Array`/`Ref` seed the set. `v` is any view of the type-home table.")]
+pub fn mutating_record_type_names(v: TyHomeView, recs: [RecInfo]) : [SymId] =
+  shape_fixpoint(map(recs, (r) => record_shape(v, r)), carrier_seeds(), false, 0)
 
 #[doc("The nominal types whose values may reach a mutable cell: every record or sum storing an `Array`, a `Ref`, or a closure whose row carries `Mutable`, directly or through another such type. `Array`/`Ref` seed the set.")]
 pub fn mutating_type_names(shapes: [CarrierShape]) : [SymId] =
@@ -39,13 +42,44 @@ fn carrier_has(xs: [SymId], s: SymId) : Bool = match xs {
   [x, ...rest] -> if sym_raw(s) >= 0 and sym_raw(x) == sym_raw(s) { true } else { carrier_has(rest, s) }
 }
 
-#[doc("The shape of a record: its type and field types.")]
-pub fn record_shape(r: RecInfo) : CarrierShape = match r {
-  RI(s, _, fields, _) -> CS(s, map(fields, field_type))
+#[doc("The shape of a record, its field types read from the module declaring it. `v` is any view of the type-home table.")]
+pub fn record_shape(v: TyHomeView, r: RecInfo) : CarrierShape = match r {
+  RI(s, tps, fields, mo) -> shape_of(tsh_at(v, mo), s, tps, map(fields, field_type))
 }
 
-#[doc("The shape of a sum: its type and every variant payload.")]
-pub fn sum_shape(s: SymId, vs: [Variant]) : CarrierShape = CS(s, variant_payloads(vs))
+#[doc("The shape of the sum `s` module `mo` declares with type parameters `tps`, its variant payloads read from that module. `v` is any view of the type-home table.")]
+pub fn sum_shape(v: TyHomeView, s: SymId, tps: [String], vs: [Variant], mo: Option[String]) : CarrierShape =
+  shape_of(tsh_at(v, mo), s, tps, variant_payloads(vs))
+
+fn shape_of(v: TyHomeView, s: SymId, tps: [String], tes: [TypeExpr]) : CarrierShape =
+  CS(s, tes_named(v, tps, tes, []), tes_hold_mutable_fn(tes))
+
+# The declarations `tes` name at their heads, in type arguments and in
+# list elements.
+fn tes_named(v: TyHomeView, tps: [String], tes: [TypeExpr], acc: [SymId]) : [SymId] = match tes {
+  []           -> acc
+  [t, ...rest] -> tes_named(v, tps, rest, te_named(v, tps, t, acc))
+}
+
+fn te_named(v: TyHomeView, tps: [String], te: TypeExpr, acc: [SymId]) : [SymId] = match te.tkind {
+  TyName(r, targs) -> tes_named(v, tps, targs, [stored_ref_sym(v, tps, r), ...acc])
+  TyList(elem)     -> te_named(v, tps, elem, acc)
+  _                -> acc
+}
+
+# The type a stored reference names: its declaration once settled; while
+# it is written, what the name denotes from `v`, the module declaring the
+# type that stores it. A type parameter names no declaration.
+fn stored_ref_sym(v: TyHomeView, tps: [String], r: DeclRef) : SymId = match r {
+  DrSym(s)              -> s
+  DrWritten(None, n)    -> if list_has(tps, written_text(n)) { sym_none() } else { head_decl(tsh_tycon_at(v, r, [])) }
+  DrWritten(Some(_), _) -> head_decl(tsh_tycon_at(v, r, []))
+}
+
+fn head_decl(t: Ty) : SymId = match t {
+  TyCon(s, _) -> s
+  _           -> sym_none()
+}
 
 fn variant_payloads(vs: [Variant]) : [TypeExpr] = match vs {
   []           -> []
@@ -135,41 +169,34 @@ fn shape_fixpoint(shapes: [CarrierShape], known: [SymId], fns: Bool, passes: Int
 fn shape_scan(shapes: [CarrierShape], known: [SymId], fns: Bool, acc: [SymId]) : [SymId] = match shapes {
   []           -> acc
   [s, ...rest] -> match s {
-    CS(ty, tes) ->
+    CS(ty, stored, mutable_fn) ->
       if carrier_has(acc, ty) { shape_scan(rest, known, fns, acc) }
-      else if te_list_names_mutating(tes, known, fns) { shape_scan(rest, known, fns, [ty, ...acc]) }
+      else if (fns and mutable_fn) or any_carrier(stored, known) { shape_scan(rest, known, fns, [ty, ...acc]) }
       else { shape_scan(rest, known, fns, acc) }
   }
+}
+
+fn any_carrier(stored: [SymId], known: [SymId]) : Bool = match stored {
+  []           -> false
+  [s, ...rest] -> if carrier_has(known, s) { true } else { any_carrier(rest, known) }
 }
 
 fn field_type(f: FieldDecl) : TypeExpr = match f {
   FD(_, _, te, _) -> te
 }
 
-# A type expression counts when it names a carrier at its head, nested in
-# a type argument / list element, or is a closure whose row names `Mutable`.
-fn te_names_mutating(te: TypeExpr, known: [SymId], fns: Bool) : Bool = match te.tkind {
-  TyName(r, targs) ->
-    if carrier_has(known, carrier_ref_sym(r)) { true }
-    else { te_list_names_mutating(targs, known, fns) }
-  TyList(elem)        -> te_names_mutating(elem, known, fns)
-  TyFn(_, _, row)     -> fns and row_expr_names_mutable(row)
-  _ -> false
+# A closure whose row names `Mutable`, at the head, in a type argument or
+# in a list element.
+fn te_holds_mutable_fn(te: TypeExpr) : Bool = match te.tkind {
+  TyName(_, targs) -> tes_hold_mutable_fn(targs)
+  TyList(elem)     -> te_holds_mutable_fn(elem)
+  TyFn(_, _, row)  -> row_expr_names_mutable(row)
+  _                -> false
 }
 
-# The type a field's reference names: its declaration once settled; while
-# it is written bare, the runtime-built type so spelled, which has no
-# declaration to settle to.
-fn carrier_ref_sym(r: DeclRef) : SymId = match r {
-  DrSym(s)              -> s
-  DrWritten(None, n)    -> core_type_sym_or_none(written_text(n))
-  DrWritten(Some(_), _) -> sym_none()
-}
-
-fn te_list_names_mutating(tes: [TypeExpr], known: [SymId], fns: Bool) : Bool = match tes {
+fn tes_hold_mutable_fn(tes: [TypeExpr]) : Bool = match tes {
   []           -> false
-  [t, ...rest] -> if te_names_mutating(t, known, fns) { true }
-                  else { te_list_names_mutating(rest, known, fns) }
+  [t, ...rest] -> if te_holds_mutable_fn(t) { true } else { tes_hold_mutable_fn(rest) }
 }
 
 fn row_expr_names_mutable(row: RowExpr) : Bool = match row {
