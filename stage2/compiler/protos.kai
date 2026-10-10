@@ -81,6 +81,9 @@
 # per the phase-1m `dsg_` discipline).
 
 import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
 import compiler.operators
 import compiler.core_refs
 import compiler.core_protos
@@ -99,7 +102,6 @@ import compiler.modules
 import compiler.proto_key
 import compiler.proto_resolve
 import compiler.proto_orphan
-import compiler.home_spell
 import compiler.decl_names
 import compiler.name_report
 import compiler.proto_rank
@@ -130,37 +132,37 @@ import compiler.core_effects
 # autogenerate per-impl property checks (except impls marked `axiom`).
 # ====================================================================
 
-# `protocol_name -> theory` and the impls exempted by `axiom <Theory>`.
-# Both are keyed by the declaring module: an exemption written in one
-# module must not exempt an unrelated impl in another, and law-checking
-# is verification, so a bare key is a silent bypass of it.
+# The theory each protocol declares, and the impls exempted by
+# `axiom <Theory>`. An impl has neither an id nor a name: it is the one
+# written at that position of its module, so an exemption cannot reach
+# an unrelated impl, which would silently bypass a verification.
 pub type LawReg = LR([ProtoLaw], [AxiomImpl])
-pub type ProtoLaw = PL(Option[String], String, String)          # home, protocol, theory
-pub type AxiomImpl = AI(Option[String], String, String, String) # home, protocol, type-head, theory
+pub type ProtoLaw = PL(SymId, String)                    # protocol, theory
+pub type AxiomImpl = AI(Option[String], Int, Int, String) # home, impl line, impl col, theory
 
 pub fn law_reg_protocols(r: LawReg) : [ProtoLaw] = match r { LR(ps, _) -> ps }
 pub fn law_reg_axioms(r: LawReg) : [AxiomImpl] = match r { LR(_, xs) -> xs }
 
-#[doc("The theory a protocol declared by `home` declares its ops obey via `laws`, if any.")]
-pub fn law_theory_of(r: LawReg, home: Option[String], proto: String) : Option[String] =
-  law_theory_loop(law_reg_protocols(r), home, proto)
+#[doc("The theory the protocol `proto` declares its ops obey via `laws`, if any.")]
+pub fn law_theory_of(r: LawReg, proto: SymId) : Option[String] =
+  law_theory_loop(law_reg_protocols(r), proto)
 
-fn law_theory_loop(ps: [ProtoLaw], home: Option[String], proto: String) : Option[String] = match ps {
+fn law_theory_loop(ps: [ProtoLaw], proto: SymId) : Option[String] = match ps {
   [] -> None
-  [PL(h, p, thy), ...rest] ->
-    if p == proto and home_eq(h, home) { Some(thy) }
-    else { law_theory_loop(rest, home, proto) }
+  [PL(p, thy), ...rest] ->
+    if sym_raw(proto) >= 0 and sym_raw(p) == sym_raw(proto) { Some(thy) }
+    else { law_theory_loop(rest, proto) }
 }
 
-#[doc("True when `impl P for <head>` declared by `home` is exempted from law-checks by an `axiom` clause.")]
-pub fn law_impl_axiomed(r: LawReg, home: Option[String], proto: String, head: String) : Bool =
-  law_axiom_loop(law_reg_axioms(r), home, proto, head)
+#[doc("True when the impl written at `line:col` of the module `home` is exempted from law-checks by an `axiom` clause.")]
+pub fn law_impl_axiomed(r: LawReg, home: Option[String], line: Int, col: Int) : Bool =
+  law_axiom_loop(law_reg_axioms(r), home, line, col)
 
-fn law_axiom_loop(xs: [AxiomImpl], home: Option[String], proto: String, head: String) : Bool = match xs {
+fn law_axiom_loop(xs: [AxiomImpl], home: Option[String], line: Int, col: Int) : Bool = match xs {
   [] -> false
-  [AI(h, p, t, _), ...rest] ->
-    if p == proto and t == head and home_eq(h, home) { true }
-    else { law_axiom_loop(rest, home, proto, head) }
+  [AI(h, l, c, _), ...rest] ->
+    if l == line and c == col and home_eq(h, home) { true }
+    else { law_axiom_loop(rest, home, line, col) }
 }
 
 #[doc("""
@@ -181,12 +183,12 @@ fn strip_law_loop(decls: [Decl], acc: [Decl], laws: [ProtoLaw],
                   axioms: [AxiomImpl]) : StrippedLaws = match decls {
   [] -> SL(list_reverse(acc), LR(list_reverse(laws), list_reverse(axioms)))
   [d, ...rest] -> match d {
-    DProtoLaws(thy, DProtocol(a, name, b, c, l, cc, mo, _), _, _, _) ->
-      strip_law_loop(rest, [DProtocol(a, name, b, c, l, cc, mo, sym_none()), ...acc],
-                     [PL(mo, name, thy), ...laws], axioms)
-    DImplAxiom(thy, DImpl(pname, pa, target, ms, l, cc, tps, _), _, _, amo) ->
-      strip_law_loop(rest, [DImpl(pname, pa, target, ms, l, cc, tps, sym_none()), ...acc],
-                     laws, [AI(amo, dotted_bare(pname), proto_type_name(target), thy), ...axioms])
+    DProtoLaws(thy, DProtocol(a, psym, b, c, l, cc, mo), _, _, _) ->
+      strip_law_loop(rest, [DProtocol(a, psym, b, c, l, cc, mo), ...acc],
+                     [PL(psym, thy), ...laws], axioms)
+    DImplAxiom(thy, DImpl(pref, pa, target, ms, l, cc, tps, _), _, _, amo) ->
+      strip_law_loop(rest, [DImpl(pref, pa, target, ms, l, cc, tps, sym_none()), ...acc],
+                     laws, [AI(amo, l, cc, thy), ...axioms])
     _ -> strip_law_loop(rest, [d, ...acc], laws, axioms)
   }
 }
@@ -277,7 +279,9 @@ fn proto_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EUnit          -> k
     EName(_)        -> k
     EMark(_)        -> k
-    ESym(_, _, _)        -> k
+    ESym(_, _)      -> k
+    ELocal(_)       -> k
+    EOp(_)          -> k
     EUnder         -> k
     EPlaceholder   -> k
     EHole(_)       -> k
@@ -295,7 +299,7 @@ fn proto_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EIf(c, t_, eo)       -> EIf(f(c), f(t_), proto_map_opt_expr(eo, f))
     EMatch(scr, arms)    -> EMatch(f(scr), map(arms, (a) => proto_map_arm_exprs(a, f)))
     ELambda(ps, b)       -> ELambda(ps, f(b))
-    ERecordLit(rh, name, fs) -> ERecordLit(rh, name, map(fs, (fi) => proto_map_field_exprs(fi, f)))
+    ERecordLit(rh, fs)   -> ERecordLit(rh, map(fs, (fi) => proto_map_field_exprs(fi, f)))
     EList(els)           -> EList(map(els, (el) => proto_map_elem_exprs(el, f)))
     ERange(a, b, opt_step) -> ERange(f(a), f(b), proto_map_opt_expr(opt_step, f))
     EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => proto_map_stmt_exprs(s, f)),
@@ -304,8 +308,8 @@ fn proto_map_expr_kind(k: ExprKind, f: (Expr) -> Expr) : ExprKind {
     EMapPipe(a, b)       -> EMapPipe(f(a), f(b))
     EFlatMapPipe(a, b)   -> EFlatMapPipe(f(a), f(b))
     EFilterPipe(a, b)    -> EFilterPipe(f(a), f(b))
-    EHandle(body, eff_name, hsym, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      EHandle(f(body), eff_name, hsym, eff_tyargs,
+    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(f(body), eff, eff_tyargs,
               proto_map_opt_expr(init_opt, f), alias_opt,
               map(clauses, (c) => proto_map_clause_exprs(c, f)),
               proto_map_opt_return_exprs(ret_opt, f))
@@ -329,26 +333,74 @@ fn proto_reg_empty() : ProtocolReg =
 # `List`. This gives a single impl per type-constructor — polymorphic
 # impls cover all instantiations, mirroring the spec's "monomorphises
 # per concrete instantiation just like any generic function" note.
-#[doc("The single-dispatch head name of a `TypeExpr` (`Money[USD]` → `Money`, `[T]` → `List`).")]
-pub fn proto_type_name(te: TypeExpr) : String {
+#[doc("The single-dispatch head of a `TypeExpr` as a reference (`Money[USD]` → `Money`, `[T]` → `List`): what the source wrote, or the declaration once resolved.")]
+pub fn proto_type_ref(te: TypeExpr) : DeclRef {
   match te.tkind {
-    TyName(_, name, _) -> name
-    TyList(_)       -> "List"
-    TyFn(_, _, _)   -> "Fn"
-    # m12.5: `Decimal<USD>` and friends collapse to the base
-    # constructor (`Decimal`); the unit annotation is invisible to
-    # protocol dispatch (which is single-dispatch on the head TyName,
-    # exactly as the spec describes for `impl Show for Money[u: Measure]`).
-    TyDim(base, _)  -> proto_type_name(base)
-    # m12.6.a: refinements collapse to the underlying base for protocol
-    # dispatch — `Int where >= 0` and `Int` resolve to the same `impl`.
-    TyRefine(base, _) -> proto_type_name(base)
-    # issue #772: a compound row is never a protocol-dispatch head; it
-    # only appears as a type argument. Return a name no `impl` matches.
-    TyRow(_) -> "Row"
-    TySurface(_) -> panic("proto_type_name: surface type not lowered")
+    TyName(r, _)    -> r
+    TyList(_)       -> ref_written("List")
+    TyFn(_, _, _)   -> ref_written("Fn")
+    # A unit annotation is invisible to dispatch: `Decimal<USD>` is `Decimal`.
+    TyDim(base, _)  -> proto_type_ref(base)
+    # A refinement dispatches as its base: `Int where >= 0` is `Int`.
+    TyRefine(base, _) -> proto_type_ref(base)
+    # A compound row is never a dispatch head: a name no `impl` matches.
+    TyRow(_) -> ref_written("Row")
+    TySurface(_) -> panic("proto_type_ref: surface type not lowered")
   }
 }
+
+#[doc("The single-dispatch head name of a `TypeExpr`: the piece an impl symbol spells and a diagnostic shows.")]
+pub fn proto_type_name(tab: SymTab, te: TypeExpr) : String = ref_text(tab, proto_type_ref(te))
+
+# A reference's name: the declaration's once resolved, the written one until then.
+fn ref_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)        -> written_text(decl_name(tab, s))
+  DrWritten(_, n) -> written_text(n)
+}
+
+# One declaration when both are resolved, one spelling while either is still written.
+fn refs_same(tab: SymTab, a: DeclRef, b: DeclRef) : Bool =
+  if ref_resolved(a) and ref_resolved(b) { sym_raw(ref_sym(a)) == sym_raw(ref_sym(b)) }
+  else { ref_text(tab, a) == ref_text(tab, b) }
+
+# The bare name an unqualified reference still spells: where `Self` and
+# a type parameter, which no declaration stands behind, are recognised.
+fn ref_bare_text(r: DeclRef) : Option[String] = match r {
+  DrWritten(None, n) -> Some(written_text(n))
+  _                  -> None
+}
+
+# A protocol head as the scope chain takes it: `m.P`, or `P`.
+fn proto_ref_spell(tab: SymTab, r: DeclRef) : String = match r {
+  DrWritten(Some(q), n) -> concat_all([written_text(q), ".", written_text(n)])
+  _                     -> ref_text(tab, r)
+}
+
+# The protocol a head denotes from the file homed at `from`; `sym_none()`
+# when it resolves to no single reachable protocol.
+fn proto_ref_sym(ps: PScope, r: DeclRef, from: Option[String]) : SymId = match r {
+  DrSym(s)        -> s
+  DrWritten(_, _) -> ps_proto_sym(ps, proto_ref_spell(ps_tab(ps), r), from)
+}
+
+# What a head resolves to, as the home the registry keys by.
+fn proto_ref_res(ps: PScope, r: DeclRef, from: Option[String]) : PkRes = match r {
+  DrSym(s)        -> PkHome(proto_sym_home(ps, s))
+  DrWritten(_, _) -> ps_resolve(ps, proto_ref_spell(ps_tab(ps), r), from)
+}
+
+fn proto_sym_home(ps: PScope, s: SymId) : Option[String] = {
+  let owner = sym_owner(ps_tab(ps), s)
+  if sym_raw(owner) == sym_raw(st_module_id(ps_root(ps))) { None }
+  else { Some(written_text(sym_name(ps_tab(ps), owner))) }
+}
+
+# An operation label has no id of its own: within a protocol, the label
+# is the operation.
+fn op_label_is(lbl: Written, name: String) : Bool = written_text(lbl) == name
+
+# The operation an impl method supplies: the label its row was declared with.
+fn impl_method_op(tab: SymTab, fid: FnId) : String = written_text(sym_name(tab, fnid_sym(fid)))
 
 fn proto_mangled_fn(proto: String, type_name: String, op: String) : String =
   concat_all(["__pimpl_", proto, "_", type_name, "_", op])
@@ -404,17 +456,16 @@ fn collect_proto_decls(ds: [Decl], reg: ProtocolReg, ps: PScope) : ProtocolReg {
   match ds {
     [] -> reg
     [d, ...rest] -> match d {
-      DProtocol(is_pub, name, tparams, ops, _, _, mo, _) -> {
-        let psym = ps_decl_sym(ps, name, mo)
+      DProtocol(is_pub, psym, tparams, ops, _, _, mo) -> {
         let reg1 = ProtocolReg {
           ops: reg.ops, impls: reg.impls, op_names: reg.op_names,
-          tparams: [PTPR(name, tparams, mo, psym), ...reg.tparams],
-          origins: [PrOR(name, mo, is_pub, psym), ...reg.origins],
+          tparams: [PTPR(psym, tparams, mo), ...reg.tparams],
+          origins: [PrOR(psym, mo, is_pub), ...reg.origins],
           dkeys: reg.dkeys,
           impl_index: reg.impl_index,
           cores: reg.cores, imports: reg.imports, root: reg.root, ids: reg.ids
         }
-        collect_proto_decls(rest, register_proto_ops(reg1, name, mo, psym, ops), ps)
+        collect_proto_decls(rest, register_proto_ops(reg1, mo, psym, ops), ps)
       }
       DDerive(_, inner, _, _) ->
         collect_proto_decls([inner, ...rest], reg, ps)
@@ -431,15 +482,15 @@ fn collect_proto_decls(ds: [Decl], reg: ProtocolReg, ps: PScope) : ProtocolReg {
   }
 }
 
-# `psym` is the protocol's own identity, read from the table the scope
-# resolves against: an impl's written protocol name resolves to the same id.
-fn register_proto_ops(reg: ProtocolReg, proto: String, mo: Option[String],
+# `psym` is the protocol's own identity: an impl's written protocol name
+# resolves to the same id.
+fn register_proto_ops(reg: ProtocolReg, mo: Option[String],
                       psym: SymId, ops: [ProtoOp]) : ProtocolReg {
   match ops {
     [] -> reg
     [op, ...rest] -> match op {
       POp(opname, _, params, ret, line, col) -> {
-        let entry = POR(proto, opname, params, ret, line, col, mo, psym)
+        let entry = POR(psym, written(opname), params, ret, line, col, mo)
         let names1 =
           if list_has(reg.op_names, opname) { reg.op_names }
           else { [opname, ...reg.op_names] }
@@ -453,7 +504,7 @@ fn register_proto_ops(reg: ProtocolReg, proto: String, mo: Option[String],
           impl_index: reg.impl_index,
           cores: reg.cores, imports: reg.imports, root: reg.root, ids: reg.ids
         }
-        register_proto_ops(reg1, proto, mo, psym, rest)
+        register_proto_ops(reg1, mo, psym, rest)
       }
     }
   }
@@ -467,8 +518,8 @@ fn proto_op_lookup_loop(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] 
   match ops {
     [] -> None
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _, _, _) ->
-        if name == target { Some(op) } else { proto_op_lookup_loop(rest, target) }
+      POR(_, name, _, _, _, _, _) ->
+        if op_label_is(name, target) { Some(op) } else { proto_op_lookup_loop(rest, target) }
     }
   }
 }
@@ -496,18 +547,23 @@ pub fn proto_core_show(reg: ProtocolReg, cores: [String]) : Option[ShowRef] =
     Some(s) -> match pid_disp(reg.ids, s) {
       None    -> None
       Some(d) -> match disp_home(d) {
-        Some(h) -> if list_has(cores, h) { Some(ShowRef(EModCall(h, disp_name(d)), ESym(s, spec_none(), disp_name(d)))) } else { None }
+        Some(h) -> if list_has(cores, h) { show_ref(pid_disp_homed_ref(reg.ids, s), s) } else { None }
         None    -> None
       }
     }
   }
 
+fn show_ref(homed: Option[ExprKind], s: SymId) : Option[ShowRef] = match homed {
+  Some(k) -> Some(ShowRef(k, ESym(s, spec_none())))
+  None    -> None
+}
+
 fn proto_ops_lookup_all_loop(ops: [ProtoOpReg], target: String) : [ProtoOpReg] {
   match ops {
     [] -> []
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _, _, _) ->
-        if name == target { [op, ...proto_ops_lookup_all_loop(rest, target)] }
+      POR(_, name, _, _, _, _, _) ->
+        if op_label_is(name, target) { [op, ...proto_ops_lookup_all_loop(rest, target)] }
         else { proto_ops_lookup_all_loop(rest, target) }
     }
   }
@@ -519,7 +575,7 @@ fn validate_impls(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
                   reg: ProtocolReg, target_mod: String,
                   ps: PScope) : [Diagnostic] =
   list_reverse(validate_impls_loop(ds, homes, df, reg, target_mod, ps,
-                                   OrphanScope(ps, nt_type_spellings(ds, target_mod)), [], []))
+                                   OrphanScope(ps), [], []))
 
 fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
                        reg: ProtocolReg, target_mod: String,
@@ -530,12 +586,14 @@ fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
     [d, ...rest] -> match homes {
       [] -> acc
       [h, ...hrest] -> match d {
-      DImpl(pspell, proto_args, target, _, line, col, _, isym) -> {
+      DImpl(pref, proto_args, target, _, line, col, _, isym) -> {
+        let tab = ps_tab(ps)
         let file = decl_diag_file(d, df)
-        let tname = proto_type_name(target)
+        let tname = proto_type_name(tab, target)
+        let pspell = proto_ref_spell(tab, pref)
         let pname = dotted_bare(pspell)
         let from = proto_mo_of(ha_home(h), target_mod)
-        let res = ps_resolve(ps, pspell, from)
+        let res = proto_ref_res(ps, pref, from)
         # Issue #180: duplicate-impl key includes the proto-arg names so
         # `impl Add[Real] for Complex` and `impl Add[Complex] for Complex`
         # coexist. Legacy `impl P for T` (proto_args == []) maps to the
@@ -544,13 +602,13 @@ fn validate_impls_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
         # for same-named types are not duplicates.
         let arg_names = match proto_args {
           [] -> [tname]
-          _  -> map(proto_args, proto_type_name)
+          _  -> map(proto_args, (a) => proto_type_name(tab, a))
         }
         let mo_key = match res {
           PkHome(Some(m)) -> m
           _ -> ""
         }
-        let key = concat_all([mo_key, "!", pname, "/", impl_target_key(ps, tname, from), "[",
+        let key = concat_all([mo_key, "!", pname, "/", impl_target_key(ps, tname, proto_type_ref(target), from), "[",
                               arg_names_mangle(arg_names), "]"])
         let proto_home = match res {
           PkHome(ph) -> Some(proto_home_name(ph, target_mod))
@@ -651,16 +709,17 @@ fn validate_impl_methods_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
     [d, ...rest] -> match homes {
       [] -> acc
       [h, ...hrest] -> match d {
-      DImpl(pspell, proto_args, target, methods, line, col, _, isym) -> {
+      DImpl(pref, proto_args, target, methods, line, col, _, isym) -> {
+        let tab = ps_tab(ps)
         let file = decl_diag_file(d, df)
-        let tname = proto_type_name(target)
-        let pname = dotted_bare(pspell)
+        let tname = proto_type_name(tab, target)
+        let pname = dotted_bare(proto_ref_spell(tab, pref))
         # The impl checks against the protocol its own module resolves
         # `pname` to — never a same-named protocol of an unrelated
         # module. Unresolved names were already reported by
         # `validate_impls`; skip them here.
         let from = proto_mo_of(ha_home(h), target_mod)
-        let psym = ps_proto_sym(ps, pspell, from)
+        let psym = proto_ref_sym(ps, pref, from)
         let proto_ops = proto_scope_ops(reg.ops, psym)
         if proto_ops == [] {
           validate_impl_methods_loop(rest, hrest, df, reg, target_mod, ps, acc)
@@ -671,15 +730,12 @@ fn validate_impl_methods_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles,
           # collapses to the target head. Heterogeneous
           # `impl P[Real, Int] for T` aligns positionally.
           let proto_tps = proto_scope_tparams(reg.tparams, psym)
-          let arg_heads = match proto_args {
-            [] -> []
-            _  -> map(proto_args, proto_type_name)
-          }
+          let arg_heads = map(proto_args, proto_type_ref)
           let all_op_names = proto_op_names(proto_ops, [])
-          let e1 = check_missing_methods(proto_ops, methods, pname, tname,
+          let e1 = check_missing_methods(tab, proto_ops, methods, pname, tname,
                                          all_op_names,
                                          file, line, col, acc)
-          let e2 = check_impl_methods(methods, proto_ops, pname, tname, target,
+          let e2 = check_impl_methods(tab, methods, proto_ops, pname, tname, target,
                                        proto_tps, arg_heads, file, e1)
           validate_impl_methods_loop(rest, hrest, df, reg, target_mod, ps, e2)
         }
@@ -704,13 +760,13 @@ fn proto_op_names(ops: [ProtoOpReg], acc: [String]) : [String] {
   match ops {
     [] -> acc
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _, _, _) -> proto_op_names(rest, [name, ...acc])
+      POR(_, name, _, _, _, _, _) -> proto_op_names(rest, [written_text(name), ...acc])
     }
   }
 }
 
 # Shape 1: every protocol op must have a matching method in the impl.
-fn check_missing_methods(proto_ops: [ProtoOpReg], methods: [Decl],
+fn check_missing_methods(tab: SymTab, proto_ops: [ProtoOpReg], methods: [Decl],
                          pname: String, tname: String,
                          all_op_names: [String],
                          file: String, line: Int, col: Int,
@@ -718,9 +774,10 @@ fn check_missing_methods(proto_ops: [ProtoOpReg], methods: [Decl],
   match proto_ops {
     [] -> acc
     [op, ...rest] -> match op {
-      POR(_, opname, _, _, _, _, _, _) -> {
+      POR(_, oplbl, _, _, _, _, _) -> {
+        let opname = written_text(oplbl)
         let acc1 =
-          if impl_has_method(methods, opname) { acc }
+          if impl_has_method(tab, methods, opname) { acc }
           else {
             [mk_diag(SevError, file, line, col,
                concat_all(["impl `", pname, " for ", tname,
@@ -729,20 +786,20 @@ fn check_missing_methods(proto_ops: [ProtoOpReg], methods: [Decl],
                   concat_all(["protocol `", pname, "` declares operations: ",
                               proto_join_with(all_op_names, ", ")]))]), ...acc]
           }
-        check_missing_methods(rest, methods, pname, tname, all_op_names,
+        check_missing_methods(tab, rest, methods, pname, tname, all_op_names,
                               file, line, col, acc1)
       }
     }
   }
 }
 
-fn impl_has_method(methods: [Decl], opname: String) : Bool {
+fn impl_has_method(tab: SymTab, methods: [Decl], opname: String) : Bool {
   match methods {
     [] -> false
     [d, ...rest] -> match d {
-      DFn(_, name, _, _, _, _, _, _, _, _, fsym) ->
-        if name == opname { true } else { impl_has_method(rest, opname) }
-      _ -> impl_has_method(rest, opname)
+      DFn(_, fid, _, _, _, _, _, _, _, _) ->
+        if impl_method_op(tab, fid) == opname { true } else { impl_has_method(tab, rest, opname) }
+      _ -> impl_has_method(tab, rest, opname)
     }
   }
 }
@@ -750,14 +807,15 @@ fn impl_has_method(methods: [Decl], opname: String) : Bool {
 # Shapes 2 + 3: walk each impl method; if it matches a protocol op,
 # check arity and signature compatibility. Methods that match no
 # protocol op are reported as unknown.
-fn check_impl_methods(methods: [Decl], proto_ops: [ProtoOpReg],
+fn check_impl_methods(tab: SymTab, methods: [Decl], proto_ops: [ProtoOpReg],
                       pname: String, tname: String, target: TypeExpr,
-                      proto_tps: [String], arg_heads: [String],
+                      proto_tps: [String], arg_heads: [DeclRef],
                       file: String, acc: [Diagnostic]) : [Diagnostic] {
   match methods {
     [] -> acc
     [d, ...rest] -> match d {
-      DFn(_, op_name, _, params, ret_opt, _, _, line, col, _, fsym) -> {
+      DFn(_, fid, _, params, ret_opt, _, _, line, col, _) -> {
+        let op_name = impl_method_op(tab, fid)
         let acc1 = match find_proto_op(proto_ops, op_name) {
           None ->
             [proto_err(file, line, col,
@@ -765,7 +823,7 @@ fn check_impl_methods(methods: [Decl], proto_ops: [ProtoOpReg],
                            "` declares method `", op_name,
                            "` which is not an operation of protocol `", pname, "`"])), ...acc]
           Some(op) -> match op {
-            POR(_, _, proto_params, proto_ret, _, _, _, _) -> {
+            POR(_, _, proto_params, proto_ret, _, _, _) -> {
               let pa = list_length(params)
               let pp = list_length(proto_params)
               let e_ar =
@@ -777,7 +835,7 @@ fn check_impl_methods(methods: [Decl], proto_ops: [ProtoOpReg],
                                  " but protocol declares arity ", int_to_string(pp)])), ...acc]
                 }
               if pa == pp {
-                check_sig_heads(params, proto_params, ret_opt, proto_ret,
+                check_sig_heads(tab, params, proto_params, ret_opt, proto_ret,
                                 op_name, pname, tname, target,
                                 proto_tps, arg_heads,
                                 file, line, col, e_ar)
@@ -785,10 +843,10 @@ fn check_impl_methods(methods: [Decl], proto_ops: [ProtoOpReg],
             }
           }
         }
-        check_impl_methods(rest, proto_ops, pname, tname, target,
+        check_impl_methods(tab, rest, proto_ops, pname, tname, target,
                            proto_tps, arg_heads, file, acc1)
       }
-      _ -> check_impl_methods(rest, proto_ops, pname, tname, target,
+      _ -> check_impl_methods(tab, rest, proto_ops, pname, tname, target,
                               proto_tps, arg_heads, file, acc)
     }
   }
@@ -798,8 +856,8 @@ fn find_proto_op(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] {
   match ops {
     [] -> None
     [op, ...rest] -> match op {
-      POR(_, name, _, _, _, _, _, _) ->
-        if name == target { Some(op) } else { find_proto_op(rest, target) }
+      POR(_, name, _, _, _, _, _) ->
+        if op_label_is(name, target) { Some(op) } else { find_proto_op(rest, target) }
     }
   }
 }
@@ -807,20 +865,21 @@ fn find_proto_op(ops: [ProtoOpReg], target: String) : Option[ProtoOpReg] {
 # Compare an impl signature against the protocol's. `Self` in the
 # protocol substitutes to the impl target; each protocol tparam `Ai`
 # substitutes to `arg_heads[i]` (or the target when `arg_heads == []`,
-# the homogeneous default per the lower_impls rule). Parameters are
+# the homogeneous default per the lower_impls rule). `tname` is the
+# target's head as a diagnostic shows it. Parameters are
 # compared structurally, so two instantiations of one constructor are
 # distinguished; the return below compares head names only, except a
 # function type, which has no meaningful head and compares structurally.
 # Unannotated impl params (`ptype == None`) are not checked — the
 # typer infers them; a pre-typer pass has no signal to compare against.
-fn check_sig_heads(impl_params: [Param], proto_params: [Param],
+fn check_sig_heads(tab: SymTab, impl_params: [Param], proto_params: [Param],
                    impl_ret_opt: Option[TypeExpr], proto_ret: TypeExpr,
                    op_name: String, pname: String, tname: String,
                    target: TypeExpr,
-                   proto_tps: [String], arg_heads: [String],
+                   proto_tps: [String], arg_heads: [DeclRef],
                    file: String, line: Int, col: Int,
                    acc: [Diagnostic]) : [Diagnostic] {
-  let e_params = check_sig_param_heads(impl_params, proto_params, tname, target,
+  let e_params = check_sig_param_heads(tab, impl_params, proto_params, tname, target,
                                         proto_tps, arg_heads,
                                         op_name, pname, file, acc)
   # Return-type check applies only when the impl is homogeneous w.r.t.
@@ -833,37 +892,32 @@ fn check_sig_heads(impl_params: [Param], proto_params: [Param],
   # parameter-position checks above still catch genuine signature
   # drift (wrong `self`/`rhs` types) — the leak here is only when
   # the impl rewrites the return shape for a known good reason.
-  if heterogeneous_impl(arg_heads, tname) { e_params }
+  if heterogeneous_impl(tab, arg_heads, proto_type_ref(target)) { e_params }
   else { match impl_ret_opt {
     None -> e_params
     Some(impl_ret) -> {
       let ok = match proto_ret.tkind {
-        TyFn(_, _, _) -> sig_type_matches(impl_ret, sig_subst(proto_ret, tname, target, proto_tps, arg_heads))
-        _ -> proto_type_name(impl_ret) == sig_head_subst(proto_ret, tname, proto_tps, arg_heads)
+        TyFn(_, _, _) -> sig_type_matches(tab, impl_ret, sig_subst(proto_ret, target, proto_tps, arg_heads))
+        _ -> refs_same(tab, proto_type_ref(impl_ret), sig_head_subst(proto_ret, target, proto_tps, arg_heads))
       }
       if ok { e_params }
       else {
         [proto_err(file, line, col,
            concat_all(["impl method `", op_name, "` in `", pname, " for ", tname,
-                       "` returns `", proto_type_text(impl_ret, file),
+                       "` returns `", type_text(tab, impl_ret),
                        "` but protocol declares return type `",
-                       sig_ret_display(proto_ret, tname, target, proto_tps, arg_heads, file), "`"])),
+                       sig_ret_display(tab, proto_ret, target, proto_tps, arg_heads), "`"])),
          ...e_params]
       }
     }
   } }
 }
 
-# A row label the file's own effect was home-spelled for reads back as
-# the name its source wrote.
-fn proto_type_text(t: TypeExpr, file: String) : String =
-  type_text_with(t, (n) => hs_display(n, Some(module_name_of_path(file))))
-
-fn sig_ret_display(t: TypeExpr, tname: String, target: TypeExpr,
-                   proto_tps: [String], arg_heads: [String], file: String) : String =
+fn sig_ret_display(tab: SymTab, t: TypeExpr, target: TypeExpr,
+                   proto_tps: [String], arg_heads: [DeclRef]) : String =
   match t.tkind {
-    TyFn(_, _, _) -> proto_type_text(sig_subst(t, tname, target, proto_tps, arg_heads), file)
-    _ -> sig_head_subst(t, tname, proto_tps, arg_heads)
+    TyFn(_, _, _) -> type_text(tab, sig_subst(t, target, proto_tps, arg_heads))
+    _ -> ref_text(tab, sig_head_subst(t, target, proto_tps, arg_heads))
   }
 
 # An impl is heterogeneous iff it carries explicit bracket args and
@@ -872,16 +926,16 @@ fn sig_ret_display(t: TypeExpr, tname: String, target: TypeExpr,
 # definition. Same-as-target args (`impl Add[Complex] for Complex`)
 # round-trip through the homogeneous default, so they are not
 # heterogeneous either.
-fn heterogeneous_impl(arg_heads: [String], tname: String) : Bool {
+fn heterogeneous_impl(tab: SymTab, arg_heads: [DeclRef], target: DeclRef) : Bool {
   match arg_heads {
     [] -> false
-    [h, ...rest] -> if h != tname { true } else { heterogeneous_impl(rest, tname) }
+    [h, ...rest] -> if not refs_same(tab, h, target) { true } else { heterogeneous_impl(tab, rest, target) }
   }
 }
 
-fn check_sig_param_heads(impl_ps: [Param], proto_ps: [Param], tname: String,
+fn check_sig_param_heads(tab: SymTab, impl_ps: [Param], proto_ps: [Param], tname: String,
                          target: TypeExpr,
-                         proto_tps: [String], arg_heads: [String],
+                         proto_tps: [String], arg_heads: [DeclRef],
                          op_name: String, pname: String,
                          file: String, acc: [Diagnostic]) : [Diagnostic] {
   match impl_ps {
@@ -894,19 +948,19 @@ fn check_sig_param_heads(impl_ps: [Param], proto_ps: [Param], tname: String,
           Some(it) -> match pp.ptype {
             None -> acc
             Some(pt) -> {
-              let ps = sig_subst(pt, tname, target, proto_tps, arg_heads)
-              if sig_type_matches(it, ps) { acc }
+              let ps = sig_subst(pt, target, proto_tps, arg_heads)
+              if sig_type_matches(tab, it, ps) { acc }
               else {
                 [proto_err(file, ip.pline, ip.pcol,
                    concat_all(["impl method `", op_name, "` in `", pname, " for ", tname,
-                               "`: parameter `", ip.pname,
-                               "` has type `", proto_type_text(it, file),
-                               "` but protocol declares `", proto_type_text(ps, file), "`"])), ...acc]
+                               "`: parameter `", written_text(ip.binder.name),
+                               "` has type `", type_text(tab, it),
+                               "` but protocol declares `", type_text(tab, ps), "`"])), ...acc]
               }
             }
           }
         }
-        check_sig_param_heads(irest, prest, tname, target,
+        check_sig_param_heads(tab, irest, prest, tname, target,
                               proto_tps, arg_heads,
                               op_name, pname, file, acc1)
       }
@@ -920,34 +974,34 @@ fn check_sig_param_heads(impl_ps: [Param], proto_ps: [Param], tname: String,
 # `Pair[Int, Bool]`) do not compare equal. Either side left
 # argument-free stays permissive and matches on the head alone,
 # preserving the pre-existing tolerance for unresolved variables.
-fn sig_type_matches(impl_t: TypeExpr, proto_t: TypeExpr) : Bool {
+fn sig_type_matches(tab: SymTab, impl_t: TypeExpr, proto_t: TypeExpr) : Bool {
   match proto_t.tkind {
-    TyName(_, pn, pargs) -> match impl_t.tkind {
-      TyName(_, inm, iargs) ->
-        if pn != inm { false }
+    TyName(pn, pargs) -> match impl_t.tkind {
+      TyName(inm, iargs) ->
+        if not refs_same(tab, pn, inm) { false }
         else if pargs == [] or iargs == [] { true }
-        else { sig_types_match(iargs, pargs) }
-      _ -> proto_type_name(impl_t) == pn
+        else { sig_types_match(tab, iargs, pargs) }
+      _ -> refs_same(tab, proto_type_ref(impl_t), pn)
     }
     TyList(pinner) -> match impl_t.tkind {
-      TyList(iinner) -> sig_type_matches(iinner, pinner)
+      TyList(iinner) -> sig_type_matches(tab, iinner, pinner)
       _ -> false
     }
     TyFn(pps, pret, prow) -> match impl_t.tkind {
       TyFn(ips, iret, irow) ->
-        sig_types_match(ips, pps) and sig_type_matches(iret, pret) and sig_rows_match(irow, prow)
+        sig_types_match(tab, ips, pps) and sig_type_matches(tab, iret, pret) and sig_rows_match(tab, irow, prow)
       _ -> false
     }
-    _ -> proto_type_name(impl_t) == proto_type_name(proto_t)
+    _ -> refs_same(tab, proto_type_ref(impl_t), proto_type_ref(proto_t))
   }
 }
 
 # Two closed rows match when their label sets do.
-fn sig_rows_match(ir: RowExpr, pr: RowExpr) : Bool =
+fn sig_rows_match(tab: SymTab, ir: RowExpr, pr: RowExpr) : Bool =
   # Compatibility with an open row is undecided, so it is not rejected.
   row_is_open(ir) or row_is_open(pr)
-    or (sig_labels_within(row_labels_of(ir), row_labels_of(pr), true)
-      and sig_labels_within(row_labels_of(pr), row_labels_of(ir), false))
+    or (sig_labels_within(tab, row_labels_of(ir), row_labels_of(pr), true)
+      and sig_labels_within(tab, row_labels_of(pr), row_labels_of(ir), false))
 
 fn row_is_open(r: RowExpr) : Bool = match r { ROpen(_, _) -> true  _ -> false }
 
@@ -955,34 +1009,34 @@ fn row_labels_of(r: RowExpr) : [RowLabel] =
   match r { REmpty -> []  RClosed(ls) -> ls  ROpen(_, ls) -> ls }
 
 # Every label of `xs` has a counterpart in `ys`; `xs_impl` says which side is the impl's.
-fn sig_labels_within(xs: [RowLabel], ys: [RowLabel], xs_impl: Bool) : Bool =
+fn sig_labels_within(tab: SymTab, xs: [RowLabel], ys: [RowLabel], xs_impl: Bool) : Bool =
   match xs {
     [] -> true
-    [x, ...rest] -> sig_label_in(x, ys, xs_impl) and sig_labels_within(rest, ys, xs_impl)
+    [x, ...rest] -> sig_label_in(tab, x, ys, xs_impl) and sig_labels_within(tab, rest, ys, xs_impl)
   }
 
-fn sig_label_in(x: RowLabel, ys: [RowLabel], x_impl: Bool) : Bool =
+fn sig_label_in(tab: SymTab, x: RowLabel, ys: [RowLabel], x_impl: Bool) : Bool =
   match ys {
     [] -> false
     [y, ...rest] ->
-      (if x_impl { sig_label_matches(x, y) } else { sig_label_matches(y, x) })
-        or sig_label_in(x, rest, x_impl)
+      (if x_impl { sig_label_matches(tab, x, y) } else { sig_label_matches(tab, y, x) })
+        or sig_label_in(tab, x, rest, x_impl)
   }
 
-fn sig_label_matches(i: RowLabel, p: RowLabel) : Bool =
+fn sig_label_matches(tab: SymTab, i: RowLabel, p: RowLabel) : Bool =
   match i {
-    RL(inm, iargs, isym) -> match p {
-      RL(pnm, pargs, psym) ->
-        eff_ref_same(inm, isym, pnm, psym) and (pargs == [] or iargs == [] or sig_types_match(iargs, pargs))
+    RL(ieff, iargs) -> match p {
+      RL(peff, pargs) ->
+        refs_same(tab, ieff, peff) and (pargs == [] or iargs == [] or sig_types_match(tab, iargs, pargs))
     }
   }
 
-fn sig_types_match(its: [TypeExpr], pts: [TypeExpr]) : Bool {
+fn sig_types_match(tab: SymTab, its: [TypeExpr], pts: [TypeExpr]) : Bool {
   match pts {
     [] -> match its { [] -> true  _ -> false }
     [p, ...prest] -> match its {
       [] -> false
-      [i, ...irest] -> if sig_type_matches(i, p) { sig_types_match(irest, prest) } else { false }
+      [i, ...irest] -> if sig_type_matches(tab, i, p) { sig_types_match(tab, irest, prest) } else { false }
     }
   }
 }
@@ -992,34 +1046,38 @@ fn sig_types_match(its: [TypeExpr], pts: [TypeExpr]) : Bool {
 # aligned bracket argument. A tparam applied to arguments (`s[Int]`
 # with `s := Chain`) substitutes at the head and keeps its arguments,
 # yielding `Chain[Int]` — the Shape-carrier form.
-fn sig_subst(t: TypeExpr, tname: String, target: TypeExpr,
-             proto_tps: [String], arg_heads: [String]) : TypeExpr {
+fn sig_subst(t: TypeExpr, target: TypeExpr,
+             proto_tps: [String], arg_heads: [DeclRef]) : TypeExpr {
   match t.tkind {
-    TyName(th, n, targs) -> {
-      let sargs = map(targs, (a) => sig_subst(a, tname, target, proto_tps, arg_heads))
-      if n == "Self" {
-        match targs { [] -> target  _ -> mk_ty(TyName(th, proto_type_name(target), sargs), t.line, t.col) }
-      } else {
-        match tparam_subst(n, proto_tps, arg_heads, tname) {
-          Some(h) -> mk_ty(TyName(th, h, sargs), t.line, t.col)
-          None    -> mk_ty(TyName(th, n, sargs), t.line, t.col)
-        }
+    TyName(r, targs) -> {
+      let sargs = map(targs, (a) => sig_subst(a, target, proto_tps, arg_heads))
+      match ref_bare_text(r) {
+        None    -> mk_ty(TyName(r, sargs), t.line, t.col)
+        Some(n) ->
+          if n == "Self" {
+            match targs { [] -> target  _ -> mk_ty(TyName(proto_type_ref(target), sargs), t.line, t.col) }
+          } else {
+            match tparam_subst(n, proto_tps, arg_heads, proto_type_ref(target)) {
+              Some(h) -> mk_ty(TyName(h, sargs), t.line, t.col)
+              None    -> mk_ty(TyName(r, sargs), t.line, t.col)
+            }
+          }
       }
     }
-    TyList(inner) -> mk_ty(TyList(sig_subst(inner, tname, target, proto_tps, arg_heads)), t.line, t.col)
+    TyList(inner) -> mk_ty(TyList(sig_subst(inner, target, proto_tps, arg_heads)), t.line, t.col)
     TyFn(ps, ret, row) -> {
-      let sps = map(ps, (p) => sig_subst(p, tname, target, proto_tps, arg_heads))
-      let sret = sig_subst(ret, tname, target, proto_tps, arg_heads)
-      mk_ty(TyFn(sps, sret, sig_subst_row(row, tname, target, proto_tps, arg_heads)), t.line, t.col)
+      let sps = map(ps, (p) => sig_subst(p, target, proto_tps, arg_heads))
+      let sret = sig_subst(ret, target, proto_tps, arg_heads)
+      mk_ty(TyFn(sps, sret, sig_subst_row(row, target, proto_tps, arg_heads)), t.line, t.col)
     }
     _ -> t
   }
 }
 
-fn sig_subst_row(r: RowExpr, tname: String, target: TypeExpr,
-                 proto_tps: [String], arg_heads: [String]) : RowExpr {
+fn sig_subst_row(r: RowExpr, target: TypeExpr,
+                 proto_tps: [String], arg_heads: [DeclRef]) : RowExpr {
   let sub = (l: RowLabel) => match l {
-    RL(n, args, s) -> RL(n, map(args, (a) => sig_subst(a, tname, target, proto_tps, arg_heads)), s)
+    RL(eff, args) -> RL(eff, map(args, (a) => sig_subst(a, target, proto_tps, arg_heads)))
   }
   match r {
     REmpty -> REmpty
@@ -1029,20 +1087,23 @@ fn sig_subst_row(r: RowExpr, tname: String, target: TypeExpr,
 }
 
 # Substitute `Self` and protocol tparams against the impl target +
-# bracket args, then collapse to the head name. Anything that doesn't
+# bracket args, then collapse to the head. Anything that doesn't
 # bind (free tparam outside the protocol's own list, etc.) falls
-# through to the standard `proto_type_name` collapse — head-name
+# through to the standard `proto_type_ref` collapse — head
 # comparison is intentionally permissive about unresolved variables.
-fn sig_head_subst(t: TypeExpr, tname: String,
-                  proto_tps: [String], arg_heads: [String]) : String {
+fn sig_head_subst(t: TypeExpr, target: TypeExpr,
+                  proto_tps: [String], arg_heads: [DeclRef]) : DeclRef {
   match t.tkind {
-    TyName(_, n, _) ->
-      if n == "Self" { tname }
-      else { match tparam_subst(n, proto_tps, arg_heads, tname) {
-        Some(h) -> h
-        None    -> proto_type_name(t)
-      } }
-    _ -> proto_type_name(t)
+    TyName(r, _) -> match ref_bare_text(r) {
+      None    -> r
+      Some(n) ->
+        if n == "Self" { proto_type_ref(target) }
+        else { match tparam_subst(n, proto_tps, arg_heads, proto_type_ref(target)) {
+          Some(h) -> h
+          None    -> r
+        } }
+    }
+    _ -> proto_type_ref(t)
   }
 }
 
@@ -1052,50 +1113,50 @@ fn sig_head_subst(t: TypeExpr, tname: String,
 # encoded in `lower_impls`. A tparam's stored name may carry a kind
 # marker (`s#Shape`); the surface name is compared, so a `[s: Shape]`
 # carrier binds `s := <target head>` exactly as a bare `[a]` does.
-fn tparam_subst(n: String, tps: [String], heads: [String],
-                tname: String) : Option[String] {
+fn tparam_subst(n: String, tps: [String], heads: [DeclRef],
+                target: DeclRef) : Option[DeclRef] {
   match tps {
     [] -> None
     [t, ...trest] -> match heads {
-      [] -> if tp_strip_kind(t) == n { Some(tname) } else { tparam_subst(n, trest, [], tname) }
+      [] -> if tp_strip_kind(t) == n { Some(target) } else { tparam_subst(n, trest, [], target) }
       [h, ...hrest] ->
-        if tp_strip_kind(t) == n { Some(h) } else { tparam_subst(n, trest, hrest, tname) }
+        if tp_strip_kind(t) == n { Some(h) } else { tparam_subst(n, trest, hrest, target) }
     }
   }
 }
 
 # Walk every DImpl and (a) lower its methods into top-level DFns,
-# (b) record (P, T) -> impl_fn_name in the registry. The fn body is
-# the impl's original body verbatim; we only rename the function and
-# leave the typer to do its work on the result.
-fn lower_impls(ds: [Decl], reg: ProtocolReg, ps: PScope, acc_fns: [Decl]) : LowerImplsRes {
+# (b) record (P, T) -> impl fn in the registry. The fn body is
+# the impl's original body verbatim; the function is declared anew
+# under its impl symbol and the typer does its work on the result.
+fn lower_impls(ds: [Decl], reg: ProtocolReg, ps: PScope, acc_fns: [Decl]) : LowerImplsRes =
+  lower_impls_loop(ds, ps, LowerImplsRes { reg: reg, fns: acc_fns, rows: [] })
+
+fn lower_impls_loop(ds: [Decl], ps: PScope, acc: LowerImplsRes) : LowerImplsRes {
   match ds {
-    [] -> LowerImplsRes { reg: reg, fns: list_reverse(acc_fns) }
+    [] -> LowerImplsRes { reg: acc.reg, fns: list_reverse(acc.fns), rows: list_reverse(acc.rows) }
     [d, ...rest] -> match d {
-      DImpl(pspell, proto_args, target, methods, _, _, _, isym) -> {
-        let tname = proto_type_name(target)
-        let pname = dotted_bare(pspell)
-        # Issue #180: derive the per-impl proto-arg name list. Empty
-        # input list = legacy form, treated as `Ai = Self` (= [tname]).
-        let arg_names = match proto_args {
-          [] -> []
-          _  -> map(proto_args, proto_type_name)
-        }
+      DImpl(pref, proto_args, target, methods, _, _, _, isym) -> {
+        let tab = ps_tab(ps)
+        let pname = dotted_bare(proto_ref_spell(tab, pref))
         # The impl's dispatch key: resolve the head from the impl's own
         # module, then spell it. Unresolved protocols keep the bare
         # name — `validate_impls` has already reported them.
         let from = impl_home_of(methods)
-        let psym = ps_proto_sym(ps, pspell, from)
-        let key = proto_key_of(reg.dkeys, pname, psym)
-        let r = lower_impl_methods(key, psym, tname, arg_names, from, methods, reg, acc_fns)
-        lower_impls(rest, r.reg, ps, r.fns)
+        let psym = proto_ref_sym(ps, pref, from)
+        # No protocol argument is the legacy form, `Ai = Self`.
+        let head = ImplHead { key: proto_key_of(acc.reg.dkeys, pname, psym), proto: psym,
+                              tname: proto_type_name(tab, target), target: proto_type_ref(target),
+                              arg_names: map(proto_args, (a) => proto_type_name(tab, a)),
+                              args: map(proto_args, proto_type_ref), home: from }
+        lower_impls_loop(rest, ps, lower_impl_methods(tab, ps_root(ps), head, methods, acc))
       }
-      DDerive(_, inner, _, _) -> lower_impls([inner, ...rest], reg, ps, acc_fns)
-      DUnstable(inner, _, _) -> lower_impls([inner, ...rest], reg, ps, acc_fns)
-      DProtoLaws(_, inner, _, _, _) -> lower_impls([inner, ...rest], reg, ps, acc_fns)
-      DImplAxiom(_, inner, _, _, _) -> lower_impls([inner, ...rest], reg, ps, acc_fns)
-      DConstructor(inner, _, _) -> lower_impls([inner, ...rest], reg, ps, acc_fns)
-      _ -> lower_impls(rest, reg, ps, acc_fns)
+      DDerive(_, inner, _, _) -> lower_impls_loop([inner, ...rest], ps, acc)
+      DUnstable(inner, _, _) -> lower_impls_loop([inner, ...rest], ps, acc)
+      DProtoLaws(_, inner, _, _, _) -> lower_impls_loop([inner, ...rest], ps, acc)
+      DImplAxiom(_, inner, _, _, _) -> lower_impls_loop([inner, ...rest], ps, acc)
+      DConstructor(inner, _, _) -> lower_impls_loop([inner, ...rest], ps, acc)
+      _ -> lower_impls_loop(rest, ps, acc)
     }
   }
 }
@@ -1103,11 +1164,16 @@ fn lower_impls(ds: [Decl], reg: ProtocolReg, ps: PScope, acc_fns: [Decl]) : Lowe
 # The declaration a duplicate check compares: what the impl's module
 # sees under the target's name. Every impl resolves in the same table,
 # so the ids compare with each other; they never meet a `TyCon`'s.
-fn impl_target_key(ps: PScope, tname: String, from: Option[String]) : String =
-  match sv_resolve(ps_tab(ps), ps_view(ps, from), NCType, tname) {
-    SvSym(s) -> concat_all([tname, "#", int_to_string(sym_raw(s))])
-    _        -> tname
+fn impl_target_key(ps: PScope, tname: String, target: DeclRef, from: Option[String]) : String = {
+  let s = match target {
+    DrSym(d)        -> d
+    DrWritten(_, _) -> match sv_resolve(ps_tab(ps), ps_view(ps, from), NCType, tname) {
+      SvSym(d) -> d
+      _        -> sym_none()
+    }
   }
+  if sym_raw(s) >= 0 { concat_all([tname, "#", int_to_string(sym_raw(s))]) } else { tname }
+}
 
 # The module an impl block lives in, read off its first method's
 # origin stamp (the cascade tags every method with the enclosing
@@ -1116,32 +1182,41 @@ fn impl_home_of(methods: [Decl]) : Option[String] =
   match methods {
     [] -> None
     [d, ...rest] -> match d {
-      DFn(_, _, _, _, _, _, _, _, _, mo, fsym) -> mo
+      DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
       _ -> impl_home_of(rest)
     }
   }
 
-type LowerImplsRes = { reg: ProtocolReg, fns: [Decl] }
+# The lowered impl methods, the registry that records them, and the
+# table row of each function declared for one.
+type LowerImplsRes = { reg: ProtocolReg, fns: [Decl], rows: [NEnt] }
 
-# `acc_fns` accumulates in reverse; the caller list_reverses on
-# return. `pkey` is the impl's protocol dispatch key, not necessarily
-# the surface name — mangling and the PIR entry both carry it. `psym`
-# is that protocol's identity, which decides whose impl the entry is.
-fn lower_impl_methods(pkey: String, psym: SymId, tname: String, arg_names: [String],
-                      home: Option[String], methods: [Decl],
-                      reg: ProtocolReg, acc_fns: [Decl]) : LowerImplsRes {
+# What one impl block gives each of its methods. `key` is the protocol's
+# dispatch key, the piece an impl symbol spells, not necessarily the
+# surface name; `proto` is that protocol's identity, which decides whose
+# impl an entry is. `tname` and `arg_names` are the symbol's type pieces,
+# `target` and `args` the references the registry files.
+type ImplHead = { key: String, proto: SymId, tname: String, target: DeclRef,
+                  arg_names: [String], args: [DeclRef], home: Option[String] }
+
+# `acc` accumulates in reverse; the caller list_reverses on return.
+fn lower_impl_methods(tab: SymTab, root: String, head: ImplHead, methods: [Decl],
+                      acc: LowerImplsRes) : LowerImplsRes {
   match methods {
-    [] -> LowerImplsRes { reg: reg, fns: acc_fns }
+    [] -> acc
     [d, ...rest] -> match d {
-      DFn(_, op_name, tparams, params, ret, row, body, line, col, mo, fsym) -> {
+      DFn(_, fid, tparams, params, ret, row, body, line, col, mo) -> {
+        let op_name = impl_method_op(tab, fid)
         # Issue #180: only the heterogeneous case (Ai != Self) augments
         # the mangled name. The default-Self form keeps the legacy
         # mangling so `impl Add for Complex` and `impl Add[Complex] for
         # Complex` produce the same impl-fn name.
-        let mangled = proto_impl_mangled_with_args(pkey, tname, op_name, arg_names)
-        let new_fn = DFn(false, mangled, tparams, params, ret, row, body, line, col, mo, fnid_none())
-        let ret_head = match ret { Some(rte) -> proto_type_name(rte)  None -> tname }
-        let entry = PIR(pkey, tname, op_name, mangled, arg_names, ret_head, home, sym_none(), psym)
+        let mangled = proto_impl_mangled_with_args(head.key, head.tname, op_name, head.arg_names)
+        let fsym = pid_fn_id(mangled, mo, root)
+        let new_fn = DFn(false, fnid_decl(fsym), tparams, params, ret, row, body, line, col, mo)
+        let ret_head = match ret { Some(rte) -> proto_type_ref(rte)  None -> head.target }
+        let entry = PIR(head.proto, head.target, written(op_name), fsym, head.args, ret_head, head.home)
+        let reg = acc.reg
         let reg1 = ProtocolReg {
           ops: reg.ops,
           impls: [entry, ...reg.impls],
@@ -1152,9 +1227,11 @@ fn lower_impl_methods(pkey: String, psym: SymId, tname: String, arg_names: [Stri
           impl_index: reg.impl_index,
           cores: reg.cores, imports: reg.imports, root: reg.root, ids: reg.ids
         }
-        lower_impl_methods(pkey, psym, tname, arg_names, home, rest, reg1, [new_fn, ...acc_fns])
+        lower_impl_methods(tab, root, head, rest,
+                           LowerImplsRes { reg: reg1, fns: [new_fn, ...acc.fns],
+                                           rows: [NEnt(NCFn, mangled, proto_home_name(mo, root), false), ...acc.rows] })
       }
-      _ -> lower_impl_methods(pkey, psym, tname, arg_names, home, rest, reg, acc_fns)
+      _ -> lower_impl_methods(tab, root, head, rest, acc)
     }
   }
 }
@@ -1171,63 +1248,55 @@ fn lower_impl_methods(pkey: String, psym: SymId, tname: String, arg_names: [Stri
 # `stdlib/protocols.kai`) now produce dispatchers tagged with the
 # core's basename so a cache loader can partition post-cascade
 # decls back into their original core/user segments.
-fn generate_dispatchers(reg: ProtocolReg) : DispGen =
-  generate_dispatchers_loop(reg.ops, op_arities_from_ops(reg.ops), reg.root, DispGen { decls: [], ids: pid_empty() })
+fn generate_dispatchers(reg: ProtocolReg, tab: SymTab) : DispGen =
+  generate_dispatchers_loop(reg.ops, op_arities_from_ops(reg.ops), tab, reg.root,
+                            DispGen { decls: [], ids: pid_empty(), rows: [] })
 
-# The dispatchers, and the id table that records each one as it is minted.
-type DispGen = { decls: [Decl], ids: ProtoIds }
+# The dispatchers, the id table that records each one as it is minted,
+# and the table row of each.
+type DispGen = { decls: [Decl], ids: ProtoIds, rows: [NEnt] }
 
-fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr], root: String,
+fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr], tab: SymTab, root: String,
                                 acc: DispGen) : DispGen {
   match ops {
     [] -> acc
     [op, ...rest] -> match op {
-      POR(pname, opname, params, ret, line, col, mo, psym) -> {
-        # Dedup by the arity-resolved dispatcher NAME, not the bare op
-        # name: an arity-ambiguous op (`f/1` + `f/2`) yields two
-        # distinct dispatcher names, so both survive; same-arity
-        # collisions still collapse to one shared dispatcher, which
-        # every protocol declaring the op then shares.
+      POR(psym, oplbl, params, ret, line, col, mo) -> {
+        let opname = written_text(oplbl)
+        # An arity-ambiguous op (`f/1` + `f/2`) yields two dispatcher
+        # names, so both survive. One dispatcher per (name, home): every
+        # protocol of a home declaring the op at that arity shares it,
+        # and two modules declaring it each get their own, so a call
+        # narrows by receiver among distinct signatures.
         let disp = proto_dispatcher_name_at(arities, opname, list_length(params))
-        let already = dispatcher_named_in_acc(acc.decls, disp, mo)
+        let dsym = pid_fn_id(disp, mo, root)
+        let already = pid_is_disp(acc.ids, dsym)
         let ids = pid_note_disp(acc.ids, disp, opname, mo, list_length(params), psym, root)
-        if already { generate_dispatchers_loop(rest, arities, root, DispGen { decls: acc.decls, ids: ids }) }
+        if already { generate_dispatchers_loop(rest, arities, tab, root, DispGen { decls: acc.decls, ids: ids, rows: acc.rows }) }
         else {
-          let stub = make_dispatcher_fn(pname, opname, disp, params, ret, line, col, mo)
-          generate_dispatchers_loop(rest, arities, root, DispGen { decls: [stub, ...acc.decls], ids: ids })
+          let pname = written_text(sym_name(tab, psym))
+          let stub = make_dispatcher_fn(pname, opname, dsym, params, ret, line, col, mo)
+          generate_dispatchers_loop(rest, arities, tab, root,
+                                    DispGen { decls: [stub, ...acc.decls], ids: ids,
+                                              rows: [NEnt(NCFn, disp, proto_home_name(mo, root), true), ...acc.rows] })
         }
       }
     }
   }
 }
 
-# One dispatcher per (name, home): two modules declaring the same op
-# each get their own, so a call narrows by receiver among distinct
-# signatures instead of meeting whichever module registered first.
-fn dispatcher_named_in_acc(ds: [Decl], want: String, mo: Option[String]) : Bool {
-  match ds {
-    [] -> false
-    [d, ...rest] -> match d {
-      DFn(_, n, _, _, _, _, _, _, _, dmo, fsym) ->
-        if n == want and mo_eq(dmo, mo) { true }
-        else { dispatcher_named_in_acc(rest, want, mo) }
-      _ -> dispatcher_named_in_acc(rest, want, mo)
-    }
-  }
-}
-
-# `disp_name` is the arity-resolved dispatcher symbol (may carry an
-# `__a<N>` suffix); `opname` is the original op name, kept for the
-# dispatch tag so the post-inference rewrite and emit resolve the impl
-# by the protocol's true op name.
-fn make_dispatcher_fn(pname: String, opname: String, disp_name: String,
+# `dsym` is the dispatcher's id, derived from its arity-resolved name
+# (which may carry an `__a<N>` suffix); `opname` is the original op name,
+# kept for the dispatch tag so the post-inference rewrite and emit
+# resolve the impl by the protocol's true op name.
+fn make_dispatcher_fn(pname: String, opname: String, dsym: SymId,
                        params: [Param], ret: TypeExpr, line: Int, col: Int,
                        mo: Option[String]) : Decl {
   let new_params = map(params, dispatcher_substitute_self_param)
   let new_ret = substitute_self_in_type(ret)
   let body = make_dispatcher_body(pname, opname, new_ret, line, col)
-  DFn(true, disp_name, [], new_params, Some(new_ret),
-      REmpty, body, line, col, mo, fnid_none())
+  DFn(true, fnid_decl(dsym), [], new_params, Some(new_ret),
+      REmpty, body, line, col, mo)
 }
 
 # Synthesises an `ETodo` body tagged `__kai_proto_dispatch__:<P>:<op>`.
@@ -1248,7 +1317,7 @@ fn make_dispatcher_body(pname: String, opname: String, ret: TypeExpr,
 fn dispatcher_substitute_self_param(p: Param) : Param {
   match p.ptype {
     None -> p
-    Some(te) -> Param { pname: p.pname, ptype: Some(substitute_self_in_type(te)),
+    Some(te) -> Param { binder: p.binder, ptype: Some(substitute_self_in_type(te)),
                          pline: p.pline, pcol: p.pcol, pborrow: p.pborrow }
   }
 }
@@ -1265,9 +1334,12 @@ fn substitute_self_in_kind(k: TyKind) : TyKind {
     # `targs` (not `args`) — `args` is a core function name and the
     # stage-1 resolver does not let the pattern binding shadow the
     # core reference inside the body.
-    TyName(th, name, targs) -> {
-      let new_name = if name == "Self" { "proto_self" } else { name }
-      TyName(th, new_name, map(targs, substitute_self_in_type))
+    TyName(r, targs) -> {
+      let r1 = match ref_bare_text(r) {
+        Some(n) -> if n == "Self" { ref_written("proto_self") } else { r }
+        None    -> r
+      }
+      TyName(r1, map(targs, substitute_self_in_type))
     }
     TyList(inner) -> TyList(substitute_self_in_type(inner))
     TyFn(ps, ret, row) ->
@@ -1298,17 +1370,19 @@ fn collect_impl_reach(ps: PScope, ds: [Decl], acc: [ImplReach]) : [ImplReach] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DImpl(pname, _, target, ms, _, _, tps, _) -> {
-        let acc1 = match derive_gen(ps, pname, impl_home_of(ms)) {
-          Some(g) -> [impl_reach(core_proto_name(g), head_tree(target), tps), ...acc]
+      DImpl(pref, _, target, ms, _, _, tps, _) -> {
+        let acc1 = match impl_gen(ps, pref, impl_home_of(ms)) {
+          Some(g) -> [impl_reach(core_proto_name(g), head_tree(ps_tab(ps), target), tps), ...acc]
           None    -> acc
         }
         collect_impl_reach(ps, rest, acc1)
       }
       DDerive(names, inner, _, _) -> match inner {
-        DType(_, tname, tps, _, _, _, _, _, _) ->
+        DType(_, tsym, tps, _, _, _, _, _) -> {
+          let tname = ref_text(ps_tab(ps), DrSym(tsym))
           collect_impl_reach(ps, rest, list_append(map(derive_gens(ps, names, derive_from(ps, inner)),
                                                    (d) => derived_reach(gen_key(d), tname, tps)), acc))
+        }
         _ -> collect_impl_reach(ps, rest, acc)
       }
       DUnstable(inner, _, _) ->
@@ -1324,10 +1398,18 @@ fn collect_impl_reach(ps: PScope, ds: [Decl], acc: [ImplReach]) : [ImplReach] {
   }
 }
 
-fn head_tree(te: TypeExpr) : HeadTree = HT(proto_type_name(te), map(te_type_args(te), head_tree))
+# The generator an impl head provides for, resolved from the impl's own file.
+fn impl_gen(ps: PScope, pref: DeclRef, from: Option[String]) : Option[CoreProto] =
+  match core_proto_of(proto_ref_sym(ps, pref, from)) {
+    Some(g) -> if core_proto_derivable(g) { Some(g) } else { None }
+    None    -> None
+  }
+
+fn head_tree(tab: SymTab, te: TypeExpr) : HeadTree =
+  HT(proto_type_name(tab, te), map(te_type_args(te), (a) => head_tree(tab, a)))
 
 fn te_type_args(te: TypeExpr) : [TypeExpr] = match te.tkind {
-  TyName(_, _, args)   -> args
+  TyName(_, args)   -> args
   TyList(elem)      -> [elem]
   TyDim(base, _)    -> te_type_args(base)
   TyRefine(base, _) -> te_type_args(base)
@@ -1398,12 +1480,14 @@ type DeriveSite = DS(String, Int, Int)
 
 fn validate_derive_decl(ps: PScope, names: [String], inner: Decl, file: String, reach: [ImplReach],
                         dline: Int, dcol: Int, errs: [Diagnostic]) : [Diagnostic] / Console = match inner {
-  DType(_, tname, tps, body, _, _, _, _, _) -> {
-    let fields = derive_field_types(body)
+  DType(_, tsym, tps, body, _, _, _, _) -> {
+    let tab = ps_tab(ps)
+    let tname = ref_text(tab, DrSym(tsym))
+    let fields = derive_field_types(tab, body)
     let gens = derive_gens(ps, names, derive_from(ps, inner))
     let keys = map(gens, gen_key)
     let own = list_append(map(keys, (n) => derived_reach(n, tname, tps)), param_reach(keys, tps))
-    validate_derive_protos(filter(gens, derive_reach_checked), tname, fields,
+    validate_derive_protos(tab, filter(gens, derive_reach_checked), tname, fields,
                            list_append(own, reach), DS(file, dline, dcol), errs)
   }
   _ -> errs
@@ -1428,16 +1512,17 @@ fn param_reach(names: [String], tps: [String]) : [ImplReach] = match names {
 # Each field a derived impl reads, labelled the way a diagnostic names it.
 type DeriveField = DFld(String, TypeExpr)
 
-fn derive_field_types(body: TypeBody) : [DeriveField] = match body {
-  TBSum(variants)  -> variant_fields(variants)
+fn derive_field_types(tab: SymTab, body: TypeBody) : [DeriveField] = match body {
+  TBSum(variants)  -> variant_fields(tab, variants)
   TBRecord(fields) -> map(fields, record_field)
   _                -> []
 }
 
-fn variant_fields(vs: [Variant]) : [DeriveField] = match vs {
+fn variant_fields(tab: SymTab, vs: [Variant]) : [DeriveField] = match vs {
   []           -> []
   [v, ...rest] -> match v {
-    Var(vname, vargs) -> list_append(variant_args(vname, vargs, 0), variant_fields(rest))
+    Var(vsym, vargs) ->
+      list_append(variant_args(written_text(sym_name(tab, vsym)), vargs, 0), variant_fields(tab, rest))
   }
 }
 
@@ -1452,27 +1537,27 @@ fn record_field(f: FieldDecl) : DeriveField = match f {
   FD(_, fname, te, _) -> DFld(concat_all(["field `", fname, "`"]), te)
 }
 
-fn validate_derive_protos(gens: [DeriveGen], tname: String, fields: [DeriveField],
+fn validate_derive_protos(tab: SymTab, gens: [DeriveGen], tname: String, fields: [DeriveField],
                           reach: [ImplReach], site: DeriveSite, errs: [Diagnostic]) : [Diagnostic] / Console = match gens {
   []           -> errs
   [d, ...rest] ->
-    validate_derive_protos(rest, tname, fields, reach, site,
-                           validate_derive_fields(d, tname, fields, reach, site, errs))
+    validate_derive_protos(tab, rest, tname, fields, reach, site,
+                           validate_derive_fields(tab, d, tname, fields, reach, site, errs))
 }
 
-fn validate_derive_fields(d: DeriveGen, tname: String, fields: [DeriveField],
+fn validate_derive_fields(tab: SymTab, d: DeriveGen, tname: String, fields: [DeriveField],
                           reach: [ImplReach], site: DeriveSite, errs: [Diagnostic]) : [Diagnostic] / Console = match fields {
   []           -> errs
   [f, ...rest] -> match f {
     DFld(what, te) -> match d { DeriveGen(pname, g) -> {
-      let path = missing_path(core_proto_name(g), head_tree(te), reach, (h) => derive_builtin_impl(g, h))
+      let path = missing_path(core_proto_name(g), head_tree(tab, te), reach, (h) => derive_builtin_impl(g, h))
       let errs1 = match path {
         [] -> errs
         _  -> {
           [report_derive_missing(pname, tname, what, path, site), ...errs]
         }
       }
-      validate_derive_fields(d, tname, rest, reach, site, errs1)
+      validate_derive_fields(tab, d, tname, rest, reach, site, errs1)
     } }
   }
 }
@@ -1508,36 +1593,44 @@ fn report_derive_missing(pname: String, tname: String, what: String, path: [Stri
 # DType followed by one synthetic DImpl per derived protocol.
 # DProtocol and ordinary DImpl decls pass through unchanged so the
 # next pass can collect them.
-# The decl stream with every `#[derive]` expanded, and the impls the
-# derives minted on their own.
-type Expanded = Expanded([Decl], [Decl])
+# The decl stream with every `#[derive]` expanded, the impls the
+# derives minted on their own, and the table row of every function the
+# derives declared.
+type Expanded = Expanded([Decl], [Decl], [NEnt])
+
+# What a derive declares: the declarations, and the table row of each
+# function among them, an impl's methods included.
+type Derived = { decls: [Decl], rows: [NEnt] }
+
+fn derived_none() : Derived = Derived { decls: [], rows: [] }
 
 # What an expansion resolves and mints against: the protocol scope, the
 # dispatchers by id, and the core modules.
 type DeriveCx = { ps: PScope, ids: ProtoIds, cores: [String] }
 
 fn expand_derives(dx: DeriveCx, ds: [Decl], target_mod: String) : Expanded =
-  expand_derives_loop(dx, ds, target_mod, collect_binser_types(dx.ps, ds, false, []), [], [])
+  expand_derives_loop(dx, ds, target_mod, collect_binser_types(dx.ps, ds, false, []), [], [], [])
 
 # `writers` names every type deriving BinSerialize: a field of one of
 # them is encoded by its writer instead of a fresh `to_bytes` array.
-fn expand_derives_loop(dx: DeriveCx, ds: [Decl], target_mod: String, writers: [String], acc: [Decl], minted: [Decl]) : Expanded {
+fn expand_derives_loop(dx: DeriveCx, ds: [Decl], target_mod: String, writers: [String], acc: [Decl], minted: [Decl],
+                       rows: [NEnt]) : Expanded {
   match ds {
-    [] -> Expanded(list_reverse(acc), minted)
+    [] -> Expanded(list_reverse(acc), minted, rows)
     [d, ...rest] -> match d {
       DDerive(names, inner, l, c) -> {
         let home = decl_type_home(inner, target_mod)
-        let derived = map(derive_impls_for(dx, names, inner, home, writers),
-                          (dd) => stamp_derived_home(dd, home, l, c))
+        let dv = derive_impls_for(dx, names, inner, home, writers)
+        let derived = map(dv.decls, (dd) => stamp_derived_home(dd, home, l, c))
         expand_derives_loop(dx, rest, target_mod, writers,
                             list_append([inner, ...list_reverse(derived)], acc),
-                            list_append(derived, minted))
+                            list_append(derived, minted), list_append(dv.rows, rows))
       }
       DUnstable(inner, _, _) ->
-        expand_derives_loop(dx, [inner, ...rest], target_mod, writers, acc, minted)
+        expand_derives_loop(dx, [inner, ...rest], target_mod, writers, acc, minted, rows)
       # Every other wrapper stays: the `#[constructor]` registry is
       # collected in the typer, so unwrapping it would lose it.
-      _ -> expand_derives_loop(dx, rest, target_mod, writers, [d, ...acc], minted)
+      _ -> expand_derives_loop(dx, rest, target_mod, writers, [d, ...acc], minted, rows)
     }
   }
 }
@@ -1551,7 +1644,7 @@ fn strip_protocols_loop(ds: [Decl], acc: [Decl]) : [Decl] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
-      DProtocol(_, _, _, _, _, _, _, _) -> strip_protocols_loop(rest, acc)
+      DProtocol(_, _, _, _, _, _, _) -> strip_protocols_loop(rest, acc)
       DImpl(_, _, _, _, _, _, _, isym)     -> strip_protocols_loop(rest, acc)
       DDerive(_, _, _, _)      -> strip_protocols_loop(rest, acc)
       _ -> strip_protocols_loop(rest, [d, ...acc])
@@ -1566,22 +1659,28 @@ fn strip_protocols_loop(ds: [Decl], acc: [Decl]) : [Decl] {
 # the protocol's own ops on the inner fields, so the fields' types
 # must already implement the same protocol — checked transitively
 # by the typer / resolver after lowering.
-# `shown` is the name the user wrote: what a derived `show` prints and
-# what a synthesised shim is called, behind any home spelling.
+# `tsym` is the type, which a derived declaration refers to by id.
+# `tname` is the name the user wrote: what a derived `show` prints, and
+# the type piece of an impl symbol and of a synthesised shim's name.
 # `ids` and `homed` say how a derived body names a protocol operation:
 # its dispatcher, through its home unless a core module derives.
-type DerivedType = { tname: String, tps: [String], shown: String, body: TypeBody, writers: [String],
-                     ids: ProtoIds, homed: Bool }
+# `home` is the module the derived functions are declared in, and `tab`
+# names the constructors.
+type DerivedType = { tsym: SymId, tname: String, tps: [String], body: TypeBody, writers: [String],
+                     ids: ProtoIds, homed: Bool, home: String, tab: SymTab }
 
-fn derive_impls_for(dx: DeriveCx, names: [String], dt: Decl, home: Option[String], writers: [String]) : [Decl] {
+fn derive_impls_for(dx: DeriveCx, names: [String], dt: Decl, home: Option[String], writers: [String]) : Derived {
   match dt {
-    DType(_, tname, tps, body, line, col, _, _, _) ->
+    DType(_, tsym, tps, body, line, col, _, _) -> {
+      let tab = ps_tab(dx.ps)
       derive_impls_loop(dx.ps, home, names,
-                        DerivedType { tname: tname, tps: tps, shown: hs_display(tname, home),
+                        DerivedType { tsym: tsym, tname: ref_text(tab, DrSym(tsym)), tps: tps,
                                       body: body, writers: writers, ids: dx.ids,
-                                      homed: derive_homed(dx.cores, home) },
-                        line, col, [])
-    _ -> []
+                                      homed: derive_homed(dx.cores, home),
+                                      home: proto_home_name(home, ps_root(dx.ps)), tab: tab },
+                        line, col, derived_none())
+    }
+    _ -> derived_none()
   }
 }
 
@@ -1593,26 +1692,28 @@ fn derive_homed(cores: [String], home: Option[String]) : Bool = match home {
 }
 
 # The protocol an entry resolves to, from the type's file, picks the
-# generator; the impl keeps the spelling as written (`m.P`), which
-# resolves to that same protocol.
+# generator and heads the impl.
 fn derive_impls_loop(ps: PScope, home: Option[String], names: [String], dt: DerivedType,
-                     line: Int, col: Int, acc: [Decl]) : [Decl] {
+                     line: Int, col: Int, acc: Derived) : Derived {
   match names {
-    [] -> list_reverse(acc)
+    [] -> Derived { decls: list_reverse(acc.decls), rows: acc.rows }
     [pspell, ...rest] -> {
-      let generated = match derive_gen(ps, pspell, home) {
+      let dv = match derive_gen(ps, pspell, home) {
         Some(g) -> derive_impl_for_protocol(g, dt, line, col)
-        None    -> []
+        None    -> derived_none()
       }
-      let ds = map(generated,
-                   (dd) => derive_generalize(impl_with_pname(dd, pspell), pspell, dt.tname, dt.tps))
-      derive_impls_loop(ps, home, rest, dt, line, col, list_append(list_reverse(ds), acc))
+      let psym = ps_proto_sym(ps, pspell, home)
+      let ds = map(dv.decls,
+                   (dd) => derive_generalize(impl_with_proto(dd, psym), pspell, dt.tsym, dt.tps))
+      derive_impls_loop(ps, home, rest, dt, line, col,
+                        Derived { decls: list_append(list_reverse(ds), acc.decls),
+                                  rows: list_append(dv.rows, acc.rows) })
     }
   }
 }
 
-fn impl_with_pname(d: Decl, pspell: String) : Decl = match d {
-  DImpl(_, pargs, target, ms, l, c, tps, isym) -> DImpl(pspell, pargs, target, ms, l, c, tps, isym)
+fn impl_with_proto(d: Decl, psym: SymId) : Decl = match d {
+  DImpl(_, pargs, target, ms, l, c, tps, isym) -> DImpl(DrSym(psym), pargs, target, ms, l, c, tps, isym)
   _ -> d
 }
 
@@ -1623,15 +1724,15 @@ fn impl_with_pname(d: Decl, pspell: String) : Decl = match d {
 fn stamp_derived_home(d: Decl, mo: Option[String], al: Int, ac: Int) : Decl = match d {
   DImpl(p, pargs, target, ms, _, _, tps, isym) ->
     DImpl(p, pargs, target, map(ms, (m) => stamp_derived_home(m, mo, al, ac)), al, ac, tps, isym)
-  DFn(p, n, tps, ps, ret, row, body, l, c, _, fsym) ->
-    DFn(p, n, tps, ps, ret, row, body, l, c, mo, fsym)
+  DFn(p, fid, tps, ps, ret, row, body, l, c, _) ->
+    DFn(p, fid, tps, ps, ret, row, body, l, c, mo)
   _ -> d
 }
 
 # Root-file types are stamped with the target module; root fns are
 # not. The synthesised fns follow the fn convention.
 fn decl_type_home(d: Decl, target_mod: String) : Option[String] = match d {
-  DType(_, _, _, _, _, _, mo, _, _) -> match mo {
+  DType(_, _, _, _, _, _, mo, _) -> match mo {
     Some(m) -> proto_mo_of(m, target_mod)
     None    -> None
   }
@@ -1640,53 +1741,69 @@ fn decl_type_home(d: Decl, target_mod: String) : Option[String] = match d {
 
 # Synthesise zero or more decls for `#derive(P) type T = ...`. v1
 # supports `Show`, `Eq`, `Hash`, `Ord`, and `BinSerialize` on records
-# and sum types. The returned list is empty when the (P, body)
+# and sum types. Nothing is declared when the (P, body)
 # combination is unsupported (the resolver / typer surfaces that as
 # "no impl"). Most protocols return a single `DImpl`; `BinSerialize`
 # additionally returns a top-level `<tname>_from_bytes` shim because
 # v1 single-dispatch cannot route a return-type-only call (issue
 # #459 §"Two design routes" + the `Serialize` prologue in
 # `stdlib/protocols.kai`).
-fn derive_impl_for_protocol(g: CoreProto, dt: DerivedType, line: Int, col: Int) : [Decl] {
-  let tname = dt.tname
-  let shown = dt.shown
-  let body = dt.body
+fn derive_impl_for_protocol(g: CoreProto, dt: DerivedType, line: Int, col: Int) : Derived {
   match g {
-    CpShow         -> option_to_list(derive_show_impl(derive_op_ref(dt.ids, dt.homed, CpShow, "show"), tname, shown, body, line, col))
-    CpEq           -> option_to_list(derive_eq_impl(derive_op_ref(dt.ids, dt.homed, CpEq, "eq"), tname, body, line, col))
-    CpHash         -> option_to_list(derive_hash_impl(derive_op_ref(dt.ids, dt.homed, CpHash, "hash"), tname, body, line, col))
-    CpOrd          -> option_to_list(derive_ord_impl(derive_op_ref(dt.ids, dt.homed, CpOrd, "cmp"), tname, body, line, col))
-    CpBinSerialize -> derive_binserialize_impl(tname, shown, body, dt.writers, line, col)
-    CpLayout       -> derive_layout_impl(tname, shown, body, line, col)
-    CpJson         -> derive_json_impl(tname, shown, body, line, col)
-    _              -> []
+    CpShow         -> derive_show_impl(derive_op_ref(dt.ids, dt.homed, CpShow, "show"), dt, line, col)
+    CpEq           -> derive_eq_impl(derive_op_ref(dt.ids, dt.homed, CpEq, "eq"), dt, line, col)
+    CpHash         -> derive_hash_impl(derive_op_ref(dt.ids, dt.homed, CpHash, "hash"), dt, line, col)
+    CpOrd          -> derive_ord_impl(derive_op_ref(dt.ids, dt.homed, CpOrd, "cmp"), dt, line, col)
+    CpBinSerialize -> derive_binserialize_impl(dt, line, col)
+    CpLayout       -> {
+      let m = derive_layout_impl(dt.tsym, dt.tname, dt.home, dt.body, line, col)
+      Derived { decls: m.decls, rows: m.rows }
+    }
+    CpJson         -> {
+      let m = derive_json_impl(dt.tsym, dt.tname, dt.home, dt.body, line, col)
+      Derived { decls: m.decls, rows: m.rows }
+    }
+    _              -> derived_none()
   }
 }
 
-fn option_to_list(o: Option[Decl]) : [Decl] = match o {
-  None    -> []
-  Some(d) -> [d]
-}
+# The scope a derived impl's methods are declared in: one per protocol
+# and type of the module.
+fn derived_scope(dt: DerivedType, g: CoreProto) : String =
+  impl_scope_keyed(dt.home, concat_all(["derive ", core_proto_name(g), " ", dt.tname]))
 
-fn derive_show_impl(opk: ExprKind, tname: String, shown: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
-  match body {
+# The method `op` of the derived impl of `g`.
+fn derived_method(dt: DerivedType, g: CoreProto, op: String, params: [Param], ret: TypeExpr,
+                  body: Expr, line: Int, col: Int) : Decl =
+  DFn(false, fnid_decl(method_sym(op, derived_scope(dt, g))), [], params, Some(ret), REmpty, body, line, col, None)
+
+# The rows of the methods `ops` of the derived impl of `g`.
+fn derived_method_rows(dt: DerivedType, g: CoreProto, ops: [String]) : [NEnt] =
+  map(ops, (op) => method_ent(op, derived_scope(dt, g)))
+
+# The derived type as a derived declaration names it.
+fn derived_self_ty(dt: DerivedType, line: Int, col: Int) : TypeExpr =
+  mk_ty(TyName(DrSym(dt.tsym), []), line, col)
+
+fn derive_show_impl(opk: ExprKind, dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
     TBRecord(fields) -> {
-      let body_expr = derive_show_record_body(opk, shown, fields, line, col)
-      Some(make_derived_impl("Show", tname, "show",
-        [Param { pname: "x", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
+      let body_expr = derive_show_record_body(opk, dt.tname, fields, line, col)
+      make_derived_impl(CpShow, dt, "show",
+        [Param { binder: binder_written("x"), ptype: Some(derived_self_ty(dt, line, col)),
                  pline: line, pcol: col, pborrow: false }],
-        mk_ty(TyName(ty_ref_none(), "String", []), line, col),
-        body_expr, line, col))
+        mk_ty(TyName(ref_written("String"), []), line, col),
+        body_expr, line, col)
     }
     TBSum(variants) -> {
-      let body_expr = derive_show_sum_body(opk, variants, line, col)
-      Some(make_derived_impl("Show", tname, "show",
-        [Param { pname: "x", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
+      let body_expr = derive_show_sum_body(opk, dt.tab, variants, line, col)
+      make_derived_impl(CpShow, dt, "show",
+        [Param { binder: binder_written("x"), ptype: Some(derived_self_ty(dt, line, col)),
                  pline: line, pcol: col, pborrow: false }],
-        mk_ty(TyName(ty_ref_none(), "String", []), line, col),
-        body_expr, line, col))
+        mk_ty(TyName(ref_written("String"), []), line, col),
+        body_expr, line, col)
     }
-    _ -> None
+    _ -> derived_none()
   }
 }
 
@@ -1712,7 +1829,7 @@ fn derive_show_field_parts(opk: ExprKind, fields: [FieldDecl], line: Int, col: I
         let prefix_s = if first { concat_all(["\"", name, ": \""]) }
                        else { concat_all(["\", ", name, ": \""]) }
         let prefix = mk_expr(EStr(prefix_s, false), line, col)
-        let access = mk_expr(EField(mk_ref("x", line, col), name), line, col)
+        let access = mk_expr(EField(mk_name("x", line, col), name), line, col)
         let call = mk_expr(ECall(mk_expr(opk, line, col), [access]), line, col)
         list_append([prefix, call], derive_show_field_parts(opk, rest, line, col, false))
       }
@@ -1720,18 +1837,18 @@ fn derive_show_field_parts(opk: ExprKind, fields: [FieldDecl], line: Int, col: I
   }
 }
 
-fn derive_show_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) : Expr {
-  let scrut = mk_ref("x", line, col)
-  let arms = map(variants, (v) => derive_show_sum_arm(opk, v, line, col))
+fn derive_show_sum_body(opk: ExprKind, tab: SymTab, variants: [Variant], line: Int, col: Int) : Expr {
+  let scrut = mk_name("x", line, col)
+  let arms = map(variants, (v) => derive_show_sum_arm(opk, tab, v, line, col))
   mk_expr(EMatch(scrut, arms), line, col)
 }
 
-fn derive_show_sum_arm(opk: ExprKind, v: Variant, line: Int, col: Int) : Arm {
+fn derive_show_sum_arm(opk: ExprKind, tab: SymTab, v: Variant, line: Int, col: Int) : Arm {
   match v {
-    Var(name, vargs) -> {
+    Var(vsym, vargs) -> {
       let pat_subs = derive_sum_pat_subs(vargs, 0, line, col)
-      let pat = mk_pat(PVariant(None, name, pat_subs), line, col)
-      let body = derive_show_sum_arm_body(opk, name, vargs, line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), pat_subs), line, col)
+      let body = derive_show_sum_arm_body(opk, written_text(sym_name(tab, vsym)), vargs, line, col)
       Arm(pat, None, body)
     }
   }
@@ -1741,7 +1858,7 @@ fn derive_sum_pat_subs(vargs: [TypeExpr], i: Int, line: Int, col: Int) : [Patter
   match vargs {
     [] -> []
     [_, ...rest] ->
-      [mk_pat(PBind(concat_all(["a", int_to_string(i)])), line, col),
+      [mk_pat(PBind(binder_written(concat_all(["a", int_to_string(i)]))), line, col),
        ...derive_sum_pat_subs(rest, i + 1, line, col)]
   }
 }
@@ -1767,36 +1884,36 @@ fn derive_sum_arg_show_calls(opk: ExprKind, vargs: [TypeExpr], i: Int, line: Int
     [_, ...rest] -> {
       let prefix = if first { mk_expr(EStr("\"\"", false), line, col) }
                    else { mk_expr(EStr("\", \"", false), line, col) }
-      let av = mk_ref(concat_all(["a", int_to_string(i)]), line, col)
+      let av = mk_name(concat_all(["a", int_to_string(i)]), line, col)
       let call = mk_expr(ECall(mk_expr(opk, line, col), [av]), line, col)
       list_append([prefix, call], derive_sum_arg_show_calls(opk, rest, i + 1, line, col, false))
     }
   }
 }
 
-fn derive_eq_impl(opk: ExprKind, tname: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
-  match body {
+fn derive_eq_impl(opk: ExprKind, dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
     TBRecord(fields) -> {
       let body_expr = derive_eq_record_body(opk, fields, line, col)
-      Some(make_derived_impl("Eq", tname, "eq",
-        [Param { pname: "a", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
+      make_derived_impl(CpEq, dt, "eq",
+        [Param { binder: binder_written("a"), ptype: Some(derived_self_ty(dt, line, col)),
                  pline: line, pcol: col, pborrow: false },
-         Param { pname: "b", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
+         Param { binder: binder_written("b"), ptype: Some(derived_self_ty(dt, line, col)),
                  pline: line, pcol: col, pborrow: false }],
-        mk_ty(TyName(ty_ref_none(), "Bool", []), line, col),
-        body_expr, line, col))
+        mk_ty(TyName(ref_written("Bool"), []), line, col),
+        body_expr, line, col)
     }
     TBSum(variants) -> {
       let body_expr = derive_eq_sum_body(opk, variants, line, col)
-      Some(make_derived_impl("Eq", tname, "eq",
-        [Param { pname: "a", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
+      make_derived_impl(CpEq, dt, "eq",
+        [Param { binder: binder_written("a"), ptype: Some(derived_self_ty(dt, line, col)),
                  pline: line, pcol: col, pborrow: false },
-         Param { pname: "b", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
+         Param { binder: binder_written("b"), ptype: Some(derived_self_ty(dt, line, col)),
                  pline: line, pcol: col, pborrow: false }],
-        mk_ty(TyName(ty_ref_none(), "Bool", []), line, col),
-        body_expr, line, col))
+        mk_ty(TyName(ref_written("Bool"), []), line, col),
+        body_expr, line, col)
     }
-    _ -> None
+    _ -> derived_none()
   }
 }
 
@@ -1810,8 +1927,8 @@ fn derive_eq_record_body(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int
 fn derive_eq_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], line: Int, col: Int) : Expr {
   match head {
     FD(_, name, _, _) -> {
-      let l_access = mk_expr(EField(mk_ref("a", line, col), name), line, col)
-      let r_access = mk_expr(EField(mk_ref("b", line, col), name), line, col)
+      let l_access = mk_expr(EField(mk_name("a", line, col), name), line, col)
+      let r_access = mk_expr(EField(mk_name("b", line, col), name), line, col)
       let call = mk_expr(ECall(mk_expr(opk, line, col), [l_access, r_access]),
                          line, col)
       match rest {
@@ -1834,7 +1951,7 @@ fn derive_eq_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) :
   match variants {
     [] -> mk_expr(EBool(false), line, col)
     _  -> {
-      let scrut = mk_ref("a", line, col)
+      let scrut = mk_name("a", line, col)
       let arms = map(variants, (v) => derive_eq_sum_outer_arm(opk, v, line, col))
       mk_expr(EMatch(scrut, arms), line, col)
     }
@@ -1843,19 +1960,19 @@ fn derive_eq_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) :
 
 fn derive_eq_sum_outer_arm(opk: ExprKind, v: Variant, line: Int, col: Int) : Arm {
   match v {
-    Var(name, vargs) -> {
+    Var(vsym, vargs) -> {
       let pat_subs = derive_eq_sum_pat_subs("la_", vargs, 0, line, col)
-      let pat = mk_pat(PVariant(None, name, pat_subs), line, col)
-      let inner = derive_eq_sum_inner_match(opk, name, vargs, line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), pat_subs), line, col)
+      let inner = derive_eq_sum_inner_match(opk, vsym, vargs, line, col)
       Arm(pat, None, inner)
     }
   }
 }
 
-fn derive_eq_sum_inner_match(opk: ExprKind, name: String, vargs: [TypeExpr], line: Int, col: Int) : Expr {
-  let scrut = mk_ref("b", line, col)
+fn derive_eq_sum_inner_match(opk: ExprKind, vsym: SymId, vargs: [TypeExpr], line: Int, col: Int) : Expr {
+  let scrut = mk_name("b", line, col)
   let pat_subs = derive_eq_sum_pat_subs("lb_", vargs, 0, line, col)
-  let match_pat = mk_pat(PVariant(None, name, pat_subs), line, col)
+  let match_pat = mk_pat(PVariant(DrSym(vsym), pat_subs), line, col)
   let body = derive_eq_sum_field_chain(opk, vargs, 0, line, col)
   let arm_match = Arm(match_pat, None, body)
   let arm_wild  = Arm(mk_pat(PWild, line, col), None,
@@ -1868,7 +1985,7 @@ fn derive_eq_sum_pat_subs(prefix: String, vargs: [TypeExpr], i: Int,
   match vargs {
     [] -> []
     [_, ...rest] ->
-      [mk_pat(PBind(concat_all([prefix, int_to_string(i)])), line, col),
+      [mk_pat(PBind(binder_written(concat_all([prefix, int_to_string(i)]))), line, col),
        ...derive_eq_sum_pat_subs(prefix, rest, i + 1, line, col)]
   }
 }
@@ -1877,8 +1994,8 @@ fn derive_eq_sum_field_chain(opk: ExprKind, vargs: [TypeExpr], i: Int, line: Int
   match vargs {
     [] -> mk_expr(EBool(true), line, col)
     [_, ...rest] -> {
-      let l = mk_ref(concat_all(["la_", int_to_string(i)]), line, col)
-      let r = mk_ref(concat_all(["lb_", int_to_string(i)]), line, col)
+      let l = mk_name(concat_all(["la_", int_to_string(i)]), line, col)
+      let r = mk_name(concat_all(["lb_", int_to_string(i)]), line, col)
       let call = mk_expr(ECall(mk_expr(opk, line, col), [l, r]), line, col)
       match rest {
         [] -> call
@@ -1891,25 +2008,25 @@ fn derive_eq_sum_field_chain(opk: ExprKind, vargs: [TypeExpr], i: Int, line: Int
   }
 }
 
-fn derive_hash_impl(opk: ExprKind, tname: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
-  match body {
+fn derive_hash_impl(opk: ExprKind, dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
     TBRecord(fields) -> {
       let body_expr = derive_hash_record_body(opk, fields, line, col)
-      Some(make_derived_impl("Hash", tname, "hash",
-        [Param { pname: "x", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
+      make_derived_impl(CpHash, dt, "hash",
+        [Param { binder: binder_written("x"), ptype: Some(derived_self_ty(dt, line, col)),
                  pline: line, pcol: col, pborrow: false }],
-        mk_ty(TyName(ty_ref_none(), "Int", []), line, col),
-        body_expr, line, col))
+        mk_ty(TyName(ref_written("Int"), []), line, col),
+        body_expr, line, col)
     }
     TBSum(variants) -> {
       let body_expr = derive_hash_sum_body(opk, variants, line, col)
-      Some(make_derived_impl("Hash", tname, "hash",
-        [Param { pname: "x", ptype: Some(mk_ty(TyName(ty_ref_none(), tname, []), line, col)),
+      make_derived_impl(CpHash, dt, "hash",
+        [Param { binder: binder_written("x"), ptype: Some(derived_self_ty(dt, line, col)),
                  pline: line, pcol: col, pborrow: false }],
-        mk_ty(TyName(ty_ref_none(), "Int", []), line, col),
-        body_expr, line, col))
+        mk_ty(TyName(ref_written("Int"), []), line, col),
+        body_expr, line, col)
     }
-    _ -> None
+    _ -> derived_none()
   }
 }
 
@@ -1923,7 +2040,7 @@ fn derive_hash_record_body(opk: ExprKind, fields: [FieldDecl], line: Int, col: I
 fn derive_hash_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], line: Int, col: Int) : Expr {
   match head {
     FD(_, name, _, _) -> {
-      let access = mk_expr(EField(mk_ref("x", line, col), name), line, col)
+      let access = mk_expr(EField(mk_name("x", line, col), name), line, col)
       let call = mk_expr(ECall(mk_expr(opk, line, col), [access]), line, col)
       match rest {
         [] -> call
@@ -1946,7 +2063,7 @@ fn derive_hash_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int)
   match variants {
     [] -> mk_expr(mk_int_synth(0), line, col)
     _  -> {
-      let scrut = mk_ref("x", line, col)
+      let scrut = mk_name("x", line, col)
       let arms = derive_hash_sum_arms(opk, variants, 1, line, col)
       mk_expr(EMatch(scrut, arms), line, col)
     }
@@ -1964,9 +2081,9 @@ fn derive_hash_sum_arms(opk: ExprKind, vs: [Variant], tag: Int, line: Int, col: 
 
 fn derive_hash_sum_arm(opk: ExprKind, v: Variant, tag: Int, line: Int, col: Int) : Arm {
   match v {
-    Var(name, vargs) -> {
+    Var(vsym, vargs) -> {
       let pat_subs = derive_eq_sum_pat_subs("h_", vargs, 0, line, col)
-      let pat = mk_pat(PVariant(None, name, pat_subs), line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), pat_subs), line, col)
       let body = derive_hash_sum_arm_body(opk, vargs, tag, line, col)
       Arm(pat, None, body)
     }
@@ -1983,7 +2100,7 @@ fn derive_hash_sum_chain(opk: ExprKind, acc: Expr, vargs: [TypeExpr], i: Int,
   match vargs {
     [] -> acc
     [_, ...rest] -> {
-      let v = mk_ref(concat_all(["h_", int_to_string(i)]), line, col)
+      let v = mk_name(concat_all(["h_", int_to_string(i)]), line, col)
       let h = mk_expr(ECall(mk_expr(opk, line, col), [v]), line, col)
       let mul = mk_expr(EBinop(BoMul, acc, mk_expr(mk_int_synth(31), line, col)), line, col)
       let next = mk_expr(EBinop(BoAdd, mul, h), line, col)
@@ -2008,32 +2125,31 @@ fn derive_hash_sum_chain(opk: ExprKind, acc: Expr, vargs: [TypeExpr], i: Int,
 # `Ord` impl — naming the missing call site in the diagnostic.
 # `min` and `max` only call the just-synthesised `cmp`, so they
 # carry no extra requirement on sub-types.
-fn derive_ord_impl(opk: ExprKind, tname: String, body: TypeBody, line: Int, col: Int) : Option[Decl] {
-  match body {
+fn derive_ord_impl(opk: ExprKind, dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
     TBRecord(fields) ->
-      Some(derive_ord_make_impl(opk, tname, derive_ord_record_body(opk, fields, line, col), line, col))
+      derive_ord_make_impl(opk, dt, derive_ord_record_body(opk, fields, line, col), line, col)
     TBSum(variants) ->
-      Some(derive_ord_make_impl(opk, tname, derive_ord_sum_body(opk, variants, line, col), line, col))
-    _ -> None
+      derive_ord_make_impl(opk, dt, derive_ord_sum_body(opk, variants, line, col), line, col)
+    _ -> derived_none()
   }
 }
 
 # Build the three-method `impl Ord for T` given a ready-to-use `cmp`
 # body expression. Factored out so the record / sum arms above share
 # the impl assembly, and so `min` / `max` are produced in one place.
-fn derive_ord_make_impl(opk: ExprKind, tname: String, cmp_body: Expr, line: Int, col: Int) : Decl {
-  let self_ty = mk_ty(TyName(ty_ref_none(), tname, []), line, col)
-  let int_ty = mk_ty(TyName(ty_ref_none(), "Int", []), line, col)
+fn derive_ord_make_impl(opk: ExprKind, dt: DerivedType, cmp_body: Expr, line: Int, col: Int) : Derived {
+  let self_ty = derived_self_ty(dt, line, col)
+  let int_ty = mk_ty(TyName(ref_written("Int"), []), line, col)
   let params2 = [
-    Param { pname: "a", ptype: Some(self_ty), pline: line, pcol: col, pborrow: false },
-    Param { pname: "b", ptype: Some(self_ty), pline: line, pcol: col, pborrow: false }
+    Param { binder: binder_written("a"), ptype: Some(self_ty), pline: line, pcol: col, pborrow: false },
+    Param { binder: binder_written("b"), ptype: Some(self_ty), pline: line, pcol: col, pborrow: false }
   ]
-  let cmp_method = DFn(false, "cmp", [], params2, Some(int_ty), REmpty,
-                          cmp_body, line, col, None, fnid_none())
+  let cmp_method = derived_method(dt, CpOrd, "cmp", params2, int_ty, cmp_body, line, col)
   # Body of min: `if cmp(a, b) <= 0 { a } else { b }`.
   # Body of max: `if cmp(a, b) >= 0 { a } else { b }`.
-  let a_var = mk_ref("a", line, col)
-  let b_var = mk_ref("b", line, col)
+  let a_var = mk_name("a", line, col)
+  let b_var = mk_name("b", line, col)
   let zero = mk_expr(mk_int_synth(0), line, col)
   let cmp_call_min = mk_expr(ECall(mk_expr(opk, line, col),
                                        [a_var, b_var]), line, col)
@@ -2045,11 +2161,11 @@ fn derive_ord_make_impl(opk: ExprKind, tname: String, cmp_body: Expr, line: Int,
   let max_body = mk_expr(EIf(
     mk_expr(EBinop(BoGe, cmp_call_max, zero), line, col),
     a_var, Some(b_var)), line, col)
-  let min_method = DFn(false, "min", [], params2, Some(self_ty), REmpty,
-                          min_body, line, col, None, fnid_none())
-  let max_method = DFn(false, "max", [], params2, Some(self_ty), REmpty,
-                          max_body, line, col, None, fnid_none())
-  DImpl("Ord", [], self_ty, [cmp_method, min_method, max_method], line, col, [], sym_none())
+  let min_method = derived_method(dt, CpOrd, "min", params2, self_ty, min_body, line, col)
+  let max_method = derived_method(dt, CpOrd, "max", params2, self_ty, max_body, line, col)
+  Derived { decls: [DImpl(DrSym(core_proto_id(CpOrd)), [], self_ty, [cmp_method, min_method, max_method],
+                          line, col, [], sym_none())],
+            rows: derived_method_rows(dt, CpOrd, ["cmp", "min", "max"]) }
 }
 
 fn derive_ord_record_body(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int) : Expr {
@@ -2063,8 +2179,8 @@ fn derive_ord_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], id
                             line: Int, col: Int) : Expr {
   match head {
     FD(_, name, _, _) -> {
-      let l_access = mk_expr(EField(mk_ref("a", line, col), name), line, col)
-      let r_access = mk_expr(EField(mk_ref("b", line, col), name), line, col)
+      let l_access = mk_expr(EField(mk_name("a", line, col), name), line, col)
+      let r_access = mk_expr(EField(mk_name("b", line, col), name), line, col)
       let cmp_call = mk_expr(ECall(mk_expr(opk, line, col),
                                     [l_access, r_access]),
                              line, col)
@@ -2072,12 +2188,12 @@ fn derive_ord_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], id
         [] -> cmp_call
         [next, ...more] -> {
           let cvar = concat_all(["c", int_to_string(idx)])
-          let pat = mk_pat(PBind(cvar), line, col)
+          let pat = mk_pat(PBind(binder_written(cvar)), line, col)
           let let_stmt = SLet(pat, None, cmp_call)
-          let cond = mk_expr(EBinop(BoNe, mk_ref(cvar, line, col),
+          let cond = mk_expr(EBinop(BoNe, mk_name(cvar, line, col),
                                           mk_expr(mk_int_synth(0), line, col)),
                              line, col)
-          let then_e = mk_ref(cvar, line, col)
+          let then_e = mk_name(cvar, line, col)
           let else_e = derive_ord_record_chain(opk, next, more, idx + 1, line, col)
           let if_e = mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
           mk_expr(EBlock([let_stmt], Some(if_e)), line, col)
@@ -2088,7 +2204,7 @@ fn derive_ord_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], id
 }
 
 fn derive_ord_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) : Expr {
-  let scrut = mk_ref("a", line, col)
+  let scrut = mk_name("a", line, col)
   let arms = derive_ord_sum_outer_arms(opk, variants, variants, 0, line, col)
   mk_expr(EMatch(scrut, arms), line, col)
 }
@@ -2107,9 +2223,9 @@ fn derive_ord_sum_outer_arms(opk: ExprKind, remaining: [Variant], all_variants: 
 fn derive_ord_sum_outer_arm(opk: ExprKind, outer_v: Variant, all_variants: [Variant],
                              outer_idx: Int, line: Int, col: Int) : Arm {
   match outer_v {
-    Var(name, vargs) -> {
+    Var(vsym, vargs) -> {
       let outer_pat_subs = derive_ord_sum_pat_subs(vargs, "a", 0, line, col)
-      let outer_pat = mk_pat(PVariant(None, name, outer_pat_subs), line, col)
+      let outer_pat = mk_pat(PVariant(DrSym(vsym), outer_pat_subs), line, col)
       let inner = derive_ord_sum_inner_match(opk, outer_v, outer_idx,
                                               all_variants, line, col)
       Arm(outer_pat, None, inner)
@@ -2124,14 +2240,14 @@ fn derive_ord_sum_pat_subs(vargs: [TypeExpr], prefix: String, i: Int,
   match vargs {
     [] -> []
     [_, ...rest] ->
-      [mk_pat(PBind(concat_all([prefix, int_to_string(i)])), line, col),
+      [mk_pat(PBind(binder_written(concat_all([prefix, int_to_string(i)]))), line, col),
        ...derive_ord_sum_pat_subs(rest, prefix, i + 1, line, col)]
   }
 }
 
 fn derive_ord_sum_inner_match(opk: ExprKind, outer_v: Variant, outer_idx: Int,
                                all_variants: [Variant], line: Int, col: Int) : Expr {
-  let scrut = mk_ref("b", line, col)
+  let scrut = mk_name("b", line, col)
   let arms = derive_ord_sum_inner_arms(opk, outer_v, outer_idx, all_variants,
                                         0, line, col)
   mk_expr(EMatch(scrut, arms), line, col)
@@ -2176,9 +2292,9 @@ fn derive_ord_sum_inner_arms(opk: ExprKind, outer_v: Variant, outer_idx: Int,
 # side of the outer-vs-inner comparison.
 fn derive_ord_sum_wild_arm(v: Variant, ret: Int, line: Int, col: Int) : Arm {
   match v {
-    Var(name, vargs) -> {
+    Var(vsym, vargs) -> {
       let pats = derive_ord_sum_wild_pats(vargs, line, col)
-      let pat = mk_pat(PVariant(None, name, pats), line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), pats), line, col)
       Arm(pat, None, mk_expr(mk_int_synth(ret), line, col))
     }
   }
@@ -2203,9 +2319,9 @@ fn derive_ord_sum_default_arm(ret: Int, line: Int, col: Int) : Arm {
 # first non-zero `cmp` wins.
 fn derive_ord_sum_self_arm(opk: ExprKind, v: Variant, line: Int, col: Int) : Arm {
   match v {
-    Var(name, vargs) -> {
+    Var(vsym, vargs) -> {
       let inner_pat_subs = derive_ord_sum_pat_subs(vargs, "b", 0, line, col)
-      let pat = mk_pat(PVariant(None, name, inner_pat_subs), line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), inner_pat_subs), line, col)
       let body = derive_ord_payload_chain(opk, vargs, 0, line, col)
       Arm(pat, None, body)
     }
@@ -2217,20 +2333,20 @@ fn derive_ord_payload_chain(opk: ExprKind, vargs: [TypeExpr], idx: Int,
   match vargs {
     [] -> mk_expr(mk_int_synth(0), line, col)
     [_, ...rest] -> {
-      let av = mk_ref(concat_all(["a", int_to_string(idx)]), line, col)
-      let bv = mk_ref(concat_all(["b", int_to_string(idx)]), line, col)
+      let av = mk_name(concat_all(["a", int_to_string(idx)]), line, col)
+      let bv = mk_name(concat_all(["b", int_to_string(idx)]), line, col)
       let cmp_call = mk_expr(ECall(mk_expr(opk, line, col), [av, bv]),
                              line, col)
       match rest {
         [] -> cmp_call
         _  -> {
           let cvar = concat_all(["p", int_to_string(idx)])
-          let pat = mk_pat(PBind(cvar), line, col)
+          let pat = mk_pat(PBind(binder_written(cvar)), line, col)
           let let_stmt = SLet(pat, None, cmp_call)
-          let cond = mk_expr(EBinop(BoNe, mk_ref(cvar, line, col),
+          let cond = mk_expr(EBinop(BoNe, mk_name(cvar, line, col),
                                           mk_expr(mk_int_synth(0), line, col)),
                              line, col)
-          let then_e = mk_ref(cvar, line, col)
+          let then_e = mk_name(cvar, line, col)
           let else_e = derive_ord_payload_chain(opk, rest, idx + 1, line, col)
           let if_e = mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
           mk_expr(EBlock([let_stmt], Some(if_e)), line, col)
@@ -2240,11 +2356,12 @@ fn derive_ord_payload_chain(opk: ExprKind, vargs: [TypeExpr], idx: Int,
   }
 }
 
-fn make_derived_impl(pname: String, tname: String, opname: String,
+fn make_derived_impl(g: CoreProto, dt: DerivedType, opname: String,
                       params: [Param], ret: TypeExpr, body: Expr,
-                      line: Int, col: Int) : Decl {
-  let method = DFn(false, opname, [], params, Some(ret), REmpty, body, line, col, None, fnid_none())
-  DImpl(pname, [], mk_ty(TyName(ty_ref_none(), tname, []), line, col), [method], line, col, [], sym_none())
+                      line: Int, col: Int) : Derived {
+  let method = derived_method(dt, g, opname, params, ret, body, line, col)
+  Derived { decls: [DImpl(DrSym(core_proto_id(g)), [], derived_self_ty(dt, line, col), [method], line, col, [], sym_none())],
+            rows: derived_method_rows(dt, g, [opname]) }
 }
 
 # `#[derive(BinSerialize)]` for records and sum types: the impl, the
@@ -2252,54 +2369,56 @@ fn make_derived_impl(pname: String, tname: String, opname: String,
 # Decoding calls `__pimpl_BinSerialize_<Head>_from_bytes` directly:
 # single dispatch picks the impl from the first argument, which for
 # `from_bytes(buf, pos)` is the buffer.
-fn derive_binserialize_impl(tname: String, shown: String, body: TypeBody,
-                              writers: [String], line: Int, col: Int) : [Decl] {
-  match body {
+fn derive_binserialize_impl(dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
     TBRecord(fields) -> {
-      let put = derive_binser_put_record(mk_ref("buf", line, col), fields, 0, writers, line, col)
-      let from_b = derive_binser_record_from_bytes(tname, fields, line, col)
-      derive_binser_decls(tname, shown, put, from_b, line, col)
+      let put = derive_binser_put_record(dt.tab, mk_name("buf", line, col), fields, 0, dt.writers, line, col)
+      let from_b = derive_binser_record_from_bytes(dt.tab, dt.tsym, fields, line, col)
+      derive_binser_decls(dt, put, from_b, line, col)
     }
     TBSum(variants) -> {
-      let put = derive_binser_put_sum(variants, writers, line, col)
-      let from_b = derive_binser_sum_from_bytes(tname, variants, line, col)
-      derive_binser_decls(tname, shown, put, from_b, line, col)
+      let put = derive_binser_put_sum(dt.tab, variants, dt.writers, line, col)
+      let from_b = derive_binser_sum_from_bytes(dt.tab, dt.tname, variants, line, col)
+      derive_binser_decls(dt, put, from_b, line, col)
     }
-    _ -> []
+    _ -> derived_none()
   }
 }
 
-fn derive_binser_decls(tname: String, shown: String, put: Expr, from_b: Expr,
-                        line: Int, col: Int) : [Decl] =
-  [make_binser_impl(tname, derive_binser_to_bytes(tname, line, col), from_b, line, col),
-   derive_binser_put_fn(tname, put, line, col),
-   derive_binser_shim(tname, shown, line, col)]
+fn derive_binser_decls(dt: DerivedType, put: Expr, from_b: Expr,
+                        line: Int, col: Int) : Derived =
+  Derived { decls: [make_binser_impl(dt, derive_binser_to_bytes(dt.tname, line, col), from_b, line, col),
+                    derive_binser_put_fn(dt, put, line, col),
+                    derive_binser_shim(dt, line, col)],
+            rows: list_append(derived_method_rows(dt, CpBinSerialize, ["to_bytes", "from_bytes"]),
+                              [NEnt(NCFn, binser_put_name(dt.tname), dt.home, false),
+                               NEnt(NCFn, binser_shim_name(dt.tname), dt.home, true)]) }
 
 # `bin_buf_bytes(<writer>(bin_buf_new(), self))`: the writer over a fresh
 # buffer. The masking pass keeps this pure because a derived writer
 # mutates only its buffer (`writes_only_first_arg`).
 fn derive_binser_to_bytes(tname: String, line: Int, col: Int) : Expr {
   let fresh = binser_lib("bin_buf_new", [], line, col)
-  let put = binser_call(binser_put_name(tname), [fresh, mk_ref("self", line, col)], line, col)
+  let put = binser_call(binser_put_name(tname), [fresh, mk_name("self", line, col)], line, col)
   binser_lib("bin_buf_bytes", [put], line, col)
 }
 
 # `fn <writer>(buf: BinBuf, self: T) : BinBuf / Mutable` appends `self`
 # to `buf`. Nested derived values are written into the same buffer, so
 # encoding a recursive value is linear in its size.
-fn derive_binser_put_fn(tname: String, body: Expr, line: Int, col: Int) : Decl {
-  let buf_ty = mk_ty(TyName(ty_ref_none(), "BinBuf", []), line, col)
-  let self_ty = mk_ty(TyName(ty_ref_none(), tname, []), line, col)
-  let params = [Param { pname: "buf", ptype: Some(buf_ty), pline: line, pcol: col, pborrow: false },
-                Param { pname: "self", ptype: Some(self_ty), pline: line, pcol: col, pborrow: false }]
-  DFn(false, binser_put_name(tname), [], params, Some(buf_ty),
-      RClosed([core_effect_row_label(CeMutable)]), body, line, col, None, fnid_none())
+fn derive_binser_put_fn(dt: DerivedType, body: Expr, line: Int, col: Int) : Decl {
+  let buf_ty = mk_ty(TyName(ref_written("BinBuf"), []), line, col)
+  let self_ty = derived_self_ty(dt, line, col)
+  let params = [Param { binder: binder_written("buf"), ptype: Some(buf_ty), pline: line, pcol: col, pborrow: false },
+                Param { binder: binder_written("self"), ptype: Some(self_ty), pline: line, pcol: col, pborrow: false }]
+  DFn(false, fnid_decl(sym_derive(NCFn, binser_put_name(dt.tname), dt.home)), [], params, Some(buf_ty),
+      RClosed([core_effect_row_label(CeMutable)]), body, line, col, None)
 }
 
 fn binser_put_name(tname: String) : String = concat_all([derived_writer_prefix(), tname])
 
 fn binser_call(name: String, args: [Expr], line: Int, col: Int) : Expr =
-  mk_expr(ECall(mk_ref(name, line, col), args), line, col)
+  mk_expr(ECall(mk_name(name, line, col), args), line, col)
 
 # A call of a function the core module of `BinSerialize` declares.
 fn binser_lib(name: String, args: [Expr], line: Int, col: Int) : Expr =
@@ -2313,25 +2432,23 @@ fn binser_lib(name: String, args: [Expr], line: Int, col: Int) : Expr =
 # primitive after Lane 4 + PR #476; the previous `Byte = Int`
 # transparent alias is gone. `byte_to_int` / `int_to_byte` are the
 # explicit conversions when interoperating with `Int` data.
-fn make_binser_impl(tname: String, to_b: Expr, from_b: Expr,
+fn make_binser_impl(dt: DerivedType, to_b: Expr, from_b: Expr,
                      line: Int, col: Int) : Decl {
-  let self_ty = mk_ty(TyName(ty_ref_none(), tname, []), line, col)
-  let byte_arr = mk_ty(TyName(ty_ref_none(), "Array", [mk_ty(TyName(ty_ref_none(), "Byte", []), line, col)]), line, col)
-  let int_ty = mk_ty(TyName(ty_ref_none(), "Int", []), line, col)
-  let str_ty = mk_ty(TyName(ty_ref_none(), "String", []), line, col)
-  let cur_ty = mk_ty(TyName(ty_ref_none(), "BinCursor", [self_ty]), line, col)
-  let res_ty = mk_ty(TyName(ty_ref_none(), "Result", [cur_ty, str_ty]), line, col)
-  let to_params = [Param { pname: "self", ptype: Some(self_ty),
+  let self_ty = derived_self_ty(dt, line, col)
+  let byte_arr = mk_ty(TyName(ref_written("Array"), [mk_ty(TyName(ref_written("Byte"), []), line, col)]), line, col)
+  let int_ty = mk_ty(TyName(ref_written("Int"), []), line, col)
+  let str_ty = mk_ty(TyName(ref_written("String"), []), line, col)
+  let cur_ty = mk_ty(TyName(ref_written("BinCursor"), [self_ty]), line, col)
+  let res_ty = mk_ty(TyName(ref_written("Result"), [cur_ty, str_ty]), line, col)
+  let to_params = [Param { binder: binder_written("self"), ptype: Some(self_ty),
                             pline: line, pcol: col, pborrow: false }]
-  let from_params = [Param { pname: "buf", ptype: Some(byte_arr),
+  let from_params = [Param { binder: binder_written("buf"), ptype: Some(byte_arr),
                               pline: line, pcol: col, pborrow: false },
-                     Param { pname: "pos", ptype: Some(int_ty),
+                     Param { binder: binder_written("pos"), ptype: Some(int_ty),
                               pline: line, pcol: col, pborrow: false }]
-  let to_method = DFn(false, "to_bytes", [], to_params, Some(byte_arr),
-                      REmpty, to_b, line, col, None, fnid_none())
-  let from_method = DFn(false, "from_bytes", [], from_params, Some(res_ty),
-                        REmpty, from_b, line, col, None, fnid_none())
-  DImpl("BinSerialize", [], self_ty, [to_method, from_method], line, col, [], sym_none())
+  let to_method = derived_method(dt, CpBinSerialize, "to_bytes", to_params, byte_arr, to_b, line, col)
+  let from_method = derived_method(dt, CpBinSerialize, "from_bytes", from_params, res_ty, from_b, line, col)
+  DImpl(DrSym(core_proto_id(CpBinSerialize)), [], self_ty, [to_method, from_method], line, col, [], sym_none())
 }
 
 # `fn <lower(tname)>_from_bytes(buf: Array[Byte], pos: Int)
@@ -2339,25 +2456,27 @@ fn make_binser_impl(tname: String, to_b: Expr, from_b: Expr,
 # wrapping the mangled per-impl name. The shim decouples the user's
 # call site from the dispatcher's first-arg constraint and gives the
 # diagnostic stack a stable function name when the decode fails.
-fn derive_binser_shim(tname: String, shown: String, line: Int, col: Int) : Decl {
-  let self_ty = mk_ty(TyName(ty_ref_none(), tname, []), line, col)
-  let byte_arr = mk_ty(TyName(ty_ref_none(), "Array", [mk_ty(TyName(ty_ref_none(), "Byte", []), line, col)]), line, col)
-  let int_ty = mk_ty(TyName(ty_ref_none(), "Int", []), line, col)
-  let str_ty = mk_ty(TyName(ty_ref_none(), "String", []), line, col)
-  let cur_ty = mk_ty(TyName(ty_ref_none(), "BinCursor", [self_ty]), line, col)
-  let res_ty = mk_ty(TyName(ty_ref_none(), "Result", [cur_ty, str_ty]), line, col)
-  let params = [Param { pname: "buf", ptype: Some(byte_arr),
+fn derive_binser_shim(dt: DerivedType, line: Int, col: Int) : Decl {
+  let self_ty = derived_self_ty(dt, line, col)
+  let byte_arr = mk_ty(TyName(ref_written("Array"), [mk_ty(TyName(ref_written("Byte"), []), line, col)]), line, col)
+  let int_ty = mk_ty(TyName(ref_written("Int"), []), line, col)
+  let str_ty = mk_ty(TyName(ref_written("String"), []), line, col)
+  let cur_ty = mk_ty(TyName(ref_written("BinCursor"), [self_ty]), line, col)
+  let res_ty = mk_ty(TyName(ref_written("Result"), [cur_ty, str_ty]), line, col)
+  let params = [Param { binder: binder_written("buf"), ptype: Some(byte_arr),
                          pline: line, pcol: col, pborrow: false },
-                Param { pname: "pos", ptype: Some(int_ty),
+                Param { binder: binder_written("pos"), ptype: Some(int_ty),
                          pline: line, pcol: col, pborrow: false }]
-  let mangled = proto_mangled_fn("BinSerialize", tname, "from_bytes")
-  let body = mk_expr(ECall(mk_ref(mangled, line, col),
-                            [mk_ref("buf", line, col),
-                             mk_ref("pos", line, col)]),
+  let mangled = proto_mangled_fn("BinSerialize", dt.tname, "from_bytes")
+  let body = mk_expr(ECall(mk_name(mangled, line, col),
+                            [mk_name("buf", line, col),
+                             mk_name("pos", line, col)]),
                      line, col)
-  DFn(true, concat_all([string_to_lower_ascii(shown), "_from_bytes"]),
-      [], params, Some(res_ty), REmpty, body, line, col, None, fnid_none())
+  DFn(true, fnid_decl(sym_derive(NCFn, binser_shim_name(dt.tname), dt.home)),
+      [], params, Some(res_ty), REmpty, body, line, col, None)
 }
+
+fn binser_shim_name(tname: String) : String = concat_all([string_to_lower_ascii(tname), "_from_bytes"])
 
 # Lowercase every ASCII byte of `tname` so the shim name
 # (`<lower(tname)>_from_bytes`) is a valid all-lowercase identifier
@@ -2395,26 +2514,26 @@ fn string_to_lower_ascii_loop(s: String, i: Int, n: Int, acc: String) : String =
 # only has the type's position, so every synthesised lambda gets its own
 # column: 16 per field (callers), 8 per nesting depth, and offsets 1 / 5
 # for writer / decoder lambdas.
-fn derive_binser_put(acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
+fn derive_binser_put(tab: SymTab, acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
                       line: Int, col: Int) : Expr =
-  derive_binser_put_at(acc, v, ftype, writers, line, col, 0)
+  derive_binser_put_at(tab, acc, v, ftype, writers, line, col, 0)
 
-fn derive_binser_put_at(acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
+fn derive_binser_put_at(tab: SymTab, acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
                          line: Int, col: Int, depth: Int) : Expr {
   match ftype.tkind {
-    TyList(elem) -> derive_binser_put_via("bin_buf_put_list", acc, v, elem, writers, line, col, depth)
+    TyList(elem) -> derive_binser_put_via(tab, "bin_buf_put_list", acc, v, elem, writers, line, col, depth)
     _ -> match binser_option_elem(ftype) {
-      Some(elem) -> derive_binser_put_via("bin_buf_put_option", acc, v, elem, writers, line, col, depth)
-      None       -> derive_binser_put_leaf(acc, v, ftype, writers, line, col)
+      Some(elem) -> derive_binser_put_via(tab, "bin_buf_put_option", acc, v, elem, writers, line, col, depth)
+      None       -> derive_binser_put_leaf(tab, acc, v, ftype, writers, line, col)
     }
   }
 }
 
 # The element of a written `Option[elem]`.
 fn binser_option_elem(ftype: TypeExpr) : Option[TypeExpr] = match ftype.tkind {
-  TyName(_, _, [elem]) -> match resolve_ty(ftype) {
-    TyCon(_, _, _, s) -> if core_ty_is(s, CtOption) { Some(elem) } else { None }
-    _                 -> None
+  TyName(_, [elem]) -> match resolve_ty(ftype) {
+    TyCon(s, _) -> if core_ty_is(s, CtOption) { Some(elem) } else { None }
+    _           -> None
   }
   _ -> None
 }
@@ -2427,12 +2546,12 @@ fn binser_leaf_ty(t: Ty) : Ty = match t {
 }
 
 # `<comb>(acc, v, (__bw, __bx) => <write __bx of type elem into __bw>)`.
-fn derive_binser_put_via(comb: String, acc: Expr, v: Expr, elem: TypeExpr, writers: [String],
+fn derive_binser_put_via(tab: SymTab, comb: String, acc: Expr, v: Expr, elem: TypeExpr, writers: [String],
                           line: Int, col: Int, depth: Int) : Expr {
   let lcol = col + depth * 8 + 1
-  let bw = Param { pname: "__bw", ptype: None, pline: line, pcol: lcol, pborrow: false }
-  let bx = Param { pname: "__bx", ptype: None, pline: line, pcol: lcol, pborrow: false }
-  let body = derive_binser_put_at(mk_ref("__bw", line, lcol), mk_ref("__bx", line, lcol),
+  let bw = Param { binder: binder_written("__bw"), ptype: None, pline: line, pcol: lcol, pborrow: false }
+  let bx = Param { binder: binder_written("__bx"), ptype: None, pline: line, pcol: lcol, pborrow: false }
+  let body = derive_binser_put_at(tab, mk_name("__bw", line, lcol), mk_name("__bx", line, lcol),
                                   elem, writers, line, col, depth + 1)
   binser_lib(comb, [acc, v, mk_expr(ELambda([bw, bx], body), line, lcol)], line, col)
 }
@@ -2441,9 +2560,9 @@ fn derive_binser_put_via(comb: String, acc: Expr, v: Expr, elem: TypeExpr, write
 # appends its mangled per-type encoder, not the `to_bytes` dispatcher:
 # inside a combinator's lambda the monomorpher does not carry the
 # instantiated type to the dispatcher call.
-fn derive_binser_put_leaf(acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
+fn derive_binser_put_leaf(tab: SymTab, acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
                            line: Int, col: Int) : Expr {
-  let head = proto_type_name(ftype)
+  let head = proto_type_name(tab, ftype)
   if list_has(writers, head) {
     binser_call(binser_put_name(head), [acc, v], line, col)
   } else {
@@ -2466,33 +2585,33 @@ fn binser_prim_writer(leaf: Ty) : Option[String] = match leaf {
   _        -> None
 }
 
-fn derive_binser_decode_call(buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
+fn derive_binser_decode_call(tab: SymTab, buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
                                line: Int, col: Int) : Expr =
-  derive_binser_decode_call_at(buf_e, pos_e, ftype, line, col, 0)
+  derive_binser_decode_call_at(tab, buf_e, pos_e, ftype, line, col, 0)
 
-fn derive_binser_decode_call_at(buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
+fn derive_binser_decode_call_at(tab: SymTab, buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
                                   line: Int, col: Int, depth: Int) : Expr {
   match ftype.tkind {
     TyList(elem) -> {
       let lcol = col + depth * 8 + 5
-      let bparam = Param { pname: "__bb", ptype: None, pline: line, pcol: lcol, pborrow: false }
-      let pparam = Param { pname: "__bp", ptype: None, pline: line, pcol: lcol, pborrow: false }
-      let bvar = mk_ref("__bb", line, lcol)
-      let pvar = mk_ref("__bp", line, lcol)
-      let body = derive_binser_decode_call_at(bvar, pvar, elem, line, col,
+      let bparam = Param { binder: binder_written("__bb"), ptype: None, pline: line, pcol: lcol, pborrow: false }
+      let pparam = Param { binder: binder_written("__bp"), ptype: None, pline: line, pcol: lcol, pborrow: false }
+      let bvar = mk_name("__bb", line, lcol)
+      let pvar = mk_name("__bp", line, lcol)
+      let body = derive_binser_decode_call_at(tab, bvar, pvar, elem, line, col,
                                                 depth + 1)
       let dec_lam = mk_expr(ELambda([bparam, pparam], body), line, lcol)
       mk_expr(ECall(derive_lib_ref(CmProtocols, "bin_list_from_bytes", line, col),
                     [buf_e, pos_e, dec_lam]), line, col)
     }
-    TyName(_, _, _) -> match binser_option_elem(ftype) {
+    TyName(_, _) -> match binser_option_elem(ftype) {
       Some(elem) -> {
         let lcol = col + depth * 8 + 5
-        let bparam = Param { pname: "__bb", ptype: None, pline: line, pcol: lcol, pborrow: false }
-        let pparam = Param { pname: "__bp", ptype: None, pline: line, pcol: lcol, pborrow: false }
-        let bvar = mk_ref("__bb", line, lcol)
-        let pvar = mk_ref("__bp", line, lcol)
-        let body = derive_binser_decode_call_at(bvar, pvar, elem, line, col,
+        let bparam = Param { binder: binder_written("__bb"), ptype: None, pline: line, pcol: lcol, pborrow: false }
+        let pparam = Param { binder: binder_written("__bp"), ptype: None, pline: line, pcol: lcol, pborrow: false }
+        let bvar = mk_name("__bb", line, lcol)
+        let pvar = mk_name("__bp", line, lcol)
+        let body = derive_binser_decode_call_at(tab, bvar, pvar, elem, line, col,
                                                   depth + 1)
         let dec_lam = mk_expr(ELambda([bparam, pparam], body), line, lcol)
         mk_expr(ECall(derive_lib_ref(CmProtocols, "bin_option_from_bytes", line, col),
@@ -2501,32 +2620,32 @@ fn derive_binser_decode_call_at(buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
       None -> match resolve_ty(ftype) {
         TyChar -> mk_expr(ECall(derive_lib_ref(CmProtocols, "bin_char_from_bytes", line, col),
                                 [buf_e, pos_e]), line, col)
-        _      -> derive_binser_decode_mangled(buf_e, pos_e, ftype, line, col)
+        _      -> derive_binser_decode_mangled(tab, buf_e, pos_e, ftype, line, col)
       }
     }
-    _ -> derive_binser_decode_mangled(buf_e, pos_e, ftype, line, col)
+    _ -> derive_binser_decode_mangled(tab, buf_e, pos_e, ftype, line, col)
   }
 }
 
-fn derive_binser_decode_mangled(buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
+fn derive_binser_decode_mangled(tab: SymTab, buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
                                   line: Int, col: Int) : Expr {
   let mangled = proto_mangled_fn("BinSerialize",
-                                   proto_type_name(ftype), "from_bytes")
-  mk_expr(ECall(mk_ref(mangled, line, col), [buf_e, pos_e]), line, col)
+                                   proto_type_name(tab, ftype), "from_bytes")
+  mk_expr(ECall(mk_name(mangled, line, col), [buf_e, pos_e]), line, col)
 }
 
 # --- record writer --------------------------------------------------
 #
 # Each field's writer receives the buffer the previous field's returned.
-fn derive_binser_put_record(acc: Expr, fields: [FieldDecl], idx: Int, writers: [String],
+fn derive_binser_put_record(tab: SymTab, acc: Expr, fields: [FieldDecl], idx: Int, writers: [String],
                              line: Int, col: Int) : Expr {
   match fields {
     [] -> acc
     [fd, ...rest] -> match fd {
       FD(_, name, ftype, _) -> {
         let fcol = col + idx * 16
-        let v = mk_expr(EField(mk_ref("self", line, fcol), name), line, fcol)
-        derive_binser_put_record(derive_binser_put(acc, v, ftype, writers, line, fcol),
+        let v = mk_expr(EField(mk_name("self", line, fcol), name), line, fcol)
+        derive_binser_put_record(tab, derive_binser_put(tab, acc, v, ftype, writers, line, fcol),
                                  rest, idx + 1, writers, line, col)
       }
     }
@@ -2539,19 +2658,19 @@ fn derive_binser_put_record(acc: Expr, fields: [FieldDecl], idx: Int, writers: [
 # `let eK = bin_<t>_end(buf, posK)` and read in place by `bin_<t>_at`
 # when the value is built, or any other type, matched out of
 # `__pimpl_BinSerialize_<Tk>_from_bytes(buf, posK)` into `pK`.
-fn derive_binser_field_guard(ftype: TypeExpr, idx: Int, pos_e: Expr, then_e: Expr,
+fn derive_binser_field_guard(tab: SymTab, ftype: TypeExpr, idx: Int, pos_e: Expr, then_e: Expr,
                                line: Int, fcol: Int, col: Int) : Expr {
-  let buf_e = mk_ref("buf", line, fcol)
+  let buf_e = mk_name("buf", line, fcol)
   match binser_prim_reader(ftype) {
     Some(r) -> {
       let evar = binser_end_var(idx)
       let end_e = binser_lib(binser_prim_end(r), [buf_e, pos_e], line, col)
-      let bad = mk_expr(EBinop(BoLt, mk_ref(evar, line, col), mk_expr(mk_int_synth(0), line, col)), line, col)
-      let err = binser_call("Err", [binser_lib("bin_end_error", [mk_ref(evar, line, col)], line, col)], line, col)
-      let bind = SLet(mk_pat(PBind(evar), line, col), None, end_e)
+      let bad = mk_expr(EBinop(BoLt, mk_name(evar, line, col), mk_expr(mk_int_synth(0), line, col)), line, col)
+      let err = binser_call("Err", [binser_lib("bin_end_error", [mk_name(evar, line, col)], line, col)], line, col)
+      let bind = SLet(mk_pat(PBind(binder_written(evar)), line, col), None, end_e)
       mk_expr(EBlock([bind], Some(mk_expr(EIf(bad, err, Some(then_e)), line, col))), line, col)
     }
-    None -> derive_binser_match_result(derive_binser_decode_call(buf_e, pos_e, ftype, line, fcol),
+    None -> derive_binser_match_result(derive_binser_decode_call(tab, buf_e, pos_e, ftype, line, fcol),
                                        binser_cursor_var(idx), then_e, line, col)
   }
 }
@@ -2559,15 +2678,15 @@ fn derive_binser_field_guard(ftype: TypeExpr, idx: Int, pos_e: Expr, then_e: Exp
 # The cursor just past field `idx`.
 fn derive_binser_field_next(ftype: TypeExpr, idx: Int, line: Int, col: Int) : Expr =
   match binser_prim_reader(ftype) {
-    Some(_) -> mk_ref(binser_end_var(idx), line, col)
-    None    -> mk_expr(EField(mk_ref(binser_cursor_var(idx), line, col), "pos"), line, col)
+    Some(_) -> mk_name(binser_end_var(idx), line, col)
+    None    -> mk_expr(EField(mk_name(binser_cursor_var(idx), line, col), "pos"), line, col)
   }
 
 # The decoded value of field `idx`, which starts at `pos_e`.
 fn derive_binser_field_value(ftype: TypeExpr, idx: Int, pos_e: Expr, line: Int, col: Int) : Expr =
   match binser_prim_reader(ftype) {
-    Some(r) -> binser_lib(binser_prim_at(r), [mk_ref("buf", line, col), pos_e], line, col)
-    None    -> mk_expr(EField(mk_ref(binser_cursor_var(idx), line, col), "value"), line, col)
+    Some(r) -> binser_lib(binser_prim_at(r), [mk_name("buf", line, col), pos_e], line, col)
+    None    -> mk_expr(EField(mk_name(binser_cursor_var(idx), line, col), "value"), line, col)
   }
 
 # The values of `ftypes`, the first starting at `pos_e`.
@@ -2591,7 +2710,7 @@ type BinPrim = BpInt | BpBool | BpString | BpChar
 
 fn binser_prim_reader(ftype: TypeExpr) : Option[BinPrim] =
   match ftype.tkind {
-    TyName(_, _, []) -> match resolve_ty(ftype) {
+    TyName(_, []) -> match resolve_ty(ftype) {
       TyInt    -> Some(BpInt)
       TyBool   -> Some(BpBool)
       TyString -> Some(BpString)
@@ -2622,12 +2741,12 @@ fn binser_prim_at(r: BinPrim) : String = concat_all(["bin_", binser_prim_word(r)
 #
 # Empty record short-circuits to `Ok((T {}, pos))` so the empty-fields
 # case still emits a valid impl.
-fn derive_binser_record_from_bytes(tname: String, fields: [FieldDecl],
+fn derive_binser_record_from_bytes(tab: SymTab, tsym: SymId, fields: [FieldDecl],
                                      line: Int, col: Int) : Expr {
-  let pos0 = mk_ref("pos", line, col)
+  let pos0 = mk_name("pos", line, col)
   match fields {
-    [] -> derive_binser_record_ok_value(tname, [], pos0, line, col)
-    _  -> derive_binser_record_decode_chain(tname, fields, fields, 0, pos0,
+    [] -> derive_binser_record_ok_value(tsym, [], pos0, line, col)
+    _  -> derive_binser_record_decode_chain(tab, tsym, fields, fields, 0, pos0,
                                               line, col)
   }
 }
@@ -2635,28 +2754,28 @@ fn derive_binser_record_from_bytes(tname: String, fields: [FieldDecl],
 # `remaining` walks left-to-right; `all_fields` is captured so the
 # final `Ok` builder can construct the record literal in declaration
 # order. `pos_e` is the cursor of the field at `idx`.
-fn derive_binser_record_decode_chain(tname: String, remaining: [FieldDecl],
+fn derive_binser_record_decode_chain(tab: SymTab, tsym: SymId, remaining: [FieldDecl],
                                        all_fields: [FieldDecl], idx: Int,
                                        pos_e: Expr, line: Int, col: Int) : Expr {
   match remaining {
-    [] -> derive_binser_record_ok_value(tname, all_fields, pos_e, line, col)
+    [] -> derive_binser_record_ok_value(tsym, all_fields, pos_e, line, col)
     [fd, ...rest] -> match fd {
       FD(_, _, ftype, _) -> {
-        let then_e = derive_binser_record_decode_chain(tname, rest, all_fields, idx + 1,
+        let then_e = derive_binser_record_decode_chain(tab, tsym, rest, all_fields, idx + 1,
                                                         derive_binser_field_next(ftype, idx, line, col),
                                                         line, col)
         # One column inside the field's writer slot, so writer and
         # decoder lambdas of one field stay distinct.
-        derive_binser_field_guard(ftype, idx, pos_e, then_e, line, col + idx * 16 + 1, col)
+        derive_binser_field_guard(tab, ftype, idx, pos_e, then_e, line, col + idx * 16 + 1, col)
       }
     }
   }
 }
 
-fn derive_binser_record_ok_value(tname: String, fields: [FieldDecl],
+fn derive_binser_record_ok_value(tsym: SymId, fields: [FieldDecl],
                                    pos_e: Expr, line: Int, col: Int) : Expr {
-  let vals = derive_binser_field_values(map(fields, field_decl_type), 0, mk_ref("pos", line, col), line, col)
-  let rec_e = mk_expr(ERecordLit(ty_ref_none(), tname, derive_binser_field_inits(fields, vals)), line, col)
+  let vals = derive_binser_field_values(map(fields, field_decl_type), 0, mk_name("pos", line, col), line, col)
+  let rec_e = mk_expr(ERecordLit(DrSym(tsym), derive_binser_field_inits(fields, vals)), line, col)
   binser_ok_cursor(rec_e, pos_e, line, col)
 }
 
@@ -2673,7 +2792,7 @@ fn field_decl_type(fd: FieldDecl) : TypeExpr = match fd { FD(_, _, t, _) -> t }
 
 # `Ok(BinCursor { value: value_e, pos: pos_e })`.
 fn binser_ok_cursor(value_e: Expr, pos_e: Expr, line: Int, col: Int) : Expr {
-  let cur_e = mk_expr(ERecordLit(ty_ref_none(), "BinCursor", [FI("value", value_e), FI("pos", pos_e)]), line, col)
+  let cur_e = mk_expr(ERecordLit(ref_written("BinCursor"), [FI("value", value_e), FI("pos", pos_e)]), line, col)
   binser_call("Ok", [cur_e], line, col)
 }
 
@@ -2681,13 +2800,13 @@ fn binser_ok_cursor(value_e: Expr, pos_e: Expr, line: Int, col: Int) : Expr {
 # Result-producing decode call.
 fn derive_binser_match_result(call: Expr, pvar: String, then_e: Expr,
                                 line: Int, col: Int) : Expr {
-  let err_pat = mk_pat(PVariant(None, "Err", [mk_pat(PBind("m"), line, col)]),
+  let err_pat = mk_pat(PVariant(ref_written("Err"), [mk_pat(PBind(binder_written("m")), line, col)]),
                         line, col)
   let err_arm = Arm(err_pat, None,
-                    mk_expr(ECall(mk_ref("Err", line, col),
-                                  [mk_ref("m", line, col)]),
+                    mk_expr(ECall(mk_name("Err", line, col),
+                                  [mk_name("m", line, col)]),
                             line, col))
-  let ok_pat = mk_pat(PVariant(None, "Ok", [mk_pat(PBind(pvar), line, col)]),
+  let ok_pat = mk_pat(PVariant(ref_written("Ok"), [mk_pat(PBind(binder_written(pvar)), line, col)]),
                        line, col)
   let ok_arm = Arm(ok_pat, None, then_e)
   mk_expr(EMatch(call, [err_arm, ok_arm]), line, col)
