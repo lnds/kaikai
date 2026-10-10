@@ -19,6 +19,7 @@ import compiler.util
 import compiler.kinds
 import compiler.fnreg
 import compiler.emit_shared
+import compiler.handle_caps
 import compiler.rec_stamp
 import compiler.infer
 import compiler.region
@@ -1067,7 +1068,7 @@ fn lower_capture_atoms(caps: [Capture], st: LowerSt, acc: [KVal]) : LResMany / C
 
 fn capture_reg(st: LowerSt, c: Capture) : String = match c {
   CapLocal(l) -> ls_reg_of(st, l)
-  CapAlias(_) -> kir_capture_name(st.locals, c)
+  CapAlias(a) -> kir_alias_id_reg(ls_reg_of(st, a))
 }
 
 # --- Blocks -------------------------------------------------------------
@@ -2828,7 +2829,9 @@ fn lower_handle(x: Expr, body: Expr, inst: InstKey, init_opt: Option[Expr],
     match ls_fresh_reg(st1) { LSReg(result, st2) -> {
       let st3 = ls_emit(st2, KLet(result, SBoxed, KLitOp(KUnitV), kpos_of(x)))
       let hs = kir_unw_handle_state(uw, init_opt, sym, x, st3)
-      let st3b = alias_in_scope(alias_opt, ls_emit(hs.st, KInstall(eff, sym, initv, handle_alias_name(alias_opt), kpos_of(x))))
+      let env = handle_env_regs(handle_captures_at(st.cls, st.enc_fn, x.line, x.col), hs.st)
+      let al = bind_handle_alias(alias_opt, hs.st)
+      let st3b = ls_emit(al.st, KInstall(eff, sym, initv, al.reg, env, kpos_of(x)))
       # Arm the cleanup right after the push, so every unwind past this
       # node runs it; the normal exit runs it explicitly before the pop.
       let st4 = if has_fin {
@@ -2846,17 +2849,23 @@ fn lower_handle(x: Expr, body: Expr, inst: InstKey, init_opt: Option[Expr],
     } } }
 }
 
-# The name an aliased install is known by: its alias binder's.
-fn handle_alias_name(alias_opt: Option[Binder]) : Option[String] = match alias_opt {
-  Some(b) -> Some(written_text(b.name))
-  None    -> None
+# The alias of an install and the state it is in scope in.
+type HandleAlias = { reg: Option[String], st: LowerSt }
+
+# An alias is a binder like any other: it takes a register of its own, so
+# a parameter or an enclosing alias spelled alike keeps its.
+fn bind_handle_alias(alias_opt: Option[Binder], st: LowerSt) : HandleAlias = match alias_opt {
+  Some(b) -> match ls_bind_alias(st, b) { LSReg(reg, st1) -> HandleAlias { reg: Some(reg), st: st1 } }
+  None    -> HandleAlias { reg: None, st: st }
 }
 
-# The install binds its alias under the name it is known by.
-fn alias_in_scope(alias_opt: Option[Binder], st: LowerSt) : LowerSt = match alias_opt {
-  Some(b) -> ls_scope_put(st, b.id, written_text(b.name))
-  None    -> st
-}
+# Where each capture of the handle's clauses lives at the install: the
+# register its binder was bound to, or none when the binder is not in
+# scope here (no clause running from this install reads that slot).
+fn handle_env_regs(caps: [Capture], st: LowerSt) : [Option[String]] = map(caps, (c) => match c {
+  CapLocal(l) -> if ls_local_bound(st, l) { Some(ls_reg_of(st, l)) } else { None }
+  CapAlias(a) -> if ls_local_bound(st, a) { Some(kir_alias_id_reg(ls_reg_of(st, a))) } else { None }
+})
 
 # The registers pushed below a handle's landing pad, popped where its exits
 # meet, innermost first.

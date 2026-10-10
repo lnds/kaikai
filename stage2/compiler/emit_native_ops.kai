@@ -23,6 +23,9 @@ import compiler.emit_native_fn
 import compiler.emit_native_slot
 import compiler.emit_native_fnix
 import compiler.effect_instance
+import compiler.core_effects
+import compiler.rt_name
+import compiler.symtab
 import compiler.fnreg
 import compiler.emit_native_call
 import compiler.emit_native_vec
@@ -218,8 +221,8 @@ fn nemit_call_freeing(ctx: Handle, sym: String, argbuf: Handle) : Handle = {
 # boxed user fn) takes the legacy all-boxed funnel unchanged.
 pub fn nemit_call_direct(ctx: Handle, sym: String, cargs: [KVal], fx: NFnIndex, dst: KSlot) : Handle / Console =
   match nfnx_by_sym(fx, sym) {
-    Some(f) -> if nfn_has_raw_slot(f) { nemit_call_raw(ctx, sym, cargs, f, dst) }
-               else { nemit_call_boxed_evf(ctx, sym, cargs, f.donor) }
+    Some(f) -> if nfn_has_raw_slot(f) { nemit_call_raw(ctx, sym, cargs, f, fx, dst) }
+               else { nemit_call_boxed_evf(ctx, sym, cargs, f, fx) }
     None    -> if string_starts_with_q(sym, "kaix_proto_dispatch") { nemit_proto_dispatch(ctx, sym, cargs) }
                else { nemit_call_freeing(ctx, ncall_sym(sym), nemit_atoms_buf(ctx, cargs)) }
   }
@@ -285,11 +288,12 @@ pub fn nemit_donor_free(ctx: Handle) : Unit / Console =
 # callee carries one and the donor token appended when it takes one; a
 # frameless, donor-less callee reduces to the legacy buffer. The frame
 # `ptr` is pushed first so it lands in the signature's leading slot.
-fn nemit_call_boxed_evf(ctx: Handle, sym: String, cargs: [KVal], dn: Bool) : Handle / Console = {
+fn nemit_call_boxed_evf(ctx: Handle, sym: String, cargs: [KVal], f: KFn, fx: NFnIndex) : Handle / Console = {
+  let dn = f.donor
   let n = native_ctx_frame_slot_count(ctx, sym)
   if n > 0 or dn {
     let buf = llvm_buf_new()
-    if n > 0 { let frame = nemit_evf_build_frame(ctx, sym, n); llvm_buf_push(buf, frame) } else { () }
+    if n > 0 { let frame = nemit_evf_build_frame(ctx, sym, f, fx, n); llvm_buf_push(buf, frame) } else { () }
     nemit_push_atoms(ctx, buf, cargs)
     if dn { let tok = ndonate_token(ctx); llvm_buf_push(buf, tok) } else { () }
     let r = nemit_call_boxed(ctx, ncall_sym(sym), buf); llvm_buf_free(buf); r
@@ -302,12 +306,12 @@ fn nemit_call_boxed_evf(ctx: Handle, sym: String, cargs: [KVal], dn: Bool) : Han
 # raw `dst` (a register whose alloca matches the raw return) keeps the bare
 # `i64`/`f64`/`i1`, so the consumer reads it directly (no box+unbox round-
 # trip). `nemit_box_ret` is a no-op on a `SBoxed` return regardless of `dst`.
-fn nemit_call_raw(ctx: Handle, sym: String, cargs: [KVal], f: KFn, dst: KSlot) : Handle / Console = {
+fn nemit_call_raw(ctx: Handle, sym: String, cargs: [KVal], f: KFn, fx: NFnIndex, dst: KSlot) : Handle / Console = {
   let ptb = llvm_buf_new()
   let ab = llvm_buf_new()
   # Prepend the evidence frame when the callee carries one, so the call type
   # matches the definition's leading `ptr __evf`.
-  nemit_evf_call_push(ctx, sym, ptb, ab)
+  nemit_evf_call_push(ctx, sym, f, fx, ptb, ab)
   nemit_raw_args(ctx, f.params, cargs, ptb, ab)
   # A donation-capable callee takes the trailing reuse token.
   if f.donor { llvm_buf_push(ptb, native_ctx_ptrt(ctx)); let tok = ndonate_token(ctx); llvm_buf_push(ab, tok) } else { () }
@@ -320,11 +324,11 @@ fn nemit_call_raw(ctx: Handle, sym: String, cargs: [KVal], f: KFn, dst: KSlot) :
 
 # Push the callee's evidence-frame arg (a `ptr` to a `[N x ptr]` of slots,
 # each filled by the live walk) + its type, when the callee carries a frame.
-#[doc("Push the callee's walk-filled evidence frame arg + type onto the buffers when it carries a frame.")]
-pub fn nemit_evf_call_push(ctx: Handle, callee: String, ptb: Handle, ab: Handle) : Unit / Console = {
+#[doc("Push the walk-filled evidence frame of the callee `f`, emitted as `callee`, and its type onto the buffers when it carries a frame.")]
+pub fn nemit_evf_call_push(ctx: Handle, callee: String, f: KFn, fx: NFnIndex, ptb: Handle, ab: Handle) : Unit / Console = {
   let n = native_ctx_frame_slot_count(ctx, callee)
   if n > 0 {
-    let frame = nemit_evf_build_frame(ctx, callee, n)
+    let frame = nemit_evf_build_frame(ctx, callee, f, fx, n)
     llvm_buf_push(ptb, native_ctx_ptrt(ctx))
     llvm_buf_push(ab, frame)
   } else { () }
@@ -332,24 +336,27 @@ pub fn nemit_evf_call_push(ctx: Handle, callee: String, ptb: Handle, ab: Handle)
 
 # Build the `[N x ptr]` evidence frame for `callee`: alloca it in the entry
 # head, store each slot's node at its index, return the array pointer. The
-# perform reads slot j.
-fn nemit_evf_build_frame(ctx: Handle, callee: String, n: Int) : Handle / Console = {
+# perform reads slot j. The slots are the callee's instances, one per slot
+# its symbol was registered with.
+fn nemit_evf_build_frame(ctx: Handle, callee: String, f: KFn, fx: NFnIndex, n: Int) : Handle / Console = {
   let arrty = llvm_array_type(native_ctx_ptrt(ctx), n)
   let frame = llvm_build_alloca_entry(ctx, arrty, "__evf_frame")
-  nemit_evf_fill_slots(ctx, callee, arrty, frame, 0, n)
+  let keys = nfnx_frame_keys(fx, f)
+  if list_length(keys) == n { nemit_evf_fill_slots(ctx, fx.tab, keys, arrty, frame, 0) }
+  else { nemit_unsupported(ctx, cat2("evidence frame: the slots of the symbol are not the frame of ", callee)) }
   frame
 }
 
-fn nemit_evf_fill_slots(ctx: Handle, callee: String, arrty: Handle, frame: Handle, j: Int, n: Int) : Unit / Console =
-  if j >= n { () }
-  else {
-    let eff = native_ctx_frame_slot_eff(ctx, callee, j)
-    let node = nemit_evf_slot_node(ctx, eff)
+fn nemit_evf_fill_slots(ctx: Handle, tab: SymTab, keys: [InstKey], arrty: Handle, frame: Handle, j: Int) : Unit / Console = match keys {
+  [] -> ()
+  [k, ...rest] -> {
+    let node = nemit_evf_slot_node(ctx, tab, k)
     let idx = llvm_const_int(native_ctx_i64t(ctx), j)
     let slotptr = llvm_build_array_gep(native_ctx_b(ctx), arrty, frame, idx)
     let _s = llvm_build_store(native_ctx_b(ctx), node, slotptr)
-    nemit_evf_fill_slots(ctx, callee, arrty, frame, j + 1, n)
+    nemit_evf_fill_slots(ctx, tab, rest, arrty, frame, j + 1)
   }
+}
 
 # The node a caller fills a slot with: a lexical handler on the stack wins,
 # falling back to the minted default node for a default-bearing effect. Either
@@ -357,13 +364,12 @@ fn nemit_evf_fill_slots(ctx: Handle, callee: String, arrty: Handle, frame: Handl
 # this fiber — the walk crossed a spawn) or a zeroed synth-default node whose
 # handler slot is NULL (a fiber-local/user effect with no real default) reports
 # `effect not handled in fiber` instead of being stored as a slot the perform
-# derefs to a segfault. Mirrors `nemit_perform_walk_node` and the C backend's
-# `evf_require_walk`.
-fn nemit_evf_slot_node(ctx: Handle, key: String) : Handle / Console = {
+# derefs to a segfault.
+fn nemit_evf_slot_node(ctx: Handle, tab: SymTab, k: InstKey) : Handle / Console = {
   let p = native_ctx_ptrt(ctx)
-  let eff = inst_key_eff(key)
+  let key = inst_key_text(tab, k)
   let effname = llvm_build_global_string(native_ctx_b(ctx), key)
-  let g = llvm_get_named_global(native_ctx_m(ctx), cat2("_kai_default_node_", eff))
+  let g = llvm_get_named_global(native_ctx_m(ctx), cat2("_kai_default_node_", rt_name(tab, k.eff)))
   let node =
     if llvm_handle_is_null(g) == 1 {
       ncall_sig1(ctx, "kaix_evidence_lookup_node", p, p, effname)
@@ -371,9 +377,8 @@ fn nemit_evf_slot_node(ctx: Handle, key: String) : Handle / Console = {
       ncall_sig2(ctx, "kaix_evidence_lookup_or_default", p, p, p, effname, g)
     }
   # `Ffi` declares no ops and is routed around the dispatcher, so its slot node
-  # legitimately carries a NULL handler the FFI shim never dereferences — leave
-  # it unguarded, mirroring the C backend's `evf_require_walk`.
-  if eff == "Ffi" { node }
+  # legitimately carries a NULL handler the FFI shim never dereferences.
+  if effect_is(k.eff, CeFfi) { node }
   else { ncall_sig2(ctx, "kaix_evidence_require", p, p, p, node, effname) }
 }
 
