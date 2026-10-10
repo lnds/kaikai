@@ -3954,15 +3954,19 @@ fn lower_tcrec(x: Expr, step: TcrecStep, cargs: [Expr], st: LowerSt) : LRes / Co
 # carries no ref to drop.
 fn lower_trmc_step(x: Expr, step: TrmcStep, cargs: [Expr], st: LowerSt) : LRes / Console = {
   let hole = step.hole
+  let spine = trmc_spine(step.cname)
   # The full slot mask of the spine ctor (0 for the builtin cons spine),
   # so the native step lays each slot at its kind like KCon/KConReuse do —
   # the same `ls_ctor_mask` (`variant_slot_mask`) the fresh route reads.
-  let slot_mask = if trmc_cname_is_cons(step.cname) { 0 } else { ls_ctor_mask_in(st, ctor_home_of_expr_ty(x), step.cname) }
+  let slot_mask = match spine {
+    KSpineCons(_)  -> 0
+    KSpineCtor(cn) -> ls_ctor_mask_in(st, ctor_home_of_expr_ty(x), cn)
+  }
   # Lower the non-hole ctor args (head value(s)) left-to-right, then the
   # self-call's args (the rebinds) — preserving evaluation order.
   match lower_kinds_vals(trmc_drop_nth(cargs, hole, 0, []), mask_kinds_but(slot_mask, hole, 0, list_length(cargs)), 0, st, []) {
     LResMany(heads, st1) ->
-      lower_trmc_seal(x, step.sym, hole, step.cname, step.dropmask,
+      lower_trmc_seal(x, step.sym, hole, spine, step.dropmask,
                       slot_mask, heads, cargs, st1)
   }
 }
@@ -3970,7 +3974,7 @@ fn lower_trmc_step(x: Expr, step: TrmcStep, cargs: [Expr], st: LowerSt) : LRes /
 # Lower the self-call's args into the loop-param rebinds and seal the step.
 # Split out of `lower_trmc_step` so the head/rebind lowerings sit at one
 # nesting level each (the back-edge mirrors `lower_tcrec`'s `KTcrecGoto`).
-fn lower_trmc_seal(x: Expr, sym: String, hole: Int, cname: String, dropmask: Int,
+fn lower_trmc_seal(x: Expr, sym: String, hole: Int, spine: KSpine, dropmask: Int,
                    slot_mask: Int, heads: [KVal], cargs: [Expr], st: LowerSt) : LRes / Console =
   # P3: lower the rebinds at the recursing fn's param slots (raw for a raw
   # param), so the TRMC back-edge re-stores them raw — no per-step
@@ -3979,19 +3983,25 @@ fn lower_trmc_seal(x: Expr, sym: String, hole: Int, cname: String, dropmask: Int
     LResMany(reb, st1) -> {
       # The variant ctor tag is resolved here (as `KCon` resolves it), so the
       # backend builds the spine cell without a name→tag table. The builtin-
-      # cons spine (`__kai_cons` / `__kai_cons_s`) is not a registered variant
-      # → tag -1 (its backend path is cons-specific and ignores the tag).
-      let tag = if trmc_cname_is_cons(cname) { 0 - 1 } else { ls_variant_tag_in(st1, ctor_home_of_expr_ty(x), cname) }
+      # cons spine is not a registered variant → tag -1 (its backend path
+      # is cons-specific and ignores the tag).
+      let tag = match spine {
+        KSpineCons(_)  -> 0 - 1
+        KSpineCtor(cn) -> ls_variant_tag_in(st1, ctor_home_of_expr_ty(x), cn)
+      }
       # Like the tcrec goto, the step leaves every enclosing match: it
       # releases the ledger's pending entries the ctor args do not consume.
       seal_tail(tcp_goto_drops(cargs, ls_set_tcpend(st1, tcl_without_tok(st1.tcpend))),
-                KTrmcStep(cat3("_kai_", sym, "_entry"), hole, cname, tag, slot_mask, dropmask,
+                KTrmcStep(cat3("_kai_", sym, "_entry"), hole, spine, tag, slot_mask, dropmask,
                           heads, assigns_of(reb, 0, []), st1.in_region, kpos_of(x)))
     }
   }
 
-fn trmc_cname_is_cons(cname: String) : Bool =
-  cname == "__kai_cons" or cname == "__kai_cons_s"
+# The sentinel spells its spine as text: the two builtin-cons markers, or
+# the constructor's name. This is the only place that text is decoded.
+fn trmc_spine(cname: String) : KSpine =
+  if cname == "__kai_cons" or cname == "__kai_cons_s" { KSpineCons(cname) }
+  else { KSpineCtor(cname) }
 
 # The ctor args minus the hole slot, in slot order — the real head value(s)
 # the backend uses to build the spine cell (NULL plugged at the hole).
