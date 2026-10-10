@@ -1,0 +1,160 @@
+name: llvm-prebuilt
+
+# Publishes the vendored static libLLVM as a release asset, one per
+# platform the release builds, so release.yml downloads it instead of
+# compiling LLVM. The asset name carries the LLVM version, a hash of the
+# files that decide its contents, and the platform; one that is already
+# published is never rebuilt. `verify` then runs the release build from the
+# published asset on a clean checkout.
+#
+# A pull request that touches those files publishes its asset before it
+# merges, so the first release after the merge already finds it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - mk/llvm.mk
+      - scripts/llvm-prebuilt.sh
+      - .github/workflows/llvm-prebuilt.yml
+  pull_request:
+    paths:
+      - mk/llvm.mk
+      - scripts/llvm-prebuilt.sh
+      - .github/workflows/llvm-prebuilt.yml
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and replace the asset even if it is already published"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: llvm-prebuilt-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Publish libLLVM ${{ matrix.os_name }}-${{ matrix.arch }}
+    # A fork's token cannot write the release.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            os_name: darwin
+            arch: arm64
+          - os: ubuntu-24.04
+            os_name: linux
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the asset
+        id: asset
+        run: |
+          name="$(./scripts/llvm-prebuilt.sh name)"
+          tag="$(./scripts/llvm-prebuilt.sh tag)"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          published=false
+          if [ "${{ inputs.force }}" != "true" ]; then
+            assets="$(gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+            if printf '%s\n' "$assets" | grep -qxF "$name" \
+               && printf '%s\n' "$assets" | grep -qxF "$name.sha256"; then
+              published=true
+            fi
+          fi
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+          echo "$name under $tag: published=$published"
+
+      - name: Install cmake + ninja [macOS]
+        if: steps.asset.outputs.published != 'true' && runner.os == 'macOS'
+        run: |
+          if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
+            brew install cmake ninja
+          fi
+
+      - name: Install cmake + ninja [Linux]
+        if: steps.asset.outputs.published != 'true' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build
+
+      - name: Build libLLVM from source
+        if: steps.asset.outputs.published != 'true'
+        run: make llvm-build
+
+      - name: Pack the asset
+        if: steps.asset.outputs.published != 'true'
+        run: make llvm-pack
+
+      # The release is a prerelease on this repository: it never becomes
+      # "latest", and the user-facing releases live on the public mirror,
+      # which only ever receives the tags release.yml pushes by name.
+      - name: Publish the asset
+        if: steps.asset.outputs.published != 'true'
+        run: |
+          name="${{ steps.asset.outputs.name }}"
+          tag="${{ steps.asset.outputs.tag }}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --prerelease \
+              --target "${{ github.event.repository.default_branch }}" \
+              --title "Prebuilt static libLLVM ${tag#llvm-static-}" \
+              --notes "Build input for kaikai releases, not a kaikai release. Each asset is the static libLLVM that \`make llvm-build\` produces for one platform and one configuration; \`make llvm-prebuilt\` downloads the one matching the checkout." \
+              || gh release view "$tag" >/dev/null
+          fi
+          gh release upload "$tag" "dist/$name" "dist/$name.sha256" --clobber
+
+  verify:
+    name: Release build from the asset ${{ matrix.os_name }}-${{ matrix.arch }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            os_name: darwin
+            arch: arm64
+          - os: ubuntu-24.04
+            os_name: linux
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    steps:
+      # build-release.sh boots from the newest bootstrap-seed tag.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install clang 18 [macOS]
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm@18
+          echo "/opt/homebrew/opt/llvm@18/bin" >> "$GITHUB_PATH"
+
+      - name: Install clang 18 [Linux]
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18-tools
+
+      # No cmake + ninja here on purpose: anything but the published asset
+      # fails this step instead of falling back to a source build.
+      - name: Fetch prebuilt static libLLVM
+        env:
+          KAI_LLVM_PREBUILT_REPO: ${{ github.repository }}
+        run: ./scripts/llvm-prebuilt.sh fetch
+
+      - name: Build release tarball
+        run: ./scripts/build-release.sh

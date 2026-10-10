@@ -1523,6 +1523,6 @@ test-binserialize-budget: kaic2
 	fi; \
 	echo "binserialize-budget OK — 100 decodes in $${wall_ms} ms ($${per_decode} ms/decode <= $$((ceiling / 100)) ms ceiling)"
 
-# LLVM static prep lives in its own file so the release libLLVM cache key
-# (release.yml) hashes only mk/llvm.mk — see the header there.
+# LLVM static prep lives in its own file so a root Makefile edit never
+# names a new prebuilt libLLVM asset — see the header there.
 include mk/llvm.mk

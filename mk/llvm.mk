@@ -1,11 +1,12 @@
-# LLVM static prep — factored out of the root Makefile so the release
-# libLLVM cache key (release.yml) can hash THIS file alone. Editing a
-# test target in the root Makefile must not invalidate the ~25-min
-# libLLVM build cache; only a real change here (version, cmake flags,
-# target list) should. Keep everything that governs the libLLVM build
-# in this file.
+# LLVM static prep — factored out of the root Makefile so the prebuilt
+# libLLVM asset is named after this file and scripts/llvm-prebuilt.sh,
+# nothing else. Editing a test target in the root Makefile must not name a
+# new asset and force a ~25-min libLLVM build; only a real change here
+# (version, cmake flags, target list) should. Keep everything that governs
+# the libLLVM build in this file.
 
-.PHONY: llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean
+.PHONY: llvm-info llvm-fetch llvm-configure llvm-build llvm-size llvm-clean \
+        llvm-prebuilt llvm-pack
 
 # ---- LLVM static prep (libLLVM for the in-process native backend) ----
 #
@@ -62,9 +63,11 @@ llvm-info:
 	@echo "First build     = ~10-30 min on a modern laptop, ~30-60 min on cold CI"
 	@echo ""
 	@echo "Workflow:"
+	@echo "  make llvm-prebuilt    # fetch the published archives, else build from source"
 	@echo "  make llvm-fetch       # download + extract tarball (one-shot)"
 	@echo "  make llvm-configure   # cmake -B build with MinSizeRel"
 	@echo "  make llvm-build       # cmake --build (the long step)"
+	@echo "  make llvm-pack        # archive a finished build as the prebuilt asset"
 	@echo "  make llvm-size        # sum sizes of the .a archives"
 	@echo "  make llvm-clean       # remove the build tree (keep source)"
 
@@ -134,11 +137,27 @@ llvm-configure: llvm-fetch
 
 # llvm-build: actually compile the static libs. This is the long step
 # (10-30 min cold). The target list is narrow on purpose; expanding it
-# raises the linked binary size in L3 roughly linearly.
-llvm-build: llvm-configure
-	cd $(LLVM_SRC_DIR) && cmake --build build --target $(LLVM_CMAKE_TARGETS)
-	@echo "llvm-build OK — static .a archives under $(LLVM_BUILD_DIR)/lib"
-	@$(MAKE) llvm-size
+# raises the linked binary size in L3 roughly linearly. Prebuilt archives
+# for this exact configuration are the same output, so they are left alone.
+llvm-build:
+	@if [ "$$(cat $(LLVM_BUILD_DIR)/.prebuilt 2>/dev/null)" = "$$(scripts/llvm-prebuilt.sh name)" ]; then \
+	  echo "llvm-build: prebuilt archives in place under $(LLVM_BUILD_DIR), nothing to build"; \
+	  exit 0; \
+	fi; \
+	$(MAKE) llvm-configure \
+	  && (cd $(LLVM_SRC_DIR) && cmake --build build --target $(LLVM_CMAKE_TARGETS)) \
+	  && echo "llvm-build OK — static .a archives under $(LLVM_BUILD_DIR)/lib" \
+	  && $(MAKE) llvm-size
+
+# llvm-prebuilt: the same archives without the compile. Fetches the asset
+# published for this host and configuration; where none exists (a fork, a
+# new LLVM version, an edited flag) it builds from source instead.
+llvm-prebuilt:
+	@scripts/llvm-prebuilt.sh fetch || { rc=$$?; [ $$rc -eq 3 ] || exit $$rc; $(MAKE) llvm-build; }
+
+# llvm-pack: archive a finished source build into dist/ as that asset.
+llvm-pack:
+	@scripts/llvm-prebuilt.sh pack dist
 
 # llvm-size: sum-of-.a measurement. The number L3 needs to estimate
 # the linked-kaic2 binary size. Static link drops a lot via dead-code
