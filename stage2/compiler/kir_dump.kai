@@ -15,6 +15,9 @@
 # driver.kai / emit_c.kai.
 
 import compiler.ast
+import compiler.symtab
+import compiler.spec_names
+import compiler.proto_ids
 import compiler.util
 import compiler.fnreg
 import compiler.emit_shared
@@ -29,13 +32,13 @@ import compiler.kir_lower_fns
 # region marks. `inline_on` selects whether the inliner runs before the
 # dump: on, the dump shows what the native backend consumes; off, the
 # raw lowering (what the `.kir.expected` goldens pin).
-pub fn emit_kir(decls: [Decl], regions: [RegionMark], inline_on: Bool, stamp_ids: [SymId], entry: SymId) : String / Console {
+pub fn emit_kir(decls: [Decl], tab: SymTab, specs: SpecNames, regions: [RegionMark], inline_on: Bool, stamp_ids: [SymId], entry: SymId) : String / Console {
   # `decls` is already post-perceus / post-tcrec — alias-resolve and
   # op-call desugar ran far upstream in the pipeline. Re-running them here
   # would double-desugar.
-  let fns = register_fn_decls(decls, entry)
-  let variants = register_variants(decls)
-  let kp = lower_to_kir(decls, regions, fns, variants, None, [], false, stamp_ids, entry)
+  let fns = register_fn_decls(decls, tab, specs, entry)
+  let variants = register_variants(decls, tab)
+  let kp = lower_to_kir(decls, tab, specs, pid_empty(), regions, fns, variants, None, [], false, stamp_ids, entry)
   kir_dump_program(if inline_on { kir_inline_program(kp) } else { kp })
 }
 
@@ -47,8 +50,8 @@ fn kir_dump_program(kp: KProgram) : String =
     kir_dump_install_order(kp.install_order),
     kir_dump_types(kp.types, ""),
     kir_dump_regions(kp.regions, ""),
-    kir_dump_handlers(kp.handlers, ""),
-    kir_dump_fns(kp.fns, "")
+    kir_dump_handlers(kp.tab, kp.handlers, ""),
+    kir_dump_fns(kp.tab, kp.fns, "")
   ])
 
 # The default-handler install order (one `install-order` line) — the
@@ -67,10 +70,10 @@ fn kir_join_names(xs: [String], acc: String) : String = match xs {
 }
 
 # Handler declarations: effect, clause-thunk symbols, optional return.
-fn kir_dump_handlers(hs: [KHandlerDecl], acc: String) : String = match hs {
+fn kir_dump_handlers(tab: SymTab, hs: [KHandlerDecl], acc: String) : String = match hs {
   [] -> acc
-  [h, ...rest] -> kir_dump_handlers(rest, concat_all([
-    acc, "handler ", h.eff, " ", h.sym, " [", kir_dump_op_thunks(h.op_thunks, ""), "]\n"]))
+  [h, ...rest] -> kir_dump_handlers(tab, rest, concat_all([
+    acc, "handler ", kir_eff_name(tab, h.eff_sym), " ", h.sym, " [", kir_dump_op_thunks(h.op_thunks, ""), "]\n"]))
 }
 
 fn kir_dump_op_thunks(ts: [KOpThunk], acc: String) : String = match ts {
@@ -124,13 +127,13 @@ fn kir_dump_regions(rs: [KRegion], acc: String) : String = match rs {
 
 # --- Functions and blocks -----------------------------------------------
 
-fn kir_dump_fns(fns: [KFn], acc: String) : String = match fns {
+fn kir_dump_fns(tab: SymTab, fns: [KFn], acc: String) : String = match fns {
   [] -> acc
-  [f, ...rest] -> kir_dump_fns(rest, cat2(acc, kir_dump_fn(f)))
+  [f, ...rest] -> kir_dump_fns(tab, rest, cat2(acc, kir_dump_fn(tab, f)))
 }
 
 #[doc("Dump a KFn list to KIR text (the same body form the whole-program dump uses). Public so the native modular cache keys a partition on its projected KIR.")]
-pub fn kir_dump_fns_pub(fns: [KFn]) : String = kir_dump_fns(fns, "")
+pub fn kir_dump_fns_pub(tab: SymTab, fns: [KFn]) : String = kir_dump_fns(tab, fns, "")
 
 #[doc("Dump only a KFn's SIGNATURE (kind + name + params + return slot), no blocks. The cross-TU external-declaration slice the modular cache folds in, so a signature/ownership change flips a consumer's key while a body change does not.")]
 pub fn kir_dump_fn_sig_pub(f: KFn) : String =
@@ -144,11 +147,11 @@ pub fn kir_dump_fn_sig_pub(f: KFn) : String =
 # Lane 0 golden shape). A stateful clause prints a `stateful` marker after
 # the return slot so the `KFn.stateful` flag is visible in the dump (the
 # clause reads/writes a handler `state` slot — see `KFn` in `kir.kai`).
-fn kir_dump_fn(f: KFn) : String =
+fn kir_dump_fn(tab: SymTab, f: KFn) : String =
   concat_all([
     "\n", kir_fn_kind_kw(f.kind), "fn ", f.sym, "(", kir_dump_params(f.params, ""), ") : ",
     kir_slot_name(f.ret), kir_stateful_mark(f.stateful), kir_donor_mark(f.donor), " {\n",
-    kir_dump_blocks(f.blocks, ""),
+    kir_dump_blocks(tab, f.blocks, ""),
     "}\n"
   ])
 
@@ -185,21 +188,21 @@ fn kir_origin_mark(o: KParamOrigin) : String = match o {
   PResume        -> " @resume"
 }
 
-fn kir_dump_blocks(bs: [KBlock], acc: String) : String = match bs {
+fn kir_dump_blocks(tab: SymTab, bs: [KBlock], acc: String) : String = match bs {
   [] -> acc
-  [b, ...rest] -> kir_dump_blocks(rest,
-    concat_all([acc, "  ", b.label, ":\n", kir_dump_stmts(b.stmts, ""),
+  [b, ...rest] -> kir_dump_blocks(tab, rest,
+    concat_all([acc, "  ", b.label, ":\n", kir_dump_stmts(tab, b.stmts, ""),
                 "    ", kir_dump_term(b.term), "\n"]))
 }
 
-fn kir_dump_stmts(ss: [KStmt], acc: String) : String = match ss {
+fn kir_dump_stmts(tab: SymTab, ss: [KStmt], acc: String) : String = match ss {
   [] -> acc
-  [s, ...rest] -> kir_dump_stmts(rest, concat_all([acc, "    ", kir_dump_stmt(s), "\n"]))
+  [s, ...rest] -> kir_dump_stmts(tab, rest, concat_all([acc, "    ", kir_dump_stmt(tab, s), "\n"]))
 }
 
-fn kir_dump_stmt(s: KStmt) : String = match s {
-  KLet(n, slot, op, _) -> concat_all([n, ": ", kir_slot_name(slot), " = ", kir_dump_op(op)])
-  KDo(op, _)           -> cat2("do ", kir_dump_op(op))
+fn kir_dump_stmt(tab: SymTab, s: KStmt) : String = match s {
+  KLet(n, slot, op, _) -> concat_all([n, ": ", kir_slot_name(slot), " = ", kir_dump_op(tab, op)])
+  KDo(op, _)           -> cat2("do ", kir_dump_op(tab, op))
   KRC(rc, _)           -> kir_dump_rc(rc)
   KStore(t, v, _)      -> concat_all([t, " <- ", kir_dump_val(v)])
   KInstall(eff, sym, init, alias, _) ->
@@ -238,7 +241,7 @@ fn kir_dump_reuse_kind(rk: KReuseKind) : String = match rk {
   RkVariantMove  -> "variant-move"
 }
 
-fn kir_dump_op(op: KOp) : String = match op {
+fn kir_dump_op(tab: SymTab, op: KOp) : String = match op {
   KCall(sym, cargs)        -> concat_all([sym, "(", kir_dump_vals(cargs, ""), ")"])
   KCallIndirect(fv, cargs) -> concat_all(["call_ind ", kir_dump_val(fv), "(", kir_dump_vals(cargs, ""), ")"])
   KCallIndirectBorrow(fv, cargs) -> concat_all(["call_ind_borrow ", kir_dump_val(fv), "(", kir_dump_vals(cargs, ""), ")"])
@@ -255,7 +258,7 @@ fn kir_dump_op(op: KOp) : String = match op {
   KProjKind(v, i, k)      -> concat_all(["projk ", kir_dump_val(v), ".", int_to_string(i), "/", int_to_string(k)])
   KTagOf(v)               -> cat2("tagof ", kir_dump_val(v))
   KClosure(sym, ar, caps) -> concat_all(["closure ", sym, "/", int_to_string(ar), " [", kir_dump_vals(caps, ""), "]"])
-  KPerform(eff, _, op2, cargs) -> concat_all(["perform ", eff, ".", op2, "(", kir_dump_vals(cargs, ""), ")"])
+  KPerform(eff, targs, op2, via, cargs) -> concat_all(["perform ", kir_eff_key(tab, eff, targs), ".", kir_op_text(op2, via), "(", kir_dump_vals(cargs, ""), ")"])
   KSetjmp(eff, sym)       -> concat_all(["setjmp ", eff, " ", sym])
   KResumeOp(c, a)         -> concat_all(["resume ", kir_dump_val(c), " ", kir_dump_val(a)])
   KResume2Op(c, a, s)     -> concat_all(["resume2 ", kir_dump_val(c), " ", kir_dump_val(a), " ", kir_dump_val(s)])

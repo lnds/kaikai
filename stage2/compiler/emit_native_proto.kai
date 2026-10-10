@@ -42,9 +42,10 @@
 
 import compiler.util
 import compiler.ast
+import compiler.symtab
+import compiler.spec_names
 import compiler.fnreg
 import compiler.emit_shared
-import compiler.reuse_ctors
 import compiler.emit_native_fn
 import compiler.emit_native_call
 
@@ -63,29 +64,29 @@ fn nadapt_allows(a: NAdapters, csym: String) : Bool = match a {
 # Registration always covers EVERY row; `adapters` only restricts which
 # adapter DEFINITIONS this TU emits (`nproto_impl_fnptr` get-or-declares, so
 # a row whose adapter lives in the sibling partition resolves at link).
-pub fn nproto_build_init(ctx: Handle, decls: [Decl], variants: [VariantEntry],
-                         fns: [EFn], adapters: NAdapters, entry: SymId) : Unit / Console = {
-  let rows = collect_pimpl_rows(decls, fns, [])
-  let v2h  = collect_variant_to_head(variants, decls)
+pub fn nproto_build_init(ctx: Handle, decls: [Decl], tab: SymTab, specs: SpecNames, variants: [VariantEntry],
+                         fns: [EFn], adapters: NAdapters, reuse_tags: [Int]) : Unit / Console = {
+  let rows = collect_pimpl_rows(decls, fns, tab, specs, [])
+  let v2h  = collect_variant_to_head(variants, decls, tab)
   # P3: emit every raw impl's `_kaiu_<csym>__boxed` adapter FIRST, each as a
   # complete standalone fn (its own entry block, no shared builder state), so
   # `_kai_proto_init_llvm` below can take each adapter's address by symbol.
   # Emitting them inside the init hook would need a save/restore of the
   # builder's insert point; a separate up-front pass is cleaner.
-  nproto_emit_adapters(ctx, rows, decls, adapters)
+  nproto_emit_adapters(ctx, rows, decls, tab, adapters)
   nproto_open_init(ctx)
   nproto_register_variants(ctx, v2h)
-  nproto_register_impls(ctx, rows, decls)
+  nproto_register_impls(ctx, rows, decls, tab)
   nproto_register_payload_ctors(ctx, variants)
-  nproto_register_reusable_tags(ctx, reusable_tags(decls, variants, entry))
+  nproto_register_reusable_tags(ctx, reuse_tags)
   nproto_seed_nullary(ctx, variants)
   llvm_build_ret_void(native_ctx_b(ctx))
 }
 
 #[doc("Emit ONLY the boxed adapters whose impl symbol is in `only` — the split-core partition's share of the P3 shims. No init hook, no registration: the split root registers every row and resolves these definitions extern at link.")]
-pub fn nproto_emit_adapters_of(ctx: Handle, decls: [Decl], fns: [EFn],
+pub fn nproto_emit_adapters_of(ctx: Handle, decls: [Decl], tab: SymTab, specs: SpecNames, fns: [EFn],
                                only: [String]) : Unit / Console =
-  nproto_emit_adapters(ctx, collect_pimpl_rows(decls, fns, []), decls, NAdaptOnly(only))
+  nproto_emit_adapters(ctx, collect_pimpl_rows(decls, fns, tab, specs, []), decls, tab, NAdaptOnly(only))
 
 # Seed every USER nullary ctor's immortal singleton at startup, so the steady-
 # state `kaix_nullary_fast` array load always hits (Red/Black/RBLeaf) and a
@@ -114,7 +115,7 @@ fn nproto_seed_one_nullary(ctx: Handle, tag: Int, nm: String) : Unit / Console =
 }
 
 # Stamp tag→name AND the full slot mask for every USER ctor with a typed
-# (Int / Real / enum) slot — the SAME `variant_slot_mask` (`ls_ctor_mask`)
+# (Int / Real / enum) slot — the SAME `variant_slot_mask` (`ctor_lay`)
 # construction, reuse and the KProj read consult. The drop walker reads this
 # mask off the tag and skips RC on the raw slots (a raw word carries no
 # refcount), so a reused and a fresh cell of the tag drop identically.
@@ -160,18 +161,18 @@ fn nproto_register_reusable_tags(ctx: Handle, tags: [Int]) : Unit / Console = ma
 # Emit an adapter for each impl that needs one (skip unknown-head rows and
 # rows outside this TU's adapter share). Done before the init hook
 # opens, so each adapter owns the builder while it is filled.
-fn nproto_emit_adapters(ctx: Handle, rows: [PimplRow], decls: [Decl],
+fn nproto_emit_adapters(ctx: Handle, rows: [PimplRow], decls: [Decl], tab: SymTab,
                         adapters: NAdapters) : Unit / Console =
   match rows {
     [] -> ()
     [pr, ...rest] -> {
       match pr {
         PR(csym, _, t, arity, sig, _, home, lent) ->
-          if stdlib_head_tag_int(home, t, decls) >= 0 and pimpl_row_needs_adapter(pr) and nadapt_allows(adapters, csym) {
+          if stdlib_head_tag_int(home, t, decls, tab) >= 0 and pimpl_row_needs_adapter(pr) and nadapt_allows(adapters, csym) {
             nproto_emit_boxed_adapter(ctx, csym, sig, arity, lent)
           } else { () }
       }
-      nproto_emit_adapters(ctx, rest, decls, adapters)
+      nproto_emit_adapters(ctx, rest, decls, tab, adapters)
     }
   }
 
@@ -212,16 +213,16 @@ fn nproto_register_variants(ctx: Handle, v2h: [Int]) : Unit / Console =
 # the runtime hashmap would never match). An impl that needs an adapter
 # (`pimpl_row_needs_adapter`) registers it; any other registers its bare
 # `c_sym` (= the dispatch ABI).
-fn nproto_register_impls(ctx: Handle, rows: [PimplRow], decls: [Decl]) : Unit / Console =
+fn nproto_register_impls(ctx: Handle, rows: [PimplRow], decls: [Decl], tab: SymTab) : Unit / Console =
   match rows {
     [] -> ()
     [pr, ...rest] -> match pr {
       PR(_, p, t, arity, _, op, home, _) -> {
-        let head_int = stdlib_head_tag_int(home, t, decls)
-        if head_int < 0 { nproto_register_impls(ctx, rest, decls) }
+        let head_int = stdlib_head_tag_int(home, t, decls, tab)
+        if head_int < 0 { nproto_register_impls(ctx, rest, decls, tab) }
         else {
           nproto_register_one(ctx, stdlib_proto_id_int(p), stdlib_proto_op_id_int(p, op), head_int, pr, arity)
-          nproto_register_impls(ctx, rest, decls)
+          nproto_register_impls(ctx, rest, decls, tab)
         }
       }
     }
