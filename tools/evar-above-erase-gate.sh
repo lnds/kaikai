@@ -50,6 +50,8 @@ SRC="$ROOT/stage2/compiler"
 #   unbox*,            (`__perceus_dup`, `__pcs_ret`), or a runtime
 #   cell_promote       primitive's borrow variant; never a declaration.
 #   sym_read         — the ESym→EVar reader itself.
+#   core_unstamp     — hands a core builtin to the passes that still read
+#                      it by name.
 #   emit_tcrec_live  — the matches are prose inside a `#[doc]` block.
 #   cache_delta_test,— fixtures; they build the node they assert on.
 #   resolve_sym_test
@@ -61,7 +63,7 @@ ALLOW='ast|parse|desugar|surface_lower|modules|type_scope|effect_scope|effect_sc
 ALLOW="$ALLOW|const_pattern|refinements|refine_enforce|vec_surface|protos"
 ALLOW="$ALLOW|json_derive|layout_derive|fmt_expr|tailfuse|tailids"
 ALLOW="$ALLOW|pipe_fusion|resolve|infer|monomorph|fwd_inline"
-ALLOW="$ALLOW|closure_spec_ast|closure_spec_emit|sym_read"
+ALLOW="$ALLOW|closure_spec_ast|closure_spec_emit|sym_read|core_unstamp"
 ALLOW="$ALLOW|emit_tcrec_live|cache_delta_test|resolve_sym_test"
 ALLOW="$ALLOW|perceus|perceus_plant_drop|perceus_tail_drop|perceus_owned_pos"
 ALLOW="$ALLOW|perceus_payer|unbox|unbox_native_raw|cell_promote"
