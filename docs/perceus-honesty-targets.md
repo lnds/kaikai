@@ -152,8 +152,12 @@ takes the slot's reference, and the assignment refills the slot. A
 vector bound from a constructor field writes in place too
 (`Box(v, n) -> Box(vec_set(v, i, x), n + 1)`, or the arm returning the
 written vector): an owned match releases its scrutinee as an arm over a
-flat constructor pattern starts, once each binder holds its own
-reference, unless the arm rebuilds into the cell.
+flat constructor pattern starts, unless the arm rebuilds into the cell.
+The arm takes the cell apart: a sole owner passes its children to the
+binders with no dup and frees the shell alone, with no cascade; a shared
+cell gives each binder a reference and loses one. Behind a guard or
+inside a region the cell is not taken apart: the arm dups its binders
+and, when it hands one on, drops the cell before its body runs.
 
 > **Current state (2026-10-10):** four shapes still copy on every write.
 > A `let` bound inside a loop or closure body and then written: every

@@ -992,6 +992,11 @@ KaiReuse kaix_drop_slot_if_token(KaiReuse token, int32_t i) {
   return token;
 }
 
+/* A flat arm takes its scrutinee apart (`kai_arm_take`). On a cell it could
+ * not take, each bound child gets its own reference. */
+int32_t kaix_arm_take(KaiValue *v, int32_t unbound)   { return kai_arm_take(v, (uint32_t) unbound); }
+void    kaix_arm_share(int32_t took, KaiValue *child) { if (!took) kai_incref(child); }
+
 /* Borrow read of a variant pointer slot — the bind-site uses this in the
  * UNIQUE branch so the child is moved (not duplicated) into the rebuild.
  * Unlike `kaix_variant_arg` (which boxes typed slots and is borrow for
