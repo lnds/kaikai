@@ -22,6 +22,10 @@
 import compiler.util
 import compiler.ast
 import compiler.emit_shared
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+import compiler.type_text
 
 # One declared `extern "C" type`/`opaque`, recovered from the
 # pre-lowering decl stream. A struct carries its field list (each field
@@ -29,8 +33,8 @@ import compiler.emit_shared
 #[doc("FFI v2 registry entry: a declared extern struct (with fields) or opaque handle, keyed by name.")]
 pub type ExternTypeReg = ExtStruct(String, [FieldDecl]) | ExtOpaque(String)
 
-#[doc("Collect every `extern \"C\" type`/`opaque` from the (pre-lowering) decl stream into the FFI v2 registry.")]
-pub fn collect_extern_types(ds: [Decl]) : [ExternTypeReg] = collect_extern_types_loop(ds, [])
+#[doc("Collect every `extern \"C\" type`/`opaque` from the decl stream into the FFI v2 registry; `tab` names the record an opaque lowered to.")]
+pub fn collect_extern_types(ds: [Decl], tab: SymTab) : [ExternTypeReg] = collect_extern_types_loop(ds, tab, [])
 
 # The phantom field name `lower_extern_opaques` (desugar.kai) stamps on
 # the one-field record an `extern "C" opaque` lowers to. The registry
@@ -39,22 +43,22 @@ pub fn collect_extern_types(ds: [Decl]) : [ExternTypeReg] = collect_extern_types
 #[doc("The phantom field name marking the record an `extern \"C\" opaque` lowers to.")]
 pub fn ffi_opaque_phantom_field() : String = "__ffi_handle"
 
-fn collect_extern_types_loop(ds: [Decl], acc: [ExternTypeReg]) : [ExternTypeReg] = match ds {
+fn collect_extern_types_loop(ds: [Decl], tab: SymTab, acc: [ExternTypeReg]) : [ExternTypeReg] = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> match d {
     DExternType(name, body, _, _, _) -> match body {
-      ETStruct(fields) -> collect_extern_types_loop(rest, [ExtStruct(name, fields), ...acc])
-      ETOpaque         -> collect_extern_types_loop(rest, [ExtOpaque(name), ...acc])
+      ETStruct(fields) -> collect_extern_types_loop(rest, tab, [ExtStruct(name, fields), ...acc])
+      ETOpaque         -> collect_extern_types_loop(rest, tab, [ExtOpaque(name), ...acc])
     }
     # Post-lowering: an `extern "C" opaque` is a one-`__ffi_handle`-field
     # record. Recognise it so emit's registry stays correct.
-    DType(_, name, _, TBRecord(fields), _, _, _, _, _) ->
-      if is_opaque_phantom_record(fields) { collect_extern_types_loop(rest, [ExtOpaque(name), ...acc]) }
-      else { collect_extern_types_loop(rest, acc) }
+    DType(_, s, _, TBRecord(fields), _, _, _, _) ->
+      if is_opaque_phantom_record(fields) { collect_extern_types_loop(rest, tab, [ExtOpaque(written_text(decl_name(tab, s))), ...acc]) }
+      else { collect_extern_types_loop(rest, tab, acc) }
     # A documented foreign type rides inside a DDoc wrapper on some
     # paths; see through it so the registry stays complete.
-    DDoc(_, _, inner, _, _) -> collect_extern_types_loop([inner, ...rest], acc)
-    _ -> collect_extern_types_loop(rest, acc)
+    DDoc(_, _, inner, _, _) -> collect_extern_types_loop([inner, ...rest], tab, acc)
+    _ -> collect_extern_types_loop(rest, tab, acc)
   }
 }
 
@@ -80,9 +84,10 @@ pub fn extern_type_name(e: ExternTypeReg) : String = match e {
 # Registry-AWARE classifier: upgrades a non-primitive named type to a
 # struct / opaque kind when the registry knows it. Fixed-width and v1
 # scalars fall through to the registry-free `ffi_kind_of_ty`.
-#[doc("Classify a boundary type, consulting the extern-type registry for struct/opaque names.")]
-pub fn ffi_kind_of_ty_reg(t: TypeExpr, reg: [ExternTypeReg]) : FfiRetKind = match t.tkind {
-  TyName(_, n, targs) ->
+#[doc("Classify a boundary type, consulting the extern-type registry for struct/opaque names; `tab` spells a type already settled.")]
+pub fn ffi_kind_of_ty_reg(t: TypeExpr, reg: [ExternTypeReg], tab: SymTab) : FfiRetKind = match t.tkind {
+  TyName(r, targs) -> {
+    let n = ref_decl_name(tab, r)
     if list_length(targs) > 0 { FfiRetUnknown(n) }
     else {
       match extern_type_lookup(reg, n) {
@@ -90,16 +95,17 @@ pub fn ffi_kind_of_ty_reg(t: TypeExpr, reg: [ExternTypeReg]) : FfiRetKind = matc
           ExtStruct(_, _) -> FfiRetStruct(n)
           ExtOpaque(_)    -> FfiRetForeign(n)
         }
-        None -> ffi_kind_of_ty(t)
+        None -> ffi_kind_of_ty(t, tab)
       }
     }
-  _ -> ffi_kind_of_ty(t)
+  }
+  _ -> ffi_kind_of_ty(t, tab)
 }
 
 #[doc("FFI v2 ret kind of an optional return type, registry-aware (None = Unit/void).")]
-pub fn ffi_ret_kind_of_reg(opt: Option[TypeExpr], reg: [ExternTypeReg]) : FfiRetKind = match opt {
+pub fn ffi_ret_kind_of_reg(opt: Option[TypeExpr], reg: [ExternTypeReg], tab: SymTab) : FfiRetKind = match opt {
   None    -> FfiRetUnit
-  Some(t) -> ffi_kind_of_ty_reg(t, reg)
+  Some(t) -> ffi_kind_of_ty_reg(t, reg, tab)
 }
 
 #[doc("The C struct fields of a registered extern struct (empty if not a struct / not found).")]
@@ -114,13 +120,16 @@ pub fn extern_struct_fields(reg: [ExternTypeReg], name: String) : [FieldDecl] =
 # struct name (rendered as the nested C struct tag). Anything else is a
 # defensive fallthrough that yields an `#error`-friendly placeholder.
 #[doc("The C type string for one extern-struct field, given the registry (fixed-width or nested struct).")]
-pub fn extern_field_c_type(fd: FieldDecl, reg: [ExternTypeReg]) : String = match fd {
+pub fn extern_field_c_type(fd: FieldDecl, reg: [ExternTypeReg], tab: SymTab) : String = match fd {
   FD(_, _, fty, _) -> match fty.tkind {
-    TyName(_, n, _) -> match ffi_fixed_of_name(n) {
-      Some(fx) -> ffi_fixed_c_type(fx)
-      None     -> match extern_type_lookup(reg, n) {
-        Some(ExtStruct(_, _)) -> extern_struct_c_tag(n)
-        _ -> concat_all(["/* unsupported FFI field type ", n, " */ int"])
+    TyName(r, _) -> {
+      let n = ref_decl_name(tab, r)
+      match ffi_fixed_of_name(n) {
+        Some(fx) -> ffi_fixed_c_type(fx)
+        None     -> match extern_type_lookup(reg, n) {
+          Some(ExtStruct(_, _)) -> extern_struct_c_tag(n)
+          _ -> concat_all(["/* unsupported FFI field type ", n, " */ int"])
+        }
       }
     }
     _ -> "/* unsupported FFI field type */ int"

@@ -1,83 +1,41 @@
-# compiler/tycon_home.kai — stamp each `TyCon` with the module that
-# declares the type.
+# compiler/tycon_home.kai — give every constructor pattern the identity
+# of the constructor it tests.
 #
-# The typer stamps a `TyCon` only when the type-home table settles its
-# name alone; a core literal or a name declared twice reaches the typed
-# decls with `module_origin` empty. Consumers that need a nominal type's
-# identity — above all the emitter, deciding which of two same-named
-# constructors a match arm tests — then see only a bare name.
-#
-# This pass runs once over the typed decls and rewrites
-# `TyCon(None, name, args)` to `TyCon(Some(m), name, args)` from the
-# declaration tables, resolving a contested name against the module
-# whose decl is being walked.
-#
-# With the type stamped, both sides of a match can be stamped too. An
+# The typer settles the patterns it checks. One that still spells its
+# constructor is settled here from the type it is matched against: an
 # ordinary `match b { Node(n) -> ... }` names its constructor without a
 # qualifier, and the module declaring the scrutinee's type is the one
-# declaring the constructor the arm tests; a bare `Node(n)` in value
-# position likewise builds the type its own annotation names. Stamping
-# from the type is what lets both sides agree on which homonym they
-# mean, and that agreement is what lets the variant table key by home.
+# declaring the constructor the arm tests.
+#
+# This pass runs once over the typed decls, so every reader after it
+# finds a pattern's constructor by id.
 
-import compiler.util
 import compiler.ast
 import compiler.ast_map
 import compiler.emit_shared
+import compiler.symtab
 import compiler.type_home
-import compiler.infer_index
 import compiler.tycon_pat
 
-#[doc("Stamp every `TyCon` in the typed decls with the module declaring that type, and qualify the constructor sites whose home that reveals.")]
-pub fn tag_tycon_modules(ds: [Decl]) : [Decl] = {
-  let homes = type_home_table(ds)
-  match homes.root {
-    IEmpty -> ds
-    _  -> {
-      let hs = THC(homes, th_ctor_names(ds, []), None, tpay_table(ds))
-      map(ds, (d) => th_decl(d, hs))
-    }
-  }
+#[doc("The typed decls with every constructor pattern that still spells its constructor naming the one its scrutinee's type declares; `tab` holds the declarations of `ds`.")]
+pub fn tag_tycon_modules(ds: [Decl], tab: SymTab) : [Decl] = {
+  let hs = THC(type_home_table(ds, tab), tpay_table(ds))
+  map(ds, (d) => th_decl(d, hs))
 }
 
-# What the walk carries: the type-home table, the constructor names a
-# bare call may denote, and the module whose decl is being walked. A
-# name absent from `ctors` is an ordinary call and is never qualified.
-#
-# The current module is what resolves a contested type name. Two modules
-# declaring `Err` are two types, and the one a decl means is its own
-# module's — the same rule the resolver applies to the name itself.
-type THCtx = THC(TyHomeTab, [String], Option[String], [TPay])
-
-fn th_ctor_names(ds: [Decl], acc: [String]) : [String] = match ds {
-  [] -> acc
-  [d, ...rest] -> match decl_transparent_inner(d) {
-    Some(inner) -> th_ctor_names([inner, ...rest], acc)
-    None -> match d {
-      DType(_, _, _, TBSum(vs), _, _, _, _, _) -> th_ctor_names(rest, th_variant_names(vs, acc))
-      _ -> th_ctor_names(rest, acc)
-    }
-  }
-}
-
-fn th_variant_names(vs: [Variant], acc: [String]) : [String] = match vs {
-  [] -> acc
-  [Var(n, _), ...rest] ->
-    if list_has(acc, n) { th_variant_names(rest, acc) }
-    else { th_variant_names(rest, [n, ...acc]) }
-}
+# What the walk carries: the type declarations a payload type is read
+# against, and the payload shapes that type a sub-pattern.
+type THCtx = THC(TyHomeTab, [TPay])
 
 # --- decl walk -------------------------------------------------------
 
-# Each decl is walked in ITS module, so a contested type name resolves
-# to the declaration that decl can actually see.
 fn th_decl(d: Decl, hs: THCtx) : Decl = match d {
-  DFn(pub_, n, tps, ps, ret, row, body, l, c, mo, fsym) ->
-    DFn(pub_, n, tps, ps, ret, row, th_expr(body, th_in_module(hs, mo)), l, c, mo, fsym)
-  DTest(desc, body, l, c, mo)          -> DTest(desc, th_expr(body, th_in_module(hs, mo)), l, c, mo)
-  DBench(desc, body, l, c, mo)         -> DBench(desc, th_expr(body, th_in_module(hs, mo)), l, c, mo)
-  DCheck(desc, ps, body, l, c, mo)     -> DCheck(desc, ps, th_expr(body, th_in_module(hs, mo)), l, c, mo)
-  DConst(pub_, n, ty, init, mo, l, c, csym) -> DConst(pub_, n, ty, th_expr(init, th_in_module(hs, mo)), mo, l, c, csym)
+  DFn(pub_, fid, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(pub_, fid, tps, ps, ret, row, th_expr(body, hs), l, c, mo)
+  DTest(desc, body, l, c, mo)          -> DTest(desc, th_expr(body, hs), l, c, mo)
+  DBench(desc, body, l, c, mo)         -> DBench(desc, th_expr(body, hs), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo)     -> DCheck(desc, ps, th_expr(body, hs), l, c, mo)
+  DConst(pub_, s, ty, init, mo, l, c)  -> DConst(pub_, s, ty, th_expr(init, hs), mo, l, c)
   DImpl(p, tas, tgt, inner, l, c, tps, isym) -> DImpl(p, tas, tgt, map(inner, (i) => th_decl(i, hs)), l, c, tps, isym)
   DDerive(ns, inner, l, c)             -> DDerive(ns, th_decl(inner, hs), l, c)
   DUnstable(inner, l, c)               -> DUnstable(th_decl(inner, hs), l, c)
@@ -91,39 +49,8 @@ fn th_decl(d: Decl, hs: THCtx) : Decl = match d {
 
 # --- expression walk -------------------------------------------------
 
-fn th_expr(e: Expr, hs: THCtx) : Expr = {
-  let walked = Expr { kind: th_kind(e.kind, hs),
-                      line: e.line, col: e.col,
-                      ty: th_opt_ty(e.ty, hs), mode: e.mode,  site: e.site }
-  th_qualify_call(walked, hs)
-}
-
-fn th_is_ctor(hs: THCtx, nm: String) : Bool = match hs { THC(_, cs, _, _) -> list_has(cs, nm) }
-
-# A qualifier reads as the TYPE only when it names the node's own type;
-# a module of the same spelling — or a home this pass already wrote —
-# is left alone.
-fn th_names_type(q: String, t: Option[Ty]) : Bool = match th_res_name(t) {
-  Some(nm) -> nm == q
-  None     -> false
-}
-
-fn th_res_name(t: Option[Ty]) : Option[String] = match t {
-  Some(TyCon(_, nm, _, _))     -> Some(nm)
-  Some(TyRefineT(inner, _)) -> th_res_name(Some(inner))
-  Some(TyDimT(inner, _))    -> th_res_name(Some(inner))
-  Some(TyFnT(_, ret, _))    -> th_res_name(Some(ret))
-  _                         -> None
-}
-
-# The home a type NAME denotes in the module being walked.
-fn th_type_home(hs: THCtx, nm: String) : Option[String] = match hs {
-  THC(t, _, cur, _) -> type_home_of(t, nm, cur)
-}
-
-fn th_in_module(hs: THCtx, mo: Option[String]) : THCtx = match hs {
-  THC(t, cs, _, ps) -> THC(t, cs, mo, ps)
-}
+fn th_expr(e: Expr, hs: THCtx) : Expr =
+  Expr { kind: th_kind(e.kind, hs), line: e.line, col: e.col, ty: e.ty, mode: e.mode, site: e.site }
 
 fn th_kind(k: ExprKind, hs: THCtx) : ExprKind = match k {
   EMatch(scr, arms) -> {
@@ -138,7 +65,7 @@ fn th_kind(k: ExprKind, hs: THCtx) : ExprKind = match k {
 fn th_stmt(s: Stmt, hs: THCtx) : Stmt = match s {
   SLet(p, ann, rhs) -> {
     let rhs2 = th_expr(rhs, hs)
-    match hs { THC(t, _, _, ps) -> SLet(tp_pat(p, rhs2.ty, t, ps), ann, rhs2) }
+    match hs { THC(t, ps) -> SLet(tp_pat(p, rhs2.ty, t, ps), ann, rhs2) }
   }
   _ -> prc_map_stmt_exprs(s, (x) => th_expr(x, hs))
 }
@@ -148,101 +75,11 @@ fn th_opt_expr(e: Option[Expr], hs: THCtx) : Option[Expr] = match e {
   Some(x) -> Some(th_expr(x, hs))
 }
 
-# A constructor site names its home, or names nothing the emitter can
-# read. Two spellings arrive without one:
-#
-#   * a bare `Ctor(args)`, whose home is the one its own annotated type
-#     names — the constructor builds that type and no other;
-#   * `EModCall(T, Ctor)`, the form the typer mints when it disambiguates
-#     a contested bare constructor by TYPE. `T` is a type name, not a
-#     module, so a home lookup against it finds nothing.
-#
-# Both rewrite to `EModCall(<module>, Ctor)`, the one spelling every
-# consumer resolves. A qualifier that does not name the node's own type
-# is a module — written by the user or by this pass one level down —
-# and is left alone.
-fn th_qualify_call(e: Expr, hs: THCtx) : Expr = match e.kind {
-  ECall(f, cargs) -> match th_ctor_home(f, e.ty, hs) {
-    None    -> e
-    Some(m) -> match f.kind {
-      EName(nm)        -> th_with_callee(e, f, cargs, m, nm)
-      EModCall(_, nm) -> th_with_callee(e, f, cargs, m, nm)
-      _               -> e
-    }
-  }
-  # A nullary constructor already qualified by TYPE. The bare `EVar`
-  # spelling is left alone: it is also how an ordinary value read looks,
-  # and rewriting it would retarget reads this pass cannot tell apart.
-  EModCall(q, nm) ->
-    if th_is_ctor(hs, nm) and th_names_type(q, e.ty) {
-      match th_type_home(hs, q) {
-        None    -> e
-        Some(m) -> Expr { kind: EModCall(m, nm), line: e.line, col: e.col,
-                          ty: e.ty, mode: e.mode,  site: e.site }
-      }
-    } else { e }
-  _ -> e
-}
-
-# The home of a constructor node, from its qualifier when that names a
-# type, and from its own annotated type when it is bare. A node that is
-# not a constructor, or whose qualifier already names a module, yields
-# None and is left as written.
-fn th_ctor_home(f: Expr, res_ty: Option[Ty], hs: THCtx) : Option[String] =
-  match f.kind {
-    EName(nm)        -> if th_is_ctor(hs, nm) { ty_home(res_ty) } else { None }
-    EModCall(q, nm) ->
-      if th_is_ctor(hs, nm) and th_names_type(q, res_ty) { th_type_home(hs, q) } else { None }
-    _               -> None
-  }
-
-fn th_with_callee(e: Expr, f: Expr, cargs: [Expr], m: String, nm: String) : Expr =
-  Expr { kind: ECall(Expr { kind: EModCall(m, nm), line: f.line, col: f.col,
-                            ty: f.ty, mode: f.mode,  site: f.site }, cargs),
-         line: e.line, col: e.col, ty: e.ty, mode: e.mode , site: 0 }
-
-
 fn th_arm(a: Arm, scr_ty: Option[Ty], hs: THCtx) : Arm = match a {
   Arm(pat, guard, body) -> match hs {
-    THC(t, _, _, ps) ->
+    THC(t, ps) ->
       Arm(tp_pat(pat, scr_ty, t, ps),
           match guard { None -> None Some(g) -> Some(th_expr(g, hs)) },
           th_expr(body, hs))
   }
 }
-
-fn ty_home(t: Option[Ty]) : Option[String] = match t {
-  Some(TyCon(mo, _, _, _))     -> mo
-  Some(TyRefineT(inner, _)) -> ty_home(Some(inner))
-  Some(TyDimT(inner, _))    -> ty_home(Some(inner))
-  _                         -> None
-}
-
-fn th_opt_ty(t: Option[Ty], hs: THCtx) : Option[Ty] = match t {
-  None    -> None
-  Some(x) -> Some(th_ty(x, hs))
-}
-
-fn th_ty(t: Ty, hs: THCtx) : Ty = match t {
-  TyCon(mo, nm, tas, sid) -> {
-    let tas2 = map(tas, (a) => th_ty(a, hs))
-    match mo {
-      Some(_) -> TyCon(mo, nm, tas2, sid)
-      None    -> TyCon(th_type_home(hs, nm), nm, tas2, sid)
-    }
-  }
-  TyListT(inner)      -> TyListT(th_ty(inner, hs))
-  TyFnT(ps, ret, row) -> TyFnT(map(ps, (p) => th_ty(p, hs)), th_ty(ret, hs), th_row(row, hs))
-  TyDimT(base, u)     -> TyDimT(th_ty(base, hs), u)
-  TyRefineT(base, p)  -> TyRefineT(th_ty(base, hs), p)
-  TyUnion(parts)      -> TyUnion(map(parts, (p) => th_ty(p, hs)))
-  TyShapeApp(sv, arg) -> TyShapeApp(sv, th_ty(arg, hs))
-  _ -> t
-}
-
-fn th_row(r: Row, hs: THCtx) : Row =
-  Row { labels: map(r.labels, (l) => th_label(l, hs)),
-        tail: r.tail, display_alias: r.display_alias }
-
-fn th_label(l: Label, hs: THCtx) : Label =
-  Label { ...l, ty_args: map(l.ty_args, (a) => th_ty(a, hs)) }

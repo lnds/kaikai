@@ -1,35 +1,39 @@
-# compiler/type_home.kai — which declaration a nominal type name denotes.
+# compiler/type_home.kai — which declaration a written type name denotes.
 #
 # A type name alone does not identify a type: a user module and a core
 # module may both declare `Sig`. The table here records every nominal
-# declaration with its module, and the lookup resolves a name as seen
-# from one module. Both the TyCon stamping pass and the variant slot
-# layout read this one rule, so they never disagree on which homonym a
-# name means.
+# declaration with its module, and the lookup resolves a reference as
+# seen from one module. Both the pattern stamping pass and the variant
+# slot layout read this one rule, so they never disagree on which
+# homonym a name means.
 
 import compiler.ast
+import compiler.written
+import compiler.decl_names
+import compiler.symtab
 import compiler.infer_index
 import compiler.scalar_ty
 
-#[doc("One nominal type declaration: its name, the module declaring it, and whether every constructor is nullary.")]
-pub type TyHome = TH(String, Option[String], Bool)
+#[doc("One nominal type declaration: its identity, the module declaring it, and whether every constructor is nullary.")]
+pub type TyHome = TH(SymId, Option[String], Bool)
 
-#[doc("The type homes keyed by name: a lookup reads the declarations of one name.")]
-pub type TyHomeTab = NameIndex[TyHome]
+#[doc("The type homes by declaration, and the symbol table a written name is looked up in.")]
+pub type TyHomeTab = { tab: SymTab, by_sym: NameIndex[TyHome] }
 
-#[doc("Every nominal type declared in `ds`, once per (name, module) pair.")]
-pub fn type_home_table(ds: [Decl]) : TyHomeTab = th_table_loop(ds, idx_empty())
+#[doc("Every nominal type declared in `ds`, once per declaration; `tab` holds their names.")]
+pub fn type_home_table(ds: [Decl], tab: SymTab) : TyHomeTab =
+  TyHomeTab { tab: tab, by_sym: th_table_loop(ds, idx_empty()) }
 
-fn th_table_loop(ds: [Decl], acc: TyHomeTab) : TyHomeTab = match ds {
+fn th_table_loop(ds: [Decl], acc: NameIndex[TyHome]) : NameIndex[TyHome] = match ds {
   [] -> acc
   [d, ...rest] -> match decl_transparent_inner(d) {
     Some(inner) -> th_table_loop([inner, ...rest], acc)
     None -> match d {
-      DType(_, nm, _, body, _, _, mo, _, _) -> match body {
+      DType(_, s, _, body, _, _, mo, _) -> match body {
         TBAlias(_)       -> th_table_loop(rest, acc)
         TBEffectAlias(_) -> th_table_loop(rest, acc)
-        TBSum(vs)        -> th_table_loop(rest, th_record(acc, nm, mo, all_variants_nullary(vs)))
-        _                -> th_table_loop(rest, th_record(acc, nm, mo, false))
+        TBSum(vs)        -> th_table_loop(rest, th_record(acc, s, mo, all_variants_nullary(vs)))
+        _                -> th_table_loop(rest, th_record(acc, s, mo, false))
       }
       _ -> th_table_loop(rest, acc)
     }
@@ -46,16 +50,14 @@ pub fn all_variants_nullary(vs: [Variant]) : Bool = match vs {
 }
 
 # A core segment is re-injected alongside its own declaration, so the
-# same (name, home) pair arrives twice; recording it once keeps the
-# uniqueness test in the lookup meaningful.
-fn th_record(acc: TyHomeTab, nm: String, mo: Option[String], en: Bool) : TyHomeTab =
-  if th_has(idx_chain(acc, nm), nm, mo) { acc } else { idx_prepend(acc, nm, TH(nm, mo, en)) }
-
-fn th_has(hs: [TyHome], nm: String, mo: Option[String]) : Bool = match hs {
-  [] -> false
-  [TH(n, m, _), ...rest] ->
-    if n == nm and same_home(m, mo) { true } else { th_has(rest, nm, mo) }
-}
+# same declaration arrives twice; recording it once keeps the uniqueness
+# test in the lookup meaningful.
+fn th_record(acc: NameIndex[TyHome], s: SymId, mo: Option[String], en: Bool) : NameIndex[TyHome] =
+  if sym_raw(s) < 0 { acc }
+  else { match idx_chain_sym(acc, s) {
+    [_, ..._] -> acc
+    []        -> idx_prepend_sym(acc, s, TH(s, mo, en))
+  } }
 
 #[doc("True iff two module slots name the same module (both empty counts as equal).")]
 pub fn same_home(a: Option[String], b: Option[String]) : Bool = match a {
@@ -63,42 +65,50 @@ pub fn same_home(a: Option[String], b: Option[String]) : Bool = match a {
   Some(x) -> match b { None -> false   Some(y) -> x == y }
 }
 
-#[doc("The declaration type name `nm` denotes from module `cur`: one in `cur` wins, else a sole declaration anywhere; None when absent or contested.")]
-pub fn type_home_entry(hs: TyHomeTab, nm: String, cur: Option[String]) : Option[TyHome] =
-  th_scan(idx_chain(hs, nm), nm, cur, None, 0)
+#[doc("The declaration the type reference `r` denotes from module `cur`: its own once it is settled; for a bare written name, one `cur` declares wins, else a sole declaration anywhere. None when absent, contested, or still written with a qualifier.")]
+pub fn type_home_entry(hs: TyHomeTab, r: DeclRef, cur: Option[String]) : Option[TyHome] = match r {
+  DrSym(s)              -> th_of_sym(hs, s)
+  DrWritten(None, n)    -> th_scan(th_named(hs, written_text(n)), cur, None, 0)
+  DrWritten(Some(_), _) -> None
+}
+
+fn th_of_sym(hs: TyHomeTab, s: SymId) : Option[TyHome] =
+  if sym_raw(s) < 0 { None }
+  else { match idx_chain_sym(hs.by_sym, s) {
+    [h, ..._] -> Some(h)
+    []        -> None
+  } }
+
+# The declarations the table holds among the types spelled `nm`.
+fn th_named(hs: TyHomeTab, nm: String) : [TyHome] =
+  flat_map(st_candidates(hs.tab, NCType, nm), (s) => match th_of_sym(hs, s) {
+    Some(h) -> [h]
+    None    -> []
+  })
 
 # Declaring `cur` answers immediately, even after other homes were seen;
 # otherwise exactly one declaration elsewhere answers.
-fn th_scan(hs: [TyHome], nm: String, cur: Option[String],
-           found: Option[TyHome], n: Int) : Option[TyHome] = match hs {
+fn th_scan(hs: [TyHome], cur: Option[String], found: Option[TyHome], n: Int) : Option[TyHome] = match hs {
   [] -> if n == 1 { found } else { None }
   [h, ...rest] -> match h {
-    TH(hn, hm, _) ->
-      if hn != nm { th_scan(rest, nm, cur, found, n) }
-      else if same_home(hm, cur) { Some(h) }
-      else { th_scan(rest, nm, cur, Some(h), n + 1) }
+    TH(_, hm, _) ->
+      if same_home(hm, cur) { Some(h) }
+      else { th_scan(rest, cur, Some(h), n + 1) }
   }
 }
-
-#[doc("The module declaring type `nm` as seen from `cur`; None for the root, an unknown name, or a contested one.")]
-pub fn type_home_of(hs: TyHomeTab, nm: String, cur: Option[String]) : Option[String] =
-  match type_home_entry(hs, nm, cur) {
-    Some(TH(_, m, _)) -> m
-    None              -> None
-  }
 
 # A tagged Int rides `.i64`, a Real `.r`, and an all-nullary sum its
 # immediate tag instead of a pointer to the interned singleton; anything
 # else — including a contested name — is a boxed `KaiValue *`.
 #[doc("Slot-kind code of payload type `te` declared in module `cur`: 1 Int, 2 Real, 3 enum, 0 boxed pointer.")]
 pub fn payload_slot_kind(hs: TyHomeTab, cur: Option[String], te: TypeExpr) : Int = match te.tkind {
-  TyName(_, n, targs) ->
+  TyName(r, targs) ->
     if list_length(targs) != 0 { 0 }
-    else { match scalar_ty_named(n) {
+    else { match scalar_ty_named(ref_spelled(r)) {
       Some(TyInt)  -> 1
       Some(TyReal) -> 2
       Some(_)      -> 0
-      None -> match type_home_entry(hs, n, cur) {
+      None -> match type_home_entry(hs, r, cur) {
         Some(TH(_, _, en)) -> if en { 3 } else { 0 }
         None               -> 0
       }
