@@ -1381,53 +1381,57 @@ fn substitute_self_in_kind(k: TyKind) : TyKind {
 }
 
 # Validate, before expansion, that every `#[derive(P)]` of Eq, Hash or
-# Show can be discharged: each field type must reach an impl of `P`
-# (explicit, derived, or builtin) through every type argument a container
-# impl bounds by `P`, so `[(Int, String)]` needs `P` on `List` and `Pair`.
-fn validate_derives(ps: PScope, ds: [Decl], df: DiagFiles) : [Diagnostic] / Console =
-  list_reverse(validate_derives_loop(ps, ds, df, collect_impl_reach(ps, ds, []), []))
+# Show can be discharged: each field type must reach an impl that answers
+# the derive (explicit, derived, or builtin) through every type argument a
+# container impl bounds by its protocol, so `[(Int, String)]` needs one on
+# `List` and on `Pair`.
+fn validate_derives(ps: PScope, sg: ShapedGens, ds: [Decl], df: DiagFiles) : [Diagnostic] / Console =
+  list_reverse(validate_derives_loop(ps, sg, ds, df, collect_impl_reach(ps, sg, ds, []), []))
 
-fn collect_impl_reach(ps: PScope, ds: [Decl], acc: [ImplReach]) : [ImplReach] {
+# Every impl, written or derived, of a protocol whose generator's fields
+# are checked here.
+fn collect_impl_reach(ps: PScope, sg: ShapedGens, ds: [Decl], acc: [ImplReach]) : [ImplReach] {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
       DImpl(pref, _, target, ms, _, _, tps, _) -> {
-        let acc1 = match impl_gen(ps, pref, impl_home_of(ms)) {
-          Some(g) -> [impl_reach(core_proto_name(g), head_tree(ps_tab(ps), target), tps), ...acc]
-          None    -> acc
-        }
-        collect_impl_reach(ps, rest, acc1)
+        let from = impl_home_of(ms)
+        let p = proto_ref_sym(ps, pref, from)
+        let acc1 = if gen_reach_checked(proto_gen(sg, p)) {
+          [impl_reach(p, head_tree(ps, from, reach_params(tps), target), tps,
+                      (b) => psc_same(ps_proto_sym(ps, b, from), p)), ...acc]
+        } else { acc }
+        collect_impl_reach(ps, sg, rest, acc1)
       }
       DDerive(names, inner, _, _) -> match inner {
-        DType(_, tsym, tps, _, _, _, _, _) -> {
-          let tname = ref_text(ps_tab(ps), DrSym(tsym))
-          collect_impl_reach(ps, rest, list_append(map(derive_gens(ps, names, derive_from(ps, inner)),
-                                                   (d) => derived_reach(gen_key(d), tname, tps)), acc))
-        }
-        _ -> collect_impl_reach(ps, rest, acc)
+        DType(_, tsym, tps, _, _, _, _, _) ->
+          collect_impl_reach(ps, sg, rest, list_append(map(reach_gens(ps, sg, names, derive_from(ps, inner)),
+                                                       (g) => derived_reach(gen_proto(g), tsym, tps)), acc))
+        _ -> collect_impl_reach(ps, sg, rest, acc)
       }
       DUnstable(inner, _, _) ->
-        collect_impl_reach(ps, [inner, ...rest], acc)
+        collect_impl_reach(ps, sg, [inner, ...rest], acc)
       DProtoLaws(_, inner, _, _, _) ->
-        collect_impl_reach(ps, [inner, ...rest], acc)
+        collect_impl_reach(ps, sg, [inner, ...rest], acc)
       DImplAxiom(_, inner, _, _, _) ->
-        collect_impl_reach(ps, [inner, ...rest], acc)
+        collect_impl_reach(ps, sg, [inner, ...rest], acc)
       DConstructor(inner, _, _) ->
-        collect_impl_reach(ps, [inner, ...rest], acc)
-      _ -> collect_impl_reach(ps, rest, acc)
+        collect_impl_reach(ps, sg, [inner, ...rest], acc)
+      _ -> collect_impl_reach(ps, sg, rest, acc)
     }
   }
 }
 
-# The generator an impl head provides for, resolved from the impl's own file.
-fn impl_gen(ps: PScope, pref: DeclRef, from: Option[String]) : Option[CoreProto] =
-  match core_proto_of(proto_ref_sym(ps, pref, from)) {
-    Some(g) -> if core_proto_derivable(g) { Some(g) } else { None }
-    None    -> None
-  }
+# A type as the file homed at `from` reads it, head by head: a type
+# parameter of the declaration, one of `params`, stays written, and any
+# other head is settled to the declaration it denotes there.
+fn head_tree(ps: PScope, from: Option[String], params: [String], te: TypeExpr) : HeadTree =
+  HT(reach_head(ps, from, params, te), map(te_type_args(te), (a) => head_tree(ps, from, params, a)))
 
-fn head_tree(tab: SymTab, te: TypeExpr) : HeadTree =
-  HT(proto_type_name(tab, te), map(te_type_args(te), (a) => head_tree(tab, a)))
+fn reach_head(ps: PScope, from: Option[String], params: [String], te: TypeExpr) : DeclRef = {
+  let r = proto_type_ref(te)
+  if prc_ref_tparam(r, params) { r } else { vdv_head(ps, te, from) }
+}
 
 fn te_type_args(te: TypeExpr) : [TypeExpr] = match te.tkind {
   TyName(_, args)   -> args
@@ -1453,45 +1457,56 @@ pub fn derive_builtin_impl(p: CoreProto, tname: String) : Bool = match p {
   _     -> false
 }
 
+# Only a scalar has a builtin impl, and a scalar head stays as written.
+fn head_builtin_impl(g: CoreProto, h: DeclRef) : Bool = match h {
+  DrWritten(None, _) -> derive_builtin_impl(g, ref_spelled(h))
+  _                  -> false
+}
+
 # The file a derive's entries are written in: the one declaring the type.
 fn derive_from(ps: PScope, inner: Decl) : Option[String] = decl_type_home(inner, ps_root(ps))
 
-# The name a generator's impls are filed under in the reach table.
-fn gen_key(d: DeriveGen) : String = match d { DeriveGen(_, g) -> core_proto_name(g) }
+fn gen_proto(d: DeriveGen) : SymId = match d { DeriveGen(p, _) -> p }
+
+fn gen_is(picked: Option[CoreProto], g: CoreProto) : Bool = match picked {
+  Some(p) -> core_proto_same(p, g)
+  None    -> false
+}
 
 # What each `#[derive]` entry fails to pick, in declaration order.
-fn derive_entry_diags(ps: PScope, ds: [Decl], df: DiagFiles, acc: [Diagnostic]) : [Diagnostic] = match ds {
+fn derive_entry_diags(ps: PScope, sg: ShapedGens, ds: [Decl], df: DiagFiles, acc: [Diagnostic]) : [Diagnostic] = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> match d {
     DDerive(names, inner, line, col) ->
-      derive_entry_diags(ps, rest, df,
-        derive_pick_diags(ps, names, derive_from(ps, inner), decl_diag_file(d, df), line, col, acc))
-    DUnstable(inner, _, _)        -> derive_entry_diags(ps, [inner, ...rest], df, acc)
-    DProtoLaws(_, inner, _, _, _) -> derive_entry_diags(ps, [inner, ...rest], df, acc)
-    DImplAxiom(_, inner, _, _, _) -> derive_entry_diags(ps, [inner, ...rest], df, acc)
-    DConstructor(inner, _, _)     -> derive_entry_diags(ps, [inner, ...rest], df, acc)
-    _ -> derive_entry_diags(ps, rest, df, acc)
+      derive_entry_diags(ps, sg, rest, df,
+        derive_pick_diags(ps, sg, names, derive_from(ps, inner), decl_diag_file(d, df), line, col, acc))
+    DUnstable(inner, _, _)        -> derive_entry_diags(ps, sg, [inner, ...rest], df, acc)
+    DProtoLaws(_, inner, _, _, _) -> derive_entry_diags(ps, sg, [inner, ...rest], df, acc)
+    DImplAxiom(_, inner, _, _, _) -> derive_entry_diags(ps, sg, [inner, ...rest], df, acc)
+    DConstructor(inner, _, _)     -> derive_entry_diags(ps, sg, [inner, ...rest], df, acc)
+    _ -> derive_entry_diags(ps, sg, rest, df, acc)
   }
 }
 
-fn validate_derives_loop(ps: PScope, ds: [Decl], df: DiagFiles, reach: [ImplReach], errs: [Diagnostic]) : [Diagnostic] / Console {
+fn validate_derives_loop(ps: PScope, sg: ShapedGens, ds: [Decl], df: DiagFiles, reach: [ImplReach],
+                         errs: [Diagnostic]) : [Diagnostic] / Console {
   match ds {
     [] -> errs
     [d, ...rest] -> match d {
       DDerive(names, inner, line, col) -> {
-        let file = decl_diag_file(d, df)
-        let errs1 = validate_derive_decl(ps, names, inner, file, reach, line, col, errs)
-        validate_derives_loop(ps, rest, df, reach, errs1)
+        let site = DS(decl_diag_file(d, df), line, col)
+        let errs1 = validate_derive_decl(ps, sg, names, inner, site, reach, errs)
+        validate_derives_loop(ps, sg, rest, df, reach, errs1)
       }
       DUnstable(inner, _, _) ->
-        validate_derives_loop(ps, [inner, ...rest], df, reach, errs)
+        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, errs)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_derives_loop(ps, [inner, ...rest], df, reach, errs)
+        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, errs)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_derives_loop(ps, [inner, ...rest], df, reach, errs)
+        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, errs)
       DConstructor(inner, _, _) ->
-        validate_derives_loop(ps, [inner, ...rest], df, reach, errs)
-      _ -> validate_derives_loop(ps, rest, df, reach, errs)
+        validate_derives_loop(ps, sg, [inner, ...rest], df, reach, errs)
+      _ -> validate_derives_loop(ps, sg, rest, df, reach, errs)
     }
   }
 }
@@ -1499,35 +1514,39 @@ fn validate_derives_loop(ps: PScope, ds: [Decl], df: DiagFiles, reach: [ImplReac
 # Where a derive reports: the file and position of its declaration.
 type DeriveSite = DS(String, Int, Int)
 
-fn validate_derive_decl(ps: PScope, names: [String], inner: Decl, file: String, reach: [ImplReach],
-                        dline: Int, dcol: Int, errs: [Diagnostic]) : [Diagnostic] / Console = match inner {
+# What a derive's fields are read with: the scope, the file and the type
+# parameters of the deriving type, its name, and where it reports.
+type ReachRead = { ps: PScope, from: Option[String], params: [String], tname: String, site: DeriveSite }
+
+fn validate_derive_decl(ps: PScope, sg: ShapedGens, names: [String], inner: Decl, site: DeriveSite,
+                        reach: [ImplReach], errs: [Diagnostic]) : [Diagnostic] / Console = match inner {
   DType(_, tsym, tps, body, _, _, _, _) -> {
     let tab = ps_tab(ps)
-    let tname = ref_text(tab, DrSym(tsym))
-    let fields = derive_field_types(tab, body)
-    let gens = derive_gens(ps, names, derive_from(ps, inner))
-    let keys = map(gens, gen_key)
-    let own = list_append(map(keys, (n) => derived_reach(n, tname, tps)), param_reach(keys, tps))
-    validate_derive_protos(tab, filter(gens, derive_reach_checked), tname, fields,
-                           list_append(own, reach), DS(file, dline, dcol), errs)
+    let from = derive_from(ps, inner)
+    let gens = reach_gens(ps, sg, names, from)
+    let own = list_append(map(gens, (g) => derived_reach(gen_proto(g), tsym, tps)), param_reaches(gens, tps))
+    let rd = ReachRead { ps: ps, from: from, params: reach_params(tps), tname: ref_text(tab, DrSym(tsym)), site: site }
+    validate_derive_protos(rd, sg, gens, derive_field_types(tab, body), list_append(own, reach), errs)
   }
   _ -> errs
 }
 
-fn derive_reach_checked(d: DeriveGen) : Bool = match d {
-  DeriveGen(_, g) -> match g {
-    CpEq   -> true
-    CpHash -> true
-    CpShow -> true
-    _      -> false
-  }
+# The entries whose generator's fields are checked here.
+fn reach_gens(ps: PScope, sg: ShapedGens, names: [String], from: Option[String]) : [DeriveGen] =
+  filter(derive_gens(ps, sg, names, from), (d) => match d { DeriveGen(_, g) -> gen_reach_checked(Some(g)) })
+
+fn gen_reach_checked(picked: Option[CoreProto]) : Bool = match picked {
+  Some(CpEq)   -> true
+  Some(CpHash) -> true
+  Some(CpShow) -> true
+  _            -> false
 }
 
 # A field typed by a parameter the derive bounds is covered by that bound.
-fn param_reach(names: [String], tps: [String]) : [ImplReach] = match names {
+fn param_reaches(gens: [DeriveGen], tps: [String]) : [ImplReach] = match gens {
   []          -> []
-  [n, ...rest] ->
-    list_append(map(derive_bound_params(tps), (tp) => IR(reach_key(n, tp), [])), param_reach(rest, tps))
+  [g, ...rest] ->
+    list_append(map(derive_bound_params(tps), (tp) => param_reach(gen_proto(g), tp)), param_reaches(rest, tps))
 }
 
 # Each field a derived impl reads, labelled the way a diagnostic names it.
@@ -1558,28 +1577,41 @@ fn record_field(f: FieldDecl) : DeriveField = match f {
   FD(_, fname, te, _) -> DFld(concat_all(["field `", fname, "`"]), te)
 }
 
-fn validate_derive_protos(tab: SymTab, gens: [DeriveGen], tname: String, fields: [DeriveField],
-                          reach: [ImplReach], site: DeriveSite, errs: [Diagnostic]) : [Diagnostic] / Console = match gens {
+fn validate_derive_protos(rd: ReachRead, sg: ShapedGens, gens: [DeriveGen], fields: [DeriveField],
+                          impls: [ImplReach], errs: [Diagnostic]) : [Diagnostic] / Console = match gens {
   []           -> errs
   [d, ...rest] ->
-    validate_derive_protos(tab, rest, tname, fields, reach, site,
-                           validate_derive_fields(tab, d, tname, fields, reach, site, errs))
+    validate_derive_protos(rd, sg, rest, fields, impls,
+                           validate_derive_fields(rd, d, derive_reach_of(rd.ps, sg, d, impls), fields, errs))
 }
 
-fn validate_derive_fields(tab: SymTab, d: DeriveGen, tname: String, fields: [DeriveField],
-                          reach: [ImplReach], site: DeriveSite, errs: [Diagnostic]) : [Diagnostic] / Console = match fields {
+# An impl of the derived protocol answers the derive. A core protocol's
+# derived body names its operation through the core home, so nothing else
+# does; any other protocol's names it bare, so an impl of every protocol
+# that picks the same generator answers too.
+fn derive_reach_of(ps: PScope, sg: ShapedGens, d: DeriveGen, impls: [ImplReach]) : ReachCx = match d {
+  DeriveGen(p, g) -> {
+    let tab = ps_tab(ps)
+    ReachCx { impls: impls,
+              serves: (q) => psc_same(q, p) or (not proto_is(p, g) and gen_is(proto_gen(sg, q), g)),
+              same: (a, b) => refs_same(tab, a, b),
+              builtin: (h) => head_builtin_impl(g, h) }
+  }
+}
+
+fn validate_derive_fields(rd: ReachRead, d: DeriveGen, reach: ReachCx, fields: [DeriveField],
+                          errs: [Diagnostic]) : [Diagnostic] / Console = match fields {
   []           -> errs
   [f, ...rest] -> match f {
-    DFld(what, te) -> match d { DeriveGen(pname, g) -> {
-      let path = missing_path(core_proto_name(g), head_tree(tab, te), reach, (h) => derive_builtin_impl(g, h))
+    DFld(what, te) -> {
+      let tab = ps_tab(rd.ps)
+      let path = map(missing_path(reach, head_tree(rd.ps, rd.from, rd.params, te)), (r) => ref_text(tab, r))
       let errs1 = match path {
         [] -> errs
-        _  -> {
-          [report_derive_missing(pname, tname, what, path, site), ...errs]
-        }
+        _  -> [report_derive_missing(ref_text(tab, DrSym(gen_proto(d))), rd.tname, what, path, rd.site), ...errs]
       }
-      validate_derive_fields(tab, d, tname, rest, reach, site, errs1)
-    } }
+      validate_derive_fields(rd, d, reach, rest, errs1)
+    }
   }
 }
 
@@ -1626,8 +1658,9 @@ type Derived = { decls: [Decl], rows: [NEnt] }
 fn derived_none() : Derived = Derived { decls: [], rows: [] }
 
 # What an expansion resolves and mints against: the protocol scope, the
-# dispatchers by id, and the core modules.
-type DeriveCx = { ps: PScope, ids: ProtoIds, cores: [String] }
+# generator each protocol picks, the dispatchers by id, and the core
+# modules.
+type DeriveCx = { ps: PScope, gens: ShapedGens, ids: ProtoIds, cores: [String] }
 
 fn expand_derives(dx: DeriveCx, ds: [Decl], target_mod: String) : Expanded =
   expand_derives_loop(dx, ds, target_mod, collect_binser_types(dx.ps, ds, false, []), [], [], [])
@@ -1680,12 +1713,13 @@ fn strip_protocols_loop(ds: [Decl], acc: [Decl]) : [Decl] {
 # the protocol's own ops on the inner fields, so the fields' types
 # must already implement the same protocol — checked transitively
 # by the typer / resolver after lowering.
-# `tsym` is the type, which a derived declaration refers to by id.
-# `ids` and `homed` say how a derived body names a protocol operation:
-# its dispatcher, through its home unless a core module derives.
-# `home` is the module the derived functions are declared in, `tab`
-# names the type and its constructors, and `heads` spells a field's type.
-type DerivedType = { tsym: SymId, tps: [String], body: TypeBody, writers: [String],
+# `tsym` is the type, which a derived declaration refers to by id, and
+# `proto` the protocol the entry resolved to. `ids` and `homed` say how
+# a derived body names an operation of `proto`: its dispatcher, through
+# its home unless a core module derives. `home` is the module the derived
+# functions are declared in, `tab` names the type and its constructors,
+# and `heads` spells a field's type.
+type DerivedType = { tsym: SymId, tps: [String], body: TypeBody, writers: [String], proto: SymId,
                      ids: ProtoIds, homed: Bool, home: String, tab: SymTab, heads: HeadScope }
 
 # The name the user wrote: what a derived `show` and a runtime message
@@ -1700,13 +1734,13 @@ fn derive_impls_for(dx: DeriveCx, names: [String], dt: Decl, home: Option[String
   match dt {
     DType(_, tsym, tps, body, line, col, _, _) -> {
       let tab = ps_tab(dx.ps)
-      derive_impls_loop(dx.ps, home, names,
-                        DerivedType { tsym: tsym, tps: tps,
-                                      body: body, writers: writers, ids: dx.ids,
-                                      homed: derive_homed(dx.cores, home),
-                                      home: proto_home_name(home, ps_root(dx.ps)), tab: tab,
-                                      heads: HeadScope(dx.ps, home) },
-                        line, col, derived_none())
+      let homed = derive_homed(dx.cores, home)
+      let of = (p: SymId) => DerivedType { tsym: tsym, tps: tps,
+                                           body: body, writers: writers, proto: p, ids: dx.ids,
+                                           homed: homed,
+                                           home: proto_home_name(home, ps_root(dx.ps)), tab: tab,
+                                           heads: HeadScope(dx.ps, home) }
+      derive_impls_loop(dx, home, names, of, line, col, derived_none())
     }
     _ -> derived_none()
   }
@@ -1720,21 +1754,23 @@ fn derive_homed(cores: [String], home: Option[String]) : Bool = match home {
 }
 
 # The protocol an entry resolves to, from the type's file, picks the
-# generator and heads the impl.
-fn derive_impls_loop(ps: PScope, home: Option[String], names: [String], dt: DerivedType,
+# generator and heads the impl. `of` is the derived type for a protocol.
+fn derive_impls_loop(dx: DeriveCx, home: Option[String], names: [String], of: (SymId) -> DerivedType,
                      line: Int, col: Int, acc: Derived) : Derived {
   match names {
     [] -> Derived { decls: list_reverse(acc.decls), rows: acc.rows }
     [pspell, ...rest] -> {
-      let dv = match derive_gen(ps, pspell, home) {
-        Some(g) -> derive_impl_for_protocol(g, dt, line, col)
-        None    -> derived_none()
+      let dv = match derive_gen(dx.ps, dx.gens, pspell, home) {
+        Some(DeriveGen(p, g)) -> {
+          let dt = of(p)
+          let m = derive_impl_for_protocol(g, dt, line, col)
+          Derived { decls: map(m.decls, (dd) => derive_generalize(impl_with_proto(dd, p), pspell, dt.tsym, dt.tps)),
+                    rows: m.rows }
+        }
+        None -> derived_none()
       }
-      let psym = ps_proto_sym(ps, pspell, home)
-      let ds = map(dv.decls,
-                   (dd) => derive_generalize(impl_with_proto(dd, psym), pspell, dt.tsym, dt.tps))
-      derive_impls_loop(ps, home, rest, dt, line, col,
-                        Derived { decls: list_append(list_reverse(ds), acc.decls),
+      derive_impls_loop(dx, home, rest, of, line, col,
+                        Derived { decls: list_append(list_reverse(dv.decls), acc.decls),
                                   rows: list_append(dv.rows, acc.rows) })
     }
   }
@@ -1778,17 +1814,18 @@ fn decl_type_home(d: Decl, target_mod: String) : Option[String] = match d {
 # `stdlib/protocols.kai`).
 fn derive_impl_for_protocol(g: CoreProto, dt: DerivedType, line: Int, col: Int) : Derived {
   match g {
-    CpShow         -> derive_show_impl(derive_op_ref(dt.ids, dt.homed, CpShow, "show"), dt, line, col)
-    CpEq           -> derive_eq_impl(derive_op_ref(dt.ids, dt.homed, CpEq, "eq"), dt, line, col)
-    CpHash         -> derive_hash_impl(derive_op_ref(dt.ids, dt.homed, CpHash, "hash"), dt, line, col)
-    CpOrd          -> derive_ord_impl(derive_op_ref(dt.ids, dt.homed, CpOrd, "cmp"), dt, line, col)
+    CpShow         -> derive_show_impl(derive_op_ref(dt.ids, dt.homed, dt.proto, "show"), dt, line, col)
+    CpEq           -> derive_eq_impl(derive_op_ref(dt.ids, dt.homed, dt.proto, "eq"), dt, line, col)
+    CpHash         -> derive_hash_impl(derive_op_ref(dt.ids, dt.homed, dt.proto, "hash"), dt, line, col)
+    CpOrd          -> derive_ord_impl(derive_op_ref(dt.ids, dt.homed, dt.proto, "cmp"), dt, line, col)
     CpBinSerialize -> derive_binserialize_impl(dt, line, col)
     CpLayout       -> {
       let m = derive_layout_impl(dt.tab, dt.tsym, dt.body, line, col)
       Derived { decls: m.decls, rows: m.rows }
     }
     CpJson         -> {
-      let m = derive_json_impl(dt.tab, dt.tsym, dt.body, (r) => head_ref_spell(dt.heads, r), line, col)
+      let m = derive_json_impl(dt.tab, dt.tsym, heads_body(dt.heads, reach_params(dt.tps), dt.body),
+                               (r) => head_ref_spell(dt.heads, r), line, col)
       Derived { decls: m.decls, rows: m.rows }
     }
     _              -> derived_none()
@@ -1798,7 +1835,13 @@ fn derive_impl_for_protocol(g: CoreProto, dt: DerivedType, line: Int, col: Int) 
 # The scope a derived impl's methods are declared in: one per protocol
 # and type of the module.
 fn derived_scope(dt: DerivedType, g: CoreProto) : String =
-  impl_scope_keyed(dt.home, concat_all(["derive ", core_proto_name(g), " ", dt_name(dt)]))
+  impl_scope_keyed(dt.home, concat_all(["derive ", derived_proto_piece(dt, g), " ", dt_name(dt)]))
+
+# The core protocol by its name; any other protocol the generator `g`
+# serves through its home too, so two of them never share a method.
+fn derived_proto_piece(dt: DerivedType, g: CoreProto) : String =
+  if proto_is(dt.proto, g) { core_proto_name(g) }
+  else { concat_all([written_text(sym_home(dt.tab, dt.proto)), ".", written_text(sym_name(dt.tab, dt.proto))]) }
 
 # The method `op` of the derived impl of `g`.
 fn derived_method(dt: DerivedType, g: CoreProto, op: String, params: [Param], ret: TypeExpr,
@@ -3020,6 +3063,28 @@ fn head_ref_spell(hs: HeadScope, r: DeclRef) : String = match hs {
   HeadScope(ps, from) -> rt_ref_name(ps_tab(ps), vdv_settle(ps, r, from))
 }
 
+# A type body as its file reads it: every head of a field's type settled
+# to the declaration it denotes there. A type parameter of the type, one
+# of `params`, stays written.
+fn heads_body(hs: HeadScope, params: [String], body: TypeBody) : TypeBody = match body {
+  TBRecord(fields) -> TBRecord(map(fields, (f) => match f {
+    FD(p, name, te, attrs) -> FD(p, name, heads_type(hs, params, te), attrs)
+  }))
+  TBSum(variants) -> TBSum(map(variants, (v) => match v {
+    Var(c, args) -> Var(c, map(args, (a) => heads_type(hs, params, a)))
+  }))
+  _ -> body
+}
+
+fn heads_type(hs: HeadScope, params: [String], te: TypeExpr) : TypeExpr = match te.tkind {
+  TyName(r, args) -> {
+    let head = if prc_ref_tparam(r, params) { r } else { match hs { HeadScope(ps, from) -> vdv_settle(ps, r, from) } }
+    mk_ty(TyName(head, map(args, (a) => heads_type(hs, params, a))), te.line, te.col)
+  }
+  TyList(elem) -> mk_ty(TyList(heads_type(hs, params, elem)), te.line, te.col)
+  _            -> te
+}
+
 # The single-dispatch head of a type written in the file homed at `from`.
 fn vdv_head(ps: PScope, te: TypeExpr, from: Option[String]) : DeclRef = match te.tkind {
   TyName(r, _)      -> vdv_settle(ps, r, from)
@@ -3066,7 +3131,7 @@ fn binser_type_refs(ps: PScope, decls: [Decl], impls: Bool, acc: [DeclRef]) : [D
         }
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tsym, _, _, _, _, _, _) ->
-          if derives_gen(ps, names, derive_from(ps, inner), CpBinSerialize) {
+          if derives_core(ps, names, derive_from(ps, inner), CpBinSerialize) {
             binser_type_refs(ps, rest, impls, [DrSym(tsym), ...acc])
           } else {
             binser_type_refs(ps, rest, impls, acc)
@@ -3094,7 +3159,7 @@ fn validate_derive_binser_loop(ps: PScope, decls: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tsym, _, body, line, col, _, _) ->
-          if derives_gen(ps, names, derive_from(ps, inner), CpBinSerialize) {
+          if derives_core(ps, names, derive_from(ps, inner), CpBinSerialize) {
             let file = decl_diag_file(d, df)
             let cx = VdvCx { ps: ps, from: derive_from(ps, inner) }
             let errs1 = validate_derive_binser_body(cx, file, vdv_type_name(ps, tsym), body,
@@ -3230,7 +3295,7 @@ fn validate_derive_layout_loop(ps: PScope, decls: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tsym, _, body, line, col, _, _) ->
-          if derives_gen(ps, names, derive_from(ps, inner), CpLayout) {
+          if derives_core(ps, names, derive_from(ps, inner), CpLayout) {
             let file = decl_diag_file(d, df)
             let errs1 = validate_derive_layout_body(ps_tab(ps), file, vdv_type_name(ps, tsym), body,
                                                      line, col, errs)
@@ -3312,10 +3377,11 @@ fn validate_derive_json_loop(ps: PScope, decls: [Decl], df: DiagFiles,
     [] -> errs
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
-        DType(_, tsym, _, body, line, col, _, _) ->
-          if derives_gen(ps, names, derive_from(ps, inner), CpJson) {
+        DType(_, tsym, tps, body, line, col, _, _) ->
+          if derives_core(ps, names, derive_from(ps, inner), CpJson) {
             let file = decl_diag_file(d, df)
-            let errs1 = validate_derive_json_body(ps_tab(ps), file, vdv_type_name(ps, tsym), body, line, col, errs)
+            let settled = heads_body(HeadScope(ps, derive_from(ps, inner)), reach_params(tps), body)
+            let errs1 = validate_derive_json_body(ps_tab(ps), file, vdv_type_name(ps, tsym), settled, line, col, errs)
             validate_derive_json_loop(ps, rest, df, errs1)
           } else {
             validate_derive_json_loop(ps, rest, df, errs)
@@ -3500,45 +3566,45 @@ fn binser_builtin_impl(ftype: TypeExpr) : Bool = match binser_leaf_ty(resolve_ty
 # `Result`, `Fn`) collapse to their constructor via `proto_type_ref`,
 # so a field of type `[Int]` is headed by `List` — and unless
 # `impl Ord for List` is declared, the derive is rejected.
-fn validate_derive_ord(ps: PScope, decls: [Decl], df: DiagFiles) : [Diagnostic] / Console {
+fn validate_derive_ord(ps: PScope, sg: ShapedGens, decls: [Decl], df: DiagFiles) : [Diagnostic] / Console {
 
-  let providers = collect_ord_providers(ps, decls, [])
-  list_reverse(validate_derive_ord_loop(ps, decls, df, providers, []))
+  let providers = collect_ord_providers(ps, sg, decls, [])
+  list_reverse(validate_derive_ord_loop(ps, sg, decls, df, providers, []))
 }
 
-fn collect_ord_providers(ps: PScope, decls: [Decl], acc: [DeclRef]) : [DeclRef] {
+fn collect_ord_providers(ps: PScope, sg: ShapedGens, decls: [Decl], acc: [DeclRef]) : [DeclRef] {
   match decls {
     [] -> acc
     [d, ...rest] -> match d {
       DImpl(pref, _, target, ms, _, _, _, _) ->
-        if proto_is(proto_ref_sym(ps, pref, impl_home_of(ms)), CpOrd) {
-          collect_ord_providers(ps, rest, [vdv_head(ps, target, impl_home_of(ms)), ...acc])
+        if gen_is(proto_gen(sg, proto_ref_sym(ps, pref, impl_home_of(ms))), CpOrd) {
+          collect_ord_providers(ps, sg, rest, [vdv_head(ps, target, impl_home_of(ms)), ...acc])
         } else {
-          collect_ord_providers(ps, rest, acc)
+          collect_ord_providers(ps, sg, rest, acc)
         }
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tsym, _, _, _, _, _, _) ->
-          if derives_gen(ps, names, derive_from(ps, inner), CpOrd) {
-            collect_ord_providers(ps, rest, [DrSym(tsym), ...acc])
+          if derives_gen(ps, sg, names, derive_from(ps, inner), CpOrd) {
+            collect_ord_providers(ps, sg, rest, [DrSym(tsym), ...acc])
           } else {
-            collect_ord_providers(ps, rest, acc)
+            collect_ord_providers(ps, sg, rest, acc)
           }
-        _ -> collect_ord_providers(ps, rest, acc)
+        _ -> collect_ord_providers(ps, sg, rest, acc)
       }
       DUnstable(inner, _, _) ->
-        collect_ord_providers(ps, [inner, ...rest], acc)
+        collect_ord_providers(ps, sg, [inner, ...rest], acc)
       DProtoLaws(_, inner, _, _, _) ->
-        collect_ord_providers(ps, [inner, ...rest], acc)
+        collect_ord_providers(ps, sg, [inner, ...rest], acc)
       DImplAxiom(_, inner, _, _, _) ->
-        collect_ord_providers(ps, [inner, ...rest], acc)
+        collect_ord_providers(ps, sg, [inner, ...rest], acc)
       DConstructor(inner, _, _) ->
-        collect_ord_providers(ps, [inner, ...rest], acc)
-      _ -> collect_ord_providers(ps, rest, acc)
+        collect_ord_providers(ps, sg, [inner, ...rest], acc)
+      _ -> collect_ord_providers(ps, sg, rest, acc)
     }
   }
 }
 
-fn validate_derive_ord_loop(ps: PScope, decls: [Decl], df: DiagFiles,
+fn validate_derive_ord_loop(ps: PScope, sg: ShapedGens, decls: [Decl], df: DiagFiles,
                               providers: [DeclRef], errs: [Diagnostic]) : [Diagnostic] / Console {
 
   match decls {
@@ -3546,27 +3612,27 @@ fn validate_derive_ord_loop(ps: PScope, decls: [Decl], df: DiagFiles,
     [d, ...rest] -> match d {
       DDerive(names, inner, _, _) -> match inner {
         DType(_, tsym, tps, body, line, col, _, _) ->
-          if derives_gen(ps, names, derive_from(ps, inner), CpOrd) {
+          if derives_gen(ps, sg, names, derive_from(ps, inner), CpOrd) {
             let file = decl_diag_file(d, df)
             let cx = VdvCx { ps: ps, from: derive_from(ps, inner) }
             let errs1 = validate_derive_ord_body(cx, file, vdv_type_name(ps, tsym), body,
                                                   derive_bound_params(tps), providers,
                                                   line, col, errs)
-            validate_derive_ord_loop(ps, rest, df, providers, errs1)
+            validate_derive_ord_loop(ps, sg, rest, df, providers, errs1)
           } else {
-            validate_derive_ord_loop(ps, rest, df, providers, errs)
+            validate_derive_ord_loop(ps, sg, rest, df, providers, errs)
           }
-        _ -> validate_derive_ord_loop(ps, rest, df, providers, errs)
+        _ -> validate_derive_ord_loop(ps, sg, rest, df, providers, errs)
       }
       DUnstable(inner, _, _) ->
-        validate_derive_ord_loop(ps, [inner, ...rest], df, providers, errs)
+        validate_derive_ord_loop(ps, sg, [inner, ...rest], df, providers, errs)
       DProtoLaws(_, inner, _, _, _) ->
-        validate_derive_ord_loop(ps, [inner, ...rest], df, providers, errs)
+        validate_derive_ord_loop(ps, sg, [inner, ...rest], df, providers, errs)
       DImplAxiom(_, inner, _, _, _) ->
-        validate_derive_ord_loop(ps, [inner, ...rest], df, providers, errs)
+        validate_derive_ord_loop(ps, sg, [inner, ...rest], df, providers, errs)
       DConstructor(inner, _, _) ->
-        validate_derive_ord_loop(ps, [inner, ...rest], df, providers, errs)
-      _ -> validate_derive_ord_loop(ps, rest, df, providers, errs)
+        validate_derive_ord_loop(ps, sg, [inner, ...rest], df, providers, errs)
+      _ -> validate_derive_ord_loop(ps, sg, rest, df, providers, errs)
     }
   }
 }
@@ -3673,8 +3739,9 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # variant field's head type must already have an impl reachable in
   # this compilation unit. Reported errors short-circuit the typer
   # via `proto_errs > 0` in the driver.
-  let pre_diags = validate_derives(ps, decls, df)
-  let pick_diags = derive_entry_diags(ps, decls, df, [])
+  let gens = shaped_gens(decls)
+  let pre_diags = validate_derives(ps, gens, decls, df)
+  let pick_diags = derive_entry_diags(ps, gens, decls, df, [])
   # Step 0b — m12.8.z: validate `#derive(Ord)` against available
   # impls *before* expansion. The synthesised `cmp` body delegates
   # to `cmp` on each field type, and the post-inference rewrite
@@ -3685,7 +3752,7 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # isn't surfaced. This pass walks the original decl stream
   # (DDerive nodes still intact) and emits a clear typer-time error
   # naming the offending field/payload.
-  let derive_diags = list_append(validate_derive_ord(ps, decls, df),
+  let derive_diags = list_append(validate_derive_ord(ps, gens, decls, df),
                      list_append(validate_derive_binserialize(ps, decls, df),
                      list_append(validate_derive_layout(ps, decls, df),
                                  validate_derive_json(ps, decls, df))))
@@ -3702,7 +3769,7 @@ pub fn lower_protocols(decls: [Decl], df: DiagFiles,
   # decls so subsequent steps see all impls uniformly. The home-anchor
   # stream scopes the impl validations below, so it is computed once
   # here.
-  let exp = expand_derives(DeriveCx { ps: ps, ids: disp_gen.ids, cores: cores }, decls, target_mod)
+  let exp = expand_derives(DeriveCx { ps: ps, gens: gens, ids: disp_gen.ids, cores: cores }, decls, target_mod)
   let expanded = match exp { Expanded(ds, _, _) -> ds }
   let derive_rows = match exp { Expanded(_, _, rows) -> rows }
   # A derived impl's methods are told apart by the op label their rows carry.
