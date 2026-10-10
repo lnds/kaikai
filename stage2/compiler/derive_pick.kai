@@ -1,0 +1,115 @@
+#[doc("""
+What a `#[derive(P)]` entry picks.
+
+The entry is a reference to a protocol, written in the file that
+declares the type and resolved from there the way an impl head is. The
+generator is chosen by the declaration the entry resolves to: one of the
+core protocols that has a generator. A protocol of another module that
+shares a core protocol's name is a different declaration and picks none.
+
+An impl provides for a generator the same way: when its head resolves,
+from the impl's own file, to that core protocol.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.diag
+import compiler.modules
+import compiler.decl_names
+import compiler.core_protos
+import compiler.proto_resolve
+import compiler.name_report
+
+#[doc("True when `#[derive]` has a generator for the core protocol `g`.")]
+pub fn core_proto_derivable(g: CoreProto) : Bool = match g {
+  CpShow         -> true
+  CpEq           -> true
+  CpOrd          -> true
+  CpHash         -> true
+  CpBinSerialize -> true
+  CpLayout       -> true
+  CpJson         -> true
+  _              -> false
+}
+
+#[doc("The generator the protocol reference `pspell` picks, resolved from the file homed at `from` (`None` = root file); `None` when it resolves to anything but a core protocol that has one.")]
+pub fn derive_gen(ps: PScope, pspell: String, from: Option[String]) : Option[CoreProto] =
+  match core_proto_of(ps_proto_sym(ps, pspell, from)) {
+    Some(g) -> if core_proto_derivable(g) { Some(g) } else { None }
+    None    -> None
+  }
+
+#[doc("True when the protocol reference `pspell`, resolved from the file homed at `from`, picks the generator `g`.")]
+pub fn picks_gen(ps: PScope, pspell: String, from: Option[String], g: CoreProto) : Bool =
+  match derive_gen(ps, pspell, from) {
+    Some(p) -> core_proto_same(p, g)
+    None    -> false
+  }
+
+#[doc("True when one of the `#[derive]` entries `names`, written in the file homed at `from`, picks the generator `g`.")]
+pub fn derives_gen(ps: PScope, names: [String], from: Option[String], g: CoreProto) : Bool = match names {
+  []           -> false
+  [n, ...rest] -> picks_gen(ps, n, from, g) or derives_gen(ps, rest, from, g)
+}
+
+#[doc("A `#[derive]` entry that picked a generator: the bare name a diagnostic shows it as, and the generator.")]
+pub type DeriveGen = DeriveGen(String, CoreProto)
+
+#[doc("The entries of `names`, written in the file homed at `from`, that pick a generator.")]
+pub fn derive_gens(ps: PScope, names: [String], from: Option[String]) : [DeriveGen] = match names {
+  []           -> []
+  [n, ...rest] -> match derive_gen(ps, n, from) {
+    Some(g) -> [DeriveGen(dotted_bare(n), g), ...derive_gens(ps, rest, from)]
+    None    -> derive_gens(ps, rest, from)
+  }
+}
+
+#[doc("The errors of the `#[derive]` entries `names` at `file:line:col`, written in the file homed at `from`: an entry that resolves to no single protocol, reported the way an impl head is, and an entry whose protocol has no generator. Prepended to `acc`.")]
+pub fn derive_pick_diags(ps: PScope, names: [String], from: Option[String], file: String,
+                         line: Int, col: Int, acc: [Diagnostic]) : [Diagnostic] = match names {
+  []           -> acc
+  [n, ...rest] -> {
+    let acc1 = match derive_gen(ps, n, from) {
+      Some(_) -> acc
+      None    -> [dp_error(ps, n, ps_resolve(ps, n, from), file, line, col), ...acc]
+    }
+    derive_pick_diags(ps, rest, from, file, line, col, acc1)
+  }
+}
+
+fn dp_error(ps: PScope, pspell: String, res: PkRes, file: String, line: Int, col: Int) : Diagnostic = {
+  let pname = dotted_bare(pspell)
+  match res {
+    PkHome(home) -> mk_diag(SevError, file, line, col,
+      concat_all(["no derive generator for protocol `", dp_spelled(home, pname), "`"]),
+      dp_core_help(pname, file, line, col))
+    PkPrivate(m) -> mk_diag(SevError, file, line, col,
+      concat_all(["protocol `", pname, "` is declared in module `", m, "` but is not `pub`"]), [])
+    PkUnknown -> mk_diag(SevError, file, line, col,
+      concat_all(["unknown protocol `", pname, "` in `#[derive]`"]), [])
+    PkAmbiguous(cands) ->
+      nr_ambiguous_diag(file, line, col, NCProtocol, pname, map(cands, (c) => dp_home_name(c, ps_root(ps))), "", [])
+  }
+}
+
+# A protocol as a diagnostic names it: through its module, bare for the root file's own.
+fn dp_spelled(home: Option[String], pname: String) : String = match home {
+  Some(m) -> concat_all([m, ".", pname])
+  None    -> pname
+}
+
+fn dp_home_name(home: Option[String], root: String) : String = match home {
+  Some(m) -> m
+  None    -> root
+}
+
+# The entry is spelled like a core protocol that has a generator, and is not it.
+fn dp_core_help(pname: String, file: String, line: Int, col: Int) : [RelatedInfo] =
+  match core_proto_named(pname) {
+    Some(g) ->
+      if core_proto_derivable(g) {
+        [ri_help(file, line, col, concat_all(["to derive the core protocol, write `#[derive(",
+                                              core_proto_home(g), ".", pname, ")]`"]))]
+      } else { [] }
+    None -> []
+  }
