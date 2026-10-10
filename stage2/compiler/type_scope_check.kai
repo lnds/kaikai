@@ -15,7 +15,8 @@ so the report names the homes the user must choose between rather than
 a spelling downstream minted.
 
 The same walk reports a bare type, effect or pattern constructor the
-file reaches only through a module it never imported.
+file reaches only through a module it never imported, and a type name
+nothing declares.
 """)]
 
 import compiler.util
@@ -32,36 +33,91 @@ import compiler.scope_file
 import compiler.name_hidden
 import compiler.diag
 import compiler.written
+import compiler.scalar_ty
+import compiler.kinds
+import compiler.tparam_bounds
+import compiler.chars
+import compiler.home_spell
 
 # The scan's fixed inputs: the table every name resolves against, the
-# view of the file being scanned, and the type parameters the enclosing
+# view of the file being scanned, the type parameters the enclosing
 # signature binds — a bound parameter is not a declaration any module
-# contests.
-type TsChk = { tab: SymTab, view: ScopeView, file: String, tps: [String] }
+# contests — the unit-kind slots of every type, and what the position
+# being read makes of a name nothing declares.
+type TsChk = { tab: SymTab, view: ScopeView, file: String, tps: [String], units: [TsUnits], pos: TsPos }
+
+# The unit-kind parameter slots of one type declaration.
+type TsUnits = TsU(SymId, [Int])
+
+# A type position, the whole body of a `type T = X`, or an argument slot
+# its head declares unit-kind: there a name with no type meaning is a
+# habitant, which the unit passes judge.
+type TsPos = TsType | TsAlias | TsUnitArg
 
 #[doc("Report every bare type name the scope view of the file that wrote it leaves contested; returns the error count. `decls` is the segmented stream `segs` marks the imported files of; `views` index `tab`.")]
 pub fn tschk_segmented(segs: [ImportSeg], decls: [Decl], tab: SymTab, views: FileViews,
       target: String, df: DiagFiles) : Int / Console + File =
-  tschk_segs(segs, decls, tab, views, target, df, 0)
+  tschk_segs(segs, decls, tab, views, target, df, tschk_unit_decls(decls, target, []), 0)
+
+fn tschk_unit_decls(ds: [Decl], target: String, acc: [TsUnits]) : [TsUnits] = match ds {
+  [] -> acc
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> tschk_unit_decls([inner, ...rest], target, acc)
+    None -> match d {
+      DType(_, nm, tps, _, _, _, mo, _, _) -> match tschk_unit_idxs(tps, 0) {
+        []   -> tschk_unit_decls(rest, target, acc)
+        idxs -> tschk_unit_decls(rest, target, [TsU(tschk_type_id(nm, mo, target), idxs), ...acc])
+      }
+      _ -> tschk_unit_decls(rest, target, acc)
+    }
+  }
+}
+
+# The id the table derives for a type declaration.
+fn tschk_type_id(nm: String, mo: Option[String], target: String) : SymId =
+  sym_derive(NCType, hs_display(nm, mo), match mo {
+    Some(m) -> m
+    None    -> target
+  })
+
+fn tschk_unit_idxs(tps: [String], i: Int) : [Int] = match tps {
+  [] -> []
+  [t, ...rest] ->
+    if tp_kind_is_unit(t) { [i, ...tschk_unit_idxs(rest, i + 1)] } else { tschk_unit_idxs(rest, i + 1) }
+}
+
+# The unit-kind slots of the type a bare head `n` resolves to.
+fn tschk_unit_slots(n: String, cx: TsChk) : [Int] = match cx.units {
+  [] -> []
+  us -> match sv_resolve(cx.tab, cx.view, NCType, n) {
+    SvSym(s) -> tschk_units_of(us, s)
+    _        -> []
+  }
+}
+
+fn tschk_units_of(us: [TsUnits], s: SymId) : [Int] = match us {
+  [] -> []
+  [TsU(d, idxs), ...rest] -> if sym_raw(d) == sym_raw(s) { idxs } else { tschk_units_of(rest, s) }
+}
 
 # A name is contested only against what the file that wrote it can see,
 # so each segment is judged under its own home's view and reported
 # against its own source file; the root's decls follow the marks.
 fn tschk_segs(segs: [ImportSeg], decls: [Decl], tab: SymTab, views: FileViews,
-      target: String, df: DiagFiles, errs: Int) : Int / Console + File = match segs {
-  [] -> errs + tschk_decls(decls, tschk_cx(tab, views, target, target, df), 0)
+      target: String, df: DiagFiles, units: [TsUnits], errs: Int) : Int / Console + File = match segs {
+  [] -> errs + tschk_decls(decls, tschk_cx(tab, views, target, target, df, units), 0)
   [ISeg(home, n), ...rest] -> {
     let seg_errs = tschk_decls(seg_take(decls, n),
-                               tschk_cx(tab, views, home, target, df), 0)
-    tschk_segs(rest, seg_drop(decls, n), tab, views, target, df, errs + seg_errs)
+                               tschk_cx(tab, views, home, target, df, units), 0)
+    tschk_segs(rest, seg_drop(decls, n), tab, views, target, df, units, errs + seg_errs)
   }
 }
 
 fn tschk_cx(tab: SymTab, views: FileViews, home: String, target: String,
-      df: DiagFiles) : TsChk {
+      df: DiagFiles, units: [TsUnits]) : TsChk {
   let file = if home == target { df_root(df) }
              else { df_file_of(df, home) }
-  TsChk { tab: tab, view: fv_of(views, st_module_id(home)), file: file, tps: [] }
+  TsChk { tab: tab, view: fv_of(views, st_module_id(home)), file: file, tps: [], units: units, pos: TsType }
 }
 
 fn tschk_decls(ds: [Decl], cx: TsChk, errs: Int) : Int / Console + File = match ds {
@@ -79,12 +135,15 @@ fn tschk_decl(d: Decl, cx0: TsChk) : Int / Console + File = match d {
   DBench(_, body, _, _, _)     -> tschk_expr(body, cx0)
   DCheck(_, ps, body, _, _, _) -> tschk_params(ps, cx0) + tschk_expr(body, cx0)
   DType(_, _, tps, body, _, _, _, _, _) -> tschk_tbody(body, tschk_bind(cx0, tps))
+  DEffect(_, _, tps, ops, _, _, _, _, _) -> tschk_ops(ops, tschk_bind(cx0, tps))
   DAxiom(_, _, _, _, tps, ps, ret, _, _, _) -> {
     let cx = tschk_bind(cx0, tps)
     tschk_params(ps, cx) + tschk_ty(ret, cx)
   }
-  DImpl(_, tas, fty, subs, _, _, _, _) ->
-    tschk_tys(tas, cx0) + tschk_ty(fty, cx0) + tschk_decls(subs, cx0, 0)
+  DImpl(_, tas, fty, subs, _, _, tps, _) -> {
+    let cx = tschk_bind(cx0, tps)
+    tschk_tys(tas, cx) + tschk_ty(fty, cx) + tschk_decls(subs, cx, 0)
+  }
   DDerive(_, inner, _, _)       -> tschk_decl(inner, cx0)
   DUnstable(inner, _, _)        -> tschk_decl(inner, cx0)
   DProtoLaws(_, inner, _, _, _) -> tschk_decl(inner, cx0)
@@ -95,12 +154,32 @@ fn tschk_decl(d: Decl, cx0: TsChk) : Int / Console + File = match d {
   _ -> 0
 }
 
+# A stored parameter carries its kind and bounds; the name a signature
+# writes is what is left without them.
 fn tschk_bind(cx: TsChk, tps: [String]) : TsChk =
-  TsChk { tab: cx.tab, view: cx.view, file: cx.file,
-          tps: list_append(cx.tps, tps) }
+  TsChk { ...cx, tps: list_append(cx.tps, map(tps, (t) => tp_strip_kind(tp_strip_bounds(t)))) }
+
+fn tschk_at(cx: TsChk, pos: TsPos) : TsChk = TsChk { ...cx, pos: pos }
+
+# Below the name a position was entered for, every name is a type again.
+fn tschk_in(cx: TsChk) : TsChk = match cx.pos {
+  TsType -> cx
+  _      -> tschk_at(cx, TsType)
+}
+
+fn tschk_ops(ops: [EffectOp], cx0: TsChk) : Int / Console + File = match ops {
+  [] -> 0
+  [EOp(_, tps, ps, ret, _, _), ...rest] -> {
+    let cx = tschk_bind(cx0, tps)
+    tschk_params(ps, cx) + tschk_ty(ret, cx) + tschk_ops(rest, cx0)
+  }
+}
 
 fn tschk_tbody(b: TypeBody, cx: TsChk) : Int / Console + File = match b {
-  TBAlias(t)   -> tschk_ty(t, cx)
+  TBAlias(t)   -> match t.tkind {
+    TyName(_, _, []) -> tschk_ty(t, tschk_at(cx, TsAlias))
+    _                -> tschk_ty(t, cx)
+  }
   TBRecord(fs) -> tschk_fields(fs, cx)
   TBSum(vs)    -> tschk_variants(vs, cx)
   TBEffectAlias(ls) -> tschk_labels(ls, 0, 0, cx)
@@ -126,14 +205,24 @@ fn tschk_ty_opt(o: Option[TypeExpr], cx: TsChk) : Int / Console + File = match o
   Some(t) -> tschk_ty(t, cx)
 }
 
-fn tschk_ty(t: TypeExpr, cx: TsChk) : Int / Console + File = match t.tkind {
-  TyName(TyRef(None, _), n, ts) -> tschk_name(n, t.line, t.col, cx) + tschk_tys(ts, cx)
-  TyName(_, _, ts)    -> tschk_tys(ts, cx)
-  TyList(x)        -> tschk_ty(x, cx)
-  TyFn(ps, r, row) -> tschk_tys(ps, cx) + tschk_ty(r, cx) + tschk_row(row, t.line, t.col, cx)
-  TyDim(x, _)      -> tschk_ty(x, cx)
-  TyRefine(x, _)   -> tschk_ty(x, cx)
-  _ -> 0
+fn tschk_ty(t: TypeExpr, cx0: TsChk) : Int / Console + File = {
+  let cx = tschk_in(cx0)
+  match t.tkind {
+    TyName(TyRef(None, _), n, []) -> tschk_name(n, t.line, t.col, cx0)
+    TyName(TyRef(None, _), n, ts) -> tschk_name(n, t.line, t.col, cx) + tschk_args(ts, tschk_unit_slots(n, cx), 0, cx)
+    TyName(_, _, ts)    -> tschk_tys(ts, cx)
+    TyList(x)        -> tschk_ty(x, cx)
+    TyFn(ps, r, row) -> tschk_tys(ps, cx) + tschk_ty(r, cx) + tschk_row(row, t.line, t.col, cx)
+    TyDim(x, _)      -> tschk_ty(x, cx)
+    TyRefine(x, _)   -> tschk_ty(x, cx)
+    _ -> 0
+  }
+}
+
+fn tschk_args(ts: [TypeExpr], units: [Int], i: Int, cx: TsChk) : Int / Console + File = match ts {
+  [] -> 0
+  [t, ...rest] ->
+    tschk_ty(t, if any(units, (u) => u == i) { tschk_at(cx, TsUnitArg) } else { cx }) + tschk_args(rest, units, i + 1, cx)
 }
 
 fn tschk_tys(ts: [TypeExpr], cx: TsChk) : Int / Console + File = match ts {
@@ -166,6 +255,7 @@ fn tschk_here(e: Expr, cx: TsChk) : Int / Console + File = match e.kind {
   EBlock(ss, _)         -> tschk_stmts(ss, cx)
   EMatch(_, arms)       -> tschk_arms(arms, cx)
   EHandle(_, eff, _, ts, _, _, _, _) -> tschk_hidden(eff, [NCEffect, NCType], e.line, e.col, cx) + tschk_tys(ts, cx)
+  ERecordLit(TyRef(None, _), n, _) -> tschk_record_lit(n, e.line, e.col, cx)
   _ -> 0
 }
 
@@ -211,6 +301,16 @@ fn tschk_children(ps: [XPos], cx: TsChk) : Int / Console + File = match ps {
   [XP(_, child), ...rest] -> tschk_expr(child, cx) + tschk_children(rest, cx)
 }
 
+# A record literal names a record type, or a constructor whose payload is
+# a record: a name neither class declares builds nothing.
+fn tschk_record_lit(n: String, l: Int, c: Int, cx: TsChk) : Int / Console + File =
+  match split_dotted_qualifier(n) {
+    Some(_) -> 0
+    None ->
+      if any([NCType, NCExternType, NCCtor], (k) => not list_is_empty(st_candidates(cx.tab, k, n))) { 0 }
+      else { render_diag(nh_unknown_type_diag(cx.file, l, c, n, false)); 1 }
+  }
+
 # A qualifier IS the choice, and a type parameter is bound by its own
 # signature rather than declared by a module: neither can be contested.
 fn tschk_name(n: String, l: Int, c: Int, cx: TsChk) : Int / Console + File =
@@ -224,10 +324,40 @@ fn tschk_name(n: String, l: Int, c: Int, cx: TsChk) : Int / Console + File =
       }
       SvSym(s) -> if sv_reaches(cx.view, sym_owner(cx.tab, s), n) { 0 }
                   else { tschk_unseen(n, [NCType, NCExternType], l, c, cx) }
-      SvNone   -> tschk_unseen(n, [NCExternType], l, c, cx)
+      SvNone   -> match cx.pos {
+        TsUnitArg -> tschk_unseen(n, [NCExternType], l, c, cx)
+        TsAlias   -> tschk_undeclared(n, l, c, cx, true)
+        TsType    -> tschk_undeclared(n, l, c, cx, false)
+      }
       _ -> tschk_unseen(n, [NCType, NCExternType], l, c, cx)
     }
   } }
+
+# A name no type declaration answers: a foreign type the file does not
+# import is reported as hidden, and a name nothing gives a meaning as unknown.
+fn tschk_undeclared(n: String, l: Int, c: Int, cx: TsChk, alias: Bool) : Int / Console + File = {
+  let hidden = tschk_unseen(n, [NCExternType], l, c, cx)
+  if hidden > 0 or tschk_denotes(n, cx) { hidden }
+  else { render_diag(nh_unknown_type_diag(cx.file, l, c, n, alias)); 1 }
+}
+
+# What a bare name can denote with no type declaration behind it: a
+# scalar, a core type, an implicit type or row parameter (any lowercase
+# name), or a declaration of a class that shares the type namespace — a
+# union component is named by its constructor alone.
+fn tschk_denotes(n: String, cx: TsChk) : Bool =
+  is_core_type(n) or tschk_lower(n) or tschk_scalar(n)
+    or any([NCEffect, NCExternType, NCKind, NCProtocol, NCCtor], (k) => not list_is_empty(st_candidates(cx.tab, k, n)))
+
+fn tschk_scalar(n: String) : Bool = match undeclared_ty_named(n, SnValue) {
+  Some(_) -> true
+  None    -> false
+}
+
+fn tschk_lower(n: String) : Bool = match char_at(n, 0) {
+  Some(ch) -> ch_is_lower(ch)
+  None     -> false
+}
 
 # A core type's name the file sees no declaration of names the core type.
 fn tschk_unseen(n: String, cs: [NCls], l: Int, c: Int, cx: TsChk) : Int / Console + File =
