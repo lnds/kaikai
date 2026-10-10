@@ -206,14 +206,14 @@ fn run_report_dump(m: Mode, df: DiagFiles, hidden: [String], tp: TypedProgram, t
       doc_items: [DocItem]) : Int / Console + File = {
   let path = df_root(df)
   match m {
-    MHoles          -> dump_holes(path, tp, hidden, false)
-    MHolesJson      -> dump_holes_json(path, tp, doc_items, hidden, false)
-    MHolesScope     -> dump_holes(path, tp, hidden, true)
-    MHolesJsonScope -> dump_holes_json(path, tp, doc_items, hidden, true)
-    MEffectsJson    -> dump_effects_json(df, tp)
-    MEffectHolesJson -> dump_effect_holes_json(path, tp)
+    MHoles          -> dump_holes(path, tp, tab, hidden, false)
+    MHolesJson      -> dump_holes_json(path, tp, tab, doc_items, hidden, false)
+    MHolesScope     -> dump_holes(path, tp, tab, hidden, true)
+    MHolesJsonScope -> dump_holes_json(path, tp, tab, doc_items, hidden, true)
+    MEffectsJson    -> dump_effects_json(df, tp, tab)
+    MEffectHolesJson -> dump_effect_holes_json(path, tp, tab)
     MExplain        -> dump_explain(df, tp)
-    MDumpTyconIds   -> dump_tycon_ids(tp.decls, tab, module_name_of_path(path))
+    MDumpTyconIds   -> dump_tycon_ids(tp.decls, tab)
     MCheckTypeIds   -> check_type_ids(tp.decls, tab)
     _ -> 0
   }
@@ -3836,7 +3836,7 @@ fn body_declares_ctor(body: TypeBody, s: SymId) : Bool = match body {
 # returns the typed module instead of an exit code. Errors are
 # folded into the returned module's decls just like a normal
 # infer_program run; consumers inspect `tm_decls` for emptiness.
-fn compile_to_module(file: String, decls: [Decl], tab: SymTab) : TypedModule / Console + File {
+fn compile_to_module(file: String, decls: [Decl], tab: SymTab) : TypedModule / Console + File + Mutable {
 
 
   let r = infer_program(file, decls, tab, false)
@@ -4279,7 +4279,7 @@ fn find_enc_call_stmt(s: Stmt, ql: Int, qc: Int, acc: Option[CallAt]) : Option[C
     _                      -> acc
   }
 
-fn dump_library_mode(file: String, src: String, decls: [Decl], tab: SymTab) : Int / Console + File {
+fn dump_library_mode(file: String, src: String, decls: [Decl], tab: SymTab) : Int / Console + File + Mutable {
 
   let tm = compile_to_module(file, decls, tab)
   let probes = lib_collect_probes(src)
@@ -4597,7 +4597,7 @@ fn core_emit_key(cc: CoreCacheOpt, edition: Option[Edition], decls: [Decl], tab:
 # participate: test/bench shapes skip the cache instead of folding the
 # shape into the key.
 fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl], tab: SymTab, specs: SpecNames,
-                             bmode: BuildMode, target_mod_name: String,
+                             ids: ProtoIds, bmode: BuildMode, target_mod_name: String,
                              regions: [RegionMark], cc: CoreCacheOpt,
                              core_mods: [ModuleEntry], edition: Option[Edition], stamp_ids: [SymId])
                              : String / Console + File + Mutable = {
@@ -4606,10 +4606,10 @@ fn emit_modular_maybe_cached(path: String, src: String, decls: [Decl], tab: SymT
   let key = if plain { core_emit_key(cc, edition, decls, tab, specs, cacheable, target_mod_name) } else { "" }
   if key == "" {
     let _s = if cc.stats { eprint("kaic2: core-emit-cache: off") } else { () }
-    emit_program_modular(path, src, decls, tab, specs, bmode, Some(target_mod_name), regions, stamp_ids)
+    emit_program_modular(path, src, decls, tab, specs, ids, bmode, Some(target_mod_name), regions, stamp_ids)
   } else {
     let cached = match ec_lookup(cc.dir, key) { None -> [] Some(tus) -> tus }
-    match emit_program_modular_cached(path, src, decls, tab, specs, bmode, Some(target_mod_name), regions, cached, cacheable, stamp_ids) {
+    match emit_program_modular_cached(path, src, decls, tab, specs, ids, bmode, Some(target_mod_name), regions, cached, cacheable, stamp_ids) {
       EMO(stream, fresh) -> {
         let n_hit = list_length(cached)
         let _w = if n_hit == 0 and list_length(fresh) > 0 {
@@ -4875,10 +4875,13 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                                 pqchk_segmented(seg_marks, scoped_decls, mod_scopes, module_table)
             let qh_errs = qhchk_decls(core_es, module_table, diag_ctx) +
                           qhchk_segmented(seg_marks, scoped_decls, mod_scopes, module_table, diag_ctx)
-            let qt_core = qh_decls(qualtype_decls(core_es, tab0, module_table, diag_ctx), module_table)
-            let qt_expanded = qh_segmented(seg_marks,
-              qualtype_segmented(seg_marks, scoped_decls, tab0, mod_scopes, module_table, diag_ctx),
-              mod_scopes, module_table)
+            let qt_core_q = qualtype_decls(core_es, tab0, module_table, diag_ctx)
+            let qt_expanded_q = qualtype_segmented(seg_marks, scoped_decls, tab0, mod_scopes, module_table, diag_ctx)
+            # A qualified union member is re-pointed to a constructor of
+            # the module it names.
+            let tab1 = st_extend(tab0, list_append(qt_core_q.rows, qt_expanded_q.rows))
+            let qt_core = qh_decls(qt_core_q.decls, module_table)
+            let qt_expanded = qh_segmented(seg_marks, qt_expanded_q.decls, mod_scopes, module_table)
             # Key each free read of a colliding const name to the
             # module that owns it (the per-module scoping type_scope
             # applies to type names, on the value side). Runs
@@ -4886,18 +4889,18 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # before the variant-ctor collapse drops its module. The
             # collision table spans both streams — core, imports and
             # root all share the value namespace.
-            let cs_coll = nu_const_coll(list_append(qt_core, qt_expanded), tab0,
+            let cs_coll = nu_const_coll(list_append(qt_core, qt_expanded), tab1,
                                             target_mod_name)
             # The effect ops rqc may defer to when a qualifier loses in
             # the module table but names an effect's op (`Stdout.print`
             # beside a user module `Stdout`).
-            let rqc_fx = rqc_collect_fx(list_append(qt_core, qt_expanded), tab0)
+            let rqc_fx = rqc_collect_fx(list_append(qt_core, qt_expanded), tab1)
             # A bare function or constructor name two modules both export
             # keys to the home the reading module can actually see. The
             # table spans both streams, like the const one; only the
             # import segments carry a viewpoint, since a core decl reads
             # its own home first and the root sees every import.
-            let vs_coll = vs_collect(list_append(qt_core, qt_expanded), tab0, target_mod_name)
+            let vs_coll = vs_collect(list_append(qt_core, qt_expanded), tab1, target_mod_name)
             let vs_expanded = vs_segmented(seg_marks, qt_expanded, vs_coll, mod_scopes,
                                            module_table, target_mod_name,
                                            core_mod_names(core_mods, []))
@@ -4931,7 +4934,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # names are not exported) and the user is free to
             # redeclare the same bare name.
             let qualified_core_mangled =
-              mangle_core_segments(qualified_core, core_segs,
+              mangle_core_segments(qualified_core, tab1, core_segs,
                                          list_length(qualified_core))
             let merged_raw = list_append(qualified_core_mangled, qualified_decls)
             # `pub` enforcement at module + core boundaries. After
@@ -4968,16 +4971,16 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # stdlib annotation naming it look like a private-access
             # violation on the user's module.
             let type_name_coll = validate_type_name_collisions_decls(
-              root_only_decls, tab0, path)
+              root_only_decls, tab1, path)
             let pub_access_vd =
               if type_name_coll != [] { vd_count(0) }
-              else { vd_render(validate_pub_access(pa_segs, tab0, list_append(fn_bounds, surface_fn_bounds), target_mod_name, core_mod_names(core_mods, []), diag_ctx)) }
+              else { vd_render(validate_pub_access(pa_segs, tab1, list_append(fn_bounds, surface_fn_bounds), target_mod_name, core_mod_names(core_mods, []), diag_ctx)) }
             # Reject two `fn foo` decls in the same root file. Mirrors
             # the type check above. The resolver's `register_one`
             # prepends blindly so a second `fn foo` would otherwise
             # silently shadow the first.
             let fn_name_coll = validate_fn_name_collisions_decls(
-              root_only_decls, tab0, path)
+              root_only_decls, tab1, path)
             # Same shape for `effect`, `const`, `axiom`.
             # `register_one` prepends each kind blindly into the env,
             # so a second decl silently shadows the first. Walks the
@@ -4989,39 +4992,42 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # established input and mirrors the post-rqc split).
             let root_only_decls_raw = pae_drop(expanded_decls_raw, n_imports_raw)
             let effect_name_coll = validate_effect_name_collisions_decls(
-              root_only_decls, tab0, path)
+              root_only_decls, tab1, path)
             let const_name_coll = validate_const_name_collisions_decls(
-              root_only_decls_raw, tab0, path)
+              root_only_decls_raw, tab1, path)
             let axiom_name_coll = validate_axiom_name_collisions_decls(
-              root_only_decls, tab0, path)
+              root_only_decls, tab1, path)
             # A core builtin is declared only by a core module, judged by
             # the file each declaration was read from: the root by its own
             # path, an import by its entry's, never through a module name a
             # user file can share with a core module.
             let import_files = diag_files(module_files(match expanded { EP_Mod(_, mt, _, _, _, _, _, _) -> mt }, []), path)
             let kai_decl_vd = vd_render(list_append(
-              kai_builtin_decl_diags(qualified_core_mangled, tab0, diag_files(module_files(core_mods, []), path), is_core_path),
-              kai_builtin_decl_diags(qualified_decls, tab0, import_files, is_core_path)))
+              kai_builtin_decl_diags(qualified_core_mangled, tab1, diag_files(module_files(core_mods, []), path), is_core_path),
+              kai_builtin_decl_diags(qualified_decls, tab1, import_files, is_core_path)))
             # Synthesise `__ref_pred_X` fn for every
             # `type X = Base where pred` so match-arm narrowing
             # `p : X` resolves cleanly (parse_optional_arm_refine
             # emits an ECall to this name).
-            let ref_synth = synthesize_refine_pred_fns(merged_raw, tab0, target_mod_name)
+            let ref_synth = synthesize_refine_pred_fns(merged_raw, tab1, target_mod_name)
             let merged_raw_synth_ref = ref_synth.decls
-            let tab1 = st_extend(tab0, ref_synth.rows)
-            let ref_pred_fns = refine_pred_fn_syms(merged_raw, tab0, target_mod_name)
+            let tab2 = st_extend(tab1, ref_synth.rows)
+            let ref_pred_fns = refine_pred_fn_syms(merged_raw, tab1)
             # Rewrite `PNarrow(name, T)` where `T` is a
             # refinement-type alias back into `PBind(name)` +
             # `__ref_pred_T(name)` guard so match-arm narrowing keeps
             # working under the unified parser path. Non-alias
             # `PNarrow` survives for the typer's union-component check.
-            let ref_alias_names = collect_refine_alias_names(merged_raw_synth_ref, tab1)
-            let merged_raw_synth = lower_pattern_narrow_decls(merged_raw_synth_ref, ref_alias_names)
+            let merged_raw_synth = lower_pattern_narrow_decls(merged_raw_synth_ref, tab2, sym_views, target_mod_name,
+                                                              collect_refine_alias_ids(merged_raw_synth_ref))
             # Lower DAxiom → DFn(body=todo!) before any other Decl
             # walker runs. Subsequent passes (alias resolution,
             # builtin injection, desugars, typer) see only ordinary
             # fns and never need to handle the DAxiom variant.
-            let merged_pre_kinds = lower_extern_opaques(lower_axioms(merged_raw_synth, target_mod_name))
+            let opaques = lower_extern_opaques(lower_axioms(merged_raw_synth, target_mod_name), target_mod_name)
+            let merged_pre_kinds = opaques.decls
+            # The record each opaque handle lowered to.
+            let tab3 = st_extend(tab2, opaques.rows)
             # Kind resolution + unit hygiene, done up front so every later
             # pass sees a stream with habitant symbols already qualified
             # (`m` -> `Metric$m`) and no `DKind`/`DUseKind` catalog decls.
@@ -5042,12 +5048,12 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                                        core_mod_names(core_mods, []), target_mod_name)
             let merged_kr = resolve_kinds_decls(merged_pre_kinds, kind_reg,
               usites, target_mod_name, hab_view)
-            let kind_ctx = build_kind_ctx(merged_kr, tab1, kind_reg, usites, hab_view)
+            let kind_ctx = build_kind_ctx(merged_kr, tab3, kind_reg, usites, hab_view)
             # Atomic (kind, theory) pairs, captured before the catalog
             # decls are stripped; the typer's unit formation and
             # unify_dim dispatch on the theory of each habitant's kind.
             let kind_theories = atomic_kind_theories(merged_kr)
-            let unit_ref_errs = validate_unit_refs_decls(merged_kr, unit_scope(kind_ctx), diag_ctx)
+            let unit_ref_errs = validate_unit_refs_decls(merged_kr, tab3, unit_scope(kind_ctx), diag_ctx)
             # Habitant-declaration rules: closed-set atoms are
             # engine-known, closed kinds admit no habitant decls, and
             # measure payloads land only on measure-carrying kinds.
@@ -5066,7 +5072,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # the impl type's own constructors; an `axiom` clause exempts.
             let law_reg = strip_sl_reg(stripped_laws)
             let gen_laws =
-              if wants_law_checks(mode) { gen_law_checks(merged_no_laws, tab1, law_reg, path) }
+              if wants_law_checks(mode) { gen_law_checks(merged_no_laws, PScope(tab3, sym_views, target_mod_name), law_reg, path) }
               else { GL([], []) }
             let merged = list_append(merged_no_laws, gen_laws_decls(gen_laws))
             emit_law_check_notes(gen_laws_notes(gen_laws))
@@ -5080,12 +5086,12 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # neither parent pre-declaring the variant as its own
             # `type`). The counter folds into the exit-code aggregator
             # below. See `validate_union_collisions_decls`.
-            let union_collision_errs = validate_union_collisions_decls(merged, tab1, diag_ctx)
+            let union_collision_errs = validate_union_collisions_decls(merged, tab3, diag_ctx)
             # At most one `#[constructor]` per constructed type. A second
             # marked fn returning the same type is rejected — arity/type
             # overloading is out (Tier 1 #3).
-            let constructor_uniq_errs = validate_constructor_uniqueness_decls(merged, diag_ctx)
-            let variant_cap_errs = validate_variant_capacity(merged, tab1, diag_ctx)
+            let constructor_uniq_errs = validate_constructor_uniqueness_decls(merged, tab3, diag_ctx)
+            let variant_cap_errs = validate_variant_capacity(merged, tab3, diag_ctx)
             # An extern type names one C layout, so a second declaration
             # under the same spelling has no reading that keeps both
             # correct — the duplicate is the defect, not an ambiguity.
@@ -5095,10 +5101,10 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # differently emit contradictory prototypes no backend can
             # honour, and under separate compilation neither `cc` nor
             # the linker ever sees the two side by side.
-            let extern_fn_errs = validate_extern_fn_homes(merged, diag_ctx)
+            let extern_fn_errs = validate_extern_fn_homes(merged, tab3, diag_ctx)
             # An extern signature names C types only: scalars, fixed-width
             # annotations, and the declared extern structs / opaques.
-            let extern_type_diags = validate_extern_fn_types(merged, tab1, diag_ctx)
+            let extern_type_diags = validate_extern_fn_types(merged, tab3, diag_ctx)
             # Closed effect aliases. Resolve every
             # `type Foo = Eff1 + Eff2 + ...` (and `type Foo = Eff`
             # single-name form) into a flat label set and rewrite every
@@ -5110,11 +5116,11 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # not the file declared an `effect` for them. Cycles and
             # non-effect labels in alias bodies are fatal.
             let injected = inject_builtin_effects(merged)
-            let declared_effs = effect_names_of(injected, tab1)
+            let declared_effs = effect_names_of(injected, tab3)
             let eff_names_for_alias = declared_effs
-            let alias_cands = collect_alias_cands(injected, tab1, diag_ctx)
+            let alias_cands = collect_alias_cands(injected, tab3, diag_ctx)
             let alias_res = resolve_alias_cands(alias_cands, eff_names_for_alias, path)
-            let raw_decls_post_eff = expand_aliases_in_decls(injected, alias_res.aliases)
+            let raw_decls_post_eff = expand_aliases_in_decls(injected, tab3, alias_res.aliases)
             # Expand transparent type aliases. `type Foo = T`
             # (single-component, name not an effect) is structural —
             # every TyName("Foo", args) rewrites to the alias body with
@@ -5124,8 +5130,9 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # `TyRefine` form at every use site (the synthesised
             # `__ref_pred_X` fns and the pattern-narrow lowering have
             # already run).
-            let ta_table = collect_transparent_aliases(raw_decls_post_eff, tab1,
-                                                        eff_names_for_alias)
+            let ta_table = collect_transparent_aliases(raw_decls_post_eff, tab3,
+                                                        eff_names_for_alias, target_mod_name,
+                                                        core_mod_names(core_mods, []))
             # Re-run effect-alias expansion after transparent type-alias
             # expansion. Transparent aliases parameterised by
             # a row variable (`type Foo[t, e] = ... / e`) may surface
@@ -5135,9 +5142,9 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # syntactically in the decl stream.
             let raw_decls_pre_pos0 =
               expand_aliases_in_decls(
-                expand_ta_decls(raw_decls_post_eff, ta_table,
+                expand_ta_decls(raw_decls_post_eff, tab3, ta_table,
                                  alias_res.aliases),
-                alias_res.aliases)
+                tab3, alias_res.aliases)
             # Alias expansion may have inserted bare unit symbols
             # (`Money[USD]` -> `Decimal<USD>`): re-qualify habitants
             # against the kind registry and re-validate, so an unknown
@@ -5147,11 +5154,11 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let raw_decls_pre_pos = resolve_kinds_decls(raw_decls_pre_pos0,
               kind_reg, usites, target_mod_name, hab_view)
             let post_alias_unit_errs = if unit_ref_errs == 0 {
-              validate_unit_refs_decls(raw_decls_pre_pos, unit_scope(kind_ctx), diag_ctx)
+              validate_unit_refs_decls(raw_decls_pre_pos, tab3, unit_scope(kind_ctx), diag_ctx)
             } else { 0 }
             # Refined parameters are checked on entry, now that every
             # refinement is the inline `TyRefine` form.
-            let raw_decls_enforced = enforce_refinements_decls(raw_decls_pre_pos, tab1, ref_pred_fns)
+            let raw_decls_enforced = enforce_refinements_decls(raw_decls_pre_pos, tab3, ref_pred_fns)
             # Rewrite `T { v1, v2 }` (the parser plants nameless
             # positional fields) into `T { f1: v1, f2: v2 }`
             # using the record's declared field order. Runs before any
@@ -5159,7 +5166,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # nameless field. Reports unknown-record + arity
             # diagnostics; on errs > 0 we short-circuit before
             # invariants downstream can panic on the still-tagged AST.
-            let pos_rec = desugar_pos_records_decls(raw_decls_enforced, tab1, diag_ctx)
+            let pos_rec = desugar_pos_records_decls(raw_decls_enforced, tab3, sym_views, target_mod_name, diag_ctx)
             let raw_decls_with_regions = pos_rec.decls
             let pos_rec_errs = pos_rec.errs
             if pos_rec_errs > 0 { pos_rec_errs } else {
@@ -5206,7 +5213,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # KIR lowering builds the equivalent block loop, so the KIR
             # dump modes keep matching the native pipeline byte-for-byte.
             let loop_low_md = match mode { MDumpPurity -> false _ -> true }
-            let loop_low = if loop_low_md { lower_loop_intrinsics(cell_low.decls, tab1) }
+            let loop_low = if loop_low_md { lower_loop_intrinsics(cell_low.decls, tab3) }
                            else { cell_low.decls }
             let var_decls = desugar_var_decls(loop_low)
             # `use Effect` desugar. Strips DUse / SUse and rewrites bare
@@ -5216,7 +5223,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # desugars so SVar and SIndexAssign are already lowered;
             # runs before lower_protocols so protocol ops don't
             # conflict with effect ops in the open set.
-            let use_res = desugar_use_decls(var_decls, tab1, path)
+            let use_res = desugar_use_decls(var_decls, tab3, sym_views, target_mod_name, path)
             let use_errs = use_res.errs
             let post_use_decls = use_res.decls
             # Lower protocols / impls / #[derive] into ordinary
@@ -5226,10 +5233,12 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             let lowered = lower_protocols(post_use_decls, diag_ctx, target_mod_name,
                                           core_mod_names(core_mods, []),
                                           scope_imports(mod_scopes, module_table),
-                                          PScope(tab1, sym_views, target_mod_name))
+                                          PScope(tab3, sym_views, target_mod_name))
             # The dispatchers, lowered impl methods and derived functions
-            # the lowering minted.
-            let sym_tab = st_extend(tab1, lowered.rows)
+            # the lowering minted. The passes below take this binding, not
+            # the same table read back out of a resolver result: `Mutable`
+            # is masked only over a table this function built.
+            let sym_tab = st_extend(tab3, lowered.rows)
             # Lift `#{x}` interp parts into
             # `string_concat_all([..., show(x), ...])` so the typer +
             # protocol-call rewrite see them. Conditional on `Show`
@@ -5320,7 +5329,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             # (`n.await(f)` / `n.cancel(f)` / `n.select(fs)`) where
             # `f`'s brand differs from the surrounding scope's.
             let nursery_brand_errs = check_nursery_brand_mismatch_decls(
-              all_decls, diag_ctx, brand_calls, brand_registry)
+              all_decls, sym_tab, diag_ctx, brand_calls, brand_registry)
             let proto_reg = lowered.reg
             let proto_errs = lowered.errs
             if doc_errs > 0 { vd_exit(json, [Verdict(doc_errs, docs.diags)]) }
@@ -5364,47 +5373,47 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
               MEnv -> { dump_env(build_ty_env(all_decls, sym_tab).env); 0 }
               MInfer -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_infer(path, rd.decls, rd.tab) }
+                if rd.errs != 0 { rd.errs } else { dump_infer(path, rd.decls, sym_tab) }
               }
               MDumpTyped -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_typed(path, rd.decls, rd.tab) }
+                if rd.errs != 0 { rd.errs } else { dump_typed(path, rd.decls, sym_tab) }
               }
               MDumpTypedCore -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_typed_core(path, rd.decls, rd.tab) }
+                if rd.errs != 0 { rd.errs } else { dump_typed_core(path, rd.decls, sym_tab) }
               }
               MDumpMono -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_mono(path, rd.decls, rd.tab) }
+                if rd.errs != 0 { rd.errs } else { dump_mono(path, rd.decls, sym_tab) }
               }
               MDumpMonoOut -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_mono_out(path, rd.decls, rd.tab) }
+                if rd.errs != 0 { rd.errs } else { dump_mono_out(path, rd.decls, sym_tab) }
               }
               MDumpRawSafe -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_rawsafe(path, rd.decls, rd.tab) }
+                if rd.errs != 0 { rd.errs } else { dump_rawsafe(path, rd.decls, sym_tab) }
               }
               MDumpBorrowSafe -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_borrowsafe(path, rd.decls, rd.tab) }
+                if rd.errs != 0 { rd.errs } else { dump_borrowsafe(path, rd.decls, sym_tab) }
               }
               MDumpLastUse -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_last_use(path, rd.decls, rd.tab) }
+                if rd.errs != 0 { rd.errs } else { dump_last_use(path, rd.decls, sym_tab) }
               }
               MDumpIntervals -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_intervals(path, rd.decls, rd.tab) }
+                if rd.errs != 0 { rd.errs } else { dump_intervals(path, rd.decls, sym_tab) }
               }
               MDumpCallElision -> {
                 let rd = resolve_decls_stamped(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else {
-                  let head_owners = build_head_owner_map(all_decls, rd.tab, module_table, target_mod_name, edition_or_oldest(edition))
-                  let fused = tailfuse_decls(all_decls, rd.tab, target_mod_name, rd.params)
+                  let head_owners = build_head_owner_map(all_decls, sym_tab, module_table, target_mod_name, edition_or_oldest(edition))
+                  let fused = tailfuse_decls(all_decls, sym_tab, target_mod_name)
                   let typed_tab = st_extend(sym_tab, fused.rows)
                   let typed = tcut_infer_program(path, diag_ctx, fused.decls, "", pv_of(lowered.reg), head_owners, kind_theories, typed_tab, sym_views, false)
                   if typed.errs != 0 { typed.errs } else { dump_call_elision(path, typed.decls, typed_tab) }
@@ -5428,7 +5437,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # The typer knows the entry point by id, so the declarations
                 # are stamped first; a resolver error leaves them unstamped.
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                dump_evidence_obligations(path, rd.decls, rd.tab, entry_id(target_mod_name))
+                dump_evidence_obligations(path, rd.decls, sym_tab, entry_id(target_mod_name))
               }
               MDumpEvidenceArity -> {
                 # Injection-arity histogram for the §A.3 ABI spike. Runs
@@ -5437,7 +5446,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # reports the per-fn evidence-param count distribution.
                 # Analysis only; exit 0.
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                dump_evidence_arity(path, rd.decls, rd.tab, entry_id(target_mod_name))
+                dump_evidence_arity(path, rd.decls, sym_tab, entry_id(target_mod_name))
               }
               MDocJson -> {
                 # Docs are syntactic — dump the side table collected at
@@ -5452,7 +5461,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # AST. Probes are read from `# @probe` comments in
                 # the source so a fixture is self-describing.
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_library_mode(path, src, rd.decls, rd.tab) }
+                if rd.errs != 0 { rd.errs } else { dump_library_mode(path, src, rd.decls, sym_tab) }
               }
               MLint -> {
                 # Lints read the typed AST, so a clean typecheck is the
@@ -5468,9 +5477,9 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 if chk != 0 { chk } else {
                   run_lint(path, diag_ctx, lint_owned_mods(expanded), all_decls,
                            post_use_decls,
-                           build_head_owner_map(all_decls, rd.tab, module_table,
+                           build_head_owner_map(all_decls, sym_tab, module_table,
                                                 target_mod_name, edition_or_oldest(edition)),
-                           rd.tab, sym_views)
+                           sym_tab, sym_views)
                 }
               }
               MLintJson -> {
@@ -5480,9 +5489,9 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 if chk != 0 { chk } else {
                   run_lint_json(path, diag_ctx, lint_owned_mods(expanded), all_decls,
                                 post_use_decls,
-                                build_head_owner_map(all_decls, rd.tab, module_table,
+                                build_head_owner_map(all_decls, sym_tab, module_table,
                                                      target_mod_name, edition_or_oldest(edition)),
-                                rd.tab, sym_views)
+                                sym_tab, sym_views)
                 }
               }
               _ -> {
@@ -5493,7 +5502,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # resolver the typer stamps `TyCon`s with, over the same
                 # table, so dispatch compares identities of one origin.
                 let proto_reg = reg_with_target_ids(proto_reg,
-                                  tsh_homes(all_decls, rd.tab, sym_views, target_mod_name))
+                                  tsh_homes(all_decls, sym_tab, sym_views, target_mod_name))
                 let stamp_ids = stamp_targets(proto_reg.impls, lowered.derived, core_mod_names(core_mods, []))
                 if chk != 0 { vd_exit(json, [Verdict(chk, rd.diags)]) }
                 else {
@@ -5511,13 +5520,13 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   let core_hit = native_core_hit(core_cache, npre)
                   let prunes = core_prunes(mode, backend, core_cache, core_hit)
                   let cut = if prunes {
-                              core_reach(all_decls, core_mod_names(core_mods, []), proto_reg)
+                              core_reach(all_decls, sym_tab, core_mod_names(core_mods, []), proto_reg)
                             } else { CoreCut(all_decls, []) }
                   prune_note(core_cache.stats, prunes, cut)
                   let all_decls = match cut { CoreCut(kept, _) -> kept }
                   let dropped = match cut { CoreCut(_, d) -> d }
                   let pruned = match dropped { [] -> false _ -> true }
-                  let head_owners = build_head_owner_map(all_decls, rd.tab, module_table, target_mod_name, edition_or_oldest(edition))
+                  let head_owners = build_head_owner_map(all_decls, sym_tab, module_table, target_mod_name, edition_or_oldest(edition))
                   # The typed blobs follow the sources, so an explicit
                   # project directory wins over the entry's own: the
                   # native paths compile a copy of the entry from an
@@ -5539,12 +5548,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   # synthesised dispatch is typed like any other body and
                   # the self-tail rewrite downstream turns the cycle into
                   # the goto-loop it already emits.
-                  let fused = tailfuse_decls(all_decls, rd.tab, target_mod_name, rd.params)
+                  let fused = tailfuse_decls(all_decls, sym_tab, target_mod_name)
                   # The fused functions are declarations the typer must name.
-                  # Extends `sym_tab`, the table built here, not `rd.tab` (the
-                  # same table read back through a record): the `Mutable`
-                  # demand of the passes below is masked only for a carrier
-                  # this function constructed.
                   let typed_tab = st_extend(sym_tab, fused.rows)
                   let typed_prog0 = tcut_infer_program(path, diag_ctx, fused.decls, tcut_dir, pv_of(lowered.reg), head_owners, kind_theories, typed_tab, sym_views, match mode { MDumpSymIds -> true _ -> false })
                   # Contracts are discharged against the typed calls, where a
@@ -5603,25 +5608,28 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                                    vd_rendered(collision_errs), vd_rendered(name_errs)]
                   if vd_failed(typed_vds) { vd_exit(json, typed_vds) }
                   else {
-                    let hole_errs = if strict_holes { strict_holes_check(path, all_decls) } else { 0 }
+                    let hole_errs = if strict_holes { strict_holes_check(path, all_decls, sym_tab) } else { 0 }
                     if hole_errs != 0 { vd_exit(json, [...typed_vds, vd_count(hole_errs)]) }
                     else if is_check_mode(mode) {
                       let mf = mono_front(typed_prog, proto_reg,
-                                 bounds_by_sym(typed_prog.decls, typed_tab, surface_fn_bounds, target_mod_name),
+                                 bounds_by_sym(typed_prog.decls, surface_fn_bounds, target_mod_name),
                                  PScope(typed_tab, sym_views, target_mod_name), target_mod_name, path, diag_ctx, true)
                       vd_exit(json, [...typed_vds, mf.verdict])
                     }
                     else if is_report_mode(mode) { run_report_dump(mode, diag_ctx, pa_hidden_from_root(pa_segs, sym_tab, target_mod_name), typed_prog, typed_tab, docs.items) }
                     else {
                       let mf = mono_front(typed_prog, proto_reg,
-                                 bounds_by_sym(typed_prog.decls, typed_tab, surface_fn_bounds, target_mod_name),
+                                 bounds_by_sym(typed_prog.decls, surface_fn_bounds, target_mod_name),
                                           PScope(typed_tab, sym_views, target_mod_name), target_mod_name, path, diag_ctx, false)
                       let mono_decls = mf.decls
                       # The names the backends spell: the table with the
                       # closure specialisations the front minted, and the
-                      # emitted name of every specialised instance.
+                      # emitted name of every specialised instance. The index
+                      # is rebuilt here: one read out of a record is never
+                      # local, and the emitters' `Mutable` is masked only
+                      # over carriers this function built.
                       let emit_tab = st_extend(typed_tab, mf.rows)
-                      let specs = mf.specs
+                      let specs = spec_names_of(spec_names_rows(mf.specs))
                       let entry = entry_id(target_mod_name)
                       # Per-function evidence obligations, computed pre-mono
                       # and re-keyed onto the specialised symbols. Codegen
@@ -5690,7 +5698,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # re-emulate perceus's exit-drop computation, so a
                       # change to one has to be mirrored in the other.
                       # Below the erasure a name is a C symbol to spell.
-                      let post_perceus_decls = sym_erase_decls_in(erase_ctx, perceus_pass_in(unboxed_decls, emit_tab, sym_views, target_mod_name))
+                      let post_perceus_decls = sym_erase_decls_in(erase_ctx, perceus_pass_in(unboxed_decls, emit_tab, specs, sym_views, target_mod_name))
                       # TCO is mandatory on BOTH backends.
                       # `tcrec_rewrite_decls` is a pure AST→AST pre-pass
                       # that plants the `__kai_tcrec|...` self-tail-call
@@ -5719,17 +5727,17 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                       # get the rewrite so modulo-cons recursion stays
                       # O(1)-stack.
                       let cons_ok = true
-                      let perceus_decls = tcrec_rewrite_decls(post_perceus_decls, true, cons_ok, target_mod_name, emit_tab)
+                      let perceus_decls = tcrec_rewrite_decls(post_perceus_decls, true, cons_ok, target_mod_name, emit_tab, specs)
                       let use_purity = match mode { MDumpPurity -> true _ -> false }
                       let use_symids = match mode { MDumpSymIds -> true _ -> false }
-                      let misses = if pruned { core_cut_misses(mono_decls, dropped) } else { [] }
+                      let misses = if pruned { core_cut_misses(mono_decls, emit_tab, dropped) } else { [] }
                       if vd_failed([mf.verdict]) { vd_exit(None, [mf.verdict]) }
                       else if list_length(misses) > 0 { core_cut_fail("references a core function pruning dropped", misses) }
                       else if pruned and core_cache_writes(backend, core_cache)
                                      and not core_hit_reusable(backend, core_hit) {
                         core_cut_fail("would write a core cache entry from a pruned core", [])
                       }
-                      else if match mode { MCheckSiteIds -> true _ -> false } { check_site_ids(perceus_decls) }
+                      else if match mode { MCheckSiteIds -> true _ -> false } { check_site_ids(perceus_decls, emit_tab) }
                       else if match mode { MCheckWrittenEq -> true _ -> false } { check_written_eq(mono_decls, emit_tab, specs) }
                       else if use_purity {
                         # Confirmed-purity side table over the same
@@ -5738,7 +5746,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                         dump_purity_marks(purity_analyze(perceus_decls, entry), emit_tab, specs); 0
                       }
                       else if use_symids {
-                        let kp = kir_inline_program(lower_to_kir(perceus_decls, emit_tab, specs, region_marks, register_fn_decls(perceus_decls, emit_tab, specs, entry),
+                        let kp = kir_inline_program(lower_to_kir(perceus_decls, emit_tab, specs, proto_reg.ids, region_marks, register_fn_decls(perceus_decls, emit_tab, specs, entry),
                                                                  register_variants(perceus_decls, emit_tab), Some(target_mod_name), raw_arm_binders, false, stamp_ids, entry))
                         let core_names = core_mod_names(core_mods, [])
                         print(string_join(symid_decl_lines("unbox", emit_tab, specs, core_names, cell_decls)
@@ -5762,7 +5770,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                         let nfns = register_fn_decls(perceus_decls, emit_tab, specs, entry)
                         let nvariants = register_variants(perceus_decls, emit_tab)
                         let ncore_names = core_mod_names(core_mods, [])
-                        let kp = kir_lin_hook(ncore_prune_unreachable(kir_inline_program(lower_to_kir(perceus_decls, emit_tab, specs, region_marks, nfns, nvariants, Some(target_mod_name), raw_arm_binders, true, stamp_ids, entry)),
+                        let kp = kir_lin_hook(ncore_prune_unreachable(kir_inline_program(lower_to_kir(perceus_decls, emit_tab, specs, proto_reg.ids, region_marks, nfns, nvariants, Some(target_mod_name), raw_arm_binders, true, stamp_ids, entry)),
                                                          perceus_decls, nfns, bmode, ncore_names), kir_verify)
                         let obj_path = native_object_path(path)
                         # Core-object split: with the shared core cache
@@ -5793,7 +5801,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                         # one object path per line for the wrapper to link.
                         let nfns = register_fn_decls(perceus_decls, emit_tab, specs, entry)
                         let nvariants = register_variants(perceus_decls, emit_tab)
-                        let kp = kir_lin_hook(ncore_prune_unreachable(kir_inline_program(lower_to_kir(perceus_decls, emit_tab, specs, region_marks, nfns, nvariants, Some(target_mod_name), raw_arm_binders, true, stamp_ids, entry)),
+                        let kp = kir_lin_hook(ncore_prune_unreachable(kir_inline_program(lower_to_kir(perceus_decls, emit_tab, specs, proto_reg.ids, region_marks, nfns, nvariants, Some(target_mod_name), raw_arm_binders, true, stamp_ids, entry)),
                                                          perceus_decls, nfns, bmode, core_mod_names(core_mods, [])), kir_verify)
                         let obj_dir = if core_cache.nmod_dir == "" { dir_of(path) } else { core_cache.nmod_dir }
                         let objs = build_native_modular(kp, perceus_decls, nvariants, nfns, bmode,
@@ -5806,9 +5814,9 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                           emit_kir(perceus_decls, emit_tab, specs, region_marks, kir_inline_on, stamp_ids, entry)
                         } else if use_modular {
                           # Per-module .c/.h stream; the wrapper splits + links.
-                          emit_modular_maybe_cached(path, src, perceus_decls, emit_tab, specs, bmode, target_mod_name, region_marks, core_cache, core_mods, edition, stamp_ids)
+                          emit_modular_maybe_cached(path, src, perceus_decls, emit_tab, specs, proto_reg.ids, bmode, target_mod_name, region_marks, core_cache, core_mods, edition, stamp_ids)
                         } else {
-                          emit_program(path, src, perceus_decls, emit_tab, specs, bmode, Some(target_mod_name), region_marks, stamp_ids)
+                          emit_program(path, src, perceus_decls, emit_tab, specs, proto_reg.ids, bmode, Some(target_mod_name), region_marks, stamp_ids)
                         }
                         match batch_out {
                           # `print` appends a trailing newline; match it
