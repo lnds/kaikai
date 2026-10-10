@@ -67,6 +67,8 @@ import compiler.resolve_use
 import compiler.scope_view
 import compiler.written
 import compiler.decl_text
+import compiler.refine_types
+import compiler.refine_slots
 
 # ====================================================================
 # checker: name resolution
@@ -366,7 +368,7 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
         RArms(e2, as1) -> RKind(e2, EMatch(s1, as1))
       }
     }
-    ELambda(params, body) -> match add_params(env_push(e), params) {
+    ELambda(params, body) -> match bind_params(env_push(e), params) {
       RParams(e1, ps1) -> match chk_expr(e1, body) {
         RExpr(e2, b1) -> RKind(env_pop(e2), ELambda(ps1, b1))
       }
@@ -407,8 +409,9 @@ fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
     EBang(inner) -> match chk_expr(e, inner) {   # scope-walk the operand
       RExpr(e1, i1) -> RKind(e1, EBang(i1))
     }
-    EHandle(body, eff, ta, init_opt, alias_opt, clauses, ret_opt) ->
-      chk_handle(e, x, body, eff, ta, init_opt, alias_opt, clauses, ret_opt)
+    EHandle(body, eff, ta, init_opt, alias_opt, clauses, ret_opt) -> match chk_tys(e, ta) {
+      RTys(e1, ta1) -> chk_handle(e1, x, body, eff, ta1, init_opt, alias_opt, clauses, ret_opt)
+    }
     # literal carrying a unit annotation. Recurse into the inner
     # numeric literal; the unit symbols themselves are validated at
     # type-resolution time, not here.
@@ -468,8 +471,10 @@ fn chk_hidden(e: Env, name: String, x: Expr, reached: SymId) : Env / Console + F
       if env_shadowed(e, name) or starts_with(name, "__") or list_has(e.rs.prelude, name) { e }
       else {
         let d = nh_diag(e.rs.tab, e.rs.view, ss, e.file, x.line, x.col, name)
-        render_diag(d)
-        env_mark_err(env_push_diag(e, d))
+        if env_reported(e.diags, e.file, x.line, x.col, diag_text(d)) { e } else {
+          render_diag(d)
+          env_mark_err(env_push_diag(e, d))
+        }
       }
   } }
 
@@ -511,18 +516,30 @@ fn chk_unlifted_interp(e: Env, x: Expr) : Env / Console + File {
 # did-you-mean suggestion moves to a separate `help:` line and is
 # suppressed when no name is within Levenshtein distance 3.
 fn chk_unbound(e: Env, name: String, x: Expr) : Env / Console + File {
-  diag_error(e.file, x.line, x.col, "cannot find `#{name}` in this scope")
   let msg = "cannot find `#{name}` in this scope"
-  let hint = unbound_hint(e, name)
-  match hint {
-    Some(h) -> diag_help(h)
-    None    -> ()
+  if env_reported(e.diags, e.file, x.line, x.col, msg) { e } else {
+    diag_error(e.file, x.line, x.col, msg)
+    let hint = unbound_hint(e, name)
+    match hint {
+      Some(h) -> diag_help(h)
+      None    -> ()
+    }
+    let related = match hint {
+      Some(h) -> [ri_help(e.file, x.line, x.col, h)]
+      None    -> []
+    }
+    env_mark_err(env_push_diag(e, mk_diag(SevError, e.file, x.line, x.col, msg, related)))
   }
-  let related = match hint {
-    Some(h) -> [ri_help(e.file, x.line, x.col, h)]
-    None    -> []
-  }
-  env_mark_err(env_push_diag(e, mk_diag(SevError, e.file, x.line, x.col, msg, related)))
+}
+
+fn diag_text(d: Diagnostic) : String = match d { D(_, _, _, _, m, _) -> m }
+
+# A predicate is read where its type is written and again wherever a
+# check of it was planted, so one mistake in it is reported once.
+fn env_reported(ds: [Diagnostic], file: String, line: Int, col: Int, msg: String) : Bool = match ds {
+  [] -> false
+  [D(_, f, l, c, m, _), ...rest] ->
+    (l == line and c == col and f == file and m == msg) or env_reported(rest, file, line, col, msg)
 }
 
 # A name that appears as a bare alias right-hand side has no
@@ -653,12 +670,13 @@ fn chk_expr_named(e: Env, name: String, x: Expr) : RExpr / Console + File =
     RKind(e1, k) -> RExpr(e1, Expr { kind: k, line: x.line, col: x.col, ty: x.ty, mode: x.mode,  site: x.site })
   }
 
-fn warn_skip(e: Env, x: Expr, msg: String) : Env / Console + File = {
-  let help = "rename one of the two, or qualify the call to name the one it means"
-  diag_warning(e.file, x.line, x.col, msg)
-  diag_help(help)
-  env_push_diag(e, mk_diag(SevWarning, e.file, x.line, x.col, msg, [ri_help(e.file, x.line, x.col, help)]))
-}
+fn warn_skip(e: Env, x: Expr, msg: String) : Env / Console + File =
+  if env_reported(e.diags, e.file, x.line, x.col, msg) { e } else {
+    let help = "rename one of the two, or qualify the call to name the one it means"
+    diag_warning(e.file, x.line, x.col, msg)
+    diag_help(help)
+    env_push_diag(e, mk_diag(SevWarning, e.file, x.line, x.col, msg, [ri_help(e.file, x.line, x.col, help)]))
+  }
 
 # The effect a reference names. A qualifier picks the module outright;
 # a bare name climbs the scope view like any other class. A reference
@@ -809,7 +827,7 @@ fn chk_clauses_loop(e: Env, cs: [HClause], stateful: Bool,
   [HC(nm, params, body, l, c), ...rest] -> {
     let e1 = env_push(e)
     let e1s = if stateful { bind_state_aliases(e1, e) } else { e1 }
-    match add_params(e1s, params) {
+    match bind_params(e1s, params) {
       RParams(e2, ps1) -> match chk_expr(e2, body) {
         RExpr(e3, b1) -> chk_clauses_loop(env_pop(e3), rest, stateful, [HC(nm, ps1, b1, l, c), ...acc])
       }
@@ -908,8 +926,10 @@ type RStmt = RStmt(Env, Stmt)
 fn chk_stmt(e: Env, s: Stmt) : RStmt / Console + File {
   match s {
     SLet(pat, ta, rhs) -> match chk_expr(e, rhs) {
-      RExpr(e1, r1) -> match bind_pat(e1, pat) {
-        RPat(e2, p1) -> RStmt(note_arity(e2, p1, binder_arity(Some(rhs), ta)), SLet(p1, ta, r1))
+      RExpr(e1, r1) -> match chk_opt_ty(e1, ta) {
+        ROptTy(e1t, ta1) -> match bind_pat(e1t, pat) {
+          RPat(e2, p1) -> RStmt(note_arity(e2, p1, binder_arity(Some(rhs), ta)), SLet(p1, ta1, r1))
+        }
       }
     }
     SAssert(cond, opt_msg) -> match chk_expr(e, cond) {
@@ -979,6 +999,68 @@ fn note_bound_arity(e: Env, l: LocalId, a: Option[Int]) : Env = match a {
   Some(n) -> Env { ...e, larity: [LocalArity(l, n), ...e.larity] }
 }
 
+# ---- refinement predicates ----
+
+# A refinement's predicate is an expression of the scope its type is
+# written in, where `self` is the value the type constrains: a binder of
+# the predicate, whatever the scope calls `self`.
+
+type RTys = RTys(Env, [TypeExpr])
+
+type ROptTy = ROptTy(Env, Option[TypeExpr])
+
+type REffOps = REffOps(Env, [EffectOp])
+
+fn chk_tys(e: Env, ts: [TypeExpr]) : RTys / Console + File =
+  if not tys_refined(ts) { RTys(e, ts) }
+  else { match chk_preds(e, tys_preds(ts), []) {
+    RExprs(e1, ps) -> RTys(e1, tys_with_preds(ts, ps))
+  } }
+
+fn chk_preds(e: Env, ps: [Expr], acc: [Expr]) : RExprs / Console + File = match ps {
+  [] -> RExprs(e, list_reverse(acc))
+  [p, ...rest] -> match env_bind(env_push(e), pred_self_binder()) {
+    RBinder(inner, _) -> match chk_expr(inner, p) {
+      RExpr(e1, p1) -> chk_preds(env_pop(e1), rest, [p1, ...acc])
+    }
+  }
+}
+
+fn chk_opt_ty(e: Env, t: Option[TypeExpr]) : ROptTy / Console + File = match t {
+  None    -> ROptTy(e, None)
+  Some(x) -> match chk_tys(e, [x]) {
+    RTys(e1, [x1, ..._]) -> ROptTy(e1, Some(x1))
+    RTys(e1, [])         -> ROptTy(e1, t)
+  }
+}
+
+# Parameters are bound before their annotations are read: a parameter's
+# refinement may name any of them.
+fn bind_params(e: Env, ps: [Param]) : RParams / Console + File = match add_params(e, ps) {
+  RParams(e1, ps1) -> {
+    let ts = params_types(ps1)
+    if not tys_refined(ts) { RParams(e1, ps1) }
+    else { match chk_tys(e1, ts) { RTys(e2, ts1) -> RParams(e2, params_with_types(ps1, ts1)) } }
+  }
+}
+
+fn op_refined(op: EffectOp) : Bool = match op {
+  EffOp(_, _, ps, ret, _, _) -> tys_refined([ret, ...params_types(ps)])
+}
+
+# An operation's parameters are in scope of its own signature only.
+fn chk_effect_ops(e: Env, ops: [EffectOp], acc: [EffectOp]) : REffOps / Console + File = match ops {
+  [] -> REffOps(e, list_reverse(acc))
+  [op, ...rest] -> if not op_refined(op) { chk_effect_ops(e, rest, [op, ...acc]) } else { match op {
+    EffOp(nm, tps, ps, ret, l, c) -> match bind_params(env_push(e), ps) {
+      RParams(e1, ps1) -> match chk_tys(e1, [ret]) {
+        RTys(e2, [ret1, ..._]) -> chk_effect_ops(env_pop(e2), rest, [EffOp(nm, tps, ps1, ret1, l, c), ...acc])
+        RTys(e2, [])           -> chk_effect_ops(env_pop(e2), rest, [EffOp(nm, tps, ps1, ret, l, c), ...acc])
+      }
+    }
+  } }
+}
+
 # ---- declaration walkers ----
 
 #[doc("A walked declaration: the env after it, and the tree with its resolved names stamped.")]
@@ -991,26 +1073,38 @@ fn rd_env(r: RDecl) : Env = match r { RDecl(e, _) -> e }
 
 fn chk_decl(e: Env, d: Decl) : RDecl / Console + File {
   match d {
-    DFn(p, fid, tp, params, rt, row, body, l, c, mo) -> match add_params(env_push(e), params) {
-      RParams(e1, ps1) -> match chk_expr(e1, body) {
-        RExpr(e2, b1) -> RDecl(Env { ...env_pop(e2), params: [ParamIds(fnid_sym(fid), param_ids(ps1)), ...e2.params] },
-                               DFn(p, fid, tp, ps1, rt, row, b1, l, c, mo))
+    DFn(p, fid, tp, params, rt, row, body, l, c, mo) -> match bind_params(env_push(e), params) {
+      RParams(e1, ps1) -> match chk_opt_ty(e1, rt) {
+        ROptTy(e1t, rt1) -> match chk_expr(e1t, body) {
+          RExpr(e2, b1) -> RDecl(Env { ...env_pop(e2), params: [ParamIds(fnid_sym(fid), param_ids(ps1)), ...e2.params] },
+                                 DFn(p, fid, tp, ps1, rt1, row, b1, l, c, mo))
+        }
       }
     }
-    DType(_, _, _, _, _, _, _, _) -> RDecl(e, d)
+    DType(pb, t, tps, body, l, c, mo, xs) -> {
+      let ts = body_types(body)
+      if not tys_refined(ts) { RDecl(e, d) }
+      else { match chk_tys(e, ts) {
+        RTys(e1, ts1) -> RDecl(e1, DType(pb, t, tps, body_with_types(body, ts1), l, c, mo, xs))
+      } }
+    }
     DTest(nm, body, l, c, mo) -> match chk_body_scope(e, body) {
       RExpr(e1, b1) -> RDecl(e1, DTest(nm, b1, l, c, mo))
     }
     DBench(nm, body, l, c, mo) -> match chk_body_scope(e, body) {
       RExpr(e1, b1) -> RDecl(e1, DBench(nm, b1, l, c, mo))
     }
-    DCheck(nm, params, body, l, c, mo) -> match add_params(env_push(e), params) {
+    DCheck(nm, params, body, l, c, mo) -> match bind_params(env_push(e), params) {
       RParams(e1, ps1) -> match chk_expr(e1, body) {
         RExpr(e2, b1) -> RDecl(env_pop(e2), DCheck(nm, ps1, b1, l, c, mo))
       }
     }
     DImport(_, _, _) -> RDecl(e, d)
-    DEffect(_, _, _, _, _, _, _, _) -> RDecl(e, d)
+    DEffect(p, esym, tps, ops, dblk, l, c, mo) ->
+      if not any(ops, op_refined) { RDecl(e, d) }
+      else { match chk_effect_ops(e, ops, []) {
+        REffOps(e1, ops1) -> RDecl(e1, DEffect(p, esym, tps, ops1, dblk, l, c, mo))
+      } }
     # protocol / impl / derive decls are stripped by `lower_protocols`
     # before `check_program` runs, so reaching one here means the
     # pipeline was driven directly into `chk_decl` (e.g. via `--check`
@@ -1036,7 +1130,10 @@ fn chk_decl(e: Env, d: Decl) : RDecl / Console + File {
     DUseKind(_, _, _, _) -> RDecl(e, d)        # stripped by the kind-resolution pass before chk runs
     DAxiom(_, _, _, _, _, _, _, _, _, _) -> RDecl(e, d)  # rewritten to DFn by lower_axioms before chk runs
     DConst(p, csym, ta, body, mo, l, c) -> match chk_expr(env_add_decl(e, csym), body) {
-      RExpr(e1, b1) -> RDecl(e1, DConst(p, csym, ta, b1, mo, l, c))
+      RExpr(e1, b1) -> match chk_tys(e1, [ta]) {
+        RTys(e2, [ta1, ..._]) -> RDecl(e2, DConst(p, csym, ta1, b1, mo, l, c))
+        RTys(e2, [])          -> RDecl(e2, DConst(p, csym, ta, b1, mo, l, c))
+      }
     }
     DExternType(_, _, _, _, _) -> RDecl(e, d)  # FFI v2: a foreign type binds no value
     DDoc(ds, dl, inner, l, c) -> match chk_decl(e, inner) {

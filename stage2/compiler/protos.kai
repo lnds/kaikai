@@ -1232,7 +1232,7 @@ fn lower_impl_methods(tab: SymTab, root: String, head: ImplHead, methods: [Decl]
         }
         lower_impl_methods(tab, root, head, rest,
                            LowerImplsRes { reg: reg1, fns: [new_fn, ...acc.fns],
-                                           rows: [NEnt(NCFn, mangled, proto_home_name(mo, root), false), ...acc.rows] })
+                                           rows: [NEnt(NCFn, mangled, proto_home_name(mo, root), false, NmImpl), ...acc.rows] })
       }
       _ -> lower_impl_methods(tab, root, head, rest, acc)
     }
@@ -1279,14 +1279,32 @@ fn generate_dispatchers_loop(ops: [ProtoOpReg], arities: [OpAr], tab: SymTab, ro
         else {
           let pname = written_text(sym_name(tab, psym))
           let stub = make_dispatcher_fn(pname, opname, dsym, params, ret, line, col, mo)
-          generate_dispatchers_loop(rest, arities, tab, root,
-                                    DispGen { decls: [stub, ...acc.decls], ids: ids,
-                                              rows: [NEnt(NCFn, disp, proto_home_name(mo, root), true), ...acc.rows] })
+          let open = DispGen { decls: [stub, ...acc.decls], ids: ids,
+                               rows: [NEnt(NCFn, disp, proto_home_name(mo, root), true, NmDispatcher), ...acc.rows] }
+          generate_dispatchers_loop(rest, arities, tab, root, with_homed_twin(open, pname, opname, disp, params, ret, line, col, mo, root))
         }
       }
     }
   }
 }
+
+# A module's dispatcher gains its homed twin: the same stub under a name
+# of its own, which only that module's protocols answer. The root file
+# has none: nothing names its dispatchers through a home.
+fn with_homed_twin(g: DispGen, pname: String, opname: String, disp: String, params: [Param], ret: TypeExpr,
+                   line: Int, col: Int, mo: Option[String], root: String) : DispGen = match mo {
+  None    -> g
+  Some(_) -> {
+    let twin = proto_homed_name(disp)
+    let stub = make_dispatcher_fn(pname, opname, pid_fn_id(twin, mo, root), params, ret, line, col, mo)
+    DispGen { decls: [stub, ...g.decls], ids: pid_note_homed(g.ids, disp, twin, mo, root),
+              rows: [NEnt(NCFn, twin, proto_home_name(mo, root), true, NmDispatcher), ...g.rows] }
+  }
+}
+
+# The name a dispatcher's homed twin is declared with: the dispatcher's,
+# under a prefix of its own.
+fn proto_homed_name(disp: String) : String = concat_all(["__homed", disp])
 
 # `dsym` is the dispatcher's id, derived from its arity-resolved name
 # (which may carry an `__a<N>` suffix); `opname` is the original op name,
@@ -2401,8 +2419,8 @@ fn derive_binser_decls(dt: DerivedType, put: Expr, from_b: Expr,
                     derive_binser_put_fn(dt, put, line, col),
                     derive_binser_shim(dt, line, col)],
             rows: list_append(derived_method_rows(dt, CpBinSerialize, ["to_bytes", "from_bytes"]),
-                              [NEnt(NCFn, binser_put_name(dt_rt_name(dt)), dt.home, false),
-                               NEnt(NCFn, binser_shim_name(dt_name(dt)), dt.home, true)]) }
+                              [NEnt(NCFn, binser_put_name(dt_rt_name(dt)), dt.home, false, NmBinWriter),
+                               NEnt(NCFn, binser_shim_name(dt_name(dt)), dt.home, true, NmDerived)]) }
 
 # `bin_buf_bytes(<writer>(bin_buf_new(), self))`: the writer over a fresh
 # buffer. The masking pass keeps this pure because a derived writer
@@ -4913,8 +4931,7 @@ fn try_rewrite_proto_call_with_ret(callee: Expr, args_: [Expr],
             match args_disp_heads(args_) {
               None -> None
               Some(_) ->
-                try_rewrite_ret_candidates(proto_cands_own_first(proto_ops_lookup_all(reg, opname), cm),
-                                           callee, args_, reg, cm, opname, ty)
+                try_rewrite_ret_candidates(proto_call_cands(reg, row, cm), callee, args_, reg, cm, opname, ty)
             }
           }
           None -> None
@@ -4985,35 +5002,24 @@ fn try_rewrite_ret_candidates(cands: [ProtoOpReg], callee: Expr,
 fn try_rewrite_proto_call(callee: Expr, args_: [Expr],
                             reg: ProtocolReg,
                             cm: Option[String]) : Option[ExprKind] {
-  match callee.kind {
-    # A qualified dispatcher: the interpolation sugar's `show`, homed at
-    # the core protocol. The qualifier selects the protocols its home
-    # declares.
-    EModCall(_, _) -> match pid_ref_disp(reg.ids, callee) {
-      Some(row) ->
-        try_rewrite_proto_candidates(pcof_matching(proto_ops_lookup_all(reg, disp_op(row)), disp_home(row)),
-                                     callee, args_, reg, cm, disp_op(row))
-      None -> None
-    }
-    _ -> match pid_bare_disp(reg.ids, callee) {
-      # Issue #180: with heterogeneous P[A] dispatch, the receiver
-      # is no longer always args[0]. We need to consider every
-      # argument as a candidate Self and find the impl whose
-      # arg-name list matches the OTHER arguments.
-      #
-      # Issue #546: when two protocols declare an op with the same
-      # name, the bare-name call site carries no protocol — only the
-      # receiver type disambiguates. Iterate every protocol declaring
-      # this op and pick the first that has an impl for the receiver.
-      # The caller's own protocol ranks first: with a contested name,
-      # a module's bare call binds its own declaration, exactly as
-      # The scope chain resolves the name for impl validation.
-      Some(row) ->
-        try_rewrite_proto_candidates(proto_cands_own_first(proto_ops_lookup_all(reg, disp_op(row)), cm),
-                                     callee, args_, reg, cm, disp_op(row))
-      None -> None
-    }
+  # With heterogeneous P[A] dispatch the receiver is not always args[0]:
+  # every argument is a candidate Self, and the impl is the one whose
+  # arg-name list matches the others.
+  match pid_bare_disp(reg.ids, callee) {
+    Some(row) -> try_rewrite_proto_candidates(proto_call_cands(reg, row, cm), callee, args_, reg, cm, disp_op(row))
+    None      -> None
   }
+}
+
+# The protocols a call of the dispatcher `row` may reach. A homed twin is
+# answered by its home's protocols only: the interpolation sugar's `show`
+# never reaches a user protocol that declares a `show`. Any other
+# dispatcher stands for its operation in every protocol declaring it,
+# since a bare call carries no protocol and the receiver's type decides;
+# the caller's own protocols rank first, as the scope chain ranks them.
+fn proto_call_cands(reg: ProtocolReg, row: DispInfo, cm: Option[String]) : [ProtoOpReg] = {
+  let all = proto_ops_lookup_all(reg, disp_op(row))
+  if disp_homed(row) { pcof_matching(all, disp_home(row)) } else { proto_cands_own_first(all, cm) }
 }
 
 # Issue #546: try each protocol declaring `opname` in registry order,
