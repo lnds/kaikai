@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.139.6 (2026-10-10)
+
+### Changed
+
+- **native**: move Int and Real Vec payloads as bare words (#2670)
+
 ## v0.139.5 (2026-10-09)
 
 ## v0.139.4 (2026-10-09)
