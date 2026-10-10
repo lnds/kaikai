@@ -3,7 +3,7 @@
 
 Families:
   arm     a pattern binds (or tests a literal against) the name slot of an identity node
-  mint    an identity node is constructed with a literal name
+  mint    an identity node is constructed with a literal name, or `mk_ref` is given one
   acc     a name accessor is called (rl_name, ty_ref_qual, hs_display, .eff, ...)
   lit     a string literal that looks like a declaration name or a `__` marker is compared
 Output: TSV  file  line  fn  family  node  text
@@ -97,6 +97,8 @@ for fname in sorted(os.listdir(SRC)):
         for a in ACCESSORS:
             if re.search(r'(^|[^A-Za-z0-9_])' + a + r'\(', code) and not FN.match(code):
                 rows.append((fname, ln, cur_fn, "acc", a, code.strip()[:200]))
+        if re.search(r'\bmk_ref\("', code) and not FN.match(code):
+            rows.append((fname, ln, cur_fn, "mint", "mk_ref", code.strip()[:200]))
         if re.search(r'\.eff\b', code):
             rows.append((fname, ln, cur_fn, "acc", ".eff", code.strip()[:200]))
         if re.search(r'(==|!=)\s*"([A-Z][A-Za-z0-9_.]*|__[A-Za-z0-9_|]*)"|"([A-Z][A-Za-z0-9_.]*|__[A-Za-z0-9_|]*)"\s*(==|!=)', code):
