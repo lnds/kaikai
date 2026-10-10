@@ -284,12 +284,12 @@ for pass in cold warm; do
   if [ "$pass" = cold ]; then out=$ctor_cold; else out=$ctor_warm; fi
   need '^ctor pat pa Tok#[0-9]+ Tok@ma$'
   need '^ctor pat pb Tok#[0-9]+ Tok@mb$'
-  need '^ctor mod main Tok#[0-9]+ Tok@ma$'
-  need '^ctor mod main Tok#[0-9]+ Tok@mb$'
+  need '^ctor sym main Tok#[0-9]+ Tok@ma$'
+  need '^ctor sym main Tok#[0-9]+ Tok@mb$'
   printf '%s\n' "$out" | grep -q ' Tok#none$' && fail "$pass: a constructor site reached unbox with no home"
   [ "$(id_of '^ctor pat pa Tok#')" != "$(id_of '^ctor pat pb Tok#')" ] \
     || fail "$pass: two modules' homonymous constructors carry one id"
-  [ "$(id_of '^ctor pat pa Tok#')" = "$(id_of '^ctor mod main Tok#[0-9]+ Tok@ma$')" ] \
+  [ "$(id_of '^ctor pat pa Tok#')" = "$(id_of '^ctor sym main Tok#[0-9]+ Tok@ma$')" ] \
     || fail "$pass: the arm and the construction of one constructor carry different ids"
 done
 [ "$ctor_cold" = "$ctor_warm" ] || fail "a warm build's constructor ids differ from a cold build's"
