@@ -5241,9 +5241,9 @@ fn apply_ty_opt(s: Subst, t: Ty) : Option[Ty] {
         Some(ps1) -> Some(TyFnT(ps1, opt_ty_or(rt, ret), opt_row_or(rw, row)))
       }
     }
-    TyCon(mo_, name, atys, sid) -> match apply_tys_opt(s, atys) {
+    TyCon(sid, atys) -> match apply_tys_opt(s, atys) {
       None      -> None
-      Some(as1) -> Some(TyCon(mo_, name, as1, sid))
+      Some(as1) -> Some(TyCon(sid, as1))
     }
     # Once the shape var binds to a constructor witness, reconstruct the
     # concrete applied type (`s := List, A := Int` → `TyListT(Int)`), so
@@ -5338,16 +5338,12 @@ fn apply_tys_opt(s: Subst, ts: [Ty]) : Option[[Ty]] {
 #
 #   - associative: nested `TyUnion` flattens (`(A | B) | C` → `A | B | C`).
 #   - idempotent:  duplicates collapse (`A | A` → `A`).
-#   - commutative: the result is sorted by `inf_mangle_ty` so component
+#   - commutative: the result is sorted by `union_order_key` so component
 #                  order does not affect type identity (`A | B ≡ B | A`).
 #
-# The sort key is `inf_mangle_ty(t)` — already deterministic, already used
-# for monomorphisation, and stable across compilations because it is
-# a pure function of the resolved Ty. Using the existing mangler also
-# means two semantically equal types (e.g. `Decimal<USD>` and
-# `Decimal` post-unit-erasure under codegen monomorphisation) sort
-# adjacently, but unification still distinguishes them at the type
-# level via `unify` / `inf_ty_eq` — normalisation is purely about
+# The key is a pure function of the resolved Ty that erases units and
+# refinements, so two types that differ only there sort adjacently;
+# unification still distinguishes them — normalisation is purely about
 # canonical ordering for equality, not about merging distinct types.
 #
 # Returns the bare component when the normalised list collapses to a
@@ -5390,7 +5386,7 @@ fn append_ty_lists(a: [Ty], b: [Ty]) : [Ty] {
   }
 }
 
-# Insertion sort keyed by `inf_mangle_ty`. The expected union arity is
+# Insertion sort keyed by `union_order_key`. The expected union arity is
 # small (a handful of bounded-context errors in the DDD use case)
 # so insertion sort beats merge sort here in both code size and
 # constant factor.
@@ -5405,14 +5401,43 @@ fn union_sort_insert(t: Ty, sorted: [Ty]) : [Ty] {
   match sorted {
     [] -> [t]
     [h, ...rest] -> {
-      if string_lt(inf_mangle_ty(t), inf_mangle_ty(h)) { [t, h, ...rest] }
+      if string_lt(union_order_key(t), union_order_key(h)) { [t, h, ...rest] }
       else { [h, ...union_sort_insert(t, rest)] }
     }
   }
 }
 
+# The canonical position of a union component: a nominal type by its
+# identity, so the order needs no symbol table and no spelling.
+fn union_order_key(t: Ty) : String = match t {
+  TyInt    -> "Int"
+  TyReal   -> "Real"
+  TyBool   -> "Bool"
+  TyString -> "String"
+  TyChar   -> "Char"
+  TyUnit   -> "Unit"
+  TyByte   -> "Byte"
+  TyInt32  -> "Int32"
+  TyUInt32 -> "UInt32"
+  TyUInt64 -> "UInt64"
+  TyInt128 -> "Int128"
+  TyHandle -> "Handle"
+  TyListT(inner) -> concat_all(["L_", union_order_key(inner), "_E"])
+  TyFnT(ps, ret, _) -> concat_all(["F_", inf_join_with(map(ps, union_order_key), "_"), "_R_", union_order_key(ret), "_E"])
+  TyCon(s, tas) -> match tas {
+    [] -> string_concat("c", int_to_string(sym_raw(s)))
+    _  -> concat_all(["c", int_to_string(sym_raw(s)), "_O_", inf_join_with(map(tas, union_order_key), "_"), "_C"])
+  }
+  TyVarT(_) -> "TVAR"
+  TyShapeApp(_, arg) -> string_concat("SVAR_", union_order_key(arg))
+  TyAny -> "Any"
+  TyDimT(base, _) -> union_order_key(base)
+  TyRefineT(base, _) -> union_order_key(base)
+  TyUnion(parts) -> concat_all(["U_", inf_join_with(map(parts, union_order_key), "_"), "_E"])
+}
+
 # Dedup adjacent equal entries. Input must already be sorted by
-# `inf_mangle_ty` so `inf_ty_eq` only fires on neighbours. `inf_ty_eq` is the
+# `union_order_key` so `inf_ty_eq` only fires on neighbours. `inf_ty_eq` is the
 # semantic equality from later in this file; forward references work
 # because top-level fn definitions are not order-dependent.
 fn union_dedup_sorted(ts: [Ty]) : [Ty] {
@@ -5439,46 +5464,28 @@ fn union_dedup_sorted(ts: [Ty]) : [Ty] {
 #
 # Two `var` cells (`var i`, `var go`) each desugar to `with State[T](init)
 # as <name>`; semantically they are two independent State handlers, but
-# their row labels were both `State[?T]` — structurally indistinguishable
-# once the cell `<name>` was dropped. When the two cells reach a
+# their row labels are both `State[?T]`. When the two cells reach a
 # row-unification partition with their `T`s still unresolved (the
-# `while`-in-lambda shape), the partition fused them and cross-bound their
-# `T`s (`Int := Bool`), corrupting downstream types. The alias `<name>`
-# already exists at the op-call site (`lookup_alias`) and at the handler
-# (`alias_opt`); we thread it into the LABEL's `eff` string as a
-# `"State@i"` suffix so distinct cells are distinct labels and never fuse.
-# The suffix is confined to the typer: every cell label is discharged by
-# its own `with State as <name>` handler (the discharge is made symmetric
-# in `filter_labels_matching_res`), so a `"State@i"` label never escapes
-# to a function signature, `main`'s row, or the emitters — which keep
-# seeing bare effect names. `label_to_string` strips it for diagnostics.
+# `while`-in-lambda shape), the partition would fuse them and cross-bind
+# their `T`s (`Int := Bool`). So a label carries the cell it belongs to,
+# the alias binder of its handler, and two cells are two labels.
+# The cell is confined to the typer: every cell label is discharged by
+# its own `with State as <name>` handler, so none escapes to a function
+# signature, `main`'s row, or the emitters.
 #
-# Unlike the codegen `@<alias>` dispatch tag, this suffix is stamped
-# whenever the alias resolves, independent of taggability: the dispatch
-# tag is disabled across a lambda boundary (the C local is out of scope),
-# but row identity must hold inside lambdas too — that is exactly where
-# the `while` thunks live.
-fn label_eff_with_alias(eff: String, alias_opt: Option[String]) : String {
-  match alias_opt {
-    None    -> eff
-    Some(a) -> string_concat(eff, string_concat("@", a))
-  }
-}
+# Unlike the codegen dispatch tag, the cell is stamped whenever the alias
+# resolves, independent of taggability: the dispatch tag is disabled
+# across a lambda boundary, but row identity must hold inside lambdas
+# too — that is exactly where the `while` thunks live.
+fn label_in_cell(esym: SymId, ty_args: [Ty], cell: LocalId) : Label =
+  Label { sym: esym, ty_args: ty_args, cell: cell }
 
-# Strip a `@<alias>` cell-identity suffix from a label eff for display.
-# `"State@i"` → `"State"`; `"Stdout"` → `"Stdout"`. Diagnostics and any
-# user-facing rendering must show the effect, not the internal cell tag.
-fn strip_label_alias(eff: String) : String =
-  strip_label_alias_loop(eff, 0, string_length(eff))
+fn label_cell(l: Label) : LocalId = l.cell
 
-fn strip_label_alias_loop(eff: String, i: Int, n: Int) : String {
-  if i >= n { eff }
-  else {
-    match char_at(eff, i) {
-      Some(c) -> if c == '@' { string_slice(eff, 0, i) } else { strip_label_alias_loop(eff, i + 1, n) }
-      None    -> eff
-    }
-  }
+# The cell an alias names; a label reached through no alias is in none.
+fn alias_cell(alias_opt: Option[LocalId]) : LocalId = match alias_opt {
+  None    -> local_none()
+  Some(a) -> a
 }
 
 fn label_concat(a: [Label], b: [Label]) : [Label] {
@@ -5927,7 +5934,7 @@ fn apply_ty_keep_row_labels(s: Subst, t: Ty) : Ty {
       TyFnT(apply_ty_keep_row_labels_list(s, params),
             apply_ty_keep_row_labels(s, ret),
             apply_row_tail_only(s, row))
-    TyCon(mo_, name, atys, sid) -> TyCon(mo_, name, apply_ty_keep_row_labels_list(s, atys), sid)
+    TyCon(sid, atys) -> TyCon(sid, apply_ty_keep_row_labels_list(s, atys))
     TyShapeApp(sv, arg) -> match subst_lookup(s, sv) {
       Some(wit) -> shape_reapply(apply_ty_keep_row_labels(s, wit), apply_ty_keep_row_labels(s, arg))
       None      -> TyShapeApp(sv, apply_ty_keep_row_labels(s, arg))
@@ -5977,7 +5984,7 @@ fn occurs(v: Int, t: Ty, s: Subst) : Bool {
     TyVarT(n) -> n == v
     TyListT(inner) -> occurs(v, inner, s)
     TyFnT(params, ret, _) -> occurs_any(v, [ret, ...params], s)
-    TyCon(_, _, atys, _) -> occurs_any(v, atys, s)
+    TyCon(_, atys) -> occurs_any(v, atys, s)
     # the shape var id shares the tvar pool, so `v` may be the head; it
     # also occurs inside the argument.
     TyShapeApp(sv, arg) -> v == sv or occurs(v, arg, s)
@@ -6169,8 +6176,8 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
     # Two nominal types unify only when they name one declaration:
     # same-name types from different modules are distinct (the
     # load-bearing rule for shadowing).
-    TyCon(_, _, aa, ta_sym) -> match b {
-      TyCon(_, _, ba, tb_sym) -> {
+    TyCon(ta_sym, aa) -> match b {
+      TyCon(tb_sym, ba) -> {
         if sym_same(ta_sym, tb_sym) { unify_list(env, aa, ba, s) }
         # implicit upcast inside structural
         # unification. When the two TyCons disagree, accept the
@@ -6196,7 +6203,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
       # rules above. Only `Decimal` has a UoM-decorated form; the other
       # named records do not.
       TyDimT(bb, bu) -> match bb {
-        TyCon(_, _, ba, tb_sym) ->
+        TyCon(tb_sym, ba) ->
           # A fixed-width `Vec[t]<n>` has a distinct inline layout, so it
           # never collapses into a bare `Vec[t]` — even at `<1>`. The
           # numeric `Real ≡ Real<1>` collapse below is untouched.
@@ -6224,8 +6231,8 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
       # mirroring the bare-numeric arms. Lets a `Decimal<USD>` value
       # flow into a fn expecting bare `Decimal` only when the units
       # cancel — anything else is a unit mismatch.
-      TyCon(_, _, ba, tb_sym) -> match ab {
-        TyCon(_, _, aa, ta_sym) ->
+      TyCon(tb_sym, ba) -> match ab {
+        TyCon(ta_sym, aa) ->
           # A fixed-width `Vec[t]<n>` never collapses into a bare `Vec[t]`
           # (distinct inline layout); the numeric collapse above stays.
           if core_ty_is(ta_sym, CtVec) { None }
@@ -6257,7 +6264,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
     # First-order shape application: `s[A] ~ D[B]` binds `s := D`
     # (a nullary constructor witness) and unifies `A ~ B`. The witness
     # carries the constructor head only; `apply_ty` reconstructs `D[A]`.
-    # A `List` head witnesses as `TyCon(None,"List",[])` and rebuilds to
+    # A `List` head witnesses as the nullary core `List` and rebuilds to
     # `TyListT`. No witness (`Int`, arity-2 `Map`) fails cleanly — the
     # strict-arity-1, no-higher-order rule.
     TyShapeApp(sv, a1) -> match shape_witness_of(b) {
@@ -6272,12 +6279,12 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
 
 # The unapplied-constructor witness of a saturated arity-1 type, or None
 # when it is not a single-arg constructor a `Shape` variable may bind to
-# (`Int`, arity-2 `Map`, functions). `List` witnesses as a nullary
-# `TyCon(None,"List",[])`; `reapply` maps that head back to `TyListT`.
+# (`Int`, arity-2 `Map`, functions). `List` witnesses as the nullary
+# core `List`; `reapply` maps that head back to `TyListT`.
 #[doc("The nullary constructor witness a `Shape` variable binds to when applied against a saturated arity-1 type.")]
 pub fn shape_witness_of(t: Ty) : Option[Ty] = match t {
   TyListT(_) -> Some(core_ty_con(CtList, []))
-  TyCon(m, n, targs, sid) -> match targs { [_one] -> Some(TyCon(m, n, [], sid)) _ -> None }
+  TyCon(sid, targs) -> match targs { [_one] -> Some(TyCon(sid, [])) _ -> None }
   _ -> None
 }
 
@@ -6285,19 +6292,19 @@ pub fn shape_witness_of(t: Ty) : Option[Ty] = match t {
 #[doc("The single type argument of a saturated arity-1 type (for shape-app decomposition).")]
 pub fn shape_arg_of(t: Ty) : Ty = match t {
   TyListT(inner) -> inner
-  TyCon(_, _, [a], _) -> a
+  TyCon(_, [a]) -> a
   _ -> TyAny
 }
 
 # Reapply a resolved constructor witness to an argument, reversing
 # `shape_witness_of`. INVARIANT: the `List` witness always rebuilds to
-# the dedicated `TyListT` node, never `TyCon(_,"List",[a])` — those two
+# the dedicated `TyListT` node, never a `TyCon` of the core `List` — those two
 # are distinct in the unifier and must not diverge. A witness that is
 # not a nullary constructor (a stray binding) passes the argument
 # through unchanged.
 #[doc("Reconstruct a concrete applied type from a resolved shape witness and its argument.")]
 pub fn shape_reapply(wit: Ty, arg: Ty) : Ty = match wit {
-  TyCon(m, n, [], sid) -> if core_ty_is(sid, CtList) { TyListT(arg) } else { TyCon(m, n, [arg], sid) }
+  TyCon(sid, []) -> if core_ty_is(sid, CtList) { TyListT(arg) } else { TyCon(sid, [arg]) }
   _ -> wit
 }
 
@@ -6314,7 +6321,7 @@ fn shape_bind(sv: Int, wit: Ty, arg: Ty, s: Subst) : Option[Subst] / Mutable =
 # id. The env's `fresh` counter advances by one per bound var.
 
 fn fresh_var(env: TyEnv) : TyEnv =
-  TyEnv { entries: env.entries, fresh: env.fresh + 1, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, row_kind: env.row_kind, ty_homes: env.ty_homes, index: env.index, vindex: env.vindex, sindex: env.sindex }
+  TyEnv { ...env, fresh: env.fresh + 1 }
 
 fn advance_fresh(env: TyEnv, n: Int) : TyEnv =
   if n <= 0 { env } else { advance_fresh(fresh_var(env), n - 1) }
@@ -6351,7 +6358,7 @@ fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if env.fresh >= need { env.fresh } else { need }
-      let env1 = TyEnv { entries: env.entries, fresh: start + n, unions: env.unions, constructors: env.constructors, head_owners: env.head_owners, row_kind: env.row_kind, ty_homes: env.ty_homes, index: env.index, vindex: env.vindex, sindex: env.sindex }
+      let env1 = TyEnv { ...env, fresh: start + n }
       let sub = mk_fresh_subst(vars, start)
       Instantiated { env: env1, ty: apply_ty(sub, body) }
     }
@@ -6471,24 +6478,11 @@ fn advance_unit_fresh(st: InferState, n: Int) : InferState {
 
 # ---- record registry (typer-side helpers) ----
 #
-# `RecInfo` + the bare/field-aware lookups (`rec_find`,
-# `rec_find_with_field`, `collect_records`) live in compiler.ast,
+# `RecInfo`, `rec_find` and `collect_records` live in compiler.ast,
 # since the positional-record desugar also consumes them. These
-# remaining helpers are typer-only: the
-# arity-discriminating wrapper and the per-module rerank that
-# `rec_find` consults to disambiguate same-name records — see
-# `rec_find_in_scope`.
-# The record a use names: the declaration `decl` when the use carries
-# one, else the name lookups (a field probe picks among same-name records,
-# `arity < 0` takes any).
-fn rec_pick(rs: [RecInfo], decl: SymId, target: String, arity: Int, probe: String) : Option[RecInfo] =
-  if sym_raw(decl) >= 0 { rec_find_decl(rs, target, decl) }
-  else if probe != "" { rec_find_with_field(rs, target, arity, probe) }
-  else if arity < 0 { rec_find(rs, target) }
-  else { rec_find_arity(rs, target, arity) }
-
-fn rec_find_arity(rs: [RecInfo], target: String, arity: Int) : Option[RecInfo] =
-  rec_find_arity_loop(rs, target, arity, None)
+# remaining helpers are typer-only.
+# The record a use names: the one `decl` declares.
+fn rec_pick(rs: [RecInfo], decl: SymId) : Option[RecInfo] = rec_find(rs, decl)
 
 # Hanga Roa: reorder a `[RecInfo]` so the records visible to a decl
 # from module `home_mod` resolve correctly under `rec_find`.
@@ -6518,7 +6512,7 @@ fn rerank_recs_loop(rs: [RecInfo], hm: Option[String], root_mod: String,
     [] -> list_append(list_reverse(home),
             list_append(list_reverse(other_mods), list_reverse(root)))
     [r, ...rs2] -> match r {
-      RI(_, _, _, mo, _) -> {
+      RI(_, _, _, mo) -> {
         let is_root_rec = match mo {
           None     -> false
           Some(rm) -> rm == root_mod
@@ -6550,30 +6544,21 @@ fn field_init_list_has(fs: [FieldInit], target: String) : Bool {
   }
 }
 
-# keep the accumulator newest-first (no `list_reverse`)
-# so a user record declared later in the decl stream shadows an
-# earlier same-name core record under `rec_find` (legacy bare-name
-# lookup). The newest-first ordering is harmless for the field-aware
-# walker — `rec_find_with_field` picks by declared-field set rather
-# than position — and is correct for the arity-aware walker, which
-# is unaffected by ordering when at most one record matches the
-# arity. Earlier the list was `list_reverse`d back to declaration
-# order (oldest-first), which made bare `rec_find` return the
-# core's record over a same-name user redeclaration.
 #[derive(BinSerialize)]
-pub type SumInfo = SI(String, [String], [Variant], Option[String])
-              # name, tparams, variants, module_origin (None = root file)
+pub type SumInfo = SI(SymId, [String], [Variant], Option[String])
+              # declaration, tparams, variants, module_origin (None = root file)
 
-fn sum_find_loop(ss: [SumInfo], target: String) : Option[SumInfo] {
+fn sum_find_loop(ss: [SumInfo], target: Int) : Option[SumInfo] {
   match ss {
     [] -> None
     [s, ...rest] -> match s {
-      SI(nm, _, _, _) -> if nm == target { Some(s) } else { sum_find_loop(rest, target) }
+      SI(ds, _, _, _) -> if sym_raw(ds) == target { Some(s) } else { sum_find_loop(rest, target) }
     }
   }
 }
 
-fn sum_find(ss: [SumInfo], target: String) : Option[SumInfo] = sum_find_loop(ss, target)
+fn sum_find(ss: [SumInfo], s: SymId) : Option[SumInfo] =
+  if sym_raw(s) < 0 { None } else { sum_find_loop(ss, sym_raw(s)) }
 
 # SumInfo analog of `rerank_recs_for`. Same semantics: library
 # code never sees the consumer's root sums.
@@ -6619,8 +6604,8 @@ fn collect_sums_loop(ds: [Decl], acc: [SumInfo]) : [SumInfo] {
     [d, ...rest] -> match decl_transparent_inner(d) {
       Some(inner) -> collect_sums_loop([inner, ...rest], acc)
       None -> match d {
-        DType(_, nm, tps, body, _, _, mo, _, _) -> match body {
-          TBSum(vs) -> collect_sums_loop(rest, [SI(nm, tps, vs, mo), ...acc])
+        DType(_, dsym, tps, body, _, _, mo, _) -> match body {
+          TBSum(vs) -> collect_sums_loop(rest, [SI(dsym, tps, vs, mo), ...acc])
           _ -> collect_sums_loop(rest, acc)
         }
         _ -> collect_sums_loop(rest, acc)
@@ -6647,7 +6632,7 @@ fn collect_sums(ds: [Decl]) : [SumInfo] = collect_sums_loop(ds, [])
 # (notably `--dump-mono` and the test runner) need to distinguish
 # call-sites authored in the user's root file from those that come
 # through core or other modules.
-type CallSite = CS(String, Int, Int, [Int], [Int], Option[String])  # name, line, col, fresh ty ids, fresh unit ids, module_origin
+type CallSite = CS(SymId, Int, Int, [Int], [Int], Option[String])  # declaration, line, col, fresh ty ids, fresh unit ids, module_origin
 
 # A typed hole site: the kind discriminator (splits `?` /
 # `?name` from `todo!(msg)`), source position, the fresh TyVarT id
@@ -6690,7 +6675,7 @@ type InferState = { file: String, env: TyEnv, core_len: Int, sub: Subst, recs: [
                     # per-op generic schemes quantify over both
                     # effect-level and op-level tparams; the row label
                     # only carries the effect-level ones. This table
-                    # records, per dotted "Eff.op" key, the effect's
+                    # records, per effect operation, the effect's
                     # arity so synth_op_call_with_scheme can split
                     # `inst.fresh` correctly. Builds during build_ty_env.
                     op_eff_arities: [OpEffArity],
@@ -6796,7 +6781,7 @@ type TailUse = TU(Int, Int, Int)
 
 #[doc("infer: `OpEffArity` — driver-facing type.")]
 #[derive(BinSerialize)]
-pub type OpEffArity = OEA(String, Int)
+pub type OpEffArity = OEA(SymId, Written, Int)  # effect, op label, the effect's tparam arity
 
 # a deferred field-access constraint. When `synth_field`
 # meets a receiver whose type is still an unbound tyvar (e.g. the
@@ -6814,20 +6799,20 @@ pub type OpEffArity = OEA(String, Int)
 #[doc("infer: `DeferredField` — a field access on a not-yet-resolved receiver.")]
 pub type DeferredField = DFd(Int, String, Int, Int, Int, Bool)  # recv tyvar id, field name, result tyvar id, line, col, named by a pattern
 
-# a parametric effect op call's row identity: the effect
-# name (with the `@cell` suffix if any) and the LIVE tyvar ids of its
+# a parametric effect op call's row identity: the effect,
+# its cell if any, and the LIVE tyvar ids of its
 # row ty_args, in declaration order. Stashed at the op-call before
 # `st_add_label` dedup can drop the label; resolved under the final sub
 # at drain time so the receiver-to-payload link the `match` binder made
 # is visible.
-#[doc("infer: `OpPayloadVars` — a parametric op call's effect name + live row-arg tyvar ids.")]
-pub type OpPayloadVars = OPV(String, SymId, [Int])  # eff name, its id, row ty_arg tyvar ids
+#[doc("infer: `OpPayloadVars` — a parametric op call's effect, cell and live row-arg tyvar ids.")]
+pub type OpPayloadVars = OPV(SymId, LocalId, [Int])  # effect, cell (`local_none()` for none), row ty_arg tyvar ids
 
 # a single effect-op call's resolution, captured at `try_op_call`.
-# `fn_name` is the enclosing function (stamped by `infer_decl` once the
-# body is walked — empty at the raw capture); `op` is the op name;
-# `cands` are every effect declaring that op (the by-name ambiguity set);
-# `chosen` is the effect the typer bound; `alias` is the `@cell` tag when
+# The first slot is the enclosing function (stamped by `infer_decl` once
+# the body is walked — `fnid_none()` at the raw capture); `op` is the op
+# label; `cands` are every effect declaring that op (the ambiguity set);
+# `chosen` is the effect the typer bound; `alias` is the alias binder when
 # the call resolved through a named instance, `None` for a bare/by-name
 # call; `tagged` is whether the dispatch keeps that tag at runtime —
 # false when the call crossed a clause/lambda boundary, where the tag is
@@ -6836,12 +6821,12 @@ pub type OpPayloadVars = OPV(String, SymId, [Int])  # eff name, its id, row ty_a
 # identity inside an unrelated handler clause). The #820 evidence
 # analysis reads this to classify each call's supplier and to surface the
 # op-name collision where it is decided — before the op call fuses into a
-# label or vanishes in an interpolation span. `fn_name` attributes the
-# resolution to its function without relying on source lines, which an
+# label or vanishes in an interpolation span. The function attributes the
+# resolution without relying on source lines, which an
 # interpolation re-parse rewrites.
-#[doc("infer: `OpResolution` — one op call's resolution: enclosing fn, op name, candidate effects, chosen effect, alias tag, runtime-tagged, site.")]
+#[doc("infer: `OpResolution` — one op call's resolution: enclosing fn, op label, candidate effects, chosen effect, alias binder, runtime-tagged, site.")]
 #[derive(BinSerialize)]
-pub type OpResolution = OPR(String, String, [String], String, Option[String], Bool, Int, Int)
+pub type OpResolution = OPR(FnId, Written, [SymId], SymId, Option[LocalId], Bool, Int, Int)
 
 # answer type, handler-state type and handle result type for the
 # currently-walked clause body of a stateful handler.
@@ -6855,24 +6840,16 @@ type EffUse = EU(Label, Int, Int)
 
 # Stack entry for `Eff as log`. The stack is pushed on entering
 # the body of a `handle ... with Eff as log { ... }` and popped
-# on exit. try_op_call consults it when the dotted lookup fails:
-# `log.print` walks the stack, finds `log → Io`, and retries as
-# `Io.print`.
+# on exit. try_op_call consults it when the receiver of `log.print`
+# is the alias binder, and types the call as `Io.print`.
 #
-# (compiler integration, scope-limited): the Bool field
-# records whether the binding is "taggable" — when true, an op
-# call through this alias gets the `@<alias>` suffix that the
-# codegen turns into a `kai_evidence_lookup_node_by_id(...)`
-# dispatch. When false (after we descended into a lambda body),
-# the alias still resolves for substitution but the codegen
-# falls back to the legacy name-keyed lookup. The handle
-# prologue's `kai_alias_<a>_id` C local is not in scope across
-# the lambda boundary, so tagged dispatch would emit invalid C.
-#[doc("infer: an effect-alias binding (alias name, effect name, taggable).")]
-# alias_name, eff_name, taggable, and the declaration the `handle` head
-# resolved to: an op dispatched through the alias names that effect, so it
-# must carry the same identity a written head does.
-pub type AliasBinding = AB(String, String, Bool, SymId)
+# The Bool field records whether the binding is "taggable" — when
+# true, an op call through this alias goes through the alias's own
+# handler instance. When false (after we descended into a lambda
+# body), the alias still resolves but the call is ambient: the handle
+# prologue's alias local is not in scope across the lambda boundary.
+#[doc("infer: an effect-alias binding (alias binder, taggable, effect).")]
+pub type AliasBinding = AB(LocalId, Bool, SymId)
 
 # `TyRes` is the narrow result returned by pure type operations that
 # don't consume or produce an expression (fresh var, instantiate a
@@ -6962,11 +6939,11 @@ fn st_refine_diag(st: InferState, d: Diagnostic) : InferState = match st.diags {
 # evidence analysis: the effect the typer chose, every effect that
 # declares this op (the by-name ambiguity set), and the alias tag.
 # Never read by inference itself, so it cannot perturb a decision.
-fn st_record_op_res(st: InferState, op: String, chosen: String,
-                    alias_opt: Option[String], tagged: Bool, line: Int, col: Int) : InferState {
+fn st_record_op_res(st: InferState, op: Written, chosen: SymId,
+                    alias_opt: Option[LocalId], tagged: Bool, line: Int, col: Int) : InferState {
   let cands = effs_declaring_op(st.op_to_eff, op)
-  # fn_name filled in by `infer_decl` once the enclosing function is known.
-  let opr = OPR("", op, cands, chosen, alias_opt, tagged, line, col)
+  # The function is filled in by `infer_decl` once it is known.
+  let opr = OPR(fnid_none(), op, cands, chosen, alias_opt, tagged, line, col)
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
@@ -6974,23 +6951,24 @@ fn st_record_op_res(st: InferState, op: String, chosen: String,
                ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, protos: st.protos, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: st.op_payload_labels, op_res: [opr, ...st.op_res], in_clause: st.in_clause, refine_ctx: st.refine_ctx, home: st.home, row_tails: st.row_tails, sig_rows: st.sig_rows, decl_row: st.decl_row }
 }
 
-# every effect declaring `op`, deduped — the by-name ambiguity set.
-fn effs_declaring_op(oe: [OpToEff], op: String) : [String] = match oe {
+# every effect declaring `op`, deduped — the ambiguity set.
+fn effs_declaring_op(oe: [OpToEff], op: Written) : [SymId] = match oe {
   []           -> []
   [p, ...rest] -> match p {
-    OEFP(o, eff) ->
-      if o == op and not list_has_string(effs_declaring_op(rest, op), eff) {
-        [eff, ...effs_declaring_op(rest, op)]
-      } else { effs_declaring_op(rest, op) }
+    OEFP(o, eff) -> {
+      let more = effs_declaring_op(rest, op)
+      if written_text(o) == written_text(op) and not any(more, (m) => sym_same(m, eff)) { [eff, ...more] }
+      else { more }
+    }
   }
 }
 
 # stamp the op-call resolution onto a just-inferred op call. `r` is the
 # result of a `synth_op_call_*`; the record rides its `st` so it is not
-# lost. Keyed by the chosen effect + the op name split from `key`.
-fn record_op_res(r: Inferred, key: String, alias_opt: Option[String],
+# lost.
+fn record_op_res(r: Inferred, eff: SymId, op: Written, alias_opt: Option[LocalId],
                  tagged: Bool, line: Int, col: Int) : Inferred =
-  Inferred { st: st_record_op_res(r.st, dotted_suffix(key), dotted_prefix(key), alias_opt, tagged, line, col),
+  Inferred { st: st_record_op_res(r.st, op, eff, alias_opt, tagged, line, col),
              ty: r.ty, expr: r.expr }
 
 # mark that the current body has performed an op
@@ -7018,15 +6996,15 @@ fn st_add_label(st0: InferState, lab: Label, line: Int, col: Int) : InferState /
 # payload tyvar (a `State.get` return) would stay free unless the concrete
 # arg an earlier op pinned (`State.set`'s value) is threaded here.
 #
-# Gated on the `@alias` cell tag: a cell's ops all share one state type by
+# Gated on the label's cell: a cell's ops all share one state type by
 # construction of its handler, so forcing the unification is sound. Effects
 # WITHOUT an alias may carry two independent instances in the row
-# (`Actor[Request]` + `Actor[Reply]`); those key by concrete `name[args]`
+# (`Actor[Request]` + `Actor[Reply]`); those key by concrete args
 # and must NOT have their args cross-bound — the shallow-unifiable check is
 # too lax a precondition for them (a free arg "unifies" with any concrete
-# one). So only same-cell (`eff@alias`) labels are threaded.
+# one). So only same-cell labels are threaded.
 fn st_unify_dedup_label(st: InferState, lab: Label, line: Int, col: Int) : InferState / Console + File + Mutable =
-  if not label_is_aliased_cell(lab.eff) { st }
+  if not label_is_aliased_cell(lab) { st }
   else {
     match find_unifiable_label_args(st.row, lab, st.sub) {
       Some(existing_args) -> st_unify_ty_args(st, existing_args, lab.ty_args, line, col)
@@ -7034,17 +7012,8 @@ fn st_unify_dedup_label(st: InferState, lab: Label, line: Int, col: Int) : Infer
     }
   }
 
-# A cell label carries an `@<alias>` identity suffix (see
-# `label_eff_with_alias`); a bare effect name does not.
-fn label_is_aliased_cell(eff: String) : Bool = label_has_at(eff, 0, string_length(eff))
-
-fn label_has_at(eff: String, i: Int, n: Int) : Bool {
-  if i >= n { false }
-  else { match char_at(eff, i) {
-    Some(c) -> if c == '@' { true } else { label_has_at(eff, i + 1, n) }
-    None    -> false
-  } }
-}
+# A label reached through a `with .. as` alias belongs to that alias's cell.
+fn label_is_aliased_cell(l: Label) : Bool = local_raw(label_cell(l)) != 0
 
 fn find_unifiable_label_args(row: [Label], target: Label, s: Subst) : Option[[Ty]] {
   match row {
@@ -7100,32 +7069,17 @@ fn tail_uses_have(us: [TailUse], t: Int) : Bool = match us {
 fn capability_labels_only(labels: [Label]) : [Label] = labels
 
 # Two labels are one effect instance: one declaration, and one cell when
-# a `with .. as` alias tells two instances of it apart. A label no
-# declaration answered has only its spelling.
+# a `with .. as` alias tells two instances of it apart. Two labels no
+# declaration answered are the same error placeholder.
 fn label_same(a: Label, b: Label) : Bool =
-  if sym_raw(a.sym) >= 0 and sym_raw(b.sym) >= 0 { label_same_id(a, b) } else { a.eff == b.eff }
+  sym_same(a.sym, b.sym) and label_cells_same(a, b)
 
 fn label_same_id(a: Label, b: Label) : Bool =
-  sym_raw(a.sym) >= 0 and sym_raw(a.sym) == sym_raw(b.sym) and label_cells_same(a.eff, b.eff)
+  sym_raw(a.sym) >= 0 and label_same(a, b)
 
-# The cell rides a label's spelling after an `@`; most labels carry none.
-fn label_cells_same(a: String, b: String) : Bool = {
-  let i = string_index_of_char(a, '@')
-  let j = string_index_of_char(b, '@')
-  if i < 0 or j < 0 { i < 0 and j < 0 }
-  else { string_slice(a, i, string_length(a) - i) == string_slice(b, j, string_length(b) - j) }
-}
-
-# `lab` is already in `row` up to its id: an unsettled twin takes `lab`'s
-# id rather than shadowing it, so a dedup never drops the settled one.
-fn label_settle_in(row: [Label], lab: Label, s: Subst) : [Label] =
-  if sym_raw(lab.sym) < 0 { row }
-  else { map(row, (h) => label_settle_one(h, lab, s)) }
-
-fn label_settle_one(h: Label, lab: Label, s: Subst) : Label =
-  if sym_raw(h.sym) < 0 and h.eff == lab.eff and labels_args_unify(h.ty_args, lab.ty_args, s) {
-    Label { ...h, sym: lab.sym }
-  } else { h }
+# Most labels are in no cell; those all agree.
+fn label_cells_same(a: Label, b: Label) : Bool =
+  local_raw(label_cell(a)) == local_raw(label_cell(b))
 
 # Speculative arity + unification check on two ty_arg lists. Wrong
 # arity → no match. Used by st_add_label and the handler-filter pass.
@@ -7191,8 +7145,8 @@ fn ty_eq_shape(a: Ty, b: Ty) : Bool {
           and (rows_label_free(arow, brow) or row_shape_compatible(arow, brow, subst_empty()))
       _ -> false
     }
-    TyCon(_, _, atas, ta_sym) -> match bx {
-      TyCon(_, _, btas, tb_sym) -> sym_same(ta_sym, tb_sym) and ty_list_eq_shape(atas, btas)
+    TyCon(ta_sym, atas) -> match bx {
+      TyCon(tb_sym, btas) -> sym_same(ta_sym, tb_sym) and ty_list_eq_shape(atas, btas)
       _ -> false
     }
     # shape-equality on unions is point-wise on
@@ -7230,11 +7184,11 @@ fn st_set_row(st: InferState, new_row: [Label]) : InferState =
 
 # push/pop the alias stack as we enter/leave a handle's body.
 # A freshly-pushed alias starts taggable.
-fn st_push_alias(st: InferState, alias: String, eff: String, esym: SymId) : InferState =
+fn st_push_alias(st: InferState, alias: LocalId, esym: SymId) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses,
-               aliases: [AB(alias, eff, true, esym), ...st.aliases],
+               aliases: [AB(alias, true, esym), ...st.aliases],
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
                ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, protos: st.protos, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, refine_ctx: st.refine_ctx, home: st.home, row_tails: st.row_tails, sig_rows: st.sig_rows, decl_row: st.decl_row }
 
@@ -7309,44 +7263,43 @@ fn st_push_deferred_hom(st: InferState, dh: DeferredHom) : InferState =
                clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
                ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, protos: st.protos, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: [dh, ...st.deferred_homs], op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, refine_ctx: st.refine_ctx, home: st.home, row_tails: st.row_tails, sig_rows: st.sig_rows, decl_row: st.decl_row }
 
-# record an op call's effect name + live row-arg tyvar ids
+# record an op call's effect, cell and live row-arg tyvar ids
 # BEFORE `st_add_label`'s dedup can drop the label. Only parametric ops
 # (non-empty id list) carry a payload tyvar a deferred field could need.
-fn st_push_op_payload_vars(st: InferState, eff: String, esym: SymId, ids: [Int]) : InferState =
+fn st_push_op_payload_vars(st: InferState, esym: SymId, cell: LocalId, ids: [Int]) : InferState =
   match ids {
     [] -> st
     _  -> InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                        recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                        row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
                        clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities,
-                       ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, protos: st.protos, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: [OPV(eff, esym, ids), ...st.op_payload_labels], op_res: st.op_res, in_clause: st.in_clause, refine_ctx: st.refine_ctx, home: st.home, row_tails: st.row_tails, sig_rows: st.sig_rows, decl_row: st.decl_row }
+                       ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, protos: st.protos, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: [OPV(esym, cell, ids), ...st.op_payload_labels], op_res: st.op_res, in_clause: st.in_clause, refine_ctx: st.refine_ctx, home: st.home, row_tails: st.row_tails, sig_rows: st.sig_rows, decl_row: st.decl_row }
   }
 
-#[doc("infer: `lookup_alias` — typer entry point invoked by the driver.")]
-pub fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
+#[doc("The effect the alias binder `l` names, or `None` when `l` is no alias in scope.")]
+pub fn lookup_alias(aliases: [AliasBinding], l: LocalId) : Option[SymId] {
   match aliases {
     [] -> None
-    [AB(alias, eff, _, _), ...rest] ->
-      if alias == name { Some(eff) } else { lookup_alias(rest, name) }
+    [AB(alias, _, s), ...rest] ->
+      if local_eq(alias, l) { Some(s) } else { lookup_alias(rest, l) }
   }
 }
 
-#[doc("The declaration the `handle` head bound to `name` resolved to, or `sym_none()` when `name` is no alias in scope.")]
-pub fn lookup_alias_sym(aliases: [AliasBinding], name: String) : SymId =
-  match aliases {
-    [] -> sym_none()
-    [AB(alias, _, _, s), ...rest] ->
-      if alias == name { s } else { lookup_alias_sym(rest, name) }
+#[doc("The declaration the `handle` head bound to the alias `l` resolved to, or `sym_none()` when `l` is no alias in scope.")]
+pub fn lookup_alias_sym(aliases: [AliasBinding], l: LocalId) : SymId =
+  match lookup_alias(aliases, l) {
+    Some(s) -> s
+    None    -> sym_none()
   }
 
-# variant of lookup_alias that also returns the binding's
+# variant of lookup_alias that returns the binding's
 # taggability flag. Used by try_op_call's alias-fallback to decide
-# whether to emit a tagged dispatch key.
-fn lookup_alias_taggable(aliases: [AliasBinding], name: String) : Option[Bool] {
+# whether the call goes through the alias's own instance.
+fn lookup_alias_taggable(aliases: [AliasBinding], l: LocalId) : Option[Bool] {
   match aliases {
     [] -> None
-    [AB(alias, _, t, _), ...rest] ->
-      if alias == name { Some(t) } else { lookup_alias_taggable(rest, name) }
+    [AB(alias, t, _), ...rest] ->
+      if local_eq(alias, l) { Some(t) } else { lookup_alias_taggable(rest, l) }
   }
 }
 
@@ -7355,7 +7308,7 @@ fn lookup_alias_taggable(aliases: [AliasBinding], name: String) : Option[Bool] {
 fn aliases_clause_tags(aliases: [AliasBinding]) : [AliasBinding] {
   match aliases {
     [] -> []
-    [AB(a, e, t, s), ...rest] -> [AB(a, e, t and eff_is_cell_effect(s), s), ...aliases_clause_tags(rest)]
+    [AB(a, t, s), ...rest] -> [AB(a, t and eff_is_cell_effect(s), s), ...aliases_clause_tags(rest)]
   }
 }
 
@@ -7408,7 +7361,7 @@ fn ty_res(st: InferState, t: Ty) : TyRes = TyRes { st: st, ty: t }
 fn mk_inferred(st: InferState, t: Ty, e: Expr) : Inferred =
   Inferred { st: st, ty: t, expr: e }
 
-# Leaf expressions (literals, EVar, EUnder, EPlaceholder) have no
+# Leaf expressions (literals, references, EUnder, EPlaceholder) have no
 # sub-nodes to rebuild, so they annotate themselves in place.
 fn inferred_leaf(st: InferState, t: Ty, e: Expr) : Inferred =
   mk_inferred(st, t, with_ty(e, t))
@@ -7481,7 +7434,7 @@ fn rigid_first_bound(st: InferState, rs: [RigidTv], all: [RigidTv], s2: Subst) :
       Some(o)  -> Some(rigid_text(n, owner, concat_all(["`", o, "`"])))
       None    -> rigid_first_bound(st, rest, all, s2)
     }
-    t -> Some(rigid_text(n, owner, concat_all(["`", inf_ty_to_string_ow(st.env.head_owners, t), "`"])))
+    t -> Some(rigid_text(n, owner, concat_all(["`", inf_ty_to_string_ow(st.env.tab, st.env.head_owners, t), "`"])))
   }
 }
 
@@ -7511,11 +7464,15 @@ fn rigid_text(name: String, owner: String, what: String) : RigidWhy =
 # expression or a method call), so name extraction is optional and
 # we fall back to the generic message when nothing useful can be
 # said.
-fn callee_display_name(callee: Expr) : Option[String] {
+fn callee_display_name(st: InferState, callee: Expr) : Option[String] = callee_name_in(st.env, callee)
+
+fn callee_name_in(env: TyEnv, callee: Expr) : Option[String] {
   match callee.kind {
-    EName(n)        -> Some(n)
-    ESym(_, _, n)     -> Some(n)
-    EModCall(m, n) -> Some(string_concat(string_concat(m, "."), n))
+    EName(n)       -> Some(written_text(n))
+    ESym(s, _)     -> Some(written_text(decl_name(env.tab, s)))
+    ELocal(l)      -> Some(written_text(local_name_in(env, l)))
+    EOp(r)         -> Some("#{decl_name(env.tab, r.eff)}.#{r.op}")
+    EModCall(m, n) -> Some("#{m}.#{n}")
     EField(_, f)   -> Some(f)
     _              -> None
   }
@@ -7560,13 +7517,13 @@ fn first_failing_arg_loop(env: TyEnv, sub: Subst, params: [Ty],
 # The signature note restates whatever the `expected:` note already
 # printed whenever the callee is the expected side, which is the common
 # case; it only earns its line when the two differ.
-fn call_sig_note_text(owners: [HeadOwnerEntry], name_opt: Option[String], resolved: Ty,
+fn call_sig_note_text(env: TyEnv, name_opt: Option[String], resolved: Ty,
                         expected_shown: String) : Option[String] {
   match name_opt {
     None -> None
     Some(nm) -> match resolved {
       TyFnT(_, _, _) -> {
-        let sig = inf_ty_to_string_ow(owners, resolved)
+        let sig = inf_ty_to_string_ow(env.tab, env.head_owners, resolved)
         if sig == expected_shown { None } else { Some("`#{nm}` expects: #{sig}") }
       }
       _ -> None
@@ -7581,7 +7538,7 @@ fn emit_call_arg_notes(env: TyEnv, sub: Subst, callee: Expr,
                          callee_ty: Ty, arg_tys: [Ty],
                          expected_shown: String) : Unit / Console + Mutable {
   let resolved = apply_ty(sub, callee_ty)
-  let name_opt = callee_display_name(callee)
+  let name_opt = callee_name_in(env, callee)
   match first_failing_arg(env, sub, resolved, arg_tys) {
     Some(idx) -> match name_opt {
       Some(nm) -> diag_note("in argument #{int_to_string(idx)} of `#{nm}`")
@@ -7589,7 +7546,7 @@ fn emit_call_arg_notes(env: TyEnv, sub: Subst, callee: Expr,
     }
     None -> ()
   }
-  match call_sig_note_text(env.head_owners, name_opt, resolved, expected_shown) {
+  match call_sig_note_text(env, name_opt, resolved, expected_shown) {
     Some(txt) -> diag_note(txt)
     None      -> ()
   }
@@ -7605,7 +7562,7 @@ fn build_call_type_mismatch_diag(env: TyEnv, sub: Subst, callee: Expr,
                                    file: String, line: Int, col: Int,
                                    expected_shown: String) : Diagnostic / Mutable {
   let resolved = apply_ty(sub, callee_ty)
-  let name_opt = callee_display_name(callee)
+  let name_opt = callee_name_in(env, callee)
   let arg_notes = match first_failing_arg(env, sub, resolved, arg_tys) {
     Some(idx) -> match name_opt {
       Some(nm) -> [ri_note(file, line, col, "in argument #{int_to_string(idx)} of `#{nm}`")]
@@ -7613,7 +7570,7 @@ fn build_call_type_mismatch_diag(env: TyEnv, sub: Subst, callee: Expr,
     }
     None -> []
   }
-  let sig_notes = match call_sig_note_text(env.head_owners, name_opt, resolved, expected_shown) {
+  let sig_notes = match call_sig_note_text(env, name_opt, resolved, expected_shown) {
     Some(txt) -> [ri_note(file, line, col, txt)]
     None      -> []
   }
@@ -7650,7 +7607,7 @@ fn arity_mismatch_of(sub: Subst, callee_ty: Ty, arg_tys: [Ty]) : Option[Int] {
 # line so users see exactly which arity was declared. When the callee
 # is anonymous, the notes omit the name but still surface the param
 # count + signature.
-fn emit_wrong_arity(owners: [HeadOwnerEntry], file: String, callee: Expr, callee_ty: Ty,
+fn emit_wrong_arity(env: TyEnv, file: String, callee: Expr, callee_ty: Ty,
                       arg_tys: [Ty], line: Int, col: Int) : Unit / Console + File {
 
   let np = match callee_ty {
@@ -7658,7 +7615,7 @@ fn emit_wrong_arity(owners: [HeadOwnerEntry], file: String, callee: Expr, callee
     _ -> 0
   }
   let na = list_length(arg_tys)
-  let name_opt = callee_display_name(callee)
+  let name_opt = callee_name_in(env, callee)
   match name_opt {
     Some(nm) -> diag_error(file, line, col, "wrong number of arguments to `#{nm}`")
     None     -> diag_error(file, line, col, "wrong number of arguments")
@@ -7669,7 +7626,7 @@ fn emit_wrong_arity(owners: [HeadOwnerEntry], file: String, callee: Expr, callee
   }
   match name_opt {
     Some(nm) -> match callee_ty {
-      TyFnT(_, _, _) -> diag_note("`#{nm}` expects: #{inf_ty_to_string_ow(owners, callee_ty)}")
+      TyFnT(_, _, _) -> diag_note("`#{nm}` expects: #{inf_ty_to_string_ow(env.tab, env.head_owners, callee_ty)}")
       _              -> ()
     }
     None -> ()
@@ -7684,14 +7641,14 @@ fn emit_wrong_arity(owners: [HeadOwnerEntry], file: String, callee: Expr, callee
 # structured T4 Diagnostic builder. Mirrors the text emitted
 # by `emit_wrong_arity` exactly so an LSP client can rebuild the same
 # `error: / note: / help:` block from the collected value.
-fn build_wrong_arity_diag(owners: [HeadOwnerEntry], file: String, callee: Expr, callee_ty: Ty,
+fn build_wrong_arity_diag(env: TyEnv, file: String, callee: Expr, callee_ty: Ty,
                             arg_tys: [Ty], line: Int, col: Int) : Diagnostic {
   let np = match callee_ty {
     TyFnT(params, _, _) -> list_length(params)
     _ -> 0
   }
   let na = list_length(arg_tys)
-  let name_opt = callee_display_name(callee)
+  let name_opt = callee_name_in(env, callee)
   let header = match name_opt {
     Some(nm) -> "wrong number of arguments to `#{nm}`"
     None     -> "wrong number of arguments"
@@ -7702,7 +7659,7 @@ fn build_wrong_arity_diag(owners: [HeadOwnerEntry], file: String, callee: Expr, 
   }
   let sig_notes = match name_opt {
     Some(nm) -> match callee_ty {
-      TyFnT(_, _, _) -> [ri_note(file, line, col, "`#{nm}` expects: #{inf_ty_to_string_ow(owners, callee_ty)}")]
+      TyFnT(_, _, _) -> [ri_note(file, line, col, "`#{nm}` expects: #{inf_ty_to_string_ow(env.tab, env.head_owners, callee_ty)}")]
       _              -> []
     }
     None -> []
@@ -7737,9 +7694,9 @@ fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
   let resolved_callee = apply_ty(st.sub, callee_ty)
   match arity_mismatch_of(st.sub, callee_ty, arg_tys) {
     Some(_np) -> {
-      emit_wrong_arity(st.env.head_owners, st.file, callee, resolved_callee, arg_tys, line, col)
+      emit_wrong_arity(st.env, st.file, callee, resolved_callee, arg_tys, line, col)
       # T4 collected diagnostic.
-      let d = build_wrong_arity_diag(st.env.head_owners, st.file, callee, resolved_callee, arg_tys, line, col)
+      let d = build_wrong_arity_diag(st.env, st.file, callee, resolved_callee, arg_tys, line, col)
       st_bump_err(st_push_diag(st, d))
     }
     None -> {
@@ -7748,7 +7705,7 @@ fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
       if st1.errs > pre_errs {
         # Mirrors the `expected:` note `st_unify` just printed, so the
         # trailing signature note can drop itself when it would repeat it.
-        let expected_shown = inf_ty_to_string_ow(st1.env.head_owners, apply_ty(st1.sub, callee_ty))
+        let expected_shown = inf_ty_to_string_ow(st1.env.tab, st1.env.head_owners, apply_ty(st1.sub, callee_ty))
         emit_call_arg_notes(st1.env, st1.sub, callee, callee_ty, arg_tys, expected_shown)
         # The related notes mirror `emit_call_arg_notes`.
         let d = build_call_type_mismatch_diag(st1.env, st1.sub, callee, callee_ty,
@@ -7766,8 +7723,8 @@ fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
 # found type's parent union, plus a concrete remediation hint. The
 # plain notes still fire when neither side is union-flavoured.
 fn emit_union_aware_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console {
-  diag_note("expected: #{inf_ty_to_string_ow(env.head_owners, expected)}")
-  diag_note("found:    #{inf_ty_to_string_ow(env.head_owners, found)}")
+  diag_note("expected: #{inf_ty_to_string_ow(env.tab, env.head_owners, expected)}")
+  diag_note("found:    #{inf_ty_to_string_ow(env.tab, env.head_owners, found)}")
   # Drill through matching wrappers (TyFn, TyCon-of-same-name with
   # mismatched args) to surface the first divergent TyCon pair. That
   # is where the union/component context is meaningful — at the
@@ -7796,8 +7753,8 @@ fn find_mismatched_tycons(expected: Ty, found: Ty) : Option[TyConPair] {
     # Same-name types from different modules are a real mismatch —
     # flag them so the diagnostic can render the modules and show the
     # user the actual confusion.
-    TyCon(_, _, eas, ta_sym) -> match found {
-      TyCon(_, _, fas, tb_sym) -> if sym_same(ta_sym, tb_sym) {
+    TyCon(ta_sym, eas) -> match found {
+      TyCon(tb_sym, fas) -> if sym_same(ta_sym, tb_sym) {
         find_mismatch_in_list(eas, fas)
       } else {
         Some(TyConPair { exp: expected, fnd: found })
@@ -7823,8 +7780,8 @@ fn find_mismatch_in_list(es: [Ty], fs: [Ty]) : Option[TyConPair] {
 
 fn tycon_pair_or_none(expected: Ty, found: Ty) : Option[TyConPair] {
   match expected {
-    TyCon(_, _, _, _) -> match found {
-      TyCon(_, _, _, _) -> Some(TyConPair { exp: expected, fnd: found })
+    TyCon(_, _) -> match found {
+      TyCon(_, _) -> Some(TyConPair { exp: expected, fnd: found })
       _           -> None
     }
     _ -> None
@@ -7836,13 +7793,9 @@ fn tycon_pair_or_none(expected: Ty, found: Ty) : Option[TyConPair] {
 # already emitted the generic expected/found notes, so no value in
 # repeating them.
 fn emit_union_focus_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console {
-  let exp_name = tycon_name_or_empty(expected)
-  let fnd_name = tycon_name_or_empty(found)
   let exp_sym = ut_ty_sym(expected)
-  # The head carries the home a contested declaration was keyed by;
-  # what the reader is shown is the name their source spells.
-  let exp_shown = inf_tycon_display_ow(env.head_owners, exp_name)
-  let fnd_shown = inf_tycon_display_ow(env.head_owners, fnd_name)
+  let exp_shown = inf_tycon_display_ow(env.tab, env.head_owners, exp_sym)
+  let fnd_shown = inf_tycon_display_ow(env.tab, env.head_owners, ut_ty_sym(found))
   let exp_comps = variants_of_type(env, exp_sym)
   let fnd_comps = variants_of_type(env, ut_ty_sym(found))
   let fnd_parents = ut_parents(env.unions, ut_ty_sym(found))
@@ -7853,7 +7806,7 @@ fn emit_union_focus_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console 
   match fnd_comps {
     [] -> match fnd_parents {
       [] -> ()
-      [p, ..._rest] -> diag_note("`#{fnd_shown}` is a component of `#{inf_tycon_display_ow(env.head_owners, tycon_name_or_empty(ut_row_ty(p)))}`")
+      [p, ..._rest] -> diag_note("`#{fnd_shown}` is a component of `#{inf_tycon_display_ow(env.tab, env.head_owners, ut_row_sym(p))}`")
     }
     _ -> diag_note("union: `#{fnd_shown}` = #{inf_join_with(fnd_comps, " | ")}")
   }
@@ -7861,7 +7814,7 @@ fn emit_union_focus_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console 
     [] -> ()
     _ -> match fnd_parents {
       [p, ..._rest] -> {
-        let ps = inf_tycon_display_ow(env.head_owners, tycon_name_or_empty(ut_row_ty(p)))
+        let ps = inf_tycon_display_ow(env.tab, env.head_owners, ut_row_sym(p))
         if ut_lists(env.unions, exp_sym, ut_row_sym(p)) {
           # The expected union already lists the found's parent — so
           # the failure is the no-chains rule (D3 does not transit
@@ -7879,22 +7832,15 @@ fn emit_union_focus_notes(env: TyEnv, expected: Ty, found: Ty) : Unit / Console 
   }
 }
 
-fn tycon_name_or_empty(t: Ty) : String {
-  match t {
-    TyCon(_, n, _, _) -> n
-    _           -> ""
-  }
-}
-
-# accept `expected = TyCon(None, U, [])` and
-# `found = TyCon(None, T, [])` when `T` is registered as a variant of `U`
+# accept a bare nominal `expected = U` and
+# `found = T` when `T` is registered as a variant of `U`
 # in the env. This is the union-of-types upcast under the dual
 # representation: `type U = A | B` adds `A` and `B` as
 # zero-arg variants of `U`, so a value of type `A` lifts to `U`.
 fn union_upcast_ok(env: TyEnv, expected: Ty, found: Ty) : Bool {
   match expected {
-    TyCon(_, _, u_args, u_sym) -> match found {
-      TyCon(_, _, t_args, t_sym) -> {
+    TyCon(u_sym, u_args) -> match found {
+      TyCon(t_sym, t_args) -> {
         # An upcast lifts a component into a DIFFERENT parent, between
         # bare nominal heads only. Without the self guard, a sum type
         # whose variant names the type itself upcasts to itself and
@@ -7941,7 +7887,7 @@ fn emit_type_hint(expected: Ty, found: Ty) : Unit / Console {
       TyInt -> diag_help("convert with `int_to_char(n)`")
       _     -> ()
     }
-    TyCon(_, _, _, tcs) -> {
+    TyCon(tcs, _) -> {
       if core_ty_is(tcs, CtOption) {
         diag_help("wrap the value with `Some(...)`, or use `None` if absent")
       } else { () }
@@ -8019,7 +7965,7 @@ fn st_past_probe(st: InferState, probe: InferState) : InferState =
 fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
   InferState {
     file: outer.file,
-    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh, unions: outer.env.unions, constructors: outer.env.constructors, head_owners: outer.env.head_owners, row_kind: outer.env.row_kind, ty_homes: outer.env.ty_homes, index: outer.env.index, vindex: outer.env.vindex, sindex: outer.env.sindex },
+    env: TyEnv { ...outer.env, fresh: inner.env.fresh },
     core_len: outer.core_len,
     sub: inner.sub,
     recs: inner.recs,
@@ -8077,7 +8023,7 @@ fn add_infer_params_loop(st: InferState, ps: [Param], acc: [Ty]) : InferredParam
     [] -> InferredParams { st: st, tys: list_reverse(acc) }
     [pm, ...rest] -> {
       let pr = param_ty_or_fresh(st, pm)
-      let env2 = ty_env_add(pr.st.env, pm.pname, mono(pr.ty))
+      let env2 = env_bind_local(pr.st.env, pm.binder, mono(pr.ty))
       let st2 = st_set_env(pr.st, env2)
       add_infer_params_loop(st2, rest, [pr.ty, ...acc])
     }
@@ -8099,7 +8045,7 @@ fn add_infer_params_with_binds_loop(st: InferState, ps: [Param],
     [] -> InferredParams { st: st, tys: list_reverse(acc) }
     [pm, ...rest] -> {
       let pr = param_ty_or_fresh_with_binds(st, pm, tpbinds, rbinds)
-      let env2 = ty_env_add(pr.st.env, pm.pname, mono(pr.ty))
+      let env2 = env_bind_local(pr.st.env, pm.binder, mono(pr.ty))
       let st2 = st_set_env(pr.st, env2)
       add_infer_params_with_binds_loop(st2, rest, tpbinds, rbinds, [pr.ty, ...acc])
     }
@@ -8167,12 +8113,7 @@ fn rec_head_slots(tps: [String], binds: [TPBind], rbinds: [RVBind]) : [Ty] =
 
 fn rec_instantiate(st: InferState, ri: RecInfo) : RecInst {
   match ri {
-    # Hanga Roa: the resulting TyCon carries the RecInfo's
-    # module_origin so the typer can distinguish, e.g.,
-    # `tuple.Pair` (mo = Some("tuple")) from a user `type Pair`
-    # in the root (mo = None). Without this both literals
-    # would emit TyCon(None, "Pair", _) and unify spuriously.
-    RI(nm, tps, fs, mo, dsym) -> {
+    RI(dsym, tps, fs, mo) -> {
       let start = st.env.fresh
       let n = list_length(tps)
       let env2 = advance_fresh(st.env, n)
@@ -8181,7 +8122,7 @@ fn rec_instantiate(st: InferState, ri: RecInfo) : RecInst {
       let flds = rec_field_tys(fs, binds, rows.binds, st.env.row_kind, env_home_view(st.env, mo))
       RecInst {
         st: st_set_sub(st_set_env(st, env2), rows.sub),
-        result_ty: TyCon(mo, nm, rec_head_slots(tps, binds, rows.binds), dsym),
+        result_ty: TyCon(dsym, rec_head_slots(tps, binds, rows.binds)),
         fields: flds
       }
     }
@@ -8219,45 +8160,122 @@ fn field_hint(fs: [FTy], target: String) : String {
 
 # ---- the walker ----
 
-# A bare value read, whether the resolver has stamped its identity or
-# not. The scheme still comes from the name: the type environment is
-# keyed by spelling, so an `ESym` types exactly as the `EVar` it
-# replaced, and the id it carries is what later passes read instead of
-# deciding the name again.
 # A read the resolver settled. The id names one declaration, so the
-# scheme comes from it and the spelling is never consulted. A name the
-# env holds under no id — a core signature, a local binder — falls back
-# to the name index.
-fn synth_sym_read(st: InferState, sy: SymId, nm: String,
-      e: Expr) : Inferred / Console + File + Mutable =
-  match ty_env_lookup_fn_id(st.env, sy, nm) {
+# scheme comes from it.
+fn synth_sym_read(st: InferState, sy: SymId, e: Expr) : Inferred / Console + File + Mutable =
+  match env_sym(st.env, sy) {
     Some(sc) -> {
       let r = st_instantiate_report(st, sc)
       let st2 = if r.fresh == [] and r.unit_fresh == [] { r.st }
-                else { st_push_inst(r.st, CS(nm, e.line, e.col, r.fresh, r.unit_fresh, None)) }
+                else { st_push_inst(r.st, CS(sy, e.line, e.col, r.fresh, r.unit_fresh, None)) }
       inferred_leaf(st2, r.ty, e)
     }
-    None -> synth_name_read(st, nm, e)
+    None -> inferred_leaf(st, TyAny, e)
   }
 
-fn names_clause_continuation(st: InferState, nm: String) : Bool = clause_cont_reaches(st.in_clause, nm)
+fn names_clause_continuation(st: InferState, l: LocalId) : Bool = clause_cont_reaches(st.in_clause, l)
 
-fn synth_name_read(st: InferState, nm: String, e: Expr) : Inferred / Console + File + Mutable =
-  if names_clause_continuation(st, nm) {
+# The name the local `l` is bound under; the empty name when nothing binds it.
+fn local_name_in(env: TyEnv, l: LocalId) : Written = match idx_chain_local(env.locals, l) {
+  [e, ..._] -> match e.key {
+    KLocal(b) -> b.name
+    _         -> written("")
+  }
+  [] -> written("")
+}
+
+# A read of a local binder.
+fn synth_local_read(st: InferState, l: LocalId, e: Expr) : Inferred / Console + File + Mutable =
+  if names_clause_continuation(st, l) {
+    let nm = local_name_in(st.env, l)
     let header = "`#{nm}` may only be called, not used as a value: it cannot escape its handler clause"
     let help_msg = "call the continuation directly, e.g. `#{nm}(v)`"
     diag_error(st.file, e.line, e.col, header)
     diag_help(help_msg)
     let d = mk_diag(SevError, st.file, e.line, e.col, header, [ri_help(st.file, e.line, e.col, help_msg)])
     inferred_leaf(st_bump_err(st_push_diag(st, d)), TyAny, e)
-  } else { match ty_env_lookup(st.env, nm) {
+  } else { match env_local(st.env, l) {
     Some(sc) -> {
       let r = st_instantiate_report(st, sc)
-      let st2 = if r.fresh == [] and r.unit_fresh == [] { r.st }
-                else { st_push_inst(r.st, CS(nm, e.line, e.col, r.fresh, r.unit_fresh, None)) }
-      inferred_leaf(st2, r.ty, e)
+      inferred_leaf(r.st, r.ty, e)
     }
     None -> inferred_leaf(st, TyAny, e)
+  } }
+
+# A mark types as the temporary the typer bound under its spelling, else
+# as the primitive of that name.
+fn synth_mark_read(st: InferState, m: Mark, e: Expr) : Inferred / Console + File + Mutable = {
+  let l = local_minted(mark_name(m))
+  match env_local(st.env, l) {
+    Some(_) -> synth_local_read(st, l, e)
+    None    -> synth_sym_read(st, builtin_sym(mark_name(m)), e)
+  }
+}
+
+# An operation read as a value types as its declared scheme.
+fn synth_op_read(st: InferState, r: OpRef, e: Expr) : Inferred / Console + File + Mutable =
+  match env_op(st.env, r.eff, r.op) {
+    Some(sc) -> {
+      let i = st_instantiate_report(st, sc)
+      inferred_leaf(i.st, i.ty, e)
+    }
+    None -> inferred_leaf(st, TyAny, e)
+  }
+
+# A name the resolver left to the typer. Settled here, the node carries
+# the declaration's id; a name nothing declares stays as written.
+fn synth_name_read(st: InferState, w: Written, e: Expr) : Inferred / Console + File + Mutable =
+  match name_read_sym(st, written_text(w)) {
+    Some(s) -> synth_sym_read(st, s, Expr { ...e, kind: ESym(s, spec_none()) })
+    None    -> inferred_leaf(st, TyAny, e)
+  }
+
+# What an unsettled bare name reads as: the newest function spelled so,
+# else a constant, a constructor, or the core primitive of that name.
+fn name_read_sym(st: InferState, nm: String) : Option[SymId] = match ty_env_collect_candidates(st.env, nm) {
+  [c, ..._] -> Some(c.sym)
+  []        -> first_bound_sym(st.env, list_append(st_candidates(st.env.tab, NCConst, nm),
+                 list_append(st_candidates(st.env.tab, NCCtor, nm), [builtin_sym(nm)])))
+}
+
+fn first_bound_sym(env: TyEnv, ss: [SymId]) : Option[SymId] = match ss {
+  []           -> None
+  [s, ...rest] -> match env_sym(env, s) {
+    Some(_) -> Some(s)
+    None    -> first_bound_sym(env, rest)
+  }
+}
+
+# What `m.f` denotes when the resolver left it: a function, constant or
+# constructor of the module `m`, a constructor of the sum `m`, else the
+# core primitive `f`.
+fn modcall_sym(st: InferState, m: String, f: String) : Option[SymId] = {
+  let tab = st.env.tab
+  let in_module = match st_module(tab, m) {
+    Some(ms) -> first_bound_sym(st.env, opt_syms([st_lookup(tab, NCFn, f, ms), st_lookup(tab, NCConst, f, ms), st_lookup(tab, NCCtor, f, ms)]))
+    None     -> None
+  }
+  match in_module {
+    Some(s) -> Some(s)
+    None    -> match sum_ctor_named(st.env, tsh_sym(st_home_view(st), m), f) {
+      Some(c) -> Some(c)
+      None    -> first_bound_sym(st.env, [builtin_sym(f)])
+    }
+  }
+}
+
+fn opt_syms(os: [Option[SymId]]) : [SymId] = match os {
+  []                 -> []
+  [Some(s), ...rest] -> [s, ...opt_syms(rest)]
+  [None, ...rest]    -> opt_syms(rest)
+}
+
+# The constructor of the sum `tsym` spelled `cname`.
+fn sum_ctor_named(env: TyEnv, tsym: SymId, cname: String) : Option[SymId] =
+  if sym_raw(tsym) < 0 { None }
+  else { match find(env_ctors(env, tsym), (e) => written_text(decl_name(env.tab, env_key_sym(e.key))) == cname) {
+    Some(e) -> Some(env_key_sym(e.key))
+    None    -> None
   } }
 
 fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
@@ -8311,9 +8329,11 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     # escapes its clause as a first-class value — `let k = resume`,
     # `f(resume)`. The continuation has no value representation outside its
     # clause, so reject it cleanly (docs/effects.md).
-    ESym(sy, _, nm) -> if sym_is_local(sy) { synth_name_read(st, nm, e) } else { synth_sym_read(st, sy, nm, e) }
+    ESym(sy, _) -> synth_sym_read(st, sy, e)
+    ELocal(l)   -> synth_local_read(st, l, e)
+    EOp(r)      -> synth_op_read(st, r, e)
     EName(nm) -> synth_name_read(st, nm, e)
-    EMark(m) -> synth_name_read(st, mark_name(m), e)
+    EMark(m) -> synth_mark_read(st, m, e)
     ECall(callee, args_)       -> synth_call_site(st, callee, args_, e.line, e.col)
     EField(obj, fnm)           -> synth_field(st, obj, fnm, e.line, e.col)
     EIndex(coll, ix)           -> synth_index(st, coll, ix, e.line, e.col)
@@ -8322,7 +8342,7 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     EIf(c, t_, eo)             -> synth_if(st, c, t_, eo, e.line, e.col)
     EMatch(scr, arms)          -> synth_match(st, scr, arms, e.line, e.col)
     ELambda(ps, body)          -> synth_lambda(st, ps, body, e.line, e.col)
-    ERecordLit(rh, nm, fis)       -> synth_record_lit(st, rh, nm, fis, e.line, e.col)
+    ERecordLit(rh, fis)        -> synth_record_lit(st, rh, fis, e.line, e.col)
     EList(els)                 -> synth_list_expr(st, els, e.line, e.col)
     ERange(lo, hi, stp)        -> synth_range(st, lo, hi, stp, e.line, e.col)
     EBlock(stmts, tail)        -> synth_block(st, stmts, tail, e.line, e.col)
@@ -8334,7 +8354,7 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     ETodo(msg)                 -> synth_todo(st, msg, e)
     EExternBody(_, _)          -> synth_extern_body(st, e)
     EBang(inner)               -> synth_bang(st, inner, e.line, e.col)
-    EHandle(_, _, _, _, _, _, _, _) -> synth_handle(st, e)
+    EHandle(_, _, _, _, _, _, _) -> synth_handle(st, e)
     # numeric literal with a unit annotation. The inner Expr is
     # always EInt or EReal; the literal's type is `TyDimT(base, u)`
     # where base is TyInt or TyReal and u is the canonical unit.
@@ -8395,38 +8415,18 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
           inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
         }
       } }
-    # qualified call. rqc rewrites
-    # `EField(EName(mod), fname)` to `EModCall(mod, fname)` after
-    # checking `fname` is in `mod`'s exports. Module fns register
-    # under both the bare `fname` and a `<mod>::<fname>` key
-    # (`add_decls_loop`); we consult the qualified key first so
-    # two modules exporting the same name resolve unambiguously
-    # to their declaring module instead of shadowing via insert
-    # order. Bare lookup remains as a fallback for legacy
-    # core-only schemes (`add_core_sigs`) that do not flow
-    # through `add_decls_loop` and therefore have no qualified
-    # entry.
-    EModCall(m, fname) -> {
-      let scheme_opt = match ty_env_lookup_qualified(st.env, m, fname) {
-        Some(sc) -> Some(sc)
-        None     -> match ty_env_lookup_ctor_in_home(st.env, m, fname) {
-          Some(sc) -> Some(sc)
-          None     -> ty_env_lookup(st.env, fname)
-        }
-      }
-      match scheme_opt {
-        Some(sc) -> synth_scheme_read(st, sc, fname, e)
-        None -> {
-          # Should not happen — rqc only rewrites when fname is in
-          # the module's exports. If we land here, the table and the
-          # decl stream got out of sync; surface as a diagnostic
-          # rather than a panic so the user sees a concrete location.
-          let perr = mk_diag(SevError, st.file, e.line, e.col,
-            concat_all(["module '", m, "' does not export '", fname,
-                        "' at the typer (rqc / TyEnv mismatch — internal)"]), [])
-          render_diag(perr)
-          inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
-        }
+    # A qualified reference the resolver left. Settled here, the node
+    # carries the declaration's id.
+    EModCall(m, fname) -> match modcall_sym(st, written_text(m), written_text(fname)) {
+      Some(s) -> synth_sym_read(st, s, Expr { ...e, kind: ESym(s, spec_none()) })
+      None -> {
+        # The resolver only leaves a name the module exports, so the
+        # table and the decl stream are out of sync: a diagnostic
+        # rather than a panic, so the user sees a concrete location.
+        let perr = mk_diag(SevError, st.file, e.line, e.col,
+          "module '#{m}' does not export '#{fname}' at the typer (rqc / TyEnv mismatch — internal)", [])
+        render_diag(perr)
+        inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
       }
     }
   }
@@ -8444,16 +8444,16 @@ fn synth_variants_of(st: InferState, ty_expr: TypeExpr, e: Expr) : Inferred / Co
 
   let ty = st_annot_ty(st, ty_expr)
   match ty {
-    TyCon(tm, name, _, tsym) -> {
+    TyCon(tsym, _) -> {
       let vc = check_variants_nullary(st.env, tsym)
       match vc {
-        VCOk(names) -> {
-          # Re-stamp the AST node with the resolved names so codegen
+        VCOk(ctors) -> {
+          # Re-stamp the AST node with the constructors so codegen
           # has them without re-walking the env. Result type is
           # `[T]` (TyListT of TyCon).
-          let result_ty = TyListT(TyCon(tm, name, [], tsym))
+          let result_ty = TyListT(TyCon(tsym, []))
           let resolved = with_ty(
-            mk_expr(EVariantsOf(ty_expr, union_merge_unique([], names)), e.line, e.col),
+            mk_expr(EVariantsOf(ty_expr, ctors), e.line, e.col),
             result_ty)
           mk_inferred(st, result_ty, resolved)
         }
@@ -8461,16 +8461,16 @@ fn synth_variants_of(st: InferState, ty_expr: TypeExpr, e: Expr) : Inferred / Co
           let perr = mk_diag(SevError, st.file, e.line, e.col,
             "`variants[T]()` requires T to be a declared sum type", [])
           render_diag(perr)
-          diag_note("type: #{inf_ty_to_string(ty)}")
+          diag_note("type: #{inf_ty_to_string(st.env.tab, ty)}")
           diag_help("declare T as `type T = A | B | ...` or use a different builtin")
           inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
         }
         VCHasPayload(bad) -> {
-          let bad_list = inf_join_with(bad, ", ")
+          let bad_list = inf_join_with(map(bad, (c) => written_text(decl_name(st.env.tab, c))), ", ")
           let perr = mk_diag(SevError, st.file, e.line, e.col,
             "`variants[T]()` requires every variant of T to be nullary", [])
           render_diag(perr)
-          diag_note("variants of `#{name}` with payload: #{bad_list}")
+          diag_note("variants of `#{decl_name(st.env.tab, tsym)}` with payload: #{bad_list}")
           diag_help("`variants[T]()` lists the inhabitants of a closed sum; this is ill-defined when a variant carries arguments")
           inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
         }
@@ -8480,7 +8480,7 @@ fn synth_variants_of(st: InferState, ty_expr: TypeExpr, e: Expr) : Inferred / Co
       let perr = mk_diag(SevError, st.file, e.line, e.col,
         "`variants[T]()` requires T to be a named user type", [])
       render_diag(perr)
-      diag_note("type: #{inf_ty_to_string(ty)}")
+      diag_note("type: #{inf_ty_to_string(st.env.tab, ty)}")
       diag_help("T must be a `type T = A | B | ...` declaration; built-ins (Int, String, [a], etc.) are not supported")
       inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
     }
@@ -8513,7 +8513,8 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
 
 
   match e.kind {
-    EHandle(body, eff_name, hsym, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
+    EHandle(body, eff_ref, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
+      let hsym = ref_sym(eff_ref)
       # type-check the init expression in the outer scope.
       # The init's inferred type IS the handler-state type — it is
       # propagated into the clauses so `state` / `log` and 2-arg
@@ -8528,7 +8529,7 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       }
       # alias rebinds the capability inside the body.
       let st_aliased = match alias_opt {
-        Some(a) -> st_push_alias(init_typed_st.st, a, eff_name, hsym)
+        Some(a) -> st_push_alias(init_typed_st.st, a.id, hsym)
         None    -> init_typed_st.st
       }
       # when a stateful handler omits the explicit `[T]`
@@ -8553,31 +8554,30 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       # still drives op dispatch inside the handle body; this env binding is what
       # lets `a` cross into `f(a)` and type against a `c: Eff` parameter.
       # The capability type carries only the effect's own tparams, not the
-      # handler's full state type: a non-parametric `Cell` is `TyCon("Cell", [])`
+      # handler's full state type: a non-parametric `Cell` has no arguments
       # even when `with Cell(0)` infers an Int state. Truncating to the effect's
       # tparam arity makes the binding unify with a `c: Cell` parameter.
-      let cap_arity = eff_tparam_arity(st_aliased.op_eff_arities, eff_name)
+      let cap_arity = eff_tparam_arity(st_aliased.op_eff_arities, hsym)
       let cap_tyargs = take_first_tys(resolved_eff_tyargs, cap_arity)
       let st_capbound = match alias_opt {
         Some(a) -> st_set_env(st_aliased,
-                     ty_env_add(st_aliased.env, a, mono(TyCon(None, eff_name, cap_tyargs, hsym))))
+                     env_bind_local(st_aliased.env, a, mono(TyCon(hsym, cap_tyargs))))
         None    -> st_aliased
       }
       let prev_row = st_capbound.row
       let st_in = InferState { ...st_set_row(st_capbound, []), row_tails: [] }
       let rb_raw = synth(st_in, body)
       let rb0 = Inferred { ...rb_raw, st: st_scope_tails(rb_raw.st, st_capbound.row_tails) }
-      let discharge_eff = label_eff_with_alias(eff_name, alias_opt)
+      let cell = match alias_opt { Some(a) -> a.id  None -> local_none() }
       let rb = Inferred { ...rb0, st: holes_under_handler(rb0.st, list_length(st_in.holes),
-                                     Label { eff: discharge_eff, ty_args: cap_tyargs, sym: hsym }) }
+                                     label_in_cell(hsym, cap_tyargs, cell)) }
       # filter out *only* the labels whose ty_args unify with
       # the handler's instantiation. Labels with the same eff name but
       # non-unifiable ty_args remain and propagate to the outer row —
       # they need their own enclosing handler.
-      # a `with State as i` handler discharges `State@i`
-      # labels symmetrically with `label_eff_with_alias`, leaving a
-      # sibling `State@go` cell for its own handler; an unaliased handler
-      # (`alias_opt = None`) discharges bare `State`, unchanged. The
+      # a `with State as i` handler discharges the labels of its own
+      # cell, leaving a sibling cell for its own handler; an unaliased
+      # handler (`alias_opt = None`) discharges the labels of no cell. The
       # discharge binds the cell's type via `unify_list`, so thread the
       # resulting substitution into the handler's output state (all reads
       # of the cell converge on the handler's instantiation).
@@ -8585,7 +8585,7 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       # arity), not the full handler state type — a non-parametric `Cell` op
       # carries a `[]` label even when `with Cell(0)` infers an Int state, so
       # matching against `[Int]` would leave the label undischarged.
-      let filt = filter_labels_matching_res(rb.st.row, discharge_eff, hsym,
+      let filt = filter_labels_matching_res(rb.st.row, hsym, cell,
                                               cap_tyargs, rb.st.sub)
       let body_row_minus = filt.kept
       let rb_st1 = st_set_sub(rb.st, filt.sub)
@@ -8597,18 +8597,18 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       # handled" still fires for what the body actually performs),
       # but we surface the parse-level mistake directly so the user
       # does not chase a "unknown op X on effect Y" cascade.
-      let st_out_eff = check_handle_effect_known(st_out1, eff_name, e.line, e.col)
-      # every clause name must be a declared op of `eff_name`.
-      let st_out2 = check_clause_names(st_out_eff, eff_name, clauses, e.line, e.col)
+      let st_out_eff = check_handle_effect_known(st_out1, eff_ref, e.line, e.col)
+      # every clause name must be a declared op of the effect.
+      let st_out2 = check_clause_names(st_out_eff, eff_ref, clauses, e.line, e.col)
       let stateful = match init_opt { Some(_) -> true None -> false }
       let r_typed = check_return_clause_opt(st_out2, ret_opt, rb.ty,
                                              stateful, init_typed_st.state_ty)
-      let cs_typed = check_clauses_types(r_typed.st, eff_name, clauses,
+      let cs_typed = check_clauses_types(r_typed.st, hsym, clauses,
                                           stateful, init_typed_st.state_ty,
                                           resolved_eff_tyargs, r_typed.ty)
       let hty = apply_ty(cs_typed.st.sub, r_typed.ty)
       let new_e = with_ty(
-        mk_expr(EHandle(rb.expr, eff_name, hsym, stamp_tes(eff_tyargs, resolved_eff_tyargs, (te: TypeExpr) => st_annot_ty(st, te)), init_typed_st.init_opt,
+        mk_expr(EHandle(rb.expr, eff_ref, stamp_tes(eff_tyargs, resolved_eff_tyargs, (te: TypeExpr) => st_annot_ty(st, te)), init_typed_st.init_opt,
                          alias_opt, cs_typed.clauses, r_typed.ret_opt),
                 e.line, e.col),
         hty)
@@ -8651,22 +8651,15 @@ fn tag_new_holes(hs: [HoleSite], n_new: Int, lab: Label) : [HoleSite] =
 type IT = { st: InferState, init_opt: Option[Expr], state_ty: Option[Ty] }
 
 # Bind the stateful handler's magic aliases (`state` / `log`, both the
-# handler-state slot) into a clause env. An alias whose name the
-# enclosing scope already binds is skipped: an outer `log` array must
-# keep its own type inside the clause instead of being retyped as the
-# state. `outer` is the env at the `handle` site; the resolver warns
-# about each name it takes over.
-fn add_state_aliases(env: TyEnv, outer: TyEnv, sty: Ty) : TyEnv =
-  add_state_aliases_loop(env, clause_state_aliases((nm) => ty_env_binds(outer, nm)), sty)
-
-fn ty_env_binds(env: TyEnv, nm: String) : Bool = match ty_env_lookup(env, nm) {
-  Some(_) -> true
-  None    -> false
-}
+# handler-state slot) into a clause env, each as the binder minted under
+# its name. A read the resolver sent to an enclosing `log` carries that
+# binder's own id, so an outer array keeps its type inside the clause.
+fn add_state_aliases(env: TyEnv, sty: Ty) : TyEnv =
+  add_state_aliases_loop(env, clause_state_aliases((nm) => false), sty)
 
 fn add_state_aliases_loop(env: TyEnv, names: [String], sty: Ty) : TyEnv = match names {
   []            -> env
-  [nm, ...rest] -> add_state_aliases_loop(ty_env_add(env, nm, mono(sty)), rest, sty)
+  [nm, ...rest] -> add_state_aliases_loop(env_bind_local(env, binder_minted(nm), mono(sty)), rest, sty)
 }
 
 type RetTyped = { st: InferState, ty: Ty, ret_opt: Option[HReturn] }
@@ -8679,19 +8672,19 @@ fn check_return_clause_opt(st: InferState, ret_opt: Option[HReturn],
   match ret_opt {
     None    -> RetTyped { st: st, ty: body_ty, ret_opt: None }
     Some(r) -> match r {
-      HR(pname, rexpr, line, col) -> {
+      HR(b, rexpr, line, col) -> {
         let outer = st
-        let env1 = ty_env_add(st.env, pname, mono(body_ty))
+        let env1 = env_bind_local(st.env, b, mono(body_ty))
         # `state` / `log` get the actual handler-state type
         # in the return clause so `return(x) -> (x, state)` types as
         # `(body_ty, state_ty)`.
         let sty = match state_ty { Some(t) -> t None -> TyAny }
-        let env2 = if stateful { add_state_aliases(env1, st.env, sty) } else { env1 }
+        let env2 = if stateful { add_state_aliases(env1, sty) } else { env1 }
         let st1 = st_set_env(st, env2)
         let rr = synth(st_clause_alias_tags(st1), rexpr)
         let st_out = st_restore_entries(outer, rr.st)
         let ty = apply_ty(st_out.sub, rr.ty)
-        RetTyped { st: st_out, ty: ty, ret_opt: Some(HR(pname, rr.expr, line, col)) }
+        RetTyped { st: st_out, ty: ty, ret_opt: Some(HR(b, rr.expr, line, col)) }
       }
     }
   }
@@ -8708,14 +8701,14 @@ type ClausesTyped = { st: InferState, clauses: [HClause] }
 
 # `result_ty` is the handle's type: what `resume` returns and what every
 # op clause evaluates to.
-fn check_clauses_types(st: InferState, eff_name: String, cs: [HClause],
+fn check_clauses_types(st: InferState, eff: SymId, cs: [HClause],
                         stateful: Bool, state_ty: Option[Ty],
                         eff_tyargs: [Ty], result_ty: Ty) : ClausesTyped / Console + File + Mutable =
 
 
-  check_clauses_types_loop(st, eff_name, cs, stateful, state_ty, eff_tyargs, result_ty, [])
+  check_clauses_types_loop(st, eff, cs, stateful, state_ty, eff_tyargs, result_ty, [])
 
-fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
+fn check_clauses_types_loop(st: InferState, eff: SymId, cs: [HClause],
                              stateful: Bool, state_ty: Option[Ty],
                              eff_tyargs: [Ty], result_ty: Ty, acc: [HClause]) : ClausesTyped / Console + File + Mutable {
 
@@ -8727,7 +8720,7 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
         if is_lifecycle_clause(head) {
           let ft = check_finally_clause(st, head, params, body, line, col,
                                          stateful, state_ty)
-          check_clauses_types_loop(ft.st, eff_name, rest, stateful, state_ty,
+          check_clauses_types_loop(ft.st, eff, rest, stateful, state_ty,
                                     eff_tyargs, result_ty, [ft.clause, ...acc])
         } else {
       {
@@ -8742,19 +8735,19 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
         # function pointers. Validation is gated on a known op scheme
         # so the unknown-op path keeps its dedicated diagnostic in
         # check_clause_names instead of layering an arity error on top.
-        let st_arity = check_clause_arity(st, eff_name, op_name, params, line, col)
+        let st_arity = check_clause_arity(st, eff, op_name, params, line, col)
         # bind the clause params and unify the op's
         # effect-tparam tyvars with the handler's instantiation, so
         # the answer type is concrete (e.g., `Int` for State.get under
         # `with State[Int]`). `st.clause_resume` is then set with the
         # concrete answer/state types so `resume(v)` / `resume(v, ns)`
         # are typechecked precisely.
-        let bind_res = bind_clause_env_typed(st_arity, eff_name, op_name, params,
+        let bind_res = bind_clause_env_typed(st_arity, eff, op_name, params,
                                               stateful, state_ty, eff_tyargs, result_ty)
         let fresh_before = st_arity.env.fresh
         let sty = match state_ty { Some(t) -> t None -> TyAny }
         let env_bound = bind_res.st.env
-        let env_with_sl = if stateful { add_state_aliases(env_bound, st.env, sty) } else { env_bound }
+        let env_with_sl = if stateful { add_state_aliases(env_bound, sty) } else { env_bound }
         let st_env = st_set_env(bind_res.st, env_with_sl)
         let answer_resolved = apply_ty(st_env.sub, bind_res.answer_ty)
         let st_resume = if stateful {
@@ -8772,15 +8765,11 @@ fn check_clauses_types_loop(st: InferState, eff_name: String, cs: [HClause],
         let st_out0 = st_restore_entries(outer, st_esc)
         let st_out = st_set_sub(st_set_clause_resume(st_out0, outer.clause_resume),
                                 subst_with_rigid(st_out0.sub, outer.sub.rigid))
-        # keep the typed body so the
-        # alias-aware op resolution that fired inside `synth` (e.g.
-        # rewriting `Console.print(...)` to `EName("Stdout.print")`)
-        # actually reaches the emit phase. Returning only `st` and
-        # discarding `rb.expr` was the bug behind the `kai_Console`
-        # leak in `demos/concurrent` — handler-clause bodies kept the
-        # original `EField(EName("Console"), "print")` shape.
+        # keep the typed body so the op resolution that fired inside
+        # `synth` (`Console.print(...)` settled to `Stdout`'s `print`)
+        # actually reaches the emit phase.
         let new_clause = HC(head, params, rb.expr, line, col)
-        check_clauses_types_loop(st_out, eff_name, rest, stateful, state_ty,
+        check_clauses_types_loop(st_out, eff, rest, stateful, state_ty,
                                   eff_tyargs, result_ty, [new_clause, ...acc])
       }
         }
@@ -8812,7 +8801,7 @@ fn check_finally_clause(st: InferState, head: ClauseHead, params: [Param], body:
   }
   let outer = st_arity
   let sty = match state_ty { Some(t) -> t None -> TyAny }
-  let env1 = if stateful { add_state_aliases(outer.env, outer.env, sty) } else { outer.env }
+  let env1 = if stateful { add_state_aliases(outer.env, sty) } else { outer.env }
   let rb = synth(st_clause_alias_tags(st_set_env(outer, env1)), body)
   let st_out = st_restore_entries(outer, rb.st)
   ClauseTyped1 { st: st_out, clause: HC(head, params, rb.expr, line, col) }
@@ -8826,13 +8815,13 @@ fn check_finally_clause(st: InferState, head: ClauseHead, params: [Param], body:
 # instantiated to concrete types.
 type ClauseBindRes = { st: InferState, answer_ty: Ty, op_rigid: [Int] }
 
-fn bind_clause_env_typed(st: InferState, eff_name: String, op_name: String,
+fn bind_clause_env_typed(st: InferState, eff: SymId, op_name: String,
                           params: [Param], stateful: Bool,
                           state_ty: Option[Ty], eff_tyargs: [Ty], result_ty: Ty) : ClauseBindRes / Console + File + Mutable {
 
 
-  let key = string_concat(eff_name, string_concat(".", op_name))
-  match ty_env_lookup(st.env, key) {
+  let key = "#{decl_name(st.env.tab, eff)}.#{op_name}"
+  match env_op(st.env, eff, written(op_name)) {
     None     -> ClauseBindRes { st: bind_params_lenient(st, params), answer_ty: TyAny, op_rigid: [] }
     Some(sc) -> {
       let inst = st_instantiate_report(st, sc)
@@ -8840,7 +8829,7 @@ fn bind_clause_env_typed(st: InferState, eff_name: String, op_name: String,
       # with the handler's instantiation. For State[Int], `get`'s
       # bound `?Tfresh` becomes `Int`, so the resume answer type is
       # `Int` rather than a free tyvar.
-      let eff_arity = lookup_op_eff_arity(st.op_eff_arities, key)
+      let eff_arity = lookup_op_eff_arity(st.op_eff_arities, eff)
       let st_unified = unify_eff_tparams(inst.st, take(inst.fresh, eff_arity), eff_tyargs,
                                           op_name)
       # The op's own type parameters are chosen per perform, so the
@@ -8931,7 +8920,7 @@ fn bind_params_with_sig_typed(st: InferState, params: [Param], arg_tys: [Ty],
       []           -> bind_params_lenient(st, params)
       [a, ...rest_a] -> {
         let st_ann = check_clause_param_annotation(st, p, a)
-        let env1 = ty_env_add(st_ann.env, p.pname, mono(a))
+        let env1 = env_bind_local(st_ann.env, p.binder, mono(a))
         bind_params_with_sig_typed(st_set_env(st_ann, env1), rest, rest_a, ret_ty,
                                      stateful, state_ty, result_ty)
       }
@@ -8972,16 +8961,15 @@ fn ty_is_generic_slot(t: Ty) : Bool {
 
 # stateless clauses bind `resume : (answer_ty) -> result_ty`.
 # Stateful clauses still bind `resume` to mono(TyAny) at the env
-# level (so name lookup succeeds and arity errors don't surface as
-# "unknown identifier"); the actual precise typing of `resume(v)` and
+# level (so a read of it has a type); the actual precise typing of `resume(v)` and
 # `resume(v, ns)` is performed by synth_call's special-case using the
 # st.clause_resume binding pushed by check_clauses_types.
 fn bind_resume_param_typed(st: InferState, p: Param, ret_ty: Ty,
                             stateful: Bool, result_ty: Ty) : InferState {
   if stateful {
-    st_set_env(st, ty_env_add(st.env, p.pname, mono(TyAny)))
+    st_set_env(st, env_bind_local(st.env, p.binder, mono(TyAny)))
   } else {
-    st_set_env(st, ty_env_add(st.env, p.pname, mono(TyFnT([ret_ty], result_ty, inf_row_empty()))))
+    st_set_env(st, env_bind_local(st.env, p.binder, mono(TyFnT([ret_ty], result_ty, inf_row_empty()))))
   }
 }
 
@@ -8990,16 +8978,23 @@ fn bind_params_lenient(st: InferState, params: [Param]) : InferState {
     []      -> st
     [p, ...rest] -> {
       let f = st_fresh_ty(st)
-      let env1 = ty_env_add(f.st.env, p.pname, mono(f.ty))
+      let env1 = env_bind_local(f.st.env, p.binder, mono(f.ty))
       bind_params_lenient(st_set_env(f.st, env1), rest)
     }
   }
 }
 
-fn check_handle_effect_known(st: InferState, eff: String,
+# The effect a `with` head names, as a diagnostic spells it.
+fn handle_eff_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)        -> written_text(decl_name(tab, s))
+  DrWritten(_, n) -> written_text(n)
+}
+
+fn check_handle_effect_known(st: InferState, eff_ref: DeclRef,
                               line: Int, col: Int) : InferState / Console + File {
-  if is_effect_in_env(st.env, eff) { st }
+  if env_has_effect(st.env, ref_sym(eff_ref)) { st }
   else {
+    let eff = handle_eff_text(st.env.tab, eff_ref)
     let header = string_concat("unknown effect in `with`: `",
       string_concat(eff, "`"))
     let perr = mk_diag(SevError, st.file, line, col, header, [])
@@ -9010,7 +9005,7 @@ fn check_handle_effect_known(st: InferState, eff: String,
   }
 }
 
-fn check_clause_names(st: InferState, eff: String, cs: [HClause],
+fn check_clause_names(st: InferState, eff_ref: DeclRef, cs: [HClause],
                       line: Int, col: Int) : InferState / Console + File {
 
 
@@ -9019,13 +9014,13 @@ fn check_clause_names(st: InferState, eff: String, cs: [HClause],
     [c, ...rest] -> match c {
       HC(head, _, _, cline, ccol) -> {
         let name = clause_head_word(head)
-        let key = string_concat(eff, string_concat(".", name))
         if is_lifecycle_clause(head) {
-          check_clause_names(st, eff, rest, line, col)
+          check_clause_names(st, eff_ref, rest, line, col)
         } else {
-        match ty_env_lookup(st.env, key) {
-          Some(_) -> check_clause_names(st, eff, rest, line, col)
+        match env_op(st.env, ref_sym(eff_ref), written(name)) {
+          Some(_) -> check_clause_names(st, eff_ref, rest, line, col)
           None -> {
+            let eff = handle_eff_text(st.env.tab, eff_ref)
             let perr = mk_diag(SevError, st.file, cline, ccol,
               string_concat("unknown op `",
                 string_concat(name,
@@ -9034,7 +9029,7 @@ fn check_clause_names(st: InferState, eff: String, cs: [HClause],
             render_diag(perr)
             diag_note("handler clauses must match an op declared in `effect #{eff} { ... }`")
             diag_help("either remove this clause, or add `#{name}(...)` to the effect declaration")
-            check_clause_names(st_bump_err(st_push_diag(st, perr)), eff, rest, line, col)
+            check_clause_names(st_bump_err(st_push_diag(st, perr)), eff_ref, rest, line, col)
           }
         }
         }
@@ -9062,10 +9057,9 @@ pub fn is_lifecycle_clause(h: ClauseHead) : Bool = match h {
 # `resume`, so the expected clause-side count is `arg_tys.length + 1`.
 # We read the arg-tys length directly off the scheme's body — no
 # instantiation needed for an arity-only check.
-fn check_clause_arity(st: InferState, eff_name: String, op_name: String,
+fn check_clause_arity(st: InferState, eff: SymId, op_name: String,
                        params: [Param], line: Int, col: Int) : InferState / Console + File {
-  let key = string_concat(eff_name, string_concat(".", op_name))
-  match ty_env_lookup(st.env, key) {
+  match env_op(st.env, eff, written(op_name)) {
     None     -> st
     Some(sc) -> match sc {
       Scheme(_, _, _, _, body) -> match body {
@@ -9074,6 +9068,7 @@ fn check_clause_arity(st: InferState, eff_name: String, op_name: String,
           let got = list_length(params)
           if got == expected { st }
           else {
+            let eff_name = written_text(decl_name(st.env.tab, eff))
             let header = string_concat("handler clause `",
               string_concat(op_name,
                 string_concat("` has wrong arity for effect `",
@@ -9097,7 +9092,7 @@ fn check_clause_arity(st: InferState, eff_name: String, op_name: String,
   }
 }
 
-# filter labels whose `eff` matches `eff_name` AND whose
+# filter labels of the effect `hsym` in `cell` whose
 # ty_args unify with `tyargs`. This is the handler-removal path: only
 # the labels matching the handler's instantiation are dropped from the
 # body's row. A handler `with Reader[Int]` does NOT remove a body's
@@ -9107,7 +9102,7 @@ fn check_clause_arity(st: InferState, eff_name: String, op_name: String,
 # discharges, so a matching label's ty_args are UNIFIED against the
 # handler's `tyargs` (binding into the substitution), not merely
 # shape-checked. Two reads of one cell that the row partition no longer
-# cross-pairs (now that distinct cells carry distinct `@<alias>` tags)
+# cross-pairs (distinct cells are distinct labels)
 # converge here instead: the first read pins the element type, the
 # handler's `[?t0]` binds the label's `[?t15]`, and the threaded subst
 # carries the binding to the next read so all reads of the cell agree.
@@ -9119,21 +9114,21 @@ fn check_clause_arity(st: InferState, eff_name: String, op_name: String,
 # `Reader[String]` handler) never leaves a partial binding behind.
 type FilterResult = { kept: [Label], sub: Subst }
 
-fn filter_labels_matching_res(xs: [Label], eff_name: String, hsym: SymId, tyargs: [Ty],
+fn filter_labels_matching_res(xs: [Label], hsym: SymId, cell: LocalId, tyargs: [Ty],
                                sub: Subst) : FilterResult / Mutable {
   match xs {
     [] -> FilterResult { kept: [], sub: sub }
     [h, ...rest] -> {
       # The guard ignores a function type's effect row; `unify` compares
       # it, so a label the unify rejects stays undischarged.
-      let handled = label_same(h, Label { eff: eff_name, ty_args: [], sym: hsym })
+      let handled = label_same(h, label_in_cell(hsym, [], cell))
       let bound = if handled and label_args_dischargeable(h.ty_args, tyargs, sub) {
         unify_list(ty_env_empty(), h.ty_args, tyargs, sub)
       } else { None }
       match bound {
-        Some(sub1) -> filter_labels_matching_res(rest, eff_name, hsym, tyargs, sub1)
+        Some(sub1) -> filter_labels_matching_res(rest, hsym, cell, tyargs, sub1)
         None -> {
-          let r = filter_labels_matching_res(rest, eff_name, hsym, tyargs, sub)
+          let r = filter_labels_matching_res(rest, hsym, cell, tyargs, sub)
           FilterResult { kept: [h, ...r.kept], sub: r.sub }
         }
       }
@@ -9175,8 +9170,8 @@ fn ty_dischargeable(a: Ty, b: Ty, s: Subst) : Bool {
       TyAny     -> true
       _ -> match ax {
         TyListT(ai) -> match bx { TyListT(bi) -> ty_dischargeable(ai, bi, s) _ -> false }
-        TyCon(_, _, aas, ta_sym) -> match bx {
-          TyCon(_, _, bas, tb_sym) -> sym_same(ta_sym, tb_sym) and ty_list_dischargeable(aas, bas, s)
+        TyCon(ta_sym, aas) -> match bx {
+          TyCon(tb_sym, bas) -> sym_same(ta_sym, tb_sym) and ty_list_dischargeable(aas, bas, s)
           _ -> false
         }
         TyFnT(aps, ar, arow) -> match bx {
@@ -9229,7 +9224,7 @@ fn st_join_label(st0: InferState, lab: Label) : LabelJoin / Mutable = {
   else if label_unpinned_among(st.decl_row, lab, st.sub) { LabelJoin { st: st_set_row(st, [lab, ...st.row]), added: true } }
   else { match filter(st.row, (h) => label_same(h, lab) and labels_args_unify(h.ty_args, lab.ty_args, st.sub)) {
     [twin] -> match unify_list(st.env, twin.ty_args, lab.ty_args, st.sub) {
-      Some(s2) -> LabelJoin { st: st_set_row(st_set_sub(st, s2), label_settle_in(st.row, lab, s2)), added: false }
+      Some(s2) -> LabelJoin { st: st_set_sub(st, s2), added: false }
       None     -> LabelJoin { st: st_set_row(st, [lab, ...st.row]), added: true }
     }
     _ -> LabelJoin { st: st_set_row(st, [lab, ...st.row]), added: true }
@@ -9305,7 +9300,7 @@ fn synth_bang(st: InferState, inner: Expr, line: Int, col: Int) : Inferred / Con
   let it_now = apply_ty(ri.st.sub, ri.ty)
   let inner_typed = with_ty(ri.expr, it_now)
   match it_now {
-    TyCon(_, _, args_, tcs) ->
+    TyCon(tcs, args_) ->
       if core_ty_is(tcs, CtOption) {
         match args_ {
           [t] -> bang_finish_option(ri.st, inner_typed, t, line, col)
@@ -9335,7 +9330,7 @@ fn bang_finish_option(st: InferState, inner_typed: Expr, t: Ty,
     Some(rt) -> {
       let rt_now = apply_ty(st.sub, rt)
       match rt_now {
-        TyCon(_, _, rargs, tcs) ->
+        TyCon(tcs, rargs) ->
           if core_ty_is(tcs, CtOption) {
             match rargs {
               [_] ->
@@ -9363,7 +9358,7 @@ fn bang_finish_result(st: InferState, inner_typed: Expr, e_ty: Ty, t: Ty,
     Some(rt) -> {
       let rt_now = apply_ty(st.sub, rt)
       match rt_now {
-        TyCon(_, _, rargs, tcs) ->
+        TyCon(tcs, rargs) ->
           if core_ty_is(tcs, CtResult) {
             match rargs {
               [_, ret_e_ty] -> {
@@ -9396,7 +9391,7 @@ fn bang_bad_operand(st: InferState, found: Ty, inner_typed: Expr,
   let perr = mk_diag(SevError, st.file, line, col,
     "`!` requires an `Option[T]` or `Result[T, E]` operand", [])
   render_diag(perr)
-  diag_note("operand type: #{inf_ty_to_string(found)}")
+  diag_note("operand type: #{inf_ty_to_string(st.env.tab, found)}")
   diag_help("`!` is reserved for the two compiler-blessed propagation types; convert the value explicitly first")
   let st1 = st_bump_err(st_push_diag(st, perr))
   let stub = with_ty(mk_expr(EBang(inner_typed), line, col), TyAny)
@@ -9410,7 +9405,7 @@ fn bang_no_enclosing_fn(st: InferState, fam: String, t: Ty, inner_typed: Expr,
   let perr = mk_diag(SevError, st.file, line, col,
     "`!` is only valid inside a function body", [])
   render_diag(perr)
-  diag_note("operand type: #{fam}[#{inf_ty_to_string(t)}]")
+  diag_note("operand type: #{fam}[#{inf_ty_to_string(st.env.tab, t)}]")
   diag_help("`!` propagates from the enclosing function; it cannot appear inside a lambda or at top level")
   let st1 = st_bump_err(st_push_diag(st, perr))
   let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
@@ -9422,9 +9417,9 @@ fn bang_ret_mismatch(st: InferState, fam: String, t: Ty, ret_ty: Ty,
 
 
   let perr = mk_diag(SevError, st.file, line, col,
-    "`!` on `#{fam}[#{inf_ty_to_string(t)}]` requires the enclosing function to return `#{fam}[U]`", [])
+    "`!` on `#{fam}[#{inf_ty_to_string(st.env.tab, t)}]` requires the enclosing function to return `#{fam}[U]`", [])
   render_diag(perr)
-  diag_note("enclosing return type: #{inf_ty_to_string(ret_ty)}")
+  diag_note("enclosing return type: #{inf_ty_to_string(st.env.tab, ret_ty)}")
   diag_help("change the function's return type, or pattern-match the operand explicitly")
   let st1 = st_bump_err(st_push_diag(st, perr))
   let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
@@ -9436,9 +9431,9 @@ fn bang_ret_mismatch_result(st: InferState, e_ty: Ty, t: Ty, ret_ty: Ty,
 
 
   let perr = mk_diag(SevError, st.file, line, col,
-    "`!` on `Result[#{inf_ty_to_string(t)}, #{inf_ty_to_string(e_ty)}]` requires the enclosing function to return `Result[U, #{inf_ty_to_string(e_ty)}]`", [])
+    "`!` on `Result[#{inf_ty_to_string(st.env.tab, t)}, #{inf_ty_to_string(st.env.tab, e_ty)}]` requires the enclosing function to return `Result[U, #{inf_ty_to_string(st.env.tab, e_ty)}]`", [])
   render_diag(perr)
-  diag_note("enclosing return type: #{inf_ty_to_string(ret_ty)}")
+  diag_note("enclosing return type: #{inf_ty_to_string(st.env.tab, ret_ty)}")
   diag_help("kaikai does not implicitly convert error types (no `From`); convert the error explicitly or change the function's return type")
   let st1 = st_bump_err(st_push_diag(st, perr))
   let stub = with_ty(mk_expr(EBang(inner_typed), line, col), t)
@@ -9635,7 +9630,7 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
             let st_unif = st_unify_call(st_fresh, callee, rc.ty, ra.tys, expected, line, col)
             let st2 = st_propagate_capability_labels(st_unif,
                         apply_ty(st_unif.sub, rc.ty), line, col)
-            let ca = coerce_lambda_args(coerce_ctor_args(st2, callee, ra.exprs, ra.tys, rc.ty), rc.ty)
+            let ca = coerce_lambda_args(coerce_ctor_args(st2, rc.expr, ra.exprs, ra.tys, rc.ty), rc.ty)
             match refine_call(ca.st, rc.expr, rc.ty, ca.exprs, ca.tys, apply_ty(st2.sub, rv.ty)) {
               RefCall(st3, ty) -> mk_inferred(st3, ty, with_ty(mk_expr(ECall(rc.expr, ca.exprs), line, col), ty))
             }
@@ -9670,32 +9665,39 @@ fn cont_arg(r: Inferred, cp: ContParts, what: String) : Inferred / Console + Fil
   Inferred { ...r, st: st_unify(r.st, cp.arg, r.ty, what, r.expr.line, r.expr.col) }
 
 # `#[constructor]` sugar: a call whose callee is a bare type name with
-# a registered constructor desugars to a call to that fn via its home
-# module, so `Rational(2, 3)` routes through `rational.make` — passing
+# a registered constructor desugars to a call to that fn,
+# so `Rational(2, 3)` routes through `rational.make` — passing
 # the fn's logic (canonicalisation, invariants), never the raw record
 # literal — and its arg literals mint against `make`'s param types.
 fn try_constructor_call(st: InferState, callee: Expr, args_: [Expr],
                         line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
 
-  match callee.kind {
-    EName(nm) -> match constructor_lookup(st.env.constructors, nm) {
-      Some(CtorE(_, home, fnm)) -> {
-        let qcallee = mk_expr(EModCall(home, fnm), callee.line, callee.col)
-        # coin bare numeric args to the marked fn's param types (its
-        # scheme is concrete, e.g. `make(BigInt, BigInt)`), so
-        # `Rational(2, 3)` mints `2`/`3` to `BigInt`. Call-arg minting
-        # is not automatic, so the sugar does it explicitly here.
-        let minted_args = match ty_env_lookup_qualified(st.env, home, fnm) {
-          Some(sc) -> constructor_mint_args(st.env, sc, args_)
-          None     -> args_
-        }
-        let rewritten = mk_expr(ECall(qcallee, minted_args), line, col)
-        Some(synth(st, rewritten))
+  match constructor_of_type(st, callee_type_sym(st, callee)) {
+    Some(CtorE(_, fsym)) -> {
+      let qcallee = mk_sym(fsym, callee.line, callee.col)
+      # coin bare numeric args to the marked fn's param types (its
+      # scheme is concrete, e.g. `make(BigInt, BigInt)`), so
+      # `Rational(2, 3)` mints `2`/`3` to `BigInt`. Call-arg minting
+      # is not automatic, so the sugar does it explicitly here.
+      let minted_args = match env_sym(st.env, fsym) {
+        Some(sc) -> constructor_mint_args(st.env, sc, args_)
+        None     -> args_
       }
-      None -> None
+      let rewritten = mk_expr(ECall(qcallee, minted_args), line, col)
+      Some(synth(st, rewritten))
     }
-    _ -> None
+    None -> None
   }
+}
+
+fn constructor_of_type(st: InferState, t: SymId) : Option[CtorEntry] =
+  if sym_raw(t) < 0 { None } else { constructor_lookup(st.env.constructors, t) }
+
+# The type a bare callee spells: only a name the resolver left unsettled
+# can be one, since a type is no value.
+fn callee_type_sym(st: InferState, callee: Expr) : SymId = match callee.kind {
+  EName(nm) -> tsh_sym(st_home_view(st), written_text(nm))
+  _         -> sym_none()
 }
 
 # Coin each bare numeric arg to the marked constructor's param type.
@@ -9738,25 +9740,27 @@ fn constructor_mint_zip(args_: [Expr], param_tys: [Ty], bh: String) : [Expr] {
 # they stay callable.
 fn try_record_type_call(st: InferState, callee: Expr, args_: [Expr],
                         line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
-  match callee.kind {
-    EName(nm) -> match ty_env_lookup(st.env, nm) {
+  let rec_opt = match callee.kind {
+    EName(nm) -> match name_read_sym(st, written_text(nm)) {
       Some(_) -> None
-      None -> match rec_find(st.recs, nm) {
-        Some(r) -> match r {
-          RI(rnm, _, fs, _, _) -> {
-            let perr = mk_diag(SevError, st.file, line, col,
-              concat_all(["record type `", rnm, "` cannot be called with positional arguments"]), [])
-            render_diag(perr)
-            diag_help(concat_all(["construct it with the record literal form: `",
-                                  rnm, " { ", rec_fields_hint(fs), " }`"]))
-            let root = with_ty(mk_expr(ECall(callee, args_), line, col), TyAny)
-            Some(mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, root))
-          }
-        }
-        None -> None
-      }
+      None    -> rec_find(st.recs, callee_type_sym(st, callee))
     }
     _ -> None
+  }
+  match rec_opt {
+    Some(r) -> match r {
+      RI(rsym, _, fs, _) -> {
+        let rnm = written_text(decl_name(st.env.tab, rsym))
+        let perr = mk_diag(SevError, st.file, line, col,
+          concat_all(["record type `", rnm, "` cannot be called with positional arguments"]), [])
+        render_diag(perr)
+        diag_help(concat_all(["construct it with the record literal form: `",
+                              rnm, " { ", rec_fields_hint(fs), " }`"]))
+        let root = with_ty(mk_expr(ECall(callee, args_), line, col), TyAny)
+        Some(mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, root))
+      }
+    }
+    None -> None
   }
 }
 
@@ -9769,13 +9773,12 @@ fn rec_fields_hint(fs: [FieldDecl]) : String = match fs {
 # when a bare-name callee resolves to multiple candidate
 # schemes (`option.map`, `list.map`, `result.map`, ...), narrow by
 # the type of the FIRST argument before instantiating. Without this
-# step the default arm calls `synth(callee)` which routes through
-# `ty_env_lookup` and picks the most-recently-prepended scheme by
-# load order — which fails when the receiver/first-arg type doesn't
-# match.
+# step the default arm calls `synth(callee)` which reads the newest
+# function of that name — which fails when the receiver/first-arg
+# type doesn't match.
 #
 # Returns Some only when:
-#   - callee is `EName(nm)`,
+#   - callee is a name the resolver left unsettled,
 #   - `nm` has 2+ candidates in the env (otherwise the default arm
 #     does the right thing already),
 #   - args_ is non-empty (we need a first-arg type to narrow on),
@@ -9788,26 +9791,12 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
 
 
   match callee.kind {
-    EName(nm) -> {
-      # ctor names (uppercase first letter) are
-      # NOT receiver-typed dispatch targets — narrow-by-first-arg was
-      # designed for module-disambiguated FN candidates (e.g.
-      # `option::map` vs `list::map`). When a user variant `Response.Ok`
-      # shadows the core `Result.Ok`, both qualified entries appear
-      # in the candidate list and `pick_by_first_arg` may prefer the
-      # ctor whose first param is concrete (`String`) over the
-      # polymorphic one (`T`), silently re-routing core `Ok(x)` to
-      # `Response::Ok`. Skip the narrow path for ctors and let the
-      # default arm pick the bare-lookup scheme — for ctors that is
-      # the core builtin, which annotation/scrutinee disambiguation
-      # rewrites to a qualified `EModCall` upstream when needed.
-      let is_ctor = match char_at(nm, 0) {
-        Some(c) -> c >= 'A' and c <= 'Z'
-        None    -> false
-      }
+    EName(w) -> {
+      let nm = written_text(w)
       # A declaration the resolver reached arrives stamped; a bare name
-      # here is a contest it left to the type.
-      if is_ctor { None } else {
+      # here is a contest it left to the type. The candidates are
+      # functions only: a constructor is never a receiver-typed
+      # dispatch target.
       let candidates = st_visible_candidates(st, nm)
       let n_cand = list_length(candidates)
       if n_cand < 2 { None }
@@ -9827,7 +9816,7 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
                 let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
                   pick.st
                 } else {
-                  st_push_inst(pick.st, CS(nm, line, col, pick.fresh, pick.unit_fresh, None))
+                  st_push_inst(pick.st, CS(pick.sym, line, col, pick.fresh, pick.unit_fresh, None))
                 }
                 let ra_rest = synth_many(st_inst, rest_args)
                 let all_arg_tys = [first_ty, ...ra_rest.tys]
@@ -9842,12 +9831,8 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
                 let st2 = st_propagate_capability_labels(st_unif,
                             apply_ty(st_unif.sub, pick.inst_ty), line, col)
                 let ty = apply_ty(st2.sub, rv.ty)
-                # A settled contest names its home; a dispatcher carries
-                # its id, since its qualified spelling is reserved for the
-                # interpolation sugar's `show`.
-                let callee_kind = if pid_qualified_is_disp(st.protos.ids, pick.mod, nm) { ESym(sym_derive(NCFn, nm, pick.mod), spec_none(), nm) }
-                                  else { EModCall(pick.mod, nm) }
-                let callee_node = with_ty(mk_expr(callee_kind, callee.line, callee.col), pick.inst_ty)
+                # A settled contest carries the id of the declaration it picked.
+                let callee_node = with_ty(mk_sym(pick.sym, callee.line, callee.col), pick.inst_ty)
                 match refine_call(st2, callee, pick.inst_ty, all_arg_exprs, all_arg_tys, ty) {
                   RefCall(st3, ty3) -> Some(mk_inferred(st3, ty3, with_ty(mk_expr(ECall(callee_node, all_arg_exprs), line, col), ty3)))
                 }
@@ -9856,7 +9841,6 @@ fn try_bare_call_narrow(st: InferState, callee: Expr, args_: [Expr],
             }
           }
         }
-      }
       }
     }
     _ -> None
@@ -9886,7 +9870,7 @@ fn hom_try_defer(st: InferState, nm: String, candidates: [TyCandidate],
       let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
       let want = TyFnT([first_ty, ...ra.tys], rv.ty, expected_row)
       let st1 = st_push_deferred_hom(st_fresh, DHom(nm, want, callee.line, callee.col))
-      let callee_node = with_ty(mk_expr(EName(nm), callee.line, callee.col), want)
+      let callee_node = with_ty(mk_name(nm, callee.line, callee.col), want)
       let root = with_ty(mk_expr(ECall(callee_node, [first_expr, ...ra.exprs]), line, col), rv.ty)
       Some(mk_inferred(st1, rv.ty, root))
     } }
@@ -9895,7 +9879,7 @@ fn hom_try_defer(st: InferState, nm: String, candidates: [TyCandidate],
 
 fn hom_cands_of(cs: [TyCandidate]) : [HomCand] = match cs {
   []           -> []
-  [c, ...rest] -> [HCand(c.mod, hom_scheme_body(c.scheme)), ...hom_cands_of(rest)]
+  [c, ...rest] -> [HCand(c.sym, hom_scheme_body(c.scheme)), ...hom_cands_of(rest)]
 }
 
 fn hom_scheme_body(sc: TyScheme) : Ty = match sc {
@@ -9928,7 +9912,7 @@ fn drain_one_deferred_hom(st: InferState, nm: String, want: Ty,
   match hom_first_param(want) {
     None      -> HomDrain { st: st, picks: [] }
     Some(arg) -> match hom_choose(cands, arg) {
-      Some(m) -> hom_commit(st, nm, m, want, line, col)
+      Some(s) -> hom_commit(st, s, want, line, col)
       # Nothing decided it, so the callee stays bare and the
       # contested-name report speaks to it.
       None    -> HomDrain { st: st, picks: [] }
@@ -9936,16 +9920,16 @@ fn drain_one_deferred_hom(st: InferState, nm: String, want: Ty,
   }
 }
 
-fn hom_commit(st: InferState, nm: String, m: String, want: Ty,
+fn hom_commit(st: InferState, s: SymId, want: Ty,
                line: Int, col: Int) : HomDrain / Console + File + Mutable {
-  match ty_env_lookup_qualified(st.env, m, nm) {
+  match env_sym(st.env, s) {
     None     -> HomDrain { st: st, picks: [] }
     Some(sc) -> {
       let inst = st_instantiate_report(st, sc)
       let st1 = if inst.fresh == [] and inst.unit_fresh == [] { inst.st }
-                else { st_push_inst(inst.st, CS(nm, line, col, inst.fresh, inst.unit_fresh, None)) }
+                else { st_push_inst(inst.st, CS(s, line, col, inst.fresh, inst.unit_fresh, None)) }
       let st2 = st_unify(st1, inst.ty, want, "function call", line, col)
-      HomDrain { st: st2, picks: [HPick(line, col, m)] }
+      HomDrain { st: st2, picks: [HPick(line, col, s)] }
     }
   }
 }
@@ -9953,10 +9937,10 @@ fn hom_commit(st: InferState, nm: String, m: String, want: Ty,
 # type-check `resume(v)` in a STATELESS clause against `resume`'s env scheme
 # (`bind_resume_param_typed` bound it to `(answer) -> ?fresh`). Done here
 # rather than via the generic `synth(callee)` path so the callee `resume`
-# never reaches the value-position guard in the `synth` `EVar` arm.
-fn synth_resume_call_stateless(st: InferState, name: String, args_: [Expr], callee: Expr,
+# never reaches the value-position guard of a local read.
+fn synth_resume_call_stateless(st: InferState, k: LocalId, args_: [Expr], callee: Expr,
                                 line: Int, col: Int) : Inferred / Console + File + Mutable {
-  let callee_ty = match ty_env_lookup(st.env, name) {
+  let callee_ty = match env_local(st.env, k) {
     Some(sc) -> (st_instantiate_report(st, sc)).ty
     None     -> TyAny
   }
@@ -9967,7 +9951,7 @@ fn synth_resume_call_stateless(st: InferState, name: String, args_: [Expr], call
   let expected = TyFnT(ra.tys, rv.ty, Row { labels: [], tail: Some(fr.id), display_alias: None })
   let st_unif = st_unify_call(st_fresh, callee, callee_ty, ra.tys, expected, line, col)
   let ty = apply_ty(st_unif.sub, rv.ty)
-  let resume_root = with_ty(mk_ref(canonical_continuation(), callee.line, callee.col), callee_ty)
+  let resume_root = with_ty(mk_local(local_minted(canonical_continuation()), callee.line, callee.col), callee_ty)
   let root = with_ty(mk_expr(ECall(resume_root, ra.exprs), line, col), ty)
   mk_inferred(st_unif, ty, root)
 }
@@ -10116,7 +10100,7 @@ fn intrinsic_text(x: Expr) : String = match x.kind {
 fn clause_result_ty(st: InferState) : Ty = match st.clause_resume {
   Some(RB(_, _, s)) -> s
   None -> match st.in_clause {
-    CcOwn(k) -> match ty_env_lookup(st.env, k) {
+    CcOwn(k) -> match env_local(st.env, k.id) {
       Some(Scheme(_, _, _, _, t)) -> match t {
         TyFnT(_, s, _) -> s
         _ -> TyAny
@@ -10130,29 +10114,29 @@ fn clause_result_ty(st: InferState) : Ty = match st.clause_resume {
 # type-check `resume(v)` / `resume(v, ns)` inside a clause body.
 # Stateful clauses validate against `clause_resume` (precise answer/state
 # types); stateless clauses type the call against `resume`'s env scheme.
-# Intercepting the call here keeps the callee off the `synth` `EVar` arm,
-# whose value-position guard would otherwise reject this legal call.
+# Intercepting the call here keeps the callee off the local-read arm of
+# `synth`, whose value-position guard would otherwise reject this legal call.
 # Returns None when the call is not a resume inside a clause.
 fn try_resume_call(st: InferState, callee: Expr, args_: [Expr],
                     line: Int, col: Int) : Option[Inferred] / Console + File + Mutable {
 
 
-  match sym_local_kind(callee.kind) {
-    EName(name) -> match st.in_clause {
-      CcOwn(k) -> if name == k {
+  match callee.kind {
+    ELocal(l) -> match st.in_clause {
+      CcOwn(k) -> if local_eq(l, k.id) {
         match st.clause_resume {
           Some(rb) -> Some(synth_resume_call(st, rb, args_, callee, line, col))
-          None     -> Some(synth_resume_call_stateless(st, name, args_, callee, line, col))
+          None     -> Some(synth_resume_call_stateless(st, l, args_, callee, line, col))
         }
       } else { None }
-      CcInLambda(k) -> if name == k { Some(lambda_resume_call(st, name, callee)) } else { None }
+      CcInLambda(k) -> if local_eq(l, k.id) { Some(lambda_resume_call(st, k.name, callee)) } else { None }
       CcNone -> None
     }
     _ -> None
   }
 }
 
-fn lambda_resume_call(st: InferState, name: String, callee: Expr) : Inferred / Console + File + Mutable = {
+fn lambda_resume_call(st: InferState, name: Written, callee: Expr) : Inferred / Console + File + Mutable = {
   let header = "calling the continuation from inside a lambda is not supported yet"
   let help_msg = "call `#{name}` in the clause body itself"
   diag_error(st.file, callee.line, callee.col, header)
@@ -10191,7 +10175,7 @@ fn synth_resume_call(st: InferState, rb: ResumeBind, args_: [Expr],
         }
       }
       let ty = apply_ty(st_after.sub, rv.ty)
-      let resume_root = with_ty(mk_ref(canonical_continuation(), callee.line, callee.col), TyAny)
+      let resume_root = with_ty(mk_local(local_minted(canonical_continuation()), callee.line, callee.col), TyAny)
       let root = with_ty(mk_expr(ECall(resume_root, ra.exprs), line, col), ty)
       mk_inferred(st_after, ty, root)
     }
