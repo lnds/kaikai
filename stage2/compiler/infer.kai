@@ -75,6 +75,8 @@ import compiler.record_fields
 import compiler.field_privacy
 import compiler.effect_alias
 import compiler.core_effects
+import compiler.scalar_ty
+import compiler.core_types
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule, `inf_` prefix)
@@ -567,71 +569,16 @@ fn inf_raw_lit_for_c(piece: String) : String =
 # `st.parts` accumulates in REVERSE here for O(1) prepend; the public
 # inf_iscan_collect entry point reverses once at the end.
 
-# True when `name` is a fixed-width boundary annotation. On the kaikai
-# side such a value is a plain `Int` (or
-# `Real` for the float `F32`) — the exact C width lives only at the
-# boundary (the classifier reads the surface name; the shim casts at
-# the call). Mapping here, not in the FFI classifier, is what lets
-# `make_gray(64)` and `Color { r: 255 }` type-check.
-fn is_ffi_fixed_name(name: String) : Bool =
-  name == "U8" or name == "U16" or name == "U32" or name == "U64" or
-  name == "I8" or name == "I16" or name == "I32" or name == "I64" or name == "F32"
-
-# The honest 1.0 fixed-width value types (`Int32`/`UInt32`/`UInt64`/
-# `Int128`), distinct from the legacy FFI annotations (`I32`/`U32`/...)
-# which still map to Int. Centralised so every type-name resolver shares
-# one source of truth. `fixed_width_ty_of_name` assumes the predicate
-# held (mirrors `is_ffi_fixed_name` / `ffi_fixed_ty_of_name`).
-#[doc("True when `name` is a fixed-width integer type name (Int32/UInt32/UInt64/Int128).")]
-pub fn is_fixed_width_name(name: String) : Bool =
-  name == "Int32" or name == "UInt32" or name == "UInt64" or name == "Int128"
-
-#[doc("The fixed-width Ty for `name`; call only when `is_fixed_width_name` holds.")]
-pub fn fixed_width_ty_of_name(name: String) : Ty =
-  if name == "Int32" { TyInt32 }
-  else if name == "UInt32" { TyUInt32 }
-  else if name == "UInt64" { TyUInt64 }
-  else { TyInt128 }
-
-# The kaikai-side `Ty` of a fixed-width annotation: `Real` for `F32`,
-# `Int` for every integer width. Only call when `is_ffi_fixed_name`.
-fn ffi_fixed_ty_of_name(name: String) : Ty =
-  if name == "F32" { TyReal } else { TyInt }
-
 # Each nominal head's module slot comes from `hv`, so an annotation
 # agrees with the constructor scheme and the record table on which
 # declaration a name denotes.
 fn inf_resolve_ty(t: TypeExpr, hv: TyHomeView) : Ty {
   match t.tkind {
-    TyName(th, name, targs) -> {
-      if name == "Int" { TyInt }
-      else if name == "Real" { TyReal }
-      else if name == "Bool" { TyBool }
-      else if name == "String" { TyString }
-      else if name == "Char" { TyChar }
-      else if name == "Unit" { TyUnit }
-      else if name == "Byte" { TyByte }
-      else if is_fixed_width_name(name) { fixed_width_ty_of_name(name) }
-      # A fixed-width boundary annotation is an `Int` (or `Real` for
-      # `F32`) on the kaikai side — it only carries its
-      # exact C width at the FFI boundary (the classifier reads the
-      # surface name). So literals and arithmetic unify normally; the
-      # shim casts at the call. Mapping here, not in the FFI classifier,
-      # is what lets `make_gray(64)` type-check. These legacy FFI
-      # annotations keep their `Int`/`Real` kaikai-side mapping; the
-      # new honest path is to write `Int32`/`UInt32`/`UInt64` directly.
-      else if is_ffi_fixed_name(name) { ffi_fixed_ty_of_name(name) }
-      # `Handle` is the surface name for the opaque LLVM
-      # C-API scalar (`TyHandle`). Only the native backend writes it.
-      else if name == "Handle" { TyHandle }
-      # `Nothing` is the uninhabited type of an abort op. The
-      # typer can't witness uninhabitedness, so
-      # we treat it as TyAny — a call producing Nothing unifies with
-      # any expected type, which is sound only because the default
-      # handler aborts before any consumer of that "value" runs.
-      else if name == "Nothing" { TyAny }
-      else if is_cont_name(name) { tsh_tycon_at(hv, th, name, cont_full_args(name, inf_resolve_args_rk(targs, [2], 0, [], hv))) }
-      else { tsh_tycon_at(hv, th, name, inf_resolve_ty_list(targs, hv)) }
+    TyName(th, name, targs) -> match undeclared_ty_named(name, SnValue) {
+      Some(t) -> t
+      None ->
+        if is_cont_name(name) { tsh_tycon_at(hv, th, name, cont_full_args(name, inf_resolve_args_rk(targs, [2], 0, [], hv))) }
+        else { tsh_tycon_at(hv, th, name, inf_resolve_ty_list(targs, hv)) }
     }
     TyList(inner) -> TyListT(inf_resolve_ty(inner, hv))
     TyFn(fps, fret, rexpr) -> TyFnT(inf_resolve_ty_list(fps, hv), inf_resolve_ty(fret, hv), inf_row_of_expr(rexpr, hv))
@@ -987,8 +934,8 @@ fn inf_row_carrier_of(t: Ty) : Option[Row] = match t {
 }
 
 # A pure body's `Cont[T, S, e]` shows as the `Cont[T, S]` it is written as.
-fn cont_shown_args(cname: String, tas: [Ty]) : [Ty] = match tas {
-  [a, s, r] -> if is_cont_name(cname) { match inf_row_carrier_of(r) {
+fn cont_shown_args(csym: SymId, tas: [Ty]) : [Ty] = match tas {
+  [a, s, r] -> if core_ty_is(csym, CtCont) { match inf_row_carrier_of(r) {
     Some(row) -> match row.tail {
       None    -> if labels_empty(row.labels) { [a, s] } else { tas }
       Some(_) -> tas
@@ -1027,11 +974,11 @@ pub fn inf_ty_to_string_ow(owners: [HeadOwnerEntry], t: Ty) : String {
       inf_ty_to_string_ow(owners, ret),
       inf_row_suffix_ow(owners, row)
     ])
-    TyCon(_, cname, tas, _) -> {
+    TyCon(_, cname, tas, csym) -> {
       let shown = inf_tycon_display_ow(owners, cname)
       match tas {
         [] -> shown
-        _ -> concat_all([shown, "[", inf_join_with(map(cont_shown_args(cname, tas), (a) => inf_tycon_arg_to_string_ow(owners, a)), ", "), "]"])
+        _ -> concat_all([shown, "[", inf_join_with(map(cont_shown_args(csym, tas), (a) => inf_tycon_arg_to_string_ow(owners, a)), ", "), "]"])
       }
     }
     TyVarT(n) -> cat2("?t", int_to_string(n))
@@ -1111,10 +1058,10 @@ pub fn inf_ty_to_string(t: Ty) : String {
       inf_ty_to_string(ret),
       inf_row_to_string_suffix(row)
     ])
-    TyCon(_, cname, tas, _) -> {
+    TyCon(_, cname, tas, csym) -> {
       match tas {
         [] -> cname
-        _ -> concat_all([cname, "[", inf_join_with(map(cont_shown_args(cname, tas), inf_tycon_arg_to_string), ", "), "]"])
+        _ -> concat_all([cname, "[", inf_join_with(map(cont_shown_args(csym, tas), inf_tycon_arg_to_string), ", "), "]"])
       }
     }
     TyVarT(n) -> cat2("?t", int_to_string(n))
@@ -1464,7 +1411,7 @@ fn check_field_privacy(df: DiagFiles, home: TyHomeView,
 
 fn field_recs_of(decls: [Decl]) : FieldRecs = field_recs(list_reverse(decls), idx_empty())
 
-#[doc("Every record declaration by name, in declaration order: a field access reads one chain instead of walking the whole program.")]
+#[doc("Every record declaration under its identity: a field access reads the one declaration its record type names instead of walking the whole program.")]
 pub type FieldRecs = NameIndex[FieldRec]
 
 #[doc("One record declaration: its name, fields, declaring module and identity.")]
@@ -1474,7 +1421,7 @@ fn field_recs(rev_decls: [Decl], ix: FieldRecs) : FieldRecs = match rev_decls {
   [] -> ix
   [d, ...rest] -> match d {
     DType(_, tn, _, TBRecord(fields), _, _, decl_mo, _, dsym) ->
-      field_recs(rest, idx_prepend(ix, tn, FRec(tn, fields, decl_mo, dsym)))
+      field_recs(rest, idx_prepend_sym(ix, dsym, FRec(tn, fields, decl_mo, dsym)))
     _ -> field_recs(rest, ix)
   }
 }
@@ -1495,20 +1442,17 @@ fn check_field_privacy_loop(df: DiagFiles, home: TyHomeView,
   }
 }
 
-fn lookup_record_field(all_decls: FieldRecs, rec_name: String, rec_sym: SymId, fname: String)
+# A record type that names no declaration has no field to judge.
+fn lookup_record_field(all_decls: FieldRecs, rec_sym: SymId, fname: String)
                          : Option[FieldDeclWithHome] =
-  field_in_recs(idx_chain(all_decls, rec_name), rec_name, rec_sym, fname)
+  if sym_raw(rec_sym) < 0 { None } else { field_in_recs(idx_chain_sym(all_decls, rec_sym), fname) }
 
-fn field_in_recs(rs: [FieldRec], rec_name: String, rec_sym: SymId, fname: String)
-                  : Option[FieldDeclWithHome] = match rs {
+fn field_in_recs(rs: [FieldRec], fname: String) : Option[FieldDeclWithHome] = match rs {
   [] -> None
-  [FRec(tn, fields, decl_mo, dsym), ...rest] ->
-    if tn == rec_name and sym_compat(dsym, rec_sym) {
-      match find_field_in_decls(fields, fname) {
-        Some(fd) -> Some(FDH(fd, decl_mo, dsym))
-        None     -> field_in_recs(rest, rec_name, rec_sym, fname)
-      }
-    } else { field_in_recs(rest, rec_name, rec_sym, fname) }
+  [FRec(_, fields, decl_mo, dsym), ...rest] -> match find_field_in_decls(fields, fname) {
+    Some(fd) -> Some(FDH(fd, decl_mo, dsym))
+    None     -> field_in_recs(rest, fname)
+  }
 }
 
 
@@ -1546,7 +1490,7 @@ fn walk_field_priv_expr(file: String, home: TyHomeView,
   let head_errs = match e.kind {
     EField(obj, fname) -> match record_carrier_of(obj.ty) {
       None         -> []
-      Some(carrier) -> match lookup_record_field(all_decls, carrier.snd, carrier.fst, fname) {
+      Some(carrier) -> match lookup_record_field(all_decls, carrier.fst, fname) {
         None -> []
         Some(FDH(fd, decl_mo, dsym)) ->
           if field_hidden(home, carrier.snd, dsym, fd) {
@@ -1575,7 +1519,7 @@ fn walk_priv_field_inits(file: String, home: TyHomeView,
   match fis {
     []           -> acc
     [FI(fname, _), ...rest] -> {
-      let n = match lookup_record_field(all_decls, rec_name, rec_sym, fname) {
+      let n = match lookup_record_field(all_decls, rec_sym, fname) {
         None -> []
         Some(FDH(fd, decl_mo, dsym)) ->
           if field_hidden(home, rec_name, dsym, fd) {
@@ -2908,10 +2852,10 @@ fn add_builtin_variant_sigs(env: TyEnv) : TyEnv {
   # so `ctor_needs_qualification` and `check_expr_against`'s ECall
   # path can route `Result.Ok(x)` and `Response.Ok(x)` to distinct
   # schemes without flipping the bare slot's protection.
-  let some_sc = scheme([0],    fn_ty([tv(0)], TyCon(None, "Option", [tv(0)], core_ty_sym(CtOption))))
-  let none_sc = scheme([0],    TyCon(None, "Option", [tv(0)], core_ty_sym(CtOption)))
-  let ok_sc   = scheme([0, 1], fn_ty([tv(0)], TyCon(None, "Result", [tv(0), tv(1)], core_ty_sym(CtResult))))
-  let err_sc  = scheme([0, 1], fn_ty([tv(1)], TyCon(None, "Result", [tv(0), tv(1)], core_ty_sym(CtResult))))
+  let some_sc = scheme([0],    fn_ty([tv(0)], core_ty_con(CtOption, [tv(0)])))
+  let none_sc = scheme([0],    core_ty_con(CtOption, [tv(0)]))
+  let ok_sc   = scheme([0, 1], fn_ty([tv(0)], core_ty_con(CtResult, [tv(0), tv(1)])))
+  let err_sc  = scheme([0, 1], fn_ty([tv(1)], core_ty_con(CtResult, [tv(0), tv(1)])))
   let es = [
     # Bare entries — the load-bearing keys that bare core code uses.
     TyEntry { name: "Some", scheme: some_sc },
@@ -3256,25 +3200,11 @@ pub fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind], hv: TyHomeView) : T
         }
         None -> match tpbind_lookup(binds, name) {
         Some(i) -> tv(i)
-        None -> {
-          if name == "Int"    { TyInt }
-          else if name == "Real"   { TyReal }
-          else if name == "Bool"   { TyBool }
-          else if name == "String" { TyString }
-          else if name == "Char"   { TyChar }
-          else if name == "Unit"   { TyUnit }
-          else if name == "Byte"     { TyByte }
-          else if is_fixed_width_name(name) { fixed_width_ty_of_name(name) }
-          else if is_ffi_fixed_name(name) { ffi_fixed_ty_of_name(name) }
-          else if name == "Handle"   { TyHandle }
-          # Nothing is the bottom type (used by
-          # abort ops and Spawn's type-erased ops); the typer treats
-          # it as TyAny because it can't witness uninhabitedness.
-          # Without this case, Spawn.spawn(thunk: Nothing) refuses
-          # any non-Nothing thunk argument.
-          else if name == "Nothing" { TyAny }
-          else if is_cont_name(name) { tsh_tycon_at(hv, th, name, cont_full_args(name, resolve_cont_tas_with(tas, binds, hv))) }
-          else { tsh_tycon_at(hv, th, name, resolve_tas_with(tas, binds, hv)) }
+        None -> match undeclared_ty_named(name, SnValue) {
+          Some(t) -> t
+          None ->
+            if is_cont_name(name) { tsh_tycon_at(hv, th, name, cont_full_args(name, resolve_cont_tas_with(tas, binds, hv))) }
+            else { tsh_tycon_at(hv, th, name, resolve_tas_with(tas, binds, hv)) }
         }
       }
       }
@@ -3458,12 +3388,15 @@ fn row_kind_indices(tparams: [String], row_names: [String], i: Int) : [Int] = ma
 # declares none: a homonym declared elsewhere has slots of its own. The
 # builtin `Cont[T, S, e]` carries its body's row in slot 2.
 fn row_kind_slots_of(table: [RowKindEntry], name: String, hv: TyHomeView) : [Int] =
-  if is_cont_name(name) { [2] } else { rk_slots_by(table, tsh_sym(hv, name)) }
+  rk_slots_by(table, tsh_sym(hv, name))
 
-fn rk_slots_by(table: [RowKindEntry], s: SymId) : [Int] = match table {
+fn rk_slots_by(table: [RowKindEntry], s: SymId) : [Int] =
+  if core_ty_is(s, CtCont) { [2] } else { rk_slots_of_decl(table, s) }
+
+fn rk_slots_of_decl(table: [RowKindEntry], s: SymId) : [Int] = match table {
   [] -> []
   [RKE(_, idxs, es), ...rest] ->
-    if sym_raw(s) >= 0 and sym_raw(es) == sym_raw(s) { idxs } else { rk_slots_by(rest, s) }
+    if sym_raw(s) >= 0 and sym_raw(es) == sym_raw(s) { idxs } else { rk_slots_of_decl(rest, s) }
 }
 
 # Reject a nominal type whose ctor field uses an effect-row variable
@@ -3991,22 +3924,12 @@ fn resolve_ty_with_binds(t: TypeExpr, tpbinds: [TPBind], rbinds: [RVBind], rk: [
         }
         None -> match tpbind_lookup(tpbinds, name) {
         Some(i) -> tv(i)
-        None -> {
-          if name == "Int" { TyInt }
-          else if name == "Real"   { TyReal }
-          else if name == "Bool"   { TyBool }
-          else if name == "String" { TyString }
-          else if name == "Char"   { TyChar }
-          else if name == "Unit"   { TyUnit }
-          else if name == "Byte"     { TyByte }
-          else if is_fixed_width_name(name) { fixed_width_ty_of_name(name) }
-          else if is_ffi_fixed_name(name) { ffi_fixed_ty_of_name(name) }
-          else if name == "Handle"   { TyHandle }
-          else if name == "Nothing" { TyAny }
+        None -> match undeclared_ty_named(name, SnValue) {
+          Some(t) -> t
           # A name the view cannot settle stays empty, and
           # `tag_tycon_modules` stamps what is still bare post-typing.
-          else { tsh_tycon_at(hv, th, name,
-                              cont_full_args(name, resolve_tycon_args(tas, row_kind_slots_of(rk, name, hv), 0, tpbinds, rbinds, rk, hv))) }
+          None -> tsh_tycon_at(hv, th, name,
+                               cont_full_args(name, resolve_tycon_args(tas, row_kind_slots_of(rk, name, hv), 0, tpbinds, rbinds, rk, hv)))
         }
       }
       }
@@ -6644,7 +6567,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
           # A fixed-width `Vec[t]<n>` has a distinct inline layout, so it
           # never collapses into a bare `Vec[t]` — even at `<1>`. The
           # numeric `Real ≡ Real<1>` collapse below is untouched.
-          if bn == "Vec" { None }
+          if core_ty_is(tb_sym, CtVec) { None }
           else if an == bn and sym_compat(ta_sym, tb_sym) { match unify_list(env, aa, ba, s) {
             None -> None
             Some(s1) -> unify_dim(UOne, bu, s1)
@@ -6672,7 +6595,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
         TyCon(_, an, aa, ta_sym) ->
           # A fixed-width `Vec[t]<n>` never collapses into a bare `Vec[t]`
           # (distinct inline layout); the numeric collapse above stays.
-          if an == "Vec" { None }
+          if core_ty_is(ta_sym, CtVec) { None }
           else if an == bn and sym_compat(ta_sym, tb_sym) { match unify_list(env, aa, ba, s) {
             None -> None
             Some(s1) -> unify_dim(au, UOne, s1)
@@ -6720,7 +6643,7 @@ fn unify_heads(env: TyEnv, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
 # `TyCon(None,"List",[])`; `reapply` maps that head back to `TyListT`.
 #[doc("The nullary constructor witness a `Shape` variable binds to when applied against a saturated arity-1 type.")]
 pub fn shape_witness_of(t: Ty) : Option[Ty] = match t {
-  TyListT(_) -> Some(TyCon(None, "List", [], core_ty_sym(CtList)))
+  TyListT(_) -> Some(core_ty_con(CtList, []))
   TyCon(m, n, targs, sid) -> match targs { [_one] -> Some(TyCon(m, n, [], sid)) _ -> None }
   _ -> None
 }
@@ -6741,8 +6664,7 @@ pub fn shape_arg_of(t: Ty) : Ty = match t {
 # through unchanged.
 #[doc("Reconstruct a concrete applied type from a resolved shape witness and its argument.")]
 pub fn shape_reapply(wit: Ty, arg: Ty) : Ty = match wit {
-  TyCon(_, "List", [], _) -> TyListT(arg)
-  TyCon(m, n, [], sid) -> TyCon(m, n, [arg], sid)
+  TyCon(m, n, [], sid) -> if core_ty_is(sid, CtList) { TyListT(arg) } else { TyCon(m, n, [arg], sid) }
   _ -> wit
 }
 
@@ -6923,15 +6845,14 @@ fn advance_unit_fresh(st: InferState, n: Int) : InferState {
 # arity-discriminating wrapper and the per-module rerank that
 # `rec_find` consults to disambiguate same-name records — see
 # `rec_find_in_scope`.
-# The record a use names: the one its fixed home declares, else the name
-# lookups (a field probe picks among same-name records, `arity < 0` takes any).
+# The record a use names: the declaration `decl` when the use carries
+# one, else the name lookups (a field probe picks among same-name records,
+# `arity < 0` takes any).
 fn rec_pick(rs: [RecInfo], decl: SymId, target: String, arity: Int, probe: String) : Option[RecInfo] =
-  match rec_find_decl(rs, target, decl) {
-    Some(r) -> Some(r)
-    None    -> if probe != "" { rec_find_with_field(rs, target, arity, probe) }
-               else if arity < 0 { rec_find(rs, target) }
-               else { rec_find_arity(rs, target, arity) }
-  }
+  if sym_raw(decl) >= 0 { rec_find_decl(rs, target, decl) }
+  else if probe != "" { rec_find_with_field(rs, target, arity, probe) }
+  else if arity < 0 { rec_find(rs, target) }
+  else { rec_find_arity(rs, target, arity) }
 
 fn rec_find_arity(rs: [RecInfo], target: String, arity: Int) : Option[RecInfo] =
   rec_find_arity_loop(rs, target, arity, None)
@@ -8414,8 +8335,8 @@ fn emit_type_hint(expected: Ty, found: Ty) : Unit / Console {
       TyInt -> diag_help("convert with `int_to_char(n)`")
       _     -> ()
     }
-    TyCon(_, nm, _, tcs) -> {
-      if tycon_is(nm, tcs, CtOption) {
+    TyCon(_, _, _, tcs) -> {
+      if core_ty_is(tcs, CtOption) {
         diag_help("wrap the value with `Some(...)`, or use `None` if absent")
       } else { () }
     }
@@ -8645,7 +8566,7 @@ fn rec_instantiate(st: InferState, ri: RecInfo) : RecInst {
     # `tuple.Pair` (mo = Some("tuple")) from a user `type Pair`
     # in the root (mo = None). Without this both literals
     # would emit TyCon(None, "Pair", _) and unify spuriously.
-    RI(nm, tps, fs, mo, _) -> {
+    RI(nm, tps, fs, mo, dsym) -> {
       let start = st.env.fresh
       let n = list_length(tps)
       let env2 = advance_fresh(st.env, n)
@@ -8654,7 +8575,7 @@ fn rec_instantiate(st: InferState, ri: RecInfo) : RecInst {
       let flds = rec_field_tys(fs, binds, rows.binds, st.env.row_kind, env_home_view(st.env, mo))
       RecInst {
         st: st_set_sub(st_set_env(st, env2), rows.sub),
-        result_ty: TyCon(mo, nm, rec_head_slots(tps, binds, rows.binds), tsh_decl_sym(st.env.ty_homes, mo, nm)),
+        result_ty: TyCon(mo, nm, rec_head_slots(tps, binds, rows.binds), dsym),
         fields: flds
       }
     }
@@ -9046,7 +8967,7 @@ fn synth_handle(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
       let cap_tyargs = take_first_tys(resolved_eff_tyargs, cap_arity)
       let st_capbound = match alias_opt {
         Some(a) -> st_set_env(st_aliased,
-                     ty_env_add(st_aliased.env, a, mono(TyCon(None, eff_name, cap_tyargs, sym_none()))))
+                     ty_env_add(st_aliased.env, a, mono(TyCon(None, eff_name, cap_tyargs, hsym))))
         None    -> st_aliased
       }
       let prev_row = st_capbound.row
@@ -9792,13 +9713,13 @@ fn synth_bang(st: InferState, inner: Expr, line: Int, col: Int) : Inferred / Con
   let it_now = apply_ty(ri.st.sub, ri.ty)
   let inner_typed = with_ty(ri.expr, it_now)
   match it_now {
-    TyCon(_, name, args_, tcs) ->
-      if tycon_is(name, tcs, CtOption) {
+    TyCon(_, _, args_, tcs) ->
+      if core_ty_is(tcs, CtOption) {
         match args_ {
           [t] -> bang_finish_option(ri.st, inner_typed, t, line, col)
           _   -> bang_bad_operand(ri.st, it_now, inner_typed, line, col)
         }
-      } else if name == "Result" {
+      } else if core_ty_is(tcs, CtResult) {
         match args_ {
           [t, e_ty] -> bang_finish_result(ri.st, inner_typed, e_ty, t, line, col)
           _ -> bang_bad_operand(ri.st, it_now, inner_typed, line, col)
@@ -9822,8 +9743,8 @@ fn bang_finish_option(st: InferState, inner_typed: Expr, t: Ty,
     Some(rt) -> {
       let rt_now = apply_ty(st.sub, rt)
       match rt_now {
-        TyCon(_, rname, rargs, tcs) ->
-          if tycon_is(rname, tcs, CtOption) {
+        TyCon(_, _, rargs, tcs) ->
+          if core_ty_is(tcs, CtOption) {
             match rargs {
               [_] ->
                 mk_inferred(st, t, with_ty(mk_expr(EBang(inner_typed), line, col), t))
@@ -9850,8 +9771,8 @@ fn bang_finish_result(st: InferState, inner_typed: Expr, e_ty: Ty, t: Ty,
     Some(rt) -> {
       let rt_now = apply_ty(st.sub, rt)
       match rt_now {
-        TyCon(_, rname, rargs, tcs) ->
-          if tycon_is(rname, tcs, CtResult) {
+        TyCon(_, _, rargs, tcs) ->
+          if core_ty_is(tcs, CtResult) {
             match rargs {
               [_, ret_e_ty] -> {
                 # pass the enclosing function's
@@ -10191,10 +10112,11 @@ fn try_constructor_call(st: InferState, callee: Expr, args_: [Expr],
 # through untouched (the unifier still confirms the result).
 # The home of the module declaring `BigInt`: a minted big literal calls
 # that module's `from_literal`.
-fn mint_bigint_home(env: TyEnv) : String = match tsh_type_home(env.ty_homes, TyAny, "BigInt") {
-  Some(h) -> h
-  None    -> "bigint"
-}
+fn mint_bigint_home(env: TyEnv) : String =
+  match tsh_sym_slot(env_home_view(env, None), core_decl_ty_name(CdBigInt), core_decl_ty_id(CdBigInt)) {
+    Some(h) -> h
+    None    -> "bigint"
+  }
 
 fn constructor_mint_args(env: TyEnv, sc: TyScheme, args_: [Expr]) : [Expr] {
   match instantiate(env, sc).ty {
@@ -10885,8 +10807,8 @@ fn try_ref_sugar_op(st: InferState, obj: Expr, obj_ty: Ty, ident: String,
 
 
   match obj_ty {
-    TyCon(_, name, _, tcs) ->
-      if tycon_is(name, tcs, CtRef) {
+    TyCon(_, _, _, tcs) ->
+      if core_ty_is(tcs, CtRef) {
         let key_opt =
           if ident == "get" { Some("Mutable.ref_get") }
           else if ident == "set" { Some("Mutable.ref_set") }
@@ -11798,15 +11720,15 @@ fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Infe
   let coll_ty = apply_ty(probe.st.sub, probe.ty)
   let ph = ixc_ref(coll)
   match coll_ty {
-    TyCon(_, cname, _, tcs) ->
-      if tycon_is(cname, tcs, CtVec) { synth_vec_index(probe, coll_ty, ph, ix, line, col) }
-      else { synth_on_coll(probe, coll_ty, ECall(index_getter(coll_ty, probe.st.env.ty_homes, line, col), [ph, ix]), line, col) }
+    TyCon(_, _, _, tcs) ->
+      if core_ty_is(tcs, CtVec) { synth_vec_index(probe, coll_ty, ph, ix, line, col) }
+      else { synth_on_coll(probe, coll_ty, ECall(index_getter(coll_ty, line, col), [ph, ix]), line, col) }
     # A fixed-width vec (`Vec[T]<n>`) reads inline: a static literal index
     # is a bare struct field load with the bound proved at compile time
     # (no runtime check). A dynamic index is declined in v1.
     TyDimT(inner, _) -> match inner {
-      TyCon(_, cname, _, tcs) ->
-        if tycon_is(cname, tcs, CtVec) {
+      TyCon(_, _, _, tcs) ->
+        if core_ty_is(tcs, CtVec) {
           if ty_is_fixed_vec(coll_ty) { synth_fixed_vec_index(probe.st, probe.expr, ix, coll_ty, line, col) }
           else {
             let bare = mk_expr(ECall(builtin_mk(CbDetachUnit, line, col), [ph]), line, col)
@@ -11821,16 +11743,14 @@ fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Infe
 
 # `Map` and `HashMap` read through the `get` of the module that declares
 # the collection's type, which is the home its symbols were minted under.
-fn index_getter(t: Ty, homes: TyHomes, line: Int, col: Int) : Expr = match t {
-  TyCon(_, cname, _, _) ->
-    if cname == "Map" or cname == "HashMap" { mk_expr(EModCall(coll_home(t, homes, cname), "get"), line, col) }
-    else { builtin_mk(CbArrayGet, line, col) }
-  _ -> builtin_mk(CbArrayGet, line, col)
+fn index_getter(t: Ty, line: Int, col: Int) : Expr = match ty_coll(t) {
+  Some(c) -> mk_expr(EModCall(core_coll_home(c), "get"), line, col)
+  None    -> builtin_mk(CbArrayGet, line, col)
 }
 
-fn coll_home(t: Ty, homes: TyHomes, cname: String) : String = match tsh_type_home(homes, t, cname) {
-  Some(h) -> h
-  None    -> if cname == "Map" { "map" } else { "hashmap" }
+fn ty_coll(t: Ty) : Option[CoreColl] = match t {
+  TyCon(_, _, _, s) -> core_coll_of(s)
+  _                 -> None
 }
 
 # Types the read `k`, whose collection is the placeholder, against the
@@ -14578,14 +14498,19 @@ fn check_record_lit_fields(st: InferState, nm: String, fis: [FieldInit], fields:
 # (`10.50<USD>` is scale 2); the scale of an arithmetic result is the
 # operation's to define. On a unit mismatch the AST is left alone and the
 # unifier reports it.
+fn is_decimal_head(n: String, s: SymId) : Bool = match core_decl_ty_head(n, s) {
+  Some(CdDecimal) -> true
+  _               -> false
+}
+
 fn try_lower_decimal_uom_lit(value: Expr, expected: Ty, bh: String) : Expr {
   match expected {
-    TyDimT(TyCon(_, "Decimal", _, dsym), u_field) -> match value.kind {
+    TyDimT(TyCon(_, dname, _, dsym), u_field) -> match value.kind {
       ELitUnit(inner, u_lit) ->
-        if inf_unit_eq(u_lit, u_field) {
-          let target_ty = TyDimT(TyCon(None, "Decimal", [], dsym), unit_canon(u_field))
-          match mint_literal(inner, TyCon(None, "Decimal", [], dsym), bh) {
-            MintOk(e) -> with_ty(e, target_ty)
+        if is_decimal_head(dname, dsym) and inf_unit_eq(u_lit, u_field) {
+          let dec = TyCon(None, core_decl_ty_name(CdDecimal), [], dsym)
+          match mint_literal(inner, dec, bh) {
+            MintOk(e) -> with_ty(e, TyDimT(dec, unit_canon(u_field)))
             _ -> value
           }
         } else { value }
@@ -15037,7 +14962,8 @@ fn mint_let_textual(st: InferState, rhs: Expr, te: TypeExpr,
 }
 
 fn synth_mint_decimal(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
-  let dec = TyCon(None, "Decimal", [], tsh_decl_sym(st.env.ty_homes, Some("decimal"), "Decimal"))
+  let dec_name = core_decl_ty_name(CdDecimal)
+  let dec = TyCon(None, dec_name, [], tsh_decl_sym(st.env.ty_homes, Some(core_decl_ty_home(CdDecimal)), dec_name))
   match mint_literal(e, dec, mint_bigint_home(st.env)) {
     MintOk(e2) -> {
       let ty = match e2.ty { Some(t) -> t None -> dec }
@@ -15279,8 +15205,8 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt / Console + File + Mutable {
     SIndexAssign(b, i, v, line, col) -> {
       let probe = synth(st, b)
       let base_ty = apply_ty(probe.st.sub, probe.ty)
-      match base_ty {
-        TyCon(_, "Map", _, _) -> {
+      match ty_coll(base_ty) {
+        Some(CcMap) -> {
           let ri = synth(probe.st, i)
           let rv = synth(ri.st, v)
           let perr = mk_diag(SevError, st.file, line, col,
@@ -16042,7 +15968,7 @@ fn check_match(st: InferState, scr: Expr, arms: [Arm], expected: Ty,
 # an if-chain over `vec_length` / `vec_get` / `vec_tail_from`.
 fn vec_match_route(scr_ty: Ty, arms: [Arm]) : Bool =
   match scr_ty {
-    TyCon(_, name, _, tcs) -> tycon_is(name, tcs, CtVec) and vec_match_has_list_arm(arms)
+    TyCon(_, _, _, tcs) -> core_ty_is(tcs, CtVec) and vec_match_has_list_arm(arms)
     _                 -> false
   }
 
@@ -16295,14 +16221,14 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
       # literal builds a pre-sized vec instead of a cons list. A BARE
       # literal keeps denoting the cons list — only annotation /
       # argument context reaches here.
-      TyCon(_, hname, hargs, tcs) ->
-        if tycon_is(hname, tcs, CtVec) { check_vec_lit_against(st, els, hargs, e.line, e.col) }
+      TyCon(_, _, hargs, tcs) ->
+        if core_ty_is(tcs, CtVec) { check_vec_lit_against(st, els, hargs, e.line, e.col) }
         else { synth(st, e) }
       # Fixed-width Vec context: `Vec[T]<k>` fixes the literal's
       # length by its habitant.
       TyDimT(inner, u) -> match inner {
-        TyCon(_, hname, hargs, tcs) ->
-          if tycon_is(hname, tcs, CtVec) { check_fixed_vec_lit(st, els, hargs, u, e.line, e.col) }
+        TyCon(_, _, hargs, tcs) ->
+          if core_ty_is(tcs, CtVec) { check_fixed_vec_lit(st, els, hargs, u, e.line, e.col) }
           else { synth(st, e) }
         _ -> synth(st, e)
       }
@@ -16607,7 +16533,7 @@ fn ctor_needs_qualification(env: TyEnv, cname: String, parent: String) : Bool {
 # the kai_byte(...) lowering.
 fn ty_is_vec_head(t: Ty) : Bool =
   match t {
-    TyCon(_, name, _, tcs) -> tycon_is(name, tcs, CtVec)
+    TyCon(_, _, _, tcs) -> core_ty_is(tcs, CtVec)
     _                 -> false
   }
 
@@ -16628,7 +16554,7 @@ fn check_vec_lit_against(st: InferState, els: [ListElem], hargs: [Ty],
   } else {
     let elem_exp = match hargs { [t] -> apply_ty(st.sub, t)  _ -> TyAny }
     let checked = check_vec_elems(st, els, elem_exp, line, col, [])
-    let vty = TyCon(None, "Vec", [apply_ty(checked.st.sub, elem_exp)], core_ty_sym(CtVec))
+    let vty = core_ty_con(CtVec, [apply_ty(checked.st.sub, elem_exp)])
     mk_inferred(checked.st, vty, vec_lit_build(list_reverse(checked.elems), vty, line, col))
   }
 }
@@ -16913,7 +16839,7 @@ fn elem_synth_unify(st: InferState, ex: Expr, elem_ty: Ty,
 #[doc("True when a type is `Vec`-headed, seeing through any `Dim` brand — the fixed-width representation reads this to keep a `Vec<1>` distinct from the dynamic `Vec`.")]
 pub fn ty_vec_headed(t: Ty) : Bool = match t {
   TyDimT(inner, _) -> ty_vec_headed(inner)
-  TyCon(_, name, _, tcs) -> tycon_is(name, tcs, CtVec)
+  TyCon(_, _, _, tcs) -> core_ty_is(tcs, CtVec)
   _ -> false
 }
 
