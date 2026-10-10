@@ -15,51 +15,55 @@ import compiler.diag
 import compiler.diag_file
 import compiler.emit_shared
 import compiler.ffi_v2
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
 
 #[doc("Reject an `extern \"C\" fn` whose parameter or return type is not a scalar, a fixed-width annotation, or a declared `extern \"C\" type`/`opaque`.")]
-pub fn validate_extern_fn_types(decls: [Decl], df: DiagFiles) : [Diagnostic] / Console + File =
-  list_reverse(extern_types_loop(decls, df, collect_extern_types(decls), []))
+pub fn validate_extern_fn_types(decls: [Decl], tab: SymTab, df: DiagFiles) : [Diagnostic] / Console + File =
+  list_reverse(extern_types_loop(decls, tab, df, collect_extern_types(decls, tab), []))
 
-fn extern_types_loop(decls: [Decl], df: DiagFiles, reg: [ExternTypeReg],
+fn extern_types_loop(decls: [Decl], tab: SymTab, df: DiagFiles, reg: [ExternTypeReg],
                      errs: [Diagnostic]) : [Diagnostic] / Console + File = match decls {
   [] -> errs
-  [d, ...rest] -> extern_types_loop(rest, df, reg, check_extern_fn(d, df, reg, errs))
+  [d, ...rest] -> extern_types_loop(rest, tab, df, reg, check_extern_fn(d, tab, df, reg, errs))
 }
 
-fn check_extern_fn(d: Decl, df: DiagFiles, reg: [ExternTypeReg], errs: [Diagnostic]) : [Diagnostic] / Console + File = match d {
-  DFn(_, name, _, params, ret, _, body, l, c, _, _) -> match body.kind {
+fn check_extern_fn(d: Decl, tab: SymTab, df: DiagFiles, reg: [ExternTypeReg], errs: [Diagnostic]) : [Diagnostic] / Console + File = match d {
+  DFn(_, fid, _, params, ret, _, body, l, c, _) -> match body.kind {
     EExternBody(AbiC, _) -> {
-      let n = check_params(params, d, df, name, l, c, reg, errs)
+      let name = written_text(sym_name(tab, fnid_sym(fid)))
+      let n = check_params(params, d, tab, df, name, l, c, reg, errs)
       match ret {
         Some(t) ->
-          if boundary_ok(t, true, reg) { n }
-          else { [report_foreign_type(df, d, name, l, c, "return type", t), ...n] }
+          if boundary_ok(t, true, tab, reg) { n }
+          else { [report_foreign_type(df, d, tab, name, l, c, "return type", t), ...n] }
         None    -> n
       }
     }
     _ -> errs
   }
-  DDoc(_, _, inner, _, _) -> check_extern_fn(inner, df, reg, errs)
-  DAttr(_, inner, _, _)   -> check_extern_fn(inner, df, reg, errs)
+  DDoc(_, _, inner, _, _) -> check_extern_fn(inner, tab, df, reg, errs)
+  DAttr(_, inner, _, _)   -> check_extern_fn(inner, tab, df, reg, errs)
   _ -> errs
 }
 
-fn check_params(params: [Param], d: Decl, df: DiagFiles, fname: String, l: Int, c: Int,
+fn check_params(params: [Param], d: Decl, tab: SymTab, df: DiagFiles, fname: String, l: Int, c: Int,
                 reg: [ExternTypeReg], errs: [Diagnostic]) : [Diagnostic] / Console + File = match params {
   [] -> errs
   [p, ...rest] -> match p.ptype {
-    None -> check_params(rest, d, df, fname, l, c, reg, errs)
+    None -> check_params(rest, d, tab, df, fname, l, c, reg, errs)
     Some(t) ->
-      if boundary_ok(t, false, reg) { check_params(rest, d, df, fname, l, c, reg, errs) }
+      if boundary_ok(t, false, tab, reg) { check_params(rest, d, tab, df, fname, l, c, reg, errs) }
       else {
-        let e = report_foreign_type(df, d, fname, l, c, concat_all(["parameter `", p.pname, "`"]), t)
-        check_params(rest, d, df, fname, l, c, reg, [e, ...errs])
+        let e = report_foreign_type(df, d, tab, fname, l, c, concat_all(["parameter `", written_text(p.binder.name), "`"]), t)
+        check_params(rest, d, tab, df, fname, l, c, reg, [e, ...errs])
       }
   }
 }
 
-fn boundary_ok(t: TypeExpr, is_return: Bool, reg: [ExternTypeReg]) : Bool = match t.tkind {
-  TyName(_, n, []) -> match ffi_kind_of_ty(t) {
+fn boundary_ok(t: TypeExpr, is_return: Bool, tab: SymTab, reg: [ExternTypeReg]) : Bool = match t.tkind {
+  TyName(r, []) -> match ffi_kind_of_ty(t, tab) {
     FfiRetUnit               -> is_return
     FfiRetInt                -> true
     FfiRetReal               -> true
@@ -67,29 +71,35 @@ fn boundary_ok(t: TypeExpr, is_return: Bool, reg: [ExternTypeReg]) : Bool = matc
     FfiRetChar               -> true
     FfiRetString             -> true
     FfiRetFixed(_)           -> true
-    FfiRetFixedVal(TyInt128) -> is_declared_foreign(reg, n)
+    FfiRetFixedVal(TyInt128) -> is_declared_foreign(reg, extern_ref_name(tab, r))
     FfiRetFixedVal(_)        -> true
-    _                        -> is_declared_foreign(reg, n)
+    _                        -> is_declared_foreign(reg, extern_ref_name(tab, r))
   }
   _ -> false
+}
+
+# The registry of foreign types is keyed by the name each was declared with.
+fn extern_ref_name(tab: SymTab, r: DeclRef) : String = match r {
+  DrWritten(_, n) -> written_text(n)
+  DrSym(s)        -> written_text(decl_name(tab, s))
 }
 
 fn is_declared_foreign(reg: [ExternTypeReg], n: String) : Bool =
   match extern_type_lookup(reg, n) { Some(_) -> true  None -> false }
 
-fn report_foreign_type(df: DiagFiles, d: Decl, fname: String, l: Int, c: Int,
+fn report_foreign_type(df: DiagFiles, d: Decl, tab: SymTab, fname: String, l: Int, c: Int,
                        what: String, t: TypeExpr) : Diagnostic / Console + File = {
   let file = decl_diag_file(d, df)
   let help = "allowed: Int, Real, Bool, Char, String, Unit (return only), fixed-width U8..F32, Int32, UInt32, UInt64, or a declared `extern \"C\" type` / `extern \"C\" opaque`"
-  let msg = concat_all(["`extern \"C\" fn ", fname, "` ", what, " has type `", type_surface_name(t), "`, which has no C layout"])
+  let msg = concat_all(["`extern \"C\" fn ", fname, "` ", what, " has type `", type_surface_name(tab, t), "`, which has no C layout"])
   let diag = mk_diag(SevError, file, l, c, msg, [ri_help(file, l, c, help)])
   render_diag(diag)
   diag
 }
 
-fn type_surface_name(t: TypeExpr) : String = match t.tkind {
-  TyName(_, n, [])    -> n
-  TyName(_, n, targs) -> concat_all([n, "[", join_with(map(targs, type_surface_name), ", "), "]"])
-  TyList(inner)    -> concat_all(["[", type_surface_name(inner), "]"])
+fn type_surface_name(tab: SymTab, t: TypeExpr) : String = match t.tkind {
+  TyName(r, [])    -> extern_ref_name(tab, r)
+  TyName(r, targs) -> concat_all([extern_ref_name(tab, r), "[", join_with(map(targs, (a) => type_surface_name(tab, a)), ", "), "]"])
+  TyList(inner)    -> concat_all(["[", type_surface_name(tab, inner), "]"])
   _                -> "?"
 }
