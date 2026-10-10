@@ -48,12 +48,12 @@ import compiler.type_stamp
 import compiler.effect_default
 import compiler.type_text
 import compiler.marks
+import compiler.intrinsics
 import compiler.sym_read
 import compiler.kinds
 import compiler.home_tu
 import compiler.loop_lower
 import compiler.cell_promote
-import compiler.tailslots
 import compiler.purity
 import compiler.escapes
 import compiler.diag
@@ -6791,17 +6791,18 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
     EMatch(scr, arms) -> emit_match_raw(src, scr, arms, x.ty, emit_unw_scr_at(x, cx))
     # A promoted var cell: the read is the raw mutable local itself;
     # the init forwards its (literal) raw form.
-    EIntrinsic(inm, iargs) ->
-      if is_cell_get(inm) { cat2("kair_", cell_ref_name(iargs)) }
-      else if inm == "__cell_init" { match iargs {
+    EIntrinsic(i, iargs) -> match i {
+      InCellGet  -> cat2("kair_", cell_ref_name(iargs))
+      InCellInit -> match iargs {
         [init] -> emit_expr_raw(src, init, cx)
         _      -> "0 /* malformed cell init */"
-      } }
-      else if tfslots_is_absent(inm) { "0" }
-      else {
+      }
+      InAbsent   -> "0"
+      _ -> {
         let boxed = emit_expr_boxed(src, x, cx)
         unbox_border(boxed, x, x.ty)
       }
+    }
     _ -> {
       # Anything else: emit boxed and unwrap. The unbox_pass should
       # not have marked these MUnboxed in the first place — defensive.
@@ -7248,15 +7249,18 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     # value position should never reach emit_expr_boxed — the typer
     # rejects them outside the clause-body context where Stage 4 codegen
     # recognises them and emits a bridge.
-    EIntrinsic(name, args_) ->
-      if is_loop_intrinsic(name) { emit_loop_intrinsic(src, name, args_, cx) }
-      else if is_cell_set(name) { emit_cell_set(src, name, args_, cx) }
-      else if is_cell_get(name) { box_wrap(x.ty, cat2("kair_", cell_ref_name(args_))) }
-      else if name == "resume_frame" { emit_resume_frame(src, args_, cx) }
-      else if name == "seg_handle" { emit_seg_handle(src, args_, cx) }
-      else if name == "seg_request" { emit_seg_request(src, args_, cx) }
-      else if tfslots_is_absent(name) { "kai_unit()" }
-      else { cat3("kai_unit() /* unreachable: intrinsic $", name, " in value position */") }
+    EIntrinsic(i, args_) -> match i {
+      InLoopWhile   -> emit_loop_intrinsic(src, i, args_, cx)
+      InLoopUntil   -> emit_loop_intrinsic(src, i, args_, cx)
+      InLoopRepeat  -> emit_loop_intrinsic(src, i, args_, cx)
+      InCellSet     -> emit_cell_set(src, i, args_, cx)
+      InCellGet     -> box_wrap(x.ty, cat2("kair_", cell_ref_name(args_)))
+      InResumeFrame -> emit_resume_frame(src, args_, cx)
+      InSegHandle   -> emit_seg_handle(src, args_, cx)
+      InSegRequest  -> emit_seg_request(src, args_, cx)
+      InAbsent      -> "kai_unit()"
+      _ -> cat3("kai_unit() /* unreachable: intrinsic $", intrinsic_name(i), " in value position */")
+    }
   }
 }
 
@@ -7302,35 +7306,35 @@ fn emit_value_array(src: String, xs: [Expr], cx: EmitCtx) : String / Console = m
 # closure's create-incref / drop-decref pair vanishes together with the
 # closure.
 
-fn emit_loop_intrinsic(src: String, name: String, args_: [Expr], cx: EmitCtx) : String / Console {
+fn emit_loop_intrinsic(src: String, i: Intrinsic, args_: [Expr], cx: EmitCtx) : String / Console {
 
-  match emit_loop_core(src, name, args_, cx) {
+  match emit_loop_core(src, i, args_, cx) {
     Some(core) -> concat_all(["({ ", core, " kai_unit(); })"])
-    None       -> emit_loop_bad(name)
+    None       -> emit_loop_bad(i)
   }
 }
 
 # The loop's C statement core (no value). Shared by the expression form
 # (which appends the `kai_unit()` result) and the statement-discard form
 # (which drops it — a loop's value is always unit).
-fn emit_loop_core(src: String, name: String, args_: [Expr], cx: EmitCtx) : Option[String] / Console {
+fn emit_loop_core(src: String, i: Intrinsic, args_: [Expr], cx: EmitCtx) : Option[String] / Console {
 
-  match name {
-    "__loop_while" -> match args_ {
+  match i {
+    InLoopWhile -> match args_ {
       [_, cnd, body] -> Some(concat_all([
         "for (;;) { ", emit_loop_cond_break(src, cnd, cx, false),
         " ", emit_loop_body_stmt(src, body, cx), " }"
       ]))
       _ -> None
     }
-    "__loop_until" -> match args_ {
+    InLoopUntil -> match args_ {
       [_, cnd, body] -> Some(concat_all([
         "for (;;) { ", emit_loop_body_stmt(src, body, cx),
         " ", emit_loop_cond_break(src, cnd, cx, true), " }"
       ]))
       _ -> None
     }
-    "__loop_repeat" -> match args_ {
+    InLoopRepeat -> match args_ {
       [_, n, body] -> Some(concat_all([
         "{ int64_t _lk = ", emit_loop_count(src, n, cx),
         "; for (; _lk > 0; _lk--) { ", emit_loop_body_stmt(src, body, cx),
@@ -7342,13 +7346,13 @@ fn emit_loop_core(src: String, name: String, args_: [Expr], cx: EmitCtx) : Optio
   }
 }
 
-fn emit_loop_bad(name: String) : String =
-  cat3("kai_unit() /* malformed loop intrinsic $", name, " */")
+fn emit_loop_bad(i: Intrinsic) : String =
+  cat3("kai_unit() /* malformed loop intrinsic $", intrinsic_name(i), " */")
 
 # A promoted var cell's write: assign the raw mutable local. A raw
 # value stores directly; a boxed value is unwrapped and consumed (the
 # store owns it, and a raw local carries no RC to hand it to).
-fn emit_cell_set(src: String, name: String, args_: [Expr], cx: EmitCtx) : String / Console {
+fn emit_cell_set(src: String, i: Intrinsic, args_: [Expr], cx: EmitCtx) : String / Console {
 
   let cell = cat2("kair_", cell_ref_name(args_))
   match args_ {
@@ -7359,7 +7363,7 @@ fn emit_cell_set(src: String, name: String, args_: [Expr], cx: EmitCtx) : String
         unbox_boxed_scalar("_cv", v.ty), "; kai_decref(_cv); kai_unit(); })"
       ])
     }
-    _ -> cat3("kai_unit() /* malformed cell set $", name, " */")
+    _ -> cat3("kai_unit() /* malformed cell set $", intrinsic_name(i), " */")
   }
 }
 
@@ -7400,10 +7404,10 @@ fn emit_expr_discard(src: String, x: Expr, cx: EmitCtx) : Option[String] / Conso
 
   match x.kind {
     EUnit -> Some("")
-    EIntrinsic(name, args_) ->
-      if is_cell_set(name) { Some(emit_cell_set_discard(src, name, args_, cx)) }
-      else if is_loop_intrinsic(name) { emit_loop_core(src, name, args_, cx) }
-      else { None }
+    EIntrinsic(i, args_) -> match i {
+      InCellSet -> Some(emit_cell_set_discard(src, i, args_, cx))
+      _         -> if is_loop_intrinsic(i) { emit_loop_core(src, i, args_, cx) } else { None }
+    }
     EIf(c, t, e_opt) -> Some(emit_if_discard(src, c, t, e_opt, cx))
     EBlock(stmts, opt_final) ->
       if emit_block_is_region(cx, x.line, x.col) { None }
@@ -7426,7 +7430,7 @@ fn emit_stmt_discard_or_drop(src: String, x: Expr, cx: EmitCtx) : String / Conso
 }
 
 # A discarded cell write: assign the raw local, no unit materialisation.
-fn emit_cell_set_discard(src: String, name: String, args_: [Expr], cx: EmitCtx) : String / Console {
+fn emit_cell_set_discard(src: String, i: Intrinsic, args_: [Expr], cx: EmitCtx) : String / Console {
 
   let cell = cat2("kair_", cell_ref_name(args_))
   match args_ {
@@ -7437,7 +7441,7 @@ fn emit_cell_set_discard(src: String, name: String, args_: [Expr], cx: EmitCtx) 
         unbox_boxed_scalar("_cv", v.ty), "; kai_decref(_cv); } "
       ])
     }
-    _ -> cat3("/* malformed cell set $", name, " */ ")
+    _ -> cat3("/* malformed cell set $", intrinsic_name(i), " */ ")
   }
 }
 

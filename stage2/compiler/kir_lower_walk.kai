@@ -36,7 +36,6 @@ import compiler.reuse_uses
 import compiler.kir_lower_raw
 import compiler.cell_promote
 import compiler.loop_lower
-import compiler.tailslots
 import compiler.kir_lower_bind
 import compiler.kir_lower_match
 import compiler.kir_lower_lit
@@ -435,17 +434,18 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
   # at its scalar type; a write stores the raw value and yields unit. A
   # loop intrinsic pastes its pred/body lambda bodies into an inline
   # block loop in the enclosing fn (the C emitter's `for (;;)` mirror).
-  EIntrinsic(inm, iargs) ->
-    if is_cell_get(inm) {
-      bind_op(st, KPrim(kir_raw_box_prim(x.ty), [KVar(lower_cell_reg(iargs, st))]), kpos_of(x))
-    }
-    else if is_cell_set(inm) { lower_cell_set(x, inm, iargs, st) }
-    else if is_loop_intrinsic(inm) { lower_loop_intrinsic(x, inm, iargs, st) }
-    else if inm == "resume_frame" { lower_resume_frame(x, iargs, st) }
-    else if inm == "seg_handle" { lower_seg_handle(x, iargs, st) }
-    else if inm == "seg_request" { lower_seg_request(x, iargs, st) }
-    else if tfslots_is_absent(inm) { LRes(KUnitV, st) }
-    else { lower_unhandled(x, st) }
+  EIntrinsic(inm, iargs) -> match inm {
+    InCellGet     -> bind_op(st, KPrim(kir_raw_box_prim(x.ty), [KVar(lower_cell_reg(iargs, st))]), kpos_of(x))
+    InCellSet     -> lower_cell_set(x, inm, iargs, st)
+    InLoopWhile   -> lower_loop_intrinsic(x, inm, iargs, st)
+    InLoopUntil   -> lower_loop_intrinsic(x, inm, iargs, st)
+    InLoopRepeat  -> lower_loop_intrinsic(x, inm, iargs, st)
+    InResumeFrame -> lower_resume_frame(x, iargs, st)
+    InSegHandle   -> lower_seg_handle(x, iargs, st)
+    InSegRequest  -> lower_seg_request(x, iargs, st)
+    InAbsent      -> LRes(KUnitV, st)
+    _             -> lower_unhandled(x, st)
+  }
 
   # Forms the resolve / desugar / typer passes rewrite away before codegen
   # (every pipe → ECall, `EIndex` → call, `EUnder`/`EPlaceholder`
@@ -661,14 +661,15 @@ fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # A promoted var cell: a read is the raw register itself (resolving an
   # active shadow rename, like an `EVar` read); the init forwards its raw
   # literal.
-  EIntrinsic(inm, iargs) ->
-    if is_cell_get(inm) { LRes(KVar(lower_cell_reg(iargs, st)), st) }
-    else if inm == "__cell_init" { match iargs {
+  EIntrinsic(inm, iargs) -> match inm {
+    InCellGet  -> LRes(KVar(lower_cell_reg(iargs, st)), st)
+    InCellInit -> match iargs {
       [init] -> lower_expr_raw(init, st)
       _      -> lower_scalar_unbox_border(x, st)
-    } }
-    else if tfslots_is_absent(inm) { lower_absent_raw(x, st) }
-    else { lower_scalar_unbox_border(x, st) }
+    }
+    InAbsent   -> lower_absent_raw(x, st)
+    _          -> lower_scalar_unbox_border(x, st)
+  }
   # The guard (`kir_node_is_raw`) only admits the FORMS above, so this arm is
   # reached only via internal recursion on a sub-operand the unbox pass left
   # boxed — lower it boxed and unbox-borrow its raw scalar (the box→raw
@@ -708,7 +709,7 @@ fn cell_unbox_prim(slot: KSlot) : String = match slot {
 # assigns). A raw value stores directly; a boxed value crosses the
 # border (borrowing unbox) and is then dropped — the store owns the
 # scalar, and a raw register carries no RC to hand the box to.
-fn lower_cell_set(x: Expr, inm: String, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
+fn lower_cell_set(x: Expr, inm: Intrinsic, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
   [_, v] -> {
     let reg = lower_cell_reg(iargs, st)
     match v.mode {
@@ -739,12 +740,13 @@ fn lower_cell_set(x: Expr, inm: String, iargs: [Expr], st: LowerSt) : LRes / Con
 # the backedge re-reads. RC inside the pasted bodies was computed under
 # the closure discipline (per-iteration balance), same as the C paste.
 
-fn lower_loop_intrinsic(x: Expr, inm: String, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
-  [_, a, b] ->
-    if inm == "__loop_while" { lower_loop_while(x, loop_arg_body(a), loop_arg_body(b), st) }
-    else if inm == "__loop_until" { lower_loop_until(x, loop_arg_body(a), loop_arg_body(b), st) }
-    else if inm == "__loop_repeat" { lower_loop_repeat(x, a, loop_arg_body(b), st) }
-    else { lower_unhandled(x, st) }
+fn lower_loop_intrinsic(x: Expr, inm: Intrinsic, iargs: [Expr], st: LowerSt) : LRes / Console = match iargs {
+  [_, a, b] -> match inm {
+    InLoopWhile  -> lower_loop_while(x, loop_arg_body(a), loop_arg_body(b), st)
+    InLoopUntil  -> lower_loop_until(x, loop_arg_body(a), loop_arg_body(b), st)
+    InLoopRepeat -> lower_loop_repeat(x, a, loop_arg_body(b), st)
+    _            -> lower_unhandled(x, st)
+  }
   _ -> lower_unhandled(x, st)
 }
 

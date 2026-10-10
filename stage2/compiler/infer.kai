@@ -22,6 +22,7 @@ import compiler.effect_default
 import compiler.type_text
 import compiler.sym_read
 import compiler.marks
+import compiler.intrinsics
 import compiler.diag_file
 import compiler.spawn_row
 import compiler.mutation_callees
@@ -41,7 +42,6 @@ import compiler.symtab_build
 import compiler.modules
 import compiler.module_table
 import compiler.loop_lower
-import compiler.tailslots
 import compiler.doc_attr
 import compiler.native_prims
 import compiler.builtin_types
@@ -8831,29 +8831,28 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
           }
           _ -> {
             let perr = mk_diag(SevError, st.file, e.line, e.col,
-              concat_all(["compiler intrinsic `$", nm, "` has a malformed argument list"]), [])
+              concat_all(["compiler intrinsic `$", intrinsic_name(nm), "` has a malformed argument list"]), [])
             render_diag(perr)
             inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
           }
         }
-      } else if nm == "resume_frame" {
-        synth_resume_frame(st, args_, e)
-      } else if nm == "resume_bad" {
-        report_resume_bad(st, args_, e)
-      } else if nm == "seg_handle" {
-        synth_seg_handle(st, args_, e)
-      } else if nm == "seg_request" {
-        synth_seg_request(st, args_, e)
-      } else if tfslots_is_absent(nm) {
-        let r = st_fresh_ty(st)
-        inferred_leaf(r.st, r.ty, e)
-      } else {
-        let perr = mk_diag(SevError, st.file, e.line, e.col,
-          concat_all(["compiler intrinsic `$", nm,
-                      "` is not valid in this position"]), [])
-        render_diag(perr)
-        inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
-      }
+      } else { match nm {
+        InResumeFrame -> synth_resume_frame(st, args_, e)
+        InResumeBad   -> report_resume_bad(st, args_, e)
+        InSegHandle   -> synth_seg_handle(st, args_, e)
+        InSegRequest  -> synth_seg_request(st, args_, e)
+        InAbsent -> {
+          let r = st_fresh_ty(st)
+          inferred_leaf(r.st, r.ty, e)
+        }
+        _ -> {
+          let perr = mk_diag(SevError, st.file, e.line, e.col,
+            concat_all(["compiler intrinsic `$", intrinsic_name(nm),
+                        "` is not valid in this position"]), [])
+          render_diag(perr)
+          inferred_leaf(st_bump_err(st_push_diag(st, perr)), TyAny, e)
+        }
+      } }
     # qualified call. rqc rewrites
     # `EField(EVar(mod), fname)` to `EModCall(mod, fname)` after
     # checking `fname` is in `mod`'s exports. Module fns register
@@ -10445,7 +10444,7 @@ fn synth_resume_frame(st: InferState, args_: [Expr], e: Expr) : Inferred / Conso
     let expected = TyFnT([s_ty], s_ty, Row { labels: [], tail: Some(fr.id), display_alias: None })
     let st1 = st_unify(st_set_sub(rf.st, fr.subst), expected, rf.ty, "deferred clause tail", e.line, e.col)
     let st2 = st_propagate_capability_labels(st1, apply_ty(st1.sub, rf.ty), e.line, e.col)
-    mk_inferred(st2, TyUnit, with_ty(mk_expr(EIntrinsic("resume_frame", [rf.expr]), e.line, e.col), TyUnit))
+    mk_inferred(st2, TyUnit, with_ty(mk_expr(EIntrinsic(InResumeFrame, [rf.expr]), e.line, e.col), TyUnit))
   }
   _ -> {
     let perr = mk_diag(SevError, st.file, e.line, e.col, "compiler intrinsic `$resume_frame` takes one argument", [])
@@ -10460,7 +10459,7 @@ fn synth_seg_request(st: InferState, args_: [Expr], e: Expr) : Inferred / Consol
   [ix, ...xs] -> {
     let ra = synth_many(st, xs)
     let r = st_fresh_ty(ra.st)
-    mk_inferred(r.st, r.ty, with_ty(mk_expr(EIntrinsic("seg_request", [with_ty(ix, TyInt), ...ra.exprs]), e.line, e.col), r.ty))
+    mk_inferred(r.st, r.ty, with_ty(mk_expr(EIntrinsic(InSegRequest, [with_ty(ix, TyInt), ...ra.exprs]), e.line, e.col), r.ty))
   }
   [] -> seg_error(st, e, "compiler intrinsic `$seg_request` takes an op index", "")
 }
@@ -10480,7 +10479,7 @@ fn synth_seg_handle(st: InferState, args_: [Expr], e: Expr) : Inferred / Console
     let rr = seg_lambda(rs.st, ret, [body_ty], rs.ty)
     let rc = seg_clauses(rr.st, cls, rt.expr, rs.ty, e_ty, 0, [])
     let st1 = seg_absorb(seg_absorb(rc.st, rt.ty, e), rr.ty, e)
-    let node = mk_expr(EIntrinsic("seg_handle", [esc, why, rt.expr, rr.expr, ...rc.exprs]), e.line, e.col)
+    let node = mk_expr(EIntrinsic(InSegHandle, [esc, why, rt.expr, rr.expr, ...rc.exprs]), e.line, e.col)
     mk_inferred(st1, rs.ty, with_ty(node, rs.ty))
   }
   _ -> seg_error(st, e, "compiler intrinsic `$seg_handle` has a malformed argument list", "")
@@ -10523,13 +10522,13 @@ fn seg_absorb(st: InferState, fn_ty: Ty, at: Expr) : InferState / Console + File
 type SegReq = { at: Expr, args: [Expr] }
 
 fn seg_request_at(e: Expr, i: Int) : Option[SegReq] = match e.kind {
-  EIntrinsic(nm, xs) -> if nm == "seg_request" { match xs {
+  EIntrinsic(InSegRequest, xs) -> match xs {
     [ix, ...args] -> match ix.kind {
       EInt(n, _) -> if n == i { Some(SegReq { at: e, args: args }) } else { None }
       _ -> None
     }
     [] -> None
-  } } else { seg_request_in(map(xp_positions(e), xpos_expr), i) }
+  }
   _ -> seg_request_in(map(xp_positions(e), xpos_expr), i)
 }
 
