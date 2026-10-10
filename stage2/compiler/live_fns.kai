@@ -3,90 +3,70 @@
 # A function runs when a decl that is not a function names it (the tests,
 # constants and effect default handlers), when the entry point does, or
 # when a running function does. A dispatcher picks an impl at run time, so one
-# that runs reaches every impl of an operation of its name. The answer
+# that runs reaches every impl of the operation it stands for. The answer
 # reads only the bodies of functions that run, so a build that lowered the
 # whole core and one that lowered only what the program reaches agree.
 
-import compiler.util
 import compiler.ast
-import compiler.entry
+import compiler.written
 import compiler.expr_positions
 import compiler.infer_index
-import compiler.emit_shared
+import compiler.proto_ids
 import compiler.core_reach
-import compiler.fnreg
 
-#[doc("The decls of `decls` that can run: every decl that is not a function, the entry point `entry`, and each function they name, transitively.")]
-pub fn live_decls(decls: [Decl], entry: SymId) : [Decl] = {
+#[doc("The decls of `decls` that can run: every decl that is not a function, the entry point `entry`, and each function they name, transitively. `ids` says which functions are dispatchers and impl methods.")]
+pub fn live_decls(decls: [Decl], ids: ProtoIds, entry: SymId) : [Decl] = {
   let fns = filter(decls, lf_is_fn)
-  let st0 = LfSt { live: idx_empty(), fns: lf_index(fns, idx_empty()), impls: lf_impls(fns, idx_empty()), work: [] }
-  let st = lf_drain(lf_decls(filter(decls, (d) => not lf_is_fn(d)), lf_seed(st0, fns, entry)))
-  filter(decls, (d) => not lf_is_fn(d) or lf_in(st.live, lf_name(d)))
+  let st0 = LfSt { live: idx_empty(), fns: lf_index(fns, idx_empty()), impls: lf_impls(fns, ids, idx_empty()), work: [] }
+  let st = lf_drain(lf_decls(filter(decls, (d) => not lf_is_fn(d)), lf_ref(st0, fnid_decl(entry))))
+  filter(decls, (d) => not lf_is_fn(d) or lf_in(st.live, lf_id(d)))
 }
 
-# Liveness is by name, so the entry point starts the walk under the name
-# it declares.
-fn lf_seed(st: LfSt, fns: [Decl], entry: SymId) : LfSt = match fns {
-  [] -> st
-  [d, ...rest] -> match d {
-    DFn(_, n, _, _, _, _, _, _, _, _, fid) -> if is_entry(entry, fid) { lf_ref(st, n) } else { lf_seed(st, rest, entry) }
-    _ -> lf_seed(st, rest, entry)
-  }
-}
-
-type LfSt = { live: NameIndex[String], fns: NameIndex[Decl], impls: NameIndex[LfImpl], work: [Decl] }
-
-# An impl's name, filed under one tail of it.
-type LfImpl = LfImpl(String, String)
+# `fns` holds each function under its declaration; `impls` each impl
+# method under the dispatcher of the operation it implements.
+type LfSt = { live: NameIndex[FnId], fns: NameIndex[Decl], impls: NameIndex[FnId], work: [Decl] }
 
 fn lf_is_fn(d: Decl) : Bool = match d {
-  DFn(_, _, _, _, _, _, _, _, _, _, _) -> true
+  DFn(_, _, _, _, _, _, _, _, _, _) -> true
   _ -> false
 }
 
-fn lf_name(d: Decl) : String = match d {
-  DFn(_, n, _, _, _, _, _, _, _, _, _) -> n
-  _ -> ""
+fn lf_id(d: Decl) : FnId = match d {
+  DFn(_, fid, _, _, _, _, _, _, _, _) -> fid
+  _ -> fnid_none()
 }
 
 fn lf_index(fns: [Decl], ix: NameIndex[Decl]) : NameIndex[Decl] = match fns {
   [] -> ix
-  [d, ...rest] -> lf_index(rest, idx_prepend(ix, lf_name(d), d))
+  [d, ...rest] -> lf_index(rest, idx_prepend_sym(ix, fnid_sym(lf_id(d)), d))
 }
 
-# Each impl `__pimpl_<P>_<T>_<op>` under every tail of its name that
-# follows an underscore, so an operation name finds it.
-fn lf_impls(fns: [Decl], ix: NameIndex[LfImpl]) : NameIndex[LfImpl] = match fns {
+fn lf_impls(fns: [Decl], ids: ProtoIds, ix: NameIndex[FnId]) : NameIndex[FnId] = match fns {
   [] -> ix
-  [d, ...rest] -> {
-    let n = lf_name(d)
-    let p = "__pimpl_"
-    lf_impls(rest, if string_starts_with_q(n, p) { lf_tails(n, string_length(p), ix) } else { ix })
-  }
+  [d, ...rest] -> lf_impls(rest, ids, match lf_impl_disp(ids, fnid_sym(lf_id(d))) {
+    Some(disp) -> idx_prepend_sym(ix, disp, lf_id(d))
+    None       -> ix
+  })
 }
 
-fn lf_tails(n: String, i: Int, ix: NameIndex[LfImpl]) : NameIndex[LfImpl] =
-  if i >= string_length(n) { ix }
-  else if string_byte_at_int(n, i) == 95 {
-    let tail = string_slice(n, i + 1, string_length(n) - i - 1)
-    lf_tails(n, i + 1, idx_prepend(ix, tail, LfImpl(tail, n)))
-  } else { lf_tails(n, i + 1, ix) }
+# The dispatcher that reaches the impl method `s`, or `None` when `s` is no impl method.
+fn lf_impl_disp(ids: ProtoIds, s: SymId) : Option[SymId] = match pid_impl(ids, s) {
+  Some(PIR(proto, _, op, _, _, _, _)) -> pid_op_disp(ids, proto, written_text(op))
+  None                                -> None
+}
 
-fn lf_in(ix: NameIndex[String], n: String) : Bool = list_has(idx_chain(ix, n), n)
+fn lf_in(ix: NameIndex[FnId], f: FnId) : Bool = any(idx_chain_sym(ix, fnid_sym(f)), (g) => fnid_eq(g, f))
 
-fn lf_ref(st: LfSt, n: String) : LfSt =
-  if lf_in(st.live, n) { st }
+fn lf_ref(st: LfSt, f: FnId) : LfSt =
+  if sym_raw(fnid_sym(f)) < 0 or lf_in(st.live, f) { st }
   else {
-    LfSt { ...st, live: idx_prepend(st.live, n, n),
-                  work: list_append(filter(idx_chain(st.fns, n), (d) => lf_name(d) == n), st.work) }
+    LfSt { ...st, live: idx_prepend_sym(st.live, fnid_sym(f), f),
+                  work: list_append(filter(idx_chain_sym(st.fns, fnid_sym(f)), (d) => fnid_eq(lf_id(d), f)), st.work) }
   }
 
-fn lf_op(st: LfSt, op: String) : LfSt = lf_impl_refs(st, op, idx_chain(st.impls, op))
-
-# Buckets are keyed by hash, so each entry re-tests the tail.
-fn lf_impl_refs(st: LfSt, op: String, xs: [LfImpl]) : LfSt = match xs {
+fn lf_refs(st: LfSt, fs: [FnId]) : LfSt = match fs {
   [] -> st
-  [LfImpl(tail, n), ...rest] -> lf_impl_refs(if tail == op { lf_ref(st, n) } else { st }, op, rest)
+  [f, ...rest] -> lf_refs(lf_ref(st, f), rest)
 }
 
 fn lf_drain(st: LfSt) : LfSt = match st.work {
@@ -94,9 +74,13 @@ fn lf_drain(st: LfSt) : LfSt = match st.work {
   [d, ...rest] -> lf_drain(lf_decls([d], LfSt { ...st, work: rest }))
 }
 
+# A function that runs and is a dispatcher reaches its operation's impls.
 fn lf_decls(ds: [Decl], st: LfSt) : LfSt = match ds {
   [] -> st
-  [d, ...rest] -> lf_decls(rest, lf_exprs(cr_decl_exprs(d), st))
+  [d, ...rest] -> {
+    let st1 = lf_exprs(cr_decl_exprs(d), st)
+    lf_decls(rest, lf_refs(st1, idx_chain_sym(st1.impls, fnid_sym(lf_id(d)))))
+  }
 }
 
 fn lf_exprs(es: [Expr], st: LfSt) : LfSt = match es {
@@ -105,13 +89,8 @@ fn lf_exprs(es: [Expr], st: LfSt) : LfSt = match es {
 }
 
 fn lf_expr(e: Expr, st: LfSt) : LfSt = match e.kind {
-  EName(n)        -> lf_ref(st, n)
-  ESym(_, _, n)  -> lf_ref(st, n)
-  EModCall(_, n) -> lf_ref(st, n)
-  ETodo(_)       ->
-    if proto_dispatch_marker_in(e) { match proto_dispatch_parts(e) { PDP(_, op) -> lf_op(st, op) } }
-    else { st }
-  _ -> lf_positions(xp_positions(e), st)
+  ESym(s, inst) -> lf_ref(st, FnId(s, inst))
+  _             -> lf_positions(xp_positions(e), st)
 }
 
 fn lf_positions(ps: [XPos], st: LfSt) : LfSt = match ps {

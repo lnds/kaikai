@@ -3,14 +3,11 @@
 # The unbox, Perceus and emit walks ask for a fn's entry or unboxed
 # signature once per decl and per call site, against one entry per
 # top-level fn in the whole program. The index buckets the registry by
-# bare name so a lookup runs over one name's entries instead of all of
-# them.
+# declaration so a lookup runs over one declaration's instances instead
+# of every entry.
 #
 # A chain is newest-first, and two modules sharing a basename register
-# the same (name, module) pair twice, so a reader states which of the two
-# it answers. A hash collision mixes foreign names into a chain; the
-# reader re-tests both name and module, so it costs a comparison, never
-# an answer.
+# one identity twice, so a reader states which of the two it answers.
 
 import compiler.infer_index
 import compiler.fnreg
@@ -23,15 +20,15 @@ import compiler.decl_names
 import compiler.core_builtin_sets
 import compiler.vec_raw
 
-#[doc("A function registry plus a hash index from bare name to the entries sharing it, the declared core builtins among its fns, the declared effects, the raw core primitives, and whether Vec reads take the bare-word paths.")]
-pub type FnIndex = { ix: NameIndex[EFn], sx: NameIndex[EFn], cs: NameIndex[EFn], all: [EFn], kai: [KaiBuiltin], effs: [SymId], raws: SymSet, vraw: VecRawCx }
+#[doc("A function registry plus a hash index from a declaration to its entries, one from an emitted C symbol to its entries, the declared core builtins among its fns, the declared effects, the raw core primitives, and whether Vec reads take the bare-word paths.")]
+pub type FnIndex = { sx: NameIndex[EFn], cs: NameIndex[EFn], all: [EFn], kai: [KaiBuiltin], effs: [SymId], raws: SymSet, vraw: VecRawCx }
 
 #[doc("The index over an empty registry.")]
-pub fn fnx_empty() : FnIndex = FnIndex { ix: idx_empty(), sx: idx_empty(), cs: idx_empty(), all: [], kai: [], effs: [], raws: sym_set_empty(), vraw: VrOff }
+pub fn fnx_empty() : FnIndex = FnIndex { sx: idx_empty(), cs: idx_empty(), all: [], kai: [], effs: [], raws: sym_set_empty(), vraw: VrOff }
 
 #[doc("Index a function registry so a signature lookup does not scan it.")]
 pub fn fnx_build(fns: [EFn]) : FnIndex =
-  FnIndex { ix: fnx_add(fns, idx_empty()), sx: fnx_add_sym(fns, idx_empty()),
+  FnIndex { sx: fnx_add_sym(fns, idx_empty()),
             cs: csym_index(fns), all: fns, kai: [], effs: [], raws: sym_set_empty(), vraw: VrOff }
 
 # Without the declared builtins a call to one still reaches it, through
@@ -50,7 +47,7 @@ pub fn fnx_with_vec_raw(fx: FnIndex, ds: [Decl]) : FnIndex = FnIndex { ...fx, vr
 
 fn fnx_effect_ids(ds: [Decl], acc: [SymId]) : [SymId] = match ds {
   [] -> acc
-  [DEffect(_, _, _, _, _, _, _, _, s), ...rest] -> fnx_effect_ids(rest, [s, ...acc])
+  [DEffect(_, s, _, _, _, _, _, _), ...rest] -> fnx_effect_ids(rest, [s, ...acc])
   [_, ...rest] -> fnx_effect_ids(rest, acc)
 }
 
@@ -71,27 +68,9 @@ fn fnx_sym_in(ss: [SymId], id: Int) : Bool = match ss {
 #[doc("The declared core builtin a call to `s` binds, or None when `s` names any other fn.")]
 pub fn fnx_kai(fx: FnIndex, s: FnId) : Option[KaiBuiltin] = kai_builtin_find(fx.kai, s)
 
-# A qualified lookup derives a key, and most programs declare no builtin.
-#[doc("The declared core builtin a call to `home.name` binds, or None when it names any other fn.")]
-pub fn fnx_kai_qualified(fx: FnIndex, home: String, name: String) : Option[KaiBuiltin] = match fx.kai {
-  [] -> None
-  _  -> match fnx_qualified(fx, home, name) {
-    Some(f) -> fnx_kai(fx, efn_sym(f))
-    None    -> None
-  }
-}
-
-fn fnx_add(fns: [EFn], ix: NameIndex[EFn]) : NameIndex[EFn] = match fns {
-  []           -> ix
-  [f, ...rest] -> match f {
-    EFn(n, _, _, _, _) -> fnx_add(rest, idx_prepend(ix, n, f))
-  }
-}
-
-# The same registry keyed by the declaration each entry instantiates. A
+# The registry keyed by the declaration each entry instantiates. A
 # bucket holds one declaration and its specialisations, told apart by
-# instance index — the name index needs a `(name, module)` test precisely
-# because a name bucket cannot tell two homonyms apart.
+# instance index.
 fn fnx_add_sym(fns: [EFn], ix: NameIndex[EFn]) : NameIndex[EFn] = match fns {
   []           -> ix
   [f, ...rest] -> match f {
@@ -115,10 +94,6 @@ pub fn fnx_ufn_sig_sym(fx: FnIndex, s: FnId) : Option[UFnSig] = match fnx_of_sym
 #[doc("The declaration a reference carrying identity `s` reaches. A local carries none and a builtin's reaches no declaration, so two homonymous declarations never trade places here.")]
 pub fn fnx_callee(fx: FnIndex, s: FnId) : Option[EFn] = fnx_of_sym(fx, s)
 
-#[doc("The fn `home` declares as `name`: a qualified reference names its declaration, never a homonym of another home.")]
-pub fn fnx_qualified(fx: FnIndex, home: String, name: String) : Option[EFn] =
-  fnx_of_sym(fx, fnid_decl(sym_derive(NCFn, name, home)))
-
 #[doc("The registry entry for the fn instance `s`: the declaration itself or one of its specialisations.")]
 pub fn fnx_of_sym(fx: FnIndex, s: FnId) : Option[EFn] = fnx_inst(idx_chain_sym(fx.sx, fnid_sym(s)), s)
 
@@ -141,27 +116,25 @@ fn efn_sig_of(e: Option[EFn]) : Option[UFnSig] = match e {
   None                       -> None
 }
 
-#[doc("The unboxed-signature classification of the fn declared as `name` by `mo`, if it has one; of a pair registered twice, the later.")]
-pub fn fnx_ufn_sig(fx: FnIndex, name: String, mo: Option[String]) : Option[UFnSig] =
-  fnx_sig_chain(idx_chain(fx.ix, name), name, mo)
+#[doc("The unboxed-signature classification of the first registry entry of the fn instance `s`: the one a scan of the registry in order finds.")]
+pub fn fnx_ufn_sig_first(fx: FnIndex, s: FnId) : Option[UFnSig] =
+  fnx_sig_oldest(idx_chain_sym(fx.sx, fnid_sym(s)), s, None)
 
-fn fnx_sig_chain(chain: [EFn], name: String, mo: Option[String]) : Option[UFnSig] = match chain {
-  []           -> None
+fn fnx_sig_oldest(chain: [EFn], s: FnId, found: Option[UFnSig]) : Option[UFnSig] = match chain {
+  []           -> found
   [f, ...rest] -> match f {
-    EFn(n, _, m2, sig, _) ->
-      if n == name and mo_eq(mo, m2) { sig } else { fnx_sig_chain(rest, name, mo) }
+    EFn(_, _, _, sig, id) -> fnx_sig_oldest(rest, s, if fnid_eq(id, s) { sig } else { found })
   }
 }
 
-#[doc("The unboxed-signature classification of the first registry entry declared as `name` by `mo`: the one a scan of the registry in order finds.")]
-pub fn fnx_ufn_sig_first(fx: FnIndex, name: String, mo: Option[String]) : Option[UFnSig] =
-  fnx_sig_oldest(idx_chain(fx.ix, name), name, mo, None)
+#[doc("TEMPORARY. A callee is `ESym(s, inst)` once the typer ran: ask `fnx_of_sym(fx, FnId(s, inst))` and delete the arm that reads a home and a name.")]
+pub fn fnx_qualified(fx: FnIndex, home: String, name: String) : Option[EFn] =
+  fnx_of_sym(fx, fnid_decl(sym_derive(NCFn, name, home)))
 
-fn fnx_sig_oldest(chain: [EFn], name: String, mo: Option[String], found: Option[UFnSig]) : Option[UFnSig] = match chain {
-  []           -> found
-  [f, ...rest] -> match f {
-    EFn(n, _, m2, sig, _) -> fnx_sig_oldest(rest, name, mo, if n == name and mo_eq(mo, m2) { sig } else { found })
-  }
+#[doc("TEMPORARY. See `fnx_qualified`: ask `fnx_kai(fx, FnId(s, inst))`.")]
+pub fn fnx_kai_qualified(fx: FnIndex, home: String, name: String) : Option[KaiBuiltin] = match fnx_qualified(fx, home, name) {
+  Some(f) -> fnx_kai(fx, efn_sym(f))
+  None    -> None
 }
 
 #[doc("The whole registry, in its original order — for the readers that need order or every entry.")]
