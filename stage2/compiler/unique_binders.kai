@@ -1,15 +1,18 @@
 #[doc("""
-Local binders made unique within each function body.
+Local binders made unique within each body, in two independent ways.
 
-A name bound more than once in a body — sibling match arms, a `let` or
-lambda param that shadows another binder — is respelled at every binding
-site but a parameter's, as `name__LINE_COL` (the binding position). A
-binder that is respelled, or whose id is bound more than once — code a
-pass cloned or inlined — takes the id minted from its spelling. Every
-read follows its binder. From here on, inside one body, two such binders
-share an id exactly when they share a spelling: an emitter spells one
-local per binder, and the ownership passes key their read tables on the
-id.
+An id bound at more than one site — code a pass cloned or inlined —
+is renumbered: each site but a parameter's takes an id of its own, made
+from the id and the binding position, and every read follows its
+binder. The ownership passes key their read tables on the id.
+
+A name bound more than once — sibling match arms, a `let` or lambda
+param that shadows another binder, a binder named like a handler-state
+alias beside a stateful handler — is respelled at every binding site
+but a parameter's, as `name__LINE_COL`. That spelling is the name the
+local is emitted under and nothing else: an emitter writes one local
+per binder, and two binders in scope together never share a spelling.
+No id is made from a spelling.
 """)]
 
 import compiler.ast
@@ -17,6 +20,7 @@ import compiler.ast_map
 import compiler.expr_positions
 import compiler.util
 import compiler.written
+import compiler.handler_alias
 
 # A binder in scope: the id it was declared with, and the binder it is now.
 type UbBind = UbBind(LocalId, Binder)
@@ -42,7 +46,7 @@ fn ub_decl(d: Decl) : Decl = match d {
 
 fn ub_body(body: Expr, params: [Binder]) : Expr = {
   let binders = list_append(params, ub_binders(body, []))
-  let multi = ub_repeated(map(binders, ub_text), [], [])
+  let multi = ub_repeated(list_append(ub_implicit(body), map(binders, ub_text)), [], [])
   let dups = ub_repeated_ids(map(binders, (b) => b.id), [], [])
   if list_is_empty(multi) and list_is_empty(dups) { body }
   else {
@@ -52,6 +56,15 @@ fn ub_body(body: Expr, params: [Binder]) : Expr = {
 }
 
 fn ub_text(b: Binder) : String = written_text(b.name)
+
+# The names a stateful handler binds in its clauses with no binder of
+# their own: a binder of the body spelled like one is a second binding.
+fn ub_implicit(body: Expr) : [String] = if ub_has_state(body) { user_state_aliases() } else { [] }
+
+fn ub_has_state(e: Expr) : Bool = match e.kind {
+  EHandle(_, _, _, Some(_), _, _, _) -> true
+  _ -> any(xp_positions(e), (p) => match p { XP(_, c) -> ub_has_state(c) })
+}
 
 fn ub_repeated(names: [String], seen: [String], acc: [String]) : [String] = match names {
   []            -> acc
@@ -177,14 +190,18 @@ fn ub_fresh(cand: String, taken: [String]) : String =
   if list_has(taken, cand) { ub_fresh(concat_all([cand, "_"]), taken) } else { cand }
 
 # The binder a binding site at `(line, col)` declares: respelled when its
-# name is bound more than once, and renumbered from its spelling when it
-# is respelled or its id is bound more than once.
+# name is bound more than once, renumbered when its id is.
 fn ub_rebound(b: Binder, line: Int, col: Int, cx: UbCx) : Binder = {
   let nm = ub_text(b)
   let to = ub_name(nm, line, col, cx)
-  if to != nm or ub_has_id(cx.dups, b.id) { Binder { id: local_minted(to), name: written(to) } }
-  else { b }
+  let dup = ub_has_id(cx.dups, b.id)
+  if to == nm and not dup { b }
+  else { Binder { id: if dup { ub_site_id(b.id, line, col) } else { b.id }, name: written(to) } }
 }
+
+# The id a binder takes at one of the sites its id is bound at.
+fn ub_site_id(l: LocalId, line: Int, col: Int) : LocalId =
+  local_minted(concat_all(["#", int_to_string(local_raw(l)), "@", int_to_string(line), ":", int_to_string(col)]))
 
 fn ub_bind(cx: UbCx, b: Binder, to: Binder) : UbCx =
   UbCx { env: [UbBind(b.id, to), ...cx.env], multi: cx.multi, dups: cx.dups, taken: cx.taken }

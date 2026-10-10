@@ -67,6 +67,7 @@ import compiler.loop_lower
 import compiler.fnreg
 import compiler.fn_index
 import compiler.fn_csym
+import compiler.enc_unit
 import compiler.infer
 import compiler.resolve
 import compiler.handler_alias
@@ -90,19 +91,29 @@ pub type BuildMode = BMBuild | BMTest | BMBench | BMCheck
 # The slot kinds are resolved once, from the declaring module, so every
 # consumer reads the same layout verdict instead of re-reading a payload
 # type name that a homonym elsewhere could shadow.
-#[doc("Emit-side variant table entry: declaring module, constructor name, arity, payload slot kinds, head tag.")]
-pub type VariantEntry = EV(Option[String], String, Int, [Int], Int)
+#[doc("Emit-side variant table entry: declaring module, constructor name, arity, payload slot kinds, head tag, and the constructor it lays out. The name is what the emitted cell carries and the tag hashes; the id is what a row is found by.")]
+pub type VariantEntry = EV(Option[String], String, Int, [Int], Int, SymId)
 
 # A `test` / `bench` / `check` block has no name to derive a symbol from,
 # so its runner is keyed on the declaring module plus its source position:
 # position alone collides across modules, and the collision silently fuses
-# two blocks' lifted lambdas into one. The symbol doubles as the enclosing
-# fn of everything lifted out of the block's body (lambdas, clauses), so
-# the collector and both backends must mint it here rather than each
-# rebuilding the string.
-#[doc("The runner symbol for a `test`/`bench`/`check` block, keyed on its module and source position.")]
-pub fn runner_enc_fn(kind: String, mo: Option[String], line: Int, col: Int) : String =
-  concat_all(["__", kind, "__", c_sym(concat_all([int_to_string(line), "_", int_to_string(col)]), mo)])
+# two blocks' lifted lambdas into one. The runner is the unit everything
+# lifted out of the block's body sits in, so the collector and both
+# backends mint it here.
+#[doc("The runner of a `test`/`bench`/`check` block of module `mo` at a source position, and its symbol.")]
+pub fn runner_enc_fn(kind: RunnerKind, mo: Option[String], line: Int, col: Int) : EncFn =
+  EncFn { unit: EuRunner(kind, mo, line, col),
+          sym: concat_all(["__", runner_word(kind), "__", c_sym(concat_all([int_to_string(line), "_", int_to_string(col)]), mo)]) }
+
+fn runner_word(kind: RunnerKind) : String = match kind {
+  RkTest  -> "test"
+  RkBench -> "bench"
+  RkCheck -> "check"
+}
+
+#[doc("The unit of the function `fid` that module `mo` declares, under the symbol `tab` and `specs` emit it with.")]
+pub fn fn_enc(tab: SymTab, specs: SpecNames, fid: FnId, mo: Option[String]) : EncFn =
+  enc_of_fn(fid, c_sym(written_text(fn_emit_name(tab, specs, fid)), mo))
 
 # A user fn's own C symbol lives in the `kaiu_` namespace so it can be
 # named after any runtime helper without redeclaring it. `c_sym` stays the
@@ -174,167 +185,6 @@ pub fn c_local(name: String) : String = string_concat("kaiv_", name)
 pub fn c_alias_id(alias: String) : String =
   concat_all(["kaiv_alias_", alias, "_id"])
 
-# One scan backs every variant-table lookup. `home` is the declaring
-# module the call site knows: `Some(m)` demands that exact entry, so two
-# modules declaring the same ctor name never read each other's arity or
-# payload layout. `None` means the site has only the bare name and takes
-# the first entry — the pre-namespace behaviour, still correct whenever
-# the name is unique in the program.
-# Resolution ladder over a name's entries, one scan: an exact (name, home)
-# match wins immediately; failing that, the name's single entry answers
-# whatever its home; a homeless entry answers a homed request (builtins and
-# root-file types register without a home). Two or more homed entries with
-# no exact match are a real ambiguity — first-entry-wins here is how one
-# homonym's cells got stamped with the other's slot layout, so the table
-# refuses to guess.
-fn evar_entry(vs: [VariantEntry], home: Option[String], target: String) : Option[VariantEntry] =
-  evar_resolve(vs, home, target, 0 - 1, None, None, "", 0)
-
-# `arity` of -1 accepts every entry of the name; a real arity narrows the
-# candidate set BEFORE the ladder runs, so two homonyms of different arity
-# never even count as an ambiguity.
-fn evar_resolve(vs: [VariantEntry], home: Option[String], target: String, arity: Int,
-                homeless: Option[VariantEntry], homed: Option[VariantEntry],
-                seen_homes: String, n: Int) : Option[VariantEntry] =
-  match vs {
-    [] ->
-      if n == 0 { None }
-      else if n == 1 { match homed { Some(_) -> homed None -> homeless } }
-      else { match homeless {
-        Some(_) -> homeless
-        None -> panic(concat_all(["ambiguous constructor '", target,
-                   "': declared by modules [", seen_homes,
-                   "] and the use site names no home — qualify the construction or the pattern"]))
-      } }
-    [h, ...rest] -> match h {
-      EV(hm, nm, ar, _, _) ->
-        if nm != target or (arity >= 0 and ar != arity) {
-          evar_resolve(rest, home, target, arity, homeless, homed, seen_homes, n)
-        }
-        else if evar_home_eq(hm, home) { Some(h) }
-        else { match hm {
-          None -> evar_resolve(rest, home, target, arity, Some(h), homed, seen_homes, n + 1)
-          Some(m) -> evar_resolve(rest, home, target, arity, homeless,
-                       match homed { Some(_) -> homed None -> Some(h) },
-                       if seen_homes == "" { m } else { concat_all([seen_homes, ", ", m]) },
-                       n + 1)
-        } }
-    }
-  }
-
-fn evar_home_eq(a: Option[String], b: Option[String]) : Bool = match a {
-  None    -> match b { None -> true  Some(_) -> false }
-  Some(x) -> match b { None -> false Some(y) -> x == y }
-}
-
-# A constructor qualifier the AST carries is not always a module: the
-# typer rewrites an ambiguous bare ctor to `EModCall(<type>, Ctor)`, so
-# the same slot may hold a type name. Resolving as a home first and
-# falling back to the bare name keeps both spellings working; only the
-# module reading disambiguates homonyms, and only it can match.
-#[doc("Arity of ctor `target` under a qualifier that may name either its module or its type.")]
-pub fn evar_find_qual(vs: [VariantEntry], qual: String, target: String) : Option[Int] =
-  match evar_entry(vs, Some(qual), target) {
-    Some(EV(_, _, ar, _, _)) -> Some(ar)
-    None                     -> evar_find(vs, target)
-  }
-
-#[doc("The home a constructor qualifier denotes, or None when it names the type rather than a module.")]
-pub fn evar_qual_home(vs: [VariantEntry], qual: String, target: String) : Option[String] =
-  match evar_entry(vs, Some(qual), target) {
-    Some(EV(hm, _, _, _, _)) -> hm
-    None                     -> None
-  }
-
-#[doc("Arity of ctor target as declared by `home`, or None when it is not a registered variant.")]
-pub fn evar_find_in(vs: [VariantEntry], home: Option[String], target: String) : Option[Int] =
-  match evar_entry(vs, home, target) {
-    None            -> None
-    Some(EV(_, _, ar, _, _)) -> Some(ar)
-  }
-
-#[doc("Variant-table lookup helper: find.")]
-pub fn evar_find(vs: [VariantEntry], target: String) : Option[Int] =
-  evar_find_in(vs, None, target)
-
-# When the call site knows no home, its ARITY still narrows which
-# homonym it means: two constructors sharing a name usually differ in
-# payload shape, and reading one's layout for the other is the
-# corruption this keying exists to remove. An arity matching no entry
-# falls back to the plain lookup.
-#[doc("The head tag of ctor `target` whose payload has `arity` slots, preferring the entry declared by `home`.")]
-pub fn evar_find_tag_arity(vs: [VariantEntry], home: Option[String], target: String, arity: Int) : Int =
-  match evar_entry_arity(vs, home, target, arity) {
-    Some(EV(_, _, _, _, t)) -> t
-    None                    -> evar_find_tag_in(vs, home, target)
-  }
-
-fn evar_entry_arity(vs: [VariantEntry], home: Option[String], target: String, arity: Int) : Option[VariantEntry] =
-  evar_resolve(vs, home, target, arity, None, None, "", 0)
-
-# The list returned here is walked in lockstep with the call site's
-# arguments, so a payload of a DIFFERENT arity is worse than none: the
-# walk runs off the end, every remaining slot classifies boxed, and a raw
-# Int64 slot receives a pointer the consumer then dereferences as an
-# integer. Fall back only when the fallback's arity still matches.
-#[doc("The payload slot kinds of ctor `target` with `arity` slots, preferring the entry declared by `home`.")]
-pub fn evar_slot_kinds_arity(vs: [VariantEntry], home: Option[String], target: String,
-                             arity: Int) : Option[[Int]] =
-  match evar_entry_arity(vs, home, target, arity) {
-    Some(EV(_, _, _, ks, _)) -> Some(ks)
-    None                     -> match evar_slot_kinds_in(vs, home, target) {
-      Some(ks) -> if list_length(ks) == arity { Some(ks) } else { None }
-      None     -> None
-    }
-  }
-
-# Falls back to 0 for an unknown name: call sites guard with `evar_find`
-# first, and the default only matters for a synthetic emit path that
-# stringifies a non-variant identifier into a kai_variant call shape.
-#[doc("The head tag of ctor target as declared by `home`, or 0 when it is not a registered variant.")]
-pub fn evar_find_tag_in(vs: [VariantEntry], home: Option[String], target: String) : Int =
-  match evar_entry(vs, home, target) {
-    None            -> 0
-    Some(EV(_, _, _, _, t)) -> t
-  }
-
-#[doc("Atom-style global variant tag lookup: the reserved tag for a builtin (0..10 per docs/variant-tags.md) or the hashed user-range tag.")]
-pub fn evar_find_tag(vs: [VariantEntry], target: String) : Int =
-  evar_find_tag_in(vs, None, target)
-
-#[doc("The head tag of ctor target with `arity` slots, preferring the entry declared by `home`, or None when unregistered.")]
-pub fn evar_find_tag_opt_arity(vs: [VariantEntry], home: Option[String], target: String, arity: Int) : Option[Int] =
-  match evar_entry_arity(vs, home, target, arity) {
-    None            -> None
-    Some(EV(_, _, _, _, t)) -> Some(t)
-  }
-
-#[doc("The head tag of ctor target as declared by `home`, or None when it is not a registered variant.")]
-pub fn evar_find_tag_opt_in(vs: [VariantEntry], home: Option[String], target: String) : Option[Int] =
-  match evar_entry(vs, home, target) {
-    None            -> None
-    Some(EV(_, _, _, _, t)) -> Some(t)
-  }
-
-# Match-side variant. Consumers (emit_pat_test_variant*, emit_bang) use
-# this to decide between the fast tag-compare path (`variant_tag == N`)
-# and the legacy strcmp fallback. The None branch protects synthetic AST
-# paths where a constructor name slipped through without registration.
-#[doc("Match-side variant. Returns Some(tag) when target is in the variants table, None otherwise.")]
-pub fn evar_find_tag_opt(vs: [VariantEntry], target: String) : Option[Int] =
-  evar_find_tag_opt_in(vs, None, target)
-
-#[doc("The payload slot kinds of ctor target as declared by `home`, or None when it is not a registered variant.")]
-pub fn evar_slot_kinds_in(vs: [VariantEntry], home: Option[String], target: String) : Option[[Int]] =
-  match evar_entry(vs, home, target) {
-    None                     -> None
-    Some(EV(_, _, _, ks, _)) -> Some(ks)
-  }
-
-#[doc("The payload slot kinds of ctor target, or None when it is not a registered variant.")]
-pub fn evar_slot_kinds(vs: [VariantEntry], target: String) : Option[[Int]] =
-  evar_slot_kinds_in(vs, None, target)
-
 #[doc("The slot kind at slot `i` of a kind list (0 boxed, 1 Int, 2 Real, 3 enum); 0 past its end.")]
 pub fn kind_at(ks: [Int], i: Int) : Int = match ks {
   []           -> 0
@@ -401,37 +251,60 @@ pub fn variant_has_primitive_slot(ks: [Int]) : Bool = match ks {
   [k, ...rest] -> if k != 0 { true } else { variant_has_primitive_slot(rest) }
 }
 
-#[doc("The fixed table of built-in variant constructors (Option/Result/etc.) every emit run seeds.")]
-pub fn builtin_variants() : [VariantEntry] =
-  # Phase 2 #440: builtins use empty type lists so the emitter falls
-  # back to the legacy boxed constructor path. Some/Ok/Err wrap an
-  # arbitrary boxed value; unboxing them would require a per-call-site
-  # type read which is not in scope for this lane.
-  #
-  # Tag assignment per docs/variant-tags.md. Builtins 0..10 are
-  # reserved; user code that matches against Sig*/Exited/Signaled
-  # (e.g. `match s { SigInt -> ... }`) needs these in the table so
-  # `evar_find_tag` resolves to the reserved value and not to a
-  # user-range tag. The runtime constructs these via stage0/runtime.h
-  # using the same convention, so producer and matcher agree.
-  # `Sig` and `Exit` are declared by the core module `effects/os.kai`, so
-  # their entries carry its home: a program constructor of the same name
-  # is a different constructor with its own tag and payload layout.
-  [EV(None, "Some", 1, [], 0), EV(None, "None", 0, [], 1),
-   EV(None, "Ok", 1, [], 2), EV(None, "Err", 1, [], 3),
-   EV(os_home(), "SigInt", 0, [], 4), EV(os_home(), "SigTerm", 0, [], 5), EV(os_home(), "SigHup", 0, [], 6),
-   EV(os_home(), "SigUsr1", 0, [], 7), EV(os_home(), "SigUsr2", 0, [], 8),
-   # Exited/Signaled carry an unboxed Int slot — the runtime constructs
-   # them via kai_variant_u with KAI_VAR_SLOT_INT, so the matcher must
-   # read slots[0].i64 not slots[0].ptr. Registering the payload type
-   # here drives emit_pat_test_variant through the typed (Phase 2 #440)
-   # slot-read path.
-   EV(os_home(), "Exited", 1, [1], 9),
-   EV(os_home(), "Signaled", 1, [1], 10),
-   EV(os_home(), "SigWinch", 0, [], 11)]
+# A row of the fixed table, and the runtime head of the sum it belongs to.
+type BuiltinRow = BR(VariantEntry, RtHead)
 
-# A core file's declarations take its basename as their home.
-fn os_home() : Option[String] = Some("os")
+#[doc("The fixed table of built-in variant constructors (Option/Result/etc.) every emit run seeds.")]
+pub fn builtin_variants() : [VariantEntry] = map(builtin_rows(), (r) => match r { BR(v, _) -> v })
+
+# The tags are reserved (docs/variant-tags.md) and the runtime builds
+# these cells itself, so producer and matcher agree by construction.
+# Some/Ok/Err wrap an arbitrary boxed value: no typed slot. Exited and
+# Signaled carry a raw Int slot, as the runtime writes them.
+fn builtin_rows() : [BuiltinRow] =
+  [core_row("Some", 1, 0, RhOption), core_row("None", 0, 1, RhOption),
+   core_row("Ok", 1, 2, RhResult), core_row("Err", 1, 3, RhResult),
+   os_row("SigInt", [], 4, RhSignal), os_row("SigTerm", [], 5, RhSignal), os_row("SigHup", [], 6, RhSignal),
+   os_row("SigUsr1", [], 7, RhSignal), os_row("SigUsr2", [], 8, RhSignal),
+   os_row("Exited", [1], 9, RhProcessExit), os_row("Signaled", [1], 10, RhProcessExit),
+   os_row("SigWinch", [], 11, RhSignal)]
+
+# A constructor the runtime builds and no module declares.
+fn core_row(name: String, arity: Int, tag: Int, head: RtHead) : BuiltinRow =
+  BR(EV(None, name, arity, [], tag, sym_derive(NCCtor, name, core_type_home())), head)
+
+# A constructor the core module `effects/os.kai` declares: a program
+# constructor of the same name is another constructor, with its own row.
+fn os_row(name: String, kinds: [Int], tag: Int, head: RtHead) : BuiltinRow =
+  BR(EV(Some(os_module_home()), name, list_length(kinds), kinds, tag, sym_derive(NCCtor, name, os_module_home())), head)
+
+fn builtin_row_of(c: SymId) : Option[BuiltinRow] =
+  find(builtin_rows(), (r) => match r { BR(v, _) -> sym_same(evar_sym(v), c) })
+
+# The runtime mints a core constructor's cells whatever module declares
+# the name, so its row lays out every declaration spelled like it. Which
+# declarations those are is the symbol table's to say.
+#[doc("The fixed row that lays out the declared constructor `c`, or None when `c` takes a row of its own.")]
+pub fn variant_absorber(tab: SymTab, c: SymId) : Option[VariantEntry] = match builtin_row_of(c) {
+  Some(BR(v, _)) -> Some(v)
+  None           -> if st_valid(tab, c) { suv_core_twin(sym_homonyms(tab, c)) } else { None }
+}
+
+fn suv_core_twin(homonyms: [SymId]) : Option[VariantEntry] = match homonyms {
+  []          -> None
+  [h, ...rest] -> match builtin_row_of(h) {
+    Some(BR(v, _)) -> match evar_home(v) {
+      None    -> Some(v)
+      Some(_) -> suv_core_twin(rest)
+    }
+    None -> suv_core_twin(rest)
+  }
+}
+
+fn suv_absorbed(tab: SymTab, c: SymId) : Bool = match variant_absorber(tab, c) {
+  Some(_) -> true
+  None    -> false
+}
 
 #[doc("First tag assigned to a user-declared variant. Mirrors KAI_USER_VARIANT_TAG_BASE in stage0/emit.c and user_variant_tag_base() in stage1/compiler.kai.")]
 pub fn user_variant_tag_base() : Int = 12
@@ -458,7 +331,7 @@ fn evar_key(home: Option[String], ctor: String) : String = match home {
 }
 
 fn evar_key_of(v: VariantEntry) : String = match v {
-  EV(hm, n, _, _, _) -> evar_key(hm, n)
+  EV(hm, n, _, _, _, _) -> evar_key(hm, n)
 }
 
 #[doc("The most user variant constructors one program may declare: the tag probe needs headroom in the uint16 range.")]
@@ -481,11 +354,10 @@ fn suv_declared_ctors(ds: [Decl], tab: SymTab, acc: Int) : Int = match ds {
 
 fn suv_own_ctors(vs: [Variant], home: Option[String], tab: SymTab, acc: Int) : Int = match vs {
   [] -> acc
-  [Var(c, _), ...rest] -> suv_own_ctors(rest, home, tab, if suv_is_builtin(home, suv_ctor_text(tab, c)) { acc } else { acc + 1 })
+  [Var(c, _), ...rest] -> suv_own_ctors(rest, home, tab, if suv_absorbed(tab, c) { acc } else { acc + 1 })
 }
 
-# The row keeps the constructor's name: the runtime tag hashes it and the
-# emitted cell carries it.
+# The name the runtime tag hashes and the emitted cell carries.
 fn suv_ctor_text(tab: SymTab, c: SymId) : String = written_text(sym_name(tab, c))
 
 #[doc("Register a declaration's variant constructors into the EVar table with stable name-keyed tags. `tab` names each constructor.")]
@@ -519,34 +391,15 @@ fn suv_pending_vs(vs: [Variant], home: Option[String], tab: SymTab, hs: TyHomeTa
     [] -> acc
     [v, ...rest] -> match v {
       Var(c, tys) -> {
-        let n = suv_ctor_text(tab, c)
-        if suv_is_builtin(home, n) {
+        if suv_absorbed(tab, c) {
           suv_pending_vs(rest, home, tab, hs, acc)
         } else {
           let ks = map(tys, (t) => payload_slot_kind(hs, home, t))
-          suv_pending_vs(rest, home, tab, hs, [EV(home, n, list_length(tys), ks, 0), ...acc])
+          suv_pending_vs(rest, home, tab, hs, [EV(home, suv_ctor_text(tab, c), list_length(tys), ks, 0, c), ...acc])
         }
       }
     }
   }
-}
-
-# A homeless builtin absorbs every declaration of its name; a homed one only
-# its own module's.
-fn suv_is_builtin(home: Option[String], ctor: String) : Bool =
-  suv_seen(builtin_variants(), None, ctor) or suv_seen(builtin_variants(), home, ctor)
-
-# Exact-key membership. Distinct from `evar_entry`, whose `None` home is
-# a wildcard for LOOKUP: at construction a homeless entry must not
-# absorb a homed one, or the collapse this keying removes comes back.
-fn suv_seen(vs: [VariantEntry], home: Option[String], ctor: String) : Bool = {
-  let k = evar_key(home, ctor)
-  suv_seen_loop(vs, k)
-}
-
-fn suv_seen_loop(vs: [VariantEntry], k: String) : Bool = match vs {
-  [] -> false
-  [h, ...rest] -> if evar_key_of(h) == k { true } else { suv_seen_loop(rest, k) }
 }
 
 # A builtin row has two writers on native: the runtime mints raw slots and a
@@ -557,10 +410,7 @@ fn suv_seen_loop(vs: [VariantEntry], k: String) : Bool = match vs {
 pub fn build_ctor_int_slots(decls: [Decl], tab: SymTab) : [CtorIntSlots] =
   cis_decls(decls, tab, type_home_table(decls, tab), map(builtin_variants(), cis_builtin))
 
-fn cis_builtin(v: VariantEntry) : CtorIntSlots = match v {
-  EV(Some(h), n, _, _, _) -> CIS(sym_derive(NCCtor, n, h), [])
-  EV(None, n, _, _, _)    -> CIS(sym_derive(NCCtor, n, core_type_home()), [])
-}
+fn cis_builtin(v: VariantEntry) : CtorIntSlots = CIS(evar_sym(v), [])
 
 fn cis_decls(ds: [Decl], tab: SymTab, hs: TyHomeTab, acc: [CtorIntSlots]) : [CtorIntSlots] = match ds {
   [] -> acc
@@ -571,14 +421,14 @@ fn cis_decls(ds: [Decl], tab: SymTab, hs: TyHomeTab, acc: [CtorIntSlots]) : [Cto
 fn cis_own(vs: [Variant], home: Option[String], tab: SymTab, hs: TyHomeTab, acc: [CtorIntSlots]) : [CtorIntSlots] = match vs {
   [] -> acc
   [Var(c, tys), ...rest] -> {
-    let flags = if suv_is_builtin(home, suv_ctor_text(tab, c)) { [] } else { map(tys, (t) => payload_slot_kind(hs, home, t) == 1) }
+    let flags = if suv_absorbed(tab, c) { [] } else { map(tys, (t) => payload_slot_kind(hs, home, t) == 1) }
     cis_own(rest, home, tab, hs, [CIS(c, flags), ...acc])
   }
 }
 
 # Sorted by the hash key, so probe order is independent of traversal
-# order. The sort is stable, so a repeated key (a builtin re-emitted by
-# core-inject) keeps its first declaration's arity/payload.
+# order. The sort is stable, so a constructor seen twice keeps its first
+# declaration's arity and payload.
 fn suv_sorted_unique(newest_first: [VariantEntry]) : [VariantEntry] =
   suv_unique(sort_by(list_reverse(newest_first), suv_cmp), [])
 
@@ -587,16 +437,16 @@ fn suv_cmp(a: VariantEntry, b: VariantEntry) : Int =
 
 fn suv_unique(vs: [VariantEntry], acc: [VariantEntry]) : [VariantEntry] = match (vs, acc) {
   ([], _) -> list_reverse(acc)
-  ([v, ...rest], [prev, ..._]) -> suv_unique(rest, if evar_key_of(prev) == evar_key_of(v) { acc } else { [v, ...acc] })
+  ([v, ...rest], [prev, ..._]) -> suv_unique(rest, if sym_same(evar_sym(prev), evar_sym(v)) { acc } else { [v, ...acc] })
   ([v, ...rest], []) -> suv_unique(rest, [v])
 }
 
 fn suv_assign(vs: [VariantEntry], used: [Int], acc: [VariantEntry]) : [VariantEntry] = match vs {
   [] -> acc
   [v, ...rest] -> match v {
-    EV(hm, n, ar, tys, _) -> {
+    EV(hm, n, ar, tys, _, c) -> {
       let t = suv_slot(evar_key(hm, n), used)
-      suv_assign(rest, [t, ...used], [EV(hm, n, ar, tys, t), ...acc])
+      suv_assign(rest, [t, ...used], [EV(hm, n, ar, tys, t, c), ...acc])
     }
   }
 }
@@ -737,26 +587,34 @@ pub fn pat_is_unboxable_lit_or_wild(p: Pattern) : Bool {
 # literal pattern. `EInt` → `<n>LL`, `EBool` → `0`/`1`,
 # `EChar` → numeric codepoint.
 
-# enc_fn (the post-monomorph, module-mangled symbol of the enclosing
-# fn / lambda) is the cross-module discriminator: `(line, col)` alone
-# collides when two modules have a lambda at the same source position,
-# so `find_lam` keys on `(enc_fn, line, col)`.
+# The enclosing unit is the cross-module discriminator: `(line, col)`
+# alone collides when two modules have a lambda at the same source
+# position, so `find_lam` keys on the unit and the position.
 #[doc("What a lifted body takes from the frame around it: the value of a local, or the handler id a cell alias names. The list order is the closure's capture array and a handle's env layout.")]
 pub type Capture = CapLocal(LocalId) | CapAlias(LocalId)
 
-#[doc("Lifted lambda descriptor (binder names of the enclosing declaration, enc_fn, line, col, params, captures, body, module) for closure emission.")]
-pub type LamInfo = LamInfo(LocalNames, String, Int, Int, [Param], [Capture], Expr, Option[String])
+#[doc("Lifted lambda descriptor (binder names of the enclosing declaration, enclosing unit, line, col, params, captures, body, module) for closure emission.")]
+pub type LamInfo = LamInfo(LocalNames, EncFn, Int, Int, [Param], [Capture], Expr, Option[String])
 
-# The lambda's C symbol derives from (enc_fn, line, col) — the same key
-# find_lam resolves — not from a program-global counter, so a lambda
-# added in one module cannot rename the lifted symbols of another.
-#[doc("C symbol of a lifted lambda at (enc_fn, line, col).")]
+# The lambda's C symbol derives from its enclosing unit's and its
+# position, not from a program-global counter, so a lambda added in one
+# module cannot rename the lifted symbols of another.
+#[doc("C symbol of a lifted lambda at a position inside the unit emitted as `enc_fn`.")]
 pub fn lam_symbol_at(enc_fn: String, line: Int, col: Int) : String =
   concat_all(["_kaiu_lam_", enc_fn, "_", int_to_string(line), "_", int_to_string(col)])
 
+#[doc("The unit of the lambda at a position inside `outer`, and its symbol.")]
+pub fn lam_enc(outer: EncFn, line: Int, col: Int) : EncFn =
+  EncFn { unit: EuLam(outer.unit, line, col), sym: lam_symbol_at(outer.sym, line, col) }
+
+#[doc("The unit a lifted lambda is.")]
+pub fn lam_unit(l: LamInfo) : EncFn = match l {
+  LamInfo(_, ef, ln, cl, _, _, _, _) -> lam_enc(ef, ln, cl)
+}
+
 #[doc("C symbol of a lifted lambda from its LamInfo.")]
 pub fn lam_symbol(l: LamInfo) : String = match l {
-  LamInfo(_, ef, ln, cl, _, _, _, _) -> lam_symbol_at(ef, ln, cl)
+  LamInfo(_, ef, ln, cl, _, _, _, _) -> lam_symbol_at(ef.sym, ln, cl)
 }
 
 #[doc("The binder names of the declaration a lifted lambda sits in: its body and its captures are spelled from them.")]
@@ -769,17 +627,28 @@ pub fn lam_locals(l: LamInfo) : LocalNames = match l {
 # share a position. The last param is the continuation. The captures are
 # what the handle's env threads in from its frame: the clause body is
 # free in them given its params and the state aliases it binds.
-#[doc("A handler clause lifted to a top-level function: (handle line, handle col, binder names of the enclosing declaration, head, params, body, stateful, enc_fn, captures, module, effect handled).")]
-pub type ClauseInfo = CI(Int, Int, LocalNames, ClauseHead, [Param], Expr, Bool, String, [Capture], Option[String], SymId)
+#[doc("A handler clause lifted to a top-level function: (handle line, handle col, binder names of the enclosing declaration, head, params, body, stateful, enclosing unit, captures, module, effect handled).")]
+pub type ClauseInfo = CI(Int, Int, LocalNames, ClauseHead, [Param], Expr, Bool, EncFn, [Capture], Option[String], SymId)
 
 #[doc("The symbol a handler clause's body lifts into; it is the enclosing fn of the lambdas and handles nested in that body.")]
 pub fn clause_body_sym(enc_fn: String, line: Int, col: Int, head: ClauseHead) : String =
   if is_lifecycle_clause(head) { user_cleanup_sym(enc_fn, line, col) }
   else { user_clause_sym(enc_fn, line, col, clause_head_word(head)) }
 
+#[doc("The unit a clause of the handle at a position inside `outer` lifts into, and its symbol: it is the enclosing unit of the lambdas and handles nested in the clause's body.")]
+pub fn clause_enc(outer: EncFn, line: Int, col: Int, head: ClauseHead) : EncFn =
+  EncFn { unit: if is_lifecycle_clause(head) { EuFinally(outer.unit, line, col) }
+                else { EuClause(outer.unit, line, col, clause_head_word(head)) },
+          sym: clause_body_sym(outer.sym, line, col, head) }
+
+#[doc("The unit a recorded clause's body lifts into.")]
+pub fn clause_unit(c: ClauseInfo) : EncFn = match c {
+  CI(line, col, _, head, _, _, _, enc_fn, _, _, _) -> clause_enc(enc_fn, line, col, head)
+}
+
 #[doc("The symbol a recorded clause's body lifts into.")]
 pub fn clause_sym(c: ClauseInfo) : String = match c {
-  CI(line, col, _, head, _, _, _, enc_fn, _, _, _) -> clause_body_sym(enc_fn, line, col, head)
+  CI(line, col, _, head, _, _, _, enc_fn, _, _, _) -> clause_body_sym(enc_fn.sym, line, col, head)
 }
 
 #[doc("The binder names of the declaration a recorded clause sits in.")]
@@ -802,13 +671,13 @@ pub fn clause_mo(c: ClauseInfo) : Option[String] = match c {
   CI(_, _, _, _, _, _, _, _, _, mo, _) -> mo
 }
 
-#[doc("Look up a lifted lambda by enclosing fn + source position. The (enc_fn, line, col) triple is unique even when two modules share a lambda at the same line/col.")]
-pub fn find_lam(lams: [LamInfo], enc_fn: String, line: Int, col: Int) : Option[LamInfo] {
+#[doc("Look up a lifted lambda by its enclosing unit and source position: unique even when two modules share a lambda at the same line/col.")]
+pub fn find_lam(lams: [LamInfo], enc_fn: EncFn, line: Int, col: Int) : Option[LamInfo] {
   match lams {
     [] -> None
     [l, ...rest] -> match l {
       LamInfo(_, ef, ln, cl, _, _, _, _) ->
-        if ef == enc_fn and ln == line and cl == col { Some(l) }
+        if ln == line and cl == col and enc_same(ef, enc_fn) { Some(l) }
         else { find_lam(rest, enc_fn, line, col) }
     }
   }
@@ -1127,20 +996,20 @@ pub fn fv_stmt(s: Stmt, own: [Binder], outer: FvOuter, acc: [Capture]) : [Captur
 
 # ---- lambda collection pass ----
 
-# `cur_enc_fn` is the emitted symbol of the fn / lambda / clause / runner
-# the walker is inside: a handle stamps it on each clause it records, so
-# the install site and the clause body mint the same symbol. `cur_mo` is
+# `cur_enc_fn` is the fn / lambda / clause / runner the walker is inside:
+# a handle stamps it on each clause it records, so the install site and
+# the clause body mint the same symbol. `cur_mo` is
 # that fn's module, carried raw because a lifted body is emitted from a
 # side table with no declaration to read it off. `locals` names the
 # binders of the declaration being walked, for the lifted bodies' text.
-#[doc("Lambda-collect state: the lambdas and clauses lifted so far, the binders in scope at the walk position, the enclosing fn's symbol and module, the binder names of the declaration being walked, and the tables a fn's symbol is spelled from.")]
+#[doc("Lambda-collect state: the lambdas and clauses lifted so far, the binders in scope at the walk position, the enclosing unit and its module, the binder names of the declaration being walked, and the tables a fn's symbol is spelled from.")]
 pub type LamCollect = { lams: [LamInfo], clauses: [ClauseInfo],
-                    scope: FvOuter, cur_enc_fn: String, cur_mo: Option[String],
+                    scope: FvOuter, cur_enc_fn: EncFn, cur_mo: Option[String],
                     locals: LocalNames, tab: SymTab, specs: SpecNames }
 
 #[doc("Lambda-collect state helper: new. `tab` and `specs` spell each walked fn's symbol.")]
 pub fn lc_new(tab: SymTab, specs: SpecNames) : LamCollect =
-  LamCollect { lams: [], clauses: [], scope: fv_outer_empty(), cur_enc_fn: "", cur_mo: None,
+  LamCollect { lams: [], clauses: [], scope: fv_outer_empty(), cur_enc_fn: enc_none(), cur_mo: None,
                locals: ln_empty(), tab: tab, specs: specs }
 
 # Snapshot the scope at entry of a scope-introducing form (fn body,
@@ -1197,7 +1066,7 @@ pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
       let outer_scope = st.scope
       let st1 = LamCollect { ...st, lams: [info, ...st.lams],
                              scope: fv_outer_bind(outer_scope, own),
-                             cur_enc_fn: lam_symbol_at(outer_enc_fn, x.line, x.col) }
+                             cur_enc_fn: lam_enc(outer_enc_fn, x.line, x.col) }
       let st2 = collect_expr(body, st1)
       LamCollect { ...st2, scope: outer_scope, cur_enc_fn: outer_enc_fn, cur_mo: st.cur_mo }
     }
@@ -1275,9 +1144,9 @@ fn collect_loop_args(args_: [Expr], st: LamCollect) : LamCollect / Console = mat
   }
 }
 
-#[doc("Append one ClauseInfo per clause of the handle at (hline, hcol), which handles `esym` inside the fn `enc_fn`.")]
+#[doc("Append one ClauseInfo per clause of the handle at (hline, hcol), which handles `esym` inside the unit `enc_fn`.")]
 pub fn lc_record_clauses(cs: [HClause], esym: SymId, stateful: Bool,
-                     hline: Int, hcol: Int, enc_fn: String,
+                     hline: Int, hcol: Int, enc_fn: EncFn,
                      st: LamCollect) : LamCollect / Console {
 
   match cs {
@@ -1306,7 +1175,7 @@ pub fn collect_hclauses(cs: [HClause], hline: Int, hcol: Int, st: LamCollect) : 
     [c, ...rest] -> match c {
       HC(head, _, body, _, _) -> {
         let outer_enc_fn = st.cur_enc_fn
-        let body_st = enter_enc_fn(st, clause_body_sym(outer_enc_fn, hline, hcol, head), st.cur_mo)
+        let body_st = enter_enc_fn(st, clause_enc(outer_enc_fn, hline, hcol, head), st.cur_mo)
         collect_hclauses(rest, hline, hcol, restore_enc_fn(collect_expr(body, body_st), outer_enc_fn))
       }
     }
@@ -1410,21 +1279,21 @@ pub fn collect_stmt(s: Stmt, st: LamCollect) : LamCollect / Console {
   }
 }
 
-# The walker swaps the enclosing fn's symbol on the way in and restores
-# the parent's on the way out, so siblings stamp their own clauses
-# against the right scope.
-#[doc("Enter the fn / lambda / clause / runner whose emitted symbol is `name`, declared by module `mo`.")]
-pub fn enter_enc_fn(st: LamCollect, name: String, mo: Option[String]) : LamCollect =
-  LamCollect { ...st, cur_enc_fn: name, cur_mo: mo }
+# The walker swaps the enclosing unit on the way in and restores the
+# parent's on the way out, so siblings stamp their own clauses against
+# the right scope.
+#[doc("Enter the fn / lambda / clause / runner `enc`, declared by module `mo`.")]
+pub fn enter_enc_fn(st: LamCollect, enc: EncFn, mo: Option[String]) : LamCollect =
+  LamCollect { ...st, cur_enc_fn: enc, cur_mo: mo }
 
-#[doc("Restore the enclosing-function name in clause-lookup state after a nested walk.")]
-pub fn restore_enc_fn(st: LamCollect, name: String) : LamCollect =
-  LamCollect { ...st, cur_enc_fn: name }
+#[doc("Restore the enclosing unit in clause-lookup state after a nested walk.")]
+pub fn restore_enc_fn(st: LamCollect, enc: EncFn) : LamCollect =
+  LamCollect { ...st, cur_enc_fn: enc }
 
 # Walk a fn / test / bench / check body under its symbol, restoring the
 # surrounding enclosing fn and lexical scope on the way out. The scope
 # starts from the body's own params: an outer local is not in scope.
-fn collect_body(body: Expr, params: [Binder], enc: String,
+fn collect_body(body: Expr, params: [Binder], enc: EncFn,
                 mo: Option[String], st: LamCollect) : LamCollect / Console {
   let outer = st.cur_enc_fn
   let outer_scope = st.scope
@@ -1444,17 +1313,17 @@ fn collect_decl_body(d: Decl, st: LamCollect) : LamCollect / Console {
 
   match d {
     DFn(_, fid, _, ps, _, _, body, _, _, mo) ->
-      collect_body(body, params_binders(ps), c_sym(written_text(fn_emit_name(st.tab, st.specs, fid)), mo), mo, st)
+      collect_body(body, params_binders(ps), fn_enc(st.tab, st.specs, fid, mo), mo, st)
     DType(_, _, _, _, _, _, _, _) -> st
-    # The runner symbol the backends will emit is also the enclosing-fn
-    # key for everything lifted out of the block's body, so the collector
-    # mints it from the same `runner_enc_fn` both backends call.
+    # The runner the backends will emit is also the enclosing unit of
+    # everything lifted out of the block's body, so the collector mints
+    # it from the same `runner_enc_fn` both backends call.
     DTest(_, body, line, col, mo) ->
-      collect_body(body, [], runner_enc_fn("test", mo, line, col), mo, st)
+      collect_body(body, [], runner_enc_fn(RkTest, mo, line, col), mo, st)
     DBench(_, body, line, col, mo) ->
-      collect_body(body, [], runner_enc_fn("bench", mo, line, col), mo, st)
+      collect_body(body, [], runner_enc_fn(RkBench, mo, line, col), mo, st)
     DCheck(_, ps, body, line, col, mo) ->
-      collect_body(body, params_binders(ps), runner_enc_fn("check", mo, line, col), mo, st)
+      collect_body(body, params_binders(ps), runner_enc_fn(RkCheck, mo, line, col), mo, st)
     DImport(_, _, _) -> st
     DEffect(_, _, _, _, _, _, _, _) -> st
     DProtocol(_, _, _, _, _, _, _) -> st
@@ -1488,16 +1357,19 @@ pub fn collect_decls(ds: [Decl], st: LamCollect) : LamCollect / Console {
 }
 
 #[doc("The name a row's constructor is emitted with.")]
-pub fn evar_name(v: VariantEntry) : String = match v { EV(_, n, _, _, _) -> n }
+pub fn evar_name(v: VariantEntry) : String = match v { EV(_, n, _, _, _, _) -> n }
 
 #[doc("The module that declares a row's constructor; None for the root file's and the runtime's.")]
-pub fn evar_home(v: VariantEntry) : Option[String] = match v { EV(hm, _, _, _, _) -> hm }
+pub fn evar_home(v: VariantEntry) : Option[String] = match v { EV(hm, _, _, _, _, _) -> hm }
 
 #[doc("The number of payload slots of a row's constructor.")]
-pub fn evar_arity(v: VariantEntry) : Int = match v { EV(_, _, ar, _, _) -> ar }
+pub fn evar_arity(v: VariantEntry) : Int = match v { EV(_, _, ar, _, _, _) -> ar }
 
 #[doc("The payload slot kinds of a row's constructor.")]
-pub fn evar_kinds(v: VariantEntry) : [Int] = match v { EV(_, _, _, ks, _) -> ks }
+pub fn evar_kinds(v: VariantEntry) : [Int] = match v { EV(_, _, _, ks, _, _) -> ks }
+
+#[doc("The constructor a row lays out.")]
+pub fn evar_sym(v: VariantEntry) : SymId = match v { EV(_, _, _, _, _, c) -> c }
 
 # ---- lambda helper emission ----
 
@@ -1511,17 +1383,12 @@ pub fn op_args_only(params: [Param]) : [Param] {
 }
 
 #[doc("The success-side variant constructor a postfix-! expression unwraps.")]
-pub fn bang_success_variant(opt_ty: Option[Ty]) : Option[String] {
-  match opt_ty {
-    None -> None
-    Some(t) -> match t {
-      TyCon(tcs, _) ->
-        if core_ty_is(tcs, CtOption) { Some("Some") }
-        else if core_ty_is(tcs, CtResult) { Some("Ok") }
-        else { None }
-      _ -> None
-    }
-  }
+pub fn bang_success_ctor(opt_ty: Option[Ty]) : Option[SymId] = match opt_ty {
+  Some(TyCon(tcs, _)) ->
+    if core_ty_is(tcs, CtOption) { Some(sym_derive(NCCtor, "Some", core_type_home())) }
+    else if core_ty_is(tcs, CtResult) { Some(sym_derive(NCCtor, "Ok", core_type_home())) }
+    else { None }
+  _ -> None
 }
 
 # m7a #6b/#6c: lower `handle { body } with Eff [as alias] { clauses }`
@@ -1581,7 +1448,7 @@ pub fn any_use_of(uses: [Use], l: LocalId) : Bool {
 # m12.7.x FFI v1: enumeration of the supported return kinds plus an
 # escape hatch (`FfiRetUnknown`) carrying the offending type name so
 # the emitted `#error` can name it back to the user.
-#[doc("FFI marshalling kind of a boundary type: scalars (Int/Real/Bool/String/Unit), fixed-width annotations (`FfiRetFixed`), struct-by-value (`FfiRetStruct`, carrying the declared name — fields looked up in the extern-type registry), and opaque handles (`FfiRetForeign`). `FfiRetUnknown` carries the offending type name so the emitted `#error` can name it.")]
+#[doc("FFI marshalling kind of a boundary type: scalars (Int/Real/Bool/String/Unit), fixed-width annotations (`FfiRetFixed`), struct-by-value (`FfiRetStruct`, carrying the struct's declaration — fields looked up in the extern-type registry), and opaque handles (`FfiRetForeign`, carrying the handle's). `FfiRetUnknown` carries the offending type name so the emitted `#error` can name it.")]
 pub type FfiRetKind
   = FfiRetUnit
   | FfiRetInt
@@ -1596,8 +1463,8 @@ pub type FfiRetKind
   # the kaikai side is a tagged fixed-width box, so marshalling reads its
   # width field and re-boxes with the matching constructor.
   | FfiRetFixedVal(Ty)
-  | FfiRetStruct(String)
-  | FfiRetForeign(String)
+  | FfiRetStruct(SymId)
+  | FfiRetForeign(SymId)
   | FfiRetUnknown(String)
 
 #[doc("A fixed-width FFI-boundary scalar. Maps to a C `uintN_t`/`intN_t`/`float` at the boundary; the kaikai side stays `Int` (or `Real` for `F32`). C-cast semantics, no range-check.")]
@@ -1738,9 +1605,9 @@ pub fn ffi_kind_of_ty(t: TypeExpr, tab: SymTab) : FfiRetKind {
 # fast path. `None` means the impl already has the boxed
 # `KaiValue*(...)` shape (String / Unit / List / Option / Result); it is
 # registered directly unless it borrows a param. See `emit_impl_shim_defs`.
-#[doc("Row for one impl method of a core protocol: the C symbol name, the protocol, the name of the impl's target type (head), the impl fn's arity, its unboxed signature (Some when scalar, None when boxed), op name, impl home, and the param positions Perceus made borrowed.")]
-pub type PimplRow = PR(String, CoreProto, String, Int, Option[UFnSig], String, Option[String], [Int])
-#                  c_sym    proto   type_name arity      unboxed sig   op_name impl home      lent
+#[doc("Row for one impl method of a core protocol: the C symbol name, the protocol, the type the impl targets, the impl fn's arity, its unboxed signature (Some when scalar, None when boxed), op name, and the param positions Perceus made borrowed.")]
+pub type PimplRow = PR(String, CoreProto, DeclRef, Int, Option[UFnSig], String, [Int])
+#                  c_sym    proto      target   arity      unboxed sig   op_name lent
 
 #[doc("The rows of the impl methods among `ds`. `ids` says which functions are impl methods, of which protocol, type and operation; `fns` is the EFn registry, holding each fn's unboxed signature (the unbox pass stamps it there); `tab` spells the name each fn is emitted under.")]
 pub fn collect_pimpl_rows(ds: [Decl], fns: [EFn], tab: SymTab, ids: ProtoIds, acc: [PimplRow]) : [PimplRow] =
@@ -1768,16 +1635,16 @@ fn pimpl_row_of(fx: FnIndex, fid: FnId, tab: SymTab, ids: ProtoIds, params: [Par
     Some(PIR(proto, target, op, _, _, _, _)) -> match core_proto_of(proto) {
       Some(cp) -> {
         let sig = fnx_ufn_sig_first(fx, fid)
-        Some(PR(c_sym(written_text(decl_name(tab, fnid_sym(fid))), mo), cp, pimpl_target_text(tab, target),
-                list_length(params), sig, written_text(op), mo, pimpl_lent(params, pimpl_raw_flags(sig), 0)))
+        Some(PR(c_sym(written_text(decl_name(tab, fnid_sym(fid))), mo), cp, target,
+                list_length(params), sig, written_text(op), pimpl_lent(params, pimpl_raw_flags(sig), 0)))
       }
       None -> None
     }
     None -> None
   } }
 
-# The name the runtime head of an impl's target is looked up under.
-fn pimpl_target_text(tab: SymTab, r: DeclRef) : String = match r {
+#[doc("The name an impl's target is emitted under: a comment beside its row.")]
+pub fn pimpl_target_text(tab: SymTab, r: DeclRef) : String = match r {
   DrSym(s)        -> written_text(decl_name(tab, s))
   DrWritten(_, n) -> written_text(n)
 }
@@ -1808,7 +1675,7 @@ fn pimpl_raw_flags(sig: Option[UFnSig]) : [Bool] = match sig {
 }
 
 #[doc("The param positions the impl borrows; the dispatch table hands every argument owned, so its adapter drops these after the call.")]
-pub fn pimpl_row_lent(pr: PimplRow) : [Int] = match pr { PR(_, _, _, _, _, _, _, lent) -> lent }
+pub fn pimpl_row_lent(pr: PimplRow) : [Int] = match pr { PR(_, _, _, _, _, _, lent) -> lent }
 
 #[doc("True when the impl cannot sit in the dispatch table as is: its ABI is raw, or it borrows a param the table hands over owned.")]
 pub fn pimpl_row_needs_adapter(pr: PimplRow) : Bool = pimpl_row_is_unboxed(pr) or pimpl_row_lent(pr) != []
@@ -1816,7 +1683,7 @@ pub fn pimpl_row_needs_adapter(pr: PimplRow) : Bool = pimpl_row_is_unboxed(pr) o
 #[doc("True when this pimpl row has an unboxed (raw-scalar) C signature and so needs a boxed shim before it can be registered in the impl table. A row is unboxed when the unbox pass classified it (`Some(US ...)`) AND it touches a raw scalar at the ABI boundary — either a scalar PARAM or a scalar RETURN. The return-only branch covers arity-0 impls like `Default` (`Default_Int_default() : Int` is emitted `i64 ()*` but the impl table bitcasts the slot to `%KaiValue* ()*` — clang's LLVM verifier rejects the mismatch; the C backend gets an implicit cast and only the LLVM smoke test catches it). issue fix-default-shim.")]
 pub fn pimpl_row_is_unboxed(pr: PimplRow) : Bool {
   match pr {
-    PR(_, _, _, _, sig, _, _, _) -> match sig {
+    PR(_, _, _, _, sig, _, _) -> match sig {
       None -> false
       Some(US(pts, rt, _)) -> any_param_scalar(pts) or ty_is_scalar(rt)
     }
@@ -1890,21 +1757,20 @@ pub fn find_substring(hay: String, needle: String, from: Int) : Int {
 # Tags are sparse (name-keyed), so no dense slot-per-tag array exists;
 # the runtime builds its indexed lookup from explicit (tag, head) pairs.
 #[doc("Variant-to-head map as flattened (variant_tag, head_tag) pairs, one pair per EVar entry. The runtime rebuilds its dense lookup from these; pairs impose no density assumption on the tag space.")]
-pub fn collect_variant_to_head(variants: [VariantEntry], decls: [Decl], tab: SymTab) : [Int] =
-  collect_v2h_pairs(variants, decls, tab, [])
+pub fn collect_variant_to_head(variants: [VariantEntry], decls: [Decl]) : [Int] =
+  collect_v2h_pairs(variants, decls, [])
 
-fn collect_v2h_pairs(vs: [VariantEntry], decls: [Decl], tab: SymTab, acc: [Int]) : [Int] {
+fn collect_v2h_pairs(vs: [VariantEntry], decls: [Decl], acc: [Int]) : [Int] {
   match vs {
     [] -> list_reverse(acc)
-    [EV(hm, name, _, _, tag), ...rest] ->
-      collect_v2h_pairs(rest, decls, tab, [variant_head_tag_for_in(hm, name, decls, tab), tag, ...acc])
+    [EV(_, _, _, _, tag, c), ...rest] -> collect_v2h_pairs(rest, decls, [variant_head_tag(c, decls), tag, ...acc])
   }
 }
 
-#[doc("Integer head tag for a builtin type name (Int -> 3, Real -> 4, Bool -> 2, ...) or a user record/sum type (dense, >= 20); -1 for unknown types. The runtime-table identity backing both LLVM-text (`_kai_proto_init_llvm`) and in-process native emission. Pub for unit testing.")]
-pub fn stdlib_head_tag_int(home: Option[String], tname: String, decls: [Decl], tab: SymTab) : Int = match rt_head_named(tname) {
-  Some(h) -> rt_head_tag(h)
-  None    -> impl_target_head_tag(home, tname, decls, tab)
+# A fixed row's sum has a reserved head; a declared constructor's is its declaration's.
+fn variant_head_tag(c: SymId, decls: [Decl]) : Int = match builtin_row_of(c) {
+  Some(BR(_, h)) -> rt_head_tag(h)
+  None           -> ctor_owner_head_tag(c, decls)
 }
 
 #[doc("The id the runtime impl table numbers the core protocol `p` with. The integer counterpart of `stdlib_proto_id_c`, shared by both the LLVM-text and in-process native impl-table registration.")]
@@ -1972,25 +1838,6 @@ pub fn pdp_op_id_int(parts: ProtoDispatchParts) : Int = match parts {
     None     -> 0
   }
 }
-
-#[doc("For a constructor `name`, find the sum type it belongs to and look up that sum's head tag. Builtins use the reserved ids; user sums resolve to their declaration's dense head tag.")]
-pub fn variant_head_tag_for(name: String, decls: [Decl], tab: SymTab) : Int =
-  variant_head_tag_for_in(None, name, decls, tab)
-
-#[doc("Head tag of the sum declaring `name` in module `home`; builtins keep their reserved ids.")]
-pub fn variant_head_tag_for_in(home: Option[String], name: String, decls: [Decl], tab: SymTab) : Int {
-  let os_tag = if evar_home_eq(home, os_home()) { os_head_tag(name) } else { 0 - 1 }
-  if name == "Some" or name == "None" { 16 }
-  else if name == "Ok" or name == "Err" { 17 }
-  else if os_tag >= 0 { os_tag }
-  else { ctor_owner_head_tag(home, name, decls, tab) }
-}
-
-fn os_head_tag(name: String) : Int =
-  if name == "SigInt" or name == "SigTerm" or name == "SigHup" or name == "SigUsr1"
-     or name == "SigUsr2" or name == "SigWinch" { 18 }
-  else if name == "Exited" or name == "Signaled" { 19 }
-  else { 0 - 1 }
 
 #[doc("The effects of the entry fn's declared row, the ones its default-handler wrapper installs.")]
 pub fn main_row_labels(decls: [Decl], entry: SymId) : [SymId] {
@@ -2135,8 +1982,7 @@ pub fn default_block_owner_sym(eff: SymId, decls: [Decl]) : SymId = match find_e
   None    -> sym_none()
 }
 
-# Issue #557 — strict variant of `effect_has_default_block` used for
-# main absorption: every clause must bridge to an `extern_handler`
+# The strict test main absorption uses: every clause must bridge to an `extern_handler`
 # intrinsic. Stage A's codegen only knows how to lower those — a
 # kaikai-bodied clause has no emitter path yet (Stage C). Treating
 # effects with kaikai-bodied defaults as absorbed would type-check

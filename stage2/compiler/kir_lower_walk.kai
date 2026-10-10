@@ -23,7 +23,6 @@ import compiler.rec_stamp
 import compiler.infer
 import compiler.region
 import compiler.kir
-import compiler.rt_name
 import compiler.kir_lower
 import compiler.ctor_ix
 import compiler.core_builtins
@@ -409,7 +408,7 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
   # block-building discipline as if/match (asu review). The clause bodies
   # are separate `KFnClause`s generated in `lower_to_kir`.
   EHandle(body, eff, tas, init_opt, alias_opt, clauses, ret_opt) ->
-    lower_handle(x, body, inst_key_of_tes(rt_name(st.tab, ref_sym(eff)), tas), init_opt, alias_opt, clauses, ret_opt, st)
+    lower_handle(x, body, inst_key_of_tes(ref_sym(eff), tas), init_opt, alias_opt, clauses, ret_opt, st)
 
   # Postfix `!` — Option/Result propagation. `expr!` unwraps the success
   # payload, or EARLY-RETURNS the whole `None`/`Err` from the enclosing fn
@@ -1052,7 +1051,7 @@ fn lower_lambda_ref(x: Expr, st: LowerSt) : LRes / Console =
   match find_lam(st.lams, st.enc_fn, x.line, x.col) {
     Some(LamInfo(_, ef, ln, cl, params, caps, _, _)) ->
       match lower_capture_atoms(caps, st, []) { LResMany(capvs, st1) ->
-        bind_op(st1, KClosure(lam_symbol_at(ef, ln, cl),
+        bind_op(st1, KClosure(lam_symbol_at(ef.sym, ln, cl),
                               list_length(params), capvs), kpos_of(x)) }
     None -> { eprint(concat_all(["kir: lambda info missing at ",
                                  int_to_string(x.line), ":", int_to_string(x.col)]));
@@ -1073,18 +1072,12 @@ fn capture_reg(st: LowerSt, c: Capture) : String = match c {
 
 # --- Blocks -------------------------------------------------------------
 
-# A block opens a lexical scope. Snapshot the shadow-rename map AND the
-# bound-register set on entry and restore both on exit (#846). A `let x` inside
-# the block that shadows an outer `let x` records `x -> .tN` in `renames`
-# so reads inside the block hit the fresh reg; restoring `renames` on exit
-# makes a read of the OUTER `x` after the block resolve back to the outer
-# reg. Restoring `regs` is what keeps a binder defined INSIDE the block
-# from leaking into a SIBLING block: without it, a name bound in one block
-# stays in `regs` (the set is append-only) and a same-name binder in the
-# next block is wrongly seen as a shadow and needlessly renamed (the
-# `__pcs_arm_ret` per-arm churn). `rc` is NOT restored (see
-# `ls_set_renames` / `ls_set_regs`), so distinct fresh regs are minted
-# monotonically and never alias.
+# A block opens a lexical scope: the register scope and the live register
+# names are snapshotted on entry and restored on exit. Restoring the scope
+# makes a read of an outer binder after the block reach the outer register
+# again; restoring the names keeps a binder of one block from making a
+# same-name binder of a sibling block take a fresh register. `rc` is not
+# restored, so fresh registers never alias.
 fn lower_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console =
   if block_is_region(st.regions, x.line, x.col) { lower_region_block(x, stmts, tail, st) }
   else { lower_plain_block(x, stmts, tail, st) }
@@ -1135,7 +1128,7 @@ fn fn_body_lowers_raw(body: Expr) : Bool =
 # border differs, so a raw destination forwards it to `lower_expr_raw_at`
 # instead of boxing it for the caller to unbox straight back.
 fn lower_plain_block_at(x: Expr, stmts: [Stmt], tail: Option[Expr], dst: KSlot, st: LowerSt) : LRes / Console {
-  let snap = st.renames
+  let snap = st.scope
   let lsnap = st.regs
   let st1 = lower_stmts(stmts, st)
   # Invariant: every heap-allocated value bound to a dead `let` is decref'd
@@ -1145,8 +1138,8 @@ fn lower_plain_block_at(x: Expr, stmts: [Stmt], tail: Option[Expr], dst: KSlot, 
   let st2 = lower_block_exit_drops(stmts, tail, st1)
   match tail {
     Some(e) -> match lower_tail_at(x, e, dst, tcp_after_stmts(st2, stmts)) { LRes(v, st3) -> match block_value_out(v, lsnap, dst, kpos_of(e), st3) {
-      LRes(v4, st4) -> LRes(v4, ls_set_regs(ls_set_renames(st4, snap), lsnap)) } }
-    None    -> LRes(KUnitV, ls_set_regs(ls_set_renames(st2, snap), lsnap))
+      LRes(v4, st4) -> LRes(v4, ls_set_regs(ls_set_scope(st4, snap), lsnap)) } }
+    None    -> LRes(KUnitV, ls_set_regs(ls_set_scope(st2, snap), lsnap))
   }
 }
 
@@ -1191,7 +1184,7 @@ fn lower_owned_tail_at(e: Expr, dst: KSlot, st: LowerSt) : LRes / Console = matc
 # returns to, which post-dominates any `if`/`match` fork inside the tail —
 # so an early fork cannot skip the pop or free the value before the copy.
 fn lower_region_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console {
-  let snap = st.renames
+  let snap = st.scope
   let lsnap = st.regs
   let osnap = st.in_region
   let stp = ls_emit(ls_set_in_region(st, true), KDo(KCall("kaix_arena_push", []), kpos_of(x)))
@@ -1201,12 +1194,12 @@ fn lower_region_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) :
     Some(e) -> match lower_expr(e, tcp_after_stmts(st2, stmts)) { LRes(v, st3) -> {
       match bind_op(st3, KCall("kaix_deep_copy_out", [v]), kpos_of(x)) { LRes(cv, st4) -> {
         let st5 = ls_emit(ls_set_in_region(st4, osnap), KDo(KCall("kaix_arena_pop", []), kpos_of(x)))
-        LRes(cv, ls_set_regs(ls_set_renames(st5, snap), lsnap))
+        LRes(cv, ls_set_regs(ls_set_scope(st5, snap), lsnap))
       } }
     } }
     None -> {
       let st3 = ls_emit(ls_set_in_region(st2, osnap), KDo(KCall("kaix_arena_pop", []), kpos_of(x)))
-      LRes(KUnitV, ls_set_regs(ls_set_renames(st3, snap), lsnap))
+      LRes(KUnitV, ls_set_regs(ls_set_scope(st3, snap), lsnap))
     }
   }
 }
@@ -1558,25 +1551,11 @@ fn lower_let_bind_raw(pat: Pattern, v: KVal, slot: KSlot, st: LowerSt) : LowerSt
   }
 }
 
-# Bind a `PBind` to an already-lowered value at `slot`. #846: when the
-# binder's written name already names a register in scope, this `let`
-# SHADOWS it. Binding a second `KLet(name, ...)` would reuse the outer
-# binder's name-keyed alloca and clobber it; instead mint a fresh `.tN`
-# register, bind the value there, and record the binder in `renames` so
-# its reads resolve to the fresh reg. `lower_block` restores `renames` on
-# exit. The rename is pushed AFTER `v` is lowered by the caller (the RHS
-# reads the OUTER binder, e.g. `let x = f(x)`), so no ordering hazard.
-fn lower_let_pbind(b: Binder, slot: KSlot, v: KVal, pat: Pattern, st: LowerSt) : LowerSt / Console = {
-  let name = written_text(b.name)
-  if ls_reg_bound(st, name) {
-    match ls_fresh_reg(st) {
-      LSReg(reg, st1) -> {
-        let st2 = ls_emit(st1, KLet(reg, slot, KLitOp(v), KAt(pat.line, pat.col)))
-        ls_push_rename(st2, b.id, reg)
-      }
-    }
-  } else { ls_emit(st, KLet(name, slot, KLitOp(v), KAt(pat.line, pat.col))) }
-}
+# Bind a `PBind` to an already-lowered value at `slot`. The binder enters
+# scope after the caller lowered `v`, so an RHS that reads an outer binder
+# of the same name (`let x = f(x)`) read that one.
+fn lower_let_pbind(b: Binder, slot: KSlot, v: KVal, pat: Pattern, st: LowerSt) : LowerSt / Console =
+  ls_let(st, b, slot, KLitOp(v), KAt(pat.line, pat.col))
 
 # Bind a pattern to an already-lowered value. A plain `PBind` aliases the
 # value into its register; a DESTRUCTURING pattern (`let { p: { x, y } } = b`,
@@ -1768,11 +1747,11 @@ fn lower_branch_into(e: Expr, join: String, lcont: String, st: LowerSt) : LowerS
 # "is it the success ctor": the success path projects slot 0 (the payload)
 # into a join register; the fail path `KRet`s the inner value verbatim — the
 # short-circuit. The success ctor (`Some` for `Option`, `Ok` for `Result`)
-# is read from `inner.ty` via the shared `bang_success_variant`; a non-
+# is read from `inner.ty` via the shared `bang_success_ctor`; a non-
 # Option/Result type here is a typer-invariant violation, lowered to a loud
 # panic stub like the oracle's `None` arm (never a silent miscompile).
 fn lower_bang(x: Expr, inner: Expr, st: LowerSt) : LRes / Console =
-  match bang_success_variant(inner.ty) {
+  match bang_success_ctor(inner.ty) {
     None       -> lower_panic_stub(kir_quote("internal: `!` on non-Option/Result reached kir lowering"), st)
     Some(ctor) -> match lower_expr(inner, st) { LRes(bv, st1) -> lower_bang_split(x, bv, ctor, st1) }
   }
@@ -1782,10 +1761,10 @@ fn lower_bang(x: Expr, inner: Expr, st: LowerSt) : LRes / Console =
 # and branches to the continuation, the fail path early-returns `bv`. Mirror
 # of `lower_if_blocks`, but the else-branch is a `KRet` (short-circuit), not
 # a store-and-merge.
-fn lower_bang_split(x: Expr, bv: KVal, ctor: String, st: LowerSt) : LRes / Console =
+fn lower_bang_split(x: Expr, bv: KVal, ctor: SymId, st: LowerSt) : LRes / Console =
   match ls_fresh_reg(st) { LSReg(join, st1) -> {
     let st2 = ls_emit(st1, KLet(join, SBoxed, KLitOp(KUnitV), kpos_of(x)))
-    match bind_op(st2, KPrim(KpTagEq, [bv, KIntV(ls_core_ctor_tag(st2, ctor))]), kpos_of(x)) { LRes(cond, st3) ->
+    match bind_op(st2, KPrim(KpTagEq, [bv, KIntV(ls_ctor_tag(st2, ctor))]), kpos_of(x)) { LRes(cond, st3) ->
       match three_labels(st3) { LSL3(lok, lfail, lcont, st4) -> {
         # condbr seals the current block and opens `lfail` as the cursor.
         let st5 = ls_seal(st4, KCondBr(cond, lok, lfail, kpos_of(x)), lfail)
@@ -1840,9 +1819,9 @@ fn match_scr_is_borrowed(scr: Expr) : Bool = match scr.kind {
 }
 
 # An arm binder's shadow rename is scoped to its arm: whatever arm lowered
-# last must not leak its renames past the match.
+# last must not leak its bindings past the match.
 fn lower_match(x: Expr, scr: Expr, arms: [Arm], st: LowerSt) : LRes / Console =
-  match lower_match_scoped(x, scr, arms, st) { LRes(v, st1) -> LRes(v, ls_set_renames(st1, st.renames)) }
+  match lower_match_scoped(x, scr, arms, st) { LRes(v, st1) -> LRes(v, ls_set_scope(st1, st.scope)) }
 
 fn lower_match_scoped(x: Expr, scr: Expr, arms: [Arm], st: LowerSt) : LRes / Console {
   let owned = not match_scr_is_borrowed(scr)
@@ -1991,7 +1970,7 @@ fn tcp_seed_arm(owned: Bool, sd: String, binders: [LocalId],
     let with_scr = if owned and not arm_body_all_tail_self_tcrec(body) {
       list_append(pend0, [tcl_scr_entry(sd)])
     } else { pend0 }
-    ls_set_tcpend(st, tcl_push_binders(st.locals, with_scr, binders))
+    ls_set_tcpend(st, tcl_push_binders(with_scr, binders))
   }
 }
 
@@ -2091,7 +2070,7 @@ fn tcp_after_stmts(st: LowerSt, ss: [Stmt]) : LowerSt = match st.tcpend {
 # The goto-site releases: drop every pending entry the tail-call args do
 # not consume — after the args are lowered (they may still dup-read the
 # binders), before the back-edge seals. Binder entries resolve through the
-# active shadow renames, like any other body read.
+# register scope, like any other body read.
 fn tcp_goto_drops(args: [Expr], st: LowerSt) : LowerSt = match st.tcpend {
   [] -> st
   _  -> tcp_drop_entries(tcl_goto_entries(st.tcpend, args), st)
@@ -2365,7 +2344,7 @@ fn lower_match_blocks(x: Expr, arms: [Arm], scrv: KVal, tagv: KVal, owned: Bool,
         # by one arm lowers its body directly in the case block; a tag SHARED
         # by N arms (`Exited(0)`/`Exited(_)`) opens a sub-fail-chain in the
         # case block that discriminates on the payload (kir_lower_variant).
-        let st8 = lower_variant_groups(cases, tagged, scrv, join, lcont, ldef, owned, sd, st6.mscr, pend0, ls_set_renames(st7, st6.renames))
+        let st8 = lower_variant_groups(cases, tagged, scrv, join, lcont, ldef, owned, sd, st6.mscr, pend0, ls_set_scope(st7, st6.scope))
         match_finish_tok(owned, sd, arms_have_arm_top(arms, st8), LRes(KVar(join), ls_set_tcpend(reopen(st8, lcont), pend0)))
       } } } } }
 
@@ -2432,20 +2411,9 @@ fn seal_match_miss(st: LowerSt, next: String) : LowerSt / Console =
   match lower_panic_stub(kir_quote("non-exhaustive match"), st) {
     LRes(_, st1) -> ls_seal(st1, KUnreachable(KNoPos), next) }
 
-# Alias a match-arm binder to the whole scrutinee. When its written name
-# already names a register in scope (a fn param / outer binder of the SAME
-# name — `match n { 0 -> ..; n if n < 0 -> .. }` over a param `n`), a second
-# `KLet(name, ...)` would reuse the outer register's name-keyed alloca and,
-# if their slots differ, widen and corrupt it. So mint a fresh `.tN`
-# register and record the binder so the arm's guard + body reads resolve to
-# it — exactly `lower_let_pbind`'s shadow discipline.
-fn bind_scr_alias(b: Binder, scrv: KVal, pos: KPos, st: LowerSt) : LowerSt / Console = {
-  let name = written_text(b.name)
-  if ls_reg_bound(st, name) {
-    match ls_fresh_reg(st) { LSReg(reg, st1) ->
-      ls_push_rename(ls_emit(st1, KLet(reg, SBoxed, KLitOp(scrv), pos)), b.id, reg) }
-  } else { ls_emit(st, KLet(name, SBoxed, KLitOp(scrv), pos)) }
-}
+# Alias a match-arm binder to the whole scrutinee.
+fn bind_scr_alias(b: Binder, scrv: KVal, pos: KPos, st: LowerSt) : LowerSt / Console =
+  ls_let(st, b, SBoxed, KLitOp(scrv), pos)
 
 # Bind the default arm's pattern to the whole scrutinee. A plain / narrowed
 # binder aliases `scrv`; an as-pattern aliases then descends; a
@@ -2739,7 +2707,7 @@ fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
         # The arm's binder may shadow-rename an outer name; that rename is
         # scoped to THIS arm's guard + body. Snapshot before binding so the
         # rest of the chain (lowered at `next_fail`) does not inherit it.
-        let rsnap = st_body.renames
+        let rsnap = st_body.scope
         let st_alias = bind_default_pattern(p, scrv, body, st_body)
         # A whole-value / as / destructure binder aliases the owned scrutinee;
         # without the structural pointer-slot incref (`lower_arm_rc`, as the
@@ -2769,7 +2737,7 @@ fn lower_guard_arms(arms: [Arm], scrv: KVal, join: String, lcont: String,
         if arm_is_terminal {
           ls_seal(reopen(st_done, next_fail), KUnreachable(KNoPos), next_fail)
         } else {
-          lower_guard_arms(rest, scrv, join, lcont, owned, sd, pend0, ls_set_renames(reopen(st_done, next_fail), rsnap))
+          lower_guard_arms(rest, scrv, join, lcont, owned, sd, pend0, ls_set_scope(reopen(st_done, next_fail), rsnap))
         }
       } } }
 }
@@ -2848,10 +2816,11 @@ fn match_has_discriminating_pattern(arms: [Arm]) : Bool = match arms {
 # path stores the discarded value. The return clause (if any) lowers
 # inline over `result` at the merge. The clause bodies are separate
 # `KFnClause`s (generated in `lower_to_kir`).
-fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
+fn lower_handle(x: Expr, body: Expr, inst: InstKey, init_opt: Option[Expr],
                 alias_opt: Option[Binder], clauses: [HClause],
                 ret_opt: Option[HReturn], st: LowerSt) : LRes / Console {
-  let sym = user_handler_sym(st.enc_fn, x.line, x.col)
+  let eff = inst_key_text(st.tab, inst)
+  let sym = user_handler_sym(st.enc_fn.sym, x.line, x.col)
   let has_fin = handle_has_finally(clauses)
   let uw = unw_handle_at(st.unw.sites, x.site)
   let ho = kir_unw_handle_vars(uw, x, st)
@@ -2859,11 +2828,11 @@ fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
     match ls_fresh_reg(st1) { LSReg(result, st2) -> {
       let st3 = ls_emit(st2, KLet(result, SBoxed, KLitOp(KUnitV), kpos_of(x)))
       let hs = kir_unw_handle_state(uw, init_opt, sym, x, st3)
-      let st3b = ls_emit(hs.st, KInstall(eff, sym, initv, handle_alias_name(alias_opt), kpos_of(x)))
+      let st3b = alias_in_scope(alias_opt, ls_emit(hs.st, KInstall(eff, sym, initv, handle_alias_name(alias_opt), kpos_of(x))))
       # Arm the cleanup right after the push, so every unwind past this
       # node runs it; the normal exit runs it explicitly before the pop.
       let st4 = if has_fin {
-        ls_emit(st3b, KSetCleanup(eff, sym, user_cleanup_sym(st.enc_fn, x.line, x.col), kpos_of(x)))
+        ls_emit(st3b, KSetCleanup(eff, sym, user_cleanup_sym(st.enc_fn.sym, x.line, x.col), kpos_of(x)))
       } else { st3b }
       # A handle carrying `init` state is stateful — its return clause sees
       # `state`/`log` (gated in `lower_handle_ret` via `KBindEvState`).
@@ -2872,7 +2841,7 @@ fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
       # evidence-frame storage is named per-SITE, not per-EFFECT: two nested
       # handlers of the same effect must NOT share a `__node_<eff>` alloca, or
       # the second push self-cycles the parent chain (refs #789).
-      let fork = HandleFork { stateful: stateful, has_fin: has_fin, frames: rs_clauses_push_frames(clauses) }
+      let fork = HandleFork { stateful: stateful, has_fin: has_fin, frames: rs_clauses_push_frames(clauses), inst: inst }
       lower_handle_fork(x, body, eff, sym, result, fork, ret_opt, list_append(hs.pops, ho.pops), st4)
     } } }
 }
@@ -2881,6 +2850,12 @@ fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
 fn handle_alias_name(alias_opt: Option[Binder]) : Option[String] = match alias_opt {
   Some(b) -> Some(written_text(b.name))
   None    -> None
+}
+
+# The install binds its alias under the name it is known by.
+fn alias_in_scope(alias_opt: Option[Binder], st: LowerSt) : LowerSt = match alias_opt {
+  Some(b) -> ls_scope_put(st, b.id, written_text(b.name))
+  None    -> st
 }
 
 # The registers pushed below a handle's landing pad, popped where its exits
@@ -2922,14 +2897,14 @@ fn handle_has_finally(cs: [HClause]) : Bool = match cs {
 # `state`/`log` bind — threaded from `lower_handle` where `init_opt` is known.
 # What shapes a handle's exits: its state, its `finally`, and whether a
 # clause defers resume frames to them.
-type HandleFork = { stateful: Bool, has_fin: Bool, frames: Bool }
+type HandleFork = { stateful: Bool, has_fin: Bool, frames: Bool, inst: InstKey }
 
 fn lower_handle_fork(x: Expr, body: Expr, eff: String, sym: String, result: String,
                      fork: HandleFork, ret_opt: Option[HReturn], pops: [String], st: LowerSt) : LRes / Console =
   match bind_op(st, KSetjmp(eff, sym), kpos_of(x)) { LRes(jmpv, st1) ->
     match three_labels(st1) { LSL3(ldisc, lbody, lret, st2) -> {
       let st3 = ls_seal(st2, KCondBr(jmpv, ldisc, lbody, kpos_of(x)), lbody)
-      let st4 = lower_handle_body(body, eff, sym, result, fork.has_fin, fork.stateful, ret_opt, lret, st3)
+      let st4 = lower_handle_body(body, eff, sym, result, fork, ret_opt, lret, st3)
       let st5 = lower_handle_discard(sym, result, lret, ldisc, st4)
       lower_handle_ret(eff, sym, result, fork, pops, lret, st5)
     } } }
@@ -2938,10 +2913,12 @@ fn lower_handle_fork(x: Expr, body: Expr, eff: String, sym: String, result: Stri
 # clause, store into result, branch to the merge. The pop sits on the
 # NORMAL exit only — the discard path's longjmp already unwound past it.
 fn lower_handle_body(body: Expr, eff: String, sym: String, result: String,
-                     has_fin: Bool, stateful: Bool, ret_opt: Option[HReturn],
+                     fork: HandleFork, ret_opt: Option[HReturn],
                      lret: String, st: LowerSt) : LowerSt / Console =
-  match lower_expr(body, ls_bind_reg(st, handle_shadow_mark(eff))) { LRes(bv, st0) -> {
-    let st1 = ls_set_regs(st0, st.regs)
+  match lower_expr(body, ls_in_handle(st, fork.inst)) { LRes(bv, st0) -> {
+    let has_fin = fork.has_fin
+    let stateful = fork.stateful
+    let st1 = ls_set_handles(ls_set_regs(st0, st.regs), st.handles)
     match ret_opt {
       None -> {
         let st2 = ls_emit(st1, KStore(result, bv, kpos_of(body)))
@@ -3005,22 +2982,27 @@ fn lower_handle_ret_value(eff: String, sym: String, bv: KVal, stateful: Bool,
                           r: HReturn, st: LowerSt) : LRes / Console = match r {
   HR(b, rexpr, _, _) -> {
     let st1 = if stateful { bind_ret_state(eff, sym, st) } else { st }
-    match lower_expr(rexpr, ls_emit(st1, KLet(written_text(b.name), SBoxed, KLitOp(bv), KNoPos))) {
-      LRes(v, st2) -> LRes(v, ls_set_renames(ls_set_regs(st2, st.regs), st.renames))
+    match lower_expr(rexpr, ls_let(st1, b, SBoxed, KLitOp(bv), KNoPos)) {
+      LRes(v, st2) -> LRes(v, ls_set_scope(ls_set_regs(st2, st.regs), st.scope))
     }
   }
 }
 
 fn bind_ret_state(eff: String, sym: String, st: LowerSt) : LowerSt / Console =
-  match alias_regs(clause_state_aliases((k) => list_has(st.regs, k)), st, []) {
+  match alias_regs(unbound_state_aliases(st), st, []) {
     AliasRegs(regs, st1) -> ls_emit(st1, KBindEvState(eff, sym, regs, KNoPos))
   }
 
 #[doc("Bind a stateful clause's state aliases, those its params and captures leave unbound, each to a register of its own.")]
 pub fn bind_self_state(st: LowerSt) : LowerSt / Console =
-  match alias_regs(clause_state_aliases((k) => list_has(st.regs, k)), st, []) {
+  match alias_regs(unbound_state_aliases(st), st, []) {
     AliasRegs(regs, st1) -> ls_emit(st1, KBindSelfState(regs, KNoPos))
   }
+
+# An alias whose binder the scope already holds reached it from outside:
+# the enclosing binding is the one the body reads.
+fn unbound_state_aliases(st: LowerSt) : [String] =
+  clause_state_aliases((k) => ls_local_bound(st, local_minted(k)))
 
 type AliasRegs = AliasRegs([String], LowerSt)
 
@@ -3028,7 +3010,7 @@ type AliasRegs = AliasRegs([String], LowerSt)
 fn alias_regs(keys: [String], st: LowerSt, regs: [String]) : AliasRegs = match keys {
   [] -> AliasRegs(list_reverse(regs), st)
   [k, ...rest] -> match ls_fresh_reg(st) {
-    LSReg(r, st1) -> alias_regs(rest, ls_push_rename(ls_bind_reg(st1, k), local_minted(k), r), [r, ...regs])
+    LSReg(r, st1) -> alias_regs(rest, ls_scope_put(ls_bind_reg(st1, k), local_minted(k), r), [r, ...regs])
   }
 }
 
@@ -3089,14 +3071,14 @@ fn kir_unw_held(names: [LocalId], clo: Option[UnwCallee]) : [LocalId] = match cl
   _                   -> names
 }
 
-# The closure a call goes through: a local in callee position whose
-# register is bound.
+# The closure a call goes through: a local in callee position that the
+# scope binds.
 fn kir_unw_closure(f: Expr, st: LowerSt) : Option[UnwCallee] = match f.kind {
-  ELocal(n) -> if ls_reg_bound(st, ls_local_name(st, n)) { Some(UkTransfer(n)) } else { None }
+  ELocal(n) -> if ls_local_bound(st, n) { Some(UkTransfer(n)) } else { None }
   ECall(g, xs) -> match g.kind {
     EMark(MkDup) -> match xs {
       [inner] -> match inner.kind {
-        ELocal(n) -> if ls_reg_bound(st, ls_local_name(st, n)) { Some(UkDup(n)) } else { None }
+        ELocal(n) -> if ls_local_bound(st, n) { Some(UkDup(n)) } else { None }
         _ -> None
       }
       _ -> None
@@ -3188,23 +3170,14 @@ fn perform_inst_args(x: Expr) : [Ty] = match x.kind {
   _ -> []
 }
 
-# An alias or a receiver names its evidence by the binder's written name.
+# An alias or a receiver names its evidence by what its binder is bound to.
 # Otherwise, inside a `handle` of the same instance in this fn, the op must
 # reach that handler, not the caller's frame slot.
 fn perform_via(r: OpRef, targs: [Ty], st: LowerSt) : KVia = match r.via {
-  ViaAlias(a) -> KvAlias(ls_local_name(st, a))
-  ViaRecv(v)  -> KvRecv(ls_local_name(st, v))
-  ViaAmbient  -> {
-    let key = kir_eff_key(st.tab, r.eff, targs)
-    if any(st.regs, (n) => shadow_mark_covers(n, key)) { KvLexical } else { KvAmbient }
-  }
+  ViaAlias(a) -> KvAlias(ls_reg_of(st, a))
+  ViaRecv(v)  -> KvRecv(ls_reg_of(st, v))
+  ViaAmbient  -> if ls_handled_here(st, inst_key_of_tys(r.eff, targs)) { KvLexical } else { KvAmbient }
 }
-
-# Not an identifier, so it never collides with a bound register in `regs`.
-fn handle_shadow_mark(key: String) : String = cat2("#handle:", key)
-
-fn shadow_mark_covers(local: String, key: String) : Bool =
-  string_slice(local, 0, 8) == "#handle:" and inst_keys_match(string_slice(local, 8, string_length(local)), key)
 
 # --- Perceus RC marks → first-class KRC statements (§4.7) ---------------
 
@@ -3749,7 +3722,7 @@ fn lower_ctor_args(cargs: [Expr], ks: [Int], st: LowerSt, acc: [KSlotInit]) : LC
 # reads whatever tag it carries).
 fn lower_enum_slot_arg(e: Expr, st: LowerSt) : LRes / Console = match e.kind {
   ESym(s, _) -> match ctor_ix_row(st.ctor_ix, s) {
-    Some(EV(_, _, ar, _, tag)) ->
+    Some(EV(_, _, ar, _, tag, _)) ->
       if ar == 0 and tag >= user_variant_tag_base() { LRes(KIntV(tag), st) }
       else { lower_expr(e, st) }
     None -> lower_expr(e, st)
@@ -3757,8 +3730,8 @@ fn lower_enum_slot_arg(e: Expr, st: LowerSt) : LRes / Console = match e.kind {
   _ -> lower_expr(e, st)
 }
 
-# `sym` is the already-resolved mangled symbol. Resolve the callee's UFnSig
-# once: it drives BOTH ends of the P3 raw-scalar ABI at this call site.
+# `sym` is the already-resolved mangled symbol and `sig` the callee's
+# UFnSig: it drives BOTH ends of the P3 raw-scalar ABI at this call site.
 #
 # ARGS — lower each at the callee's PARAM slot (`lower_tcrec_args`, shared
 # with the self-tail-call back-edge): a raw param gets its arg lowered RAW
@@ -3778,9 +3751,8 @@ fn lower_enum_slot_arg(e: Expr, st: LowerSt) : LRes / Console = match e.kind {
 # arg / result — the unbox pass marks them `MUnboxed`, so neither the raw
 # args nor the raw result register attract a KDup/KDrop. The raw slots here
 # only change the repr, never the RC plan.
-#[doc("Lower the direct call `sym(cargs)` at `x`.")]
-pub fn lower_direct_call(x: Expr, sym: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
-  let sig = fnx_ufn_by_csym(st.fx, sym)
+#[doc("Lower the direct call `sym(cargs)` at `x`, of a callee whose unboxed signature is `sig`.")]
+pub fn lower_direct_call(x: Expr, sym: String, sig: Option[UFnSig], cargs: [Expr], st: LowerSt) : LRes / Console = {
   match lower_tcrec_args(cargs, sig, st) { LResMany(avs0, st0) ->
     match ob_pin_literals(cargs, avs0, st0, []) { LResMany(avs, st1) -> {
       let held = ob_held(x, cargs, avs, st1)
@@ -3869,13 +3841,13 @@ fn ob_drop_go(st: LowerSt, cargs: [Expr], avs: [KVal], pos: KPos) : LowerSt = ma
 # declaration is read as a register spelled like it and called indirectly.
 fn lower_callee_dispatch(x: Expr, fid: FnId, cargs: [Expr], st: LowerSt) : LRes / Console =
   if callee_is_direct(st, fid) {
-    lower_direct_call(x, c_sym_of_callee_st(st, fid), cargs, st)
+    lower_direct_call(x, c_sym_of_callee_st(st, fid), ls_call_sig(st, fid), cargs, st)
   } else { lower_reg_call(x, ls_fn_name(st, fid), cargs, st) }
 
-# A local holding a function value, called through `kaix_apply` under the
-# name it was written with.
+# A local holding a function value, called through `kaix_apply` from its
+# register.
 fn lower_local_call(x: Expr, l: LocalId, cargs: [Expr], st: LowerSt) : LRes / Console =
-  lower_reg_call(x, ls_local_name(st, l), cargs, st)
+  lower_reg_call(x, ls_reg_of(st, l), cargs, st)
 
 fn lower_reg_call(x: Expr, reg: String, cargs: [Expr], st: LowerSt) : LRes / Console =
   match lower_exprs(cargs, st, []) { LResMany(avs0, st0) ->
@@ -3937,13 +3909,13 @@ fn lower_resume(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match ca
 # the dropmask is a bitfield over the same ordering, so the two must stay
 # aligned.
 fn lower_tcrec(x: Expr, step: TcrecStep, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match lower_tcrec_args(cargs, fnx_ufn_by_csym(st.fx, step.sym), st) {
+  match lower_tcrec_args(cargs, fnx_ufn_sig_first(st.fx, step.fid), st) {
     LResMany(avs, st1) ->
       # The goto leaves every enclosing match block, skipping their
       # continuation scrutinee drops and this path's unconsumed binder
       # dups — release the pending ledger entries before the back-edge.
       seal_tail(tcp_goto_drops(cargs, st1),
-                KTcrecGoto(cat3("_kai_", step.sym, "_entry"), assigns_of(avs, 0, []),
+                KTcrecGoto(cat3("_kai_", ls_fn_c_sym(st1, step.fid), "_entry"), assigns_of(avs, 0, []),
                            step.dropmask, kpos_of(x)))
   }
 
@@ -3989,7 +3961,7 @@ fn lower_trmc_seal(x: Expr, step: TrmcStep, spine: KSpine,
   # P3: lower the rebinds at the recursing fn's param slots (raw for a raw
   # param), so the TRMC back-edge re-stores them raw — no per-step
   # `kaix_int` re-box. Same `lower_tcrec_args` the `KTcrecGoto` path uses.
-  match lower_tcrec_args(trmc_self_args(cargs, step.hole), fnx_ufn_by_csym(st.fx, step.sym), st) {
+  match lower_tcrec_args(trmc_self_args(cargs, step.hole), fnx_ufn_sig_first(st.fx, step.fid), st) {
     LResMany(reb, st1) -> {
       # The variant ctor tag is resolved here (as `KCon` resolves it), so the
       # backend builds the spine cell without a name→tag table. The builtin-
@@ -4005,7 +3977,7 @@ fn lower_trmc_seal(x: Expr, step: TrmcStep, spine: KSpine,
       # Like the tcrec goto, the step leaves every enclosing match: it
       # releases the ledger's pending entries the ctor args do not consume.
       seal_tail(tcp_goto_drops(cargs, ls_set_tcpend(st1, tcl_without_tok(st1.tcpend))),
-                KTrmcStep(cat3("_kai_", step.sym, "_entry"), step.hole, spine, tag, slot_mask, step.dropmask,
+                KTrmcStep(cat3("_kai_", ls_fn_c_sym(st1, step.fid), "_entry"), step.hole, spine, tag, slot_mask, step.dropmask,
                           heads, assigns_of(reb, 0, []), st1.in_region, kpos_of(x)))
     }
   }

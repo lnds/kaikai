@@ -29,7 +29,7 @@ import compiler.ffi_v2
 pub fn emit_ffi_struct_typedefs(reg: [ExternTypeReg], tab: SymTab) : String = match reg {
   [] -> ""
   [e, ...rest] -> match e {
-    ExtStruct(name, fields) -> cat2(emit_ffi_one_struct_typedef(name, fields, reg, tab),
+    ExtStruct(s, fields) -> cat2(emit_ffi_one_struct_typedef(extern_struct_c_tag(tab, s), fields, reg, tab),
                                     emit_ffi_struct_typedefs(rest, tab))
     ExtOpaque(_) -> emit_ffi_struct_typedefs(rest, tab)
   }
@@ -98,7 +98,7 @@ fn ffi_v2_arg_decrefs(params: [Param], i: Int, reg: [ExternTypeReg], tab: SymTab
 fn ffi_v2_extern_decl(cname: String, params: [Param], ret_kind: FfiRetKind,
                       reg: [ExternTypeReg], tab: SymTab) : String =
   concat_all([
-    "extern ", ffi_v2_c_ret_type(ret_kind, reg), " ", cname,
+    "extern ", ffi_v2_c_ret_type(ret_kind, tab), " ", cname,
     "(", ffi_v2_c_param_list(params, reg, tab), ");\n"
   ])
 
@@ -109,17 +109,17 @@ fn ffi_v2_c_param_list(params: [Param], reg: [ExternTypeReg], tab: SymTab) : Str
 
 fn ffi_v2_c_param_type(p: Param, reg: [ExternTypeReg], tab: SymTab) : String = match p.ptype {
   None    -> "void *"
-  Some(t) -> ffi_v2_c_type(ffi_kind_of_ty_reg(t, reg, tab))
+  Some(t) -> ffi_v2_c_type(ffi_kind_of_ty_reg(t, reg, tab), tab)
 }
 
-fn ffi_v2_c_ret_type(k: FfiRetKind, reg: [ExternTypeReg]) : String = match k {
+fn ffi_v2_c_ret_type(k: FfiRetKind, tab: SymTab) : String = match k {
   FfiRetUnit -> "void"
-  _          -> ffi_v2_c_type(k)
+  _          -> ffi_v2_c_type(k, tab)
 }
 
 # The C type for one v2 kind. Struct → the `kai_ffi.h` `typedef` name,
 # opaque → `void *`, fixed-width → its C scalar, v1 scalars unchanged.
-fn ffi_v2_c_type(k: FfiRetKind) : String = match k {
+fn ffi_v2_c_type(k: FfiRetKind, tab: SymTab) : String = match k {
   FfiRetUnit       -> "void"
   FfiRetInt        -> "int64_t"
   FfiRetReal       -> "double"
@@ -128,7 +128,7 @@ fn ffi_v2_c_type(k: FfiRetKind) : String = match k {
   FfiRetString     -> "const char *"
   FfiRetFixed(fx)  -> ffi_fixed_c_type(fx)
   FfiRetFixedVal(t) -> fixed_val_c_type(t)
-  FfiRetStruct(n)  -> extern_struct_c_tag(n)
+  FfiRetStruct(s)  -> extern_struct_c_tag(tab, s)
   FfiRetForeign(_) -> "void *"
   FfiRetUnknown(_) -> "void *"
 }
@@ -167,16 +167,16 @@ fn ffi_v2_unbox_one(kind: FfiRetKind, arg: String, box: String, reg: [ExternType
   FfiRetFixedVal(t) ->
     concat_all(["    ", fixed_val_c_type(t), " ", arg, " = ", box, fixed_val_box_field(t), ";\n"])
   FfiRetForeign(_) -> concat_all(["    void *", arg, " = kai_foreign_ptr(", box, ");\n"])
-  FfiRetStruct(n)  -> ffi_v2_unbox_struct(n, arg, box, reg, tab)
+  FfiRetStruct(s)  -> ffi_v2_unbox_struct(s, arg, box, reg, tab)
   FfiRetUnknown(t) -> concat_all(["#error \"FFI arg type `", t, "` is not supported\"\n"])
 }
 
 # Unwrap a boxed record into a C struct literal. Each field is read by
 # name (`kai_record_get_borrow`) and unboxed at its C width.
-fn ffi_v2_unbox_struct(name: String, arg: String, box: String, reg: [ExternTypeReg], tab: SymTab) : String {
-  let fields = extern_struct_fields(reg, name)
+fn ffi_v2_unbox_struct(s: SymId, arg: String, box: String, reg: [ExternTypeReg], tab: SymTab) : String {
+  let fields = extern_struct_fields(reg, s)
   concat_all([
-    "    ", extern_struct_c_tag(name), " ", arg, " = { ",
+    "    ", extern_struct_c_tag(tab, s), " ", arg, " = { ",
     ffi_v2_struct_field_inits(fields, box, reg, tab), " };\n"
   ])
 }
@@ -241,21 +241,21 @@ fn ffi_v2_ret_body(ret_kind: FfiRetKind, call_expr: String, arg_setup: String,
     concat_all([arg_setup, "    ", fixed_val_c_type(t), " _kai_ffi_ret = ", call_expr, ";\n", arg_decrefs,
                 "    return ", fixed_val_box_ctor(t), "(_kai_ffi_ret);\n"])
   FfiRetForeign(_) -> concat_all([arg_setup, "    void *_kai_ffi_ret = ", call_expr, ";\n", arg_decrefs, "    return kai_foreign(_kai_ffi_ret);\n"])
-  FfiRetStruct(n) -> ffi_v2_rebox_struct(n, call_expr, arg_setup, arg_decrefs, reg, tab)
+  FfiRetStruct(s) -> ffi_v2_rebox_struct(s, call_expr, arg_setup, arg_decrefs, reg, tab)
   FfiRetUnknown(t) -> concat_all(["#error \"FFI return type `", t, "` is not supported\"\n"])
 }
 
 # Re-box a returned C struct into a fresh KAI_RECORD: stash the C
 # struct in a local, then build a record whose fields box each member
 # at its kaikai width (a fixed-width field re-boxes as Int / Real).
-fn ffi_v2_rebox_struct(name: String, call_expr: String, arg_setup: String,
+fn ffi_v2_rebox_struct(s: SymId, call_expr: String, arg_setup: String,
                        arg_decrefs: String, reg: [ExternTypeReg], tab: SymTab) : String {
-  let fields = extern_struct_fields(reg, name)
+  let fields = extern_struct_fields(reg, s)
   let n = list_length(fields)
   let ns = int_to_string(n)
   concat_all([
     arg_setup,
-    "    ", extern_struct_c_tag(name), " _kai_ffi_ret = ", call_expr, ";\n",
+    "    ", extern_struct_c_tag(tab, s), " _kai_ffi_ret = ", call_expr, ";\n",
     arg_decrefs,
     "    KaiValue *_kai_ffi_fields[", ns, "];\n",
     "    const char *_kai_ffi_names[", ns, "];\n",

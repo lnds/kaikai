@@ -41,7 +41,7 @@ pub fn bind_pattern_fields(p: Pattern, scrv: KVal, body: Expr, st: LowerSt) : Lo
   # A top-level as-pattern (`a @ A`, `a: A` after the narrow rewrite): bind the
   # whole scrutinee to `name`, then bind the inner pattern's own sub-binders.
   PAs(b, _)                 -> bind_pattern_fields(as_inner(p), scrv, body,
-                                 ls_emit(st, KLet(written_text(b.name), SBoxed, KLitOp(scrv), KAt(p.line, p.col))))
+                                 ls_let(st, b, SBoxed, KLitOp(scrv), KAt(p.line, p.col)))
   _                         -> st
 }
 
@@ -81,7 +81,7 @@ pub fn kcr_tag(c: KCtorRef) : Int = match c {
 # side reads the other writer's cells wrong (the rc-detector and
 # os_process parity catches, one per direction).
 pub fn slot_kind_of(c: KCtorRef, idx: Int) : Int = match c {
-  KCR(Some(EV(_, _, _, ks, tag))) -> if tag < user_variant_tag_base() { 0 - 1 } else { kind_at(ks, idx) }
+  KCR(Some(EV(_, _, _, ks, tag, _))) -> if tag < user_variant_tag_base() { 0 - 1 } else { kind_at(ks, idx) }
   KCR(None)                       -> 0 - 1
 }
 
@@ -135,9 +135,9 @@ fn bind_slot_pattern(c: KCtorRef, sp: Pattern, scrv: KVal, idx: Int, body: Expr,
   # A kind-0 pointer slot binder reads a direct `.ptr` borrow (`KProjBorrow`);
   # every other slot stays the mask-consulting `KProj`. The read op matches the
   # ctor's write layout, so no tagged pointer is ever read raw nor vice versa.
-  PBind(b)             -> ls_emit(st, KLet(written_text(b.name), bind_slot_kslot(st, c, idx, b, sp.line, sp.col), bind_slot_op(c, idx, scrv), KAt(sp.line, sp.col)))
+  PBind(b)             -> ls_let(st, b, bind_slot_kslot(st, c, idx, b, sp.line, sp.col), bind_slot_op(c, idx, scrv), KAt(sp.line, sp.col))
   PRecord(_)           -> bind_nested_slot(c, sp, scrv, idx, body, st)
-  PAs(b, _)            -> bind_nested_as(c, sp, written_text(b.name), scrv, idx, body, st)
+  PAs(b, _)            -> bind_nested_as(c, sp, b, scrv, idx, body, st)
   PVariant(_, subs)    -> if nullary_slot_ctor(subs) { st } else { bind_nested_slot(c, sp, scrv, idx, body, st) }
   PVariantRecord(_, _) -> bind_nested_slot(c, sp, scrv, idx, body, st)
   PList(_, _)          -> bind_nested_slot(c, sp, scrv, idx, body, st)
@@ -160,9 +160,9 @@ fn bind_nested_slot(c: KCtorRef, sp: Pattern, scrv: KVal, idx: Int, body: Expr, 
 
 # An as-pattern slot (`name @ inner`): bind the slot to `name`, then bind
 # the inner pattern against the SAME projected value.
-fn bind_nested_as(c: KCtorRef, sp: Pattern, name: String, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console =
+fn bind_nested_as(c: KCtorRef, sp: Pattern, b: Binder, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console =
   match bind_op(st, bind_slot_op(c, idx, scrv), KAt(sp.line, sp.col)) { LRes(sub, st1) -> {
-    let st2 = ls_emit(st1, KLet(name, SBoxed, KLitOp(sub), KAt(sp.line, sp.col)))
+    let st2 = ls_let(st1, b, SBoxed, KLitOp(sub), KAt(sp.line, sp.col))
     bind_pattern_fields_any(as_inner(sp), sub, body, st2)
   } }
 
@@ -193,10 +193,10 @@ fn bind_record_subfields(fields: [PField], v: KVal, body: Expr, st: LowerSt) : L
 # A plain field binder owns the field read (`kai_op_field` increfs).
 fn bind_field_pattern(fname: String, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console =
   match sub.pkind {
-    PBind(b) -> ls_emit(st, KLet(written_text(b.name), SBoxed, KPrim(KpField, [v, KStrV(fname)]), KAt(sub.line, sub.col)))
+    PBind(b) -> ls_let(st, b, SBoxed, KPrim(KpField, [v, KStrV(fname)]), KAt(sub.line, sub.col))
     PAs(b, inner) ->
       if field_sub_destructures(inner) { bind_field_owned(fname, sub, v, body, st) }
-      else { bind_field_as(fname, written_text(b.name), sub, v, body, st) }
+      else { bind_field_as(fname, b, sub, v, body, st) }
     _ -> if field_sub_destructures(sub) { bind_field_owned(fname, sub, v, body, st) } else { st }
   }
 
@@ -232,7 +232,7 @@ pub fn bind_let_owned(pat: Pattern, v: KVal, st: LowerSt) : LowerSt / Console = 
 
 fn bind_field_sub(sub: Pattern, fv: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match sub.pkind {
   PAs(b, inner) ->
-    bind_field_sub(inner, fv, body, ls_emit(st, KLet(written_text(b.name), SBoxed, KLitOp(fv), KAt(sub.line, sub.col))))
+    bind_field_sub(inner, fv, body, ls_let(st, b, SBoxed, KLitOp(fv), KAt(sub.line, sub.col)))
   _ -> bind_pattern_fields_any(sub, fv, body, st)
 }
 
@@ -247,7 +247,7 @@ fn dup_binders(names: [LocalId], pos: KPos, st: LowerSt) : LowerSt = match names
 fn bind_list_cells(pats: [Pattern], opt_rest: Option[Binder], cur: KVal,
                    sp: Pattern, st: LowerSt) : LowerSt / Console = match pats {
   [] -> match opt_rest {
-    Some(b)    -> ls_emit(st, KLet(written_text(b.name), SBoxed, KLitOp(cur), KAt(sp.line, sp.col)))
+    Some(b)    -> ls_let(st, b, SBoxed, KLitOp(cur), KAt(sp.line, sp.col))
     None       -> st
   }
   [hp, ...rest] -> match bind_op(st, KProj(cur, 0), KAt(hp.line, hp.col)) { LRes(headv, st1) -> {
@@ -258,15 +258,15 @@ fn bind_list_cells(pats: [Pattern], opt_rest: Option[Binder], cur: KVal,
 }
 
 fn bind_list_head(hp: Pattern, headv: KVal, st: LowerSt) : LowerSt / Console = match hp.pkind {
-  PBind(b) -> ls_emit(st, KLet(written_text(b.name), SBoxed, KLitOp(headv), KAt(hp.line, hp.col)))
+  PBind(b) -> ls_let(st, b, SBoxed, KLitOp(headv), KAt(hp.line, hp.col))
   _        -> bind_field_sub(hp, headv, bind_body_none(), st)
 }
 
 # An as-pattern field whose inner pattern binds no cells (`f: name @ x`):
 # `name` owns the field read outright.
-fn bind_field_as(fname: String, name: String, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console =
+fn bind_field_as(fname: String, b: Binder, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console =
   match bind_op(st, KPrim(KpField, [v, KStrV(fname)]), KAt(sub.line, sub.col)) { LRes(fv, st1) -> {
-    let st2 = ls_emit(st1, KLet(name, SBoxed, KLitOp(fv), KAt(sub.line, sub.col)))
+    let st2 = ls_let(st1, b, SBoxed, KLitOp(fv), KAt(sub.line, sub.col))
     bind_pattern_fields_any(as_inner(sub), fv, body, st2)
   } }
 
