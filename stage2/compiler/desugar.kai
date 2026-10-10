@@ -72,6 +72,8 @@ import compiler.refinements
 import compiler.loop_lower
 import compiler.brand_transp
 import compiler.core_effects
+import compiler.decl_names
+import compiler.symtab_build
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule)
@@ -301,13 +303,12 @@ fn dsg_rename_pfields_names(fs: [PField], acc: [String]) : [String] {
 # ====================================================================
 #
 # `T { v1, v2 }` desugars to `T { f1: v1, f2: v2 }` using `T`'s
-# declared field order. The parser (parse_record_pos_loop) tags each
-# positional value with a `__pos_<i>__` field-name sentinel; this
-# pass rewrites those sentinels into the real field names by
-# consulting the record-decl table.
+# declared field order. The parser (parse_record_pos_loop) plants each
+# positional value as a field with no name (`mk_field_pos`); this pass
+# gives each its real field name by consulting the record-decl table.
 #
 # Validation is reported here and gated upstream of all later passes
-# so a downstream walker never sees a sentinel field name. Two
+# so a downstream walker never sees a nameless field. Two
 # diagnostics:
 #   * unknown record name → "unknown record type T"
 #   * arity mismatch → "T expects N positional fields, got M"
@@ -502,7 +503,7 @@ fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: [RecInfo], file: String, err
       let rfis = dpr_fields(fis, recs, file, errs)
       let is_spread = match rfis.fields {
         [] -> false
-        [f0, ..._rest_] -> match f0 { FI(nm0, _) -> is_spread_field_marker(nm0) }
+        [f0, ..._rest_] -> match f0 { FI(_, v0) -> field_is_spread(v0) }
       }
       if is_spread {
         let r = dpr_record_spread(rh, name, rfis.fields, line, col, recs, file, rfis.errs)
@@ -667,19 +668,19 @@ fn dpr_opt_ret(or_: Option[HReturn], recs: [RecInfo], file: String, errs: Int) :
   }
 }
 
-# Rewrite `[FI("__pos_0__", e0), ...]` into named `[FI(field0, e0), ...]`
+# Rewrite positional fields `[e0, ...]` into named `[FI(field0, e0), ...]`
 # using the record's declared field order. Reports diagnostics for
 # unknown record names and arity mismatches.
 fn dpr_record_lit(name: String, fis: [FieldInit], line: Int, col: Int, recs: [RecInfo], file: String, errs: Int) : DPRFields / Console + File {
 
   let is_pos = match fis {
     [] -> false
-    [f, ..._rest] -> match f { FI(nm, _) -> is_pos_field_marker(nm) }
+    [f, ..._rest] -> match f { FI(_, v) -> field_is_pos(v) }
   }
   if not is_pos {
     DPRFields { fields: fis, errs: errs }
   } else {
-    # Positional record-lit: every field is a `__pos_<i>__` marker
+    # Positional record-lit: every field is nameless
     # at this point, so probing by field name does not disambiguate
     # same-(name, arity) collisions. Fall back to the bare-name
     # lookup; the field-set tie-breaker activates downstream in
@@ -717,7 +718,7 @@ fn rename_pos_fields(fis: [FieldInit], fds: [FieldDecl]) : [FieldInit] {
       [] -> [fi, ...frest]
       [fd, ...drest] -> match fi {
         FI(_, val) -> match fd {
-          FD(_, real_name, _, _) -> [FI(real_name, val), ...rename_pos_fields(frest, drest)]
+          FD(_, real_name, _, _) -> [FI(real_name, field_written(val)), ...rename_pos_fields(frest, drest)]
         }
       }
     }
@@ -835,14 +836,15 @@ fn dpr_record_spread(
   errs: Int
 ) : DPRSpread / Console + File {
 
-  # Split: head FI is the spread sentinel carrying `src`; rest are
+  # Split: head FI is the spread field carrying `src`; rest are
   # named overrides (parser already rejected pun / positional /
   # second-spread, so each FI here pairs a real field name with an
   # already-recursed expression).
   match fis {
     [] -> DPRSpread { expr: mk_expr(ERecordLit(rh, name, fis), line, col), errs: errs }
     [head, ...overrides] -> match head {
-      FI(_marker, src) -> {
+      FI(_, marked) -> {
+        let src = field_written(marked)
         # Probe by the first override's field name to disambiguate
         # same-(name, arity) record collisions. Falls
         # back to bare lookup when no overrides accompany the spread
@@ -1117,6 +1119,29 @@ pub fn lower_axiom_one(d: Decl) : Decl {
 #[doc("Synthesise the predicate fn backing each `type T = base where pred` refinement alias.")]
 pub fn synthesize_refine_pred_fns(decls: [Decl], target_mod: String) : [Decl] =
   synth_refine_loop(decls, target_mod, target_mod, [])
+
+#[doc("The identity of each predicate fn `synthesize_refine_pred_fns` mints for `decls`.")]
+pub fn refine_pred_fn_syms(decls: [Decl], target_mod: String) : [SymId] =
+  refine_pred_syms_loop(decls, target_mod, target_mod, [])
+
+fn refine_pred_syms_loop(decls: [Decl], target_mod: String, cur_mod: String,
+                         acc: [SymId]) : [SymId] = match decls {
+  [] -> acc
+  [d, ...rest] -> {
+    let next_mod = decl_home_hint_reset(d, cur_mod, target_mod)
+    let minted = map(synth_refine_for_decl(d, None), (f) => fn_decl_sym(f, next_mod))
+    refine_pred_syms_loop(rest, target_mod, next_mod, list_append(minted, acc))
+  }
+}
+
+#[doc("The identity of the fn `d` declares, homed at its own module or at `root` when it carries none; `sym_none()` for any other declaration.")]
+pub fn fn_decl_sym(d: Decl, root: String) : SymId = match d {
+  DFn(_, n, _, _, _, _, _, _, _, mo, _) -> match mo {
+    Some(m) -> sym_derive(NCFn, n, m)
+    None    -> sym_derive(NCFn, n, root)
+  }
+  _ -> sym_none()
+}
 
 fn synth_refine_loop(decls: [Decl], target_mod: String, cur_mod: String,
                        acc: [Decl]) : [Decl] {
@@ -1499,6 +1524,30 @@ fn mk_cell_get(n: String, line: Int, col: Int) : ExprKind {
   ECall(getter, [])
 }
 
+# `@x`, the operand `x` of a `MkDeref` call. On a `Ref[T]` named `n` it
+# is the read `n.get()`, which the alias rewrite maps to
+# `Mutable.ref_get(n)`. A `var`/`State`/`Reader` cell reads naked and is
+# not a `Ref`, so `@` on one is rejected and the node stays as written.
+fn lcr_deref(callee: Expr, x: Expr, caps: [String], reject_at: Bool, line: Int, col: Int, file: String, errs: Int) : VLExpr / Console + File = match x.kind {
+  EVar(n) ->
+    if list_has(caps, n) {
+      diag_error(file, line, col, concat_all([
+        "`@", n, "` is not how a `var` cell is read — read it naked, as `", n, "`"
+      ]))
+      diag_help(concat_all([
+        "`@` dereferences a first-class `Ref[T]`; a `var`/`State`/`Reader` cell is block-local and reads without `@`"
+      ]))
+      VLExpr { expr: mk_expr(ECall(callee, [x]), line, col), errs: errs + 1 }
+    } else {
+      let getter = mk_expr(EField(mk_ref(n, x.line, x.col), "get"), line, col)
+      VLExpr { expr: mk_expr(ECall(getter, []), line, col), errs: errs }
+    }
+  _ -> {
+    let r = lcr_expr(x, caps, reject_at, file, errs)
+    VLExpr { expr: mk_expr(ECall(callee, [r.expr]), line, col), errs: r.errs }
+  }
+}
+
 fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, file: String, errs: Int) : VLExpr / Console + File {
 
   match k {
@@ -1510,30 +1559,19 @@ fn lcr_kind(k: ExprKind, caps: [String], reject_at: Bool, line: Int, col: Int, f
     # one and needs no cell read.
     ESym(i, inst, n) -> VLExpr { expr: mk_expr(ESym(i, inst, n), line, col), errs: errs }
     ECall(callee, args_) -> match callee.kind {
+      EMark(MkDeref) -> match args_ {
+        [x] -> lcr_deref(callee, x, caps, reject_at, line, col, file, errs)
+        _   -> VLExpr { expr: mk_expr(k, line, col), errs: errs }
+      }
+      # A var's slot: every late read of the var is sent to it by the
+      # enclosing block, so it becomes the allocation it stood for.
+      EMark(MkVarSlot(_)) -> {
+        let ra = lcr_exprs(args_, caps, reject_at, file, errs)
+        VLExpr { expr: mk_expr(var_slot_call(k, ra.exprs), line, col), errs: ra.errs }
+      }
       EField(base, fname) -> match base.kind {
         EVar(n) ->
-          if fname == "__deref" {
-            if list_has(caps, n) {
-              # `@cell`. A `var`/`State`/`Reader` cell reads naked; `@`
-              # is the deref of a first-class `Ref[T]`, which a cell is
-              # not. Reject it.
-              diag_error(file, line, col, concat_all([
-                "`@", n, "` is not how a `var` cell is read — read it naked, as `", n, "`"
-              ]))
-              diag_help(concat_all([
-                "`@` dereferences a first-class `Ref[T]`; a `var`/`State`/`Reader` cell is block-local and reads without `@`"
-              ]))
-              let ra = lcr_exprs(args_, caps, reject_at, file, errs + 1)
-              VLExpr { expr: mk_expr(ECall(callee, ra.exprs), line, col), errs: ra.errs }
-            } else {
-              # `@ref` — deref of a `Ref[T]`. Rewrite the sentinel to the
-              # real `ref.get()`; the alias rewrite maps it to
-              # `Mutable.ref_get(ref)`.
-              let getter = mk_expr(EField(mk_ref(n, base.line, base.col), "get"), line, col)
-              let ra = lcr_exprs(args_, caps, reject_at, file, errs)
-              VLExpr { expr: mk_expr(ECall(getter, ra.exprs), line, col), errs: ra.errs }
-            }
-          } else if list_has(caps, n) and (fname == "get" or fname == "set") {
+          if list_has(caps, n) and (fname == "get" or fname == "set") {
             # A real State op on the cell: `n.get()` (also what a naked
             # read lowers to) or `n.set(v)` (also what `n := v` lowers
             # to). Legal — recurse into the args only, NOT the callee,
@@ -2751,17 +2789,24 @@ type VarSlotOp = VsGet | VsSet
 fn var_slot_name(name: String) : String = string_concat(name, "__slot")
 
 # The `let` a var's slot lowering mints: its var's name and the slot's.
+# Its value is a `MkVarSlot` call on the allocation's callee and
+# arguments until the cell-read relowering turns it into that call.
 fn var_slot_of(p: Pattern, rhs: Expr) : Option[VarSlot] = match p.pkind {
   PBind(s) -> match rhs.kind {
-    ECall(f, [_, _]) -> match f.kind {
-      EVar(fname) -> if fname == "array_make" and ends_with(s, "__slot") {
-        Some(VarSlot(string_slice(s, 0, string_length(s) - 6), s))
-      } else { None }
+    ECall(f, _) -> match f.kind {
+      EMark(MkVarSlot(n)) -> Some(VarSlot(n, s))
       _ -> None
     }
     _ -> None
   }
   _ -> None
+}
+
+# The call a var's slot stands for, from the operands of its mark: the
+# callee, then the arguments. `k` is the marked node itself.
+fn var_slot_call(k: ExprKind, operands: [Expr]) : ExprKind = match operands {
+  [f, ...xs] -> ECall(f, xs)
+  []         -> k
 }
 
 fn specialise_body(name: String, slot_name: String, e: Expr) : Expr {
@@ -2859,8 +2904,9 @@ fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
         if init_is_safe(init_d) and not body_escapes(name, inner_expr) {
           let slot_name = var_slot_name(name)
           let slot_init = mk_expr(
-            ECall(mk_ref("array_make", line, col),
-                  [mk_expr(mk_int_synth(1), line, col), init_d]),
+            ECall(mk_expr(EMark(MkVarSlot(name)), line, col),
+                  [mk_ref("array_make", line, col),
+                   mk_expr(mk_int_synth(1), line, col), init_d]),
             line, col)
           let let_pat = mk_pat(PBind(slot_name), line, col)
           let let_stmt = SLet(let_pat, None, slot_init)

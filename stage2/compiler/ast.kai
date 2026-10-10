@@ -329,6 +329,21 @@ pub type Mark = MkFuseMissing | MkScrutinee | MkGuardDrop | MkBorrow
   # A `region { }` block as the parser read it: called on the block, or
   # on a one-parameter lambda that names the region.
   | MkRegion
+  # A record literal's field written without a name: a positional value,
+  # and the `...src` a spread copies from. Called on the value, in the
+  # field's slot, until the record desugar gives every field its name.
+  | MkFieldPos | MkFieldSpread
+  # `@x` on a bare name, called on that reference: the cell-read lowering
+  # decides whether `x` is a `Ref` to read or a cell that reads naked.
+  | MkDeref
+  # A `var` lowered to a one-cell slot, naming the var: stands for the
+  # call that allocates the slot, called on that call's callee and
+  # arguments, until the cell-read relowering has sent every late read
+  # of the var to the slot.
+  | MkVarSlot(String)
+  # The collection of an index read while the read is typed: bound in the
+  # typing environment only, and replaced by the typed collection after.
+  | MkIndexColl
 
 #[doc("A compiler-internal operation, written `$name(args)`. The set is closed because this compiler implements every one of them; `compiler.intrinsics` holds the spelling each has after the `$`.")]
 #[derive(BinSerialize)]
@@ -1437,6 +1452,15 @@ pub fn mk_int_synth(v: Int) : ExprKind = EInt(v, "")
 pub fn lam_pat_binder_name(line: Int, col: Int) : String =
   string_concat_all(["__lam_pat_", int_to_string(line), "_", int_to_string(col), "__"])
 
+#[doc("The binder a point-free section's receiver is bound to. Only the parser mints it, and a parameter has no slot for its kind, so the kind rides this name: it is spelled here and nowhere else.")]
+pub fn point_free_binder() : String = "__pl"
+
+#[doc("True when `ps` are the parameters of a point-free section, a lambda the author wrote with a leading dot.")]
+pub fn params_point_free(ps: [Param]) : Bool = match ps {
+  [p] -> p.pname == point_free_binder()
+  _   -> false
+}
+
 #[doc("Render an integer literal: the author's spelling when there is one, else the decimal value.")]
 pub fn int_lit_text(v: Int, span: String) : String =
   if span == "" { int_to_string(v) } else { span }
@@ -1565,19 +1589,58 @@ pub type Row = {
 # row variable id within the enclosing function declaration.
 pub type RVBind = RVB(String, Int)
 
-# Synthetic field-name markers (issue #326). The parser injects these
-# sentinel names into anonymous-record / positional-tuple FieldInit
-# lists; downstream passes (record-literal desugar, codegen) branch on
-# them. They are an AST-shape convention shared between the parser and
-# its consumers, so they live with the AST model rather than inside the
-# parser. Real field names cannot start with `__`, so the sentinels are
-# unambiguous.
-pub fn pos_field_marker(i: Int) : String =
-  string_concat("__pos_", string_concat(int_to_string(i), "__"))
+# A record literal's field is written four ways: `...base`, a positional
+# value, a pun (`x`), and `name: value`. The first two have no name, so
+# their slot holds "" and their value is called by a mark; a pun wraps
+# its value in `SfFieldPun`.
 
-pub fn spread_field_marker() : String = "__spread__"
+#[doc("The init of a positional field: no name, its value called by `MkFieldPos`.")]
+pub fn mk_field_pos(value: Expr) : FieldInit = FI("", field_marked(MkFieldPos, value))
 
-pub fn is_spread_field_marker(s: String) : Bool = s == "__spread__"
+#[doc("The init a `...src` spread occupies: no name, its source called by `MkFieldSpread`.")]
+pub fn mk_field_spread(src: Expr) : FieldInit = FI("", field_marked(MkFieldSpread, src))
+
+fn field_marked(m: Mark, value: Expr) : Expr =
+  mk_expr(ECall(mk_expr(EMark(m), value.line, value.col), [value]), value.line, value.col)
+
+#[doc("The value of a positional field, or None when the field is of any other kind.")]
+pub fn field_pos_value(value: Expr) : Option[Expr] = match value.kind {
+  ECall(f, [inner]) -> match f.kind {
+    EMark(MkFieldPos) -> Some(inner)
+    _ -> None
+  }
+  _ -> None
+}
+
+#[doc("The source a spread field copies from, or None when the field is of any other kind.")]
+pub fn field_spread_value(value: Expr) : Option[Expr] = match value.kind {
+  ECall(f, [inner]) -> match f.kind {
+    EMark(MkFieldSpread) -> Some(inner)
+    _ -> None
+  }
+  _ -> None
+}
+
+#[doc("True when a field's value is a positional one.")]
+pub fn field_is_pos(value: Expr) : Bool = match field_pos_value(value) {
+  Some(_) -> true
+  None    -> false
+}
+
+#[doc("True when a field's value is the source of a spread.")]
+pub fn field_is_spread(value: Expr) : Bool = match field_spread_value(value) {
+  Some(_) -> true
+  None    -> false
+}
+
+#[doc("The expression the author wrote in a field's slot: a positional value or a spread source from under its mark, any other value as it is.")]
+pub fn field_written(value: Expr) : Expr = match field_spread_value(value) {
+  Some(src) -> src
+  None      -> match field_pos_value(value) {
+    Some(v) -> v
+    None    -> value
+  }
+}
 
 #[doc("The init of a punned field `{ x }`: the field's own name, its value wrapped in `SfFieldPun` so the writer can restore the shorthand.")]
 pub fn mk_field_pun(name: String, value: Expr) : FieldInit =
@@ -1591,27 +1654,6 @@ pub fn field_pun_value(value: Expr) : Option[Expr] = match value.kind {
   }
   _ -> None
 }
-
-pub fn is_pos_field_marker(s: String) : Bool {
-  let n = string_length(s)
-  if n < 8 { false }
-  else {
-    match char_at(s, 0) { Some(c0) -> if c0 != '_' { false } else {
-      match char_at(s, 1) { Some(c1) -> if c1 != '_' { false } else {
-        match char_at(s, 2) { Some(c2) -> if c2 != 'p' { false } else {
-          match char_at(s, 3) { Some(c3) -> if c3 != 'o' { false } else {
-            match char_at(s, 4) { Some(c4) -> if c4 != 's' { false } else {
-              match char_at(s, 5) { Some(c5) -> c5 == '_'
-                None -> false
-              }
-              } None -> false }
-            } None -> false }
-          } None -> false }
-        } None -> false }
-      } None -> false }
-  }
-}
-
 
 # ====================================================================
 # Record table (issue #648) — moved from main.kai under issue #677
