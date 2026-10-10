@@ -16,45 +16,38 @@ import compiler.ast
 import compiler.expr_positions
 import compiler.infer
 import compiler.util
-import compiler.decl_names
-import compiler.symtab_build
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
 
-#[doc("Print the declaration behind every nominal type in the root file's typed function bodies; `target` is the root module.")]
-pub fn dump_tycon_ids(decls: [Decl], target: String) : Int / Console {
-  let names = tid_decl_names(decls, target, map(core_type_names(), (n) => TidName(sym_raw(core_type_sym(n)), string_concat(n, "@core"))))
-  tid_decls(decls, names)
+#[doc("Print the declaration behind every nominal type in the root file's typed function bodies; `tab` holds the program's declarations.")]
+pub fn dump_tycon_ids(decls: [Decl], tab: SymTab) : Int / Console {
+  let names = tid_decl_names(decls, map(core_type_names(), (n) => TidName(core_type_sym(n), Some("core"), false)))
+  tid_decls(decls, tab, names)
   0
 }
 
-# One type declaration: its identity and how the dump renders it.
-type TidName = TidName(Int, String)
+# One declaration a nominal type may name: its identity, the module
+# declaring it, and whether it is a constructor.
+type TidName = TidName(SymId, Option[String], Bool)
 
-fn tid_decl_names(ds: [Decl], target: String, acc: [TidName]) : [TidName] = match ds {
+fn tid_decl_names(ds: [Decl], acc: [TidName]) : [TidName] = match ds {
   [] -> acc
   [d, ...rest] -> match decl_transparent_inner(d) {
-    Some(inner) -> tid_decl_names([inner, ...rest], target, acc)
+    Some(inner) -> tid_decl_names([inner, ...rest], acc)
     None -> match d {
-      DType(_, nm, _, body, _, _, mo, _, s) ->
-        tid_decl_names(rest, target, tid_ctor_names(body, mo, target,
-          [TidName(sym_raw(s), concat_all([nm, "@", tid_home(mo)])), ...acc]))
-      _ -> tid_decl_names(rest, target, acc)
+      DType(_, s, _, body, _, _, mo, _) ->
+        tid_decl_names(rest, tid_ctor_names(body, mo, [TidName(s, mo, false), ...acc]))
+      _ -> tid_decl_names(rest, acc)
     }
   }
 }
 
 # A type declaration is listed before its constructors, so an id both
 # could answer reads as the type.
-fn tid_ctor_names(body: TypeBody, mo: Option[String], target: String, acc: [TidName]) : [TidName] = match body {
-  TBSum(vs) -> list_append(acc, map(vs, (v) => match v {
-    Var(n, _) -> TidName(sym_raw(sym_derive(NCCtor, n, tid_owner(mo, target))),
-                         concat_all([n, "@", tid_home(mo), " (constructor)"]))
-  }))
+fn tid_ctor_names(body: TypeBody, mo: Option[String], acc: [TidName]) : [TidName] = match body {
+  TBSum(vs) -> list_append(acc, map(vs, (v) => match v { Var(c, _) -> TidName(c, mo, true) }))
   _ -> acc
-}
-
-fn tid_owner(mo: Option[String], target: String) : String = match mo {
-  Some(m) -> m
-  None    -> target
 }
 
 fn tid_home(mo: Option[String]) : String = match mo {
@@ -62,88 +55,88 @@ fn tid_home(mo: Option[String]) : String = match mo {
   None -> "(root)"
 }
 
-fn tid_render(names: [TidName], s: SymId) : String =
-  if sym_raw(s) < 0 { "-" } else { tid_lookup(names, sym_raw(s)) }
+fn tid_render(tab: SymTab, names: [TidName], s: SymId) : String =
+  if sym_raw(s) < 0 { "-" } else { tid_lookup(tab, names, s) }
 
-fn tid_lookup(names: [TidName], id: Int) : String = match names {
-  [] -> concat_all(["#", int_to_string(id), "?"])
-  [TidName(i, r), ...rest] -> if i == id { r } else { tid_lookup(rest, id) }
+fn tid_lookup(tab: SymTab, names: [TidName], s: SymId) : String = match names {
+  [] -> concat_all(["#", int_to_string(sym_raw(s)), "?"])
+  [TidName(i, mo, is_ctor), ...rest] ->
+    if sym_raw(i) != sym_raw(s) { tid_lookup(tab, rest, s) }
+    else { concat_all([written_text(decl_name(tab, s)), "@", tid_home(mo), if is_ctor { " (constructor)" } else { "" }]) }
 }
 
-fn tid_decls(ds: [Decl], names: [TidName]) : Unit / Console = match ds {
+fn tid_decls(ds: [Decl], tab: SymTab, names: [TidName]) : Unit / Console = match ds {
   [] -> ()
   [d, ...rest] -> {
     match d {
-      DFn(_, nm, _, _, _, _, body, _, _, None, _) -> tid_fn(nm, body, names)
+      DFn(_, fid, _, _, _, _, body, _, _, None) -> tid_fn(tab, fid, body, names)
       _ -> ()
     }
-    tid_decls(rest, names)
+    tid_decls(rest, tab, names)
   }
 }
 
-fn tid_fn(nm: String, body: Expr, names: [TidName]) : Unit / Console {
-  print(concat_all(["fn ", nm]))
-  tid_print(list_reverse(tid_expr(body, [])), names)
+fn tid_fn(tab: SymTab, fid: FnId, body: Expr, names: [TidName]) : Unit / Console {
+  print(concat_all(["fn ", written_text(decl_name(tab, fnid_sym(fid)))]))
+  tid_print(tab, list_reverse(tid_expr(tab, body, [])), names)
 }
 
-# A nominal type met in a body: its printed form and its identity.
-type TidSeen = TidSeen(String, SymId)
-
-fn tid_print(seen: [TidSeen], names: [TidName]) : Unit / Console = match seen {
+fn tid_print(tab: SymTab, seen: [Ty], names: [TidName]) : Unit / Console = match seen {
   [] -> ()
-  [TidSeen(t, s), ...rest] -> {
-    print(concat_all(["  ", t, "  ", tid_render(names, s)]))
-    tid_print(rest, names)
+  [t, ...rest] -> {
+    print(concat_all(["  ", inf_ty_to_string(tab, t), "  ", tid_render(tab, names, tid_head(t))]))
+    tid_print(tab, rest, names)
   }
 }
 
-# Newest first; the caller reverses into first-appearance order.
-fn tid_expr(e: Expr, acc: [TidSeen]) : [TidSeen] {
+fn tid_head(t: Ty) : SymId = match t {
+  TyCon(s, _) -> s
+  _           -> sym_none()
+}
+
+# The nominal types met in a body, newest first; the caller reverses
+# into first-appearance order.
+fn tid_expr(tab: SymTab, e: Expr, acc: [Ty]) : [Ty] {
   let here = match e.ty {
-    Some(t) -> if is_op_callee(e) { acc } else { tid_ty(t, acc) }
+    Some(t) -> if is_op_callee(e) { acc } else { tid_ty(tab, t, acc) }
     None -> acc
   }
-  tid_children(xp_positions(e), here)
+  tid_children(tab, xp_positions(e), here)
 }
 
 # An op's callee carries the effect instance it performs, not a nominal type.
 fn is_op_callee(e: Expr) : Bool = match e.kind {
-  EName(n)       -> string_index_of_char(n, '.') >= 0 and is_con(e.ty)
-  ESym(_, _, n) -> string_index_of_char(n, '.') >= 0 and is_con(e.ty)
-  _             -> false
+  EOp(_) -> true
+  _      -> false
 }
 
-fn is_con(t: Option[Ty]) : Bool = match t {
-  Some(TyCon(_, _, _, _)) -> true
-  _ -> false
-}
-
-fn tid_children(ps: [XPos], acc: [TidSeen]) : [TidSeen] = match ps {
+fn tid_children(tab: SymTab, ps: [XPos], acc: [Ty]) : [Ty] = match ps {
   [] -> acc
-  [XP(_, c), ...rest] -> tid_children(rest, tid_expr(c, acc))
+  [XP(_, c), ...rest] -> tid_children(tab, rest, tid_expr(tab, c, acc))
 }
 
-fn tid_ty(t: Ty, acc: [TidSeen]) : [TidSeen] = match t {
-  TyCon(_, _, args, s) -> tid_tys(args, tid_add(acc, TidSeen(inf_ty_to_string(t), s)))
-  TyListT(inner) -> tid_ty(inner, acc)
-  TyFnT(ps, ret, _) -> tid_ty(ret, tid_tys(ps, acc))
-  TyDimT(base, _) -> tid_ty(base, acc)
-  TyRefineT(base, _) -> tid_ty(base, acc)
+fn tid_ty(tab: SymTab, t: Ty, acc: [Ty]) : [Ty] = match t {
+  TyCon(_, args) -> tid_tys(tab, args, tid_add(tab, acc, t))
+  TyListT(inner) -> tid_ty(tab, inner, acc)
+  TyFnT(ps, ret, _) -> tid_ty(tab, ret, tid_tys(tab, ps, acc))
+  TyDimT(base, _) -> tid_ty(tab, base, acc)
+  TyRefineT(base, _) -> tid_ty(tab, base, acc)
   _ -> acc
 }
 
-fn tid_tys(ts: [Ty], acc: [TidSeen]) : [TidSeen] = match ts {
+fn tid_tys(tab: SymTab, ts: [Ty], acc: [Ty]) : [Ty] = match ts {
   [] -> acc
-  [t, ...rest] -> tid_tys(rest, tid_ty(t, acc))
+  [t, ...rest] -> tid_tys(tab, rest, tid_ty(tab, t, acc))
 }
 
-fn tid_add(acc: [TidSeen], x: TidSeen) : [TidSeen] =
-  if tid_has(acc, x) { acc } else { [x, ...acc] }
+fn tid_add(tab: SymTab, acc: [Ty], t: Ty) : [Ty] =
+  if tid_has(tab, acc, t) { acc } else { [t, ...acc] }
 
-fn tid_has(acc: [TidSeen], x: TidSeen) : Bool = match acc {
+# Two types are one line of the dump when they name one declaration and
+# print alike.
+fn tid_has(tab: SymTab, acc: [Ty], t: Ty) : Bool = match acc {
   [] -> false
-  [TidSeen(t, s), ...rest] -> match x {
-    TidSeen(xt, xs) ->
-      if t == xt and sym_raw(s) == sym_raw(xs) { true } else { tid_has(rest, x) }
-  }
+  [x, ...rest] ->
+    if sym_raw(tid_head(x)) == sym_raw(tid_head(t)) and inf_ty_to_string(tab, x) == inf_ty_to_string(tab, t) { true }
+    else { tid_has(tab, rest, t) }
 }

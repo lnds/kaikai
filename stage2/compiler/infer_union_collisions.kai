@@ -12,6 +12,11 @@ import compiler.diag_file
 import compiler.infer
 import compiler.infer_index
 import compiler.modules
+import compiler.written
+import compiler.decl_names
+import compiler.symtab
+import compiler.symtab_build
+import compiler.decl_text
 
 # === D2: name-collision error semantics ===
 #
@@ -34,89 +39,64 @@ import compiler.modules
 #   - `A | A` (same parent claiming `A` twice) is D6 idempotence,
 #     not D2 — `normalize_union` collapses the duplicate, no error.
 
-type VariantClaim = VC(String, String, String, Int, Int)
-#                       ^vname  ^home   ^parent ^line ^col   (line/col of
-#                                                     the claiming TBSum)
+type VariantClaim = VC(SymId, SymId, Int, Int)
+#                       ^variant ^parent ^line ^col   (line/col of the
+#                                                claiming TBSum)
 
-# Claims bucketed by variant name. A bucket keeps insertion order
-# newest-first, so its first match is the one a scan of all claims finds.
+# Claims bucketed by the variant's constructor id, which a second sum of
+# the same home claiming the name derives too. A bucket keeps insertion
+# order newest-first, so its first match is the one a scan of all claims
+# finds.
 type Claims = NameIndex[VariantClaim]
 
-# Find the first claim of `vname` from the same home whose parent
-# differs from `parent`. Same-parent claims are not collisions (D6
-# idempotence; the union normalises to a singleton). Two homes each
-# claiming the name is not a collision either — that is ctor
-# overloading, resolved at the use site.
-fn find_other_claim(chain: [VariantClaim], vname: String,
-    home: String, parent: String) : Option[VariantClaim] {
+# Find the first claim in the variant's bucket whose parent differs from
+# `parent`. Same-parent claims are not collisions (D6 idempotence; the
+# union normalises to a singleton). Two homes each claiming the name are
+# two constructors — ctor overloading, resolved at the use site.
+fn find_other_claim(chain: [VariantClaim], parent: SymId) : Option[VariantClaim] {
   match chain {
     [] -> None
     [c, ...rest] -> match c {
-      VC(n, h, p, _, _) -> {
-        if n == vname and h == home and p != parent { Some(c) }
-        else { find_other_claim(rest, vname, home, parent) }
+      VC(_, p, _, _) -> {
+        if sym_raw(p) != sym_raw(parent) { Some(c) }
+        else { find_other_claim(rest, parent) }
       }
     }
   }
 }
 
 fn add_claim(claims: Claims, c: VariantClaim) : Claims =
-  match c { VC(n, _, _, _, _) -> idx_prepend(claims, n, c) }
+  match c { VC(v, _, _, _) -> idx_prepend_sym(claims, v, c) }
 
 # Public entry: validate every TBSum's variants against earlier
 # claims. Returns the count of D2 errors (0 means clean). Plumbed
 # into `compile_source` next to `pred_errs` and `var_use_errs`.
 #[doc("infer: `validate_union_collisions_decls` — typer entry point invoked by the driver.")]
-pub fn validate_union_collisions_decls(ds: [Decl], df: DiagFiles) : Int / Console + File {
+pub fn validate_union_collisions_decls(ds: [Decl], tab: SymTab, df: DiagFiles) : Int / Console + File {
 
-  let top_names = collect_top_type_names(ds)
+  let top_names = collect_top_type_names(ds, tab)
   # D2 only governs root-file unions. `target_mod` is the root file's
   # stamped module_origin (`tag_target_decls_module_origin`); a DType
   # whose origin differs belongs to a core/imported module and must
   # not participate — a user union reusing a core type's variant name
   # is ctor overloading resolved at use sites, not a collision.
   let target_mod = module_name_of_path(df_root(df))
-  # pre-seed the claim table with the builtin variant
-  # constructors registered by `add_builtin_variant_sigs` (Result.Ok,
-  # Result.Err, Option.Some, Option.None). A user `pub type T = Ok(...)`
-  # would otherwise overwrite the bare `Ok` entry in the TyEnv —
-  # because `add_variants_loop` prepends the user scheme — and silently
-  # break every core site that constructs `Result.Ok`. Catching the
-  # collision here gives a precise diagnostic at the user's DType
-  # instead of a cascade of unrelated type-mismatch errors pointing at
-  # nonexistent line numbers in the user file.
-  validate_union_collisions_loop(ds, top_names, df, target_mod, 0,
-      builtin_variant_claims())
+  validate_union_collisions_loop(ds, tab, top_names, df, target_mod, 0, idx_empty())
 }
 
-# The home a decl's claims are scoped to. Root-file decls (unstamped, or
-# stamped with the root module's own name) share the empty home with the
-# builtin claims, so a root union shadowing `Result.Ok` is still caught.
-fn decl_claim_home(origin: Option[String], target_mod: String) : String =
+# Root-file decls are unstamped, or stamped with the root module's own name.
+fn decl_is_root(origin: Option[String], target_mod: String) : Bool =
   match origin {
-    None    -> ""
-    Some(m) -> if m == target_mod { "" } else { m }
+    None    -> true
+    Some(m) -> m == target_mod
   }
 
-# builtin variant constructors that share a top-level
-# namespace with user-declared variants. Mirrors the entries injected
-# by `add_builtin_variant_sigs`. Kept in sync manually — both lists
-# are short and stable.
-fn builtin_variant_claims() : Claims =
-  index_claims([
-    VC("Some", "", "Option", 0, 0),
-    VC("None", "", "Option", 0, 0),
-    VC("Ok",   "", "Result", 0, 0),
-    VC("Err",  "", "Result", 0, 0)
-  ], idx_empty())
+# A root variant spelled like a constructor the core builds (`Some`,
+# `None`, `Ok`, `Err`) is a reference to that one, never a claim.
+fn names_core_ctor(tab: SymTab, vname: String) : Bool =
+  st_valid(tab, sym_derive(NCCtor, vname, core_type_home()))
 
-fn index_claims(cs: [VariantClaim], acc: Claims) : Claims =
-  match cs {
-    [] -> acc
-    [c, ...rest] -> index_claims(rest, add_claim(acc, c))
-  }
-
-fn validate_union_collisions_loop(remaining: [Decl], top_names: [String],
+fn validate_union_collisions_loop(remaining: [Decl], tab: SymTab, top_names: [String],
     df: DiagFiles,
     target_mod: String, errs: Int,
     claims: Claims) : Int / Console + File {
@@ -128,44 +108,42 @@ fn validate_union_collisions_loop(remaining: [Decl], top_names: [String],
       # union participates without colliding with the root's: two homes
       # claiming one variant name is ctor overloading resolved at the
       # use site, not D2. Within one home the check is unchanged.
-      DType(_, parent, _, body, line, col, origin, _, _) -> match body {
+      DType(_, parent, _, body, line, col, origin, _) -> match body {
         TBSum(vs) -> {
           let decl_file = decl_diag_file(d, df)
-          let home = decl_claim_home(origin, target_mod)
-          let r = check_variants_for_collision(vs, home, parent, line, col,
+          let r = check_variants_for_collision(vs, tab, decl_is_root(origin, target_mod), parent, line, col,
           top_names, claims, decl_file, errs)
-          validate_union_collisions_loop(rest, top_names, df, target_mod, r.errs, r.claims)
+          validate_union_collisions_loop(rest, tab, top_names, df, target_mod, r.errs, r.claims)
         }
-        _ -> validate_union_collisions_loop(rest, top_names, df, target_mod, errs, claims)
+        _ -> validate_union_collisions_loop(rest, tab, top_names, df, target_mod, errs, claims)
       }
-      _ -> validate_union_collisions_loop(rest, top_names, df, target_mod, errs, claims)
+      _ -> validate_union_collisions_loop(rest, tab, top_names, df, target_mod, errs, claims)
     }
   }
 }
 
 type CollisionResult = { errs: Int, claims: Claims }
 
-# One variant against the claims seen so far. Pre-declared names and
-# builtin claims (sentinel line/col 0) are references, not implicit
-# declarations, so neither reports.
-fn variant_collision_step(vname: String, home: String, parent: String,
+# One variant against the claims seen so far. A pre-declared name and a
+# root variant spelled like a core constructor are references, not
+# implicit declarations, so neither reports.
+fn variant_collision_step(v: SymId, tab: SymTab, is_root: Bool, parent: SymId,
     line: Int, col: Int, top_names: [String],
     claims: Claims,
-    decl_file: String) : CollisionResult / Console + File =
-  if list_has(top_names, vname) { CollisionResult { errs: 0, claims: claims } }
-  else { match find_other_claim(idx_chain(claims, vname), vname, home, parent) {
+    decl_file: String) : CollisionResult / Console + File = {
+  let vname = written_text(decl_name(tab, v))
+  if list_has(top_names, vname) or (is_root and names_core_ctor(tab, vname)) { CollisionResult { errs: 0, claims: claims } }
+  else { match find_other_claim(idx_chain_sym(claims, v), parent) {
     None -> CollisionResult { errs: 0,
-        claims: add_claim(claims, VC(vname, home, parent, line, col)) }
-    Some(prev) -> match prev {
-      VC(_, _, _, 0, 0) -> CollisionResult { errs: 0, claims: claims }
-      _ -> {
-        report_d2_collision(decl_file, vname, parent, line, col, prev)
-        CollisionResult { errs: 1, claims: claims }
-      }
+        claims: add_claim(claims, VC(v, parent, line, col)) }
+    Some(prev) -> {
+      report_d2_collision(tab, decl_file, vname, parent, line, col, prev)
+      CollisionResult { errs: 1, claims: claims }
     }
   } }
+}
 
-fn check_variants_for_collision(vs: [Variant], home: String, parent: String,
+fn check_variants_for_collision(vs: [Variant], tab: SymTab, is_root: Bool, parent: SymId,
     line: Int, col: Int,
     top_names: [String], claims: Claims,
     decl_file: String, errs: Int) : CollisionResult / Console + File {
@@ -173,10 +151,10 @@ fn check_variants_for_collision(vs: [Variant], home: String, parent: String,
   match vs {
     [] -> CollisionResult { errs: errs, claims: claims }
     [v, ...rest] -> match v {
-      Var(vname, _) -> {
-        let step = variant_collision_step(vname, home, parent, line, col,
+      Var(c, _) -> {
+        let step = variant_collision_step(c, tab, is_root, parent, line, col,
           top_names, claims, decl_file)
-        check_variants_for_collision(rest, home, parent, line, col,
+        check_variants_for_collision(rest, tab, is_root, parent, line, col,
           top_names, step.claims, decl_file,
           errs + step.errs)
       }
@@ -206,19 +184,19 @@ fn report_builtin_collision(file: String, vname: String, parent: String,
 # claim the name); the note points at the *earlier* decl; the hint
 # tells the user how to fix it. The wording matches the spec in the
 # lane brief verbatim modulo file paths.
-fn report_d2_collision(file: String, vname: String, parent: String,
+fn report_d2_collision(tab: SymTab, file: String, vname: String, parent: SymId,
     line: Int, col: Int, prev: VariantClaim) : Unit / Console + File {
   match prev {
-    VC(_, _, prev_parent, prev_line, prev_col) -> {
+    VC(_, prev_parent, prev_line, prev_col) -> {
       let msg = concat_all(["type '", vname,
           "' is declared by both 'type ",
-          prev_parent,
+          written_text(decl_name(tab, prev_parent)),
           " = ...' (",
           file, ":",
           int_to_string(prev_line), ":",
           int_to_string(prev_col),
           ") and 'type ",
-          parent,
+          written_text(decl_name(tab, parent)),
           " = ...' (",
           file, ":",
           int_to_string(line), ":",

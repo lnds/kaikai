@@ -12,6 +12,7 @@ import compiler.infer
 import compiler.infer_unit_habitant
 import compiler.infer_unit_expr
 import compiler.diag_file
+import compiler.symtab
 
 # Unit hygiene: walk the decl stream collecting every name
 # introduced by a `unit <Name>` declaration (atomic or aliased). The
@@ -76,12 +77,18 @@ fn collect_pub_unit_names_loop(decls: [Decl], acc: [String]) : [String] {
 #   - Unit-kind tparams (`impl[u: Measure] ...`) extend the visible
 #     set for the duration of a single decl; that scoping is handled
 #     in `validate_unit_refs_decl` itself.
-#[doc("infer: `validate_unit_refs_decls` — typer entry point invoked by the driver.")]
-pub fn validate_unit_refs_decls(decls: [Decl], scope: UnitScope,
+#[doc("infer: `validate_unit_refs_decls` — typer entry point invoked by the driver; `tab` names a type head already settled.")]
+pub fn validate_unit_refs_decls(decls: [Decl], tab: SymTab, scope: UnitScope,
                               df: DiagFiles) : Int / Console + File =
-  validate_unit_refs_decls_loop(decls, scope, df, 0)
+  validate_unit_refs_decls_loop(decls, UnitCx { units: scope, tab: tab }, df, 0)
 
-fn validate_unit_refs_decls_loop(decls: [Decl], scope: UnitScope,
+# The unit scope in force, and the table a settled type head is named from.
+type UnitCx = { units: UnitScope, tab: SymTab }
+
+fn unit_cx_add_locals(cx: UnitCx, names: [String]) : UnitCx =
+  UnitCx { units: unit_scope_add_locals(cx.units, names), tab: cx.tab }
+
+fn validate_unit_refs_decls_loop(decls: [Decl], scope: UnitCx,
                                     df: DiagFiles, errs: Int) : Int / Console + File {
   match decls {
     [] -> errs
@@ -94,7 +101,7 @@ fn validate_unit_refs_decls_loop(decls: [Decl], scope: UnitScope,
 
 # The `DImpl` arm re-enters the walk for the methods, which already
 # resolved their file from the enclosing decl.
-fn validate_unit_refs_sub_decls(decls: [Decl], scope: UnitScope,
+fn validate_unit_refs_sub_decls(decls: [Decl], scope: UnitCx,
                                   file: String, errs: Int) : Int / Console + File {
   match decls {
     [] -> errs
@@ -104,12 +111,12 @@ fn validate_unit_refs_sub_decls(decls: [Decl], scope: UnitScope,
   }
 }
 
-fn validate_unit_refs_decl(d: Decl, scope: UnitScope, file: String) : Int / Console + File = match d {
-  DFn(_, _, tparams, ps, ret, _, body, _, _, _, _) -> {
+fn validate_unit_refs_decl(d: Decl, scope: UnitCx, file: String) : Int / Console + File = match d {
+  DFn(_, _, tparams, ps, ret, _, body, _, _, _) -> {
     # Extend the scope with this fn's unit-kind tparams (parametric
     # impls like `impl[u: Measure] Show for Real<u>` introduce `u` as
     # a unit symbol valid only inside this body).
-    let local_scope = unit_scope_add_locals(scope, collect_unit_tparam_names(tparams))
+    let local_scope = unit_cx_add_locals(scope, collect_unit_tparam_names(tparams))
     let e0 = validate_unit_refs_params(ps, local_scope, file, 0)
     let e1 = match ret {
       Some(te) -> e0 + validate_unit_refs_te(te, local_scope, file)
@@ -119,22 +126,22 @@ fn validate_unit_refs_decl(d: Decl, scope: UnitScope, file: String) : Int / Cons
   }
   # a type decl's unit-kind tparams scope over its body
   # (`type Money[c: Currency] = Decimal<c>`), same as fn tparams.
-  DType(_, _, tparams, body, _, _, _, _, _) ->
+  DType(_, _, tparams, body, _, _, _, _) ->
     validate_unit_refs_typebody(body,
-      unit_scope_add_locals(scope, collect_unit_tparam_names(tparams)), file)
+      unit_cx_add_locals(scope, collect_unit_tparam_names(tparams)), file)
   # a unit alias body is shape-checked at its declaration —
   # expansion happens after this pass, so a Module-kind product could
   # otherwise ride in through the alias name.
   DUnit(_, _, UBAlias(body), _, line, col, _) ->
-    validate_unit_expr(body, scope, file, line, col) +
-    validate_module_unit_shape(body, scope, file, line, col) +
-    validate_semilattice_unit_shape(body, scope, file, line, col)
+    validate_unit_expr(body, scope.units, file, line, col) +
+    validate_module_unit_shape(body, scope.units, file, line, col) +
+    validate_semilattice_unit_shape(body, scope.units, file, line, col)
   DTest(_, body, _, _, _) -> validate_unit_refs_expr(body, scope, file)
   DBench(_, body, _, _, _) -> validate_unit_refs_expr(body, scope, file)
   DCheck(_, ps, body, _, _, _) ->
     validate_unit_refs_params(ps, scope, file, 0) +
     validate_unit_refs_expr(body, scope, file)
-  DEffect(_, _, _, ops, _, _, _, _, _) -> validate_unit_refs_eops(ops, scope, file, 0)
+  DEffect(_, _, _, ops, _, _, _, _) -> validate_unit_refs_eops(ops, scope, file, 0)
   DImpl(_, _, _, sub_decls, _, _, _, _) ->
     validate_unit_refs_sub_decls(sub_decls, scope, file, 0)
   DDerive(_, inner, _, _) -> validate_unit_refs_decl(inner, scope, file)
@@ -163,7 +170,7 @@ fn collect_unit_tparam_names_loop(tparams: [String], acc: [String]) : [String] {
   }
 }
 
-fn validate_unit_refs_params(ps: [Param], scope: UnitScope, file: String,
+fn validate_unit_refs_params(ps: [Param], scope: UnitCx, file: String,
                                 acc: Int) : Int / Console + File = match ps {
   [] -> acc
   [p, ...rest] -> {
@@ -175,7 +182,7 @@ fn validate_unit_refs_params(ps: [Param], scope: UnitScope, file: String,
   }
 }
 
-fn validate_unit_refs_eops(ops: [EffectOp], scope: UnitScope, file: String,
+fn validate_unit_refs_eops(ops: [EffectOp], scope: UnitCx, file: String,
                               acc: Int) : Int / Console + File = match ops {
   [] -> acc
   [op, ...rest] -> match op {
@@ -187,14 +194,14 @@ fn validate_unit_refs_eops(ops: [EffectOp], scope: UnitScope, file: String,
   }
 }
 
-fn validate_unit_refs_typebody(b: TypeBody, scope: UnitScope, file: String) : Int / Console + File = match b {
+fn validate_unit_refs_typebody(b: TypeBody, scope: UnitCx, file: String) : Int / Console + File = match b {
   TBAlias(te) -> validate_unit_refs_te(te, scope, file)
   TBRecord(fs) -> validate_unit_refs_fdecls(fs, scope, file, 0)
   TBSum(vs) -> validate_unit_refs_variants(vs, scope, file, 0)
   TBEffectAlias(_) -> 0
 }
 
-fn validate_unit_refs_fdecls(fs: [FieldDecl], scope: UnitScope, file: String,
+fn validate_unit_refs_fdecls(fs: [FieldDecl], scope: UnitCx, file: String,
                                 acc: Int) : Int / Console + File = match fs {
   [] -> acc
   [f, ...rest] -> match f {
@@ -205,7 +212,7 @@ fn validate_unit_refs_fdecls(fs: [FieldDecl], scope: UnitScope, file: String,
   }
 }
 
-fn validate_unit_refs_variants(vs: [Variant], scope: UnitScope, file: String,
+fn validate_unit_refs_variants(vs: [Variant], scope: UnitCx, file: String,
                                   acc: Int) : Int / Console + File = match vs {
   [] -> acc
   [v, ...rest] -> match v {
@@ -216,16 +223,16 @@ fn validate_unit_refs_variants(vs: [Variant], scope: UnitScope, file: String,
   }
 }
 
-fn validate_unit_refs_te(te: TypeExpr, scope: UnitScope, file: String) : Int / Console + File = match te.tkind {
-  TyName(_, _, targs) -> validate_unit_refs_te_list(targs, scope, file, 0)
+fn validate_unit_refs_te(te: TypeExpr, scope: UnitCx, file: String) : Int / Console + File = match te.tkind {
+  TyName(_, targs) -> validate_unit_refs_te_list(targs, scope, file, 0)
   TyList(inner) -> validate_unit_refs_te(inner, scope, file)
   TyFn(ps, ret, _) -> validate_unit_refs_te_list(ps, scope, file, 0) +
                        validate_unit_refs_te(ret, scope, file)
   TyDim(base, u) -> validate_unit_refs_te(base, scope, file) +
-                     validate_unit_expr(u, scope, file, te.line, te.col) +
-                     validate_module_unit_shape(u, scope, file, te.line, te.col) +
-                     validate_semilattice_unit_shape(u, scope, file, te.line, te.col) +
-                     validate_habitant_slots(base, u, scope, file, te.line, te.col)
+                     validate_unit_expr(u, scope.units, file, te.line, te.col) +
+                     validate_module_unit_shape(u, scope.units, file, te.line, te.col) +
+                     validate_semilattice_unit_shape(u, scope.units, file, te.line, te.col) +
+                     validate_habitant_slots(scope.tab, base, u, scope.units, file, te.line, te.col)
   TyRefine(base, _) -> validate_unit_refs_te(base, scope, file)
   # a compound row as a type argument — validate units
   # inside any parameterised labels it carries (`Reader[Int<m>]`).
@@ -235,23 +242,23 @@ fn validate_unit_refs_te(te: TypeExpr, scope: UnitScope, file: String) : Int / C
 
 # The head type name of a `TyDim`'s base (`Vec[Real]` -> `Vec`), or
 # empty when the base is not a named type.
-fn validate_unit_refs_row(row: RowExpr, scope: UnitScope, file: String) : Int / Console + File =
+fn validate_unit_refs_row(row: RowExpr, scope: UnitCx, file: String) : Int / Console + File =
   match row {
     REmpty -> 0
     RClosed(labels) -> validate_unit_refs_rls(labels, scope, file, 0)
     ROpen(_, labels) -> validate_unit_refs_rls(labels, scope, file, 0)
   }
 
-fn validate_unit_refs_rls(ls: [RowLabel], scope: UnitScope, file: String,
+fn validate_unit_refs_rls(ls: [RowLabel], scope: UnitCx, file: String,
                              acc: Int) : Int / Console + File = match ls {
   [] -> acc
-  [RL(_, ts, _), ...rest] -> {
+  [RL(_, ts), ...rest] -> {
     let e1 = acc + validate_unit_refs_te_list(ts, scope, file, 0)
     validate_unit_refs_rls(rest, scope, file, e1)
   }
 }
 
-fn validate_unit_refs_te_list(ts: [TypeExpr], scope: UnitScope, file: String,
+fn validate_unit_refs_te_list(ts: [TypeExpr], scope: UnitCx, file: String,
                                  acc: Int) : Int / Console + File = match ts {
   [] -> acc
   [t, ...rest] -> {
@@ -260,10 +267,10 @@ fn validate_unit_refs_te_list(ts: [TypeExpr], scope: UnitScope, file: String,
   }
 }
 
-fn validate_unit_refs_expr(e: Expr, scope: UnitScope, file: String) : Int / Console + File =
+fn validate_unit_refs_expr(e: Expr, scope: UnitCx, file: String) : Int / Console + File =
   validate_unit_refs_kind(e.kind, scope, file, e.line, e.col)
 
-fn validate_unit_refs_kind(k: ExprKind, scope: UnitScope, file: String,
+fn validate_unit_refs_kind(k: ExprKind, scope: UnitCx, file: String,
                               line: Int, col: Int) : Int / Console + File = match k {
   EInt(_, _)        -> 0
   EReal(_, _)       -> 0
@@ -276,7 +283,9 @@ fn validate_unit_refs_kind(k: ExprKind, scope: UnitScope, file: String,
   EUnit          -> 0
   EName(_)        -> 0
   EMark(_)        -> 0
-  ESym(_, _, _)        -> 0
+  ESym(_, _)      -> 0
+  ELocal(_)       -> 0
+  EOp(_)          -> 0
   EUnder         -> 0
   EPlaceholder   -> 0
   EHole(_)       -> 0
@@ -300,7 +309,7 @@ fn validate_unit_refs_kind(k: ExprKind, scope: UnitScope, file: String,
   EMatch(scr, arms) -> validate_unit_refs_expr(scr, scope, file) +
                         validate_unit_refs_arms(arms, scope, file, 0)
   ELambda(_, b) -> validate_unit_refs_expr(b, scope, file)
-  ERecordLit(_, _, fs) -> validate_unit_refs_fields(fs, scope, file, 0)
+  ERecordLit(_, fs) -> validate_unit_refs_fields(fs, scope, file, 0)
   EList(els) -> validate_unit_refs_elems(els, scope, file, 0)
   ERange(a, b, opt_step) -> validate_unit_refs_expr(a, scope, file) +
                              validate_unit_refs_expr(b, scope, file) +
@@ -315,19 +324,19 @@ fn validate_unit_refs_kind(k: ExprKind, scope: UnitScope, file: String,
                          validate_unit_refs_expr(b, scope, file)
   EFilterPipe(a, b)  -> validate_unit_refs_expr(a, scope, file) +
                          validate_unit_refs_expr(b, scope, file)
-  EHandle(body, _, _, _, init_opt, _, clauses, ret_opt) ->
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) ->
     validate_unit_refs_expr(body, scope, file) +
     validate_unit_refs_opt_expr(init_opt, scope, file) +
     validate_unit_refs_clauses(clauses, scope, file, 0) +
     validate_unit_refs_opt_return(ret_opt, scope, file)
   ELitUnit(inner, u) -> validate_unit_refs_expr(inner, scope, file) +
-                         validate_unit_expr(u, scope, file, line, col) +
-                         validate_module_unit_shape(u, scope, file, line, col) +
-                         validate_semilattice_unit_shape(u, scope, file, line, col)
+                         validate_unit_expr(u, scope.units, file, line, col) +
+                         validate_module_unit_shape(u, scope.units, file, line, col) +
+                         validate_semilattice_unit_shape(u, scope.units, file, line, col)
   EBang(inner) -> validate_unit_refs_expr(inner, scope, file)
 }
 
-fn validate_unit_refs_expr_list(es: [Expr], scope: UnitScope, file: String,
+fn validate_unit_refs_expr_list(es: [Expr], scope: UnitCx, file: String,
                                    acc: Int) : Int / Console + File = match es {
   [] -> acc
   [e, ...rest] -> {
@@ -336,13 +345,13 @@ fn validate_unit_refs_expr_list(es: [Expr], scope: UnitScope, file: String,
   }
 }
 
-fn validate_unit_refs_opt_expr(opt: Option[Expr], scope: UnitScope,
+fn validate_unit_refs_opt_expr(opt: Option[Expr], scope: UnitCx,
                                   file: String) : Int / Console + File = match opt {
   None -> 0
   Some(e) -> validate_unit_refs_expr(e, scope, file)
 }
 
-fn validate_unit_refs_arms(arms: [Arm], scope: UnitScope, file: String,
+fn validate_unit_refs_arms(arms: [Arm], scope: UnitCx, file: String,
                               acc: Int) : Int / Console + File = match arms {
   [] -> acc
   [a, ...rest] -> match a {
@@ -354,7 +363,7 @@ fn validate_unit_refs_arms(arms: [Arm], scope: UnitScope, file: String,
   }
 }
 
-fn validate_unit_refs_fields(fs: [FieldInit], scope: UnitScope, file: String,
+fn validate_unit_refs_fields(fs: [FieldInit], scope: UnitCx, file: String,
                                 acc: Int) : Int / Console + File = match fs {
   [] -> acc
   [f, ...rest] -> match f {
@@ -365,7 +374,7 @@ fn validate_unit_refs_fields(fs: [FieldInit], scope: UnitScope, file: String,
   }
 }
 
-fn validate_unit_refs_elems(els: [ListElem], scope: UnitScope, file: String,
+fn validate_unit_refs_elems(els: [ListElem], scope: UnitCx, file: String,
                                acc: Int) : Int / Console + File = match els {
   [] -> acc
   [el, ...rest] -> {
@@ -377,7 +386,7 @@ fn validate_unit_refs_elems(els: [ListElem], scope: UnitScope, file: String,
   }
 }
 
-fn validate_unit_refs_stmts(stmts: [Stmt], scope: UnitScope, file: String,
+fn validate_unit_refs_stmts(stmts: [Stmt], scope: UnitCx, file: String,
                                acc: Int) : Int / Console + File = match stmts {
   [] -> acc
   [s, ...rest] -> {
@@ -403,7 +412,7 @@ fn validate_unit_refs_stmts(stmts: [Stmt], scope: UnitScope, file: String,
   }
 }
 
-fn validate_unit_refs_clauses(cs: [HClause], scope: UnitScope, file: String,
+fn validate_unit_refs_clauses(cs: [HClause], scope: UnitCx, file: String,
                                  acc: Int) : Int / Console + File = match cs {
   [] -> acc
   [c, ...rest] -> match c {
@@ -414,13 +423,13 @@ fn validate_unit_refs_clauses(cs: [HClause], scope: UnitScope, file: String,
   }
 }
 
-fn validate_unit_refs_opt_te(opt: Option[TypeExpr], scope: UnitScope,
+fn validate_unit_refs_opt_te(opt: Option[TypeExpr], scope: UnitCx,
                              file: String) : Int / Console + File = match opt {
   None -> 0
   Some(te) -> validate_unit_refs_te(te, scope, file)
 }
 
-fn validate_unit_refs_opt_return(opt: Option[HReturn], scope: UnitScope,
+fn validate_unit_refs_opt_return(opt: Option[HReturn], scope: UnitCx,
                                     file: String) : Int / Console + File = match opt {
   None -> 0
   Some(r) -> match r { HR(_, b, _, _) -> validate_unit_refs_expr(b, scope, file) }
