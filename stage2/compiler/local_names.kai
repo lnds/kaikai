@@ -1,0 +1,141 @@
+#[doc("""
+The names of a declaration's local binders, by binder id.
+
+A read of a local carries the binder's id and nothing else. A pass that
+must spell that local — an emitter writing a C identifier, a dump, a
+diagnostic — asks here: the map is built once from the declaration, by
+walking every place a binder is declared.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.expr_positions
+
+#[doc("A declaration's binders by id: a search tree over ids, which are counters or hashes and so arrive in no order that keeps it balanced or unbalances it for long.")]
+pub type LocalNames = LnLeaf | LnNode(LocalNames, Int, Written, LocalNames)
+
+#[doc("No binders.")]
+pub fn ln_empty() : LocalNames = LnLeaf
+
+#[doc("The binders `d` declares anywhere inside it: parameters, patterns, `var`s, handler aliases and clause parameters.")]
+pub fn ln_of_decl(d: Decl) : LocalNames = ln_decl(d, LnLeaf)
+
+#[doc("The name the binder `l` was declared with; the empty name when `ns` holds no such binder.")]
+pub fn ln_text(ns: LocalNames, l: LocalId) : Written = ln_get(ns, local_raw(l))
+
+#[doc("`ns` with the binders the parameters `ps` declare.")]
+pub fn ln_with_params(ns: LocalNames, ps: [Param]) : LocalNames = ln_params(ps, ns)
+
+#[doc("`ns` with every binder declared inside `e`.")]
+pub fn ln_with_expr(ns: LocalNames, e: Expr) : LocalNames = ln_expr(e, ns)
+
+fn ln_get(t: LocalNames, k: Int) : Written = match t {
+  LnLeaf -> written("")
+  LnNode(lo, key, w, hi) -> if k == key { w } else if k < key { ln_get(lo, k) } else { ln_get(hi, k) }
+}
+
+fn ln_put(t: LocalNames, k: Int, w: Written) : LocalNames = match t {
+  LnLeaf -> LnNode(LnLeaf, k, w, LnLeaf)
+  LnNode(lo, key, v, hi) ->
+    if k == key { t }
+    else if k < key { LnNode(ln_put(lo, k, w), key, v, hi) }
+    else { LnNode(lo, key, v, ln_put(hi, k, w)) }
+}
+
+fn ln_binder(b: Binder, t: LocalNames) : LocalNames = ln_put(t, local_raw(b.id), b.name)
+
+fn ln_opt_binder(o: Option[Binder], t: LocalNames) : LocalNames = match o {
+  Some(b) -> ln_binder(b, t)
+  None    -> t
+}
+
+fn ln_decl(d: Decl, t: LocalNames) : LocalNames = match decl_transparent_inner(d) {
+  Some(inner) -> ln_decl(inner, t)
+  None -> match d {
+    DFn(_, _, _, ps, _, _, body, _, _, _)   -> ln_expr(body, ln_params(ps, t))
+    DCheck(_, ps, body, _, _, _)            -> ln_expr(body, ln_params(ps, t))
+    DTest(_, body, _, _, _)                 -> ln_expr(body, t)
+    DBench(_, body, _, _, _)                -> ln_expr(body, t)
+    DConst(_, _, _, e, _, _, _)             -> ln_expr(e, t)
+    DImpl(_, _, _, ds, _, _, _, _)          -> ln_decls(ds, t)
+    DEffect(_, _, _, _, Some(blk), _, _, _) -> ln_default(blk, t)
+    _                                       -> t
+  }
+}
+
+fn ln_decls(ds: [Decl], t: LocalNames) : LocalNames = match ds {
+  []           -> t
+  [d, ...rest] -> ln_decls(rest, ln_decl(d, t))
+}
+
+fn ln_default(blk: DefaultBlock, t: LocalNames) : LocalNames = match blk {
+  DBlk(cls, oret, _, _) -> ln_hret(oret, ln_clauses(cls, t))
+}
+
+fn ln_params(ps: [Param], t: LocalNames) : LocalNames = match ps {
+  []           -> t
+  [p, ...rest] -> ln_params(rest, ln_binder(p.binder, t))
+}
+
+# A node's own binders first, then every sub-expression's.
+fn ln_expr(e: Expr, t: LocalNames) : LocalNames = ln_positions(xp_positions(e), ln_own(e.kind, t))
+
+fn ln_positions(ps: [XPos], t: LocalNames) : LocalNames = match ps {
+  []                  -> t
+  [XP(_, c), ...rest] -> ln_positions(rest, ln_expr(c, t))
+}
+
+fn ln_own(k: ExprKind, t: LocalNames) : LocalNames = match k {
+  ELambda(ps, _)                       -> ln_params(ps, t)
+  EMatch(_, arms)                      -> ln_arms(arms, t)
+  EBlock(ss, _)                        -> ln_stmts(ss, t)
+  EHandle(_, _, _, _, alias, cls, ret) -> ln_hret(ret, ln_clauses(cls, ln_opt_binder(alias, t)))
+  _                                    -> t
+}
+
+fn ln_arms(arms: [Arm], t: LocalNames) : LocalNames = match arms {
+  []                      -> t
+  [Arm(p, _, _), ...rest] -> ln_arms(rest, ln_pat(p, t))
+}
+
+fn ln_stmts(ss: [Stmt], t: LocalNames) : LocalNames = match ss {
+  []           -> t
+  [s, ...rest] -> ln_stmts(rest, ln_stmt(s, t))
+}
+
+fn ln_stmt(s: Stmt, t: LocalNames) : LocalNames = match s {
+  SLet(p, _, _)       -> ln_pat(p, t)
+  SVar(b, _, _, _, _) -> ln_binder(b, t)
+  _                   -> t
+}
+
+fn ln_clauses(cls: [HClause], t: LocalNames) : LocalNames = match cls {
+  []                            -> t
+  [HC(_, ps, _, _, _), ...rest] -> ln_clauses(rest, ln_params(ps, t))
+}
+
+fn ln_hret(o: Option[HReturn], t: LocalNames) : LocalNames = match o {
+  Some(HR(b, _, _, _)) -> ln_binder(b, t)
+  None                 -> t
+}
+
+fn ln_pats(ps: [Pattern], t: LocalNames) : LocalNames = match ps {
+  []           -> t
+  [p, ...rest] -> ln_pats(rest, ln_pat(p, t))
+}
+
+fn ln_pfields(fs: [PField], t: LocalNames) : LocalNames = match fs {
+  []                         -> t
+  [PField(_, p, _), ...rest] -> ln_pfields(rest, ln_pat(p, t))
+}
+
+fn ln_pat(p: Pattern, t: LocalNames) : LocalNames = match p.pkind {
+  PBind(b)              -> ln_binder(b, t)
+  PAs(b, inner)         -> ln_pat(inner, ln_binder(b, t))
+  PNarrow(b, _)         -> ln_binder(b, t)
+  PList(ps, rest)       -> ln_opt_binder(rest, ln_pats(ps, t))
+  PVariant(_, ps)       -> ln_pats(ps, t)
+  PVariantRecord(_, fs) -> ln_pfields(fs, t)
+  PRecord(fs)           -> ln_pfields(fs, t)
+  _                     -> t
+}
