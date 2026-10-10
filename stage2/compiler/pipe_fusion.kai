@@ -5,6 +5,7 @@ import compiler.decl_names
 import compiler.symtab_build
 import compiler.util
 import compiler.core_effects
+import compiler.proto_ids
 
 # Map-pipe deforestation (issue #1134). `map g . map f = map (g . f)`
 # collapses two map traversals into one — one result list, zero
@@ -100,10 +101,10 @@ pub type FoldTerminal
 # only at rewrite time.
 pub type FusedFold = { source: Expr, stages: [Expr], term: FoldTerminal }
 
-#[doc("Recognise a `map`-pipe chain into a fold-shaped terminal (`foldl(init, combine)`, `sum`, `product`, `length`) for terminal fusion. A bare range head (`[a..b] |> sum()`) is the zero-stage chain: it fuses with an identity stage so the range is never constructed.")]
-pub fn pipe_fusion_as_terminal_fold(lhs: Expr, rhs: Expr) : Option[FusedFold] =
+#[doc("Recognise a `map`-pipe chain into a fold-shaped terminal (`foldl(init, combine)`, `sum`, `product`, `length`) for terminal fusion. A bare range head (`[a..b] |> sum()`) is the zero-stage chain: it fuses with an identity stage so the range is never constructed. `ids` tells a protocol's `foldl` from any other callee.")]
+pub fn pipe_fusion_as_terminal_fold(ids: ProtoIds, lhs: Expr, rhs: Expr) : Option[FusedFold] =
   match lhs.kind {
-    EMapPipe(_, _) -> match pipe_fusion_as_terminal(rhs) {
+    EMapPipe(_, _) -> match pipe_fusion_as_terminal(ids, rhs) {
       Some(term) -> {
         let flat = pipe_fusion_flatten_map_chain(lhs)
         Some(FusedFold { source: flat.source, stages: flat.stages, term: term })
@@ -113,17 +114,17 @@ pub fn pipe_fusion_as_terminal_fold(lhs: Expr, rhs: Expr) : Option[FusedFold] =
     # Only a RANGE head earns the zero-stage rewrite: for a plain list,
     # `sum(xs)` beats `map_sum(xs, identity)` (monomorphised static loop
     # vs a closure call per element).
-    ERange(_, _, _) -> match pipe_fusion_as_terminal(rhs) {
+    ERange(_, _, _) -> match pipe_fusion_as_terminal(ids, rhs) {
       Some(term) -> Some(FusedFold { source: lhs, stages: [], term: term })
       None -> None
     }
     _ -> None
   }
 
-fn pipe_fusion_as_terminal(rhs: Expr) : Option[FoldTerminal] =
+fn pipe_fusion_as_terminal(ids: ProtoIds, rhs: Expr) : Option[FoldTerminal] =
   match rhs.kind {
     ECall(callee, [init, combine]) ->
-      if pipe_fusion_callee_is_foldl(callee) { Some(TermFoldl(init, combine)) }
+      if pipe_fusion_callee_is_foldl(ids, callee) { Some(TermFoldl(init, combine)) }
       else { None }
     # `|> sum()` — the zero-arg call spelling of a named terminal.
     ECall(callee, []) -> match callee.kind {
@@ -170,21 +171,27 @@ fn pipe_fusion_flatten_map_chain(e: Expr) : FlatMapChain =
     _ -> FlatMapChain { source: e, stages: [] }
   }
 
-fn pipe_fusion_callee_is_foldl(callee: Expr) : Bool =
+fn pipe_fusion_callee_is_foldl(ids: ProtoIds, callee: Expr) : Bool =
   match callee.kind {
     EModCall(_, op) -> op == "foldl"
     EVar(name)      -> name == "foldl"
-    ESym(s, _, n)   -> pipe_fusion_is_list_fn(s, "foldl") or n == "__proto_foldl"
+    ESym(s, _, _)   -> pipe_fusion_is_list_fn(s, "foldl") or pipe_fusion_is_proto_foldl(ids, s)
     _               -> false
   }
 
-#[doc("Whether the chain's `foldl` terminal is the protocol operation rather than `list.foldl`: only a container implementing the protocol then fuses, through the model's own `foldl`.")]
-pub fn pipe_fusion_foldl_is_proto(rhs: Expr) : Bool = match rhs.kind {
+# True when `s` is a dispatcher standing for a protocol operation `foldl`.
+fn pipe_fusion_is_proto_foldl(ids: ProtoIds, s: SymId) : Bool = match pid_disp(ids, s) {
+  Some(d) -> disp_op(d) == "foldl"
+  None    -> false
+}
+
+#[doc("The reference the chain's `foldl` terminal calls when it is the protocol operation rather than `list.foldl`: only a container implementing the protocol then fuses, through the model's own `foldl`.")]
+pub fn pipe_fusion_proto_foldl(ids: ProtoIds, rhs: Expr) : Option[ExprKind] = match rhs.kind {
   ECall(callee, _) -> match callee.kind {
-    ESym(_, _, n) -> n == "__proto_foldl"
-    _             -> false
+    ESym(s, _, _) -> if pipe_fusion_is_proto_foldl(ids, s) { Some(callee.kind) } else { None }
+    _             -> None
   }
-  _ -> false
+  _ -> None
 }
 
 # The stage argument for the rewritten call plus the `let` binds that
@@ -260,7 +267,7 @@ structure. This is the functor `fusion` law realised through the
 model's traversal, not a hand-written combinator: it works for any
 container that implements the protocol's `foldl`.
 """)]
-pub fn pipe_fusion_generic_fold_rewrite(ff: FusedFold, foldl_disp: String,
+pub fn pipe_fusion_generic_fold_rewrite(ff: FusedFold, foldl_disp: Option[ExprKind],
                                         line: Int, col: Int) : Expr {
   match ff.term {
     # `sum`/`product` have no explicit combiner: the neutral element and
@@ -276,7 +283,7 @@ pub fn pipe_fusion_generic_fold_rewrite(ff: FusedFold, foldl_disp: String,
       let hoisted = pipe_fusion_hoist_lambdas([staged.stage, combine], 0, line, col)
       let refs = hoisted.refs
       let comb = pipe_fusion_compose_combiner(refs_head(refs), refs_second(refs), line, col)
-      pipe_fusion_fold_with(ff.source, init, comb, foldl_disp,
+      pipe_fusion_fold_with(ff.source, init, comb, pipe_fusion_foldl_ref(foldl_disp, line, col),
         list_append(staged.binds, hoisted.binds), line, col)
     }
     _ -> pipe_fusion_stage_fold(ff, CfMapFoldl, [], line, col)
@@ -293,12 +300,18 @@ fn refs_second(refs: [Expr]) : Expr = match refs {
   _ -> mk_expr(EMark(MkFuseMissing), 0, 0)
 }
 
+# The terminal's own dispatcher, by its id; an explicit `foldl` terminal
+# over a protocol container always names one.
+fn pipe_fusion_foldl_ref(foldl_disp: Option[ExprKind], line: Int, col: Int) : Expr = match foldl_disp {
+  Some(k) -> mk_expr(k, line, col)
+  None    -> mk_expr(EMark(MkFuseMissing), line, col)
+}
+
 # `foldl(source, init, combiner)` (via the protocol dispatcher) with the
 # hoisted stage binds ahead.
 fn pipe_fusion_fold_with(source: Expr, init: Expr, combiner: Expr,
-                         foldl_disp: String, binds: [Stmt], line: Int, col: Int) : Expr {
-  let call = mk_expr(ECall(mk_ref(foldl_disp, line, col),
-                           [source, init, combiner]), line, col)
+                         foldl: Expr, binds: [Stmt], line: Int, col: Int) : Expr {
+  let call = mk_expr(ECall(foldl, [source, init, combiner]), line, col)
   match binds {
     [] -> call
     _  -> mk_expr(EBlock(binds, Some(call)), line, col)
