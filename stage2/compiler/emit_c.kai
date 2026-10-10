@@ -53,7 +53,6 @@ import compiler.type_text
 import compiler.marks
 import compiler.ret_slots
 import compiler.intrinsics
-import compiler.sym_read
 import compiler.kinds
 import compiler.home_tu
 import compiler.loop_lower
@@ -95,7 +94,6 @@ import compiler.perceus_arg_reads
 import compiler.perceus_reads
 import compiler.perceus_read_walk
 import compiler.protos
-import compiler.proto_ids
 import compiler.emit_shared
 import compiler.rec_stamp
 import compiler.head_tag_decl
@@ -574,32 +572,6 @@ fn emit_variant_ctor(cx: EmitCtx) : String = if cx.in_region { "kai_arena_varian
 # the all-zero placeholder.
 
 # ====================================================================
-
-fn ctor_int_slots_of(ks: [Int]) : [Bool] = map(ks, (k) => k == 1)
-
-# Build the [CtorIntSlots] map the unbox pass consumes. One entry per
-# registered constructor (user + builtin), in slot order. Called from the
-# driver (which can reach this emit-layer fn) and threaded into
-# `unbox_pass` so the field-binder seeding knows which sub-PBind reads a
-# raw-int64 slot.
-#
-# A builtin-tag ctor (`tag < user_variant_tag_base()` — `Exited`/`Signaled`,
-# or a user type reusing such a name) has TWO writer layouts on native: the
-# runtime mints raw slots, user-side construction builds boxed. `typed_inits`
-# guards it to all-boxed. This table is the source BOTH the read-side seeding
-# (`slot_is_int`) and the write-side ctor permit (`nab_ctor_flags`) consult, so
-# it must carry the SAME guard: a builtin-tag ctor has NO raw-Int slot here
-# either. Aligning it here keeps the one source of truth and matches
-# `slot_kind_of`'s sentinel (a builtin-tag binder stays boxed regardless), so a
-# permit can never mark raw a slot the ctor writes boxed.
-pub fn build_ctor_int_slots(decls: [Decl], tab: SymTab) : [CtorIntSlots] = {
-  let vs = register_variants(decls, tab)
-  map(vs, (ev) => match ev {
-    EV(hm, n, _, ks, tag) ->
-      if tag < user_variant_tag_base() { CIS(hm, n, map(ks, (_k) => false)) }
-      else { CIS(hm, n, ctor_int_slots_of(ks)) }
-  })
-}
 
 # issue #381: warn on unused local `let` and pattern bindings.
 #
@@ -2324,7 +2296,7 @@ fn emit_callee_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String 
     # A modulo-cons site: `args_e` are the original ctor args, the one at
     # the step's hole being the self-call. Builds the cell with an open
     # hole, extends the cctx, rebinds the params and jumps.
-    EMark(MkTrmcStep(s)) -> emit_trmc_step(src, s.sym, s.hole, s.cname, s.dropmask, s.params, args_e, cx)
+    EMark(MkTrmcStep(s)) -> emit_trmc_step(src, s, args_e, cx)
     # A self-tail-call site: the rebind+goto block. `emit_fn_body` plants
     # the label it jumps to.
     EMark(MkTcrecStep(s)) -> tcrec_emit_goto(src, s.sym, s.dropmask, s.params, args_e, cx)
@@ -2396,7 +2368,7 @@ fn emit_evf_one_slot(eff: String, cx: EmitCtx) : String = {
 # effect (no longer pushed). A non-default effect stays on the plain walk, whose
 # NULL result (no handler on this fiber — the walk crossed a spawn) is reported
 # by `kai_evidence_require` instead of stored as a NULL slot the perform derefs.
-fn evf_terminal_slot(key: String, cx: EmitCtx) : String = evf_thunk_slot(key, cx.effs)
+fn evf_terminal_slot(key: String, cx: EmitCtx) : String = evf_thunk_slot(key, cx.effs, (s) => eff_label(cx, s))
 
 # Emit a direct user-fn call `kai_<csym>(<frame?><args>)`, prepending the
 # evidence frame when the callee carries one. The single funnel every
@@ -2445,14 +2417,14 @@ fn evf_join_args(frame_arg: String, rest: String) : String =
 # default node, else the live by-name walk (the thunk has no caller frame; the
 # node live at the indirect call is the ≤1-handler-correct one). Empty when the
 # callee carries no frame.
-fn emit_evf_thunk_frame(slots: [String], effs: [Decl]) : String = match slots {
+fn emit_evf_thunk_frame(slots: [String], effs: [Decl], lab: (SymId) -> String) : String = match slots {
   [] -> ""
-  _  -> concat_all(["(KaiEvidence *[]){", join_with(map(slots, (e) => evf_thunk_slot(e, effs)), ", "), "}"])
+  _  -> concat_all(["(KaiEvidence *[]){", join_with(map(slots, (e) => evf_thunk_slot(e, effs, lab)), ", "), "}"])
 }
 
-fn evf_thunk_slot(key: String, effs: [Decl]) : String = {
+fn evf_thunk_slot(key: String, effs: [Decl], lab: (SymId) -> String) : String = {
   let eff = inst_key_eff(key)
-  if effect_has_default_block(eff, effs) {
+  if effect_has_default_block(eff, effs, lab) {
     concat_all(["kai_evidence_lookup_or_default(\"", key,
                 "\", &_kai_default_node_", string_to_lower_ascii(eff), ")"])
   } else { evf_require_walk(key) }
@@ -7816,8 +7788,8 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_sy
         # width casts); a purely-scalar signature stays on the basic
         # shim.
         let csym = ffi_extern_symbol_of(body, name)
-        if ffi_sig_uses_v2(params, ret_ty_opt, cx.ffi_reg) {
-          emit_ffi_v2_shim_body(sig, csym, params, ret_ty_opt, cx.ffi_reg)
+        if ffi_sig_uses_v2(params, ret_ty_opt, cx.ffi_reg, cx.tab) {
+          emit_ffi_v2_shim_body(sig, csym, params, ret_ty_opt, cx.ffi_reg, cx.tab)
         } else {
           emit_ffi_shim_body(sig, csym, params, ret_ty_opt, cx.tab)
         }
@@ -8303,7 +8275,7 @@ fn emit_param_reads(params: [Param], start: Int) : String {
   }
 }
 
-fn emit_fn_thunk(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: EvFrames, effs: [Decl], capable: [String]) : String {
+fn emit_fn_thunk(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: EvFrames, effs: [Decl], capable: [String], lab: (SymId) -> String) : String {
   match d {
     DFn(_, fid, _, params, opt_ret, _, body, _, _, mo) -> {
       let sym = c_sym(emit_fn_text(tab, specs, fid), mo)
@@ -8338,7 +8310,7 @@ fn emit_fn_thunk(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: Ev
       # A thunk is the indirect (closure) entry; it has no
       # caller frame, so it fills the callee's frame from the live evidence
       # stack (a walk per slot — the ≤1-handler-correct node at the call).
-      let thunk_frame = emit_evf_thunk_frame(frame_slots_of(frames, sym), effs)
+      let thunk_frame = emit_evf_thunk_frame(frame_slots_of(frames, sym), effs, lab)
       match fnx_ufn_sig_first(fx, fid) {
         Some(US(pts, rt, mask)) -> {
           # Mixed-param lane: raw slots unbox `args[i]` to `kair_<p>`,
@@ -8506,7 +8478,7 @@ fn emit_thunk_arg_list_masked(params: [Param], mask: [Bool], i: Int) : String {
 # ---- top-level passes ----
 
 fn fn_forward_decls(decls: [Decl], tab: SymTab, specs: SpecNames, fx: FnIndex, capable: [String], const_syms: [String], entry: SymId) : String = {
-  let frames = frames_index(build_evidence_frames(decls, entry))
+  let frames = frames_index(build_evidence_frames(decls, tab, specs, entry))
   concat_all(map(decls, (d) => emit_fn_forward(d, tab, specs, fx, frames, capable, const_syms)))
 }
 
@@ -8543,7 +8515,7 @@ fn fn_bodies_loop(src: String, decls: [Decl], cx: EmitCtx, const_syms: [String],
   [] -> b
   [d, ...rest] -> match d {
     DFn(_, _, _, _, _, _, _, _, _, _) -> {
-      let b1 = sb_append(sb_append(b, emit_fn_body(src, d, cx, cx.fns, const_syms)), emit_fn_thunk(d, cx.tab, cx.specs, cx.fx, cx.evf, cx.effs, cx.rd_capable))
+      let b1 = sb_append(sb_append(b, emit_fn_body(src, d, cx, cx.fns, const_syms)), emit_fn_thunk(d, cx.tab, cx.specs, cx.fx, cx.evf, cx.effs, cx.rd_capable, (s) => eff_label(cx, s)))
       fn_bodies_loop(src, rest, cx, const_syms, b1)
     }
     _ -> fn_bodies_loop(src, rest, cx, const_syms, b)
@@ -10445,7 +10417,7 @@ pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl],
   let env_structs = emit_handle_env_typedefs(clauses_info)
   # C struct typedefs for every `extern "C" type`, so a struct-by-value
   # shim can name `struct __kai_ffi_<Name>`.
-  let ffi_structs = emit_ffi_struct_typedefs(collect_extern_types(decls, tab))
+  let ffi_structs = emit_ffi_struct_typedefs(collect_extern_types(decls, tab), tab)
   let fixed_vec_tds = collect_fixed_vec_typedefs(decls)
   let types_h = concat_all([
     "/* generated by kaikai stage 2 — shared types header */\n",
@@ -10616,7 +10588,7 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], tab: SymTab, s
   # C struct typedefs for every `extern "C" type`. When present they go to
   # a SHARED `kai_ffi.h` (so a hand-written shim names the same type), and
   # `out.c` includes it (`ffi_header_inc` above) rather than inlining them.
-  let ffi_structs = emit_ffi_struct_typedefs(extern_types)
+  let ffi_structs = emit_ffi_struct_typedefs(extern_types, tab)
   # Single-TU compilation: the donation-capable set is the whole program, so
   # the `_donor` ABI is consistent across def / forward / thunk / call site.
   # Excludes any fn whose body carries a TRMC self-tail step (the leftover
@@ -12286,7 +12258,7 @@ fn root_only_insts(insts: [ResolvedCS]) : [ResolvedCS] = match insts {
 }
 
 #[doc("Emit-layer entry point dump_mono")]
-pub fn dump_mono(file: String, decls: [Decl], tab: SymTab) : Int / Console + File {
+pub fn dump_mono(file: String, decls: [Decl], tab: SymTab) : Int / Console + File + Mutable {
 
 
   let r = infer_program(file, decls, tab, false)
@@ -12314,7 +12286,7 @@ fn dump_mono_out_line(tab: SymTab, cs: ResolvedCS) : Unit / Console {
 }
 
 #[doc("Emit-layer entry point dump_mono_out")]
-pub fn dump_mono_out(file: String, decls: [Decl], tab: SymTab) : Int / Console + File {
+pub fn dump_mono_out(file: String, decls: [Decl], tab: SymTab) : Int / Console + File + Mutable {
 
 
   let r = infer_program(file, decls, tab, false)

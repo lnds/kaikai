@@ -18,19 +18,20 @@
 import compiler.util
 import compiler.ast
 import compiler.written
+import compiler.symtab
 import compiler.emit_shared
 import compiler.ffi_v2
 
 # Emit one C `typedef struct { ... } <Name>;` per extern struct in the
 # registry, for the shared `kai_ffi.h`. Opaque handles need no typedef
 # (they cross as `void *`).
-#[doc("Emit the C struct typedefs for every `extern \"C\" type` in the registry.")]
-pub fn emit_ffi_struct_typedefs(reg: [ExternTypeReg]) : String = match reg {
+#[doc("Emit the C struct typedefs for every `extern \"C\" type` in the registry; `tab` names a field type already settled.")]
+pub fn emit_ffi_struct_typedefs(reg: [ExternTypeReg], tab: SymTab) : String = match reg {
   [] -> ""
   [e, ...rest] -> match e {
-    ExtStruct(name, fields) -> cat2(emit_ffi_one_struct_typedef(name, fields, reg),
-                                    emit_ffi_struct_typedefs(rest))
-    ExtOpaque(_) -> emit_ffi_struct_typedefs(rest)
+    ExtStruct(name, fields) -> cat2(emit_ffi_one_struct_typedef(name, fields, reg, tab),
+                                    emit_ffi_struct_typedefs(rest, tab))
+    ExtOpaque(_) -> emit_ffi_struct_typedefs(rest, tab)
   }
 }
 
@@ -39,19 +40,19 @@ pub fn emit_ffi_struct_typedefs(reg: [ExternTypeReg]) : String = match reg {
 # bare `<Name>` (`extern_struct_c_tag`), so `out.c` and a shim that
 # `#include`s `kai_ffi.h` share one nominal C type — a layout mismatch is
 # a C compile error, not silent boundary corruption.
-fn emit_ffi_one_struct_typedef(name: String, fields: [FieldDecl], reg: [ExternTypeReg]) : String =
+fn emit_ffi_one_struct_typedef(name: String, fields: [FieldDecl], reg: [ExternTypeReg], tab: SymTab) : String =
   concat_all([
     "typedef struct {\n",
-    emit_ffi_struct_fields(fields, reg),
+    emit_ffi_struct_fields(fields, reg, tab),
     "} ", name, ";\n"
   ])
 
-fn emit_ffi_struct_fields(fields: [FieldDecl], reg: [ExternTypeReg]) : String = match fields {
+fn emit_ffi_struct_fields(fields: [FieldDecl], reg: [ExternTypeReg], tab: SymTab) : String = match fields {
   [] -> ""
   [fd, ...rest] -> match fd {
     FD(_, fname, _, _) -> concat_all([
-      "    ", extern_field_c_type(fd, reg), " ", fname, ";\n",
-      emit_ffi_struct_fields(rest, reg)
+      "    ", extern_field_c_type(fd, reg, tab), " ", fname, ";\n",
+      emit_ffi_struct_fields(rest, reg, tab)
     ])
   }
 }
@@ -62,31 +63,31 @@ fn emit_ffi_struct_fields(fields: [FieldDecl], reg: [ExternTypeReg]) : String = 
 # mentions at least one v2 type).
 #[doc("Synthesise the C body of an `extern \"C\" fn` whose signature uses an FFI v2 type (struct / opaque / fixed-width).")]
 pub fn emit_ffi_v2_shim_body(sig: String, cname: String, params: [Param],
-                             ret_ty_opt: Option[TypeExpr], reg: [ExternTypeReg]) : String {
-  let ret_kind = ffi_ret_kind_of_reg(ret_ty_opt, reg)
-  let extern_decl = ffi_v2_extern_decl(cname, params, ret_kind, reg)
-  let arg_setup = ffi_v2_arg_setup(params, 0, reg)
+                             ret_ty_opt: Option[TypeExpr], reg: [ExternTypeReg], tab: SymTab) : String {
+  let ret_kind = ffi_ret_kind_of_reg(ret_ty_opt, reg, tab)
+  let extern_decl = ffi_v2_extern_decl(cname, params, ret_kind, reg, tab)
+  let arg_setup = ffi_v2_arg_setup(params, 0, reg, tab)
   let arg_list = ffi_v2_arg_list(params, 0)
   let call_expr = concat_all([cname, "(", arg_list, ")"])
   # Callee-owns: the shim decrefs each boxed input after the call. An
   # opaque handle's box is the deconstructor's job here — the shim reads
   # the void* and releases the box, so a handle threaded through several
   # calls is dup'd before each non-final call and moved on the last.
-  let body = ffi_v2_ret_body(ret_kind, call_expr, arg_setup, ffi_v2_arg_decrefs(params, 0, reg), reg)
+  let body = ffi_v2_ret_body(ret_kind, call_expr, arg_setup, ffi_v2_arg_decrefs(params, 0, reg, tab), reg, tab)
   concat_all([extern_decl, sig, " {\n", body, "}\n\n"])
 }
 
 # Release each boxed input after the call. A Unit param carries no boxed
 # value (elided in arg setup), so it is skipped.
-fn ffi_v2_arg_decrefs(params: [Param], i: Int, reg: [ExternTypeReg]) : String = match params {
+fn ffi_v2_arg_decrefs(params: [Param], i: Int, reg: [ExternTypeReg], tab: SymTab) : String = match params {
   [] -> ""
   [p, ...rest] -> {
-    let kind = match p.ptype { None -> FfiRetUnknown("") Some(t) -> ffi_kind_of_ty_reg(t, reg) }
+    let kind = match p.ptype { None -> FfiRetUnknown("") Some(t) -> ffi_kind_of_ty_reg(t, reg, tab) }
     let head = match kind {
       FfiRetUnit -> ""
       _          -> concat_all(["    kai_decref(", c_local(written_text(p.binder.name)), ");\n"])
     }
-    cat2(head, ffi_v2_arg_decrefs(rest, i + 1, reg))
+    cat2(head, ffi_v2_arg_decrefs(rest, i + 1, reg, tab))
   }
 }
 
@@ -95,20 +96,20 @@ fn ffi_v2_arg_decrefs(params: [Param], i: Int, reg: [ExternTypeReg]) : String = 
 # prototype with the right struct-by-value / void* shape to lay out
 # the call ABI.
 fn ffi_v2_extern_decl(cname: String, params: [Param], ret_kind: FfiRetKind,
-                      reg: [ExternTypeReg]) : String =
+                      reg: [ExternTypeReg], tab: SymTab) : String =
   concat_all([
     "extern ", ffi_v2_c_ret_type(ret_kind, reg), " ", cname,
-    "(", ffi_v2_c_param_list(params, reg), ");\n"
+    "(", ffi_v2_c_param_list(params, reg, tab), ");\n"
   ])
 
-fn ffi_v2_c_param_list(params: [Param], reg: [ExternTypeReg]) : String = match params {
+fn ffi_v2_c_param_list(params: [Param], reg: [ExternTypeReg], tab: SymTab) : String = match params {
   [] -> "void"
-  _  -> join_with(map(params, (p) => ffi_v2_c_param_type(p, reg)), ", ")
+  _  -> join_with(map(params, (p) => ffi_v2_c_param_type(p, reg, tab)), ", ")
 }
 
-fn ffi_v2_c_param_type(p: Param, reg: [ExternTypeReg]) : String = match p.ptype {
+fn ffi_v2_c_param_type(p: Param, reg: [ExternTypeReg], tab: SymTab) : String = match p.ptype {
   None    -> "void *"
-  Some(t) -> ffi_v2_c_type(ffi_kind_of_ty_reg(t, reg))
+  Some(t) -> ffi_v2_c_type(ffi_kind_of_ty_reg(t, reg, tab))
 }
 
 fn ffi_v2_c_ret_type(k: FfiRetKind, reg: [ExternTypeReg]) : String = match k {
@@ -136,21 +137,21 @@ fn ffi_v2_c_type(k: FfiRetKind) : String = match k {
 # of the matching C type. A struct unwraps field-by-field into a C
 # struct literal; an opaque reads `kai_foreign_ptr`; a fixed-width
 # C-casts the underlying Int/Real; v1 scalars match the v1 shim.
-fn ffi_v2_arg_setup(params: [Param], i: Int, reg: [ExternTypeReg]) : String = match params {
+fn ffi_v2_arg_setup(params: [Param], i: Int, reg: [ExternTypeReg], tab: SymTab) : String = match params {
   [] -> ""
   [p, ...rest] -> {
     let kind = match p.ptype {
       None    -> FfiRetUnknown("missing")
-      Some(t) -> ffi_kind_of_ty_reg(t, reg)
+      Some(t) -> ffi_kind_of_ty_reg(t, reg, tab)
     }
     let arg = concat_all(["_kai_ffi_arg", int_to_string(i)])
     let box = c_local(written_text(p.binder.name))
-    let stmt = ffi_v2_unbox_one(kind, arg, box, reg)
-    cat2(stmt, ffi_v2_arg_setup(rest, i + 1, reg))
+    let stmt = ffi_v2_unbox_one(kind, arg, box, reg, tab)
+    cat2(stmt, ffi_v2_arg_setup(rest, i + 1, reg, tab))
   }
 }
 
-fn ffi_v2_unbox_one(kind: FfiRetKind, arg: String, box: String, reg: [ExternTypeReg]) : String = match kind {
+fn ffi_v2_unbox_one(kind: FfiRetKind, arg: String, box: String, reg: [ExternTypeReg], tab: SymTab) : String = match kind {
   FfiRetInt    -> concat_all(["    int64_t ", arg, " = kai_intf(", box, ");\n"])
   FfiRetReal   -> concat_all(["    double ", arg, " = ", box, "->as.r;\n"])
   FfiRetBool   -> concat_all(["    int ", arg, " = ", box, "->as.b ? 1 : 0;\n"])
@@ -166,31 +167,31 @@ fn ffi_v2_unbox_one(kind: FfiRetKind, arg: String, box: String, reg: [ExternType
   FfiRetFixedVal(t) ->
     concat_all(["    ", fixed_val_c_type(t), " ", arg, " = ", box, fixed_val_box_field(t), ";\n"])
   FfiRetForeign(_) -> concat_all(["    void *", arg, " = kai_foreign_ptr(", box, ");\n"])
-  FfiRetStruct(n)  -> ffi_v2_unbox_struct(n, arg, box, reg)
+  FfiRetStruct(n)  -> ffi_v2_unbox_struct(n, arg, box, reg, tab)
   FfiRetUnknown(t) -> concat_all(["#error \"FFI arg type `", t, "` is not supported\"\n"])
 }
 
 # Unwrap a boxed record into a C struct literal. Each field is read by
 # name (`kai_record_get_borrow`) and unboxed at its C width.
-fn ffi_v2_unbox_struct(name: String, arg: String, box: String, reg: [ExternTypeReg]) : String {
+fn ffi_v2_unbox_struct(name: String, arg: String, box: String, reg: [ExternTypeReg], tab: SymTab) : String {
   let fields = extern_struct_fields(reg, name)
   concat_all([
     "    ", extern_struct_c_tag(name), " ", arg, " = { ",
-    ffi_v2_struct_field_inits(fields, box, reg), " };\n"
+    ffi_v2_struct_field_inits(fields, box, reg, tab), " };\n"
   ])
 }
 
-fn ffi_v2_struct_field_inits(fields: [FieldDecl], box: String, reg: [ExternTypeReg]) : String = match fields {
+fn ffi_v2_struct_field_inits(fields: [FieldDecl], box: String, reg: [ExternTypeReg], tab: SymTab) : String = match fields {
   [] -> ""
-  [fd] -> ffi_v2_struct_field_init(fd, box, reg)
-  [fd, ...rest] -> concat_all([ffi_v2_struct_field_init(fd, box, reg), ", ",
-                               ffi_v2_struct_field_inits(rest, box, reg)])
+  [fd] -> ffi_v2_struct_field_init(fd, box, reg, tab)
+  [fd, ...rest] -> concat_all([ffi_v2_struct_field_init(fd, box, reg, tab), ", ",
+                               ffi_v2_struct_field_inits(rest, box, reg, tab)])
 }
 
-fn ffi_v2_struct_field_init(fd: FieldDecl, box: String, reg: [ExternTypeReg]) : String = match fd {
+fn ffi_v2_struct_field_init(fd: FieldDecl, box: String, reg: [ExternTypeReg], tab: SymTab) : String = match fd {
   FD(_, fname, fty, _) -> {
     let fbox = concat_all(["kai_op_field_borrow(", box, ", \"", fname, "\")"])
-    let kind = ffi_kind_of_ty_reg(fty, reg)
+    let kind = ffi_kind_of_ty_reg(fty, reg, tab)
     ffi_v2_field_read(kind, fbox)
   }
 }
@@ -223,7 +224,7 @@ fn ffi_v2_arg_list(params: [Param], i: Int) : String = match params {
 # KAI_RECORD; an opaque parks the pointer in a KAI_FOREIGN; fixed-width
 # widens to Int/Real; v1 scalars unchanged.
 fn ffi_v2_ret_body(ret_kind: FfiRetKind, call_expr: String, arg_setup: String,
-                   arg_decrefs: String, reg: [ExternTypeReg]) : String = match ret_kind {
+                   arg_decrefs: String, reg: [ExternTypeReg], tab: SymTab) : String = match ret_kind {
   FfiRetUnit -> concat_all([arg_setup, "    ", call_expr, ";\n", arg_decrefs, "    return kai_unit();\n"])
   FfiRetInt -> concat_all([arg_setup, "    int64_t _kai_ffi_ret = (int64_t) ", call_expr, ";\n", arg_decrefs, "    return kai_int(_kai_ffi_ret);\n"])
   FfiRetReal -> concat_all([arg_setup, "    double _kai_ffi_ret = (double) ", call_expr, ";\n", arg_decrefs, "    return kai_real(_kai_ffi_ret);\n"])
@@ -240,7 +241,7 @@ fn ffi_v2_ret_body(ret_kind: FfiRetKind, call_expr: String, arg_setup: String,
     concat_all([arg_setup, "    ", fixed_val_c_type(t), " _kai_ffi_ret = ", call_expr, ";\n", arg_decrefs,
                 "    return ", fixed_val_box_ctor(t), "(_kai_ffi_ret);\n"])
   FfiRetForeign(_) -> concat_all([arg_setup, "    void *_kai_ffi_ret = ", call_expr, ";\n", arg_decrefs, "    return kai_foreign(_kai_ffi_ret);\n"])
-  FfiRetStruct(n) -> ffi_v2_rebox_struct(n, call_expr, arg_setup, arg_decrefs, reg)
+  FfiRetStruct(n) -> ffi_v2_rebox_struct(n, call_expr, arg_setup, arg_decrefs, reg, tab)
   FfiRetUnknown(t) -> concat_all(["#error \"FFI return type `", t, "` is not supported\"\n"])
 }
 
@@ -248,7 +249,7 @@ fn ffi_v2_ret_body(ret_kind: FfiRetKind, call_expr: String, arg_setup: String,
 # struct in a local, then build a record whose fields box each member
 # at its kaikai width (a fixed-width field re-boxes as Int / Real).
 fn ffi_v2_rebox_struct(name: String, call_expr: String, arg_setup: String,
-                       arg_decrefs: String, reg: [ExternTypeReg]) : String {
+                       arg_decrefs: String, reg: [ExternTypeReg], tab: SymTab) : String {
   let fields = extern_struct_fields(reg, name)
   let n = list_length(fields)
   let ns = int_to_string(n)
@@ -258,22 +259,22 @@ fn ffi_v2_rebox_struct(name: String, call_expr: String, arg_setup: String,
     arg_decrefs,
     "    KaiValue *_kai_ffi_fields[", ns, "];\n",
     "    const char *_kai_ffi_names[", ns, "];\n",
-    ffi_v2_rebox_struct_fields(fields, 0, reg),
+    ffi_v2_rebox_struct_fields(fields, 0, reg, tab),
     "    return kai_record(", ns, ", _kai_ffi_fields, _kai_ffi_names);\n"
   ])
 }
 
-fn ffi_v2_rebox_struct_fields(fields: [FieldDecl], i: Int, reg: [ExternTypeReg]) : String = match fields {
+fn ffi_v2_rebox_struct_fields(fields: [FieldDecl], i: Int, reg: [ExternTypeReg], tab: SymTab) : String = match fields {
   [] -> ""
   [fd, ...rest] -> match fd {
     FD(_, fname, fty, _) -> {
       let ix = int_to_string(i)
       let member = concat_all(["_kai_ffi_ret.", fname])
-      let boxed = ffi_v2_rebox_member(ffi_kind_of_ty_reg(fty, reg), member)
+      let boxed = ffi_v2_rebox_member(ffi_kind_of_ty_reg(fty, reg, tab), member)
       concat_all([
         "    _kai_ffi_fields[", ix, "] = ", boxed, ";\n",
         "    _kai_ffi_names[", ix, "] = \"", fname, "\";\n",
-        ffi_v2_rebox_struct_fields(rest, i + 1, reg)
+        ffi_v2_rebox_struct_fields(rest, i + 1, reg, tab)
       ])
     }
   }
@@ -294,14 +295,14 @@ fn ffi_v2_rebox_member(kind: FfiRetKind, member: String) : String = match kind {
 # fixed-width type — the trigger for the extended shim path. A
 # purely-scalar signature stays on the basic shim.
 #[doc("True when an extern fn signature uses a struct/opaque/fixed-width boundary type, per the registry.")]
-pub fn ffi_sig_uses_v2(params: [Param], ret_ty_opt: Option[TypeExpr], reg: [ExternTypeReg]) : Bool =
-  ffi_kind_is_v2(ffi_ret_kind_of_reg(ret_ty_opt, reg)) or ffi_params_use_v2(params, reg)
+pub fn ffi_sig_uses_v2(params: [Param], ret_ty_opt: Option[TypeExpr], reg: [ExternTypeReg], tab: SymTab) : Bool =
+  ffi_kind_is_v2(ffi_ret_kind_of_reg(ret_ty_opt, reg, tab)) or ffi_params_use_v2(params, reg, tab)
 
-fn ffi_params_use_v2(params: [Param], reg: [ExternTypeReg]) : Bool = match params {
+fn ffi_params_use_v2(params: [Param], reg: [ExternTypeReg], tab: SymTab) : Bool = match params {
   [] -> false
   [p, ...rest] -> {
-    let k = match p.ptype { None -> FfiRetUnknown("") Some(t) -> ffi_kind_of_ty_reg(t, reg) }
-    if ffi_kind_is_v2(k) { true } else { ffi_params_use_v2(rest, reg) }
+    let k = match p.ptype { None -> FfiRetUnknown("") Some(t) -> ffi_kind_of_ty_reg(t, reg, tab) }
+    if ffi_kind_is_v2(k) { true } else { ffi_params_use_v2(rest, reg, tab) }
   }
 }
 
