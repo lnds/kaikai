@@ -1,0 +1,178 @@
+#[doc("Native codegen for the fused `Vec` prims (kir_lower_vec): each is one call to a runtime entry, raw scalars in and, but for the boxed field read, out.")]
+# The runtime entry owns the buffer layout and every guard; this module only
+# marshals. A record write passes its fields as a stack `[n x i64]` plus the
+# kind string and (push only) the field names the first push classifies with.
+
+import compiler.util
+import compiler.kir
+import compiler.emit_native_fn
+import compiler.emit_native_call
+import compiler.kir_prims
+
+#[doc("Emit a fused Vec prim: a read yields its payload, a write the result vec.")]
+pub fn nemit_vec_raw_prim(ctx: Handle, p: PrimOp, cargs: [KVal]) : Handle / Console = match p {
+  KpVecReadField(VbInt)  -> nvec_read_field(ctx, "kaix_vec_field_i64", SInt64, cargs)
+  KpVecReadField(VbReal) -> nvec_read_field(ctx, "kaix_vec_field_f64", SReal, cargs)
+  KpVecReadFieldBoxed    -> nvec_read_field_boxed(ctx, cargs)
+  KpVecRead(VbInt)       -> nvec_read(ctx, "kaix_vec_get_i64", SInt64, cargs)
+  KpVecRead(VbReal)      -> nvec_read(ctx, "kaix_vec_get_f64", SReal, cargs)
+  KpVecPushRec           -> nvec_push_rec(ctx, cargs)
+  KpVecSetRec            -> nvec_set_rec(ctx, cargs)
+  KpVecPush(VbInt)       -> nvec_push(ctx, "kaix_vec_push_i64", SInt64, cargs)
+  KpVecPush(VbReal)      -> nvec_push(ctx, "kaix_vec_push_f64", SReal, cargs)
+  KpVecSet(VbInt)        -> nvec_set(ctx, "kaix_vec_set_i64", SInt64, cargs)
+  KpVecSet(VbReal)       -> nvec_set(ctx, "kaix_vec_set_f64", SReal, cargs)
+  _                      -> nvec_bad(ctx, kprim_text(p))
+}
+
+fn nvec_bad(ctx: Handle, what: String) : Handle / Console = {
+  nemit_unsupported(ctx, cat2("malformed bare-word vec prim ", what))
+  nemit_null(ctx)
+}
+
+fn nvec_ty(ctx: Handle, slot: KSlot) : Handle = match slot {
+  SReal -> native_ctx_f64t(ctx)
+  _     -> native_ctx_i64t(ctx)
+}
+
+# `sym(ptr vec, i64 i, i32 fidx, i32 n, i32 owned) -> i64 | double`.
+fn nvec_read_field(ctx: Handle, sym: String, slot: KSlot, cargs: [KVal]) : Handle / Console = match cargs {
+  [v, i, KIntV(fidx), KIntV(n), KIntV(owned)] -> {
+    let i32t = native_ctx_i32t(ctx)
+    let vh = nemit_atom(ctx, v)
+    let ih = nemit_atom_raw(ctx, i, SInt64)
+    let ptb = llvm_buf_new(); llvm_buf_push(ptb, native_ctx_ptrt(ctx)); llvm_buf_push(ptb, native_ctx_i64t(ctx)); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, i32t); llvm_buf_push(ptb, i32t)
+    let ab = llvm_buf_new(); llvm_buf_push(ab, vh); llvm_buf_push(ab, ih); llvm_buf_push(ab, llvm_const_i32(i32t, fidx)); llvm_buf_push(ab, llvm_const_i32(i32t, n)); llvm_buf_push(ab, llvm_const_i32(i32t, owned))
+    ncall_finish(ctx, sym, nvec_ty(ctx, slot), ptb, ab)
+  }
+  _ -> nvec_bad(ctx, sym)
+}
+
+# `kaix_vec_field_boxed(ptr vec, i64 i, i32 fidx, i32 owned) -> ptr`.
+fn nvec_read_field_boxed(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [v, i, KIntV(fidx), KIntV(owned)] -> {
+    let p = native_ctx_ptrt(ctx)
+    let i32t = native_ctx_i32t(ctx)
+    let vh = nemit_atom(ctx, v)
+    let ih = nemit_atom_raw(ctx, i, SInt64)
+    ncall_sig4(ctx, "kaix_vec_field_boxed", p, p, native_ctx_i64t(ctx), i32t, i32t, vh, ih, llvm_const_i32(i32t, fidx), llvm_const_i32(i32t, owned))
+  }
+  _ -> nvec_bad(ctx, "vec.read.field.boxed")
+}
+
+# `sym(ptr vec, i64 i, i32 owned) -> i64 | double`.
+fn nvec_read(ctx: Handle, sym: String, slot: KSlot, cargs: [KVal]) : Handle / Console = match cargs {
+  [v, i, KIntV(owned)] -> {
+    let i32t = native_ctx_i32t(ctx)
+    let vh = nemit_atom(ctx, v)
+    let ih = nemit_atom_raw(ctx, i, SInt64)
+    ncall_sig3(ctx, sym, nvec_ty(ctx, slot), native_ctx_ptrt(ctx), native_ctx_i64t(ctx), i32t, vh, ih, llvm_const_i32(i32t, owned))
+  }
+  _ -> nvec_bad(ctx, sym)
+}
+
+# `sym(ptr vec, i64 | double x) -> ptr`.
+fn nvec_push(ctx: Handle, sym: String, slot: KSlot, cargs: [KVal]) : Handle / Console = match cargs {
+  [v, x] -> {
+    let vh = nemit_atom(ctx, v)
+    let xh = nemit_atom_raw(ctx, x, slot)
+    ncall_sig2(ctx, sym, native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), nvec_ty(ctx, slot), vh, xh)
+  }
+  _ -> nvec_bad(ctx, sym)
+}
+
+# `sym(ptr vec, i64 i, i64 | double x) -> ptr`.
+fn nvec_set(ctx: Handle, sym: String, slot: KSlot, cargs: [KVal]) : Handle / Console = match cargs {
+  [v, i, x] -> {
+    let p = native_ctx_ptrt(ctx)
+    let vh = nemit_atom(ctx, v)
+    let ih = nemit_atom_raw(ctx, i, SInt64)
+    let xh = nemit_atom_raw(ctx, x, slot)
+    ncall_sig3(ctx, sym, p, p, native_ctx_i64t(ctx), nvec_ty(ctx, slot), vh, ih, xh)
+  }
+  _ -> nvec_bad(ctx, sym)
+}
+
+# `kaix_vec_push_rec_bits(ptr vec, i64 n, ptr bits, ptr kinds, ptr names) -> ptr`
+# over `[v, kinds, (value, name)...]`.
+fn nvec_push_rec(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [v, KStrV(kinds), ...pairs] -> {
+    let p = native_ctx_ptrt(ctx)
+    let i64t = native_ctx_i64t(ctx)
+    let vh = nemit_atom(ctx, v)
+    let bits = nvec_bits_array(ctx, kinds, nvec_evens(pairs))
+    let names = nvec_names_array(ctx, nvec_evens(nvec_tail(pairs)))
+    let kh = llvm_build_global_string(native_ctx_b(ctx), kinds)
+    let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i64t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p)
+    let ab = llvm_buf_new(); llvm_buf_push(ab, vh); llvm_buf_push(ab, llvm_const_int(i64t, string_length(kinds))); llvm_buf_push(ab, bits); llvm_buf_push(ab, kh); llvm_buf_push(ab, names)
+    ncall_finish(ctx, "kaix_vec_push_rec_bits", p, ptb, ab)
+  }
+  _ -> nvec_bad(ctx, "vec.write.push.rec")
+}
+
+# `kaix_vec_set_rec_bits(ptr vec, i64 i, i64 n, ptr bits, ptr kinds) -> ptr`
+# over `[v, i, kinds, value...]`.
+fn nvec_set_rec(ctx: Handle, cargs: [KVal]) : Handle / Console = match cargs {
+  [v, i, KStrV(kinds), ...vals] -> {
+    let p = native_ctx_ptrt(ctx)
+    let i64t = native_ctx_i64t(ctx)
+    let vh = nemit_atom(ctx, v)
+    let ih = nemit_atom_raw(ctx, i, SInt64)
+    let bits = nvec_bits_array(ctx, kinds, vals)
+    let kh = llvm_build_global_string(native_ctx_b(ctx), kinds)
+    let ptb = llvm_buf_new(); llvm_buf_push(ptb, p); llvm_buf_push(ptb, i64t); llvm_buf_push(ptb, i64t); llvm_buf_push(ptb, p); llvm_buf_push(ptb, p)
+    let ab = llvm_buf_new(); llvm_buf_push(ab, vh); llvm_buf_push(ab, ih); llvm_buf_push(ab, llvm_const_int(i64t, string_length(kinds))); llvm_buf_push(ab, bits); llvm_buf_push(ab, kh)
+    ncall_finish(ctx, "kaix_vec_set_rec_bits", p, ptb, ab)
+  }
+  _ -> nvec_bad(ctx, "vec.write.set.rec")
+}
+
+fn nvec_tail(xs: [KVal]) : [KVal] = match xs {
+  []           -> []
+  [_, ...rest] -> rest
+}
+
+fn nvec_evens(xs: [KVal]) : [KVal] = match xs {
+  []           -> []
+  [x, ...rest] -> [x, ...nvec_evens(nvec_tail(rest))]
+}
+
+fn nvec_kind_slot(kinds: String, k: Int) : KSlot =
+  if string_slice(kinds, k, 1) == "r" { SReal } else { SInt64 }
+
+# The fields as a stack `[n x i64]`; a Real stores its `double` into the
+# same 8-byte slot, which is the word the buffer holds.
+fn nvec_bits_array(ctx: Handle, kinds: String, vals: [KVal]) : Handle / Console = {
+  let arrty = llvm_array_type(native_ctx_i64t(ctx), list_length(vals))
+  let arr = llvm_build_alloca_entry(ctx, arrty, "vecbits")
+  nvec_store_bits(ctx, arr, arrty, kinds, vals, 0)
+  arr
+}
+
+fn nvec_store_bits(ctx: Handle, arr: Handle, arrty: Handle, kinds: String, vals: [KVal], k: Int) : Unit / Console = match vals {
+  []           -> ()
+  [x, ...rest] -> {
+    let raw = nemit_atom_raw(ctx, x, nvec_kind_slot(kinds, k))
+    let dst = llvm_build_array_gep(native_ctx_b(ctx), arrty, arr, llvm_const_i32(native_ctx_i32t(ctx), k))
+    let _s = llvm_build_store(native_ctx_b(ctx), raw, dst)
+    nvec_store_bits(ctx, arr, arrty, kinds, rest, k + 1)
+  }
+}
+
+fn nvec_names_array(ctx: Handle, names: [KVal]) : Handle / Console = {
+  let arrty = llvm_array_type(native_ctx_ptrt(ctx), list_length(names))
+  let arr = llvm_build_alloca_entry(ctx, arrty, "vecnames")
+  nvec_store_names(ctx, arr, arrty, names, 0)
+  arr
+}
+
+fn nvec_store_names(ctx: Handle, arr: Handle, arrty: Handle, names: [KVal], k: Int) : Unit / Console = match names {
+  [] -> ()
+  [KStrV(nm), ...rest] -> {
+    let nh = llvm_build_global_string(native_ctx_b(ctx), nm)
+    let dst = llvm_build_array_gep(native_ctx_b(ctx), arrty, arr, llvm_const_i32(native_ctx_i32t(ctx), k))
+    let _s = llvm_build_store(native_ctx_b(ctx), nh, dst)
+    nvec_store_names(ctx, arr, arrty, rest, k + 1)
+  }
+  _ -> nemit_unsupported(ctx, "bare-word vec push with a non-literal field name")
+}

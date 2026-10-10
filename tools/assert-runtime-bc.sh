@@ -2,13 +2,13 @@
 # assert-runtime-bc.sh — fail if the native P2 bitcode is NOT active.
 #
 # P2 (docs/native-codegen-perf-plan.md §P2) generates the runtime bitcode at
-# build time, gated to clang 18; without it the native build silently falls
+# build time, gated to a clang of the linked libLLVM's major; without it the native build silently falls
 # back to the legacy cc-links-runtime_llvm.c path (correct, just no O2
 # inlining of the runtime). That silent opt-out is fine for a casual dev
-# without clang 18 — but a RELEASE or the native CI gate must NOT ship in the
+# without that clang — but a RELEASE or the native CI gate must NOT ship in the
 # slow path unnoticed. This script is the assert: it runs after the bitcode
 # generation step and fails the job if P2 did not turn on, so a base-image
-# change that drops clang 18 turns a silent perf regression into a red build.
+# change that drops that clang turns a silent perf regression into a red build.
 #
 # USAGE  tools/assert-runtime-bc.sh   (run after make / gen-runtime-bc.sh)
 set -eu

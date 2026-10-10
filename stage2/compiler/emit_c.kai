@@ -91,6 +91,7 @@ import compiler.unbox
 import compiler.perceus
 import compiler.borrow_map
 import compiler.perceus_payer
+import compiler.perceus_arg_reads
 import compiler.perceus_reads
 import compiler.perceus_read_walk
 import compiler.protos
@@ -2953,36 +2954,21 @@ fn emit_field_init_name(fi: FieldInit) : String {
 # raw helpers' decref).
 
 # `vec_get(v, i).f` / `vec_get_borrow(v, i).f` on a REC carrier →
-# `kai_vec_get_field(_borrow)(v, i, fidx)`. The helper's RC contract
-# on (v, i) matches the vec_get variant it replaces; no record, no
-# base drop.
-fn emit_vec_get_field_fused(src: String, base: Expr, fname: String, cx: EmitCtx) : Option[String] / Console = match base.kind {
-  ECall(f, args_e) -> match vec_get_field_helper(f) {
-    Some(helper) ->
-      if not cx.in_region {
-        match vec_rec_field_slot(cx.recs, base.ty, fname) {
-          Some(fidx) -> match args_e {
-            [v, i] -> Some(concat_all([
-              helper, emit_expr(src, v, cx), ", ", emit_expr(src, i, cx),
-              ", ", int_to_string(fidx), ")"
-            ]))
-            _ -> None
-          }
-          None -> None
-        }
-      } else { None }
-    None -> None
+# `kai_vec_get_field(_borrow)`: no record is built. An owned vec in the
+# borrowing form's slot has no other taker, so the helper releases it.
+fn emit_vec_get_field_fused(src: String, base: Expr, fname: String, cx: EmitCtx) : Option[String] / Console =
+  if cx.in_region { None } else {
+    match vec_field_read(cx.recs, base, fname) {
+      None     -> None
+      Some(fr) -> {
+        let g = fr.get
+        let fidx = match fr.col { VecCol(k, _) -> int_to_string(k) }
+        let vi = concat_all([emit_expr(src, g.v, cx), ", ", emit_expr(src, g.i, cx), ", ", fidx])
+        if g.borrows { Some(concat_all(["kai_vec_get_field_borrow(", vi, if emit_is_owned_borrow(g.v) { ", 1)" } else { ", 0)" }])) }
+        else { Some(cat3("kai_vec_get_field(", vi, ")")) }
+      }
+    }
   }
-  _ -> None
-}
-
-# The runtime helper reading one field of the element `f` fetches, when
-# `f` is a `vec_get` form.
-fn vec_get_field_helper(f: Expr) : Option[String] = match builtin_ref(f) {
-  Some(CbVecGet)       -> Some("kai_vec_get_field(")
-  Some(CbVecGetBorrow) -> Some("kai_vec_get_field_borrow(")
-  _                    -> None
-}
 
 # `vec_push(v, Rec{..})` / `vec_set(v, i, Rec{..})` on a REC carrier →
 # `kai_vec_push_rec_raw` / `kai_vec_set_rec_raw` with the unpacked
@@ -13577,7 +13563,8 @@ fn tcrec_kind_raw_read(k: ExprKind, p: String, bm: BorrowMap) : Bool {
     ECall(f, xs) ->
       if tcrec_is_dup_callee(f) { tcrec_dup_arg_raw_read(xs, p, bm) }
       else if tcrec_expr_raw_read(f, p, bm) { true }
-      else { tcrec_args_raw_read(tcrec_owned_args(xs, tcrec_borrowed_slots(bm, f), 0), p, bm) }
+      else if pcs_any_arg_is_var(p, xs) { tcrec_args_raw_read(tcrec_owned_args(xs, tcrec_borrowed_slots(bm, f), 0), p, bm) }
+      else { tcrec_args_raw_read(xs, p, bm) }
     EIntrinsic(_, xs) -> tcrec_args_raw_read(xs, p, bm)
     ESurface(sf) -> tcrec_args_raw_read(surface_children(sf), p, bm)
     EBinop(_, l, r) ->
