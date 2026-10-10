@@ -48,6 +48,7 @@ import compiler.type_stamp
 import compiler.effect_default
 import compiler.type_text
 import compiler.marks
+import compiler.ret_slots
 import compiler.intrinsics
 import compiler.sym_read
 import compiler.kinds
@@ -13097,7 +13098,7 @@ fn tcrec_walk_tail(k: ExprKind, me: SelfRef, arity: Int, scope: [String], cons_o
         # alive through mixed-signature unboxing.
         Some(e) -> match e.kind {
           EVar(tn) ->
-            if tn == "__pcs_arm_ret" or tn == "__pcs_block_ret" {
+            if ret_slot_is_scope(tn) {
               match trmc_find_ret_let_rhs(stmts, tn) {
                 Some(inner) -> tcrec_walk_tail(inner.kind, me, arity, scope1, cons_ok)
                 None        -> false
@@ -13294,20 +13295,15 @@ fn trmc_walk_modcons_arms(arms: [Arm], me: SelfRef, arity: Int, scope: [String],
   }
 }
 
-# Recognise the perceus exit-drop wrap shape:
-# `EBlock(stmts, Some(EVar("__pcs_ret")))`. Cheap structural test —
-# only allocates if the shape matches, in which case the caller
-# proceeds to extract the SLet and rebuild.
-
-# Recognise the perceus exit-drop wrap shape:
-# `EBlock(stmts, Some(EVar("__pcs_ret")))`. Cheap structural test —
-# only allocates if the shape matches, in which case the caller
-# proceeds to extract the SLet and rebuild.
+# Recognise the perceus exit-drop wrap shape: a block whose tail reads
+# the fn's result slot. Cheap structural test — only allocates if the
+# shape matches, in which case the caller proceeds to extract the SLet
+# and rebuild.
 fn tcrec_is_pcs_ret_wrap(body: Expr) : Bool {
   match body.kind {
     EBlock(_, opt_tail) -> match opt_tail {
       Some(t) -> match t.kind {
-        EVar(nm) -> nm == "__pcs_ret"
+        EVar(nm) -> ret_slot_is_fn(nm)
         _ -> false
       }
       None -> false
@@ -13374,15 +13370,9 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, name: String,
   }
 }
 
-# Decomposition of `EBlock(stmts, Some(EVar("__pcs_ret")))` into the
-# entry stmts before the SLet, the SLet's RHS (the original body),
-# and the exit stmts after the SLet. Returns None if no
-# `SLet(PBind("__pcs_ret"), _, _)` is found in stmts.
-
-# Decomposition of `EBlock(stmts, Some(EVar("__pcs_ret")))` into the
-# entry stmts before the SLet, the SLet's RHS (the original body),
-# and the exit stmts after the SLet. Returns None if no
-# `SLet(PBind("__pcs_ret"), _, _)` is found in stmts.
+# Decomposition of the exit-drop wrap into the entry stmts before the
+# SLet of the fn's result slot, the SLet's RHS (the original body), and
+# the exit stmts after it. Returns None if no stmt binds that slot.
 type TcrecPcsTriple = TcrecPcsTriple([Stmt], Expr, [Stmt])
 
 fn tcrec_find_pcs_ret_let(stmts: [Stmt], before_acc: [Stmt]) : Option[TcrecPcsTriple] {
@@ -13391,7 +13381,7 @@ fn tcrec_find_pcs_ret_let(stmts: [Stmt], before_acc: [Stmt]) : Option[TcrecPcsTr
     [s, ...rest] -> match s {
       SLet(pat, _, rhs) -> match pat.pkind {
         PBind(nm) ->
-          if nm == "__pcs_ret" {
+          if ret_slot_is_fn(nm) {
             Some(TcrecPcsTriple(list_reverse(before_acc), rhs, rest))
           } else {
             tcrec_find_pcs_ret_let(rest, [s, ...before_acc])
@@ -13406,12 +13396,12 @@ fn tcrec_find_pcs_ret_let(stmts: [Stmt], before_acc: [Stmt]) : Option[TcrecPcsTr
 fn tcrec_rebuild_pcs_ret_wrap(orig: Expr, before: [Stmt], new_inner: Expr,
                               after: [Stmt]) : Expr {
   let ret_let = SLet(
-    Pattern { pkind: PBind("__pcs_ret"), line: new_inner.line, col: new_inner.col },
+    Pattern { pkind: PBind(ret_slot_name(RsFn)), line: new_inner.line, col: new_inner.col },
     None,
     new_inner
   )
   let stmts = list_append(before, [ret_let, ...after])
-  let tail = Expr { kind: EVar("__pcs_ret"), line: new_inner.line, col: new_inner.col,
+  let tail = Expr { kind: EVar(ret_slot_name(RsFn)), line: new_inner.line, col: new_inner.col,
                     ty: new_inner.ty, mode: new_inner.mode,  site: new_inner.site }
   Expr { kind: EBlock(stmts, Some(tail)),
          line: orig.line, col: orig.col, ty: orig.ty, mode: orig.mode,  site: orig.site }
@@ -13502,7 +13492,7 @@ fn tcrec_hoisted_arg_rhs(stmts: [Stmt], acc: [Expr]) : [Expr] {
     [s, ...rest] -> match s {
       SLet(pat, _, rhs) -> match pat.pkind {
         PBind(bn) ->
-          if string_starts_with_q(bn, "__pcs_ta") { tcrec_hoisted_arg_rhs(rest, [rhs, ...acc]) }
+          if ret_slot_is_tail_arg(bn) { tcrec_hoisted_arg_rhs(rest, [rhs, ...acc]) }
           else { tcrec_hoisted_arg_rhs(rest, acc) }
         _ -> tcrec_hoisted_arg_rhs(rest, acc)
       }
@@ -13893,7 +13883,7 @@ fn trmc_unwrap_ret(e: Expr) : Expr {
     EBlock(stmts, opt_tail) -> match opt_tail {
       Some(t) -> match t.kind {
         EVar(tn) ->
-          if tn == "__pcs_arm_ret" or tn == "__pcs_block_ret" {
+          if ret_slot_is_scope(tn) {
             match trmc_find_ret_let_rhs(stmts, tn) {
               Some(inner) -> inner
               None        -> e
