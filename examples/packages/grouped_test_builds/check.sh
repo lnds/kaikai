@@ -6,7 +6,8 @@
 # failure that only the shared build hits fails the run before any test runs.
 # Also: a block's unused binding is reported in the file that declares it,
 # a module that does not parse fails the build even when nothing uses it, and
-# a block reaches its own file's functions whatever else the build holds.
+# a block reaches its own file's functions whatever else the build holds, and
+# a type named like a core effect is one type across the build.
 
 set -eu
 
@@ -103,5 +104,16 @@ printf 'fn helper() : Int = 1\n\ntest "a" {\n  assert helper() == 1\n}\n' > "$TM
 printf 'test "b" {\n  assert helper() == 2\n}\n\nfn helper() : Int = 2\n' > "$TMP/first/tests/b_test.kai"
 run first
 [ "$(cat "$TMP/rc")" -eq 0 ] || { cat "$TMP/err"; fail "a block reached the function of the file loaded before its own"; }
+
+# 8 — a block reads a type name as its own file does, and a record's field
+# keeps the type its module wrote, though a core effect has the same name.
+mk_pkg homonym
+printf 'pub type State = Cold | Ready\n\npub type Session = { state: State }\n\npub fn state_name(s: State) : String = match s {\n  Cold -> "cold"\n  Ready -> "ready"\n}\n' > "$TMP/homonym/lib/session.kai"
+printf 'import lib.session\n\ntest "field" {\n  assert session.state_name(session.Session { state: session.Ready }.state) == "ready"\n}\n\ntest "annotation" {\n  let s : State = session.Cold\n  assert session.state_name(s) == "cold"\n}\n' > "$TMP/homonym/tests/a_test.kai"
+printf 'test "b" {\n  assert 1 + 1 == 2\n}\n' > "$TMP/homonym/tests/b_test.kai"
+run homonym
+[ "$(cat "$TMP/rc")" -eq 0 ] || { cat "$TMP/err"; fail "a package type named like a core effect was two types"; }
+grep -q "ok   field" "$TMP/err" || fail "the record field test did not run"
+grep -q "ok   annotation" "$TMP/err" || fail "the annotation test did not run"
 
 echo "grouped_test_builds: OK"
