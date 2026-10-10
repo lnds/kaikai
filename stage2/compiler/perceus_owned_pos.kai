@@ -13,16 +13,15 @@ a tail value to. No other read is touched.
 """)]
 
 import compiler.ast
-import compiler.sym_read
+import compiler.perceus_reads
 import compiler.ast_map
 import compiler.ret_slots
 import compiler.core_builtins
-import compiler.util
 
-type PopCx = { borrowed: [String], slots: (Expr) -> [Int] }
+type PopCx = { borrowed: [Binder], slots: (Expr) -> [Int] }
 
 #[doc("Dup every bare read of a `borrowed` binder that an owned position of `body` yields; `slots` gives a callee's borrowed argument positions.")]
-pub fn pop_own_positions(body: Expr, borrowed: [String], slots: (Expr) -> [Int]) : Expr = match borrowed {
+pub fn pop_own_positions(body: Expr, borrowed: [Binder], slots: (Expr) -> [Int]) : Expr = match borrowed {
   []         -> body
   [_, ...__] -> {
     let cx = PopCx { borrowed: borrowed, slots: slots }
@@ -37,7 +36,7 @@ fn pop_expr(e: Expr, cx: PopCx) : Expr =
 fn pop_kind(k: ExprKind, cx: PopCx) : ExprKind = match k {
   EBlock(stmts, tail)  -> EBlock(map(stmts, (s) => pop_stmt(s, cx)), tail)
   EList(els)           -> EList(map(els, (el) => pop_elem(el, cx)))
-  ERecordLit(rh, nm, fis)  -> ERecordLit(rh, nm, map(fis, (fi) => pop_field(fi, cx)))
+  ERecordLit(rh, fis)  -> ERecordLit(rh, map(fis, (fi) => pop_field(fi, cx)))
   ECall(f, args_)      -> if pop_is_sentinel(f) { k } else { ECall(f, pop_args(args_, cx.slots(f), 0, cx)) }
   _                    -> k
 }
@@ -67,13 +66,13 @@ fn pop_args(args_: [Expr], borrowed_slots: [Int], i: Int, cx: PopCx) : [Expr] = 
 }
 
 # Perceus's own marks manage their operands, and a unit coercion hands
-# its operand through. A call through a name, whatever fn or closure it
-# names, is an ordinary call.
+# its operand through. A call of a declaration, of a closure a local
+# holds or of an effect operation is an ordinary call.
 fn pop_is_sentinel(f: Expr) : Bool = match f.kind {
-  ESym(_, _, _)  -> pop_is_coercion(f)
-  EName(_)        -> false
-  EModCall(_, _) -> false
-  _              -> true
+  ESym(_, _) -> pop_is_coercion(f)
+  ELocal(_)  -> false
+  EOp(_)     -> false
+  _          -> true
 }
 
 fn pop_is_coercion(f: Expr) : Bool = match builtin_ref(f) {
@@ -82,41 +81,37 @@ fn pop_is_coercion(f: Expr) : Bool = match builtin_ref(f) {
 }
 
 fn pop_is_wrap(pat: Pattern) : Bool = match pat.pkind {
-  PBind(nm) -> ret_slot_is_any(nm)
-  _         -> false
+  PBind(b) -> ret_slot_binds_any(b)
+  _        -> false
 }
 
-fn pop_value(e: Expr, cx: PopCx) : Expr = match sym_read_kind(e.kind) {
-  EName(nm) -> if list_has(cx.borrowed, nm) { pop_dup(e) } else { e }
-  _        -> Expr { kind: pop_value_kind(e.kind, cx), line: e.line, col: e.col,
-                     ty: e.ty, mode: e.mode,  site: e.site }
+fn pop_value(e: Expr, cx: PopCx) : Expr = match e.kind {
+  ELocal(l) -> if pcs_has(cx.borrowed, l) { pop_dup(e) } else { e }
+  _         -> Expr { kind: pop_value_kind(e.kind, cx), line: e.line, col: e.col,
+                      ty: e.ty, mode: e.mode,  site: e.site }
 }
 
 fn pop_value_kind(k: ExprKind, cx: PopCx) : ExprKind = match k {
   EIf(c, t, oe)       -> EIf(c, pop_value(t, cx), prc_map_opt_expr(oe, (x) => pop_value(x, cx)))
   EMatch(scr, arms)   -> EMatch(scr, map(arms, (a) => match a { Arm(p, g, b) -> Arm(p, g, pop_value(b, cx)) }))
   EBlock(stmts, tail) -> match tail {
-    Some(t) -> EBlock(pop_wrapped(stmts, pop_tail_wrap(t), cx), Some(pop_value(t, cx)))
+    Some(t) -> EBlock(pop_wrapped(stmts, t, cx), Some(pop_value(t, cx)))
     None    -> k
   }
   _ -> k
 }
 
-# The wrap a block tail names, if the tail is a bare result slot.
-fn pop_tail_wrap(t: Expr) : String = match sym_read_kind(t.kind) {
-  EName(nm) -> if ret_slot_is_any(nm) { nm } else { "" }
-  _        -> ""
-}
-
-fn pop_wrapped(stmts: [Stmt], wrap: String, cx: PopCx) : [Stmt] = match wrap {
-  "" -> stmts
-  _  -> map(stmts, (s) => match s {
+# The wrap a block tail names, if the tail is a bare result slot: its rhs
+# is owned where the block's value is.
+fn pop_wrapped(stmts: [Stmt], tail: Expr, cx: PopCx) : [Stmt] = match tail.kind {
+  ELocal(l) -> map(stmts, (s) => match s {
     SLet(pat, ann, rhs) -> match pat.pkind {
-      PBind(nm) -> if nm == wrap { SLet(pat, ann, pop_value(rhs, cx)) } else { s }
-      _         -> s
+      PBind(b) -> if local_eq(b.id, l) and ret_slot_binds_any(b) { SLet(pat, ann, pop_value(rhs, cx)) } else { s }
+      _        -> s
     }
     _ -> s
   })
+  _ -> stmts
 }
 
 fn pop_dup(a: Expr) : Expr =

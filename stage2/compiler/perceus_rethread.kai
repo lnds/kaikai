@@ -13,17 +13,16 @@ backends take a reference for.
 """)]
 
 import compiler.ast
-import compiler.util
-import compiler.sym_read
+import compiler.perceus_reads
 import compiler.expr_positions
 import compiler.fnreg
 import compiler.infer.{list_has_int}
 
 #[doc("The arm binders of `body`'s matches on a `borrowed` parameter whose every read is an argument in a borrowed slot; `slots` gives a callee's borrowed positions.")]
-pub fn prt_borrow_only_binders(body: Expr, borrowed: [String], slots: (Expr) -> [Int]) : [String] =
+pub fn prt_borrow_only_binders(body: Expr, borrowed: [Binder], slots: (Expr) -> [Int]) : [Binder] =
   prt_walk(body, borrowed, slots, [])
 
-fn prt_walk(e: Expr, borrowed: [String], slots: (Expr) -> [Int], acc: [String]) : [String] = {
+fn prt_walk(e: Expr, borrowed: [Binder], slots: (Expr) -> [Int], acc: [Binder]) : [Binder] = {
   let here = match e.kind {
     EMatch(s, arms) -> if prt_scr_is_param(s, borrowed) { prt_arms(arms, slots, acc) } else { acc }
     _               -> acc
@@ -31,18 +30,18 @@ fn prt_walk(e: Expr, borrowed: [String], slots: (Expr) -> [Int], acc: [String]) 
   prt_walk_ps(xp_positions(e), borrowed, slots, here)
 }
 
-fn prt_walk_ps(ps: [XPos], borrowed: [String], slots: (Expr) -> [Int], acc: [String]) : [String] = match ps {
+fn prt_walk_ps(ps: [XPos], borrowed: [Binder], slots: (Expr) -> [Int], acc: [Binder]) : [Binder] = match ps {
   []                  -> acc
   [XP(_, c), ...rest] -> prt_walk_ps(rest, borrowed, slots, prt_walk(c, borrowed, slots, acc))
 }
 
 #[doc("True when `s` is the bare read of a `borrowed` parameter.")]
-pub fn prt_scr_is_param(s: Expr, borrowed: [String]) : Bool = match s.kind {
-  EName(nm) -> list_has(borrowed, nm)
-  _        -> false
+pub fn prt_scr_is_param(s: Expr, borrowed: [Binder]) : Bool = match s.kind {
+  ELocal(l) -> pcs_has(borrowed, l)
+  _         -> false
 }
 
-fn prt_arms(arms: [Arm], slots: (Expr) -> [Int], acc: [String]) : [String] = match arms {
+fn prt_arms(arms: [Arm], slots: (Expr) -> [Int], acc: [Binder]) : [Binder] = match arms {
   []           -> acc
   [a, ...rest] -> match a {
     Arm(pat, opt_g, body) -> prt_arms(rest, slots, list_append(acc, prt_arm_borrow_only(pat, opt_g, body, slots)))
@@ -50,65 +49,68 @@ fn prt_arms(arms: [Arm], slots: (Expr) -> [Int], acc: [String]) : [String] = mat
 }
 
 #[doc("The binders one arm of a match on a borrowed parameter only ever borrows. Reads may carry a Perceus dup.")]
-pub fn prt_arm_borrow_only(pat: Pattern, opt_g: Option[Expr], body: Expr, slots: (Expr) -> [Int]) : [String] =
+pub fn prt_arm_borrow_only(pat: Pattern, opt_g: Option[Expr], body: Expr, slots: (Expr) -> [Int]) : [Binder] =
   filter(prt_projected(pat, []), (nm) => prt_qualifies(nm, opt_g, body, slots))
 
-fn prt_qualifies(nm: String, opt_g: Option[Expr], body: Expr, slots: (Expr) -> [Int]) : Bool = {
+fn prt_qualifies(nm: Binder, opt_g: Option[Expr], body: Expr, slots: (Expr) -> [Int]) : Bool = {
   let in_guard = match opt_g { Some(g) -> prt_mentions(nm, g) > 0  None -> false }
-  let borrows = prt_borrows(nm, body, slots)
+  let borrows = prt_borrows(nm.id, body, slots)
   not in_guard and borrows > 0 and borrows == prt_mentions(nm, body)
 }
 
 # Binders a variant or list pattern projects, through nested variant and
 # list sub-patterns only.
-fn prt_projected(p: Pattern, acc: [String]) : [String] = match p.pkind {
-  PVariant(_, _, subs) -> prt_subs(subs, acc)
-  PList(subs, _)       -> prt_subs(subs, acc)
-  _                    -> acc
+fn prt_projected(p: Pattern, acc: [Binder]) : [Binder] = match p.pkind {
+  PVariant(_, subs) -> prt_subs(subs, acc)
+  PList(subs, _)    -> prt_subs(subs, acc)
+  _                 -> acc
 }
 
-fn prt_subs(subs: [Pattern], acc: [String]) : [String] = match subs {
+fn prt_subs(subs: [Pattern], acc: [Binder]) : [Binder] = match subs {
   []           -> acc
   [p, ...rest] -> prt_subs(rest, match p.pkind {
-    PBind(nm) -> [nm, ...acc]
-    _         -> prt_projected(p, acc)
+    PBind(b) -> [b, ...acc]
+    _        -> prt_projected(p, acc)
   })
 }
 
 # Reads of `nm` that are a whole argument in a borrowed slot and carry a
 # reference-counted type.
-fn prt_borrows(nm: String, e: Expr, slots: (Expr) -> [Int]) : Int = match e.kind {
+fn prt_borrows(nm: LocalId, e: Expr, slots: (Expr) -> [Int]) : Int = match e.kind {
   ECall(f, xs) -> {
-    let here = match sym_read_kind(f.kind) {
-      EName(_) -> prt_borrowed_args(nm, xs, slots(f), 0)
-      _       -> 0
+    let here = match f.kind {
+      ESym(_, _) -> prt_borrowed_args(nm, xs, slots(f), 0)
+      ELocal(_)  -> prt_borrowed_args(nm, xs, slots(f), 0)
+      EOp(_)     -> prt_borrowed_args(nm, xs, slots(f), 0)
+      _          -> 0
     }
     here + prt_borrows_ps(nm, xp_positions(e), slots)
   }
   _ -> prt_borrows_ps(nm, xp_positions(e), slots)
 }
 
-fn prt_borrows_ps(nm: String, ps: [XPos], slots: (Expr) -> [Int]) : Int = match ps {
+fn prt_borrows_ps(nm: LocalId, ps: [XPos], slots: (Expr) -> [Int]) : Int = match ps {
   []                  -> 0
   [XP(r, c), ...rest] ->
     (if xrole_inline(r) { prt_borrows(nm, c, slots) } else { 0 }) + prt_borrows_ps(nm, rest, slots)
 }
 
-fn prt_borrowed_args(nm: String, xs: [Expr], bpos: [Int], i: Int) : Int = match xs {
+fn prt_borrowed_args(nm: LocalId, xs: [Expr], bpos: [Int], i: Int) : Int = match xs {
   []           -> 0
   [a, ...rest] -> {
-    let here = if prt_arg_var(a) == nm and list_has_int(bpos, i) and prt_is_rc(a.ty) { 1 } else { 0 }
+    let here = if prt_arg_reads(a, nm) and list_has_int(bpos, i) and prt_is_rc(a.ty) { 1 } else { 0 }
     here + prt_borrowed_args(nm, rest, bpos, i + 1)
   }
 }
 
-fn prt_arg_var(a: Expr) : String = match a.kind {
-  EName(u)      -> u
+# The argument is `nm` read bare, or under a dup.
+fn prt_arg_reads(a: Expr, nm: LocalId) : Bool = match a.kind {
+  ELocal(u)    -> local_eq(u, nm)
   ECall(f, xs) -> match xs {
-    [x] -> if prt_is_dup(f) { prt_arg_var(x) } else { "" }
-    _   -> ""
+    [x] -> prt_is_dup(f) and prt_arg_reads(x, nm)
+    _   -> false
   }
-  _ -> ""
+  _ -> false
 }
 
 fn prt_is_dup(f: Expr) : Bool = match f.kind {
@@ -122,13 +124,13 @@ fn prt_is_rc(ty: Option[Ty]) : Bool = match ty {
 }
 
 # Every mention of `nm`: reads, lambda captures and interpolation spans.
-fn prt_mentions(nm: String, e: Expr) : Int = match e.kind {
-  EName(u)      -> if u == nm { 1 } else { 0 }
-  EStr(span, _) -> if string_contains(span, nm) { 1 } else { 0 }
-  _            -> prt_mentions_ps(nm, xp_positions(e))
+fn prt_mentions(nm: Binder, e: Expr) : Int = match e.kind {
+  ELocal(u)     -> if local_eq(u, nm.id) { 1 } else { 0 }
+  EStr(span, _) -> if pcs_span_spells(nm, span) { 1 } else { 0 }
+  _             -> prt_mentions_ps(nm, xp_positions(e))
 }
 
-fn prt_mentions_ps(nm: String, ps: [XPos]) : Int = match ps {
+fn prt_mentions_ps(nm: Binder, ps: [XPos]) : Int = match ps {
   []                  -> 0
   [XP(_, c), ...rest] -> prt_mentions(nm, c) + prt_mentions_ps(nm, rest)
 }
