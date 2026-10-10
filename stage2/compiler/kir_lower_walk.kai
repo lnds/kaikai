@@ -1988,12 +1988,12 @@ fn match_selftail_scr_drop(owned: Bool, sd: String, body: Expr, st: LowerSt) : L
     if unw_mreg(st1.unw, sd) == "" { st1 } else { ls_emit(st1, KStore(sd, KUnitV, kpos_of(body))) }
   } else { st }
 
-# True iff EVERY tail leaf of `body` is a pure self-tail-call sentinel
-# (`__kai_tcrec|`, the C oracle's `tcrec_tail_always_sentinel`). A
-# `__kai_trmc|` step is NOT a leaf here, so a cons-modulo arm never
+# True iff EVERY tail leaf of `body` is a pure self-tail-call step
+# (`MkTcrecStep`, the C oracle's `tcrec_tail_always_sentinel`). A
+# `MkTrmcStep` is NOT a leaf here, so a cons-modulo arm never
 # satisfies this (its cell is consumed by the TRMC reuse + dropmask).
 fn arm_body_all_tail_self_tcrec(body: Expr) : Bool = match body.kind {
-  ECall(f, _) -> match f.kind { EVar(callee) -> es_tcrec_is_sentinel(callee) _ -> false }
+  ECall(f, _) -> match f.kind { EMark(MkTcrecStep(_)) -> true  _ -> false }
   EIf(_, t, oe) -> match oe {
     None    -> false
     Some(e) -> arm_body_all_tail_self_tcrec(t) and arm_body_all_tail_self_tcrec(e)
@@ -2064,14 +2064,14 @@ fn tcp_drop_entries(es: [String], st: LowerSt) : LowerSt = match es {
   }
 }
 
-# True iff ANY tail leaf of `body` is a `__kai_trmc|` modulo-cons step sentinel
+# True iff ANY tail leaf of `body` is a `MkTrmcStep` modulo-cons step
 # (the C oracle's `trmc_body_has_step`). Such an arm's scrutinee cell is reused
 # in place by a TRMC step on at least one path; the arm-top reuse token model
 # (`KArmTopReuse`) captures the consumed cell once at the arm top so the step
 # reuses it (or frees it on a non-step tail like `balance_left(ins(l,..),..)`).
-# A pure self-tcrec body is NOT a step (its callee is `__kai_tcrec|`).
+# A pure self-tcrec body is NOT a step (its callee is `MkTcrecStep`).
 fn body_has_trmc_step(body: Expr) : Bool = match body.kind {
-  ECall(f, _) -> match f.kind { EVar(callee) -> es_trmc_is_step_sentinel(callee) _ -> false }
+  ECall(f, _) -> match f.kind { EMark(MkTrmcStep(_)) -> true  _ -> false }
   EIf(_, t, oe) -> body_has_trmc_step(t) or match oe { None -> false Some(e) -> body_has_trmc_step(e) }
   EMatch(_, arms) -> arms_have_trmc_step(arms)
   EBlock(_, ot) -> match ot { None -> false Some(e) -> body_has_trmc_step(e) }
@@ -2527,7 +2527,7 @@ fn reuse_scrutinee_binders(p: Pattern, vs: [VariantEntry]) : [String] = match p.
 }
 
 # True iff this arm should capture its consumed scrutinee as an arm-top reuse
-# token (#872): a PVariant arm whose body has a `__kai_trmc|` step on some tail
+# token: a PVariant arm whose body has a `MkTrmcStep` step on some tail
 # (`Node(c, ins(l,..),..)`) and binds ≥1 pointer child. The TRMC step reuses the
 # token in place; a non-step tail (`balance_left(ins(l,..),..)`) frees it. The C
 # oracle's `try_arm_top_reuse` predicate.
@@ -3063,7 +3063,7 @@ fn lower_call_at(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console 
   }
 }
 
-# The dense dispatch: sentinels → terminators; resume → resume
+# The dense dispatch: resume → resume
 # terminator; constructor / ordinary call otherwise. The
 # string-matching lives in the pure `classify_callee` (base); the walk
 # only routes the resulting `CalleeKind` to its lowering.
@@ -3088,6 +3088,8 @@ fn lower_mark_call(x: Expr, m: Mark, cargs: [Expr], st: LowerSt) : LRes / Consol
   else if mark_is_transparent(m) { lower_borrow_through(cargs, st) }
   else { match m {
     MkApplyBorrow -> lower_apply_borrow(x, cargs, st)
+    MkTcrecStep(s) -> lower_tcrec(x, s, cargs, st)
+    MkTrmcStep(s)  -> lower_trmc_step(x, s, cargs, st)
     MkTrmcApply   -> lower_trmc_apply(x, cargs, st)
     MkDup         -> lower_rc_unary(cargs, KDupMk, st)
     MkReuseCons    -> lower_reuse(x, m, cargs, st)
@@ -3109,8 +3111,6 @@ fn ls_classify(st: LowerSt, csym: FnId, callee: String) : CalleeKind = match fnx
 # Dispatch a non-effect-op bare call by its `CalleeKind`.
 fn lower_named_call_kind(x: Expr, callee: String, csym: FnId, cargs: [Expr], st: LowerSt) : LRes / Console =
   match ls_classify(st, csym, callee) {
-    CkTrmcStep  -> lower_trmc_step(x, callee, cargs, st)
-    CkTcrec     -> lower_tcrec(x, callee, cargs, st)
     CkResume    -> lower_resume(x, cargs, st)
     # `__strip_unit(e)` is a compile-time unit erasure — identity at
     # runtime, so lower the inner expr directly (like `__perceus_borrow`).
@@ -3918,29 +3918,26 @@ fn lower_resume(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match ca
   _ -> LRes(KUnitV, st)
 }
 
-# `__kai_tcrec|<sym>|<dropmask>|<p0>|...` → KTcrecGoto (seals the block).
-# Invariant (Linus review #2): `tcrec_rewrite_decls` plants the call args
-# in the SAME order as the loop params `p0..pN`, so the ordinal index from
-# `assigns_of(avs, 0, …)` IS the slot index — the pipe's `_pnames` are
-# redundant here and deliberately unused. If that producer ever reorders,
-# this assumption breaks silently; the dropmask is a bitfield over the same
-# p0..pN ordering, so the two must stay aligned.
-fn lower_tcrec(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match es_tcrec_split_pipe(callee) {
-    [_, sym, dropmask_str, ..._pnames] -> match lower_tcrec_args(cargs, fnx_ufn_by_csym(st.fx, sym), st) {
-      LResMany(avs, st1) ->
-        # The goto leaves every enclosing match block, skipping their
-        # continuation scrutinee drops and this path's unconsumed binder
-        # dups — release the pending ledger entries before the back-edge.
-        seal_tail(tcp_goto_drops(cargs, st1),
-                  KTcrecGoto(cat3("_kai_", sym, "_entry"), assigns_of(avs, 0, []),
-                             es_tcrec_parse_decimal(dropmask_str), kpos_of(x)))
-    }
-    _ -> LRes(KUnitV, st)
+# A `MkTcrecStep` call → KTcrecGoto (seals the block).
+# Invariant: `tcrec_rewrite_decls` plants the call args in the SAME order
+# as the loop params, so the ordinal index from `assigns_of(avs, 0, …)` IS
+# the slot index — the step's `params` are redundant here and deliberately
+# unused. If that producer ever reorders, this assumption breaks silently;
+# the dropmask is a bitfield over the same ordering, so the two must stay
+# aligned.
+fn lower_tcrec(x: Expr, step: TcrecStep, cargs: [Expr], st: LowerSt) : LRes / Console =
+  match lower_tcrec_args(cargs, fnx_ufn_by_csym(st.fx, step.sym), st) {
+    LResMany(avs, st1) ->
+      # The goto leaves every enclosing match block, skipping their
+      # continuation scrutinee drops and this path's unconsumed binder
+      # dups — release the pending ledger entries before the back-edge.
+      seal_tail(tcp_goto_drops(cargs, st1),
+                KTcrecGoto(cat3("_kai_", step.sym, "_entry"), assigns_of(avs, 0, []),
+                           step.dropmask, kpos_of(x)))
   }
 
-# `__kai_trmc|<sym>|<holeslot>|<cname>|<dropmask>|<p0>|...` → KTrmcStep.
-# Same ordinal-index invariant as `lower_tcrec` (Linus review #2): `_pnames`
+# A `MkTrmcStep` call → KTrmcStep.
+# Same ordinal-index invariant as `lower_tcrec`: the step's `params`
 # are unused; cargs order == slot order, guaranteed by the rewrite producer.
 #
 # CRITICAL — the self-call is the back-edge, NEVER a value (mirror the C
@@ -3955,24 +3952,20 @@ fn lower_tcrec(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Con
 # The dropmask threads identically to `KTcrecGoto` (it reconciles the
 # exit-drops the goto skips); the hole-slot arg is never materialised, so it
 # carries no ref to drop.
-fn lower_trmc_step(x: Expr, callee: String, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match es_tcrec_split_pipe(callee) {
-    [_, sym, hole_str, cname, dropmask_str, ..._pnames] -> {
-      let hole = es_tcrec_parse_decimal(hole_str)
-      # The full slot mask of the spine ctor (0 for the builtin cons spine),
-      # so the native step lays each slot at its kind like KCon/KConReuse do —
-      # the same `ls_ctor_mask` (`variant_slot_mask`) the fresh route reads.
-      let slot_mask = if trmc_cname_is_cons(cname) { 0 } else { ls_ctor_mask_in(st, ctor_home_of_expr_ty(x), cname) }
-      # Lower the non-hole ctor args (head value(s)) left-to-right, then the
-      # self-call's args (the rebinds) — preserving evaluation order.
-      match lower_kinds_vals(trmc_drop_nth(cargs, hole, 0, []), mask_kinds_but(slot_mask, hole, 0, list_length(cargs)), 0, st, []) {
-        LResMany(heads, st1) ->
-          lower_trmc_seal(x, sym, hole, cname, es_tcrec_parse_decimal(dropmask_str),
-                          slot_mask, heads, cargs, st1)
-      }
-    }
-    _ -> LRes(KUnitV, st)
+fn lower_trmc_step(x: Expr, step: TrmcStep, cargs: [Expr], st: LowerSt) : LRes / Console = {
+  let hole = step.hole
+  # The full slot mask of the spine ctor (0 for the builtin cons spine),
+  # so the native step lays each slot at its kind like KCon/KConReuse do —
+  # the same `ls_ctor_mask` (`variant_slot_mask`) the fresh route reads.
+  let slot_mask = if trmc_cname_is_cons(step.cname) { 0 } else { ls_ctor_mask_in(st, ctor_home_of_expr_ty(x), step.cname) }
+  # Lower the non-hole ctor args (head value(s)) left-to-right, then the
+  # self-call's args (the rebinds) — preserving evaluation order.
+  match lower_kinds_vals(trmc_drop_nth(cargs, hole, 0, []), mask_kinds_but(slot_mask, hole, 0, list_length(cargs)), 0, st, []) {
+    LResMany(heads, st1) ->
+      lower_trmc_seal(x, step.sym, hole, step.cname, step.dropmask,
+                      slot_mask, heads, cargs, st1)
   }
+}
 
 # Lower the self-call's args into the loop-param rebinds and seal the step.
 # Split out of `lower_trmc_step` so the head/rebind lowerings sit at one

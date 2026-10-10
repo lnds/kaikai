@@ -7,8 +7,8 @@
 # decl list and emits forward decls, closure thunks, the FFI bridge, the
 # expression/statement lowering, and the `int main` scaffolding linking
 # against stage 0's runtime.h. The tail-call rewrite (`tcrec_*`) lives
-# here too: it is a C-emitter pre-pass (it mints `__kai_tcrec|<c_sym>|…`
-# goto strings and calls `emit_expr` / `c_sym`), not a `[Decl]→[Decl]`
+# here too: it is a C-emitter pre-pass (it plants the tail-step marks
+# and calls `emit_expr` / `c_sym`), not a `[Decl]→[Decl]`
 # peer of monomorph/unbox/perceus — see
 # docs/lane-infer-cross-section-analysis.md §3.
 #
@@ -2006,9 +2006,11 @@ fn emit_reuse_variant_body(src: String, cname: String, cargs: [Expr],
 fn emit_call_expr(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String / Console =
   match f.kind {
     # A mark in callee position names no C symbol: it asks for a
-    # lowering the mark itself decides, so it never enters the
-    # spelling-keyed dispatch below.
-    EMark(m) -> emit_mark_call(src, m, args_e, cx)
+    # lowering the mark itself decides. A tail step keeps the arguments
+    # of the call it replaces, so it takes the named path for what that
+    # path does to them.
+    EMark(m) -> if mark_is_tail_step(m) { emit_call_expr_named(src, f, args_e, cx) }
+                else { emit_mark_call(src, m, args_e, cx) }
     _        -> emit_call_expr_named(src, f, args_e, cx)
   }
 
@@ -2359,35 +2361,6 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
       # or intrinsic shares its name.
       if ec_declared(cx, f) {
         emit_named_call_lookup(src, callee, ec_callee_sym(f), args_e, cx)
-      } else if trmc_is_step_sentinel(callee) {
-        # TRMC modulo-cons site, planted by `trmc_rewrite_decl`. The
-        # callee carries `__kai_trmc|<sym>|<holeslot>|<cname>|<dropmask>|<p0>|...`
-        # and `args_e` are the original ctor args (arg[holeslot] is the
-        # self-call). Emit the build-hole + cctx_extend_linear + rebind +
-        # goto block (mirror rbtree__koka.c:288-304).
-        let parts = tcrec_split_pipe(callee)
-        match parts {
-          [_, sym, holeslot_str, cname, dropmask_str, ...pnames] -> {
-            let holeslot = tcrec_parse_decimal(holeslot_str)
-            let dropmask = tcrec_parse_decimal(dropmask_str)
-            emit_trmc_step(src, sym, holeslot, cname, dropmask, pnames, args_e, cx)
-          }
-          _ -> "kai_unit() /* trmc: malformed step sentinel */"
-        }
-      } else if tcrec_is_sentinel(callee) {
-        # Issue #37: self-tail-call site, planted by `tcrec_rewrite_decl`.
-        # The callee carries `__kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...`;
-        # split, parse, and emit the rebind+goto block. The label
-        # `_kai_<c_sym>_entry` is planted by `emit_fn_body`.
-        let parts = tcrec_split_pipe(callee)
-        match parts {
-          [_, sym, dropmask_str, ...pnames] -> {
-            let dropmask = tcrec_parse_decimal(dropmask_str)
-            tcrec_emit_goto(src, sym, dropmask, pnames, args_e,
-                            cx)
-          }
-          _ -> "kai_unit() /* tcrec: malformed sentinel */"
-        }
       } else if callee == canonical_continuation() {
         match args_e {
           [a] -> concat_all([
@@ -2740,6 +2713,13 @@ fn emit_call_expr_default(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : S
         None     -> emit_user_call_seq(c_sym(fname, Some(mod)), emit_arg_vals(src, args_e, cx), cx)
       }
     }
+    # A modulo-cons site: `args_e` are the original ctor args, the one at
+    # the step's hole being the self-call. Builds the cell with an open
+    # hole, extends the cctx, rebinds the params and jumps.
+    EMark(MkTrmcStep(s)) -> emit_trmc_step(src, s.sym, s.hole, s.cname, s.dropmask, s.params, args_e, cx)
+    # A self-tail-call site: the rebind+goto block. `emit_fn_body` plants
+    # the label it jumps to.
+    EMark(MkTcrecStep(s)) -> tcrec_emit_goto(src, s.sym, s.dropmask, s.params, args_e, cx)
     _ -> emit_apply_seq("kai_apply(", emit_expr(src, f, cx), emit_arg_vals(src, args_e, cx))
   }
 }
@@ -3912,11 +3892,11 @@ fn arm_tail_consumes_kind(k: ExprKind) : Bool = match k {
     (match opt_e { None -> false Some(e2) -> arm_all_tails_consume_token(e2) })
   EBlock(_, opt_tail) -> match opt_tail { None -> false Some(e) -> arm_all_tails_consume_token(e) }
   EMatch(_, arms) -> arm_tail_consumes_arms(arms)
-  # A tail ECall is acceptable ONLY if it is a TRMC step sentinel or a TRMC
+  # A tail ECall is acceptable ONLY if it is a TRMC step or a TRMC
   # apply of a constructor rebuild (the token is consumed building the node).
   # Any other call (balance_left, …) does NOT consume the token → reject.
   ECall(f, xs) -> match sym_read_kind(f.kind) {
-    EVar(callee) -> trmc_is_step_sentinel(callee)
+    EMark(MkTrmcStep(_)) -> true
     EMark(MkTrmcApply) -> arm_apply_is_ctor(xs)
     _ -> false
   }
@@ -6646,7 +6626,7 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
     # Phase 3 unboxing — when the callee resolves to a UFn, emit
     # the raw call inline (`<callee>(<raw args>)`) so the result
     # stays a raw scalar without a kai_int wrap-and-unwrap. The
-    # tcrec sentinel callee is special — it always lowers to the
+    # tcrec step is special — it always lowers to the
     # `goto`-block which `tcrec_emit_goto` already produces in raw
     # form when the surrounding fn is UFn. Other callees fall back
     # to the boxed-then-unbox boundary form.
@@ -6669,18 +6649,9 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         [coll, ix] -> emit_fixed_vec_get_dyn(src, coll, ix, cx)
         _ -> fixed_vec_arity_mismatch(MkFixedVecGetDyn)
       }
+      EMark(MkTcrecStep(s)) -> tcrec_emit_goto(src, s.sym, s.dropmask, s.params, args_e, cx)
       EVar(callee) ->
-        if tcrec_is_sentinel(callee) {
-          let parts = tcrec_split_pipe(callee)
-          match parts {
-            [_, sym, dropmask_str, ...pnames] -> {
-              let dropmask = tcrec_parse_decimal(dropmask_str)
-              tcrec_emit_goto(src, sym, dropmask, pnames, args_e,
-                              cx)
-            }
-            _ -> "0 /* tcrec: malformed sentinel */"
-          }
-        } else { match emit_raw_rcore(src, callee_e, callee, args_e, cx) {
+        match emit_raw_rcore(src, callee_e, callee, args_e, cx) {
           Some(s) -> s
           None -> match emit_ufn_raw_call_at(src, x, callee_e, args_e, cx) {
           Some(s) -> s
@@ -6688,7 +6659,7 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
             let boxed = emit_expr_boxed(src, x, cx)
             unbox_border(boxed, x, x.ty)
           }
-        } } }
+        } }
       _ -> match emit_ufn_raw_call_at(src, x, callee_e, args_e, cx) {
         Some(s) -> s
         None    -> {
@@ -13142,14 +13113,11 @@ fn tcrec_block_scope(stmts: [Stmt], scope: [String]) : [String] {
 # ---- m37 / TCO: self-tail-call rewrite ------------------------------
 #
 # Runs after `perceus_pass`. Each self-tail-call's callee is replaced with
-# a pipe-encoded sentinel carrying what `emit_call_expr` needs:
-#
-#     __kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...
-#
-# `c_sym` mints the goto label `_kai_<c_sym>_entry`; bit `i` of `dropmask`
-# drops param `i` before the rebind, standing in for the exit drop the goto
-# jumps past (`tcrec_compute_site_dropmask`); `p0..pN` are the params in
-# declaration order. Pipe cannot appear in a kaikai identifier.
+# a `MkTcrecStep` mark carrying what `emit_call_expr` needs: `sym` mints
+# the goto label `_kai_<sym>_entry`; bit `i` of `dropmask` drops param `i`
+# before the rebind, standing in for the exit drop the goto jumps past
+# (`tcrec_compute_site_dropmask`); `params` are the params in declaration
+# order.
 #[doc("Rewrite every self-tail-call into the goto sentinel the C and native emitters lower to a loop.")]
 pub fn tcrec_rewrite_decls(decls: [Decl], allow_trmc: Bool, cons_ok: Bool, root: String) : [Decl] / Console + Mutable = {
   # The goto rebinds a parameter slot in place, so a read that hands the
@@ -13792,73 +13760,33 @@ fn tcrec_lookup_dm(table: [TcrDm], line: Int, col: Int) : Int {
   }
 }
 
-# Issue #102: omit the trailing `|` when pnames is empty (zero-arg
-# self-tail-call). The decoder `tcrec_split_pipe` then yields exactly
-# 3 parts and `[_, sym, mask, ...pnames]` matches with `pnames = []`,
-# so `tcrec_emit_rebinds` correctly emits nothing — instead of the
-# malformed `kai_ = _t0;` produced when an empty trailing element
-# leaked into the pnames list.
-
-# Issue #102: omit the trailing `|` when pnames is empty (zero-arg
-# self-tail-call). The decoder `tcrec_split_pipe` then yields exactly
-# 3 parts and `[_, sym, mask, ...pnames]` matches with `pnames = []`,
-# so `tcrec_emit_rebinds` correctly emits nothing — instead of the
-# malformed `kai_ = _t0;` produced when an empty trailing element
-# leaked into the pnames list.
-fn tcrec_make_sentinel(sym: String, dropmask: Int, pnames: [String]) : String =
-  match pnames {
-    [] -> concat_all(["__kai_tcrec|", sym, "|", int_to_string(dropmask)])
-    _  -> concat_all(["__kai_tcrec|", sym, "|", int_to_string(dropmask),
-                      "|", string_join(pnames, "|")])
-  }
-
-# ---- TRMC sentinel wire-format -------------------------------------
+# ---- TRMC step -----------------------------------------------------
 #
 # A modulo-cons tail leaf is rewritten to
-#   ECall(EVar("__kai_trmc|<sym>|<holeslot>|<tag>|<cname>|<nargs>|<mask>|<dropmask>|<p0>|<p1>|..."), ctor_args)
-# where `ctor_args` are the ORIGINAL constructor arguments (one of them,
-# at index <holeslot>, is the self-call `ECall(EVar(nm), self_args)`).
-# The emitter (`emit_trmc_step`) builds the node with a NULL hole at
-# <holeslot>, extends the cctx to point at it, rebinds the loop params
-# from the self-call's args (with <dropmask> reconciling Perceus's
-# exit-drops, exactly like tcrec_emit_goto), and `goto`s the entry label.
+#   ECall(EMark(MkTrmcStep(..)), ctor_args)
+# where `ctor_args` are the ORIGINAL constructor arguments (the one at
+# the step's `hole` is the self-call `ECall(EVar(nm), self_args)`).
+# The emitter (`emit_trmc_step`) builds the node with a NULL hole there,
+# extends the cctx to point at it, rebinds the loop params from the
+# self-call's args (with `dropmask` reconciling Perceus's exit-drops,
+# exactly like tcrec_emit_goto), and `goto`s the entry label.
 #
 # A non-modulo-cons tail leaf is wrapped in the `MkTrmcApply` mark, which
 # the emitter lowers to `kai_cctx_apply_linear(_kai_acc, <leaf>)`.
 #
 # The ctor tag/mask/payload-types are resolved at emit time from
-# `cname` against `cx.variants` (the rewrite pass has no EmitCtx), so
-# the wire-format carries `sym|holeslot|cname|dropmask|p0|p1|...`.
-fn trmc_make_step_sentinel(sym: String, holeslot: Int, cname: String,
-                           dropmask: Int, pnames: [String]) : String =
-  match pnames {
-    [] -> concat_all(["__kai_trmc|", sym, "|", int_to_string(holeslot), "|",
-                      cname, "|", int_to_string(dropmask)])
-    _  -> concat_all(["__kai_trmc|", sym, "|", int_to_string(holeslot), "|",
-                      cname, "|", int_to_string(dropmask),
-                      "|", string_join(pnames, "|")])
-  }
-
-fn trmc_is_step_sentinel(callee: String) : Bool = string_starts_with_q(callee, "__kai_trmc|")
-
-# Issue #706: the sentinel wire-format helpers now live in
-# `emit_shared.kai` (`es_tcrec_*`) so both the C and LLVM emitters
-# decode the same format. These thin wrappers preserve the local call
-# sites unchanged.
-fn tcrec_is_sentinel(callee: String) : Bool = es_tcrec_is_sentinel(callee)
-
-fn tcrec_split_pipe(s: String) : [String] = es_tcrec_split_pipe(s)
+# `cname` against `cx.variants` (the rewrite pass has no EmitCtx).
 
 # Tail-position rewrite. Mirrors the M1 walker but produces a fresh
 # `Expr` tree where each tail-self-call's callee has been swapped
-# for a freshly-built sentinel `EVar` whose dropmask is computed
+# for a freshly-built step mark whose dropmask is computed
 # *per call site* by inspecting that site's args. Args are not
 # recursed into — they are non-tail and `emit_expr` evaluates
 # them normally on emit.
 
 # Tail-position rewrite. Mirrors the M1 walker but produces a fresh
 # `Expr` tree where each tail-self-call's callee has been swapped
-# for a freshly-built sentinel `EVar` whose dropmask is computed
+# for a freshly-built step mark whose dropmask is computed
 # *per call site* by inspecting that site's args. Args are not
 # recursed into — they are non-tail and `emit_expr` evaluates
 # them normally on emit.
@@ -13930,8 +13858,8 @@ fn trmc_rewrite_body(body0: Expr, me: SelfRef, arity: Int, c_sym_str: String,
   txd_plant(out, txd_wrap_drops(body0))
 }
 
-# Build the step-sentinel `ECall` for a modulo-cons leaf: compute the
-# per-site dropmask (base + side table), make the sentinel callee, and apply
+# Build the step `ECall` for a modulo-cons leaf: compute the
+# per-site dropmask (base + side table), make the step callee, and apply
 # it to the ctor args (`args` carries the self-call at slot `h`). Shared
 # by the user-ctor, builtin-cons-literal, and reuse-cons leaves so the
 # dropmask discipline stays single-sourced.
@@ -13945,8 +13873,8 @@ fn trmc_make_step_call(cname: String, args: [Expr], h: Int, line: Int, col: Int,
     None     -> 0
   }
   let dropmask = base_mask + site_mask
-  let sentinel = trmc_make_step_sentinel(c_sym_str, h, cname, dropmask, pnames)
-  ECall(Expr { kind: EVar(sentinel), line: line, col: col, ty: None, mode: MBoxed , site: 0 }, args)
+  let step = MkTrmcStep(TrmcStep { sym: c_sym_str, hole: h, cname: cname, dropmask: dropmask, params: pnames })
+  ECall(Expr { kind: EMark(step), line: line, col: col, ty: None, mode: MBoxed , site: 0 }, args)
 }
 
 fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
@@ -14007,8 +13935,8 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
             None     -> 0
           }
           let dropmask = base_mask + site_mask
-          let sentinel = trmc_make_step_sentinel(c_sym_str, h, cname, dropmask, pnames)
-          ECall(Expr { kind: EVar(sentinel), line: line, col: col, ty: f.ty, mode: f.mode , site: 0 }, xs)
+          let step = MkTrmcStep(TrmcStep { sym: c_sym_str, hole: h, cname: cname, dropmask: dropmask, params: pnames })
+          ECall(Expr { kind: EMark(step), line: line, col: col, ty: f.ty, mode: f.mode , site: 0 }, xs)
         }
         None -> match trmc_reuse_variant_ctor(f, xs, me, arity) {
           # A Perceus reuse rebuild of a modulo-cons ctor is that ctor's step:
@@ -14087,7 +14015,7 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
         } else { k }
       # A qualified call to the enclosing module with the fn's own name
       # is the same self-call (the monomorphiser's module-shared
-      # retarget); the sentinel replaces the callee wholesale.
+      # retarget); the step mark replaces the callee wholesale.
       EModCall(callmod, callee) ->
         if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
           tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, c_sym_str)
@@ -14119,7 +14047,7 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
   }
 }
 
-# Plant the goto sentinel for one recognised self-call site (shared by
+# Plant the goto step for one recognised self-call site (shared by
 # the bare-EVar and qualified-EModCall shapes).
 fn tcrec_make_step_site(f: Expr, xs: [Expr], params: [Param], pnames: [String],
                         uses: UseIx, dm_table: [TcrDm], skip_set: [String],
@@ -14127,9 +14055,9 @@ fn tcrec_make_step_site(f: Expr, xs: [Expr], params: [Param], pnames: [String],
   let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
   let site_mask = tcrec_lookup_dm(dm_table, f.line, f.col)
   let dropmask = base_mask + site_mask
-  let sentinel = tcrec_make_sentinel(c_sym_str, dropmask, pnames)
+  let step = MkTcrecStep(TcrecStep { sym: c_sym_str, dropmask: dropmask, params: pnames })
   ECall(
-    Expr { kind: EVar(sentinel), line: f.line, col: f.col,
+    Expr { kind: EMark(step), line: f.line, col: f.col,
            ty: f.ty, mode: f.mode,  site: f.site },
     xs)
 }
@@ -14176,7 +14104,7 @@ pub fn trmc_body_has_step(body: Expr) : Bool = trmc_scan_step_kind(body.kind)
 fn trmc_scan_step_kind(k: ExprKind) : Bool {
   match k {
     ECall(f, xs) -> match f.kind {
-      EVar(callee) -> if trmc_is_step_sentinel(callee) { true } else { trmc_scan_step_exprs(xs) }
+      EMark(MkTrmcStep(_)) -> true
       _ -> trmc_scan_step_exprs(xs)
     }
     EIf(c, t, opt_e) ->
@@ -14225,10 +14153,8 @@ fn trmc_scan_step_stmts(stmts: [Stmt]) : Bool {
 fn tcrec_scan_kind(k: ExprKind) : Bool {
   match k {
     ECall(f, xs) -> match f.kind {
-      EVar(callee) ->
-        if tcrec_is_sentinel(callee) { true }
-        else if trmc_is_step_sentinel(callee) { true }   # TRMC step needs the goto label too
-        else { tcrec_scan_exprs(xs) }
+      # A TRMC step needs the goto label too.
+      EMark(m) -> if mark_is_tail_step(m) { true } else { tcrec_scan_exprs(xs) }
       _ -> if tcrec_body_has_sentinel(f) { true } else { tcrec_scan_exprs(xs) }
     }
     EIf(c, t, opt_e) ->
@@ -14310,19 +14236,10 @@ fn tcrec_scan_stmts(stmts: [Stmt]) : Bool {
   }
 }
 
-# Decimal parser used by the emit-side sentinel decoder. Stops at
-# the first non-digit; returns 0 on an empty / malformed input. The
-# encoder emits via `int_to_string` so only `[0-9]+` ever reaches us.
-
-# Decimal parser used by the emit-side sentinel decoder. Stops at
-# the first non-digit; returns 0 on an empty / malformed input. The
-# encoder emits via `int_to_string` so only `[0-9]+` ever reaches us.
-fn tcrec_parse_decimal(s: String) : Int = es_tcrec_parse_decimal(s)
-
 # ---- m37 / TCO — goto-block emission ------------------------------
 #
-# Called from `emit_call_expr` when the callee's `EVar` carries a
-# `__kai_tcrec|...` sentinel. Emits the rebind-and-goto block
+# Called from `emit_call_expr` when the callee is a `MkTcrecStep` mark.
+# Emits the rebind-and-goto block
 # documented in `tcrec_rewrite_decl`. Refcount discipline:
 #
 # 1. Evaluate every arg into a fresh `_t<i>` local (each with rc=1
