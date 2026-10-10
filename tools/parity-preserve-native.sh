@@ -43,7 +43,7 @@ resolve_llvm_config() {
   fi
   command -v llvm-config >/dev/null 2>&1 && { command -v llvm-config; return 0; }
   if command -v brew >/dev/null 2>&1; then
-    for f in llvm llvm@18; do
+    for f in llvm llvm@22; do
       c="$(brew --prefix "$f" 2>/dev/null)/bin/llvm-config"
       [ -x "$c" ] && { echo "$c"; return 0; }
     done

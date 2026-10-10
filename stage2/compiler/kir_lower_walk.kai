@@ -44,6 +44,7 @@ import compiler.kir_lower_variant
 import compiler.kir_lower_ptest
 import compiler.kir_lower_ptest_seal
 import compiler.vec_raw
+import compiler.kir_lower_vec
 import compiler.emit_tcrec_live
 import compiler.raw_border
 import compiler.handler_alias
@@ -636,7 +637,14 @@ fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # boxed path needs.
   ECall(f, cargs) -> match lower_fixed_vec_read_raw(x, f, cargs, st) {
     Some(r) -> r
-    None    -> lower_call(x, f, cargs, st)
+    None    -> match vec_raw_read(st.recs, x.kind, x.ty) {
+      Some(rd) -> lower_vec_raw_read(x, rd, st)
+      None     -> lower_call(x, f, cargs, st)
+    }
+  }
+  EField(_, _) -> match vec_raw_read(st.recs, x.kind, x.ty) {
+    Some(rd) -> lower_vec_raw_read(x, rd, st)
+    None     -> lower_scalar_unbox_border(x, st)
   }
   # A single-tail block transparently wraps its raw tail. A plain block with
   # statements lowers them in its own scope and its tail at the raw slot; a
@@ -1284,39 +1292,38 @@ fn lower_field_read(st: LowerSt, op: KOp, base: KVal, pos: KPos) : LRes / Consol
 
 # ---- Vec raw element fusion (classifier verdict in vec_raw.kai) -----
 
-# `vec_get(v, i).f` / `vec_get_borrow(v, i).f` on a REC carrier →
-# `kai_vec_get_field(_borrow)(v, i, fidx)`. The helper's RC contract on
-# (v, i) matches the vec_get variant it replaces; no record is built,
-# so there is no base to drop.
-fn lower_vec_get_field_fused(x: Expr, base: Expr, fname: String, st: LowerSt) : Option[LRes] / Console = match base.kind {
-  ECall(f, cargs) -> match vec_get_field_prim(f) {
-    Some(prim) ->
-      match vec_rec_field_slot(st.recs, base.ty, fname) {
-        Some(fidx) -> match cargs {
-          [v, i] -> {
-            let rv = lower_expr(v, st)
-            match rv { LRes(vv, st1) -> {
-              let ri = lower_expr(i, st1)
-              match ri { LRes(iv, st2) ->
-                Some(bind_op(st2, KPrim(prim, [vv, iv, KIntV(fidx)]), kpos_of(x))) }
-            } }
-          }
-          _ -> None
-        }
-        None -> None
-      }
-    None -> None
+# `vec_get(v, i).f` / `vec_get_borrow(v, i).f` on a REC carrier, for a
+# field the bare-word paths do not carry: the column is read as its box and
+# no record is built.
+fn lower_vec_get_field_fused(x: Expr, base: Expr, fname: String, st: LowerSt) : Option[LRes] / Console = match vec_field_read(st.recs, base, fname) {
+  None     -> None
+  Some(fr) -> {
+    let a = lower_vec_read_args(fr.get, st)
+    Some(lower_vec_read_bind(x, a, vec_boxed_field_op(fr.col, a.vv, a.iv, a.owned), SBoxed))
   }
-  _ -> None
 }
 
-# The prim reading one field of the element `f` fetches, when `f` is a
-# `vec_get` form.
-fn vec_get_field_prim(f: Expr) : Option[PrimOp] = match builtin_ref(f) {
-  Some(CbVecGet)       -> Some(KpVecGetField)
-  Some(CbVecGetBorrow) -> Some(KpVecGetFieldBorrow)
-  _                    -> None
+# A bare-word Vec read (verdict in vec_raw.kai).
+fn lower_vec_raw_read(x: Expr, rd: VecRawRead, st: LowerSt) : LRes / Console = {
+  let a = lower_vec_read_args(rd.get, st)
+  lower_vec_read_bind(x, a, vec_raw_read_op(rd, a.vv, a.iv, a.owned), vec_bits_slot(rd.bits))
 }
+
+# A fused Vec read only borrows the vec, so the read releases it after when
+# it owns it: a consuming `vec_get`, or an owned value in the borrowing
+# one's slot. The vec stays in flight while the index runs.
+type VecReadArgs = { vv: KVal, iv: KVal, owned: Bool, st: LowerSt }
+
+fn lower_vec_read_args(g: VecGet, st: LowerSt) : VecReadArgs / Console =
+  match lower_expr(g.v, st) { LRes(vv, st1) ->
+    match lower_expr_raw_at(g.i, SInt64, lower_flight_add(g.v, vv, st1)) { LRes(iv, st2) ->
+      VecReadArgs { vv: vv, iv: iv, owned: not g.borrows or ob_is_marked(g.v), st: lower_flight_end(st1, st2) } } }
+
+fn lower_vec_read_bind(x: Expr, a: VecReadArgs, op: KOp, slot: KSlot) : LRes / Console =
+  match bind_op_slot(a.st, op, slot, kpos_of(x)) {
+    LRes(rv, st1) -> if a.owned { LRes(rv, ls_emit(st1, KRC(KDrop(a.vv), kpos_of(x)))) }
+                     else { LRes(rv, st1) }
+  }
 
 # `vec_push(v, Rec{..})` / `vec_set(v, i, Rec{..})` on a REC carrier →
 # `kai_vec_push_rec_raw` / `kai_vec_set_rec_raw` over the unpacked
@@ -1329,44 +1336,93 @@ fn lower_vec_write_rec_fused(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : Opt
     if is_builtin_ref(f, CbVecPush) {
       match cargs {
         [v, lit] -> match lit.kind {
-          ERecordLit(_, _, fis) ->
-            if vec_elem_is_rec_carrier(st.recs, lit.ty) {
-              let rv = lower_expr(v, st)
-              match rv { LRes(vv, st1) ->
-                match lower_vec_rec_pairs(fis, st1, []) {
-                  LResMany(pvs, st2) ->
-                    Some(bind_op(st2,
-                      KPrim(KpVecPushRecRaw, [vv, KIntV(list_length(fis)), ...pvs]),
-                      kpos_of(x)))
-                } }
-            } else { None }
-          _ -> None
+          ERecordLit(_, _, fis) -> match vec_rec_lit_bits(st.recs, lit.ty, fis) {
+            Some(bs) -> Some(lower_vec_push_rec_bits(x, v, fis, bs, st))
+            None ->
+              if vec_elem_is_rec_carrier(st.recs, lit.ty) {
+                match lower_vec_write_target(v, st) { LRes(vv, st1) ->
+                  match lower_vec_rec_pairs(fis, st1, []) {
+                    LResMany(pvs, st2) ->
+                      Some(bind_op(lower_flight_end(st, st2),
+                        KPrim(KpVecPushRecRaw, [vv, KIntV(list_length(fis)), ...pvs]),
+                        kpos_of(x)))
+                  } }
+              } else { None }
+          }
+          _ -> lower_vec_push_scalar(x, v, lit, st)
         }
         _ -> None
       }
     } else if is_builtin_ref(f, CbVecSet) {
       match cargs {
         [v, i, lit] -> match lit.kind {
-          ERecordLit(_, _, fis) ->
-            if vec_elem_is_rec_carrier(st.recs, lit.ty) {
-              let rv = lower_expr(v, st)
-              match rv { LRes(vv, st1) -> {
-                let ri = lower_expr(i, st1)
-                match ri { LRes(iv, st2) ->
-                  match lower_vec_rec_vals(fis, st2, []) {
-                    LResMany(fvs, st3) ->
-                      Some(bind_op(st3,
-                        KPrim(KpVecSetRecRaw, [vv, iv, KIntV(list_length(fis)), ...fvs]),
-                        kpos_of(x)))
-                  } }
-              } }
-            } else { None }
-          _ -> None
+          ERecordLit(_, _, fis) -> match vec_rec_lit_bits(st.recs, lit.ty, fis) {
+            Some(bs) -> Some(lower_vec_set_rec_bits(x, v, i, fis, bs, st))
+            None ->
+              if vec_elem_is_rec_carrier(st.recs, lit.ty) {
+                match lower_vec_write_target(v, st) { LRes(vv, st1) ->
+                  match lower_expr(i, st1) { LRes(iv, st2) ->
+                    match lower_vec_rec_vals(fis, st2, []) {
+                      LResMany(fvs, st3) ->
+                        Some(bind_op(lower_flight_end(st, st3),
+                          KPrim(KpVecSetRecRaw, [vv, iv, KIntV(list_length(fis)), ...fvs]),
+                          kpos_of(x)))
+                    } } }
+              } else { None }
+          }
+          _ -> lower_vec_set_scalar(x, v, i, lit, st)
         }
         _ -> None
       }
     } else { None }
   _ -> None
+}
+
+# The vec a fused write consumes stays in flight while its other operands
+# run; the write's own op lands it.
+fn lower_vec_write_target(v: Expr, st: LowerSt) : LRes / Console =
+  match lower_expr(v, st) { LRes(vv, st1) -> LRes(vv, lower_flight_add(v, vv, st1)) }
+
+# The bare-word writes: every payload is lowered at its raw slot, so no box
+# is built; the runtime entry keeps the unique-or-copy decision.
+type LVecFields = LVecFields([VecField], LowerSt)
+
+fn lower_vec_fields_raw(fis: [FieldInit], bs: [VecBits], st: LowerSt, acc: [VecField]) : LVecFields / Console = match fis {
+  []            -> LVecFields(list_reverse(acc), st)
+  [fi, ...rest] -> match fi {
+    FI(nm, e) -> match bs {
+      []            -> LVecFields(list_reverse(acc), st)
+      [b, ...brest] -> match lower_expr_raw_at(e, vec_bits_slot(b), st) {
+        LRes(ev, st1) -> lower_vec_fields_raw(rest, brest, st1, [VecField(nm, b, ev), ...acc])
+      }
+    }
+  }
+}
+
+fn lower_vec_push_rec_bits(x: Expr, v: Expr, fis: [FieldInit], bs: [VecBits], st: LowerSt) : LRes / Console =
+  match lower_vec_write_target(v, st) { LRes(vv, st1) ->
+    match lower_vec_fields_raw(fis, bs, st1, []) { LVecFields(fs, st2) ->
+      bind_op(lower_flight_end(st, st2), vec_push_rec_op(vv, fs), kpos_of(x)) } }
+
+fn lower_vec_set_rec_bits(x: Expr, v: Expr, i: Expr, fis: [FieldInit], bs: [VecBits], st: LowerSt) : LRes / Console =
+  match lower_vec_write_target(v, st) { LRes(vv, st1) ->
+    match lower_expr_raw_at(i, SInt64, st1) { LRes(iv, st2) ->
+      match lower_vec_fields_raw(fis, bs, st2, []) { LVecFields(fs, st3) ->
+        bind_op(lower_flight_end(st, st3), vec_set_rec_op(vv, iv, fs), kpos_of(x)) } } }
+
+fn lower_vec_push_scalar(x: Expr, v: Expr, e: Expr, st: LowerSt) : Option[LRes] / Console = match vec_bits_of(e.ty) {
+  None    -> None
+  Some(b) -> match lower_vec_write_target(v, st) { LRes(vv, st1) ->
+    match lower_expr_raw_at(e, vec_bits_slot(b), st1) { LRes(xv, st2) ->
+      Some(bind_op(lower_flight_end(st, st2), vec_push_scalar_op(b, vv, xv), kpos_of(x))) } }
+}
+
+fn lower_vec_set_scalar(x: Expr, v: Expr, i: Expr, e: Expr, st: LowerSt) : Option[LRes] / Console = match vec_bits_of(e.ty) {
+  None    -> None
+  Some(b) -> match lower_vec_write_target(v, st) { LRes(vv, st1) ->
+    match lower_expr_raw_at(i, SInt64, st1) { LRes(iv, st2) ->
+      match lower_expr_raw_at(e, vec_bits_slot(b), st2) { LRes(xv, st3) ->
+        Some(bind_op(lower_flight_end(st, st3), vec_set_scalar_op(b, vv, iv, xv), kpos_of(x))) } } }
 }
 
 fn lower_vec_rec_pairs(fis: [FieldInit], st: LowerSt, acc: [KVal]) : LResMany / Console = match fis {

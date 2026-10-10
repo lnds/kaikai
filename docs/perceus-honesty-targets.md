@@ -134,6 +134,22 @@ raw paths and borrow reads at the call site. An idiomatic
 `vec.push`/`vec.get` fill+sum loop measures identical wall and RSS to
 the builtin-prim spelling on both backends.
 
+**A lend that ends before the hand-over leaves the container unique.**
+A read in a borrowed slot that runs before the container's one owning
+read on that path does not raise its count: `vec_set(v, i, vec_get(v, i)
++ 1)` writes in place whether the read sits in the write's arguments or
+in an earlier `let`, on a param threaded through a tail-recursive loop
+or on a local. A bare argument is handed over when its call runs, after
+its sibling arguments were evaluated; a read that runs after the
+hand-over keeps the dup, and that write copies. A `let` read on several
+exclusive paths, once on each, moves on every one, as a param does.
+
+> **Current state (2026-10-10):** a `var` reassigned in a `while` body
+> (`v := vec_set(v, i, x)`) copies on every write on both backends,
+> with or without a read: the slot keeps its reference while the
+> right-hand side runs. So does a vector held in a constructor field
+> and rebuilt from the arm that binds it.
+
 ### User-parameter borrow (#1127)
 
 The borrow **surface** extends to **user function parameters**: `^` on a

@@ -201,19 +201,18 @@ cp stage2/runtime_owner_c.c "$STAGE/share/kaikai/include/runtime_owner_c.c"
 # P2 (docs/native-codegen-perf-plan.md §P2): ship the native-runtime bitcode
 # so the installed `kai build --backend=native` links it before O2 and
 # inlines the runtime ops. The `make -C stage2 KAI_LLVM=1 kaic2` above
-# already generated stage0/runtime_llvm.bc (via tools/gen-runtime-bc.sh,
-# clang 18). The bitcode encodes THIS build host's data layout, so it is
+# already generated stage0/runtime_llvm.bc (via tools/gen-runtime-bc.sh).
+# The bitcode encodes THIS build host's data layout, so it is
 # correct only for a tarball of the SAME platform — which is exactly what a
 # release runner produces (the macOS-arm64 runner builds the macOS-arm64
 # tarball). kai resolves it next to runtime_llvm.c under
 # share/kaikai/include in the installed layout. ASSERT it is present and
 # active: a release that silently fell back to the legacy cc-link path would
-# ship the slow native default. (build-release runs on a clang-18 runner;
-# the assert turns a dropped clang-18 into a red release, not a silent perf
-# regression — asu guard #2.)
+# ship the slow native default.
 if ! "$ROOT/tools/assert-runtime-bc.sh" >&2; then
-  echo "build-release.sh: native P2 bitcode not generated — clang 18 missing on the release host." >&2
-  echo "  Install clang 18 (brew install llvm@18 / apt-get install clang-18) before releasing," >&2
+  need="$("$LLVM_CONFIG" --version | cut -d. -f1)"
+  echo "build-release.sh: native P2 bitcode not generated — clang $need missing on the release host." >&2
+  echo "  Install clang $need (brew install llvm@$need / apt-get install clang-$need) before releasing," >&2
   echo "  or the shipped native backend would run the slow legacy path." >&2
   exit 2
 fi

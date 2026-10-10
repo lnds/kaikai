@@ -96,7 +96,7 @@ KAI_LLVM_AUTO := 1
 endif
 ifeq ($(KAI_LLVM),1)
 ifeq ($(LLVM_CONFIG_RESOLVED),)
-$(error KAI_LLVM=1 but '$(LLVM_CONFIG)' was not found. Put llvm-config on PATH or pass LLVM_CONFIG=/path/to/llvm-config (Homebrew keg-only: LLVM_CONFIG=$$(brew --prefix llvm@18)/bin/llvm-config))
+$(error KAI_LLVM=1 but '$(LLVM_CONFIG)' was not found. Put llvm-config on PATH or pass LLVM_CONFIG=/path/to/llvm-config (Homebrew keg-only: LLVM_CONFIG=$$(brew --prefix llvm@22)/bin/llvm-config))
 endif
 LLVM_CPPFLAGS := $(shell $(LLVM_CONFIG) --cflags) -DKAI_LLVM
 # Component set is `nativecodegen` (NOT `native`): the backend EMITS code,
@@ -251,8 +251,8 @@ else
 endif
 	@# P2 (docs/native-codegen-perf-plan.md §P2): generate the native-runtime
 	@# bitcode the in-process backend links before O2. Build-time + gated to
-	@# clang 18 (writer <= the libLLVM-18 reader); a clang-18-less host opts
-	@# out cleanly (native falls back to linking runtime_llvm.c with cc). The
+	@# a clang of the linked libLLVM's major; a host without one opts out
+	@# cleanly (native falls back to linking runtime_llvm.c with cc). The
 	@# script is idempotent — a no-op when the .bc is fresh.
 	@../tools/gen-runtime-bc.sh || true
 	@# Terminal banner, deliberately the last line of the build: the P2
@@ -6975,7 +6975,7 @@ test-perceus-1135-vec-value-native: $(TARGET) bin-kai build
 #   3. the stdlib-module map shape: a module-qualified self-call must
 #      still tcrec-rewrite to the goto (over-release + stack growth
 #      without it) — gated by output diff incl. a 200k-deep map.
-PERCEUS_1135_RAW_FIXTURES := vec_rec_raw_fusion_1135 vec_stdlib_map_qualified_tco_1135
+PERCEUS_1135_RAW_FIXTURES := vec_rec_raw_fusion_1135 vec_stdlib_map_qualified_tco_1135 vec_bare_words vec_fused_read_owned_row
 
 test-perceus-1135-vec-raw: $(TARGET) build
 	@set -e; \
@@ -6991,6 +6991,9 @@ test-perceus-1135-vec-raw: $(TARGET) build
 	grep -q 'vec_inplace=101 vec_cow=2' build/s2-vec_rec_raw_fusion_1135.rc \
 	  || { echo "perceus-1135-vec-raw FAIL (raw fusion: expected vec_inplace=101 vec_cow=2)"; \
 	       grep vec_ build/s2-vec_rec_raw_fusion_1135.rc || true; exit 1; }; \
+	grep -q 'vec_inplace=283 vec_cow=7' build/s2-vec_bare_words.rc \
+	  || { echo "perceus-1135-vec-raw FAIL (bare words: expected vec_inplace=283 vec_cow=7)"; \
+	       grep vec_ build/s2-vec_bare_words.rc || true; exit 1; }; \
 	echo "perceus-1135-vec-raw OK (raw moves ride unique-or-copy; qualified self-call keeps the goto)"
 
 test-perceus-1135-vec-raw-native: $(TARGET) bin-kai build
@@ -7006,7 +7009,66 @@ test-perceus-1135-vec-raw-native: $(TARGET) bin-kai build
 	grep -q 'vec_inplace=101 vec_cow=2' build/s2-vec_rec_raw_fusion_1135-n.rc \
 	  || { echo "perceus-1135-vec-raw-native FAIL (raw fusion: expected vec_inplace=101 vec_cow=2)"; \
 	       grep vec_ build/s2-vec_rec_raw_fusion_1135-n.rc || true; exit 1; }; \
+	grep -q 'vec_inplace=283 vec_cow=7' build/s2-vec_bare_words-n.rc \
+	  || { echo "perceus-1135-vec-raw-native FAIL (bare words: expected vec_inplace=283 vec_cow=7)"; \
+	       grep vec_ build/s2-vec_bare_words-n.rc || true; exit 1; }; \
+	KAI_NATIVE_DUMP_IR=build/s2-vec_bare_words-n.ll KAI_NATIVE_MODULAR=0 KAI_BACKEND=native ../bin/kai build ../examples/perceus/vec_bare_words.kai -o build/s2-vec_bare_words-ir 2> build/s2-vec_bare_words-ir.err \
+	  || { echo "perceus-1135-vec-raw-native FAIL (bare words: whole-program build errored)"; cat build/s2-vec_bare_words-ir.err; exit 1; }; \
+	for sym in kaix_vec_field_boxed kaix_vec_field_i64 kaix_vec_field_f64 kaix_vec_get_i64 kaix_vec_get_f64 kaix_vec_push_rec_bits kaix_vec_set_rec_bits kaix_vec_push_i64 kaix_vec_push_f64 kaix_vec_set_i64 kaix_vec_set_f64; do \
+	  grep -q "@$$sym(" build/s2-vec_bare_words-n.ll \
+	    || { echo "perceus-1135-vec-raw-native FAIL (bare words: no $$sym in the IR — the access fell back to a box)"; exit 1; }; \
+	done; \
+	../bin/kai build ../examples/stdlib/vec_bare_word_traps.kai -o build/s2-vec_bare_word_traps-n 2> build/s2-vec_bare_word_traps-n.err \
+	  || { echo "perceus-1135-vec-raw-native FAIL (bare-word traps: native build errored)"; cat build/s2-vec_bare_word_traps-n.err; exit 1; }; \
+	./build/s2-vec_bare_word_traps-n > build/s2-vec_bare_word_traps-n.out 2>&1 \
+	  || { echo "perceus-1135-vec-raw-native FAIL (bare-word traps: a trap escaped its fiber)"; cat build/s2-vec_bare_word_traps-n.out; exit 1; }; \
+	diff -q ../examples/stdlib/vec_bare_word_traps.out.expected build/s2-vec_bare_word_traps-n.out > /dev/null \
+	  || { echo "perceus-1135-vec-raw-native FAIL (bare-word traps: output diff)"; diff ../examples/stdlib/vec_bare_word_traps.out.expected build/s2-vec_bare_word_traps-n.out; exit 1; }; \
 	echo "perceus-1135-vec-raw-native OK (counters + outputs match the C-direct gate)"
+
+# A read of a vector that feeds its own write is a lend that ends before the
+# write runs. Each entry is `fixture:in-place:copies`: the output must match
+# the golden and the KAI_TRACE_RC counters must be exactly those. The first
+# two write a uniquely owned vector in place whether the read sits in the
+# write's arguments or in an earlier `let`, on a param or on a local. The
+# third reads after the write, so each of its writes must copy.
+PERCEUS_VEC_LEND_FIXTURES := vec_lend_then_write:600:0 vec_lend_then_write_local:4:0 vec_read_after_write:0:4
+
+test-perceus-vec-lend-write: $(TARGET) build
+	@set -e; \
+	for fx in $(PERCEUS_VEC_LEND_FIXTURES); do \
+	  name=$${fx%%:*}; \
+	  want="vec_inplace=$$(echo $$fx | cut -d: -f2) vec_cow=$$(echo $$fx | cut -d: -f3)"; \
+	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
+	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$src > build/s2-$$name.c \
+	    || { echo "perceus-vec-lend-write FAIL ($$name kaic2 errored)"; exit 1; }; \
+	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
+	  diff -q $$exp build/s2-$$name.out > /dev/null \
+	    || { echo "perceus-vec-lend-write FAIL ($$name output diff)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	  got="$$(grep -o 'vec_inplace=[0-9]* vec_cow=[0-9]*' build/s2-$$name.rc || true)"; \
+	  [ "$$got" = "$$want" ] \
+	    || { echo "perceus-vec-lend-write FAIL ($$name: expected $$want, got $$got)"; exit 1; }; \
+	done; \
+	echo "perceus-vec-lend-write OK (lent-then-written vectors stay in place; a read after the write copies)"
+
+.PHONY: test-perceus-vec-lend-write-native
+test-perceus-vec-lend-write-native: $(TARGET) bin-kai build
+	@set -e; \
+	for fx in $(PERCEUS_VEC_LEND_FIXTURES); do \
+	  name=$${fx%%:*}; \
+	  want="vec_inplace=$$(echo $$fx | cut -d: -f2) vec_cow=$$(echo $$fx | cut -d: -f3)"; \
+	  src=../examples/perceus/$$name.kai; exp=../examples/perceus/$$name.out.expected; \
+	  ../bin/kai build $$src -o build/s2-$$name-n 2> build/s2-$$name-n.err \
+	    || { echo "perceus-vec-lend-write-native FAIL ($$name native build errored)"; cat build/s2-$$name-n.err; exit 1; }; \
+	  KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name-n > build/s2-$$name-n.out 2> build/s2-$$name-n.rc; \
+	  diff -q $$exp build/s2-$$name-n.out > /dev/null \
+	    || { echo "perceus-vec-lend-write-native FAIL ($$name output diff)"; diff $$exp build/s2-$$name-n.out; exit 1; }; \
+	  got="$$(grep -o 'vec_inplace=[0-9]* vec_cow=[0-9]*' build/s2-$$name-n.rc || true)"; \
+	  [ "$$got" = "$$want" ] \
+	    || { echo "perceus-vec-lend-write-native FAIL ($$name: expected $$want, got $$got)"; exit 1; }; \
+	done; \
+	echo "perceus-vec-lend-write-native OK (counters + outputs match the C-direct gate)"
 
 # Issue #1151 — recursive vec_push growth from empty. A loop threading
 # the vec through the stdlib module call appends on the SHARED (CoW)
@@ -11253,7 +11315,7 @@ test-native-static-slot-read: $(TARGET) bin-kai build
 # carries `memory(none)` in the native IR (and NEVER `willreturn`); an
 # allocating fn carries only `nounwind`. Binary acceptance: `opt -O2`
 # CSEs two identical pure calls to one. Native-gated: a C-only kaic2
-# cannot dump the native IR. Requires `opt` (LLVM 18).
+# cannot dump the native IR. Requires the `opt` of the linked libLLVM.
 # KAI_NATIVE_MODULAR=0: the purity attributes are a property of the emitter,
 # identical on both native paths, but this gate INSPECTS the dumped IR for the
 # user fns `@heavy`/`@noisy` — which the native-modular default splits across
@@ -11276,7 +11338,7 @@ test-native-purity-attrs: $(TARGET) bin-kai build
 	  || { echo "native-purity FAIL (noisy $$ngrp should be nounwind only)"; grep "^attributes" build/s2-purity.ll; exit 1; }; \
 	if grep -q 'willreturn' build/s2-purity.ll; then echo "native-purity FAIL (willreturn stamped)"; exit 1; fi; \
 	printf 'declare i64 @h(i64) #0\ndefine i64 @t(i64 %%a) {\n  %%x = call i64 @h(i64 %%a)\n  %%y = call i64 @h(i64 %%a)\n  %%r = add i64 %%x, %%y\n  ret i64 %%r\n}\nattributes #0 = { nounwind memory(none) }\n' > build/s2-purity-cse.ll; \
-	ncalls=$$(opt -O2 -S build/s2-purity-cse.ll 2>/dev/null | grep -c 'call i64 @h'); \
+	ncalls=$$("$$($(LLVM_CONFIG) --bindir)/opt" -O2 -S build/s2-purity-cse.ll 2>/dev/null | grep -c 'call i64 @h'); \
 	[ "$$ncalls" = "1" ] \
 	  && echo "native-purity OK (heavy=memory(none), noisy=nounwind, no willreturn, duplicate pure call CSE'd to $$ncalls)" \
 	  || { echo "native-purity FAIL (pure call NOT CSE'd: $$ncalls calls)"; exit 1; }
@@ -11967,9 +12029,9 @@ endif
 
 # A trap or a failed assertion leaves through the unwinder, and each native
 # landing pad on the way releases what its frame owned: the failed asserts
-# leak nothing, and both trap fixtures stay correct at every thread count.
+# leak nothing, and the trap fixtures stay correct at every thread count.
 # Their per-run ledger is pinned by rc-leak-gate.
-TRAP_PAD_FIXTURES := trap_releases_pending trap_through_runtime_callback
+TRAP_PAD_FIXTURES := trap_releases_pending trap_through_runtime_callback trap_vec_fused_access trap_vec_read_index_in_flight trap_vec_write_operand_in_flight
 ifeq ($(KAI_LLVM),1)
 test-trap-pads-native: $(TARGET) bin-kai build
 	@set -e; \
@@ -11995,14 +12057,14 @@ test-trap-pads-native:
 endif
 
 # Native ASAN sibling: a pad and the trap's unwind never release the same
-# reference. On Linux LeakSanitizer also runs on the fixture whose frames are
+# reference. On Linux LeakSanitizer also runs on the fixtures whose frames are
 # all kaikai; the callback fixture leaks what its C frames held, by design.
 TRAP_PAD_LSAN := $(if $(filter Linux,$(shell uname -s)),1,0)
 test-trap-pads-asan-native: $(TARGET) bin-kai build
 	@mv ../stage0/runtime_llvm.bc ../stage0/runtime_llvm.bc.hidtp 2>/dev/null || true; \
 	mv ../stage0/runtime_inline.bc ../stage0/runtime_inline.bc.hidtp 2>/dev/null || true; \
 	st=0; \
-	for spec in trap_releases_pending:$(TRAP_PAD_LSAN) trap_through_runtime_callback:0; do \
+	for spec in trap_releases_pending:$(TRAP_PAD_LSAN) trap_through_runtime_callback:0 trap_vec_fused_access:$(TRAP_PAD_LSAN) trap_vec_read_index_in_flight:$(TRAP_PAD_LSAN) trap_vec_write_operand_in_flight:$(TRAP_PAD_LSAN); do \
 	  name=$${spec%%:*}; leaks=$${spec##*:}; \
 	  CFLAGS="-std=c99 -O1 -g -fsanitize=address -fno-omit-frame-pointer -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable" \
 	    KAI_BACKEND=native ../bin/kai build ../examples/perceus/$$name.kai -o build/tp-$$name-asan-n 2> build/tp-$$name-asan-n.err \
