@@ -1,0 +1,62 @@
+# Every push to main that touches the compiler saves a fresh set of
+# per-commit caches (the c-modular self-host objects alone are ~1.6 GB),
+# and nothing deletes the set it superseded. A restore only ever wants the
+# newest one (the restore-keys prefix picks it), so the older sets are dead
+# weight that pushes the repo past its 10 GB ceiling, and GitHub's LRU then
+# evicts the vendored libLLVM the release boots from, which only a release
+# or the weekly warmer reads.
+
+name: main-cache-prune
+
+on:
+  workflow_run:
+    workflows: [tier1, tier1-native]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  actions: write   # deleting a cache needs write; the default is read
+
+concurrency:
+  group: main-cache-prune
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    name: Keep only the newest per-commit cache of each family on main
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Delete superseded main caches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Family = key with its trailing per-commit hash removed; the
+          # longer prefixes come first so kaic2-c-obj is not read as kaic2-c.
+          family() {
+            case "$1" in
+              cmodular-selfhost-*) echo "${1%-*}" ;;
+              kaic2-c-obj-*|kaic2-native-obj-*) echo "${1%-*}" ;;
+              kaic2-c-*|kaic2-native-*) echo "${1%-*}" ;;
+              *) echo "" ;;
+            esac
+          }
+          freed=0; n=0
+          declare -A seen=()
+          # Newest first, so the first key of a family is the one kept.
+          while read -r id bytes key; do
+            [ -n "$id" ] || continue
+            fam=$(family "$key")
+            [ -n "$fam" ] || continue
+            if [ -z "${seen[$fam]:-}" ]; then seen[$fam]=1; continue; fi
+            if gh api --method DELETE "repos/$REPO/actions/caches/$id" >/dev/null 2>&1; then
+              freed=$((freed + bytes)); n=$((n + 1))
+              echo "deleted $key ($((bytes / 1048576)) MB)"
+            else
+              echo "::warning::could not delete cache $id ($key)"
+            fi
+          done < <(gh api "repos/$REPO/actions/caches?per_page=100&ref=refs/heads/main&sort=created_at&direction=desc" \
+                     --jq '.actions_caches[] | "\(.id) \(.size_in_bytes) \(.key)"')
+          echo "$n cache(s) deleted, $((freed / 1048576)) MB freed" >> "$GITHUB_STEP_SUMMARY"
