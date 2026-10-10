@@ -1,6 +1,9 @@
 #[doc("Effect-row lints: effect_over_declared and effect_ffi_without_extern. A public signature whose declared effect row carries a label the body never demands over-declares it; one motor (declared minus used), two lint ids — Ffi gets its own.")]
 
 import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
 import compiler.expr_positions
 import compiler.lint_idiom
 import compiler.util
@@ -9,16 +12,16 @@ import compiler.core_effects
 # `LintFinding` is defined in `compiler.lint_idiom` and shared by every
 # lint module.
 
-#[doc("Effect-row findings over a typed program's root-file public functions, given the root module name.")]
-pub fn effect_findings(decls: [Decl], root_mod: String) : [LintFinding] =
-  scan_overdeclared(decls, root_mod, [])
+#[doc("Effect-row findings over a typed program's root-file public functions, given the table that names them and the root module name.")]
+pub fn effect_findings(decls: [Decl], tab: SymTab, root_mod: String) : [LintFinding] =
+  scan_overdeclared(decls, tab, root_mod, [])
 
 # ---- the over-declared scan ------------------------------------------
 
-fn scan_overdeclared(decls: [Decl], root_mod: String, acc: [LintFinding]) : [LintFinding] {
+fn scan_overdeclared(decls: [Decl], tab: SymTab, root_mod: String, acc: [LintFinding]) : [LintFinding] {
   match decls {
     []           -> list_reverse(acc)
-    [d, ...rest] -> scan_overdeclared(rest, root_mod, fx_decl(d, root_mod, acc))
+    [d, ...rest] -> scan_overdeclared(rest, tab, root_mod, fx_decl(d, tab, root_mod, acc))
   }
 }
 
@@ -28,11 +31,11 @@ fn scan_overdeclared(decls: [Decl], root_mod: String, acc: [LintFinding]) : [Lin
 # an effect reached through a helper shows on that helper-call's type and
 # counts as used. An open row (a tail variable) or a parametric label is
 # left alone — the typer may satisfy it in ways this scan cannot see.
-fn fx_decl(d: Decl, root_mod: String, acc: [LintFinding]) : [LintFinding] {
+fn fx_decl(d: Decl, tab: SymTab, root_mod: String, acc: [LintFinding]) : [LintFinding] {
   match d {
-    DFn(is_pub, name, _, _, _, row, body, line, col, mo, _) ->
+    DFn(is_pub, fid, _, _, _, row, body, line, col, mo) ->
       if is_pub and fx_is_root_origin(mo, root_mod) {
-        fx_labels(declared_closed_labels(row), name, line, col, effects_in_expr(body, []), acc)
+        fx_labels(declared_closed_labels(row), FxFn(tab, fnid_sym(fid), line, col), effects_in_expr(body, []), acc)
       } else { acc }
     _ -> acc
   }
@@ -50,24 +53,35 @@ fn fx_is_root_origin(mo: Option[String], root_mod: String) : Bool {
 # Each declared label absent from the used-set is over-declared. `Ffi`
 # carries its own lint id and message; every other effect is
 # effect_over_declared.
-fn fx_labels(labels: [RowLabel], fn_name: String, line: Int, col: Int, used: [SymId], acc: [LintFinding]) : [LintFinding] {
+fn fx_labels(labels: [RowLabel], f: FxFn, used: [SymId], acc: [LintFinding]) : [LintFinding] {
   match labels {
     []           -> acc
     [l, ...rest] -> {
-      let a1 = if mem_sym(rl_sym(l), used) { acc } else { [fx_finding(l, fn_name, line, col), ...acc] }
-      fx_labels(rest, fn_name, line, col, used, a1)
+      let a1 = if mem_sym(rl_sym(l), used) { acc } else { [fx_finding(l, f), ...acc] }
+      fx_labels(rest, f, used, a1)
     }
   }
 }
 
-fn fx_finding(l: RowLabel, fn_name: String, line: Int, col: Int) : LintFinding {
-  if effect_is(rl_sym(l), CeFfi) {
-    LF("effect_ffi_without_extern", line, col,
-       concat_all(["pub fn `", fn_name, "` declares `/ Ffi` but its body calls no extern function"]))
-  } else {
-    LF("effect_over_declared", line, col,
-       concat_all(["pub fn `", fn_name, "` declares effect `", rl_name(l), "` its body never uses"]))
+# The function a finding is about: the table that names it, its id, its position.
+type FxFn = FxFn(SymTab, SymId, Int, Int)
+
+fn fx_finding(l: RowLabel, f: FxFn) : LintFinding = match f {
+  FxFn(tab, s, line, col) -> {
+    let fn_name = written_text(decl_name(tab, s))
+    if effect_is(rl_sym(l), CeFfi) {
+      LF("effect_ffi_without_extern", line, col,
+         concat_all(["pub fn `", fn_name, "` declares `/ Ffi` but its body calls no extern function"]))
+    } else {
+      LF("effect_over_declared", line, col,
+         concat_all(["pub fn `", fn_name, "` declares effect `", written_text(fx_label_text(tab, l)), "` its body never uses"]))
+    }
   }
+}
+
+fn fx_label_text(tab: SymTab, l: RowLabel) : Written = match l {
+  RL(DrSym(s), _)        -> decl_name(tab, s)
+  RL(DrWritten(_, n), _) -> n
 }
 
 # ---- declared row ----------------------------------------------------
@@ -86,7 +100,7 @@ fn declared_closed_labels(row: RowExpr) : [RowLabel] {
 
 # ---- effects demanded by a body --------------------------------------
 #
-# An effect is demanded when the body references one of its ops, calls a
+# An effect is demanded when the body performs one of its ops, calls a
 # function whose resolved type carries it in its row, or installs a
 # handler for it. Mirrors `lint.kai`'s purity sources, but collects the
 # effect declarations rather than a yes/no.
@@ -98,13 +112,11 @@ fn effects_in_expr(e: Expr, acc: [SymId]) : [SymId] {
 
 # An `EExternBody` is the body of an `extern "C" fn`: it IS the foreign
 # call, so it demands `Ffi` even though there is no `ECall` node.
-# A flattened `Eff.op` reference carries its effect's id; any other
-# reference carries an id no row label has.
 fn effects_here(e: Expr, acc: [SymId]) : [SymId] {
   match e.kind {
-    ESym(s, _, _)    -> [s, ...acc]
+    EOp(r)           -> [r.eff, ...acc]
     ECall(callee, _) -> add_callee_effects(callee, acc)
-    EHandle(_, _, hsym, _, _, _, _, _) -> [hsym, ...acc]
+    EHandle(_, head, _, _, _, _, _) -> [ref_sym(head), ...acc]
     EExternBody(AbiC, _) -> [core_effect_id(CeFfi), ...acc]
     _                -> acc
   }

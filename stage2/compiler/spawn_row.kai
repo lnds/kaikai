@@ -18,63 +18,66 @@
 # surface reaches this one check.
 
 import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
 import compiler.diag
 import compiler.diag_file
 import compiler.spawn_capture
-import compiler.util.{string_index_of_char}
 import compiler.core_effects
 
-#[doc("Reject a spawned thunk the child fiber cannot honour: an effect it cannot resolve, or a captured value it would mutate as a copy. Each diagnostic names the file declaring the decl it fires on.")]
-pub fn check_spawn_rows(df: DiagFiles, recs: [RecInfo], mod_decls: [Decl],
+#[doc("Reject a spawned thunk the child fiber cannot honour: an effect it cannot resolve, or a captured value it would mutate as a copy. Each diagnostic names the file declaring the decl it fires on; `tab` names what it reports.")]
+pub fn check_spawn_rows(df: DiagFiles, tab: SymTab, recs: [RecInfo], mod_decls: [Decl],
                          all_decls: [Decl]) : [Diagnostic] / Console + File =
-  check_spawn_rows_loop(df, recs, all_decls, mod_decls, [])
+  check_spawn_rows_loop(df, tab, recs, all_decls, mod_decls, [])
 
 
-fn check_spawn_rows_loop(df: DiagFiles, recs: [RecInfo], all_decls: [Decl],
+fn check_spawn_rows_loop(df: DiagFiles, tab: SymTab, recs: [RecInfo], all_decls: [Decl],
                           ds: [Decl],
                           acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DFn(_, _, _, _, _, _, body, _, _, _, _) -> {
-        let acc1 = walk_spawn_rows_expr(decl_diag_file(d, df), recs, all_decls, body, acc)
-        check_spawn_rows_loop(df, recs, all_decls, rest, acc1)
+      DFn(_, _, _, _, _, _, body, _, _, _) -> {
+        let site = SpawnSite { file: decl_diag_file(d, df), tab: tab, owner: d }
+        let acc1 = walk_spawn_rows_expr(site, recs, all_decls, body, acc)
+        check_spawn_rows_loop(df, tab, recs, all_decls, rest, acc1)
       }
-      _ -> check_spawn_rows_loop(df, recs, all_decls, rest, acc)
+      _ -> check_spawn_rows_loop(df, tab, recs, all_decls, rest, acc)
     }
   }
 }
 
 
-fn walk_spawn_rows_expr(file: String, recs: [RecInfo], decls: [Decl], e: Expr,
+fn walk_spawn_rows_expr(site: SpawnSite, recs: [RecInfo], decls: [Decl], e: Expr,
                          acc: [Diagnostic]) : [Diagnostic] / Console + File {
   let here = match e.kind {
-    ECall(callee, args_) -> if callee_is_spawn(callee) { check_spawned_thunk(file, recs, decls, args_) } else { [] }
+    ECall(callee, args_) -> if callee_is_spawn(callee) { check_spawned_thunk(site, recs, decls, args_) } else { [] }
     _ -> []
   }
-  walk_spawn_rows_list(file, recs, decls, spawn_expr_children(e), list_append(acc, here))
+  walk_spawn_rows_list(site, recs, decls, spawn_expr_children(e), list_append(acc, here))
 }
 
 
 # The two halves of the boundary: the row the child cannot resolve, and
 # the values it would mutate as a copy.
-fn check_spawned_thunk(file: String, recs: [RecInfo], decls: [Decl],
+fn check_spawned_thunk(site: SpawnSite, recs: [RecInfo], decls: [Decl],
                         args_: [Expr]) : [Diagnostic] / Console + File {
-  let row_errs = check_spawned_thunk_row(file, decls, args_)
+  let row_errs = check_spawned_thunk_row(site, decls, args_)
   match spawn_thunk_arg(args_) {
     None      -> row_errs
-    Some(thk) -> list_append(row_errs, check_thunk_captures(file, recs, thk))
+    Some(thk) -> list_append(row_errs, check_thunk_captures(site, recs, thk))
   }
 }
 
 
-fn walk_spawn_rows_list(file: String, recs: [RecInfo], decls: [Decl], es: [Expr],
+fn walk_spawn_rows_list(site: SpawnSite, recs: [RecInfo], decls: [Decl], es: [Expr],
                          acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match es {
     []           -> acc
     [h, ...rest] -> {
-      let a1 = walk_spawn_rows_expr(file, recs, decls, h, acc)
-      walk_spawn_rows_list(file, recs, decls, rest, a1)
+      let a1 = walk_spawn_rows_expr(site, recs, decls, h, acc)
+      walk_spawn_rows_list(site, recs, decls, rest, a1)
     }
   }
 }
@@ -100,12 +103,12 @@ fn spawn_expr_children(e: Expr) : [Expr] {
     EIntrinsic(_, args_) -> args_
     ESurface(sf)         -> surface_children(sf)
     EList(els)           -> list_elem_exprs(els)
-    ERecordLit(_, _, fs)    -> field_init_exprs(fs)
+    ERecordLit(_, fs)    -> field_init_exprs(fs)
     EIf(c, t, eo)        -> [c, t, ...opt_expr(eo)]
     ERange(a, b, os)     -> [a, b, ...opt_expr(os)]
     EMatch(scr, arms)    -> [scr, ...arm_exprs(arms)]
     EBlock(stmts, tail)  -> cat_exprs(stmt_exprs(stmts), opt_expr(tail))
-    EHandle(body, _, _, _, io, _, cs, _) ->
+    EHandle(body, _, _, io, _, cs, _) ->
       [body, ...cat_exprs(opt_expr(io), clause_exprs(cs))]
     _ -> []
   }
@@ -181,14 +184,14 @@ fn spawn_thunk_arg(args_: [Expr]) : Option[Expr] {
 }
 
 
-fn check_spawned_thunk_row(file: String, decls: [Decl],                             args_: [Expr]) : [Diagnostic] / Console + File {
+fn check_spawned_thunk_row(site: SpawnSite, decls: [Decl],                             args_: [Expr]) : [Diagnostic] / Console + File {
   match spawn_thunk_arg(args_) {
     None      -> []
     Some(thk) -> match thk.ty {
       None     -> []
       Some(t)  -> match t {
         TyFnT(_, _, row) ->
-          report_spawn_row_labels(file, decls, row.labels,
+          report_spawn_row_labels(site, decls, row.labels,
                                    thk.line, thk.col, [])
         _ -> []
       }
@@ -204,7 +207,7 @@ fn check_spawned_thunk_row(file: String, decls: [Decl],                         
 # a `with .. as` cell: its label names one handler, which the thunk
 # captured, not an effect the child has to find.
 fn effect_crosses_spawn(l: Label, decls: [Decl]) : Bool {
-  if string_index_of_char(l.eff, '@') >= 0 { true } else { match find_effect_decl(l.sym, decls) {
+  if local_raw(l.cell) != 0 { true } else { match find_effect_decl(l.sym, decls) {
     None      -> true
     Some(blk) ->
       if spawn_effect_is_fiber_local(l.sym) { true }
@@ -217,7 +220,7 @@ fn find_effect_decl(s: SymId, decls: [Decl]) : Option[Option[DefaultBlock]] {
   match decls {
     []           -> None
     [d, ...rest] -> match d {
-      DEffect(_, _, _, _, defblk, _, _, _, esym) ->
+      DEffect(_, esym, _, _, defblk, _, _, _) ->
         if sym_raw(esym) >= 0 and sym_raw(esym) == sym_raw(s) { Some(defblk) } else { find_effect_decl(s, rest) }
       _ -> find_effect_decl(s, rest)
     }
@@ -272,16 +275,16 @@ fn spawn_effect_is_fiber_local(s: SymId) : Bool =
 
 
 
-fn report_spawn_row_labels(file: String, decls: [Decl],                             labels: [Label], line: Int, col: Int,
+fn report_spawn_row_labels(site: SpawnSite, decls: [Decl],                             labels: [Label], line: Int, col: Int,
                             acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match labels {
     []           -> acc
     [l, ...rest] ->
       if effect_crosses_spawn(l, decls) {
-        report_spawn_row_labels(file, decls, rest, line, col, acc)
+        report_spawn_row_labels(site, decls, rest, line, col, acc)
       } else {
-        let d = report_spawn_escape(file, l.eff, line, col)
-        report_spawn_row_labels(file, decls, rest, line, col, list_append(acc, [d]))
+        let d = report_spawn_escape(site.file, written_text(decl_name(site.tab, l.sym)), line, col)
+        report_spawn_row_labels(site, decls, rest, line, col, list_append(acc, [d]))
       }
   }
 }

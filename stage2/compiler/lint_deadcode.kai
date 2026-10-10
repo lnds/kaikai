@@ -1,6 +1,9 @@
 #[doc("Dead-code lint: dead_code_unused_priv. A private root-file function never referenced anywhere in the file is dead code the compiler does not warn about; pub functions and each file's entry point are always considered reachable.")]
 
 import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
 import compiler.entry
 import compiler.expr_positions
 import compiler.diag_file
@@ -11,26 +14,26 @@ import compiler.call_site_target
 # `LintFinding` is defined in `compiler.lint_idiom` and shared by every
 # lint module.
 
-#[doc("dead_code_unused_priv findings over a typed program's root-file decls; one finding per unreferenced private function. `declared` lists the top-level fn names the source actually declares — a lowered decl absent from it was synthesised and is exempt. `root` is the root module.")]
-pub fn deadcode_findings(decls: [Decl], declared: [String], root: String) : [LintFinding] {
-  let used = collect_used(decls, DcUsed([], []))
-  scan_unused(decls, used, declared, root, [])
+#[doc("dead_code_unused_priv findings over a typed program's root-file decls; one finding per unreferenced private function. `tab` names a function in its finding. `declared` lists the top-level fns the source actually declares — a lowered decl absent from it was synthesised and is exempt. `root` is the root module.")]
+pub fn deadcode_findings(decls: [Decl], tab: SymTab, declared: [SymId], root: String) : [LintFinding] {
+  let cx = DcCx { tab: tab, used: collect_used(decls, []), declared: declared, root: root }
+  scan_unused(decls, cx, [])
 }
 
-#[doc("dead_code_unused_priv findings over the decls a unit owns, each paired with the file declaring it. Reachability is judged against `all` — every decl in the unit — so a private fn referenced from anywhere is alive. `root` is the root module.")]
-pub fn deadcode_file_findings(owned: [Decl], all: [Decl], declared: [String],
+#[doc("dead_code_unused_priv findings over the decls a unit owns, each paired with the file declaring it. Reachability is judged against `all` — every decl in the unit — so a private fn referenced from anywhere is alive. `tab` names a function in its finding; `root` is the root module.")]
+pub fn deadcode_file_findings(owned: [Decl], all: [Decl], tab: SymTab, declared: [SymId],
                                df: DiagFiles, root: String) : [FileFinding] {
-  let used = collect_used(all, DcUsed([], []))
-  dc_file_loop(owned, used, declared, df, root, [])
+  let cx = DcCx { tab: tab, used: collect_used(all, []), declared: declared, root: root }
+  dc_file_loop(owned, cx, df, [])
 }
 
-fn dc_file_loop(ds: [Decl], used: DcUsed, declared: [String],
-                 df: DiagFiles, root: String, acc: [FileFinding]) : [FileFinding] = match ds {
+type DcCx = { tab: SymTab, used: [SymId], declared: [SymId], root: String }
+
+fn dc_file_loop(ds: [Decl], cx: DcCx, df: DiagFiles, acc: [FileFinding]) : [FileFinding] = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> {
-    let here = dc_decl(d, used, declared, root, [])
-    dc_file_loop(rest, used, declared, df, root,
-                 dc_tag(here, decl_diag_file(d, df), acc))
+    let here = dc_decl(d, cx, [])
+    dc_file_loop(rest, cx, df, dc_tag(here, decl_diag_file(d, df), acc))
   }
 }
 
@@ -41,25 +44,25 @@ fn dc_tag(xs: [LintFinding], file: String, acc: [FileFinding]) : [FileFinding] =
 
 # ---- the declared set ------------------------------------------------
 #
-# Names of fns the source declares at top level, read off the AST as the
+# The fns the source declares at top level, read off the AST as the
 # parser produced it (before protocol lowering synthesises its own).
 # Attribute wrappers are transparent; an `impl`/`derive` body is not
 # descended into, because its methods are not top-level declarations.
 
-#[doc("Top-level fn names a source AST declares, seeing through attribute wrappers. Methods inside `impl` / `derive` are excluded: they are lowered into top-level DFns but the user never declared them as such.")]
-pub fn deadcode_declared_fns(decls: [Decl]) : [String] =
+#[doc("The top-level fns a source AST declares, seeing through attribute wrappers. Methods inside `impl` / `derive` are excluded: they are lowered into top-level DFns but the user never declared them as such.")]
+pub fn deadcode_declared_fns(decls: [Decl]) : [SymId] =
   declared_loop(decls, [])
 
-fn declared_loop(decls: [Decl], acc: [String]) : [String] {
+fn declared_loop(decls: [Decl], acc: [SymId]) : [SymId] {
   match decls {
     []           -> acc
     [d, ...rest] -> declared_loop(rest, declared_in_decl(d, acc))
   }
 }
 
-fn declared_in_decl(d: Decl, acc: [String]) : [String] {
+fn declared_in_decl(d: Decl, acc: [SymId]) : [SymId] {
   match d {
-    DFn(_, name, _, _, _, _, _, _, _, _, _) -> [name, ...acc]
+    DFn(_, fid, _, _, _, _, _, _, _, _) -> [fnid_sym(fid), ...acc]
     DUnstable(inner, _, _)               -> declared_in_decl(inner, acc)
     DConstructor(inner, _, _)            -> declared_in_decl(inner, acc)
     DDoc(_, _, inner, _, _)              -> declared_in_decl(inner, acc)
@@ -70,51 +73,40 @@ fn declared_in_decl(d: Decl, acc: [String]) : [String] {
 # ---- the reference set -----------------------------------------------
 #
 # What any fn, test, bench or check body references: the declaration a
-# resolved reference names, by id, and the spelling of a reference nothing
-# resolved. A private function neither set holds is referenced nowhere and
-# is dead; a local binder spelled like it is no reference to it.
+# resolved reference names, by id. A private function the set does not
+# hold is referenced nowhere and is dead; a local binder spelled like it
+# is no reference to it.
 
-type DcUsed = DcUsed([SymId], [String])
-
-fn collect_used(decls: [Decl], acc: DcUsed) : DcUsed {
+fn collect_used(decls: [Decl], acc: [SymId]) : [SymId] {
   match decls {
     []           -> acc
     [d, ...rest] -> collect_used(rest, used_in_decl(d, acc))
   }
 }
 
-fn used_in_decl(d: Decl, acc: DcUsed) : DcUsed {
+fn used_in_decl(d: Decl, acc: [SymId]) : [SymId] {
   match d {
-    DFn(_, _, _, _, _, _, body, _, _, _, _) -> names_in_expr(body, acc)
-    DTest(_, body, _, _, _)                 -> names_in_expr(body, acc)
-    DBench(_, body, _, _, _)                -> names_in_expr(body, acc)
-    DCheck(_, _, body, _, _, _)             -> names_in_expr(body, acc)
-    _                                       -> acc
+    DFn(_, _, _, _, _, _, body, _, _, _) -> names_in_expr(body, acc)
+    DTest(_, body, _, _, _)              -> names_in_expr(body, acc)
+    DBench(_, body, _, _, _)             -> names_in_expr(body, acc)
+    DCheck(_, _, body, _, _, _)          -> names_in_expr(body, acc)
+    _                                    -> acc
   }
 }
 
-fn names_in_expr(e: Expr, acc: DcUsed) : DcUsed =
+fn names_in_expr(e: Expr, acc: [SymId]) : [SymId] =
   names_in_positions(xp_positions(e), name_here(e, acc))
 
-fn name_here(e: Expr, acc: DcUsed) : DcUsed = match acc {
-  DcUsed(ids, names) -> match e.kind {
-    EName(n) -> DcUsed(ids, [n, ...names])
-    _       -> match callee_id(e) {
-      Some(s) -> DcUsed([s, ...ids], names)
-      None    -> acc
-    }
-  }
+fn name_here(e: Expr, acc: [SymId]) : [SymId] = match callee_id(e) {
+  Some(s) -> [s, ...acc]
+  None    -> acc
 }
 
-fn names_in_positions(xs: [XPos], acc: DcUsed) : DcUsed {
+fn names_in_positions(xs: [XPos], acc: [SymId]) : [SymId] {
   match xs {
     []                  -> acc
     [XP(_, x), ...rest] -> names_in_positions(rest, names_in_expr(x, acc))
   }
-}
-
-fn dc_is_used(s: SymId, name: String, used: DcUsed) : Bool = match used {
-  DcUsed(ids, names) -> dc_has_id(ids, s) or mem(name, names)
 }
 
 fn dc_has_id(ids: [SymId], s: SymId) : Bool = match ids {
@@ -124,23 +116,21 @@ fn dc_has_id(ids: [SymId], s: SymId) : Bool = match ids {
 
 # ---- the unused scan -------------------------------------------------
 
-fn scan_unused(decls: [Decl], used: DcUsed, declared: [String], root: String,
-                acc: [LintFinding]) : [LintFinding] {
+fn scan_unused(decls: [Decl], cx: DcCx, acc: [LintFinding]) : [LintFinding] {
   match decls {
     []           -> list_reverse(acc)
-    [d, ...rest] -> scan_unused(rest, used, declared, root, dc_decl(d, used, declared, root, acc))
+    [d, ...rest] -> scan_unused(rest, cx, dc_decl(d, cx, acc))
   }
 }
 
-# A private function (not pub, not its file's entry point) whose name
-# never appears in the reference set is dead code. pub functions are
-# reachable from other modules.
-fn dc_decl(d: Decl, used: DcUsed, declared: [String], root: String, acc: [LintFinding]) : [LintFinding] {
+# A private function (not pub, not its file's entry point) no reference
+# names is dead code. pub functions are reachable from other modules.
+fn dc_decl(d: Decl, cx: DcCx, acc: [LintFinding]) : [LintFinding] {
   match d {
-    DFn(is_pub, name, _, _, _, _, _, line, col, mo, fid) ->
-      if dc_is_dead(is_pub, is_file_entry(root, mo, fid), name, fnid_sym(fid), used, declared) {
+    DFn(is_pub, fid, _, _, _, _, _, line, col, mo) ->
+      if dc_is_dead(is_pub, is_file_entry(cx.root, mo, fid), fnid_sym(fid), cx) {
         [LF("dead_code_unused_priv", line, col,
-            concat_all(["private function `", name, "` is never used; remove it or export it"])), ...acc]
+            concat_all(["private function `", written_text(decl_name(cx.tab, fnid_sym(fid))), "` is never used; remove it or export it"])), ...acc]
       } else { acc }
     _ -> acc
   }
@@ -148,16 +138,8 @@ fn dc_decl(d: Decl, used: DcUsed, declared: [String], root: String, acc: [LintFi
 
 # The lint runs on the lowered AST, where an `impl`/`derive` method has
 # already become a top-level `__pimpl_*` DFn indistinguishable from a
-# private fn. Requiring the name in `declared` — the fn names the source
+# private fn. Requiring the fn in `declared` — the fns the source
 # text itself declares at top level — is what keeps the two apart: the
 # remedies the message proposes only exist for a fn the user wrote.
-fn dc_is_dead(is_pub: Bool, entry: Bool, name: String, s: SymId,
-               used: DcUsed, declared: [String]) : Bool =
-  not is_pub and not entry and mem(name, declared) and not dc_is_used(s, name, used)
-
-fn mem(name: String, xs: [String]) : Bool {
-  match xs {
-    []           -> false
-    [x, ...rest] -> if x == name { true } else { mem(name, rest) }
-  }
-}
+fn dc_is_dead(is_pub: Bool, entry: Bool, s: SymId, cx: DcCx) : Bool =
+  not is_pub and not entry and dc_has_id(cx.declared, s) and not dc_has_id(cx.used, s)
