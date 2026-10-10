@@ -2387,13 +2387,16 @@ pub type TyEnv = { entries: [TyEntry], fresh: Int, unions: UnionTable,
                # what exhaustiveness and constructor disambiguation query.
                vindex: VariantIndex[TyEntry],
                # the local binders among `entries`, by binder id.
-               locals: NameIndex[TyEntry] }
+               locals: NameIndex[TyEntry],
+               # the program's nominal types whose values may reach a
+               # mutable cell. Empty until `typecheck_module` attaches it.
+               carriers: [SymId] }
 
 #[doc("infer: a nominal head and the modules that declare it.")]
 pub type HeadOwnerEntry = HOE(SymId, [String])
 
 #[doc("infer: the empty typing environment.")]
-pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: ut_empty(), constructors: [], head_owners: [], row_kind: [], ty_homes: tsh_none(), tab: st_empty(), index: idx_empty(), vindex: vix_empty(), locals: idx_empty() }
+pub fn ty_env_empty() : TyEnv = TyEnv { entries: [], fresh: 0, unions: ut_empty(), constructors: [], head_owners: [], row_kind: [], ty_homes: tsh_none(), tab: st_empty(), index: idx_empty(), vindex: vix_empty(), locals: idx_empty(), carriers: [] }
 
 # What a bare type name in the program being typed denotes.
 fn env_home_view(env: TyEnv, mo: Option[String]) : TyHomeView = tsh_view(env.ty_homes, mo)
@@ -10534,34 +10537,11 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
                         line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
-  # The receiver's type picks among the modules declaring `ident`; a
-  # name none of them answers reads the root file's function, else the
-  # builtin.
-  let candidates = st_visible_candidates(st, ident)
-  let picked = match pick_by_first_arg(st, candidates, obj_ty) {
-    Some(p) -> Some(p)
-    None -> match ufcs_bare_sym(st.env, ident) {
-      None -> None
-      Some(s) -> match env_sym(st.env, s) {
-        None -> None
-        Some(sc) -> {
-          let inst = st_instantiate_report(st, sc)
-          Some(PickResult { st: inst.st, inst_ty: inst.ty,
-                            fresh: inst.fresh, unit_fresh: inst.unit_fresh, sym: s })
-        }
-      }
-    }
-  }
-  match picked {
+  match ufcs_target(st, ident, obj_ty, line, col) {
     None -> ufcs_method_not_found(st, ident, obj_expr, obj_ty, args_, line, col)
-    Some(pick) -> {
-      let inst_st = pick.st
-      let inst_ty = pick.inst_ty
-      let st_inst = if pick.fresh == [] and pick.unit_fresh == [] {
-        inst_st
-      } else {
-        st_push_inst(inst_st, CS(pick.sym, line, col, pick.fresh, pick.unit_fresh, None))
-      }
+    Some(target) -> {
+      let st_inst = target.st
+      let inst_ty = target.inst_ty
       match inst_ty {
         TyFnT(params, _, _) -> match params {
           [] -> ufcs_method_not_found(st_inst, ident, obj_expr, obj_ty, args_, line, col)
@@ -10585,7 +10565,7 @@ fn synth_ufcs_dispatch(st: InferState, ident: String, obj_expr: Expr,
               let st_fresh = st_set_sub(rv.st, fr.subst)
               let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
               let expected = TyFnT(all_arg_tys, rv.ty, expected_row)
-              let synth_callee = mk_sym(pick.sym, line, col)
+              let synth_callee = target.callee
               # propagate capability-only labels through UFCS.
               let st_unif = st_unify_call(st_fresh, synth_callee, inst_ty, all_arg_tys, expected, line, col)
               let st2 = st_propagate_capability_labels(st_unif,
@@ -10615,14 +10595,63 @@ fn env_home_fn(env: TyEnv, home: String, name: String) : Option[SymId] = match s
   }
 }
 
-# What a method name no visible module answers reads: the root file's
-# function, else the builtin.
+# What a method name no visible module answers and no binder in scope
+# spells reads: the root file's function, else the builtin.
 fn ufcs_bare_sym(env: TyEnv, ident: String) : Option[SymId] =
   match env_home_fn(env, tsh_target(env.ty_homes), ident) {
     Some(s) -> Some(s)
     None    -> match env_sym(env, builtin_sym(ident)) {
       Some(_) -> Some(builtin_sym(ident))
       None    -> None
+    }
+  }
+
+# The innermost binder in scope the source wrote as `name`. Binders are
+# bound after every declaration, so they are the prefix of the entries.
+fn env_local_written(es: [TyEntry], name: String) : Option[Binder] = match es {
+  [] -> None
+  [e, ...rest] -> match e.key {
+    KLocal(b) -> if written_text(b.name) == name { Some(b) } else { env_local_written(rest, name) }
+    _         -> None
+  }
+}
+
+# The callee of a UFCS call, instantiated, with the state past it.
+type UfcsTarget = { st: InferState, inst_ty: Ty, callee: Expr }
+
+fn ufcs_sym_target(st: InferState, s: SymId, inst_ty: Ty, fresh: [Int], unit_fresh: [Int],
+                   line: Int, col: Int) : UfcsTarget {
+  let st_inst = if fresh == [] and unit_fresh == [] { st }
+                else { st_push_inst(st, CS(s, line, col, fresh, unit_fresh, None)) }
+  UfcsTarget { st: st_inst, inst_ty: inst_ty, callee: mk_sym(s, line, col) }
+}
+
+# What `obj.ident(…)` calls. The receiver's type picks among the modules
+# declaring `ident`; a name none of them answers reads as the bare name
+# does: the innermost binder spelled so, else the root file's function,
+# else the builtin.
+fn ufcs_target(st: InferState, ident: String, obj_ty: Ty,
+               line: Int, col: Int) : Option[UfcsTarget] / Mutable =
+  match pick_by_first_arg(st, st_visible_candidates(st, ident), obj_ty) {
+    Some(p) -> Some(ufcs_sym_target(p.st, p.sym, p.inst_ty, p.fresh, p.unit_fresh, line, col))
+    None -> match env_local_written(st.env.entries, ident) {
+      Some(b) -> match env_local(st.env, b.id) {
+        None -> None
+        Some(sc) -> {
+          let inst = st_instantiate_report(st, sc)
+          Some(UfcsTarget { st: inst.st, inst_ty: inst.ty, callee: mk_local(b.id, line, col) })
+        }
+      }
+      None -> match ufcs_bare_sym(st.env, ident) {
+        None -> None
+        Some(s) -> match env_sym(st.env, s) {
+          None -> None
+          Some(sc) -> {
+            let inst = st_instantiate_report(st, sc)
+            Some(ufcs_sym_target(inst.st, s, inst.ty, inst.fresh, inst.unit_fresh, line, col))
+          }
+        }
+      }
     }
   }
 
@@ -11120,23 +11149,26 @@ fn field_non_record_or_partial_app(st: InferState, obj_expr: Expr, fnm: String,
                                      line: Int, col: Int) : Inferred / Console + File {
 
 
-  match ufcs_fn_named(st, fnm) {
-    Some(_) -> {
-      let perr = mk_diag(SevError, st.file, line, col,
-        concat_all(["`", fnm, "` is a function in scope, not a field. ",
-                    "UFCS only fires at call sites — write `expr.", fnm, "(args)`, ",
-                    "not a bare `expr.", fnm, "`."]), [])
-      render_diag(perr)
-      mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, field_root(obj_expr, fnm, line, col, TyAny))
-    }
-    None -> mk_inferred(st, TyAny, field_root(obj_expr, fnm, line, col, TyAny))
-  }
+  if ufcs_reaches(st, fnm) {
+    let perr = mk_diag(SevError, st.file, line, col,
+      concat_all(["`", fnm, "` is a function in scope, not a field. ",
+                  "UFCS only fires at call sites — write `expr.", fnm, "(args)`, ",
+                  "not a bare `expr.", fnm, "`."]), [])
+    render_diag(perr)
+    mk_inferred(st_bump_err(st_push_diag(st, perr)), TyAny, field_root(obj_expr, fnm, line, col, TyAny))
+  } else { mk_inferred(st, TyAny, field_root(obj_expr, fnm, line, col, TyAny)) }
 }
 
-# A function a UFCS call could reach under `ident`.
-fn ufcs_fn_named(st: InferState, ident: String) : Option[SymId] = match st_visible_candidates(st, ident) {
-  [c, ..._] -> Some(c.sym)
-  []        -> ufcs_bare_sym(st.env, ident)
+# Whether a UFCS call could reach something under `ident`.
+fn ufcs_reaches(st: InferState, ident: String) : Bool = match st_visible_candidates(st, ident) {
+  [_, ..._] -> true
+  []        -> match env_local_written(st.env.entries, ident) {
+    Some(_) -> true
+    None    -> match ufcs_bare_sym(st.env, ident) {
+      Some(_) -> true
+      None    -> false
+    }
+  }
 }
 
 # `e1[e2]` dispatches on the container's inferred
@@ -13091,13 +13123,12 @@ fn mask_local_mutable_demand(st: InferState, params: [Param], body: Expr) : Infe
   if not labels_contain_mutable(st.row) { st }
   else {
     let body_resolved = finalise_typed_expr(st.sub, body)
-    # The mutation-carrying record names (every record with a transitive
+    # An argument of a mutation-carrying type (every type with a transitive
     # `Array`/`Ref` field, e.g. `HashMap` / `HashSet` / `{ arr: Array }`)
-    # come from the program's records. An argument of such a type carries
-    # mutation, so passing it to a `/ Mutable` callee is observable iff that
-    # argument is a parameter or escapes. Computed up front: both the local-set
-    # scan and the demand classifier consult it.
-    let dmut = mutating_type_names(carrier_shapes(st.recs, st.sums))
+    # carries mutation, so passing it to a `/ Mutable` callee is observable
+    # iff that argument is a parameter or escapes. Both the local-set scan
+    # and the demand classifier consult the set.
+    let dmut = st.env.carriers
     let local_set = collect_local_arrays(body_resolved, [], dmut)
     let opaque = opaque_binders(params, body_resolved)
     let escaped_set = collect_escaped_names(st.protos.ids, body_resolved, [])
@@ -13107,12 +13138,14 @@ fn mask_local_mutable_demand(st: InferState, params: [Param], body: Expr) : Infe
   }
 }
 
-fn carrier_shapes(recs: [RecInfo], sums: [SumInfo]) : [CarrierShape] =
-  list_append(map(recs, record_shape), map(sums, sum_carrier_shape))
+fn carrier_shapes(v: TyHomeView, recs: [RecInfo], sums: [SumInfo]) : [CarrierShape] =
+  list_append(map(recs, (r) => record_shape(v, r)), map(sums, (s) => sum_carrier_shape(v, s)))
 
-fn sum_carrier_shape(s: SumInfo) : CarrierShape = match s {
-  SI(sum, _, vs, _) -> sum_shape(sum, vs)
+fn sum_carrier_shape(v: TyHomeView, s: SumInfo) : CarrierShape = match s {
+  SI(sum, tps, vs, mo) -> sum_shape(v, sum, tps, vs, mo)
 }
+
+fn ty_env_with_carriers(env: TyEnv, cs: [SymId]) : TyEnv = TyEnv { ...env, carriers: cs }
 
 fn st_drop_effect(st: InferState, c: CoreEffect) : InferState {
   let row1 = filter(st.row, (h) => not effect_is(h.sym, c))
@@ -19049,7 +19082,13 @@ pub type TcShared = {
   field_recs: FieldRecs,
   unions:    UnionTable,
   # In stream order, which is the order the modules are typed in.
-  unions_ahead: [UnionRow]
+  unions_ahead: [UnionRow],
+  # The types whose values may reach a mutable cell, and the records
+  # that reach an `Array`/`Ref` through fields alone. Whether a type
+  # is one depends only on what it stores, so the program's closure
+  # answers for every module.
+  carriers:     [SymId],
+  rec_carriers: [SymId]
 }
 
 #[doc("infer: build the `TcShared` tables once over the whole program, so a module's typecheck neither rebuilds the seed nor rescans the program for homes and aliases.")]
@@ -19059,6 +19098,8 @@ pub fn tc_shared(file: String, df: DiagFiles, all_program_decls: [Decl],
   let eff_names = sym_names(tab, collect_effect_ids(all_program_decls))
   let seed = build_ty_env_seed()
   let homes = tsh_homes(all_program_decls, tab, views, module_name_of_path(file))
+  let hview = tsh_view(homes, None)
+  let recs = collect_records(all_program_decls)
   TcShared {
     seed: seed,
     inh: TEP(seed.env.entries, seed.env.index, seed.env.vindex),
@@ -19067,7 +19108,9 @@ pub fn tc_shared(file: String, df: DiagFiles, all_program_decls: [Decl],
     alias_res: resolve_alias_cands(alias_cands, eff_names, file),
     field_recs: field_recs_of(all_program_decls),
     unions: ut_empty(),
-    unions_ahead: collect_union_rows(all_program_decls, tab, tsh_view(homes, None))
+    unions_ahead: collect_union_rows(all_program_decls, tab, hview),
+    carriers: mutating_type_names(carrier_shapes(hview, recs, collect_sums(all_program_decls))),
+    rec_carriers: mutating_record_type_names(hview, recs)
   }
 }
 
@@ -19076,10 +19119,8 @@ pub fn tc_shared_extend(sh: TcShared, delta: ModuleEnvDelta) : TcShared =
   match sh.inh {
     TEP(es, ix, vx) -> match union_rows_split(sh.unions_ahead, delta.unions, []) {
       URSplit(block, ahead) -> TcShared {
-        seed: sh.seed,
+        ...sh,
         inh: ty_env_prepend_batch(delta.ty_entries, es, ix, vx),
-        rk_table: sh.rk_table, homes: sh.homes, alias_res: sh.alias_res,
-        field_recs: sh.field_recs,
         unions: ut_add(sh.unions, block), unions_ahead: ahead
       }
     }
@@ -19178,7 +19219,7 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
   # table; threading it here keeps `synth_pipe_dispatch`'s lookup
   # `O(1)` per call site.
   let env_with_owners = ty_env_with_head_owners(data0.built.env, head_owners)
-  let built1 = BuiltEnv { env: env_with_owners,
+  let built1 = BuiltEnv { env: ty_env_with_carriers(env_with_owners, sh.carriers),
                           core_len: data0.built.core_len,
                           op_eff_arities: data0.built.op_eff_arities }
   let data = ProgramData { decls_a: data0.decls_a, built: built1,
@@ -19212,7 +19253,7 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
   let cov_diags = check_default_coverage(df, tab, tp.decls, all_decls_for_typer, sh.homes)
   let priv_diags = check_field_privacy(df, tab, tsh_view(sh.homes, mod.name), tp.decls,
     if list_length(all_program_decls) > 0 { sh.field_recs } else { field_recs_of(data.decls_a) })
-  let spawn_diags = check_spawn_rows(df, tab, data.recs, tp.decls, all_decls_for_typer)
+  let spawn_diags = check_spawn_rows(df, tab, sh.rec_carriers, tp.decls, all_decls_for_typer)
   let typed = TypedProgram {
     decls: tp.decls, errs: tp.errs + list_length(cov_diags) + list_length(priv_diags) + list_length(spawn_diags),
     insts: tp.insts, holes: tp.holes, row_holes: tp.row_holes,
