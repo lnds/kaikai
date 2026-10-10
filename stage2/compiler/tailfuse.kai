@@ -33,6 +33,7 @@ fusing it under a convention that does not hold.
 import compiler.ast
 import compiler.util
 import compiler.tailgraph
+import compiler.call_site_target
 import compiler.tailsig
 import compiler.tailslots
 import compiler.tailids
@@ -43,11 +44,10 @@ import compiler.home_tu
 import compiler.decl_names
 import compiler.emit_shared
 
-# The group's member names, the fused entry's name, its slot layout, the
-# module the group lives in, and the ids of the member declarations —
-# a resolved call names one of them outright, so the (name, module)
-# walk is only what an unresolved call falls back to.
-type TfCtx = TfCtx([String], TfFused, TfSlots, Option[String], [SymId])
+# The group's member names, the fused entry's name, its slot layout, and
+# the ids of the member declarations: a resolved call names one of them
+# outright, so the names are only what an unresolved call falls back to.
+type TfCtx = TfCtx([String], TfFused, TfSlots, [SymId])
 
 # The fused entry: its name and the id every call to it carries.
 type TfFused = TfFused(String, SymId)
@@ -55,11 +55,10 @@ type TfFused = TfFused(String, SymId)
 # The module a group is fused in and the parameter ids the resolver recorded.
 type TfIn = { target: String, pids: NameIndex[ParamIds] }
 
-fn tfctx_names(c: TfCtx) : [String] = match c { TfCtx(ns, _, _, _, _) -> ns }
-fn tfctx_lead(c: TfCtx) : TfFused = match c { TfCtx(_, l, _, _, _) -> l }
-fn tfctx_slots(c: TfCtx) : TfSlots = match c { TfCtx(_, _, sl, _, _) -> sl }
-fn tfctx_mo(c: TfCtx) : Option[String] = match c { TfCtx(_, _, _, m, _) -> m }
-fn tfctx_syms(c: TfCtx) : [SymId] = match c { TfCtx(_, _, _, _, ss) -> ss }
+fn tfctx_names(c: TfCtx) : [String] = match c { TfCtx(ns, _, _, _) -> ns }
+fn tfctx_lead(c: TfCtx) : TfFused = match c { TfCtx(_, l, _, _) -> l }
+fn tfctx_slots(c: TfCtx) : TfSlots = match c { TfCtx(_, _, sl, _) -> sl }
+fn tfctx_syms(c: TfCtx) : [SymId] = match c { TfCtx(_, _, _, ss) -> ss }
 
 #[doc("The name of the fused function minted for the group whose first member is `lead`. The name is derived from the member's own name so a group in a module lands beside it, and carries a prefix no source identifier can spell.")]
 pub fn tailfuse_name(lead: String) : String = cat2("__kai_fused_", lead)
@@ -206,7 +205,7 @@ fn tf_make_fused(lead: Decl, members: [Decl], names: [String], slots: TfSlots, f
       TfSlots(sps, layout) -> match fz {
         TfFused(fname, fsid) -> {
           let fresh = tf_fresh_params(sps, 0)
-          let ctx = TfCtx(names, fz, slots, mo, tf_member_syms(members))
+          let ctx = TfCtx(names, fz, slots, tf_member_syms(members))
           DFn(false, fname, tparams, [tf_tag_param(ln, cl), ...fresh],
               opt_ret, row, tf_dispatch_body(members, layout, ctx, ln, cl),
               ln, cl, mo, fnid_decl(fsid))
@@ -438,13 +437,11 @@ fn tf_retarget_arms(arms: [Arm], ctx: TfCtx, scope: [String]) : [Arm] {
   }
 }
 
-# The callee must name a member of THIS group: same module, matching
-# arity, not shadowed. A bare name resolves against the group's own
-# module, a qualified one only when the qualifier IS that module — a
+# The callee must name a member of THIS group at matching arity: a
 # same-named function in another module is a different function.
 fn tf_retarget_call(k: ExprKind, f: Expr, xs: [Expr], ctx: TfCtx,
                     scope: [String]) : ExprKind {
-  match tf_member_index(f.kind, ctx, scope) {
+  match tf_member_index(f, ctx, scope) {
     None    -> k
     Some(i) -> match tfctx_slots(ctx) {
       TfSlots(_, layout) ->
@@ -454,19 +451,15 @@ fn tf_retarget_call(k: ExprKind, f: Expr, xs: [Expr], ctx: TfCtx,
   }
 }
 
-fn tf_member_index(fk: ExprKind, ctx: TfCtx, scope: [String]) : Option[Int] {
-  match fk {
-    # A resolved call names one declaration: the member is found by id,
-    # with no (name, module) pair to agree on. A local's id indexes no
-    # member, and the scope keeps it from matching one by name.
-    ESym(s, _, n)      -> match tf_sym_index(tfctx_syms(ctx), s, 0) {
-                         Some(i) -> Some(i)
-                         None    -> if sym_raw(s) >= 0 { None } else { tf_lookup_member(n, ctx, scope) }
-                       }
-    EVar(n)         -> tf_lookup_member(n, ctx, scope)
-    EModCall(cm, n) ->
-      if tf_mod_is_own(cm, tfctx_mo(ctx)) { tf_lookup_member(n, ctx, scope) } else { None }
-    _ -> None
+fn tf_member_index(f: Expr, ctx: TfCtx, scope: [String]) : Option[Int] = match f.kind {
+  # A name the resolver left bare is matched by spelling, unless a binder
+  # in scope shadows it.
+  EVar(n) -> tf_lookup_member(n, ctx, scope)
+  # Any other callee names one declaration or none: the member is found
+  # by id, and a local's id indexes no member.
+  _ -> match callee_id(f) {
+    Some(s) -> tf_sym_index(tfctx_syms(ctx), s, 0)
+    None    -> None
   }
 }
 
@@ -487,7 +480,3 @@ fn tf_name_index(names: [String], n: String, i: Int) : Option[Int] = match names
   [h, ...rest] -> if h == n { Some(i) } else { tf_name_index(rest, n, i + 1) }
 }
 
-fn tf_mod_is_own(callmod: String, mo: Option[String]) : Bool = match mo {
-  None    -> false
-  Some(m) -> m == callmod
-}
