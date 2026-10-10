@@ -338,10 +338,9 @@ test-decl-symid-survives:
 test-symid-names: kaic2
 	@./tools/symid-names-gate.sh
 
-# The respelling is a stand-in for identity, so it must not spread while
-# it is being retired. Effects stay spelled — the runtime dispatches an
-# effect by its bare label, so that spelling is ABI — but the type half
-# retires once `TyCon` carries a `SymId` instead of a name string.
+# A contested declaration's emitted name is spelled by one function, from
+# its id: a second file minting a home spelling is a second rule, and the
+# pieces of a program that meet on the name stop meeting.
 test-respelling-confined:
 	@./tools/respelling-confined-gate.sh
 
