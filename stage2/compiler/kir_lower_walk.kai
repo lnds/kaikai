@@ -23,7 +23,6 @@ import compiler.rec_stamp
 import compiler.infer
 import compiler.region
 import compiler.kir
-import compiler.rt_name
 import compiler.kir_lower
 import compiler.ctor_ix
 import compiler.core_builtins
@@ -409,7 +408,7 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
   # block-building discipline as if/match (asu review). The clause bodies
   # are separate `KFnClause`s generated in `lower_to_kir`.
   EHandle(body, eff, tas, init_opt, alias_opt, clauses, ret_opt) ->
-    lower_handle(x, body, inst_key_of_tes(rt_name(st.tab, ref_sym(eff)), tas), init_opt, alias_opt, clauses, ret_opt, st)
+    lower_handle(x, body, inst_key_of_tes(ref_sym(eff), tas), init_opt, alias_opt, clauses, ret_opt, st)
 
   # Postfix `!` — Option/Result propagation. `expr!` unwraps the success
   # payload, or EARLY-RETURNS the whole `None`/`Err` from the enclosing fn
@@ -1052,7 +1051,7 @@ fn lower_lambda_ref(x: Expr, st: LowerSt) : LRes / Console =
   match find_lam(st.lams, st.enc_fn, x.line, x.col) {
     Some(LamInfo(_, ef, ln, cl, params, caps, _, _)) ->
       match lower_capture_atoms(caps, st, []) { LResMany(capvs, st1) ->
-        bind_op(st1, KClosure(lam_symbol_at(ef, ln, cl),
+        bind_op(st1, KClosure(lam_symbol_at(ef.sym, ln, cl),
                               list_length(params), capvs), kpos_of(x)) }
     None -> { eprint(concat_all(["kir: lambda info missing at ",
                                  int_to_string(x.line), ":", int_to_string(x.col)]));
@@ -2848,10 +2847,11 @@ fn match_has_discriminating_pattern(arms: [Arm]) : Bool = match arms {
 # path stores the discarded value. The return clause (if any) lowers
 # inline over `result` at the merge. The clause bodies are separate
 # `KFnClause`s (generated in `lower_to_kir`).
-fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
+fn lower_handle(x: Expr, body: Expr, inst: InstKey, init_opt: Option[Expr],
                 alias_opt: Option[Binder], clauses: [HClause],
                 ret_opt: Option[HReturn], st: LowerSt) : LRes / Console {
-  let sym = user_handler_sym(st.enc_fn, x.line, x.col)
+  let eff = inst_key_text(st.tab, inst)
+  let sym = user_handler_sym(st.enc_fn.sym, x.line, x.col)
   let has_fin = handle_has_finally(clauses)
   let uw = unw_handle_at(st.unw.sites, x.site)
   let ho = kir_unw_handle_vars(uw, x, st)
@@ -2863,7 +2863,7 @@ fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
       # Arm the cleanup right after the push, so every unwind past this
       # node runs it; the normal exit runs it explicitly before the pop.
       let st4 = if has_fin {
-        ls_emit(st3b, KSetCleanup(eff, sym, user_cleanup_sym(st.enc_fn, x.line, x.col), kpos_of(x)))
+        ls_emit(st3b, KSetCleanup(eff, sym, user_cleanup_sym(st.enc_fn.sym, x.line, x.col), kpos_of(x)))
       } else { st3b }
       # A handle carrying `init` state is stateful — its return clause sees
       # `state`/`log` (gated in `lower_handle_ret` via `KBindEvState`).
@@ -2872,7 +2872,7 @@ fn lower_handle(x: Expr, body: Expr, eff: String, init_opt: Option[Expr],
       # evidence-frame storage is named per-SITE, not per-EFFECT: two nested
       # handlers of the same effect must NOT share a `__node_<eff>` alloca, or
       # the second push self-cycles the parent chain (refs #789).
-      let fork = HandleFork { stateful: stateful, has_fin: has_fin, frames: rs_clauses_push_frames(clauses) }
+      let fork = HandleFork { stateful: stateful, has_fin: has_fin, frames: rs_clauses_push_frames(clauses), inst: inst }
       lower_handle_fork(x, body, eff, sym, result, fork, ret_opt, list_append(hs.pops, ho.pops), st4)
     } } }
 }
@@ -2922,14 +2922,14 @@ fn handle_has_finally(cs: [HClause]) : Bool = match cs {
 # `state`/`log` bind — threaded from `lower_handle` where `init_opt` is known.
 # What shapes a handle's exits: its state, its `finally`, and whether a
 # clause defers resume frames to them.
-type HandleFork = { stateful: Bool, has_fin: Bool, frames: Bool }
+type HandleFork = { stateful: Bool, has_fin: Bool, frames: Bool, inst: InstKey }
 
 fn lower_handle_fork(x: Expr, body: Expr, eff: String, sym: String, result: String,
                      fork: HandleFork, ret_opt: Option[HReturn], pops: [String], st: LowerSt) : LRes / Console =
   match bind_op(st, KSetjmp(eff, sym), kpos_of(x)) { LRes(jmpv, st1) ->
     match three_labels(st1) { LSL3(ldisc, lbody, lret, st2) -> {
       let st3 = ls_seal(st2, KCondBr(jmpv, ldisc, lbody, kpos_of(x)), lbody)
-      let st4 = lower_handle_body(body, eff, sym, result, fork.has_fin, fork.stateful, ret_opt, lret, st3)
+      let st4 = lower_handle_body(body, eff, sym, result, fork, ret_opt, lret, st3)
       let st5 = lower_handle_discard(sym, result, lret, ldisc, st4)
       lower_handle_ret(eff, sym, result, fork, pops, lret, st5)
     } } }
@@ -2938,10 +2938,12 @@ fn lower_handle_fork(x: Expr, body: Expr, eff: String, sym: String, result: Stri
 # clause, store into result, branch to the merge. The pop sits on the
 # NORMAL exit only — the discard path's longjmp already unwound past it.
 fn lower_handle_body(body: Expr, eff: String, sym: String, result: String,
-                     has_fin: Bool, stateful: Bool, ret_opt: Option[HReturn],
+                     fork: HandleFork, ret_opt: Option[HReturn],
                      lret: String, st: LowerSt) : LowerSt / Console =
-  match lower_expr(body, ls_bind_reg(st, handle_shadow_mark(eff))) { LRes(bv, st0) -> {
-    let st1 = ls_set_regs(st0, st.regs)
+  match lower_expr(body, ls_in_handle(st, fork.inst)) { LRes(bv, st0) -> {
+    let has_fin = fork.has_fin
+    let stateful = fork.stateful
+    let st1 = ls_set_handles(ls_set_regs(st0, st.regs), st.handles)
     match ret_opt {
       None -> {
         let st2 = ls_emit(st1, KStore(result, bv, kpos_of(body)))
@@ -3194,17 +3196,8 @@ fn perform_inst_args(x: Expr) : [Ty] = match x.kind {
 fn perform_via(r: OpRef, targs: [Ty], st: LowerSt) : KVia = match r.via {
   ViaAlias(a) -> KvAlias(ls_local_name(st, a))
   ViaRecv(v)  -> KvRecv(ls_local_name(st, v))
-  ViaAmbient  -> {
-    let key = kir_eff_key(st.tab, r.eff, targs)
-    if any(st.regs, (n) => shadow_mark_covers(n, key)) { KvLexical } else { KvAmbient }
-  }
+  ViaAmbient  -> if ls_handled_here(st, inst_key_of_tys(r.eff, targs)) { KvLexical } else { KvAmbient }
 }
-
-# Not an identifier, so it never collides with a bound register in `regs`.
-fn handle_shadow_mark(key: String) : String = cat2("#handle:", key)
-
-fn shadow_mark_covers(local: String, key: String) : Bool =
-  string_slice(local, 0, 8) == "#handle:" and inst_keys_match(string_slice(local, 8, string_length(local)), key)
 
 # --- Perceus RC marks → first-class KRC statements (§4.7) ---------------
 
@@ -3757,8 +3750,8 @@ fn lower_enum_slot_arg(e: Expr, st: LowerSt) : LRes / Console = match e.kind {
   _ -> lower_expr(e, st)
 }
 
-# `sym` is the already-resolved mangled symbol. Resolve the callee's UFnSig
-# once: it drives BOTH ends of the P3 raw-scalar ABI at this call site.
+# `sym` is the already-resolved mangled symbol and `sig` the callee's
+# UFnSig: it drives BOTH ends of the P3 raw-scalar ABI at this call site.
 #
 # ARGS — lower each at the callee's PARAM slot (`lower_tcrec_args`, shared
 # with the self-tail-call back-edge): a raw param gets its arg lowered RAW
@@ -3778,9 +3771,8 @@ fn lower_enum_slot_arg(e: Expr, st: LowerSt) : LRes / Console = match e.kind {
 # arg / result — the unbox pass marks them `MUnboxed`, so neither the raw
 # args nor the raw result register attract a KDup/KDrop. The raw slots here
 # only change the repr, never the RC plan.
-#[doc("Lower the direct call `sym(cargs)` at `x`.")]
-pub fn lower_direct_call(x: Expr, sym: String, cargs: [Expr], st: LowerSt) : LRes / Console = {
-  let sig = fnx_ufn_by_csym(st.fx, sym)
+#[doc("Lower the direct call `sym(cargs)` at `x`, of a callee whose unboxed signature is `sig`.")]
+pub fn lower_direct_call(x: Expr, sym: String, sig: Option[UFnSig], cargs: [Expr], st: LowerSt) : LRes / Console = {
   match lower_tcrec_args(cargs, sig, st) { LResMany(avs0, st0) ->
     match ob_pin_literals(cargs, avs0, st0, []) { LResMany(avs, st1) -> {
       let held = ob_held(x, cargs, avs, st1)
@@ -3869,7 +3861,7 @@ fn ob_drop_go(st: LowerSt, cargs: [Expr], avs: [KVal], pos: KPos) : LowerSt = ma
 # declaration is read as a register spelled like it and called indirectly.
 fn lower_callee_dispatch(x: Expr, fid: FnId, cargs: [Expr], st: LowerSt) : LRes / Console =
   if callee_is_direct(st, fid) {
-    lower_direct_call(x, c_sym_of_callee_st(st, fid), cargs, st)
+    lower_direct_call(x, c_sym_of_callee_st(st, fid), ls_call_sig(st, fid), cargs, st)
   } else { lower_reg_call(x, ls_fn_name(st, fid), cargs, st) }
 
 # A local holding a function value, called through `kaix_apply` under the
@@ -3937,13 +3929,13 @@ fn lower_resume(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match ca
 # the dropmask is a bitfield over the same ordering, so the two must stay
 # aligned.
 fn lower_tcrec(x: Expr, step: TcrecStep, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match lower_tcrec_args(cargs, fnx_ufn_by_csym(st.fx, step.sym), st) {
+  match lower_tcrec_args(cargs, fnx_ufn_sig_first(st.fx, step.fid), st) {
     LResMany(avs, st1) ->
       # The goto leaves every enclosing match block, skipping their
       # continuation scrutinee drops and this path's unconsumed binder
       # dups — release the pending ledger entries before the back-edge.
       seal_tail(tcp_goto_drops(cargs, st1),
-                KTcrecGoto(cat3("_kai_", step.sym, "_entry"), assigns_of(avs, 0, []),
+                KTcrecGoto(cat3("_kai_", ls_fn_c_sym(st1, step.fid), "_entry"), assigns_of(avs, 0, []),
                            step.dropmask, kpos_of(x)))
   }
 
@@ -3989,7 +3981,7 @@ fn lower_trmc_seal(x: Expr, step: TrmcStep, spine: KSpine,
   # P3: lower the rebinds at the recursing fn's param slots (raw for a raw
   # param), so the TRMC back-edge re-stores them raw — no per-step
   # `kaix_int` re-box. Same `lower_tcrec_args` the `KTcrecGoto` path uses.
-  match lower_tcrec_args(trmc_self_args(cargs, step.hole), fnx_ufn_by_csym(st.fx, step.sym), st) {
+  match lower_tcrec_args(trmc_self_args(cargs, step.hole), fnx_ufn_sig_first(st.fx, step.fid), st) {
     LResMany(reb, st1) -> {
       # The variant ctor tag is resolved here (as `KCon` resolves it), so the
       # backend builds the spine cell without a name→tag table. The builtin-
@@ -4005,7 +3997,7 @@ fn lower_trmc_seal(x: Expr, step: TrmcStep, spine: KSpine,
       # Like the tcrec goto, the step leaves every enclosing match: it
       # releases the ledger's pending entries the ctor args do not consume.
       seal_tail(tcp_goto_drops(cargs, ls_set_tcpend(st1, tcl_without_tok(st1.tcpend))),
-                KTrmcStep(cat3("_kai_", step.sym, "_entry"), step.hole, spine, tag, slot_mask, step.dropmask,
+                KTrmcStep(cat3("_kai_", ls_fn_c_sym(st1, step.fid), "_entry"), step.hole, spine, tag, slot_mask, step.dropmask,
                           heads, assigns_of(reb, 0, []), st1.in_region, kpos_of(x)))
     }
   }

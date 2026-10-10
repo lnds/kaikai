@@ -33,11 +33,13 @@ import compiler.core_builtins
 import compiler.core_prim_ix
 import compiler.ctor_ix
 import compiler.emit_shared
-import compiler.resolve
+import compiler.core_effects
 import compiler.region
 import compiler.reuse_cells
 import compiler.kir
 import compiler.rt_name
+import compiler.enc_unit
+import compiler.effect_instance
 import compiler.kir_lin_cfg
 import compiler.unwind_pend
 import compiler.unwind_cx
@@ -74,9 +76,9 @@ pub fn reuse_plan_none() : ReusePlan = ReusePlan { rot: RNInone, flat: [], cells
 # block label, current block's reversed statement list, the EFn symbol
 # table, the core builtins' rows keyed by id, the variant→tag table and
 # its rows keyed by constructor id, the lifted-lambda table (`find_lam`),
-# and the enclosing-fn key the lambda lookup is scoped by.
+# and the enclosing unit the lambda lookup is scoped by.
 pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
-                     fns: [EFn], fx: FnIndex, core_ix: CoreIx, ctor_ix: CtorIx, vs: [VariantEntry], lams: [LamInfo], enc_fn: String,
+                     fns: [EFn], fx: FnIndex, core_ix: CoreIx, ctor_ix: CtorIx, vs: [VariantEntry], lams: [LamInfo], enc_fn: EncFn,
                      consts: [Decl],
                      # `regs` is the set of register names bound in the
                      # current lexical scope: params, captures, and every
@@ -177,6 +179,11 @@ pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
                      # An enclosing arm holds the fn-wide arm-top reuse token,
                      # so a nested arm must not capture over it.
                      arm_tok: Bool,
+                     # The instances the `handle`s around the walk position
+                     # install, innermost first: an op of one of them reaches
+                     # that handler, not the fn's frame slot. A handle's body
+                     # extends it; restored at the body's exit.
+                     handles: [InstKey],
                      # The symbol table and the specialisations' emitted
                      # names, which spell a declaration's symbol; the
                      # binders of the declaration being lowered, which spell
@@ -208,22 +215,23 @@ pub fn ls_new(fns: [EFn], fx: FnIndex, variants: [VariantEntry], ctors: CtorIx, 
               consts: [Decl], ffi: [SymId], recs: [RecInfo], stamps: [RecStamp], regions: [RegionMark], raw_binders: [RawArmBinder], root_mod: Option[String],
               tab: SymTab, specs: SpecNames) : LowerSt =
   LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, fx: fx, core_ix: core_ix_build(), ctor_ix: ctors, vs: variants,
-            lams: lams, enc_fn: "", consts: consts, regs: [], ffi: ffi, renames: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: recs, stamps: stamps, in_region: false, regions: regions, raw_binders: raw_binders, tcpend: [], unw: unw_frame_none(unw_cx_empty()), root_mod: root_mod, arm_tok: false,
+            lams: lams, enc_fn: enc_none(), consts: consts, regs: [], ffi: ffi, renames: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: recs, stamps: stamps, in_region: false, regions: regions, raw_binders: raw_binders, tcpend: [], unw: unw_frame_none(unw_cx_empty()), root_mod: root_mod, arm_tok: false, handles: [],
             tab: tab, specs: specs, locals: ln_empty() }
 
 #[doc("`st` with the arm-top token marked held (or released).")]
 pub fn ls_set_arm_tok(st: LowerSt, held: Bool) : LowerSt = LowerSt { ...st, arm_tok: held }
 
 # Reset the per-function counters and block buffers, preserving the shared
-# tables. `enc_fn` is the fn/lambda symbol the body's nested lambdas are
-# scoped by (`find_lam` keys on it); `regs` the registers its params and
-# captures take; `locals` the binders of the declaration it belongs to;
-# `body_fns` the EFn table. Called at the head of every KFn lowering.
-pub fn ls_enter_fn_with(st: LowerSt, enc_fn: String, regs: [String], locals: LocalNames,
+# tables. `enc_fn` is the fn / lambda / clause / runner the body's nested
+# lambdas are scoped by (`find_lam` keys on it); `regs` the registers its
+# params and captures take; `locals` the binders of the declaration it
+# belongs to; `body_fns` the EFn table. Called at the head of every KFn
+# lowering.
+pub fn ls_enter_fn_with(st: LowerSt, enc_fn: EncFn, regs: [String], locals: LocalNames,
                         body_fns: [EFn]) : LowerSt =
   LowerSt { ...st, rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: body_fns, enc_fn: enc_fn,
             regs: regs, renames: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), in_region: false,
-            tcpend: [], unw: unw_blank(st.unw), arm_tok: false, locals: kir_body_locals(locals) }
+            tcpend: [], unw: unw_blank(st.unw), arm_tok: false, handles: [], locals: kir_body_locals(locals) }
 
 #[doc("`ns` with the binders a body reads and no node declares: the handler-state aliases and the continuation, each minted under its key.")]
 pub fn kir_body_locals(ns: LocalNames) : LocalNames =
@@ -233,6 +241,15 @@ fn body_locals_loop(keys: [String], ns: LocalNames) : LocalNames = match keys {
   []           -> ns
   [k, ...rest] -> body_locals_loop(rest, ln_with_binder(ns, binder_minted(k)))
 }
+
+#[doc("`st` inside the body of a `handle` that installs the instance `k`.")]
+pub fn ls_in_handle(st: LowerSt, k: InstKey) : LowerSt = LowerSt { ...st, handles: [k, ...st.handles] }
+
+#[doc("`st` with the enclosing `handle`s restored to `hs`.")]
+pub fn ls_set_handles(st: LowerSt, hs: [InstKey]) : LowerSt = LowerSt { ...st, handles: hs }
+
+#[doc("True when a `handle` around the walk position installs an instance the op of instance `k` reaches.")]
+pub fn ls_handled_here(st: LowerSt, k: InstKey) : Bool = any(st.handles, (h) => inst_keys_match(h, k))
 
 #[doc("The state with `u` as the current frame's unwind sites.")]
 pub fn ls_with_unw(st: LowerSt, u: UnwFrame) : LowerSt = LowerSt { ...st, unw: u }
@@ -291,7 +308,7 @@ pub fn ls_reg_of(st: LowerSt, l: LocalId) : String = match ls_lookup_rename(st, 
 #[doc("The name the local `l` was written with.")]
 pub fn ls_local_name(st: LowerSt, l: LocalId) : String = {
   let w = written_text(ln_text(st.locals, l))
-  if w == "" { panic(concat_all(["identity: the name of local ", int_to_string(local_raw(l)), " of ", st.enc_fn, " in ls_local_name"])) } else { w }
+  if w == "" { panic(concat_all(["identity: the name of local ", int_to_string(local_raw(l)), " of ", st.enc_fn.sym, " in ls_local_name"])) } else { w }
 }
 
 #[doc("The register a lambda or clause reads the capture `c` from: the captured binder's written name, or the register holding the alias's handler id.")]
@@ -446,8 +463,25 @@ pub fn ls_is_ffi(st: LowerSt, s: SymId) : Bool = any(st.ffi, (f) => sym_raw(f) =
 pub fn c_sym_of_callee_st(st: LowerSt, fid: FnId) : String =
   if ls_is_ffi(st, fnid_sym(fid)) { ffi_wrapper_sym(ls_fn_name(st, fid), efn_module_of(st, fid)) }
   else { match ls_callee(st, fid) {
-    Some(EFn(_, _, mo, _, efid)) -> ls_fn_call_sym(st, efid, c_sym(ls_fn_name(st, fid), mo))
-    None                      -> core_call_sym(st, fid)
+    Some(e) -> ls_fn_call_sym(st, efn_sym(e), efn_c_sym(e))
+    None    -> core_call_sym(st, fid)
+  } }
+
+#[doc("The C symbol the fn instance `f` is emitted under: its registry entry's, which carries the module that declares it.")]
+pub fn ls_fn_c_sym(st: LowerSt, f: FnId) : String = match ls_callee(st, f) {
+  Some(e) -> efn_c_sym(e)
+  None    -> ls_fn_name(st, f)
+}
+
+#[doc("The unboxed signature a direct call of `fid` is lowered at: the fn's own when the call binds its symbol, none through an FFI wrapper or a core builtin's native entry.")]
+pub fn ls_call_sig(st: LowerSt, fid: FnId) : Option[UFnSig] =
+  if ls_is_ffi(st, fnid_sym(fid)) { None }
+  else { match ls_callee(st, fid) {
+    Some(e) -> match fnx_kai(st.fx, efn_sym(e)) {
+      Some(_) -> None
+      None    -> fnx_ufn_sig_first(st.fx, efn_sym(e))
+    }
+    None -> None
   } }
 
 # A declared core builtin is called as a `builtin_table` row is, through
@@ -497,8 +531,8 @@ pub fn ffi_wrapper_sym(name: String, mo: Option[String]) : String =
 pub type FnValue = FV(String, Int)
 
 pub fn ls_fn_value(st: LowerSt, fid: FnId) : Option[FnValue] = match ls_callee(st, fid) {
-  Some(EFn(_, arity, mo, _, _)) -> Some(FV(c_user_thunk_sym(c_sym(ls_fn_name(st, fid), mo)), arity))
-  None                          -> kir_core_fn_value(st, fid)
+  Some(e) -> match e { EFn(_, arity, _, _, _) -> Some(FV(c_user_thunk_sym(efn_c_sym(e)), arity)) }
+  None    -> kir_core_fn_value(st, fid)
 }
 
 # A PRELUDE builtin used as a first-class value (`map(xs, int_to_string)`,
@@ -841,31 +875,27 @@ pub fn local_is_continuation(l: LocalId) : Bool = local_eq(l, local_minted(canon
 
 # --- Effect default-handler install order ---------------------------------
 
-# The canonical install order for the built-in default handlers. The
-# single source of truth both backends must agree on — the C and LLVM
-# copies of this list drifting was a major effect divergence the KIR
-# closes. Reproduced here (a target-neutral list, not analysis) so
-# `KProgram.install_order` carries it once.
-pub fn kir_builtin_install_order() : [String] =
-  ["Stdout", "Stderr", "Stdin", "Env", "File", "Clock",
-   "Random", "SecureRandom", "NetTcp", "NetDns", "Signal", "Process", "Log",
-   "Mutable", "Cancel", "Link", "Monitor", "Spawn"]
+# The effects of a row the runtime does not install first go after those
+# (so pop order mirrors reverse-declaration).
+fn kir_later_effects(row: [SymId]) : [SymId] =
+  filter(row, (s) => not effect_is_any(s, default_install_first()))
 
-# User-declared effects in main's row that are NOT builtin defaults go
-# after the builtins (so pop order mirrors reverse-declaration).
-pub fn kir_user_effects_in_row(main_row: [String]) : [String] = match main_row {
-  [] -> []
-  [x, ...rest] ->
-    if name_in_list(kir_builtin_install_order(), x) { kir_user_effects_in_row(rest) }
-    else { [x, ...kir_user_effects_in_row(rest)] }
+# The install order of a program whose entry row is `row`: the effects the
+# runtime installs first, in its order, then the row's others.
+fn kir_order_of(row: [SymId]) : [SymId] =
+  list_append(map(default_install_first(), core_effect_id), kir_later_effects(row))
+
+# The label of an effect the runtime installs first: the name the program
+# emits it under, or its declared one in a program that does not hold it.
+fn kir_first_label(tab: SymTab, c: CoreEffect) : String = {
+  let s = core_effect_id(c)
+  if st_valid(tab, s) { rt_name(tab, s) } else { core_effect_name(c) }
 }
 
-fn kir_eff_names(tab: SymTab, effs: [SymId]) : [String] = map(effs, (s) => rt_name(tab, s))
-
-# The full install order: builtins first, then main-row user effects.
-# `main_row_labels` (emit_shared) extracts main's effect row.
+#[doc("The labels of the full install order, as a dump prints it: the effects the runtime installs first, then the entry row's others.")]
 pub fn kir_install_order(decls: [Decl], tab: SymTab, entry: SymId) : [String] =
-  list_append(kir_builtin_install_order(), kir_user_effects_in_row(kir_eff_names(tab, main_row_labels(decls, entry))))
+  list_append(map(default_install_first(), (c) => kir_first_label(tab, c)),
+              map(kir_later_effects(main_row_labels(decls, entry)), (s) => rt_name(tab, s)))
 
 # --- Default-handler op→runtime-symbol resolution (native install) ------
 #
@@ -940,40 +970,29 @@ pub fn kir_default_of_decl(s: SymId, decls: [Decl]) : Option[KDefault] = match d
 # (`Mutable`) into the row BEFORE the filter, so their default handler is
 # installed around `kai_main` even when the inferred row omits them. The
 # result stays a SET (the helper dedups).
-pub fn kir_default_handlers(decls: [Decl], tab: SymTab, entry: SymId) : [KDefault] =
-  kir_default_handlers_loop(kir_install_order(decls, tab, entry),
+pub fn kir_default_handlers(decls: [Decl], entry: SymId) : [KDefault] =
+  kir_default_handlers_loop(kir_order_of(main_row_labels(decls, entry)),
                             ensure_unconditional_defaults(add_missing_effects(
                               default_effects_absorbed_by_handler(decls),
-                              main_row_labels(decls, entry))), tab, decls)
+                              main_row_labels(decls, entry))), decls)
 
 #[doc("The defaults a test or bench entry installs: every effect in `runner_entry_row`, in install order.")]
-pub fn kir_runner_default_handlers(decls: [Decl], tab: SymTab) : [KDefault] = {
+pub fn kir_runner_default_handlers(decls: [Decl]) : [KDefault] = {
   let row = runner_entry_row(decls)
-  kir_default_handlers_loop(list_append(kir_builtin_install_order(), kir_user_effects_in_row(kir_eff_names(tab, row))),
-                            row, tab, decls)
+  kir_default_handlers_loop(kir_order_of(row), row, decls)
 }
 
-# The install order is a list of runtime labels: each one installs the
-# row's effect it names.
-fn kir_default_handlers_loop(order: [String], main_row: [SymId], tab: SymTab,
-                             decls: [Decl]) : [KDefault] = match order {
+# Each effect of the install order that the row holds installs its default.
+fn kir_default_handlers_loop(order: [SymId], main_row: [SymId], decls: [Decl]) : [KDefault] = match order {
   [] -> []
-  [eff, ...rest] -> match kir_default_labelled(eff, main_row, tab, decls) {
-    None    -> kir_default_handlers_loop(rest, main_row, tab, decls)
-    Some(d) -> [d, ...kir_default_handlers_loop(rest, main_row, tab, decls)]
+  [s, ...rest] -> match kir_default_in_row(s, main_row, decls) {
+    None    -> kir_default_handlers_loop(rest, main_row, decls)
+    Some(d) -> [d, ...kir_default_handlers_loop(rest, main_row, decls)]
   }
 }
 
-fn kir_default_labelled(eff: String, row: [SymId], tab: SymTab, decls: [Decl]) : Option[KDefault] = match row {
-  [] -> None
-  [s, ...rest] ->
-    if rt_name(tab, s) == eff {
-      match kir_default_of_decl(s, decls) {
-        Some(d) -> Some(d)
-        None    -> kir_default_labelled(eff, rest, tab, decls)
-      }
-    } else { kir_default_labelled(eff, rest, tab, decls) }
-}
+fn kir_default_in_row(s: SymId, row: [SymId], decls: [Decl]) : Option[KDefault] =
+  if effect_among(row, s) { kir_default_of_decl(s, decls) } else { None }
 
 # Synthesise a `KDefault` (op→field-index map) for EVERY effect DECLARED in
 # the program — a deliberate SUPERSET of `kir_default_handlers`. The native

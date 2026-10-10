@@ -71,6 +71,7 @@ import compiler.fnreg
 import compiler.fn_index
 import compiler.kai_builtin
 import compiler.fn_csym
+import compiler.enc_unit
 import compiler.modules
 import compiler.module_table
 import compiler.qual_head
@@ -219,12 +220,12 @@ type EmitCtx = { lcs: [LocalId], fns: [EFn], fx: FnIndex, variants: [VariantEntr
                  # decls. The FFI shim emitter keys off it to unwrap a
                  # record into a C struct / pass an opaque void*.
                  ffi_reg: [ExternTypeReg],
-                 # The post-monomorph, module-mangled symbol of the fn /
-                 # lambda whose body is currently being emitted. Passed to
-                 # `find_lam` so a nested ELambda resolves to ITS module's
-                 # LamInfo, not a same-(line,col) lambda from another module
-                 # (the multi-module emit puts both in one `lams` list).
-                 cur_enc_fn: String,
+                 # The fn / lambda / clause / runner whose body is being
+                 # emitted, and its symbol. `find_lam` reads the unit so a
+                 # nested ELambda resolves to ITS module's LamInfo, not a
+                 # same-(line,col) lambda from another module (the
+                 # multi-module emit puts both in one `lams` list).
+                 cur_enc_fn: EncFn,
                  # The record table. An `EField` whose base type resolves to a
                  # known record lowers to a constant-index read (`field_index_of`
                  # + the desugar-canonicalised declaration-order layout) instead
@@ -241,8 +242,8 @@ type EmitCtx = { lcs: [LocalId], fns: [EFn], fx: FnIndex, variants: [VariantEntr
                  # the id it carries.
                  ctor_ix: CtorIx,
                  # The per-function evidence-frame ABI: each
-                 # function's USER-effect slot layout, keyed by emitted
-                 # symbol. The perform site reads its own frame's slot for
+                 # function's USER-effect slot layout, keyed by
+                 # function. The perform site reads its own frame's slot for
                  # an effect (falling back to the by-name walk when the
                  # frame does not carry it); a call site fills the callee's
                  # frame from its own supplier classification. Built once at
@@ -253,10 +254,10 @@ type EmitCtx = { lcs: [LocalId], fns: [EFn], fx: FnIndex, variants: [VariantEntr
                  # reuse-variant arm emit reads this to route its fresh-alloc
                  # rebuild cells through `_donor` — see emit_reuse_donate.kai.
                  rd_active: Bool,
-                 # Names of every donation-capable top-level fn, pre-scanned
-                 # once. A call site consults it (with a live arm token, i.e.
+                 # Every donation-capable top-level fn, pre-scanned once.
+                 # A call site consults it (with a live arm token, i.e.
                  # `reuse_donor` set) to donate that token across the call.
-                 rd_capable: [String],
+                 rd_capable: [FnId],
                  # Pending releases the tcrec goto-tail path must emit before
                  # jumping: enclosing owned match scrutinee aliases plus
                  # not-yet-consumed arm-binder increfs (emit_tcrec_live ledger).
@@ -296,10 +297,10 @@ fn emit_ctx_with_evf(cx: EmitCtx, evf: EvFrames) : EmitCtx =
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
             hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: cx.cur_enc_fn, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
 
-# Set the enclosing-fn key (entering a fn or lambda body). `find_lam`
+# Set the enclosing unit (entering a fn or lambda body). `find_lam`
 # keys on this + (line, col) so a nested ELambda resolves to its own
 # module's LamInfo, never a same-position lambda from another module.
-fn emit_ctx_with_enc_fn(cx: EmitCtx, ef: String) : EmitCtx =
+fn emit_ctx_with_enc_fn(cx: EmitCtx, ef: EncFn) : EmitCtx =
   EmitCtx { lcs: cx.lcs, fns: cx.fns, fx: cx.fx, variants: cx.variants, lams: cx.lams, cls: cx.cls,
             regions: cx.regions, in_region: cx.in_region, borrowed: cx.borrowed,
             hoisted: cx.hoisted, reuse_donor: cx.reuse_donor, kind1_raw: cx.kind1_raw, consts: cx.consts, effs: cx.effs, ffi_reg: cx.ffi_reg, cur_enc_fn: ef, recs: cx.recs, stamps: cx.stamps, core_ix: cx.core_ix, ctor_ix: cx.ctor_ix, evf: cx.evf, rd_active: cx.rd_active, rd_capable: cx.rd_capable, tcpend: cx.tcpend, unw: cx.unw, root_mod: cx.root_mod, tab: cx.tab, specs: cx.specs, locals: cx.locals }
@@ -1896,11 +1897,14 @@ fn emit_ob_drops(args_e: [Expr], i: Int) : String = match args_e {
 # original boxed-only dispatch.
 fn emit_ufn_boxed_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option[String] / Console =
   match fnx_callee(cx.fx, ec_callee_sym(f)) {
-    Some(EFn(n, _, mo, Some(US(ptys, rt, mask)), _)) -> {
-      let raw_call = emit_user_call_seq(c_sym(written_text(n), mo), emit_arg_vals_masked(src, args_e, mask, ptys, cx), cx)
-      Some(ufn_call_result(rt, raw_call))
+    Some(e) -> match e {
+      EFn(_, _, _, Some(US(ptys, rt, mask)), efid) -> {
+        let raw_call = emit_user_call_seq(efid, efn_c_sym(e), emit_arg_vals_masked(src, args_e, mask, ptys, cx), cx)
+        Some(ufn_call_result(rt, raw_call))
+      }
+      _ -> None
     }
-    _ -> None
+    None -> None
   }
 
 
@@ -2193,7 +2197,8 @@ fn emit_callee_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String 
         # structs. The runtime IDENTITY label is the instance key (`Eff` or
         # `Eff[args]`): the evidence stack and the frame slots are keyed by it.
         let eff_evn = ev_name_of(cx.tab, cx.effs, r.eff)
-        let eff_idn = inst_key_of_callee(eff_n, f.ty)
+        let eff_inst = inst_key_of_callee(r.eff, f.ty)
+        let eff_idn = key_of(eff_n, eff_inst.args)
         let op_n = written_text(r.op)
         # §6 named instances: a capability-parameter op call `c.op` goes
         # through `ViaRecv`. The evidence is the parameter `kaiv_<recv>`
@@ -2211,7 +2216,7 @@ fn emit_callee_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String 
         # innermost-by-name walk. Under KAI_EVIDENCE_FRAME_ONLY the walk
         # fallback is compiled out so a frame-carried effect MUST resolve
         # through its slot — the oracle that falsifies a wrong transport.
-        let evf_slot = frame_slot_here(cx.evf, cx.cur_enc_fn, eff_idn)
+        let evf_slot = frame_slot_here(cx.evf, cx.cur_enc_fn, eff_inst)
         let walk_c = match r.via {
           ViaAlias(a) -> {
             # By-id resolves an aliased cell/capability. NULL means it was
@@ -2300,7 +2305,7 @@ fn emit_callee_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String 
     EMark(MkTrmcStep(s)) -> emit_trmc_step(src, s, args_e, cx)
     # A self-tail-call site: the rebind+goto block. `emit_fn_body` plants
     # the label it jumps to.
-    EMark(MkTcrecStep(s)) -> tcrec_emit_goto(src, s.sym, s.dropmask, s.params, args_e, cx)
+    EMark(MkTcrecStep(s)) -> tcrec_emit_goto(src, s.fid, s.dropmask, s.params, args_e, cx)
     _ -> emit_apply_seq("kai_apply(", emit_expr(src, f, cx), emit_arg_vals(src, args_e, cx))
   }
 }
@@ -2309,7 +2314,7 @@ fn emit_callee_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : String 
 # carries: the id decides, never a spelling.
 fn emit_sym_call(src: String, fid: FnId, args_e: [Expr], cx: EmitCtx) : String / Console =
   match fnx_callee(cx.fx, fid) {
-    Some(EFn(n, _, mo, _, efid)) -> emit_fn_call_seq(efid, c_sym(written_text(n), mo), emit_arg_vals(src, args_e, cx), cx)
+    Some(e) -> emit_fn_call_seq(efn_sym(e), efn_c_sym(e), emit_arg_vals(src, args_e, cx), cx)
     # A raw core prim is checked before the boxed row: its args
     # marshal raw per the prim's param types and its result is raw.
     None -> match core_ix_raw(cx.core_ix, fnid_sym(fid)) {
@@ -2338,7 +2343,7 @@ fn effect_declares_default(effs: [Decl], s: SymId) : Bool = match effect_decl_de
 #     startup-minted default node `&_kai_default_node_<eff>`;
 #   - otherwise the caller has it lexically (a `handle` in scope) →
 #     `kai_evidence_lookup_node("E")`, the node live at this point.
-fn emit_evf_call_arg(slots: [String], call_args: String, cx: EmitCtx) : String = match slots {
+fn emit_evf_call_arg(slots: [InstKey], call_args: String, cx: EmitCtx) : String = match slots {
   [] -> call_args
   _  -> {
     let frame = if evf_forwards_prefix(slots, 0, cx) { "__evf" }
@@ -2350,15 +2355,15 @@ fn emit_evf_call_arg(slots: [String], call_args: String, cx: EmitCtx) : String =
 # Every callee slot i is the caller's slot i: the callee gets the caller's own
 # frame instead of a copy. A frame is never written after the call fills it,
 # and each copy is a stack slot of its own in every recursive frame.
-fn evf_forwards_prefix(slots: [String], i: Int, cx: EmitCtx) : Bool = match slots {
+fn evf_forwards_prefix(slots: [InstKey], i: Int, cx: EmitCtx) : Bool = match slots {
   [] -> true
   [eff, ...rest] -> frame_slot_here(cx.evf, cx.cur_enc_fn, eff) == i and evf_forwards_prefix(rest, i + 1, cx)
 }
 
-fn emit_evf_slots(slots: [String], cx: EmitCtx) : String =
+fn emit_evf_slots(slots: [InstKey], cx: EmitCtx) : String =
   join_with(map(slots, (eff) => emit_evf_one_slot(eff, cx)), ", ")
 
-fn emit_evf_one_slot(eff: String, cx: EmitCtx) : String = {
+fn emit_evf_one_slot(eff: InstKey, cx: EmitCtx) : String = {
   let caller_idx = frame_slot_here(cx.evf, cx.cur_enc_fn, eff)
   if caller_idx >= 0 { concat_all(["__evf[", int_to_string(caller_idx), "]"]) }
   else { evf_terminal_slot(eff, cx) }
@@ -2369,27 +2374,28 @@ fn emit_evf_one_slot(eff: String, cx: EmitCtx) : String = {
 # effect (no longer pushed). A non-default effect stays on the plain walk, whose
 # NULL result (no handler on this fiber — the walk crossed a spawn) is reported
 # by `kai_evidence_require` instead of stored as a NULL slot the perform derefs.
-fn evf_terminal_slot(key: String, cx: EmitCtx) : String = evf_thunk_slot(key, cx.effs, cx.tab)
+fn evf_terminal_slot(key: InstKey, cx: EmitCtx) : String = evf_thunk_slot(key, cx.effs, cx.tab)
 
-# Emit a direct user-fn call `kai_<csym>(<frame?><args>)`, prepending the
-# evidence frame when the callee carries one. The single funnel every
-# user-fn call site routes through, so the frame is filled consistently;
-# a frameless callee (`frame_slots_of` empty) reduces to the legacy form.
+# Emit a direct call of the user fn `fid`, `kai_<csym>(<frame?><args>)`,
+# prepending the evidence frame when the callee carries one. The single
+# funnel every user-fn call site routes through, so the frame is filled
+# consistently; a frameless callee (`frame_slots_of` empty) reduces to the
+# legacy form.
 # A declared core builtin is called as a `builtin_table` row is: its
 # runtime symbol, the args owned, no evidence frame and no donor token.
 fn emit_fn_call_seq(fid: FnId, csym: String, vals: [String], cx: EmitCtx) : String = match fnx_kai(cx.fx, fid) {
   Some(kb) -> emit_kai_call_seq(kb, vals)
-  None     -> emit_user_call_seq(csym, vals, cx)
+  None     -> emit_user_call_seq(fid, csym, vals, cx)
 }
 
 fn emit_kai_call_seq(kb: KaiBuiltin, vals: [String]) : String = seq_call(cat2(kai_builtin_csym(kb), "("), vals, ")")
 
-fn emit_user_call_seq(csym: String, vals: [String], cx: EmitCtx) : String {
+fn emit_user_call_seq(fid: FnId, csym: String, vals: [String], cx: EmitCtx) : String {
   let q = seq_operands(vals)
-  seq_wrap(q, emit_user_call(csym, seq_joined(q), cx))
+  seq_wrap(q, emit_user_call(fid, csym, seq_joined(q), cx))
 }
 
-fn emit_user_call(csym: String, call_args: String, cx: EmitCtx) : String = {
+fn emit_user_call(fid: FnId, csym: String, call_args: String, cx: EmitCtx) : String = {
   # A donation-capable callee has a trailing `_donor` param; EVERY call to
   # it must fill that slot. A call inside an arm-top-reuse body (a live
   # `_arm_ru` token, signalled by `reuse_donor`) MOVES the token into the
@@ -2397,13 +2403,13 @@ fn emit_user_call(csym: String, call_args: String, cx: EmitCtx) : String = {
   # capable callee passes a null token; a non-capable callee is unchanged.
   # The move is always sound — whichever consumer runs first wins, the rest
   # see null and fresh-alloc — so no tail-position analysis is needed here.
-  if rd_is_capable(csym, cx.rd_capable) {
+  if rd_is_capable(fid, cx.rd_capable) {
     match cx.reuse_donor {
-      Some(_) -> rd_wrap_call(cat5(c_user_sym(csym), "(", emit_evf_call_arg(frame_slots_of(cx.evf, csym), call_args, cx), ")", ""))
-      None    -> cat5(c_user_sym(csym), "(", rd_join_null_donor(emit_evf_call_arg(frame_slots_of(cx.evf, csym), call_args, cx)), ")", "")
+      Some(_) -> rd_wrap_call(cat5(c_user_sym(csym), "(", emit_evf_call_arg(frame_slots_of(cx.evf, fid), call_args, cx), ")", ""))
+      None    -> cat5(c_user_sym(csym), "(", rd_join_null_donor(emit_evf_call_arg(frame_slots_of(cx.evf, fid), call_args, cx)), ")", "")
     }
   } else {
-    cat5(c_user_sym(csym), "(", emit_evf_call_arg(frame_slots_of(cx.evf, csym), call_args, cx), ")", "")
+    cat5(c_user_sym(csym), "(", emit_evf_call_arg(frame_slots_of(cx.evf, fid), call_args, cx), ")", "")
   }
 }
 
@@ -2418,17 +2424,17 @@ fn evf_join_args(frame_arg: String, rest: String) : String =
 # default node, else the live by-name walk (the thunk has no caller frame; the
 # node live at the indirect call is the ≤1-handler-correct one). Empty when the
 # callee carries no frame.
-fn emit_evf_thunk_frame(slots: [String], effs: [Decl], tab: SymTab) : String = match slots {
+fn emit_evf_thunk_frame(slots: [InstKey], effs: [Decl], tab: SymTab) : String = match slots {
   [] -> ""
   _  -> concat_all(["(KaiEvidence *[]){", join_with(map(slots, (e) => evf_thunk_slot(e, effs, tab)), ", "), "}"])
 }
 
-fn evf_thunk_slot(key: String, effs: [Decl], tab: SymTab) : String = {
-  let eff = inst_key_eff(key)
-  if effect_has_default_block(eff, effs, tab) {
-    concat_all(["kai_evidence_lookup_or_default(\"", key,
-                "\", &_kai_default_node_", string_to_lower_ascii(eff), ")"])
-  } else { evf_require_walk(key) }
+fn evf_thunk_slot(key: InstKey, effs: [Decl], tab: SymTab) : String = {
+  let label = inst_key_text(tab, key)
+  if effect_declares_default(effs, key.eff) {
+    concat_all(["kai_evidence_lookup_or_default(\"", label,
+                "\", &_kai_default_node_", string_to_lower_ascii(rt_name(tab, key.eff)), ")"])
+  } else { evf_require_walk(key.eff, label) }
 }
 
 # A non-default frame slot resolved by the dynamic walk: `kai_evidence_require`
@@ -2439,11 +2445,11 @@ fn evf_thunk_slot(key: String, effs: [Decl], tab: SymTab) : String = {
 # ops and is routed around the dispatcher, so its slot node legitimately carries
 # a NULL handler the FFI shim never dereferences — the bare lookup, not the
 # guard, preserves that.
-fn evf_require_walk(eff: String) : String =
-  if eff == "Ffi" { concat_all(["kai_evidence_lookup_node(\"", eff, "\")"]) }
+fn evf_require_walk(eff: SymId, label: String) : String =
+  if effect_is(eff, CeFfi) { concat_all(["kai_evidence_lookup_node(\"", label, "\")"]) }
   else {
-    concat_all(["kai_evidence_require(kai_evidence_lookup_node(\"", eff,
-                "\"), \"", eff, "\")"])
+    concat_all(["kai_evidence_require(kai_evidence_lookup_node(\"", label,
+                "\"), \"", label, "\")"])
   }
 
 fn emit_range_expr(src: String, from: Expr, to: Expr, opt_step: Option[Expr],
@@ -4708,6 +4714,13 @@ fn emit_fn_text(tab: SymTab, specs: SpecNames, f: FnId) : String =
   if fnid_inst(f) == spec_none() { written_text(decl_name(tab, fnid_sym(f))) }
   else { written_text(spec_text(specs, f)) }
 
+# The C symbol the function instance `f` is emitted under: its registry
+# entry's, which carries the module that declares it.
+fn emit_fn_c_sym(cx: EmitCtx, f: FnId) : String = match fnx_callee(cx.fx, f) {
+  Some(e) -> efn_c_sym(e)
+  None    -> emit_fn_text(cx.tab, cx.specs, f)
+}
+
 fn emit_match_default(src: String, scrut: Expr, arms: [Arm], cx: EmitCtx) : String / Console {
 
   # Borrowed scrutinee: emit the inner value and SKIP the exit decref —
@@ -5062,16 +5075,16 @@ fn emit_string_expr(src: String, span: String, is_triple: Bool, cx: EmitCtx) : S
 # expression is replaced with `kai_closure(&lam_symbol, arity,
 # n_caps, captures)`; the body is emitted as a separate function later.
 
-# A handle is identified by `(enc_fn, line, col)`, never by position
-# alone: two modules share a position, and so do two specialisations of
-# one generic fn. Keying this union on position alone merged unrelated
-# handles' captures into one env struct.
-fn handle_captures_at(cls: [ClauseInfo], enc: String, hline: Int, hcol: Int) : [Capture] {
+# A handle is identified by its enclosing unit and its position, never by
+# position alone: two modules share a position, and so do two
+# specialisations of one generic fn. Keying this union on position alone
+# merged unrelated handles' captures into one env struct.
+fn handle_captures_at(cls: [ClauseInfo], enc: EncFn, hline: Int, hcol: Int) : [Capture] {
   match cls {
     [] -> []
     [c, ...rest] -> {
       let k = clause_parts(c)
-      if k.line == hline and k.col == hcol and k.enc_fn == enc {
+      if k.line == hline and k.col == hcol and enc_same(k.enc_fn, enc) {
         merge_capture_set(k.caps, handle_captures_at(rest, enc, hline, hcol))
       } else {
         handle_captures_at(rest, enc, hline, hcol)
@@ -5082,7 +5095,7 @@ fn handle_captures_at(cls: [ClauseInfo], enc: String, hline: Int, hcol: Int) : [
 
 # A recorded clause by field: the one place this file reads `CI`'s layout.
 type ClauseParts = { line: Int, col: Int, eff: SymId, head: ClauseHead, params: [Param], body: Expr,
-                     stateful: Bool, enc_fn: String, caps: [Capture] }
+                     stateful: Bool, enc_fn: EncFn, caps: [Capture] }
 
 fn clause_parts(c: ClauseInfo) : ClauseParts = match c {
   CI(line, col, _, head, params, body, stateful, enc_fn, caps, _, eff) ->
@@ -5209,7 +5222,7 @@ fn emit_lam_helper(src: String, l: LamInfo, cx: EmitCtx) : String / Console {
       let body_lcs = list_append(list_append(cx.lcs, pnames), capture_locals(caps))
       let frame = unw_frame(cx.unw, cx.locals, pnames, pnames, body)
       let lam_cx = emit_ctx_with_unw(emit_ctx_with_lcs(cx, body_lcs), frame)
-      let body_c = emit_expr(src, body, emit_ctx_with_enc_fn(lam_cx, lam_symbol(l)))
+      let body_c = emit_expr(src, body, emit_ctx_with_enc_fn(lam_cx, lam_unit(l)))
       let tail = match params {
         [] -> concat_all(["    return ", body_c, ";\n}\n\n"])
         _  -> concat_all([
@@ -5233,7 +5246,7 @@ fn emit_lam_helpers(src: String, lams: [LamInfo], tab: SymTab, specs: SpecNames,
   # inside one fills a frame-carrying callee's evidence (the by-name walk
   # stays the fallback for any effect the frame does not carry).
   concat_all(map(lams, (l) => emit_lam_helper(src, l, EmitCtx { tab: tab, specs: specs, locals: ln_empty(), lcs: [], fns: fns, fx: fx, variants: variants, lams: lams, cls: cls,
-                                                                regions: [], in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: consts, effs: effs, ffi_reg: [], cur_enc_fn: "", recs: recs, stamps: stamps, core_ix: core_ix, ctor_ix: ctor_ix, evf: evf, rd_active: false, rd_capable: [], tcpend: [], unw: unw_frame_none(ucx), root_mod: root_mod })))
+                                                                regions: [], in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: consts, effs: effs, ffi_reg: [], cur_enc_fn: enc_none(), recs: recs, stamps: stamps, core_ix: core_ix, ctor_ix: ctor_ix, evf: evf, rd_active: false, rd_capable: [], tcpend: [], unw: unw_frame_none(ucx), root_mod: root_mod })))
 }
 
 fn emit_one_lam_forward(l: LamInfo) : String =
@@ -5262,7 +5275,7 @@ fn emit_clause_sig(c: ClauseInfo, effs: [Decl], tab: SymTab) : String {
     _  -> cat2(", ", join_with(map(op_args, (pm) => cat2("KaiValue *", c_local(written_text(pm.binder.name)))), ", "))
   }
   concat_all([
-    "static KaiValue *", user_clause_sym(k.enc_fn, k.line, k.col, op_name),
+    "static KaiValue *", user_clause_sym(k.enc_fn.sym, k.line, k.col, op_name),
     "(", ev_name_of(tab, effs, k.eff), " *self", arg_str, ", KaiCont *k)"
   ])
 }
@@ -5270,7 +5283,7 @@ fn emit_clause_sig(c: ClauseInfo, effs: [Decl], tab: SymTab) : String {
 fn emit_clause_forward(c: ClauseInfo, effs: [Decl], tab: SymTab) : String = {
   let k = clause_parts(c)
   if is_lifecycle_clause(k.head) {
-    cat2(emit_cleanup_sig(k.enc_fn, k.line, k.col), ";\n")
+    cat2(emit_cleanup_sig(k.enc_fn.sym, k.line, k.col), ";\n")
   } else { cat2(emit_clause_sig(c, effs, tab), ";\n") }
 }
 
@@ -5304,7 +5317,7 @@ fn emit_handle_env_typedefs_loop(cs: [ClauseInfo], seen: [String]) : String {
     [] -> ""
     [c, ...rest] -> {
       let k = clause_parts(c)
-      let key = handle_env_struct_name(k.enc_fn, k.line, k.col)
+      let key = handle_env_struct_name(k.enc_fn.sym, k.line, k.col)
       if list_has(seen, key) {
         emit_handle_env_typedefs_loop(rest, seen)
       } else {
@@ -5377,10 +5390,10 @@ fn emit_cleanup_thunk(src: String, c: ClauseInfo, cx: EmitCtx) : String / Consol
     "    ", evn, " *self = (", evn, " *) _self; (void) self;\n"
   ])
   concat_all([
-    emit_cleanup_sig(k.enc_fn, k.line, k.col), " {\n",
+    emit_cleanup_sig(k.enc_fn.sym, k.line, k.col), " {\n",
     self_bind,
     clause_state_prologue(k.stateful, cap_names),
-    emit_clause_env_prologue(ns, k.enc_fn, k.line, k.col, k.caps),
+    emit_clause_env_prologue(ns, k.enc_fn.sym, k.line, k.col, k.caps),
     "    return ", body_c, ";\n",
     "}\n\n"
   ])
@@ -5407,7 +5420,7 @@ fn emit_op_clause_body(src: String, c: ClauseInfo, cx: EmitCtx) : String / Conso
   let frame = unw_frame(cx.unw, scx.locals, owned, owned, k.body)
   let body_cx = emit_ctx_with_unw(emit_ctx_with_lcs(scx, list_append(scx.lcs, capture_locals(k.caps))), frame)
   let body_c = emit_expr_in_clause(src, k.body, body_cx, k.stateful)
-  let env_prologue = emit_clause_env_prologue(ns, k.enc_fn, k.line, k.col, k.caps)
+  let env_prologue = emit_clause_env_prologue(ns, k.enc_fn.sym, k.line, k.col, k.caps)
   concat_all([
     emit_clause_sig(c, cx.effs, cx.tab), " {\n",
     euw_with_fiber(frame.sites != [], "    (void) self; (void) k;\n    "),
@@ -5458,7 +5471,7 @@ fn emit_expr_in_clause(src: String, e: Expr, cx: EmitCtx, stateful: Bool) : Stri
   emit_expr(src, e, cx)
 
 fn emit_clause_bodies(src: String, cs: [ClauseInfo], cx: EmitCtx) : String / Console = {
-  concat_all(map(cs, (c) => emit_clause_body(src, c, emit_ctx_with_enc_fn(cx, clause_sym(c)))))
+  concat_all(map(cs, (c) => emit_clause_body(src, c, emit_ctx_with_enc_fn(cx, clause_unit(c)))))
 }
 
 # m7c-d — emit each clause as a top-level LLVM function. Mirrors
@@ -6208,7 +6221,7 @@ fn emit_kind_raw(src: String, x: Expr, cx: EmitCtx) : String / Console {
         [coll, ix] -> emit_fixed_vec_get_dyn(src, coll, ix, cx)
         _ -> fixed_vec_arity_mismatch(MkFixedVecGetDyn)
       }
-      EMark(MkTcrecStep(s)) -> tcrec_emit_goto(src, s.sym, s.dropmask, s.params, args_e, cx)
+      EMark(MkTcrecStep(s)) -> tcrec_emit_goto(src, s.fid, s.dropmask, s.params, args_e, cx)
       ESym(_, _) ->
         match emit_raw_rcore(src, callee_e, args_e, cx) {
           Some(s) -> s
@@ -6337,11 +6350,14 @@ fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option
       # RETURNS raw (a raw context cannot consume a boxed result).
       # Args are still marshalled per the mask — boxed params pass
       # `KaiValue *`, raw params pass scalars.
-      Some(EFn(n, _, mo, Some(US(ptys, rt, mask)), _)) ->
-        if ty_is_unboxable_t(rt) {
-          Some(emit_ufn_raw_call_go(src, f, c_sym(written_text(n), mo), args_e, mask, ptys, rt, cx))
-        } else { None }
-      _ -> None
+      Some(e) -> match e {
+        EFn(_, _, _, Some(US(ptys, rt, mask)), efid) ->
+          if ty_is_unboxable_t(rt) {
+            Some(emit_ufn_raw_call_go(src, f, efid, efn_c_sym(e), args_e, mask, ptys, rt, cx))
+          } else { None }
+        _ -> None
+      }
+      None -> None
     }
     _ -> None
   }
@@ -6351,15 +6367,15 @@ fn emit_ufn_raw_call(src: String, f: Expr, args_e: [Expr], cx: EmitCtx) : Option
 # `__perceus_owned_borrow` mark; else bind each marked arg to a temp,
 # call, and drop the temps after — the raw-context mirror of
 # emit_call_with_owned_borrow_drops.
-fn emit_ufn_raw_call_go(src: String, f: Expr, sym: String, args_e: [Expr], mask: [Bool], ptys: [Ty], rt: Ty, cx: EmitCtx) : String / Console {
+fn emit_ufn_raw_call_go(src: String, f: Expr, fid: FnId, sym: String, args_e: [Expr], mask: [Bool], ptys: [Ty], rt: Ty, cx: EmitCtx) : String / Console {
   if emit_args_have_owned_borrow(args_e) {
     let hold = emit_ob_hold(f, args_e, emit_ctx_declaring(cx, emit_ob_names(args_e, 0)))
     let binds = emit_ob_binds(src, args_e, 0, cx)
     let raw_vals = emit_arg_vals_masked(src, emit_ob_rewrite_args(args_e, 0), mask, ptys, hold.cx)
     let drops = emit_ob_drops(args_e, 0)
-    concat_all(["({ ", binds, hold.push, raw_c_type(Some(rt)), " _bcr = ", emit_user_call_seq(sym, raw_vals, hold.cx), "; ", hold.pop, drops, "_bcr; })"])
+    concat_all(["({ ", binds, hold.push, raw_c_type(Some(rt)), " _bcr = ", emit_user_call_seq(fid, sym, raw_vals, hold.cx), "; ", hold.pop, drops, "_bcr; })"])
   } else {
-    emit_user_call_seq(sym, emit_arg_vals_masked(src, args_e, mask, ptys, cx), cx)
+    emit_user_call_seq(fid, sym, emit_arg_vals_masked(src, args_e, mask, ptys, cx), cx)
   }
 }
 
@@ -6686,9 +6702,11 @@ fn emit_expr_boxed(src: String, x: Expr, cx: EmitCtx) : String / Console {
     # a shim; reaching it as an ordinary expression is a compiler bug.
     EExternBody(_, _) -> concat_all(["kai_core_panic(kai_str(\"extern body in expression position\"))"])
     EBang(inner) -> emit_bang(src, x, inner, cx)
-    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
-      emit_handle(src, body, ref_sym(eff), inst_key_of_tes(rt_ref_name(cx.tab, eff), eff_tyargs), init_opt, alias_opt,
+    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
+      let inst = inst_key_of_tes(ref_sym(eff), eff_tyargs)
+      emit_handle(src, body, HandleOf { inst: inst, label: key_of(rt_ref_name(cx.tab, eff), inst.args) }, init_opt, alias_opt,
                   clauses, ret_opt, x.line, x.col, x.site, cx)
+    }
     # m12.5: codegen erasure — `1.0<USD>` emits the same C as `1.0`.
     # Units are typer-only; the generated value carries no unit tag.
     ELitUnit(inner, _) -> emit_expr(src, inner, cx)
@@ -7031,25 +7049,30 @@ fn emit_bang(src: String, x: Expr, inner: Expr, cx: EmitCtx) : String / Console 
 # param or the stateful prologue's `kai_state`/`kai_log`) inside one block.
 fn alias_is_byid_cell(hsym: SymId) : Bool = effect_is(hsym, CeState) or effect_is(hsym, CeReader)
 
-fn emit_handle(src: String, body: Expr, hsym: SymId, key: String, init_opt: Option[Expr],
+# The instance a `handle` installs, and the label the run time knows it by.
+type HandleOf = { inst: InstKey, label: String }
+
+fn emit_handle(src: String, body: Expr, h: HandleOf, init_opt: Option[Expr],
                alias_opt: Option[Binder],
                clauses: [HClause],
                ret_opt: Option[HReturn], hline: Int, hcol: Int, hsite: Int,
                cx: EmitCtx) : String / Console {
 
-  let body_c = emit_expr(src, body, emit_ctx_with_evf(cx, frame_shadow(cx.evf, cx.cur_enc_fn, key)))
-  # The install site's own enclosing fn IS the handle's enc_fn — the
-  # collector stamped `cur_enc_fn` on every clause it recorded here — so
-  # the clause symbols resolve without a position lookup that would match
-  # a homonymous handle in another module.
-  let enc = cx.cur_enc_fn
+  let hsym = h.inst.eff
+  let key = h.label
+  let body_c = emit_expr(src, body, emit_ctx_with_evf(cx, frame_shadow(cx.evf, cx.cur_enc_fn, h.inst)))
+  # The install site's own enclosing unit IS the handle's — the collector
+  # stamped `cur_enc_fn` on every clause it recorded here — so the clause
+  # symbols resolve without a position lookup that would match a
+  # homonymous handle in another module.
+  let enc = cx.cur_enc_fn.sym
   let assigns = emit_clause_assignments(clauses, enc, hline, hcol)
   # R9: gather every name any clause body of this handle captures
   # from the surrounding scope. Filtered against `lcs` so a name that
   # is *not* in scope at the install site (e.g. a top-level fn that
   # `fv_expr` already excluded via `globals` — defensive) does not
   # produce an undefined assign.
-  let env_caps = list_filter_in(handle_captures_at(cx.cls, enc, hline, hcol), cx.lcs)
+  let env_caps = list_filter_in(handle_captures_at(cx.cls, cx.cur_enc_fn, hline, hcol), cx.lcs)
   let env_alloc = emit_handle_env_alloc(cx.locals, env_caps, enc, hline, hcol)
   let env_assign = emit_handle_env_ev_assign(env_caps)
   # An `as`-bound capability is exposed two ways inside the handle prologue:
@@ -7673,7 +7696,7 @@ fn emit_param_list_unboxed_each(params: [Param], tys: [Ty], acc: [String]) : [St
 # transported user effect takes `KaiEvidence **__evf` as its FIRST param
 # (the Koka evidence vector); the call site fills each slot. Empty when the
 # fn carries no transported effect (the legacy by-name walk serves it).
-fn evf_param_decl(slots: [String]) : String = match slots {
+fn evf_param_decl(slots: [InstKey]) : String = match slots {
   [] -> ""
   _  -> "KaiEvidence **__evf"
 }
@@ -7684,7 +7707,7 @@ fn evf_join_params(frame_decl: String, rest: String) : String =
   else if rest == "void" { frame_decl }
   else { concat_all([frame_decl, ", ", rest]) }
 
-fn emit_fn_signature_evf(name: String, params: [Param], slots: [String]) : String =
+fn emit_fn_signature_evf(name: String, params: [Param], slots: [InstKey]) : String =
   cat5("static KaiValue *", c_user_sym(name), "(", evf_join_params(evf_param_decl(slots), emit_param_list(params)), ")")
 
 fn emit_fn_signature(name: String, params: [Param]) : String =
@@ -7702,7 +7725,7 @@ fn emit_fn_signature_unboxed(name: String, params: [Param], sig: UFnSig) : Strin
 
 # Same as above but with the evidence-frame param prepended (the
 # pointer is orthogonal to arg/return unboxing — it rides as the first arg).
-fn emit_fn_signature_unboxed_evf(name: String, params: [Param], sig: UFnSig, slots: [String]) : String =
+fn emit_fn_signature_unboxed_evf(name: String, params: [Param], sig: UFnSig, slots: [InstKey]) : String =
   match sig {
     US(pts, rt, mask) -> concat_all([
       "static ", ufn_ret_c_type(rt),
@@ -7753,18 +7776,18 @@ fn emit_param_list_masked(params: [Param], tys: [Ty], mask: [Bool], acc: [String
   }
 }
 
-fn emit_fn_forward(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: EvFrames, capable: [String], const_syms: [String]) : String {
+fn emit_fn_forward(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: EvFrames, capable: [FnId], const_fns: [FnId]) : String {
   match d {
     DFn(_, fid, _, params, _, _, body, _, _, mo) -> {
       let sym = c_sym(emit_fn_text(tab, specs, fid), mo)
-      let slots = frame_slots_of(frames, sym)
+      let slots = frame_slots_of(frames, fid)
       # Match the definition's `_donor` suffix so the forward decl agrees —
       # keyed on the SAME capable set the def and call site use.
       let sig = rd_splice_param(match fnx_ufn_sig_first(fx, fid) {
         Some(us) -> emit_fn_signature_unboxed_evf(sym, params, us, slots)
         None     -> emit_fn_signature_evf(sym, params, slots)
-      }, rd_is_capable(sym, capable))
-      cat2(purity_const_prefix(sym, const_syms), cat2(sig, ";\n"))
+      }, rd_is_capable(fid, capable))
+      cat2(purity_const_prefix(fid, const_fns), cat2(sig, ";\n"))
     }
     _ -> ""
   }
@@ -7772,16 +7795,10 @@ fn emit_fn_forward(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: 
 
 # `KAI_CONST ` when the confirmation table proved this fn memory-clean,
 # else empty. The prefix must be IDENTICAL on the forward decl and the
-# definition (both go through this helper on the same `c_sym`), so `cc`
+# definition (both go through this helper on the same fn), so `cc`
 # never sees a mismatched declaration.
-fn purity_const_prefix(sym: String, const_syms: [String]) : String =
-  if ec_name_present(const_syms, sym) { "KAI_CONST " } else { "" }
-
-fn ec_name_present(xs: [String], t: String) : Bool = match xs {
-  [] -> false
-  [h, ...rest] -> if h == t { true } else { ec_name_present(rest, t) }
-  _ -> false
-}
+fn purity_const_prefix(fid: FnId, const_fns: [FnId]) : String =
+  if any(const_fns, (f) => fnid_eq(f, fid)) { "KAI_CONST " } else { "" }
 
 fn emit_thunk_forward(d: Decl, tab: SymTab, specs: SpecNames) : String {
   match d {
@@ -7791,13 +7808,13 @@ fn emit_thunk_forward(d: Decl, tab: SymTab, specs: SpecNames) : String {
   }
 }
 
-fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_syms: [String]) : String / Console {
+fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_fns: [FnId]) : String / Console {
 
   match d {
     DFn(_, fid, tps, params, ret_ty_opt, row, body, _, _, mo) -> {
       let name = emit_fn_text(cx.tab, cx.specs, fid)
       let opt_sig = fnx_ufn_sig_first(cx.fx, fid)
-      let evf_slots = frame_slots_of(cx.evf, c_sym(name, mo))
+      let evf_slots = frame_slots_of(cx.evf, fid)
       # Interprocedural reuse donation: a fn whose body rebuilds a variant
       # through a reuse arm takes a hidden `_donor` reuse-token param so an
       # out-of-line caller holding a live unconsumed token can donate it
@@ -7806,8 +7823,8 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_sy
       # definition, forward decl, thunk and call site never disagree. Under
       # separate compilation the set is empty (a cross-TU call cannot see the
       # body), so no fn takes `_donor` and every call site omits it.
-      let rd_cap = rd_is_capable(c_sym(name, mo), cx.rd_capable)
-      let sig = cat2(purity_const_prefix(c_sym(name, mo), const_syms), rd_splice_param(match opt_sig {
+      let rd_cap = rd_is_capable(fid, cx.rd_capable)
+      let sig = cat2(purity_const_prefix(fid, const_fns), rd_splice_param(match opt_sig {
         Some(us) -> emit_fn_signature_unboxed_evf(c_sym(name, mo), params, us, evf_slots)
         None     -> emit_fn_signature_evf(c_sym(name, mo), params, evf_slots)
       }, rd_cap))
@@ -7865,9 +7882,10 @@ fn emit_fn_body(src: String, d: Decl, cx: EmitCtx, body_fns_pre: [EFn], const_sy
         # mono) nor the per-ctor `.ty` (the brand does not survive the
         # unit normaliser on every ctor), so every ctor in the body routes.
         let body_in_region = cx.in_region or fn_has_region_brand(params, ret_ty_opt)
-        let frame = unw_fn_frame(cx.unw, locals, c_sym(name, mo), Some(row), unw_param_seeds(params, opt_sig, cx.unw.ucx), pids, body)
+        let enc = enc_of_fn(fid, c_sym(name, mo))
+        let frame = unw_fn_frame(cx.unw, locals, enc.unit, Some(row), unw_param_seeds(params, opt_sig, cx.unw.ucx), pids, body)
         let body_cx = EmitCtx { ...cx, locals: locals, lcs: body_lcs, fns: body_fns, in_region: body_in_region,
-                                hoisted: [], reuse_donor: None, kind1_raw: [], cur_enc_fn: c_sym(name, mo),
+                                hoisted: [], reuse_donor: None, kind1_raw: [], cur_enc_fn: enc,
                                 rd_active: rd_cap, tcpend: [], unw: frame }
         # Phase 3 unboxing — UFn body emits a raw return expression
         # whose value is the raw scalar matching `ret_ty`. The
@@ -8314,14 +8332,14 @@ fn emit_param_reads(params: [Param], start: Int) : String {
   }
 }
 
-fn emit_fn_thunk(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: EvFrames, effs: [Decl], capable: [String]) : String {
+fn emit_fn_thunk(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: EvFrames, effs: [Decl], capable: [FnId]) : String {
   match d {
     DFn(_, fid, _, params, opt_ret, _, body, _, _, mo) -> {
       let sym = c_sym(emit_fn_text(tab, specs, fid), mo)
       # A donation-capable fn has a trailing `_donor` param; the indirect
       # (closure) entry has no live token to donate, so it passes null.
       # Keyed on the same capable set as the def/forward/call site.
-      let rd_arg = if rd_is_capable(sym, capable) { concat_all([", ", rd_null_arg()]) } else { "" }
+      let rd_arg = if rd_is_capable(fid, capable) { concat_all([", ", rd_null_arg()]) } else { "" }
       let hdr = concat_all([
         "static KaiValue *", c_user_thunk_sym(sym),
         "(KaiValue *self, KaiValue **args, int n) {\n    (void) self; (void) n;\n"
@@ -8349,7 +8367,7 @@ fn emit_fn_thunk(d: Decl, tab: SymTab, specs: SpecNames, fx: FnIndex, frames: Ev
       # A thunk is the indirect (closure) entry; it has no
       # caller frame, so it fills the callee's frame from the live evidence
       # stack (a walk per slot — the ≤1-handler-correct node at the call).
-      let thunk_frame = emit_evf_thunk_frame(frame_slots_of(frames, sym), effs, tab)
+      let thunk_frame = emit_evf_thunk_frame(frame_slots_of(frames, fid), effs, tab)
       match fnx_ufn_sig_first(fx, fid) {
         Some(US(pts, rt, mask)) -> {
           # Mixed-param lane: raw slots unbox `args[i]` to `kair_<p>`,
@@ -8516,9 +8534,9 @@ fn emit_thunk_arg_list_masked(params: [Param], mask: [Bool], i: Int) : String {
 
 # ---- top-level passes ----
 
-fn fn_forward_decls(decls: [Decl], tab: SymTab, specs: SpecNames, fx: FnIndex, capable: [String], const_syms: [String], entry: SymId) : String = {
-  let frames = frames_index(build_evidence_frames(decls, tab, specs, entry))
-  concat_all(map(decls, (d) => emit_fn_forward(d, tab, specs, fx, frames, capable, const_syms)))
+fn fn_forward_decls(decls: [Decl], tab: SymTab, specs: SpecNames, fx: FnIndex, capable: [FnId], const_fns: [FnId], entry: SymId) : String = {
+  let frames = frames_index(build_evidence_frames(decls, entry))
+  concat_all(map(decls, (d) => emit_fn_forward(d, tab, specs, fx, frames, capable, const_fns)))
 }
 
 # Drop from the donation-capable set any fn whose body carries a TRMC
@@ -8526,18 +8544,18 @@ fn fn_forward_decls(decls: [Decl], tab: SymTab, specs: SpecNames, fx: FnIndex, c
 # would skip — a leak) or a raw unboxed return (the wrap casts through
 # `int64_t`, truncating a `double`/pointer). A reuse-variant-rotation fn is
 # neither, so this is a soundness fence over `rd_scan_capable`, not a live
-# behaviour change. Keyed on the module-mangled `c_sym` like the set itself.
-fn rd_donatable_filter(capable: [String], decls: [Decl], tab: SymTab, specs: SpecNames, fx: FnIndex) : [String] =
-  filter(capable, (csym) => rd_donatable_ok(csym, decls, tab, specs, fx))
+# behaviour change.
+fn rd_donatable_filter(capable: [FnId], decls: [Decl], fx: FnIndex) : [FnId] =
+  filter(capable, (f) => rd_donatable_ok(f, decls, fx))
 
-fn rd_donatable_ok(csym: String, decls: [Decl], tab: SymTab, specs: SpecNames, fx: FnIndex) : Bool = match decls {
+fn rd_donatable_ok(f: FnId, decls: [Decl], fx: FnIndex) : Bool = match decls {
   []           -> true
   [d, ...rest] -> match d {
-    DFn(_, fid, _, _, _, _, body, _, _, mo) ->
-      if c_sym(emit_fn_text(tab, specs, fid), mo) == csym {
+    DFn(_, fid, _, _, _, _, body, _, _, _) ->
+      if fnid_eq(fid, f) {
         not tcrec_body_has_sentinel(body) and not rd_decl_ret_is_raw(fid, fx)
-      } else { rd_donatable_ok(csym, rest, tab, specs, fx) }
-    _ -> rd_donatable_ok(csym, rest, tab, specs, fx)
+      } else { rd_donatable_ok(f, rest, fx) }
+    _ -> rd_donatable_ok(f, rest, fx)
   }
 }
 
@@ -8547,17 +8565,17 @@ fn rd_decl_ret_is_raw(fid: FnId, fx: FnIndex) : Bool =
 fn thunk_forward_decls(decls: [Decl], tab: SymTab, specs: SpecNames) : String =
   concat_all(map(decls, (d) => emit_thunk_forward(d, tab, specs)))
 
-fn fn_bodies(src: String, decls: [Decl], cx: EmitCtx, const_syms: [String]) : String / Console + Mutable =
-  sb_build(fn_bodies_loop(src, decls, cx, const_syms, sb_new()))
+fn fn_bodies(src: String, decls: [Decl], cx: EmitCtx, const_fns: [FnId]) : String / Console + Mutable =
+  sb_build(fn_bodies_loop(src, decls, cx, const_fns, sb_new()))
 
-fn fn_bodies_loop(src: String, decls: [Decl], cx: EmitCtx, const_syms: [String], b: SB) : SB / Console + Mutable = match decls {
+fn fn_bodies_loop(src: String, decls: [Decl], cx: EmitCtx, const_fns: [FnId], b: SB) : SB / Console + Mutable = match decls {
   [] -> b
   [d, ...rest] -> match d {
     DFn(_, _, _, _, _, _, _, _, _, _) -> {
-      let b1 = sb_append(sb_append(b, emit_fn_body(src, d, cx, cx.fns, const_syms)), emit_fn_thunk(d, cx.tab, cx.specs, cx.fx, cx.evf, cx.effs, cx.rd_capable))
-      fn_bodies_loop(src, rest, cx, const_syms, b1)
+      let b1 = sb_append(sb_append(b, emit_fn_body(src, d, cx, cx.fns, const_fns)), emit_fn_thunk(d, cx.tab, cx.specs, cx.fx, cx.evf, cx.effs, cx.rd_capable))
+      fn_bodies_loop(src, rest, cx, const_fns, b1)
     }
-    _ -> fn_bodies_loop(src, rest, cx, const_syms, b)
+    _ -> fn_bodies_loop(src, rest, cx, const_fns, b)
   }
 }
 
@@ -8565,15 +8583,14 @@ fn fn_bodies_loop(src: String, decls: [Decl], cx: EmitCtx, const_syms: [String],
 #      when test_mode is on) ----
 
 fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr, line: Int,
-                cx: EmitCtx, test_enc: String) : String / Console {
+                cx: EmitCtx, test_enc: EncFn) : String / Console {
 
   # desc_span is the raw source of the description including its quotes,
   # so it's already a valid C string literal. We wrap the body in
   # setjmp/longjmp: kai_assert_check inside the body can longjmp us out
   # on failure, and the test still counts as a tried test.
-  # `test_enc` is the runner symbol the collector stamped on this test's
-  # lambdas, so `find_lam` resolves them (a test body's lambda otherwise
-  # looked up under the wrong enc_fn → "non-callable").
+  # `test_enc` is the runner the collector stamped on this test's
+  # lambdas, so `find_lam` resolves them.
   let body_cx = EmitCtx { ...cx, locals: ln_with_expr(ln_empty(), body), hoisted: [], reuse_donor: None, kind1_raw: [], cur_enc_fn: test_enc }
   let body_c = emit_expr(src, body, body_cx)
   concat_all([
@@ -8604,7 +8621,7 @@ fn emit_one_test(src: String, cx: EmitCtx,
   match id_d {
     DWI(id, d) -> match d {
       DTest(desc_span, body, tl, tc, mo) ->
-        emit_test_fn(src, id, desc_span, body, tl, cx, runner_enc_fn("test", mo, tl, tc))
+        emit_test_fn(src, id, desc_span, body, tl, cx, runner_enc_fn(RkTest, mo, tl, tc))
       _ -> ""
     }
   }
@@ -8665,7 +8682,7 @@ fn test_register_line(dwi: DeclWithId) : String = match dwi {
 # panic the process, since timing aborted code is meaningless.
 
 fn emit_bench_fn(src: String, id: Int, desc_span: String, body: Expr,
-                 cx: EmitCtx, bench_enc: String) : String / Console {
+                 cx: EmitCtx, bench_enc: EncFn) : String / Console {
 
   let body_cx = EmitCtx { ...cx, locals: ln_with_expr(ln_empty(), body), hoisted: [], reuse_donor: None, kind1_raw: [], cur_enc_fn: bench_enc }
   let body_c = emit_expr(src, body, body_cx)
@@ -8703,7 +8720,7 @@ fn emit_one_bench(src: String, cx: EmitCtx,
   match id_d {
     DWI(id, d) -> match d {
       DBench(desc_span, body, bl, bc, mo) ->
-        emit_bench_fn(src, id, desc_span, body, cx, runner_enc_fn("bench", mo, bl, bc))
+        emit_bench_fn(src, id, desc_span, body, cx, runner_enc_fn(RkBench, mo, bl, bc))
       _ -> ""
     }
   }
@@ -9008,7 +9025,7 @@ fn emit_check_param_inits_assign(params: [Param], tab: SymTab) : String {
 }
 
 fn emit_check_fn(src: String, id: Int, desc_span: String, params: [Param], body: Expr,
-                 cx: EmitCtx, check_enc: String) : String / Console {
+                 cx: EmitCtx, check_enc: EncFn) : String / Console {
 
   let lcs2 = list_append(param_local_ids(params), cx.lcs)
   let body_cx = EmitCtx { ...cx, locals: ln_with_expr(ln_with_params(ln_empty(), params), body), lcs: lcs2,
@@ -9068,7 +9085,7 @@ fn emit_one_check(src: String, cx: EmitCtx,
   match id_d {
     DWI(id, d) -> match d {
       DCheck(desc_span, ps, body, cl, cc, mo) ->
-        emit_check_fn(src, id, desc_span, ps, body, cx, runner_enc_fn("check", mo, cl, cc))
+        emit_check_fn(src, id, desc_span, ps, body, cx, runner_enc_fn(RkCheck, mo, cl, cc))
       _ -> ""
     }
   }
@@ -9662,11 +9679,6 @@ fn default_node_global_for(d: Decl, decls: [Decl], ext: Bool, tab: SymTab) : Str
   _ -> ""
 }
 
-# `rt` is an effect's emitted name, as an evidence-frame slot key holds it.
-fn effect_has_default_block(rt: String, decls: [Decl], tab: SymTab) : Bool =
-  any(collect_effect_ids(decls), (s) => rt_name(tab, s) == rt and
-    (match find_effect_default_block(s, decls) { None -> false  Some(_) -> true }))
-
 # The bridge to a runtime C handler. An op argument reaches the handler as an
 # OWNED reference (the call site hands one over per op arg), and the shim is
 # where that reference is released: the C bodies borrow their args and incref
@@ -9722,40 +9734,7 @@ fn default_setup_assign_from_clause(eff_name: String, c: HClause) : String =
 # Every effect of `main_row` whose declaration carries a `default { }`
 # block bridged through `$extern_handler` is set up from that block.
 fn default_setups_for(main_row: [SymId], decls: [Decl], tab: SymTab) : String =
-  concat_all(map(default_install_order(main_row, tab), (eff) => default_setups_from_block(eff, decls, tab)))
-
-# The effects of `main_row` in install order: the builtin defaults in the
-# runtime's order, then the others in row order. It orders emitted text,
-# so it reads each effect's run-time name.
-fn default_install_order(main_row: [SymId], tab: SymTab) : [SymId] = {
-  let builtins = builtin_default_install_order()
-  list_append(default_builtins_in(builtins, main_row, tab),
-              filter(main_row, (s) => not list_has(builtins, rt_name(tab, s))))
-}
-
-fn default_builtins_in(order: [String], main_row: [SymId], tab: SymTab) : [SymId] = match order {
-  [] -> []
-  [name, ...rest] -> list_append(default_row_named(main_row, name, tab), default_builtins_in(rest, main_row, tab))
-}
-
-fn default_row_named(main_row: [SymId], name: String, tab: SymTab) : [SymId] = match main_row {
-  [] -> []
-  [s, ...rest] -> if rt_name(tab, s) == name { [s] } else { default_row_named(rest, name, tab) }
-}
-
-# Push order for default handlers — mirrors the historic hardcoded
-# arrangement so push/pop stays balanced and selfhost stays
-# byte-identical. Pops in `default_pops_for` walk this list in
-# reverse.
-
-# Push order for default handlers — mirrors the historic hardcoded
-# arrangement so push/pop stays balanced and selfhost stays
-# byte-identical. Pops in `default_pops_for` walk this list in
-# reverse.
-fn builtin_default_install_order() : [String] =
-  ["Stdout", "Stderr", "Stdin", "Env", "File", "Clock",
-   "Random", "SecureRandom", "NetTcp", "NetDns", "Signal", "Process", "Log",
-   "Mutable", "Cancel", "Link", "Monitor", "Spawn"]
+  concat_all(map(default_install_order(main_row), (eff) => default_setups_from_block(eff, decls, tab)))
 
 # Issue #115: aggregate the typed shim definitions for every
 # default handler that `default_setups_for` will install. Emitted
@@ -9777,7 +9756,7 @@ fn builtin_default_install_order() : [String] =
 # C compile error before the binary is produced (and well before
 # UBSan would otherwise catch the type mismatch at runtime).
 fn default_shims_for(main_row: [SymId], decls: [Decl], tab: SymTab) : String =
-  concat_all(map(default_install_order(main_row, tab), (eff) => default_shims_from_block(eff, decls, tab)))
+  concat_all(map(default_install_order(main_row), (eff) => default_shims_from_block(eff, decls, tab)))
 
 
 fn desugar_op_calls_decls(ds: [Decl], effs: [SymId]) : [Decl] =
@@ -9958,7 +9937,7 @@ fn desugar_interp_decls_loop(ds: [Decl], op_names: [String],
                            ts: if list_length(ts_coll) == 0 { None }
                                else { Some(ts_ctx(ts_coll, home, target, cores, scopes, global_mt, imps, [])) },
                            es: if list_length(es_coll) == 0 { None }
-                               else { Some(es_ctx(es_coll, home, target, cores, scopes, global_mt, tab, views)) },
+                               else { Some(es_ctx(home, target, scopes, global_mt, tab, views)) },
                            locals: [] }
       desugar_interp_decls_loop(rest, op_names, global_mt, scopes,
                                 coll, ts_coll, es_coll, tab, views, imps,
@@ -10439,10 +10418,10 @@ pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl],
   # change can never mix ABIs with cached entries.
   # `KAI_CONST` purity does not change the ABI and needs no such care.
   let fx = fnx_build_decls(decls, fns)
-  let rd_cap_set = rd_donatable_filter(rd_scan_capable(decls, tab, specs), decls, tab, specs, fx)
-  let const_syms = purity_const_syms(purity_analyze(decls, entry), tab, specs)
+  let rd_cap_set = rd_donatable_filter(rd_scan_capable(decls), decls, fx)
+  let const_fns = purity_const_fns(purity_analyze(decls, entry))
   let clause_fwd = emit_clause_forwards(clauses_info, effect_decls_only(decls), tab)
-  let fwd = fn_forward_decls(decls, tab, specs, fx, rd_cap_set, const_syms, entry)
+  let fwd = fn_forward_decls(decls, tab, specs, fx, rd_cap_set, const_fns, entry)
   let thunk_fwd = thunk_forward_decls(decls, tab, specs)
   let lam_fwd = emit_lam_forward_decls(lams)
   let default_ev_extern = emit_default_node_extern_decls(effect_decls_only(decls), tab)
@@ -10460,12 +10439,12 @@ pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl],
   # every TU (root and module) emits defs, thunks, and call sites keyed on
   # it, which is what keeps the `_donor` ABI link-consistent across `.o`s.
   let cx = EmitCtx { lcs: [], fns: fns, fx: fx, variants: variants, lams: lams, cls: clauses_info,
-                     regions: regions, in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls, tab), cur_enc_fn: "", recs: collect_records(decls), stamps: rec_stamps(decls, stamp_ids), core_ix: core_ix, ctor_ix: ctor_ix, evf: frames_index(build_evidence_frames(decls, tab, specs, entry)), rd_active: false, rd_capable: rd_cap_set, tcpend: [], unw: unw_frame_none(unw_cx(decls, clauses_info)), root_mod: target_origin, tab: tab, specs: specs, locals: ln_empty() }
+                     regions: regions, in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls, tab), cur_enc_fn: enc_none(), recs: collect_records(decls), stamps: rec_stamps(decls, stamp_ids), core_ix: core_ix, ctor_ix: ctor_ix, evf: frames_index(build_evidence_frames(decls, entry)), rd_active: false, rd_capable: rd_cap_set, tcpend: [], unw: unw_frame_none(unw_cx(decls, clauses_info)), root_mod: target_origin, tab: tab, specs: specs, locals: ln_empty() }
   # Root TU: root-file fn bodies + ALL lambdas/clauses + tests/benches/
   # checks + the main wrapper. Lambdas and clauses have no mo, so they
   # ride root — link-safe and complete.
   let root_decls = decls_of_origin(decls, None)
-  let root_bodies = fn_bodies(src, root_decls, cx, const_syms)
+  let root_bodies = fn_bodies(src, root_decls, cx, const_fns)
   let lam_bodies = emit_lam_helpers(src, lams, tab, specs, fns, cx.fx, variants, clauses_info, const_decls_only(decls), effect_decls_only(decls), collect_records(decls), cx.stamps, core_ix, cx.ctor_ix, cx.evf, cx.root_mod, cx.unw.ucx)
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
   let tests = emit_all_tests(src, decls, cx, target_origin)
@@ -10481,7 +10460,7 @@ pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl],
   # module's fn bodies. `fn_bodies` carries the `Console` effect, so we
   # fold with an explicit loop rather than `map` (which is pure).
   let mod_names = distinct_module_origins(decls)
-  let mto = emit_module_tus_loop(src, decls, mod_names, cx, const_syms,
+  let mto = emit_module_tus_loop(src, decls, mod_names, cx, const_fns,
                                  cached, cacheable, [], [])
   let mod_tus = match mto { MTO(tus, _) -> tus }
   let fresh_tus = match mto { MTO(_, fresh) -> fresh }
@@ -10505,22 +10484,22 @@ pub fn emit_program_modular_cached(file: String, src: String, raw_decls: [Decl],
 type ModTusOut = MTO([CModuleTU], [CTU])
 
 #[doc("Build one CModuleTU per module name, each carrying that module's mo-filtered fn bodies; a stem present in `cached` splices the cached body instead of emitting. Explicit loop (not map) because `fn_bodies` carries the Console effect.")]
-fn emit_module_tus_loop(src: String, decls: [Decl], mod_names: [String], cx: EmitCtx, const_syms: [String], cached: [CTU], cacheable: [String], acc: [CModuleTU], acc_fresh: [CTU]) : ModTusOut / Console + Mutable = match mod_names {
+fn emit_module_tus_loop(src: String, decls: [Decl], mod_names: [String], cx: EmitCtx, const_fns: [FnId], cached: [CTU], cacheable: [String], acc: [CModuleTU], acc_fresh: [CTU]) : ModTusOut / Console + Mutable = match mod_names {
   [] -> MTO(list_reverse(acc), list_reverse(acc_fresh))
   [m, ...rest] -> {
     let stem = tu_stem(Some(m))
     match ec_find(cached, stem) {
       Some(body) ->
-        emit_module_tus_loop(src, decls, rest, cx, const_syms, cached,
+        emit_module_tus_loop(src, decls, rest, cx, const_fns, cached,
                              cacheable,
                              [CModuleTU { stem: stem, body: body }, ...acc],
                              acc_fresh)
       None -> {
-        let body = fn_bodies(src, decls_of_origin(decls, Some(m)), cx, const_syms)
+        let body = fn_bodies(src, decls_of_origin(decls, Some(m)), cx, const_fns)
         let tu = CModuleTU { stem: stem, body: body }
         let fresh1 = if list_has(cacheable, m) { [CTU(stem, body), ...acc_fresh] }
                      else { acc_fresh }
-        emit_module_tus_loop(src, decls, rest, cx, const_syms, cached,
+        emit_module_tus_loop(src, decls, rest, cx, const_fns, cached,
                              cacheable, [tu, ...acc], fresh1)
       }
     }
@@ -10599,15 +10578,13 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], tab: SymTab, s
   # filter is a soundness fence, not a live change. Computed once, threaded
   # to the forward decls and the emit context.
   let fx = fnx_build_decls(decls, fns)
-  let rd_cap_set = rd_donatable_filter(rd_scan_capable(decls, tab, specs), decls, tab, specs, fx)
-  # Confirmed-purity symbols (#1139): the emitted `c_sym` of every fn
-  # whose lowered body is memory-clean, so the signature helper prefixes
-  # `KAI_CONST`. Computed once over the same decls the native backend
-  # sees; empty under separate compilation is fine (a cross-TU caller
-  # keeps the barrier). Same set drives the forward decl and the body.
-  let const_syms = purity_const_syms(purity_analyze(decls, entry), tab, specs)
+  let rd_cap_set = rd_donatable_filter(rd_scan_capable(decls), decls, fx)
+  # Every fn whose lowered body is memory-clean, so the signature helper
+  # prefixes `KAI_CONST`. Computed once over the same decls the native
+  # backend sees. Same set drives the forward decl and the body.
+  let const_fns = purity_const_fns(purity_analyze(decls, entry))
   let clause_fwd = emit_clause_forwards(clauses_info, effect_decls_only(decls), tab)
-  let fwd = fn_forward_decls(decls, tab, specs, fx, rd_cap_set, const_syms, entry)
+  let fwd = fn_forward_decls(decls, tab, specs, fx, rd_cap_set, const_fns, entry)
   let thunk_fwd = thunk_forward_decls(decls, tab, specs)
   let lam_fwd = emit_lam_forward_decls(lams)
   # Top-level emission runs with an empty lexical scope; each fn /
@@ -10624,8 +10601,8 @@ pub fn emit_program(file: String, src: String, raw_decls: [Decl], tab: SymTab, s
   # recursing, so the entry `lcs` is `[]`.
   let core_ix = core_ix_build()
   let cx = EmitCtx { lcs: [], fns: fns, fx: fx, variants: variants, lams: lams, cls: cls,
-                     regions: regions, in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls, tab), cur_enc_fn: "", recs: collect_records(decls), stamps: rec_stamps(decls, stamp_ids), core_ix: core_ix, ctor_ix: ctor_ix, evf: frames_index(build_evidence_frames(decls, tab, specs, entry)), rd_active: false, rd_capable: rd_cap_set, tcpend: [], unw: unw_frame_none(unw_cx(decls, clauses_info)), root_mod: target_origin, tab: tab, specs: specs, locals: ln_empty() }
-  let bodies = fn_bodies(src, decls, cx, const_syms)
+                     regions: regions, in_region: false, borrowed: [], hoisted: [], reuse_donor: None, kind1_raw: [], consts: const_decls_only(decls), effs: effect_decls_only(decls), ffi_reg: collect_extern_types(decls, tab), cur_enc_fn: enc_none(), recs: collect_records(decls), stamps: rec_stamps(decls, stamp_ids), core_ix: core_ix, ctor_ix: ctor_ix, evf: frames_index(build_evidence_frames(decls, entry)), rd_active: false, rd_capable: rd_cap_set, tcpend: [], unw: unw_frame_none(unw_cx(decls, clauses_info)), root_mod: target_origin, tab: tab, specs: specs, locals: ln_empty() }
+  let bodies = fn_bodies(src, decls, cx, const_fns)
   let lam_bodies = emit_lam_helpers(src, lams, tab, specs, fns, cx.fx, variants, cls, const_decls_only(decls), effect_decls_only(decls), collect_records(decls), cx.stamps, core_ix, cx.ctor_ix, cx.evf, cx.root_mod, cx.unw.ucx)
   let clause_bodies = emit_clause_bodies(src, clauses_info, cx)
   let tests = emit_all_tests(src, decls, cx, target_origin)
@@ -12476,8 +12453,8 @@ fn tcrec_walk_arms(arms: [Arm], me: SelfRef, arity: Int, cons_ok: Bool, tab: Sym
 # ---- m37 / TCO: self-tail-call rewrite ------------------------------
 #
 # Runs after `perceus_pass`. Each self-tail-call's callee is replaced with
-# a `MkTcrecStep` mark carrying what `emit_call_expr` needs: `sym` mints
-# the goto label `_kai_<sym>_entry`; bit `i` of `dropmask` drops param `i`
+# a `MkTcrecStep` mark carrying what `emit_call_expr` needs: `fid` is the
+# fn whose entry label the goto targets; bit `i` of `dropmask` drops param `i`
 # before the rebind, standing in for the exit drop the goto jumps past
 # (`tcrec_compute_site_dropmask`); `params` are the params in declaration
 # order.
@@ -12488,14 +12465,14 @@ pub fn tcrec_rewrite_decls(decls: [Decl], allow_trmc: Bool, cons_ok: Bool, root:
   # callee never took ownership. The borrow map is what separates that
   # from an owned pass, which releases through the callee.
   let bmap = pcs_planned_borrow_map(decls)
-  map(decls, (d) => tcrec_rewrite_decl(d, allow_trmc, cons_ok, bmap, tab, specs))
+  map(decls, (d) => tcrec_rewrite_decl(d, allow_trmc, cons_ok, bmap, tab))
 }
 
 # The body may arrive wrapped by perceus as `EBlock([entry..., SLet(__pcs_ret,
 # INNER), exit...], Some(ELocal(__pcs_ret)))`; `tcrec_rewrite_pcs_ret_wrap`
 # rewrites INNER and rebuilds the wrap. The wrap-less and entry-only shapes
 # need no unwrap: the walker descends through `EBlock(_, Some(tail))`.
-fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap, tab: SymTab, specs: SpecNames) : Decl / Console + Mutable {
+fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap, tab: SymTab) : Decl / Console + Mutable {
 
   match d {
     DFn(is_pub, fid, tparams, params, opt_ret, row, body, ln, cl, mo) -> {
@@ -12505,7 +12482,7 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap,
           EBlock(stmts, _) ->
             tcrec_rewrite_pcs_ret_wrap(d, is_pub, fid, tparams, params,
                                         opt_ret, row, body, stmts, ln, cl, mo,
-                                        arity, allow_trmc, cons_ok, bmap, tab, specs)
+                                        arity, allow_trmc, cons_ok, bmap, tab)
           _ -> d
         }
       } else {
@@ -12515,7 +12492,6 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap,
           let pnames = map(params, (p) => written_text(p.binder.name))
           let uses = pcs_use_index(body, pbs)
           {
-            let c_sym_str = c_sym(written_text(fn_emit_name(tab, specs, fid)), mo)
             # Skip-set aligned with pcs_pass's wrap-skip decisions: the
             # derived set under-approximates on a rewritten body (the
             # reuse recogniser replaces the cons the classifier judged
@@ -12551,10 +12527,10 @@ fn tcrec_rewrite_decl(d: Decl, allow_trmc: Bool, cons_ok: Bool, bmap: BorrowMap,
             # without the modulo-cons reuse-in-place the C backend gets).
             let new_body =
               if allow_trmc and trmc_row_is_affine(row) and trmc_body_has_modcons(body, SelfRef(fid), arity, cons_ok, tab) {
-                trmc_rewrite_body(body, SelfRef(fid), arity, c_sym_str,
+                trmc_rewrite_body(body, SelfRef(fid), arity, fid,
                                   params, pnames, uses, dm_table, skip_set, cons_ok, tab, ln_of_decl(d))
               } else {
-                tcrec_rewrite_body(body, SelfRef(fid), arity, c_sym_str,
+                tcrec_rewrite_body(body, SelfRef(fid), arity, fid,
                                    params, pnames, uses, dm_table, skip_set)
               }
             DFn(is_pub, fid, tparams, params, opt_ret, row, new_body, ln, cl, mo)
@@ -12642,7 +12618,7 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, fid: FnId,
                               body: Expr, stmts: [Stmt],
                               ln: Int, cl: Int, mo: Option[String],
                               arity: Int, allow_trmc: Bool, cons_ok: Bool,
-                              bmap: BorrowMap, tab: SymTab, specs: SpecNames) : Decl / Console + Mutable {
+                              bmap: BorrowMap, tab: SymTab) : Decl / Console + Mutable {
 
   match tcrec_find_pcs_ret_let(stmts, []) {
     None -> d
@@ -12661,7 +12637,6 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, fid: FnId,
           let pnames = map(params, (p) => written_text(p.binder.name))
           let uses = pcs_use_index(inner, pbs)
           {
-            let c_sym_str = c_sym(written_text(fn_emit_name(tab, specs, fid)), mo)
             # Skip-set aligned with pcs_pass's wrap-skip decisions —
             # widened with the params the rewriter left bare (raw
             # transfer), same as the non-wrap branch. Plus the planned
@@ -12680,10 +12655,10 @@ fn tcrec_rewrite_pcs_ret_wrap(d: Decl, is_pub: Bool, fid: FnId,
             let new_body =
               if is_trmc_inner {
                 let ns = ln_of_decl(d)
-                txd_plant_exit(ns, trmc_rewrite_body(inner, SelfRef(fid), arity, c_sym_str,
+                txd_plant_exit(ns, trmc_rewrite_body(inner, SelfRef(fid), arity, fid,
                                                      params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns), after)
               } else {
-                let new_inner = tcrec_rewrite_body(inner, SelfRef(fid), arity, c_sym_str,
+                let new_inner = tcrec_rewrite_body(inner, SelfRef(fid), arity, fid,
                                                     params, pnames, uses, dm_table, skip_set)
                 tcrec_rebuild_pcs_ret_wrap(body, before, new_inner, after)
               }
@@ -13140,11 +13115,11 @@ fn tcrec_lookup_dm(table: [TcrDm], line: Int, col: Int) : Int {
 # *per call site* by inspecting that site's args. Args are not
 # recursed into — they are non-tail and `emit_expr` evaluates
 # them normally on emit.
-fn tcrec_rewrite_body(body: Expr, me: SelfRef, arity: Int, c_sym_str: String,
+fn tcrec_rewrite_body(body: Expr, me: SelfRef, arity: Int, self_fn: FnId,
                       params: [Param], pnames: [String], uses: UseIx,
                       dm_table: [TcrDm], skip_set: [Binder]) : Expr =
   Expr { kind: tcrec_rewrite_kind(body.kind, body.line, body.col, me, arity,
-                                   c_sym_str, params, pnames, uses, dm_table, skip_set),
+                                   self_fn, params, pnames, uses, dm_table, skip_set),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
 
 fn trmc_expr_nth(xs: [Expr], i: Int) : Option[Expr] =
@@ -13198,12 +13173,12 @@ fn trmc_find_ret_let_rhs(stmts: [Stmt], ret: LocalId) : Option[Expr] {
 # threaded into the step is the same per-site dropmask the ordinary
 # tcrec uses, computed from the self-call's args; it reconciles
 # Perceus's exit-drops that the goto skips.
-fn trmc_rewrite_body(body0: Expr, me: SelfRef, arity: Int, c_sym_str: String,
+fn trmc_rewrite_body(body0: Expr, me: SelfRef, arity: Int, self_fn: FnId,
                      params: [Param], pnames: [String], uses: UseIx,
                      dm_table: [TcrDm], skip_set: [Binder], cons_ok: Bool, tab: SymTab, ns: LocalNames) : Expr {
   let body = trmc_unwrap_ret(body0)
   let out = Expr { kind: trmc_rewrite_kind(body.kind, body.line, body.col, me, arity,
-                                  c_sym_str, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns),
+                                  self_fn, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns),
          line: body.line, col: body.col, ty: body.ty, mode: body.mode,  site: body.site }
   txd_plant(ns, out, txd_wrap_drops(body0))
 }
@@ -13215,7 +13190,7 @@ fn trmc_rewrite_body(body0: Expr, me: SelfRef, arity: Int, c_sym_str: String,
 # dropmask discipline stays single-sourced. `ctor` is the constructor of
 # the cell, absent on a builtin cons.
 fn trmc_make_step_call(cname: String, ctor: SymId, args: [Expr], h: Int, line: Int, col: Int,
-                       c_sym_str: String, params: [Param], pnames: [String],
+                       self_fn: FnId, params: [Param], pnames: [String],
                        uses: UseIx, dm_table: [TcrDm], skip_set: [Binder]) : ExprKind {
   let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
   let self_e = trmc_expr_nth(args, h)
@@ -13224,28 +13199,28 @@ fn trmc_make_step_call(cname: String, ctor: SymId, args: [Expr], h: Int, line: I
     None     -> 0
   }
   let dropmask = base_mask + site_mask
-  let step = MkTrmcStep(TrmcStep { sym: c_sym_str, hole: h, cname: cname, ctor: ctor, dropmask: dropmask, params: pnames })
+  let step = MkTrmcStep(TrmcStep { fid: self_fn, hole: h, cname: cname, ctor: ctor, dropmask: dropmask, params: pnames })
   ECall(Expr { kind: EMark(step), line: line, col: col, ty: None, mode: MBoxed , site: 0 }, args)
 }
 
 fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
-                     c_sym_str: String, params: [Param], pnames: [String],
+                     self_fn: FnId, params: [Param], pnames: [String],
                      uses: UseIx, dm_table: [TcrDm], skip_set: [Binder], cons_ok: Bool, tab: SymTab, ns: LocalNames) : ExprKind {
   match k {
     EIf(c, t, opt_e) -> {
-      let t1 = trmc_rewrite_body(t, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)
+      let t1 = trmc_rewrite_body(t, me, arity, self_fn, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)
       let opt_e1 = match opt_e {
         None -> None
-        Some(e2) -> Some(trmc_rewrite_body(e2, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns))
+        Some(e2) -> Some(trmc_rewrite_body(e2, me, arity, self_fn, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns))
       }
       EIf(c, t1, opt_e1)
     }
     EMatch(s, arms) ->
-      EMatch(s, trmc_rewrite_arms(arms, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, [], cons_ok, tab, ns))
+      EMatch(s, trmc_rewrite_arms(arms, me, arity, self_fn, params, pnames, uses, dm_table, skip_set, [], cons_ok, tab, ns))
     EBlock(stmts, opt_tail) -> {
       match opt_tail {
         None -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
-        Some(e) -> EBlock(stmts, Some(trmc_rewrite_body(e, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)))
+        Some(e) -> EBlock(stmts, Some(trmc_rewrite_body(e, me, arity, self_fn, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)))
       }
     }
     # Builtin cons literal `[head, ...self(t)]` in tail position. The
@@ -13253,13 +13228,13 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
     EList(els) ->
       if cons_ok { match trmc_list_cons_modcons(els, me, arity) {
         Some(cargs) -> trmc_make_step_call(trmc_cons_cname(), sym_none(), cargs, 1, line, col,
-                                           c_sym_str, params, pnames, uses, dm_table, skip_set)
+                                           self_fn, params, pnames, uses, dm_table, skip_set)
         None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
       } } else { trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 }) }
     # A bare self-call beside a modulo-cons step is a loop step that leaves
     # the accumulator open, never a call whose result plugs the hole.
     ECall(f, xs) -> if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
-      tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, c_sym_str)
+      tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, self_fn)
     } else {
       # Tail-position ctor application: is it modulo-cons (user ctor or,
       # via perceus's reuse-cons rewrite, the builtin cons)?
@@ -13284,14 +13259,14 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
             None     -> 0
           }
           let dropmask = base_mask + site_mask
-          let step = MkTrmcStep(TrmcStep { sym: c_sym_str, hole: h, cname: written_text(decl_name(tab, csym)), ctor: csym, dropmask: dropmask, params: pnames })
+          let step = MkTrmcStep(TrmcStep { fid: self_fn, hole: h, cname: written_text(decl_name(tab, csym)), ctor: csym, dropmask: dropmask, params: pnames })
           ECall(Expr { kind: EMark(step), line: line, col: col, ty: f.ty, mode: f.mode , site: 0 }, xs)
         }
         None -> match trmc_reuse_variant_ctor(f, xs, me, arity, tab) {
           # A Perceus reuse rebuild of a modulo-cons ctor is that ctor's step:
           # the arm-top token hands the step the scrutinee's cell as its hole.
           Some(ctor) -> trmc_rewrite_kind(ctor.kind, ctor.line, ctor.col, me, arity,
-                                          c_sym_str, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)
+                                          self_fn, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)
           None -> {
           # Reuse-cons leaf: the mark over `(scr, head, self)`.
           let reuse = match f.kind {
@@ -13300,7 +13275,7 @@ fn trmc_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
           }
           match reuse {
             Some(cargs) -> trmc_make_step_call(trmc_cons_scr_cname(), sym_none(), cargs, 1, line, col,
-                                               c_sym_str, params, pnames, uses, dm_table, skip_set)
+                                               self_fn, params, pnames, uses, dm_table, skip_set)
             None        -> trmc_wrap_apply(Expr { kind: k, line: line, col: col, ty: None, mode: MBoxed , site: 0 })
           }
           }
@@ -13341,47 +13316,47 @@ fn trmc_wrap_apply(leaf: Expr) : ExprKind =
   ECall(Expr { kind: EMark(MkTrmcApply), line: leaf.line, col: leaf.col, ty: leaf.ty, mode: leaf.mode,  site: leaf.site },
         [leaf])
 
-fn trmc_rewrite_arms(arms: [Arm], me: SelfRef, arity: Int, c_sym_str: String,
+fn trmc_rewrite_arms(arms: [Arm], me: SelfRef, arity: Int, self_fn: FnId,
                      params: [Param], pnames: [String], uses: UseIx,
                      dm_table: [TcrDm], skip_set: [Binder], acc: [Arm], cons_ok: Bool, tab: SymTab, ns: LocalNames) : [Arm] {
   match arms {
     [] -> list_reverse(acc)
     [a, ...rest] -> match a {
       Arm(pat, opt_g, body) -> {
-        let new_body = trmc_rewrite_body(body, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)
-        trmc_rewrite_arms(rest, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set, [Arm(pat, opt_g, new_body), ...acc], cons_ok, tab, ns)
+        let new_body = trmc_rewrite_body(body, me, arity, self_fn, params, pnames, uses, dm_table, skip_set, cons_ok, tab, ns)
+        trmc_rewrite_arms(rest, me, arity, self_fn, params, pnames, uses, dm_table, skip_set, [Arm(pat, opt_g, new_body), ...acc], cons_ok, tab, ns)
       }
     }
   }
 }
 
 fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
-                      c_sym_str: String, params: [Param], pnames: [String],
+                      self_fn: FnId, params: [Param], pnames: [String],
                       uses: UseIx, dm_table: [TcrDm], skip_set: [Binder]) : ExprKind {
   match k {
     ECall(f, xs) ->
       if tcrec_callee_is_self(f, me) and list_length(xs) == arity {
         # The base mask is per-fn; the side-table mask is per-site and
         # never re-adds a base bit, so OR == ADD.
-        tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, c_sym_str)
+        tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, self_fn)
       } else { k }
     EIf(c, t, opt_e) -> {
-      let t1 = tcrec_rewrite_body(t, me, arity, c_sym_str, params, pnames, uses, dm_table, skip_set)
+      let t1 = tcrec_rewrite_body(t, me, arity, self_fn, params, pnames, uses, dm_table, skip_set)
       let opt_e1 = match opt_e {
         None -> None
-        Some(e2) -> Some(tcrec_rewrite_body(e2, me, arity, c_sym_str, params,
+        Some(e2) -> Some(tcrec_rewrite_body(e2, me, arity, self_fn, params,
                                             pnames, uses, dm_table, skip_set))
       }
       EIf(c, t1, opt_e1)
     }
     EMatch(s, arms) ->
-      EMatch(s, tcrec_rewrite_arms(arms, me, arity, c_sym_str, params, pnames,
+      EMatch(s, tcrec_rewrite_arms(arms, me, arity, self_fn, params, pnames,
                                     uses, dm_table, skip_set, []))
     EBlock(stmts, opt_tail) -> {
       match opt_tail {
         None -> k
         Some(e) ->
-          EBlock(stmts, Some(tcrec_rewrite_body(e, me, arity, c_sym_str, params,
+          EBlock(stmts, Some(tcrec_rewrite_body(e, me, arity, self_fn, params,
                                                  pnames, uses, dm_table, skip_set)))
       }
     }
@@ -13392,27 +13367,27 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, me: SelfRef, arity: Int,
 # Plant the goto step for one recognised self-call site.
 fn tcrec_make_step_site(f: Expr, xs: [Expr], params: [Param], pnames: [String],
                         uses: UseIx, dm_table: [TcrDm], skip_set: [Binder],
-                        c_sym_str: String) : ExprKind {
+                        self_fn: FnId) : ExprKind {
   let base_mask = tcrec_compute_site_dropmask(params, uses, skip_set, 0, 0)
   let site_mask = tcrec_lookup_dm(dm_table, f.line, f.col)
   let dropmask = base_mask + site_mask
-  let step = MkTcrecStep(TcrecStep { sym: c_sym_str, dropmask: dropmask, params: pnames })
+  let step = MkTcrecStep(TcrecStep { fid: self_fn, dropmask: dropmask, params: pnames })
   ECall(
     Expr { kind: EMark(step), line: f.line, col: f.col,
            ty: f.ty, mode: f.mode,  site: f.site },
     xs)
 }
 
-fn tcrec_rewrite_arms(arms: [Arm], me: SelfRef, arity: Int, c_sym_str: String,
+fn tcrec_rewrite_arms(arms: [Arm], me: SelfRef, arity: Int, self_fn: FnId,
                       params: [Param], pnames: [String], uses: UseIx,
                       dm_table: [TcrDm], skip_set: [Binder], acc: [Arm]) : [Arm] {
   match arms {
     [] -> list_reverse(acc)
     [a, ...rest] -> match a {
       Arm(pat, opt_g, body) -> {
-        let new_body = tcrec_rewrite_body(body, me, arity, c_sym_str, params,
+        let new_body = tcrec_rewrite_body(body, me, arity, self_fn, params,
                                           pnames, uses, dm_table, skip_set)
-        tcrec_rewrite_arms(rest, me, arity, c_sym_str, params, pnames, uses,
+        tcrec_rewrite_arms(rest, me, arity, self_fn, params, pnames, uses,
                            dm_table, skip_set, [Arm(pat, opt_g, new_body), ...acc])
       }
     }
@@ -13620,7 +13595,7 @@ fn emit_trmc_step(src: String, s: TrmcStep, args_e: [Expr], cx: EmitCtx) : Strin
   # Builtin cons modulo-cons step — the markers `__kai_cons` / `__kai_cons_s`
   # mean the node is a `kai_cons` cell, not a registered variant, so it takes
   # the cons-specific build path (hole at the cdr).
-  if s.cname == trmc_cons_cname() or s.cname == trmc_cons_scr_cname() { emit_trmc_cons_step(src, s.sym, s.dropmask, s.params, args_e, cx) }
+  if s.cname == trmc_cons_cname() or s.cname == trmc_cons_scr_cname() { emit_trmc_cons_step(src, s.fid, s.dropmask, s.params, args_e, cx) }
   else { emit_trmc_variant_step(src, s, args_e, cx) }
 }
 
@@ -13635,14 +13610,15 @@ fn emit_trmc_step(src: String, s: TrmcStep, args_e: [Expr], cx: EmitCtx) : Strin
 # Like the tcrec goto, the step leaves every enclosing match: after the args
 # are read it releases the ledger's pending entries they do not consume, the
 # scrutinees' exit decrefs among them.
-fn emit_trmc_cons_step(src: String, sym: String, dropmask: Int, pnames: [String],
+fn emit_trmc_cons_step(src: String, fid: FnId, dropmask: Int, pnames: [String],
                        args_e: [Expr], cx: EmitCtx) : String / Console {
+  let sym = emit_fn_c_sym(cx, fid)
   let head_c = match args_e { [h, _] -> emit_expr(src, h, cx) _ -> "kai_unit() /* trmc cons: bad args */" }
   let self_args = match args_e {
     [_, t] -> match t.kind { ECall(_, sa) -> sa _ -> [] }
     _      -> []
   }
-  let sig_opt  = fnx_ufn_by_csym(cx.fx, sym)
+  let sig_opt  = fnx_ufn_sig_first(cx.fx, fid)
   let arg_lets = match sig_opt {
     Some(US(pts, _, pmask)) -> tcrec_emit_arg_lets_masked(src, self_args, pts, pmask, 0, cx)
     None                    -> tcrec_emit_arg_lets(src, self_args, 0, cx)
@@ -13689,7 +13665,8 @@ fn trmc_row_kinds(row: Option[VariantEntry], n: Int) : Option[[Int]] = match row
 
 fn emit_trmc_variant_step(src: String, s: TrmcStep, args_e: [Expr],
                   cx: EmitCtx) : String / Console {
-  let sym = s.sym
+  let fid = s.fid
+  let sym = emit_fn_c_sym(cx, fid)
   let holeslot = s.hole
   let cname = s.cname
   let dropmask = s.dropmask
@@ -13716,7 +13693,7 @@ fn emit_trmc_variant_step(src: String, s: TrmcStep, args_e: [Expr],
   # the TRMC step rebinds `kai_<p>` (boxed prefix) for a param the
   # signature minted as `kair_<p>` (`undeclared identifier 'kai_k'`) —
   # the exact failure when mixed-sig and the TRMC+reuse path compose.
-  let sig_opt  = fnx_ufn_by_csym(cx.fx, sym)
+  let sig_opt  = fnx_ufn_sig_first(cx.fx, fid)
   let arg_lets = match sig_opt {
     Some(US(pts, _, pmask)) -> tcrec_emit_arg_lets_masked(src, self_args, pts, pmask, 0, cx)
     None                    -> tcrec_emit_arg_lets(src, self_args, 0, cx)
@@ -13935,14 +13912,15 @@ fn emit_trmc_int_slot(src: String, a: Expr, cx: EmitCtx) : String / Console =
 fn emit_trmc_real_slot(src: String, a: Expr, cx: EmitCtx) : String / Console =
   concat_all(["kai_take_real(", emit_expr(src, a, cx), ")"])
 
-fn tcrec_emit_goto(src: String, sym: String, dropmask: Int, pnames: [String],
+fn tcrec_emit_goto(src: String, fid: FnId, dropmask: Int, pnames: [String],
                    args_e: [Expr], cx: EmitCtx) : String / Console {
 
+  let sym = emit_fn_c_sym(cx, fid)
   # Phase 3 unboxing — when the recursive callee is a UFn, the
   # rebound parameters are raw scalars (`kair_<name>`) and the
   # arg values are evaluated as raw expressions. Drops collapse
   # to no-ops since raw scalars carry no reference count.
-  match fnx_ufn_by_csym(cx.fx, sym) {
+  match fnx_ufn_sig_first(cx.fx, fid) {
     Some(US(pts, rt, mask)) -> {
       # Mixed-param lane: params are a mix of raw scalars and boxed
       # pointers. Raw slots take raw `_tN` temporaries and are never

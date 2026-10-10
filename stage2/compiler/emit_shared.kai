@@ -68,6 +68,7 @@ import compiler.loop_lower
 import compiler.fnreg
 import compiler.fn_index
 import compiler.fn_csym
+import compiler.enc_unit
 import compiler.infer
 import compiler.parse
 import compiler.resolve
@@ -97,13 +98,23 @@ pub type VariantEntry = EV(Option[String], String, Int, [Int], Int)
 # A `test` / `bench` / `check` block has no name to derive a symbol from,
 # so its runner is keyed on the declaring module plus its source position:
 # position alone collides across modules, and the collision silently fuses
-# two blocks' lifted lambdas into one. The symbol doubles as the enclosing
-# fn of everything lifted out of the block's body (lambdas, clauses), so
-# the collector and both backends must mint it here rather than each
-# rebuilding the string.
-#[doc("The runner symbol for a `test`/`bench`/`check` block, keyed on its module and source position.")]
-pub fn runner_enc_fn(kind: String, mo: Option[String], line: Int, col: Int) : String =
-  concat_all(["__", kind, "__", c_sym(concat_all([int_to_string(line), "_", int_to_string(col)]), mo)])
+# two blocks' lifted lambdas into one. The runner is the unit everything
+# lifted out of the block's body sits in, so the collector and both
+# backends mint it here.
+#[doc("The runner of a `test`/`bench`/`check` block of module `mo` at a source position, and its symbol.")]
+pub fn runner_enc_fn(kind: RunnerKind, mo: Option[String], line: Int, col: Int) : EncFn =
+  EncFn { unit: EuRunner(kind, mo, line, col),
+          sym: concat_all(["__", runner_word(kind), "__", c_sym(concat_all([int_to_string(line), "_", int_to_string(col)]), mo)]) }
+
+fn runner_word(kind: RunnerKind) : String = match kind {
+  RkTest  -> "test"
+  RkBench -> "bench"
+  RkCheck -> "check"
+}
+
+#[doc("The unit of the function `fid` that module `mo` declares, under the symbol `tab` and `specs` emit it with.")]
+pub fn fn_enc(tab: SymTab, specs: SpecNames, fid: FnId, mo: Option[String]) : EncFn =
+  enc_of_fn(fid, c_sym(written_text(fn_emit_name(tab, specs, fid)), mo))
 
 # A user fn's own C symbol lives in the `kaiu_` namespace so it can be
 # named after any runtime helper without redeclaring it. `c_sym` stays the
@@ -743,26 +754,34 @@ pub fn pat_is_unboxable_lit_or_wild(p: Pattern) : Bool {
 # literal pattern. `EInt` → `<n>LL`, `EBool` → `0`/`1`,
 # `EChar` → numeric codepoint.
 
-# enc_fn (the post-monomorph, module-mangled symbol of the enclosing
-# fn / lambda) is the cross-module discriminator: `(line, col)` alone
-# collides when two modules have a lambda at the same source position,
-# so `find_lam` keys on `(enc_fn, line, col)`.
+# The enclosing unit is the cross-module discriminator: `(line, col)`
+# alone collides when two modules have a lambda at the same source
+# position, so `find_lam` keys on the unit and the position.
 #[doc("What a lifted body takes from the frame around it: the value of a local, or the handler id a cell alias names. The list order is the closure's capture array and a handle's env layout.")]
 pub type Capture = CapLocal(LocalId) | CapAlias(LocalId)
 
-#[doc("Lifted lambda descriptor (binder names of the enclosing declaration, enc_fn, line, col, params, captures, body, module) for closure emission.")]
-pub type LamInfo = LamInfo(LocalNames, String, Int, Int, [Param], [Capture], Expr, Option[String])
+#[doc("Lifted lambda descriptor (binder names of the enclosing declaration, enclosing unit, line, col, params, captures, body, module) for closure emission.")]
+pub type LamInfo = LamInfo(LocalNames, EncFn, Int, Int, [Param], [Capture], Expr, Option[String])
 
-# The lambda's C symbol derives from (enc_fn, line, col) — the same key
-# find_lam resolves — not from a program-global counter, so a lambda
-# added in one module cannot rename the lifted symbols of another.
-#[doc("C symbol of a lifted lambda at (enc_fn, line, col).")]
+# The lambda's C symbol derives from its enclosing unit's and its
+# position, not from a program-global counter, so a lambda added in one
+# module cannot rename the lifted symbols of another.
+#[doc("C symbol of a lifted lambda at a position inside the unit emitted as `enc_fn`.")]
 pub fn lam_symbol_at(enc_fn: String, line: Int, col: Int) : String =
   concat_all(["_kaiu_lam_", enc_fn, "_", int_to_string(line), "_", int_to_string(col)])
 
+#[doc("The unit of the lambda at a position inside `outer`, and its symbol.")]
+pub fn lam_enc(outer: EncFn, line: Int, col: Int) : EncFn =
+  EncFn { unit: EuLam(outer.unit, line, col), sym: lam_symbol_at(outer.sym, line, col) }
+
+#[doc("The unit a lifted lambda is.")]
+pub fn lam_unit(l: LamInfo) : EncFn = match l {
+  LamInfo(_, ef, ln, cl, _, _, _, _) -> lam_enc(ef, ln, cl)
+}
+
 #[doc("C symbol of a lifted lambda from its LamInfo.")]
 pub fn lam_symbol(l: LamInfo) : String = match l {
-  LamInfo(_, ef, ln, cl, _, _, _, _) -> lam_symbol_at(ef, ln, cl)
+  LamInfo(_, ef, ln, cl, _, _, _, _) -> lam_symbol_at(ef.sym, ln, cl)
 }
 
 #[doc("The binder names of the declaration a lifted lambda sits in: its body and its captures are spelled from them.")]
@@ -775,17 +794,28 @@ pub fn lam_locals(l: LamInfo) : LocalNames = match l {
 # share a position. The last param is the continuation. The captures are
 # what the handle's env threads in from its frame: the clause body is
 # free in them given its params and the state aliases it binds.
-#[doc("A handler clause lifted to a top-level function: (handle line, handle col, binder names of the enclosing declaration, head, params, body, stateful, enc_fn, captures, module, effect handled).")]
-pub type ClauseInfo = CI(Int, Int, LocalNames, ClauseHead, [Param], Expr, Bool, String, [Capture], Option[String], SymId)
+#[doc("A handler clause lifted to a top-level function: (handle line, handle col, binder names of the enclosing declaration, head, params, body, stateful, enclosing unit, captures, module, effect handled).")]
+pub type ClauseInfo = CI(Int, Int, LocalNames, ClauseHead, [Param], Expr, Bool, EncFn, [Capture], Option[String], SymId)
 
 #[doc("The symbol a handler clause's body lifts into; it is the enclosing fn of the lambdas and handles nested in that body.")]
 pub fn clause_body_sym(enc_fn: String, line: Int, col: Int, head: ClauseHead) : String =
   if is_lifecycle_clause(head) { user_cleanup_sym(enc_fn, line, col) }
   else { user_clause_sym(enc_fn, line, col, clause_head_word(head)) }
 
+#[doc("The unit a clause of the handle at a position inside `outer` lifts into, and its symbol: it is the enclosing unit of the lambdas and handles nested in the clause's body.")]
+pub fn clause_enc(outer: EncFn, line: Int, col: Int, head: ClauseHead) : EncFn =
+  EncFn { unit: if is_lifecycle_clause(head) { EuFinally(outer.unit, line, col) }
+                else { EuClause(outer.unit, line, col, clause_head_word(head)) },
+          sym: clause_body_sym(outer.sym, line, col, head) }
+
+#[doc("The unit a recorded clause's body lifts into.")]
+pub fn clause_unit(c: ClauseInfo) : EncFn = match c {
+  CI(line, col, _, head, _, _, _, enc_fn, _, _, _) -> clause_enc(enc_fn, line, col, head)
+}
+
 #[doc("The symbol a recorded clause's body lifts into.")]
 pub fn clause_sym(c: ClauseInfo) : String = match c {
-  CI(line, col, _, head, _, _, _, enc_fn, _, _, _) -> clause_body_sym(enc_fn, line, col, head)
+  CI(line, col, _, head, _, _, _, enc_fn, _, _, _) -> clause_body_sym(enc_fn.sym, line, col, head)
 }
 
 #[doc("The binder names of the declaration a recorded clause sits in.")]
@@ -808,13 +838,13 @@ pub fn clause_mo(c: ClauseInfo) : Option[String] = match c {
   CI(_, _, _, _, _, _, _, _, _, mo, _) -> mo
 }
 
-#[doc("Look up a lifted lambda by enclosing fn + source position. The (enc_fn, line, col) triple is unique even when two modules share a lambda at the same line/col.")]
-pub fn find_lam(lams: [LamInfo], enc_fn: String, line: Int, col: Int) : Option[LamInfo] {
+#[doc("Look up a lifted lambda by its enclosing unit and source position: unique even when two modules share a lambda at the same line/col.")]
+pub fn find_lam(lams: [LamInfo], enc_fn: EncFn, line: Int, col: Int) : Option[LamInfo] {
   match lams {
     [] -> None
     [l, ...rest] -> match l {
       LamInfo(_, ef, ln, cl, _, _, _, _) ->
-        if ef == enc_fn and ln == line and cl == col { Some(l) }
+        if ln == line and cl == col and enc_same(ef, enc_fn) { Some(l) }
         else { find_lam(rest, enc_fn, line, col) }
     }
   }
@@ -1183,20 +1213,20 @@ pub fn fv_interp_parts(parts: [IPart], own: [Binder], outer: FvOuter, acc: [Capt
 
 # ---- lambda collection pass ----
 
-# `cur_enc_fn` is the emitted symbol of the fn / lambda / clause / runner
-# the walker is inside: a handle stamps it on each clause it records, so
-# the install site and the clause body mint the same symbol. `cur_mo` is
+# `cur_enc_fn` is the fn / lambda / clause / runner the walker is inside:
+# a handle stamps it on each clause it records, so the install site and
+# the clause body mint the same symbol. `cur_mo` is
 # that fn's module, carried raw because a lifted body is emitted from a
 # side table with no declaration to read it off. `locals` names the
 # binders of the declaration being walked, for the lifted bodies' text.
-#[doc("Lambda-collect state: the lambdas and clauses lifted so far, the binders in scope at the walk position, the enclosing fn's symbol and module, the binder names of the declaration being walked, and the tables a fn's symbol is spelled from.")]
+#[doc("Lambda-collect state: the lambdas and clauses lifted so far, the binders in scope at the walk position, the enclosing unit and its module, the binder names of the declaration being walked, and the tables a fn's symbol is spelled from.")]
 pub type LamCollect = { lams: [LamInfo], clauses: [ClauseInfo],
-                    scope: FvOuter, cur_enc_fn: String, cur_mo: Option[String],
+                    scope: FvOuter, cur_enc_fn: EncFn, cur_mo: Option[String],
                     locals: LocalNames, tab: SymTab, specs: SpecNames }
 
 #[doc("Lambda-collect state helper: new. `tab` and `specs` spell each walked fn's symbol.")]
 pub fn lc_new(tab: SymTab, specs: SpecNames) : LamCollect =
-  LamCollect { lams: [], clauses: [], scope: fv_outer_empty(), cur_enc_fn: "", cur_mo: None,
+  LamCollect { lams: [], clauses: [], scope: fv_outer_empty(), cur_enc_fn: enc_none(), cur_mo: None,
                locals: ln_empty(), tab: tab, specs: specs }
 
 # Snapshot the scope at entry of a scope-introducing form (fn body,
@@ -1253,7 +1283,7 @@ pub fn collect_expr(x: Expr, st: LamCollect) : LamCollect / Console {
       let outer_scope = st.scope
       let st1 = LamCollect { ...st, lams: [info, ...st.lams],
                              scope: fv_outer_bind(outer_scope, own),
-                             cur_enc_fn: lam_symbol_at(outer_enc_fn, x.line, x.col) }
+                             cur_enc_fn: lam_enc(outer_enc_fn, x.line, x.col) }
       let st2 = collect_expr(body, st1)
       LamCollect { ...st2, scope: outer_scope, cur_enc_fn: outer_enc_fn, cur_mo: st.cur_mo }
     }
@@ -1331,9 +1361,9 @@ fn collect_loop_args(args_: [Expr], st: LamCollect) : LamCollect / Console = mat
   }
 }
 
-#[doc("Append one ClauseInfo per clause of the handle at (hline, hcol), which handles `esym` inside the fn `enc_fn`.")]
+#[doc("Append one ClauseInfo per clause of the handle at (hline, hcol), which handles `esym` inside the unit `enc_fn`.")]
 pub fn lc_record_clauses(cs: [HClause], esym: SymId, stateful: Bool,
-                     hline: Int, hcol: Int, enc_fn: String,
+                     hline: Int, hcol: Int, enc_fn: EncFn,
                      st: LamCollect) : LamCollect / Console {
 
   match cs {
@@ -1362,7 +1392,7 @@ pub fn collect_hclauses(cs: [HClause], hline: Int, hcol: Int, st: LamCollect) : 
     [c, ...rest] -> match c {
       HC(head, _, body, _, _) -> {
         let outer_enc_fn = st.cur_enc_fn
-        let body_st = enter_enc_fn(st, clause_body_sym(outer_enc_fn, hline, hcol, head), st.cur_mo)
+        let body_st = enter_enc_fn(st, clause_enc(outer_enc_fn, hline, hcol, head), st.cur_mo)
         collect_hclauses(rest, hline, hcol, restore_enc_fn(collect_expr(body, body_st), outer_enc_fn))
       }
     }
@@ -1491,21 +1521,21 @@ pub fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect / Conso
   }
 }
 
-# The walker swaps the enclosing fn's symbol on the way in and restores
-# the parent's on the way out, so siblings stamp their own clauses
-# against the right scope.
-#[doc("Enter the fn / lambda / clause / runner whose emitted symbol is `name`, declared by module `mo`.")]
-pub fn enter_enc_fn(st: LamCollect, name: String, mo: Option[String]) : LamCollect =
-  LamCollect { ...st, cur_enc_fn: name, cur_mo: mo }
+# The walker swaps the enclosing unit on the way in and restores the
+# parent's on the way out, so siblings stamp their own clauses against
+# the right scope.
+#[doc("Enter the fn / lambda / clause / runner `enc`, declared by module `mo`.")]
+pub fn enter_enc_fn(st: LamCollect, enc: EncFn, mo: Option[String]) : LamCollect =
+  LamCollect { ...st, cur_enc_fn: enc, cur_mo: mo }
 
-#[doc("Restore the enclosing-function name in clause-lookup state after a nested walk.")]
-pub fn restore_enc_fn(st: LamCollect, name: String) : LamCollect =
-  LamCollect { ...st, cur_enc_fn: name }
+#[doc("Restore the enclosing unit in clause-lookup state after a nested walk.")]
+pub fn restore_enc_fn(st: LamCollect, enc: EncFn) : LamCollect =
+  LamCollect { ...st, cur_enc_fn: enc }
 
 # Walk a fn / test / bench / check body under its symbol, restoring the
 # surrounding enclosing fn and lexical scope on the way out. The scope
 # starts from the body's own params: an outer local is not in scope.
-fn collect_body(body: Expr, params: [Binder], enc: String,
+fn collect_body(body: Expr, params: [Binder], enc: EncFn,
                 mo: Option[String], st: LamCollect) : LamCollect / Console {
   let outer = st.cur_enc_fn
   let outer_scope = st.scope
@@ -1525,17 +1555,17 @@ fn collect_decl_body(d: Decl, st: LamCollect) : LamCollect / Console {
 
   match d {
     DFn(_, fid, _, ps, _, _, body, _, _, mo) ->
-      collect_body(body, params_binders(ps), c_sym(written_text(fn_emit_name(st.tab, st.specs, fid)), mo), mo, st)
+      collect_body(body, params_binders(ps), fn_enc(st.tab, st.specs, fid, mo), mo, st)
     DType(_, _, _, _, _, _, _, _) -> st
-    # The runner symbol the backends will emit is also the enclosing-fn
-    # key for everything lifted out of the block's body, so the collector
-    # mints it from the same `runner_enc_fn` both backends call.
+    # The runner the backends will emit is also the enclosing unit of
+    # everything lifted out of the block's body, so the collector mints
+    # it from the same `runner_enc_fn` both backends call.
     DTest(_, body, line, col, mo) ->
-      collect_body(body, [], runner_enc_fn("test", mo, line, col), mo, st)
+      collect_body(body, [], runner_enc_fn(RkTest, mo, line, col), mo, st)
     DBench(_, body, line, col, mo) ->
-      collect_body(body, [], runner_enc_fn("bench", mo, line, col), mo, st)
+      collect_body(body, [], runner_enc_fn(RkBench, mo, line, col), mo, st)
     DCheck(_, ps, body, line, col, mo) ->
-      collect_body(body, params_binders(ps), runner_enc_fn("check", mo, line, col), mo, st)
+      collect_body(body, params_binders(ps), runner_enc_fn(RkCheck, mo, line, col), mo, st)
     DImport(_, _, _) -> st
     DEffect(_, _, _, _, _, _, _, _) -> st
     DProtocol(_, _, _, _, _, _, _) -> st
@@ -2312,8 +2342,7 @@ pub fn default_block_owner_sym(eff: SymId, decls: [Decl]) : SymId = match find_e
   None    -> sym_none()
 }
 
-# Issue #557 — strict variant of `effect_has_default_block` used for
-# main absorption: every clause must bridge to an `extern_handler`
+# The strict test main absorption uses: every clause must bridge to an `extern_handler`
 # intrinsic. Stage A's codegen only knows how to lower those — a
 # kaikai-bodied clause has no emitter path yet (Stage C). Treating
 # effects with kaikai-bodied defaults as absorbed would type-check

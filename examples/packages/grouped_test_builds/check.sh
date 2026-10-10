@@ -180,4 +180,43 @@ run stale
 [ "$(cat "$TMP/rc")" -ne 0 ] || fail "the importer's earlier check outlived the edit to the imported main"
 grep -qF "$imported_main" "$TMP/err" || fail "the importer checked again did not say the main is imported"
 
+# 13 — two test files that each declare an effect and a type of one name keep
+# them apart in the shared build: each handler answers its own file's effect.
+mk_pkg twins
+cat > "$TMP/twins/tests/a_test.kai" <<'EOF'
+effect Log {
+  say(s: String) : Int
+}
+
+type Item = { n: Int }
+
+fn use_log() : Int / Log = Log.say("alpha")
+
+test "a handles its own Log" {
+  let it = Item { n: 1 }
+  let r = handle { use_log() } with Log { say(s, resume) -> resume(string_length(s) + it.n) }
+  assert r == 6
+}
+EOF
+cat > "$TMP/twins/tests/b_test.kai" <<'EOF'
+effect Log {
+  say(s: String, n: Int) : String
+}
+
+type Item = { name: String }
+
+fn use_log() : String / Log = Log.say("beta", 2)
+
+test "b handles its own Log" {
+  let it = Item { name: "!" }
+  let r = handle { use_log() } with Log { say(s, n, resume) -> resume("#{s}#{n}#{it.name}") }
+  assert r == "beta2!"
+}
+EOF
+run twins
+[ "$(cat "$TMP/rc")" -eq 0 ] || { cat "$TMP/err"; fail "test files declaring one effect name did not pass together"; }
+for t in a b; do
+  grep -q "ok   $t handles its own Log" "$TMP/err" || fail "the block of ${t}_test that handles its own Log did not pass"
+done
+
 echo "grouped_test_builds: OK"

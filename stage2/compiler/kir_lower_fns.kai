@@ -24,6 +24,7 @@ import compiler.fn_index
 import compiler.core_prims
 import compiler.fn_csym
 import compiler.emit_shared
+import compiler.enc_unit
 import compiler.emit_reuse_donate
 import compiler.ffi_v2
 import compiler.region
@@ -61,9 +62,9 @@ pub fn lower_to_kir(raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: Proto
   # (narrower than a LowerSt field).
   let freg    = collect_extern_types(raw_decls, tab)
   # Donation-capable fns — the SAME structural scan the C backend runs
-  # (`emit_reuse_donate`), keyed on the mangled symbol, so both backends
-  # pick one capable set and the reuse ABI cannot diverge between them.
-  let capable = rd_scan_capable(raw_decls, tab, specs)
+  # (`emit_reuse_donate`), so both backends pick one capable set and the
+  # reuse ABI cannot diverge between them.
+  let capable = rd_scan_capable(raw_decls)
   let kfns    = lower_fns(raw_decls, st0, freg, capable, entry, [])
   # Each lifted lambda becomes a top-level `KFnLambda`, and each handler
   # clause a `KFnClause` (mirror of emit_c's `emit_lam_helpers` /
@@ -81,8 +82,8 @@ pub fn lower_to_kir(raw_decls: [Decl], tab: SymTab, specs: SpecNames, ids: Proto
              fns: list_append(kfns, list_append(lamfns, list_append(clsfns, rs.fns))),
              handlers: canon_handler_op_order(lower_handler_decls(lc.clauses, lc.clauses, []), raw_decls),
              install_order: kir_install_order(raw_decls, tab, entry),
-             defaults: kir_default_handlers(raw_decls, tab, entry),
-             runner_defaults: kir_runner_default_handlers(raw_decls, tab),
+             defaults: kir_default_handlers(raw_decls, entry),
+             runner_defaults: kir_runner_default_handlers(raw_decls),
              synth_defaults: kir_synth_handler_effects(raw_decls, tab),
              regions: lower_regions(regions, []), runners: rs.runners, entry: entry, tab: tab, specs: specs,
              reuse_tags: reusable_tags(raw_decls, ids, ctors, entry) }
@@ -114,23 +115,25 @@ fn lower_runner_loop(decls: [Decl], st: LowerSt, freg: [ExternTypeReg],
   [] -> RunnerLower { fns: list_reverse(fns_acc), runners: list_reverse(run_acc) }
   [d, ...rest] -> match d {
     DTest(desc, body, line, col, mo) -> {
-      # The sym IS the runner enc_fn the lambda collector stamped on this
-      # body's lambdas, so `find_lam` resolves a lambda inside the test
-      # body (a bare `_kai_test_<i>` sym would leave it "non-callable").
-      let sym = runner_enc_fn("test", mo, line, col)
-      let kfn = lower_fn(FnHead { name: sym, usig: None, locals: ln_of_decl(d) }, [], None, None, body, None, body_fns, st, freg, false, false)
+      # The runner is the unit the lambda collector stamped on this body's
+      # lambdas, so `find_lam` resolves a lambda inside the test body.
+      let enc = runner_enc_fn(RkTest, mo, line, col)
+      let sym = enc.sym
+      let kfn = lower_fn(FnHead { name: sym, enc: enc, usig: None, locals: ln_of_decl(d) }, [], None, None, body, None, body_fns, st, freg, false, false)
       let r = KRunner { sym: sym, desc: desc, kind: KRTest, line: line, home: runner_home(mo) }
       lower_runner_loop(rest, st, freg, body_fns, ti + 1, bi, [kfn, ...fns_acc], [r, ...run_acc])
     }
     DBench(desc, body, line, col, mo) -> {
-      let sym = runner_enc_fn("bench", mo, line, col)
-      let kfn = lower_fn(FnHead { name: sym, usig: None, locals: ln_of_decl(d) }, [], None, None, body, None, body_fns, st, freg, false, false)
+      let enc = runner_enc_fn(RkBench, mo, line, col)
+      let sym = enc.sym
+      let kfn = lower_fn(FnHead { name: sym, enc: enc, usig: None, locals: ln_of_decl(d) }, [], None, None, body, None, body_fns, st, freg, false, false)
       let r = KRunner { sym: sym, desc: desc, kind: KRBench, line: line, home: runner_home(mo) }
       lower_runner_loop(rest, st, freg, body_fns, ti, bi + 1, [kfn, ...fns_acc], [r, ...run_acc])
     }
     DCheck(desc, ps, body, line, col, mo) -> {
-      let sym = runner_enc_fn("check", mo, line, col)
-      let kfn = lower_fn(FnHead { name: sym, usig: None, locals: ln_of_decl(d) }, ps, None, None, body, None, body_fns, st, freg, false, false)
+      let enc = runner_enc_fn(RkCheck, mo, line, col)
+      let sym = enc.sym
+      let kfn = lower_fn(FnHead { name: sym, enc: enc, usig: None, locals: ln_of_decl(d) }, ps, None, None, body, None, body_fns, st, freg, false, false)
       let r = KRunner { sym: sym, desc: desc, kind: KRCheck(check_param_specs(st.tab, ps)), line: line, home: runner_home(mo) }
       lower_runner_loop(rest, st, freg, body_fns, ti, bi, [kfn, ...fns_acc], [r, ...run_acc])
     }
@@ -164,7 +167,7 @@ fn type_ref_label(tab: SymTab, r: DeclRef) : String = match r {
 
 # --- Ordinary functions -------------------------------------------------
 
-fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], capable: [String], entry: SymId, acc: [KFn]) : [KFn] / Console = match ds {
+fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], capable: [FnId], entry: SymId, acc: [KFn]) : [KFn] / Console = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> match d {
     DFn(_, fid, _, params, ret_ty, row, body, _, _, _) -> {
@@ -176,8 +179,8 @@ fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], capable: [String], 
       # The entry point never takes the donor param: the runtime calls it
       # directly, outside the donor-aware call funnel.
       let ent = is_entry(entry, fid)
-      let dn = not ent and rd_is_capable(c_sym(name, mo), capable)
-      let head = FnHead { name: name, usig: fnx_ufn_sig_first(st.fx, fid), locals: ln_of_decl(d) }
+      let dn = not ent and rd_is_capable(fid, capable)
+      let head = FnHead { name: name, enc: enc_of_fn(fid, c_sym(name, mo)), usig: fnx_ufn_sig_first(st.fx, fid), locals: ln_of_decl(d) }
       let kfn = lower_fn(head, params, ret_ty, Some(row), body, mo, st.fns, st, freg, dn, ent)
       lower_fns(rest, st, freg, capable, entry, [kfn, ...acc])
     }
@@ -186,8 +189,9 @@ fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], capable: [String], 
 }
 
 # What `lower_fn` is told about the fn it lowers: the name it is emitted
-# under, its unboxed signature, and its binders.
-type FnHead = { name: String, usig: Option[UFnSig], locals: LocalNames }
+# under, the unit it is and its symbol, its unboxed signature, and its
+# binders.
+type FnHead = { name: String, enc: EncFn, usig: Option[UFnSig], locals: LocalNames }
 
 # Lower one function to a KFn. Counters reset (Risk 2b); the enclosing-fn
 # key is the fn's own symbol so nested lambdas resolve to their LamInfo.
@@ -196,10 +200,10 @@ type FnHead = { name: String, usig: Option[UFnSig], locals: LocalNames }
 fn lower_fn(head: FnHead, params: [Param], ret_ty: Option[TypeExpr], row: Option[RowExpr],
             body: Expr, mo: Option[String], body_fns: [EFn], st0: LowerSt, freg: [ExternTypeReg], dn: Bool, ent: Bool) : KFn / Console {
   let name = head.name
-  let sym = c_sym(name, mo)
+  let sym = head.enc.sym
   # Enter WITH the EFn table already rotated to prefer `mo` (this fn's
   # module) by the cached `lower_fns` loop.
-  let st1 = ls_enter_fn_with(st0, sym, param_regs(params, []), head.locals, body_fns)
+  let st1 = ls_enter_fn_with(st0, head.enc, param_regs(params, []), head.locals, body_fns)
   # P3 raw scalar params: resolve this fn's UFnSig (the classifier already
   # applied the no-tparams / no-FFI / no-effect-row gates and computed the
   # per-param `raw_mask`). A `Some(US(...))` lowers each raw param to its
@@ -209,7 +213,7 @@ fn lower_fn(head: FnHead, params: [Param], ret_ty: Option[TypeExpr], row: Option
   # The unbox pass reads the SAME mask (`ufn_param_env`), so the body's raw
   # param reads and these slots can never disagree.
   let usig = head.usig
-  let st = kir_unw_enter(ls_with_unw(st1, unw_fn_frame(st1.unw, st1.locals, sym, row, unw_param_seeds(params, usig, st1.unw.ucx),
+  let st = kir_unw_enter(ls_with_unw(st1, unw_fn_frame(st1.unw, st1.locals, head.enc.unit, row, unw_param_seeds(params, usig, st1.unw.ucx),
                                                         param_ids(params), body)))
   let kparams = lower_params_sig(params, usig)
   # An `extern "C" fn` (issue #260) lowers to a DFn whose body is the magic
@@ -233,7 +237,7 @@ fn lower_fn(head: FnHead, params: [Param], ret_ty: Option[TypeExpr], row: Option
     let c_symbol = ffi_extern_symbol_of(body, name)
     KFn { sym: ffi_wrapper_sym(name, mo), kind: KFnFfi(c_symbol, ffi_param_kinds(params, freg, st.tab), kffi_kind_of_ret(ret_ty, freg, st.tab)),
           params: kparams, ret: slot_of_ty(ret_ty), blocks: [],
-          region_id: None, stateful: false, mo: mo, donor: false, entry: false }
+          region_id: None, stateful: false, mo: mo, donor: false, entry: false, fid: enc_fn_id(head.enc) }
   } else {
     # A `__proto_<op>` dispatcher's body is an `ETodo` marker that the shared
     # lowering would otherwise reduce to a panic stub (the native path then
@@ -262,7 +266,7 @@ fn lower_fn(head: FnHead, params: [Param], ret_ty: Option[TypeExpr], row: Option
     match r {
       LRes(val, st1) -> KFn { sym: sym, kind: KFnNormal, params: kparams,
                               ret: ret_slot, blocks: ls_finish(st1, KRet(val, kpos_of(body))),
-                              region_id: None, stateful: false, mo: mo, donor: dn, entry: ent }
+                              region_id: None, stateful: false, mo: mo, donor: dn, entry: ent, fid: enc_fn_id(head.enc) }
     }
   }
 }
@@ -270,7 +274,7 @@ fn lower_fn(head: FnHead, params: [Param], ret_ty: Option[TypeExpr], row: Option
 # The fn a declared core builtin's declaration emits, so the builtin is a
 # value through its thunk: it hands its owned params to the native entry.
 fn lower_kai_forwarder(body: Expr, name: String, params: [Param], st: LowerSt) : LRes / Console =
-  lower_direct_call(body, core_native_call_sym(name),
+  lower_direct_call(body, core_native_call_sym(name), None,
                     map(params, (p) => mk_local(p.binder.id, body.line, body.col)), st)
 
 # The KIR FFI marshalling kind of each `extern "C" fn` param, in
@@ -396,7 +400,7 @@ fn lower_lam_fn(l: LamInfo, st0: LowerSt, body_fns: [EFn]) : KFn / Console = mat
     let sym = lam_symbol(l)
     let locals = kir_body_locals(lam_locals(l))
     let pids = param_ids(params)
-    let st = kir_unw_enter(ls_with_unw(ls_enter_fn_with(st0, sym, param_regs(params, capture_names(caps, locals)), locals, body_fns),
+    let st = kir_unw_enter(ls_with_unw(ls_enter_fn_with(st0, lam_unit(l), param_regs(params, capture_names(caps, locals)), locals, body_fns),
                                        unw_frame(st0.unw, locals, pids, pids, body)))
     let kparams = list_append(lower_params(params, []), lower_captures(caps, locals, 0, []))
     match lower_expr(body, st) { LRes(val, st1) -> {
@@ -409,7 +413,7 @@ fn lower_lam_fn(l: LamInfo, st0: LowerSt, body_fns: [EFn]) : KFn / Console = mat
       let st2 = lam_drop_params(params, st1)
       KFn { sym: sym, kind: KFnLambda, params: kparams, ret: SBoxed,
             blocks: ls_finish(st2, KRet(val, kpos_of(body))), region_id: None,
-            stateful: false, mo: None, donor: false, entry: false } } }
+            stateful: false, mo: None, donor: false, entry: false, fid: fnid_none() } } }
   }
 }
 
@@ -463,17 +467,17 @@ fn list_index_of_str(xs: [String], s: String, i: Int) : Int = match xs {
   [h, ...rest] -> if h == s { i } else { list_index_of_str(rest, s, i + 1) }
 }
 
-# The cross-clause union of every clause's captures for the handle pinned
-# at (enc_fn, line, col) — mirror of emit_c's `handle_captures_at`. The
-# enclosing fn is part of the key: position alone merges the captures of
-# two unrelated handles that happen to share a line and column. Stable
+# The cross-clause union of every clause's captures for the handle at a
+# position inside the unit `enc` — mirror of emit_c's `handle_captures_at`.
+# The enclosing unit is part of the key: position alone merges the captures
+# of two unrelated handles that happen to share a line and column. Stable
 # "first-occurrence-wins" order, shared by the install (env fill) and the
 # clause prologue (env index) so both agree by construction.
-fn kir_handle_captures_at(cls: [ClauseInfo], enc: String, hline: Int, hcol: Int) : [String] = match cls {
+fn kir_handle_captures_at(cls: [ClauseInfo], enc: EncFn, hline: Int, hcol: Int) : [String] = match cls {
   [] -> []
   [c, ...rest] -> match c {
     CI(line, col, _, _, _, _, _, enc_fn, caps, _, _) ->
-      if line == hline and col == hcol and enc_fn == enc {
+      if line == hline and col == hcol and enc_same(enc_fn, enc) {
         kir_merge_str_set(capture_names(caps, kir_body_locals(clause_locals(c))), kir_handle_captures_at(rest, enc, hline, hcol))
       } else {
         kir_handle_captures_at(rest, enc, hline, hcol)
@@ -525,7 +529,7 @@ fn lower_clause_fn(c: ClauseInfo, all_cls: [ClauseInfo], st0: LowerSt, body_fns:
     let locals = kir_body_locals(clause_locals(c))
     let cnames = capture_names(caps, locals)
     let owned = if is_fin { [] } else { unw_clause_seeds(c) }
-    let st = kir_unw_enter(ls_with_unw(ls_enter_fn_with(st0, sym, param_regs(params, cnames), locals, body_fns),
+    let st = kir_unw_enter(ls_with_unw(ls_enter_fn_with(st0, clause_unit(c), param_regs(params, cnames), locals, body_fns),
                                        unw_frame(st0.unw, locals, owned, owned, body)))
     # `PEnvCapture(j)` indexes the handle UNION, not the clause's own caps.
     let env_caps = kir_handle_captures_at(all_cls, enc_fn, line, col)
@@ -537,7 +541,7 @@ fn lower_clause_fn(c: ClauseInfo, all_cls: [ClauseInfo], st0: LowerSt, body_fns:
       check_resume_one_shot(sym, blocks)
       KFn { sym: sym, kind: if is_fin { KFnCleanup } else { KFnClause },
             params: kparams, ret: SBoxed,
-            blocks: blocks, region_id: None, stateful: stateful, mo: None, donor: false, entry: false }
+            blocks: blocks, region_id: None, stateful: stateful, mo: None, donor: false, entry: false, fid: fnid_none() }
     } }
   }
 }
@@ -674,8 +678,8 @@ fn lower_handler_decls(clauses: [ClauseInfo], all_cls: [ClauseInfo], acc: [KHand
       lower_handler_decls(rest, all_cls, acc)
     } else {
       let op = clause_head_word(head)
-      let sym = user_handler_sym(enc_fn, line, col)
-      let ot  = KOT(op, user_clause_sym(enc_fn, line, col, op), 0)
+      let sym = user_handler_sym(enc_fn.sym, line, col)
+      let ot  = KOT(op, user_clause_sym(enc_fn.sym, line, col, op), 0)
       let ecaps = kir_handle_captures_at(all_cls, enc_fn, line, col)
       lower_handler_decls(rest, all_cls, hdecl_add(acc, esym, sym, ot, ecaps))
     }
