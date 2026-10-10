@@ -27,7 +27,7 @@
 #   - Alias rewriting: `rewrite_alias_*` / `alias_map_*` + `AliasMap` /
 #     `StmtsRewrite`.
 #   - Protocol-dispatch decoding: `proto_dispatch_*` / `pimpl_*` +
-#     `ProtoDispatchParts` / `PimplRow` / `PR2`.
+#     `ProtoDispatchParts` / `PimplRow`.
 #   - The AST collector/functor glue both backends walk (`collect_*`,
 #     `map_*_exprs`, `map_expr_kind`, `pat_bindings`).
 #   - The lifted-clause/lambda descriptors `VariantEntry` / `ClauseInfo`
@@ -72,6 +72,7 @@ import compiler.infer
 import compiler.parse
 import compiler.resolve
 import compiler.handler_alias
+import compiler.proto_ids
 import compiler.unbox
 import compiler.evidence_scan
 import compiler.perceus_payer
@@ -1811,9 +1812,9 @@ pub fn ffi_kind_of_ty(t: TypeExpr, tab: SymTab) : FfiRetKind {
   }
 }
 
-# Row for one `__pimpl_*` entry: the C symbol name, the core protocol,
-# the kaikai type name (head), and the impl fn's arity. Heterogeneous-
-# mangled impls (`__pimpl_<P>_<T>_<op>__a_<args>`) collapse to the same
+# Row for one impl method of a core protocol: the C symbol name, the
+# protocol, the name of the type the impl is for (its head), and the impl
+# fn's arity. Heterogeneous impls of one type collapse to the same
 # `(P, T)` dispatch key — the typer's compile-time rewrite already
 # routes the right arg-shape; the runtime only needs the head match.
 # The arity is needed by the LLVM emit to synthesise the bitcast
@@ -1833,43 +1834,48 @@ pub fn ffi_kind_of_ty(t: TypeExpr, tab: SymTab) : FfiRetKind {
 # fast path. `None` means the impl already has the boxed
 # `KaiValue*(...)` shape (String / Unit / List / Option / Result); it is
 # registered directly unless it borrows a param. See `emit_impl_shim_defs`.
-#[doc("Row for one `__pimpl_*` entry: the C symbol name, the core protocol, the kaikai type name (head), the impl fn's arity, its unboxed signature (Some when scalar, None when boxed), op name, impl home, and the param positions Perceus made borrowed.")]
+#[doc("Row for one impl method of a core protocol: the C symbol name, the protocol, the name of the impl's target type (head), the impl fn's arity, its unboxed signature (Some when scalar, None when boxed), op name, impl home, and the param positions Perceus made borrowed.")]
 pub type PimplRow = PR(String, CoreProto, String, Int, Option[UFnSig], String, Option[String], [Int])
 #                  c_sym    proto   type_name arity      unboxed sig   op_name impl home      lent
 
-#[doc("AST collector walking pimpl rows. `fns` is the EFn registry, holding each fn's unboxed signature (the unbox pass stamps it there); `tab` and `specs` spell the name each fn is emitted under.")]
-pub fn collect_pimpl_rows(ds: [Decl], fns: [EFn], tab: SymTab, specs: SpecNames, acc: [PimplRow]) : [PimplRow] =
-  pimpl_rows(ds, fnx_build(fns), tab, specs, acc)
+#[doc("The rows of the impl methods among `ds`. `ids` says which functions are impl methods, of which protocol, type and operation; `fns` is the EFn registry, holding each fn's unboxed signature (the unbox pass stamps it there); `tab` spells the name each fn is emitted under.")]
+pub fn collect_pimpl_rows(ds: [Decl], fns: [EFn], tab: SymTab, ids: ProtoIds, acc: [PimplRow]) : [PimplRow] =
+  pimpl_rows(ds, fnx_build(fns), tab, ids, acc)
 
-fn pimpl_rows(ds: [Decl], fx: FnIndex, tab: SymTab, specs: SpecNames, acc: [PimplRow]) : [PimplRow] {
+fn pimpl_rows(ds: [Decl], fx: FnIndex, tab: SymTab, ids: ProtoIds, acc: [PimplRow]) : [PimplRow] {
   match ds {
     [] -> list_reverse(acc)
     [d, ...rest] -> match d {
       DFn(_, fid, _, params, _, _, _, _, _, mo) ->
-        match pimpl_row_of(fx, fid, written_text(fn_emit_name(tab, specs, fid)), params, mo) {
-          Some(row) -> pimpl_rows(rest, fx, tab, specs, [row, ...acc])
-          None      -> pimpl_rows(rest, fx, tab, specs, acc)
+        match pimpl_row_of(fx, fid, tab, ids, params, mo) {
+          Some(row) -> pimpl_rows(rest, fx, tab, ids, [row, ...acc])
+          None      -> pimpl_rows(rest, fx, tab, ids, acc)
         }
-      _ -> pimpl_rows(rest, fx, tab, specs, acc)
+      _ -> pimpl_rows(rest, fx, tab, ids, acc)
     }
   }
 }
 
-# The row of the fn `fid` when `name`, the name it is emitted under,
-# spells a protocol impl.
-fn pimpl_row_of(fx: FnIndex, fid: FnId, name: String, params: [Param], mo: Option[String]) : Option[PimplRow] =
-  if not string_starts_with_q(name, "__pimpl_") { None }
-  else { match parse_pimpl_name(name) {
-    Some(pr) -> {
-      let sig = fnx_ufn_sig_first(fx, fid)
-      Some(pr_with_csym(pr, c_sym(name, mo), list_length(params), sig, mo, pimpl_lent(params, pimpl_raw_flags(sig), 0)))
+# The row of the fn `fid` when it is an impl method of a core protocol.
+# The table dispatches to the impl itself, never to a specialisation.
+fn pimpl_row_of(fx: FnIndex, fid: FnId, tab: SymTab, ids: ProtoIds, params: [Param], mo: Option[String]) : Option[PimplRow] =
+  if fnid_inst(fid) != spec_none() { None }
+  else { match pid_impl(ids, fnid_sym(fid)) {
+    Some(PIR(proto, target, op, _, _, _, _)) -> match core_proto_of(proto) {
+      Some(cp) -> {
+        let sig = fnx_ufn_sig_first(fx, fid)
+        Some(PR(c_sym(written_text(decl_name(tab, fnid_sym(fid))), mo), cp, pimpl_target_text(tab, target),
+                list_length(params), sig, written_text(op), mo, pimpl_lent(params, pimpl_raw_flags(sig), 0)))
+      }
+      None -> None
     }
     None -> None
   } }
 
-#[doc("Attach the minted C symbol, unboxed signature, impl home and borrowed positions to a decoded protocol-impl row.")]
-pub fn pr_with_csym(pr: PimplRow, csym: String, arity: Int, sig: Option[UFnSig], home: Option[String], lent: [Int]) : PimplRow {
-  match pr { PR(_, p, t, _, _, op, _, _) -> PR(csym, p, t, arity, sig, op, home, lent) }
+# The name the runtime head of an impl's target is looked up under.
+fn pimpl_target_text(tab: SymTab, r: DeclRef) : String = match r {
+  DrSym(s)        -> written_text(decl_name(tab, s))
+  DrWritten(_, n) -> written_text(n)
 }
 
 # Only boxed params: a raw one reaches the impl unboxed and the adapter
@@ -1936,93 +1942,6 @@ pub fn ty_is_scalar(t: Ty) : Bool {
     TyDimT(inner, _)    -> ty_is_scalar(inner)
     TyRefineT(inner, _) -> ty_is_scalar(inner)
     _ -> false
-  }
-}
-
-#[doc("Parse `__pimpl_<P>_<T>_<op>` or `__pimpl_<P>_<T>_<op>__a_<args>` back into (proto, type_name). The proto is the core protocol whose name the symbol spells; any other protocol returns None to skip.")]
-pub fn parse_pimpl_name(name: String) : Option[PimplRow] {
-  # name = "__pimpl_" ++ <rest>; cut prefix.
-  let prefix_len = 8
-  let n = string_length(name)
-  if n <= prefix_len { None }
-  else {
-    let rest = string_slice(name, prefix_len, n - prefix_len)
-    # split off the trailing "__a_..." suffix if present.
-    let base = pimpl_strip_arg_suffix(rest)
-    # `base` is now `<P>_<T>_<op>`. Take P as the core protocol the
-    # symbol leads with; everything between `<P>_` and the final
-    # `_<op>` is the type name.
-    match pimpl_split_proto(base) {
-      None -> None
-      Some(p_rest) -> match p_rest {
-        PR2(p, rest1) -> {
-          # rest1 = "<T>_<op>". Strip the trailing `_<op>` by finding
-          # the last underscore.
-          let m = string_length(rest1)
-          let last = find_last_underscore_proto(rest1, m - 1)
-          if last <= 0 { None }
-          else {
-            let tname = string_slice(rest1, 0, last)
-            let op = string_slice(rest1, last + 1, m - last - 1)
-            Some(PR("", p, tname, 0, None, op, None, []))
-          }
-        }
-      }
-    }
-  }
-}
-
-#[doc("Two-field protocol-impl name split (proto, rest).")]
-pub type PR2 = PR2(CoreProto, String)
-
-# Strip a `__a_…` suffix off a `__pimpl_*` symbol's payload string.
-
-# Strip a `__a_…` suffix off a `__pimpl_*` symbol's payload string.
-#[doc("Strip a `__a_…` suffix off a `__pimpl_*` symbol's payload string.")]
-pub fn pimpl_strip_arg_suffix(s: String) : String {
-  let marker = "__a_"
-  let idx = find_substring(s, marker, 0)
-  let n = string_length(s)
-  if idx >= n { s }
-  else { string_slice(s, 0, idx) }
-}
-
-# No core protocol's name holds a `_`, so at most one leads `s`.
-#[doc("The core protocol whose name `s` starts with, and the remainder after the trailing `_`. None when no core protocol leads `s`.")]
-pub fn pimpl_split_proto(s: String) : Option[PR2] {
-  let try_one = (cp: CoreProto) => {
-    let p = core_proto_name(cp)
-    let plen = string_length(p)
-    let n = string_length(s)
-    if n > plen and substring_eq(s, 0, p) {
-      let after = char_at_or_zero(s, plen)
-      if after == '_' {
-        Some(PR2(cp, string_slice(s, plen + 1, n - plen - 1)))
-      } else { None }
-    } else { None }
-  }
-  pimpl_first_match(core_protos(), try_one)
-}
-
-#[doc("Protocol-impl name decoder: first match.")]
-pub fn pimpl_first_match(opts: [CoreProto], f: (CoreProto) -> Option[PR2]) : Option[PR2] {
-  match opts {
-    [] -> None
-    [o, ...rest] -> match f(o) {
-      Some(r) -> Some(r)
-      None    -> pimpl_first_match(rest, f)
-    }
-  }
-}
-
-#[doc("Find the last underscore boundary in a protocol-impl name for splitting.")]
-pub fn find_last_underscore_proto(s: String, from: Int) : Int {
-  if from < 0 { -1 }
-  else {
-    match char_at(s, from) {
-      Some('_') -> from
-      _         -> find_last_underscore_proto(s, from - 1)
-    }
   }
 }
 
