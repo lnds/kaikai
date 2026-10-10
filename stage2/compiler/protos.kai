@@ -2369,15 +2369,27 @@ fn derive_binser_put_at(acc: Expr, v: Expr, ftype: TypeExpr, writers: [String],
                          line: Int, col: Int, depth: Int) : Expr {
   match ftype.tkind {
     TyList(elem) -> derive_binser_put_via("bin_buf_put_list", acc, v, elem, writers, line, col, depth)
-    TyName(_, tn, targs) -> match targs {
-      [elem] ->
-        if tn == "Option" {
-          derive_binser_put_via("bin_buf_put_option", acc, v, elem, writers, line, col, depth)
-        } else { derive_binser_put_leaf(acc, v, ftype, writers, line, col) }
-      _ -> derive_binser_put_leaf(acc, v, ftype, writers, line, col)
+    _ -> match binser_option_elem(ftype) {
+      Some(elem) -> derive_binser_put_via("bin_buf_put_option", acc, v, elem, writers, line, col, depth)
+      None       -> derive_binser_put_leaf(acc, v, ftype, writers, line, col)
     }
-    _ -> derive_binser_put_leaf(acc, v, ftype, writers, line, col)
   }
+}
+
+# The element of a written `Option[elem]`.
+fn binser_option_elem(ftype: TypeExpr) : Option[TypeExpr] = match ftype.tkind {
+  TyName(_, _, [elem]) -> match resolve_ty(ftype) {
+    TyCon(_, _, _, s) -> if core_ty_is(s, CtOption) { Some(elem) } else { None }
+    _                 -> None
+  }
+  _ -> None
+}
+
+# What a field dispatches on: its resolved type under any unit or refinement.
+fn binser_leaf_ty(t: Ty) : Ty = match t {
+  TyDimT(b, _)    -> binser_leaf_ty(b)
+  TyRefineT(b, _) -> binser_leaf_ty(b)
+  _               -> t
 }
 
 # `<comb>(acc, v, (__bw, __bx) => <write __bx of type elem into __bw>)`.
@@ -2401,7 +2413,7 @@ fn derive_binser_put_leaf(acc: Expr, v: Expr, ftype: TypeExpr, writers: [String]
   if list_has(writers, head) {
     binser_call(binser_put_name(head), [acc, v], line, col)
   } else {
-    match binser_prim_writer(head) {
+    match binser_prim_writer(binser_leaf_ty(resolve_ty(ftype))) {
       Some(w) -> binser_call(w, [acc, v], line, col)
       None    -> {
         let enc = proto_mangled_fn("BinSerialize", head, "to_bytes")
@@ -2411,13 +2423,14 @@ fn derive_binser_put_leaf(acc: Expr, v: Expr, ftype: TypeExpr, writers: [String]
   }
 }
 
-fn binser_prim_writer(head: String) : Option[String] =
-  if head == "Int" { Some("bin_buf_put_int") }
-  else if head == "String" { Some("bin_buf_put_string") }
-  else if head == "Bool" { Some("bin_buf_put_bool") }
-  else if head == "Real" { Some("bin_buf_put_real") }
-  else if head == "Char" { Some("bin_buf_put_char") }
-  else { None }
+fn binser_prim_writer(leaf: Ty) : Option[String] = match leaf {
+  TyInt    -> Some("bin_buf_put_int")
+  TyString -> Some("bin_buf_put_string")
+  TyBool   -> Some("bin_buf_put_bool")
+  TyReal   -> Some("bin_buf_put_real")
+  TyChar   -> Some("bin_buf_put_char")
+  _        -> None
+}
 
 fn derive_binser_decode_call(buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
                                line: Int, col: Int) : Expr =
@@ -2438,29 +2451,25 @@ fn derive_binser_decode_call_at(buf_e: Expr, pos_e: Expr, ftype: TypeExpr,
       mk_expr(ECall(mk_ref("bin_list_from_bytes", line, col),
                     [buf_e, pos_e, dec_lam]), line, col)
     }
-    TyName(_, tn, targs) ->
-      if tn == "Option" {
-        match targs {
-          [elem] -> {
-            let lcol = col + depth * 8 + 5
-            let bparam = Param { pname: "__bb", ptype: None, pline: line, pcol: lcol, pborrow: false }
-            let pparam = Param { pname: "__bp", ptype: None, pline: line, pcol: lcol, pborrow: false }
-            let bvar = mk_ref("__bb", line, lcol)
-            let pvar = mk_ref("__bp", line, lcol)
-            let body = derive_binser_decode_call_at(bvar, pvar, elem, line, col,
-                                                      depth + 1)
-            let dec_lam = mk_expr(ELambda([bparam, pparam], body), line, lcol)
-            mk_expr(ECall(mk_ref("bin_option_from_bytes", line, col),
-                          [buf_e, pos_e, dec_lam]), line, col)
-          }
-          _ -> derive_binser_decode_mangled(buf_e, pos_e, ftype, line, col)
-        }
-      } else if tn == "Char" {
-        mk_expr(ECall(mk_ref("bin_char_from_bytes", line, col),
-                      [buf_e, pos_e]), line, col)
-      } else {
-        derive_binser_decode_mangled(buf_e, pos_e, ftype, line, col)
+    TyName(_, _, _) -> match binser_option_elem(ftype) {
+      Some(elem) -> {
+        let lcol = col + depth * 8 + 5
+        let bparam = Param { pname: "__bb", ptype: None, pline: line, pcol: lcol, pborrow: false }
+        let pparam = Param { pname: "__bp", ptype: None, pline: line, pcol: lcol, pborrow: false }
+        let bvar = mk_ref("__bb", line, lcol)
+        let pvar = mk_ref("__bp", line, lcol)
+        let body = derive_binser_decode_call_at(bvar, pvar, elem, line, col,
+                                                  depth + 1)
+        let dec_lam = mk_expr(ELambda([bparam, pparam], body), line, lcol)
+        mk_expr(ECall(mk_ref("bin_option_from_bytes", line, col),
+                      [buf_e, pos_e, dec_lam]), line, col)
       }
+      None -> match resolve_ty(ftype) {
+        TyChar -> mk_expr(ECall(mk_ref("bin_char_from_bytes", line, col),
+                                [buf_e, pos_e]), line, col)
+        _      -> derive_binser_decode_mangled(buf_e, pos_e, ftype, line, col)
+      }
+    }
     _ -> derive_binser_decode_mangled(buf_e, pos_e, ftype, line, col)
   }
 }
@@ -2548,12 +2557,13 @@ type BinPrim = BpInt | BpBool | BpString | BpChar
 
 fn binser_prim_reader(ftype: TypeExpr) : Option[BinPrim] =
   match ftype.tkind {
-    TyName(_, tn, []) ->
-      if tn == "Int" { Some(BpInt) }
-      else if tn == "Bool" { Some(BpBool) }
-      else if tn == "String" { Some(BpString) }
-      else if tn == "Char" { Some(BpChar) }
-      else { None }
+    TyName(_, _, []) -> match resolve_ty(ftype) {
+      TyInt    -> Some(BpInt)
+      TyBool   -> Some(BpBool)
+      TyString -> Some(BpString)
+      TyChar   -> Some(BpChar)
+      _        -> None
+    }
     _ -> None
   }
 
@@ -2938,9 +2948,9 @@ fn validate_derive_binser_one(file: String, tname: String, fname: String,
     errs
   } else if list_has(providers, head) {
     errs
-  } else if binser_builtin_impl(head) {
+  } else if binser_builtin_impl(ftype) {
     errs
-  } else if binser_collection_head(head) {
+  } else if binser_collection_head(ftype) {
     # `List` and `Option` route through `bin_list_*` / `bin_option_*`
     # combinators emitted by the derive. Validate that the element
     # type still has a usable impl/derive, recursively.
@@ -2955,8 +2965,11 @@ fn validate_derive_binser_one(file: String, tname: String, fname: String,
   }
 }
 
-fn binser_collection_head(head: String) : Bool =
-  head == "List" or head == "Option"
+fn binser_collection_head(ftype: TypeExpr) : Bool = match binser_leaf_ty(resolve_ty(ftype)) {
+  TyListT(_)        -> true
+  TyCon(_, _, _, s) -> core_ty_is(s, CtList) or core_ty_is(s, CtOption)
+  _                 -> false
+}
 
 # Pre-expansion validator for `#[derive(Layout)]`. `derive_layout_impl`
 # returns no decls when the record is not Layout-bearing, so without this
@@ -3166,7 +3179,7 @@ fn validate_derive_json_one(file: String, tname: String, fd: FieldDecl,
       # which requires a `#[json(default)]` or an `Option` type.
       if field_attr_json_skip(attrs) {
         let has_default = match field_attr_json_default(attrs) { Some(_) -> true None -> false }
-        if has_default or json_head_name(ftype) == "Option" { errs }
+        if has_default or json_head_is_option(ftype) { errs }
         else {
           let derr = derive_error(file, line, col, concat_all(["cannot `#[derive(Json)]` for `", tname,
             "`: field `", fname, "` carries `#[json(skip)]` but has no `#[json(default)]` and is not `Option` — decode cannot reconstruct a skipped field"]))
@@ -3213,14 +3226,7 @@ fn validate_derive_binser_collection_elem(file: String, tname: String,
 fn binser_collection_elem(ftype: TypeExpr) : Option[TypeExpr] {
   match ftype.tkind {
     TyList(elem) -> Some(elem)
-    TyName(_, tn, targs) ->
-      if tn == "Option" {
-        match targs {
-          [elem] -> Some(elem)
-          _ -> None
-        }
-      } else { None }
-    _ -> None
+    _            -> binser_option_elem(ftype)
   }
 }
 
@@ -3230,8 +3236,15 @@ fn binser_collection_elem(ftype: TypeExpr) : Option[TypeExpr] {
 # pre-existed it. `Byte` rides the `Int` impl by virtue of Lane 4's
 # nominal-but-byte-castable design. `Char` rides a hand-written
 # `bin_char_*` pair the derive routes to directly.
-fn binser_builtin_impl(tname: String) : Bool =
-  list_has(["Int", "Real", "Bool", "String", "Byte", "Char"], tname)
+fn binser_builtin_impl(ftype: TypeExpr) : Bool = match binser_leaf_ty(resolve_ty(ftype)) {
+  TyInt    -> true
+  TyReal   -> true
+  TyBool   -> true
+  TyString -> true
+  TyByte   -> true
+  TyChar   -> true
+  _        -> false
+}
 
 # m12.8.z: pre-expansion validation for `#derive(Ord)`. Walks the
 # decl stream once to collect every type that has — or will have

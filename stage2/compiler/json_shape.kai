@@ -12,6 +12,7 @@ its own.
 
 import compiler.util
 import compiler.ast
+import compiler.fnreg
 
 #[doc("The JSON shape a field's declared type binds as. `JSOpt` wraps the inner shape rather than being a leaf of its own: `Option[[Int]]` needs both the optional reader and the element reader the list would have used.")]
 pub type JsonShape = JSStr | JSInt | JSReal | JSBool
@@ -43,15 +44,35 @@ fn jd_sole_arg(t: TypeExpr) : Option[TypeExpr] = match t.tkind {
 
 pub fn jd_shape_of(t: TypeExpr) : Option[JsonShape] = match t.tkind {
   TyList(elem) -> jd_wrap_list(jd_shape_of(elem))
-  TyName(_, n, _) ->
-    if n == "String" { Some(JSStr) }
-    else if n == "Int" { Some(JSInt) }
-    else if n == "Real" { Some(JSReal) }
-    else if n == "Bool" { Some(JSBool) }
-    else if n == "Option" { jd_wrap_opt(jd_shape_inner(t)) }
-    else if n == "List" { jd_wrap_list(jd_shape_inner(t)) }
-    else if jd_is_user_type(n) and jd_arity(t) == 0 { Some(JSRecord(n)) }
+  TyName(_, n, _) -> jd_named_shape(t, n, resolve_ty(t))
+  _ -> None
+}
+
+# The shape of a written type name, decided by what it resolves to. The
+# name is only what a nested record's shape is spelled with.
+fn jd_named_shape(t: TypeExpr, n: String, ty: Ty) : Option[JsonShape] = match ty {
+  TyString -> Some(JSStr)
+  TyInt    -> Some(JSInt)
+  TyReal   -> Some(JSReal)
+  TyBool   -> Some(JSBool)
+  _ -> match jd_collection_of(ty) {
+    Some(CtOption) -> jd_wrap_opt(jd_shape_inner(t))
+    Some(_)        -> jd_wrap_list(jd_shape_inner(t))
+    None -> if jd_is_user_type(n) and jd_arity(t) == 0 { Some(JSRecord(n)) } else { None }
+  }
+}
+
+# The collection a resolved head is: `Option` or `List`.
+fn jd_collection_of(ty: Ty) : Option[CoreTy] = match ty {
+  TyCon(_, _, _, s) ->
+    if core_ty_is(s, CtOption) { Some(CtOption) }
+    else if core_ty_is(s, CtList) { Some(CtList) }
     else { None }
+  _ -> None
+}
+
+fn jd_collection(t: TypeExpr) : Option[CoreTy] = match t.tkind {
+  TyName(_, _, _) -> jd_collection_of(resolve_ty(t))
   _ -> None
 }
 
@@ -131,29 +152,37 @@ pub fn json_field_reject(ftype: TypeExpr) : Option[String] = match jd_shape_of(f
 }
 
 fn jd_reject_why(t: TypeExpr) : String = match t.tkind {
-  TyName(_, n, _) ->
-    if n == "Option" or n == "List" { jd_arg_reject_why(t, n) }
-    else if jd_arity(t) > 0 {
-      concat_all(["`", n, "` is generic; only a monomorphic record can derive Json"])
-    }
-    else { concat_all(["`", n, "` has no JSON denotation"]) }
+  TyName(_, n, _) -> match jd_collection(t) {
+    Some(c) -> jd_arg_reject_why(t, c)
+    None ->
+      if jd_arity(t) > 0 {
+        concat_all(["`", n, "` is generic; only a monomorphic record can derive Json"])
+      }
+      else { concat_all(["`", n, "` has no JSON denotation"]) }
+  }
   TyList(elem) -> concat_all(["its element type: ", jd_reject_why(elem)])
   _ -> "only records of JSON-bindable fields can derive Json"
 }
 
-fn jd_arg_reject_why(t: TypeExpr, head: String) : String = match jd_sole_arg(t) {
-  None    -> concat_all(["`", head, "` without a single type argument"])
+fn jd_arg_reject_why(t: TypeExpr, head: CoreTy) : String = match jd_sole_arg(t) {
+  None    -> concat_all(["`", core_ty_name(head), "` without a single type argument"])
   Some(a) ->
-    if head == "Option" and jd_head_is(a, "Option") {
+    if jd_is_option(head) and json_head_is_option(a) {
       "`Option[Option[T]]` cannot be told apart from `Option[T]`: one JSON `null` denotes one absence"
     } else {
-      concat_all(["its ", head, " element type: ", jd_reject_why(a)])
+      concat_all(["its ", core_ty_name(head), " element type: ", jd_reject_why(a)])
     }
 }
 
-fn jd_head_is(t: TypeExpr, name: String) : Bool = match t.tkind {
-  TyName(_, n, _) -> n == name
-  _            -> false
+fn jd_is_option(c: CoreTy) : Bool = match c {
+  CtOption -> true
+  _        -> false
+}
+
+#[doc("True when the head of `ftype` is `Option`.")]
+pub fn json_head_is_option(ftype: TypeExpr) : Bool = match jd_collection(ftype) {
+  Some(c) -> jd_is_option(c)
+  None    -> false
 }
 
 #[doc("The head type name of `ftype` as written, for a diagnostic that names the offending field's type.")]

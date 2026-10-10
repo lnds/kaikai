@@ -46,6 +46,7 @@ import compiler.site_ids
 import compiler.ast
 import compiler.entry
 import compiler.core_protos
+import compiler.core_types
 import compiler.operators
 import compiler.type_stamp
 import compiler.effect_default
@@ -558,15 +559,17 @@ fn emit_region_marks_has(ms: [RegionMark], line: Int, col: Int) : Bool {
 # fall back to the RC ctor when `kai_arena_current()` is NULL.
 fn ty_has_region_brand(ty: Ty) : Bool = match ty {
   TyDimT(base, _) -> match base {
-    TyCon(_, name, _, _) -> not ty_is_numeric_carrier_name(name)
+    TyCon(_, name, _, s) -> not ty_is_numeric_carrier(name, s)
     TyListT(_)        -> true
     _                 -> false
   }
   _ -> false
 }
 
-fn ty_is_numeric_carrier_name(name: String) : Bool =
-  name == "Decimal" or name == "DecimalBig" or name == "BigInt"
+fn ty_is_numeric_carrier(name: String, s: SymId) : Bool = match core_decl_ty_head(name, s) {
+  Some(_) -> true
+  None    -> false
+}
 
 # The signature-brand predicate (`fn_has_region_brand`) and
 # `te_is_region_branded` live in `compiler.region`, shared with the native
@@ -9255,27 +9258,34 @@ fn bench_call_list(n: Int, i: Int) : String {
 # primitives. Anything else collapses to a panic stub so the failure
 # is loud rather than silent — protocol-based / structural derivation
 # lands in v1.x and v2.
-fn check_arbitrary_for_ty(ty: TypeExpr) : String {
-  match ty.tkind {
-    TyName(_, name, _args) -> {
-      if name == "Int" { "kai_arbitrary_int()" }
-      else if name == "Bool" { "kai_arbitrary_bool()" }
-      else if name == "Char" { "kai_arbitrary_char()" }
-      else if name == "String" { "kai_arbitrary_string()" }
-      else { check_arbitrary_panic(name) }
-    }
-    TyList(inner) -> match inner.tkind {
-      TyName(_, iname, _) -> {
-        if iname == "Int" { "kai_arbitrary_list_int()" }
-        else if iname == "Bool" { "kai_arbitrary_list_bool()" }
-        else if iname == "Char" { "kai_arbitrary_list_char()" }
-        else if iname == "String" { "kai_arbitrary_list_string()" }
-        else { check_arbitrary_panic(concat_all(["[", iname, "]"])) }
-      }
-      _ -> check_arbitrary_panic("[<complex>]")
-    }
-    _ -> check_arbitrary_panic("<complex>")
+fn check_arbitrary_for_ty(ty: TypeExpr) : String = match resolve_ty(ty) {
+  TyListT(elem) -> match check_scalar_word(elem) {
+    Some(w) -> concat_all(["kai_arbitrary_list_", w, "()"])
+    None    -> check_arbitrary_panic(check_ty_label(ty))
   }
+  t -> match check_scalar_word(t) {
+    Some(w) -> concat_all(["kai_arbitrary_", w, "()"])
+    None    -> check_arbitrary_panic(check_ty_label(ty))
+  }
+}
+
+# The word the runtime's generator and shrinker names spell a scalar with.
+fn check_scalar_word(t: Ty) : Option[String] = match t {
+  TyInt    -> Some("int")
+  TyBool   -> Some("bool")
+  TyChar   -> Some("char")
+  TyString -> Some("string")
+  _        -> None
+}
+
+# How the "no generator" panic names a parameter type, as written.
+fn check_ty_label(ty: TypeExpr) : String = match ty.tkind {
+  TyName(_, name, _) -> name
+  TyList(inner) -> match inner.tkind {
+    TyName(_, iname, _) -> concat_all(["[", iname, "]"])
+    _                   -> "[<complex>]"
+  }
+  _ -> "<complex>"
 }
 
 fn check_arbitrary_panic(label: String) : String =
@@ -9295,25 +9305,15 @@ fn check_arbitrary_panic(label: String) : String =
 # shrink-head); scalars have one. Empty list means no shrink for this
 # type — the runner will skip the param. Issue #438.
 fn check_shrink_for_ty(ty: TypeExpr) : [String] {
-  match ty.tkind {
-    TyName(_, name, _args) -> {
-      if name == "Int" { ["kai_shrink_int"] }
-      else if name == "Bool" { ["kai_shrink_bool"] }
-      else if name == "Char" { ["kai_shrink_char"] }
-      else if name == "String" { ["kai_shrink_string"] }
-      else { [] }
+  match resolve_ty(ty) {
+    TyListT(elem) -> match check_scalar_word(elem) {
+      Some(w) -> [concat_all(["kai_shrink_list_", w]), concat_all(["kai_shrink_list_", w, "_head"])]
+      None    -> []
     }
-    TyList(inner) -> match inner.tkind {
-      TyName(_, iname, _) -> {
-        if iname == "Int"    { ["kai_shrink_list_int",    "kai_shrink_list_int_head"] }
-        else if iname == "Bool"   { ["kai_shrink_list_bool",   "kai_shrink_list_bool_head"] }
-        else if iname == "Char"   { ["kai_shrink_list_char",   "kai_shrink_list_char_head"] }
-        else if iname == "String" { ["kai_shrink_list_string", "kai_shrink_list_string_head"] }
-        else { [] }
-      }
-      _ -> []
+    t -> match check_scalar_word(t) {
+      Some(w) -> [concat_all(["kai_shrink_", w])]
+      None    -> []
     }
-    _ -> []
   }
 }
 
@@ -9752,33 +9752,34 @@ fn emit_impl_table_array_loop(rows: [PimplRow], decls: [Decl], acc: String) : St
   }
 }
 
-# Map a kaikai type-name (mangled form like `Int`, `String`, `Option`,
-# `Result`, or a user type) to the runtime head-tag C constant.
-
-# Map a kaikai type-name (mangled form like `Int`, `String`, `Option`,
-# `Result`, or a user type) to the runtime head-tag C constant.
-fn stdlib_head_tag_c(home: Option[String], tname: String, decls: [Decl]) : String {
-  if tname == "Int"          { "KAI_HEAD_INT" }
-  else if tname == "Real"    { "KAI_HEAD_REAL" }
-  else if tname == "Bool"    { "KAI_HEAD_BOOL" }
-  else if tname == "Char"    { "KAI_HEAD_CHAR" }
-  else if tname == "String"  { "KAI_HEAD_STRING" }
-  else if tname == "Unit"    { "KAI_HEAD_UNIT" }
-  else if tname == "Byte"    { "KAI_HEAD_BYTE" }
-  else if tname == "List"    { "KAI_HEAD_LIST" }
-  else if tname == "Array"   { "KAI_HEAD_ARRAY" }
-  else if tname == "Vec"     { "KAI_HEAD_VEC" }
-  else if tname == "Option"  { "KAI_HEAD_OPTION" }
-  else if tname == "Result"  { "KAI_HEAD_RESULT" }
-  else if tname == "Signal"  { "KAI_HEAD_SIGNAL" }
-  else if tname == "ProcessExit" { "KAI_HEAD_PROCESS_EXIT" }
-  else {
+# The runtime head-tag C constant of an impl's target, which a lowered
+# impl symbol carries as a spelling.
+fn stdlib_head_tag_c(home: Option[String], tname: String, decls: [Decl]) : String = match rt_head_named(tname) {
+  Some(h) -> rt_head_c(h)
+  None -> {
     # User-declared record/sum type: dense head tag (>= 20). -1 only when
     # the name names no record/sum decl (truly unknown).
     let ut = impl_target_head_tag(home, tname, decls)
     if ut >= 0 { concat_all([int_to_string(ut), " /* user type: ", tname, " */"]) }
     else { concat_all(["-1 /* unknown type: ", tname, " */"]) }
   }
+}
+
+fn rt_head_c(h: RtHead) : String = match h {
+  RhUnit        -> "KAI_HEAD_UNIT"
+  RhBool        -> "KAI_HEAD_BOOL"
+  RhInt         -> "KAI_HEAD_INT"
+  RhReal        -> "KAI_HEAD_REAL"
+  RhChar        -> "KAI_HEAD_CHAR"
+  RhString      -> "KAI_HEAD_STRING"
+  RhList        -> "KAI_HEAD_LIST"
+  RhArray       -> "KAI_HEAD_ARRAY"
+  RhByte        -> "KAI_HEAD_BYTE"
+  RhVec         -> "KAI_HEAD_VEC"
+  RhOption      -> "KAI_HEAD_OPTION"
+  RhResult      -> "KAI_HEAD_RESULT"
+  RhSignal      -> "KAI_HEAD_SIGNAL"
+  RhProcessExit -> "KAI_HEAD_PROCESS_EXIT"
 }
 
 fn emit_variant_to_head_array(xs: [Int]) : String =
