@@ -16,6 +16,9 @@ of a global fn) differ.
 `from_bytes` reads from `pos` rather than 0 and returns
 `Result[BinCursor[T], String]`, so a Layout record composes inside a
 cursor-threaded decode the same way a BinSerialize one does.
+
+The derived type is named by its id; everything else a body mentions is
+written text the resolver settles like source.
 """)]
 
 import compiler.util
@@ -24,6 +27,8 @@ import compiler.kinds
 import compiler.layout_synth
 import compiler.core_builtins
 import compiler.core_modules
+import compiler.core_protos
+import compiler.symtab
 import compiler.derive_mint
 
 # Fixed byte length of a Layout record: the sum of its field widths. The
@@ -34,7 +39,7 @@ fn ld_total_width(fields: [LayoutField], acc: Int) : Int = match fields {
 }
 
 fn ld_expr(k: ExprKind, line: Int, col: Int) : Expr = mk_expr(k, line, col)
-fn ld_var(n: String, line: Int, col: Int) : Expr = ld_expr(EName(n), line, col)
+fn ld_var(n: String, line: Int, col: Int) : Expr = mk_name(n, line, col)
 fn ld_int(n: Int, line: Int, col: Int) : Expr = ld_expr(mk_int_synth(n), line, col)
 
 fn ld_call(callee: String, args: [Expr], line: Int, col: Int) : Expr =
@@ -48,57 +53,58 @@ fn ld_prim(b: CoreBuiltin, args: [Expr], line: Int, col: Int) : Expr =
   ld_expr(ECall(builtin_mk(b, line, col), args), line, col)
 
 fn ld_ty(n: String, args: [TypeExpr], line: Int, col: Int) : TypeExpr =
-  mk_ty(TyName(ty_ref_none(), n, args), line, col)
+  mk_ty(TyName(ref_written(n), args), line, col)
 
 fn ld_param(name: String, ty: TypeExpr, line: Int, col: Int) : Param =
-  Param { pname: name, ptype: Some(ty), pline: line, pcol: col, pborrow: false }
+  Param { binder: binder_written(name), ptype: Some(ty), pline: line, pcol: col, pborrow: false }
 
 fn ld_byte_arr(line: Int, col: Int) : TypeExpr =
   ld_ty("Array", [ld_ty("Byte", [], line, col)], line, col)
 
 # `Result[BinCursor[T], String]` — the from_bytes return shared with
 # BinSerialize.
-fn ld_result_ty(tname: String, line: Int, col: Int) : TypeExpr {
-  let self_ty = ld_ty(tname, [], line, col)
-  let cur_ty = ld_ty("BinCursor", [self_ty], line, col)
+fn ld_result_ty(d: DeriveFor, line: Int, col: Int) : TypeExpr {
+  let cur_ty = ld_ty("BinCursor", [derive_self_ty(d, line, col)], line, col)
   ld_ty("Result", [cur_ty, ld_ty("String", [], line, col)], line, col)
 }
 
-#[doc("The `#[derive(Layout)]` decls for `type T = { .. }`: the protocol impl plus the `from_bytes` shim. Empty when the body is not an all-Layout-fields record.")]
-pub fn derive_layout_impl(tname: String, shown: String, body: TypeBody,
-                          line: Int, col: Int) : [Decl] = match body {
+#[doc("The `#[derive(Layout)]` decls for the type `t`, with the row of each function: the protocol impl plus the `from_bytes` shim. `tab` names the type and the module its functions are minted in. Nothing when the body is not an all-Layout-fields record.")]
+pub fn derive_layout_impl(tab: SymTab, t: SymId, body: TypeBody,
+                          line: Int, col: Int) : Minted = match body {
   TBRecord(fields) -> match layout_fields_of(fields) {
-    Some(lfs) -> [ld_impl(tname, lfs, line, col), ld_shim(tname, shown, line, col)]
-    None -> []
+    Some(lfs) -> {
+      let d = DeriveFor { tab: tab, t: t }
+      minted_append(ld_impl(d, lfs, line, col), ld_shim(d, line, col))
+    }
+    None -> minted_none()
   }
-  _ -> []
+  _ -> minted_none()
 }
 
-fn ld_impl(tname: String, lfs: [LayoutField], line: Int, col: Int) : Decl {
-  let self_ty = ld_ty(tname, [], line, col)
-  let to_params = [ld_param("self", self_ty, line, col)]
+fn ld_impl(d: DeriveFor, lfs: [LayoutField], line: Int, col: Int) : Minted {
+  let to_params = [ld_param("self", derive_self_ty(d, line, col), line, col)]
   let from_params = [ld_param("buf", ld_byte_arr(line, col), line, col),
                      ld_param("pos", ld_ty("Int", [], line, col), line, col)]
-  let to_method = DFn(false, "to_bytes", [], to_params,
-                      Some(ld_byte_arr(line, col)), REmpty,
-                      ld_to_bytes_body(lfs, line, col), line, col, None, fnid_none())
-  let from_method = DFn(false, "from_bytes", [], from_params,
-                        Some(ld_result_ty(tname, line, col)), REmpty,
-                        ld_from_bytes_body(tname, lfs, line, col), line, col, None, fnid_none())
-  DImpl("Layout", [], self_ty, [to_method, from_method], line, col, [], sym_none())
+  derive_impl(d, CpLayout,
+              [DeriveMethod("to_bytes", to_params, ld_byte_arr(line, col),
+                            ld_to_bytes_body(lfs, line, col)),
+               DeriveMethod("from_bytes", from_params, ld_result_ty(d, line, col),
+                            ld_from_bytes_body(d, lfs, line, col))],
+              line, col)
 }
 
 # `fn <lower(T)>_from_bytes(buf, pos)` — the non-overloaded entry point.
 # Single dispatch picks the impl from the first argument, which here is the
 # buffer, so the user cannot call `from_bytes` directly.
-fn ld_shim(tname: String, shown: String, line: Int, col: Int) : Decl {
+fn ld_shim(d: DeriveFor, line: Int, col: Int) : Minted {
   let params = [ld_param("buf", ld_byte_arr(line, col), line, col),
                 ld_param("pos", ld_ty("Int", [], line, col), line, col)]
+  let tname = derive_type_name(d)
   let mangled = concat_all(["__pimpl_Layout_", tname, "_from_bytes"])
   let body = ld_call(mangled, [ld_var("buf", line, col), ld_var("pos", line, col)],
                      line, col)
-  DFn(true, concat_all([ld_lower(shown, 0, string_length(shown), ""), "_from_bytes"]),
-      [], params, Some(ld_result_ty(tname, line, col)), REmpty, body, line, col, None, fnid_none())
+  derive_fn(d, concat_all([ld_lower(tname, 0, string_length(tname), ""), "_from_bytes"]),
+            params, ld_result_ty(d, line, col), body, line, col)
 }
 
 # ASCII lowercaser for the shim name. Local rather than shared with
@@ -150,23 +156,23 @@ fn ld_enc_fold(lfs: [LayoutField], acc: Expr, line: Int, col: Int) : Expr =
 # return `Option`, so each arm still threads a `None -> Err(..)` branch rather
 # than asserting.
 
-fn ld_from_bytes_body(tname: String, lfs: [LayoutField], line: Int, col: Int) : Expr {
+fn ld_from_bytes_body(d: DeriveFor, lfs: [LayoutField], line: Int, col: Int) : Expr {
   let width = ld_total_width(lfs, 0)
   let have = ld_prim(CbArrayLength, [ld_var("buf", line, col)], line, col)
   let need = ld_expr(EBinop(BoAdd, ld_var("pos", line, col), ld_int(width, line, col)),
                      line, col)
   let short = ld_expr(EBinop(BoLt, have, need), line, col)
-  let err = ld_call("Err", [ld_expr(EStr(ld_short_msg(tname), false), line, col)], line, col)
-  ld_expr(EIf(short, err, Some(ld_tower(tname, lfs, 0, [], line, col))), line, col)
+  let err = ld_call("Err", [ld_expr(EStr(ld_short_msg(derive_type_name(d)), false), line, col)], line, col)
+  ld_expr(EIf(short, err, Some(ld_tower(d, lfs, 0, [], line, col))), line, col)
 }
 
 # `EStr` carries the raw source span, quotes included.
 fn ld_short_msg(tname: String) : String =
   concat_all(["\"Layout ", tname, ": buffer too short\""])
 
-fn ld_tower(tname: String, lfs: [LayoutField], off: Int, bound: [String],
+fn ld_tower(d: DeriveFor, lfs: [LayoutField], off: Int, bound: [String],
             line: Int, col: Int) : Expr = match lfs {
-  [] -> ld_ok_cursor(tname, list_reverse(bound), off, line, col)
+  [] -> ld_ok_cursor(d, list_reverse(bound), off, line, col)
   [f, ...rest] -> {
     let getter = match lf_order(f) {
       BigEndian    -> "bin_get_uint_be"
@@ -176,11 +182,11 @@ fn ld_tower(tname: String, lfs: [LayoutField], off: Int, bound: [String],
                      line, col)
     let read = ld_lib(getter, [ld_var("buf", line, col), at,
                                 ld_int(lf_width(f), line, col)], line, col)
-    let ok = ld_tower(tname, rest, off + lf_width(f), [lf_name(f), ...bound], line, col)
-    let some_arm = Arm(mk_pat(PVariant(None, "Some", [mk_pat(PBind(lf_name(f)), line, col)]),
-                              line, col), None, ok)
-    let none_arm = Arm(mk_pat(PVariant(None, "None", []), line, col), None,
-                       ld_call("Err", [ld_expr(EStr(ld_short_msg(tname), false), line, col)],
+    let ok = ld_tower(d, rest, off + lf_width(f), [lf_name(f), ...bound], line, col)
+    let bind = mk_pat(PBind(binder_written(lf_name(f))), line, col)
+    let some_arm = Arm(mk_pat(PVariant(ref_written("Some"), [bind]), line, col), None, ok)
+    let none_arm = Arm(mk_pat(PVariant(ref_written("None"), []), line, col), None,
+                       ld_call("Err", [ld_expr(EStr(ld_short_msg(derive_type_name(d)), false), line, col)],
                                line, col))
     ld_expr(EMatch(read, [some_arm, none_arm]), line, col)
   }
@@ -189,12 +195,12 @@ fn ld_tower(tname: String, lfs: [LayoutField], off: Int, bound: [String],
 # `Ok(BinCursor { value: T { f: __attach_unit(f), .. }, pos: pos + width })`.
 # `__attach_unit` re-applies the field's brand so the plain `Int` the getter
 # returned fits the branded record field.
-fn ld_ok_cursor(tname: String, names: [String], width: Int,
+fn ld_ok_cursor(d: DeriveFor, names: [String], width: Int,
                 line: Int, col: Int) : Expr {
-  let rec_e = ld_expr(ERecordLit(ty_ref_none(), tname, ld_field_inits(names, line, col)), line, col)
+  let rec_e = ld_expr(ERecordLit(DrSym(d.t), ld_field_inits(names, line, col)), line, col)
   let end = ld_expr(EBinop(BoAdd, ld_var("pos", line, col), ld_int(width, line, col)),
                     line, col)
-  let cur = ld_expr(ERecordLit(ty_ref_none(), "BinCursor", [FI("value", rec_e), FI("pos", end)]),
+  let cur = ld_expr(ERecordLit(ref_written("BinCursor"), [FI("value", rec_e), FI("pos", end)]),
                     line, col)
   ld_call("Ok", [cur], line, col)
 }
