@@ -3848,11 +3848,42 @@ fn body_declares_ctor(body: TypeBody, s: SymId) : Bool = match body {
 # returns the typed module instead of an exit code. Errors are
 # folded into the returned module's decls just like a normal
 # infer_program run; consumers inspect `tm_decls` for emptiness.
-fn compile_to_module(file: String, decls: [Decl], tab: SymTab) : TypedModule / Console + File + Mutable {
-
-
-  let r = infer_program(file, decls, tab, false)
+fn compile_to_module(file: String, decls: [Decl], tin: TyperIn) : TypedModule / Console + File + Mutable {
+  let r = infer_program(file, decls, tin, false)
   TypedModule { tm_file: file, tm_decls: r.decls }
+}
+
+# A protocol registry whose impl targets carry the ids the typer stamps
+# types with, beside the view of it the typer reads. `stamped_registry`
+# is the only builder of either.
+type StampedView = StampedView(ProtoView)
+type Stamped = { reg: ProtocolReg, view: StampedView }
+
+# What a resolved program hands the typer in every mode, beside the
+# stream it types.
+type TyperFront = { df: DiagFiles, views: FileViews, target: String, roots: Roots,
+                    kind_theories: [KindTheory], edition: Edition }
+
+# Each impl entry takes its target's identity from the resolver the typer
+# stamps `TyCon`s with, over the same table, so dispatch compares
+# identities of one origin.
+fn stamped_registry(f: TyperFront, reg: ProtocolReg, decls: [Decl], tab: SymTab) : Stamped = {
+  let stamped = reg_with_target_ids(reg, tsh_homes(decls, tab, f.views, f.target, f.roots))
+  Stamped { reg: stamped, view: StampedView(pv_of(stamped)) }
+}
+
+fn stamped_view(f: TyperFront, reg: ProtocolReg, decls: [Decl], tab: SymTab) : StampedView =
+  stamped_registry(f, reg, decls, tab).view
+
+# The typer's inputs for the stream `decls` of the program `f` fronts.
+# The one place they are assembled: a mode that types a program asks
+# here, so none types it against a partial view of it. The registry
+# comes as its view, which carries no table: `Mutable` stays masked over
+# the caller's own.
+fn typer_in(f: TyperFront, protos: StampedView, decls: [Decl], tab: SymTab) : TyperIn = match protos {
+  StampedView(pv) -> TyperIn { df: f.df, protos: pv,
+                               head_owners: build_head_owner_map(decls, tab, f.target, f.edition),
+                               kind_theories: f.kind_theories, tab: tab, views: f.views, roots: f.roots }
 }
 
 # ---------------- JSON serialization ----------------
@@ -4291,9 +4322,9 @@ fn find_enc_call_stmt(s: Stmt, ql: Int, qc: Int, acc: Option[CallAt]) : Option[C
     _                      -> acc
   }
 
-fn dump_library_mode(file: String, src: String, decls: [Decl], tab: SymTab) : Int / Console + File + Mutable {
-
-  let tm = compile_to_module(file, decls, tab)
+fn dump_library_mode(file: String, src: String, decls: [Decl], tin: TyperIn) : Int / Console + File + Mutable {
+  let tab = tin.tab
+  let tm = compile_to_module(file, decls, tin)
   let probes = lib_collect_probes(src)
   let entries = lib_run_probes(tm, tab, decls, probes)
   print(concat_all([
@@ -5381,55 +5412,58 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
             else if axiom_name_coll != [] { vd_exit(json, [vd_rendered(axiom_name_coll)]) }
             else if vd_failed([kai_decl_vd]) { vd_exit(json, [kai_decl_vd]) }
             else {
+            let front = TyperFront { df: diag_ctx, views: sym_views, target: target_mod_name, roots: roots,
+                                     kind_theories: kind_theories, edition: edition_or_oldest(edition) }
             match mode {
               MAst -> { dump_program(surface_decls, tab0); 0 }
               MTypes -> { dump_types(doc_decls, own_tab); 0 }
               MEnv -> { dump_env(build_ty_env(all_decls, sym_tab).env); 0 }
               MInfer -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_infer(path, rd.decls, sym_tab) }
+                if rd.errs != 0 { rd.errs } else { let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab); dump_infer(path, rd.decls, tin) }
               }
               MDumpTyped -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_typed(path, rd.decls, sym_tab) }
+                if rd.errs != 0 { rd.errs } else { let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab); dump_typed(path, rd.decls, tin) }
               }
               MDumpTypedCore -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_typed_core(path, rd.decls, sym_tab) }
+                if rd.errs != 0 { rd.errs } else { let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab); dump_typed_core(path, rd.decls, tin) }
               }
               MDumpMono -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_mono(path, rd.decls, sym_tab) }
+                if rd.errs != 0 { rd.errs } else { let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab); dump_mono(path, rd.decls, tin) }
               }
               MDumpMonoOut -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_mono_out(path, rd.decls, sym_tab) }
+                if rd.errs != 0 { rd.errs } else { let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab); dump_mono_out(path, rd.decls, tin) }
               }
               MDumpRawSafe -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_rawsafe(path, rd.decls, sym_tab) }
+                if rd.errs != 0 { rd.errs } else { let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab); dump_rawsafe(path, rd.decls, tin) }
               }
               MDumpBorrowSafe -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_borrowsafe(path, rd.decls, sym_tab) }
+                if rd.errs != 0 { rd.errs } else { let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab); dump_borrowsafe(path, rd.decls, tin) }
               }
               MDumpLastUse -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_last_use(path, rd.decls, sym_tab) }
+                if rd.errs != 0 { rd.errs } else { let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab); dump_last_use(path, rd.decls, tin) }
               }
               MDumpIntervals -> {
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_intervals(path, rd.decls, sym_tab) }
+                if rd.errs != 0 { rd.errs } else { let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab); dump_intervals(path, rd.decls, tin) }
               }
               MDumpCallElision -> {
                 let rd = resolve_decls_stamped(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else {
-                  let head_owners = build_head_owner_map(all_decls, sym_tab, target_mod_name, edition_or_oldest(edition))
+                  let protos = stamped_view(front, lowered.reg, all_decls, sym_tab)
                   let fused = tailfuse_decls(all_decls, sym_tab, target_mod_name)
                   let typed_tab = st_extend(sym_tab, fused.rows)
-                  let typed = tcut_infer_program(path, diag_ctx, fused.decls, "", pv_of(lowered.reg), head_owners, kind_theories, typed_tab, sym_views, roots, false)
+                  let tin = typer_in(front, protos, all_decls, typed_tab)
+                  let typed = tcut_infer_program(path, fused.decls, "", tin, false)
                   if typed.errs != 0 { typed.errs } else { dump_call_elision(path, typed.decls, typed_tab) }
                 }
               }
@@ -5451,7 +5485,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # The typer knows the entry point by id, so the declarations
                 # are stamped first; a resolver error leaves them unstamped.
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                dump_evidence_obligations(path, rd.decls, sym_tab, entry)
+                let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab)
+                dump_evidence_obligations(path, rd.decls, tin, entry)
               }
               MDumpEvidenceArity -> {
                 # Injection-arity histogram for the §A.3 ABI spike. Runs
@@ -5460,7 +5495,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # reports the per-fn evidence-param count distribution.
                 # Analysis only; exit 0.
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                dump_evidence_arity(path, rd.decls, sym_tab, entry)
+                let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab)
+                dump_evidence_arity(path, rd.decls, tin, entry)
               }
               MDocJson -> {
                 # Docs are syntactic — dump the side table collected at
@@ -5475,25 +5511,21 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 # AST. Probes are read from `# @probe` comments in
                 # the source so a fixture is self-describing.
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
-                if rd.errs != 0 { rd.errs } else { dump_library_mode(path, src, rd.decls, sym_tab) }
+                if rd.errs != 0 { rd.errs } else { let tin = typer_in(front, stamped_view(front, lowered.reg, rd.decls, sym_tab), rd.decls, sym_tab); dump_library_mode(path, src, rd.decls, tin) }
               }
               MLint -> {
                 # Lints read the typed AST, so a clean typecheck is the
                 # precondition. A type-rejected program returns its error
                 # count (it is not a valid build); a clean one runs the
                 # lints and always exits 0 so a lint never blocks a build.
-                # The head-owner cache is the same one a build computes:
-                # a lint that rejected a pipe the build accepts would be
-                # unusable on idiomatic code.
+                # The typer reads what a build's does: a lint that rejected
+                # a pipe the build accepts would be unusable on idiomatic code.
                 let rd = resolve_decls_views(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else {
-                  run_lint(path, diag_ctx, lint_owned_mods(expanded), all_decls,
-                           post_use_decls,
-                           build_head_owner_map(all_decls, sym_tab,
-                                                target_mod_name, edition_or_oldest(edition)),
-                           sym_tab, sym_views)
+                  let tin = typer_in(front, stamped_view(front, lowered.reg, all_decls, sym_tab), all_decls, sym_tab)
+                  run_lint(path, lint_owned_mods(expanded), all_decls, post_use_decls, tin)
                 }
               }
               MLintJson -> {
@@ -5501,22 +5533,16 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                 let chk = rd.errs
                 let all_decls = rd.decls
                 if chk != 0 { chk } else {
-                  run_lint_json(path, diag_ctx, lint_owned_mods(expanded), all_decls,
-                                post_use_decls,
-                                build_head_owner_map(all_decls, sym_tab,
-                                                     target_mod_name, edition_or_oldest(edition)),
-                                sym_tab, sym_views)
+                  let tin = typer_in(front, stamped_view(front, lowered.reg, all_decls, sym_tab), all_decls, sym_tab)
+                  run_lint_json(path, lint_owned_mods(expanded), all_decls, post_use_decls, tin)
                 }
               }
               _ -> {
                 let rd = resolve_decls_stamped(diag_ctx, all_decls, sym_views, sym_tab, target_mod_name, callee_ops)
                 let chk = rd.errs
                 let all_decls = rd.decls
-                # Each impl entry takes its target's identity from the
-                # resolver the typer stamps `TyCon`s with, over the same
-                # table, so dispatch compares identities of one origin.
-                let proto_reg = reg_with_target_ids(proto_reg,
-                                  tsh_homes(all_decls, sym_tab, sym_views, target_mod_name, roots))
+                let stamped = stamped_registry(front, proto_reg, all_decls, sym_tab)
+                let proto_reg = stamped.reg
                 let stamp_ids = stamp_targets(proto_reg.impls, lowered.derived, core_mod_names(core_mods, []))
                 if chk != 0 { vd_exit(json, [Verdict(chk, rd.diags)]) }
                 else {
@@ -5540,7 +5566,6 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   let all_decls = match cut { CoreCut(kept, _) -> kept }
                   let dropped = match cut { CoreCut(_, d) -> d }
                   let pruned = match dropped { [] -> false _ -> true }
-                  let head_owners = build_head_owner_map(all_decls, sym_tab, target_mod_name, edition_or_oldest(edition))
                   # The typed blobs follow the sources, so an explicit
                   # project directory wins over the entry's own: the
                   # native paths compile a copy of the entry from an
@@ -5565,7 +5590,8 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                   let fused = tailfuse_decls(all_decls, sym_tab, target_mod_name)
                   # The fused functions are declarations the typer must name.
                   let typed_tab = st_extend(sym_tab, fused.rows)
-                  let typed_prog0 = tcut_infer_program(path, diag_ctx, fused.decls, tcut_dir, pv_of(proto_reg), head_owners, kind_theories, typed_tab, sym_views, roots, match mode { MDumpSymIds -> true _ -> false })
+                  let tin = typer_in(front, stamped.view, all_decls, typed_tab)
+                  let typed_prog0 = tcut_infer_program(path, fused.decls, tcut_dir, tin, match mode { MDumpSymIds -> true _ -> false })
                   # Contracts are discharged against the typed calls, where a
                   # pipe is the call it spells.
                   let contract_vd = if typed_prog0.errs != 0 { vd_count(0) }
@@ -5618,7 +5644,7 @@ fn compile_source(path: String, mode: Mode, backend: Backend, strict_holes: Bool
                                    vd_rendered(collision_errs), vd_rendered(name_errs)]
                   if vd_failed(typed_vds) { vd_exit(json, typed_vds) }
                   else {
-                    let hole_errs = if strict_holes { strict_holes_check(path, all_decls, sym_tab) } else { 0 }
+                    let hole_errs = if strict_holes { strict_holes_check(path, all_decls, tin) } else { 0 }
                     if hole_errs != 0 { vd_exit(json, [...typed_vds, vd_count(hole_errs)]) }
                     else if is_check_mode(mode) {
                       let mf = mono_front(typed_prog, proto_reg,

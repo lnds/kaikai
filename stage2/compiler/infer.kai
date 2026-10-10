@@ -87,6 +87,7 @@ import compiler.effect_alias
 import compiler.core_effects
 import compiler.scalar_ty
 import compiler.core_types
+import compiler.record_head
 
 # ====================================================================
 # Local mirrors of main.kai helpers (downward-glue rule, `inf_` prefix)
@@ -7417,17 +7418,16 @@ fn callee_display_name(st: InferState, callee: Expr) : Option[String] = {
   }
 }
 
-# A declaration as a diagnostic names it to the reader: by its name alone
-# when the reader's own module or the prelude declares it, under its
-# module otherwise, since a second module may declare the name too.
+# A declaration as a diagnostic names it to the reader: under its module
+# only when the program declares the name more than once. The reader's
+# own declaration and a builtin, whose home nobody writes, stay bare.
 fn decl_shown(st: InferState, s: SymId) : String = {
   let tab = st.env.tab
   let n = "#{decl_name(tab, s)}"
-  if not st_valid(tab, s) { n }
+  if not st_valid(tab, s) or not sym_contested(tab, s) { n }
   else {
     let owner = sym_owner(tab, s)
-    let v = st_scope(st)
-    if not st_valid(tab, owner) or sym_same(owner, v.home) or sv_is_core(v, owner) { n }
+    if not st_valid(tab, owner) or sym_same(owner, st_scope(st).home) or sym_same(owner, st_module_id(core_type_home())) { n }
     else { "#{home_shown(st, owner)}.#{n}" }
   }
 }
@@ -8557,7 +8557,7 @@ fn synth(st: InferState, e: Expr) : Inferred / Console + File + Mutable {
     EIf(c, t_, eo)             -> synth_if(st, c, t_, eo, e.line, e.col)
     EMatch(scr, arms)          -> synth_match(st, scr, arms, e.line, e.col)
     ELambda(ps, body)          -> synth_lambda(st, ps, body, e.line, e.col)
-    ERecordLit(rh, fis)        -> synth_record_lit(st, rh, fis, e.line, e.col)
+    ERecordLit(rh, fis)        -> synth_record_lit(st, rh, fis, TyAny, e.line, e.col)
     EList(els)                 -> synth_list_expr(st, els, e.line, e.col)
     ERange(lo, hi, stp)        -> synth_range(st, lo, hi, stp, e.line, e.col)
     EBlock(stmts, tail)        -> synth_block(st, stmts, tail, e.line, e.col)
@@ -9759,9 +9759,10 @@ fn arg_wants_vec_context(x: Expr, et: Ty) : Bool =
 
 # `synth_many` with the callee's declared params threaded per position.
 # The expected type routes a Vec-context arg (literal / collect) through
-# the bidirectional check, and coins a dimensioned numeric literal to the
-# parameter's declared carrier (`10.50<USD>` against `Decimal<USD>`);
-# every other arg keeps the plain synth path.
+# the bidirectional check, coins a dimensioned numeric literal to the
+# parameter's declared carrier (`10.50<USD>` against `Decimal<USD>`), and
+# names the record a bare literal head builds; every other arg keeps the
+# plain synth path.
 fn synth_many_vec_args(st: InferState, es: [Expr],
                        param_tys: [Ty]) : InferredList / Console + File + Mutable {
   match es {
@@ -9773,7 +9774,7 @@ fn synth_many_vec_args(st: InferState, es: [Expr],
         Some(et) ->
           if arg_wants_vec_context(x, et) {
             check_expr_against(st, x, et, "argument", x.line, x.col)
-          } else { synth(st, x) }
+          } else { synth_expecting(st, x, et) }
         None -> synth(st, x)
       }
       let lowered = match exp {
@@ -12600,7 +12601,7 @@ fn synth_pipe_plain(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) :
 # shape is accepted.)
 #
 # Construction: linear over `(decls, modules)`, called once per
-# `compile_source` invocation right before `infer_program_with_protos`
+# `compile_source` invocation right before `infer_program`
 # runs the typer over the same decl stream. Lookup at each pipe call
 # site is `find_head_owner` walking the cache; it is a small linear
 # list (one entry per `pub type` across all modules in scope) and the
@@ -12820,6 +12821,14 @@ fn pipe_op_dispatcher(pv: ProtoView, t: Ty, op: String) : Option[ExprKind] =
     None    -> None
   }
 
+# A pipe calls the op of the module that owns its head, and a mismatch
+# names the callee so; an op no module supplies keeps its own name.
+fn pipe_callee_shown(st: InferState, owner: SymId, op: String, qualified: Option[SymId], callee: Expr) : Option[String] =
+  match qualified {
+    Some(_) -> Some("#{sym_name(st.env.tab, owner)}.#{op}")
+    None    -> callee_display_name(st, callee)
+  }
+
 # `xs | f` where `f` takes the whole container instead of the element:
 # the pipe-stage parameter unifies with `lhs_ty` but not with its
 # element type. That is the `|` vs `|>` confusion, not a genuine type
@@ -12996,7 +13005,8 @@ fn synth_pipe_dispatch(st: InferState, cf: CoreFn, lhs: Expr, rhs: Expr,
               st_bump_err(st_fresh)
             }
             None ->
-              st_unify_call(st_fresh, pipe_callee, rc.ty, [rl.ty, rf.ty], expected, line, col)
+              st_unify_named(st_fresh, pipe_callee_shown(st_fresh, owner, op, qualified, pipe_callee),
+                             rc.ty, [rl.ty, rf.ty], expected, line, col)
           }
           match refine_call(st2, pipe_callee, rc.ty, [rl.expr, rf.expr], [rl.ty, rf.ty], apply_ty(st2.sub, rv.ty)) {
             RefCall(st3, ty) -> {
@@ -14186,28 +14196,34 @@ fn all_demands_local_in_list_elems(tab: SymTab, els: [ListElem], locals: [LocalI
   }
 }
 
-fn synth_record_lit(st: InferState, rh: DeclRef, fis: [FieldInit], line: Int, col: Int) : Inferred / Console + File + Mutable {
+fn synth_record_lit(st: InferState, rh: DeclRef, fis: [FieldInit], expected: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable {
 
 
-  # The record is the type the reference names from the module under
-  # inference: two modules' homonymous records are two declarations, and
-  # each literal reaches its reader's. The typed literal carries that
-  # declaration's id.
-  let named = tsh_tycon_at(st_home_view(st), rh, [])
-  let rsym = ty_head_sym(named)
-  match rec_pick(st.recs, rsym) {
+  # The typed literal carries the id of the record its head settles to,
+  # and its fields lie in the order that record declares: a field's slot
+  # is the declaration's, however the literal wrote it.
+  let head = record_head_sym(st, rh, expected, line, col)
+  match head_record(st.recs, head.sym) {
     None -> {
-      let r = synth_field_inits(st, fis, [], line, col)
+      let named = match head.sym {
+        Some(s) -> TyCon(s, [])
+        None    -> tsh_tycon_at(st_home_view(st), rh, [])
+      }
+      let r = synth_field_inits(head.st, fis, [], line, col)
       let root = with_ty(mk_expr(ERecordLit(rh, r.fis), line, col), named)
       mk_inferred(r.st, named, root)
     }
-    Some(ri) -> {
-      let inst = rec_instantiate(st, ri)
-      let r = synth_field_inits(inst.st, fis, inst.fields, line, col)
-      let st1 = check_record_lit_fields(r.st, rsym, fis, inst.fields, line, col)
-      let ty = apply_ty(st1.sub, inst.result_ty)
-      let root = with_ty(mk_expr(ERecordLit(DrSym(rsym), r.fis), line, col), ty)
-      mk_inferred(st1, ty, root)
+    Some(ri) -> match ri {
+      RI(rsym, _, fds, _) ->
+        if rh_out_of_order(fis, fds) { synth(head.st, rh_in_declared_order(DrSym(rsym), fis, fds, line, col)) }
+        else {
+          let inst = rec_instantiate(head.st, ri)
+          let r = synth_field_inits(inst.st, fis, inst.fields, line, col)
+          let st1 = check_record_lit_fields(r.st, rsym, fis, inst.fields, line, col)
+          let ty = apply_ty(st1.sub, inst.result_ty)
+          let root = with_ty(mk_expr(ERecordLit(DrSym(rsym), r.fis), line, col), ty)
+          mk_inferred(st1, ty, root)
+        }
     }
   }
 }
@@ -14395,7 +14411,7 @@ fn refine_coerce_value(m: MintedExpr, want: Ty, what: String, line: Int, col: In
     RcProven -> m
     RcRefuted(why) -> {
       # The refuted value and the refinement it carries read the locals in scope.
-      let names = ln_with_binder(st_local_names(m.st, m.pair.expr), pred_self_binder())
+      let names = ln_with_binder(st_local_names(m.st), pred_self_binder())
       let show = (e) => fmt_expr_text(e, m.st.env.tab, names)
       let perr = mk_diag(SevError, m.st.file, line, col, concat_all([what, ": ", loose_text(why, show, show)]), [])
       render_diag(perr)
@@ -14517,11 +14533,12 @@ fn local_text_in(es: [TyEntry], l: LocalId) : Written = match es {
   }
 }
 
-# The names a diagnostic printing `e` needs: `e` itself when it reads a local.
-fn st_local_names(st: InferState, e: Expr) : LocalNames = match e.kind {
-  ELocal(l) -> ln_with_binder(ln_empty(), Binder { id: l, name: st_local_text(st, l) })
-  _         -> ln_empty()
-}
+# The names a diagnostic printing an expression needs: every local in scope.
+fn st_local_names(st: InferState) : LocalNames =
+  foldl(st.env.entries, ln_empty(), (ns, en) => match en.key {
+    KLocal(b) -> ln_with_binder(ns, b)
+    _         -> ns
+  })
 
 # Where a join widened a type variable, so a later mismatch names it.
 fn widened_note(args_: [Expr], binds: [RvBind]) : String = match nth(args_, rv_widened_at(binds)) {
@@ -14691,8 +14708,17 @@ fn synth_let_rhs_or_mint(st: InferState, rhs: Expr, te: TypeExpr,
   match rhs.kind {
     EIntLit(_)     -> mint_let_textual(st, rhs, te, line, col)
     EDecimalLit(_) -> mint_let_textual(st, rhs, te, line, col)
+    # The annotation names the record a bare literal head builds.
+    ERecordLit(rh, fis) -> synth_record_lit(st, rh, fis, st_annot_ty(st, te), rhs.line, rhs.col)
     _ -> synth(st, rhs)
   }
+}
+
+# `e` where a type is expected: a record literal's head is asked of that
+# type first; any other shape is synthesised.
+fn synth_expecting(st: InferState, e: Expr, expected: Ty) : Inferred / Console + File + Mutable = match e.kind {
+  ERecordLit(rh, fis) -> synth_record_lit(st, rh, fis, expected, e.line, e.col)
+  _                   -> synth(st, e)
 }
 
 fn mint_let_textual(st: InferState, rhs: Expr, te: TypeExpr,
@@ -15264,18 +15290,64 @@ fn variant_arity_check(st: InferState, ps: [Pattern], tys: [Ty],
 # module decides when there is one.
 fn ref_ty_sym(hv: TyHomeView, r: DeclRef) : SymId = ut_ty_sym(tsh_tycon_at(hv, r, []))
 
+# The record a `Name { … }` head names, in a literal or a pattern. A bare
+# name is the expected type's record when that type is a record so named;
+# else it climbs the reader's scope over the records of the name, where a
+# type that is no record is no candidate. A name no record answers is
+# read as a type name is, for the diagnostics about it.
+fn record_head(st: InferState, r: DeclRef, expected: Ty) : Settled = match r {
+  DrSym(s)              -> SetOne(s)
+  DrWritten(Some(_), _) -> settle_sym(ref_ty_sym(st_home_view(st), r))
+  DrWritten(None, w)    -> {
+    let name = written_text(w)
+    let t = ut_ty_sym(apply_ty(st.sub, expected))
+    if record_named(st, t, name) { SetOne(t) }
+    else { match rh_on_ladder(st.env.tab, st_scope(st), st.recs, name) {
+      SvSym(s)    -> SetOne(s)
+      SvAmbig(ss) -> SetTie(ss)
+      _           -> settle_sym(ref_ty_sym(st_home_view(st), r))
+    } }
+  }
+}
+
+fn settle_sym(s: SymId) : Settled = if sym_raw(s) >= 0 { SetOne(s) } else { SetNone }
+
+# True when `t` is the record its own module declares as `name`.
+fn record_named(st: InferState, t: SymId, name: String) : Bool =
+  sym_raw(t) >= 0 and is_some(rec_find(st.recs, t)) and match st_lookup(st.env.tab, NCType, name, sym_owner(st.env.tab, t)) {
+    Some(s) -> sym_same(s, t)
+    None    -> false
+  }
+
+# A record head settled, its tie reported: no declaration when it names
+# none.
+type RecHead = { st: InferState, sym: Option[SymId] }
+
+fn record_head_sym(st: InferState, r: DeclRef, expected: Ty, line: Int, col: Int) : RecHead / Console + File =
+  match record_head(st, r, expected) {
+    SetOne(s)  -> RecHead { st: st, sym: Some(s) }
+    SetTie(ss) -> RecHead { st: report_tie(st, ref_text(st.env.tab, r), ss, false, line, col), sym: None }
+    _          -> RecHead { st: st, sym: None }
+  }
+
+fn head_record(recs: [RecInfo], s: Option[SymId]) : Option[RecInfo] = match s {
+  Some(x) -> rec_pick(recs, x)
+  None    -> None
+}
+
 # `Name { fields }` names a record type; the typed pattern holds its id.
 fn check_variant_record_pattern(st: InferState, r: DeclRef, pfs: [PField], expected: Ty, line: Int, col: Int) : PatChecked / Console + File + Mutable {
 
 
-  let rsym = ref_ty_sym(st_home_view(st), r)
-  match rec_pick(st.recs, rsym) {
+  let head = record_head_sym(st, r, expected, line, col)
+  match head_record(st.recs, head.sym) {
     None -> {
-      let fs = check_unknown_pfields(st, pfs)
+      let fs = check_unknown_pfields(head.st, pfs)
       PatChecked { st: fs.st, pat: mk_pat(PVariantRecord(r, fs.fields), line, col) }
     }
     Some(ri) -> {
-      let inst = rec_instantiate(st, ri)
+      let rsym = match ri { RI(s, _, _, _) -> s }
+      let inst = rec_instantiate(head.st, ri)
       let what = string_concat("record pattern '", string_concat(ref_text(st.env.tab, r), "'"))
       let s1 = st_unify(inst.st, expected, inst.result_ty, what, line, col)
       let fs = check_pfield_list(s1, pfs, ri, inst.fields, line, col)
@@ -16010,6 +16082,8 @@ fn check_expr_against(st: InferState, e: Expr, expected: Ty,
     # names a constructor of the expected sum picks its scheme.
     EName(_) -> nullary_ctor_check_or_synth(st, e, expected)
     ESym(_, _) -> nullary_ctor_check_or_synth(st, e, expected)
+    # A record literal's head is asked of the expected type first.
+    ERecordLit(rh, fis) -> synth_record_lit(st, rh, fis, expected, e.line, e.col)
     # thread expected into block tails so a
     # `{ ...stmts...; ctor(args) }` body benefits from the same
     # annotation-driven disambiguation as a bare ctor expression.
@@ -16488,7 +16562,7 @@ fn check_body_against_ret(st: InferState, body: Expr, expected: Ty,
     ECall(_, _) -> check_expr_against(st, body, expected, what, body.line, body.col)
     EName(_) -> check_expr_against(st, body, expected, what, body.line, body.col)
     ESym(_, _) -> check_expr_against(st, body, expected, what, body.line, body.col)
-    _ -> synth(st, body)
+    _ -> synth_expecting(st, body, expected)
   }
 }
 
@@ -18730,7 +18804,7 @@ fn reject_predicate_effect(st: InferState, kind: String, performed: [Label], con
       let line = if uline >= 0 { uline } else { cond.line }
       let col  = if ucol  >= 0 { ucol  } else { cond.col }
       let what = match callee_at(cond, line, col) {
-        Some(f) -> "calls effectful function `#{fmt_expr_text(f, st.env.tab, st_local_names(st, f))}`"
+        Some(f) -> "calls effectful function `#{fmt_expr_text(f, st.env.tab, st_local_names(st))}`"
         None    -> "performs `#{label_display(st.env.tab, st.env.head_owners, apply_label_args(st.sub, lab))}`"
       }
       let header = concat_all(["`", kind, "` predicate ", what, ". Refinement / contract predicates may only ",
@@ -19078,14 +19152,17 @@ pub fn merge_env_deltas(parent: ModuleEnvDelta, child: ModuleEnvDelta) : ModuleE
 #[doc("infer: one module's slice of the post-cascade decl stream — its home module name (`None` for the synthetic seed) and its decls.")]
 pub type ModuleDecls = { name: Option[String], decls: [Decl] }
 
+#[doc("infer: what the typer reads beside the declarations it types. `df` attributes each diagnostic to the file declaring what it fires on; `protos` is the registry whose impl targets carry the ids types are stamped with; `views` are the files' scopes and `roots` the compile's root modules.")]
+pub type TyperIn = { df: DiagFiles, protos: ProtoView, head_owners: [HeadOwnerEntry], kind_theories: [KindTheory],
+                     tab: SymTab, views: FileViews, roots: Roots }
+
 #[doc("infer: run HM + bidirectional inference over a program, returning the TypedProgram.")]
-pub fn infer_program(file: String, decls: [Decl], tab: SymTab, verbose: Bool) : TypedProgram / Console + File + Mutable =
-
-
-  infer_program_with_protos(file, decls, tab, verbose, pv_empty())
+pub fn infer_program(file: String, decls: [Decl], tin: TyperIn, verbose: Bool) : TypedProgram / Console + File + Mutable =
+  infer_program_with_protos_cached(file, tin.df, decls, verbose, tin.protos, tin.head_owners,
+                                   tin.kind_theories, tin.tab, tin.views, tin.roots)
 
 # pre-typer data tables collected once over the full
-# decl stream. `infer_program_with_protos` (and the per-module fold
+# decl stream. `infer_program` (and the per-module fold
 # composing it) read these tables; under scope A the cascade
 # computes them globally and the fold inherits them without
 # recomputing.
@@ -19220,7 +19297,7 @@ fn unit_alias_compose(child: [UAliasEntry], parent: [UAliasEntry])
 # and returns the typed decls plus the delta this module
 # contributes. The composed result of folding `typecheck_module`
 # over a list of modules is byte-identical to the monolithic
-# pre-refactor `infer_program_with_protos` on the concatenation.
+# whole-program inference on the concatenation.
 #
 # A single-module call collects ProgramData over its
 # `decls` and runs `infer_all_loop` once. Multi-module fold lives
@@ -19339,26 +19416,12 @@ fn take_op_eff_arities(xs: [OpEffArity], n: Int,
   } }
 }
 
-# fold `typecheck_module` left-to-right across the
-# per-module decl streams, threading the accumulating
-# `ModuleEnvDelta` as `inherited` for each segment. The fold is
-# trivial when `modules` has a single segment (the path every legacy
-# caller still uses): one iteration, `inherited = empty_delta`,
-# identical to the earlier flatten-and-call shape. Multi-segment
-# callers (the stdlib cache loader, core/user split) drive
-# real fold dynamics — see `typecheck_program_loop`.
-fn typecheck_program(file: String, df: DiagFiles, modules: [ModuleDecls],
-                      tab: SymTab, protos: ProtoView,
-                      verbose: Bool) : TypedProgram / Console + File + Mutable =
-  typecheck_program_with_head_owners(file, df, modules, protos,
-                                     head_owner_seed(), [], tab, fv_empty(),
-                                     roots_of(module_name_of_path(file), []), verbose)
-
+# Fold `typecheck_module` left-to-right across the per-module decl
+# streams, threading the accumulating `ModuleEnvDelta` as `inherited`
+# for each segment.
 # variant accepting the per-compile head-owner cache. The
 # cache is built once by `compile_source` after `expand_imports`
-# completes; callers that never build a module table (lints, dumps,
-# test helpers) pass `head_owner_seed()` so pipes over a list still
-# dispatch, while user `pub type` heads stay undiscoverable.
+# completes.
 fn typecheck_program_with_head_owners(file: String, df: DiagFiles, modules: [ModuleDecls],
                                        protos: ProtoView,
                                        head_owners: [HeadOwnerEntry],
@@ -19679,32 +19742,12 @@ fn buckets_finish(acc: [HomeBucket], out: [ModuleDecls]) : [ModuleDecls] =
          ...out])
   }
 
-# variant accepting a snapshot of the protocol impl table
-# from `lower_protocols`. `synth_binop` consults it to gate dispatch
-# on impl existence (heterogeneous `Real + Complex` etc.).
-#
-# thin wrapper around `typecheck_program` over a
-# single-module input. Every legacy caller of
-# infer_program_with_protos goes through here; the per-module fold
-# entry point is `typecheck_program`.
-# Kind theories: recomputed from the decl stream so the library/LSP
-# entry points get the theory dispatch too; the driver's main path
-# passes its pre-strip capture through the cached variant instead
-# (kind decls are stripped before the typer there).
-fn infer_program_with_protos(file: String, decls: [Decl], tab: SymTab, verbose: Bool,
-                               protos: ProtoView) : TypedProgram / Console + File + Mutable =
-  infer_program_with_protos_cached(file, diag_files_flat(file), decls, verbose,
-                                   protos, head_owner_seed(),
-                                   atomic_kind_theories(decls), tab, fv_empty(),
-                                   roots_of(module_name_of_path(file), []))
-
 # variant accepting the per-compile head-owner cache. The
 # `compile_source` driver builds the cache from the post-`expand_imports`
 # decl stream + module table once per invocation and passes it here so
 # `synth_pipe_dispatch` can resolve any in-scope `pub type T` against
 # its declaring module without a hardcoded compiler table.
-#[doc("infer: infer a program with protocol-impl registry + per-compile cache hooks. `df` attributes each diagnostic to the file declaring the decl it fires on; `roots` are the compile's root modules.")]
-pub fn infer_program_with_protos_cached(file: String, df: DiagFiles, decls: [Decl], verbose: Bool,
+fn infer_program_with_protos_cached(file: String, df: DiagFiles, decls: [Decl], verbose: Bool,
                                        protos: ProtoView,
                                        head_owners: [HeadOwnerEntry],
                                        kind_theories: [KindTheory],
