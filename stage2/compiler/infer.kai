@@ -41,6 +41,7 @@ import compiler.expr_positions
 import compiler.cont_crossing
 import compiler.handler_cover
 import compiler.decl_names
+import compiler.entry
 import compiler.symtab
 import compiler.symtab_build
 import compiler.modules
@@ -1422,27 +1423,28 @@ fn eff_already_in(acc: [Label], eff: String) : Bool = match acc {
 # builtins, so this function reads back the same labels it would
 # have read from an explicit annotation.
 
-fn check_default_coverage(df: DiagFiles, mod_decls: [Decl], all_decls: [Decl]) : [Diagnostic] / Console + File {
+fn check_default_coverage(df: DiagFiles, mod_decls: [Decl], all_decls: [Decl],
+                          homes: TyHomes) : [Diagnostic] / Console + File {
   # Precompute the `eff_name -> default ops` table once over `all_decls`,
   # then thread it through every per-DFn body walk so each `EHandle`
   # resolves its effect's default ops by assoc-list lookup instead of
   # re-scanning all declarations.
   let eff_map = build_effect_default_op_map(all_decls)
-  list_reverse(check_default_coverage_loop(df, all_decls, eff_map, mod_decls, []))
+  list_reverse(check_default_coverage_loop(df, all_decls, eff_map, homes, mod_decls, []))
 }
 
 
 fn check_default_coverage_loop(df: DiagFiles, all_decls: [Decl],
-                                eff_map: [EffDefaultOps], ds: [Decl],
+                                eff_map: [EffDefaultOps], homes: TyHomes, ds: [Decl],
                                 acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match ds {
     [] -> acc
     [d, ...rest] -> match d {
-      DFn(_, fname, _, _, _, _, body, _, _, _, fsym) -> {
-        let acc1 = walk_coverage_expr(decl_diag_file(d, df), all_decls, eff_map, fname, body, [], acc)
-        check_default_coverage_loop(df, all_decls, eff_map, rest, acc1)
+      DFn(_, _, _, _, _, _, body, _, _, mo, fsym) -> {
+        let acc1 = walk_coverage_expr(decl_diag_file(d, df), all_decls, eff_map, decl_is_entry(homes, mo, fsym), body, [], acc)
+        check_default_coverage_loop(df, all_decls, eff_map, homes, rest, acc1)
       }
-      _ -> check_default_coverage_loop(df, all_decls, eff_map, rest, acc)
+      _ -> check_default_coverage_loop(df, all_decls, eff_map, homes, rest, acc)
     }
   }
 }
@@ -1889,12 +1891,12 @@ fn find_top_eff_frame(stack: [HandleFrame], eff_name: String, esym: SymId) : Opt
   }
 }
 
-# walker over a typed (or pre-typed) Expr. `fname` is the
-# enclosing `DFn` name, used for the main-discharge step (step 4) and
-# for diagnostic context.
+# walker over a typed (or pre-typed) Expr. `entry` says the enclosing
+# `DFn` is the program's entry point, where the startup defaults
+# discharge an op no handler covers.
 
 fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
-                       fname: String,
+                       entry: Bool,
                        e: Expr, stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match e.kind {
     EInt(_, _)           -> acc
@@ -1917,81 +1919,81 @@ fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
     EVariantsOf(_, _) -> acc
     EModCall(_, _)    -> acc
     EIntrinsic(_, args_) ->
-      walk_coverage_list(file, decls, eff_map, fname, args_, stack, acc)
+      walk_coverage_list(file, decls, eff_map, entry, args_, stack, acc)
     ESurface(sf) ->
-      walk_coverage_list(file, decls, eff_map, fname, surface_children(sf), stack, acc)
+      walk_coverage_list(file, decls, eff_map, entry, surface_children(sf), stack, acc)
     ECall(callee, args_) -> {
       # Detect `Eff.op(...)` shape produced by synth_op_call_with_scheme.
       # The callee is `EVar("Eff.op")` (possibly with an `@alias` suffix on
       # the dispatch key — strip that before splitting).
       let csym = match callee.kind { ESym(s, _, _) -> s  _ -> sym_none() }
       let head_errs = match sym_read_kind(callee.kind) {
-        EVar(key) -> check_op_call_coverage(file, decls, eff_map, fname, key, csym,
+        EVar(key) -> check_op_call_coverage(file, decls, eff_map, entry, key, csym,
                                               stack, e.line, e.col)
         _ -> []
       }
       let acc1 = list_append(head_errs, acc)
-      let acc2 = walk_coverage_expr(file, decls, eff_map, fname, callee, stack, acc1)
-      walk_coverage_list(file, decls, eff_map, fname, args_, stack, acc2)
+      let acc2 = walk_coverage_expr(file, decls, eff_map, entry, callee, stack, acc1)
+      walk_coverage_list(file, decls, eff_map, entry, args_, stack, acc2)
     }
-    EField(base, _) -> walk_coverage_expr(file, decls, eff_map, fname, base, stack, acc)
+    EField(base, _) -> walk_coverage_expr(file, decls, eff_map, entry, base, stack, acc)
     EIndex(a, b)    -> {
-      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
-      walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, entry, a, stack, acc)
+      walk_coverage_expr(file, decls, eff_map, entry, b, stack, a1)
     }
     EBinop(_, a, b) -> {
-      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
-      walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, entry, a, stack, acc)
+      walk_coverage_expr(file, decls, eff_map, entry, b, stack, a1)
     }
-    EUnop(_, x)     -> walk_coverage_expr(file, decls, eff_map, fname, x, stack, acc)
+    EUnop(_, x)     -> walk_coverage_expr(file, decls, eff_map, entry, x, stack, acc)
     EIf(c, t, eo)   -> {
-      let a1 = walk_coverage_expr(file, decls, eff_map, fname, c, stack, acc)
-      let a2 = walk_coverage_expr(file, decls, eff_map, fname, t, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, entry, c, stack, acc)
+      let a2 = walk_coverage_expr(file, decls, eff_map, entry, t, stack, a1)
       match eo {
-        Some(b) -> walk_coverage_expr(file, decls, eff_map, fname, b, stack, a2)
+        Some(b) -> walk_coverage_expr(file, decls, eff_map, entry, b, stack, a2)
         None    -> a2
       }
     }
     EMatch(scr, arms) -> {
-      let a1 = walk_coverage_expr(file, decls, eff_map, fname, scr, stack, acc)
-      walk_coverage_arms(file, decls, eff_map, fname, arms, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, entry, scr, stack, acc)
+      walk_coverage_arms(file, decls, eff_map, entry, arms, stack, a1)
     }
     ELambda(_, _) -> acc           # lambda bodies have their own row
-    ERecordLit(_, _, fs) -> walk_coverage_fields(file, decls, eff_map, fname, fs, stack, acc)
-    EList(els)        -> walk_coverage_elems(file, decls, eff_map, fname, els, stack, acc)
+    ERecordLit(_, _, fs) -> walk_coverage_fields(file, decls, eff_map, entry, fs, stack, acc)
+    EList(els)        -> walk_coverage_elems(file, decls, eff_map, entry, els, stack, acc)
     ERange(a, b, opt) -> {
-      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
-      let a2 = walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, entry, a, stack, acc)
+      let a2 = walk_coverage_expr(file, decls, eff_map, entry, b, stack, a1)
       match opt {
-        Some(s) -> walk_coverage_expr(file, decls, eff_map, fname, s, stack, a2)
+        Some(s) -> walk_coverage_expr(file, decls, eff_map, entry, s, stack, a2)
         None    -> a2
       }
     }
     EBlock(stmts, tail) -> {
-      let a1 = walk_coverage_stmts(file, decls, eff_map, fname, stmts, stack, acc)
+      let a1 = walk_coverage_stmts(file, decls, eff_map, entry, stmts, stack, acc)
       match tail {
-        Some(t) -> walk_coverage_expr(file, decls, eff_map, fname, t, stack, a1)
+        Some(t) -> walk_coverage_expr(file, decls, eff_map, entry, t, stack, a1)
         None    -> a1
       }
     }
     EPipe(a, b)        -> {
-      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
-      walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, entry, a, stack, acc)
+      walk_coverage_expr(file, decls, eff_map, entry, b, stack, a1)
     }
     EMapPipe(a, b)     -> {
-      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
-      walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, entry, a, stack, acc)
+      walk_coverage_expr(file, decls, eff_map, entry, b, stack, a1)
     }
     EFlatMapPipe(a, b) -> {
-      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
-      walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, entry, a, stack, acc)
+      walk_coverage_expr(file, decls, eff_map, entry, b, stack, a1)
     }
     EFilterPipe(a, b)  -> {
-      let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
-      walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, entry, a, stack, acc)
+      walk_coverage_expr(file, decls, eff_map, entry, b, stack, a1)
     }
-    EBang(inner)       -> walk_coverage_expr(file, decls, eff_map, fname, inner, stack, acc)
-    ELitUnit(inner, _) -> walk_coverage_expr(file, decls, eff_map, fname, inner, stack, acc)
+    EBang(inner)       -> walk_coverage_expr(file, decls, eff_map, entry, inner, stack, acc)
+    ELitUnit(inner, _) -> walk_coverage_expr(file, decls, eff_map, entry, inner, stack, acc)
     EHandle(body, eff_name, hsym, _, init_opt, _, clauses, ret_opt) -> {
       let clause_ops = handle_clause_op_names(clauses)
       let default_ops = effect_default_op_map_get(eff_map, hsym)
@@ -1999,52 +2001,52 @@ fn walk_coverage_expr(file: String, decls: [Decl], eff_map: [EffDefaultOps],
       let missing = handler_missing_ops(effect_decl_of(hsym, decls), clause_ops, default_ops)
       let a0 = list_append(report_partial_handler(file, eff_name, missing, e.line, e.col), acc)
       let a1 = match init_opt {
-        Some(i) -> walk_coverage_expr(file, decls, eff_map, fname, i, stack, a0)
+        Some(i) -> walk_coverage_expr(file, decls, eff_map, entry, i, stack, a0)
         None    -> a0
       }
       # Clause bodies execute outside `with eff_name` (the typer enforces
       # this; clauses are separate functions). Walk them under the outer
       # stack so a Eff.op clause body that itself calls Eff.op is not
       # silently treated as discharged by this frame.
-      let a2 = walk_coverage_clauses(file, decls, eff_map, fname, clauses, stack, a1)
+      let a2 = walk_coverage_clauses(file, decls, eff_map, entry, clauses, stack, a1)
       let a3 = match ret_opt {
         Some(r) -> match r {
-          HR(_, b, _, _) -> walk_coverage_expr(file, decls, eff_map, fname, b, stack, a2)
+          HR(_, b, _, _) -> walk_coverage_expr(file, decls, eff_map, entry, b, stack, a2)
         }
         None -> a2
       }
-      walk_coverage_expr(file, decls, eff_map, fname, body, [frame, ...stack], a3)
+      walk_coverage_expr(file, decls, eff_map, entry, body, [frame, ...stack], a3)
     }
   }
 }
 
 
 fn walk_coverage_list(file: String, decls: [Decl], eff_map: [EffDefaultOps],
-                       fname: String,
+                       entry: Bool,
                        es: [Expr], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match es {
     []           -> acc
     [h, ...rest] -> {
-      let a1 = walk_coverage_expr(file, decls, eff_map, fname, h, stack, acc)
-      walk_coverage_list(file, decls, eff_map, fname, rest, stack, a1)
+      let a1 = walk_coverage_expr(file, decls, eff_map, entry, h, stack, acc)
+      walk_coverage_list(file, decls, eff_map, entry, rest, stack, a1)
     }
   }
 }
 
 
 fn walk_coverage_arms(file: String, decls: [Decl], eff_map: [EffDefaultOps],
-                       fname: String,
+                       entry: Bool,
                        arms: [Arm], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match arms {
     []           -> acc
     [a, ...rest] -> match a {
       Arm(_, og, body) -> {
         let a1 = match og {
-          Some(g) -> walk_coverage_expr(file, decls, eff_map, fname, g, stack, acc)
+          Some(g) -> walk_coverage_expr(file, decls, eff_map, entry, g, stack, acc)
           None    -> acc
         }
-        let a2 = walk_coverage_expr(file, decls, eff_map, fname, body, stack, a1)
-        walk_coverage_arms(file, decls, eff_map, fname, rest, stack, a2)
+        let a2 = walk_coverage_expr(file, decls, eff_map, entry, body, stack, a1)
+        walk_coverage_arms(file, decls, eff_map, entry, rest, stack, a2)
       }
     }
   }
@@ -2052,14 +2054,14 @@ fn walk_coverage_arms(file: String, decls: [Decl], eff_map: [EffDefaultOps],
 
 
 fn walk_coverage_fields(file: String, decls: [Decl], eff_map: [EffDefaultOps],
-                         fname: String,
+                         entry: Bool,
                          fs: [FieldInit], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match fs {
     []           -> acc
     [f, ...rest] -> match f {
       FI(_, e) -> {
-        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
-        walk_coverage_fields(file, decls, eff_map, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, entry, e, stack, acc)
+        walk_coverage_fields(file, decls, eff_map, entry, rest, stack, a1)
       }
     }
   }
@@ -2067,18 +2069,18 @@ fn walk_coverage_fields(file: String, decls: [Decl], eff_map: [EffDefaultOps],
 
 
 fn walk_coverage_elems(file: String, decls: [Decl], eff_map: [EffDefaultOps],
-                        fname: String,
+                        entry: Bool,
                         els: [ListElem], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match els {
     []            -> acc
     [el, ...rest] -> match el {
       ElPlain(e)  -> {
-        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
-        walk_coverage_elems(file, decls, eff_map, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, entry, e, stack, acc)
+        walk_coverage_elems(file, decls, eff_map, entry, rest, stack, a1)
       }
       ElSpread(e) -> {
-        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
-        walk_coverage_elems(file, decls, eff_map, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, entry, e, stack, acc)
+        walk_coverage_elems(file, decls, eff_map, entry, rest, stack, a1)
       }
     }
   }
@@ -2086,57 +2088,57 @@ fn walk_coverage_elems(file: String, decls: [Decl], eff_map: [EffDefaultOps],
 
 
 fn walk_coverage_stmts(file: String, decls: [Decl], eff_map: [EffDefaultOps],
-                        fname: String,
+                        entry: Bool,
                         ss: [Stmt], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match ss {
     []           -> acc
     [s, ...rest] -> match s {
       SLet(_, _, e) -> {
-        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
-        walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, entry, e, stack, acc)
+        walk_coverage_stmts(file, decls, eff_map, entry, rest, stack, a1)
       }
       SVar(_, _, e, _, _) -> {
-        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
-        walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, entry, e, stack, acc)
+        walk_coverage_stmts(file, decls, eff_map, entry, rest, stack, a1)
       }
       SAssert(e, og) -> {
-        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
+        let a1 = walk_coverage_expr(file, decls, eff_map, entry, e, stack, acc)
         let a2 = match og {
-          Some(g) -> walk_coverage_expr(file, decls, eff_map, fname, g, stack, a1)
+          Some(g) -> walk_coverage_expr(file, decls, eff_map, entry, g, stack, a1)
           None    -> a1
         }
-        walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, a2)
+        walk_coverage_stmts(file, decls, eff_map, entry, rest, stack, a2)
       }
       SExprStmt(e) -> {
-        let a1 = walk_coverage_expr(file, decls, eff_map, fname, e, stack, acc)
-        walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, entry, e, stack, acc)
+        walk_coverage_stmts(file, decls, eff_map, entry, rest, stack, a1)
       }
       SIndexAssign(a, b, c, _, _) -> {
-        let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
-        let a2 = walk_coverage_expr(file, decls, eff_map, fname, b, stack, a1)
-        let a3 = walk_coverage_expr(file, decls, eff_map, fname, c, stack, a2)
-        walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, a3)
+        let a1 = walk_coverage_expr(file, decls, eff_map, entry, a, stack, acc)
+        let a2 = walk_coverage_expr(file, decls, eff_map, entry, b, stack, a1)
+        let a3 = walk_coverage_expr(file, decls, eff_map, entry, c, stack, a2)
+        walk_coverage_stmts(file, decls, eff_map, entry, rest, stack, a3)
       }
       SAssign(a, c, _, _) -> {
-        let a1 = walk_coverage_expr(file, decls, eff_map, fname, a, stack, acc)
-        let a3 = walk_coverage_expr(file, decls, eff_map, fname, c, stack, a1)
-        walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, a3)
+        let a1 = walk_coverage_expr(file, decls, eff_map, entry, a, stack, acc)
+        let a3 = walk_coverage_expr(file, decls, eff_map, entry, c, stack, a1)
+        walk_coverage_stmts(file, decls, eff_map, entry, rest, stack, a3)
       }
-      SUse(_, _, _) -> walk_coverage_stmts(file, decls, eff_map, fname, rest, stack, acc)
+      SUse(_, _, _) -> walk_coverage_stmts(file, decls, eff_map, entry, rest, stack, acc)
     }
   }
 }
 
 
 fn walk_coverage_clauses(file: String, decls: [Decl], eff_map: [EffDefaultOps],
-                          fname: String,
+                          entry: Bool,
                           cs: [HClause], stack: [HandleFrame], acc: [Diagnostic]) : [Diagnostic] / Console + File {
   match cs {
     []           -> acc
     [c, ...rest] -> match c {
       HC(_, _, body, _, _) -> {
-        let a1 = walk_coverage_expr(file, decls, eff_map, fname, body, stack, acc)
-        walk_coverage_clauses(file, decls, eff_map, fname, rest, stack, a1)
+        let a1 = walk_coverage_expr(file, decls, eff_map, entry, body, stack, acc)
+        walk_coverage_clauses(file, decls, eff_map, entry, rest, stack, a1)
       }
     }
   }
@@ -2148,7 +2150,7 @@ fn walk_coverage_clauses(file: String, decls: [Decl], eff_map: [EffDefaultOps],
 # function call, FFI shim, etc.).
 
 fn check_op_call_coverage(file: String, decls: [Decl],
-                           eff_map: [EffDefaultOps], fname: String,
+                           eff_map: [EffDefaultOps], entry: Bool,
                            key: String, esym: SymId, stack: [HandleFrame],
                            line: Int, col: Int) : [Diagnostic] / Console + File {
   let bare = strip_alias_suffix(key)
@@ -2180,14 +2182,14 @@ fn check_op_call_coverage(file: String, decls: [Decl],
               # default block and synthesize the missing clauses; at
               # that point this branch flips to check `_default_ops`
               # and discharges.
-              [report_uncovered_op(file, fname, eff_name, op_name, esym, decls,
+              [report_uncovered_op(file, eff_name, op_name, esym, decls,
                                    line, col, false)]
             }
         }
         None ->
           # No enclosing handle for `eff_name`. The op either fires from
           # main (step 4) or escapes to the caller's row.
-          if fname == "main" {
+          if entry {
             # every effect (builtin or user) with a
             # source-level `default { }` block bridging via
             # `$extern_handler` gets auto-installed at main. The
@@ -2195,7 +2197,7 @@ fn check_op_call_coverage(file: String, decls: [Decl],
             let default_ops = effect_default_op_map_get(eff_map, esym)
             if list_has_string(default_ops, op_name) { [] }
             else {
-              [report_uncovered_op(file, fname, eff_name, op_name, esym, decls,
+              [report_uncovered_op(file, eff_name, op_name, esym, decls,
                                    line, col, true)]
             }
           }
@@ -2236,11 +2238,11 @@ fn is_effect_declared(eff_name: String, decls: [Decl]) : Bool {
 }
 
 # Emit the structured diagnostic for an unhandled op. The `at_main` flag
-# distinguishes "no handle, fname is main, default block does not cover
+# distinguishes "no handle at the entry point, default block does not cover
 # the op" from "enclosing handle exists, clauses omit the op, default
 # does not fill the gap" — the help lines differ.
 
-fn report_uncovered_op(file: String, fname: String, eff_raw: String,
+fn report_uncovered_op(file: String, eff_raw: String,
                         op_name: String, esym: SymId, decls: [Decl],
                         line: Int, col: Int, at_main: Bool) : Diagnostic / Console + File {
   # The row and the handler tables key the effect by its spelled name;
@@ -2450,10 +2452,13 @@ fn env_home_view(env: TyEnv, mo: Option[String]) : TyHomeView = tsh_view(env.ty_
 
 fn st_home_view(st: InferState) : TyHomeView = env_home_view(st.env, st_mo(st))
 
-fn st_mo(st: InferState) : Option[String] = if st.home == "" { None } else { Some(st.home) }
+fn st_mo(st: InferState) : Option[String] = st.home
 
 # The module a use in the decl under inference is read from.
-fn st_reader(st: InferState) : String = if st.home == "" { tsh_target(st.env.ty_homes) } else { st.home }
+fn st_reader(st: InferState) : String = match st.home {
+  Some(m) -> m
+  None    -> tsh_target(st.env.ty_homes)
+}
 
 fn ty_env_add(env: TyEnv, name: String, sc: TyScheme) : TyEnv {
   let k = ty_bucket_key(name)
@@ -4190,8 +4195,9 @@ and identity.
 pub fn fn_scheme_of_decl(d: Decl, row_kind_table: [RowKindEntry],
                          homes: TyHomes) : Option[TyScheme] {
   match d {
-    DFn(_, fname, tparams, params, opt_ret, rexpr, _, _, _, dmo, fsym) -> {
+    DFn(_, _, tparams, params, opt_ret, rexpr, _, _, _, dmo, fsym) -> {
       let hv = tsh_view(homes, dmo)
+      let phantom = elaborate_phantom_row(rexpr, decl_is_entry(homes, dmo, fsym))
       # collect row-variable names per decl, allocate small
       # bound ids (0, 1, ...) in order of appearance, build the body
       # type with those ids in tail positions. The scheme generalises
@@ -4232,7 +4238,7 @@ pub fn fn_scheme_of_decl(d: Decl, row_kind_table: [RowKindEntry],
       # elaboration. Excludes `main` (which absorbs builtin effects
       # under its REmpty branch in check_body_row).
       let phantom_id = list_length(rbinds)
-      let row = if elaborate_phantom_row(rexpr, fname) {
+      let row = if phantom {
         Row { labels: [], tail: Some(phantom_id), display_alias: None }
       } else {
         row_of_expr_with_binds(rexpr, tpbinds, rbinds, hv)
@@ -4247,7 +4253,7 @@ pub fn fn_scheme_of_decl(d: Decl, row_kind_table: [RowKindEntry],
       let split = tparam_id_split(effective_tparams)
       let rk_tvar_ids = tparam_type_ids_of(effective_tparams, rk_names)
       let tvars = remove_ints(split.tvars, rk_tvar_ids)
-      let rvars = if elaborate_phantom_row(rexpr, fname) {
+      let rvars = if phantom {
         list_append(rvbind_ids(rbinds), [phantom_id])
       } else {
         rvbind_ids(rbinds)
@@ -4260,16 +4266,22 @@ pub fn fn_scheme_of_decl(d: Decl, row_kind_table: [RowKindEntry],
 }
 
 # predicate gating the elaboration of a phantom row
-# variable on a fn signature lacking a `/` row clause. `main` is
+# variable on a fn signature lacking a `/` row clause. The entry point is
 # excluded because `check_body_row`'s REmpty branch absorbs builtin
 # effects there; adding a phantom row var would interfere with that
 # special-case.
-fn elaborate_phantom_row(rexpr: RowExpr, fname: String) : Bool {
+fn elaborate_phantom_row(rexpr: RowExpr, entry: Bool) : Bool {
   match rexpr {
-    REmpty -> fname != "main"
+    REmpty -> not entry
     _      -> false
   }
 }
+
+# A file types the same whether it is the root or loaded as a module (an
+# import, a member of a grouped test build), so the entry rules apply to
+# the function each module would start at were it the root.
+fn decl_is_entry(hs: TyHomes, mo: Option[String], f: FnId) : Bool =
+  is_file_entry(tsh_target(hs), mo, f)
 
 # walk a decl's signature for lowercase identifiers in type
 # position, appending them in first-seen order. Skip names already
@@ -7236,10 +7248,10 @@ type InferState = { file: String, env: TyEnv, core_len: Int, sub: Subst, recs: [
                     in_clause: ClauseCont,
                     # the decl a refinement violation names.
                     refine_ctx: String,
-                    # module the decl under inference belongs to; "" for
+                    # module the decl under inference belongs to; `None` for
                     # the root file. A constructor this home declares is
                     # never ambiguous at a use site inside it.
-                    home: String,
+                    home: Option[String],
                     # Row variables the body performs by applying a
                     # function whose row ends in one, with the call site.
                     row_tails: [TailUse],
@@ -7366,7 +7378,7 @@ fn infer_state_new_full_aliases(file: String, env: TyEnv, core_len: Int,
                recs: recs, errs: 0, insts: [], holes: [], row: [],
                eff_uses: [], aliases: [], clause_resume: None,
                op_eff_arities: op_eff_arities, ret_ty: None,
-               type_aliases: type_aliases, op_to_eff: op_to_eff, proto_impls: [], sums: [], diags: [], deferred_fields: [], deferred_homs: [], op_payload_labels: [], op_res: [], in_clause: CcNone, refine_ctx: "", home: "", row_tails: [], sig_rows: [], decl_row: [] }
+               type_aliases: type_aliases, op_to_eff: op_to_eff, proto_impls: [], sums: [], diags: [], deferred_fields: [], deferred_homs: [], op_payload_labels: [], op_res: [], in_clause: CcNone, refine_ctx: "", home: None, row_tails: [], sig_rows: [], decl_row: [] }
 
 fn st_set_proto_impls(st: InferState, pis: [ProtoImplReg]) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
@@ -7707,10 +7719,7 @@ fn st_set_clause_resume(st: InferState, rb: Option[ResumeBind]) : InferState =
                ret_ty: st.ret_ty, type_aliases: st.type_aliases, op_to_eff: st.op_to_eff, proto_impls: st.proto_impls, sums: st.sums, diags: st.diags, deferred_fields: st.deferred_fields, deferred_homs: st.deferred_homs, op_payload_labels: st.op_payload_labels, op_res: st.op_res, in_clause: st.in_clause, refine_ctx: st.refine_ctx, home: st.home, row_tails: st.row_tails, sig_rows: st.sig_rows, decl_row: st.decl_row }
 
 # mark whether the current scope is a handler op-clause body.
-fn st_set_home(st: InferState, mo: Option[String]) : InferState =
-  st_set_home_str(st, match mo { None -> "" Some(m) -> m })
-
-fn st_set_home_str(st: InferState, h: String) : InferState =
+fn st_set_home(st: InferState, h: Option[String]) : InferState =
   InferState { file: st.file, env: st.env, core_len: st.core_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
@@ -16521,7 +16530,7 @@ fn report_ctor_ambiguity_if_any(st: InferState, cname: String,
 fn report_ctor_parents_if_ambiguous(st: InferState, cname: String,
                                     line: Int, col: Int) : InferState / Console + File {
   let parents = ty_env_qualified_parents_excluding_builtin(st.env, cname)
-  if list_length(parents) <= 1 or st.home == "" { st }
+  if list_length(parents) <= 1 or is_none(st.home) { st }
   else {
     let perr = mk_diag(SevError, st.file, line, col,
       concat_all(["ambiguous constructor '", cname,
@@ -18423,10 +18432,10 @@ fn hole_row_handling(base: HoleRow, handled: [Label]) : HoleRow = match base {
   HRowLabels(declared, _, a) -> HRowLabels(declared, handled, a)
 }
 
-# `main` without a row absorbs the default-handled effects, as
+# The entry point without a row absorbs the default-handled effects, as
 # `check_body_row` does.
-fn fn_hole_row(st: InferState, nm: String, row: RowExpr) : HoleRow = match row {
-  REmpty       -> HRowLabels([], [], nm == "main")
+fn fn_hole_row(st: InferState, entry: Bool, row: RowExpr) : HoleRow = match row {
+  REmpty       -> HRowLabels([], [], entry)
   RClosed(lbs) -> HRowLabels(apply_labels(st.sub, st_annot_labels(st, lbs)), [], false)
   ROpen(_, _)  -> HRowOpen
 }
@@ -18516,7 +18525,8 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # Without this advance, the inferencer's first fresh row var
       # would alias `phantom_id = len(rbinds)`, which the scheme
       # already quantifies over.
-      let phantom_extra = if elaborate_phantom_row(row, nm) { 1 } else { 0 }
+      let entry = decl_is_entry(env.ty_homes, mo, fsym)
+      let phantom_extra = if elaborate_phantom_row(row, entry) { 1 } else { 0 }
       let st0 = advance_row_fresh(InferState { ...st_init, sig_rows: rbinds }, list_length(rbinds) + phantom_extra)
       # mk_tpbinds allocates ids 0..n-1 for the fn-level tparams, but
       # infer_state_new starts env.fresh at 0 too. Without bumping the
@@ -18614,7 +18624,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # `mask_local_mutable_demand` and is a no-op when `Mutable`
       # is not in the row to begin with.
       let st1c = check_cont_crossings(mask_local_mutable_demand(st1b, ps, rb.expr), rb.expr)
-      let st2pre = check_body_row(st1c, nm, row, rbinds, line, col, all_decls)
+      let st2pre = check_body_row(st1c, nm, entry, row, rbinds, line, col, all_decls)
       # drain the deferred field-access constraints now that
       # the body's tyvars have settled — `check_body_row` above unified
       # the inferred effect row against the declared one, so a generic
@@ -18644,7 +18654,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # instances authored in the user's root file from those that
       # come through core or other modules.
       let resolved0 = resolve_callsites(list_reverse(st2.insts), st2.sub, mo)
-      let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub, HOwner(nm, map(ps, (p) => p.pname)), fn_hole_row(st2, nm, row))
+      let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub, HOwner(nm, map(ps, (p) => p.pname)), fn_hole_row(st2, entry, row))
       # apply the final substitution to every
       # `Expr.ty` annotation in the body so the post-inference protocol-
       # call rewrite can read concrete head types from sites whose
@@ -18698,7 +18708,7 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       # higher-order helpers like `inf_map_expr_kind` (which pass
       # lambdas with effecting bodies) keep their current shape.
       let final_row = match row {
-        REmpty -> if nm == "main" {
+        REmpty -> if entry {
           let extended = collect_call_labels(final_body, st2.row)
           inferred_main_row(extended)
         } else { row }
@@ -19239,11 +19249,11 @@ fn subst_tparams_tes(ts: [TypeExpr], mapping: [TParamMapEntry]) : [TypeExpr] {
 # Every effect the body performs, including the labels and tail of each
 # row variable it performs, must appear in the declared row. Row
 # variables resolve only once the body is typed, so they are checked here.
-fn check_body_row(st: InferState, fname: String, declared: RowExpr, rbinds: [RVBind],
+fn check_body_row(st: InferState, fname: String, entry: Bool, declared: RowExpr, rbinds: [RVBind],
                   line: Int, col: Int, decls: [Decl]) : InferState / Console + File + Mutable =
   if declares_row_hole(declared) { st }
   else {
-    let st1 = check_body_labels(st_add_tail_labels(st, st.row_tails), fname, declared, line, col, decls)
+    let st1 = check_body_labels(st_add_tail_labels(st, st.row_tails), fname, entry, declared, line, col, decls)
     match rbinds {
       [] -> st1
       _  -> check_body_tails(st1, fname, declared_root(st.sub, declared, rbinds), rbinds, st.row_tails)
@@ -19329,7 +19339,7 @@ fn report_row_var_unhandled(st: InferState, fname: String, n: String, line: Int,
   st_bump_err(st_push_diag(st, d))
 }
 
-fn check_body_labels(st: InferState, fname: String, declared: RowExpr,
+fn check_body_labels(st: InferState, fname: String, entry: Bool, declared: RowExpr,
                      line: Int, col: Int, decls: [Decl]) : InferState / Console + File + Mutable {
   # every body label must match a declared label by eff name AND
   # unifiable ty_args. An open declared row's tail is the caller's row
@@ -19360,7 +19370,7 @@ fn check_body_labels(st: InferState, fname: String, declared: RowExpr,
       # also absorb user-declared effects that carry a
       # source-level `default { }` block. Stage A's `default_setups_from_block`
       # wires shims for them at `main`, so the runtime IS evidence-backed.
-      if fname == "main" {
+      if entry {
         check_body_row_label_loop(st, fname,
                                   only_non_absorbed_labels(st, st.row, decls),
                                   [], line, col)
@@ -19376,7 +19386,7 @@ fn check_body_labels(st: InferState, fname: String, declared: RowExpr,
       let st1 = check_body_row_label_loop(st, fname, st.row,
                                             st_annot_labels(st, lbs),
                                             line, col)
-      if fname == "main" {
+      if entry {
         check_main_row_handlable(st1, st.row, line, col, decls)
       } else { st1 }
     }
@@ -20087,7 +20097,7 @@ pub fn typecheck_module(file: String, df: DiagFiles, mod: ModuleDecls,
   # performs the op. Without this, `is_effect_declared` returns false
   # for any user effect declared in the same file but partitioned away
   # from its `fn main()`, silencing the per-op coverage walker.
-  let cov_diags = check_default_coverage(df, tp.decls, all_decls_for_typer)
+  let cov_diags = check_default_coverage(df, tp.decls, all_decls_for_typer, sh.homes)
   let priv_diags = check_field_privacy(df, tsh_view(sh.homes, mod.name), tp.decls,
     if list_length(all_program_decls) > 0 { sh.field_recs } else { field_recs_of(data.decls_a) })
   let spawn_diags = check_spawn_rows(df, data.recs, tp.decls, all_decls_for_typer)

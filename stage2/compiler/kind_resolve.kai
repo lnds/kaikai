@@ -215,10 +215,10 @@ fn skl_loop(xs: [SymKinds], sym: String) : [String] = match xs {
 # The single `use kind` open for `sym` as seen from `home`: the used
 # kind that `sym` also inhabits, if exactly one such kind exists and
 # the open was written by the resolving module. Returns None otherwise.
-fn used_kind_for(c: KindCtx, home: String, candidates: [String]) : Option[String] =
+fn used_kind_for(c: KindCtx, home: Option[String], candidates: [String]) : Option[String] =
   ukf_loop(kc_uses(c), home, candidates, None)
 
-fn ukf_loop(uses: [HomedDecl], home: String, candidates: [String],
+fn ukf_loop(uses: [HomedDecl], home: Option[String], candidates: [String],
             found: Option[String]) : Option[String] = match uses {
   [] -> found
   [u, ...rest] ->
@@ -230,11 +230,14 @@ fn ukf_loop(uses: [HomedDecl], home: String, candidates: [String],
     } else { ukf_loop(rest, home, candidates, found) }
 }
 
-# An open resolves for the module that wrote it. The empty home is the
-# root file, whose decls carry no module origin.
-fn use_kind_visible_at(u: HomedDecl, home: String) : Bool = match hd_home(u) {
-  None    -> home == ""
-  Some(m) -> m == home
+# An open resolves for the module that wrote it. A root-file open carries
+# no module origin and resolves for the reader that names no module.
+fn use_kind_visible_at(u: HomedDecl, home: Option[String]) : Bool = match hd_home(u) {
+  None    -> is_none(home)
+  Some(m) -> match home {
+    Some(h) -> m == h
+    None    -> false
+  }
 }
 
 # Result of resolving one bare symbol: the qualified rewrite, an error
@@ -244,16 +247,16 @@ pub type SymRes = SRok(String) | SRunknown | SRambig([String]) | SRambigMod([Str
 
 #[doc("Resolve a bare habitant symbol with no use-site module (module-scoped names are already spelled by the rewrite when this is reached).")]
 pub fn resolve_sym(c: KindCtx, locals: [String], sym: String) : SymRes =
-  resolve_sym_from(c, locals, sym, "")
+  resolve_sym_from(c, locals, sym, None)
 
 # Resolve a bare habitant symbol under the precedence. A symbol already
 # carrying a qualifier (explicit `<Metric.m>`, or an idempotent second
 # pass) is returned unchanged; so is a unit-kind tparam in local scope
 # (`[u: Metric]` binds `u` as a unit variable, never a habitant) and a
 # built-in symbol.
-#[doc("Resolve a bare habitant symbol as seen from the module `home`: a name declared by several modules resolves against the sites its module may see, its own declaration first.")]
+#[doc("Resolve a bare habitant symbol as seen from the module `home`, `None` when no module reads it: a name declared by several modules resolves against the sites its module may see, its own declaration first.")]
 pub fn resolve_sym_from(c: KindCtx, locals: [String], sym: String,
-      home: String) : SymRes {
+      home: Option[String]) : SymRes {
   # Already qualified, module-qualified, or a local unit-kind tparam —
   # leave unchanged.
   if kind_sym_is_qualified(sym) or mod_sym_has_home(sym) or list_has(locals, sym) {
@@ -271,7 +274,7 @@ pub fn resolve_sym_from(c: KindCtx, locals: [String], sym: String,
 # habitant (`<3>`, `<"tag">`) resolves by its literal's domain against
 # the form-b (`with Int` / `with String`) kinds; a symbol resolves by
 # name against the declared-habitant map.
-fn rs_unscoped(c: KindCtx, sym: String, home: String) : SymRes =
+fn rs_unscoped(c: KindCtx, sym: String, home: Option[String]) : SymRes =
   if list_has(kc_aliases(c), sym) { SRok(sym) }
   else {
     let candidates = match unit_sym_value_domain(sym) {
@@ -283,7 +286,7 @@ fn rs_unscoped(c: KindCtx, sym: String, home: String) : SymRes =
 
 # The precedence over a candidate-kind list: unique wins, `use kind`
 # breaks a tie, anything else is ambiguous.
-fn pick_candidate(c: KindCtx, sym: String, home: String,
+fn pick_candidate(c: KindCtx, sym: String, home: Option[String],
                   candidates: [String]) : SymRes = match candidates {
   [] -> SRunknown
   [only] -> SRok(kind_qualify_nondefault(only, sym))
@@ -301,14 +304,16 @@ fn pick_candidate(c: KindCtx, sym: String, home: String,
 # its home module exactly when the chosen kind still has the name
 # declared in several modules, so unrelated atoms stop unifying.
 
-fn rs_module_scoped(c: KindCtx, sym: String, home: String) : Option[SymRes] = {
+fn rs_module_scoped(c: KindCtx, sym: String, home: Option[String]) : Option[SymRes] = {
   let sites = unit_sites_for(kc_sites(c), sym)
   if list_length(unit_sites_homes(sites)) < 2 { None }
   else {
-    let own = unit_sites_own(sites, home)
-    match own {
-      [] -> Some(rs_foreign(c, sym, sites, home))
-      _  -> Some(rs_pick_at(c, sym, home, own, sites))
+    match home {
+      None    -> Some(rs_foreign(c, sym, sites, home))
+      Some(h) -> match unit_sites_own(sites, h) {
+        []  -> Some(rs_foreign(c, sym, sites, home))
+        own -> Some(rs_pick_at(c, sym, h, own, sites))
+      }
     }
   }
 }
@@ -322,7 +327,7 @@ fn rs_pick_at(c: KindCtx, sym: String, at_home: String, chosen: [UnitSite],
   if unit_sites_all_alias(chosen) {
     SRok(unit_spell(sym, at_home, unit_name_multi_at(all_sites, measure_kind_name())))
   } else {
-    match pick_candidate(c, sym, at_home, unit_sites_kinds(chosen)) {
+    match pick_candidate(c, sym, Some(at_home), unit_sites_kinds(chosen)) {
       SRok(_) -> rs_pick_kind_at(c, sym, at_home, chosen, all_sites)
       r -> r
     }
@@ -330,14 +335,14 @@ fn rs_pick_at(c: KindCtx, sym: String, at_home: String, chosen: [UnitSite],
 
 fn rs_pick_kind_at(c: KindCtx, sym: String, at_home: String,
       chosen: [UnitSite], all_sites: [UnitSite]) : SymRes = {
-  let k = rs_chosen_kind(c, at_home, unit_sites_kinds(chosen))
+  let k = rs_chosen_kind(c, Some(at_home), unit_sites_kinds(chosen))
   SRok(kind_qualify_nondefault(k,
     unit_spell(sym, at_home, unit_name_multi_at(all_sites, k))))
 }
 
 # The kind pick_candidate already accepted: unique, or the `use kind`
 # tie-break.
-fn rs_chosen_kind(c: KindCtx, home: String, kinds: [String]) : String = match kinds {
+fn rs_chosen_kind(c: KindCtx, home: Option[String], kinds: [String]) : String = match kinds {
   [only] -> only
   _ -> match used_kind_for(c, home, kinds) {
     Some(k) -> k
@@ -349,8 +354,8 @@ fn rs_chosen_kind(c: KindCtx, home: String, kinds: [String]) : String = match ki
 # alias with atoms (or several alias homes) is unresolvable — an alias
 # expands by bare name, so no spelling separates the candidates.
 fn rs_foreign(c: KindCtx, sym: String, sites: [UnitSite],
-      home: String) : SymRes = {
-  let vis = rs_visible_rung(c, unit_sites_pub_foreign(sites, home), home)
+      home: Option[String]) : SymRes = {
+  let vis = rs_visible_rung(c, rs_pub_foreign(sites, home), home)
   let homes = unit_sites_homes(vis)
   match homes {
     [] -> SRok(sym)   # only non-exported foreign declarations: the privacy validator reports the reference
@@ -370,20 +375,28 @@ fn rs_foreign(c: KindCtx, sym: String, sites: [UnitSite],
 # of the cores, which every module sees without importing. No home (the
 # validator's view of a symbol the rewrite left bare) sees every exported
 # site, as does a view with neither imports nor cores.
-fn rs_visible_rung(c: KindCtx, vis: [UnitSite], home: String) : [UnitSite] =
-  if home == "" { vis }
-  else {
+fn rs_visible_rung(c: KindCtx, vis: [UnitSite], home: Option[String]) : [UnitSite] = match home {
+  None    -> vis
+  Some(h) -> {
     let v = kc_view(c)
-    let seen = unit_sites_in(vis, list_append(mod_imports_of(v.imports, home), v.cores))
+    let seen = unit_sites_in(vis, list_append(mod_imports_of(v.imports, h), v.cores))
     if list_length(seen) > 0 { seen } else { vis }
   }
+}
+
+# The exported sites outside the reader's own module; every exported site
+# when no module reads.
+fn rs_pub_foreign(sites: [UnitSite], home: Option[String]) : [UnitSite] = match home {
+  Some(h) -> unit_sites_pub_foreign(sites, h)
+  None    -> filter(sites, (s) => match s { USite(_, _, p, _, _) -> p })
+}
 
 fn mod_imports_of(imps: [ModImports], home: String) : [String] = match imps {
   [] -> []
   [MImp(o, names), ...rest] -> if o == home { names } else { mod_imports_of(rest, home) }
 }
 
-fn rs_foreign_kind(c: KindCtx, sym: String, home: String, vis: [UnitSite],
+fn rs_foreign_kind(c: KindCtx, sym: String, home: Option[String], vis: [UnitSite],
       sites: [UnitSite]) : SymRes = {
   let k = rs_chosen_kind(c, home, unit_sites_kinds(vis))
   let khomes = unit_sites_homes(unit_sites_of_kind(vis, k))
@@ -406,7 +419,7 @@ fn rewrite_unit(c: KindCtx, locals: [String], home: String,
       u: UnitExprT) : UnitExprT = match u {
   UOne -> u
   UVar(_) -> u
-  USym(s) -> match resolve_sym_from(c, locals, s, home) { SRok(q) -> USym(q) _ -> u }
+  USym(s) -> match resolve_sym_from(c, locals, s, Some(home)) { SRok(q) -> USym(q) _ -> u }
   UMul(a, b) -> UMul(rewrite_unit(c, locals, home, a), rewrite_unit(c, locals, home, b))
   UInv(a) -> UInv(rewrite_unit(c, locals, home, a))
   UPow(a, n) -> UPow(rewrite_unit(c, locals, home, a), n)

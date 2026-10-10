@@ -10,6 +10,7 @@
 # layer around it).
 
 import compiler.ast
+import compiler.entry
 import compiler.home_tu
 import compiler.util
 import compiler.fnreg
@@ -39,7 +40,7 @@ import compiler.infer.{is_lifecycle_clause}
 # (design §5).
 pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
                     fns: [EFn], variants: [VariantEntry], target_origin: Option[String], raw_binders: [RawArmBinder],
-                    traps: Bool, stamp_ids: [SymId]) : KProgram / Console {
+                    traps: Bool, stamp_ids: [SymId], entry: SymId) : KProgram / Console {
   let types = lower_types(raw_decls, variants, [])
   # The lifted-lambda table is the SAME analysis the emitters run
   # (`collect_decls` over the global-name set) — reused, not re-derived.
@@ -56,7 +57,7 @@ pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
   # (`emit_reuse_donate`), keyed on the mangled symbol, so both backends
   # pick one capable set and the reuse ABI cannot diverge between them.
   let capable = rd_scan_capable(raw_decls)
-  let kfns    = lower_fns(raw_decls, st0, freg, capable, [])
+  let kfns    = lower_fns(raw_decls, st0, freg, capable, entry, [])
   # Each lifted lambda becomes a top-level `KFnLambda`, and each handler
   # clause a `KFnClause` (mirror of emit_c's `emit_lam_helpers` /
   # `emit_clause_bodies`), appended after the ordinary fns.
@@ -72,11 +73,11 @@ pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
   KProgram { types: types,
              fns: list_append(kfns, list_append(lamfns, list_append(clsfns, rs.fns))),
              handlers: canon_handler_op_order(lower_handler_decls(lc.clauses, lc.clauses, []), raw_decls),
-             install_order: kir_install_order(raw_decls),
-             defaults: kir_default_handlers(raw_decls),
+             install_order: kir_install_order(raw_decls, entry),
+             defaults: kir_default_handlers(raw_decls, entry),
              runner_defaults: kir_runner_default_handlers(raw_decls),
              synth_defaults: kir_synth_handler_effects(raw_decls),
-             regions: lower_regions(regions, []), runners: rs.runners }
+             regions: lower_regions(regions, []), runners: rs.runners, entry: entry }
 }
 
 # The runner KFns + the KRunner index, built together so the emitted
@@ -109,19 +110,19 @@ fn lower_runner_loop(decls: [Decl], st: LowerSt, freg: [ExternTypeReg],
       # body's lambdas, so `find_lam` resolves a lambda inside the test
       # body (a bare `_kai_test_<i>` sym would leave it "non-callable").
       let sym = runner_enc_fn("test", mo, line, col)
-      let kfn = lower_fn(sym, [], None, None, body, None, body_fns, st, freg, false)
+      let kfn = lower_fn(sym, [], None, None, body, None, body_fns, st, freg, false, false)
       let r = KRunner { sym: sym, desc: desc, kind: KRTest, line: line, home: runner_home(mo) }
       lower_runner_loop(rest, st, freg, body_fns, ti + 1, bi, [kfn, ...fns_acc], [r, ...run_acc])
     }
     DBench(desc, body, line, col, mo) -> {
       let sym = runner_enc_fn("bench", mo, line, col)
-      let kfn = lower_fn(sym, [], None, None, body, None, body_fns, st, freg, false)
+      let kfn = lower_fn(sym, [], None, None, body, None, body_fns, st, freg, false, false)
       let r = KRunner { sym: sym, desc: desc, kind: KRBench, line: line, home: runner_home(mo) }
       lower_runner_loop(rest, st, freg, body_fns, ti, bi + 1, [kfn, ...fns_acc], [r, ...run_acc])
     }
     DCheck(desc, ps, body, line, col, mo) -> {
       let sym = runner_enc_fn("check", mo, line, col)
-      let kfn = lower_fn(sym, ps, None, None, body, None, body_fns, st, freg, false)
+      let kfn = lower_fn(sym, ps, None, None, body, None, body_fns, st, freg, false, false)
       let r = KRunner { sym: sym, desc: desc, kind: KRCheck(check_param_specs(ps)), line: line, home: runner_home(mo) }
       lower_runner_loop(rest, st, freg, body_fns, ti, bi, [kfn, ...fns_acc], [r, ...run_acc])
     }
@@ -158,21 +159,22 @@ fn collect_lams(decls: [Decl], fns: [EFn], variants: [VariantEntry]) : LamCollec
 
 # --- Ordinary functions -------------------------------------------------
 
-fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], capable: [String], acc: [KFn]) : [KFn] / Console = match ds {
+fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], capable: [String], entry: SymId, acc: [KFn]) : [KFn] / Console = match ds {
   [] -> list_reverse(acc)
   [d, ...rest] -> match d {
-    DFn(_, name, _, params, ret_ty, row, body, _, _, _, _) -> {
+    DFn(_, name, _, params, ret_ty, row, body, _, _, _, fid) -> {
       # `home_tu(d)` is the fn's home TU (== its `mo` for a DFn); the
       # KFn carries it so the native partitioner reads the partition off
       # the KFn instead of re-deriving it.
       let mo = home_tu(d)
-      # `main` never takes the donor param: the runtime entry calls it
+      # The entry point never takes the donor param: the runtime calls it
       # directly, outside the donor-aware call funnel.
-      let dn = name != "main" and rd_is_capable(c_sym(name, mo), capable)
-      let kfn = lower_fn(name, params, ret_ty, Some(row), body, mo, st.fns, st, freg, dn)
-      lower_fns(rest, st, freg, capable, [kfn, ...acc])
+      let ent = is_entry(entry, fid)
+      let dn = not ent and rd_is_capable(c_sym(name, mo), capable)
+      let kfn = lower_fn(name, params, ret_ty, Some(row), body, mo, st.fns, st, freg, dn, ent)
+      lower_fns(rest, st, freg, capable, entry, [kfn, ...acc])
     }
-    _ -> lower_fns(rest, st, freg, capable, acc)
+    _ -> lower_fns(rest, st, freg, capable, entry, acc)
   }
 }
 
@@ -181,7 +183,7 @@ fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], capable: [String], 
 # The body lowers into the entry block and whatever blocks the control
 # flow forks off; the final value seals the last block with `KRet`.
 fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr], row: Option[RowExpr],
-            body: Expr, mo: Option[String], body_fns: [EFn], st0: LowerSt, freg: [ExternTypeReg], dn: Bool) : KFn / Console {
+            body: Expr, mo: Option[String], body_fns: [EFn], st0: LowerSt, freg: [ExternTypeReg], dn: Bool, ent: Bool) : KFn / Console {
   let sym = c_sym(name, mo)
   # Enter WITH the EFn table already rotated to prefer `mo` (this fn's
   # module) by the cached `lower_fns` loop, so a bare call inside the body
@@ -222,7 +224,7 @@ fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr], row: Option
     let c_symbol = ffi_extern_symbol_of(body, name)
     KFn { sym: ffi_wrapper_sym(name, mo), kind: KFnFfi(c_symbol, ffi_param_kinds(params, freg), kffi_kind_of_ret(ret_ty, freg)),
           params: kparams, ret: slot_of_ty(ret_ty), blocks: [],
-          region_id: None, stateful: false, mo: mo, donor: false }
+          region_id: None, stateful: false, mo: mo, donor: false, entry: false }
   } else {
     # A `__proto_<op>` dispatcher's body is an `ETodo` marker that the shared
     # lowering would otherwise reduce to a panic stub (the native path then
@@ -251,7 +253,7 @@ fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr], row: Option
     match r {
       LRes(val, st1) -> KFn { sym: sym, kind: KFnNormal, params: kparams,
                               ret: ret_slot, blocks: ls_finish(st1, KRet(val, kpos_of(body))),
-                              region_id: None, stateful: false, mo: mo, donor: dn }
+                              region_id: None, stateful: false, mo: mo, donor: dn, entry: ent }
     }
   }
 }
@@ -398,7 +400,7 @@ fn lower_lam_fn(l: LamInfo, st0: LowerSt, body_fns: [EFn]) : KFn / Console = mat
       let st2 = lam_drop_params(params, st1)
       KFn { sym: sym, kind: KFnLambda, params: kparams, ret: SBoxed,
             blocks: ls_finish(st2, KRet(val, kpos_of(body))), region_id: None,
-            stateful: false, mo: None, donor: false } } }
+            stateful: false, mo: None, donor: false, entry: false } } }
   }
 }
 
@@ -523,7 +525,7 @@ fn lower_clause_fn(c: ClauseInfo, all_cls: [ClauseInfo], st0: LowerSt, body_fns:
       check_resume_one_shot(sym, blocks)
       KFn { sym: sym, kind: if is_fin { KFnCleanup } else { KFnClause },
             params: kparams, ret: SBoxed,
-            blocks: blocks, region_id: None, stateful: stateful, mo: None, donor: false }
+            blocks: blocks, region_id: None, stateful: stateful, mo: None, donor: false, entry: false }
     } }
   }
 }
