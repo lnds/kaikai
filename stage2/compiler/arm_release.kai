@@ -1,30 +1,77 @@
 #[doc("""
-Whether an owned match hands its scrutinee back as an arm starts.
+How an owned match lets go of its scrutinee in each arm.
 
 An arm binder is bound with a reference of its own while the scrutinee's
 cell keeps its reference to the same value until the match ends, so inside
 the arm no binder is unique and a write through one copies. Under a flat
 constructor pattern every binder owns its value once bound, and the arm
-reads the cell again only to rebuild into it. When it does not, and it
-hands a binder on, the match releases the cell before the body runs.
+reads the cell again only to rebuild into it.
 
-An arm that releases every binder itself hands none on: an early release
-would gain nothing, and each child would die by a release of its own
-instead of inside the cell's. Both emitters ask here.
+When it does not, the arm takes the cell apart as it starts: a sole owner
+hands its children to the binders and frees the shell alone, with no dup
+and no cascade; a shared cell dups what the arm bound and loses one
+reference. An arm that cannot take the cell apart still drops it first
+when it hands a binder on. Both emitters ask here.
 """)]
 
 import compiler.ast
 import compiler.emit_shared
 import compiler.expr_exists
+import compiler.kir_pat_alias
 import compiler.perceus
 import compiler.perceus_reads
 import compiler.trmc_exit_drops
 
-#[doc("True when the body of an arm gains from an early release of the scrutinee and never needs its cell: `pat` is a constructor over plain binders, `body` leaves one of them to a consumer, and it neither rebuilds into the cell nor steps a modulo-cons loop through it.")]
-pub fn arm_frees_scrutinee(pat: Pattern, body: Expr) : Bool = match pat.pkind {
+#[doc("Where one arm of an owned match releases the scrutinee: at the exit of the match, by a drop as the arm starts, or taken apart as the arm starts.")]
+pub type ScrRelease = ScrKept | ScrFreed | ScrTaken
+
+#[doc("What taking a cell apart needs: the binders of its pointer slots, its slot kinds, and the mask of the pointer slots no binder took.")]
+pub type ArmTake = ArmTake([String], [Int], Int)
+
+#[doc("How the arm `pat -> body` of an owned match releases its scrutinee. `may_take` is false where the cell cannot be taken apart: behind a guard, which may still reject the arm, or inside a region.")]
+pub fn arm_release(pat: Pattern, body: Expr, may_take: Bool) : ScrRelease = match pat.pkind {
   PVariant(_, _, subs) ->
-    arl_flat(subs) and arl_hands_on(subs, txd_wrap_drops(body)) and not xp_exists(body, false, arl_needs_cell)
-  _ -> false
+    if arl_flat(subs) and not xp_exists(body, false, arl_needs_cell) { arl_how(subs, body, may_take) }
+    else { ScrKept }
+  _ -> ScrKept
+}
+
+#[doc("True when `r` leaves the scrutinee to the exit of the match.")]
+pub fn scr_kept(r: ScrRelease) : Bool = match r {
+  ScrKept -> true
+  _       -> false
+}
+
+#[doc("The plan to take apart the cell a flat constructor pattern matched.")]
+pub fn arm_take_plan(pat: Pattern, vs: [VariantEntry]) : ArmTake = match pat.pkind {
+  PVariant(_, _, subs) -> arl_plan(subs, arl_kinds(pat_slot_kinds(pat, vs)))
+  _                    -> ArmTake([], [], 0)
+}
+
+# An unknown constructor stores every slot as a pointer.
+fn arl_kinds(ks: Option[[Int]]) : [Int] = match ks {
+  Some(xs) -> xs
+  None     -> []
+}
+
+fn arl_plan(subs: [Pattern], ks: [Int]) : ArmTake =
+  ArmTake(arl_ptr_binders(subs, ks, 0), ks, arl_mask(subs, ks, 0, 1))
+
+fn arl_ptr_binders(subs: [Pattern], ks: [Int], i: Int) : [String] = match subs {
+  []           -> []
+  [p, ...rest] -> match p.pkind {
+    PBind(nm) -> if kind_at(ks, i) == 0 { [nm, ...arl_ptr_binders(rest, ks, i + 1)] } else { arl_ptr_binders(rest, ks, i + 1) }
+    _         -> arl_ptr_binders(rest, ks, i + 1)
+  }
+}
+
+# One bit per slot: `bit` is the bit of slot `i`.
+fn arl_mask(subs: [Pattern], ks: [Int], i: Int, bit: Int) : Int = match subs {
+  []           -> 0
+  [p, ...rest] -> match p.pkind {
+    PWild -> (if kind_at(ks, i) == 0 { bit } else { 0 }) + arl_mask(rest, ks, i + 1, 2 * bit)
+    _     -> arl_mask(rest, ks, i + 1, 2 * bit)
+  }
 }
 
 fn arl_flat(subs: [Pattern]) : Bool = match subs {
@@ -33,6 +80,20 @@ fn arl_flat(subs: [Pattern]) : Bool = match subs {
     PBind(_) -> arl_flat(rest)
     PWild    -> arl_flat(rest)
     _        -> false
+  }
+}
+
+# The mask holds one bit per slot, and a take with no binder gains nothing.
+fn arl_how(subs: [Pattern], body: Expr, may_take: Bool) : ScrRelease =
+  if may_take and list_length(subs) <= 30 and arl_binds(subs) { ScrTaken }
+  else if arl_hands_on(subs, txd_wrap_drops(body)) { ScrFreed }
+  else { ScrKept }
+
+fn arl_binds(subs: [Pattern]) : Bool = match subs {
+  []           -> false
+  [p, ...rest] -> match p.pkind {
+    PBind(_) -> true
+    _        -> arl_binds(rest)
   }
 }
 

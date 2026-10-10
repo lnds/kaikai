@@ -6784,6 +6784,33 @@ static inline void kai_reuse_free(KaiReuse at) {
 #endif
 }
 
+/* A flat arm takes apart the variant cell its pattern matched. A sole owner
+ * hands its children to the arm's binders: the pointer slots in `unbound`,
+ * which no binder took, are released, and the shell is freed with no
+ * cascade. A shared cell loses one reference and returns 0: the caller then
+ * dups the children it bound. The unique half stays out of line, so an
+ * arm's prologue is a refcount test. */
+__attribute__((noinline)) KAI_RT_SHARED void kai_arm_take_shell(KaiValue *v, uint32_t unbound) {
+    for (int i = 0; unbound != 0; ++i, unbound >>= 1) {
+        if (unbound & 1u) kai_decref(kai_var_slots(v)[i].ptr);
+    }
+    KAI_VAR_NAME_FREE(kai_variant_name_of(v->variant_tag));
+    kai_var_block_free(v, v->var_n_args);
+    kai_rc_count_free();
+#ifdef KAI_TRACE_RC
+    kai_rc_free_by_tag[(int) KAI_VARIANT]++;
+#endif
+}
+
+static inline int kai_arm_take(KaiValue *v, uint32_t unbound) {
+    if (kai_check_unique(v)) { kai_arm_take_shell(v, unbound); return 1; }
+    if (kai_is_ptr(v) && v->rc != INT32_MAX) {
+        KAI_RC_TRAFFIC_INC(kai_rc_decref_total);
+        v->rc -= 1;
+    }
+    return 0;
+}
+
 /* TRMC reuse-in-place (Koka kk_block_drop_reuse + kk_block_alloc_at,
  * fused for the TRMC modulo-cons site). `_scr` is the variant cell the
  * enclosing `match` arm just consumed. When it is UNIQUE and has the
