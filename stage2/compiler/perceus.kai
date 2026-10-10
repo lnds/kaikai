@@ -442,6 +442,11 @@ fn pcs_borrow_positions(pnames: [String], bset: [String], i: Int) : [Int] = matc
 #[doc("Borrowed parameter positions registered for `key`, or the empty list.")]
 pub fn pcs_borrow_lookup(bmap: BorrowMap, key: String) : [Int] = bm_lookup(bmap, key)
 
+# The slots `f` borrows, for a call that takes `nm` bare; no other call's
+# slots change what a walk tracking `nm` decides, so its key is never built.
+fn pcs_lent_slots(nm: String, f: Expr, xs: [Expr], bmap: BorrowMap) : [Int] =
+  if pcs_any_arg_is_var(nm, xs) { pcs_borrow_slots(bmap, f) } else { [] }
+
 # An empty map answers no slot, so the callee's key is never built for it.
 fn pcs_borrow_slots(bmap: BorrowMap, f: Expr) : [Int] = match bmap {
   BEmpty -> []
@@ -939,15 +944,9 @@ fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: ConsumeIndex, bm: Bor
     if pcs_any_arg_is_lambda(xs) and (pcs_name_in_exprs(nm, xs) or pcs_name_in_expr(nm, f)) {
       false
     } else {
-      let key = pcs_callee_key(f)
-      let consumed = cix_lookup(cmap, key)
-      let is_ctor = match sym_read_kind(f.kind) {
-        EVar(c)        -> pcs_name_is_ctor(c)
-        EModCall(_, c) -> pcs_name_is_ctor(c)
-        _              -> false
-      }
       pcs_consuming_slots_kind(nm, f.kind, cmap, bm) and
-        pcs_consuming_args(nm, xs, list_append(consumed, pcs_borrow_lookup(bm, key)), is_ctor, 0, cmap, bm)
+        (if pcs_any_arg_is_var(nm, xs) { pcs_consuming_call_args(nm, f, xs, cmap, bm) }
+         else { pcs_consuming_args(nm, xs, [], false, 0, cmap, bm) })
     }
   }
   EMatch(s, arms) -> {
@@ -967,6 +966,17 @@ fn pcs_consuming_slots_kind(nm: String, k: ExprKind, cmap: ConsumeIndex, bm: Bor
   # move-safe, an assert message blocks on mere presence (it only runs
   # on the aborting path), and the remaining roles apply the slot check.
   _ -> pcs_consuming_slots_ps(nm, xp_positions_kind(k), cmap, bm)
+}
+
+# The callee's slots matter only to a call that takes `nm` bare.
+fn pcs_consuming_call_args(nm: String, f: Expr, xs: [Expr], cmap: ConsumeIndex, bm: BorrowMap) : Bool = {
+  let key = pcs_callee_key(f)
+  let is_ctor = match sym_read_kind(f.kind) {
+    EVar(c)        -> pcs_name_is_ctor(c)
+    EModCall(_, c) -> pcs_name_is_ctor(c)
+    _              -> false
+  }
+  pcs_consuming_args(nm, xs, list_append(cix_lookup(cmap, key), pcs_borrow_lookup(bm, key)), is_ctor, 0, cmap, bm)
 }
 
 fn pcs_consuming_slots_ps(nm: String, ps: [XPos], cmap: ConsumeIndex, bm: BorrowMap) : Bool = match ps {
@@ -1514,7 +1524,7 @@ fn perceus_decl_b(d: Decl, fns: FnIndex, bmap: BorrowMap, cmap: ConsumeIndex, op
         let skip_set0 = pcs_list_union(
           pcs_list_union(
             pcs_list_union(
-              pcs_list_union(pcs_branch_aware_skip_params(pnames, body, bmap), borrowed),
+              pcs_list_union(pcs_params_moved_raw(pnames, body, uses, bmap, pcs_list_union(raw_pnames, borrowed)), borrowed),
               arm_moves),
             goto_moves),
           raw_pnames)
@@ -2477,8 +2487,9 @@ fn pcs_max_paths_b_kind(nm: String, k: ExprKind, bmap: BorrowMap) : Int = match 
   EStr(span, is_triple) -> pcs_interp_ident_count(nm, span, is_triple)
   ECall(f, xs)        -> {
     # Discount args that land in a borrowed slot of the callee: those uses
-    # of `nm` are borrows, not consumers, and do not count.
-    let positions = pcs_borrow_slots(bmap, f)
+    # of `nm` are borrows, not consumers, and do not count. The slots are
+    # looked up only for a call that takes `nm` bare.
+    let positions = if pcs_any_arg_bare(nm, xs) { pcs_borrow_slots(bmap, f) } else { [] }
     pcs_max_paths_b_expr(nm, f, bmap) + pcs_max_paths_b_args(nm, xs, positions, 0, bmap)
   }
   # Branch positions are alternatives of each other — the count takes
@@ -2558,8 +2569,8 @@ pub fn pcs_branch_aware_skip_params(pnames: [String], body: Expr,
                                     bmap: BorrowMap) : [String] = match pnames {
   []           -> []
   [h, ...rest] -> {
-    # A lent read ahead of the move is a second read to the branch planter,
-    # which then declines; every path consumes, so it has nothing to plant.
+    # Borrowed reads still count here: the branch planter assumes one read
+    # per path, and a lent read ahead of the move is a second one.
     let rest_skip = pcs_branch_aware_skip_params(rest, body, bmap)
     if pcs_param_moves_raw(h, body, bmap) { [h, ...rest_skip] } else { rest_skip }
   }
@@ -2567,9 +2578,31 @@ pub fn pcs_branch_aware_skip_params(pnames: [String], body: Expr,
 
 # Each condition walks the body, so a failing one spares the rest.
 fn pcs_param_moves_raw(h: String, body: Expr, bmap: BorrowMap) : Bool =
-  (pcs_max_paths_in_expr(h, body) <= 1 or pcs_lends_end_first(h, body, bmap)) and
-  pcs_consumed_b_expr(h, body, bmap) and
-  pcs_all_consumers_linear(h, body)
+  pcs_max_paths_in_expr(h, body) <= 1 and pcs_param_consumed_linear(h, body, bmap)
+
+fn pcs_param_consumed_linear(h: String, body: Expr, bmap: BorrowMap) : Bool =
+  pcs_consumed_b_expr(h, body, bmap) and pcs_all_consumers_linear(h, body)
+
+# A param read twice on some path that every path hands over at one owning
+# read, after its lends. `held` names the params that hold no reference.
+fn pcs_param_lends_then_moves(h: String, body: Expr, uses: UseIx, held: [String], bmap: BorrowMap) : Bool =
+  not list_has(held, h) and not pcs_uses_have_in_lam(uses, h) and
+  pcs_lends_end_first(h, body, bmap) and
+  pcs_all_consumers_linear(h, body) and
+  pcs_consumed_b_expr(h, body, bmap)
+
+# The params Perceus moves raw. One read per path decides as the TCO pass
+# does; only a param read twice on some path is walked for lends. The TCO
+# pass needs no copy of that second rule: it widens its skip-set with every
+# param the rewrite left bare in an owned position. The branch planter
+# declines a lent read ahead of the move as a second read, and has nothing
+# to plant for a param every path consumes.
+fn pcs_params_moved_raw(pnames: [String], body: Expr, uses: UseIx, bmap: BorrowMap, held: [String]) : [String] =
+  filter(pnames, (h) => pcs_param_moves(h, body, uses, bmap, held))
+
+fn pcs_param_moves(h: String, body: Expr, uses: UseIx, bmap: BorrowMap, held: [String]) : Bool =
+  if pcs_max_paths_in_expr(h, body) <= 1 { pcs_param_consumed_linear(h, body, bmap) }
+  else { pcs_param_lends_then_moves(h, body, uses, held, bmap) }
 
 # One owning read on every path, every lend on that path over before it.
 fn pcs_lends_end_first(nm: String, e: Expr, bmap: BorrowMap) : Bool =
@@ -2667,7 +2700,7 @@ fn pcs_bac_st(bad: Bool, done: Bool, pending: Bool) : PcsBac = PcsBac { bad: bad
 fn pcs_bac(nm: String, e: Expr, bmap: BorrowMap, st: PcsBac) : PcsBac = match sym_read_kind(e.kind) {
   EVar(u)         -> pcs_bac_st(st.bad, st.done, st.pending or u == nm)
   ECall(f, xs)    -> {
-    let a = pcs_bac_args(nm, xs, pcs_borrow_slots(bmap, f), 0, bmap,
+    let a = pcs_bac_args(nm, xs, pcs_lent_slots(nm, f, xs, bmap), 0, bmap,
                          pcs_bac_st(st.bad, st.done, false))
     if pcs_name_is_ctor(pcs_callee_name(f)) { pcs_bac_st(a.bad, a.done, st.pending or a.pending) }
     else { pcs_bac_st(a.bad, a.done or a.pending, st.pending) }
@@ -3524,7 +3557,7 @@ fn pcs_consumed_b_expr(nm: String, e: Expr, bmap: BorrowMap) : Bool = match sym_
   }
   ECall(f, xs)     -> {
     if pcs_consumed_b_expr(nm, f, bmap) { true }
-    else { pcs_consumed_b_args(nm, xs, pcs_borrow_slots(bmap, f), 0, bmap) }
+    else { pcs_consumed_b_args(nm, xs, pcs_lent_slots(nm, f, xs, bmap), 0, bmap) }
   }
   _                -> pcs_consumed_b_ps(nm, xp_positions(e), bmap)
 }
