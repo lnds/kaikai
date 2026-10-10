@@ -21,23 +21,31 @@ import compiler.pub_access_decl
 import compiler.pub_access_table
 import compiler.pa_index
 import compiler.resolve
+import compiler.decl_names
+import compiler.symtab
+import compiler.symtab_build
+import compiler.written
 
 type PaVerdict = PaVisible | PaPrivateTo(String) | PaUnknown
 
 type PaMeta = { name: String, kind: String, is_pub: Bool }
 
+# What every reference of one declaration is checked against.
+type PaCx = { table: PaIndex, tab: SymTab, home: String, target_mod: String,
+      cores: [String], file: String }
+
 #[doc("Validate module privacy over the per-module decl segments: the violations, in source order. `bounds` carries every module's fn tparam bounds, keyed by the module that declares the fn (the parser strips them from the stored tparams into a side table).")]
-pub fn validate_pub_access(segs: [CoreSegment], bounds: [FnBoundsRec],
+pub fn validate_pub_access(segs: [CoreSegment], tab: SymTab, bounds: [FnBoundsRec],
       target_mod: String, cores: [String],
       df: DiagFiles) : [Diagnostic] / Console + File {
-  let table = pai_build(pa_table(segs))
-  let e1 = pa_check_segs(segs, table, target_mod, cores, df, [])
-  list_reverse(pa_check_bound_segs(segs, bounds, table, df, e1))
+  let table = pai_build(pa_table(segs, tab))
+  let e1 = pa_check_segs(segs, table, tab, target_mod, cores, df, [])
+  list_reverse(pa_check_bound_segs(segs, bounds, table, tab, df, e1))
 }
 
 #[doc("The top-level names a root-file reference cannot reach: every carrier is non-`pub` in a foreign module.")]
-pub fn pa_hidden_from_root(segs: [CoreSegment], target_mod: String) : [String] = {
-  let entries = pa_table(segs)
+pub fn pa_hidden_from_root(segs: [CoreSegment], tab: SymTab, target_mod: String) : [String] = {
+  let entries = pa_table(segs, tab)
   pa_hidden_loop(entries, pai_build(entries), target_mod, [])
 }
 
@@ -140,92 +148,121 @@ fn pa_is_ctor(k: PaKind) : Bool = match k {
 
 # Each segment carries its own module, so the diagnostics for its
 # decls name that module's file rather than the root path.
-fn pa_check_segs(segs: [CoreSegment], table: PaIndex, target_mod: String,
+fn pa_check_segs(segs: [CoreSegment], table: PaIndex, tab: SymTab, target_mod: String,
       cores: [String], df: DiagFiles,
       errs: [Diagnostic]) : [Diagnostic] / Console + File = match segs {
   [] -> errs
-  [PSeg(mod_name, ds), ...rest] ->
-    pa_check_segs(rest, table, target_mod, cores, df,
-      pa_check_decls(ds, mod_name, target_mod, cores, table,
-        df_file_of(df, mod_name), errs))
+  [PSeg(mod_name, ds), ...rest] -> {
+    let cx = PaCx { table: table, tab: tab, home: mod_name, target_mod: target_mod,
+                    cores: cores, file: df_file_of(df, mod_name) }
+    pa_check_segs(rest, table, tab, target_mod, cores, df, pa_check_decls(ds, cx, errs))
+  }
 }
 
-fn pa_check_decls(ds: [Decl], home: String, target_mod: String,
-      cores: [String], table: PaIndex, file: String,
+fn pa_check_decls(ds: [Decl], cx: PaCx,
       errs: [Diagnostic]) : [Diagnostic] / Console + File = match ds {
   [] -> errs
   [d, ...rest] ->
-    pa_check_decls(rest, home, target_mod, cores, table, file,
-      pa_check_refs(pa_decl_refs(d), pa_decl_meta(d),
-      home, target_mod, cores, table, file, errs))
+    pa_check_decls(rest, cx, pa_check_refs(pa_decl_refs(d), pa_decl_meta(d, cx.tab), cx, errs))
 }
 
 fn pa_meta(name: String, kind: String, is_pub: Bool) : PaMeta =
   PaMeta { name: name, kind: kind, is_pub: is_pub }
 
-fn pa_decl_meta(d: Decl) : PaMeta = match d {
-  DFn(is_pub, name, _, _, _, _, _, _, _, _, _)  -> pa_meta(name, "fn", is_pub)
+fn pa_decl_meta(d: Decl, tab: SymTab) : PaMeta = match d {
+  DFn(is_pub, fid, _, _, _, _, _, _, _, _)     -> pa_meta(pa_sym_text(tab, fnid_sym(fid)), "fn", is_pub)
   DAxiom(is_pub, _, name, _, _, _, _, _, _, _) -> pa_meta(name, "axiom", is_pub)
-  DConst(is_pub, name, _, _, _, _, _, _)        -> pa_meta(name, "const", is_pub)
-  DType(is_pub, name, _, _, _, _, _, _, _)      -> pa_meta(name, "type", is_pub)
-  DEffect(is_pub, name, _, _, _, _, _, _, _)    -> pa_meta(name, "effect", is_pub)
-  DProtocol(is_pub, name, _, _, _, _, _, _)     -> pa_meta(name, "protocol", is_pub)
-  DUnit(is_pub, name, _, _, _, _, _)            -> pa_meta(name, "unit", is_pub)
-  DDerive(_, inner, _, _)    -> pa_decl_meta(inner)
-  DUnstable(inner, _, _)     -> pa_decl_meta(inner)
-  DProtoLaws(_, inner, _, _, _) -> pa_decl_meta(inner)
-  DImplAxiom(_, inner, _, _, _) -> pa_decl_meta(inner)
-  DConstructor(inner, _, _)  -> pa_decl_meta(inner)
-  DDoc(_, _, inner, _, _)    -> pa_decl_meta(inner)
+  DConst(is_pub, s, _, _, _, _, _)             -> pa_meta(pa_sym_text(tab, s), "const", is_pub)
+  DType(is_pub, s, _, _, _, _, _, _)           -> pa_meta(pa_sym_text(tab, s), "type", is_pub)
+  DEffect(is_pub, s, _, _, _, _, _, _)         -> pa_meta(pa_sym_text(tab, s), "effect", is_pub)
+  DProtocol(is_pub, s, _, _, _, _, _)          -> pa_meta(pa_sym_text(tab, s), "protocol", is_pub)
+  DUnit(is_pub, name, _, _, _, _, _)           -> pa_meta(name, "unit", is_pub)
+  DDerive(_, inner, _, _)    -> pa_decl_meta(inner, tab)
+  DUnstable(inner, _, _)     -> pa_decl_meta(inner, tab)
+  DProtoLaws(_, inner, _, _, _) -> pa_decl_meta(inner, tab)
+  DImplAxiom(_, inner, _, _, _) -> pa_decl_meta(inner, tab)
+  DConstructor(inner, _, _)  -> pa_decl_meta(inner, tab)
+  DDoc(_, _, inner, _, _)    -> pa_decl_meta(inner, tab)
   # An impl is not an exported signature of its own; its references
   # get the cross-module check but never the leak rule.
   _ -> pa_meta("", "", false)
 }
 
-fn pa_check_refs(refs: [PaRef], meta: PaMeta, home: String,
-      target_mod: String, cores: [String],
-      table: PaIndex, file: String,
+fn pa_sym_text(tab: SymTab, s: SymId) : String = written_text(sym_name(tab, s))
+
+fn pa_check_refs(refs: [PaRef], meta: PaMeta, cx: PaCx,
       errs: [Diagnostic]) : [Diagnostic] = match refs {
   [] -> errs
   [r, ...rest] ->
-    pa_check_refs(rest, meta, home, target_mod, cores, table, file,
-      list_append(pa_check_ref(r, meta, home, target_mod, cores, table, file), errs))
+    pa_check_refs(rest, meta, cx, list_append(pa_check_ref(r, meta, cx), errs))
 }
 
-fn pa_check_ref(r: PaRef, meta: PaMeta, home: String, target_mod: String,
-      cores: [String], table: PaIndex,
-      file: String) : [Diagnostic] =
-  match pa_decide_at(table, r.name, home, target_mod, cores, r.is_ty) {
+fn pa_check_ref(r: PaRef, meta: PaMeta, cx: PaCx) : [Diagnostic] = match r.name {
+  PnWritten(n) -> pa_check_written(r, n, meta, cx)
+  PnSym(s)     -> pa_check_sym(r, s, meta, cx)
+}
+
+fn pa_check_written(r: PaRef, n: String, meta: PaMeta, cx: PaCx) : [Diagnostic] =
+  match pa_decide_at(cx.table, n, cx.home, cx.target_mod, cx.cores, r.is_ty) {
     # A builtin's name reaches a declaration only where the reader's own
     # module declares it, and that one is visible; elsewhere it is the builtin.
-    PaPrivateTo(m) -> if list_has(core_names(), r.name) { [] } else { [pa_diag_private(file, r, m)] }
+    PaPrivateTo(m) -> if list_has(core_names(), n) { [] } else { [pa_diag_private(cx.file, r, n, m)] }
     PaUnknown -> []
     PaVisible ->
-      if pa_leak_position(r, meta) { pa_check_leak(r, meta, home, table, file) }
+      if pa_leak_position(r, meta) { pa_check_leak(r, n, meta, cx) }
       else { [] }
   }
+
+# A reference a scope pass settled is judged on the declaration it names:
+# reachable when its reader's own or `pub`, and a leak when a `pub`
+# signature exposes a non-`pub` one of its own module.
+fn pa_check_sym(r: PaRef, s: SymId, meta: PaMeta, cx: PaCx) : [Diagnostic] =
+  if not st_valid(cx.tab, s) or sym_exported(cx.tab, s) { [] }
+  else if not sym_owned_by(cx.tab, s, st_module_id(cx.home)) {
+    [pa_diag_private(cx.file, r, pa_sym_text(cx.tab, s), written_text(sym_home(cx.tab, s)))]
+  }
+  else if pa_leak_position(r, meta) {
+    match pa_cls_leak_word(sym_class(cx.tab, s)) {
+      Some(w) -> [pa_diag_leak(cx.file, r, meta, pa_sym_text(cx.tab, s), w, cx.home)]
+      None    -> []
+    }
+  }
+  else { [] }
+
+# The kind word of a class the leak rule covers: the type namespace
+# without constructors, which a type exposes on its own.
+fn pa_cls_leak_word(c: NCls) : Option[String] = match c {
+  NCType     -> Some(pa_kind_word(PkType))
+  NCEffect   -> Some(pa_kind_word(PkEffect))
+  NCProtocol -> Some(pa_kind_word(PkProtocol))
+  NCUnit     -> Some(pa_kind_word(PkUnit))
+  _          -> None
+}
 
 # The leak rule fires only for type-namespace references on the
 # exported surface of a `pub` declaration.
 fn pa_leak_position(r: PaRef, meta: PaMeta) : Bool =
   meta.is_pub and r.in_sig and r.leakable and r.is_ty
 
-fn pa_diag_private(file: String, r: PaRef, owner: String) : Diagnostic =
+fn pa_diag_private(file: String, r: PaRef, name: String, owner: String) : Diagnostic =
   mk_diag(SevError, file, r.line, r.col,
-    concat_all(["`", r.name, "` is private to module `", owner,
+    concat_all(["`", name, "` is private to module `", owner,
       "`; declare it `pub` in `", owner,
       "` to use it from other modules"]), [])
 
-fn pa_check_leak(r: PaRef, meta: PaMeta, home: String, table: PaIndex,
-      file: String) : [Diagnostic] =
-  match pa_leak_kind(table, r.name, home) {
+fn pa_check_leak(r: PaRef, n: String, meta: PaMeta, cx: PaCx) : [Diagnostic] =
+  match pa_leak_kind(cx.table, n, cx.home) {
     None -> []
-    Some(kind_word) -> [mk_diag(SevError, file, r.line, r.col,
-        concat_all(["pub ", meta.kind, " `", meta.name,
-      "` exposes non-pub ", kind_word, " `", r.name,
-      "` from module `", home, "`; mark `", r.name,
-      "` as `pub` or remove it from the signature"]), [])]
+    Some(kind_word) -> [pa_diag_leak(cx.file, r, meta, n, kind_word, cx.home)]
   }
+
+fn pa_diag_leak(file: String, r: PaRef, meta: PaMeta, name: String, kind_word: String,
+      home: String) : Diagnostic =
+  mk_diag(SevError, file, r.line, r.col,
+    concat_all(["pub ", meta.kind, " `", meta.name,
+      "` exposes non-pub ", kind_word, " `", name,
+      "` from module `", home, "`; mark `", name,
+      "` as `pub` or remove it from the signature"]), [])
 
 # ==== fn tparam bounds ====
 
@@ -233,26 +270,30 @@ fn pa_check_leak(r: PaRef, meta: PaMeta, home: String, table: PaIndex,
 # parser stores fn-decl bounds in a side table instead of the tparam
 # string — walk each module's fn decls against its own bounds.
 fn pa_check_bound_segs(segs: [CoreSegment], bounds: [FnBoundsRec],
-      table: PaIndex, df: DiagFiles,
+      table: PaIndex, tab: SymTab, df: DiagFiles,
       errs: [Diagnostic]) : [Diagnostic] = match segs {
   [] -> errs
   [PSeg(mod_name, ds), ...rest] -> {
     let own = filter(bounds, (b) => match b { FBR(_, mo, _) -> mo == Some(mod_name) })
-    let e1 = if list_length(own) == 0 { errs } else { pa_check_bound_decls(ds, own, mod_name, table, df_file_of(df, mod_name), errs) }
-    pa_check_bound_segs(rest, bounds, table, df, e1)
+    let cx = PaCx { table: table, tab: tab, home: mod_name, target_mod: mod_name,
+                    cores: [], file: df_file_of(df, mod_name) }
+    let e1 = if list_length(own) == 0 { errs } else { pa_check_bound_decls(ds, own, cx, errs) }
+    pa_check_bound_segs(rest, bounds, table, tab, df, e1)
   }
 }
 
-fn pa_check_bound_decls(ds: [Decl], bounds: [FnBoundsRec], home: String,
-      table: PaIndex, file: String,
+# The side table keys a function's bounds by the name it was written with.
+fn pa_check_bound_decls(ds: [Decl], bounds: [FnBoundsRec], cx: PaCx,
       errs: [Diagnostic]) : [Diagnostic] = match ds {
   [] -> errs
   [d, ...rest] -> match d {
-    DFn(is_pub, name, _, _, _, _, _, line, col, _, _) ->
-      pa_check_bound_decls(rest, bounds, home, table, file,
+    DFn(is_pub, fid, _, _, _, _, _, line, col, _) -> {
+      let name = pa_sym_text(cx.tab, fnid_sym(fid))
+      pa_check_bound_decls(rest, bounds, cx,
         pa_check_refs(pa_bound_table_refs(bounds, name, line, col),
-      pa_meta(name, "fn", is_pub), home, home, [], table, file, errs))
-    _ -> pa_check_bound_decls(rest, bounds, home, table, file, errs)
+                      pa_meta(name, "fn", is_pub), cx, errs))
+    }
+    _ -> pa_check_bound_decls(rest, bounds, cx, errs)
   }
 }
 
